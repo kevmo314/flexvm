@@ -8,6 +8,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -56,6 +57,8 @@ pub struct Daemon {
     /// Migrations this host was asked to take in. An id it has answered for
     /// as aborted can never start here afterwards.
     migrations: Mutex<HashMap<u64, Incoming>>,
+    /// Held for the daemon's lifetime (see `lock_run_dir`).
+    _run_lock: Vec<std::fs::File>,
     /// Armed test faults and when they expire; None unless FLEXVM_FAULTS=1.
     faults: Option<Mutex<HashMap<String, Instant>>>,
 }
@@ -78,8 +81,9 @@ enum Outcome {
 
 pub fn run(cfg: Config) -> Result<()> {
     std::fs::create_dir_all(&cfg.run_dir)?;
+    let run_lock = lock_run_dir(&cfg.run_dir)?;
     let listener = TcpListener::bind(&cfg.listen)?;
-    kill_orphans(&cfg.run_dir);
+    kill_orphans(&cfg.run_dir)?;
     let cgroup_root = setup_cgroups(&cfg.listen);
     net::sysctl("net.ipv4.ip_forward", "1")?;
     if let Some(dev) = &cfg.announce_dev {
@@ -97,6 +101,7 @@ pub fn run(cfg: Config) -> Result<()> {
         ips: Mutex::new(HashSet::new()),
         last_migration: Mutex::new(None),
         migrations: Mutex::new(HashMap::new()),
+        _run_lock: run_lock,
         faults: std::env::var("FLEXVM_FAULTS").is_ok_and(|v| v == "1").then(|| Mutex::new(HashMap::new())),
     });
     eprintln!("flexvm daemon listening on {} (advertised as {})", d.cfg.listen, d.cfg.advertise);
@@ -120,37 +125,71 @@ pub fn run(cfg: Config) -> Result<()> {
     Ok(())
 }
 
-/// Kills Firecrackers a previous daemon left running out of `run_dir`, and
-/// waits until they are gone, before this one answers anything. Otherwise a
-/// migration target that restarted would answer an unknown migration as
-/// aborted, its source would resume, and the orphan would be a second copy.
-fn kill_orphans(run_dir: &Path) {
-    let prefix = run_dir.join("");
-    let orphan = |pid: &str| {
-        std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|c| c.trim() == "firecracker")
-            && std::fs::read(format!("/proc/{pid}/cmdline"))
-                .is_ok_and(|c| c.split(|&b| b == 0).any(|a| a.starts_with(prefix.as_os_str().as_bytes())))
+/// Claims `run_dir` for this daemon's lifetime: an exclusive lock on it and
+/// shared locks on its ancestors, so no other daemon can use the same
+/// directory, one inside it or one around it (whose orphan cleanup would
+/// otherwise kill this daemon's Firecrackers, or the other way round).
+fn lock_run_dir(run_dir: &Path) -> Result<Vec<std::fs::File>> {
+    let dir = run_dir.canonicalize()?;
+    let mut locks = Vec::new();
+    for (i, d) in dir.ancestors().enumerate() {
+        let f = std::fs::File::open(d)?;
+        let how = if i == 0 { libc::LOCK_EX } else { libc::LOCK_SH };
+        if unsafe { libc::flock(f.as_raw_fd(), how | libc::LOCK_NB) } < 0 {
+            let e = std::io::Error::last_os_error();
+            bail!("run directory {} overlaps another daemon's ({} is locked: {e})", dir.display(), d.display());
+        }
+        locks.push(f);
+    }
+    Ok(locks)
+}
+
+/// Kills the Firecrackers a previous daemon left running in `run_dir` and
+/// confirms they are dead. It must succeed before this daemon answers
+/// anything: otherwise a migration target that restarted would answer an
+/// unknown migration as aborted, its source would resume, and the orphan
+/// would be a second copy.
+fn kill_orphans(run_dir: &Path) -> Result<()> {
+    let prefix = run_dir.canonicalize()?.join("");
+    let gone = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ESRCH);
+    // Ok(false) for a process that is not one of ours or no longer exists.
+    let ours = |pid: &str| -> Result<bool> {
+        let read = |what| match std::fs::read(format!("/proc/{pid}/{what}")) {
+            Ok(b) => Ok(Some(b)),
+            Err(e) if gone(&e) => Ok(None),
+            Err(e) => Err(format!("/proc/{pid}/{what}: {e}")),
+        };
+        let Some(comm) = read("comm")? else { return Ok(false) };
+        let Some(cmdline) = read("cmdline")? else { return Ok(false) };
+        Ok(comm.trim_ascii() == b"firecracker"
+            && cmdline.split(|&b| b == 0).any(|a| a.starts_with(prefix.as_os_str().as_bytes())))
     };
-    let pids: Vec<String> = std::fs::read_dir("/proc")
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|e| e.file_name().into_string().ok())
-        .filter(|p| p.bytes().all(|b| b.is_ascii_digit()) && orphan(p))
-        .collect();
-    for pid in &pids {
+    let mut orphans = Vec::new();
+    for e in std::fs::read_dir("/proc")? {
+        let pid = e?.file_name().into_string().unwrap_or_default();
+        if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) || !ours(&pid)? {
+            continue;
+        }
+        let fd = match crate::util::pidfd_open(pid.parse()?) {
+            Ok(fd) => fd,
+            Err(e) if gone(&e) => continue,
+            Err(e) => bail!("pidfd_open({pid}): {e}"),
+        };
+        // The pid may have been reused between the check and pidfd_open.
+        if !ours(&pid)? {
+            continue;
+        }
         eprintln!("killing firecracker {pid} left over in {}", run_dir.display());
-        unsafe { libc::kill(pid.parse().unwrap_or(0), libc::SIGKILL) };
+        crate::util::pidfd_kill(&fd).map_err(|e| format!("kill {pid}: {e}"))?;
+        orphans.push((pid, fd));
     }
-    // Gone, or a zombie whose vCPUs are dead.
-    let dead = |pid: &String| {
-        std::fs::read_to_string(format!("/proc/{pid}/stat"))
-            .map_or(true, |s| s.rsplit_once(')').is_some_and(|(_, rest)| rest.trim_start().starts_with('Z')))
-    };
-    let start = Instant::now();
-    while !pids.iter().all(dead) && start.elapsed() < Duration::from_secs(10) {
-        thread::sleep(Duration::from_millis(10));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    for (pid, fd) in orphans {
+        if !crate::util::pidfd_wait(&fd, deadline.saturating_duration_since(Instant::now()))? {
+            bail!("firecracker {pid} left over in {} would not die", run_dir.display());
+        }
     }
+    Ok(())
 }
 
 /// Creates a cgroup subtree for this daemon's VMs, if cgroup v2 is writable.
