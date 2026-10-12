@@ -8,7 +8,8 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -79,6 +80,7 @@ enum Outcome {
 pub fn run(cfg: Config) -> Result<()> {
     std::fs::create_dir_all(&cfg.run_dir)?;
     let listener = TcpListener::bind(&cfg.listen)?;
+    kill_orphans(&cfg.run_dir);
     let cgroup_root = setup_cgroups(&cfg.listen);
     net::sysctl("net.ipv4.ip_forward", "1")?;
     if let Some(dev) = &cfg.announce_dev {
@@ -117,6 +119,39 @@ pub fn run(cfg: Config) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// Kills Firecrackers a previous daemon left running out of `run_dir`, and
+/// waits until they are gone, before this one answers anything. Otherwise a
+/// migration target that restarted would answer an unknown migration as
+/// aborted, its source would resume, and the orphan would be a second copy.
+fn kill_orphans(run_dir: &Path) {
+    let prefix = run_dir.join("");
+    let orphan = |pid: &str| {
+        std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|c| c.trim() == "firecracker")
+            && std::fs::read(format!("/proc/{pid}/cmdline"))
+                .is_ok_and(|c| c.split(|&b| b == 0).any(|a| a.starts_with(prefix.as_os_str().as_bytes())))
+    };
+    let pids: Vec<String> = std::fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|p| p.bytes().all(|b| b.is_ascii_digit()) && orphan(p))
+        .collect();
+    for pid in &pids {
+        eprintln!("killing firecracker {pid} left over in {}", run_dir.display());
+        unsafe { libc::kill(pid.parse().unwrap_or(0), libc::SIGKILL) };
+    }
+    // Gone, or a zombie whose vCPUs are dead.
+    let dead = |pid: &String| {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .map_or(true, |s| s.rsplit_once(')').is_some_and(|(_, rest)| rest.trim_start().starts_with('Z')))
+    };
+    let start = Instant::now();
+    while !pids.iter().all(dead) && start.elapsed() < Duration::from_secs(10) {
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// Creates a cgroup subtree for this daemon's VMs, if cgroup v2 is writable.
