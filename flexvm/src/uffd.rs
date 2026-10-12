@@ -4,11 +4,16 @@
 //! according to that state, so a VM can be backed by any mix of a shared
 //! template image, zero pages and pages still living on a migration source.
 //!
-//!   BASE     -> copied from the template memory file (holes map the zero page)
-//!   ZERO     -> discarded by the guest (balloon / virtio-mem); maps the zero page
-//!   REMOTE   -> fetched from the migration source's page server
-//!   INFLIGHT -> a fetch is in progress; its UFFDIO_COPY wakes any waiters
-//!   PRESENT  -> populated in this VM, the only copy is inside Firecracker
+//!   BASE      -> copied from the template memory file (holes map the zero page)
+//!   ZERO      -> discarded by the guest (balloon / virtio-mem); maps the zero page
+//!   REMOTE    -> fetched from the migration source's page server
+//!   INFLIGHT  -> claimed by one installer; its UFFDIO_COPY wakes any waiters
+//!   DISCARDED -> INFLIGHT, but a REMOVE hit it; its installer must not publish it
+//!   PRESENT   -> populated in this VM, the only copy is inside Firecracker
+//!
+//! A page leaves BASE, ZERO or REMOTE only by being claimed. Its claimant
+//! installs it and then settles it, so an install that raced a REMOVE never
+//! overwrites the newer state (see `Pages`).
 //!
 //! The pager also reads PRESENT pages out of the (paused) Firecracker process
 //! with process_vm_readv so this host can act as a migration source.
@@ -35,9 +40,12 @@ pub const PRESENT: u8 = 1;
 pub const ZERO: u8 = 2;
 pub const REMOTE: u8 = 3;
 pub const INFLIGHT: u8 = 4;
+pub const DISCARDED: u8 = 5;
 
 /// Pages copied per fault from the template, to cut down on round trips.
 const FAULT_AROUND: usize = 16;
+/// Pages claimed per prefetch copy; faults on them wait for it.
+const PREFETCH_RUN: usize = 256;
 /// Pages fetched per remote fault.
 const REMOTE_FAULT_RUN: usize = 64;
 /// Pages per background pull request.
@@ -84,10 +92,131 @@ pub struct Mapping {
 /// Initial page states for a VM migrating in: runs of `[first_page, count, state]`.
 pub type Runs = Vec<(u64, u64, u8)>;
 
+fn eagain() -> io::Error {
+    io::Error::from_raw_os_error(libc::EAGAIN)
+}
+
+/// The page state machine. Installers claim pages (-> INFLIGHT), populate
+/// them and settle them; a REMOVE on a claimed page turns it DISCARDED so its
+/// installer neither copies stale data into it nor marks it PRESENT over the
+/// discard. Settling returns whether a REMOTE page got resolved, for the
+/// pager's count of pages still to pull.
+pub struct Pages(Vec<AtomicU8>);
+
+impl Pages {
+    pub fn new(n: usize) -> Pages {
+        // BASE is 0, so a zeroed allocation (lazily backed by the kernel) is the initial state.
+        Pages(unsafe { std::mem::transmute::<Vec<u8>, Vec<AtomicU8>>(vec![0u8; n]) })
+    }
+
+    pub fn get(&self, page: usize) -> u8 {
+        self.0[page].load(Ordering::SeqCst)
+    }
+
+    fn set(&self, page: usize, state: u8) {
+        self.0[page].store(state, Ordering::SeqCst)
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Claims up to `max` consecutive pages from `first` that are in state
+    /// `from` and pass `ok`. Returns how many it claimed.
+    pub fn claim(&self, first: usize, max: usize, from: u8, ok: impl Fn(usize) -> bool) -> usize {
+        let mut n = 0;
+        while n < max
+            && first + n < self.0.len()
+            && ok(first + n)
+            && self.0[first + n].compare_exchange(from, INFLIGHT, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+        {
+            n += 1;
+        }
+        n
+    }
+
+    /// Applies a REMOVE of `page`. Returns whether it resolved a REMOTE page.
+    pub fn discard(&self, page: usize) -> bool {
+        let old = self.0[page]
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |s| {
+                Some(if s == INFLIGHT || s == DISCARDED { DISCARDED } else { ZERO })
+            })
+            .unwrap();
+        old == REMOTE
+    }
+
+    /// Settles claimed `page`, claimed from state `from`. If a REMOVE raced
+    /// a successful copy, the copy may have landed after the kernel zapped the
+    /// page, so it is PRESENT, never ZERO: a fault on a PRESENT page that is
+    /// not actually there gets the zero page.
+    fn settle(&self, page: usize, populated: bool, from: u8) -> bool {
+        let old = self.0[page]
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |s| {
+                Some(match (s, populated) {
+                    (_, true) => PRESENT,
+                    (DISCARDED, false) => ZERO,
+                    (_, false) => from,
+                })
+            })
+            .unwrap();
+        debug_assert!(old == INFLIGHT || old == DISCARDED, "settling unclaimed page {page} in state {old}");
+        from == REMOTE && (populated || old == DISCARDED)
+    }
+
+    /// Gives back claimed pages without installing them.
+    pub fn release(&self, first: usize, n: usize, from: u8) -> usize {
+        (first..first + n).filter(|&p| self.settle(p, false, from)).count()
+    }
+
+    /// Installs claimed pages `[first, first + n)` with `populate(page, count)`,
+    /// which returns how many pages from `page` it populated (UFFDIO_COPY may
+    /// stop part way) and wakes their waiters. Pages discarded before their
+    /// copy are skipped; EEXIST counts as populated. EAGAIN is retried until
+    /// `stop` is set, or without `stop` ends the install. Unfinished pages are
+    /// given back. Returns the REMOTE pages resolved and the error, if any.
+    pub fn install(
+        &self,
+        first: usize,
+        n: usize,
+        from: u8,
+        stop: Option<&AtomicBool>,
+        mut populate: impl FnMut(usize, usize) -> io::Result<usize>,
+    ) -> (usize, io::Result<()>) {
+        let (end, mut resolved, mut i) = (first + n, 0, first);
+        while i < end {
+            if self.get(i) == DISCARDED {
+                resolved += self.settle(i, false, from) as usize;
+                i += 1;
+                continue;
+            }
+            let mut m = 1;
+            while i + m < end && self.get(i + m) == INFLIGHT {
+                m += 1;
+            }
+            match populate(i, m) {
+                Ok(done) => {
+                    let done = done.clamp(1, m);
+                    resolved += (i..i + done).filter(|&p| self.settle(p, true, from)).count();
+                    i += done;
+                }
+                Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
+                    resolved += self.settle(i, true, from) as usize;
+                    i += 1;
+                }
+                Err(e) if e.raw_os_error() == Some(libc::EAGAIN) && stop.is_some_and(|s| !s.load(Ordering::SeqCst)) => {
+                    thread::sleep(Duration::from_micros(200))
+                }
+                Err(e) => return (resolved + self.release(i, end - i, from), Err(e)),
+            }
+        }
+        (resolved, Ok(()))
+    }
+}
+
 pub struct Pager {
     base: Arc<Template>,
     mappings: OnceLock<Vec<Mapping>>,
-    pages: OnceLock<Vec<AtomicU8>>,
+    pages: OnceLock<Pages>,
     uffd: OnceLock<OwnedFd>,
     ready: (Mutex<bool>, Condvar),
     /// Firecracker pid, for reading pages out when acting as a migration source.
@@ -144,14 +273,13 @@ impl Pager {
         let (body, fd) = recv_with_fd(stream.as_raw_fd())?;
         let mappings: Vec<Mapping> = serde_json::from_slice(&body)?;
         let total = mappings.iter().map(|m| m.offset as usize + m.size).max().unwrap_or(0) / PAGE_SIZE;
-        // BASE is 0, so a zeroed allocation (lazily backed by the kernel) is the initial state.
-        let pages: Vec<AtomicU8> = unsafe { std::mem::transmute::<Vec<u8>, Vec<AtomicU8>>(vec![0u8; total]) };
+        let pages = Pages::new(total);
         if let Some((runs, addr, vm)) = initial {
             let _ = self.pull_started.set(Instant::now());
             let mut remote = 0;
             for (first, count, state) in runs {
-                for p in &pages[first as usize..(first + count) as usize] {
-                    p.store(state, Ordering::Relaxed);
+                for p in first as usize..(first + count) as usize {
+                    pages.set(p, state);
                 }
                 if state == REMOTE {
                     remote += count as usize;
@@ -179,23 +307,17 @@ impl Pager {
         for &(first, count) in &self.base.working_set {
             let (mut i, end) = (first as usize, ((first + count) as usize).min(pages.len()));
             while i < end {
-                if pages[i].load(Ordering::SeqCst) != BASE {
-                    i += 1;
-                    continue;
-                }
                 // Holes were zero at snapshot time (mostly free memory the guest
                 // allocates again); map them too, or each one costs a fault.
                 let data = self.base.has_data(i);
                 let region_end = self.locate((i * PAGE_SIZE) as u64).map_or(i + 1, |m| (m.offset as usize + m.size) / PAGE_SIZE);
-                let mut n = 1;
-                while i + n < end.min(region_end)
-                    && self.base.has_data(i + n) == data
-                    && pages[i + n].load(Ordering::SeqCst) == BASE
-                {
-                    n += 1;
+                let max = PREFETCH_RUN.min(end.min(region_end) - i);
+                let n = pages.claim(i, max, BASE, |p| self.base.has_data(p) == data);
+                if n > 0 {
+                    let src = |p: usize, c: usize| data.then(|| self.base.pages(p, c));
+                    let _ = pages.install(i, n, BASE, None, |p, c| self.populate(p, c, src(p, c)));
                 }
-                let _ = self.install(i, n, data.then(|| self.base.pages(i, n)));
-                i += n;
+                i += n.max(1);
             }
         }
     }
@@ -203,8 +325,9 @@ impl Pager {
     /// Runs of pages populated so far, as `(first_page, count)`.
     pub fn present_runs(&self) -> Vec<(u64, u64)> {
         let mut runs: Vec<(u64, u64)> = Vec::new();
-        for (i, p) in self.pages().iter().enumerate() {
-            if p.load(Ordering::Relaxed) != PRESENT {
+        let pages = self.pages();
+        for i in 0..pages.len() {
+            if pages.get(i) != PRESENT {
                 continue;
             }
             match runs.last_mut() {
@@ -232,7 +355,7 @@ impl Pager {
 
     /// Counts `n` remote pages as resolved.
     fn pulled(&self, n: usize) {
-        if self.remote_left.fetch_sub(n, Ordering::SeqCst) == n {
+        if n > 0 && self.remote_left.fetch_sub(n, Ordering::SeqCst) == n {
             let _ = self.pull_finished.set(Instant::now());
         }
     }
@@ -253,8 +376,9 @@ impl Pager {
         self.mappings.get().map(|m| m.as_slice()).unwrap_or(&[])
     }
 
-    fn pages(&self) -> &[AtomicU8] {
-        self.pages.get().map(|p| p.as_slice()).unwrap_or(&[])
+    fn pages(&self) -> &Pages {
+        static EMPTY: Pages = Pages(Vec::new());
+        self.pages.get().unwrap_or(&EMPTY)
     }
 
     fn fd(&self) -> RawFd {
@@ -262,10 +386,11 @@ impl Pager {
     }
 
     /// Counts pages per state.
-    pub fn census(&self) -> [usize; 5] {
-        let mut c = [0usize; 5];
-        for p in self.pages() {
-            c[p.load(Ordering::Relaxed) as usize] += 1;
+    pub fn census(&self) -> [usize; 6] {
+        let mut c = [0usize; 6];
+        let pages = self.pages();
+        for i in 0..pages.len() {
+            c[pages.get(i) as usize] += 1;
         }
         c
     }
@@ -274,10 +399,11 @@ impl Pager {
     /// pages become REMOTE there, ZERO stays ZERO and BASE is implied.
     pub fn export_runs(&self) -> Result<Runs> {
         let mut runs: Runs = Vec::new();
+        let pages = self.pages();
         for m in self.mappings() {
             let first = m.offset as usize / PAGE_SIZE;
             for i in first..first + m.size / PAGE_SIZE {
-                let s = match self.pages()[i].load(Ordering::Relaxed) {
+                let s = match pages.get(i) {
                     PRESENT => REMOTE,
                     ZERO => ZERO,
                     BASE => continue,
@@ -372,126 +498,88 @@ impl Pager {
     }
 
     fn discard(&self, start: u64, end: u64) {
-        let mut a = start & !(PAGE_SIZE as u64 - 1);
+        let (mut a, mut resolved) = (start & !(PAGE_SIZE as u64 - 1), 0);
         while a < end {
             if let Some((p, _)) = self.page_of(a) {
-                if self.pages()[p].swap(ZERO, Ordering::SeqCst) == REMOTE {
-                    self.pulled(1);
-                }
+                resolved += self.pages().discard(p) as usize;
             }
             a += PAGE_SIZE as u64;
         }
+        self.pulled(resolved);
     }
 
     fn fault(&self, addr: u64) -> io::Result<()> {
         let Some((page, m)) = self.page_of(addr) else {
             return Err(io::Error::other("fault outside guest memory"));
         };
-        let region_end = (m.offset as usize + m.size) / PAGE_SIZE;
+        let region_left = (m.offset as usize + m.size) / PAGE_SIZE - page;
         let pages = self.pages();
-        match pages[page].load(Ordering::SeqCst) {
-            PRESENT => self.wake(page, 1),
-            // Someone else is fetching it; retry until it lands (their copy wakes us).
-            INFLIGHT => Err(io::Error::from_raw_os_error(libc::EAGAIN)),
+        match pages.get(page) {
+            // Normally a fault that raced the install. If a REMOVE zapped the
+            // page after it was installed, it gets the zero page instead.
+            PRESENT => match self.populate(page, 1, None) {
+                Err(e) if e.raw_os_error() == Some(libc::EEXIST) => self.wake(page, 1),
+                r => r.map(drop),
+            },
+            // Someone else is installing it; retry until it lands (their copy wakes us).
+            INFLIGHT | DISCARDED => Err(eagain()),
             REMOTE => {
-                let mut n = 0;
-                while n < REMOTE_FAULT_RUN
-                    && page + n < region_end
-                    && pages[page + n]
-                        .compare_exchange(REMOTE, INFLIGHT, Ordering::SeqCst, Ordering::SeqCst)
-                        .is_ok()
-                {
-                    n += 1;
-                }
+                let n = pages.claim(page, REMOTE_FAULT_RUN.min(region_left), REMOTE, |_| true);
                 if n == 0 {
-                    return Ok(());
+                    return Err(eagain());
                 }
                 let mut buf = vec![0u8; n * PAGE_SIZE];
-                let mut client = self.remote.lock().unwrap();
-                let res = client
-                    .as_mut()
-                    .ok_or_else(|| io::Error::other("no migration source"))
-                    .and_then(|c| c.fetch((page * PAGE_SIZE) as u64, &mut buf));
-                drop(client);
-                if let Err(e) = res {
-                    for p in &pages[page..page + n] {
-                        p.store(REMOTE, Ordering::SeqCst);
-                    }
+                let fetched = match self.remote.lock().unwrap().as_mut() {
+                    Some(c) => c.fetch((page * PAGE_SIZE) as u64, &mut buf),
+                    None => Err(io::Error::other("no migration source")),
+                };
+                if let Err(e) = fetched {
+                    self.pulled(pages.release(page, n, REMOTE));
                     return Err(e);
                 }
-                self.install(page, n, Some(&buf))?;
-                self.pulled(n);
-                Ok(())
+                let src = |p: usize, c: usize| &buf[(p - page) * PAGE_SIZE..(p - page + c) * PAGE_SIZE];
+                let (resolved, res) = pages.install(page, n, REMOTE, None, |p, c| self.populate(p, c, Some(src(p, c))));
+                self.pulled(resolved);
+                res
             }
             state => {
                 // BASE or ZERO: serve a run of neighbours with the same source.
                 let from_template = state == BASE && self.base.has_data(page);
-                let mut n = 1;
-                while n < FAULT_AROUND && page + n < region_end {
-                    let s = pages[page + n].load(Ordering::SeqCst);
-                    let same = match s {
-                        BASE => self.base.has_data(page + n) == from_template,
-                        ZERO => !from_template,
-                        _ => false,
-                    };
-                    if !same {
-                        break;
-                    }
-                    n += 1;
+                let same = |p: usize| state == ZERO || self.base.has_data(p) == from_template;
+                let n = pages.claim(page, FAULT_AROUND.min(region_left), state, same);
+                if n == 0 {
+                    return Err(eagain());
                 }
-                if from_template {
-                    self.install(page, n, Some(self.base.pages(page, n)))
-                } else {
-                    self.install(page, n, None)
-                }
+                let src = |p: usize, c: usize| from_template.then(|| self.base.pages(p, c));
+                pages.install(page, n, state, None, |p, c| self.populate(p, c, src(p, c))).1
             }
         }
     }
 
-    /// Populates `n` pages starting at `page`, from `src` or with zeroes, and
-    /// marks them PRESENT. Pages that are already populated are skipped.
-    fn install(&self, page: usize, n: usize, src: Option<&[u8]>) -> io::Result<()> {
-        let res = self.populate(page, n, src);
-        let res = match res {
-            Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
-                // Part of the run was already there; go page by page.
-                let mut r = Ok(());
-                for i in 0..n {
-                    match self.populate(page + i, 1, src.map(|s| &s[i * PAGE_SIZE..(i + 1) * PAGE_SIZE])) {
-                        Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {}
-                        Err(e) => r = Err(e),
-                        Ok(()) => {}
-                    }
-                }
-                r
-            }
-            r => r,
-        };
-        if res.is_ok() {
-            for p in &self.pages()[page..page + n] {
-                p.store(PRESENT, Ordering::SeqCst);
-            }
-        }
-        res
-    }
-
-    fn populate(&self, page: usize, n: usize, src: Option<&[u8]>) -> io::Result<()> {
+    /// Populates up to `n` pages starting at `page`, from `src` or with
+    /// zeroes, and wakes their waiters. Returns how many it populated: the
+    /// kernel stops early (reporting progress) at a page that already exists.
+    fn populate(&self, page: usize, n: usize, src: Option<&[u8]>) -> io::Result<usize> {
         let (dst, _) = self.host_addr(page).ok_or_else(|| io::Error::other("bad page"))?;
         let len = (n * PAGE_SIZE) as u64;
-        let rc = match src {
+        let (rc, progress) = match src {
             Some(src) => {
                 let mut c = UffdioCopy { dst, src: src.as_ptr() as u64, len, mode: 0, copy: 0 };
-                unsafe { libc::ioctl(self.fd(), UFFDIO_COPY, &mut c) }
+                (unsafe { libc::ioctl(self.fd(), UFFDIO_COPY, &mut c) }, c.copy)
             }
             None => {
                 let mut z = UffdioZeropage { range: UffdioRange { start: dst, len }, mode: 0, zeropage: 0 };
-                unsafe { libc::ioctl(self.fd(), UFFDIO_ZEROPAGE, &mut z) }
+                (unsafe { libc::ioctl(self.fd(), UFFDIO_ZEROPAGE, &mut z) }, z.zeropage)
             }
         };
-        if rc < 0 {
-            return Err(io::Error::last_os_error());
+        if rc == 0 {
+            return Ok(n);
         }
-        Ok(())
+        let err = io::Error::last_os_error();
+        match progress.max(0) as usize / PAGE_SIZE {
+            0 => Err(err),
+            done => Ok(done),
+        }
     }
 
     fn wake(&self, page: usize, n: usize) -> io::Result<()> {
@@ -533,34 +621,21 @@ impl Pager {
                 let chunk_end = (chunk + PULL_RUN).min(end);
                 let mut i = chunk;
                 while i < chunk_end {
-                    if pages[i].compare_exchange(REMOTE, INFLIGHT, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+                    let n = pages.claim(i, chunk_end - i, REMOTE, |_| true);
+                    if n == 0 {
                         i += 1;
                         continue;
                     }
-                    let mut n = 1;
-                    while i + n < chunk_end
-                        && pages[i + n]
-                            .compare_exchange(REMOTE, INFLIGHT, Ordering::SeqCst, Ordering::SeqCst)
-                            .is_ok()
-                    {
-                        n += 1;
-                    }
                     let b = &mut buf[..n * PAGE_SIZE];
                     if let Err(e) = client.fetch((i * PAGE_SIZE) as u64, b) {
-                        for p in &pages[i..i + n] {
-                            p.store(REMOTE, Ordering::SeqCst);
-                        }
+                        self.pulled(pages.release(i, n, REMOTE));
                         return Err(e);
                     }
-                    loop {
-                        match self.install(i, n, Some(b)) {
-                            Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => {
-                                thread::sleep(Duration::from_micros(200))
-                            }
-                            r => break r?,
-                        }
-                    }
-                    self.pulled(n);
+                    let src = |p: usize, c: usize| &b[(p - i) * PAGE_SIZE..(p - i + c) * PAGE_SIZE];
+                    let (resolved, res) =
+                        pages.install(i, n, REMOTE, Some(&self.stop), |p, c| self.populate(p, c, Some(src(p, c))));
+                    self.pulled(resolved);
+                    res?;
                     i += n;
                 }
                 chunk += PULL_THREADS * PULL_RUN;
@@ -646,4 +721,192 @@ fn recv_with_fd(sock: RawFd) -> Result<(Vec<u8>, OwnedFd)> {
     let fd = unsafe { std::ptr::read_unaligned(libc::CMSG_DATA(c) as *const RawFd) };
     body.truncate(n as usize);
     Ok((body, unsafe { OwnedFd::from_raw_fd(fd) }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pages(states: &[u8]) -> Pages {
+        let p = Pages::new(states.len());
+        for (i, &s) in states.iter().enumerate() {
+            p.set(i, s);
+        }
+        p
+    }
+
+    fn states(p: &Pages) -> Vec<u8> {
+        (0..p.len()).map(|i| p.get(i)).collect()
+    }
+
+    fn os(code: i32) -> io::Error {
+        io::Error::from_raw_os_error(code)
+    }
+
+    #[test]
+    fn claimed_pages_have_one_installer() {
+        let p = pages(&[REMOTE, REMOTE, BASE, REMOTE]);
+        assert_eq!(p.claim(0, 8, REMOTE, |_| true), 2);
+        assert_eq!(p.claim(0, 8, REMOTE, |_| true), 0);
+        assert_eq!(p.claim(3, 8, REMOTE, |i| i != 3), 0);
+        let mut calls = Vec::new();
+        let (resolved, res) = p.install(0, 2, REMOTE, None, |i, n| {
+            calls.push((i, n));
+            Ok(n)
+        });
+        assert!(res.is_ok());
+        assert_eq!((resolved, calls), (2, vec![(0, 2)]));
+        assert_eq!(states(&p), [PRESENT, PRESENT, BASE, REMOTE]);
+    }
+
+    #[test]
+    fn remove_during_fetch_skips_the_copy() {
+        // A REMOVE lands while the pages are on the wire: the installer must
+        // not copy stale bytes into the discarded page or mark it PRESENT.
+        let p = pages(&[REMOTE; 4]);
+        p.claim(0, 4, REMOTE, |_| true);
+        assert!(!p.discard(1), "the installer accounts for claimed pages");
+        let mut calls = Vec::new();
+        let (resolved, res) = p.install(0, 4, REMOTE, None, |i, n| {
+            calls.push((i, n));
+            Ok(n)
+        });
+        assert!(res.is_ok());
+        assert_eq!(calls, [(0, 1), (2, 2)]);
+        assert_eq!(states(&p), [PRESENT, ZERO, PRESENT, PRESENT]);
+        assert_eq!(resolved, 4);
+    }
+
+    #[test]
+    fn remove_during_copy_leaves_page_present() {
+        // The copy may land after the kernel zapped the page, so the page may
+        // hold data: it must not become ZERO (PRESENT faults are zero-filled).
+        let p = pages(&[REMOTE; 2]);
+        p.claim(0, 2, REMOTE, |_| true);
+        let (resolved, res) = p.install(0, 2, REMOTE, None, |_, n| {
+            p.discard(1);
+            Ok(n)
+        });
+        assert!(res.is_ok());
+        assert_eq!((states(&p), resolved), (vec![PRESENT, PRESENT], 2));
+        // A REMOVE after the install wins.
+        assert!(!p.discard(0));
+        assert_eq!(states(&p), [ZERO, PRESENT]);
+    }
+
+    #[test]
+    fn failed_fetch_gives_pages_back() {
+        let p = pages(&[REMOTE; 3]);
+        p.claim(0, 3, REMOTE, |_| true);
+        p.discard(2);
+        assert_eq!(p.release(0, 3, REMOTE), 1);
+        assert_eq!(states(&p), [REMOTE, REMOTE, ZERO]);
+        assert_eq!(p.claim(0, 3, REMOTE, |_| true), 2);
+    }
+
+    #[test]
+    fn partial_copies_and_errors() {
+        // UFFDIO_COPY stops after two pages, the next one already exists, then EIO.
+        let p = pages(&[REMOTE; 6]);
+        p.claim(0, 6, REMOTE, |_| true);
+        let mut script = vec![Ok(2), Err(os(libc::EEXIST)), Err(os(libc::EIO))].into_iter();
+        let (resolved, res) = p.install(0, 6, REMOTE, None, |_, _| script.next().unwrap());
+        assert_eq!(res.unwrap_err().raw_os_error(), Some(libc::EIO));
+        assert_eq!(states(&p), [PRESENT, PRESENT, PRESENT, REMOTE, REMOTE, REMOTE]);
+        assert_eq!(resolved, 3);
+    }
+
+    #[test]
+    fn eagain_retries_only_with_a_stop_flag() {
+        let p = pages(&[BASE; 2]);
+        p.claim(0, 2, BASE, |_| true);
+        let (_, res) = p.install(0, 2, BASE, None, |_, _| Err(os(libc::EAGAIN)));
+        assert_eq!(res.unwrap_err().raw_os_error(), Some(libc::EAGAIN));
+        assert_eq!(states(&p), [BASE, BASE]);
+
+        let stop = AtomicBool::new(false);
+        p.claim(0, 2, BASE, |_| true);
+        let mut script = vec![Err(os(libc::EAGAIN)), Ok(2)].into_iter();
+        let (resolved, res) = p.install(0, 2, BASE, Some(&stop), |_, _| script.next().unwrap());
+        assert!(res.is_ok());
+        assert_eq!((states(&p), resolved), (vec![PRESENT, PRESENT], 0));
+    }
+
+    #[test]
+    fn prefetch_racing_remove() {
+        let p = pages(&[BASE; 3]);
+        p.claim(0, 3, BASE, |_| true);
+        assert_eq!(p.claim(0, 3, BASE, |_| true), 0, "a fault waits for the prefetch");
+        p.discard(0);
+        let (_, res) = p.install(0, 3, BASE, None, |i, n| {
+            assert_eq!((i, n), (1, 2));
+            p.discard(2);
+            Ok(n)
+        });
+        assert!(res.is_ok());
+        assert_eq!(states(&p), [ZERO, PRESENT, PRESENT]);
+        // A failed copy of a discarded page leaves it ZERO, not BASE.
+        let p = pages(&[BASE; 2]);
+        p.claim(0, 2, BASE, |_| true);
+        let (_, res) = p.install(0, 2, BASE, None, |_, _| {
+            p.discard(0);
+            Err(os(libc::ENOMEM))
+        });
+        assert!(res.is_err());
+        assert_eq!(states(&p), [ZERO, BASE]);
+    }
+
+    /// Random interleavings of claims, REMOVEs (including mid-copy), partial
+    /// copies, errors and failed fetches: no page stays claimed and every
+    /// REMOTE page is counted as resolved exactly once.
+    #[test]
+    fn remote_accounting_adds_up() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rand = move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        for _ in 0..200 {
+            let p = pages(&[REMOTE; 64]);
+            let mut resolved = 0;
+            for _ in 0..200 {
+                let first = rand(64);
+                if rand(4) == 0 {
+                    resolved += p.discard(first) as usize;
+                    continue;
+                }
+                let n = p.claim(first, 1 + rand(16), REMOTE, |_| true);
+                if n == 0 {
+                    continue;
+                }
+                if rand(4) == 0 {
+                    resolved += p.release(first, n, REMOTE);
+                    continue;
+                }
+                let mut script = Vec::new();
+                for _ in 0..8 {
+                    script.push((rand(3) == 0, rand(64), rand(5), rand(64)));
+                }
+                let mut script = script.into_iter();
+                let (r, _) = p.install(first, n, REMOTE, None, |i, m| {
+                    let (remove, at, outcome, k) = script.next().unwrap_or((false, 0, 4, 0));
+                    if remove {
+                        p.discard(i + at % m);
+                    }
+                    match outcome {
+                        0 => Err(os(libc::EEXIST)),
+                        1 => Err(os(libc::EAGAIN)),
+                        2 => Err(os(libc::EIO)),
+                        _ => Ok(1 + k % m),
+                    }
+                });
+                resolved += r;
+            }
+            let s = states(&p);
+            assert!(s.iter().all(|&s| s != INFLIGHT && s != DISCARDED), "{s:?}");
+            assert_eq!(resolved, 64 - s.iter().filter(|&&s| s == REMOTE).count());
+        }
+    }
 }

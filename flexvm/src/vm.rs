@@ -167,7 +167,7 @@ impl Vm {
     }
 
     pub fn describe(&self) -> Value {
-        let [base, present, zero, remote, inflight] = self.pager.census();
+        let [base, present, zero, remote, inflight, discarded] = self.pager.census();
         let mib = |pages: usize| (pages * PAGE_SIZE) as u64 >> 20;
         let hotplug = self.fc(|fc| fc.get("/hotplug/memory")).unwrap_or(Value::Null);
         json!({
@@ -179,7 +179,7 @@ impl Vm {
             "rss_mib": self.rss() >> 20,
             "guest_mib": self.template.meta.mem_mib + hotplug["plugged_size_mib"].as_u64().unwrap_or(0),
             "max_mib": self.template.meta.max_mib,
-            "pages_mib": {"base": mib(base), "present": mib(present), "zero": mib(zero), "remote": mib(remote + inflight)},
+            "pages_mib": {"base": mib(base), "present": mib(present), "zero": mib(zero), "remote": mib(remote + inflight + discarded)},
         })
     }
 }
