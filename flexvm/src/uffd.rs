@@ -225,6 +225,10 @@ pub struct Pager {
     remote_left: AtomicUsize,
     pull_started: OnceLock<Instant>,
     pull_finished: OnceLock<Instant>,
+    /// Held while reading and applying a batch of uffd events.
+    events: Mutex<()>,
+    /// Set by the checkpoint barrier: no new prefetch.
+    quiesce: AtomicBool,
     stop: AtomicBool,
 }
 
@@ -245,6 +249,8 @@ impl Pager {
             remote_left: AtomicUsize::new(0),
             pull_started: OnceLock::new(),
             pull_finished: OnceLock::new(),
+            events: Mutex::new(()),
+            quiesce: AtomicBool::new(false),
             stop: AtomicBool::new(false),
         });
         let p = pager.clone();
@@ -306,7 +312,7 @@ impl Pager {
         let pages = self.pages();
         for &(first, count) in &self.base.working_set {
             let (mut i, end) = (first as usize, ((first + count) as usize).min(pages.len()));
-            while i < end {
+            while i < end && !self.quiesce.load(Ordering::SeqCst) {
                 // Holes were zero at snapshot time (mostly free memory the guest
                 // allocates again); map them too, or each one costs a fault.
                 let data = self.base.has_data(i);
@@ -395,15 +401,34 @@ impl Pager {
         c
     }
 
-    /// Run-length encodes the page states a migration target needs: PRESENT
-    /// pages become REMOTE there, ZERO stays ZERO and BASE is implied.
-    pub fn export_runs(&self) -> Result<Runs> {
+    /// Checkpoint barrier, for a paused VM: stops prefetching, waits for
+    /// REMOVE events already read to be applied and for in-flight installs to
+    /// settle, then exports page states that match the saved device state.
+    /// A page installed behind the scan only gains the contents its old state
+    /// already implied (template or zero), as the paused guest cannot write it.
+    ///
+    /// The export is the run-length encoded page states a migration target
+    /// needs: PRESENT pages become REMOTE there, ZERO stays ZERO and BASE is
+    /// implied.
+    pub fn quiesce_export(&self) -> Result<Runs> {
+        self.quiesce.store(true, Ordering::SeqCst);
+        drop(self.events.lock().unwrap());
+        let start = Instant::now();
         let mut runs: Runs = Vec::new();
         let pages = self.pages();
         for m in self.mappings() {
             let first = m.offset as usize / PAGE_SIZE;
-            for i in first..first + m.size / PAGE_SIZE {
-                let s = match pages.get(i) {
+            for (i, p) in pages.0[first..first + m.size / PAGE_SIZE].iter().enumerate() {
+                let mut s = p.load(Ordering::Relaxed);
+                if s == BASE {
+                    continue;
+                }
+                let i = first + i;
+                while (s == INFLIGHT || s == DISCARDED) && start.elapsed() < Duration::from_secs(1) {
+                    thread::sleep(Duration::from_micros(20));
+                    s = p.load(Ordering::SeqCst);
+                }
+                let s = match s {
                     PRESENT => REMOTE,
                     ZERO => ZERO,
                     BASE => continue,
@@ -464,6 +489,7 @@ impl Pager {
                 break;
             }
             if pfd.revents & libc::POLLIN != 0 {
+                let _events = self.events.lock().unwrap();
                 let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
                 if n > 0 {
                     for msg in buf[..n as usize].chunks_exact(32) {

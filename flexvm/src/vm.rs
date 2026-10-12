@@ -140,13 +140,14 @@ impl Vm {
     }
 
     /// Pauses the VM and saves only its device/vCPU state (memory stays put
-    /// and is served by the pager). Returns the page states a target needs.
+    /// and is served by the pager). Returns the page states a target needs,
+    /// taken behind the pager's barrier so they match the saved state.
     pub fn checkpoint(&self, vmstate: &Path) -> Result<Runs> {
         self.fc(|fc| {
             fc.pause()?;
             fc.put("/snapshot/create", json!({"snapshot_type": "Full", "snapshot_path": vmstate, "mem_file_path": "", "sync_snapshot_files": false}))
         })?;
-        self.pager.export_runs()
+        self.pager.quiesce_export()
     }
 
     pub fn resume(&self) -> Result<()> {
