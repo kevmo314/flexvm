@@ -5,8 +5,13 @@
 //! template time for warm templates). flexvm-init reaps it like any child,
 //! records its exit status and keeps its stdout and stderr in a bounded ring.
 //!
-//! Requests: `APP`, `APPSTATUS`, `LOGS <offset> <follow 0|1>`, `PROBE <port>`
-//! and `QUIESCE`. Replies are frames, as for the other requests.
+//! Requests: `APP`, `APPSTATUS`, `LOGS <offset> <follow 0|1>`, `PROBE <port>`,
+//! `CHECK <timeout ms> <hex shell command>` and `QUIESCE`. Replies are
+//! frames, as for the other requests.
+//!
+//! An app with a non-root user runs with no_new_privs and an empty
+//! capability bounding set, so setuid binaries and file capabilities in the
+//! image cannot take it back to root (and do not work for it).
 //!
 //! app.conf is one `key value` per line; values escape `\` and newline as
 //! `\\` and `\n`. Keys: `arg` (repeated, argv in order), `env` (repeated,
@@ -20,7 +25,7 @@ use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::{Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::{frame, spawn, wait_pid, Statuses, FRAME_MSG, FRAME_STDOUT};
 
@@ -28,7 +33,7 @@ const CONF: &str = "/etc/flexvm/app.conf";
 /// Bytes of app output kept for `LOGS`; older output is dropped.
 const RING_BYTES: usize = 1 << 20;
 
-pub const VERBS: [&str; 5] = ["APP", "APPSTATUS", "LOGS", "PROBE", "QUIESCE"];
+pub const VERBS: [&str; 6] = ["APP", "APPSTATUS", "LOGS", "PROBE", "CHECK", "QUIESCE"];
 
 #[derive(Clone, Copy)]
 enum State {
@@ -67,7 +72,21 @@ impl App {
     }
 }
 
+/// Bounds writes, so a host that stops reading cannot park this thread.
+fn send_timeout(out: &Mutex<File>, secs: i64) {
+    use std::os::fd::AsRawFd;
+    let tv = libc::timeval { tv_sec: secs, tv_usec: 0 };
+    let fd = out.lock().unwrap().as_raw_fd();
+    unsafe {
+        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDTIMEO, (&tv as *const libc::timeval).cast(), std::mem::size_of_val(&tv) as _)
+    };
+}
+
 pub fn handle(verb: &str, arg: &str, out: &Mutex<File>, statuses: &Statuses) -> io::Result<()> {
+    // `LOGS` may legitimately wait on a slow reader; it holds no lock while writing.
+    if verb != "LOGS" {
+        send_timeout(out, 5);
+    }
     match verb {
         "APP" => {
             let reply = match start(statuses) {
@@ -76,7 +95,14 @@ pub fn handle(verb: &str, arg: &str, out: &Mutex<File>, statuses: &Statuses) -> 
             };
             frame(out, FRAME_MSG, reply.as_bytes())
         }
-        "APPSTATUS" => frame(out, FRAME_MSG, APP.lock().unwrap().status().as_bytes()),
+        "APPSTATUS" => {
+            let status = APP.lock().unwrap().status();
+            frame(out, FRAME_MSG, status.as_bytes())
+        }
+        "CHECK" => {
+            let reply = check(arg, statuses).unwrap_or_else(|e| format!("error: {e}"));
+            frame(out, FRAME_MSG, reply.as_bytes())
+        }
         "LOGS" => {
             let mut a = arg.split_whitespace();
             let offset = a.next().and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -157,6 +183,48 @@ fn read_conf() -> io::Result<Conf> {
     Ok(c)
 }
 
+/// Runs a readiness command with output discarded, killing its process
+/// group if it outlives the deadline: `ok`, `exit <code>` or `timeout`.
+fn check(arg: &str, statuses: &Statuses) -> io::Result<String> {
+    let (ms, hex) = arg.trim().split_once(' ').ok_or_else(|| io::Error::other("usage: CHECK <ms> <hex>"))?;
+    let ms: u64 = ms.parse().map_err(|_| io::Error::other("bad timeout"))?;
+    let bytes = (0..hex.len())
+        .step_by(2)
+        .map(|i| hex.get(i..i + 2).and_then(|h| u8::from_str_radix(h, 16).ok()))
+        .collect::<Option<Vec<u8>>>()
+        .ok_or_else(|| io::Error::other("bad command encoding"))?;
+    let cmd = String::from_utf8_lossy(&bytes).into_owned();
+    let child = spawn(
+        Command::new("/bin/sh")
+            .args(["-c", &cmd])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0),
+        statuses,
+        true,
+    )
+    .map_err(|e| io::Error::new(e.kind(), format!("cannot run /bin/sh: {e}")))?;
+    let pid = child.id() as i32;
+    let deadline = Instant::now() + Duration::from_millis(ms);
+    let (lock, cv) = &**statuses;
+    let mut map = lock.lock().unwrap();
+    loop {
+        if let Some(Some(code)) = map.get(&pid).copied() {
+            map.remove(&pid);
+            return Ok(if code == 0 { "ok".into() } else { format!("exit {code}") });
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            drop(map);
+            unsafe { libc::kill(-pid, libc::SIGKILL) };
+            wait_pid(statuses, pid);
+            return Ok("timeout".into());
+        }
+        map = cv.wait_timeout(map, left).unwrap().0;
+    }
+}
+
 /// Starts the app unless it is already running. Returns its pid.
 fn start(statuses: &Statuses) -> io::Result<i32> {
     let mut app = APP.lock().unwrap();
@@ -173,15 +241,25 @@ fn start(statuses: &Statuses) -> io::Result<i32> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let (uid, gid, groups) = (c.uid, c.gid, c.groups.clone());
+    // Keep the app (even as root) from reading flexvm-init's memory or ptracing it.
+    unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
     // Its own session, so signals for flexvm-init's console never reach it.
     // Credentials are dropped here rather than with CommandExt::uid, which
     // would clear the supplementary groups.
     unsafe {
         cmd.pre_exec(move || {
+            if uid != 0 {
+                // No way back to root: drop every capability from the bounding set
+                // while we still may, then forbid gaining privileges on exec.
+                for cap in 0..64 {
+                    libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0);
+                }
+            }
             let ok = libc::setsid() >= 0
                 && libc::setgroups(groups.len(), groups.as_ptr()) == 0
                 && libc::setgid(gid) == 0
-                && libc::setuid(uid) == 0;
+                && libc::setuid(uid) == 0
+                && (uid == 0 || libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0);
             if ok { Ok(()) } else { Err(io::Error::last_os_error()) }
         });
     }
@@ -218,6 +296,11 @@ fn pump(mut r: impl Read + Send + 'static) {
 /// ring still holds), then its status. With `follow`, keeps sending new
 /// output until the app has exited.
 fn logs(out: &Mutex<File>, mut offset: u64, follow: bool) -> io::Result<()> {
+    // Without `follow`, only what was there when asked.
+    let stop = {
+        let app = APP.lock().unwrap();
+        if follow { u64::MAX } else { app.dropped + app.ring.len() as u64 }
+    };
     loop {
         let (chunk, status, done) = {
             let mut app = APP.lock().unwrap();
@@ -235,7 +318,8 @@ fn logs(out: &Mutex<File>, mut offset: u64, follow: bool) -> io::Result<()> {
                 }
             }
             let start = (offset - app.dropped) as usize;
-            let n = (app.ring.len() - start).min(64 * 1024);
+            let avail = (app.ring.len() - start) as u64;
+            let n = avail.min(stop.saturating_sub(offset)).min(64 * 1024) as usize;
             let chunk: Vec<u8> = app.ring.range(start..start + n).copied().collect();
             let done = !follow || !matches!(app.state, State::Running(_));
             (chunk, app.status(), done)
