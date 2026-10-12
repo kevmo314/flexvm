@@ -145,6 +145,8 @@ pub struct Vm {
     /// Free page reports may be held in Firecracker: a hold was sent and no
     /// release has landed since (see `hold_reports`).
     reports_held: AtomicBool,
+    /// Whether the daemon serves this VM's memory requests (see `Daemon::watch_memory`).
+    pub mem_watched: AtomicBool,
     /// Migration target only: the source's answer to `release`, true or an error.
     pub released: OnceLock<Value>,
     /// Host ends of exec sessions, by id, so a checkpoint can close them.
@@ -310,6 +312,7 @@ impl Vm {
             last_resize: Mutex::new(Instant::now()),
             starved: AtomicBool::new(false),
             reports_held: AtomicBool::new(false),
+            mem_watched: AtomicBool::new(false),
             released: OnceLock::new(),
             execs: Mutex::new(HashMap::new()),
             devices: Mutex::new(()),
@@ -329,6 +332,11 @@ impl Vm {
 
     pub fn vsock(&self) -> PathBuf {
         self.vsock.clone()
+    }
+
+    /// Where Firecracker forwards the guest's connections to host port `MEM_PORT`.
+    pub fn mem_sock(&self) -> PathBuf {
+        PathBuf::from(format!("{}_{}", self.vsock.display(), crate::guest::MEM_PORT))
     }
 
     pub fn state(&self) -> State {
@@ -858,6 +866,8 @@ impl Vm {
         self.pager.kill_firecracker();
         let Some(mut fc) = self.fc.lock().unwrap().take() else { return };
         fc.kill();
+        // Wake the daemon's listener for guest memory requests so it sees the VM is gone.
+        let _ = std::os::unix::net::UnixStream::connect(self.mem_sock());
         self.pager.join();
         crate::fc::release(&self.tap, self.cgroup.as_deref(), &self.dir);
     }

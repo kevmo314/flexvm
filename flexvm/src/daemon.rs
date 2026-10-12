@@ -674,6 +674,17 @@ impl Daemon {
         Ok(())
     }
 
+    /// Serves the guest's memory requests in the background, once per VM.
+    /// Starts and migrations call it as the VM arrives; the controller's
+    /// tick catches every other way in (restores, resumes).
+    fn watch_memory(self: &Arc<Self>, vm: &Arc<Vm>) {
+        if vm.mem_watched.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let (d, vm) = (self.clone(), vm.clone());
+        thread::spawn(move || serve_mem_requests(d, vm));
+    }
+
     fn run_vm(self: &Arc<Self>, name: &str, template: &str, ip: Option<&str>) -> Result<Value> {
         let mut t = Phases::new();
         let _op = self.admit()?;
@@ -742,6 +753,7 @@ impl Daemon {
         }
         self.announce(&vm);
         t.mark("announce");
+        self.watch_memory(&vm);
         Ok(json!({
             "name": name,
             "ip": ip.to_string(),
@@ -1827,6 +1839,7 @@ impl Daemon {
         thread::spawn(move || {
             let _releasing = CountGuard(&d.releases);
             vm.restore_devices();
+            d.watch_memory(&vm);
             let start = Instant::now();
             vm.pager.wait_pulled();
             let pulled = start.elapsed();
@@ -1959,6 +1972,7 @@ impl Daemon {
             host_avail = host_available_mib();
         }
         for vm in &vms {
+            self.watch_memory(vm);
             // Never alongside a lifecycle operation on the VM; paused and
             // suspended VMs have no fresh statistics and are left alone.
             let Ok(_busy) = self.reserve(&vm.name, "resizing", Duration::ZERO) else { continue };
@@ -1971,8 +1985,8 @@ impl Daemon {
                 }
             }
             if vm.state() == State::Running {
-                match resize(vm, host_avail, self.cfg.reserve_mib) {
-                    Ok(grew) => host_avail = host_avail.saturating_sub(grew),
+                match resize(vm, host_avail, self.cfg.reserve_mib, None) {
+                    Ok((_, short)) => host_avail = host_avail.saturating_sub(short),
                     Err(e) => eprintln!("vm {}: resize: {e}", vm.name),
                 }
             }
@@ -2027,45 +2041,120 @@ fn host_available_mib() -> u64 {
     proc_kb("/proc/meminfo", "MemAvailable").unwrap_or(0) >> 20
 }
 
-/// Grows or shrinks a VM's hotplugged memory to keep its free memory within a
-/// band, and returns how much it grew. Freed pages inside plugged memory go
-/// back to the host through free page reporting, so this mostly decides how
-/// far the guest may grow. A VM that needs to grow past what this host can
-/// back is flagged as starved so the controller moves it somewhere roomier.
-fn resize(vm: &Vm, host_avail: u64, reserve: u64) -> Result<u64> {
+/// Free memory (MiB) the controller keeps plugged for a guest with `total`
+/// MiB. The guest agent asks for more as soon as it has less than this, and
+/// throttles allocations that outrun the plug (guest/src/mem.rs uses the same mark).
+pub fn headroom(total: u64) -> u64 {
+    (total / 4).max(1024.min(total / 2))
+}
+
+/// What a resize did, answered to the guest when it asked.
+#[derive(Debug, PartialEq)]
+enum Resized {
+    Grew,
+    Same,
+    /// The guest is still processing the previous request.
+    Busy,
+    /// Short on memory but at its ceiling.
+    Full,
+}
+
+/// Grows or shrinks a VM's hotplugged memory to keep `headroom` of it free,
+/// never shrinking below what its template was snapshotted with. Plugged
+/// memory the guest has not touched costs the host nothing, and pages it
+/// frees go back through free page reporting, so this mostly decides how far
+/// the guest may grow before asking again. `fresh` is (available, total) MiB
+/// from the guest itself; otherwise the balloon statistics are used, which
+/// can be a second old. Returns what happened and the MiB the guest is short,
+/// which is what it is about to take from the host. A VM that is short and
+/// cannot grow here (ceiling, or the host's reserve) is flagged as starved so
+/// the controller moves it somewhere roomier.
+fn resize(vm: &Vm, host_avail: u64, reserve: u64, fresh: Option<(u64, u64)>) -> Result<(Resized, u64)> {
     let meta = &vm.template.meta;
     let hotplug_total = meta.max_mib - meta.mem_mib;
     if hotplug_total == 0 {
-        return Ok(0);
+        return Ok((Resized::Full, 0));
     }
-    let (stats, hp) = vm.fc(|fc| Ok((fc.get("/balloon/statistics")?, fc.get("/hotplug/memory")?)))?;
-    let avail = stats["available_memory"].as_u64().unwrap_or(0) >> 20;
-    let total = stats["total_memory"].as_u64().unwrap_or(0) >> 20;
+    // Serializes the controller's ticks with the guest's own requests.
+    let mut last = vm.last_resize.lock().unwrap();
+    let (stats, hp) = vm.fc(|fc| {
+        let stats = if fresh.is_none() { fc.get("/balloon/statistics")? } else { Value::Null };
+        Ok((stats, fc.get("/hotplug/memory")?))
+    })?;
+    let (avail, total) = fresh.unwrap_or_else(|| {
+        let mib = |k: &str| stats[k].as_u64().unwrap_or(0) >> 20;
+        (mib("available_memory"), mib("total_memory"))
+    });
     let requested = hp["requested_size_mib"].as_u64().unwrap_or(0);
     let plugged = hp["plugged_size_mib"].as_u64().unwrap_or(0);
-    if total == 0 || plugged != requested {
-        return Ok(0); // no stats yet, or the guest is still processing the last request
+    if total == 0 {
+        return Ok((Resized::Same, 0)); // no stats yet
     }
-    let headroom = (total / 4).max(256);
+    if plugged != requested {
+        return Ok((Resized::Busy, 0));
+    }
+    let floor = meta.plugged_mib.min(hotplug_total);
+    let headroom = headroom(total);
     let round = |mib: u64| mib.div_ceil(STEP_MIB) * STEP_MIB;
-    let mut last = vm.last_resize.lock().unwrap();
-    let new = if avail < headroom {
+    // Balloon statistics lag a plug by up to a second; don't grow twice on stale numbers.
+    let stale = fresh.is_none() && last.elapsed() < Duration::from_millis(1500);
+    let new = if avail < headroom && !stale {
         (requested + round(headroom * 2 - avail)).min(hotplug_total)
-    } else if avail > headroom * 3 && requested > 0 && last.elapsed() > Duration::from_secs(10) {
-        requested.saturating_sub((avail - headroom * 2) / STEP_MIB * STEP_MIB)
+    } else if avail > headroom * 3 && requested > floor && last.elapsed() > Duration::from_secs(10) {
+        requested.saturating_sub((avail - headroom * 2) / STEP_MIB * STEP_MIB).max(floor)
     } else {
         requested
     };
-    let grow = new.saturating_sub(requested);
-    // Starved: short on memory and either at its ceiling or growing into the host's reserve.
-    let starved = avail < headroom && (new == requested || host_avail.saturating_sub(grow) < reserve);
-    vm.starved.store(starved, Ordering::SeqCst);
-    if new != requested {
-        eprintln!("vm {}: available {avail}/{total} MiB, hotplug {requested} -> {new} MiB", vm.name);
-        vm.fc(|fc| fc.patch("/hotplug/memory", json!({"requested_size_mib": new})))?;
-        *last = Instant::now();
+    let short = headroom.saturating_sub(avail);
+    let full = short > 0 && requested == hotplug_total;
+    vm.starved.store(full || (short > 0 && host_avail.saturating_sub(short) < reserve), Ordering::SeqCst);
+    if new == requested {
+        return Ok((if full { Resized::Full } else { Resized::Same }, short));
     }
-    Ok(grow)
+    let why = if fresh.is_some() { "guest asked" } else { "tick" };
+    eprintln!("vm {}: available {avail}/{total} MiB, hotplug {requested} -> {new} MiB ({why})", vm.name);
+    vm.fc(|fc| fc.patch("/hotplug/memory", json!({"requested_size_mib": new})))?;
+    *last = Instant::now();
+    Ok((if new > requested { Resized::Grew } else { Resized::Same }, short))
+}
+
+/// Answers the guest agent's memory requests for `vm` (`MEM <available KiB>
+/// <total KiB>`, sent when it runs low) with an immediate resize, until the
+/// VM is gone from this host.
+fn serve_mem_requests(d: Arc<Daemon>, vm: Arc<Vm>) {
+    let path = vm.mem_sock();
+    let _ = std::fs::remove_file(&path);
+    let listener = match std::os::unix::net::UnixListener::bind(&path) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("vm {}: memory requests: {e}", vm.name);
+            return;
+        }
+    };
+    for conn in listener.incoming() {
+        if vm.pid().is_none() {
+            break;
+        }
+        let Ok(conn) = conn else { continue };
+        let _ = conn.set_read_timeout(Some(Duration::from_secs(1)));
+        let mut line = String::new();
+        if std::io::BufRead::read_line(&mut BufReader::new(&conn), &mut line).is_err() {
+            continue;
+        }
+        let mut f = line.split_whitespace().skip(1).filter_map(|v| v.parse::<u64>().ok());
+        let (Some(avail), Some(total)) = (f.next(), f.next()) else { continue };
+        let reply = match resize(&vm, host_available_mib(), d.cfg.reserve_mib, Some((avail >> 10, total >> 10))) {
+            Ok((Resized::Grew, _)) => "grow",
+            Ok((Resized::Busy, _)) => "busy",
+            Ok((Resized::Full, _)) => "full",
+            Ok((Resized::Same, _)) => "ok",
+            Err(e) => {
+                eprintln!("vm {}: resize on request: {e}", vm.name);
+                "busy"
+            }
+        };
+        let _ = (&conn).write_all(format!("{reply}\n").as_bytes());
+    }
 }
 
 /// Tells a migration source to drop its copy, retrying with backoff (up to

@@ -25,6 +25,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 mod app;
+mod mem;
 mod net;
 mod session;
 
@@ -55,6 +56,7 @@ fn main() {
         if let Err(e) = net::setup() {
             log(&format!("network setup failed: {e}"));
         }
+        mem::start();
     }
     let statuses: Statuses = Arc::new((Mutex::new(HashMap::new()), Condvar::new()));
     {

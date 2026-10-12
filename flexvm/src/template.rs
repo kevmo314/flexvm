@@ -34,12 +34,29 @@ pub const BOOT_ARGS: &str = "console=ttyS0 quiet reboot=k panic=1 pci=off \
 pub const SLOT_MIB: u64 = 1024;
 /// Step the controller grows and shrinks guests by (MiB).
 pub const STEP_MIB: u64 = 128;
+/// Default boot memory (MiB) for a guest that may grow to `max_mib`. Hot-plugged
+/// memory is movable, so the kernel's own allocations, including the page
+/// structs of every hot-plugged block (1/64 of it), must fit in boot memory: a
+/// 256 MiB base runs out near 11 GiB plugged and the guest kernel OOMs. Boot
+/// memory the guest does not touch costs the host nothing either.
+pub fn base_mib(max_mib: u64) -> u64 {
+    (256 + max_mib / 32).div_ceil(STEP_MIB) * STEP_MIB
+}
+
+/// Hotplug memory a template is snapshotted with, so every VM starts with it
+/// plugged (MiB). Plugged memory the guest never touches costs the host
+/// nothing, so a burst of allocations right after `run` never waits on the
+/// host. The controller never shrinks a VM below this.
+pub const PLUG_MIB: u64 = 4096;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Meta {
     pub vcpus: u32,
     pub mem_mib: u64,
     pub max_mib: u64,
+    /// Hotplug memory plugged in the snapshot (MiB).
+    #[serde(default)]
+    pub plugged_mib: u64,
     pub kernel: PathBuf,
     pub rootfs: PathBuf,
     #[serde(default)]
@@ -534,8 +551,31 @@ fn record_working_set(paths: &Paths, name: &str, tap: &str, sockets: &Arc<Socket
     Ok(runs.iter().map(|r| r.1 as usize).sum::<usize>() * PAGE_SIZE)
 }
 
+/// Plugs `mib` of hotplug memory into a booted template VM and waits until
+/// the guest has onlined it. Returns the plugged size.
+fn plug(fc: &Firecracker, mib: u64) -> Result<u64> {
+    if mib == 0 {
+        return Ok(0);
+    }
+    fc.patch("/hotplug/memory", json!({"requested_size_mib": mib}))?;
+    retry(Duration::from_secs(60), || match fc.get("/hotplug/memory")?["plugged_size_mib"].as_u64() {
+        Some(p) if p == mib => Ok(()),
+        p => bail!("plugged {p:?} of {mib} MiB"),
+    })?;
+    Ok(mib)
+}
+
 /// Cold-boots a VM and snapshots it into `paths.templates/name`.
-pub fn create(paths: &Paths, name: &str, vcpus: u32, mem_mib: u64, max_mib: u64, image: Option<ImageMeta>) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+pub fn create(
+    paths: &Paths,
+    name: &str,
+    vcpus: u32,
+    mem_mib: u64,
+    max_mib: u64,
+    plug_mib: u64,
+    image: Option<ImageMeta>,
+) -> Result<()> {
     // Restores swap in each VM's own tap; this one only exists while building.
     let tap = format!("fvtpl{}", std::process::id());
     crate::net::create_tap(&tap)?;
@@ -543,7 +583,7 @@ pub fn create(paths: &Paths, name: &str, vcpus: u32, mem_mib: u64, max_mib: u64,
     // map the old files, which must not be truncated or rewritten under them.
     let staging = format!(".{name}.new-{}", std::process::id());
     let _ = std::fs::remove_dir_all(paths.templates.join(&staging));
-    let res = build(paths, &staging, name, vcpus, mem_mib, max_mib, &tap, image);
+    let res = build(paths, &staging, name, vcpus, mem_mib, max_mib, plug_mib, &tap, image);
     crate::net::delete_tap(&tap);
     let staged = paths.templates.join(&staging);
     let res = res.and_then(|()| publish(paths, name, &staged));
@@ -595,6 +635,7 @@ fn build(
     vcpus: u32,
     mem_mib: u64,
     max_mib: u64,
+    plug_mib: u64,
     tap: &str,
     image: Option<ImageMeta>,
 ) -> Result<()> {
@@ -630,6 +671,7 @@ fn build(
     fc.put("/actions", json!({"action_type": "InstanceStart"}))?;
     retry(Duration::from_secs(30), || guest::ping(&vsock))?;
     let booted = start.elapsed();
+    let plugged = plug(&fc, plug_mib.min(hotplug) / STEP_MIB * STEP_MIB)?;
 
     // Leave as little as possible in the snapshot.
     match &image {
@@ -657,6 +699,7 @@ fn build(
         vcpus,
         mem_mib,
         max_mib: mem_mib + hotplug,
+        plugged_mib: plugged,
         kernel: paths.kernel.clone(),
         rootfs,
         id: String::new(),
@@ -669,8 +712,8 @@ fn build(
     let wset = record_working_set(paths, staging, tap, &sockets)?;
     let size = std::fs::metadata(dir.join("mem"))?.len();
     println!(
-        "template {name} (id {}): {vcpus} vCPUs, {mem_mib} MiB base + {hotplug} MiB hotplug, booted in {} ms, \
-         memory file {} MiB ({} MiB of zeroes punched out), working set {} MiB",
+        "template {name} (id {}): {vcpus} vCPUs, {mem_mib} MiB base + {hotplug} MiB hotplug ({plugged} MiB plugged), \
+         booted in {} ms, memory file {} MiB ({} MiB of zeroes punched out), working set {} MiB",
         meta.id,
         ms(booted),
         size >> 20,
