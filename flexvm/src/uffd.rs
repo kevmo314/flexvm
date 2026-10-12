@@ -43,6 +43,8 @@ const REMOTE_FAULT_RUN: usize = 64;
 /// Pages per background pull request.
 const PULL_RUN: usize = 256;
 const PULL_THREADS: usize = 4;
+/// Threads copying the working set in when it is installed in huge pages.
+const PREFETCH_THREADS: usize = 4;
 
 // From linux/userfaultfd.h.
 const UFFD_EVENT_PAGEFAULT: u8 = 0x12;
@@ -79,7 +81,19 @@ pub struct Mapping {
     pub base_host_virt_addr: u64,
     pub size: usize,
     pub offset: u64,
+    /// Host page size backing the region: 4 KiB, or 2 MiB for hugetlbfs.
+    #[serde(default = "small_page")]
+    pub page_size: usize,
 }
+
+fn small_page() -> usize {
+    PAGE_SIZE
+}
+
+/// Chunk states when guest memory is backed by huge pages.
+const CHUNK_EMPTY: u8 = 0;
+const CHUNK_INFLIGHT: u8 = 1;
+const CHUNK_PRESENT: u8 = 2;
 
 /// Initial page states for a VM migrating in: runs of `[first_page, count, state]`.
 pub type Runs = Vec<(u64, u64, u8)>;
@@ -88,6 +102,10 @@ pub struct Pager {
     base: Arc<Template>,
     mappings: OnceLock<Vec<Mapping>>,
     pages: OnceLock<Vec<AtomicU8>>,
+    /// 4 KiB pages per host page: 1, or 512 with 2 MiB huge pages. Huge pages
+    /// are installed whole, so their state is tracked per chunk as well.
+    gran: OnceLock<usize>,
+    chunks: OnceLock<Vec<AtomicU8>>,
     uffd: OnceLock<OwnedFd>,
     ready: (Mutex<bool>, Condvar),
     /// Firecracker pid, for reading pages out when acting as a migration source.
@@ -97,6 +115,8 @@ pub struct Pager {
     pull_started: OnceLock<Instant>,
     pull_finished: OnceLock<Instant>,
     stop: AtomicBool,
+    /// Page-fault events received from the userfaultfd.
+    pub faults: AtomicUsize,
 }
 
 impl Pager {
@@ -109,6 +129,8 @@ impl Pager {
             base,
             mappings: OnceLock::new(),
             pages: OnceLock::new(),
+            gran: OnceLock::new(),
+            chunks: OnceLock::new(),
             uffd: OnceLock::new(),
             ready: (Mutex::new(false), Condvar::new()),
             pid: AtomicU32::new(0),
@@ -117,6 +139,7 @@ impl Pager {
             pull_started: OnceLock::new(),
             pull_finished: OnceLock::new(),
             stop: AtomicBool::new(false),
+            faults: AtomicUsize::new(0),
         });
         let p = pager.clone();
         thread::Builder::new().name("uffd".into()).spawn(move || {
@@ -161,6 +184,10 @@ impl Pager {
             *self.remote.lock().unwrap() = Some(PageClient::connect(&addr, &vm)?);
         }
         let fresh = self.remote_left() == 0;
+        let gran = mappings.iter().map(|m| m.page_size).max().unwrap_or(PAGE_SIZE).max(PAGE_SIZE) / PAGE_SIZE;
+        let _ = self.gran.set(gran);
+        let chunks = if gran > 1 { (0..total.div_ceil(gran)).map(|_| AtomicU8::new(CHUNK_EMPTY)).collect() } else { Vec::new() };
+        let _ = self.chunks.set(chunks);
         let _ = self.mappings.set(mappings);
         let _ = self.pages.set(pages);
         let _ = self.uffd.set(fd);
@@ -175,6 +202,9 @@ impl Pager {
     /// Copies the template's recorded working set in up front, while the
     /// vCPUs are still being restored, instead of one fault at a time.
     fn prefetch(&self) {
+        if self.gran() > 1 {
+            return self.prefetch_chunks();
+        }
         let pages = self.pages();
         for &(first, count) in &self.base.working_set {
             let (mut i, end) = (first as usize, ((first + count) as usize).min(pages.len()));
@@ -344,7 +374,10 @@ impl Pager {
                         let a = u64::from_ne_bytes(msg[8..16].try_into().unwrap());
                         let b = u64::from_ne_bytes(msg[16..24].try_into().unwrap());
                         match msg[0] {
-                            UFFD_EVENT_PAGEFAULT => pending.push_back(b),
+                            UFFD_EVENT_PAGEFAULT => {
+                                self.faults.fetch_add(1, Ordering::Relaxed);
+                                pending.push_back(b)
+                            }
                             UFFD_EVENT_REMOVE => self.discard(a, b),
                             _ => {}
                         }
@@ -372,6 +405,9 @@ impl Pager {
     }
 
     fn discard(&self, start: u64, end: u64) {
+        if self.gran() > 1 {
+            return self.discard_chunks(start, end);
+        }
         let mut a = start & !(PAGE_SIZE as u64 - 1);
         while a < end {
             if let Some((p, _)) = self.page_of(a) {
@@ -387,6 +423,9 @@ impl Pager {
         let Some((page, m)) = self.page_of(addr) else {
             return Err(io::Error::other("fault outside guest memory"));
         };
+        if self.gran() > 1 {
+            return self.fault_chunk(page / self.gran());
+        }
         let region_end = (m.offset as usize + m.size) / PAGE_SIZE;
         let pages = self.pages();
         match pages[page].load(Ordering::SeqCst) {
@@ -523,6 +562,9 @@ impl Pager {
 
     fn pull(&self, stripe: usize, addr: &str, vm: &str) -> io::Result<()> {
         let mut client = PageClient::connect(addr, vm)?;
+        if self.gran() > 1 {
+            return self.pull_chunks(stripe, &mut client);
+        }
         let pages = self.pages();
         let mut buf = vec![0u8; PULL_RUN * PAGE_SIZE];
         for m in self.mappings() {
@@ -564,6 +606,174 @@ impl Pager {
                     i += n;
                 }
                 chunk += PULL_THREADS * PULL_RUN;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Huge pages: guest memory is installed a whole host page (chunk) at a
+/// time, so a chunk is filled from all of its pages' sources at once.
+impl Pager {
+    fn gran(&self) -> usize {
+        self.gran.get().copied().unwrap_or(1)
+    }
+
+    fn chunks(&self) -> &[AtomicU8] {
+        self.chunks.get().map(|c| c.as_slice()).unwrap_or(&[])
+    }
+
+    /// Claims an empty chunk for filling; returns the state it was in.
+    fn claim(&self, chunk: usize) -> u8 {
+        match self.chunks()[chunk].compare_exchange(CHUNK_EMPTY, CHUNK_INFLIGHT, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(s) | Err(s) => s,
+        }
+    }
+
+    fn fault_chunk(&self, chunk: usize) -> io::Result<()> {
+        match self.claim(chunk) {
+            CHUNK_EMPTY => self.fill(chunk, None),
+            CHUNK_PRESENT => self.wake(chunk * self.gran(), self.gran()),
+            _ => Err(io::Error::from_raw_os_error(libc::EAGAIN)),
+        }
+    }
+
+    /// Fills a claimed chunk from the template, zeroes and the migration
+    /// source (`client`, or the shared fault client) with one UFFDIO_COPY.
+    fn fill(&self, chunk: usize, client: Option<&mut PageClient>) -> io::Result<()> {
+        thread_local! {
+            static BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let gran = self.gran();
+        let pages = self.pages();
+        let first = chunk * gran;
+        let n = gran.min(pages.len() - first);
+        let res = BUF.with(|buf| -> io::Result<usize> {
+            let mut buf = buf.borrow_mut();
+            buf.resize(n * PAGE_SIZE, 0);
+            let mut client = client;
+            let mut remote = 0;
+            let mut i = 0;
+            while i < n {
+                let s = pages[first + i].load(Ordering::SeqCst);
+                let data = s == BASE && self.base.has_data(first + i);
+                let mut j = i + 1;
+                while j < n && {
+                    let t = pages[first + j].load(Ordering::SeqCst);
+                    if s == REMOTE { t == REMOTE } else { t != REMOTE && (t == BASE && self.base.has_data(first + j)) == data }
+                } {
+                    j += 1;
+                }
+                let dst = &mut buf[i * PAGE_SIZE..j * PAGE_SIZE];
+                if s == REMOTE {
+                    let off = ((first + i) * PAGE_SIZE) as u64;
+                    match client.as_deref_mut() {
+                        Some(c) => c.fetch(off, dst)?,
+                        None => {
+                            let mut g = self.remote.lock().unwrap();
+                            g.as_mut().ok_or_else(|| io::Error::other("no migration source"))?.fetch(off, dst)?
+                        }
+                    }
+                    remote += j - i;
+                } else if data {
+                    dst.copy_from_slice(self.base.pages(first + i, j - i));
+                } else {
+                    dst.fill(0);
+                }
+                i = j;
+            }
+            match self.populate(first, n, Some(&buf)) {
+                Err(e) if e.raw_os_error() != Some(libc::EEXIST) => Err(e),
+                _ => Ok(remote),
+            }
+        });
+        match res {
+            Ok(remote) => {
+                for p in &pages[first..first + n] {
+                    p.store(PRESENT, Ordering::SeqCst);
+                }
+                self.chunks()[chunk].store(CHUNK_PRESENT, Ordering::SeqCst);
+                if remote > 0 {
+                    self.pulled(remote);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                self.chunks()[chunk].store(CHUNK_EMPTY, Ordering::SeqCst);
+                Err(e)
+            }
+        }
+    }
+
+    /// Fills every chunk the working set touches, on a few threads.
+    fn prefetch_chunks(&self) {
+        let gran = self.gran();
+        let mut want: Vec<usize> = Vec::new();
+        for &(first, count) in &self.base.working_set {
+            for c in first as usize / gran..=(first + count - 1) as usize / gran {
+                if want.last() != Some(&c) {
+                    want.push(c);
+                }
+            }
+        }
+        want.dedup();
+        let next = AtomicUsize::new(0);
+        thread::scope(|s| {
+            for _ in 0..PREFETCH_THREADS {
+                s.spawn(|| loop {
+                    let i = next.fetch_add(1, Ordering::SeqCst);
+                    let Some(&c) = want.get(i) else { return };
+                    if c < self.chunks().len() && self.claim(c) == CHUNK_EMPTY {
+                        let _ = self.fill(c, None);
+                    }
+                });
+            }
+        });
+    }
+
+    /// Only whole huge pages can be discarded.
+    fn discard_chunks(&self, start: u64, end: u64) {
+        let gran = self.gran();
+        let huge = (gran * PAGE_SIZE) as u64;
+        let mut a = start.next_multiple_of(huge);
+        while a + huge <= end {
+            if let Some((p, _)) = self.page_of(a) {
+                let c = p / gran;
+                for q in &self.pages()[c * gran..(c + 1) * gran] {
+                    if q.swap(ZERO, Ordering::SeqCst) == REMOTE {
+                        self.pulled(1);
+                    }
+                }
+                self.chunks()[c].store(CHUNK_EMPTY, Ordering::SeqCst);
+            }
+            a += huge;
+        }
+    }
+
+    fn pull_chunks(&self, stripe: usize, client: &mut PageClient) -> io::Result<()> {
+        let gran = self.gran();
+        let pages = self.pages();
+        while self.remote_left() > 0 && !self.stop.load(Ordering::SeqCst) {
+            for c in (stripe..self.chunks().len()).step_by(PULL_THREADS) {
+                if self.stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                let end = ((c + 1) * gran).min(pages.len());
+                if !pages[c * gran..end].iter().any(|p| p.load(Ordering::Relaxed) == REMOTE) {
+                    continue;
+                }
+                while self.claim(c) == CHUNK_EMPTY {
+                    match self.fill(c, Some(client)) {
+                        Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => thread::sleep(Duration::from_micros(200)),
+                        r => {
+                            r?;
+                            break;
+                        }
+                    }
+                }
+            }
+            if self.remote_left() > 0 {
+                thread::sleep(Duration::from_millis(1));
             }
         }
         Ok(())

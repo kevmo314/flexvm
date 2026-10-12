@@ -47,6 +47,7 @@ impl Vm {
         vmstate: &Path,
         remote: Option<(Runs, String, String)>,
         ip: Ipv4Addr,
+        huge_pages: &str,
         phases: &mut Phases,
     ) -> Result<(Arc<Vm>, Duration)> {
         let Idle { fc, dir, cgroup, tap } = idle;
@@ -63,6 +64,7 @@ impl Vm {
         let restored = (|| {
             let pager = Pager::start(&dir.join("uffd.sock"), template.clone(), remote)?;
             pager.set_pid(fc.pid());
+            crate::util::trace_mark(&format!("vm {name} pid {}", fc.pid()));
             // Route the VM's address while Firecracker restores; it is not on the critical path.
             let route = {
                 let tap = tap.clone();
@@ -78,6 +80,7 @@ impl Vm {
                     "network_overrides": [{"iface_id": "eth0", "host_dev_name": tap}],
                     "clock_realtime": true,
                     "resume_vm": true,
+                    "huge_pages": huge_pages,
                 }),
             )?;
             // Includes Firecracker's resume: the load request sets resume_vm.
@@ -132,11 +135,10 @@ impl Vm {
         self.fc.lock().unwrap().as_ref().map(|f| f.pid())
     }
 
-    /// Host memory this VM is actually using.
+    /// Host memory this VM is actually using (hugetlb pages are not in VmRSS).
     pub fn rss(&self) -> u64 {
-        self.pid()
-            .and_then(|p| crate::util::proc_kb(&format!("/proc/{p}/status"), "VmRSS"))
-            .unwrap_or(0)
+        let status = |key| self.pid().and_then(|p| crate::util::proc_kb(&format!("/proc/{p}/status"), key)).unwrap_or(0);
+        status("VmRSS") + status("HugetlbPages")
     }
 
     /// Pauses the VM and saves only its device/vCPU state (memory stays put
@@ -154,6 +156,7 @@ impl Vm {
     }
 
     pub fn kill(&self) {
+        crate::util::trace_mark(&format!("kill {} uffd_faults {}", self.name, self.pager.faults.load(std::sync::atomic::Ordering::Relaxed)));
         self.pager.stop();
         if let Some(mut fc) = self.fc.lock().unwrap().take() {
             fc.kill();
@@ -179,6 +182,7 @@ impl Vm {
             "rss_mib": self.rss() >> 20,
             "guest_mib": self.template.meta.mem_mib + hotplug["plugged_size_mib"].as_u64().unwrap_or(0),
             "max_mib": self.template.meta.max_mib,
+            "uffd_faults": self.pager.faults.load(std::sync::atomic::Ordering::Relaxed),
             "pages_mib": {"base": mib(base), "present": mib(present), "zero": mib(zero), "remote": mib(remote + inflight)},
         })
     }

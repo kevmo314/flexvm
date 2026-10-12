@@ -26,7 +26,9 @@ usage:
   flexvm daemon [--listen ADDR] [--advertise ADDR] [--run DIR]
                 [--peer ADDR]... [--reserve MIB] [--pool N]
                 [--vm-ips CIDR|FIRST-LAST] [--underlay IP]
-                [--announce-dev IFACE] [--dns IP]            run the host daemon (root)
+                [--announce-dev IFACE] [--dns IP]
+                [--huge-pages None|2M] [--huge-pages-incoming None|2M]
+                                                             run the host daemon (root)
   flexvm run NAME [--template T] [--ip IP]                   start a VM from a template
   flexvm ls                                                  list VMs
   flexvm exec NAME CMD...                                    run a shell command in a VM
@@ -145,6 +147,8 @@ fn real_main() -> Result<()> {
                 },
                 announce_dev: args.get("announce-dev").map(String::from),
                 dns: args.get("dns").map(String::from),
+                huge_pages: args.get("huge-pages").unwrap_or("None").to_string(),
+                huge_pages_incoming: args.get("huge-pages-incoming").unwrap_or("None").to_string(),
             })
         }
         Some("bench") => bench::run(&host, &args),

@@ -42,6 +42,11 @@ pub struct Config {
     pub underlay: Ipv4Addr,
     /// Answer ARP for local VMs on this interface and announce them when they arrive.
     pub announce_dev: Option<String>,
+    /// Guest memory backing for VMs started here: "None" (4 KiB) or "2M" (hugetlbfs).
+    pub huge_pages: String,
+    /// Backing for VMs migrating in. Post-copy fetches a whole huge page per
+    /// fault, so 4 KiB keeps migration downtime down.
+    pub huge_pages_incoming: String,
     pub dns: Option<String>,
 }
 
@@ -177,7 +182,7 @@ impl Daemon {
         t.mark("claim_ip");
         let restored = self.pool.take().and_then(|idle| {
             t.mark("pool_take");
-            Vm::restore(idle, name, tpl.clone(), &tpl.vmstate(), None, ip, &mut t)
+            Vm::restore(idle, name, tpl.clone(), &tpl.vmstate(), None, ip, &self.cfg.huge_pages, &mut t)
         });
         let (vm, restore) = restored.inspect_err(|_| {
             self.ips.lock().unwrap().remove(&ip);
@@ -415,7 +420,7 @@ impl Daemon {
             let vmstate = idle.dir.join("vmstate.in");
             std::fs::write(&vmstate, &state)?;
             t.mark("write_state");
-            Vm::restore(idle, &name, tpl, &vmstate, Some((runs, source.clone(), name.clone())), ip, &mut t)
+            Vm::restore(idle, &name, tpl, &vmstate, Some((runs, source.clone(), name.clone())), ip, &self.cfg.huge_pages_incoming, &mut t)
         })();
         let (vm, restore) = restored.inspect_err(|_| {
             self.ips.lock().unwrap().remove(&ip);
