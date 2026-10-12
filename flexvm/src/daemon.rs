@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, Read, Write};
-use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, TcpListener, TcpStream, ToSocketAddrs};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -98,7 +98,7 @@ pub fn run(cfg: Config) -> Result<()> {
         ips: Mutex::new(HashSet::new()),
         last_migration: Mutex::new(None),
         migrations: Mutex::new(HashMap::new()),
-        faults: std::env::var_os("FLEXVM_FAULTS").map(|_| Mutex::new(HashMap::new())),
+        faults: std::env::var("FLEXVM_FAULTS").is_ok_and(|v| v == "1").then(|| Mutex::new(HashMap::new())),
     });
     eprintln!("flexvm daemon listening on {} (advertised as {})", d.cfg.listen, d.cfg.advertise);
     {
@@ -477,10 +477,12 @@ impl Daemon {
             let paused = t.mark("checkpoint");
             let state = std::fs::read(&vmstate)?;
             t.mark("read_state");
-            let conn = TcpStream::connect(to)?;
+            let addr = to.to_socket_addrs()?.next().ok_or("bad target address")?;
+            let conn = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
             conn.set_nodelay(true)?;
             // A target that hangs leaves the outcome to `outcome` below.
             conn.set_read_timeout(Some(Duration::from_secs(30)))?;
+            conn.set_write_timeout(Some(Duration::from_secs(30)))?;
             Ok((runs, paused, state, conn))
         })();
         let (runs, paused, state, mut conn) = match prepared {
