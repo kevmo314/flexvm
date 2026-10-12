@@ -164,17 +164,29 @@ Overrides follow `docker run`: `--entrypoint` and `--cmd` (words, or a JSON
 array; a new entrypoint drops the image's command), `--env K=V` (repeatable),
 `--workdir`, `--user name|uid[:group|gid]`.
 
+Images are untrusted input processed as root. Every document and blob is
+checked against its digest before use (layers once more right before they are
+unpacked, and their uncompressed contents against the config's `diff_ids`
+while unpacking), and builds are bounded: `--max-download-mib` (8192, all
+layers compressed), `--max-unpacked-mib` (16384), `--max-file-mib` (4096),
+`--max-entries` (1,000,000), plus 4 MiB per manifest or config and 1 MiB per
+tar metadata entry.
+
 - **Pull.** Native registry v2 client (no docker or skopeo): anonymous bearer
   tokens, or basic credentials from `$DOCKER_CONFIG`, `~/.docker/config.json`
   or, under sudo, the invoking user's. Indexes resolve to linux/amd64. Blobs
   are streamed to `ARTIFACTS/images/blobs/sha256/` and checked against their
   digests; gzip, zstd and uncompressed layers are supported. Archives are read
-  in place (layers are located inside the tarball, not extracted).
+  in place (layers are located inside the tarball, not extracted). Registry
+  credentials go only over HTTPS to the registry itself or its token service
+  (auth.docker.io for Docker Hub); redirects to blob storage carry none.
 - **Root filesystem.** Layers are applied in order as root, with whiteouts and
   opaque directories, ownership, modes, xattrs, device nodes, symlinks and
   hard links. Every path resolves inside the image (`openat2(RESOLVE_IN_ROOT)`),
   so absolute symlinks behave as in a container and a layer cannot write
-  outside it. flexvm adds `/sbin/flexvm-init`, its mount points,
+  outside it; whiteouts must name one entry, and removal walks directory fds.
+  Layers are unpacked in `ARTIFACTS/images/tmp/`, root-owned and 0700, so
+  other users cannot reach their setuid files or device nodes. flexvm adds `/sbin/flexvm-init`, its mount points,
   `/etc/flexvm/app.conf` (argv, env, workdir, uid/gid/groups resolved against
   the image's own `/etc/passwd` and `/etc/group`), an `/etc/hosts`, and an
   empty `/etc/resolv.conf` if the image has none (the daemon's `--dns` fills
@@ -182,7 +194,8 @@ array; a new entrypoint drops the image's command), `--env K=V` (repeatable),
   are cached in `ARTIFACTS/images/rootfs/` by image config digest, flexvm-init
   and overrides, and templates attach the cached file in place, so templates of
   one image share one copy in the page cache (it is never rewritten; deleting it
-  breaks those templates). The template's content ID covers that file as its
+  breaks those templates). Cache entries are published with fsync and rename
+  and only count once their `.ok` marker exists. The template's content ID covers that file as its
   `rootfs` component plus the image's manifest and config digests and the
   app config, so it differs whenever the image does.
 - **Process.** flexvm-init stays PID 1. It starts the entrypoint in its own
@@ -192,13 +205,17 @@ array; a new entrypoint drops the image's command), `--env K=V` (repeatable),
   app exits. There is no restart policy. Nothing beyond the entrypoint is
   assumed: distroless and scratch images work, and `flexvm exec` on an image
   without `/bin/sh` exits 127 with a message saying so. `/dev/stdout` and
-  friends exist, so images that log to them work.
+  friends exist, so images that log to them work. With a non-root `--user`
+  (or image `User`), the app runs with `no_new_privs` and no capabilities in
+  its bounding set, so setuid binaries and file capabilities in the image do
+  not work for it (and cannot make it root again); flexvm-init is not
+  dumpable, so the app cannot ptrace or read it.
 - **When the app starts.** By default at `run`: the snapshot is an idle booted
   guest and `run` sends `APP` after the address is set (`app_start`, ~17 ms
   for nginx), then the app starts as it would anywhere. With `--warm` the
   template starts the app, waits until it is ready (`--ready-port N`: something
   accepts on 127.0.0.1:N in the guest, default the first exposed TCP port;
-  `--ready-cmd CMD`: a shell command exits 0; `--ready-timeout S`, default 120)
+  `--ready-cmd CMD`: a shell command exits 0, killed when the deadline passes; `--ready-timeout S`, default 120)
   and snapshots it running.
 
 > **`--warm` clones share userland state.** Every VM restored from a warm
