@@ -14,7 +14,7 @@ in tens of milliseconds.
 | Memory return | virtio-balloon **free page reporting**: pages the guest frees go back to the host within seconds. |
 | Root filesystem | One read-only ext4 image on virtio-pmem with DAX, shared by every VM through the host page cache. Writes go to a tmpfs overlay inside the guest, so they migrate with memory. |
 | Start | Every VM is a **UFFD restore of a template snapshot** into a pre-spawned, pre-cgrouped Firecracker. The template's recorded working set is copied in bulk; everything else is faulted in lazily from a shared, sparse template image. |
-| Migration | **Post-copy**: pause, save vCPU and device state only (~20–200 KiB), resume on the target, then the target's pager fetches pages from the paused source on fault and in the background. The source releases the VM once every page has arrived. |
+| Migration | **Post-copy**: pause, save vCPU and device state only (~20–200 KiB), resume on the target, then the target's pager fetches pages from the paused source on fault and in the background. The source releases the VM once every page has arrived, and never resumes it once the target may own it. |
 | Pressure | If a VM needs to grow and the host would drop below `--reserve`, or the host is already below it, the daemon migrates that VM to the peer with the most spare memory. |
 | Network | Each VM has its own IPv4 /32 routed to a per-VM tap. The address moves with the VM, so open TCP connections survive migration. See below. |
 
@@ -26,6 +26,42 @@ the migration source), `INFLIGHT` or `PRESENT`. A migration target needs only
 the run-length list of PRESENT and ZERO pages; the source serves PRESENT pages
 straight out of the paused Firecracker with `process_vm_readv`. No memory file
 is written, so the pause does not grow with VM size.
+
+Every install (fault, prefetch, background pull) first claims its pages
+(`INFLIGHT`). A balloon or virtio-mem REMOVE on a claimed page marks it
+`DISCARDED`, so the installer skips it instead of copying stale bytes in or
+marking it PRESENT; failed fetches and copies give their claims back. Copies
+hold a lock that REMOVE handling takes exclusively, and the kernel fails copies
+while a REMOVE is queued, so no data lands in a page the guest has just given
+back. The kernel's zap itself can still come after a page settled PRESENT, so a
+fault on a PRESENT page zero-fills it if it is missing. A checkpoint stops prefetch and waits for claims to
+settle before exporting page states, so they match the saved vmstate. If the
+migration source stays unreachable for 10 s (fetches reconnect with backoff
+until then), the target kills the VM and reports it `failed`.
+
+Pausing Firecracker stops only the vCPUs, so before the state-only snapshot the
+source also brings the VM's tap down (no RX into guest memory), closes host
+exec sessions (vsock) and parks the balloon statistics timer; the target and an
+aborted source put the timer back.
+
+### Migration ownership
+
+Each migration has a random id. Once the target may have received the vmstate,
+the source never resumes on its own: it resumes only on an explicit refusal, or
+when the target, asked about that id, says it aborted (asking also fences the
+id off, so it can never start later). If the target committed, the source stays
+paused and serves memory until the target releases it with the same id;
+release is idempotent and ignores any other VM by that name. If the target
+cannot be asked, the VM stays paused on the source until it can. A daemon
+locks its run directory (refusing to start if another daemon uses it, or one
+inside or around it) and kills any Firecracker a previous instance left there,
+confirming each is dead, before it answers anything, so "never seen this id" is true of a restarted target too
+(a source resuming then rolls the VM back to the pause point; it never runs
+twice).
+
+`FLEXVM_FAULTS=1` lets a daemon accept `{"op": "fault", "fault": F, "ms": N}`
+(`pages`, `route`, `lost_ack`, `status`); `scripts/faults.py` uses it to check
+each failure path.
 
 ### Networking
 

@@ -1,4 +1,6 @@
 use std::io::{self, BufRead, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -37,6 +39,92 @@ pub fn retry<T>(timeout: Duration, mut f: impl FnMut() -> Result<T>) -> Result<T
             Err(e) if start.elapsed() >= timeout => return Err(e),
             Err(_) => std::thread::sleep(Duration::from_micros(200)),
         }
+    }
+}
+
+/// Connects to `addr` within `timeout`, splitting what is left of it evenly
+/// across the addresses not tried yet, so a blackholed one cannot use it all.
+pub fn connect(addr: &str, timeout: Duration) -> io::Result<std::net::TcpStream> {
+    use std::net::ToSocketAddrs;
+    let deadline = Instant::now() + timeout;
+    let addrs: Vec<_> = addr.to_socket_addrs()?.collect();
+    let mut last = io::Error::other(format!("{addr} resolves to no address"));
+    for (i, a) in addrs.iter().enumerate() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        match std::net::TcpStream::connect_timeout(a, left / (addrs.len() - i) as u32) {
+            Ok(s) => return Ok(s),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
+/// Connects to the unix socket at `path` within `timeout`, with reads and
+/// writes on it timing out after `timeout` too. (A blocking connect waits
+/// for as long as the listener's backlog stays full.)
+pub fn connect_unix(path: &std::path::Path, timeout: Duration) -> io::Result<UnixStream> {
+    use std::os::unix::ffi::OsStrExt;
+    let deadline = Instant::now() + timeout;
+    let mut sa: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    sa.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.len() >= sa.sun_path.len() {
+        return Err(io::Error::other("socket path too long"));
+    }
+    for (d, s) in sa.sun_path.iter_mut().zip(bytes) {
+        *d = *s as libc::c_char;
+    }
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+    // A non-blocking unix connect fails with EAGAIN while the backlog is full.
+    while unsafe { libc::connect(fd.as_raw_fd(), &sa as *const _ as *const libc::sockaddr, len) } < 0 {
+        let e = io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::EAGAIN) || Instant::now() >= deadline {
+            return Err(e);
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let s = UnixStream::from(fd);
+    s.set_nonblocking(false)?;
+    s.set_read_timeout(Some(timeout))?;
+    s.set_write_timeout(Some(timeout))?;
+    Ok(s)
+}
+
+/// A pidfd for `pid`: it keeps naming that process even once the pid is reused.
+pub fn pidfd_open(pid: u32) -> io::Result<OwnedFd> {
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
+}
+
+/// SIGKILLs the process behind `pidfd`; one that already exited is fine.
+pub fn pidfd_kill(pidfd: &OwnedFd) -> io::Result<()> {
+    let null = std::ptr::null::<libc::siginfo_t>();
+    if unsafe { libc::syscall(libc::SYS_pidfd_send_signal, pidfd.as_raw_fd(), libc::SIGKILL, null, 0) } < 0 {
+        let e = io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::ESRCH) {
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+/// Waits up to `timeout` for the process behind `pidfd` to exit.
+pub fn pidfd_wait(pidfd: &OwnedFd, timeout: Duration) -> io::Result<bool> {
+    let mut pfd = libc::pollfd { fd: pidfd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+    match unsafe { libc::poll(&mut pfd, 1, timeout.as_millis().min(i32::MAX as u128) as i32) } {
+        n if n < 0 => Err(io::Error::last_os_error()),
+        n => Ok(n > 0),
     }
 }
 
