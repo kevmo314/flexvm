@@ -145,7 +145,7 @@ fn reap(statuses: Statuses) {
         }
         if pid < 0 {
             match io::Error::last_os_error().raw_os_error() {
-                Some(libc::ECHILD) => { drop(cv.wait(map).unwrap()); }
+                Some(libc::ECHILD) => drop(cv.wait(map).unwrap()),
                 Some(libc::EINTR) => {}
                 _ => return,
             }

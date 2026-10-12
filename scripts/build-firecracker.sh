@@ -10,6 +10,11 @@ patches=$(cd "$root/firecracker" && sha256sum -- *.patch)
 patched=$(printf '%s\n%s\n' "$FC_VERSION" "$patches")
 
 if [ ! -f "$stamp" ] || [ "$(cat "$stamp")" != "$patched" ]; then
+  # Only replace our own checkout; a user-supplied FC_SRC is never deleted.
+  if [ -n "${FC_SRC:-}" ] && [ -e "$src" ]; then
+    echo "$src is not a $FC_VERSION tree patched by this script; remove it or unset FC_SRC" >&2
+    exit 1
+  fi
   rm -rf -- "$src"
   git clone -q --depth 1 --branch "$FC_VERSION" https://github.com/firecracker-microvm/firecracker.git "$src"
   for p in "$root"/firecracker/*.patch; do
