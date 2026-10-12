@@ -5,9 +5,9 @@ that the VM ends up running on exactly one host (md5 of a guest file intact)
 or cleanly failed.
 
 usage: scripts/faults.py [--a ADDR] [--b ADDR] [--bin FLEXVM] [--log-dir DIR] SCENARIO... | all
-  'all' runs the scenarios that leave both daemons running; source_killed and
-  target_restart kill a daemon with SIGKILL and restart it with the same
-  command line and environment (logging to --log-dir).
+  'all' runs the scenarios that leave both daemons running; source_killed,
+  target_restart and target_restart_symlink kill a daemon with SIGKILL and
+  restart it with the same command line and environment (logging to --log-dir).
 """
 import argparse, json, os, socket, subprocess, sys, tempfile, threading, time
 
@@ -135,15 +135,13 @@ def kill_daemon(host):
 def start_daemon(host, argv, env):
     log = open(os.path.join(args.log_dir, f"flexvm-{host.replace(':', '_')}.log"), "a")
     subprocess.Popen(["sudo", "env", *env, "setsid", *argv], stdout=log, stderr=log, stdin=subprocess.DEVNULL)
-    check(f"restarted daemon on {host}", wait_for(lambda: rpc(host, {"op": "info"}, timeout=2).get("ok") if can_connect(host) else False, 30))
+    def up():
+        try:
+            return rpc(host, {"op": "info"}, timeout=15).get("ok")
+        except OSError:
+            return False
 
-
-def can_connect(host):
-    try:
-        socket.create_connection(tuple([host.rsplit(":", 1)[0], int(host.rsplit(":", 1)[1])]), timeout=1).close()
-        return True
-    except OSError:
-        return False
+    check(f"restarted daemon on {host}", wait_for(up, 30))
 
 
 def firecrackers(run_dir):
@@ -152,8 +150,9 @@ def firecrackers(run_dir):
     for pid in subprocess.run(["pgrep", "-x", "firecracker"], capture_output=True, text=True).stdout.split():
         argv = proc(pid, "cmdline").split(b"\0")
         for a in argv:
-            if a.startswith(run_dir.encode() + b"/"):
-                out[pid] = os.path.dirname(a.decode())
+            d = os.path.realpath(os.path.dirname(a.decode(errors="replace")))
+            if d.startswith(os.path.realpath(run_dir) + "/"):
+                out[pid] = d
     return out
 
 
@@ -422,11 +421,59 @@ def exec_race():
     cleanup(n)
 
 
+def target_restart_symlink():
+    """target_restart with the target's --run given through a symlink."""
+    argv, env = kill_daemon(B)
+    i = argv.index("--run") + 1
+    link = os.path.realpath(argv[i]) + "-link"
+    subprocess.run(["sudo", "ln", "-sfn", os.path.realpath(argv[i]), link], check=True)
+    start_daemon(B, argv[:i] + [link] + argv[i + 1:], env)
+    try:
+        target_restart()
+    finally:
+        kill_daemon(B)
+        start_daemon(B, argv, env)
+        subprocess.run(["sudo", "rm", "-f", link])
+
+
+def guest_hang():
+    """A guest that never answers its agent (Firecracker stopped) must not
+    hold the admission lock forever: execs fail within their deadline, and
+    once it is back, the VM still runs and migrates."""
+    n = "ft-guest-hang"
+    m = setup(n)
+    fcs = [pid for pid, d in firecrackers(run_dir(A)).items() if os.path.exists(os.path.join(d, "v.sock"))]
+    check("guest hang: found the VM's firecracker", len(fcs) == 1, fcs)
+    subprocess.run(["sudo", "kill", "-STOP", fcs[0]])
+    times = []
+
+    def one():
+        t = time.time()
+        try:
+            r = subprocess.run([BIN, "--host", A, "exec", n, "echo hi"], capture_output=True, text=True, timeout=60)
+            times.append((round(time.time() - t, 1), r.returncode))
+        except subprocess.TimeoutExpired:
+            times.append((None, None))
+
+    execs = [threading.Thread(target=one) for _ in range(3)]
+    for e in execs:
+        e.start()
+    for e in execs:
+        e.join()
+    subprocess.run(["sudo", "kill", "-CONT", fcs[0]])
+    check("guest hang: every exec gave up within its deadline", all(t is not None and t < 20 and c != 0 for t, c in times), times)
+    check("guest hang: exec works again", sh(A, n, "echo hi") == (0, "hi"))
+    ok(A, {"op": "migrate", "name": n, "to": B})
+    wait_released(B, n)
+    check("guest hang: migrates afterwards, md5 intact", where(n) == {B: "running"} and md5(B, n) == m, where(n))
+    cleanup(n)
+
+
 SCENARIOS = dict(basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, refused=refused, pages_blip=pages_blip,
                  pages_dead_restore=pages_dead_restore, pages_dead=pages_dead, quiet_source=quiet_source,
                  shared_run_dir=shared_run_dir, exec_race=exec_race, source_killed=source_killed,
-                 target_restart=target_restart)
-safe = [s for s in SCENARIOS if s not in ("source_killed", "target_restart")]
+                 target_restart=target_restart, target_restart_symlink=target_restart_symlink, guest_hang=guest_hang)
+safe = [s for s in SCENARIOS if s not in ("source_killed", "target_restart", "target_restart_symlink")]
 names = [n for s in args.scenarios for n in (safe if s == "all" else [s])]
 for s in names:
     SCENARIOS[s]()
