@@ -51,6 +51,8 @@ const REMOTE_FAULT_RUN: usize = 64;
 /// Pages per background pull request.
 const PULL_RUN: usize = 256;
 const PULL_THREADS: usize = 4;
+/// How long a fault may keep failing (other than EAGAIN) before the pager gives up.
+const FAULT_TIMEOUT: Duration = Duration::from_secs(1);
 /// How long the migration source may stay unreachable before the pager gives up.
 const SOURCE_TIMEOUT: Duration = Duration::from_secs(10);
 const BACKOFF_MIN: Duration = Duration::from_millis(10);
@@ -249,6 +251,8 @@ pub struct Pager {
     ready: (Mutex<bool>, Condvar),
     /// Firecracker pid, for reading pages out when acting as a migration source.
     pid: AtomicU32,
+    /// Firecracker as a pidfd, so killing it never hits a reused pid.
+    pidfd: OnceLock<OwnedFd>,
     remote: Mutex<Option<Link>>,
     remote_left: AtomicUsize,
     pull_started: OnceLock<Instant>,
@@ -274,6 +278,7 @@ impl Pager {
             uffd: OnceLock::new(),
             ready: (Mutex::new(false), Condvar::new()),
             pid: AtomicU32::new(0),
+            pidfd: OnceLock::new(),
             remote: Mutex::new(None),
             remote_left: AtomicUsize::new(0),
             pull_started: OnceLock::new(),
@@ -287,10 +292,7 @@ impl Pager {
         thread::Builder::new().name("uffd".into()).spawn(move || {
             let prefetch = match p.handshake(&listener, initial) {
                 Ok(prefetch) => prefetch,
-                Err(e) => {
-                    eprintln!("uffd handshake failed: {e}");
-                    return;
-                }
+                Err(e) => return p.fail(format!("uffd handshake failed: {e}")),
             };
             // Prefetch alongside fault handling: Firecracker itself touches guest
             // memory while restoring devices and must not wait behind it.
@@ -312,13 +314,10 @@ impl Pager {
         let pages = Pages::new(total);
         if let Some((runs, source)) = initial {
             let _ = self.pull_started.set(Instant::now());
-            let mut remote = 0;
+            let remote = remote_pages(&runs, total)?;
             for (first, count, state) in runs {
                 for p in first as usize..(first + count) as usize {
                     pages.set(p, state);
-                }
-                if state == REMOTE {
-                    remote += count as usize;
                 }
             }
             self.remote_left.store(remote, Ordering::SeqCst);
@@ -422,6 +421,10 @@ impl Pager {
 
     pub fn set_pid(&self, pid: u32) {
         self.pid.store(pid, Ordering::SeqCst);
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+        if fd >= 0 {
+            let _ = self.pidfd.set(unsafe { OwnedFd::from_raw_fd(fd as RawFd) });
+        }
     }
 
     pub fn stop(&self) {
@@ -431,17 +434,14 @@ impl Pager {
 
     /// Gives up on the VM's memory: unless it was stopped on purpose, records
     /// why and kills Firecracker, whose vCPUs (or snapshot load) may be
-    /// blocked on pages that will never come. Its pid cannot have been reused:
-    /// the daemon has not reaped it yet.
+    /// blocked on pages that will never come.
     fn fail(&self, why: String) {
         if !self.stop.load(Ordering::SeqCst) {
             eprintln!("uffd: {why}; killing the vm");
             let _ = self.failed.set(why);
-            match self.pid.load(Ordering::SeqCst) {
-                0 => {}
-                pid => unsafe {
-                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
-                },
+            if let Some(fd) = self.pidfd.get() {
+                let null = std::ptr::null::<libc::siginfo_t>();
+                unsafe { libc::syscall(libc::SYS_pidfd_send_signal, fd.as_raw_fd(), libc::SIGKILL, null, 0) };
             }
         }
         self.stop();
@@ -555,7 +555,8 @@ impl Pager {
             self.clone().spawn_pullers();
         }
         let fd = self.fd();
-        let mut pending: VecDeque<u64> = VecDeque::new();
+        // Faults to retry, with when they first failed other than with EAGAIN.
+        let mut pending: VecDeque<(u64, Option<Instant>)> = VecDeque::new();
         let mut buf = [0u8; 32 * 64];
         while !self.stop.load(Ordering::SeqCst) {
             let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
@@ -574,7 +575,7 @@ impl Pager {
                         let a = u64::from_ne_bytes(msg[8..16].try_into().unwrap());
                         let b = u64::from_ne_bytes(msg[16..24].try_into().unwrap());
                         match msg[0] {
-                            UFFD_EVENT_PAGEFAULT => pending.push_back(b),
+                            UFFD_EVENT_PAGEFAULT => pending.push_back((b, None)),
                             UFFD_EVENT_REMOVE => self.discard(&removing, a, b),
                             _ => {}
                         }
@@ -582,13 +583,22 @@ impl Pager {
                 }
             }
             // Retry faults that hit EAGAIN once the events ahead of them are drained.
+            // Other errors (say ENOMEM) are retried for a while: a dropped
+            // fault would block its vCPU forever.
             for _ in 0..pending.len() {
-                let addr = pending.pop_front().unwrap();
+                let (addr, since) = pending.pop_front().unwrap();
                 match self.fault(addr) {
                     Ok(()) => {}
-                    Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => pending.push_back(addr),
+                    Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => pending.push_back((addr, since)),
                     Err(e) if e.kind() == io::ErrorKind::TimedOut => return self.fail(e.to_string()),
-                    Err(e) => eprintln!("uffd: fault at {addr:#x}: {e}"),
+                    Err(e) => match since {
+                        None => {
+                            eprintln!("uffd: fault at {addr:#x}: {e}; retrying");
+                            pending.push_back((addr, Some(Instant::now())));
+                        }
+                        Some(t) if t.elapsed() < FAULT_TIMEOUT => pending.push_back((addr, since)),
+                        Some(_) => return self.fail(format!("fault at {addr:#x}: {e}")),
+                    },
                 }
             }
         }
@@ -635,8 +645,10 @@ impl Pager {
                     None => Err(io::Error::other("no migration source")),
                 };
                 if let Err(e) = fetched {
-                    self.pulled(pages.release(page, n, REMOTE));
-                    return Err(e);
+                    let resolved = pages.release(page, n, REMOTE);
+                    self.pulled(resolved);
+                    // All discarded meanwhile: nothing left to fetch, serve the fault again.
+                    return Err(if resolved == n { eagain() } else { e });
                 }
                 let src = |p: usize, c: usize| &buf[(p - page) * PAGE_SIZE..(p - page + c) * PAGE_SIZE];
                 let (resolved, res) = pages.install(page, n, REMOTE, None, |p, c| self.populate(p, c, Some(src(p, c))));
@@ -724,8 +736,14 @@ impl Pager {
                     }
                     let b = &mut buf[..n * PAGE_SIZE];
                     if let Err(e) = link.fetch((i * PAGE_SIZE) as u64, b, Some(&self.stop)) {
-                        self.pulled(pages.release(i, n, REMOTE));
-                        return Err(e);
+                        let resolved = pages.release(i, n, REMOTE);
+                        self.pulled(resolved);
+                        if resolved < n {
+                            return Err(e);
+                        }
+                        // All discarded meanwhile.
+                        i += n;
+                        continue;
                     }
                     let src = |p: usize, c: usize| &b[(p - i) * PAGE_SIZE..(p - i + c) * PAGE_SIZE];
                     let (resolved, res) =
@@ -864,6 +882,24 @@ pub fn serve_pages(pager: &Pager, mut stream: impl Read + Write, down: impl Fn()
             }
         }
     }
+}
+
+/// Checks page runs from a migration source (ascending, disjoint, in bounds,
+/// and only states a source exports) and counts their REMOTE pages.
+fn remote_pages(runs: &Runs, total: usize) -> Result<usize> {
+    let (mut next, mut remote) = (0, 0);
+    for &(first, count, state) in runs {
+        match first.checked_add(count) {
+            Some(end) if first >= next && count > 0 && end <= total as u64 && (state == REMOTE || state == ZERO) => {
+                next = end;
+                if state == REMOTE {
+                    remote += count as usize;
+                }
+            }
+            _ => bail!("bad page run {:?}", (first, count, state)),
+        }
+    }
+    Ok(remote)
 }
 
 /// Receives Firecracker's handshake: a JSON body plus the uffd over SCM_RIGHTS.
@@ -1029,6 +1065,23 @@ mod tests {
         let (_, res) = p.install(0, 2, BASE, None, |_, _| Err(os(libc::ENOMEM)));
         assert!(res.is_err());
         assert_eq!(states(&p), [ZERO, BASE]);
+    }
+
+    #[test]
+    fn incoming_runs_are_validated() {
+        assert_eq!(remote_pages(&vec![(0, 2, REMOTE), (2, 3, ZERO), (8, 2, REMOTE)], 10).unwrap(), 4);
+        for bad in [
+            vec![(0, 2, REMOTE), (1, 2, REMOTE)],
+            vec![(4, 2, REMOTE), (0, 2, REMOTE)],
+            vec![(9, 2, REMOTE)],
+            vec![(u64::MAX, 2, REMOTE)],
+            vec![(0, 0, REMOTE)],
+            vec![(0, 1, INFLIGHT)],
+            vec![(0, 1, DISCARDED)],
+            vec![(0, 1, PRESENT)],
+        ] {
+            assert!(remote_pages(&bad, 10).is_err(), "{bad:?}");
+        }
     }
 
     /// Random interleavings of claims, REMOVEs (including while a claim's

@@ -105,10 +105,10 @@ impl Vm {
         let (pager, took) = match restored {
             Ok(r) => r,
             Err(e) => {
-                drop(fc);
                 if let Ok(pager) = pager {
                     pager.stop();
                 }
+                drop(fc);
                 crate::net::delete_tap(&tap);
                 let _ = std::fs::remove_dir_all(&dir);
                 return Err(e);
