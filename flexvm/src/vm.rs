@@ -1,7 +1,7 @@
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -10,7 +10,7 @@ use crate::bail;
 use crate::fc::{Firecracker, Idle};
 use crate::template::Template;
 use crate::uffd::{Pager, Runs};
-use crate::util::{Result, PAGE_SIZE};
+use crate::util::{Phases, Result, PAGE_SIZE};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
@@ -30,6 +30,8 @@ pub struct Vm {
     pub last_resize: Mutex<Instant>,
     /// Needs more memory than this host can give it.
     pub starved: AtomicBool,
+    /// Migration target only: the source's answer to `release`, true or an error.
+    pub released: OnceLock<Value>,
     fc: Mutex<Option<Firecracker>>,
     cgroup: Option<PathBuf>,
 }
@@ -37,7 +39,7 @@ pub struct Vm {
 impl Vm {
     /// Restores `vmstate` into an idle Firecracker, with guest memory served
     /// by a pager over `template` plus `remote` pages when migrating in, and
-    /// `ip` routed to the VM's tap.
+    /// `ip` routed to the VM's tap. Marks each step in `phases`.
     pub fn restore(
         idle: Idle,
         name: &str,
@@ -45,6 +47,7 @@ impl Vm {
         vmstate: &Path,
         remote: Option<(Runs, String, String)>,
         ip: Ipv4Addr,
+        phases: &mut Phases,
     ) -> Result<(Arc<Vm>, Duration)> {
         let Idle { fc, dir, cgroup, tap } = idle;
         // Name the cgroup after the VM; renaming is free, joining is not.
@@ -56,6 +59,7 @@ impl Vm {
                 Err(_) => cg,
             }
         });
+        phases.mark("cgroup_rename");
         let restored = (|| {
             let pager = Pager::start(&dir.join("uffd.sock"), template.clone(), remote)?;
             pager.set_pid(fc.pid());
@@ -64,7 +68,7 @@ impl Vm {
                 let tap = tap.clone();
                 std::thread::spawn(move || crate::net::attach(ip, &tap))
             };
-            let start = Instant::now();
+            phases.mark("pager_start");
             fc.put(
                 "/snapshot/load",
                 json!({
@@ -76,9 +80,11 @@ impl Vm {
                     "resume_vm": true,
                 }),
             )?;
-            let took = start.elapsed();
+            // Includes Firecracker's resume: the load request sets resume_vm.
+            let took = phases.mark("snapshot_load");
             pager.wait_ready(Duration::from_secs(5))?;
             route.join().map_err(|_| "route thread panicked")??;
+            phases.mark("route_wait");
             Ok((pager, took))
         })();
         let (pager, took) = match restored {
@@ -100,6 +106,7 @@ impl Vm {
             state: Mutex::new(State::Running),
             last_resize: Mutex::new(Instant::now()),
             starved: AtomicBool::new(false),
+            released: OnceLock::new(),
             fc: Mutex::new(Some(fc)),
             cgroup,
         });

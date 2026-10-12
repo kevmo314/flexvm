@@ -1,3 +1,4 @@
+mod bench;
 mod daemon;
 mod fc;
 mod guest;
@@ -8,8 +9,9 @@ mod util;
 mod vm;
 
 use std::io::{BufReader, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
@@ -29,6 +31,7 @@ usage:
   flexvm ls                                                  list VMs
   flexvm exec NAME CMD...                                    run a shell command in a VM
   flexvm migrate NAME --to ADDR                              live-migrate a VM to another daemon
+  flexvm bench [--to ADDR] [--iterations N] [--dirty-mib N]  per-phase run/migrate latency into bench/
   flexvm kill NAME                                           stop a VM
 
 options:
@@ -144,6 +147,7 @@ fn real_main() -> Result<()> {
                 dns: args.get("dns").map(String::from),
             })
         }
+        Some("bench") => bench::run(&host, &args),
         Some("run") => print(call(
             &host,
             json!({"op": "run", "name": name, "template": args.get("template").unwrap_or("default"), "ip": args.get("ip")}),
@@ -166,7 +170,26 @@ fn real_main() -> Result<()> {
 }
 
 fn call(host: &str, req: Value) -> Result<Value> {
-    let mut c = TcpStream::connect(host).map_err(|e| format!("connect to daemon at {host}: {e}"))?;
+    let c = TcpStream::connect(host).map_err(|e| format!("connect to daemon at {host}: {e}"))?;
+    rpc_reply(c, req)
+}
+
+fn call_with_timeout(host: &str, req: Value, timeout: Duration) -> Result<Value> {
+    let mut error = None;
+    for addr in host.to_socket_addrs()? {
+        match TcpStream::connect_timeout(&addr, timeout) {
+            Ok(c) => {
+                c.set_read_timeout(Some(timeout))?;
+                c.set_write_timeout(Some(timeout))?;
+                return rpc_reply(c, req);
+            }
+            Err(e) => error = Some(e),
+        }
+    }
+    Err(format!("connect to daemon at {host}: {}", error.map(|e| e.to_string()).unwrap_or_else(|| "no addresses".into())).into())
+}
+
+fn rpc_reply(mut c: TcpStream, req: Value) -> Result<Value> {
     send_json(&mut c, &req)?;
     let reply = recv_json(&mut BufReader::new(c))?.ok_or("daemon hung up")?;
     if reply["ok"] != json!(true) {
