@@ -5,7 +5,9 @@
 //! Everything is cached by digest under the cache directory:
 //! `blobs/sha256/<hex>` for registry blobs and `rootfs/<key>.ext4` for built
 //! filesystems, where the key covers the image config digest, the
-//! flexvm-init binary and the overrides.
+//! flexvm-init binary and the overrides. Templates attach the cached
+//! filesystem in place (it is never rewritten), so every template of one
+//! image shares one copy in the page cache; deleting it breaks them.
 
 pub mod reference;
 mod registry;
@@ -34,6 +36,8 @@ pub struct ImageMeta {
     /// which has none, the config digest).
     pub digest: String,
     pub config_digest: String,
+    /// `/etc/flexvm/app.conf` as written into the root filesystem.
+    pub app_conf: String,
     /// What flexvm-init runs: entrypoint followed by command.
     pub argv: Vec<String>,
     /// Started before the snapshot (true) or on every `run` (false).
@@ -130,8 +134,8 @@ fn app_config(config: &Value, o: &Options) -> Result<App> {
 }
 
 /// Builds (or finds in the cache) the root filesystem for `o.image` and
-/// links it to `out`. `init` is the static flexvm-init binary.
-pub fn prepare(cache: &Path, init: &Path, o: &Options, out: &Path) -> Result<ImageMeta> {
+/// returns its path. `init` is the static flexvm-init binary.
+pub fn prepare(cache: &Path, init: &Path, o: &Options) -> Result<(PathBuf, ImageMeta)> {
     let img = source::fetch(cache, &o.image)?;
     let config: Value = serde_json::from_slice(&img.config)?;
     let (os, arch) = (config["os"].as_str().unwrap_or("linux"), config["architecture"].as_str().unwrap_or("amd64"));
@@ -152,27 +156,25 @@ pub fn prepare(cache: &Path, init: &Path, o: &Options, out: &Path) -> Result<Ima
         json!({"v": 1, "config": img.config_digest, "init": sha256_hex(&init_bytes), "options": o}).to_string().as_bytes(),
     );
     let cached = cache.join("rootfs").join(format!("{}.ext4", &key["sha256:".len()..]));
-    if cached.exists() {
+    // The app config written into it, kept beside it for the template's id.
+    let conf_path = cached.with_extension("conf");
+    if cached.exists() && conf_path.exists() {
         eprintln!("image: root filesystem cached at {}", cached.display());
     } else {
-        build_rootfs(cache, &img, &app, &init_bytes, &cached)?;
+        let conf = build_rootfs(cache, &img, &app, &init_bytes, &cached)?;
+        std::fs::write(&conf_path, conf)?;
     }
-    // A hard link shares one inode, and so one page cache, between templates.
-    let tmp = out.with_extension("tmp");
-    let _ = std::fs::remove_file(&tmp);
-    if std::fs::hard_link(&cached, &tmp).is_err() {
-        std::fs::copy(&cached, &tmp)?;
-    }
-    std::fs::rename(&tmp, out)?;
-    Ok(ImageMeta {
+    let app_conf = std::fs::read_to_string(&conf_path)?;
+    Ok((cached, ImageMeta {
         source: o.image.clone(),
         digest: img.digest,
         config_digest: img.config_digest,
+        app_conf,
         argv: app.argv,
         warm: o.warm,
         ready,
         ready_timeout: o.ready_timeout,
-    })
+    }))
 }
 
 /// Warm templates: starts the app in the template VM and waits until it is
@@ -202,7 +204,7 @@ pub fn warm_up(vsock: &Path, meta: &ImageMeta) -> Result<()> {
 
 /// The app's buffered output and its final status line.
 pub fn read_logs(vsock: &Path) -> Result<(Vec<u8>, String)> {
-    let mut r = guest::start_logs(vsock, 0, false)?;
+    let mut r = guest::start_logs(vsock, 0, false, guest::TIMEOUT)?;
     let mut out = Vec::new();
     while let Some((kind, data)) = guest::read_frame(&mut r)? {
         match kind {
@@ -213,7 +215,8 @@ pub fn read_logs(vsock: &Path) -> Result<(Vec<u8>, String)> {
     bail!("guest closed the connection while sending logs")
 }
 
-fn build_rootfs(cache: &Path, img: &source::Image, app: &App, init: &[u8], dest: &Path) -> Result<()> {
+/// Returns the app.conf it wrote.
+fn build_rootfs(cache: &Path, img: &source::Image, app: &App, init: &[u8], dest: &Path) -> Result<String> {
     let work = cache.join("tmp").join(format!("rootfs-{}", std::process::id()));
     if work.exists() {
         std::fs::remove_dir_all(&work)?;
@@ -227,8 +230,9 @@ fn build_rootfs(cache: &Path, img: &source::Image, app: &App, init: &[u8], dest:
             eprintln!("image: applying layer {}/{} {}", i + 1, img.layers.len(), layer.name());
             root.apply_layer(unpack::decompress(layer.open()?)?).map_err(|e| format!("layer {}: {e}", layer.name()))?;
         }
-        inject(&mut root, app, init)?;
-        mkfs(&work, root.entries, dest)
+        let conf = inject(&mut root, app, init)?;
+        mkfs(&work, root.entries, dest)?;
+        Ok(conf)
     })();
     let _ = std::fs::remove_dir_all(&work);
     res
@@ -240,7 +244,7 @@ fn escape(s: &str) -> String {
 
 /// Adds what flexvm-init needs to boot and run the app: its mount points,
 /// itself, `/etc/flexvm/app.conf`, and sensible `/etc/hosts` and `/etc/resolv.conf`.
-fn inject(root: &mut Root, app: &App, init: &[u8]) -> Result<()> {
+fn inject(root: &mut Root, app: &App, init: &[u8]) -> Result<String> {
     for (dir, mode) in [
         ("proc", 0o555),
         ("sys", 0o555),
@@ -286,7 +290,8 @@ fn inject(root: &mut Root, app: &App, init: &[u8]) -> Result<()> {
     }
     conf += &format!("cwd {}\nuid {uid}\ngid {gid}\n", escape(&app.workdir));
     conf += &format!("groups {}\n", groups.iter().map(|g| g.to_string()).collect::<Vec<_>>().join(" "));
-    root.write_file("etc/flexvm/app.conf", conf.as_bytes(), 0o644)
+    root.write_file("etc/flexvm/app.conf", conf.as_bytes(), 0o644)?;
+    Ok(conf)
 }
 
 /// Resolves an image `User` (`name`, `uid`, `name:group`, `uid:gid`) against

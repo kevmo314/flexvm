@@ -1,11 +1,11 @@
 //! The container image's entrypoint, supervised by flexvm-init.
 //!
 //! Image templates carry `/etc/flexvm/app.conf`, written at build time from
-//! the image config. The host starts the app with `START` (at `run`, or at
+//! the image config. The host starts the app with `APP` (at `run`, or at
 //! template time for warm templates). flexvm-init reaps it like any child,
 //! records its exit status and keeps its stdout and stderr in a bounded ring.
 //!
-//! Requests: `START`, `STATUS`, `LOGS <offset> <follow 0|1>`, `PROBE <port>`
+//! Requests: `APP`, `APPSTATUS`, `LOGS <offset> <follow 0|1>`, `PROBE <port>`
 //! and `QUIESCE`. Replies are frames, as for the other requests.
 //!
 //! app.conf is one `key value` per line; values escape `\` and newline as
@@ -28,7 +28,7 @@ const CONF: &str = "/etc/flexvm/app.conf";
 /// Bytes of app output kept for `LOGS`; older output is dropped.
 const RING_BYTES: usize = 1 << 20;
 
-pub const VERBS: [&str; 5] = ["START", "STATUS", "LOGS", "PROBE", "QUIESCE"];
+pub const VERBS: [&str; 5] = ["APP", "APPSTATUS", "LOGS", "PROBE", "QUIESCE"];
 
 #[derive(Clone, Copy)]
 enum State {
@@ -69,14 +69,14 @@ impl App {
 
 pub fn handle(verb: &str, arg: &str, out: &Mutex<File>, statuses: &Statuses) -> io::Result<()> {
     match verb {
-        "START" => {
+        "APP" => {
             let reply = match start(statuses) {
                 Ok(pid) => format!("ok {pid}"),
                 Err(e) => format!("error: {e}"),
             };
             frame(out, FRAME_MSG, reply.as_bytes())
         }
-        "STATUS" => frame(out, FRAME_MSG, APP.lock().unwrap().status().as_bytes()),
+        "APPSTATUS" => frame(out, FRAME_MSG, APP.lock().unwrap().status().as_bytes()),
         "LOGS" => {
             let mut a = arg.split_whitespace();
             let offset = a.next().and_then(|s| s.parse().ok()).unwrap_or(0);

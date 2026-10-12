@@ -16,6 +16,7 @@ use serde_json::json;
 use crate::bail;
 use crate::fc::Firecracker;
 use crate::guest;
+use crate::image::ImageMeta;
 use crate::uffd::Pager;
 use crate::util::{ms, retry, Result, PAGE_SIZE};
 
@@ -43,6 +44,9 @@ pub struct Meta {
     pub id: String,
     #[serde(default)]
     components: BTreeMap<String, Component>,
+    /// Set for templates built from a container image; part of the content id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<ImageMeta>,
 }
 
 pub const FORMAT_VERSION: u64 = 2;
@@ -150,12 +154,20 @@ fn hash_file(path: &Path) -> Result<Component> {
     Ok(Component { hash, metadata })
 }
 
-fn content_id(components: &BTreeMap<String, Component>) -> String {
+/// Image templates also cover the image's identity and the app config; the
+/// root filesystem built from the image is the `rootfs` component.
+fn content_id(components: &BTreeMap<String, Component>, image: Option<&ImageMeta>) -> String {
     let mut hash = Hash::new();
     hash.word(FORMAT_VERSION);
     for (name, component) in components {
         hash.update(name.as_bytes());
         hash.update(component.hash.as_bytes());
+    }
+    if let Some(i) = image {
+        for part in ["image", &i.digest, &i.config_digest, &i.app_conf] {
+            hash.update(part.as_bytes());
+        }
+        hash.word(i.warm as u64);
     }
     hash.finish()
 }
@@ -175,7 +187,7 @@ impl Meta {
         for (name, path) in self.files(paths, dir) {
             self.components.insert(name.into(), hash_file(&path)?);
         }
-        self.id = content_id(&self.components);
+        self.id = content_id(&self.components, self.image.as_ref());
         Ok(())
     }
 
@@ -183,7 +195,7 @@ impl Meta {
     /// matches `cache` (or the stamp from creation) are trusted; others are
     /// rehashed if `rehash`, else rejected. Returns whether anything was rehashed.
     fn verify(&self, paths: &Paths, dir: &Path, cache: &mut BTreeMap<String, Stamp>, rehash: bool) -> Result<bool> {
-        if self.id.is_empty() || self.components.len() != 5 || content_id(&self.components) != self.id {
+        if self.id.is_empty() || self.components.len() != 5 || content_id(&self.components, self.image.as_ref()) != self.id {
             bail!("template at {} has no valid content id; recreate it with `flexvm template`", dir.display());
         }
         let mut rehashed = false;
@@ -413,6 +425,8 @@ fn sparsify(path: &Path) -> Result<u64> {
 fn record_working_set(paths: &Paths, name: &str, tap: &str) -> Result<usize> {
     let tpl = Template::open(paths, name)?;
     let run = tpl.dir.join("record");
+    // A failed earlier build may have left its sockets behind.
+    let _ = std::fs::remove_dir_all(&run);
     std::fs::create_dir_all(&run)?;
     let pager = Pager::start(&run.join("uffd.sock"), tpl.clone(), None)?;
     let fc = Firecracker::spawn(&paths.firecracker, &run)?;
@@ -431,6 +445,10 @@ fn record_working_set(paths: &Paths, name: &str, tap: &str) -> Result<usize> {
     )?;
     retry(Duration::from_secs(10), || guest::ping(&run.join("v.sock")))?;
     guest::net(&run.join("v.sock"), "10.255.255.254".parse()?, None)?;
+    // Like `run`: start a cold image template's app.
+    if tpl.meta.image.as_ref().is_some_and(|i| !i.warm) {
+        guest::start_app(&run.join("v.sock"))?;
+    }
     guest::exec(&run.join("v.sock"), "true")?;
     fc.pause()?;
     let runs = pager.present_runs();
@@ -442,7 +460,7 @@ fn record_working_set(paths: &Paths, name: &str, tap: &str) -> Result<usize> {
 }
 
 /// Cold-boots a VM and snapshots it into `paths.templates/name`.
-pub fn create(paths: &Paths, name: &str, vcpus: u32, mem_mib: u64, max_mib: u64) -> Result<()> {
+pub fn create(paths: &Paths, name: &str, vcpus: u32, mem_mib: u64, max_mib: u64, image: Option<ImageMeta>) -> Result<()> {
     // Restores swap in each VM's own tap; this one only exists while building.
     let tap = format!("fvtpl{}", std::process::id());
     crate::net::create_tap(&tap)?;
@@ -450,7 +468,7 @@ pub fn create(paths: &Paths, name: &str, vcpus: u32, mem_mib: u64, max_mib: u64)
     // map the old files, which must not be truncated or rewritten under them.
     let staging = format!(".{name}.new-{}", std::process::id());
     let _ = std::fs::remove_dir_all(paths.templates.join(&staging));
-    let res = build(paths, &staging, name, vcpus, mem_mib, max_mib, &tap);
+    let res = build(paths, &staging, name, vcpus, mem_mib, max_mib, &tap, image);
     crate::net::delete_tap(&tap);
     if res.is_err() {
         let _ = std::fs::remove_dir_all(paths.templates.join(&staging));
@@ -467,7 +485,17 @@ pub fn create(paths: &Paths, name: &str, vcpus: u32, mem_mib: u64, max_mib: u64)
     Ok(())
 }
 
-fn build(paths: &Paths, staging: &str, name: &str, vcpus: u32, mem_mib: u64, max_mib: u64, tap: &str) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+fn build(
+    paths: &Paths,
+    staging: &str,
+    name: &str,
+    vcpus: u32,
+    mem_mib: u64,
+    max_mib: u64,
+    tap: &str,
+    image: Option<ImageMeta>,
+) -> Result<()> {
     let dir = paths.templates.join(staging);
     std::fs::create_dir_all(&dir)?;
     let run = dir.join("boot");
@@ -502,7 +530,18 @@ fn build(paths: &Paths, staging: &str, name: &str, vcpus: u32, mem_mib: u64, max
     let booted = start.elapsed();
 
     // Leave as little as possible in the snapshot.
-    guest::exec(&vsock, "sync; echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory")?;
+    match &image {
+        Some(img) => {
+            if img.warm {
+                crate::image::warm_up(&vsock, img)?;
+            }
+            // Images may have no shell.
+            guest::quiesce(&vsock)?;
+        }
+        None => {
+            guest::exec(&vsock, "sync; echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory")?;
+        }
+    }
     fc.pause()?;
     fc.put(
         "/snapshot/create",
@@ -520,6 +559,7 @@ fn build(paths: &Paths, staging: &str, name: &str, vcpus: u32, mem_mib: u64, max
         rootfs,
         id: String::new(),
         components: BTreeMap::new(),
+        image,
     };
     meta.identify(paths, &dir)?;
     std::fs::write(dir.join("meta.json"), serde_json::to_vec_pretty(&meta)?)?;
@@ -565,7 +605,7 @@ mod tests {
             let mut meta = Meta {
                 vcpus: 2, mem_mib: 256, max_mib: 1024,
                 kernel: paths.kernel.clone(), rootfs: paths.rootfs.clone(),
-                id: String::new(), components: BTreeMap::new(),
+                id: String::new(), components: BTreeMap::new(), image: None,
             };
             for (name, path) in meta.files(&paths, &dir) {
                 std::fs::write(path, name.as_bytes()).unwrap();
@@ -596,10 +636,36 @@ mod tests {
             component.metadata.inode += 1;
             component.metadata.mtime += 1;
         }
-        assert_eq!(content_id(&meta.components), f.meta.id);
+        assert_eq!(content_id(&meta.components, None), f.meta.id);
         meta.verify(&f.paths, &f.dir, &mut BTreeMap::new(), true).unwrap();
         meta.id = "wrong".into();
         assert!(meta.verify(&f.paths, &f.dir, &mut BTreeMap::new(), true).is_err());
+    }
+
+    #[test]
+    fn image_identity_is_part_of_the_id() {
+        let f = Fixture::new();
+        let image = |digest: &str, conf: &str| ImageMeta {
+            source: "x".into(),
+            digest: digest.into(),
+            config_digest: "sha256:c".into(),
+            app_conf: conf.into(),
+            argv: vec!["/x".into()],
+            warm: false,
+            ready: None,
+            ready_timeout: Duration::ZERO,
+        };
+        let ids: Vec<String> = [image("sha256:a", "arg /x\n"), image("sha256:b", "arg /x\n"), image("sha256:a", "arg /y\n")]
+            .iter()
+            .map(|i| content_id(&f.meta.components, Some(i)))
+            .collect();
+        assert!(ids[0] != f.meta.id && ids[0] != ids[1] && ids[0] != ids[2]);
+        let mut meta = f.meta.clone();
+        meta.image = Some(image("sha256:a", "arg /x\n"));
+        meta.identify(&f.paths, &f.dir).unwrap();
+        meta.verify(&f.paths, &f.dir, &mut BTreeMap::new(), false).unwrap();
+        meta.image.as_mut().unwrap().digest = "sha256:b".into();
+        assert!(meta.verify(&f.paths, &f.dir, &mut BTreeMap::new(), false).is_err());
     }
 
     #[test]

@@ -2,6 +2,7 @@ mod bench;
 mod daemon;
 mod fc;
 mod guest;
+mod image;
 mod net;
 mod template;
 mod uffd;
@@ -23,6 +24,10 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
 
 usage:
   flexvm template NAME [--vcpus N] [--mem MIB] [--max MIB]   cold-boot and snapshot a template (root)
+                [--image REF|ARCHIVE|DIR] [--entrypoint ARGV] [--cmd ARGV]
+                [--env K=V]... [--workdir DIR] [--user USER[:GROUP]]
+                [--warm [--ready-port N | --ready-cmd CMD] [--ready-timeout S]]
+                                                             ... from a container image
   flexvm daemon [--listen ADDR] [--advertise ADDR] [--run DIR]
                 [--peer ADDR]... [--reserve MIB] [--pool N]
                 [--vm-ips CIDR|FIRST-LAST] [--underlay IP]
@@ -30,14 +35,17 @@ usage:
   flexvm run NAME [--template T] [--ip IP]                   start a VM from a template
   flexvm ls                                                  list VMs
   flexvm exec NAME CMD...                                    run a shell command in a VM
+  flexvm logs NAME [-f]                                      an image app's output (-f: follow)
   flexvm migrate NAME --to ADDR                              live-migrate a VM to another daemon
   flexvm bench [--to ADDR] [--iterations N] [--dirty-mib N]  per-phase run/migrate latency into bench/
+               [--template T] [--ready-port N | --ready-http N]  ... and until an image app answers
   flexvm kill NAME                                           stop a VM
 
 options:
   --host ADDR        daemon to talk to (env FLEXVM_HOST, default 127.0.0.1:7070)
   --artifacts DIR    firecracker, vmlinux, rootfs.ext4 (env FLEXVM_ARTIFACTS, default ./artifacts)
   --templates DIR    template store (default ARTIFACTS/templates)
+  --image-cache DIR  image blobs and root filesystems (default ARTIFACTS/images)
 ";
 
 struct Args {
@@ -52,7 +60,9 @@ impl Args {
         let mut it = std::env::args().skip(1);
         while let Some(a) = it.next() {
             if let Some(flag) = a.strip_prefix("--") {
-                flags.push((flag.to_string(), it.next().unwrap_or_default()));
+                // Switches take no value.
+                let value = if ["warm", "follow"].contains(&flag) { "1".into() } else { it.next().unwrap_or_default() };
+                flags.push((flag.to_string(), value));
             } else {
                 positional.push(a);
                 // Everything after `exec NAME` is the guest command.
@@ -114,12 +124,24 @@ fn real_main() -> Result<()> {
             let cpus = (util::host_cpus() as u64).min(32);
             let cpus = if cpus > 1 { cpus & !1 } else { 1 };
             let host_mib = proc_kb("/proc/meminfo", "MemTotal").unwrap_or(0) >> 20;
+            let mut paths = paths()?;
+            let image = image_options(&args)?
+                .map(|opts| {
+                    let artifacts = paths.kernel.parent().ok_or("bad artifacts dir")?.to_path_buf();
+                    let cache = args.get("image-cache").map(PathBuf::from).unwrap_or_else(|| artifacts.join("images"));
+                    let init = args.get("init").map(PathBuf::from).unwrap_or_else(|| artifacts.join("flexvm-init"));
+                    let (rootfs, meta) = image::prepare(&cache, &init, &opts)?;
+                    paths.rootfs = rootfs;
+                    Ok::<_, util::Error>(meta)
+                })
+                .transpose()?;
             template::create(
-                &paths()?,
+                &paths,
                 name,
                 args.num("vcpus", cpus)? as u32,
                 args.num("mem", 256)?,
                 args.num("max", host_mib)?,
+                image,
             )
         }
         Some("daemon") => {
@@ -158,6 +180,10 @@ fn real_main() -> Result<()> {
             let to = args.get("to").ok_or("migrate needs --to ADDR")?;
             print(call(&host, json!({"op": "migrate", "name": name, "to": to}))?)
         }
+        Some("logs") => {
+            let follow = args.get("follow").is_some() || pos.get(2) == Some(&"-f");
+            logs(&host, name, follow)
+        }
         Some("exec") => {
             let code = exec(&host, name, &pos[2..].join(" "))?;
             std::process::exit(code);
@@ -166,6 +192,76 @@ fn real_main() -> Result<()> {
             eprint!("{USAGE}");
             std::process::exit(2);
         }
+    }
+}
+
+/// `template --image` and its overrides, or None for a plain template.
+fn image_options(args: &Args) -> Result<Option<image::Options>> {
+    let Some(src) = args.get("image") else {
+        for f in ["entrypoint", "cmd", "env", "workdir", "user", "warm", "ready-port", "ready-cmd"] {
+            if args.get(f).is_some() {
+                return Err(format!("--{f} needs --image").into());
+            }
+        }
+        return Ok(None);
+    };
+    let warm = args.get("warm").is_some();
+    let ready = match (args.get("ready-port"), args.get("ready-cmd")) {
+        (Some(_), Some(_)) => return Err("pass --ready-port or --ready-cmd, not both".into()),
+        (Some(p), None) => Some(image::Ready::Port(p.parse().map_err(|_| format!("bad --ready-port {p:?}"))?)),
+        (None, Some(c)) => Some(image::Ready::Cmd(c.into())),
+        (None, None) => None,
+    };
+    if ready.is_some() && !warm {
+        return Err("--ready-port and --ready-cmd only apply with --warm".into());
+    }
+    Ok(Some(image::Options {
+        image: src.into(),
+        entrypoint: args.get("entrypoint").map(image::parse_argv).transpose()?,
+        cmd: args.get("cmd").map(image::parse_argv).transpose()?,
+        env: args.all("env"),
+        workdir: args.get("workdir").map(String::from),
+        user: args.get("user").map(String::from),
+        warm,
+        ready,
+        ready_timeout: Duration::from_secs(args.num("ready-timeout", 120)?),
+    }))
+}
+
+/// Prints an image app's output. With `follow`, keeps printing until the app
+/// exits, reconnecting from the same offset if the connection drops.
+fn logs(host: &str, name: &str, follow: bool) -> Result<()> {
+    let mut offset = 0u64;
+    let mut retries = 0;
+    loop {
+        let mut c = TcpStream::connect(host)?;
+        send_json(&mut c, &json!({"op": "logs", "name": name, "offset": offset, "follow": follow}))?;
+        let mut r = BufReader::new(c);
+        let reply = recv_json(&mut r)?.ok_or("daemon hung up")?;
+        if reply["ok"] != json!(true) {
+            return Err(reply["error"].as_str().unwrap_or("logs failed").to_string().into());
+        }
+        while let Some((kind, data)) = guest::read_frame(&mut r)? {
+            if kind == guest::FRAME_MSG {
+                // `<status> <next offset>`
+                let status = String::from_utf8_lossy(&data);
+                let status = status.rsplit_once(' ').map(|(s, _)| s).unwrap_or(&status);
+                if !status.starts_with("running") {
+                    eprintln!("[app {status}]");
+                }
+                return Ok(());
+            }
+            std::io::stdout().write_all(&data)?;
+            std::io::stdout().flush()?;
+            offset += data.len() as u64;
+            retries = 0;
+        }
+        // vsock connections reset when the VM migrates or pauses.
+        retries += 1;
+        if !follow || retries > 25 {
+            return Err("connection to the guest closed".into());
+        }
+        std::thread::sleep(Duration::from_millis(200));
     }
 }
 
