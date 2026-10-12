@@ -240,6 +240,16 @@ impl Daemon {
         Ok(tpl)
     }
 
+    /// The local template matching a migration source's. Preflight runs before
+    /// the source pauses and may rehash changed files; incoming only stats them.
+    fn migration_template(&self, req: &Value, preflight: bool) -> Result<Arc<Template>> {
+        let name = req["template"].as_str().ok_or("missing template")?;
+        let tpl = self.template(name)?;
+        tpl.check_id(req["id"].as_str().ok_or("missing template id")?)?;
+        tpl.verify(&self.cfg.paths, preflight)?;
+        Ok(tpl)
+    }
+
     fn vm(&self, name: &str) -> Result<Arc<Vm>> {
         match self.vms.lock().unwrap().get(name) {
             Some(vm) => Ok(vm.clone()),
@@ -268,6 +278,7 @@ impl Daemon {
                 return Ok(serve_pages(&vm.pager, &mut stream, || self.fault("pages"))?);
             }
             "exec" => return self.exec(&name, req["cmd"].as_str().unwrap_or(""), w),
+            "preflight" => self.migration_template(&req, true).map(|tpl| json!({"id": tpl.meta.id})),
             "incoming" => match self.incoming(&req, &mut r) {
                 // Committed, but the source never hears about it.
                 Ok(_) if self.fault("lost_ack") => return Ok(()),
@@ -517,6 +528,8 @@ impl Daemon {
     /// aborted, and never once it committed.
     fn migrate(self: &Arc<Self>, name: &str, to: &str) -> Result<Value> {
         let vm = self.vm(name)?;
+        // Before pausing, so a template mismatch costs no downtime.
+        crate::template::preflight(&self.cfg.paths, &vm.template, to)?;
         let mig = migration_id();
         vm.start_source(mig)?;
         let mut t = Phases::new();
@@ -546,6 +559,7 @@ impl Daemon {
                     "name": name,
                     "mig": mig,
                     "template": vm.template.name,
+                    "id": vm.template.meta.id,
                     "ip": vm.ip.to_string(),
                     "source": self.cfg.advertise,
                     "runs": runs,
@@ -720,7 +734,7 @@ impl Daemon {
         if self.vms.lock().unwrap().contains_key(name) {
             bail!("vm name {name:?} is taken here");
         }
-        let tpl = self.template(req["template"].as_str().ok_or("missing template")?)?;
+        let tpl = self.migration_template(req, false)?;
         let ip = self.claim_ip(Some(req["ip"].as_str().ok_or("missing ip")?))?;
         t.mark("claim_ip");
         let restored = (|| {

@@ -205,13 +205,13 @@ fn print(v: Value) -> Result<()> {
 
 fn list(v: Value) -> Result<()> {
     println!(
-        "{:<16} {:<15} {:<10} {:<8} {:>4} {:>8} {:>9} {:>8} {:>8}",
-        "NAME", "IP", "TEMPLATE", "STATE", "VCPU", "RSS MiB", "GUEST MiB", "MAX MiB", "PULL MiB"
+        "{:<16} {:<15} {:<10} {:<8} {:>4} {:>8} {:>9} {:>8} {:>8} {:>16}",
+        "NAME", "IP", "TEMPLATE", "STATE", "VCPU", "RSS MiB", "GUEST MiB", "MAX MiB", "PULL MiB", "TEMPLATE ID"
     );
     let n = |v: &Value| v.as_u64().unwrap_or(0);
     for vm in v.as_array().into_iter().flatten() {
         println!(
-            "{:<16} {:<15} {:<10} {:<8} {:>4} {:>8} {:>9} {:>8} {:>8}",
+            "{:<16} {:<15} {:<10} {:<8} {:>4} {:>8} {:>9} {:>8} {:>8} {:>16}",
             vm["name"].as_str().unwrap_or(""),
             vm["ip"].as_str().unwrap_or(""),
             vm["template"].as_str().unwrap_or(""),
@@ -221,6 +221,7 @@ fn list(v: Value) -> Result<()> {
             n(&vm["guest_mib"]),
             n(&vm["max_mib"]),
             n(&vm["pages_mib"]["remote"]),
+            vm["template_id"].as_str().unwrap_or(""),
         );
     }
     Ok(())
