@@ -446,13 +446,29 @@ pub fn create(paths: &Paths, name: &str, vcpus: u32, mem_mib: u64, max_mib: u64)
     // Restores swap in each VM's own tap; this one only exists while building.
     let tap = format!("fvtpl{}", std::process::id());
     crate::net::create_tap(&tap)?;
-    let res = build(paths, name, vcpus, mem_mib, max_mib, &tap);
+    // Build next to the live template and swap it in at the end: running VMs
+    // map the old files, which must not be truncated or rewritten under them.
+    let staging = format!(".{name}.new-{}", std::process::id());
+    let _ = std::fs::remove_dir_all(paths.templates.join(&staging));
+    let res = build(paths, &staging, name, vcpus, mem_mib, max_mib, &tap);
     crate::net::delete_tap(&tap);
-    res
+    if res.is_err() {
+        let _ = std::fs::remove_dir_all(paths.templates.join(&staging));
+        return res;
+    }
+    let live = paths.templates.join(name);
+    let old = paths.templates.join(format!(".{name}.old-{}", std::process::id()));
+    let had_old = std::fs::rename(&live, &old).is_ok();
+    std::fs::rename(paths.templates.join(&staging), &live)?;
+    if had_old {
+        // Unlinked files stay valid for the VMs still mapping them.
+        let _ = std::fs::remove_dir_all(&old);
+    }
+    Ok(())
 }
 
-fn build(paths: &Paths, name: &str, vcpus: u32, mem_mib: u64, max_mib: u64, tap: &str) -> Result<()> {
-    let dir = paths.templates.join(name);
+fn build(paths: &Paths, staging: &str, name: &str, vcpus: u32, mem_mib: u64, max_mib: u64, tap: &str) -> Result<()> {
+    let dir = paths.templates.join(staging);
     std::fs::create_dir_all(&dir)?;
     let run = dir.join("boot");
     std::fs::create_dir_all(&run)?;
@@ -505,7 +521,7 @@ fn build(paths: &Paths, name: &str, vcpus: u32, mem_mib: u64, max_mib: u64, tap:
     meta.identify(paths, &dir)?;
     std::fs::write(dir.join("meta.json"), serde_json::to_vec_pretty(&meta)?)?;
     let _ = std::fs::remove_file(dir.join("wset"));
-    let wset = record_working_set(paths, name, tap)?;
+    let wset = record_working_set(paths, staging, tap)?;
     let size = std::fs::metadata(dir.join("mem"))?.len();
     println!(
         "template {name} (id {}): {vcpus} vCPUs, {mem_mib} MiB base + {hotplug} MiB hotplug, booted in {} ms, \
