@@ -192,7 +192,7 @@ fn record_working_set(paths: &Paths, name: &str, tap: &str) -> Result<usize> {
     std::fs::create_dir_all(&run)?;
     let pager = Pager::start(&run.join("uffd.sock"), tpl.clone(), None)?;
     let fc = Firecracker::spawn(&paths.firecracker, &run)?;
-    pager.set_pid(fc.pid());
+    pager.set_pid(fc.pid())?;
     fc.put(
         "/snapshot/load",
         json!({

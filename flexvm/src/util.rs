@@ -1,4 +1,5 @@
 use std::io::{self, BufRead, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::time::{Duration, Instant};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -37,6 +38,54 @@ pub fn retry<T>(timeout: Duration, mut f: impl FnMut() -> Result<T>) -> Result<T
             Err(e) if start.elapsed() >= timeout => return Err(e),
             Err(_) => std::thread::sleep(Duration::from_micros(200)),
         }
+    }
+}
+
+/// Connects to `addr`, trying each address it resolves to within one deadline.
+pub fn connect(addr: &str, timeout: Duration) -> io::Result<std::net::TcpStream> {
+    use std::net::ToSocketAddrs;
+    let deadline = Instant::now() + timeout;
+    let mut last = io::Error::other(format!("{addr} resolves to no address"));
+    for a in addr.to_socket_addrs()? {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        match std::net::TcpStream::connect_timeout(&a, left) {
+            Ok(s) => return Ok(s),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
+/// A pidfd for `pid`: it keeps naming that process even once the pid is reused.
+pub fn pidfd_open(pid: u32) -> io::Result<OwnedFd> {
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
+}
+
+/// SIGKILLs the process behind `pidfd`; one that already exited is fine.
+pub fn pidfd_kill(pidfd: &OwnedFd) -> io::Result<()> {
+    let null = std::ptr::null::<libc::siginfo_t>();
+    if unsafe { libc::syscall(libc::SYS_pidfd_send_signal, pidfd.as_raw_fd(), libc::SIGKILL, null, 0) } < 0 {
+        let e = io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::ESRCH) {
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+/// Waits up to `timeout` for the process behind `pidfd` to exit.
+pub fn pidfd_wait(pidfd: &OwnedFd, timeout: Duration) -> io::Result<bool> {
+    let mut pfd = libc::pollfd { fd: pidfd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+    match unsafe { libc::poll(&mut pfd, 1, timeout.as_millis().min(i32::MAX as u128) as i32) } {
+        n if n < 0 => Err(io::Error::last_os_error()),
+        n => Ok(n > 0),
     }
 }
 

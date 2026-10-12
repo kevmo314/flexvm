@@ -82,7 +82,7 @@ impl Vm {
         let pager = Pager::start(&dir.join("uffd.sock"), template.clone(), remote);
         let restored = (|| {
             let pager = pager.as_ref().map_err(|e| e.to_string())?.clone();
-            pager.set_pid(fc.pid());
+            pager.set_pid(fc.pid())?;
             // Route the VM's address while Firecracker restores; it is not on the critical path.
             let route = {
                 let tap = tap.clone();

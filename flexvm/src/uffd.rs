@@ -20,7 +20,7 @@
 
 use std::collections::VecDeque;
 use std::io::{self, IoSliceMut, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::TcpStream;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixListener;
 use std::path::Path;
@@ -116,12 +116,17 @@ fn eagain() -> io::Error {
 /// its installer then skips it. Settling returns whether a REMOTE page got
 /// resolved, for the pager's count of pages still to pull.
 ///
-/// No install can land in a page after the kernel has zapped it for a
-/// REMOVE: the kernel fails copies with EAGAIN while a REMOVE event is queued
-/// and zaps the range only once the event has been read, and the event is
-/// read and applied under `events` held exclusively, while installers hold it
-/// shared from checking a page's state until they have settled it. So a page
-/// is PRESENT exactly when it is populated.
+/// No data copy can land in a page after a REMOVE of it: the kernel fails
+/// copies with EAGAIN while a REMOVE event is queued, the event is read and
+/// applied under `events` held exclusively, and installers hold it shared from
+/// checking a page's state until they have settled it. After that a removed
+/// page is ZERO, which only ever gets zero-filled.
+///
+/// The kernel zaps the range only after the event is read, though, and not
+/// under any lock of ours, so a page can still go missing after it settled
+/// PRESENT (say a zero-fill that hit EEXIST on the old mapping just before the
+/// zap). That can only happen to a page the guest gave back, so a fault on a
+/// PRESENT page zero-fills it if it is missing.
 pub struct Pages {
     states: Vec<AtomicU8>,
     events: RwLock<()>,
@@ -419,12 +424,13 @@ impl Pager {
         self.done.1.notify_all();
     }
 
-    pub fn set_pid(&self, pid: u32) {
+    /// Names the Firecracker this pager serves; required before it loads a
+    /// snapshot, so a failing pager can always kill it.
+    pub fn set_pid(&self, pid: u32) -> Result<()> {
         self.pid.store(pid, Ordering::SeqCst);
-        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
-        if fd >= 0 {
-            let _ = self.pidfd.set(unsafe { OwnedFd::from_raw_fd(fd as RawFd) });
-        }
+        let fd = crate::util::pidfd_open(pid).map_err(|e| format!("pidfd_open({pid}): {e}"))?;
+        let _ = self.pidfd.set(fd);
+        Ok(())
     }
 
     pub fn stop(&self) {
@@ -439,9 +445,10 @@ impl Pager {
         if !self.stop.load(Ordering::SeqCst) {
             eprintln!("uffd: {why}; killing the vm");
             let _ = self.failed.set(why);
-            if let Some(fd) = self.pidfd.get() {
-                let null = std::ptr::null::<libc::siginfo_t>();
-                unsafe { libc::syscall(libc::SYS_pidfd_send_signal, fd.as_raw_fd(), libc::SIGKILL, null, 0) };
+            match self.pidfd.get().map(crate::util::pidfd_kill) {
+                Some(Ok(())) => {}
+                Some(Err(e)) => eprintln!("uffd: cannot kill firecracker: {e}"),
+                None => eprintln!("uffd: no firecracker to kill"),
             }
         }
         self.stop();
@@ -630,8 +637,12 @@ impl Pager {
         let region_left = (m.offset as usize + m.size) / PAGE_SIZE - page;
         let pages = self.pages();
         match pages.get(page) {
-            // A fault that raced the install.
-            PRESENT => self.wake(page, 1),
+            // Normally a fault that raced the install; if the page is really
+            // missing, a REMOVE zapped it after it settled (see `Pages`).
+            PRESENT => match self.populate(page, 1, None) {
+                Err(e) if e.raw_os_error() == Some(libc::EEXIST) => self.wake(page, 1),
+                r => r.map(drop),
+            },
             // Someone else is installing it; retry until it lands (their copy wakes us).
             INFLIGHT | DISCARDED => Err(eagain()),
             REMOTE => {
@@ -834,8 +845,7 @@ pub struct PageClient {
 
 impl PageClient {
     pub fn connect(source: &Source) -> io::Result<Self> {
-        let addr = source.addr.to_socket_addrs()?.next().ok_or_else(|| io::Error::other("bad source address"))?;
-        let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(500))?;
+        let mut stream = crate::util::connect(&source.addr, Duration::from_millis(500))?;
         stream.set_nodelay(true)?;
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
         let hello = serde_json::json!({"op": "pages", "name": source.vm, "mig": source.mig});
