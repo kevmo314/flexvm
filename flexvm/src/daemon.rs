@@ -79,8 +79,11 @@ enum Outcome {
     Aborted,
 }
 
-pub fn run(cfg: Config) -> Result<()> {
+pub fn run(mut cfg: Config) -> Result<()> {
     std::fs::create_dir_all(&cfg.run_dir)?;
+    // Every Firecracker gets paths under the canonical directory, which is
+    // what `kill_orphans` compares against.
+    cfg.run_dir = cfg.run_dir.canonicalize()?;
     let run_lock = lock_run_dir(&cfg.run_dir)?;
     let listener = TcpListener::bind(&cfg.listen)?;
     kill_orphans(&cfg.run_dir)?;
@@ -150,7 +153,7 @@ fn lock_run_dir(run_dir: &Path) -> Result<Vec<std::fs::File>> {
 /// unknown migration as aborted, its source would resume, and the orphan
 /// would be a second copy.
 fn kill_orphans(run_dir: &Path) -> Result<()> {
-    let prefix = run_dir.canonicalize()?.join("");
+    let run_dir = run_dir.canonicalize()?;
     let gone = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ESRCH);
     // Ok(false) for a process that is not one of ours or no longer exists.
     let ours = |pid: &str| -> Result<bool> {
@@ -161,8 +164,25 @@ fn kill_orphans(run_dir: &Path) -> Result<()> {
         };
         let Some(comm) = read("comm")? else { return Ok(false) };
         let Some(cmdline) = read("cmdline")? else { return Ok(false) };
-        Ok(comm.trim_ascii() == b"firecracker"
-            && cmdline.split(|&b| b == 0).any(|a| a.starts_with(prefix.as_os_str().as_bytes())))
+        if comm.trim_ascii() != b"firecracker" {
+            return Ok(false);
+        }
+        // Its API socket as the process sees it: relative to its cwd and
+        // through whatever symlinks an earlier daemon's --run went through.
+        let args: Vec<&[u8]> = cmdline.split(|&b| b == 0).collect();
+        let Some(sock) = args.iter().position(|a| *a == b"--api-sock").and_then(|i| args.get(i + 1)) else {
+            return Ok(false);
+        };
+        let mut sock = PathBuf::from(std::ffi::OsStr::from_bytes(sock));
+        if sock.is_relative() {
+            match std::fs::read_link(format!("/proc/{pid}/cwd")) {
+                Ok(cwd) => sock = cwd.join(sock),
+                Err(e) if gone(&e) => return Ok(false),
+                Err(e) => return Err(format!("/proc/{pid}/cwd: {e}").into()),
+            }
+        }
+        let dir = sock.parent().unwrap_or(&sock);
+        Ok(dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf()).starts_with(&run_dir))
     };
     let mut orphans = Vec::new();
     for e in std::fs::read_dir("/proc")? {
