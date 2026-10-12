@@ -45,21 +45,32 @@ pub struct Meta {
     components: BTreeMap<String, Component>,
 }
 
-pub const FORMAT_VERSION: u64 = 1;
+pub const FORMAT_VERSION: u64 = 2;
 
+/// What a component file looked like when it was last hashed. ctime catches
+/// rewrites that restore mtime; a rename or copy changes the inode.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Stamp {
     size: u64,
     mtime: i64,
     mtime_nsec: i64,
+    ctime: i64,
+    ctime_nsec: i64,
     inode: u64,
     device: u64,
 }
 
 impl Stamp {
-    fn read(file: &File) -> Result<Self> {
-        let m = file.metadata()?;
-        Ok(Self { size: m.len(), mtime: m.mtime(), mtime_nsec: m.mtime_nsec(), inode: m.ino(), device: m.dev() })
+    fn of(m: &std::fs::Metadata) -> Self {
+        Self {
+            size: m.len(),
+            mtime: m.mtime(),
+            mtime_nsec: m.mtime_nsec(),
+            ctime: m.ctime(),
+            ctime_nsec: m.ctime_nsec(),
+            inode: m.ino(),
+            device: m.dev(),
+        }
     }
 }
 
@@ -69,8 +80,8 @@ struct Component {
     metadata: Stamp,
 }
 
-// FNV-1a assumes accidental 64-bit collisions are negligible for this template
-// store. This is an identity check for trusted files, not adversarial integrity.
+/// FNV-1a over 64-bit words, folded so high bits feed back down. An identity
+/// check for trusted files, not protection against tampering.
 struct Hash(u64);
 
 impl Hash {
@@ -78,10 +89,20 @@ impl Hash {
         Self(0xcbf29ce484222325)
     }
 
+    fn word(&mut self, w: u64) {
+        let h = (self.0 ^ w).wrapping_mul(0x9e3779b97f4a7c15);
+        self.0 = h ^ (h >> 29);
+    }
+
     fn update(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.0 = (self.0 ^ u64::from(b)).wrapping_mul(0x100000001b3);
+        self.word(bytes.len() as u64);
+        let mut words = bytes.chunks_exact(8);
+        for w in &mut words {
+            self.word(u64::from_le_bytes(w.try_into().unwrap()));
         }
+        let mut tail = [0u8; 8];
+        tail[..words.remainder().len()].copy_from_slice(words.remainder());
+        self.word(u64::from_le_bytes(tail));
     }
 
     fn finish(self) -> String {
@@ -89,31 +110,50 @@ impl Hash {
     }
 }
 
-fn content_hash(file: &File, sparse: bool) -> Result<String> {
+/// Hashes a file's logical content: its length and every page that is not all
+/// zeroes, so sparse and fully allocated copies of the same bytes match.
+fn content_hash(file: &File) -> Result<String> {
     let len = file.metadata()?.len();
+    let page = PAGE_SIZE as u64;
     let mut hash = Hash::new();
-    hash.update(&len.to_le_bytes());
-    let extents = if sparse { data_extents(file, len)? } else { vec![(0, len)] };
-    let mut buf = vec![0u8; 1024 * 1024];
-    for (start, end) in extents {
-        hash.update(&start.to_le_bytes());
-        hash.update(&(end - start).to_le_bytes());
-        let mut off = start;
-        while off < end {
-            let n = (end - off).min(buf.len() as u64) as usize;
-            file.read_exact_at(&mut buf[..n], off)?;
-            hash.update(&buf[..n]);
+    hash.word(len);
+    let mut buf = vec![0u8; 1 << 20];
+    let mut next = 0;
+    for (start, end) in data_extents(file, len)? {
+        let mut off = (start / page * page).max(next);
+        next = end.div_ceil(page) * page;
+        while off < next {
+            let n = (next - off).min(buf.len() as u64) as usize;
+            let have = (len - off).min(n as u64) as usize;
+            file.read_exact_at(&mut buf[..have], off)?;
+            buf[have..n].fill(0);
+            for (i, p) in buf[..n].chunks(PAGE_SIZE).enumerate() {
+                if p.iter().fold(0, |a, &b| a | b) != 0 {
+                    hash.word(off / page + i as u64);
+                    hash.update(p);
+                }
+            }
             off += n as u64;
         }
     }
     Ok(hash.finish())
 }
 
+/// Hashes the file at `path`, failing if it changes underneath.
+fn hash_file(path: &Path) -> Result<Component> {
+    let file = File::open(path).map_err(|e| format!("template component {}: {e}", path.display()))?;
+    let metadata = Stamp::of(&file.metadata()?);
+    let hash = content_hash(&file)?;
+    if Stamp::of(&file.metadata()?) != metadata {
+        bail!("template component {} changed while hashing", path.display());
+    }
+    Ok(Component { hash, metadata })
+}
+
 fn content_id(components: &BTreeMap<String, Component>) -> String {
     let mut hash = Hash::new();
-    hash.update(&FORMAT_VERSION.to_le_bytes());
+    hash.word(FORMAT_VERSION);
     for (name, component) in components {
-        hash.update(&(name.len() as u64).to_le_bytes());
         hash.update(name.as_bytes());
         hash.update(component.hash.as_bytes());
     }
@@ -133,42 +173,36 @@ impl Meta {
 
     fn identify(&mut self, paths: &Paths, dir: &Path) -> Result<()> {
         for (name, path) in self.files(paths, dir) {
-            let file = File::open(path)?;
-            let metadata = Stamp::read(&file)?;
-            let hash = content_hash(&file, name == "mem")?;
-            if Stamp::read(&file)? != metadata {
-                bail!("template component {name} changed while hashing");
-            }
-            self.components.insert(name.into(), Component { hash, metadata });
+            self.components.insert(name.into(), hash_file(&path)?);
         }
         self.id = content_id(&self.components);
         Ok(())
     }
 
+    /// Checks the files still match the recorded hashes. Files whose stat
+    /// matches `cache` (or the stamp from creation) are trusted; others are
+    /// rehashed if `rehash`, else rejected.
     fn verify(&self, paths: &Paths, dir: &Path, cache: &mut BTreeMap<String, Stamp>, rehash: bool) -> Result<()> {
         if self.id.is_empty() || self.components.len() != 5 || content_id(&self.components) != self.id {
-            bail!("template identity missing or invalid; recreate template at {}", dir.display());
+            bail!("template at {} has no valid content id; recreate it with `flexvm template`", dir.display());
         }
-        let mut stamps = BTreeMap::new();
         for (name, path) in self.files(paths, dir) {
-            let component = self.components.get(name).ok_or("missing template component hash")?;
-            let file = File::open(&path).map_err(|e| format!("template component {}: {e}", path.display()))?;
-            let metadata = Stamp::read(&file)?;
-            let expected = cache.get(name).unwrap_or(&component.metadata);
-            if &metadata != expected {
-                if !rehash {
-                    bail!("template component {name} changed since preflight; retry preflight");
-                }
-                if content_hash(&file, name == "mem")? != component.hash {
-                    bail!("template content mismatch for {name} at {} (id {})", path.display(), self.id);
-                }
-                if Stamp::read(&file)? != metadata {
-                    bail!("template component {name} changed while hashing");
-                }
+            let component = &self.components[name];
+            let stamp = Stamp::of(
+                &std::fs::metadata(&path).map_err(|e| format!("template component {}: {e}", path.display()))?,
+            );
+            if cache.get(name).unwrap_or(&component.metadata) == &stamp {
+                continue;
             }
-            stamps.insert(name.into(), metadata);
+            if !rehash {
+                bail!("template component {} changed since preflight", path.display());
+            }
+            let now = hash_file(&path)?;
+            if now.hash != component.hash {
+                bail!("template component {} does not match template {}", path.display(), self.id);
+            }
+            cache.insert(name.into(), now.metadata);
         }
-        *cache = stamps;
         Ok(())
     }
 }
@@ -222,8 +256,6 @@ impl Template {
         let meta: Meta = serde_json::from_slice(
             &std::fs::read(dir.join("meta.json")).map_err(|e| format!("template {name:?}: {e}"))?,
         )?;
-        let mut verified = BTreeMap::new();
-        meta.verify(paths, &dir, &mut verified, true)?;
         let file = File::open(dir.join("mem"))?;
         let len = file.metadata()?.len() as usize;
         let data = data_bitmap(&file, len)?;
@@ -238,18 +270,27 @@ impl Template {
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
         Ok(Arc::new(Template {
-            name: name.into(), dir, meta, working_set, map: map as *const u8, len, data,
-            verified: Mutex::new(verified),
+            name: name.into(),
+            dir,
+            meta,
+            working_set,
+            map: map as *const u8,
+            len,
+            data,
+            verified: Mutex::default(),
         }))
     }
 
-    // Files must remain immutable while VMs use them; metadata is a cheap cache
-    // key, not protection against writers preserving timestamps.
+    /// Checks the files against the content id: stat only, unless `rehash` and
+    /// a file changed since it was last hashed. Never call on the run path.
     pub fn verify(&self, paths: &Paths, rehash: bool) -> Result<()> {
         self.meta.verify(paths, &self.dir, &mut self.verified.lock().unwrap(), rehash)
     }
 
     pub fn check_id(&self, id: &str) -> Result<()> {
+        if self.meta.id.is_empty() {
+            bail!("template {:?} has no content id; recreate it with `flexvm template`", self.name);
+        }
         if self.meta.id != id {
             bail!("template {:?} id mismatch: local {}, source {id}", self.name, self.meta.id);
         }
@@ -297,6 +338,7 @@ fn data_extents(file: &File, len: u64) -> Result<Vec<(u64, u64)>> {
     while off < len {
         let data = unsafe { libc::lseek(fd, off as i64, libc::SEEK_DATA) };
         if data < 0 {
+            // ENXIO: no data past `off`. Anything else would silently zero real pages.
             let e = std::io::Error::last_os_error();
             if e.raw_os_error() == Some(libc::ENXIO) {
                 break;
@@ -515,13 +557,6 @@ mod tests {
     }
 
     #[test]
-    fn fnv_known_vector() {
-        let mut hash = Hash::new();
-        hash.update(b"hello");
-        assert_eq!(hash.finish(), "a430d84680aabd0b");
-    }
-
-    #[test]
     fn identity_roundtrip_and_metadata_independence() {
         let f = Fixture::new();
         let mut meta: Meta = serde_json::from_slice(&serde_json::to_vec(&f.meta).unwrap()).unwrap();
@@ -544,7 +579,7 @@ mod tests {
             // Replacement changes inode even for equal-size content.
             f.replace(name, &vec![b'x'; name.len()]);
             let error = f.meta.verify(&f.paths, &f.dir, &mut cache, true).unwrap_err().to_string();
-            assert!(error.contains(&format!("content mismatch for {name}")), "{error}");
+            assert!(error.contains("does not match"), "{error}");
         }
     }
 
@@ -563,28 +598,32 @@ mod tests {
     }
 
     #[test]
-    fn sparse_hash_covers_offsets_bytes_and_length() {
+    fn hash_is_logical_content() {
         let f = Fixture::new();
-        let sparse = |name: &str, offset: u64, value: u8| {
+        let file = |name: &str, offset: u64, value: u8, sparse: bool| {
             let file = File::options().read(true).write(true).create_new(true).open(f.dir.join(name)).unwrap();
-            file.set_len(1 << 30).unwrap();
-            file.write_all_at(&[value; PAGE_SIZE], offset).unwrap();
+            if sparse {
+                file.set_len(64 << 20).unwrap();
+            } else {
+                file.write_all_at(&vec![0; 64 << 20], 0).unwrap();
+            }
+            file.write_all_at(&[value; 100], offset).unwrap();
             file.sync_all().unwrap();
             file
         };
-        let a = sparse("a", 1 << 20, 1);
-        let b = sparse("b", 2 << 20, 1);
-        let c = sparse("c", 1 << 20, 2);
-        let hash = content_hash(&a, true).unwrap();
-        assert_ne!(hash, content_hash(&b, true).unwrap());
-        assert_ne!(hash, content_hash(&c, true).unwrap());
-        assert_eq!(data_extents(&a, 1 << 30).unwrap(), vec![(1 << 20, (1 << 20) + PAGE_SIZE as u64)]);
-        a.set_len(2 << 30).unwrap();
-        assert_ne!(hash, content_hash(&a, true).unwrap());
+        let a = file("a", 1 << 20, 1, true);
+        let hash = content_hash(&a).unwrap();
+        assert_eq!(data_extents(&a, 64 << 20).unwrap(), vec![(1 << 20, (1 << 20) + PAGE_SIZE as u64)]);
+        assert_eq!(hash, content_hash(&file("dense", 1 << 20, 1, false)).unwrap());
+        assert_ne!(hash, content_hash(&file("b", 2 << 20, 1, true)).unwrap());
+        assert_ne!(hash, content_hash(&file("c", 1 << 20, 2, true)).unwrap());
+        assert_ne!(hash, content_hash(&file("d", (1 << 20) + 1, 1, true)).unwrap());
+        a.set_len(128 << 20).unwrap();
+        assert_ne!(hash, content_hash(&a).unwrap());
     }
 
     #[test]
-    fn open_checks_identity_and_changed_files() {
+    fn open_does_not_verify() {
         let f = Fixture::new();
         std::fs::write(f.dir.join("meta.json"), serde_json::to_vec(&f.meta).unwrap()).unwrap();
         let tpl = Template::open(&f.paths, "").unwrap();
@@ -593,8 +632,9 @@ mod tests {
         assert!(error.contains("id mismatch"));
         assert!(error.contains(&f.meta.id));
         f.replace("kernel", b"changed");
-        assert!(Template::open(&f.paths, "").is_err());
+        Template::open(&f.paths, "").unwrap();
         assert!(tpl.verify(&f.paths, false).is_err());
+        assert!(tpl.verify(&f.paths, true).is_err());
     }
 
     #[test]
@@ -602,9 +642,9 @@ mod tests {
         let f = Fixture::new();
         let path = f.dir.join("kernel");
         let file = File::options().read(true).write(true).open(path).unwrap();
-        let original = Stamp::read(&file).unwrap();
+        let original = Stamp::of(&file.metadata().unwrap());
         file.set_len(original.size + 1).unwrap();
-        assert_ne!(Stamp::read(&file).unwrap().size, original.size);
+        assert_ne!(Stamp::of(&file.metadata().unwrap()).size, original.size);
         assert!(f.meta.verify(&f.paths, &f.dir, &mut BTreeMap::new(), false).is_err());
         file.set_len(original.size).unwrap();
         let times = [
@@ -612,9 +652,28 @@ mod tests {
             libc::timespec { tv_sec: original.mtime + 1, tv_nsec: original.mtime_nsec },
         ];
         assert_eq!(unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) }, 0);
-        assert_ne!(Stamp::read(&file).unwrap().mtime, original.mtime);
+        assert_ne!(Stamp::of(&file.metadata().unwrap()).mtime, original.mtime);
         assert!(f.meta.verify(&f.paths, &f.dir, &mut BTreeMap::new(), false).is_err());
         f.meta.verify(&f.paths, &f.dir, &mut BTreeMap::new(), true).unwrap();
+    }
+
+    #[test]
+    fn same_size_rewrite_with_restored_mtime_is_caught() {
+        let f = Fixture::new();
+        let mut cache = BTreeMap::new();
+        f.meta.verify(&f.paths, &f.dir, &mut cache, true).unwrap();
+        let file = File::options().write(true).open(f.dir.join("kernel")).unwrap();
+        let before = Stamp::of(&file.metadata().unwrap());
+        std::thread::sleep(Duration::from_millis(10));
+        file.write_all_at(b"KERNEL", 0).unwrap();
+        let times = [
+            libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_OMIT },
+            libc::timespec { tv_sec: before.mtime, tv_nsec: before.mtime_nsec },
+        ];
+        assert_eq!(unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) }, 0);
+        assert!(f.meta.verify(&f.paths, &f.dir, &mut cache, false).is_err());
+        let error = f.meta.verify(&f.paths, &f.dir, &mut cache, true).unwrap_err().to_string();
+        assert!(error.contains("does not match"), "{error}");
     }
 
     #[test]

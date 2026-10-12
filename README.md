@@ -196,8 +196,9 @@ firecracker/        patches on top of Firecracker v1.17.0
   and again on arrival. Copy the template and its artifacts to each host;
   independently booted snapshots generally have different IDs. Older templates
   without IDs must be recreated. Keep template files and artifacts immutable
-  while VMs use them. Verification caches file size, mtime and inode; FNV-1a
-  IDs detect accidental differences on trusted hosts, not hostile tampering.
+  while VMs use them. Files are rehashed (before pausing) only when their
+  size, mtime, ctime or inode changed; IDs are a 64-bit non-cryptographic hash
+  that detects accidental differences on trusted hosts, not tampering.
 - The control channel is plain TCP with no authentication; it must not be
   exposed outside a trusted network.
 - The controller samples guest memory once a second (balloon stats). A very

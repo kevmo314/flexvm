@@ -233,7 +233,6 @@ impl Daemon {
     fn template(&self, name: &str) -> Result<Arc<Template>> {
         let mut t = self.templates.lock().unwrap();
         if let Some(t) = t.get(name) {
-            t.verify(&self.cfg.paths, true)?;
             return Ok(t.clone());
         }
         let tpl = Template::open(&self.cfg.paths, name)?;
@@ -241,18 +240,13 @@ impl Daemon {
         Ok(tpl)
     }
 
+    /// The local template matching a migration source's. Preflight runs before
+    /// the source pauses and may rehash changed files; incoming only stats them.
     fn migration_template(&self, req: &Value, preflight: bool) -> Result<Arc<Template>> {
         let name = req["template"].as_str().ok_or("missing template")?;
-        let id = req["id"].as_str().ok_or("missing template id")?;
-        let tpl = if preflight {
-            self.template(name)?
-        } else {
-            self.templates.lock().unwrap().get(name).cloned().ok_or("template not cached; preflight required")?
-        };
-        tpl.check_id(id)?;
-        if !preflight {
-            tpl.verify(&self.cfg.paths, false)?;
-        }
+        let tpl = self.template(name)?;
+        tpl.check_id(req["id"].as_str().ok_or("missing template id")?)?;
+        tpl.verify(&self.cfg.paths, preflight)?;
         Ok(tpl)
     }
 
