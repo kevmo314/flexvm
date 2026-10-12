@@ -36,7 +36,7 @@ usage:
   flexvm suspend NAME                                        checkpoint to the daemon's --state-dir and free
                                                              the VM's memory; `resume` restores it lazily
   flexvm checkpoint NAME DIR [--keep-running | --stop]       write the VM's full state to DIR (new directory)
-  flexvm restore DIR [--name N] [--ip IP]                    start a VM from a checkpoint (same template id)
+  flexvm restore DIR [--name N] [--ip IP|auto]               start a VM from a checkpoint (same template id)
   flexvm bench [--to ADDR] [--iterations N] [--dirty-mib N]  per-phase run/migrate latency into bench/
   flexvm kill NAME                                           stop a VM
 

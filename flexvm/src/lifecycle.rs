@@ -195,6 +195,7 @@ impl Daemon {
             bail!("vm name {name:?} is empty or taken");
         }
         let ip = match ip {
+            Some("auto") => self.claim_ip(None)?,
             Some(ip) => self.claim_ip(Some(ip))?,
             None => {
                 let ip = ck.manifest.ip;
@@ -255,6 +256,7 @@ impl Daemon {
         t.mark("clock");
         self.announce(ip);
         let to_load = (m.data_pages * PAGE_SIZE as u64) >> 20;
+        let state = vm.state().name();
         thread::spawn(move || {
             let pulled = vm.pager.wait_pulled();
             let took = vm.pager.pull_time().map(ms);
@@ -268,6 +270,7 @@ impl Daemon {
         Ok(json!({
             "name": name,
             "ip": ip.to_string(),
+            "state": state,
             "restore_ms": ms(restore),
             "ready_ms": ms(ready),
             "clock_offset_ms": clock.as_ref().ok(),
