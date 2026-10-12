@@ -11,9 +11,9 @@
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::os::fd::{FromRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
@@ -26,7 +26,7 @@ const FRAME_STDERR: u8 = 2;
 const FRAME_EXIT: u8 = 3;
 const FRAME_MSG: u8 = 4;
 
-type Statuses = Arc<(Mutex<HashMap<i32, i32>>, Condvar)>;
+type Statuses = Arc<(Mutex<HashMap<i32, Option<i32>>>, Condvar)>;
 
 fn main() {
     if unsafe { libc::getpid() } == 1 {
@@ -126,11 +126,29 @@ fn setup_root() -> io::Result<()> {
 /// Reaps every child (we are PID 1, so orphans land here too) and records
 /// exit codes for the EXEC handlers waiting on them.
 fn reap(statuses: Statuses) {
+    let (lock, cv) = &*statuses;
     loop {
+        let mut map = lock.lock().unwrap();
         let mut status = 0;
-        let pid = unsafe { libc::waitpid(-1, &mut status, 0) };
+        // Check for children under the spawn lock so a notification cannot be missed.
+        let mut pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+        if pid == 0 {
+            drop(map);
+            pid = unsafe { libc::waitpid(-1, &mut status, 0) };
+            if pid < 0 {
+                match io::Error::last_os_error().raw_os_error() {
+                    Some(libc::ECHILD) | Some(libc::EINTR) => continue,
+                    _ => return,
+                }
+            }
+            map = lock.lock().unwrap();
+        }
         if pid < 0 {
-            thread::sleep(std::time::Duration::from_millis(100));
+            match io::Error::last_os_error().raw_os_error() {
+                Some(libc::ECHILD) => { drop(cv.wait(map).unwrap()); }
+                Some(libc::EINTR) => {}
+                _ => return,
+            }
             continue;
         }
         let code = if libc::WIFEXITED(status) {
@@ -138,17 +156,31 @@ fn reap(statuses: Statuses) {
         } else {
             128 + libc::WTERMSIG(status)
         };
-        let (lock, cv) = &*statuses;
-        lock.lock().unwrap().insert(pid, code);
-        cv.notify_all();
+        if let Some(exit) = map.get_mut(&pid) {
+            *exit = Some(code);
+            cv.notify_all();
+        }
     }
+}
+
+fn spawn(command: &mut Command, statuses: &Statuses, deliver_exit: bool) -> io::Result<Child> {
+    let (lock, cv) = &**statuses;
+    // Hold the lock through spawn and registration, even if the child exits immediately.
+    let mut map = lock.lock().unwrap();
+    let child = command.spawn()?;
+    if deliver_exit {
+        map.insert(child.id() as i32, None);
+    }
+    cv.notify_all();
+    Ok(child)
 }
 
 fn wait_pid(statuses: &Statuses, pid: i32) -> i32 {
     let (lock, cv) = &**statuses;
     let mut map = lock.lock().unwrap();
     loop {
-        if let Some(code) = map.remove(&pid) {
+        if let Some(Some(code)) = map.get(&pid).copied() {
+            map.remove(&pid);
             return code;
         }
         map = cv.wait(map).unwrap();
@@ -160,18 +192,19 @@ fn serve(statuses: Statuses) -> io::Result<()> {
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
     let mut addr: libc::sockaddr_vm = unsafe { std::mem::zeroed() };
     addr.svm_family = libc::AF_VSOCK as _;
     addr.svm_port = VSOCK_PORT;
     addr.svm_cid = libc::VMADDR_CID_ANY;
     let rc = unsafe {
-        libc::bind(fd, (&addr as *const libc::sockaddr_vm).cast(), std::mem::size_of_val(&addr) as _)
+        libc::bind(fd.as_raw_fd(), (&addr as *const libc::sockaddr_vm).cast(), std::mem::size_of_val(&addr) as _)
     };
-    if rc != 0 || unsafe { libc::listen(fd, 64) } != 0 {
+    if rc != 0 || unsafe { libc::listen(fd.as_raw_fd(), 64) } != 0 {
         return Err(io::Error::last_os_error());
     }
     loop {
-        let conn = unsafe { libc::accept4(fd, std::ptr::null_mut(), std::ptr::null_mut(), libc::SOCK_CLOEXEC) };
+        let conn = unsafe { libc::accept4(fd.as_raw_fd(), std::ptr::null_mut(), std::ptr::null_mut(), libc::SOCK_CLOEXEC) };
         if conn < 0 {
             continue;
         }
@@ -238,22 +271,26 @@ fn handle(stream: std::fs::File, mut r: BufReader<std::fs::File>, line: &str, st
             }
         }
         "SPAWN" => {
-            let child = Command::new("/bin/sh")
-                .args(["-c", arg])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .process_group(0)
-                .spawn()?;
+            let child = spawn(
+                Command::new("/bin/sh")
+                    .args(["-c", arg])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .process_group(0),
+                statuses, false,
+            )?;
             frame(&out, FRAME_MSG, child.id().to_string().as_bytes())
         }
         "EXEC" => {
-            let mut child = Command::new("/bin/sh")
-                .args(["-c", arg])
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()?;
+            let mut child = spawn(
+                Command::new("/bin/sh")
+                    .args(["-c", arg])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped()),
+                statuses, true,
+            )?;
             let pid = child.id() as i32;
             let pumps = [
                 pump(child.stdout.take().unwrap(), out.clone(), FRAME_STDOUT),

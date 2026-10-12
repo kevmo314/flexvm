@@ -13,22 +13,35 @@ out=$root/artifacts
 mkdir -p "$out"
 cd "$out"
 
+temps=()
+trap 'rm -rf -- "${temps[@]}"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+download() {
+  local target=$1 url=$2 tmp
+  tmp=$(mktemp "./$target.XXXXXX")
+  temps+=("$tmp")
+  curl -fsSL -o "$tmp" "$url"
+  mv -f "$tmp" "$target"
+}
+
 if [ ! -x firecracker ]; then
   echo "fetching firecracker $FC_VERSION"
-  tmp=$(mktemp -d)
+  tmp=$(mktemp -d ./firecracker.XXXXXX)
+  temps+=("$tmp")
   curl -fsSL "https://github.com/firecracker-microvm/firecracker/releases/download/$FC_VERSION/firecracker-$FC_VERSION-$ARCH.tgz" | tar xz -C "$tmp"
-  cp "$tmp/release-$FC_VERSION-$ARCH/firecracker-$FC_VERSION-$ARCH" firecracker
-  rm -rf "$tmp"
+  mv "$tmp/release-$FC_VERSION-$ARCH/firecracker-$FC_VERSION-$ARCH" firecracker
 fi
 
 if [ ! -f vmlinux ]; then
   echo "fetching $KERNEL"
-  curl -fsSL -o vmlinux "$CI/$KERNEL"
+  download vmlinux "$CI/$KERNEL"
 fi
 
 if [ ! -f base.squashfs ]; then
   echo "fetching ubuntu-24.04 rootfs"
-  curl -fsSL -o base.squashfs "$CI/ubuntu-24.04.squashfs"
+  download base.squashfs "$CI/ubuntu-24.04.squashfs"
 fi
 
 ls -lh "$out"
