@@ -191,8 +191,13 @@ firecracker/        patches on top of Firecracker v1.17.0
   kept for migration targets.
 - **vsock connections reset on migration**, so host↔guest sessions must
   reconnect. Guest processes are unaffected.
-- **Templates must be identical on every host** (same name, same files). They
-  should be content-addressed and distributed.
+- **Templates must be identical on every host.** Creation records a content ID
+  and component hashes in `meta.json`; migration checks the ID before pausing
+  and again on arrival. Copy the template and its artifacts to each host;
+  independently booted snapshots generally have different IDs. Older templates
+  without IDs must be recreated. Keep template files and artifacts immutable
+  while VMs use them. Verification caches file size, mtime and inode; FNV-1a
+  IDs detect accidental differences on trusted hosts, not hostile tampering.
 - The control channel is plain TCP with no authentication; it must not be
   exposed outside a trusted network.
 - The controller samples guest memory once a second (balloon stats). A very

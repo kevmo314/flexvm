@@ -299,6 +299,7 @@ impl Vm {
             "ip": self.ip.to_string(),
             "tap": self.tap,
             "template": self.template.name,
+            "template_id": self.template.meta.id,
             "state": self.state().name(),
             "vcpus": self.template.meta.vcpus,
             "rss_mib": self.rss() >> 20,

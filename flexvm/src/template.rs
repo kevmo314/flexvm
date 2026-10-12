@@ -2,10 +2,12 @@
 //! agent came up. Every VM is a UFFD restore of a template, so "boot" costs a
 //! snapshot load and pages are copied in only as the guest touches them.
 
+use std::collections::BTreeMap;
 use std::fs::File;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -37,6 +39,144 @@ pub struct Meta {
     pub max_mib: u64,
     pub kernel: PathBuf,
     pub rootfs: PathBuf,
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    components: BTreeMap<String, Component>,
+}
+
+pub const FORMAT_VERSION: u64 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Stamp {
+    size: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+    inode: u64,
+    device: u64,
+}
+
+impl Stamp {
+    fn read(file: &File) -> Result<Self> {
+        let m = file.metadata()?;
+        Ok(Self { size: m.len(), mtime: m.mtime(), mtime_nsec: m.mtime_nsec(), inode: m.ino(), device: m.dev() })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Component {
+    hash: String,
+    metadata: Stamp,
+}
+
+// FNV-1a assumes accidental 64-bit collisions are negligible for this template
+// store. This is an identity check for trusted files, not adversarial integrity.
+struct Hash(u64);
+
+impl Hash {
+    fn new() -> Self {
+        Self(0xcbf29ce484222325)
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 ^ u64::from(b)).wrapping_mul(0x100000001b3);
+        }
+    }
+
+    fn finish(self) -> String {
+        format!("{:016x}", self.0)
+    }
+}
+
+fn content_hash(file: &File, sparse: bool) -> Result<String> {
+    let len = file.metadata()?.len();
+    let mut hash = Hash::new();
+    hash.update(&len.to_le_bytes());
+    let extents = if sparse { data_extents(file, len)? } else { vec![(0, len)] };
+    let mut buf = vec![0u8; 1024 * 1024];
+    for (start, end) in extents {
+        hash.update(&start.to_le_bytes());
+        hash.update(&(end - start).to_le_bytes());
+        let mut off = start;
+        while off < end {
+            let n = (end - off).min(buf.len() as u64) as usize;
+            file.read_exact_at(&mut buf[..n], off)?;
+            hash.update(&buf[..n]);
+            off += n as u64;
+        }
+    }
+    Ok(hash.finish())
+}
+
+fn content_id(components: &BTreeMap<String, Component>) -> String {
+    let mut hash = Hash::new();
+    hash.update(&FORMAT_VERSION.to_le_bytes());
+    for (name, component) in components {
+        hash.update(&(name.len() as u64).to_le_bytes());
+        hash.update(name.as_bytes());
+        hash.update(component.hash.as_bytes());
+    }
+    hash.finish()
+}
+
+impl Meta {
+    fn files(&self, paths: &Paths, dir: &Path) -> [(&'static str, PathBuf); 5] {
+        [
+            ("vmstate", dir.join("vmstate")),
+            ("mem", dir.join("mem")),
+            ("rootfs", self.rootfs.clone()),
+            ("kernel", self.kernel.clone()),
+            ("firecracker", paths.firecracker.clone()),
+        ]
+    }
+
+    fn identify(&mut self, paths: &Paths, dir: &Path) -> Result<()> {
+        for (name, path) in self.files(paths, dir) {
+            let file = File::open(path)?;
+            let metadata = Stamp::read(&file)?;
+            let hash = content_hash(&file, name == "mem")?;
+            if Stamp::read(&file)? != metadata {
+                bail!("template component {name} changed while hashing");
+            }
+            self.components.insert(name.into(), Component { hash, metadata });
+        }
+        self.id = content_id(&self.components);
+        Ok(())
+    }
+
+    fn verify(&self, paths: &Paths, dir: &Path, cache: &mut BTreeMap<String, Stamp>, rehash: bool) -> Result<()> {
+        if self.id.is_empty() || self.components.len() != 5 || content_id(&self.components) != self.id {
+            bail!("template identity missing or invalid; recreate template at {}", dir.display());
+        }
+        let mut stamps = BTreeMap::new();
+        for (name, path) in self.files(paths, dir) {
+            let component = self.components.get(name).ok_or("missing template component hash")?;
+            let file = File::open(&path).map_err(|e| format!("template component {}: {e}", path.display()))?;
+            let metadata = Stamp::read(&file)?;
+            let expected = cache.get(name).unwrap_or(&component.metadata);
+            if &metadata != expected {
+                if !rehash {
+                    bail!("template component {name} changed since preflight; retry preflight");
+                }
+                if content_hash(&file, name == "mem")? != component.hash {
+                    bail!("template content mismatch for {name} at {} (id {})", path.display(), self.id);
+                }
+                if Stamp::read(&file)? != metadata {
+                    bail!("template component {name} changed while hashing");
+                }
+            }
+            stamps.insert(name.into(), metadata);
+        }
+        *cache = stamps;
+        Ok(())
+    }
+}
+
+pub fn preflight(paths: &Paths, tpl: &Template, to: &str) -> Result<()> {
+    tpl.verify(paths, true)?;
+    crate::call(to, json!({"op": "preflight", "template": tpl.name, "id": tpl.meta.id}))?;
+    Ok(())
 }
 
 /// Paths shared by everything that creates or runs VMs.
@@ -70,6 +210,7 @@ pub struct Template {
     len: usize,
     /// Bitmap of pages that hold data in the memory file (the rest are holes).
     data: Vec<u64>,
+    verified: Mutex<BTreeMap<String, Stamp>>,
 }
 
 unsafe impl Send for Template {}
@@ -81,20 +222,38 @@ impl Template {
         let meta: Meta = serde_json::from_slice(
             &std::fs::read(dir.join("meta.json")).map_err(|e| format!("template {name:?}: {e}"))?,
         )?;
+        let mut verified = BTreeMap::new();
+        meta.verify(paths, &dir, &mut verified, true)?;
         let file = File::open(dir.join("mem"))?;
         let len = file.metadata()?.len() as usize;
+        let data = data_bitmap(&file, len)?;
         let map = unsafe {
             libc::mmap(std::ptr::null_mut(), len.max(1), libc::PROT_READ, libc::MAP_SHARED, file.as_raw_fd(), 0)
         };
         if map == libc::MAP_FAILED {
             bail!("mmap template memory: {}", std::io::Error::last_os_error());
         }
-        let data = data_bitmap(&file, len)?;
         let working_set = std::fs::read(dir.join("wset"))
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
-        Ok(Arc::new(Template { name: name.into(), dir, meta, working_set, map: map as *const u8, len, data }))
+        Ok(Arc::new(Template {
+            name: name.into(), dir, meta, working_set, map: map as *const u8, len, data,
+            verified: Mutex::new(verified),
+        }))
+    }
+
+    // Files must remain immutable while VMs use them; metadata is a cheap cache
+    // key, not protection against writers preserving timestamps.
+    pub fn verify(&self, paths: &Paths, rehash: bool) -> Result<()> {
+        self.meta.verify(paths, &self.dir, &mut self.verified.lock().unwrap(), rehash)
+    }
+
+    pub fn check_id(&self, id: &str) -> Result<()> {
+        if self.meta.id != id {
+            bail!("template {:?} id mismatch: local {}, source {id}", self.name, self.meta.id);
+        }
+        Ok(())
     }
 
     pub fn vmstate(&self) -> PathBuf {
@@ -123,12 +282,21 @@ impl Drop for Template {
 fn data_bitmap(file: &File, len: usize) -> Result<Vec<u64>> {
     let pages = len.div_ceil(PAGE_SIZE);
     let mut bits = vec![0u64; pages.div_ceil(64)];
+    for (data, end) in data_extents(file, len as u64)? {
+        for p in (data as usize / PAGE_SIZE)..(end as usize).div_ceil(PAGE_SIZE).min(pages) {
+            bits[p / 64] |= 1 << (p % 64);
+        }
+    }
+    Ok(bits)
+}
+
+fn data_extents(file: &File, len: u64) -> Result<Vec<(u64, u64)>> {
     let fd = file.as_raw_fd();
-    let mut off: i64 = 0;
-    while (off as usize) < len {
-        let data = unsafe { libc::lseek(fd, off, libc::SEEK_DATA) };
+    let mut extents = Vec::new();
+    let mut off = 0;
+    while off < len {
+        let data = unsafe { libc::lseek(fd, off as i64, libc::SEEK_DATA) };
         if data < 0 {
-            // ENXIO: no data past `off`. Anything else would silently zero real pages.
             let e = std::io::Error::last_os_error();
             if e.raw_os_error() == Some(libc::ENXIO) {
                 break;
@@ -139,13 +307,14 @@ fn data_bitmap(file: &File, len: usize) -> Result<Vec<u64>> {
         if hole < 0 {
             return Err(std::io::Error::last_os_error().into());
         }
-        let end = hole;
-        for p in (data as usize / PAGE_SIZE)..(end as usize).div_ceil(PAGE_SIZE).min(pages) {
-            bits[p / 64] |= 1 << (p % 64);
+        let end = (hole as u64).min(len);
+        if end <= data as u64 {
+            bail!("invalid sparse extent");
         }
+        extents.push((data as u64, end));
         off = end;
     }
-    Ok(bits)
+    Ok(extents)
 }
 
 /// Punches holes over all-zero pages so they cost nothing to store or serve.
@@ -269,24 +438,191 @@ fn build(paths: &Paths, name: &str, vcpus: u32, mem_mib: u64, max_mib: u64, tap:
     let punched = sparsify(&dir.join("mem"))?;
     let _ = std::fs::remove_dir_all(&run);
 
-    let meta = Meta {
+    let mut meta = Meta {
         vcpus,
         mem_mib,
         max_mib: mem_mib + hotplug,
         kernel: paths.kernel.clone(),
         rootfs: paths.rootfs.clone(),
+        id: String::new(),
+        components: BTreeMap::new(),
     };
+    meta.identify(paths, &dir)?;
     std::fs::write(dir.join("meta.json"), serde_json::to_vec_pretty(&meta)?)?;
     let _ = std::fs::remove_file(dir.join("wset"));
     let wset = record_working_set(paths, name, tap)?;
     let size = std::fs::metadata(dir.join("mem"))?.len();
     println!(
-        "template {name}: {vcpus} vCPUs, {mem_mib} MiB base + {hotplug} MiB hotplug, booted in {} ms, \
+        "template {name} (id {}): {vcpus} vCPUs, {mem_mib} MiB base + {hotplug} MiB hotplug, booted in {} ms, \
          memory file {} MiB ({} MiB of zeroes punched out), working set {} MiB",
+        meta.id,
         ms(booted),
         size >> 20,
         punched >> 20,
         wset >> 20
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct Fixture {
+        paths: Paths,
+        dir: PathBuf,
+        meta: Meta,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "flexvm-identity-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let paths = Paths {
+                firecracker: dir.join("firecracker"),
+                kernel: dir.join("kernel"),
+                rootfs: dir.join("rootfs"),
+                templates: dir.clone(),
+            };
+            let mut meta = Meta {
+                vcpus: 2, mem_mib: 256, max_mib: 1024,
+                kernel: paths.kernel.clone(), rootfs: paths.rootfs.clone(),
+                id: String::new(), components: BTreeMap::new(),
+            };
+            for (name, path) in meta.files(&paths, &dir) {
+                std::fs::write(path, name.as_bytes()).unwrap();
+            }
+            meta.identify(&paths, &dir).unwrap();
+            Self { paths, dir, meta }
+        }
+
+        fn replace(&self, name: &str, bytes: &[u8]) {
+            let path = self.meta.files(&self.paths, &self.dir).into_iter().find(|(n, _)| *n == name).unwrap().1;
+            let tmp = self.dir.join("replacement");
+            std::fs::write(&tmp, bytes).unwrap();
+            std::fs::rename(tmp, path).unwrap();
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn fnv_known_vector() {
+        let mut hash = Hash::new();
+        hash.update(b"hello");
+        assert_eq!(hash.finish(), "a430d84680aabd0b");
+    }
+
+    #[test]
+    fn identity_roundtrip_and_metadata_independence() {
+        let f = Fixture::new();
+        let mut meta: Meta = serde_json::from_slice(&serde_json::to_vec(&f.meta).unwrap()).unwrap();
+        for component in meta.components.values_mut() {
+            component.metadata.inode += 1;
+            component.metadata.mtime += 1;
+        }
+        assert_eq!(content_id(&meta.components), f.meta.id);
+        meta.verify(&f.paths, &f.dir, &mut BTreeMap::new(), true).unwrap();
+        meta.id = "wrong".into();
+        assert!(meta.verify(&f.paths, &f.dir, &mut BTreeMap::new(), true).is_err());
+    }
+
+    #[test]
+    fn changed_components_are_rejected() {
+        for name in ["vmstate", "mem", "rootfs", "kernel", "firecracker"] {
+            let f = Fixture::new();
+            let mut cache = BTreeMap::new();
+            f.meta.verify(&f.paths, &f.dir, &mut cache, true).unwrap();
+            // Replacement changes inode even for equal-size content.
+            f.replace(name, &vec![b'x'; name.len()]);
+            let error = f.meta.verify(&f.paths, &f.dir, &mut cache, true).unwrap_err().to_string();
+            assert!(error.contains(&format!("content mismatch for {name}")), "{error}");
+        }
+    }
+
+    #[test]
+    fn cache_refresh_requires_preflight() {
+        let f = Fixture::new();
+        let mut cache = BTreeMap::new();
+        f.meta.verify(&f.paths, &f.dir, &mut cache, false).unwrap();
+        f.replace("rootfs", b"rootfs");
+        assert!(f.meta.verify(&f.paths, &f.dir, &mut cache, false).is_err());
+        f.meta.verify(&f.paths, &f.dir, &mut cache, true).unwrap();
+        f.meta.verify(&f.paths, &f.dir, &mut cache, false).unwrap();
+        f.replace("rootfs", b"broken");
+        assert!(f.meta.verify(&f.paths, &f.dir, &mut cache, true).is_err());
+        assert!(f.meta.verify(&f.paths, &f.dir, &mut cache, false).is_err());
+    }
+
+    #[test]
+    fn sparse_hash_covers_offsets_bytes_and_length() {
+        let f = Fixture::new();
+        let sparse = |name: &str, offset: u64, value: u8| {
+            let file = File::options().read(true).write(true).create_new(true).open(f.dir.join(name)).unwrap();
+            file.set_len(1 << 30).unwrap();
+            file.write_all_at(&[value; PAGE_SIZE], offset).unwrap();
+            file.sync_all().unwrap();
+            file
+        };
+        let a = sparse("a", 1 << 20, 1);
+        let b = sparse("b", 2 << 20, 1);
+        let c = sparse("c", 1 << 20, 2);
+        let hash = content_hash(&a, true).unwrap();
+        assert_ne!(hash, content_hash(&b, true).unwrap());
+        assert_ne!(hash, content_hash(&c, true).unwrap());
+        assert_eq!(data_extents(&a, 1 << 30).unwrap(), vec![(1 << 20, (1 << 20) + PAGE_SIZE as u64)]);
+        a.set_len(2 << 30).unwrap();
+        assert_ne!(hash, content_hash(&a, true).unwrap());
+    }
+
+    #[test]
+    fn open_checks_identity_and_changed_files() {
+        let f = Fixture::new();
+        std::fs::write(f.dir.join("meta.json"), serde_json::to_vec(&f.meta).unwrap()).unwrap();
+        let tpl = Template::open(&f.paths, "").unwrap();
+        tpl.check_id(&f.meta.id).unwrap();
+        let error = tpl.check_id("wrong").unwrap_err().to_string();
+        assert!(error.contains("id mismatch"));
+        assert!(error.contains(&f.meta.id));
+        f.replace("kernel", b"changed");
+        assert!(Template::open(&f.paths, "").is_err());
+        assert!(tpl.verify(&f.paths, false).is_err());
+    }
+
+    #[test]
+    fn size_and_mtime_invalidate_cache() {
+        let f = Fixture::new();
+        let path = f.dir.join("kernel");
+        let file = File::options().read(true).write(true).open(path).unwrap();
+        let original = Stamp::read(&file).unwrap();
+        file.set_len(original.size + 1).unwrap();
+        assert_ne!(Stamp::read(&file).unwrap().size, original.size);
+        assert!(f.meta.verify(&f.paths, &f.dir, &mut BTreeMap::new(), false).is_err());
+        file.set_len(original.size).unwrap();
+        let times = [
+            libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_OMIT },
+            libc::timespec { tv_sec: original.mtime + 1, tv_nsec: original.mtime_nsec },
+        ];
+        assert_eq!(unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) }, 0);
+        assert_ne!(Stamp::read(&file).unwrap().mtime, original.mtime);
+        assert!(f.meta.verify(&f.paths, &f.dir, &mut BTreeMap::new(), false).is_err());
+        f.meta.verify(&f.paths, &f.dir, &mut BTreeMap::new(), true).unwrap();
+    }
+
+    #[test]
+    fn old_templates_require_recreation() {
+        let f = Fixture::new();
+        let mut meta = f.meta.clone();
+        meta.id.clear();
+        meta.components.clear();
+        assert!(meta.verify(&f.paths, &f.dir, &mut BTreeMap::new(), true).is_err());
+    }
 }
