@@ -189,8 +189,11 @@ firecracker/        patches on top of Firecracker v1.17.0
   file-backed restore here. Fresh VMs could be restored straight from the
   template file (sharing unmodified pages between VMs too), with the pager
   kept for migration targets.
-- **vsock connections reset on migration**, so host↔guest sessions must
-  reconnect. Guest processes are unaffected.
+- **vsock connections reset on migration.** `flexvm exec` reconnects for up
+  to 30 seconds, trying the original daemon and its peers. Guest commands keep
+  running; each session retains up to 4 MiB of recent output (at most 4096 chunks). If recovery falls
+  behind that buffer, exec reports output loss explicitly. Finished sessions
+  retain their exit until CLOSE or a five-minute expiry.
 - **Templates must be identical on every host.** Creation records a content ID
   and component hashes in `meta.json`; migration checks the ID before pausing
   and again on arrival. Copy the template and its artifacts to each host;
@@ -206,3 +209,28 @@ firecracker/        patches on top of Firecracker v1.17.0
   triggers over vsock would react faster.
 - Snapshot load is dominated by KVM memslot creation in this nested
   environment; expect much lower numbers on bare metal.
+
+### Resumable exec protocol
+
+Legacy `EXEC <len>`, `SPAWN <len>`, `PING` and `NET` retain their wire format.
+Sessions use `SESSION <id> <len>\n` followed by exactly `len` command bytes,
+`ATTACH <id> <offset>\n`, or `CLOSE <id>\n`. The client chooses a random ID;
+retrying SESSION with the same ID and command attaches to the existing process
+from offset zero. Reusing an ID for another command fails. IDs contain up to
+64 ASCII letters, digits, underscores or hyphens; commands are at most 1 MiB.
+
+Frames retain `[kind u8][payload length u32 LE][payload]`. SESSION and ATTACH
+first return kind 4 with the session ID. Session stdout/stderr (kinds 1/2)
+prefix their bytes with an absolute `u64 LE` offset in the combined output
+stream. Kind 3 contains the final `u64 LE` offset and `i32 LE` exit code.
+Kind 5 contains the earliest retained `u64 LE` offset and reports output loss;
+clients must not silently skip it. Kind 4 also carries `waiting` heartbeats,
+`error: ...` failures, or `closed` for CLOSE. Socket writes happen outside the
+output ring mutex. Reading an exit does not discard it: the CLI sends CLOSE
+after receiving it, and the guest retains the ID as a tombstone until expiry
+so a delayed creation retry cannot execute the command again.
+
+The daemon JSON exec request adds `session`, `action` (`start`, `attach`, or
+`close`), and `offset`; start also supplies `cmd`. Start/attach return the usual
+JSON success reply followed by session frames; close returns a JSON reply.
+Daemon info includes `peers` for recovery discovery.

@@ -8,10 +8,10 @@ mod uffd;
 mod util;
 mod vm;
 
-use std::io::{BufReader, Write};
+use std::io::{BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -227,21 +227,164 @@ fn list(v: Value) -> Result<()> {
     Ok(())
 }
 
-fn exec(host: &str, name: &str, cmd: &str) -> Result<i32> {
-    let mut c = TcpStream::connect(host)?;
-    send_json(&mut c, &json!({"op": "exec", "name": name, "cmd": cmd}))?;
-    let mut r = BufReader::new(c);
-    let reply = recv_json(&mut r)?.ok_or("daemon hung up")?;
-    if reply["ok"] != json!(true) {
-        return Err(reply["error"].as_str().unwrap_or("exec failed").to_string().into());
-    }
-    while let Some((kind, data)) = guest::read_frame(&mut r)? {
-        match kind {
-            guest::FRAME_STDOUT => std::io::stdout().write_all(&data)?,
-            guest::FRAME_STDERR => std::io::stderr().write_all(&data)?,
-            guest::FRAME_EXIT => return Ok(i32::from_le_bytes(data[..4].try_into()?)),
-            _ => eprintln!("{}", String::from_utf8_lossy(&data)),
+/// Connect with bounded I/O so a dead host cannot stall session recovery.
+fn exec_stream(host: &str, req: Value, timeout: Duration) -> Result<BufReader<TcpStream>> {
+    let mut error = "no addresses".to_string();
+    for addr in host.to_socket_addrs()? {
+        match TcpStream::connect_timeout(&addr, timeout) {
+            Ok(mut c) => {
+                c.set_read_timeout(Some(timeout))?;
+                c.set_write_timeout(Some(timeout))?;
+                send_json(&mut c, &req)?;
+                let mut r = BufReader::new(c);
+                let reply = recv_json(&mut r)?.ok_or("daemon hung up")?;
+                if reply["ok"] != json!(true) {
+                    return Err(reply["error"].as_str().unwrap_or("exec failed").to_string().into());
+                }
+                // The guest emits a heartbeat every second even for silent commands.
+                r.get_ref().set_read_timeout(Some(Duration::from_secs(3)))?;
+                return Ok(r);
+            }
+            Err(e) => error = e.to_string(),
         }
     }
-    Err("guest closed the connection before the command exited".into())
+    Err(error.into())
+}
+
+fn exec(host: &str, name: &str, cmd: &str) -> Result<i32> {
+    exec_session(host, name, cmd, &mut std::io::stdout().lock(), &mut std::io::stderr().lock())
+}
+
+fn exec_session(host: &str, name: &str, cmd: &str, stdout: &mut impl Write, stderr: &mut impl Write) -> Result<i32> {
+    let mut random = [0u8; 16];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
+    let id: String = random.iter().map(|b| format!("{b:02x}")).collect();
+    let mut hosts = vec![host.to_string()];
+    // Cache peers before starting: the original host may disappear with the connection.
+    if let Ok(info) = call_with_timeout(host, json!({"op": "info"}), Duration::from_secs(1)) {
+        add_peers(&mut hosts, &info);
+    }
+    let mut offset = 0;
+    let mut started = false;
+    let mut deadline = Instant::now() + Duration::from_secs(30);
+    let mut error = String::new();
+    loop {
+        for target in hosts.clone() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() { return Err(format!("exec recovery timed out: {error}").into()); }
+            let req = json!({"op": "exec", "name": name, "session": id,
+                "action": if started { "attach" } else { "start" }, "offset": offset, "cmd": cmd});
+            let mut r = match exec_stream(&target, req, remaining.min(Duration::from_secs(2))) {
+                Ok(r) => r,
+                Err(e) => { error = e.to_string(); continue; }
+            };
+            match exec_frames(&mut r, &id, &mut started, &mut offset, stdout, stderr, &mut deadline)? {
+                StreamEnd::Exit(code) => {
+                    // A failed acknowledgement is harmless: finished sessions expire after five minutes.
+                    let _ = call_with_timeout(&target, json!({"op": "exec", "name": name,
+                        "session": id, "action": "close"}), Duration::from_secs(2));
+                    return Ok(code);
+                }
+                StreamEnd::Disconnected(reason) => error = reason,
+            }
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() { return Err(format!("exec recovery timed out: {error}").into()); }
+        if let Ok(info) = call_with_timeout(host, json!({"op": "info"}), remaining.min(Duration::from_secs(1))) {
+            add_peers(&mut hosts, &info);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+enum StreamEnd {
+    Exit(i32),
+    Disconnected(String),
+}
+
+fn exec_frames(
+    r: &mut impl Read, id: &str, started: &mut bool, offset: &mut u64,
+    stdout: &mut impl Write, stderr: &mut impl Write, deadline: &mut Instant,
+) -> Result<StreamEnd> {
+    loop {
+        let (kind, data) = match guest::read_frame(r) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => return Ok(StreamEnd::Disconnected("daemon closed the stream".into())),
+            Err(e) => return Ok(StreamEnd::Disconnected(e.to_string())),
+        };
+        match kind {
+            guest::FRAME_STDOUT | guest::FRAME_STDERR => {
+                if !*started { return Err("session output before session id".into()); }
+                let bytes = guest::session_output(&data, *offset)?;
+                if kind == guest::FRAME_STDOUT {
+                    stdout.write_all(bytes)?;
+                    stdout.flush()?;
+                } else {
+                    stderr.write_all(bytes)?;
+                    stderr.flush()?;
+                }
+                *offset += bytes.len() as u64;
+            }
+            guest::FRAME_EXIT => return Ok(StreamEnd::Exit(guest::session_exit(&data, *offset)?)),
+            guest::FRAME_LOST => {
+                let start = u64::from_le_bytes(data.as_slice().try_into().map_err(|_| "bad output-lost frame")?);
+                return Err(format!("session output lost: needed offset {offset}, retained output starts at {start}").into());
+            }
+            guest::FRAME_MSG if data == id.as_bytes() => { *started = true; continue; }
+            guest::FRAME_MSG if data == b"waiting" && *started => {}
+            guest::FRAME_MSG => return Ok(StreamEnd::Disconnected(String::from_utf8_lossy(&data).into_owned())),
+            _ => return Err(format!("unknown session frame {kind}").into()),
+        }
+        *deadline = Instant::now() + Duration::from_secs(30);
+    }
+}
+
+fn add_peers(hosts: &mut Vec<String>, info: &Value) {
+    for peer in info["peers"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+        if !hosts.iter().any(|host| host == peer) {
+            hosts.push(peer.to_string());
+        }
+    }
+}
+
+#[cfg(test)]
+mod exec_tests {
+    use super::*;
+
+    fn frame(w: &mut Vec<u8>, kind: u8, data: &[u8]) {
+        w.push(kind);
+        w.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        w.extend_from_slice(data);
+    }
+
+    #[test]
+    fn resumes_partial_frame_without_duplicates() {
+        let mut first = Vec::new();
+        frame(&mut first, guest::FRAME_MSG, b"test-id");
+        frame(&mut first, guest::FRAME_STDOUT, &[0u64.to_le_bytes().as_slice(), b"abc"].concat());
+        first.extend_from_slice(&[guest::FRAME_STDERR, 11, 0, 0, 0]);
+        first.extend_from_slice(&3u64.to_le_bytes());
+        first.extend_from_slice(b"d");
+        let mut offset = 0;
+        let mut started = false;
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut deadline = Instant::now();
+        assert!(matches!(exec_frames(&mut first.as_slice(), "test-id", &mut started, &mut offset,
+            &mut stdout, &mut stderr, &mut deadline).unwrap(), StreamEnd::Disconnected(_)));
+        assert!(started);
+        assert_eq!(offset, 3);
+        let mut resumed = Vec::new();
+        frame(&mut resumed, guest::FRAME_MSG, b"test-id");
+        frame(&mut resumed, guest::FRAME_STDERR, &[3u64.to_le_bytes().as_slice(), b"def"].concat());
+        frame(&mut resumed, guest::FRAME_EXIT, &[6u64.to_le_bytes().as_slice(), &7i32.to_le_bytes()].concat());
+        assert!(matches!(exec_frames(&mut resumed.as_slice(), "test-id", &mut started, &mut offset,
+            &mut stdout, &mut stderr, &mut deadline).unwrap(), StreamEnd::Exit(7)));
+        assert_eq!(stdout, b"abc");
+        assert_eq!(stderr, b"def");
+        assert_eq!(offset, 6);
+        let mut hosts = vec!["original".to_string()];
+        add_peers(&mut hosts, &json!({"peers": ["original", "target", "target"]}));
+        assert_eq!(hosts, ["original", "target"]);
+    }
 }
