@@ -406,12 +406,16 @@ impl Daemon {
             if vm.state() != State::Running {
                 bail!("vm {name} is not running here");
             }
-            guest::start_exec(&vm.vsock(), cmd)
+            let g = guest::start_exec(&vm.vsock(), cmd)?;
+            let id = vm.track_exec(g.get_ref())?;
+            Ok((vm, g, id))
         });
         match guest {
-            Ok(mut g) => {
+            Ok((vm, mut g, id)) => {
                 send_json(&mut w, &json!({"ok": true}))?;
-                std::io::copy(&mut g, &mut w)?;
+                let copied = std::io::copy(&mut g, &mut w);
+                vm.untrack_exec(id);
+                copied?;
             }
             Err(e) => send_json(&mut w, &json!({"ok": false, "error": e.to_string()}))?,
         }
@@ -692,6 +696,9 @@ impl Daemon {
         // Once every page has arrived, or as soon as the VM is gone here, the
         // source drops its copy: it must never run again either way.
         thread::spawn(move || {
+            if let Err(e) = vm.restore_devices() {
+                eprintln!("vm {}: {e}", vm.name);
+            }
             let start = Instant::now();
             vm.pager.wait_pulled();
             let pulled = start.elapsed();

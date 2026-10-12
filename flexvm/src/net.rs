@@ -19,6 +19,34 @@ pub const GATEWAY_MAC: &str = "06:00:a9:fe:01:01";
 /// The MAC of every guest's eth0.
 pub const GUEST_MAC: &str = "06:00:ac:10:00:02";
 
+/// Brings tap `name` up or down. Down, it takes no packets, so Firecracker
+/// does not write any into guest memory.
+pub fn set_link_up(name: &str, up: bool) -> Result<()> {
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        bail!("socket: {}", std::io::Error::last_os_error());
+    }
+    let mut req: libc::ifreq = unsafe { std::mem::zeroed() };
+    for (d, s) in req.ifr_name.iter_mut().zip(name.bytes().take(libc::IFNAMSIZ - 1)) {
+        *d = s as libc::c_char;
+    }
+    let res = unsafe {
+        if libc::ioctl(fd, libc::SIOCGIFFLAGS, &mut req) < 0 {
+            -1
+        } else {
+            let flags = &mut req.ifr_ifru.ifru_flags;
+            *flags = if up { *flags | libc::IFF_UP as libc::c_short } else { *flags & !(libc::IFF_UP as libc::c_short) };
+            libc::ioctl(fd, libc::SIOCSIFFLAGS, &req)
+        }
+    };
+    let err = std::io::Error::last_os_error();
+    unsafe { libc::close(fd) };
+    if res < 0 {
+        bail!("set {name} {}: {err}", if up { "up" } else { "down" });
+    }
+    Ok(())
+}
+
 /// Runs `ip` commands in one process, continuing past errors.
 pub fn ip_batch(cmds: &[String]) -> Result<()> {
     let mut child = Command::new("ip")

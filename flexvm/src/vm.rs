@@ -1,6 +1,8 @@
-use std::net::Ipv4Addr;
+use std::collections::HashMap;
+use std::net::{Ipv4Addr, Shutdown};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -8,7 +10,7 @@ use serde_json::{json, Value};
 
 use crate::bail;
 use crate::fc::{Firecracker, Idle};
-use crate::template::Template;
+use crate::template::{Template, BALLOON_STATS_S};
 use crate::uffd::{Pager, Runs, Source};
 use crate::util::{Phases, Result, PAGE_SIZE};
 
@@ -46,6 +48,9 @@ pub struct Vm {
     pub starved: AtomicBool,
     /// Migration target only: the source's answer to `release`, true or an error.
     pub released: OnceLock<Value>,
+    /// Host ends of exec sessions, by id.
+    execs: Mutex<HashMap<u64, UnixStream>>,
+    next_exec: AtomicU64,
     fc: Mutex<Option<Firecracker>>,
     cgroup: Option<PathBuf>,
 }
@@ -125,6 +130,8 @@ impl Vm {
             last_resize: Mutex::new(Instant::now()),
             starved: AtomicBool::new(false),
             released: OnceLock::new(),
+            execs: Mutex::new(HashMap::new()),
+            next_exec: AtomicU64::new(0),
             fc: Mutex::new(Some(fc)),
             cgroup,
         });
@@ -163,16 +170,53 @@ impl Vm {
     /// Pauses the VM and saves only its device/vCPU state (memory stays put
     /// and is served by the pager). Returns the page states a target needs,
     /// taken behind the pager's barrier so they match the saved state.
+    ///
+    /// Pausing stops only the vCPUs; Firecracker's devices would go on
+    /// writing guest memory (and their rings) behind the saved state, which
+    /// the target then pulls. So first the tap goes down (no RX), host exec
+    /// sessions are closed (vsock RX is gated after the snapshot, but host
+    /// socket events still walk the TX queue), and the balloon's statistics
+    /// timer is pushed out of the way (its next round happens now, before the
+    /// snapshot). `resume` undoes this; a target calls `restore_devices`.
     pub fn checkpoint(&self, vmstate: &Path) -> Result<Runs> {
+        crate::net::set_link_up(&self.tap, false)?;
+        for (_, s) in self.execs.lock().unwrap().drain() {
+            let _ = s.shutdown(Shutdown::Both);
+        }
         self.fc(|fc| {
             fc.pause()?;
+            fc.patch("/balloon/statistics", json!({"stats_polling_interval_s": u16::MAX}))?;
             fc.put("/snapshot/create", json!({"snapshot_type": "Full", "snapshot_path": vmstate, "mem_file_path": "", "sync_snapshot_files": false}))
         })?;
         self.pager.quiesce_export()
     }
 
+    /// Resumes a VM paused by `checkpoint`.
     pub fn resume(&self) -> Result<()> {
-        self.fc(|fc| fc.resume())
+        crate::net::set_link_up(&self.tap, true)?;
+        self.fc(|fc| fc.resume())?;
+        self.restore_devices()
+    }
+
+    /// Puts back what `checkpoint` turned off inside Firecracker.
+    pub fn restore_devices(&self) -> Result<()> {
+        self.fc(|fc| fc.patch("/balloon/statistics", json!({"stats_polling_interval_s": BALLOON_STATS_S})).map(drop))
+    }
+
+    /// Registers the host end of an exec session, so a checkpoint can close
+    /// it. Fails unless the VM is running here.
+    pub fn track_exec(&self, s: &UnixStream) -> Result<u64> {
+        let mut execs = self.execs.lock().unwrap();
+        if self.state() != State::Running {
+            bail!("vm {} is not running here", self.name);
+        }
+        let id = self.next_exec.fetch_add(1, Ordering::SeqCst);
+        execs.insert(id, s.try_clone()?);
+        Ok(id)
+    }
+
+    pub fn untrack_exec(&self, id: u64) {
+        self.execs.lock().unwrap().remove(&id);
     }
 
     pub fn kill(&self) {
@@ -194,6 +238,7 @@ impl Vm {
         json!({
             "name": self.name,
             "ip": self.ip.to_string(),
+            "tap": self.tap,
             "template": self.template.name,
             "state": self.state().name(),
             "vcpus": self.template.meta.vcpus,

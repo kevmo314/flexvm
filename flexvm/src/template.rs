@@ -17,6 +17,9 @@ use crate::guest;
 use crate::uffd::Pager;
 use crate::util::{ms, retry, Result, PAGE_SIZE};
 
+/// How often Firecracker refreshes the guest's balloon statistics.
+pub const BALLOON_STATS_S: u16 = 1;
+
 pub const BOOT_ARGS: &str = "console=ttyS0 quiet reboot=k panic=1 pci=off \
     i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd \
     rootflags=dax init=/sbin/flexvm-init memhp_default_state=online_movable psi=1";
@@ -239,7 +242,7 @@ fn build(paths: &Paths, name: &str, vcpus: u32, mem_mib: u64, max_mib: u64, tap:
     fc.put("/pmem/root", json!({"id": "root", "path_on_host": paths.rootfs, "root_device": true, "read_only": true}))?;
     fc.put(
         "/balloon",
-        json!({"amount_mib": 0, "deflate_on_oom": false, "stats_polling_interval_s": 1, "free_page_reporting": true}),
+        json!({"amount_mib": 0, "deflate_on_oom": false, "stats_polling_interval_s": BALLOON_STATS_S, "free_page_reporting": true}),
     )?;
     let hotplug = max_mib.saturating_sub(mem_mib) / SLOT_MIB * SLOT_MIB;
     if hotplug > 0 {
