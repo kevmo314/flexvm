@@ -34,7 +34,7 @@ use std::io::{self, BufWriter, Write};
 use std::net::Ipv4Addr;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -214,6 +214,13 @@ impl Staging {
         let mf = File::create(self.tmp.join("manifest.json"))?;
         (&mf).write_all(&text)?;
         mf.sync_all()?;
+        // The checkpoint belongs to whoever owns the directory it was put in
+        // (the daemon runs as root), so they can move and delete it.
+        let parent = std::fs::metadata(self.dest.parent().unwrap())?;
+        let owner = (Some(parent.uid()), Some(parent.gid()));
+        for f in ["manifest.json", "vmstate", "pagemap", "pages", ""] {
+            std::os::unix::fs::chown(self.tmp.join(f), owner.0, owner.1)?;
+        }
         fsync_dir(&self.tmp)?;
         t.mark("fsync");
         rename_noreplace(&self.tmp, &self.dest)?;
