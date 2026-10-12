@@ -144,7 +144,7 @@ impl Vm {
     pub fn checkpoint(&self, vmstate: &Path) -> Result<Runs> {
         self.fc(|fc| {
             fc.pause()?;
-            fc.put("/snapshot/create", json!({"snapshot_type": "Full", "snapshot_path": vmstate, "mem_file_path": ""}))
+            fc.put("/snapshot/create", json!({"snapshot_type": "Full", "snapshot_path": vmstate, "mem_file_path": "", "sync_snapshot_files": false}))
         })?;
         self.pager.export_runs()
     }
