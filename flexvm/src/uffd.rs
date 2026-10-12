@@ -179,16 +179,22 @@ impl Pager {
         for &(first, count) in &self.base.working_set {
             let (mut i, end) = (first as usize, ((first + count) as usize).min(pages.len()));
             while i < end {
-                if !self.base.has_data(i) || pages[i].load(Ordering::SeqCst) != BASE {
+                if pages[i].load(Ordering::SeqCst) != BASE {
                     i += 1;
                     continue;
                 }
+                // Holes were zero at snapshot time (mostly free memory the guest
+                // allocates again); map them too, or each one costs a fault.
+                let data = self.base.has_data(i);
                 let region_end = self.locate((i * PAGE_SIZE) as u64).map_or(i + 1, |m| (m.offset as usize + m.size) / PAGE_SIZE);
                 let mut n = 1;
-                while i + n < end.min(region_end) && self.base.has_data(i + n) && pages[i + n].load(Ordering::SeqCst) == BASE {
+                while i + n < end.min(region_end)
+                    && self.base.has_data(i + n) == data
+                    && pages[i + n].load(Ordering::SeqCst) == BASE
+                {
                     n += 1;
                 }
-                let _ = self.install(i, n, Some(self.base.pages(i, n)));
+                let _ = self.install(i, n, data.then(|| self.base.pages(i, n)));
                 i += n;
             }
         }
