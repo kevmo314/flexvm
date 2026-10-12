@@ -116,7 +116,8 @@ def alive(pid):
 def daemon_pid(host):
     for pid in filter(str.isdigit, os.listdir("/proc")):
         argv = proc(pid, "cmdline").split(b"\0")
-        if b"daemon" in argv and host.encode() in argv and os.path.basename(argv[0]) not in (b"sudo", b"env", b"setsid"):
+        listens = any(a == b"--listen" and v == host.encode() for a, v in zip(argv, argv[1:]))
+        if b"daemon" in argv and listens and os.path.basename(argv[0]) not in (b"sudo", b"env", b"setsid"):
             return pid
     raise AssertionError(f"no daemon listening on {host}")
 
