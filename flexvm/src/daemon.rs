@@ -22,7 +22,7 @@ use crate::guest;
 use crate::net::{self, IpRange};
 use crate::template::{Paths, Template, STEP_MIB};
 use crate::uffd::{serve_pages, Runs};
-use crate::util::{ms, proc_kb, recv_json, send_json, Result};
+use crate::util::{ms, proc_kb, recv_json, send_json, Phases, Result};
 use crate::vm::{State, Vm};
 
 pub struct Config {
@@ -153,6 +153,10 @@ impl Daemon {
             "route" => self.route(&req),
             "migrate" => self.migrate(&name, req["to"].as_str().unwrap_or("")),
             "info" => Ok(self.info()),
+            "bench_info" => self.bench_info(req["template"].as_str().unwrap_or("default")),
+            "migration_status" => self.vm(&name).map(|vm| {
+                json!({"background_pull_ms": vm.pager.pull_time().map(ms), "released": vm.released.get()})
+            }),
             _ => Err(format!("unknown op {op:?}").into()),
         };
         let reply = match reply {
@@ -164,27 +168,35 @@ impl Daemon {
     }
 
     fn run_vm(&self, name: &str, template: &str, ip: Option<&str>) -> Result<Value> {
+        let mut t = Phases::new();
         if name.is_empty() || self.vms.lock().unwrap().contains_key(name) {
             bail!("vm name {name:?} is empty or taken");
         }
         let tpl = self.template(template)?;
         let ip = self.claim_ip(ip)?;
-        let start = Instant::now();
-        let restored = Vm::restore(self.pool.take()?, name, tpl.clone(), &tpl.vmstate(), None, ip);
+        t.mark("claim_ip");
+        let restored = self.pool.take().and_then(|idle| {
+            t.mark("pool_take");
+            Vm::restore(idle, name, tpl.clone(), &tpl.vmstate(), None, ip, &mut t)
+        });
         let (vm, restore) = restored.inspect_err(|_| {
             self.ips.lock().unwrap().remove(&ip);
         })?;
         self.vms.lock().unwrap().insert(name.into(), vm.clone());
-        let running = start.elapsed();
+        t.mark("register");
+        let running = t.total();
         // The guest reseeds its RNG itself: Firecracker bumps the VMGenID on restore.
         guest::net(&vm.vsock(), ip, self.cfg.dns.as_deref())?;
+        t.mark("guest_net");
         self.announce(ip);
+        t.mark("announce");
         Ok(json!({
             "name": name,
             "ip": ip.to_string(),
             "restore_ms": ms(restore),
             "running_ms": ms(running),
-            "ready_ms": ms(start.elapsed()),
+            "ready_ms": ms(t.total()),
+            "timings_ms": t.json(),
         }))
     }
 
@@ -295,6 +307,26 @@ impl Daemon {
         })
     }
 
+    fn bench_info(&self, template: &str) -> Result<Value> {
+        let read = |path| std::fs::read_to_string(path).ok().map(|s| s.trim().to_string());
+        let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+        let model = cpuinfo.lines().find_map(|l| Some(l.split_once(':')?).filter(|(k, _)| k.trim() == "model name"));
+        let firecracker = std::process::Command::new(&self.cfg.paths.firecracker).arg("--version").output().ok();
+        Ok(json!({
+            "daemon": self.info(),
+            "hostname": read("/proc/sys/kernel/hostname"),
+            "kernel": read("/proc/sys/kernel/osrelease"),
+            "loadavg": read("/proc/loadavg"),
+            "cpu_model": model.map(|(_, v)| v.trim()),
+            "host_cpus": crate::util::host_cpus(),
+            // This host is itself a guest, so VMs here run nested.
+            "nested_virt": cpuinfo.split_whitespace().any(|f| f == "hypervisor"),
+            "firecracker": firecracker.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()),
+            "pool": self.cfg.pool,
+            "template": self.template(template)?.meta,
+        }))
+    }
+
     /// Live-migrates `name` to the daemon at `to` with post-copy: pause, ship
     /// the vCPU/device state and a page map, resume on the target, then let
     /// the target pull memory from us on demand and in the background.
@@ -307,12 +339,13 @@ impl Daemon {
             }
             *st = State::Source;
         }
-        let start = Instant::now();
+        let mut t = Phases::new();
         let vmstate = vm.dir.join("vmstate.out");
         let result = (|| -> Result<Value> {
             let runs = vm.checkpoint(&vmstate)?;
-            let paused = start.elapsed();
+            let paused = t.mark("checkpoint");
             let state = std::fs::read(&vmstate)?;
+            t.mark("read_state");
             let mut conn = TcpStream::connect(to)?;
             conn.set_nodelay(true)?;
             let remote_pages: u64 = runs.iter().filter(|r| r.2 == crate::uffd::REMOTE).map(|r| r.1).sum();
@@ -329,22 +362,27 @@ impl Daemon {
                 }),
             )?;
             conn.write_all(&state)?;
+            t.mark("send_state");
             let reply = recv_json(&mut BufReader::new(conn))?.ok_or("target hung up")?;
             if reply["ok"] != json!(true) {
                 bail!("target refused: {}", reply["error"]);
             }
-            let downtime = start.elapsed();
+            t.mark("target");
+            let downtime = t.total();
             // Send traffic for the VM straight to its new host.
             if let Some(via) = reply["result"]["underlay"].as_str() {
                 net::route_via(vm.ip, via.parse()?)?;
             }
+            t.mark("reroute");
             Ok(json!({
                 "name": name,
                 "to": to,
                 "checkpoint_ms": ms(paused),
                 "downtime_ms": ms(downtime),
-                "rerouted_ms": ms(start.elapsed()),
+                "rerouted_ms": ms(t.total()),
                 "target_restore_ms": reply["result"]["restore_ms"],
+                "timings_ms": t.json(),
+                "target_timings_ms": reply["result"]["timings_ms"],
                 "vmstate_kib": state.len() >> 10,
                 "to_transfer_mib": (remote_pages * crate::util::PAGE_SIZE as u64) >> 20,
             }))
@@ -358,27 +396,33 @@ impl Daemon {
     }
 
     fn incoming(self: &Arc<Self>, req: &Value, r: &mut impl Read) -> Result<Value> {
+        let mut t = Phases::new();
         let name = req["name"].as_str().ok_or("missing name")?.to_string();
         let source = req["source"].as_str().ok_or("missing source")?.to_string();
         let runs: Runs = serde_json::from_value(req["runs"].clone())?;
         let mut state = vec![0u8; req["vmstate_len"].as_u64().ok_or("missing vmstate_len")? as usize];
         r.read_exact(&mut state)?;
+        t.mark("recv_state");
         if self.vms.lock().unwrap().contains_key(&name) {
             bail!("vm name {name:?} is taken here");
         }
         let tpl = self.template(req["template"].as_str().ok_or("missing template")?)?;
         let ip = self.claim_ip(Some(req["ip"].as_str().ok_or("missing ip")?))?;
+        t.mark("claim_ip");
         let restored = (|| {
             let idle = self.pool.take()?;
+            t.mark("pool_take");
             let vmstate = idle.dir.join("vmstate.in");
             std::fs::write(&vmstate, &state)?;
-            Vm::restore(idle, &name, tpl, &vmstate, Some((runs, source.clone(), name.clone())), ip)
+            t.mark("write_state");
+            Vm::restore(idle, &name, tpl, &vmstate, Some((runs, source.clone(), name.clone())), ip, &mut t)
         })();
         let (vm, restore) = restored.inspect_err(|_| {
             self.ips.lock().unwrap().remove(&ip);
         })?;
         self.vms.lock().unwrap().insert(name.clone(), vm.clone());
         self.announce(ip);
+        t.mark("register");
         // Tell the source to drop its copy once every page has arrived.
         thread::spawn(move || {
             let start = Instant::now();
@@ -386,14 +430,21 @@ impl Daemon {
                 thread::sleep(Duration::from_millis(5));
             }
             let pulled = start.elapsed();
-            let release = TcpStream::connect(&source).and_then(|mut c| {
+            let release = (|| {
+                let mut c = TcpStream::connect(&source)?;
                 send_json(&mut c, &json!({"op": "release", "name": name}))?;
-                let _ = recv_json(&mut BufReader::new(c));
-                Ok(())
-            });
-            eprintln!("vm {name}: memory pulled from {source} in {} ms (release: {release:?})", ms(pulled));
+                recv_json(&mut BufReader::new(c))
+            })();
+            let released = match release {
+                Ok(Some(r)) if r["ok"] == json!(true) => json!(true),
+                Ok(Some(r)) => r["error"].clone(),
+                Ok(None) => json!("source hung up"),
+                Err(e) => json!(e.to_string()),
+            };
+            eprintln!("vm {name}: memory pulled from {source} in {} ms (release: {released})", ms(pulled));
+            let _ = vm.released.set(released);
         });
-        Ok(json!({"restore_ms": ms(restore), "underlay": self.cfg.underlay.to_string()}))
+        Ok(json!({"restore_ms": ms(restore), "underlay": self.cfg.underlay.to_string(), "timings_ms": t.json()}))
     }
 
     /// One pass of the elastic memory controller.

@@ -22,7 +22,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
@@ -94,6 +94,8 @@ pub struct Pager {
     pid: AtomicU32,
     remote: Mutex<Option<PageClient>>,
     remote_left: AtomicUsize,
+    pull_started: OnceLock<Instant>,
+    pull_finished: OnceLock<Instant>,
     stop: AtomicBool,
 }
 
@@ -112,6 +114,8 @@ impl Pager {
             pid: AtomicU32::new(0),
             remote: Mutex::new(None),
             remote_left: AtomicUsize::new(0),
+            pull_started: OnceLock::new(),
+            pull_finished: OnceLock::new(),
             stop: AtomicBool::new(false),
         });
         let p = pager.clone();
@@ -143,6 +147,7 @@ impl Pager {
         // BASE is 0, so a zeroed allocation (lazily backed by the kernel) is the initial state.
         let pages: Vec<AtomicU8> = unsafe { std::mem::transmute::<Vec<u8>, Vec<AtomicU8>>(vec![0u8; total]) };
         if let Some((runs, addr, vm)) = initial {
+            let _ = self.pull_started.set(Instant::now());
             let mut remote = 0;
             for (first, count, state) in runs {
                 for p in &pages[first as usize..(first + count) as usize] {
@@ -159,6 +164,9 @@ impl Pager {
         let _ = self.mappings.set(mappings);
         let _ = self.pages.set(pages);
         let _ = self.uffd.set(fd);
+        if fresh && self.pull_started.get().is_some() {
+            let _ = self.pull_finished.set(Instant::now());
+        }
         *self.ready.0.lock().unwrap() = true;
         self.ready.1.notify_all();
         Ok(fresh && !self.base.working_set.is_empty())
@@ -209,6 +217,18 @@ impl Pager {
             bail!("firecracker never connected to the uffd socket");
         }
         Ok(())
+    }
+
+    /// How long an incoming migration took to pull every remote page, once done.
+    pub fn pull_time(&self) -> Option<Duration> {
+        Some(self.pull_finished.get()?.duration_since(*self.pull_started.get()?))
+    }
+
+    /// Counts `n` remote pages as resolved.
+    fn pulled(&self, n: usize) {
+        if self.remote_left.fetch_sub(n, Ordering::SeqCst) == n {
+            let _ = self.pull_finished.set(Instant::now());
+        }
     }
 
     pub fn set_pid(&self, pid: u32) {
@@ -350,7 +370,7 @@ impl Pager {
         while a < end {
             if let Some((p, _)) = self.page_of(a) {
                 if self.pages()[p].swap(ZERO, Ordering::SeqCst) == REMOTE {
-                    self.remote_left.fetch_sub(1, Ordering::SeqCst);
+                    self.pulled(1);
                 }
             }
             a += PAGE_SIZE as u64;
@@ -394,7 +414,7 @@ impl Pager {
                     return Err(e);
                 }
                 self.install(page, n, Some(&buf))?;
-                self.remote_left.fetch_sub(n, Ordering::SeqCst);
+                self.pulled(n);
                 Ok(())
             }
             state => {
@@ -534,7 +554,7 @@ impl Pager {
                             r => break r?,
                         }
                     }
-                    self.remote_left.fetch_sub(n, Ordering::SeqCst);
+                    self.pulled(n);
                     i += n;
                 }
                 chunk += PULL_THREADS * PULL_RUN;

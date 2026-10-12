@@ -44,6 +44,41 @@ pub fn ms(d: Duration) -> f64 {
     (d.as_secs_f64() * 1e5).round() / 100.0
 }
 
+/// Back-to-back phase timings: each mark covers the time since the previous
+/// one, so the phases sum to the total.
+pub struct Phases {
+    start: Instant,
+    last: Instant,
+    marks: serde_json::Map<String, serde_json::Value>,
+}
+
+impl Phases {
+    pub fn new() -> Phases {
+        let now = Instant::now();
+        Phases { start: now, last: now, marks: serde_json::Map::new() }
+    }
+
+    /// Ends phase `name` now and returns its length.
+    pub fn mark(&mut self, name: &str) -> Duration {
+        let now = Instant::now();
+        let d = now - self.last;
+        self.last = now;
+        self.marks.insert(name.into(), ms(d).into());
+        d
+    }
+
+    /// Time from the start to the last mark.
+    pub fn total(&self) -> Duration {
+        self.last - self.start
+    }
+
+    pub fn json(&self) -> serde_json::Value {
+        let mut marks = self.marks.clone();
+        marks.insert("total".into(), ms(self.total()).into());
+        marks.into()
+    }
+}
+
 /// Reads a `Key: value kB` field from a /proc style file, in bytes.
 pub fn proc_kb(path: &str, key: &str) -> Option<u64> {
     let s = std::fs::read_to_string(path).ok()?;

@@ -108,6 +108,18 @@ LAN.
 The daemon must run as root: it uses `/dev/kvm`, privileged userfaultfd,
 `process_vm_readv` on Firecracker and cgroup v2.
 
+## Benchmarks
+
+```sh
+flexvm --host 192.168.1.10:7070 bench                                        # run
+flexvm --host 192.168.1.10:7070 bench --to 192.168.1.11:7070 --dirty-mib 500 # run + migrate
+```
+
+Each trial runs a fresh VM, optionally writes N MiB into its /tmp and migrates
+it (waiting for the full pull), then kills it. Phases are back-to-back daemon
+timings that sum to `total`; the report lands in `bench/<date>-<sha>.json` with
+p50/p90/p99/max per phase, raw samples and host context.
+
 ## Layout
 
 ```
