@@ -260,41 +260,48 @@ fn exec_session(host: &str, name: &str, cmd: &str, stdout: &mut impl Write, stde
     std::fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
     let id: String = random.iter().map(|b| format!("{b:02x}")).collect();
     let mut hosts = vec![host.to_string()];
-    // Cache peers before starting: the original host may disappear with the connection.
-    if let Ok(info) = call_with_timeout(host, json!({"op": "info"}), Duration::from_secs(1)) {
-        add_peers(&mut hosts, &info);
-    }
     let mut offset = 0;
     let mut started = false;
     let mut deadline = Instant::now() + Duration::from_secs(30);
     let mut error = String::new();
-    loop {
-        for target in hosts.clone() {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() { return Err(format!("exec recovery timed out: {error}").into()); }
-            let req = json!({"op": "exec", "name": name, "session": id,
-                "action": if started { "attach" } else { "start" }, "offset": offset, "cmd": cmd});
-            let mut r = match exec_stream(&target, req, remaining.min(Duration::from_secs(2))) {
-                Ok(r) => r,
-                Err(e) => { error = e.to_string(); continue; }
-            };
-            match exec_frames(&mut r, &id, &mut started, &mut offset, stdout, stderr, &mut deadline)? {
+    for i in 0.. {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() { return Err(format!("exec recovery timed out: {error}").into()); }
+        // A VM that no daemon knows was never there; one mid-migration is known to both.
+        if !started && i == hosts.len() && error.starts_with("no vm named") {
+            return Err(error.into());
+        }
+        if i > 0 && i % hosts.len() == 0 {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let target = hosts[i % hosts.len()].clone();
+        let req = json!({"op": "exec", "name": name, "session": id,
+            "action": if started { "attach" } else { "start" }, "offset": offset, "cmd": cmd});
+        match exec_stream(&target, req, remaining.min(Duration::from_secs(2))) {
+            Ok(mut r) => match exec_frames(&mut r, &id, &mut started, &mut offset, stdout, stderr, &mut deadline)? {
                 StreamEnd::Exit(code) => {
-                    // A failed acknowledgement is harmless: finished sessions expire after five minutes.
-                    let _ = call_with_timeout(&target, json!({"op": "exec", "name": name,
-                        "session": id, "action": "close"}), Duration::from_secs(2));
+                    // Fire and forget: the daemon acts on it after we hang up, and a lost
+                    // acknowledgement is harmless since finished sessions expire after five minutes.
+                    if let Some(addr) = target.to_socket_addrs().ok().and_then(|mut a| a.next()) {
+                        if let Ok(mut c) = TcpStream::connect_timeout(&addr, Duration::from_secs(1)) {
+                            let _ = send_json(&mut c, &json!({"op": "exec", "name": name, "session": id, "action": "close"}));
+                        }
+                    }
                     return Ok(code);
                 }
                 StreamEnd::Disconnected(reason) => error = reason,
+            },
+            Err(e) => error = e.to_string(),
+        }
+        // Peers are only needed once the VM may have moved; the host it was on knows them.
+        for h in [&target, host] {
+            if let Ok(info) = call_with_timeout(h, json!({"op": "info"}), Duration::from_secs(1)) {
+                add_peers(&mut hosts, &info);
+                break;
             }
         }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() { return Err(format!("exec recovery timed out: {error}").into()); }
-        if let Ok(info) = call_with_timeout(host, json!({"op": "info"}), remaining.min(Duration::from_secs(1))) {
-            add_peers(&mut hosts, &info);
-        }
-        std::thread::sleep(Duration::from_millis(200));
     }
+    unreachable!()
 }
 
 enum StreamEnd {
