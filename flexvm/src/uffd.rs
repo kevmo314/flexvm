@@ -20,7 +20,7 @@
 
 use std::collections::VecDeque;
 use std::io::{self, IoSliceMut, Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixListener;
 use std::path::Path;
@@ -51,6 +51,10 @@ const REMOTE_FAULT_RUN: usize = 64;
 /// Pages per background pull request.
 const PULL_RUN: usize = 256;
 const PULL_THREADS: usize = 4;
+/// How long the migration source may stay unreachable before the pager gives up.
+const SOURCE_TIMEOUT: Duration = Duration::from_secs(10);
+const BACKOFF_MIN: Duration = Duration::from_millis(10);
+const BACKOFF_MAX: Duration = Duration::from_secs(1);
 
 // From linux/userfaultfd.h.
 const UFFD_EVENT_PAGEFAULT: u8 = 0x12;
@@ -91,6 +95,15 @@ pub struct Mapping {
 
 /// Initial page states for a VM migrating in: runs of `[first_page, count, state]`.
 pub type Runs = Vec<(u64, u64, u8)>;
+
+/// Where an incoming VM's remote pages live: the source daemon, the VM's
+/// name there and the migration that moves it.
+#[derive(Debug, Clone)]
+pub struct Source {
+    pub addr: String,
+    pub vm: String,
+    pub mig: u64,
+}
 
 fn eagain() -> io::Error {
     io::Error::from_raw_os_error(libc::EAGAIN)
@@ -221,21 +234,24 @@ pub struct Pager {
     ready: (Mutex<bool>, Condvar),
     /// Firecracker pid, for reading pages out when acting as a migration source.
     pid: AtomicU32,
-    remote: Mutex<Option<PageClient>>,
+    remote: Mutex<Option<Link>>,
     remote_left: AtomicUsize,
     pull_started: OnceLock<Instant>,
     pull_finished: OnceLock<Instant>,
+    /// Signalled when the pull finishes or the pager stops.
+    done: (Mutex<()>, Condvar),
     /// Held while reading and applying a batch of uffd events.
     events: Mutex<()>,
     /// Set by the checkpoint barrier: no new prefetch.
     quiesce: AtomicBool,
+    failed: OnceLock<String>,
     stop: AtomicBool,
 }
 
 impl Pager {
     /// Listens on `sock` for Firecracker's UFFD handshake and serves faults in
     /// the background. `initial` seeds page states for an incoming migration.
-    pub fn start(sock: &Path, base: Arc<Template>, initial: Option<(Runs, String, String)>) -> Result<Arc<Pager>> {
+    pub fn start(sock: &Path, base: Arc<Template>, initial: Option<(Runs, Source)>) -> Result<Arc<Pager>> {
         let _ = std::fs::remove_file(sock);
         let listener = UnixListener::bind(sock)?;
         let pager = Arc::new(Pager {
@@ -249,8 +265,10 @@ impl Pager {
             remote_left: AtomicUsize::new(0),
             pull_started: OnceLock::new(),
             pull_finished: OnceLock::new(),
+            done: (Mutex::new(()), Condvar::new()),
             events: Mutex::new(()),
             quiesce: AtomicBool::new(false),
+            failed: OnceLock::new(),
             stop: AtomicBool::new(false),
         });
         let p = pager.clone();
@@ -274,13 +292,13 @@ impl Pager {
     }
 
     /// Takes over Firecracker's userfaultfd. Returns whether to prefetch the working set.
-    fn handshake(&self, listener: &UnixListener, initial: Option<(Runs, String, String)>) -> Result<bool> {
+    fn handshake(&self, listener: &UnixListener, initial: Option<(Runs, Source)>) -> Result<bool> {
         let (stream, _) = listener.accept()?;
         let (body, fd) = recv_with_fd(stream.as_raw_fd())?;
         let mappings: Vec<Mapping> = serde_json::from_slice(&body)?;
         let total = mappings.iter().map(|m| m.offset as usize + m.size).max().unwrap_or(0) / PAGE_SIZE;
         let pages = Pages::new(total);
-        if let Some((runs, addr, vm)) = initial {
+        if let Some((runs, source)) = initial {
             let _ = self.pull_started.set(Instant::now());
             let mut remote = 0;
             for (first, count, state) in runs {
@@ -292,7 +310,10 @@ impl Pager {
                 }
             }
             self.remote_left.store(remote, Ordering::SeqCst);
-            *self.remote.lock().unwrap() = Some(PageClient::connect(&addr, &vm)?);
+            // Connect now: the restore itself faults on remote pages.
+            let mut link = Link::new(source);
+            link.client = PageClient::connect(&link.source).ok();
+            *self.remote.lock().unwrap() = Some(link);
         }
         let fresh = self.remote_left() == 0;
         let _ = self.mappings.set(mappings);
@@ -363,7 +384,28 @@ impl Pager {
     fn pulled(&self, n: usize) {
         if n > 0 && self.remote_left.fetch_sub(n, Ordering::SeqCst) == n {
             let _ = self.pull_finished.set(Instant::now());
+            self.notify();
         }
+    }
+
+    /// Blocks until every remote page has arrived (true), or the pager has
+    /// stopped or failed first (false).
+    pub fn wait_pulled(&self) -> bool {
+        let mut guard = self.done.0.lock().unwrap();
+        loop {
+            if self.remote_left() == 0 {
+                return true;
+            }
+            if self.stop.load(Ordering::SeqCst) {
+                return false;
+            }
+            guard = self.done.1.wait(guard).unwrap();
+        }
+    }
+
+    fn notify(&self) {
+        let _guard = self.done.0.lock().unwrap();
+        self.done.1.notify_all();
     }
 
     pub fn set_pid(&self, pid: u32) {
@@ -372,6 +414,30 @@ impl Pager {
 
     pub fn stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
+        self.notify();
+    }
+
+    /// Gives up on the VM's memory: unless it was stopped on purpose, records
+    /// why and kills Firecracker, whose vCPUs (or snapshot load) may be
+    /// blocked on pages that will never come. Its pid cannot have been reused:
+    /// the daemon has not reaped it yet.
+    fn fail(&self, why: String) {
+        if !self.stop.load(Ordering::SeqCst) {
+            eprintln!("uffd: {why}; killing the vm");
+            let _ = self.failed.set(why);
+            match self.pid.load(Ordering::SeqCst) {
+                0 => {}
+                pid => unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                },
+            }
+        }
+        self.stop();
+    }
+
+    /// Why the pager gave up, if it did. The VM cannot make progress then.
+    pub fn failed(&self) -> Option<&str> {
+        self.failed.get().map(|s| s.as_str())
     }
 
     pub fn remote_left(&self) -> usize {
@@ -509,6 +575,7 @@ impl Pager {
                 match self.fault(addr) {
                     Ok(()) => {}
                     Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => pending.push_back(addr),
+                    Err(e) if e.kind() == io::ErrorKind::TimedOut => return self.fail(e.to_string()),
                     Err(e) => eprintln!("uffd: fault at {addr:#x}: {e}"),
                 }
             }
@@ -556,7 +623,7 @@ impl Pager {
                 }
                 let mut buf = vec![0u8; n * PAGE_SIZE];
                 let fetched = match self.remote.lock().unwrap().as_mut() {
-                    Some(c) => c.fetch((page * PAGE_SIZE) as u64, &mut buf),
+                    Some(link) => link.fetch((page * PAGE_SIZE) as u64, &mut buf, None),
                     None => Err(io::Error::other("no migration source")),
                 };
                 if let Err(e) = fetched {
@@ -619,24 +686,19 @@ impl Pager {
 
     /// Pulls every REMOTE page in the background so the source can let go.
     fn spawn_pullers(self: Arc<Self>) {
-        let (addr, vm) = {
-            let g = self.remote.lock().unwrap();
-            let c = g.as_ref().unwrap();
-            (c.addr.clone(), c.vm.clone())
-        };
+        let source = self.remote.lock().unwrap().as_ref().unwrap().source.clone();
         for t in 0..PULL_THREADS {
             let p = self.clone();
-            let (addr, vm) = (addr.clone(), vm.clone());
+            let link = Link::new(source.clone());
             thread::spawn(move || {
-                if let Err(e) = p.pull(t, &addr, &vm) {
-                    eprintln!("uffd: background pull {t} failed: {e}");
+                if let Err(e) = p.pull(t, link) {
+                    p.fail(format!("background pull {t} failed: {e}"));
                 }
             });
         }
     }
 
-    fn pull(&self, stripe: usize, addr: &str, vm: &str) -> io::Result<()> {
-        let mut client = PageClient::connect(addr, vm)?;
+    fn pull(&self, stripe: usize, mut link: Link) -> io::Result<()> {
         let pages = self.pages();
         let mut buf = vec![0u8; PULL_RUN * PAGE_SIZE];
         for m in self.mappings() {
@@ -653,7 +715,7 @@ impl Pager {
                         continue;
                     }
                     let b = &mut buf[..n * PAGE_SIZE];
-                    if let Err(e) = client.fetch((i * PAGE_SIZE) as u64, b) {
+                    if let Err(e) = link.fetch((i * PAGE_SIZE) as u64, b, Some(&self.stop)) {
                         self.pulled(pages.release(i, n, REMOTE));
                         return Err(e);
                     }
@@ -671,21 +733,90 @@ impl Pager {
     }
 }
 
+/// A page-server connection to the migration source that reconnects with
+/// backoff, and gives up once the source has been unreachable for
+/// `SOURCE_TIMEOUT`.
+struct Link {
+    source: Source,
+    client: Option<PageClient>,
+    /// When the current outage began.
+    down: Option<Instant>,
+    retry_at: Instant,
+    backoff: Duration,
+}
+
+impl Link {
+    fn new(source: Source) -> Link {
+        Link { source, client: None, down: None, retry_at: Instant::now(), backoff: BACKOFF_MIN }
+    }
+
+    /// Reads guest memory at `offset` from the source. Waiting to reconnect,
+    /// it sleeps until `stop` is set, or without `stop` fails with EAGAIN.
+    /// Fails with TimedOut once the outage is too long.
+    fn fetch(&mut self, offset: u64, buf: &mut [u8], stop: Option<&AtomicBool>) -> io::Result<()> {
+        loop {
+            if self.client.is_none() {
+                let wait = self.retry_at.saturating_duration_since(Instant::now());
+                match stop {
+                    Some(s) if s.load(Ordering::SeqCst) => return Err(io::Error::other("pager stopped")),
+                    Some(_) => thread::sleep(wait),
+                    None if !wait.is_zero() => return Err(eagain()),
+                    None => {}
+                }
+                match PageClient::connect(&self.source) {
+                    Ok(c) => self.client = Some(c),
+                    Err(e) => {
+                        self.lost(e)?;
+                        continue;
+                    }
+                }
+            }
+            match self.client.as_mut().unwrap().fetch(offset, buf) {
+                Ok(()) => {
+                    self.down = None;
+                    self.backoff = BACKOFF_MIN;
+                    return Ok(());
+                }
+                Err(e) => {
+                    self.client = None;
+                    self.lost(e)?;
+                }
+            }
+        }
+    }
+
+    /// Schedules a reconnect after `e`, or gives up.
+    fn lost(&mut self, e: io::Error) -> io::Result<()> {
+        let since = *self.down.get_or_insert_with(Instant::now);
+        if since.elapsed() >= SOURCE_TIMEOUT {
+            let why = format!("migration source {} unreachable for {:?}: {e}", self.source.addr, since.elapsed());
+            return Err(io::Error::new(io::ErrorKind::TimedOut, why));
+        }
+        if self.backoff == BACKOFF_MIN {
+            eprintln!("uffd: page fetch from {} failed, reconnecting: {e}", self.source.addr);
+        }
+        self.retry_at = Instant::now() + self.backoff;
+        self.backoff = (self.backoff * 2).min(BACKOFF_MAX);
+        Ok(())
+    }
+}
+
 /// Client for a migration source's page server.
 pub struct PageClient {
-    addr: String,
-    vm: String,
     stream: TcpStream,
 }
 
 impl PageClient {
-    pub fn connect(addr: &str, vm: &str) -> io::Result<Self> {
-        let mut stream = TcpStream::connect(addr)?;
+    pub fn connect(source: &Source) -> io::Result<Self> {
+        let addr = source.addr.to_socket_addrs()?.next().ok_or_else(|| io::Error::other("bad source address"))?;
+        let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(500))?;
         stream.set_nodelay(true)?;
-        let mut hello = serde_json::to_vec(&serde_json::json!({"op": "pages", "name": vm}))?;
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        let hello = serde_json::json!({"op": "pages", "name": source.vm, "mig": source.mig});
+        let mut hello = serde_json::to_vec(&hello)?;
         hello.push(b'\n');
         stream.write_all(&hello)?;
-        Ok(PageClient { addr: addr.into(), vm: vm.into(), stream })
+        Ok(PageClient { stream })
     }
 
     pub fn fetch(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
@@ -702,12 +833,13 @@ impl PageClient {
     }
 }
 
-/// Serves page reads for `pager` on an accepted page-server connection.
-pub fn serve_pages(pager: &Pager, mut stream: impl Read + Write) -> io::Result<()> {
+/// Serves page reads for `pager` on an accepted page-server connection,
+/// until the client hangs up or `down()` says to drop it.
+pub fn serve_pages(pager: &Pager, mut stream: impl Read + Write, down: impl Fn() -> bool) -> io::Result<()> {
     let mut req = [0u8; 12];
     let mut buf = Vec::new();
     loop {
-        if stream.read_exact(&mut req).is_err() {
+        if stream.read_exact(&mut req).is_err() || down() {
             return Ok(());
         }
         let offset = u64::from_le_bytes(req[..8].try_into().unwrap());

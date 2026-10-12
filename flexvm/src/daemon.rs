@@ -21,7 +21,7 @@ use crate::fc::Pool;
 use crate::guest;
 use crate::net::{self, IpRange};
 use crate::template::{Paths, Template, STEP_MIB};
-use crate::uffd::{serve_pages, Runs};
+use crate::uffd::{serve_pages, Runs, Source};
 use crate::util::{ms, proc_kb, recv_json, send_json, Phases, Result};
 use crate::vm::{State, Vm};
 
@@ -142,7 +142,7 @@ impl Daemon {
             "pages" => {
                 let vm = self.vm(&name)?;
                 let mut stream = ReadWrite(r, w);
-                return Ok(serve_pages(&vm.pager, &mut stream)?);
+                return Ok(serve_pages(&vm.pager, &mut stream, || false)?);
             }
             "exec" => return self.exec(&name, req["cmd"].as_str().unwrap_or(""), w),
             "incoming" => self.incoming(&req, &mut r),
@@ -155,7 +155,12 @@ impl Daemon {
             "info" => Ok(self.info()),
             "bench_info" => self.bench_info(req["template"].as_str().unwrap_or("default")),
             "migration_status" => self.vm(&name).map(|vm| {
-                json!({"background_pull_ms": vm.pager.pull_time().map(ms), "released": vm.released.get()})
+                json!({
+                    "background_pull_ms": vm.pager.pull_time().map(ms),
+                    "released": vm.released.get(),
+                    "state": vm.state().name(),
+                    "failed": vm.pager.failed(),
+                })
             }),
             _ => Err(format!("unknown op {op:?}").into()),
         };
@@ -337,7 +342,7 @@ impl Daemon {
             if *st != State::Running {
                 bail!("vm {name} is not running here");
             }
-            *st = State::Source;
+            *st = State::Source(0);
         }
         let mut t = Phases::new();
         let vmstate = vm.dir.join("vmstate.out");
@@ -398,7 +403,7 @@ impl Daemon {
     fn incoming(self: &Arc<Self>, req: &Value, r: &mut impl Read) -> Result<Value> {
         let mut t = Phases::new();
         let name = req["name"].as_str().ok_or("missing name")?.to_string();
-        let source = req["source"].as_str().ok_or("missing source")?.to_string();
+        let source = Source { addr: req["source"].as_str().ok_or("missing source")?.into(), vm: name.clone(), mig: 0 };
         let runs: Runs = serde_json::from_value(req["runs"].clone())?;
         let mut state = vec![0u8; req["vmstate_len"].as_u64().ok_or("missing vmstate_len")? as usize];
         r.read_exact(&mut state)?;
@@ -415,7 +420,7 @@ impl Daemon {
             let vmstate = idle.dir.join("vmstate.in");
             std::fs::write(&vmstate, &state)?;
             t.mark("write_state");
-            Vm::restore(idle, &name, tpl, &vmstate, Some((runs, source.clone(), name.clone())), ip, &mut t)
+            Vm::restore(idle, &name, tpl, &vmstate, Some((runs, source.clone())), ip, &mut t)
         })();
         let (vm, restore) = restored.inspect_err(|_| {
             self.ips.lock().unwrap().remove(&ip);
@@ -423,15 +428,18 @@ impl Daemon {
         self.vms.lock().unwrap().insert(name.clone(), vm.clone());
         self.announce(ip);
         t.mark("register");
-        // Tell the source to drop its copy once every page has arrived.
+        // Tell the source to drop its copy once every page has arrived, or
+        // as soon as the VM is gone here.
         thread::spawn(move || {
             let start = Instant::now();
-            while vm.pager.remote_left() > 0 {
-                thread::sleep(Duration::from_millis(5));
-            }
+            vm.pager.wait_pulled();
             let pulled = start.elapsed();
+            if let Some(why) = vm.pager.failed() {
+                eprintln!("vm {name}: lost its memory ({why}); stopping it");
+                vm.kill();
+            }
             let release = (|| {
-                let mut c = TcpStream::connect(&source)?;
+                let mut c = TcpStream::connect(&source.addr)?;
                 send_json(&mut c, &json!({"op": "release", "name": name}))?;
                 recv_json(&mut BufReader::new(c))
             })();
@@ -441,7 +449,7 @@ impl Daemon {
                 Ok(None) => json!("source hung up"),
                 Err(e) => json!(e.to_string()),
             };
-            eprintln!("vm {name}: memory pulled from {source} in {} ms (release: {released})", ms(pulled));
+            eprintln!("vm {name}: pull from {} ended after {} ms (release: {released})", source.addr, ms(pulled));
             let _ = vm.released.set(released);
         });
         Ok(json!({"restore_ms": ms(restore), "underlay": self.cfg.underlay.to_string(), "timings_ms": t.json()}))

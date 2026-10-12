@@ -9,14 +9,28 @@ use serde_json::{json, Value};
 use crate::bail;
 use crate::fc::{Firecracker, Idle};
 use crate::template::Template;
-use crate::uffd::{Pager, Runs};
+use crate::uffd::{Pager, Runs, Source};
 use crate::util::{Phases, Result, PAGE_SIZE};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
     Running,
-    /// Paused here while a migration target pulls its memory.
-    Source,
+    /// Paused here for migration `.0`: the target may own the VM from the
+    /// moment it gets the state, so this copy is never resumed unless the
+    /// target confirms the migration aborted.
+    Source(u64),
+    /// Its memory is lost (the pager gave up) or it could not be resumed.
+    Failed,
+}
+
+impl State {
+    pub fn name(self) -> &'static str {
+        match self {
+            State::Running => "running",
+            State::Source(_) => "source",
+            State::Failed => "failed",
+        }
+    }
 }
 
 pub struct Vm {
@@ -45,7 +59,7 @@ impl Vm {
         name: &str,
         template: Arc<Template>,
         vmstate: &Path,
-        remote: Option<(Runs, String, String)>,
+        remote: Option<(Runs, Source)>,
         ip: Ipv4Addr,
         phases: &mut Phases,
     ) -> Result<(Arc<Vm>, Duration)> {
@@ -60,8 +74,9 @@ impl Vm {
             }
         });
         phases.mark("cgroup_rename");
+        let pager = Pager::start(&dir.join("uffd.sock"), template.clone(), remote);
         let restored = (|| {
-            let pager = Pager::start(&dir.join("uffd.sock"), template.clone(), remote)?;
+            let pager = pager.as_ref().map_err(|e| e.to_string())?.clone();
             pager.set_pid(fc.pid());
             // Route the VM's address while Firecracker restores; it is not on the critical path.
             let route = {
@@ -91,6 +106,9 @@ impl Vm {
             Ok(r) => r,
             Err(e) => {
                 drop(fc);
+                if let Ok(pager) = pager {
+                    pager.stop();
+                }
                 crate::net::delete_tap(&tap);
                 let _ = std::fs::remove_dir_all(&dir);
                 return Err(e);
@@ -118,7 +136,10 @@ impl Vm {
     }
 
     pub fn state(&self) -> State {
-        *self.state.lock().unwrap()
+        match self.pager.failed() {
+            Some(_) => State::Failed,
+            None => *self.state.lock().unwrap(),
+        }
     }
 
     pub fn fc<R>(&self, f: impl FnOnce(&Firecracker) -> Result<R>) -> Result<R> {
@@ -156,9 +177,8 @@ impl Vm {
 
     pub fn kill(&self) {
         self.pager.stop();
-        if let Some(mut fc) = self.fc.lock().unwrap().take() {
-            fc.kill();
-        }
+        let Some(mut fc) = self.fc.lock().unwrap().take() else { return };
+        fc.kill();
         crate::net::delete_tap(&self.tap);
         if let Some(cg) = &self.cgroup {
             // The cgroup stays busy until the kernel has finished tearing the process down.
@@ -175,7 +195,7 @@ impl Vm {
             "name": self.name,
             "ip": self.ip.to_string(),
             "template": self.template.name,
-            "state": format!("{:?}", self.state()).to_lowercase(),
+            "state": self.state().name(),
             "vcpus": self.template.meta.vcpus,
             "rss_mib": self.rss() >> 20,
             "guest_mib": self.template.meta.mem_mib + hotplug["plugged_size_mib"].as_u64().unwrap_or(0),
