@@ -34,6 +34,7 @@ impl Firecracker {
             .stdout(log.try_clone()?)
             .stderr(log)
             .spawn()?;
+        crate::util::trace_mark(&format!("spawn {}", child.id()));
         let fc = Firecracker { child, sock };
         retry(Duration::from_secs(5), || Ok(UnixStream::connect(&fc.sock)?))?;
         Ok(fc)

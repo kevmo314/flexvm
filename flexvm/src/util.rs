@@ -64,6 +64,7 @@ impl Phases {
         let d = now - self.last;
         self.last = now;
         self.marks.insert(name.into(), ms(d).into());
+        trace_mark(name);
         d
     }
 
@@ -91,4 +92,18 @@ pub fn proc_kb(path: &str, key: &str) -> Option<u64> {
 
 pub fn host_cpus() -> usize {
     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+}
+
+/// Writes `msg` to the ftrace marker named by FLEXVM_TRACE_MARKER, if set, so
+/// phase boundaries line up with KVM tracepoints.
+pub fn trace_mark(msg: &str) {
+    use std::sync::OnceLock;
+    static MARKER: OnceLock<Option<std::fs::File>> = OnceLock::new();
+    let f = MARKER.get_or_init(|| {
+        let path = std::env::var_os("FLEXVM_TRACE_MARKER")?;
+        std::fs::OpenOptions::new().write(true).open(path).ok()
+    });
+    if let Some(mut f) = f.as_ref() {
+        let _ = f.write_all(format!("fvmark {msg}").as_bytes());
+    }
 }
