@@ -490,7 +490,7 @@ impl Daemon {
                         return Ok(send_json(&mut w, &json!({"ok": closed, "error": "session close failed"}))?);
                     }
                     if req["session"].is_string() {
-                        w.set_write_timeout(Some(Duration::from_secs(2)))?;
+                        // The guest heartbeats every second; silence means the VM moved.
                         g.get_ref().set_read_timeout(Some(Duration::from_secs(3)))?;
                     }
                     send_json(&mut w, &json!({"ok": true}))?;

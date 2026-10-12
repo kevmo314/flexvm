@@ -191,8 +191,9 @@ firecracker/        patches on top of Firecracker v1.17.0
   kept for migration targets.
 - **vsock connections reset on migration.** `flexvm exec` reconnects for up
   to 30 seconds, trying the original daemon and its peers. Guest commands keep
-  running; each session retains up to 4 MiB of recent output (at most 4096 chunks). If recovery falls
-  behind that buffer, exec reports output loss explicitly. Finished sessions
+  running; each session retains up to 4 MiB of recent output (at most 4096 chunks).
+  Output waits for an attached client, and for 30 seconds after it drops; past
+  that the buffer wraps and exec reports output loss explicitly. Finished sessions
   retain their exit until CLOSE or a five-minute expiry.
 - **Templates must be identical on every host.** Creation records a content ID
   and component hashes in `meta.json`; migration checks the ID before pausing

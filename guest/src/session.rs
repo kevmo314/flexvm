@@ -11,6 +11,8 @@ use crate::{spawn, wait_pid, write_frame, Statuses, FRAME_EXIT, FRAME_MSG, FRAME
 const CAPACITY: usize = 4 * 1024 * 1024;
 const MAX_CHUNKS: usize = 4096;
 const RETENTION: Duration = Duration::from_secs(300);
+/// How long output keeps waiting for a dropped client (the CLI retries for 30 s).
+const GRACE: Duration = Duration::from_secs(30);
 pub const FRAME_LOST: u8 = 5;
 
 type Session = Arc<(Mutex<Output>, Condvar)>;
@@ -34,6 +36,11 @@ struct Output {
     end: u64,
     exit: Option<(i32, Instant)>,
     closed: bool,
+    // While a client is attached, or recently was, output waits for it instead of
+    // overwriting what it has not been sent; half the ring is slack for bytes in flight.
+    readers: usize,
+    sent: u64,
+    detached: Option<Instant>,
 }
 
 impl Output {
@@ -104,15 +111,30 @@ pub fn cleanup(sessions: &Sessions) {
         .retain(|_, entry| entry.output.0.lock().unwrap().exit.is_none_or(|(_, at)| at.elapsed() < RETENTION));
 }
 
-pub fn handle(
-    mut w: impl Write,
-    mut r: impl Read,
-    line: &str,
-    sessions: &Sessions,
-    statuses: &Statuses,
-) -> io::Result<()> {
-    let request = parse(line)?;
-    let (id, offset, output) = match request {
+/// Request errors are reported as a message frame; write errors just end the stream,
+/// since a frame may have been cut short and anything after it would corrupt it.
+pub fn handle(mut w: impl Write, r: impl Read, line: &str, sessions: &Sessions, statuses: &Statuses) -> io::Result<()> {
+    match open(r, line, sessions, statuses) {
+        Ok(Some((id, offset, output))) => {
+            let result = write_frame(&mut w, FRAME_MSG, id.as_bytes()).and_then(|_| drain(&mut w, &output, offset));
+            let mut ring = output.0.lock().unwrap();
+            ring.readers -= 1;
+            ring.detached = Some(Instant::now());
+            drop(ring);
+            output.1.notify_all();
+            result
+        }
+        Ok(None) => write_frame(&mut w, FRAME_MSG, b"closed"),
+        Err(e) => fail(&mut w, e),
+    }
+}
+
+fn fail(w: &mut impl Write, e: impl std::fmt::Display) -> io::Result<()> {
+    write_frame(w, FRAME_MSG, format!("error: {e}").as_bytes())
+}
+
+fn open<'a>(mut r: impl Read, line: &'a str, sessions: &Sessions, statuses: &Statuses) -> io::Result<Option<(&'a str, u64, Session)>> {
+    Ok(Some(match parse(line)? {
         Request::Start { id, len } => {
             let mut command = vec![0; len];
             r.read_exact(&mut command)?;
@@ -122,7 +144,7 @@ pub fn handle(
                 if entry.command != command {
                     return Err(io::Error::other("session id already used for another command"));
                 }
-                entry.output.clone()
+                attach(&entry.output, 0)
             } else {
                 let command_text = std::str::from_utf8(&command).map_err(io::Error::other)?;
                 let mut child = spawn(
@@ -135,7 +157,7 @@ pub fn handle(
                     true,
                 )?;
                 let pid = child.id() as i32;
-                let output = Arc::new((Mutex::new(Output::default()), Condvar::new()));
+                let output = Arc::new((Mutex::new(Output { readers: 1, ..Default::default() }), Condvar::new()));
                 map.insert(id.to_string(), Entry { command, output: output.clone() });
                 let pumps = [
                     pump(child.stdout.take().unwrap(), output.clone(), FRAME_STDOUT),
@@ -156,9 +178,8 @@ pub fn handle(
             (id, 0, output)
         }
         Request::Attach { id, offset } => {
-            let output =
-                sessions.lock().unwrap().get(id).ok_or_else(|| io::Error::other("unknown session"))?.output.clone();
-            (id, offset, output)
+            let map = sessions.lock().unwrap();
+            (id, offset, attach(&map.get(id).ok_or_else(|| io::Error::other("unknown session"))?.output, offset))
         }
         Request::Close { id } => {
             let map = sessions.lock().unwrap();
@@ -169,13 +190,16 @@ pub fn handle(
             }
             output.closed = true;
             output.chunks.clear();
-            drop(output);
-            drop(map);
-            return write_frame(&mut w, FRAME_MSG, b"closed");
+            return Ok(None);
         }
-    };
-    write_frame(&mut w, FRAME_MSG, id.as_bytes())?;
-    drain(&mut w, &output, offset)
+    }))
+}
+
+fn attach(output: &Session, offset: u64) -> Session {
+    let mut ring = output.0.lock().unwrap();
+    ring.readers += 1;
+    ring.sent = offset;
+    output.clone()
 }
 
 fn pump(mut r: impl Read + Send + 'static, output: Session, kind: u8) -> thread::JoinHandle<()> {
@@ -188,7 +212,14 @@ fn pump(mut r: impl Read + Send + 'static, output: Session, kind: u8) -> thread:
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
             };
-            output.0.lock().unwrap().push(kind, &buf[..n], CAPACITY);
+            let mut ring = output.0.lock().unwrap();
+            while ring.end.saturating_sub(ring.sent) >= CAPACITY as u64 / 2
+                && (ring.readers > 0 || ring.detached.is_some_and(|t| t.elapsed() < GRACE))
+            {
+                ring = output.1.wait_timeout(ring, Duration::from_secs(1)).unwrap().0;
+            }
+            ring.push(kind, &buf[..n], CAPACITY);
+            drop(ring);
             output.1.notify_all();
         }
     })
@@ -199,10 +230,12 @@ fn drain(w: &mut impl Write, output: &Session, mut offset: u64) -> io::Result<()
         let (kind, data) = {
             let ring = output.0.lock().unwrap();
             if ring.closed {
-                return Err(io::Error::other("session closed"));
+                drop(ring);
+                return fail(w, "session closed");
             }
             if offset > ring.end {
-                return Err(io::Error::other("offset past output end"));
+                drop(ring);
+                return fail(w, "offset past output end");
             }
             if offset < ring.start {
                 (FRAME_LOST, ring.start.to_le_bytes().to_vec())
@@ -223,7 +256,11 @@ fn drain(w: &mut impl Write, output: &Session, mut offset: u64) -> io::Result<()
         };
         write_frame(w, kind, &data)?;
         match kind {
-            FRAME_STDOUT | FRAME_STDERR => offset += (data.len() - 8) as u64,
+            FRAME_STDOUT | FRAME_STDERR => {
+                offset += (data.len() - 8) as u64;
+                output.0.lock().unwrap().sent = offset;
+                output.1.notify_all();
+            }
             FRAME_EXIT | FRAME_LOST => return Ok(()),
             _ => {}
         }
@@ -308,16 +345,38 @@ mod tests {
         assert_eq!(wire[0], FRAME_MSG);
         assert!(statuses.0.lock().unwrap().is_empty(), "retry registered a second process");
         assert_eq!(sessions.lock().unwrap().len(), 1);
-        assert!(handle(Vec::new(), &b"false"[..], "SESSION retry 5", &sessions, &statuses).is_err());
+        let mut wire = Vec::new();
+        handle(&mut wire, &b"false"[..], "SESSION retry 5", &sessions, &statuses).unwrap();
+        assert!(wire.ends_with(b"error: session id already used for another command"));
         handle(Vec::new(), io::empty(), "CLOSE retry", &sessions, &statuses).unwrap();
         assert!(output.0.lock().unwrap().chunks.is_empty());
-        assert!(handle(Vec::new(), command.as_slice(), &line, &sessions, &statuses).is_err());
+        let mut wire = Vec::new();
+        handle(&mut wire, command.as_slice(), &line, &sessions, &statuses).unwrap();
+        assert!(wire.ends_with(b"error: session closed"));
         assert!(statuses.0.lock().unwrap().is_empty());
         cleanup(&sessions);
         assert_eq!(sessions.lock().unwrap().len(), 1, "closed ID must remain a tombstone");
         output.0.lock().unwrap().exit = Some((7, Instant::now() - RETENTION - Duration::from_secs(1)));
         cleanup(&sessions);
         assert!(sessions.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn attached_reader_applies_backpressure() {
+        let output = Arc::new((Mutex::new(Output { readers: 1, ..Default::default() }), Condvar::new()));
+        let pumped = pump(io::repeat(b'x').take(2 * CAPACITY as u64), output.clone(), FRAME_STDOUT);
+        let ring = output.0.lock().unwrap();
+        let (ring, _) = output.1.wait_timeout_while(ring, Duration::from_secs(2), |r| r.end < CAPACITY as u64 / 2).unwrap();
+        drop(ring);
+        thread::sleep(Duration::from_millis(50));
+        let ring = output.0.lock().unwrap();
+        assert_eq!(ring.start, 0, "attached reader's unsent output was overwritten");
+        assert!(ring.end < CAPACITY as u64 / 2 + 16 * 1024);
+        drop(ring);
+        output.0.lock().unwrap().readers = 0;
+        output.1.notify_all();
+        pumped.join().unwrap();
+        assert_eq!(output.0.lock().unwrap().start, CAPACITY as u64);
     }
 
     #[test]
@@ -355,6 +414,8 @@ mod tests {
             assert_eq!(&wire[5..13], &6u64.to_le_bytes());
             assert_eq!(&wire[13..], &7i32.to_le_bytes());
         }
-        assert!(drain(&mut Vec::new(), &output, 7).is_err());
+        wire.clear();
+        drain(&mut wire, &output, 7).unwrap();
+        assert!(wire.ends_with(b"error: offset past output end"));
     }
 }

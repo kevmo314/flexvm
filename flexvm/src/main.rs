@@ -332,6 +332,8 @@ fn exec_frames(
             }
             guest::FRAME_MSG if data == id.as_bytes() => { *started = true; continue; }
             guest::FRAME_MSG if data == b"waiting" && *started => {}
+            // Before the ID echo the request itself failed (bad command, old agent): don't retry it.
+            guest::FRAME_MSG if !*started => return Err(String::from_utf8_lossy(&data).into_owned().into()),
             guest::FRAME_MSG => return Ok(StreamEnd::Disconnected(String::from_utf8_lossy(&data).into_owned())),
             _ => return Err(format!("unknown session frame {kind}").into()),
         }

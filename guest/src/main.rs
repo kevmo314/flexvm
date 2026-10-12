@@ -237,16 +237,9 @@ fn serve(statuses: Statuses) -> io::Result<()> {
             let statuses = statuses.clone();
             let sessions = sessions.clone();
             thread::spawn(move || {
+                // A blocked write is backpressure from a slow client; migration resets the socket.
                 if matches!(line.split_whitespace().next(), Some("SESSION" | "ATTACH" | "CLOSE")) {
-                    let timeout = libc::timeval { tv_sec: 2, tv_usec: 0 };
-                    unsafe {
-                        libc::setsockopt(stream.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDTIMEO,
-                            (&timeout as *const libc::timeval).cast(), std::mem::size_of_val(&timeout) as _);
-                    }
-                    let mut errors = match stream.try_clone() { Ok(w) => w, Err(_) => return };
-                    if let Err(e) = session::handle(stream, r, &line, &sessions, &statuses) {
-                        let _ = write_frame(&mut errors, FRAME_MSG, format!("error: {e}").as_bytes());
-                    }
+                    let _ = session::handle(stream, r, &line, &sessions, &statuses);
                 } else {
                     let _ = handle(stream, r, &line, &statuses);
                 }
