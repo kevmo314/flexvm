@@ -1,4 +1,4 @@
-//! Guest networking, done with plain ioctls so the image needs no iproute2.
+//! Guest networking, done with ioctls and rtnetlink so the image needs no iproute2.
 //!
 //! Every VM is a clone of one template, so everything except the VM's own
 //! address is identical and set up once at template boot: eth0 talks to a
@@ -8,6 +8,7 @@
 
 use std::io;
 use std::net::Ipv4Addr;
+use std::sync::OnceLock;
 
 pub const GATEWAY: Ipv4Addr = Ipv4Addr::new(169, 254, 1, 1);
 pub const GATEWAY_MAC: [u8; 6] = [0x06, 0x00, 0xa9, 0xfe, 0x01, 0x01];
@@ -83,6 +84,9 @@ fn add_route(s: &Sock, dst: Ipv4Addr, mask: Ipv4Addr, gw: Option<Ipv4Addr>) -> i
     }
 }
 
+/// rtnetlink socket and eth0's index, kept from template boot for `configure`.
+static NETLINK: OnceLock<(libc::c_int, u32)> = OnceLock::new();
+
 /// Template-time setup: lo and eth0 up, gateway route and its static ARP entry.
 pub fn setup() -> io::Result<()> {
     let s = Sock::new()?;
@@ -90,7 +94,15 @@ pub fn setup() -> io::Result<()> {
     link_up(&s, IFACE)?;
     add_route(&s, GATEWAY, Ipv4Addr::BROADCAST, None)?;
     add_route(&s, Ipv4Addr::UNSPECIFIED, Ipv4Addr::UNSPECIFIED, Some(GATEWAY))?;
-    pin_gateway(&s)
+    pin_gateway(&s)?;
+    let mut req = ifreq(IFACE);
+    s.ioctl(libc::SIOCGIFINDEX, &mut req)?;
+    let fd = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW | libc::SOCK_CLOEXEC, libc::NETLINK_ROUTE) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let _ = NETLINK.set((fd, unsafe { req.ifr_ifru.ifru_ifindex } as u32));
+    Ok(())
 }
 
 /// The host never answers ARP for the gateway; its MAC is pinned instead.
@@ -109,18 +121,38 @@ fn pin_gateway(s: &Sock) -> io::Result<()> {
 }
 
 /// Gives eth0 its per-VM /32 address, and optionally a nameserver.
+///
+/// This runs on every start, right after restore, when each guest page the
+/// kernel touches for the first time costs a nested page fault. So it is one
+/// RTM_NEWADDR on a netlink socket opened at template boot: adding an address
+/// leaves the gateway route and ARP entry alone, where SIOCSIFADDR plus
+/// SIOCSIFNETMASK flush them and need them put back.
 pub fn configure(ip: Ipv4Addr, dns: Option<&str>) -> io::Result<()> {
-    let s = Sock::new()?;
-    let mut req = ifreq(IFACE);
-    req.ifr_ifru.ifru_addr = sockaddr(ip);
-    s.ioctl(libc::SIOCSIFADDR, &mut req)?;
-    let mut req = ifreq(IFACE);
-    req.ifr_ifru.ifru_netmask = sockaddr(Ipv4Addr::BROADCAST);
-    s.ioctl(libc::SIOCSIFNETMASK, &mut req)?;
-    // Setting the address flushes the interface's routes and neighbours; put them back.
-    add_route(&s, GATEWAY, Ipv4Addr::BROADCAST, None)?;
-    add_route(&s, Ipv4Addr::UNSPECIFIED, Ipv4Addr::UNSPECIFIED, Some(GATEWAY))?;
-    pin_gateway(&s)?;
+    let (fd, ifindex) = *NETLINK.get().ok_or_else(|| io::Error::other("no netlink socket"))?;
+    let mut msg = [0u8; 40];
+    msg[..4].copy_from_slice(&40u32.to_ne_bytes());
+    msg[4..6].copy_from_slice(&libc::RTM_NEWADDR.to_ne_bytes());
+    let flags = libc::NLM_F_REQUEST | libc::NLM_F_ACK | libc::NLM_F_CREATE | libc::NLM_F_REPLACE;
+    msg[6..8].copy_from_slice(&(flags as u16).to_ne_bytes());
+    // struct ifaddrmsg: family, prefixlen, flags, scope, index.
+    msg[16..20].copy_from_slice(&[libc::AF_INET as u8, 32, 0, libc::RT_SCOPE_UNIVERSE]);
+    msg[20..24].copy_from_slice(&ifindex.to_ne_bytes());
+    for (i, kind) in [libc::IFA_LOCAL, libc::IFA_ADDRESS].into_iter().enumerate() {
+        let a = &mut msg[24 + 8 * i..32 + 8 * i];
+        a[..2].copy_from_slice(&8u16.to_ne_bytes());
+        a[2..4].copy_from_slice(&kind.to_ne_bytes());
+        a[4..].copy_from_slice(&ip.octets());
+    }
+    let mut ack = [0u8; 64];
+    if unsafe { libc::send(fd, msg.as_ptr().cast(), msg.len(), 0) } < 0
+        || unsafe { libc::recv(fd, ack.as_mut_ptr().cast(), ack.len(), 0) } < 20
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let code = i32::from_ne_bytes(ack[16..20].try_into().unwrap());
+    if u16::from_ne_bytes([ack[4], ack[5]]) == libc::NLMSG_ERROR as u16 && code != 0 {
+        return Err(io::Error::from_raw_os_error(-code));
+    }
     if let Some(dns) = dns {
         std::fs::write("/etc/resolv.conf", format!("nameserver {dns}\n"))?;
     }

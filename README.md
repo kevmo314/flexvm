@@ -38,7 +38,7 @@ is written, so the pause does not grow with VM size.
 - Every guest's network setup is the same except for its address. The gateway
   is a fixed link-local address whose MAC is pinned in the guest, and every
   tap uses that MAC. So clones of one template need no per-VM changes beyond
-  `NET <ip>`, which the guest agent applies in about a millisecond with ioctls.
+  `NET <ip>`, which the guest agent applies with one rtnetlink message.
 - Taps are created ahead of time with the pooled Firecracker processes. The
   host route and a permanent neighbour entry are set with rtnetlink while the
   snapshot loads, so networking adds nothing to start time.
@@ -132,7 +132,7 @@ flexvm/src/
   fc.rs        Firecracker process, API client, warm pool
   guest.rs     vsock client for flexvm-init
 guest/src/main.rs   flexvm-init: PID 1, overlay root, vsock exec agent
-guest/src/net.rs    guest network setup with ioctls (no iproute2 needed)
+guest/src/net.rs    guest network setup with ioctls and rtnetlink (no iproute2 needed)
 firecracker/        patches on top of Firecracker v1.17.0
 ```
 

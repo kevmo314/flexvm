@@ -175,11 +175,25 @@ fn serve(statuses: Statuses) -> io::Result<()> {
         if conn < 0 {
             continue;
         }
-        let statuses = statuses.clone();
-        thread::spawn(move || {
-            let stream = unsafe { std::fs::File::from_raw_fd(conn as RawFd) };
-            let _ = handle(stream, statuses);
-        });
+        let stream = unsafe { std::fs::File::from_raw_fd(conn as RawFd) };
+        // The host sends its request with the connection; don't let a silent one stall accepting.
+        let timeout = libc::timeval { tv_sec: 1, tv_usec: 0 };
+        let opt = (&timeout as *const libc::timeval).cast();
+        unsafe { libc::setsockopt(conn, libc::SOL_SOCKET, libc::SO_RCVTIMEO, opt, std::mem::size_of_val(&timeout) as _) };
+        let Ok(mut r) = stream.try_clone().map(BufReader::new) else { continue };
+        let mut line = String::new();
+        if r.read_line(&mut line).is_err() {
+            continue;
+        }
+        // NET is on the critical path of every start, right after restore, when a new
+        // thread (stack, task, a wakeup on another vCPU) costs milliseconds. PING and
+        // NET are quick, so answer them here; only commands get a thread.
+        if line.starts_with("PING") || line.starts_with("NET ") {
+            let _ = handle(stream, r, &line, &statuses);
+        } else {
+            let statuses = statuses.clone();
+            thread::spawn(move || handle(stream, r, &line, &statuses));
+        }
     }
 }
 
@@ -192,10 +206,8 @@ fn frame(w: &Mutex<std::fs::File>, kind: u8, payload: &[u8]) -> io::Result<()> {
     w.write_all(payload)
 }
 
-fn handle(stream: std::fs::File, statuses: Statuses) -> io::Result<()> {
-    let mut r = BufReader::new(stream.try_clone()?);
-    let mut line = String::new();
-    r.read_line(&mut line)?;
+/// Serves one request; `line` is its first line, already read from `r`.
+fn handle(stream: std::fs::File, mut r: BufReader<std::fs::File>, line: &str, statuses: &Statuses) -> io::Result<()> {
     let line = line.trim_end();
     let out = Arc::new(Mutex::new(stream));
     let (verb, arg) = line.split_once(' ').unwrap_or((line, ""));
@@ -250,7 +262,7 @@ fn handle(stream: std::fs::File, statuses: Statuses) -> io::Result<()> {
             for p in pumps {
                 let _ = p.join();
             }
-            let code = wait_pid(&statuses, pid);
+            let code = wait_pid(statuses, pid);
             frame(&out, FRAME_EXIT, &code.to_le_bytes())
         }
         _ => frame(&out, FRAME_MSG, format!("unknown request {verb:?}").as_bytes()),
