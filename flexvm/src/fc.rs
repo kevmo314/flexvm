@@ -64,7 +64,18 @@ impl Firecracker {
     }
 
     fn request(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value> {
-        let mut stream = UnixStream::connect(&self.sock)?;
+        self.send(UnixStream::connect(&self.sock)?, method, path, body)
+    }
+
+    /// `request`, but connecting, writing and reading each time out after `timeout`.
+    pub fn request_within(&self, method: &str, path: &str, body: Option<Value>, timeout: Duration) -> Result<Value> {
+        if timeout.is_zero() {
+            bail!("firecracker {method} {path}: out of time");
+        }
+        self.send(crate::util::connect_unix(&self.sock, timeout)?, method, path, body)
+    }
+
+    fn send(&self, mut stream: UnixStream, method: &str, path: &str, body: Option<Value>) -> Result<Value> {
         let body = body.map(|b| b.to_string()).unwrap_or_default();
         // One write, so Firecracker's API thread wakes once per request.
         let req = format!(

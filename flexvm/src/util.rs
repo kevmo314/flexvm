@@ -1,5 +1,6 @@
 use std::io::{self, BufRead, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -57,6 +58,42 @@ pub fn connect(addr: &str, timeout: Duration) -> io::Result<std::net::TcpStream>
         }
     }
     Err(last)
+}
+
+/// Connects to the unix socket at `path` within `timeout`, with reads and
+/// writes on it timing out after `timeout` too. (A blocking connect waits
+/// for as long as the listener's backlog stays full.)
+pub fn connect_unix(path: &std::path::Path, timeout: Duration) -> io::Result<UnixStream> {
+    use std::os::unix::ffi::OsStrExt;
+    let deadline = Instant::now() + timeout;
+    let mut sa: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    sa.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.len() >= sa.sun_path.len() {
+        return Err(io::Error::other("socket path too long"));
+    }
+    for (d, s) in sa.sun_path.iter_mut().zip(bytes) {
+        *d = *s as libc::c_char;
+    }
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+    // A non-blocking unix connect fails with EAGAIN while the backlog is full.
+    while unsafe { libc::connect(fd.as_raw_fd(), &sa as *const _ as *const libc::sockaddr, len) } < 0 {
+        let e = io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::EAGAIN) || Instant::now() >= deadline {
+            return Err(e);
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let s = UnixStream::from(fd);
+    s.set_nonblocking(false)?;
+    s.set_read_timeout(Some(timeout))?;
+    s.set_write_timeout(Some(timeout))?;
+    Ok(s)
 }
 
 /// A pidfd for `pid`: it keeps naming that process even once the pid is reused.

@@ -14,10 +14,13 @@ pub const FRAME_STDERR: u8 = 2;
 pub const FRAME_EXIT: u8 = 3;
 pub const FRAME_MSG: u8 = 4;
 
-/// Opens a connection to the guest agent and sends one request line.
-pub fn request(uds: &Path, line: &str) -> Result<BufReader<UnixStream>> {
-    let mut s = UnixStream::connect(uds)?;
-    s.set_read_timeout(Some(Duration::from_secs(2)))?;
+/// How long a request may wait on Firecracker or the guest agent.
+pub const TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Opens a connection to the guest agent and sends one request line. Reads
+/// and writes on the returned stream time out after `timeout`.
+pub fn request(uds: &Path, line: &str, timeout: Duration) -> Result<BufReader<UnixStream>> {
+    let mut s = crate::util::connect_unix(uds, timeout)?;
     // One write: Firecracker reads the CONNECT line without blocking as soon as
     // any of it arrives, and drops the connection if the line is incomplete.
     // It reads only up to the newline, so the request rides along and is
@@ -29,15 +32,22 @@ pub fn request(uds: &Path, line: &str) -> Result<BufReader<UnixStream>> {
     if !ok.starts_with("OK") {
         bail!("vsock connect refused: {ok:?}");
     }
-    r.get_ref().set_read_timeout(None)?;
     Ok(r)
 }
 
-/// Starts a shell command in the guest; frames follow on the returned stream.
-pub fn start_exec(uds: &Path, cmd: &str) -> Result<BufReader<UnixStream>> {
-    let mut r = request(uds, &format!("EXEC {}", cmd.len()))?;
+/// Starts a shell command in the guest; frames follow on the returned
+/// stream, which still has `request`'s timeouts.
+pub fn start_exec(uds: &Path, cmd: &str, timeout: Duration) -> Result<BufReader<UnixStream>> {
+    let mut r = request(uds, &format!("EXEC {}", cmd.len()), timeout)?;
     r.get_mut().write_all(cmd.as_bytes())?;
     Ok(r)
+}
+
+/// Lets a stream from `request` wait on the guest for as long as it takes.
+pub fn untimed(r: &BufReader<UnixStream>) -> Result<()> {
+    r.get_ref().set_read_timeout(None)?;
+    r.get_ref().set_write_timeout(None)?;
+    Ok(())
 }
 
 /// Reads one frame. Returns None at end of stream.
@@ -56,7 +66,7 @@ pub fn read_frame(r: &mut impl Read) -> Result<Option<(u8, Vec<u8>)>> {
 }
 
 pub fn ping(uds: &Path) -> Result<()> {
-    let mut r = request(uds, "PING")?;
+    let mut r = request(uds, "PING", Duration::from_secs(2))?;
     match read_frame(&mut r)? {
         Some((FRAME_MSG, m)) if m == b"pong" => Ok(()),
         other => bail!("unexpected ping reply {other:?}"),
@@ -65,7 +75,8 @@ pub fn ping(uds: &Path) -> Result<()> {
 
 /// Runs a shell command in the guest and collects its output.
 pub fn exec(uds: &Path, cmd: &str) -> Result<(i32, Vec<u8>)> {
-    let mut r = start_exec(uds, cmd)?;
+    let mut r = start_exec(uds, cmd, TIMEOUT)?;
+    untimed(&r)?;
     let mut out = Vec::new();
     while let Some((kind, data)) = read_frame(&mut r)? {
         match kind {
@@ -78,7 +89,7 @@ pub fn exec(uds: &Path, cmd: &str) -> Result<(i32, Vec<u8>)> {
 
 /// Sets the guest's address (and nameserver). Doubles as the readiness check.
 pub fn net(uds: &Path, ip: std::net::Ipv4Addr, dns: Option<&str>) -> Result<()> {
-    let mut r = request(uds, &format!("NET {ip} {}", dns.unwrap_or("")))?;
+    let mut r = request(uds, &format!("NET {ip} {}", dns.unwrap_or("")), TIMEOUT)?;
     match read_frame(&mut r)? {
         Some((FRAME_MSG, m)) if m == b"ok" => Ok(()),
         Some((_, m)) => bail!("guest network setup: {}", String::from_utf8_lossy(&m)),

@@ -231,28 +231,41 @@ impl Vm {
     /// Retries a few times; the VM keeps running regardless, only its
     /// statistics go stale.
     fn unpark_balloon(&self) {
-        let res = crate::util::retry(Duration::from_millis(500), || {
-            self.fc(|fc| fc.patch("/balloon/statistics", json!({"stats_polling_interval_s": BALLOON_STATS_S})))
-        });
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let res = loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let body = json!({"stats_polling_interval_s": BALLOON_STATS_S});
+            match self.fc(|fc| fc.request_within("PATCH", "/balloon/statistics", Some(body), left)) {
+                Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+                r => break r,
+            }
+        };
         if let Err(e) = res {
             eprintln!("vm {}: balloon statistics stay off: {e}", self.name);
         }
     }
 
     /// Starts `cmd` in the guest and registers the session so a checkpoint
-    /// can close it. Fails unless the VM is running here.
+    /// can close it. Fails unless the VM is running here. Everything done
+    /// under the admission lock has a deadline (`guest::TIMEOUT`), so a stuck
+    /// guest cannot hold off migrations; the session is untimed afterwards.
     pub fn exec(&self, cmd: &str) -> Result<(BufReader<UnixStream>, u64)> {
-        let mut execs = self.execs.lock().unwrap();
-        if self.state() != State::Running {
-            bail!("vm {} is not running here", self.name);
-        }
-        let g = crate::guest::start_exec(&self.vsock(), cmd)?;
-        let id = self.next_exec.fetch_add(1, Ordering::SeqCst);
-        execs.insert(id, g.get_ref().try_clone()?);
+        let (g, id) = {
+            let mut execs = self.execs.lock().unwrap();
+            if self.state() != State::Running {
+                bail!("vm {} is not running here", self.name);
+            }
+            let g = crate::guest::start_exec(&self.vsock(), cmd, crate::guest::TIMEOUT)?;
+            let id = self.next_exec.fetch_add(1, Ordering::SeqCst);
+            execs.insert(id, g.get_ref().try_clone()?);
+            (g, id)
+        };
+        crate::guest::untimed(&g)?;
         Ok((g, id))
     }
 
     /// Sets the guest's address, unless the VM is no longer running here.
+    /// Bounded by `guest::TIMEOUT`, as it holds the admission lock.
     pub fn guest_net(&self, ip: Ipv4Addr, dns: Option<&str>) -> Result<()> {
         let _admission = self.execs.lock().unwrap();
         if self.state() != State::Running {
