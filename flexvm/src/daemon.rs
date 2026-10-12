@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, Read, Write};
-use std::net::{Ipv4Addr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -467,8 +467,7 @@ impl Daemon {
             let paused = t.mark("checkpoint");
             let state = std::fs::read(&vmstate)?;
             t.mark("read_state");
-            let addr = to.to_socket_addrs()?.next().ok_or("bad target address")?;
-            let conn = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
+            let conn = crate::util::connect(to, Duration::from_secs(2))?;
             conn.set_nodelay(true)?;
             // A target that hangs leaves the outcome to `outcome` below.
             conn.set_read_timeout(Some(Duration::from_secs(30)))?;
