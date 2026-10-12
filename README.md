@@ -31,9 +31,10 @@ Every install (fault, prefetch, background pull) first claims its pages
 (`INFLIGHT`). A balloon or virtio-mem REMOVE on a claimed page marks it
 `DISCARDED`, so the installer skips it instead of copying stale bytes in or
 marking it PRESENT; failed fetches and copies give their claims back. Copies
-hold a lock that REMOVE handling takes exclusively, and the kernel zaps a
-removed range only after its event is read, so no copy can land in a page the
-guest has just given back. A checkpoint stops prefetch and waits for claims to
+hold a lock that REMOVE handling takes exclusively, and the kernel fails copies
+while a REMOVE is queued, so no data lands in a page the guest has just given
+back. The kernel's zap itself can still come after a page settled PRESENT, so a
+fault on a PRESENT page zero-fills it if it is missing. A checkpoint stops prefetch and waits for claims to
 settle before exporting page states, so they match the saved vmstate. If the
 migration source stays unreachable for 10 s (fetches reconnect with backoff
 until then), the target kills the VM and reports it `failed`.
@@ -52,8 +53,9 @@ id off, so it can never start later). If the target committed, the source stays
 paused and serves memory until the target releases it with the same id;
 release is idempotent and ignores any other VM by that name. If the target
 cannot be asked, the VM stays paused on the source until it can. A daemon
-kills any Firecracker left in its run directory by a previous instance before
-it answers anything, so "never seen this id" is true of a restarted target too
+locks its run directory (refusing to start if another daemon uses it, or one
+inside or around it) and kills any Firecracker a previous instance left there,
+confirming each is dead, before it answers anything, so "never seen this id" is true of a restarted target too
 (a source resuming then rolls the VM back to the pause point; it never runs
 twice).
 
