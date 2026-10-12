@@ -111,7 +111,7 @@ RAM and double memory use on a host that is already short.
 | of which Firecracker snapshot load | 22–50 ms (mostly KVM memslot setup, which is slow under nested virt) |
 | Migration downtime | **36–62 ms** (2 vCPU), **56–63 ms** (24 vCPU, 500 MB live data) |
 | TCP connection through two migrations | no errors, worst stall 217 ms (one client retransmit) |
-| nginx image, `run` → first HTTP response from the host | **169 ms** p50 (run 48 + nginx startup 119); `--warm`: **55 ms** p50 (run 32 + first request 21) |
+| nginx image, `run` → first HTTP response from the host | **205 ms** p50 (run 56 + nginx startup 144); `--warm`: **55 ms** p50 (run 31 + first request 22) |
 | Background memory pull | ~1.1 GB/s over loopback TCP |
 | Idle VM host RSS | 13–35 MiB |
 
@@ -180,9 +180,11 @@ array; a new entrypoint drops the image's command), `--env K=V` (repeatable),
   empty `/etc/resolv.conf` if the image has none (the daemon's `--dns` fills
   it at `run`). `mkfs.ext4 -d` writes the read-only image. Built filesystems
   are cached in `ARTIFACTS/images/rootfs/` by image config digest, flexvm-init
-  and overrides, and hard-linked into each template, so templates of one image
-  share one copy in the page cache. The template's `meta.json` records the
-  image's manifest and config digests.
+  and overrides, and templates attach the cached file in place, so templates of
+  one image share one copy in the page cache (it is never rewritten; deleting it
+  breaks those templates). The template's content ID covers that file as its
+  `rootfs` component plus the image's manifest and config digests and the
+  app config, so it differs whenever the image does.
 - **Process.** flexvm-init stays PID 1. It starts the entrypoint in its own
   session with the image's env, workdir and credentials, reaps it and records
   its exit status, and keeps its stdout and stderr (interleaved) in a 1 MiB
@@ -192,7 +194,7 @@ array; a new entrypoint drops the image's command), `--env K=V` (repeatable),
   without `/bin/sh` exits 127 with a message saying so. `/dev/stdout` and
   friends exist, so images that log to them work.
 - **When the app starts.** By default at `run`: the snapshot is an idle booted
-  guest and `run` sends `START` after the address is set (`app_start`, ~17 ms
+  guest and `run` sends `APP` after the address is set (`app_start`, ~17 ms
   for nginx), then the app starts as it would anywhere. With `--warm` the
   template starts the app, waits until it is ready (`--ready-port N`: something
   accepts on 127.0.0.1:N in the guest, default the first exposed TCP port;
