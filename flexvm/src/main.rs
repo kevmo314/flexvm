@@ -1,4 +1,5 @@
 mod bench;
+mod bench_lifecycle;
 mod checkpoint;
 mod daemon;
 mod fc;
@@ -47,6 +48,7 @@ usage:
   flexvm restore DIR [--name N] [--ip IP|auto]               start a VM from a checkpoint (same template id)
   flexvm bench [--to ADDR] [--iterations N] [--dirty-mib N]  per-phase run/migrate latency into bench/
                [--template T] [--ready-port N | --ready-http N]  ... and until an image app answers
+  flexvm bench --lifecycle DIR [--to ADDR] [--dirty-mib N,N..] pause/checkpoint/restore/suspend latency into bench/
   flexvm kill NAME                                           stop a VM
 
 options:
@@ -186,7 +188,10 @@ fn real_main() -> Result<()> {
                 dns: args.get("dns").map(String::from),
             })
         }
-        Some("bench") => bench::run(&host, &args),
+        Some("bench") => match args.get("lifecycle") {
+            Some(dir) => bench_lifecycle::run(&host, &args, dir),
+            None => bench::run(&host, &args),
+        },
         Some("run") => print(call(
             &host,
             json!({"op": "run", "name": name, "template": args.get("template").unwrap_or("default"), "ip": args.get("ip")}),
