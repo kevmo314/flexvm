@@ -6,6 +6,7 @@
 //! Request: one text line, `PING`, `NET <ip> [dns]`, `EXEC <len>` or `SPAWN <len>`;
 //! EXEC/SPAWN are followed by `len` bytes of shell command. Resumable commands use
 //! `SESSION <id> <len>`, `ATTACH <id> <offset>` and `CLOSE <id>` (see session.rs).
+//! Image templates add the app requests in `app.rs`.
 //! Response: frames of `[kind u8][len u32 LE][payload]`, where kind is
 //! 1 = stdout, 2 = stderr, 3 = exit code (i32 LE), 4 = message.
 
@@ -18,6 +19,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
+mod app;
 mod net;
 mod session;
 
@@ -119,6 +121,10 @@ fn setup_root() -> io::Result<()> {
     mount("devpts", "/dev/pts", "devpts", 0, "")?;
     std::fs::create_dir_all("/dev/shm")?;
     mount("tmpfs", "/dev/shm", "tmpfs", 0, "size=0")?;
+    // devtmpfs lacks these; images log to /dev/stdout (nginx) and the like.
+    for (link, target) in [("fd", "/proc/self/fd"), ("stdin", "/proc/self/fd/0"), ("stdout", "/proc/self/fd/1"), ("stderr", "/proc/self/fd/2")] {
+        let _ = std::os::unix::fs::symlink(target, format!("/dev/{link}"));
+    }
     unsafe { libc::sethostname(c"flexvm".as_ptr(), 6) };
     std::env::set_var("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
     std::env::set_var("HOME", "/root");
@@ -304,14 +310,23 @@ fn handle(stream: std::fs::File, mut r: BufReader<std::fs::File>, line: &str, st
             frame(&out, FRAME_MSG, child.id().to_string().as_bytes())
         }
         "EXEC" => {
-            let mut child = spawn(
+            let spawned = spawn(
                 Command::new("/bin/sh")
                     .args(["-c", arg])
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped()),
                 statuses, true,
-            )?;
+            );
+            // Minimal images (distroless, scratch) have no shell.
+            let mut child = match spawned {
+                Ok(c) => c,
+                Err(e) => {
+                    let msg = format!("flexvm-init: cannot run /bin/sh: {e} (does the image have a shell?)\n");
+                    frame(&out, FRAME_STDERR, msg.as_bytes())?;
+                    return frame(&out, FRAME_EXIT, &127i32.to_le_bytes());
+                }
+            };
             let pid = child.id() as i32;
             let pumps = [
                 pump(child.stdout.take().unwrap(), out.clone(), FRAME_STDOUT),
@@ -323,6 +338,7 @@ fn handle(stream: std::fs::File, mut r: BufReader<std::fs::File>, line: &str, st
             let code = wait_pid(statuses, pid);
             frame(&out, FRAME_EXIT, &code.to_le_bytes())
         }
+        v if app::VERBS.contains(&v) => app::handle(v, arg, &out, statuses),
         _ => frame(&out, FRAME_MSG, format!("unknown request {verb:?}").as_bytes()),
     }
 }
