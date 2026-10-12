@@ -1,0 +1,23 @@
+--- a/src/vmm/src/persist.rs
++++ b/src/vmm/src/persist.rs
+@@ -186,11 +186,15 @@
+             "snapshot requires KVM".into(),
+         ))
+     })?;
+-    kvm_vm.snapshot_memory_to_file(
+-        &params.mem_file_path,
+-        params.snapshot_type,
+-        params.sync_snapshot_files,
+-    )?;
++    // flexvm: an empty mem_file_path saves only the microVM state. Guest memory is
++    // then served straight out of the paused process by the UFFD page server.
++    if !params.mem_file_path.as_os_str().is_empty() {
++        kvm_vm.snapshot_memory_to_file(
++            &params.mem_file_path,
++            params.snapshot_type,
++            params.sync_snapshot_files,
++        )?;
++    }
+ 
+     // We need to mark queues as dirty again for all activated devices. The reason we
+     // do it here is that we don't mark pages as dirty during runtime
