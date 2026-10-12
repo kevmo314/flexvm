@@ -66,12 +66,13 @@ impl Firecracker {
     fn request(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value> {
         let mut stream = UnixStream::connect(&self.sock)?;
         let body = body.map(|b| b.to_string()).unwrap_or_default();
-        write!(
-            stream,
+        // One write, so Firecracker's API thread wakes once per request.
+        let req = format!(
             "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\n\
              Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
-        )?;
+        );
+        stream.write_all(req.as_bytes())?;
         let mut r = BufReader::new(stream);
         let mut status = String::new();
         r.read_line(&mut status)?;

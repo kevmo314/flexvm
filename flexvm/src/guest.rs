@@ -18,7 +18,9 @@ pub const FRAME_MSG: u8 = 4;
 pub fn request(uds: &Path, line: &str) -> Result<BufReader<UnixStream>> {
     let mut s = UnixStream::connect(uds)?;
     s.set_read_timeout(Some(Duration::from_secs(2)))?;
-    writeln!(s, "CONNECT {PORT}")?;
+    // One write: Firecracker reads the CONNECT line without blocking as soon as
+    // any of it arrives, and drops the connection if the line is incomplete.
+    s.write_all(format!("CONNECT {PORT}\n").as_bytes())?;
     let mut r = BufReader::new(s);
     let mut ok = String::new();
     r.read_line(&mut ok)?;
