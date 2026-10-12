@@ -127,7 +127,7 @@ fn iteration(
 }
 
 /// Nearest-rank p50/p90/p99/max of every phase in `group`.
-fn summarize(samples: &[Value], group: &str) -> Result<Value> {
+pub(crate) fn summarize(samples: &[Value], group: &str) -> Result<Value> {
     let Some(phases) = samples.first().and_then(|s| s[group].as_object()) else {
         bail!("no {group} timings; are the daemons up to date?");
     };
@@ -144,7 +144,7 @@ fn summarize(samples: &[Value], group: &str) -> Result<Value> {
     Ok(summary.into())
 }
 
-fn command(bin: &str, args: &[&str]) -> Result<String> {
+pub(crate) fn command(bin: &str, args: &[&str]) -> Result<String> {
     let out = Command::new(bin).args(args).output()?;
     if !out.status.success() {
         bail!("{bin} failed: {}", String::from_utf8_lossy(&out.stderr).trim());
