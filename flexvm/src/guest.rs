@@ -167,6 +167,19 @@ pub fn probe(uds: &Path, port: u16) -> Result<bool> {
     Ok(message(uds, &format!("PROBE {port}"))? == "ok")
 }
 
+/// Runs a readiness command (`sh -c`) in the guest with its output
+/// discarded; the guest kills it if it runs past `timeout`. True on exit 0.
+pub fn check(uds: &Path, cmd: &str, timeout: Duration) -> Result<bool> {
+    let hex: String = cmd.bytes().map(|b| format!("{b:02x}")).collect();
+    let mut r = request(uds, &format!("CHECK {} {hex}", timeout.as_millis()), timeout + TIMEOUT)?;
+    match read_frame(&mut r)? {
+        Some((FRAME_MSG, m)) if m == b"ok" => Ok(true),
+        Some((FRAME_MSG, m)) if m.starts_with(b"exit ") || m == b"timeout" => Ok(false),
+        Some((_, m)) => bail!("readiness command: {}", String::from_utf8_lossy(&m)),
+        None => bail!("guest closed the connection during the readiness command"),
+    }
+}
+
 /// Syncs and drops guest caches before a snapshot, without needing a shell.
 pub fn quiesce(uds: &Path) -> Result<()> {
     match message(uds, "QUIESCE")?.as_str() {

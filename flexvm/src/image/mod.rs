@@ -14,6 +14,8 @@ mod registry;
 mod source;
 mod unpack;
 
+use std::fs::File;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -25,6 +27,8 @@ use crate::bail;
 use crate::guest;
 use crate::util::{ms, Result};
 use registry::sha256_hex;
+pub use unpack::Limits;
+use registry::sync_dir;
 use unpack::Root;
 
 /// What a template records about its image; part of its metadata.
@@ -75,6 +79,8 @@ pub struct Options {
     pub ready: Option<Ready>,
     #[serde(skip)]
     pub ready_timeout: Duration,
+    #[serde(skip)]
+    pub limits: Limits,
 }
 
 /// `--entrypoint` / `--cmd`: a JSON array, or words split on whitespace.
@@ -136,7 +142,7 @@ fn app_config(config: &Value, o: &Options) -> Result<App> {
 /// Builds (or finds in the cache) the root filesystem for `o.image` and
 /// returns its path. `init` is the static flexvm-init binary.
 pub fn prepare(cache: &Path, init: &Path, o: &Options) -> Result<(PathBuf, ImageMeta)> {
-    let img = source::fetch(cache, &o.image)?;
+    let img = source::fetch(cache, &o.image, &o.limits)?;
     let config: Value = serde_json::from_slice(&img.config)?;
     let (os, arch) = (config["os"].as_str().unwrap_or("linux"), config["architecture"].as_str().unwrap_or("amd64"));
     if os != "linux" || arch != "amd64" {
@@ -152,17 +158,39 @@ pub fn prepare(cache: &Path, init: &Path, o: &Options) -> Result<(PathBuf, Image
         (None, false) => None,
     };
     let init_bytes = std::fs::read(init).map_err(|e| format!("flexvm-init at {init:?}: {e} (run scripts/build-rootfs.sh)"))?;
+    // The config pins the uncompressed layers (diff_ids, each checked while
+    // unpacking); they are in the key explicitly too.
     let key = sha256_hex(
-        json!({"v": 1, "config": img.config_digest, "init": sha256_hex(&init_bytes), "options": o}).to_string().as_bytes(),
+        json!({
+            "v": 2, "config": img.config_digest, "diff_ids": img.diff_ids,
+            "init": sha256_hex(&init_bytes), "options": o,
+        })
+        .to_string()
+        .as_bytes(),
     );
-    let cached = cache.join("rootfs").join(format!("{}.ext4", &key["sha256:".len()..]));
-    // The app config written into it, kept beside it for the template's id.
+    let rootfs_dir = cache.join("rootfs");
+    let cached = rootfs_dir.join(format!("{}.ext4", &key["sha256:".len()..]));
+    // The app config written into it, kept beside it for the template's id;
+    // `.ok` is written last and makes the entry valid.
     let conf_path = cached.with_extension("conf");
-    if cached.exists() && conf_path.exists() {
+    let done = cached.with_extension("ok");
+    if done.exists() && cached.exists() && conf_path.exists() {
         eprintln!("image: root filesystem cached at {}", cached.display());
     } else {
-        let conf = build_rootfs(cache, &img, &app, &init_bytes, &cached)?;
-        std::fs::write(&conf_path, conf)?;
+        let _ = std::fs::remove_file(&done);
+        std::fs::create_dir_all(&rootfs_dir)?;
+        let tmp = cached.with_extension(format!("tmp{}", std::process::id()));
+        let res = build_rootfs(cache, &img, &app, &init_bytes, &tmp, &o.limits).and_then(|conf| {
+            File::open(&tmp)?.sync_all()?;
+            publish(&conf_path, conf.as_bytes())?;
+            std::fs::rename(&tmp, &cached)?;
+            publish(&done, b"")?;
+            sync_dir(&rootfs_dir)
+        });
+        if res.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        res?;
     }
     let app_conf = std::fs::read_to_string(&conf_path)?;
     Ok((cached, ImageMeta {
@@ -183,9 +211,11 @@ pub fn warm_up(vsock: &Path, meta: &ImageMeta) -> Result<()> {
     let start = Instant::now();
     guest::start_app(vsock)?;
     loop {
+        let left = meta.ready_timeout.saturating_sub(start.elapsed());
         let ready = match &meta.ready {
             Some(Ready::Port(p)) => guest::probe(vsock, *p)?,
-            Some(Ready::Cmd(c)) => guest::exec(vsock, c)?.0 == 0,
+            // Killed in the guest if it outlives the deadline; output discarded.
+            Some(Ready::Cmd(c)) => guest::check(vsock, c, left.max(Duration::from_millis(100)))?,
             None => true,
         };
         if ready {
@@ -202,40 +232,86 @@ pub fn warm_up(vsock: &Path, meta: &ImageMeta) -> Result<()> {
     }
 }
 
-/// The app's buffered output and its final status line.
+/// The last 64 KiB of the app's buffered output, and its final status line.
 pub fn read_logs(vsock: &Path) -> Result<(Vec<u8>, String)> {
+    const KEEP: usize = 64 << 10;
     let mut r = guest::start_logs(vsock, 0, false, guest::TIMEOUT)?;
     let mut out = Vec::new();
     while let Some((kind, data)) = guest::read_frame(&mut r)? {
         match kind {
             guest::FRAME_MSG => return Ok((out, String::from_utf8_lossy(&data).into_owned())),
-            _ => out.extend_from_slice(&data),
+            _ => {
+                out.extend_from_slice(&data);
+                if out.len() > 2 * KEEP {
+                    out.drain(..out.len() - KEEP);
+                }
+            }
         }
     }
     bail!("guest closed the connection while sending logs")
 }
 
+/// Writes `path` durably: a temporary file, fsynced, renamed over it.
+fn publish(path: &Path, data: &[u8]) -> Result<()> {
+    let tmp = path.with_extension(format!("part{}", std::process::id()));
+    let mut f = File::create(&tmp)?;
+    f.write_all(data)?;
+    f.sync_all()?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// A private staging area: `cache/tmp`, root-owned and 0700, so no other
+/// user can reach the setuid binaries, device nodes or capabilities an
+/// image's layers carry while they sit unpacked on the host.
+fn staging_dir(cache: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let tmp = cache.join("tmp");
+    std::fs::create_dir_all(&tmp)?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700))?;
+    let m = std::fs::symlink_metadata(&tmp)?;
+    let euid = unsafe { libc::geteuid() };
+    if !m.is_dir() || m.uid() != euid || m.mode() & 0o077 != 0 {
+        bail!("{tmp:?} must be a directory owned by uid {euid} with mode 0700");
+    }
+    Ok(tmp)
+}
+
+/// Unpacks the image, checking every layer, into `dest` (an ext4 image).
 /// Returns the app.conf it wrote.
-fn build_rootfs(cache: &Path, img: &source::Image, app: &App, init: &[u8], dest: &Path) -> Result<String> {
-    let work = cache.join("tmp").join(format!("rootfs-{}", std::process::id()));
+fn build_rootfs(cache: &Path, img: &source::Image, app: &App, init: &[u8], dest: &Path, limits: &Limits) -> Result<String> {
+    let work = staging_dir(cache)?.join(format!("rootfs-{}", std::process::id()));
     if work.exists() {
         std::fs::remove_dir_all(&work)?;
     }
-    std::fs::create_dir_all(&work)?;
+    std::fs::create_dir(&work)?;
     let res = (|| {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o755))?;
-        let mut root = Root::open(&work)?;
-        for (i, layer) in img.layers.iter().enumerate() {
-            eprintln!("image: applying layer {}/{} {}", i + 1, img.layers.len(), layer.name());
-            root.apply_layer(unpack::decompress(layer.open()?)?).map_err(|e| format!("layer {}: {e}", layer.name()))?;
-        }
+        let mut root = Root::open(&work, *limits)?;
+        unpack_layers(&mut root, img)?;
         let conf = inject(&mut root, app, init)?;
         mkfs(&work, root.entries, dest)?;
         Ok(conf)
     })();
     let _ = std::fs::remove_dir_all(&work);
     res
+}
+
+/// Applies the image's layers in order, checking each blob against its
+/// descriptor first and its uncompressed contents against the config's
+/// diff_ids as it goes.
+fn unpack_layers(root: &mut Root, img: &source::Image) -> Result<()> {
+    for (i, layer) in img.layers.iter().enumerate() {
+        eprintln!("image: applying layer {}/{} {}", i + 1, img.layers.len(), layer.name());
+        let what = |e| format!("layer {}: {e}", layer.name());
+        layer.verify().map_err(what)?;
+        let diff_id = root.apply_layer(unpack::decompress(layer.open()?)?).map_err(what)?;
+        if diff_id != img.diff_ids[i] {
+            bail!("layer {} unpacks to {diff_id}, the image config says {}", layer.name(), img.diff_ids[i]);
+        }
+    }
+    Ok(())
 }
 
 fn escape(s: &str) -> String {
@@ -348,22 +424,19 @@ fn mkfs(dir: &Path, entries: u64, dest: &Path) -> Result<()> {
     let kib: u64 = String::from_utf8_lossy(&du.stdout).split_whitespace().next().and_then(|s| s.parse().ok()).ok_or("du failed")?;
     let mib = (kib * 12 / 10 / 1024 + 64).div_ceil(2) * 2;
     let inodes = entries * 12 / 10 + 4096;
-    std::fs::create_dir_all(dest.parent().unwrap())?;
-    let tmp: PathBuf = dest.with_extension(format!("tmp{}", std::process::id()));
-    let _ = std::fs::remove_file(&tmp);
-    std::fs::File::create(&tmp)?.set_len(mib << 20)?;
+    let tmp = dest;
+    let _ = std::fs::remove_file(tmp);
+    std::fs::File::create(tmp)?.set_len(mib << 20)?;
     let out = Command::new("mkfs.ext4")
         .args(["-q", "-F", "-b", "4096", "-L", "flexroot", "-N", &inodes.to_string(), "-d"])
         .arg(dir)
-        .arg(&tmp)
+        .arg(tmp)
         .output()
         .map_err(|e| format!("mkfs.ext4: {e}"))?;
     if !out.status.success() {
-        let _ = std::fs::remove_file(&tmp);
         bail!("mkfs.ext4 failed: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
-    std::fs::rename(&tmp, dest)?;
-    eprintln!("image: root filesystem {} ({mib} MiB, {entries} entries)", dest.display());
+    eprintln!("image: root filesystem built ({mib} MiB, {entries} entries)");
     Ok(())
 }
 
@@ -390,5 +463,124 @@ mod tests {
         assert!(app_config(&json!({"config": {}}), &Options::default()).is_err());
         assert_eq!(parse_argv(r#"["a b", "c"]"#).unwrap(), ["a b", "c"]);
         assert_eq!(parse_argv("python3 -m http.server").unwrap(), ["python3", "-m", "http.server"]);
+    }
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("flexvm-img-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn tar_of(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut b = tar::Builder::new(Vec::new());
+        let (uid, gid) = unsafe { (libc::getuid() as u64, libc::getgid() as u64) };
+        for (path, data) in files {
+            let mut h = tar::Header::new_gnu();
+            h.set_uid(uid);
+            h.set_gid(gid);
+            h.set_mode(0o644);
+            h.set_size(data.len() as u64);
+            b.append_data(&mut h, path, *data).unwrap();
+        }
+        b.into_inner().unwrap()
+    }
+
+    /// A legacy `docker save` directory whose config claims `claimed` as the
+    /// layer's diff_id while the layer file holds `layer`.
+    fn docker_save(dir: &Path, claimed: &[u8], layer: &[u8]) {
+        let config = json!({"architecture": "amd64", "os": "linux", "config": {"Cmd": ["/x"]},
+            "rootfs": {"type": "layers", "diff_ids": [sha256_hex(claimed)]}});
+        std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+        std::fs::write(dir.join("layer.tar"), layer).unwrap();
+        std::fs::write(dir.join("manifest.json"), json!([{"Config": "config.json", "Layers": ["layer.tar"]}]).to_string()).unwrap();
+    }
+
+    fn unpack_dir(src: &Path) -> Result<PathBuf> {
+        let img = source::fetch(Path::new("/nonexistent"), src.to_str().unwrap(), &Limits::default())?;
+        let out = src.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let mut root = Root::open(&out, Limits::default())?;
+        unpack_layers(&mut root, &img)?;
+        Ok(out)
+    }
+
+    #[test]
+    fn layers_must_match_the_config_diff_ids() {
+        let good = tar_of(&[("a", b"good")]);
+        let evil = tar_of(&[("a", b"evil")]);
+        let d = tmpdir("diffid-ok");
+        docker_save(&d, &good, &good);
+        assert_eq!(std::fs::read(unpack_dir(&d).unwrap().join("a")).unwrap(), b"good");
+        // Same config (so same cache key before this fix), different layer: refused.
+        let d2 = tmpdir("diffid-bad");
+        docker_save(&d2, &good, &evil);
+        let e = unpack_dir(&d2).unwrap_err().to_string();
+        assert!(e.contains("the image config says"), "{e}");
+        std::fs::remove_dir_all(&d).unwrap();
+        std::fs::remove_dir_all(&d2).unwrap();
+    }
+
+    /// An OCI layout with one gzip'd layer; returns the config and layer digests.
+    fn oci_layout(dir: &Path, layer: &[u8]) -> (String, String) {
+        use std::io::Write as _;
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(layer).unwrap();
+        let blob = gz.finish().unwrap();
+        let config = json!({"architecture": "amd64", "os": "linux", "config": {"Cmd": ["/x"]},
+            "rootfs": {"type": "layers", "diff_ids": [sha256_hex(layer)]}}).to_string();
+        let put = |data: &[u8]| {
+            let d = sha256_hex(data);
+            let p = registry::blob_path(&dir.join("blobs"), &d).unwrap();
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, data).unwrap();
+            d
+        };
+        let (cd, ld) = (put(config.as_bytes()), put(&blob));
+        let manifest = json!({"schemaVersion": 2, "config": {"digest": cd, "size": config.len()},
+            "layers": [{"digest": ld, "size": blob.len()}]}).to_string();
+        let md = put(manifest.as_bytes());
+        std::fs::write(dir.join("index.json"), json!({"manifests": [{"digest": md, "size": manifest.len()}]}).to_string()).unwrap();
+        (cd, ld)
+    }
+
+    #[test]
+    fn local_blobs_are_verified() {
+        let layer = tar_of(&[("a", b"data")]);
+        let d = tmpdir("oci-ok");
+        oci_layout(&d, &layer);
+        assert_eq!(std::fs::read(unpack_dir(&d).unwrap().join("a")).unwrap(), b"data");
+
+        // A tampered layer blob (same size) is caught before it is unpacked.
+        let d2 = tmpdir("oci-layer");
+        let (_, ld) = oci_layout(&d2, &layer);
+        let p = registry::blob_path(&d2.join("blobs"), &ld).unwrap();
+        let mut b = std::fs::read(&p).unwrap();
+        let n = b.len();
+        b[n - 1] ^= 0xff;
+        std::fs::write(&p, &b).unwrap();
+        let e = unpack_dir(&d2).unwrap_err().to_string();
+        assert!(e.contains("has digest"), "{e}");
+        assert!(!d2.join("out/a").exists());
+
+        // A tampered config is refused outright.
+        let d3 = tmpdir("oci-config");
+        let (cd, _) = oci_layout(&d3, &layer);
+        let p = registry::blob_path(&d3.join("blobs"), &cd).unwrap();
+        std::fs::write(&p, std::fs::read_to_string(&p).unwrap().replace("/x", "/y")).unwrap();
+        assert!(source::fetch(Path::new("/nonexistent"), d3.to_str().unwrap(), &Limits::default()).is_err());
+        for d in [d, d2, d3] {
+            std::fs::remove_dir_all(d).unwrap();
+        }
+    }
+
+    #[test]
+    fn download_budget_is_checked_up_front() {
+        let d = tmpdir("budget");
+        oci_layout(&d, &tar_of(&[("a", &[0u8; 100_000])]));
+        let tiny = Limits { download: 10, ..Limits::default() };
+        let e = source::fetch(Path::new("/nonexistent"), d.to_str().unwrap(), &tiny).err().unwrap().to_string();
+        assert!(e.contains("download limit"), "{e}");
+        std::fs::remove_dir_all(d).unwrap();
     }
 }

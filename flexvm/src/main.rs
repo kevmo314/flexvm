@@ -27,6 +27,7 @@ usage:
                 [--image REF|ARCHIVE|DIR] [--entrypoint ARGV] [--cmd ARGV]
                 [--env K=V]... [--workdir DIR] [--user USER[:GROUP]]
                 [--warm [--ready-port N | --ready-cmd CMD] [--ready-timeout S]]
+                [--max-download-mib N] [--max-unpacked-mib N] [--max-file-mib N] [--max-entries N]
                                                              ... from a container image
   flexvm daemon [--listen ADDR] [--advertise ADDR] [--run DIR]
                 [--peer ADDR]... [--reserve MIB] [--pool N]
@@ -225,6 +226,15 @@ fn image_options(args: &Args) -> Result<Option<image::Options>> {
         warm,
         ready,
         ready_timeout: Duration::from_secs(args.num("ready-timeout", 120)?),
+        limits: {
+            let d = image::Limits::default();
+            image::Limits {
+                download: args.num("max-download-mib", d.download >> 20)? << 20,
+                unpacked: args.num("max-unpacked-mib", d.unpacked >> 20)? << 20,
+                file: args.num("max-file-mib", d.file >> 20)? << 20,
+                entries: args.num("max-entries", d.entries)?,
+            }
+        },
     }))
 }
 
