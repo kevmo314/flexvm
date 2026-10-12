@@ -42,17 +42,19 @@ pub fn retry<T>(timeout: Duration, mut f: impl FnMut() -> Result<T>) -> Result<T
     }
 }
 
-/// Connects to `addr`, trying each address it resolves to within one deadline.
+/// Connects to `addr` within `timeout`, splitting what is left of it evenly
+/// across the addresses not tried yet, so a blackholed one cannot use it all.
 pub fn connect(addr: &str, timeout: Duration) -> io::Result<std::net::TcpStream> {
     use std::net::ToSocketAddrs;
     let deadline = Instant::now() + timeout;
+    let addrs: Vec<_> = addr.to_socket_addrs()?.collect();
     let mut last = io::Error::other(format!("{addr} resolves to no address"));
-    for a in addr.to_socket_addrs()? {
+    for (i, a) in addrs.iter().enumerate() {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             break;
         }
-        match std::net::TcpStream::connect_timeout(&a, left) {
+        match std::net::TcpStream::connect_timeout(a, left / (addrs.len() - i) as u32) {
             Ok(s) => return Ok(s),
             Err(e) => last = e,
         }
