@@ -25,7 +25,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, RwLockWriteGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -110,28 +110,43 @@ fn eagain() -> io::Error {
 }
 
 /// The page state machine. Installers claim pages (-> INFLIGHT), populate
-/// them and settle them; a REMOVE on a claimed page turns it DISCARDED so its
-/// installer neither copies stale data into it nor marks it PRESENT over the
-/// discard. Settling returns whether a REMOTE page got resolved, for the
-/// pager's count of pages still to pull.
-pub struct Pages(Vec<AtomicU8>);
+/// them and settle them; a REMOVE on a claimed page turns it DISCARDED, and
+/// its installer then skips it. Settling returns whether a REMOTE page got
+/// resolved, for the pager's count of pages still to pull.
+///
+/// No install can land in a page after the kernel has zapped it for a
+/// REMOVE: the kernel fails copies with EAGAIN while a REMOVE event is queued
+/// and zaps the range only once the event has been read, and the event is
+/// read and applied under `events` held exclusively, while installers hold it
+/// shared from checking a page's state until they have settled it. So a page
+/// is PRESENT exactly when it is populated.
+pub struct Pages {
+    states: Vec<AtomicU8>,
+    events: RwLock<()>,
+}
 
 impl Pages {
     pub fn new(n: usize) -> Pages {
         // BASE is 0, so a zeroed allocation (lazily backed by the kernel) is the initial state.
-        Pages(unsafe { std::mem::transmute::<Vec<u8>, Vec<AtomicU8>>(vec![0u8; n]) })
+        let states = unsafe { std::mem::transmute::<Vec<u8>, Vec<AtomicU8>>(vec![0u8; n]) };
+        Pages { states, events: RwLock::new(()) }
     }
 
     pub fn get(&self, page: usize) -> u8 {
-        self.0[page].load(Ordering::SeqCst)
+        self.states[page].load(Ordering::SeqCst)
     }
 
     fn set(&self, page: usize, state: u8) {
-        self.0[page].store(state, Ordering::SeqCst)
+        self.states[page].store(state, Ordering::SeqCst)
     }
 
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.states.len()
+    }
+
+    /// Held while reading and applying uffd events; required by `discard`.
+    pub fn removing(&self) -> RwLockWriteGuard<'_, ()> {
+        self.events.write().unwrap()
     }
 
     /// Claims up to `max` consecutive pages from `first` that are in state
@@ -139,9 +154,9 @@ impl Pages {
     pub fn claim(&self, first: usize, max: usize, from: u8, ok: impl Fn(usize) -> bool) -> usize {
         let mut n = 0;
         while n < max
-            && first + n < self.0.len()
+            && first + n < self.states.len()
             && ok(first + n)
-            && self.0[first + n].compare_exchange(from, INFLIGHT, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+            && self.states[first + n].compare_exchange(from, INFLIGHT, Ordering::SeqCst, Ordering::SeqCst).is_ok()
         {
             n += 1;
         }
@@ -149,8 +164,8 @@ impl Pages {
     }
 
     /// Applies a REMOVE of `page`. Returns whether it resolved a REMOTE page.
-    pub fn discard(&self, page: usize) -> bool {
-        let old = self.0[page]
+    pub fn discard(&self, _removing: &RwLockWriteGuard<'_, ()>, page: usize) -> bool {
+        let old = self.states[page]
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |s| {
                 Some(if s == INFLIGHT || s == DISCARDED { DISCARDED } else { ZERO })
             })
@@ -158,12 +173,9 @@ impl Pages {
         old == REMOTE
     }
 
-    /// Settles claimed `page`, claimed from state `from`. If a REMOVE raced
-    /// a successful copy, the copy may have landed after the kernel zapped the
-    /// page, so it is PRESENT, never ZERO: a fault on a PRESENT page that is
-    /// not actually there gets the zero page.
+    /// Settles claimed `page`, claimed from state `from`.
     fn settle(&self, page: usize, populated: bool, from: u8) -> bool {
-        let old = self.0[page]
+        let old = self.states[page]
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |s| {
                 Some(match (s, populated) {
                     (_, true) => PRESENT,
@@ -172,7 +184,7 @@ impl Pages {
                 })
             })
             .unwrap();
-        debug_assert!(old == INFLIGHT || old == DISCARDED, "settling unclaimed page {page} in state {old}");
+        debug_assert!(old == INFLIGHT || (old == DISCARDED && !populated), "settling page {page} in state {old}");
         from == REMOTE && (populated || old == DISCARDED)
     }
 
@@ -197,6 +209,7 @@ impl Pages {
     ) -> (usize, io::Result<()>) {
         let (end, mut resolved, mut i) = (first + n, 0, first);
         while i < end {
+            let installing = self.events.read().unwrap();
             if self.get(i) == DISCARDED {
                 resolved += self.settle(i, false, from) as usize;
                 i += 1;
@@ -217,6 +230,8 @@ impl Pages {
                     i += 1;
                 }
                 Err(e) if e.raw_os_error() == Some(libc::EAGAIN) && stop.is_some_and(|s| !s.load(Ordering::SeqCst)) => {
+                    // A REMOVE is queued: let the event thread read it.
+                    drop(installing);
                     thread::sleep(Duration::from_micros(200))
                 }
                 Err(e) => return (resolved + self.release(i, end - i, from), Err(e)),
@@ -240,8 +255,6 @@ pub struct Pager {
     pull_finished: OnceLock<Instant>,
     /// Signalled when the pull finishes or the pager stops.
     done: (Mutex<()>, Condvar),
-    /// Held while reading and applying a batch of uffd events.
-    events: Mutex<()>,
     /// Set by the checkpoint barrier: no new prefetch.
     quiesce: AtomicBool,
     failed: OnceLock<String>,
@@ -266,7 +279,6 @@ impl Pager {
             pull_started: OnceLock::new(),
             pull_finished: OnceLock::new(),
             done: (Mutex::new(()), Condvar::new()),
-            events: Mutex::new(()),
             quiesce: AtomicBool::new(false),
             failed: OnceLock::new(),
             stop: AtomicBool::new(false),
@@ -449,7 +461,7 @@ impl Pager {
     }
 
     fn pages(&self) -> &Pages {
-        static EMPTY: Pages = Pages(Vec::new());
+        static EMPTY: Pages = Pages { states: Vec::new(), events: RwLock::new(()) };
         self.pages.get().unwrap_or(&EMPTY)
     }
 
@@ -478,13 +490,13 @@ impl Pager {
     /// implied.
     pub fn quiesce_export(&self) -> Result<Runs> {
         self.quiesce.store(true, Ordering::SeqCst);
-        drop(self.events.lock().unwrap());
+        drop(self.pages().removing());
         let start = Instant::now();
         let mut runs: Runs = Vec::new();
         let pages = self.pages();
         for m in self.mappings() {
             let first = m.offset as usize / PAGE_SIZE;
-            for (i, p) in pages.0[first..first + m.size / PAGE_SIZE].iter().enumerate() {
+            for (i, p) in pages.states[first..first + m.size / PAGE_SIZE].iter().enumerate() {
                 let mut s = p.load(Ordering::Relaxed);
                 if s == BASE {
                     continue;
@@ -555,7 +567,7 @@ impl Pager {
                 break;
             }
             if pfd.revents & libc::POLLIN != 0 {
-                let _events = self.events.lock().unwrap();
+                let removing = self.pages().removing();
                 let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
                 if n > 0 {
                     for msg in buf[..n as usize].chunks_exact(32) {
@@ -563,7 +575,7 @@ impl Pager {
                         let b = u64::from_ne_bytes(msg[16..24].try_into().unwrap());
                         match msg[0] {
                             UFFD_EVENT_PAGEFAULT => pending.push_back(b),
-                            UFFD_EVENT_REMOVE => self.discard(a, b),
+                            UFFD_EVENT_REMOVE => self.discard(&removing, a, b),
                             _ => {}
                         }
                     }
@@ -590,11 +602,11 @@ impl Pager {
         Some((((addr - m.base_host_virt_addr + m.offset) as usize) / PAGE_SIZE, m))
     }
 
-    fn discard(&self, start: u64, end: u64) {
+    fn discard(&self, removing: &RwLockWriteGuard<'_, ()>, start: u64, end: u64) {
         let (mut a, mut resolved) = (start & !(PAGE_SIZE as u64 - 1), 0);
         while a < end {
             if let Some((p, _)) = self.page_of(a) {
-                resolved += self.pages().discard(p) as usize;
+                resolved += self.pages().discard(removing, p) as usize;
             }
             a += PAGE_SIZE as u64;
         }
@@ -608,12 +620,8 @@ impl Pager {
         let region_left = (m.offset as usize + m.size) / PAGE_SIZE - page;
         let pages = self.pages();
         match pages.get(page) {
-            // Normally a fault that raced the install. If a REMOVE zapped the
-            // page after it was installed, it gets the zero page instead.
-            PRESENT => match self.populate(page, 1, None) {
-                Err(e) if e.raw_os_error() == Some(libc::EEXIST) => self.wake(page, 1),
-                r => r.map(drop),
-            },
+            // A fault that raced the install.
+            PRESENT => self.wake(page, 1),
             // Someone else is installing it; retry until it lands (their copy wakes us).
             INFLIGHT | DISCARDED => Err(eagain()),
             REMOTE => {
@@ -901,6 +909,10 @@ mod tests {
         io::Error::from_raw_os_error(code)
     }
 
+    fn discard(p: &Pages, page: usize) -> bool {
+        p.discard(&p.removing(), page)
+    }
+
     #[test]
     fn claimed_pages_have_one_installer() {
         let p = pages(&[REMOTE, REMOTE, BASE, REMOTE]);
@@ -923,7 +935,7 @@ mod tests {
         // not copy stale bytes into the discarded page or mark it PRESENT.
         let p = pages(&[REMOTE; 4]);
         p.claim(0, 4, REMOTE, |_| true);
-        assert!(!p.discard(1), "the installer accounts for claimed pages");
+        assert!(!discard(&p, 1), "the installer accounts for claimed pages");
         let mut calls = Vec::new();
         let (resolved, res) = p.install(0, 4, REMOTE, None, |i, n| {
             calls.push((i, n));
@@ -936,27 +948,35 @@ mod tests {
     }
 
     #[test]
-    fn remove_during_copy_leaves_page_present() {
-        // The copy may land after the kernel zapped the page, so the page may
-        // hold data: it must not become ZERO (PRESENT faults are zero-filled).
+    fn remove_during_copy_waits_for_settle() {
+        // A REMOVE read while a copy is in progress is applied only after the
+        // copy has settled (and so before the kernel zaps the range): the page
+        // ends ZERO, never PRESENT without its data.
         let p = pages(&[REMOTE; 2]);
         p.claim(0, 2, REMOTE, |_| true);
-        let (resolved, res) = p.install(0, 2, REMOTE, None, |_, n| {
-            p.discard(1);
-            Ok(n)
+        let removed = AtomicBool::new(false);
+        thread::scope(|scope| {
+            let (resolved, res) = p.install(0, 2, REMOTE, None, |_, n| {
+                scope.spawn(|| {
+                    discard(&p, 1);
+                    removed.store(true, Ordering::SeqCst);
+                });
+                thread::sleep(Duration::from_millis(50));
+                assert!(!removed.load(Ordering::SeqCst), "REMOVE applied mid-copy");
+                Ok(n)
+            });
+            assert!(res.is_ok());
+            assert_eq!(resolved, 2);
         });
-        assert!(res.is_ok());
-        assert_eq!((states(&p), resolved), (vec![PRESENT, PRESENT], 2));
-        // A REMOVE after the install wins.
-        assert!(!p.discard(0));
-        assert_eq!(states(&p), [ZERO, PRESENT]);
+        assert!(removed.load(Ordering::SeqCst));
+        assert_eq!(states(&p), [PRESENT, ZERO]);
     }
 
     #[test]
     fn failed_fetch_gives_pages_back() {
         let p = pages(&[REMOTE; 3]);
         p.claim(0, 3, REMOTE, |_| true);
-        p.discard(2);
+        discard(&p, 2);
         assert_eq!(p.release(0, 3, REMOTE), 1);
         assert_eq!(states(&p), [REMOTE, REMOTE, ZERO]);
         assert_eq!(p.claim(0, 3, REMOTE, |_| true), 2);
@@ -995,28 +1015,25 @@ mod tests {
         let p = pages(&[BASE; 3]);
         p.claim(0, 3, BASE, |_| true);
         assert_eq!(p.claim(0, 3, BASE, |_| true), 0, "a fault waits for the prefetch");
-        p.discard(0);
+        discard(&p, 0);
         let (_, res) = p.install(0, 3, BASE, None, |i, n| {
             assert_eq!((i, n), (1, 2));
-            p.discard(2);
             Ok(n)
         });
         assert!(res.is_ok());
         assert_eq!(states(&p), [ZERO, PRESENT, PRESENT]);
-        // A failed copy of a discarded page leaves it ZERO, not BASE.
+        // A discarded page whose neighbours fail to copy ends ZERO, not BASE.
         let p = pages(&[BASE; 2]);
         p.claim(0, 2, BASE, |_| true);
-        let (_, res) = p.install(0, 2, BASE, None, |_, _| {
-            p.discard(0);
-            Err(os(libc::ENOMEM))
-        });
+        discard(&p, 0);
+        let (_, res) = p.install(0, 2, BASE, None, |_, _| Err(os(libc::ENOMEM)));
         assert!(res.is_err());
         assert_eq!(states(&p), [ZERO, BASE]);
     }
 
-    /// Random interleavings of claims, REMOVEs (including mid-copy), partial
-    /// copies, errors and failed fetches: no page stays claimed and every
-    /// REMOTE page is counted as resolved exactly once.
+    /// Random interleavings of claims, REMOVEs (including while a claim's
+    /// fetch is in flight), partial copies, errors and failed fetches: no page
+    /// stays claimed and every REMOTE page is counted as resolved exactly once.
     #[test]
     fn remote_accounting_adds_up() {
         let mut seed = 0x9e37_79b9_7f4a_7c15u64;
@@ -1032,7 +1049,7 @@ mod tests {
             for _ in 0..200 {
                 let first = rand(64);
                 if rand(4) == 0 {
-                    resolved += p.discard(first) as usize;
+                    resolved += discard(&p, first) as usize;
                     continue;
                 }
                 let n = p.claim(first, 1 + rand(16), REMOTE, |_| true);
@@ -1043,16 +1060,16 @@ mod tests {
                     resolved += p.release(first, n, REMOTE);
                     continue;
                 }
+                for _ in 0..rand(3) {
+                    assert!(!discard(&p, first + rand(n)));
+                }
                 let mut script = Vec::new();
                 for _ in 0..8 {
-                    script.push((rand(3) == 0, rand(64), rand(5), rand(64)));
+                    script.push((rand(5), rand(64)));
                 }
                 let mut script = script.into_iter();
-                let (r, _) = p.install(first, n, REMOTE, None, |i, m| {
-                    let (remove, at, outcome, k) = script.next().unwrap_or((false, 0, 4, 0));
-                    if remove {
-                        p.discard(i + at % m);
-                    }
+                let (r, _) = p.install(first, n, REMOTE, None, |_, m| {
+                    let (outcome, k) = script.next().unwrap_or((4, 0));
                     match outcome {
                         0 => Err(os(libc::EEXIST)),
                         1 => Err(os(libc::EAGAIN)),
