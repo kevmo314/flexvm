@@ -2,13 +2,15 @@
 //! daemons and writes per-phase latency percentiles to `bench/`. Every number
 //! is a daemon-side phase timing; the phases of each op sum to its `total`.
 
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
 
-use crate::util::Result;
+use crate::util::{ms, Result};
 use crate::{bail, call_with_timeout, Args};
 
 pub fn run(host: &str, args: &Args) -> Result<()> {
@@ -19,6 +21,13 @@ pub fn run(host: &str, args: &Args) -> Result<()> {
     let settle = Duration::from_millis(args.num("settle-ms", 100)?);
     let template = args.get("template").unwrap_or("default");
     let (to, ip) = (args.get("to"), args.get("ip"));
+    // Image apps: also time, from the client, until the app answers.
+    let ready = match (args.get("ready-port"), args.get("ready-http")) {
+        (Some(p), None) => Some((p.parse().map_err(|_| "bad --ready-port")?, false)),
+        (None, Some(p)) => Some((p.parse().map_err(|_| "bad --ready-http")?, true)),
+        (None, None) => None,
+        _ => bail!("pass --ready-port or --ready-http, not both"),
+    };
     if iterations == 0 {
         bail!("--iterations must be positive");
     }
@@ -39,7 +48,7 @@ pub fn run(host: &str, args: &Args) -> Result<()> {
     let mut samples = Vec::new();
     for i in 0..warmup + iterations {
         let name = format!("bench-{}-{date}-{i}", std::process::id());
-        let sample = iteration(host, to, &name, template, ip, dirty_mib, timeout).map_err(|e| {
+        let sample = iteration(host, to, &name, template, ip, dirty_mib, ready, timeout).map_err(|e| {
             // The VM may be on either host, depending on where the trial failed.
             for h in to.into_iter().chain([host]) {
                 let _ = rpc(h, json!({"op": "kill", "name": name}));
@@ -55,6 +64,9 @@ pub fn run(host: &str, args: &Args) -> Result<()> {
     }
 
     let mut summary = json!({"run": summarize(&samples, "run")?});
+    if ready.is_some() {
+        summary["client"] = summarize(&samples, "client")?;
+    }
     if to.is_some() {
         summary["migrate"] = summarize(&samples, "migrate")?;
         summary["migrate_target"] = summarize(&samples, "migrate_target")?;
@@ -66,6 +78,7 @@ pub fn run(host: &str, args: &Args) -> Result<()> {
         "params": {
             "host": host, "to": to, "template": template, "ip": ip, "iterations": iterations,
             "warmup": warmup, "dirty_mib": dirty_mib, "settle_ms": settle.as_millis(),
+            "ready_port": ready.map(|r| r.0), "ready_http": ready.is_some_and(|r| r.1),
         },
         "host_context": {"source": source, "target": target},
         "summary_ms": summary,
@@ -81,6 +94,7 @@ pub fn run(host: &str, args: &Args) -> Result<()> {
 
 /// One trial: run `name`, optionally dirty its memory and migrate it, then
 /// kill it. Returns its phase timings grouped by op.
+#[allow(clippy::too_many_arguments)]
 fn iteration(
     host: &str,
     to: Option<&str>,
@@ -88,11 +102,23 @@ fn iteration(
     template: &str,
     ip: Option<&str>,
     dirty_mib: u64,
+    ready: Option<(u16, bool)>,
     timeout: Duration,
 ) -> Result<Value> {
     let rpc = |host: &str, req| call_with_timeout(host, req, timeout);
+    let start = Instant::now();
     let run = rpc(host, json!({"op": "run", "name": name, "template": template, "ip": ip}))?;
+    let run_rpc = start.elapsed();
     let mut sample = json!({"run": run["timings_ms"]});
+    if let Some((port, http)) = ready {
+        let ip: std::net::Ipv4Addr = run["ip"].as_str().ok_or("run reply has no ip")?.parse()?;
+        wait_ready((ip, port).into(), http, start + timeout)?;
+        sample["client"] = json!({
+            "run_rpc": ms(run_rpc),
+            "app_ready": ms(start.elapsed() - run_rpc),
+            "total": ms(start.elapsed()),
+        });
+    }
     if let Some(to) = to {
         if dirty_mib > 0 {
             // /tmp is a tmpfs, so this lands in guest memory.
@@ -124,6 +150,29 @@ fn iteration(
     }
     rpc(to.unwrap_or(host), json!({"op": "kill", "name": name}))?;
     Ok(sample)
+}
+
+/// Waits until `addr` accepts a TCP connection or, with `http`, answers a GET.
+fn wait_ready(addr: SocketAddr, http: bool, deadline: Instant) -> Result<()> {
+    loop {
+        let attempt = (|| -> std::io::Result<()> {
+            let mut c = TcpStream::connect_timeout(&addr, Duration::from_millis(200))?;
+            if http {
+                c.set_read_timeout(Some(Duration::from_secs(2)))?;
+                c.write_all(b"GET / HTTP/1.0\r\n\r\n")?;
+                let mut b = [0u8; 1];
+                if c.read(&mut b)? == 0 {
+                    return Err(std::io::ErrorKind::UnexpectedEof.into());
+                }
+            }
+            Ok(())
+        })();
+        match attempt {
+            Ok(()) => return Ok(()),
+            Err(e) if Instant::now() >= deadline => bail!("{addr} not ready: {e}"),
+            Err(_) => thread::sleep(Duration::from_millis(1)),
+        }
+    }
 }
 
 /// Nearest-rank p50/p90/p99/max of every phase in `group`.
