@@ -19,7 +19,6 @@ use serde_json::{json, Value};
 
 use crate::bail;
 use crate::fc::Pool;
-use crate::guest;
 use crate::net::{self, IpRange};
 use crate::template::{Paths, Template, STEP_MIB};
 use crate::uffd::{serve_pages, Runs, Source};
@@ -262,7 +261,7 @@ impl Daemon {
         t.mark("register");
         let running = t.total();
         // The guest reseeds its RNG itself: Firecracker bumps the VMGenID on restore.
-        guest::net(&vm.vsock(), ip, self.cfg.dns.as_deref())?;
+        vm.guest_net(ip, self.cfg.dns.as_deref())?;
         t.mark("guest_net");
         self.announce(ip);
         t.mark("announce");
@@ -403,11 +402,7 @@ impl Daemon {
 
     fn exec(&self, name: &str, cmd: &str, mut w: TcpStream) -> Result<()> {
         let guest = self.vm(name).and_then(|vm| {
-            if vm.state() != State::Running {
-                bail!("vm {name} is not running here");
-            }
-            let g = guest::start_exec(&vm.vsock(), cmd)?;
-            let id = vm.track_exec(g.get_ref())?;
+            let (g, id) = vm.exec(cmd)?;
             Ok((vm, g, id))
         });
         match guest {
@@ -464,16 +459,7 @@ impl Daemon {
     fn migrate(self: &Arc<Self>, name: &str, to: &str) -> Result<Value> {
         let vm = self.vm(name)?;
         let mig = migration_id();
-        {
-            let mut st = vm.state.lock().unwrap();
-            if *st != State::Running || vm.pager.failed().is_some() {
-                bail!("vm {name} is not running here");
-            }
-            if vm.pager.remote_left() > 0 {
-                bail!("vm {name} is still pulling its memory from its previous host");
-            }
-            *st = State::Source(mig);
-        }
+        vm.start_source(mig)?;
         let mut t = Phases::new();
         let vmstate = vm.dir.join("vmstate.out");
         let prepared = (|| -> Result<_> {
@@ -696,9 +682,7 @@ impl Daemon {
         // Once every page has arrived, or as soon as the VM is gone here, the
         // source drops its copy: it must never run again either way.
         thread::spawn(move || {
-            if let Err(e) = vm.restore_devices() {
-                eprintln!("vm {}: {e}", vm.name);
-            }
+            vm.restore_devices();
             let start = Instant::now();
             vm.pager.wait_pulled();
             let pulled = start.elapsed();

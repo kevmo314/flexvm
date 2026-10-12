@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::BufReader;
 use std::net::{Ipv4Addr, Shutdown};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -48,7 +49,9 @@ pub struct Vm {
     pub starved: AtomicBool,
     /// Migration target only: the source's answer to `release`, true or an error.
     pub released: OnceLock<Value>,
-    /// Host ends of exec sessions, by id.
+    /// Host ends of exec sessions, by id. Also the admission lock for host
+    /// vsock sessions: held from checking the VM runs here until a session is
+    /// registered, and by `start_source` while it marks the VM migrating.
     execs: Mutex<HashMap<u64, UnixStream>>,
     next_exec: AtomicU64,
     fc: Mutex<Option<Firecracker>>,
@@ -178,6 +181,7 @@ impl Vm {
     /// socket events still walk the TX queue), and the balloon's statistics
     /// timer is pushed out of the way (its next round happens now, before the
     /// snapshot). `resume` undoes this; a target calls `restore_devices`.
+    /// Call after `start_source`.
     pub fn checkpoint(&self, vmstate: &Path) -> Result<Runs> {
         crate::net::set_link_up(&self.tap, false)?;
         for (_, s) in self.execs.lock().unwrap().drain() {
@@ -191,28 +195,70 @@ impl Vm {
         self.pager.quiesce_export()
     }
 
-    /// Resumes a VM paused by `checkpoint`.
+    /// Marks the VM as the source of migration `mig`. From then on no host
+    /// vsock session opens (see `exec`), so `checkpoint` can close them all.
+    pub fn start_source(&self, mig: u64) -> Result<()> {
+        let _admission = self.execs.lock().unwrap();
+        let mut st = self.state.lock().unwrap();
+        if *st != State::Running || self.pager.failed().is_some() {
+            bail!("vm {} is not running here", self.name);
+        }
+        if self.pager.remote_left() > 0 {
+            bail!("vm {} is still pulling its memory from its previous host", self.name);
+        }
+        *st = State::Source(mig);
+        Ok(())
+    }
+
+    /// Resumes a VM paused by `checkpoint`, putting its devices back first.
     pub fn resume(&self) -> Result<()> {
         crate::net::set_link_up(&self.tap, true)?;
-        self.fc(|fc| fc.resume())?;
-        self.restore_devices()
+        self.unpark_balloon();
+        self.fc(|fc| fc.resume())
     }
 
-    /// Puts back what `checkpoint` turned off inside Firecracker.
-    pub fn restore_devices(&self) -> Result<()> {
-        self.fc(|fc| fc.patch("/balloon/statistics", json!({"stats_polling_interval_s": BALLOON_STATS_S})).map(drop))
+    /// On a migration target: puts back the balloon statistics timer that the
+    /// source's `checkpoint` parked, unless the VM is already migrating on
+    /// (its next host does it then). Runs off the critical path; holding the
+    /// admission lock keeps a new migration from parking the timer meanwhile.
+    pub fn restore_devices(&self) {
+        let _admission = self.execs.lock().unwrap();
+        if self.state() == State::Running {
+            self.unpark_balloon();
+        }
     }
 
-    /// Registers the host end of an exec session, so a checkpoint can close
-    /// it. Fails unless the VM is running here.
-    pub fn track_exec(&self, s: &UnixStream) -> Result<u64> {
+    /// Retries a few times; the VM keeps running regardless, only its
+    /// statistics go stale.
+    fn unpark_balloon(&self) {
+        let res = crate::util::retry(Duration::from_millis(500), || {
+            self.fc(|fc| fc.patch("/balloon/statistics", json!({"stats_polling_interval_s": BALLOON_STATS_S})))
+        });
+        if let Err(e) = res {
+            eprintln!("vm {}: balloon statistics stay off: {e}", self.name);
+        }
+    }
+
+    /// Starts `cmd` in the guest and registers the session so a checkpoint
+    /// can close it. Fails unless the VM is running here.
+    pub fn exec(&self, cmd: &str) -> Result<(BufReader<UnixStream>, u64)> {
         let mut execs = self.execs.lock().unwrap();
         if self.state() != State::Running {
             bail!("vm {} is not running here", self.name);
         }
+        let g = crate::guest::start_exec(&self.vsock(), cmd)?;
         let id = self.next_exec.fetch_add(1, Ordering::SeqCst);
-        execs.insert(id, s.try_clone()?);
-        Ok(id)
+        execs.insert(id, g.get_ref().try_clone()?);
+        Ok((g, id))
+    }
+
+    /// Sets the guest's address, unless the VM is no longer running here.
+    pub fn guest_net(&self, ip: Ipv4Addr, dns: Option<&str>) -> Result<()> {
+        let _admission = self.execs.lock().unwrap();
+        if self.state() != State::Running {
+            bail!("vm {} is not running here", self.name);
+        }
+        crate::guest::net(&self.vsock(), ip, dns)
     }
 
     pub fn untrack_exec(&self, id: u64) {
