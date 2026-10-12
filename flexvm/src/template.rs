@@ -181,11 +181,12 @@ impl Meta {
 
     /// Checks the files still match the recorded hashes. Files whose stat
     /// matches `cache` (or the stamp from creation) are trusted; others are
-    /// rehashed if `rehash`, else rejected.
-    fn verify(&self, paths: &Paths, dir: &Path, cache: &mut BTreeMap<String, Stamp>, rehash: bool) -> Result<()> {
+    /// rehashed if `rehash`, else rejected. Returns whether anything was rehashed.
+    fn verify(&self, paths: &Paths, dir: &Path, cache: &mut BTreeMap<String, Stamp>, rehash: bool) -> Result<bool> {
         if self.id.is_empty() || self.components.len() != 5 || content_id(&self.components) != self.id {
             bail!("template at {} has no valid content id; recreate it with `flexvm template`", dir.display());
         }
+        let mut rehashed = false;
         for (name, path) in self.files(paths, dir) {
             let component = &self.components[name];
             let stamp = Stamp::of(
@@ -202,8 +203,9 @@ impl Meta {
                 bail!("template component {} does not match template {}", path.display(), self.id);
             }
             cache.insert(name.into(), now.metadata);
+            rehashed = true;
         }
-        Ok(())
+        Ok(rehashed)
     }
 }
 
@@ -284,7 +286,18 @@ impl Template {
     /// Checks the files against the content id: stat only, unless `rehash` and
     /// a file changed since it was last hashed. Never call on the run path.
     pub fn verify(&self, paths: &Paths, rehash: bool) -> Result<()> {
-        self.meta.verify(paths, &self.dir, &mut self.verified.lock().unwrap(), rehash)
+        let cache = &mut self.verified.lock().unwrap();
+        if self.meta.verify(paths, &self.dir, cache, rehash)? {
+            // Record the new stamps so the next daemon on this host need not rehash.
+            let mut meta = self.meta.clone();
+            for (name, stamp) in cache.iter() {
+                meta.components.get_mut(name).unwrap().metadata = stamp.clone();
+            }
+            let tmp = self.dir.join(format!("meta.json.{}", std::process::id()));
+            let _ = std::fs::write(&tmp, serde_json::to_vec_pretty(&meta)?)
+                .and_then(|_| std::fs::rename(&tmp, self.dir.join("meta.json")));
+        }
+        Ok(())
     }
 
     pub fn check_id(&self, id: &str) -> Result<()> {
@@ -655,6 +668,16 @@ mod tests {
         assert_ne!(Stamp::of(&file.metadata().unwrap()).mtime, original.mtime);
         assert!(f.meta.verify(&f.paths, &f.dir, &mut BTreeMap::new(), false).is_err());
         f.meta.verify(&f.paths, &f.dir, &mut BTreeMap::new(), true).unwrap();
+    }
+
+    #[test]
+    fn rehash_is_remembered_across_opens() {
+        let f = Fixture::new();
+        std::fs::write(f.dir.join("meta.json"), serde_json::to_vec(&f.meta).unwrap()).unwrap();
+        f.replace("rootfs", b"rootfs");
+        assert!(Template::open(&f.paths, "").unwrap().verify(&f.paths, false).is_err());
+        Template::open(&f.paths, "").unwrap().verify(&f.paths, true).unwrap();
+        Template::open(&f.paths, "").unwrap().verify(&f.paths, false).unwrap();
     }
 
     #[test]
