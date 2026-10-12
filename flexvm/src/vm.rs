@@ -12,12 +12,19 @@ use serde_json::{json, Value};
 use crate::bail;
 use crate::fc::{Firecracker, Idle};
 use crate::template::{Template, BALLOON_STATS_S};
-use crate::uffd::{Pager, Runs, Source};
+use crate::uffd::{Origin, Pager, Runs, Source};
 use crate::util::{Phases, Result, PAGE_SIZE};
 
+/// Where a VM is in its lifecycle on this host. Transitions happen under the
+/// daemon's per-name operation lock (see `Daemon::reserve`); the states of a
+/// VM without a Firecracker here (starting, suspended) live in the daemon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
     Running,
+    /// vCPUs stopped by `pause`, memory and devices kept.
+    Paused,
+    /// Paused for a checkpoint to disk; goes back to Running or Paused.
+    Checkpointing,
     /// Paused here for migration `.0`: the target may own the VM from the
     /// moment it gets the state, so this copy is never resumed unless the
     /// target confirms the migration aborted.
@@ -30,9 +37,16 @@ impl State {
     pub fn name(self) -> &'static str {
         match self {
             State::Running => "running",
+            State::Paused => "paused",
+            State::Checkpointing => "checkpointing",
             State::Source(_) => "source",
             State::Failed => "failed",
         }
+    }
+
+    /// Whether the VM's address is served from this host.
+    pub fn local(self) -> bool {
+        matches!(self, State::Running | State::Paused | State::Checkpointing)
     }
 }
 
@@ -56,6 +70,10 @@ pub struct Vm {
     next_exec: AtomicU64,
     fc: Mutex<Option<Firecracker>>,
     cgroup: Option<PathBuf>,
+    /// Set by `start_source` and `start_checkpoint` for a VM that was
+    /// paused: `resume` then puts it back paused (and a migration target
+    /// keeps it paused).
+    was_paused: AtomicBool,
 }
 
 impl Vm {
@@ -69,6 +87,22 @@ impl Vm {
         vmstate: &Path,
         remote: Option<(Runs, Source)>,
         ip: Ipv4Addr,
+        phases: &mut Phases,
+    ) -> Result<(Arc<Vm>, Duration)> {
+        let origin = remote.map(|(runs, source)| (runs, Origin::Peer(source)));
+        Vm::restore_from(idle, name, template, vmstate, origin, ip, true, phases)
+    }
+
+    /// `restore`, from any page origin, and leaving the VM paused unless `resume`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn restore_from(
+        idle: Idle,
+        name: &str,
+        template: Arc<Template>,
+        vmstate: &Path,
+        remote: Option<(Runs, Origin)>,
+        ip: Ipv4Addr,
+        resume: bool,
         phases: &mut Phases,
     ) -> Result<(Arc<Vm>, Duration)> {
         let Idle { fc, dir, cgroup, tap } = idle;
@@ -100,7 +134,7 @@ impl Vm {
                     "vsock_override": {"uds_path": dir.join("v.sock")},
                     "network_overrides": [{"iface_id": "eth0", "host_dev_name": tap}],
                     "clock_realtime": true,
-                    "resume_vm": true,
+                    "resume_vm": resume,
                 }),
             )?;
             // Includes Firecracker's resume: the load request sets resume_vm.
@@ -129,7 +163,7 @@ impl Vm {
             ip,
             tap,
             pager,
-            state: Mutex::new(State::Running),
+            state: Mutex::new(if resume { State::Running } else { State::Paused }),
             last_resize: Mutex::new(Instant::now()),
             starved: AtomicBool::new(false),
             released: OnceLock::new(),
@@ -137,6 +171,7 @@ impl Vm {
             next_exec: AtomicU64::new(0),
             fc: Mutex::new(Some(fc)),
             cgroup,
+            was_paused: AtomicBool::new(false),
         });
         Ok((vm, took))
     }
@@ -183,14 +218,23 @@ impl Vm {
     /// snapshot). `resume` undoes this; a target calls `restore_devices`.
     /// Call after `start_source`.
     pub fn checkpoint(&self, vmstate: &Path) -> Result<Runs> {
+        self.save_state(vmstate, false)
+    }
+
+    /// `checkpoint`, with Firecracker fsyncing the state file if `sync`.
+    /// Call after `start_source` or `start_checkpoint`.
+    pub fn save_state(&self, vmstate: &Path, sync: bool) -> Result<Runs> {
         crate::net::set_link_up(&self.tap, false)?;
         for (_, s) in self.execs.lock().unwrap().drain() {
             let _ = s.shutdown(Shutdown::Both);
         }
+        let paused = self.was_paused.load(Ordering::SeqCst);
         self.fc(|fc| {
-            fc.pause()?;
+            if !paused {
+                fc.pause()?;
+            }
             fc.patch("/balloon/statistics", json!({"stats_polling_interval_s": u16::MAX}))?;
-            fc.put("/snapshot/create", json!({"snapshot_type": "Full", "snapshot_path": vmstate, "mem_file_path": "", "sync_snapshot_files": false}))
+            fc.put("/snapshot/create", json!({"snapshot_type": "Full", "snapshot_path": vmstate, "mem_file_path": "", "sync_snapshot_files": sync}))
         })?;
         self.pager.quiesce_export()
     }
@@ -198,23 +242,95 @@ impl Vm {
     /// Marks the VM as the source of migration `mig`. From then on no host
     /// vsock session opens (see `exec`), so `checkpoint` can close them all.
     pub fn start_source(&self, mig: u64) -> Result<()> {
+        self.leave(State::Source(mig))
+    }
+
+    /// Marks the VM as being checkpointed to disk, like `start_source`.
+    pub fn start_checkpoint(&self) -> Result<()> {
+        self.leave(State::Checkpointing)
+    }
+
+    fn leave(&self, to: State) -> Result<()> {
         let _admission = self.execs.lock().unwrap();
         let mut st = self.state.lock().unwrap();
-        if *st != State::Running || self.pager.failed().is_some() {
+        if !matches!(*st, State::Running | State::Paused) || self.pager.failed().is_some() {
             bail!("vm {} is not running here", self.name);
         }
         if self.pager.remote_left() > 0 {
-            bail!("vm {} is still pulling its memory from its previous host", self.name);
+            bail!("vm {} is still pulling its memory from its previous host or checkpoint", self.name);
         }
-        *st = State::Source(mig);
+        self.was_paused.store(*st == State::Paused, Ordering::SeqCst);
+        *st = to;
         Ok(())
     }
 
-    /// Resumes a VM paused by `checkpoint`, putting its devices back first.
-    pub fn resume(&self) -> Result<()> {
+    /// Whether the VM was paused when its current migration or checkpoint began.
+    pub fn was_paused(&self) -> bool {
+        self.was_paused.load(Ordering::SeqCst)
+    }
+
+    /// Undoes `checkpoint`: puts the devices back and resumes the vCPUs,
+    /// unless the VM was paused before. Returns the state to go back to.
+    pub fn resume(&self) -> Result<State> {
         crate::net::set_link_up(&self.tap, true)?;
         self.unpark_balloon();
-        self.fc(|fc| fc.resume())
+        if self.was_paused.swap(false, Ordering::SeqCst) {
+            return Ok(State::Paused);
+        }
+        self.fc(|fc| fc.resume())?;
+        Ok(State::Running)
+    }
+
+    /// Ends a checkpoint to disk that keeps the VM here: back to running or
+    /// paused, or failed if it cannot be resumed.
+    pub fn end_checkpoint(&self) -> Result<State> {
+        let mut st = self.state.lock().unwrap();
+        if *st != State::Checkpointing {
+            bail!("vm {} is not being checkpointed", self.name);
+        }
+        match self.resume() {
+            Ok(s) => {
+                *st = s;
+                Ok(s)
+            }
+            Err(e) => {
+                *st = State::Failed;
+                bail!("resuming vm {} after its checkpoint failed: {e}", self.name)
+            }
+        }
+    }
+
+    /// Stops the vCPUs; memory and devices stay as they are.
+    pub fn pause(&self) -> Result<()> {
+        let mut st = self.state.lock().unwrap();
+        match self.state_locked(&st) {
+            State::Paused => return Ok(()),
+            State::Running => {}
+            s => bail!("vm {} is {}, not running", self.name, s.name()),
+        }
+        self.fc(|fc| fc.pause())?;
+        *st = State::Paused;
+        Ok(())
+    }
+
+    /// Resumes a VM stopped by `pause`.
+    pub fn unpause(&self) -> Result<()> {
+        let mut st = self.state.lock().unwrap();
+        match self.state_locked(&st) {
+            State::Running => return Ok(()),
+            State::Paused => {}
+            s => bail!("vm {} is {}, not paused", self.name, s.name()),
+        }
+        self.fc(|fc| fc.resume())?;
+        *st = State::Running;
+        Ok(())
+    }
+
+    fn state_locked(&self, st: &State) -> State {
+        if self.pager.failed().is_some() {
+            return State::Failed;
+        }
+        *st
     }
 
     /// On a migration target: puts back the balloon statistics timer that the
@@ -223,9 +339,56 @@ impl Vm {
     /// admission lock keeps a new migration from parking the timer meanwhile.
     pub fn restore_devices(&self) {
         let _admission = self.execs.lock().unwrap();
-        if self.state() == State::Running {
+        if matches!(self.state(), State::Running | State::Paused) {
             self.unpark_balloon();
         }
+    }
+
+    /// Runs `cmd` in the guest and returns its exit code and output.
+    pub fn sh(&self, cmd: &str) -> Result<(i32, String)> {
+        let (mut g, id) = self.exec(cmd)?;
+        let mut out = Vec::new();
+        let res = loop {
+            match crate::guest::read_frame(&mut g) {
+                Ok(Some((crate::guest::FRAME_EXIT, d))) if d.len() >= 4 => {
+                    break Ok(i32::from_le_bytes(d[..4].try_into().unwrap()))
+                }
+                Ok(Some((_, d))) => out.extend_from_slice(&d),
+                Ok(None) => break Err("guest closed the connection before the command exited".into()),
+                Err(e) => break Err(e),
+            }
+        };
+        self.untrack_exec(id);
+        Ok((res?, String::from_utf8_lossy(&out).into_owned()))
+    }
+
+    /// Steps the guest's wall clock to the host's if it is off by more than
+    /// `tolerance`. A restore leaves the guest's clock where it was saved (the
+    /// guest's TSC clocksource resumes from its saved value, and Firecracker's
+    /// `clock_realtime` only moves kvmclock), so it lags by however long the VM
+    /// was stopped. The offset is measured with one exec bracketed by host
+    /// timestamps and corrected relative to the guest's own clock, so the
+    /// second exec's latency does not matter. Returns the offset found (ms).
+    pub fn sync_clock(&self, tolerance: Duration) -> Result<f64> {
+        let now = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as i128;
+        let before = now();
+        let (code, out) = self.sh("date +%s%N")?;
+        let after = now();
+        let guest: i128 = match (code, out.trim().parse()) {
+            (0, Ok(ns)) => ns,
+            _ => bail!("reading the guest clock: {out:?} (exit {code})"),
+        };
+        let offset = guest - (before + after) / 2;
+        if offset.unsigned_abs() > tolerance.as_nanos() {
+            let cmd = format!(
+                "n=$(( $(date +%s%N) - ({offset}) )); date -s @$((n / 1000000000)).$(printf %09d $((n % 1000000000))) >/dev/null"
+            );
+            match self.sh(&cmd)? {
+                (0, _) => {}
+                (code, out) => bail!("setting the guest clock: {out:?} (exit {code})"),
+            }
+        }
+        Ok(offset as f64 / 1e6)
     }
 
     /// Retries a few times; the VM keeps running regardless, only its

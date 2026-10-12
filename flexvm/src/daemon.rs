@@ -12,7 +12,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -22,9 +22,13 @@ use crate::bail;
 use crate::fc::Pool;
 use crate::net::{self, IpRange};
 use crate::template::{Paths, Template, STEP_MIB};
-use crate::uffd::{serve_pages, Runs, Source};
+use crate::checkpoint::{Checkpoint, Manifest, Staging};
+use crate::uffd::{serve_pages, Origin, Runs, Source};
 use crate::util::{ms, proc_kb, recv_json, send_json, Error, Phases, Result};
 use crate::vm::{State, Vm};
+
+#[path = "lifecycle.rs"]
+mod lifecycle;
 
 pub struct Config {
     pub paths: Paths,
@@ -44,6 +48,22 @@ pub struct Config {
     /// Answer ARP for local VMs on this interface and announce them when they arrive.
     pub announce_dev: Option<String>,
     pub dns: Option<String>,
+    /// Durable local state: checkpoints of suspended VMs. Must be on disk
+    /// (not tmpfs) for suspending to free memory.
+    pub state_dir: PathBuf,
+}
+
+/// How long a lifecycle operation waits for another one on the same VM.
+const LIFECYCLE_WAIT: Duration = Duration::from_secs(30);
+/// How long a checkpoint waits for a VM to finish pulling its memory.
+const DRAIN_WAIT: Duration = Duration::from_secs(60);
+/// Guest clock error tolerated after a restore or resume.
+const CLOCK_TOLERANCE: Duration = Duration::from_millis(20);
+
+/// A VM suspended to a checkpoint under `state_dir/suspended`.
+struct Suspended {
+    dir: PathBuf,
+    manifest: Manifest,
 }
 
 pub struct Daemon {
@@ -61,6 +81,22 @@ pub struct Daemon {
     _run_lock: Vec<std::fs::File>,
     /// Armed test faults and when they expire; None unless FLEXVM_FAULTS=1.
     faults: Option<Mutex<HashMap<String, Instant>>>,
+    /// VM names with a lifecycle operation in progress, and which (see `reserve`).
+    busy: (Mutex<HashMap<String, &'static str>>, Condvar),
+    suspended: Mutex<HashMap<String, Suspended>>,
+}
+
+/// A VM name reserved for one lifecycle operation; released on drop.
+struct Busy<'a> {
+    d: &'a Daemon,
+    name: String,
+}
+
+impl Drop for Busy<'_> {
+    fn drop(&mut self) {
+        self.d.busy.0.lock().unwrap().remove(&self.name);
+        self.d.busy.1.notify_all();
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,7 +142,10 @@ pub fn run(mut cfg: Config) -> Result<()> {
         migrations: Mutex::new(HashMap::new()),
         _run_lock: run_lock,
         faults: std::env::var("FLEXVM_FAULTS").is_ok_and(|v| v == "1").then(|| Mutex::new(HashMap::new())),
+        busy: (Mutex::new(HashMap::new()), Condvar::new()),
+        suspended: Mutex::new(HashMap::new()),
     });
+    d.load_suspended()?;
     eprintln!("flexvm daemon listening on {} (advertised as {})", d.cfg.listen, d.cfg.advertise);
     {
         let d = d.clone();
@@ -285,8 +324,15 @@ impl Daemon {
                 res => res,
             },
             "run" => self.run_vm(&name, req["template"].as_str().unwrap_or("default"), req["ip"].as_str()),
-            "ls" => Ok(json!(self.vms.lock().unwrap().values().map(|v| v.describe()).collect::<Vec<_>>())),
+            "ls" => Ok(self.list()),
             "kill" => self.kill(&name),
+            "pause" => self.pause(&name),
+            "resume" => self.resume(&name),
+            "suspend" => self.suspend(&name),
+            "checkpoint" => {
+                self.checkpoint(&name, req["dir"].as_str().ok_or("missing dir")?, req["stop"].as_bool().unwrap_or(false))
+            }
+            "restore" => self.restore(req["dir"].as_str().ok_or("missing dir")?, req["name"].as_str(), req["ip"].as_str()),
             "release" => self.release(&name, &req),
             "migration" => self.migration_outcome(&req),
             "fault" => self.inject(&req),
@@ -314,7 +360,8 @@ impl Daemon {
 
     fn run_vm(&self, name: &str, template: &str, ip: Option<&str>) -> Result<Value> {
         let mut t = Phases::new();
-        if name.is_empty() || self.vms.lock().unwrap().contains_key(name) {
+        let _busy = self.reserve(name, "starting", Duration::ZERO)?;
+        if name.is_empty() || self.taken(name) {
             bail!("vm name {name:?} is empty or taken");
         }
         let tpl = self.template(template)?;
@@ -394,7 +441,7 @@ impl Daemon {
     /// A peer tells us where a VM address lives (`via`), or that it is gone.
     fn route(&self, req: &Value) -> Result<Value> {
         let ip: Ipv4Addr = req["ip"].as_str().ok_or("missing ip")?.parse()?;
-        let local = self.vms.lock().unwrap().values().any(|v| v.ip == ip && v.state() == State::Running);
+        let local = self.vms.lock().unwrap().values().any(|v| v.ip == ip && v.state().local());
         if !local {
             match req["via"].as_str() {
                 Some(via) => net::route_via(ip, via.parse()?)?,
@@ -406,12 +453,30 @@ impl Daemon {
 
     /// Stops a VM and withdraws its address from the network.
     fn kill(&self, name: &str) -> Result<Value> {
+        let _busy = self.reserve(name, "killing", LIFECYCLE_WAIT)?;
+        self.kill_reserved(name)
+    }
+
+    /// `kill`, for a caller holding the name's reservation. A suspended VM's
+    /// checkpoint is deleted.
+    fn kill_reserved(&self, name: &str) -> Result<Value> {
         let vm = self.vms.lock().unwrap().remove(name);
-        let Some(vm) = vm else { bail!("no vm named {name:?}") };
-        vm.kill();
-        self.ips.lock().unwrap().remove(&vm.ip);
+        let ip = match vm {
+            Some(vm) => {
+                vm.kill();
+                vm.ip
+            }
+            None => {
+                let s = self.suspended.lock().unwrap().remove(name);
+                let Some(s) = s else { bail!("no vm named {name:?}") };
+                if let Err(e) = std::fs::remove_dir_all(&s.dir) {
+                    eprintln!("vm {name}: removing its checkpoint {}: {e}", s.dir.display());
+                }
+                s.manifest.ip
+            }
+        };
+        self.ips.lock().unwrap().remove(&ip);
         let peers = self.cfg.peers.clone();
-        let ip = vm.ip;
         thread::spawn(move || {
             for peer in &peers {
                 let _ = peer_call(peer, json!({"op": "route", "ip": ip.to_string()}));
@@ -527,6 +592,7 @@ impl Daemon {
     /// on this copy is resumed only if the target says migration `mig`
     /// aborted, and never once it committed.
     fn migrate(self: &Arc<Self>, name: &str, to: &str) -> Result<Value> {
+        let _busy = self.reserve(name, "migrating", LIFECYCLE_WAIT)?;
         let vm = self.vm(name)?;
         // Before pausing, so a template mismatch costs no downtime.
         crate::template::preflight(&self.cfg.paths, &vm.template, to)?;
@@ -564,6 +630,8 @@ impl Daemon {
                     "source": self.cfg.advertise,
                     "runs": runs,
                     "vmstate_len": state.len(),
+                    // A paused VM stays paused on the target, which pulls its pages before it ever runs.
+                    "paused": vm.was_paused(),
                 }),
             )?;
             conn.write_all(&state)?;
@@ -612,8 +680,8 @@ impl Daemon {
             return e;
         }
         match vm.resume() {
-            Ok(()) => {
-                *st = State::Running;
+            Ok(s) => {
+                *st = s;
                 e
             }
             Err(r) => {
@@ -678,7 +746,7 @@ impl Daemon {
                 for _ in 0..10 {
                     thread::sleep(delay);
                     // The VM may have come back here meanwhile.
-                    if d.vms.lock().unwrap().values().any(|v| v.ip == ip && v.state() == State::Running) {
+                    if d.vms.lock().unwrap().values().any(|v| v.ip == ip && v.state().local()) {
                         return;
                     }
                     match d.route_via(ip, via) {
@@ -731,7 +799,8 @@ impl Daemon {
         state: &[u8],
         t: &mut Phases,
     ) -> Result<Value> {
-        if self.vms.lock().unwrap().contains_key(name) {
+        let _busy = self.reserve(name, "incoming", Duration::ZERO)?;
+        if self.taken(name) {
             bail!("vm name {name:?} is taken here");
         }
         let tpl = self.migration_template(req, false)?;
@@ -743,7 +812,9 @@ impl Daemon {
             let vmstate = idle.dir.join("vmstate.in");
             std::fs::write(&vmstate, state)?;
             t.mark("write_state");
-            Vm::restore(idle, name, tpl, &vmstate, Some((runs, source.clone())), ip, t)
+            let paused = req["paused"].as_bool().unwrap_or(false);
+            let origin = Some((runs, Origin::Peer(source.clone())));
+            Vm::restore_from(idle, name, tpl, &vmstate, origin, ip, !paused, t)
         })();
         let (vm, restore) = restored.inspect_err(|_| {
             self.ips.lock().unwrap().remove(&ip);
@@ -774,6 +845,9 @@ impl Daemon {
         let vms: Vec<Arc<Vm>> = self.vms.lock().unwrap().values().cloned().collect();
         let mut host_avail = host_available_mib();
         for vm in &vms {
+            // Never alongside a lifecycle operation on the VM; paused and
+            // suspended VMs have no fresh statistics and are left alone.
+            let Ok(_busy) = self.reserve(&vm.name, "resizing", Duration::ZERO) else { continue };
             if vm.state() == State::Running {
                 match resize(vm, host_avail, self.cfg.reserve_mib) {
                     Ok(grew) => host_avail = host_avail.saturating_sub(grew),

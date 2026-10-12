@@ -82,19 +82,19 @@ struct Component {
 
 /// FNV-1a over 64-bit words, folded so high bits feed back down. An identity
 /// check for trusted files, not protection against tampering.
-struct Hash(u64);
+pub(crate) struct Hash(u64);
 
 impl Hash {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self(0xcbf29ce484222325)
     }
 
-    fn word(&mut self, w: u64) {
+    pub(crate) fn word(&mut self, w: u64) {
         let h = (self.0 ^ w).wrapping_mul(0x9e3779b97f4a7c15);
         self.0 = h ^ (h >> 29);
     }
 
-    fn update(&mut self, bytes: &[u8]) {
+    pub(crate) fn update(&mut self, bytes: &[u8]) {
         self.word(bytes.len() as u64);
         let mut words = bytes.chunks_exact(8);
         for w in &mut words {
@@ -105,8 +105,12 @@ impl Hash {
         self.word(u64::from_le_bytes(tail));
     }
 
-    fn finish(self) -> String {
+    pub(crate) fn finish(self) -> String {
         format!("{:016x}", self.0)
+    }
+
+    pub(crate) fn value(&self) -> u64 {
+        self.0
     }
 }
 
