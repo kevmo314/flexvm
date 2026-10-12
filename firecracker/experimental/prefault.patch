@@ -1,0 +1,132 @@
+--- a/src/vmm/src/builder.rs
++++ b/src/vmm/src/builder.rs
+@@ -40,7 +40,6 @@
+ use crate::gdb;
+ use crate::initrd::{InitrdConfig, InitrdError};
+ use crate::logger::debug;
+-#[cfg(target_arch = "aarch64")]
+ use crate::logger::warn;
+ use crate::persist::{MicrovmState, MicrovmStateError};
+ use crate::resources::VmResources;
+@@ -519,6 +518,13 @@
+         device_manager,
+     };
+ 
++    // flexvm: map the guest pages the UFFD handler has already populated into
++    // KVM's page tables, so the guest does not exit once per page on first touch.
++    #[cfg(target_arch = "x86_64")]
++    if std::env::var_os("FC_PREFAULT").is_some() {
++        prefault_present(&kvm_vm, &vcpus[0]);
++    }
++
+     // Move vcpus to their own threads and start their state machine in the 'Paused' state.
+     kvm_vm.start_vcpus(
+         vcpus,
+@@ -537,6 +543,107 @@
+     Ok(vmm)
+ }
+ 
++/// Finds the guest pages already present in this process (PAGEMAP_SCAN) and
++/// maps them into KVM's two-dimensional page tables with KVM_PRE_FAULT_MEMORY.
++#[cfg(target_arch = "x86_64")]
++fn prefault_present(vm: &KvmVm, vcpu: &crate::Vcpu) {
++    use std::os::fd::AsRawFd;
++    use vm_memory::{Address, GuestMemoryBackend, GuestMemoryRegion};
++
++    #[repr(C)]
++    struct PmScanArg {
++        size: u64,
++        flags: u64,
++        start: u64,
++        end: u64,
++        walk_end: u64,
++        vec: u64,
++        vec_len: u64,
++        max_pages: u64,
++        category_inverted: u64,
++        category_mask: u64,
++        category_anyof_mask: u64,
++        return_mask: u64,
++    }
++    #[repr(C)]
++    #[derive(Clone, Copy, Default)]
++    struct PageRegion {
++        start: u64,
++        end: u64,
++        categories: u64,
++    }
++    #[repr(C)]
++    struct PreFault {
++        gpa: u64,
++        size: u64,
++        flags: u64,
++        padding: [u64; 5],
++    }
++    const PAGEMAP_SCAN: libc::c_ulong = 0xC060_6610;
++    const KVM_PRE_FAULT_MEMORY: libc::c_ulong = 0xC040_AED5;
++    const PAGE_IS_PRESENT: u64 = 1 << 3;
++
++    let start = std::time::Instant::now();
++    let pagemap = match std::fs::File::open("/proc/self/pagemap") {
++        Ok(f) => f,
++        Err(err) => return warn!("prefault: open pagemap: {err}"),
++    };
++    let vcpu_fd = vcpu.kvm_vcpu.fd.as_raw_fd();
++    let mut found = vec![PageRegion::default(); 1024];
++    let (mut ranges, mut bytes, mut failed) = (0u64, 0u64, 0u64);
++    for region in vm.guest_memory().iter() {
++        let hva = region.as_ptr() as u64;
++        let gpa = region.start_addr().raw_value();
++        let end = hva + region.len();
++        let mut at = hva;
++        while at < end {
++            let mut arg = PmScanArg {
++                size: std::mem::size_of::<PmScanArg>() as u64,
++                flags: 0,
++                start: at,
++                end,
++                walk_end: 0,
++                vec: found.as_mut_ptr() as u64,
++                vec_len: found.len() as u64,
++                max_pages: 0,
++                category_inverted: 0,
++                category_mask: PAGE_IS_PRESENT,
++                category_anyof_mask: 0,
++                return_mask: PAGE_IS_PRESENT,
++            };
++            // SAFETY: arg and found are valid for the duration of the call.
++            let n = unsafe { libc::ioctl(pagemap.as_raw_fd(), PAGEMAP_SCAN as _, &mut arg) };
++            if n < 0 {
++                return warn!("prefault: PAGEMAP_SCAN: {}", io::Error::last_os_error());
++            }
++            for r in &found[..n as usize] {
++                let mut pf = PreFault { gpa: gpa + (r.start - hva), size: r.end - r.start, flags: 0, padding: [0; 5] };
++                while pf.size > 0 {
++                    // SAFETY: pf is a valid kvm_pre_fault_memory.
++                    if unsafe { libc::ioctl(vcpu_fd, KVM_PRE_FAULT_MEMORY as _, &mut pf) } < 0 {
++                        let err = io::Error::last_os_error();
++                        if !matches!(err.raw_os_error(), Some(libc::EINTR) | Some(libc::EAGAIN)) {
++                            failed += 1;
++                            break;
++                        }
++                    }
++                }
++                ranges += 1;
++                bytes += r.end - r.start;
++            }
++            if arg.walk_end <= at {
++                break;
++            }
++            at = arg.walk_end;
++        }
++    }
++    warn!(
++        "prefault: {ranges} ranges, {} KiB in {} us ({failed} failed)",
++        bytes >> 10,
++        start.elapsed().as_micros()
++    );
++}
++
+ /// 64 bytes due to alignment requirement in 3.1 of https://www.kernel.org/doc/html/v5.8/virt/kvm/devices/vcpu.html#attribute-kvm-arm-vcpu-pvtime-ipa
+ #[cfg(target_arch = "aarch64")]
+ const STEALTIME_STRUCT_MEM_SIZE: u64 = 64;
