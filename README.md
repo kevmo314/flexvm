@@ -44,6 +44,79 @@ source also brings the VM's tap down (no RX into guest memory), closes host
 exec sessions (vsock) and parks the balloon statistics timer; the target and an
 aborted source put the timer back.
 
+### Lifecycle: pause, checkpoint, restore, suspend
+
+```
+starting -> running <-> paused                     (pause / resume)
+running | paused -> checkpointing -> running | paused | gone   (checkpoint [--stop])
+running | paused -> checkpointing -> suspended -> running      (suspend / resume)
+running | paused -> source (migrating) -> gone, or back if the target aborted
+any -> failed (memory lost) -> gone                (kill)
+```
+
+Every lifecycle operation (and each controller resize) first reserves the
+VM's name, so operations on one VM never interleave; the controller skips a
+VM that is busy, paused or suspended.
+
+- **pause / resume** stop and restart the vCPUs; memory and devices stay.
+  Both take under a millisecond (2 vCPU) to 1.5 ms (24 vCPU).
+- **checkpoint NAME DIR** pauses the VM, quiesces its devices and pager like a
+  migration source does (a VM still pulling memory from a migration source or
+  checkpoint finishes that first), saves the vCPU/device state and writes
+  every page that differs from the template into DIR, then resumes the VM
+  (`--keep-running`, the default) or kills it (`--stop`). The pause lasts as
+  long as the write (about 0.4 GB/s here).
+- **restore DIR** works on any host whose template has the same content id.
+  It loads the saved state into a pooled Firecracker whose pager takes
+  pages from the checkpoint's page file: on fault, and in the background
+  (the template's working set first) until all are in, so the VM is ready
+  in about the time of a `run`. By default the VM keeps its name and
+  address; a restore refuses an address a peer is using (`--ip auto` picks a
+  new one, which also makes a restore a fork of a running VM).
+- **suspend** checkpoints into the daemon's `--state-dir` (default
+  `/var/lib/flexvm/<listen>`; it must be on disk, not tmpfs) and then kills
+  Firecracker, so the VM costs no memory. Memory is released only once the
+  checkpoint is durable, and the pager is stopped before Firecracker dies,
+  so no discard event can mark a saved page as zero. `resume` restores it
+  lazily like `restore`, and deletes the checkpoint once every page is in. Suspended
+  VMs survive a daemon restart.
+- **Clock.** A restored guest's wall clock resumes from when it was saved: the
+  guest uses the TSC clocksource, whose saved value Firecracker restores
+  (`clock_realtime` only moves kvmclock). A restore or a suspended VM's
+  resume steps the guest clock to the host's (measured with one bracketed
+  exec, corrected relative to the guest's own clock, residual error of a few
+  ms). Across a plain pause the TSC keeps counting, so the clock stays right
+  (measured: 0 ms drift after 20 s); `resume` still checks it in the
+  background. A paused VM can also be **migrated**: it stays paused on the
+  target, which pulls all its pages from the source with nothing faulting.
+
+#### Checkpoint format (version 1)
+
+A checkpoint is a directory that is written in full or not at all. Every file
+goes into a fresh `.NAME.partial-<pid>-<n>` directory next to the target and is
+fsynced. The directory is then renamed into place (`RENAME_NOREPLACE`;
+checkpoints are never overwritten or modified) and the parent fsynced. A
+later checkpoint to the same place clears partial directories that a dead
+daemon left behind.
+
+| file | contents |
+|---|---|
+| `manifest.json` | line 1: checksum of the rest; then JSON with the format version, name, address, template name and content id, machine (vCPUs, base/max/hotplugged MiB), guest page count, page counts and the length and checksum of each file |
+| `vmstate` | Firecracker's state-only snapshot |
+| `pagemap` | `FVPGMAP1`, then runs `(first page, count, DATA\|ZERO)` and one checksum per 64-page block of `pages` |
+| `pages` | DATA pages back to back, in guest page order |
+
+Pages the pager has PRESENT are a superset of what changed (template pages
+read in by prefetch are PRESENT too). The writer therefore compares each page
+with the template and with zero. A page equal to the template (or zero over a
+template hole) is BASE and is not stored. Zero over template data is a ZERO
+run, and anything else is DATA. A restore checks the manifest, `vmstate` and
+`pagemap` before it loads anything, and checks every block of `pages` as it
+reads it. A bad block fails the VM (it is killed) rather than letting it run on wrong memory. The
+checksum is the 64-bit content hash used for template ids. It catches
+corruption, but not deliberate tampering. A checkpoint belongs to the owner of
+the directory it was written into.
+
 ### Migration ownership
 
 Each migration has a random id. Once the target may have received the vmstate,
@@ -112,6 +185,16 @@ RAM and double memory use on a host that is already short.
 | TCP connection through two migrations | no errors, worst stall 217 ms (one client retransmit) |
 | Background memory pull | ~1.1 GB/s over loopback TCP |
 | Idle VM host RSS | 13–35 MiB |
+| pause / resume (daemon side; RPC round trip ~2.3 ms) | **0.6 / 0.7 ms** (2 vCPU), 1.5 ms resume (24 vCPU) |
+| checkpoint, by memory touched: 0 / 256 / 1024 MiB written in the guest | 133 / 616 / 2609 ms paused (p50; 3 / 268 / 1055 MiB stored) |
+| restore → guest agent answering | **33 / 27 / 67 ms** (snapshot load 28 / 24 / 63 ms); whole checkpoint paged in after 39 / 153 / 509 ms |
+| suspend (checkpoint + free) / resume of a suspended VM to ready | 127 / 448 / 2012 ms; 27 / 28 / 36 ms |
+| suspended VM host RSS | 0 (Firecracker gone) |
+
+Lifecycle numbers are from `flexvm bench --lifecycle` with the 2-vCPU template,
+5 trials per size, restoring on the second daemon of the same host
+(`bench/*-lifecycle.json`). The guest clock step after a restore adds another
+35–100 ms after ready.
 
 ## Quickstart
 
@@ -134,7 +217,12 @@ flexvm run web                                  # -> 192.168.1.128
 flexvm exec web 'free -m'
 flexvm ls
 flexvm migrate web --to 192.168.1.11:7070       # address and connections follow
-flexvm --host 192.168.1.11:7070 kill web
+export FLEXVM_HOST=192.168.1.11:7070
+flexvm pause web; flexvm resume web             # vCPUs stopped, memory kept
+flexvm suspend web; flexvm resume web           # state to local disk, memory freed; lazy restore
+flexvm checkpoint web /data/web-1 --stop        # complete state to disk; VM stops
+flexvm --host 192.168.1.10:7070 restore /data/web-1   # same template id needed; same name and address
+flexvm --host 192.168.1.10:7070 kill web
 ```
 
 `scripts/netlab.sh up && scripts/netlab.sh daemons` builds the same setup on
@@ -149,7 +237,13 @@ The daemon must run as root: it uses `/dev/kvm`, privileged userfaultfd,
 ```sh
 flexvm --host 192.168.1.10:7070 bench                                        # run
 flexvm --host 192.168.1.10:7070 bench --to 192.168.1.11:7070 --dirty-mib 500 # run + migrate
+flexvm --host 192.168.1.10:7070 bench --lifecycle /data/ckpt --to 192.168.1.11:7070 --dirty-mib 0,256,1024
 ```
+
+`--lifecycle DIR` runs, for each memory size, VMs that are paused and resumed
+ten times, checkpointed into DIR with `--stop`, restored on `--to`, then
+suspended and resumed there. The report covers every phase, including the
+background page-in.
 
 Each trial runs a fresh VM, optionally writes N MiB into its /tmp and migrates
 it (waiting for the full pull), then kills it. Phases are back-to-back daemon
@@ -161,7 +255,9 @@ p50/p90/p99/max per phase, raw samples and host context.
 ```
 flexvm/src/
   daemon.rs    RPC, migration, elastic memory controller, pressure policy
-  uffd.rs      userfaultfd pager + page server
+  lifecycle.rs pause/resume, checkpoint, restore, suspend; per-VM operation lock
+  checkpoint.rs checkpoint format: crash-consistent writer, verified page-file reader
+  uffd.rs      userfaultfd pager (template / zero / migration source / checkpoint file) + page server
   template.rs  cold boot, snapshot, sparse image, working-set recording
   vm.rs        restore into a pooled Firecracker, checkpoint, stats
   net.rs       taps, rtnetlink routes and neighbours, gratuitous ARP, address ranges
@@ -204,5 +300,23 @@ firecracker/        patches on top of Firecracker v1.17.0
 - The controller samples guest memory once a second (balloon stats). A very
   fast allocation burst can still hit the in-guest OOM killer; guest PSI
   triggers over vsock would react faster.
+- **Checkpoints pause the VM for the whole write** (about 0.4 GB/s: reading
+  memory out of Firecracker, comparing with the template, checksumming,
+  fsync). Copy-on-write or pre-copy (#8) would make the pause independent of
+  memory size. Checkpoints are full each time, not incremental.
+- **The restore working set is the template's** (pages a fresh VM touches to
+  become ready), not the checkpointed VM's own recent working set. This host
+  has no idle page tracking to record that. Everything else is paged in
+  address order in the background.
+- A checkpoint, including a suspended VM, needs the template it was made
+  from, and the template's content id must match. Rebuilding a template
+  strands its checkpoints, so keep old templates while their checkpoints
+  matter.
+- **Fresh `run`s and migration targets keep the guest clock they were saved
+  with**: the template's snapshot time, and the downtime lost on each
+  migration. Only lifecycle restores and resumes step the clock (the same
+  `Vm::sync_clock` could run after `run`, off the critical path).
+- A guest that gets a different address on restore keeps its old one too,
+  unless it has iproute2 to drop it.
 - Snapshot load is dominated by KVM memslot creation in this nested
   environment; expect much lower numbers on bare metal.
