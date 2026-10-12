@@ -197,6 +197,8 @@ fn record_working_set(paths: &Paths, name: &str, tap: &str) -> Result<usize> {
             "mem_backend": {"backend_type": "Uffd", "backend_path": run.join("uffd.sock")},
             "vsock_override": {"uds_path": run.join("v.sock")},
             "network_overrides": [{"iface_id": "eth0", "host_dev_name": tap}],
+            // Like the daemon's restores: stepping the clock touches pages of its own.
+            "clock_realtime": true,
             "resume_vm": true,
         }),
     )?;
