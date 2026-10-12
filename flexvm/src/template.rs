@@ -125,10 +125,18 @@ fn data_bitmap(file: &File, len: usize) -> Result<Vec<u64>> {
     while (off as usize) < len {
         let data = unsafe { libc::lseek(fd, off, libc::SEEK_DATA) };
         if data < 0 {
-            break;
+            // ENXIO: no data past `off`. Anything else would silently zero real pages.
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::ENXIO) {
+                break;
+            }
+            return Err(e.into());
         }
         let hole = unsafe { libc::lseek(fd, data, libc::SEEK_HOLE) };
-        let end = if hole < 0 { len as i64 } else { hole };
+        if hole < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let end = hole;
         for p in (data as usize / PAGE_SIZE)..(end as usize).div_ceil(PAGE_SIZE).min(pages) {
             bits[p / 64] |= 1 << (p % 64);
         }
