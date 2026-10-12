@@ -1,0 +1,1327 @@
+{
+  "date_utc": "2026-10-12T21-04-45Z",
+  "git_dirty": false,
+  "git_sha": "bc5c5a44102b16bbb99ba4473af81a34dd4d54ae",
+  "host_context": {
+    "source": {
+      "cpu_model": "AMD Ryzen 9 3900X 12-Core Processor",
+      "daemon": {
+        "addr": "127.0.0.1:7080",
+        "ips": [],
+        "mem_available_mib": 19007,
+        "mem_total_mib": 32049,
+        "reserve_mib": 1024,
+        "underlay": "127.0.0.1",
+        "vms": 0
+      },
+      "firecracker": "Firecracker v1.17.0\n\n2026-10-12T17:04:45.705637240 [anonymous-instance:main] Firecracker exiting successfully. exit_code=0",
+      "host_cpus": 24,
+      "hostname": "Chicago",
+      "kernel": "6.18.40.1-microsoft-standard-WSL2",
+      "loadavg": "15.48 15.34 15.41 19/2419 3301696",
+      "nested_virt": true,
+      "pool": 2,
+      "template": {
+        "kernel": "/home/kevin/flexvm/artifacts/vmlinux",
+        "max_mib": 32000,
+        "mem_mib": 256,
+        "rootfs": "/home/kevin/flexvm/artifacts/rootfs.ext4",
+        "vcpus": 24
+      }
+    },
+    "target": {
+      "cpu_model": "AMD Ryzen 9 3900X 12-Core Processor",
+      "daemon": {
+        "addr": "127.0.0.1:7081",
+        "ips": [],
+        "mem_available_mib": 19007,
+        "mem_total_mib": 32049,
+        "reserve_mib": 1024,
+        "underlay": "127.0.0.1",
+        "vms": 0
+      },
+      "firecracker": "Firecracker v1.17.0\n\n2026-10-12T17:04:45.709834342 [anonymous-instance:main] Firecracker exiting successfully. exit_code=0",
+      "host_cpus": 24,
+      "hostname": "Chicago",
+      "kernel": "6.18.40.1-microsoft-standard-WSL2",
+      "loadavg": "15.48 15.34 15.41 17/2419 3301698",
+      "nested_virt": true,
+      "pool": 2,
+      "template": {
+        "kernel": "/home/kevin/flexvm/artifacts/vmlinux",
+        "max_mib": 32000,
+        "mem_mib": 256,
+        "rootfs": "/home/kevin/flexvm/artifacts/rootfs.ext4",
+        "vcpus": 24
+      }
+    }
+  },
+  "params": {
+    "dirty_mib": 0,
+    "host": "127.0.0.1:7080",
+    "ip": null,
+    "iterations": 30,
+    "settle_ms": 100,
+    "template": "default",
+    "to": "127.0.0.1:7081",
+    "warmup": 3
+  },
+  "samples_ms": [
+    {
+      "migrate": {
+        "background_pull": 106.67,
+        "checkpoint": 14.92,
+        "downtime": 51.25,
+        "read_state": 0.12,
+        "reroute": 0.08,
+        "send_state": 1.66,
+        "target": 34.55,
+        "total": 51.33
+      },
+      "migrate_target": {
+        "cgroup_rename": 0.03,
+        "claim_ip": 0.01,
+        "pager_start": 1.7,
+        "pool_take": 0.09,
+        "recv_state": 1.27,
+        "register": 0.23,
+        "route_wait": 0.02,
+        "snapshot_load": 30.44,
+        "total": 33.94,
+        "write_state": 0.16
+      },
+      "run": {
+        "announce": 0.08,
+        "cgroup_rename": 0.04,
+        "claim_ip": 1.28,
+        "guest_net": 10.09,
+        "pager_start": 1.81,
+        "pool_take": 0.1,
+        "register": 0.0,
+        "route_wait": 0.0,
+        "snapshot_load": 30.05,
+        "total": 43.45
+      }
+    },
+    {
+      "migrate": {
+        "background_pull": 104.23,
+        "checkpoint": 16.75,
+        "downtime": 48.71,
+        "read_state": 0.11,
+        "reroute": 0.07,
+        "send_state": 1.33,
+        "target": 30.52,
+        "total": 48.78
+      },
+      "migrate_target": {
+        "cgroup_rename": 0.04,
+        "claim_ip": 0.01,
+        "pager_start": 1.54,
+        "pool_take": 0.06,
+        "recv_state": 0.99,
+        "register": 0.12,
+        "route_wait": 0.0,
+        "snapshot_load": 27.28,
+        "total": 30.22,
+        "write_state": 0.2
+      },
+      "run": {
+        "announce": 0.09,
+        "cgroup_rename": 0.07,
+        "claim_ip": 1.38,
+        "guest_net": 9.82,
+        "pager_start": 2.11,
+        "pool_take": 0.11,
+        "register": 0.0,
+        "route_wait": 0.0,
+        "snapshot_load": 44.65,
+        "total": 58.25
+      }
+    },
+    {
+      "migrate": {
+        "background_pull": 90.65,
+        "checkpoint": 16.11,
+        "downtime": 54.21,
+        "read_state": 0.12,
+        "reroute": 0.51,
+        "send_state": 1.91,
+        "target": 36.07,
+        "total": 54.72
+      },
+      "migrate_target": {
+        "cgroup_rename": 0.04,
+        "claim_ip": 0.01,
+        "pager_start": 1.86,
+        "pool_take": 0.08,
+        "recv_state": 1.63,
+        "register": 0.1,
+        "route_wait": 0.0,
+        "snapshot_load": 32.27,
+        "total": 36.19,
+        "write_state": 0.2
+      },
+      "run": {
+        "announce": 0.11,
+        "cgroup_rename": 0.04,
+        "claim_ip": 0.96,
+        "guest_net": 9.6,
+        "pager_start": 2.19,
+        "pool_take": 0.1,
+        "register": 0.0,
+        "route_wait": 0.0,
+        "snapshot_load": 29.45,
+        "total": 42.45
+      }
+    },
+    {
+      "migrate": {
+        "background_pull": 106.62,
+        "checkpoint": 11.06,
+        "downtime": 79.88,
+        "read_state": 0.08,
+        "reroute": 0.33,
+        "send_state": 1.27,
+        "target": 67.46,
+        "total": 80.21
+      },
+      "migrate_target": {
+        "cgroup_rename": 0.03,
+        "claim_ip": 0.0,
+        "pager_start": 2.69,
+        "pool_take": 0.07,
+        "recv_state": 1.17,
+        "register": 0.19,
+        "route_wait": 0.0,
+        "snapshot_load": 62.59,
+        "total": 66.93,
+        "write_state": 0.19
+      },
+      "run": {
+        "announce": 0.09,
+        "cgroup_rename": 0.05,
+        "claim_ip": 1.02,
+        "guest_net": 8.03,
+        "pager_start": 2.26,
+        "pool_take": 0.11,
+        "register": 0.0,
+        "route_wait": 0.0,
+        "snapshot_load": 31.12,
+        "total": 42.69
+      }
+    },
+    {
+      "migrate": {
+        "background_pull": 90.53,
+        "checkpoint": 12.21,
+        "downtime": 50.54,
+        "read_state": 0.09,
+        "reroute": 0.15,
+        "send_state": 1.37,
+        "target": 36.87,
+        "total": 50.69
+      },
+      "migrate_target": {
+        "cgroup_rename": 0.04,
+        "claim_ip": 0.01,
+        "pager_start": 1.93,
+        "pool_take": 0.11,
+        "recv_state": 1.25,
+        "register": 0.11,
+        "route_wait": 0.0,
+        "snapshot_load": 33.33,
+        "total": 36.97,
+        "write_state": 0.19
+      },
+      "run": {
+        "announce": 0.1,
+        "cgroup_rename": 0.04,
+        "claim_ip": 0.93,
+        "guest_net": 9.71,
+        "pager_start": 1.97,
+        "pool_take": 0.08,
+        "register": 0.0,
+        "route_wait": 0.0,
+        "snapshot_load": 30.07,
+        "total": 42.9
+      }
+    },
+    {
+      "migrate": {
+        "background_pull": 97.58,
+        "checkpoint": 13.41,
+        "downtime": 51.73,
+        "read_state": 0.11,
+        "reroute": 0.12,
+        "send_state": 1.37,
+        "target": 36.84,
+        "total": 51.85
+      },
+      "migrate_target": {
+        "cgroup_rename": 0.03,
+        "claim_ip": 0.01,
+        "pager_start": 1.9,
+        "pool_take": 0.05,
+        "recv_state": 1.17,
+        "register": 0.15,
+        "route_wait": 0.0,
+        "snapshot_load": 33.3,
+        "total": 36.75,
+        "write_state": 0.14
+      },
+      "run": {
+        "announce": 0.1,
+        "cgroup_rename": 0.04,
+        "claim_ip": 1.0,
+        "guest_net": 11.06,
+        "pager_start": 1.87,
+        "pool_take": 0.07,
+        "register": 0.0,
+        "route_wait": 0.0,
+        "snapshot_load": 34.96,
+        "total": 49.1
+      }
+    },
+    {
+      "migrate": {
+        "background_pull": 105.1,
+        "checkpoint": 13.86,
+        "downtime": 51.08,
+        "read_state": 0.08,
+        "reroute": 0.19,
+        "send_state": 1.51,
+        "target": 35.63,
+        "total": 51.27
+      },
+      "migrate_target": {
+        "cgroup_rename": 0.03,
+        "claim_ip": 0.01,
+        "pager_start": 1.92,
+        "pool_take": 0.13,
+        "recv_state": 1.14,
+        "register": 0.34,
+        "route_wait": 0.0,
+        "snapshot_load": 31.72,
+        "total": 35.49,
+        "write_state": 0.19
+      },
+      "run": {
+        "announce": 0.09,
+        "cgroup_rename": 0.04,
+        "claim_ip": 1.09,
+        "guest_net": 14.74,
+        "pager_start": 1.89,
+        "pool_take": 0.09,
+        "register": 0.0,
+        "route_wait": 0.0,
+        "snapshot_load": 36.1,
+        "total": 54.05
+      }
+    },
+    {
+      "migrate": {
+        "background_pull": 98.53,
+        "checkpoint": 11.86,
+        "downtime": 47.01,
+        "read_state": 0.1,
+        "reroute": 0.09,
+        "send_state": 1.4,
+        "target": 33.65,
+        "total": 47.1
+      },
+      "migrate_target": {
+        "cgroup_rename": 0.04,
+        "claim_ip": 0.01,
+        "pager_start": 2.05,
+        "pool_take": 0.1,
+        "recv_state": 1.43,
+        "register": 0.09,
+        "route_wait": 0.0,
+        "snapshot_load": 29.54,
+        "total": 33.47,
+        "write_state": 0.21
+      },
+      "run": {
+        "announce": 0.09,
+        "cgroup_rename": 0.04,
+        "claim_ip": 1.22,
+        "guest_net": 10.83,
+        "pager_start": 2.07,
+        "pool_take": 0.08,
+        "register": 0.0,
+        "route_wait": 0.0,
+        "snapshot_load": 30.7,
+        "total": 45.03
+      }
+    },
+    {
+      "migrate": {
+        "background_pull": 101.71,
+        "checkpoint": 14.37,
+        "downtime": 51.12,
+        "read_state": 0.12,
+        "reroute": 0.34,
+        "send_state": 2.34,
+        "target": 34.28,
+        "total": 51.45
+      },
+      "migrate_target": {
+        "cgroup_rename": 0.04,
+        "claim_ip": 0.01,
+        "pager_start": 1.72,
+        "pool_take": 0.13,
+        "recv_state": 2.24,
+        "register": 0.11,
+        "route_wait": 0.0,
+        "snapshot_load": 30.52,
+        "total": 35.0,
+        "write_state": 0.23
+      },
+      "run": {
+        "announce": 0.1,
+        "cgroup_rename": 0.05,
+        "claim_ip": 1.22,
+        "guest_net": 9.18,
+        "pager_start": 1.8,
+        "pool_take": 0.11,
+        "register": 0.0,
+        "route_wait": 0.0,
+        "snapshot_load": 27.06,
+        "total": 39.53
+      }
+    },
+    {
+      "migrate": {
+        "background_pull": 93.56,
+        "checkpoint": 15.18,
+        "downtime": 58.14,
+        "read_state": 0.11,
+        "reroute": 0.17,
+        "send_state": 1.64,
+        "target": 41.22,
+        "total": 58.31
+      },
+      "migrate_target": {
+        "cgroup_rename": 0.04,
+        "claim_ip": 0.01,
+        "pager_start": 1.97,
+        "pool_take": 0.15,
+        "recv_state": 1.58,
+        "register": 0.1,
+        "route_wait": 0.0,
+        "snapshot_load": 37.31,
+        "total": 41.35,
+        "write_state": 0.2
+      },
+      "run": {
+        "announce": 0.1,
+        "cgroup_rename": 0.04,
+        "claim_ip": 1.29,
+        "guest_net": 10.07,
+        "pager_start": 1.96,
+        "pool_take": 0.1,
+        "register": 0.01,
+        "route_wait": 0.0,
+        "snapshot_load": 38.37,
+        "total": 51.95
+      }
+    },
+    {
+      "migrate": {
+        "background_pull": 100.55,
+        "checkpoint": 14.83,
+        "downtime": 60.21,
+        "read_state": 0.1,
+        "reroute": 0.06,
+        "send_state": 1.37,
+        "target": 43.91,
+        "total": 60.27
+      },
+      "migrate_target": {
+        "cgroup_rename": 0.03,
+        "claim_ip": 0.0,
+        "pager_start": 2.05,
+        "pool_take": 0.07,
+        "recv_state": 1.6,
+        "register": 0.09,
+        "route_wait": 0.0,
+        "snapshot_load": 39.62,
+        "total": 43.63,
+        "write_state": 0.16
+      },
+      "run": {
+        "announce": 0.09,
+        "cgroup_rename": 0.07,
+        "claim_ip": 1.32,
+        "guest_net": 8.48,
+        "pager_start": 1.96,
+        "pool_take": 0.08,
+        "register": 0.0,
+        "route_wait": 0.0,
+        "snapshot_load": 29.66,
+        "total": 41.67
+      }
+    },
+    {
+      "migrate": {
+        "background_pull": 98.16,
+        "checkpoint": 13.01,
+        "downtime": 52.83,
+        "read_state": 0.15,
+        "reroute": 0.1,
+        "send_state": 1.46,
+        "target": 38.21,
+        "total": 52.93
+      },
+      "migrate_target": {
+        "cgroup_rename": 0.06,
+        "claim_ip": 0.01,
+        "pager_start": 2.08,
+        "pool_take": 0.12,
+        "recv_state": 1.62,
+        "register": 0.09,
+        "route_wait": 0.0,
+        "snapshot_load": 34.21,
+        "total": 38.43,
+        "write_state": 0.24
+      },
+      "run": {
+        "announce": 0.15,
+        "cgroup_rename": 0.04,
+        "claim_ip": 1.18,
+        "guest_net": 8.34,
+        "pager_start": 1.68,
+        "pool_take": 0.08,
+        "register": 0.0,
+        "route_wait": 0.0,
+        "snapshot_load": 28.96,
+        "total": 40.44
+      }
+    },
+    {
+      "migrate": {
+        "background_pull": 83.0,
+        "checkpoint": 14.7,
+        "downtime": 56.28,
+        "read_state": 0.1,
+        "reroute": 0.1,
+        "send_state": 1.3,
+        "target": 40.18,
+        "total": 56.38
+      },
+      "migrate_target": {
+        "cgroup_rename": 0.08,
+        "claim_ip": 0.01,
+        "pager_start": 2.31,
+        "pool_take": 0.15,
+        "recv_state": 1.18,
+        "register": 0.09,
+        "route_wait": 0.0,
+        "snapshot_load": 35.82,
+        "total": 39.89,
+        "write_state": 0.25
+      },
+      "run": {
+        "announce": 0.09,
+        "cgroup_rename": 0.04,
+        "claim_ip": 1.25,
+        "guest_net": 10.89,
+        "pager_start": 2.26,
+        "pool_take": 0.09,
+        "register": 0.0,
+        "route_wait": 0.0,
+        "snapshot_load": 34.73,
+        "total": 49.36
+      }
+    },
+    {
+      "migrate": {
+        "background_pull": 86.14,
+        "checkpoint": 11.38,
+        "downtime": 46.08,
+        "read_state": 0.08,
+        "reroute": 0.13,
+        "send_state": 1.3,
+        "target": 33.32,
+        "total": 46.21
+      },
+      "migrate_target": {
+        "cgroup_rename": 0.03,
+        "claim_ip": 0.0,
+        "pager_start": 1.8,
+        "pool_take": 0.09,
+        "recv_state": 1.32,
+        "register": 0.11,
+        "route_wait": 0.0,
+        "snapshot_load": 29.72,
+        "total": 33.24,
+        "write_state": 0.16
+      },
+      "run": {
+        "announce": 0.08,
+        "cgroup_rename": 0.04,
+        "claim_ip": 0.99,
+        "guest_net": 10.03,
+        "pager_start": 2.0,
+        "pool_take": 0.07,
+        "register": 0.0,
+        "route_wait": 0.0,
+        "snapshot_load": 30.91,
+        "total": 44.13
+      }
+    },
+    {
+      "migrate": {
+        "background_pull": 89.75,
+        "checkpoint": 14.19,
+        "downtime": 58.71,
+        "read_state": 0.07,
+        "reroute": 0.1,
+        "send_state": 1.39,
+        "target": 43.06,
+        "total": 58.82
+      },
+      "migrate_target": {
+        "cgroup_rename": 0.03,
+        "claim_ip": 0.0,
+        "pager_start": 1.94,
+        "pool_take": 0.08,
+        "recv_state": 1.05,
+        "register": 0.09,
+        "route_wait": 0.0,
+        "snapshot_load": 39.71,
+        "total": 43.07,
+        "write_state": 0.15
+      },
+      "run": {
+        "announce": 0.13,
+        "cgroup_rename": 0.04,
+        "claim_ip": 1.31,
+        "guest_net": 10.73,
+        "pager_start": 1.97,
+        "pool_take": 0.07,
+        "register": 0.01,
+        "route_wait": 0.0,
+        "snapshot_load": 36.34,
+        "total": 50.61
+      }
+    },
+    {
+      "migrate": {
+        "background_pull": 91.26,
+        "checkpoint": 16.92,
+        "downtime": 51.96,
+        "read_state": 0.1,
+        "reroute": 0.09,
+        "send_state": 1.43,
+        "target": 33.51,
+        "total": 52.05
+      },
+      "migrate_target": {
+        "cgroup_rename": 0.03,
+        "claim_ip": 0.01,
+        "pager_start": 2.04,
+        "pool_take": 0.1,
+        "recv_state": 1.35,
+        "register": 0.14,
+        "route_wait": 0.01,
+        "snapshot_load": 29.49,
+        "total": 33.35,
+        "write_state": 0.19
+      },
+      "run": {
+        "announce": 0.11,
+        "cgroup_rename": 0.03,
+        "claim_ip": 1.08,
+        "guest_net": 9.21,
+        "pager_start": 1.85,
+        "pool_take": 0.08,
+        "register": 0.0,
+        "route_wait": 0.0,
+        "snapshot_load": 27.21,
+        "total": 39.58
+      }
+    },
+    {
+      "migrate": {
+        "background_pull": 106.31,
+        "checkpoint": 16.37,
+        "downtime": 56.45,
+        "read_state": 0.11,
+        "reroute": 0.13,
+        "send_state": 1.71,
+        "target": 38.26,
+        "total": 56.58
+      },
+      "migrate_target": {
+        "cgroup_rename": 0.04,
+        "claim_ip": 0.0,
+        "pager_start": 2.06,
+        "pool_take": 0.09,
+        "recv_state": 1.63,
+        "register": 0.09,
+        "route_wait": 0.0,
+        "snapshot_load": 34.25,
+        "total": 38.36,
+        "write_state": 0.19
+      },
+      "run": {
+        "announce": 0.14,
+        "cgroup_rename": 0.04,
+        "claim_ip": 1.03,
+        "guest_net": 9.45,
+        "pager_start": 1.96,
+        "pool_take": 0.12,
+        "register": 0.0,
+        "route_wait": 0.0,
+        "snapshot_load": 29.0,
+        "total": 41.74
+      }
+    },
+    {
+      "migrate": {
+        "background_pull": 97.98,
+        "checkpoint": 16.14,
+        "downtime": 63.25,
+        "read_state": 0.1,
+        "reroute": 0.49,
+        "send_state": 1.34,
+        "target": 45.67,
+        "total": 63.74
+      },
+      "migrate_target": {
+        "cgroup_rename": 0.03,
+        "claim_ip": 0.01,
+        "pager_start": 1.87,
+        "pool_take": 0.1,
+        "recv_state": 1.33,
+        "register": 0.11,
+        "route_wait": 0.0,
+        "snapshot_load": 42.05,
+        "total": 45.65,
+        "write_state": 0.16
+      },
+      "run": {
+        "announce": 0.11,
+        "cgroup_rename": 0.04,
+        "claim_ip": 1.08,
+        "guest_net": 9.0,
+        "pager_start": 2.09,
+        "pool_take": 0.08,
+        "register": 0.0,
+        "route_wait": 0.0,
+        "snapshot_load": 30.2,
+        "total": 42.61
+      }
+    },
+    {
+      "migrate": {
+        "background_pull": 98.51,
+        "checkpoint": 13.48,
+        "downtime": 57.47,
+        "read_state": 0.1,
+        "reroute": 0.27,
+        "send_state": 1.75,
+        "target": 42.14,
+        "total": 57.75
+      },
+      "migrate_target": {
+        "cgroup_rename": 0.04,
+        "claim_ip": 0.01,
+        "pager_start": 1.89,
+        "pool_take": 0.09,
+        "recv_state": 1.71,
+        "register": 0.11,
+        "route_wait": 0.0,
+        "snapshot_load": 38.24,
+        "total": 42.27,
+        "write_state": 0.19
+      },
+      "run": {
+        "announce": 0.1,
+        "cgroup_rename": 0.05,
+        "claim_ip": 1.03,
+        "guest_net": 9.54,
+        "pager_start": 1.88,
+        "pool_take": 0.09,
+        "register": 0.0,
+        "route_wait": 0.0,
+        "snapshot_load": 31.52,
+        "total": 44.23
+      }
+    },
+    {
+      "migrate": {
+        "background_pull": 91.02,
+        "checkpoint": 17.23,
+        "downtime": 53.0,
+        "read_state": 0.18,
+        "reroute": 0.07,
+        "send_state": 1.65,
+        "target": 33.95,
+        "total": 53.07
+      },
+      "migrate_target": {
+        "cgroup_rename": 0.03,
+        "claim_ip": 0.01,
+        "pager_start": 1.8,
+        "pool_take": 0.09,
+        "recv_state": 1.6,
+        "register": 0.09,
+        "route_wait": 0.0,
+        "snapshot_load": 29.9,
+        "total": 33.73,
+        "write_state": 0.2
+      },
+      "run": {
+        "announce": 0.08,
+        "cgroup_rename": 0.07,
+        "claim_ip": 1.05,
+        "guest_net": 10.09,
+        "pager_start": 1.96,
+        "pool_take": 0.13,
+        "register": 0.0,
+        "route_wait": 0.0,
+        "snapshot_load": 29.44,
+        "total": 42.84
+      }
+    },
+    {
+      "migrate": {
+        "background_pull": 85.95,
+        "checkpoint": 13.94,
+        "downtime": 52.19,
+        "read_state": 0.1,
+        "reroute": 0.1,
+        "send_state": 1.54,
+        "target": 36.61,
+        "total": 52.29
+      },
+      "migrate_target": {
+        "cgroup_rename": 0.04,
+        "claim_ip": 0.0,
+        "pager_start": 1.85,
+        "pool_take": 0.11,
+        "recv_state": 1.44,
+        "register": 0.11,
+        "route_wait": 0.0,
+        "snapshot_load": 32.96,
+        "total": 36.74,
+        "write_state": 0.22
+      },
+      "run": {
+        "announce": 0.1,
+        "cgroup_rename": 0.04,
+        "claim_ip": 1.02,
+        "guest_net": 9.74,
+        "pager_start": 1.9,
+        "pool_take": 0.07,
+        "register": 0.01,
+        "route_wait": 0.0,
+        "snapshot_load": 33.32,
+        "total": 46.2
+      }
+    },
+    {
+      "migrate": {
+        "background_pull": 89.8,
+        "checkpoint": 13.53,
+        "downtime": 45.19,
+        "read_state": 0.1,
+        "reroute": 0.12,
+        "send_state": 1.37,
+        "target": 30.2,
+        "total": 45.31
+      },
+      "migrate_target": {
+        "cgroup_rename": 0.03,
+        "claim_ip": 0.0,
+        "pager_start": 1.78,
+        "pool_take": 0.07,
+        "recv_state": 1.31,
+        "register": 0.09,
+        "route_wait": 0.02,
+        "snapshot_load": 26.64,
+        "total": 30.1,
+        "write_state": 0.15
+      },
+      "run": {
+        "announce": 0.09,
+        "cgroup_rename": 0.04,
+        "claim_ip": 1.49,
+        "guest_net": 10.26,
+        "pager_start": 2.02,
+        "pool_take": 0.11,
+        "register": 0.0,
+        "route_wait": 0.0,
+        "snapshot_load": 31.81,
+        "total": 45.83
+      }
+    },
+    {
+      "migrate": {
+        "background_pull": 91.74,
+        "checkpoint": 13.89,
+        "downtime": 49.59,
+        "read_state": 0.12,
+        "reroute": 0.15,
+        "send_state": 1.48,
+        "target": 34.1,
+        "total": 49.74
+      },
+      "migrate_target": {
+        "cgroup_rename": 0.04,
+        "claim_ip": 0.01,
+        "pager_start": 1.56,
+        "pool_take": 0.11,
+        "recv_state": 1.5,
+        "register": 0.16,
+        "route_wait": 0.0,
+        "snapshot_load": 30.57,
+        "total": 34.16,
+        "write_state": 0.21
+      },
+      "run": {
+        "announce": 0.09,
+        "cgroup_rename": 0.04,
+        "claim_ip": 1.16,
+        "guest_net": 11.26,
+        "pager_start": 1.85,
+        "pool_take": 0.12,
+        "register": 0.0,
+        "route_wait": 0.0,
+        "snapshot_load": 31.99,
+        "total": 46.51
+      }
+    },
+    {
+      "migrate": {
+        "background_pull": 92.43,
+        "checkpoint": 14.35,
+        "downtime": 55.29,
+        "read_state": 0.13,
+        "reroute": 0.09,
+        "send_state": 1.65,
+        "target": 39.16,
+        "total": 55.38
+      },
+      "migrate_target": {
+        "cgroup_rename": 0.04,
+        "claim_ip": 0.01,
+        "pager_start": 2.24,
+        "pool_take": 0.1,
+        "recv_state": 1.96,
+        "register": 0.09,
+        "route_wait": 0.0,
+        "snapshot_load": 34.66,
+        "total": 39.31,
+        "write_state": 0.19
+      },
+      "run": {
+        "announce": 0.09,
+        "cgroup_rename": 0.04,
+        "claim_ip": 1.13,
+        "guest_net": 8.7,
+        "pager_start": 1.92,
+        "pool_take": 0.08,
+        "register": 0.0,
+        "route_wait": 0.0,
+        "snapshot_load": 28.97,
+        "total": 40.93
+      }
+    },
+    {
+      "migrate": {
+        "background_pull": 90.49,
+        "checkpoint": 14.56,
+        "downtime": 55.61,
+        "read_state": 0.1,
+        "reroute": 0.3,
+        "send_state": 1.41,
+        "target": 39.54,
+        "total": 55.91
+      },
+      "migrate_target": {
+        "cgroup_rename": 0.04,
+        "claim_ip": 0.0,
+        "pager_start": 1.87,
+        "pool_take": 0.09,
+        "recv_state": 1.29,
+        "register": 0.09,
+        "route_wait": 0.0,
+        "snapshot_load": 35.93,
+        "total": 39.64,
+        "write_state": 0.32
+      },
+      "run": {
+        "announce": 0.11,
+        "cgroup_rename": 0.08,
+        "claim_ip": 1.11,
+        "guest_net": 9.49,
+        "pager_start": 2.09,
+        "pool_take": 0.07,
+        "register": 0.0,
+        "route_wait": 0.0,
+        "snapshot_load": 29.88,
+        "total": 42.84
+      }
+    },
+    {
+      "migrate": {
+        "background_pull": 92.59,
+        "checkpoint": 15.28,
+        "downtime": 55.62,
+        "read_state": 0.11,
+        "reroute": 0.34,
+        "send_state": 1.37,
+        "target": 38.86,
+        "total": 55.96
+      },
+      "migrate_target": {
+        "cgroup_rename": 0.04,
+        "claim_ip": 0.01,
+        "pager_start": 2.92,
+        "pool_take": 0.09,
+        "recv_state": 1.3,
+        "register": 0.11,
+        "route_wait": 0.0,
+        "snapshot_load": 34.14,
+        "total": 38.83,
+        "write_state": 0.22
+      },
+      "run": {
+        "announce": 0.07,
+        "cgroup_rename": 0.04,
+        "claim_ip": 1.27,
+        "guest_net": 9.97,
+        "pager_start": 2.26,
+        "pool_take": 0.1,
+        "register": 0.0,
+        "route_wait": 0.0,
+        "snapshot_load": 46.51,
+        "total": 60.22
+      }
+    },
+    {
+      "migrate": {
+        "background_pull": 89.69,
+        "checkpoint": 16.48,
+        "downtime": 53.81,
+        "read_state": 0.28,
+        "reroute": 0.64,
+        "send_state": 1.39,
+        "target": 35.65,
+        "total": 54.46
+      },
+      "migrate_target": {
+        "cgroup_rename": 0.03,
+        "claim_ip": 0.01,
+        "pager_start": 1.69,
+        "pool_take": 0.08,
+        "recv_state": 1.19,
+        "register": 0.09,
+        "route_wait": 0.0,
+        "snapshot_load": 32.33,
+        "total": 35.56,
+        "write_state": 0.14
+      },
+      "run": {
+        "announce": 0.12,
+        "cgroup_rename": 0.04,
+        "claim_ip": 1.18,
+        "guest_net": 9.78,
+        "pager_start": 2.07,
+        "pool_take": 0.08,
+        "register": 0.0,
+        "route_wait": 0.0,
+        "snapshot_load": 32.52,
+        "total": 45.8
+      }
+    },
+    {
+      "migrate": {
+        "background_pull": 96.72,
+        "checkpoint": 15.33,
+        "downtime": 50.47,
+        "read_state": 0.14,
+        "reroute": 0.57,
+        "send_state": 1.34,
+        "target": 33.66,
+        "total": 51.04
+      },
+      "migrate_target": {
+        "cgroup_rename": 0.04,
+        "claim_ip": 0.01,
+        "pager_start": 1.9,
+        "pool_take": 0.16,
+        "recv_state": 1.28,
+        "register": 0.1,
+        "route_wait": 0.0,
+        "snapshot_load": 29.82,
+        "total": 33.51,
+        "write_state": 0.2
+      },
+      "run": {
+        "announce": 0.12,
+        "cgroup_rename": 0.04,
+        "claim_ip": 1.17,
+        "guest_net": 9.48,
+        "pager_start": 1.8,
+        "pool_take": 0.07,
+        "register": 0.0,
+        "route_wait": 0.0,
+        "snapshot_load": 31.75,
+        "total": 44.44
+      }
+    },
+    {
+      "migrate": {
+        "background_pull": 86.47,
+        "checkpoint": 15.52,
+        "downtime": 42.43,
+        "read_state": 0.09,
+        "reroute": 0.12,
+        "send_state": 1.49,
+        "target": 25.33,
+        "total": 42.55
+      },
+      "migrate_target": {
+        "cgroup_rename": 0.03,
+        "claim_ip": 0.0,
+        "pager_start": 1.53,
+        "pool_take": 0.08,
+        "recv_state": 1.14,
+        "register": 0.09,
+        "route_wait": 0.0,
+        "snapshot_load": 22.1,
+        "total": 25.15,
+        "write_state": 0.18
+      },
+      "run": {
+        "announce": 0.1,
+        "cgroup_rename": 0.08,
+        "claim_ip": 0.96,
+        "guest_net": 8.83,
+        "pager_start": 1.86,
+        "pool_take": 0.08,
+        "register": 0.0,
+        "route_wait": 0.0,
+        "snapshot_load": 30.44,
+        "total": 42.35
+      }
+    },
+    {
+      "migrate": {
+        "background_pull": 94.16,
+        "checkpoint": 13.51,
+        "downtime": 54.35,
+        "read_state": 0.1,
+        "reroute": 0.18,
+        "send_state": 1.34,
+        "target": 39.4,
+        "total": 54.54
+      },
+      "migrate_target": {
+        "cgroup_rename": 0.04,
+        "claim_ip": 0.01,
+        "pager_start": 3.08,
+        "pool_take": 0.11,
+        "recv_state": 1.22,
+        "register": 0.11,
+        "route_wait": 0.01,
+        "snapshot_load": 34.59,
+        "total": 39.34,
+        "write_state": 0.18
+      },
+      "run": {
+        "announce": 0.1,
+        "cgroup_rename": 0.06,
+        "claim_ip": 1.43,
+        "guest_net": 10.14,
+        "pager_start": 1.91,
+        "pool_take": 0.1,
+        "register": 0.0,
+        "route_wait": 0.0,
+        "snapshot_load": 35.71,
+        "total": 49.46
+      }
+    }
+  ],
+  "summary_ms": {
+    "migrate": {
+      "background_pull": {
+        "max": 106.67,
+        "p50": 92.59,
+        "p90": 105.1,
+        "p99": 106.67
+      },
+      "checkpoint": {
+        "max": 17.23,
+        "p50": 14.37,
+        "p90": 16.48,
+        "p99": 17.23
+      },
+      "downtime": {
+        "max": 79.88,
+        "p50": 52.83,
+        "p90": 58.71,
+        "p99": 79.88
+      },
+      "read_state": {
+        "max": 0.28,
+        "p50": 0.1,
+        "p90": 0.14,
+        "p99": 0.28
+      },
+      "reroute": {
+        "max": 0.64,
+        "p50": 0.13,
+        "p90": 0.49,
+        "p99": 0.64
+      },
+      "send_state": {
+        "max": 2.34,
+        "p50": 1.4,
+        "p90": 1.71,
+        "p99": 2.34
+      },
+      "target": {
+        "max": 67.46,
+        "p50": 36.61,
+        "p90": 43.06,
+        "p99": 67.46
+      },
+      "total": {
+        "max": 80.21,
+        "p50": 52.93,
+        "p90": 58.82,
+        "p99": 80.21
+      }
+    },
+    "migrate_target": {
+      "cgroup_rename": {
+        "max": 0.08,
+        "p50": 0.04,
+        "p90": 0.04,
+        "p99": 0.08
+      },
+      "claim_ip": {
+        "max": 0.01,
+        "p50": 0.01,
+        "p90": 0.01,
+        "p99": 0.01
+      },
+      "pager_start": {
+        "max": 3.08,
+        "p50": 1.9,
+        "p90": 2.31,
+        "p99": 3.08
+      },
+      "pool_take": {
+        "max": 0.16,
+        "p50": 0.09,
+        "p90": 0.13,
+        "p99": 0.16
+      },
+      "recv_state": {
+        "max": 2.24,
+        "p50": 1.31,
+        "p90": 1.63,
+        "p99": 2.24
+      },
+      "register": {
+        "max": 0.34,
+        "p50": 0.1,
+        "p90": 0.16,
+        "p99": 0.34
+      },
+      "route_wait": {
+        "max": 0.02,
+        "p50": 0.0,
+        "p90": 0.01,
+        "p99": 0.02
+      },
+      "snapshot_load": {
+        "max": 62.59,
+        "p50": 32.96,
+        "p90": 39.62,
+        "p99": 62.59
+      },
+      "total": {
+        "max": 66.93,
+        "p50": 36.74,
+        "p90": 43.07,
+        "p99": 66.93
+      },
+      "write_state": {
+        "max": 0.32,
+        "p50": 0.19,
+        "p90": 0.23,
+        "p99": 0.32
+      }
+    },
+    "run": {
+      "announce": {
+        "max": 0.15,
+        "p50": 0.1,
+        "p90": 0.12,
+        "p99": 0.15
+      },
+      "cgroup_rename": {
+        "max": 0.08,
+        "p50": 0.04,
+        "p90": 0.07,
+        "p99": 0.08
+      },
+      "claim_ip": {
+        "max": 1.49,
+        "p50": 1.13,
+        "p90": 1.32,
+        "p99": 1.49
+      },
+      "guest_net": {
+        "max": 14.74,
+        "p50": 9.74,
+        "p90": 10.89,
+        "p99": 14.74
+      },
+      "pager_start": {
+        "max": 2.26,
+        "p50": 1.96,
+        "p90": 2.19,
+        "p99": 2.26
+      },
+      "pool_take": {
+        "max": 0.13,
+        "p50": 0.08,
+        "p90": 0.11,
+        "p99": 0.13
+      },
+      "register": {
+        "max": 0.01,
+        "p50": 0.0,
+        "p90": 0.0,
+        "p99": 0.01
+      },
+      "route_wait": {
+        "max": 0.0,
+        "p50": 0.0,
+        "p90": 0.0,
+        "p99": 0.0
+      },
+      "snapshot_load": {
+        "max": 46.51,
+        "p50": 30.91,
+        "p90": 36.34,
+        "p99": 46.51
+      },
+      "total": {
+        "max": 60.22,
+        "p50": 44.13,
+        "p90": 51.95,
+        "p99": 60.22
+      }
+    }
+  }
+}
