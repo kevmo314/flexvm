@@ -363,9 +363,68 @@ def target_restart():
     cleanup(n)
 
 
+def shared_run_dir():
+    """A second daemon on A's run directory, or one inside it, must refuse to
+    start (before binding or killing anything); A's VM keeps running."""
+    n = "ft-shared-run"
+    m = setup(n)
+    argv = [a.decode() for a in proc(daemon_pid(A), "cmdline").split(b"\0") if a]
+    rdir = argv[argv.index("--run") + 1]
+    for label, other in (("same", rdir), ("nested", os.path.join(rdir, "nested"))):
+        bad = argv[:]
+        bad[bad.index("--run") + 1] = other
+        r = subprocess.run(["sudo", *bad], capture_output=True, text=True, timeout=30)
+        check(f"shared run dir ({label}): second daemon refuses", r.returncode != 0 and "overlaps" in r.stderr, r.stderr.strip())
+    subprocess.run(["sudo", "rmdir", os.path.join(rdir, "nested")])
+    check("shared run dir: VM untouched", where(n) == {A: "running"} and md5(A, n) == m, where(n))
+    cleanup(n)
+
+
+def exec_race():
+    """Execs keep starting while the VM migrates there and back: every exec
+    finishes or is refused (none hangs), and the VM ends on one host intact."""
+    n = "ft-exec-race"
+    m = setup(n)
+    stop, results = threading.Event(), {"ok": 0, "refused": 0, "cut": 0, "hung": 0}
+
+    def worker():
+        while not stop.is_set():
+            for h in (A, B):
+                try:
+                    r = subprocess.run([BIN, "--host", h, "exec", n, "echo hi"], capture_output=True, text=True, timeout=30)
+                except subprocess.TimeoutExpired:
+                    results["hung"] += 1
+                    continue
+                if r.returncode == 0 and r.stdout.strip() == "hi":
+                    results["ok"] += 1
+                elif "not running" in r.stderr or "no vm named" in r.stderr:
+                    results["refused"] += 1
+                else:
+                    results["cut"] += 1
+
+    workers = [threading.Thread(target=worker) for _ in range(6)]
+    for w in workers:
+        w.start()
+    time.sleep(0.5)
+    ok(A, {"op": "migrate", "name": n, "to": B})
+    wait_released(B, n)
+    time.sleep(0.3)
+    ok(B, {"op": "migrate", "name": n, "to": A})
+    wait_released(A, n)
+    time.sleep(0.3)
+    stop.set()
+    for w in workers:
+        w.join()
+    check("exec race: no exec hung", results["hung"] == 0, results)
+    check("exec race: back on A only", where(n) == {A: "running"}, where(n))
+    check("exec race: md5 intact", md5(A, n) == m)
+    cleanup(n)
+
+
 SCENARIOS = dict(basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, refused=refused, pages_blip=pages_blip,
                  pages_dead_restore=pages_dead_restore, pages_dead=pages_dead, quiet_source=quiet_source,
-                 source_killed=source_killed, target_restart=target_restart)
+                 shared_run_dir=shared_run_dir, exec_race=exec_race, source_killed=source_killed,
+                 target_restart=target_restart)
 safe = [s for s in SCENARIOS if s not in ("source_killed", "target_restart")]
 names = [n for s in args.scenarios for n in (safe if s == "all" else [s])]
 for s in names:
