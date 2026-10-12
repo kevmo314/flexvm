@@ -475,11 +475,14 @@ fn build(paths: &Paths, staging: &str, name: &str, vcpus: u32, mem_mib: u64, max
     let vsock = run.join("v.sock");
     let _ = std::fs::remove_file(&vsock);
 
+    // Pin the exact image file: artifacts/rootfs.ext4 is a symlink a rebuild
+    // repoints, and this snapshot's page cache is only valid for these bytes.
+    let rootfs = std::fs::canonicalize(&paths.rootfs)?;
     let start = Instant::now();
     let fc = Firecracker::spawn(&paths.firecracker, &run)?;
     fc.put("/boot-source", json!({"kernel_image_path": paths.kernel, "boot_args": BOOT_ARGS}))?;
     fc.put("/machine-config", json!({"vcpu_count": vcpus, "mem_size_mib": mem_mib}))?;
-    fc.put("/pmem/root", json!({"id": "root", "path_on_host": paths.rootfs, "root_device": true, "read_only": true}))?;
+    fc.put("/pmem/root", json!({"id": "root", "path_on_host": rootfs, "root_device": true, "read_only": true}))?;
     fc.put(
         "/balloon",
         json!({"amount_mib": 0, "deflate_on_oom": false, "stats_polling_interval_s": BALLOON_STATS_S, "free_page_reporting": true}),
@@ -514,7 +517,7 @@ fn build(paths: &Paths, staging: &str, name: &str, vcpus: u32, mem_mib: u64, max
         mem_mib,
         max_mib: mem_mib + hotplug,
         kernel: paths.kernel.clone(),
-        rootfs: paths.rootfs.clone(),
+        rootfs,
         id: String::new(),
         components: BTreeMap::new(),
     };
