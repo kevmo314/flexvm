@@ -20,7 +20,9 @@ pub fn request(uds: &Path, line: &str) -> Result<BufReader<UnixStream>> {
     s.set_read_timeout(Some(Duration::from_secs(2)))?;
     // One write: Firecracker reads the CONNECT line without blocking as soon as
     // any of it arrives, and drops the connection if the line is incomplete.
-    s.write_all(format!("CONNECT {PORT}\n").as_bytes())?;
+    // It reads only up to the newline, so the request rides along and is
+    // forwarded once the guest accepts, saving a round trip.
+    s.write_all(format!("CONNECT {PORT}\n{line}\n").as_bytes())?;
     let mut r = BufReader::new(s);
     let mut ok = String::new();
     r.read_line(&mut ok)?;
@@ -28,7 +30,6 @@ pub fn request(uds: &Path, line: &str) -> Result<BufReader<UnixStream>> {
         bail!("vsock connect refused: {ok:?}");
     }
     r.get_ref().set_read_timeout(None)?;
-    r.get_mut().write_all(format!("{line}\n").as_bytes())?;
     Ok(r)
 }
 
