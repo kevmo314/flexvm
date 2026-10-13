@@ -10,7 +10,7 @@ usage: scripts/faults.py [--a ADDR] [--b ADDR] [--a-dir DIR] [--b-dir DIR]
 The script starts both listeners (FLEXVM_FAULTS=1, VMs log to DIR/run/vms)
 and stops them at the end. Checkpoint scenarios write to --ckpt-dir.
 """
-import argparse, base64, json, os, signal, socket, subprocess, sys, tempfile, threading, time
+import argparse, base64, json, os, signal, socket, subprocess, sys, tempfile, threading, time, traceback
 
 p = argparse.ArgumentParser(usage=__doc__)
 p.add_argument("--a", default="127.0.0.1:7130")
@@ -29,6 +29,8 @@ p.add_argument("scenarios", nargs="+")
 args = p.parse_args()
 BIN = os.path.abspath(args.bin)
 failures = 0
+# What each scenario made, removed after it whatever happened.
+scenario_vms, scenario_checkpoints = set(), set()
 
 
 class Host:
@@ -98,6 +100,7 @@ def control(host, name, req, timeout=60):
 
 
 def run(host, name, ip=None, template=None):
+    scenario_vms.add(name)
     a = ["run", name, "--template", template or args.template, "-d"] + (["--ip", ip] if ip else [])
     return cli_json(host, *a)
 
@@ -115,6 +118,7 @@ def checkpoint(host, name, path, stop=False, incremental=False, timeout=300):
 
 
 def restore(host, path, name=None, ip=None, paused=False):
+    scenario_vms.add(name or os.path.basename(path))
     a = ["restore", path, "-d"] + (["--name", name] if name else []) + (["--ip", ip] if ip else []) + (["--paused"] if paused else [])
     return cli_json(host, *a)
 
@@ -984,6 +988,7 @@ def slow_preload():
 def ckpt_path(label):
     os.makedirs(args.ckpt_dir, exist_ok=True)
     path = os.path.join(args.ckpt_dir, label)
+    scenario_checkpoints.add(path)
     subprocess.run(["rm", "-rf", path])
     return path
 
@@ -2194,12 +2199,20 @@ for h in (A, B):
             kill(h, n)
 try:
     for s in names:
+        scenario_vms.clear()
+        scenario_checkpoints.clear()
         try:
             SCENARIOS[s]()
         except Exception as e:
+            traceback.print_exc()
             check(f"{s}: raised {type(e).__name__}", False, e)
         finally:
             disarm()
+            for n in scenario_vms:
+                for h in (A, B):
+                    kill(h, n)
+            for path in scenario_checkpoints:
+                rm_ckpt(path)
 finally:
     stop_listeners()
 print("failures:", failures)
