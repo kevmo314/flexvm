@@ -262,6 +262,12 @@ impl Staging {
         &self.dest
     }
 
+    /// A path to the destination's directory as pinned (it is published
+    /// into), whatever happens to its name meanwhile; valid while this lives.
+    pub fn pinned_dir(&self) -> PathBuf {
+        PathBuf::from(format!("/proc/self/fd/{}", self.parent.as_raw_fd()))
+    }
+
     /// Where Firecracker is to write the VM's state.
     pub fn vmstate(&self) -> PathBuf {
         self.vmstate.clone()
@@ -350,6 +356,15 @@ impl Staging {
         fsync_fd(self.ck.as_raw_fd())?;
         // Last check before it becomes visible.
         still_valid()?;
+        // The rename goes through the pinned directory: it must still be the
+        // one the destination path names, or the checkpoint would appear
+        // somewhere else.
+        let named = std::fs::metadata(self.dest.parent().unwrap_or(Path::new("/")))
+            .map_err(|e| format!("the directory of {} was moved or replaced during the checkpoint: {e}", self.dest.display()))?;
+        let pinned = fstat(self.parent.as_raw_fd())?;
+        if std::os::unix::fs::MetadataExt::dev(&named) != pinned.st_dev as u64 || std::os::unix::fs::MetadataExt::ino(&named) != pinned.st_ino as u64 {
+            return Err(CommitError::Failed(format!("the directory of {} was moved or replaced during the checkpoint", self.dest.display()).into()));
+        }
         t.mark("fsync");
         let (outer, parent) = (self.outer.as_raw_fd(), self.parent.as_raw_fd());
         let rc = unsafe { libc::renameat2(outer, c"ck".as_ptr(), parent, self.base.as_ptr(), libc::RENAME_NOREPLACE) };
@@ -827,6 +842,8 @@ pub fn chain_ids(dir: &Path) -> Result<Vec<String>> {
         if ids.len() >= MAX_CHAIN {
             bail!("more than {MAX_CHAIN} checkpoints deep");
         }
+        // Resolved as a restore resolves it (`Link::open`).
+        dir = dir.canonicalize().map_err(|e| format!("{}: {e}", dir.display()))?;
         let dfd = open_dir_at(libc::AT_FDCWD, &CString::new(dir.as_os_str().as_bytes())?).map_err(|e| format!("{}: {e}", dir.display()))?;
         let (_, text) = read_at(dfd.as_raw_fd(), "manifest.json", 1 << 20).map_err(|e| format!("{}: {e}", dir.display()))?;
         let split = text.iter().position(|&b| b == b'\n').ok_or("manifest has no checksum")?;

@@ -565,6 +565,7 @@ impl Daemon {
         let snapshot_discards = vm.snapshot_discards.load(Ordering::SeqCst);
         let dest = staging.dest().to_path_buf();
         let (parent, links) = parent.unzip();
+        let pinned = staging.pinned_dir();
         let parent_ref = parent.clone();
         let committed = staging.commit(vm, src, &frozen.runs, parent, plugged.unwrap_or(0), t, || {
             cancelled()?;
@@ -576,10 +577,11 @@ impl Daemon {
             // to its parent, through each manifest's.
             if let (Some(p), Some(ids)) = (&parent_ref, &links) {
                 // (This checkpoint's directory exists only once published,
-                // as a plain directory, so `../NAME` is NAME beside it.)
-                let first = match (p.path.strip_prefix("../"), dest.parent()) {
-                    (Some(name), Some(dir)) => dir.join(name),
-                    _ => PathBuf::from(&p.path),
+                // as a plain directory in the pinned one, so `../NAME` is
+                // NAME in that.)
+                let first = match p.path.strip_prefix("../") {
+                    Some(name) => pinned.join(name),
+                    None => PathBuf::from(&p.path),
                 };
                 let now = crate::checkpoint::chain_ids(&first);
                 if now.as_ref().ok() != Some(ids) {

@@ -1150,9 +1150,16 @@ impl Pager {
             self.registered_wp.store(true, Ordering::SeqCst);
         }
         // Dirty from here on; then protect. A page written before its turn
-        // to be protected is protected afterwards all the same.
-        self.pages().take_dirty();
-        self.tracking.store(true, Ordering::SeqCst);
+        // to be protected is protected afterwards all the same. Under the
+        // fault lock: a fault already marking and unprotecting a block
+        // finishes both first, so it never unprotects one whose mark this
+        // reset cleared. (Not held while protecting: the serve thread must
+        // be free to read events, or a queued REMOVE would fail the calls.)
+        {
+            let _wp = self.wp.lock().unwrap();
+            self.pages().take_dirty();
+            self.tracking.store(true, Ordering::SeqCst);
+        }
         // In chunks: while the kernel changes a range, KVM retries guest
         // faults anywhere in it, so one call over a whole region would stall
         // the vCPUs for as long as it takes.
