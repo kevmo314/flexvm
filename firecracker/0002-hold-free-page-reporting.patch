@@ -1,0 +1,115 @@
+diff --git a/src/firecracker/src/api_server/request/balloon.rs b/src/firecracker/src/api_server/request/balloon.rs
+index 4093a0e..e85504a 100644
+--- a/src/firecracker/src/api_server/request/balloon.rs
++++ b/src/firecracker/src/api_server/request/balloon.rs
+@@ -94,6 +94,12 @@ where
+             )))
+         }
+         (Some("hinting"), body) => parse_patch_hinting(body, path_tokens),
++        // flexvm: PATCH /balloon/reporting/hold and /balloon/reporting/release
++        (Some("reporting"), _) => match path_tokens.next() {
++            Some("hold") => Ok(ParsedRequest::new_sync(VmmAction::HoldFreePageReporting(true))),
++            Some("release") => Ok(ParsedRequest::new_sync(VmmAction::HoldFreePageReporting(false))),
++            _ => method_to_error(Method::Patch),
++        },
+         (_, Some(body)) => Ok(ParsedRequest::new_sync(VmmAction::UpdateBalloon(
+             serde_json::from_slice::<BalloonUpdateConfig>(body.raw())?,
+         ))),
+diff --git a/src/vmm/src/devices/virtio/balloon/device.rs b/src/vmm/src/devices/virtio/balloon/device.rs
+index 4008b15..c475bf7 100644
+--- a/src/vmm/src/devices/virtio/balloon/device.rs
++++ b/src/vmm/src/devices/virtio/balloon/device.rs
+@@ -267,6 +267,8 @@ pub struct Balloon {
+ 
+     // Holds state for free page hinting
+     pub(crate) hinting_state: HintingState,
++    // flexvm: while set, free page reports stay queued (not discarded or acked).
++    pub(crate) hold_reporting: bool,
+ }
+ 
+ impl Balloon {
+@@ -330,6 +332,7 @@ impl Balloon {
+             latest_stats: BalloonStats::default(),
+             pfn_buffer: [0u32; MAX_PAGE_COMPACT_BUFFER],
+             hinting_state: Default::default(),
++            hold_reporting: false,
+         })
+     }
+ 
+@@ -370,9 +373,21 @@ impl Balloon {
+         self.queue_evts[self.free_page_reporting_idx()]
+             .read()
+             .map_err(BalloonError::EventFd)?;
++        if self.hold_reporting {
++            return Ok(());
++        }
+         self.process_free_page_reporting_queue()
+     }
+ 
++    /// flexvm: holds free page reports in their queue, or releases and processes them.
++    pub fn hold_free_page_reporting(&mut self, hold: bool) -> Result<(), BalloonError> {
++        self.hold_reporting = hold;
++        if !hold && self.free_page_reporting() && self.is_activated() {
++            self.process_free_page_reporting_queue()?;
++        }
++        Ok(())
++    }
++
+     pub(crate) fn process_inflate(&mut self) -> Result<(), BalloonError> {
+         // This is safe since we checked in the event handler that the device is activated.
+         let mem = &self
+diff --git a/src/vmm/src/lib.rs b/src/vmm/src/lib.rs
+index 41b7b8d..179f6bb 100644
+--- a/src/vmm/src/lib.rs
++++ b/src/vmm/src/lib.rs
+@@ -649,6 +649,15 @@ impl Vmm {
+         Ok(())
+     }
+ 
++    /// flexvm: holds or releases the balloon's free page reports.
++    pub fn hold_balloon_reporting(&mut self, hold: bool) -> Result<(), VmmError> {
++        self.device_manager
++            .with_virtio_device(BALLOON_DEV_ID, |dev: &mut Balloon| {
++                dev.hold_free_page_reporting(hold)
++            })??;
++        Ok(())
++    }
++
+     /// Returns the current state of the memory hotplug device.
+     pub fn memory_hotplug_status(&self) -> Result<VirtioMemStatus, VmmError> {
+         self.device_manager
+diff --git a/src/vmm/src/rpc_interface.rs b/src/vmm/src/rpc_interface.rs
+index ca743fa..eeec22f 100644
+--- a/src/vmm/src/rpc_interface.rs
++++ b/src/vmm/src/rpc_interface.rs
+@@ -143,6 +143,8 @@ pub enum VmmAction {
+     GetFreePageHintingStatus,
+     /// Stops a free page hinting run
+     StopFreePageHinting,
++    /// flexvm: holds (true) or releases (false) free page reports
++    HoldFreePageReporting(bool),
+     /// Update existing block device properties such as `path_on_host` or `rate_limiter`.
+     UpdateBlockDevice(BlockDeviceUpdateConfig),
+     /// Update a network interface, after microVM start. Currently, the only updatable properties
+@@ -515,6 +517,7 @@ impl<'a> PrebootApiController<'a> {
+             | StartFreePageHinting(_)
+             | GetFreePageHintingStatus
+             | StopFreePageHinting
++            | HoldFreePageReporting(_)
+             | HotUnplugDevice(_) => Err(VmmActionError::OperationNotSupportedPreBoot),
+             #[cfg(target_arch = "x86_64")]
+             SendCtrlAltDel => Err(VmmActionError::OperationNotSupportedPreBoot),
+@@ -834,6 +837,13 @@ impl RuntimeApiController {
+                 .stop_balloon_hinting()
+                 .map(|_| VmmData::Empty)
+                 .map_err(VmmActionError::BalloonUpdate),
++            HoldFreePageReporting(hold) => self
++                .vmm
++                .lock()
++                .expect("Poisoned lock")
++                .hold_balloon_reporting(hold)
++                .map(|_| VmmData::Empty)
++                .map_err(VmmActionError::BalloonUpdate),
+             UpdateBlockDevice(new_cfg) => self.update_block_device(new_cfg),
+             UpdateNetworkInterface(netif_update) => self.update_net_rate_limiters(netif_update),
+             UpdatePmemDevice(new_cfg) => self.update_pmem_device(new_cfg),

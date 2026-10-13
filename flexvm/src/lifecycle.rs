@@ -538,6 +538,22 @@ impl Daemon {
             }
         };
         let mut pause = None;
+        // Free page reports wait in the balloon's queue until the copy is
+        // over (released when this goes out of scope, after `end_copy` or
+        // `unfreeze`): a discard of an unsaved page would make the pager
+        // save everything left first, stalling the guest. Without the
+        // Firecracker patch the copy still saves first, only slower (test
+        // fault `ckpt_no_hold` skips the hold, to compare).
+        let _held = match cow && !self.fault("ckpt_no_hold") {
+            true => match vm.hold_reports(true) {
+                Ok(()) => Some(HeldReports(vm)),
+                Err(e) => {
+                    eprintln!("vm {}: free page reports not held during the copy: {e}", vm.name);
+                    None
+                }
+            },
+            false => None,
+        };
         if cow {
             if let Err(e) = vm.end_checkpoint() {
                 vm.pager.unfreeze(&frozen);
@@ -732,6 +748,17 @@ const STARTED: &str = "STARTED";
 const DISCARDED: &str = "DISCARDED";
 
 /// Creates marker file `name` in `dir` and makes it durable.
+/// Releases the free page reports a copy-on-write checkpoint held.
+struct HeldReports<'a>(&'a Vm);
+
+impl Drop for HeldReports<'_> {
+    fn drop(&mut self) {
+        if let Err(e) = self.0.hold_reports(false) {
+            eprintln!("vm {}: releasing free page reports failed: {e}", self.0.name);
+        }
+    }
+}
+
 fn mark_durably(dir: &Path, name: &str) -> std::io::Result<()> {
     std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(dir.join(name))?.sync_all()?;
     std::fs::File::open(dir)?.sync_all()

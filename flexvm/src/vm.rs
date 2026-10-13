@@ -594,6 +594,28 @@ impl Vm {
         Ok(first.unwrap_or(0.0))
     }
 
+    /// Holds the guest's free page reports in the balloon's queue (`hold`),
+    /// or processes and acknowledges them again. Held, Firecracker does not
+    /// discard reported pages, so no REMOVE reaches the pager while a
+    /// copy-on-write checkpoint still has pages to save. Needs
+    /// `firecracker/0002-hold-free-page-reporting.patch`. A release is
+    /// retried for a few seconds: until it lands, the guest's reported pages
+    /// stay off its free lists.
+    pub fn hold_reports(&self, hold: bool) -> Result<()> {
+        let path = if hold { "/balloon/reporting/hold" } else { "/balloon/reporting/release" };
+        let deadline = Instant::now() + Duration::from_secs(if hold { 1 } else { 5 });
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.fc(|fc| fc.request_within("PATCH", path, None, left)) {
+                Err(e) if !hold && Instant::now() < deadline && self.pid().is_some() => {
+                    eprintln!("vm {}: releasing free page reports: {e}; retrying", self.name);
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                r => return r.map(|_| ()),
+            }
+        }
+    }
+
     /// Retries a few times; the VM keeps running regardless, only its
     /// statistics go stale.
     fn unpark_balloon(&self) {

@@ -212,7 +212,7 @@ pages are written while it runs. A guest write to a page not saved yet
 faults, the pager saves that page first and only then lets the write
 through, so the checkpoint is exactly the memory at the pause.
 
-- **No Firecracker change.** The pager registers write-protect mode
+- **No Firecracker change for write tracking.** The pager registers write-protect mode
   (`UFFDIO_REGISTER` with `MODE_MISSING|MODE_WP`) on Firecracker's existing
   userfaultfd and its ranges. Nothing has to be requested at `UFFDIO_API`
   time: write-protect faults are reported with `UFFD_PAGEFAULT_FLAG_WP`
@@ -251,16 +251,41 @@ through, so the checkpoint is exactly the memory at the pause.
   which never waits for Firecracker.
 - **Discards.** The kernel zaps a page right after the pager reads the
   REMOVE event for it, so a balloon or virtio-mem discard must not be read
-  while pages are unsaved. Before each read the pager probes for a queued
-  REMOVE (re-protecting an unsaved page fails with EAGAIN while one is
-  queued) and first saves everything left: in memory with 8 threads if it
-  fits in a quarter of available memory, else by waiting for the writers.
-  The guest's faults wait meanwhile (the kernel refuses every ioctl until
-  the event is read): free page reporting during the copy cost 0.35 s
-  (1 GiB) to 1.5 s (4 GiB) stalls here. A REMOVE that slips in between the
-  probe and the read, or writers that stall, invalidate the checkpoint
-  instead of saving wrong contents. virtio-mem only discards or plugs on
-  the host's request, which waits for the checkpoint.
+  while pages are unsaved. So none is made during the copy:
+  - **Free page reports are held.** Before the resume the daemon sends
+    `PATCH /balloon/reporting/hold` (`firecracker/0002`): Firecracker leaves
+    the guest's reports in the queue, neither discarding nor acknowledging
+    them, until `.../release` after the copy (also on failure) processes
+    them. The guest's reporting worker just waits for the acknowledgement
+    (it reports asynchronously; nothing else in the guest waits on it).
+    The one batch in flight, 32 blocks of 2 or 4 MiB, stays off the
+    guest's free lists meanwhile: 90 MiB measured, and allocating all of
+    MemAvailable during a held copy works, without OOM or hung tasks.
+  - **Measured** (guest rewriting 1 GiB, two threads allocating, touching
+    and freeing 512 MiB every 1.6 s; disk throttled to 300 MB/s so the copy
+    takes 6 s at 1.7 GiB and 13–15 s at 4 GiB, long enough for reports;
+    3 runs each): without the hold every run with a report during the copy
+    stalled all faulting vCPUs once for 1.2–1.3 s (1.7 GiB) or 2.9–3.6 s
+    (4 GiB); with it no discard reaches the pager, the worst page write is
+    65–96 ms (faults waiting for the slowed writers past the rescue budget,
+    as before) and nothing reaches 134 ms; p99.99 is unchanged (0.1–0.5 ms for
+    the rewriter, 1–4 ms for the allocating threads, including the
+    guest's own page faults). `scripts/faults.py cow_reports_held` checks
+    that reports are held during a copy and carried out after it.
+  - **Balloon inflate and virtio-mem** happen only on the host's request:
+    flexvm's balloon target stays 0 (the guest never inflates on its own,
+    and `deflate_on_oom` is off), and virtio-mem resizes need the VM's
+    reservation, which the checkpoint holds.
+  - **Fallback.** A REMOVE that comes anyway (a Firecracker without the
+    patch, where the hold request fails and is logged) is still safe:
+    before each read the pager probes for a queued REMOVE (re-protecting an
+    unsaved page fails with EAGAIN while one is queued) and first saves
+    everything left, in memory with 8 threads if it fits in a quarter of
+    available memory, else by waiting for the writers. The guest's faults
+    wait meanwhile (the kernel refuses every ioctl until the event is
+    read): 1.2–3.6 s stalls here (see below). A REMOVE that slips in between the probe and the
+    read, or writers that stall, invalidate the checkpoint instead of
+    saving wrong contents.
 - **Other operations** wait for the copy: migration, pause, suspend and
   resizes need the VM's reservation, which the checkpoint holds. A kill
   stops the copy (the checkpoint fails). Exec works (the VM is `running`;
@@ -458,12 +483,20 @@ back to loading the snapshot then and there.
   `rp_filter=0` would not help where `all` is 2, as distributions set it), and
   queue up to 4096 frames, so an injected burst fits while the guest catches up.
 
-### Firecracker patch
+### Firecracker patches
 
 `firecracker/0001-snapshot-state-only.patch`: an empty `mem_file_path` in
 `PUT /snapshot/create` saves only the microVM state. Stock Firecracker always
 writes all guest memory, which would make migration downtime proportional to
 RAM and double memory use on a host that is already short.
+
+`firecracker/0002-hold-free-page-reporting.patch`: `PATCH
+/balloon/reporting/hold` and `PATCH /balloon/reporting/release`. While held,
+the balloon leaves free page reports in their virtqueue (it consumes the
+queue notification but pops nothing); a release processes whatever is
+queued. Not saved in snapshots: a restored balloon is not held, and reports
+queued at the snapshot are processed at its first resume, which kicks
+every queue.
 
 ## Measured (WSL2, Ryzen 9 3900X, nested KVM)
 
@@ -481,7 +514,7 @@ RAM and double memory use on a host that is already short.
 | Idle VM host RSS | 13–35 MiB |
 | pause / resume (daemon side; RPC round trip ~2.3 ms) | **0.6 / 0.7 ms** (2 vCPU), 1.5 ms resume (24 vCPU) |
 | checkpoint `--keep-running`, 256 / 1024 / 4096 MiB written in the guest: VM paused | **20 / 18 / 24–31 ms** (was 125 / 406–428 / 1456–1923 ms); write protection armed beforehand while it runs (first checkpoint only): 20 / 95–125 / 270–380 ms; whole checkpoint 220–250 / 450–620 / 1900–2200 ms |
-| ... with a guest rewriting 2 × 256 MiB during the copy | pause 17–56 ms; 650–2700 write faults, 340–1970 of them saving 20–120 MiB first (120–250 µs each); writer iterations > 100 µs: 4–9k (idle 0.1–1k), worst single stall 35–50 ms at 1 GiB (one 100–150 ms stall before 2 MiB protect chunks), but 0.35–1.5 s when free page reporting discards during the copy |
+| ... with a guest rewriting 2 × 256 MiB during the copy | pause 17–56 ms; 650–2700 write faults, 340–1970 of them saving 20–120 MiB first (120–250 µs each); writer iterations > 100 µs: 4–9k (idle 0.1–1k), worst single stall 35–50 ms at 1 GiB (one 100–150 ms stall before 2 MiB protect chunks); free page reports are held during the copy (they cost 0.35–3.6 s stalls before) |
 | incremental checkpoint of a 4 GiB VM (small writer running) | **paused 29–50 ms, 92–112 ms in all, 35 MiB written** (full: 4238 MiB, 1.5–1.9 s) |
 | checkpoint `--stop`, by memory touched: 256 / 1024 MiB written in the guest | write_pages 113–249 / 483–521 ms (was 435–480 / 2019–2892 ms); paused 286–430 / 760–816 ms (was 653–703 / 2335–3255), including Firecracker's exit; disk: 4–5 GB/s O_DIRECT, 1 GB/s buffered |
 | restore → guest agent answering | **33 / 27 / 67 ms** (snapshot load 28 / 24 / 63 ms); whole checkpoint paged in after 39 / 153 / 509 ms |
@@ -722,13 +755,13 @@ firecracker/        patches on top of Firecracker v1.17.0
 - The controller samples guest memory once a second (balloon stats). A very
   fast allocation burst can still hit the in-guest OOM killer; guest PSI
   triggers over vsock would react faster.
-- **A discard during a copy-on-write checkpoint stalls the guest** until the
-  unsaved pages are saved (0.35–1.5 s measured, mostly free page reporting
-  after the guest grew), because the kernel zaps a page as soon as the
-  REMOVE is read and refuses other uffd operations until then. Holding free
-  page reports back in Firecracker's balloon during the copy would avoid
-  it; that needs a Firecracker change. `--stop` checkpoints and suspends
-  still pause for the whole write. Write tracking stays on once a VM has
+- **A copy-on-write checkpoint's copy holds back the VM's memory changes:**
+  free page reports wait until it is done (memory the guest frees then
+  goes back to the host only afterwards), and the guest cannot grow by
+  hotplug meanwhile, so a guest still growing fast can hit its OOM killer
+  during a long copy. A discard that reaches the pager anyway (Firecracker
+  without `0002`) still stalls the guest until the unsaved pages are saved.
+  `--stop` checkpoints and suspends still pause for the whole write. Write tracking stays on once a VM has
   had a keep-running checkpoint (one fault per 64 KiB block written between
   checkpoints); a restored VM starts without it, so its first checkpoint is
   full (installing its pages write-protected would allow a delta against
