@@ -774,6 +774,7 @@ def held_restore_frozen():
     m = setup(n)
     busy_guest(A, n)
     time.sleep(0.5)
+    old_ip = vms(A)[n]["ip"]
     ok(A, {"op": "checkpoint", "name": n, "dir": path, "stop": True})
 
     def held(no_hold):
@@ -809,6 +810,14 @@ def held_restore_frozen():
     check("held: pending frames delivered after resume", tap_frames(B, n)[1] > f1[1], (f1, tap_frames(B, n)))
     guest_healthy(B, n, "held after resume", m)
     print(f"held: resumed and answered within {time.time() - t:.2f} s")
+    rpc(B, {"op": "kill", "name": n})
+    # Held at a new address: the guest takes it on resume (and only then).
+    r = ok(B, {"op": "restore", "dir": path, "paused": True, "ip": "auto"})
+    refused = rpc(B, {"op": "checkpoint", "name": n, "dir": path + "-x"})
+    check("held at a new address: no checkpoint before it takes the address", not refused["ok"], refused)
+    ok(B, {"op": "resume", "name": n})
+    code, out = sh(B, n, "ip -4 -o addr show eth0")
+    check("held at a new address: guest has it, and only it, after resume", r["ip"] in out and old_ip not in out, (r["ip"], old_ip, out))
     rpc(B, {"op": "kill", "name": n})
 
     h0, h1, f0, f1, conn = held(True)
