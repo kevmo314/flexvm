@@ -245,22 +245,24 @@ impl Pages {
         let states = unsafe { std::mem::transmute::<Vec<u8>, Vec<AtomicU8>>(vec![0u8; n]) };
         let dirty = unsafe { std::mem::transmute::<Vec<u64>, Vec<AtomicU64>>(vec![0u64; n.div_ceil(64)]) };
         let touched = (0..n.div_ceil(CHUNK * 64)).map(|_| AtomicU64::new(0)).collect();
-        Pages { states, touched, events: RwLock::new(()), dirty, ..Pages::EMPTY }
+        Pages { states, touched, events: RwLock::new(()), dirty, ..Pages::empty() }
     }
 
-    const EMPTY: Pages = Pages {
-        states: Vec::new(),
-        touched: Vec::new(),
-        events: RwLock::new(()),
-        dirty: Vec::new(),
-        waiting: AtomicBool::new(false),
-        wake: OnceLock::new(),
-        read_gen: AtomicU64::new(0),
-        read_lock: Mutex::new(()),
-        read_cv: Condvar::new(),
-        install_eagain: AtomicU64::new(0),
-        parked: Mutex::new(Vec::new()),
-    };
+    const fn empty() -> Pages {
+        Pages {
+            states: Vec::new(),
+            touched: Vec::new(),
+            events: RwLock::new(()),
+            dirty: Vec::new(),
+            waiting: AtomicBool::new(false),
+            wake: OnceLock::new(),
+            read_gen: AtomicU64::new(0),
+            read_lock: Mutex::new(()),
+            read_cv: Condvar::new(),
+            install_eagain: AtomicU64::new(0),
+            parked: Mutex::new(Vec::new()),
+        }
+    }
 
     /// A fault read at `read` waits for `page` to be installed.
     fn park(&self, page: usize, read: Instant) {
@@ -546,7 +548,7 @@ impl Pages {
         first: usize,
         n: usize,
         buf: &mut [u8],
-        fetch: &mut dyn FnMut(u64, &mut [u8], &AtomicBool, &mut dyn FnMut(&[u8])) -> io::Result<()>,
+        fetch: &mut FetchAny<'_>,
         stop: &AtomicBool,
         retry: &mut dyn FnMut(&io::Error) -> bool,
         mut populate: impl FnMut(usize, usize, &[u8]) -> io::Result<usize>,
@@ -788,7 +790,7 @@ pub struct Pager {
     pub fault_stats: FaultStats,
     /// Runs of REMOTE pages faults claimed, `(first, count)`, for the
     /// fetchers (`fetch_faults`).
-    demand: (Mutex<VecDeque<(usize, usize, Instant)>>, Condvar),
+    demand: (Mutex<VecDeque<Job>>, Condvar),
 }
 
 /// What `Pager::freeze` captured for a checkpoint.
@@ -1314,7 +1316,7 @@ impl Pager {
     }
 
     fn pages(&self) -> &Pages {
-        static EMPTY: Pages = Pages::EMPTY;
+        static EMPTY: Pages = Pages::empty();
         self.pages.get().unwrap_or(&EMPTY)
     }
 
@@ -2555,6 +2557,10 @@ pub fn remote_among(runs: &Runs, wanted: impl IntoIterator<Item = u64>) -> Vec<u
 /// reporting what has arrived as it does (see `PageClient::fetch`; a file
 /// read reports nothing).
 type Fetch = dyn FnMut(u64, &mut [u8], &AtomicBool, &mut dyn FnMut(&[u8])) -> io::Result<()> + Send;
+/// `Fetch`, borrowed and not necessarily `Send`.
+type FetchAny<'a> = dyn FnMut(u64, &mut [u8], &AtomicBool, &mut dyn FnMut(&[u8])) -> io::Result<()> + 'a;
+/// A run of REMOTE pages a fault claimed, `(first, count)`, and when it was queued.
+type Job = (usize, usize, Instant);
 
 /// A background pull could not install pages because their range is no
 /// longer mapped in Firecracker at all (UFFDIO_COPY and UFFDIO_ZEROPAGE fail
