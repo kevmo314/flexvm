@@ -941,10 +941,14 @@ impl Daemon {
             return self.claim_new(ip);
         };
         // Recorded, durably, before the VM is taken in: a newer VM with the
-        // address (an operator unlent it and it was given out again) is not
-        // taken over here.
-        if gen != LEGACY_GEN && !self.record_gen(ip, gen, false)? {
-            bail!("{ip} has a newer generation than this vm's ({gen}): it was given out again");
+        // address (an operator unlent it and it was given out again), or a
+        // withdrawal of this one, is not taken over here. Every arrival has a
+        // generation (0 is none).
+        if gen == LEGACY_GEN {
+            bail!("{ip}: the arriving vm has no address generation");
+        }
+        if !self.record_gen(ip, gen, false)? {
+            bail!("{ip}'s generation {gen} was withdrawn or a newer one given out: the vm is not taken in");
         }
         let mut a = self.addrs.lock().unwrap();
         if a.used.contains_key(&ip) {
@@ -1239,6 +1243,12 @@ impl Daemon {
                 eprintln!("vm {name}: {e}");
             }
         }
+        self.withdraw_from_peers(ip, gen);
+        Ok(json!({"name": name}))
+    }
+
+    /// Tells the peers, in the background, that generation `gen` of `ip` is gone.
+    fn withdraw_from_peers(&self, ip: Ipv4Addr, gen: Option<u64>) {
         let req = json!({"op": "route", "ip": ip.to_string(), "gen": gen});
         let peers = self.cfg.peers.clone();
         thread::spawn(move || {
@@ -1246,7 +1256,6 @@ impl Daemon {
                 let _ = peer_call(peer, req.clone());
             }
         });
-        Ok(json!({"name": name}))
     }
 
     /// The target of migration `mig` is done with our paused copy of `name`;
@@ -1658,6 +1667,33 @@ impl Daemon {
         // Both put the address's route back on the tap.
         let lock = self.addr_lock(vm.ip);
         let route = lock.lock().unwrap();
+        // Not if its address's generation was withdrawn or a newer one given
+        // out meanwhile (say an operator unlent it and the home host handed it
+        // to a new VM): that VM owns the address and its route. This copy
+        // never runs again; it is gone, as a superseded suspended VM stays
+        // put on restart.
+        let ip = vm.ip;
+        let gen = self.addrs.lock().unwrap().used.get(&ip).copied();
+        if let Some(gen) = gen.filter(|&g| !self.gens.lock().unwrap().current(ip, g)) {
+            *vm.state.lock().unwrap() = State::Failed;
+            {
+                let mut addrs = self.addrs.lock().unwrap();
+                let mut vms = self.vms.lock().unwrap();
+                if vms.get(&vm.name).is_some_and(|v| Arc::ptr_eq(v, vm)) {
+                    vms.remove(&vm.name);
+                    addrs.used.remove(&ip);
+                }
+                addrs.withdraw(ip, gen);
+            }
+            drop(route);
+            if let Some(h) = &self.holder {
+                h.forget(ip, mig);
+            }
+            self.drop_held_in(vm);
+            vm.kill();
+            self.withdraw_from_peers(ip, Some(gen));
+            return format!("{e}; not resumed here: generation {gen} of its address {ip} was superseded meanwhile, so this copy is gone").into();
+        }
         // Packets held meanwhile go into the tap first: Firecracker reads
         // them once resumed, ahead of what the restored route brings.
         if let Some(h) = &self.holder {
@@ -2011,7 +2047,7 @@ impl Daemon {
         let tpl = self.migration_template(req)?;
         t.mark("template");
         // The address keeps its incarnation wherever the VM goes.
-        let gen = req["gen"].as_u64().unwrap_or(LEGACY_GEN);
+        let gen = req["gen"].as_u64().ok_or("missing gen")?;
         let claim = self.claim_given_ip(req["ip"].as_str().ok_or("missing ip")?, ClaimFor::Incoming(gen))?;
         t.mark("claim_ip");
         let idle = self.pool.take()?;
@@ -2178,7 +2214,7 @@ impl Daemon {
                 let mut vms = self.vms.lock().unwrap();
                 let late = Instant::now() >= deadline;
                 let closing = self.closing.load(Ordering::SeqCst);
-                let stale = claim.gen != LEGACY_GEN && !self.gens.lock().unwrap().current(ip, claim.gen);
+                let stale = !self.gens.lock().unwrap().current(ip, claim.gen);
                 if stale {
                     let gen = claim.gen;
                     drop((vms, addrs));
@@ -2820,7 +2856,7 @@ struct Gens {
 
 impl Gens {
     fn load(dir: PathBuf) -> Result<Gens> {
-        lifecycle::create_dir_durably(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        crate::util::create_dir_durably(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let mut reserved = 0;
         let mut seen = HashMap::new();
         for e in std::fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))? {

@@ -6,7 +6,7 @@ or cleanly failed.
 
 usage: scripts/faults.py [--a ADDR] [--b ADDR] [--bin FLEXVM] [--log-dir DIR] SCENARIO... | all
   'all' runs the scenarios that leave both daemons running; source_killed,
-  target_restart, target_restart_symlink, checkpoint_crash, cow_crash, late_withdrawal,
+  target_restart, target_restart_symlink, checkpoint_crash, cow_crash, late_withdrawal, suspend_no_gen,
   suspend_resume, hot_budget and resume_mark_fails kill a daemon with SIGKILL and restart it with the same command line and
   environment (logging to --log-dir). Checkpoint scenarios write to --ckpt-dir.
 """
@@ -1743,16 +1743,19 @@ def ckpt_dir_moved():
 # --- two-step migration (migrate_in) ---------------------------------------
 
 
-def migrate_in_raw(host, name, ip, source, template=None):
+def migrate_in_raw(host, name, ip, source, template=None, gen="now"):
     """Asks `host` to prepare an incoming migration as a source would, for a
-    VM like `source` (its template id and memory regions, from `source_vm`).
-    Returns the open socket and the prepare reply."""
+    VM like `source` (its template id and memory regions, from `source_vm`),
+    by default with an address generation newer than any before (the time
+    in ms; None sends none). Returns the open socket and the prepare reply."""
     template_id, regions = source
     h, port = host.rsplit(":", 1)
     s = socket.create_connection((h, int(port)), timeout=60)
     mig = int.from_bytes(os.urandom(6), "little")
     req = {"op": "migrate_in", "name": name, "mig": mig, "template": template or args.template, "id": template_id,
            "ip": ip, "source": A, "regions": regions}
+    if gen is not None:
+        req["gen"] = int(time.time() * 1000) if gen == "now" else gen
     s.sendall((json.dumps(req) + "\n").encode())
     buf = b""
     while not buf.endswith(b"\n"):
@@ -1768,7 +1771,7 @@ def nothing_left(label, name, ip):
     check(f"{label}: name free on B", wait_for(lambda: name not in vms(B), 10), vms(B).get(name))
     check(f"{label}: address free on B", wait_for(lambda: ip not in ok(B, {"op": "info"})["ips"], 10))
     # Not B's to hand out, but another migration may bring it.
-    s, r, _ = migrate_in_raw(B, name, ip, template_id())
+    s, r, _ = migrate_in_raw(B, name, ip, source_vm())
     check(f"{label}: name and address usable on B", r.get("ok"), r)
     s.close()
     check(f"{label}: and free again", wait_for(lambda: ip not in ok(B, {"op": "info"})["ips"] and name not in vms(B), 10))
@@ -2142,8 +2145,24 @@ def raw(host, data, timeout=10):
 def forged_peer():
     """Peer-sized lengths a forged peer sends (a huge vmstate, too many
     preloaded pages, a huge page request, an endless request line) are refused
-    without the daemon dying, and page-server refusals reach the client."""
-    tid = template_id()
+    without the daemon dying, and page-server refusals reach the client. An
+    arrival without an address generation (none, or 0), or with one older
+    than the newest recorded, is refused."""
+    tid = source_vm()
+    n, ip = "ft-forged-gen", "10.250.0.10"
+    gone = lambda: wait_for(lambda: ip not in ok(B, {"op": "info"})["ips"] and n not in vms(B), 10)
+    for label, gen in (("none", None), ("zero", 0)):
+        s, r, _ = migrate_in_raw(B, n, ip, tid, gen=gen)
+        s.close()
+        check(f"forged gen {label}: arrival refused", not r.get("ok") and "gen" in r.get("error", ""), r)
+    newest = int(time.time() * 1000)
+    s, r, _ = migrate_in_raw(B, n, ip, tid, gen=newest)
+    s.close()
+    check("forged gen: a newer one is taken", r.get("ok") and gone(), r)
+    s, r, _ = migrate_in_raw(B, n, ip, tid, gen=newest - 1)
+    s.close()
+    check("forged gen: an older one than recorded is refused", not r.get("ok") and "newer one" in r.get("error", ""), r)
+    gone()
     for label, hdr in (("vmstate", {"runs": [], "vmstate_len": 1 << 40, "preload": []}),
                        ("preload", {"runs": [], "vmstate_len": 0, "preload": list(range(5000))})):
         n, ip = f"ft-forged-{label}", "10.250.0.9"
@@ -2276,6 +2295,59 @@ def late_withdrawal():
     check("late withdrawal: the last VM's withdrawal frees it", wait_for(lambda: ip not in lent(), 10), lent())
 
 
+def abort_superseded():
+    """A migration source whose migration aborts does not resume a VM whose
+    address's generation was superseded meanwhile (say the home host handed
+    the address to a newer VM): that copy is gone, and the address's route
+    is not taken back."""
+    n = "ft-abort-superseded"
+    m = setup(n, mib=20)
+    ip = vms(A)[n]["ip"]
+    ok(A, {"op": "migrate", "name": n, "to": B})
+    wait_released(B, n)
+    check("abort superseded: running on B", where(n) == {B: "running"} and md5(B, n) == m, where(n))
+    old = ok(A, {"op": "info"})["lent"].get(ip)
+    # A newer generation of the address, as its home host would announce it
+    # (here only to B, so that A still prepares to take the VM back).
+    newer = old + 100000
+    r = ok(B, {"op": "route", "ip": ip, "via": "127.0.0.1", "gen": newer})
+    check("abort superseded: B takes the newer generation", not r["stale"], r)
+    # B's page server refuses, so A refuses the arrival after B paused, and B aborts.
+    fault(B, "pages", 30000)
+    r = rpc(B, {"op": "migrate", "name": n, "to": A}, timeout=120)
+    fault(B, "pages", 0)
+    check("abort superseded: migration aborted, copy not resumed", not r["ok"] and "superseded" in r.get("error", ""), r)
+    check("abort superseded: running nowhere", where(n) == {}, where(n))
+    check("abort superseded: its old loan freed", wait_for(lambda: ip not in ok(A, {"op": "info"})["lent"], 10))
+    cleanup(n)
+    # Let A, the home host, know the newer generation too, and retire it,
+    # so A's later ones for this address are newer still.
+    for h in (A, B):
+        ok(h, {"op": "route", "ip": ip, "via": "127.0.0.1", "gen": newer})
+        ok(h, {"op": "route", "ip": ip, "gen": newer})
+
+
+def suspend_no_gen():
+    """A suspended VM whose checkpoint lacks its address generation, while
+    the address has one recorded, is quarantined on restart (not brought
+    back), and its checkpoint still restores at a new address."""
+    n = "ft-suspend-nogen"
+    m = setup(n, mib=20)
+    ok(A, {"op": "suspend", "name": n})
+    argv = [a.decode() for a in proc(daemon_pid(A), "cmdline").split(b"\0") if a]
+    d = os.path.join(argv[argv.index("--state-dir") + 1], "suspended", n)
+    check("suspend no gen: generation recorded in the checkpoint",
+          subprocess.run(["sudo", "test", "-f", f"{d}/GEN"]).returncode == 0, d)
+    subprocess.run(["sudo", "rm", "-f", f"{d}/GEN"], check=True)
+    argv, env = kill_daemon(A)
+    start_daemon(A, argv, env)
+    check("suspend no gen: quarantined, not brought back", n not in vms(A), vms(A).get(n))
+    r = rpc(A, {"op": "restore", "dir": d, "name": n + "2", "ip": "auto"})
+    check("suspend no gen: its checkpoint restores at a new address", r["ok"] and md5(A, n + "2") == m, r)
+    cleanup(n + "2")
+    subprocess.run(["sudo", "rm", "-rf", d], check=True)
+
+
 SCENARIOS = dict(plug_race=plug_race, plug_storm=plug_storm, cow_grow=cow_grow, basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, refused=refused, pages_blip=pages_blip,
                  pages_dead_restore=pages_dead_restore, pages_dead=pages_dead, resume_kill=resume_kill, prepared_retry=prepared_retry, quiet_source=quiet_source,
                  shared_run_dir=shared_run_dir, exec_race=exec_race, guest_calls=guest_calls, source_killed=source_killed,
@@ -2292,10 +2364,11 @@ SCENARIOS = dict(plug_race=plug_race, plug_storm=plug_storm, cow_grow=cow_grow, 
                  slow_preload=slow_preload, ckpt_packet_hold=ckpt_packet_hold, hot_budget=hot_budget,
                  suspend_disk_freed=suspend_disk_freed, resume_mark_fails=resume_mark_fails,
                  kill_source=kill_source, forged_peer=forged_peer,
-                 restore_ip_peer=restore_ip_peer, late_withdrawal=late_withdrawal)
+                 restore_ip_peer=restore_ip_peer, late_withdrawal=late_withdrawal, abort_superseded=abort_superseded,
+                 suspend_no_gen=suspend_no_gen)
 safe = [s for s in SCENARIOS
         if s not in ("source_killed", "target_restart", "target_restart_symlink", "checkpoint_crash", "cow_crash", "late_withdrawal",
-                     "suspend_resume", "hot_budget", "resume_mark_fails")]
+                     "suspend_no_gen", "suspend_resume", "hot_budget", "resume_mark_fails")]
 names = [n for s in args.scenarios for n in (safe if s == "all" else [s])]
 for s in names:
     scenario_vms.clear()

@@ -274,13 +274,12 @@ impl Daemon {
         let rss = vm.rss();
         let dest = self.cfg.state_dir.join("suspended").join(name);
         let staging = Staging::new(&dest, vm.dir.join("checkpoint.vmstate"))?;
+        // Its address keeps its generation across a restart (`load_suspended`):
+        // recorded in the checkpoint, durably, before it is published, or no
+        // suspend.
+        let gen = self.addrs.lock().unwrap().used.get(&vm.ip).copied().ok_or_else(|| format!("{} is not claimed here", vm.ip))?;
+        staging.add_file(GEN, gen.to_string().as_bytes()).map_err(|e| format!("vm {name}: recording its address generation: {e}"))?;
         let manifest = self.save(&vm, staging, false, false, &mut t)?.manifest;
-        // Its address keeps its generation across a restart (`load_suspended`).
-        if let Some(gen) = self.addrs.lock().unwrap().used.get(&vm.ip).copied() {
-            if let Err(e) = write_gen(&dest, gen) {
-                eprintln!("vm {name}: recording its address generation: {e}; a restart gives it a new one");
-            }
-        }
         // The checkpoint is durable; only now let go of the memory. The pager
         // stops before Firecracker dies, and its page states are never read
         // again: a resume pages in from the checkpoint.
@@ -749,6 +748,11 @@ impl Daemon {
                     let gen = match read_gen(&e.path()) {
                         Some(gen) if self.gens.lock().unwrap().current(ip, gen) => Ok(gen),
                         Some(gen) => Err(format!("its address {ip}'s generation {gen} was withdrawn or superseded")),
+                        // (A suspend records it before publishing; only a
+                        // checkpoint from before generations lacks one.)
+                        None if self.gens.lock().unwrap().seen.contains_key(&ip) => {
+                            Err(format!("no generation recorded for it, and its address {ip} has one"))
+                        }
                         None if self.cfg.vm_ips.contains(ip) => Ok(self.new_gen(ip)?),
                         None => Err(format!("no generation recorded for its address {ip}, which is not this host's to hand out")),
                     };
@@ -911,16 +915,6 @@ impl Drop for HeldReports<'_> {
 
 /// In a suspended VM's checkpoint: its address's generation (see `Gens`).
 const GEN: &str = "GEN";
-
-/// Records a suspended VM's address generation in its checkpoint, durably.
-fn write_gen(dir: &Path, gen: u64) -> std::io::Result<()> {
-    let tmp = dir.join(".GEN.tmp");
-    let mut f = std::fs::File::create(&tmp)?;
-    f.write_all(gen.to_string().as_bytes())?;
-    f.sync_all()?;
-    std::fs::rename(&tmp, dir.join(GEN))?;
-    std::fs::File::open(dir)?.sync_all()
-}
 
 fn read_gen(dir: &Path) -> Option<u64> {
     std::fs::read_to_string(dir.join(GEN)).ok()?.trim().parse().ok()
