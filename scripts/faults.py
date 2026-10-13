@@ -749,12 +749,14 @@ def guest_hang():
     cleanup(n)
 
 
-def migrate_in_raw(host, name, ip, template_id, gen=1, template=None):
+def migrate_in_raw(host, name, ip, template_id, gen=None, template=None):
     """Asks `host` to prepare an incoming migration as a source would.
     Returns the open socket and the prepare reply."""
     h, port = host.addr.rsplit(":", 1)
     s = socket.create_connection((h, int(port)), timeout=60)
     mig = int.from_bytes(os.urandom(6), "little")
+    # Newer than any the host has seen for it, as an arriving VM's is.
+    gen = addr(host, ip).get("seen", 0) + 1 if gen is None else gen
     req = {"op": "migrate_in", "name": name, "mig": mig, "template": template or args.template, "id": template_id,
            "ip": ip, "gen": gen, "source": A.addr}
     s.sendall((json.dumps(req) + "\n").encode())

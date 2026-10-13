@@ -64,7 +64,6 @@ impl Proc {
         vm.unpause()?;
         self.paused_by_request.store(false, Ordering::SeqCst);
         let took = start.elapsed();
-        self.publish();
         // A held restore at a new address: the guest gets it now.
         let old = vm.pending_net.lock().unwrap().take();
         if let Some(old) = old {
@@ -75,6 +74,8 @@ impl Proc {
             let deadline = Instant::now() + crate::guest::TIMEOUT;
             let _ = vm.sh(&format!("ip -4 addr del {old}/32 dev eth0 2>/dev/null"), deadline);
         }
+        // Running in the registry once it has its address.
+        self.publish();
         drop(op);
         // Off the critical path: the guest's clock keeps counting while
         // paused (its TSC runs on), so this rarely needs to change it.
