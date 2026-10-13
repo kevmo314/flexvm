@@ -199,6 +199,7 @@ impl Vm {
         remote: Option<(Runs, Origin)>,
         ip: Ipv4Addr,
         load: Load,
+        learn: bool,
         phases: &mut Phases,
     ) -> Result<(Arc<Vm>, Duration)> {
         let mut clock_realtime = true;
@@ -207,6 +208,10 @@ impl Vm {
             let idle = pool.take()?;
             phases.mark("pool_take");
             let prepared = Vm::prepare(idle, template.clone(), phases)?;
+            if learn {
+                // What the load touches (`Template::load_set`), for migrations to preload.
+                prepared.pager.learn_load_set();
+            }
             let path = match vmstate {
                 Snapshot::Path(p) => p.to_path_buf(),
                 Snapshot::Bytes(b) => {

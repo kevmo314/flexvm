@@ -148,7 +148,7 @@ fn load_set_file(host: &Host, tpl: &Template) -> PathBuf {
     host.run.join("standby").join(format!(".loadset-{}", tpl.meta.id))
 }
 
-fn save_load_set(host: &Host, tpl: &Template) {
+pub fn save_load_set(host: &Host, tpl: &Template) {
     let set = tpl.load_set();
     if !set.is_empty() {
         if let Ok(b) = serde_json::to_vec(&set) {

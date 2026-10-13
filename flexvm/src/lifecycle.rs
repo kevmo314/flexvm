@@ -303,7 +303,7 @@ impl Proc {
             // Loaded paused: everything up to the resume below can fail
             // without the VM having run. The bytes that were verified are
             // loaded, from a file only root controls.
-            Vm::restore(&self.pool, name, tpl, crate::vm::Snapshot::Bytes(&ck.vmstate), origin, ip, load, t)
+            Vm::restore(&self.pool, name, tpl, crate::vm::Snapshot::Bytes(&ck.vmstate), origin, ip, load, false, t)
         })()
         .map_err(Restore::NotRun)?;
         let dir = ck.dir;

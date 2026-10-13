@@ -334,7 +334,12 @@ impl Proc {
         t.mark("claim_ip");
         let load = if fault("resume_kill") { crate::vm::Load::RunningKilled } else { crate::vm::Load::Running };
         let vmstate = tpl.vmstate();
-        let restored = Vm::restore(&self.pool, name, tpl, crate::vm::Snapshot::Path(&vmstate), None, ip, load, &mut t);
+        // The first load of a template on this host learns what loads touch.
+        let learn = crate::standby::load_set(&self.host, &tpl).is_empty();
+        let restored = Vm::restore(&self.pool, name, tpl.clone(), crate::vm::Snapshot::Path(&vmstate), None, ip, load, learn, &mut t);
+        if learn && restored.is_ok() {
+            crate::standby::save_load_set(&self.host, &tpl);
+        }
         let vm = match restored {
             Ok((vm, _)) => vm,
             Err(e) => {
