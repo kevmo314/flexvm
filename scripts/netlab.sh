@@ -5,7 +5,7 @@
 #   fvB  192.168.100.2   host B, hands out VM addresses .192-.250
 #   fvC  192.168.100.10  a plain client machine
 #
-# usage: netlab.sh up | down | daemons | stop
+# usage: netlab.sh up | down | listeners | stop | fv A|B ARGS...
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -31,41 +31,39 @@ down() {
   for ns in fvA fvB fvC fvlan; do ip netns del "$ns" 2>/dev/null || true; done
 }
 
-daemons() {
-  # ip netns exec remounts sysfs; restore the host cgroup2 hierarchy there.
-  ip netns exec fvA sh -c 'mount -t cgroup2 none /sys/fs/cgroup && exec "$@"' sh "$flexvm" daemon --listen 192.168.100.1:7070 --peer 192.168.100.2:7070 \
-    --announce-dev eth0 --vm-ips 192.168.100.128-192.168.100.191 > "$root/daemon-A.log" 2>&1 &
-  ip netns exec fvB sh -c 'mount -t cgroup2 none /sys/fs/cgroup && exec "$@"' sh "$flexvm" daemon --listen 192.168.100.2:7070 --peer 192.168.100.1:7070 \
-    --announce-dev eth0 --vm-ips 192.168.100.192-192.168.100.250 > "$root/daemon-B.log" 2>&1 &
+# flexvm on host A or B (STATE/RUN under /run/flexvm-lab-<host>), in its
+# namespace, with the cgroup2 hierarchy that `ip netns exec`'s sysfs lacks.
+fv() {
+  local h=$1
+  shift
+  ip netns exec "fv$h" sh -c 'mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null; exec "$@"' sh \
+    "$flexvm" --state "/run/flexvm-lab-$h/state" --run "/run/flexvm-lab-$h/run" "$@"
+}
+
+listeners() {
+  mkdir -p /run/flexvm-lab-A /run/flexvm-lab-B
+  fv A listen 192.168.100.1:7070 --peer 192.168.100.2:7070 \
+    --announce-dev eth0 --vm-ips 192.168.100.128-192.168.100.191 > "$root/listen-A.log" 2>&1 &
+  fv B listen 192.168.100.2:7070 --peer 192.168.100.1:7070 \
+    --announce-dev eth0 --vm-ips 192.168.100.192-192.168.100.250 > "$root/listen-B.log" 2>&1 &
   sleep 1
 }
 
 stop() {
-  # Restrict process cleanup to the lab's network namespaces.
-  local ns pid comm
-  for ns in fvA fvB; do
-    while read -r pid; do
-      [[ $pid =~ ^[0-9]+$ ]] || continue
-      comm=$(cat "/proc/$pid/comm" 2>/dev/null) || continue
-      case "$comm" in
-        flexvm|firecracker) kill "$pid" 2>/dev/null || true ;;
-      esac
-    done < <(ip netns pids "$ns" 2>/dev/null)
+  # The lab's listeners and VM processes, by their state directories (each
+  # VM's Firecracker dies with its process).
+  local p pids=
+  for p in /proc/[0-9]*; do
+    tr '\0' ' ' < "$p/cmdline" 2>/dev/null | grep -q -- "--state /run/flexvm-lab-" && pids+=" ${p#/proc/}"
   done
-  # Capture each netns inode before down removes the namespace.
-  local h inode cg
-  for h in A B; do
-    inode=$(stat -L -c %i "/run/netns/fv$h" 2>/dev/null) || continue
-    if [[ $h == A ]]; then
-      cg=/sys/fs/cgroup/flexvm/192_168_100_1_7070_ns$inode
-    else
-      cg=/sys/fs/cgroup/flexvm/192_168_100_2_7070_ns$inode
-    fi
-    [[ -d $cg ]] || continue
-    echo 1 > "$cg/cgroup.kill" 2>/dev/null || true
-    find "$cg" -mindepth 1 -depth -type d -exec rmdir {} + 2>/dev/null || true
-    rmdir "$cg" 2>/dev/null || true
+  for p in $pids; do kill -9 "$p" 2>/dev/null || true; done
+  sleep 1
+  for p in $pids; do
+    for cg in /sys/fs/cgroup/flexvm/idle-"$p"-*; do
+      [[ -d $cg ]] && rmdir "$cg" 2>/dev/null || true
+    done
   done
+  rm -rf /run/flexvm-lab-A /run/flexvm-lab-B
 }
 
-"${1:-up}"
+"${@:-up}"

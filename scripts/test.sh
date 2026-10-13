@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 # Root/KVM integration test. Build artifacts and the default template as in README.md first.
-# netlab down stops ALL flexvm/firecracker processes: use a dedicated test host.
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -20,10 +19,12 @@ lab_started=0
 fail() { echo "$*" >&2; exit 1; }
 pass() { results[current]=PASS; printf 'PASS: %s\n' "${checks[current]}"; }
 
+# flexvm on the lab host in namespace $1 ($2, its listener's address, is
+# only for reading).
 cli() {
-    local ns=$1 host=$2
+    local ns=$1
     shift 2
-    timeout 60s ip netns exec "$ns" "$flexvm" --host "$host" "$@"
+    timeout 60s "$netlab" fv "${ns#fv}" "$@"
 }
 
 # main.rs prints run as JSON, ls as NAME IP TEMPLATE STATE ... (one header row),
@@ -49,23 +50,17 @@ wait_for() {
     done
 }
 
+# Nothing of the lab's is left: no process with its state directories, no
+# namespace, no state directory.
 resources_gone() {
-    local links children ns
-    if pgrep -x firecracker >/dev/null; then return 1; fi
-    links=$(ip -o link show) || return 1
-    if awk -F ': ' '$2 ~ /^fv/ {found=1} END {exit !found}' <<< "$links"; then return 1; fi
-    # Also inspect any remaining named namespaces, not only the initial namespace.
+    local p ns
+    for p in /proc/[0-9]*; do
+        tr '\0' ' ' < "$p/cmdline" 2>/dev/null | grep -q -- "--state /run/flexvm-lab-" && return 1
+    done
     while read -r ns _; do
-        [[ -n "$ns" ]] || continue
-        links=$(ip -n "$ns" -o link show) || return 1
-        if awk -F ': ' '$2 ~ /^fv/ {found=1} END {exit !found}' <<< "$links"; then return 1; fi
         case "$ns" in fvA|fvB|fvC|fvlan) return 1 ;; esac
     done < <(ip netns list)
-    if [[ -d /sys/fs/cgroup/flexvm ]]; then
-        # Daemon-level directories may remain, but no VM or idle-pool children may.
-        children=$(find /sys/fs/cgroup/flexvm -mindepth 2 -type d) || return 1
-        [[ -z "$children" ]] || return 1
-    fi
+    [[ ! -e /run/flexvm-lab-A && ! -e /run/flexvm-lab-B ]]
 }
 
 finish() {
@@ -96,11 +91,8 @@ finish() {
         else
             results[5]=FAIL
             printf 'FAIL: %s\n' "${checks[5]}"
-            pgrep -ax firecracker
-            ip -o link show
-            if [[ -d /sys/fs/cgroup/flexvm ]]; then
-                find /sys/fs/cgroup/flexvm -mindepth 2 -type d
-            fi
+            ip netns list
+            ls -d /run/flexvm-lab-* 2>/dev/null
         fi
     fi
     for i in "${!checks[@]}"; do
@@ -118,7 +110,7 @@ finish() {
     done
     printf 'Summary: %d PASS, %d FAIL, %d SKIP\n' "$passed" "$failed" "$skipped"
     if (( failed != 0 || status != 0 )); then
-        echo "See $root/daemon-A.log and $root/daemon-B.log for daemon diagnostics." >&2
+        echo "See $root/listen-A.log, $root/listen-B.log and the VM logs in /run/flexvm-lab-*/run/vms." >&2
         if [[ -n "$work" ]]; then echo "Test diagnostics retained in $work" >&2; fi
         exit 1
     fi
@@ -131,7 +123,7 @@ finish() {
 trap finish EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-for tool in ip python3 timeout pgrep pkill awk find; do
+for tool in ip python3 timeout awk; do
     command -v "$tool" >/dev/null || fail "Missing prerequisite: $tool"
 done
 [[ -x "$flexvm" ]] || fail 'Build target/release/flexvm first.'
@@ -144,13 +136,14 @@ done
 work=$(mktemp -d /tmp/flexvm-test.XXXXXX)
 lab_started=1
 "$netlab" up
-"$netlab" daemons
-wait_for cli fvA "$host_A" ls
-wait_for cli fvB "$host_B" ls
+"$netlab" listeners
+wait_for test -f /run/flexvm-lab-A/state/host.json
+wait_for test -f /run/flexvm-lab-B/state/host.json
+sleep 0.5
 pass
 
 current=1
-addr=$(cli fvA "$host_A" run "$name" | run_ip)
+addr=$(cli fvA "$host_A" run "$name" -d | run_ip)
 listed fvA "$host_A" "$addr" || fail 'ls did not report the new VM and address.'
 [[ $(cli fvA "$host_A" exec "$name" 'printf flexvm-exec-ok') == flexvm-exec-ok ]] || fail 'Guest exec output mismatch.'
 if cli fvA "$host_A" exec "$name" 'exit 7'; then
@@ -162,7 +155,7 @@ fi
 cli fvA "$host_A" kill "$name"
 absent fvA "$host_A" || fail 'Killed VM is still listed.'
 # Reclaim the exact address, rather than assuming the allocator reuses its first slot.
-reclaimed=$(cli fvA "$host_A" run "$name" --ip "$addr" | run_ip)
+reclaimed=$(cli fvA "$host_A" run "$name" --ip "$addr" -d | run_ip)
 [[ $reclaimed == "$addr" ]] || fail 'Killed VM address was not released.'
 pass
 
@@ -181,7 +174,7 @@ verify_guest() {
 }
 migrate() {
     local source=$1 source_host=$2 target=$3 target_host=$4
-    cli "$source" "$source_host" migrate "$name" --to "$target_host"
+    cli "$source" "$source_host" migrate "$name" "$target_host"
     wait_for listed "$target" "$target_host" "$addr"
     # Post-copy returns before release. Wait for source removal before reusing its name.
     wait_for absent "$source" "$source_host"
