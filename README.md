@@ -391,13 +391,15 @@ not wait on the host:
 - **Pre-plugged.** Templates are snapshotted with `PLUG_MIB` (4 GiB) of
   virtio-mem already plugged, so a VM starts with ~5 GiB of RAM. The memory
   is free in the snapshot (holes in the template file), and guest pages cost
-  the host only once touched. Idle RSS, run latency and template size barely
-  move (measured below).
-  The controller never shrinks a VM below this, because shrinking runs offlining,
-  which touches the page structs.
+  the host only once touched. Only the page structs (1/64) are data: the
+  template's memory file grows from 48 to 131 MiB. The controller never
+  shrinks a VM below this, because unplugging means offlining, which walks
+  the page structs.
 - **Overcommit.** The guest runs with `vm.overcommit_memory=1`, so one
-  allocation larger than the current RAM (`bytearray(8 << 30)`) succeeds and
-  grows as it is touched. Under the default heuristic it failed outright.
+  allocation larger than the guest's current RAM succeeds and grows as it is
+  touched. Under the default heuristic, `bytearray(1 << 30)` in a 230 MiB
+  guest failed with ENOMEM before touching a page, which no host reaction
+  could fix.
 - **Asking, not polling.** flexvm-init (`guest/src/mem.rs`) puts everything in
   a memory cgroup whose `memory.high` sits `headroom(MemTotal)` below
   MemTotal. That is the same mark the daemon keeps free (a quarter of the
@@ -429,15 +431,48 @@ not wait on the host:
   deadline). The target refuses a vmstate whose memory regions differ from
   its own.
 
-Measured with the 2 vCPU template (WSL2, loaded host). Each burst ran right
-after `run`, with a fresh VM per trial:
+Measured with the 2 vCPU template (WSL2, loaded host), a fresh VM per trial,
+with each burst run right after `run`:
 
-| Burst right after `run` | main | this |
+| Burst right after `run` | before | now |
 |---|---|---|
-| `python3 -c 'b=bytearray(1<<30)'` | MemoryError 3/3 | ok 10/10 |
-| 1 GiB: dd buffer, 64 MiB chunks, /dev/shm, 4 parallel | ok (touch is slow here, ~100 MB/s) | ok 40/40 |
-| 3 GiB: bytearray, chunks, /dev/shm | n/a (base too small) | ok 10/10 |
-| 300 MiB, controller slowed to 4 s (≈ a 4× faster guest) | OOM-killed 4/8 | see below |
+| 1 GiB in one buffer (`python3 -c 'b=bytearray(1<<30)'`, `dd bs=1G`) | ENOMEM 11/11 | ok 40/40 |
+| 1 GiB in 64 MiB chunks, to /dev/shm, or from 4 parallel writers | ok 9/9 (first touch is slow here) | ok 60/60 |
+| 3 GiB in one buffer, in chunks, or to /dev/shm | ENOMEM 2/2 (one buffer) | ok 19/19 |
+| 300 MiB with the controller slowed to 4 s (as if the guest were 4× faster) | OOM-killed 4/8 | - |
+| 2 GiB, 4 s controller, template with nothing pre-plugged | - | ok 14/14 (grown on guest requests) |
+
+Memory still goes back to the host. A VM's host RSS went from 19 MiB idle to
+2630 MiB holding 2.5 GiB in /dev/shm, then back to 96 MiB 15 s after the
+file was deleted. What stays resident is the page structs of the touched
+memory (1/64 of it) and small free fragments that free page reporting skips.
+Two details keep untouched plugged memory free:
+
+- Templates wait for free page reporting to finish before the snapshot.
+  Otherwise every VM reports the 4 GiB again after restore, and the walk over
+  its page structs costs ~64 MiB RSS per VM.
+- The pager copies 16 template pages per fault only when faults are
+  sequential. Strided reads, such as reporting touching one page struct per
+  4 MiB block, used to pull in 16 times what they touched. Recorded working
+  sets are padded to 16-page blocks instead, so restores still prefetch
+  around what they touch.
+
+Cost, against main on the same host. The A/B alternated the two daemons
+trial by trial, 2 × 60 runs; migrations come from four alternating rounds of
+`flexvm bench --dirty-mib 200`, 15 trials each:
+
+| | main | now |
+|---|---|---|
+| Idle VM host RSS | 18 MiB | 9–22 MiB |
+| `run` p50 (interleaved) | 31.7 / 32.9 ms | 34.8 / 33.2 ms |
+| of which snapshot load | 22.4 ms | 22.7 ms |
+| of which guest agent's first reply (`guest_net`) | 6.3 ms | 7.3 ms |
+| Migration downtime p50 / p90 | 62.8 / 71.9 ms | 51.5 / 71.7 ms |
+| Background pull p50 (200 MiB dirty) | 316 ms | 304 ms |
+
+The extra ~1 ms of `guest_net` comes from the first touches after restore,
+not from the memory cgroup itself: NET round trips in a running guest take
+0.5–0.6 ms with the agent inside the cgroup or outside it.
 
 ### Migration ownership
 
@@ -674,7 +709,7 @@ every queue.
 
 | | |
 |---|---|
-| Template cold boot (one time) | 250 ms (2 vCPU), 420 ms (24 vCPU) |
+| Template cold boot (one time) | 250 ms (2 vCPU), 420 ms (24 vCPU), then seconds to plug 4 GiB and let free page reporting finish |
 | `run` → guest agent answering with its address set, hot pool | **4–7 ms** p50, 6–14 ms p90 (resume ~2 ms, `START` ~3 ms; host load ~20) |
 | same, hot pool empty (snapshot load) | 45–54 ms p50 under the same load (36–56 ms on a quieter host) |
 | of which Firecracker snapshot load | 22–50 ms (mostly KVM memslot setup, which is slow under nested virt) |
@@ -683,7 +718,7 @@ every queue.
 | UDP stream through the same, 5,000 datagrams/s | **0 lost**, 0–17 reordered per round (12 rounds); before: 184–770 lost per round. At 20,000/s: 0 lost, 0–14 reordered |
 | nginx image, `run` → first HTTP response from the host | **205 ms** p50 (run 56 + nginx startup 144); `--warm`: **55 ms** p50 (run 31 + first request 22) |
 | Background memory pull | ~1.1 GB/s over loopback TCP |
-| Idle VM host RSS | 13–35 MiB |
+| Idle VM host RSS | 9–22 MiB (with 4 GiB plugged) |
 | pause / resume (daemon side; RPC round trip ~2.3 ms) | **0.6 / 0.7 ms** (2 vCPU), 1.5 ms resume (24 vCPU) |
 | checkpoint `--keep-running`, 256 / 1024 / 4096 MiB written in the guest: VM paused | **20 / 18 / 24–31 ms** (was 125 / 406–428 / 1456–1923 ms); write protection armed beforehand while it runs (first checkpoint only): 20 / 95–125 / 270–380 ms; whole checkpoint 220–250 / 450–620 / 1900–2200 ms |
 | ... with a guest rewriting 2 × 256 MiB during the copy | pause 17–56 ms; 650–2700 write faults, 340–1970 of them saving 20–120 MiB first (120–250 µs each); writer iterations > 100 µs: 4–9k (idle 0.1–1k), worst single stall 35–50 ms at 1 GiB (one 100–150 ms stall before 2 MiB protect chunks); free page reports are held during the copy (they cost 0.35–3.6 s stalls before) |
