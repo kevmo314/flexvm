@@ -1262,17 +1262,25 @@ impl Daemon {
     /// `kill`, for a caller holding the name's reservation. A suspended VM's
     /// checkpoint is deleted.
     fn kill_reserved(&self, name: &str) -> Result<Value> {
-        // Out of the map and the claims at once (see `switch_route`).
+        // Out of the map now; its address stays claimed until its Firecracker
+        // is confirmed dead (`Vm::kill` waits for it), so nothing can hand the
+        // address out (say lend it to a restore elsewhere) while it still runs.
         let (vm, gen) = {
-            let mut addrs = self.addrs.lock().unwrap();
+            let addrs = self.addrs.lock().unwrap();
             let vm = self.vms.lock().unwrap().remove(name);
-            let gen = vm.as_ref().and_then(|vm| addrs.used.remove(&vm.ip));
+            let gen = vm.as_ref().and_then(|vm| addrs.used.get(&vm.ip).copied());
             (vm, gen)
         };
         let (ip, gen) = match vm {
             Some(vm) => {
                 self.drop_held_in(&vm);
                 vm.kill();
+                {
+                    let mut addrs = self.addrs.lock().unwrap();
+                    if gen.is_some() && addrs.used.get(&vm.ip).copied() == gen {
+                        addrs.used.remove(&vm.ip);
+                    }
+                }
                 if let State::Source(mig) = vm.state() {
                     if let Some(h) = &self.holder {
                         h.forget(vm.ip, mig);
@@ -1741,21 +1749,25 @@ impl Daemon {
         let gen = self.addrs.lock().unwrap().used.get(&ip).copied();
         if let Some(gen) = gen.filter(|&g| !self.gens.lock().unwrap().current(ip, g)) {
             *vm.state.lock().unwrap() = State::Failed;
-            {
+            let ours = {
                 let mut addrs = self.addrs.lock().unwrap();
                 let mut vms = self.vms.lock().unwrap();
-                if vms.get(&vm.name).is_some_and(|v| Arc::ptr_eq(v, vm)) {
-                    vms.remove(&vm.name);
-                    addrs.used.remove(&ip);
-                }
                 addrs.withdraw(ip, gen);
-            }
+                vms.get(&vm.name).is_some_and(|v| Arc::ptr_eq(v, vm)) && vms.remove(&vm.name).is_some()
+            };
             drop(route);
             if let Some(h) = &self.holder {
                 h.forget(ip, mig);
             }
             self.drop_held_in(vm);
             vm.kill();
+            // Its claim of the address goes only once it is dead.
+            if ours {
+                let mut addrs = self.addrs.lock().unwrap();
+                if addrs.used.get(&ip) == Some(&gen) {
+                    addrs.used.remove(&ip);
+                }
+            }
             // The hold had the address's route; give it back to the newer VM,
             // as a peer announced it (`route` left it alone while held).
             self.reinstall_route(ip);
@@ -1968,9 +1980,10 @@ impl Daemon {
 
     /// Points the route for `vm`'s address at `via`, unless the address
     /// belongs to a newer VM here by now. Serialized with address claims, so
-    /// a VM claiming it later routes it to itself after this; `vm` leaves the
-    /// map and the claims together (`release`, `kill_reserved`), so a claim
-    /// without it in the map is a newer VM's. Nor if `vm`'s generation `gen`
+    /// a VM claiming it later routes it to itself after this. A claim without
+    /// `vm` in the map is a newer VM's, or that of `vm` being killed (whose
+    /// claim goes only once it is dead): either way the route stays. Nor if
+    /// `vm`'s generation `gen`
     /// was withdrawn (killed at the target) or a newer one seen meanwhile.
     fn switch_route(&self, vm: &Arc<Vm>, gen: u64, via: Ipv4Addr) -> Result<()> {
         let _route = self.addr_lock(vm.ip).lock().unwrap();

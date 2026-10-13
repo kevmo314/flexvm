@@ -123,8 +123,19 @@ impl Daemon {
         let _op = self.admit()?;
         let busy = self.reserve(name, "resuming", LIFECYCLE_WAIT)?;
         if let Ok(vm) = self.vm(name) {
+            // Its address's generation must still be current (a held
+            // restore's address may have been given out again meanwhile):
+            // checked under the address's lock, held through the resume.
+            let route = self.addr_lock(vm.ip).lock().unwrap();
+            let gen = self.addrs.lock().unwrap().used.get(&vm.ip).copied();
+            if gen.is_some_and(|g| !self.gens.lock().unwrap().current(vm.ip, g)) {
+                drop(route);
+                self.kill_reserved(name)?;
+                bail!("vm {name}: its address {}'s generation was withdrawn or superseded; it is not resumed, and is gone", vm.ip);
+            }
             let start = Instant::now();
             vm.unpause()?;
+            drop(route);
             let took = start.elapsed();
             // A held restore at a new address: the guest gets it now, still
             // under the reservation.
@@ -334,16 +345,29 @@ impl Daemon {
                 .map_err(|e| format!("{e}; restore with --ip auto (or another address)"))?,
         };
         t.mark("claim_ip");
-        // A user's checkpoint is immutable and may be restored again whether
-        // or not this VM got to run.
-        self.restore_checkpoint(&name, ck, ip, false, paused, &mut t).map_err(|e| {
+        let give_back = |e: Error| {
             let gen = self.addrs.lock().unwrap().used.remove(&ip);
             // A borrowed address goes back to its home host.
             if !self.cfg.vm_ips.contains(ip) {
                 self.withdraw_from_peers(ip, gen);
             }
-            e.error()
-        })
+            e
+        };
+        // Its address's generation must still be current when the VM runs
+        // (a borrowed one may have been withdrawn or given out again since
+        // the claim): checked under the address's lock, held through the
+        // restore and its resume, so no route message changes it meanwhile.
+        let route = self.addr_lock(ip).lock().unwrap();
+        let gen = self.addrs.lock().unwrap().used.get(&ip).copied();
+        if gen.is_some_and(|g| !self.gens.lock().unwrap().current(ip, g)) {
+            drop(route);
+            return Err(give_back(format!("{ip}'s generation was withdrawn or superseded since it was claimed; restore with --ip auto").into()));
+        }
+        // A user's checkpoint is immutable and may be restored again whether
+        // or not this VM got to run.
+        let res = self.restore_checkpoint(&name, ck, ip, false, paused, &mut t);
+        drop(route);
+        res.map_err(|e| give_back(e.error()))
     }
 
     /// Restores `ck` as VM `name` at `ip` (already claimed), its memory paged
