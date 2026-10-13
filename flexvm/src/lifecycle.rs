@@ -628,7 +628,7 @@ impl Proc {
             match vm.hotplug_plugged() {
                 Some(now) if cow && now >= plugged.unwrap_or(0) => {}
                 now if now == plugged => {}
-                _ => bail!("guest memory was resized during the checkpoint; try again"),
+                now => bail!("guest memory was resized during the checkpoint ({plugged:?} -> {now:?} MiB plugged); try again"),
             }
             Ok(())
         });
