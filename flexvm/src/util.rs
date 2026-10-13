@@ -21,16 +21,23 @@ pub fn send_json(w: &mut impl Write, v: &serde_json::Value) -> io::Result<()> {
     w.flush()
 }
 
-const MAX_LINE: u64 = 1024 * 1024;
+/// Longest JSON line `recv_json` accepts: room for an exec command of the
+/// guest's 1 MiB limit even when escaping inflates it.
+const MAX_LINE: u64 = 8 << 20;
 
 /// Reads one JSON line. Returns None on EOF.
 pub fn recv_json(r: &mut impl BufRead) -> Result<Option<serde_json::Value>> {
+    recv_json_max(r, MAX_LINE)
+}
+
+/// Reads one JSON line of at most `max` bytes. Returns None on EOF.
+pub fn recv_json_max(r: &mut impl BufRead, max: u64) -> Result<Option<serde_json::Value>> {
     let mut line = String::new();
-    if r.take(MAX_LINE).read_line(&mut line)? == 0 {
+    if r.take(max).read_line(&mut line)? == 0 {
         return Ok(None);
     }
-    if line.len() as u64 == MAX_LINE && !line.ends_with('\n') {
-        bail!("JSON request line exceeds limit of {MAX_LINE} bytes");
+    if line.len() as u64 == max && !line.ends_with('\n') {
+        bail!("JSON line exceeds limit of {max} bytes");
     }
     Ok(Some(serde_json::from_str(&line)?))
 }
@@ -294,6 +301,10 @@ mod tests {
         assert_eq!(recv_json(&mut input).unwrap(), Some(0.into()));
         assert_eq!(recv_json(&mut input).unwrap(), Some(1.into()));
         assert!(recv_json(&mut input).unwrap().is_none());
+        // Callers that expect more (migration headers) raise the limit.
+        let mut line = vec![b' '; MAX_LINE as usize + 100];
+        line.extend_from_slice(b"2\n");
+        assert_eq!(recv_json_max(&mut io::Cursor::new(line), 2 * MAX_LINE).unwrap(), Some(2.into()));
     }
 
     #[test]

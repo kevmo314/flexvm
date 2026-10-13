@@ -1544,7 +1544,7 @@ impl Daemon {
         let mut br = ByDeadline { r: &mut r, at: deadline };
         let pager = prepared.vm.pager.clone();
         let res = thread::scope(|scope| -> Result<(Value, Arc<Vm>)> {
-            let hdr = recv_json(&mut (&mut br).take(MAX_HEADER))?.ok_or("source hung up before sending the vmstate")?;
+            let hdr = crate::util::recv_json_max(&mut br, MAX_HEADER)?.ok_or("source hung up before sending the vmstate")?;
             // The source has paused: the downtime here starts now.
             let mut t = Phases::new();
             let runs: Runs = serde_json::from_value(hdr["runs"].clone())?;
