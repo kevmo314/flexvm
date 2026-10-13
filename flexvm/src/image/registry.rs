@@ -217,7 +217,21 @@ impl Registry {
 
 /// Makes renames into `dir` durable.
 pub fn sync_dir(dir: &Path) -> Result<()> {
-    std::fs::File::open(dir)?.sync_all()?;
+    std::fs::File::open(dir)
+        .and_then(|d| d.sync_all())
+        .map_err(|e| format!("fsync of directory {}: {e}", dir.display()))?;
+    Ok(())
+}
+
+/// Creates `dir` (and missing parents) and makes the entries for it and its
+/// `levels - 1` nearest ancestors durable, by fsyncing each one's parent.
+/// Every time, not only when it creates them: another process may have
+/// created them without that having reached the disk yet.
+pub fn create_dir_durably(dir: &Path, levels: usize) -> Result<()> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    for parent in dir.ancestors().skip(1).take(levels) {
+        sync_dir(if parent.as_os_str().is_empty() { Path::new(".") } else { parent })?;
+    }
     Ok(())
 }
 
