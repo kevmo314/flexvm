@@ -78,6 +78,21 @@ def fault(host, f, ms):
     ok(host, {"op": "fault", "fault": f, "ms": ms})
 
 
+FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_before_run", "restore_after_run",
+          "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "resume_kill",
+          "prepare_fail", "short_incoming", "slow_preload", "kill_prepared")
+
+
+def disarm():
+    """Disarms every test fault on both daemons, so none outlives its scenario."""
+    for h in (A, B):
+        try:
+            for f in FAULTS:
+                rpc(h, {"op": "fault", "fault": f, "ms": 0})
+        except OSError:
+            pass  # not up (a scenario that restarts it failed)
+
+
 def setup(name, host=None, mib=200):
     host = host or A
     ok(host, {"op": "run", "name": name, "template": args.template})
@@ -249,7 +264,16 @@ def pages_blip():
     st = wait_released(B, n)
     check("pages blip: pull recovered", st["released"] is True and st["failed"] is None, f"{st} after {time.time()-t:.1f}s")
     check("pages blip: only on B", where(n) == {B: "running"}, where(n))
-    check("pages blip: md5 intact", md5(B, n) == m)
+    got = md5(B, n)
+    check("pages blip: md5 intact", got == m, got)
+    # The blip stalled B's snapshot load, restoring the vCPUs' TSCs seconds
+    # apart: KVM then keeps no master clock for the VM, so its snapshots have
+    # no realtime clock. It must still migrate (issue #50).
+    r = rpc(B, {"op": "migrate", "name": n, "to": A}, timeout=120)
+    check("pages blip: migrates back", r["ok"], r)
+    wait_released(A, n)
+    w, back = where(n), md5(A, n)
+    check("pages blip: back on A only, md5 intact", w == {A: "running"} and back == m, (w, back))
     cleanup(n)
 
 
@@ -258,6 +282,7 @@ def pages_dead_restore():
     m = setup(n)
     fault(A, "pages", 20000)
     r = rpc(A, {"op": "migrate", "name": n, "to": B}, timeout=120)
+    fault(A, "pages", 0)
     check("pages dead at restore: target refuses", not r["ok"], r)
     # Loaded with its vCPUs stopped, it is killed before it ever ran there.
     check("pages dead at restore: never ran on the target",
@@ -273,9 +298,72 @@ def pages_dead():
     ok(A, {"op": "migrate", "name": n, "to": B})
     fault(A, "pages", 30000)
     st = wait_released(B, n)
+    fault(A, "pages", 0)
     check("pages dead: target failed cleanly", st["state"] == "failed" and st["failed"], st)
     check("pages dead: source copy released", st["released"] is True, st)
     check("pages dead: running nowhere", where(n) == {B: "failed"}, where(n))
+    cleanup(n)
+
+
+def restore_loads(host):
+    return ok(host, {"op": "info"})["loads"]
+
+
+def hot_ready(host):
+    ready = ok(host, {"op": "info"})["hot"]["ready"]
+    return sum(c for k, c in ready.items() if k.split("@")[0] == args.template)
+
+
+def resume_kill():
+    """Firecracker dies right after a restored VM's resume was sent, so the
+    guest may have run: nothing loads the VM again (that could repeat what
+    the guest did). A migration target has committed before it resumes, so
+    the VM is failed there and the source never resumes its copy; a run from
+    the hot pool fails without a fallback load."""
+    n = "ft-resume-kill"
+    setup(n)
+    before = restore_loads(B)
+    fault(B, "resume_kill", 60000)
+    r = rpc(A, {"op": "migrate", "name": n, "to": B}, timeout=120)
+    fault(B, "resume_kill", 0)
+    check("resume kill: migration committed", r["ok"], r)
+    loads = restore_loads(B) - before
+    check("resume kill: target loaded the vm once, no retry", loads == 1, loads)
+    st = wait_released(B, n)
+    check("resume kill: failed on B, running nowhere", where(n) == {B: "failed"}, (where(n), st))
+    cleanup(n)
+    n = "ft-resume-kill-hot"
+    check("resume kill: a paused vm is ready", wait_for(lambda: hot_ready(A) > 0, 60), ok(A, {"op": "info"})["hot"])
+    before = restore_loads(A)
+    fault(A, "resume_kill", 60000)
+    r = rpc(A, {"op": "run", "name": n, "template": args.template})
+    fault(A, "resume_kill", 0)
+    check("resume kill: run from the hot pool fails", not r["ok"] and "may have run" in r.get("error", ""), r)
+    loads = restore_loads(A) - before
+    check("resume kill: no fallback load", loads == 0, loads)
+    check("resume kill: no vm left", n not in vms(A), vms(A).get(n))
+    check("resume kill: the name runs again", rpc(A, {"op": "run", "name": n, "template": args.template})["ok"])
+    cleanup(n)
+
+
+def prepared_retry():
+    """A migration target whose prepared Firecracker dies before the load
+    (`kill_prepared`) loads once more on a fresh one, before it commits: the
+    guest never ran, and the paused source still serves every page,
+    including the preloaded ones the dead pager had. The same retry, without
+    clock_realtime, takes a VM whose snapshot has no realtime clock (#50)."""
+    n = "ft-prepared-retry"
+    m = setup(n)
+    before = restore_loads(B)
+    fault(B, "kill_prepared", 30000)
+    r = rpc(A, {"op": "migrate", "name": n, "to": B}, timeout=120)
+    fault(B, "kill_prepared", 0)
+    check("prepared retry: migration commits", r["ok"], r)
+    loads = restore_loads(B) - before
+    check("prepared retry: loaded twice (one retry)", loads == 2, loads)
+    st = wait_released(B, n)
+    w, got = where(n), md5(B, n)
+    check("prepared retry: only on B, md5 intact", w == {B: "running"} and got == m, (w, got, st))
     cleanup(n)
 
 
@@ -416,16 +504,18 @@ def exec_race():
     workers = [threading.Thread(target=worker) for _ in range(6)]
     for w in workers:
         w.start()
-    time.sleep(0.5)
-    ok(A, {"op": "migrate", "name": n, "to": B})
-    wait_released(B, n)
-    time.sleep(0.3)
-    ok(B, {"op": "migrate", "name": n, "to": A})
-    wait_released(A, n)
-    time.sleep(0.3)
-    stop.set()
-    for w in workers:
-        w.join()
+    try:
+        time.sleep(0.5)
+        ok(A, {"op": "migrate", "name": n, "to": B})
+        wait_released(B, n)
+        time.sleep(0.3)
+        ok(B, {"op": "migrate", "name": n, "to": A})
+        wait_released(A, n)
+        time.sleep(0.3)
+    finally:
+        stop.set()
+        for w in workers:
+            w.join()
     check("exec race: no exec hung", results["hung"] == 0, results)
     check("exec race: back on A only", where(n) == {A: "running"}, where(n))
     check("exec race: md5 intact", md5(A, n) == m)
@@ -1533,7 +1623,7 @@ def slow_preload():
 
 
 SCENARIOS = dict(basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, refused=refused, pages_blip=pages_blip,
-                 pages_dead_restore=pages_dead_restore, pages_dead=pages_dead, quiet_source=quiet_source,
+                 pages_dead_restore=pages_dead_restore, pages_dead=pages_dead, resume_kill=resume_kill, prepared_retry=prepared_retry, quiet_source=quiet_source,
                  shared_run_dir=shared_run_dir, exec_race=exec_race, source_killed=source_killed,
                  target_restart=target_restart, target_restart_symlink=target_restart_symlink, guest_hang=guest_hang,
                  checkpoint_restore=checkpoint_restore, checkpoint_fork=checkpoint_fork,
@@ -1551,6 +1641,9 @@ safe = [s for s in SCENARIOS
                      "suspend_resume")]
 names = [n for s in args.scenarios for n in (safe if s == "all" else [s])]
 for s in names:
-    SCENARIOS[s]()
+    try:
+        SCENARIOS[s]()
+    finally:
+        disarm()
 print("failures:", failures)
 sys.exit(1 if failures else 0)
