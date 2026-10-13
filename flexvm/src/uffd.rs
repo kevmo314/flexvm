@@ -56,7 +56,7 @@ pub const DISCARDED: u8 = 5;
 
 /// Pages copied per fault from the template, to cut down on round trips,
 /// once faults run sequentially (see `Pager::template_next`).
-const FAULT_AROUND: usize = 16;
+pub const FAULT_AROUND: usize = 16;
 /// Pages claimed per prefetch copy; faults on them wait for it.
 const PREFETCH_RUN: usize = 256;
 /// Pages fetched per remote fault.

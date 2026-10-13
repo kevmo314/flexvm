@@ -543,12 +543,27 @@ fn record_working_set(paths: &Paths, name: &str, tap: &str, sockets: &Arc<Socket
     }
     guest::exec(&fc.sockets.vsock, "true")?;
     fc.pause()?;
-    let runs = pager.present_runs();
+    let runs = pad_runs(pager.present_runs(), crate::uffd::FAULT_AROUND as u64);
     pager.stop();
     drop(fc);
     let _ = std::fs::remove_dir_all(&run);
     std::fs::write(tpl.dir.join("wset"), serde_json::to_vec(&runs)?)?;
     Ok(runs.iter().map(|r| r.1 as usize).sum::<usize>() * PAGE_SIZE)
+}
+
+/// Widens each run to `align`-page boundaries (merging overlaps): a fresh VM
+/// touches pages near the recorded ones too, and prefetching them in bulk is
+/// cheaper than faulting them in one by one later.
+fn pad_runs(runs: Vec<(u64, u64)>, align: u64) -> Vec<(u64, u64)> {
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for (first, count) in runs {
+        let (start, end) = (first / align * align, (first + count).div_ceil(align) * align);
+        match out.last_mut() {
+            Some((f, n)) if start <= *f + *n => *n = end.max(*f + *n) - *f,
+            _ => out.push((start, end - start)),
+        }
+    }
+    out
 }
 
 /// Plugs `mib` of hotplug memory into a booted template VM and waits until
@@ -754,6 +769,12 @@ fn build(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn working_set_runs_are_padded_and_merged() {
+        assert_eq!(pad_runs(vec![(3, 2), (17, 1), (20, 40), (100, 1)], 16), vec![(0, 64), (96, 16)]);
+        assert_eq!(pad_runs(vec![], 16), vec![]);
+    }
 
     #[test]
     fn boot_memory_holds_page_structs_for_the_ceiling() {
