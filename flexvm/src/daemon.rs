@@ -76,6 +76,8 @@ const INCOMING_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_VMSTATE: u64 = 64 << 20;
 /// Most pages a migration source may send along with the vmstate.
 const MAX_PRELOAD: usize = 4096;
+/// Largest header (page states) a migration source may send.
+const MAX_HEADER: u64 = 256 << 20;
 /// How long a migration source waits for the target's preflight answer.
 const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a checkpoint waits for virtio-mem to carry out the last resize.
@@ -1418,14 +1420,17 @@ impl Daemon {
         // What this host has learned its loads touch, for the source to send along.
         let load_set = prepared.load_set.clone();
         send_json(&mut w, &json!({"ok": true, "result": {"timings_ms": prep.json(), "load_set": load_set}}))?;
-        // The vmstate follows once the source has paused; a source that
-        // stalls must not hold a counted operation (and so shutdown) forever.
-        r.get_ref().set_read_timeout(Some(INCOMING_READ_TIMEOUT))?;
-        let pager = prepared.vm.pager.clone();
+        // The vmstate follows once the source has paused. A source that
+        // stalls or trickles must not hold the name, the address, the
+        // prepared Firecracker and a counted operation (and so shutdown)
+        // forever: everything it sends from here is due by one deadline.
         // The migration connection, for the held packets that follow our answer.
         let conn = r.get_ref().try_clone()?;
+        let wait = if self.fault("short_incoming") { Duration::from_secs(2) } else { INCOMING_READ_TIMEOUT };
+        let mut r = ByDeadline { r: &mut r, at: Instant::now() + wait };
+        let pager = prepared.vm.pager.clone();
         let reply = thread::scope(|scope| -> Result<Value> {
-            let hdr = recv_json(&mut r)?.ok_or("source hung up before sending the vmstate")?;
+            let hdr = recv_json(&mut (&mut r).take(MAX_HEADER))?.ok_or("source hung up before sending the vmstate")?;
             // The source has paused: the downtime here starts now.
             let mut t = Phases::new();
             let runs: Runs = serde_json::from_value(hdr["runs"].clone())?;
@@ -1525,8 +1530,8 @@ impl Daemon {
     }
 
     /// Restores and resumes a prepared incoming VM from the source's state.
-    /// Records the outcome for the source: committed once it may have run
-    /// here, aborted if it was killed before the source was answered.
+    /// Records the outcome for the source: aborted if the VM was killed
+    /// before it ever ran here, committed (by `take_in`) before it may run.
     fn finish_in(
         self: &Arc<Self>,
         p: PreparedIn<'_>,
@@ -1544,9 +1549,12 @@ impl Daemon {
             migs.insert(mig, Incoming::Pending);
         }
         let res = self.take_in(p, runs, state, paused, t);
-        // A failed restore has killed the VM, so the source may resume it.
-        let outcome = if res.is_ok() { Incoming::Committed } else { Incoming::Aborted };
-        self.migrations.lock().unwrap().insert(mig, outcome);
+        let mut migs = self.migrations.lock().unwrap();
+        // Before committing, a failure has killed a VM that never ran, so the
+        // source may resume it. Once committed, it stays committed.
+        if res.is_err() && migs.get(&mig) == Some(&Incoming::Pending) {
+            migs.insert(mig, Incoming::Aborted);
+        }
         res
     }
 
@@ -1589,28 +1597,53 @@ impl Daemon {
             thread::spawn(move || crate::uffd::probe(&source, page))
         });
         prepared.pager.seed(runs, Origin::Peer(source.clone()))?;
+        // A prepared load connected the pager long ago; it may have given up.
+        if let Some(why) = prepared.pager.failed() {
+            bail!("its pager failed: {why}");
+        }
         let vmstate = prepared.dir().join("vmstate.in");
         std::fs::write(&vmstate, state)?;
         t.mark("write_state");
-        let load = if paused { crate::vm::Load::Paused } else { crate::vm::Load::Running };
+        // Loaded with its vCPUs stopped: it must not run here before every
+        // check that can still abort the migration has passed (the source
+        // would then resume an older state of a VM that ran on).
+        let load = if paused { crate::vm::Load::Paused } else { crate::vm::Load::PausedUnheld };
         let restored = prepared.load(&name, &vmstate, ip, load, t);
         let probed = probe.map_or(Ok(()), |p| p.join().unwrap_or_else(|_| Err(std::io::Error::other("probe panicked"))));
         let (vm, restore) = restored?;
-        if let Err(e) = probed {
+        let checked = match (probed, vm.pager.failed()) {
+            (Err(e), _) => Err(format!("migration source {} does not serve pages: {e}", source.addr).into()),
+            (_, Some(why)) => Err(format!("its memory cannot be paged in: {why}").into()),
+            _ => self.publish(&name, &vm),
+        };
+        if let Err(e) = checked {
+            // Never ran here: the source may resume its copy.
             vm.kill();
-            bail!("migration source {} does not serve pages: {e}", source.addr);
-        }
-        if let Err(e) = self.publish(&name, &vm) {
-            // Not ours after all: the source may resume its copy.
-            vm.kill();
-            return Err(e);
+            return Err(format!("{e} (it never ran here)").into());
         }
         claim.commit();
+        // The ownership boundary: from here on this host owns the VM, and the
+        // source never resumes its copy.
+        self.migrations.lock().unwrap().insert(source.mig, Incoming::Committed);
         t.mark("register");
         let arrived = vm.clone();
         // While the arrival still holds the name: no kill or migration of
         // this VM can come before it, so none misses it.
         self.held_in.lock().unwrap().insert(source.mig, HeldIn { vm: vm.clone(), revoked: Arc::default(), conn: None });
+        let mut resume_error = None;
+        if !paused {
+            match vm.fc(|fc| fc.resume()) {
+                Ok(()) => *vm.state.lock().unwrap() = State::Running,
+                Err(e) => {
+                    // It may have run: the migration stays committed.
+                    eprintln!("vm {name}: resuming after migration {} failed: {e}", source.mig);
+                    vm.set_failed();
+                    resume_error = Some(e.to_string());
+                }
+            }
+            t.mark("resume");
+        }
+        // Announced once the packets its source held are in (`after_arrival`).
         // The guest clock missed the downtime; fixed once this migration lets go of the VM.
         if vm.state() == State::Running {
             self.sync_clock_later(vm.clone());
@@ -1635,7 +1668,13 @@ impl Daemon {
             eprintln!("vm {}: pull from {} ended after {} ms (release: {released})", vm.name, source.addr, ms(pulled));
             let _ = vm.released.set(released);
         });
-        Ok((json!({"restore_ms": ms(restore), "underlay": self.cfg.underlay.to_string(), "timings_ms": t.json()}), arrived))
+        let reply = json!({
+            "restore_ms": ms(restore),
+            "underlay": self.cfg.underlay.to_string(),
+            "timings_ms": t.json(),
+            "resume_error": resume_error,
+        });
+        Ok((reply, arrived))
     }
 
     /// SIGTERM/SIGINT: stops every VM and paused or idle Firecracker, then
@@ -2070,6 +2109,39 @@ struct PreparedIn<'a> {
     /// The template's load set here (`Template::load_set`).
     load_set: Vec<u64>,
     _busy: Busy<'a>,
+}
+
+/// A reader that fails once `at` has passed, however slowly the other end
+/// trickles: each read waits at most for what is left.
+struct ByDeadline<'a> {
+    r: &'a mut BufReader<TcpStream>,
+    at: Instant,
+}
+
+impl ByDeadline<'_> {
+    fn arm(&self) -> std::io::Result<()> {
+        match self.at.saturating_duration_since(Instant::now()) {
+            d if d.is_zero() => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "migration source too slow")),
+            d => self.r.get_ref().set_read_timeout(Some(d)),
+        }
+    }
+}
+
+impl Read for ByDeadline<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.arm()?;
+        self.r.read(buf)
+    }
+}
+
+impl std::io::BufRead for ByDeadline<'_> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        self.arm()?;
+        self.r.fill_buf()
+    }
+    fn consume(&mut self, n: usize) {
+        self.r.consume(n)
+    }
 }
 
 /// Reads `len` bytes, refusing more than `max`.

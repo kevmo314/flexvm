@@ -22,8 +22,9 @@ pub enum Load {
     Running,
     /// Paused, devices included (held in Firecracker's pause loop).
     Paused,
-    /// Test fault `restore_no_hold` only: vCPUs stopped but devices running,
-    /// as Firecracker leaves a VM loaded with `resume_vm: false`.
+    /// vCPUs stopped but devices running, as Firecracker leaves a VM loaded
+    /// with `resume_vm: false`: a migration target about to resume it once
+    /// it owns the VM, and test fault `restore_no_hold`.
     PausedUnheld,
 }
 
