@@ -256,6 +256,10 @@ pub(crate) trait GuestPages: Sync {
     fn region_end(&self, page: usize) -> Option<usize>;
     /// Copies the pages from `page` on (all in one region) into `buf`.
     fn read(&self, page: usize, buf: &mut [u8]) -> Result<()>;
+    /// The `n` pages from `page` on, in place, if they can be had without a copy.
+    fn direct(&self, _page: usize, _n: usize) -> Option<&[u8]> {
+        None
+    }
 }
 
 impl GuestPages for Pager {
@@ -265,6 +269,10 @@ impl GuestPages for Pager {
 
     fn read(&self, page: usize, buf: &mut [u8]) -> Result<()> {
         self.read_guest((page * PAGE_SIZE) as u64, buf)
+    }
+
+    fn direct(&self, page: usize, n: usize) -> Option<&[u8]> {
+        self.guest_slice((page * PAGE_SIZE) as u64, n * PAGE_SIZE)
     }
 }
 
@@ -423,8 +431,14 @@ fn write_pages(template: &Template, src: &dyn GuestPages, runs: &Runs, out: &Pag
         loop {
             let k = next.fetch_add(1, Ordering::Relaxed);
             let Some(&(first, n)) = units.get(k).filter(|_| !failed.load(Ordering::Relaxed)) else { return Ok(()) };
-            let bytes = buf.get(n * PAGE_SIZE);
-            src.read(first, bytes)?;
+            let bytes: &[u8] = match src.direct(first, n) {
+                Some(mem) => mem,
+                None => {
+                    let b = buf.get(n * PAGE_SIZE);
+                    src.read(first, b)?;
+                    b
+                }
+            };
             let mut unit = Unit { first, kinds: Vec::with_capacity(n), sums: Vec::new(), at: 0 };
             iov.clear();
             for (i, page) in bytes.chunks(PAGE_SIZE).enumerate() {

@@ -17,7 +17,9 @@
 //! overwrites the newer state (see `Pages`).
 //!
 //! The pager also reads PRESENT pages out of the (paused) Firecracker process
-//! with process_vm_readv so this host can act as a migration source.
+//! so this host can act as a migration source: straight out of guest memory
+//! when Firecracker backs it with a memfd and hands that over in the
+//! handshake (it then maps it too), else with process_vm_readv.
 
 use std::collections::VecDeque;
 use std::io::{self, IoSliceMut, Read, Write};
@@ -264,6 +266,8 @@ pub struct Pager {
     mappings: OnceLock<Vec<Mapping>>,
     pages: OnceLock<Pages>,
     uffd: OnceLock<OwnedFd>,
+    /// Guest memory, mapped read-only, when Firecracker shares its memfd.
+    mem: OnceLock<GuestMem>,
     ready: (Mutex<bool>, Condvar),
     /// Firecracker pid, for reading pages out when acting as a migration source.
     pid: AtomicU32,
@@ -295,6 +299,7 @@ impl Pager {
             mappings: OnceLock::new(),
             pages: OnceLock::new(),
             uffd: OnceLock::new(),
+            mem: OnceLock::new(),
             ready: (Mutex::new(false), Condvar::new()),
             pid: AtomicU32::new(0),
             pidfd: OnceLock::new(),
@@ -328,9 +333,13 @@ impl Pager {
     /// Takes over Firecracker's userfaultfd. Returns whether to prefetch the working set.
     fn handshake(&self, listener: &UnixListener, initial: Option<(Runs, Origin)>) -> Result<bool> {
         let (stream, _) = listener.accept()?;
-        let (body, fd) = recv_with_fd(stream.as_raw_fd())?;
+        let (body, mut fds) = recv_with_fds(stream.as_raw_fd())?;
         let mappings: Vec<Mapping> = serde_json::from_slice(&body)?;
         let total = mappings.iter().map(|m| m.offset as usize + m.size).max().unwrap_or(0) / PAGE_SIZE;
+        if fds.len() > 1 {
+            let _ = self.mem.set(GuestMem::map(fds.pop().unwrap(), total * PAGE_SIZE)?);
+        }
+        let fd = fds.pop().ok_or("handshake carried no file descriptor")?;
         let pages = Pages::new(total);
         if let Some((runs, origin)) = initial {
             let _ = self.pull_started.set(Instant::now());
@@ -588,11 +597,24 @@ impl Pager {
         Some((m.base_host_virt_addr + (off - m.offset), m))
     }
 
+    /// Guest memory at `offset`, without copying it, when the pager maps it.
+    /// Only for pages Firecracker has populated (PRESENT): touching a hole
+    /// through this mapping would fill it behind the pager's back.
+    pub fn guest_slice(&self, offset: u64, len: usize) -> Option<&[u8]> {
+        let mem = self.mem.get()?;
+        let end = (offset as usize).checked_add(len).filter(|&e| e <= mem.len)?;
+        Some(unsafe { std::slice::from_raw_parts(mem.ptr.add(offset as usize), end - offset as usize) })
+    }
+
     /// Reads guest memory at `offset` out of the Firecracker process.
     pub fn read_guest(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
         let Some(m) = self.locate(offset) else { bail!("offset {offset:#x} outside guest memory") };
         if offset + buf.len() as u64 > m.offset + m.size as u64 {
             bail!("read crosses a region boundary");
+        }
+        if let Some(mem) = self.guest_slice(offset, buf.len()) {
+            buf.copy_from_slice(mem);
+            return Ok(());
         }
         let local = libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() };
         let remote = libc::iovec {
@@ -975,6 +997,12 @@ pub fn serve_pages(pager: &Pager, mut stream: impl Read + Write, down: impl Fn()
         }
         let offset = u64::from_le_bytes(req[..8].try_into().unwrap());
         let len = u32::from_le_bytes(req[8..].try_into().unwrap()) as usize;
+        let direct = pager.locate(offset).filter(|m| offset + len as u64 <= m.offset + m.size as u64).and_then(|_| pager.guest_slice(offset, len));
+        if let Some(mem) = direct {
+            stream.write_all(&[0])?;
+            stream.write_all(mem)?;
+            continue;
+        }
         buf.resize(len, 0);
         match pager.read_guest(offset, &mut buf) {
             Ok(()) => {
@@ -1016,27 +1044,64 @@ fn remote_pages(runs: &Runs, total: usize) -> Result<usize> {
     Ok(remote)
 }
 
-/// Receives Firecracker's handshake: a JSON body plus the uffd over SCM_RIGHTS.
-fn recv_with_fd(sock: RawFd) -> Result<(Vec<u8>, OwnedFd)> {
+/// Guest memory mapped from Firecracker's memfd.
+struct GuestMem {
+    ptr: *const u8,
+    len: usize,
+    _fd: OwnedFd,
+}
+
+unsafe impl Send for GuestMem {}
+unsafe impl Sync for GuestMem {}
+
+impl GuestMem {
+    fn map(fd: OwnedFd, len: usize) -> Result<GuestMem> {
+        let ptr = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_SHARED | libc::MAP_NORESERVE, fd.as_raw_fd(), 0) };
+        if ptr == libc::MAP_FAILED {
+            bail!("mmap guest memory: {}", io::Error::last_os_error());
+        }
+        Ok(GuestMem { ptr: ptr as *const u8, len, _fd: fd })
+    }
+}
+
+impl Drop for GuestMem {
+    fn drop(&mut self) {
+        unsafe { libc::munmap(self.ptr as *mut _, self.len) };
+    }
+}
+
+/// Receives Firecracker's handshake: a JSON body plus, over SCM_RIGHTS, the
+/// uffd and (with the flexvm memfd patch) the memfd backing guest memory.
+fn recv_with_fds(sock: RawFd) -> Result<(Vec<u8>, Vec<OwnedFd>)> {
     let mut body = vec![0u8; 64 * 1024];
-    let mut cmsg = [0u8; 64];
+    let mut cmsg = [0u64; 8];
     let mut iov = [IoSliceMut::new(&mut body)];
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = iov.as_mut_ptr().cast();
     msg.msg_iovlen = 1;
     msg.msg_control = cmsg.as_mut_ptr().cast();
-    msg.msg_controllen = cmsg.len();
-    let n = unsafe { libc::recvmsg(sock, &mut msg, 0) };
+    msg.msg_controllen = std::mem::size_of_val(&cmsg);
+    let n = unsafe { libc::recvmsg(sock, &mut msg, libc::MSG_CMSG_CLOEXEC) };
     if n <= 0 {
         bail!("recvmsg: {}", io::Error::last_os_error());
     }
-    let c = unsafe { libc::CMSG_FIRSTHDR(&msg) };
-    if c.is_null() || unsafe { (*c).cmsg_type } != libc::SCM_RIGHTS {
+    let mut fds = Vec::new();
+    let mut c = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+    while !c.is_null() {
+        if unsafe { (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_RIGHTS } {
+            let data = unsafe { libc::CMSG_DATA(c) } as *const RawFd;
+            let count = (unsafe { (*c).cmsg_len } - unsafe { libc::CMSG_LEN(0) } as usize) / std::mem::size_of::<RawFd>();
+            for i in 0..count {
+                fds.push(unsafe { OwnedFd::from_raw_fd(std::ptr::read_unaligned(data.add(i))) });
+            }
+        }
+        c = unsafe { libc::CMSG_NXTHDR(&msg, c) };
+    }
+    if fds.is_empty() {
         bail!("handshake carried no file descriptor");
     }
-    let fd = unsafe { std::ptr::read_unaligned(libc::CMSG_DATA(c) as *const RawFd) };
     body.truncate(n as usize);
-    Ok((body, unsafe { OwnedFd::from_raw_fd(fd) }))
+    Ok((body, fds))
 }
 
 #[cfg(test)]

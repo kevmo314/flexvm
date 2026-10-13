@@ -186,6 +186,18 @@ each failure path.
 writes all guest memory, which would make migration downtime proportional to
 RAM and double memory use on a host that is already short.
 
+`firecracker/0002-memfd-guest-memory.patch` (prototype): a UFFD restore backs
+guest memory with a memfd (`MAP_SHARED`) and sends it with the uffd in the
+handshake; balloon and virtio-mem discards use `MADV_REMOVE`, which frees
+shared memory and still raises a userfaultfd REMOVE event. The pager maps the
+memfd read-only, so the checkpoint writer classifies PRESENT pages in place
+and writes them with `O_DIRECT` straight from guest memory, and the page server
+sends them without `process_vm_readv`. Without the patch the pager falls back
+to `process_vm_readv`. Measured here: the same checkpoint wall time (it is
+disk-bound) for about 20% less daemon CPU, and no change in migration pull
+speed; freeing a dead VM's memory moves into the daemon (it holds the last
+reference to the memfd).
+
 ## Measured (WSL2, Ryzen 9 3900X, nested KVM)
 
 | | |
