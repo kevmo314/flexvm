@@ -635,7 +635,7 @@ impl Root {
 }
 
 /// Wraps a layer blob in the decompressor its magic bytes call for.
-pub fn decompress(r: impl Read + 'static) -> Result<Box<dyn Read>> {
+pub fn decompress<'a>(r: impl Read + 'a) -> Result<Box<dyn Read + 'a>> {
     let mut r = BufReader::with_capacity(256 << 10, r);
     let magic = r.fill_buf()?.get(..4).map(|m| m.to_vec()).unwrap_or_default();
     Ok(match magic.as_slice() {

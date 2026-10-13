@@ -467,14 +467,17 @@ fn build_rootfs(staging: &Path, img: &source::Image, app: &App, init: &[u8], des
 }
 
 /// Applies the image's layers in order, checking each blob against its
-/// descriptor first and its uncompressed contents against the config's
+/// descriptor and its uncompressed contents against the config's
 /// diff_ids as it goes.
 fn unpack_layers(root: &mut Root, img: &source::Image) -> Result<()> {
     for (i, layer) in img.layers.iter().enumerate() {
         eprintln!("image: applying layer {}/{} {}", i + 1, img.layers.len(), layer.name());
         let what = |e| format!("layer {}: {e}", layer.name());
-        layer.verify().map_err(what)?;
-        let diff_id = root.apply_layer(unpack::decompress(layer.open()?)?).map_err(what)?;
+        let mut blob = layer.open().map_err(what)?;
+        let applied = unpack::decompress(&mut blob).and_then(|r| root.apply_layer(r));
+        // A corrupt blob usually breaks unpacking too: report its digest first.
+        layer.verify(blob).map_err(what)?;
+        let diff_id = applied.map_err(what)?;
         if diff_id != img.diff_ids[i] {
             bail!("layer {} unpacks to {diff_id}, the image config says {}", layer.name(), img.diff_ids[i]);
         }
@@ -719,17 +722,34 @@ mod tests {
         oci_layout(&d, &layer);
         assert_eq!(std::fs::read(unpack_dir(&d).unwrap().join("a")).unwrap(), b"data");
 
-        // A tampered layer blob (same size) is caught before it is unpacked.
+        // A changed gzip header keeps the layer valid but fails its compressed digest.
         let d2 = tmpdir("oci-layer");
         let (_, ld) = oci_layout(&d2, &layer);
         let p = registry::blob_path(&d2.join("blobs"), &ld).unwrap();
         let mut b = std::fs::read(&p).unwrap();
-        let n = b.len();
-        b[n - 1] ^= 0xff;
+        b[4] ^= 0xff; // gzip mtime is not part of the uncompressed stream
         std::fs::write(&p, &b).unwrap();
         let e = unpack_dir(&d2).unwrap_err().to_string();
         assert!(e.contains("has digest"), "{e}");
-        assert!(!d2.join("out/a").exists());
+        assert_eq!(std::fs::read(d2.join("out/a")).unwrap(), b"data");
+        let cached = d2.join("cache/key.ext4");
+        let staging = d2.join("staging");
+        let img = source::fetch(Path::new("/nonexistent"), d2.to_str().unwrap(), &Limits::default()).unwrap();
+        let e = cached_rootfs(&cached, |_| {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new().mode(0o700).create(&staging)?;
+            let mut root = Root::open(&staging, Limits::default())?;
+            let res = unpack_layers(&mut root, &img);
+            assert_eq!(std::fs::read(staging.join("a")).unwrap(), b"data");
+            std::fs::remove_dir_all(&staging)?;
+            res?;
+            panic!("a corrupt layer must fail before building the rootfs");
+        }).unwrap_err().to_string();
+        assert!(!staging.exists());
+        assert!(e.contains("has digest"), "{e}");
+        for path in [&cached, &cached.with_extension("conf"), &cached.with_extension("ok")] {
+            assert!(!path.exists(), "{} was published", path.display());
+        }
 
         // A tampered config is refused outright.
         let d3 = tmpdir("oci-config");
