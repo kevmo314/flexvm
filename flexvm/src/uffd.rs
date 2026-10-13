@@ -108,9 +108,12 @@ const UFFDIO_WRITEPROTECT_MODE_WP: u64 = 1;
 const UFFDIO_COPY_MODE_WP: u64 = 2;
 /// Pages a write-protect fault unprotects (and saves first, during a copy).
 const WP_BLOCK: usize = 16;
-/// Merge protect ranges across gaps up to this many pages; past this many
-/// ranges in a region, protect the whole region at once.
+/// Merge protect ranges across gaps up to this many pages: one more
+/// protect call costs about as much as the kernel walking this many
+/// populated pages (about 19 µs a call, 70-90 ms per GiB populated, here).
 const PROTECT_GAP: usize = 64;
+/// Up to this many ranges in a region are protected one by one without
+/// looking further; past it, see `Pager::freeze`.
 const PROTECT_RUNS: usize = 256;
 /// Threads copying unsaved pages into memory while a discard is held back.
 const SAVE_REST_THREADS: usize = 8;
@@ -396,6 +399,16 @@ impl Pages {
             from += 1;
         }
         end
+    }
+
+    /// How many pages in `[from, end)` are in `state` (not BASE).
+    pub fn count(&self, state: u8, from: usize, end: usize) -> usize {
+        let (mut i, mut n) = (self.next_not_base(from, end), 0);
+        while i < end {
+            n += (self.states[i].load(Ordering::Relaxed) == state) as usize;
+            i = self.next_not_base(i + 1, end);
+        }
+        n
     }
 
     /// Held while reading and applying uffd events; required by `discard`.
@@ -1905,7 +1918,11 @@ impl Pager {
                         _ => ranges.push((p, p + 1)),
                     }
                 }
-                if ranges.len() > PROTECT_RUNS {
+                // Range by range, so that the pause grows with what was
+                // written rather than with what is populated; unless the
+                // calls would cost more than walking every populated page
+                // of the region once (the writes covered most of it).
+                if ranges.len() > PROTECT_RUNS && ranges.len() * PROTECT_GAP > pages.count(PRESENT, from, to) {
                     ranges = vec![(from, to)];
                 }
                 for (s, e) in ranges {
@@ -2849,6 +2866,7 @@ mod tests {
             for end in from..=300 {
                 let want = (from..end).find(|&i| st[i] != PRESENT).unwrap_or(end);
                 assert_eq!(p.next_not(PRESENT, from, end), want, "PRESENT from {from} end {end}");
+                assert_eq!(p.count(PRESENT, from, end), st[from..end].iter().filter(|&&s| s == PRESENT).count());
             }
         }
 
