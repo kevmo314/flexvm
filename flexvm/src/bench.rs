@@ -248,8 +248,7 @@ fn lifecycle(h: &Hosts, args: &Args, template: &str, dir: &str, date: &str) -> R
 /// checkpoint --stop, restore on the other host, then suspend and resume
 /// there.
 fn trial(h: &Hosts, name: &str, template: &str, mib: u64, ck: &std::path::Path) -> Result<Value> {
-    let run = h.cli(&h.a, &["run", name, "--template", template, "-d"])?;
-    let pid = run["pid"].as_i64().ok_or("no pid")? as i32;
+    h.cli(&h.a, &["run", name, "--template", template, "-d"])?;
     if mib > 0 && crate::exec(&h.a, name, &format!("dd if=/dev/urandom of=/tmp/f bs=1M count={mib} 2>/dev/null"))? != 0 {
         bail!("dirtying guest memory failed");
     }
@@ -257,12 +256,12 @@ fn trial(h: &Hosts, name: &str, template: &str, mib: u64, ck: &std::path::Path) 
     let (mut p, mut r) = (Vec::new(), Vec::new());
     for _ in 0..10 {
         let t = Instant::now();
-        unsafe { libc::kill(pid, libc::SIGTSTP) };
+        h.a.signal(name, libc::SIGTSTP)?;
         h.wait("pause", || Hosts::state(&h.a, name) == "paused")?;
         p.push(ms(t.elapsed()));
         thread::sleep(Duration::from_millis(20));
         let t = Instant::now();
-        unsafe { libc::kill(pid, libc::SIGCONT) };
+        h.a.signal(name, libc::SIGCONT)?;
         h.wait("resume", || Hosts::state(&h.a, name) == "running")?;
         r.push(ms(t.elapsed()));
         thread::sleep(Duration::from_millis(20));
@@ -291,9 +290,8 @@ fn trial(h: &Hosts, name: &str, template: &str, mib: u64, ck: &std::path::Path) 
     restore["ready"] = rs["ready_ms"].clone();
     restore["pull"] = h.pulled(&h.b, name)?;
 
-    let pid = h.b.entry(name)?.pid as i32;
     let t = Instant::now();
-    unsafe { libc::kill(pid, libc::SIGTERM) };
+    h.b.signal(name, libc::SIGTERM)?;
     h.wait("suspend", || !h.b.alive(name))?;
     let suspend = json!({"total": ms(t.elapsed())});
     let rr = h.cli(&h.b, &["resume", name, "-d"])?;
