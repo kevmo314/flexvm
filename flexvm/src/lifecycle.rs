@@ -753,6 +753,9 @@ pub(super) struct Saved {
 /// timeout). `end` injects them into the VM's own tap and gives the address
 /// back to it before resuming, so they arrive ahead of newer traffic.
 /// Dropped without `end` (the VM stops here), they are forgotten.
+/// Longest a checkpoint's release waits for held packets still on their way.
+const CKPT_RELEASE: Duration = Duration::from_millis(20);
+
 struct PacketHold<'a> {
     d: &'a Daemon,
     vm: &'a Vm,
@@ -768,13 +771,18 @@ impl PacketHold<'_> {
         }
     }
 
-    /// Hands the held packets to the VM, then `Vm::end_checkpoint`.
+    /// Hands the held packets to the VM, then `Vm::end_checkpoint`. Waits at
+    /// most `CKPT_RELEASE` for packets still on their way, as the VM stays
+    /// paused meanwhile.
     fn end(&mut self) -> Result<State> {
-        if let Some(h) = &self.d.holder {
-            let (ip, tap) = (self.vm.ip, &self.vm.tap);
-            self.stats = self.d.release_into(h, ip, self.id, self.vm, |()| net::attach(ip, tap));
-        }
-        self.vm.end_checkpoint()
+        let Some(h) = &self.d.holder else { return self.vm.end_checkpoint() };
+        let (ip, tap) = (self.vm.ip, &self.vm.tap);
+        self.stats = self.d.release_into(h, ip, self.id, self.vm, CKPT_RELEASE, |()| net::attach(ip, tap));
+        let res = self.vm.end_checkpoint();
+        // Still held only if the route could not be switched back (the
+        // resume routes it again, or failed): never leave it on the device.
+        h.forget(ip, self.id);
+        res
     }
 }
 

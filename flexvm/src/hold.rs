@@ -26,7 +26,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{BufReader, Read, Write};
 use std::net::{Ipv4Addr, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -60,6 +60,9 @@ pub struct Holder {
     held: Mutex<HashMap<Ipv4Addr, Arc<Entry>>>,
     /// The reader has packets in hand that it has not queued yet.
     reading: AtomicBool,
+    /// Times the reader has found the device empty: once it moves on, every
+    /// packet that was in the device before has been queued.
+    passes: AtomicU64,
     /// Held while the TUN route of an address is added or deleted.
     routes: Mutex<()>,
 }
@@ -125,7 +128,7 @@ impl Holder {
         let _ = crate::net::sysctl(&format!("net.ipv6.conf.{dev}.disable_ipv6"), "1");
         crate::net::set_link_up(&dev, true)?;
         let ifindex = crate::net::ifindex(&dev)?;
-        let h = Arc::new(Holder { dev, ifindex, tun, held: Mutex::new(HashMap::new()), reading: AtomicBool::new(false), routes: Mutex::new(()) });
+        let h = Arc::new(Holder { dev, ifindex, tun, held: Mutex::new(HashMap::new()), reading: AtomicBool::new(false), passes: AtomicU64::new(0), routes: Mutex::new(()) });
         let reader = h.clone();
         std::thread::Builder::new().name("hold".into()).spawn(move || reader.read_loop())?;
         Ok(Some(h))
@@ -212,6 +215,79 @@ impl Holder {
         stats.dropped += q.dropped + q.packets.len() as u64;
         q.packets.clear();
         Some((stats, switched))
+    }
+
+    /// `release` into a VM on this host (`sink` injects into its tap, which
+    /// never waits), for a VM paused only briefly. Waits only for `ip`'s own
+    /// packets: on each side of `switch`, for the reader to get past what was
+    /// in the device then, never for the device to go quiet (another VM's
+    /// held traffic may keep it busy); and for at most `within` in all. If
+    /// `switch` fails the address stays held, its route through the device
+    /// too, until the caller `forget`s it.
+    pub fn release_local(
+        &self,
+        ip: Ipv4Addr,
+        mig: u64,
+        sink: &mut dyn FnMut(&[u8]) -> bool,
+        switch: impl FnOnce() -> Result<()>,
+        within: Duration,
+    ) -> Option<(Stats, Result<()>)> {
+        let e = self.entry(ip).filter(|e| e.mig == mig)?;
+        {
+            let mut q = e.q.lock().unwrap();
+            if q.releasing {
+                return None;
+            }
+            q.releasing = true;
+        }
+        let end = Instant::now() + within;
+        let mut stats = Stats::default();
+        self.drain(&e, sink, &mut stats, end);
+        let switched = switch();
+        self.drain(&e, sink, &mut stats, end);
+        if switched.is_ok() {
+            let mut held = self.held.lock().unwrap();
+            if held.get(&ip).is_some_and(|x| Arc::ptr_eq(x, &e)) {
+                held.remove(&ip);
+            }
+        }
+        let mut q = e.q.lock().unwrap();
+        stats.dropped += q.dropped;
+        q.dropped = 0;
+        if switched.is_ok() {
+            stats.dropped += q.packets.len() as u64;
+            q.packets.clear();
+        }
+        Some((stats, switched))
+    }
+
+    /// Hands `e`'s queue to `sink`; then, once the reader has got past what
+    /// is in the device now (or by `end`), what that added.
+    fn drain(&self, e: &Entry, sink: &mut dyn FnMut(&[u8]) -> bool, stats: &mut Stats, end: Instant) {
+        let mut give = |stats: &mut Stats| loop {
+            let batch = e.q.lock().unwrap().take_batch();
+            if batch.is_empty() {
+                return;
+            }
+            for p in batch {
+                match sink(&p) {
+                    true => {
+                        stats.packets += 1;
+                        stats.bytes += p.len() as u64;
+                    }
+                    false => stats.dropped += 1,
+                }
+            }
+        };
+        give(stats);
+        let pass = self.passes.load(Ordering::SeqCst);
+        while Instant::now() < end
+            && self.passes.load(Ordering::SeqCst) == pass
+            && (self.reading.load(Ordering::SeqCst) || readable(&self.tun))
+        {
+            std::thread::yield_now();
+        }
+        give(stats);
     }
 
     /// Hands queued packets to `sink` until the queue and the device are
@@ -304,6 +380,7 @@ impl Holder {
                     q.packets.push_back(p.to_vec());
                 }
             }
+            self.passes.fetch_add(1, Ordering::SeqCst);
             self.reading.store(false, Ordering::SeqCst);
         }
     }

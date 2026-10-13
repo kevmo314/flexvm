@@ -502,6 +502,13 @@ impl HotPool {
             };
             {
                 let mut s = self.state.lock().unwrap();
+                // A run may have started since the pick (taking the idle
+                // Firecracker can take a while): wait until it has answered,
+                // keeping the Firecracker, so the load never overlaps it.
+                while !s.closed && s.epoch == epoch && s.deferring() {
+                    let left = s.starting_since.map_or(Duration::ZERO, |t| MAX_DEFER.saturating_sub(t.elapsed()));
+                    s = self.wake.wait_timeout(s, left.max(Duration::from_millis(1))).unwrap().0;
+                }
                 if s.closed || s.epoch != epoch {
                     drop(s);
                     drop(idle);
@@ -528,6 +535,9 @@ impl HotPool {
             // Recheck before stocking it: its own size, and anything that
             // happened meanwhile (shed, close, a newer generation).
             let size = loaded.as_ref().ok().and_then(|p| p.pid()).map(rss_kib).unwrap_or(0);
+            // What the stock uses now: runs may have taken some meanwhile.
+            // (Only this worker adds to it.)
+            let used = self.in_use();
             let mut s = self.state.lock().unwrap();
             s.loading = None;
             let current = s.epoch == epoch && !s.closed;
@@ -566,6 +576,19 @@ impl HotPool {
                 (Err(_), _) => {}
             }
         }
+    }
+
+    /// Host memory the stocked VMs and those being retired use (KiB),
+    /// measured outside the lock; one that cannot be measured counts as its
+    /// stock's cost.
+    fn in_use(&self) -> u64 {
+        let (pids, retiring) = {
+            let s = self.state.lock().unwrap();
+            let pids: Vec<(u32, u64)> =
+                s.stocks.values().flat_map(|k| k.ready.iter().filter_map(|p| Some((p.pid()?, k.cost_kib)))).collect();
+            (pids, s.retiring_kib)
+        };
+        retiring + pids.iter().map(|&(pid, cost)| Some(rss_kib(pid)).filter(|&k| k > 0).unwrap_or(cost)).sum::<u64>()
     }
 
     fn failed(&self, template: &Template, why: String) {
