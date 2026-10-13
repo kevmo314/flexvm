@@ -64,6 +64,8 @@ pub struct Stats {
     /// Discards held back until the copy was done, and for how long in all.
     pub drains: AtomicU64,
     pub drain_ns: AtomicU64,
+    /// Pages copied into memory while a discard was held back.
+    pub held_pages: AtomicU64,
 }
 
 pub struct Cow {
@@ -243,6 +245,7 @@ impl Cow {
             "deferred": get(&s.deferred),
             "discards_held": get(&s.drains),
             "discards_held_ms": get(&s.drain_ns) as f64 / 1e6,
+            "saved_while_held_mib": (get(&s.held_pages) * PAGE_SIZE as u64) >> 20,
             "running_ms": self.started.elapsed().as_secs_f64() * 1e3,
         })
     }
@@ -266,10 +269,10 @@ impl GuestPages for CowPages<'_> {
     fn read(&self, page: usize, buf: &mut [u8]) -> Result<()> {
         let cow = self.cow;
         if self.slow {
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(50));
         }
         if !cow.active() {
-            crate::bail!("the checkpoint copy was stopped");
+            crate::bail!("the checkpoint copy stopped: {}", cow.error().unwrap_or_else(|| "the vm is gone".into()));
         }
         let n = buf.len() / PAGE_SIZE;
         let mine: Vec<bool> = (0..n).map(|i| cow.claim(page + i, PENDING, READING)).collect();
@@ -308,7 +311,7 @@ impl GuestPages for CowPages<'_> {
                     s => crate::bail!("page {p} is in copy state {s}, not saved"),
                 }
                 if !cow.active() {
-                    crate::bail!("the checkpoint copy was stopped");
+                    crate::bail!("the checkpoint copy stopped: {}", cow.error().unwrap_or_else(|| "the vm is gone".into()));
                 }
             }
             let bytes = cow.rescued.lock().unwrap().remove(&p).ok_or_else(|| format!("page {p}: rescued copy missing"))?;
@@ -363,7 +366,7 @@ mod tests {
         let mut buf = vec![0u8; 8 * PAGE_SIZE];
         std::thread::scope(|s| {
             s.spawn(|| {
-                std::thread::sleep(Duration::from_millis(20));
+                std::thread::sleep(Duration::from_millis(50));
                 cow.rescue(5, vec![5u8; PAGE_SIZE].into());
             });
             pages.read(0, &mut buf).unwrap();

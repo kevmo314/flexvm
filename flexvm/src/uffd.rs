@@ -89,6 +89,8 @@ const WP_BLOCK: usize = 16;
 /// ranges in a region, protect the whole region at once.
 const PROTECT_GAP: usize = 64;
 const PROTECT_RUNS: usize = 256;
+/// Threads copying unsaved pages into memory while a discard is held back.
+const SAVE_REST_THREADS: usize = 8;
 /// Pages write-protected per call while the VM runs (2 MiB).
 const ARM_CHUNK: usize = 512;
 
@@ -785,8 +787,11 @@ impl Pager {
                 // hit pages a checkpoint copy has yet to save: let it finish.
                 let cow = self.cow.lock().unwrap().clone();
                 if let Some(cow) = cow.filter(|c| c.active()) {
-                    if self.remove_queued(&cow) && !cow.drain() {
-                        cow.invalidate("a discard was held back while the copy made no progress");
+                    if self.remove_queued(&cow) {
+                        self.save_rest(&cow);
+                        if !cow.drain() {
+                            cow.invalidate("a discard was held back while the copy made no progress");
+                        }
                     }
                 }
                 let removing = self.pages().removing();
@@ -1052,6 +1057,43 @@ impl Pager {
                 r => return r,
             }
         }
+    }
+
+    /// While a REMOVE is held back (and with it every fault, as the kernel
+    /// refuses our ioctls until it is read): copies the pages the checkpoint
+    /// has yet to save into memory with several threads, so the guest waits
+    /// for memory bandwidth rather than for the disk. Only if they fit in a
+    /// quarter of the host's available memory; else the writers finish.
+    fn save_rest(&self, cow: &Cow) {
+        let avail = crate::util::proc_kb("/proc/meminfo", "MemAvailable").unwrap_or(0) as usize;
+        if cow.left() * PAGE_SIZE > avail / 4 {
+            return;
+        }
+        let threads = thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, SAVE_REST_THREADS);
+        let chunks: Vec<(usize, usize)> = self
+            .mappings()
+            .iter()
+            .flat_map(|m| {
+                let (from, to) = (m.offset as usize / PAGE_SIZE, (m.offset as usize + m.size) / PAGE_SIZE);
+                (from..to).step_by(PREFETCH_RUN).map(move |c| (c, (c + PREFETCH_RUN).min(to)))
+            })
+            .collect();
+        let next = AtomicUsize::new(0);
+        thread::scope(|s| {
+            for _ in 0..threads {
+                s.spawn(|| loop {
+                    let Some(&(first, end)) = chunks.get(next.fetch_add(1, Ordering::Relaxed)) else { return };
+                    if cow.left() == 0 || !cow.active() {
+                        return;
+                    }
+                    let claimed: Vec<usize> = (first..end).filter(|&p| cow.claim(p, PENDING, RESCUING)).collect();
+                    match claimed.is_empty() || self.rescue(cow, first, end, &claimed).is_ok() {
+                        true => _ = cow.stats.held_pages.fetch_add(claimed.len() as u64, Ordering::Relaxed),
+                        false => claimed.iter().for_each(|&p| cow.unclaim(p)),
+                    }
+                });
+            }
+        });
     }
 
     /// Whether a REMOVE event is queued (the kernel then fails our ioctls
