@@ -116,10 +116,10 @@ VM that is busy, paused or suspended.
   pooled Firecracker, paused. That Firecracker's pager takes pages from the
   checkpoint's page file: on fault, and in the background (the template's
   working set first) until all are in. The VM is ready in about the time of
-  a `run`. By default it keeps its name and address, which only the
-  address's home host can give it (see Networking), so elsewhere restore
-  with `--ip auto`, which picks a new one; that also makes a restore a fork
-  of a running VM. `--paused` holds the restored VM paused
+  a `run`. By default it keeps its name and address; on another host it
+  borrows the address from its home host (see Networking), which refuses
+  one in use or lent out. `--ip auto` picks a new one, which also makes a
+  restore a fork of a running VM. `--paused` holds the restored VM paused
   until `resume`; its memory is still paged in meanwhile.
 - **suspend** checkpoints into the daemon's `--state-dir` (default
   `/var/lib/flexvm/<listen>`). The state dir must be on disk, not tmpfs, and
@@ -667,15 +667,20 @@ and a second copy could repeat what it did.
   range (one that does not answer is not checked, and a WARNING says so),
   and hands out no address in an overlap it learns of later (it checks
   every 10 s).
-  **Only an address's home host hands it to a new VM**: `run --ip`,
-  `restore --ip`, and a restore keeping its checkpoint's address, are
+  **Only an address's home host hands it to a new VM**: `run --ip` is
   refused for an address outside the host's range ("start the vm on its
-  home host, or use --ip auto"). An address leaves its home only with a VM
-  that migrates away: it stays reserved there ("lent", recorded in
-  `STATE_DIR/lent-ips.json`, which outlives restarts) until that VM is
-  killed wherever it is (its host tells the peers), or it migrates back. If
-  that message is lost, the address stays taken; `flexvm unlend IP` frees
-  it. Leaks, never collisions.
+  home host, or use --ip auto"). A restore of another host's address
+  (its checkpoint's, or `--ip`) borrows it: it asks the home host (op
+  `lend_ip`), which checks the address is free (no VM there, not lent),
+  gives it a new generation, records the loan durably and answers with the
+  generation; the restore then claims the address with it, and gives it
+  back (a withdrawal) if it fails. A home host that does not answer fails
+  the restore ("restore with --ip auto"). An address leaves its home only
+  this way or with a VM that migrates away: it stays reserved there
+  ("lent", recorded in `STATE_DIR/lent-ips.json`, which outlives restarts)
+  until that VM is killed wherever it is (its host tells the peers), or it
+  migrates back. If that message is lost, the address stays taken; `flexvm
+  unlend IP` frees it. Leaks, never collisions.
 - **Generations.** Each VM's address carries a generation that orders the
   VMs that have had it. Its home host gives a new, higher one every time it
   hands the address out (run, restore). A VM keeps its generation through

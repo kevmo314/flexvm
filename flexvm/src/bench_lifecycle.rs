@@ -105,8 +105,7 @@ fn trial(
     checkpoint["paused"] = c["paused_ms"].clone();
     checkpoint["data_mib"] = c["data_mib"].clone();
 
-    // A new address: only the old one's home host may hand that out.
-    let rs = rpc(to, json!({"op": "restore", "dir": ck, "ip": "auto"}))?;
+    let rs = rpc(to, json!({"op": "restore", "dir": ck}))?;
     let mut restore = rs["timings_ms"].clone();
     restore["ready"] = rs["ready_ms"].clone();
     restore["pull"] = wait_pull(rpc, to, name)?;

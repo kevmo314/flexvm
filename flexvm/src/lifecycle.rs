@@ -337,7 +337,11 @@ impl Daemon {
         // A user's checkpoint is immutable and may be restored again whether
         // or not this VM got to run.
         self.restore_checkpoint(&name, ck, ip, false, paused, &mut t).map_err(|e| {
-            self.addrs.lock().unwrap().used.remove(&ip);
+            let gen = self.addrs.lock().unwrap().used.remove(&ip);
+            // A borrowed address goes back to its home host.
+            if !self.cfg.vm_ips.contains(ip) {
+                self.withdraw_from_peers(ip, gen);
+            }
             e.error()
         })
     }

@@ -739,6 +739,7 @@ impl Daemon {
                 vm.fc(|fc| fc.patch("/hotplug/memory", json!({"requested_size_mib": mib})))
             }),
             "route" => self.route(&req),
+            "lend_ip" => self.lend_ip(&req),
             "unlend" => {
                 let ip: Ipv4Addr = req["ip"].as_str().ok_or("missing ip")?.parse()?;
                 Ok(json!({"freed": self.addrs.lock().unwrap().unlend(ip)}))
@@ -933,12 +934,37 @@ impl Daemon {
         let ip: Ipv4Addr = ip.parse().map_err(|_| format!("bad address {ip:?}"))?;
         let _route = self.addr_lock(ip).lock().unwrap();
         let ClaimFor::Incoming(gen) = why else {
-            if !self.cfg.vm_ips.contains(ip) {
-                let home = self.peer_ranges.lock().unwrap().iter().find(|(_, r)| r.contains(ip)).map(|(p, _)| p.clone());
+            if self.cfg.vm_ips.contains(ip) {
+                return self.claim_new(ip);
+            }
+            let home = self.home_of(ip);
+            if why != ClaimFor::Restore {
                 let home = home.map_or("its home host".to_string(), |h| format!("its home host {h}"));
                 bail!("{ip} is not this host's to hand out (--vm-ips {}): start the vm on {home}, or use --ip auto", self.cfg.vm_ips);
             }
-            return self.claim_new(ip);
+            // A restore keeping another host's address borrows it from that
+            // host, which lends it out like a VM migrating away, with a new
+            // generation; given back (withdrawn) if the restore fails.
+            let Some(home) = home else { bail!("{ip} is from no range a peer that answers has: restore with --ip auto") };
+            let r = peer_call(&home, json!({"op": "lend_ip", "ip": ip.to_string()}))
+                .map_err(|e| format!("cannot borrow {ip} from its home host {home}: {e}; restore with --ip auto"))?;
+            let gen = r["gen"].as_u64().filter(|&g| g != LEGACY_GEN).ok_or_else(|| format!("{home} lent {ip} without a generation"))?;
+            let claimed = (|| -> Result<()> {
+                if !self.record_gen(ip, gen, false)? {
+                    bail!("{ip}'s generation {gen} from {home} is already superseded here");
+                }
+                let mut a = self.addrs.lock().unwrap();
+                if let Some(why) = self.ip_taken(&a, ip) {
+                    bail!("{why}");
+                }
+                a.used.insert(ip, gen);
+                Ok(())
+            })();
+            if let Err(e) = claimed {
+                self.withdraw_from_peers(ip, Some(gen));
+                return Err(e);
+            }
+            return Ok(IpClaim { addrs: &self.addrs, ip, gen, was_lent: false, done: false });
         };
         // Recorded, durably, before the VM is taken in: a newer VM with the
         // address (an operator unlent it and it was given out again), or a
@@ -960,6 +986,38 @@ impl Daemon {
         }
         a.used.insert(ip, gen);
         Ok(IpClaim { addrs: &self.addrs, ip, gen, was_lent: lent.is_some(), done: false })
+    }
+
+    /// The peer whose `--vm-ips` holds `ip`, learning the peers' ranges again
+    /// if none is known to.
+    fn home_of(&self, ip: Ipv4Addr) -> Option<String> {
+        let find = || self.peer_ranges.lock().unwrap().iter().find(|(_, r)| r.contains(ip)).map(|(p, _)| p.clone());
+        find().or_else(|| {
+            let _ = self.refresh_peer_ranges(false);
+            find()
+        })
+    }
+
+    /// A peer restoring a checkpoint at `ip`, from our range, borrows it:
+    /// if it is free here, it is lent out (durably, as to a VM migrating
+    /// away) with a new generation, which the answer carries. The VM's kill
+    /// wherever it is, or its migrating back, gives it back.
+    fn lend_ip(&self, req: &Value) -> Result<Value> {
+        let ip: Ipv4Addr = req["ip"].as_str().ok_or("missing ip")?.parse()?;
+        if !self.cfg.vm_ips.contains(ip) {
+            bail!("{ip} is not from this host's range {}", self.cfg.vm_ips);
+        }
+        let _route = self.addr_lock(ip).lock().unwrap();
+        if let Some(why) = self.ip_taken(&self.addrs.lock().unwrap(), ip) {
+            bail!("{why}");
+        }
+        let gen = self.new_gen(ip)?;
+        let mut a = self.addrs.lock().unwrap();
+        if let Some(why) = self.ip_taken(&a, ip) {
+            bail!("{why}");
+        }
+        a.lend(ip, gen)?;
+        Ok(json!({"gen": gen}))
     }
 
     /// The lock for `ip`'s route (see `addr_locks`).
