@@ -173,7 +173,8 @@ impl Registry {
         let path = blob_path(blobs, digest)?;
         let dir = path.parent().unwrap().to_path_buf();
         std::fs::create_dir_all(&dir)?;
-        sweep_parts(&dir)?;
+        // Best effort: leftovers never stand in the way of a pull.
+        sweep_parts(&dir);
         if path.exists() {
             return Ok(path);
         }
@@ -217,9 +218,9 @@ impl Registry {
 }
 
 /// Removes abandoned downloads while preserving files owned by live processes.
-fn sweep_parts(dir: &Path) -> std::io::Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
+fn sweep_parts(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
         let Some((hex, pid)) = name.rsplit_once(".part") else { continue };
@@ -230,12 +231,8 @@ fn sweep_parts(dir: &Path) -> std::io::Result<()> {
         if pid <= 0 || unsafe { libc::kill(pid, 0) } == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
             continue;
         }
-        match std::fs::remove_file(entry.path()) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
-            _ => {}
-        }
+        let _ = std::fs::remove_file(entry.path());
     }
-    Ok(())
 }
 
 /// Makes renames into `dir` durable.
@@ -320,7 +317,7 @@ mod tests {
         for path in [&stale, &live, &other, &blob] {
             std::fs::write(path, "data").unwrap();
         }
-        sweep_parts(&dir).unwrap();
+        sweep_parts(&dir);
         assert!(!stale.exists());
         assert!(live.exists() && other.exists() && blob.exists());
         std::fs::remove_dir_all(dir).unwrap();
