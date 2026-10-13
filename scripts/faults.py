@@ -1372,7 +1372,7 @@ def cow_grow():
     res, seen = {}, {"max": plugged0, "copying": False}
     t = threading.Thread(target=lambda: res.update(r=rpc(A, {"op": "checkpoint", "name": n, "dir": path}, timeout=600)))
     t.start()
-    copying = wait_for(lambda: vms(A).get(n, {}).get("checkpoint_copy"), 30)
+    copying = wait_for(lambda: vms(A).get(n, {}).get("checkpoint_copy") and vms(A)[n]["state"] == "running", 60)
     check("cow grow: copy runs in the background", copying, vms(A).get(n))
     stop = threading.Event()
 
