@@ -1644,11 +1644,7 @@ impl Daemon {
             addr: req["source"].as_str().ok_or("missing source")?.into(),
             vm: name.clone(),
             mig,
-            // Absent from older sources: then unchecked.
-            regions: match &req["regions"] {
-                Value::Null => Vec::new(),
-                r => serde_json::from_value(r.clone()).map_err(|e| format!("bad regions: {e}"))?,
-            },
+            regions: serde_json::from_value(req["regions"].clone()).map_err(|e| format!("bad regions: {e}"))?,
         };
         let busy = self.reserve(&name, "incoming", Duration::ZERO)?;
         if self.taken(&name) {
