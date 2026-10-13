@@ -71,21 +71,30 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: e2e
+          cache-on-failure: true
 
       # Patched Firecracker: rebuilt only when the patches or the build script change.
-      - name: Cache Firecracker
+      # Each artifact is saved right after it is built, so a failing test run still fills the cache.
+      - name: Restore Firecracker
         id: fc-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: artifacts/firecracker
           key: firecracker-${{ hashFiles('firecracker/*.patch', 'scripts/build-firecracker.sh') }}
       - name: Build Firecracker
         if: steps.fc-cache.outputs.cache-hit != 'true'
         run: ./scripts/build-firecracker.sh
+      - name: Save Firecracker
+        if: steps.fc-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: artifacts/firecracker
+          key: ${{ steps.fc-cache.outputs.cache-primary-key }}
 
       # Guest kernel and base root filesystem (fetch.sh skips the stock Firecracker: the patched one is there).
-      - name: Cache downloads
-        uses: actions/cache@v4
+      - name: Restore downloads
+        id: dl-cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             artifacts/vmlinux
@@ -93,11 +102,19 @@ jobs:
           key: downloads-${{ hashFiles('scripts/fetch.sh') }}
       - name: Fetch kernel and base rootfs
         run: ./scripts/fetch.sh
+      - name: Save downloads
+        if: steps.dl-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            artifacts/vmlinux
+            artifacts/base.squashfs
+          key: ${{ steps.dl-cache.outputs.cache-primary-key }}
 
       # Root filesystem with flexvm-init: rebuilt only when the guest agent or the image recipe changes.
-      - name: Cache rootfs
+      - name: Restore rootfs
         id: rootfs-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             artifacts/rootfs-*.ext4
@@ -107,6 +124,15 @@ jobs:
       - name: Build rootfs
         if: steps.rootfs-cache.outputs.cache-hit != 'true'
         run: ./scripts/build-rootfs.sh
+      - name: Save rootfs
+        if: steps.rootfs-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            artifacts/rootfs-*.ext4
+            artifacts/rootfs.ext4
+            artifacts/flexvm-init
+          key: ${{ steps.rootfs-cache.outputs.cache-primary-key }}
 
       - name: Build flexvm
         run: cargo build --release -p flexvm
