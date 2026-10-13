@@ -497,7 +497,7 @@ impl Daemon {
         }
         let tpl = self.template(template)?;
         let claim = match ip {
-            Some(ip) => self.claim_given_ip(ip, true)?,
+            Some(ip) => self.claim_given_ip(ip, ClaimFor::Run)?,
             None => self.claim_ip()?,
         };
         let ip = claim.ip;
@@ -570,12 +570,12 @@ impl Daemon {
     }
 
     /// Reserves a given address: one picked with `run --ip` (checked against
-    /// the peers too, best effort) or a migrating VM's own (`incoming`).
-    /// A lent address coming back (`incoming`) is taken out of the lent set
-    /// only if the claim commits.
-    fn claim_given_ip(&self, ip: &str, ask_peers: bool) -> Result<IpClaim<'_>> {
+    /// the peers too, best effort), a restore's, or a migrating VM's own.
+    /// Only a VM migrating in may take a lent address (it is coming back),
+    /// and it leaves the lent set only if the claim commits.
+    fn claim_given_ip(&self, ip: &str, why: ClaimFor) -> Result<IpClaim<'_>> {
         let ip: Ipv4Addr = ip.parse().map_err(|_| format!("bad address {ip:?}"))?;
-        if ask_peers {
+        if why == ClaimFor::Run {
             for peer in &self.cfg.peers {
                 if peer_info(peer).is_ok_and(|info| info_ips(&info).any(|i| i == ip)) {
                     bail!("{ip} is in use on {peer}");
@@ -587,7 +587,7 @@ impl Daemon {
             bail!("{ip} is already in use here");
         }
         let was_lent = a.lent.contains(&ip);
-        if was_lent && ask_peers {
+        if was_lent && why != ClaimFor::Incoming {
             bail!("{ip} is in use on another host (lent out with a migrated vm)");
         }
         a.used.insert(ip);
@@ -598,10 +598,11 @@ impl Daemon {
     /// (restores): `want`, or the first free one in this host's range.
     pub(super) fn claim_ip_kept(&self, want: Option<&str>) -> Result<Ipv4Addr> {
         let claim = match want {
-            Some(ip) => self.claim_given_ip(ip, false)?,
+            Some(ip) => self.claim_given_ip(ip, ClaimFor::Restore)?,
             None => self.claim_ip()?,
         };
         let ip = claim.ip;
+        // Never a lent address (refused above), so this only marks it used.
         claim.commit();
         Ok(ip)
     }
@@ -864,7 +865,20 @@ impl Daemon {
         vm.settle_hotplug(settle + SETTLE_WAIT)?;
         let settle = settle.elapsed();
         let mig = migration_id();
-        vm.start_source(mig)?;
+        // Durably lent before the target can have the VM: if we crash with
+        // the outcome unknown, a restart must not hand the address out. A
+        // failure to record it stops the migration here. Undone only once
+        // this copy is known to stay (`abort_migration`).
+        let ours = self.cfg.vm_ips.contains(vm.ip);
+        if ours {
+            self.addrs.lock().unwrap().lend(vm.ip)?;
+        }
+        if let Err(e) = vm.start_source(mig) {
+            if ours {
+                self.addrs.lock().unwrap().unlend(vm.ip);
+            }
+            return Err(e);
+        }
         let mut t = Phases::new();
         let vmstate = vm.dir.join("vmstate.out");
         let prepared = (|| -> Result<_> {
@@ -954,6 +968,10 @@ impl Daemon {
             Err(r) => (State::Failed, format!("{e}; resuming it here failed too: {r}").into()),
         };
         *vm.state.lock().unwrap() = s;
+        // The VM stays here after all: its address is no longer lent.
+        if self.cfg.vm_ips.contains(vm.ip) {
+            self.addrs.lock().unwrap().unlend(vm.ip);
+        }
         if s == State::Running {
             // The guest clock missed the pause; fixed once the migration lets go of the VM.
             self.sync_clock_later(vm.clone());
@@ -1075,7 +1093,7 @@ impl Daemon {
             bail!("vm name {name:?} is taken here");
         }
         let tpl = self.migration_template(req, false)?;
-        let claim = self.claim_given_ip(req["ip"].as_str().ok_or("missing ip")?, false)?;
+        let claim = self.claim_given_ip(req["ip"].as_str().ok_or("missing ip")?, ClaimFor::Incoming)?;
         let ip = claim.ip;
         t.mark("claim_ip");
         let restored = (|| {
@@ -1479,25 +1497,43 @@ impl Addrs {
         Ok(Addrs { used: HashSet::new(), lent, file })
     }
 
-    /// A VM with `ip` left for another host; `ours` if `ip` is from our range.
+    /// Records `ip` as lent, durably, or fails (and records nothing).
+    fn lend(&mut self, ip: Ipv4Addr) -> Result<()> {
+        if !self.lent.insert(ip) {
+            return Ok(());
+        }
+        if let Err(e) = self.save() {
+            self.lent.remove(&ip);
+            bail!("cannot record {ip} as lent in {}: {e}", self.file.display());
+        }
+        Ok(())
+    }
+
+    /// A VM with `ip` left for another host; `ours` if `ip` is from our range
+    /// (then `migrate` has lent it already).
     fn move_out(&mut self, ip: Ipv4Addr, ours: bool) {
         self.used.remove(&ip);
         if ours && self.lent.insert(ip) {
-            self.save();
+            if let Err(e) = self.save() {
+                eprintln!("cannot record lent addresses in {}: {e}", self.file.display());
+            }
         }
     }
 
+    /// Frees a lent address. If that cannot be recorded, a restart only
+    /// keeps it taken for longer.
     fn unlend(&mut self, ip: Ipv4Addr) -> bool {
         let freed = self.lent.remove(&ip);
         if freed {
-            self.save();
+            if let Err(e) = self.save() {
+                eprintln!("cannot record lent addresses in {}: {e}", self.file.display());
+            }
         }
         freed
     }
 
-    /// Writes the lent set atomically and durably. A failure is logged: the
-    /// set in memory still holds, only a restart would forget it.
-    fn save(&self) {
+    /// Writes the lent set atomically and durably.
+    fn save(&self) -> std::io::Result<()> {
         let tmp = self.file.with_extension("tmp");
         let res = (|| -> std::io::Result<()> {
             let mut f = std::fs::File::create(&tmp)?;
@@ -1506,10 +1542,16 @@ impl Addrs {
             std::fs::rename(&tmp, &self.file)?;
             std::fs::File::open(self.file.parent().unwrap_or(Path::new(".")))?.sync_all()
         })();
-        if let Err(e) = res {
-            eprintln!("cannot record lent addresses in {}: {e}", self.file.display());
-        }
+        res
     }
+}
+
+/// Who wants a given address (`Daemon::claim_given_ip`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClaimFor {
+    Run,
+    Restore,
+    Incoming,
 }
 
 /// An address reserved for a VM being started or migrated in. Unless
