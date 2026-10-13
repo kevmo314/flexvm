@@ -377,7 +377,8 @@ fn start(statuses: &Statuses) -> io::Result<i32> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    // Keep the app (even as root) from reading flexvm-init's memory or ptracing it.
+    // Keep the app from reading flexvm-init's memory or ptracing it (a root
+    // app with CAP_SYS_PTRACE still can: root in the guest owns the guest).
     unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
     restrict(&mut cmd, &c, None);
     let mut child = spawn(&mut cmd, statuses, true).map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", c.argv[0])))?;
