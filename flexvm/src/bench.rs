@@ -71,6 +71,7 @@ pub fn run(host: &str, args: &Args) -> Result<()> {
     if to.is_some() {
         summary["migrate"] = summarize(&samples, "migrate")?;
         summary["migrate_target"] = summarize(&samples, "migrate_target")?;
+        summary["post_copy"] = summarize(&samples, "post_copy")?;
     }
     let report = json!({
         "date_utc": date,
@@ -128,7 +129,19 @@ fn iteration(
                 bail!("dirtying guest memory failed");
             }
         }
+        // The guest reads what it wrote, here and right after the migration
+        // (while its pages are still being pulled): the difference is how
+        // long post-copy faults stalled it.
+        let read = |h: &str| -> Result<f64> {
+            let t = Instant::now();
+            if crate::exec(h, name, "cat /tmp/dirty > /dev/null")? != 0 {
+                bail!("reading guest memory back failed");
+            }
+            Ok(ms(t.elapsed()))
+        };
+        let read_local = if dirty_mib > 0 { Some(read(host)?) } else { None };
         let migrated = rpc(host, json!({"op": "migrate", "name": name, "to": to}))?;
+        let read_after = if dirty_mib > 0 { Some(read(to)?) } else { None };
         // Wait for the full pull and for the source to drop its copy.
         let deadline = Instant::now() + timeout;
         let status = loop {
@@ -148,6 +161,24 @@ fn iteration(
         sample["migrate"]["downtime"] = migrated["downtime_ms"].clone();
         sample["migrate"]["background_pull"] = status["background_pull_ms"].clone();
         sample["migrate_target"] = migrated["target_timings_ms"].clone();
+        // Fault service on the target, by kind (see `uffd::FaultStats`).
+        let f = &status["faults"];
+        let mut post = json!({});
+        for kind in ["local", "remote", "wait", "fetch", "pull"] {
+            for stat in ["count", "sum_ms", "p50_us", "p99_us", "max_us"] {
+                post[format!("{kind}_{stat}")] = f[kind][stat].clone();
+            }
+        }
+        // How long vCPUs (and Firecracker's own threads) were blocked on
+        // missing pages in all.
+        let blocked: f64 = ["local", "remote", "wait"].iter().filter_map(|k| f[k]["sum_ms"].as_f64()).sum();
+        post["fault_blocked"] = json!(blocked);
+        if let (Some(local), Some(after)) = (read_local, read_after) {
+            post["read_local"] = json!(local);
+            post["read_after_migrate"] = json!(after);
+            post["stall"] = json!(after - local);
+        }
+        sample["post_copy"] = post;
     }
     rpc(to.unwrap_or(host), json!({"op": "kill", "name": name}))?;
     Ok(sample)

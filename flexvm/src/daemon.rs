@@ -753,6 +753,7 @@ impl Daemon {
                     "released": vm.released.get(),
                     "state": vm.state().name(),
                     "failed": vm.pager.failed(),
+                    "faults": vm.pager.fault_stats.report(),
                 })
             }),
             _ => Err(format!("unknown op {op:?}").into()),

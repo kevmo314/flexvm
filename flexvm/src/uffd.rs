@@ -211,6 +211,7 @@ pub struct Pages {
     /// checkpoint's pause (written after a write-protect fault, installed,
     /// or discarded). See `Pager::freeze`.
     dirty: Vec<AtomicU64>,
+    parked: Mutex<Vec<(usize, Option<Instant>)>>,
 }
 
 /// Pages per `touched` bit: one page of `states`.
@@ -222,7 +223,36 @@ impl Pages {
         let states = unsafe { std::mem::transmute::<Vec<u8>, Vec<AtomicU8>>(vec![0u8; n]) };
         let dirty = unsafe { std::mem::transmute::<Vec<u64>, Vec<AtomicU64>>(vec![0u64; n.div_ceil(64)]) };
         let touched = (0..n.div_ceil(CHUNK * 64)).map(|_| AtomicU64::new(0)).collect();
-        Pages { states, touched, events: RwLock::new(()), dirty }
+        Pages { states, touched, events: RwLock::new(()), dirty, parked: Mutex::new(Vec::new()) }
+    }
+
+    fn park(&self, page: usize, read: Instant) {
+        let mut parked = self.parked.lock().unwrap();
+        match parked.iter_mut().find(|(p, _)| *p == page) {
+            Some((_, woke)) => {
+                if woke.is_some_and(|t| t < read) {
+                    *woke = None;
+                }
+            }
+            None => parked.push((page, None)),
+        }
+    }
+
+    fn unpark(&self, page: usize, read: Instant) -> Option<Instant> {
+        let mut parked = self.parked.lock().unwrap();
+        let i = parked.iter().position(|(p, _)| *p == page)?;
+        parked.swap_remove(i).1.filter(|&t| t >= read)
+    }
+
+    fn woke(&self, first: usize, n: usize) {
+        let mut parked = self.parked.lock().unwrap();
+        if parked.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        for (_, woke) in parked.iter_mut().filter(|(p, w)| (first..first + n).contains(p) && w.is_none()) {
+            *woke = Some(now);
+        }
     }
 
     pub fn mark_dirty(&self, page: usize) {
@@ -388,6 +418,7 @@ impl Pages {
             match populate(i, m) {
                 Ok(done) => {
                     let done = done.clamp(1, m);
+                    self.woke(i, done);
                     resolved += (i..i + done).filter(|&p| self.settle(p, true, from)).count();
                     i += done;
                 }
@@ -405,6 +436,90 @@ impl Pages {
         }
         (resolved, Ok(()))
     }
+}
+
+/// Fault service latency kinds: served from the template, zero or a present
+/// page; fetched by the fault itself from the VM's origin; waited for
+/// another installer (a puller, the prefetch); write-protect faults. And
+/// not faults: how long each fetch for a fault, and each background pull
+/// request, took.
+const KINDS: [&str; 6] = ["local", "remote", "wait", "wp", "fetch", "pull"];
+const LOCAL: usize = 0;
+const FETCHED: usize = 1;
+const WAITED: usize = 2;
+const WP: usize = 3;
+const FETCH: usize = 4;
+const PULL: usize = 5;
+/// Histogram buckets per doubling of latency: 1 << SUB_BITS.
+const SUB_BITS: u32 = 2;
+const BUCKETS: usize = 40 << SUB_BITS;
+
+/// How long faults took to serve, from reading the event to resolving it,
+/// per kind: counts, sums and a log-scale histogram (19% resolution).
+pub struct FaultStats {
+    kinds: [Kind; KINDS.len()],
+}
+
+struct Kind {
+    sum_ns: AtomicU64,
+    max_ns: AtomicU64,
+    hist: [AtomicU64; BUCKETS],
+}
+
+impl FaultStats {
+    fn new() -> FaultStats {
+        let kind = || Kind { sum_ns: AtomicU64::new(0), max_ns: AtomicU64::new(0), hist: std::array::from_fn(|_| AtomicU64::new(0)) };
+        FaultStats { kinds: std::array::from_fn(|_| kind()) }
+    }
+
+    fn record(&self, kind: usize, took: Duration) {
+        let ns = (took.as_nanos() as u64).max(1);
+        let k = &self.kinds[kind];
+        k.sum_ns.fetch_add(ns, Ordering::Relaxed);
+        k.max_ns.fetch_max(ns, Ordering::Relaxed);
+        k.hist[bucket(ns)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Per kind: how many, their total and p50/p90/p99/max, in µs.
+    pub fn report(&self) -> serde_json::Value {
+        let mut out = serde_json::Map::new();
+        for (name, k) in KINDS.iter().zip(&self.kinds) {
+            let hist: Vec<u64> = k.hist.iter().map(|h| h.load(Ordering::Relaxed)).collect();
+            let count: u64 = hist.iter().sum();
+            let pct = |p: u64| {
+                let rank = (count * p).div_ceil(100).max(1);
+                let mut seen = 0;
+                let i = hist.iter().position(|&h| {
+                    seen += h;
+                    seen >= rank
+                });
+                i.map_or(0.0, |i| bucket_floor(i) as f64 / 1e3)
+            };
+            let v = serde_json::json!({
+                "count": count,
+                "sum_ms": k.sum_ns.load(Ordering::Relaxed) as f64 / 1e6,
+                "p50_us": pct(50), "p90_us": pct(90), "p99_us": pct(99),
+                "max_us": k.max_ns.load(Ordering::Relaxed) as f64 / 1e3,
+            });
+            out.insert(name.to_string(), v);
+        }
+        out.into()
+    }
+}
+
+/// The histogram bucket of `ns`: four per power of two (anything under
+/// 4 ns counts as 4).
+fn bucket(ns: u64) -> usize {
+    let ns = ns.max(1 << SUB_BITS);
+    let log = 63 - ns.leading_zeros();
+    let frac = (ns >> (log - SUB_BITS)) & ((1 << SUB_BITS) - 1);
+    (((log as usize) << SUB_BITS) + frac as usize).min(BUCKETS - 1)
+}
+
+/// The smallest latency in bucket `i`, in nanoseconds.
+fn bucket_floor(i: usize) -> u64 {
+    let (log, frac) = (i as u32 >> SUB_BITS, (i as u64) & ((1 << SUB_BITS) - 1));
+    (((1u64 << SUB_BITS) + frac) << log) >> SUB_BITS
 }
 
 /// How long a Firecracker has to connect to its pager once started.
@@ -471,6 +586,8 @@ pub struct Pager {
     learning: AtomicBool,
     /// The prefetch, held back until `loaded` while learning: (loaded, due).
     prefetch: Mutex<(bool, bool)>,
+    /// How long faults took to serve.
+    pub fault_stats: FaultStats,
 }
 
 /// What `Pager::freeze` captured for a checkpoint.
@@ -533,6 +650,7 @@ impl Pager {
             awaiting_seed: AtomicBool::new(false),
             learning: AtomicBool::new(false),
             prefetch: Mutex::new((false, false)),
+            fault_stats: FaultStats::new(),
         });
         let p = pager.clone();
         let thread = thread::Builder::new().name("uffd".into()).spawn(move || {
@@ -983,7 +1101,7 @@ impl Pager {
     }
 
     fn pages(&self) -> &Pages {
-        static EMPTY: Pages = Pages { states: Vec::new(), touched: Vec::new(), events: RwLock::new(()), dirty: Vec::new() };
+        static EMPTY: Pages = Pages { states: Vec::new(), touched: Vec::new(), events: RwLock::new(()), dirty: Vec::new(), parked: Mutex::new(Vec::new()) };
         self.pages.get().unwrap_or(&EMPTY)
     }
 
@@ -1082,8 +1200,10 @@ impl Pager {
             self.clone().spawn_pullers();
         }
         let fd = self.fd();
-        // Faults to retry (address, flags), with when they first failed other than with EAGAIN.
-        let mut pending: VecDeque<(u64, u64, Option<Instant>)> = VecDeque::new();
+        // Faults to retry: (address, flags, when it was read, whether it
+        // waited for another installer), with when it first failed other
+        // than with EAGAIN.
+        let mut pending: VecDeque<(u64, u64, Instant, bool, Option<Instant>)> = VecDeque::new();
         let mut buf = [0u8; 32 * 64];
         while !self.stop.load(Ordering::SeqCst) {
             let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
@@ -1119,7 +1239,7 @@ impl Pager {
                                         self.base.note_load_fault(page as u64);
                                     }
                                 }
-                                pending.push_back((b, a, None))
+                                pending.push_back((b, a, Instant::now(), false, None))
                             }
                             UFFD_EVENT_REMOVE => self.discard(&removing, a, b),
                             _ => {}
@@ -1131,10 +1251,18 @@ impl Pager {
             // Other errors (say ENOMEM) are retried for a while: a dropped
             // fault would block its vCPU forever.
             for _ in 0..pending.len() {
-                let (addr, flags, since) = pending.pop_front().unwrap();
+                let (addr, flags, read, waited, since) = pending.pop_front().unwrap();
                 match self.fault(addr, flags) {
-                    Ok(()) => {}
-                    Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => pending.push_back((addr, flags, since)),
+                    Ok(kind) => {
+                        let woke = self.page_of(addr).filter(|_| waited).and_then(|(page, _)| self.pages().unpark(page, read));
+                        self.fault_stats.record(if waited && kind != WP { WAITED } else { kind }, woke.unwrap_or_else(Instant::now) - read)
+                    }
+                    Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => {
+                        if let Some((page, _)) = self.page_of(addr).filter(|(page, _)| matches!(self.pages().get(*page), INFLIGHT | DISCARDED)) {
+                            self.pages().park(page, read);
+                        }
+                        pending.push_back((addr, flags, read, true, since))
+                    }
                     // Firecracker unmapped guest memory (tearing down a failed load, or exiting).
                     Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) && self.unmapped(addr, PAGE_SIZE) => {
                         return self.gone()
@@ -1143,12 +1271,15 @@ impl Pager {
                     Err(e) => match since {
                         None => {
                             eprintln!("uffd: fault at {addr:#x}: {e}; retrying");
-                            pending.push_back((addr, flags, Some(Instant::now())));
+                            pending.push_back((addr, flags, read, waited, Some(Instant::now())));
                         }
-                        Some(t) if t.elapsed() < FAULT_TIMEOUT => pending.push_back((addr, flags, since)),
+                        Some(t) if t.elapsed() < FAULT_TIMEOUT => pending.push_back((addr, flags, read, waited, since)),
                         Some(_) => return self.fail(format!("fault at {addr:#x}: {e}")),
                     },
                 }
+            }
+            if pending.is_empty() {
+                self.pages().parked.lock().unwrap().clear();
             }
         }
     }
@@ -1177,13 +1308,14 @@ impl Pager {
         self.pulled(resolved);
     }
 
-    fn fault(&self, addr: u64, flags: u64) -> io::Result<()> {
+    /// Serves a fault; returns its kind (`KINDS`).
+    fn fault(&self, addr: u64, flags: u64) -> io::Result<usize> {
         let Some((page, m)) = self.page_of(addr) else {
             return Err(io::Error::other("fault outside guest memory"));
         };
         let _wp = self.wp.lock().unwrap();
         if flags & UFFD_PAGEFAULT_FLAG_WP != 0 {
-            return self.wp_fault(page, m);
+            return self.wp_fault(page, m).map(|()| WP);
         }
         // Runs stay within a 2 MiB chunk: Firecracker keeps unplugged
         // virtio-mem slots PROT_NONE, which splits the region into VMAs at
@@ -1204,12 +1336,12 @@ impl Pager {
                     false => self.populate(page, 1, None),
                 };
                 match res {
-                    Err(e) if e.raw_os_error() == Some(libc::EEXIST) => self.wake(page, 1),
+                    Err(e) if e.raw_os_error() == Some(libc::EEXIST) => self.wake(page, 1).map(|()| LOCAL),
                     r => {
                         if r.is_ok() && !unsaved {
                             pages.mark_dirty(page);
                         }
-                        r.map(drop)
+                        r.map(|_| LOCAL)
                     }
                 }
             }
@@ -1223,6 +1355,7 @@ impl Pager {
                 let mut buf = vec![0u8; n * PAGE_SIZE];
                 // Claimed REMOTE pages keep the file (see `pulled`).
                 let file = self.file.lock().unwrap().clone();
+                let started = Instant::now();
                 let fetched = match file {
                     Some(file) => file.read(page, &mut buf, false),
                     None if self.from_file.load(Ordering::SeqCst) => Err(io::Error::other("checkpoint file already released")),
@@ -1231,6 +1364,7 @@ impl Pager {
                         None => Err(io::Error::other("no migration source")),
                     },
                 };
+                self.fault_stats.record(FETCH, started.elapsed());
                 if let Err(e) = fetched {
                     let resolved = pages.release(page, n, REMOTE);
                     self.pulled(resolved);
@@ -1240,7 +1374,7 @@ impl Pager {
                 let src = |p: usize, c: usize| &buf[(p - page) * PAGE_SIZE..(p - page + c) * PAGE_SIZE];
                 let (resolved, res) = pages.install(page, n, REMOTE, None, |p, c| self.populate(p, c, Some(src(p, c))));
                 self.pulled(resolved);
-                res
+                res.map(|()| FETCHED)
             }
             state => {
                 // BASE or ZERO: serve a run of neighbours with the same source.
@@ -1256,7 +1390,7 @@ impl Pager {
                     self.template_next.store(page + n, Ordering::Relaxed);
                 }
                 let src = |p: usize, c: usize| from_template.then(|| self.base.pages(p, c));
-                pages.install(page, n, state, None, |p, c| self.populate(p, c, src(p, c))).1
+                pages.install(page, n, state, None, |p, c| self.populate(p, c, src(p, c))).1.map(|()| LOCAL)
             }
         }
     }
@@ -1782,7 +1916,10 @@ impl Pager {
             return Ok(i + 1);
         }
         let b = &mut buf[..n * PAGE_SIZE];
-        if let Err(e) = fetch((i * PAGE_SIZE) as u64, b, &self.stop) {
+        let started = Instant::now();
+        let fetched = fetch((i * PAGE_SIZE) as u64, b, &self.stop);
+        self.fault_stats.record(PULL, started.elapsed());
+        if let Err(e) = fetched {
             let resolved = pages.release(i, n, REMOTE);
             self.pulled(resolved);
             if resolved < n {
@@ -2141,6 +2278,27 @@ mod tests {
 
     fn discard(p: &Pages, page: usize) -> bool {
         p.discard(&p.removing(), page)
+    }
+
+    #[test]
+    fn fault_latency_buckets() {
+        for ns in [4u64, 5, 7, 8, 15, 16, 17, 100, 999, 1000, 123_456, 10_000_000_000] {
+            let b = bucket(ns);
+            assert!(bucket_floor(b) <= ns && ns < bucket_floor(b + 1), "{ns}: bucket {b} [{}, {})", bucket_floor(b), bucket_floor(b + 1));
+        }
+        let s = FaultStats::new();
+        for us in 1..=100 {
+            s.record(FETCHED, Duration::from_micros(us));
+        }
+        s.record(WAITED, Duration::from_millis(3));
+        let r = s.report();
+        assert_eq!(r["remote"]["count"], 100);
+        let p50 = r["remote"]["p50_us"].as_f64().unwrap();
+        assert!((40.0..=50.0).contains(&p50), "{p50}");
+        assert_eq!(r["remote"]["max_us"], 100.0);
+        assert_eq!(r["wait"]["count"], 1);
+        assert_eq!(r["local"]["count"], 0);
+        assert_eq!(r["local"]["p99_us"], 0.0);
     }
 
     #[test]
