@@ -170,11 +170,10 @@ fn is_local_addr(ip: Ipv4Addr) -> Result<bool> {
 /// a network namespace also share routes: never replace the target's tap
 /// route with a route through this same host.
 pub fn route_via(ip: Ipv4Addr, via: Ipv4Addr) -> Result<()> {
-    if is_local_addr(via)? {
+    // Not knowing is no reason to leave a peer's VM unrouted.
+    if is_local_addr(via).unwrap_or(false) {
         static LOGGED: std::sync::Once = std::sync::Once::new();
-        if std::env::var("FLEXVM_DEBUG").is_ok_and(|v| v == "1") {
-            LOGGED.call_once(|| eprintln!("debug: skipping route {ip}/32 via local address {via}; preserving tap route"));
-        }
+        LOGGED.call_once(|| eprintln!("not routing {ip} via {via}: a local address (daemons sharing a host); this is logged once"));
         return Ok(());
     }
     let mut route = rtmsg(RT_SCOPE_UNIVERSE);

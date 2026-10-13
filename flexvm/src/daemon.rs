@@ -442,6 +442,11 @@ fn live_netns() -> HashSet<u64> {
 
 fn setup_cgroups(listen: &str) -> Option<PathBuf> {
     let setup = || -> Result<PathBuf> {
+        // Not a cgroup2 root (cgroup v1's tmpfs would take the writes below
+        // as plain files), or none at all (`ip netns exec`'s fresh sysfs).
+        if !Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
+            bail!("no cgroup2 hierarchy mounted at /sys/fs/cgroup");
+        }
         let root = PathBuf::from("/sys/fs/cgroup/flexvm");
         std::fs::create_dir_all(&root).map_err(|e| format!("create {}: {e}", root.display()))?;
         std::fs::write(root.join("cgroup.subtree_control"), "+cpu +memory")
