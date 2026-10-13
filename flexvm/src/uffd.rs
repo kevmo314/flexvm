@@ -157,6 +157,7 @@ pub struct Source {
     pub mig: u64,
     /// The source's guest memory regions as `(offset, size)`; the target's
     /// must be the same, or the page map would not cover the saved state.
+    /// Empty when the source did not say (not checked then).
     pub regions: Vec<(u64, u64)>,
 }
 
@@ -647,7 +648,7 @@ impl Pager {
         if let Some((runs, origin)) = initial {
             if let Origin::Peer(source) = &origin {
                 let ours = regions(&mappings);
-                if source.regions != ours {
+                if !source.regions.is_empty() && source.regions != ours {
                     bail!("guest memory regions {ours:?} differ from the source's {:?}", source.regions);
                 }
             }
