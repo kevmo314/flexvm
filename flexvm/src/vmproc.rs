@@ -695,8 +695,11 @@ impl Proc {
                     bail!("vm {} is not running here", vm.name);
                 }
                 *vm.last_resize.lock().unwrap() = Instant::now();
-                let mib = req["mib"].as_u64().ok_or("missing mib")?;
-                vm.fc(|fc| fc.patch("/hotplug/memory", json!({"requested_size_mib": mib})))
+                // At most the template's ceiling; says what it set.
+                let meta = &vm.template.meta;
+                let mib = req["mib"].as_u64().ok_or("missing mib")?.min(meta.max_mib - meta.mem_mib);
+                vm.fc(|fc| fc.patch("/hotplug/memory", json!({"requested_size_mib": mib})))?;
+                Ok(json!({"requested_mib": mib}))
             }
             "status" => Ok(json!({
                 "state": vm.state().name(),
