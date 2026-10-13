@@ -3,7 +3,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, Shutdown};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -107,6 +107,11 @@ pub struct Vm {
     /// The pager's discard count just before the last snapshot: a discard
     /// after it means the saved state and memory may disagree.
     pub snapshot_discards: AtomicU64,
+    /// The last checkpoint taken of this VM here while write tracking ran
+    /// (its directory and id), which the next one can be a delta against.
+    pub last_checkpoint: Mutex<Option<(PathBuf, String)>>,
+    /// Kills waiting: a checkpoint in progress gives up (and clears it).
+    pub cancel_checkpoint: AtomicUsize,
 }
 
 impl Vm {
@@ -217,6 +222,8 @@ impl Vm {
             clock_pending: AtomicBool::new(false),
             pending_net: Mutex::new(None),
             snapshot_discards: AtomicU64::new(0),
+            last_checkpoint: Mutex::new(None),
+            cancel_checkpoint: AtomicUsize::new(0),
         })
     }
 
@@ -676,6 +683,8 @@ impl Vm {
             "guest_mib": self.template.meta.mem_mib + hotplug["plugged_size_mib"].as_u64().unwrap_or(0),
             "max_mib": self.template.meta.max_mib,
             "pages_mib": {"base": mib(base), "present": mib(present), "zero": mib(zero), "remote": mib(remote + inflight + discarded)},
+            "checkpoint_copy": self.pager.copying(),
+            "write_tracking": self.pager.tracking(),
         })
     }
 }

@@ -17,6 +17,7 @@
 //! target, which pulls all its pages before it can run.
 
 use super::*;
+use crate::uffd::Frozen;
 use crate::util::PAGE_SIZE;
 
 impl Daemon {
@@ -164,7 +165,11 @@ impl Daemon {
     }
 
     /// Checkpoints `name` to `dir`, then resumes it or (`stop`) kills it.
-    pub(super) fn checkpoint(self: &Arc<Self>, name: &str, dir: &str, stop: bool) -> Result<Value> {
+    /// A VM that runs on is paused only to save its state and arm
+    /// copy-on-write; its pages are written while it runs. `incremental`
+    /// writes only what changed since its last such checkpoint, as a delta
+    /// against it.
+    pub(super) fn checkpoint(self: &Arc<Self>, name: &str, dir: &str, stop: bool, incremental: bool) -> Result<Value> {
         // Counted, so a shutdown lets it finish first.
         let _op = self.admit()?;
         let mut t = Phases::new();
@@ -173,15 +178,15 @@ impl Daemon {
         let staging = Staging::new(Path::new(dir), vm.dir.join("checkpoint.vmstate"))?;
         let dest = staging.dest().to_path_buf();
         t.mark("prepare");
-        let (m, paused) = self.save(&vm, staging, &mut t)?;
+        let saved = self.save(&vm, staging, !stop, incremental, &mut t)?;
+        let m = &saved.manifest;
         let state = if stop {
             self.kill_reserved(name)?;
             t.mark("stop");
             "stopped"
         } else {
-            let s = vm.end_checkpoint()?;
-            t.mark("resume");
             drop(busy);
+            let s = vm.state();
             if s == State::Running {
                 self.sync_clock_later(vm.clone());
             }
@@ -191,13 +196,32 @@ impl Daemon {
             "name": name,
             "dir": dest,
             "state": state,
-            "paused_ms": ms(paused.elapsed()),
+            "paused_ms": ms(saved.paused),
             "checkpoint_ms": ms(t.total()),
             "data_mib": (m.data_pages * PAGE_SIZE as u64) >> 20,
             "zero_mib": (m.zero_pages * PAGE_SIZE as u64) >> 20,
             "vmstate_kib": m.files["vmstate"].len >> 10,
+            "incremental": m.parent.is_some(),
+            "parent": m.parent.as_ref().map(|p| &p.path),
+            "id": saved.id,
+            "dirty_mib": (saved.dirty * PAGE_SIZE) >> 20,
+            "protect": {"ranges": saved.protected, "ms": ms(saved.protect)},
+            "copy": saved.copy,
+            "pause_memhash": saved.memhash,
             "timings_ms": t.json(),
         }))
+    }
+
+    /// Test hook (FLEXVM_FAULTS=1): the canonical hash of the memory a
+    /// checkpoint (chain) restores, to compare with `pause_memhash`.
+    pub(super) fn ckhash(&self, dir: &str) -> Result<Value> {
+        if self.faults.is_none() {
+            bail!("ckhash is a test hook (start the daemon with FLEXVM_FAULTS=1)");
+        }
+        let ck = Checkpoint::open(Path::new(dir))?;
+        let tpl = self.template(&ck.manifest.template)?;
+        tpl.check_id(&ck.manifest.template_id)?;
+        Ok(json!({"hash": ck.content_hash(&tpl)?, "id": ck.id, "chain": ck.chain, "data_pages": ck.data_pages()}))
     }
 
     /// Suspends `name` to local disk and frees its memory.
@@ -213,7 +237,7 @@ impl Daemon {
         let rss = vm.rss();
         let dest = self.cfg.state_dir.join("suspended").join(name);
         let staging = Staging::new(&dest, vm.dir.join("checkpoint.vmstate"))?;
-        let (manifest, _) = self.save(&vm, staging, &mut t)?;
+        let manifest = self.save(&vm, staging, false, false, &mut t)?.manifest;
         // The checkpoint is durable; only now let go of the memory. The pager
         // stops before Firecracker dies, and its page states are never read
         // again: a resume pages in from the checkpoint.
@@ -287,6 +311,7 @@ impl Daemon {
     /// whether the VM's vCPUs ran.
     fn restore_checkpoint(&self, name: &str, ck: Checkpoint, ip: Ipv4Addr, owned: bool, hold: bool, t: &mut Phases) -> std::result::Result<Value, Restore> {
         let m = ck.manifest.clone();
+        let to_load = (ck.data_pages() * PAGE_SIZE as u64) >> 20;
         let (vm, restore) = (|| -> Result<_> {
             let tpl = self.template_with_id(&m.template, &m.template_id)?;
             tpl.check_id(&m.template_id)?;
@@ -374,7 +399,6 @@ impl Daemon {
         let clock = vm.sync_clock(CLOCK_TOLERANCE, Instant::now() + CLOCK_DEADLINE);
         t.mark("clock");
         self.announce(ip);
-        let to_load = (m.data_pages * PAGE_SIZE as u64) >> 20;
         let state = vm.state().name();
         thread::spawn(move || {
             let pulled = vm.pager.wait_pulled();
@@ -399,11 +423,50 @@ impl Daemon {
         }))
     }
 
-    /// Checkpoints `vm` through `staging`, leaving it in `Checkpointing`
-    /// (or as it was, on failure; or failed, if a checkpoint may have been
-    /// published that could not be revoked). Returns the manifest and when
-    /// it paused.
-    fn save(&self, vm: &Vm, mut staging: Staging, t: &mut Phases) -> Result<(Manifest, Instant)> {
+    /// Checkpoints `vm` through `staging`. Without `cow` it stays paused for
+    /// the write and is left in `Checkpointing` (or as it was, on failure; or
+    /// failed, if a checkpoint may have been published that could not be
+    /// revoked). With `cow` it is paused only until memory is frozen
+    /// (write-protected), then goes back to running (or paused) while the
+    /// pages are written. `incremental` writes a delta against the VM's last
+    /// checkpoint here.
+    fn save(&self, vm: &Arc<Vm>, mut staging: Staging, cow: bool, incremental: bool, t: &mut Phases) -> Result<Saved> {
+        let parent = match incremental {
+            false => None,
+            true => {
+                let last = vm.last_checkpoint.lock().unwrap().clone();
+                let Some((dir, id)) = last.filter(|_| vm.pager.tracking()) else {
+                    bail!("vm {} has no checkpoint to build on: take a full one with --keep-running first (an incremental checkpoint builds on the last one taken of the vm on this host, since it was last restored or migrated, that the vm ran on after)", vm.name)
+                };
+                // The whole chain must restore: every link verified, and room
+                // for one more.
+                let ck = Checkpoint::open(&dir).map_err(|e| format!("the last checkpoint of vm {}: {e}; take a full one", vm.name))?;
+                if ck.id != id {
+                    bail!("the last checkpoint of vm {}, {}, has changed; take a full one", vm.name, dir.display());
+                }
+                if ck.chain.len() + 2 > crate::checkpoint::MAX_CHAIN {
+                    bail!("vm {}: a delta on {} would make a chain of more than {} checkpoints; take a full one", vm.name, dir.display(), crate::checkpoint::MAX_CHAIN);
+                }
+                // Page data is checked as it is read: for a VM that stops
+                // after this checkpoint, read the pages it inherits now, so
+                // it is never stopped onto a chain that cannot restore. (A
+                // VM that runs on keeps its memory either way.)
+                if !cow {
+                    ck.verify_data().map_err(|e| format!("the last checkpoint of vm {}: {e}; take a full one", vm.name))?;
+                    t.mark("verify_chain");
+                }
+                let mut ids = vec![ck.id.clone()];
+                ids.extend(ck.chain_ids.iter().cloned());
+                let parent = crate::checkpoint::Parent { path: crate::checkpoint::parent_path(staging.dest(), &dir), id };
+                Some((parent, ids))
+            }
+        };
+        let cancelled = || -> Result<()> {
+            if vm.cancel_checkpoint.swap(0, Ordering::SeqCst) > 0 {
+                bail!("vm {} is being killed", vm.name);
+            }
+            Ok(())
+        };
         // A VM still pulling memory from a migration source or its own
         // checkpoint finishes that first.
         if vm.pager.remote_left() > 0 && !vm.pager.wait_pulled_for(DRAIN_WAIT) {
@@ -418,30 +481,150 @@ impl Daemon {
         vm.settle_hotplug(Instant::now() + SETTLE_WAIT)?;
         t.mark("settle_hotplug");
         // Disk space for the pages it has now, while it still runs.
-        staging.preallocate(vm.pager.census()[crate::uffd::PRESENT as usize])?;
+        let present = vm.pager.census()[crate::uffd::PRESENT as usize];
+        staging.preallocate(if incremental { present.min(vm.pager.dirty_count()) } else { present })?;
         t.mark("preallocate");
+        if cow {
+            // Write-protect everything while the VM still runs, so the pause
+            // only re-protects what it writes from here on. Arming starts the
+            // dirty history afresh: until a full checkpoint succeeds after it,
+            // there is no base for a delta.
+            if !vm.pager.tracking() {
+                *vm.last_checkpoint.lock().unwrap() = None;
+            }
+            vm.pager.arm_tracking()?;
+            t.mark("arm_tracking");
+        }
         let plugged = vm.hotplug_plugged();
+        cancelled()?;
         vm.start_checkpoint()?;
         let paused = Instant::now();
-        let saved = vm.save_state(&staging.vmstate(), true).map_err(CommitError::Failed).and_then(|runs| {
+        // A checkpoint that fails gives back the dirty pages it took (see
+        // `Pager::unfreeze`), so the last checkpoint stays the base of the
+        // next delta; one that succeeds becomes it.
+        let mut memhash = None;
+        let frozen = (|| -> Result<Frozen> {
+            let runs = vm.save_state(&staging.vmstate(), false)?;
             t.mark("snapshot");
-            // A discard (balloon or virtio-mem) or resize from just before the
-            // snapshot on would make the pages disagree with the saved state:
-            // never publish such a checkpoint (the next attempt can succeed).
-            let discards = vm.snapshot_discards.load(Ordering::SeqCst);
-            staging.commit(vm, &runs, t, || {
-                if vm.pager.discards() != discards || vm.hotplug_plugged() != plugged {
-                    bail!("guest memory changed after the vm was paused (a device discarded pages); try again");
+            if self.fault("ckpt_memhash") {
+                memhash = Some(vm.pager.content_hash()?);
+                t.mark("memhash");
+            }
+            if self.fault("ckpt_fail_protect") {
+                vm.pager.fail_protect.store(true, Ordering::SeqCst);
+            }
+            let frozen = vm.pager.freeze(&runs, incremental, cow)?;
+            t.mark("freeze");
+            // A discard (balloon or virtio-mem) from just before the snapshot
+            // on would make the pages disagree with the saved state.
+            let checked = match vm.pager.discards() != vm.snapshot_discards.load(Ordering::SeqCst) {
+                true => Err("guest memory changed after the vm was paused (a device discarded pages); try again".into()),
+                false => cancelled(),
+            };
+            if let Err(e) = checked {
+                vm.pager.unfreeze(&frozen);
+                return Err(e);
+            }
+            Ok(frozen)
+        })();
+        let frozen = match frozen {
+            Ok(f) => f,
+            Err(e) => {
+                return Err(match vm.end_checkpoint() {
+                    Ok(_) => e,
+                    Err(r) => format!("{e}; {r}").into(),
+                });
+            }
+        };
+        let mut pause = None;
+        if cow {
+            if let Err(e) = vm.end_checkpoint() {
+                vm.pager.unfreeze(&frozen);
+                return Err(e);
+            }
+            pause = Some(paused.elapsed());
+            t.mark("resume");
+            if self.fault("ckpt_abort") {
+                // Test: give the copy up half way through.
+                let (pager, c) = (vm.pager.clone(), frozen.cow.clone().unwrap());
+                let half = c.left() / 2;
+                thread::spawn(move || {
+                    let start = Instant::now();
+                    while c.left() > half && c.active() && start.elapsed() < Duration::from_secs(10) {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    pager.abort_copy();
+                });
+            }
+        }
+        let cow_pages = frozen.cow.as_deref().map(|c| crate::cow::CowPages { guest: vm.pager.as_ref(), cow: c, slow: self.fault("ckpt_slow") });
+        let src: &dyn crate::checkpoint::GuestPages = match &cow_pages {
+            Some(c) => c,
+            None => vm.pager.as_ref(),
+        };
+        let snapshot_discards = vm.snapshot_discards.load(Ordering::SeqCst);
+        let dest = staging.dest().to_path_buf();
+        let (parent, links) = parent.unzip();
+        let pinned = staging.pinned_dir();
+        let parent_ref = parent.clone();
+        let committed = staging.commit(vm, src, &frozen.runs, parent, plugged.unwrap_or(0), t, || {
+            cancelled()?;
+            if self.fault("ckpt_fail_write") {
+                bail!("injected fault: writing the checkpoint failed");
+            }
+            // The chain this delta needs must still be there, unchanged.
+            // Walked as a restore will: from this checkpoint's own reference
+            // to its parent, through each manifest's.
+            if let (Some(p), Some(ids)) = (&parent_ref, &links) {
+                // (This checkpoint's directory exists only once published,
+                // as a plain directory in the pinned one, so `../NAME` is
+                // NAME in that.)
+                let first = match p.path.strip_prefix("../") {
+                    Some(name) => pinned.join(name),
+                    None => PathBuf::from(&p.path),
+                };
+                let now = crate::checkpoint::chain_ids(&first);
+                if now.as_ref().ok() != Some(ids) {
+                    bail!("the checkpoints this delta builds on changed or went ({}); take a full one", now.err().map_or("other ids".into(), |e| e.to_string()));
                 }
-                Ok(())
-            })
+            }
+            match &frozen.cow {
+                // Discards while it runs are fine once the pages they hit were saved.
+                Some(c) => {
+                    if let Some(why) = c.error() {
+                        bail!("{why}; try again");
+                    }
+                }
+                None if vm.pager.discards() != snapshot_discards => {
+                    bail!("guest memory changed after the vm was paused (a device discarded pages); try again")
+                }
+                None => {}
+            }
+            if vm.hotplug_plugged() != plugged {
+                bail!("guest memory was resized during the checkpoint; try again");
+            }
+            Ok(())
         });
-        match saved {
-            Ok(m) => Ok((m, paused)),
+        let copy = frozen.cow.as_ref().map(|c| c.report());
+        match &committed {
+            Ok(_) => vm.pager.end_copy(),
+            Err(_) => vm.pager.unfreeze(&frozen),
+        }
+        let paused = pause.unwrap_or_else(|| paused.elapsed());
+        match committed {
+            Ok((manifest, id)) => {
+                // The new base of deltas, if the VM runs on with tracking.
+                *vm.last_checkpoint.lock().unwrap() = cow.then(|| (dest, id.clone()));
+                Ok(Saved { manifest, id, paused, dirty: frozen.dirty, protected: frozen.protected, protect: frozen.protect, copy, memhash })
+            }
+            Err(CommitError::Failed(e)) if cow => Err(e),
             Err(CommitError::Failed(e)) => match vm.end_checkpoint() {
                 Ok(_) => Err(e),
                 Err(r) => Err(format!("{e}; {r}").into()),
             },
+            // Running on already: a checkpoint that may reappear after a
+            // crash is one of a VM that went on running, as any other is.
+            Err(CommitError::Uncertain(e)) if cow => Err(format!("{e}; the checkpoint may reappear after a crash").into()),
             Err(CommitError::Uncertain(e)) => {
                 vm.set_failed();
                 Err(format!("{e}; vm {} stays paused and is marked failed, as the checkpoint may come back", vm.name).into())
@@ -507,6 +690,23 @@ impl Daemon {
             }
         });
     }
+}
+
+/// What `Daemon::save` wrote.
+pub(super) struct Saved {
+    pub manifest: Manifest,
+    pub id: String,
+    /// Write-protect ranges re-armed in the pause, and how long that took.
+    pub protected: usize,
+    pub protect: Duration,
+    /// How long the VM was paused.
+    pub paused: Duration,
+    /// Pages dirtied since the previous checkpoint's pause.
+    pub dirty: usize,
+    /// Copy-on-write statistics, when the VM ran on during the write.
+    pub copy: Option<Value>,
+    /// Test hook: the canonical hash of memory at the pause.
+    pub memhash: Option<String>,
 }
 
 /// How a restore failed: before the VM's vCPUs ever ran, or after.

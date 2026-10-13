@@ -18,6 +18,15 @@
 //!
 //! The pager also reads PRESENT pages out of the (paused) Firecracker process
 //! with process_vm_readv so this host can act as a migration source.
+//!
+//! Write tracking: once a VM has been checkpointed while running, its memory
+//! is also registered for write-protect faults on Firecracker's userfaultfd
+//! (no feature has to be negotiated for that at UFFDIO_API time), and every
+//! populated page is protected at each checkpoint's pause. A write fault
+//! unprotects a block of pages and marks them dirty; so do installs and
+//! discards. The next checkpoint can then save only the dirty pages, and a
+//! checkpoint of a running VM saves pages before the guest overwrites them
+//! (see `cow`).
 
 use std::collections::VecDeque;
 use std::io::{self, IoSliceMut, Read, Write};
@@ -34,6 +43,7 @@ use serde::Deserialize;
 
 use crate::bail;
 use crate::checkpoint::PageFile;
+use crate::cow::{Cow, PENDING, READING, RESCUING};
 use crate::template::Template;
 use crate::util::{Result, PAGE_SIZE};
 
@@ -63,9 +73,26 @@ const BACKOFF_MAX: Duration = Duration::from_secs(1);
 // From linux/userfaultfd.h.
 const UFFD_EVENT_PAGEFAULT: u8 = 0x12;
 const UFFD_EVENT_REMOVE: u8 = 0x15;
+const UFFD_PAGEFAULT_FLAG_WP: u64 = 2;
+const UFFDIO_REGISTER: libc::c_ulong = 0xC020_AA00;
 const UFFDIO_WAKE: libc::c_ulong = 0x8010_AA02;
 const UFFDIO_COPY: libc::c_ulong = 0xC028_AA03;
 const UFFDIO_ZEROPAGE: libc::c_ulong = 0xC020_AA04;
+const UFFDIO_WRITEPROTECT: libc::c_ulong = 0xC018_AA06;
+const UFFDIO_REGISTER_MODE_MISSING: u64 = 1;
+const UFFDIO_REGISTER_MODE_WP: u64 = 2;
+const UFFDIO_WRITEPROTECT_MODE_WP: u64 = 1;
+const UFFDIO_COPY_MODE_WP: u64 = 2;
+/// Pages a write-protect fault unprotects (and saves first, during a copy).
+const WP_BLOCK: usize = 16;
+/// Merge protect ranges across gaps up to this many pages; past this many
+/// ranges in a region, protect the whole region at once.
+const PROTECT_GAP: usize = 64;
+const PROTECT_RUNS: usize = 256;
+/// Threads copying unsaved pages into memory while a discard is held back.
+const SAVE_REST_THREADS: usize = 8;
+/// Pages write-protected per call while the VM runs (2 MiB).
+const ARM_CHUNK: usize = 512;
 
 #[repr(C)]
 struct UffdioRange {
@@ -87,6 +114,19 @@ struct UffdioZeropage {
     range: UffdioRange,
     mode: u64,
     zeropage: i64,
+}
+
+#[repr(C)]
+struct UffdioRegister {
+    range: UffdioRange,
+    mode: u64,
+    ioctls: u64,
+}
+
+#[repr(C)]
+struct UffdioWriteprotect {
+    range: UffdioRange,
+    mode: u64,
 }
 
 /// One guest memory region, as Firecracker describes it in the UFFD handshake.
@@ -141,13 +181,41 @@ fn eagain() -> io::Error {
 pub struct Pages {
     states: Vec<AtomicU8>,
     events: RwLock<()>,
+    /// One bit per page: its contents may have changed since the last
+    /// checkpoint's pause (written after a write-protect fault, installed,
+    /// or discarded). See `Pager::freeze`.
+    dirty: Vec<AtomicU64>,
 }
 
 impl Pages {
     pub fn new(n: usize) -> Pages {
         // BASE is 0, so a zeroed allocation (lazily backed by the kernel) is the initial state.
         let states = unsafe { std::mem::transmute::<Vec<u8>, Vec<AtomicU8>>(vec![0u8; n]) };
-        Pages { states, events: RwLock::new(()) }
+        let dirty = unsafe { std::mem::transmute::<Vec<u64>, Vec<AtomicU64>>(vec![0u64; n.div_ceil(64)]) };
+        Pages { states, events: RwLock::new(()), dirty }
+    }
+
+    pub fn mark_dirty(&self, page: usize) {
+        if let Some(w) = self.dirty.get(page / 64) {
+            w.fetch_or(1 << (page % 64), Ordering::SeqCst);
+        }
+    }
+
+    /// The dirty bits, cleared.
+    fn take_dirty(&self) -> Vec<u64> {
+        self.dirty.iter().map(|w| w.swap(0, Ordering::SeqCst)).collect()
+    }
+
+    /// The dirty bits, left as they are.
+    fn read_dirty(&self) -> Vec<u64> {
+        self.dirty.iter().map(|w| w.load(Ordering::SeqCst)).collect()
+    }
+
+    /// Marks dirty again what `take_dirty` returned.
+    fn restore_dirty(&self, bits: &[u64]) {
+        for (w, &b) in self.dirty.iter().zip(bits) {
+            w.fetch_or(b, Ordering::SeqCst);
+        }
     }
 
     pub fn get(&self, page: usize) -> u8 {
@@ -188,6 +256,7 @@ impl Pages {
                 Some(if s == INFLIGHT || s == DISCARDED { DISCARDED } else { ZERO })
             })
             .unwrap();
+        self.mark_dirty(page);
         old == REMOTE
     }
 
@@ -203,6 +272,10 @@ impl Pages {
             })
             .unwrap();
         debug_assert!(old == INFLIGHT || (old == DISCARDED && !populated), "settling page {page} in state {old}");
+        if populated {
+            // Installed writable: it may change without a fault from now on.
+            self.mark_dirty(page);
+        }
         from == REMOTE && (populated || old == DISCARDED)
     }
 
@@ -287,6 +360,35 @@ pub struct Pager {
     stop: AtomicBool,
     /// The fault-serving thread, joined by `join`.
     thread: Mutex<Option<thread::JoinHandle<()>>>,
+    /// Memory is registered for write-protect faults and write tracking is on.
+    tracking: AtomicBool,
+    registered_wp: AtomicBool,
+    /// The copy-on-write state of a checkpoint whose pages are being written.
+    cow: Mutex<Option<Arc<Cow>>>,
+    /// Held while handling a fault and while a checkpoint freezes memory, so
+    /// a fault read before the freeze cannot unprotect a page after it.
+    wp: Mutex<()>,
+    /// Firecracker's /proc/PID/pagemap, to tell populated pages apart.
+    pagemap: OnceLock<std::fs::File>,
+    /// Test fault: the next freeze fails to re-protect pages.
+    pub fail_protect: AtomicBool,
+}
+
+/// What `Pager::freeze` captured for a checkpoint.
+pub struct Frozen {
+    /// Page states for the writer: REMOTE pages are saved from the guest,
+    /// ZERO pages are discarded, BASE pages (incremental only) are the template's.
+    pub runs: Runs,
+    /// Copy-on-write state, when the VM is to run on during the write.
+    pub cow: Option<Arc<Cow>>,
+    /// Pages dirtied since the previous checkpoint's pause.
+    pub dirty: usize,
+    /// The dirty bits taken, which a checkpoint that fails gives back
+    /// (`Pager::unfreeze`).
+    taken: Vec<u64>,
+    /// Ranges write-protected, and how long that took.
+    pub protected: usize,
+    pub protect: Duration,
 }
 
 impl Pager {
@@ -317,6 +419,12 @@ impl Pager {
             failed: OnceLock::new(),
             stop: AtomicBool::new(false),
             thread: Mutex::new(None),
+            tracking: AtomicBool::new(false),
+            registered_wp: AtomicBool::new(false),
+            cow: Mutex::new(None),
+            wp: Mutex::new(()),
+            pagemap: OnceLock::new(),
+            fail_protect: AtomicBool::new(false),
         });
         let p = pager.clone();
         let thread = thread::Builder::new().name("uffd".into()).spawn(move || {
@@ -586,7 +694,7 @@ impl Pager {
     }
 
     fn pages(&self) -> &Pages {
-        static EMPTY: Pages = Pages { states: Vec::new(), events: RwLock::new(()) };
+        static EMPTY: Pages = Pages { states: Vec::new(), events: RwLock::new(()), dirty: Vec::new() };
         self.pages.get().unwrap_or(&EMPTY)
     }
 
@@ -680,8 +788,8 @@ impl Pager {
             self.clone().spawn_pullers();
         }
         let fd = self.fd();
-        // Faults to retry, with when they first failed other than with EAGAIN.
-        let mut pending: VecDeque<(u64, Option<Instant>)> = VecDeque::new();
+        // Faults to retry (address, flags), with when they first failed other than with EAGAIN.
+        let mut pending: VecDeque<(u64, u64, Option<Instant>)> = VecDeque::new();
         let mut buf = [0u8; 32 * 64];
         while !self.stop.load(Ordering::SeqCst) {
             let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
@@ -693,6 +801,17 @@ impl Pager {
                 break;
             }
             if pfd.revents & libc::POLLIN != 0 {
+                // A REMOVE the kernel acts on as soon as it is read must not
+                // hit pages a checkpoint copy has yet to save: let it finish.
+                let cow = self.cow.lock().unwrap().clone();
+                if let Some(cow) = cow.filter(|c| c.active()) {
+                    if self.remove_queued(&cow) {
+                        self.save_rest(&cow);
+                        if !cow.drain() {
+                            cow.invalidate("a discard was held back while the copy made no progress");
+                        }
+                    }
+                }
                 let removing = self.pages().removing();
                 let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
                 if n > 0 {
@@ -700,7 +819,7 @@ impl Pager {
                         let a = u64::from_ne_bytes(msg[8..16].try_into().unwrap());
                         let b = u64::from_ne_bytes(msg[16..24].try_into().unwrap());
                         match msg[0] {
-                            UFFD_EVENT_PAGEFAULT => pending.push_back((b, None)),
+                            UFFD_EVENT_PAGEFAULT => pending.push_back((b, a, None)),
                             UFFD_EVENT_REMOVE => self.discard(&removing, a, b),
                             _ => {}
                         }
@@ -711,17 +830,17 @@ impl Pager {
             // Other errors (say ENOMEM) are retried for a while: a dropped
             // fault would block its vCPU forever.
             for _ in 0..pending.len() {
-                let (addr, since) = pending.pop_front().unwrap();
-                match self.fault(addr) {
+                let (addr, flags, since) = pending.pop_front().unwrap();
+                match self.fault(addr, flags) {
                     Ok(()) => {}
-                    Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => pending.push_back((addr, since)),
+                    Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => pending.push_back((addr, flags, since)),
                     Err(e) if fatal(&e) => return self.fail(e.to_string()),
                     Err(e) => match since {
                         None => {
                             eprintln!("uffd: fault at {addr:#x}: {e}; retrying");
-                            pending.push_back((addr, Some(Instant::now())));
+                            pending.push_back((addr, flags, Some(Instant::now())));
                         }
-                        Some(t) if t.elapsed() < FAULT_TIMEOUT => pending.push_back((addr, since)),
+                        Some(t) if t.elapsed() < FAULT_TIMEOUT => pending.push_back((addr, flags, since)),
                         Some(_) => return self.fail(format!("fault at {addr:#x}: {e}")),
                     },
                 }
@@ -739,9 +858,13 @@ impl Pager {
 
     fn discard(&self, removing: &RwLockWriteGuard<'_, ()>, start: u64, end: u64) {
         self.discards.fetch_add(1, Ordering::SeqCst);
+        let cow = self.cow.lock().unwrap().clone().filter(|c| c.active());
         let (mut a, mut resolved) = (start & !(PAGE_SIZE as u64 - 1), 0);
         while a < end {
             if let Some((p, _)) = self.page_of(a) {
+                if let Some(cow) = cow.as_ref().filter(|c| matches!(c.state(p), PENDING | READING | RESCUING)) {
+                    cow.invalidate(&format!("page {p} was discarded before it was saved"));
+                }
                 resolved += self.pages().discard(removing, p) as usize;
             }
             a += PAGE_SIZE as u64;
@@ -749,19 +872,38 @@ impl Pager {
         self.pulled(resolved);
     }
 
-    fn fault(&self, addr: u64) -> io::Result<()> {
+    fn fault(&self, addr: u64, flags: u64) -> io::Result<()> {
         let Some((page, m)) = self.page_of(addr) else {
             return Err(io::Error::other("fault outside guest memory"));
         };
+        let _wp = self.wp.lock().unwrap();
+        if flags & UFFD_PAGEFAULT_FLAG_WP != 0 {
+            return self.wp_fault(page, m);
+        }
         let region_left = (m.offset as usize + m.size) / PAGE_SIZE - page;
         let pages = self.pages();
         match pages.get(page) {
             // Normally a fault that raced the install; if the page is really
             // missing, a REMOVE zapped it after it settled (see `Pages`).
-            PRESENT => match self.populate(page, 1, None) {
-                Err(e) if e.raw_os_error() == Some(libc::EEXIST) => self.wake(page, 1),
-                r => r.map(drop),
-            },
+            PRESENT => {
+                // Missing at a checkpoint's pause too, so zero then: if the
+                // copy has yet to save it, keep it protected until it has.
+                let cow = self.cow.lock().unwrap().clone().filter(|c| c.active());
+                let unsaved = cow.is_some_and(|c| matches!(c.state(page), PENDING | READING));
+                let res = match unsaved {
+                    true => self.copy_zero_protected(page),
+                    false => self.populate(page, 1, None),
+                };
+                match res {
+                    Err(e) if e.raw_os_error() == Some(libc::EEXIST) => self.wake(page, 1),
+                    r => {
+                        if r.is_ok() && !unsaved {
+                            pages.mark_dirty(page);
+                        }
+                        r.map(drop)
+                    }
+                }
+            }
             // Someone else is installing it; retry until it lands (their copy wakes us).
             INFLIGHT | DISCARDED => Err(eagain()),
             REMOTE => {
@@ -800,6 +942,401 @@ impl Pager {
                 pages.install(page, n, state, None, |p, c| self.populate(p, c, src(p, c))).1
             }
         }
+    }
+
+    /// A write to a write-protected page. During a checkpoint copy, saves the
+    /// pages of its block that the copy has not saved yet; then unprotects
+    /// the block (except pages still to be saved by a writer) and marks it
+    /// dirty. Never reads a page that may be missing, which would fault back
+    /// to this thread: only pages the pagemap shows populated are read (a
+    /// missing one was missing, so zero, at the pause).
+    fn wp_fault(&self, page: usize, m: &Mapping) -> io::Result<()> {
+        let (region_first, region_end) = (m.offset as usize / PAGE_SIZE, (m.offset as usize + m.size) / PAGE_SIZE);
+        let block = page - page % WP_BLOCK;
+        let (first, end) = (block.max(region_first), (block + WP_BLOCK).min(region_end));
+        let cow = self.cow.lock().unwrap().clone().filter(|c| c.active());
+        if let Some(cow) = &cow {
+            cow.stats.faults.fetch_add(1, Ordering::Relaxed);
+            if cow.state(page) == READING {
+                cow.stats.deferred.fetch_add(1, Ordering::Relaxed);
+                return Err(eagain());
+            }
+            // Over budget, nothing more is copied here: unsaved pages of the
+            // block stay protected, and the writers take them first.
+            if cow.over_budget() {
+                let unsaved: Vec<usize> = (first..end).filter(|&p| cow.state(p) == PENDING).collect();
+                unsaved.iter().for_each(|&p| cow.want(p));
+                if unsaved.contains(&page) {
+                    return Err(eagain());
+                }
+            }
+            let start = Instant::now();
+            let claimed: Vec<usize> = match cow.over_budget() {
+                true => Vec::new(),
+                false => (first..end).filter(|&p| cow.claim(p, PENDING, RESCUING)).collect(),
+            };
+            if !claimed.is_empty() {
+                if let Err(e) = self.rescue(cow, first, end, &claimed) {
+                    claimed.iter().for_each(|&p| cow.unclaim(p));
+                    return Err(e);
+                }
+                let ns = start.elapsed().as_nanos() as u64;
+                let s = &cow.stats;
+                s.rescues.fetch_add(1, Ordering::Relaxed);
+                s.rescued_pages.fetch_add(claimed.len() as u64, Ordering::Relaxed);
+                s.rescue_ns.fetch_add(ns, Ordering::Relaxed);
+                s.rescue_max_ns.fetch_max(ns, Ordering::Relaxed);
+            }
+        }
+        // Unprotect what may change now, in runs around pages still protected for the copy.
+        let keep = |p: usize| cow.as_ref().is_some_and(|c| matches!(c.state(p), PENDING | READING | RESCUING));
+        let mut p = first;
+        while p < end {
+            if keep(p) {
+                p += 1;
+                continue;
+            }
+            let mut q = p + 1;
+            while q < end && !keep(q) {
+                q += 1;
+            }
+            (p..q).for_each(|d| self.pages().mark_dirty(d));
+            self.writeprotect(p, q - p, false)?;
+            p = q;
+        }
+        Ok(())
+    }
+
+    /// Copies the `claimed` pages (RESCUING, within `first..end` of one
+    /// region) out of the guest into the copy-on-write state.
+    fn rescue(&self, cow: &Cow, first: usize, end: usize, claimed: &[usize]) -> io::Result<()> {
+        let present = self.populated(first, end - first)?;
+        let mut buf = vec![0u8; (end - first) * PAGE_SIZE];
+        let mut i = 0;
+        while i < claimed.len() {
+            let mut j = i + 1;
+            while j < claimed.len() && claimed[j] == claimed[j - 1] + 1 && present[claimed[j] - first] == present[claimed[i] - first] {
+                j += 1;
+            }
+            let (a, b) = (claimed[i] - first, claimed[j - 1] + 1 - first);
+            if present[a] {
+                let off = (claimed[i] * PAGE_SIZE) as u64;
+                self.read_guest(off, &mut buf[a * PAGE_SIZE..b * PAGE_SIZE]).map_err(|e| io::Error::other(e.to_string()))?;
+            }
+            i = j;
+        }
+        for &p in claimed {
+            cow.rescue(p, buf[(p - first) * PAGE_SIZE..(p - first + 1) * PAGE_SIZE].into());
+        }
+        Ok(())
+    }
+
+    /// Which of `n` pages from `page` are populated (or swapped out) in Firecracker.
+    fn populated(&self, page: usize, n: usize) -> io::Result<Vec<bool>> {
+        let f = match self.pagemap.get() {
+            Some(f) => f,
+            None => {
+                let f = std::fs::File::open(format!("/proc/{}/pagemap", self.pid.load(Ordering::SeqCst)))?;
+                let _ = self.pagemap.set(f);
+                self.pagemap.get().unwrap()
+            }
+        };
+        let (addr, _) = self.host_addr(page).ok_or_else(|| io::Error::other("bad page"))?;
+        let mut raw = vec![0u8; n * 8];
+        std::os::unix::fs::FileExt::read_exact_at(f, &mut raw, addr / PAGE_SIZE as u64 * 8)?;
+        Ok(raw.chunks(8).map(|e| u64::from_le_bytes(e.try_into().unwrap()) & (3 << 62) != 0).collect())
+    }
+
+    /// Installs a zero page that stays write-protected.
+    fn copy_zero_protected(&self, page: usize) -> io::Result<usize> {
+        static ZEROES: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
+        let (dst, _) = self.host_addr(page).ok_or_else(|| io::Error::other("bad page"))?;
+        let mut c = UffdioCopy { dst, src: ZEROES.as_ptr() as u64, len: PAGE_SIZE as u64, mode: UFFDIO_COPY_MODE_WP, copy: 0 };
+        if unsafe { libc::ioctl(self.fd(), UFFDIO_COPY, &mut c) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(1)
+    }
+
+    /// Write-protects (or unprotects, waking writers waiting on them) `n` pages from `page`.
+    fn writeprotect(&self, page: usize, n: usize, protect: bool) -> io::Result<()> {
+        let (start, _) = self.host_addr(page).ok_or_else(|| io::Error::other("bad page"))?;
+        let mode = if protect { UFFDIO_WRITEPROTECT_MODE_WP } else { 0 };
+        let mut wp = UffdioWriteprotect { range: UffdioRange { start, len: (n * PAGE_SIZE) as u64 }, mode };
+        if unsafe { libc::ioctl(self.fd(), UFFDIO_WRITEPROTECT, &mut wp) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// `writeprotect`, retrying for a while if a REMOVE is queued.
+    fn writeprotect_retry(&self, page: usize, n: usize, protect: bool) -> io::Result<()> {
+        let start = Instant::now();
+        loop {
+            match self.writeprotect(page, n, protect) {
+                Err(e) if e.raw_os_error() == Some(libc::EAGAIN) && start.elapsed() < Duration::from_secs(2) => {
+                    thread::sleep(Duration::from_micros(200))
+                }
+                r => return r,
+            }
+        }
+    }
+
+    /// While a REMOVE is held back (and with it every fault, as the kernel
+    /// refuses our ioctls until it is read): copies the pages the checkpoint
+    /// has yet to save into memory with several threads, so the guest waits
+    /// for memory bandwidth rather than for the disk. Only if they fit in a
+    /// quarter of the host's available memory; else the writers finish.
+    fn save_rest(&self, cow: &Cow) {
+        let avail = crate::util::proc_kb("/proc/meminfo", "MemAvailable").unwrap_or(0) as usize;
+        if cow.left() * PAGE_SIZE > avail / 4 {
+            return;
+        }
+        let threads = thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, SAVE_REST_THREADS);
+        let chunks: Vec<(usize, usize)> = self
+            .mappings()
+            .iter()
+            .flat_map(|m| {
+                let (from, to) = (m.offset as usize / PAGE_SIZE, (m.offset as usize + m.size) / PAGE_SIZE);
+                (from..to).step_by(PREFETCH_RUN).map(move |c| (c, (c + PREFETCH_RUN).min(to)))
+            })
+            .collect();
+        let next = AtomicUsize::new(0);
+        thread::scope(|s| {
+            for _ in 0..threads {
+                // Fewer threads if they cannot be had; the writers do the rest.
+                let spawned = thread::Builder::new().spawn_scoped(s, || loop {
+                    let Some(&(first, end)) = chunks.get(next.fetch_add(1, Ordering::Relaxed)) else { return };
+                    if cow.left() == 0 || !cow.active() {
+                        return;
+                    }
+                    let claimed: Vec<usize> = (first..end).filter(|&p| cow.claim(p, PENDING, RESCUING)).collect();
+                    match claimed.is_empty() || self.rescue(cow, first, end, &claimed).is_ok() {
+                        true => _ = cow.stats.held_pages.fetch_add(claimed.len() as u64, Ordering::Relaxed),
+                        false => claimed.iter().for_each(|&p| cow.unclaim(p)),
+                    }
+                });
+                if spawned.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    /// Whether a REMOVE event is queued (the kernel then fails our ioctls
+    /// with EAGAIN until it is read). Probes by protecting a page the copy
+    /// has yet to save, which is protected already, so changes nothing.
+    fn remove_queued(&self, cow: &Cow) -> bool {
+        let Some(p) = cow.unsaved_page() else { return false };
+        matches!(self.writeprotect(p, 1, true), Err(e) if e.raw_os_error() == Some(libc::EAGAIN))
+    }
+
+    /// Turns write tracking on, while the VM runs: registers guest memory for
+    /// write-protect faults (once) and protects all of it, so the pause of
+    /// the checkpoint that follows only re-protects what changed meanwhile.
+    pub fn arm_tracking(&self) -> Result<Duration> {
+        let start = Instant::now();
+        if self.tracking.load(Ordering::SeqCst) {
+            return Ok(Duration::ZERO);
+        }
+        if !self.registered_wp.load(Ordering::SeqCst) {
+            for m in self.mappings() {
+                let range = UffdioRange { start: m.base_host_virt_addr, len: m.size as u64 };
+                let mut r = UffdioRegister { range, mode: UFFDIO_REGISTER_MODE_MISSING | UFFDIO_REGISTER_MODE_WP, ioctls: 0 };
+                if unsafe { libc::ioctl(self.fd(), UFFDIO_REGISTER, &mut r) } < 0 {
+                    bail!("registering guest memory for write-protect faults: {}", io::Error::last_os_error());
+                }
+            }
+            self.registered_wp.store(true, Ordering::SeqCst);
+        }
+        // Dirty from here on; then protect. A page written before its turn
+        // to be protected is protected afterwards all the same. Under the
+        // fault lock: a fault already marking and unprotecting a block
+        // finishes both first, so it never unprotects one whose mark this
+        // reset cleared. (Not held while protecting: the serve thread must
+        // be free to read events, or a queued REMOVE would fail the calls.)
+        {
+            let _wp = self.wp.lock().unwrap();
+            self.pages().take_dirty();
+            self.tracking.store(true, Ordering::SeqCst);
+        }
+        // In chunks: while the kernel changes a range, KVM retries guest
+        // faults anywhere in it, so one call over a whole region would stall
+        // the vCPUs for as long as it takes.
+        for m in self.mappings() {
+            let (mut p, end) = (m.offset as usize / PAGE_SIZE, (m.offset as usize + m.size) / PAGE_SIZE);
+            while p < end {
+                let n = ARM_CHUNK.min(end - p);
+                if let Err(e) = self.writeprotect_retry(p, n, true) {
+                    self.tracking.store(false, Ordering::SeqCst);
+                    bail!("write-protecting guest memory: {e}");
+                }
+                p += n;
+            }
+        }
+        Ok(start.elapsed())
+    }
+
+    /// Whether write tracking is on (see `arm_tracking`).
+    pub fn tracking(&self) -> bool {
+        self.tracking.load(Ordering::SeqCst)
+    }
+
+    /// Pages dirtied since the last checkpoint's pause.
+    pub fn dirty_count(&self) -> usize {
+        self.pages().dirty.iter().map(|w| w.load(Ordering::Relaxed).count_ones() as usize).sum()
+    }
+
+    /// Captures memory for a checkpoint of the paused VM, after
+    /// `quiesce_export` gave `runs`: takes the pages dirtied since the last
+    /// checkpoint's pause (starting a new interval), picks the pages to write
+    /// (all populated ones, or with `incremental` only the dirty ones, plus
+    /// explicit runs for dirty pages now discarded or the template's), and
+    /// with `cow` arms copy-on-write for them so the VM can run on: whatever
+    /// was unprotected since the last pause is write-protected again first.
+    pub fn freeze(&self, runs: &Runs, incremental: bool, cow: bool) -> Result<Frozen> {
+        let _wp = self.wp.lock().unwrap();
+        if (cow || incremental) && !self.tracking() {
+            bail!("write tracking is off");
+        }
+        let pages = self.pages();
+        // A VM that stays paused for the write (and is then killed) keeps its
+        // dirty pages: if the checkpoint fails and it runs on, they still
+        // tell what is unprotected. One that runs on starts a new interval.
+        let dirty = match cow {
+            true => pages.take_dirty(),
+            false => pages.read_dirty(),
+        };
+        let ndirty = dirty.iter().map(|w| w.count_ones() as usize).sum();
+        // Set bits in ascending page order.
+        let dirty_pages = || {
+            dirty.iter().enumerate().flat_map(|(w, &bits)| {
+                std::iter::successors((bits != 0).then_some(bits), |b| Some(b & (b - 1)).filter(|&b| b != 0))
+                    .map(move |b| w * 64 + b.trailing_zeros() as usize)
+            })
+        };
+        let start = Instant::now();
+        let mut protected = 0;
+        if cow {
+            // Everything populated was protected at the last pause (or when
+            // tracking began); since then only dirty pages were unprotected.
+            for m in self.mappings() {
+                let (from, to) = (m.offset as usize / PAGE_SIZE, (m.offset as usize + m.size) / PAGE_SIZE);
+                let mut ranges: Vec<(usize, usize)> = Vec::new();
+                for p in dirty_pages().filter(|&p| p >= from && p < to && pages.get(p) == PRESENT) {
+                    match ranges.last_mut() {
+                        Some((_, e)) if p <= *e + PROTECT_GAP => *e = p + 1,
+                        _ => ranges.push((p, p + 1)),
+                    }
+                }
+                if ranges.len() > PROTECT_RUNS {
+                    ranges = vec![(from, to)];
+                }
+                for (s, e) in ranges {
+                    let res = match self.fail_protect.swap(false, Ordering::SeqCst) {
+                        true => Err(io::Error::other("injected fault")),
+                        false => self.writeprotect_retry(s, e - s, true),
+                    };
+                    if let Err(e) = res {
+                        // Every page must stay protected or dirty: give the
+                        // bits back, and protect everything again next time.
+                        pages.restore_dirty(&dirty);
+                        self.tracking.store(false, Ordering::SeqCst);
+                        bail!("write-protecting guest memory: {e}");
+                    }
+                    protected += 1;
+                }
+            }
+        }
+        let protect = start.elapsed();
+        let out = match incremental {
+            false => runs.clone(),
+            true => {
+                // Pages not dirty keep what the previous checkpoint has.
+                let mut out: Runs = Vec::new();
+                for p in dirty_pages().take_while(|&p| p < pages.len()) {
+                    let r = runs.partition_point(|r| r.0 <= p as u64);
+                    let st = match r.checked_sub(1).map(|r| runs[r]) {
+                        Some((f, n, s)) if (p as u64) < f + n => s,
+                        _ => BASE,
+                    };
+                    match out.last_mut() {
+                        Some((f, n, s)) if *s == st && *f + *n == p as u64 => *n += 1,
+                        _ => out.push((p as u64, 1, st)),
+                    }
+                }
+                out
+            }
+        };
+        let cow = cow.then(|| Arc::new(Cow::new(pages.len(), &out)));
+        *self.cow.lock().unwrap() = cow.clone();
+        let taken = if cow.is_some() { dirty } else { Vec::new() };
+        Ok(Frozen { runs: out, cow, dirty: ndirty, taken, protected, protect })
+    }
+
+    /// Undoes `freeze` for a checkpoint that failed: stops its copy and marks
+    /// dirty again what it took, so the previous checkpoint is still the base
+    /// of the next delta. Pages the freeze protected stay protected until
+    /// written, which marks them dirty, so nothing is lost either way.
+    pub fn unfreeze(&self, frozen: &Frozen) {
+        self.end_copy();
+        let _wp = self.wp.lock().unwrap();
+        self.pages().restore_dirty(&frozen.taken);
+    }
+
+    /// Ends a checkpoint copy, finished or not. Pages stay protected for tracking.
+    pub fn end_copy(&self) {
+        if let Some(cow) = self.cow.lock().unwrap().take() {
+            cow.stop();
+        }
+    }
+
+    /// Stops a checkpoint copy in progress (its checkpoint fails).
+    pub fn abort_copy(&self) {
+        if let Some(cow) = self.cow.lock().unwrap().as_ref() {
+            cow.invalidate("the copy was aborted");
+            cow.stop();
+        }
+    }
+
+    /// Whether a checkpoint copy is in progress.
+    pub fn copying(&self) -> bool {
+        self.cow.lock().unwrap().is_some()
+    }
+
+    /// The canonical hash of guest memory as it is now (for a paused VM; a
+    /// test hook): see `checkpoint::Canon`.
+    pub fn content_hash(&self) -> Result<String> {
+        let pages = self.pages();
+        let mut canon = crate::checkpoint::Canon::new(&self.base);
+        let mut buf = vec![0u8; 256 * PAGE_SIZE];
+        for m in self.mappings() {
+            let (mut p, end) = (m.offset as usize / PAGE_SIZE, (m.offset as usize + m.size) / PAGE_SIZE);
+            while p < end {
+                match pages.get(p) {
+                    BASE => p += 1,
+                    ZERO => {
+                        canon.page(p, &buf[..0]);
+                        p += 1;
+                    }
+                    PRESENT => {
+                        let mut q = p + 1;
+                        while q < end && q - p < 256 && pages.get(q) == PRESENT {
+                            q += 1;
+                        }
+                        let b = &mut buf[..(q - p) * PAGE_SIZE];
+                        self.read_guest((p * PAGE_SIZE) as u64, b)?;
+                        for (i, page) in b.chunks(PAGE_SIZE).enumerate() {
+                            canon.page(p + i, page);
+                        }
+                        buf[..(q - p) * PAGE_SIZE].fill(0);
+                        p = q;
+                    }
+                    s => bail!("page {p} is in state {s}"),
+                }
+            }
+        }
+        Ok(canon.finish())
     }
 
     /// Populates up to `n` pages starting at `page`, from `src` or with

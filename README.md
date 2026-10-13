@@ -65,9 +65,12 @@ VM that is busy, paused or suspended.
   migration source or its checkpoint), and for virtio-mem to settle (see
   below). It then pauses the VM, quiesces its devices and pager like a
   migration source does, saves the vCPU/device state and writes every page
-  that differs from the template into DIR. Finally it resumes the VM
-  (`--keep-running`, the default) or kills it (`--stop`). The pause lasts as
-  long as the write (2–3 GB/s here, against a disk that takes 4–5 GB/s).
+  that differs from the template into DIR. With `--keep-running` (the
+  default) the VM resumes as soon as its memory is write-protected and the
+  pages are written copy-on-write while it runs (pause 17–30 ms at any
+  size, see below); with `--stop` it stays paused for the write (2–3 GB/s
+  here) and is killed. `--incremental` writes only what changed since its
+  last checkpoint, as a delta against it.
 - **restore DIR** works on any host whose template has the same content id.
   It loads the verified state (copied to the VM's own run directory) into a
   pooled Firecracker, paused. That Firecracker's pager takes pages from the
@@ -135,7 +138,7 @@ VM that is busy, paused or suspended.
   target, which pulls all its pages from the source. Resuming it there
   waits (up to 30 s) for that pull, so it never runs split across hosts.
 
-#### Checkpoint format (version 2)
+#### Checkpoint format (versions 2 and 3)
 
 A checkpoint is a directory that is written in full or not at all. The
 destination's directory may belong to an unprivileged user while the daemon
@@ -190,6 +193,107 @@ page map records, so no thread waits for another. `pages` is created in the
 staging directory and preallocated (`fallocate`) for every PRESENT page
 before the VM pauses, which is what lets ext4 run the direct writes in
 parallel; it is trimmed to what was written.
+
+An incremental checkpoint (format 3) adds `parent` to the manifest: the
+parent's path (`../NAME` when they share a directory, else absolute) and id
+(its manifest's checksum line). Its page map lists only pages that changed
+since the parent's pause, with a third kind, TEMPLATE (the template's page,
+a run only). A restore follows the chain (at most 64 deep), checks each
+link and that it names the template and size its child does, refuses a
+parent that is missing or whose id changed, and flattens the maps: each page
+is read from the newest checkpoint that has it. Deleting or rewriting a
+parent breaks its children.
+
+#### Copy-on-write and incremental checkpoints
+
+A checkpoint of a VM that runs on (`--keep-running`) pauses it only to save
+its vCPU/device state and to arm userfaultfd write protection (uffd-wp); the
+pages are written while it runs. A guest write to a page not saved yet
+faults, the pager saves that page first and only then lets the write
+through, so the checkpoint is exactly the memory at the pause.
+
+- **No Firecracker change.** The pager registers write-protect mode
+  (`UFFDIO_REGISTER` with `MODE_MISSING|MODE_WP`) on Firecracker's existing
+  userfaultfd and its ranges. Nothing has to be requested at `UFFDIO_API`
+  time: write-protect faults are reported with `UFFD_PAGEFAULT_FLAG_WP`
+  regardless, `WP_UNPOPULATED` is not needed (a page not populated at the
+  pause is the template's or zero, which the page map records) and
+  `WP_ASYNC` would let writes through unsaved. Checked on 6.18 against a
+  context created like Firecracker's (`EVENT_REMOVE` only).
+- **Write tracking.** The first keep-running checkpoint registers write
+  protection and protects all guest memory while the VM still runs (in 2 MiB
+  calls: KVM retries guest faults anywhere in a range the kernel is
+  changing, so one call over a region would stall the vCPUs; 70–90 ms
+  per GiB populated here). From then on a write fault unprotects a 64 KiB
+  block and marks it dirty, as do installs and discards. At each
+  checkpoint's pause only the pages dirtied since are protected again, so
+  the pause does not grow with memory size.
+- **The pause.** Pause through the API, save the state (as for a
+  migration), take the dirty pages, re-protect them, arm copy-on-write for
+  the pages to save, resume: 17–30 ms here at any size (was 125 ms at 256 MiB
+  and 1.5–1.9 s at 4 GiB).
+- **The copy.** The parallel writer reads each unsaved page out of
+  Firecracker and writes it as before. A write fault on an unsaved page
+  copies its block into memory (a "rescue": 120–250 µs here, a heavily
+  loaded host) before unprotecting it; writers take the rescued copy. Past
+  256 MiB of rescued copies a fault waits for the writers to reach its page
+  instead. Writers never unprotect anything, so tracking continues.
+- **KVM and devices.** KVM's own writes to guest memory (kvmclock through
+  its pfn cache, steal time and PV EOI through user accesses) go through
+  the host page tables, so they fault like the guest's: protecting a range
+  invalidates KVM's mappings (MMU notifier), and the cache refills with a
+  write fault. Measured: every checkpoint takes write faults on the
+  kvmclock page (which only KVM writes) and the steal-time pages right after
+  the resume, and its contents equal the memory at the pause. Writes that
+  KVM makes without faulting (the preempted flag) fail on a protected page
+  and are skipped. Firecracker's device emulation writes through its
+  mapping too; a device thread blocked on a fault waits only for the pager,
+  which never waits for Firecracker.
+- **Discards.** The kernel zaps a page right after the pager reads the
+  REMOVE event for it, so a balloon or virtio-mem discard must not be read
+  while pages are unsaved. Before each read the pager probes for a queued
+  REMOVE (re-protecting an unsaved page fails with EAGAIN while one is
+  queued) and first saves everything left: in memory with 8 threads if it
+  fits in a quarter of available memory, else by waiting for the writers.
+  The guest's faults wait meanwhile (the kernel refuses every ioctl until
+  the event is read): free page reporting during the copy cost 0.35 s
+  (1 GiB) to 1.5 s (4 GiB) stalls here. A REMOVE that slips in between the
+  probe and the read, or writers that stall, invalidate the checkpoint
+  instead of saving wrong contents. virtio-mem only discards or plugs on
+  the host's request, which waits for the checkpoint.
+- **Other operations** wait for the copy: migration, pause, suspend and
+  resizes need the VM's reservation, which the checkpoint holds. A kill
+  stops the copy (the checkpoint fails). Exec works (the VM is `running`;
+  `ls` shows `checkpoint_copy`).
+- **Failure.** A copy that fails publishes nothing and the VM runs on. A
+  daemon crash leaves only root-only staging, as before.
+- **Incremental** (`--incremental`): writes only the pages dirtied since the
+  VM's last checkpoint here that it ran on after (taken since it last
+  arrived on this host), as a delta that names its parent (format 3). The
+  delta is chosen over writing a merged full image because it costs time
+  and space in proportion to what changed (35 MiB and 90–110 ms for a 4 GiB
+  VM with a small writer, against 4.2 GiB and 1.5–1.9 s); the price is that
+  restores read a chain and parents must be kept. Before writing a delta
+  the whole chain is verified (and must stay under 64 links), and just
+  before publishing it is walked again through the manifests' parent
+  references and must have the same ids. The check covers metadata and page
+  checksum lists; page data is checked when read, except that a `--stop`
+  delta (whose VM is then gone) reads every page it inherits first. Re-arming
+  write tracking (after a failed re-protection) forgets the dirty history,
+  so the next delta needs a full checkpoint first. A failed checkpoint gives back the
+  dirty pages it took, so the last good one stays the base, and every page
+  stays either protected or dirty. `--stop` can be incremental too.
+  Tracking costs a write fault per 64 KiB block written between
+  checkpoints, and the first protect makes KVM refault each page once.
+
+`scripts/faults.py` checks this with `scripts/memwriter.c`, a guest program
+that rewrites its memory all the time in a known order, each page stamped
+with its iteration and a salt from RDRAND, and checks every page against its
+own record before rewriting it, plus all of them on request at an iteration
+boundary. A restored copy finds any page saved with contents from after the
+pause (or before its last write before it). The daemon also hashes guest
+memory during the pause (`ckpt_memhash` test fault), which must equal the
+hash of what the checkpoint restores (`ckhash`).
 
 ### Migration ownership
 
@@ -341,6 +445,9 @@ RAM and double memory use on a host that is already short.
 | Background memory pull | ~1.1 GB/s over loopback TCP |
 | Idle VM host RSS | 13–35 MiB |
 | pause / resume (daemon side; RPC round trip ~2.3 ms) | **0.6 / 0.7 ms** (2 vCPU), 1.5 ms resume (24 vCPU) |
+| checkpoint `--keep-running`, 256 / 1024 / 4096 MiB written in the guest: VM paused | **20 / 18 / 24–31 ms** (was 125 / 406–428 / 1456–1923 ms); write protection armed beforehand while it runs (first checkpoint only): 20 / 95–125 / 270–380 ms; whole checkpoint 220–250 / 450–620 / 1900–2200 ms |
+| ... with a guest rewriting 2 × 256 MiB during the copy | pause 17–56 ms; 650–2700 write faults, 340–1970 of them saving 20–120 MiB first (120–250 µs each); writer iterations > 100 µs: 4–9k (idle 0.1–1k), worst single stall 35–50 ms at 1 GiB (one 100–150 ms stall before 2 MiB protect chunks), but 0.35–1.5 s when free page reporting discards during the copy |
+| incremental checkpoint of a 4 GiB VM (small writer running) | **paused 29–50 ms, 92–112 ms in all, 35 MiB written** (full: 4238 MiB, 1.5–1.9 s) |
 | checkpoint `--stop`, by memory touched: 256 / 1024 MiB written in the guest | write_pages 113–249 / 483–521 ms (was 435–480 / 2019–2892 ms); paused 286–430 / 760–816 ms (was 653–703 / 2335–3255), including Firecracker's exit; disk: 4–5 GB/s O_DIRECT, 1 GB/s buffered |
 | restore → guest agent answering | **33 / 27 / 67 ms** (snapshot load 28 / 24 / 63 ms); whole checkpoint paged in after 39 / 153 / 509 ms |
 | suspend (checkpoint + free) / resume of a suspended VM to ready | 127 / 448 / 2012 ms; 27 / 28 / 36 ms |
@@ -376,6 +483,7 @@ export FLEXVM_HOST=192.168.1.11:7070
 flexvm pause web; flexvm resume web             # vCPUs stopped, memory kept
 flexvm suspend web; flexvm resume web           # state to local disk, memory freed; lazy restore
 flexvm checkpoint web /data/web-1 --stop        # complete state to disk; VM stops
+# or, running on: flexvm checkpoint web /data/web-1; flexvm checkpoint web /data/web-2 --incremental
 flexvm --host 192.168.1.10:7070 restore /data/web-1   # same template id needed; same name and address
 flexvm --host 192.168.1.10:7070 kill web
 ```
@@ -512,7 +620,8 @@ p50/p90/p99/max per phase, raw samples and host context.
 flexvm/src/
   daemon.rs    RPC, migration, elastic memory controller, pressure policy
   lifecycle.rs pause/resume, checkpoint, restore, suspend; per-VM operation lock
-  checkpoint.rs checkpoint format: crash-consistent writer, verified page-file reader
+  checkpoint.rs checkpoint format: crash-consistent writer, verified page-file reader, delta chains
+  cow.rs       copy-on-write state of a running VM's checkpoint (write faults save pages first)
   uffd.rs      userfaultfd pager (template / zero / migration source / checkpoint file) + page server
   template.rs  cold boot, snapshot, sparse image, working-set recording
   vm.rs        restore into a pooled Firecracker, checkpoint, stats
@@ -568,9 +677,17 @@ firecracker/        patches on top of Firecracker v1.17.0
 - The controller samples guest memory once a second (balloon stats). A very
   fast allocation burst can still hit the in-guest OOM killer; guest PSI
   triggers over vsock would react faster.
-- **Checkpoints pause the VM for the whole write** (2–3 GB/s here, mostly
-  disk-bound; the one remaining copy is `process_vm_readv`). Copy-on-write or pre-copy (#8) would make the pause independent of
-  memory size. Checkpoints are full each time, not incremental.
+- **A discard during a copy-on-write checkpoint stalls the guest** until the
+  unsaved pages are saved (0.35–1.5 s measured, mostly free page reporting
+  after the guest grew), because the kernel zaps a page as soon as the
+  REMOVE is read and refuses other uffd operations until then. Holding free
+  page reports back in Firecracker's balloon during the copy would avoid
+  it; that needs a Firecracker change. `--stop` checkpoints and suspends
+  still pause for the whole write. Write tracking stays on once a VM has
+  had a keep-running checkpoint (one fault per 64 KiB block written between
+  checkpoints); a restored VM starts without it, so its first checkpoint is
+  full (installing its pages write-protected would allow a delta against
+  the checkpoint it came from).
 - **The restore working set is the template's** (pages a fresh VM touches to
   become ready), not the checkpointed VM's own recent working set. This host
   has no idle page tracking to record that. Everything else is paged in
