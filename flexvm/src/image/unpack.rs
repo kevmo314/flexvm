@@ -859,6 +859,34 @@ mod tests {
     }
 
     #[test]
+    fn whiteouts_hide_only_lower_entries_in_any_order() {
+        let s = Sandbox::new("wh-order");
+        let mut root = s.open();
+        root.apply_layer(&layer(&[("a/b/c/old", 'f', "old"), ("a/b/x", 'f', "x"), ("pre", 'f', "lower"), ("o/old", 'f', "o")])[..])
+            .unwrap();
+        root.apply_layer(&layer(&[
+            (".wh.pre", 'f', ""),                // before the same layer's pre
+            ("pre", 'f', "upper"),
+            ("a/b/c/new", 'f', "new"),
+            ("a/b/.wh.c", 'f', ""),              // nested: keeps c/new, drops c/old
+            ("a/b/link", 'h', "a/b/x"),          // hard link to a lower file
+            ("a/b/.wh.link", 'f', ""),           // same layer: kept
+            ("a/b/.wh.x", 'f', ""),              // lower: removed, the link keeps its data
+            ("o/new", 'f', "n"),
+            ("o/.wh..wh..opq", 'f', ""),
+            ("o/.wh.new", 'f', ""),
+        ])[..])
+        .unwrap();
+        assert_eq!(s.read("pre").as_deref(), Some("upper"));
+        assert_eq!(s.read("a/b/c/new").as_deref(), Some("new"));
+        assert_eq!(s.read("a/b/c/old"), None);
+        assert_eq!(s.read("a/b/link").as_deref(), Some("x"));
+        assert_eq!(s.read("a/b/x"), None);
+        assert_eq!(s.read("o/new").as_deref(), Some("n"));
+        assert_eq!(s.read("o/old"), None);
+    }
+
+    #[test]
     fn whiteouts_cannot_leave_their_directory() {
         for name in [&b".wh.."[..], b".wh..", b"a/.wh..", b".wh.", b"a/.wh."] {
             let s = Sandbox::new("wh");
