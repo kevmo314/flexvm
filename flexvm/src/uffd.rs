@@ -180,6 +180,10 @@ fn eagain() -> io::Error {
 /// PRESENT page zero-fills it if it is missing.
 pub struct Pages {
     states: Vec<AtomicU8>,
+    /// One bit per `CHUNK` pages: set once any of them may have left BASE.
+    /// Lets a scan skip untouched stretches without reading (and faulting
+    /// in) their part of `states`.
+    touched: Vec<AtomicU64>,
     events: RwLock<()>,
     /// One bit per page: its contents may have changed since the last
     /// checkpoint's pause (written after a write-protect fault, installed,
@@ -187,12 +191,16 @@ pub struct Pages {
     dirty: Vec<AtomicU64>,
 }
 
+/// Pages per `touched` bit: one page of `states`.
+const CHUNK: usize = 4096;
+
 impl Pages {
     pub fn new(n: usize) -> Pages {
         // BASE is 0, so a zeroed allocation (lazily backed by the kernel) is the initial state.
         let states = unsafe { std::mem::transmute::<Vec<u8>, Vec<AtomicU8>>(vec![0u8; n]) };
         let dirty = unsafe { std::mem::transmute::<Vec<u64>, Vec<AtomicU64>>(vec![0u64; n.div_ceil(64)]) };
-        Pages { states, events: RwLock::new(()), dirty }
+        let touched = (0..n.div_ceil(CHUNK * 64)).map(|_| AtomicU64::new(0)).collect();
+        Pages { states, touched, events: RwLock::new(()), dirty }
     }
 
     pub fn mark_dirty(&self, page: usize) {
@@ -223,11 +231,58 @@ impl Pages {
     }
 
     fn set(&self, page: usize, state: u8) {
+        self.touch(page);
         self.states[page].store(state, Ordering::SeqCst)
+    }
+
+    /// Marks `page`'s chunk before its state leaves BASE.
+    fn touch(&self, page: usize) {
+        let c = page / CHUNK;
+        let bit = 1u64 << (c % 64);
+        if self.touched[c / 64].load(Ordering::Relaxed) & bit == 0 {
+            self.touched[c / 64].fetch_or(bit, Ordering::SeqCst);
+        }
+    }
+
+    fn touched(&self, page: usize) -> bool {
+        let c = page / CHUNK;
+        self.touched[c / 64].load(Ordering::SeqCst) & (1 << (c % 64)) != 0
     }
 
     pub fn len(&self) -> usize {
         self.states.len()
+    }
+
+    /// The first page in `[from, end)` not in state BASE, or `end`. Skips
+    /// BASE (zero) states eight at a time: a VM's map is mostly BASE (the
+    /// unplugged virtio-mem region alone is millions of pages), and a
+    /// migration scans it with the VM paused.
+    pub fn next_not_base(&self, mut from: usize, end: usize) -> usize {
+        const W: usize = std::mem::size_of::<u64>();
+        let end = end.min(self.states.len());
+        let base = self.states.as_ptr() as usize;
+        while from < end {
+            if from % CHUNK == 0 && !self.touched(from) {
+                from += CHUNK;
+                continue;
+            }
+            if (base + from) % W == 0 && from + W <= end {
+                // SAFETY: in bounds and aligned; AtomicU8 has the layout of u8,
+                // and a relaxed 8-byte load of them is what x86 does anyway.
+                let word = unsafe { &*((base + from) as *const std::sync::atomic::AtomicU64) };
+                let w = word.load(Ordering::Relaxed);
+                if w == 0 {
+                    from += W;
+                    continue;
+                }
+                return from + (w.trailing_zeros() / 8) as usize;
+            }
+            if self.states[from].load(Ordering::Relaxed) != BASE {
+                return from;
+            }
+            from += 1;
+        }
+        end
     }
 
     /// Held while reading and applying uffd events; required by `discard`.
@@ -242,6 +297,10 @@ impl Pages {
         while n < max
             && first + n < self.states.len()
             && ok(first + n)
+            && (from != BASE || {
+                self.touch(first + n);
+                true
+            })
             && self.states[first + n].compare_exchange(from, INFLIGHT, Ordering::SeqCst, Ordering::SeqCst).is_ok()
         {
             n += 1;
@@ -251,6 +310,7 @@ impl Pages {
 
     /// Applies a REMOVE of `page`. Returns whether it resolved a REMOTE page.
     pub fn discard(&self, _removing: &RwLockWriteGuard<'_, ()>, page: usize) -> bool {
+        self.touch(page);
         let old = self.states[page]
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |s| {
                 Some(if s == INFLIGHT || s == DISCARDED { DISCARDED } else { ZERO })
@@ -695,7 +755,7 @@ impl Pager {
     }
 
     fn pages(&self) -> &Pages {
-        static EMPTY: Pages = Pages { states: Vec::new(), events: RwLock::new(()), dirty: Vec::new() };
+        static EMPTY: Pages = Pages { states: Vec::new(), touched: Vec::new(), events: RwLock::new(()), dirty: Vec::new() };
         self.pages.get().unwrap_or(&EMPTY)
     }
 
@@ -730,12 +790,11 @@ impl Pager {
         let pages = self.pages();
         for m in self.mappings() {
             let first = m.offset as usize / PAGE_SIZE;
-            for (i, p) in pages.states[first..first + m.size / PAGE_SIZE].iter().enumerate() {
-                let mut s = p.load(Ordering::Relaxed);
-                if s == BASE {
-                    continue;
-                }
-                let i = first + i;
+            let end = first + m.size / PAGE_SIZE;
+            let mut i = pages.next_not_base(first, end);
+            while i < end {
+                let p = &pages.states[i];
+                let mut s = p.load(Ordering::SeqCst);
                 while (s == INFLIGHT || s == DISCARDED) && start.elapsed() < Duration::from_secs(1) {
                     thread::sleep(Duration::from_micros(20));
                     s = p.load(Ordering::SeqCst);
@@ -743,13 +802,17 @@ impl Pager {
                 let s = match s {
                     PRESENT => REMOTE,
                     ZERO => ZERO,
-                    BASE => continue,
+                    BASE => {
+                        i = pages.next_not_base(i + 1, end);
+                        continue;
+                    }
                     s => bail!("page {i} is still in state {s}; the VM is mid-migration"),
                 };
                 match runs.last_mut() {
                     Some((f, n, st)) if *st == s && *f + *n == i as u64 => *n += 1,
                     _ => runs.push((i as u64, 1, s)),
                 }
+                i = pages.next_not_base(i + 1, end);
             }
         }
         Ok(runs)
@@ -1672,6 +1735,31 @@ mod tests {
 
     fn discard(p: &Pages, page: usize) -> bool {
         p.discard(&p.removing(), page)
+    }
+
+    #[test]
+    fn next_not_base_finds_every_state() {
+        let mut st = vec![BASE; 300];
+        for &i in &[0usize, 7, 8, 9, 63, 64, 65, 130, 299] {
+            st[i] = PRESENT;
+        }
+        let p = pages(&st);
+        for from in 0..300 {
+            for end in from..=300 {
+                let want = (from..end).find(|&i| st[i] != BASE).unwrap_or(end);
+                assert_eq!(p.next_not_base(from, end), want, "from {from} end {end}");
+            }
+        }
+        assert_eq!(p.next_not_base(10, 1000), 63);
+
+        // Untouched chunks are skipped without reading them.
+        let p = Pages::new(3 * CHUNK + 5);
+        assert_eq!(p.next_not_base(0, p.len()), p.len());
+        p.set(2 * CHUNK + 7, ZERO);
+        assert_eq!(p.next_not_base(0, p.len()), 2 * CHUNK + 7);
+        assert_eq!(p.claim(CHUNK + 3, 2, BASE, |_| true), 2);
+        assert_eq!(p.next_not_base(0, p.len()), CHUNK + 3);
+        assert_eq!(p.next_not_base(CHUNK + 5, p.len()), 2 * CHUNK + 7);
     }
 
     #[test]
