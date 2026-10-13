@@ -7,6 +7,7 @@ use std::fs::File;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -254,23 +255,64 @@ pub struct Template {
     pub meta: Meta,
     /// Pages a fresh VM touches on its way to ready, as `(first_page, count)`.
     pub working_set: Vec<(u64, u64)>,
+    /// Its guest agent predates `START`, so starts use `NET` and leave the clock alone.
+    pub legacy_agent: AtomicBool,
     map: *const u8,
     len: usize,
     /// Bitmap of pages that hold data in the memory file (the rest are holes).
     data: Vec<u64>,
     verified: Mutex<BTreeMap<String, Stamp>>,
+    /// The directory as opened, through `_handle`, whatever its path refers to now.
+    fixed: PathBuf,
+    /// The directory's inode: a different one at `dir` is another template.
+    pub ino: u64,
+    _handle: File,
 }
 
 unsafe impl Send for Template {}
 unsafe impl Sync for Template {}
 
+/// Published templates live in `templates/.gen/<content id>/` and never change
+/// afterwards (apart from cached file stamps in meta.json); `templates/NAME` is
+/// a symlink to the current generation, swapped atomically by `create`. A
+/// running VM keeps the generation it was restored from.
+pub const GENERATIONS: &str = ".gen";
+
 impl Template {
+    /// The directory `templates/name` currently stands for: its generation, or
+    /// the directory itself for a template made before generations existed.
+    pub fn resolve(paths: &Paths, name: &str) -> Result<PathBuf> {
+        let link = paths.templates.join(name);
+        match std::fs::read_link(&link) {
+            Ok(target) => Ok(paths.templates.join(target)),
+            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => Ok(link),
+            Err(e) => bail!("template {name:?}: {e}"),
+        }
+    }
+
+    /// Generation `id` of template `name`, if this host has it.
+    pub fn generation(paths: &Paths, id: &str) -> Option<PathBuf> {
+        let dir = paths.templates.join(GENERATIONS).join(id);
+        (!id.is_empty() && !id.contains('/') && dir.is_dir()).then_some(dir)
+    }
+
     pub fn open(paths: &Paths, name: &str) -> Result<Arc<Template>> {
-        let dir = paths.templates.join(name);
+        Template::open_dir(name, Template::resolve(paths, name)?)
+    }
+
+    /// Opens the template files in `dir`, which `open` resolved from `name`.
+    pub fn open_dir(name: &str, dir: PathBuf) -> Result<Arc<Template>> {
+        // Everything is read through one handle on the directory, and so is
+        // the vmstate Firecracker loads later (`vmstate`): a template from
+        // before generations is replaced by renaming another directory over
+        // its path, and this one must keep reading the files it started with.
+        let handle = File::open(&dir).map_err(|e| format!("template {name:?}: {e}"))?;
+        let ino = handle.metadata()?.ino();
+        let fixed = PathBuf::from(format!("/proc/{}/fd/{}", std::process::id(), handle.as_raw_fd()));
         let meta: Meta = serde_json::from_slice(
-            &std::fs::read(dir.join("meta.json")).map_err(|e| format!("template {name:?}: {e}"))?,
+            &std::fs::read(fixed.join("meta.json")).map_err(|e| format!("template {name:?}: {e}"))?,
         )?;
-        let file = File::open(dir.join("mem"))?;
+        let file = File::open(fixed.join("mem"))?;
         let len = file.metadata()?.len() as usize;
         let data = data_bitmap(&file, len)?;
         let map = unsafe {
@@ -279,7 +321,7 @@ impl Template {
         if map == libc::MAP_FAILED {
             bail!("mmap template memory: {}", std::io::Error::last_os_error());
         }
-        let working_set = std::fs::read(dir.join("wset"))
+        let working_set = std::fs::read(fixed.join("wset"))
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
@@ -288,10 +330,14 @@ impl Template {
             dir,
             meta,
             working_set,
+            legacy_agent: AtomicBool::new(false),
             map: map as *const u8,
             len,
             data,
             verified: Mutex::default(),
+            fixed,
+            ino,
+            _handle: handle,
         }))
     }
 
@@ -322,8 +368,17 @@ impl Template {
         Ok(())
     }
 
+    /// Identifies this generation: its content id (or directory, for old templates).
+    pub fn key(&self) -> String {
+        if self.meta.id.is_empty() {
+            self.dir.display().to_string()
+        } else {
+            self.meta.id.clone()
+        }
+    }
+
     pub fn vmstate(&self) -> PathBuf {
-        self.dir.join("vmstate")
+        self.fixed.join("vmstate")
     }
 
     pub fn has_data(&self, page: usize) -> bool {
@@ -444,7 +499,7 @@ fn record_working_set(paths: &Paths, name: &str, tap: &str) -> Result<usize> {
         }),
     )?;
     retry(Duration::from_secs(10), || guest::ping(&run.join("v.sock")))?;
-    guest::net(&run.join("v.sock"), "10.255.255.254".parse()?, None)?;
+    guest::start(&run.join("v.sock"), "10.255.255.254".parse()?, None, &tpl.legacy_agent)?;
     // Like `run`: start a cold image template's app.
     if tpl.meta.image.as_ref().is_some_and(|i| !i.warm) {
         guest::start_app(&run.join("v.sock"))?;
@@ -470,15 +525,37 @@ pub fn create(paths: &Paths, name: &str, vcpus: u32, mem_mib: u64, max_mib: u64,
     let _ = std::fs::remove_dir_all(paths.templates.join(&staging));
     let res = build(paths, &staging, name, vcpus, mem_mib, max_mib, &tap, image);
     crate::net::delete_tap(&tap);
-    if res.is_err() {
-        let _ = std::fs::remove_dir_all(paths.templates.join(&staging));
-        return res;
+    let staged = paths.templates.join(&staging);
+    let res = res.and_then(|()| publish(paths, name, &staged));
+    let _ = std::fs::remove_dir_all(&staged);
+    res
+}
+
+/// Moves a finished build into its generation directory and points
+/// `templates/name` at it with one atomic rename of a symlink. Nothing is ever
+/// deleted here: running and suspended VMs, migrations, pooled VMs and
+/// checkpoints refer to generations by content id, so old generations stay
+/// until an operator removes them (see the README).
+fn publish(paths: &Paths, name: &str, staged: &Path) -> Result<()> {
+    let meta: Meta = serde_json::from_slice(&std::fs::read(staged.join("meta.json"))?)?;
+    let gens = paths.templates.join(GENERATIONS);
+    std::fs::create_dir_all(&gens)?;
+    let gen = gens.join(&meta.id);
+    if !gen.exists() {
+        std::fs::rename(staged, &gen)?;
     }
     let live = paths.templates.join(name);
+    let tmp = paths.templates.join(format!(".{name}.link-{}", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    std::os::unix::fs::symlink(Path::new(GENERATIONS).join(&meta.id), &tmp)?;
+    // A template from before generations is a plain directory: move it aside first.
+    let legacy = std::fs::symlink_metadata(&live).is_ok_and(|m| m.is_dir());
     let old = paths.templates.join(format!(".{name}.old-{}", std::process::id()));
-    let had_old = std::fs::rename(&live, &old).is_ok();
-    std::fs::rename(paths.templates.join(&staging), &live)?;
-    if had_old {
+    if legacy {
+        std::fs::rename(&live, &old)?;
+    }
+    std::fs::rename(&tmp, &live)?;
+    if legacy {
         // Unlinked files stay valid for the VMs still mapping them.
         let _ = std::fs::remove_dir_all(&old);
     }
@@ -626,6 +703,45 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
+    }
+
+    #[test]
+    fn publish_swaps_generations_and_keeps_them_all() {
+        let f = Fixture::new();
+        let stage = |id: &str| {
+            let dir = f.dir.join(format!(".t.new-{id}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let meta = Meta { id: id.into(), ..f.meta.clone() };
+            std::fs::write(dir.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+            std::fs::write(dir.join("vmstate"), id).unwrap();
+            dir
+        };
+        let current = || std::fs::read_to_string(Template::resolve(&f.paths, "t").unwrap().join("vmstate")).unwrap();
+        let gens = || {
+            let mut g: Vec<String> = std::fs::read_dir(f.dir.join(GENERATIONS))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect();
+            g.sort();
+            g
+        };
+        // A template from before generations: a plain directory.
+        std::fs::create_dir_all(f.dir.join("t")).unwrap();
+        std::fs::write(f.dir.join("t/vmstate"), "legacy").unwrap();
+        assert_eq!(current(), "legacy");
+        publish(&f.paths, "t", &stage("a")).unwrap();
+        assert_eq!(current(), "a");
+        let a = Template::resolve(&f.paths, "t").unwrap();
+        publish(&f.paths, "t", &stage("b")).unwrap();
+        assert_eq!(current(), "b");
+        // Whoever resolved `a` before the swap still reads a's files.
+        assert_eq!(std::fs::read_to_string(a.join("vmstate")).unwrap(), "a");
+        assert_eq!(gens(), ["a", "b"]);
+        publish(&f.paths, "t", &stage("c")).unwrap();
+        assert_eq!(current(), "c");
+        assert_eq!(gens(), ["a", "b", "c"]);
+        assert_eq!(Template::generation(&f.paths, "a"), Some(f.dir.join(GENERATIONS).join("a")));
+        assert_eq!(Template::generation(&f.paths, "x"), None);
     }
 
     #[test]

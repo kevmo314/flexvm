@@ -96,6 +96,8 @@ impl Daemon {
     }
 
     pub(super) fn pause(&self, name: &str) -> Result<Value> {
+        // Counted, so a shutdown lets it finish first.
+        let _op = self.admit()?;
         let _busy = self.reserve(name, "pausing", LIFECYCLE_WAIT)?;
         let vm = self.vm(name)?;
         let start = Instant::now();
@@ -105,6 +107,8 @@ impl Daemon {
 
     /// Resumes a paused VM, or restores a suspended one from its checkpoint.
     pub(super) fn resume(self: &Arc<Self>, name: &str) -> Result<Value> {
+        // Counted, so a shutdown lets it finish first.
+        let _op = self.admit()?;
         let busy = self.reserve(name, "resuming", LIFECYCLE_WAIT)?;
         if let Ok(vm) = self.vm(name) {
             let start = Instant::now();
@@ -150,7 +154,7 @@ impl Daemon {
             // Its vCPUs may have run, so its checkpoint is consumed:
             // re-arming it would replay whatever the VM did since.
             Err(Restore::Ran(e)) => {
-                self.ips.lock().unwrap().remove(&s.manifest.ip);
+                self.addrs.lock().unwrap().used.remove(&s.manifest.ip);
                 if let Err(r) = delete_checkpoint(&s.dir) {
                     eprintln!("vm {name}: removing {}: {r}", s.dir.display());
                 }
@@ -161,6 +165,8 @@ impl Daemon {
 
     /// Checkpoints `name` to `dir`, then resumes it or (`stop`) kills it.
     pub(super) fn checkpoint(self: &Arc<Self>, name: &str, dir: &str, stop: bool) -> Result<Value> {
+        // Counted, so a shutdown lets it finish first.
+        let _op = self.admit()?;
         let mut t = Phases::new();
         let busy = self.reserve(name, "checkpointing", LIFECYCLE_WAIT)?;
         let vm = self.vm(name)?;
@@ -196,6 +202,8 @@ impl Daemon {
 
     /// Suspends `name` to local disk and frees its memory.
     pub(super) fn suspend(&self, name: &str) -> Result<Value> {
+        // Counted, so a shutdown lets it finish first.
+        let _op = self.admit()?;
         let mut t = Phases::new();
         let _busy = self.reserve(name, "suspending", LIFECYCLE_WAIT)?;
         if name.is_empty() || name.starts_with('.') || name.contains('/') {
@@ -239,6 +247,8 @@ impl Daemon {
     /// Restores the checkpoint at `dir` as a new VM, by default with the name
     /// and address it was checkpointed with.
     pub(super) fn restore(&self, dir: &str, name: Option<&str>, ip: Option<&str>, paused: bool) -> Result<Value> {
+        // Counted, so a shutdown lets it finish first.
+        let _op = self.admit()?;
         let mut t = Phases::new();
         let ck = Checkpoint::open(Path::new(dir))?;
         t.mark("verify_checkpoint");
@@ -248,8 +258,8 @@ impl Daemon {
             bail!("vm name {name:?} is empty or taken");
         }
         let ip = match ip {
-            Some("auto") => self.claim_ip(None)?,
-            Some(ip) => self.claim_ip(Some(ip))?,
+            Some("auto") => self.claim_ip_kept(None)?,
+            Some(ip) => self.claim_ip_kept(Some(ip))?,
             None => {
                 let ip = ck.manifest.ip;
                 for peer in &self.cfg.peers {
@@ -258,14 +268,14 @@ impl Daemon {
                         bail!("{ip} is in use on {peer}; restore with --ip");
                     }
                 }
-                self.claim_ip(Some(&ip.to_string()))?
+                self.claim_ip_kept(Some(&ip.to_string()))?
             }
         };
         t.mark("claim_ip");
         // A user's checkpoint is immutable and may be restored again whether
         // or not this VM got to run.
         self.restore_checkpoint(&name, ck, ip, false, paused, &mut t).map_err(|e| {
-            self.ips.lock().unwrap().remove(&ip);
+            self.addrs.lock().unwrap().used.remove(&ip);
             e.error()
         })
     }
@@ -278,7 +288,7 @@ impl Daemon {
     fn restore_checkpoint(&self, name: &str, ck: Checkpoint, ip: Ipv4Addr, owned: bool, hold: bool, t: &mut Phases) -> std::result::Result<Value, Restore> {
         let m = ck.manifest.clone();
         let (vm, restore) = (|| -> Result<_> {
-            let tpl = self.template(&m.template)?;
+            let tpl = self.template_with_id(&m.template, &m.template_id)?;
             tpl.check_id(&m.template_id)?;
             tpl.verify(&self.cfg.paths, true)?;
             t.mark("verify_template");
@@ -457,7 +467,7 @@ impl Daemon {
             }
             match Checkpoint::open(&e.path()) {
                 Ok(ck) => {
-                    if !self.ips.lock().unwrap().insert(ck.manifest.ip) {
+                    if !self.addrs.lock().unwrap().used.insert(ck.manifest.ip) {
                         eprintln!("suspended vm {name}: {} is already taken", ck.manifest.ip);
                     }
                     eprintln!("suspended vm {name} ({}) found in {}", ck.manifest.ip, e.path().display());
@@ -473,7 +483,7 @@ impl Daemon {
     /// Steps the guest's clock in the background, if it is off: under the
     /// VM's reservation (so never inside a snapshot or on a VM that has
     /// migrated on), and at most one at a time per VM.
-    fn sync_clock_later(self: &Arc<Self>, vm: Arc<Vm>) {
+    pub(super) fn sync_clock_later(self: &Arc<Self>, vm: Arc<Vm>) {
         if vm.clock_pending.swap(true, Ordering::SeqCst) {
             return;
         }

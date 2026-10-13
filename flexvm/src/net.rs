@@ -90,9 +90,13 @@ pub fn delete_taps_with_prefix(prefix: &str) {
 }
 
 /// Routes `ip` to the VM behind `tap`, with a permanent neighbor entry so the
-/// first packet does not wait on ARP.
+/// first packet does not wait on ARP. Called as a tap is handed to a VM, so it
+/// first puts the gateway MAC back on the tap: udev (`MACAddressPolicy=persistent`)
+/// may have replaced it after `create_tap`, and the guest's pinned ARP entry
+/// for its gateway would then point nowhere.
 pub fn attach(ip: Ipv4Addr, tap: &str) -> Result<()> {
     let ifindex = ifindex(tap)?;
+    set_mac(ifindex, &parse_mac(GATEWAY_MAC)?)?;
     let mut route = rtmsg(RT_SCOPE_LINK);
     attr(&mut route, RTA_DST, &ip.octets());
     attr(&mut route, RTA_OIF, &ifindex.to_ne_bytes());
@@ -105,6 +109,18 @@ pub fn attach(ip: Ipv4Addr, tap: &str) -> Result<()> {
     attr(&mut neigh, NDA_DST, &ip.octets());
     attr(&mut neigh, NDA_LLADDR, &parse_mac(GUEST_MAC)?);
     netlink(RTM_NEWNEIGH, NLM_F_CREATE | NLM_F_REPLACE, &neigh)
+}
+
+/// Sets a link's MAC address with one RTM_SETLINK; a no-op if it already has it.
+fn set_mac(ifindex: u32, mac: &[u8; 6]) -> Result<()> {
+    // struct ifinfomsg: family, pad, type, index, flags, change.
+    let mut msg = Vec::with_capacity(28);
+    msg.extend_from_slice(&[libc::AF_UNSPEC as u8, 0, 0, 0]);
+    msg.extend_from_slice(&(ifindex as i32).to_ne_bytes());
+    msg.extend_from_slice(&0u32.to_ne_bytes());
+    msg.extend_from_slice(&0u32.to_ne_bytes());
+    attr(&mut msg, IFLA_ADDRESS, mac);
+    netlink(RTM_SETLINK, 0, &msg)
 }
 
 /// Routes `ip` to the host at `via`, where the VM now lives.
@@ -123,6 +139,7 @@ pub fn unroute(ip: Ipv4Addr) {
 
 // Just enough rtnetlink to change routes and neighbours without spawning
 // `ip`, which costs tens of milliseconds on a busy host.
+const RTM_SETLINK: u16 = 19;
 const RTM_NEWROUTE: u16 = 24;
 const RTM_DELROUTE: u16 = 25;
 const RTM_NEWNEIGH: u16 = 28;
@@ -131,6 +148,7 @@ const NLM_F_REQUEST: u16 = 0x1;
 const NLM_F_ACK: u16 = 0x4;
 const NLM_F_REPLACE: u16 = 0x100;
 const NLM_F_CREATE: u16 = 0x400;
+const IFLA_ADDRESS: u16 = 1;
 const RTA_DST: u16 = 1;
 const RTA_OIF: u16 = 4;
 const RTA_GATEWAY: u16 = 5;
@@ -272,6 +290,12 @@ pub struct IpRange {
     last: u32,
 }
 
+impl std::fmt::Display for IpRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}-{}", Ipv4Addr::from(self.first), Ipv4Addr::from(self.last))
+    }
+}
+
 impl IpRange {
     pub fn parse(s: &str) -> Result<IpRange> {
         if let Some((a, b)) = s.split_once('-') {
@@ -290,6 +314,14 @@ impl IpRange {
         let base = u32::from(net.parse::<Ipv4Addr>()?) & mask;
         // Skip the network and broadcast addresses.
         Ok(IpRange { first: base + 1, last: (base | !mask) - 1 })
+    }
+
+    pub fn contains(&self, ip: Ipv4Addr) -> bool {
+        (self.first..=self.last).contains(&u32::from(ip))
+    }
+
+    pub fn overlaps(&self, other: &IpRange) -> bool {
+        self.first <= other.last && other.first <= self.last
     }
 
     /// The first address in the range that `taken` rejects.

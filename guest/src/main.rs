@@ -3,10 +3,13 @@
 //! Sets up a writable overlay on top of the read-only (DAX) root, then serves
 //! a tiny command protocol on vsock so the host can run things in the VM.
 //!
-//! Request: one text line, `PING`, `NET <ip> [dns]`, `EXEC <len>` or `SPAWN <len>`;
-//! EXEC/SPAWN are followed by `len` bytes of shell command. Resumable commands use
-//! `SESSION <id> <len>`, `ATTACH <id> <offset>` and `CLOSE <id>` (see session.rs).
-//! Image templates add the app requests in `app.rs`.
+//! Request: one text line, `PING`, `NET <ip> [dns]`, `START <ip> <secs.nanos> [dns]`,
+//! `EXEC <len>` or `SPAWN <len>`; EXEC/SPAWN are followed by `len` bytes of shell
+//! command. `START` is `NET` plus the host's wall clock, sent on every start;
+//! `CLOCK <secs.nanos>` sets just the clock, after a migration or a resume;
+//! `FORKS` counts the RNG reseeds for new VMGenIDs the kernel has done.
+//! Resumable commands use `SESSION <id> <len>`, `ATTACH <id> <offset>` and
+//! `CLOSE <id>` (see session.rs). Image templates add the app requests in `app.rs`.
 //! Response: frames of `[kind u8][len u32 LE][payload]`, where kind is
 //! 1 = stdout, 2 = stderr, 3 = exit code (i32 LE), 4 = message.
 
@@ -237,7 +240,7 @@ fn serve(statuses: Statuses) -> io::Result<()> {
         // NET is on the critical path of every start, right after restore, when a new
         // thread (stack, task, a wakeup on another vCPU) costs milliseconds. PING and
         // NET are quick, so answer them here; only commands get a thread.
-        if line.starts_with("PING") || line.starts_with("NET ") {
+        if ["PING", "NET ", "START ", "CLOCK ", "FORKS"].iter().any(|v| line.starts_with(v)) {
             let _ = handle(stream, r, &line, &statuses);
         } else {
             let statuses = statuses.clone();
@@ -297,6 +300,36 @@ fn handle(stream: std::fs::File, mut r: BufReader<std::fs::File>, line: &str, st
                 Err(e) => frame(&out, FRAME_MSG, format!("error: {e}").as_bytes()),
             }
         }
+        // START <ipv4> <unix time secs.nanos> [nameserver]: NET for a VM that was just
+        // restored or resumed, plus the host's wall clock. The guest clock otherwise
+        // carries on from the moment the template was snapshotted.
+        "START" => {
+            let mut parts = arg.split_whitespace();
+            let (ip, now, dns) = (parts.next(), parts.next(), parts.next());
+            let res = match (ip.map(|ip| ip.parse()), now.and_then(parse_time)) {
+                (Some(Ok(ip)), Some(now)) => net::configure(ip, dns).map_err(|e| e.to_string()).map(|()| now),
+                _ => Err(format!("bad start request {arg:?}")),
+            };
+            // Acked only once the clock is set, so "ok" means it is.
+            match res.and_then(set_clock) {
+                Ok(_) => frame(&out, FRAME_MSG, b"ok"),
+                Err(e) => frame(&out, FRAME_MSG, format!("error: {e}").as_bytes()),
+            }
+        }
+        // CLOCK <unix time secs.nanos>: the host's wall clock, after a VM resumed
+        // from a pause or arrived by migration (which costs it the downtime).
+        // Answers `ok <ns>`: how far off the clock was (guest minus host).
+        "CLOCK" => match parse_time(arg.trim()).ok_or_else(|| format!("bad time {arg:?}")).and_then(set_clock) {
+            Ok(off) => frame(&out, FRAME_MSG, format!("ok {off}").as_bytes()),
+            Err(e) => frame(&out, FRAME_MSG, format!("error: {e}").as_bytes()),
+        },
+        // FORKS: how many times the kernel has reseeded its RNG for a new
+        // VMGenID, i.e. how many snapshot restores this guest has finished
+        // processing. See `forks`.
+        "FORKS" => match forks() {
+            Ok(n) => frame(&out, FRAME_MSG, format!("ok {n}").as_bytes()),
+            Err(e) => frame(&out, FRAME_MSG, format!("error: {e}").as_bytes()),
+        },
         "SPAWN" => {
             let child = spawn(
                 Command::new("/bin/sh")
@@ -342,6 +375,69 @@ fn handle(stream: std::fs::File, mut r: BufReader<std::fs::File>, line: &str, st
         _ => frame(&out, FRAME_MSG, format!("unknown request {verb:?}").as_bytes()),
     }
 }
+
+/// Parses `secs.nanos` (nanos zero-padded to 9 digits).
+fn parse_time(s: &str) -> Option<libc::timespec> {
+    let (secs, nanos) = s.split_once('.')?;
+    let nanos: i64 = nanos.parse().ok().filter(|n| (0..1_000_000_000).contains(n) && nanos.len() == 9)?;
+    Some(libc::timespec { tv_sec: secs.parse().ok()?, tv_nsec: nanos as _ })
+}
+
+/// Steps CLOCK_REALTIME to `now` unless it is already within a few ms (the
+/// request's own transit time), which leaves a clock that is right alone.
+/// (The host makes sure no clock request is still in flight when it
+/// snapshots the VM; see `Vm::start_source`.)
+/// Returns how far off the clock was (ns, guest minus `now`).
+fn set_clock(now: libc::timespec) -> Result<i128, String> {
+    let ns = |t: &libc::timespec| t.tv_sec as i128 * 1_000_000_000 + t.tv_nsec as i128;
+    let mut cur = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut cur) };
+    let off = ns(&cur) - ns(&now);
+    if off.abs() < 5_000_000 {
+        return Ok(off);
+    }
+    if unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &now) } != 0 {
+        return Err(format!("set clock: {}", io::Error::last_os_error()));
+    }
+    Ok(off)
+}
+
+/// Counts "crng reseeded due to virtual machine fork" in the kernel log.
+/// The kernel prints it in add_vmfork_randomness() right after crng_reseed()
+/// for a new VMGenID, so once the count has gone up since a snapshot was
+/// taken, everything that reads the RNG from then on gets fresh state. (This
+/// kernel's vmgenid sends no uevent, and /dev/sysgenid's counter is not
+/// ordered against the reseed.) Reads the whole ring buffer, so it needs no
+/// state from before the snapshot.
+fn forks() -> io::Result<usize> {
+    let fd = unsafe { libc::open(c"/dev/kmsg".as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mut buf = vec![0u8; 8192];
+    let mut n = 0;
+    loop {
+        let r = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+        if r < 0 {
+            match io::Error::last_os_error().raw_os_error() {
+                // Records overwritten while reading; carry on with the next.
+                Some(libc::EPIPE) => continue,
+                Some(libc::EAGAIN) => return Ok(n),
+                _ => return Err(io::Error::last_os_error()),
+            }
+        }
+        if r == 0 {
+            return Ok(n);
+        }
+        let record = &buf[..r as usize];
+        if record.windows(FORK_MSG.len()).any(|w| w == FORK_MSG) {
+            n += 1;
+        }
+    }
+}
+
+const FORK_MSG: &[u8] = b"crng reseeded due to virtual machine fork";
 
 fn pump(mut r: impl Read + Send + 'static, out: Arc<Mutex<std::fs::File>>, kind: u8) -> thread::JoinHandle<()> {
     thread::spawn(move || {

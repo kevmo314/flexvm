@@ -259,6 +259,9 @@ impl Pages {
     }
 }
 
+/// How long a Firecracker has to connect to its pager once started.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub struct Pager {
     base: Arc<Template>,
     mappings: OnceLock<Vec<Mapping>>,
@@ -282,6 +285,8 @@ pub struct Pager {
     quiesce: AtomicBool,
     failed: OnceLock<String>,
     stop: AtomicBool,
+    /// The fault-serving thread, joined by `join`.
+    thread: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 impl Pager {
@@ -291,6 +296,8 @@ impl Pager {
     pub fn start(sock: &Path, base: Arc<Template>, initial: Option<(Runs, Origin)>) -> Result<Arc<Pager>> {
         let _ = std::fs::remove_file(sock);
         let listener = UnixListener::bind(sock)?;
+        // Polled, so a Firecracker that never connects cannot hold the thread forever.
+        listener.set_nonblocking(true)?;
         let pager = Arc::new(Pager {
             base,
             mappings: OnceLock::new(),
@@ -309,9 +316,10 @@ impl Pager {
             quiesce: AtomicBool::new(false),
             failed: OnceLock::new(),
             stop: AtomicBool::new(false),
+            thread: Mutex::new(None),
         });
         let p = pager.clone();
-        thread::Builder::new().name("uffd".into()).spawn(move || {
+        let thread = thread::Builder::new().name("uffd".into()).spawn(move || {
             let prefetch = match p.handshake(&listener, initial) {
                 Ok(prefetch) => prefetch,
                 Err(e) => return p.fail(format!("uffd handshake failed: {e}")),
@@ -324,12 +332,50 @@ impl Pager {
             }
             p.serve();
         })?;
+        *pager.thread.lock().unwrap() = Some(thread);
         Ok(pager)
+    }
+
+    /// Waits for the pager thread to finish, after `stop` (or Firecracker's exit).
+    pub fn join(&self) {
+        let thread = self.thread.lock().unwrap().take();
+        if let Some(t) = thread.filter(|t| t.thread().id() != thread::current().id()) {
+            let _ = t.join();
+        }
     }
 
     /// Takes over Firecracker's userfaultfd. Returns whether to prefetch the working set.
     fn handshake(&self, listener: &UnixListener, initial: Option<(Runs, Origin)>) -> Result<bool> {
-        let (stream, _) = listener.accept()?;
+        let start = Instant::now();
+        let stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if self.stop.load(Ordering::SeqCst) {
+                        bail!("stopped before Firecracker connected");
+                    }
+                    if start.elapsed() > HANDSHAKE_TIMEOUT {
+                        bail!("Firecracker did not connect within {HANDSHAKE_TIMEOUT:?}");
+                    }
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        };
+        // The same deadline and stop for the handshake message itself.
+        loop {
+            let mut pfd = libc::pollfd { fd: stream.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+            if unsafe { libc::poll(&mut pfd, 1, 10) } > 0 {
+                break;
+            }
+            if self.stop.load(Ordering::SeqCst) {
+                bail!("stopped before Firecracker sent its handshake");
+            }
+            if start.elapsed() > HANDSHAKE_TIMEOUT {
+                bail!("Firecracker sent no handshake within {HANDSHAKE_TIMEOUT:?}");
+            }
+        }
+        stream.set_nonblocking(false)?;
         let (body, fd) = recv_with_fd(stream.as_raw_fd())?;
         let mappings: Vec<Mapping> = serde_json::from_slice(&body)?;
         let total = mappings.iter().map(|m| m.offset as usize + m.size).max().unwrap_or(0) / PAGE_SIZE;
@@ -487,6 +533,8 @@ impl Pager {
 
     pub fn stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
+        // Also ends a prefetch still running (e.g. for a drained hot pool's VM).
+        self.quiesce.store(true, Ordering::SeqCst);
         self.notify();
     }
 
@@ -504,6 +552,14 @@ impl Pager {
             }
         }
         self.stop();
+    }
+
+    /// SIGKILLs the Firecracker through its pidfd, without waiting for
+    /// anything (such as a call holding the VM's API lock).
+    pub fn kill_firecracker(&self) {
+        if let Some(fd) = self.pidfd.get() {
+            let _ = crate::util::pidfd_kill(fd);
+        }
     }
 
     /// Why the pager gave up, if it did. The VM cannot make progress then.

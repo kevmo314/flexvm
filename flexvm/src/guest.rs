@@ -3,7 +3,8 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::bail;
 use crate::util::Result;
@@ -133,6 +134,66 @@ pub fn exec(uds: &Path, cmd: &str) -> Result<(i32, Vec<u8>)> {
         }
     }
     bail!("guest closed the connection before the command exited")
+}
+
+/// Tells a just started (or resumed) guest its address, nameserver and the
+/// wall-clock time: its clock otherwise carries on from the template snapshot.
+/// Doubles as the readiness check. Agents that predate `START` get `NET`
+/// instead, and `legacy` remembers that for the template.
+pub fn start(uds: &Path, ip: std::net::Ipv4Addr, dns: Option<&str>, legacy: &AtomicBool) -> Result<()> {
+    if legacy.load(Ordering::Relaxed) {
+        return net(uds, ip, dns);
+    }
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
+    let line = format!("START {ip} {}.{:09} {}", now.as_secs(), now.subsec_nanos(), dns.unwrap_or(""));
+    let mut r = request(uds, &line, TIMEOUT)?;
+    match read_frame(&mut r)? {
+        Some((FRAME_MSG, m)) if m == b"ok" => Ok(()),
+        Some((FRAME_MSG, m)) if m.starts_with(b"unknown request") => {
+            legacy.store(true, Ordering::Relaxed);
+            net(uds, ip, dns)
+        }
+        Some((_, m)) => bail!("guest start: {}", String::from_utf8_lossy(&m)),
+        None => bail!("guest closed the connection during start"),
+    }
+}
+
+/// Steps the guest's wall clock to the host's, e.g. after a migration (the
+/// guest's clock misses the downtime) or a resume. A no-op for agents that
+/// predate it (`legacy`).
+///
+/// Returns how far off the guest clock was (ms, guest minus host), or None
+/// if the agent cannot do it.
+pub fn clock(uds: &Path, legacy: &AtomicBool, timeout: Duration) -> Result<Option<f64>> {
+    if legacy.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
+    let mut r = request(uds, &format!("CLOCK {}.{:09}", now.as_secs(), now.subsec_nanos()), timeout)?;
+    match read_frame(&mut r)? {
+        Some((FRAME_MSG, m)) if m.starts_with(b"ok") => {
+            let off: f64 = String::from_utf8_lossy(&m[2..]).trim().parse().unwrap_or(0.0);
+            Ok(Some(off / 1e6))
+        }
+        Some((FRAME_MSG, m)) if m.starts_with(b"unknown request") => {
+            legacy.store(true, Ordering::Relaxed);
+            Ok(None)
+        }
+        Some((_, m)) => bail!("guest clock: {}", String::from_utf8_lossy(&m)),
+        None => bail!("guest closed the connection while setting the clock"),
+    }
+}
+
+/// How many times the guest kernel has reseeded its RNG for a new VMGenID
+/// (`FORKS`), or None if the agent predates the request.
+pub fn forks(uds: &Path) -> Result<Option<usize>> {
+    let mut r = request(uds, "FORKS", TIMEOUT)?;
+    match read_frame(&mut r)? {
+        Some((FRAME_MSG, m)) if m.starts_with(b"ok ") => Ok(Some(String::from_utf8_lossy(&m[3..]).trim().parse()?)),
+        Some((FRAME_MSG, m)) if m.starts_with(b"unknown request") => Ok(None),
+        Some((_, m)) => bail!("guest forks: {}", String::from_utf8_lossy(&m)),
+        None => bail!("guest closed the connection"),
+    }
 }
 
 /// Sets the guest's address (and nameserver). Doubles as the readiness check.

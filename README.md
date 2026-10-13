@@ -13,7 +13,7 @@ in tens of milliseconds.
 | Memory growth | 256 MiB base + a virtio-mem region up to host RAM. The daemon hot-plugs 128 MiB slots when the guest's available memory drops below 25% (min 256 MiB), and unplugs when it has lots spare. |
 | Memory return | virtio-balloon **free page reporting**: pages the guest frees go back to the host within seconds. |
 | Root filesystem | One read-only ext4 image on virtio-pmem with DAX, shared by every VM through the host page cache. Writes go to a tmpfs overlay inside the guest, so they migrate with memory. |
-| Start | Every VM is a **UFFD restore of a template snapshot** into a pre-spawned, pre-cgrouped Firecracker. The template's recorded working set is copied in bulk; everything else is faulted in lazily from a shared, sparse template image. |
+| Start | Every VM is a **UFFD restore of a template snapshot** into a pre-spawned, pre-cgrouped Firecracker. The template's recorded working set is copied in bulk; everything else is faulted in lazily from a shared, sparse template image. A **hot pool** keeps VMs already restored and paused, so `run` is usually just a resume. |
 | Migration | **Post-copy**: pause, save vCPU and device state only (~20–200 KiB), resume on the target, then the target's pager fetches pages from the paused source on fault and in the background. The source releases the VM once every page has arrived, and never resumes it once the target may own it. |
 | Pressure | If a VM needs to grow and the host would drop below `--reserve`, or the host is already below it, the daemon migrates that VM to the peer with the most spare memory. |
 | Network | Each VM has its own IPv4 /32 routed to a per-VM tap. The address moves with the VM, so open TCP connections survive migration. See below. |
@@ -209,6 +209,65 @@ twice).
 (`pages`, `route`, `lost_ack`, `status`); `scripts/faults.py` uses it to check
 each failure path.
 
+### Hot pool
+
+`run` takes a VM from the template's hot pool when one is ready: it was
+restored in the background exactly like any other VM (same pager, so it
+migrates and checkpoints like any other), then paused. Starting it is: route
+its address to its tap, resume, `START`. When the pool is empty, `run` falls
+back to loading the snapshot then and there.
+
+- **Size.** `--hot N` per template (default 2, `0` disables) within
+  `--hot-mib` of host memory for all of them together, the VM being loaded
+  included (default 512; a paused 24-vCPU VM costs ~26 MiB here). One
+  background worker refills, one VM at a time; it gives back the newest
+  paused VMs when the stock outgrows the budget, and loads nothing while the
+  host is below `--reserve` + one VM. The memory controller drops the pool
+  (and any load in progress) when the host goes below `--reserve`.
+- **Generations.** `flexvm template` publishes each build as an immutable
+  `templates/.gen/<content id>/` and points `templates/NAME` at it with one
+  atomic symlink swap. It never deletes a generation: VMs, migrations, pooled
+  VMs and checkpoints refer to them by content id. Remove old ones by hand
+  (`rm -r templates/.gen/<id>`) once no daemon has a VM from them (`flexvm ls`
+  shows each VM's template id). The daemon resolves the link on every `run` (one
+  readlink), so new VMs and new pooled VMs use the new generation while
+  running VMs keep theirs; the stock of the old one is dropped. An incoming
+  migration uses the generation with the source's content id if the host has
+  it. A template opened from a plain directory (made before generations) is
+  read through a handle on that directory, so swapping another one over its
+  path cannot mix files either.
+- **Settling.** The first run after a restore is slow (Firecracker's first
+  resume, the guest catching up and handling the new VMGenID: ~10 ms of extra
+  `NET` latency here). Each pooled VM therefore runs once in the background,
+  as long as the reseed below takes plus 50 ms, then is paused. Firecracker
+  calls in a load have deadlines, and shutdown kills a load in progress.
+- **RNG.** Firecracker gives every snapshot load a new VMGenID; on it, the
+  guest kernel reseeds its RNG and then logs `random: crng reseeded due to
+  virtual machine fork` (add_vmfork_randomness). The agent's `FORKS` counts
+  those lines in `/dev/kmsg`, and a pooled VM is only stocked once the count
+  has gone up, so no two handed-out VMs of a template share RNG state; until
+  then only the idle agent runs. That is what is provable here: this kernel's
+  vmgenid sends no uevent, and `/dev/sysgenid` is not ordered against the
+  reseed. With an agent that has no `FORKS`, a pooled VM is only checked to
+  answer (logged once). VMs restored on the fallback path or migrated reseed
+  after resume, as before.
+- **Clock.** The guests use the TSC clocksource, so Firecracker's
+  `clock_realtime` (which adjusts kvmclock) has no effect: a VM's wall clock
+  starts at the template's snapshot time, whether pooled or not (minutes to
+  days behind). The TSC keeps running while a VM is paused, so a pause adds no
+  further error. The agent's `START <ip> <unix time> [dns]` (sent instead of
+  `NET`) sets the address and steps `CLOCK_REALTIME` to the host's time, and
+  answers only then. A pooled VM gets its clock stepped (`CLOCK`) while it
+  settles, so `START` at take finds it right and skips `clock_settime`, which
+  can take tens of ms in a 24-vCPU guest. A migration target, after resuming,
+  and a source that resumes after an aborted migration send `CLOCK` in the
+  background, repeated until a round trip is short, so the guest gets back
+  the downtime too: measured within ±2 ms. If a clock request fails it may
+  still be on its way into the guest, so the next migration first waits for
+  the agent to answer a ping (it serves requests in order) rather than let it
+  land, stale, after the snapshot. Agents that predate `START` get `NET` and
+  keep the stale clock.
+
 ### Networking
 
 ```
@@ -224,8 +283,28 @@ each failure path.
 - Taps are created ahead of time with the pooled Firecracker processes. The
   host route and a permanent neighbour entry are set with rtnetlink while the
   snapshot loads, so networking adds nothing to start time.
-- Addresses come from the daemon's `--vm-ips` range. Before handing one out,
-  the daemon checks it against its peers' addresses. `flexvm run --ip` picks
+- udev with `MACAddressPolicy=persistent` can replace a new tap's MAC after
+  the daemon set it to the gateway MAC, which leaves the guest's pinned
+  gateway entry pointing nowhere. The daemon puts the MAC back (one
+  `RTM_SETLINK`) whenever it hands a tap to a VM. To stop udev touching the
+  taps at all, install a link file:
+
+  ```ini
+  # /etc/systemd/network/10-flexvm-taps.link
+  [Match]
+  OriginalName=fv*
+
+  [Link]
+  MACAddressPolicy=none
+  ```
+- Addresses come from the daemon's `--vm-ips` range, which is authoritative:
+  **every host's range must be disjoint** from the others' (a daemon warns in
+  its log when a peer's overlaps). Handing one out asks no peer, so two hosts
+  can never pick the same address. An address whose VM migrated to another
+  host stays reserved ("lent", recorded in `STATE_DIR/lent-ips.json`, which
+  outlives restarts) until that VM is killed wherever it is (its host tells
+  the peers), or it migrates back. If that message is lost, the address stays
+  taken; `flexvm unlend IP` frees it. Leaks, never collisions. `flexvm run --ip` picks
   one explicitly.
 - Reachability:
   - **Peers** get a route pushed to them: `<vm-ip>/32 via <host underlay ip>`.
@@ -252,7 +331,8 @@ RAM and double memory use on a host that is already short.
 | | |
 |---|---|
 | Template cold boot (one time) | 250 ms (2 vCPU), 420 ms (24 vCPU) |
-| `run` → guest agent answering with its address set | **36–56 ms** (22–50 ms before the network device was added; host was also busier) |
+| `run` → guest agent answering with its address set, hot pool | **4–7 ms** p50, 6–14 ms p90 (resume ~2 ms, `START` ~3 ms; host load ~20) |
+| same, hot pool empty (snapshot load) | 45–54 ms p50 under the same load (36–56 ms on a quieter host) |
 | of which Firecracker snapshot load | 22–50 ms (mostly KVM memslot setup, which is slow under nested virt) |
 | Migration downtime | **36–62 ms** (2 vCPU), **56–63 ms** (24 vCPU, 500 MB live data) |
 | TCP connection through two migrations | no errors, worst stall 217 ms (one client retransmit) |
@@ -304,7 +384,14 @@ one machine out of network namespaces: two hosts and a client on a simulated
 LAN.
 
 The daemon must run as root: it uses `/dev/kvm`, privileged userfaultfd,
-`process_vm_readv` on Firecracker and cgroup v2.
+`process_vm_readv` on Firecracker and cgroup v2. On SIGTERM or SIGINT it stops
+taking new VMs and migrations, lets the ones in progress finish, waits until
+every VM paused here as a migration source has been released by its target
+(killing it earlier would lose the pages the target has not pulled), stops its
+VMs and pooled Firecrackers, tells the sources of VMs that migrated in to drop
+their copies, and removes its taps, cgroups and run directory. It logs what it
+is waiting for every 5 s; a second signal stops the waiting and logs what that
+costs.
 
 ## Container images
 
@@ -428,6 +515,7 @@ flexvm/src/
   uffd.rs      userfaultfd pager (template / zero / migration source / checkpoint file) + page server
   template.rs  cold boot, snapshot, sparse image, working-set recording
   vm.rs        restore into a pooled Firecracker, checkpoint, stats
+  hot.rs       hot pool: restored, settled and paused VMs per template
   net.rs       taps, rtnetlink routes and neighbours, gratuitous ARP, address ranges
   fc.rs        Firecracker process, API client, warm pool
   guest.rs     vsock client for flexvm-init
@@ -444,8 +532,8 @@ firecracker/        patches on top of Firecracker v1.17.0
 - **Post-copy risk**: until the background pull finishes (~1 s per GB), the
   VM's memory is split across two hosts, and losing either one loses the VM.
 - **Networking is IPv4 only.** Peers form a full mesh (every daemon lists
-  every other one). Address allocation is per-host ranges plus a check
-  against peers, not real cluster-wide address management.
+  every other one). Address allocation is disjoint per-host ranges
+  (configured by hand), not real cluster-wide address management.
 - **Packets in flight during a migration are dropped.** The source could
   buffer them and forward them to the target to avoid the ~200 ms client
   retransmit stall.

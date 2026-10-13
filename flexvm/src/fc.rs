@@ -6,13 +6,17 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use serde_json::Value;
 
 use crate::bail;
 use crate::util::{retry, Result};
+
+/// Deadline for a Firecracker API call that does not pick its own.
+pub const API_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct Firecracker {
     child: Child,
@@ -63,8 +67,9 @@ impl Firecracker {
         self.patch("/vm", serde_json::json!({"state": "Resumed"})).map(|_| ())
     }
 
+    /// Every call has a deadline, so none can hold a VM's API lock forever.
     fn request(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value> {
-        self.send(UnixStream::connect(&self.sock)?, method, path, body)
+        self.request_within(method, path, body, API_TIMEOUT)
     }
 
     /// `request`, but connecting, writing and reading each time out after `timeout`.
@@ -128,6 +133,7 @@ impl Drop for Firecracker {
 }
 
 /// An idle Firecracker with its directory, (already joined) cgroup and tap.
+/// Dropping it kills the Firecracker and removes all three.
 pub struct Idle {
     pub fc: Firecracker,
     pub dir: PathBuf,
@@ -135,18 +141,55 @@ pub struct Idle {
     pub tap: String,
 }
 
+impl Idle {
+    /// Takes the parts out; the caller becomes responsible for cleaning them up.
+    pub fn into_parts(self) -> (Firecracker, PathBuf, Option<PathBuf>, String) {
+        let me = std::mem::ManuallyDrop::new(self);
+        // SAFETY: `me` is never used or dropped again, so each field is moved out exactly once.
+        unsafe { (std::ptr::read(&me.fc), std::ptr::read(&me.dir), std::ptr::read(&me.cgroup), std::ptr::read(&me.tap)) }
+    }
+}
+
+impl Drop for Idle {
+    fn drop(&mut self) {
+        self.fc.kill();
+        release(&self.tap, self.cgroup.as_deref(), &self.dir);
+    }
+}
+
+/// Removes a VM's tap, cgroup and directory. Its Firecracker must be gone.
+pub fn release(tap: &str, cgroup: Option<&Path>, dir: &Path) {
+    crate::net::delete_tap(tap);
+    if let Some(cg) = cgroup.filter(|cg| cg.exists()) {
+        // The cgroup stays busy until the kernel has finished tearing the process down.
+        let _ = retry(Duration::from_secs(2), || Ok(std::fs::remove_dir(cg)?));
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// Idle Firecracker processes, spawned ahead of time so starting a VM only
 /// pays for the snapshot load. Each one owns a fresh directory under `root`
 /// and has already been moved into its own cgroup (that move alone costs tens
 /// of milliseconds, as it waits for an RCU grace period).
+///
+/// A single background worker keeps `size` of them ready, so concurrent
+/// takes cannot make the pool overshoot.
 pub struct Pool {
     bin: PathBuf,
     root: PathBuf,
     cgroups: Option<PathBuf>,
     tap_prefix: String,
     size: usize,
-    idle: Mutex<Vec<Idle>>,
+    state: Mutex<PoolState>,
+    wake: Condvar,
+    worker: Mutex<Option<JoinHandle<()>>>,
     next: AtomicU64,
+}
+
+#[derive(Default)]
+struct PoolState {
+    idle: Vec<Idle>,
+    closed: bool,
 }
 
 impl Pool {
@@ -157,10 +200,13 @@ impl Pool {
             cgroups,
             tap_prefix: tap_prefix.into(),
             size,
-            idle: Mutex::new(Vec::new()),
+            state: Mutex::new(PoolState::default()),
+            wake: Condvar::new(),
+            worker: Mutex::new(None),
             next: AtomicU64::new(0),
         });
-        pool.refill();
+        let p = pool.clone();
+        *pool.worker.lock().unwrap() = Some(std::thread::spawn(move || p.refill()));
         pool
     }
 
@@ -168,45 +214,87 @@ impl Pool {
         let n = self.next.fetch_add(1, Ordering::SeqCst);
         let id = format!("idle-{}-{n}", std::process::id());
         let tap = format!("{}{n:x}", self.tap_prefix);
-        crate::net::create_tap(&tap)?;
         let dir = self.root.join(&id);
-        std::fs::create_dir_all(&dir)?;
-        let fc = Firecracker::spawn(&self.bin, &dir)?;
-        let cgroup = match &self.cgroups {
-            Some(root) => {
-                let cg = root.join(&id);
-                std::fs::create_dir_all(&cg)?;
+        let cgroup = self.cgroups.as_ref().map(|root| root.join(&id));
+        let fc = (|| {
+            crate::net::create_tap(&tap)?;
+            std::fs::create_dir_all(&dir)?;
+            let fc = Firecracker::spawn(&self.bin, &dir)?;
+            if let Some(cg) = &cgroup {
+                std::fs::create_dir_all(cg)?;
                 std::fs::write(cg.join("cgroup.procs"), fc.pid().to_string())?;
-                Some(cg)
             }
-            None => None,
-        };
-        Ok(Idle { fc, dir, cgroup, tap })
+            Ok(fc)
+        })();
+        match fc {
+            Ok(fc) => Ok(Idle { fc, dir, cgroup, tap }),
+            Err(e) => {
+                // A Firecracker that was started has already been killed by its drop.
+                release(&tap, cgroup.as_deref(), &dir);
+                Err(e)
+            }
+        }
     }
 
-    /// Hands out an idle Firecracker, then tops the pool back up.
-    pub fn take(self: &Arc<Self>) -> Result<Idle> {
-        let got = self.idle.lock().unwrap().pop();
-        let got = match got {
-            Some(f) => f,
-            None => self.spawn()?,
+    /// Hands out an idle Firecracker, or spawns one right away if none is ready.
+    pub fn take(&self) -> Result<Idle> {
+        let got = {
+            let mut s = self.state.lock().unwrap();
+            if s.closed {
+                bail!("daemon is shutting down");
+            }
+            s.idle.pop()
         };
-        self.refill();
-        Ok(got)
+        self.wake.notify_one();
+        match got {
+            Some(f) => Ok(f),
+            None => self.spawn(),
+        }
     }
 
-    fn refill(self: &Arc<Self>) {
-        let pool = self.clone();
-        std::thread::spawn(move || {
-            while pool.idle.lock().unwrap().len() < pool.size {
-                match pool.spawn() {
-                    Ok(f) => pool.idle.lock().unwrap().push(f),
-                    Err(e) => {
-                        eprintln!("pool: cannot spawn firecracker: {e}");
-                        return;
-                    }
+    /// The worker: tops the pool up to `size`, one Firecracker at a time.
+    fn refill(&self) {
+        let mut backoff = Duration::from_millis(100);
+        loop {
+            {
+                let s = self.state.lock().unwrap();
+                let s = self.wake.wait_while(s, |s| !s.closed && s.idle.len() >= self.size).unwrap();
+                if s.closed {
+                    return;
                 }
             }
-        });
+            match self.spawn() {
+                Ok(f) => {
+                    backoff = Duration::from_millis(100);
+                    let mut s = self.state.lock().unwrap();
+                    if s.closed {
+                        drop(s);
+                        drop(f);
+                        return;
+                    }
+                    s.idle.push(f);
+                }
+                Err(e) => {
+                    eprintln!("pool: cannot spawn firecracker: {e}");
+                    let s = self.state.lock().unwrap();
+                    let _ = self.wake.wait_timeout_while(s, backoff, |s| !s.closed);
+                    backoff = (backoff * 2).min(Duration::from_secs(10));
+                }
+            }
+        }
+    }
+
+    /// Stops the worker and tears down every idle Firecracker. Later takes fail.
+    pub fn close(&self) {
+        let idle = {
+            let mut s = self.state.lock().unwrap();
+            s.closed = true;
+            std::mem::take(&mut s.idle)
+        };
+        self.wake.notify_all();
+        if let Some(w) = self.worker.lock().unwrap().take() {
+            let _ = w.join();
+        }
+        drop(idle);
     }
 }

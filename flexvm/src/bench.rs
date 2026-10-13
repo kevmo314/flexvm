@@ -63,7 +63,8 @@ pub fn run(host: &str, args: &Args) -> Result<()> {
         thread::sleep(settle);
     }
 
-    let mut summary = json!({"run": summarize(&samples, "run")?});
+    let hot = samples.iter().filter(|s| s["hot"] == json!(true)).count();
+    let mut summary = json!({"run": summarize(&samples, "run")?, "run_hot_pool_hits": hot});
     if ready.is_some() {
         summary["client"] = summarize(&samples, "client")?;
     }
@@ -109,7 +110,7 @@ fn iteration(
     let start = Instant::now();
     let run = rpc(host, json!({"op": "run", "name": name, "template": template, "ip": ip}))?;
     let run_rpc = start.elapsed();
-    let mut sample = json!({"run": run["timings_ms"]});
+    let mut sample = json!({"run": run["timings_ms"], "hot": run["hot"]});
     if let Some((port, http)) = ready {
         let ip: std::net::Ipv4Addr = run["ip"].as_str().ok_or("run reply has no ip")?.parse()?;
         wait_ready((ip, port).into(), http, start + timeout)?;
@@ -175,17 +176,27 @@ fn wait_ready(addr: SocketAddr, http: bool, deadline: Instant) -> Result<()> {
     }
 }
 
-/// Nearest-rank p50/p90/p99/max of every phase in `group`.
+/// Nearest-rank p50/p90/p99/max of every phase in `group`. A phase only some
+/// samples went through (e.g. the snapshot load on a hot pool miss) counts as
+/// 0 in the others, so the phases still add up to each sample's total.
 pub(crate) fn summarize(samples: &[Value], group: &str) -> Result<Value> {
-    let Some(phases) = samples.first().and_then(|s| s[group].as_object()) else {
+    let mut phases: Vec<&String> = Vec::new();
+    for s in samples {
+        let Some(p) = s[group].as_object() else {
+            bail!("a sample has no {group} timings; are the daemons up to date?");
+        };
+        for k in p.keys() {
+            if !phases.contains(&k) {
+                phases.push(k);
+            }
+        }
+    }
+    if phases.is_empty() {
         bail!("no {group} timings; are the daemons up to date?");
-    };
+    }
     let mut summary = Map::new();
-    for phase in phases.keys() {
-        let mut v = samples
-            .iter()
-            .map(|s| s[group][phase].as_f64().ok_or(format!("a sample is missing {group}.{phase}")))
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+    for phase in phases {
+        let mut v: Vec<f64> = samples.iter().map(|s| s[group][phase].as_f64().unwrap_or(0.0)).collect();
         v.sort_by(f64::total_cmp);
         let rank = |p: usize| v[(v.len() * p).div_ceil(100) - 1];
         summary.insert(phase.clone(), json!({"p50": rank(50), "p90": rank(90), "p99": rank(99), "max": v[v.len() - 1]}));
@@ -213,6 +224,13 @@ mod tests {
         let want = json!({"total": {"p50": 100.0, "p90": 100.0, "p99": 100.0, "max": 100.0}});
         assert_eq!(summarize(&samples[..1], "run").unwrap(), want);
         assert!(summarize(&[], "run").is_err());
-        assert!(summarize(&[json!({"run": {"total": 1}}), json!({"run": {}})], "run").is_err());
+        let mixed = [json!({"run": {"load": 3, "total": 4}}), json!({"run": {"resume": 1, "total": 2}})];
+        let want = json!({
+            "load": {"p50": 0.0, "p90": 3.0, "p99": 3.0, "max": 3.0},
+            "total": {"p50": 2.0, "p90": 4.0, "p99": 4.0, "max": 4.0},
+            "resume": {"p50": 0.0, "p90": 1.0, "p99": 1.0, "max": 1.0},
+        });
+        assert_eq!(summarize(&mixed, "run").unwrap(), want);
+        assert!(summarize(&[json!({"run": {"total": 1}}), json!({})], "run").is_err());
     }
 }
