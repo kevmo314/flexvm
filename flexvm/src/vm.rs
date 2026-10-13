@@ -342,6 +342,14 @@ impl Vm {
 
     /// Whether its Firecracker still runs. A Firecracker busy with a request
     /// counts as running.
+    /// How its Firecracker exited, and the end of its log.
+    pub fn post_mortem(&self) -> String {
+        match self.fc.lock().unwrap().as_mut() {
+            Some(fc) => fc.post_mortem(&self.dir),
+            None => "no firecracker".into(),
+        }
+    }
+
     pub fn firecracker_alive(&self) -> bool {
         match self.fc.try_lock() {
             Ok(mut fc) => fc.as_mut().is_some_and(|f| f.alive()),

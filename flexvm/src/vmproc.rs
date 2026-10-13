@@ -626,7 +626,7 @@ impl Proc {
                 if self.leaving.load(Ordering::SeqCst) {
                     continue;
                 }
-                eprintln!("vm {}: gone ({}); stopping", vm.name, vm.pager.failed().unwrap_or("its firecracker exited"));
+                eprintln!("vm {}: gone ({}; {}); stopping", vm.name, vm.pager.failed().unwrap_or("its firecracker exited"), vm.post_mortem());
                 self.drop_held_in();
                 vm.kill();
                 self.withdraw();
