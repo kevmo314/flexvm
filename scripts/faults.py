@@ -702,8 +702,9 @@ def pause_resume():
     sh(A, n, "date -s @$(date +%s)")  # fresh VMs keep the template's clock; start from a right one
     r = ok(A, {"op": "pause", "name": n})
     check("pause: paused", vms(A)[n]["state"] == "paused", r)
-    code, out = sh(A, n, "echo hi")
-    check("pause: exec refused while paused", code != 0 and "not running" in out, out)
+    # Straight to the daemon: the CLI would retry on the peer for a while.
+    r = rpc(A, {"op": "exec", "name": n, "cmd": "echo hi"})
+    check("pause: exec refused while paused", not r["ok"] and "not running" in r["error"], r)
     time.sleep(0.2)
     controller_quiet = vms(A)[n]["state"] == "paused"
     time.sleep(3)
