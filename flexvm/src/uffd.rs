@@ -2877,7 +2877,7 @@ mod tests {
             thread::sleep(Duration::from_millis(50));
             s.write_all(&[&[0u8][..], &[2u8; 3 * 4096]].concat()).unwrap();
         });
-        let source = Source { addr, vm: "v".into(), mig: 1 };
+        let source = Source { addr, vm: "v".into(), mig: 1, regions: Vec::new() };
         let mut c = PageClient::connect(&source).unwrap();
         let mut buf = vec![0u8; 4 * PAGE_SIZE];
         let start = Instant::now();
