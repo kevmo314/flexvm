@@ -2781,7 +2781,6 @@ mod tests {
                         _ => Ok(1 + rand(c)),
                     }
                 });
-                drop(fetch);
                 // Only pages a failed install gave back can be REMOTE again by then.
                 resolved += discarded;
                 resolved += r;
