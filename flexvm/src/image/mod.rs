@@ -474,8 +474,10 @@ fn unpack_layers(root: &mut Root, img: &source::Image) -> Result<()> {
         eprintln!("image: applying layer {}/{} {}", i + 1, img.layers.len(), layer.name());
         let what = |e| format!("layer {}: {e}", layer.name());
         let mut blob = layer.open().map_err(what)?;
-        let diff_id = root.apply_layer(unpack::decompress(&mut blob).map_err(what)?).map_err(what)?;
+        let applied = unpack::decompress(&mut blob).and_then(|r| root.apply_layer(r));
+        // A corrupt blob usually breaks unpacking too: report its digest first.
         layer.verify(blob).map_err(what)?;
+        let diff_id = applied.map_err(what)?;
         if diff_id != img.diff_ids[i] {
             bail!("layer {} unpacks to {diff_id}, the image config says {}", layer.name(), img.diff_ids[i]);
         }

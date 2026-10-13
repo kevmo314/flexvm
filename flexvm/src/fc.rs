@@ -174,18 +174,21 @@ impl Firecracker {
     }
 }
 
-/// Reads at most 64 KiB, dropping the first partial line when seeking into a log.
+/// Reads at most the last 64 KiB, dropping the first partial line when
+/// seeking into a log. Invalid UTF-8 is replaced, not fatal.
 fn log_tail(r: &mut (impl Read + Seek)) -> std::io::Result<String> {
+    const MAX: u64 = 64 << 10;
     let len = r.seek(SeekFrom::End(0))?;
-    let start = len.saturating_sub(64 << 10);
+    // One byte before the tail tells whether it starts on a line boundary.
+    let start = len.saturating_sub(MAX + 1);
     r.seek(SeekFrom::Start(start))?;
     let mut log = Vec::new();
-    r.take(64 << 10).read_to_end(&mut log)?;
-    if start != 0 {
+    r.take(MAX + 1).read_to_end(&mut log)?;
+    if log.len() as u64 > MAX {
         let end = log.iter().position(|&b| b == b'\n').map_or(log.len(), |i| i + 1);
         log.drain(..end);
     }
-    String::from_utf8(log).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    Ok(String::from_utf8_lossy(&log).into_owned())
 }
 
 impl Drop for Firecracker {
@@ -423,7 +426,7 @@ mod tests {
         drop(f);
         let mut r = Counted { inner: File::open(&path).unwrap(), read: 0 };
         assert_eq!(log_tail(&mut r).unwrap(), "first\nsecond\nthird\nfourth\nfifth\n");
-        assert_eq!(r.read, 64 << 10);
+        assert_eq!(r.read, (64 << 10) + 1);
         std::fs::remove_file(path).unwrap();
     }
 
@@ -438,5 +441,15 @@ mod tests {
         let mut log = "é".repeat(64 << 10).into_bytes();
         log.extend_from_slice(b"\nlast");
         assert_eq!(log_tail(&mut Cursor::new(log)).unwrap(), "last");
+        // A tail that starts exactly on a line keeps that line.
+        let mut log = vec![b'x'; 100];
+        log.push(b'\n');
+        log.extend(std::iter::repeat_n(b'y', (64 << 10) - 4));
+        log.extend_from_slice(b"\nend");
+        assert_eq!(log_tail(&mut Cursor::new(&log)).unwrap().len(), 64 << 10);
+        assert!(log_tail(&mut Cursor::new(&log)).unwrap().starts_with('y'));
+        // Short logs without a trailing newline and with binary junk.
+        let log = b"ok\n\xff\xfe junk\nlast line";
+        assert_eq!(log_tail(&mut Cursor::new(&log[..])).unwrap(), "ok\n\u{fffd}\u{fffd} junk\nlast line");
     }
 }
