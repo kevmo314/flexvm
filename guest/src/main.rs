@@ -248,7 +248,8 @@ fn serve(statuses: Statuses) -> io::Result<()> {
         let conn = unsafe { libc::accept4(fd.as_raw_fd(), std::ptr::null_mut(), std::ptr::null_mut(), libc::SOCK_CLOEXEC) };
         if conn < 0 {
             let e = io::Error::last_os_error();
-            if e.kind() != io::ErrorKind::Interrupted {
+            // A client gone before accept, or a signal, says nothing about resources.
+            if !matches!(e.kind(), io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted) {
                 if backoff.is_zero() {
                     eprintln!("vsock accept failed: {e}; backing off");
                 }

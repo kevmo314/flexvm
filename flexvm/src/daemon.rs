@@ -316,7 +316,8 @@ pub fn run(mut cfg: Config) -> Result<()> {
                 conn
             }
             Err(e) => {
-                if e.kind() != std::io::ErrorKind::Interrupted {
+                // A client gone before accept, or a signal, says nothing about resources.
+                if !matches!(e.kind(), std::io::ErrorKind::Interrupted | std::io::ErrorKind::ConnectionAborted) {
                     if backoff.is_zero() {
                         eprintln!("daemon accept failed: {e}; backing off");
                     }

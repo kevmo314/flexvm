@@ -145,8 +145,12 @@ impl Api {
              Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         );
-        for attempt in 0..2 {
-            let mut r = match self.connection.borrow_mut().take() {
+        // At most two tries: a cached connection Firecracker has since closed
+        // fails the write before a byte goes out; then one fresh connection.
+        loop {
+            let cached = self.connection.borrow_mut().take();
+            let reused = cached.is_some();
+            let mut r = match cached {
                 Some(mut r) => {
                     r.get_mut().at = at;
                     r
@@ -160,7 +164,6 @@ impl Api {
                     };
                     match s {
                         Ok(s) => BufReader::new(crate::util::By { s, at }),
-                        Err(_) if attempt == 0 => continue,
                         Err(e) => return Err(Box::new(NotSent(format!("firecracker {method} {path}: cannot connect: {e}")))),
                     }
                 }
@@ -168,11 +171,13 @@ impl Api {
             let mut sent = false;
             let (code, buf, close) = match exchange(&mut r, req.as_bytes(), &mut sent) {
                 Ok(response) => response,
-                Err(_) if !sent && attempt == 0 => continue,
+                Err(_) if !sent && reused => continue,
                 Err(e) if !sent => return Err(Box::new(NotSent(format!("firecracker {method} {path}: {e}")))),
                 Err(e) => return Err(e),
             };
-            if !close {
+            // Bytes past the answer were never asked for: the stream is not
+            // in step any more.
+            if !close && r.buffer().is_empty() {
                 *self.connection.borrow_mut() = Some(r);
             }
             let text = String::from_utf8_lossy(&buf);
@@ -185,7 +190,6 @@ impl Api {
                 Ok(serde_json::from_str(&text).unwrap_or(Value::String(text.into_owned())))
             };
         }
-        unreachable!()
     }
 }
 
@@ -638,6 +642,35 @@ mod tests {
             assert!(!not_sent(&call(&api, &server.path).unwrap_err()));
             assert!(api.connection.borrow().is_none());
         }
+    }
+
+    #[test]
+    fn api_drops_a_connection_with_unrequested_bytes() {
+        let server = Server::new(|listener| {
+            let mut r = accept(&listener);
+            read_request(&mut r);
+            r.get_mut().write_all(b"HTTP/1.1 204 No Content\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n").unwrap();
+            let mut fresh = accept(&listener);
+            read_request(&mut fresh);
+            fresh.get_mut().write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n2").unwrap();
+        });
+        let api = Api::default();
+        call(&api, &server.path).unwrap();
+        assert!(api.connection.borrow().is_none());
+        assert_eq!(call(&api, &server.path).unwrap(), serde_json::json!(2));
+    }
+
+    #[test]
+    fn api_does_not_retry_a_fresh_connection() {
+        let server = Server::new(|listener| {
+            // Closed before reading: the request may or may not have gone out,
+            // but a fresh connection is never tried twice.
+            drop(accept(&listener));
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+        });
+        let api = Api::default();
+        assert!(call(&api, &server.path).is_err());
     }
 
     #[test]
