@@ -10,7 +10,7 @@ usage: scripts/faults.py [--a ADDR] [--b ADDR] [--bin FLEXVM] [--log-dir DIR] SC
   suspend_resume, hot_budget and resume_mark_fails kill a daemon with SIGKILL and restart it with the same command line and
   environment (logging to --log-dir). Checkpoint scenarios write to --ckpt-dir.
 """
-import argparse, base64, json, os, socket, subprocess, sys, tempfile, threading, time
+import argparse, base64, json, os, socket, subprocess, sys, tempfile, threading, time, traceback
 
 p = argparse.ArgumentParser(usage=__doc__)
 p.add_argument("--a", default="127.0.0.1:7092")
@@ -1980,6 +1980,7 @@ for s in names:
     try:
         SCENARIOS[s]()
     except Exception as e:
+        traceback.print_exc()
         check(f"{s}: scenario raised", False, repr(e))
     finally:
         disarm()
