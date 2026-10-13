@@ -192,10 +192,10 @@ fn route(host: &Host, req: &Value) -> Result<Value> {
     let gen = req["gen"].as_u64().filter(|&g| g > 0).ok_or("route messages carry the address's generation")?;
     let via: Option<Ipv4Addr> = req["via"].as_str().map(|v| v.parse()).transpose()?;
     let l = host.lock()?;
-    if !host.observe(&l, ip, gen, via.is_none())? {
+    if !host.observe(&l, ip, gen, via)? {
         return Ok(json!({"ip": ip.to_string(), "stale": true}));
     }
-    let local = host.holder(&l, ip)?.is_some();
+    let local = host.keeps_route(&l, ip, gen)?;
     if !local {
         match via {
             Some(via) => crate::net::route_via(ip, via)?,

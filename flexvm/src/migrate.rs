@@ -246,6 +246,9 @@ impl Proc {
             Ok((true, l)) => l,
             Ok((false, l)) => {
                 drop(l);
+                if let Some(h) = self.holder() {
+                    h.forget(vm.ip, mig);
+                }
                 eprintln!("vm {}: {e}; generation {gen} of {} was superseded meanwhile, so it is destroyed instead of resumed", vm.name, vm.ip);
                 self.finish(op, End::Gone, 1, None)
             }
@@ -623,24 +626,30 @@ impl Proc {
         let checked = match (probed, vm.pager.failed()) {
             (Err(e), _) => Err(format!("migration source {} does not serve pages: {e}", source.addr).into()),
             (_, Some(why)) => Err(format!("its memory cannot be paged in: {why}").into()),
-            _ => before_commit.take().map_or(Ok(Ok(())), |f| f()).and_then(|r| r).and_then(|()| -> Result<()> {
+            _ => before_commit.take().map_or(Ok(Ok(())), |f| f()).and_then(|r| r).and_then(|()| {
                 // The ownership boundary: the generation is still current,
                 // the deadline has not passed, and the migration record goes
                 // from pending to committed (refused if the source's query
-                // fenced it off). From here on this host owns the VM.
+                // fenced it off). From here on this host owns the VM. The
+                // host lock is held until it runs, so no newer generation is
+                // taken in meanwhile.
                 let l = self.host.lock()?;
                 if Instant::now() >= deadline {
                     bail!("the migration ran past its deadline");
                 }
                 self.host.commit_incoming(&l, ip, self.gen())?;
-                self.arrived.lock().unwrap().as_mut().ok_or("no migration record")?.commit(&l)
+                self.arrived.lock().unwrap().as_mut().ok_or("no migration record")?.commit(&l)?;
+                Ok(l)
             }),
         };
-        if let Err(e) = checked {
-            // Never ran here: the source may resume its copy.
-            vm.kill();
-            return Err(format!("{e} (it never ran here)").into());
-        }
+        let committed = match checked {
+            Ok(l) => l,
+            Err(e) => {
+                // Never ran here: the source may resume its copy.
+                vm.kill();
+                return Err(format!("{e} (it never ran here)").into());
+            }
+        };
         t.mark("register");
         self.set_vm(vm.clone());
         if !paused {
@@ -654,6 +663,7 @@ impl Proc {
             }
             t.mark("resume");
         }
+        drop(committed);
         self.publish();
         Ok(vm)
     }

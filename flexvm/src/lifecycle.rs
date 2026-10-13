@@ -61,7 +61,9 @@ impl Proc {
         let vm = self.vm();
         let op = self.op_within()?;
         let start = Instant::now();
+        let still = self.still_current(vm.ip)?;
         vm.unpause()?;
+        drop(still);
         self.paused_by_request.store(false, Ordering::SeqCst);
         let took = start.elapsed();
         // A held restore at a new address: the guest gets it now.
@@ -300,6 +302,7 @@ impl Proc {
             self.announce();
             return Ok(json!({"name": name, "ip": ip.to_string(), "pid": std::process::id(), "state": "paused", "restore_ms": ms(restore), "timings_ms": t.json()}));
         }
+        let still = self.still_current(ip).map_err(|e| Restore::NotRun(kill(e)))?;
         if owned {
             // Durably consumed before it can run: a crash from here on must
             // not bring this checkpoint back.
@@ -324,6 +327,7 @@ impl Proc {
         }
         // From the resume request on, the vCPUs may have run.
         vm.unpause().map_err(|e| Restore::Ran(kill(e)))?;
+        drop(still);
         t.mark("resume");
         self.set_vm(vm.clone());
         self.publish();
@@ -814,7 +818,7 @@ pub fn discard(host: &Host, name: &str) -> Result<()> {
         let l = host.lock()?;
         host.release(&l, ip, name)?;
         if let Some(gen) = gen {
-            host.observe(&l, ip, gen, true)?;
+            host.observe(&l, ip, gen, None)?;
             drop(l);
             for peer in &host.cfg.peers {
                 let _ = crate::vmproc::peer_call(peer, json!({"op": "route", "ip": ip.to_string(), "gen": gen}));

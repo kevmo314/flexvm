@@ -277,9 +277,7 @@ impl Host {
         };
         let mut a = self.addr(l, ip)?;
         let gen = self.next_gen(a.seen)?;
-        a.seen = gen;
-        a.withdrawn = false;
-        a.holder = Some(holder.into());
+        a = Addr { seen: gen, holder: Some(holder.into()), held: gen, lent: a.lent, ..Addr::default() };
         // The high-water mark orders generations; this record need not be durable.
         self.put_addr(ip, &a, false)?;
         Ok(AddrClaim { host: self.clone(), ip, gen, holder: holder.into(), kept: false })
@@ -324,8 +322,11 @@ impl Host {
         if let Some(lent) = a.lent.filter(|&lent| gen < lent) {
             bail!("{ip} is lent out with a newer vm (generation {lent}, not {gen})");
         }
+        if gen > a.seen {
+            a.via = None;
+        }
         a.seen = a.seen.max(gen);
-        a.holder = Some(holder.into());
+        (a.holder, a.held) = (Some(holder.into()), gen);
         self.put_addr(ip, &a, true)?;
         Ok(AddrClaim { host: self.clone(), ip, gen, holder: holder.into(), kept: false })
     }
@@ -375,25 +376,45 @@ impl Host {
         Ok(())
     }
 
-    /// Takes in a message about generation `gen` of `ip`: an announcement, or
-    /// a withdrawal. Returns false if it is stale (an older generation, or an
-    /// announcement of a withdrawn one). A withdrawal frees a loan of its
-    /// generation or an older one.
-    pub fn observe(&self, l: &Locked, ip: Ipv4Addr, gen: u64, withdrawn: bool) -> Result<bool> {
+    /// Takes in a message about generation `gen` of `ip`: an announcement
+    /// that its VM is at `via`, or (None) a withdrawal. Returns false if it
+    /// is stale (an older generation, or an announcement of a withdrawn
+    /// one). A withdrawal frees a loan of its generation or an older one.
+    pub fn observe(&self, l: &Locked, ip: Ipv4Addr, gen: u64, via: Option<Ipv4Addr>) -> Result<bool> {
         let mut a = self.addr(l, ip)?;
-        let fresh = gen > a.seen || (gen == a.seen && (withdrawn || !a.withdrawn));
-        if !fresh {
+        let withdrawn = via.is_none();
+        if gen < a.seen || (gen == a.seen && a.withdrawn && !withdrawn) {
             return Ok(false);
         }
-        let changed = (gen, withdrawn) != (a.seen, a.withdrawn) || (withdrawn && a.lent.is_some_and(|lent| lent <= gen));
-        a.seen = gen;
-        a.withdrawn = withdrawn;
+        let before = a.clone();
+        (a.seen, a.withdrawn, a.via) = (gen, withdrawn, via);
         if withdrawn && a.lent.is_some_and(|lent| lent <= gen) {
             a.lent = None;
         }
-        if changed {
+        if a != before {
             self.put_addr(ip, &a, true)?;
         }
+        Ok(true)
+    }
+
+    /// Whether the VM here holding `ip` keeps its route against a peer's
+    /// message about generation `gen`: it has that generation or a newer
+    /// one, or it is a migration's paused source (whose release moves the
+    /// route).
+    pub fn keeps_route(&self, l: &Locked, ip: Ipv4Addr, gen: u64) -> Result<bool> {
+        let a = self.addr(l, ip)?;
+        let source = || a.holder.as_deref().and_then(|h| self.entry(h).ok()).is_some_and(|e| e.state == "source");
+        Ok(self.held(&a) && (a.held >= gen || source()))
+    }
+
+    /// Puts back the route a peer announced for `ip`'s current generation,
+    /// once nothing here holds the address: a claim or hold of it here that
+    /// kept the route has gone without the VM running here. Whether it did.
+    pub fn reinstall(&self, l: &Locked, ip: Ipv4Addr) -> Result<bool> {
+        let a = self.addr(l, ip)?;
+        let Some(via) = a.via.filter(|_| !a.withdrawn && !self.held(&a)) else { return Ok(false) };
+        crate::net::route_via(ip, via)?;
+        eprintln!("put back route {ip} via {via} (generation {})", a.seen);
         Ok(true)
     }
 
@@ -521,8 +542,12 @@ pub struct Addr {
     /// migrated away: not handed out until that VM is withdrawn wherever it
     /// is, or comes back.
     pub lent: Option<u64>,
-    /// The VM here using it (alive or suspended), if any.
+    /// The VM here using it (alive or suspended), if any, and with what
+    /// generation.
     pub holder: Option<String>,
+    pub held: u64,
+    /// Where a peer said the newest generation's VM is (see `reinstall`).
+    pub via: Option<Ipv4Addr>,
 }
 
 impl Addr {
@@ -1072,14 +1097,16 @@ mod tests {
         h.lend(&l, a_ip, g1).unwrap();
         a.release(&l).unwrap();
         assert!(h.claim_new(&l, "x", Some(a_ip)).is_err());
-        assert!(!h.observe(&l, a_ip, g1 - 1, true).unwrap(), "older withdrawal is stale");
+        assert!(!h.observe(&l, a_ip, g1 - 1, None).unwrap(), "older withdrawal is stale");
         assert!(h.addr(&l, a_ip).unwrap().lent.is_some());
-        assert!(h.observe(&l, a_ip, g1, true).unwrap());
+        assert!(h.observe(&l, a_ip, g1, None).unwrap());
         assert!(h.addr(&l, a_ip).unwrap().lent.is_none());
         // An announcement of a withdrawn generation is stale; a newer one is not.
-        assert!(!h.observe(&l, a_ip, g1, false).unwrap());
+        let via = Some(ip("192.0.2.1"));
+        assert!(!h.observe(&l, a_ip, g1, via).unwrap());
         assert!(!h.current(&l, a_ip, g1).unwrap());
-        assert!(h.observe(&l, a_ip, g1 + 5, false).unwrap());
+        assert!(h.observe(&l, a_ip, g1 + 5, via).unwrap());
+        assert_eq!(h.addr(&l, a_ip).unwrap().via, via);
         // An arrival with an old generation is refused, a current one taken in.
         assert!(h.claim_incoming(&l, "y", a_ip, g1).is_err());
         assert!(h.claim_incoming(&l, "y", a_ip, 0).is_err());

@@ -186,6 +186,18 @@ impl Proc {
         }
     }
 
+    /// The host lock, if the VM's address's generation is still current:
+    /// taken right before the VM runs, and held until it does, so no message
+    /// about a newer generation is taken in meanwhile.
+    pub fn still_current(&self, ip: Ipv4Addr) -> Result<crate::host::Locked> {
+        let l = self.host.lock()?;
+        let gen = self.gen();
+        if !self.host.current(&l, ip, gen)? {
+            bail!("{ip}'s generation {gen} was withdrawn or given out again meanwhile; restore with --ip auto");
+        }
+        Ok(l)
+    }
+
     /// The generation of the VM's address (see `host::Addr`).
     pub fn gen(&self) -> u64 {
         self.addr.lock().unwrap().as_ref().map_or(0, |a| a.gen)
@@ -270,7 +282,16 @@ impl Proc {
                 let _ = std::fs::write(self.host.run.join("vms").join(format!("{name}.moved")), &to);
                 eprintln!("vm {name}: moved to {to}");
             }
-            (_, a) => drop(a),
+            (_, Some(a)) => {
+                // Never ran here: a peer's route for it comes back (say its
+                // migration source's, which runs it again).
+                let ip = a.ip;
+                if let Ok(l) = self.host.lock() {
+                    let _ = a.release(&l);
+                    let _ = self.host.reinstall(&l, ip);
+                }
+            }
+            (_, None) => {}
         }
         drop(self.arrived.lock().unwrap().take());
         if let Some(dir) = self.consumed.lock().unwrap().take() {
@@ -313,16 +334,19 @@ impl Proc {
     }
 
     /// The VM's address is free again here, and peers are told so (all of
-    /// it done before this returns, as the process is about to exit).
+    /// it done before this returns, as the process is about to exit). Its
+    /// route goes, or, if a peer announced a newer generation meanwhile,
+    /// points there again.
     fn withdraw(&self, a: AddrClaim) {
         let (ip, gen) = (a.ip, a.gen);
         if let Ok(l) = self.host.lock() {
             // Only while it is ours: never another VM's route.
-            if self.host.holder(&l, ip).is_ok_and(|h| h.is_none_or(|h| h == self.name())) {
+            let ours = self.host.holder(&l, ip).is_ok_and(|h| h.is_none_or(|h| h == self.name()));
+            let _ = a.release(&l);
+            let _ = self.host.observe(&l, ip, gen, None);
+            if ours && !self.host.reinstall(&l, ip).unwrap_or(false) {
                 crate::net::unroute(ip);
             }
-            let _ = a.release(&l);
-            let _ = self.host.observe(&l, ip, gen, true);
         }
         let req = json!({"op": "route", "ip": ip.to_string(), "gen": gen});
         let sends: Vec<_> = self.host.cfg.peers.iter().cloned().map(|p| {
