@@ -39,7 +39,8 @@ mod lifecycle;
 const FAULTS: &[&str] = &[
     "pages", "route", "lost_ack", "status", "prepare_fail", "short_incoming", "slow_preload",
     "restore_no_hold", "restore_before_run", "restore_after_run", "ckpt_memhash", "ckpt_fail_protect",
-    "ckpt_no_hold", "ckpt_abort", "ckpt_slow", "ckpt_fail_write", "ckpt_copy_wait",
+    "ckpt_no_hold", "ckpt_abort", "ckpt_slow", "ckpt_fail_write", "ckpt_copy_wait", "resume_kill", "kill_prepared",
+    "guest_drop", "guest_lose_reply",
 ];
 
 pub struct Config {
@@ -2307,6 +2308,24 @@ impl Drop for IpClaim<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every fault the code checks can be armed (and nothing else can).
+    #[test]
+    fn fault_list_matches_the_code() {
+        let mut used: Vec<&str> = [include_str!("daemon.rs"), include_str!("lifecycle.rs")]
+            .iter()
+            .flat_map(|src| src.split("self.fault(\"").skip(1).map(|s| s.split('"').next().unwrap()))
+            .collect();
+        // Guest faults are armed in `inject` itself.
+        let inject = include_str!("daemon.rs").split("fn inject(").nth(1).unwrap().split("\n    }\n").next().unwrap();
+        let arms: Vec<&str> = inject.split(" => *guest::FAULT").collect();
+        used.extend(arms[..arms.len() - 1].iter().filter_map(|s| s.rsplit('"').nth(1)));
+        used.sort();
+        used.dedup();
+        let mut known = FAULTS.to_vec();
+        known.sort();
+        assert_eq!(used, known);
+    }
 
     #[test]
     fn lent_addresses_persist_and_claims_roll_back() {
