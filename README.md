@@ -15,7 +15,7 @@ process and the VM is gone, send it a signal and the VM pauses or suspends.
 ./scripts/build-firecracker.sh   # patched firecracker -> artifacts/firecracker (needs musl-tools, libseccomp-dev)
 ./scripts/build-rootfs.sh        # artifacts/rootfs.ext4, and artifacts/flexvm-init for image templates
 cargo build --release
-sudo ./target/release/flexvm template default   # cold-boot and snapshot a template (all CPUs, ceiling = host RAM)
+sudo ./target/release/flexvm template default   # cold-boot and snapshot a template (all CPUs, ceiling = host RAM, 4 GiB plugged)
 ```
 
 flexvm runs as root (KVM, userfaultfd, routes, cgroups). Commands below
@@ -144,8 +144,9 @@ between network namespaces and fails on a lost datagram or a long stall.
   files under `/var/lib/flexvm` and `/run/flexvm`.
 - **Start** restores a template snapshot; memory is faulted in from a shared
   sparse image. Standby VMs are restored ahead of time.
-- **Memory** grows by virtio-mem hot-plug when the guest runs low and goes
-  back through free page reporting.
+- **Memory**: templates come with 4 GiB plugged (free until touched); past
+  that the guest asks for more over vsock the moment it runs low, admitted
+  against the host's reserve. Freed pages go back through free page reporting.
 - **Migration** is post-copy: the target is prepared first, then the source
   pauses, sends only vCPU and device state (~20-200 KiB), the target resumes
   and pulls pages on fault and in the background. Packets that arrive during
