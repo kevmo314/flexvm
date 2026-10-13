@@ -164,7 +164,7 @@ fn iteration(
         // Fault service on the target, by kind (see `uffd::FaultStats`).
         let f = &status["faults"];
         let mut post = json!({});
-        for kind in ["local", "remote", "wait", "fetch", "pull"] {
+        for kind in ["local", "remote", "wait", "fetch", "pull", "queued", "first"] {
             for stat in ["count", "sum_ms", "p50_us", "p99_us", "max_us"] {
                 post[format!("{kind}_{stat}")] = f[kind][stat].clone();
             }

@@ -64,6 +64,11 @@ const REMOTE_FAULT_RUN: usize = 64;
 /// Pages per background pull request.
 const PULL_RUN: usize = 256;
 const PULL_THREADS: usize = 4;
+/// Threads fetching pages for faults, each with its own connection.
+const FAULT_FETCHERS: usize = 8;
+/// Fetched pages are installed as they arrive, the first one at once and
+/// then at least this many at a time.
+const STREAM_RUN: usize = 16;
 /// Why a pager stopped whose Firecracker unmapped guest memory or exited.
 const GONE: &str = "firecracker unmapped guest memory";
 
@@ -211,6 +216,20 @@ pub struct Pages {
     /// checkpoint's pause (written after a write-protect fault, installed,
     /// or discarded). See `Pager::freeze`.
     dirty: Vec<AtomicU64>,
+    /// Set while faults wait for claimed pages to settle: installers then
+    /// signal `wake` (an eventfd the event thread polls) when they settle any.
+    waiting: AtomicBool,
+    wake: OnceLock<OwnedFd>,
+    /// Bumped (and `read_cv` notified) each time the event thread has read
+    /// and applied events: an install that hit EAGAIN, because a REMOVE was
+    /// queued, waits for that rather than polling.
+    read_gen: AtomicU64,
+    read_lock: Mutex<()>,
+    read_cv: Condvar,
+    /// Installs that hit EAGAIN and waited for the event thread.
+    pub install_eagain: AtomicU64,
+    /// Pages faults wait on, and when a copy into them woke the faulting
+    /// threads: what their latency counts to (`FaultStats`).
     parked: Mutex<Vec<(usize, Option<Instant>)>>,
 }
 
@@ -223,9 +242,24 @@ impl Pages {
         let states = unsafe { std::mem::transmute::<Vec<u8>, Vec<AtomicU8>>(vec![0u8; n]) };
         let dirty = unsafe { std::mem::transmute::<Vec<u64>, Vec<AtomicU64>>(vec![0u64; n.div_ceil(64)]) };
         let touched = (0..n.div_ceil(CHUNK * 64)).map(|_| AtomicU64::new(0)).collect();
-        Pages { states, touched, events: RwLock::new(()), dirty, parked: Mutex::new(Vec::new()) }
+        Pages { states, touched, events: RwLock::new(()), dirty, ..Pages::EMPTY }
     }
 
+    const EMPTY: Pages = Pages {
+        states: Vec::new(),
+        touched: Vec::new(),
+        events: RwLock::new(()),
+        dirty: Vec::new(),
+        waiting: AtomicBool::new(false),
+        wake: OnceLock::new(),
+        read_gen: AtomicU64::new(0),
+        read_lock: Mutex::new(()),
+        read_cv: Condvar::new(),
+        install_eagain: AtomicU64::new(0),
+        parked: Mutex::new(Vec::new()),
+    };
+
+    /// A fault read at `read` waits for `page` to be installed.
     fn park(&self, page: usize, read: Instant) {
         let mut parked = self.parked.lock().unwrap();
         match parked.iter_mut().find(|(p, _)| *p == page) {
@@ -238,21 +272,55 @@ impl Pages {
         }
     }
 
+    /// When a copy woke a fault read at `read` that waited for `page`, if one did.
     fn unpark(&self, page: usize, read: Instant) -> Option<Instant> {
         let mut parked = self.parked.lock().unwrap();
         let i = parked.iter().position(|(p, _)| *p == page)?;
         parked.swap_remove(i).1.filter(|&t| t >= read)
     }
 
+    /// Pages `first..first + n` were just copied in, which woke whoever waited on them.
     fn woke(&self, first: usize, n: usize) {
-        let mut parked = self.parked.lock().unwrap();
-        if parked.is_empty() {
+        if !self.waiting.load(Ordering::SeqCst) {
             return;
         }
+        let mut parked = self.parked.lock().unwrap();
         let now = Instant::now();
         for (_, woke) in parked.iter_mut().filter(|(p, w)| (first..first + n).contains(p) && w.is_none()) {
             *woke = Some(now);
         }
+    }
+
+    /// Tells a waiting event thread that claimed pages settled.
+    fn settled(&self) {
+        if self.waiting.load(Ordering::SeqCst) {
+            if let Some(fd) = self.wake.get() {
+                let one = 1u64;
+                unsafe { libc::write(fd.as_raw_fd(), (&one as *const u64).cast(), 8) };
+            }
+        }
+    }
+
+    /// The event thread has read and applied events.
+    fn events_read(&self) {
+        self.read_gen.fetch_add(1, Ordering::SeqCst);
+        let _guard = self.read_lock.lock().unwrap();
+        self.read_cv.notify_all();
+    }
+
+    /// After an install hit EAGAIN (a REMOVE is queued, and the kernel
+    /// fails copies until the event thread has read it): waits until events
+    /// were read since `seen` (`read_gen` before the copy), or if they were
+    /// already, briefly, for the kernel to finish with them.
+    fn wait_events_read(&self, seen: u64) {
+        self.install_eagain.fetch_add(1, Ordering::Relaxed);
+        if self.read_gen.load(Ordering::SeqCst) != seen {
+            thread::sleep(Duration::from_micros(20));
+            return;
+        }
+        let guard = self.read_lock.lock().unwrap();
+        // Bounded: the event thread may itself be waiting for something.
+        let _ = self.read_cv.wait_timeout_while(guard, Duration::from_millis(1), |_| self.read_gen.load(Ordering::SeqCst) == seen);
     }
 
     pub fn mark_dirty(&self, page: usize) {
@@ -386,7 +454,9 @@ impl Pages {
 
     /// Gives back claimed pages without installing them.
     pub fn release(&self, first: usize, n: usize, from: u8) -> usize {
-        (first..first + n).filter(|&p| self.settle(p, false, from)).count()
+        let resolved = (first..first + n).filter(|&p| self.settle(p, false, from)).count();
+        self.settled();
+        resolved
     }
 
     /// Installs claimed pages `[first, first + n)` with `populate(page, count)`,
@@ -415,6 +485,7 @@ impl Pages {
             while i + m < end && self.get(i + m) == INFLIGHT {
                 m += 1;
             }
+            let gen = self.read_gen.load(Ordering::SeqCst);
             match populate(i, m) {
                 Ok(done) => {
                     let done = done.clamp(1, m);
@@ -429,27 +500,97 @@ impl Pages {
                 Err(e) if e.raw_os_error() == Some(libc::EAGAIN) && stop.is_some_and(|s| !s.load(Ordering::SeqCst)) => {
                     // A REMOVE is queued: let the event thread read it.
                     drop(installing);
-                    thread::sleep(Duration::from_micros(200))
+                    self.wait_events_read(gen)
                 }
                 Err(e) => return (resolved + self.release(i, end - i, from), Err(e)),
             }
         }
+        self.settled();
         (resolved, Ok(()))
+    }
+
+    /// Fetches claimed REMOTE pages `first..first + n` with `fetch` (into
+    /// `buf`) and installs them as they arrive with `populate(page, count,
+    /// data)` (as `install` does): the first one as soon as it is in, as a
+    /// fault waits for it, then at least `STREAM_RUN` at a time, so that a
+    /// fault on any of them waits only for its part of the transfer. A
+    /// failed fetch is tried again, for what has yet to arrive, while
+    /// `retry` says so. Pages it does not install are given back. Returns
+    /// the REMOTE pages resolved, and the error that stopped it.
+    #[allow(clippy::too_many_arguments)]
+    fn fetch_install(
+        &self,
+        first: usize,
+        n: usize,
+        buf: &mut [u8],
+        fetch: &mut dyn FnMut(u64, &mut [u8], &AtomicBool, &mut dyn FnMut(&[u8])) -> io::Result<()>,
+        stop: &AtomicBool,
+        retry: &mut dyn FnMut(&io::Error) -> bool,
+        mut populate: impl FnMut(usize, usize, &[u8]) -> io::Result<usize>,
+    ) -> (usize, std::result::Result<(), Failed>) {
+        // Installs pages `from..to` (counted from `first`) out of `data`,
+        // which holds them from page `base` on.
+        let mut install = |from: usize, to: usize, data: &[u8], base: usize| {
+            let src = |p: usize, c: usize| &data[(p - first - base) * PAGE_SIZE..(p - first - base + c) * PAGE_SIZE];
+            self.install(first + from, to - from, REMOTE, Some(stop), |p, c| populate(p, c, src(p, c)))
+        };
+        // Pages from `first` installed (or given back by a failed install).
+        let mut done = 0;
+        let mut resolved = 0;
+        let mut failed: Option<io::Error> = None;
+        loop {
+            let base = done;
+            let fetched = fetch(((first + base) * PAGE_SIZE) as u64, &mut buf[base * PAGE_SIZE..n * PAGE_SIZE], stop, &mut |data| {
+                let ready = base + data.len() / PAGE_SIZE;
+                if failed.is_none() && ready > done && (done == 0 || ready - done >= STREAM_RUN) {
+                    let (r, res) = install(done, ready, data, base);
+                    resolved += r;
+                    failed = res.err();
+                    done = ready;
+                }
+            });
+            if failed.is_some() {
+                break;
+            }
+            match fetched {
+                Ok(()) => {
+                    if done < n {
+                        let (r, res) = install(done, n, &buf[..n * PAGE_SIZE], 0);
+                        resolved += r;
+                        failed = res.err();
+                        done = n;
+                    }
+                    break;
+                }
+                Err(e) if done < n && retry(&e) => {}
+                Err(e) => {
+                    resolved += self.release(first + done, n - done, REMOTE);
+                    return (resolved, Err(Failed::Fetch(e)));
+                }
+            }
+        }
+        match failed {
+            None => (resolved, Ok(())),
+            Some(e) => (resolved + self.release(first + done, n - done, REMOTE), Err(Failed::Install(e))),
+        }
     }
 }
 
 /// Fault service latency kinds: served from the template, zero or a present
-/// page; fetched by the fault itself from the VM's origin; waited for
-/// another installer (a puller, the prefetch); write-protect faults. And
-/// not faults: how long each fetch for a fault, and each background pull
-/// request, took.
-const KINDS: [&str; 6] = ["local", "remote", "wait", "wp", "fetch", "pull"];
+/// page; had its run fetched from the VM's origin; waited for another
+/// installer (a puller, the prefetch, another fault's run); write-protect
+/// faults. And not faults: how long fetching and installing each fault's
+/// run took, each background pull run, and how long a fault's run waited
+/// for a fetcher.
+const KINDS: [&str; 8] = ["local", "remote", "wait", "wp", "fetch", "pull", "queued", "first"];
 const LOCAL: usize = 0;
 const FETCHED: usize = 1;
 const WAITED: usize = 2;
 const WP: usize = 3;
 const FETCH: usize = 4;
 const PULL: usize = 5;
+const QUEUED: usize = 6;
+const FIRST: usize = 7;
 /// Histogram buckets per doubling of latency: 1 << SUB_BITS.
 const SUB_BITS: u32 = 2;
 const BUCKETS: usize = 40 << SUB_BITS;
@@ -522,6 +663,38 @@ fn bucket_floor(i: usize) -> u64 {
     (((1u64 << SUB_BITS) + frac) << log) >> SUB_BITS
 }
 
+/// A fault the event thread has yet to resolve.
+struct Pending {
+    addr: u64,
+    flags: u64,
+    /// When its event was read.
+    read: Instant,
+    /// Its kind (`KINDS`) once resolved, when known before: it waited for
+    /// another installer, or had its run fetched.
+    kind: Option<usize>,
+    /// Waiting for claimed pages to settle, which wakes the event thread;
+    /// otherwise retried every millisecond.
+    parked: bool,
+    /// When it first failed other than with EAGAIN.
+    since: Option<Instant>,
+}
+
+/// Why `Pager::fetch_install` stopped.
+enum Failed {
+    Fetch(io::Error),
+    Install(io::Error),
+}
+
+/// What became of a fault the event thread looked at.
+enum Served {
+    /// Resolved, as this kind (`KINDS`).
+    Done(usize),
+    /// Its page is claimed by another installer.
+    Waiting,
+    /// Its run was claimed and handed to a fetcher.
+    Fetching,
+}
+
 /// How long a Firecracker has to connect to its pager once started.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -590,6 +763,9 @@ pub struct Pager {
     prefetch: Mutex<(bool, bool)>,
     /// How long faults took to serve.
     pub fault_stats: FaultStats,
+    /// Runs of REMOTE pages faults claimed, `(first, count)`, for the
+    /// fetchers (`fetch_faults`).
+    demand: (Mutex<VecDeque<(usize, usize, Instant)>>, Condvar),
 }
 
 /// What `Pager::freeze` captured for a checkpoint.
@@ -654,6 +830,7 @@ impl Pager {
             learning: AtomicBool::new(false),
             prefetch: Mutex::new((false, false)),
             fault_stats: FaultStats::new(),
+            demand: (Mutex::new(VecDeque::new()), Condvar::new()),
         });
         let p = pager.clone();
         let thread = thread::Builder::new().name("uffd".into()).spawn(move || {
@@ -936,6 +1113,9 @@ impl Pager {
             drop(self.file.lock().unwrap().take());
             let _ = self.pull_finished.set(Instant::now());
             self.notify();
+            // Fault fetchers end now, letting go of the file too.
+            drop(self.demand.0.lock().unwrap());
+            self.demand.1.notify_all();
         }
     }
 
@@ -999,6 +1179,8 @@ impl Pager {
         // Also ends a prefetch still running (e.g. for a drained hot pool's VM).
         self.quiesce.store(true, Ordering::SeqCst);
         self.notify();
+        drop(self.demand.0.lock().unwrap());
+        self.demand.1.notify_all();
         let _initial = self.initial.lock().unwrap();
         self.seeded.notify_all();
     }
@@ -1085,6 +1267,11 @@ impl Pager {
         self.discards.load(Ordering::SeqCst)
     }
 
+    /// Installs that found a REMOVE queued and waited for it to be read.
+    pub fn install_eagain(&self) -> u64 {
+        self.pages().install_eagain.load(Ordering::Relaxed)
+    }
+
     /// Whether pages are still to come from a migration source.
     pub fn pulling_from_peer(&self) -> bool {
         self.remote_left() > 0 && !self.from_file.load(Ordering::SeqCst)
@@ -1104,7 +1291,7 @@ impl Pager {
     }
 
     fn pages(&self) -> &Pages {
-        static EMPTY: Pages = Pages { states: Vec::new(), touched: Vec::new(), events: RwLock::new(()), dirty: Vec::new(), parked: Mutex::new(Vec::new()) };
+        static EMPTY: Pages = Pages::EMPTY;
         self.pages.get().unwrap_or(&EMPTY)
     }
 
@@ -1203,21 +1390,35 @@ impl Pager {
             self.clone().spawn_pullers();
         }
         let fd = self.fd();
-        // Faults to retry: (address, flags, when it was read, whether it
-        // waited for another installer), with when it first failed other
-        // than with EAGAIN.
-        let mut pending: VecDeque<(u64, u64, Instant, bool, Option<Instant>)> = VecDeque::new();
+        let pages = self.pages();
+        // Installers wake this thread through it when faults wait on them.
+        let wake = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        if wake < 0 {
+            return self.fail(format!("eventfd: {}", io::Error::last_os_error()));
+        }
+        let _ = pages.wake.set(unsafe { OwnedFd::from_raw_fd(wake) });
+        let mut pending: VecDeque<Pending> = VecDeque::new();
         let mut buf = [0u8; 32 * 64];
         while !self.stop.load(Ordering::SeqCst) {
-            let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
-            let timeout = if pending.is_empty() { 100 } else { 1 };
-            if unsafe { libc::poll(&mut pfd, 1, timeout) } < 0 {
+            let mut pfd = [
+                libc::pollfd { fd, events: libc::POLLIN, revents: 0 },
+                libc::pollfd { fd: wake, events: libc::POLLIN, revents: 0 },
+            ];
+            // Faults waiting for another installer are woken by it; others
+            // (EAGAIN, errors) are retried every millisecond. The timeout
+            // also bounds a missed wakeup.
+            let timeout = if pending.iter().all(|p| p.parked) { 100 } else { 1 };
+            if unsafe { libc::poll(pfd.as_mut_ptr(), 2, timeout) } < 0 {
                 continue;
             }
-            if pfd.revents & (libc::POLLERR | libc::POLLHUP) != 0 {
+            if pfd[0].revents & (libc::POLLERR | libc::POLLHUP) != 0 {
                 break;
             }
-            if pfd.revents & libc::POLLIN != 0 {
+            if pfd[1].revents & libc::POLLIN != 0 {
+                let mut n = 0u64;
+                unsafe { libc::read(wake, (&mut n as *mut u64).cast(), 8) };
+            }
+            if pfd[0].revents & libc::POLLIN != 0 {
                 // A REMOVE the kernel acts on as soon as it is read must not
                 // hit pages a checkpoint copy has yet to save: let it finish.
                 let cow = self.cow.lock().unwrap().clone();
@@ -1229,7 +1430,7 @@ impl Pager {
                         }
                     }
                 }
-                let removing = self.pages().removing();
+                let removing = pages.removing();
                 let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
                 if n > 0 {
                     for msg in buf[..n as usize].chunks_exact(32) {
@@ -1242,47 +1443,67 @@ impl Pager {
                                         self.base.note_load_fault(page as u64);
                                     }
                                 }
-                                pending.push_back((b, a, Instant::now(), false, None))
+                                let p = Pending { addr: b, flags: a, read: Instant::now(), kind: None, parked: false, since: None };
+                                pending.push_back(p)
                             }
                             UFFD_EVENT_REMOVE => self.discard(&removing, a, b),
                             _ => {}
                         }
                     }
                 }
+                drop(removing);
+                pages.events_read();
             }
+            // Before the faults look at page states: an installer that
+            // settles a page after that sees it set, and wakes this thread.
+            pages.waiting.store(!pending.is_empty(), Ordering::SeqCst);
             // Retry faults that hit EAGAIN once the events ahead of them are drained.
             // Other errors (say ENOMEM) are retried for a while: a dropped
             // fault would block its vCPU forever.
             for _ in 0..pending.len() {
-                let (addr, flags, read, waited, since) = pending.pop_front().unwrap();
-                match self.fault(addr, flags) {
-                    Ok(kind) => {
-                        let woke = self.page_of(addr).filter(|_| waited).and_then(|(page, _)| self.pages().unpark(page, read));
-                        self.fault_stats.record(if waited && kind != WP { WAITED } else { kind }, woke.unwrap_or_else(Instant::now) - read)
+                let mut p = pending.pop_front().unwrap();
+                match self.fault(p.addr, p.flags) {
+                    Ok(Served::Done(kind)) => {
+                        // A fault that waited was resolved by the copy that woke its thread.
+                        let page = self.page_of(p.addr).map(|(page, _)| page);
+                        let woke = page.filter(|_| p.kind.is_some()).and_then(|page| pages.unpark(page, p.read));
+                        let kind = if kind == WP { WP } else { p.kind.unwrap_or(kind) };
+                        self.fault_stats.record(kind, woke.unwrap_or_else(Instant::now) - p.read);
+                        continue;
                     }
-                    Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => {
-                        if let Some((page, _)) = self.page_of(addr).filter(|(page, _)| matches!(self.pages().get(*page), INFLIGHT | DISCARDED)) {
-                            self.pages().park(page, read);
+                    Ok(served) => {
+                        p.parked = true;
+                        match served {
+                            Served::Fetching => p.kind = Some(FETCHED),
+                            _ => _ = p.kind.get_or_insert(WAITED),
                         }
-                        pending.push_back((addr, flags, read, true, since))
+                        if let Some((page, _)) = self.page_of(p.addr) {
+                            pages.park(page, p.read);
+                        }
                     }
+                    Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => p.parked = false,
                     // Firecracker unmapped guest memory (tearing down a failed load, or exiting).
-                    Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) && self.unmapped(addr, PAGE_SIZE) => {
+                    Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) && self.unmapped(p.addr, PAGE_SIZE) => {
                         return self.gone()
                     }
                     Err(e) if fatal(&e) => return self.fail(e.to_string()),
-                    Err(e) => match since {
-                        None => {
-                            eprintln!("uffd: fault at {addr:#x}: {e}; retrying");
-                            pending.push_back((addr, flags, read, waited, Some(Instant::now())));
+                    Err(e) => {
+                        p.parked = false;
+                        match p.since {
+                            None => {
+                                eprintln!("uffd: fault at {:#x}: {e}; retrying", p.addr);
+                                p.since = Some(Instant::now());
+                            }
+                            Some(t) if t.elapsed() < FAULT_TIMEOUT => {}
+                            Some(_) => return self.fail(format!("fault at {:#x}: {e}", p.addr)),
                         }
-                        Some(t) if t.elapsed() < FAULT_TIMEOUT => pending.push_back((addr, flags, read, waited, since)),
-                        Some(_) => return self.fail(format!("fault at {addr:#x}: {e}")),
-                    },
+                    }
                 }
+                pending.push_back(p);
             }
             if pending.is_empty() {
-                self.pages().parked.lock().unwrap().clear();
+                pages.waiting.store(false, Ordering::SeqCst);
+                pages.parked.lock().unwrap().clear();
             }
         }
     }
@@ -1311,14 +1532,15 @@ impl Pager {
         self.pulled(resolved);
     }
 
-    /// Serves a fault; returns its kind (`KINDS`).
-    fn fault(&self, addr: u64, flags: u64) -> io::Result<usize> {
+    /// Serves a fault, without waiting for the network or disk: a REMOTE
+    /// page's run goes to a fetcher (`fetch_faults`), and the fault waits.
+    fn fault(&self, addr: u64, flags: u64) -> io::Result<Served> {
         let Some((page, m)) = self.page_of(addr) else {
             return Err(io::Error::other("fault outside guest memory"));
         };
         let _wp = self.wp.lock().unwrap();
         if flags & UFFD_PAGEFAULT_FLAG_WP != 0 {
-            return self.wp_fault(page, m).map(|()| WP);
+            return self.wp_fault(page, m).map(|()| Served::Done(WP));
         }
         // Runs stay within a 2 MiB chunk: Firecracker keeps unplugged
         // virtio-mem slots PROT_NONE, which splits the region into VMAs at
@@ -1339,45 +1561,27 @@ impl Pager {
                     false => self.populate(page, 1, None),
                 };
                 match res {
-                    Err(e) if e.raw_os_error() == Some(libc::EEXIST) => self.wake(page, 1).map(|()| LOCAL),
+                    Err(e) if e.raw_os_error() == Some(libc::EEXIST) => self.wake(page, 1).map(|()| Served::Done(LOCAL)),
                     r => {
                         if r.is_ok() && !unsaved {
                             pages.mark_dirty(page);
                         }
-                        r.map(|_| LOCAL)
+                        r.map(|_| Served::Done(LOCAL))
                     }
                 }
             }
-            // Someone else is installing it; retry until it lands (their copy wakes us).
-            INFLIGHT | DISCARDED => Err(eagain()),
+            // Someone else is installing it: their copy wakes the faulting
+            // thread, and their settling this thread, to finish the fault.
+            INFLIGHT | DISCARDED => Ok(Served::Waiting),
             REMOTE => {
                 let n = pages.claim(page, REMOTE_FAULT_RUN.min(region_left), REMOTE, |_| true);
                 if n == 0 {
                     return Err(eagain());
                 }
-                let mut buf = vec![0u8; n * PAGE_SIZE];
-                // Claimed REMOTE pages keep the file (see `pulled`).
-                let file = self.file.lock().unwrap().clone();
-                let started = Instant::now();
-                let fetched = match file {
-                    Some(file) => file.read(page, &mut buf, false),
-                    None if self.from_file.load(Ordering::SeqCst) => Err(io::Error::other("checkpoint file already released")),
-                    None => match self.remote.lock().unwrap().as_mut() {
-                        Some(link) => link.fetch((page * PAGE_SIZE) as u64, &mut buf, None),
-                        None => Err(io::Error::other("no migration source")),
-                    },
-                };
-                self.fault_stats.record(FETCH, started.elapsed());
-                if let Err(e) = fetched {
-                    let resolved = pages.release(page, n, REMOTE);
-                    self.pulled(resolved);
-                    // All discarded meanwhile: nothing left to fetch, serve the fault again.
-                    return Err(if resolved == n { eagain() } else { e });
-                }
-                let src = |p: usize, c: usize| &buf[(p - page) * PAGE_SIZE..(p - page + c) * PAGE_SIZE];
-                let (resolved, res) = pages.install(page, n, REMOTE, None, |p, c| self.populate(p, c, Some(src(p, c))));
-                self.pulled(resolved);
-                res.map(|()| FETCHED)
+                let mut jobs = self.demand.0.lock().unwrap();
+                jobs.push_back((page, n, Instant::now()));
+                self.demand.1.notify_one();
+                Ok(Served::Fetching)
             }
             state => {
                 // BASE or ZERO: serve a run of neighbours with the same source.
@@ -1393,7 +1597,7 @@ impl Pager {
                     self.template_next.store(page + n, Ordering::Relaxed);
                 }
                 let src = |p: usize, c: usize| from_template.then(|| self.base.pages(p, c));
-                pages.install(page, n, state, None, |p, c| self.populate(p, c, src(p, c))).1.map(|()| LOCAL)
+                pages.install(page, n, state, None, |p, c| self.populate(p, c, src(p, c))).1.map(|()| Served::Done(LOCAL))
             }
         }
     }
@@ -1852,26 +2056,43 @@ impl Pager {
     }
 
     /// Pulls every REMOTE page in the background so the source can let go
-    /// (or, restoring a checkpoint, so the VM no longer needs its file).
+    /// (or, restoring a checkpoint, so the VM no longer needs its file), and
+    /// starts the threads that fetch pages for faults (`fetch_faults`).
     fn spawn_pullers(self: Arc<Self>) {
         let file = self.file.lock().unwrap().clone();
-        let source = self.remote.lock().unwrap().as_ref().map(|l| l.source.clone());
+        // The connection made for the snapshot load goes to a fault fetcher.
+        let mut link = self.remote.lock().unwrap().take();
+        let source = link.as_ref().map(|l| l.source.clone());
+        // Reads from where REMOTE pages come from: the checkpoint file
+        // (evicting what it read, for a puller) or its own source connection.
+        let mut fetcher = |puller: bool| -> Option<Box<Fetch>> {
+            match (&file, &source) {
+                (Some(file), _) => {
+                    let file = file.clone();
+                    Some(Box::new(move |off, buf, _, _| file.read(off as usize / PAGE_SIZE, buf, puller)))
+                }
+                (None, Some(source)) => {
+                    let mut link = link.take().unwrap_or_else(|| Link::new(source.clone()));
+                    // A fault waits for the first page of its run: ask for it first.
+                    let head = if puller { 0 } else { PAGE_SIZE };
+                    Some(Box::new(move |off, buf, stop, progress| link.fetch(off, buf, stop, head, progress)))
+                }
+                (None, None) => None,
+            }
+        };
+        // Released already: every page is in.
+        if file.is_none() && self.from_file.load(Ordering::SeqCst) {
+            return;
+        }
+        for _ in 0..FAULT_FETCHERS {
+            let p = self.clone();
+            let Some(mut fetch) = fetcher(false) else { return self.fail("remote pages but nowhere to pull them from".into()) };
+            thread::spawn(move || p.fetch_faults(&mut fetch));
+        }
         for t in 0..PULL_THREADS {
             let p = self.clone();
             let file = file.clone();
-            let mut fetch: Box<Fetch> = match (&file, &source) {
-                (Some(file), _) => {
-                    let file = file.clone();
-                    Box::new(move |off, buf, _| file.read(off as usize / PAGE_SIZE, buf, true))
-                }
-                (None, Some(source)) => {
-                    let mut link = Link::new(source.clone());
-                    Box::new(move |off, buf, stop| link.fetch(off, buf, Some(stop)))
-                }
-                // Released already: every page is in.
-                (None, None) if self.from_file.load(Ordering::SeqCst) => return,
-                (None, None) => return self.fail("remote pages but nowhere to pull them from".into()),
-            };
+            let Some(mut fetch) = fetcher(true) else { return self.fail("remote pages but nowhere to pull them from".into()) };
             thread::spawn(move || {
                 // A checkpoint's pages come off local disk: the ones in the
                 // template's working set first, as the guest needs them soonest.
@@ -1893,6 +2114,86 @@ impl Pager {
         }
     }
 
+    /// Fetches and installs the runs faults claimed (`demand`), so that the
+    /// event thread never waits for the network or disk: faults on other
+    /// pages, and REMOVEs, are served meanwhile. The faulting thread is
+    /// woken by the copy, the event thread by the pages settling. Returns
+    /// once no REMOTE page is left, or the pager stops or gives up.
+    fn fetch_faults(&self, fetch: &mut Fetch) {
+        let mut buf = vec![0u8; REMOTE_FAULT_RUN * PAGE_SIZE];
+        // Since when installs have kept failing (other than with EAGAIN).
+        let mut failing: Option<Instant> = None;
+        loop {
+            let (page, n, queued) = {
+                let mut jobs = self.demand.0.lock().unwrap();
+                loop {
+                    if self.stop.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    if let Some(job) = jobs.pop_front() {
+                        break job;
+                    }
+                    // Claimed pages count as left until they settle, so
+                    // with none left no fault can queue another run.
+                    if self.remote_left() == 0 {
+                        return;
+                    }
+                    jobs = self.demand.1.wait_timeout(jobs, Duration::from_millis(100)).unwrap().0;
+                }
+            };
+            self.fault_stats.record(QUEUED, queued.elapsed());
+            let started = Instant::now();
+            // A link waits out a source outage itself (until it gives up,
+            // which is fatal); other errors are retried for a while.
+            let mut retry = |e: &io::Error| {
+                let again = !fatal(e) && !self.stop.load(Ordering::SeqCst) && started.elapsed() < FAULT_TIMEOUT;
+                if again {
+                    eprintln!("uffd: fetching pages {page}+{n} for a fault: {e}; retrying");
+                    thread::sleep(BACKOFF_MIN);
+                }
+                again
+            };
+            let mut first = true;
+            let (resolved, res) = self.pages().fetch_install(page, n, &mut buf, fetch, &self.stop, &mut retry, |p, c, src| {
+                let r = self.populate(p, c, Some(src));
+                if std::mem::take(&mut first) {
+                    self.fault_stats.record(FIRST, queued.elapsed());
+                }
+                r
+            });
+            self.fault_stats.record(FETCH, started.elapsed());
+            self.pulled(resolved);
+            match res {
+                Ok(()) => failing = None,
+                // All discarded meanwhile, there was nothing left to fetch.
+                Err(Failed::Fetch(_)) if resolved == n || self.stop.load(Ordering::SeqCst) => {}
+                Err(Failed::Fetch(e)) => return self.fail(format!("fetching pages for a fault: {e}")),
+                Err(Failed::Install(e))
+                    if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ESRCH))
+                        && self.host_addr(page).is_some_and(|(a, _)| self.unmapped(a, n * PAGE_SIZE)) =>
+                {
+                    return self.gone()
+                }
+                // The rest went back to REMOTE: the faults claim them again.
+                Err(Failed::Install(e)) => match *failing.get_or_insert_with(Instant::now) {
+                    t if t.elapsed() >= FAULT_TIMEOUT => return self.fail(format!("installing pages for a fault: {e}")),
+                    _ => eprintln!("uffd: installing pages {page}+{n} for a fault: {e}; retrying"),
+                },
+            }
+        }
+    }
+
+    /// `Pages::fetch_install` into guest memory.
+    fn fetch_install(
+        &self,
+        first: usize,
+        n: usize,
+        buf: &mut [u8],
+        fetch: &mut Fetch,
+        retry: &mut dyn FnMut(&io::Error) -> bool,
+    ) -> (usize, std::result::Result<(), Failed>) {
+        self.pages().fetch_install(first, n, buf, fetch, &self.stop, retry, |p, c, src| self.populate(p, c, Some(src)))
+    }
     /// Pulls the REMOTE pages of every `PULL_THREADS`th range of the
     /// template's working set, starting at range `stripe`.
     fn pull_working_set(&self, stripe: usize, fetch: &mut Fetch) -> io::Result<()> {
@@ -1936,29 +2237,22 @@ impl Pager {
         if n == 0 {
             return Ok(i + 1);
         }
-        let b = &mut buf[..n * PAGE_SIZE];
         let started = Instant::now();
-        let fetched = fetch((i * PAGE_SIZE) as u64, b, &self.stop);
+        let (resolved, res) = self.fetch_install(i, n, buf, fetch, &mut |_| false);
         self.fault_stats.record(PULL, started.elapsed());
-        if let Err(e) = fetched {
-            let resolved = pages.release(i, n, REMOTE);
-            self.pulled(resolved);
-            if resolved < n {
-                return Err(e);
-            }
-            // All discarded meanwhile.
-            return Ok(i + n);
-        }
-        let src = |p: usize, c: usize| &b[(p - i) * PAGE_SIZE..(p - i + c) * PAGE_SIZE];
-        let (resolved, res) = pages.install(i, n, REMOTE, Some(&self.stop), |p, c| self.populate(p, c, Some(src(p, c))));
         self.pulled(resolved);
-        res.map_err(|e| match e.raw_os_error() {
-            Some(libc::ENOENT | libc::ESRCH) if self.host_addr(i).is_some_and(|(a, _)| self.unmapped(a, n * PAGE_SIZE)) => {
-                io::Error::other(Unmapped)
-            }
-            _ => e,
-        })?;
-        Ok(i + n)
+        match res {
+            Ok(()) => Ok(i + n),
+            // All discarded meanwhile.
+            Err(Failed::Fetch(_)) if resolved == n => Ok(i + n),
+            Err(Failed::Fetch(e)) => Err(e),
+            Err(Failed::Install(e)) => Err(match e.raw_os_error() {
+                Some(libc::ENOENT | libc::ESRCH) if self.host_addr(i).is_some_and(|(a, _)| self.unmapped(a, n * PAGE_SIZE)) => {
+                    io::Error::other(Unmapped)
+                }
+                _ => e,
+            }),
+        }
     }
 }
 
@@ -1979,19 +2273,17 @@ impl Link {
         Link { source, client: None, down: None, retry_at: Instant::now(), backoff: BACKOFF_MIN }
     }
 
-    /// Reads guest memory at `offset` from the source. Waiting to reconnect,
-    /// it sleeps until `stop` is set, or without `stop` fails with EAGAIN.
-    /// Fails with TimedOut once the outage is too long.
-    fn fetch(&mut self, offset: u64, buf: &mut [u8], stop: Option<&AtomicBool>) -> io::Result<()> {
+    /// Reads guest memory at `offset` from the source, reporting `progress`
+    /// as `PageClient::fetch` does (from the start again after a reconnect).
+    /// Waiting to reconnect, it sleeps until `stop` is set. Fails with
+    /// TimedOut once the outage is too long.
+    fn fetch(&mut self, offset: u64, buf: &mut [u8], stop: &AtomicBool, head: usize, progress: &mut dyn FnMut(&[u8])) -> io::Result<()> {
         loop {
             if self.client.is_none() {
-                let wait = self.retry_at.saturating_duration_since(Instant::now());
-                match stop {
-                    Some(s) if s.load(Ordering::SeqCst) => return Err(io::Error::other("pager stopped")),
-                    Some(_) => thread::sleep(wait),
-                    None if !wait.is_zero() => return Err(eagain()),
-                    None => {}
+                if stop.load(Ordering::SeqCst) {
+                    return Err(io::Error::other("pager stopped"));
                 }
+                thread::sleep(self.retry_at.saturating_duration_since(Instant::now()));
                 match PageClient::connect(&self.source) {
                     Ok(c) => self.client = Some(c),
                     Err(e) => {
@@ -2000,7 +2292,7 @@ impl Link {
                     }
                 }
             }
-            match self.client.as_mut().unwrap().fetch(offset, buf) {
+            match self.client.as_mut().unwrap().fetch(offset, buf, head, progress) {
                 Ok(()) => {
                     self.down = None;
                     self.backoff = BACKOFF_MIN;
@@ -2115,21 +2407,46 @@ impl PageClient {
         Ok(PageClient { stream, acked: false })
     }
 
-    pub fn fetch(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
-        let mut req = [0u8; 12];
-        req[..8].copy_from_slice(&offset.to_le_bytes());
-        req[8..].copy_from_slice(&(buf.len() as u32).to_le_bytes());
+    /// Reads guest memory at `offset` into `buf`, calling `progress` with
+    /// what has arrived so far as it does. With `head` (bytes, less than
+    /// `buf`), the first `head` bytes are asked for on their own, ahead of
+    /// the rest: the server reads and sends them without waiting to read
+    /// the rest out of guest memory.
+    pub fn fetch(&mut self, offset: u64, buf: &mut [u8], head: usize, progress: &mut dyn FnMut(&[u8])) -> io::Result<()> {
+        let parts = match head {
+            h if h > 0 && h < buf.len() => vec![(0, h), (h, buf.len())],
+            _ => vec![(0, buf.len())],
+        };
+        let mut req = Vec::with_capacity(12 * parts.len());
+        for &(a, b) in &parts {
+            req.extend_from_slice(&(offset + a as u64).to_le_bytes());
+            req.extend_from_slice(&((b - a) as u32).to_le_bytes());
+        }
         self.stream.write_all(&req)?;
         if !self.acked {
             read_ack(&mut self.stream)?;
             self.acked = true;
         }
-        let mut status = [0u8; 1];
-        self.stream.read_exact(&mut status)?;
-        if status[0] != 0 {
-            return Err(io::Error::other("page server could not read guest memory"));
+        for (a, b) in parts {
+            let mut status = [0u8; 1];
+            self.stream.read_exact(&mut status)?;
+            if status[0] != 0 {
+                return Err(io::Error::other("page server could not read guest memory"));
+            }
+            let mut filled = a;
+            while filled < b {
+                match self.stream.read(&mut buf[filled..b]) {
+                    Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+                    Ok(n) => {
+                        filled += n;
+                        progress(&buf[..filled]);
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e),
+                }
+            }
         }
-        self.stream.read_exact(buf)
+        Ok(())
     }
 }
 
@@ -2155,12 +2472,11 @@ pub fn serve_pages(pager: &Pager, conn: &TcpStream, mut stream: impl Read + Writ
             stream.write_all(&[1])?;
             return Ok(());
         }
-        buf.resize(len, 0);
-        match pager.read_guest(offset, &mut buf) {
-            Ok(()) => {
-                stream.write_all(&[0])?;
-                stream.write_all(&buf)?;
-            }
+        // The status byte, then the pages: sent with one write.
+        buf.resize(1 + len, 0);
+        buf[0] = 0;
+        match pager.read_guest(offset, &mut buf[1..]) {
+            Ok(()) => stream.write_all(&buf)?,
             Err(e) => {
                 eprintln!("page server: {e}");
                 stream.write_all(&[1])?;
@@ -2204,8 +2520,10 @@ pub fn remote_among(runs: &Runs, wanted: impl IntoIterator<Item = u64>) -> Vec<u
         .collect()
 }
 
-/// Reads guest memory at an offset from wherever a puller pulls it.
-type Fetch = dyn FnMut(u64, &mut [u8], &AtomicBool) -> io::Result<()> + Send;
+/// Reads guest memory at an offset from wherever REMOTE pages come from,
+/// reporting what has arrived as it does (see `PageClient::fetch`; a file
+/// read reports nothing).
+type Fetch = dyn FnMut(u64, &mut [u8], &AtomicBool, &mut dyn FnMut(&[u8])) -> io::Result<()> + Send;
 
 /// A background pull could not install pages because their range is no
 /// longer mapped in Firecracker at all (UFFDIO_COPY and UFFDIO_ZEROPAGE fail
@@ -2299,6 +2617,190 @@ mod tests {
 
     fn discard(p: &Pages, page: usize) -> bool {
         p.discard(&p.removing(), page)
+    }
+
+    /// Streamed installs under random interleavings: the fetch delivers its
+    /// run in random pieces and may fail part way (and be retried, or not),
+    /// REMOVEs land while it is on the wire, copies stop part way, hit
+    /// EEXIST, EAGAIN or fail. Every page ends settled, installed pages get
+    /// their own contents, and every REMOTE page is counted resolved once.
+    #[test]
+    fn streamed_installs_add_up() {
+        let seed = AtomicU64::new(0x2545_f491_4f6c_dd1d);
+        let rand = |n: usize| {
+            let mut s = seed.load(Ordering::Relaxed);
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            seed.store(s, Ordering::Relaxed);
+            (s % n as u64) as usize
+        };
+        let stop = AtomicBool::new(false);
+        let mut fetches = 0;
+        for _ in 0..1000 {
+            let p = pages(&[REMOTE; 64]);
+            let mut resolved = 0;
+            for _ in 0..20 {
+                let first = rand(64);
+                if rand(4) == 0 {
+                    resolved += discard(&p, first) as usize;
+                    continue;
+                }
+                let n = p.claim(first, 1 + rand(48), REMOTE, |_| true);
+                if n == 0 {
+                    continue;
+                }
+                let (fails, retries) = (rand(3), rand(2) == 0);
+                let (mut attempts, mut discarded) = (0, 0);
+                let mut fetch = |off: u64, buf: &mut [u8], _: &AtomicBool, progress: &mut dyn FnMut(&[u8])| -> io::Result<()> {
+                    attempts += 1;
+                    let start = off as usize / PAGE_SIZE;
+                    assert!(start >= first && start + buf.len() / PAGE_SIZE == first + n, "refetches what has yet to arrive");
+                    let mut filled = 0;
+                    while filled < buf.len() {
+                        let k = (1 + rand(3 * PAGE_SIZE)).min(buf.len() - filled);
+                        for (i, b) in buf[filled..filled + k].iter_mut().enumerate() {
+                            *b = (start + (filled + i) / PAGE_SIZE) as u8;
+                        }
+                        filled += k;
+                        if rand(8) == 0 {
+                            discarded += discard(&p, first + rand(n)) as usize;
+                        }
+                        if attempts <= fails && rand(4) == 0 {
+                            return Err(os(libc::ECONNRESET));
+                        }
+                        progress(&buf[..filled]);
+                    }
+                    Ok(())
+                };
+                let mut retry = |_: &io::Error| retries;
+                let (r, _) = p.fetch_install(first, n, &mut vec![0u8; n * PAGE_SIZE], &mut fetch, &stop, &mut retry, |pg, c, src| {
+                    assert!(src.len() >= c * PAGE_SIZE);
+                    for i in 0..c {
+                        assert!(src[i * PAGE_SIZE..(i + 1) * PAGE_SIZE].iter().all(|&b| b == (pg + i) as u8), "page {} gets its own data", pg + i);
+                    }
+                    match rand(10) {
+                        0 => Err(os(libc::EEXIST)),
+                        1 => {
+                            // A REMOVE is queued; the event thread reads it.
+                            p.read_gen.fetch_add(1, Ordering::SeqCst);
+                            Err(os(libc::EAGAIN))
+                        }
+                        2 => Err(os(libc::EIO)),
+                        _ => Ok(1 + rand(c)),
+                    }
+                });
+                drop(fetch);
+                // Only pages a failed install gave back can be REMOTE again by then.
+                resolved += discarded;
+                resolved += r;
+                fetches += 1;
+            }
+            let s = states(&p);
+            assert!(s.iter().all(|&s| s != INFLIGHT && s != DISCARDED), "{s:?}");
+            assert_eq!(resolved, 64 - s.iter().filter(|&&s| s == REMOTE).count());
+        }
+        assert!(fetches > 5000);
+    }
+
+    /// Faults waiting on claimed pages are woken when they settle, whether
+    /// installed, given back or discarded; with none waiting, nobody is.
+    #[test]
+    fn settling_wakes_waiting_faults() {
+        let p = pages(&[REMOTE; 8]);
+        let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        assert!(fd >= 0);
+        p.wake.set(unsafe { OwnedFd::from_raw_fd(fd) }).unwrap();
+        let woken = || {
+            let mut n = 0u64;
+            unsafe { libc::read(fd, (&mut n as *mut u64).cast(), 8) == 8 }
+        };
+        p.claim(0, 2, REMOTE, |_| true);
+        assert!(p.install(0, 2, REMOTE, None, |_, n| Ok(n)).1.is_ok());
+        assert!(!woken(), "nobody waits");
+        p.waiting.store(true, Ordering::SeqCst);
+        p.claim(2, 2, REMOTE, |_| true);
+        assert!(p.install(2, 2, REMOTE, None, |_, n| Ok(n)).1.is_ok());
+        assert!(woken(), "installed");
+        p.claim(4, 2, REMOTE, |_| true);
+        p.release(4, 2, REMOTE);
+        assert!(woken(), "given back");
+        p.claim(6, 2, REMOTE, |_| true);
+        discard(&p, 6);
+        discard(&p, 7);
+        assert!(p.install(6, 2, REMOTE, None, |_, _| panic!("discarded pages are not copied")).1.is_ok());
+        assert!(woken(), "discarded while claimed");
+        assert!(!woken());
+        assert_eq!(states(&p), [PRESENT, PRESENT, PRESENT, PRESENT, REMOTE, REMOTE, ZERO, ZERO]);
+    }
+
+    /// An install that hits EAGAIN (a REMOVE is queued) waits for the event
+    /// thread to read events, then copies again.
+    #[test]
+    fn eagain_waits_for_events_read() {
+        let p = pages(&[REMOTE; 2]);
+        p.claim(0, 2, REMOTE, |_| true);
+        let stop = AtomicBool::new(false);
+        let mut calls = 0;
+        thread::scope(|s| {
+            s.spawn(|| {
+                thread::sleep(Duration::from_millis(20));
+                discard(&p, 1);
+                p.events_read();
+            });
+            let (resolved, res) = p.install(0, 2, REMOTE, Some(&stop), |_, n| {
+                calls += 1;
+                match p.read_gen.load(Ordering::SeqCst) {
+                    0 => Err(os(libc::EAGAIN)),
+                    _ => Ok(n),
+                }
+            });
+            assert!(res.is_ok());
+            assert_eq!(resolved, 2);
+        });
+        assert!(calls >= 2);
+        assert!(p.install_eagain.load(Ordering::SeqCst) >= 1);
+        assert_eq!(states(&p), [PRESENT, ZERO]);
+    }
+
+    /// A fetch with a head asks for it on its own, pipelined ahead of the
+    /// rest, and reports the head as soon as it is in.
+    #[test]
+    fn fetch_asks_for_the_head_first() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            let mut r = io::BufReader::new(s.try_clone().unwrap());
+            let mut hello = String::new();
+            io::BufRead::read_line(&mut r, &mut hello).unwrap();
+            let mut reqs = [0u8; 24];
+            r.read_exact(&mut reqs).unwrap();
+            let req = |i: usize| {
+                let q = &reqs[i * 12..(i + 1) * 12];
+                (u64::from_le_bytes(q[..8].try_into().unwrap()), u32::from_le_bytes(q[8..].try_into().unwrap()))
+            };
+            assert_eq!((req(0), req(1)), ((8192, 4096), (12288, 3 * 4096)));
+            let mut s = s;
+            s.write_all(b"{\"ok\": true}\n").unwrap();
+            s.write_all(&[&[0u8][..], &[1u8; 4096]].concat()).unwrap();
+            thread::sleep(Duration::from_millis(50));
+            s.write_all(&[&[0u8][..], &[2u8; 3 * 4096]].concat()).unwrap();
+        });
+        let source = Source { addr, vm: "v".into(), mig: 1 };
+        let mut c = PageClient::connect(&source).unwrap();
+        let mut buf = vec![0u8; 4 * PAGE_SIZE];
+        let start = Instant::now();
+        let mut head_at = None;
+        c.fetch(8192, &mut buf, PAGE_SIZE, &mut |data| {
+            if data.len() >= PAGE_SIZE && head_at.is_none() {
+                head_at = Some(start.elapsed());
+            }
+        })
+        .unwrap();
+        assert!(head_at.unwrap() < Duration::from_millis(40), "head reported before the rest arrived");
+        assert!(buf[..PAGE_SIZE].iter().all(|&b| b == 1) && buf[PAGE_SIZE..].iter().all(|&b| b == 2));
+        server.join().unwrap();
     }
 
     #[test]

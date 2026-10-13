@@ -40,6 +40,20 @@ settle before exporting page states, so they match the saved vmstate. If the
 migration source stays unreachable for 10 s (fetches reconnect with backoff
 until then), the target kills the VM and reports it `failed`.
 
+One thread reads uffd events, but it never waits for the network or disk:
+a fault on a REMOTE page claims a 64-page run and hands it to one of 8
+fetcher threads (each with its own connection to the source), so faults on
+template and zero pages, and REMOVEs, are served meanwhile. Fetchers and the
+4 background pullers install pages as they arrive (16 at a time), and a
+fetcher asks for the faulting page on its own, pipelined ahead of the rest of
+its run. A fault on a page someone else is installing waits for that copy,
+which wakes the faulting thread; installers signal the event thread (an
+eventfd) when pages settle, and an install that hits EAGAIN (a REMOVE is
+queued) waits until the event thread has read events, instead of polling.
+`migration_status` reports fault service latency per kind (served locally,
+fetched, waited for another installer), measured from reading the fault to
+the copy that woke it, plus fetch, queueing and pull times.
+
 Pausing Firecracker stops only the vCPUs, so before the state-only snapshot the
 source also brings the VM's tap down (no RX into guest memory), closes host
 exec sessions (vsock) and parks the balloon statistics timer; the target and an
@@ -811,6 +825,7 @@ every queue.
 | UDP stream through the same, 5,000 datagrams/s | **0 lost**, 0–17 reordered per round (12 rounds); before: 184–770 lost per round. At 20,000/s: 0 lost, 0–14 reordered |
 | nginx image, `run` → first HTTP response from the host | **205 ms** p50 (run 56 + nginx startup 144); `--warm`: **55 ms** p50 (run 31 + first request 22) |
 | Background memory pull | ~1.1 GB/s over loopback TCP |
+| Post-copy faults, 500 MiB written then read back right after the migration (host load ~15) | REMOTE fault p50 **1.3 ms** (was 4.2–5.2 ms, fetched on the event thread), p99 2.6–4.2 ms (was 15–17); template/zero faults p50 41–49 µs (was 1.3 ms, queued behind fetches); all faults blocked 0.77–0.84 s in all (was 1.3–1.6) |
 | Idle VM host RSS | 9–22 MiB (with 4 GiB plugged) |
 | pause / resume (daemon side; RPC round trip ~2.3 ms) | **0.6 / 0.7 ms** (2 vCPU), 1.5 ms resume (24 vCPU) |
 | checkpoint `--keep-running`, 256 / 1024 / 4096 MiB written in the guest: VM paused | **20 / 18 / 24–31 ms** (was 125 / 406–428 / 1456–1923 ms); write protection armed beforehand while it runs (first checkpoint only): 20 / 95–125 / 270–380 ms; whole checkpoint 220–250 / 450–620 / 1900–2200 ms |
@@ -1002,10 +1017,22 @@ flexvm --host 192.168.1.10:7070 bench --lifecycle /data/ckpt --to 192.168.1.11:7
 client sees it, then `app_ready` until the VM accepts a TCP connection on N
 (or answers `GET /`), and their `total`.
 
+With `--dirty-mib`, the guest also reads its file back before the migration
+and right after it, while its pages are still being pulled; the `post_copy`
+group has both read times, their difference (`stall`), and the target's fault
+service: counts and p50/p99/max latency of faults served locally, fetched
+(`remote`) or that waited for another installer (`wait`), their total
+(`fault_blocked`), and fetch, queueing and pull times. (On nested KVM the
+read after a migration is dominated by KVM mapping each page once again,
+not by the pager: compare the fault numbers.)
+
 `--lifecycle DIR` runs, for each memory size, VMs that are paused and resumed
 ten times, checkpointed into DIR with `--stop`, restored on `--to`, then
 suspended and resumed there. The report covers every phase, including the
-background page-in.
+background page-in. `--scatter-pages N` adds keep-running checkpoints
+before that: one that arms write tracking, one with nothing written since,
+and one after the guest rewrote N pages spread evenly over its file (the
+`cow` group: pauses, re-protect time, ranges protected, MiB dirty).
 
 Each trial runs a fresh VM, optionally writes N MiB into its /tmp and migrates
 it (waiting for the full pull), then kills it. Phases are back-to-back daemon
