@@ -1460,10 +1460,9 @@ impl Daemon {
         let lost = arrived.is_some() && self.fault("lost_ack");
         let answered = match lost {
             true => w.shutdown(std::net::Shutdown::Both).map_err(Error::from),
-            false => w
-                .set_write_timeout(Some(deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1))))
-                .map_err(Error::from)
-                .and_then(|()| Ok(send_json(&mut w, &reply)?)),
+            // Every partial write by the deadline; one that misses it leaves
+            // a committed migration committed (the source asks).
+            false => w.try_clone().map_err(Error::from).and_then(|s| Ok(send_json(&mut crate::util::By { s, at: deadline }, &reply)?)),
         };
         // Only now, on the same buffered reader: the held packets follow the
         // answer. A committed VM is announced even if answering failed.
