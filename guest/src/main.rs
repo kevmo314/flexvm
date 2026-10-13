@@ -33,7 +33,8 @@ const VSOCK_PORT: u32 = 52;
 /// all of it.
 const BODY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Longest request line and command body.
-const MAX_LINE: u64 = 4096;
+// CHECK hex-encodes a command of up to MAX_BODY bytes.
+const MAX_LINE: u64 = 2 * MAX_BODY as u64 + 128;
 const MAX_BODY: usize = 1024 * 1024;
 /// How many command bodies may be arriving at once; more are refused.
 const MAX_BODY_READERS: usize = 16;
@@ -245,7 +246,9 @@ fn serve(statuses: Statuses) -> io::Result<()> {
     }
     let mut backoff = Duration::ZERO;
     loop {
-        let conn = unsafe { libc::accept4(fd.as_raw_fd(), std::ptr::null_mut(), std::ptr::null_mut(), libc::SOCK_CLOEXEC) };
+        let mut peer: libc::sockaddr_vm = unsafe { std::mem::zeroed() };
+        let mut peer_len = std::mem::size_of_val(&peer) as libc::socklen_t;
+        let conn = unsafe { libc::accept4(fd.as_raw_fd(), (&mut peer as *mut libc::sockaddr_vm).cast(), &mut peer_len, libc::SOCK_CLOEXEC) };
         if conn < 0 {
             let e = io::Error::last_os_error();
             // A client gone before accept, or a signal, says nothing about resources.
@@ -259,13 +262,19 @@ fn serve(statuses: Statuses) -> io::Result<()> {
         }
         backoff = Duration::ZERO;
         let stream = unsafe { std::fs::File::from_raw_fd(conn as RawFd) };
+        if !host_peer(&peer, peer_len) {
+            continue;
+        }
         // The host sends its request with the connection; don't let a silent one stall accepting.
         receive_timeout(conn, Duration::from_secs(1));
         let Ok(mut r) = stream.try_clone().map(BufReader::new) else { continue };
-        let mut line = String::new();
-        if !(r.by_ref().take(MAX_LINE).read_line(&mut line).is_ok() && line.ends_with('\n')) {
-            continue;
-        }
+        let line = match request_line(&mut r) {
+            Ok(line) => line,
+            Err(e) => {
+                let _ = write_frame(&mut &stream, FRAME_MSG, format!("error: {e}").as_bytes());
+                continue;
+            }
+        };
         // NET is on the critical path of every start, right after restore, when a new
         // thread (stack, task, a wakeup on another vCPU) costs milliseconds. PING and
         // NET are quick, so answer them here; only commands get a thread.
@@ -582,6 +591,21 @@ fn pump(mut r: impl Read + Send + 'static, out: Arc<Mutex<std::fs::File>>, kind:
     })
 }
 
+fn host_peer(peer: &libc::sockaddr_vm, len: libc::socklen_t) -> bool {
+    len as usize == std::mem::size_of_val(peer)
+        && peer.svm_family == libc::AF_VSOCK as libc::sa_family_t
+        && peer.svm_cid == libc::VMADDR_CID_HOST
+}
+
+fn request_line(r: &mut impl BufRead) -> io::Result<String> {
+    let mut line = String::new();
+    r.take(MAX_LINE).read_line(&mut line)?;
+    if !line.ends_with('\n') {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "request line too long or incomplete"));
+    }
+    Ok(line)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -621,5 +645,36 @@ mod tests {
         assert_eq!(readers.len(), MAX_BODY_READERS);
         drop(readers);
         assert!(BodyReader::admit().is_some());
+    }
+}
+
+#[cfg(test)]
+mod request_tests {
+    use super::*;
+
+    #[test]
+    fn lines_are_bounded_and_large_checks_fit() {
+        let mut input = io::Cursor::new(vec![b'x'; MAX_LINE as usize + 1]);
+        assert!(request_line(&mut input).is_err());
+        assert_eq!(input.position(), MAX_LINE);
+        let line = format!("CHECK 1000 {}\n", "ab".repeat(MAX_BODY));
+        assert_eq!(request_line(&mut io::Cursor::new(line.as_bytes())).unwrap(), line);
+        assert!(request_line(&mut io::Cursor::new(b"PING")).is_err());
+        let mut input = io::Cursor::new(b"PING\nNEXT\n");
+        assert_eq!(request_line(&mut input).unwrap(), "PING\n");
+        assert_eq!(input.position(), 5);
+    }
+
+    #[test]
+    fn only_host_cid_is_allowed() {
+        let mut peer: libc::sockaddr_vm = unsafe { std::mem::zeroed() };
+        peer.svm_family = libc::AF_VSOCK as _;
+        peer.svm_cid = libc::VMADDR_CID_HOST;
+        let len = std::mem::size_of_val(&peer) as _;
+        assert!(host_peer(&peer, len));
+        peer.svm_cid = 3;
+        assert!(!host_peer(&peer, len));
+        peer.svm_cid = libc::VMADDR_CID_HOST;
+        assert!(!host_peer(&peer, 0));
     }
 }

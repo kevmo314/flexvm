@@ -24,9 +24,15 @@ p.add_argument("scenarios", nargs="+")
 args = p.parse_args()
 A, B, BIN = args.a, args.b, args.bin
 failures = 0
+scenario_vms = set()
+scenario_checkpoints = set()
 
 
 def rpc(host, req, timeout=60):
+    if req.get("op") in ("run", "restore") and "name" in req:
+        scenario_vms.add(req["name"])
+    if req.get("op") == "checkpoint":
+        scenario_checkpoints.add(req["dir"])
     h, port = host.rsplit(":", 1)
     with socket.create_connection((h, int(port)), timeout=timeout) as s:
         s.sendall((json.dumps(req) + "\n").encode())
@@ -90,8 +96,8 @@ def disarm():
         try:
             for f in FAULTS:
                 rpc(h, {"op": "fault", "fault": f, "ms": 0})
-        except OSError:
-            pass  # not up (a scenario that restarts it failed)
+        except Exception as e:
+            check(f"disarm on {h}", False, repr(e))
 
 
 def setup(name, host=None, mib=200):
@@ -656,12 +662,13 @@ def guest_hang():
 def ckpt_path(label):
     os.makedirs(args.ckpt_dir, exist_ok=True)
     path = os.path.join(args.ckpt_dir, label)
+    scenario_checkpoints.add(path)
     subprocess.run(["sudo", "rm", "-rf", path])
     return path
 
 
 def rm_ckpt(path):
-    subprocess.run(["sudo", "rm", "-rf", path])
+    subprocess.run(["sudo", "rm", "-rf", path], check=True)
 
 
 def marker(host, name):
@@ -1968,9 +1975,24 @@ safe = [s for s in SCENARIOS
                      "suspend_resume", "hot_budget", "resume_mark_fails")]
 names = [n for s in args.scenarios for n in (safe if s == "all" else [s])]
 for s in names:
+    scenario_vms.clear()
+    scenario_checkpoints.clear()
     try:
         SCENARIOS[s]()
+    except Exception as e:
+        check(f"{s}: scenario raised", False, repr(e))
     finally:
         disarm()
+        for name in list(scenario_vms):
+            for host in (A, B):
+                try:
+                    rpc(host, {"op": "kill", "name": name}, timeout=10)
+                except Exception as e:
+                    check(f"{s}: cleanup {name} on {host}", False, repr(e))
+        for path in list(scenario_checkpoints):
+            try:
+                rm_ckpt(path)
+            except Exception as e:
+                check(f"{s}: cleanup {path}", False, repr(e))
 print("failures:", failures)
 sys.exit(1 if failures else 0)

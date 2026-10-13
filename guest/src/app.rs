@@ -284,9 +284,15 @@ impl CheckGroup {
         }
         let dir = format!("{ROOT}/flexvm-check-{}", NEXT.fetch_add(1, Ordering::Relaxed));
         std::fs::create_dir(&dir).map_err(|e| io::Error::other(format!("create {dir}: {e}")))?;
-        let g = CheckGroup { procs: CString::new(format!("{dir}/cgroup.procs")).unwrap(), dir, done: false };
+        Self::from_dir(dir)
+    }
+
+    fn from_dir(dir: String) -> io::Result<CheckGroup> {
+        let mut g = CheckGroup { procs: CString::new(format!("{dir}/cgroup.procs")).unwrap(), dir, done: false };
         // Needs cgroup.kill (Linux 5.14) to kill every task at once.
         if !std::path::Path::new(&format!("{}/cgroup.kill", g.dir)).exists() {
+            g.done = true;
+            std::fs::remove_dir(&g.dir)?;
             return Err(io::Error::other("the kernel has no cgroup.kill"));
         }
         Ok(g)
@@ -386,11 +392,11 @@ fn start(statuses: &Statuses) -> io::Result<i32> {
     app.state = State::Running(pid);
     app.push(format!("flexvm-init: started {:?} as pid {pid}\n", c.argv).as_bytes());
     drop(app);
-    pump(child.stdout.take().unwrap());
-    pump(child.stderr.take().unwrap());
+    let pumps = [pump(child.stdout.take().unwrap()), pump(child.stderr.take().unwrap())];
     let statuses = statuses.clone();
     thread::spawn(move || {
         let code = wait_pid(&statuses, pid);
+        join_pumps(pumps, Duration::from_secs(2));
         let mut app = APP.lock().unwrap();
         app.state = State::Exited(code);
         app.push(format!("flexvm-init: pid {pid} exited with status {code}\n").as_bytes());
@@ -398,7 +404,7 @@ fn start(statuses: &Statuses) -> io::Result<i32> {
     Ok(pid)
 }
 
-fn pump(mut r: impl Read + Send + 'static) {
+fn pump(mut r: impl Read + Send + 'static) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut buf = [0u8; 16 * 1024];
         while let Ok(n) = r.read(&mut buf) {
@@ -407,7 +413,20 @@ fn pump(mut r: impl Read + Send + 'static) {
             }
             APP.lock().unwrap().push(&buf[..n]);
         }
-    });
+    })
+}
+
+// Descendants may retain a pipe after the app exits; never wait indefinitely.
+fn join_pumps(pumps: [thread::JoinHandle<()>; 2], timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while pumps.iter().any(|p| !p.is_finished()) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    for pump in pumps {
+        if pump.is_finished() {
+            let _ = pump.join();
+        }
+    }
 }
 
 /// Sends the app's output from stream offset `offset` (clamped to what the
@@ -448,5 +467,31 @@ fn logs(out: &Mutex<File>, mut offset: u64, follow: bool) -> io::Result<()> {
         if done && chunk.is_empty() {
             return frame(out, FRAME_MSG, format!("{status} {offset}").as_bytes());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_check_group_is_removed() {
+        let dir = std::env::temp_dir().join(format!("flexvm-check-group-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        assert!(CheckGroup::from_dir(dir.to_str().unwrap().into()).err().unwrap().to_string().contains("cgroup.kill"));
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn pumps_drain_output_and_wait_is_bounded() {
+        let marker = b"app pump regression marker";
+        join_pumps([pump(io::Cursor::new(marker)), pump(io::empty())], Duration::from_secs(1));
+        assert!(APP.lock().unwrap().ring.make_contiguous().windows(marker.len()).any(|w| w == marker));
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let blocked = thread::spawn(move || { let _ = rx.recv(); });
+        let start = Instant::now();
+        join_pumps([blocked, thread::spawn(|| {})], Duration::from_millis(20));
+        assert!(start.elapsed() < Duration::from_secs(1));
+        tx.send(()).unwrap();
     }
 }

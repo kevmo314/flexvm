@@ -227,6 +227,10 @@ pub fn ping(uds: &Path) -> Result<()> {
     })
 }
 
+fn exit_code(data: &[u8]) -> Result<i32> {
+    Ok(i32::from_le_bytes(data.try_into().map_err(|_| "bad exit frame length")?))
+}
+
 /// Runs a shell command in the guest and collects its output.
 pub fn exec(uds: &Path, cmd: &str) -> Result<(i32, Vec<u8>)> {
     let mut r = start_exec(crate::util::connect_unix(uds, TIMEOUT)?, cmd, TIMEOUT)?;
@@ -234,7 +238,7 @@ pub fn exec(uds: &Path, cmd: &str) -> Result<(i32, Vec<u8>)> {
     let mut out = Vec::new();
     while let Some((kind, data)) = read_frame(&mut r)? {
         match kind {
-            FRAME_EXIT => return Ok((i32::from_le_bytes(data[..4].try_into()?), out)),
+            FRAME_EXIT => return Ok((exit_code(&data)?, out)),
             _ => out.extend_from_slice(&data),
         }
     }
@@ -375,6 +379,14 @@ pub fn start_logs(s: UnixStream, offset: u64, follow: bool, timeout: Duration) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exit_frames_require_exactly_four_bytes() {
+        assert_eq!(exit_code(&(-7i32).to_le_bytes()).unwrap(), -7);
+        for len in [0, 1, 3, 5, 12] {
+            assert!(exit_code(&vec![0; len]).is_err());
+        }
+    }
 
     #[test]
     fn session_offsets() {

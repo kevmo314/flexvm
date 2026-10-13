@@ -224,7 +224,7 @@ pub fn run(mut cfg: Config) -> Result<()> {
     let mut run_lock = lock_run_dir(&cfg.run_dir)?;
     // The state dir is this daemon's alone too (another daemon's startup
     // would clear its trees), and must survive a power loss.
-    crate::util::create_dir_durably(&cfg.state_dir.join("suspended"))
+    crate::util::create_private_dir_durably(&cfg.state_dir.join("suspended"))
         .map_err(|e| format!("state dir {}: {e}", cfg.state_dir.display()))?;
     cfg.state_dir = cfg.state_dir.canonicalize()?;
     run_lock.extend(lock_run_dir(&cfg.state_dir)?);
