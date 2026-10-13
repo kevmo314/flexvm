@@ -85,6 +85,31 @@ pub const MAX_CHAIN: usize = 64;
 const UNIT: usize = 256;
 /// Most writer threads; a few saturate the disk.
 const MAX_WRITERS: usize = 12;
+const MAX_VMSTATE_BYTES: u64 = 64 * 1024 * 1024;
+/// Serialized metadata across the entire chain, excluding lazily read pages.
+const MAX_CHAIN_METADATA_BYTES: u64 = 256 * 1024 * 1024;
+
+#[derive(Default)]
+struct ReadBudget(u64);
+
+impl ReadBudget {
+    fn charge(&mut self, bytes: u64) -> Result<()> {
+        self.0 = self.0.checked_add(bytes).filter(|&n| n <= MAX_CHAIN_METADATA_BYTES)
+            .ok_or("checkpoint chain exceeds the 256 MiB metadata budget")?;
+        Ok(())
+    }
+}
+
+/// A page can contribute at most one run (32 bytes) and one checksum (4).
+fn pagemap_bound(guest_pages: u64, max_mib: u64) -> Result<u64> {
+    let max_bytes = max_mib.checked_mul(1 << 20).ok_or("template maximum memory size overflows")?;
+    let max_pages = max_bytes / PAGE_SIZE as u64;
+    if guest_pages == 0 || guest_pages > max_pages {
+        bail!("guest memory size {guest_pages} pages exceeds template maximum {max_mib} MiB or is empty");
+    }
+    guest_pages.checked_mul(36).and_then(|n| n.checked_add(24))
+        .ok_or_else(|| "pagemap size bound overflows".into())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileSum {
@@ -332,7 +357,11 @@ impl Staging {
         let pagemap = self.create("pagemap")?;
         (&pagemap).write_all(map)?;
         pagemap.sync_all()?;
-        let vmstate = std::fs::read(&self.vmstate)?;
+        let mut vmstate = Vec::new();
+        File::open(&self.vmstate)?.take(MAX_VMSTATE_BYTES + 1).read_to_end(&mut vmstate)?;
+        if vmstate.len() as u64 > MAX_VMSTATE_BYTES {
+            return Err(CommitError::Failed("vmstate exceeds the 64 MiB size limit".into()));
+        }
         let vmstate_file = self.create("vmstate")?;
         (&vmstate_file).write_all(&vmstate)?;
         vmstate_file.sync_all()?;
@@ -605,13 +634,19 @@ struct Buf(*mut u8, usize);
 
 impl Buf {
     fn new(len: usize) -> io::Result<Buf> {
+        unsafe { Self::allocate(len, |layout| std::alloc::alloc_zeroed(layout)) }
+    }
+
+    /// `alloc` must return null or a zeroed allocation for the supplied layout,
+    /// owned by the caller and releasable with `std::alloc::dealloc`.
+    unsafe fn allocate(len: usize, alloc: impl FnOnce(std::alloc::Layout) -> *mut u8) -> io::Result<Buf> {
         let layout = std::alloc::Layout::from_size_align(len, PAGE_SIZE)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         if len == 0 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty checkpoint buffer"));
         }
         // Zeroing makes creating a u8 slice valid even before GuestPages::read.
-        let p = unsafe { std::alloc::alloc_zeroed(layout) };
+        let p = alloc(layout);
         if p.is_null() {
             return Err(io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate checkpoint buffer"));
         }
@@ -634,6 +669,13 @@ impl Drop for Buf {
 /// `threads` threads, and builds the page map. With `explicit` (a delta),
 /// pages listed that are the template's get TEMPLATE runs instead of no run.
 fn write_pages(template: &Template, src: &dyn GuestPages, runs: &Runs, out: &PagesFile, threads: usize, explicit: bool) -> Result<Written> {
+    write_pages_with_buffer(template, src, runs, out, threads, explicit, || Buf::new(UNIT * PAGE_SIZE))
+}
+
+fn write_pages_with_buffer(
+    template: &Template, src: &dyn GuestPages, runs: &Runs, out: &PagesFile, threads: usize, explicit: bool,
+    buffer: impl Fn() -> io::Result<Buf> + Sync,
+) -> Result<Written> {
     // Units of REMOTE pages, never across a memory region.
     let mut units: Vec<(usize, usize)> = Vec::new();
     for &(first, count, _) in runs.iter().filter(|r| r.2 == REMOTE) {
@@ -668,7 +710,7 @@ fn write_pages(template: &Template, src: &dyn GuestPages, runs: &Runs, out: &Pag
         }
     };
     let work = || -> Result<()> {
-        let mut buf = Buf::new(UNIT * PAGE_SIZE)?;
+        let mut buf = buffer()?;
         let mut iov: Vec<libc::iovec> = Vec::with_capacity(UNIT);
         loop {
             if failed.load(Ordering::Relaxed) {
@@ -789,7 +831,7 @@ pub struct Checkpoint {
     pub id: String,
     /// The verified VM state. Load these bytes (from a file only root
     /// controls), not the checkpoint's file, which may have changed since.
-    pub vmstate: Vec<u8>,
+    pub vmstate: VmState,
     /// Initial page states for the pager: DATA pages are REMOTE, read from `file`.
     pub runs: Runs,
     pub file: Arc<PageFile>,
@@ -797,6 +839,34 @@ pub struct Checkpoint {
     pub chain: Vec<PathBuf>,
     /// The ids of `chain`, in the same order.
     pub chain_ids: Vec<String>,
+}
+
+/// Verified state bytes plus the memory geometry that must be checked against
+/// the actual template before allocating or loading a VM.
+pub struct VmState {
+    bytes: Vec<u8>,
+    guest_pages: u64,
+    mem_mib: u64,
+    max_mib: u64,
+}
+
+impl VmState {
+    fn new(bytes: Vec<u8>, manifest: &Manifest) -> Self {
+        Self { bytes, guest_pages: manifest.guest_pages, mem_mib: manifest.mem_mib, max_mib: manifest.max_mib }
+    }
+
+    pub(crate) fn validate_template(&self, template: &Template) -> Result<()> {
+        pagemap_bound(self.guest_pages, template.meta.max_mib)?;
+        if self.mem_mib != template.meta.mem_mib || self.max_mib != template.meta.max_mib {
+            bail!("checkpoint memory configuration does not match template {} ({} MiB boot, {} MiB maximum)",
+                template.name, template.meta.mem_mib, template.meta.max_mib);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 
 /// Opens regular file `name` in `dir` (never through a symlink) and reads up
@@ -824,11 +894,12 @@ struct Link {
 }
 
 impl Link {
-    fn open(dir: &Path) -> Result<Link> {
+    fn open(dir: &Path, budget: &mut ReadBudget) -> Result<Link> {
         let dir = dir.canonicalize().map_err(|e| format!("checkpoint {}: {e}", dir.display()))?;
         let bad = |why: String| format!("checkpoint {} is invalid: {why}", dir.display());
         let dfd = open_dir_at(libc::AT_FDCWD, &CString::new(dir.as_os_str().as_bytes())?).map_err(|e| bad(e.to_string()))?;
         let (_, text) = read_at(dfd.as_raw_fd(), "manifest.json", 1 << 20).map_err(|e| bad(format!("manifest.json: {e}")))?;
+        budget.charge(text.len() as u64).map_err(|e| bad(e.to_string()))?;
         let split = text.iter().position(|&b| b == b'\n').ok_or_else(|| bad("manifest has no checksum".into()))?;
         let (want, body) = (&text[..split], &text[split + 1..]);
         if want != sum(body).as_bytes() {
@@ -839,9 +910,28 @@ impl Link {
             (FORMAT, None) | (FORMAT_INCREMENTAL, Some(_)) => {}
             (f, _) => bail!("{}", bad(format!("format {f}; this flexvm reads formats {FORMAT} and {FORMAT_INCREMENTAL}"))),
         }
+        let map_bound = pagemap_bound(manifest.guest_pages, manifest.max_mib).map_err(|e| bad(e.to_string()))?;
+        if manifest.mem_mib > manifest.max_mib || manifest.hotplug_mib > manifest.max_mib - manifest.mem_mib {
+            bail!("{}", bad("guest memory configuration exceeds template maximum".into()));
+        }
+        // Check every declared length and charge the chain before reading either
+        // file. No unchecked manifest length controls a payload read.
+        for (name, limit) in [("vmstate", MAX_VMSTATE_BYTES), ("pagemap", map_bound)] {
+            let want = manifest.files.get(name).ok_or_else(|| bad(format!("manifest lists no {name}")))?;
+            if want.len > limit {
+                bail!("{}", bad(format!("{name} length {} exceeds limit {limit} bytes", want.len)));
+            }
+            budget.charge(want.len).map_err(|e| bad(e.to_string()))?;
+        }
         let read_checked = |name: &str| -> Result<Vec<u8>> {
             let want = manifest.files.get(name).ok_or_else(|| bad(format!("manifest lists no {name}")))?;
-            let (_, bytes) = read_at(dfd.as_raw_fd(), name, want.len + 1).map_err(|e| bad(format!("{name}: {e}")))?;
+            let file = open_at(dfd.as_raw_fd(), name).map_err(|e| bad(format!("{name}: {e}")))?;
+            let st = fstat(file.as_raw_fd())?;
+            if st.st_mode & libc::S_IFMT != libc::S_IFREG || st.st_size < 0 || st.st_size as u64 != want.len {
+                bail!("{}", bad(format!("{name} is not a regular file of the declared length")));
+            }
+            let mut bytes = Vec::new();
+            Read::take(file, want.len + 1).read_to_end(&mut bytes).map_err(|e| bad(format!("{name}: {e}")))?;
             if bytes.len() as u64 != want.len || sum(&bytes) != want.hash {
                 bail!("{}", bad(format!("{name} does not match its checksum")));
             }
@@ -907,7 +997,11 @@ impl Checkpoint {
     /// delta against, and verifies everything but the page data itself,
     /// which is checked page by page as it is read.
     pub fn open(dir: &Path) -> Result<Checkpoint> {
-        let top = Link::open(dir)?;
+        Self::open_with_budget(dir, &mut ReadBudget::default())
+    }
+
+    fn open_with_budget(dir: &Path, budget: &mut ReadBudget) -> Result<Checkpoint> {
+        let top = Link::open(dir, budget)?;
         let mut links = vec![top];
         while let Some(parent) = links.last().unwrap().manifest.parent.clone() {
             let child = links.last().unwrap();
@@ -915,12 +1009,12 @@ impl Checkpoint {
                 bail!("checkpoint {} is more than {MAX_CHAIN} deltas deep", dir.display());
             }
             let path = child.dir.join(&parent.path);
-            let link = Link::open(&path).map_err(|e| format!("parent of {}: {e}", child.dir.display()))?;
+            let link = Link::open(&path, budget).map_err(|e| format!("parent of {}: {e}", child.dir.display()))?;
             let (c, p) = (&child.manifest, &link.manifest);
             if link.id != parent.id {
                 bail!("checkpoint {}: its parent {} has changed (id {} is not {})", child.dir.display(), link.dir.display(), link.id, parent.id);
             }
-            if c.template_id != p.template_id || c.guest_pages != p.guest_pages {
+            if c.template_id != p.template_id || c.guest_pages != p.guest_pages || c.max_mib != p.max_mib || c.mem_mib != p.mem_mib {
                 bail!("checkpoint {}: its parent {} is of another template or size", child.dir.display(), link.dir.display());
             }
             links.push(link);
@@ -942,6 +1036,7 @@ impl Checkpoint {
             }
         }
         let (dir, manifest, id, vmstate) = top.unwrap();
+        let vmstate = VmState::new(vmstate, &manifest);
         let (runs, file) = flatten(&layers, files, sums);
         Ok(Checkpoint { dir, manifest, id, vmstate, runs, file: Arc::new(file), chain, chain_ids })
     }
@@ -970,6 +1065,7 @@ impl Checkpoint {
     /// The canonical hash of the memory this checkpoint restores (a test
     /// hook; see `Canon`).
     pub fn content_hash(&self, template: &Template) -> Result<String> {
+        self.vmstate.validate_template(template)?;
         let mut canon = Canon::new(template);
         let mut buf = vec![0u8; 256 * PAGE_SIZE];
         for &(first, count, state) in &self.runs {
@@ -1096,7 +1192,10 @@ fn parse_pagemap(map: &[u8], guest_pages: u64, delta: bool) -> Result<(MapRuns, 
         bail!("bad pagemap header");
     }
     let (nruns, ndata) = (word(1)?, word(2)?);
-    if Some(map.len() as u64) != nruns.checked_mul(32).zip(ndata.checked_mul(4)).and_then(|(r, d)| (24 + r).checked_add(d)) {
+    if nruns > guest_pages || ndata > guest_pages {
+        bail!("pagemap run or data count exceeds guest memory size");
+    }
+    if Some(map.len() as u64) != nruns.checked_mul(32).zip(ndata.checked_mul(4)).and_then(|(r, d)| r.checked_add(24)?.checked_add(d)) {
         bail!("bad pagemap length");
     }
     let nruns = nruns as usize;
@@ -1116,7 +1215,7 @@ fn parse_pagemap(map: &[u8], guest_pages: u64, delta: bool) -> Result<(MapRuns, 
     // The DATA runs must tile the page file exactly.
     let mut tiles: Vec<(u64, u64)> = runs.iter().filter(|r| r.2 == DATA).map(|r| (r.3, r.1)).collect();
     tiles.sort_unstable();
-    let end = tiles.iter().try_fold(0u64, |pos, &(at, n)| (at == pos).then_some(pos + n));
+    let end = tiles.iter().try_fold(0u64, |pos, &(at, n)| (at == pos).then(|| pos.checked_add(n)).flatten());
     if end != Some(ndata) {
         bail!("data runs do not cover the {ndata} stored pages exactly once");
     }
@@ -1194,17 +1293,152 @@ mod tests {
         let mut buf = Buf::new(PAGE_SIZE).unwrap();
         assert_eq!(buf.0 as usize % PAGE_SIZE, 0);
         assert!(buf.get(PAGE_SIZE).iter().all(|&b| b == 0));
-        // A valid layout larger than the address space Linux can map must fail
-        // allocation without aborting (even with virtual-memory overcommit).
-        let len = isize::MAX as usize & !(PAGE_SIZE - 1);
-        assert_eq!(Buf::new(len).err().unwrap().kind(), io::ErrorKind::OutOfMemory);
+        let failed = unsafe { Buf::allocate(PAGE_SIZE, |_| std::ptr::null_mut()) };
+        assert_eq!(failed.err().unwrap().kind(), io::ErrorKind::OutOfMemory);
+        assert_eq!(Buf::new(0).err().unwrap().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(Buf::new(usize::MAX).err().unwrap().kind(), io::ErrorKind::InvalidInput);
+    }
+
+    fn empty_manifest() -> Manifest {
+        let mut map = MAGIC.to_vec();
+        map.extend_from_slice(&[0; 16]);
+        serde_json::from_value(serde_json::json!({
+            "format": FORMAT, "created_unix_ms": 0, "name": "x", "ip": "10.0.0.1",
+            "template": "tpl", "template_id": "id", "vcpus": 1,
+            "mem_mib": 1, "max_mib": 1, "hotplug_mib": 0, "guest_pages": 256,
+            "data_pages": 0, "zero_pages": 0,
+            "files": {
+                "vmstate": {"len": 1, "hash": sum(b"s")},
+                "pagemap": {"len": map.len(), "hash": sum(&map)},
+                "pages": {"len": 0, "hash": sums_sum(&[])}
+            }
+        })).unwrap()
+    }
+
+    fn write_manifest(dir: &Path, manifest: &Manifest) -> String {
+        let body = serde_json::to_vec(manifest).unwrap();
+        let id = sum(&body);
+        let mut text = format!("{id}\n").into_bytes();
+        text.extend_from_slice(&body);
+        std::fs::write(dir.join("manifest.json"), text).unwrap();
+        id
+    }
+
+    #[test]
+    fn manifest_lengths_are_rejected_before_opening_payloads() {
+        let dir = std::env::temp_dir().join(format!("flexvm-lengths-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let original = empty_manifest();
+        for (name, len, expected) in [
+            ("vmstate", MAX_VMSTATE_BYTES + 1, "vmstate length"),
+            ("vmstate", u64::MAX, "vmstate length"),
+            ("pagemap", 24 + 256 * 36 + 1, "pagemap length"),
+            ("pagemap", u64::MAX, "pagemap length"),
+        ] {
+            let mut m = original.clone();
+            m.files.get_mut(name).unwrap().len = len;
+            write_manifest(&dir, &m);
+            let error = Link::open(&dir, &mut ReadBudget::default()).err().unwrap().to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+        for (pages, max_mib, expected) in [(257, 1, "guest memory size"), (0, 1, "guest memory size"), (1, u64::MAX, "overflows")] {
+            let mut m = original.clone();
+            m.guest_pages = pages;
+            m.max_mib = max_mib;
+            write_manifest(&dir, &m);
+            let error = Link::open(&dir, &mut ReadBudget::default()).err().unwrap().to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+        assert_eq!(pagemap_bound(256, 1).unwrap(), 24 + 256 * 36);
+        assert!(pagemap_bound(u64::MAX / 256 * 256, u64::MAX / 256).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn chain_budget_is_cumulative_and_checked_before_payload_reads() {
+        let dir = std::env::temp_dir().join(format!("flexvm-budget-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut map = MAGIC.to_vec();
+        map.extend_from_slice(&[0; 16]);
+        let mut parent = None;
+        let mut total_cost = 0;
+        for i in 0..3 {
+            let link = dir.join(format!("ck{i}"));
+            std::fs::create_dir(&link).unwrap();
+            let mut m = empty_manifest();
+            m.parent = parent;
+            if m.parent.is_some() {
+                m.format = FORMAT_INCREMENTAL;
+            }
+            let id = write_manifest(&link, &m);
+            parent = Some(Parent { path: format!("../ck{i}"), id });
+            std::fs::write(link.join("vmstate"), b"s").unwrap();
+            std::fs::write(link.join("pagemap"), &map).unwrap();
+            std::fs::write(link.join("pages"), []).unwrap();
+            total_cost += std::fs::metadata(link.join("manifest.json")).unwrap().len() + 1 + map.len() as u64;
+        }
+        let top = dir.join("ck2");
+        assert_eq!(Checkpoint::open(&top).unwrap().chain.len(), 2);
+        let mut budget = ReadBudget(MAX_CHAIN_METADATA_BYTES - total_cost);
+        Checkpoint::open_with_budget(&top, &mut budget).unwrap();
+        assert_eq!(budget.0, MAX_CHAIN_METADATA_BYTES);
+        // One byte short rejects the base before touching its payloads.
+        std::fs::remove_file(dir.join("ck0/vmstate")).unwrap();
+        let mut budget = ReadBudget(MAX_CHAIN_METADATA_BYTES - total_cost + 1);
+        let error = Checkpoint::open_with_budget(&top, &mut budget).err().unwrap().to_string();
+        assert!(error.contains("chain exceeds"), "{error}");
+        assert!(ReadBudget(1).charge(u64::MAX).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_buffer_allocation_cleans_up_staging() {
+        let dir = std::env::temp_dir().join(format!("flexvm-oom-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tpl = template(&dir, &[None]);
+        let dest = dir.join("ck");
+        let vmstate = dir.join("private.vmstate");
+        let mut staging = Staging::new(&dest, vmstate.clone()).unwrap();
+        std::fs::write(&vmstate, b"s").unwrap();
+        staging.preallocate(1).unwrap();
+        let result = write_pages_with_buffer(
+            &tpl, &Guest { pages: vec![page(1)], region: 1, fail: None }, &vec![(0, 1, REMOTE)],
+            staging.pages.as_ref().unwrap(), 4, false,
+            || unsafe { Buf::allocate(UNIT * PAGE_SIZE, |_| std::ptr::null_mut()) },
+        );
+        assert!(result.err().unwrap().to_string().contains("cannot allocate checkpoint buffer"));
+        drop(staging);
+        assert!(!dest.exists() && !vmstate.exists());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "only the template remains");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn guest_memory_is_checked_against_the_actual_template() {
+        let dir = std::env::temp_dir().join(format!("flexvm-template-bound-{}", std::process::id()));
+        let tpl = template(&dir, &[None; 256]);
+        let mut m = empty_manifest();
+        VmState::new(Vec::new(), &m).validate_template(&tpl).unwrap();
+        // A forged maximum in the manifest cannot enlarge the actual template.
+        m.max_mib = 2;
+        m.guest_pages = 257;
+        let error = VmState::new(Vec::new(), &m).validate_template(&tpl).unwrap_err().to_string();
+        assert!(error.contains("guest memory size"), "{error}");
+        m.guest_pages = 256;
+        let error = VmState::new(Vec::new(), &m).validate_template(&tpl).unwrap_err().to_string();
+        assert!(error.contains("does not match template"), "{error}");
+        m.max_mib = 1;
+        m.mem_mib = 0;
+        assert!(VmState::new(Vec::new(), &m).validate_template(&tpl).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
     /// A template whose memory file has `pages` pages; `Some(b)` is a page
     /// filled with `b`, `None` a hole.
     fn template(dir: &Path, pages: &[Option<u8>]) -> Arc<Template> {
         let tdir = dir.join("tpl");
         std::fs::create_dir_all(&tdir).unwrap();
-        let meta = r#"{"vcpus": 1, "mem_mib": 1, "max_mib": 1, "kernel": "/k", "rootfs": "/r"}"#;
+        let max_mib = pages.len().div_ceil((1 << 20) / PAGE_SIZE).max(1);
+        let meta = format!(r#"{{"vcpus": 1, "mem_mib": 1, "max_mib": {max_mib}, "kernel": "/k", "rootfs": "/r"}}"#);
         std::fs::write(tdir.join("meta.json"), meta).unwrap();
         let mem = File::create(tdir.join("mem")).unwrap();
         mem.set_len((pages.len() * PAGE_SIZE) as u64).unwrap();
@@ -1444,8 +1678,9 @@ mod tests {
         }
         let ck = Checkpoint { dir: dir.clone(), manifest: serde_json::from_value(serde_json::json!({
             "format": 2, "created_unix_ms": 0, "name": "x", "ip": "10.0.0.1", "template": "tpl", "template_id": "", "vcpus": 1,
-            "mem_mib": 1, "max_mib": 1, "hotplug_mib": 0, "guest_pages": n, "data_pages": 0, "zero_pages": 0, "files": {}})).unwrap(),
-            id: String::new(), vmstate: Vec::new(), runs, file: Arc::new(file), chain: Vec::new(), chain_ids: Vec::new() };
+            "mem_mib": 1, "max_mib": 2, "hotplug_mib": 0, "guest_pages": n, "data_pages": 0, "zero_pages": 0, "files": {}})).unwrap(),
+            id: String::new(), vmstate: VmState { bytes: Vec::new(), guest_pages: n as u64, mem_mib: 1, max_mib: 2 },
+            runs, file: Arc::new(file), chain: Vec::new(), chain_ids: Vec::new() };
         assert_eq!(ck.content_hash(&tpl).unwrap(), want.finish());
         let _ = std::fs::remove_dir_all(&dir);
     }

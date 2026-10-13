@@ -166,13 +166,13 @@ static void *run(void *arg) {
 	for (uint64_t p = 0; p < w->n; p++) write_page(w, p, 0, 0);
 	uint64_t last = now_ns();
 	for (;;) {
-		uint64_t g = atomic_load(&want_gen);
-		if (g != atomic_load(&w->done_gen)) {
+		uint64_t g = atomic_load_explicit(&want_gen, memory_order_acquire);
+		if (g != atomic_load_explicit(&w->done_gen, memory_order_relaxed)) {
 			full_check(w);
 			// Publish immutable stats; main requests the next generation only
 			// after finishing all reads of this snapshot.
 			w->snapshot = w->stats;
-			atomic_store(&w->done_gen, g);
+			atomic_store_explicit(&w->done_gen, g, memory_order_release);
 			last = now_ns();
 		}
 		if (atomic_exchange(&w->reset, 0)) {
@@ -240,9 +240,10 @@ int main(int argc, char **argv) {
 			for (int i = 0; i < nthreads; i++) atomic_store(&workers[i].reset, 1);
 			continue;
 		}
-		uint64_t g = atomic_fetch_add(&want_gen, 1) + 1;
+		// Release the previous snapshot reads before workers may replace them.
+		uint64_t g = atomic_fetch_add_explicit(&want_gen, 1, memory_order_release) + 1;
 		for (int i = 0; i < nthreads; i++)
-			while (atomic_load(&workers[i].done_gen) != g) usleep(1000);
+			while (atomic_load_explicit(&workers[i].done_gen, memory_order_acquire) != g) usleep(1000);
 		FILE *f = fopen(tmp, "w");
 		if (!f) continue;
 		fprintf(f, "gen %llu threads %d pages %llu\n", (unsigned long long)g, nthreads, (unsigned long long)n);
