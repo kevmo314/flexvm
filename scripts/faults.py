@@ -789,7 +789,7 @@ def held_restore_frozen():
         conn = subprocess.Popen(["sudo", "python3", "-c",
                                  "import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); "
                                  "s.sendall(b'CONNECT 52\\nPING\\n'); s.settimeout(30); d=b''\nwhile b'pong' not in d:\n c=s.recv(200)\n if not c: break\n d+=c\nprint(d)",
-                                 vsock_path(B, n)], stdout=subprocess.PIPE, text=True)
+                                 vsock_path(B, n)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
         udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         for _ in range(30):
             udp.sendto(b"x" * 64, (ip, 9))
