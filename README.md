@@ -14,7 +14,7 @@ in tens of milliseconds.
 | Memory return | virtio-balloon **free page reporting**: pages the guest frees go back to the host within seconds. |
 | Root filesystem | One read-only ext4 image on virtio-pmem with DAX, shared by every VM through the host page cache. Writes go to a tmpfs overlay inside the guest, so they migrate with memory. |
 | Start | Every VM is a **UFFD restore of a template snapshot** into a pre-spawned, pre-cgrouped Firecracker. The template's recorded working set is copied in bulk; everything else is faulted in lazily from a shared, sparse template image. A **hot pool** keeps VMs already restored and paused, so `run` is usually just a resume. |
-| Migration | **Post-copy**: pause, save vCPU and device state only (~20–200 KiB), resume on the target, then the target's pager fetches pages from the paused source on fault and in the background. The source releases the VM once every page has arrived, and never resumes it once the target may own it. |
+| Migration | **Post-copy**: the target gets everything ready first (template, address, a Firecracker with the template's VM structure already built); then pause, save vCPU and device state only (~20–200 KiB), load it and resume on the target, then the target's pager fetches pages from the paused source on fault and in the background. The source releases the VM once every page has arrived, and never resumes it once the target may own it. |
 | Pressure | If a VM needs to grow and the host would drop below `--reserve`, or the host is already below it, the daemon migrates that VM to the peer with the most spare memory. |
 | Network | Each VM has its own IPv4 /32 routed to a per-VM tap. The address moves with the VM, so open TCP connections survive migration. See below. |
 | Container images | `flexvm template NAME --image REF` builds the root filesystem from an OCI/Docker image; flexvm-init runs and supervises its entrypoint. See below. |
@@ -44,6 +44,35 @@ Pausing Firecracker stops only the vCPUs, so before the state-only snapshot the
 source also brings the VM's tap down (no RX into guest memory), closes host
 exec sessions (vsock) and parks the balloon statistics timer; the target and an
 aborted source put the timer back.
+
+### Migration steps
+
+Only what needs the VM's state happens while it is paused:
+
+1. Before the pause, over one connection (`migrate_in`): the target checks the
+   template, reserves the name and address, takes a pooled Firecracker and
+   starts its pager. With `firecracker/0002-*.patch` it also has Firecracker
+   prepare the load from the template's snapshot: KVM VM, vCPUs, memory slots,
+   guest memory handed to the pager (which then waits for the page states),
+   the vsock socket and the pmem mapping. A target that cannot take the VM
+   refuses here, before anything happened to it.
+2. The source parks the balloon timer, then pauses (taking the tap down
+   alongside), saves the state, exports its page states and reads the pages
+   of the template's *load set* that it holds: pages Firecracker touches
+   while loading and resuming a VM of that template (vCPU clock pages,
+   virtqueues), learned from the hot pool's loads (which hold their prefetch
+   back until then). Header, vmstate and those pages go out on the open
+   connection.
+3. The target seeds its pager, loads the state (vCPU, VM and device state
+   only, when prepared) and resumes, installing the preloaded pages while
+   Firecracker parses the state. It checks the source's page server answers
+   while loading, so a VM whose memory cannot come is never committed.
+
+Downtime p50 on an idle host (`flexvm bench`, 2 runs of 12–15 trials each,
+interleaved): 2 vCPU 36 ms before, 27 ms with steps 1–3 on stock Firecracker,
+11 ms with the patch (pause 2 ms, snapshot 1.6 ms, transfer 0.1 ms, target
+load 5 ms); 24 vCPU 48, 42 and 28 ms (its load is still 17 ms: vCPU threads,
+state parsing, resume).
 
 ### Lifecycle: pause, checkpoint, restore, suspend
 
@@ -492,6 +521,18 @@ back to loading the snapshot then and there.
 writes all guest memory, which would make migration downtime proportional to
 RAM and double memory use on a host that is already short.
 
+`firecracker/0002-prepare-snapshot-load.patch`: `PUT /snapshot/prepare`, with
+the body of a load, does the part of a snapshot load that does not depend on
+the VM being loaded, from the given snapshot (the template's): it creates the
+KVM VM, its vCPUs and memory slots, hands guest memory to the UFFD handler,
+binds the vsock socket and maps the pmem file into KVM. The next
+`PUT /snapshot/load` of a compatible snapshot (same vCPUs, machine
+configuration and memory layout; hot-plugged slots are replugged to match)
+then only restores vCPU, VM and device state. Under nested virtualization
+those prepared steps are most of a load (creating a KVM memory slot alone
+takes 3–10 ms on a busy host). Without the patch, Firecracker rejects the
+path and flexvm loads the whole snapshot during the pause.
+
 `firecracker/0003-hold-free-page-reporting.patch`: `PATCH
 /balloon/reporting/hold` and `PATCH /balloon/reporting/release`. While held,
 the balloon leaves free page reports in their virtqueue (it consumes the
@@ -508,7 +549,7 @@ every queue.
 | `run` → guest agent answering with its address set, hot pool | **4–7 ms** p50, 6–14 ms p90 (resume ~2 ms, `START` ~3 ms; host load ~20) |
 | same, hot pool empty (snapshot load) | 45–54 ms p50 under the same load (36–56 ms on a quieter host) |
 | of which Firecracker snapshot load | 22–50 ms (mostly KVM memslot setup, which is slow under nested virt) |
-| Migration downtime | **36–62 ms** (2 vCPU), **56–63 ms** (24 vCPU, 500 MB live data) |
+| Migration downtime, idle VM, idle host | **11 ms** p50, 16 ms p90 (2 vCPU); 28 / 31 ms (24 vCPU) |
 | TCP ping-pong through two migrations (`scripts/nettest.sh`, host load ~20 on 24 threads) | worst stall **69–158 ms**, at most 1.6x that round's downtime (12 rounds); before packets were held: 206–220 ms, one retransmit timeout every round |
 | UDP stream through the same, 5,000 datagrams/s | **0 lost**, 0–17 reordered per round (12 rounds); before: 184–770 lost per round. At 20,000/s: 0 lost, 0–14 reordered |
 | nginx image, `run` → first HTTP response from the host | **205 ms** p50 (run 56 + nginx startup 144); `--warm`: **55 ms** p50 (run 31 + first request 22) |

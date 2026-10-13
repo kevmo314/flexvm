@@ -3,7 +3,9 @@
 //!
 //! Every connection starts with one JSON request line. Most ops answer with
 //! one JSON line; `exec` then streams guest frames, `pages` switches to the
-//! binary page protocol and `incoming` is followed by the raw vmstate bytes.
+//! binary page protocol, `migrate_in` answers twice (prepared, then loaded)
+//! around a header line, the vmstate and preloaded pages, and `incoming` (from
+//! older sources) is followed by the raw vmstate bytes.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, Read, Write};
