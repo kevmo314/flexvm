@@ -722,10 +722,12 @@ the guest can leave any cgroup); without cgroup2 their session is killed.
   one image share one copy in the page cache (it is never rewritten; deleting it
   breaks those templates). Builds of the same cache key are serialized with
   a lock; entries are published with fsync and no-replace rename, with their
-  `.ok` marker last. Templates only ever get marked entries, so a build that
-  finds an unmarked one (an interrupted build) removes it and rebuilds; a
-  marked entry with missing files is refused. The template's content ID covers that file as its
-  `rootfs` component plus the image's manifest and config digests and the
+  `.ok` marker last. Every reuse also fsyncs the cache directory under the
+  lock; a failed fsync refuses the entry. Templates only ever get durably
+  marked entries, so a build that finds an unmarked one (an interrupted
+  build) removes it and rebuilds; a marked entry with missing files is
+  refused. The template's content ID covers that file as its `rootfs`
+  component plus the image's manifest and config digests and the
   app config, so it differs whenever the image does.
 - **Process.** flexvm-init stays PID 1. It starts the entrypoint in its own
   session with the image's env, workdir and credentials, reaps it and records
