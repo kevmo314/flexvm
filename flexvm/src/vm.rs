@@ -43,8 +43,8 @@ impl Load {
 pub enum Snapshot<'a> {
     /// A file that stays put, such as a template's.
     Path(&'a Path),
-    /// Verified checkpoint bytes and memory geometry, checked before loading.
-    Bytes(&'a crate::checkpoint::VmState),
+    /// Bytes to write next to the Firecracker that loads them.
+    Bytes(&'a [u8]),
 }
 
 /// Firecracker's error for a snapshot saved without KVM's realtime clock,
@@ -226,9 +226,6 @@ impl Vm {
         load: Load,
         phases: &mut Phases,
     ) -> Result<(Arc<Vm>, Duration)> {
-        if let Snapshot::Bytes(state) = vmstate {
-            state.validate_template(&template)?;
-        }
         let mut clock_realtime = true;
         let mut retried = false;
         let (vm, took) = loop {
@@ -239,7 +236,7 @@ impl Vm {
                 Snapshot::Path(p) => p.to_path_buf(),
                 Snapshot::Bytes(b) => {
                     let p = prepared.dir().join("vmstate.in");
-                    std::fs::write(&p, b.bytes())?;
+                    std::fs::write(&p, b)?;
                     phases.mark("write_state");
                     p
                 }

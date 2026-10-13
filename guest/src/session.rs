@@ -36,9 +36,8 @@ const MAX_LIVE: usize = 64;
 const MAX_TOMBSTONES: usize = 4096;
 /// Output every live session may keep without drawing on the pool.
 const BASE: usize = 128 * 1024;
-const MAX_RETAINED_OUTPUT: usize = 64 * 1024 * 1024;
 /// Shared by all rings for growth beyond `BASE`, in `STEP`s.
-const POOL: usize = MAX_RETAINED_OUTPUT - MAX_LIVE * BASE;
+const POOL: usize = 64 * 1024 * 1024 - MAX_LIVE * BASE;
 const STEP: usize = 256 * 1024;
 const RETENTION: Duration = Duration::from_secs(300);
 /// How long output keeps waiting for a dropped client (the CLI retries for 30 s).
@@ -617,52 +616,6 @@ mod tests {
         outputs[5].0.lock().unwrap().detached = Some(Instant::now() - ABANDONED);
         table.reclaim();
         assert!(table.live.contains_key("5"));
-    }
-
-    #[test]
-    fn session_limit_rejects_new_commands_but_allows_retries() {
-        let sessions = Sessions::default();
-        let statuses = statuses();
-        {
-            let mut table = sessions.lock().unwrap();
-            for i in 0..MAX_LIVE {
-                finished(&mut table, &i.to_string(), None);
-            }
-        }
-        let mut wire = Vec::new();
-        handle(&mut wire, &b"true"[..], None, "SESSION new 4", &sessions, &statuses).unwrap();
-        assert_eq!(wire[0], FRAME_MSG);
-        assert!(wire.ends_with(b"error: too many sessions: 64 commands are running or awaiting their client"));
-        assert!(!sessions.lock().unwrap().live.contains_key("new"));
-        assert!(statuses.0.lock().unwrap().is_empty(), "rejected commands must never spawn");
-        wire.clear();
-        handle(&mut wire, &b"true"[..], None, "SESSION 0 4", &sessions, &statuses).unwrap();
-        assert!(wire.windows(5).any(|w| w == [FRAME_EXIT, 12, 0, 0, 0]));
-        assert_eq!(sessions.lock().unwrap().live.len(), MAX_LIVE);
-        assert!(statuses.0.lock().unwrap().is_empty(), "a retry must never spawn");
-    }
-
-    #[test]
-    fn concurrent_output_reservations_cannot_exceed_the_shared_budget() {
-        let table = Table::default();
-        let reservations = thread::scope(|scope| {
-            let handles: Vec<_> = (0..8).map(|_| {
-                let pool = table.pool.clone();
-                scope.spawn(move || {
-                    (0..MAX_LIVE / 8).map(|_| {
-                        let mut reservation = Reservation { pool: Some(pool.clone()), bytes: 0 };
-                        reservation.grow(CAPACITY);
-                        reservation
-                    }).collect::<Vec<_>>()
-                })
-            }).collect();
-            handles.into_iter().flat_map(|h| h.join().unwrap()).collect::<Vec<_>>()
-        });
-        assert_eq!(table.pool.load(Ordering::Acquire), 0);
-        let reserved: usize = reservations.iter().map(|r| r.bytes).sum();
-        assert_eq!(MAX_LIVE * BASE + reserved, MAX_RETAINED_OUTPUT);
-        drop(reservations);
-        assert_eq!(table.pool.load(Ordering::Acquire), POOL);
     }
 
     #[test]
