@@ -16,8 +16,30 @@ use crate::bail;
 use crate::socket::{SocketRoot, Sockets};
 use crate::util::{retry, Result};
 
+/// How long a new Firecracker has to open its API socket.
+pub const SPAWN_READY: Duration = Duration::from_secs(5);
+
 /// Deadline for a Firecracker API call that does not pick its own.
 pub const API_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A request that never reached Firecracker: its API socket would not take
+/// a connection (it is dead, say). Any other failure, an error answer
+/// included, may come after Firecracker acted on some of it.
+#[derive(Debug)]
+pub struct NotSent(String);
+
+impl std::fmt::Display for NotSent {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NotSent {}
+
+/// Whether `e` says the request never reached Firecracker.
+pub fn not_sent(e: &crate::util::Error) -> bool {
+    e.downcast_ref::<NotSent>().is_some()
+}
 
 pub struct Firecracker {
     child: Child,
@@ -25,8 +47,9 @@ pub struct Firecracker {
 }
 
 impl Firecracker {
-    /// Starts Firecracker with private sockets and a log inside `dir`.
-    pub fn spawn(bin: &Path, dir: &Path, sockets: Sockets) -> Result<Self> {
+    /// Starts Firecracker with private sockets and a log inside `dir`, and
+    /// waits up to `ready` for its API socket.
+    pub fn spawn(bin: &Path, dir: &Path, sockets: Sockets, ready: Duration) -> Result<Self> {
         crate::socket::check(&sockets.api)?;
         let log = File::create(dir.join("firecracker.log"))?;
         let child = Command::new(bin)
@@ -39,7 +62,7 @@ impl Firecracker {
             .stderr(log)
             .spawn()?;
         let fc = Firecracker { child, sockets };
-        retry(Duration::from_secs(5), || Ok(UnixStream::connect(&fc.sockets.api)?))?;
+        retry(ready, || Ok(UnixStream::connect(&fc.sockets.api)?))?;
         Ok(fc)
     }
 
@@ -78,7 +101,8 @@ impl Firecracker {
             bail!("firecracker {method} {path}: out of time");
         }
         let at = std::time::Instant::now() + timeout;
-        let s = crate::util::connect_unix(&self.sockets.api, timeout)?;
+        let s = crate::util::connect_unix(&self.sockets.api, timeout)
+            .map_err(|e| Box::new(NotSent(format!("firecracker {method} {path}: cannot connect: {e}"))))?;
         self.send(crate::util::By { s, at }, method, path, body)
     }
 
@@ -112,6 +136,9 @@ impl Firecracker {
         let mut buf = vec![0u8; len];
         r.read_exact(&mut buf)?;
         let text = String::from_utf8_lossy(&buf);
+        if code == 0 {
+            bail!("firecracker {method} {path}: no status in the answer");
+        }
         if !(200..300).contains(&code) {
             bail!("firecracker {method} {path}: {code} {text}");
         }
@@ -119,6 +146,25 @@ impl Firecracker {
             return Ok(Value::Null);
         }
         Ok(serde_json::from_str(&text).unwrap_or(Value::String(text.into_owned())))
+    }
+
+    /// Whether the process is still running (it has not exited or been killed).
+    pub fn alive(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+
+    /// How Firecracker exited, if it has, and the end of its log: why a
+    /// request to it failed.
+    pub fn post_mortem(&mut self, dir: &Path) -> String {
+        let status = match self.child.try_wait() {
+            Ok(Some(st)) => format!("exited ({st})"),
+            Ok(None) => "still running".into(),
+            Err(e) => format!("unknown ({e})"),
+        };
+        let log = std::fs::read_to_string(dir.join("firecracker.log")).unwrap_or_default();
+        let tail: Vec<&str> = log.lines().rev().take(5).collect();
+        let tail: Vec<&str> = tail.into_iter().rev().collect();
+        format!("firecracker {} {status}; log: {}", self.pid(), tail.join(" | "))
     }
 
     pub fn kill(&mut self) {
@@ -214,7 +260,7 @@ impl Pool {
         pool
     }
 
-    fn spawn(&self) -> Result<Idle> {
+    fn spawn(&self, ready: Duration) -> Result<Idle> {
         let n = self.next.fetch_add(1, Ordering::SeqCst);
         let id = format!("idle-{}-{n}", std::process::id());
         let tap = format!("{}{n:x}", self.tap_prefix);
@@ -223,7 +269,7 @@ impl Pool {
         let fc = (|| {
             crate::net::create_tap(&tap)?;
             std::fs::create_dir_all(&dir)?;
-            let fc = Firecracker::spawn(&self.bin, &dir, self.sockets.allocate()?)?;
+            let fc = Firecracker::spawn(&self.bin, &dir, self.sockets.allocate()?, ready)?;
             if let Some(cg) = &cgroup {
                 std::fs::create_dir_all(cg)?;
                 std::fs::write(cg.join("cgroup.procs"), fc.pid().to_string())?;
@@ -240,19 +286,44 @@ impl Pool {
         }
     }
 
-    /// Hands out an idle Firecracker, or spawns one right away if none is ready.
+    /// Hands out an idle Firecracker, or spawns one right away if none is
+    /// ready. One that has died meanwhile is torn down, never handed out.
     pub fn take(&self) -> Result<Idle> {
+        self.take_by(None)
+    }
+
+    /// `take`, done by `deadline` if given (a spawned Firecracker must be up by then).
+    pub fn take_by(&self, deadline: Option<std::time::Instant>) -> Result<Idle> {
+        let ready = match deadline {
+            Some(d) => d.saturating_duration_since(std::time::Instant::now()).min(SPAWN_READY),
+            None => SPAWN_READY,
+        };
+        if ready.is_zero() {
+            bail!("out of time for an idle firecracker");
+        }
+        let mut dead = Vec::new();
         let got = {
             let mut s = self.state.lock().unwrap();
             if s.closed {
                 bail!("daemon is shutting down");
             }
-            s.idle.pop()
+            loop {
+                match s.idle.pop() {
+                    Some(mut f) => match f.fc.alive() {
+                        true => break Some(f),
+                        false => dead.push(f),
+                    },
+                    None => break None,
+                }
+            }
         };
         self.wake.notify_one();
+        for mut f in dead {
+            eprintln!("pool: dropping a dead idle firecracker: {}", f.fc.post_mortem(&f.dir));
+        }
         match got {
             Some(f) => Ok(f),
-            None => self.spawn(),
+            None => self.spawn(ready),
         }
     }
 
@@ -267,7 +338,7 @@ impl Pool {
                     return;
                 }
             }
-            match self.spawn() {
+            match self.spawn(SPAWN_READY) {
                 Ok(f) => {
                     backoff = Duration::from_millis(100);
                     let mut s = self.state.lock().unwrap();

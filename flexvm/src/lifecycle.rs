@@ -318,11 +318,6 @@ impl Daemon {
             tpl.check_id(&m.template_id)?;
             tpl.verify(&self.cfg.paths, true)?;
             t.mark("verify_template");
-            let idle = self.pool.take()?;
-            t.mark("pool_take");
-            // Load the bytes that were verified, from a file only root controls.
-            let vmstate = idle.dir.join("vmstate.in");
-            std::fs::write(&vmstate, &ck.vmstate)?;
             let origin = Some((ck.runs, Origin::File(ck.file)));
             let load = match hold && self.fault("restore_no_hold") {
                 true => crate::vm::Load::PausedUnheld,
@@ -330,7 +325,8 @@ impl Daemon {
             };
             // Loaded paused: everything up to the resume below can fail
             // without the VM having run.
-            Vm::restore_from(idle, name, tpl, &vmstate, origin, ip, load, t)
+            // Load the bytes that were verified, from a file only root controls.
+            Vm::restore_from(&self.pool, name, tpl, crate::vm::Snapshot::Bytes(&ck.vmstate), origin, ip, load, t)
         })()
         .map_err(Restore::NotRun)?;
         let dir = ck.dir;

@@ -378,16 +378,21 @@ confirming each is dead, before it answers anything, so "never seen this id" is 
 twice).
 
 `FLEXVM_FAULTS=1` lets a daemon accept `{"op": "fault", "fault": F, "ms": N}`
-(`pages`, `route`, `lost_ack`, `status`); `scripts/faults.py` uses it to check
-each failure path.
+(`pages`, `route`, `lost_ack`, `status`, `resume_kill`, ...); `scripts/faults.py` uses it to check
+each failure path, and disarms every fault after each scenario so none leaks
+into the next (`ms: 0` disarms one).
 
 ### Hot pool
 
 `run` takes a VM from the template's hot pool when one is ready: it was
 restored in the background exactly like any other VM (same pager, so it
 migrates and checkpoints like any other), then paused. Starting it is: route
-its address to its tap, resume, `START`. When the pool is empty, `run` falls
-back to loading the snapshot then and there.
+its address to its tap, resume, `START`. When the pool is empty (or the
+paused VM's resume never reached its Firecracker), `run` falls back to
+loading the snapshot then and there. A resume that reached it and failed
+(an error answer, a timeout, a Firecracker that died) fails the `run`
+instead: Firecracker resumes vCPUs one by one, so the guest may have run,
+and a second copy could repeat what it did.
 
 - **Size.** `--hot N` per template (default 2, `0` disables) within
   `--hot-mib` of host memory for all of them together, the VM being loaded
@@ -439,6 +444,22 @@ back to loading the snapshot then and there.
   the agent to answer a ping (it serves requests in order) rather than let it
   land, stale, after the snapshot. Agents that predate `START` get `NET` and
   keep the stale clock.
+  KVM saves the realtime clock that `clock_realtime` needs only while the VM
+  has a master clock, and drops that for good once the vCPUs' TSCs were
+  restored more than a second apart: a migration target whose load waited
+  on its source for guest memory (each vCPU's kvmclock page faults during
+  the load). Firecracker refuses to load such a VM's later snapshots with
+  `clock_realtime`, so a restore that gets that error tries once more on a
+  fresh Firecracker without it; the clock is stepped afterwards as above. A
+  restore also tries once more when its Firecracker died with nothing given
+  up, and the idle and hot pools never hand out a Firecracker that has died.
+  Retries stop at the resume: snapshots are always loaded with the vCPUs
+  stopped and resumed only once loaded, and a failed resume is never
+  retried, as the guest may have run (test fault `resume_kill`). A
+  migration target whose prepared load fails that way retries on a fresh,
+  unprepared Firecracker before it commits (the guest never ran, and the
+  paused source still serves every page, the preloaded ones included); once
+  committed, a failed resume leaves the VM failed there.
 
 ### Networking
 

@@ -645,12 +645,23 @@ impl Daemon {
         let hot = self.hot.take(&tpl);
         t.mark("hot_take");
         let hot_age = hot.as_ref().map(|p| p.age());
-        let restored = match hot {
-            Some(paused) => paused.resume(name, ip, &mut t),
-            None => self.pool.take().and_then(|idle| {
-                t.mark("pool_take");
-                Vm::restore(idle, name, tpl.clone(), &tpl.vmstate(), None, ip, &mut t).map(|(vm, _)| vm)
-            }),
+        let kill = self.fault("resume_kill");
+        let resumed = hot.map(|paused| paused.resume(name, ip, kill, &mut t));
+        let load = if kill { crate::vm::Load::RunningKilled } else { crate::vm::Load::Running };
+        let vmstate = tpl.vmstate();
+        let cold = |t: &mut Phases| {
+            Vm::restore(&self.pool, name, tpl.clone(), crate::vm::Snapshot::Path(&vmstate), None, ip, load, t).map(|(vm, _)| vm)
+        };
+        let restored = match resumed {
+            Some(Ok(vm)) => Ok(vm),
+            // The guest may have run (say, the resume timed out): never a second copy.
+            Some(Err((e, true))) => Err(format!("resuming a paused vm from the hot pool failed, and it may have run: {e}").into()),
+            // Not resumed (or refused): it never ran for `name`, so load a fresh one.
+            Some(Err((e, false))) => {
+                eprintln!("vm {name}: cannot resume a paused vm from the hot pool ({e}); loading the snapshot");
+                cold(&mut t)
+            }
+            None => cold(&mut t),
         };
         let vm = restored?;
         let restore = t.total() - claimed;
@@ -926,7 +937,9 @@ impl Daemon {
     /// fails once everything is prepared), `short_incoming` (a prepared
     /// incoming migration waits 2 s for the source, not 30) or
     /// `slow_preload` (a migration source sends the preloaded pages 300 ms
-    /// after the vmstate).
+    /// after the vmstate), `kill_prepared` (an incoming migration's
+    /// prepared Firecracker dies, and its pager sees it, just before the load) or `resume_kill` (Firecracker
+    /// is killed right after a restored VM's resume is sent).
     fn inject(&self, req: &Value) -> Result<Value> {
         let Some(faults) = &self.faults else { bail!("fault injection is off (start the daemon with FLEXVM_FAULTS=1)") };
         let fault = req["fault"].as_str().ok_or("missing fault")?;
@@ -1009,6 +1022,7 @@ impl Daemon {
             "lent_ips": self.addrs.lock().unwrap().lent.iter().map(|ip| ip.to_string()).collect::<Vec<_>>(),
             "vms": self.vms.lock().unwrap().len(),
             "hot": self.hot.describe(),
+            "loads": crate::vm::loads(),
         })
     }
 
@@ -1461,11 +1475,12 @@ impl Daemon {
             // in, or the migration aborts, before it commits: nothing else
             // reads this connection until our answer.
             let br = &mut br;
-            let preload = scope.spawn(move || -> Result<()> {
+            // Received, then installed (Err inside: a retried load's new
+            // pager does without them).
+            let preload = scope.spawn(move || -> Result<Result<()>> {
                 let len = (pages.len() * crate::util::PAGE_SIZE) as u64;
                 let data = read_vec(br, len, u64::MAX).map_err(|e| format!("receiving the preloaded pages: {e}"))?;
-                pager.preload(&pages, &data, deadline).map_err(|e| format!("preloading pages: {e}"))?;
-                Ok(())
+                Ok(pager.preload(&pages, &data, deadline).map(drop).map_err(|e| format!("preloading pages: {e}").into()))
             });
             let preloaded = move || preload.join().unwrap_or_else(|_| Err("preloading panicked".into()));
             let paused = hdr["paused"].as_bool().unwrap_or(false);
@@ -1550,7 +1565,7 @@ impl Daemon {
         state: &[u8],
         paused: bool,
         deadline: Instant,
-        before_commit: impl FnOnce() -> Result<()>,
+        before_commit: impl FnOnce() -> Result<Result<()>>,
         t: &mut Phases,
     ) -> Result<(Value, Arc<Vm>)> {
         let mig = p.source.mig;
@@ -1607,10 +1622,11 @@ impl Daemon {
         state: &[u8],
         paused: bool,
         deadline: Instant,
-        before_commit: impl FnOnce() -> Result<()>,
+        before_commit: impl FnOnce() -> Result<Result<()>>,
         t: &mut Phases,
     ) -> Result<(Value, Arc<Vm>)> {
-        let PreparedIn { vm: prepared, claim, source, name, _busy, .. } = p;
+        let PreparedIn { vm: mut prepared, claim, source, name, _busy, .. } = p;
+        let mut before_commit = Some(before_commit);
         let ip = claim.ip;
         // Is the source's page server there? Asked alongside the load, which
         // may not need it (preloaded pages): a VM whose memory cannot come
@@ -1620,10 +1636,19 @@ impl Daemon {
             let page = r.0;
             thread::spawn(move || crate::uffd::probe(&source, page, deadline))
         });
+        let (tpl, runs_again) = (prepared.template(), runs.clone());
+        if self.fault("kill_prepared") {
+            // Dead, and its pager has seen it go: the load fails at once, and
+            // the retry below takes over.
+            prepared.kill_firecracker();
+            prepared.pager.firecracker_gone();
+        }
         prepared.pager.seed(runs, Origin::Peer(source.clone()))?;
-        // A prepared load connected the pager long ago; it may have given up.
-        if let Some(why) = prepared.pager.failed() {
-            bail!("its pager failed: {why}");
+        // A prepared load connected the pager long ago; it may have given up
+        // on pages. (One whose Firecracker went is left to the load, which
+        // fails and retries on a fresh one.)
+        if prepared.pager.lost_pages() {
+            bail!("its pager failed: {}", prepared.pager.failed().unwrap_or_default());
         }
         let vmstate = prepared.dir().join("vmstate.in");
         std::fs::write(&vmstate, state)?;
@@ -1632,13 +1657,33 @@ impl Daemon {
         // check that can still abort the migration has passed (the source
         // would then resume an older state of a VM that ran on).
         let load = if paused { crate::vm::Load::Paused } else { crate::vm::Load::PausedUnheld };
-        let restored = prepared.load(&name, &vmstate, ip, load, Some(deadline), t);
+        let restored = match prepared.load(&name, &vmstate, ip, load, true, Some(deadline), t) {
+            // Once more on a fresh Firecracker (see `Retry`): the failed load
+            // never ran the guest, nothing is committed, and the source,
+            // paused, still serves every page. The preloaded pages went to
+            // the old pager; the new one fetches them like any other.
+            Err(e) if crate::vm::retry_of(&e).is_some() => (|| {
+                let realtime = crate::vm::retry_of(&e) != Some(crate::vm::Retry::WithoutRealtime);
+                eprintln!("vm {name}: loading it once more on a fresh firecracker{}", if realtime { "" } else { ", without clock_realtime" });
+                // Every byte the source sends before our answer is read first.
+                let _ = before_commit.take().unwrap()()?;
+                if Instant::now() >= deadline {
+                    bail!("no time left to load it again");
+                }
+                let fresh = Vm::prepare(self.pool.take_by(Some(deadline))?, &name, tpl, t)?;
+                fresh.pager.seed(runs_again, Origin::Peer(source.clone()))?;
+                let vmstate = fresh.dir().join("vmstate.in");
+                std::fs::write(&vmstate, state)?;
+                fresh.load(&name, &vmstate, ip, load, realtime, Some(deadline), t)
+            })(),
+            r => r,
+        };
         let probed = probe.map_or(Ok(()), |p| p.join().unwrap_or_else(|_| Err(std::io::Error::other("probe panicked"))));
         let (vm, restore) = restored?;
         let checked = match (probed, vm.pager.failed()) {
             (Err(e), _) => Err(format!("migration source {} does not serve pages: {e}", source.addr).into()),
             (_, Some(why)) => Err(format!("its memory cannot be paged in: {why}").into()),
-            _ => before_commit().and_then(|()| {
+            _ => before_commit.take().map_or(Ok(Ok(())), |f| f()).and_then(|r| r).and_then(|()| {
                 // The ownership boundary, in one step under the locks it
                 // takes, with the deadline checked under them too: the VM is
                 // registered, its address committed, and the migration
@@ -1673,7 +1718,7 @@ impl Daemon {
         self.held_in.lock().unwrap().insert(source.mig, HeldIn { vm: vm.clone(), revoked: Arc::default(), conn: None });
         let mut resume_error = None;
         if !paused {
-            match vm.fc(|fc| fc.resume()) {
+            match vm.start(self.fault("resume_kill")) {
                 Ok(()) => *vm.state.lock().unwrap() = State::Running,
                 Err(e) => {
                     // It may have run: the migration stays committed.

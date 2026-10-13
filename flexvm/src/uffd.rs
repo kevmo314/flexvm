@@ -63,6 +63,13 @@ const REMOTE_FAULT_RUN: usize = 64;
 /// Pages per background pull request.
 const PULL_RUN: usize = 256;
 const PULL_THREADS: usize = 4;
+/// Why a pager stopped whose Firecracker unmapped guest memory or exited.
+const GONE: &str = "firecracker unmapped guest memory";
+
+/// How long Firecracker has, once it unmapped guest memory, to exit or
+/// answer the request that failed, before the pager kills it.
+const UNMAPPED_GRACE: Duration = Duration::from_secs(2);
+
 /// How long a fault may keep failing (other than EAGAIN) before the pager gives up.
 const FAULT_TIMEOUT: Duration = Duration::from_secs(1);
 /// How long the migration source may stay unreachable before the pager gives up.
@@ -150,6 +157,7 @@ pub struct Source {
 }
 
 /// Where a VM's REMOTE pages come from.
+#[derive(Clone)]
 pub enum Origin {
     /// The paused source of an incoming migration.
     Peer(Source),
@@ -849,12 +857,60 @@ impl Pager {
         self.stop();
     }
 
+    /// Whether nothing at all is mapped at `addr..addr + len` in Firecracker
+    /// any more (or it is gone). A uffd copy also fails with ENOENT across a
+    /// VMA boundary, e.g. into an unplugged virtio-mem slot, where memory is
+    /// still mapped: that is not this.
+    fn unmapped(&self, addr: u64, len: usize) -> bool {
+        let pid = self.pid.load(Ordering::SeqCst);
+        let Ok(maps) = std::fs::read_to_string(format!("/proc/{pid}/maps")) else { return true };
+        let end = addr + len as u64;
+        !maps.lines().any(|l| {
+            let range = l.split_whitespace().next().unwrap_or("");
+            let (a, b) = range.split_once('-').unwrap_or(("", ""));
+            match (u64::from_str_radix(a, 16), u64::from_str_radix(b, 16)) {
+                (Ok(a), Ok(b)) => a < end && b > addr,
+                _ => false,
+            }
+        })
+    }
+
+    /// Gives up on guest memory that Firecracker has unmapped: it is most
+    /// likely tearing down a load that failed, and about to answer the load
+    /// request with why. Like `fail`, but Firecracker gets `UNMAPPED_GRACE`
+    /// to do that (or exit) before it is killed.
+    fn gone(&self) {
+        // Once, though every puller runs into it.
+        if !self.stop.load(Ordering::SeqCst) && self.failed.set(GONE.into()).is_ok() {
+            eprintln!("uffd: firecracker unmapped guest memory; killing it unless it exits within {UNMAPPED_GRACE:?}");
+            if let Some(fd) = self.pidfd.get().and_then(|fd| fd.try_clone().ok()) {
+                thread::spawn(move || {
+                    if !crate::util::pidfd_wait(&fd, UNMAPPED_GRACE).unwrap_or(false) {
+                        let _ = crate::util::pidfd_kill(&fd);
+                    }
+                });
+            }
+        }
+        self.stop();
+    }
+
     /// SIGKILLs the Firecracker through its pidfd, without waiting for
     /// anything (such as a call holding the VM's API lock).
     pub fn kill_firecracker(&self) {
         if let Some(fd) = self.pidfd.get() {
             let _ = crate::util::pidfd_kill(fd);
         }
+    }
+
+    /// Test fault `kill_prepared`: Firecracker was killed; treat it as gone.
+    pub fn firecracker_gone(&self) {
+        self.gone();
+    }
+
+    /// Whether the pager gave up on pages for its own reasons (the source,
+    /// the checkpoint file), rather than because Firecracker went away.
+    pub fn lost_pages(&self) -> bool {
+        self.failed().is_some_and(|why| why != GONE)
     }
 
     /// Why the pager gave up, if it did. The VM cannot make progress then.
@@ -1033,6 +1089,10 @@ impl Pager {
                 match self.fault(addr, flags) {
                     Ok(()) => {}
                     Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => pending.push_back((addr, flags, since)),
+                    // Firecracker unmapped guest memory (tearing down a failed load, or exiting).
+                    Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) && self.unmapped(addr, PAGE_SIZE) => {
+                        return self.gone()
+                    }
                     Err(e) if fatal(&e) => return self.fail(e.to_string()),
                     Err(e) => match since {
                         None => {
@@ -1603,8 +1663,10 @@ impl Pager {
                     true => p.pull_working_set(t, &mut fetch),
                     false => Ok(()),
                 };
-                if let Err(e) = pulled.and_then(|()| p.pull(t, &mut fetch)) {
-                    return p.fail(format!("background pull {t} failed: {e}"));
+                match pulled.and_then(|()| p.pull(t, &mut fetch)) {
+                    Err(e) if unmapped(&e) => return p.gone(),
+                    Err(e) => return p.fail(format!("background pull {t} failed: {e}")),
+                    Ok(()) => {}
                 }
                 if let Some(file) = file.filter(|_| p.remote_left() == 0) {
                     file.drop_cache();
@@ -1669,7 +1731,12 @@ impl Pager {
         let src = |p: usize, c: usize| &b[(p - i) * PAGE_SIZE..(p - i + c) * PAGE_SIZE];
         let (resolved, res) = pages.install(i, n, REMOTE, Some(&self.stop), |p, c| self.populate(p, c, Some(src(p, c))));
         self.pulled(resolved);
-        res?;
+        res.map_err(|e| match e.raw_os_error() {
+            Some(libc::ENOENT | libc::ESRCH) if self.host_addr(i).is_some_and(|(a, _)| self.unmapped(a, n * PAGE_SIZE)) => {
+                io::Error::other(Unmapped)
+            }
+            _ => e,
+        })?;
         Ok(i + n)
     }
 }
@@ -1854,6 +1921,25 @@ pub fn remote_among(runs: &Runs, wanted: impl IntoIterator<Item = u64>) -> Vec<u
 
 /// Reads guest memory at an offset from wherever a puller pulls it.
 type Fetch = dyn FnMut(u64, &mut [u8], &AtomicBool) -> io::Result<()> + Send;
+
+/// A background pull could not install pages because their range is no
+/// longer mapped in Firecracker at all (UFFDIO_COPY and UFFDIO_ZEROPAGE fail
+/// with ENOENT outside a registered VMA, ESRCH once its memory is gone; see
+/// `Pager::unmapped`).
+#[derive(Debug)]
+struct Unmapped;
+
+impl std::fmt::Display for Unmapped {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("guest memory is no longer mapped")
+    }
+}
+
+impl std::error::Error for Unmapped {}
+
+fn unmapped(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|e| e.is::<Unmapped>())
+}
 
 /// Errors after which the pager gives up on the VM: its migration source has
 /// been gone too long, or its checkpoint file is unreadable or corrupt.
