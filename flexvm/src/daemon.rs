@@ -459,7 +459,8 @@ impl Daemon {
             "resume" => self.resume(&name),
             "suspend" => self.suspend(&name),
             "checkpoint" => {
-                self.checkpoint(&name, req["dir"].as_str().ok_or("missing dir")?, req["stop"].as_bool().unwrap_or(false))
+                let dir = req["dir"].as_str().ok_or("missing dir")?;
+                self.checkpoint(&name, dir, req["stop"].as_bool().unwrap_or(false), req["incremental"].as_bool().unwrap_or(false))
             }
             "restore" => self.restore(
                 req["dir"].as_str().ok_or("missing dir")?,
@@ -468,6 +469,7 @@ impl Daemon {
                 req["paused"].as_bool().unwrap_or(false),
             ),
             "memhash" => self.memhash(&name),
+            "ckhash" => self.ckhash(req["dir"].as_str().ok_or("missing dir")?),
             "release" => self.release(&name, &req),
             "migration" => self.migration_outcome(&req),
             "fault" => self.inject(&req),
@@ -676,6 +678,11 @@ impl Daemon {
 
     /// Stops a VM and withdraws its address from the network.
     fn kill(&self, name: &str) -> Result<Value> {
+        // A checkpoint still writing a running VM's pages gives up rather
+        // than hold the kill up.
+        if let Ok(vm) = self.vm(name) {
+            vm.pager.abort_copy();
+        }
         let _busy = self.reserve(name, "killing", LIFECYCLE_WAIT)?;
         self.kill_reserved(name)
     }
