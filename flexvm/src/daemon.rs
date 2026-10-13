@@ -1058,8 +1058,8 @@ impl Daemon {
             }
         };
         let prepared = (|| -> Result<_> {
-            let runs = vm.checkpoint(&vmstate, hold)?;
-            let paused = t.mark("checkpoint");
+            let runs = vm.checkpoint(&vmstate, hold, &mut t)?;
+            let paused = t.total();
             let state = std::fs::read(&vmstate)?;
             t.mark("read_state");
             let conn = crate::util::connect(to, Duration::from_secs(2))?;

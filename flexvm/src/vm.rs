@@ -279,23 +279,30 @@ impl Vm {
     /// queued on a tap that a paused Firecracker no longer reads and that
     /// then goes down; what the guest sends until the pause still leaves
     /// through the tap. Call after `start_source`.
-    pub fn checkpoint(&self, vmstate: &Path, unroute: impl FnOnce()) -> Result<Runs> {
-        self.save_state(vmstate, false, unroute)
+    pub fn checkpoint(&self, vmstate: &Path, unroute: impl FnOnce(), t: &mut Phases) -> Result<Runs> {
+        self.save_state_timed(vmstate, false, unroute, t)
     }
 
     /// `checkpoint`, with Firecracker fsyncing the state file if `sync`.
     /// Call after `start_source` or `start_checkpoint`.
     pub fn save_state(&self, vmstate: &Path, sync: bool, unroute: impl FnOnce()) -> Result<Runs> {
+        self.save_state_timed(vmstate, sync, unroute, &mut Phases::new())
+    }
+
+    fn save_state_timed(&self, vmstate: &Path, sync: bool, unroute: impl FnOnce(), t: &mut Phases) -> Result<Runs> {
         for (_, s) in self.execs.lock().unwrap().drain() {
             let _ = s.shutdown(Shutdown::Both);
         }
         unroute();
+        t.mark("hold");
         // Always, even if already paused: Firecracker freezes device
         // emulation only while it sits in the loop an API pause enters (a VM
         // loaded paused is not in it). The tap goes down after the pause, so
         // the guest's last packets still leave.
         self.fc(|fc| fc.pause())?;
+        t.mark("pause");
         crate::net::set_link_up(&self.tap, false)?;
+        t.mark("link_down");
         self.fc(|fc| {
             // The balloon timer is parked: changing it writes the stats
             // queue, which has to happen before the snapshot. Nothing else
@@ -303,10 +310,15 @@ impl Vm {
             // we send no guest-facing request (balloon, hotplug) to a paused
             // source.
             fc.patch("/balloon/statistics", json!({"stats_polling_interval_s": u16::MAX}))?;
+            t.mark("park_balloon");
             self.snapshot_discards.store(self.pager.discards(), Ordering::SeqCst);
-            fc.put("/snapshot/create", json!({"snapshot_type": "Full", "snapshot_path": vmstate, "mem_file_path": "", "sync_snapshot_files": sync}))
+            fc.put("/snapshot/create", json!({"snapshot_type": "Full", "snapshot_path": vmstate, "mem_file_path": "", "sync_snapshot_files": sync}))?;
+            t.mark("snapshot_create");
+            Ok(())
         })?;
-        self.pager.quiesce_export()
+        let runs = self.pager.quiesce_export()?;
+        t.mark("export_runs");
+        Ok(runs)
     }
 
     /// Marks the VM as the source of migration `mig`. From then on no host
