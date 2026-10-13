@@ -124,9 +124,10 @@ VM that is busy, paused or suspended.
   The guest uses the TSC clocksource, whose saved value Firecracker
   restores, while `clock_realtime` only moves kvmclock. A restore or a
   suspended VM's resume therefore steps the guest clock under the VM's
-  reservation, within a 5 s deadline. The step measures the offset with one
-  bracketed exec and sets an absolute time: the host's, plus half the round
-  trip. Repeating it cannot double-step, and the residual error is a few ms.
+  reservation, within a 5 s deadline, with the agent's `CLOCK` (it sets the
+  host's time and reports how far off it was), repeated until a round trip
+  is under 5 ms; the residual error is a few ms. Agents without `CLOCK` get
+  no step (logged once): an exec could run late, after a snapshot.
   Across a plain pause the TSC keeps counting, so the clock stays right
   (measured: 0 ms drift after 20 s). `resume` still checks it in the
   background, at most one check per VM at a time.
@@ -578,10 +579,9 @@ firecracker/        patches on top of Firecracker v1.17.0
   from, and the template's content id must match. Rebuilding a template
   strands its checkpoints, so keep old templates while their checkpoints
   matter.
-- **Fresh `run`s and migration targets keep the guest clock they were saved
-  with**: the template's snapshot time, and the downtime lost on each
-  migration. Only lifecycle restores and resumes step the clock (the same
-  `Vm::sync_clock` could run after `run`, off the critical path).
+- **Guests whose agent predates `START`/`CLOCK` keep the clock they were
+  saved with** (the template's snapshot time, minus each migration's
+  downtime); see "Hot pool" for how the agent's requests fix it.
 - A guest that gets a different address on restore keeps its old one too,
   unless it has iproute2 to drop it.
 - Snapshot load is dominated by KVM memslot creation in this nested
