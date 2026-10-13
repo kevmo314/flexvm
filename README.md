@@ -170,7 +170,9 @@ unpacked, and their uncompressed contents against the config's `diff_ids`
 while unpacking), and builds are bounded: `--max-download-mib` (8192, all
 layers compressed), `--max-unpacked-mib` (16384), `--max-file-mib` (4096),
 `--max-entries` (1,000,000), plus 4 MiB per manifest or config and 1 MiB per
-tar metadata entry.
+tar entry's metadata (PAX records and GNU long names together, one of each).
+Readiness commands run as the app does (same user and restrictions) in a
+cgroup of their own that is killed when the check ends.
 
 - **Pull.** Native registry v2 client (no docker or skopeo): anonymous bearer
   tokens, or basic credentials from `$DOCKER_CONFIG`, `~/.docker/config.json`
@@ -185,8 +187,12 @@ tar metadata entry.
   hard links. Every path resolves inside the image (`openat2(RESOLVE_IN_ROOT)`),
   so absolute symlinks behave as in a container and a layer cannot write
   outside it; whiteouts must name one entry, and removal walks directory fds.
-  Layers are unpacked in `ARTIFACTS/images/tmp/`, root-owned and 0700, so
-  other users cannot reach their setuid files or device nodes. flexvm adds `/sbin/flexvm-init`, its mount points,
+  Layers are unpacked in `--image-staging` (default `/var/lib/flexvm/staging`),
+  which must be root-owned and 0700 with an ancestry only root can change, and
+  is used through a descriptor, so other users can neither reach the image's
+  setuid files and device nodes nor swap the directory mid-build. The image
+  cache is trusted by whoever can write it (it is reused as is); writes into it
+  never follow symlinks. flexvm adds `/sbin/flexvm-init`, its mount points,
   `/etc/flexvm/app.conf` (argv, env, workdir, uid/gid/groups resolved against
   the image's own `/etc/passwd` and `/etc/group`), an `/etc/hosts`, and an
   empty `/etc/resolv.conf` if the image has none (the daemon's `--dns` fills
