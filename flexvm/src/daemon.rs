@@ -145,10 +145,16 @@ pub struct Daemon {
     /// the newest it has seen for every address (see `Gens`). Taken after
     /// `addrs` when both are needed.
     gens: Mutex<Gens>,
-    /// One lock per VM address, held from deciding what its route should be
-    /// until the kernel has it: peers' announcements and withdrawals, a
-    /// VM's local route, migration route switches and packet holds.
-    addr_locks: Mutex<HashMap<Ipv4Addr, Arc<Mutex<()>>>>,
+    /// Locks for VM addresses (an address picks one by hash), held from
+    /// deciding what an address's route should be, and recording what that
+    /// decision learned (`Gens`), until the kernel has the route: peers'
+    /// announcements and withdrawals, migration route switches and packet
+    /// holds. A VM starting or arriving here claims its address first, and
+    /// route messages leave a claimed address alone.
+    addr_locks: [Mutex<()>; 64],
+    /// The `--vm-ips` of each peer that answered `info`: the addresses
+    /// route messages may be about, besides ours and those of VMs here.
+    peer_ranges: Mutex<HashMap<String, IpRange>>,
     /// Held for the daemon's lifetime (see `lock_run_dir`).
     _run_lock: Vec<std::fs::File>,
     /// Armed test faults and when they expire; None unless FLEXVM_FAULTS=1.
@@ -307,7 +313,7 @@ pub fn run(mut cfg: Config) -> Result<()> {
     net::delete_taps_with_prefix(&tap_prefix);
     // Before serving anything: addresses lent out before a restart stay taken.
     let addrs = Addrs::load(cfg.state_dir.join(LENT_FILE))?;
-    let gens = Gens::load(cfg.state_dir.join(GENS_FILE))?;
+    let gens = Gens::load(cfg.state_dir.join(GENS_DIR))?;
     let sockets = crate::socket::SocketRoot::new(&cfg.run_dir)?;
     let pool = Pool::new(&cfg.paths.firecracker, &cfg.run_dir, sockets, cgroup_root.clone(), &tap_prefix, cfg.pool);
     let hot = HotPool::new(pool.clone(), cfg.hot, cfg.hot_mib, cfg.reserve_mib);
@@ -332,13 +338,16 @@ pub fn run(mut cfg: Config) -> Result<()> {
         admission: Admission::new(cfg_reserve_mib),
         migrations: Mutex::default(),
         gens: Mutex::new(gens),
-        addr_locks: Mutex::default(),
+        addr_locks: std::array::from_fn(|_| Mutex::new(())),
+        peer_ranges: Mutex::default(),
         _run_lock: run_lock,
         faults: std::env::var("FLEXVM_FAULTS").is_ok_and(|v| v == "1").then(|| Mutex::new(HashMap::new())),
         busy: (Mutex::new(HashMap::new()), Condvar::new()),
         suspended: Mutex::new(HashMap::new()),
         holder,
     });
+    // Before anything is handed out: peers that answer must not share our range.
+    d.refresh_peer_ranges()?;
     d.load_suspended()?;
     eprintln!("flexvm daemon listening on {} (advertised as {})", d.cfg.listen, d.cfg.advertise);
     {
@@ -367,11 +376,10 @@ pub fn run(mut cfg: Config) -> Result<()> {
     }
     if !d.cfg.peers.is_empty() {
         let d = d.clone();
-        thread::spawn(move || {
-            let mut warned = HashSet::new();
-            loop {
-                d.check_peer_ranges(&mut warned);
-                thread::sleep(Duration::from_secs(10));
+        thread::spawn(move || loop {
+            thread::sleep(Duration::from_secs(10));
+            if let Err(e) = d.refresh_peer_ranges() {
+                eprintln!("ERROR: {e}; not handing out addresses in the overlap");
             }
         });
     }
@@ -727,7 +735,6 @@ impl Daemon {
                 vm.fc(|fc| fc.patch("/hotplug/memory", json!({"requested_size_mib": mib})))
             }),
             "route" => self.route(&req),
-            "gen" => self.assign_gen(&req),
             "unlend" => {
                 let ip: Ipv4Addr = req["ip"].as_str().ok_or("missing ip")?.parse()?;
                 Ok(json!({"freed": self.addrs.lock().unwrap().unlend(ip)}))
@@ -782,9 +789,6 @@ impl Daemon {
         let hot = self.hot.take(&tpl);
         t.mark("hot_take");
         let hot_age = hot.as_ref().map(|p| p.age());
-        // Either way the address gets routed to the VM's tap.
-        let lock = self.addr_lock(ip);
-        let route = lock.lock().unwrap();
         let kill = self.fault("resume_kill");
         let resumed = hot.map(|paused| paused.resume(name, ip, kill, &mut t));
         let load = if kill { crate::vm::Load::RunningKilled } else { crate::vm::Load::Running };
@@ -803,7 +807,6 @@ impl Daemon {
             }
             None => cold(&mut t),
         };
-        drop(route);
         let vm = restored?;
         let restore = t.total() - claimed;
         if let Err(e) = self.publish(name, &vm) {
@@ -856,7 +859,8 @@ impl Daemon {
     /// reported gone.
     fn claim_ip(&self) -> Result<IpClaim<'_>> {
         let mut a = self.addrs.lock().unwrap();
-        let ip = self.cfg.vm_ips.allocate(|ip| a.used.contains_key(&ip) || a.lent.contains_key(&ip)).ok_or("no free addresses left")?;
+        let taken = |ip| a.used.contains_key(&ip) || a.lent.contains_key(&ip) || self.contested(ip);
+        let ip = self.cfg.vm_ips.allocate(taken).ok_or("no free addresses left")?;
         let gen = self.gens.lock().unwrap().assign(ip)?;
         a.used.insert(ip, gen);
         Ok(IpClaim { addrs: &self.addrs, ip, gen, was_lent: false, done: false })
@@ -864,111 +868,65 @@ impl Daemon {
 
     /// Reserves a given address: one picked with `run --ip`, a restore's, or
     /// a migrating VM's own (`ClaimFor::Incoming`, with the generation it
-    /// carries). A new VM's address (run, restore) must not be in use or
-    /// lent out on any peer either (asked, best effort, as a restore of a
-    /// checkpoint's own address always was), and gets a new generation from
-    /// the address's home host. Only a VM migrating in may take a lent
-    /// address (it is coming back), only the generation it was lent with or
-    /// a newer one, and it leaves the lent set only if the claim commits.
+    /// carries). Only an address's home host hands it to a new VM (run,
+    /// restore), with a new generation; it leaves only with a VM migrating
+    /// away, lent. Only a VM migrating in may take a lent address (it is
+    /// coming back), only with the generation it was lent with or a newer
+    /// one, and it leaves the lent set only if the claim commits.
     fn claim_given_ip(&self, ip: &str, why: ClaimFor) -> Result<IpClaim<'_>> {
         let ip: Ipv4Addr = ip.parse().map_err(|_| format!("bad address {ip:?}"))?;
-        // A generation from the home host, if that is a peer.
-        let from_home = match why {
-            ClaimFor::Incoming(_) => None,
-            _ => match self.check_peers_for(ip)? {
-                Some(home) => {
-                    let r = peer_call(&home, json!({"op": "gen", "ip": ip.to_string()}))
-                        .map_err(|e| format!("{ip}: its home host {home} gave no generation for it: {e}"))?;
-                    Some(r["gen"].as_u64().ok_or_else(|| format!("{ip}: {home} sent no generation"))?)
-                }
-                None => None,
-            },
-        };
+        if let ClaimFor::Incoming(gen) = why {
+            // Recorded, durably, before the VM is taken in: a newer VM with
+            // the address (an operator unlent it and it was given out again)
+            // is not taken over here.
+            let _route = self.addr_lock(ip).lock().unwrap();
+            if gen != LEGACY_GEN && !self.record_gen(ip, gen, false)? {
+                bail!("{ip} has a newer generation than this vm's ({gen}): it was given out again");
+            }
+        } else if !self.cfg.vm_ips.contains(ip) || self.contested(ip) {
+            let home = self.peer_ranges.lock().unwrap().iter().find(|(_, r)| r.contains(ip)).map(|(p, _)| p.clone());
+            let home = home.map_or("its home host".to_string(), |h| format!("its home host {h}"));
+            bail!("{ip} is not this host's to hand out (--vm-ips {}): start the vm on {home}, or use --ip auto", self.cfg.vm_ips);
+        }
         let mut a = self.addrs.lock().unwrap();
         if a.used.contains_key(&ip) {
             bail!("{ip} is already in use here");
         }
         let lent = a.lent.get(&ip).copied();
-        let mut gens = self.gens.lock().unwrap();
         let gen = match (why, lent) {
             (ClaimFor::Incoming(gen), Some(l)) if gen < l => {
                 bail!("{ip} is lent out with a newer vm (generation {l}, not {gen})")
             }
-            (ClaimFor::Incoming(gen), _) => {
-                // A VM whose address has been given out again since (an
-                // operator unlent it) must not take it over here.
-                if gen != LEGACY_GEN && !gens.observe(ip, gen, false) {
-                    bail!("{ip} has a newer generation than this vm's ({gen}): it was given out again");
-                }
-                gen
-            }
+            (ClaimFor::Incoming(gen), _) => gen,
             (_, Some(_)) => bail!("{ip} is in use on another host (lent out with a migrated vm)"),
-            (_, None) => match from_home {
-                Some(gen) => {
-                    gens.observe(ip, gen, false);
-                    gen
-                }
-                None => gens.assign(ip)?,
-            },
+            (_, None) => self.gens.lock().unwrap().assign(ip)?,
         };
-        drop(gens);
         a.used.insert(ip, gen);
         Ok(IpClaim { addrs: &self.addrs, ip, gen, was_lent: lent.is_some(), done: false })
     }
 
-    /// Refuses `ip` for a new VM if a peer that answers holds it, or has
-    /// lent it out with a VM that migrated away from there. Returns the
-    /// peer whose range it is from (its home), if not ours. An address from
-    /// no answering host's range needs every peer to answer: one that does
-    /// not may be its home.
-    fn check_peers_for(&self, ip: Ipv4Addr) -> Result<Option<String>> {
-        let mut home = None;
-        let mut silent = Vec::new();
-        for peer in &self.cfg.peers {
-            let Ok(info) = peer_info(peer) else {
-                silent.push(peer.as_str());
-                continue;
-            };
-            if info_ips(&info, "ips").any(|i| i == ip) {
-                bail!("{ip} is in use on {peer}");
-            }
-            if info_ips(&info, "lent_ips").any(|i| i == ip) {
-                bail!("{ip} is lent out by {peer} to a vm that migrated away from it");
-            }
-            if info["vm_ips"].as_str().and_then(|r| IpRange::parse(r).ok()).is_some_and(|r| r.contains(ip)) {
-                home = Some(peer.clone());
-            }
-        }
-        if self.cfg.vm_ips.contains(ip) {
-            return Ok(None);
-        }
-        if home.is_none() && !silent.is_empty() {
-            bail!("{ip} is not from this host's range, and {} did not answer (its home host gives it a generation)", silent.join(", "));
-        }
-        Ok(home)
-    }
-
-    /// A peer asks for a new generation of `ip`, from our range, for a VM it
-    /// is about to start with it (`claim_given_ip`).
-    fn assign_gen(&self, req: &Value) -> Result<Value> {
-        let ip: Ipv4Addr = req["ip"].as_str().ok_or("missing ip")?.parse()?;
-        if !self.cfg.vm_ips.contains(ip) {
-            bail!("{ip} is not from this host's range {}", self.cfg.vm_ips);
-        }
-        let a = self.addrs.lock().unwrap();
-        if a.used.contains_key(&ip) {
-            bail!("{ip} is in use on its home host");
-        }
-        if a.lent.contains_key(&ip) {
-            bail!("{ip} is lent out by its home host to a vm that migrated away");
-        }
-        let gen = self.gens.lock().unwrap().assign(ip)?;
-        Ok(json!({"gen": gen}))
-    }
-
     /// The lock for `ip`'s route (see `addr_locks`).
-    pub(super) fn addr_lock(&self, ip: Ipv4Addr) -> Arc<Mutex<()>> {
-        self.addr_locks.lock().unwrap().entry(ip).or_default().clone()
+    pub(super) fn addr_lock(&self, ip: Ipv4Addr) -> &Mutex<()> {
+        &self.addr_locks[u32::from(ip) as usize % self.addr_locks.len()]
+    }
+
+    /// Takes in that generation `gen` of `ip` is announced (or, `withdrawn`,
+    /// gone), for a caller holding `ip`'s lock (`addr_lock`). False if that
+    /// is stale (see `Gens`). A change is on disk before this returns.
+    pub(super) fn record_gen(&self, ip: Ipv4Addr, gen: u64, withdrawn: bool) -> Result<bool> {
+        let (verdict, dir) = {
+            let g = self.gens.lock().unwrap();
+            (g.judge(ip, gen, withdrawn), g.dir.clone())
+        };
+        match verdict {
+            None => Ok(false),
+            Some(None) => Ok(true),
+            Some(Some(seen)) => {
+                persist_seen(&dir, ip, seen).map_err(|e| format!("cannot record generation {gen} of {ip} in {}: {e}", dir.display()))?;
+                self.gens.lock().unwrap().apply(ip, seen);
+                Ok(true)
+            }
+        }
     }
 
     /// Reserves an address and keeps it, for callers that roll back themselves
@@ -1025,30 +983,31 @@ impl Daemon {
     /// than the newest seen here, or an announcement of a generation already
     /// withdrawn, is stale and changes nothing. A withdrawal frees our loan
     /// of the address if it was lent with that generation or an older one.
-    /// The decision and the kernel's route change happen under the address's
-    /// lock, so they cannot interleave with another route change for it.
+    /// The decision is recorded on disk before anything is acted on or
+    /// answered (a failure refuses the message), and it and the kernel's
+    /// route change happen under the address's lock. Only for addresses this
+    /// host knows of (`managed`); an address claimed here by a VM (running,
+    /// starting, or arriving) keeps its route to that VM.
     fn route(&self, req: &Value) -> Result<Value> {
         let ip: Ipv4Addr = req["ip"].as_str().ok_or("missing ip")?.parse()?;
         let via: Option<Ipv4Addr> = req["via"].as_str().map(str::parse).transpose()?;
         // Hosts of a cluster run the same version; a message without one is
         // older than any generation seen.
         let gen = req["gen"].as_u64().unwrap_or(LEGACY_GEN);
-        let lock = self.addr_lock(ip);
-        let _route = lock.lock().unwrap();
-        let (fresh, freed) = {
+        if !self.managed(ip) {
+            bail!("{ip} is from no range this host knows of");
+        }
+        let _route = self.addr_lock(ip).lock().unwrap();
+        let fresh = self.record_gen(ip, gen, via.is_none())?;
+        let (local, freed) = {
             let mut addrs = self.addrs.lock().unwrap();
-            let mut gens = self.gens.lock().unwrap();
-            let fresh = gens.observe(ip, gen, via.is_none());
-            if fresh {
-                if let Err(e) = gens.save() {
-                    eprintln!("cannot record address generations in {}: {e}", gens.file.display());
-                }
-            }
             // A withdrawal: the VM holding it was killed, so a lent address is free again.
             let freed = via.is_none() && addrs.withdraw(ip, gen);
-            (fresh, freed)
+            // Claimed here, not by a migration's paused copy (whose release
+            // moves the route): a VM here owns the route.
+            let source = self.vms.lock().unwrap().values().any(|v| v.ip == ip && matches!(v.state(), State::Source(_)));
+            (addrs.used.contains_key(&ip) && !source, freed)
         };
-        let local = self.vms.lock().unwrap().values().any(|v| v.ip == ip && v.state().local());
         // A migration away from here is holding its packets; its release moves the route.
         let held = self.holder.as_ref().is_some_and(|h| h.holding(ip));
         if fresh && !local && !held {
@@ -1060,19 +1019,41 @@ impl Daemon {
         Ok(json!({"ip": ip.to_string(), "local": local, "freed": freed, "stale": !fresh}))
     }
 
-    /// Complains (once per peer and range) when a peer's `--vm-ips` overlaps
-    /// ours: both would hand out the same addresses.
-    fn check_peer_ranges(&self, warned: &mut HashSet<(String, String)>) {
+    /// Learns the `--vm-ips` of the peers that answer. One that overlaps ours
+    /// is an error: both hosts would hand out the same addresses. Startup
+    /// refuses it; later, no address in the overlap is handed out.
+    fn refresh_peer_ranges(&self) -> Result<()> {
+        let mut clash = Vec::new();
         for peer in &self.cfg.peers {
             let Ok(info) = peer_info(peer) else { continue };
             let Some(theirs) = info["vm_ips"].as_str().and_then(|r| IpRange::parse(r).ok()) else { continue };
-            if theirs.overlaps(&self.cfg.vm_ips) && warned.insert((peer.clone(), theirs.to_string())) {
-                eprintln!(
-                    "WARNING: --vm-ips {} overlaps {peer}'s {theirs}; both hosts can hand out the same \
-                     addresses. Give every host a disjoint range.",
-                    self.cfg.vm_ips
-                );
+            if theirs.overlaps(&self.cfg.vm_ips) {
+                clash.push(format!("{peer}'s {theirs}"));
             }
+            self.peer_ranges.lock().unwrap().insert(peer.clone(), theirs);
+        }
+        if !clash.is_empty() {
+            bail!("--vm-ips {} overlaps {}: give every host a disjoint range", self.cfg.vm_ips, clash.join(", "));
+        }
+        Ok(())
+    }
+
+    /// Whether a peer's range overlapping ours holds `ip` (never handed out).
+    fn contested(&self, ip: Ipv4Addr) -> bool {
+        self.peer_ranges.lock().unwrap().values().any(|r| r.overlaps(&self.cfg.vm_ips) && r.contains(ip))
+    }
+
+    /// Whether route messages may be about `ip`: ours, a peer's, or a VM's
+    /// here. Learns the peers' ranges again before saying no.
+    fn managed(&self, ip: Ipv4Addr) -> bool {
+        let known = || {
+            self.cfg.vm_ips.contains(ip)
+                || self.peer_ranges.lock().unwrap().values().any(|r| r.contains(ip))
+                || self.addrs.lock().unwrap().used.contains_key(&ip)
+        };
+        known() || {
+            let _ = self.refresh_peer_ranges();
+            known()
         }
     }
 
@@ -1154,12 +1135,12 @@ impl Daemon {
         // The withdrawal carries the address's generation, so a late one can
         // neither free a newer VM's loan of it nor remove its route, and no
         // late announcement of this one is taken afterwards, here either.
+        // (The VM is gone either way; a failure to record that only costs
+        // this host's guard against a late announcement of it.)
         if let Some(gen) = gen {
-            let mut gens = self.gens.lock().unwrap();
-            if gens.observe(ip, gen, true) {
-                if let Err(e) = gens.save() {
-                    eprintln!("cannot record address generations in {}: {e}", gens.file.display());
-                }
+            let _route = self.addr_lock(ip).lock().unwrap();
+            if let Err(e) = self.record_gen(ip, gen, true) {
+                eprintln!("vm {name}: {e}");
             }
         }
         let req = json!({"op": "route", "ip": ip.to_string(), "gen": gen});
@@ -1501,7 +1482,7 @@ impl Daemon {
                 Some(Outcome::Committed(target)) => (target, false),
                 Some(Outcome::Aborted) => return Err(self.abort_migration(&vm, mig, e)),
                 None => {
-                    self.reconcile_later(vm.clone(), mig, to.to_string());
+                    self.reconcile_later(vm.clone(), mig, gen, to.to_string());
                     bail!("migrating {name} to {to}: {e}; {to} has not said whether it resumed the vm, so it stays paused here until it does");
                 }
             },
@@ -1510,7 +1491,7 @@ impl Daemon {
         let downtime = t.total();
         // The target owns the VM now; this copy only serves its memory. The
         // packets held meanwhile follow on the migration connection.
-        let (held, rerouted) = self.reroute(&vm, mig, to, &target, answered.then_some(&conn));
+        let (held, rerouted) = self.reroute(&vm, mig, gen, to, &target, answered.then_some(&conn));
         t.mark("reroute");
         Ok(json!({
             "name": name,
@@ -1632,7 +1613,7 @@ impl Daemon {
 
     /// Keeps asking `to` how migration `mig` went, with the VM paused here,
     /// until it answers or the VM is killed.
-    fn reconcile_later(self: &Arc<Self>, vm: Arc<Vm>, mig: u64, to: String) {
+    fn reconcile_later(self: &Arc<Self>, vm: Arc<Vm>, mig: u64, gen: u64, to: String) {
         let d = self.clone();
         thread::spawn(move || {
             let mut patience = Duration::from_secs(1);
@@ -1644,7 +1625,7 @@ impl Daemon {
                 match d.outcome(&to, mig, patience) {
                     Some(Outcome::Committed(target)) => {
                         eprintln!("vm {}: migration {mig} to {to} committed", vm.name);
-                        let _ = d.reroute(&vm, mig, &to, &target, None);
+                        let _ = d.reroute(&vm, mig, gen, &to, &target, None);
                         return;
                     }
                     Some(Outcome::Aborted) if here() => {
@@ -1671,7 +1652,7 @@ impl Daemon {
     /// If the address belongs to a newer VM here by now (the VM came back
     /// while this migration's outcome was unknown), the held packets go to
     /// that VM's tap and the route stays.
-    fn reroute(self: &Arc<Self>, vm: &Arc<Vm>, mig: u64, to: &str, target: &Value, conn: Option<&TcpStream>) -> (Option<hold::Stats>, Result<()>) {
+    fn reroute(self: &Arc<Self>, vm: &Arc<Vm>, mig: u64, gen: u64, to: &str, target: &Value, conn: Option<&TcpStream>) -> (Option<hold::Stats>, Result<()>) {
         let ip = vm.ip;
         let newer = self.vms.lock().unwrap().values().find(|v| v.ip == ip && !Arc::ptr_eq(v, vm) && v.state().local()).cloned();
         if let Some(newer) = newer {
@@ -1695,7 +1676,7 @@ impl Daemon {
             // (its answer was lost, it gave up waiting) the packets are dropped.
             match conn.map(hold::start) {
                 Some(Ok(seq)) => {
-                    if let Some((stats, r)) = hold::send(h, ip, mig, conn.unwrap(), seq, || self.switch_route(vm, via)) {
+                    if let Some((stats, r)) = hold::send(h, ip, mig, conn.unwrap(), seq, || self.switch_route(vm, gen, via)) {
                         held = Some(stats);
                         res = Some(r);
                     }
@@ -1708,7 +1689,7 @@ impl Daemon {
                 }
             }
         }
-        let res = res.unwrap_or_else(|| self.switch_route(vm, via));
+        let res = res.unwrap_or_else(|| self.switch_route(vm, gen, via));
         if let Err(e) = &res {
             eprintln!("route {ip} via {via}: {e}; retrying");
             let d = self.clone();
@@ -1721,7 +1702,7 @@ impl Daemon {
                     if d.vms.lock().unwrap().values().any(|v| v.ip == ip && v.state().local()) {
                         return;
                     }
-                    match d.switch_route(&vm, via) {
+                    match d.switch_route(&vm, gen, via) {
                         Ok(()) => return eprintln!("route {ip} via {via}: done"),
                         Err(e) => eprintln!("route {ip} via {via}: {e}"),
                     }
@@ -1789,13 +1770,16 @@ impl Daemon {
     /// belongs to a newer VM here by now. Serialized with address claims, so
     /// a VM claiming it later routes it to itself after this; `vm` leaves the
     /// map and the claims together (`release`, `kill_reserved`), so a claim
-    /// without it in the map is a newer VM's.
-    fn switch_route(&self, vm: &Arc<Vm>, via: Ipv4Addr) -> Result<()> {
-        let lock = self.addr_lock(vm.ip);
-        let _route = lock.lock().unwrap();
+    /// without it in the map is a newer VM's. Nor if `vm`'s generation `gen`
+    /// was withdrawn (killed at the target) or a newer one seen meanwhile.
+    fn switch_route(&self, vm: &Arc<Vm>, gen: u64, via: Ipv4Addr) -> Result<()> {
+        let _route = self.addr_lock(vm.ip).lock().unwrap();
         let addrs = self.addrs.lock().unwrap();
         let ours = self.vms.lock().unwrap().values().any(|v| Arc::ptr_eq(v, vm));
         if !ours && addrs.used.contains_key(&vm.ip) {
+            return Ok(());
+        }
+        if !self.gens.lock().unwrap().current(vm.ip, gen) {
             return Ok(());
         }
         self.route_via(vm.ip, via)
@@ -2050,9 +2034,6 @@ impl Daemon {
         // check that can still abort the migration has passed (the source
         // would then resume an older state of a VM that ran on).
         let load = if paused { crate::vm::Load::Paused } else { crate::vm::Load::PausedUnheld };
-        // Loading routes the address to the VM's tap.
-        let lock = self.addr_lock(ip);
-        let route = lock.lock().unwrap();
         let restored = match prepared.load(&name, &vmstate, ip, load, true, Some(deadline), t) {
             // Once more on a fresh Firecracker (see `Retry`): the failed load
             // never ran the guest, nothing is committed, and the source,
@@ -2074,7 +2055,6 @@ impl Daemon {
             })(),
             r => r,
         };
-        drop(route);
         let probed = probe.map_or(Ok(()), |p| p.join().unwrap_or_else(|_| Err(std::io::Error::other("probe panicked"))));
         let (vm, restore) = restored?;
         let checked = match (probed, vm.pager.failed()) {
@@ -2088,10 +2068,21 @@ impl Daemon {
                 // the source never resumes its copy. Or none of it happens.
                 // (An aborted claim rolls back, taking the address lock, only
                 // once these are released.)
+                // Its generation is checked once more under the address's
+                // lock: it may have been withdrawn, or a newer one seen, since
+                // the claim.
+                let _route = self.addr_lock(ip).lock().unwrap();
                 let mut addrs = self.addrs.lock().unwrap();
                 let mut vms = self.vms.lock().unwrap();
                 let late = Instant::now() >= deadline;
                 let closing = self.closing.load(Ordering::SeqCst);
+                let stale = claim.gen != LEGACY_GEN && !self.gens.lock().unwrap().current(ip, claim.gen);
+                if stale {
+                    let gen = claim.gen;
+                    drop((vms, addrs));
+                    drop(claim);
+                    return Err(format!("generation {gen} of {ip} was withdrawn or superseded meanwhile").into());
+                }
                 if !late && !closing {
                     vms.insert(name.clone(), vm.clone());
                     claim.commit_with(&mut addrs);
@@ -2602,10 +2593,6 @@ fn migration_id() -> u64 {
 }
 
 
-/// The addresses listed under `key` in a peer's `info`.
-fn info_ips<'a>(info: &'a Value, key: &str) -> impl Iterator<Item = Ipv4Addr> + 'a {
-    info[key].as_array().into_iter().flatten().filter_map(|v| v.as_str()?.parse().ok())
-}
 
 fn peer_info(peer: &str) -> Result<Value> {
     peer_call(peer, json!({"op": "info"}))
@@ -2695,7 +2682,7 @@ const LENT_FILE: &str = "lent-ips.json";
 const LEGACY_GEN: u64 = 0;
 
 /// Where a daemon keeps address generations, in its state directory.
-const GENS_FILE: &str = "addr-gens.json";
+const GENS_DIR: &str = "gens";
 /// Generations reserved on disk at a time, so handing one out rarely writes.
 const GEN_BLOCK: u64 = 1024;
 
@@ -2707,82 +2694,104 @@ struct Seen {
     withdrawn: bool,
 }
 
-#[derive(Default, serde::Serialize, serde::Deserialize)]
-struct GensFile {
-    /// Every generation this host hands out is below this.
-    reserved: u64,
-    seen: HashMap<Ipv4Addr, Seen>,
-}
-
 /// Address generations: they order the VMs that have had an address.
 ///
-/// The address's home host (whose `--vm-ips` holds it) gives out a new,
-/// higher generation every time a VM gets the address (run, restore; a
-/// peer starting a VM with it asks the home host, op `gen`). A VM keeps its
+/// Only the address's home host (whose `--vm-ips` holds it) hands it to a
+/// new VM (run, restore), each time with a higher generation. A VM keeps its
 /// generation through migrations and suspends. Route announcements and
 /// withdrawals carry it, and every host keeps the newest generation it has
 /// seen for each address: a message about an older one, or an announcement
 /// of one already withdrawn, is stale and ignored. So a late withdrawal can
 /// neither remove a newer VM's route nor free its loan, and a late
-/// announcement cannot bring back a route for a VM that is gone. Persisted:
-/// what was seen, and a high-water mark of the generations handed out.
+/// announcement cannot bring back a route for a VM that is gone.
+///
+/// Persisted in `STATE_DIR/gens/`: a high-water mark of the generations
+/// handed out (`reserved`, raised `GEN_BLOCK` at a time, so a restart never
+/// repeats one), and one small file per address with what was seen, written
+/// under that address's lock only (`Daemon::record_gen`).
 struct Gens {
     next: u64,
     reserved: u64,
     seen: HashMap<Ipv4Addr, Seen>,
-    file: PathBuf,
+    dir: PathBuf,
 }
 
 impl Gens {
-    fn load(file: PathBuf) -> Result<Gens> {
-        let f: GensFile = match std::fs::read(&file) {
-            Ok(b) => serde_json::from_slice(&b).map_err(|e| format!("{}: {e}", file.display()))?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => GensFile::default(),
-            Err(e) => bail!("{}: {e}", file.display()),
-        };
+    fn load(dir: PathBuf) -> Result<Gens> {
+        lifecycle::create_dir_durably(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let mut reserved = 0;
+        let mut seen = HashMap::new();
+        for e in std::fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))? {
+            let e = e?;
+            let name = e.file_name().to_string_lossy().into_owned();
+            let text = || std::fs::read_to_string(e.path()).map_err(|err| format!("{}: {err}", e.path().display()));
+            let bad = || format!("{}: unreadable", e.path().display());
+            if name == "reserved" {
+                reserved = text()?.trim().parse().map_err(|_| bad())?;
+            } else if let Ok(ip) = name.parse::<Ipv4Addr>() {
+                let t = text()?;
+                let (gen, withdrawn) = t.trim().split_once(' ').ok_or_else(bad)?;
+                seen.insert(ip, Seen { gen: gen.parse().map_err(|_| bad())?, withdrawn: withdrawn == "withdrawn" });
+            }
+        }
         // What was handed out before a crash is below `reserved`.
-        Ok(Gens { next: f.reserved.max(1), reserved: f.reserved, seen: f.seen, file })
+        Ok(Gens { next: reserved.max(1), reserved, seen, dir })
     }
 
-    /// A new generation for `ip`, newer than any seen for it here.
+    /// A new generation for `ip`, newer than any seen for it here. Not
+    /// recorded as seen on disk: any later one is newer anyway.
     fn assign(&mut self, ip: Ipv4Addr) -> Result<u64> {
         let gen = self.next.max(self.seen.get(&ip).map_or(0, |s| s.gen) + 1);
         if gen >= self.reserved {
-            let before = self.reserved;
+            write_durably(&self.dir, "reserved", &(gen + GEN_BLOCK).to_string())
+                .map_err(|e| format!("cannot record address generations in {}: {e}", self.dir.display()))?;
             self.reserved = gen + GEN_BLOCK;
-            if let Err(e) = self.save() {
-                self.reserved = before;
-                bail!("cannot record address generations in {}: {e}", self.file.display());
-            }
         }
         self.next = gen + 1;
         self.seen.insert(ip, Seen { gen, withdrawn: false });
         Ok(gen)
     }
 
-    /// Takes in a message about generation `gen` of `ip` (an announcement,
-    /// or a withdrawal), unless it is stale. Returns whether it is not.
-    fn observe(&mut self, ip: Ipv4Addr, gen: u64, withdrawn: bool) -> bool {
-        let fresh = match self.seen.get(&ip) {
-            None => true,
-            Some(s) => gen > s.gen || (gen == s.gen && (withdrawn || !s.withdrawn)),
-        };
-        if fresh {
-            self.seen.insert(ip, Seen { gen, withdrawn });
+    /// What a message about generation `gen` of `ip` (an announcement, or
+    /// `withdrawn`) means: None if stale, else what it changes (if anything).
+    fn judge(&self, ip: Ipv4Addr, gen: u64, withdrawn: bool) -> Option<Option<Seen>> {
+        let new = Seen { gen, withdrawn };
+        match self.seen.get(&ip) {
+            None => Some(Some(new)),
+            Some(s) if *s == new => Some(None),
+            Some(s) if gen > s.gen || (gen == s.gen && withdrawn) => Some(Some(new)),
+            Some(_) => None,
         }
-        fresh
     }
 
-    /// Writes everything atomically and durably.
-    fn save(&self) -> std::io::Result<()> {
-        let f = GensFile { reserved: self.reserved, seen: self.seen.clone() };
-        let tmp = self.file.with_extension("tmp");
-        let mut out = std::fs::File::create(&tmp)?;
-        out.write_all(&serde_json::to_vec(&f)?)?;
-        out.sync_all()?;
-        std::fs::rename(&tmp, &self.file)?;
-        std::fs::File::open(self.file.parent().unwrap_or(Path::new(".")))?.sync_all()
+    /// Whether generation `gen` of `ip` may still be live: none newer, and
+    /// it was not withdrawn.
+    fn current(&self, ip: Ipv4Addr, gen: u64) -> bool {
+        self.judge(ip, gen, false).is_some()
     }
+
+    /// Takes in `seen` (judged and recorded on disk), unless something newer
+    /// came in meanwhile.
+    fn apply(&mut self, ip: Ipv4Addr, seen: Seen) {
+        if self.seen.get(&ip).is_none_or(|s| (seen.gen, seen.withdrawn) >= (s.gen, s.withdrawn)) {
+            self.seen.insert(ip, seen);
+        }
+    }
+}
+
+/// Records what was seen of `ip` in its file under `dir` (see `Gens`).
+fn persist_seen(dir: &Path, ip: Ipv4Addr, s: Seen) -> std::io::Result<()> {
+    write_durably(dir, &ip.to_string(), &format!("{} {}", s.gen, if s.withdrawn { "withdrawn" } else { "live" }))
+}
+
+/// Replaces `dir/name` with `text`, atomically and durably.
+fn write_durably(dir: &Path, name: &str, text: &str) -> std::io::Result<()> {
+    let tmp = dir.join(format!(".{name}.tmp"));
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(text.as_bytes())?;
+    f.sync_all()?;
+    std::fs::rename(&tmp, dir.join(name))?;
+    std::fs::File::open(dir)?.sync_all()
 }
 
 /// The addresses this host is responsible for. One lock covers both maps, so
@@ -3127,9 +3136,20 @@ mod tests {
 
     #[test]
     fn generations_order_messages_and_survive_restarts() {
+        // `Daemon::record_gen` without the daemon.
+        fn obs(g: &mut Gens, ip: Ipv4Addr, gen: u64, withdrawn: bool) -> bool {
+            match g.judge(ip, gen, withdrawn) {
+                None => false,
+                Some(None) => true,
+                Some(Some(s)) => {
+                    persist_seen(&g.dir, ip, s).unwrap();
+                    g.apply(ip, s);
+                    true
+                }
+            }
+        }
         let dir = std::env::temp_dir().join(format!("flexvm-gens-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join(GENS_FILE);
+        let file = dir.join(GENS_DIR);
         let (a, b): (Ipv4Addr, Ipv4Addr) = ("10.0.0.2".parse().unwrap(), "10.0.0.3".parse().unwrap());
         let mut g = Gens::load(file.clone()).unwrap();
         let g1 = g.assign(a).unwrap();
@@ -3137,17 +3157,17 @@ mod tests {
         assert!(g2 > g1 && g.assign(b).unwrap() > g2);
         // A late withdrawal or announcement of g1 is stale; g2's withdrawal
         // is not, and blocks a late announcement of g2.
-        assert!(!g.observe(a, g1, true) && !g.observe(a, g1, false));
-        assert!(g.observe(a, g2, true) && g.observe(a, g2, true) && !g.observe(a, g2, false));
+        assert!(!obs(&mut g, a, g1, true) && !obs(&mut g, a, g1, false));
+        assert!(obs(&mut g, a, g2, true) && obs(&mut g, a, g2, true) && !obs(&mut g, a, g2, false));
+        assert!(!g.current(a, g2) && !g.current(a, g1));
         // A message without a generation is older than any.
-        assert!(!g.observe(a, LEGACY_GEN, true));
-        g.save().unwrap();
+        assert!(!obs(&mut g, a, LEGACY_GEN, true));
         // After a restart: what was seen holds, and new generations are newer
-        // than any handed out before (even unsaved ones).
+        // than any handed out before (even ones never recorded as seen).
         let mut g = Gens::load(file.clone()).unwrap();
-        assert!(!g.observe(a, g2, false));
+        assert!(!obs(&mut g, a, g2, false));
         let g3 = g.assign(a).unwrap();
-        assert!(g3 > g2 && g.observe(a, g3, false));
+        assert!(g3 > g2 && obs(&mut g, a, g3, false) && g.current(a, g3));
         let mut other = Gens::load(file.clone()).unwrap();
         assert!(other.assign(b).unwrap() > g3);
         let _ = std::fs::remove_dir_all(&dir);

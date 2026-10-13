@@ -731,8 +731,10 @@ def fv_hash(b):
 
 
 def checkpoint_restore():
-    """checkpoint --stop on A, restore on B: file contents, a running
-    process, the address and an open TCP connection all survive."""
+    """checkpoint --stop on A, restore with its own address: B refuses it
+    (only an address's home host hands it out), A restores it, and file
+    contents, a running process, the address and an open TCP connection all
+    survive. (Other scenarios restore on B at a new address.)"""
     n, path = "ft-ckpt", ckpt_path("ft-ckpt")
     m = setup(n)
     proc_before = marker(A, n)
@@ -745,18 +747,20 @@ def checkpoint_restore():
     leftovers = [f for f in os.listdir(args.ckpt_dir) if f.startswith(".flexvm-staging-")]
     check("checkpoint: published, no partial left", os.path.exists(os.path.join(path, "manifest.json")) and not leftovers, leftovers)
     check("checkpoint --stop: gone from A", n not in vms(A), vms(A).get(n))
-    r = ok(B, {"op": "restore", "dir": path})
+    r = rpc(B, {"op": "restore", "dir": path})
+    check("restore: another host refuses the address", not r["ok"] and "not this host's" in r.get("error", "") and "--ip auto" in r.get("error", ""), r)
+    r = ok(A, {"op": "restore", "dir": path})
     print(f"restore: ready in {r['ready_ms']} ms (snapshot load {r['restore_ms']} ms), clock was {r['clock_offset_ms']} ms off; {r['timings_ms']}")
-    check("restore: same address", r["ip"] == ip and sh(B, n, "ip -4 -o addr show eth0")[1].count(ip) == 1, r["ip"])
+    check("restore: same address", r["ip"] == ip and sh(A, n, "ip -4 -o addr show eth0")[1].count(ip) == 1, r["ip"])
     check("restore: TCP connection survived", echo(conn, b"after\n"))
     conn.close()
     with socket.create_connection((ip, 7000), timeout=10) as c2:
         check("restore: new TCP connection", echo(c2, b"new\n"))
-    check("restore: md5 intact", md5(B, n) == m)
-    check("restore: process survived (pid, start time)", marker_id(B, n) == proc_before, (proc_before, marker_id(B, n)))
-    err = guest_clock_error(B, n)
+    check("restore: md5 intact", md5(A, n) == m)
+    check("restore: process survived (pid, start time)", marker_id(A, n) == proc_before, (proc_before, marker_id(A, n)))
+    err = guest_clock_error(A, n)
     check("restore: guest clock right", err is not None and abs(err) < 0.5, err)
-    check("restore: whole checkpoint paged in", wait_for(lambda: vms(B)[n]["pages_mib"]["remote"] == 0, 30), vms(B)[n]["pages_mib"])
+    check("restore: whole checkpoint paged in", wait_for(lambda: vms(A)[n]["pages_mib"]["remote"] == 0, 30), vms(A)[n]["pages_mib"])
     cleanup(n)
     rm_ckpt(path)
 
@@ -774,7 +778,7 @@ def checkpoint_fork():
     code, _ = sh(A, n, "echo changed >> /tmp/f")
     check("fork: A keeps working", code == 0 and md5(A, n) != m)
     taken = rpc(B, {"op": "restore", "dir": path, "name": "ft-fork2"})
-    check("fork: restore refuses an address in use on a peer", not taken["ok"] and "in use" in taken["error"], taken)
+    check("fork: restore refuses another host's address", not taken["ok"] and "not this host's" in taken["error"], taken)
     r = ok(B, {"op": "restore", "dir": path, "name": "ft-fork2", "ip": "auto"})
     ip = r["ip"]
     code, out = sh(B, "ft-fork2", "ip -4 -o addr show eth0")
@@ -803,11 +807,11 @@ def checkpoint_corrupt():
         subprocess.run(["sudo", "cp", "-a", pristine, path], check=True)
 
     poke("vmstate", 100)
-    r = rpc(B, {"op": "restore", "dir": path})
+    r = rpc(A, {"op": "restore", "dir": path})
     check("corrupt vmstate: refused", not r["ok"] and "checksum" in r["error"], r)
     reset()
     poke("manifest.json", 40)
-    r = rpc(B, {"op": "restore", "dir": path})
+    r = rpc(A, {"op": "restore", "dir": path})
     check("corrupt manifest: refused", not r["ok"] and "invalid" in r["error"], r)
     reset()
     text = subprocess.run(["sudo", "cat", f"{path}/manifest.json"], capture_output=True, check=True).stdout
@@ -816,14 +820,14 @@ def checkpoint_corrupt():
     forged = json.dumps(body).encode()
     subprocess.run(["sudo", "tee", f"{path}/manifest.json"], input=fv_hash(forged).encode() + b"\n" + forged,
                    stdout=subprocess.DEVNULL, check=True)
-    r = rpc(B, {"op": "restore", "dir": path})
+    r = rpc(A, {"op": "restore", "dir": path})
     check("other template id: refused", not r["ok"] and "id mismatch" in r["error"], r)
     reset()
     poke("pages", 50 * 1024 * 1024)
-    r = rpc(B, {"op": "restore", "dir": path})
-    st = lambda: vms(B).get(n, {}).get("state")
+    r = rpc(A, {"op": "restore", "dir": path})
+    st = lambda: vms(A).get(n, {}).get("state")
     check("corrupt page data: VM fails, never runs on", (not r["ok"]) or wait_for(lambda: st() == "failed", 30), (r, st()))
-    rpc(B, {"op": "kill", "name": n})
+    rpc(A, {"op": "kill", "name": n})
     rm_ckpt(path)
     rm_ckpt(pristine)
 
@@ -889,8 +893,8 @@ def checkpoint_crash():
     ok(A, {"op": "checkpoint", "name": n, "dir": path, "stop": True})
     left = [f for f in os.listdir(args.ckpt_dir) if f.startswith(".flexvm-staging-")]
     check("crash: next checkpoint cleared the debris", not left, left)
-    ok(B, {"op": "restore", "dir": path})
-    check("crash: next checkpoint restores", md5(B, n) == m)
+    ok(A, {"op": "restore", "dir": path})
+    check("crash: next checkpoint restores", md5(A, n) == m)
     cleanup(n)
     rm_ckpt(path)
 
@@ -977,24 +981,24 @@ def held_restore_frozen():
     ok(A, {"op": "checkpoint", "name": n, "dir": path, "stop": True})
 
     def held(no_hold):
-        fault(B, "restore_no_hold", 600000 if no_hold else 0)
-        r = ok(B, {"op": "restore", "dir": path, "paused": True})
-        fault(B, "restore_no_hold", 0)
-        check(f"held{'(no hold)' if no_hold else ''}: restored paused", r["state"] == "paused" and vms(B)[n]["state"] == "paused", r)
-        wait_for(lambda: ok(B, {"op": "memhash", "name": n})["remote"] == 0, 30)
-        ip = vm_ip(B, n)
-        h0, f0 = ok(B, {"op": "memhash", "name": n}), tap_frames(B, n)
+        fault(A, "restore_no_hold", 600000 if no_hold else 0)
+        r = ok(A, {"op": "restore", "dir": path, "paused": True})
+        fault(A, "restore_no_hold", 0)
+        check(f"held{'(no hold)' if no_hold else ''}: restored paused", r["state"] == "paused" and vms(A)[n]["state"] == "paused", r)
+        wait_for(lambda: ok(A, {"op": "memhash", "name": n})["remote"] == 0, 30)
+        ip = vm_ip(A, n)
+        h0, f0 = ok(A, {"op": "memhash", "name": n}), tap_frames(A, n)
         # Pending host activity: frames on the tap, a vsock connection, and
         # the balloon statistics timer (every second).
         conn = subprocess.Popen(["sudo", "python3", "-c",
                                  "import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); "
                                  "s.sendall(b'CONNECT 52\\nPING\\n'); s.settimeout(30); d=b''\nwhile b'pong' not in d:\n c=s.recv(200)\n if not c: break\n d+=c\nprint(d)",
-                                 vsock_path(B, n)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+                                 vsock_path(A, n)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
         udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         for _ in range(30):
             udp.sendto(b"x" * 64, (ip, 9))
             time.sleep(0.1)
-        h1, f1 = ok(B, {"op": "memhash", "name": n}), tap_frames(B, n)
+        h1, f1 = ok(A, {"op": "memhash", "name": n}), tap_frames(A, n)
         return h0, h1, f0, f1, conn
 
     h0, h1, f0, f1, conn = held(False)
@@ -1002,14 +1006,14 @@ def held_restore_frozen():
     check("held: no frames moved", f0 == f1, (f0, f1))
     check("held: vsock connection waits", conn.poll() is None)
     t = time.time()
-    ok(B, {"op": "resume", "name": n})
+    ok(A, {"op": "resume", "name": n})
     out, _ = conn.communicate(timeout=30)
     check("held: pending vsock connection answered after resume", "OK" in out and "pong" in out, out)
     time.sleep(0.5)
-    check("held: pending frames delivered after resume", tap_frames(B, n)[1] > f1[1], (f1, tap_frames(B, n)))
-    guest_healthy(B, n, "held after resume", m)
+    check("held: pending frames delivered after resume", tap_frames(A, n)[1] > f1[1], (f1, tap_frames(A, n)))
+    guest_healthy(A, n, "held after resume", m)
     print(f"held: resumed and answered within {time.time() - t:.2f} s")
-    rpc(B, {"op": "kill", "name": n})
+    rpc(A, {"op": "kill", "name": n})
     # Held at a new address: the guest takes it on resume (and only then).
     r = ok(B, {"op": "restore", "dir": path, "paused": True, "ip": "auto"})
     refused = rpc(B, {"op": "checkpoint", "name": n, "dir": path + "-x"})
@@ -1022,7 +1026,7 @@ def held_restore_frozen():
     h0, h1, f0, f1, conn = held(True)
     check("no hold (control): the same activity changes guest memory", h0 != h1 or f0 != f1, (h0, h1, f0, f1))
     conn.kill()
-    rpc(B, {"op": "kill", "name": n})
+    rpc(A, {"op": "kill", "name": n})
     rm_ckpt(path)
 
 
@@ -1059,8 +1063,8 @@ def checkpoint_hotplug():
     text = subprocess.run(["sudo", "cat", f"{path}/manifest.json"], capture_output=True).stdout
     plugged = json.loads(text.split(b"\n", 1)[1])["hotplug_mib"]
     check("hotplug: saved with the resize done", plugged == want, (plugged, want))
-    ok(B, {"op": "restore", "dir": path})
-    check("hotplug: restores intact", md5(B, n) == m)
+    ok(A, {"op": "restore", "dir": path})
+    check("hotplug: restores intact", md5(A, n) == m)
     cleanup(n)
     rm_ckpt(path)
 
@@ -1077,11 +1081,11 @@ def checkpoint_untrusted_dir():
     check("untrusted dir: no staging left behind", not left, left)
     os.rename(f"{path}/vmstate", f"{path}/vmstate.real")
     os.symlink(f"{path}/vmstate.real", f"{path}/vmstate")
-    r = rpc(B, {"op": "restore", "dir": path})
+    r = rpc(A, {"op": "restore", "dir": path})
     check("untrusted dir: restore refuses a symlinked file", not r["ok"] and "vmstate" in r["error"], r)
     os.unlink(f"{path}/vmstate")
     os.rename(f"{path}/vmstate.real", f"{path}/vmstate")
-    r = rpc(B, {"op": "restore", "dir": path})
+    r = rpc(A, {"op": "restore", "dir": path})
     check("untrusted dir: restores once it is a plain file again", r["ok"], r)
     cleanup(n)
     rm_ckpt(path)
@@ -1763,9 +1767,11 @@ def nothing_left(label, name, ip):
     """B holds neither the name nor the address after an abandoned migration."""
     check(f"{label}: name free on B", wait_for(lambda: name not in vms(B), 10), vms(B).get(name))
     check(f"{label}: address free on B", wait_for(lambda: ip not in ok(B, {"op": "info"})["ips"], 10))
-    r = rpc(B, {"op": "run", "name": name, "template": args.template, "ip": ip})
-    check(f"{label}: name and address usable on B", r["ok"], r)
-    rpc(B, {"op": "kill", "name": name})
+    # Not B's to hand out, but another migration may bring it.
+    s, r, _ = migrate_in_raw(B, name, ip, template_id())
+    check(f"{label}: name and address usable on B", r.get("ok"), r)
+    s.close()
+    check(f"{label}: and free again", wait_for(lambda: ip not in ok(B, {"op": "info"})["ips"] and name not in vms(B), 10))
 
 
 def source_vm():
@@ -2187,17 +2193,21 @@ def forged_peer():
 
 
 def restore_ip_peer():
-    """restore --ip, and run --ip, refuse an address a peer's VM holds."""
+    """restore --ip and run --ip refuse an address that is not the host's to
+    hand out (a peer's live one, or one from no host's range), naming its
+    home host."""
     n, path = "ft-rip", ckpt_path("ft-rip")
     ok(A, {"op": "run", "name": n, "template": args.template})
     ok(A, {"op": "checkpoint", "name": n, "dir": path})
     ok(B, {"op": "run", "name": "ft-rip-b", "template": args.template})
     theirs = vms(B)["ft-rip-b"]["ip"]
     r = rpc(A, {"op": "restore", "dir": path, "name": "ft-rip2", "ip": theirs})
-    check("restore --ip: a peer's live address is refused", not r["ok"] and "in use on" in r.get("error", ""), r)
+    check("restore --ip: a peer's live address is refused", not r["ok"] and "not this host's" in r.get("error", "") and B in r.get("error", ""), r)
     check("restore --ip: nothing restored", "ft-rip2" not in vms(A) and theirs not in ok(A, {"op": "info"})["ips"])
     r = rpc(A, {"op": "run", "name": "ft-rip3", "template": args.template, "ip": theirs})
-    check("run --ip: a peer's live address is refused", not r["ok"] and "in use on" in r.get("error", ""), r)
+    check("run --ip: a peer's live address is refused", not r["ok"] and "not this host's" in r.get("error", ""), r)
+    r = rpc(A, {"op": "run", "name": "ft-rip3", "template": args.template, "ip": "10.250.0.5"})
+    check("run --ip: an address from no host's range is refused", not r["ok"] and "not this host's" in r.get("error", ""), r)
     r = rpc(A, {"op": "restore", "dir": path, "name": "ft-rip2", "ip": "auto"})
     check("restore --ip auto still works", r["ok"], r)
     for x in (n, "ft-rip-b", "ft-rip2", "ft-rip3"):

@@ -152,6 +152,17 @@ impl Daemon {
             suspended.remove(name)
         };
         let Some(s) = s else { bail!("no vm named {name:?}") };
+        // Its address's generation must still be live (see `Gens`).
+        let ip = s.manifest.ip;
+        let stale = {
+            let _route = self.addr_lock(ip).lock().unwrap();
+            let gen = self.addrs.lock().unwrap().used.get(&ip).copied();
+            gen.is_some_and(|g| !self.gens.lock().unwrap().current(ip, g))
+        };
+        if stale {
+            self.suspended.lock().unwrap().insert(name.into(), s);
+            bail!("vm {name}: its address {ip}'s generation was withdrawn or superseded; it stays suspended");
+        }
         // The checkpoint stays where it is; `restore_checkpoint` marks it
         // STARTED, durably, before any vCPU runs, and a daemon restart
         // discards started checkpoints instead of bringing them back.
@@ -351,9 +362,7 @@ impl Daemon {
                 false => crate::vm::Load::Paused,
             };
             // Loaded paused: everything up to the resume below can fail
-            // without the VM having run. It routes the address to the tap.
-            let lock = self.addr_lock(ip);
-            let _route = lock.lock().unwrap();
+            // without the VM having run.
             // Load the bytes that were verified, from a file only root controls.
             Vm::restore_from(&self.pool, name, tpl, crate::vm::Snapshot::Bytes(&ck.vmstate), origin, ip, load, t)
         })()
@@ -731,23 +740,33 @@ impl Daemon {
             match Checkpoint::open(&e.path()) {
                 Ok(ck) => {
                     let ip = ck.manifest.ip;
-                    let mut addrs = self.addrs.lock().unwrap();
-                    match addrs.used.entry(ip) {
+                    // The generation it was suspended with, unchanged. One
+                    // withdrawn or superseded meanwhile (the VM's address went
+                    // on elsewhere), or none recorded where this host may not
+                    // hand the address out, is left alone: it is not brought
+                    // back.
+                    let gen = {
+                        let mut gens = self.gens.lock().unwrap();
+                        match read_gen(&e.path()) {
+                            Some(gen) if gens.current(ip, gen) => Ok(gen),
+                            Some(gen) => Err(format!("its address {ip}'s generation {gen} was withdrawn or superseded")),
+                            None if self.cfg.vm_ips.contains(ip) => Ok(gens.assign(ip)?),
+                            None => Err(format!("no generation recorded for its address {ip}, which is not this host's to hand out")),
+                        }
+                    };
+                    let gen = match gen {
+                        Ok(gen) => gen,
+                        Err(why) => {
+                            eprintln!("QUARANTINED suspended vm {name} in {}: {why}; not brought back (remove it by hand)", e.path().display());
+                            continue;
+                        }
+                    };
+                    match self.addrs.lock().unwrap().used.entry(ip) {
                         std::collections::hash_map::Entry::Occupied(_) => eprintln!("suspended vm {name}: {ip} is already taken"),
                         std::collections::hash_map::Entry::Vacant(v) => {
-                            // The generation it was suspended with, unchanged.
-                            let mut gens = self.gens.lock().unwrap();
-                            let gen = match read_gen(&e.path()) {
-                                Some(gen) => {
-                                    gens.observe(ip, gen, false);
-                                    gen
-                                }
-                                None => gens.assign(ip)?,
-                            };
                             v.insert(gen);
                         }
                     }
-                    drop(addrs);
                     eprintln!("suspended vm {name} ({}) found in {}", ck.manifest.ip, e.path().display());
                     self.suspended.lock().unwrap().insert(name, Suspended { dir: ck.dir, manifest: ck.manifest, quarantine: None });
                 }
