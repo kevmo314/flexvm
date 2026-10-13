@@ -8,6 +8,14 @@ KERNEL=${KERNEL:-vmlinux-6.1.155}
 ARCH=x86_64
 CI=https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/$CI_VERSION/$ARCH
 
+FC_URL=https://github.com/firecracker-microvm/firecracker/releases/download/$FC_VERSION/firecracker-$FC_VERSION-$ARCH.tgz
+
+# --urls: print what would be fetched, as `NAME URL` lines (CI keys its caches on them).
+if [ "${1:-}" = --urls ]; then
+  printf '%s %s\n' firecracker "$FC_URL" vmlinux "$CI/$KERNEL" base.squashfs "$CI/ubuntu-24.04.squashfs"
+  exit 0
+fi
+
 root=$(cd "$(dirname "$0")/.." && pwd)
 out=$root/artifacts
 mkdir -p "$out"
@@ -30,7 +38,7 @@ if [ ! -x firecracker ]; then
   echo "fetching firecracker $FC_VERSION"
   tmp=$(mktemp -d ./firecracker.XXXXXX)
   temps+=("$tmp")
-  curl -fsSL "https://github.com/firecracker-microvm/firecracker/releases/download/$FC_VERSION/firecracker-$FC_VERSION-$ARCH.tgz" | tar xz -C "$tmp"
+  curl -fsSL "$FC_URL" | tar xz -C "$tmp"
   mv "$tmp/release-$FC_VERSION-$ARCH/firecracker-$FC_VERSION-$ARCH" firecracker
 fi
 

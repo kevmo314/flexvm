@@ -677,6 +677,14 @@ LAN. `scripts/nettest.sh` builds a private copy of it (namespaces `fv5*`,
 forth under a TCP ping-pong and a sequence-numbered UDP stream, and fails on
 any lost datagram or a TCP stall over twice the downtime.
 
+`sudo scripts/e2e.py` is what CI (`.github/workflows/ci.yml`) runs on a
+GitHub-hosted runner with KVM: it builds a template and an image template,
+starts two hosts on loopback (ports 7140/7141, VM addresses 10.140.0.x and
+10.141.0.x, run directories `/run/fvci-*`), checks run, exec, ls, pause and
+resume, migration with an open TCP connection, checkpoint and restore,
+suspend and resume, and that kill and shutdown leave nothing behind, then runs
+a selection of `scripts/faults.py` scenarios against the same hosts.
+
 The daemon must run as root: it uses `/dev/kvm`, privileged userfaultfd,
 `process_vm_readv` on Firecracker and cgroup v2. Its taps, hold device and
 cgroups are named after its port (cgroups also after its listen address and
