@@ -6,6 +6,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -14,6 +17,8 @@ env:
   CARGO_TERM_COLOR: always
   # flexvm's own toolchain. Firecracker builds with the one its rust-toolchain.toml pins.
   RUST_TOOLCHAIN: "1.88.0"
+  # No FC_VERSION / CI_VERSION / KERNEL overrides are set here. fetch.sh --urls resolves
+  # them, and the cache keys below are built from its output, so setting one changes the keys.
 
 jobs:
   check:
@@ -21,12 +26,14 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-09
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: cargo fmt --check
         # The tree predates rustfmt; enforce once it has been formatted in one go.
         continue-on-error: true
@@ -47,7 +54,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Enable KVM
         run: |
@@ -65,28 +74,48 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y -q --no-install-recommends musl-tools libseccomp-dev squashfs-tools e2fsprogs
 
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-09
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: e2e
           cache-on-failure: true
 
-      # Patched Firecracker: rebuilt only when the patches or the build script change.
-      # Each artifact is saved right after it is built, so a failing test run still fills the cache.
+      # Cache keys: the build inputs in the repo, what fetch.sh resolves (versions and
+      # URLs, plus the ETags of the unversioned S3 objects), and the build environment
+      # (runner image; flexvm's toolchain for the rootfs; Firecracker's toolchain is
+      # pinned by its tag, which the URL list carries).
+      - name: Cache keys
+        id: keys
+        run: |
+          ./scripts/fetch.sh --urls > urls.txt
+          for f in vmlinux base.squashfs; do
+            url=$(awk -v f="$f" '$1 == f {print $2}' urls.txt)
+            etag=$(curl -sfI "$url" | tr -d '\r' | awk 'tolower($1) == "etag:" {print $2}')
+            test -n "$etag"
+            echo "$f-etag $etag" >> urls.txt
+          done
+          cat urls.txt
+          echo "env=$ImageOS-$ImageVersion" >> "$GITHUB_OUTPUT"
+          echo "fc=$(grep '^firecracker ' urls.txt | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+          echo "downloads=$(sha256sum urls.txt | cut -c1-16)" >> "$GITHUB_OUTPUT"
+          rm urls.txt
+
+      # Patched Firecracker: rebuilt only when its inputs change. Each artifact is saved
+      # right after it is built, so a failing test run still fills the cache.
       - name: Restore Firecracker
         id: fc-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: artifacts/firecracker
-          key: firecracker-${{ hashFiles('firecracker/*.patch', 'scripts/build-firecracker.sh') }}
+          key: firecracker-${{ steps.keys.outputs.env }}-${{ steps.keys.outputs.fc }}-${{ hashFiles('firecracker/*.patch', 'scripts/build-firecracker.sh') }}
       - name: Build Firecracker
         if: steps.fc-cache.outputs.cache-hit != 'true'
         run: ./scripts/build-firecracker.sh
       - name: Save Firecracker
         if: steps.fc-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: artifacts/firecracker
           key: ${{ steps.fc-cache.outputs.cache-primary-key }}
@@ -94,39 +123,43 @@ jobs:
       # Guest kernel and base root filesystem (fetch.sh skips the stock Firecracker: the patched one is there).
       - name: Restore downloads
         id: dl-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             artifacts/vmlinux
             artifacts/base.squashfs
-          key: downloads-${{ hashFiles('scripts/fetch.sh') }}
+          key: downloads-${{ steps.keys.outputs.downloads }}-${{ hashFiles('scripts/fetch.sh') }}
       - name: Fetch kernel and base rootfs
-        run: ./scripts/fetch.sh
+        run: |
+          ./scripts/fetch.sh
+          echo "base=$(sha256sum artifacts/base.squashfs | cut -c1-16)" >> "$GITHUB_OUTPUT"
+        id: fetch
       - name: Save downloads
         if: steps.dl-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             artifacts/vmlinux
             artifacts/base.squashfs
           key: ${{ steps.dl-cache.outputs.cache-primary-key }}
 
-      # Root filesystem with flexvm-init: rebuilt only when the guest agent or the image recipe changes.
+      # Root filesystem with flexvm-init: rebuilt when the guest agent, the image recipe,
+      # the base image (by checksum) or the build environment change.
       - name: Restore rootfs
         id: rootfs-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             artifacts/rootfs-*.ext4
             artifacts/rootfs.ext4
             artifacts/flexvm-init
-          key: rootfs-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('guest/**', 'scripts/build-rootfs.sh', 'scripts/fetch.sh', 'Cargo.lock', 'Cargo.toml') }}
+          key: rootfs-${{ steps.keys.outputs.env }}-rust${{ env.RUST_TOOLCHAIN }}-base${{ steps.fetch.outputs.base }}-${{ hashFiles('guest/**', 'scripts/build-rootfs.sh', 'Cargo.lock', 'Cargo.toml') }}
       - name: Build rootfs
         if: steps.rootfs-cache.outputs.cache-hit != 'true'
         run: ./scripts/build-rootfs.sh
       - name: Save rootfs
         if: steps.rootfs-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             artifacts/rootfs-*.ext4
@@ -143,11 +176,12 @@ jobs:
       - name: Collect logs
         if: failure()
         run: |
+          mkdir -p "$RUNNER_TEMP/e2e-logs"
           sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/e2e-logs" || true
           sudo dmesg | tail -200 > "$RUNNER_TEMP/e2e-logs/dmesg.txt" || true
       - name: Upload logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-logs
           path: ${{ runner.temp }}/e2e-logs

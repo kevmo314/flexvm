@@ -13,7 +13,7 @@ usage: sudo scripts/e2e.py [--bin FLEXVM] [--artifacts DIR] [--log-dir DIR]
                            [--image REF | --no-image] [--faults "SCENARIO ..."]
                            [CASE ...]
 """
-import argparse, glob, json, os, re, shlex, shutil, signal, socket, subprocess, sys, time, traceback
+import argparse, glob, hashlib, json, os, re, shutil, signal, socket, subprocess, sys, tempfile, time, traceback
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -67,41 +67,68 @@ def template(name, *extra, timeout=600):
     return flexvm("template", name, *extra, timeout=timeout).stdout
 
 
+def listener_inode(port):
+    """Inode of the socket listening on 127.0.0.1:port (or on any address), or None."""
+    for line in open("/proc/net/tcp").read().splitlines()[1:]:
+        f = line.split()
+        addr, lport = f[1].split(":")
+        if int(lport, 16) == port and f[3] == "0A" and addr in ("0100007F", "00000000"):
+            return f[9]
+    return None
+
+
+def owns_socket(pid, inode):
+    try:
+        return any(os.readlink(f"/proc/{pid}/fd/{fd}") == f"socket:[{inode}]" for fd in os.listdir(f"/proc/{pid}/fd"))
+    except OSError:
+        return False
+
+
 class Host:
     def __init__(self, label, port, peer_port, net):
         self.label, self.addr = label, f"127.0.0.1:{port}"
         self.peer = f"127.0.0.1:{peer_port}"
         self.port, self.net = port, net
-        self.run_dir = f"/run/fvci-{label}"
-        self.state_dir = f"/var/tmp/fvci-{label}-state"
+        # Inside this run's own fresh directories (see main); the daemon creates them.
+        self.run_dir = os.path.join(RUN, label)
+        self.state_dir = os.path.join(WORK, f"{label}-state")
         self.log = os.path.join(args.log_dir, f"daemon-{label}.log")
         self.proc = None
+        self.vms = set()  # names of the VMs this script created here or moved here
 
     # lifecycle of the host itself
     def start(self):
-        for d in (self.run_dir, self.state_dir):
-            shutil.rmtree(d, ignore_errors=True)
+        if listener_inode(self.port) is not None:
+            raise AssertionError(f"port {self.port} is in use; pick other ports with --port-a")
         cmd = [BIN, "--artifacts", ARTIFACTS, "daemon", "--listen", self.addr, "--peer", self.peer,
                "--run", self.run_dir, "--state-dir", self.state_dir, "--vm-ips", f"{self.net}.2-{self.net}.60",
                "--hot", "1", "--pool", "1", "--reserve", "256"]
         # FLEXVM_FAULTS lets scripts/faults.py inject failures; it changes nothing otherwise.
         self.proc = subprocess.Popen(cmd, stdout=open(self.log, "a"), stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                      env={**os.environ, "FLEXVM_FAULTS": "1"}, start_new_session=True)
+        # Up once our own child holds the listening socket and answers on it.
         deadline = time.time() + 30
-        while flexvm("--host", self.addr, "ls", check=False).returncode != 0:
+        while not (owns_socket(self.proc.pid, listener_inode(self.port))
+                   and flexvm("--host", self.addr, "ls", check=False).returncode == 0):
             if self.proc.poll() is not None or time.time() > deadline:
                 raise AssertionError(f"host {self.label} did not come up; see {self.log}")
             time.sleep(0.2)
 
     def stop(self, timeout=60):
-        if self.proc and self.proc.poll() is None:
-            self.proc.send_signal(signal.SIGTERM)
-            try:
-                self.proc.wait(timeout)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-                self.proc.wait()
-                raise AssertionError(f"host {self.label} did not stop within {timeout} s")
+        """SIGTERM and wait; raises if it died early, had to be killed or exited with an error."""
+        if not self.proc:
+            return
+        if self.proc.poll() is not None:
+            raise AssertionError(f"host {self.label} died early (exit {self.proc.returncode}); see {self.log}")
+        self.proc.send_signal(signal.SIGTERM)
+        try:
+            code = self.proc.wait(timeout)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait()
+            raise AssertionError(f"host {self.label} did not stop within {timeout} s; killed it")
+        if code != 0:
+            raise AssertionError(f"host {self.label} exited {code} on SIGTERM; see {self.log}")
 
     def cli(self, *argv, **kw):
         return flexvm("--host", self.addr, *argv, **kw)
@@ -110,6 +137,7 @@ class Host:
     def run(self, vm, template=None, ip=None):
         """Starts a VM; returns its address."""
         extra = (["--template", template or args.template]) + (["--ip", ip] if ip else [])
+        self.vms.add(vm)
         return json.loads(self.cli("run", vm, *extra).stdout)["ip"]
 
     def exec(self, vm, cmd, timeout=120):
@@ -140,9 +168,12 @@ class Host:
 
     def restore(self, path, name=None, ip=None):
         extra = (["--name", name] if name else []) + (["--ip", ip] if ip else [])
-        return json.loads(self.cli("restore", path, *extra).stdout)
+        r = json.loads(self.cli("restore", path, *extra).stdout)
+        self.vms.add(r["name"])
+        return r
 
     def migrate(self, vm, to):
+        to.vms.add(vm)
         return json.loads(self.cli("migrate", vm, "--to", to.addr).stdout)
 
     def logs(self, vm):
@@ -237,8 +268,10 @@ def md5(host, vm):
 
 def marker(host, vm):
     """Starts a guest process counting up in /tmp/count; returns (pid, start time)."""
-    must(host, vm, "setsid sh -c 'i=0; while :; do i=$((i+1)); echo $i > /tmp/count; sleep 0.05; done' "
-                   ">/dev/null 2>&1 </dev/null & echo $! > /tmp/marker.pid")
+    # Written to a temporary file and renamed, so a read never sees it empty or half written.
+    must(host, vm, "rm -f /tmp/count; setsid sh -c 'i=0; while :; do i=$((i+1)); echo $i > /tmp/count.new; "
+                   "mv /tmp/count.new /tmp/count; sleep 0.05; done' >/dev/null 2>&1 </dev/null & echo $! > /tmp/marker.pid; "
+                   "for i in $(seq 100); do [ -s /tmp/count ] && exit 0; sleep 0.05; done; exit 1")
     return marker_id(host, vm)
 
 
@@ -256,9 +289,17 @@ def clock_error(host, vm):
     return float(out) - (before + time.time()) / 2
 
 
-def echo_server(host, vm, port=7000):
+def echo_server(host, vm, ip, port=7000):
+    """Starts a TCP echo server in the guest; returns once it echoes for the host."""
     must(host, vm, f"setsid socat TCP-LISTEN:{port},fork,reuseaddr EXEC:cat >/dev/null 2>&1 </dev/null &")
-    time.sleep(0.3)
+
+    def up():
+        try:
+            with socket.create_connection((ip, port), timeout=1) as s:
+                return echo(s, b"ping\n")
+        except OSError:
+            return False
+    assert wait_for(up, 10), f"echo server in {vm} not reachable on {ip}:{port}"
 
 
 def echo(conn, msg):
@@ -273,20 +314,14 @@ def echo(conn, msg):
 
 
 def where(vm):
-    return {h.label: h.ls()[vm]["state"] for h in (A, B) if vm in h.ls()}
-
-
-def gone(vm):
-    return wait_for(lambda: where(vm) == {}, 30)
-
-
-CKPT = "/var/tmp/fvci-ckpt"
+    return {h.label: ls[vm]["state"] for h in (A, B) for ls in [h.ls()] if vm in ls}
 
 
 def ckpt_dir(label):
-    os.makedirs(CKPT, exist_ok=True)
-    path = os.path.join(CKPT, label)
-    shutil.rmtree(path, ignore_errors=True)
+    """A path for a new checkpoint, inside this run's own work directory."""
+    os.makedirs(os.path.join(WORK, "ckpt"), exist_ok=True)
+    path = os.path.join(WORK, "ckpt", label)
+    assert not os.path.exists(path), path
     return path
 
 
@@ -322,11 +357,17 @@ def run_exec_ls():
     check("exec: stdout", out == "to-stdout\n", repr(out))
     check("exec: stderr", err == "to-stderr\n", repr(err))
     check("exec: exit status", code == 7, code)
-    code, out, _ = A.exec(vm, "head -c 3000000 /dev/zero | tr '\\0' x | wc -c")
-    check("exec: pipeline in the guest", code == 0 and out.strip() == "3000000", out)
-    code, out, _ = A.exec(vm, "seq 1 200000 | md5sum")
-    want = subprocess.run("seq 1 200000 | md5sum", shell=True, capture_output=True, text=True).stdout
-    check("exec: 1.2 MB of output intact", code == 0 and out == want, out)
+    # Multi-MB output streamed whole through exec and checked on the host.
+    code, out, err = A.exec(vm, "head -c 3000000 /dev/zero | tr '\\0' x")
+    check("exec: 3 MB of pipeline output, all of it", code == 0 and out == "x" * 3000000,
+          (code, len(out), err[-200:]))
+    want = subprocess.run(["seq", "1", "800000"], capture_output=True, text=True).stdout
+    sha = lambda b: hashlib.sha256(b.encode()).hexdigest()
+    code, out, err = A.exec(vm, "seq 1 800000")
+    check(f"exec: {len(want) / 1e6:.1f} MB of stdout intact", code == 0 and sha(out) == sha(want),
+          (code, len(out), len(want), err[-200:]))
+    code, out, err = A.exec(vm, "seq 1 800000 >&2")
+    check("exec: the same on stderr", code == 0 and out == "" and sha(err) == sha(want), (code, len(out), len(err)))
     check("exec: guest has its address on eth0", ip in must(A, vm, "ip -4 -o addr show eth0"))
     check("exec: unknown vm fails", A.exec("e2e-no-such-vm", "true")[0] != 0)
     A.kill(vm)
@@ -338,13 +379,20 @@ def pause_resume():
     vm = "e2e-pause"
     A.run(vm)
     proc = marker(A, vm)
+    paused_s = 4
+    c0, t0 = count(A, vm), time.time()
     A.pause(vm)
     check("pause: ls says paused", A.ls()[vm]["state"] == "paused", A.ls()[vm])
-    time.sleep(3)
+    time.sleep(paused_s)
     r = A.resume(vm)
     check("resume: ls says running", A.ls()[vm]["state"] == "running", A.ls()[vm])
     print(f"  resume: {r.get('resume_ms')} ms")
-    c1 = count(A, vm)
+    c1, t1 = count(A, vm), time.time()
+    # The counter ticks at most every 50 ms. Had the guest run through the pause it would
+    # have gained ~paused_s / 0.05; paused, only what the reads and RPCs around it took.
+    print(f"  counter +{c1 - c0} over {t1 - t0:.1f} s with {paused_s} s paused")
+    check("pause: guest stopped while paused", c1 - c0 < (t1 - t0 - paused_s) / 0.05 + paused_s / 0.05 / 2,
+          (c0, c1, round(t1 - t0, 2)))
     time.sleep(0.5)
     c2 = count(A, vm)
     check("resume: guest process continues", c2 > c1, (c1, c2))
@@ -361,7 +409,7 @@ def migrate():
     ip = A.run(vm)
     m = fill(A, vm)
     proc = marker(A, vm)
-    echo_server(A, vm)
+    echo_server(A, vm, ip)
     conn = socket.create_connection((ip, 7000), timeout=10)
     check("tcp echo before", echo(conn, b"before\n"))
     for src, dst in ((A, B), (B, A)):
@@ -419,14 +467,15 @@ def checkpoint_restore():
 def suspend_resume():
     """suspend frees the VM's Firecracker; resume brings back process and RAM."""
     vm = "e2e-suspend"
-    A.run(vm)
+    ip = A.run(vm)
     m = fill(A, vm)
     proc = marker(A, vm)
-    before = set(A.firecrackers())
+    res = vm_resources(ip)
+    check("found the VM's Firecracker", res["pid"] in A.firecrackers(), res)
     r = A.suspend(vm)
     print(f"  suspend: {r.get('suspend_ms')} ms, {r.get('data_mib')} MiB on disk")
     check("suspend: ls says suspended", A.ls()[vm]["state"] == "suspended", A.ls()[vm])
-    check("suspend: a Firecracker exited", wait_for(lambda: not before <= set(A.firecrackers()), 10))
+    check("suspend: its Firecracker exited", wait_for(lambda: not os.path.exists(f"/proc/{res['pid']}"), 10), res)
     check("suspend: exec refused", A.exec(vm, "true", timeout=60)[0] != 0)
     r = A.resume(vm)
     print(f"  resume: ready in {r.get('ready_ms')} ms")
@@ -466,8 +515,18 @@ def image_template():
         return
     name = args.template + "-img"
     t = time.time()
-    template(name, "--image", args.image, "--vcpus", "2", "--max", "2048",
-             "--cmd", json.dumps(["sh", "-c", "echo app-started; exec httpd -f -p 8080 -h /etc"]))
+    cmd = ["sh", "-c", "mkdir -p /tmp/www && echo hello-from-image > /tmp/www/index.html && "
+                       "echo app-started && exec httpd -f -p 8080 -h /tmp/www"]
+    # Anonymous registry pulls get rate limited (HTTP 429); only that is retried.
+    for delay in (5, 15, 30, None):
+        try:
+            template(name, "--image", args.image, "--vcpus", "2", "--max", "2048", "--cmd", json.dumps(cmd))
+            break
+        except AssertionError as e:
+            if delay is None or "HTTP 429" not in str(e):
+                raise
+            print(f"  registry rate limit; retrying in {delay} s")
+            time.sleep(delay)
     print(f"  template from {args.image}: {time.time() - t:.1f} s")
     vm = "e2e-img"
     ip = A.run(vm, template=name)
@@ -475,15 +534,24 @@ def image_template():
     code, out, err = A.exec(vm, "cat /etc/os-release 2>/dev/null; busybox | head -1")
     check("image vm: image's userland", code == 0 and "BusyBox" in out, out + err)
 
-    def http():
+    def get(path):
+        """(status code, body) of an HTTP/1.0 GET from the host, or None."""
         try:
             with socket.create_connection((ip, 8080), timeout=2) as s:
-                s.sendall(b"GET /hostname HTTP/1.0\r\n\r\n")
-                return s.recv(4096).startswith(b"HTTP/1.")
+                s.sendall(b"GET %s HTTP/1.0\r\n\r\n" % path)
+                data = b""
+                while d := s.recv(65536):
+                    data += d
         except OSError:
-            return False
-    check("image vm: app answers HTTP from the host", wait_for(http, 15),
-          A.exec(vm, "ps; netstat -ltn; wget -qO- http://127.0.0.1:8080/hostname")[1:] + (A.logs(vm),))
+            return None
+        head, _, body = data.partition(b"\r\n\r\n")
+        m = re.match(rb"HTTP/1\.[01] (\d{3}) ", head)
+        return (int(m.group(1)), body) if m else None
+    got = wait_for(lambda: get(b"/index.html"), 15)
+    check("image vm: app answers 200 with the file", got == (200, b"hello-from-image\n"),
+          (got, A.exec(vm, "ps; netstat -ltn")[1:], A.logs(vm)))
+    missing = get(b"/missing")
+    check("image vm: 404 for a missing file", missing is not None and missing[0] == 404, missing)
     A.kill(vm)
 
 
@@ -495,12 +563,16 @@ def faults():
         return
     r = subprocess.run([sys.executable, os.path.join(ROOT, "scripts", "faults.py"), "--a", A.addr, "--b", B.addr,
                         "--bin", BIN, "--template", args.template, "--log-dir", args.log_dir,
-                        "--ckpt-dir", os.path.join(CKPT, "faults"), *args.faults.split()], timeout=900)
+                        "--ckpt-dir", os.path.join(WORK, "faults-ckpt"), *args.faults.split()], timeout=900)
     check("faults.py: no failures", r.returncode == 0, f"exit {r.returncode}")
 
 
 # --- main ------------------------------------------------------------------------
 
+# Directories of this run's own, shared with nothing else: run directories under /run
+# (tmpfs), state and checkpoints under /var/tmp (suspend needs a disk).
+RUN = tempfile.mkdtemp(prefix="fvci-", dir="/run")
+WORK = tempfile.mkdtemp(prefix="fvci-", dir="/var/tmp")
 A = Host("a", args.port_a, args.port_a + 1, args.net_a)
 B = Host("b", args.port_a + 1, args.port_a, args.net_b)
 
@@ -532,33 +604,37 @@ def main():
                 traceback.print_exc()
                 results.append((c, "FAIL", time.time() - t))
                 failed.append(c)
-                for h in (A, B):  # free what the case left, so the next one starts clean
-                    for vm in h.ls():
-                        if vm.startswith("e2e-") or vm.startswith("ft-"):
-                            h.kill(vm, check=False)
+                for h in (A, B):  # free the VMs this script made, so the next case starts clean
+                    for vm in sorted(h.vms & set(h.ls())):
+                        h.kill(vm, check=False)
     finally:
         if failed:
             for h in (A, B):
                 h.save_logs()
         t = time.time()
+        problems = []
         for h in (A, B):
             try:
                 h.stop()
-            except AssertionError as e:
-                print(e)
-        left = wait_for(lambda: A.leftovers() + B.leftovers() == [] or None, 15) is not None
-        stray = A.leftovers() + B.leftovers()
-        results.append(("hosts stop, nothing left", "PASS" if not stray else "FAIL", time.time() - t))
-        if stray:
+            except Exception as e:
+                problems.append(str(e))
+        wait_for(lambda: not (A.leftovers() + B.leftovers()), 15)
+        problems += [f"left behind: {x}" for x in A.leftovers() + B.leftovers()]
+        results.append(("hosts stop cleanly, nothing left", "FAIL" if problems else "PASS", time.time() - t))
+        if problems:
             failed.append("teardown")
-            print(f"left behind: {stray}")
-        shutil.rmtree(CKPT, ignore_errors=True)
-        for h in (A, B):
-            shutil.rmtree(h.state_dir, ignore_errors=True)
+            print("\n".join(problems))
+        shutil.rmtree(WORK, ignore_errors=True)
+        shutil.rmtree(RUN, ignore_errors=True)
     print("\n" + "\n".join(f"{s} {c} ({d:.1f} s)" for c, s, d in results))
     print(f"{len(results) - len(failed)} passed, {len(failed)} failed in {time.time() - started:.0f} s")
     return 1 if failed else 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        code = main()
+    finally:
+        shutil.rmtree(WORK, ignore_errors=True)
+        shutil.rmtree(RUN, ignore_errors=True)
+    sys.exit(code)
