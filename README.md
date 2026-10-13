@@ -661,9 +661,12 @@ and a second copy could repeat what it did.
   MACAddressPolicy=none
   ```
 - Addresses come from the daemon's `--vm-ips` range, which is authoritative:
-  **every host's range must be disjoint** from the others'. A daemon refuses
-  to start when a peer that answers has an overlapping range, and hands out
-  no address in an overlap it learns of later (it checks every 10 s).
+  **every host's range must be disjoint** from the others'. That is a
+  precondition for the operator to ensure; the daemon only checks it best
+  effort. It refuses to start when a peer that answers has an overlapping
+  range (one that does not answer is not checked, and a WARNING says so),
+  and hands out no address in an overlap it learns of later (it checks
+  every 10 s).
   **Only an address's home host hands it to a new VM**: `run --ip`,
   `restore --ip`, and a restore keeping its checkpoint's address, are
   refused for an address outside the host's range ("start the vm on its
@@ -681,9 +684,12 @@ and a second copy could repeat what it did.
   and route announcements and withdrawals carry it.
   - Every host keeps the newest generation it has seen per address, and
     whether that one was withdrawn, in `STATE_DIR/gens/` (one small file per
-    address, written before the message is acted on or answered; a failure
-    refuses the message), plus a high-water mark of the generations it
-    hands out (reserved 1024 at a time, so a restart never repeats one).
+    address, written before the message is acted on or answered, or before
+    a claim of a new generation exists; a failure refuses the message or
+    fails the claim), plus a high-water mark of the generations it hands
+    out (reserved 1024 at a time, so a restart never repeats one). The last
+    check that an address is free (not used, lent or in an overlapping
+    peer range) and the claim happen in one critical section.
   - A message about an older generation, or an announcement of one already
     withdrawn, is ignored: a late withdrawal for a VM long gone (say one an
     operator unlent, whose address then went to a new VM that migrated away
@@ -692,15 +698,18 @@ and a second copy could repeat what it did.
     restart. A withdrawal frees a loan of its generation or an older one.
   - Route messages are taken only for addresses of this host's range, a
     peer's, or a VM here, and leave the route of an address a VM here has
-    claimed (running, starting or arriving) alone. Deciding a route and
-    changing it in the kernel happen under that address's lock, as do
+    claimed (running, starting or arriving) with that generation or a
+    newer one alone; a newer one supersedes such a claim. Deciding a route
+    and changing it in the kernel happen under that address's lock, as do
     migration route switches (which check the VM's generation first) and
     packet holds. An arriving VM's generation is recorded before it is
-    taken in and checked again when it commits.
+    taken in and checked again when it commits; if it does not commit, the
+    newest route a peer announced for the address is put back.
   - A suspended VM whose generation was withdrawn or superseded meanwhile
-    is not resumed; one without a recorded generation, on a host that is
-    not its address's home, is quarantined (left on disk, logged, not
-    brought back) at startup.
+    is not resumed (checked under the address's lock, held until the VM
+    has resumed); one without a recorded generation, on a host that is not
+    its address's home, is quarantined (left on disk, logged, not brought
+    back) at startup; its checkpoint restores with `--ip auto`.
   - Hosts of a cluster must be upgraded together: the page server's answer
     line and the generations are part of the protocol.
 - Reachability:

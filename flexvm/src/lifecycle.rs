@@ -152,14 +152,13 @@ impl Daemon {
             suspended.remove(name)
         };
         let Some(s) = s else { bail!("no vm named {name:?}") };
-        // Its address's generation must still be live (see `Gens`).
+        // Its address's generation must still be live (see `Gens`), from the
+        // check through consuming the checkpoint and resuming the VM: no
+        // route message for the address is taken in meanwhile.
         let ip = s.manifest.ip;
-        let stale = {
-            let _route = self.addr_lock(ip).lock().unwrap();
-            let gen = self.addrs.lock().unwrap().used.get(&ip).copied();
-            gen.is_some_and(|g| !self.gens.lock().unwrap().current(ip, g))
-        };
-        if stale {
+        let route = self.addr_lock(ip).lock().unwrap();
+        let gen = self.addrs.lock().unwrap().used.get(&ip).copied();
+        if gen.is_some_and(|g| !self.gens.lock().unwrap().current(ip, g)) {
             self.suspended.lock().unwrap().insert(name.into(), s);
             bail!("vm {name}: its address {ip}'s generation was withdrawn or superseded; it stays suspended");
         }
@@ -170,6 +169,7 @@ impl Daemon {
             t.mark("verify_checkpoint");
             self.restore_checkpoint(name, ck, s.manifest.ip, true, false, &mut t)
         });
+        drop(route);
         match res {
             Ok(mut v) => {
                 v["from"] = json!("suspended");
@@ -745,19 +745,20 @@ impl Daemon {
                     // on elsewhere), or none recorded where this host may not
                     // hand the address out, is left alone: it is not brought
                     // back.
-                    let gen = {
-                        let mut gens = self.gens.lock().unwrap();
-                        match read_gen(&e.path()) {
-                            Some(gen) if gens.current(ip, gen) => Ok(gen),
-                            Some(gen) => Err(format!("its address {ip}'s generation {gen} was withdrawn or superseded")),
-                            None if self.cfg.vm_ips.contains(ip) => Ok(gens.assign(ip)?),
-                            None => Err(format!("no generation recorded for its address {ip}, which is not this host's to hand out")),
-                        }
+                    let _route = self.addr_lock(ip).lock().unwrap();
+                    let gen = match read_gen(&e.path()) {
+                        Some(gen) if self.gens.lock().unwrap().current(ip, gen) => Ok(gen),
+                        Some(gen) => Err(format!("its address {ip}'s generation {gen} was withdrawn or superseded")),
+                        None if self.cfg.vm_ips.contains(ip) => Ok(self.new_gen(ip)?),
+                        None => Err(format!("no generation recorded for its address {ip}, which is not this host's to hand out")),
                     };
                     let gen = match gen {
                         Ok(gen) => gen,
                         Err(why) => {
-                            eprintln!("QUARANTINED suspended vm {name} in {}: {why}; not brought back (remove it by hand)", e.path().display());
+                            eprintln!(
+                                "QUARANTINED suspended vm {name} in {}: {why}; not brought back (its checkpoint restores with --ip auto)",
+                                e.path().display()
+                            );
                             continue;
                         }
                     };

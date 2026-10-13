@@ -2264,6 +2264,13 @@ def late_withdrawal():
     wait_released(B, n3)
     third = lent().get(ip)
     check("late withdrawal: a restarted home host hands out newer generations", third is not None and third > new, (new, third))
+    # The generation it handed out is on disk: after another restart, a
+    # repeated withdrawal of the one before it is still stale.
+    time.sleep(1)
+    argv, env = kill_daemon(A)
+    start_daemon(A, argv, env)
+    r = ok(A, {"op": "route", "ip": ip, "gen": new})
+    check("late withdrawal: repeated after a restart, stale for the newer loan", r["stale"] and not r["freed"] and lent().get(ip) == third, (r, lent()))
     for x in (n, n2, n3):
         cleanup(x)
     check("late withdrawal: the last VM's withdrawal frees it", wait_for(lambda: ip not in lent(), 10), lent())
