@@ -75,7 +75,9 @@ impl Registry {
                     if self.basic.is_none() { " (no credentials in docker config)" } else { "" }
                 ),
                 Err(ureq::Error::Status(code, resp)) => {
-                    let body = resp.into_string().unwrap_or_default();
+                    let mut body = Vec::new();
+                    let _ = resp.into_reader().take(300).read_to_end(&mut body);
+                    let body = String::from_utf8_lossy(&body);
                     bail!("GET {url}: HTTP {code}: {}", body.chars().take(300).collect::<String>().trim())
                 }
                 Err(e) => bail!("GET {url}: {e}"),
@@ -177,7 +179,7 @@ impl Registry {
         let tmp = path.with_extension(format!("part{}", std::process::id()));
         let resp = self.get(&format!("blobs/{digest}"), "*/*")?;
         let res = (|| {
-            let mut f = std::fs::File::create(&tmp)?;
+            let mut f = super::create_new(&tmp)?;
             let mut r = resp.into_reader().take(size + 1);
             let mut h = Sha256::new();
             let mut buf = vec![0u8; 256 << 10];

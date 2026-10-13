@@ -14,8 +14,11 @@ mod registry;
 mod source;
 mod unpack;
 
+use std::ffi::CString;
 use std::fs::File;
 use std::io::Write;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -28,6 +31,8 @@ use crate::guest;
 use crate::util::{ms, Result};
 use registry::sha256_hex;
 pub use unpack::Limits;
+#[cfg(test)]
+use unpack::MAX_DOCUMENT;
 use registry::sync_dir;
 use unpack::Root;
 
@@ -81,6 +86,9 @@ pub struct Options {
     pub ready_timeout: Duration,
     #[serde(skip)]
     pub limits: Limits,
+    /// Where layers are unpacked; see `staging_dir`.
+    #[serde(skip)]
+    pub staging: PathBuf,
 }
 
 /// `--entrypoint` / `--cmd`: a JSON array, or words split on whitespace.
@@ -180,10 +188,12 @@ pub fn prepare(cache: &Path, init: &Path, o: &Options) -> Result<(PathBuf, Image
         let _ = std::fs::remove_file(&done);
         std::fs::create_dir_all(&rootfs_dir)?;
         let tmp = cached.with_extension(format!("tmp{}", std::process::id()));
-        let res = build_rootfs(cache, &img, &app, &init_bytes, &tmp, &o.limits).and_then(|conf| {
+        let res = build_rootfs(&o.staging, &img, &app, &init_bytes, &tmp, &o.limits).and_then(|conf| {
             File::open(&tmp)?.sync_all()?;
             publish(&conf_path, conf.as_bytes())?;
             std::fs::rename(&tmp, &cached)?;
+            // The image and its config are durable before the marker says so.
+            sync_dir(&rootfs_dir)?;
             publish(&done, b"")?;
             sync_dir(&rootfs_dir)
         });
@@ -254,47 +264,95 @@ pub fn read_logs(vsock: &Path) -> Result<(Vec<u8>, String)> {
 /// Writes `path` durably: a temporary file, fsynced, renamed over it.
 fn publish(path: &Path, data: &[u8]) -> Result<()> {
     let tmp = path.with_extension(format!("part{}", std::process::id()));
-    let mut f = File::create(&tmp)?;
+    let mut f = create_new(&tmp)?;
     f.write_all(data)?;
     f.sync_all()?;
     std::fs::rename(&tmp, path)?;
     Ok(())
 }
 
-/// A private staging area: `cache/tmp`, root-owned and 0700, so no other
-/// user can reach the setuid binaries, device nodes or capabilities an
-/// image's layers carry while they sit unpacked on the host.
-fn staging_dir(cache: &Path) -> Result<PathBuf> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    let tmp = cache.join("tmp");
-    std::fs::create_dir_all(&tmp)?;
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700))?;
-    let m = std::fs::symlink_metadata(&tmp)?;
-    let euid = unsafe { libc::geteuid() };
-    if !m.is_dir() || m.uid() != euid || m.mode() & 0o077 != 0 {
-        bail!("{tmp:?} must be a directory owned by uid {euid} with mode 0700");
+/// Creates a new file, replacing a stale one but never writing through a
+/// symlink someone else put in the cache.
+pub(crate) fn create_new(path: &Path) -> Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let _ = std::fs::remove_file(path);
+    Ok(std::fs::OpenOptions::new().write(true).create_new(true).custom_flags(libc::O_NOFOLLOW).open(path)?)
+}
+
+/// Default for `--image-staging`.
+pub const STAGING: &str = "/var/lib/flexvm/staging";
+
+/// Checks that only root can change what `path` names: it and every
+/// ancestor must be root-owned and not group/other writable (sticky
+/// directories excepted, where others cannot move root's entries).
+fn check_ancestry(path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    for dir in path.ancestors() {
+        let m = std::fs::symlink_metadata(dir)?;
+        let writable = m.mode() & 0o022 != 0 && m.mode() & libc::S_ISVTX == 0;
+        if m.uid() != 0 || writable || m.file_type().is_symlink() {
+            bail!(
+                "image staging directory {}: {} must be root-owned and not writable by others \
+                 (choose another with --image-staging)",
+                path.display(),
+                dir.display()
+            );
+        }
     }
-    Ok(tmp)
+    Ok(())
+}
+
+/// The private staging directory where layers are unpacked: root-owned,
+/// 0700, with an ancestry only root can change, opened without following
+/// symlinks. No other user can reach the setuid binaries, device nodes or
+/// capabilities an image carries while they sit unpacked on the host, or
+/// swap the directory underneath the build.
+fn staging_dir(path: &Path) -> Result<OwnedFd> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(path)?;
+    let path = std::fs::canonicalize(path)?;
+    check_ancestry(&path)?;
+    let c = CString::new(path.as_os_str().as_bytes()).map_err(|_| "NUL in path")?;
+    let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+    if fd < 0 {
+        bail!("open {}: {}", path.display(), std::io::Error::last_os_error());
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 || st.st_uid != 0 || st.st_mode & libc::S_IFMT != libc::S_IFDIR {
+        bail!("{} is not a root-owned directory", path.display());
+    }
+    if unsafe { libc::fchmod(fd.as_raw_fd(), 0o700) } != 0 {
+        bail!("chmod {}: {}", path.display(), std::io::Error::last_os_error());
+    }
+    Ok(fd)
 }
 
 /// Unpacks the image, checking every layer, into `dest` (an ext4 image).
 /// Returns the app.conf it wrote.
-fn build_rootfs(cache: &Path, img: &source::Image, app: &App, init: &[u8], dest: &Path, limits: &Limits) -> Result<String> {
-    let work = staging_dir(cache)?.join(format!("rootfs-{}", std::process::id()));
-    if work.exists() {
-        std::fs::remove_dir_all(&work)?;
+fn build_rootfs(staging: &Path, img: &source::Image, app: &App, init: &[u8], dest: &Path, limits: &Limits) -> Result<String> {
+    let staging = staging_dir(staging)?;
+    let name = CString::new(format!("rootfs-{}", std::process::id())).unwrap();
+    // Everything relative to the staging fd, never through its path again.
+    unpack::remove_at(staging.as_raw_fd(), &name, 0)?;
+    if unsafe { libc::mkdirat(staging.as_raw_fd(), name.as_ptr(), 0o755) } != 0 {
+        bail!("mkdir in staging: {}", std::io::Error::last_os_error());
     }
-    std::fs::create_dir(&work)?;
     let res = (|| {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o755))?;
-        let mut root = Root::open(&work, *limits)?;
+        let work = unpack::open_dir_at(staging.as_raw_fd(), &name)?;
+        // mkdirat applied the umask.
+        if unsafe { libc::fchmod(work.as_raw_fd(), 0o755) } != 0 {
+            bail!("chmod staging: {}", std::io::Error::last_os_error());
+        }
+        // mkfs.ext4 and du reach the same directory through our fd.
+        let path = PathBuf::from(format!("/proc/{}/fd/{}/{}", std::process::id(), staging.as_raw_fd(), name.to_str().unwrap()));
+        let mut root = Root::from_fd(work, *limits);
         unpack_layers(&mut root, img)?;
         let conf = inject(&mut root, app, init)?;
-        mkfs(&work, root.entries, dest)?;
+        mkfs(&path, root.entries, dest)?;
         Ok(conf)
     })();
-    let _ = std::fs::remove_dir_all(&work);
+    let _ = unpack::remove_at(staging.as_raw_fd(), &name, 0);
     res
 }
 
@@ -424,13 +482,13 @@ fn mkfs(dir: &Path, entries: u64, dest: &Path) -> Result<()> {
     let kib: u64 = String::from_utf8_lossy(&du.stdout).split_whitespace().next().and_then(|s| s.parse().ok()).ok_or("du failed")?;
     let mib = (kib * 12 / 10 / 1024 + 64).div_ceil(2) * 2;
     let inodes = entries * 12 / 10 + 4096;
-    let tmp = dest;
-    let _ = std::fs::remove_file(tmp);
-    std::fs::File::create(tmp)?.set_len(mib << 20)?;
+    // mkfs writes through our descriptor, so the name cannot be swapped for a symlink.
+    let image = create_new(dest)?;
+    image.set_len(mib << 20)?;
     let out = Command::new("mkfs.ext4")
         .args(["-q", "-F", "-b", "4096", "-L", "flexroot", "-N", &inodes.to_string(), "-d"])
         .arg(dir)
-        .arg(tmp)
+        .arg(format!("/proc/{}/fd/{}", std::process::id(), image.as_raw_fd()))
         .output()
         .map_err(|e| format!("mkfs.ext4: {e}"))?;
     if !out.status.success() {
@@ -581,6 +639,43 @@ mod tests {
         let tiny = Limits { download: 10, ..Limits::default() };
         let e = source::fetch(Path::new("/nonexistent"), d.to_str().unwrap(), &tiny).err().unwrap().to_string();
         assert!(e.contains("download limit"), "{e}");
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn staging_needs_a_root_only_ancestry() {
+        check_ancestry(Path::new("/")).unwrap();
+        // The test runs unprivileged: its own directories never qualify.
+        let d = tmpdir("ancestry");
+        assert!(check_ancestry(&d).unwrap_err().to_string().contains("must be root-owned"));
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn cache_writes_never_follow_symlinks() {
+        let d = tmpdir("nofollow");
+        let victim = d.join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        std::os::unix::fs::symlink(&victim, d.join("x.part")).unwrap();
+        std::os::unix::fs::symlink(&victim, d.join("x")).unwrap();
+        publish(&d.join("x"), b"new").unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+        assert_eq!(std::fs::read_to_string(d.join("x")).unwrap(), "new");
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn cached_documents_are_verified() {
+        let d = tmpdir("cached-doc");
+        let p = d.join("config");
+        std::fs::write(&p, b"{}").unwrap();
+        let digest = sha256_hex(b"{}");
+        assert!(source::read_verified(&p, 2, &digest).is_ok());
+        assert!(source::read_verified(&p, 3, &digest).is_err());
+        std::fs::write(&p, b"[]").unwrap();
+        assert!(source::read_verified(&p, 2, &digest).is_err());
+        std::fs::write(&p, vec![b' '; (MAX_DOCUMENT + 1) as usize]).unwrap();
+        assert!(source::read_verified(&p, MAX_DOCUMENT + 1, &digest).is_err());
         std::fs::remove_dir_all(d).unwrap();
     }
 }

@@ -28,6 +28,7 @@ usage:
                 [--env K=V]... [--workdir DIR] [--user USER[:GROUP]]
                 [--warm [--ready-port N | --ready-cmd CMD] [--ready-timeout S]]
                 [--max-download-mib N] [--max-unpacked-mib N] [--max-file-mib N] [--max-entries N]
+                [--image-staging DIR]
                                                              ... from a container image
   flexvm daemon [--listen ADDR] [--advertise ADDR] [--run DIR]
                 [--peer ADDR]... [--reserve MIB] [--pool N]
@@ -226,6 +227,7 @@ fn image_options(args: &Args) -> Result<Option<image::Options>> {
         warm,
         ready,
         ready_timeout: Duration::from_secs(args.num("ready-timeout", 120)?),
+        staging: args.get("image-staging").unwrap_or(image::STAGING).into(),
         limits: {
             let d = image::Limits::default();
             image::Limits {

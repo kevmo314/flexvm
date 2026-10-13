@@ -45,8 +45,10 @@ impl Default for Limits {
 
 /// Largest manifest, index or config document accepted.
 pub const MAX_DOCUMENT: u64 = 4 << 20;
-/// Largest tar metadata entry (PAX header, GNU long name or link).
+/// Most tar metadata (PAX header, GNU long name and link) for one entry, together.
 const MAX_META: u64 = 1 << 20;
+/// Most PAX records for one entry.
+const MAX_PAX_RECORDS: usize = 256;
 /// Deepest directory tree removal descends into.
 const MAX_DEPTH: u32 = 4096;
 
@@ -121,7 +123,7 @@ fn is_dir(st: &libc::stat) -> bool {
 }
 
 /// Opens directory `name` in `dir` without following a symlink.
-fn open_dir_at(dir: RawFd, name: &CStr) -> Result<OwnedFd> {
+pub fn open_dir_at(dir: RawFd, name: &CStr) -> Result<OwnedFd> {
     let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     let fd = unsafe { libc::openat(dir, name.as_ptr(), flags) };
     if fd < 0 {
@@ -155,7 +157,7 @@ fn list_dir(dir: RawFd) -> Result<Vec<CString>> {
 
 /// Removes `name` in `dir`, recursively, never leaving `dir`: every step is
 /// an `*at` call on a directory fd opened without following symlinks.
-fn remove_at(dir: RawFd, name: &CStr, depth: u32) -> Result<()> {
+pub fn remove_at(dir: RawFd, name: &CStr, depth: u32) -> Result<()> {
     if depth > MAX_DEPTH {
         bail!("directory tree too deep to remove");
     }
@@ -256,16 +258,23 @@ impl<R: Read> Read for Meter<R> {
 struct Pending {
     long_name: Option<Vec<u8>>,
     long_link: Option<Vec<u8>>,
-    pax: Vec<(String, Vec<u8>)>,
+    pax: Option<Vec<(String, Vec<u8>)>>,
+    /// Metadata bytes read for the coming entry so far.
+    bytes: u64,
 }
 
-fn read_meta<R: Read>(e: &mut tar::Entry<R>) -> Result<Vec<u8>> {
-    if e.size() > MAX_META {
-        bail!("tar metadata entry of {} bytes is over the {MAX_META} byte limit", e.size());
+impl Pending {
+    /// Reads a metadata entry within what is left of the per-entry budget.
+    fn read<R: Read>(&mut self, e: &mut tar::Entry<R>) -> Result<Vec<u8>> {
+        let left = MAX_META - self.bytes;
+        if e.size() > left {
+            bail!("tar metadata for one entry exceeds {MAX_META} bytes");
+        }
+        self.bytes += e.size();
+        let mut v = Vec::with_capacity(e.size() as usize);
+        e.take(left).read_to_end(&mut v)?;
+        Ok(v)
     }
-    let mut v = Vec::with_capacity(e.size() as usize);
-    e.take(MAX_META).read_to_end(&mut v)?;
-    Ok(v)
 }
 
 fn trim_nul(mut v: Vec<u8>) -> Vec<u8> {
@@ -285,10 +294,16 @@ struct Entry {
 }
 
 impl Root {
+    #[cfg(test)]
     pub fn open(dir: &Path, limits: Limits) -> Result<Root> {
         let fd = unsafe { libc::open(cpath(dir)?.as_ptr(), libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) };
         check(fd, "open", dir)?;
-        Ok(Root { fd: unsafe { OwnedFd::from_raw_fd(fd) }, limits, entries: 0, seen: 0, unpacked: 0 })
+        Ok(Root::from_fd(unsafe { OwnedFd::from_raw_fd(fd) }, limits))
+    }
+
+    /// The tree under directory `fd`.
+    pub fn from_fd(fd: OwnedFd, limits: Limits) -> Root {
+        Root { fd, limits, entries: 0, seen: 0, unpacked: 0 }
     }
 
     fn openat2(&self, rel: &[u8], flags: i32) -> io::Result<OwnedFd> {
@@ -389,25 +404,37 @@ impl Root {
             }
             use tar::EntryType as T;
             match e.header().entry_type() {
-                T::GNULongName => {
-                    pending.long_name = Some(trim_nul(read_meta(&mut e)?));
-                    continue;
-                }
-                T::GNULongLink => {
-                    pending.long_link = Some(trim_nul(read_meta(&mut e)?));
-                    continue;
-                }
-                T::XHeader => {
-                    let data = read_meta(&mut e)?;
-                    for ext in tar::PaxExtensions::new(&data) {
-                        let ext = ext.map_err(|_| "bad PAX record")?;
-                        let key = ext.key().map_err(|_| "bad PAX key")?.to_string();
-                        pending.pax.push((key, ext.value_bytes().to_vec()));
+                T::GNULongName | T::GNULongLink | T::XHeader => {
+                    let kind = e.header().entry_type();
+                    let repeated = match kind {
+                        T::GNULongName => pending.long_name.is_some(),
+                        T::GNULongLink => pending.long_link.is_some(),
+                        _ => pending.pax.is_some(),
+                    };
+                    if repeated {
+                        bail!("repeated {kind:?} metadata before one tar entry");
+                    }
+                    let data = pending.read(&mut e)?;
+                    match kind {
+                        T::GNULongName => pending.long_name = Some(trim_nul(data)),
+                        T::GNULongLink => pending.long_link = Some(trim_nul(data)),
+                        _ => {
+                            let mut records = Vec::new();
+                            for ext in tar::PaxExtensions::new(&data) {
+                                let ext = ext.map_err(|_| "bad PAX record")?;
+                                if records.len() == MAX_PAX_RECORDS {
+                                    bail!("more than {MAX_PAX_RECORDS} PAX records for one tar entry");
+                                }
+                                let key = ext.key().map_err(|_| "bad PAX key")?.to_string();
+                                records.push((key, ext.value_bytes().to_vec()));
+                            }
+                            pending.pax = Some(records);
+                        }
                     }
                     continue;
                 }
                 T::XGlobalHeader => {
-                    read_meta(&mut e)?;
+                    Pending::default().read(&mut e)?;
                     continue;
                 }
                 _ => {}
@@ -455,7 +482,7 @@ impl Root {
         let mut link = p.long_link.or_else(|| h.link_name_bytes().map(|l| l.into_owned()));
         let (mut uid, mut gid) = (h.uid()? as u32, h.gid()? as u32);
         let mut xattrs = Vec::new();
-        for (key, value) in p.pax {
+        for (key, value) in p.pax.unwrap_or_default() {
             let num = || std::str::from_utf8(&value).ok().and_then(|v| v.parse::<u64>().ok());
             match key.as_str() {
                 "path" => path = value,
@@ -613,11 +640,58 @@ pub fn decompress(r: impl Read + 'static) -> Result<Box<dyn Read>> {
     let magic = r.fill_buf()?.get(..4).map(|m| m.to_vec()).unwrap_or_default();
     Ok(match magic.as_slice() {
         [0x1f, 0x8b, ..] => Box::new(flate2::read::MultiGzDecoder::new(r)),
-        [0x28, 0xb5, 0x2f, 0xfd] => Box::new(
-            ruzstd::decoding::StreamingDecoder::new(r).map_err(|e| format!("zstd layer: {e}"))?,
-        ),
+        [0x28, 0xb5, 0x2f, 0xfd] => Box::new(ZstdFrames { src: r, dec: ruzstd::decoding::FrameDecoder::new(), active: false }),
         _ => Box::new(r),
     })
+}
+
+/// Decodes every zstd frame in a stream, skipping skippable frames, so all
+/// of it is decompressed and counted (one `StreamingDecoder` stops after the
+/// first frame).
+struct ZstdFrames<R> {
+    src: R,
+    dec: ruzstd::decoding::FrameDecoder,
+    /// Inside a frame.
+    active: bool,
+}
+
+impl<R: BufRead> Read for ZstdFrames<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        use ruzstd::decoding::errors::{FrameDecoderError, ReadFrameHeaderError};
+        use ruzstd::decoding::BlockDecodingStrategy;
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            if self.active {
+                while self.dec.can_collect() < buf.len() && !self.dec.is_finished() {
+                    let want = buf.len() - self.dec.can_collect();
+                    self.dec.decode_blocks(&mut self.src, BlockDecodingStrategy::UptoBytes(want)).map_err(io::Error::other)?;
+                }
+                let n = self.dec.read(buf)?;
+                if n > 0 {
+                    return Ok(n);
+                }
+                if self.dec.is_finished() && self.dec.can_collect() == 0 {
+                    self.active = false;
+                }
+                continue;
+            }
+            if self.src.fill_buf()?.is_empty() {
+                return Ok(0);
+            }
+            match self.dec.init(&mut self.src) {
+                Ok(()) => self.active = true,
+                Err(FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::SkipFrame { length, .. })) => {
+                    let skipped = io::copy(&mut (&mut self.src).take(length as u64), &mut io::sink())?;
+                    if skipped != length as u64 {
+                        return Err(io::Error::other("truncated zstd skippable frame"));
+                    }
+                }
+                Err(e) => return Err(io::Error::other(format!("zstd layer: {e}"))),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -812,7 +886,74 @@ mod tests {
         // A huge PAX header is refused before it is read into memory.
         let huge = end(raw_entry(b"PaxHeader", tar::EntryType::XHeader, 2 << 20));
         let e = s.open().apply_layer(&huge[..]).unwrap_err().to_string();
-        assert!(e.contains("metadata entry"), "{e}");
+        assert!(e.contains("tar metadata"), "{e}");
+    }
+
+    fn pax(records: &[(&str, &str)]) -> Vec<u8> {
+        let mut data = Vec::new();
+        for (k, v) in records {
+            let rec = |len: usize| format!("{len} {k}={v}\n");
+            let mut len = rec(0).len();
+            while rec(len).len() != len {
+                len = rec(len).len();
+            }
+            data.extend_from_slice(rec(len).as_bytes());
+        }
+        let mut v = raw_entry(b"PaxHeader", tar::EntryType::XHeader, data.len() as u64);
+        v[512..512 + data.len()].copy_from_slice(&data);
+        v
+    }
+
+    #[test]
+    fn tar_metadata_cannot_pile_up() {
+        let s = Sandbox::new("meta");
+        let file = layer(&[("f", 'f', "x")]);
+        let file = &file[..file.len() - 1024]; // without the end-of-archive blocks
+        // Two local PAX headers in a row.
+        let mut two = pax(&[("comment", "a")]);
+        two.extend(pax(&[("comment", "b")]));
+        two.extend_from_slice(file);
+        let e = s.open().apply_layer(&end(two)[..]).unwrap_err().to_string();
+        assert!(e.contains("repeated"), "{e}");
+        // Too many records in one.
+        let many: Vec<(String, String)> = (0..300).map(|i| (format!("k{i}"), "v".to_string())).collect();
+        let many: Vec<(&str, &str)> = many.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let mut t = pax(&many);
+        t.extend_from_slice(file);
+        let e = s.open().apply_layer(&end(t)[..]).unwrap_err().to_string();
+        assert!(e.contains("PAX records"), "{e}");
+        // A long name and a PAX header that each fit, but not together.
+        let big = "x".repeat(700_000);
+        let mut t = raw_entry(b"././@LongLink", tar::EntryType::GNULongName, 600_000);
+        t.extend(pax(&[("comment", &big)]));
+        t.extend_from_slice(file);
+        let e = s.open().apply_layer(&end(t)[..]).unwrap_err().to_string();
+        assert!(e.contains("exceeds"), "{e}");
+    }
+
+    #[test]
+    fn zstd_layers_decode_every_frame() {
+        use ruzstd::encoding::{compress_to_vec, CompressionLevel};
+        let tar = layer(&[("a", 'f', "first"), ("b", 'f', "second")]);
+        let (one, two) = tar.split_at(1024);
+        let mut z = compress_to_vec(one, CompressionLevel::Fastest);
+        // A skippable frame between the two data frames.
+        z.extend_from_slice(&0x184D2A50u32.to_le_bytes());
+        z.extend_from_slice(&3u32.to_le_bytes());
+        z.extend_from_slice(b"abc");
+        z.extend(compress_to_vec(two, CompressionLevel::Fastest));
+        let mut out = Vec::new();
+        decompress(io::Cursor::new(z.clone())).unwrap().read_to_end(&mut out).unwrap();
+        assert_eq!(out, tar);
+        let s = Sandbox::new("zstd");
+        let diff = s.open().apply_layer(decompress(io::Cursor::new(z)).unwrap()).unwrap();
+        assert_eq!(diff, format!("sha256:{:x}", Sha256::digest(&tar)));
+        assert_eq!(s.read("b").as_deref(), Some("second"));
+        // Garbage after the last frame is an error, not ignored.
+        let mut bad = compress_to_vec(&tar[..], CompressionLevel::Fastest);
+        bad.extend_from_slice(b"trailing junk");
+        let mut out = Vec::new();
+        assert!(decompress(io::Cursor::new(bad)).unwrap().read_to_end(&mut out).is_err());
     }
 
     #[test]

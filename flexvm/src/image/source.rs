@@ -51,7 +51,9 @@ impl Blob {
     fn open(&self) -> Result<(Box<dyn Read>, u64)> {
         Ok(match self {
             Blob::File(p) => {
-                let f = File::open(p)?;
+                use std::os::unix::fs::OpenOptionsExt;
+                // Never block on a FIFO or open a device a symlink points at.
+                let f = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW).open(p)?;
                 let m = f.metadata()?;
                 if !m.is_file() {
                     bail!("{p:?} is not a regular file");
@@ -151,6 +153,16 @@ fn diff_ids(config: &[u8], layers: usize) -> Result<Vec<String>> {
     Ok(ids)
 }
 
+/// Reads a cached document: a regular file of exactly `size` bytes (at most
+/// `MAX_DOCUMENT`) whose contents match `digest`.
+pub(super) fn read_verified(path: &Path, size: u64, digest: &str) -> Result<Vec<u8>> {
+    let data = Blob::File(path.to_path_buf()).read_document()?;
+    if data.len() as u64 != size || sha256_hex(&data) != digest {
+        bail!("cached blob {} does not match {digest} ({size} bytes)", path.display());
+    }
+    Ok(data)
+}
+
 /// Layer descriptors from a manifest: digests, and sizes within the download budget.
 fn descriptors(manifest: &Value, limits: &Limits) -> Result<Vec<(String, u64)>> {
     let descs = manifest["layers"].as_array().ok_or("manifest has no layers")?;
@@ -208,7 +220,7 @@ fn pull(cache: &Path, mut reg: Registry, limits: &Limits) -> Result<Image> {
     if config_size > MAX_DOCUMENT {
         bail!("image config of {config_size} bytes is over the {MAX_DOCUMENT} byte limit");
     }
-    let config = std::fs::read(reg.blob(&config_digest, config_size, &blobs)?)?;
+    let config = read_verified(&reg.blob(&config_digest, config_size, &blobs)?, config_size, &config_digest)?;
     let descs = descriptors(&manifest, limits)?;
     let mut layers = Vec::new();
     for (i, (d, size)) in descs.iter().enumerate() {
