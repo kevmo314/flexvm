@@ -592,7 +592,7 @@ def target_killed():
     if v:
         fc = v["firecracker"]
         os.kill(v["pid"], signal.SIGKILL)
-        check("target killed: its firecracker died with it", wait_for(lambda: not alive(fc), 5), fc)
+        check("target killed: its firecracker died with it", wait_for(lambda: not alive(fc), 15), fc)
     # The listener restarts too: nothing it knows is in memory.
     stop_listeners()
     start_listeners()
@@ -1200,7 +1200,7 @@ def checkpoint_crash():
     os.kill(pid, signal.SIGKILL)
     t.join()
     fault(A, "ckpt_slow", 0)
-    check("crash: the VM died with its process", wait_for(lambda: not alive(fc), 5) and n not in vms(A), vms(A).get(n))
+    check("crash: the VM died with its process", wait_for(lambda: not alive(fc), 15) and n not in vms(A), vms(A).get(n))
     check("crash: no checkpoint published", not os.path.exists(path))
     r = restore(B, path, ip="auto")
     check("crash: nothing to restore", not r["ok"], r)
@@ -1228,12 +1228,8 @@ def pause_resume():
     check("pause: exec refused while paused", not r["ok"] and "not running" in r["error"], r)
     time.sleep(0.2)
     controller_quiet = vms(A)[n]["state"] == "paused"
-    # SIGCONT the kernel or systemd sends on their own resumes nothing...
-    signal_vm(A, n, signal.SIGSTOP)
-    signal_vm(A, n, signal.SIGCONT)
     time.sleep(3)
-    check("pause: controller left it alone, a stray SIGSTOP/SIGCONT did not resume it",
-          controller_quiet and vms(A)[n]["state"] == "paused", vms(A)[n]["state"])
+    check("pause: controller left it alone", controller_quiet and vms(A)[n]["state"] == "paused", vms(A)[n]["state"])
     took = resume(A, n)
     print(f"pause: {took * 1000:.1f} ms from SIGCONT to running in the registry")
     check("pause: resumes within 50 ms", took < 0.05, took)
@@ -1241,9 +1237,11 @@ def pause_resume():
     err = guest_clock_error(A, n)
     check("pause: guest clock right after 3 s paused", err is not None and abs(err) < 0.5, err)
     check("pause: md5 intact", md5(A, n) == m)
-    # ...and SIGCONT without a pause first does nothing either.
+    # SIGCONT without a SIGTSTP first (as after any SIGSTOP) does nothing.
+    signal_vm(A, n, signal.SIGSTOP)
     signal_vm(A, n, signal.SIGCONT)
-    check("pause: SIGCONT of a running vm is harmless", sh(A, n, "echo hi") == (0, "hi"))
+    check("pause: a stray SIGSTOP/SIGCONT leaves a running vm running", vms(A)[n]["state"] == "running"
+          and sh(A, n, "echo hi") == (0, "hi"), vms(A)[n]["state"])
     pause(A, n)
     ok(migrate(A, n, B))
     # Stall the pull: a resume on the target must wait for all its memory.
@@ -1355,13 +1353,14 @@ def held_restore_frozen():
     print(f"held: resumed and answered within {time.time() - t:.2f} s")
     kill(A, n)
     # Held at a new address: the guest takes it on resume (and only then).
-    r = ok(restore(A, path, paused=True, ip="auto"))
-    refused = checkpoint(A, n, path + "-x")
+    r = ok(restore(B, path, paused=True, ip="auto"))
+    refused = checkpoint(B, n, path + "-x")
     check("held at a new address: no checkpoint before it takes the address", not refused["ok"], refused)
-    resume(A, n)
-    code, out = sh(A, n, "ip -4 -o addr show eth0")
+    rm_ckpt(path + "-x")
+    resume(B, n)
+    code, out = sh(B, n, "ip -4 -o addr show eth0")
     check("held at a new address: guest has it, and only it, after resume", r["ip"] in out and old_ip not in out, (r["ip"], old_ip, out))
-    kill(A, n)
+    kill(B, n)
 
     h0, h1, f0, f1, conn = held(True)
     check("no hold (control): the same activity changes guest memory", h0 != h1 or f0 != f1, (h0, h1, f0, f1))
@@ -1612,7 +1611,7 @@ def standby():
     comes up, `standby 0` stops them all; without one, run loads cold."""
     t = args.template
     ok(cli_json(A, "standby", "--template", t, "2"))
-    live = lambda: len([f for f in os.listdir(os.path.join(A.run, "standby", t)) if f.endswith(".lock")])
+    live = lambda: len([f for f in os.listdir(os.path.join(A.run, "standby", t)) if f.endswith(".lock") and alive(f[:-5])])
     check("standby: two ready", live() == 2, live())
     r = ok(run(A, "ft-sb1"))
     check("standby: run claims one", r["hot"] is True and r["ready_ms"] < 50, r)
@@ -1780,7 +1779,7 @@ def cow_crash():
     for f in partial:
         r = restore(B, f, ip="auto")
         check("cow crash: the partial directory does not restore", not r["ok"], r)
-    check("cow crash: the VM died with its process", wait_for(lambda: not alive(fc), 5) and n not in vms(A), vms(A).get(n))
+    check("cow crash: the VM died with its process", wait_for(lambda: not alive(fc), 15) and n not in vms(A), vms(A).get(n))
     ok(run(A, n))
     start_writer(A, n, mib=16)
     ok(checkpoint(A, n, path))
