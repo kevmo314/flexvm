@@ -430,25 +430,24 @@ back to loading the snapshot then and there.
     queue (length, sequence number, packet), then whatever reached the TUN
     device meanwhile. It waits until the target has injected all of it,
     points its own route at the target, and sends the few packets that were
-    still on their way. The target accepts one stream per migration, for
-    that VM instance only, within 10 s of its arrival, and closes the right
-    early if the VM is killed or moves on; a stream that broke off may
-    resume (on a new connection) where it stopped, but what was lost in
-    flight is not resent. Sequence numbers count gaps and drop duplicates.
+    still on their way. The target takes one stream per migration, on that
+    connection, for that VM instance only, and stops it if the VM is killed
+    or moves on. Nothing is resent: a stream that breaks off, or a source
+    whose answer was lost, loses the rest (counted). Sequence numbers count
+    gaps and drop duplicates.
   - The target injects each packet into the guest as an Ethernet frame sent
     out of the VM's tap from an AF_PACKET socket (from the gateway's MAC to
     the guest's): Firecracker reads it like any other frame, byte for byte as
     it arrived, with no host routing involved; packets that are not whole
     IPv4 packets for the VM's address are dropped (and counted). Only when the
-    stream ends (or none opens within 250 ms; a later one is still taken)
+    stream ends (or none opens within 250 ms; then none is taken any more)
     does it announce the address (route pushes to peers, gratuitous ARP,
     each only while that VM still runs there), so held packets come before
     traffic sent straight to it.
   - If the migration aborts, the source injects the held packets into the
     VM's own tap before resuming it. If it lost track of the outcome, the
-    packets wait for it (even after the paused copy is gone) and then go to
-    the target on a new connection, or to the VM's tap here if the VM has
-    come back meanwhile.
+    packets wait for it (even after the paused copy is gone): dropped if the
+    VM went to the target, injected into its tap here if it has come back.
 
   `migrate` reports `held: {packets, kib, dropped, injected, dropped_target}`.
   TCP peers stall for about the downtime instead of a retransmit timeout
@@ -533,9 +532,10 @@ any lost datagram or a TCP stall over twice the downtime.
 
 The daemon must run as root: it uses `/dev/kvm`, privileged userfaultfd,
 `process_vm_readv` on Firecracker and cgroup v2. Its taps, hold device and
-cgroups are named after its port, so one daemon per port and network
-namespace: a second one (on another address) refuses to start, before it
-cleans up anything (abstract socket `flexvm-port-<port>`). On SIGTERM or SIGINT it stops
+cgroups are named after its port (cgroups also after its listen address and
+network namespace), so one daemon per port and network namespace: a second
+one (on another address) refuses to start, before it cleans up anything
+(abstract socket `flexvm-port-<port>`). On SIGTERM or SIGINT it stops
 taking new VMs and migrations, lets the ones in progress finish, waits until
 every VM paused here as a migration source has been released by its target
 (killing it earlier would lose the pages the target has not pulled), stops its

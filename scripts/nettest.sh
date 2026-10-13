@@ -33,6 +33,7 @@ run_B=/run/$P-b
 name=nettest-$$
 work=$(mktemp -d /tmp/flexvm-nettest.XXXXXX)
 daemon_pids=()
+ns_A= ns_B= ns_C=
 bg_pids=()
 failed=0
 
@@ -71,7 +72,8 @@ teardown() {
     for pid in $(our_firecrackers); do kill -9 "$pid" 2>/dev/null; done
     sleep 0.5
     for ns in "${P}A" "${P}B" "${P}C" "${P}lan"; do ip netns del "$ns" 2>/dev/null; done
-    for cg in "/sys/fs/cgroup/flexvm/${NET//./_}_1_7070" "/sys/fs/cgroup/flexvm/${NET//./_}_2_7070"; do
+    # The daemons' cgroups are named after their listen address and netns.
+    for cg in "/sys/fs/cgroup/flexvm/${NET//./_}_1_7070_ns$ns_A" "/sys/fs/cgroup/flexvm/${NET//./_}_2_7070_ns$ns_B"; do
         [[ -d $cg ]] || continue
         find "$cg" -mindepth 1 -depth -type d -exec rmdir {} + 2>/dev/null
         rmdir "$cg" 2>/dev/null
@@ -95,6 +97,7 @@ ip -n "${P}lan" link set br0 up
 for spec in A:1 B:2 C:10; do
     h=${spec%%:*}
     ip netns add "$P$h"
+    printf -v "ns_$h" '%s' "$(stat -L -c %i "/run/netns/$P$h")"
     ip link add eth0 netns "$P$h" type veth peer name "p$h" netns "${P}lan"
     ip -n "${P}lan" link set "p$h" master br0 up
     ip -n "$P$h" addr add "$NET.${spec#*:}/24" dev eth0

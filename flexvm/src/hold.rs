@@ -45,6 +45,10 @@ const CATCH_UP: Duration = Duration::from_millis(100);
 const MAX_FRAME: usize = 65535;
 /// How long a source waits for a target to accept its held packets.
 const ACCEPT_WAIT: Duration = Duration::from_secs(1);
+/// How long a source waits for a target to confirm a sync.
+const SYNC_WAIT: Duration = Duration::from_millis(250);
+/// How long a source waits for the target's account of the stream.
+const REPLY_WAIT: Duration = Duration::from_secs(1);
 
 pub struct Holder {
     dev: String,
@@ -237,9 +241,10 @@ impl Holder {
         }
     }
 
-    /// Drops what migration `mig` held for `ip` (its VM is gone), and the
-    /// address's route through the TUN device if it is still there.
-    pub fn forget(&self, ip: Ipv4Addr, mig: u64) {
+    /// Drops what migration `mig` held for `ip` (its VM is gone, or the
+    /// packets cannot be delivered), and the address's route through the TUN
+    /// device if it is still there. Returns what it dropped.
+    pub fn forget(&self, ip: Ipv4Addr, mig: u64) -> Stats {
         let gone = {
             let mut held = self.held.lock().unwrap();
             match held.get(&ip) {
@@ -247,10 +252,13 @@ impl Holder {
                 _ => None,
             }
         };
-        if gone.is_some() {
-            // Matches the TUN device as the route's interface: never another route.
-            let _ = tun_route(RTM_DELROUTE, 0, ip, self.ifindex);
-        }
+        let Some(e) = gone else { return Stats::default() };
+        // Matches the TUN device as the route's interface: never another route.
+        let _ = tun_route(RTM_DELROUTE, 0, ip, self.ifindex);
+        let mut q = e.q.lock().unwrap();
+        let dropped = q.dropped + q.packets.len() as u64;
+        q.packets.clear();
+        Stats { dropped, ..Stats::default() }
     }
 
     /// Reads the TUN device and queues each packet on its address's entry.
@@ -370,15 +378,16 @@ fn tap_tx_dropped(tap: &str) -> u64 {
         .unwrap_or(0)
 }
 
-// The stream. The source opens it with `START`; the receiver answers `b'a'`
-// and the sequence number it expects next (a u64; 0 unless an earlier
-// stream of the same migration broke off), and only then does the source
-// take packets off its queue. Then frames: a big-endian u32 length, a u64
-// sequence number and that many bytes of IP packet. `SYNC` (no more) asks
-// the receiver to answer one byte once it has injected everything before
-// it. Length 0 ends the stream, and the receiver answers with one JSON line
-// (`Received`). Sequence numbers let the receiver count what went missing
-// and drop duplicates; a packet lost on a broken stream is not resent.
+// The stream, on the migration connection right after the target's answer.
+// The source opens it with `START`; the receiver answers `b'a'` and the
+// sequence number it expects first (a u64, 0), and only then does the
+// source take packets off its queue. Then frames: a big-endian u32 length,
+// a u64 sequence number and that many bytes of IP packet. `SYNC` (no more)
+// asks the receiver to answer `b's'` once it has injected everything
+// before it; a missing or wrong answer breaks the stream. Length 0 ends
+// it, and the receiver answers with one JSON line (`Received`). Sequence
+// numbers let the receiver count what went missing and drop duplicates.
+// Nothing is resent: what a broken stream loses is counted as dropped.
 const SYNC: u32 = u32::MAX;
 const START: u32 = u32::MAX - 1;
 /// Receivers running at once, all migrations together.
@@ -394,7 +403,7 @@ pub struct Received {
     pub dropped: u64,
     /// The stream ended properly (rather than timing out or breaking off).
     pub ended: bool,
-    /// The sequence number a resumed stream would start at.
+    /// The next sequence number expected.
     pub next: u64,
 }
 
@@ -406,15 +415,16 @@ pub fn wait_start(r: &mut BufReader<TcpStream>, deadline: Instant) -> bool {
 
 /// Accepts a stream opened with `START` and injects its packets, all for
 /// `ip`, into `tap` until it ends or `deadline` (enforced on every read and
-/// write, partial frames included). `next` is the first sequence number
-/// expected. Answers the source when the stream ends. None if too many
-/// streams are being received already.
-pub fn receive(r: &mut BufReader<TcpStream>, ip: Ipv4Addr, tap: &str, next: u64, deadline: Instant) -> Option<Received> {
+/// write, partial frames included). Each injection happens under `revoked`
+/// and only while it is false (the VM is still the one the stream is for).
+/// Answers the source when the stream ends. None if too many streams are
+/// being received already.
+pub fn receive(r: &mut BufReader<TcpStream>, ip: Ipv4Addr, tap: &str, revoked: &Mutex<bool>, deadline: Instant) -> Option<Received> {
     let _slot = Receiver::enter()?;
-    let mut got = Received { next, ..Received::default() };
+    let mut got = Received::default();
     let Ok(inj) = Injector::new(tap) else { return Some(got) };
     let mut ack = vec![b'a'];
-    ack.extend_from_slice(&next.to_be_bytes());
+    ack.extend_from_slice(&0u64.to_be_bytes());
     if write_by(r.get_ref(), &ack, deadline).is_err() {
         return Some(got);
     }
@@ -447,7 +457,11 @@ pub fn receive(r: &mut BufReader<TcpStream>, ip: Ipv4Addr, tap: &str, next: u64,
         }
         got.dropped += seq - got.next;
         got.next = seq + 1;
-        if valid(&buf[..len], ip) && inj.send(&buf[..len]) {
+        let sent = {
+            let revoked = revoked.lock().unwrap();
+            !*revoked && valid(&buf[..len], ip) && inj.send(&buf[..len])
+        };
+        if sent {
             got.injected += 1;
         } else {
             got.dropped += 1;
@@ -461,8 +475,8 @@ pub fn receive(r: &mut BufReader<TcpStream>, ip: Ipv4Addr, tap: &str, next: u64,
     Some(got)
 }
 
-/// An IPv4 packet, whole, for `ip`.
-fn valid(p: &[u8], ip: Ipv4Addr) -> bool {
+/// An IPv4 packet, whole, for `ip`: all a guest is ever handed.
+pub fn valid(p: &[u8], ip: Ipv4Addr) -> bool {
     let ihl = (p.first().copied().unwrap_or(0) & 15) as usize * 4;
     p.len() >= 20
         && p[0] >> 4 == 4
@@ -508,17 +522,26 @@ fn read_by(r: &mut BufReader<TcpStream>, mut buf: &mut [u8], deadline: Instant) 
     Ok(())
 }
 
-fn write_by(mut w: &TcpStream, buf: &[u8], deadline: Instant) -> std::io::Result<()> {
-    let left = deadline.saturating_duration_since(Instant::now());
-    if left.is_zero() {
-        return Err(std::io::ErrorKind::TimedOut.into());
+/// Writes all of `buf`, giving up at `deadline` however slowly it drains.
+fn write_by(mut w: &TcpStream, mut buf: &[u8], deadline: Instant) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        w.set_write_timeout(Some(left))?;
+        match w.write(buf) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(n) => buf = &buf[n..],
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
     }
-    w.set_write_timeout(Some(left))?;
-    w.write_all(buf)
+    Ok(())
 }
 
 /// Opens a stream on `conn` (`START`) and waits for the receiver to accept
-/// it. Returns the sequence number to start at.
+/// it. Returns the sequence number to start at (0).
 pub fn start(conn: &TcpStream) -> Result<u64> {
     let deadline = Instant::now() + ACCEPT_WAIT;
     write_by(conn, &START.to_be_bytes(), deadline)?;
@@ -540,32 +563,22 @@ pub fn send(holder: &Holder, ip: Ipv4Addr, mig: u64, conn: &TcpStream, seq: u64,
     let _ = conn.set_write_timeout(Some(CATCH_UP * 4));
     let out = std::cell::RefCell::new(Out { buf: Vec::with_capacity(64 << 10), seq, broken: false, conn });
     let mut sink = |p: &[u8]| out.borrow_mut().frame(p);
+    // Exactly one `s` per sync, in time, or the stream counts as broken.
     let mut barrier = || {
         let mut o = out.borrow_mut();
         o.buf.extend_from_slice(&SYNC.to_be_bytes());
-        if !o.flush() {
-            return false;
+        let mut ack = [0u8; 1];
+        let ok = o.flush() && conn.try_clone().is_ok_and(|c| read_by(&mut BufReader::with_capacity(1, c), &mut ack, Instant::now() + SYNC_WAIT).is_ok()) && ack[0] == b's';
+        if !ok {
+            o.broken = true;
+            eprintln!("hold {ip}: the target did not confirm the held packets; dropping the rest");
         }
-        let _ = conn.set_read_timeout(Some(CATCH_UP));
-        if (&mut &*conn).read_exact(&mut [0u8; 1]).is_err() {
-            // Slow rather than gone, maybe; the stream goes on, unordered.
-            eprintln!("hold {ip}: the target did not confirm the held packets in time");
-        }
-        true
+        ok
     };
     let (mut stats, switched) = holder.release(ip, mig, &mut sink, &mut barrier, switch)?;
     let mut o = out.into_inner();
     o.buf.extend_from_slice(&0u32.to_be_bytes());
-    let reply = o
-        .flush()
-        .then(|| {
-            let _ = conn.set_read_timeout(Some(Duration::from_secs(1)));
-            // A late answer to a sync may come first.
-            let mut line = String::new();
-            std::io::BufRead::read_line(&mut BufReader::new(conn), &mut line).ok()?;
-            serde_json::from_str::<Value>(line.trim_start_matches('s')).ok()
-        })
-        .flatten();
+    let reply = o.flush().then(|| read_reply(conn, Instant::now() + REPLY_WAIT)).flatten();
     match reply {
         Some(r) => {
             stats.injected = r["injected"].as_u64().unwrap_or(0);
@@ -575,6 +588,21 @@ pub fn send(holder: &Holder, ip: Ipv4Addr, mig: u64, conn: &TcpStream, seq: u64,
         None => stats.dropped_target = stats.packets,
     }
     Some((stats, switched))
+}
+
+/// The receiver's closing JSON line: at most 256 bytes, by `deadline`.
+fn read_reply(conn: &TcpStream, deadline: Instant) -> Option<Value> {
+    let mut r = BufReader::with_capacity(1, conn.try_clone().ok()?);
+    let mut line = Vec::new();
+    let mut b = [0u8; 1];
+    while line.len() < 256 {
+        read_by(&mut r, &mut b, deadline).ok()?;
+        if b[0] == b'\n' {
+            return serde_json::from_slice(&line).ok();
+        }
+        line.push(b[0]);
+    }
+    None
 }
 
 /// The sending end of a held-packet stream, buffered.
