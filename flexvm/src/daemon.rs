@@ -44,7 +44,7 @@ const FAULTS: &[&str] = &[
     "pages", "route", "lost_ack", "status", "prepare_fail", "short_incoming", "slow_preload",
     "restore_no_hold", "restore_before_run", "restore_after_run", "ckpt_memhash", "ckpt_fail_protect",
     "ckpt_no_hold", "ckpt_abort", "ckpt_slow", "ckpt_fail_write", "ckpt_copy_wait", "resume_kill", "kill_prepared",
-    "guest_drop", "guest_lose_reply", "hot_low_estimate",
+    "guest_drop", "guest_lose_reply", "hot_low_estimate", "started_fsync", "started_unmark",
 ];
 
 pub struct Config {
@@ -99,6 +99,12 @@ const SETTLE_WAIT: Duration = Duration::from_secs(10);
 struct Suspended {
     dir: PathBuf,
     manifest: Manifest,
+    /// Why it cannot be resumed: a resume failed to mark its checkpoint
+    /// STARTED and could not durably take the mark back either, so the
+    /// checkpoint may or may not come back after a crash. It never ran
+    /// from it; `kill` discards it, and a daemon restart goes by what the
+    /// disk holds (STARTED: deleted, else suspended again).
+    quarantine: Option<String>,
 }
 
 pub struct Daemon {
@@ -954,7 +960,10 @@ impl Daemon {
     /// `slow_preload` (a migration source sends the preloaded pages 300 ms
     /// after the vmstate), `kill_prepared` (an incoming migration's
     /// prepared Firecracker dies, and its pager sees it, just before the load), `resume_kill` (Firecracker
-    /// is killed right after a restored VM's resume is sent), `guest_drop`
+    /// is killed right after a restored VM's resume is sent), `started_fsync`
+    /// (a suspended VM's resume creates its STARTED marker but fails to make
+    /// it durable), `started_unmark` (taking that marker back then fails
+    /// at the directory fsync), `guest_drop`
     /// (the daemon's retried guest requests are refused before reaching the
     /// guest) or `guest_lose_reply` (they are carried out but their replies
     /// lost); those two for `ms` from the first request they hit.
@@ -2033,8 +2042,9 @@ fn resize(vm: &Vm, host_avail: u64, reserve: u64) -> Result<u64> {
     Ok(grow)
 }
 
-/// Tells a migration source to drop its copy, retrying with backoff for a
-/// while. Returns true, or the last error.
+/// Tells a migration source to drop its copy, retrying with backoff (up to
+/// 30 s apart) until it answers, however long that takes. Returns true, or
+/// the error it answered with.
 ///
 /// An obligation: the source stays paused (and a shutting-down source waits)
 /// until it hears this, so it is retried with backoff for as long as it

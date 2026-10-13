@@ -63,7 +63,8 @@ impl Daemon {
                 "ip": m.ip.to_string(),
                 "template": m.template,
                 "template_id": m.template_id,
-                "state": "suspended",
+                "state": if s.quarantine.is_some() { "quarantined" } else { "suspended" },
+                "quarantine": s.quarantine,
                 "vcpus": m.vcpus,
                 "rss_mib": 0,
                 "guest_mib": m.mem_mib + m.hotplug_mib,
@@ -143,7 +144,13 @@ impl Daemon {
             return Ok(json!({"name": name, "state": "running", "from": "paused", "resume_ms": ms(took)}));
         }
         let mut t = Phases::new();
-        let s = self.suspended.lock().unwrap().remove(name);
+        let s = {
+            let mut suspended = self.suspended.lock().unwrap();
+            if let Some(why) = suspended.get(name).and_then(|s| s.quarantine.as_ref()) {
+                bail!("vm {name} is quarantined: {why}; kill it to discard its checkpoint");
+            }
+            suspended.remove(name)
+        };
         let Some(s) = s else { bail!("no vm named {name:?}") };
         // The checkpoint stays where it is; `restore_checkpoint` marks it
         // STARTED, durably, before any vCPU runs, and a daemon restart
@@ -161,6 +168,14 @@ impl Daemon {
             Err(Restore::NotRun(e)) => {
                 self.suspended.lock().unwrap().insert(name.into(), s);
                 Err(e)
+            }
+            // It never ran, but its checkpoint may or may not be marked
+            // STARTED on disk: neither resumable nor to be deleted here.
+            Err(Restore::Uncertain(e)) => {
+                let why = e.to_string();
+                eprintln!("vm {name}: quarantined: {why}");
+                self.suspended.lock().unwrap().insert(name.into(), Suspended { quarantine: Some(why.clone()), ..s });
+                bail!("vm {name} is quarantined: {why}; kill it to discard its checkpoint")
             }
             // Its vCPUs may have run, so its checkpoint is consumed:
             // re-arming it would replay whatever the VM did since.
@@ -257,7 +272,7 @@ impl Daemon {
         vm.kill();
         t.mark("release");
         let data_mib = (manifest.data_pages * PAGE_SIZE as u64) >> 20;
-        self.suspended.lock().unwrap().insert(name.into(), Suspended { dir: dest.clone(), manifest });
+        self.suspended.lock().unwrap().insert(name.into(), Suspended { dir: dest.clone(), manifest, quarantine: None });
         Ok(json!({
             "name": name,
             "state": "suspended",
@@ -370,9 +385,22 @@ impl Daemon {
         if owned {
             // Durably consumed before it can run: a crash from here on must
             // not bring this checkpoint back (see `load_suspended`).
-            if let Err(e) = mark_durably(&dir, STARTED) {
-                let _ = std::fs::remove_file(dir.join(STARTED));
-                return Err(Restore::NotRun(kill(format!("marking the checkpoint started: {e}").into())));
+            let marked = match self.fault("started_fsync") {
+                true => std::fs::File::create(dir.join(STARTED)).and(Err(std::io::Error::other("injected fault: fsync failed"))),
+                false => mark_durably(&dir, STARTED),
+            };
+            if let Err(e) = marked {
+                // The marker may be on disk, or get there later: take it
+                // back durably, or the VM may be neither resumable nor gone.
+                vm.kill();
+                let unmarked = match self.fault("started_unmark") {
+                    true => std::fs::remove_file(dir.join(STARTED)).and(Err(std::io::Error::other("injected fault: fsync failed"))),
+                    false => unmark_durably(&dir, STARTED),
+                };
+                return Err(match unmarked {
+                    Ok(()) => Restore::NotRun(format!("marking the checkpoint started: {e}").into()),
+                    Err(r) => Restore::Uncertain(format!("marking the checkpoint started: {e}; removing the mark: {r}").into()),
+                });
             }
         }
         // From the resume request on, the vCPUs may have run.
@@ -689,7 +717,7 @@ impl Daemon {
                         eprintln!("suspended vm {name}: {} is already taken", ck.manifest.ip);
                     }
                     eprintln!("suspended vm {name} ({}) found in {}", ck.manifest.ip, e.path().display());
-                    self.suspended.lock().unwrap().insert(name, Suspended { dir: ck.dir, manifest: ck.manifest });
+                    self.suspended.lock().unwrap().insert(name, Suspended { dir: ck.dir, manifest: ck.manifest, quarantine: None });
                 }
                 Err(err) => eprintln!("ignoring {}: {err}", e.path().display()),
             }
@@ -798,12 +826,14 @@ impl Drop for PacketHold<'_> {
 pub(super) enum Restore {
     NotRun(Error),
     Ran(Error),
+    /// Not run, but its (owned) checkpoint may be marked STARTED or not.
+    Uncertain(Error),
 }
 
 impl Restore {
     fn error(self) -> Error {
         match self {
-            Restore::NotRun(e) | Restore::Ran(e) => e,
+            Restore::NotRun(e) | Restore::Ran(e) | Restore::Uncertain(e) => e,
         }
     }
 }
@@ -830,6 +860,15 @@ impl Drop for HeldReports<'_> {
 /// Creates marker file `name` in `dir` and makes it durable.
 fn mark_durably(dir: &Path, name: &str) -> std::io::Result<()> {
     std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(dir.join(name))?.sync_all()?;
+    std::fs::File::open(dir)?.sync_all()
+}
+
+/// Removes marker file `name` from `dir`, if there, and makes that durable.
+fn unmark_durably(dir: &Path, name: &str) -> std::io::Result<()> {
+    match std::fs::remove_file(dir.join(name)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
     std::fs::File::open(dir)?.sync_all()
 }
 

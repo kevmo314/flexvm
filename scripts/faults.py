@@ -7,7 +7,7 @@ or cleanly failed.
 usage: scripts/faults.py [--a ADDR] [--b ADDR] [--bin FLEXVM] [--log-dir DIR] SCENARIO... | all
   'all' runs the scenarios that leave both daemons running; source_killed,
   target_restart, target_restart_symlink, checkpoint_crash, cow_crash,
-  suspend_resume and hot_budget kill a daemon with SIGKILL and restart it with the same command line and
+  suspend_resume, hot_budget and resume_mark_fails kill a daemon with SIGKILL and restart it with the same command line and
   environment (logging to --log-dir). Checkpoint scenarios write to --ckpt-dir.
 """
 import argparse, base64, json, os, socket, subprocess, sys, tempfile, threading, time
@@ -81,7 +81,7 @@ def fault(host, f, ms):
 FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_before_run", "restore_after_run",
           "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "resume_kill",
           "prepare_fail", "short_incoming", "slow_preload", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
-          "hot_low_estimate")
+          "hot_low_estimate", "started_fsync", "started_unmark")
 
 
 def disarm():
@@ -1152,6 +1152,91 @@ def suspend_resume():
     cleanup(n)
 
 
+def open_under(host, path):
+    """Files under `path` the daemon on `host` still has open."""
+    fds = subprocess.run(["sudo", "find", f"/proc/{daemon_pid(host)}/fd", "-type", "l", "-printf", "%l\n"],
+                         capture_output=True, text=True).stdout.split("\n")
+    return [f for f in fds if f.startswith(path.rstrip("/") + "/")]
+
+
+def free_mib(path):
+    st = os.statvfs(path)
+    return st.f_bavail * st.f_frsize >> 20
+
+
+def suspend_disk_freed():
+    """A resumed suspended VM gives its checkpoint's disk space back once
+    every page is in (its pager lets go of the page file), while it runs on."""
+    n = "ft-susp-disk"
+    m = setup(n, mib=1024)
+    r = ok(A, {"op": "suspend", "name": n})
+    d, data = r["dir"], r["data_mib"]
+    state = os.path.dirname(os.path.dirname(d))
+    check("disk freed: checkpoint written", data >= 1000, r)
+    before = free_mib(state)
+    ok(A, {"op": "resume", "name": n})
+    check("disk freed: paged back in", wait_for(lambda: vms(A)[n]["pages_mib"]["remote"] == 0, 60), vms(A)[n])
+    gone = wait_for(lambda: subprocess.run(["sudo", "test", "-e", d]).returncode != 0, 30)
+    check("disk freed: checkpoint deleted", gone)
+    released = wait_for(lambda: not open_under(A, d), 10)
+    check("disk freed: daemon holds no checkpoint file", released, open_under(A, d))
+    after = free_mib(state)
+    print(f"disk freed: {data} MiB checkpoint; free space {before} -> {after} MiB (+{after - before})")
+    check("disk freed: its space came back", after - before >= data * 0.8, (before, after, data))
+    check("disk freed: still running, md5 intact", vms(A)[n]["state"] == "running" and md5(A, n) == m)
+    cleanup(n)
+
+
+def resume_mark_fails():
+    """A resume whose STARTED marker cannot be made durable takes it back
+    durably and leaves the VM suspended; if taking it back fails too, the VM
+    is quarantined (neither resumable nor deleted) until a kill, or until a
+    daemon restart goes by what the disk holds."""
+    n = "ft-mark-fail"
+    m = setup(n, mib=20)
+    d = ok(A, {"op": "suspend", "name": n})["dir"]
+    exists = lambda f: subprocess.run(["sudo", "test", "-e", os.path.join(d, f)]).returncode == 0
+
+    fault(A, "started_fsync", 60000)
+    r = rpc(A, {"op": "resume", "name": n})
+    fault(A, "started_fsync", 0)
+    check("mark fails: resume refused", not r["ok"] and "quarantined" not in r["error"], r)
+    check("mark fails: still suspended", vms(A).get(n, {}).get("state") == "suspended", vms(A).get(n))
+    check("mark fails: marker taken back", not exists("STARTED") and exists("manifest.json"))
+    ok(A, {"op": "resume", "name": n})
+    check("mark fails: resumes later, md5 intact", md5(A, n) == m)
+
+    d = ok(A, {"op": "suspend", "name": n})["dir"]
+    fault(A, "started_fsync", 60000)
+    fault(A, "started_unmark", 60000)
+    r = rpc(A, {"op": "resume", "name": n})
+    disarm()
+    check("unmark fails: resume refused, quarantined", not r["ok"] and "quarantined" in r["error"], r)
+    v = vms(A).get(n, {})
+    check("unmark fails: listed quarantined, with why", v.get("state") == "quarantined" and "removing the mark" in (v.get("quarantine") or ""), v)
+    r = rpc(A, {"op": "resume", "name": n})
+    check("unmark fails: no resume while quarantined", not r["ok"] and "quarantined" in r["error"], r)
+    check("unmark fails: checkpoint kept", exists("manifest.json"))
+    argv, env = kill_daemon(A)
+    start_daemon(A, argv, env)
+    check("unmark fails: after a restart, suspended again (no marker on disk)", vms(A).get(n, {}).get("state") == "suspended", vms(A).get(n))
+    ok(A, {"op": "resume", "name": n})
+    check("unmark fails: then resumes, md5 intact", md5(A, n) == m)
+
+    d = ok(A, {"op": "suspend", "name": n})["dir"]
+    fault(A, "started_fsync", 60000)
+    fault(A, "started_unmark", 60000)
+    rpc(A, {"op": "resume", "name": n})
+    disarm()
+    check("quarantined kill: quarantined", vms(A).get(n, {}).get("state") == "quarantined", vms(A).get(n))
+    ok(A, {"op": "kill", "name": n})
+    check("quarantined kill: gone", n not in vms(A), vms(A).get(n))
+    check("quarantined kill: checkpoint deleted", not exists("manifest.json"))
+    r = rpc(A, {"op": "resume", "name": n})
+    check("quarantined kill: no resume", not r["ok"], r)
+    cleanup(n)
+
+
 # --- copy-on-write and incremental checkpoints --------------------------------
 #
 # memwriter (scripts/memwriter.c) rewrites guest memory continuously, each
@@ -1857,10 +1942,11 @@ SCENARIOS = dict(basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, r
                  ckpt_failed_stop=ckpt_failed_stop, ckpt_rearm=ckpt_rearm,
                  ckpt_dir_moved=ckpt_dir_moved, prepare_disconnect=prepare_disconnect,
                  prepare_trickle=prepare_trickle, prepare_fail=prepare_fail, fc_prepare=fc_prepare,
-                 slow_preload=slow_preload, ckpt_packet_hold=ckpt_packet_hold, hot_budget=hot_budget)
+                 slow_preload=slow_preload, ckpt_packet_hold=ckpt_packet_hold, hot_budget=hot_budget,
+                 suspend_disk_freed=suspend_disk_freed, resume_mark_fails=resume_mark_fails)
 safe = [s for s in SCENARIOS
         if s not in ("source_killed", "target_restart", "target_restart_symlink", "checkpoint_crash", "cow_crash",
-                     "suspend_resume", "hot_budget")]
+                     "suspend_resume", "hot_budget", "resume_mark_fails")]
 names = [n for s in args.scenarios for n in (safe if s == "all" else [s])]
 for s in names:
     try:
