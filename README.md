@@ -65,7 +65,7 @@ VM that is busy, paused or suspended.
   checkpoint finishes that first), saves the vCPU/device state and writes
   every page that differs from the template into DIR, then resumes the VM
   (`--keep-running`, the default) or kills it (`--stop`). The pause lasts as
-  long as the write (about 0.4 GB/s here).
+  long as the write (2.5–3.5 GB/s here, against a disk that takes 4–5 GB/s).
 - **restore DIR** works on any host whose template has the same content id.
   It loads the saved state into a pooled Firecracker whose pager takes
   pages from the checkpoint's page file: on fault, and in the background
@@ -90,7 +90,7 @@ VM that is busy, paused or suspended.
   background. A paused VM can also be **migrated**: it stays paused on the
   target, which pulls all its pages from the source with nothing faulting.
 
-#### Checkpoint format (version 1)
+#### Checkpoint format (version 2)
 
 A checkpoint is a directory that is written in full or not at all. Every file
 goes into a fresh `.NAME.partial-<pid>-<n>` directory next to the target and is
@@ -103,19 +103,31 @@ daemon left behind.
 |---|---|
 | `manifest.json` | line 1: checksum of the rest; then JSON with the format version, name, address, template name and content id, machine (vCPUs, base/max/hotplugged MiB), guest page count, page counts and the length and checksum of each file |
 | `vmstate` | Firecracker's state-only snapshot |
-| `pagemap` | `FVPGMAP1`, then runs `(first page, count, DATA\|ZERO)` and one checksum per 64-page block of `pages` |
-| `pages` | DATA pages back to back, in guest page order |
+| `pagemap` | `FVPGMAP2`, run and data page counts, then runs `(first page, count, DATA\|ZERO, index in pages)` and the CRC32C of every page in `pages` |
+| `pages` | DATA pages back to back, in roughly guest page order |
 
 Pages the pager has PRESENT are a superset of what changed (template pages
 read in by prefetch are PRESENT too). The writer therefore compares each page
 with the template and with zero. A page equal to the template (or zero over a
 template hole) is BASE and is not stored. Zero over template data is a ZERO
 run, and anything else is DATA. A restore checks the manifest, `vmstate` and
-`pagemap` before it loads anything, and checks every block of `pages` as it
-reads it. A bad block fails the VM (it is killed) rather than letting it run on wrong memory. The
-checksum is the 64-bit content hash used for template ids. It catches
-corruption, but not deliberate tampering. A checkpoint belongs to the owner of
-the directory it was written into.
+`pagemap` (whose DATA runs must tile `pages` exactly) before it loads
+anything, and checks every page of `pages` against its CRC32C as it reads
+it. A bad page fails the VM (it is killed) rather than letting it run on
+wrong memory. The checksums catch corruption, but not deliberate tampering. A
+checkpoint belongs to the owner of the directory it was written into.
+
+The writer makes one pass over each page and one copy of it. Up to 12
+threads take 1 MiB units of PRESENT pages in turn. A thread copies its unit
+out of Firecracker with `process_vm_readv`, compares each page with the
+template (only where the template has data) and computes its CRC32C and
+whether it is all zero in the same read (SSE4.2, three interleaved streams).
+It then reserves the unit's place at the end of `pages` and writes its DATA
+pages there with `pwritev` and `O_DIRECT`, straight from its buffer, so the
+page cache is never involved. Units land in the order they finish, which the
+page map records, so no thread waits for another. `pages` is preallocated
+(`fallocate`) for every PRESENT page before the VM pauses, which is what lets
+ext4 run the direct writes in parallel; it is trimmed to what was written.
 
 ### Migration ownership
 
@@ -186,7 +198,7 @@ RAM and double memory use on a host that is already short.
 | Background memory pull | ~1.1 GB/s over loopback TCP |
 | Idle VM host RSS | 13–35 MiB |
 | pause / resume (daemon side; RPC round trip ~2.3 ms) | **0.6 / 0.7 ms** (2 vCPU), 1.5 ms resume (24 vCPU) |
-| checkpoint, by memory touched: 0 / 256 / 1024 MiB written in the guest | 133 / 616 / 2609 ms paused (p50; 3 / 268 / 1055 MiB stored) |
+| checkpoint `--stop`, by memory touched: 256 / 1024 / 4096 MiB written in the guest | write_pages 93–119 / 357–396 / 1438–2485 ms (2.3–2.9 GB/s; was 342–481 / 1609–1834 / 6358–7715 ms, 0.55–0.78 GB/s); paused 237–317 / 671–691 / 2158–3258 ms including Firecracker's exit; disk: 5.1 GB/s O_DIRECT, 1.0 GB/s buffered |
 | restore → guest agent answering | **33 / 27 / 67 ms** (snapshot load 28 / 24 / 63 ms); whole checkpoint paged in after 39 / 153 / 509 ms |
 | suspend (checkpoint + free) / resume of a suspended VM to ready | 127 / 448 / 2012 ms; 27 / 28 / 36 ms |
 | suspended VM host RSS | 0 (Firecracker gone) |
@@ -300,10 +312,10 @@ firecracker/        patches on top of Firecracker v1.17.0
 - The controller samples guest memory once a second (balloon stats). A very
   fast allocation burst can still hit the in-guest OOM killer; guest PSI
   triggers over vsock would react faster.
-- **Checkpoints pause the VM for the whole write** (about 0.4 GB/s: reading
-  memory out of Firecracker, comparing with the template, checksumming,
-  fsync). Copy-on-write or pre-copy (#8) would make the pause independent of
-  memory size. Checkpoints are full each time, not incremental.
+- **Checkpoints pause the VM for the whole write** (2.5–3.5 GB/s here,
+  mostly disk-bound; the one remaining copy is `process_vm_readv`).
+  Copy-on-write or pre-copy (#8) would make the pause independent of memory
+  size. Checkpoints are full each time, not incremental.
 - **The restore working set is the template's** (pages a fresh VM touches to
   become ready), not the checkpointed VM's own recent working set. This host
   has no idle page tracking to record that. Everything else is paged in
