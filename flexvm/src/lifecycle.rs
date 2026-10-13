@@ -308,19 +308,14 @@ impl Daemon {
         if name.is_empty() || self.taken(&name) {
             bail!("vm name {name:?} is empty or taken");
         }
+        // A given address, the checkpoint's own included, is checked against
+        // the peers as well (`claim_given_ip`).
         let ip = match ip {
             Some("auto") => self.claim_ip_kept(None)?,
             Some(ip) => self.claim_ip_kept(Some(ip))?,
-            None => {
-                let ip = ck.manifest.ip;
-                for peer in &self.cfg.peers {
-                    let used = peer_info(peer).is_ok_and(|i| i["ips"].as_array().is_some_and(|a| a.contains(&json!(ip.to_string()))));
-                    if used {
-                        bail!("{ip} is in use on {peer}; restore with --ip");
-                    }
-                }
-                self.claim_ip_kept(Some(&ip.to_string()))?
-            }
+            None => self
+                .claim_ip_kept(Some(&ck.manifest.ip.to_string()))
+                .map_err(|e| format!("{e}; restore with --ip auto (or another address)"))?,
         };
         t.mark("claim_ip");
         // A user's checkpoint is immutable and may be restored again whether
@@ -727,8 +722,13 @@ impl Daemon {
             }
             match Checkpoint::open(&e.path()) {
                 Ok(ck) => {
-                    if !self.addrs.lock().unwrap().used.insert(ck.manifest.ip) {
-                        eprintln!("suspended vm {name}: {} is already taken", ck.manifest.ip);
+                    match self.addrs.lock().unwrap().used.entry(ck.manifest.ip) {
+                        std::collections::hash_map::Entry::Vacant(v) => {
+                            v.insert(addr_token());
+                        }
+                        std::collections::hash_map::Entry::Occupied(_) => {
+                            eprintln!("suspended vm {name}: {} is already taken", ck.manifest.ip)
+                        }
                     }
                     eprintln!("suspended vm {name} ({}) found in {}", ck.manifest.ip, e.path().display());
                     self.suspended.lock().unwrap().insert(name, Suspended { dir: ck.dir, manifest: ck.manifest, quarantine: None });

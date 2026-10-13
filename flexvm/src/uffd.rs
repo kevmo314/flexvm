@@ -71,6 +71,16 @@ const GONE: &str = "firecracker unmapped guest memory";
 /// answer the request that failed, before the pager kills it.
 const UNMAPPED_GRACE: Duration = Duration::from_secs(2);
 
+/// Largest read a page server serves in one request: the largest any pager
+/// asks for. A longer one is a broken or hostile client.
+pub const MAX_FETCH: usize = PULL_RUN * PAGE_SIZE;
+const _: () = assert!(REMOTE_FAULT_RUN <= PULL_RUN && PREFETCH_RUN <= PULL_RUN);
+/// How long a page-server connection may sit idle between requests while
+/// its VM is still a migration source (once it is not, it ends within a
+/// second); a client that comes back after this just reconnects.
+const SERVE_IDLE: Duration = Duration::from_secs(600);
+/// How long a page server waits for a client to take a reply.
+const SERVE_WRITE: Duration = Duration::from_secs(30);
 /// How long a fault may keep failing (other than EAGAIN) before the pager gives up.
 const FAULT_TIMEOUT: Duration = Duration::from_secs(1);
 /// How long the migration source may stay unreachable before the pager gives up.
@@ -1895,6 +1905,7 @@ fn probe_once(source: &Source, page: u64, at: Instant) -> io::Result<()> {
     req.extend_from_slice(&(page * PAGE_SIZE as u64).to_le_bytes());
     req.extend_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
     s.write_all(&req)?;
+    read_ack(&mut s)?;
     let mut status = [0u8; 1];
     s.read_exact(&mut status)?;
     if status[0] != 0 {
@@ -1903,9 +1914,35 @@ fn probe_once(source: &Source, page: u64, at: Instant) -> io::Result<()> {
     s.read_exact(&mut vec![0u8; PAGE_SIZE])
 }
 
+/// Reads the page server's answer to the `pages` request: one JSON line,
+/// `{"ok": true}` before the binary protocol, or why it refuses (then it
+/// hangs up). Read a byte at a time, so nothing after it is consumed.
+fn read_ack(s: &mut impl Read) -> io::Result<()> {
+    let mut line = Vec::new();
+    let mut b = [0u8; 1];
+    while b[0] != b'\n' {
+        if line.len() >= 4096 {
+            return Err(io::Error::other("page server sent an overlong answer"));
+        }
+        if s.read(&mut b)? == 0 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "page server hung up before answering"));
+        }
+        line.push(b[0]);
+    }
+    let v: serde_json::Value = serde_json::from_slice(&line).map_err(|e| io::Error::other(format!("page server answer: {e}")))?;
+    if v["ok"] != serde_json::json!(true) {
+        let why = v["error"].as_str().unwrap_or("no reason given");
+        return Err(io::Error::other(format!("page server refused: {why}")));
+    }
+    Ok(())
+}
+
 /// Client for a migration source's page server.
 pub struct PageClient {
     stream: TcpStream,
+    /// Whether the server's answer to the `pages` request has been read: it
+    /// is read along with the first reply, so connecting costs no round trip.
+    acked: bool,
 }
 
 impl PageClient {
@@ -1917,7 +1954,7 @@ impl PageClient {
         let mut hello = serde_json::to_vec(&hello)?;
         hello.push(b'\n');
         stream.write_all(&hello)?;
-        Ok(PageClient { stream })
+        Ok(PageClient { stream, acked: false })
     }
 
     pub fn fetch(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
@@ -1925,6 +1962,10 @@ impl PageClient {
         req[..8].copy_from_slice(&offset.to_le_bytes());
         req[8..].copy_from_slice(&(buf.len() as u32).to_le_bytes());
         self.stream.write_all(&req)?;
+        if !self.acked {
+            read_ack(&mut self.stream)?;
+            self.acked = true;
+        }
         let mut status = [0u8; 1];
         self.stream.read_exact(&mut status)?;
         if status[0] != 0 {
@@ -1934,17 +1975,28 @@ impl PageClient {
     }
 }
 
-/// Serves page reads for `pager` on an accepted page-server connection,
-/// until the client hangs up or `down()` says to drop it.
-pub fn serve_pages(pager: &Pager, mut stream: impl Read + Write, down: impl Fn() -> bool) -> io::Result<()> {
+/// Serves page reads for `pager` on an accepted page-server connection
+/// (already answered `ok`), until the client hangs up, sits idle for
+/// `SERVE_IDLE`, asks for more than `MAX_FETCH`, or `stop()` says to drop
+/// it. `stop` is asked before every request and every second meanwhile, so
+/// a connection ends soon after its VM stops being a migration source.
+/// `conn` is the socket under `stream`, for its timeouts.
+pub fn serve_pages(pager: &Pager, conn: &TcpStream, mut stream: impl Read + Write, stop: impl Fn() -> bool) -> io::Result<()> {
+    conn.set_read_timeout(Some(Duration::from_secs(1)))?;
+    conn.set_write_timeout(Some(SERVE_WRITE))?;
     let mut req = [0u8; 12];
     let mut buf = Vec::new();
     loop {
-        if stream.read_exact(&mut req).is_err() || down() {
+        if !read_request(&mut stream, &mut req, &stop) || stop() {
             return Ok(());
         }
         let offset = u64::from_le_bytes(req[..8].try_into().unwrap());
         let len = u32::from_le_bytes(req[8..].try_into().unwrap()) as usize;
+        if len > MAX_FETCH {
+            eprintln!("page server: refusing a {len}-byte read (at most {MAX_FETCH}); dropping the connection");
+            stream.write_all(&[1])?;
+            return Ok(());
+        }
         buf.resize(len, 0);
         match pager.read_guest(offset, &mut buf) {
             Ok(()) => {
@@ -1957,6 +2009,28 @@ pub fn serve_pages(pager: &Pager, mut stream: impl Read + Write, down: impl Fn()
             }
         }
     }
+}
+
+/// Reads one 12-byte request through the socket's 1 s read timeout. False
+/// when the client hung up or the connection should end (`stop`, or idle
+/// for `SERVE_IDLE`).
+fn read_request(stream: &mut impl Read, req: &mut [u8; 12], stop: &impl Fn() -> bool) -> bool {
+    let since = Instant::now();
+    let mut n = 0;
+    while n < req.len() {
+        match stream.read(&mut req[n..]) {
+            Ok(0) => return false,
+            Ok(k) => n += k,
+            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+                if stop() || since.elapsed() >= SERVE_IDLE {
+                    return false;
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return false,
+        }
+    }
+    true
 }
 
 /// The pages of `wanted` (sorted) that `runs` make REMOTE on a target.

@@ -117,8 +117,9 @@ VM that is busy, paused or suspended.
   checkpoint's page file: on fault, and in the background (the template's
   working set first) until all are in. The VM is ready in about the time of
   a `run`. By default it keeps its name and address. A restore refuses an
-  address a peer is using; `--ip auto` picks a new one, which also makes a
-  restore a fork of a running VM. `--paused` holds the restored VM paused
+  address a peer is using or has lent out, whether it is the checkpoint's or
+  one given with `--ip` (as does `run --ip`); `--ip auto` picks a new one,
+  which also makes a restore a fork of a running VM. `--paused` holds the restored VM paused
   until `resume`; its memory is still paged in meanwhile.
 - **suspend** checkpoints into the daemon's `--state-dir` (default
   `/var/lib/flexvm/<listen>`). The state dir must be on disk, not tmpfs, and
@@ -505,13 +506,29 @@ the source never resumes on its own: it resumes only on an explicit refusal, or
 when the target, asked about that id, says it aborted (asking also fences the
 id off, so it can never start later). If the target committed, the source stays
 paused and serves memory until the target releases it with the same id;
-release is idempotent and ignores any other VM by that name. If the target
+release is idempotent and ignores any other VM by that name. Meanwhile `kill`
+refuses that paused copy (kill the VM where it runs); `kill --force` kills it
+anyway, without withdrawing the address, and the target loses every page it
+has not pulled. If the target
 cannot be asked, the VM stays paused on the source until it can. A daemon
 locks its run directory (refusing to start if another daemon uses it, or one
 inside or around it) and kills any Firecracker a previous instance left there,
 confirming each is dead, before it answers anything, so "never seen this id" is true of a restarted target too
 (a source resuming then rolls the VM back to the pause point; it never runs
-twice).
+twice). It also removes the run directories those Firecrackers left. A
+target forgets an aborted migration's id 10 minutes after it aborted, and a
+committed one's 10 minutes after its source answered the release, so the
+record of migrations stays bounded.
+
+The page server (`pages`) answers its request line with one JSON line,
+`{"ok": true}` or why it refuses, before the binary protocol, so a target
+reports the source's reason rather than a hang-up. It serves reads of at most
+1 MiB (the largest a pager asks for) and drops a connection that asks for
+more, that sits idle for 10 minutes, or whose VM is no longer that
+migration's source (checked every second). Peer-sized lengths are bounded
+everywhere a daemon reads them: request lines (16 MiB), a migration's header
+(256 MiB, parsed straight into page runs), vmstate (64 MiB), preloaded pages
+(4096).
 
 `FLEXVM_FAULTS=1` lets a daemon accept `{"op": "fault", "fault": F, "ms": N}`
 for any of the faults in `FAULTS` (`flexvm/src/daemon.rs`, described at
@@ -651,7 +668,15 @@ and a second copy could repeat what it did.
   outlives restarts) until that VM is killed wherever it is (its host tells
   the peers), or it migrates back. If that message is lost, the address stays
   taken; `flexvm unlend IP` frees it. Leaks, never collisions. `flexvm run --ip` picks
-  one explicitly.
+  one explicitly (refused if a peer that answers uses it or has lent it out).
+- **Incarnations.** Each VM's address carries a random token, given out with
+  the address (run, restore) and kept by the VM through migrations. The lent
+  record stores it, and withdrawals and route announcements carry it: a
+  withdrawal frees a loan, or removes a route a peer announced, only if the
+  tokens match. So a late withdrawal for a VM long gone (say one an operator
+  unlent, whose address then went to a new VM that migrated away too) leaves
+  the newer VM's loan and route alone. A VM migrating back takes its address
+  back only with the token it was lent with.
 - Reachability:
   - **Peers** get a route pushed to them: `<vm-ip>/32 via <host underlay ip>`.
     Routes via an address local to the daemon's network namespace (including

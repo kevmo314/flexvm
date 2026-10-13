@@ -294,6 +294,9 @@ def pages_dead_restore():
     # Loaded with its vCPUs stopped, it is killed before it ever ran there.
     check("pages dead at restore: never ran on the target",
           "never ran here" in r.get("error", "") or "snapshot/load" in r.get("error", ""), r.get("error"))
+    # The page server's refusal reaches the target, not just a hang-up.
+    check("pages dead at restore: the source's reason is reported",
+          "page server refused: injected fault" in r.get("error", "") or "snapshot/load" in r.get("error", ""), r.get("error"))
     check("pages dead at restore: source resumed, only on A", where(n) == {A: "running"}, where(n))
     check("pages dead at restore: md5 intact on A", md5(A, n) == m)
     cleanup(n)
@@ -2094,6 +2097,146 @@ def plug_storm():
     cleanup(n)
 
 
+def kill_source():
+    """A migration's paused source copy cannot be killed (the target still
+    pulls from it and releases it); the VM lives on at the target."""
+    n = "ft-kill-source"
+    m = setup(n, mib=1500)
+    ok(A, {"op": "migrate", "name": n, "to": B})
+    # Keep the pull from finishing (the target retries for 10 s).
+    fault(A, "pages", 3000)
+    r = rpc(A, {"op": "kill", "name": n})
+    check("kill source: refused", not r["ok"] and "source of migration" in r.get("error", ""), r)
+    check("kill source: copy still paused on A", vms(A).get(n, {}).get("state") == "source", where(n))
+    st = wait_released(B, n)
+    check("kill source: target pulled everything and released it",
+          st["released"] is True and st["failed"] is None and where(n) == {B: "running"}, (st, where(n)))
+    check("kill source: md5 intact on B", md5(B, n) == m)
+    cleanup(n)
+
+
+def raw(host, data, timeout=10):
+    """Sends `data` on a new connection; returns everything until EOF."""
+    h, port = host.rsplit(":", 1)
+    with socket.create_connection((h, int(port)), timeout=timeout) as s:
+        try:
+            s.sendall(data)
+            s.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+        out = b""
+        try:
+            while d := s.recv(65536):
+                out += d
+        except OSError:
+            pass
+    return out
+
+
+def forged_peer():
+    """Peer-sized lengths a forged peer sends (a huge vmstate, too many
+    preloaded pages, a huge page request, an endless request line) are refused
+    without the daemon dying, and page-server refusals reach the client."""
+    tid = template_id()
+    for label, hdr in (("vmstate", {"runs": [], "vmstate_len": 1 << 40, "preload": []}),
+                       ("preload", {"runs": [], "vmstate_len": 0, "preload": list(range(5000))})):
+        n, ip = f"ft-forged-{label}", "10.250.0.9"
+        s, r, _ = migrate_in_raw(B, n, ip, tid)
+        check(f"forged {label}: target prepared", r.get("ok"), r)
+        s.sendall((json.dumps(hdr) + "\n").encode())
+        s.settimeout(30)
+        try:
+            reply = s.recv(65536)
+        except OSError as e:
+            reply = str(e).encode()
+        s.close()
+        check(f"forged {label}: refused", b'"ok":false' in reply and b"more than" in reply, reply[:300])
+        check(f"forged {label}: target still up", rpc(B, {"op": "info"}).get("ok"))
+        nothing_left(f"forged {label}", n, ip)
+    raw(B, b"x" * (17 << 20))
+    check("forged request line: endless line cut off, target still up", rpc(B, {"op": "info"}).get("ok"))
+    # The page server answers before its binary protocol, refusals too.
+    n = "ft-forged-pages"
+    m = setup(n, mib=1500)
+    out = raw(A, (json.dumps({"op": "pages", "name": n, "mig": 1}) + "\n").encode())
+    try:
+        refusal = json.loads(out.split(b"\n")[0])
+    except ValueError:
+        refusal = {}
+    check("forged pages: refusal answered", refusal.get("ok") is False and "not the source" in refusal.get("error", ""), out[:200])
+    r = ok(A, {"op": "migrate", "name": n, "to": B})
+    h, port = A.rsplit(":", 1)
+    with socket.create_connection((h, int(port)), timeout=10) as s:
+        req = json.dumps({"op": "pages", "name": n, "mig": r["mig"]}).encode() + b"\n"
+        s.sendall(req + (0).to_bytes(8, "little") + (0xFFFFFFFF).to_bytes(4, "little"))
+        out = b""
+        try:
+            while d := s.recv(65536):
+                out += d
+        except OSError:
+            pass
+    if out.startswith(b'{"ok":true}\n'):
+        check("forged pages: a 4 GiB page request is refused", out == b'{"ok":true}\n\x01', out[:100])
+    else:
+        print(f"forged pages: pull finished before the forged request ({out[:100]!r}); huge request not exercised")
+    check("forged pages: source still up", rpc(A, {"op": "info"}).get("ok"))
+    st = wait_released(B, n)
+    check("forged pages: migration completed", st["released"] is True and where(n) == {B: "running"}, (st, where(n)))
+    check("forged pages: md5 intact", md5(B, n) == m)
+    cleanup(n)
+
+
+def restore_ip_peer():
+    """restore --ip, and run --ip, refuse an address a peer's VM holds."""
+    n, path = "ft-rip", ckpt_path("ft-rip")
+    ok(A, {"op": "run", "name": n, "template": args.template})
+    ok(A, {"op": "checkpoint", "name": n, "dir": path})
+    ok(B, {"op": "run", "name": "ft-rip-b", "template": args.template})
+    theirs = vms(B)["ft-rip-b"]["ip"]
+    r = rpc(A, {"op": "restore", "dir": path, "name": "ft-rip2", "ip": theirs})
+    check("restore --ip: a peer's live address is refused", not r["ok"] and "in use on" in r.get("error", ""), r)
+    check("restore --ip: nothing restored", "ft-rip2" not in vms(A) and theirs not in ok(A, {"op": "info"})["ips"])
+    r = rpc(A, {"op": "run", "name": "ft-rip3", "template": args.template, "ip": theirs})
+    check("run --ip: a peer's live address is refused", not r["ok"] and "in use on" in r.get("error", ""), r)
+    r = rpc(A, {"op": "restore", "dir": path, "name": "ft-rip2", "ip": "auto"})
+    check("restore --ip auto still works", r["ok"], r)
+    for x in (n, "ft-rip-b", "ft-rip2", "ft-rip3"):
+        cleanup(x)
+    rm_ckpt(path)
+
+
+def late_withdrawal():
+    """A withdrawal of an address for a VM long gone cannot free a newer
+    VM's loan of the same address."""
+    lent = lambda: ok(A, {"op": "info"})["lent"]
+    n = "ft-late-1"
+    setup(n, mib=1)
+    ip = vms(A)[n]["ip"]
+    ok(A, {"op": "migrate", "name": n, "to": B})
+    wait_released(B, n)
+    old = lent().get(ip)
+    check("late withdrawal: lent while away", old is not None, lent())
+    ok(B, {"op": "kill", "name": n})
+    check("late withdrawal: its own withdrawal frees it", wait_for(lambda: ip not in lent(), 10), lent())
+    n2 = "ft-late-2"
+    ok(A, {"op": "run", "name": n2, "template": args.template, "ip": ip})
+    ok(A, {"op": "migrate", "name": n2, "to": B})
+    wait_released(B, n2)
+    new = lent().get(ip)
+    check("late withdrawal: lent again, a new incarnation", new is not None and new != old, (old, new))
+    # B announces the route for the second VM in the background.
+    time.sleep(1)
+    r = ok(A, {"op": "route", "ip": ip, "tok": old})
+    check("late withdrawal: the old one frees nothing", not r["freed"] and lent().get(ip) == new, (r, lent()))
+    check("late withdrawal: and keeps the newer route", r["stale"], r)
+    r = ok(A, {"op": "route", "ip": ip})
+    check("late withdrawal: one without incarnation frees nothing", not r["freed"] and lent().get(ip) == new, (r, lent()))
+    ok(B, {"op": "kill", "name": n2})
+    check("late withdrawal: the newer VM's withdrawal frees it", wait_for(lambda: ip not in lent(), 10), lent())
+    cleanup(n)
+    cleanup(n2)
+
+
 SCENARIOS = dict(plug_race=plug_race, plug_storm=plug_storm, cow_grow=cow_grow, basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, refused=refused, pages_blip=pages_blip,
                  pages_dead_restore=pages_dead_restore, pages_dead=pages_dead, resume_kill=resume_kill, prepared_retry=prepared_retry, quiet_source=quiet_source,
                  shared_run_dir=shared_run_dir, exec_race=exec_race, guest_calls=guest_calls, source_killed=source_killed,
@@ -2108,7 +2251,9 @@ SCENARIOS = dict(plug_race=plug_race, plug_storm=plug_storm, cow_grow=cow_grow, 
                  ckpt_dir_moved=ckpt_dir_moved, prepare_disconnect=prepare_disconnect,
                  prepare_trickle=prepare_trickle, prepare_fail=prepare_fail, fc_prepare=fc_prepare,
                  slow_preload=slow_preload, ckpt_packet_hold=ckpt_packet_hold, hot_budget=hot_budget,
-                 suspend_disk_freed=suspend_disk_freed, resume_mark_fails=resume_mark_fails)
+                 suspend_disk_freed=suspend_disk_freed, resume_mark_fails=resume_mark_fails,
+                 kill_source=kill_source, forged_peer=forged_peer,
+                 restore_ip_peer=restore_ip_peer, late_withdrawal=late_withdrawal)
 safe = [s for s in SCENARIOS
         if s not in ("source_killed", "target_restart", "target_restart_symlink", "checkpoint_crash", "cow_crash",
                      "suspend_resume", "hot_budget", "resume_mark_fails")]
