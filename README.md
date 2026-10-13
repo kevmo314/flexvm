@@ -256,7 +256,9 @@ through, so the checkpoint is exactly the memory at the pause.
     `PATCH /balloon/reporting/hold` (`firecracker/0003`): Firecracker leaves
     the guest's reports in the queue, neither discarding nor acknowledging
     them, until `.../release` after the copy (also on failure) processes
-    them. The guest's reporting worker just waits for the acknowledgement
+    them. A hold whose answer is lost counts as held, and a release that
+    fails for 5 s is retried by the controller, under the VM's
+    reservation, until it lands. The guest's reporting worker just waits for the acknowledgement
     (it reports asynchronously; nothing else in the guest waits on it).
     The one batch in flight, 32 blocks of 2 or 4 MiB, stays off the
     guest's free lists meanwhile: 90 MiB measured, and allocating all of

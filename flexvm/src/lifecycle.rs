@@ -543,17 +543,15 @@ impl Daemon {
         // `unfreeze`): a discard of an unsaved page would make the pager
         // save everything left first, stalling the guest. Without the
         // Firecracker patch the copy still saves first, only slower (test
-        // fault `ckpt_no_hold` skips the hold, to compare).
-        let _held = match cow && !self.fault("ckpt_no_hold") {
-            true => match vm.hold_reports(true) {
-                Ok(()) => Some(HeldReports(vm)),
-                Err(e) => {
-                    eprintln!("vm {}: free page reports not held during the copy: {e}", vm.name);
-                    None
-                }
-            },
-            false => None,
-        };
+        // fault `ckpt_no_hold` skips the hold, to compare). The guard comes
+        // first: a hold whose answer is lost may still have been applied.
+        let _held = (cow && !self.fault("ckpt_no_hold")).then(|| {
+            let held = HeldReports(vm);
+            if let Err(e) = vm.hold_reports() {
+                eprintln!("vm {}: free page reports may not be held during the copy: {e}", vm.name);
+            }
+            held
+        });
         if cow {
             if let Err(e) = vm.end_checkpoint() {
                 vm.pager.unfreeze(&frozen);
@@ -747,18 +745,19 @@ const STARTED: &str = "STARTED";
 /// In a suspended VM's checkpoint: the VM was killed.
 const DISCARDED: &str = "DISCARDED";
 
-/// Creates marker file `name` in `dir` and makes it durable.
-/// Releases the free page reports a copy-on-write checkpoint held.
+/// Releases the free page reports a copy-on-write checkpoint held; if that
+/// fails, the controller retries it.
 struct HeldReports<'a>(&'a Vm);
 
 impl Drop for HeldReports<'_> {
     fn drop(&mut self) {
-        if let Err(e) = self.0.hold_reports(false) {
+        if let Err(e) = self.0.release_reports(Duration::from_secs(5)) {
             eprintln!("vm {}: releasing free page reports failed: {e}", self.0.name);
         }
     }
 }
 
+/// Creates marker file `name` in `dir` and makes it durable.
 fn mark_durably(dir: &Path, name: &str) -> std::io::Result<()> {
     std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(dir.join(name))?.sync_all()?;
     std::fs::File::open(dir)?.sync_all()

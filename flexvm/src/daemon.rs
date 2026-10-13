@@ -1572,6 +1572,14 @@ impl Daemon {
             // Never alongside a lifecycle operation on the VM; paused and
             // suspended VMs have no fresh statistics and are left alone.
             let Ok(_busy) = self.reserve(&vm.name, "resizing", Duration::ZERO) else { continue };
+            // Free page reports a checkpoint copy held and could not release
+            // (under the reservation, so never a newer copy's hold).
+            if vm.release_pending() && matches!(vm.state(), State::Running | State::Paused) {
+                match vm.release_reports(Duration::from_millis(500)) {
+                    Ok(()) => eprintln!("vm {}: released free page reports", vm.name),
+                    Err(e) => eprintln!("vm {}: releasing free page reports: {e}", vm.name),
+                }
+            }
             if vm.state() == State::Running {
                 match resize(vm, host_avail, self.cfg.reserve_mib) {
                     Ok(grew) => host_avail = host_avail.saturating_sub(grew),
