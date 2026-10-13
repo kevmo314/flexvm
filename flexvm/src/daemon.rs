@@ -939,15 +939,18 @@ impl Daemon {
     /// `slow_preload` (a migration source sends the preloaded pages 300 ms
     /// after the vmstate), `kill_prepared` (an incoming migration's
     /// prepared Firecracker dies, and its pager sees it, just before the load), `resume_kill` (Firecracker
-    /// is killed right after a restored VM's resume is sent) or `guest_drop`
-    /// (guest requests are refused before reaching the guest, for `ms` from
-    /// the first one).
+    /// is killed right after a restored VM's resume is sent), `guest_drop`
+    /// (the daemon's retried guest requests are refused before reaching the
+    /// guest) or `guest_lose_reply` (they are carried out but their replies
+    /// lost); those two for `ms` from the first request they hit.
     fn inject(&self, req: &Value) -> Result<Value> {
         let Some(faults) = &self.faults else { bail!("fault injection is off (start the daemon with FLEXVM_FAULTS=1)") };
         let fault = req["fault"].as_str().ok_or("missing fault")?;
         let ms = Duration::from_millis(req["ms"].as_u64().unwrap_or(1000));
-        if fault == "guest_drop" {
-            *guest::DROP_FOR.lock().unwrap() = Some((ms, None));
+        match fault {
+            "guest_drop" => *guest::FAULT.lock().unwrap() = Some((guest::Fault::Refuse, ms, None)),
+            "guest_lose_reply" => *guest::FAULT.lock().unwrap() = Some((guest::Fault::LoseReply, ms, None)),
+            _ => {}
         }
         let until = Instant::now() + ms;
         faults.lock().unwrap().insert(fault.into(), until);
@@ -1029,6 +1032,7 @@ impl Daemon {
             "vms": self.vms.lock().unwrap().len(),
             "hot": self.hot.describe(),
             "loads": crate::vm::loads(),
+            "guest_retries": guest::retries(),
         })
     }
 

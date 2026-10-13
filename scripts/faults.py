@@ -80,7 +80,7 @@ def fault(host, f, ms):
 
 FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_before_run", "restore_after_run",
           "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "resume_kill",
-          "prepare_fail", "short_incoming", "slow_preload", "kill_prepared", "guest_drop")
+          "prepare_fail", "short_incoming", "slow_preload", "kill_prepared", "guest_drop", "guest_lose_reply")
 
 
 def disarm():
@@ -566,6 +566,15 @@ def guest_calls():
     check("guest calls: only on B", where(n) == {B: "running"}, where(n))
     err = guest_clock_error(B, n)
     check("guest calls: target stepped the guest clock", err is not None and abs(err) < 0.5, err)
+    # A clock step the guest carried out but whose answer was lost goes again.
+    before = ok(B, {"op": "info"})["guest_retries"].get("CLOCK", 0)
+    ok(B, {"op": "pause", "name": n})
+    fault(B, "guest_lose_reply", 300)
+    ok(B, {"op": "resume", "name": n})
+    retried = lambda: ok(B, {"op": "info"})["guest_retries"].get("CLOCK", 0) > before
+    check("guest calls: a clock step with its reply lost went again", wait_for(retried, 10),
+          ok(B, {"op": "info"})["guest_retries"])
+    check("guest calls: exec after the lost reply", sh(B, n, "echo hi") == (0, "hi"))
     cleanup(n)
 
 

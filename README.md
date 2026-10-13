@@ -378,7 +378,7 @@ confirming each is dead, before it answers anything, so "never seen this id" is 
 twice).
 
 `FLEXVM_FAULTS=1` lets a daemon accept `{"op": "fault", "fault": F, "ms": N}`
-(`pages`, `route`, `lost_ack`, `status`, `resume_kill`, `guest_drop`, ...); `scripts/faults.py` uses it to check
+(`pages`, `route`, `lost_ack`, `status`, `resume_kill`, `guest_drop`, `guest_lose_reply`, ...); `scripts/faults.py` uses it to check
 each failure path, and disarms every fault after each scenario so none leaks
 into the next (`ms: 0` disarms one).
 
@@ -828,11 +828,13 @@ firecracker/        patches on top of Firecracker v1.17.0
   that the buffer wraps and exec reports output loss explicitly. Finished sessions
   retain their exit until CLOSE or a five-minute expiry. The daemon's own
   guest requests (`START`/`NET`, `PING`, `CLOCK`) go again when their
-  connection is refused or drops before an answer, within their deadline
-  (5 s; 2 s for a ping): the agent serves them in order, so a retry never
-  lands before an earlier try. A command's body (after its request line)
-  may take up to 30 s to reach the agent, which right after a restore or
-  migration can be busy faulting its memory in.
+  connection is refused or drops before an answer, all I/O within one
+  deadline (5 s; 2 s for a ping; `info` counts the retries): the agent
+  serves them in order, so a retry never lands before an earlier try. A
+  command's body (after its request line) may take up to 30 s in all to
+  reach the agent, which right after a restore or migration can be busy
+  faulting its memory in; at most 16 bodies are read at once (more are
+  refused), each at most 1 MiB, request lines at most 4 KiB.
 - **Templates must be identical on every host.** Creation records a content ID
   and component hashes in `meta.json`; migration checks the ID before pausing
   and again on arrival. Copy the template and its artifacts to each host;

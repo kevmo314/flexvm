@@ -3,11 +3,13 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::bail;
-use crate::util::Result;
+use crate::util::{By, Result};
 
 pub const PORT: u32 = 52;
 pub const FRAME_STDOUT: u8 = 1;
@@ -44,24 +46,58 @@ pub fn dropped(e: &crate::util::Error) -> bool {
         })
 }
 
-/// Sends a request (`attempt`, given the time left) until the guest
-/// answers it or `deadline` passes: one whose connection dropped goes again
-/// after a short pause. Only for requests that are safe to repeat. The agent
-/// serves them one at a time in the order they connect, so an earlier try
-/// that still reached it never lands after a later one.
-pub fn answered<T>(deadline: Instant, mut attempt: impl FnMut(Duration) -> Result<T>) -> Result<T> {
+/// Sends a request (`attempt`, given the deadline for all of its I/O) until
+/// the guest answers it or `deadline` passes: one whose connection dropped
+/// goes again after a short pause, counted under `what` (see `retries`).
+/// Only for requests that are safe to repeat. The agent serves them one at
+/// a time in the order they connect, so an earlier try that still reached it
+/// never lands after a later one.
+pub fn answered<T>(what: &'static str, deadline: Instant, mut attempt: impl FnMut(Instant) -> Result<T>) -> Result<T> {
     let mut pause = Duration::from_millis(5);
     loop {
-        let left = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
-        match attempt(left) {
+        match attempt(deadline) {
             Ok(v) => return Ok(v),
             Err(e) if !dropped(&e) || Instant::now() + pause >= deadline => return Err(e),
             Err(_) => {
                 std::thread::sleep(pause);
                 pause = (pause * 2).min(Duration::from_millis(100));
+                *RETRIES.lock().unwrap().entry(what).or_default() += 1;
             }
         }
     }
+}
+
+static RETRIES: Mutex<BTreeMap<&'static str, u64>> = Mutex::new(BTreeMap::new());
+
+/// How many times each kind of retried guest request went again.
+pub fn retries() -> BTreeMap<&'static str, u64> {
+    RETRIES.lock().unwrap().clone()
+}
+
+/// Sends one request line and reads the one frame that answers it, all of
+/// it (connecting, the handshake, every partial write and read) by
+/// `deadline`; none is sent once that has passed.
+fn ask(uds: &Path, line: &str, deadline: Instant) -> Result<Option<(u8, Vec<u8>)>> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, format!("no time left for {line:?}")).into());
+    }
+    let s = crate::util::connect_unix(uds, left)?;
+    if fault(Fault::Refuse) {
+        return Err(Dropped("injected fault: guest connection refused".into()).into());
+    }
+    let mut r = BufReader::new(By { s, at: deadline });
+    r.get_mut().write_all(format!("CONNECT {PORT}\n{line}\n").as_bytes())?;
+    let mut ok = String::new();
+    r.by_ref().take(64).read_line(&mut ok)?;
+    if !ok.starts_with("OK") {
+        return Err(Dropped(format!("vsock connect refused: {ok:?}")).into());
+    }
+    let reply = read_frame(&mut r)?;
+    if reply.is_some() && fault(Fault::LoseReply) {
+        return Err(Dropped("injected fault: guest reply lost".into()).into());
+    }
+    Ok(reply)
 }
 
 /// Opens a connection to the guest agent and sends one request line. Reads
@@ -75,10 +111,6 @@ pub fn request(uds: &Path, line: &str, timeout: Duration) -> Result<BufReader<Un
 pub fn request_on(mut s: UnixStream, line: &str, timeout: Duration) -> Result<BufReader<UnixStream>> {
     s.set_read_timeout(Some(timeout))?;
     s.set_write_timeout(Some(timeout))?;
-    if dropping() {
-        let _ = s.shutdown(std::net::Shutdown::Both);
-        return Err(Dropped("injected fault: guest connection dropped".into()).into());
-    }
     // One write: Firecracker reads the CONNECT line without blocking as soon as
     // any of it arrives, and drops the connection if the line is incomplete.
     // It reads only up to the newline, so the request rides along and is
@@ -93,16 +125,25 @@ pub fn request_on(mut s: UnixStream, line: &str, timeout: Duration) -> Result<Bu
     Ok(r)
 }
 
-/// Test fault `guest_drop` (see `Daemon::inject`): for this long from the
-/// first guest request after it is armed (the start, once known), every
-/// guest request's connection is cut before the request reaches the guest,
-/// as a refused or reset vsock connection would be.
-pub static DROP_FOR: std::sync::Mutex<Option<(Duration, Option<Instant>)>> = std::sync::Mutex::new(None);
+/// Test faults for the requests `answered` retries (see `Daemon::inject`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Fault {
+    /// `guest_drop`: the connection is cut before the request reaches the guest.
+    Refuse,
+    /// `guest_lose_reply`: the guest carries the request out, but its reply is lost.
+    LoseReply,
+}
 
-fn dropping() -> bool {
-    let mut armed = DROP_FOR.lock().unwrap();
-    let Some((span, start)) = armed.as_mut() else { return false };
-    start.get_or_insert_with(Instant::now).elapsed() < *span
+/// The armed test fault: which, and for how long from the first request
+/// it hits (the start, once known).
+pub static FAULT: Mutex<Option<(Fault, Duration, Option<Instant>)>> = Mutex::new(None);
+
+fn fault(which: Fault) -> bool {
+    let mut armed = FAULT.lock().unwrap();
+    match armed.as_mut() {
+        Some((f, span, start)) if *f == which => start.get_or_insert_with(Instant::now).elapsed() < *span,
+        _ => false,
+    }
 }
 
 /// Starts a shell command in the guest; frames follow on the returned
@@ -177,9 +218,8 @@ pub fn read_frame(r: &mut impl Read) -> Result<Option<(u8, Vec<u8>)>> {
 
 /// Checks that the guest agent answers, within 2 s.
 pub fn ping(uds: &Path) -> Result<()> {
-    answered(Instant::now() + Duration::from_secs(2), |left| {
-        let mut r = request(uds, "PING", left)?;
-        match read_frame(&mut r)? {
+    answered("PING", Instant::now() + Duration::from_secs(2), |by| {
+        match ask(uds, "PING", by)? {
             Some((FRAME_MSG, m)) if m == b"pong" => Ok(()),
             None => Err(Dropped("guest closed the connection before answering a ping".into()).into()),
             other => bail!("unexpected ping reply {other:?}"),
@@ -207,19 +247,17 @@ pub fn exec(uds: &Path, cmd: &str) -> Result<(i32, Vec<u8>)> {
 /// instead, and `legacy` remembers that for the template. Bounded by
 /// `TIMEOUT`; a dropped connection is retried (see `answered`).
 pub fn start(uds: &Path, ip: std::net::Ipv4Addr, dns: Option<&str>, legacy: &AtomicBool) -> Result<()> {
-    answered(Instant::now() + TIMEOUT, |left| {
+    answered("START", Instant::now() + TIMEOUT, |by| {
         if legacy.load(Ordering::Relaxed) {
-            return net(uds, ip, dns, left);
+            return net(uds, ip, dns, by);
         }
-        let started = Instant::now();
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
         let line = format!("START {ip} {}.{:09} {}", now.as_secs(), now.subsec_nanos(), dns.unwrap_or(""));
-        let mut r = request(uds, &line, left)?;
-        match read_frame(&mut r)? {
+        match ask(uds, &line, by)? {
             Some((FRAME_MSG, m)) if m == b"ok" => Ok(()),
             Some((FRAME_MSG, m)) if m.starts_with(b"unknown request") => {
                 legacy.store(true, Ordering::Relaxed);
-                net(uds, ip, dns, left.saturating_sub(started.elapsed()).max(Duration::from_millis(1)))
+                net(uds, ip, dns, by)
             }
             Some((_, m)) => bail!("guest start: {}", String::from_utf8_lossy(&m)),
             None => Err(Dropped("guest closed the connection during start".into()).into()),
@@ -238,10 +276,9 @@ pub fn clock(uds: &Path, legacy: &AtomicBool, timeout: Duration) -> Result<Optio
     if legacy.load(Ordering::Relaxed) {
         return Ok(None);
     }
-    answered(Instant::now() + timeout, |left| {
+    answered("CLOCK", Instant::now() + timeout, |by| {
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
-        let mut r = request(uds, &format!("CLOCK {}.{:09}", now.as_secs(), now.subsec_nanos()), left)?;
-        match read_frame(&mut r)? {
+        match ask(uds, &format!("CLOCK {}.{:09}", now.as_secs(), now.subsec_nanos()), by)? {
             Some((FRAME_MSG, m)) if m.starts_with(b"ok") => {
                 let off: f64 = String::from_utf8_lossy(&m[2..]).trim().parse().unwrap_or(0.0);
                 Ok(Some(off / 1e6))
@@ -268,11 +305,10 @@ pub fn forks(uds: &Path) -> Result<Option<usize>> {
     }
 }
 
-/// Sets the guest's address (and nameserver), within `timeout`: `start`
-/// for agents that predate `START`.
-fn net(uds: &Path, ip: std::net::Ipv4Addr, dns: Option<&str>, timeout: Duration) -> Result<()> {
-    let mut r = request(uds, &format!("NET {ip} {}", dns.unwrap_or("")), timeout)?;
-    match read_frame(&mut r)? {
+/// Sets the guest's address (and nameserver), by `deadline`: `start` for
+/// agents that predate `START`.
+fn net(uds: &Path, ip: std::net::Ipv4Addr, dns: Option<&str>, deadline: Instant) -> Result<()> {
+    match ask(uds, &format!("NET {ip} {}", dns.unwrap_or("")), deadline)? {
         Some((FRAME_MSG, m)) if m == b"ok" => Ok(()),
         Some((_, m)) => bail!("guest network setup: {}", String::from_utf8_lossy(&m)),
         None => Err(Dropped("guest closed the connection during network setup".into()).into()),
@@ -357,7 +393,7 @@ mod tests {
     fn retries_only_dropped_connections() {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut tries = 0;
-        let got = answered(deadline, |_| {
+        let got = answered("TEST", deadline, |_| {
             tries += 1;
             match tries {
                 1 => Err(Dropped("guest closed the connection".into()).into()),
@@ -369,7 +405,7 @@ mod tests {
         // An answer, or no answer in time, is final.
         for e in [|| -> Result<()> { bail!("guest clock: bad time") }, || Err(std::io::Error::from(std::io::ErrorKind::WouldBlock).into())] {
             let mut tries = 0;
-            assert!(answered(deadline, |_| {
+            assert!(answered("TEST", deadline, |_| {
                 tries += 1;
                 e()
             })
@@ -377,8 +413,16 @@ mod tests {
             assert_eq!(tries, 1);
         }
         let start = Instant::now();
-        assert!(answered(start + Duration::from_millis(50), |_| -> Result<()> { Err(Dropped("gone".into()).into()) }).is_err());
+        assert!(answered("TEST", start + Duration::from_millis(50), |_| -> Result<()> { Err(Dropped("gone".into()).into()) }).is_err());
         assert!(start.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn no_attempt_after_the_deadline() {
+        // Refused before connecting: the socket's absence is never noticed.
+        let e = ask(Path::new("/nonexistent/v.sock"), "PING", Instant::now()).unwrap_err();
+        assert_eq!(e.downcast_ref::<std::io::Error>().map(|e| e.kind()), Some(std::io::ErrorKind::TimedOut));
+        assert!(!dropped(&e));
     }
 
     #[test]
