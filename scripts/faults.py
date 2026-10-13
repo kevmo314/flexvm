@@ -347,8 +347,9 @@ def resume_kill():
 
 
 def prepared_retry():
-    """A migration target whose prepared Firecracker dies before the load
-    (`kill_prepared`) loads once more on a fresh one, before it commits: the
+    """A migration target whose prepared Firecracker dies before the load,
+    its pager having seen it go (`kill_prepared`), loads once more on a fresh
+    one, before it commits: the
     guest never ran, and the paused source still serves every page,
     including the preloaded ones the dead pager had. The same retry, without
     clock_realtime, takes a VM whose snapshot has no realtime clock (#50)."""
