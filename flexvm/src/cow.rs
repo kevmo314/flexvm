@@ -423,7 +423,7 @@ mod tests {
             assert!(cow.claim(1, PENDING, RESCUING));
             cow.rescue(1, vec![1u8; PAGE_SIZE].into());
             let gate = Gate { entered: std::sync::Barrier::new(2), go: std::sync::Barrier::new(2) };
-            let pages = CowPages { guest: &gate, cow: &cow, slow: false };
+            let pages = CowPages { guest: &gate, cow: &cow, slow: Duration::ZERO };
             let mut buf = vec![0u8; 2 * PAGE_SIZE];
             let e = std::thread::scope(|s| {
                 let w = s.spawn(|| pages.read(0, &mut buf));
