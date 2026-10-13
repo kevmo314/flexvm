@@ -540,23 +540,19 @@ impl Vm {
         Ok((res?, String::from_utf8_lossy(&out).into_owned()))
     }
 
-    /// Steps the guest's wall clock to the host's if it is off by more than
-    /// `tolerance`; all of it done by `deadline`. A restore leaves the
-    /// guest's clock where it was saved (the guest's TSC clocksource resumes
-    /// from its saved value, and Firecracker's `clock_realtime` only moves
-    /// kvmclock), so it lags by however long the VM was stopped. The offset is
-    /// measured with one exec bracketed by host timestamps; the step sets an
-    /// absolute time (the host's, plus half the measured round trip for the
-    /// exec's delay), so running it twice never steps twice. Returns the
-    /// offset found (ms). Callers hold the VM's reservation. The one place
-    /// that sets the guest clock (a guest agent request would replace the
-    /// execs here).
-    ///
-    /// An agent with `CLOCK` does it in one request instead (no exec): it
-    /// sets the host's time and reports how far off it was; as the guest ends
-    /// up behind by the request's transit time, the request goes again (a few
-    /// times at most) until a round trip is short.
-    pub fn sync_clock(&self, tolerance: Duration, deadline: Instant) -> Result<f64> {
+    /// Steps the guest's wall clock to the host's, all of it by `deadline`.
+    /// A restore leaves the guest's clock where it was saved (the guest's TSC
+    /// clocksource resumes from its saved value, and Firecracker's
+    /// `clock_realtime` only moves kvmclock), so it lags by however long the
+    /// VM was stopped. One agent request (`CLOCK`) sets the host's time and
+    /// reports how far off the clock was (ms, returned); as the guest ends up
+    /// behind by the request's transit time, it goes again (a few times at
+    /// most) until a round trip is short. The guest skips steps under 5 ms.
+    /// Callers hold the VM's reservation. An agent without `CLOCK` gets no
+    /// step (logged once): a command run through exec could be delayed past
+    /// the deadline and land after a snapshot, which nothing can fence.
+    pub fn sync_clock(&self, _tolerance: Duration, deadline: Instant) -> Result<f64> {
+        static WARNED: AtomicBool = AtomicBool::new(false);
         let mut first = None;
         for _ in 0..3 {
             let start = Instant::now();
@@ -568,8 +564,12 @@ impl Vm {
                         return Ok(off);
                     }
                 }
-                Ok(None) if first.is_none() => return self.sync_clock_exec(tolerance, deadline),
-                Ok(None) => return Ok(first.unwrap_or(0.0)),
+                Ok(None) => {
+                    if first.is_none() && !WARNED.swap(true, Ordering::Relaxed) {
+                        eprintln!("vm {}: its guest agent cannot set the clock (no CLOCK); clocks of such VMs are left alone", self.name);
+                    }
+                    return Ok(first.unwrap_or(0.0));
+                }
                 Err(e) => {
                     self.clock_unsure.store(true, Ordering::SeqCst);
                     return Err(e);
@@ -577,28 +577,6 @@ impl Vm {
             }
         }
         Ok(first.unwrap_or(0.0))
-    }
-
-    /// `sync_clock` through two execs, for agents without `CLOCK`.
-    fn sync_clock_exec(&self, tolerance: Duration, deadline: Instant) -> Result<f64> {
-        let now = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as i128;
-        let before = now();
-        let (code, out) = self.sh("date +%s%N", deadline)?;
-        let after = now();
-        let guest: i128 = match (code, out.trim().parse()) {
-            (0, Ok(ns)) => ns,
-            _ => bail!("reading the guest clock: {out:?} (exit {code})"),
-        };
-        let offset = guest - (before + after) / 2;
-        if offset.unsigned_abs() > tolerance.as_nanos() {
-            let at = now() + (after - before) / 2;
-            let cmd = format!("date -s @{}.{:09} >/dev/null", at / 1_000_000_000, at % 1_000_000_000);
-            match self.sh(&cmd, deadline)? {
-                (0, _) => {}
-                (code, out) => bail!("setting the guest clock: {out:?} (exit {code})"),
-            }
-        }
-        Ok(offset as f64 / 1e6)
     }
 
     /// Retries a few times; the VM keeps running regardless, only its
