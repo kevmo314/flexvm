@@ -730,6 +730,101 @@ def pause_resume():
     cleanup(n)
 
 
+def busy_guest(host, name):
+    """Floods the network (UDP to the gateway) and churns memory (freed
+    pages go back through balloon free page reporting) in the background."""
+    code, out = sh(host, name, "(while :; do echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; done | socat -u - UDP:169.254.1.1:9) "
+                   ">/dev/null 2>&1 < /dev/null & "
+                   "(while :; do head -c 200M /dev/zero > /dev/shm/churn; rm -f /dev/shm/churn; done) "
+                   ">/dev/null 2>&1 < /dev/null & echo ok")
+    assert code == 0, out
+
+
+def tap_frames(host, name):
+    """Frames the VM's Firecracker has put on its tap (and taken off it)."""
+    tap = vms(host)[name]["tap"]
+    read = lambda what: int(open(f"/sys/class/net/{tap}/statistics/{what}").read())
+    return read("rx_packets"), read("tx_packets")
+
+
+def guest_healthy(host, name, label, m):
+    code, out = sh(host, name, "dmesg | grep -ciE 'virtio.*(error|bad|broken|timeout)|bug:|corrupt' ; true")
+    check(f"{label}: guest answers, no virtio errors", code == 0 and out.strip() == "0", out)
+    before = tap_frames(host, name)[0]
+    time.sleep(0.5)
+    check(f"{label}: guest network still sending", tap_frames(host, name)[0] > before + 10, (before, tap_frames(host, name)))
+    check(f"{label}: md5 intact", md5(host, name) == m)
+
+
+def paused_devices_quiet():
+    """With the guest flooding its network and churning memory right up to
+    the pause, devices must leave guest memory alone while it is paused
+    (Firecracker patch 0002): no frames move and no page is discarded. Then
+    repeated checkpoints, a migration and a checkpoint/restore all stay
+    consistent under that load."""
+    n = "ft-busy"
+    m = setup(n)
+    busy_guest(A, n)
+    time.sleep(1)
+    a = tap_frames(A, n)
+    time.sleep(0.5)
+    check("busy: guest is flooding", tap_frames(A, n)[0] > a[0] + 100, (a, tap_frames(A, n)))
+    # And the host sends the guest a few frames while it is paused, with RX
+    # buffers to spare: an unfrozen Firecracker writes them into guest memory.
+    ip = to_tap(A, n)
+    udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    # A host exec session streaming across every pause: frozen vsock queues
+    # must pick up where they were (no notification lost on thaw).
+    ticks = subprocess.Popen([BIN, "--host", A, "exec", n, "while :; do echo tick; sleep 0.02; done"],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    seen = []
+    threading.Thread(target=lambda: [seen.append(time.time()) for _ in ticks.stdout], daemon=True).start()
+    time.sleep(0.5)
+    moved, discarded = 0, 0
+    for _ in range(5):
+        ok(A, {"op": "pause", "name": n})
+        f0, z0 = tap_frames(A, n), vms(A)[n]["pages_mib"]["zero"]
+        for _ in range(5):
+            udp.sendto(b"x" * 64, (ip, 9))
+            time.sleep(0.1)
+        f1, z1 = tap_frames(A, n), vms(A)[n]["pages_mib"]["zero"]
+        moved += (f1[0] - f0[0]) + (f1[1] - f0[1])
+        discarded += abs(z1 - z0)
+        ok(A, {"op": "resume", "name": n})
+        time.sleep(0.2)
+    after = tap_frames(A, n)
+    for _ in range(5):
+        udp.sendto(b"x" * 64, (ip, 9))
+    time.sleep(0.3)
+    check("resumed: host frames delivered again", tap_frames(A, n)[1] >= after[1] + 5, (after, tap_frames(A, n)))
+    count = len(seen)
+    time.sleep(0.5)
+    check("resumed: exec session streamed across 5 pauses", ticks.poll() is None and len(seen) > count + 5, (count, len(seen)))
+    ticks.kill()
+    check("paused: no frames moved through the tap", moved == 0, moved)
+    check("paused: no guest memory discarded", discarded == 0, discarded)
+    fails = []
+    for i in range(3):
+        path = ckpt_path(f"ft-busy-{i}")
+        r = rpc(A, {"op": "checkpoint", "name": n, "dir": path})
+        if not r["ok"]:
+            fails.append(r["error"])
+        rm_ckpt(path)
+    check("busy: checkpoints never see memory change behind the snapshot", not fails, fails)
+    r = ok(A, {"op": "migrate", "name": n, "to": B})
+    print(f"busy: migrate downtime {r['downtime_ms']} ms")
+    st = wait_released(B, n)
+    check("busy: migrated, source released", where(n) == {B: "running"} and st["released"] is True, (where(n), st))
+    to_tap(B, n)
+    guest_healthy(B, n, "busy after migrate", m)
+    path = ckpt_path("ft-busy")
+    ok(B, {"op": "checkpoint", "name": n, "dir": path, "stop": True})
+    ok(A, {"op": "restore", "dir": path})
+    guest_healthy(A, n, "busy after checkpoint/restore", m)
+    cleanup(n)
+    rm_ckpt(path)
+
+
 def api_sock(host, name):
     """The API socket of `name`'s Firecracker on `host`, its only VM."""
     assert list(vms(host)) == [name], vms(host)
@@ -873,7 +968,7 @@ SCENARIOS = dict(basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, r
                  checkpoint_corrupt=checkpoint_corrupt, checkpoint_crash=checkpoint_crash, pause_resume=pause_resume,
                  suspend_resume=suspend_resume, checkpoint_hotplug=checkpoint_hotplug,
                  checkpoint_untrusted_dir=checkpoint_untrusted_dir, resume_failures=resume_failures,
-                 state_dir_lock=state_dir_lock)
+                 state_dir_lock=state_dir_lock, paused_devices_quiet=paused_devices_quiet)
 safe = [s for s in SCENARIOS
         if s not in ("source_killed", "target_restart", "target_restart_symlink", "checkpoint_crash", "suspend_resume")]
 names = [n for s in args.scenarios for n in (safe if s == "all" else [s])]
