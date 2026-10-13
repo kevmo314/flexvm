@@ -1722,19 +1722,41 @@ impl Link {
 /// pager would (for up to `SOURCE_TIMEOUT`, and not past `deadline`):
 /// whether it serves pages at all.
 pub fn probe(source: &Source, page: u64, deadline: Instant) -> io::Result<()> {
-    let mut buf = vec![0u8; PAGE_SIZE];
-    let mut link = Link::new(source.clone());
+    let give_up = deadline.min(Instant::now() + SOURCE_TIMEOUT);
+    let mut backoff = BACKOFF_MIN;
     loop {
-        match link.fetch(page * PAGE_SIZE as u64, &mut buf, None) {
-            // Waiting to reconnect.
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-            r => return r,
+        let e = match probe_once(source, page, give_up) {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+        if Instant::now() + backoff >= give_up {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, format!("no page from {} in time: {e}", source.addr)));
         }
-        if Instant::now() >= deadline {
-            return Err(io::Error::new(io::ErrorKind::TimedOut, "no answer from the page server in time"));
-        }
-        thread::sleep(Duration::from_millis(10));
+        thread::sleep(backoff);
+        backoff = (backoff * 2).min(BACKOFF_MAX);
     }
+}
+
+/// One `probe` attempt: connecting, the request and every read by `at`.
+fn probe_once(source: &Source, page: u64, at: Instant) -> io::Result<()> {
+    let left = at.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(io::Error::new(io::ErrorKind::TimedOut, "deadline passed"));
+    }
+    let s = crate::util::connect(&source.addr, left)?;
+    s.set_nodelay(true)?;
+    let mut s = crate::util::By { s, at };
+    let mut req = serde_json::to_vec(&serde_json::json!({"op": "pages", "name": source.vm, "mig": source.mig}))?;
+    req.push(b'\n');
+    req.extend_from_slice(&(page * PAGE_SIZE as u64).to_le_bytes());
+    req.extend_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
+    s.write_all(&req)?;
+    let mut status = [0u8; 1];
+    s.read_exact(&mut status)?;
+    if status[0] != 0 {
+        return Err(io::Error::other("page server could not read guest memory"));
+    }
+    s.read_exact(&mut vec![0u8; PAGE_SIZE])
 }
 
 /// Client for a migration source's page server.
