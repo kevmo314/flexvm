@@ -66,6 +66,8 @@ impl Paused {
     /// Restores `template` into `idle`, lets it settle and pauses it.
     pub fn load(idle: Idle, template: Arc<Template>) -> Result<Paused> {
         let pager = Pager::start(&idle.fc.sockets.uffd, template.clone(), None)?;
+        // Off the request path, so it can afford to learn what a load touches.
+        pager.learn_load_set();
         let paused = Paused { idle: Some(idle), pager, template, loaded: Instant::now() };
         let idle = paused.idle.as_ref().unwrap();
         paused.pager.set_pid(idle.fc.pid())?;
@@ -83,7 +85,11 @@ impl Paused {
         idle.fc.request_within("PATCH", "/vm", Some(json!({"state": "Paused"})), API_TIMEOUT)?;
         paused.pager.wait_ready(Duration::from_secs(5))?;
         // Get the slow first run after a restore out of the way, off the request path.
-        idle.fc.request_within("PATCH", "/vm", Some(json!({"state": "Resumed"})), API_TIMEOUT)?;
+        let resumed = idle.fc.request_within("PATCH", "/vm", Some(json!({"state": "Resumed"})), API_TIMEOUT);
+        // The load set includes what resuming touches (Firecracker kicks the
+        // virtqueues), as a migration target's load resumes the VM too.
+        paused.pager.loaded();
+        resumed?;
         wait_for_reseed(&idle.fc.sockets.vsock)?;
         // Step the wall clock now: it keeps time while paused, so START at
         // take finds it right and skips clock_settime, which can take tens of

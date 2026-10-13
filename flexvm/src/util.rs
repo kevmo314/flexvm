@@ -1,4 +1,4 @@
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
@@ -60,6 +60,70 @@ pub fn connect(addr: &str, timeout: Duration) -> io::Result<std::net::TcpStream>
         }
     }
     Err(last)
+}
+
+/// A socket whose timeouts can be set per operation.
+pub trait Timed: Read + Write {
+    fn read_timeout(&self, t: Duration) -> io::Result<()>;
+    fn write_timeout(&self, t: Duration) -> io::Result<()>;
+}
+
+impl Timed for std::net::TcpStream {
+    fn read_timeout(&self, t: Duration) -> io::Result<()> {
+        self.set_read_timeout(Some(t))
+    }
+    fn write_timeout(&self, t: Duration) -> io::Result<()> {
+        self.set_write_timeout(Some(t))
+    }
+}
+
+impl Timed for UnixStream {
+    fn read_timeout(&self, t: Duration) -> io::Result<()> {
+        self.set_read_timeout(Some(t))
+    }
+    fn write_timeout(&self, t: Duration) -> io::Result<()> {
+        self.set_write_timeout(Some(t))
+    }
+}
+
+/// `s`, with every read and write (each partial one) ending by `at`,
+/// however slowly the other end trickles.
+pub struct By<S> {
+    pub s: S,
+    pub at: Instant,
+}
+
+impl<S> By<S> {
+    fn left(&self) -> io::Result<Duration> {
+        match self.at.saturating_duration_since(Instant::now()) {
+            d if d.is_zero() => Err(io::Error::new(io::ErrorKind::TimedOut, "deadline passed")),
+            d => Ok(d),
+        }
+    }
+}
+
+fn timed_out(e: io::Error) -> io::Error {
+    match e.kind() {
+        io::ErrorKind::WouldBlock => io::Error::new(io::ErrorKind::TimedOut, "deadline passed"),
+        _ => e,
+    }
+}
+
+impl<S: Timed> Read for By<S> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.s.read_timeout(self.left()?)?;
+        self.s.read(buf).map_err(timed_out)
+    }
+}
+
+impl<S: Timed> Write for By<S> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.s.write_timeout(self.left()?)?;
+        self.s.write(buf).map_err(timed_out)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.s.flush()
+    }
 }
 
 /// Connects to the unix socket at `path` within `timeout`, with reads and

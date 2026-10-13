@@ -180,6 +180,10 @@ fn eagain() -> io::Error {
 /// PRESENT page zero-fills it if it is missing.
 pub struct Pages {
     states: Vec<AtomicU8>,
+    /// One bit per `CHUNK` pages: set once any of them may have left BASE.
+    /// Lets a scan skip untouched stretches without reading (and faulting
+    /// in) their part of `states`.
+    touched: Vec<AtomicU64>,
     events: RwLock<()>,
     /// One bit per page: its contents may have changed since the last
     /// checkpoint's pause (written after a write-protect fault, installed,
@@ -187,12 +191,16 @@ pub struct Pages {
     dirty: Vec<AtomicU64>,
 }
 
+/// Pages per `touched` bit: one page of `states`.
+const CHUNK: usize = 4096;
+
 impl Pages {
     pub fn new(n: usize) -> Pages {
         // BASE is 0, so a zeroed allocation (lazily backed by the kernel) is the initial state.
         let states = unsafe { std::mem::transmute::<Vec<u8>, Vec<AtomicU8>>(vec![0u8; n]) };
         let dirty = unsafe { std::mem::transmute::<Vec<u64>, Vec<AtomicU64>>(vec![0u64; n.div_ceil(64)]) };
-        Pages { states, events: RwLock::new(()), dirty }
+        let touched = (0..n.div_ceil(CHUNK * 64)).map(|_| AtomicU64::new(0)).collect();
+        Pages { states, touched, events: RwLock::new(()), dirty }
     }
 
     pub fn mark_dirty(&self, page: usize) {
@@ -223,11 +231,51 @@ impl Pages {
     }
 
     fn set(&self, page: usize, state: u8) {
+        self.touch(page);
         self.states[page].store(state, Ordering::SeqCst)
+    }
+
+    /// Marks `page`'s chunk before its state leaves BASE.
+    fn touch(&self, page: usize) {
+        let c = page / CHUNK;
+        let bit = 1u64 << (c % 64);
+        if self.touched[c / 64].load(Ordering::Relaxed) & bit == 0 {
+            self.touched[c / 64].fetch_or(bit, Ordering::SeqCst);
+        }
+    }
+
+    fn touched(&self, page: usize) -> bool {
+        let c = page / CHUNK;
+        self.touched[c / 64].load(Ordering::SeqCst) & (1 << (c % 64)) != 0
     }
 
     pub fn len(&self) -> usize {
         self.states.len()
+    }
+
+    /// The first page in `[from, end)` not in state BASE, or `end`. Skips
+    /// chunks no state in which ever left BASE without reading them: a VM's
+    /// map is mostly BASE (the unplugged virtio-mem region alone is millions
+    /// of pages), and a migration scans it with the VM paused.
+    pub fn next_not_base(&self, from: usize, end: usize) -> usize {
+        self.next_not(BASE, from, end)
+    }
+
+    /// The first page in `[from, end)` not in `state`, or `end`. States are
+    /// only ever read as the byte atomics they are written as.
+    pub fn next_not(&self, state: u8, mut from: usize, end: usize) -> usize {
+        let end = end.min(self.states.len());
+        while from < end {
+            if state == BASE && from % CHUNK == 0 && !self.touched(from) {
+                from += CHUNK;
+                continue;
+            }
+            if self.states[from].load(Ordering::Relaxed) != state {
+                return from;
+            }
+            from += 1;
+        }
+        end
     }
 
     /// Held while reading and applying uffd events; required by `discard`.
@@ -242,6 +290,10 @@ impl Pages {
         while n < max
             && first + n < self.states.len()
             && ok(first + n)
+            && (from != BASE || {
+                self.touch(first + n);
+                true
+            })
             && self.states[first + n].compare_exchange(from, INFLIGHT, Ordering::SeqCst, Ordering::SeqCst).is_ok()
         {
             n += 1;
@@ -251,6 +303,7 @@ impl Pages {
 
     /// Applies a REMOVE of `page`. Returns whether it resolved a REMOTE page.
     pub fn discard(&self, _removing: &RwLockWriteGuard<'_, ()>, page: usize) -> bool {
+        self.touch(page);
         let old = self.states[page]
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |s| {
                 Some(if s == INFLIGHT || s == DISCARDED { DISCARDED } else { ZERO })
@@ -372,6 +425,19 @@ pub struct Pager {
     pagemap: OnceLock<std::fs::File>,
     /// Test fault: the next freeze fails to re-protect pages.
     pub fail_protect: AtomicBool,
+    /// Initial page states and their origin, applied when Firecracker
+    /// connects (see `seed`).
+    initial: Mutex<Option<(Runs, Origin)>>,
+    /// Signalled by `seed` and `stop`, for a handshake waiting for the seed.
+    seeded: Condvar,
+    /// Firecracker connects before the page states are known (a prepared
+    /// load, see `expect_seed`): the handshake waits for `seed`.
+    awaiting_seed: AtomicBool,
+    /// Learning the template's load set (`learn_load_set`): faults go into
+    /// it until `loaded`, and the working-set prefetch waits until then.
+    learning: AtomicBool,
+    /// The prefetch, held back until `loaded` while learning: (loaded, due).
+    prefetch: Mutex<(bool, bool)>,
 }
 
 /// What `Pager::freeze` captured for a checkpoint.
@@ -394,7 +460,8 @@ pub struct Frozen {
 impl Pager {
     /// Listens on `sock` for Firecracker's UFFD handshake and serves faults in
     /// the background. `initial` seeds page states for an incoming migration
-    /// or a checkpoint restore, with where their REMOTE pages come from.
+    /// or a checkpoint restore, with where their REMOTE pages come from; it
+    /// can also be given later, with `seed`, until Firecracker connects.
     pub fn start(sock: &Path, base: Arc<Template>, initial: Option<(Runs, Origin)>) -> Result<Arc<Pager>> {
         crate::socket::check(sock)?;
         let _ = std::fs::remove_file(sock);
@@ -426,18 +493,29 @@ impl Pager {
             wp: Mutex::new(()),
             pagemap: OnceLock::new(),
             fail_protect: AtomicBool::new(false),
+            initial: Mutex::new(initial),
+            seeded: Condvar::new(),
+            awaiting_seed: AtomicBool::new(false),
+            learning: AtomicBool::new(false),
+            prefetch: Mutex::new((false, false)),
         });
         let p = pager.clone();
         let thread = thread::Builder::new().name("uffd".into()).spawn(move || {
-            let prefetch = match p.handshake(&listener, initial) {
+            let prefetch = match p.handshake(&listener) {
                 Ok(prefetch) => prefetch,
                 Err(e) => return p.fail(format!("uffd handshake failed: {e}")),
             };
             // Prefetch alongside fault handling: Firecracker itself touches guest
             // memory while restoring devices and must not wait behind it.
             if prefetch {
-                let p = p.clone();
-                thread::spawn(move || p.prefetch());
+                let mut state = p.prefetch.lock().unwrap();
+                match p.learning.load(Ordering::SeqCst) && !state.0 {
+                    true => state.1 = true,
+                    false => {
+                        let p = p.clone();
+                        thread::spawn(move || p.prefetch());
+                    }
+                }
             }
             p.serve();
         })?;
@@ -453,8 +531,48 @@ impl Pager {
         }
     }
 
+    /// Sets the initial page states and where their REMOTE pages come from,
+    /// for a pager started without them. Only before Firecracker loads a
+    /// snapshot.
+    pub fn seed(&self, runs: Runs, origin: Origin) -> Result<()> {
+        if self.pages.get().is_some() || self.initial.lock().unwrap().is_some() {
+            bail!("pager already seeded");
+        }
+        *self.initial.lock().unwrap() = Some((runs, origin));
+        self.seeded.notify_all();
+        Ok(())
+    }
+
+    /// Firecracker will connect before `seed` (it prepares the load ahead of
+    /// the vmstate): the handshake then waits for the seed (or `stop`)
+    /// before it serves a fault. Firecracker touches no
+    /// guest memory until the load itself.
+    pub fn expect_seed(&self, yes: bool) {
+        self.awaiting_seed.store(yes, Ordering::SeqCst);
+    }
+
+    /// Records the pages the coming snapshot load faults on into the
+    /// template's load set (see `Template::load_set`), holding the working-set
+    /// prefetch back until `loaded` so that it does not hide them. For loads
+    /// off the critical path (the hot pool's). Call before the load.
+    pub fn learn_load_set(&self) {
+        self.learning.store(true, Ordering::SeqCst);
+    }
+
+    /// The snapshot load is done (or failed): stops learning and lets a
+    /// held-back prefetch go.
+    pub fn loaded(self: &Arc<Self>) {
+        self.learning.store(false, Ordering::SeqCst);
+        let mut state = self.prefetch.lock().unwrap();
+        state.0 = true;
+        if std::mem::take(&mut state.1) {
+            let p = self.clone();
+            thread::spawn(move || p.prefetch());
+        }
+    }
+
     /// Takes over Firecracker's userfaultfd. Returns whether to prefetch the working set.
-    fn handshake(&self, listener: &UnixListener, initial: Option<(Runs, Origin)>) -> Result<bool> {
+    fn handshake(&self, listener: &UnixListener) -> Result<bool> {
         let start = Instant::now();
         let stream = loop {
             match listener.accept() {
@@ -489,6 +607,18 @@ impl Pager {
         let mappings: Vec<Mapping> = serde_json::from_slice(&body)?;
         let total = mappings.iter().map(|m| m.offset as usize + m.size).max().unwrap_or(0) / PAGE_SIZE;
         let pages = Pages::new(total);
+        let initial = {
+            // No deadline of its own: the migration's protocol deadline drops
+            // the prepared VM, which stops the pager.
+            let mut initial = self.initial.lock().unwrap();
+            while initial.is_none() && self.awaiting_seed.load(Ordering::SeqCst) {
+                if self.stop.load(Ordering::SeqCst) {
+                    bail!("stopped before the page states arrived");
+                }
+                initial = self.seeded.wait(initial).unwrap();
+            }
+            initial.take()
+        };
         if let Some((runs, origin)) = initial {
             let _ = self.pull_started.set(Instant::now());
             let remote = remote_pages(&runs, total)?;
@@ -560,6 +690,60 @@ impl Pager {
             }
         }
         runs
+    }
+
+    /// Installs REMOTE pages whose contents came along with the vmstate (one
+    /// `PAGE_SIZE` slice of `data` per page of `list`), once Firecracker has
+    /// connected (and the page states are set): the load would otherwise
+    /// fault on them one round trip at a time. Runs alongside the load; a
+    /// page a fault or puller claimed first is waited for (by `deadline`),
+    /// so all of them are in when it returns. Returns how many it installed.
+    pub fn preload(&self, list: &[u64], data: &[u8], deadline: Instant) -> Result<usize> {
+        if data.len() != list.len() * PAGE_SIZE {
+            bail!("preload of {} pages has {} bytes", list.len(), data.len());
+        }
+        while self.wait_ready(Duration::from_millis(10)).is_err() {
+            if self.stop.load(Ordering::SeqCst) || Instant::now() >= deadline {
+                bail!("the pager stopped or Firecracker never connected");
+            }
+        }
+        let pages = self.pages();
+        let mut installed = 0;
+        for (&page, src) in list.iter().zip(data.chunks_exact(PAGE_SIZE)) {
+            let page = page as usize;
+            if page >= pages.len() {
+                continue;
+            }
+            // Done once the page is no longer REMOTE nor being installed by
+            // someone else (a fault or a puller, whose fetch may fail and
+            // give it back): when this returns, every listed page is in.
+            loop {
+                if let Some(why) = self.failed() {
+                    bail!("the pager failed: {why}");
+                }
+                match pages.get(page) {
+                    REMOTE if pages.claim(page, 1, REMOTE, |_| true) == 1 => {
+                        let (resolved, res) = pages.install(page, 1, REMOTE, None, |p, c| self.populate(p, c, Some(src)));
+                        self.pulled(resolved);
+                        installed += resolved;
+                        match res {
+                            Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => {}
+                            r => break r?,
+                        }
+                    }
+                    REMOTE | INFLIGHT | DISCARDED => {}
+                    _ => break,
+                }
+                if self.stop.load(Ordering::SeqCst) || Instant::now() >= deadline {
+                    bail!("page {page} still being installed at the deadline");
+                }
+                thread::sleep(Duration::from_micros(50));
+            }
+        }
+        if let Some(why) = self.failed() {
+            bail!("the pager failed: {why}");
+        }
+        Ok(installed)
     }
 
     /// Blocks until Firecracker has handed over its userfaultfd.
@@ -645,6 +829,8 @@ impl Pager {
         // Also ends a prefetch still running (e.g. for a drained hot pool's VM).
         self.quiesce.store(true, Ordering::SeqCst);
         self.notify();
+        let _initial = self.initial.lock().unwrap();
+        self.seeded.notify_all();
     }
 
     /// Gives up on the VM's memory: unless it was stopped on purpose, records
@@ -695,7 +881,7 @@ impl Pager {
     }
 
     fn pages(&self) -> &Pages {
-        static EMPTY: Pages = Pages { states: Vec::new(), events: RwLock::new(()), dirty: Vec::new() };
+        static EMPTY: Pages = Pages { states: Vec::new(), touched: Vec::new(), events: RwLock::new(()), dirty: Vec::new() };
         self.pages.get().unwrap_or(&EMPTY)
     }
 
@@ -730,26 +916,31 @@ impl Pager {
         let pages = self.pages();
         for m in self.mappings() {
             let first = m.offset as usize / PAGE_SIZE;
-            for (i, p) in pages.states[first..first + m.size / PAGE_SIZE].iter().enumerate() {
-                let mut s = p.load(Ordering::Relaxed);
-                if s == BASE {
-                    continue;
-                }
-                let i = first + i;
+            let end = first + m.size / PAGE_SIZE;
+            let mut i = pages.next_not_base(first, end);
+            while i < end {
+                let p = &pages.states[i];
+                let mut s = p.load(Ordering::SeqCst);
                 while (s == INFLIGHT || s == DISCARDED) && start.elapsed() < Duration::from_secs(1) {
                     thread::sleep(Duration::from_micros(20));
                     s = p.load(Ordering::SeqCst);
                 }
-                let s = match s {
-                    PRESENT => REMOTE,
-                    ZERO => ZERO,
-                    BASE => continue,
+                let (raw, s) = match s {
+                    PRESENT => (PRESENT, REMOTE),
+                    ZERO => (ZERO, ZERO),
+                    BASE => {
+                        i = pages.next_not_base(i + 1, end);
+                        continue;
+                    }
                     s => bail!("page {i} is still in state {s}; the VM is mid-migration"),
                 };
+                // The rest of a stretch in the same state, eight at a time.
+                let n = (pages.next_not(raw, i + 1, end) - i) as u64;
                 match runs.last_mut() {
-                    Some((f, n, st)) if *st == s && *f + *n == i as u64 => *n += 1,
-                    _ => runs.push((i as u64, 1, s)),
+                    Some((f, c, st)) if *st == s && *f + *c == i as u64 => *c += n,
+                    _ => runs.push((i as u64, n, s)),
                 }
+                i = pages.next_not_base(i + n as usize, end);
             }
         }
         Ok(runs)
@@ -820,7 +1011,14 @@ impl Pager {
                         let a = u64::from_ne_bytes(msg[8..16].try_into().unwrap());
                         let b = u64::from_ne_bytes(msg[16..24].try_into().unwrap());
                         match msg[0] {
-                            UFFD_EVENT_PAGEFAULT => pending.push_back((b, a, None)),
+                            UFFD_EVENT_PAGEFAULT => {
+                                if self.learning.load(Ordering::Relaxed) {
+                                    if let Some((page, _)) = self.page_of(b) {
+                                        self.base.note_load_fault(page as u64);
+                                    }
+                                }
+                                pending.push_back((b, a, None))
+                            }
                             UFFD_EVENT_REMOVE => self.discard(&removing, a, b),
                             _ => {}
                         }
@@ -1544,6 +1742,47 @@ impl Link {
     }
 }
 
+/// Fetches `page` from a migration source's page server, retrying as a
+/// pager would (for up to `SOURCE_TIMEOUT`, and not past `deadline`):
+/// whether it serves pages at all.
+pub fn probe(source: &Source, page: u64, deadline: Instant) -> io::Result<()> {
+    let give_up = deadline.min(Instant::now() + SOURCE_TIMEOUT);
+    let mut backoff = BACKOFF_MIN;
+    loop {
+        let e = match probe_once(source, page, give_up) {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+        if Instant::now() + backoff >= give_up {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, format!("no page from {} in time: {e}", source.addr)));
+        }
+        thread::sleep(backoff);
+        backoff = (backoff * 2).min(BACKOFF_MAX);
+    }
+}
+
+/// One `probe` attempt: connecting, the request and every read by `at`.
+fn probe_once(source: &Source, page: u64, at: Instant) -> io::Result<()> {
+    let left = at.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(io::Error::new(io::ErrorKind::TimedOut, "deadline passed"));
+    }
+    let s = crate::util::connect(&source.addr, left)?;
+    s.set_nodelay(true)?;
+    let mut s = crate::util::By { s, at };
+    let mut req = serde_json::to_vec(&serde_json::json!({"op": "pages", "name": source.vm, "mig": source.mig}))?;
+    req.push(b'\n');
+    req.extend_from_slice(&(page * PAGE_SIZE as u64).to_le_bytes());
+    req.extend_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
+    s.write_all(&req)?;
+    let mut status = [0u8; 1];
+    s.read_exact(&mut status)?;
+    if status[0] != 0 {
+        return Err(io::Error::other("page server could not read guest memory"));
+    }
+    s.read_exact(&mut vec![0u8; PAGE_SIZE])
+}
+
 /// Client for a migration source's page server.
 pub struct PageClient {
     stream: TcpStream,
@@ -1598,6 +1837,19 @@ pub fn serve_pages(pager: &Pager, mut stream: impl Read + Write, down: impl Fn()
             }
         }
     }
+}
+
+/// The pages of `wanted` (sorted) that `runs` make REMOTE on a target.
+pub fn remote_among(runs: &Runs, wanted: impl IntoIterator<Item = u64>) -> Vec<u64> {
+    let mut remote: Vec<(u64, u64)> = runs.iter().filter(|r| r.2 == REMOTE).map(|r| (r.0, r.0 + r.1)).collect();
+    remote.sort_unstable();
+    wanted
+        .into_iter()
+        .filter(|&p| {
+            let i = remote.partition_point(|r| r.1 <= p);
+            remote.get(i).is_some_and(|r| r.0 <= p)
+        })
+        .collect()
 }
 
 /// Reads guest memory at an offset from wherever a puller pulls it.
@@ -1672,6 +1924,44 @@ mod tests {
 
     fn discard(p: &Pages, page: usize) -> bool {
         p.discard(&p.removing(), page)
+    }
+
+    #[test]
+    fn remote_among_picks_remote_pages() {
+        let runs: Runs = vec![(10, 5, REMOTE), (15, 2, ZERO), (100, 1, REMOTE), (3, 2, REMOTE)];
+        assert_eq!(remote_among(&runs, [0, 3, 4, 5, 9, 10, 14, 15, 16, 99, 100, 101]), vec![3, 4, 10, 14, 100]);
+        assert!(remote_among(&Vec::new(), [1, 2]).is_empty());
+    }
+
+    #[test]
+    fn next_not_base_finds_every_state() {
+        let mut st = vec![BASE; 300];
+        for &i in &[0usize, 7, 8, 9, 63, 64, 65, 130, 299] {
+            st[i] = PRESENT;
+        }
+        let p = pages(&st);
+        for from in 0..300 {
+            for end in from..=300 {
+                let want = (from..end).find(|&i| st[i] != BASE).unwrap_or(end);
+                assert_eq!(p.next_not_base(from, end), want, "from {from} end {end}");
+            }
+        }
+        assert_eq!(p.next_not_base(10, 1000), 63);
+        for from in 0..300 {
+            for end in from..=300 {
+                let want = (from..end).find(|&i| st[i] != PRESENT).unwrap_or(end);
+                assert_eq!(p.next_not(PRESENT, from, end), want, "PRESENT from {from} end {end}");
+            }
+        }
+
+        // Untouched chunks are skipped without reading them.
+        let p = Pages::new(3 * CHUNK + 5);
+        assert_eq!(p.next_not_base(0, p.len()), p.len());
+        p.set(2 * CHUNK + 7, ZERO);
+        assert_eq!(p.next_not_base(0, p.len()), 2 * CHUNK + 7);
+        assert_eq!(p.claim(CHUNK + 3, 2, BASE, |_| true), 2);
+        assert_eq!(p.next_not_base(0, p.len()), CHUNK + 3);
+        assert_eq!(p.next_not_base(CHUNK + 5, p.len()), 2 * CHUNK + 7);
     }
 
     #[test]

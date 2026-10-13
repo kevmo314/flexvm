@@ -1,0 +1,651 @@
+--- a/src/firecracker/src/api_server/request/snapshot.rs
++++ b/src/firecracker/src/api_server/request/snapshot.rs
+@@ -9,7 +9,7 @@
+     Vm, VmState,
+ };
+ 
+-use super::super::parsed_request::{ParsedRequest, RequestError};
++use super::super::parsed_request::{ParsedRequest, RequestAction, RequestError};
+ use super::super::request::{Body, Method, StatusCode};
+ 
+ /// Deprecation message for the `mem_file_path` field.
+@@ -31,6 +31,15 @@
+         Some(request_type) => match request_type {
+             "create" => parse_put_snapshot_create(body),
+             "load" => parse_put_snapshot_load(body),
++            // flexvm: the part of a load that needs no state of the VM being loaded.
++            "prepare" => parse_put_snapshot_load(body).map(|req| match req.into_parts() {
++                (RequestAction::Sync(action), _) => match *action {
++                    VmmAction::LoadSnapshot(params) => ParsedRequest::new(RequestAction::Sync(
++                        Box::new(VmmAction::PrepareSnapshot(params)),
++                    )),
++                    other => ParsedRequest::new(RequestAction::Sync(Box::new(other))),
++                },
++            }),
+             _ => Err(RequestError::InvalidPathMethod(
+                 format!("/snapshot/{}", request_type),
+                 Method::Put,
+--- a/src/vmm/src/builder.rs
++++ b/src/vmm/src/builder.rs
+@@ -419,15 +419,44 @@
+     UnsupportedClockRealtime,
+ }
+ 
++/// flexvm: the part of `build_microvm_from_snapshot` that only needs the layout of
++/// `microvm_state`: the KVM VM, its vCPUs and memory slots, then the vsock backend and pmem
++/// mappings (`KvmVm::prepare_devices`).
++pub fn prepare_microvm_from_snapshot(
++    microvm_state: &MicrovmState,
++    guest_memory: Vec<GuestRegionMmap>,
++) -> Result<(KvmVm, Vec<crate::Vcpu>), BuildMicrovmFromSnapshotError> {
++    let kvm = Kvm::new(microvm_state.kvm_state.kvm_cap_modifiers.clone())
++        .map_err(StartMicrovmError::Kvm)?;
++    // Set up KVM VM and register memory regions.
++    // Build custom CPU config if a custom template is provided.
++    let mut vm = KvmVm::new(kvm).map_err(StartMicrovmError::KvmVm)?;
++
++    let vcpu_count = u8::try_from(microvm_state.vcpu_states.len()).map_err(|_| {
++        BuildMicrovmFromSnapshotError::VmUpdateConfig(MachineConfigError::InvalidVcpuCount)
++    })?;
++    let vcpus = vm
++        .create_vcpus(vcpu_count)
++        .map_err(StartMicrovmError::KvmVm)?;
++
++    vm.restore_memory_regions(guest_memory, &microvm_state.vm_state.memory)
++        .map_err(StartMicrovmError::KvmVm)?;
++    vm.prepare_devices(&microvm_state.device_states)
++        .map_err(StartMicrovmError::KvmVm)?;
++    Ok((vm, vcpus))
++}
++
+ /// Builds and starts a microVM based on the provided MicrovmState.
+ ///
+ /// An `Arc` reference of the built `Vmm` is also plugged in the `EventManager`, while another
+-/// is returned.
++/// is returned. With `prepared` (flexvm), the KVM VM and vCPUs come from
++/// `prepare_microvm_from_snapshot` and `guest_memory` is unused.
+ #[allow(clippy::too_many_arguments)]
+ pub fn build_microvm_from_snapshot(
+     instance_info: &InstanceInfo,
+     event_manager: &mut EventManager,
+     microvm_state: MicrovmState,
++    prepared: Option<(KvmVm, Vec<crate::Vcpu>)>,
+     guest_memory: Vec<GuestRegionMmap>,
+     uffd: Option<Uffd>,
+     seccomp_filters: &BpfThreadMap,
+@@ -437,18 +466,29 @@
+     // Build Vmm.
+     debug!("event_start: build microvm from snapshot");
+ 
+-    let kvm = Kvm::new(microvm_state.kvm_state.kvm_cap_modifiers.clone())
+-        .map_err(StartMicrovmError::Kvm)?;
+-    // Set up KVM VM and register memory regions.
+-    // Build custom CPU config if a custom template is provided.
+-    let mut vm = KvmVm::new(kvm).map_err(StartMicrovmError::KvmVm)?;
+-
+-    let mut vcpus = vm
+-        .create_vcpus(vm_resources.machine_config.vcpu_count)
+-        .map_err(StartMicrovmError::KvmVm)?;
+-
+-    vm.restore_memory_regions(guest_memory, &microvm_state.vm_state.memory)
+-        .map_err(StartMicrovmError::KvmVm)?;
++    let (mut vm, mut vcpus) = match prepared {
++        Some((vm, vcpus)) => {
++            // Hot-plugged memory may differ from the snapshot it was prepared with.
++            vm.replug_memory(&microvm_state.vm_state.memory)
++                .map_err(StartMicrovmError::KvmVm)?;
++            (vm, vcpus)
++        }
++        None => {
++            let kvm = Kvm::new(microvm_state.kvm_state.kvm_cap_modifiers.clone())
++                .map_err(StartMicrovmError::Kvm)?;
++            // Set up KVM VM and register memory regions.
++            // Build custom CPU config if a custom template is provided.
++            let mut vm = KvmVm::new(kvm).map_err(StartMicrovmError::KvmVm)?;
++
++            let vcpus = vm
++                .create_vcpus(vm_resources.machine_config.vcpu_count)
++                .map_err(StartMicrovmError::KvmVm)?;
++
++            vm.restore_memory_regions(guest_memory, &microvm_state.vm_state.memory)
++                .map_err(StartMicrovmError::KvmVm)?;
++            (vm, vcpus)
++        }
++    };
+ 
+     #[cfg(target_arch = "x86_64")]
+     {
+@@ -509,6 +549,10 @@
+     #[allow(unused_mut)]
+     let mut device_manager =
+         DeviceManager::restore(device_ctor_args, &microvm_state.device_states)?;
++    // flexvm: anything prepared that the devices did not take.
++    kvm_vm
++        .drop_prepared_devices()
++        .map_err(StartMicrovmError::KvmVm)?;
+ 
+     let vmm = Vmm {
+         instance_info: instance_info.clone(),
+--- a/src/vmm/src/device_manager/persist.rs
++++ b/src/vmm/src/device_manager/persist.rs
+@@ -538,7 +538,15 @@
+             let ctor_args = VsockUdsConstructorArgs {
+                 cid: vsock_state.device_state.frontend.cid,
+             };
+-            let backend = VsockUnixBackend::restore(ctor_args, &vsock_state.device_state.backend)?;
++            // flexvm: the backend may have been set up ahead (`KvmVm::prepare_devices`).
++            let backend_state = &vsock_state.device_state.backend;
++            let backend = match vm.take_prepared_vsock(ctor_args.cid, &backend_state.uds_path) {
++                Some(mut backend) => {
++                    backend.local_port_last = backend_state.local_port_last;
++                    backend
++                }
++                None => VsockUnixBackend::restore(ctor_args, backend_state)?,
++            };
+             let device = Arc::new(Mutex::new(Vsock::restore(
+                 VsockConstructorArgs {
+                     mem: mem.clone(),
+--- a/src/vmm/src/devices/virtio/pmem/device.rs
++++ b/src/vmm/src/devices/virtio/pmem/device.rs
+@@ -311,7 +311,15 @@
+         acked_features: u64,
+         config_space: Option<ConfigSpace>,
+     ) -> Result<Self, PmemError> {
+-        let mmap = PmemMmap::new(&config.path_on_host, config.read_only)?;
++        // flexvm: the mapping and its KVM slot may have been set up ahead
++        // (`KvmVm::prepare_devices`).
++        let prepared = config_space.as_ref().and_then(|cs| {
++            vm.take_prepared_pmem(&config.path_on_host, config.read_only, cs.start, cs.size)
++        });
++        let (mmap, prepared_slot) = match prepared {
++            Some((mmap, slot)) => (mmap, Some(slot)),
++            None => (PmemMmap::new(&config.path_on_host, config.read_only)?, None),
++        };
+ 
+         let guest_region = match config_space {
+             Some(cs) => {
+@@ -329,7 +337,10 @@
+         } else {
+             0
+         };
+-        let kvm_mem_slot = KvmMemSlot::new(vm, cs.start, cs.size, mmap.mmap_ptr, flags)?;
++        let kvm_mem_slot = match prepared_slot {
++            Some(slot) => KvmMemSlot { vm, slot },
++            None => KvmMemSlot::new(vm, cs.start, cs.size, mmap.mmap_ptr, flags)?,
++        };
+ 
+         let rate_limiter = config
+             .rate_limiter
+--- a/src/vmm/src/persist.rs
++++ b/src/vmm/src/persist.rs
+@@ -366,6 +366,146 @@
+     GuestMemory(#[from] RestoreFromSnapshotGuestMemoryError),
+     /// Failed to build microVM from snapshot: {0}
+     Build(#[from] BuildMicrovmFromSnapshotError),
++    /// The prepared microVM does not fit this snapshot: {0}
++    Prepared(String),
++}
++
++/// flexvm: what `PrepareSnapshot` set up: a KVM VM with its vCPUs and memory slots for the layout
++/// of `state`, and guest memory already handed to the UFFD handler.
++pub struct PreparedRestore {
++    state: MicrovmState,
++    backend_path: std::path::PathBuf,
++    track_dirty_pages: bool,
++    huge_pages: crate::vmm_config::snapshot::SnapshotLoadHugePageConfig,
++    vm: vstate::vm::KvmVm,
++    vcpus: Vec<vstate::vcpu::Vcpu>,
++    uffd: Option<Uffd>,
++}
++
++impl Debug for PreparedRestore {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("PreparedRestore")
++            .field("backend_path", &self.backend_path)
++            .finish()
++    }
++}
++
++/// flexvm: see `VmmAction::PrepareSnapshot`. Only the UFFD memory backend is supported.
++pub fn prepare_from_snapshot(
++    params: &LoadSnapshotParams,
++) -> Result<PreparedRestore, RestoreFromSnapshotError> {
++    if params.mem_backend.backend_type != MemBackendType::Uffd {
++        return Err(RestoreFromSnapshotError::Prepared(
++            "only the Uffd memory backend can be prepared".into(),
++        ));
++    }
++    let mut state = snapshot_state_from_file(&params.snapshot_path)?;
++    snapshot_state_sanity_check(&state)?;
++    if let (Some(vsock_override), VirtioDevicesState::Mmio(mmio_state)) = (
++        &params.vsock_override,
++        &mut state.device_states.virtio_state,
++    ) && let Some(vsock) = mmio_state.vsock_device.as_mut()
++    {
++        vsock
++            .device_state
++            .backend
++            .uds_path
++            .clone_from(&vsock_override.uds_path);
++    }
++    let huge_pages = params.huge_pages.resolve(state.vm_info.huge_pages);
++    let (guest_memory, uffd) = guest_memory_from_uffd(
++        &params.mem_backend.backend_path,
++        &state.vm_state.memory,
++        params.track_dirty_pages,
++        huge_pages,
++    )
++    .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?;
++    let (vm, vcpus) = builder::prepare_microvm_from_snapshot(&state, guest_memory)?;
++    Ok(PreparedRestore {
++        state,
++        backend_path: params.mem_backend.backend_path.clone(),
++        track_dirty_pages: params.track_dirty_pages,
++        huge_pages: params.huge_pages,
++        vm,
++        vcpus,
++        uffd,
++    })
++}
++
++/// The identity of the devices `KvmVm::prepare_devices` sets up from `state`: the transport,
++/// the vsock (cid, socket path) and each pmem (path, read only, guest range), in order.
++#[allow(clippy::type_complexity)]
++fn prepared_devices(
++    state: &MicrovmState,
++) -> (bool, Option<(u64, String)>, Vec<(String, bool, u64, u64)>) {
++    match &state.device_states.virtio_state {
++        VirtioDevicesState::Mmio(mmio) => (
++            true,
++            mmio.vsock_device.as_ref().map(|v| {
++                (
++                    v.device_state.frontend.cid,
++                    v.device_state.backend.uds_path.clone(),
++                )
++            }),
++            mmio.pmem_devices
++                .iter()
++                .map(|p| {
++                    let (c, cs) = (&p.device_state.config, &p.device_state.config_space);
++                    (c.path_on_host.clone(), c.read_only, cs.start, cs.size)
++                })
++                .collect(),
++        ),
++        VirtioDevicesState::Pci(_) => (false, None, Vec::new()),
++    }
++}
++
++/// Whether the VM prepared from `p` can take `state`, loaded with `params`: everything prepared
++/// from the other snapshot must be what this one would have set up, or devices would collide
++/// with it (a second KVM slot over the pmem range, a second bind of the vsock socket).
++fn check_prepared(
++    p: &PreparedRestore,
++    state: &MicrovmState,
++    params: &LoadSnapshotParams,
++) -> Result<(), RestoreFromSnapshotError> {
++    let (a, b) = (&p.state, state);
++    let same_regions = a.vm_state.memory.regions.len() == b.vm_state.memory.regions.len()
++        && a.vm_state
++            .memory
++            .regions
++            .iter()
++            .zip(&b.vm_state.memory.regions)
++            .all(|(x, y)| {
++                x.base_address == y.base_address
++                    && x.size == y.size
++                    && x.region_type == y.region_type
++                    && x.plugged.len() == y.plugged.len()
++            });
++    let mismatch = if a.vcpu_states.len() != b.vcpu_states.len() {
++        "vCPU count"
++    } else if a.vm_info.mem_size_mib != b.vm_info.mem_size_mib
++        || a.vm_info.smt != b.vm_info.smt
++        || a.vm_info.cpu_template != b.vm_info.cpu_template
++        || a.vm_info.huge_pages != b.vm_info.huge_pages
++    {
++        "machine configuration"
++    } else if a.kvm_state.kvm_cap_modifiers != b.kvm_state.kvm_cap_modifiers {
++        "KVM capabilities"
++    } else if !same_regions {
++        "memory layout"
++    } else if prepared_devices(a) != prepared_devices(b) {
++        "pmem or vsock device"
++    } else if params.mem_backend.backend_type != MemBackendType::Uffd
++        || p.backend_path != params.mem_backend.backend_path
++        || p.track_dirty_pages != params.track_dirty_pages
++        || p.huge_pages != params.huge_pages
++    {
++        "memory backend"
++    } else {
++        return Ok(());
++    };
++    Err(RestoreFromSnapshotError::Prepared(format!(
++        "{mismatch} differs"
++    )))
+ }
+ /// Sub-Error type for [`restore_from_snapshot`] to contain either [`GuestMemoryFromFileError`] or
+ /// [`GuestMemoryFromUffdError`] within [`RestoreFromSnapshotError`].
+@@ -384,6 +524,7 @@
+     seccomp_filters: &BpfThreadMap,
+     params: &LoadSnapshotParams,
+     vm_resources: &mut VmResources,
++    prepared: Option<PreparedRestore>,
+ ) -> Result<Arc<Mutex<Vmm>>, RestoreFromSnapshotError> {
+     let mut microvm_state = snapshot_state_from_file(&params.snapshot_path)?;
+     for entry in &params.network_overrides {
+@@ -453,6 +594,23 @@
+     // Some sanity checks before building the microvm.
+     snapshot_state_sanity_check(&microvm_state)?;
+ 
++    // flexvm: memory, KVM VM and vCPUs set up by `prepare_from_snapshot`.
++    if let Some(p) = prepared {
++        check_prepared(&p, &microvm_state, params)?;
++        return builder::build_microvm_from_snapshot(
++            instance_info,
++            event_manager,
++            microvm_state,
++            Some((p.vm, p.vcpus)),
++            Vec::new(),
++            p.uffd,
++            seccomp_filters,
++            vm_resources,
++            params.clock_realtime,
++        )
++        .map_err(RestoreFromSnapshotError::Build);
++    }
++
+     let mem_backend_path = &params.mem_backend.backend_path;
+     let mem_state = &microvm_state.vm_state.memory;
+ 
+@@ -487,6 +645,7 @@
+         instance_info,
+         event_manager,
+         microvm_state,
++        None,
+         guest_memory,
+         uffd,
+         seccomp_filters,
+--- a/src/vmm/src/rpc_interface.rs
++++ b/src/vmm/src/rpc_interface.rs
+@@ -96,6 +96,12 @@
+     /// called before the microVM has booted. If this action is successful, the loaded microVM will
+     /// be in `Paused` state. Should change this state to `Resumed` for the microVM to run.
+     LoadSnapshot(LoadSnapshotParams),
++    /// flexvm: does the part of a snapshot load that needs no state of the VM being loaded,
++    /// using the snapshot at `snapshot_path` (e.g. the template the VM was restored from) for the
++    /// layout: creates the KVM VM, its vCPUs and memory slots, hands guest memory to the UFFD
++    /// handler, and sets up the vsock backend and pmem mappings. A following `LoadSnapshot` of a
++    /// compatible snapshot then only restores vCPU, VM and device state.
++    PrepareSnapshot(LoadSnapshotParams),
+     /// Partial update of the MMDS contents.
+     PatchMMDS(Value),
+     /// Pause the guest, by pausing the microVM VCPUs.
+@@ -293,6 +299,8 @@
+     // Some PrebootApiRequest errors are irrecoverable and Firecracker
+     // should cleanly teardown if they occur.
+     fatal_error: Option<BuildMicrovmFromRequestsError>,
++    // flexvm: set up by `PrepareSnapshot`, used by the next `LoadSnapshot`.
++    prepared: Option<crate::persist::PreparedRestore>,
+ }
+ 
+ // TODO Remove when `EventManager` implements `std::fmt::Debug`.
+@@ -355,6 +363,7 @@
+             built_vmm: None,
+             boot_path: false,
+             fatal_error: None,
++            prepared: None,
+         }
+     }
+ 
+@@ -476,6 +485,9 @@
+             InsertNetworkDevice(config) => self.insert_net_device(config),
+             LoadSnapshot(config) => self
+                 .load_snapshot(&config)
++                .map_err(VmmActionError::LoadSnapshot),
++            PrepareSnapshot(config) => self
++                .prepare_snapshot(&config)
+                 .map_err(VmmActionError::LoadSnapshot),
+             PatchMMDS(value) => mmds_patch_data(
+                 self.vm_resources
+@@ -638,6 +650,24 @@
+         .map_err(VmmActionError::StartMicrovm)
+     }
+ 
++    // flexvm: see `VmmAction::PrepareSnapshot`.
++    fn prepare_snapshot(
++        &mut self,
++        load_params: &LoadSnapshotParams,
++    ) -> Result<VmmData, LoadSnapshotError> {
++        if self.boot_path || self.prepared.is_some() {
++            let err = LoadSnapshotError::LoadSnapshotNotAllowed;
++            info!("{}", err);
++            return Err(err);
++        }
++        let prepared = crate::persist::prepare_from_snapshot(load_params).inspect_err(|_| {
++            // Guest memory may have been handed to the UFFD handler already.
++            self.fatal_error = Some(BuildMicrovmFromRequestsError::Restore);
++        })?;
++        self.prepared = Some(prepared);
++        Ok(VmmData::Empty)
++    }
++
+     // On success, this command will end the pre-boot stage and this controller
+     // will be replaced by a runtime controller.
+     fn load_snapshot(
+@@ -659,6 +689,7 @@
+             self.seccomp_filters,
+             load_params,
+             self.vm_resources,
++            self.prepared.take(),
+         )
+         .inspect_err(|_| {
+             // If restore fails, we consider the process is too dirty to recover.
+@@ -850,6 +881,7 @@
+             | ConfigureMetrics(_)
+             | ConfigureSerial(_)
+             | LoadSnapshot(_)
++            | PrepareSnapshot(_)
+             | PutCpuConfiguration(_)
+             | SetBalloonDevice(_)
+             | SetVsockDevice(_)
+--- a/src/vmm/src/vstate/vm.rs
++++ b/src/vmm/src/vstate/vm.rs
+@@ -83,17 +83,40 @@
+     pub vcpus_handles: Mutex<Vec<VcpuHandle>>,
+     /// Event fd written to by vCPUs on exit.
+     pub vcpus_exit_evt: EventFd,
++    /// flexvm: device resources set up by a prepared snapshot load, taken by the devices
++    /// restored from the loaded snapshot.
++    pub prepared_devices: Mutex<PreparedDevices>,
+     /// Test-only countdown that forces the Nth-next `set_user_memory_region` call to fail, used
+     /// to exercise partial-failure handling. 0 means never fail.
+     #[cfg(test)]
+     fail_set_user_memory_region_in: AtomicU32,
+ }
+ 
++/// flexvm: device resources that need no device state, set up ahead of a snapshot load
++/// (`KvmVm::prepare_devices`): binding the vsock socket and mapping pmem files into KVM take
++/// milliseconds.
++#[derive(Debug, Default)]
++pub struct PreparedDevices {
++    /// (cid, socket path, backend)
++    vsock: Option<(u64, String, crate::devices::virtio::vsock::VsockUnixBackend)>,
++    /// (path, read only, guest address, size, mapping, KVM slot)
++    pmem: Vec<(
++        String,
++        bool,
++        u64,
++        u64,
++        crate::devices::virtio::pmem::device::PmemMmap,
++        u32,
++    )>,
++}
++
+ /// Errors associated with the wrappers over KVM ioctls.
+ /// Needs `rustfmt::skip` to make multiline comments work
+ #[rustfmt::skip]
+ #[derive(Debug, thiserror::Error, displaydoc::Display)]
+ pub enum VmError {
++    /// flexvm: cannot prepare a snapshot load: {0}
++    Prepare(String),
+     /// Cannot set the memory regions: {0}
+     SetUserMemoryRegion(kvm_ioctls::Error),
+     /// Failed to create VM: {0}
+@@ -195,6 +218,7 @@
+             uffd: None,
+             vcpus_handles: Mutex::new(Vec::new()),
+             vcpus_exit_evt,
++            prepared_devices: Mutex::new(PreparedDevices::default()),
+             #[cfg(test)]
+             fail_set_user_memory_region_in: AtomicU32::new(0),
+         })
+@@ -513,6 +537,149 @@
+         ));
+ 
+         self.register_memory_region(arcd_region)
++    }
++
++    /// flexvm: binds the vsock backend's socket and maps the pmem files of `devices` into KVM,
++    /// for the devices restored by the coming snapshot load to take (MMIO transport only).
++    pub fn prepare_devices(
++        &self,
++        devices: &crate::device_manager::DevicesState,
++    ) -> Result<(), VmError> {
++        use crate::device_manager::VirtioDevicesState;
++        let VirtioDevicesState::Mmio(mmio) = &devices.virtio_state else {
++            return Ok(());
++        };
++        let mut prepared = self.common.prepared_devices.lock().unwrap();
++        if let Some(vsock) = &mmio.vsock_device {
++            let (cid, path) = (
++                vsock.device_state.frontend.cid,
++                &vsock.device_state.backend.uds_path,
++            );
++            let backend = crate::devices::virtio::vsock::VsockUnixBackend::new(cid, path.clone())
++                .map_err(|e| VmError::Prepare(format!("vsock: {e}")))?;
++            prepared.vsock = Some((cid, path.clone(), backend));
++        }
++        for pmem in &mmio.pmem_devices {
++            let (config, cs) = (&pmem.device_state.config, &pmem.device_state.config_space);
++            let mmap = crate::devices::virtio::pmem::device::PmemMmap::new(
++                &config.path_on_host,
++                config.read_only,
++            )
++            .map_err(|e| VmError::Prepare(format!("pmem: {e}")))?;
++            if mmap.mmap_len != cs.size {
++                return Err(VmError::Prepare(format!(
++                    "pmem: {} changed size",
++                    config.path_on_host
++                )));
++            }
++            let slot = self
++                .next_kvm_slot(1)
++                .ok_or(VmError::NotEnoughMemorySlots(self.common.max_memslots))?;
++            self.set_user_memory_region(kvm_bindings::kvm_userspace_memory_region {
++                slot,
++                guest_phys_addr: cs.start,
++                memory_size: cs.size,
++                userspace_addr: mmap.mmap_ptr,
++                flags: if config.read_only {
++                    kvm_bindings::KVM_MEM_READONLY
++                } else {
++                    0
++                },
++            })?;
++            prepared.pmem.push((
++                config.path_on_host.clone(),
++                config.read_only,
++                cs.start,
++                cs.size,
++                mmap,
++                slot,
++            ));
++        }
++        Ok(())
++    }
++
++    /// flexvm: the vsock backend prepared for `cid` at `path`, if any.
++    pub fn take_prepared_vsock(
++        &self,
++        cid: u64,
++        path: &str,
++    ) -> Option<crate::devices::virtio::vsock::VsockUnixBackend> {
++        let mut prepared = self.common.prepared_devices.lock().unwrap();
++        match &prepared.vsock {
++            Some((c, p, _)) if *c == cid && p == path => prepared.vsock.take().map(|v| v.2),
++            _ => None,
++        }
++    }
++
++    /// flexvm: the pmem mapping and KVM slot prepared for this file at this guest range, if any.
++    pub fn take_prepared_pmem(
++        &self,
++        path: &str,
++        read_only: bool,
++        start: u64,
++        size: u64,
++    ) -> Option<(crate::devices::virtio::pmem::device::PmemMmap, u32)> {
++        let mut prepared = self.common.prepared_devices.lock().unwrap();
++        let i = prepared
++            .pmem
++            .iter()
++            .position(|p| p.0 == path && p.1 == read_only && p.2 == start && p.3 == size)?;
++        let p = prepared.pmem.swap_remove(i);
++        Some((p.4, p.5))
++    }
++
++    /// flexvm: undoes whatever prepared device resources were not taken. A pmem mapping whose
++    /// KVM slot cannot be removed stays mapped (the guest could still reach it) and is an error.
++    pub fn drop_prepared_devices(&self) -> Result<(), VmError> {
++        let prepared = std::mem::take(&mut *self.common.prepared_devices.lock().unwrap());
++        let mut res = Ok(());
++        for (path, _, start, _, mmap, slot) in prepared.pmem {
++            let removed = self.set_user_memory_region(kvm_bindings::kvm_userspace_memory_region {
++                slot,
++                guest_phys_addr: start,
++                memory_size: 0,
++                userspace_addr: mmap.mmap_ptr,
++                flags: 0,
++            });
++            if let Err(e) = removed {
++                std::mem::forget(mmap);
++                res = Err(VmError::Prepare(format!(
++                    "cannot remove the slot of unused pmem {path}: {e}"
++                )));
++            }
++        }
++        res
++    }
++
++    /// flexvm: plugs and unplugs memory slots of hotpluggable regions to match `state`, for a VM
++    /// whose memory regions were restored from another snapshot of the same layout.
++    pub fn replug_memory(&self, state: &GuestMemoryState) -> Result<(), VmError> {
++        for rstate in &state.regions {
++            let Some(region) = self
++                .guest_memory()
++                .iter()
++                .find(|r| r.start_addr().0 == rstate.base_address)
++            else {
++                return Err(VmError::Prepare(format!(
++                    "no region at {:#x}",
++                    rstate.base_address
++                )));
++            };
++            let current: Vec<bool> = region.plugged.lock().unwrap().iter().by_vals().collect();
++            if current.len() != rstate.plugged.len() {
++                return Err(VmError::Prepare(format!(
++                    "region at {:#x} has other slots",
++                    rstate.base_address
++                )));
++            }
++            for (i, (&now, &want)) in current.iter().zip(&rstate.plugged).enumerate() {
++                if now != want {
++                    let slot = region.slot_from + u32::try_from(i).unwrap();
++                    region.update_slot(self, &region.mem_slot(slot), want)?;
++                }
++            }
++        }
++        Ok(())
+     }
+ 
+     /// Register a list of new memory regions to this [`KvmVm`].
