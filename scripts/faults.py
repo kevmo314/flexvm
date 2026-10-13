@@ -1104,7 +1104,7 @@ def checkpoint_restore():
     check("restore: process survived (pid, start time)", marker_id(A, n) == proc_before, (proc_before, marker_id(A, n)))
     err = guest_clock_error(A, n)
     check("restore: guest clock right", err is not None and abs(err) < 0.5, err)
-    check("restore: whole checkpoint paged in", wait_for(lambda: vms(A)[n]["pages_mib"]["remote"] == 0, 30), vms(A)[n]["pages_mib"])
+    check("restore: whole checkpoint paged in", wait_for(lambda: vms(A)[n].get("pages_mib", {}).get("remote") == 0, 30), vms(A)[n].get("pages_mib"))
     cleanup(n)
     check("restore: killing it gives the address back", wait_for(lambda: ip not in ok(A, {"op": "info"})["lent"], 10))
     rm_ckpt(path)
@@ -1491,7 +1491,7 @@ def suspend_resume():
     check("suspend: process survived", marker_id(A, n) == proc_before, (proc_before, marker_id(A, n)))
     err = guest_clock_error(A, n)
     check("suspend: guest clock right", err is not None and abs(err) < 0.5, err)
-    check("suspend: paged back in", wait_for(lambda: vms(A)[n]["pages_mib"]["remote"] == 0, 30), vms(A)[n])
+    check("suspend: paged back in", wait_for(lambda: vms(A)[n].get("pages_mib", {}).get("remote") == 0, 30), vms(A)[n])
     cleanup(n)
 
 
@@ -1543,7 +1543,7 @@ def suspend_disk_freed():
     check("disk freed: checkpoint written", data >= 1000, r)
     before = free_mib(A.state)
     ok(resume_suspended(A, n))
-    check("disk freed: paged back in", wait_for(lambda: vms(A)[n]["pages_mib"]["remote"] == 0, 60), vms(A)[n])
+    check("disk freed: paged back in", wait_for(lambda: vms(A)[n].get("pages_mib", {}).get("remote") == 0, 60), vms(A)[n])
     check("disk freed: checkpoint deleted", wait_for(lambda: not os.path.exists(d), 30))
     pid = vm_pid(A, n)
     check("disk freed: the vm process holds no checkpoint file", wait_for(lambda: not open_under(pid, d), 10), open_under(pid, d))
