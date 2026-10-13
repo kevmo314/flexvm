@@ -55,7 +55,7 @@ wait_for() {
 resources_gone() {
     local p ns
     for p in /proc/[0-9]*; do
-        tr '\0' ' ' < "$p/cmdline" 2>/dev/null | grep -q -- "--state /run/flexvm-lab-" && return 1
+        { tr '\0' ' ' < "$p/cmdline"; } 2>/dev/null | grep -q -- "--state /run/flexvm-lab-" && return 1
     done
     while read -r ns _; do
         case "$ns" in fvA|fvB|fvC|fvlan) return 1 ;; esac

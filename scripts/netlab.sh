@@ -54,7 +54,7 @@ stop() {
   # VM's Firecracker dies with its process).
   local p pids=
   for p in /proc/[0-9]*; do
-    tr '\0' ' ' < "$p/cmdline" 2>/dev/null | grep -q -- "--state /run/flexvm-lab-" && pids+=" ${p#/proc/}"
+    { tr '\0' ' ' < "$p/cmdline"; } 2>/dev/null | grep -q -- "--state /run/flexvm-lab-" && pids+=" ${p#/proc/}"
   done
   for p in $pids; do kill -9 "$p" 2>/dev/null || true; done
   sleep 1

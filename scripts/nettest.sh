@@ -60,7 +60,7 @@ wait_for() {
 our_processes() {
     local p
     for p in /proc/[0-9]*; do
-        tr '\0' ' ' < "$p/cmdline" 2>/dev/null | grep -qE -- "--state ($dir_A|$dir_B)/state" && echo "${p#/proc/}"
+        { tr '\0' ' ' < "$p/cmdline"; } 2>/dev/null | grep -qE -- "--state ($dir_A|$dir_B)/state" && echo "${p#/proc/}"
     done
 }
 
