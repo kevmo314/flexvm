@@ -696,8 +696,8 @@ impl Pager {
     /// `PAGE_SIZE` slice of `data` per page of `list`), once Firecracker has
     /// connected (and the page states are set): the load would otherwise
     /// fault on them one round trip at a time. Runs alongside the load; a
-    /// page a fault or puller claimed first is skipped. Returns how many it
-    /// installed.
+    /// page a fault or puller claimed first is waited for (by `deadline`),
+    /// so all of them are in when it returns. Returns how many it installed.
     pub fn preload(&self, list: &[u64], data: &[u8], deadline: Instant) -> Result<usize> {
         if data.len() != list.len() * PAGE_SIZE {
             bail!("preload of {} pages has {} bytes", list.len(), data.len());
@@ -711,13 +711,37 @@ impl Pager {
         let mut installed = 0;
         for (&page, src) in list.iter().zip(data.chunks_exact(PAGE_SIZE)) {
             let page = page as usize;
-            if page >= pages.len() || pages.claim(page, 1, REMOTE, |_| true) == 0 {
+            if page >= pages.len() {
                 continue;
             }
-            let (resolved, res) = pages.install(page, 1, REMOTE, None, |p, c| self.populate(p, c, Some(src)));
-            self.pulled(resolved);
-            res?;
-            installed += resolved;
+            // Done once the page is no longer REMOTE nor being installed by
+            // someone else (a fault or a puller, whose fetch may fail and
+            // give it back): when this returns, every listed page is in.
+            loop {
+                if let Some(why) = self.failed() {
+                    bail!("the pager failed: {why}");
+                }
+                match pages.get(page) {
+                    REMOTE if pages.claim(page, 1, REMOTE, |_| true) == 1 => {
+                        let (resolved, res) = pages.install(page, 1, REMOTE, None, |p, c| self.populate(p, c, Some(src)));
+                        self.pulled(resolved);
+                        installed += resolved;
+                        match res {
+                            Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => {}
+                            r => break r?,
+                        }
+                    }
+                    REMOTE | INFLIGHT | DISCARDED => {}
+                    _ => break,
+                }
+                if self.stop.load(Ordering::SeqCst) || Instant::now() >= deadline {
+                    bail!("page {page} still being installed at the deadline");
+                }
+                thread::sleep(Duration::from_micros(50));
+            }
+        }
+        if let Some(why) = self.failed() {
+            bail!("the pager failed: {why}");
         }
         Ok(installed)
     }
