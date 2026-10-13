@@ -18,6 +18,7 @@ use crate::bail;
 use crate::fc::Firecracker;
 use crate::guest;
 use crate::image::ImageMeta;
+use crate::socket::SocketRoot;
 use crate::uffd::Pager;
 use crate::util::{ms, retry, Result, PAGE_SIZE};
 
@@ -480,34 +481,34 @@ fn sparsify(path: &Path) -> Result<u64> {
 
 /// Restores the template once and records which pages the guest touches
 /// until its agent answers; restores prefetch exactly those.
-fn record_working_set(paths: &Paths, name: &str, tap: &str) -> Result<usize> {
+fn record_working_set(paths: &Paths, name: &str, tap: &str, sockets: &Arc<SocketRoot>) -> Result<usize> {
     let tpl = Template::open(paths, name)?;
     let run = tpl.dir.join("record");
-    // A failed earlier build may have left its sockets behind.
+    // A failed earlier build may have left its logs behind.
     let _ = std::fs::remove_dir_all(&run);
     std::fs::create_dir_all(&run)?;
-    let pager = Pager::start(&run.join("uffd.sock"), tpl.clone(), None)?;
-    let fc = Firecracker::spawn(&paths.firecracker, &run)?;
+    let fc = Firecracker::spawn(&paths.firecracker, &run, sockets.allocate()?)?;
+    let pager = Pager::start(&fc.sockets.uffd, tpl.clone(), None)?;
     pager.set_pid(fc.pid())?;
     fc.put(
         "/snapshot/load",
         json!({
             "snapshot_path": tpl.vmstate(),
-            "mem_backend": {"backend_type": "Uffd", "backend_path": run.join("uffd.sock")},
-            "vsock_override": {"uds_path": run.join("v.sock")},
+            "mem_backend": {"backend_type": "Uffd", "backend_path": fc.sockets.uffd},
+            "vsock_override": {"uds_path": fc.sockets.vsock},
             "network_overrides": [{"iface_id": "eth0", "host_dev_name": tap}],
             // Like the daemon's restores: stepping the clock touches pages of its own.
             "clock_realtime": true,
             "resume_vm": true,
         }),
     )?;
-    retry(Duration::from_secs(10), || guest::ping(&run.join("v.sock")))?;
-    guest::start(&run.join("v.sock"), "10.255.255.254".parse()?, None, &tpl.legacy_agent)?;
+    retry(Duration::from_secs(10), || guest::ping(&fc.sockets.vsock))?;
+    guest::start(&fc.sockets.vsock, "10.255.255.254".parse()?, None, &tpl.legacy_agent)?;
     // Like `run`: start a cold image template's app.
     if tpl.meta.image.as_ref().is_some_and(|i| !i.warm) {
-        guest::start_app(&run.join("v.sock"))?;
+        guest::start_app(&fc.sockets.vsock)?;
     }
-    guest::exec(&run.join("v.sock"), "true")?;
+    guest::exec(&fc.sockets.vsock, "true")?;
     fc.pause()?;
     let runs = pager.present_runs();
     pager.stop();
@@ -585,14 +586,14 @@ fn build(
     std::fs::create_dir_all(&dir)?;
     let run = dir.join("boot");
     std::fs::create_dir_all(&run)?;
-    let vsock = run.join("v.sock");
-    let _ = std::fs::remove_file(&vsock);
+    let sockets = SocketRoot::new(&dir)?;
 
     // Pin the exact image file: artifacts/rootfs.ext4 is a symlink a rebuild
     // repoints, and this snapshot's page cache is only valid for these bytes.
     let rootfs = std::fs::canonicalize(&paths.rootfs)?;
     let start = Instant::now();
-    let fc = Firecracker::spawn(&paths.firecracker, &run)?;
+    let fc = Firecracker::spawn(&paths.firecracker, &run, sockets.allocate()?)?;
+    let vsock = fc.sockets.vsock.clone();
     fc.put("/boot-source", json!({"kernel_image_path": paths.kernel, "boot_args": BOOT_ARGS}))?;
     fc.put("/machine-config", json!({"vcpu_count": vcpus, "mem_size_mib": mem_mib}))?;
     fc.put("/pmem/root", json!({"id": "root", "path_on_host": rootfs, "root_device": true, "read_only": true}))?;
@@ -649,7 +650,7 @@ fn build(
     meta.identify(paths, &dir)?;
     std::fs::write(dir.join("meta.json"), serde_json::to_vec_pretty(&meta)?)?;
     let _ = std::fs::remove_file(dir.join("wset"));
-    let wset = record_working_set(paths, staging, tap)?;
+    let wset = record_working_set(paths, staging, tap, &sockets)?;
     let size = std::fs::metadata(dir.join("mem"))?.len();
     println!(
         "template {name} (id {}): {vcpus} vCPUs, {mem_mib} MiB base + {hotplug} MiB hotplug, booted in {} ms, \

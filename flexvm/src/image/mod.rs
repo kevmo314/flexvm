@@ -644,10 +644,15 @@ mod tests {
 
     #[test]
     fn staging_needs_a_root_only_ancestry() {
-        check_ancestry(Path::new("/")).unwrap();
-        // The test runs unprivileged: its own directories never qualify.
+        use std::os::unix::fs::PermissionsExt;
+        // Whoever runs it (root or not, with / root-owned or not): a group
+        // writable directory and a symlink never qualify.
         let d = tmpdir("ancestry");
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o775)).unwrap();
         assert!(check_ancestry(&d).unwrap_err().to_string().contains("must be root-owned"));
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink("/", d.join("link")).unwrap();
+        assert!(check_ancestry(&d.join("link")).is_err());
         std::fs::remove_dir_all(d).unwrap();
     }
 

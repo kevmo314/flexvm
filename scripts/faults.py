@@ -149,14 +149,14 @@ def start_daemon(host, argv, env):
 
 
 def firecrackers(run_dir):
-    """Firecracker pids running out of `run_dir`, with their directories."""
+    """Firecracker pids running out of `run_dir`, with their directories
+    there (found by their log, as their sockets live elsewhere)."""
     out = {}
     for pid in subprocess.run(["pgrep", "-x", "firecracker"], capture_output=True, text=True).stdout.split():
-        argv = proc(pid, "cmdline").split(b"\0")
-        for a in argv:
-            d = os.path.realpath(os.path.dirname(a.decode(errors="replace")))
-            if d.startswith(os.path.realpath(run_dir) + "/"):
-                out[pid] = d
+        log = subprocess.run(["sudo", "readlink", f"/proc/{pid}/fd/1"], capture_output=True, text=True).stdout.strip()
+        d = os.path.dirname(log)
+        if d.startswith(os.path.realpath(run_dir) + "/"):
+            out[pid] = d
     return out
 
 
@@ -832,9 +832,9 @@ def api_sock(host, name):
     """The API socket of `name`'s Firecracker on `host`, found by the pid
     `ls` reports (the run directory also holds idle and hot-pool ones)."""
     pid = str(vms(host)[name]["pid"])
-    d = firecrackers(run_dir(host)).get(pid)
-    assert d, (pid, firecrackers(run_dir(host)))
-    return os.path.join(d, "api.sock")
+    assert pid in firecrackers(run_dir(host)), (pid, firecrackers(run_dir(host)))
+    argv = proc(pid, "cmdline").split(b"\0")
+    return argv[argv.index(b"--api-sock") + 1].decode()
 
 
 def fc_api(sock, method, path, body=None):

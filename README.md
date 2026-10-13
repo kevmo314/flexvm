@@ -579,6 +579,14 @@ their copies, and removes its taps, cgroups and run directory. It logs what it
 is waiting for every 5 s; a second signal stops the waiting and logs what that
 costs.
 
+Firecracker API, vsock and UFFD sockets live in short private directories
+under `/run/flexvm/s` (or `/tmp/flexvm-s-<uid>` if that is unusable), one per
+daemon or template build, named after a hash of its run or build directory,
+with a counter-named slot per Firecracker. They must be real directories owned
+by the process's user with mode 0700. Sockets are removed with their VM or pool
+slot, and a restarted daemon removes what its predecessor left. Deep artifact,
+template and run paths do not affect socket path lengths.
+
 ## Container images
 
 ```sh

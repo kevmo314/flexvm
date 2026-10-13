@@ -71,9 +71,7 @@ pub fn connect_unix(path: &std::path::Path, timeout: Duration) -> io::Result<Uni
     let mut sa: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     sa.sun_family = libc::AF_UNIX as libc::sa_family_t;
     let bytes = path.as_os_str().as_bytes();
-    if bytes.len() >= sa.sun_path.len() {
-        return Err(io::Error::other("socket path too long"));
-    }
+    crate::socket::check(path)?;
     for (d, s) in sa.sun_path.iter_mut().zip(bytes) {
         *d = *s as libc::c_char;
     }
