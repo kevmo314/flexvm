@@ -401,6 +401,16 @@ impl Pages {
         end
     }
 
+    /// The first page in `[from, end)` in `state` (not BASE), or `end`.
+    pub fn next_in(&self, state: u8, mut from: usize, end: usize) -> usize {
+        let end = end.min(self.states.len());
+        from = self.next_not_base(from, end);
+        while from < end && self.states[from].load(Ordering::Relaxed) != state {
+            from = self.next_not_base(from + 1, end);
+        }
+        from
+    }
+
     /// How many pages in `[from, end)` are in `state` (not BASE).
     pub fn count(&self, state: u8, from: usize, end: usize) -> usize {
         let (mut i, mut n) = (self.next_not_base(from, end), 0);
@@ -1782,14 +1792,17 @@ impl Pager {
             return;
         }
         let threads = thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, SAVE_REST_THREADS);
-        let chunks: Vec<(usize, usize)> = self
-            .mappings()
-            .iter()
-            .flat_map(|m| {
-                let (from, to) = (m.offset as usize / PAGE_SIZE, (m.offset as usize + m.size) / PAGE_SIZE);
-                (from..to).step_by(PREFETCH_RUN).map(move |c| (c, (c + PREFETCH_RUN).min(to)))
-            })
-            .collect();
+        // Only the runs to save (not every page of guest memory: a VM's
+        // unplugged virtio-mem region alone is millions), within a region.
+        let mut chunks: Vec<(usize, usize)> = Vec::new();
+        for &(first, end) in cow.runs() {
+            let mut c = first;
+            while c < end {
+                let e = (c + PREFETCH_RUN).min(end).min(self.region_end(c).unwrap_or(c + 1));
+                chunks.push((c, e));
+                c = e;
+            }
+        }
         let next = AtomicUsize::new(0);
         thread::scope(|s| {
             for _ in 0..threads {
@@ -2252,7 +2265,8 @@ impl Pager {
         let pages = self.pages();
         let n = pages.claim(i, (end - i).min(buf.len() / PAGE_SIZE), REMOTE, |_| true);
         if n == 0 {
-            return Ok(i + 1);
+            // On to the next REMOTE page, skipping untouched stretches.
+            return Ok(pages.next_in(REMOTE, i + 1, end));
         }
         let started = Instant::now();
         let (resolved, res) = self.fetch_install(i, n, buf, fetch, &mut |_| false);
@@ -2867,6 +2881,7 @@ mod tests {
                 let want = (from..end).find(|&i| st[i] != PRESENT).unwrap_or(end);
                 assert_eq!(p.next_not(PRESENT, from, end), want, "PRESENT from {from} end {end}");
                 assert_eq!(p.count(PRESENT, from, end), st[from..end].iter().filter(|&&s| s == PRESENT).count());
+                assert_eq!(p.next_in(PRESENT, from, end), (from..end).find(|&i| st[i] == PRESENT).unwrap_or(end));
             }
         }
 
