@@ -254,35 +254,21 @@ impl Pages {
     }
 
     /// The first page in `[from, end)` not in state BASE, or `end`. Skips
-    /// BASE (zero) states eight at a time: a VM's map is mostly BASE (the
-    /// unplugged virtio-mem region alone is millions of pages), and a
-    /// migration scans it with the VM paused.
+    /// chunks no state in which ever left BASE without reading them: a VM's
+    /// map is mostly BASE (the unplugged virtio-mem region alone is millions
+    /// of pages), and a migration scans it with the VM paused.
     pub fn next_not_base(&self, from: usize, end: usize) -> usize {
         self.next_not(BASE, from, end)
     }
 
-    /// The first page in `[from, end)` not in `state`, or `end`; eight at a
-    /// time where it can.
+    /// The first page in `[from, end)` not in `state`, or `end`. States are
+    /// only ever read as the byte atomics they are written as.
     pub fn next_not(&self, state: u8, mut from: usize, end: usize) -> usize {
-        const W: usize = std::mem::size_of::<u64>();
         let end = end.min(self.states.len());
-        let base = self.states.as_ptr() as usize;
-        let pattern = u64::from_ne_bytes([state; W]);
         while from < end {
             if state == BASE && from % CHUNK == 0 && !self.touched(from) {
                 from += CHUNK;
                 continue;
-            }
-            if (base + from) % W == 0 && from + W <= end {
-                // SAFETY: in bounds and aligned; AtomicU8 has the layout of u8,
-                // and a relaxed 8-byte load of them is what x86 does anyway.
-                let word = unsafe { &*((base + from) as *const std::sync::atomic::AtomicU64) };
-                let w = word.load(Ordering::Relaxed) ^ pattern;
-                if w == 0 {
-                    from += W;
-                    continue;
-                }
-                return from + (w.to_le().trailing_zeros() / 8) as usize;
             }
             if self.states[from].load(Ordering::Relaxed) != state {
                 return from;
