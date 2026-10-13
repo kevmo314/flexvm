@@ -148,6 +148,8 @@ fn paths(args: &Args) -> Result<Paths> {
 
 fn real_main() -> Result<()> {
     let args = Args::parse();
+    // Exported for the VM processes this one may start.
+    let _ = paths(&args);
     let pos: Vec<&str> = args.positional.iter().map(|s| s.as_str()).collect();
     let name = pos.get(1).copied().unwrap_or("");
     let template = args.get("template").unwrap_or("default");

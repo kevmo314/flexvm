@@ -171,7 +171,12 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>) -> Result
     unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
     let paused = Paused::load(p.pool.take()?, tpl.clone())?;
     *p.standby.lock().unwrap() = Some(paused);
+    if p.stop_requested() {
+        drop(p.standby.lock().unwrap().take());
+        p.end(0);
+    }
     let sock = d.join(format!("{key}.{me}.sock"));
+    p.files.lock().unwrap().extend([sock.clone(), d.join(format!("{me}.lock"))]);
     let listener = UnixListener::bind(&sock)?;
     if let Some(mut f) = notify.take() {
         let _ = send_json(&mut f, &json!({"ok": true, "result": {"pid": me, "template": template}}));
@@ -188,7 +193,8 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>) -> Result
             // A newer generation of the template, or too many of us: go.
             let current = Template::resolve(&p.paths, template).ok().and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()));
             let pids = live(host, template);
-            let extra = pids.len() > target(host, template) && pids.last() == Some(&me);
+            // The newest go first.
+            let extra = pids.iter().position(|&p| p == me).is_some_and(|i| i >= target(host, template));
             let dead = p.standby.lock().unwrap().as_mut().is_none_or(|s| !s.alive());
             if current.as_deref() != Some(&key) || extra || dead {
                 gone(0);
@@ -209,6 +215,7 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>) -> Result
                 *p.claimer.lock().unwrap() = Some(c);
                 *p.cmd.lock().unwrap() = req["cmd"].as_str().map(String::from);
                 drop(lock);
+                p.files.lock().unwrap().clear();
                 let _ = std::fs::remove_file(d.join(format!("{me}.lock")));
                 // Off the claim's path: a replacement.
                 let (state, run, t) = (host.state.clone(), host.run.clone(), template.to_string());

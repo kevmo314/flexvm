@@ -62,6 +62,7 @@ impl Proc {
         let op = self.op()?;
         let start = Instant::now();
         vm.unpause()?;
+        self.paused_by_request.store(false, Ordering::SeqCst);
         let took = start.elapsed();
         self.publish();
         // A held restore at a new address: the guest gets it now.
@@ -326,6 +327,7 @@ impl Proc {
                 *vm.pending_net.lock().unwrap() = Some(m.ip);
             }
             self.set_vm(vm.clone());
+            self.paused_by_request.store(true, Ordering::SeqCst);
             self.publish();
             self.announce();
             return Ok(json!({"name": name, "ip": ip.to_string(), "pid": std::process::id(), "state": "paused", "restore_ms": ms(restore), "timings_ms": t.json()}));
@@ -350,6 +352,7 @@ impl Proc {
                     Err(r) => Restore::Uncertain(format!("marking the checkpoint started: {e}; removing the mark: {r}").into()),
                 });
             }
+            *self.consumed.lock().unwrap() = Some(dir.clone());
         }
         // From the resume request on, the vCPUs may have run.
         vm.unpause().map_err(|e| Restore::Ran(kill(e)))?;
@@ -378,16 +381,15 @@ impl Proc {
         t.mark("clock");
         self.announce();
         let state = vm.state().name();
-        let host = (self.host.state.clone(), name.to_string());
+        let p = self.arc();
         thread::spawn(move || {
             let pulled = vm.pager.wait_pulled();
             let took = vm.pager.pull_time().map(ms);
             eprintln!("vm {}: {to_load} MiB paged in from {} (complete: {pulled}, {took:?} ms)", vm.name, dir.display());
-            if owned {
-                if let Err(e) = delete_checkpoint(&dir) {
-                    eprintln!("vm {}: removing {}: {e}", vm.name, dir.display());
+            if let Some(p) = p {
+                if let Some(dir) = p.consumed.lock().unwrap().take() {
+                    delete_consumed(&p.host, &vm.name, &dir);
                 }
-                let _ = std::fs::remove_file(host.0.join("suspended").join(gen_file(&host.1)));
             }
         });
         Ok(json!({
@@ -827,9 +829,21 @@ pub fn discard(host: &Host, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// What `ls` shows of a suspended VM, from its manifest.
+/// Deletes the checkpoint a suspended VM was resumed from (marked STARTED).
+pub fn delete_consumed(host: &Host, name: &str, dir: &Path) {
+    if let Err(e) = delete_checkpoint(dir) {
+        eprintln!("vm {name}: removing {}: {e}", dir.display());
+    }
+    let _ = std::fs::remove_file(host.state.join("suspended").join(gen_file(name)));
+}
+
+/// What `ls` shows of a suspended VM, from its manifest. A consumed one
+/// (resumed, its process gone) is not shown.
 pub fn describe_suspended(host: &Host, name: &str) -> Option<Value> {
     let dir = host.suspended(name);
+    if dir.join(STARTED).exists() || dir.join(DISCARDED).exists() {
+        return None;
+    }
     let text = std::fs::read(dir.join("manifest.json")).ok()?;
     let body = text.splitn(2, |&b| b == b'\n').nth(1)?;
     let m: Manifest = serde_json::from_slice(body).ok()?;

@@ -322,6 +322,12 @@ impl Proc {
                 thread::sleep(delay);
                 delay = (delay * 2).min(Duration::from_secs(5));
             }
+            // The route retries do not outlive the process: one last try.
+            if let Some(via) = p.pending_route.lock().unwrap().take() {
+                if let Err(e) = p.switch_route(via) {
+                    eprintln!("route {} via {via}: {e}; giving up", p.vm().ip);
+                }
+            }
             let vm = p.vm();
             p.set_leaving(true);
             vm.kill();
@@ -373,13 +379,17 @@ impl Proc {
         let res = res.unwrap_or_else(|| self.switch_route(via));
         if let Err(e) = &res {
             eprintln!("route {ip} via {via}: {e}; retrying");
+            *self.pending_route.lock().unwrap() = Some(via);
             if let Some(p) = self.arc() {
                 thread::spawn(move || {
                     let mut delay = Duration::from_millis(100);
                     for _ in 0..10 {
                         thread::sleep(delay);
                         match p.switch_route(via) {
-                            Ok(()) => return eprintln!("route {ip} via {via}: done"),
+                            Ok(()) => {
+                                p.pending_route.lock().unwrap().take();
+                                return eprintln!("route {ip} via {via}: done");
+                            }
                             Err(e) => eprintln!("route {ip} via {via}: {e}"),
                         }
                         delay = (delay * 2).min(Duration::from_secs(5));
@@ -459,6 +469,7 @@ impl Proc {
             });
             let preloaded = move || preload.join().unwrap_or_else(|_| Err("preloading panicked".into()));
             let paused = hdr["paused"].as_bool().unwrap_or(false);
+            self.paused_by_request.store(paused, Ordering::SeqCst);
             let vm = self.take_in(prepared, runs, &state, paused, deadline, preloaded, &mut t)?;
             Ok((vm, t.json()))
         });
@@ -637,7 +648,7 @@ impl Proc {
                     bail!("the migration ran past its deadline");
                 }
                 self.host.commit_incoming(&l, ip, self.gen.load(Ordering::SeqCst))?;
-                self.host.mig_set(source.mig, "committed")?;
+                self.host.mig_set_locked(&l, source.mig, "committed")?;
                 Ok(())
             }),
         };

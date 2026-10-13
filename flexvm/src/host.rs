@@ -84,14 +84,14 @@ impl Host {
     /// The host whose durable state is in `state` and runtime state in `run`.
     pub fn open(state: &Path, run: &Path) -> Result<Host> {
         // Made if we can (root); a reader such as `ls` does without.
-        for d in [state.join("addrs"), state.join("standby")] {
+        for d in [state.join("addrs"), state.join("standby"), state.join("migs")] {
             if !d.is_dir() {
                 let _ = crate::util::create_dir_durably(&d);
             }
         }
         // Suspended VMs' memory: root's alone.
         let _ = crate::util::create_private_dir_durably(&state.join("suspended"));
-        for d in ["vms", "migs", "standby", "w"] {
+        for d in ["vms", "standby", "w"] {
             let _ = std::fs::create_dir_all(run.join(d));
         }
         let canon = |d: &Path| d.canonicalize().map_err(|e| format!("{}: {e} (run flexvm as root to create it)", d.display()));
@@ -353,33 +353,51 @@ impl Host {
         self.held(&a).then_some(a.holder).flatten()
     }
 
-    // Incoming migrations: `RUN/migs/ID`, each under its own flock.
+    // Incoming migrations: `STATE/migs/ID`, durable, changed under the host
+    // lock. A committed id is never forgotten (within `MIG_KEEP`), so no one
+    // asking later is ever told it aborted.
 
-    fn mig(&self, id: u64) -> Result<(File, PathBuf)> {
-        let path = self.run.join("migs").join(id.to_string());
-        let f = File::options().create(true).truncate(false).read(true).write(true).open(&path)?;
-        flock(&f, libc::LOCK_EX)?;
-        Ok((f, path))
+    fn mig_read(&self, id: u64) -> String {
+        std::fs::read_to_string(self.state.join("migs").join(id.to_string())).unwrap_or_default()
+    }
+
+    fn mig_write(&self, id: u64, text: &str) -> Result<()> {
+        write_file(&self.state.join("migs"), &id.to_string(), text.as_bytes(), true)
+            .map_err(|e| format!("cannot record migration {id}: {e}"))?;
+        Ok(())
     }
 
     /// Records migration `id` as pending here, for this process. An id is
-    /// taken in only once.
+    /// taken in only once. Prunes records older than `MIG_KEEP`.
     pub fn mig_begin(&self, id: u64) -> Result<()> {
-        let (f, path) = self.mig(id)?;
-        if f.metadata()?.len() > 0 {
+        let _l = self.lock()?;
+        if !self.mig_read(id).is_empty() {
             bail!("migration {id} was already seen here");
         }
-        write_at(&f, &path, &format!("pending {}", me()))
+        let dir = self.state.join("migs");
+        for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let old = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age > MIG_KEEP);
+            if old {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+        self.mig_write(id, &format!("pending {}", me()))
     }
 
     /// Moves migration `id` from pending to `to` (committed, released or
-    /// aborted), unless it was fenced off meanwhile.
+    /// aborted), unless it was fenced off meanwhile. Durable before it
+    /// returns: a committed VM is resumed only after this.
     pub fn mig_set(&self, id: u64, to: &str) -> Result<()> {
-        let (f, path) = self.mig(id)?;
-        let now = std::fs::read_to_string(&path)?;
+        let l = self.lock()?;
+        self.mig_set_locked(&l, id, to)
+    }
+
+    /// `mig_set`, for a caller holding the host lock.
+    pub fn mig_set_locked(&self, _: &Locked, id: u64, to: &str) -> Result<()> {
+        let now = self.mig_read(id);
         let state = now.split_whitespace().next().unwrap_or("");
         match (state, to) {
-            ("pending", _) | ("committed", "released") => write_at(&f, &path, &format!("{to} {}", me())),
+            ("pending", _) | ("committed", "released") => self.mig_write(id, &format!("{to} {}", me())),
             (s, t) if s == t => Ok(()),
             (s, _) => bail!("migration {id} is {s} here"),
         }
@@ -388,24 +406,30 @@ impl Host {
     /// How migration `id` went here, for its source: `pending`, `committed`,
     /// `released` (the VM has all its pages, or is gone) or `aborted`. One
     /// that is unknown, or pending with its process gone, is recorded as
-    /// aborted first, so it can never commit.
+    /// aborted first, so it can never commit. A VM process that is gone has
+    /// no Firecracker either (it dies with the process's main thread).
     pub fn mig_status(&self, id: u64) -> Result<String> {
-        let (f, path) = self.mig(id)?;
-        let now = std::fs::read_to_string(&path)?;
+        let _l = self.lock()?;
+        let now = self.mig_read(id);
         let mut w = now.split_whitespace();
-        let (state, pid, start) = (w.next().unwrap_or(""), w.next().unwrap_or(""), w.next().unwrap_or(""));
-        let live = || pid.parse().ok().and_then(starttime).is_some_and(|s| s.to_string() == start);
+        let state = w.next().unwrap_or("");
+        let owner: Vec<&str> = w.collect();
+        let live = owner.len() == 3 && owner.join(" ") == owner_of(owner[0]);
         let out = match state {
-            "pending" | "" if state.is_empty() || !live() => {
-                write_at(&f, &path, "aborted")?;
-                "aborted"
-            }
-            "committed" if !live() => "released",
+            "" => "aborted",
+            "pending" if !live => "aborted",
+            "committed" if !live => "released",
             s => s,
         };
+        if out == "aborted" && state != "aborted" {
+            self.mig_write(id, "aborted")?;
+        }
         Ok(out.into())
     }
 }
+
+/// How long a migration record is kept: far longer than any source waits.
+const MIG_KEEP: Duration = Duration::from_secs(7 * 24 * 3600);
 
 /// What a host knows about one of the addresses it has seen.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -470,6 +494,7 @@ pub struct Entry {
     /// running, paused, checkpointing, source, starting, arriving, failed
     pub state: String,
     pub firecracker: Option<u32>,
+    pub instance: u64,
     /// Needs more memory than this host can give it.
     pub starved: bool,
 }
@@ -560,17 +585,18 @@ pub fn write_file(dir: &Path, name: &str, data: &[u8], durable: bool) -> std::io
     Ok(())
 }
 
-fn write_at(f: &File, path: &Path, text: &str) -> Result<()> {
-    f.set_len(0)?;
-    std::fs::write(path, text)?;
-    Ok(())
+
+/// This process, as `<pid> <start time> <boot id>`: names one process even
+/// once the pid is reused, or the host rebooted.
+fn me() -> String {
+    owner_of(&std::process::id().to_string())
 }
 
-/// This process, as `<pid> <start time>`: a pid with its start time names
-/// one process even once the pid is reused.
-fn me() -> String {
-    let pid = std::process::id();
-    format!("{pid} {}", starttime(pid).unwrap_or(0))
+/// What `me` said in process `pid`, if it is still alive.
+fn owner_of(pid: &str) -> String {
+    let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap_or_default();
+    let start = pid.parse().ok().and_then(starttime).unwrap_or(0);
+    format!("{pid} {start} {}", boot.trim())
 }
 
 /// The start time (field 22 of /proc/PID/stat) of a live process.
@@ -704,11 +730,11 @@ mod tests {
         h.mig_set(2, "released").unwrap();
         assert_eq!(h.mig_status(2).unwrap(), "released");
         // Pending with its process gone: fenced off.
-        std::fs::write(h.run.join("migs/3"), "pending 999999999 1").unwrap();
+        std::fs::write(h.state.join("migs/3"), "pending 999999999 1 x").unwrap();
         assert_eq!(h.mig_status(3).unwrap(), "aborted");
         assert!(h.mig_set(3, "committed").is_err());
         // Committed by a process that is gone: its VM is gone too.
-        std::fs::write(h.run.join("migs/4"), "committed 999999999 1").unwrap();
+        std::fs::write(h.state.join("migs/4"), "committed 999999999 1 x").unwrap();
         assert_eq!(h.mig_status(4).unwrap(), "released");
     }
 }

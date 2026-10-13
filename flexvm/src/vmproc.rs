@@ -77,6 +77,20 @@ pub struct Proc {
     pub cmd: Mutex<Option<String>>,
     /// Signals that came before the VM was up, handled once it is.
     early: Mutex<Vec<i32>>,
+    /// Paused by SIGTSTP (or held by `restore --paused`): only then does
+    /// SIGCONT resume it. The kernel sends SIGCONT after any SIGSTOP, and
+    /// systemd right after SIGTERM.
+    pub paused_by_request: AtomicBool,
+    /// A resumed suspended VM's checkpoint, deleted once all its pages are
+    /// in, or when the process ends (it is marked STARTED: consumed).
+    pub consumed: Mutex<Option<PathBuf>>,
+    /// A route to a migration target that could not be set yet (retried
+    /// in the background, and once more before the process ends).
+    pub pending_route: Mutex<Option<Ipv4Addr>>,
+    /// This VM instance, in the registry: unlike a pid, never reused.
+    pub instance: u64,
+    /// Files this process owns, removed when it ends (a standby VM's socket and lock).
+    pub files: Mutex<Vec<PathBuf>>,
     me: std::sync::Weak<Proc>,
 }
 
@@ -109,6 +123,11 @@ impl Proc {
             claimer: Mutex::new(None),
             cmd: Mutex::new(None),
             early: Mutex::new(Vec::new()),
+            paused_by_request: AtomicBool::new(false),
+            consumed: Mutex::new(None),
+            pending_route: Mutex::new(None),
+            instance: crate::migrate::migration_id(),
+            files: Mutex::new(Vec::new()),
             me: me.clone(),
         }))
     }
@@ -171,6 +190,7 @@ impl Proc {
             max_mib: vm.template.meta.max_mib,
             state: vm.state().name().into(),
             firecracker: vm.pid(),
+            instance: self.instance,
             starved: vm.starved.load(Ordering::SeqCst),
         };
         if let Err(e) = n.publish(&e) {
@@ -184,7 +204,13 @@ impl Proc {
         if let Some(mig) = self.arrived.lock().unwrap().take() {
             let _ = self.host.mig_set(mig, "released");
         }
+        if let Some(dir) = self.consumed.lock().unwrap().take() {
+            crate::lifecycle::delete_consumed(&self.host, &self.name(), &dir);
+        }
         drop(self.name.lock().unwrap().take());
+        for f in self.files.lock().unwrap().drain(..) {
+            let _ = std::fs::remove_file(f);
+        }
         if let Some(c) = self.claimer.lock().unwrap().take() {
             let mut w = &c;
             let _ = send_json(&mut w, &json!({"exit": code}));
@@ -224,10 +250,13 @@ impl Proc {
         let vm = self.vm();
         let (ip, gen, name) = (vm.ip, self.gen.load(Ordering::SeqCst), vm.name.clone());
         if let Ok(l) = self.host.lock() {
+            // Only while it is ours: never another VM's route.
+            if self.host.holder(&l, ip).is_none_or(|h| h == name) {
+                crate::net::unroute(ip);
+            }
             let _ = self.host.release(&l, ip, &name);
             let _ = self.host.observe(&l, ip, gen, true);
         }
-        crate::net::unroute(ip);
         let req = json!({"op": "route", "ip": ip.to_string(), "gen": gen});
         let sends: Vec<_> = self.host.cfg.peers.iter().cloned().map(|p| {
             let req = req.clone();
@@ -417,8 +446,15 @@ impl Proc {
             return;
         };
         let res = match sig {
-            libc::SIGTSTP => self.op().and_then(|_op| vm.pause()).map(|()| self.publish()),
+            libc::SIGTSTP => self.op().and_then(|_op| vm.pause()).map(|()| {
+                self.paused_by_request.store(true, Ordering::SeqCst);
+                self.publish()
+            }),
+            libc::SIGCONT if self.leaving.load(Ordering::SeqCst) || !self.paused_by_request.load(Ordering::SeqCst) => Ok(()),
             libc::SIGCONT => self.resume().map(drop),
+            // A migration source goes once its target has the memory; a
+            // target still pulling is suspended once it has it all (`save`).
+            libc::SIGTERM if matches!(vm.state(), State::Source(_)) => Ok(eprintln!("vm {}: migrating away; it ends once the target has its memory", vm.name)),
             libc::SIGTERM => match self.suspend() {
                 Ok(v) => {
                     eprintln!("{v}");
@@ -707,6 +743,11 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
 
 impl Proc {
     /// Becomes the process of `vm`, already running (a claimed standby VM).
+    /// Whether SIGINT or SIGTERM came before the VM was up.
+    pub fn stop_requested(&self) -> bool {
+        self.early.lock().unwrap().iter().any(|&s| s == libc::SIGINT || s == libc::SIGTERM)
+    }
+
     pub fn arc(&self) -> Option<Arc<Proc>> {
         self.me.upgrade()
     }
