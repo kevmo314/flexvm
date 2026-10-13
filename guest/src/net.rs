@@ -125,10 +125,11 @@ fn pin_gateway(s: &Sock) -> io::Result<()> {
 ///
 /// This runs on every start, right after restore, when each guest page the
 /// kernel touches for the first time costs a nested page fault. So it is one
-/// RTM_NEWADDR when the IP is unchanged, or a delete followed by an add when
-/// it changes, on a socket opened at template boot. Adding an address
-/// leaves the gateway route and ARP entry alone, where SIOCSIFADDR plus
-/// SIOCSIFNETMASK flush them and need them put back.
+/// RTM_NEWADDR on a socket opened at template boot, plus an RTM_DELADDR of
+/// the previous address when a restore (a fork) brings a new one. Adding an
+/// address leaves the gateway route and ARP entry alone, where SIOCSIFADDR
+/// plus SIOCSIFNETMASK flush them and need them put back. The add goes first:
+/// deleting eth0's last address would flush them too.
 pub fn configure(ip: Ipv4Addr, dns: Option<&str>) -> io::Result<()> {
     // Keep the managed address in snapshot state, under the socket's ACK lock.
     static ADDRESS: Mutex<Option<Ipv4Addr>> = Mutex::new(None);
@@ -146,13 +147,11 @@ fn update_address(
     ip: Ipv4Addr,
     mut request: impl FnMut(u16, Ipv4Addr) -> io::Result<()>,
 ) -> io::Result<()> {
-    if let Some(old) = address.filter(|old| *old != ip) {
-        request(libc::RTM_DELADDR, old)?;
-        *address = None;
-    }
     request(libc::RTM_NEWADDR, ip)?;
-    *address = Some(ip);
-    Ok(())
+    match address.replace(ip).filter(|old| *old != ip).map(|old| request(libc::RTM_DELADDR, old)) {
+        Some(Err(e)) if e.raw_os_error() != Some(libc::EADDRNOTAVAIL) => Err(e),
+        _ => Ok(()),
+    }
 }
 
 fn address_request(fd: libc::c_int, ifindex: u32, kind: u16, ip: Ipv4Addr) -> io::Result<()> {
@@ -225,33 +224,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn managed_address_changes_delete_only_the_previous_ip() {
+    fn a_new_address_is_added_before_the_previous_one_is_deleted() {
         let old = Ipv4Addr::new(10, 0, 0, 1);
         let new = Ipv4Addr::new(10, 0, 0, 2);
         let mut address = None;
         for (ip, expected) in [
             (old, vec![(libc::RTM_NEWADDR, old)]),
             (old, vec![(libc::RTM_NEWADDR, old)]),
-            (new, vec![(libc::RTM_DELADDR, old), (libc::RTM_NEWADDR, new)]),
+            (new, vec![(libc::RTM_NEWADDR, new), (libc::RTM_DELADDR, old)]),
         ] {
             let mut sent = Vec::new();
             update_address(&mut address, ip, |kind, ip| { sent.push((kind, ip)); Ok(()) }).unwrap();
             assert_eq!(sent, expected);
             assert_eq!(address, Some(ip));
         }
-    }
-
-    #[test]
-    fn managed_address_tracks_successful_requests_on_failure() {
-        let old = Ipv4Addr::new(10, 0, 0, 1);
-        let new = Ipv4Addr::new(10, 0, 0, 2);
-        let mut address = Some(old);
-        assert!(update_address(&mut address, new, |_, _| Err(io::Error::other("delete failed"))).is_err());
+        // A failed add keeps the old address; one already gone is not an error.
+        assert!(update_address(&mut address, old, |_, _| Err(io::Error::other("add failed"))).is_err());
+        assert_eq!(address, Some(new));
+        let gone = |kind, _| if kind == libc::RTM_DELADDR { Err(io::Error::from_raw_os_error(libc::EADDRNOTAVAIL)) } else { Ok(()) };
+        update_address(&mut address, old, gone).unwrap();
         assert_eq!(address, Some(old));
-        assert!(update_address(&mut address, new, |kind, _| {
-            if kind == libc::RTM_DELADDR { Ok(()) } else { Err(io::Error::other("add failed")) }
-        }).is_err());
-        assert_eq!(address, None);
     }
 
     fn ack(seq: u32, code: i32) -> Vec<u8> {
