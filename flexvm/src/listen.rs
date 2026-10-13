@@ -152,18 +152,23 @@ fn incoming(host: &Host, req: &Value, line: &[u8], conn: TcpStream) -> Result<()
 }
 
 /// Hands a page connection to the VM process it is for.
-fn pages(host: &Host, req: &Value, mut conn: TcpStream) -> Result<()> {
+fn pages(host: &Host, req: &Value, conn: TcpStream) -> Result<()> {
     let name = req["name"].as_str().unwrap_or("");
     let fwd = json!({"op": "pages", "mig": req["mig"]});
-    match crate::vmproc::connect(host, name, &fwd, &[conn.as_raw_fd()]) {
-        Ok(_) => Ok(()),
-        Err(e) => {
-            // The page client reads a status byte for each request.
-            use std::io::Write;
-            let _ = conn.write_all(&[1]);
-            Err(e)
-        }
+    if let Err(e) = crate::vmproc::connect(host, name, &fwd, &[conn.as_raw_fd()]) {
+        refuse_pages(conn, &format!("vm {name} is not the source of migration {}: {e}", req["mig"]));
     }
+    Ok(())
+}
+
+/// Refuses a page connection with one JSON line, which its pager reports.
+pub fn refuse_pages(mut conn: TcpStream, why: &str) {
+    let _ = send_json(&mut conn, &json!({"ok": false, "error": why}));
+    // Take what the client sent meanwhile (its first request), so closing
+    // does not reset the connection before it reads why.
+    let _ = conn.shutdown(std::net::Shutdown::Write);
+    let _ = conn.set_read_timeout(Some(std::time::Duration::from_secs(1)));
+    let _ = std::io::copy(&mut (&mut conn).take(1 << 20), &mut std::io::sink());
 }
 
 fn migration(host: &Host, req: &Value) -> Result<Value> {

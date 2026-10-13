@@ -558,21 +558,28 @@ impl Proc {
         let _ = send_json(&mut &c, &reply);
     }
 
-    /// A page connection the peer listener passed on: served if this VM is
-    /// the source of that migration.
+    /// A page connection the peer listener passed on: answered with one
+    /// JSON line, then served (`serve_pages`) while this VM is the source of
+    /// that migration.
     fn pages(&self, req: &Value, fds: Vec<OwnedFd>) {
         let Some(fd) = fds.into_iter().next() else { return };
-        let mut s = std::net::TcpStream::from(fd);
+        let s = std::net::TcpStream::from(fd);
         let vm = self.vm();
-        if req["mig"].as_u64().map(State::Source) != Some(vm.state()) || fault("pages") {
-            // The page client reads a status byte: refuse rather than hang up silently.
-            let _ = s.write_all(&[1]);
-            return;
+        let source = req["mig"].as_u64().map(State::Source);
+        if source != Some(vm.state()) {
+            return crate::listen::refuse_pages(s, &format!("vm {} is not the source of migration {}", vm.name, req["mig"]));
+        }
+        if fault("pages") {
+            return crate::listen::refuse_pages(s, "injected fault: page server down");
         }
         let _ = s.set_nodelay(true);
-        let r = s.try_clone().map(BufReader::new);
-        if let Ok(r) = r {
-            let _ = crate::uffd::serve_pages(&vm.pager, ReadWrite(r, s), || fault("pages"));
+        let served = (|| -> Result<()> {
+            send_json(&mut &s, &json!({"ok": true}))?;
+            let r = BufReader::new(s.try_clone()?);
+            Ok(crate::uffd::serve_pages(&vm.pager, &s, ReadWrite(r, s.try_clone()?), || fault("pages") || Some(vm.state()) != source)?)
+        })();
+        if let Err(e) = served {
+            eprintln!("vm {}: page server: {e}", vm.name);
         }
     }
 

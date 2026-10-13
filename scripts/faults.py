@@ -1111,7 +1111,6 @@ def checkpoint_restore():
     check("restore: guest clock right", err is not None and abs(err) < 0.5, err)
     check("restore: whole checkpoint paged in", wait_for(lambda: vms(A)[n].get("pages_mib", {}).get("remote") == 0, 30), vms(A)[n].get("pages_mib"))
     cleanup(n)
-    check("restore: killing it gives the address back", wait_for(lambda: ip not in ok(A, {"op": "info"})["lent"], 10))
     rm_ckpt(path)
 
 

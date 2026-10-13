@@ -247,24 +247,6 @@ impl Proc {
         };
         let ip = self.set_addr(claim);
         t.mark("claim_ip");
-        let give_back = |e: Error| {
-            let gen = self.addrs.lock().unwrap().used.remove(&ip);
-            // A borrowed address goes back to its home host.
-            if !self.cfg.vm_ips.contains(ip) {
-                self.withdraw_from_peers(ip, gen);
-            }
-            e
-        };
-        // Its address's generation must still be current when the VM runs
-        // (a borrowed one may have been withdrawn or given out again since
-        // the claim): checked under the address's lock, held through the
-        // restore and its resume, so no route message changes it meanwhile.
-        let route = self.addr_lock(ip).lock().unwrap();
-        let gen = self.addrs.lock().unwrap().used.get(&ip).copied();
-        if gen.is_some_and(|g| !self.gens.lock().unwrap().current(ip, g)) {
-            drop(route);
-            return Err(give_back(format!("{ip}'s generation was withdrawn or superseded since it was claimed; restore with --ip auto").into()));
-        }
         // A user's checkpoint is immutable and may be restored again whether
         // or not this VM got to run.
         self.restore_checkpoint(&name, ck, ip, false, paused, &mut t).map_err(Restore::error)
