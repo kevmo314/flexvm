@@ -90,21 +90,6 @@ pub fn delete_tap(name: &str) {
     let _ = ip_batch(&[format!("link del dev {name}")]);
 }
 
-/// Deletes taps left behind by an earlier run with the same prefix.
-pub fn delete_taps_with_prefix(prefix: &str) {
-    let cmds: Vec<String> = std::fs::read_dir("/sys/class/net")
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|e| e.file_name().into_string().ok())
-        .filter(|n| n.starts_with(prefix))
-        .map(|n| format!("link del dev {n}"))
-        .collect();
-    if !cmds.is_empty() {
-        let _ = ip_batch(&cmds);
-    }
-}
-
 /// Routes `ip` to the VM behind `tap`, with a permanent neighbor entry so the
 /// first packet does not wait on ARP. Called as a tap is handed to a VM, so it
 /// first puts the gateway MAC back on the tap: udev (`MACAddressPolicy=persistent`)

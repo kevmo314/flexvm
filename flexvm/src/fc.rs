@@ -53,16 +53,20 @@ impl Firecracker {
     /// waits up to `ready` for its API socket.
     pub fn spawn(bin: &Path, dir: &Path, sockets: Sockets, ready: Duration) -> Result<Self> {
         crate::socket::check(&sockets.api)?;
+        use std::os::unix::process::CommandExt;
         let log = File::create(dir.join("firecracker.log"))?;
-        let child = Command::new(bin)
-            .arg("--api-sock")
-            .arg(&sockets.api)
-            .arg("--level")
-            .arg("Warn")
-            .stdin(Stdio::null())
-            .stdout(log.try_clone()?)
-            .stderr(log)
-            .spawn()?;
+        let mut cmd = Command::new(bin);
+        cmd.arg("--api-sock").arg(&sockets.api).arg("--level").arg("Warn").stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log);
+        // Firecracker never outlives its VM process (whose pager serves its
+        // memory). The signal comes when the spawning thread exits, so VM
+        // processes spawn from their main thread, which lives as long as they do.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                Ok(())
+            });
+        }
+        let child = cmd.spawn()?;
         let fc = Firecracker { child, sockets, api: Api::default() };
         retry(ready, || Ok(UnixStream::connect(&fc.sockets.api)?))?;
         Ok(fc)

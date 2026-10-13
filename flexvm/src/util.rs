@@ -319,3 +319,103 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 }
+
+/// Sends `line` (one JSON request line) on `s` with `fds` attached.
+pub fn send_with_fds(s: &UnixStream, line: &[u8], fds: &[RawFd]) -> io::Result<()> {
+    let mut iov = libc::iovec { iov_base: line.as_ptr() as *mut libc::c_void, iov_len: line.len() };
+    let space = unsafe { libc::CMSG_SPACE(std::mem::size_of_val(fds) as u32) } as usize;
+    let mut cbuf = vec![0u8; space];
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    if !fds.is_empty() {
+        msg.msg_control = cbuf.as_mut_ptr().cast();
+        msg.msg_controllen = space as _;
+        unsafe {
+            let c = libc::CMSG_FIRSTHDR(&msg);
+            (*c).cmsg_level = libc::SOL_SOCKET;
+            (*c).cmsg_type = libc::SCM_RIGHTS;
+            (*c).cmsg_len = libc::CMSG_LEN(std::mem::size_of_val(fds) as u32) as _;
+            std::ptr::copy_nonoverlapping(fds.as_ptr(), libc::CMSG_DATA(c) as *mut RawFd, fds.len());
+        }
+    }
+    let n = loop {
+        let n = unsafe { libc::sendmsg(s.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) };
+        if n >= 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            break n;
+        }
+    };
+    if n < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if (n as usize) < line.len() {
+        (&*s).write_all(&line[n as usize..])?;
+    }
+    Ok(())
+}
+
+/// Reads one request line from `s`, and the fds that came with it. The
+/// peer sends nothing after the line until it has an answer.
+pub fn recv_with_fds(s: &UnixStream, max: usize) -> io::Result<(Vec<u8>, Vec<OwnedFd>)> {
+    let mut line = Vec::new();
+    let mut fds = Vec::new();
+    let mut buf = [0u8; 4096];
+    while !line.ends_with(b"\n") {
+        if line.len() > max {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "request line too long"));
+        }
+        let mut iov = libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() };
+        let mut cbuf = [0u8; 256];
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cbuf.as_mut_ptr().cast();
+        msg.msg_controllen = cbuf.len() as _;
+        let n = unsafe { libc::recvmsg(s.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
+        unsafe {
+            let mut c = libc::CMSG_FIRSTHDR(&msg);
+            while !c.is_null() {
+                if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_RIGHTS {
+                    let n = ((*c).cmsg_len as usize - libc::CMSG_LEN(0) as usize) / std::mem::size_of::<RawFd>();
+                    let data = libc::CMSG_DATA(c) as *const RawFd;
+                    for i in 0..n {
+                        fds.push(OwnedFd::from_raw_fd(std::ptr::read_unaligned(data.add(i))));
+                    }
+                }
+                c = libc::CMSG_NXTHDR(&msg, c);
+            }
+        }
+        if n == 0 {
+            break;
+        }
+        line.extend_from_slice(&buf[..n as usize]);
+    }
+    Ok((line, fds))
+}
+
+/// Blocks `sigs` in this thread and every thread it starts afterwards, so
+/// only `wait_signal` sees them.
+pub fn block_signals(sigs: &[i32]) -> libc::sigset_t {
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        for &s in sigs {
+            libc::sigaddset(&mut set, s);
+        }
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+        set
+    }
+}
+
+pub fn wait_signal(set: &libc::sigset_t) -> i32 {
+    let mut sig = 0;
+    while unsafe { libc::sigwait(set, &mut sig) } != 0 {}
+    sig
+}

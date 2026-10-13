@@ -127,25 +127,20 @@ pub fn request_on(mut s: UnixStream, line: &str, timeout: Duration) -> Result<Bu
     Ok(r)
 }
 
-/// Test faults for the requests `answered` retries (see `Daemon::inject`).
+/// Test faults for the requests `answered` retries (`flexvm debug fault`).
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Fault {
+enum Fault {
     /// `guest_drop`: the connection is cut before the request reaches the guest.
     Refuse,
     /// `guest_lose_reply`: the guest carries the request out, but its reply is lost.
     LoseReply,
 }
 
-/// The armed test fault: which, and for how long from the first request
-/// it hits (the start, once known).
-pub static FAULT: Mutex<Option<(Fault, Duration, Option<Instant>)>> = Mutex::new(None);
-
 fn fault(which: Fault) -> bool {
-    let mut armed = FAULT.lock().unwrap();
-    match armed.as_mut() {
-        Some((f, span, start)) if *f == which => start.get_or_insert_with(Instant::now).elapsed() < *span,
-        _ => false,
-    }
+    crate::host::fault(match which {
+        Fault::Refuse => "guest_drop",
+        Fault::LoseReply => "guest_lose_reply",
+    })
 }
 
 /// Starts a shell command in the guest; frames follow on the returned

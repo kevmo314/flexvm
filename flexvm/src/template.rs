@@ -290,8 +290,6 @@ pub struct Template {
     verified: Mutex<BTreeMap<String, Stamp>>,
     /// The directory as opened, through `_handle`, whatever its path refers to now.
     fixed: PathBuf,
-    /// The directory's inode: a different one at `dir` is another template.
-    pub ino: u64,
     _handle: File,
 }
 
@@ -336,7 +334,6 @@ impl Template {
         // before generations is replaced by renaming another directory over
         // its path, and this one must keep reading the files it started with.
         let handle = File::open(&dir).map_err(|e| format!("template {name:?}: {e}"))?;
-        let ino = handle.metadata()?.ino();
         let fixed = PathBuf::from(format!("/proc/{}/fd/{}", std::process::id(), handle.as_raw_fd()));
         let meta: Meta = serde_json::from_slice(
             &std::fs::read(fixed.join("meta.json")).map_err(|e| format!("template {name:?}: {e}"))?,
@@ -366,7 +363,6 @@ impl Template {
             data,
             verified: Mutex::default(),
             fixed,
-            ino,
             _handle: handle,
         }))
     }
@@ -412,14 +408,6 @@ impl Template {
         Ok(())
     }
 
-    /// Identifies this generation: its content id (or directory, for old templates).
-    pub fn key(&self) -> String {
-        if self.meta.id.is_empty() {
-            self.dir.display().to_string()
-        } else {
-            self.meta.id.clone()
-        }
-    }
 
     pub fn vmstate(&self) -> PathBuf {
         self.fixed.join("vmstate")

@@ -83,13 +83,19 @@ static RUN_DIR: OnceLock<PathBuf> = OnceLock::new();
 impl Host {
     /// The host whose durable state is in `state` and runtime state in `run`.
     pub fn open(state: &Path, run: &Path) -> Result<Host> {
-        for d in [state.join("addrs"), state.join("suspended"), state.join("standby")] {
-            crate::util::create_dir_durably(&d)?;
+        // Made if we can (root); a reader such as `ls` does without.
+        for d in [state.join("addrs"), state.join("standby")] {
+            if !d.is_dir() {
+                let _ = crate::util::create_dir_durably(&d);
+            }
         }
+        // Suspended VMs' memory: root's alone.
+        let _ = crate::util::create_private_dir_durably(&state.join("suspended"));
         for d in ["vms", "migs", "standby", "w"] {
-            std::fs::create_dir_all(run.join(d)).map_err(|e| format!("{}: {e}", run.join(d).display()))?;
+            let _ = std::fs::create_dir_all(run.join(d));
         }
-        let (state, run) = (state.canonicalize()?, run.canonicalize()?);
+        let canon = |d: &Path| d.canonicalize().map_err(|e| format!("{}: {e} (run flexvm as root to create it)", d.display()));
+        let (state, run) = (canon(state)?, canon(run)?);
         let cfg = match std::fs::read(state.join("host.json")) {
             Ok(b) => serde_json::from_slice(&b).map_err(|e| format!("{}/host.json: {e}", state.display()))?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Config::default(),
@@ -252,6 +258,9 @@ impl Host {
     /// it is lent out with a newer one.
     pub fn claim_incoming(&self, l: &Locked, holder: &str, ip: Ipv4Addr, gen: u64) -> Result<()> {
         let mut a = self.addr(l, ip);
+        if gen == 0 {
+            bail!("{ip}: an arrival must carry its address's generation");
+        }
         if self.held(&a) && a.holder.as_deref() != Some(holder) {
             bail!("{ip} is in use here");
         }
@@ -420,7 +429,7 @@ impl Addr {
 }
 
 /// The host lock, held until dropped.
-pub struct Locked(File);
+pub struct Locked(#[allow(dead_code)] File);
 
 /// A VM process's claim on its name. Dropping it removes the registry entry.
 pub struct NameLock {
@@ -461,6 +470,43 @@ pub struct Entry {
     /// running, paused, checkpointing, source, starting, arriving, failed
     pub state: String,
     pub firecracker: Option<u32>,
+    /// Needs more memory than this host can give it.
+    pub starved: bool,
+}
+
+/// Removes what VM processes that died left behind: taps, cgroups and work
+/// directories named after their pids. Only names this host's `prefix`
+/// makes, and only of processes that are gone.
+pub fn collect_garbage(run: &Path, prefix: &str) {
+    let gone = |pid: &str| u32::from_str_radix(pid, 16).ok().is_some_and(|p| starttime(p).is_none());
+    let mut taps = Vec::new();
+    for e in std::fs::read_dir("/sys/class/net").into_iter().flatten().flatten() {
+        let n = e.file_name().to_string_lossy().into_owned();
+        let Some(rest) = n.strip_prefix(prefix) else { continue };
+        if let Some(pid) = rest.split_once('t').map(|(p, _)| p).filter(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_hexdigit())) {
+            if gone(pid) {
+                taps.push(format!("link del dev {n}"));
+            }
+        }
+    }
+    if !taps.is_empty() {
+        let _ = crate::net::ip_batch(&taps);
+    }
+    for e in std::fs::read_dir("/sys/fs/cgroup/flexvm").into_iter().flatten().flatten() {
+        let n = e.file_name().to_string_lossy().into_owned();
+        let pid = n.strip_prefix("idle-").and_then(|r| r.split('-').next()).and_then(|p| p.parse::<u32>().ok());
+        if pid.is_some_and(|p| starttime(p).is_none()) {
+            let _ = std::fs::write(e.path().join("cgroup.kill"), "1");
+            let _ = std::fs::remove_dir(e.path());
+        }
+    }
+    for e in std::fs::read_dir(run.join("w")).into_iter().flatten().flatten() {
+        let pid = e.file_name().to_string_lossy().parse::<u32>().ok();
+        if pid.is_some_and(|p| starttime(p).is_none()) {
+            crate::socket::remove(&e.path());
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
 }
 
 pub fn check_name(name: &str) -> Result<()> {

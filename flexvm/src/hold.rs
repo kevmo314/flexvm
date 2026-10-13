@@ -3,14 +3,14 @@
 //! peers would wait out a retransmit timeout: 200 ms, or 400+ ms when the
 //! retransmit is lost too).
 //!
-//! Source: each daemon owns one TUN device, `fv<port>h`. Just before pausing
+//! Source: each VM process owns one TUN device, `<prefix><pid>h`. Just before pausing
 //! a VM, `hold` points the VM's /32 at it (one rtnetlink message; that route
 //! is all this module adds to the host's routing). A thread reads the device
 //! and queues each packet on its address's entry, up to `CAP` bytes, and
 //! does nothing else. Once the target has the VM running, `release` hands
 //! the queue, then whatever still reaches the device, to a sink, switches
 //! the route to the target, and hands over what arrived meanwhile. The
-//! daemon's sink streams them to the target daemon over TCP (`send`).
+//! source VM process's sink streams them to the target over the migration connection (`send`).
 //!
 //! Target: `receive` reads that stream and injects each packet into the
 //! guest by sending it as an Ethernet frame out of the VM's tap from an
@@ -112,11 +112,11 @@ impl Stats {
 }
 
 impl Holder {
-    /// Creates TUN device `fv<port>h`, owned by this daemon alone: if another
-    /// process has it, this fails (the caller stops). None, with a warning,
-    /// if the host has no TUN support: then nothing is held.
-    pub fn new(port: u16) -> Result<Option<Arc<Holder>>> {
-        let dev = format!("fv{port}h");
+    /// Creates TUN device `dev`, owned by this process alone (it goes when
+    /// the process does). None, with a warning, if the host has no TUN
+    /// support: then nothing is held.
+    pub fn new(dev: &str) -> Result<Option<Arc<Holder>>> {
+        let dev = dev.to_string();
         let tun = match open_tun(&dev) {
             Ok(tun) => tun,
             Err(Tun::Busy(e)) => return Err(e),
@@ -145,13 +145,6 @@ impl Holder {
             return Err(e);
         }
         Ok(())
-    }
-
-    /// Whether packets for `ip` are held here, including while they are
-    /// released, until `release` has switched the route: no one else may
-    /// move it meanwhile.
-    pub fn holding(&self, ip: Ipv4Addr) -> bool {
-        self.entry(ip).is_some()
     }
 
     /// Whether migration `mig` holds `ip` and has not released it.
@@ -749,7 +742,7 @@ fn open_tun(dev: &str) -> std::result::Result<OwnedFd, Tun> {
         let e = std::io::Error::last_os_error();
         let msg = format!("{dev}: {e}");
         return Err(match e.raw_os_error() {
-            Some(libc::EBUSY | libc::EEXIST | libc::EPERM) => Tun::Busy(format!("{msg} (another daemon on this port?)").into()),
+            Some(libc::EBUSY | libc::EEXIST | libc::EPERM) => Tun::Busy(format!("{msg} (another process has it)").into()),
             _ => Tun::Unsupported(msg.into()),
         });
     }
