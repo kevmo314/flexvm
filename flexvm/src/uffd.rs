@@ -408,7 +408,13 @@ pub struct Pager {
     pidfd: OnceLock<OwnedFd>,
     remote: Mutex<Option<Link>>,
     /// The checkpoint page file REMOTE pages come from, when restoring one.
-    file: OnceLock<Arc<PageFile>>,
+    /// Let go once the last REMOTE page has settled (see `pulled`): readers
+    /// still holding a clone finish first, then its files (the chain's too)
+    /// close, so a deleted checkpoint's disk space comes back while the VM
+    /// runs on.
+    file: Mutex<Option<Arc<PageFile>>>,
+    /// The VM's REMOTE pages came from a checkpoint file (not a peer).
+    from_file: AtomicBool,
     discards: AtomicU64,
     remote_left: AtomicUsize,
     pull_started: OnceLock<Instant>,
@@ -485,7 +491,8 @@ impl Pager {
             pid: AtomicU32::new(0),
             pidfd: OnceLock::new(),
             remote: Mutex::new(None),
-            file: OnceLock::new(),
+            file: Mutex::new(None),
+            from_file: AtomicBool::new(false),
             discards: AtomicU64::new(0),
             remote_left: AtomicUsize::new(0),
             pull_started: OnceLock::new(),
@@ -644,13 +651,17 @@ impl Pager {
                     *self.remote.lock().unwrap() = Some(link);
                 }
                 Origin::File(file) => {
-                    let _ = self.file.set(file);
+                    self.from_file.store(true, Ordering::SeqCst);
+                    // Nothing to read from it (all BASE or ZERO): not kept.
+                    if remote > 0 {
+                        *self.file.lock().unwrap() = Some(file);
+                    }
                 }
             }
         }
         // A checkpoint restore prefetches the template's working set too: the
         // pages the checkpoint left BASE are still the template's.
-        let fresh = self.remote_left() == 0 || self.file.get().is_some();
+        let fresh = self.remote_left() == 0 || self.from_file.load(Ordering::SeqCst);
         let _ = self.mappings.set(mappings);
         let _ = self.pages.set(pages);
         let _ = self.uffd.set(fd);
@@ -769,9 +780,13 @@ impl Pager {
         Some(self.pull_finished.get()?.duration_since(*self.pull_started.get()?))
     }
 
-    /// Counts `n` remote pages as resolved.
+    /// Counts `n` remote pages as resolved. With the last one, lets go of
+    /// the checkpoint file: every claim on a REMOTE page has settled (a
+    /// claimed page counts until its claimant settles it), so nothing reads
+    /// it any more but those already reading, through clones of their own.
     fn pulled(&self, n: usize) {
         if n > 0 && self.remote_left.fetch_sub(n, Ordering::SeqCst) == n {
+            drop(self.file.lock().unwrap().take());
             let _ = self.pull_finished.set(Instant::now());
             self.notify();
         }
@@ -925,7 +940,7 @@ impl Pager {
 
     /// Whether pages are still to come from a migration source.
     pub fn pulling_from_peer(&self) -> bool {
-        self.remote_left() > 0 && self.file.get().is_none()
+        self.remote_left() > 0 && !self.from_file.load(Ordering::SeqCst)
     }
 
     pub fn remote_left(&self) -> usize {
@@ -1175,8 +1190,11 @@ impl Pager {
                     return Err(eagain());
                 }
                 let mut buf = vec![0u8; n * PAGE_SIZE];
-                let fetched = match self.file.get() {
+                // Claimed REMOTE pages keep the file (see `pulled`).
+                let file = self.file.lock().unwrap().clone();
+                let fetched = match file {
                     Some(file) => file.read(page, &mut buf, false),
+                    None if self.from_file.load(Ordering::SeqCst) => Err(io::Error::other("checkpoint file already released")),
                     None => match self.remote.lock().unwrap().as_mut() {
                         Some(link) => link.fetch((page * PAGE_SIZE) as u64, &mut buf, None),
                         None => Err(io::Error::other("no migration source")),
@@ -1645,7 +1663,7 @@ impl Pager {
     /// Pulls every REMOTE page in the background so the source can let go
     /// (or, restoring a checkpoint, so the VM no longer needs its file).
     fn spawn_pullers(self: Arc<Self>) {
-        let file = self.file.get().cloned();
+        let file = self.file.lock().unwrap().clone();
         let source = self.remote.lock().unwrap().as_ref().map(|l| l.source.clone());
         for t in 0..PULL_THREADS {
             let p = self.clone();
@@ -1659,6 +1677,8 @@ impl Pager {
                     let mut link = Link::new(source.clone());
                     Box::new(move |off, buf, stop| link.fetch(off, buf, Some(stop)))
                 }
+                // Released already: every page is in.
+                (None, None) if self.from_file.load(Ordering::SeqCst) => return,
                 (None, None) => return self.fail("remote pages but nowhere to pull them from".into()),
             };
             thread::spawn(move || {
@@ -1676,6 +1696,8 @@ impl Pager {
                 if let Some(file) = file.filter(|_| p.remote_left() == 0) {
                     file.drop_cache();
                 }
+                // `fetch` holds the file too: dropped as the thread ends,
+                // which it does as soon as nothing is left to pull.
             });
         }
     }
@@ -1689,7 +1711,7 @@ impl Pager {
             for m in self.mappings() {
                 let (from, to) = (m.offset as usize / PAGE_SIZE, (m.offset as usize + m.size) / PAGE_SIZE);
                 let (mut i, end) = (first.max(from), end.min(to));
-                while i < end && !self.stop.load(Ordering::SeqCst) {
+                while i < end && !self.stop.load(Ordering::SeqCst) && self.remote_left() > 0 {
                     i = self.pull_run(i, end, &mut buf, fetch)?;
                 }
             }
@@ -1703,7 +1725,7 @@ impl Pager {
             let first = m.offset as usize / PAGE_SIZE;
             let end = first + m.size / PAGE_SIZE;
             let mut chunk = first + stripe * PULL_RUN;
-            while chunk < end && !self.stop.load(Ordering::SeqCst) {
+            while chunk < end && !self.stop.load(Ordering::SeqCst) && self.remote_left() > 0 {
                 let chunk_end = (chunk + PULL_RUN).min(end);
                 let mut i = chunk;
                 while i < chunk_end {

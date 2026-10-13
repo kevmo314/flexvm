@@ -41,9 +41,11 @@
 //! (at most `MAX_CHAIN` deep), checks every link and flattens the maps, so
 //! pages are read from whichever checkpoint holds their latest version.
 //!
-//! Crash consistency: everything is written into a fresh `.NAME.partial-*`
-//! directory next to the destination, fsynced, and then renamed into place
-//! (never over an existing one) and the parent fsynced. A checkpoint directory
+//! Crash consistency: everything is written into the `ck` directory of a
+//! fresh, root-only `.flexvm-staging-<pid>-<n>` directory next to the
+//! destination (all pinned by fd), fsynced, and then renamed into place
+//! (never over an existing one) and the parent fsynced; a later checkpoint
+//! there clears staging a dead daemon left. A checkpoint directory
 //! therefore either holds a complete checkpoint or does not exist, and is
 //! never modified afterwards. Restores verify the manifest, `vmstate` and
 //! `pagemap` up front, and every page of `pages` as it is read.

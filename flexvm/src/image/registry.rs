@@ -217,7 +217,9 @@ impl Registry {
 
 /// Makes renames into `dir` durable.
 pub fn sync_dir(dir: &Path) -> Result<()> {
-    std::fs::File::open(dir)?.sync_all()?;
+    std::fs::File::open(dir)
+        .and_then(|d| d.sync_all())
+        .map_err(|e| format!("fsync of directory {}: {e}", dir.display()))?;
     Ok(())
 }
 

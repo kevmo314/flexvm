@@ -9,8 +9,8 @@ in tens of milliseconds.
 
 | Concern | Mechanism |
 |---|---|
-| CPU | vCPUs = host cores (FC max 32). Idle vCPUs halt and cost nothing; fairness via a per-VM cgroup (`cpu.weight`). |
-| Memory growth | 256 MiB base + a virtio-mem region up to host RAM. The daemon hot-plugs 128 MiB slots when the guest's available memory drops below 25% (min 256 MiB), and unplugs when it has lots spare. |
+| CPU | vCPUs = host cores (FC max 32). Idle vCPUs halt and cost nothing. Each VM's Firecracker runs in a cgroup of its own with the `cpu` controller on, all at the default `cpu.weight`, so busy VMs share contended CPU equally however many threads each runs. |
+| Memory growth | 256 MiB base + a virtio-mem region up to host RAM (in 1 GiB slots). The daemon hot-plugs memory in 128 MiB steps when the guest's available memory drops below 25% (min 256 MiB), and unplugs when it has lots spare. |
 | Memory return | virtio-balloon **free page reporting**: pages the guest frees go back to the host within seconds. |
 | Root filesystem | One read-only ext4 image on virtio-pmem with DAX, shared by every VM through the host page cache. Writes go to a tmpfs overlay inside the guest, so they migrate with memory. |
 | Start | Every VM is a **UFFD restore of a template snapshot** into a pre-spawned, pre-cgrouped Firecracker. The template's recorded working set is copied in bulk; everything else is faulted in lazily from a shared, sparse template image. A **hot pool** keeps VMs already restored and paused, so `run` is usually just a resume. |
@@ -129,7 +129,9 @@ VM that is busy, paused or suspended.
   A suspended VM's checkpoint stays in `suspended/`.
   - **Resume** first creates a `STARTED` marker in it and fsyncs it, before
     any vCPU runs. It then restores lazily like `restore`, and deletes the
-    checkpoint once every page is in.
+    checkpoint once every page is in. The pager closes the checkpoint's
+    files as soon as the last page has settled (readers still busy finish
+    first), so the deletion gives the disk space back while the VM runs on.
   - **Kill** creates a `DISCARDED` marker the same way before it answers.
   - **Daemon restart** deletes marked checkpoints and brings back the rest,
     so suspended VMs survive a restart, and a resumed or killed one never
@@ -137,6 +139,13 @@ VM that is busy, paused or suspended.
   - **Failed resume.** If it fails before the resume request reaches
     Firecracker, the VM stays suspended. If it fails after, the checkpoint
     is consumed: the VM is gone, as re-arming it would replay what it did.
+    If the `STARTED` marker cannot be made durable, it is removed again and
+    the directory fsynced before the VM goes back to suspended. If that
+    fails too, the marker may or may not survive a crash: the VM (which
+    never ran) is listed `quarantined`, with why. It cannot be resumed; a
+    `kill` discards it as usual, and a daemon restart goes by what the disk
+    holds (marker: deleted; none: suspended again). Test faults
+    `started_fsync` and `started_unmark` cover both.
 - **Device quiescing.** An API pause (`PATCH /vm Paused`) puts Firecracker's
   VMM thread into a loop that serves only API requests until the resume. It
   does not return to its event loop meanwhile, so device emulation stops
@@ -168,8 +177,9 @@ VM that is busy, paused or suspended.
   restores, while `clock_realtime` only moves kvmclock. A restore or a
   suspended VM's resume therefore steps the guest clock under the VM's
   reservation, within a 5 s deadline, with the agent's `CLOCK` (it sets the
-  host's time and reports how far off it was), repeated until a round trip
-  is under 5 ms; the residual error is a few ms. Agents without `CLOCK` get
+  host's time and reports how far off it was), up to three tries, stopping
+  at the first whose round trip is under 5 ms; the residual error is a few
+  ms. Agents without `CLOCK` get
   no step (logged once): an exec could run late, after a snapshot.
   Across a plain pause the TSC keeps counting, so the clock stays right
   (measured: 0 ms drift after 20 s). `resume` still checks it in the
@@ -387,7 +397,14 @@ confirming each is dead, before it answers anything, so "never seen this id" is 
 twice).
 
 `FLEXVM_FAULTS=1` lets a daemon accept `{"op": "fault", "fault": F, "ms": N}`
-(`pages`, `route`, `lost_ack`, `status`, `resume_kill`, `guest_drop`, `guest_lose_reply`, ...); `scripts/faults.py` uses it to check
+for any of the faults in `FAULTS` (`flexvm/src/daemon.rs`, described at
+`Daemon::inject`; anything else is refused): migration (`pages`, `route`,
+`lost_ack`, `status`, `prepare_fail`, `short_incoming`, `slow_preload`,
+`kill_prepared`), restores (`restore_no_hold`, `restore_before_run`,
+`restore_after_run`, `resume_kill`, `started_fsync`, `started_unmark`),
+checkpoints (`ckpt_memhash`, `ckpt_fail_protect`, `ckpt_no_hold`,
+`ckpt_abort`, `ckpt_slow`, `ckpt_fail_write`, `ckpt_copy_wait`) and guest
+requests (`guest_drop`, `guest_lose_reply`). `scripts/faults.py` uses it to check
 each failure path, and disarms every fault after each scenario so none leaks
 into the next (`ms: 0` disarms one).
 
@@ -457,7 +474,7 @@ and a second copy could repeat what it did.
   settles, so `START` at take finds it right and skips `clock_settime`, which
   can take tens of ms in a 24-vCPU guest. A migration target, after resuming,
   and a source that resumes after an aborted migration send `CLOCK` in the
-  background, repeated until a round trip is short, so the guest gets back
+  background (up to three tries, until a round trip is under 5 ms), so the guest gets back
   the downtime too: measured within ±2 ms. If a clock request fails it may
   still be on its way into the guest, so the next migration first waits for
   the agent to answer a ping (it serves requests in order) rather than let it
@@ -759,12 +776,14 @@ the guest can leave any cgroup); without cgroup2 their session is killed.
   (or image `User`), the app runs with `no_new_privs` and no capabilities in
   its bounding set, so setuid binaries and file capabilities in the image do
   not work for it (and cannot make it root again); flexvm-init is not
-  dumpable, so the app cannot ptrace or read it.
+  dumpable, so such an app cannot ptrace or read it. That does not stop an
+  app running as root with `CAP_SYS_PTRACE`, which can reach flexvm-init
+  anyway (root in the guest owns the guest).
 - **When the app starts.** By default at `run`: the snapshot is an idle booted
   guest and `run` sends `APP` after the address is set (`app_start`, ~17 ms
   for nginx), then the app starts as it would anywhere. With `--warm` the
   template starts the app, waits until it is ready (`--ready-port N`: something
-  accepts on 127.0.0.1:N in the guest, default the first exposed TCP port;
+  accepts on 127.0.0.1:N in the guest, default the lowest exposed TCP port;
   `--ready-cmd CMD`: a shell command exits 0, killed when the deadline passes; `--ready-timeout S`, default 120)
   and snapshots it running.
 
@@ -803,10 +822,12 @@ p50/p90/p99/max per phase, raw samples and host context.
 
 ```
 flexvm/src/
-  daemon.rs    RPC, migration, elastic memory controller, pressure policy
+  main.rs      command line
+  daemon.rs    RPC, migration, elastic memory controller, pressure policy, test faults
   lifecycle.rs pause/resume, checkpoint, restore, suspend; per-VM operation lock
   checkpoint.rs checkpoint format: crash-consistent writer, verified page-file reader, delta chains
   cow.rs       copy-on-write state of a running VM's checkpoint (write faults save pages first)
+  crc32c.rs    CRC32C of checkpoint pages (SSE4.2, three interleaved streams)
   uffd.rs      userfaultfd pager (template / zero / migration source / checkpoint file) + page server
   template.rs  cold boot, snapshot, sparse image, working-set recording
   vm.rs        restore into a pooled Firecracker, checkpoint, stats
@@ -814,13 +835,19 @@ flexvm/src/
   net.rs       taps, rtnetlink routes and neighbours, gratuitous ARP, address ranges
   hold.rs      holds a migrating VM's packets while it is paused, injects them where it resumes
   fc.rs        Firecracker process, API client, warm pool
+  socket.rs    short private directories for Firecracker API, vsock and UFFD sockets
   guest.rs     vsock client for flexvm-init
+  util.rs      errors, JSON framing, connects with deadlines, phase timers, pidfds, /proc helpers
+  bench.rs     `flexvm bench`: run and migration latency per phase
+  bench_lifecycle.rs `flexvm bench --lifecycle`: pause, checkpoint, restore, suspend
   image/       container images: references, registry client, archives and
                layouts, layer unpacking, root filesystem build
-guest/src/main.rs   flexvm-init: PID 1, overlay root, vsock exec agent
-guest/src/app.rs    image entrypoint: start, supervision, log ring, readiness probe
-guest/src/net.rs    guest network setup with ioctls and rtnetlink (no iproute2 needed)
-firecracker/        patches on top of Firecracker v1.17.0
+guest/src/main.rs     flexvm-init: PID 1, overlay root, vsock exec agent
+guest/src/session.rs  resumable exec sessions: output rings, attach, tombstones
+guest/src/app.rs      image entrypoint: start, supervision, log ring, readiness probe
+guest/src/net.rs      guest network setup with ioctls and rtnetlink (no iproute2 needed)
+firecracker/          patches on top of Firecracker v1.17.0
+scripts/              setup, builds, fault and network tests
 ```
 
 ## Limitations / next steps
