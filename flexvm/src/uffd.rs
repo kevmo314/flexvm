@@ -54,7 +54,8 @@ pub const REMOTE: u8 = 3;
 pub const INFLIGHT: u8 = 4;
 pub const DISCARDED: u8 = 5;
 
-/// Pages copied per fault from the template, to cut down on round trips.
+/// Pages copied per fault from the template, to cut down on round trips,
+/// once faults run sequentially (see `Pager::template_next`).
 const FAULT_AROUND: usize = 16;
 /// Pages claimed per prefetch copy; faults on them wait for it.
 const PREFETCH_RUN: usize = 256;
@@ -426,6 +427,11 @@ pub struct Pager {
     done: (Mutex<()>, Condvar),
     /// Set by the checkpoint barrier: no new prefetch.
     quiesce: AtomicBool,
+    /// The page after the last template fault. Only a fault there (a
+    /// sequential scan) copies `FAULT_AROUND` pages: strided reads, like the
+    /// guest walking the page structs of its free memory, would otherwise
+    /// pull in sixteen times what they touch.
+    template_next: AtomicUsize,
     failed: OnceLock<String>,
     stop: AtomicBool,
     /// The fault-serving thread, joined by `join`.
@@ -502,6 +508,7 @@ impl Pager {
             pull_finished: OnceLock::new(),
             done: (Mutex::new(()), Condvar::new()),
             quiesce: AtomicBool::new(false),
+            template_next: AtomicUsize::new(usize::MAX),
             failed: OnceLock::new(),
             stop: AtomicBool::new(false),
             thread: Mutex::new(None),
@@ -1229,9 +1236,14 @@ impl Pager {
                 // BASE or ZERO: serve a run of neighbours with the same source.
                 let from_template = state == BASE && self.base.has_data(page);
                 let same = |p: usize| state == ZERO || self.base.has_data(p) == from_template;
-                let n = pages.claim(page, FAULT_AROUND.min(region_left), state, same);
+                let sequential = !from_template || self.template_next.load(Ordering::Relaxed) == page;
+                let around = if sequential { FAULT_AROUND } else { 1 };
+                let n = pages.claim(page, around.min(region_left), state, same);
                 if n == 0 {
                     return Err(eagain());
+                }
+                if from_template {
+                    self.template_next.store(page + n, Ordering::Relaxed);
                 }
                 let src = |p: usize, c: usize| from_template.then(|| self.base.pages(p, c));
                 pages.install(page, n, state, None, |p, c| self.populate(p, c, src(p, c))).1
