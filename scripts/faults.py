@@ -6,11 +6,11 @@ or cleanly failed.
 
 usage: scripts/faults.py [--a ADDR] [--b ADDR] [--bin FLEXVM] [--log-dir DIR] SCENARIO... | all
   'all' runs the scenarios that leave both daemons running; source_killed,
-  target_restart, target_restart_symlink, checkpoint_crash and suspend_resume
-  kill a daemon with SIGKILL and restart it with the same command line and
+  target_restart, target_restart_symlink, checkpoint_crash, cow_crash and
+  suspend_resume kill a daemon with SIGKILL and restart it with the same command line and
   environment (logging to --log-dir). Checkpoint scenarios write to --ckpt-dir.
 """
-import argparse, json, os, socket, subprocess, sys, tempfile, threading, time
+import argparse, base64, json, os, socket, subprocess, sys, tempfile, threading, time
 
 p = argparse.ArgumentParser(usage=__doc__)
 p.add_argument("--a", default="127.0.0.1:7092")
@@ -964,6 +964,213 @@ def suspend_resume():
     cleanup(n)
 
 
+# --- copy-on-write and incremental checkpoints --------------------------------
+#
+# memwriter (scripts/memwriter.c) rewrites guest memory continuously, each
+# page stamped with its iteration and a random salt, and checks every page
+# against its own record before rewriting it; on SIGUSR1 each thread stops at
+# an iteration boundary and checks all its pages (see the source). A restored
+# copy that finds nothing wrong was saved exactly as it was at the pause. The
+# daemon's ckpt_memhash fault also hashes guest memory during the pause, which
+# must equal the hash of what the checkpoint restores (`ckhash`).
+
+_memwriter = None
+
+
+def memwriter_b64():
+    global _memwriter
+    if _memwriter is None:
+        src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "memwriter.c")
+        out = os.path.join(tempfile.mkdtemp(prefix="memwriter-"), "memwriter")
+        cc = "musl-gcc" if subprocess.run(["which", "musl-gcc"], capture_output=True).returncode == 0 else "gcc"
+        subprocess.run([cc, "-O2", "-static", "-mrdrnd", "-pthread", "-o", out, src], check=True)
+        _memwriter = base64.b64encode(open(out, "rb").read()).decode()
+    return _memwriter
+
+
+def start_writer(host, name, mib=64, threads=2):
+    code, out = sh(host, name, f"echo {memwriter_b64()} | base64 -d > /tmp/memwriter && chmod +x /tmp/memwriter && "
+                               f"setsid /tmp/memwriter {mib} {threads} /tmp/mw.status >/dev/null 2>&1 < /dev/null & sleep 1; pidof memwriter")
+    assert code == 0 and out.strip(), out
+
+
+def writer_check(host, name):
+    """Has the writer check all its memory at a quiesced instant; returns
+    (errors found continuously or in the check, iterations, status text)."""
+    code, out = sh(host, name, "p=$(pidof memwriter) || exit 1; s=$(head -1 /tmp/mw.status 2>/dev/null); kill -USR1 $p; "
+                               "for i in $(seq 1 600); do t=$(head -1 /tmp/mw.status 2>/dev/null); [ \"$t\" != \"$s\" ] && break; sleep 0.05; done; "
+                               "[ \"$t\" != \"$s\" ] && cat /tmp/mw.status")
+    rows = [l.split() for l in out.splitlines() if l.startswith("thread")]
+    if code != 0 or not rows:
+        return None, 0, out
+    errors = sum(int(r[r.index("cont_errors") + 1]) + int(r[r.index("full_errors") + 1]) for r in rows)
+    return errors, sum(int(r[r.index("k") + 1]) for r in rows), out
+
+
+def cow_exact():
+    """A keep-running checkpoint of a guest that rewrites its memory all the
+    time: the VM pauses only briefly and works during the copy, and the
+    checkpoint holds exactly its memory at the pause."""
+    n, path = "ft-cow", ckpt_path("ft-cow")
+    ok(A, {"op": "run", "name": n, "template": args.template})
+    start_writer(A, n, mib=64)
+    fault(A, "ckpt_memhash", 120000)
+    fault(A, "ckpt_slow", 120000)
+    res = {}
+    t = threading.Thread(target=lambda: res.update(r=rpc(A, {"op": "checkpoint", "name": n, "dir": path}, timeout=300)))
+    t.start()
+    copying = wait_for(lambda: vms(A).get(n, {}).get("checkpoint_copy"), 30)
+    check("cow: copy runs in the background", copying, vms(A).get(n))
+    if copying:
+        _, k0, _ = writer_check(A, n)
+        code, out = sh(A, n, "echo alive")
+        _, k1, _ = writer_check(A, n)
+        check("cow: the VM runs during the copy (exec, writer progress)", code == 0 and k1 > k0, (code, out, k0, k1))
+    t.join()
+    fault(A, "ckpt_slow", 0)
+    r = res.get("r", {})
+    check("cow: checkpoint written", r.get("ok"), r)
+    if not r.get("ok"):
+        return cleanup(n)
+    r = r["result"]
+    print(f"cow: paused {r['paused_ms']} ms (with the test hash: {r['timings_ms'].get('memhash')} ms), "
+          f"checkpoint {r['checkpoint_ms']} ms; copy {r['copy']}")
+    pause = r["paused_ms"] - r["timings_ms"].get("memhash", 0)
+    check("cow: paused only for the state save", pause < 200, r["timings_ms"])
+    check("cow: guest wrote during the copy (write faults saved pages first)", r["copy"]["rescues"] > 0, r["copy"])
+    h = ok(A, {"op": "ckhash", "dir": path})
+    check("cow: checkpoint == memory at the pause", h["hash"] == r["pause_memhash"], (h["hash"], r["pause_memhash"]))
+    errors, _, out = writer_check(A, n)
+    check("cow: the original is intact", errors == 0, out)
+    ok(B, {"op": "restore", "dir": path, "name": "ft-cow2", "ip": "auto"})
+    errors, _, out = writer_check(B, "ft-cow2")
+    check("cow: the restored copy has exactly the pause-time memory", errors == 0, out)
+    fault(A, "ckpt_memhash", 0)
+    cleanup(n)
+    cleanup("ft-cow2")
+    rm_ckpt(path)
+
+
+def cow_abort():
+    """A copy that fails half way (and one that a kill cuts short) publishes
+    nothing; the VM runs on unharmed, and the next checkpoint is complete."""
+    n, path = "ft-cow-abort", ckpt_path("ft-cow-abort")
+    ok(A, {"op": "run", "name": n, "template": args.template})
+    start_writer(A, n, mib=64)
+    ok(A, {"op": "checkpoint", "name": n, "dir": path + "-base"})
+    fault(A, "ckpt_abort", 60000)
+    r = rpc(A, {"op": "checkpoint", "name": n, "dir": path})
+    fault(A, "ckpt_abort", 0)
+    check("cow abort: checkpoint failed", not r["ok"] and "abort" in r["error"], r)
+    check("cow abort: nothing published", not os.path.exists(path))
+    check("cow abort: VM still running", where(n) == {A: "running"} and not vms(A)[n]["checkpoint_copy"], vms(A).get(n))
+    errors, _, out = writer_check(A, n)
+    check("cow abort: guest memory intact, writes flow", errors == 0, out)
+    r = rpc(A, {"op": "checkpoint", "name": n, "dir": path, "incremental": True})
+    check("cow abort: no delta against a base the failed copy consumed", not r["ok"] and "build on" in r["error"], r)
+    fault(A, "ckpt_memhash", 60000)
+    r = ok(A, {"op": "checkpoint", "name": n, "dir": path})
+    fault(A, "ckpt_memhash", 0)
+    check("cow abort: next checkpoint is exact", ok(A, {"op": "ckhash", "dir": path})["hash"] == r["pause_memhash"])
+    # A kill gives the copy up rather than waiting for it.
+    fault(A, "ckpt_slow", 60000)
+    res = {}
+    t = threading.Thread(target=lambda: res.update(r=rpc(A, {"op": "checkpoint", "name": n, "dir": path + "-killed"}, timeout=300)))
+    t.start()
+    wait_for(lambda: vms(A).get(n, {}).get("checkpoint_copy"), 30)
+    start = time.time()
+    k = rpc(A, {"op": "kill", "name": n})
+    took = time.time() - start
+    t.join()
+    fault(A, "ckpt_slow", 0)
+    check("cow abort: kill during the copy is quick", k["ok"] and took < 10, (k, took))
+    check("cow abort: killed copy published nothing", not res["r"]["ok"] and not os.path.exists(path + "-killed"), res)
+    for p in (path, path + "-base", path + "-killed"):
+        rm_ckpt(p)
+
+
+def cow_crash():
+    """The daemon dies while a running VM's checkpoint is being copied: no
+    checkpoint appears, and the next one to the same place succeeds."""
+    n, path = "ft-cow-crash", ckpt_path("ft-cow-crash")
+    ok(A, {"op": "run", "name": n, "template": args.template})
+    start_writer(A, n, mib=64)
+    fault(A, "ckpt_slow", 120000)
+    t = threading.Thread(target=lambda: rpc(A, {"op": "checkpoint", "name": n, "dir": path}, timeout=300))
+    t.start()
+    check("cow crash: caught the copy in the background", wait_for(lambda: vms(A).get(n, {}).get("checkpoint_copy"), 30))
+    time.sleep(0.5)
+    argv, env = kill_daemon(A)
+    t.join()
+    check("cow crash: no checkpoint published", not os.path.exists(path))
+    r = rpc(B, {"op": "restore", "dir": path})
+    check("cow crash: nothing to restore", not r["ok"], r)
+    partial = [os.path.join(args.ckpt_dir, f, "ck") for f in os.listdir(args.ckpt_dir) if f.startswith(".flexvm-staging-")]
+    for f in partial:
+        r = rpc(B, {"op": "restore", "dir": f})
+        check("cow crash: the partial directory does not restore", not r["ok"], r)
+    start_daemon(A, argv, env)
+    check("cow crash: the VM died with its daemon", n not in vms(A), vms(A).get(n))
+    ok(A, {"op": "run", "name": n, "template": args.template})
+    start_writer(A, n, mib=16)
+    ok(A, {"op": "checkpoint", "name": n, "dir": path})
+    left = [f for f in os.listdir(args.ckpt_dir) if f.startswith(".flexvm-staging-")]
+    check("cow crash: next checkpoint cleared the debris", not left, left)
+    ok(B, {"op": "restore", "dir": path, "name": n + "2", "ip": "auto"})
+    errors, _, out = writer_check(B, n + "2")
+    check("cow crash: next checkpoint restores intact", errors == 0, out)
+    cleanup(n)
+    cleanup(n + "2")
+    rm_ckpt(path)
+
+
+def ckpt_incremental():
+    """A full checkpoint and two deltas of a running VM: each delta stores
+    only what changed, each link of the chain restores exactly its pause-time
+    memory, and a chain with a missing or replaced parent is refused."""
+    n = "ft-inc"
+    paths = [ckpt_path(f"ft-inc{i}") for i in range(3)]
+    ok(A, {"op": "run", "name": n, "template": args.template})
+    r = rpc(A, {"op": "checkpoint", "name": n, "dir": paths[0], "incremental": True})
+    check("incremental: refused without a base", not r["ok"] and "build on" in r["error"], r)
+    code, out = sh(A, n, "dd if=/dev/urandom of=/tmp/f bs=1M count=200 2>/dev/null; md5sum /tmp/f")
+    m = out.split()[0]
+    start_writer(A, n, mib=4)
+    fault(A, "ckpt_memhash", 120000)
+    res = []
+    for i, p in enumerate(paths):
+        r = ok(A, {"op": "checkpoint", "name": n, "dir": p, "incremental": i > 0})
+        res.append(r)
+        print(f"incremental {i}: paused {r['paused_ms']} ms, {r['data_mib']} MiB data, dirty {r['dirty_mib']} MiB, parent {r['parent']}")
+        time.sleep(1)
+    fault(A, "ckpt_memhash", 0)
+    check("incremental: deltas store only what changed", all(r["data_mib"] < res[0]["data_mib"] / 4 for r in res[1:]),
+          [r["data_mib"] for r in res])
+    check("incremental: deltas name their parent", [r["parent"] for r in res] == [None, "../ft-inc0", "../ft-inc1"],
+          [r["parent"] for r in res])
+    for i, p in enumerate(paths):
+        h = ok(A, {"op": "ckhash", "dir": p})
+        check(f"incremental: link {i} == memory at its pause", h["hash"] == res[i]["pause_memhash"] and len(h["chain"]) == i, h)
+    for i, x in ((2, "ft-inc3"), (1, "ft-inc2")):
+        ok(B, {"op": "restore", "dir": paths[i], "name": x, "ip": "auto"})
+        errors, _, out = writer_check(B, x)
+        check(f"incremental: restore of link {i} intact", errors == 0 and md5(B, x).startswith(m), out)
+        cleanup(x)
+    # A replaced parent (same path, other contents) and a missing one.
+    os.rename(paths[1], paths[1] + ".moved")
+    r = rpc(B, {"op": "restore", "dir": paths[2], "name": "ft-inc4", "ip": "auto"})
+    check("incremental: missing parent refused", not r["ok"] and "parent" in r["error"], r)
+    subprocess.run(["sudo", "cp", "-a", paths[0], paths[1]], check=True)
+    r = rpc(B, {"op": "restore", "dir": paths[2], "name": "ft-inc4", "ip": "auto"})
+    check("incremental: replaced parent refused", not r["ok"] and "changed" in r["error"], r)
+    rm_ckpt(paths[1])
+    os.rename(paths[1] + ".moved", paths[1])
+    cleanup(n)
+    cleanup("ft-inc4")
+    for p in paths:
+        rm_ckpt(p)
+
+
 SCENARIOS = dict(basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, refused=refused, pages_blip=pages_blip,
                  pages_dead_restore=pages_dead_restore, pages_dead=pages_dead, quiet_source=quiet_source,
                  shared_run_dir=shared_run_dir, exec_race=exec_race, source_killed=source_killed,
@@ -972,9 +1179,11 @@ SCENARIOS = dict(basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, r
                  checkpoint_corrupt=checkpoint_corrupt, checkpoint_crash=checkpoint_crash, pause_resume=pause_resume,
                  suspend_resume=suspend_resume, checkpoint_hotplug=checkpoint_hotplug,
                  checkpoint_untrusted_dir=checkpoint_untrusted_dir, resume_failures=resume_failures,
-                 state_dir_lock=state_dir_lock, held_restore_frozen=held_restore_frozen)
+                 state_dir_lock=state_dir_lock, held_restore_frozen=held_restore_frozen,
+                 cow_exact=cow_exact, cow_abort=cow_abort, cow_crash=cow_crash, ckpt_incremental=ckpt_incremental)
 safe = [s for s in SCENARIOS
-        if s not in ("source_killed", "target_restart", "target_restart_symlink", "checkpoint_crash", "suspend_resume")]
+        if s not in ("source_killed", "target_restart", "target_restart_symlink", "checkpoint_crash", "cow_crash",
+                     "suspend_resume")]
 names = [n for s in args.scenarios for n in (safe if s == "all" else [s])]
 for s in names:
     SCENARIOS[s]()
