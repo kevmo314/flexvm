@@ -565,6 +565,29 @@ fn plug(fc: &Firecracker, mib: u64) -> Result<u64> {
     Ok(mib)
 }
 
+/// Waits until the guest's free page reporting has gone quiet, so the memory
+/// just plugged and freed here is reported in the template rather than in
+/// every VM after restore (where reporting 4 GiB walks the page structs of all
+/// of it: ~64 MiB more RSS per VM). Returns the MiB reported.
+fn wait_reporting_done(fc: &Firecracker, metrics: &Path) -> Result<u64> {
+    let (start, mut quiet, mut total, mut seen) = (Instant::now(), 0, 0u64, 0usize);
+    // Reporting starts 2 s after memory is freed and works through it in rounds.
+    while quiet < 4 && start.elapsed() < Duration::from_secs(120) {
+        std::thread::sleep(Duration::from_secs(1));
+        fc.put("/actions", json!({"action_type": "FlushMetrics"}))?;
+        let text = std::fs::read_to_string(metrics)?;
+        let mut freed = 0;
+        for line in text[seen..].lines() {
+            let m: serde_json::Value = serde_json::from_str(line).unwrap_or_default();
+            freed += m["balloon"]["free_page_report_freed"].as_u64().unwrap_or(0);
+        }
+        seen = text.len();
+        total += freed;
+        quiet = if freed == 0 { quiet + 1 } else { 0 };
+    }
+    Ok(total >> 20)
+}
+
 /// Cold-boots a VM and snapshots it into `paths.templates/name`.
 #[allow(clippy::too_many_arguments)]
 pub fn create(
@@ -651,6 +674,9 @@ fn build(
     let start = Instant::now();
     let fc = Firecracker::spawn(&paths.firecracker, &run, sockets.allocate()?, crate::fc::SPAWN_READY)?;
     let vsock = fc.sockets.vsock.clone();
+    let metrics = run.join("metrics.json");
+    File::create(&metrics)?;
+    fc.put("/metrics", json!({"metrics_path": metrics}))?;
     fc.put("/boot-source", json!({"kernel_image_path": paths.kernel, "boot_args": BOOT_ARGS}))?;
     fc.put("/machine-config", json!({"vcpu_count": vcpus, "mem_size_mib": mem_mib}))?;
     fc.put("/pmem/root", json!({"id": "root", "path_on_host": rootfs, "root_device": true, "read_only": true}))?;
@@ -686,6 +712,7 @@ fn build(
             guest::exec(&vsock, "sync; echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory")?;
         }
     }
+    let reported = wait_reporting_done(&fc, &metrics)?;
     fc.pause()?;
     fc.put(
         "/snapshot/create",
@@ -712,8 +739,8 @@ fn build(
     let wset = record_working_set(paths, staging, tap, &sockets)?;
     let size = std::fs::metadata(dir.join("mem"))?.len();
     println!(
-        "template {name} (id {}): {vcpus} vCPUs, {mem_mib} MiB base + {hotplug} MiB hotplug ({plugged} MiB plugged), \
-         booted in {} ms, memory file {} MiB ({} MiB of zeroes punched out), working set {} MiB",
+        "template {name} (id {}): {vcpus} vCPUs, {mem_mib} MiB base + {hotplug} MiB hotplug ({plugged} MiB plugged, \
+         {reported} MiB reported free), booted in {} ms, memory file {} MiB ({} MiB of zeroes punched out), working set {} MiB",
         meta.id,
         ms(booted),
         size >> 20,
