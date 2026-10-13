@@ -1619,9 +1619,27 @@ impl Daemon {
         let checked = match (probed, vm.pager.failed()) {
             (Err(e), _) => Err(format!("migration source {} does not serve pages: {e}", source.addr).into()),
             (_, Some(why)) => Err(format!("its memory cannot be paged in: {why}").into()),
-            _ => before_commit().and_then(|()| match Instant::now() < deadline {
-                true => self.publish(&name, &vm),
-                false => Err("the migration ran past its deadline".into()),
+            _ => before_commit().and_then(|()| {
+                // The ownership boundary, in one step under the locks it
+                // takes, with the deadline checked under them too: the VM is
+                // registered, its address committed, and the migration
+                // recorded committed; from here on this host owns the VM and
+                // the source never resumes its copy. Or none of it happens.
+                // (An aborted claim rolls back, taking the address lock, only
+                // once these are released.)
+                let mut addrs = self.addrs.lock().unwrap();
+                let mut vms = self.vms.lock().unwrap();
+                let late = Instant::now() >= deadline;
+                let closing = self.closing.load(Ordering::SeqCst);
+                if !late && !closing {
+                    vms.insert(name.clone(), vm.clone());
+                    claim.commit_with(&mut addrs);
+                    self.migrations.lock().unwrap().insert(source.mig, Incoming::Committed);
+                    return Ok(());
+                }
+                drop((vms, addrs));
+                drop(claim);
+                Err(if late { "the migration ran past its deadline" } else { "daemon is shutting down" }.into())
             }),
         };
         if let Err(e) = checked {
@@ -1629,10 +1647,6 @@ impl Daemon {
             vm.kill();
             return Err(format!("{e} (it never ran here)").into());
         }
-        claim.commit();
-        // The ownership boundary: from here on this host owns the VM, and the
-        // source never resumes its copy.
-        self.migrations.lock().unwrap().insert(source.mig, Incoming::Committed);
         t.mark("register");
         let arrived = vm.clone();
         // While the arrival still holds the name: no kill or migration of
@@ -2184,10 +2198,16 @@ struct IpClaim<'a> {
 }
 
 impl IpClaim<'_> {
-    fn commit(mut self) {
+    fn commit(self) {
+        let addrs = self.addrs;
+        self.commit_with(&mut addrs.lock().unwrap());
+    }
+
+    /// `commit`, for a caller holding the address lock.
+    fn commit_with(mut self, addrs: &mut Addrs) {
         self.done = true;
         if self.was_lent {
-            self.addrs.lock().unwrap().unlend(self.ip);
+            addrs.unlend(self.ip);
         }
     }
 }
