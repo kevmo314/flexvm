@@ -419,10 +419,44 @@ back to loading the snapshot then and there.
     configuration. Give VMs addresses from the LAN's subnet and they can use
     the LAN's normal gateway for internet access.
 - On migration, the target routes the address to its new tap before the VM
-  resumes and then announces it. The source points its own route at the
-  target as soon as the target answers. The guest keeps its address and TCP
-  state, so connections continue. Packets in flight during the downtime are
-  lost, so the client stalls for one retransmit timeout (~200 ms on Linux).
+  resumes. The guest keeps its address and TCP state, so connections
+  continue, and packets that arrive during the downtime are held, not lost
+  (`hold.rs`):
+  - Just before pausing the VM, the source routes its address to a TUN
+    device of its own (`fv<port>h`; the one route this adds). A thread queues
+    what arrives there, up to 4 MiB per VM, beyond that dropping and counting.
+  - Once the target answers (the VM runs there), the source opens a stream
+    on the migration connection and, once the target accepts it, sends the
+    queue (length, sequence number, packet), then whatever reached the TUN
+    device meanwhile. It waits until the target has injected all of it,
+    points its own route at the target, and sends the few packets that were
+    still on their way. The target takes one stream per migration, on that
+    connection, for that VM instance only, and stops it if the VM is killed
+    or moves on. Nothing is resent: a stream that breaks off, or a source
+    whose answer was lost, loses the rest (counted). Sequence numbers count
+    gaps and drop duplicates.
+  - The target injects each packet into the guest as an Ethernet frame sent
+    out of the VM's tap from an AF_PACKET socket (from the gateway's MAC to
+    the guest's): Firecracker reads it like any other frame, byte for byte as
+    it arrived, with no host routing involved; packets that are not whole
+    IPv4 packets for the VM's address are dropped (and counted). Only when the
+    stream ends (or none opens within 250 ms; then none is taken any more)
+    does it announce the address (route pushes to peers, gratuitous ARP,
+    each only while that VM still runs there), so held packets come before
+    traffic sent straight to it.
+  - If the migration aborts, the source injects the held packets into the
+    VM's own tap before resuming it. If it lost track of the outcome, the
+    packets wait for it (even after the paused copy is gone): dropped if the
+    VM went to the target, injected into its tap here if it has come back.
+
+  `migrate` reports `held: {packets, kib, dropped, injected, dropped_target}`.
+  TCP peers stall for about the downtime instead of a retransmit timeout
+  (200 ms, 400+ ms when the retransmit is lost too). Taps carry a host-scope
+  address (`169.254.1.2`, not answered in ARP: `arp_ignore=3`), because the
+  reverse-path filter drops everything an addressless tap sends once the
+  guest's address is routed to the TUN device, even in loose mode (a per-tap
+  `rp_filter=0` would not help where `all` is 2, as distributions set it), and
+  queue up to 4096 frames, so an injected burst fits while the guest catches up.
 
 ### Firecracker patch
 
@@ -440,7 +474,8 @@ RAM and double memory use on a host that is already short.
 | same, hot pool empty (snapshot load) | 45–54 ms p50 under the same load (36–56 ms on a quieter host) |
 | of which Firecracker snapshot load | 22–50 ms (mostly KVM memslot setup, which is slow under nested virt) |
 | Migration downtime | **36–62 ms** (2 vCPU), **56–63 ms** (24 vCPU, 500 MB live data) |
-| TCP connection through two migrations | no errors, worst stall 217 ms (one client retransmit) |
+| TCP ping-pong through two migrations (`scripts/nettest.sh`, host load ~20 on 24 threads) | worst stall **69–158 ms**, at most 1.6x that round's downtime (12 rounds); before packets were held: 206–220 ms, one retransmit timeout every round |
+| UDP stream through the same, 5,000 datagrams/s | **0 lost**, 0–17 reordered per round (12 rounds); before: 184–770 lost per round. At 20,000/s: 0 lost, 0–14 reordered |
 | nginx image, `run` → first HTTP response from the host | **205 ms** p50 (run 56 + nginx startup 144); `--warm`: **55 ms** p50 (run 31 + first request 22) |
 | Background memory pull | ~1.1 GB/s over loopback TCP |
 | Idle VM host RSS | 13–35 MiB |
@@ -490,10 +525,17 @@ flexvm --host 192.168.1.10:7070 kill web
 
 `scripts/netlab.sh up && scripts/netlab.sh daemons` builds the same setup on
 one machine out of network namespaces: two hosts and a client on a simulated
-LAN.
+LAN. `scripts/nettest.sh` builds a private copy of it (namespaces `fv5*`,
+`192.168.155.0/24`, touching only its own processes), migrates a VM back and
+forth under a TCP ping-pong and a sequence-numbered UDP stream, and fails on
+any lost datagram or a TCP stall over twice the downtime.
 
 The daemon must run as root: it uses `/dev/kvm`, privileged userfaultfd,
-`process_vm_readv` on Firecracker and cgroup v2. On SIGTERM or SIGINT it stops
+`process_vm_readv` on Firecracker and cgroup v2. Its taps, hold device and
+cgroups are named after its port (cgroups also after its listen address and
+network namespace), so one daemon per port and network namespace: a second
+one (on another address) refuses to start, before it cleans up anything
+(abstract socket `flexvm-port-<port>`). On SIGTERM or SIGINT it stops
 taking new VMs and migrations, lets the ones in progress finish, waits until
 every VM paused here as a migration source has been released by its target
 (killing it earlier would lose the pages the target has not pulled), stops its
@@ -627,6 +669,7 @@ flexvm/src/
   vm.rs        restore into a pooled Firecracker, checkpoint, stats
   hot.rs       hot pool: restored, settled and paused VMs per template
   net.rs       taps, rtnetlink routes and neighbours, gratuitous ARP, address ranges
+  hold.rs      holds a migrating VM's packets while it is paused, injects them where it resumes
   fc.rs        Firecracker process, API client, warm pool
   guest.rs     vsock client for flexvm-init
   image/       container images: references, registry client, archives and
@@ -644,9 +687,11 @@ firecracker/        patches on top of Firecracker v1.17.0
 - **Networking is IPv4 only.** Peers form a full mesh (every daemon lists
   every other one). Address allocation is disjoint per-host ranges
   (configured by hand), not real cluster-wide address management.
-- **Packets in flight during a migration are dropped.** The source could
-  buffer them and forward them to the target to avoid the ~200 ms client
-  retransmit stall.
+- **Packets held during a migration** are capped at 4 MiB per VM; a faster
+  flood loses the excess (counted). A few packets can be reordered around
+  the moment the source's route switches. IPv4 only; the guest's own packets
+  in the instant before the pause are lost on hosts with strict
+  (`rp_filter=1`) reverse-path filtering.
 - **NAT on a host would break connections on migration**, because the
   translation state stays behind. Use routable VM addresses (as above) or do
   NAT at a dedicated gateway.

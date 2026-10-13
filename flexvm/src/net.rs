@@ -63,11 +63,27 @@ pub fn ip_batch(cmds: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// A host-scope address on every tap, never used as a source (host scope)
+/// nor answered for in ARP (`arp_ignore=3`; the guest's gateway MAC is
+/// pinned anyway). Without any address, the reverse-path filter drops
+/// everything the guest sends while its address is routed elsewhere, even in
+/// loose mode (`__fib_validate_source`: no address on the input device means
+/// fail), as it is in the moment before a migrating VM pauses (`hold`). A
+/// per-tap `rp_filter=0` would not do: the kernel uses the larger of the
+/// tap's and `all`'s setting, and distributions set `all` to 2.
+pub const TAP_ADDR: &str = "169.254.1.2/32";
+
+/// Frames a tap queues for its Firecracker (the default is 1000): room for
+/// the packets a migration held, injected all at once (`hold`).
+pub const TAP_QUEUE: u32 = 4096;
+
 pub fn create_tap(name: &str) -> Result<()> {
     ip_batch(&[
         format!("tuntap add dev {name} mode tap"),
-        format!("link set dev {name} address {GATEWAY_MAC} up"),
-    ])
+        format!("addr add {TAP_ADDR} dev {name} scope host"),
+        format!("link set dev {name} address {GATEWAY_MAC} txqueuelen {TAP_QUEUE} up"),
+    ])?;
+    sysctl(&format!("net.ipv4.conf.{name}.arp_ignore"), "3")
 }
 
 pub fn delete_tap(name: &str) {
@@ -221,7 +237,7 @@ fn netlink(kind: u16, flags: u16, body: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn ifindex(dev: &str) -> Result<u32> {
+pub fn ifindex(dev: &str) -> Result<u32> {
     let name = std::ffi::CString::new(dev)?;
     match unsafe { libc::if_nametoindex(name.as_ptr()) } {
         0 => bail!("no interface {dev}"),
@@ -229,7 +245,7 @@ fn ifindex(dev: &str) -> Result<u32> {
     }
 }
 
-fn parse_mac(s: &str) -> Result<[u8; 6]> {
+pub fn parse_mac(s: &str) -> Result<[u8; 6]> {
     let mut mac = [0u8; 6];
     for (m, part) in mac.iter_mut().zip(s.trim().split(':')) {
         *m = u8::from_str_radix(part, 16)?;

@@ -242,6 +242,7 @@ impl Daemon {
         // stops before Firecracker dies, and its page states are never read
         // again: a resume pages in from the checkpoint.
         self.vms.lock().unwrap().remove(name);
+        self.drop_held_in(&vm);
         vm.kill();
         t.mark("release");
         let data_mib = (manifest.data_pages * PAGE_SIZE as u64) >> 20;
@@ -356,7 +357,7 @@ impl Daemon {
                 *vm.pending_net.lock().unwrap() = Some(m.ip);
             }
             self.vms.lock().unwrap().insert(name.into(), vm.clone());
-            self.announce(ip);
+            self.announce(&vm);
             return Ok(json!({"name": name, "ip": ip.to_string(), "state": "paused", "restore_ms": ms(restore), "timings_ms": t.json()}));
         }
         if owned {
@@ -398,7 +399,7 @@ impl Daemon {
         // holds the VM's reservation, as every clock step must.
         let clock = vm.sync_clock(CLOCK_TOLERANCE, Instant::now() + CLOCK_DEADLINE);
         t.mark("clock");
-        self.announce(ip);
+        self.announce(&vm);
         let state = vm.state().name();
         thread::spawn(move || {
             let pulled = vm.pager.wait_pulled();
@@ -504,7 +505,7 @@ impl Daemon {
         // next delta; one that succeeds becomes it.
         let mut memhash = None;
         let frozen = (|| -> Result<Frozen> {
-            let runs = vm.save_state(&staging.vmstate(), false)?;
+            let runs = vm.save_state(&staging.vmstate(), false, || {})?;
             t.mark("snapshot");
             if self.fault("ckpt_memhash") {
                 memhash = Some(vm.pager.content_hash()?);

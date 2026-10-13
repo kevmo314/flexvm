@@ -267,27 +267,35 @@ impl Vm {
     /// socket events still walk the TX queue), and the balloon's statistics
     /// timer is pushed out of the way (its next round happens now, before the
     /// snapshot). `resume` undoes this; a target calls `restore_devices`.
-    /// Call after `start_source`.
-    pub fn checkpoint(&self, vmstate: &Path) -> Result<Runs> {
-        self.save_state(vmstate, false)
+    ///
+    /// `unroute` runs just before the pause and moves the VM's address off
+    /// the tap (`hold`), so packets for it from then on are held rather than
+    /// queued on a tap that a paused Firecracker no longer reads and that
+    /// then goes down; what the guest sends until the pause still leaves
+    /// through the tap. Call after `start_source`.
+    pub fn checkpoint(&self, vmstate: &Path, unroute: impl FnOnce()) -> Result<Runs> {
+        self.save_state(vmstate, false, unroute)
     }
 
     /// `checkpoint`, with Firecracker fsyncing the state file if `sync`.
     /// Call after `start_source` or `start_checkpoint`.
-    pub fn save_state(&self, vmstate: &Path, sync: bool) -> Result<Runs> {
-        crate::net::set_link_up(&self.tap, false)?;
+    pub fn save_state(&self, vmstate: &Path, sync: bool, unroute: impl FnOnce()) -> Result<Runs> {
         for (_, s) in self.execs.lock().unwrap().drain() {
             let _ = s.shutdown(Shutdown::Both);
         }
+        unroute();
+        // Always, even if already paused: Firecracker freezes device
+        // emulation only while it sits in the loop an API pause enters (a VM
+        // loaded paused is not in it). The tap goes down after the pause, so
+        // the guest's last packets still leave.
+        self.fc(|fc| fc.pause())?;
+        crate::net::set_link_up(&self.tap, false)?;
         self.fc(|fc| {
-            // Always, even if already paused: Firecracker freezes device
-            // emulation only while it sits in the loop an API pause enters
-            // (a VM loaded paused is not in it). Then the balloon timer is
-            // parked: changing it writes the stats queue, which has to happen
-            // before the snapshot. Nothing else may write guest memory until
-            // the pages are captured or served: we send no guest-facing
-            // request (balloon, hotplug) to a paused source.
-            fc.pause()?;
+            // The balloon timer is parked: changing it writes the stats
+            // queue, which has to happen before the snapshot. Nothing else
+            // may write guest memory until the pages are captured or served:
+            // we send no guest-facing request (balloon, hotplug) to a paused
+            // source.
             fc.patch("/balloon/statistics", json!({"stats_polling_interval_s": u16::MAX}))?;
             self.snapshot_discards.store(self.pager.discards(), Ordering::SeqCst);
             fc.put("/snapshot/create", json!({"snapshot_type": "Full", "snapshot_path": vmstate, "mem_file_path": "", "sync_snapshot_files": sync}))

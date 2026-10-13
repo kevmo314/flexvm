@@ -6,6 +6,7 @@ mod crc32c;
 mod daemon;
 mod fc;
 mod guest;
+mod hold;
 mod image;
 mod hot;
 mod net;
