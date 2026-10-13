@@ -45,7 +45,7 @@
 //! fresh, root-only `.flexvm-staging-<pid>-<n>` directory next to the
 //! destination (all pinned by fd), fsynced, and then renamed into place
 //! (never over an existing one) and the parent fsynced; a later checkpoint
-//! there clears staging a dead daemon left. A checkpoint directory
+//! there clears staging a dead process left. A checkpoint directory
 //! therefore either holds a complete checkpoint or does not exist, and is
 //! never modified afterwards. Restores verify the manifest, `vmstate` and
 //! `pagemap` up front, and every page of `pages` as it is read.
@@ -221,7 +221,7 @@ impl<E: Into<Error>> From<E> for CommitError {
 /// durable. Dropped unpublished, it is removed.
 ///
 /// The destination's directory may belong to an unprivileged user while the
-/// daemon runs as root, so nothing here follows a path the user can change:
+/// VM process runs as root, so nothing here follows a path the user can change:
 /// the destination's directory is pinned by fd, files are written inside a
 /// root-only (0700) staging directory in it, also pinned, and are created
 /// with `O_EXCL | O_NOFOLLOW`. Firecracker writes the VM state into the VM's
@@ -249,7 +249,7 @@ impl Staging {
     /// Claims a staging directory for a checkpoint at `dest`, which must not
     /// exist yet (checkpoints are immutable); Firecracker is to write the VM
     /// state to `vmstate`, a path only root controls. Clears out staging
-    /// directories that daemons no longer running left in the same directory.
+    /// directories that processes no longer running left in the same directory.
     pub fn new(dest: &Path, vmstate: PathBuf) -> Result<Staging> {
         let parent = match dest.parent() {
             Some(p) if !p.as_os_str().is_empty() => p,
@@ -299,7 +299,7 @@ impl Staging {
         create_at(self.ck.as_raw_fd(), name)
     }
 
-    /// Adds a small file of the daemon's own to the checkpoint, durably,
+    /// Adds a small file of flexvm's own to the checkpoint, durably,
     /// published with it (a suspended VM's `GEN`).
     pub fn add_file(&self, name: &str, bytes: &[u8]) -> Result<()> {
         let f = self.create(name)?;
@@ -388,7 +388,7 @@ impl Staging {
         (&mf).write_all(&text)?;
         mf.sync_all()?;
         // The checkpoint belongs to whoever owns the directory it was put in
-        // (the daemon runs as root), so they can move and delete it.
+        // (flexvm runs as root), so they can move and delete it.
         let owner = fstat(self.parent.as_raw_fd())?;
         publish_permissions(&[pages.file.as_raw_fd(), pagemap.as_raw_fd(), vmstate_file.as_raw_fd(), mf.as_raw_fd()], self.ck.as_raw_fd(), &owner)?;
         fsync_fd(self.ck.as_raw_fd())?;
@@ -451,15 +451,7 @@ fn exists_at(dir: RawFd, name: &CStr) -> bool {
     unsafe { libc::fstatat(dir, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) == 0 }
 }
 
-/// Removes `ck` from `outer`, with every file in it (only we write there).
-fn remove_ck(outer: &OwnedFd, ck: &OwnedFd) {
-    for f in std::fs::read_dir(format!("/proc/self/fd/{}", ck.as_raw_fd())).into_iter().flatten().flatten() {
-        unsafe { libc::unlinkat(ck.as_raw_fd(), cname(&f.file_name().to_string_lossy()).as_ptr(), 0) };
-    }
-    unsafe { libc::unlinkat(outer.as_raw_fd(), c"ck".as_ptr(), libc::AT_REMOVEDIR) };
-}
-
-/// Removes staging directories of daemons that are gone: only directories
+/// Removes staging directories of processes that are gone: only directories
 /// this user owns and nobody else may enter, as `Staging::new` makes them.
 fn clear_stale(parent: &OwnedFd) {
     let Ok(dir) = std::fs::read_dir(format!("/proc/self/fd/{}", parent.as_raw_fd())) else { return };
@@ -1573,7 +1565,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let dest = dir.join("ck");
-        // Staging left by a daemon that is gone is cleared, if it is private
+        // Staging left by a process that is gone is cleared, if it is private
         // like ours; anything else with that name is left alone.
         let stale = dir.join(format!("{STAGING_PREFIX}999999999-1"));
         std::fs::create_dir_all(stale.join("ck")).unwrap();

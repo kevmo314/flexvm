@@ -290,7 +290,7 @@ fn claim(p: &Arc<Proc>, req: &Value) -> std::result::Result<Value, (Error, bool)
     p.set_addr(claim);
     p.set_vm(vm);
     let mut v = p.start_guest(&mut t).map_err(|e| (e, false))?;
-    v["hot"] = json!(true);
+    v["standby"] = json!(true);
     Ok(v)
 }
 

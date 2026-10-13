@@ -180,14 +180,14 @@ fn is_local_addr(ip: Ipv4Addr) -> Result<bool> {
     Ok(local)
 }
 
-/// Routes `ip` to the host at `via`, where the VM now lives. Daemons sharing
+/// Routes `ip` to the host at `via`, where the VM now lives. Hosts sharing
 /// a network namespace also share routes: never replace the target's tap
 /// route with a route through this same host.
 pub fn route_via(ip: Ipv4Addr, via: Ipv4Addr) -> Result<()> {
     // Not knowing is no reason to leave a peer's VM unrouted.
     if is_local_addr(via).unwrap_or(false) {
         static LOGGED: std::sync::Once = std::sync::Once::new();
-        LOGGED.call_once(|| eprintln!("not routing {ip} via {via}: a local address (daemons sharing a host); this is logged once"));
+        LOGGED.call_once(|| eprintln!("not routing {ip} via {via}: a local address (hosts sharing a network namespace); this is logged once"));
         return Ok(());
     }
     let mut route = rtmsg(RT_SCOPE_UNIVERSE);
@@ -365,7 +365,7 @@ pub fn gratuitous_arp(dev: &str, ip: Ipv4Addr) -> Result<()> {
     Ok(())
 }
 
-/// The block of addresses a daemon hands out, as `a.b.c.d/len` or `first-last`.
+/// The block of addresses a host hands out, as `a.b.c.d/len` or `first-last`.
 #[derive(Debug, Clone)]
 pub struct IpRange {
     first: u32,

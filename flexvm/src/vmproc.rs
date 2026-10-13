@@ -458,7 +458,7 @@ impl Proc {
         }
         self.set_vm(vm);
         let mut v = self.start_guest(&mut t)?;
-        v["hot"] = json!(false);
+        v["standby"] = json!(false);
         Ok(v)
     }
 

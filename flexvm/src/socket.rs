@@ -59,7 +59,7 @@ fn bases() -> [PathBuf; 2] {
 }
 
 /// The socket root a `SocketRoot::new(key)` would use under each base. Named
-/// after the key, so a restarted daemon finds what its predecessor left.
+/// after the key, so a process with the same key finds what its predecessor left.
 pub fn roots(key: &Path) -> Vec<PathBuf> {
     roots_in(&bases(), key)
 }
@@ -78,14 +78,14 @@ pub fn remove(key: &Path) {
     }
 }
 
-/// One daemon or template build. Slots keep it alive until their cleanup.
+/// One VM process or template build. Slots keep it alive until their cleanup.
 pub struct SocketRoot {
     pub dir: PathBuf,
     next: AtomicU64,
 }
 
 impl SocketRoot {
-    /// A fresh root for `key` (the daemon's canonical run directory, or a
+    /// A fresh root for `key` (a VM process's work directory, or a
     /// template build's directory), replacing a stale one of the same key.
     pub fn new(key: &Path) -> Result<Arc<Self>> {
         Self::from_bases(&bases(), key)

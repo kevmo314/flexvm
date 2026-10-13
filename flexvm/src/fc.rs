@@ -148,7 +148,7 @@ impl Firecracker {
     }
 }
 
-/// Calls on a VM hold its `fc` mutex; standalone/pooled Firecrackers have
+/// Calls on a VM hold its `fc` mutex; idle Firecrackers have
 /// one owner. Keep the reader too, so any buffered bytes stay with the socket.
 #[derive(Default)]
 struct Api {

@@ -448,7 +448,7 @@ impl Proc {
         // virtio-mem request still in flight could discard memory after the
         // state is saved. The guest only sends one to follow a size change
         // from the host, so wait until it has followed the last one (the
-        // controller cannot make another while we hold the reservation).
+        // controller cannot make another while we hold the operation lock).
         vm.settle_hotplug(Instant::now() + SETTLE_WAIT)?;
         t.mark("settle_hotplug");
         // Disk space for the pages it has now, while it still runs.

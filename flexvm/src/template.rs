@@ -277,7 +277,7 @@ pub struct Template {
     /// Its guest agent predates `START`, so starts use `NET` and leave the clock alone.
     pub legacy_agent: AtomicBool,
     /// Pages Firecracker touches while loading this template's snapshot,
-    /// learned from the hot pool's loads here (`Pager::learn_load_set`): vCPU
+    /// learned from the standby VMs' loads here (`Pager::learn_load_set`): vCPU
     /// clock pages, virtqueues and the like, at the same addresses in every
     /// VM of the template. A migration source sends the ones it has along
     /// with the vmstate, so the target's load need not fetch them one round
@@ -398,7 +398,7 @@ impl Template {
         let cache = &mut self.verified.lock().unwrap();
         // Through the handle: `dir` may name another template by now.
         if self.meta.verify(paths, &self.fixed, cache, rehash)? {
-            // Record the new stamps so the next daemon on this host need not rehash.
+            // Record the new stamps so the next process on this host need not rehash.
             let mut meta = self.meta.clone();
             for (name, stamp) in cache.iter() {
                 meta.components.get_mut(name).unwrap().metadata = stamp.clone();
@@ -537,7 +537,7 @@ fn record_working_set(paths: &Paths, name: &str, tap: &str, sockets: &Arc<Socket
             "mem_backend": {"backend_type": "Uffd", "backend_path": fc.sockets.uffd},
             "vsock_override": {"uds_path": fc.sockets.vsock},
             "network_overrides": [{"iface_id": "eth0", "host_dev_name": tap}],
-            // Like the daemon's restores: stepping the clock touches pages of its own.
+            // Like VM restores: stepping the clock touches pages of its own.
             "clock_realtime": true,
             "resume_vm": true,
         }),
@@ -640,7 +640,7 @@ pub fn create(
 
 /// Moves a finished build into its generation directory and points
 /// `templates/name` at it with one atomic rename of a symlink. Nothing is ever
-/// deleted here: running and suspended VMs, migrations, pooled VMs and
+/// deleted here: running and suspended VMs, migrations, standby VMs and
 /// checkpoints refer to generations by content id, so old generations stay
 /// until an operator removes them (see the README).
 fn publish(paths: &Paths, name: &str, staged: &Path) -> Result<()> {

@@ -92,9 +92,8 @@ pub fn loads() -> u64 {
 use crate::uffd::{Origin, Pager, Runs};
 use crate::util::{Phases, Result, PAGE_SIZE};
 
-/// Where a VM is in its lifecycle on this host. Transitions happen under the
-/// daemon's per-name operation lock (see `Daemon::reserve`); the states of a
-/// VM without a Firecracker here (starting, suspended) live in the daemon.
+/// Where a VM is in its lifecycle on this host. Transitions happen under its
+/// process's operation lock (`Proc::op`).
 /// A clock request that took longer than this may have left the guest that
 /// far behind (see `sync_clock`).
 pub const CLOCK_RTT: Duration = Duration::from_millis(5);
@@ -168,7 +167,7 @@ pub struct Vm {
     /// paused: `resume` then puts it back paused (and a migration target
     /// keeps it paused).
     was_paused: AtomicBool,
-    /// A background clock check is queued (see `Daemon::sync_clock_later`).
+    /// A background clock check is queued (see `Proc::sync_clock_later`).
     pub clock_pending: AtomicBool,
     /// Restored held paused at a new address: the guest still has this old
     /// one, and gets the new one on its first resume.
@@ -197,7 +196,7 @@ impl Vm {
     /// could repeat what it did.
     #[allow(clippy::too_many_arguments)]
     pub fn restore(
-        pool: &Spawner,
+        spawner: &Spawner,
         name: &str,
         template: Arc<Template>,
         vmstate: Snapshot,
@@ -210,8 +209,8 @@ impl Vm {
         let mut clock_realtime = true;
         let mut retried = false;
         let (vm, took) = loop {
-            let idle = pool.take()?;
-            phases.mark("pool_take");
+            let idle = spawner.take()?;
+            phases.mark("spawn");
             let prepared = Vm::prepare(idle, template.clone(), phases)?;
             if learn {
                 // What the load touches (`Template::load_set`), for migrations to preload.
@@ -470,13 +469,12 @@ impl Vm {
         // and must not arrive after the snapshot (on a target, or in a
         // checkpoint) with a stale time. The agent serves requests in order,
         // so a ping answered now means it has been dealt with. Not under the
-        // state lock: a ping can take seconds, and the daemon reads `state`
-        // under its VM map's lock.
+        // state lock: a ping can take seconds, and `state` is read often.
         if self.clock_unsure.load(Ordering::SeqCst) {
             crate::guest::ping(&self.vsock()).map_err(|e| format!("vm {}: guest agent not answering: {e}", self.name))?;
             self.clock_unsure.store(false, Ordering::SeqCst);
         }
-        // Transitions are serialized by the daemon's reservation; check again
+        // Transitions are serialized by the operation lock; check again
         // all the same (the pager may have failed meanwhile).
         let mut st = self.state.lock().unwrap();
         leavable(*st)?;
@@ -506,7 +504,7 @@ impl Vm {
 
     /// Ends a checkpoint to disk that keeps the VM here: back to running or
     /// paused, or failed if it cannot be resumed. (Transitions are serialized
-    /// by the daemon's reservation; the state lock is never held across a
+    /// by the operation lock; the state lock is never held across a
     /// Firecracker request, so readers never wait on one.)
     pub fn end_checkpoint(&self) -> Result<State> {
         if *self.state.lock().unwrap() != State::Checkpointing {
@@ -569,7 +567,7 @@ impl Vm {
     /// virtio-mem requests on its VMM thread, paused vCPUs or not, and each
     /// can discard memory and write the used ring; the guest driver only
     /// sends them to follow a size change from the host. Callers keep the
-    /// controller from resizing meanwhile (the VM's reservation).
+    /// controller from resizing meanwhile (the VM's operation lock).
     pub fn settle_hotplug(&self, deadline: Instant) -> Result<()> {
         if self.template.meta.max_mib <= self.template.meta.mem_mib {
             return Ok(());
@@ -686,7 +684,7 @@ impl Vm {
     /// reports how far off the clock was (ms, returned); as the guest ends up
     /// behind by the request's transit time, it goes again (a few times at
     /// most) until a round trip is short. The guest skips steps under 5 ms.
-    /// Callers hold the VM's reservation. An agent without `CLOCK` gets no
+    /// Callers hold the VM's operation lock. An agent without `CLOCK` gets no
     /// step (logged once): a command run through exec could be delayed past
     /// the deadline and land after a snapshot, which nothing can fence.
     pub fn sync_clock(&self, deadline: Instant) -> Result<f64> {
@@ -817,7 +815,7 @@ impl Vm {
 
     /// Sets the guest's address and wall clock (`START`; `NET` for older
     /// agents), unless the VM is no longer running here. Bounded by
-    /// `guest::TIMEOUT`. Callers hold the VM's reservation, so no migration
+    /// `guest::TIMEOUT`. Callers hold the VM's operation lock, so no migration
     /// or checkpoint starts meanwhile. If it fails, the clock may be anyone's
     /// guess (see `leave`).
     pub fn guest_net(&self, ip: Ipv4Addr, dns: Option<&str>) -> Result<()> {
@@ -832,7 +830,7 @@ impl Vm {
     }
 
     /// Starts an image template's app, unless the VM is no longer running
-    /// here. Bounded by `guest::TIMEOUT`; callers hold the VM's reservation.
+    /// here. Bounded by `guest::TIMEOUT`; callers hold the VM's operation lock.
     pub fn start_app(&self) -> Result<u32> {
         if self.state() != State::Running {
             bail!("vm {} is not running here", self.name);

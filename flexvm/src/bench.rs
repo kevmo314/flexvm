@@ -138,8 +138,8 @@ fn runs(h: &Hosts, args: &Args, template: &str, date: &str) -> Result<Value> {
         // Let standby VMs refill between trials; misses show up as cold runs.
         thread::sleep(settle);
     }
-    let hot = samples.iter().filter(|s| s["hot"] == json!(true)).count();
-    let mut summary = json!({"run": summarize(&samples, "run")?, "run_client": summarize(&samples, "run_client")?, "run_hot_hits": hot});
+    let standby = samples.iter().filter(|s| s["standby"] == json!(true)).count();
+    let mut summary = json!({"run": summarize(&samples, "run")?, "run_client": summarize(&samples, "run_client")?, "run_standby_hits": standby});
     if ready.is_some() {
         summary["client"] = summarize(&samples, "client")?;
     }
@@ -162,7 +162,7 @@ fn iteration(h: &Hosts, name: &str, template: &str, dirty_mib: u64, ready: Optio
     let start = Instant::now();
     let run = h.cli(&h.a, &["run", name, "--template", template, "-d"])?;
     let run_cli = start.elapsed();
-    let mut sample = json!({"run": run["timings_ms"], "hot": run["hot"], "run_client": {"total": ms(run_cli)}});
+    let mut sample = json!({"run": run["timings_ms"], "standby": run["standby"], "run_client": {"total": ms(run_cli)}});
     if let Some((port, http)) = ready {
         let ip: std::net::Ipv4Addr = run["ip"].as_str().ok_or("run reply has no ip")?.parse()?;
         wait_ready((ip, port).into(), http, start + h.timeout)?;
