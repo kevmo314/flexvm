@@ -1,0 +1,128 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # flexvm's own toolchain. Firecracker builds with the one its rust-toolchain.toml pins.
+  RUST_TOOLCHAIN: "1.88.0"
+
+jobs:
+  check:
+    name: fmt, clippy, unit tests, release build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt --check
+        # The tree predates rustfmt; enforce once it has been formatted in one go.
+        continue-on-error: true
+        run: |
+          if ! cargo fmt --all --check > fmt.diff; then
+            echo "::warning title=cargo fmt::$(grep -c '^Diff in' fmt.diff) hunks differ from rustfmt (not enforced yet)"
+            exit 1
+          fi
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: unit tests
+        run: cargo test --workspace
+      - name: release build
+        run: cargo build --release --workspace
+
+  e2e:
+    name: end-to-end (KVM)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+          grep -m1 -o -E 'vmx|svm' /proc/cpuinfo
+          # KVM_GET_API_VERSION must answer 12, and KVM_CREATE_VM must work.
+          python3 -c 'import fcntl, os; fd = os.open("/dev/kvm", os.O_RDWR); v = fcntl.ioctl(fd, 0xAE00); vm = fcntl.ioctl(fd, 0xAE01, 0); print("KVM API", v, "vm fd", vm); assert v == 12'
+          nproc; free -m; uname -r
+
+      - name: Host packages
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends musl-tools libseccomp-dev squashfs-tools e2fsprogs
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: e2e
+
+      # Patched Firecracker: rebuilt only when the patches or the build script change.
+      - name: Cache Firecracker
+        id: fc-cache
+        uses: actions/cache@v4
+        with:
+          path: artifacts/firecracker
+          key: firecracker-${{ hashFiles('firecracker/*.patch', 'scripts/build-firecracker.sh') }}
+      - name: Build Firecracker
+        if: steps.fc-cache.outputs.cache-hit != 'true'
+        run: ./scripts/build-firecracker.sh
+
+      # Guest kernel and base root filesystem (fetch.sh skips the stock Firecracker: the patched one is there).
+      - name: Cache downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            artifacts/vmlinux
+            artifacts/base.squashfs
+          key: downloads-${{ hashFiles('scripts/fetch.sh') }}
+      - name: Fetch kernel and base rootfs
+        run: ./scripts/fetch.sh
+
+      # Root filesystem with flexvm-init: rebuilt only when the guest agent or the image recipe changes.
+      - name: Cache rootfs
+        id: rootfs-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            artifacts/rootfs-*.ext4
+            artifacts/rootfs.ext4
+            artifacts/flexvm-init
+          key: rootfs-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('guest/**', 'scripts/build-rootfs.sh', 'scripts/fetch.sh', 'Cargo.lock', 'Cargo.toml') }}
+      - name: Build rootfs
+        if: steps.rootfs-cache.outputs.cache-hit != 'true'
+        run: ./scripts/build-rootfs.sh
+
+      - name: Build flexvm
+        run: cargo build --release -p flexvm
+
+      - name: End-to-end tests
+        run: sudo python3 -u scripts/e2e.py --log-dir "$RUNNER_TEMP/e2e-logs"
+
+      - name: Collect logs
+        if: failure()
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/e2e-logs" || true
+          sudo dmesg | tail -200 > "$RUNNER_TEMP/e2e-logs/dmesg.txt" || true
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-logs
+          path: ${{ runner.temp }}/e2e-logs
+          if-no-files-found: ignore

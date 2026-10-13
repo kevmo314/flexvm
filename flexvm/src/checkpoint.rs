@@ -1295,8 +1295,8 @@ mod tests {
             for &(f, c, s) in &runs {
                 state[f as usize..(f + c) as usize].fill(s);
             }
-            for i in 0..n {
-                let got = match state[i] {
+            for (i, &st) in state.iter().enumerate() {
+                let got = match st {
                     crate::uffd::BASE if tpl.has_data(i) => tpl.pages(i, 1).to_vec(),
                     crate::uffd::BASE | crate::uffd::ZERO => vec![0; PAGE_SIZE],
                     _ => {
@@ -1305,7 +1305,7 @@ mod tests {
                         b
                     }
                 };
-                assert!(got == want(i), "page {i} (state {}, {threads} threads)", state[i]);
+                assert!(got == want(i), "page {i} (state {st}, {threads} threads)");
             }
             last = Some((runs, state, file, path));
         }
