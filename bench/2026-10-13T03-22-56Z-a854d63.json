@@ -1,0 +1,942 @@
+{
+  "date_utc": "2026-10-13T03-22-56Z",
+  "git_dirty": true,
+  "git_sha": "a854d6311a4b58d063aba3f5d72c3086b037df7f",
+  "host_context": {
+    "source": {
+      "cpu_model": "AMD Ryzen 9 3900X 12-Core Processor",
+      "daemon": {
+        "addr": "127.0.0.1:7106",
+        "hot": {
+          "budget_mib": 512,
+          "loading": false,
+          "per_template": 2,
+          "ready": {
+            "default@a006701c4cd37664": 2
+          }
+        },
+        "ips": [],
+        "lent_ips": [],
+        "mem_available_mib": 17877,
+        "mem_total_mib": 32049,
+        "peers": [
+          "127.0.0.1:7107"
+        ],
+        "reserve_mib": 1024,
+        "underlay": "127.0.0.1",
+        "vm_ips": "10.106.0.2-10.106.0.60",
+        "vms": 0
+      },
+      "firecracker": "Firecracker v1.17.0\n\n2026-10-12T23:22:56.323143583 [anonymous-instance:main] Firecracker exiting successfully. exit_code=0",
+      "host_cpus": 24,
+      "hostname": "Chicago",
+      "hot": 2,
+      "hot_mib": 512,
+      "kernel": "6.18.40.1-microsoft-standard-WSL2",
+      "loadavg": "18.65 20.98 21.05 16/3156 3826915",
+      "nested_virt": true,
+      "pool": 2,
+      "template": {
+        "components": {
+          "firecracker": {
+            "hash": "472b49f99ee6567d",
+            "metadata": {
+              "ctime": 1791845418,
+              "ctime_nsec": 262863694,
+              "device": 2096,
+              "inode": 4717562,
+              "mtime": 1791845418,
+              "mtime_nsec": 262863694,
+              "size": 5750992
+            }
+          },
+          "kernel": {
+            "hash": "ea687839d2e32572",
+            "metadata": {
+              "ctime": 1791845418,
+              "ctime_nsec": 250863696,
+              "device": 2096,
+              "inode": 4717561,
+              "mtime": 1791845418,
+              "mtime_nsec": 250863696,
+              "size": 44279576
+            }
+          },
+          "mem": {
+            "hash": "2a0ef0f0e904b879",
+            "metadata": {
+              "ctime": 1791859773,
+              "ctime_nsec": 697261333,
+              "device": 2096,
+              "inode": 4801577,
+              "mtime": 1791859773,
+              "mtime_nsec": 697261333,
+              "size": 33554432000
+            }
+          },
+          "rootfs": {
+            "hash": "b6d8fb6a37147d06",
+            "metadata": {
+              "ctime": 1791859708,
+              "ctime_nsec": 985269006,
+              "device": 2096,
+              "inode": 4984404,
+              "mtime": 1791859708,
+              "mtime_nsec": 57269111,
+              "size": 549453824
+            }
+          },
+          "vmstate": {
+            "hash": "38eb683129852977",
+            "metadata": {
+              "ctime": 1791859735,
+              "ctime_nsec": 717265503,
+              "device": 2096,
+              "inode": 4801550,
+              "mtime": 1791859735,
+              "mtime_nsec": 717265503,
+              "size": 28273
+            }
+          }
+        },
+        "id": "a006701c4cd37664",
+        "kernel": "/home/kevin/flexvm/.claude/worktrees/agent-ab35715d6e695df57/artifacts/vmlinux",
+        "max_mib": 32000,
+        "mem_mib": 1280,
+        "plugged_mib": 4096,
+        "rootfs": "/home/kevin/flexvm/.claude/worktrees/agent-ab35715d6e695df57/artifacts/rootfs-1c3c5a283541.ext4",
+        "vcpus": 2
+      }
+    },
+    "target": {
+      "cpu_model": "AMD Ryzen 9 3900X 12-Core Processor",
+      "daemon": {
+        "addr": "127.0.0.1:7107",
+        "hot": {
+          "budget_mib": 512,
+          "loading": false,
+          "per_template": 2,
+          "ready": {
+            "default@a006701c4cd37664": 2
+          }
+        },
+        "ips": [],
+        "lent_ips": [],
+        "mem_available_mib": 17877,
+        "mem_total_mib": 32049,
+        "peers": [
+          "127.0.0.1:7106"
+        ],
+        "reserve_mib": 1024,
+        "underlay": "127.0.0.1",
+        "vm_ips": "10.107.0.2-10.107.0.60",
+        "vms": 0
+      },
+      "firecracker": "Firecracker v1.17.0\n\n2026-10-12T23:22:56.325875856 [anonymous-instance:main] Firecracker exiting successfully. exit_code=0",
+      "host_cpus": 24,
+      "hostname": "Chicago",
+      "hot": 2,
+      "hot_mib": 512,
+      "kernel": "6.18.40.1-microsoft-standard-WSL2",
+      "loadavg": "18.65 20.98 21.05 16/3156 3826917",
+      "nested_virt": true,
+      "pool": 2,
+      "template": {
+        "components": {
+          "firecracker": {
+            "hash": "472b49f99ee6567d",
+            "metadata": {
+              "ctime": 1791845418,
+              "ctime_nsec": 262863694,
+              "device": 2096,
+              "inode": 4717562,
+              "mtime": 1791845418,
+              "mtime_nsec": 262863694,
+              "size": 5750992
+            }
+          },
+          "kernel": {
+            "hash": "ea687839d2e32572",
+            "metadata": {
+              "ctime": 1791845418,
+              "ctime_nsec": 250863696,
+              "device": 2096,
+              "inode": 4717561,
+              "mtime": 1791845418,
+              "mtime_nsec": 250863696,
+              "size": 44279576
+            }
+          },
+          "mem": {
+            "hash": "2a0ef0f0e904b879",
+            "metadata": {
+              "ctime": 1791859773,
+              "ctime_nsec": 697261333,
+              "device": 2096,
+              "inode": 4801577,
+              "mtime": 1791859773,
+              "mtime_nsec": 697261333,
+              "size": 33554432000
+            }
+          },
+          "rootfs": {
+            "hash": "b6d8fb6a37147d06",
+            "metadata": {
+              "ctime": 1791859708,
+              "ctime_nsec": 985269006,
+              "device": 2096,
+              "inode": 4984404,
+              "mtime": 1791859708,
+              "mtime_nsec": 57269111,
+              "size": 549453824
+            }
+          },
+          "vmstate": {
+            "hash": "38eb683129852977",
+            "metadata": {
+              "ctime": 1791859735,
+              "ctime_nsec": 717265503,
+              "device": 2096,
+              "inode": 4801550,
+              "mtime": 1791859735,
+              "mtime_nsec": 717265503,
+              "size": 28273
+            }
+          }
+        },
+        "id": "a006701c4cd37664",
+        "kernel": "/home/kevin/flexvm/.claude/worktrees/agent-ab35715d6e695df57/artifacts/vmlinux",
+        "max_mib": 32000,
+        "mem_mib": 1280,
+        "plugged_mib": 4096,
+        "rootfs": "/home/kevin/flexvm/.claude/worktrees/agent-ab35715d6e695df57/artifacts/rootfs-1c3c5a283541.ext4",
+        "vcpus": 2
+      }
+    }
+  },
+  "params": {
+    "dirty_mib": 200,
+    "host": "127.0.0.1:7106",
+    "ip": null,
+    "iterations": 15,
+    "ready_http": false,
+    "ready_port": null,
+    "settle_ms": 100,
+    "template": "default",
+    "to": "127.0.0.1:7107",
+    "warmup": 3
+  },
+  "samples_ms": [
+    {
+      "hot": true,
+      "migrate": {
+        "background_pull": 322.79,
+        "checkpoint": 10.91,
+        "downtime": 54.95,
+        "read_state": 0.03,
+        "reroute": 0.05,
+        "send_state": 0.63,
+        "target": 43.39,
+        "total": 55.0
+      },
+      "migrate_target": {
+        "cgroup_rename": 0.04,
+        "claim_ip": 0.08,
+        "pager_start": 3.25,
+        "pool_take": 0.03,
+        "recv_state": 0.2,
+        "register": 0.93,
+        "route_wait": 0.01,
+        "snapshot_load": 37.49,
+        "total": 42.07,
+        "write_state": 0.06
+      },
+      "run": {
+        "announce": 0.18,
+        "cgroup_rename": 0.04,
+        "claim_ip": 0.05,
+        "guest_net": 7.27,
+        "hot_take": 0.03,
+        "register": 0.01,
+        "resume": 1.35,
+        "route": 0.55,
+        "total": 9.49
+      }
+    },
+    {
+      "hot": true,
+      "migrate": {
+        "background_pull": 266.76,
+        "checkpoint": 11.49,
+        "downtime": 42.36,
+        "read_state": 0.04,
+        "reroute": 0.18,
+        "send_state": 0.63,
+        "target": 30.19,
+        "total": 42.54
+      },
+      "migrate_target": {
+        "cgroup_rename": 0.03,
+        "claim_ip": 0.07,
+        "pager_start": 2.02,
+        "pool_take": 0.03,
+        "recv_state": 0.06,
+        "register": 0.11,
+        "route_wait": 0.01,
+        "snapshot_load": 26.73,
+        "total": 29.11,
+        "write_state": 0.06
+      },
+      "run": {
+        "announce": 0.09,
+        "cgroup_rename": 0.04,
+        "claim_ip": 0.04,
+        "guest_net": 4.63,
+        "hot_take": 0.03,
+        "register": 0.01,
+        "resume": 0.68,
+        "route": 0.29,
+        "total": 5.81
+      }
+    },
+    {
+      "hot": true,
+      "migrate": {
+        "background_pull": 285.91,
+        "checkpoint": 11.3,
+        "downtime": 47.0,
+        "read_state": 0.03,
+        "reroute": 0.1,
+        "send_state": 0.66,
+        "target": 35.01,
+        "total": 47.1
+      },
+      "migrate_target": {
+        "cgroup_rename": 0.03,
+        "claim_ip": 0.1,
+        "pager_start": 2.76,
+        "pool_take": 0.03,
+        "recv_state": 0.2,
+        "register": 0.14,
+        "route_wait": 0.0,
+        "snapshot_load": 30.72,
+        "total": 34.03,
+        "write_state": 0.06
+      },
+      "run": {
+        "announce": 0.1,
+        "cgroup_rename": 0.04,
+        "claim_ip": 0.04,
+        "guest_net": 3.55,
+        "hot_take": 0.04,
+        "register": 0.01,
+        "resume": 0.78,
+        "route": 0.35,
+        "total": 4.91
+      }
+    },
+    {
+      "hot": true,
+      "migrate": {
+        "background_pull": 290.59,
+        "checkpoint": 10.53,
+        "downtime": 43.65,
+        "read_state": 0.04,
+        "reroute": 0.12,
+        "send_state": 0.64,
+        "target": 32.44,
+        "total": 43.77
+      },
+      "migrate_target": {
+        "cgroup_rename": 0.03,
+        "claim_ip": 0.08,
+        "pager_start": 2.05,
+        "pool_take": 0.03,
+        "recv_state": 0.29,
+        "register": 0.12,
+        "route_wait": 0.01,
+        "snapshot_load": 28.9,
+        "total": 31.6,
+        "write_state": 0.08
+      },
+      "run": {
+        "announce": 0.07,
+        "cgroup_rename": 0.04,
+        "claim_ip": 0.05,
+        "guest_net": 4.47,
+        "hot_take": 0.02,
+        "register": 0.01,
+        "resume": 5.4,
+        "route": 0.33,
+        "total": 10.39
+      }
+    },
+    {
+      "hot": true,
+      "migrate": {
+        "background_pull": 271.11,
+        "checkpoint": 8.01,
+        "downtime": 41.07,
+        "read_state": 0.04,
+        "reroute": 0.13,
+        "send_state": 0.72,
+        "target": 32.3,
+        "total": 41.2
+      },
+      "migrate_target": {
+        "cgroup_rename": 0.04,
+        "claim_ip": 0.1,
+        "pager_start": 2.32,
+        "pool_take": 0.03,
+        "recv_state": 0.23,
+        "register": 0.13,
+        "route_wait": 0.04,
+        "snapshot_load": 28.38,
+        "total": 31.32,
+        "write_state": 0.07
+      },
+      "run": {
+        "announce": 0.11,
+        "cgroup_rename": 0.04,
+        "claim_ip": 0.04,
+        "guest_net": 4.95,
+        "hot_take": 0.03,
+        "register": 0.01,
+        "resume": 1.6,
+        "route": 0.73,
+        "total": 7.5
+      }
+    },
+    {
+      "hot": true,
+      "migrate": {
+        "background_pull": 292.33,
+        "checkpoint": 9.52,
+        "downtime": 45.97,
+        "read_state": 0.03,
+        "reroute": 0.15,
+        "send_state": 0.67,
+        "target": 35.76,
+        "total": 46.12
+      },
+      "migrate_target": {
+        "cgroup_rename": 0.03,
+        "claim_ip": 0.07,
+        "pager_start": 2.47,
+        "pool_take": 0.03,
+        "recv_state": 0.1,
+        "register": 0.11,
+        "route_wait": 0.0,
+        "snapshot_load": 31.5,
+        "total": 34.37,
+        "write_state": 0.05
+      },
+      "run": {
+        "announce": 0.22,
+        "cgroup_rename": 0.31,
+        "claim_ip": 0.04,
+        "guest_net": 7.82,
+        "hot_take": 0.03,
+        "register": 0.01,
+        "resume": 8.94,
+        "route": 0.27,
+        "total": 17.63
+      }
+    },
+    {
+      "hot": true,
+      "migrate": {
+        "background_pull": 323.98,
+        "checkpoint": 12.07,
+        "downtime": 44.32,
+        "read_state": 0.03,
+        "reroute": 0.1,
+        "send_state": 0.8,
+        "target": 31.42,
+        "total": 44.43
+      },
+      "migrate_target": {
+        "cgroup_rename": 0.04,
+        "claim_ip": 0.08,
+        "pager_start": 3.43,
+        "pool_take": 0.03,
+        "recv_state": 0.2,
+        "register": 0.1,
+        "route_wait": 0.01,
+        "snapshot_load": 26.42,
+        "total": 30.35,
+        "write_state": 0.07
+      },
+      "run": {
+        "announce": 0.13,
+        "cgroup_rename": 0.05,
+        "claim_ip": 0.04,
+        "guest_net": 4.75,
+        "hot_take": 0.03,
+        "register": 0.01,
+        "resume": 0.86,
+        "route": 0.38,
+        "total": 6.24
+      }
+    },
+    {
+      "hot": true,
+      "migrate": {
+        "background_pull": 281.8,
+        "checkpoint": 11.39,
+        "downtime": 52.15,
+        "read_state": 0.04,
+        "reroute": 0.12,
+        "send_state": 0.83,
+        "target": 39.9,
+        "total": 52.27
+      },
+      "migrate_target": {
+        "cgroup_rename": 0.05,
+        "claim_ip": 0.1,
+        "pager_start": 2.45,
+        "pool_take": 0.03,
+        "recv_state": 0.27,
+        "register": 0.12,
+        "route_wait": 0.01,
+        "snapshot_load": 35.86,
+        "total": 38.96,
+        "write_state": 0.07
+      },
+      "run": {
+        "announce": 0.23,
+        "cgroup_rename": 0.04,
+        "claim_ip": 0.05,
+        "guest_net": 8.06,
+        "hot_take": 0.01,
+        "register": 0.01,
+        "resume": 1.7,
+        "route": 1.07,
+        "total": 11.16
+      }
+    },
+    {
+      "hot": true,
+      "migrate": {
+        "background_pull": 244.42,
+        "checkpoint": 7.06,
+        "downtime": 34.45,
+        "read_state": 0.03,
+        "reroute": 0.13,
+        "send_state": 0.76,
+        "target": 26.59,
+        "total": 34.58
+      },
+      "migrate_target": {
+        "cgroup_rename": 0.03,
+        "claim_ip": 0.07,
+        "pager_start": 2.56,
+        "pool_take": 0.03,
+        "recv_state": 0.04,
+        "register": 0.1,
+        "route_wait": 0.0,
+        "snapshot_load": 22.43,
+        "total": 25.31,
+        "write_state": 0.05
+      },
+      "run": {
+        "announce": 0.06,
+        "cgroup_rename": 0.04,
+        "claim_ip": 0.05,
+        "guest_net": 3.9,
+        "hot_take": 0.04,
+        "register": 0.01,
+        "resume": 1.5,
+        "route": 0.25,
+        "total": 5.85
+      }
+    },
+    {
+      "hot": true,
+      "migrate": {
+        "background_pull": 293.88,
+        "checkpoint": 10.16,
+        "downtime": 58.72,
+        "read_state": 0.04,
+        "reroute": 0.13,
+        "send_state": 0.72,
+        "target": 47.8,
+        "total": 58.86
+      },
+      "migrate_target": {
+        "cgroup_rename": 0.03,
+        "claim_ip": 0.11,
+        "pager_start": 3.0,
+        "pool_take": 0.03,
+        "recv_state": 0.13,
+        "register": 0.11,
+        "route_wait": 0.01,
+        "snapshot_load": 42.96,
+        "total": 46.43,
+        "write_state": 0.06
+      },
+      "run": {
+        "announce": 0.13,
+        "cgroup_rename": 0.04,
+        "claim_ip": 0.04,
+        "guest_net": 4.69,
+        "hot_take": 0.04,
+        "register": 0.01,
+        "resume": 1.72,
+        "route": 0.29,
+        "total": 6.96
+      }
+    },
+    {
+      "hot": true,
+      "migrate": {
+        "background_pull": 306.13,
+        "checkpoint": 7.74,
+        "downtime": 41.79,
+        "read_state": 0.04,
+        "reroute": 0.12,
+        "send_state": 0.56,
+        "target": 33.46,
+        "total": 41.91
+      },
+      "migrate_target": {
+        "cgroup_rename": 0.03,
+        "claim_ip": 0.08,
+        "pager_start": 2.36,
+        "pool_take": 0.03,
+        "recv_state": 0.16,
+        "register": 0.13,
+        "route_wait": 0.01,
+        "snapshot_load": 29.79,
+        "total": 32.64,
+        "write_state": 0.05
+      },
+      "run": {
+        "announce": 0.27,
+        "cgroup_rename": 0.04,
+        "claim_ip": 0.04,
+        "guest_net": 5.57,
+        "hot_take": 0.03,
+        "register": 0.01,
+        "resume": 0.79,
+        "route": 0.41,
+        "total": 7.17
+      }
+    },
+    {
+      "hot": true,
+      "migrate": {
+        "background_pull": 339.39,
+        "checkpoint": 12.49,
+        "downtime": 54.06,
+        "read_state": 0.05,
+        "reroute": 0.49,
+        "send_state": 0.77,
+        "target": 40.76,
+        "total": 54.55
+      },
+      "migrate_target": {
+        "cgroup_rename": 0.05,
+        "claim_ip": 0.08,
+        "pager_start": 2.47,
+        "pool_take": 0.08,
+        "recv_state": 0.35,
+        "register": 0.11,
+        "route_wait": 0.0,
+        "snapshot_load": 36.48,
+        "total": 39.72,
+        "write_state": 0.1
+      },
+      "run": {
+        "announce": 0.17,
+        "cgroup_rename": 0.04,
+        "claim_ip": 0.04,
+        "guest_net": 5.53,
+        "hot_take": 0.03,
+        "register": 0.01,
+        "resume": 1.26,
+        "route": 0.28,
+        "total": 7.36
+      }
+    },
+    {
+      "hot": true,
+      "migrate": {
+        "background_pull": 347.77,
+        "checkpoint": 10.97,
+        "downtime": 67.21,
+        "read_state": 0.05,
+        "reroute": 0.04,
+        "send_state": 0.62,
+        "target": 55.56,
+        "total": 67.25
+      },
+      "migrate_target": {
+        "cgroup_rename": 0.04,
+        "claim_ip": 0.11,
+        "pager_start": 2.05,
+        "pool_take": 0.03,
+        "recv_state": 0.1,
+        "register": 0.2,
+        "route_wait": 0.01,
+        "snapshot_load": 48.73,
+        "total": 51.36,
+        "write_state": 0.09
+      },
+      "run": {
+        "announce": 0.09,
+        "cgroup_rename": 0.04,
+        "claim_ip": 0.04,
+        "guest_net": 4.57,
+        "hot_take": 0.03,
+        "register": 0.01,
+        "resume": 0.73,
+        "route": 0.36,
+        "total": 5.87
+      }
+    },
+    {
+      "hot": true,
+      "migrate": {
+        "background_pull": 321.51,
+        "checkpoint": 10.61,
+        "downtime": 45.8,
+        "read_state": 0.03,
+        "reroute": 0.09,
+        "send_state": 0.59,
+        "target": 34.57,
+        "total": 45.88
+      },
+      "migrate_target": {
+        "cgroup_rename": 0.03,
+        "claim_ip": 0.07,
+        "pager_start": 2.22,
+        "pool_take": 0.02,
+        "recv_state": 0.15,
+        "register": 0.14,
+        "route_wait": 0.01,
+        "snapshot_load": 31.07,
+        "total": 33.77,
+        "write_state": 0.06
+      },
+      "run": {
+        "announce": 0.4,
+        "cgroup_rename": 0.04,
+        "claim_ip": 0.04,
+        "guest_net": 4.13,
+        "hot_take": 0.03,
+        "register": 0.01,
+        "resume": 0.7,
+        "route": 0.37,
+        "total": 5.73
+      }
+    },
+    {
+      "hot": true,
+      "migrate": {
+        "background_pull": 285.78,
+        "checkpoint": 10.43,
+        "downtime": 46.08,
+        "read_state": 0.04,
+        "reroute": 0.11,
+        "send_state": 0.67,
+        "target": 34.94,
+        "total": 46.18
+      },
+      "migrate_target": {
+        "cgroup_rename": 0.07,
+        "claim_ip": 0.07,
+        "pager_start": 2.31,
+        "pool_take": 0.04,
+        "recv_state": 0.1,
+        "register": 0.13,
+        "route_wait": 0.01,
+        "snapshot_load": 31.25,
+        "total": 34.01,
+        "write_state": 0.05
+      },
+      "run": {
+        "announce": 0.37,
+        "cgroup_rename": 0.04,
+        "claim_ip": 0.04,
+        "guest_net": 5.41,
+        "hot_take": 0.03,
+        "register": 0.01,
+        "resume": 0.68,
+        "route": 0.32,
+        "total": 6.9
+      }
+    }
+  ],
+  "summary_ms": {
+    "migrate": {
+      "background_pull": {
+        "max": 347.77,
+        "p50": 292.33,
+        "p90": 339.39,
+        "p99": 347.77
+      },
+      "checkpoint": {
+        "max": 12.49,
+        "p50": 10.61,
+        "p90": 12.07,
+        "p99": 12.49
+      },
+      "downtime": {
+        "max": 67.21,
+        "p50": 45.97,
+        "p90": 58.72,
+        "p99": 67.21
+      },
+      "read_state": {
+        "max": 0.05,
+        "p50": 0.04,
+        "p90": 0.05,
+        "p99": 0.05
+      },
+      "reroute": {
+        "max": 0.49,
+        "p50": 0.12,
+        "p90": 0.18,
+        "p99": 0.49
+      },
+      "send_state": {
+        "max": 0.83,
+        "p50": 0.67,
+        "p90": 0.8,
+        "p99": 0.83
+      },
+      "target": {
+        "max": 55.56,
+        "p50": 34.94,
+        "p90": 47.8,
+        "p99": 55.56
+      },
+      "total": {
+        "max": 67.25,
+        "p50": 46.12,
+        "p90": 58.86,
+        "p99": 67.25
+      }
+    },
+    "migrate_target": {
+      "cgroup_rename": {
+        "max": 0.07,
+        "p50": 0.03,
+        "p90": 0.05,
+        "p99": 0.07
+      },
+      "claim_ip": {
+        "max": 0.11,
+        "p50": 0.08,
+        "p90": 0.11,
+        "p99": 0.11
+      },
+      "pager_start": {
+        "max": 3.43,
+        "p50": 2.45,
+        "p90": 3.25,
+        "p99": 3.43
+      },
+      "pool_take": {
+        "max": 0.08,
+        "p50": 0.03,
+        "p90": 0.04,
+        "p99": 0.08
+      },
+      "recv_state": {
+        "max": 0.35,
+        "p50": 0.16,
+        "p90": 0.29,
+        "p99": 0.35
+      },
+      "register": {
+        "max": 0.93,
+        "p50": 0.12,
+        "p90": 0.2,
+        "p99": 0.93
+      },
+      "route_wait": {
+        "max": 0.04,
+        "p50": 0.01,
+        "p90": 0.01,
+        "p99": 0.04
+      },
+      "snapshot_load": {
+        "max": 48.73,
+        "p50": 31.07,
+        "p90": 42.96,
+        "p99": 48.73
+      },
+      "total": {
+        "max": 51.36,
+        "p50": 34.01,
+        "p90": 46.43,
+        "p99": 51.36
+      },
+      "write_state": {
+        "max": 0.1,
+        "p50": 0.06,
+        "p90": 0.09,
+        "p99": 0.1
+      }
+    },
+    "run": {
+      "announce": {
+        "max": 0.4,
+        "p50": 0.13,
+        "p90": 0.37,
+        "p99": 0.4
+      },
+      "cgroup_rename": {
+        "max": 0.31,
+        "p50": 0.04,
+        "p90": 0.05,
+        "p99": 0.31
+      },
+      "claim_ip": {
+        "max": 0.05,
+        "p50": 0.04,
+        "p90": 0.05,
+        "p99": 0.05
+      },
+      "guest_net": {
+        "max": 8.06,
+        "p50": 4.75,
+        "p90": 7.82,
+        "p99": 8.06
+      },
+      "hot_take": {
+        "max": 0.04,
+        "p50": 0.03,
+        "p90": 0.04,
+        "p99": 0.04
+      },
+      "register": {
+        "max": 0.01,
+        "p50": 0.01,
+        "p90": 0.01,
+        "p99": 0.01
+      },
+      "resume": {
+        "max": 8.94,
+        "p50": 1.26,
+        "p90": 5.4,
+        "p99": 8.94
+      },
+      "route": {
+        "max": 1.07,
+        "p50": 0.35,
+        "p90": 0.73,
+        "p99": 1.07
+      },
+      "total": {
+        "max": 17.63,
+        "p50": 6.96,
+        "p90": 11.16,
+        "p99": 17.63
+      }
+    },
+    "run_hot_pool_hits": 15
+  }
+}

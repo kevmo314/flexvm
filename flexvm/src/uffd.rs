@@ -54,8 +54,9 @@ pub const REMOTE: u8 = 3;
 pub const INFLIGHT: u8 = 4;
 pub const DISCARDED: u8 = 5;
 
-/// Pages copied per fault from the template, to cut down on round trips.
-const FAULT_AROUND: usize = 16;
+/// Pages copied per fault from the template, to cut down on round trips,
+/// once faults run sequentially (see `Pager::template_next`).
+pub const FAULT_AROUND: usize = 16;
 /// Pages claimed per prefetch copy; faults on them wait for it.
 const PREFETCH_RUN: usize = 256;
 /// Pages fetched per remote fault.
@@ -154,6 +155,9 @@ pub struct Source {
     pub addr: String,
     pub vm: String,
     pub mig: u64,
+    /// The source's guest memory regions as `(offset, size)`; the target's
+    /// must be the same, or the page map would not cover the saved state.
+    pub regions: Vec<(u64, u64)>,
 }
 
 /// Where a VM's REMOTE pages come from.
@@ -423,6 +427,11 @@ pub struct Pager {
     done: (Mutex<()>, Condvar),
     /// Set by the checkpoint barrier: no new prefetch.
     quiesce: AtomicBool,
+    /// The page after the last template fault. Only a fault there (a
+    /// sequential scan) copies `FAULT_AROUND` pages: strided reads, like the
+    /// guest walking the page structs of its free memory, would otherwise
+    /// pull in sixteen times what they touch.
+    template_next: AtomicUsize,
     failed: OnceLock<String>,
     stop: AtomicBool,
     /// The fault-serving thread, joined by `join`.
@@ -499,6 +508,7 @@ impl Pager {
             pull_finished: OnceLock::new(),
             done: (Mutex::new(()), Condvar::new()),
             quiesce: AtomicBool::new(false),
+            template_next: AtomicUsize::new(usize::MAX),
             failed: OnceLock::new(),
             stop: AtomicBool::new(false),
             thread: Mutex::new(None),
@@ -635,6 +645,12 @@ impl Pager {
             initial.take()
         };
         if let Some((runs, origin)) = initial {
+            if let Origin::Peer(source) = &origin {
+                let ours = regions(&mappings);
+                if source.regions != ours {
+                    bail!("guest memory regions {ours:?} differ from the source's {:?}", source.regions);
+                }
+            }
             let _ = self.pull_started.set(Instant::now());
             let remote = remote_pages(&runs, total)?;
             for (first, count, state) in runs {
@@ -947,6 +963,11 @@ impl Pager {
         self.remote_left.load(Ordering::SeqCst)
     }
 
+    /// Guest memory regions as `(offset, size)`, in Firecracker's order.
+    pub fn regions(&self) -> Vec<(u64, u64)> {
+        regions(self.mappings())
+    }
+
     fn mappings(&self) -> &[Mapping] {
         self.mappings.get().map(|m| m.as_slice()).unwrap_or(&[])
     }
@@ -1215,9 +1236,14 @@ impl Pager {
                 // BASE or ZERO: serve a run of neighbours with the same source.
                 let from_template = state == BASE && self.base.has_data(page);
                 let same = |p: usize| state == ZERO || self.base.has_data(p) == from_template;
-                let n = pages.claim(page, FAULT_AROUND.min(region_left), state, same);
+                let sequential = !from_template || self.template_next.load(Ordering::Relaxed) == page;
+                let around = if sequential { FAULT_AROUND } else { 1 };
+                let n = pages.claim(page, around.min(region_left), state, same);
                 if n == 0 {
                     return Err(eagain());
+                }
+                if from_template {
+                    self.template_next.store(page + n, Ordering::Relaxed);
                 }
                 let src = |p: usize, c: usize| from_template.then(|| self.base.pages(p, c));
                 pages.install(page, n, state, None, |p, c| self.populate(p, c, src(p, c))).1
@@ -1976,6 +2002,10 @@ fn fatal(e: &io::Error) -> bool {
 
 /// Checks page runs from a migration source (ascending, disjoint, in bounds,
 /// and only states a source exports) and counts their REMOTE pages.
+fn regions(mappings: &[Mapping]) -> Vec<(u64, u64)> {
+    mappings.iter().map(|m| (m.offset, m.size as u64)).collect()
+}
+
 fn remote_pages(runs: &Runs, total: usize) -> Result<usize> {
     let (mut next, mut remote) = (0, 0);
     for &(first, count, state) in runs {

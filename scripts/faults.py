@@ -85,7 +85,7 @@ def fault(host, f, ms):
 
 
 FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_before_run", "restore_after_run",
-          "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "resume_kill",
+          "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "ckpt_crawl", "resume_kill",
           "prepare_fail", "short_incoming", "slow_preload", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
           "hot_low_estimate", "started_fsync", "started_unmark")
 
@@ -100,9 +100,9 @@ def disarm():
             check(f"disarm on {h}", False, repr(e))
 
 
-def setup(name, host=None, mib=200):
+def setup(name, host=None, mib=200, template=None):
     host = host or A
-    ok(host, {"op": "run", "name": name, "template": args.template})
+    ok(host, {"op": "run", "name": name, "template": template or args.template})
     code, out = sh(host, name, f"dd if=/dev/urandom of=/tmp/f bs=1M count={mib} 2>/dev/null; md5sum /tmp/f")
     assert code == 0, out
     return out.split()[0]
@@ -1357,6 +1357,66 @@ def cow_exact():
     rm_ckpt(path)
 
 
+def cow_grow():
+    """A guest that needs more memory while a copy-on-write checkpoint of it
+    is being copied gets it (growing does not wait for the copy): it fills
+    2 GiB more than it had without an OOM, the checkpoint completes, and it
+    holds exactly the memory and size at the pause. COW_GROW_TEMPLATE picks
+    a template with little or nothing pre-plugged, so the guest must grow."""
+    n, path = "ft-cow-grow", ckpt_path("ft-cow-grow")
+    m = setup(n, mib=600, template=os.environ.get("COW_GROW_TEMPLATE"))
+    v = vms(A)[n]
+    plugged0, fill = v["plugged_mib"], v["guest_mib"] + 2048
+    fault(A, "ckpt_memhash", 300000)
+    fault(A, "ckpt_crawl", 300000)
+    res, seen = {}, {"max": plugged0, "copying": False}
+    t = threading.Thread(target=lambda: res.update(r=rpc(A, {"op": "checkpoint", "name": n, "dir": path}, timeout=600)))
+    t.start()
+    copying = wait_for(lambda: vms(A).get(n, {}).get("checkpoint_copy") and vms(A)[n]["state"] == "running", 60)
+    check("cow grow: copy runs in the background", copying, vms(A).get(n))
+    stop = threading.Event()
+
+    def watch():
+        while not stop.is_set():
+            try:
+                v = vms(A).get(n, {})
+                if v.get("checkpoint_copy"):
+                    seen["copying"] = True
+                    seen["max"] = max(seen["max"], v.get("plugged_mib") or 0)
+            except (OSError, AssertionError):
+                pass
+            time.sleep(0.2)
+
+    w = threading.Thread(target=watch)
+    w.start()
+    code, out = sh(A, n, f"python3 -c 'l=[bytearray(64<<20) for _ in range({fill}//64)]; print(len(l)*64)'")
+    still = vms(A).get(n, {}).get("checkpoint_copy")
+    stop.set()
+    w.join()
+    check("cow grow: the guest filled 2 GiB more than it had, no OOM", code == 0 and out == str(fill // 64 * 64), (code, out[-200:]))
+    check("cow grow: it grew while the copy ran", seen["max"] >= plugged0 + 1024, (plugged0, seen))
+    print(f"cow grow: plugged {plugged0} -> {seen['max']} MiB during the copy; copy still running after the fill: {still}")
+    t.join()
+    fault(A, "ckpt_crawl", 0)
+    fault(A, "ckpt_memhash", 0)
+    r = res.get("r", {})
+    check("cow grow: checkpoint written", r.get("ok"), r)
+    if r.get("ok"):
+        r = r["result"]
+        h = ok(A, {"op": "ckhash", "dir": path})
+        check("cow grow: checkpoint == memory at the pause", h["hash"] == r["pause_memhash"], (h["hash"], r["pause_memhash"]))
+        ok(B, {"op": "restore", "dir": path, "name": "ft-cow-grow2", "ip": "auto"})
+        check("cow grow: restored at the size it had at the pause", vms(B)["ft-cow-grow2"]["plugged_mib"] == plugged0,
+              (plugged0, vms(B)["ft-cow-grow2"]["plugged_mib"]))
+        check("cow grow: restored file intact", md5(B, "ft-cow-grow2") == m)
+        code, out = sh(B, "ft-cow-grow2", "python3 -c 'b=bytearray(512<<20); print(len(b)>>20)'")
+        check("cow grow: restored guest can use memory", code == 0 and out == "512", out)
+    check("cow grow: original still running, file intact", where(n) == {A: "running"} and md5(A, n) == m, where(n))
+    cleanup(n)
+    cleanup("ft-cow-grow2")
+    rm_ckpt(path)
+
+
 def cow_abort():
     """A copy that fails half way (and one that a kill cuts short) publishes
     nothing; the VM runs on unharmed, and the next checkpoint is complete."""
@@ -1676,14 +1736,16 @@ def ckpt_dir_moved():
 # --- two-step migration (migrate_in) ---------------------------------------
 
 
-def migrate_in_raw(host, name, ip, template_id, template=None):
-    """Asks `host` to prepare an incoming migration as a source would.
+def migrate_in_raw(host, name, ip, source, template=None):
+    """Asks `host` to prepare an incoming migration as a source would, for a
+    VM like `source` (its template id and memory regions, from `source_vm`).
     Returns the open socket and the prepare reply."""
+    template_id, regions = source
     h, port = host.rsplit(":", 1)
     s = socket.create_connection((h, int(port)), timeout=60)
     mig = int.from_bytes(os.urandom(6), "little")
     req = {"op": "migrate_in", "name": name, "mig": mig, "template": template or args.template, "id": template_id,
-           "ip": ip, "source": A}
+           "ip": ip, "source": A, "regions": regions}
     s.sendall((json.dumps(req) + "\n").encode())
     buf = b""
     while not buf.endswith(b"\n"):
@@ -1703,18 +1765,19 @@ def nothing_left(label, name, ip):
     rpc(B, {"op": "kill", "name": name})
 
 
-def template_id():
+def source_vm():
+    """The template id and memory regions a source would send for a VM of the template."""
     n = "ft-tplid"
     ok(A, {"op": "run", "name": n, "template": args.template})
-    tid = vms(A)[n]["template_id"]
+    v = vms(A)[n]
     rpc(A, {"op": "kill", "name": n})
-    return tid
+    return v["template_id"], v["regions"]
 
 
 def prepare_disconnect():
     """A source that goes away after the target prepared leaves nothing behind."""
     n, ip = "ft-prep-gone", "10.250.0.7"
-    s, r, mig = migrate_in_raw(B, n, ip, template_id())
+    s, r, mig = migrate_in_raw(B, n, ip, source_vm())
     check("prepare disconnect: target prepared", r.get("ok"), r)
     info = ok(B, {"op": "info"})
     check("prepare disconnect: address held while prepared", ip in info["ips"], (info["ips"], vms(B).get(n)))
@@ -1729,7 +1792,7 @@ def prepare_trickle():
     `short_incoming`), however much it keeps sending."""
     n, ip = "ft-prep-trickle", "10.250.0.8"
     fault(B, "short_incoming", 30000)
-    s, r, _ = migrate_in_raw(B, n, ip, template_id())
+    s, r, _ = migrate_in_raw(B, n, ip, source_vm())
     check("prepare trickle: target prepared", r.get("ok"), r)
     start, cut = time.time(), False
     try:
@@ -1955,7 +2018,83 @@ def hot_budget():
     start_daemon(A, argv, env)
 
 
-SCENARIOS = dict(basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, refused=refused, pages_blip=pages_blip,
+def plug_race():
+    """Migrations that start right after a memory hot-plug (or unplug) was
+    requested: the plug settles first (or, if it stalls, is cut down to what
+    the guest managed), and the VM ends up on B with all its memory usable.
+    PLUG_TEMPLATE picks the template; one snapshotted with nothing plugged
+    makes the first step plug into a slot that was never mapped."""
+    n = "ft-plug-race"
+    m = setup(n, mib=50, template=os.environ.get("PLUG_TEMPLATE"))
+    # (from, to, MiB to plug, delay before migrating); the last one is more
+    # than the guest can online quickly, so the migration has to cut it short.
+    steps = [(A, B, 384, 0), (B, A, 1024, 0), (A, B, 2048, 0.05), (B, A, -1024, 0), (A, B, 384, 0.2),
+             (B, A, 1024, 0.1), (A, B, 12288, 0), (B, A, None, 0)]
+    for i, (src, dst, delta, gap) in enumerate(steps):
+        v = vms(src)[n]
+        if delta is None:  # everything: takes the guest longer than a migration waits
+            delta = v["max_mib"] - (v["guest_mib"] - v["plugged_mib"]) - v["plugged_mib"]
+        want = v["plugged_mib"] + delta
+        ok(src, {"op": "hotplug", "name": n, "mib": want})
+        time.sleep(gap)
+        r = rpc(src, {"op": "migrate", "name": n, "to": dst})
+        check(f"plug race {i}: migrate succeeds", r["ok"], r.get("error"))
+        st = wait_released(dst, n, timeout=60)
+        check(f"plug race {i}: pull finished and released", st["released"] is True and st["failed"] is None, st)
+        check(f"plug race {i}: only on target, running", where(n) == {dst: "running"}, where(n))
+        hp = lambda: (vms(dst)[n]["requested_mib"], vms(dst)[n]["plugged_mib"])
+        settled = wait_for(lambda: hp()[0] == hp()[1] and (delta > 8192 or hp()[1] == want), 15)
+        check(f"plug race {i}: hot-plug settled on target", settled, (want, hp()))
+        check(f"plug race {i}: md5 intact", md5(dst, n) == m)
+        code, out = sh(dst, n, "python3 -c 'b=bytearray(512<<20); print(len(b)>>20)'")
+        check(f"plug race {i}: guest can use its memory", code == 0 and out == "512", out)
+        code, out = sh(dst, n, "grep MemTotal /proc/meminfo")
+        print(f"plug race {i}: {hp()} {out}", flush=True)
+    cleanup(n)
+
+
+def plug_storm():
+    """The memory controller keeps resizing (here: a hot-plug request every
+    20 ms, up and down) while the VM migrates back and forth. Resizes and
+    migrations must not interleave: every migration lands intact."""
+    n = "ft-plug-storm"
+    m = setup(n, mib=50, template=os.environ.get("PLUG_TEMPLATE"))
+    stop = threading.Event()
+
+    def storm():
+        up = True
+        while not stop.is_set():
+            for h in (A, B):
+                try:
+                    v = vms(h).get(n)
+                    if v and v["state"] == "running" and v["plugged_mib"] is not None:
+                        rpc(h, {"op": "hotplug", "name": n, "mib": max(0, v["plugged_mib"] + (512 if up else -512))}, timeout=10)
+                        up = not up
+                except (OSError, AssertionError, KeyError):
+                    pass
+            time.sleep(0.02)
+
+    t = threading.Thread(target=storm)
+    t.start()
+    for i, (src, dst) in enumerate([(A, B), (B, A)] * 3):
+        r = rpc(src, {"op": "migrate", "name": n, "to": dst})
+        check(f"plug storm {i}: migrate succeeds", r["ok"], r.get("error"))
+        st = wait_released(dst, n, timeout=60)
+        check(f"plug storm {i}: pull finished and released", st["released"] is True and st["failed"] is None, st)
+        check(f"plug storm {i}: only on target, running", where(n) == {dst: "running"}, where(n))
+    stop.set()
+    t.join()
+    w = where(n)
+    check("plug storm: only on one host, running", list(w.values()) == ["running"], (w, {h: vms(h).get(n) for h in (A, B)}))
+    dst = B if w.get(B) == "running" else A
+    got = md5(dst, n)
+    check("plug storm: md5 intact", got == m, (dst, got))
+    code, out = sh(dst, n, "python3 -c 'b=bytearray(512<<20); print(len(b)>>20)'")
+    check("plug storm: guest can use its memory", code == 0 and out == "512", out)
+    cleanup(n)
+
+
+SCENARIOS = dict(plug_race=plug_race, plug_storm=plug_storm, cow_grow=cow_grow, basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, refused=refused, pages_blip=pages_blip,
                  pages_dead_restore=pages_dead_restore, pages_dead=pages_dead, resume_kill=resume_kill, prepared_retry=prepared_retry, quiet_source=quiet_source,
                  shared_run_dir=shared_run_dir, exec_race=exec_race, guest_calls=guest_calls, source_killed=source_killed,
                  target_restart=target_restart, target_restart_symlink=target_restart_symlink, guest_hang=guest_hang,

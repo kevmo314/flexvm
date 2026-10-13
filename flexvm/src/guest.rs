@@ -12,6 +12,8 @@ use crate::bail;
 use crate::util::{By, Result};
 
 pub const PORT: u32 = 52;
+/// Host port the guest connects to when it needs memory now (guest/src/mem.rs).
+pub const MEM_PORT: u32 = 53;
 pub const FRAME_STDOUT: u8 = 1;
 pub const FRAME_STDERR: u8 = 2;
 pub const FRAME_EXIT: u8 = 3;

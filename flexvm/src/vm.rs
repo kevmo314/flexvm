@@ -145,6 +145,13 @@ pub struct Vm {
     /// Free page reports may be held in Firecracker: a hold was sent and no
     /// release has landed since (see `hold_reports`).
     reports_held: AtomicBool,
+    /// Whether the daemon serves this VM's memory requests (see `Daemon::watch_memory`).
+    pub mem_watched: AtomicBool,
+    /// True while a copy-on-write checkpoint copies this VM's memory with
+    /// the VM running: its reservation is held, but it may still grow (not
+    /// shrink). Resizes then hold this lock, and the checkpoint takes it to
+    /// end the copy, so none is in progress once the reservation goes.
+    pub cow_copy: Mutex<bool>,
     /// Migration target only: the source's answer to `release`, true or an error.
     pub released: OnceLock<Value>,
     /// Host ends of exec sessions, by id, so a checkpoint can close them.
@@ -310,6 +317,8 @@ impl Vm {
             last_resize: Mutex::new(Instant::now()),
             starved: AtomicBool::new(false),
             reports_held: AtomicBool::new(false),
+            mem_watched: AtomicBool::new(false),
+            cow_copy: Mutex::new(false),
             released: OnceLock::new(),
             execs: Mutex::new(HashMap::new()),
             devices: Mutex::new(()),
@@ -329,6 +338,11 @@ impl Vm {
 
     pub fn vsock(&self) -> PathBuf {
         self.vsock.clone()
+    }
+
+    /// Where Firecracker forwards the guest's connections to host port `MEM_PORT`.
+    pub fn mem_sock(&self) -> PathBuf {
+        PathBuf::from(format!("{}_{}", self.vsock.display(), crate::guest::MEM_PORT))
     }
 
     pub fn state(&self) -> State {
@@ -858,6 +872,8 @@ impl Vm {
         self.pager.kill_firecracker();
         let Some(mut fc) = self.fc.lock().unwrap().take() else { return };
         fc.kill();
+        // Wake the daemon's listener for guest memory requests so it sees the VM is gone.
+        let _ = std::os::unix::net::UnixStream::connect(self.mem_sock());
         self.pager.join();
         crate::fc::release(&self.tap, self.cgroup.as_deref(), &self.dir);
     }
@@ -873,11 +889,14 @@ impl Vm {
             "pid": self.pid(),
             "template": self.template.name,
             "template_id": self.template.meta.id,
+            "regions": self.pager.regions(),
             "state": self.state().name(),
             "vcpus": self.template.meta.vcpus,
             "rss_mib": self.rss() >> 20,
             "guest_mib": self.template.meta.mem_mib + hotplug["plugged_size_mib"].as_u64().unwrap_or(0),
             "max_mib": self.template.meta.max_mib,
+            "plugged_mib": hotplug["plugged_size_mib"],
+            "requested_mib": hotplug["requested_size_mib"],
             "pages_mib": {"base": mib(base), "present": mib(present), "zero": mib(zero), "remote": mib(remote + inflight + discarded)},
             "checkpoint_copy": self.pager.copying(),
             "write_tracking": self.pager.tracking(),

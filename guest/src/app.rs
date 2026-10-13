@@ -282,7 +282,9 @@ impl CheckGroup {
                 return Err(io::Error::other(format!("mount cgroup2: {}", io::Error::last_os_error())));
             }
         }
-        let dir = format!("{ROOT}/flexvm-check-{}", NEXT.fetch_add(1, Ordering::Relaxed));
+        // Under the guest's memory mark, like the app (see mem.rs).
+        let parent = crate::mem::parent().unwrap_or(ROOT);
+        let dir = format!("{parent}/flexvm-check-{}", NEXT.fetch_add(1, Ordering::Relaxed));
         std::fs::create_dir(&dir).map_err(|e| io::Error::other(format!("create {dir}: {e}")))?;
         Self::from_dir(dir)
     }
@@ -386,7 +388,8 @@ fn start(statuses: &Statuses) -> io::Result<i32> {
     // Keep the app from reading flexvm-init's memory or ptracing it (a root
     // app with CAP_SYS_PTRACE still can: root in the guest owns the guest).
     unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
-    restrict(&mut cmd, &c, None);
+    // Into the throttled group before dropping privileges (see mem.rs).
+    restrict(&mut cmd, &c, crate::mem::work_procs());
     let mut child = spawn(&mut cmd, statuses, true).map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", c.argv[0])))?;
     let pid = child.id() as i32;
     app.state = State::Running(pid);

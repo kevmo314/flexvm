@@ -25,6 +25,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 mod app;
+mod mem;
 mod net;
 mod session;
 
@@ -55,6 +56,7 @@ fn main() {
         if let Err(e) = net::setup() {
             log(&format!("network setup failed: {e}"));
         }
+        mem::start();
     }
     let statuses: Statuses = Arc::new((Mutex::new(HashMap::new()), Condvar::new()));
     {
@@ -187,6 +189,7 @@ fn reap(statuses: Statuses) {
 }
 
 fn spawn(command: &mut Command, statuses: &Statuses, deliver_exit: bool) -> io::Result<Child> {
+    mem::contain(command);
     let (lock, cv) = &**statuses;
     // Hold the lock through spawn and registration, even if the child exits immediately.
     let mut map = lock.lock().unwrap();

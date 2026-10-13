@@ -257,8 +257,8 @@ impl Cow {
 pub struct CowPages<'a> {
     pub guest: &'a dyn GuestPages,
     pub cow: &'a Cow,
-    /// Test fault `ckpt_slow`: take a while over each unit.
-    pub slow: bool,
+    /// Test faults `ckpt_slow` and `ckpt_crawl`: wait this long over each unit.
+    pub slow: Duration,
 }
 
 impl GuestPages for CowPages<'_> {
@@ -268,9 +268,7 @@ impl GuestPages for CowPages<'_> {
 
     fn read(&self, page: usize, buf: &mut [u8]) -> Result<()> {
         let cow = self.cow;
-        if self.slow {
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        std::thread::sleep(self.slow);
         if !cow.active() {
             crate::bail!("the checkpoint copy stopped: {}", cow.error().unwrap_or_else(|| "the vm is gone".into()));
         }
@@ -369,7 +367,7 @@ mod tests {
         // Page 5 is being saved by a fault while the writer gets there.
         assert!(cow.claim(5, PENDING, RESCUING));
         assert!(!cow.claim(5, PENDING, READING), "one saver per page");
-        let pages = CowPages { guest: &live, cow: &cow, slow: false };
+        let pages = CowPages { guest: &live, cow: &cow, slow: Duration::ZERO };
         let mut buf = vec![0u8; 8 * PAGE_SIZE];
         std::thread::scope(|s| {
             s.spawn(|| {
@@ -425,7 +423,7 @@ mod tests {
             assert!(cow.claim(1, PENDING, RESCUING));
             cow.rescue(1, vec![1u8; PAGE_SIZE].into());
             let gate = Gate { entered: std::sync::Barrier::new(2), go: std::sync::Barrier::new(2) };
-            let pages = CowPages { guest: &gate, cow: &cow, slow: false };
+            let pages = CowPages { guest: &gate, cow: &cow, slow: Duration::ZERO };
             let mut buf = vec![0u8; 2 * PAGE_SIZE];
             let e = std::thread::scope(|s| {
                 let w = s.spawn(|| pages.read(0, &mut buf));

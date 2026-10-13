@@ -34,12 +34,29 @@ pub const BOOT_ARGS: &str = "console=ttyS0 quiet reboot=k panic=1 pci=off \
 pub const SLOT_MIB: u64 = 1024;
 /// Step the controller grows and shrinks guests by (MiB).
 pub const STEP_MIB: u64 = 128;
+/// Default boot memory (MiB) for a guest that may grow to `max_mib`. Hot-plugged
+/// memory is movable, so the kernel's own allocations, including the page
+/// structs of every hot-plugged block (1/64 of it), must fit in boot memory: a
+/// 256 MiB base runs out near 11 GiB plugged and the guest kernel OOMs. Boot
+/// memory the guest does not touch costs the host nothing either.
+pub fn base_mib(max_mib: u64) -> u64 {
+    (256 + max_mib / 32).div_ceil(STEP_MIB) * STEP_MIB
+}
+
+/// Hotplug memory a template is snapshotted with, so every VM starts with it
+/// plugged (MiB). Plugged memory the guest never touches costs the host
+/// nothing, so a burst of allocations right after `run` never waits on the
+/// host. The controller never shrinks a VM below this.
+pub const PLUG_MIB: u64 = 4096;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Meta {
     pub vcpus: u32,
     pub mem_mib: u64,
     pub max_mib: u64,
+    /// Hotplug memory plugged in the snapshot (MiB).
+    #[serde(default)]
+    pub plugged_mib: u64,
     pub kernel: PathBuf,
     pub rootfs: PathBuf,
     #[serde(default)]
@@ -526,7 +543,7 @@ fn record_working_set(paths: &Paths, name: &str, tap: &str, sockets: &Arc<Socket
     }
     guest::exec(&fc.sockets.vsock, "true")?;
     fc.pause()?;
-    let runs = pager.present_runs();
+    let runs = pad_runs(pager.present_runs(), crate::uffd::FAULT_AROUND as u64);
     pager.stop();
     drop(fc);
     let _ = std::fs::remove_dir_all(&run);
@@ -534,8 +551,71 @@ fn record_working_set(paths: &Paths, name: &str, tap: &str, sockets: &Arc<Socket
     Ok(runs.iter().map(|r| r.1 as usize).sum::<usize>() * PAGE_SIZE)
 }
 
+/// Widens each run to `align`-page boundaries (merging overlaps): a fresh VM
+/// touches pages near the recorded ones too, and prefetching them in bulk is
+/// cheaper than faulting them in one by one later.
+fn pad_runs(runs: Vec<(u64, u64)>, align: u64) -> Vec<(u64, u64)> {
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for (first, count) in runs {
+        let (start, end) = (first / align * align, (first + count).div_ceil(align) * align);
+        match out.last_mut() {
+            Some((f, n)) if start <= *f + *n => *n = end.max(*f + *n) - *f,
+            _ => out.push((start, end - start)),
+        }
+    }
+    out
+}
+
+/// Plugs `mib` of hotplug memory into a booted template VM and waits until
+/// the guest has onlined it. Returns the plugged size.
+fn plug(fc: &Firecracker, mib: u64) -> Result<u64> {
+    if mib == 0 {
+        return Ok(0);
+    }
+    fc.patch("/hotplug/memory", json!({"requested_size_mib": mib}))?;
+    retry(Duration::from_secs(60), || match fc.get("/hotplug/memory")?["plugged_size_mib"].as_u64() {
+        Some(p) if p == mib => Ok(()),
+        p => bail!("plugged {p:?} of {mib} MiB"),
+    })?;
+    Ok(mib)
+}
+
+/// Waits until the guest's free page reporting has gone quiet, so the memory
+/// just plugged and freed here is reported in the template rather than in
+/// every VM after restore (where reporting 4 GiB walks the page structs of all
+/// of it: ~64 MiB more RSS per VM). Done means 4 s without a report, after at
+/// least `expect_mib` were reported. Returns the MiB reported and whether it
+/// finished; the caller says so when it did not.
+fn wait_reporting_done(fc: &Firecracker, metrics: &Path, expect_mib: u64) -> Result<(u64, bool)> {
+    let (start, mut quiet, mut total, mut seen) = (Instant::now(), 0, 0u64, 0usize);
+    // Reporting starts 2 s after memory is freed and works through it in rounds.
+    while !(quiet >= 4 && total >> 20 >= expect_mib) && start.elapsed() < Duration::from_secs(120) {
+        std::thread::sleep(Duration::from_secs(1));
+        fc.put("/actions", json!({"action_type": "FlushMetrics"}))?;
+        let text = std::fs::read_to_string(metrics)?;
+        let mut freed = 0;
+        for line in text[seen..].lines() {
+            let m: serde_json::Value = serde_json::from_str(line).unwrap_or_default();
+            freed += m["balloon"]["free_page_report_freed"].as_u64().unwrap_or(0);
+        }
+        seen = text.len();
+        total += freed;
+        quiet = if freed == 0 { quiet + 1 } else { 0 };
+    }
+    Ok((total >> 20, quiet >= 4 && total >> 20 >= expect_mib))
+}
+
 /// Cold-boots a VM and snapshots it into `paths.templates/name`.
-pub fn create(paths: &Paths, name: &str, vcpus: u32, mem_mib: u64, max_mib: u64, image: Option<ImageMeta>) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+pub fn create(
+    paths: &Paths,
+    name: &str,
+    vcpus: u32,
+    mem_mib: u64,
+    max_mib: u64,
+    plug_mib: u64,
+    image: Option<ImageMeta>,
+) -> Result<()> {
     // Restores swap in each VM's own tap; this one only exists while building.
     let tap = format!("fvtpl{}", std::process::id());
     crate::net::create_tap(&tap)?;
@@ -543,7 +623,7 @@ pub fn create(paths: &Paths, name: &str, vcpus: u32, mem_mib: u64, max_mib: u64,
     // map the old files, which must not be truncated or rewritten under them.
     let staging = format!(".{name}.new-{}", std::process::id());
     let _ = std::fs::remove_dir_all(paths.templates.join(&staging));
-    let res = build(paths, &staging, name, vcpus, mem_mib, max_mib, &tap, image);
+    let res = build(paths, &staging, name, vcpus, mem_mib, max_mib, plug_mib, &tap, image);
     crate::net::delete_tap(&tap);
     let staged = paths.templates.join(&staging);
     let res = res.and_then(|()| publish(paths, name, &staged));
@@ -595,6 +675,7 @@ fn build(
     vcpus: u32,
     mem_mib: u64,
     max_mib: u64,
+    plug_mib: u64,
     tap: &str,
     image: Option<ImageMeta>,
 ) -> Result<()> {
@@ -610,6 +691,9 @@ fn build(
     let start = Instant::now();
     let fc = Firecracker::spawn(&paths.firecracker, &run, sockets.allocate()?, crate::fc::SPAWN_READY)?;
     let vsock = fc.sockets.vsock.clone();
+    let metrics = run.join("metrics.json");
+    File::create(&metrics)?;
+    fc.put("/metrics", json!({"metrics_path": metrics}))?;
     fc.put("/boot-source", json!({"kernel_image_path": paths.kernel, "boot_args": BOOT_ARGS}))?;
     fc.put("/machine-config", json!({"vcpu_count": vcpus, "mem_size_mib": mem_mib}))?;
     fc.put("/pmem/root", json!({"id": "root", "path_on_host": rootfs, "root_device": true, "read_only": true}))?;
@@ -630,6 +714,7 @@ fn build(
     fc.put("/actions", json!({"action_type": "InstanceStart"}))?;
     retry(Duration::from_secs(30), || guest::ping(&vsock))?;
     let booted = start.elapsed();
+    let plugged = plug(&fc, plug_mib.min(hotplug) / STEP_MIB * STEP_MIB)?;
 
     // Leave as little as possible in the snapshot.
     match &image {
@@ -644,6 +729,15 @@ fn build(
             guest::exec(&vsock, "sync; echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory")?;
         }
     }
+    // Nearly all of the plug is free and should be reported (the rest is the
+    // guest's own page structs and per-CPU lists).
+    let (reported, done) = wait_reporting_done(&fc, &metrics, plugged * 3 / 4)?;
+    if !done {
+        eprintln!(
+            "template {name}: free page reporting did not finish ({reported} MiB reported of {plugged} MiB \
+             plugged); VMs will report the rest after restore, at some RSS each"
+        );
+    }
     fc.pause()?;
     fc.put(
         "/snapshot/create",
@@ -657,6 +751,7 @@ fn build(
         vcpus,
         mem_mib,
         max_mib: mem_mib + hotplug,
+        plugged_mib: plugged,
         kernel: paths.kernel.clone(),
         rootfs,
         id: String::new(),
@@ -669,8 +764,8 @@ fn build(
     let wset = record_working_set(paths, staging, tap, &sockets)?;
     let size = std::fs::metadata(dir.join("mem"))?.len();
     println!(
-        "template {name} (id {}): {vcpus} vCPUs, {mem_mib} MiB base + {hotplug} MiB hotplug, booted in {} ms, \
-         memory file {} MiB ({} MiB of zeroes punched out), working set {} MiB",
+        "template {name} (id {}): {vcpus} vCPUs, {mem_mib} MiB base + {hotplug} MiB hotplug ({plugged} MiB plugged, \
+         {reported} MiB reported free), booted in {} ms, memory file {} MiB ({} MiB of zeroes punched out), working set {} MiB",
         meta.id,
         ms(booted),
         size >> 20,
@@ -684,6 +779,22 @@ fn build(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn working_set_runs_are_padded_and_merged() {
+        assert_eq!(pad_runs(vec![(3, 2), (17, 1), (20, 40), (100, 1)], 16), vec![(0, 64), (96, 16)]);
+        assert_eq!(pad_runs(vec![], 16), vec![]);
+    }
+
+    #[test]
+    fn boot_memory_holds_page_structs_for_the_ceiling() {
+        assert_eq!(base_mib(0), 256);
+        assert_eq!(base_mib(32000), 1280);
+        for max in [4096, 32000, 262144] {
+            // Page structs of a fully plugged region take 1/64 of it; leave as much again.
+            assert!(base_mib(max) >= 256 + max / 64 * 2, "{max}");
+        }
+    }
 
     struct Fixture {
         paths: Paths,
@@ -705,7 +816,7 @@ mod tests {
                 templates: dir.clone(),
             };
             let mut meta = Meta {
-                vcpus: 2, mem_mib: 256, max_mib: 1024,
+                vcpus: 2, mem_mib: 256, max_mib: 1024, plugged_mib: 0,
                 kernel: paths.kernel.clone(), rootfs: paths.rootfs.clone(),
                 id: String::new(), components: BTreeMap::new(), image: None,
             };

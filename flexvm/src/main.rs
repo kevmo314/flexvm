@@ -30,7 +30,8 @@ const USAGE: &str = "\
 flexvm: elastic Firecracker microVMs with post-copy live migration
 
 usage:
-  flexvm template NAME [--vcpus N] [--mem MIB] [--max MIB]   cold-boot and snapshot a template (root)
+  flexvm template NAME [--vcpus N] [--mem MIB] [--max MIB] [--plug MIB]
+                                                             cold-boot and snapshot a template (root)
                 [--image REF|ARCHIVE|DIR] [--entrypoint ARGV] [--cmd ARGV]
                 [--env K=V]... [--workdir DIR] [--user USER[:GROUP]]
                 [--warm [--ready-port N | --ready-cmd CMD] [--ready-timeout S]]
@@ -148,6 +149,7 @@ fn real_main() -> Result<()> {
             let cpus = (util::host_cpus() as u64).min(32);
             let cpus = if cpus > 1 { cpus & !1 } else { 1 };
             let host_mib = proc_kb("/proc/meminfo", "MemTotal").unwrap_or(0) >> 20;
+            let max = args.num("max", host_mib)?;
             let mut paths = paths()?;
             let image = image_options(&args)?
                 .map(|opts| {
@@ -163,8 +165,9 @@ fn real_main() -> Result<()> {
                 &paths,
                 name,
                 args.num("vcpus", cpus)? as u32,
-                args.num("mem", 256)?,
-                args.num("max", host_mib)?,
+                args.num("mem", template::base_mib(max))?,
+                max,
+                args.num("plug", template::PLUG_MIB)?,
                 image,
             )
         }
