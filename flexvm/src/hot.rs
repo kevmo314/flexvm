@@ -35,7 +35,7 @@ use crate::fc::{Idle, Pool};
 use crate::guest;
 use crate::template::Template;
 use crate::uffd::Pager;
-use crate::util::{Phases, Result, PAGE_SIZE};
+use crate::util::{Error, Phases, Result, PAGE_SIZE};
 use crate::vm::{name_cgroup, Vm};
 
 /// Host memory a paused VM costs beyond the template pages it prefetched (KiB).
@@ -110,25 +110,42 @@ impl Paused {
         self.idle.as_ref().map(|i| i.fc.pid())
     }
 
+    /// Whether its Firecracker still runs and its pager has not given up.
+    fn alive(&mut self) -> bool {
+        self.pager.failed().is_none() && self.idle.as_mut().is_some_and(|i| i.fc.alive())
+    }
+
     /// Turns this into the running VM `name` at `ip`: names its cgroup, routes
-    /// the address to its tap and resumes the vCPUs.
-    pub fn resume(mut self, name: &str, ip: Ipv4Addr, phases: &mut Phases) -> Result<Arc<Vm>> {
+    /// the address to its tap and resumes the vCPUs. On failure, the VM is
+    /// torn down, and the flag says whether the guest may have run for `name`:
+    /// unless the resume was never sent or Firecracker refused it. With
+    /// `kill` (test fault `resume_kill`), Firecracker is killed right after
+    /// the resume is sent.
+    pub fn resume(mut self, name: &str, ip: Ipv4Addr, kill: bool, phases: &mut Phases) -> std::result::Result<Arc<Vm>, (Error, bool)> {
         let (fc, dir, cgroup, tap) = self.idle.take().unwrap().into_parts();
         let idle = Idle { fc, dir, cgroup: name_cgroup(cgroup, name), tap };
         phases.mark("cgroup_rename");
+        let mut sent = false;
         let resumed = (|| {
             // Route before the guest can send anything; one netlink round trip.
             crate::net::attach(ip, &idle.tap)?;
             phases.mark("route");
-            idle.fc.request_within("PATCH", "/vm", Some(json!({"state": "Resumed"})), API_TIMEOUT)?;
+            sent = true;
+            let res = idle.fc.request_within("PATCH", "/vm", Some(json!({"state": "Resumed"})), API_TIMEOUT);
+            if kill {
+                self.pager.kill_firecracker();
+                bail!("injected fault: firecracker killed after the resume was sent");
+            }
+            res?;
             phases.mark("resume");
             Ok(())
         })();
         if let Err(e) = resumed {
+            let ran = sent && !crate::fc::rejected(&e);
             self.pager.stop();
             drop(idle);
             self.pager.join();
-            return Err(e);
+            return Err((e, ran));
         }
         Ok(Vm::assemble(name, self.template.clone(), idle, ip, self.pager.clone(), crate::vm::State::Running))
     }
@@ -228,19 +245,34 @@ impl HotPool {
     }
 
     /// Hands out a paused VM of `template`'s generation, or None if there is
-    /// none ready.
+    /// none ready. One whose Firecracker or pager died meanwhile is torn
+    /// down, never handed out.
     pub fn take(&self, template: &Arc<Template>) -> Option<Paused> {
         if self.per_template == 0 {
             return None;
         }
+        let mut dead = Vec::new();
         let got = {
             let mut s = self.state.lock().unwrap();
             if s.closed {
                 return None;
             }
-            s.stocks.get_mut(&template.key()).and_then(|k| k.ready.pop_front())
+            let stock = s.stocks.get_mut(&template.key())?;
+            loop {
+                match stock.ready.pop_front() {
+                    Some(mut p) => match p.alive() {
+                        true => break Some(p),
+                        false => dead.push(p),
+                    },
+                    None => break None,
+                }
+            }
         };
         self.wake.notify_one();
+        if !dead.is_empty() {
+            eprintln!("hot pool {}: dropping {} paused vms that died", template.name, dead.len());
+        }
+        drop(dead);
         got
     }
 

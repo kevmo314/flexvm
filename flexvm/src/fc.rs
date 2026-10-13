@@ -19,6 +19,24 @@ use crate::util::{retry, Result};
 /// Deadline for a Firecracker API call that does not pick its own.
 pub const API_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Firecracker answered a request with an error: it did not carry it out.
+#[derive(Debug)]
+pub struct Rejected(String);
+
+impl std::fmt::Display for Rejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Rejected {}
+
+/// Whether `e` is Firecracker's own refusal of a request (rather than, say,
+/// a connection that broke or timed out, after which it may have run).
+pub fn rejected(e: &crate::util::Error) -> bool {
+    e.downcast_ref::<Rejected>().is_some()
+}
+
 pub struct Firecracker {
     child: Child,
     pub sockets: Sockets,
@@ -112,13 +130,35 @@ impl Firecracker {
         let mut buf = vec![0u8; len];
         r.read_exact(&mut buf)?;
         let text = String::from_utf8_lossy(&buf);
+        if code == 0 {
+            bail!("firecracker {method} {path}: no status in the answer");
+        }
         if !(200..300).contains(&code) {
-            bail!("firecracker {method} {path}: {code} {text}");
+            return Err(Box::new(Rejected(format!("firecracker {method} {path}: {code} {text}"))));
         }
         if text.trim().is_empty() {
             return Ok(Value::Null);
         }
         Ok(serde_json::from_str(&text).unwrap_or(Value::String(text.into_owned())))
+    }
+
+    /// Whether the process is still running (it has not exited or been killed).
+    pub fn alive(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+
+    /// How Firecracker exited, if it has, and the end of its log: why a
+    /// request to it failed.
+    pub fn post_mortem(&mut self, dir: &Path) -> String {
+        let status = match self.child.try_wait() {
+            Ok(Some(st)) => format!("exited ({st})"),
+            Ok(None) => "still running".into(),
+            Err(e) => format!("unknown ({e})"),
+        };
+        let log = std::fs::read_to_string(dir.join("firecracker.log")).unwrap_or_default();
+        let tail: Vec<&str> = log.lines().rev().take(5).collect();
+        let tail: Vec<&str> = tail.into_iter().rev().collect();
+        format!("firecracker {} {status}; log: {}", self.pid(), tail.join(" | "))
     }
 
     pub fn kill(&mut self) {
@@ -240,16 +280,29 @@ impl Pool {
         }
     }
 
-    /// Hands out an idle Firecracker, or spawns one right away if none is ready.
+    /// Hands out an idle Firecracker, or spawns one right away if none is
+    /// ready. One that has died meanwhile is torn down, never handed out.
     pub fn take(&self) -> Result<Idle> {
+        let mut dead = Vec::new();
         let got = {
             let mut s = self.state.lock().unwrap();
             if s.closed {
                 bail!("daemon is shutting down");
             }
-            s.idle.pop()
+            loop {
+                match s.idle.pop() {
+                    Some(mut f) => match f.fc.alive() {
+                        true => break Some(f),
+                        false => dead.push(f),
+                    },
+                    None => break None,
+                }
+            }
         };
         self.wake.notify_one();
+        for mut f in dead {
+            eprintln!("pool: dropping a dead idle firecracker: {}", f.fc.post_mortem(&f.dir));
+        }
         match got {
             Some(f) => Ok(f),
             None => self.spawn(),

@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use crate::bail;
-use crate::fc::{Firecracker, Idle};
+use crate::fc::{Firecracker, Idle, Pool};
 use crate::template::{Template, BALLOON_STATS_S};
 
 /// How long resuming a paused migration target waits for its memory to arrive.
@@ -26,6 +26,67 @@ pub enum Load {
     /// with `resume_vm: false`: a migration target about to resume it once
     /// it owns the VM, and test fault `restore_no_hold`.
     PausedUnheld,
+    /// Test fault `resume_kill` only: `Running`, but Firecracker is killed
+    /// right after the resume request is sent, as if it crashed with the
+    /// guest already running.
+    RunningKilled,
+}
+
+impl Load {
+    fn running(self) -> bool {
+        matches!(self, Load::Running | Load::RunningKilled)
+    }
+}
+
+/// The vmstate a VM is restored from.
+#[derive(Clone, Copy)]
+pub enum Snapshot<'a> {
+    /// A file that stays put, such as a template's.
+    Path(&'a Path),
+    /// Bytes to write next to the Firecracker that loads them.
+    Bytes(&'a [u8]),
+}
+
+/// Firecracker's error for a snapshot saved without KVM's realtime clock,
+/// loaded with `clock_realtime`.
+const NO_REALTIME: &str = "clock_realtime requested but not present in the snapshot state";
+
+/// Why another load, on a fresh Firecracker, could succeed where one failed.
+/// Every load stops the vCPUs (`resume_vm: false`), so a failed one never ran
+/// the guest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Retry {
+    /// The Firecracker died on its own before the load, nothing given up.
+    Fresh,
+    /// The snapshot has no realtime clock: load it without `clock_realtime`.
+    WithoutRealtime,
+}
+
+/// A snapshot load that failed, and whether another Firecracker could do it.
+#[derive(Debug)]
+pub struct LoadFailed {
+    error: String,
+    pub retry: Option<Retry>,
+}
+
+impl std::fmt::Display for LoadFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(&self.error)
+    }
+}
+
+impl std::error::Error for LoadFailed {}
+
+/// The retry `e` (from `Prepared::load`) allows, if any.
+pub fn retry_of(e: &crate::util::Error) -> Option<Retry> {
+    e.downcast_ref::<LoadFailed>().and_then(|l| l.retry)
+}
+
+/// Snapshot loads started (`Prepared::load`, retries included), for tests to count.
+static LOADS: AtomicU64 = AtomicU64::new(0);
+
+pub fn loads() -> u64 {
+    LOADS.load(Ordering::SeqCst)
 }
 
 use crate::uffd::{Origin, Pager, Runs, Source};
@@ -120,39 +181,99 @@ pub struct Vm {
 }
 
 impl Vm {
-    /// Restores `vmstate` into an idle Firecracker, with guest memory served
-    /// by a pager over `template` plus `remote` pages when migrating in, and
-    /// `ip` routed to the VM's tap. Marks each step in `phases`.
+    /// Restores `vmstate` into an idle Firecracker from `pool`, with guest
+    /// memory served by a pager over `template` plus `remote` pages when
+    /// migrating in, and `ip` routed to the VM's tap. Marks each step in
+    /// `phases`.
+    #[allow(clippy::too_many_arguments)]
     pub fn restore(
-        idle: Idle,
+        pool: &Pool,
         name: &str,
         template: Arc<Template>,
-        vmstate: &Path,
+        vmstate: Snapshot,
         remote: Option<(Runs, Source)>,
         ip: Ipv4Addr,
+        load: Load,
         phases: &mut Phases,
     ) -> Result<(Arc<Vm>, Duration)> {
         let origin = remote.map(|(runs, source)| (runs, Origin::Peer(source)));
-        Vm::restore_from(idle, name, template, vmstate, origin, ip, Load::Running, phases)
+        Vm::restore_from(pool, name, template, vmstate, origin, ip, load, phases)
     }
 
     /// `restore`, from any page origin, starting the VM as `load` says.
+    ///
+    /// The snapshot is loaded with the vCPUs stopped, so a load that fails
+    /// never ran the guest and is tried once more, on a fresh Firecracker,
+    /// when `Prepared::load` says it may (see `Retry`). A running VM is
+    /// resumed only once loaded, and never retried after that: once the
+    /// resume is sent the guest may have run, and running the snapshot again
+    /// could repeat what it did.
     #[allow(clippy::too_many_arguments)]
     pub fn restore_from(
-        idle: Idle,
+        pool: &Pool,
         name: &str,
         template: Arc<Template>,
-        vmstate: &Path,
+        vmstate: Snapshot,
         remote: Option<(Runs, Origin)>,
         ip: Ipv4Addr,
         load: Load,
         phases: &mut Phases,
     ) -> Result<(Arc<Vm>, Duration)> {
-        let prepared = Vm::prepare(idle, name, template, phases)?;
-        if let Some((runs, origin)) = remote {
-            prepared.pager.seed(runs, origin)?;
+        let mut clock_realtime = true;
+        let mut retried = false;
+        let (vm, took) = loop {
+            let idle = pool.take()?;
+            phases.mark("pool_take");
+            let prepared = Vm::prepare(idle, name, template.clone(), phases)?;
+            let path = match vmstate {
+                Snapshot::Path(p) => p.to_path_buf(),
+                Snapshot::Bytes(b) => {
+                    let p = prepared.dir().join("vmstate.in");
+                    std::fs::write(&p, b)?;
+                    phases.mark("write_state");
+                    p
+                }
+            };
+            if let Some((runs, origin)) = &remote {
+                prepared.pager.seed(runs.clone(), origin.clone())?;
+            }
+            let held = if load.running() { Load::PausedUnheld } else { load };
+            match prepared.load(name, &path, ip, held, clock_realtime, None, phases) {
+                Ok(r) => break r,
+                Err(e) => match retry_of(&e) {
+                    Some(Retry::WithoutRealtime) if !retried => {
+                        eprintln!("vm {name}: snapshot saved without KVM's realtime clock; loading it without clock_realtime");
+                        clock_realtime = false;
+                    }
+                    Some(Retry::Fresh) if !retried => eprintln!("vm {name}: restore failed ({e}); once more on a fresh firecracker"),
+                    _ => return Err(e),
+                },
+            }
+            retried = true;
+        };
+        if load.running() {
+            if let Err(e) = vm.start(load == Load::RunningKilled) {
+                vm.kill();
+                bail!("resuming the restored vm failed (it may have run, so it is not loaded again): {e}");
+            }
+            *vm.state.lock().unwrap() = State::Running;
+            phases.mark("resume");
         }
-        prepared.load(name, vmstate, ip, load, None, phases)
+        Ok((vm, took))
+    }
+
+    /// Resumes the vCPUs of a VM just loaded with them stopped. With `kill`
+    /// (test fault `resume_kill`), Firecracker is killed right after the
+    /// request is sent.
+    pub fn start(&self, kill: bool) -> Result<()> {
+        self.fc(|fc| {
+            let res = fc.resume();
+            if kill {
+                self.pager.kill_firecracker();
+                bail!("injected fault: firecracker killed after the resume was sent");
+            }
+            res
+        })
     }
 
     /// The part of a restore that needs no vmstate: names the cgroup and
@@ -764,6 +885,15 @@ pub struct Prepared {
 }
 
 impl Prepared {
+    pub fn template(&self) -> Arc<Template> {
+        self.template.clone()
+    }
+
+    /// Test fault `kill_prepared`: kills the Firecracker (and waits for it).
+    pub fn kill_firecracker(&mut self) {
+        self.idle.as_mut().unwrap().fc.kill();
+    }
+
     /// The Firecracker's directory, where the vmstate to load goes.
     pub fn dir(&self) -> &Path {
         &self.idle.as_ref().unwrap().dir
@@ -806,21 +936,28 @@ impl Prepared {
         }
     }
 
-    /// Loads `vmstate` and starts the VM as `load` says, with `ip` routed to
-    /// its tap. Seed the pager first if pages are to come from elsewhere.
-    /// Every Firecracker request and wait ends by `deadline`, if given.
+    /// Loads `vmstate`, the vCPUs stopped, held paused as `load` says (a
+    /// running VM is resumed by the caller: see `Vm::restore_from`), with
+    /// `ip` routed to its tap. Seed the pager first if pages are to come from
+    /// elsewhere. Every Firecracker request and wait ends by `deadline`, if
+    /// given. A failure (`LoadFailed` for a failed load request) says whether
+    /// a fresh Firecracker could do it: the guest never ran here either way.
+    #[allow(clippy::too_many_arguments)]
     pub fn load(
         mut self,
         name: &str,
         vmstate: &Path,
         ip: Ipv4Addr,
         load: Load,
+        clock_realtime: bool,
         deadline: Option<Instant>,
         phases: &mut Phases,
     ) -> Result<(Arc<Vm>, Duration)> {
+        LOADS.fetch_add(1, Ordering::SeqCst);
         let idle = self.idle.as_ref().unwrap();
         let (fc, tap) = (&idle.fc, idle.tap.clone());
         let left = |most: Duration| deadline.map_or(most, |d| d.saturating_duration_since(Instant::now()).min(most));
+        let mut load_failed = None;
         let restored = (|| -> Result<Duration> {
             // Route the VM's address while Firecracker restores; it is not on the critical path.
             let route = std::thread::spawn(move || crate::net::attach(ip, &tap));
@@ -832,14 +969,17 @@ impl Prepared {
                     "mem_backend": {"backend_type": "Uffd", "backend_path": fc.sockets.uffd},
                     "vsock_override": {"uds_path": fc.sockets.vsock},
                     "network_overrides": [{"iface_id": "eth0", "host_dev_name": idle.tap}],
-                    "clock_realtime": true,
-                    "resume_vm": load == Load::Running,
+                    "clock_realtime": clock_realtime,
+                    // Resumed only once nothing here can fail (by the caller).
+                    "resume_vm": false,
                 })),
                 left(crate::fc::API_TIMEOUT),
             );
             self.pager.loaded();
-            // Includes Firecracker's resume: the load request sets resume_vm.
             let took = phases.mark("snapshot_load");
+            if let Err(e) = &loaded {
+                load_failed = Some(e.to_string());
+            }
             let held = loaded.and_then(|_| {
                 if load == Load::Paused {
                     // Loaded paused, Firecracker stops only the vCPUs and goes on
@@ -856,8 +996,25 @@ impl Prepared {
             phases.mark("route_wait");
             Ok(took)
         })();
-        let took = restored?;
-        let state = if load == Load::Running { State::Running } else { State::Paused };
+        let took = match restored {
+            Ok(took) => took,
+            Err(e) => {
+                let idle = self.idle.as_mut().unwrap();
+                let retry = match &load_failed {
+                    Some(why) if why.contains(NO_REALTIME) => Some(Retry::WithoutRealtime),
+                    // Died on its own, with no page given up.
+                    Some(_) if !self.pager.lost_pages() && !idle.fc.alive() => Some(Retry::Fresh),
+                    _ => None,
+                };
+                eprintln!("vm {name}: restore failed: {e} ({})", idle.fc.post_mortem(&idle.dir));
+                if load_failed.is_some() {
+                    return Err(Box::new(LoadFailed { error: e.to_string(), retry }));
+                }
+                return Err(e);
+            }
+        };
+        // Its vCPUs are stopped: running once the caller resumes it.
+        let state = if load.running() { State::Running } else { State::Paused };
         let idle = self.idle.take().unwrap();
         Ok((Vm::assemble(name, self.template.clone(), idle, ip, self.pager.clone(), state), took))
     }
