@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use crate::bail;
-use crate::fc::Pool;
+use crate::fc::Spawner;
 use crate::guest;
 use crate::hold::Holder;
 use crate::host::{fault, Entry, Host, NameLock};
@@ -54,7 +54,7 @@ pub enum Start {
 pub struct Proc {
     pub host: Host,
     pub paths: Paths,
-    pub pool: Arc<Pool>,
+    pub pool: Spawner,
     name: Mutex<Option<NameLock>>,
     vm: OnceLock<Arc<Vm>>,
     /// The generation of the VM's address (see `host::Addr`).
@@ -105,7 +105,7 @@ impl Proc {
         std::fs::create_dir_all(&work)?;
         let sockets = crate::socket::SocketRoot::new(&work)?;
         let tap_prefix = format!("{}{:x}t", host.cfg.prefix, std::process::id());
-        let pool = Pool::new(&paths.firecracker, &work, sockets, cgroup_root(), &tap_prefix, 0);
+        let pool = Spawner::new(&paths.firecracker, &work, sockets, cgroup_root(), &tap_prefix);
         Ok(Arc::new_cyclic(|me| Proc {
             host,
             paths,
@@ -215,7 +215,7 @@ impl Proc {
             let mut w = &c;
             let _ = send_json(&mut w, &json!({"exit": code}));
         }
-        self.pool.close();
+
         let work = self.host.run.join("w").join(std::process::id().to_string());
         crate::socket::remove(&work);
         let _ = std::fs::remove_dir_all(&work);

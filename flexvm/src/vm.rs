@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use crate::bail;
-use crate::fc::{Firecracker, Idle, Pool};
+use crate::fc::{Firecracker, Idle, Spawner};
 use crate::template::{Template, BALLOON_STATS_S};
 
 /// How long resuming a paused migration target waits for its memory to arrive.
@@ -185,7 +185,7 @@ impl Vm {
     /// `phases`.
     #[allow(clippy::too_many_arguments)]
     pub fn restore(
-        pool: &Pool,
+        pool: &Spawner,
         name: &str,
         template: Arc<Template>,
         vmstate: Snapshot,
@@ -208,7 +208,7 @@ impl Vm {
     /// could repeat what it did.
     #[allow(clippy::too_many_arguments)]
     pub fn restore_from(
-        pool: &Pool,
+        pool: &Spawner,
         name: &str,
         template: Arc<Template>,
         vmstate: Snapshot,
@@ -222,7 +222,7 @@ impl Vm {
         let (vm, took) = loop {
             let idle = pool.take()?;
             phases.mark("pool_take");
-            let prepared = Vm::prepare(idle, name, template.clone(), phases)?;
+            let prepared = Vm::prepare(idle, template.clone(), phases)?;
             let path = match vmstate {
                 Snapshot::Path(p) => p.to_path_buf(),
                 Snapshot::Bytes(b) => {
@@ -277,11 +277,8 @@ impl Vm {
     /// The part of a restore that needs no vmstate: names the cgroup and
     /// starts the pager, which gets its page states later (`Pager::seed`).
     /// A migration target does this before its source pauses.
-    pub fn prepare(idle: Idle, name: &str, template: Arc<Template>, phases: &mut Phases) -> Result<Prepared> {
+    pub fn prepare(idle: Idle, template: Arc<Template>, phases: &mut Phases) -> Result<Prepared> {
         crate::compat::check(&template, idle.fc.pid())?;
-        let (fc, dir, cgroup, tap) = idle.into_parts();
-        let idle = Idle { fc, dir, cgroup: name_cgroup(cgroup, name), tap };
-        phases.mark("cgroup_rename");
         let pager = match Pager::start(&idle.fc.sockets.uffd, template.clone(), None) {
             Ok(p) => p,
             Err(e) => {
@@ -1100,19 +1097,6 @@ fn lock_by<T>(m: &Mutex<T>, deadline: Instant) -> Result<std::sync::MutexGuard<'
             Err(std::sync::TryLockError::Poisoned(e)) => return Ok(e.into_inner()),
         }
     }
-}
-
-/// Names a pooled Firecracker's cgroup after its VM (renaming is free, joining is not).
-/// Best effort: cgroup v2 refuses renames, so there it keeps its pool name.
-pub fn name_cgroup(cgroup: Option<PathBuf>, name: &str) -> Option<PathBuf> {
-    cgroup.map(|cg| {
-        let named = cg.with_file_name(name);
-        let _ = std::fs::remove_dir(&named);
-        match std::fs::rename(&cg, &named) {
-            Ok(()) => named,
-            Err(_) => cg,
-        }
-    })
 }
 
 /// Whether Firecracker answered a PATCH of `path` with a client error (4xx):

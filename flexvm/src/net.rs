@@ -7,9 +7,8 @@
 //! address via it, and (with `--announce-dev`) sends a gratuitous ARP so the
 //! rest of the LAN, reaching VMs through proxy ARP, follows immediately.
 
-use std::io::Write;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::net::Ipv4Addr;
-use std::process::{Command, Stdio};
 
 use crate::bail;
 use crate::util::Result;
@@ -47,22 +46,6 @@ pub fn set_link_up(name: &str, up: bool) -> Result<()> {
     Ok(())
 }
 
-/// Runs `ip` commands in one process, continuing past errors.
-pub fn ip_batch(cmds: &[String]) -> Result<()> {
-    let mut child = Command::new("ip")
-        .args(["-force", "-batch", "-"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    child.stdin.take().unwrap().write_all(cmds.join("\n").as_bytes())?;
-    let out = child.wait_with_output()?;
-    if !out.status.success() {
-        bail!("ip: {}", String::from_utf8_lossy(&out.stderr).trim());
-    }
-    Ok(())
-}
-
 /// A host-scope address on every tap, never used as a source (host scope)
 /// nor answered for in ARP (`arp_ignore=3`; the guest's gateway MAC is
 /// pinned anyway). Without any address, the reverse-path filter drops
@@ -77,17 +60,63 @@ pub const TAP_ADDR: &str = "169.254.1.2/32";
 /// the packets a migration held, injected all at once (`hold`).
 pub const TAP_QUEUE: u32 = 4096;
 
+/// Creates tap `name` (persistent, so Firecracker can open it by name) with
+/// the gateway MAC, `TAP_ADDR`, a `TAP_QUEUE` queue and `arp_ignore=3`, up:
+/// with ioctls and rtnetlink, as spawning `ip` costs tens of milliseconds.
 pub fn create_tap(name: &str) -> Result<()> {
-    ip_batch(&[
-        format!("tuntap add dev {name} mode tap"),
-        format!("addr add {TAP_ADDR} dev {name} scope host"),
-        format!("link set dev {name} address {GATEWAY_MAC} txqueuelen {TAP_QUEUE} up"),
-    ])?;
-    sysctl(&format!("net.ipv4.conf.{name}.arp_ignore"), "3")
+    const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
+    const TUNSETPERSIST: libc::c_ulong = 0x4004_54cb;
+    let fd = unsafe { libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+    if fd < 0 {
+        bail!("/dev/net/tun: {}", std::io::Error::last_os_error());
+    }
+    let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+    let mut req = ifreq(name);
+    req.ifr_ifru.ifru_flags = (libc::IFF_TAP | libc::IFF_NO_PI) as libc::c_short;
+    if unsafe { libc::ioctl(fd.as_raw_fd(), TUNSETIFF as _, &req) } < 0 || unsafe { libc::ioctl(fd.as_raw_fd(), TUNSETPERSIST as _, 1) } < 0 {
+        bail!("create tap {name}: {}", std::io::Error::last_os_error());
+    }
+    drop(fd);
+    let made = (|| -> Result<()> {
+        let index = ifindex(name)?;
+        let mut addr = vec![libc::AF_INET as u8, 32, 0, RT_SCOPE_HOST];
+        addr.extend_from_slice(&index.to_ne_bytes());
+        let local: Ipv4Addr = TAP_ADDR.split('/').next().unwrap_or_default().parse()?;
+        attr(&mut addr, IFA_LOCAL, &local.octets());
+        attr(&mut addr, IFA_ADDRESS, &local.octets());
+        netlink(RTM_NEWADDR, NLM_F_CREATE | NLM_F_REPLACE, &addr)?;
+        set_mac(index, &parse_mac(GATEWAY_MAC)?)?;
+        let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+        let mut q = ifreq(name);
+        q.ifr_ifru.ifru_metric = TAP_QUEUE as i32;
+        let rc = unsafe { libc::ioctl(sock, libc::SIOCSIFTXQLEN as _, &q) };
+        unsafe { libc::close(sock) };
+        if rc < 0 {
+            bail!("txqueuelen of {name}: {}", std::io::Error::last_os_error());
+        }
+        sysctl(&format!("net.ipv4.conf.{name}.arp_ignore"), "3")?;
+        set_link_up(name, true)
+    })();
+    if made.is_err() {
+        delete_tap(name);
+    }
+    made
 }
 
 pub fn delete_tap(name: &str) {
-    let _ = ip_batch(&[format!("link del dev {name}")]);
+    let Ok(index) = ifindex(name) else { return };
+    let mut msg = vec![libc::AF_UNSPEC as u8, 0, 0, 0];
+    msg.extend_from_slice(&(index as i32).to_ne_bytes());
+    msg.extend_from_slice(&[0; 8]);
+    let _ = netlink(RTM_DELLINK, 0, &msg);
+}
+
+fn ifreq(name: &str) -> libc::ifreq {
+    let mut req: libc::ifreq = unsafe { std::mem::zeroed() };
+    for (d, s) in req.ifr_name.iter_mut().zip(name.bytes().take(libc::IFNAMSIZ - 1)) {
+        *d = s as libc::c_char;
+    }
+    req
 }
 
 /// Routes `ip` to the VM behind `tap`, with a permanent neighbor entry so the
@@ -175,7 +204,12 @@ pub fn unroute(ip: Ipv4Addr) {
 
 // Just enough rtnetlink to change routes and neighbours without spawning
 // `ip`, which costs tens of milliseconds on a busy host.
+const RTM_DELLINK: u16 = 17;
 const RTM_SETLINK: u16 = 19;
+const RTM_NEWADDR: u16 = 20;
+const IFA_ADDRESS: u16 = 1;
+const IFA_LOCAL: u16 = 2;
+const RT_SCOPE_HOST: u8 = 254;
 const RTM_NEWROUTE: u16 = 24;
 const RTM_DELROUTE: u16 = 25;
 const RTM_NEWNEIGH: u16 = 28;

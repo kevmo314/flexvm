@@ -568,7 +568,7 @@ impl Proc {
         let idle = self.pool.take()?;
         t.mark("pool_take");
         let load_set = crate::standby::load_set(&self.host, &tpl);
-        let vm = Vm::prepare(idle, &name, tpl, t)?;
+        let vm = Vm::prepare(idle, tpl, t)?;
         if vm.prepare_load()? {
             t.mark("prepare_load");
         }
@@ -628,7 +628,7 @@ impl Proc {
                 if Instant::now() >= deadline {
                     bail!("no time left to load it again");
                 }
-                let fresh = Vm::prepare(self.pool.take_by(Some(deadline))?, &name, tpl, t)?;
+                let fresh = Vm::prepare(self.pool.take_by(Some(deadline))?, tpl, t)?;
                 fresh.pager.seed(runs_again, Origin::Peer(source.clone()))?;
                 let vmstate = fresh.dir().join("vmstate.in");
                 std::fs::write(&vmstate, state)?;

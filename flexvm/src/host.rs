@@ -504,18 +504,14 @@ pub struct Entry {
 /// makes, and only of processes that are gone.
 pub fn collect_garbage(run: &Path, prefix: &str) {
     let gone = |pid: &str| u32::from_str_radix(pid, 16).ok().is_some_and(|p| starttime(p).is_none());
-    let mut taps = Vec::new();
     for e in std::fs::read_dir("/sys/class/net").into_iter().flatten().flatten() {
         let n = e.file_name().to_string_lossy().into_owned();
         let Some(rest) = n.strip_prefix(prefix) else { continue };
         if let Some(pid) = rest.split_once('t').map(|(p, _)| p).filter(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_hexdigit())) {
             if gone(pid) {
-                taps.push(format!("link del dev {n}"));
+                crate::net::delete_tap(&n);
             }
         }
-    }
-    if !taps.is_empty() {
-        let _ = crate::net::ip_batch(&taps);
     }
     for e in std::fs::read_dir("/sys/fs/cgroup/flexvm").into_iter().flatten().flatten() {
         let n = e.file_name().to_string_lossy().into_owned();

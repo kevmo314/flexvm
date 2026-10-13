@@ -38,7 +38,7 @@ use crate::fc::Idle;
 use crate::guest;
 use crate::uffd::Pager;
 use crate::util::{send_json, Error, Phases, Result};
-use crate::vm::{name_cgroup, Vm};
+use crate::vm::Vm;
 use crate::vmproc::Proc;
 
 fn dir(host: &Host, template: &str) -> PathBuf {
@@ -408,9 +408,7 @@ impl Paused {
     /// `kill` (test fault `resume_kill`), Firecracker is killed right after
     /// the resume is sent.
     pub fn resume(mut self, name: &str, ip: Ipv4Addr, kill: bool, phases: &mut Phases) -> std::result::Result<Arc<Vm>, (Error, bool)> {
-        let (fc, dir, cgroup, tap) = self.idle.take().unwrap().into_parts();
-        let idle = Idle { fc, dir, cgroup: name_cgroup(cgroup, name), tap };
-        phases.mark("cgroup_rename");
+        let idle = self.idle.take().unwrap();
         let mut sent = false;
         let resumed = (|| {
             // Route before the guest can send anything; one netlink round trip.
