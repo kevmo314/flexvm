@@ -235,6 +235,7 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
         let Ok(req) = serde_json::from_slice::<Value>(&line) else { continue };
         match claim(p, &req) {
             Ok(v) => {
+                crate::host::stall("claim_stall");
                 let _ = std::fs::remove_file(&sock);
                 p.serve_control();
                 let _ = send_json(&mut &c, &json!({"ok": true, "result": v}));

@@ -351,6 +351,9 @@ fn follow(conn: std::os::unix::net::UnixStream, id: host::Ident) -> Result<()> {
 /// `kill NAME`: destroys a VM, live (SIGINT, then waits for it to go) or
 /// suspended.
 fn kill(host: &Host, name: &str) -> Result<()> {
+    if host.entry(name).is_ok_and(|e| e.state == "source") {
+        return Err(format!("vm {name} is the source of a migration in progress; it ends once the target has its memory (kill it where it runs)").into());
+    }
     if let Ok(vm) = host.signal(name, libc::SIGINT) {
         if !vm.wait(Duration::from_secs(30)) {
             return Err(format!("vm {name} is still there; see its log").into());

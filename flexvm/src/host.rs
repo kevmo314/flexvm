@@ -344,9 +344,8 @@ impl Host {
             bail!("{ip} is lent out with a newer vm (generation {lent}, not {gen})");
         }
         if gen > a.seen {
-            a.via = None;
+            (a.seen, a.withdrawn, a.via) = (gen, false, None);
         }
-        a.seen = a.seen.max(gen);
         (a.holder, a.held) = (Some(holder.into()), gen);
         self.put_addr(ip, &a, true)?;
         Ok(AddrClaim { host: self.clone(), ip, gen, holder: holder.into(), kept: false, fresh: false })
@@ -995,6 +994,14 @@ pub fn fault(name: &str) -> bool {
     c.as_ref().is_some_and(|(_, armed)| armed.get(name).is_some_and(|&until| now < until))
 }
 
+/// Test hook: waits 3 s at a step where `name` is armed, for a test to kill
+/// the process there.
+pub fn stall(name: &str) {
+    if fault(name) {
+        std::thread::sleep(Duration::from_secs(3));
+    }
+}
+
 /// Arms `name` for `ms` (0 disarms it).
 pub fn arm(host: &Host, name: &str, ms: u64) -> Result<()> {
     let _l = host.lock()?;
@@ -1136,6 +1143,10 @@ mod tests {
         assert!(h.claim_incoming(&l, "y", a_ip, 0).is_err());
         h.claim_incoming(&l, "y", a_ip, g1 + 5).unwrap().keep();
         h.commit_incoming(&l, a_ip, g1 + 5).unwrap();
+        // A newer generation than a withdrawn one is current again.
+        assert!(h.observe(&l, a_ip, g1 + 5, None).unwrap());
+        h.claim_incoming(&l, "y", a_ip, g1 + 6).unwrap().keep();
+        assert!(h.current(&l, a_ip, g1 + 6).unwrap());
         // A refused claim of a held address gives nothing back.
         let w = h.take_name("w", false).unwrap();
         let wc = h.claim_new(&l, "w", Some(ip("10.9.0.3"))).unwrap();

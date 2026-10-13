@@ -204,7 +204,7 @@ def fault(host, f, ms):
 FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_before_run", "restore_after_run",
           "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "resume_kill",
           "prepare_fail", "short_incoming", "slow_preload", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
-          "started_fsync", "started_unmark")
+          "started_fsync", "started_unmark", "start_stall", "incoming_stall", "claim_stall")
 
 
 def disarm():
@@ -346,10 +346,10 @@ def basic():
     wait_released(A, n)
     check("basic: back on A only", where(n) == {A: "running"}, where(n))
     check("basic: md5 intact after round trip", md5(A, n) == m)
-    # Both records stay: neither id can be taken for aborted later.
-    s1, s2 = peer(B, {"op": "migration", "mig": r["mig"]}), peer(A, {"op": "migration", "mig": r2["mig"]})
-    check("basic: committed ids are remembered after their processes left", s1["result"]["outcome"] == "released"
-          and s2["result"]["outcome"] == "released", (s1, s2))
+    # A target forgets a migration only once its source said it is done
+    # with it (it never asks again); until then it says released.
+    migs = lambda h: os.listdir(os.path.join(h.state, "migs"))
+    check("basic: records go once their sources are done", wait_for(lambda: not migs(A) and not migs(B), 10), (migs(A), migs(B)))
     s3 = peer(B, {"op": "migration", "mig": 12345})
     check("basic: an unknown id is fenced as aborted", s3["result"]["outcome"] == "aborted", s3)
     cleanup(n)
@@ -585,10 +585,10 @@ def source_killed():
 
 def target_killed():
     """The target VM process is SIGKILLed after it resumed the VM, before
-    the source knew: its Firecracker dies with it, the committed record
-    survives the process (and the listener), so the source is told
-    `released`, never `aborted`: it does not resurrect the VM (that would
-    roll it back). The VM is lost, as the host it ran on lost it."""
+    the source knew. The committed record survives the process (and the
+    listener), so the source is told `released`, never `aborted`: it does not
+    resurrect the VM (that would roll it back). The answer comes only once
+    the dead process's Firecracker is gone too, however soon it is asked."""
     n = "ft-target-killed"
     setup(n, mib=1500)
     fault(B, "lost_ack", 2000)
@@ -603,8 +603,14 @@ def target_killed():
     check("target killed: VM running on target", v is not None and v["state"] == "running", v)
     if v:
         fc = v["firecracker"]
+        migs = os.path.join(B.state, "migs")
+        newest = max(os.listdir(migs), key=lambda m: os.path.getmtime(os.path.join(migs, m)))
         os.kill(v["pid"], signal.SIGKILL)
-        check("target killed: its firecracker died with it", wait_for(lambda: not alive(fc), 15), fc)
+        # Asked at once, before the Firecracker can have died of its own accord.
+        fault(B, "status", 0)
+        st = peer(B, {"op": "migration", "mig": int(newest)})
+        check("target killed: released only once its firecracker is dead",
+              st.get("ok") and st["result"]["outcome"] == "released" and not alive(fc), (st, alive(fc)))
     # The listener restarts too: nothing it knows is in memory.
     stop_listeners()
     start_listeners()
@@ -872,25 +878,36 @@ def prepare_fail():
 def abort_superseded():
     """A migration that aborts after the source paused does not resume the
     source if a newer generation of its address was recorded meanwhile (the
-    address went to another VM): the copy is destroyed instead."""
+    address went to another VM): the copy is destroyed instead, and the
+    route the newer VM's host announced replaces the hold."""
     n = "ft-superseded"
     setup(n)
     v = vms(A)[n]
     ip, gen = v["ip"], v["gen"]
+    # The replacement's host: an on-link address that is not ours (the
+    # default gateway), so the route is really installed.
+    gw = subprocess.run(["ip", "route", "show", "default"], capture_output=True, text=True).stdout.split()[2]
     fault(A, "pages", 30000)
     res = {}
     t = threading.Thread(target=lambda: res.update(r=migrate(A, n, B)))
     t.start()
     # While the target probes the dead page server, the address moves on.
     wait_for(lambda: vms(A).get(n, {}).get("state") == "source", 20)
-    r = peer(A, {"op": "route", "ip": ip, "via": "127.0.0.9", "gen": gen + 1})
+    r = peer(A, {"op": "route", "ip": ip, "via": gw, "gen": gen + 1})
+    check("abort superseded: the newer generation is taken, the source keeps the route",
+          r.get("ok") and not r["result"].get("stale") and r["result"].get("local"), r)
+    # The target hears of it too (its arrival does not commit then).
+    peer(B, {"op": "route", "ip": ip, "via": gw, "gen": gen + 1})
     t.join()
     fault(A, "pages", 0)
     r = res.get("r", {})
     check("abort superseded: migration failed", not r.get("ok"), r)
-    check("abort superseded: source not resumed, destroyed", "superseded" in r.get("error", "") and
-          wait_for(lambda: n not in vms(A), 10), (r, where(n)))
+    check("abort superseded: source not resumed, destroyed", wait_for(lambda: n not in vms(A), 10), where(n))
+    check("abort superseded: says why", "superseded" in log(A, n), log(A, n)[-300:])
     check("abort superseded: running nowhere", where(n) == {}, where(n))
+    route = subprocess.run(["ip", "route", "show", f"{ip}/32"], capture_output=True, text=True).stdout.strip()
+    check("abort superseded: the address routes to the replacement, not the hold", f"via {gw}" in route, route)
+    check("abort superseded: the source put that route back itself", f"put back route {ip} via {gw} (generation {gen + 1})" in log(A, n), log(A, n)[-300:])
     subprocess.run(["ip", "route", "del", f"{ip}/32"], capture_output=True)
 
 
@@ -1081,7 +1098,8 @@ def fv_hash(b):
 
 def checkpoint_restore():
     """checkpoint --stop on A, restore on B: file contents, a running
-    process, the address and an open TCP connection all survive."""
+    process, the address and an open TCP connection all survive. B borrows
+    the address from A, its home host, which refuses it while lent."""
     n, path = "ft-ckpt", ckpt_path("ft-ckpt")
     m = setup(n)
     proc_before = marker(A, n)
@@ -1094,23 +1112,25 @@ def checkpoint_restore():
     leftovers = [f for f in os.listdir(args.ckpt_dir) if f.startswith(".flexvm-staging-")]
     check("checkpoint: published, no partial left", os.path.exists(os.path.join(path, "manifest.json")) and not leftovers, leftovers)
     check("checkpoint --stop: gone from A", wait_for(lambda: n not in vms(A), 10), vms(A).get(n))
-    # A's address restored on B: checkpoints restore anywhere with --ip auto,
-    # but its own address only on its home host.
-    r = restore(B, path)
-    check("restore: B refuses A's address", not r["ok"] and "range" in r["error"], r)
-    r = ok(restore(A, path))
+    r = ok(restore(B, path))
     print(f"restore: ready in {r['ready_ms']} ms (snapshot load {r['restore_ms']} ms), clock was {r['clock_offset_ms']} ms off; {r['timings_ms']}")
-    check("restore: same address", r["ip"] == ip and sh(A, n, "ip -4 -o addr show eth0")[1].count(ip) == 1, r["ip"])
+    check("restore: same address", r["ip"] == ip and sh(B, n, "ip -4 -o addr show eth0")[1].count(ip) == 1, r["ip"])
     check("restore: TCP connection survived", echo(conn, b"after\n"))
     conn.close()
     with socket.create_connection((ip, 7000), timeout=10) as c2:
         check("restore: new TCP connection", echo(c2, b"new\n"))
-    check("restore: md5 intact", md5(A, n) == m)
-    check("restore: process survived (pid, start time)", marker_id(A, n) == proc_before, (proc_before, marker_id(A, n)))
-    err = guest_clock_error(A, n)
+    check("restore: md5 intact", md5(B, n) == m)
+    check("restore: process survived (pid, start time)", marker_id(B, n) == proc_before, (proc_before, marker_id(B, n)))
+    err = guest_clock_error(B, n)
     check("restore: guest clock right", err is not None and abs(err) < 0.5, err)
-    check("restore: whole checkpoint paged in", wait_for(lambda: vms(A)[n].get("pages_mib", {}).get("remote") == 0, 30), vms(A)[n].get("pages_mib"))
+    check("restore: whole checkpoint paged in", wait_for(lambda: vms(B)[n].get("pages_mib", {}).get("remote") == 0, 30), vms(B)[n].get("pages_mib"))
+    check("restore: the address is lent out by its home host", addr(A, ip).get("lent") == vms(B)[n]["gen"], (addr(A, ip), vms(B)[n]["gen"]))
+    again = restore(A, path, name=n + "-again")
+    check("restore: the home host refuses it while lent", not again["ok"] and "lent" in again.get("error", ""), again)
+    r = restore(B, path, name=n + "-again")
+    check("restore: and refuses to lend it twice", not r["ok"] and "cannot borrow" in r.get("error", "") and "lent" in r.get("error", ""), r)
     cleanup(n)
+    check("restore: killing it gives the address back", wait_for(lambda: not addr(A, ip).get("lent"), 10), addr(A, ip))
     rm_ckpt(path)
 
 
@@ -1500,15 +1520,15 @@ def suspend_resume():
 
 
 def suspend_gen():
-    """A suspended VM keeps its address's generation beside its checkpoint;
-    one without it is quarantined (never given a new one), and its
-    checkpoint still restores with --ip auto."""
+    """A suspended VM's checkpoint holds its address's generation (GEN); one
+    without it is quarantined (never given a new one), and its checkpoint
+    still restores with --ip auto."""
     n = "ft-susp-gen"
     m = setup(n, mib=20)
     gen = vms(A)[n]["gen"]
     suspend(A, n)
-    genfile = os.path.join(A.state, "suspended", f".gen-{n}")
-    check("suspend gen: recorded beside the checkpoint", open(genfile).read().strip() == str(gen), gen)
+    genfile = os.path.join(A.state, "suspended", n, "GEN")
+    check("suspend gen: recorded in the checkpoint", open(genfile).read().strip() == str(gen), gen)
     os.rename(genfile, genfile + ".x")
     check("suspend gen: without it, listed quarantined", vms(A).get(n, {}).get("state") == "quarantined", vms(A).get(n))
     r = resume_suspended(A, n)
@@ -1516,6 +1536,11 @@ def suspend_gen():
     os.rename(genfile + ".x", genfile)
     ok(resume_suspended(A, n))
     check("suspend gen: resumes once it is back, md5 intact", md5(A, n) == m)
+    suspend(A, n)
+    os.unlink(genfile)
+    r = restore(A, os.path.join(A.state, "suspended", n), name=n + "2", ip="auto")
+    check("suspend gen: without it, its checkpoint restores at a new address", r["ok"] and md5(A, n + "2") == m, r)
+    cleanup(n + "2")
     cleanup(n)
 
 
@@ -2325,6 +2350,248 @@ def plug_storm():
     cleanup(n)
 
 
+def kill_source():
+    """A migration's paused source copy cannot be killed (the target still
+    pulls from it and releases it); the VM lives on at the target."""
+    n = "ft-kill-source"
+    m = setup(n, mib=1500)
+    ok(migrate(A, n, B))
+    # Keep the pull from finishing (the target retries for 10 s).
+    fault(A, "pages", 3000)
+    r = kill(A, n)
+    check("kill source: refused", not r["ok"] and "source of a migration" in r.get("error", ""), r)
+    check("kill source: copy still paused on A", vms(A).get(n, {}).get("state") == "source", where(n))
+    st = wait_released(B, n)
+    check("kill source: target pulled everything and released it",
+          st["released"] is True and st["failed"] is None and where(n) == {B: "running"}, (st, where(n)))
+    check("kill source: md5 intact on B", md5(B, n) == m)
+    cleanup(n)
+
+
+def raw(host, data, timeout=10):
+    """Sends `data` on a new connection to `host`'s listener; returns everything until EOF."""
+    h, port = host.addr.rsplit(":", 1)
+    with socket.create_connection((h, int(port)), timeout=timeout) as s:
+        try:
+            s.sendall(data)
+            s.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+        out = b""
+        try:
+            while d := s.recv(65536):
+                out += d
+        except OSError:
+            pass
+    return out
+
+
+def forged_peer():
+    """What a forged or broken peer sends is refused without anything dying:
+    arrivals without an address generation (none, 0) or with one older than
+    recorded, a huge vmstate, too many preloaded pages, an endless request
+    line, a huge page request; page-server refusals reach the client."""
+    tid = source_vm()
+    n, ip = "ft-forged-gen", B.ips.split("-")[1].rsplit(".", 1)[0] + ".210"
+    scenario_vms.add(n)
+    for label, gen in (("zero", 0),):
+        s, r, _ = migrate_in_raw(B, n, ip, tid, gen=gen)
+        s.close()
+        check(f"forged gen {label}: arrival refused", not r.get("ok") and "generation" in r.get("error", ""), r)
+    newest = addr(B, ip).get("seen", 0) + 10
+    s, r, _ = migrate_in_raw(B, n, ip, tid, gen=newest)
+    s.close()
+    check("forged gen: a newer one is taken", r.get("ok"), r)
+    nothing_left("forged gen", n, ip)
+    s, r, _ = migrate_in_raw(B, n, ip, tid, gen=newest - 1)
+    s.close()
+    check("forged gen: an older one than recorded is refused", not r.get("ok") and "newer generation" in r.get("error", ""), r)
+    for label, hdr in (("vmstate", {"runs": [], "vmstate_len": 1 << 40, "preload": []}),
+                       ("preload", {"runs": [], "vmstate_len": 0, "preload": list(range(5000))})):
+        n = f"ft-forged-{label}"
+        scenario_vms.add(n)
+        s, r, _ = migrate_in_raw(B, n, ip, tid)
+        check(f"forged {label}: target prepared", r.get("ok"), r)
+        s.sendall((json.dumps(hdr) + "\n").encode())
+        s.settimeout(30)
+        try:
+            reply = s.recv(65536)
+        except OSError as e:
+            reply = str(e).encode()
+        s.close()
+        check(f"forged {label}: refused", b'"ok":false' in reply and b"more than" in reply, reply[:300])
+        nothing_left(f"forged {label}", n, ip)
+    raw(B, b"x" * (17 << 20))
+    check("forged request line: endless line cut off, listener still up", peer(B, {"op": "migration", "mig": 1}).get("ok"))
+    # The page server answers before its binary protocol, refusals too.
+    n = "ft-forged-pages"
+    m = setup(n, mib=1500)
+    out = raw(A, (json.dumps({"op": "pages", "name": n, "mig": 1}) + "\n").encode())
+    try:
+        refusal = json.loads(out.split(b"\n")[0])
+    except ValueError:
+        refusal = {}
+    check("forged pages: refusal answered", refusal.get("ok") is False and "not the source" in refusal.get("error", ""), out[:200])
+    r = ok(migrate(A, n, B))
+    with socket.create_connection(tuple(A.addr.rsplit(":", 1)[:1]) + (int(A.addr.rsplit(":", 1)[1]),), timeout=10) as s:
+        req = json.dumps({"op": "pages", "name": n, "mig": r["mig"]}).encode() + b"\n"
+        s.sendall(req + (0).to_bytes(8, "little") + (0xFFFFFFFF).to_bytes(4, "little"))
+        out = b""
+        try:
+            while d := s.recv(65536):
+                out += d
+        except OSError:
+            pass
+    if out.startswith(b'{"ok":true}\n'):
+        check("forged pages: a 4 GiB page request is refused", out == b'{"ok":true}\n\x01', out[:100])
+    else:
+        print(f"forged pages: pull finished before the forged request ({out[:100]!r}); huge request not exercised")
+    st = wait_released(B, n)
+    check("forged pages: migration completed", st["released"] is True and where(n) == {B: "running"}, (st, where(n)))
+    check("forged pages: md5 intact", md5(B, n) == m)
+    cleanup(n)
+
+
+def restore_ip_peer():
+    """run --ip refuses an address that is not the host's to hand out (a
+    peer's, or one from no host's range); restore --ip borrows a peer's from
+    its home host, which refuses one in use there."""
+    n, path = "ft-rip", ckpt_path("ft-rip")
+    ok(run(A, n))
+    ok(checkpoint(A, n, path))
+    ok(run(B, "ft-rip-b"))
+    theirs = vms(B)["ft-rip-b"]["ip"]
+    r = restore(A, path, name="ft-rip2", ip=theirs)
+    check("restore --ip: a peer's live address is refused by its home host",
+          not r["ok"] and "cannot borrow" in r.get("error", "") and B.addr in r.get("error", "") and "in use" in r.get("error", ""), r)
+    check("restore --ip: nothing restored", "ft-rip2" not in vms(A) and not addr(A, theirs).get("holder"), addr(A, theirs))
+    r = run(A, "ft-rip3", ip=theirs)
+    check("run --ip: a peer's address is refused", not r["ok"] and "not this host's" in r.get("error", ""), r)
+    r = run(A, "ft-rip3", ip="10.250.0.5")
+    check("run --ip: an address from no host's range is refused", not r["ok"] and "not this host's" in r.get("error", ""), r)
+    r = restore(A, path, name="ft-rip2", ip="auto")
+    check("restore --ip auto still works", r["ok"], r)
+    rm_ckpt(path)
+
+
+def late_withdrawal():
+    """Address generations order the VMs that had an address: a late
+    withdrawal for a VM long gone cannot free a newer VM's loan of it or
+    remove its route, and a late announcement of a withdrawn VM brings no
+    route back, also after the listener that got them restarts."""
+    lent = lambda ip: addr(A, ip).get("lent")
+    n = "ft-late-1"
+    setup(n, mib=1)
+    ip = vms(A)[n]["ip"]
+    ok(migrate(A, n, B))
+    wait_released(B, n)
+    old = lent(ip)
+    check("late withdrawal: lent while away", old is not None, addr(A, ip))
+    kill(B, n)
+    check("late withdrawal: its own withdrawal frees it", wait_for(lambda: not lent(ip), 10), addr(A, ip))
+    n2 = "ft-late-2"
+    ok(run(A, n2, ip=ip))
+    ok(migrate(A, n2, B))
+    wait_released(B, n2)
+    new = lent(ip)
+    check("late withdrawal: lent again, a newer generation", new is not None and old is not None and new > old, (old, new))
+    time.sleep(1)
+    r = ok(peer(A, {"op": "route", "ip": ip, "gen": old}))
+    check("late withdrawal: the old one is stale and frees nothing", r["stale"] and lent(ip) == new, (r, addr(A, ip)))
+    r = peer(A, {"op": "route", "ip": ip})
+    check("late withdrawal: one without a generation is refused", not r["ok"] and lent(ip) == new, (r, addr(A, ip)))
+    kill(B, n2)
+    check("late withdrawal: the newer VM's withdrawal frees it", wait_for(lambda: not lent(ip), 10), addr(A, ip))
+    late = lambda g: ok(peer(A, {"op": "route", "ip": ip, "via": "127.0.0.1", "gen": g}))
+    check("late announcement: of a withdrawn generation is stale", late(new)["stale"])
+    check("late announcement: of an older generation is stale", late(old)["stale"])
+    stop_listeners()
+    start_listeners()
+    check("late announcement after a restart: still stale", late(new)["stale"])
+    n3 = "ft-late-3"
+    ok(run(A, n3, ip=ip))
+    third = vms(A)[n3]["gen"]
+    check("late withdrawal: newer generations still", third > new, (new, third))
+    r = ok(peer(A, {"op": "route", "ip": ip, "gen": new}))
+    check("late withdrawal: an older one leaves the newer VM alone", r["stale"] and where(n3) == {A: "running"}, (r, where(n3)))
+
+
+def incoming_killed():
+    """An incoming VM process SIGKILLed after it took the name and address
+    (no cleanup runs): both are free again for the next taker once its
+    Firecracker is gone, and the migration it began reads as aborted."""
+    n, ip = "ft-in-killed", B.ips.split("-")[1].rsplit(".", 1)[0] + ".211"
+    scenario_vms.add(n)
+    fault(B, "incoming_stall", 10000)
+    s, r, mig = [None], [None], [None]
+    t = threading.Thread(target=lambda: (lambda x: (s.__setitem__(0, x[0]), r.__setitem__(0, x[1]), mig.__setitem__(0, x[2])))(migrate_in_raw(B, n, ip, source_vm())))
+    t.start()
+    pid = None
+    lock = os.path.join(B.run, "vms", f"{n}.lock")
+    wait_for(lambda: os.path.exists(lock) and open(lock).read().strip(), 20)
+    pid = int(open(lock).read().split()[0])
+    time.sleep(1)
+    fcs = [int(open(os.path.join(d, "fc")).read().split()[0]) for d in
+           [os.path.join(B.run, "w", str(pid), e) for e in os.listdir(os.path.join(B.run, "w", str(pid)))] if os.path.exists(os.path.join(d, "fc"))]
+    os.kill(pid, signal.SIGKILL)
+    t.join()
+    fault(B, "incoming_stall", 0)
+    check("incoming killed: addressed held at the kill", addr(B, ip).get("holder") == n, addr(B, ip))
+    st = peer(B, {"op": "migration", "mig": mig[0]})
+    check("incoming killed: its migration is aborted, once its firecracker is gone",
+          st.get("ok") and st["result"]["outcome"] == "aborted" and not any(alive(p) for p in fcs), (st, fcs))
+    r2 = run(B, n, ip=None)
+    check("incoming killed: the name is usable", r2["ok"], r2)
+    kill(B, n)
+
+
+def start_killed():
+    """A VM process SIGKILLed between claiming its address and loading the
+    VM: the address is free again, for a VM with a newer generation."""
+    n = "ft-start-killed"
+    scenario_vms.add(n)
+    ip = A.ips.split("-")[1].rsplit(".", 1)[0] + ".212"
+    fault(A, "start_stall", 10000)
+    p = subprocess.Popen([BIN, "--state", A.state, "--run", A.run, "run", n, "--template", args.template, "--ip", ip],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=ENV)
+    wait_for(lambda: addr(A, ip).get("holder") == n, 20)
+    gen = addr(A, ip).get("held")
+    p.kill()
+    p.wait()
+    fault(A, "start_stall", 0)
+    r = run(A, n + "2", ip=ip)
+    check("start killed: its address is free again, a newer generation", r["ok"] and vms(A)[n + "2"]["gen"] > gen, (r, gen))
+    kill(A, n + "2")
+    scenario_vms.add(n + "2")
+
+
+def claim_killed():
+    """A standby VM SIGKILLed after it resumed the VM for a claim, before it
+    answered: `run` says the claim is uncertain and starts nothing else."""
+    n = "ft-claim-killed"
+    scenario_vms.add(n)
+    code, out, err = cli(A, "standby", "--template", args.template, "1")
+    check("claim killed: a standby vm", code == 0, err)
+    fault(A, "claim_stall", 10000)
+    lockdir = os.path.join(A.run, "standby", args.template)
+    pids = [int(open(os.path.join(lockdir, f)).read().split()[0]) for f in os.listdir(lockdir) if f.endswith(".lock")]
+    res = {}
+    t = threading.Thread(target=lambda: res.update(r=cli_json(A, "run", n, "--template", args.template, "-d")))
+    t.start()
+    time.sleep(1.5)
+    for p in pids:
+        try:
+            os.kill(p, signal.SIGKILL)
+        except OSError:
+            pass
+    t.join()
+    fault(A, "claim_stall", 0)
+    r = res.get("r", {})
+    check("claim killed: uncertain, not started again", not r.get("ok") and "may have started" in r.get("error", ""), r)
+    check("claim killed: running nowhere", wait_for(lambda: n not in vms(A), 10), vms(A).get(n))
+    cli(A, "standby", "--template", args.template, "0")
+
+
 SCENARIOS = dict(
     cow_grow=cow_grow, plug_race=plug_race, plug_storm=plug_storm,
     basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, refused=refused, pages_blip=pages_blip,
@@ -2339,7 +2606,9 @@ SCENARIOS = dict(
     ckpt_failed_stop=ckpt_failed_stop, ckpt_rearm=ckpt_rearm, ckpt_dir_moved=ckpt_dir_moved,
     prepare_disconnect=prepare_disconnect, prepare_trickle=prepare_trickle, prepare_fail=prepare_fail,
     fc_prepare=fc_prepare, slow_preload=slow_preload, ckpt_packet_hold=ckpt_packet_hold, standby=standby,
-    suspend_disk_freed=suspend_disk_freed, resume_mark_fails=resume_mark_fails)
+    suspend_disk_freed=suspend_disk_freed, resume_mark_fails=resume_mark_fails, kill_source=kill_source,
+    forged_peer=forged_peer, restore_ip_peer=restore_ip_peer, late_withdrawal=late_withdrawal,
+    incoming_killed=incoming_killed, start_killed=start_killed, claim_killed=claim_killed)
 names = [n for s in args.scenarios for n in (list(SCENARIOS) if s == "all" else [s])]
 if os.geteuid() != 0:
     sys.exit("run as root (sudo)")

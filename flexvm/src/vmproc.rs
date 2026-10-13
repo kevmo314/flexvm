@@ -448,6 +448,7 @@ impl Proc {
         };
         let ip = self.set_addr(claim);
         t.mark("claim_ip");
+        crate::host::stall("start_stall");
         let load = if fault("resume_kill") { crate::vm::Load::RunningKilled } else { crate::vm::Load::Running };
         // The first load of a template on this host learns what loads touch.
         let learn = crate::standby::load_set(&self.host, &tpl).is_empty();
