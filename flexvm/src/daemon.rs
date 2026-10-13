@@ -112,8 +112,24 @@ pub struct Daemon {
     /// VM names with a lifecycle operation in progress, and which (see `reserve`).
     busy: (Mutex<HashMap<String, &'static str>>, Condvar),
     suspended: Mutex<HashMap<String, Suspended>>,
-    /// Holds packets for VMs paused to migrate away; None if it could not be set up.
+    /// Holds packets for VMs paused to migrate away; None without TUN support.
     holder: Option<Arc<Holder>>,
+    /// Migrations in here whose sources may still send the packets they held.
+    held_in: Mutex<HashMap<u64, HeldIn>>,
+    _port_lock: std::os::unix::net::UnixListener,
+    me: std::sync::Weak<Daemon>,
+}
+
+/// A one-shot right to send a VM that migrated in the packets its source
+/// held: bound to that VM instance, taken by one stream at a time, gone once
+/// a stream ends, after `HELD_IN_TTL`, or when the VM is killed, replaced or
+/// migrates on.
+struct HeldIn {
+    vm: Arc<Vm>,
+    until: Instant,
+    taken: bool,
+    /// Where a stream that broke off left off.
+    next: u64,
 }
 
 /// A VM name reserved for one lifecycle operation; released on drop.
@@ -145,6 +161,17 @@ const HOLD_FENCE: Duration = Duration::from_millis(250);
 /// Longest a target spends taking in held packets.
 const HELD_STREAM: Duration = Duration::from_secs(2);
 
+/// How long the source of a migration in here may send held packets.
+const HELD_IN_TTL: Duration = Duration::from_secs(10);
+
+/// Claims `port` for this daemon in this network namespace: an abstract
+/// unix socket, gone when the daemon is.
+fn lock_port(port: u16) -> Result<std::os::unix::net::UnixListener> {
+    use std::os::linux::net::SocketAddrExt;
+    let addr = std::os::unix::net::SocketAddr::from_abstract_name(format!("flexvm-port-{port}"))?;
+    std::os::unix::net::UnixListener::bind_addr(&addr).map_err(|e| format!("port {port} is taken by another flexvm daemon in this network namespace ({e})").into())
+}
+
 /// How a migration ended on its target, as seen by the source.
 enum Outcome {
     Committed(Value),
@@ -166,9 +193,11 @@ pub fn run(mut cfg: Config) -> Result<()> {
     cfg.state_dir = cfg.state_dir.canonicalize()?;
     run_lock.extend(lock_run_dir(&cfg.state_dir)?);
     let listener = TcpListener::bind(&cfg.listen)?;
-    // Its device first, before any cleanup: one daemon per port owns it.
+    // Before any cleanup: taps, the hold device and cgroups are named after
+    // the port, so one daemon per port (in this network namespace) owns them.
     let port: u16 = cfg.listen.rsplit(':').next().and_then(|p| p.parse().ok()).unwrap_or(0);
-    let holder = Holder::new(port).inspect_err(|e| eprintln!("packets in flight during migrations will be dropped: {e}")).ok();
+    let port_lock = lock_port(port)?;
+    let holder = Holder::new(port)?;
     kill_orphans(&cfg.run_dir)?;
     let cgroup_root = setup_cgroups(&cfg.listen);
     net::sysctl("net.ipv4.ip_forward", "1")?;
@@ -182,7 +211,10 @@ pub fn run(mut cfg: Config) -> Result<()> {
     let addrs = Addrs::load(cfg.state_dir.join(LENT_FILE))?;
     let pool = Pool::new(&cfg.paths.firecracker, &cfg.run_dir, cgroup_root.clone(), &tap_prefix, cfg.pool);
     let hot = HotPool::new(pool.clone(), cfg.hot, cfg.hot_mib, cfg.reserve_mib);
-    let d = Arc::new(Daemon {
+    let d = Arc::new_cyclic(|me| Daemon {
+        me: me.clone(),
+        _port_lock: port_lock,
+        held_in: Mutex::new(HashMap::new()),
         cfg,
         vms: Mutex::new(HashMap::new()),
         templates: Mutex::new(HashMap::new()),
@@ -468,7 +500,7 @@ impl Daemon {
             },
             // Packets a source held for a VM that migrated here, when the
             // migration connection could not carry them.
-            "held" => return self.held(&name, &req, w),
+            "held" => return self.held(&name, &req, r),
             "run" => self.run_vm(&name, req["template"].as_str().unwrap_or("default"), req["ip"].as_str()),
             "ls" => Ok(self.list()),
             "kill" => self.kill(&name),
@@ -571,7 +603,7 @@ impl Daemon {
             self.addrs.lock().unwrap().used.remove(&ip);
             return Err(e);
         }
-        self.announce(ip);
+        self.announce(&vm);
         t.mark("announce");
         Ok(json!({
             "name": name,
@@ -635,19 +667,27 @@ impl Daemon {
         Ok(ip)
     }
 
-    /// Points the network at this host for `ip`: a gratuitous ARP for the LAN
-    /// and a route for each peer. Runs in the background.
-    fn announce(&self, ip: Ipv4Addr) {
-        let peers = self.cfg.peers.clone();
-        let dev = self.cfg.announce_dev.clone();
-        let via = self.cfg.underlay;
+    /// Points the network at this host for `vm`'s address: a gratuitous ARP
+    /// for the LAN and a route for each peer. Runs in the background; each
+    /// step happens only while `vm` itself is still served from here (not
+    /// killed, replaced or migrated on).
+    fn announce(&self, vm: &Arc<Vm>) {
+        let Some(d) = self.me.upgrade() else { return };
+        let vm = vm.clone();
+        let ip = vm.ip;
         thread::spawn(move || {
-            if let Some(dev) = &dev {
+            let current = || d.vm(&vm.name).is_ok_and(|v| Arc::ptr_eq(&v, &vm)) && vm.state().local();
+            let dev = d.cfg.announce_dev.clone();
+            let via = d.cfg.underlay;
+            if let Some(dev) = dev.as_deref().filter(|_| current()) {
                 if let Err(e) = net::gratuitous_arp(dev, ip) {
                     eprintln!("announce {ip}: {e}");
                 }
             }
-            for peer in &peers {
+            for peer in &d.cfg.peers {
+                if !current() {
+                    return;
+                }
                 if let Err(e) = peer_call(peer, json!({"op": "route", "ip": ip.to_string(), "via": via.to_string()})) {
                     eprintln!("announce {ip} to {peer}: {e}");
                 }
@@ -655,7 +695,9 @@ impl Daemon {
             // A second ARP for anyone who missed the first.
             if let Some(dev) = &dev {
                 thread::sleep(Duration::from_millis(200));
-                let _ = net::gratuitous_arp(dev, ip);
+                if current() {
+                    let _ = net::gratuitous_arp(dev, ip);
+                }
             }
         });
     }
@@ -717,10 +759,19 @@ impl Daemon {
     /// `kill`, for a caller holding the name's reservation. A suspended VM's
     /// checkpoint is deleted.
     fn kill_reserved(&self, name: &str) -> Result<Value> {
-        let vm = self.vms.lock().unwrap().remove(name);
+        // Out of the map and the claims at once (see `switch_route`).
+        let vm = {
+            let mut addrs = self.addrs.lock().unwrap();
+            let vm = self.vms.lock().unwrap().remove(name);
+            if let Some(vm) = &vm {
+                addrs.used.remove(&vm.ip);
+            }
+            vm
+        };
         let ip = match vm {
             Some(vm) => {
                 vm.kill();
+                self.drop_held_in(&vm);
                 if let (State::Source(mig), Some(h)) = (vm.state(), &self.holder) {
                     h.forget(vm.ip, mig);
                 }
@@ -752,19 +803,22 @@ impl Daemon {
     /// any other VM by that name, such as the same VM migrated back here.
     fn release(&self, name: &str, req: &Value) -> Result<Value> {
         let mig = req["mig"].as_u64().ok_or("missing mig")?;
+        // The copy leaves the map and its address the claims at once, under
+        // the address lock (see `switch_route`).
         let vm = {
+            let mut addrs = self.addrs.lock().unwrap();
             let mut vms = self.vms.lock().unwrap();
-            match vms.get(name).map(|v| v.state()) {
+            let vm = match vms.get(name).map(|v| v.state()) {
                 None => return Ok(json!({"name": name, "already": true})),
                 Some(State::Source(m)) if m == mig => vms.remove(name).unwrap(),
                 Some(_) => bail!("vm {name} here is not the source of migration {mig}"),
-            }
+            };
+            // It lives on at the target: from our range, it stays taken until
+            // the VM is withdrawn (killed) wherever it is, or an operator frees it.
+            addrs.move_out(vm.ip, self.cfg.vm_ips.contains(vm.ip));
+            vm
         };
         vm.kill();
-        // It lives on at the target: from our range, it stays taken until the
-        // VM is withdrawn (killed) wherever it is, or an operator frees it.
-        let ours = self.cfg.vm_ips.contains(vm.ip);
-        self.addrs.lock().unwrap().move_out(vm.ip, ours);
         Ok(json!({"name": name}))
     }
 
@@ -919,6 +973,8 @@ impl Daemon {
         if ours {
             self.addrs.lock().unwrap().lend(vm.ip)?;
         }
+        // Its previous source can no longer send it held packets.
+        self.drop_held_in(&vm);
         if let Err(e) = vm.start_source(mig) {
             if ours {
                 self.addrs.lock().unwrap().unlend(vm.ip);
@@ -1117,19 +1173,20 @@ impl Daemon {
         let mut held = None;
         let mut res = None;
         if let Some(h) = self.holder.as_ref().filter(|h| h.holding_for(ip, mig)) {
-            let other = match conn {
-                Some(_) => None,
-                None => crate::util::connect(to, Duration::from_secs(2))
-                    .and_then(|mut c| {
-                        send_json(&mut c, &json!({"op": "held", "name": vm.name, "mig": mig}))?;
-                        Ok(c)
-                    })
-                    .inspect_err(|e| eprintln!("vm {}: cannot send held packets to {to}: {e}", vm.name))
-                    .ok(),
-            };
-            match conn.or(other.as_ref()) {
-                Some(c) => {
-                    if let Some((stats, r)) = hold::send(h, ip, mig, c, || self.route_via(ip, via)) {
+            // The migration connection, or else a new one; nothing is taken
+            // off the queue until the target has accepted the stream.
+            let started = conn.and_then(|c| hold::start(c).ok().map(|seq| (None, seq))).or_else(|| {
+                let c = crate::util::connect(to, Duration::from_secs(2)).map_err(Error::from).and_then(|mut c| -> Result<_> {
+                    send_json(&mut c, &json!({"op": "held", "name": vm.name, "mig": mig}))?;
+                    let seq = hold::start(&c)?;
+                    Ok((Some(c), seq))
+                });
+                c.inspect_err(|e| eprintln!("vm {}: cannot send held packets to {to}: {e}", vm.name)).ok()
+            });
+            match started {
+                Some((other, seq)) => {
+                    let c = other.as_ref().or(conn).unwrap();
+                    if let Some((stats, r)) = hold::send(h, ip, mig, c, seq, || self.switch_route(vm, via)) {
                         held = Some(stats);
                         res = Some(r);
                     }
@@ -1137,10 +1194,11 @@ impl Daemon {
                 None => h.forget(ip, mig),
             }
         }
-        let res = res.unwrap_or_else(|| self.route_via(ip, via));
+        let res = res.unwrap_or_else(|| self.switch_route(vm, via));
         if let Err(e) = &res {
             eprintln!("route {ip} via {via}: {e}; retrying");
             let d = self.clone();
+            let vm = vm.clone();
             thread::spawn(move || {
                 let mut delay = Duration::from_millis(100);
                 for _ in 0..10 {
@@ -1149,7 +1207,7 @@ impl Daemon {
                     if d.vms.lock().unwrap().values().any(|v| v.ip == ip && v.state().local()) {
                         return;
                     }
-                    match d.route_via(ip, via) {
+                    match d.switch_route(&vm, via) {
                         Ok(()) => return eprintln!("route {ip} via {via}: done"),
                         Err(e) => eprintln!("route {ip} via {via}: {e}"),
                     }
@@ -1175,7 +1233,7 @@ impl Daemon {
                 return None;
             }
         };
-        let (mut stats, _) = h.release(ip, mig, &mut |p| inj.send(p), &mut || {}, || switch(()))?;
+        let (mut stats, _) = h.release(ip, mig, &mut |p| inj.send(p), &mut || true, || switch(()))?;
         stats.injected = stats.packets;
         stats.dropped_target = inj.dropped();
         Some(stats)
@@ -1183,17 +1241,70 @@ impl Daemon {
 
     /// The source of a migration in here sends the packets it held on this
     /// connection (when the migration connection could not carry them).
-    fn held(&self, name: &str, req: &Value, mut w: TcpStream) -> Result<()> {
+    fn held(&self, name: &str, req: &Value, mut r: BufReader<TcpStream>) -> Result<()> {
         let mig = req["mig"].as_u64().ok_or("missing mig")?;
-        let vm = self.vm(name)?;
-        if self.migrations.lock().unwrap().get(&mig) != Some(&Incoming::Committed) || !vm.state().local() {
-            bail!("vm {name} did not migrate here in migration {mig}");
+        if !hold::wait_start(&mut r, Instant::now() + HELD_STREAM) {
+            return Ok(());
         }
-        let got = hold::receive(&w, &vm.tap, HELD_STREAM, Instant::now() + HELD_STREAM);
-        if got.ended {
-            send_json(&mut w, &json!({"injected": got.injected, "dropped": got.dropped}))?;
-        }
+        let Some((vm, next)) = self.claim_held(mig, Some(name)) else {
+            let _ = (&mut r.get_ref()).write_all(b"n");
+            bail!("no held packets expected for vm {name} from migration {mig}");
+        };
+        self.receive_held(mig, &vm, next, &mut r);
         Ok(())
+    }
+
+    /// Takes the right to send migration `mig`'s held packets, if it is
+    /// still open and its VM (named `name`, if given) is the one that
+    /// arrived and is still served from here.
+    fn claim_held(&self, mig: u64, name: Option<&str>) -> Option<(Arc<Vm>, u64)> {
+        let mut held = self.held_in.lock().unwrap();
+        held.retain(|_, h| h.until > Instant::now());
+        let h = held.get_mut(&mig)?;
+        let current = self.vm(&h.vm.name).is_ok_and(|v| Arc::ptr_eq(&v, &h.vm)) && h.vm.state().local();
+        if h.taken || !current || name.is_some_and(|n| n != h.vm.name) {
+            return None;
+        }
+        h.taken = true;
+        Some((h.vm.clone(), h.next))
+    }
+
+    /// Receives a claimed stream for migration `mig` and gives up the
+    /// claim: for good if the stream ended, else for a resumed one.
+    fn receive_held(&self, mig: u64, vm: &Vm, next: u64, r: &mut BufReader<TcpStream>) {
+        let got = hold::receive(r, vm.ip, &vm.tap, next, Instant::now() + HELD_STREAM);
+        let mut held = self.held_in.lock().unwrap();
+        match got {
+            Some(got) if got.ended => {
+                held.remove(&mig);
+            }
+            // Broke off, or too many streams at once: a retry may resume it.
+            got => {
+                if let Some(h) = held.get_mut(&mig) {
+                    h.taken = false;
+                    h.next = got.map_or(next, |g| g.next);
+                }
+            }
+        }
+    }
+
+    /// Closes the rights to send held packets to `vm` (killed or leaving).
+    fn drop_held_in(&self, vm: &Arc<Vm>) {
+        self.held_in.lock().unwrap().retain(|_, h| !Arc::ptr_eq(&h.vm, vm));
+    }
+
+    /// Points the route for `vm`'s address at `via`, unless the address
+    /// belongs to a newer VM here by now. Serialized with address claims, so
+    /// a VM claiming it later routes it to itself after this; `vm` leaves the
+    /// map and the claims together (`release`, `kill_reserved`), so a claim
+    /// without it in the map is a newer VM's.
+    fn switch_route(&self, vm: &Arc<Vm>, via: Ipv4Addr) -> Result<()> {
+        let addrs = self.addrs.lock().unwrap();
+        let ours = self.vms.lock().unwrap().values().any(|v| Arc::ptr_eq(v, vm));
+        if !ours && addrs.used.contains(&vm.ip) {
+            return Ok(());
+        }
+        self.route_via(vm.ip, via)
     }
 
     fn route_via(&self, ip: Ipv4Addr, via: Ipv4Addr) -> Result<()> {
@@ -1222,8 +1333,9 @@ impl Daemon {
         }
         let res = self.take_in(&name, req, runs, source, &state, &mut t);
         if let Ok((_, vm)) = &res {
+            self.held_in.lock().unwrap().insert(mig, HeldIn { vm: vm.clone(), until: Instant::now() + HELD_IN_TTL, taken: false, next: 0 });
             // Nothing more is buffered: the source waits for our answer.
-            self.announce_after_held(vm.clone(), r.get_ref().try_clone().ok());
+            self.announce_after_held(mig, vm.clone(), r.get_ref().try_clone().ok());
         }
         // A failed restore has killed the VM, so the source may resume it.
         let outcome = if res.is_ok() { Incoming::Committed } else { Incoming::Aborted };
@@ -1233,21 +1345,28 @@ impl Daemon {
 
     /// Once a VM that migrated in runs, injects the packets its source held,
     /// which follow our answer on the migration connection, then announces
-    /// the VM, so held packets come before traffic sent straight here. A
-    /// source that held nothing sends nothing; then this waits `HOLD_FENCE`.
-    /// Announces only if `vm` itself is still served from here by then (not
-    /// killed, replaced, or migrated on: its next host announces it).
-    fn announce_after_held(self: &Arc<Self>, vm: Arc<Vm>, conn: Option<TcpStream>) {
+    /// the VM, so held packets come before traffic sent straight here. If no
+    /// stream opens within `HOLD_FENCE` (none held, or the source is slow),
+    /// announces anyway and still takes a late one until `HELD_IN_TTL`.
+    fn announce_after_held(self: &Arc<Self>, mig: u64, vm: Arc<Vm>, conn: Option<TcpStream>) {
         let d = self.clone();
         thread::spawn(move || {
-            if let Some(mut c) = conn {
-                let got = hold::receive(&c, &vm.tap, HOLD_FENCE, Instant::now() + HELD_STREAM);
-                if got.ended {
-                    let _ = send_json(&mut c, &json!({"injected": got.injected, "dropped": got.dropped}));
+            let mut r = conn.map(BufReader::new);
+            let opened = r.as_mut().is_some_and(|r| hold::wait_start(r, Instant::now() + HOLD_FENCE));
+            if !opened {
+                d.announce(&vm);
+            }
+            let late = !opened && r.as_mut().is_some_and(|r| hold::wait_start(r, Instant::now() + HELD_IN_TTL));
+            if let Some(r) = r.as_mut().filter(|_| opened || late) {
+                match d.claim_held(mig, None) {
+                    Some((vm, next)) => d.receive_held(mig, &vm, next, r),
+                    None => {
+                        let _ = (&mut r.get_ref()).write_all(b"n");
+                    }
                 }
             }
-            if d.vm(&vm.name).is_ok_and(|v| Arc::ptr_eq(&v, &vm)) && vm.state().local() {
-                d.announce(vm.ip);
+            if opened {
+                d.announce(&vm);
             }
         });
     }

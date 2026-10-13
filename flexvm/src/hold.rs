@@ -23,10 +23,10 @@
 //! own tap the same way, before resuming it.
 
 use std::collections::{HashMap, VecDeque};
-use std::io::{Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::net::{Ipv4Addr, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -43,6 +43,8 @@ pub const CAP: usize = 4 << 20;
 const CATCH_UP: Duration = Duration::from_millis(100);
 /// Largest frame in the stream (an IP packet is at most 64 KiB).
 const MAX_FRAME: usize = 65535;
+/// How long a source waits for a target to accept its held packets.
+const ACCEPT_WAIT: Duration = Duration::from_secs(1);
 
 pub struct Holder {
     dev: String,
@@ -99,19 +101,26 @@ impl Stats {
 }
 
 impl Holder {
-    /// Creates TUN device `fv<port>h`, owned by this daemon alone: a second
-    /// daemon on the same port fails here (the device is busy) and holds
-    /// nothing.
-    pub fn new(port: u16) -> Result<Arc<Holder>> {
+    /// Creates TUN device `fv<port>h`, owned by this daemon alone: if another
+    /// process has it, this fails (the caller stops). None, with a warning,
+    /// if the host has no TUN support: then nothing is held.
+    pub fn new(port: u16) -> Result<Option<Arc<Holder>>> {
         let dev = format!("fv{port}h");
-        let tun = open_tun(&dev)?;
+        let tun = match open_tun(&dev) {
+            Ok(tun) => tun,
+            Err(Tun::Busy(e)) => return Err(e),
+            Err(Tun::Unsupported(e)) => {
+                eprintln!("packets in flight during migrations will be dropped: {e}");
+                return Ok(None);
+            }
+        };
         let _ = crate::net::sysctl(&format!("net.ipv6.conf.{dev}.disable_ipv6"), "1");
         crate::net::set_link_up(&dev, true)?;
         let ifindex = crate::net::ifindex(&dev)?;
         let h = Arc::new(Holder { dev, ifindex, tun, held: Mutex::new(HashMap::new()), reading: AtomicBool::new(false) });
         let reader = h.clone();
         std::thread::Builder::new().name("hold".into()).spawn(move || reader.read_loop())?;
-        Ok(h)
+        Ok(Some(h))
     }
 
     /// Starts holding packets for `ip` for migration `mig`: call just before
@@ -126,9 +135,11 @@ impl Holder {
         Ok(())
     }
 
-    /// Whether packets for `ip` are being held (and not yet released).
+    /// Whether packets for `ip` are held here, including while they are
+    /// released, until `release` has switched the route: no one else may
+    /// move it meanwhile.
     pub fn holding(&self, ip: Ipv4Addr) -> bool {
-        self.entry(ip).is_some_and(|e| !e.q.lock().unwrap().releasing)
+        self.entry(ip).is_some()
     }
 
     /// Whether migration `mig` holds `ip` and has not released it.
@@ -146,13 +157,15 @@ impl Holder {
     /// arrives meanwhile goes in another round, up to four); calls `switch`
     /// to move the address's route; then hands over the packets that
     /// entered the device during the switch, and stops holding. `sink`
-    /// returns false for a packet it lost. None if `mig` does not hold `ip`.
+    /// returns false for a packet it lost; `barrier` false if the far end is
+    /// lost, and then nothing more is handed over (what is left counts as
+    /// dropped) but the route still switches. None if `mig` does not hold `ip`.
     pub fn release(
         &self,
         ip: Ipv4Addr,
         mig: u64,
         sink: &mut dyn FnMut(&[u8]) -> bool,
-        barrier: &mut dyn FnMut(),
+        barrier: &mut dyn FnMut() -> bool,
         switch: impl FnOnce() -> Result<()>,
     ) -> Option<(Stats, Result<()>)> {
         let e = self.entry(ip).filter(|e| e.mig == mig)?;
@@ -164,16 +177,22 @@ impl Holder {
             q.releasing = true;
         }
         let mut stats = Stats::default();
+        let mut lost = false;
         // What arrives while `barrier` waits is handed over in another round.
         for _ in 0..4 {
             self.hand_over(&e, sink, &mut stats);
-            barrier();
+            if !barrier() {
+                lost = true;
+                break;
+            }
             if e.q.lock().unwrap().packets.len() < 16 && !readable(&self.tun) {
                 break;
             }
         }
         let switched = switch();
-        self.hand_over(&e, sink, &mut stats);
+        if !lost {
+            self.hand_over(&e, sink, &mut stats);
+        }
         {
             let mut held = self.held.lock().unwrap();
             if held.get(&ip).is_some_and(|x| Arc::ptr_eq(x, &e)) {
@@ -351,45 +370,63 @@ fn tap_tx_dropped(tap: &str) -> u64 {
         .unwrap_or(0)
 }
 
-// The stream: frames of a big-endian u32 length, a u64 sequence number and
-// that many bytes of IP packet; `SYNC` (no more) asks the receiver to answer
-// one byte once it has injected everything before it; length 0 ends the
-// stream, and the receiver answers with one JSON line (`Received`).
+// The stream. The source opens it with `START`; the receiver answers `b'a'`
+// and the sequence number it expects next (a u64; 0 unless an earlier
+// stream of the same migration broke off), and only then does the source
+// take packets off its queue. Then frames: a big-endian u32 length, a u64
+// sequence number and that many bytes of IP packet. `SYNC` (no more) asks
+// the receiver to answer one byte once it has injected everything before
+// it. Length 0 ends the stream, and the receiver answers with one JSON line
+// (`Received`). Sequence numbers let the receiver count what went missing
+// and drop duplicates; a packet lost on a broken stream is not resent.
 const SYNC: u32 = u32::MAX;
+const START: u32 = u32::MAX - 1;
+/// Receivers running at once, all migrations together.
+const MAX_RECEIVERS: usize = 8;
+static RECEIVERS: AtomicUsize = AtomicUsize::new(0);
 
 /// What a target did with a stream of held packets.
 #[derive(Debug, Default)]
 pub struct Received {
     pub injected: u64,
-    /// Injection refused, the tap's queue overflowed, or sequence numbers missing.
+    /// Not injected: malformed or not for the VM, duplicated, missing from
+    /// the sequence, refused by the kernel, or lost to a full tap queue.
     pub dropped: u64,
     /// The stream ended properly (rather than timing out or breaking off).
     pub ended: bool,
+    /// The sequence number a resumed stream would start at.
+    pub next: u64,
 }
 
-/// Reads held packets from `conn` and injects them into `tap`, until the
-/// end of the stream or `deadline`. A source that holds nothing sends
-/// nothing: then this waits at most `first` for the first frame.
-pub fn receive(conn: &TcpStream, tap: &str, first: Duration, deadline: Instant) -> Received {
-    let mut got = Received::default();
-    let Ok(inj) = Injector::new(tap) else { return got };
-    let mut r = std::io::BufReader::new(conn);
-    let mut expect = 0u64;
-    let mut wait = first;
+/// Waits until `deadline` for a source to open a stream on `r` (`START`).
+pub fn wait_start(r: &mut BufReader<TcpStream>, deadline: Instant) -> bool {
+    let mut head = [0u8; 4];
+    read_by(r, &mut head, deadline).is_ok() && u32::from_be_bytes(head) == START
+}
+
+/// Accepts a stream opened with `START` and injects its packets, all for
+/// `ip`, into `tap` until it ends or `deadline` (enforced on every read and
+/// write, partial frames included). `next` is the first sequence number
+/// expected. Answers the source when the stream ends. None if too many
+/// streams are being received already.
+pub fn receive(r: &mut BufReader<TcpStream>, ip: Ipv4Addr, tap: &str, next: u64, deadline: Instant) -> Option<Received> {
+    let _slot = Receiver::enter()?;
+    let mut got = Received { next, ..Received::default() };
+    let Ok(inj) = Injector::new(tap) else { return Some(got) };
+    let mut ack = vec![b'a'];
+    ack.extend_from_slice(&next.to_be_bytes());
+    if write_by(r.get_ref(), &ack, deadline).is_err() {
+        return Some(got);
+    }
     let mut buf = vec![0u8; MAX_FRAME];
     loop {
-        let left = deadline.saturating_duration_since(Instant::now()).min(wait);
-        if left.is_zero() || conn.set_read_timeout(Some(left)).is_err() {
-            break;
-        }
-        wait = Duration::MAX;
         let mut head = [0u8; 4];
-        if r.read_exact(&mut head).is_err() {
+        if read_by(r, &mut head, deadline).is_err() {
             break;
         }
         let len = u32::from_be_bytes(head);
         if len == SYNC {
-            if (&mut &*conn).write_all(b"s").is_err() {
+            if write_by(r.get_ref(), b"s", deadline).is_err() {
                 break;
             }
             continue;
@@ -400,38 +437,121 @@ pub fn receive(conn: &TcpStream, tap: &str, first: Duration, deadline: Instant) 
             break;
         }
         let mut seq = [0u8; 8];
-        if len > MAX_FRAME || r.read_exact(&mut seq).is_err() || r.read_exact(&mut buf[..len]).is_err() {
+        if len > MAX_FRAME || read_by(r, &mut seq, deadline).is_err() || read_by(r, &mut buf[..len], deadline).is_err() {
             break;
         }
         let seq = u64::from_be_bytes(seq);
-        got.dropped += seq.saturating_sub(expect);
-        expect = seq + 1;
-        if inj.send(&buf[..len]) {
+        if seq < got.next {
+            got.dropped += 1;
+            continue;
+        }
+        got.dropped += seq - got.next;
+        got.next = seq + 1;
+        if valid(&buf[..len], ip) && inj.send(&buf[..len]) {
             got.injected += 1;
         } else {
             got.dropped += 1;
         }
     }
     got.dropped += inj.dropped();
-    got
+    if got.ended {
+        let reply = json!({"injected": got.injected, "dropped": got.dropped});
+        let _ = write_by(r.get_ref(), format!("{reply}\n").as_bytes(), deadline);
+    }
+    Some(got)
 }
 
-/// Streams what migration `mig` held for `ip` to a target over `conn`
-/// (after the request that tells it what follows), and reads back what the
-/// target did with it. Before `switch` moves the route (and with it newer
-/// packets) to the target, it waits, up to `CATCH_UP` per round, until the
-/// target has injected everything sent so far (`SYNC`), so those come first.
-pub fn send(holder: &Holder, ip: Ipv4Addr, mig: u64, conn: &TcpStream, switch: impl FnOnce() -> Result<()>) -> Option<(Stats, Result<()>)> {
+/// An IPv4 packet, whole, for `ip`.
+fn valid(p: &[u8], ip: Ipv4Addr) -> bool {
+    let ihl = (p.first().copied().unwrap_or(0) & 15) as usize * 4;
+    p.len() >= 20
+        && p[0] >> 4 == 4
+        && ihl >= 20
+        && ihl <= p.len()
+        && u16::from_be_bytes([p[2], p[3]]) as usize == p.len()
+        && p[16..20] == ip.octets()
+}
+
+/// Counts running receivers, up to `MAX_RECEIVERS`.
+struct Receiver;
+
+impl Receiver {
+    fn enter() -> Option<Receiver> {
+        RECEIVERS
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n < MAX_RECEIVERS).then_some(n + 1))
+            .ok()
+            .map(|_| Receiver)
+    }
+}
+
+impl Drop for Receiver {
+    fn drop(&mut self) {
+        RECEIVERS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Fills `buf` from `r`, giving up at `deadline` however the bytes trickle in.
+fn read_by(r: &mut BufReader<TcpStream>, mut buf: &mut [u8], deadline: Instant) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        r.get_ref().set_read_timeout(Some(left))?;
+        match r.read(buf) {
+            Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+            Ok(n) => buf = &mut buf[n..],
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+fn write_by(mut w: &TcpStream, buf: &[u8], deadline: Instant) -> std::io::Result<()> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(std::io::ErrorKind::TimedOut.into());
+    }
+    w.set_write_timeout(Some(left))?;
+    w.write_all(buf)
+}
+
+/// Opens a stream on `conn` (`START`) and waits for the receiver to accept
+/// it. Returns the sequence number to start at.
+pub fn start(conn: &TcpStream) -> Result<u64> {
+    let deadline = Instant::now() + ACCEPT_WAIT;
+    write_by(conn, &START.to_be_bytes(), deadline)?;
+    let mut ack = [0u8; 9];
+    let mut r = BufReader::with_capacity(9, conn.try_clone()?);
+    read_by(&mut r, &mut ack, deadline)?;
+    if ack[0] != b'a' {
+        bail!("the target refused the held packets");
+    }
+    Ok(u64::from_be_bytes(ack[1..].try_into().unwrap()))
+}
+
+/// Streams what migration `mig` held for `ip` to a target over `conn`,
+/// after `start` (numbering from `seq`), and reads back what the target did
+/// with it. Before `switch` moves the route (and with it newer packets) to
+/// the target, it waits, up to `CATCH_UP` per round, until the target has
+/// injected everything sent so far (`SYNC`), so those come first.
+pub fn send(holder: &Holder, ip: Ipv4Addr, mig: u64, conn: &TcpStream, seq: u64, switch: impl FnOnce() -> Result<()>) -> Option<(Stats, Result<()>)> {
     let _ = conn.set_write_timeout(Some(CATCH_UP * 4));
-    let out = std::cell::RefCell::new(Out { buf: Vec::with_capacity(64 << 10), seq: 0, broken: false, conn });
+    let out = std::cell::RefCell::new(Out { buf: Vec::with_capacity(64 << 10), seq, broken: false, conn });
     let mut sink = |p: &[u8]| out.borrow_mut().frame(p);
     let mut barrier = || {
         let mut o = out.borrow_mut();
         o.buf.extend_from_slice(&SYNC.to_be_bytes());
-        if o.flush() {
-            let _ = conn.set_read_timeout(Some(CATCH_UP));
-            let _ = (&mut &*conn).read_exact(&mut [0u8; 1]);
+        if !o.flush() {
+            return false;
         }
+        let _ = conn.set_read_timeout(Some(CATCH_UP));
+        if (&mut &*conn).read_exact(&mut [0u8; 1]).is_err() {
+            // Slow rather than gone, maybe; the stream goes on, unordered.
+            eprintln!("hold {ip}: the target did not confirm the held packets in time");
+        }
+        true
     };
     let (mut stats, switched) = holder.release(ip, mig, &mut sink, &mut barrier, switch)?;
     let mut o = out.into_inner();
@@ -440,9 +560,9 @@ pub fn send(holder: &Holder, ip: Ipv4Addr, mig: u64, conn: &TcpStream, switch: i
         .flush()
         .then(|| {
             let _ = conn.set_read_timeout(Some(Duration::from_secs(1)));
-            // A late answer to the sync may come first.
+            // A late answer to a sync may come first.
             let mut line = String::new();
-            std::io::BufRead::read_line(&mut std::io::BufReader::new(conn), &mut line).ok()?;
+            std::io::BufRead::read_line(&mut BufReader::new(conn), &mut line).ok()?;
             serde_json::from_str::<Value>(line.trim_start_matches('s')).ok()
         })
         .flatten();
@@ -491,12 +611,18 @@ fn readable(fd: &OwnedFd) -> bool {
     unsafe { libc::poll(&mut pfd, 1, 0) > 0 }
 }
 
+enum Tun {
+    /// Another process has the device.
+    Busy(crate::util::Error),
+    Unsupported(crate::util::Error),
+}
+
 /// Opens TUN device `dev`. TUNSETIFF fails (busy) if another process has it.
-fn open_tun(dev: &str) -> Result<OwnedFd> {
+fn open_tun(dev: &str) -> std::result::Result<OwnedFd, Tun> {
     const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
     let fd = unsafe { libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC | libc::O_NONBLOCK) };
     if fd < 0 {
-        bail!("/dev/net/tun: {}", std::io::Error::last_os_error());
+        return Err(Tun::Unsupported(format!("/dev/net/tun: {}", std::io::Error::last_os_error()).into()));
     }
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
     let mut req: libc::ifreq = unsafe { std::mem::zeroed() };
@@ -505,7 +631,12 @@ fn open_tun(dev: &str) -> Result<OwnedFd> {
     }
     req.ifr_ifru.ifru_flags = (libc::IFF_TUN | libc::IFF_NO_PI) as libc::c_short;
     if unsafe { libc::ioctl(fd.as_raw_fd(), TUNSETIFF as _, &req) } < 0 {
-        bail!("{dev}: {} (another daemon on this port?)", std::io::Error::last_os_error());
+        let e = std::io::Error::last_os_error();
+        let msg = format!("{dev}: {e}");
+        return Err(match e.raw_os_error() {
+            Some(libc::EBUSY | libc::EEXIST | libc::EPERM) => Tun::Busy(format!("{msg} (another daemon on this port?)").into()),
+            _ => Tun::Unsupported(msg.into()),
+        });
     }
     // Room for what arrives while a release is catching up (the default is 500).
     req.ifr_ifru.ifru_metric = 10000;
