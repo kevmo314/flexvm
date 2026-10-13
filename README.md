@@ -525,7 +525,7 @@ The page server (`pages`) answers its request line with one JSON line,
 reports the source's reason rather than a hang-up. It serves reads of at most
 1 MiB (the largest a pager asks for) and drops a connection that asks for
 more, that sits idle for 10 minutes, or whose VM is no longer that
-migration's source (checked every second). Peer-sized lengths are bounded
+migration's source (released or killed; checked every second). Peer-sized lengths are bounded
 everywhere a daemon reads them: request lines (16 MiB), a migration's header
 (256 MiB, parsed straight into page runs), vmstate (64 MiB), preloaded pages
 (4096).
@@ -669,14 +669,29 @@ and a second copy could repeat what it did.
   the peers), or it migrates back. If that message is lost, the address stays
   taken; `flexvm unlend IP` frees it. Leaks, never collisions. `flexvm run --ip` picks
   one explicitly (refused if a peer that answers uses it or has lent it out).
-- **Incarnations.** Each VM's address carries a random token, given out with
-  the address (run, restore) and kept by the VM through migrations. The lent
-  record stores it, and withdrawals and route announcements carry it: a
-  withdrawal frees a loan, or removes a route a peer announced, only if the
-  tokens match. So a late withdrawal for a VM long gone (say one an operator
-  unlent, whose address then went to a new VM that migrated away too) leaves
-  the newer VM's loan and route alone. A VM migrating back takes its address
-  back only with the token it was lent with.
+- **Generations.** Each VM's address carries a generation that orders the
+  VMs that have had it. The address's home host (whose `--vm-ips` holds it)
+  hands out a higher one every time a VM gets the address (run, restore; a
+  peer starting a VM with one of its addresses asks it, and refuses when it
+  cannot, as it does for an address from no answering host's range while a
+  peer is silent). A VM keeps its generation through migrations and
+  suspends (`GEN` in the suspended checkpoint); a restore is a new
+  generation. Lent records store it (records from before generations count
+  as 0, older than any), and route announcements and withdrawals carry it.
+  Every host keeps, in `STATE_DIR/addr-gens.json`, the newest generation it
+  has seen per address and whether that one was withdrawn, plus a
+  high-water mark of the generations it hands out (reserved 1024 at a time,
+  so a restart never repeats one). A message about an older generation, or
+  an announcement of one already withdrawn, is ignored: a late withdrawal
+  for a VM long gone (say one an operator unlent, whose address then went
+  to a new VM that migrated away too) leaves the newer VM's loan and route
+  alone, and a late announcement brings back no route for a VM that is
+  gone, also after a restart. A withdrawal frees a loan of its generation
+  or an older one. Deciding a route and changing it in the kernel happen
+  under one lock per address (peer messages, local routes of starting,
+  restored or arriving VMs, migration route switches and packet holds).
+  Hosts of a cluster must be upgraded together: the page server's answer
+  line and the generations are part of the protocol.
 - Reachability:
   - **Peers** get a route pushed to them: `<vm-ip>/32 via <host underlay ip>`.
     Routes via an address local to the daemon's network namespace (including

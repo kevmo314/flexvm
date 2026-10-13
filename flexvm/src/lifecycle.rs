@@ -264,6 +264,12 @@ impl Daemon {
         let dest = self.cfg.state_dir.join("suspended").join(name);
         let staging = Staging::new(&dest, vm.dir.join("checkpoint.vmstate"))?;
         let manifest = self.save(&vm, staging, false, false, &mut t)?.manifest;
+        // Its address keeps its generation across a restart (`load_suspended`).
+        if let Some(gen) = self.addrs.lock().unwrap().used.get(&vm.ip).copied() {
+            if let Err(e) = write_gen(&dest, gen) {
+                eprintln!("vm {name}: recording its address generation: {e}; a restart gives it a new one");
+            }
+        }
         // The checkpoint is durable; only now let go of the memory. The pager
         // stops before Firecracker dies, and its page states are never read
         // again: a resume pages in from the checkpoint.
@@ -345,7 +351,9 @@ impl Daemon {
                 false => crate::vm::Load::Paused,
             };
             // Loaded paused: everything up to the resume below can fail
-            // without the VM having run.
+            // without the VM having run. It routes the address to the tap.
+            let lock = self.addr_lock(ip);
+            let _route = lock.lock().unwrap();
             // Load the bytes that were verified, from a file only root controls.
             Vm::restore_from(&self.pool, name, tpl, crate::vm::Snapshot::Bytes(&ck.vmstate), origin, ip, load, t)
         })()
@@ -722,14 +730,24 @@ impl Daemon {
             }
             match Checkpoint::open(&e.path()) {
                 Ok(ck) => {
-                    match self.addrs.lock().unwrap().used.entry(ck.manifest.ip) {
+                    let ip = ck.manifest.ip;
+                    let mut addrs = self.addrs.lock().unwrap();
+                    match addrs.used.entry(ip) {
+                        std::collections::hash_map::Entry::Occupied(_) => eprintln!("suspended vm {name}: {ip} is already taken"),
                         std::collections::hash_map::Entry::Vacant(v) => {
-                            v.insert(addr_token());
-                        }
-                        std::collections::hash_map::Entry::Occupied(_) => {
-                            eprintln!("suspended vm {name}: {} is already taken", ck.manifest.ip)
+                            // The generation it was suspended with, unchanged.
+                            let mut gens = self.gens.lock().unwrap();
+                            let gen = match read_gen(&e.path()) {
+                                Some(gen) => {
+                                    gens.observe(ip, gen, false);
+                                    gen
+                                }
+                                None => gens.assign(ip)?,
+                            };
+                            v.insert(gen);
                         }
                     }
+                    drop(addrs);
                     eprintln!("suspended vm {name} ({}) found in {}", ck.manifest.ip, e.path().display());
                     self.suspended.lock().unwrap().insert(name, Suspended { dir: ck.dir, manifest: ck.manifest, quarantine: None });
                 }
@@ -869,6 +887,23 @@ impl Drop for HeldReports<'_> {
             eprintln!("vm {}: releasing free page reports failed: {e}", self.0.name);
         }
     }
+}
+
+/// In a suspended VM's checkpoint: its address's generation (see `Gens`).
+const GEN: &str = "GEN";
+
+/// Records a suspended VM's address generation in its checkpoint, durably.
+fn write_gen(dir: &Path, gen: u64) -> std::io::Result<()> {
+    let tmp = dir.join(".GEN.tmp");
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(gen.to_string().as_bytes())?;
+    f.sync_all()?;
+    std::fs::rename(&tmp, dir.join(GEN))?;
+    std::fs::File::open(dir)?.sync_all()
+}
+
+fn read_gen(dir: &Path) -> Option<u64> {
+    std::fs::read_to_string(dir.join(GEN)).ok()?.trim().parse().ok()
 }
 
 /// Creates marker file `name` in `dir` and makes it durable.

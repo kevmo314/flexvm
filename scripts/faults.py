@@ -6,7 +6,7 @@ or cleanly failed.
 
 usage: scripts/faults.py [--a ADDR] [--b ADDR] [--bin FLEXVM] [--log-dir DIR] SCENARIO... | all
   'all' runs the scenarios that leave both daemons running; source_killed,
-  target_restart, target_restart_symlink, checkpoint_crash, cow_crash,
+  target_restart, target_restart_symlink, checkpoint_crash, cow_crash, late_withdrawal,
   suspend_resume, hot_budget and resume_mark_fails kill a daemon with SIGKILL and restart it with the same command line and
   environment (logging to --log-dir). Checkpoint scenarios write to --ckpt-dir.
 """
@@ -2206,8 +2206,10 @@ def restore_ip_peer():
 
 
 def late_withdrawal():
-    """A withdrawal of an address for a VM long gone cannot free a newer
-    VM's loan of the same address."""
+    """Address generations order the VMs that had an address: a late
+    withdrawal for a VM long gone cannot free a newer VM's loan of it or
+    remove its route, and a late announcement of a withdrawn VM brings no
+    route back, also after the host that got them restarts (A, SIGKILL)."""
     lent = lambda: ok(A, {"op": "info"})["lent"]
     n = "ft-late-1"
     setup(n, mib=1)
@@ -2223,18 +2225,38 @@ def late_withdrawal():
     ok(A, {"op": "migrate", "name": n2, "to": B})
     wait_released(B, n2)
     new = lent().get(ip)
-    check("late withdrawal: lent again, a new incarnation", new is not None and new != old, (old, new))
+    check("late withdrawal: lent again, a newer generation", new is not None and old is not None and new > old, (old, new))
     # B announces the route for the second VM in the background.
     time.sleep(1)
-    r = ok(A, {"op": "route", "ip": ip, "tok": old})
+    r = ok(A, {"op": "route", "ip": ip, "gen": old})
     check("late withdrawal: the old one frees nothing", not r["freed"] and lent().get(ip) == new, (r, lent()))
     check("late withdrawal: and keeps the newer route", r["stale"], r)
     r = ok(A, {"op": "route", "ip": ip})
-    check("late withdrawal: one without incarnation frees nothing", not r["freed"] and lent().get(ip) == new, (r, lent()))
+    check("late withdrawal: one without a generation frees nothing", not r["freed"] and r["stale"] and lent().get(ip) == new, (r, lent()))
     ok(B, {"op": "kill", "name": n2})
     check("late withdrawal: the newer VM's withdrawal frees it", wait_for(lambda: ip not in lent(), 10), lent())
-    cleanup(n)
-    cleanup(n2)
+    time.sleep(0.5)
+    late = lambda g: ok(A, {"op": "route", "ip": ip, "via": "127.0.0.1", "gen": g})
+    r = late(new)
+    check("late announcement: of a withdrawn generation is stale", r["stale"], r)
+    r = late(old)
+    check("late announcement: of an older generation is stale", r["stale"], r)
+    argv, env = kill_daemon(A)
+    start_daemon(A, argv, env)
+    r = late(new)
+    check("late announcement after a restart: still stale", r["stale"], r)
+    r = ok(A, {"op": "route", "ip": ip, "gen": old})
+    check("late withdrawal after a restart: stale", r["stale"] and not r["freed"], r)
+    # The home host's generations keep growing across its restart.
+    n3 = "ft-late-3"
+    ok(A, {"op": "run", "name": n3, "template": args.template, "ip": ip})
+    ok(A, {"op": "migrate", "name": n3, "to": B})
+    wait_released(B, n3)
+    third = lent().get(ip)
+    check("late withdrawal: a restarted home host hands out newer generations", third is not None and third > new, (new, third))
+    for x in (n, n2, n3):
+        cleanup(x)
+    check("late withdrawal: the last VM's withdrawal frees it", wait_for(lambda: ip not in lent(), 10), lent())
 
 
 SCENARIOS = dict(plug_race=plug_race, plug_storm=plug_storm, cow_grow=cow_grow, basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, refused=refused, pages_blip=pages_blip,
@@ -2255,7 +2277,7 @@ SCENARIOS = dict(plug_race=plug_race, plug_storm=plug_storm, cow_grow=cow_grow, 
                  kill_source=kill_source, forged_peer=forged_peer,
                  restore_ip_peer=restore_ip_peer, late_withdrawal=late_withdrawal)
 safe = [s for s in SCENARIOS
-        if s not in ("source_killed", "target_restart", "target_restart_symlink", "checkpoint_crash", "cow_crash",
+        if s not in ("source_killed", "target_restart", "target_restart_symlink", "checkpoint_crash", "cow_crash", "late_withdrawal",
                      "suspend_resume", "hot_budget", "resume_mark_fails")]
 names = [n for s in args.scenarios for n in (safe if s == "all" else [s])]
 for s in names:
