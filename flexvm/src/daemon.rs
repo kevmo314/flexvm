@@ -162,12 +162,25 @@ const HOLD_FENCE: Duration = Duration::from_millis(250);
 const HELD_STREAM: Duration = Duration::from_secs(2);
 
 /// Claims `port` for this daemon in this network namespace: an abstract
-/// unix socket, gone when the daemon is.
+/// unix socket, gone when the daemon is (see `LOCK_WAIT`).
 fn lock_port(port: u16) -> Result<std::os::unix::net::UnixListener> {
     use std::os::linux::net::SocketAddrExt;
     let addr = std::os::unix::net::SocketAddr::from_abstract_name(format!("flexvm-port-{port}"))?;
-    std::os::unix::net::UnixListener::bind_addr(&addr).map_err(|e| format!("port {port} is taken by another flexvm daemon in this network namespace ({e})").into())
+    let deadline = Instant::now() + LOCK_WAIT;
+    loop {
+        match std::os::unix::net::UnixListener::bind_addr(&addr) {
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
+            r => return r.map_err(|e| format!("port {port} is taken by another flexvm daemon in this network namespace ({e})").into()),
+        }
+    }
 }
+
+/// How long startup waits for a predecessor's locks. A daemon killed with
+/// SIGKILL looks dead (its main thread a zombie) while its last thread still
+/// closes its files, which takes a while when one of them is its hold device
+/// (the kernel unregisters the interface); a restart must not fail on that.
+/// A daemon that is alive keeps its locks, and startup fails after this.
+const LOCK_WAIT: Duration = Duration::from_secs(3);
 
 /// How a migration ended on its target, as seen by the source.
 enum Outcome {
@@ -291,9 +304,13 @@ fn lock_run_dir(run_dir: &Path) -> Result<Vec<std::fs::File>> {
     for (i, d) in dir.ancestors().enumerate() {
         let f = std::fs::File::open(d)?;
         let how = if i == 0 { libc::LOCK_EX } else { libc::LOCK_SH };
-        if unsafe { libc::flock(f.as_raw_fd(), how | libc::LOCK_NB) } < 0 {
+        let deadline = Instant::now() + LOCK_WAIT;
+        while unsafe { libc::flock(f.as_raw_fd(), how | libc::LOCK_NB) } < 0 {
             let e = std::io::Error::last_os_error();
-            bail!("run directory {} overlaps another daemon's ({} is locked: {e})", dir.display(), d.display());
+            if e.raw_os_error() != Some(libc::EWOULDBLOCK) || Instant::now() >= deadline {
+                bail!("run directory {} overlaps another daemon's ({} is locked: {e})", dir.display(), d.display());
+            }
+            thread::sleep(Duration::from_millis(50));
         }
         locks.push(f);
     }
