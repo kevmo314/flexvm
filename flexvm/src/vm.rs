@@ -320,6 +320,8 @@ impl Vm {
     /// unless the VM was paused before. Returns the state to go back to.
     pub fn resume(&self) -> Result<State> {
         crate::net::set_link_up(&self.tap, true)?;
+        // Taking the tap down deleted the VM's /32 route; put it back.
+        crate::net::attach(self.ip, &self.tap)?;
         self.unpark_balloon();
         if self.was_paused.swap(false, Ordering::SeqCst) {
             return Ok(State::Paused);
