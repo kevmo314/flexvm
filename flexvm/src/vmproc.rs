@@ -274,7 +274,7 @@ impl Proc {
         }
         drop(self.arrived.lock().unwrap().take());
         if let Some(dir) = self.consumed.lock().unwrap().take() {
-            crate::lifecycle::delete_consumed(&self.host, &self.name(), &dir);
+            crate::lifecycle::delete_consumed(&self.name(), &dir);
         }
         drop(self.name.lock().unwrap().take());
         for f in self.files.lock().unwrap().drain(..) {

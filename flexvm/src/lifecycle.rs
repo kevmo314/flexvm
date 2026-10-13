@@ -138,13 +138,13 @@ impl Proc {
                 bail!("vm {} is {}; not suspending it", vm.name, vm.state().name());
             }
             // The checkpoint it was resumed from, if any, goes first: it is
-            // where this one goes, beside its generation.
+            // where this one goes.
             if let Some(dir) = self.consumed.lock().unwrap().take() {
-                delete_consumed(&self.host, &vm.name, &dir);
+                delete_consumed(&vm.name, &dir);
             }
-            // Its address's generation, durably, before the checkpoint can exist.
-            crate::host::write_file(&self.host.state.join("suspended"), &gen_file(&vm.name), self.gen().to_string().as_bytes(), true)?;
             let staging = Staging::new(&self.host.suspended(&vm.name), vm.dir.join("checkpoint.vmstate"))?;
+            // Its address's generation, published with the checkpoint.
+            staging.add_file(GEN, self.gen().to_string().as_bytes())?;
             let saved = self.save(vm, staging, false, false, &mut t);
             self.publish();
             saved
@@ -184,10 +184,9 @@ impl Proc {
             // Rebooted since: the disk holds no STARTED marker, so it never ran.
             unmark_durably(&dir, QUARANTINE)?;
         }
-        let gen: u64 = std::fs::read_to_string(self.host.state.join("suspended").join(gen_file(name)))
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .ok_or_else(|| format!("vm {name}: quarantined: its address generation was never recorded, so it cannot be resumed with its address; restore its checkpoint with --ip auto"))?;
+        let gen = read_gen(&dir).ok_or_else(|| {
+            format!("vm {name} is quarantined: its address generation was never recorded, so it cannot be resumed with its address; restore its checkpoint with --ip auto")
+        })?;
         let ck = Checkpoint::open(&dir)?;
         t.mark("verify_checkpoint");
         let ip = ck.manifest.ip;
@@ -360,7 +359,7 @@ impl Proc {
             if let Some(p) = p {
                 let _op = p.op();
                 if let Some(dir) = p.consumed.lock().unwrap().take() {
-                    delete_consumed(&p.host, &vm.name, &dir);
+                    delete_consumed(&vm.name, &dir);
                 }
             }
         });
@@ -741,7 +740,7 @@ impl Drop for HeldReports<'_> {
     }
 }
 
-/// In a suspended VM's checkpoint: its address's generation (see `Gens`).
+/// In a suspended VM's checkpoint: its address's generation (see `host::Addr`).
 const GEN: &str = "GEN";
 
 fn read_gen(dir: &Path) -> Option<u64> {
@@ -799,11 +798,6 @@ impl Drop for CopyGrowth<'_> {
 /// reboots, when the disk shows whether the marker made it.
 const QUARANTINE: &str = "QUARANTINE";
 
-/// Where a suspended VM's address generation is kept, beside its checkpoint.
-fn gen_file(name: &str) -> String {
-    format!(".gen-{name}")
-}
-
 fn boot_id() -> String {
     std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap_or_default().trim().to_string()
 }
@@ -813,15 +807,9 @@ fn boot_id() -> String {
 /// it never comes back, then frees and withdraws its address.
 pub fn discard(host: &Host, name: &str) -> Result<()> {
     let dir = host.suspended(name);
-    let manifest = describe_suspended(host, name);
+    let (ip, gen) = (manifest(&dir).map(|m| m.ip), read_gen(&dir));
     mark_durably(&dir, DISCARDED).map_err(|e| format!("discarding the checkpoint of {name}: {e}"))?;
-    if let Err(e) = delete_checkpoint(&dir) {
-        eprintln!("vm {name}: removing {}: {e}", dir.display());
-    }
-    let gen_path = host.state.join("suspended").join(gen_file(name));
-    let gen = std::fs::read_to_string(&gen_path).ok().and_then(|s| s.trim().parse::<u64>().ok());
-    let _ = std::fs::remove_file(&gen_path);
-    let ip: Option<Ipv4Addr> = manifest.and_then(|m| m["ip"].as_str()?.parse().ok());
+    delete_consumed(name, &dir);
     if let Some(ip) = ip {
         let l = host.lock()?;
         host.release(&l, ip, name)?;
@@ -836,12 +824,17 @@ pub fn discard(host: &Host, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Deletes the checkpoint a suspended VM was resumed from (marked STARTED).
-pub fn delete_consumed(host: &Host, name: &str, dir: &Path) {
+/// Deletes a checkpoint marked STARTED or DISCARDED.
+pub fn delete_consumed(name: &str, dir: &Path) {
     if let Err(e) = delete_checkpoint(dir) {
         eprintln!("vm {name}: removing {}: {e}", dir.display());
     }
-    let _ = std::fs::remove_file(host.state.join("suspended").join(gen_file(name)));
+}
+
+/// A checkpoint's manifest, unverified.
+fn manifest(dir: &Path) -> Option<Manifest> {
+    let text = std::fs::read(dir.join("manifest.json")).ok()?;
+    serde_json::from_slice(text.splitn(2, |&b| b == b'\n').nth(1)?).ok()
 }
 
 /// What `ls` shows of a suspended VM, from its manifest. A consumed one
@@ -851,12 +844,9 @@ pub fn describe_suspended(host: &Host, name: &str) -> Option<Value> {
     if dir.join(STARTED).exists() || dir.join(DISCARDED).exists() {
         return None;
     }
-    let text = std::fs::read(dir.join("manifest.json")).ok()?;
-    let body = text.splitn(2, |&b| b == b'\n').nth(1)?;
-    let m: Manifest = serde_json::from_slice(body).ok()?;
+    let m = manifest(&dir)?;
     // Without its address's generation it is never resumed (see `resume_suspended`).
-    let no_gen = !host.state.join("suspended").join(gen_file(name)).exists();
-    let state = if no_gen || dir.join(QUARANTINE).exists() { "quarantined" } else { "suspended" };
+    let state = if read_gen(&dir).is_none() || dir.join(QUARANTINE).exists() { "quarantined" } else { "suspended" };
     Some(json!({
         "name": name, "ip": m.ip.to_string(), "template": m.template, "template_id": m.template_id,
         "state": state, "vcpus": m.vcpus, "guest_mib": m.mem_mib + m.hotplug_mib, "max_mib": m.max_mib,
