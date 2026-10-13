@@ -424,12 +424,12 @@ not wait on the host:
   only when it is actually short of free memory and cannot grow here: at its
   ceiling, or with the host below `--reserve`. Plugged-but-free memory is not
   counted as use, and the pressure policy still picks VMs by host RSS.
-- **Resizes and migrations exclude each other.** Every resize holds the VM's
-  resize lock and only touches a running VM. `start_source` takes the same
-  lock and waits for any plug in flight to settle (`Vm::settle_hotplug`:
-  requested == plugged, else cut down to what is plugged by half the
-  deadline). The target refuses a vmstate whose memory regions differ from
-  its own.
+- **Resizes stay out of lifecycle operations.** A resize, whether from a
+  controller tick or from the guest asking, holds the VM's reservation, like
+  migrations, checkpoints and pauses do, and only touches a running VM. A
+  guest that asks during one is told `busy`. A migration also waits for any
+  plug in flight to settle (`Vm::settle_hotplug`). The target refuses a
+  vmstate whose memory regions differ from its own.
 
 Measured with the 2 vCPU template (WSL2, loaded host), a fresh VM per trial,
 with each burst run right after `run`:
