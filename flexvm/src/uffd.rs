@@ -1682,6 +1682,8 @@ impl Pager {
         }
         // Unprotect what may change now, in runs around pages still protected for the copy.
         let keep = |p: usize| cow.as_ref().is_some_and(|c| matches!(c.state(p), PENDING | READING | RESCUING));
+        // Whether this call unprotected the faulting page, which wakes it.
+        let mut woken = false;
         let mut p = first;
         while p < end {
             if keep(p) {
@@ -1694,12 +1696,22 @@ impl Pager {
             }
             (p..q).for_each(|d| self.pages().mark_dirty(d));
             self.writeprotect(p, q - p, false)?;
+            woken |= (p..q).contains(&page);
             p = q;
         }
+        // Test fault `ckpt_wp_race`: the writer that claimed the page is
+        // done with it before the fault is settled.
+        if self.wp_race.load(Ordering::Relaxed) && !woken {
+            let t = Instant::now();
+            while keep(page) && t.elapsed() < Duration::from_millis(50) {
+                thread::sleep(Duration::from_micros(100));
+            }
+        }
         // A writer claimed the faulting page itself (PENDING -> READING)
-        // after the check above: it stays protected, and nothing else wakes
-        // the fault. Retry it once the writer is done with the page.
-        if keep(page) {
+        // after the check above, so it stayed protected, and nothing else
+        // wakes the fault (writers never unprotect, even once they are done
+        // with it): retry it, and unprotect it then.
+        if !woken {
             if let Some(cow) = &cow {
                 cow.stats.deferred.fetch_add(1, Ordering::Relaxed);
             }
