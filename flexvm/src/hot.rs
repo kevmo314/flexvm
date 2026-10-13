@@ -79,15 +79,17 @@ impl Paused {
             "clock_realtime": true,
             "resume_vm": false,
         });
-        let loaded = idle.fc.request_within("PUT", "/snapshot/load", Some(body), LOAD_TIMEOUT);
-        paused.pager.loaded();
-        loaded?;
+        idle.fc.request_within("PUT", "/snapshot/load", Some(body), LOAD_TIMEOUT)?;
         // Loaded with resume_vm false, Firecracker still runs its devices (tap
         // RX, vsock, balloon timer) into guest memory; an API pause stops them.
         idle.fc.request_within("PATCH", "/vm", Some(json!({"state": "Paused"})), API_TIMEOUT)?;
         paused.pager.wait_ready(Duration::from_secs(5))?;
         // Get the slow first run after a restore out of the way, off the request path.
-        idle.fc.request_within("PATCH", "/vm", Some(json!({"state": "Resumed"})), API_TIMEOUT)?;
+        let resumed = idle.fc.request_within("PATCH", "/vm", Some(json!({"state": "Resumed"})), API_TIMEOUT);
+        // The load set includes what resuming touches (Firecracker kicks the
+        // virtqueues), as a migration target's load resumes the VM too.
+        paused.pager.loaded();
+        resumed?;
         wait_for_reseed(&idle.fc.sockets.vsock)?;
         // Step the wall clock now: it keeps time while paused, so START at
         // take finds it right and skips clock_settime, which can take tens of
