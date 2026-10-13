@@ -15,6 +15,7 @@ install -m 755 target/x86_64-unknown-linux-gnu/release/flexvm-init artifacts/fle
 
 work=$root/build/rootfs
 sudo rm -rf "$work"
+mkdir -p "$(dirname "$work")"
 sudo unsquashfs -q -d "$work" artifacts/base.squashfs
 sudo install -m 755 target/x86_64-unknown-linux-gnu/release/flexvm-init "$work/sbin/flexvm-init"
 
