@@ -1,7 +1,7 @@
 //! A Firecracker process and a minimal client for its HTTP-over-UDS API.
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -161,7 +161,7 @@ impl Firecracker {
             Ok(None) => "still running".into(),
             Err(e) => format!("unknown ({e})"),
         };
-        let log = std::fs::read_to_string(dir.join("firecracker.log")).unwrap_or_default();
+        let log = File::open(dir.join("firecracker.log")).and_then(|mut f| log_tail(&mut f)).unwrap_or_default();
         let tail: Vec<&str> = log.lines().rev().take(5).collect();
         let tail: Vec<&str> = tail.into_iter().rev().collect();
         format!("firecracker {} {status}; log: {}", self.pid(), tail.join(" | "))
@@ -172,6 +172,20 @@ impl Firecracker {
         let _ = self.child.wait();
         self.sockets.cleanup();
     }
+}
+
+/// Reads at most 64 KiB, dropping the first partial line when seeking into a log.
+fn log_tail(r: &mut (impl Read + Seek)) -> std::io::Result<String> {
+    let len = r.seek(SeekFrom::End(0))?;
+    let start = len.saturating_sub(64 << 10);
+    r.seek(SeekFrom::Start(start))?;
+    let mut log = Vec::new();
+    r.take(64 << 10).read_to_end(&mut log)?;
+    if start != 0 {
+        let end = log.iter().position(|&b| b == b'\n').map_or(log.len(), |i| i + 1);
+        log.drain(..end);
+    }
+    String::from_utf8(log).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
 impl Drop for Firecracker {
@@ -371,5 +385,58 @@ impl Pool {
             let _ = w.join();
         }
         drop(idle);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Counted<R> {
+        inner: R,
+        read: usize,
+    }
+
+    impl<R: Read> Read for Counted<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.read += n;
+            Ok(n)
+        }
+    }
+
+    impl<R: Seek> Seek for Counted<R> {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    #[test]
+    fn post_mortem_log_reads_only_a_bounded_tail() {
+        let path = std::env::temp_dir().join(format!("flexvm-fc-tail-{}", std::process::id()));
+        let mut f = File::create(&path).unwrap();
+        // Invalid UTF-8 outside the tail must never be read. The tail starts
+        // halfway through a long line, which must be discarded.
+        f.write_all(&vec![0xff; 2 << 20]).unwrap();
+        f.write_all(&vec![b'x'; 64 << 10]).unwrap();
+        f.write_all(b"\nfirst\nsecond\nthird\nfourth\nfifth\n").unwrap();
+        drop(f);
+        let mut r = Counted { inner: File::open(&path).unwrap(), read: 0 };
+        assert_eq!(log_tail(&mut r).unwrap(), "first\nsecond\nthird\nfourth\nfifth\n");
+        assert_eq!(r.read, 64 << 10);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn log_tail_keeps_small_logs_and_discards_partial_lines() {
+        use std::io::Cursor;
+        for log in ["", "one", "one\ntwo\n"] {
+            assert_eq!(log_tail(&mut Cursor::new(log.as_bytes())).unwrap(), log);
+        }
+        assert_eq!(log_tail(&mut Cursor::new(vec![b'x'; 128 << 10])).unwrap(), "");
+        // Seeking can land inside a UTF-8 character in the discarded line.
+        let mut log = "é".repeat(64 << 10).into_bytes();
+        log.extend_from_slice(b"\nlast");
+        assert_eq!(log_tail(&mut Cursor::new(log)).unwrap(), "last");
     }
 }

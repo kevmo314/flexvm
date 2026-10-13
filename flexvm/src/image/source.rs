@@ -4,9 +4,9 @@
 //! extracted to disk first.
 //!
 //! All of it is untrusted. Documents are size-capped and digest-checked
-//! before use; layer blobs are checked against their descriptors' digest and
-//! size (`Layer::verify`) right before they are unpacked, and their
-//! uncompressed contents against the config's `diff_ids` while unpacking.
+//! before use; while unpacking, layer blobs are checked against their
+//! descriptors' digest and size, and their uncompressed contents against
+//! the config's `diff_ids`.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -88,33 +88,46 @@ impl Layer {
         }
     }
 
-    pub fn open(&self) -> Result<Box<dyn Read>> {
-        Ok(self.src.open()?.0)
-    }
-
-    /// Reads the whole blob and checks it against its descriptor.
-    pub fn verify(&self) -> Result<()> {
-        let (mut r, len) = self.src.open()?;
+    pub fn open(&self) -> Result<LayerReader> {
+        let (inner, len) = self.src.open()?;
         if let Some(size) = self.size {
             if len != size {
                 bail!("layer {} is {len} bytes, its descriptor says {size}", self.name());
             }
         }
-        let Some(digest) = &self.digest else { return Ok(()) };
-        let mut h = Sha256::new();
-        let mut buf = vec![0u8; 1 << 20];
-        loop {
-            let n = r.read(&mut buf)?;
-            if n == 0 {
-                break;
+        Ok(LayerReader { inner, hash: Sha256::new(), n: 0 })
+    }
+
+    /// Checks the blob hashed while unpacking, including any remaining bytes.
+    pub fn verify(&self, mut r: LayerReader) -> Result<()> {
+        std::io::copy(&mut r, &mut std::io::sink())?;
+        if let Some(size) = self.size {
+            if r.n != size {
+                bail!("layer {} is {} bytes, its descriptor says {size}", self.name(), r.n);
             }
-            h.update(&buf[..n]);
         }
-        let got = format!("sha256:{:x}", h.finalize());
+        let Some(digest) = &self.digest else { return Ok(()) };
+        let got = format!("sha256:{:x}", r.hash.finalize());
         if &got != digest {
             bail!("layer blob {digest} has digest {got}");
         }
         Ok(())
+    }
+}
+
+/// Hashes the compressed bytes as the decompressor reads them.
+pub struct LayerReader {
+    inner: Box<dyn Read>,
+    hash: Sha256,
+    n: u64,
+}
+
+impl Read for LayerReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.hash.update(&buf[..n]);
+        self.n += n as u64;
+        Ok(n)
     }
 }
 

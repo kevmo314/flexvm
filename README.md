@@ -682,10 +682,10 @@ array; a new entrypoint drops the image's command), `--env K=V` (repeatable),
 `--workdir`, `--user name|uid[:group|gid]`.
 
 Images are untrusted input processed as root. Every document and blob is
-checked against its digest before use (layers once more right before they are
-unpacked, and their uncompressed contents against the config's `diff_ids`
-while unpacking), and builds are bounded: `--max-download-mib` (8192, all
-layers compressed), `--max-unpacked-mib` (16384), `--max-file-mib` (4096),
+checked against its digest (layers while unpacking into private staging,
+and their uncompressed contents against the config's `diff_ids`, all before
+publishing the root filesystem), and builds are bounded: `--max-download-mib`
+(8192, all layers compressed), `--max-unpacked-mib` (16384), `--max-file-mib` (4096),
 `--max-entries` (1,000,000), plus 4 MiB per manifest or config and 1 MiB per
 tar entry's metadata (PAX records and GNU long names together, one of each).
 Readiness commands run as the app does (same user and restrictions) in a
