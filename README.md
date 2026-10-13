@@ -457,22 +457,17 @@ Two details keep untouched plugged memory free:
   sets are padded to 16-page blocks instead, so restores still prefetch
   around what they touch.
 
-Cost, against main on the same host. The A/B alternated the two daemons
-trial by trial, 2 × 60 runs; migrations come from four alternating rounds of
-`flexvm bench --dirty-mib 200`, 15 trials each:
+Cost, measured against main on the same host. Run latency alternated the two
+daemons trial by trial (60 runs each); migration used four alternating rounds
+of `flexvm bench --dirty-mib 200`, 15 trials each:
 
 | | main | now |
 |---|---|---|
-| Idle VM host RSS | 18 MiB | 9–22 MiB |
-| `run` p50 (interleaved) | 31.7 / 32.9 ms | 34.8 / 33.2 ms |
-| of which snapshot load | 22.4 ms | 22.7 ms |
-| of which guest agent's first reply (`guest_net`) | 6.3 ms | 7.3 ms |
-| Migration downtime p50 / p90 | 62.8 / 71.9 ms | 51.5 / 71.7 ms |
-| Background pull p50 (200 MiB dirty) | 316 ms | 304 ms |
-
-The extra ~1 ms of `guest_net` comes from the first touches after restore,
-not from the memory cgroup itself: NET round trips in a running guest take
-0.5–0.6 ms with the agent inside the cgroup or outside it.
+| Idle VM host RSS | 18 MiB | 9–23 MiB |
+| `run` p50 from the hot pool | 4.7 ms | 4.4 ms |
+| `run` p50 with no hot pool (snapshot load) | 38.0 ms (load 26.8) | 39.6 ms (load 26.4) |
+| Migration downtime p50 / p90 | 52.5 / 82.5 ms | 48.5 / 59.3 ms |
+| Background pull p50 (200 MiB dirty) | 330 ms | 303 ms |
 
 ### Migration ownership
 
