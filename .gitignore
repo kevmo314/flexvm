@@ -4,3 +4,4 @@
 /state*
 *.log
 /.claude
+__pycache__/
