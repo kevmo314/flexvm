@@ -1,0 +1,72 @@
+--- a/src/vmm/src/persist.rs
++++ b/src/vmm/src/persist.rs
+@@ -585,7 +585,9 @@
+             .map_err(GuestMemoryFromUffdError::Register)?;
+     }
+ 
+-    send_uffd_handshake(mem_uds_path, &backend_mappings, &uffd)?;
++    // flexvm: the memfd backing guest memory goes along with the uffd.
++    let memfd = guest_memory[0].file_offset().map(|f| f.file().as_raw_fd());
++    send_uffd_handshake(mem_uds_path, &backend_mappings, &uffd, memfd)?;
+ 
+     Ok((guest_memory, Some(uffd)))
+ }
+@@ -595,7 +597,10 @@
+     track_dirty_pages: bool,
+     huge_pages: HugePageConfig,
+ ) -> Result<(Vec<GuestRegionMmap>, Vec<GuestRegionUffdMapping>), GuestMemoryFromUffdError> {
+-    let guest_memory = memory::anonymous(mem_state.regions(), track_dirty_pages, huge_pages)?;
++    // flexvm: guest memory is a shared memfd, so the page server can map it
++    // and read (or write out) guest pages without copying them out first.
++    let regions: Vec<_> = mem_state.regions().collect();
++    let guest_memory = memory::memfd_backed(&regions, track_dirty_pages, huge_pages)?;
+     let mut backend_mappings = Vec::with_capacity(guest_memory.len());
+     let mut offset = 0;
+     for mem_region in guest_memory.iter() {
+@@ -617,14 +622,16 @@
+     mem_uds_path: &Path,
+     backend_mappings: &[GuestRegionUffdMapping],
+     uffd: &impl AsRawFd,
++    memfd: Option<std::os::unix::io::RawFd>,
+ ) -> Result<(), GuestMemoryFromUffdError> {
+     // This is safe to unwrap() because we control the contents of the vector
+     // (i.e GuestRegionUffdMapping entries).
+     let backend_mappings = serde_json::to_string(backend_mappings).unwrap();
+ 
+     let socket = UnixStream::connect(mem_uds_path)?;
+-    socket.send_with_fd(
+-        backend_mappings.as_bytes(),
++    let fds: Vec<_> = std::iter::once(uffd.as_raw_fd()).chain(memfd).collect();
++    socket.send_with_fds(
++        &[backend_mappings.as_bytes()],
+         // In the happy case we can close the fd since the other process has it open and is
+         // using it to serve us pages.
+         //
+@@ -655,7 +662,7 @@
+         // Moreover, Firecracker holds a copy of the UFFD fd as well, so that even if the
+         // page fault handler process does not tear down Firecracker when necessary, the
+         // uffd will still be alive but with no one to serve faults, leading to guest freeze.
+-        uffd.as_raw_fd(),
++        &fds,
+     )?;
+ 
+     // We prevent Rust from closing the socket file descriptor to avoid a potential race condition
+--- a/src/vmm/src/vstate/memory.rs
++++ b/src/vmm/src/vstate/memory.rs
+@@ -820,8 +820,15 @@
+             _ => {
+                 // Madvise the region in order to mark it as not used.
+                 let host_addr = self.get_host_address(caddr)?;
++                // flexvm: MADV_DONTNEED only unmaps shared memory; MADV_REMOVE frees it
++                // (and, like MADV_DONTNEED, tells userfaultfd).
++                let advice = if self.inner.flags() & libc::MAP_SHARED != 0 {
++                    libc::MADV_REMOVE
++                } else {
++                    libc::MADV_DONTNEED
++                };
+                 // SAFETY: The address and length are known to be valid.
+-                let ret = unsafe { libc::madvise(host_addr.cast(), len, libc::MADV_DONTNEED) };
++                let ret = unsafe { libc::madvise(host_addr.cast(), len, advice) };
+                 if ret < 0 {
+                     let os_error = std::io::Error::last_os_error();
+                     error!("discard_range: madvise failed: {:?}", os_error);
