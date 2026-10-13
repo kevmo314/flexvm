@@ -214,7 +214,7 @@ fn serve(statuses: Statuses) -> io::Result<()> {
     if rc != 0 || unsafe { libc::listen(fd.as_raw_fd(), 64) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    let sessions: session::Sessions = Arc::new(Mutex::new(HashMap::new()));
+    let sessions = session::Sessions::default();
     {
         let sessions = sessions.clone();
         thread::spawn(move || loop {
@@ -245,7 +245,8 @@ fn serve(statuses: Statuses) -> io::Result<()> {
         } else {
             let statuses = statuses.clone();
             let sessions = sessions.clone();
-            thread::spawn(move || {
+            // Out of threads: drop this connection (closing it) rather than abort PID 1.
+            let _ = thread::Builder::new().spawn(move || {
                 // A blocked write is backpressure from a slow client; migration resets the socket.
                 if matches!(line.split_whitespace().next(), Some("SESSION" | "ATTACH" | "CLOSE")) {
                     let _ = session::handle(stream, r, &line, &sessions, &statuses);

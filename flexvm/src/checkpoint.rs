@@ -533,7 +533,9 @@ impl PagesFile {
         }
     }
 
-    /// Writes the buffers in `iov` (page-aligned, whole pages) at `off`.
+    /// Writes the buffers in `iov` (page-aligned, initialized whole pages) at
+    /// a page-aligned `off`. The caller keeps their allocations alive and
+    /// unchanged until this returns, including through the buffered retry.
     fn write(&self, iov: &mut [libc::iovec], off: u64) -> io::Result<()> {
         match pwritev_all(&self.file, &mut iov.to_vec(), off) {
             // O_DIRECT turned out not to work here after all: write through the cache.
@@ -547,6 +549,10 @@ impl PagesFile {
     }
 }
 
+// Each iovec points into initialized, readable storage owned by the caller,
+// which stays alive and unchanged through every synchronous syscall here.
+// O_DIRECT callers supply aligned addresses, lengths and offsets. Advancing a
+// partially written iovec stays within its allocation; it does not own memory.
 fn pwritev_all(file: &File, mut iov: &mut [libc::iovec], mut off: u64) -> io::Result<()> {
     while !iov.is_empty() {
         let cnt = iov.len().min(libc::UIO_MAXIOV as usize) as libc::c_int;
@@ -576,15 +582,24 @@ fn pwritev_all(file: &File, mut iov: &mut [libc::iovec], mut off: u64) -> io::Re
     Ok(())
 }
 
-/// A page-aligned buffer, for O_DIRECT.
+/// Owns a nonempty, PAGE_SIZE-aligned allocation of initialized bytes, for
+/// O_DIRECT. `get` lends at most the allocation's length exclusively; raw
+/// iovecs derived from it must be consumed before reuse or drop of the buffer.
 struct Buf(*mut u8, usize);
 
 impl Buf {
-    fn new(len: usize) -> Buf {
-        let layout = std::alloc::Layout::from_size_align(len, PAGE_SIZE).unwrap();
-        let p = unsafe { std::alloc::alloc(layout) };
-        assert!(!p.is_null(), "out of memory");
-        Buf(p, len)
+    fn new(len: usize) -> io::Result<Buf> {
+        let layout = std::alloc::Layout::from_size_align(len, PAGE_SIZE)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        if len == 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty checkpoint buffer"));
+        }
+        // Zeroing makes creating a u8 slice valid even before GuestPages::read.
+        let p = unsafe { std::alloc::alloc_zeroed(layout) };
+        if p.is_null() {
+            return Err(io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate checkpoint buffer"));
+        }
+        Ok(Buf(p, len))
     }
 
     fn get(&mut self, len: usize) -> &mut [u8] {
@@ -637,7 +652,7 @@ fn write_pages(template: &Template, src: &dyn GuestPages, runs: &Runs, out: &Pag
         }
     };
     let work = || -> Result<()> {
-        let mut buf = Buf::new(UNIT * PAGE_SIZE);
+        let mut buf = Buf::new(UNIT * PAGE_SIZE)?;
         let mut iov: Vec<libc::iovec> = Vec::with_capacity(UNIT);
         loop {
             if failed.load(Ordering::Relaxed) {
@@ -649,6 +664,9 @@ fn write_pages(template: &Template, src: &dyn GuestPages, runs: &Runs, out: &Pag
             src.read(first, bytes)?;
             let mut unit = Unit { first, kinds: Vec::with_capacity(n), sums: Vec::new(), at: 0 };
             iov.clear();
+            // Only whole initialized pages enter the iovecs. Coalescing is
+            // within this one allocation, which is not reused until write
+            // (and all its pwritev calls) has returned.
             for (i, page) in bytes.chunks(PAGE_SIZE).enumerate() {
                 let (kind, sum) = classify(template, first + i, page);
                 unit.kinds.push(kind);
@@ -1155,6 +1173,16 @@ mod tests {
     use super::*;
     use crate::template::Paths;
 
+    #[test]
+    fn buffer_is_aligned_initialized_and_allocation_failure_is_an_error() {
+        let mut buf = Buf::new(PAGE_SIZE).unwrap();
+        assert_eq!(buf.0 as usize % PAGE_SIZE, 0);
+        assert!(buf.get(PAGE_SIZE).iter().all(|&b| b == 0));
+        // A valid layout larger than the address space Linux can map must fail
+        // allocation without aborting (even with virtual-memory overcommit).
+        let len = isize::MAX as usize & !(PAGE_SIZE - 1);
+        assert_eq!(Buf::new(len).err().unwrap().kind(), io::ErrorKind::OutOfMemory);
+    }
     /// A template whose memory file has `pages` pages; `Some(b)` is a page
     /// filled with `b`, `None` a hole.
     fn template(dir: &Path, pages: &[Option<u8>]) -> Arc<Template> {
