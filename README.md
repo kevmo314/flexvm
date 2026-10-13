@@ -10,8 +10,8 @@ in tens of milliseconds.
 | Concern | Mechanism |
 |---|---|
 | CPU | vCPUs = host cores (FC max 32). Idle vCPUs halt and cost nothing. Each VM's Firecracker runs in a cgroup of its own with the `cpu` controller on, all at the default `cpu.weight`, so busy VMs share contended CPU equally however many threads each runs. |
-| Memory growth | 256 MiB base + a virtio-mem region up to host RAM (in 1 GiB slots). The daemon hot-plugs memory in 128 MiB steps when the guest's available memory drops below 25% (min 256 MiB), and unplugs when it has lots spare. |
-| Memory return | virtio-balloon **free page reporting**: pages the guest frees go back to the host within seconds. |
+| Memory growth | Boot memory (256 MiB + 1/32 of the ceiling) + a virtio-mem region up to host RAM, of which **4 GiB is already plugged in the template**. Plugged memory the guest never touched costs the host nothing, so bursts never wait on the host. Past that, the guest asks for more over vsock the moment it runs low, and the daemon keeps a quarter of the guest (at least 1 GiB) free. See [Memory](#memory). |
+| Memory return | virtio-balloon **free page reporting**: pages the guest frees go back to the host within seconds, whether or not they stay plugged. |
 | Root filesystem | One read-only ext4 image on virtio-pmem with DAX, shared by every VM through the host page cache. Writes go to a tmpfs overlay inside the guest, so they migrate with memory. |
 | Start | Every VM is a **UFFD restore of a template snapshot** into a pre-spawned, pre-cgrouped Firecracker. The template's recorded working set is copied in bulk; everything else is faulted in lazily from a shared, sparse template image. A **hot pool** keeps VMs already restored and paused, so `run` is usually just a resume. |
 | Migration | **Post-copy**: the target gets everything ready first (template, address, a Firecracker with the template's VM structure already built); then pause, save vCPU and device state only (~20–200 KiB), load it and resume on the target, then the target's pager fetches pages from the paused source on fault and in the background. The source releases the VM once every page has arrived, and never resumes it once the target may own it. |
@@ -380,6 +380,64 @@ boundary. A restored copy finds any page saved with contents from after the
 pause (or before its last write before it). The daemon also hashes guest
 memory during the pause (`ckpt_memhash` test fault), which must equal the
 hash of what the checkpoint restores (`ckhash`).
+
+### Memory
+
+A VM never needs a memory size: it must be able to grow to host RAM without
+the guest OOM killer firing first. Growth by hot-plug is reactive, though,
+and a guest can allocate faster than a 1 s controller notices. So growth does
+not wait on the host:
+
+- **Pre-plugged.** Templates are snapshotted with `PLUG_MIB` (4 GiB) of
+  virtio-mem already plugged, so a VM starts with ~5 GiB of RAM. The memory
+  is free in the snapshot (holes in the template file), and guest pages cost
+  the host only once touched. Idle RSS, run latency and template size barely
+  move (measured below).
+  The controller never shrinks a VM below this, because shrinking runs offlining,
+  which touches the page structs.
+- **Overcommit.** The guest runs with `vm.overcommit_memory=1`, so one
+  allocation larger than the current RAM (`bytearray(8 << 30)`) succeeds and
+  grows as it is touched. Under the default heuristic it failed outright.
+- **Asking, not polling.** flexvm-init (`guest/src/mem.rs`) puts everything in
+  a memory cgroup whose `memory.high` sits `headroom(MemTotal)` below
+  MemTotal. That is the same mark the daemon keeps free (a quarter of the
+  guest, at least 1 GiB). Crossing it wakes the agent (a `memory.events`
+  notification, no timer), which sends `MEM <available> <total>` to the host
+  on vsock port 53. The daemon resizes at once with those fresh numbers
+  instead of waiting for its next tick.
+- **Wait, don't die.** Allocations that outrun the plug are throttled by the
+  kernel at `memory.high` rather than OOM-killed. Memory block uevents move the
+  mark as memory arrives. If the host answers `full` (at the ceiling), or
+  nothing arrives within 3 s, the agent lifts the throttle, and the guest
+  behaves as it would without it.
+- **Boot memory for page structs.** Hot-plugged memory is movable, so the
+  page structs of every plugged block (1/64 of it) and all other kernel
+  allocations live in boot memory. A 256 MiB base ran out at ~11 GiB plugged
+  and the guest kernel OOMed. The default base is therefore 256 MiB + 1/32 of
+  the ceiling (1280 MiB on a 32 GiB host); untouched, it costs nothing.
+- **Shrinking** is free page reporting (freed pages go back within seconds,
+  plugged or not), plus unplugging memory above the template's plug once a
+  guest has had more than three times its headroom free for 10 s.
+- **Host accounting.** A VM is starved (and migrated by the pressure policy)
+  only when it is actually short of free memory and cannot grow here: at its
+  ceiling, or with the host below `--reserve`. Plugged-but-free memory is not
+  counted as use, and the pressure policy still picks VMs by host RSS.
+- **Resizes and migrations exclude each other.** Every resize holds the VM's
+  resize lock and only touches a running VM. `start_source` takes the same
+  lock and waits for any plug in flight to settle (`Vm::settle_hotplug`:
+  requested == plugged, else cut down to what is plugged by half the
+  deadline). The target refuses a vmstate whose memory regions differ from
+  its own.
+
+Measured with the 2 vCPU template (WSL2, loaded host). Each burst ran right
+after `run`, with a fresh VM per trial:
+
+| Burst right after `run` | main | this |
+|---|---|---|
+| `python3 -c 'b=bytearray(1<<30)'` | MemoryError 3/3 | ok 10/10 |
+| 1 GiB: dd buffer, 64 MiB chunks, /dev/shm, 4 parallel | ok (touch is slow here, ~100 MB/s) | ok 40/40 |
+| 3 GiB: bytearray, chunks, /dev/shm | n/a (base too small) | ok 10/10 |
+| 300 MiB, controller slowed to 4 s (≈ a 4× faster guest) | OOM-killed 4/8 | see below |
 
 ### Migration ownership
 
@@ -853,6 +911,7 @@ flexvm/src/
 guest/src/main.rs     flexvm-init: PID 1, overlay root, vsock exec agent
 guest/src/session.rs  resumable exec sessions: output rings, attach, tombstones
 guest/src/app.rs      image entrypoint: start, supervision, log ring, readiness probe
+guest/src/mem.rs      memory cgroup mark, asks the host for memory over vsock
 guest/src/net.rs      guest network setup with ioctls and rtnetlink (no iproute2 needed)
 firecracker/          patches on top of Firecracker v1.17.0
 scripts/              setup, builds, fault and network tests
@@ -907,9 +966,6 @@ scripts/              setup, builds, fault and network tests
   restart policy, health checks, volumes or stop signal; stdout and stderr
   share one ring; `logs -f` stops when the VM migrates away (vsock resets).
   Building needs root (to keep ownership) and an uncompressed archive.
-- The controller samples guest memory once a second (balloon stats). A very
-  fast allocation burst can still hit the in-guest OOM killer; guest PSI
-  triggers over vsock would react faster.
 - **A copy-on-write checkpoint's copy holds back the VM's memory changes:**
   free page reports wait until it is done (memory the guest frees then
   goes back to the host only afterwards), and the guest cannot grow by
@@ -934,6 +990,15 @@ scripts/              setup, builds, fault and network tests
   downtime); see "Hot pool" for how the agent's requests fix it.
 - A guest that gets a different address on restore keeps its old one too,
   unless it has iproute2 to drop it.
+- **Growth past the pre-plugged 4 GiB is still reactive.** The guest asks
+  the moment it crosses its mark and is throttled meanwhile, but plugging
+  takes ~250 ms per GiB here. The throttle is lifted after 3 s (or when the
+  host is full), and a guest that keeps allocating can then OOM. Unplugging
+  also only covers memory above the template's plug.
+- **First touch of guest memory is slow under nested virt** (~10 ms per MiB
+  here: a userfaultfd zero-page fault plus an EPT fault per page). This
+  throttles bursts on its own; on bare metal the guest-side mechanisms above
+  carry more of the load.
 - Snapshot load is dominated by KVM memslot creation in this nested
   environment; expect much lower numbers on bare metal.
 
