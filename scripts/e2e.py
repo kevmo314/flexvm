@@ -29,14 +29,17 @@ p.add_argument("--image", default="public.ecr.aws/docker/library/busybox:1.36",
                help="container image for the image-template case")
 p.add_argument("--no-image", action="store_true", help="skip the image-template case (needs registry access)")
 # The scripts/faults.py scenarios that fit CI time: migration failure paths and fencing, address
-# generations, checkpoint corruption, copy-on-write exactness, held packets and devices, signals,
-# standby VMs. Left out: slow or heavy ones (pages_dead, quiet_source, guest_hang, cow_reports_held,
-# guest_calls, suspend_disk_freed, source_killed: their 1.5 GB guests outgrow the CI template, and the host
-# moves them) and the ones that restart the listeners (target_killed, suspend_resume).
+# generations and loans, forged peers, processes killed between steps, checkpoint corruption,
+# copy-on-write exactness, growth (on a template with little pre-plugged), held packets and devices,
+# signals, standby VMs. Left out: slow or heavy ones (pages_dead, quiet_source, guest_hang,
+# cow_reports_held, guest_calls, suspend_disk_freed, source_killed, kill_source, forged_peer: their
+# 1.5 GB guests outgrow the CI template, and the host moves them) and the ones that restart the
+# listeners (target_killed, suspend_resume).
 FAULTS = ("basic route lost_ack unknown refused pages_blip pages_dead_restore prepared_retry resume_kill exec_race "
-          "checkpoint_fork checkpoint_corrupt held_restore_frozen cow_exact cow_abort ckpt_incremental "
+          "checkpoint_restore checkpoint_fork checkpoint_corrupt held_restore_frozen cow_exact cow_abort ckpt_incremental "
           "ckpt_failed_stop ckpt_rearm prepare_fail fc_prepare slow_preload ckpt_packet_hold "
-          "abort_superseded gen_zero signals suspend_gen standby")
+          "abort_superseded gen_zero signals suspend_gen standby restore_ip_peer late_withdrawal "
+          "incoming_killed start_killed claim_killed cow_grow plug_storm")
 p.add_argument("--faults", default=FAULTS, help="scripts/faults.py scenarios to run against the two hosts ('' for none)")
 p.add_argument("cases", nargs="*", help="cases to run (default: all)")
 args = p.parse_args()
@@ -291,8 +294,10 @@ def vm_resources(ip):
             pass
     cgroup = None
     if pid:
+        # Only a leaf of flexvm's own: anything else may be shared, or inherited.
         rel = open(f"/proc/{pid}/cgroup").read().strip().split("::", 1)[-1]
-        cgroup = "/sys/fs/cgroup" + rel
+        if rel.startswith("/flexvm/") and rel.count("/") == 2:
+            cgroup = "/sys/fs/cgroup" + rel
     return {"route": route.strip(), "tap": tap, "pid": pid, "cgroup": cgroup}
 
 
@@ -617,11 +622,13 @@ def faults():
     if not args.faults.split():
         print("  none selected")
         return
+    # Growth needs a template that starts with little plugged.
+    env = {**os.environ, "COW_GROW_TEMPLATE": GROW, "PLUG_TEMPLATE": GROW}
     r = subprocess.run([sys.executable, os.path.join(ROOT, "scripts", "faults.py"), "--a", A.addr, "--b", B.addr,
                         "--a-state", A.state_dir, "--a-run", A.run_dir, "--b-state", B.state_dir, "--b-run", B.run_dir,
                         "--a-ips", f"{A.net}.2-{A.net}.60", "--b-ips", f"{B.net}.2-{B.net}.60",
                         "--no-listeners", "--bin", BIN, "--artifacts", ARTIFACTS, "--template", args.template,
-                        "--ckpt-dir", os.path.join(WORK, "faults-ckpt"), *args.faults.split()], timeout=1200)
+                        "--ckpt-dir", os.path.join(WORK, "faults-ckpt"), *args.faults.split()], timeout=1800, env=env)
     check("faults.py: no failures", r.returncode == 0, f"exit {r.returncode}")
 
 
@@ -632,6 +639,7 @@ def faults():
 RUN = tempfile.mkdtemp(prefix="fvci-", dir="/run")
 WORK = tempfile.mkdtemp(prefix="fvci-", dir="/var/tmp")
 A = Host("a", args.port_a, args.port_a + 1, args.net_a)
+GROW = args.template + "-grow"
 B = Host("b", args.port_a + 1, args.port_a, args.net_b)
 
 
@@ -645,7 +653,9 @@ def main():
     try:
         t = time.time()
         template(args.template, "--vcpus", "2", "--max", "2048")
-        print(f"PASS template ({time.time() - t:.1f} s)", flush=True)
+        # A larger ceiling with little plugged at the start: VMs must grow.
+        template(GROW, "--vcpus", "2", "--max", "4096", "--plug", "128")
+        print(f"PASS templates ({time.time() - t:.1f} s)", flush=True)
     except Exception as e:
         print(f"FAIL template: {e}", flush=True)
         return 1
@@ -666,9 +676,13 @@ def main():
                     for vm in sorted(h.vms & set(h.ls())):
                         h.kill(vm, check=False)
     finally:
+        # Teardown happens whatever saving the logs does.
         if failed:
             for h in (A, B):
-                h.save_logs()
+                try:
+                    h.save_logs()
+                except Exception as e:
+                    print(f"saving {h.label}'s logs: {e}", flush=True)
         t = time.time()
         problems = []
         for h in (A, B):
