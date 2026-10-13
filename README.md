@@ -172,7 +172,10 @@ layers compressed), `--max-unpacked-mib` (16384), `--max-file-mib` (4096),
 `--max-entries` (1,000,000), plus 4 MiB per manifest or config and 1 MiB per
 tar entry's metadata (PAX records and GNU long names together, one of each).
 Readiness commands run as the app does (same user and restrictions) in a
-cgroup of their own that is killed when the check ends.
+cgroup of their own that is killed and checked empty when the check ends; a
+failed cleanup fails the check. Non-root checks need cgroup2 with
+`cgroup.kill` and fail closed without it. Root checks are trusted (root in
+the guest can leave any cgroup); without cgroup2 their session is killed.
 
 - **Pull.** Native registry v2 client (no docker or skopeo): anonymous bearer
   tokens, or basic credentials from `$DOCKER_CONFIG`, `~/.docker/config.json`

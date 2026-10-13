@@ -20,7 +20,7 @@
 use std::collections::VecDeque;
 use std::ffi::CString;
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
@@ -186,8 +186,12 @@ fn read_conf() -> io::Result<Conf> {
 
 /// Runs a readiness command as the app would run (its user, env, workdir and
 /// restrictions) with output discarded: `ok`, `exit <code>` or `timeout`.
+///
 /// The command and everything it starts live in a cgroup of their own, which
-/// is killed whenever the check ends; without cgroup2, its session is.
+/// is killed, checked empty and removed whenever the check ends; a check
+/// whose cleanup fails is an error, never `ok`. A non-root check requires
+/// that cgroup and fails closed without it. A root check is trusted (it
+/// could leave any cgroup): without cgroup2 its session is killed instead.
 fn check(arg: &str, statuses: &Statuses) -> io::Result<String> {
     let (ms, hex) = arg.trim().split_once(' ').ok_or_else(|| io::Error::other("usage: CHECK <ms> <hex>"))?;
     let ms: u64 = ms.parse().map_err(|_| io::Error::other("bad timeout"))?;
@@ -197,7 +201,11 @@ fn check(arg: &str, statuses: &Statuses) -> io::Result<String> {
         .collect::<Option<Vec<u8>>>()
         .ok_or_else(|| io::Error::other("bad command encoding"))?;
     let c = read_conf()?;
-    let cg = CheckGroup::new();
+    let mut cg = match CheckGroup::new() {
+        Ok(g) => Some(g),
+        Err(_) if c.uid == 0 => None,
+        Err(e) => return Err(io::Error::other(format!("cannot contain a non-root readiness check: {e}"))),
+    };
     let mut cmd = Command::new("/bin/sh");
     cmd.args(["-c", &String::from_utf8_lossy(&bytes)])
         .env_clear()
@@ -206,29 +214,35 @@ fn check(arg: &str, statuses: &Statuses) -> io::Result<String> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let procs = cg.as_ref().map(|g| g.procs.clone());
-    restrict(&mut cmd, &c, procs);
+    restrict(&mut cmd, &c, cg.as_ref().map(|g| g.procs.clone()));
+    // On error the guard removes the (empty) group.
     let child = spawn(&mut cmd, statuses, true).map_err(|e| io::Error::new(e.kind(), format!("cannot run /bin/sh: {e}")))?;
     let pid = child.id() as i32;
     let code = wait_until(statuses, pid, Instant::now() + Duration::from_millis(ms));
     // Kill whatever is left, the leader included if it timed out.
-    match &cg {
-        Some(g) => g.kill(),
-        None => unsafe {
-            libc::kill(-pid, libc::SIGKILL);
-        },
-    }
+    let cleaned = match &mut cg {
+        Some(g) => g.cleanup(),
+        None => {
+            unsafe { libc::kill(-pid, libc::SIGKILL) };
+            Ok(())
+        }
+    };
     let code = match code {
-        Some(code) => code,
+        Some(code) => Some(code),
         None => {
             unsafe { libc::kill(pid, libc::SIGKILL) };
             if wait_until(statuses, pid, Instant::now() + Duration::from_secs(2)).is_none() {
                 return Err(io::Error::other(format!("readiness command {pid} would not die")));
             }
-            return Ok("timeout".into());
+            None
         }
     };
-    Ok(if code == 0 { "ok".into() } else { format!("exit {code}") })
+    cleaned.map_err(|e| io::Error::other(format!("readiness check cleanup failed: {e}")))?;
+    Ok(match code {
+        Some(0) => "ok".into(),
+        Some(code) => format!("exit {code}"),
+        None => "timeout".into(),
+    })
 }
 
 /// Waits for `pid`'s exit status until `deadline`.
@@ -248,42 +262,63 @@ fn wait_until(statuses: &Statuses, pid: i32, deadline: Instant) -> Option<i32> {
     }
 }
 
-/// A cgroup2 group for one readiness check.
+/// A cgroup2 group for one readiness check. Dropping it without `cleanup`
+/// (an early return) still kills and removes it, within the same bound.
 struct CheckGroup {
     dir: String,
     /// `<dir>/cgroup.procs`, for the child to move itself into before exec.
     procs: CString,
+    done: bool,
 }
 
 impl CheckGroup {
-    fn new() -> Option<CheckGroup> {
+    fn new() -> io::Result<CheckGroup> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
         const ROOT: &str = "/sys/fs/cgroup";
         if !std::path::Path::new(&format!("{ROOT}/cgroup.procs")).exists() {
             let (src, dst, ty) = (c"cgroup2", c"/sys/fs/cgroup", c"cgroup2");
             if unsafe { libc::mount(src.as_ptr(), dst.as_ptr(), ty.as_ptr(), 0, std::ptr::null()) } != 0 {
-                return None;
+                return Err(io::Error::other(format!("mount cgroup2: {}", io::Error::last_os_error())));
             }
         }
         let dir = format!("{ROOT}/flexvm-check-{}", NEXT.fetch_add(1, Ordering::Relaxed));
-        std::fs::create_dir(&dir).ok()?;
-        let procs = CString::new(format!("{dir}/cgroup.procs")).ok()?;
-        Some(CheckGroup { dir, procs })
+        std::fs::create_dir(&dir).map_err(|e| io::Error::other(format!("create {dir}: {e}")))?;
+        let g = CheckGroup { procs: CString::new(format!("{dir}/cgroup.procs")).unwrap(), dir, done: false };
+        // Needs cgroup.kill (Linux 5.14) to kill every task at once.
+        if !std::path::Path::new(&format!("{}/cgroup.kill", g.dir)).exists() {
+            return Err(io::Error::other("the kernel has no cgroup.kill"));
+        }
+        Ok(g)
     }
 
-    /// Kills every task in the group, waits (bounded) for it to empty, removes it.
-    fn kill(&self) {
-        let _ = std::fs::write(format!("{}/cgroup.kill", self.dir), "1");
+    /// Kills every task in the group, checks it emptied within 2 s, and
+    /// removes it. Any failure is returned.
+    fn cleanup(&mut self) -> io::Result<()> {
+        self.done = true;
+        std::fs::write(format!("{}/cgroup.kill", self.dir), "1")?;
         let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline {
-            let events = std::fs::read_to_string(format!("{}/cgroup.events", self.dir)).unwrap_or_default();
-            if events.contains("populated 0") {
+        loop {
+            let events = std::fs::read_to_string(format!("{}/cgroup.events", self.dir))?;
+            if events.lines().any(|l| l == "populated 0") {
                 break;
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::other(format!("{} still has tasks after 2 s", self.dir)));
             }
             thread::sleep(Duration::from_millis(5));
         }
-        let _ = std::fs::remove_dir(&self.dir);
+        std::fs::remove_dir(&self.dir)
+    }
+}
+
+impl Drop for CheckGroup {
+    fn drop(&mut self) {
+        if !self.done {
+            if let Err(e) = self.cleanup() {
+                let _ = writeln!(io::stderr(), "flexvm-init: readiness check group: {e}");
+            }
+        }
     }
 }
 
