@@ -1,6 +1,7 @@
 mod bench;
 mod bench_lifecycle;
 mod checkpoint;
+mod crc32c;
 mod daemon;
 mod fc;
 mod guest;
