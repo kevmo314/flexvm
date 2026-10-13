@@ -264,6 +264,10 @@ fn flock(f: &File, op: libc::c_int) -> std::io::Result<()> {
 
 /// Holds a stable per-key lock through the cache check, build and publication.
 fn cached_rootfs(cached: &Path, build: impl FnOnce(&Path) -> Result<String>) -> Result<PathBuf> {
+    cached_rootfs_with_sync(cached, build, sync_dir)
+}
+
+fn cached_rootfs_with_sync(cached: &Path, build: impl FnOnce(&Path) -> Result<String>, sync: impl Fn(&Path) -> Result<()>) -> Result<PathBuf> {
     use std::os::unix::fs::OpenOptionsExt;
     let dir = cached.parent().unwrap();
     std::fs::create_dir_all(dir)?;
@@ -277,9 +281,17 @@ fn cached_rootfs(cached: &Path, build: impl FnOnce(&Path) -> Result<String>) -> 
         flock(&lock, libc::LOCK_EX)?;
     }
     let ok = cached.with_extension("ok");
+    let marked = match std::fs::symlink_metadata(&ok) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(e.into()),
+    };
     if entry_complete(cached) {
+        // A previous publisher may have failed its fsync after renaming .ok.
+        // File contents were synced before rename; confirm the names too.
+        sync(dir)?;
         eprintln!("image: root filesystem cached at {}", cached.display());
-    } else if std::fs::symlink_metadata(&ok).is_ok() {
+    } else if marked {
         // Once marked, templates may use the entry: never rebuild it in place.
         bail!(
             "image cache entry {} is marked complete but has missing files; templates may use it, \
@@ -293,7 +305,7 @@ fn cached_rootfs(cached: &Path, build: impl FnOnce(&Path) -> Result<String>) -> 
         // anything still has open.
         remove_leftovers(cached)?;
         let tmp = cached.with_extension(format!("tmp{}", std::process::id()));
-        let res = build(&tmp).and_then(|conf| publish_rootfs(&tmp, cached, &conf));
+        let res = build(&tmp).and_then(|conf| publish_rootfs(&tmp, cached, &conf, &sync));
         let _ = std::fs::remove_file(&tmp);
         res?;
     }
@@ -323,22 +335,22 @@ fn remove_leftovers(cached: &Path) -> Result<()> {
 }
 
 /// Publishes immutable files, with the completion marker last. A competing
-/// publisher's entry may only be reused once all three files are present.
-fn publish_rootfs(tmp: &Path, cached: &Path, conf: &str) -> Result<()> {
+/// publisher's entry may only be reused once all three files are durable.
+fn publish_rootfs(tmp: &Path, cached: &Path, conf: &str, sync: impl Fn(&Path) -> Result<()>) -> Result<()> {
     File::open(tmp)?.sync_all()?;
-    if !rename_noreplace(tmp, cached)? {
-        return require_complete(cached);
-    }
-    if !publish(&cached.with_extension("conf"), conf.as_bytes())? {
-        return require_complete(cached);
-    }
-    // The image and its config are durable before the marker says so.
     let dir = cached.parent().unwrap();
-    sync_dir(dir)?;
-    if !publish(&cached.with_extension("ok"), b"")? {
+    if !rename_noreplace(tmp, cached)? || !publish(&cached.with_extension("conf"), conf.as_bytes())? {
         require_complete(cached)?;
+    } else {
+        // The image and its config are durable before the marker says so.
+        sync(dir)?;
+        if !publish(&cached.with_extension("ok"), b"")? {
+            require_complete(cached)?;
+        }
     }
-    sync_dir(dir)
+    // Even a complete collision winner may still need its marker synced.
+    // On failure leave it intact, but do not hand it out to this build.
+    sync(dir)
 }
 
 /// Returns false on EEXIST, leaving the existing file untouched.
@@ -774,10 +786,10 @@ mod tests {
         let cached = d.join("key.ext4");
         let tmp = d.join("build");
         std::fs::write(&tmp, "first image").unwrap();
-        publish_rootfs(&tmp, &cached, "first config").unwrap();
+        publish_rootfs(&tmp, &cached, "first config", sync_dir).unwrap();
         let inode = std::fs::metadata(&cached).unwrap().ino();
         std::fs::write(&tmp, "second image").unwrap();
-        publish_rootfs(&tmp, &cached, "second config").unwrap();
+        publish_rootfs(&tmp, &cached, "second config", sync_dir).unwrap();
         assert_eq!(std::fs::metadata(&cached).unwrap().ino(), inode);
         assert_eq!(std::fs::read_to_string(&cached).unwrap(), "first image");
         assert!(!publish(&cached.with_extension("conf"), b"second config").unwrap());
@@ -786,7 +798,7 @@ mod tests {
         assert_eq!(std::fs::read(cached.with_extension("ok")).unwrap(), b"");
         // An existing image without its completion marker cannot be reused.
         std::fs::remove_file(cached.with_extension("ok")).unwrap();
-        assert!(publish_rootfs(&tmp, &cached, "second config").is_err());
+        assert!(publish_rootfs(&tmp, &cached, "second config", sync_dir).is_err());
         assert!(!cached.with_extension("ok").exists());
         std::fs::remove_dir_all(d).unwrap();
     }
@@ -803,7 +815,7 @@ mod tests {
             // Simulate a publisher that did not participate in the lock.
             let winner = d.join("winner");
             std::fs::write(&winner, "winner image")?;
-            publish_rootfs(&winner, &cached, "winner config")?;
+            publish_rootfs(&winner, &cached, "winner config", sync_dir)?;
             Ok("loser config".into())
         }).unwrap();
         assert_eq!(path, std::fs::canonicalize(real.join("key.ext4")).unwrap());
@@ -815,6 +827,60 @@ mod tests {
         std::fs::remove_file(path.with_extension("conf")).unwrap();
         assert!(cached_rootfs(&cached, |_| panic!("marked entry must not be rebuilt")).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "winner image");
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn cache_durability_failure_is_retried_before_reuse() {
+        use std::os::unix::fs::MetadataExt;
+        let d = tmpdir("durability");
+        let cached = d.join("key.ext4");
+        let fail_after_marker = |dir: &Path| {
+            assert_eq!(dir, d);
+            if cached.with_extension("ok").exists() {
+                return Err(std::io::Error::from_raw_os_error(libc::EIO).into());
+            }
+            sync_dir(dir)
+        };
+        // Publication reaches the marker rename, but must not return a path.
+        assert!(cached_rootfs_with_sync(&cached, |tmp| {
+            std::fs::write(tmp, "image")?;
+            Ok("config".into())
+        }, fail_after_marker).is_err());
+        assert!(entry_complete(&cached));
+        let inode = std::fs::metadata(&cached).unwrap().ino();
+        // A cache hit must retry that fsync, and still refuse on failure.
+        assert!(cached_rootfs_with_sync(&cached, |_| panic!("must not rebuild"), fail_after_marker).is_err());
+        assert!(entry_complete(&cached));
+        let path = cached_rootfs_with_sync(&cached, |_| panic!("must not rebuild"), |dir| {
+            assert_eq!(dir, d);
+            sync_dir(dir)
+        }).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        // Once handed out, even a damaged marked entry cannot be cleaned up.
+        std::fs::remove_file(cached.with_extension("conf")).unwrap();
+        assert!(cached_rootfs(&cached, |_| panic!("must not rebuild")).is_err());
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn collision_reuse_requires_durability() {
+        let d = tmpdir("collision-durability");
+        let cached = d.join("key.ext4");
+        assert!(cached_rootfs_with_sync(&cached, |tmp| {
+            std::fs::write(tmp, "loser image")?;
+            let winner = d.join("winner");
+            std::fs::write(&winner, "winner image")?;
+            publish_rootfs(&winner, &cached, "winner config", sync_dir)?;
+            Ok("loser config".into())
+        }, |dir| {
+            assert_eq!(dir, d);
+            Err(std::io::Error::from_raw_os_error(libc::EIO).into())
+        }).is_err());
+        assert_eq!(std::fs::read_to_string(&cached).unwrap(), "winner image");
+        assert!(entry_complete(&cached));
+        assert!(cached_rootfs(&cached, |_| panic!("must reuse winner")).is_ok());
         std::fs::remove_dir_all(d).unwrap();
     }
 
@@ -852,7 +918,7 @@ mod tests {
         let tmp = d.join("build");
         std::fs::write(&tmp, "image").unwrap();
         std::fs::write(cached.with_extension("conf"), "existing config").unwrap();
-        assert!(publish_rootfs(&tmp, &cached, "new config").is_err());
+        assert!(publish_rootfs(&tmp, &cached, "new config", sync_dir).is_err());
         assert_eq!(std::fs::read_to_string(cached.with_extension("conf")).unwrap(), "existing config");
         assert!(!cached.with_extension("ok").exists());
         std::fs::remove_dir_all(d).unwrap();
