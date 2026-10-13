@@ -716,7 +716,7 @@ impl Vm {
     pub fn sync_clock(&self, _tolerance: Duration, deadline: Instant) -> Result<f64> {
         static WARNED: AtomicBool = AtomicBool::new(false);
         let mut first = None;
-        for _ in 0..3 {
+        for tries in 1.. {
             let start = Instant::now();
             let left = deadline.saturating_duration_since(start);
             match crate::guest::clock(&self.vsock(), &self.template.legacy_agent, left) {
@@ -724,6 +724,15 @@ impl Vm {
                     let off = *first.get_or_insert(off);
                     if start.elapsed() < CLOCK_RTT {
                         return Ok(off);
+                    }
+                    // A guest still faulting its memory in answers slowly: past
+                    // three tries, keep going (a little apart) while time is
+                    // left, as each slow step leaves it behind by its transit.
+                    if Instant::now() + Duration::from_millis(200) >= deadline {
+                        break;
+                    }
+                    if tries >= 3 {
+                        std::thread::sleep(Duration::from_millis(100));
                     }
                 }
                 Ok(None) => {
@@ -872,7 +881,7 @@ impl Vm {
     pub fn describe(&self) -> Value {
         let [base, present, zero, remote, inflight, discarded] = self.pager.census();
         let mib = |pages: usize| (pages * PAGE_SIZE) as u64 >> 20;
-        let hotplug = self.fc(|fc| fc.get("/hotplug/memory")).unwrap_or(Value::Null);
+        let hotplug = self.fc(|fc| fc.request_within("GET", "/hotplug/memory", None, Duration::from_millis(500))).unwrap_or(Value::Null);
         json!({
             "name": self.name,
             "ip": self.ip.to_string(),

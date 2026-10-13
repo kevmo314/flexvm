@@ -143,6 +143,33 @@ pub fn refill(host: &Host, template: &str, wait: bool) -> Result<usize> {
     Ok(want)
 }
 
+/// Where this host keeps what a template's loads touch (`Template::load_set`),
+/// as standby VMs learn it, for migrations to preload.
+fn load_set_file(host: &Host, tpl: &Template) -> PathBuf {
+    host.run.join("standby").join(format!(".loadset-{}", tpl.meta.id))
+}
+
+fn save_load_set(host: &Host, tpl: &Template) {
+    let set = tpl.load_set();
+    if !set.is_empty() {
+        if let Ok(b) = serde_json::to_vec(&set) {
+            let _ = crate::host::write_file(&host.run.join("standby"), &format!(".loadset-{}", tpl.meta.id), &b, false);
+        }
+    }
+}
+
+/// The pages loads of `tpl` touch, as this process and this host's standby
+/// VMs have seen them.
+pub fn load_set(host: &Host, tpl: &Template) -> Vec<u64> {
+    let mut set = tpl.load_set();
+    if let Some(saved) = std::fs::read(load_set_file(host, tpl)).ok().and_then(|b| serde_json::from_slice::<Vec<u64>>(&b).ok()) {
+        set.extend(saved);
+        set.sort_unstable();
+        set.dedup();
+    }
+    set
+}
+
 /// Makes `w` fd 3 of the child `cmd` starts, for its readiness line.
 pub fn notify_fd(cmd: &mut Command, w: OwnedFd) {
     let fd = w.as_raw_fd();
@@ -171,6 +198,7 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>) -> Result
     unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
     let paused = Paused::load(p.pool.take()?, tpl.clone())?;
     *p.standby.lock().unwrap() = Some(paused);
+    save_load_set(host, &tpl);
     if p.stop_requested() {
         drop(p.standby.lock().unwrap().take());
         p.end(0);

@@ -561,8 +561,8 @@ impl Proc {
 
     /// Test hooks (FLEXVM_FAULTS=1).
     fn debug(&self, req: &Value) -> Result<Value> {
-        if std::env::var("FLEXVM_FAULTS").ok().as_deref() != Some("1") {
-            bail!("debug requests need FLEXVM_FAULTS=1");
+        if req["what"] != "status" && std::env::var("FLEXVM_FAULTS").ok().as_deref() != Some("1") {
+            bail!("memhash needs FLEXVM_FAULTS=1");
         }
         let vm = self.vm();
         match req["what"].as_str().unwrap_or("") {

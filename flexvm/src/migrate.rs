@@ -116,7 +116,7 @@ impl Proc {
             t.mark("read_state");
             // The pages the target's load will touch, so it need not fetch
             // them one round trip at a time (see `Template::load_set`).
-            let mut wanted = vm.template.load_set();
+            let mut wanted = crate::standby::load_set(&self.host, &vm.template);
             if let Ok(theirs) = serde_json::from_value::<Vec<u64>>(prepared["load_set"].clone()) {
                 wanted.extend(theirs);
                 wanted.sort_unstable();
@@ -504,8 +504,11 @@ impl Proc {
         *self.held_in.lock().unwrap() = Some(revoked.clone());
         let p = self.clone();
         thread::spawn(move || {
-            if hold::wait_start(&mut r, (Instant::now() + HOLD_FENCE).min(deadline)) {
+            let fence = Instant::now();
+            if hold::wait_start(&mut r, (fence + HOLD_FENCE).min(deadline)) {
                 hold::receive(&mut r, vm.ip, &vm.tap, &revoked, (Instant::now() + HELD_STREAM).min(deadline));
+            } else {
+                eprintln!("vm {}: no held packets from the source after {} ms", vm.name, ms(fence.elapsed()));
             }
             p.held_in.lock().unwrap().take();
             p.announce();
@@ -564,7 +567,7 @@ impl Proc {
         t.mark("claim_ip");
         let idle = self.pool.take()?;
         t.mark("pool_take");
-        let load_set = tpl.load_set();
+        let load_set = crate::standby::load_set(&self.host, &tpl);
         let vm = Vm::prepare(idle, &name, tpl, t)?;
         if vm.prepare_load()? {
             t.mark("prepare_load");
@@ -634,7 +637,7 @@ impl Proc {
             r => r,
         };
         let probed = probe.map_or(Ok(()), |p| p.join().unwrap_or_else(|_| Err(std::io::Error::other("probe panicked"))));
-        let (vm, _restore) = restored?;
+        let (vm, _restore) = restored.map_err(|e| format!("{e} (it never ran here)"))?;
         let checked = match (probed, vm.pager.failed()) {
             (Err(e), _) => Err(format!("migration source {} does not serve pages: {e}", source.addr).into()),
             (_, Some(why)) => Err(format!("its memory cannot be paged in: {why}").into()),
