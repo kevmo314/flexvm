@@ -26,7 +26,7 @@ use crate::host::{fault, Host};
 use crate::uffd::{Frozen, Origin};
 use crate::util::{ms, Error, Phases, Result, PAGE_SIZE};
 use crate::vm::{State, Vm};
-use crate::vmproc::{Proc, CLOCK_DEADLINE, CLOCK_TOLERANCE};
+use crate::vmproc::{Proc, CLOCK_DEADLINE};
 
 /// How long a checkpoint waits for a VM to finish pulling its memory.
 const DRAIN_WAIT: Duration = Duration::from_secs(60);
@@ -303,7 +303,7 @@ impl Proc {
             // Loaded paused: everything up to the resume below can fail
             // without the VM having run. The bytes that were verified are
             // loaded, from a file only root controls.
-            Vm::restore_from(&self.pool, name, tpl, crate::vm::Snapshot::Bytes(&ck.vmstate), origin, ip, load, t)
+            Vm::restore(&self.pool, name, tpl, crate::vm::Snapshot::Bytes(&ck.vmstate), origin, ip, load, t)
         })()
         .map_err(Restore::NotRun)?;
         let dir = ck.dir;
@@ -378,7 +378,7 @@ impl Proc {
         })();
         let ready = ready.map_err(|e| Restore::Ran(kill(e)))?;
         // The guest's clock stopped when it was checkpointed.
-        let clock = vm.sync_clock(CLOCK_TOLERANCE, Instant::now() + CLOCK_DEADLINE);
+        let clock = vm.sync_clock(Instant::now() + CLOCK_DEADLINE);
         t.mark("clock");
         self.announce();
         let state = vm.state().name();
@@ -496,7 +496,7 @@ impl Proc {
         // next delta; one that succeeds becomes it.
         let mut memhash = None;
         let frozen = (|| -> Result<Frozen> {
-            let runs = vm.save_state(&staging.vmstate(), false, || hold.hold())?;
+            let runs = vm.save_state(&staging.vmstate(), false, true, || hold.hold(), &mut Phases::new())?;
             t.mark("snapshot");
             if fault("ckpt_memhash") {
                 memhash = Some(vm.pager.content_hash()?);

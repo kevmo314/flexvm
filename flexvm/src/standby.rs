@@ -36,9 +36,8 @@ use crate::host::{fault, Host};
 use crate::template::{Paths, Template};
 use crate::fc::Idle;
 use crate::guest;
-use crate::uffd::Pager;
 use crate::util::{send_json, Error, Phases, Result};
-use crate::vm::Vm;
+use crate::vm::{Prepared, Vm};
 use crate::vmproc::Proc;
 
 fn dir(host: &Host, template: &str) -> PathBuf {
@@ -351,99 +350,74 @@ const FORKS_BASELINE: usize = 0;
 const RESEED_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A VM restored from a template, run once to settle and paused again.
-pub struct Paused {
-    idle: Option<Idle>,
-    pager: Arc<Pager>,
-    template: Arc<Template>,
-}
+/// Dropping it tears it down.
+pub struct Paused(Prepared);
 
 impl Paused {
     /// Restores `template` into `idle`, lets it settle and pauses it.
     pub fn load(idle: Idle, template: Arc<Template>) -> Result<Paused> {
-        let pager = Pager::start(&idle.fc.sockets.uffd, template.clone(), None)?;
+        let p = Vm::prepare(idle, template, &mut Phases::new())?;
         // Off the request path, so it can afford to learn what a load touches.
-        pager.learn_load_set();
-        let paused = Paused { idle: Some(idle), pager, template };
-        let idle = paused.idle.as_ref().unwrap();
-        paused.pager.set_pid(idle.fc.pid())?;
-        let body = json!({
-            "snapshot_path": paused.template.vmstate(),
-            "mem_backend": {"backend_type": "Uffd", "backend_path": idle.fc.sockets.uffd},
-            "vsock_override": {"uds_path": idle.fc.sockets.vsock},
-            "network_overrides": [{"iface_id": "eth0", "host_dev_name": idle.tap}],
-            "clock_realtime": true,
-            "resume_vm": false,
-        });
-        idle.fc.request_within("PUT", "/snapshot/load", Some(body), LOAD_TIMEOUT)?;
+        p.pager.learn_load_set();
+        let fc = p.firecracker();
+        let body = crate::vm::load_body(&p.template().vmstate(), fc, p.tap(), true);
+        fc.request_within("PUT", "/snapshot/load", Some(body), LOAD_TIMEOUT)?;
         // Loaded with resume_vm false, Firecracker still runs its devices (tap
         // RX, vsock, balloon timer) into guest memory; an API pause stops them.
-        idle.fc.request_within("PATCH", "/vm", Some(json!({"state": "Paused"})), API_TIMEOUT)?;
-        paused.pager.wait_ready(Duration::from_secs(5))?;
+        fc.request_within("PATCH", "/vm", Some(json!({"state": "Paused"})), API_TIMEOUT)?;
+        p.pager.wait_ready(Duration::from_secs(5))?;
         // Get the slow first run after a restore out of the way, off the request path.
-        let resumed = idle.fc.request_within("PATCH", "/vm", Some(json!({"state": "Resumed"})), API_TIMEOUT);
+        let resumed = fc.request_within("PATCH", "/vm", Some(json!({"state": "Resumed"})), API_TIMEOUT);
         // The load set includes what resuming touches (Firecracker kicks the
         // virtqueues), as a migration target's load resumes the VM too.
-        paused.pager.loaded();
+        p.pager.loaded();
         resumed?;
-        wait_for_reseed(&idle.fc.sockets.vsock)?;
+        wait_for_reseed(&fc.sockets.vsock)?;
         // Step the wall clock now: it keeps time while paused, so START at
         // take finds it right and skips clock_settime, which can take tens of
         // ms in a 24-vCPU guest (it IPIs the vCPUs). Best effort: START steps
         // it otherwise.
-        let _ = guest::clock(&idle.fc.sockets.vsock, &paused.template.legacy_agent, guest::TIMEOUT);
+        let _ = guest::clock(&fc.sockets.vsock, &p.template().legacy_agent, guest::TIMEOUT);
         std::thread::sleep(SETTLE);
-        idle.fc.request_within("PATCH", "/vm", Some(json!({"state": "Paused"})), API_TIMEOUT)?;
-        Ok(paused)
+        fc.request_within("PATCH", "/vm", Some(json!({"state": "Paused"})), API_TIMEOUT)?;
+        Ok(Paused(p))
     }
 
     /// Whether its Firecracker still runs and its pager has not given up.
     pub fn alive(&mut self) -> bool {
-        self.pager.failed().is_none() && self.idle.as_mut().is_some_and(|i| i.fc.alive())
+        self.0.pager.failed().is_none() && self.0.firecracker_alive()
     }
 
-    /// Turns this into the running VM `name` at `ip`: names its cgroup, routes
-    /// the address to its tap and resumes the vCPUs. On failure, the VM is
-    /// torn down, and the flag says whether the guest may have run for `name`:
-    /// unless the resume never reached Firecracker. With
-    /// `kill` (test fault `resume_kill`), Firecracker is killed right after
-    /// the resume is sent.
-    pub fn resume(mut self, name: &str, ip: Ipv4Addr, kill: bool, phases: &mut Phases) -> std::result::Result<Arc<Vm>, (Error, bool)> {
-        let idle = self.idle.take().unwrap();
+    /// Turns this into the running VM `name` at `ip`: routes the address to
+    /// its tap and resumes the vCPUs. On failure, the VM is torn down, and
+    /// the flag says whether the guest may have run for `name`: unless the
+    /// resume never reached Firecracker. With `kill` (test fault
+    /// `resume_kill`), Firecracker is killed right after the resume is sent.
+    pub fn resume(self, name: &str, ip: Ipv4Addr, kill: bool, phases: &mut Phases) -> std::result::Result<Arc<Vm>, (Error, bool)> {
+        let p = self.0;
         let mut sent = false;
-        let resumed = (|| {
+        let resumed = (|| -> Result<()> {
             // Route before the guest can send anything; one netlink round trip.
-            crate::net::attach(ip, &idle.tap)?;
+            crate::net::attach(ip, p.tap())?;
             phases.mark("route");
             sent = true;
-            let res = idle.fc.request_within("PATCH", "/vm", Some(json!({"state": "Resumed"})), API_TIMEOUT);
+            let res = p.firecracker().request_within("PATCH", "/vm", Some(json!({"state": "Resumed"})), API_TIMEOUT);
             if kill {
-                self.pager.kill_firecracker();
+                p.pager.kill_firecracker();
                 bail!("injected fault: firecracker killed after the resume was sent");
             }
             res?;
             phases.mark("resume");
             Ok(())
         })();
-        if let Err(e) = resumed {
+        match resumed {
+            Ok(()) => Ok(p.into_vm(name, ip, crate::vm::State::Running)),
             // Once the request may have reached Firecracker, some vCPUs may
             // have run even if it answers with an error.
-            let ran = sent && !crate::fc::not_sent(&e);
-            self.pager.stop();
-            drop(idle);
-            self.pager.join();
-            return Err((e, ran));
-        }
-        Ok(Vm::assemble(name, self.template.clone(), idle, ip, self.pager.clone(), crate::vm::State::Running))
-    }
-}
-
-impl Drop for Paused {
-    fn drop(&mut self) {
-        // Still ours (never resumed): stop the pager, including its prefetch, and tear down.
-        if let Some(idle) = self.idle.take() {
-            self.pager.stop();
-            drop(idle);
-            self.pager.join();
+            Err(e) => {
+                let ran = sent && !crate::fc::not_sent(&e);
+                Err((e, ran))
+            }
         }
     }
 }

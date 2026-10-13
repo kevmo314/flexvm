@@ -140,7 +140,7 @@ impl Holder {
         let _routes = self.routes.lock().unwrap();
         let entry = Arc::new(Entry { mig, q: Mutex::default() });
         self.held.lock().unwrap().insert(ip, entry);
-        if let Err(e) = tun_route(RTM_NEWROUTE, NLM_F_CREATE | NLM_F_REPLACE, ip, self.ifindex) {
+        if let Err(e) = crate::net::route_dev(true, ip, self.ifindex) {
             self.held.lock().unwrap().remove(&ip);
             return Err(e);
         }
@@ -331,7 +331,7 @@ impl Holder {
         };
         let Some(e) = gone else { return Stats::default() };
         // Matches the TUN device as the route's interface: never another route.
-        let _ = tun_route(RTM_DELROUTE, 0, ip, self.ifindex);
+        let _ = crate::net::route_dev(false, ip, self.ifindex);
         let mut q = e.q.lock().unwrap();
         let dropped = q.dropped + q.packets.len() as u64;
         q.packets.clear();
@@ -756,51 +756,4 @@ fn open_tun(dev: &str) -> std::result::Result<OwnedFd, Tun> {
         }
     }
     Ok(fd)
-}
-
-const RTM_NEWROUTE: u16 = 24;
-const RTM_DELROUTE: u16 = 25;
-const NLM_F_REQUEST: u16 = 0x1;
-const NLM_F_ACK: u16 = 0x4;
-const NLM_F_REPLACE: u16 = 0x100;
-const NLM_F_CREATE: u16 = 0x400;
-
-/// Adds or deletes the main-table route of `ip` through the TUN device
-/// (`ifindex`). A delete names the device, so it removes only that route.
-fn tun_route(kind: u16, flags: u16, ip: Ipv4Addr, ifindex: u32) -> Result<()> {
-    // struct rtmsg: family, dst_len, src_len, tos, table (main), protocol
-    // (static), scope (link), type (unicast); flags
-    let mut m = vec![libc::AF_INET as u8, 32, 0, 0, 254, 4, 253, 1, 0, 0, 0, 0];
-    for (kind, data) in [(1u16, &ip.octets()[..]), (4, &ifindex.to_ne_bytes()[..])] {
-        m.extend_from_slice(&((4 + data.len()) as u16).to_ne_bytes());
-        m.extend_from_slice(&kind.to_ne_bytes());
-        m.extend_from_slice(data);
-    }
-    let fd = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW | libc::SOCK_CLOEXEC, libc::NETLINK_ROUTE) };
-    if fd < 0 {
-        bail!("netlink socket: {}", std::io::Error::last_os_error());
-    }
-    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    let mut msg = Vec::with_capacity(16 + m.len());
-    msg.extend_from_slice(&((16 + m.len()) as u32).to_ne_bytes());
-    msg.extend_from_slice(&kind.to_ne_bytes());
-    msg.extend_from_slice(&(flags | NLM_F_REQUEST | NLM_F_ACK).to_ne_bytes());
-    msg.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0]);
-    msg.extend_from_slice(&m);
-    let mut ack = [0u8; 256];
-    let n = unsafe {
-        if libc::send(fd.as_raw_fd(), msg.as_ptr().cast(), msg.len(), 0) < 0 {
-            -1
-        } else {
-            libc::recv(fd.as_raw_fd(), ack.as_mut_ptr().cast(), ack.len(), 0)
-        }
-    };
-    if n < 20 {
-        bail!("netlink: {}", std::io::Error::last_os_error());
-    }
-    let code = i32::from_ne_bytes(ack[16..20].try_into().unwrap());
-    if u16::from_ne_bytes([ack[4], ack[5]]) == 2 && code != 0 {
-        bail!("route {ip} through the hold device: {}", std::io::Error::from_raw_os_error(-code));
-    }
-    Ok(())
 }

@@ -110,7 +110,7 @@ impl Proc {
             }
         };
         let captured = (|| -> Result<_> {
-            let runs = vm.checkpoint(&vmstate, hold, &mut t)?;
+            let runs = vm.save_state(&vmstate, false, false, hold, &mut t)?;
             let paused = t.total();
             let state = std::fs::read(&vmstate)?;
             t.mark("read_state");

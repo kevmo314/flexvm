@@ -769,11 +769,10 @@ impl Proc {
         let Some(p) = self.me.upgrade() else { return };
         thread::spawn(move || {
             let res = p.op().and_then(|_op| {
-                vm.clock_pending.store(false, Ordering::SeqCst);
                 if vm.state() != State::Running {
                     return Ok(None);
                 }
-                vm.sync_clock(CLOCK_TOLERANCE, Instant::now() + CLOCK_DEADLINE).map(Some)
+                vm.sync_clock(Instant::now() + CLOCK_DEADLINE).map(Some)
             });
             vm.clock_pending.store(false, Ordering::SeqCst);
             match res {

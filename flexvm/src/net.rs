@@ -196,6 +196,18 @@ pub fn route_via(ip: Ipv4Addr, via: Ipv4Addr) -> Result<()> {
     netlink(RTM_NEWROUTE, NLM_F_CREATE | NLM_F_REPLACE, &route)
 }
 
+/// Adds the route of `ip` to device `ifindex` (replacing any other), or
+/// deletes it: a delete names the device, so it removes only that route.
+pub fn route_dev(add: bool, ip: Ipv4Addr, ifindex: u32) -> Result<()> {
+    let mut route = rtmsg(RT_SCOPE_LINK);
+    attr(&mut route, RTA_DST, &ip.octets());
+    attr(&mut route, RTA_OIF, &ifindex.to_ne_bytes());
+    match add {
+        true => netlink(RTM_NEWROUTE, NLM_F_CREATE | NLM_F_REPLACE, &route),
+        false => netlink(RTM_DELROUTE, 0, &route),
+    }
+}
+
 pub fn unroute(ip: Ipv4Addr) {
     let mut route = rtmsg(RT_SCOPE_NOWHERE);
     attr(&mut route, RTA_DST, &ip.octets());
