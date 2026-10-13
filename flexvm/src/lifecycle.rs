@@ -157,7 +157,7 @@ impl Proc {
             // resume pages in from the checkpoint.
             Ok(s) => {
                 let data = (s.manifest.data_pages * PAGE_SIZE as u64) >> 20;
-                eprintln!("{}", json!({"name": vm.name, "state": "suspended", "freed_rss_mib": vm.rss() >> 20, "data_mib": data, "suspend_ms": ms(t.total()), "timings_ms": t.json()}));
+                eprintln!("{}", json!({"name": vm.name, "state": "suspended", "dir": self.host.suspended(&vm.name), "freed_rss_mib": vm.rss() >> 20, "data_mib": data, "suspend_ms": ms(t.total()), "timings_ms": t.json()}));
                 self.finish(&op, End::Suspended, 0, None)
             }
             Err(e) => e,

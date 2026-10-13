@@ -9,8 +9,8 @@
 //! lives. `run` claims one with `claim {name, ip, cmd}`, passing its stdout
 //! and stderr: the standby process takes the name and address and becomes
 //! that VM. It answers on the claim connection, and once it ends, sends
-//! `{"exit": code}` there. A claim sent but not answered may have started
-//! the VM: it is never tried again elsewhere.
+//! `{"exit": code}` there. A claim it said it is taking (`claiming`) but did
+//! not answer may have started the VM: it is never tried again elsewhere.
 //!
 //! The first run after a restore is slow (Firecracker's first resume, the
 //! guest catching up and handling the new VMGenID), so a standby VM runs
@@ -204,6 +204,11 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
         let Ok((c, _)) = listener.accept() else { continue };
         let Ok((line, fds)) = crate::util::recv_with_fds(&c, 1 << 20) else { continue };
         let Ok(req) = serde_json::from_slice::<Value>(&line) else { continue };
+        // From here the claim may take effect: whoever sent it must not
+        // start the VM elsewhere without hearing how it went.
+        if send_json(&mut &c, &json!({"claiming": true})).is_err() {
+            continue;
+        }
         match claim(p, &req) {
             Ok(v) => {
                 crate::host::stall("claim_stall");
@@ -287,9 +292,14 @@ pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]
             let _ = std::fs::remove_file(&sock);
             continue;
         };
-        let answer = crate::util::send_with_fds(&c, &line, fds)
-            .map_err(Error::from)
-            .and_then(|()| crate::util::recv_json(&mut BufReader::new(&c))?.ok_or_else(|| "it hung up".into()));
+        // A standby VM that goes without taking the request (it was on its
+        // way out) never says it is claiming.
+        let mut r = BufReader::new(&c);
+        let taken = crate::util::send_with_fds(&c, &line, fds).ok().and_then(|()| crate::util::recv_json(&mut r).ok().flatten());
+        if taken.is_none_or(|t| t["claiming"] != json!(true)) {
+            continue;
+        }
+        let answer = crate::util::recv_json(&mut r).and_then(|a| a.ok_or_else(|| "it hung up".into()));
         let reply = match answer {
             Ok(r) => r,
             Err(e) => {
