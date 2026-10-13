@@ -385,6 +385,29 @@ pub fn wait_signal(set: &libc::sigset_t) -> i32 {
     sig
 }
 
+/// Starts this binary with `args` in a session of its own (it outlives the
+/// caller), stdin empty, output to `log`, `fd3` as its fd 3, with `env`;
+/// reaped in the background.
+pub fn spawn_self<S: AsRef<std::ffi::OsStr>>(args: &[S], log: &std::fs::File, fd3: RawFd, env: &[(&str, &str)]) -> io::Result<()> {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = std::process::Command::new("/proc/self/exe");
+    cmd.args(args).envs(env.iter().copied()).stdin(std::process::Stdio::null()).stdout(log.try_clone()?).stderr(log.try_clone()?);
+    unsafe {
+        cmd.pre_exec(move || {
+            libc::setsid();
+            // dup2 onto itself would leave it close-on-exec.
+            let moved = if fd3 == 3 { libc::fcntl(3, libc::F_SETFD, 0) } else { libc::dup2(fd3, 3) };
+            if moved < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn()?;
+    std::thread::spawn(move || child.wait());
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

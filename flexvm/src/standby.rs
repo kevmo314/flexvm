@@ -20,12 +20,10 @@
 use std::fs::File;
 use std::io::BufReader;
 use std::net::Ipv4Addr;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -125,24 +123,12 @@ pub fn refill(host: &Host, template: &str) -> Result<usize> {
         return Ok(0);
     }
     let mut ready = Vec::new();
+    let log = std::fs::OpenOptions::new().create(true).append(true).open(d.join("standby.log"))?;
+    let args = [host.state.as_os_str(), host.run.as_os_str(), template.as_ref()];
     for _ in 0..want {
-        let log = std::fs::OpenOptions::new().create(true).append(true).open(d.join("standby.log"))?;
-        let mut cmd = Command::new("/proc/self/exe");
-        cmd.args(["--state".as_ref(), host.state.as_os_str(), "--run".as_ref(), host.run.as_os_str()])
-            .args(["run", "--standby", "--template", template])
-            .stdin(Stdio::null())
-            .stdout(log.try_clone()?)
-            .stderr(log);
         let (r, w) = std::os::unix::net::UnixStream::pair()?;
-        notify_fd(&mut cmd, w.into());
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
-        let mut child = cmd.spawn()?;
-        std::thread::spawn(move || child.wait());
+        let args = ["--state".as_ref(), args[0], "--run".as_ref(), args[1], "run".as_ref(), "--standby".as_ref(), "--template".as_ref(), args[2]];
+        crate::util::spawn_self(&args, &log, w.as_raw_fd(), &[("FLEXVM_NOTIFY_FD", "3")])?;
         ready.push(r);
     }
     for r in ready {
@@ -179,21 +165,6 @@ pub fn load_set(host: &Host, tpl: &Template) -> Vec<u64> {
         set.dedup();
     }
     set
-}
-
-/// Makes `w` fd 3 of the child `cmd` starts, for its readiness line.
-pub fn notify_fd(cmd: &mut Command, w: OwnedFd) {
-    let fd = w.as_raw_fd();
-    cmd.env("FLEXVM_NOTIFY_FD", "3");
-    unsafe {
-        cmd.pre_exec(move || {
-            let _keep = &w;
-            if libc::dup2(fd, 3) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
 }
 
 /// `run --standby`: loads a standby VM of `template`, then waits to be

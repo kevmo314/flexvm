@@ -17,8 +17,6 @@
 use std::io::Read;
 use std::net::{Ipv4Addr, TcpListener, TcpStream, ToSocketAddrs};
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::process::CommandExt;
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::{json, Value};
@@ -135,28 +133,9 @@ fn incoming(host: &Host, req: &Value, line: &[u8], conn: TcpStream) -> Result<()
         return Ok(());
     }
     let log = std::fs::OpenOptions::new().create(true).append(true).open(host.run.join("vms").join(format!("{name}.log")))?;
-    let fd = conn.as_raw_fd();
-    let mut cmd = Command::new("/proc/self/exe");
-    cmd.args(["--state".as_ref(), host.state.as_os_str(), "--run".as_ref(), host.run.as_os_str(), "run".as_ref(), "--incoming".as_ref()])
-        .env("FLEXVM_INCOMING", std::str::from_utf8(line)?)
-        .stdin(Stdio::null())
-        .stdout(log.try_clone()?)
-        .stderr(log);
-    unsafe {
-        cmd.pre_exec(move || {
-            libc::setsid();
-            if libc::dup2(fd, 3) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    match cmd.spawn() {
-        Ok(mut child) => {
-            drop(conn);
-            std::thread::spawn(move || child.wait());
-        }
-        Err(e) => refuse(&conn, format!("cannot start the vm process: {e}"))?,
+    let args = ["--state".as_ref(), host.state.as_os_str(), "--run".as_ref(), host.run.as_os_str(), "run".as_ref(), "--incoming".as_ref()];
+    if let Err(e) = crate::util::spawn_self(&args, &log, conn.as_raw_fd(), &[("FLEXVM_INCOMING", std::str::from_utf8(line)?)]) {
+        refuse(&conn, format!("cannot start the vm process: {e}"))?;
     }
     Ok(())
 }

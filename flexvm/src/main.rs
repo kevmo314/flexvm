@@ -297,21 +297,10 @@ fn log_file(host: &Host, name: &str) -> Result<std::fs::File> {
 /// `-d`: runs this same command in the background (in its own session,
 /// output to `RUN/vms/NAME.log`), and prints what it says once the VM is up.
 fn spawn_detached(host: &Host, name: &str) -> Result<()> {
-    use std::os::unix::process::CommandExt;
-    let log = log_file(host, name)?;
     let argv: Vec<String> = std::env::args().skip(1).filter(|a| a != "-d").collect();
-    let mut cmd = std::process::Command::new("/proc/self/exe");
-    cmd.args(&argv).stdin(std::process::Stdio::null()).stdout(log.try_clone()?).stderr(log);
     let (r, w) = std::os::unix::net::UnixStream::pair()?;
-    standby::notify_fd(&mut cmd, w.into());
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
-    cmd.spawn()?;
-    drop(cmd);
+    util::spawn_self(&argv, &log_file(host, name)?, w.as_raw_fd(), &[("FLEXVM_NOTIFY_FD", "3")])?;
+    drop(w);
     let log = host.run.join("vms").join(format!("{name}.log"));
     let reply = recv_json(&mut BufReader::new(r))?.ok_or_else(|| format!("the vm process failed to start (see {})", log.display()))?;
     if reply["ok"] != json!(true) {
