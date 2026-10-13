@@ -31,6 +31,9 @@ use crate::template::{Paths, Template, STEP_MIB};
 use crate::util::{ms, proc_kb, send_json, Error, Phases, Result};
 use crate::vm::{State, Vm};
 
+/// The exit status of a VM process whose VM died under it.
+pub const DIED: i32 = 3;
+
 /// How long a requested operation waits for another one on the same VM.
 pub const OP_WAIT: Duration = Duration::from_secs(30);
 /// Guest clock error tolerated after a restore or resume.
@@ -529,6 +532,14 @@ impl Proc {
         self.serve_control();
         let p = self.clone();
         thread::spawn(move || p.controller());
+        // Firecracker's exit is noticed at once.
+        if let Some(fc) = self.vm().pid().and_then(Ident::of).and_then(|id| crate::host::PidFd::open(id).ok().flatten()) {
+            let p = self.clone();
+            thread::spawn(move || {
+                while !fc.wait(Duration::from_secs(3600)) {}
+                p.died();
+            });
+        }
         let p = self.clone();
         thread::spawn(move || p.serve_memory());
         if self.vm().template.meta.image.is_some() {
@@ -701,6 +712,27 @@ impl Proc {
         }
     }
 
+    /// The VM died under this process (its Firecracker exited, or its memory
+    /// is lost): ends the process with `DIED`, the address withdrawn as for a
+    /// kill, why (Firecracker's exit status and the end of its log, the
+    /// guest's console) in the log and in `RUN/vms/NAME.failed`, which `ls`
+    /// shows until `kill` removes it. Not for a migration source, whose end
+    /// its target decides.
+    fn died(&self) {
+        let vm = self.vm();
+        if matches!(vm.state(), State::Source(_)) || self.leaving.load(Ordering::SeqCst) {
+            return;
+        }
+        let op = self.op();
+        if self.leaving.load(Ordering::SeqCst) {
+            return;
+        }
+        let why = format!("{}; {}", vm.pager.failed().unwrap_or("its firecracker exited"), vm.post_mortem());
+        eprintln!("vm {}: died: {why}", vm.name);
+        let _ = std::fs::write(self.host.run.join("vms").join(format!("{}.failed", vm.name)), &why);
+        self.finish(&op, End::Gone, DIED, None);
+    }
+
     /// Once a second: notices a VM that died or lost its memory, resizes
     /// its memory, retries held report releases, and takes a turn at
     /// relieving the host's memory pressure.
@@ -708,14 +740,8 @@ impl Proc {
         loop {
             thread::sleep(Duration::from_secs(1));
             let vm = self.vm();
-            let dead = !vm.firecracker_alive() || vm.pager.failed().is_some();
-            if dead && !matches!(vm.state(), State::Source(_)) && !self.leaving.load(Ordering::SeqCst) {
-                let op = self.op();
-                if self.leaving.load(Ordering::SeqCst) {
-                    continue;
-                }
-                eprintln!("vm {}: gone ({}; {}); stopping", vm.name, vm.pager.failed().unwrap_or("its firecracker exited"), vm.post_mortem());
-                self.finish(&op, End::Gone, 1, None);
+            if !vm.firecracker_alive() || vm.pager.failed().is_some() {
+                self.died();
             }
             if let Ok(_op) = self.op.try_lock() {
                 if vm.release_pending() && matches!(vm.state(), State::Running | State::Paused) {

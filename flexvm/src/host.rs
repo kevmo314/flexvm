@@ -170,7 +170,7 @@ impl Host {
             reap(&self.run, old)?;
         }
         let dir = self.run.join("vms");
-        for ext in ["json", "sock"] {
+        for ext in ["json", "sock", "moved", "failed"] {
             let _ = std::fs::remove_file(dir.join(format!("{name}.{ext}")));
         }
         f.set_len(0)?;

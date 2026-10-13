@@ -352,6 +352,10 @@ fn kill(host: &Host, name: &str) -> Result<()> {
         let _lock = host.take_name(name, true)?;
         return lifecycle::discard(host, name);
     }
+    // A VM that died: its record goes.
+    if !host.alive(name) && std::fs::remove_file(host.run.join("vms").join(format!("{name}.failed"))).is_ok() {
+        return Ok(());
+    }
     Err(format!("no vm named {name:?}").into())
 }
 
@@ -372,6 +376,12 @@ fn list(host: &Host, as_json: bool) -> Result<()> {
             if let Some(v) = lifecycle::describe_suspended(host, &n) {
                 vms.push(v);
             }
+        }
+    }
+    for e in std::fs::read_dir(host.run.join("vms")).into_iter().flatten().flatten() {
+        let n = e.file_name().to_string_lossy().into_owned();
+        if let Some(n) = n.strip_suffix(".failed").filter(|n| !host.alive(n)) {
+            vms.push(json!({"name": n, "state": "failed", "error": std::fs::read_to_string(e.path()).unwrap_or_default()}));
         }
     }
     if as_json {

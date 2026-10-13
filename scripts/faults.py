@@ -2592,6 +2592,34 @@ def claim_killed():
     cli(A, "standby", "--template", args.template, "0")
 
 
+def fc_died():
+    """A VM's Firecracker dies under it (a guest panic, an OOM kill): its
+    process notices at once, cleans up as a kill would (address withdrawn,
+    route gone), exits with status 3, and `ls` shows it failed, with
+    Firecracker's exit status and the end of its log, until `kill`."""
+    n = "ft-fc-died"
+    scenario_vms.add(n)
+    p = subprocess.Popen([BIN, "--state", A.state, "--run", A.run, "run", n, "--template", args.template],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=ENV)
+    check("fc died: up", wait_for(lambda: vms(A).get(n, {}).get("state") == "running", 30), vms(A).get(n))
+    v = vms(A)[n]
+    os.kill(v["firecracker"], signal.SIGKILL)
+    t = time.time()
+    try:
+        code = p.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        code = None
+    took = time.time() - t
+    check("fc died: noticed at once, exit status 3", code == 3 and took < 2, (code, took))
+    failed = vms(A).get(n, {})
+    check("fc died: ls shows it failed, saying how", failed.get("state") == "failed" and "signal: 9" in failed.get("error", ""), failed)
+    check("fc died: address withdrawn", not addr(A, v["ip"]).get("holder") and addr(A, v["ip"]).get("withdrawn"), addr(A, v["ip"]))
+    route = subprocess.run(["ip", "route", "show", f"{v['ip']}/32"], capture_output=True, text=True).stdout.strip()
+    check("fc died: route gone", route == "", route)
+    ok(kill(A, n))
+    check("fc died: kill clears it", n not in vms(A), vms(A).get(n))
+
+
 SCENARIOS = dict(
     cow_grow=cow_grow, plug_race=plug_race, plug_storm=plug_storm,
     basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, refused=refused, pages_blip=pages_blip,
@@ -2608,7 +2636,7 @@ SCENARIOS = dict(
     fc_prepare=fc_prepare, slow_preload=slow_preload, ckpt_packet_hold=ckpt_packet_hold, standby=standby,
     suspend_disk_freed=suspend_disk_freed, resume_mark_fails=resume_mark_fails, kill_source=kill_source,
     forged_peer=forged_peer, restore_ip_peer=restore_ip_peer, late_withdrawal=late_withdrawal,
-    incoming_killed=incoming_killed, start_killed=start_killed, claim_killed=claim_killed)
+    incoming_killed=incoming_killed, start_killed=start_killed, claim_killed=claim_killed, fc_died=fc_died)
 names = [n for s in args.scenarios for n in (list(SCENARIOS) if s == "all" else [s])]
 if os.geteuid() != 0:
     sys.exit("run as root (sudo)")

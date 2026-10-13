@@ -26,7 +26,11 @@ A VM process:
 5. waits for signals and control requests until the VM is gone.
 
 Exit status: 0 when the VM was suspended, migrated away or killed on request;
-1 when it failed (memory lost, Firecracker died).
+1 when it failed to start; 3 when it died under the process (its Firecracker
+exited, watched through a pidfd, or its memory was lost): cleaned up as a
+kill, with why (Firecracker's exit status and the end of its log, the
+guest's console) in `RUN/vms/NAME.failed`, which `ls` shows as `failed`
+until `flexvm kill NAME`.
 
 Ownership is held in guards that give back exactly what they took: the name
 lock (`NameLock`), the address claim (`AddrClaim`: dropped, it releases the
