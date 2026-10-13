@@ -125,20 +125,45 @@ fn pin_gateway(s: &Sock) -> io::Result<()> {
 ///
 /// This runs on every start, right after restore, when each guest page the
 /// kernel touches for the first time costs a nested page fault. So it is one
-/// RTM_NEWADDR on a netlink socket opened at template boot: adding an address
-/// leaves the gateway route and ARP entry alone, where SIOCSIFADDR plus
-/// SIOCSIFNETMASK flush them and need them put back.
+/// RTM_NEWADDR on a socket opened at template boot, plus an RTM_DELADDR of
+/// the previous address when a restore (a fork) brings a new one. Adding an
+/// address leaves the gateway route and ARP entry alone, where SIOCSIFADDR
+/// plus SIOCSIFNETMASK flush them and need them put back. The add goes first:
+/// deleting eth0's last address would flush them too.
 pub fn configure(ip: Ipv4Addr, dns: Option<&str>) -> io::Result<()> {
-    // One receiver owns the shared socket until its matching ACK arrives.
-    static REQUEST: Mutex<()> = Mutex::new(());
-    static SEQUENCE: AtomicU32 = AtomicU32::new(1);
-    let _request = REQUEST.lock().unwrap();
-    let seq = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    // Keep the managed address in snapshot state, under the socket's ACK lock.
+    static ADDRESS: Mutex<Option<Ipv4Addr>> = Mutex::new(None);
+    let mut address = ADDRESS.lock().unwrap();
     let (fd, ifindex) = *NETLINK.get().ok_or_else(|| io::Error::other("no netlink socket"))?;
+    update_address(&mut address, ip, |kind, ip| address_request(fd, ifindex, kind, ip))?;
+    if let Some(dns) = dns {
+        std::fs::write("/etc/resolv.conf", format!("nameserver {dns}\n"))?;
+    }
+    Ok(())
+}
+
+fn update_address(
+    address: &mut Option<Ipv4Addr>,
+    ip: Ipv4Addr,
+    mut request: impl FnMut(u16, Ipv4Addr) -> io::Result<()>,
+) -> io::Result<()> {
+    request(libc::RTM_NEWADDR, ip)?;
+    match address.replace(ip).filter(|old| *old != ip).map(|old| request(libc::RTM_DELADDR, old)) {
+        Some(Err(e)) if e.raw_os_error() != Some(libc::EADDRNOTAVAIL) => Err(e),
+        _ => Ok(()),
+    }
+}
+
+fn address_request(fd: libc::c_int, ifindex: u32, kind: u16, ip: Ipv4Addr) -> io::Result<()> {
+    static SEQUENCE: AtomicU32 = AtomicU32::new(1);
+    let seq = SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let mut msg = [0u8; 40];
     msg[..4].copy_from_slice(&40u32.to_ne_bytes());
-    msg[4..6].copy_from_slice(&libc::RTM_NEWADDR.to_ne_bytes());
-    let flags = libc::NLM_F_REQUEST | libc::NLM_F_ACK | libc::NLM_F_CREATE | libc::NLM_F_REPLACE;
+    msg[4..6].copy_from_slice(&kind.to_ne_bytes());
+    let mut flags = libc::NLM_F_REQUEST | libc::NLM_F_ACK;
+    if kind == libc::RTM_NEWADDR {
+        flags |= libc::NLM_F_CREATE | libc::NLM_F_REPLACE;
+    }
     msg[6..8].copy_from_slice(&(flags as u16).to_ne_bytes());
     msg[8..12].copy_from_slice(&seq.to_ne_bytes());
     // struct ifaddrmsg: family, prefixlen, flags, scope, index.
@@ -169,9 +194,6 @@ pub fn configure(ip: Ipv4Addr, dns: Option<&str>) -> io::Result<()> {
             break;
         }
     }
-    if let Some(dns) = dns {
-        std::fs::write("/etc/resolv.conf", format!("nameserver {dns}\n"))?;
-    }
     Ok(())
 }
 
@@ -200,6 +222,29 @@ fn matching_ack(mut data: &[u8], seq: u32) -> Option<io::Result<()>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_address_is_added_before_the_previous_one_is_deleted() {
+        let old = Ipv4Addr::new(10, 0, 0, 1);
+        let new = Ipv4Addr::new(10, 0, 0, 2);
+        let mut address = None;
+        for (ip, expected) in [
+            (old, vec![(libc::RTM_NEWADDR, old)]),
+            (old, vec![(libc::RTM_NEWADDR, old)]),
+            (new, vec![(libc::RTM_NEWADDR, new), (libc::RTM_DELADDR, old)]),
+        ] {
+            let mut sent = Vec::new();
+            update_address(&mut address, ip, |kind, ip| { sent.push((kind, ip)); Ok(()) }).unwrap();
+            assert_eq!(sent, expected);
+            assert_eq!(address, Some(ip));
+        }
+        // A failed add keeps the old address; one already gone is not an error.
+        assert!(update_address(&mut address, old, |_, _| Err(io::Error::other("add failed"))).is_err());
+        assert_eq!(address, Some(new));
+        let gone = |kind, _| if kind == libc::RTM_DELADDR { Err(io::Error::from_raw_os_error(libc::EADDRNOTAVAIL)) } else { Ok(()) };
+        update_address(&mut address, old, gone).unwrap();
+        assert_eq!(address, Some(old));
+    }
 
     fn ack(seq: u32, code: i32) -> Vec<u8> {
         let mut data = vec![0; 20];

@@ -457,8 +457,17 @@ impl Root {
             }
             if let Some(hidden) = name_bytes.strip_prefix(b".wh.") {
                 let hidden = whiteout_target(hidden)?;
+                let rel = parent.join(std::ffi::OsStr::from_bytes(hidden.as_bytes()));
                 if let Ok(dir) = self.resolve(&parent) {
-                    remove_at(dir.as_raw_fd(), &hidden, 0)?;
+                    if mine.contains(&rel) || ancestors.contains(&rel) {
+                        // Keep this layer's entries, but hide lower descendants.
+                        if lstat_at(dir.as_raw_fd(), &hidden).is_some_and(|st| is_dir(&st)) {
+                            let sub = open_dir_at(dir.as_raw_fd(), &hidden)?;
+                            make_opaque(sub.as_raw_fd(), &rel, &mine, &ancestors, 0)?;
+                        }
+                    } else {
+                        remove_at(dir.as_raw_fd(), &hidden, 0)?;
+                    }
                 }
                 continue;
             }
@@ -828,6 +837,53 @@ mod tests {
         assert_eq!(h.ino(), n.ino());
         assert_eq!(n.mode() & 0o7777, 0o4755);
         assert_eq!(root.read("abs/through"), Some(b"t".to_vec()));
+    }
+
+    #[test]
+    fn plain_whiteout_keeps_same_layer_file_and_descendants() {
+        let s = Sandbox::new("wh-mine");
+        let mut root = s.open();
+        root.apply_layer(&layer(&[("foo", 'f', "lower"), ("dir/old", 'f', "old"), ("gone", 'f', "gone")])[..]).unwrap();
+        root.apply_layer(&layer(&[
+            ("foo", 'f', "upper"),
+            (".wh.foo", 'f', ""),
+            ("dir/new", 'f', "new"),
+            (".wh.dir", 'f', ""),
+            (".wh.gone", 'f', ""),
+        ])[..]).unwrap();
+        assert_eq!(s.read("foo").as_deref(), Some("upper"));
+        assert_eq!(s.read("dir/new").as_deref(), Some("new"));
+        assert_eq!(s.read("dir/old"), None);
+        assert_eq!(s.read("gone"), None);
+        assert!(!s.root.join(".wh.foo").exists());
+    }
+
+    #[test]
+    fn whiteouts_hide_only_lower_entries_in_any_order() {
+        let s = Sandbox::new("wh-order");
+        let mut root = s.open();
+        root.apply_layer(&layer(&[("a/b/c/old", 'f', "old"), ("a/b/x", 'f', "x"), ("pre", 'f', "lower"), ("o/old", 'f', "o")])[..])
+            .unwrap();
+        root.apply_layer(&layer(&[
+            (".wh.pre", 'f', ""),                // before the same layer's pre
+            ("pre", 'f', "upper"),
+            ("a/b/c/new", 'f', "new"),
+            ("a/b/.wh.c", 'f', ""),              // nested: keeps c/new, drops c/old
+            ("a/b/link", 'h', "a/b/x"),          // hard link to a lower file
+            ("a/b/.wh.link", 'f', ""),           // same layer: kept
+            ("a/b/.wh.x", 'f', ""),              // lower: removed, the link keeps its data
+            ("o/new", 'f', "n"),
+            ("o/.wh..wh..opq", 'f', ""),
+            ("o/.wh.new", 'f', ""),
+        ])[..])
+        .unwrap();
+        assert_eq!(s.read("pre").as_deref(), Some("upper"));
+        assert_eq!(s.read("a/b/c/new").as_deref(), Some("new"));
+        assert_eq!(s.read("a/b/c/old"), None);
+        assert_eq!(s.read("a/b/link").as_deref(), Some("x"));
+        assert_eq!(s.read("a/b/x"), None);
+        assert_eq!(s.read("o/new").as_deref(), Some("n"));
+        assert_eq!(s.read("o/old"), None);
     }
 
     #[test]
