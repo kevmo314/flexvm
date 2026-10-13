@@ -9,10 +9,13 @@
 //!   a migration), whose page server takes it from there;
 //! - `migration`: how an incoming migration went (see `Host::mig_status`),
 //!   or (`done`) that its source will not ask again;
-//! - `route`: a peer announces or withdraws a VM address.
+//! - `route`: a peer announces or withdraws a VM address;
+//! - `lend`: a peer restoring a checkpoint borrows an address of this host.
+//!
+//! Only the configured peers' addresses are served.
 
 use std::io::Read;
-use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, TcpListener, TcpStream, ToSocketAddrs};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
@@ -79,6 +82,12 @@ fn activated() -> Option<TcpListener> {
 }
 
 fn handle(host: &Host, mut conn: TcpStream) -> Result<()> {
+    // Only this host's peers (by address: the network between them is
+    // trusted) may send it VMs, take their memory or move addresses.
+    let from = conn.peer_addr()?.ip();
+    if !host.cfg.peers.iter().filter_map(|p| p.to_socket_addrs().ok()).flatten().any(|a| a.ip() == from) {
+        bail!("{from} is not a peer of this host (flexvm listen --peer)");
+    }
     let line = read_line(&mut conn)?;
     let req: Value = serde_json::from_slice(&line)?;
     let reply = match req["op"].as_str().unwrap_or("") {
@@ -86,6 +95,7 @@ fn handle(host: &Host, mut conn: TcpStream) -> Result<()> {
         "pages" => return pages(host, &req, conn),
         "migration" => migration(host, &req),
         "route" => route(host, &req),
+        "lend" => lend(host, &req),
         op => Err(format!("unknown op {op:?}").into()),
     };
     let reply = match reply {
@@ -182,6 +192,13 @@ fn migration(host: &Host, req: &Value) -> Result<Value> {
     }
     let outcome = host.mig_status(mig)?;
     Ok(json!({"outcome": outcome, "underlay": host.cfg.underlay().map(|u| u.to_string())}))
+}
+
+/// A peer restores a checkpoint with an address of this host's range.
+fn lend(host: &Host, req: &Value) -> Result<Value> {
+    let ip: Ipv4Addr = req["ip"].as_str().ok_or("missing ip")?.parse()?;
+    let gen = host.lend_new(&host.lock()?, ip)?;
+    Ok(json!({"ip": ip.to_string(), "gen": gen}))
 }
 
 /// A peer tells us where a VM's address lives now (`via`), or that the VM is

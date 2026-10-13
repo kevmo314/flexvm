@@ -179,6 +179,34 @@ impl Proc {
         ip
     }
 
+    /// Borrows `ip`, of another host's range, from that host, for VM `name`
+    /// (a restore keeping its checkpoint's address): its home host lends it
+    /// out, as to a VM migrating away, with a new generation.
+    pub fn borrow(&self, name: &str, ip: Ipv4Addr) -> Result<AddrClaim> {
+        let mut why = Vec::new();
+        for peer in &self.host.cfg.peers {
+            let gen = match peer_call(peer, json!({"op": "lend", "ip": ip.to_string()})) {
+                Ok(r) => r["gen"].as_u64().filter(|&g| g > 0).ok_or_else(|| format!("{peer} lent {ip} without a generation"))?,
+                Err(e) => {
+                    why.push(format!("{peer}: {e}"));
+                    continue;
+                }
+            };
+            let claimed = self.host.lock().and_then(|l| self.host.claim_incoming(&l, name, ip, gen));
+            return match claimed {
+                Ok(mut c) => {
+                    c.fresh = true;
+                    Ok(c)
+                }
+                Err(e) => {
+                    let _ = peer_call(peer, json!({"op": "route", "ip": ip.to_string(), "gen": gen}));
+                    bail!("cannot take {ip} borrowed from {peer}: {e}; restore with --ip auto")
+                }
+            };
+        }
+        bail!("cannot borrow {ip} from its home host ({}); restore with --ip auto", why.join("; "))
+    }
+
     /// Lets the VM's name keep its address after this process (suspended).
     pub fn keep_addr(&self) {
         if let Some(a) = self.addr.lock().unwrap().take() {
@@ -276,6 +304,7 @@ impl Proc {
         match (end, addr) {
             (End::Suspended, Some(a)) => a.keep(),
             (End::Gone, Some(a)) => self.withdraw(a),
+            (End::NotStarted, Some(a)) if a.fresh => self.withdraw(a),
             (End::Moved(to), a) => {
                 drop(a);
                 let name = self.name();

@@ -242,9 +242,13 @@ impl Proc {
             Some(ip) => Some(ip.parse().map_err(|_| format!("bad address {ip:?}"))?),
             None => Some(ck.manifest.ip),
         };
-        let claim = {
-            let l = self.host.lock()?;
-            self.host.claim_new(&l, &name, want).map_err(|e| format!("{e}; restore with --ip auto (or another address)"))?
+        let claim = match want.filter(|&ip| !self.host.cfg.range().is_ok_and(|r| r.contains(ip))) {
+            // Another host's address: borrowed from that host.
+            Some(ip) => self.borrow(&name, ip)?,
+            None => {
+                let l = self.host.lock()?;
+                self.host.claim_new(&l, &name, want).map_err(|e| format!("{e}; restore with --ip auto (or another address)"))?
+            }
         };
         let ip = self.set_addr(claim);
         t.mark("claim_ip");

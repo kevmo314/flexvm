@@ -269,8 +269,9 @@ impl Host {
         let taken = |ip| self.addr(l, ip).map_or(true, |a| a.lent.is_some() || self.held(&a));
         let ip = match want {
             Some(ip) if !range.contains(ip) => {
-                bail!("{ip} is not in this host's range {range}: start the vm on its home host, or let it pick an address")
+                bail!("{ip} is not this host's to hand out (range {range}): start the vm on its home host, or let it pick an address")
             }
+            Some(ip) if self.addr(l, ip)?.lent.is_some() => bail!("{ip} is lent out, with a vm that migrated away"),
             Some(ip) if taken(ip) => bail!("{ip} is in use"),
             Some(ip) => ip,
             None => range.allocate(taken).ok_or("no free addresses left")?,
@@ -280,7 +281,27 @@ impl Host {
         a = Addr { seen: gen, holder: Some(holder.into()), held: gen, lent: a.lent, ..Addr::default() };
         // The high-water mark orders generations; this record need not be durable.
         self.put_addr(ip, &a, false)?;
-        Ok(AddrClaim { host: self.clone(), ip, gen, holder: holder.into(), kept: false })
+        Ok(AddrClaim { host: self.clone(), ip, gen, holder: holder.into(), kept: false, fresh: true })
+    }
+
+    /// Lends `ip`, from this host's range, to a peer restoring a checkpoint
+    /// with it: if no VM here has it and it is not lent out, it is, durably,
+    /// with a new generation (returned). The VM's withdrawal wherever it is,
+    /// or its migrating here, gives it back.
+    pub fn lend_new(&self, l: &Locked, ip: Ipv4Addr) -> Result<u64> {
+        if !self.cfg.range()?.contains(ip) {
+            bail!("{ip} is not from this host's range {}", self.cfg.vm_ips);
+        }
+        let a = self.addr(l, ip)?;
+        if let Some(gen) = a.lent {
+            bail!("{ip} is lent out (generation {gen})");
+        }
+        if self.held(&a) {
+            bail!("{ip} is in use");
+        }
+        let gen = self.next_gen(a.seen)?;
+        self.put_addr(ip, &Addr { seen: gen, lent: Some(gen), ..Addr::default() }, true)?;
+        Ok(gen)
     }
 
     /// A generation newer than `seen` and than any handed out here before,
@@ -328,7 +349,7 @@ impl Host {
         a.seen = a.seen.max(gen);
         (a.holder, a.held) = (Some(holder.into()), gen);
         self.put_addr(ip, &a, true)?;
-        Ok(AddrClaim { host: self.clone(), ip, gen, holder: holder.into(), kept: false })
+        Ok(AddrClaim { host: self.clone(), ip, gen, holder: holder.into(), kept: false, fresh: false })
     }
 
     /// An arrival commits: its generation must still be current. Takes back
@@ -565,6 +586,9 @@ pub struct AddrClaim {
     pub gen: u64,
     holder: String,
     kept: bool,
+    /// A generation made for this VM (not one it brought along): withdrawn
+    /// even if the VM never ran.
+    pub fresh: bool,
 }
 
 impl AddrClaim {
@@ -1129,6 +1153,23 @@ mod tests {
         assert!(g >= 2048);
         std::fs::write(h.state.join("addrs/.gens"), "x").unwrap();
         assert!(h.claim_new(&l, "z", None).is_err());
+    }
+
+    #[test]
+    fn addresses_are_lent_to_restoring_peers_only_when_free() {
+        let h = host("lend");
+        let l = h.lock().unwrap();
+        let ip = "10.9.0.2".parse().unwrap();
+        assert!(h.lend_new(&l, "10.9.9.9".parse().unwrap()).is_err(), "not ours");
+        let g = h.lend_new(&l, ip).unwrap();
+        assert!(h.lend_new(&l, ip).unwrap_err().to_string().contains("lent"));
+        assert!(h.claim_new(&l, "x", Some(ip)).err().unwrap().to_string().contains("lent"));
+        // The borrower's withdrawal gives it back, with newer generations after.
+        assert!(h.observe(&l, ip, g, None).unwrap());
+        let _x = h.take_name("x", false).unwrap();
+        let c = h.claim_new(&l, "x", Some(ip)).unwrap();
+        assert!(c.gen > g && c.fresh);
+        assert!(h.lend_new(&l, ip).unwrap_err().to_string().contains("in use"));
     }
 
     #[test]
