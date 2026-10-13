@@ -10,6 +10,7 @@ mod hold;
 mod image;
 mod hot;
 mod net;
+mod socket;
 mod template;
 mod uffd;
 mod util;

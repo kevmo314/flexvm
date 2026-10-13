@@ -13,6 +13,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::bail;
+use crate::socket::{SocketRoot, Sockets};
 use crate::util::{retry, Result};
 
 /// Deadline for a Firecracker API call that does not pick its own.
@@ -20,26 +21,25 @@ pub const API_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct Firecracker {
     child: Child,
-    sock: PathBuf,
+    pub sockets: Sockets,
 }
 
 impl Firecracker {
-    /// Starts Firecracker with its API socket and log inside `dir`.
-    pub fn spawn(bin: &Path, dir: &Path) -> Result<Self> {
-        let sock = dir.join("api.sock");
-        let _ = std::fs::remove_file(&sock);
+    /// Starts Firecracker with private sockets and a log inside `dir`.
+    pub fn spawn(bin: &Path, dir: &Path, sockets: Sockets) -> Result<Self> {
+        crate::socket::check(&sockets.api)?;
         let log = File::create(dir.join("firecracker.log"))?;
         let child = Command::new(bin)
             .arg("--api-sock")
-            .arg(&sock)
+            .arg(&sockets.api)
             .arg("--level")
             .arg("Warn")
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
             .stderr(log)
             .spawn()?;
-        let fc = Firecracker { child, sock };
-        retry(Duration::from_secs(5), || Ok(UnixStream::connect(&fc.sock)?))?;
+        let fc = Firecracker { child, sockets };
+        retry(Duration::from_secs(5), || Ok(UnixStream::connect(&fc.sockets.api)?))?;
         Ok(fc)
     }
 
@@ -77,7 +77,7 @@ impl Firecracker {
         if timeout.is_zero() {
             bail!("firecracker {method} {path}: out of time");
         }
-        self.send(crate::util::connect_unix(&self.sock, timeout)?, method, path, body)
+        self.send(crate::util::connect_unix(&self.sockets.api, timeout)?, method, path, body)
     }
 
     fn send(&self, mut stream: UnixStream, method: &str, path: &str, body: Option<Value>) -> Result<Value> {
@@ -122,7 +122,7 @@ impl Firecracker {
     pub fn kill(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_file(&self.sock);
+        self.sockets.cleanup();
     }
 }
 
@@ -177,6 +177,7 @@ pub fn release(tap: &str, cgroup: Option<&Path>, dir: &Path) {
 pub struct Pool {
     bin: PathBuf,
     root: PathBuf,
+    sockets: Arc<SocketRoot>,
     cgroups: Option<PathBuf>,
     tap_prefix: String,
     size: usize,
@@ -193,10 +194,11 @@ struct PoolState {
 }
 
 impl Pool {
-    pub fn new(bin: &Path, root: &Path, cgroups: Option<PathBuf>, tap_prefix: &str, size: usize) -> Arc<Pool> {
+    pub fn new(bin: &Path, root: &Path, sockets: Arc<SocketRoot>, cgroups: Option<PathBuf>, tap_prefix: &str, size: usize) -> Arc<Pool> {
         let pool = Arc::new(Pool {
             bin: bin.into(),
             root: root.into(),
+            sockets,
             cgroups,
             tap_prefix: tap_prefix.into(),
             size,
@@ -219,7 +221,7 @@ impl Pool {
         let fc = (|| {
             crate::net::create_tap(&tap)?;
             std::fs::create_dir_all(&dir)?;
-            let fc = Firecracker::spawn(&self.bin, &dir)?;
+            let fc = Firecracker::spawn(&self.bin, &dir, self.sockets.allocate()?)?;
             if let Some(cg) = &cgroup {
                 std::fs::create_dir_all(cg)?;
                 std::fs::write(cg.join("cgroup.procs"), fc.pid().to_string())?;

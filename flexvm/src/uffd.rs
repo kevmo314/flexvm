@@ -396,6 +396,7 @@ impl Pager {
     /// the background. `initial` seeds page states for an incoming migration
     /// or a checkpoint restore, with where their REMOTE pages come from.
     pub fn start(sock: &Path, base: Arc<Template>, initial: Option<(Runs, Origin)>) -> Result<Arc<Pager>> {
+        crate::socket::check(sock)?;
         let _ = std::fs::remove_file(sock);
         let listener = UnixListener::bind(sock)?;
         // Polled, so a Firecracker that never connects cannot hold the thread forever.

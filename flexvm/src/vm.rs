@@ -97,6 +97,7 @@ pub struct Vm {
     clock_unsure: AtomicBool,
     next_exec: AtomicU64,
     fc: Mutex<Option<Firecracker>>,
+    vsock: PathBuf,
     cgroup: Option<PathBuf>,
     /// Set by `start_source` and `start_checkpoint` for a VM that was
     /// paused: `resume` then puts it back paused (and a migration target
@@ -149,7 +150,7 @@ impl Vm {
         let (fc, dir, cgroup, tap) = idle.into_parts();
         let cgroup = name_cgroup(cgroup, name);
         phases.mark("cgroup_rename");
-        let pager = Pager::start(&dir.join("uffd.sock"), template.clone(), remote);
+        let pager = Pager::start(&fc.sockets.uffd, template.clone(), remote);
         let restored = (|| {
             let pager = pager.as_ref().map_err(|e| e.to_string())?.clone();
             pager.set_pid(fc.pid())?;
@@ -163,8 +164,8 @@ impl Vm {
                 "/snapshot/load",
                 json!({
                     "snapshot_path": vmstate,
-                    "mem_backend": {"backend_type": "Uffd", "backend_path": dir.join("uffd.sock")},
-                    "vsock_override": {"uds_path": dir.join("v.sock")},
+                    "mem_backend": {"backend_type": "Uffd", "backend_path": fc.sockets.uffd},
+                    "vsock_override": {"uds_path": fc.sockets.vsock},
                     "network_overrides": [{"iface_id": "eth0", "host_dev_name": tap}],
                     "clock_realtime": true,
                     "resume_vm": load == Load::Running,
@@ -220,6 +221,7 @@ impl Vm {
             devices: Mutex::new(()),
             clock_unsure: AtomicBool::new(false),
             next_exec: AtomicU64::new(0),
+            vsock: fc.sockets.vsock.clone(),
             fc: Mutex::new(Some(fc)),
             cgroup,
             was_paused: AtomicBool::new(false),
@@ -232,7 +234,7 @@ impl Vm {
     }
 
     pub fn vsock(&self) -> PathBuf {
-        self.dir.join("v.sock")
+        self.vsock.clone()
     }
 
     pub fn state(&self) -> State {

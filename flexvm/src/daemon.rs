@@ -219,7 +219,12 @@ pub fn run(mut cfg: Config) -> Result<()> {
     net::delete_taps_with_prefix(&tap_prefix);
     // Before serving anything: addresses lent out before a restart stay taken.
     let addrs = Addrs::load(cfg.state_dir.join(LENT_FILE))?;
-    let pool = Pool::new(&cfg.paths.firecracker, &cfg.run_dir, cgroup_root.clone(), &tap_prefix, cfg.pool);
+    let sockets = crate::socket::SocketRoot::new()?;
+    // Both a debugging aid and the ownership mapping for restart cleanup.
+    let link = cfg.run_dir.join("sockets");
+    let _ = std::fs::remove_file(&link);
+    std::os::unix::fs::symlink(&sockets.dir, &link)?;
+    let pool = Pool::new(&cfg.paths.firecracker, &cfg.run_dir, sockets, cgroup_root.clone(), &tap_prefix, cfg.pool);
     let hot = HotPool::new(pool.clone(), cfg.hot, cfg.hot_mib, cfg.reserve_mib);
     let d = Arc::new_cyclic(|me| Daemon {
         me: me.clone(),
@@ -324,6 +329,7 @@ fn lock_run_dir(run_dir: &Path) -> Result<Vec<std::fs::File>> {
 /// would be a second copy.
 fn kill_orphans(run_dir: &Path) -> Result<()> {
     let run_dir = run_dir.canonicalize()?;
+    let sockets = crate::socket::previous(&run_dir)?;
     let gone = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ESRCH);
     // Ok(false) for a process that is not one of ours or no longer exists.
     let ours = |pid: &str| -> Result<bool> {
@@ -352,7 +358,8 @@ fn kill_orphans(run_dir: &Path) -> Result<()> {
             }
         }
         let dir = sock.parent().unwrap_or(&sock);
-        Ok(dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf()).starts_with(&run_dir))
+        let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        Ok(dir.starts_with(&run_dir) || sockets.as_ref().is_some_and(|s| dir.starts_with(s)))
     };
     let mut orphans = Vec::new();
     for e in std::fs::read_dir("/proc")? {
@@ -378,6 +385,9 @@ fn kill_orphans(run_dir: &Path) -> Result<()> {
         if !crate::util::pidfd_wait(&fd, deadline.saturating_duration_since(Instant::now()))? {
             bail!("firecracker {pid} left over in {} would not die", run_dir.display());
         }
+    }
+    if let Some(dir) = sockets {
+        std::fs::remove_dir_all(&dir).map_err(|e| format!("cleaning socket directory {}: {e}", dir.display()))?;
     }
     Ok(())
 }
@@ -1519,6 +1529,11 @@ impl Daemon {
             let _ = std::fs::remove_dir(root);
         }
         net::delete_taps_with_prefix(&self.tap_prefix);
+        // The pool is still referenced by background threads until exit;
+        // all of its slots and VMs are gone, so remove the empty root now.
+        if let Ok(Some(dir)) = crate::socket::previous(&self.cfg.run_dir) {
+            let _ = std::fs::remove_dir(dir);
+        }
         // The run directory only; the state directory (suspended VMs, lent
         // addresses) outlives us.
         let _ = std::fs::remove_dir_all(&self.cfg.run_dir);

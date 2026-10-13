@@ -65,14 +65,14 @@ pub struct Paused {
 impl Paused {
     /// Restores `template` into `idle`, lets it settle and pauses it.
     pub fn load(idle: Idle, template: Arc<Template>) -> Result<Paused> {
-        let pager = Pager::start(&idle.dir.join("uffd.sock"), template.clone(), None)?;
+        let pager = Pager::start(&idle.fc.sockets.uffd, template.clone(), None)?;
         let paused = Paused { idle: Some(idle), pager, template, loaded: Instant::now() };
         let idle = paused.idle.as_ref().unwrap();
         paused.pager.set_pid(idle.fc.pid())?;
         let body = json!({
             "snapshot_path": paused.template.vmstate(),
-            "mem_backend": {"backend_type": "Uffd", "backend_path": idle.dir.join("uffd.sock")},
-            "vsock_override": {"uds_path": idle.dir.join("v.sock")},
+            "mem_backend": {"backend_type": "Uffd", "backend_path": idle.fc.sockets.uffd},
+            "vsock_override": {"uds_path": idle.fc.sockets.vsock},
             "network_overrides": [{"iface_id": "eth0", "host_dev_name": idle.tap}],
             "clock_realtime": true,
             "resume_vm": false,
@@ -84,12 +84,12 @@ impl Paused {
         paused.pager.wait_ready(Duration::from_secs(5))?;
         // Get the slow first run after a restore out of the way, off the request path.
         idle.fc.request_within("PATCH", "/vm", Some(json!({"state": "Resumed"})), API_TIMEOUT)?;
-        wait_for_reseed(&idle.dir.join("v.sock"))?;
+        wait_for_reseed(&idle.fc.sockets.vsock)?;
         // Step the wall clock now: it keeps time while paused, so START at
         // take finds it right and skips clock_settime, which can take tens of
         // ms in a 24-vCPU guest (it IPIs the vCPUs). Best effort: START steps
         // it otherwise.
-        let _ = guest::clock(&idle.dir.join("v.sock"), &paused.template.legacy_agent, guest::TIMEOUT);
+        let _ = guest::clock(&idle.fc.sockets.vsock, &paused.template.legacy_agent, guest::TIMEOUT);
         std::thread::sleep(SETTLE);
         idle.fc.request_within("PATCH", "/vm", Some(json!({"state": "Paused"})), API_TIMEOUT)?;
         Ok(paused)
