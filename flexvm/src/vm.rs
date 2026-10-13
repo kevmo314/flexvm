@@ -598,7 +598,7 @@ impl Vm {
     /// or processes and acknowledges them again. Held, Firecracker does not
     /// discard reported pages, so no REMOVE reaches the pager while a
     /// copy-on-write checkpoint still has pages to save. Needs
-    /// `firecracker/0002-hold-free-page-reporting.patch`. A release is
+    /// `firecracker/0003-hold-free-page-reporting.patch`. A release is
     /// retried for a few seconds: until it lands, the guest's reported pages
     /// stay off its free lists.
     pub fn hold_reports(&self, hold: bool) -> Result<()> {

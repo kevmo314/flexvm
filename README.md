@@ -253,7 +253,7 @@ through, so the checkpoint is exactly the memory at the pause.
   REMOVE event for it, so a balloon or virtio-mem discard must not be read
   while pages are unsaved. So none is made during the copy:
   - **Free page reports are held.** Before the resume the daemon sends
-    `PATCH /balloon/reporting/hold` (`firecracker/0002`): Firecracker leaves
+    `PATCH /balloon/reporting/hold` (`firecracker/0003`): Firecracker leaves
     the guest's reports in the queue, neither discarding nor acknowledging
     them, until `.../release` after the copy (also on failure) processes
     them. The guest's reporting worker just waits for the acknowledgement
@@ -490,7 +490,7 @@ back to loading the snapshot then and there.
 writes all guest memory, which would make migration downtime proportional to
 RAM and double memory use on a host that is already short.
 
-`firecracker/0002-hold-free-page-reporting.patch`: `PATCH
+`firecracker/0003-hold-free-page-reporting.patch`: `PATCH
 /balloon/reporting/hold` and `PATCH /balloon/reporting/release`. While held,
 the balloon leaves free page reports in their virtqueue (it consumes the
 queue notification but pops nothing); a release processes whatever is
@@ -760,7 +760,7 @@ firecracker/        patches on top of Firecracker v1.17.0
   goes back to the host only afterwards), and the guest cannot grow by
   hotplug meanwhile, so a guest still growing fast can hit its OOM killer
   during a long copy. A discard that reaches the pager anyway (Firecracker
-  without `0002`) still stalls the guest until the unsaved pages are saved.
+  without `0003`) still stalls the guest until the unsaved pages are saved.
   `--stop` checkpoints and suspends still pause for the whole write. Write tracking stays on once a VM has
   had a keep-running checkpoint (one fault per 64 KiB block written between
   checkpoints); a restored VM starts without it, so its first checkpoint is
