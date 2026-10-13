@@ -152,7 +152,7 @@ impl Vm {
         if let Some((runs, origin)) = remote {
             prepared.pager.seed(runs, origin)?;
         }
-        prepared.load(name, vmstate, ip, load, phases)
+        prepared.load(name, vmstate, ip, load, None, phases)
     }
 
     /// The part of a restore that needs no vmstate: names the cgroup and
@@ -787,8 +787,8 @@ impl Prepared {
             "/snapshot/prepare",
             json!({
                 "snapshot_path": self.template.vmstate(),
-                "mem_backend": {"backend_type": "Uffd", "backend_path": idle.dir.join("uffd.sock")},
-                "vsock_override": {"uds_path": idle.dir.join("v.sock")},
+                "mem_backend": {"backend_type": "Uffd", "backend_path": idle.fc.sockets.uffd},
+                "vsock_override": {"uds_path": idle.fc.sockets.vsock},
                 "network_overrides": [{"iface_id": "eth0", "host_dev_name": idle.tap}],
             }),
         );
@@ -808,22 +808,34 @@ impl Prepared {
 
     /// Loads `vmstate` and starts the VM as `load` says, with `ip` routed to
     /// its tap. Seed the pager first if pages are to come from elsewhere.
-    pub fn load(mut self, name: &str, vmstate: &Path, ip: Ipv4Addr, load: Load, phases: &mut Phases) -> Result<(Arc<Vm>, Duration)> {
+    /// Every Firecracker request and wait ends by `deadline`, if given.
+    pub fn load(
+        mut self,
+        name: &str,
+        vmstate: &Path,
+        ip: Ipv4Addr,
+        load: Load,
+        deadline: Option<Instant>,
+        phases: &mut Phases,
+    ) -> Result<(Arc<Vm>, Duration)> {
         let idle = self.idle.as_ref().unwrap();
         let (fc, tap) = (&idle.fc, idle.tap.clone());
+        let left = |most: Duration| deadline.map_or(most, |d| d.saturating_duration_since(Instant::now()).min(most));
         let restored = (|| -> Result<Duration> {
             // Route the VM's address while Firecracker restores; it is not on the critical path.
             let route = std::thread::spawn(move || crate::net::attach(ip, &tap));
-            let loaded = fc.put(
+            let loaded = fc.request_within(
+                "PUT",
                 "/snapshot/load",
-                json!({
+                Some(json!({
                     "snapshot_path": vmstate,
                     "mem_backend": {"backend_type": "Uffd", "backend_path": fc.sockets.uffd},
                     "vsock_override": {"uds_path": fc.sockets.vsock},
                     "network_overrides": [{"iface_id": "eth0", "host_dev_name": idle.tap}],
                     "clock_realtime": true,
                     "resume_vm": load == Load::Running,
-                }),
+                })),
+                left(crate::fc::API_TIMEOUT),
             );
             self.pager.loaded();
             // Includes Firecracker's resume: the load request sets resume_vm.
@@ -833,10 +845,10 @@ impl Prepared {
                     // Loaded paused, Firecracker stops only the vCPUs and goes on
                     // emulating devices; an API pause enters the loop that holds
                     // device emulation too, until the resume.
-                    fc.pause()?;
+                    fc.request_within("PATCH", "/vm", Some(json!({"state": "Paused"})), left(crate::fc::API_TIMEOUT))?;
                     phases.mark("hold_paused");
                 }
-                self.pager.wait_ready(Duration::from_secs(5))
+                self.pager.wait_ready(left(Duration::from_secs(5)))
             });
             let routed = route.join().map_err(|_| "route thread panicked")?;
             held?;

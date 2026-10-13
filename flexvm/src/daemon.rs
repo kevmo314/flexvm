@@ -565,17 +565,7 @@ impl Daemon {
             "migrate_in" => return self.migrate_in(&req, r, w),
             "logs" => return self.logs(&name, &req, w),
             "preflight" => self.migration_template(&req, true).map(|tpl| json!({"id": tpl.meta.id})),
-            "incoming" => match {
-                // The vmstate follows; a source that stalls must not hold a
-                // counted operation (and so shutdown) forever.
-                r.get_ref().set_read_timeout(Some(INCOMING_READ_TIMEOUT))?;
-                self.incoming(&req, &mut r)
-            } {
-                // Committed, but the source never hears about it. (Shut down,
-                // as the announcing thread holds a clone of the connection.)
-                Ok(_) if self.fault("lost_ack") => return Ok(w.shutdown(std::net::Shutdown::Both)?),
-                res => res,
-            },
+            "incoming" => return self.incoming(&req, r, w),
             "run" => self.run_vm(&name, req["template"].as_str().unwrap_or("default"), req["ip"].as_str()),
             "ls" => Ok(self.list()),
             "kill" => self.kill(&name),
@@ -919,8 +909,10 @@ impl Daemon {
     /// server drops connections), `route` (rerouting after a migration
     /// fails), `lost_ack` (incoming migrations get no reply), `status`
     /// (migration status queries fail), `prepare_fail` (an incoming migration
-    /// fails once everything is prepared) or `short_incoming` (a prepared
-    /// incoming migration waits 2 s for the source, not 30).
+    /// fails once everything is prepared), `short_incoming` (a prepared
+    /// incoming migration waits 2 s for the source, not 30) or
+    /// `slow_preload` (a migration source sends the preloaded pages 300 ms
+    /// after the vmstate).
     fn inject(&self, req: &Value) -> Result<Value> {
         let Some(faults) = &self.faults else { bail!("fault injection is off (start the daemon with FLEXVM_FAULTS=1)") };
         let fault = req["fault"].as_str().ok_or("missing fault")?;
@@ -1120,6 +1112,9 @@ impl Daemon {
                 }),
             )?;
             conn.write_all(&state)?;
+            if self.fault("slow_preload") {
+                thread::sleep(Duration::from_millis(300));
+            }
             conn.write_all(&data)?;
             t.mark("send_state");
             Ok(recv_json(&mut reader)?.ok_or("target hung up")?)
@@ -1425,80 +1420,108 @@ impl Daemon {
         // The vmstate follows once the source has paused. A source that
         // stalls or trickles must not hold the name, the address, the
         // prepared Firecracker and a counted operation (and so shutdown)
-        // forever: everything it sends from here is due by one deadline.
-        // The migration connection, for the held packets that follow our answer.
-        let conn = r.get_ref().try_clone()?;
+        // forever: from here, everything up to our answer (its reads, the
+        // load, the checks, writing the answer) is due by one deadline, and
+        // the migration aborts if that passes before it commits.
         let wait = if self.fault("short_incoming") { Duration::from_secs(2) } else { INCOMING_READ_TIMEOUT };
-        let mut r = ByDeadline { r: &mut r, at: Instant::now() + wait };
+        let deadline = Instant::now() + wait;
+        let mut br = ByDeadline { r: &mut r, at: deadline };
         let pager = prepared.vm.pager.clone();
-        let reply = thread::scope(|scope| -> Result<Value> {
-            let hdr = recv_json(&mut (&mut r).take(MAX_HEADER))?.ok_or("source hung up before sending the vmstate")?;
+        let res = thread::scope(|scope| -> Result<(Value, Arc<Vm>)> {
+            let hdr = recv_json(&mut (&mut br).take(MAX_HEADER))?.ok_or("source hung up before sending the vmstate")?;
             // The source has paused: the downtime here starts now.
             let mut t = Phases::new();
             let runs: Runs = serde_json::from_value(hdr["runs"].clone())?;
-            let state = read_vec(&mut r, hdr["vmstate_len"].as_u64().ok_or("missing vmstate_len")?, MAX_VMSTATE)?;
+            let state = read_vec(&mut br, hdr["vmstate_len"].as_u64().ok_or("missing vmstate_len")?, MAX_VMSTATE)?;
             t.mark("recv_state");
             let pages: Vec<u64> = serde_json::from_value(hdr["preload"].clone()).unwrap_or_default();
             if pages.len() > MAX_PRELOAD {
                 bail!("{} pages to preload, more than {MAX_PRELOAD}", pages.len());
             }
             // The pages the load touches follow the vmstate: received and
-            // installed while Firecracker parses the state. One missing
-            // when the load wants it is fetched like any other.
-            let r = &mut r;
-            scope.spawn(move || {
+            // installed while Firecracker parses the state (one missing when
+            // the load wants it is fetched like any other). All of them are
+            // in, or the migration aborts, before it commits: nothing else
+            // reads this connection until our answer.
+            let br = &mut br;
+            let preload = scope.spawn(move || -> Result<()> {
                 let len = (pages.len() * crate::util::PAGE_SIZE) as u64;
-                if let Err(e) = read_vec(r, len, u64::MAX).and_then(|data| pager.preload(&pages, &data)) {
-                    eprintln!("migration {}: preloading pages: {e}", req["mig"]);
-                }
+                let data = read_vec(br, len, u64::MAX).map_err(|e| format!("receiving the preloaded pages: {e}"))?;
+                pager.preload(&pages, &data, deadline).map_err(|e| format!("preloading pages: {e}"))?;
+                Ok(())
             });
+            let preloaded = move || preload.join().unwrap_or_else(|_| Err("preloading panicked".into()));
             let paused = hdr["paused"].as_bool().unwrap_or(false);
-            let (v, vm) = self.finish_in(prepared, runs, &state, paused, &mut t)?;
-            // Before the answer: the held packets follow it on this connection.
-            self.after_arrival(req, &vm, &conn);
-            Ok(v)
+            self.finish_in(prepared, runs, &state, paused, deadline, preloaded, &mut t)
         });
-        let reply = match reply {
-            // Committed, but the source never hears about it. (Shut down,
-            // as the announcing thread holds a clone of the connection.)
-            Ok(_) if self.fault("lost_ack") => return Ok(w.shutdown(std::net::Shutdown::Both)?),
-            Ok(v) => json!({"ok": true, "result": v}),
-            Err(e) => json!({"ok": false, "error": e.to_string()}),
+        let (reply, arrived) = match res {
+            Ok((v, vm)) => (json!({"ok": true, "result": v}), Some(vm)),
+            Err(e) => (json!({"ok": false, "error": e.to_string()}), None),
         };
-        send_json(&mut w, &reply)?;
-        Ok(())
+        // Committed, but the source never hears about it.
+        let lost = arrived.is_some() && self.fault("lost_ack");
+        let answered = match lost {
+            true => w.shutdown(std::net::Shutdown::Both).map_err(Error::from),
+            false => w
+                .set_write_timeout(Some(deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1))))
+                .map_err(Error::from)
+                .and_then(|()| Ok(send_json(&mut w, &reply)?)),
+        };
+        // Only now, on the same buffered reader: the held packets follow the
+        // answer. A committed VM is announced even if answering failed.
+        if let Some(vm) = arrived {
+            self.after_arrival(req, &vm, r, deadline);
+        }
+        answered
     }
 
     /// An incoming migration from a source that sends everything at once,
     /// after pausing (`incoming`, from daemons before `migrate_in`).
-    fn incoming(self: &Arc<Self>, req: &Value, r: &mut BufReader<TcpStream>) -> Result<Value> {
-        let mut t = Phases::new();
-        let _op = self.admit()?;
-        let runs: Runs = serde_json::from_value(req["runs"].clone())?;
-        let state = read_vec(r, req["vmstate_len"].as_u64().ok_or("missing vmstate_len")?, MAX_VMSTATE)?;
-        t.mark("recv_state");
-        let prepared = self.prepare_in(req, false, &mut t)?;
-        let (v, vm) = self.finish_in(prepared, runs, &state, req["paused"].as_bool().unwrap_or(false), &mut t)?;
-        self.after_arrival(req, &vm, r.get_ref());
-        Ok(v)
+    fn incoming(self: &Arc<Self>, req: &Value, mut r: BufReader<TcpStream>, mut w: TcpStream) -> Result<()> {
+        // The vmstate follows; a source that stalls must not hold a counted
+        // operation (and so shutdown) forever.
+        let deadline = Instant::now() + INCOMING_READ_TIMEOUT;
+        r.get_ref().set_read_timeout(Some(INCOMING_READ_TIMEOUT))?;
+        let res = (|| {
+            let mut t = Phases::new();
+            let _op = self.admit()?;
+            let runs: Runs = serde_json::from_value(req["runs"].clone())?;
+            let state = read_vec(&mut r, req["vmstate_len"].as_u64().ok_or("missing vmstate_len")?, MAX_VMSTATE)?;
+            t.mark("recv_state");
+            let prepared = self.prepare_in(req, false, &mut t)?;
+            let paused = req["paused"].as_bool().unwrap_or(false);
+            self.finish_in(prepared, runs, &state, paused, deadline, || Ok(()), &mut t)
+        })();
+        let (reply, arrived) = match res {
+            Ok((v, vm)) => (json!({"ok": true, "result": v}), Some(vm)),
+            Err(e) => (json!({"ok": false, "error": e.to_string()}), None),
+        };
+        // Committed, but the source never hears about it.
+        let answered = match arrived.is_some() && self.fault("lost_ack") {
+            true => w.shutdown(std::net::Shutdown::Both).map_err(Error::from),
+            false => Ok(send_json(&mut w, &reply)?),
+        };
+        if let Some(vm) = arrived {
+            self.after_arrival(req, &vm, r, deadline);
+        }
+        answered
     }
 
-    /// For a VM that arrived as migration `req["mig"]`: takes the packets its
-    /// source held, which follow our answer on `conn` (the migration
-    /// connection, with nothing more buffered: the source waits for the
-    /// answer), then announces the VM (`announce_after_held`).
-    fn after_arrival(self: &Arc<Self>, req: &Value, vm: &Arc<Vm>, conn: &TcpStream) {
+    /// For a VM that arrived as migration `req["mig"]`, once the source has
+    /// our answer: takes the packets its source held, which follow it on `r`
+    /// (the migration connection, read through the same buffer), then
+    /// announces the VM (`announce_after_held`). Nothing of it past `deadline`.
+    fn after_arrival(self: &Arc<Self>, req: &Value, vm: &Arc<Vm>, r: BufReader<TcpStream>, deadline: Instant) {
         let Some(mig) = req["mig"].as_u64() else { return };
-        let conn = conn.try_clone().ok();
         let revoked = {
             let mut held = self.held_in.lock().unwrap();
             let right = held.get_mut(&mig).filter(|h| Arc::ptr_eq(&h.vm, vm));
             right.map(|h| {
-                h.conn = conn.as_ref().and_then(|c| c.try_clone().ok());
+                h.conn = r.get_ref().try_clone().ok();
                 h.revoked.clone()
             })
         };
-        self.announce_after_held(mig, vm.clone(), conn.zip(revoked));
+        self.announce_after_held(mig, vm.clone(), revoked.map(|rv| (r, rv)), deadline);
     }
 
     /// The part of taking a VM in that needs no vmstate. `preflight`: the
@@ -1537,12 +1560,15 @@ impl Daemon {
     /// Restores and resumes a prepared incoming VM from the source's state.
     /// Records the outcome for the source: aborted if the VM was killed
     /// before it ever ran here, committed (by `take_in`) before it may run.
+    #[allow(clippy::too_many_arguments)]
     fn finish_in(
         self: &Arc<Self>,
         p: PreparedIn<'_>,
         runs: Runs,
         state: &[u8],
         paused: bool,
+        deadline: Instant,
+        before_commit: impl FnOnce() -> Result<()>,
         t: &mut Phases,
     ) -> Result<(Value, Arc<Vm>)> {
         let mig = p.source.mig;
@@ -1553,7 +1579,7 @@ impl Daemon {
             }
             migs.insert(mig, Incoming::Pending);
         }
-        let res = self.take_in(p, runs, state, paused, t);
+        let res = self.take_in(p, runs, state, paused, deadline, before_commit, t);
         let mut migs = self.migrations.lock().unwrap();
         // Before committing, a failure has killed a VM that never ran, so the
         // source may resume it. Once committed, it stays committed.
@@ -1569,13 +1595,18 @@ impl Daemon {
     /// stream opens within `HOLD_FENCE` (none held, or the source is slow),
     /// closes the right and announces: a later stream would come after
     /// traffic sent straight here, so its packets are dropped instead.
-    fn announce_after_held(self: &Arc<Self>, mig: u64, vm: Arc<Vm>, stream: Option<(TcpStream, Arc<Mutex<bool>>)>) {
+    fn announce_after_held(
+        self: &Arc<Self>,
+        mig: u64,
+        vm: Arc<Vm>,
+        stream: Option<(BufReader<TcpStream>, Arc<Mutex<bool>>)>,
+        deadline: Instant,
+    ) {
         let d = self.clone();
         thread::spawn(move || {
-            if let Some((conn, revoked)) = stream {
-                let mut r = BufReader::new(conn);
-                if hold::wait_start(&mut r, Instant::now() + HOLD_FENCE) {
-                    hold::receive(&mut r, vm.ip, &vm.tap, &revoked, Instant::now() + HELD_STREAM);
+            if let Some((mut r, revoked)) = stream {
+                if hold::wait_start(&mut r, (Instant::now() + HOLD_FENCE).min(deadline)) {
+                    hold::receive(&mut r, vm.ip, &vm.tap, &revoked, (Instant::now() + HELD_STREAM).min(deadline));
                 }
             }
             d.held_in.lock().unwrap().remove(&mig);
@@ -1583,12 +1614,18 @@ impl Daemon {
         });
     }
 
+    /// Loads the VM held, runs every check that can still abort (the source's
+    /// page server, the pager, `before_commit`, `deadline`, registering the
+    /// name), commits, then resumes it.
+    #[allow(clippy::too_many_arguments)]
     fn take_in(
         self: &Arc<Self>,
         p: PreparedIn<'_>,
         runs: Runs,
         state: &[u8],
         paused: bool,
+        deadline: Instant,
+        before_commit: impl FnOnce() -> Result<()>,
         t: &mut Phases,
     ) -> Result<(Value, Arc<Vm>)> {
         let PreparedIn { vm: prepared, claim, source, name, _busy, .. } = p;
@@ -1599,7 +1636,7 @@ impl Daemon {
         let probe = runs.iter().find(|r| r.2 == crate::uffd::REMOTE).map(|r| {
             let source = source.clone();
             let page = r.0;
-            thread::spawn(move || crate::uffd::probe(&source, page))
+            thread::spawn(move || crate::uffd::probe(&source, page, deadline))
         });
         prepared.pager.seed(runs, Origin::Peer(source.clone()))?;
         // A prepared load connected the pager long ago; it may have given up.
@@ -1613,13 +1650,16 @@ impl Daemon {
         // check that can still abort the migration has passed (the source
         // would then resume an older state of a VM that ran on).
         let load = if paused { crate::vm::Load::Paused } else { crate::vm::Load::PausedUnheld };
-        let restored = prepared.load(&name, &vmstate, ip, load, t);
+        let restored = prepared.load(&name, &vmstate, ip, load, Some(deadline), t);
         let probed = probe.map_or(Ok(()), |p| p.join().unwrap_or_else(|_| Err(std::io::Error::other("probe panicked"))));
         let (vm, restore) = restored?;
         let checked = match (probed, vm.pager.failed()) {
             (Err(e), _) => Err(format!("migration source {} does not serve pages: {e}", source.addr).into()),
             (_, Some(why)) => Err(format!("its memory cannot be paged in: {why}").into()),
-            _ => self.publish(&name, &vm),
+            _ => before_commit().and_then(|()| match Instant::now() < deadline {
+                true => self.publish(&name, &vm),
+                false => Err("the migration ran past its deadline".into()),
+            }),
         };
         if let Err(e) = checked {
             // Never ran here: the source may resume its copy.

@@ -698,11 +698,10 @@ impl Pager {
     /// fault on them one round trip at a time. Runs alongside the load; a
     /// page a fault or puller claimed first is skipped. Returns how many it
     /// installed.
-    pub fn preload(&self, list: &[u64], data: &[u8]) -> Result<usize> {
+    pub fn preload(&self, list: &[u64], data: &[u8], deadline: Instant) -> Result<usize> {
         if data.len() != list.len() * PAGE_SIZE {
             bail!("preload of {} pages has {} bytes", list.len(), data.len());
         }
-        let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
         while self.wait_ready(Duration::from_millis(10)).is_err() {
             if self.stop.load(Ordering::SeqCst) || Instant::now() >= deadline {
                 bail!("the pager stopped or Firecracker never connected");
@@ -1720,11 +1719,22 @@ impl Link {
 }
 
 /// Fetches `page` from a migration source's page server, retrying as a
-/// pager would (for up to `SOURCE_TIMEOUT`): whether it serves pages at all.
-pub fn probe(source: &Source, page: u64) -> io::Result<()> {
-    let stop = AtomicBool::new(false);
+/// pager would (for up to `SOURCE_TIMEOUT`, and not past `deadline`):
+/// whether it serves pages at all.
+pub fn probe(source: &Source, page: u64, deadline: Instant) -> io::Result<()> {
     let mut buf = vec![0u8; PAGE_SIZE];
-    Link::new(source.clone()).fetch(page * PAGE_SIZE as u64, &mut buf, Some(&stop))
+    let mut link = Link::new(source.clone());
+    loop {
+        match link.fetch(page * PAGE_SIZE as u64, &mut buf, None) {
+            // Waiting to reconnect.
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            r => return r,
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "no answer from the page server in time"));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// Client for a migration source's page server.
