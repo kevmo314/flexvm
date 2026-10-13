@@ -28,7 +28,7 @@
 //! checkpoint of a running VM saves pages before the guest overwrites them
 //! (see `cow`).
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, IoSliceMut, Read, Write};
 use std::net::TcpStream;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -775,6 +775,11 @@ pub struct Pager {
     pub wp_race: AtomicBool,
     /// Test fault: copies of fault-fetched runs past their first page to fail once more.
     pub tail_fail: AtomicU32,
+    /// Test fault: from then on every copy of a fault-fetched run fails
+    /// (ENOMEM), and the pullers wait.
+    pub stuck_from: Mutex<Option<Instant>>,
+    /// Pages whose install failed, and since when they have kept failing.
+    install_failing: Mutex<HashMap<usize, Instant>>,
     /// Initial page states and their origin, applied when Firecracker
     /// connects (see `seed`).
     initial: Mutex<Option<(Runs, Origin)>>,
@@ -852,6 +857,8 @@ impl Pager {
             fail_protect: AtomicBool::new(false),
             wp_race: AtomicBool::new(false),
             tail_fail: AtomicU32::new(0),
+            stuck_from: Mutex::new(None),
+            install_failing: Mutex::new(HashMap::new()),
             initial: Mutex::new(initial),
             seeded: Condvar::new(),
             awaiting_seed: AtomicBool::new(false),
@@ -1607,7 +1614,7 @@ impl Pager {
                     return Err(eagain());
                 }
                 let mut jobs = self.demand.0.lock().unwrap();
-                jobs.push_back((page, n, Instant::now(), None));
+                jobs.push_back((page, n, Instant::now()));
                 self.demand.1.notify_one();
                 Ok(Served::Fetching)
             }
@@ -2170,8 +2177,7 @@ impl Pager {
         let mut buf = vec![0u8; REMOTE_FAULT_RUN * PAGE_SIZE];
         let pages = self.pages();
         loop {
-            // `failing`: since when installing these pages has kept failing.
-            let (page, n, queued, failing) = {
+            let (page, n, queued) = {
                 let mut jobs = self.demand.0.lock().unwrap();
                 loop {
                     if self.stop.load(Ordering::SeqCst) {
@@ -2217,8 +2223,13 @@ impl Pager {
                 })
             };
             let mut first = true;
+            let stuck = *self.stuck_from.lock().unwrap();
             let (resolved, res) = pages.fetch_install(page, n, &mut buf, &mut fetch, &self.stop, &mut retry, |p, c, src| {
                 if tail_fail && p != page && self.tail_fail.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |k| k.checked_sub(1)).is_ok() {
+                    return Err(io::Error::from_raw_os_error(libc::ENOMEM));
+                }
+                // Test fault `fetch_enomem_stuck`.
+                if stuck.is_some_and(|t| Instant::now() >= t) {
                     return Err(io::Error::from_raw_os_error(libc::ENOMEM));
                 }
                 let r = self.populate(p, c, Some(src));
@@ -2230,7 +2241,12 @@ impl Pager {
             self.fault_stats.record(FETCH, started.elapsed());
             self.pulled(resolved);
             match res {
-                Ok(()) => {}
+                Ok(()) => {
+                    let mut failing = self.install_failing.lock().unwrap();
+                    if !failing.is_empty() {
+                        (page..page + n).for_each(|p| _ = failing.remove(&p));
+                    }
+                }
                 // All discarded meanwhile, there was nothing left to fetch.
                 Err(Failed::Fetch(_)) if resolved == n || self.stop.load(Ordering::SeqCst) => {}
                 Err(Failed::Fetch(e)) => return self.fail(format!("fetching pages for a fault: {e}")),
@@ -2241,7 +2257,16 @@ impl Pager {
                     return self.gone()
                 }
                 Err(Failed::Install(e)) => {
-                    let since = failing.unwrap_or_else(Instant::now);
+                    // Since when these pages have kept failing to install,
+                    // whoever claimed them (this requeue, or a fault that
+                    // got to them first): kept per page, so that no claim
+                    // starts the deadline over.
+                    let since = {
+                        let mut failing = self.install_failing.lock().unwrap();
+                        let since = (page..page + n).filter_map(|p| failing.get(&p).copied()).min().unwrap_or_else(Instant::now);
+                        (page..page + n).for_each(|p| _ = failing.entry(p).or_insert(since));
+                        since
+                    };
                     if since.elapsed() >= FAULT_TIMEOUT {
                         return self.fail(format!("installing pages for a fault: {e}"));
                     }
@@ -2257,7 +2282,7 @@ impl Pager {
                         match pages.claim(i, page + n - i, REMOTE, |_| true) {
                             0 => i += 1,
                             k => {
-                                jobs.push_back((i, k, Instant::now(), Some(since)));
+                                jobs.push_back((i, k, Instant::now()));
                                 i += k;
                             }
                         }
@@ -2317,6 +2342,10 @@ impl Pager {
     /// Pulls the REMOTE pages from `i` on (up to `end`, within one region)
     /// that it can claim in one go. Returns where to go on from.
     fn pull_run(&self, i: usize, end: usize, buf: &mut [u8], fetch: &mut Fetch) -> io::Result<usize> {
+        // Test fault `fetch_enomem_stuck`: only faults fetch pages.
+        while self.stuck_from.lock().unwrap().is_some() && !self.stop.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(10));
+        }
         let pages = self.pages();
         let n = pages.claim(i, (end - i).min(buf.len() / PAGE_SIZE), REMOTE, |_| true);
         if n == 0 {
@@ -2612,9 +2641,9 @@ pub fn remote_among(runs: &Runs, wanted: impl IntoIterator<Item = u64>) -> Vec<u
 type Fetch = dyn FnMut(u64, &mut [u8], &AtomicBool, &mut dyn FnMut(&[u8])) -> io::Result<()> + Send;
 /// `Fetch`, borrowed and not necessarily `Send`.
 type FetchAny<'a> = dyn FnMut(u64, &mut [u8], &AtomicBool, &mut dyn FnMut(&[u8])) -> io::Result<()> + 'a;
-/// A run of REMOTE pages a fault claimed, `(first, count)`, when it was
-/// queued, and since when installing it has kept failing.
-type Job = (usize, usize, Instant, Option<Instant>);
+/// A run of REMOTE pages a fault claimed, `(first, count)`, and when it
+/// was queued.
+type Job = (usize, usize, Instant);
 
 /// A background pull could not install pages because their range is no
 /// longer mapped in Firecracker at all (UFFDIO_COPY and UFFDIO_ZEROPAGE fail

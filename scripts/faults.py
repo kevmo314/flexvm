@@ -87,7 +87,7 @@ def fault(host, f, ms):
 FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_before_run", "restore_after_run",
           "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "ckpt_crawl", "resume_kill",
           "prepare_fail", "short_incoming", "slow_preload", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
-          "hot_low_estimate", "started_fsync", "started_unmark", "ckpt_wp_race", "fetch_tail_enomem")
+          "hot_low_estimate", "started_fsync", "started_unmark", "ckpt_wp_race", "fetch_tail_enomem", "fetch_enomem_stuck")
 
 
 def disarm():
@@ -1607,6 +1607,32 @@ def fetch_tail_enomem():
     cleanup(n)
 
 
+def fetch_enomem_stuck():
+    """Pages a fault needs that keep failing to install (ENOMEM on every
+    copy, the pullers held off) make the target give up within the fault
+    deadline and report the VM failed, however the pages get claimed again
+    (by the waiting fault or by the requeue), instead of leaving the vCPU
+    blocked for good."""
+    n = "ft-stuck"
+    setup(n, mib=400)
+    fault(B, "fetch_enomem_stuck", 60000)
+    ok(A, {"op": "migrate", "name": n, "to": B})
+    t0 = time.time()
+    threading.Thread(target=lambda: sh(B, n, "md5sum /tmp/f"), daemon=True).start()
+    st = {}
+
+    def failed():
+        st.update(rpc(B, {"op": "migration_status", "name": n}).get("result") or {})
+        return st.get("state") == "failed"
+
+    gave_up = wait_for(failed, 20)
+    took = time.time() - t0
+    fault(B, "fetch_enomem_stuck", 0)
+    check(f"stuck: target gave up ({took:.1f} s) and reports the vm failed", gave_up and "installing pages" in (st.get("failed") or ""),
+          {k: st.get(k) for k in ("state", "failed", "released")})
+    cleanup(n)
+
+
 def cow_reports_held():
     """Exercise Firecracker's report hold and the pager's REMOVE fallback
     with disk writers gated until the guest has freed memory."""
@@ -2432,7 +2458,7 @@ SCENARIOS = dict(plug_race=plug_race, plug_storm=plug_storm, cow_grow=cow_grow, 
                  suspend_resume=suspend_resume, checkpoint_hotplug=checkpoint_hotplug,
                  checkpoint_untrusted_dir=checkpoint_untrusted_dir, resume_failures=resume_failures,
                  state_dir_lock=state_dir_lock, held_restore_frozen=held_restore_frozen,
-                 cow_exact=cow_exact, cow_abort=cow_abort, cow_crash=cow_crash, cow_reports_held=cow_reports_held, cow_wp_race=cow_wp_race, fetch_tail_enomem=fetch_tail_enomem, ckpt_incremental=ckpt_incremental,
+                 cow_exact=cow_exact, cow_abort=cow_abort, cow_crash=cow_crash, cow_reports_held=cow_reports_held, cow_wp_race=cow_wp_race, fetch_tail_enomem=fetch_tail_enomem, fetch_enomem_stuck=fetch_enomem_stuck, ckpt_incremental=ckpt_incremental,
                  ckpt_failed_stop=ckpt_failed_stop, ckpt_rearm=ckpt_rearm,
                  ckpt_dir_moved=ckpt_dir_moved, prepare_disconnect=prepare_disconnect,
                  prepare_trickle=prepare_trickle, prepare_fail=prepare_fail, fc_prepare=fc_prepare,
