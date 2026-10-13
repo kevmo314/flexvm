@@ -493,7 +493,7 @@ impl Daemon {
     fn template(&self, name: &str) -> Result<Arc<Template>> {
         let dir = Template::resolve(&self.cfg.paths, name)?;
         let tpl = self.template_at(name, dir)?;
-        self.hot.warm(&tpl);
+        self.hot.warm(&tpl, self.fault("hot_low_estimate"));
         self.forget_old_generations(&tpl);
         Ok(tpl)
     }
@@ -570,6 +570,9 @@ impl Daemon {
         let op = req["op"].as_str().unwrap_or("").to_string();
         // A release lets a shutting-down source exit; it must still get its reply out.
         let _releasing = (op == "release").then(|| self.ops.enter());
+        // The hot pool refills only once this run has answered (dropped
+        // after the reply is sent), so its load does not slow the START.
+        let _starting = (op == "run").then(|| self.hot.starting());
         let name = req["name"].as_str().unwrap_or("").to_string();
         let reply = match op.as_str() {
             // Streaming ops write their own replies.
@@ -1414,6 +1417,9 @@ impl Daemon {
         let (mut stats, _) = h.release(ip, mig, &mut |p| hold::valid(p, ip) && inj.send(p), &mut || true, || switch(()))?;
         stats.injected = stats.packets;
         stats.dropped_target = inj.dropped();
+        // Closing a packet socket waits for an RCU grace period (tens of ms
+        // on a busy host), which the VM, still paused, need not wait for.
+        thread::spawn(move || drop(inj));
         Some(stats)
     }
 

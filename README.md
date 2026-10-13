@@ -252,6 +252,15 @@ pages are written while it runs. A guest write to a page not saved yet
 faults, the pager saves that page first and only then lets the write
 through, so the checkpoint is exactly the memory at the pause.
 
+- **Packets are held during the pause.** Taking the tap down for the
+  snapshot deletes the VM's /32, so packets for it would otherwise follow
+  the host's default route for the 15–50 ms pause. As in a migration, just
+  before the pause the address is pointed at the daemon's hold device; before
+  the resume the held packets are injected into the VM's own tap and the
+  route goes back to it, so they arrive ahead of newer traffic. A checkpoint
+  reports them as `held_packets`. A 1 kHz UDP stream through 6 checkpoints
+  lost 59 datagrams (7–11 per pause) before, none now
+  (`scripts/faults.py ckpt_packet_hold`).
 - **No Firecracker change for write tracking.** The pager registers write-protect mode
   (`UFFDIO_REGISTER` with `MODE_MISSING|MODE_WP`) on Firecracker's existing
   userfaultfd and its ranges. Nothing has to be requested at `UFFDIO_API`
@@ -399,8 +408,18 @@ and a second copy could repeat what it did.
   included (default 512; a paused 24-vCPU VM costs ~26 MiB here). One
   background worker refills, one VM at a time; it gives back the newest
   paused VMs when the stock outgrows the budget, and loads nothing while the
-  host is below `--reserve` + one VM. The memory controller drops the pool
+  host is below `--reserve` + one VM. What a VM costs starts as an estimate
+  (working set + 8 MiB) and becomes the largest RSS measured; a load that
+  comes out over the budget is dropped, its size learned, and that template
+  backs off (5 s, doubling up to 5 min) instead of loading again at once. A
+  template that fits is loaded before one that does not. Paused VMs that died
+  are dropped on the worker's next round (at most a second), and one that
+  cannot be measured counts as its estimate. The memory controller drops the pool
   (and any load in progress) when the host goes below `--reserve`.
+- **Refills wait for runs.** A load (snapshot load, the guest's first run)
+  competes with a `run`'s resume and `START`, so none starts while a `run`
+  is in progress: the worker refills once it has answered (or after 2 s of
+  back-to-back runs).
 - **Generations.** `flexvm template` publishes each build as an immutable
   `templates/.gen/<content id>/` and points `templates/NAME` at it with one
   atomic symlink swap. It never deletes a generation: VMs, migrations, pooled
@@ -811,7 +830,7 @@ firecracker/        patches on top of Firecracker v1.17.0
 - **Networking is IPv4 only.** Peers form a full mesh (every daemon lists
   every other one). Address allocation is disjoint per-host ranges
   (configured by hand), not real cluster-wide address management.
-- **Packets held during a migration** are capped at 4 MiB per VM; a faster
+- **Packets held during a migration or checkpoint** are capped at 4 MiB per VM; a faster
   flood loses the excess (counted). A few packets can be reordered around
   the moment the source's route switches. IPv4 only; the guest's own packets
   in the instant before the pause are lost on hosts with strict

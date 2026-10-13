@@ -6,8 +6,8 @@ or cleanly failed.
 
 usage: scripts/faults.py [--a ADDR] [--b ADDR] [--bin FLEXVM] [--log-dir DIR] SCENARIO... | all
   'all' runs the scenarios that leave both daemons running; source_killed,
-  target_restart, target_restart_symlink, checkpoint_crash, cow_crash and
-  suspend_resume kill a daemon with SIGKILL and restart it with the same command line and
+  target_restart, target_restart_symlink, checkpoint_crash, cow_crash,
+  suspend_resume and hot_budget kill a daemon with SIGKILL and restart it with the same command line and
   environment (logging to --log-dir). Checkpoint scenarios write to --ckpt-dir.
 """
 import argparse, base64, json, os, socket, subprocess, sys, tempfile, threading, time
@@ -80,7 +80,8 @@ def fault(host, f, ms):
 
 FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_before_run", "restore_after_run",
           "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "resume_kill",
-          "prepare_fail", "short_incoming", "slow_preload", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait")
+          "prepare_fail", "short_incoming", "slow_preload", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
+          "hot_low_estimate")
 
 
 def disarm():
@@ -1761,6 +1762,88 @@ def slow_preload():
     cleanup(n)
 
 
+def ckpt_packet_hold():
+    """Packets for a VM that arrive while a keep-running checkpoint has it
+    paused are held and handed to it, not lost on its downed tap: a 1 kHz
+    UDP sequence stream across three checkpoints arrives whole, and a TCP
+    connection keeps echoing without a retransmit."""
+    n = "ft-ckpt-pkt"
+    ok(A, {"op": "run", "name": n, "template": args.template})
+    ip = vm_ip(A, n)
+    code, out = sh(A, n, "setsid socat -u UDP-RECV:9000 OPEN:/tmp/udp,creat,append >/dev/null 2>&1 < /dev/null &")
+    assert code == 0, out
+    tcp_server(A, n)
+    conn = socket.create_connection((ip, 7000), timeout=10)
+    conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    stop, sent, echoes = threading.Event(), [0], [True]
+
+    def stream():
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        while not stop.is_set():
+            s.sendto(b"%08d\n" % sent[0], (ip, 9000))
+            sent[0] += 1
+            time.sleep(0.001)
+
+    def pingpong():
+        while not stop.is_set() and echoes[0]:
+            echoes[0] = echo(conn, b"x" * 32)
+            time.sleep(0.002)
+
+    threads = [threading.Thread(target=stream, daemon=True), threading.Thread(target=pingpong, daemon=True)]
+    for t in threads:
+        t.start()
+    time.sleep(0.5)
+    paths, results = [], []
+    for i in range(3):
+        paths.append(ckpt_path(f"{n}-{i}"))
+        results.append(rpc(A, {"op": "checkpoint", "name": n, "dir": paths[-1], "stop": False}, timeout=120))
+        time.sleep(0.5)
+    stop.set()
+    for t in threads:
+        t.join(10)
+    info = conn.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 104)
+    retrans = int.from_bytes(info[100:104], "little")
+    conn.close()
+    time.sleep(0.3)
+    check("ckpt packet hold: checkpoints taken, vm running", all(r["ok"] for r in results) and where(n) == {A: "running"},
+          [r.get("error") for r in results])
+    held = [(r.get("result") or {}).get("held_packets") or {} for r in results]
+    check("ckpt packet hold: packets held during each pause and all injected",
+          all(h.get("packets", 0) > 0 and h.get("injected") == h.get("packets") and h.get("dropped") == 0
+              and h.get("dropped_target") == 0 for h in held), held)
+    code, out = sh(A, n, "sort -u /tmp/udp | wc -l")
+    got = int(out) if code == 0 and out.isdigit() else -1
+    check("ckpt packet hold: no udp datagram lost", got == sent[0], f"sent {sent[0]}, received {got}")
+    check("ckpt packet hold: tcp echoed throughout, no retransmit", echoes[0] and retrans == 0, f"retransmits {retrans}")
+    cleanup(n)
+    for p in paths:
+        rm_ckpt(p)
+
+
+def hot_budget():
+    """A hot pool budget smaller than one paused VM, whose first cost
+    estimate is too low (fault hot_low_estimate): the worker loads one, learns
+    what it costs and backs off, rather than load and drop VMs in a loop.
+    Restarts A with --hot-mib 16 (a paused `small` VM takes ~20 MiB), then
+    with its own command line again."""
+    argv, env = kill_daemon(A)
+    start_daemon(A, argv + ["--hot-mib", "16"], env)
+    fault(A, "hot_low_estimate", 60000)
+    n = "ft-hot-budget"
+    r = rpc(A, {"op": "run", "name": n, "template": "small"})
+    fault(A, "hot_low_estimate", 0)
+    check("hot budget: run without the pool", r["ok"] and not r["result"]["hot"], r)
+    rpc(A, {"op": "kill", "name": n})
+    time.sleep(15)
+    hot = ok(A, {"op": "info"})["hot"]
+    small = [k for k in hot["ready"] if k.startswith("small@")]
+    check("hot budget: at most two loads in 15 s, nothing stocked", 1 <= hot["loads"] <= 2 and small
+          and hot["ready"][small[0]] == 0, hot)
+    check("hot budget: learned that a paused vm exceeds the budget", small and hot["cost_mib"][small[0]] > 16, hot)
+    argv2, env2 = kill_daemon(A)
+    start_daemon(A, argv, env)
+
+
 SCENARIOS = dict(basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, refused=refused, pages_blip=pages_blip,
                  pages_dead_restore=pages_dead_restore, pages_dead=pages_dead, resume_kill=resume_kill, prepared_retry=prepared_retry, quiet_source=quiet_source,
                  shared_run_dir=shared_run_dir, exec_race=exec_race, guest_calls=guest_calls, source_killed=source_killed,
@@ -1774,10 +1857,10 @@ SCENARIOS = dict(basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, r
                  ckpt_failed_stop=ckpt_failed_stop, ckpt_rearm=ckpt_rearm,
                  ckpt_dir_moved=ckpt_dir_moved, prepare_disconnect=prepare_disconnect,
                  prepare_trickle=prepare_trickle, prepare_fail=prepare_fail, fc_prepare=fc_prepare,
-                 slow_preload=slow_preload)
+                 slow_preload=slow_preload, ckpt_packet_hold=ckpt_packet_hold, hot_budget=hot_budget)
 safe = [s for s in SCENARIOS
         if s not in ("source_killed", "target_restart", "target_restart_symlink", "checkpoint_crash", "cow_crash",
-                     "suspend_resume")]
+                     "suspend_resume", "hot_budget")]
 names = [n for s in args.scenarios for n in (safe if s == "all" else [s])]
 for s in names:
     try:
