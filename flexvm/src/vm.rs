@@ -147,6 +147,11 @@ pub struct Vm {
     reports_held: AtomicBool,
     /// Whether the daemon serves this VM's memory requests (see `Daemon::watch_memory`).
     pub mem_watched: AtomicBool,
+    /// True while a copy-on-write checkpoint copies this VM's memory with
+    /// the VM running: its reservation is held, but it may still grow (not
+    /// shrink). Resizes then hold this lock, and the checkpoint takes it to
+    /// end the copy, so none is in progress once the reservation goes.
+    pub cow_copy: Mutex<bool>,
     /// Migration target only: the source's answer to `release`, true or an error.
     pub released: OnceLock<Value>,
     /// Host ends of exec sessions, by id, so a checkpoint can close them.
@@ -313,6 +318,7 @@ impl Vm {
             starved: AtomicBool::new(false),
             reports_held: AtomicBool::new(false),
             mem_watched: AtomicBool::new(false),
+            cow_copy: Mutex::new(false),
             released: OnceLock::new(),
             execs: Mutex::new(HashMap::new()),
             devices: Mutex::new(()),

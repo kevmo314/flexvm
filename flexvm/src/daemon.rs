@@ -1982,6 +1982,29 @@ impl Daemon {
         Ok(())
     }
 
+    /// Resizes `vm` unless a lifecycle operation holds it, except that a VM
+    /// whose copy-on-write checkpoint is being copied may grow: the copy only
+    /// reads the pages it had at the pause, and memory plugged after it was
+    /// unplugged then (never populated), so the copy never reads it, and the
+    /// checkpoint keeps the plugged size it saved. Paused and suspended VMs
+    /// have no fresh statistics and are left alone.
+    fn resize_now(&self, vm: &Vm, hint: Option<u64>) -> Result<Resized> {
+        if let Ok(_busy) = self.reserve(&vm.name, "resizing", Duration::ZERO) {
+            return resize(vm, &self.admission, hint, false);
+        }
+        self.resize_during_copy(vm, hint)
+    }
+
+    /// Grows `vm` if a copy-on-write checkpoint is copying it (its
+    /// reservation is held then; see `resize_now`), else answers `Busy`.
+    fn resize_during_copy(&self, vm: &Vm, hint: Option<u64>) -> Result<Resized> {
+        let copying = vm.cow_copy.lock().unwrap();
+        if *copying {
+            return resize(vm, &self.admission, hint, true);
+        }
+        Ok(Resized::Busy)
+    }
+
     /// One pass of the elastic memory controller.
     fn control_tick(self: &Arc<Self>) {
         let vms: Vec<Arc<Vm>> = self.vms.lock().unwrap().values().cloned().collect();
@@ -1991,9 +2014,15 @@ impl Daemon {
         }
         for vm in &vms {
             self.watch_memory(vm);
-            // Never alongside a lifecycle operation on the VM; paused and
-            // suspended VMs have no fresh statistics and are left alone.
-            let Ok(_busy) = self.reserve(&vm.name, "resizing", Duration::ZERO) else { continue };
+            // Never alongside a lifecycle operation on the VM (other than
+            // growing during a checkpoint copy); paused and suspended VMs
+            // have no fresh statistics and are left alone.
+            let Ok(_busy) = self.reserve(&vm.name, "resizing", Duration::ZERO) else {
+                if let Err(e) = self.resize_during_copy(vm, None) {
+                    eprintln!("vm {}: resize: {e}", vm.name);
+                }
+                continue;
+            };
             // Free page reports a checkpoint copy held and could not release
             // (under the reservation, so never a newer copy's hold).
             if vm.release_pending() && matches!(vm.state(), State::Running | State::Paused) {
@@ -2003,7 +2032,7 @@ impl Daemon {
                 }
             }
             if vm.state() == State::Running {
-                if let Err(e) = resize(vm, &self.admission, None) {
+                if let Err(e) = resize(vm, &self.admission, None, false) {
                     eprintln!("vm {}: resize: {e}", vm.name);
                 }
             }
@@ -2121,7 +2150,7 @@ impl Admission {
 /// against the host's reserve. A VM that is short and cannot grow here (at
 /// its ceiling, or refused) is flagged as starved so the controller moves it
 /// somewhere roomier.
-fn resize(vm: &Vm, admission: &Admission, hint: Option<u64>) -> Result<Resized> {
+fn resize(vm: &Vm, admission: &Admission, hint: Option<u64>, grow_only: bool) -> Result<Resized> {
     let meta = &vm.template.meta;
     let hotplug_total = meta.max_mib - meta.mem_mib;
     if hotplug_total == 0 {
@@ -2158,7 +2187,7 @@ fn resize(vm: &Vm, admission: &Admission, hint: Option<u64>) -> Result<Resized> 
     let new = if short > 0 && !stale {
         let step = round(headroom * 2 - avail).min(round(total / 4).max(STEP_MIB));
         (requested + step).min(hotplug_total)
-    } else if avail > headroom * 3 && requested > floor && last.elapsed() > Duration::from_secs(10) {
+    } else if !grow_only && avail > headroom * 3 && requested > floor && last.elapsed() > Duration::from_secs(10) {
         requested.saturating_sub((avail - headroom * 2) / STEP_MIB * STEP_MIB).max(floor)
     } else {
         requested
@@ -2233,16 +2262,13 @@ fn serve_mem_requests(d: Arc<Daemon>, vm: Arc<Vm>) {
             let _ = (&conn).write_all(b"busy\n");
             continue;
         }
-        // Like a controller tick, never alongside a lifecycle operation.
-        let Ok(_busy) = d.reserve(&vm.name, "resizing", Duration::ZERO) else {
-            let _ = (&conn).write_all(b"busy\n");
-            continue;
-        };
         if !d.vm(&vm.name).is_ok_and(|v| Arc::ptr_eq(&v, &vm)) {
             break; // this copy is gone from here
         }
         acted = Some(Instant::now());
-        let reply = match resize(&vm, &d.admission, Some(avail)) {
+        // Like a controller tick: not alongside a lifecycle operation, other
+        // than growing during a checkpoint copy.
+        let reply = match d.resize_now(&vm, Some(avail)) {
             Ok(Resized::Grew) => "grow",
             Ok(Resized::Busy) => "busy",
             Ok(Resized::Full) => "full",

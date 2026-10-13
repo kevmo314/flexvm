@@ -85,7 +85,7 @@ def fault(host, f, ms):
 
 
 FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_before_run", "restore_after_run",
-          "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "resume_kill",
+          "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "ckpt_crawl", "resume_kill",
           "prepare_fail", "short_incoming", "slow_preload", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
           "hot_low_estimate", "started_fsync", "started_unmark")
 
@@ -1357,6 +1357,66 @@ def cow_exact():
     rm_ckpt(path)
 
 
+def cow_grow():
+    """A guest that needs more memory while a copy-on-write checkpoint of it
+    is being copied gets it (growing does not wait for the copy): it fills
+    2 GiB more than it had without an OOM, the checkpoint completes, and it
+    holds exactly the memory and size at the pause. COW_GROW_TEMPLATE picks
+    a template with little or nothing pre-plugged, so the guest must grow."""
+    n, path = "ft-cow-grow", ckpt_path("ft-cow-grow")
+    m = setup(n, mib=600, template=os.environ.get("COW_GROW_TEMPLATE"))
+    v = vms(A)[n]
+    plugged0, fill = v["plugged_mib"], v["guest_mib"] + 2048
+    fault(A, "ckpt_memhash", 300000)
+    fault(A, "ckpt_crawl", 300000)
+    res, seen = {}, {"max": plugged0, "copying": False}
+    t = threading.Thread(target=lambda: res.update(r=rpc(A, {"op": "checkpoint", "name": n, "dir": path}, timeout=600)))
+    t.start()
+    copying = wait_for(lambda: vms(A).get(n, {}).get("checkpoint_copy"), 30)
+    check("cow grow: copy runs in the background", copying, vms(A).get(n))
+    stop = threading.Event()
+
+    def watch():
+        while not stop.is_set():
+            try:
+                v = vms(A).get(n, {})
+                if v.get("checkpoint_copy"):
+                    seen["copying"] = True
+                    seen["max"] = max(seen["max"], v.get("plugged_mib") or 0)
+            except (OSError, AssertionError):
+                pass
+            time.sleep(0.2)
+
+    w = threading.Thread(target=watch)
+    w.start()
+    code, out = sh(A, n, f"python3 -c 'l=[bytearray(64<<20) for _ in range({fill}//64)]; print(len(l)*64)'")
+    still = vms(A).get(n, {}).get("checkpoint_copy")
+    stop.set()
+    w.join()
+    check("cow grow: the guest filled 2 GiB more than it had, no OOM", code == 0 and out == str(fill // 64 * 64), (code, out[-200:]))
+    check("cow grow: it grew while the copy ran", seen["max"] >= plugged0 + 1024, (plugged0, seen))
+    print(f"cow grow: plugged {plugged0} -> {seen['max']} MiB during the copy; copy still running after the fill: {still}")
+    t.join()
+    fault(A, "ckpt_crawl", 0)
+    fault(A, "ckpt_memhash", 0)
+    r = res.get("r", {})
+    check("cow grow: checkpoint written", r.get("ok"), r)
+    if r.get("ok"):
+        r = r["result"]
+        h = ok(A, {"op": "ckhash", "dir": path})
+        check("cow grow: checkpoint == memory at the pause", h["hash"] == r["pause_memhash"], (h["hash"], r["pause_memhash"]))
+        ok(B, {"op": "restore", "dir": path, "name": "ft-cow-grow2", "ip": "auto"})
+        check("cow grow: restored at the size it had at the pause", vms(B)["ft-cow-grow2"]["plugged_mib"] == plugged0,
+              (plugged0, vms(B)["ft-cow-grow2"]["plugged_mib"]))
+        check("cow grow: restored file intact", md5(B, "ft-cow-grow2") == m)
+        code, out = sh(B, "ft-cow-grow2", "python3 -c 'b=bytearray(512<<20); print(len(b)>>20)'")
+        check("cow grow: restored guest can use memory", code == 0 and out == "512", out)
+    check("cow grow: original still running, file intact", where(n) == {A: "running"} and md5(A, n) == m, where(n))
+    cleanup(n)
+    cleanup("ft-cow-grow2")
+    rm_ckpt(path)
+
+
 def cow_abort():
     """A copy that fails half way (and one that a kill cuts short) publishes
     nothing; the VM runs on unharmed, and the next checkpoint is complete."""
@@ -2031,7 +2091,7 @@ def plug_storm():
     cleanup(n)
 
 
-SCENARIOS = dict(plug_race=plug_race, plug_storm=plug_storm, basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, refused=refused, pages_blip=pages_blip,
+SCENARIOS = dict(plug_race=plug_race, plug_storm=plug_storm, cow_grow=cow_grow, basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, refused=refused, pages_blip=pages_blip,
                  pages_dead_restore=pages_dead_restore, pages_dead=pages_dead, resume_kill=resume_kill, prepared_retry=prepared_retry, quiet_source=quiet_source,
                  shared_run_dir=shared_run_dir, exec_race=exec_race, guest_calls=guest_calls, source_killed=source_killed,
                  target_restart=target_restart, target_restart_symlink=target_restart_symlink, guest_hang=guest_hang,
