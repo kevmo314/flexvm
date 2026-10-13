@@ -17,6 +17,7 @@ in tens of milliseconds.
 | Migration | **Post-copy**: pause, save vCPU and device state only (~20–200 KiB), resume on the target, then the target's pager fetches pages from the paused source on fault and in the background. The source releases the VM once every page has arrived, and never resumes it once the target may own it. |
 | Pressure | If a VM needs to grow and the host would drop below `--reserve`, or the host is already below it, the daemon migrates that VM to the peer with the most spare memory. |
 | Network | Each VM has its own IPv4 /32 routed to a per-VM tap. The address moves with the VM, so open TCP connections survive migration. See below. |
+| Container images | `flexvm template NAME --image REF` builds the root filesystem from an OCI/Docker image; flexvm-init runs and supervises its entrypoint. See below. |
 
 ### Pages
 
@@ -110,6 +111,7 @@ RAM and double memory use on a host that is already short.
 | of which Firecracker snapshot load | 22–50 ms (mostly KVM memslot setup, which is slow under nested virt) |
 | Migration downtime | **36–62 ms** (2 vCPU), **56–63 ms** (24 vCPU, 500 MB live data) |
 | TCP connection through two migrations | no errors, worst stall 217 ms (one client retransmit) |
+| nginx image, `run` → first HTTP response from the host | **205 ms** p50 (run 56 + nginx startup 144); `--warm`: **55 ms** p50 (run 31 + first request 22) |
 | Background memory pull | ~1.1 GB/s over loopback TCP |
 | Idle VM host RSS | 13–35 MiB |
 
@@ -118,7 +120,7 @@ RAM and double memory use on a host that is already short.
 ```sh
 ./scripts/fetch.sh               # firecracker, guest kernel 6.1, ubuntu 24.04 base
 ./scripts/build-firecracker.sh   # patched firecracker -> artifacts/firecracker (needs musl-tools, libseccomp-dev)
-./scripts/build-rootfs.sh        # artifacts/rootfs.ext4 with flexvm-init
+./scripts/build-rootfs.sh        # artifacts/rootfs.ext4, and artifacts/flexvm-init for image templates
 cargo build --release
 
 sudo ./target/release/flexvm template default             # all CPUs, ceiling = host RAM
@@ -144,12 +146,106 @@ LAN.
 The daemon must run as root: it uses `/dev/kvm`, privileged userfaultfd,
 `process_vm_readv` on Firecracker and cgroup v2.
 
+## Container images
+
+```sh
+sudo flexvm template web --image nginx:1.27                    # any registry: Docker Hub, ghcr.io, gcr.io, ...
+sudo flexvm template app --image ./app.tar --env PORT=8080     # `docker save` output or an OCI archive
+sudo flexvm template py  --image ./oci-layout --cmd "python3 -m http.server 8000"
+sudo flexvm template web-warm --image nginx:1.27 --warm        # snapshot nginx running and ready
+flexvm run web1 --template web
+curl http://<ip>/
+flexvm logs web1 -f
+```
+
+`REF` is a registry reference (`nginx`, `ghcr.io/org/app@sha256:…`), an
+uncompressed `docker save` / OCI archive, or an OCI image layout directory.
+Overrides follow `docker run`: `--entrypoint` and `--cmd` (words, or a JSON
+array; a new entrypoint drops the image's command), `--env K=V` (repeatable),
+`--workdir`, `--user name|uid[:group|gid]`.
+
+Images are untrusted input processed as root. Every document and blob is
+checked against its digest before use (layers once more right before they are
+unpacked, and their uncompressed contents against the config's `diff_ids`
+while unpacking), and builds are bounded: `--max-download-mib` (8192, all
+layers compressed), `--max-unpacked-mib` (16384), `--max-file-mib` (4096),
+`--max-entries` (1,000,000), plus 4 MiB per manifest or config and 1 MiB per
+tar entry's metadata (PAX records and GNU long names together, one of each).
+Readiness commands run as the app does (same user and restrictions) in a
+cgroup of their own that is killed and checked empty when the check ends; a
+failed cleanup fails the check. Non-root checks need cgroup2 with
+`cgroup.kill` and fail closed without it. Root checks are trusted (root in
+the guest can leave any cgroup); without cgroup2 their session is killed.
+
+- **Pull.** Native registry v2 client (no docker or skopeo): anonymous bearer
+  tokens, or basic credentials from `$DOCKER_CONFIG`, `~/.docker/config.json`
+  or, under sudo, the invoking user's. Indexes resolve to linux/amd64. Blobs
+  are streamed to `ARTIFACTS/images/blobs/sha256/` and checked against their
+  digests; gzip, zstd and uncompressed layers are supported. Archives are read
+  in place (layers are located inside the tarball, not extracted). Registry
+  credentials go only over HTTPS to the registry itself or its token service
+  (auth.docker.io for Docker Hub); redirects to blob storage carry none.
+- **Root filesystem.** Layers are applied in order as root, with whiteouts and
+  opaque directories, ownership, modes, xattrs, device nodes, symlinks and
+  hard links. Every path resolves inside the image (`openat2(RESOLVE_IN_ROOT)`),
+  so absolute symlinks behave as in a container and a layer cannot write
+  outside it; whiteouts must name one entry, and removal walks directory fds.
+  Layers are unpacked in `--image-staging` (default `/var/lib/flexvm/staging`),
+  which must be root-owned and 0700 with an ancestry only root can change, and
+  is used through a descriptor, so other users can neither reach the image's
+  setuid files and device nodes nor swap the directory mid-build. The image
+  cache is trusted by whoever can write it (it is reused as is); writes into it
+  never follow symlinks. flexvm adds `/sbin/flexvm-init`, its mount points,
+  `/etc/flexvm/app.conf` (argv, env, workdir, uid/gid/groups resolved against
+  the image's own `/etc/passwd` and `/etc/group`), an `/etc/hosts`, and an
+  empty `/etc/resolv.conf` if the image has none (the daemon's `--dns` fills
+  it at `run`). `mkfs.ext4 -d` writes the read-only image. Built filesystems
+  are cached in `ARTIFACTS/images/rootfs/` by image config digest, flexvm-init
+  and overrides, and templates attach the cached file in place, so templates of
+  one image share one copy in the page cache (it is never rewritten; deleting it
+  breaks those templates). Cache entries are published with fsync and rename
+  and only count once their `.ok` marker exists. The template's content ID covers that file as its
+  `rootfs` component plus the image's manifest and config digests and the
+  app config, so it differs whenever the image does.
+- **Process.** flexvm-init stays PID 1. It starts the entrypoint in its own
+  session with the image's env, workdir and credentials, reaps it and records
+  its exit status, and keeps its stdout and stderr (interleaved) in a 1 MiB
+  ring: `flexvm logs NAME` prints it and the status, `-f` follows until the
+  app exits. There is no restart policy. Nothing beyond the entrypoint is
+  assumed: distroless and scratch images work, and `flexvm exec` on an image
+  without `/bin/sh` exits 127 with a message saying so. `/dev/stdout` and
+  friends exist, so images that log to them work. With a non-root `--user`
+  (or image `User`), the app runs with `no_new_privs` and no capabilities in
+  its bounding set, so setuid binaries and file capabilities in the image do
+  not work for it (and cannot make it root again); flexvm-init is not
+  dumpable, so the app cannot ptrace or read it.
+- **When the app starts.** By default at `run`: the snapshot is an idle booted
+  guest and `run` sends `APP` after the address is set (`app_start`, ~17 ms
+  for nginx), then the app starts as it would anywhere. With `--warm` the
+  template starts the app, waits until it is ready (`--ready-port N`: something
+  accepts on 127.0.0.1:N in the guest, default the first exposed TCP port;
+  `--ready-cmd CMD`: a shell command exits 0, killed when the deadline passes; `--ready-timeout S`, default 120)
+  and snapshots it running.
+
+> **`--warm` clones share userland state.** Every VM restored from a warm
+> template starts from the same memory: anything the app generated before the
+> snapshot (RNG seeds, session and TLS keys, UUIDs, tokens, caches) is
+> identical in every clone. Firecracker's VMGenID makes the guest kernel
+> reseed its RNG on restore, but nothing tells the app. Only use `--warm` for
+> apps that hold no secrets or per-instance identity at startup, or that
+> regenerate them per connection from the kernel RNG.
+
 ## Benchmarks
 
 ```sh
 flexvm --host 192.168.1.10:7070 bench                                        # run
 flexvm --host 192.168.1.10:7070 bench --to 192.168.1.11:7070 --dirty-mib 500 # run + migrate
+flexvm --host 192.168.1.10:7070 bench --template web --ready-http 80           # run until the app answers
 ```
+
+`--ready-port N` / `--ready-http N` add a `client` group: `run_rpc` as the
+client sees it, then `app_ready` until the VM accepts a TCP connection on N
+(or answers `GET /`), and their `total`.
 
 Each trial runs a fresh VM, optionally writes N MiB into its /tmp and migrates
 it (waiting for the full pull), then kills it. Phases are back-to-back daemon
@@ -167,7 +263,10 @@ flexvm/src/
   net.rs       taps, rtnetlink routes and neighbours, gratuitous ARP, address ranges
   fc.rs        Firecracker process, API client, warm pool
   guest.rs     vsock client for flexvm-init
+  image/       container images: references, registry client, archives and
+               layouts, layer unpacking, root filesystem build
 guest/src/main.rs   flexvm-init: PID 1, overlay root, vsock exec agent
+guest/src/app.rs    image entrypoint: start, supervision, log ring, readiness probe
 guest/src/net.rs    guest network setup with ioctls and rtnetlink (no iproute2 needed)
 firecracker/        patches on top of Firecracker v1.17.0
 ```
@@ -205,6 +304,10 @@ firecracker/        patches on top of Firecracker v1.17.0
   that detects accidental differences on trusted hosts, not tampering.
 - The control channel is plain TCP with no authentication; it must not be
   exposed outside a trusted network.
+- **Container images**: linux/amd64 only; no Docker credential helpers; no
+  restart policy, health checks, volumes or stop signal; stdout and stderr
+  share one ring; `logs -f` stops when the VM migrates away (vsock resets).
+  Building needs root (to keep ownership) and an uncompressed archive.
 - The controller samples guest memory once a second (balloon stats). A very
   fast allocation burst can still hit the in-guest OOM killer; guest PSI
   triggers over vsock would react faster.

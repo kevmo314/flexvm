@@ -274,6 +274,16 @@ impl Vm {
         crate::guest::net(&self.vsock(), ip, dns)
     }
 
+    /// Starts an image template's app, unless the VM is no longer running
+    /// here. Bounded by `guest::TIMEOUT`, as it holds the admission lock.
+    pub fn start_app(&self) -> Result<u32> {
+        let _admission = self.execs.lock().unwrap();
+        if self.state() != State::Running {
+            bail!("vm {} is not running here", self.name);
+        }
+        crate::guest::start_app(&self.vsock())
+    }
+
     pub fn untrack_exec(&self, id: u64) {
         self.execs.lock().unwrap().remove(&id);
     }

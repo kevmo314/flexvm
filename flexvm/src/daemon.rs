@@ -279,6 +279,7 @@ impl Daemon {
                 return Ok(serve_pages(&vm.pager, &mut stream, || self.fault("pages"))?);
             }
             "exec" => return self.exec(&name, &req, w),
+            "logs" => return self.logs(&name, &req, w),
             "preflight" => self.migration_template(&req, true).map(|tpl| json!({"id": tpl.meta.id})),
             "incoming" => match self.incoming(&req, &mut r) {
                 // Committed, but the source never hears about it.
@@ -334,6 +335,11 @@ impl Daemon {
         // The guest reseeds its RNG itself: Firecracker bumps the VMGenID on restore.
         vm.guest_net(ip, self.cfg.dns.as_deref())?;
         t.mark("guest_net");
+        // Image templates start their app now, unless the snapshot holds it running.
+        if tpl.meta.image.as_ref().is_some_and(|i| !i.warm) {
+            vm.start_app().map_err(|e| format!("{e} (see `flexvm logs {name}`)"))?;
+            t.mark("app_start");
+        }
         self.announce(ip);
         t.mark("announce");
         Ok(json!({
@@ -497,6 +503,26 @@ impl Daemon {
                     std::io::copy(&mut g, &mut w)?;
                     Ok(())
                 })();
+                vm.untrack_exec(id);
+                copied?;
+            }
+            Err(e) => send_json(&mut w, &json!({"ok": false, "error": e.to_string()}))?,
+        }
+        Ok(())
+    }
+
+    /// Streams an image app's output: `offset`, and `follow` to keep going.
+    fn logs(&self, name: &str, req: &Value, mut w: TcpStream) -> Result<()> {
+        let guest = self.vm(name).and_then(|vm| {
+            // Registered like an exec session, so a checkpoint closes it.
+            let (offset, follow) = (req["offset"].as_u64().unwrap_or(0), req["follow"] == json!(true));
+            let (g, id) = vm.exec(|uds| guest::start_logs(uds, offset, follow, guest::TIMEOUT))?;
+            Ok((vm, g, id))
+        });
+        match guest {
+            Ok((vm, mut g, id)) => {
+                send_json(&mut w, &json!({"ok": true}))?;
+                let copied = std::io::copy(&mut g, &mut w);
                 vm.untrack_exec(id);
                 copied?;
             }

@@ -10,6 +10,8 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
 
 RUSTFLAGS="-C target-feature=+crt-static" cargo build --release -p flexvm-init --target x86_64-unknown-linux-gnu
+# Also injected into templates built from container images (flexvm template --image).
+install -m 755 target/x86_64-unknown-linux-gnu/release/flexvm-init artifacts/flexvm-init
 
 work=$root/build/rootfs
 sudo rm -rf "$work"
