@@ -242,3 +242,23 @@ pub fn proc_kb(path: &str, key: &str) -> Option<u64> {
 pub fn host_cpus() -> usize {
     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
 }
+
+/// Creates `dir` and any missing parents, and fsyncs every parent along the
+/// way (each time, as a crash may have lost an entry made before, or another
+/// process made it without syncing), so the hierarchy survives a power loss.
+/// Errors name the directory.
+pub fn create_dir_durably(dir: &std::path::Path) -> io::Result<()> {
+    let named = |p: &std::path::Path, what: &str, e: io::Error| io::Error::new(e.kind(), format!("{what} {}: {e}", p.display()));
+    let dir = std::path::absolute(dir).map_err(|e| named(dir, "resolving", e))?;
+    let mut path = std::path::PathBuf::from("/");
+    for part in dir.components().skip(1) {
+        let parent = path.clone();
+        path.push(part);
+        match std::fs::create_dir(&path) {
+            Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(named(&path, "creating", e)),
+            _ => {}
+        }
+        std::fs::File::open(&parent).and_then(|f| f.sync_all()).map_err(|e| named(&parent, "fsync of directory", e))?;
+    }
+    Ok(())
+}

@@ -872,24 +872,6 @@ fn unmark_durably(dir: &Path, name: &str) -> std::io::Result<()> {
     std::fs::File::open(dir)?.sync_all()
 }
 
-/// Creates `dir` and any missing parents, and fsyncs every parent along the
-/// way (each time, as a crash may have lost an entry made before), so the
-/// hierarchy survives a power loss.
-pub(super) fn create_dir_durably(dir: &Path) -> std::io::Result<()> {
-    let dir = std::path::absolute(dir)?;
-    let mut path = PathBuf::from("/");
-    for part in dir.components().skip(1) {
-        let parent = path.clone();
-        path.push(part);
-        match std::fs::create_dir(&path) {
-            Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e),
-            _ => {}
-        }
-        std::fs::File::open(&parent)?.sync_all()?;
-    }
-    Ok(())
-}
-
 /// Deletes a checkpoint directory so that a crash part way through cannot
 /// leave a complete checkpoint without its marker (`remove_dir_all` may
 /// unlink STARTED or DISCARDED first): the manifest goes first, durably,

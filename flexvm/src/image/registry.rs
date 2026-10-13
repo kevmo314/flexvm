@@ -223,18 +223,6 @@ pub fn sync_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Creates `dir` (and missing parents) and makes the entries for it and its
-/// `levels - 1` nearest ancestors durable, by fsyncing each one's parent.
-/// Every time, not only when it creates them: another process may have
-/// created them without that having reached the disk yet.
-pub fn create_dir_durably(dir: &Path, levels: usize) -> Result<()> {
-    std::fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
-    for parent in dir.ancestors().skip(1).take(levels) {
-        sync_dir(if parent.as_os_str().is_empty() { Path::new(".") } else { parent })?;
-    }
-    Ok(())
-}
-
 pub fn sha256_hex(data: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(data))
 }

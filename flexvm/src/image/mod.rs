@@ -270,9 +270,9 @@ fn cached_rootfs(cached: &Path, build: impl FnOnce(&Path) -> Result<String>) -> 
 fn cached_rootfs_with_sync(cached: &Path, build: impl FnOnce(&Path) -> Result<String>, sync: impl Fn(&Path) -> Result<()>) -> Result<PathBuf> {
     use std::os::unix::fs::OpenOptionsExt;
     let dir = cached.parent().unwrap();
-    // images/rootfs and images/ themselves, durably: entries handed out
-    // must survive a crash right after the very first build.
-    registry::create_dir_durably(dir, 2)?;
+    // The whole hierarchy, durably, on every build: entries handed out must
+    // survive a crash right after the very first build (of any cache path).
+    crate::util::create_dir_durably(dir)?;
     // Never unlink the lock: waiters must all lock the same inode.
     let lock = File::options().write(true).create(true).truncate(false).custom_flags(libc::O_NOFOLLOW).open(cached.with_extension("lock"))?;
     if let Err(e) = flock(&lock, libc::LOCK_EX | libc::LOCK_NB) {
@@ -649,13 +649,13 @@ mod tests {
     fn cache_directories_are_created_durably_and_errors_name_them() {
         let d = tmpdir("durable");
         let rootfs = d.join("images").join("rootfs");
-        registry::create_dir_durably(&rootfs, 2).unwrap();
+        crate::util::create_dir_durably(&rootfs).unwrap();
         assert!(rootfs.is_dir());
         let missing = d.join("missing");
         let e = sync_dir(&missing).unwrap_err().to_string();
         assert!(e.contains(&missing.display().to_string()), "{e}");
         std::fs::write(d.join("file"), b"").unwrap();
-        let e = registry::create_dir_durably(&d.join("file").join("x"), 2).unwrap_err().to_string();
+        let e = crate::util::create_dir_durably(&d.join("file").join("x")).unwrap_err().to_string();
         assert!(e.contains("file/x"), "{e}");
         let _ = std::fs::remove_dir_all(&d);
     }
