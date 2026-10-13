@@ -67,6 +67,10 @@ const DRAIN_WAIT: Duration = Duration::from_secs(60);
 const CLOCK_TOLERANCE: Duration = Duration::from_millis(20);
 /// How long checking and stepping the guest clock may take.
 const CLOCK_DEADLINE: Duration = Duration::from_secs(5);
+/// How long an incoming migration may take to send its vmstate.
+const INCOMING_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a migration source waits for the target's preflight answer.
+const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a checkpoint waits for virtio-mem to carry out the last resize.
 const SETTLE_WAIT: Duration = Duration::from_secs(10);
 
@@ -438,7 +442,12 @@ impl Daemon {
             "exec" => return self.exec(&name, &req, w),
             "logs" => return self.logs(&name, &req, w),
             "preflight" => self.migration_template(&req, true).map(|tpl| json!({"id": tpl.meta.id})),
-            "incoming" => match self.incoming(&req, &mut r) {
+            "incoming" => match {
+                // The vmstate follows; a source that stalls must not hold a
+                // counted operation (and so shutdown) forever.
+                r.get_ref().set_read_timeout(Some(INCOMING_READ_TIMEOUT))?;
+                self.incoming(&req, &mut r)
+            } {
                 // Committed, but the source never hears about it.
                 Ok(_) if self.fault("lost_ack") => return Ok(()),
                 res => res,
@@ -858,7 +867,7 @@ impl Daemon {
         let _busy = self.reserve(name, "migrating", LIFECYCLE_WAIT)?;
         let vm = self.vm(name)?;
         // Before pausing, so a template mismatch costs no downtime.
-        crate::template::preflight(&self.cfg.paths, &vm.template, to)?;
+        crate::template::preflight(&self.cfg.paths, &vm.template, to, PREFLIGHT_TIMEOUT)?;
         // Before the pause (not part of the downtime): no virtio-mem resize may
         // still be under way.
         let settle = Instant::now();

@@ -222,9 +222,11 @@ impl Meta {
     }
 }
 
-pub fn preflight(paths: &Paths, tpl: &Template, to: &str) -> Result<()> {
+/// Checks the template here, then asks `to` whether it has the same one;
+/// connecting, writing and reading each by `timeout`.
+pub fn preflight(paths: &Paths, tpl: &Template, to: &str, timeout: Duration) -> Result<()> {
     tpl.verify(paths, true)?;
-    crate::call(to, json!({"op": "preflight", "template": tpl.name, "id": tpl.meta.id}))?;
+    crate::call_with_timeout(to, json!({"op": "preflight", "template": tpl.name, "id": tpl.meta.id}), timeout)?;
     Ok(())
 }
 

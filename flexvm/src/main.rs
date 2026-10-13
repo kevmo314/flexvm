@@ -322,7 +322,7 @@ fn call(host: &str, req: Value) -> Result<Value> {
     rpc_reply(c, req)
 }
 
-fn call_with_timeout(host: &str, req: Value, timeout: Duration) -> Result<Value> {
+pub(crate) fn call_with_timeout(host: &str, req: Value, timeout: Duration) -> Result<Value> {
     let mut error = None;
     for addr in host.to_socket_addrs()? {
         match TcpStream::connect_timeout(&addr, timeout) {
