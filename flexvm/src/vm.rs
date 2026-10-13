@@ -15,6 +15,10 @@ use crate::template::{Template, BALLOON_STATS_S};
 
 /// How long resuming a paused migration target waits for its memory to arrive.
 const PULL_WAIT: Duration = Duration::from_secs(30);
+
+/// Test fault `restore_no_hold`: leave VMs loaded paused out of Firecracker's
+/// pause loop (devices keep running), to show what the hold prevents.
+pub static SKIP_HOLD: AtomicBool = AtomicBool::new(false);
 use crate::uffd::{Origin, Pager, Runs, Source};
 use crate::util::{Phases, Result, PAGE_SIZE};
 
@@ -66,10 +70,12 @@ pub struct Vm {
     pub starved: AtomicBool,
     /// Migration target only: the source's answer to `release`, true or an error.
     pub released: OnceLock<Value>,
-    /// Host ends of exec sessions, by id. Also the admission lock for host
-    /// vsock sessions: held from checking the VM runs here until a session is
-    /// registered, and by `start_source` while it marks the VM migrating.
+    /// Host ends of exec sessions, by id, so a checkpoint can close them.
+    /// Held only for map operations, never across I/O.
     execs: Mutex<HashMap<u64, UnixStream>>,
+    /// Serializes putting back device settings on a migration target
+    /// (`restore_devices`) with leaving for a migration or checkpoint.
+    devices: Mutex<()>,
     next_exec: AtomicU64,
     fc: Mutex<Option<Firecracker>>,
     cgroup: Option<PathBuf>,
@@ -147,6 +153,13 @@ impl Vm {
             )?;
             // Includes Firecracker's resume: the load request sets resume_vm.
             let took = phases.mark("snapshot_load");
+            if !resume && !SKIP_HOLD.load(Ordering::SeqCst) {
+                // Loaded paused, Firecracker stops only the vCPUs and goes on
+                // emulating devices; an API pause enters the loop that holds
+                // device emulation too, until the resume.
+                fc.pause()?;
+                phases.mark("hold_paused");
+            }
             pager.wait_ready(Duration::from_secs(5))?;
             route.join().map_err(|_| "route thread panicked")??;
             phases.mark("route_wait");
@@ -176,6 +189,7 @@ impl Vm {
             starved: AtomicBool::new(false),
             released: OnceLock::new(),
             execs: Mutex::new(HashMap::new()),
+            devices: Mutex::new(()),
             next_exec: AtomicU64::new(0),
             fc: Mutex::new(Some(fc)),
             cgroup,
@@ -238,11 +252,15 @@ impl Vm {
         for (_, s) in self.execs.lock().unwrap().drain() {
             let _ = s.shutdown(Shutdown::Both);
         }
-        let paused = self.was_paused.load(Ordering::SeqCst);
         self.fc(|fc| {
-            if !paused {
-                fc.pause()?;
-            }
+            // Always, even if already paused: Firecracker freezes device
+            // emulation only while it sits in the loop an API pause enters
+            // (a VM loaded paused is not in it). Then the balloon timer is
+            // parked: changing it writes the stats queue, which has to happen
+            // before the snapshot. Nothing else may write guest memory until
+            // the pages are captured or served: we send no guest-facing
+            // request (balloon, hotplug) to a paused source.
+            fc.pause()?;
             fc.patch("/balloon/statistics", json!({"stats_polling_interval_s": u16::MAX}))?;
             self.snapshot_discards.store(self.pager.discards(), Ordering::SeqCst);
             fc.put("/snapshot/create", json!({"snapshot_type": "Full", "snapshot_path": vmstate, "mem_file_path": "", "sync_snapshot_files": sync}))
@@ -261,8 +279,11 @@ impl Vm {
         self.leave(State::Checkpointing)
     }
 
+    /// Leaves Running or Paused for a migration or checkpoint. Exec sessions
+    /// need no lock against this: one registered before is closed by
+    /// `save_state`, one registered after sees the state and closes itself.
     fn leave(&self, to: State) -> Result<()> {
-        let _admission = self.execs.lock().unwrap();
+        let _devices = self.devices.lock().unwrap();
         let mut st = self.state.lock().unwrap();
         if !matches!(*st, State::Running | State::Paused) || self.pager.failed().is_some() {
             bail!("vm {} is not running here", self.name);
@@ -293,34 +314,30 @@ impl Vm {
     }
 
     /// Ends a checkpoint to disk that keeps the VM here: back to running or
-    /// paused, or failed if it cannot be resumed.
+    /// paused, or failed if it cannot be resumed. (Transitions are serialized
+    /// by the daemon's reservation; the state lock is never held across a
+    /// Firecracker request, so readers never wait on one.)
     pub fn end_checkpoint(&self) -> Result<State> {
-        let mut st = self.state.lock().unwrap();
-        if *st != State::Checkpointing {
+        if *self.state.lock().unwrap() != State::Checkpointing {
             bail!("vm {} is not being checkpointed", self.name);
         }
-        match self.resume() {
-            Ok(s) => {
-                *st = s;
-                Ok(s)
-            }
-            Err(e) => {
-                *st = State::Failed;
-                bail!("resuming vm {} after its checkpoint failed: {e}", self.name)
-            }
-        }
+        let (s, res) = match self.resume() {
+            Ok(s) => (s, Ok(s)),
+            Err(e) => (State::Failed, Err(format!("resuming vm {} after its checkpoint failed: {e}", self.name).into())),
+        };
+        *self.state.lock().unwrap() = s;
+        res
     }
 
     /// Stops the vCPUs; memory and devices stay as they are.
     pub fn pause(&self) -> Result<()> {
-        let mut st = self.state.lock().unwrap();
-        match self.state_locked(&st) {
+        match self.state() {
             State::Paused => return Ok(()),
             State::Running => {}
             s => bail!("vm {} is {}, not running", self.name, s.name()),
         }
         self.fc(|fc| fc.pause())?;
-        *st = State::Paused;
+        *self.state.lock().unwrap() = State::Paused;
         Ok(())
     }
 
@@ -331,14 +348,13 @@ impl Vm {
         if self.pager.pulling_from_peer() && !self.pager.wait_pulled_for(PULL_WAIT) {
             bail!("vm {} is still pulling its memory from its previous host; resume it once that is done", self.name);
         }
-        let mut st = self.state.lock().unwrap();
-        match self.state_locked(&st) {
+        match self.state() {
             State::Running => return Ok(()),
             State::Paused => {}
             s => bail!("vm {} is {}, not paused", self.name, s.name()),
         }
         self.fc(|fc| fc.resume())?;
-        *st = State::Running;
+        *self.state.lock().unwrap() = State::Running;
         Ok(())
     }
 
@@ -347,6 +363,12 @@ impl Vm {
             return State::Failed;
         }
         *st
+    }
+
+    /// `state`, waiting no later than `deadline` for the lock.
+    fn state_by(&self, deadline: Instant) -> Result<State> {
+        let st = *lock_by(&self.state, deadline)?;
+        Ok(self.state_locked(&st))
     }
 
     /// Marks the VM failed: it stays as it is until killed.
@@ -398,36 +420,54 @@ impl Vm {
     /// On a migration target: puts back the balloon statistics timer that the
     /// source's `checkpoint` parked, unless the VM is already migrating on
     /// (its next host does it then). Runs off the critical path; holding the
-    /// admission lock keeps a new migration from parking the timer meanwhile.
+    /// devices lock keeps a new migration from parking the timer meanwhile.
     pub fn restore_devices(&self) {
-        let _admission = self.execs.lock().unwrap();
+        let _devices = self.devices.lock().unwrap();
         if matches!(self.state(), State::Running | State::Paused) {
             self.unpark_balloon();
         }
     }
 
+    /// Registers a new exec session, then checks the VM still runs here: if
+    /// it no longer does (a migration or checkpoint started meanwhile), the
+    /// session is closed again. Never waits past `deadline`.
+    fn track(&self, s: &UnixStream, deadline: Instant) -> Result<u64> {
+        let id = self.next_exec.fetch_add(1, Ordering::SeqCst);
+        lock_by(&self.execs, deadline)?.insert(id, s.try_clone()?);
+        if self.state_by(deadline).ok() != Some(State::Running) {
+            self.untrack_by(id, deadline);
+            let _ = s.shutdown(Shutdown::Both);
+            bail!("vm {} is not running here", self.name);
+        }
+        Ok(id)
+    }
+
+    /// Forgets session `id`, whose stream the caller has shut down. If the
+    /// map cannot be had by `deadline`, the dead entry stays until the next
+    /// checkpoint drains the map or the VM goes.
+    fn untrack_by(&self, id: u64, deadline: Instant) {
+        if let Ok(mut execs) = lock_by(&self.execs, deadline) {
+            execs.remove(&id);
+        }
+    }
+
     /// Runs `cmd` in the guest and returns its exit code and (at most 64 KiB
     /// of) output. Everything (admission, connecting, the handshake, writing
-    /// the command and every read) ends by `deadline`; the session is closed
-    /// if it does not.
+    /// the command, every read and the bookkeeping) ends by `deadline`; the
+    /// session is closed if it does not.
     pub fn sh(&self, cmd: &str, deadline: Instant) -> Result<(i32, String)> {
         const MAX_OUTPUT: usize = 64 << 10;
-        let expired = || Instant::now() >= deadline;
-        let (mut g, raw, id) = {
-            let mut execs = loop {
-                match self.execs.try_lock() {
-                    Ok(g) => break g,
-                    Err(std::sync::TryLockError::WouldBlock) if !expired() => std::thread::sleep(Duration::from_millis(1)),
-                    Err(_) => bail!("guest command {cmd:?} timed out waiting to start"),
-                }
-            };
-            if self.state() != State::Running {
-                bail!("vm {} is not running here", self.name);
-            }
-            let left = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
-            let s = crate::util::connect_unix(&self.vsock(), left)?;
-            let raw = s.try_clone()?;
-            let mut g = BufReader::new(Deadline { s, at: deadline });
+        if Instant::now() >= deadline {
+            bail!("guest command {cmd:?}: deadline already passed");
+        }
+        if self.state_by(deadline)? != State::Running {
+            bail!("vm {} is not running here", self.name);
+        }
+        let left = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
+        let s = crate::util::connect_unix(&self.vsock(), left)?;
+        let raw = s.try_clone()?;
+        let mut g = BufReader::new(Deadline { s, at: deadline });
+        let started = (|| -> Result<u64> {
             let req = format!("CONNECT {}\nEXEC {}\n{cmd}", crate::guest::PORT, cmd.len());
             g.get_mut().write_all(req.as_bytes())?;
             let mut ok = String::new();
@@ -435,9 +475,14 @@ impl Vm {
             if !ok.starts_with("OK") {
                 bail!("vsock connect refused: {ok:?}");
             }
-            let id = self.next_exec.fetch_add(1, Ordering::SeqCst);
-            execs.insert(id, raw.try_clone()?);
-            (g, raw, id)
+            self.track(&raw, deadline)
+        })();
+        let id = match started {
+            Ok(id) => id,
+            Err(e) => {
+                let _ = raw.shutdown(Shutdown::Both);
+                return Err(e);
+            }
         };
         let mut out = Vec::new();
         let res: Result<i32> = loop {
@@ -451,10 +496,8 @@ impl Vm {
                 Err(e) => break Err(format!("guest command {cmd:?}: {e}").into()),
             }
         };
-        if res.is_err() {
-            let _ = raw.shutdown(Shutdown::Both);
-        }
-        self.untrack_exec(id);
+        let _ = raw.shutdown(Shutdown::Both);
+        self.untrack_by(id, deadline);
         Ok((res?, String::from_utf8_lossy(&out).into_owned()))
     }
 
@@ -506,30 +549,24 @@ impl Vm {
             eprintln!("vm {}: balloon statistics stay off: {e}", self.name);
         }
     }
-
-    /// Opens an exec session with `start` and registers the session so a checkpoint
-    /// can close it. Fails unless the VM is running here. Everything done
-    /// under the admission lock has a deadline (`guest::TIMEOUT`), so a stuck
-    /// guest cannot hold off migrations; the session is untimed afterwards.
+    /// Opens an exec session with `start` and registers the session so a
+    /// checkpoint can close it. Fails unless the VM is running here. No lock
+    /// is held while `start` talks to the guest (it has its own deadline,
+    /// `guest::TIMEOUT`); the session is untimed afterwards.
     pub fn exec(&self, start: impl FnOnce(&Path) -> Result<BufReader<UnixStream>>) -> Result<(BufReader<UnixStream>, u64)> {
-        let (g, id) = {
-            let mut execs = self.execs.lock().unwrap();
-            if self.state() != State::Running {
-                bail!("vm {} is not running here", self.name);
-            }
-            let g = start(&self.vsock())?;
-            let id = self.next_exec.fetch_add(1, Ordering::SeqCst);
-            execs.insert(id, g.get_ref().try_clone()?);
-            (g, id)
-        };
+        if self.state() != State::Running {
+            bail!("vm {} is not running here", self.name);
+        }
+        let g = start(&self.vsock())?;
+        let id = self.track(g.get_ref(), Instant::now() + crate::guest::TIMEOUT)?;
         crate::guest::untimed(&g)?;
         Ok((g, id))
     }
 
     /// Sets the guest's address, unless the VM is no longer running here.
-    /// Bounded by `guest::TIMEOUT`, as it holds the admission lock.
+    /// Bounded by `guest::TIMEOUT`. Callers hold the VM's reservation, so no
+    /// migration or checkpoint starts meanwhile.
     pub fn guest_net(&self, ip: Ipv4Addr, dns: Option<&str>) -> Result<()> {
-        let _admission = self.execs.lock().unwrap();
         if self.state() != State::Running {
             bail!("vm {} is not running here", self.name);
         }
@@ -537,9 +574,8 @@ impl Vm {
     }
 
     /// Starts an image template's app, unless the VM is no longer running
-    /// here. Bounded by `guest::TIMEOUT`, as it holds the admission lock.
+    /// here. Bounded by `guest::TIMEOUT`; callers hold the VM's reservation.
     pub fn start_app(&self) -> Result<u32> {
-        let _admission = self.execs.lock().unwrap();
         if self.state() != State::Running {
             bail!("vm {} is not running here", self.name);
         }
@@ -612,5 +648,19 @@ impl Write for Deadline {
     }
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+/// Locks `m`, waiting no later than `deadline`.
+fn lock_by<T>(m: &Mutex<T>, deadline: Instant) -> Result<std::sync::MutexGuard<'_, T>> {
+    loop {
+        match m.try_lock() {
+            Ok(g) => return Ok(g),
+            Err(std::sync::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_micros(200))
+            }
+            Err(std::sync::TryLockError::WouldBlock) => bail!("timed out waiting for a lock"),
+            Err(std::sync::TryLockError::Poisoned(e)) => return Ok(e.into_inner()),
+        }
     }
 }

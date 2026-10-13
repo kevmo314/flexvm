@@ -70,6 +70,31 @@ impl Daemon {
         json!(out)
     }
 
+    /// Test hook (FLEXVM_FAULTS=1): a hash of every page of `name`'s memory
+    /// that is in place, read out of Firecracker, with their count.
+    pub(super) fn memhash(&self, name: &str) -> Result<Value> {
+        if self.faults.is_none() {
+            bail!("memhash is a test hook (start the daemon with FLEXVM_FAULTS=1)");
+        }
+        let vm = self.vm(name)?;
+        let mut hash = crate::template::Hash::new();
+        let (mut pages, mut buf) = (0u64, vec![0u8; 256 * PAGE_SIZE]);
+        for (first, count) in vm.pager.present_runs() {
+            let (mut p, end) = (first, first + count);
+            while p < end {
+                let region_end = vm.pager.region_end(p as usize).ok_or("page outside guest memory")? as u64;
+                let n = (end - p).min(256).min(region_end - p);
+                let b = &mut buf[..n as usize * PAGE_SIZE];
+                vm.pager.read_guest(p * PAGE_SIZE as u64, b)?;
+                hash.word(p);
+                hash.update(b);
+                pages += n;
+                p += n;
+            }
+        }
+        Ok(json!({"name": name, "hash": hash.finish(), "pages": pages, "remote": vm.pager.remote_left()}))
+    }
+
     pub(super) fn pause(&self, name: &str) -> Result<Value> {
         let _busy = self.reserve(name, "pausing", LIFECYCLE_WAIT)?;
         let vm = self.vm(name)?;
@@ -99,7 +124,7 @@ impl Daemon {
         // discards started checkpoints instead of bringing them back.
         let res = Checkpoint::open(&s.dir).map_err(Restore::NotRun).and_then(|ck| {
             t.mark("verify_checkpoint");
-            self.restore_checkpoint(name, ck, s.manifest.ip, true, &mut t)
+            self.restore_checkpoint(name, ck, s.manifest.ip, true, false, &mut t)
         });
         match res {
             Ok(mut v) => {
@@ -115,7 +140,9 @@ impl Daemon {
             // re-arming it would replay whatever the VM did since.
             Err(Restore::Ran(e)) => {
                 self.ips.lock().unwrap().remove(&s.manifest.ip);
-                let _ = std::fs::remove_dir_all(&s.dir);
+                if let Err(r) = delete_checkpoint(&s.dir) {
+                    eprintln!("vm {name}: removing {}: {r}", s.dir.display());
+                }
                 bail!("vm {name} failed after it resumed: {e}; it is gone, its checkpoint is consumed")
             }
         }
@@ -192,7 +219,7 @@ impl Daemon {
     /// deletes marked checkpoints) even if the deletion does not.
     pub(super) fn discard_suspended(&self, name: &str, s: &Suspended) -> Result<()> {
         mark_durably(&s.dir, DISCARDED).map_err(|e| format!("discarding the checkpoint of {name}: {e}"))?;
-        if let Err(e) = std::fs::remove_dir_all(&s.dir) {
+        if let Err(e) = delete_checkpoint(&s.dir) {
             eprintln!("vm {name}: removing {}: {e}", s.dir.display());
         }
         Ok(())
@@ -200,7 +227,7 @@ impl Daemon {
 
     /// Restores the checkpoint at `dir` as a new VM, by default with the name
     /// and address it was checkpointed with.
-    pub(super) fn restore(&self, dir: &str, name: Option<&str>, ip: Option<&str>) -> Result<Value> {
+    pub(super) fn restore(&self, dir: &str, name: Option<&str>, ip: Option<&str>, paused: bool) -> Result<Value> {
         let mut t = Phases::new();
         let ck = Checkpoint::open(Path::new(dir))?;
         t.mark("verify_checkpoint");
@@ -226,7 +253,7 @@ impl Daemon {
         t.mark("claim_ip");
         // A user's checkpoint is immutable and may be restored again whether
         // or not this VM got to run.
-        self.restore_checkpoint(&name, ck, ip, false, &mut t).map_err(|e| {
+        self.restore_checkpoint(&name, ck, ip, false, paused, &mut t).map_err(|e| {
             self.ips.lock().unwrap().remove(&ip);
             e.error()
         })
@@ -237,7 +264,7 @@ impl Daemon {
     /// template's working set first. `owned` checkpoints (a suspended VM's)
     /// are deleted once the VM no longer needs them. On failure, says
     /// whether the VM's vCPUs ran.
-    fn restore_checkpoint(&self, name: &str, ck: Checkpoint, ip: Ipv4Addr, owned: bool, t: &mut Phases) -> std::result::Result<Value, Restore> {
+    fn restore_checkpoint(&self, name: &str, ck: Checkpoint, ip: Ipv4Addr, owned: bool, hold: bool, t: &mut Phases) -> std::result::Result<Value, Restore> {
         let m = ck.manifest.clone();
         let (vm, restore) = (|| -> Result<_> {
             let tpl = self.template(&m.template)?;
@@ -250,6 +277,7 @@ impl Daemon {
             let vmstate = idle.dir.join("vmstate.in");
             std::fs::write(&vmstate, &ck.vmstate)?;
             let origin = Some((ck.runs, Origin::File(ck.file)));
+            crate::vm::SKIP_HOLD.store(hold && self.fault("restore_no_hold"), Ordering::SeqCst);
             // Loaded paused: everything up to the resume below can fail
             // without the VM having run.
             Vm::restore_from(idle, name, tpl, &vmstate, origin, ip, false, t)
@@ -270,6 +298,13 @@ impl Daemon {
         }
         if vm.state() != State::Paused {
             return Err(Restore::NotRun(kill(format!("vm is {} before resuming", vm.state().name()).into())));
+        }
+        if hold {
+            // Held paused, devices frozen too (see `Vm::restore_from`), until
+            // `resume`; its memory is still paged in meanwhile.
+            self.vms.lock().unwrap().insert(name.into(), vm.clone());
+            self.announce(ip);
+            return Ok(json!({"name": name, "ip": ip.to_string(), "state": "paused", "restore_ms": ms(restore), "timings_ms": t.json()}));
         }
         if owned {
             // Durably consumed before it can run: a crash from here on must
@@ -318,7 +353,7 @@ impl Daemon {
             let took = vm.pager.pull_time().map(ms);
             eprintln!("vm {}: {to_load} MiB paged in from {} (complete: {pulled}, {took:?} ms)", vm.name, dir.display());
             if owned {
-                if let Err(e) = std::fs::remove_dir_all(&dir) {
+                if let Err(e) = delete_checkpoint(&dir) {
                     eprintln!("vm {}: removing {}: {e}", vm.name, dir.display());
                 }
             }
@@ -394,7 +429,9 @@ impl Daemon {
                 // Staging of a suspend that never completed (its VM died with
                 // the daemon), a VM that was resumed (it has run since, and
                 // died with the daemon), or a killed one. Only root writes here.
-                let _ = std::fs::remove_dir_all(e.path());
+                if let Err(err) = delete_checkpoint(&e.path()) {
+                    eprintln!("removing {}: {err}", e.path().display());
+                }
                 continue;
             }
             match Checkpoint::open(&e.path()) {
@@ -484,4 +521,18 @@ pub(super) fn create_dir_durably(dir: &Path) -> std::io::Result<()> {
         std::fs::File::open(&parent)?.sync_all()?;
     }
     Ok(())
+}
+
+/// Deletes a checkpoint directory so that a crash part way through cannot
+/// leave a complete checkpoint without its marker (`remove_dir_all` may
+/// unlink STARTED or DISCARDED first): the manifest goes first, durably,
+/// which makes what is left unloadable, then the rest. If the manifest
+/// cannot be removed durably, nothing else is touched.
+fn delete_checkpoint(dir: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(dir.join("manifest.json")) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    std::fs::File::open(dir)?.sync_all()?;
+    std::fs::remove_dir_all(dir)
 }

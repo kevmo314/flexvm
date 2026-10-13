@@ -45,7 +45,7 @@ usage:
   flexvm suspend NAME                                        checkpoint to the daemon's --state-dir and free
                                                              the VM's memory; `resume` restores it lazily
   flexvm checkpoint NAME DIR [--keep-running | --stop]       write the VM's full state to DIR (new directory)
-  flexvm restore DIR [--name N] [--ip IP|auto]               start a VM from a checkpoint (same template id)
+  flexvm restore DIR [--name N] [--ip IP|auto] [--paused]    start a VM from a checkpoint (same template id)
   flexvm bench [--to ADDR] [--iterations N] [--dirty-mib N]  per-phase run/migrate latency into bench/
                [--template T] [--ready-port N | --ready-http N]  ... and until an image app answers
   flexvm bench --lifecycle DIR [--to ADDR] [--dirty-mib N,N..] pause/checkpoint/restore/suspend latency into bench/
@@ -59,7 +59,7 @@ options:
 ";
 
 /// Flags that take no value.
-const SWITCHES: &[&str] = &["warm", "follow", "stop", "keep-running"];
+const SWITCHES: &[&str] = &["warm", "follow", "stop", "keep-running", "paused"];
 
 struct Args {
     positional: Vec<String>,
@@ -209,7 +209,7 @@ fn real_main() -> Result<()> {
         }
         Some("restore") => {
             let dir = std::path::absolute(pos.get(1).ok_or("restore needs DIR")?)?;
-            print(call(&host, json!({"op": "restore", "dir": dir, "name": args.get("name"), "ip": args.get("ip")}))?)
+            print(call(&host, json!({"op": "restore", "dir": dir, "name": args.get("name"), "ip": args.get("ip"), "paused": args.has("paused")}))?)
         }
         Some("migrate") => {
             let to = args.get("to").ok_or("migrate needs --to ADDR")?;

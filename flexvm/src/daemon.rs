@@ -344,7 +344,13 @@ impl Daemon {
             "checkpoint" => {
                 self.checkpoint(&name, req["dir"].as_str().ok_or("missing dir")?, req["stop"].as_bool().unwrap_or(false))
             }
-            "restore" => self.restore(req["dir"].as_str().ok_or("missing dir")?, req["name"].as_str(), req["ip"].as_str()),
+            "restore" => self.restore(
+                req["dir"].as_str().ok_or("missing dir")?,
+                req["name"].as_str(),
+                req["ip"].as_str(),
+                req["paused"].as_bool().unwrap_or(false),
+            ),
+            "memhash" => self.memhash(&name),
             "release" => self.release(&name, &req),
             "migration" => self.migration_outcome(&req),
             "fault" => self.inject(&req),
@@ -738,20 +744,18 @@ impl Daemon {
     /// Resumes our copy after migration `mig` failed without the target ever
     /// owning the VM. Returns the error to report.
     fn abort_migration(&self, vm: &Vm, mig: u64, e: Error) -> Error {
-        let mut st = vm.state.lock().unwrap();
-        if *st != State::Source(mig) {
+        // Only `migrate` itself or, once it has given up, the one
+        // `reconcile_later` thread of this migration gets here, so the state
+        // lock need not be held across the Firecracker requests.
+        if *vm.state.lock().unwrap() != State::Source(mig) {
             return e;
         }
-        match vm.resume() {
-            Ok(s) => {
-                *st = s;
-                e
-            }
-            Err(r) => {
-                *st = State::Failed;
-                format!("{e}; resuming it here failed too: {r}").into()
-            }
-        }
+        let (s, e) = match vm.resume() {
+            Ok(s) => (s, e),
+            Err(r) => (State::Failed, format!("{e}; resuming it here failed too: {r}").into()),
+        };
+        *vm.state.lock().unwrap() = s;
+        e
     }
 
     /// Asks `to` how migration `mig` went, for up to `patience`. None if it
