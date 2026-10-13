@@ -189,6 +189,7 @@ fn reap(statuses: Statuses) {
 }
 
 fn spawn(command: &mut Command, statuses: &Statuses, deliver_exit: bool) -> io::Result<Child> {
+    mem::contain(command);
     let (lock, cv) = &**statuses;
     // Hold the lock through spawn and registration, even if the child exits immediately.
     let mut map = lock.lock().unwrap();
