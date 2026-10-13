@@ -755,6 +755,16 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    #[test]
+    fn boot_memory_holds_page_structs_for_the_ceiling() {
+        assert_eq!(base_mib(0), 256);
+        assert_eq!(base_mib(32000), 1280);
+        for max in [4096, 32000, 262144] {
+            // Page structs of a fully plugged region take 1/64 of it; leave as much again.
+            assert!(base_mib(max) >= 256 + max / 64 * 2, "{max}");
+        }
+    }
+
     struct Fixture {
         paths: Paths,
         dir: PathBuf,
@@ -775,7 +785,7 @@ mod tests {
                 templates: dir.clone(),
             };
             let mut meta = Meta {
-                vcpus: 2, mem_mib: 256, max_mib: 1024,
+                vcpus: 2, mem_mib: 256, max_mib: 1024, plugged_mib: 0,
                 kernel: paths.kernel.clone(), rootfs: paths.rootfs.clone(),
                 id: String::new(), components: BTreeMap::new(), image: None,
             };
