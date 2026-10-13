@@ -39,10 +39,10 @@ CMD in the guest, streams its output, and the process exits with CMD's status
 | SIGINT | destroy the VM, withdraw its address, exit 0 (Ctrl-C works) |
 | SIGSTOP | cannot be caught: freezes the pager, so the guest stalls. Unsupported |
 
-All four are blocked in every thread and taken by one thread with `sigwait`,
-so SIGTSTP never stops the process. Every operation on the VM (signal,
-control request, controller resize, clock step) holds the VM's operation
-mutex, replacing the daemon's per-name reservation map.
+They (and SIGHUP, ignored: a closed terminal leaves the VM running) are
+blocked in every thread and taken by one thread with `sigwait`, so SIGTSTP
+never stops the process. Every operation on the VM (signal, control
+request, controller resize, clock step) holds the VM's operation mutex.
 
 ## On-disk state
 
@@ -53,15 +53,17 @@ STATE (default /var/lib/flexvm, on disk)
   host.json              host config: listen, peers, vm_ips, underlay, announce_dev, dns, reserve_mib, prefix
   lock                   the host lock (flock), held for short critical sections only
   addrs/IP               per address: newest generation seen, withdrawn?, lent generation, holder name
-  addrs/next             generation high-water mark, reserved 1024 at a time
-  suspended/NAME/        a suspended VM's checkpoint (+ GEN, STARTED, DISCARDED markers)
+  addrs/.gens            generation high-water mark, reserved 1024 at a time, with the boot id
+  suspended/NAME/        a suspended VM's checkpoint (+ STARTED, DISCARDED, QUARANTINE markers)
+  suspended/.gen-NAME    its address's generation, written durably before the checkpoint
   standby/TEMPLATE       how many standby VMs to keep for a template
   migs/ID                incoming migration records (fencing), fsynced
 RUN (default /run/flexvm, tmpfs)
   vms/NAME.{lock,json,sock,log}   registry entry, liveness lock, control socket, log of -d/standby VMs
-  standby/KEY/PID.sock   standby VMs of a template generation
+  standby/T/KEY.PID.sock a standby VM of template T, generation KEY (PID.lock while it lives)
+  standby/.loadset-ID    pages loads of template ID touch, learned by standby VMs, for migrations to preload
   faults.json            armed test faults (FLEXVM_FAULTS=1 only)
-  w/PID/                 a VM process's Firecracker directory
+  w/PID/                 a VM process's Firecracker directories and sockets
 ```
 
 **Liveness** is the name lock: a registry entry whose `.lock` can be locked
@@ -297,10 +299,13 @@ where it is kept and what tests it.
   record says released/dead, the source exits, nothing runs twice),
   `checkpoint_crash`/`cow_crash` (SIGKILL the VM process mid-write: no
   checkpoint appears, staging is cleared by the next one), `hot_budget`
-  becomes `standby` (count, refill, claim fallback). Dropped:
+  becomes `standby` (count, refill, claim fallback). New: `abort_superseded`,
+  `gen_zero`, `suspend_gen`, `signals`. Dropped:
   `target_restart_symlink`, `shared_run_dir`, `state_dir_lock` (they tested a
   daemon's run-dir locking and orphan killing on restart; there is no daemon
   to restart, and Firecracker dies with its VM process).
+- `scripts/e2e.py` (CI): the commands, then a selection of faults.py
+  scenarios against its two hosts (`--no-listeners`).
 - `scripts/nettest.sh` and `scripts/test.sh`: same checks, VM processes and
   listeners instead of daemons.
 - Latency before/after: `run` (standby hit and cold), migration downtime,
