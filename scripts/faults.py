@@ -292,7 +292,9 @@ def quiet_source():
 
     threading.Thread(target=flood, daemon=True).start()
     session = subprocess.Popen([BIN, "--host", A, "exec", n, "while :; do echo tick; sleep 0.05; done"],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    ticks = [0]
+    threading.Thread(target=lambda: [ticks.__setitem__(0, ticks[0] + 1) for _ in session.stdout], daemon=True).start()
     sysfs = f"/sys/class/net/{tap}"
     tx = lambda: int(open(f"{sysfs}/statistics/tx_packets").read())
     # Daemons sharing one host share a routing table, so point the address
@@ -313,7 +315,10 @@ def quiet_source():
     check("quiet source: tap down while paused", flags & 1 == 0, hex(flags))
     check("quiet source: cannot route to the tap while paused", routed.returncode != 0, routed.stderr.strip())
     check("quiet source: no packets to the tap while paused", t0 == t1, (t0, t1))
-    check("quiet source: exec session closed", wait_for(lambda: session.poll() is not None, 10), session.poll())
+    # The source closed its side; the exec client resumes the session on B.
+    after = ticks[0]
+    check("quiet source: exec session resumed on the target", wait_for(lambda: ticks[0] > after + 5, 10), (after, ticks[0]))
+    session.kill()
     stop.set()
     st = wait_released(B, n)
     check("quiet source: released, only on B", st["released"] is True and where(n) == {B: "running"}, (st, where(n)))
