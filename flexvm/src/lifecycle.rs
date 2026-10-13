@@ -282,13 +282,16 @@ impl Daemon {
 
     /// Checkpoints `vm` through `staging`, leaving it in `Checkpointing`
     /// (or as it was, on failure). Returns the manifest and when it paused.
-    fn save(&self, vm: &Vm, staging: Staging, t: &mut Phases) -> Result<(Manifest, Instant)> {
+    fn save(&self, vm: &Vm, mut staging: Staging, t: &mut Phases) -> Result<(Manifest, Instant)> {
         // A VM still pulling memory from a migration source or its own
         // checkpoint finishes that first.
         if vm.pager.remote_left() > 0 && !vm.pager.wait_pulled_for(DRAIN_WAIT) {
             bail!("vm {} is still pulling its memory; try again once it has", vm.name);
         }
         t.mark("drain");
+        // Disk space for the pages it has now, while it still runs.
+        staging.preallocate(vm.pager.census()[crate::uffd::PRESENT as usize])?;
+        t.mark("preallocate");
         vm.start_checkpoint()?;
         let paused = Instant::now();
         let saved = vm.save_state(&staging.vmstate(), true).and_then(|runs| {

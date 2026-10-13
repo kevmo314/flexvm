@@ -108,10 +108,6 @@ impl Hash {
     pub(crate) fn finish(self) -> String {
         format!("{:016x}", self.0)
     }
-
-    pub(crate) fn value(&self) -> u64 {
-        self.0
-    }
 }
 
 /// Hashes a file's logical content: its length and every page that is not all
