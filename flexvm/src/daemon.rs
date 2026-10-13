@@ -682,12 +682,14 @@ impl Daemon {
         // than hold the kill up.
         let vm = self.vm(name).ok();
         if let Some(vm) = &vm {
-            vm.cancel_checkpoint.store(true, Ordering::SeqCst);
+            vm.cancel_checkpoint.fetch_add(1, Ordering::SeqCst);
             vm.pager.abort_copy();
         }
         let busy = self.reserve(name, "killing", LIFECYCLE_WAIT);
-        if let Some(vm) = &vm {
-            vm.cancel_checkpoint.store(false, Ordering::SeqCst);
+        // This kill no longer waits; one that gave up leaves its request for
+        // the checkpoint in the way to see.
+        if let (Some(vm), Ok(_)) = (&vm, &busy) {
+            let _ = vm.cancel_checkpoint.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| Some(n.saturating_sub(1)));
         }
         let _busy = busy?;
         self.kill_reserved(name)

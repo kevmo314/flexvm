@@ -3,7 +3,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, Shutdown};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -110,8 +110,8 @@ pub struct Vm {
     /// The last checkpoint taken of this VM here while write tracking ran
     /// (its directory and id), which the next one can be a delta against.
     pub last_checkpoint: Mutex<Option<(PathBuf, String)>>,
-    /// A kill is waiting: a checkpoint in progress gives up.
-    pub cancel_checkpoint: AtomicBool,
+    /// Kills waiting: a checkpoint in progress gives up (and clears it).
+    pub cancel_checkpoint: AtomicUsize,
 }
 
 impl Vm {
@@ -223,7 +223,7 @@ impl Vm {
             pending_net: Mutex::new(None),
             snapshot_discards: AtomicU64::new(0),
             last_checkpoint: Mutex::new(None),
-            cancel_checkpoint: AtomicBool::new(false),
+            cancel_checkpoint: AtomicUsize::new(0),
         })
     }
 

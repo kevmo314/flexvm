@@ -370,6 +370,8 @@ pub struct Pager {
     wp: Mutex<()>,
     /// Firecracker's /proc/PID/pagemap, to tell populated pages apart.
     pagemap: OnceLock<std::fs::File>,
+    /// Test fault: the next freeze fails to re-protect pages.
+    pub fail_protect: AtomicBool,
 }
 
 /// What `Pager::freeze` captured for a checkpoint.
@@ -422,6 +424,7 @@ impl Pager {
             cow: Mutex::new(None),
             wp: Mutex::new(()),
             pagemap: OnceLock::new(),
+            fail_protect: AtomicBool::new(false),
         });
         let p = pager.clone();
         let thread = thread::Builder::new().name("uffd".into()).spawn(move || {
@@ -1223,7 +1226,11 @@ impl Pager {
                     ranges = vec![(from, to)];
                 }
                 for (s, e) in ranges {
-                    if let Err(e) = self.writeprotect_retry(s, e - s, true) {
+                    let res = match self.fail_protect.swap(false, Ordering::SeqCst) {
+                        true => Err(io::Error::other("injected fault")),
+                        false => self.writeprotect_retry(s, e - s, true),
+                    };
+                    if let Err(e) = res {
                         // Every page must stay protected or dirty: give the
                         // bits back, and protect everything again next time.
                         pages.restore_dirty(&dirty);

@@ -447,14 +447,22 @@ impl Daemon {
                 if ck.chain.len() + 2 > crate::checkpoint::MAX_CHAIN {
                     bail!("vm {}: a delta on {} would make a chain of more than {} checkpoints; take a full one", vm.name, dir.display(), crate::checkpoint::MAX_CHAIN);
                 }
-                let mut links = vec![(ck.dir.clone(), ck.id.clone())];
-                links.extend(ck.chain.iter().cloned().zip(ck.chain_ids.iter().cloned()));
+                // Page data is checked as it is read: for a VM that stops
+                // after this checkpoint, read the pages it inherits now, so
+                // it is never stopped onto a chain that cannot restore. (A
+                // VM that runs on keeps its memory either way.)
+                if !cow {
+                    ck.verify_data().map_err(|e| format!("the last checkpoint of vm {}: {e}; take a full one", vm.name))?;
+                    t.mark("verify_chain");
+                }
+                let mut ids = vec![ck.id.clone()];
+                ids.extend(ck.chain_ids.iter().cloned());
                 let parent = crate::checkpoint::Parent { path: crate::checkpoint::parent_path(staging.dest(), &dir), id };
-                Some((parent, links))
+                Some((parent, ids))
             }
         };
         let cancelled = || -> Result<()> {
-            if vm.cancel_checkpoint.load(Ordering::SeqCst) {
+            if vm.cancel_checkpoint.swap(0, Ordering::SeqCst) > 0 {
                 bail!("vm {} is being killed", vm.name);
             }
             Ok(())
@@ -478,7 +486,12 @@ impl Daemon {
         t.mark("preallocate");
         if cow {
             // Write-protect everything while the VM still runs, so the pause
-            // only re-protects what it writes from here on.
+            // only re-protects what it writes from here on. Arming starts the
+            // dirty history afresh: until a full checkpoint succeeds after it,
+            // there is no base for a delta.
+            if !vm.pager.tracking() {
+                *vm.last_checkpoint.lock().unwrap() = None;
+            }
             vm.pager.arm_tracking()?;
             t.mark("arm_tracking");
         }
@@ -496,6 +509,9 @@ impl Daemon {
             if self.fault("ckpt_memhash") {
                 memhash = Some(vm.pager.content_hash()?);
                 t.mark("memhash");
+            }
+            if self.fault("ckpt_fail_protect") {
+                vm.pager.fail_protect.store(true, Ordering::SeqCst);
             }
             let frozen = vm.pager.freeze(&runs, incremental, cow)?;
             t.mark("freeze");
@@ -549,16 +565,25 @@ impl Daemon {
         let snapshot_discards = vm.snapshot_discards.load(Ordering::SeqCst);
         let dest = staging.dest().to_path_buf();
         let (parent, links) = parent.unzip();
+        let parent_ref = parent.clone();
         let committed = staging.commit(vm, src, &frozen.runs, parent, plugged.unwrap_or(0), t, || {
             cancelled()?;
             if self.fault("ckpt_fail_write") {
                 bail!("injected fault: writing the checkpoint failed");
             }
             // The chain this delta needs must still be there, unchanged.
-            for (dir, id) in links.iter().flatten() {
-                match crate::checkpoint::checkpoint_id(dir) {
-                    Ok(now) if now == *id => {}
-                    _ => bail!("checkpoint {} that this delta builds on has changed or gone; take a full one", dir.display()),
+            // Walked as a restore will: from this checkpoint's own reference
+            // to its parent, through each manifest's.
+            if let (Some(p), Some(ids)) = (&parent_ref, &links) {
+                // (This checkpoint's directory exists only once published,
+                // as a plain directory, so `../NAME` is NAME beside it.)
+                let first = match (p.path.strip_prefix("../"), dest.parent()) {
+                    (Some(name), Some(dir)) => dir.join(name),
+                    _ => PathBuf::from(&p.path),
+                };
+                let now = crate::checkpoint::chain_ids(&first);
+                if now.as_ref().ok() != Some(ids) {
+                    bail!("the checkpoints this delta builds on changed or went ({}); take a full one", now.err().map_or("other ids".into(), |e| e.to_string()));
                 }
             }
             match &frozen.cow {

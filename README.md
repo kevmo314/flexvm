@@ -274,8 +274,13 @@ through, so the checkpoint is exactly the memory at the pause.
   and space in proportion to what changed (35 MiB and 90–110 ms for a 4 GiB
   VM with a small writer, against 4.2 GiB and 1.5–1.9 s); the price is that
   restores read a chain and parents must be kept. Before writing a delta
-  the whole chain is verified (and must stay under 64 links), and it is
-  checked again just before publishing. A failed checkpoint gives back the
+  the whole chain is verified (and must stay under 64 links), and just
+  before publishing it is walked again through the manifests' parent
+  references and must have the same ids. The check covers metadata and page
+  checksum lists; page data is checked when read, except that a `--stop`
+  delta (whose VM is then gone) reads every page it inherits first. Re-arming
+  write tracking (after a failed re-protection) forgets the dirty history,
+  so the next delta needs a full checkpoint first. A failed checkpoint gives back the
   dirty pages it took, so the last good one stays the base, and every page
   stays either protected or dirty. `--stop` can be incremental too.
   Tracking costs a write fault per 64 KiB block written between

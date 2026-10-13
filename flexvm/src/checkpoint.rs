@@ -817,16 +817,29 @@ impl Link {
     }
 }
 
-/// The id (manifest checksum) of the checkpoint at `dir`, if it has a
-/// manifest whose checksum holds. Cheap: reads only the manifest.
-pub fn checkpoint_id(dir: &Path) -> Result<String> {
-    let dfd = open_dir_at(libc::AT_FDCWD, &CString::new(dir.as_os_str().as_bytes())?)?;
-    let (_, text) = read_at(dfd.as_raw_fd(), "manifest.json", 1 << 20)?;
-    let split = text.iter().position(|&b| b == b'\n').ok_or("manifest has no checksum")?;
-    if text[..split] != *sum(&text[split + 1..]).as_bytes() {
-        bail!("manifest checksum mismatch");
+/// The ids of the checkpoint at `dir` and its ancestors, nearest first,
+/// following each manifest's parent reference as a restore does. Reads only
+/// the manifests (each checked against its checksum).
+pub fn chain_ids(dir: &Path) -> Result<Vec<String>> {
+    let mut ids = Vec::new();
+    let mut dir = dir.to_path_buf();
+    loop {
+        if ids.len() >= MAX_CHAIN {
+            bail!("more than {MAX_CHAIN} checkpoints deep");
+        }
+        let dfd = open_dir_at(libc::AT_FDCWD, &CString::new(dir.as_os_str().as_bytes())?).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let (_, text) = read_at(dfd.as_raw_fd(), "manifest.json", 1 << 20).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let split = text.iter().position(|&b| b == b'\n').ok_or("manifest has no checksum")?;
+        if text[..split] != *sum(&text[split + 1..]).as_bytes() {
+            bail!("{}: manifest checksum mismatch", dir.display());
+        }
+        ids.push(String::from_utf8_lossy(&text[..split]).into_owned());
+        let m: Manifest = serde_json::from_slice(&text[split + 1..])?;
+        match m.parent {
+            Some(p) => dir = dir.join(p.path),
+            None => return Ok(ids),
+        }
     }
-    Ok(String::from_utf8_lossy(&text[..split]).into_owned())
 }
 
 /// How `child` (a checkpoint directory) names `parent`: relative to the
@@ -880,6 +893,22 @@ impl Checkpoint {
         let (dir, manifest, id, vmstate) = top.unwrap();
         let (runs, file) = flatten(&layers, files, sums);
         Ok(Checkpoint { dir, manifest, id, vmstate, runs, file: Arc::new(file), chain, chain_ids })
+    }
+
+    /// Reads every page the checkpoint (chain) restores from its files and
+    /// checks it against its checksum.
+    pub fn verify_data(&self) -> Result<()> {
+        let mut buf = vec![0u8; 256 * PAGE_SIZE];
+        for &(first, count, state) in self.runs.iter().filter(|r| r.2 == REMOTE) {
+            let (mut p, end) = (first as usize, (first + count) as usize);
+            while p < end {
+                let n = (end - p).min(256);
+                self.file.read(p, &mut buf[..n * PAGE_SIZE], true)?;
+                p += n;
+            }
+            let _ = state;
+        }
+        Ok(())
     }
 
     /// Pages the restored VM pulls from the checkpoint files.
