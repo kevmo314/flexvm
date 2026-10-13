@@ -259,6 +259,9 @@ def pages_dead_restore():
     fault(A, "pages", 20000)
     r = rpc(A, {"op": "migrate", "name": n, "to": B}, timeout=120)
     check("pages dead at restore: target refuses", not r["ok"], r)
+    # Loaded with its vCPUs stopped, it is killed before it ever ran there.
+    check("pages dead at restore: never ran on the target",
+          "never ran here" in r.get("error", "") or "snapshot/load" in r.get("error", ""), r.get("error"))
     check("pages dead at restore: source resumed, only on A", where(n) == {A: "running"}, where(n))
     check("pages dead at restore: md5 intact on A", md5(A, n) == m)
     cleanup(n)
@@ -1340,6 +1343,167 @@ def ckpt_dir_moved():
         rm_ckpt(d)
 
 
+# --- two-step migration (migrate_in) ---------------------------------------
+
+
+def migrate_in_raw(host, name, ip, template_id, template=None):
+    """Asks `host` to prepare an incoming migration as a source would.
+    Returns the open socket and the prepare reply."""
+    h, port = host.rsplit(":", 1)
+    s = socket.create_connection((h, int(port)), timeout=60)
+    mig = int.from_bytes(os.urandom(6), "little")
+    req = {"op": "migrate_in", "name": name, "mig": mig, "template": template or args.template, "id": template_id,
+           "ip": ip, "source": A}
+    s.sendall((json.dumps(req) + "\n").encode())
+    buf = b""
+    while not buf.endswith(b"\n"):
+        d = s.recv(65536)
+        if not d:
+            break
+        buf += d
+    return s, (json.loads(buf) if buf else {"ok": False, "error": "hung up"}), mig
+
+
+def nothing_left(label, name, ip):
+    """B holds neither the name nor the address after an abandoned migration."""
+    check(f"{label}: name free on B", wait_for(lambda: name not in vms(B), 10), vms(B).get(name))
+    check(f"{label}: address free on B", wait_for(lambda: ip not in ok(B, {"op": "info"})["ips"], 10))
+    r = rpc(B, {"op": "run", "name": name, "template": args.template, "ip": ip})
+    check(f"{label}: name and address usable on B", r["ok"], r)
+    rpc(B, {"op": "kill", "name": name})
+
+
+def template_id():
+    n = "ft-tplid"
+    ok(A, {"op": "run", "name": n, "template": args.template})
+    tid = vms(A)[n]["template_id"]
+    rpc(A, {"op": "kill", "name": n})
+    return tid
+
+
+def prepare_disconnect():
+    """A source that goes away after the target prepared leaves nothing behind."""
+    n, ip = "ft-prep-gone", "10.250.0.7"
+    s, r, mig = migrate_in_raw(B, n, ip, template_id())
+    check("prepare disconnect: target prepared", r.get("ok"), r)
+    info = ok(B, {"op": "info"})
+    check("prepare disconnect: address held while prepared", ip in info["ips"], (info["ips"], vms(B).get(n)))
+    s.close()
+    nothing_left("prepare disconnect", n, ip)
+    st = ok(B, {"op": "migration", "mig": mig})
+    check("prepare disconnect: migration fenced as aborted", st["outcome"] == "aborted", st)
+
+
+def prepare_trickle():
+    """A source that trickles its header is cut off by one deadline (here 2 s,
+    `short_incoming`), however much it keeps sending."""
+    n, ip = "ft-prep-trickle", "10.250.0.8"
+    fault(B, "short_incoming", 30000)
+    s, r, _ = migrate_in_raw(B, n, ip, template_id())
+    check("prepare trickle: target prepared", r.get("ok"), r)
+    start, cut = time.time(), False
+    try:
+        for c in b'{"runs": [' + b"[1, 1, 3], " * 100:
+            s.sendall(bytes([c]))
+            time.sleep(0.05)
+            if time.time() - start > 15:
+                break
+    except OSError:
+        cut = True
+    s.settimeout(10)
+    try:
+        reply = s.recv(65536)
+    except OSError:
+        reply = b""
+    took = time.time() - start
+    s.close()
+    fault(B, "short_incoming", 0)
+    check("prepare trickle: cut off by the deadline", (cut or b"too slow" in reply) and took < 12, (took, reply[:200]))
+    nothing_left("prepare trickle", n, ip)
+
+
+def prepare_fail():
+    """A target that fails once everything is prepared refuses before the
+    source pauses; the VM never stops running."""
+    n = "ft-prep-fail"
+    m = setup(n)
+    fault(B, "prepare_fail", 10000)
+    r = rpc(A, {"op": "migrate", "name": n, "to": B})
+    fault(B, "prepare_fail", 0)
+    check("prepare fail: migrate refused", not r["ok"] and "injected fault" in r["error"], r)
+    check("prepare fail: running on A only", where(n) == {A: "running"}, where(n))
+    check("prepare fail: md5 intact", md5(A, n) == m)
+    ip = vms(A)[n]["ip"]
+    check("prepare fail: target holds nothing", n not in vms(B) and ip not in ok(B, {"op": "info"})["ips"])
+    r = rpc(A, {"op": "migrate", "name": n, "to": B})
+    check("prepare fail: a later migration works", r["ok"] and where(n).get(B) == "running", r)
+    wait_released(B, n)
+    check("prepare fail: md5 intact on B", md5(B, n) == m)
+    cleanup(n)
+
+
+def fc_prepare():
+    """Firecracker's prepared load (firecracker/0002-*.patch): refuses a second
+    prepare, a snapshot of another layout, and a load after boot config."""
+    argv = [a.decode() for a in proc(daemon_pid(A), "cmdline").split(b"\0") if a]
+    art = argv[argv.index("--artifacts") + 1] if "--artifacts" in argv else "artifacts"
+    tpls = argv[argv.index("--templates") + 1] if "--templates" in argv else os.path.join(art, "templates")
+    fc = os.path.join(art, "firecracker")
+    other = "small" if args.template != "small" else "default"
+    vmstate = lambda t: os.path.join(tpls, t, "vmstate")
+    if not os.path.exists(vmstate(other)):
+        return print(f"fc prepare: skipped, no template {other!r} to mismatch with")
+
+    def run(label, steps):
+        d = tempfile.mkdtemp(prefix="fvp", dir="/tmp")
+        os.chmod(d, 0o777)
+        uffd = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        uffd.bind(f"{d}/u.sock")
+        os.chmod(f"{d}/u.sock", 0o777)
+        uffd.listen(1)
+        held = []
+        threading.Thread(target=lambda: held.append(uffd.accept()), daemon=True).start()
+        p = subprocess.Popen(["sudo", fc, "--api-sock", f"{d}/api.sock", "--level", "Warn"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        wait_for(lambda: os.path.exists(f"{d}/api.sock"), 5)
+
+        def put(path, body):
+            r = subprocess.run(["sudo", "curl", "-s", "-o", "/dev/stderr", "-w", "%{http_code}", "--unix-socket",
+                                f"{d}/api.sock", "-X", "PUT", f"http://x{path}", "-d", json.dumps(body)],
+                               capture_output=True, text=True, timeout=30)
+            return int(r.stdout or 0), r.stderr
+
+        load = lambda t: {"snapshot_path": vmstate(t), "mem_backend": {"backend_type": "Uffd", "backend_path": f"{d}/u.sock"},
+                          "vsock_override": {"uds_path": f"{d}/v.sock"}}
+        try:
+            code, body = put("/snapshot/prepare", load(args.template))
+            if code == 400 and "Invalid request" in body:
+                return print("fc prepare: skipped, Firecracker without the prepare patch (flexvm falls back to a full load)")
+            check(f"fc prepare ({label}): prepared", code == 204, (code, body))
+            steps(put, load)
+        finally:
+            subprocess.run(["sudo", "kill", "-9", str(p.pid)])
+            p.wait()
+            subprocess.run(["sudo", "rm", "-rf", d])
+
+    def twice(put, load):
+        code, body = put("/snapshot/prepare", load(args.template))
+        check("fc prepare: a second prepare is refused", code == 400, (code, body))
+
+    def mismatch(put, load):
+        code, body = put("/snapshot/load", load(other))
+        check("fc prepare: a snapshot of another layout is refused", code == 400 and "differs" in body, (code, body))
+
+    def config_between(put, load):
+        put("/boot-source", {"kernel_image_path": "/nonexistent"})
+        code, body = put("/snapshot/load", load(args.template))
+        check("fc prepare: a load after boot config is refused", code == 400, (code, body))
+
+    run("twice", twice)
+    run("mismatch", mismatch)
+    run("config", config_between)
+
+
 SCENARIOS = dict(basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, refused=refused, pages_blip=pages_blip,
                  pages_dead_restore=pages_dead_restore, pages_dead=pages_dead, quiet_source=quiet_source,
                  shared_run_dir=shared_run_dir, exec_race=exec_race, source_killed=source_killed,
@@ -1351,7 +1515,8 @@ SCENARIOS = dict(basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, r
                  state_dir_lock=state_dir_lock, held_restore_frozen=held_restore_frozen,
                  cow_exact=cow_exact, cow_abort=cow_abort, cow_crash=cow_crash, cow_reports_held=cow_reports_held, ckpt_incremental=ckpt_incremental,
                  ckpt_failed_stop=ckpt_failed_stop, ckpt_rearm=ckpt_rearm,
-                 ckpt_dir_moved=ckpt_dir_moved)
+                 ckpt_dir_moved=ckpt_dir_moved, prepare_disconnect=prepare_disconnect,
+                 prepare_trickle=prepare_trickle, prepare_fail=prepare_fail, fc_prepare=fc_prepare)
 safe = [s for s in SCENARIOS
         if s not in ("source_killed", "target_restart", "target_restart_symlink", "checkpoint_crash", "cow_crash",
                      "suspend_resume")]
