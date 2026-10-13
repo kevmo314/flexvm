@@ -154,6 +154,9 @@ pub struct Source {
     pub addr: String,
     pub vm: String,
     pub mig: u64,
+    /// The source's guest memory regions as `(offset, size)`; the target's
+    /// must be the same, or the page map would not cover the saved state.
+    pub regions: Vec<(u64, u64)>,
 }
 
 /// Where a VM's REMOTE pages come from.
@@ -635,6 +638,12 @@ impl Pager {
             initial.take()
         };
         if let Some((runs, origin)) = initial {
+            if let Origin::Peer(source) = &origin {
+                let ours = regions(&mappings);
+                if source.regions != ours {
+                    bail!("guest memory regions {ours:?} differ from the source's {:?}", source.regions);
+                }
+            }
             let _ = self.pull_started.set(Instant::now());
             let remote = remote_pages(&runs, total)?;
             for (first, count, state) in runs {
@@ -945,6 +954,11 @@ impl Pager {
 
     pub fn remote_left(&self) -> usize {
         self.remote_left.load(Ordering::SeqCst)
+    }
+
+    /// Guest memory regions as `(offset, size)`, in Firecracker's order.
+    pub fn regions(&self) -> Vec<(u64, u64)> {
+        regions(self.mappings())
     }
 
     fn mappings(&self) -> &[Mapping] {
@@ -1976,6 +1990,10 @@ fn fatal(e: &io::Error) -> bool {
 
 /// Checks page runs from a migration source (ascending, disjoint, in bounds,
 /// and only states a source exports) and counts their REMOTE pages.
+fn regions(mappings: &[Mapping]) -> Vec<(u64, u64)> {
+    mappings.iter().map(|m| (m.offset, m.size as u64)).collect()
+}
+
 fn remote_pages(runs: &Runs, total: usize) -> Result<usize> {
     let (mut next, mut remote) = (0, 0);
     for &(first, count, state) in runs {

@@ -648,6 +648,16 @@ impl Daemon {
             "release" => self.release(&name, &req),
             "migration" => self.migration_outcome(&req),
             "fault" => self.inject(&req),
+            // Test hook: set a VM's hotplug size directly, as the controller would.
+            "hotplug" if self.faults.is_some() => self.reserve(&name, "resizing", Duration::from_secs(2)).and_then(|_busy| {
+                let vm = self.vm(&name)?;
+                let mib = req["mib"].as_u64().ok_or("missing mib")?;
+                *vm.last_resize.lock().unwrap() = Instant::now();
+                if vm.state() != State::Running {
+                    bail!("vm {name} is not running here");
+                }
+                vm.fc(|fc| fc.patch("/hotplug/memory", json!({"requested_size_mib": mib})))
+            }),
             "route" => self.route(&req),
             "unlend" => {
                 let ip: Ipv4Addr = req["ip"].as_str().ok_or("missing ip")?.parse()?;
@@ -1286,6 +1296,7 @@ impl Daemon {
                 "id": vm.template.meta.id,
                 "ip": vm.ip.to_string(),
                 "source": self.cfg.advertise,
+                "regions": vm.pager.regions(),
             }),
         )?;
         let reply = recv_json(&mut reader)?.ok_or_else(|| format!("{to} hung up"))?;
@@ -1625,7 +1636,12 @@ impl Daemon {
     fn prepare_in(&self, req: &Value, t: &mut Phases) -> Result<PreparedIn<'_>> {
         let name = req["name"].as_str().ok_or("missing name")?.to_string();
         let mig = req["mig"].as_u64().ok_or("missing mig")?;
-        let source = Source { addr: req["source"].as_str().ok_or("missing source")?.into(), vm: name.clone(), mig };
+        let source = Source {
+            addr: req["source"].as_str().ok_or("missing source")?.into(),
+            vm: name.clone(),
+            mig,
+            regions: serde_json::from_value(req["regions"].clone()).map_err(|e| format!("bad regions: {e}"))?,
+        };
         let busy = self.reserve(&name, "incoming", Duration::ZERO)?;
         if self.taken(&name) {
             bail!("vm name {name:?} is taken here");
@@ -2075,8 +2091,12 @@ fn resize(vm: &Vm, host_avail: u64, reserve: u64, fresh: Option<(u64, u64)>) -> 
     if hotplug_total == 0 {
         return Ok((Resized::Full, 0));
     }
-    // Serializes the controller's ticks with the guest's own requests.
+    // Callers hold the VM's reservation, so no lifecycle operation (migration,
+    // checkpoint, pause) runs meanwhile; only a running VM is resized.
     let mut last = vm.last_resize.lock().unwrap();
+    if vm.state() != State::Running {
+        return Ok((Resized::Busy, 0));
+    }
     let (stats, hp) = vm.fc(|fc| {
         let stats = if fresh.is_none() { fc.get("/balloon/statistics")? } else { Value::Null };
         Ok((stats, fc.get("/hotplug/memory")?))
@@ -2143,6 +2163,14 @@ fn serve_mem_requests(d: Arc<Daemon>, vm: Arc<Vm>) {
         }
         let mut f = line.split_whitespace().skip(1).filter_map(|v| v.parse::<u64>().ok());
         let (Some(avail), Some(total)) = (f.next(), f.next()) else { continue };
+        // Like a controller tick, never alongside a lifecycle operation.
+        let Ok(_busy) = d.reserve(&vm.name, "resizing", Duration::ZERO) else {
+            let _ = (&conn).write_all(b"busy\n");
+            continue;
+        };
+        if !d.vm(&vm.name).is_ok_and(|v| Arc::ptr_eq(&v, &vm)) {
+            break; // this copy is gone from here
+        }
         let reply = match resize(&vm, host_available_mib(), d.cfg.reserve_mib, Some((avail >> 10, total >> 10))) {
             Ok((Resized::Grew, _)) => "grow",
             Ok((Resized::Busy, _)) => "busy",

@@ -100,9 +100,9 @@ def disarm():
             check(f"disarm on {h}", False, repr(e))
 
 
-def setup(name, host=None, mib=200):
+def setup(name, host=None, mib=200, template=None):
     host = host or A
-    ok(host, {"op": "run", "name": name, "template": args.template})
+    ok(host, {"op": "run", "name": name, "template": template or args.template})
     code, out = sh(host, name, f"dd if=/dev/urandom of=/tmp/f bs=1M count={mib} 2>/dev/null; md5sum /tmp/f")
     assert code == 0, out
     return out.split()[0]
@@ -1955,7 +1955,80 @@ def hot_budget():
     start_daemon(A, argv, env)
 
 
-SCENARIOS = dict(basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, refused=refused, pages_blip=pages_blip,
+def plug_race():
+    """Migrations that start right after a memory hot-plug (or unplug) was
+    requested: the plug settles first (or, if it stalls, is cut down to what
+    the guest managed), and the VM ends up on B with all its memory usable.
+    PLUG_TEMPLATE picks the template; one snapshotted with nothing plugged
+    makes the first step plug into a slot that was never mapped."""
+    n = "ft-plug-race"
+    m = setup(n, mib=50, template=os.environ.get("PLUG_TEMPLATE"))
+    # (from, to, MiB to plug, delay before migrating); the last one is more
+    # than the guest can online quickly, so the migration has to cut it short.
+    steps = [(A, B, 384, 0), (B, A, 1024, 0), (A, B, 2048, 0.05), (B, A, -1024, 0), (A, B, 384, 0.2),
+             (B, A, 1024, 0.1), (A, B, 12288, 0), (B, A, None, 0)]
+    for i, (src, dst, delta, gap) in enumerate(steps):
+        v = vms(src)[n]
+        if delta is None:  # everything: takes the guest longer than a migration waits
+            delta = v["max_mib"] - (v["guest_mib"] - v["plugged_mib"]) - v["plugged_mib"]
+        want = v["plugged_mib"] + delta
+        ok(src, {"op": "hotplug", "name": n, "mib": want})
+        time.sleep(gap)
+        r = rpc(src, {"op": "migrate", "name": n, "to": dst})
+        check(f"plug race {i}: migrate succeeds", r["ok"], r.get("error"))
+        st = wait_released(dst, n, timeout=60)
+        check(f"plug race {i}: pull finished and released", st["released"] is True and st["failed"] is None, st)
+        check(f"plug race {i}: only on target, running", where(n) == {dst: "running"}, where(n))
+        hp = lambda: (vms(dst)[n]["requested_mib"], vms(dst)[n]["plugged_mib"])
+        settled = wait_for(lambda: hp()[0] == hp()[1] and (delta > 8192 or hp()[1] == want), 15)
+        check(f"plug race {i}: hot-plug settled on target", settled, (want, hp()))
+        check(f"plug race {i}: md5 intact", md5(dst, n) == m)
+        code, out = sh(dst, n, "python3 -c 'b=bytearray(512<<20); print(len(b)>>20)'")
+        check(f"plug race {i}: guest can use its memory", code == 0 and out == "512", out)
+        code, out = sh(dst, n, "grep MemTotal /proc/meminfo")
+        print(f"plug race {i}: {hp()} {out}", flush=True)
+    cleanup(n)
+
+
+def plug_storm():
+    """The memory controller keeps resizing (here: a hot-plug request every
+    20 ms, up and down) while the VM migrates back and forth. Resizes and
+    migrations must not interleave: every migration lands intact."""
+    n = "ft-plug-storm"
+    m = setup(n, mib=50, template=os.environ.get("PLUG_TEMPLATE"))
+    stop = threading.Event()
+
+    def storm():
+        up = True
+        while not stop.is_set():
+            for h in (A, B):
+                try:
+                    v = vms(h).get(n)
+                    if v and v["state"] == "running" and v["plugged_mib"] is not None:
+                        rpc(h, {"op": "hotplug", "name": n, "mib": max(0, v["plugged_mib"] + (512 if up else -512))}, timeout=10)
+                        up = not up
+                except (OSError, AssertionError, KeyError):
+                    pass
+            time.sleep(0.02)
+
+    t = threading.Thread(target=storm)
+    t.start()
+    for i, (src, dst) in enumerate([(A, B), (B, A)] * 3):
+        r = rpc(src, {"op": "migrate", "name": n, "to": dst})
+        check(f"plug storm {i}: migrate succeeds", r["ok"], r.get("error"))
+        st = wait_released(dst, n, timeout=60)
+        check(f"plug storm {i}: pull finished and released", st["released"] is True and st["failed"] is None, st)
+        check(f"plug storm {i}: only on target, running", where(n) == {dst: "running"}, where(n))
+    stop.set()
+    t.join()
+    dst = B if where(n).get(B) == "running" else A
+    check("plug storm: md5 intact", md5(dst, n) == m)
+    code, out = sh(dst, n, "python3 -c 'b=bytearray(512<<20); print(len(b)>>20)'")
+    check("plug storm: guest can use its memory", code == 0 and out == "512", out)
+    cleanup(n)
+
+
+SCENARIOS = dict(plug_race=plug_race, plug_storm=plug_storm, basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, refused=refused, pages_blip=pages_blip,
                  pages_dead_restore=pages_dead_restore, pages_dead=pages_dead, resume_kill=resume_kill, prepared_retry=prepared_retry, quiet_source=quiet_source,
                  shared_run_dir=shared_run_dir, exec_race=exec_race, guest_calls=guest_calls, source_killed=source_killed,
                  target_restart=target_restart, target_restart_symlink=target_restart_symlink, guest_hang=guest_hang,

@@ -888,6 +888,8 @@ impl Vm {
             "rss_mib": self.rss() >> 20,
             "guest_mib": self.template.meta.mem_mib + hotplug["plugged_size_mib"].as_u64().unwrap_or(0),
             "max_mib": self.template.meta.max_mib,
+            "plugged_mib": hotplug["plugged_size_mib"],
+            "requested_mib": hotplug["requested_size_mib"],
             "pages_mib": {"base": mib(base), "present": mib(present), "zero": mib(zero), "remote": mib(remote + inflight + discarded)},
             "checkpoint_copy": self.pager.copying(),
             "write_tracking": self.pager.tracking(),
