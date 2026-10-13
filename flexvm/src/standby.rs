@@ -234,6 +234,7 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>) -> Result
         match claim(p, &req) {
             Ok(v) => {
                 let _ = std::fs::remove_file(&sock);
+                p.serve_control();
                 let mut w = &c;
                 let _ = send_json(&mut w, &json!({"ok": true, "result": v}));
                 for (fd, to) in fds.iter().zip([1, 2]) {

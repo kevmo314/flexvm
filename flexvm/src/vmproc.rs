@@ -91,6 +91,8 @@ pub struct Proc {
     pub instance: u64,
     /// Files this process owns, removed when it ends (a standby VM's socket and lock).
     pub files: Mutex<Vec<PathBuf>>,
+    /// The control socket is open.
+    serving: AtomicBool,
     me: std::sync::Weak<Proc>,
 }
 
@@ -128,6 +130,7 @@ impl Proc {
             pending_route: Mutex::new(None),
             instance: crate::migrate::migration_id(),
             files: Mutex::new(Vec::new()),
+            serving: AtomicBool::new(false),
             me: me.clone(),
         }))
     }
@@ -390,7 +393,12 @@ impl Proc {
 
     /// Serves the control socket, runs the controller and takes signals.
     /// Never returns: the process ends with the VM.
-    fn serve(self: &Arc<Self>) -> ! {
+    /// Opens the control socket (once): before the VM is reported ready, so
+    /// whoever started it can use it right away.
+    pub fn serve_control(self: &Arc<Self>) {
+        if self.serving.swap(true, Ordering::SeqCst) {
+            return;
+        }
         let sock = self.host.sock(&self.name());
         let _ = std::fs::remove_file(&sock);
         match UnixListener::bind(&sock) {
@@ -414,6 +422,10 @@ impl Proc {
             }
             Err(e) => eprintln!("vm {}: no control socket at {}: {e}", self.name(), sock.display()),
         }
+    }
+
+    fn serve(self: &Arc<Self>) -> ! {
+        self.serve_control();
         let p = self.clone();
         thread::spawn(move || p.controller());
         if self.vm().template.meta.image.is_some() {
@@ -726,6 +738,9 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
         }
         Start::Standby { template } => crate::standby::serve(&p, &template, &mut notify),
     };
+    if res.is_ok() && p.vm.get().is_some() {
+        p.serve_control();
+    }
     let reply = match &res {
         Ok(v) => json!({"ok": true, "result": v}),
         Err(e) => json!({"ok": false, "error": e.to_string()}),

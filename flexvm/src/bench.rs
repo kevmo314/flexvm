@@ -279,7 +279,14 @@ fn trial(h: &Hosts, name: &str, template: &str, mib: u64, ck: &std::path::Path) 
     checkpoint["data_mib"] = c["data_mib"].clone();
     h.wait("the checkpointed vm to go", || !h.a.alive(name))?;
 
-    let rs = h.cli(&h.b, &["restore", &ck.to_string_lossy(), "--name", name, "-d"])?;
+    // Another host gives it an address of its own (its own is the first host's to give).
+    let ip = if h.to.is_some() { "auto" } else { "" };
+    let ck = ck.to_string_lossy();
+    let mut argv = vec!["restore", &ck, "--name", name, "-d"];
+    if !ip.is_empty() {
+        argv.extend(["--ip", ip]);
+    }
+    let rs = h.cli(&h.b, &argv)?;
     let mut restore = rs["timings_ms"].clone();
     restore["ready"] = rs["ready_ms"].clone();
     restore["pull"] = h.pulled(&h.b, name)?;

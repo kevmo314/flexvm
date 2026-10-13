@@ -483,6 +483,7 @@ impl Proc {
                 return Err(e);
             }
         };
+        self.serve_control();
         let reply = json!({"ok": true, "result": {
             "underlay": self.host.cfg.underlay().map(|u| u.to_string()),
             "timings_ms": t,
