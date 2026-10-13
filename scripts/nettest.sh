@@ -54,12 +54,14 @@ wait_for() {
     done
 }
 
-# Our Firecrackers: their API sockets live under our run directories.
+# Our Firecrackers: they log (stdout) into VM directories under our run
+# directories; their sockets live elsewhere.
 our_firecrackers() {
-    local p cmd
+    local p log
     for p in /proc/[0-9]*; do
-        cmd=$(tr '\0' ' ' 2>/dev/null < "$p/cmdline") 2>/dev/null || continue
-        case $cmd in *firecracker*"--api-sock $run_A/"*|*firecracker*"--api-sock $run_B/"*) echo "${p#/proc/}" ;; esac
+        [[ $(cat "$p/comm" 2>/dev/null) == firecracker ]] || continue
+        log=$(readlink "$p/fd/1" 2>/dev/null) || continue
+        case $log in "$run_A"/*|"$run_B"/*) echo "${p#/proc/}" ;; esac
     done
 }
 

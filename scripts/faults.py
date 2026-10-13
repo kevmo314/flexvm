@@ -304,10 +304,9 @@ def quiet_source():
     threading.Thread(target=lambda: [ticks.__setitem__(0, ticks[0] + 1) for _ in session.stdout], daemon=True).start()
     sysfs = f"/sys/class/net/{tap}"
     tx = lambda: int(open(f"{sysfs}/statistics/tx_packets").read())
-    # Daemons sharing one host share a routing table, so point the address
-    # at the source's tap explicitly (as a stale LAN path would).
+    # While paused, try to point the address back at the source's tap (as a
+    # stale LAN path would).
     to_tap = lambda: subprocess.run(["sudo", "ip", "route", "replace", f"{ip}/32", "dev", tap], capture_output=True, text=True)
-    to_tap()
     t = tx()
     time.sleep(0.3)
     check("quiet source: flood reaches the tap while running", tx() > t + 10, (t, tx()))
@@ -516,17 +515,8 @@ def guest_clock_error(host, name):
     return float(out) - (before + after) / 2 if code == 0 else None
 
 
-def to_tap(host, name):
-    """Daemons sharing one host share its routing table, and a peer's route
-    for a VM it just announced replaces ours: point the address at the VM's
-    tap, as its own host would."""
-    time.sleep(0.5)  # let the restoring daemon's announcement land first
-    vm = vms(host)[name]
-    # Some taps lose the gateway MAC create_tap gave them (udev racing it?),
-    # and then the host ignores the guest's frames.
-    subprocess.run(["sudo", "ip", "link", "set", "dev", vm["tap"], "address", "06:00:a9:fe:01:01"], check=True)
-    subprocess.run(["sudo", "ip", "route", "replace", f"{vm['ip']}/32", "dev", vm["tap"]], check=True)
-    return vm["ip"]
+def vm_ip(host, name):
+    return vms(host)[name]["ip"]
 
 
 def echo(s, msg):
@@ -568,7 +558,7 @@ def checkpoint_restore():
     m = setup(n)
     proc_before = marker(A, n)
     tcp_server(A, n)
-    ip = to_tap(A, n)
+    ip = vm_ip(A, n)
     conn = socket.create_connection((ip, 7000), timeout=10)
     check("checkpoint: TCP echo before", echo(conn, b"before\n"))
     r = ok(A, {"op": "checkpoint", "name": n, "dir": path, "stop": True})
@@ -578,7 +568,6 @@ def checkpoint_restore():
     check("checkpoint --stop: gone from A", n not in vms(A), vms(A).get(n))
     r = ok(B, {"op": "restore", "dir": path})
     print(f"restore: ready in {r['ready_ms']} ms (snapshot load {r['restore_ms']} ms), clock was {r['clock_offset_ms']} ms off; {r['timings_ms']}")
-    to_tap(B, n)
     check("restore: same address", r["ip"] == ip and sh(B, n, "ip -4 -o addr show eth0")[1].count(ip) == 1, r["ip"])
     check("restore: TCP connection survived", echo(conn, b"after\n"))
     conn.close()
@@ -787,7 +776,7 @@ def held_restore_frozen():
         fault(B, "restore_no_hold", 0)
         check(f"held{'(no hold)' if no_hold else ''}: restored paused", r["state"] == "paused" and vms(B)[n]["state"] == "paused", r)
         wait_for(lambda: ok(B, {"op": "memhash", "name": n})["remote"] == 0, 30)
-        ip = to_tap(B, n)
+        ip = vm_ip(B, n)
         h0, f0 = ok(B, {"op": "memhash", "name": n}), tap_frames(B, n)
         # Pending host activity: frames on the tap, a vsock connection, and
         # the balloon statistics timer (every second).
