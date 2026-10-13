@@ -250,37 +250,76 @@ fn require_complete(cached: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Holds a stable per-key lock through the cache check, build and publication.
-fn cached_rootfs(cached: &Path, build: impl FnOnce(&Path) -> Result<String>) -> Result<PathBuf> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::create_dir_all(cached.parent().unwrap())?;
-    // Never unlink the lock: waiters must all lock the same inode.
-    let lock = File::options().write(true).create(true).truncate(false).custom_flags(libc::O_NOFOLLOW).open(cached.with_extension("lock"))?;
+fn flock(f: &File, op: libc::c_int) -> std::io::Result<()> {
     loop {
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0 {
-            break;
+        if unsafe { libc::flock(f.as_raw_fd(), op) } == 0 {
+            return Ok(());
         }
         let e = std::io::Error::last_os_error();
         if e.kind() != std::io::ErrorKind::Interrupted {
-            return Err(e.into());
+            return Err(e);
         }
     }
+}
+
+/// Holds a stable per-key lock through the cache check, build and publication.
+fn cached_rootfs(cached: &Path, build: impl FnOnce(&Path) -> Result<String>) -> Result<PathBuf> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let dir = cached.parent().unwrap();
+    std::fs::create_dir_all(dir)?;
+    // Never unlink the lock: waiters must all lock the same inode.
+    let lock = File::options().write(true).create(true).truncate(false).custom_flags(libc::O_NOFOLLOW).open(cached.with_extension("lock"))?;
+    if let Err(e) = flock(&lock, libc::LOCK_EX | libc::LOCK_NB) {
+        if e.raw_os_error() != Some(libc::EWOULDBLOCK) {
+            return Err(e.into());
+        }
+        eprintln!("image: waiting for another build of {}", cached.display());
+        flock(&lock, libc::LOCK_EX)?;
+    }
+    let ok = cached.with_extension("ok");
     if entry_complete(cached) {
         eprintln!("image: root filesystem cached at {}", cached.display());
+    } else if std::fs::symlink_metadata(&ok).is_ok() {
+        // Once marked, templates may use the entry: never rebuild it in place.
+        bail!(
+            "image cache entry {} is marked complete but has missing files; templates may use it, \
+             so remove its .ext4, .conf and .ok files (and those templates) to rebuild it",
+            cached.display()
+        );
     } else {
-        // A crashed publication must not be repaired with a different build,
-        // or an old marker made to certify files it was never written for.
-        for path in [cached.to_path_buf(), cached.with_extension("conf"), cached.with_extension("ok")] {
-            if std::fs::symlink_metadata(path).is_ok() {
-                require_complete(cached)?;
-            }
-        }
+        // Without its marker the entry was never handed out (prepare returns
+        // only once the marker is durable, and publishers hold this lock), so
+        // a crashed build's leftovers can go. Unlinking never alters a file
+        // anything still has open.
+        remove_leftovers(cached)?;
         let tmp = cached.with_extension(format!("tmp{}", std::process::id()));
         let res = build(&tmp).and_then(|conf| publish_rootfs(&tmp, cached, &conf));
         let _ = std::fs::remove_file(&tmp);
         res?;
     }
     Ok(std::fs::canonicalize(cached)?)
+}
+
+/// Removes an unmarked entry's files and its crashed builds' temporaries;
+/// only called with the entry's lock held and its `.ok` absent.
+fn remove_leftovers(cached: &Path) -> Result<()> {
+    let dir = cached.parent().unwrap();
+    let stem = cached.file_stem().unwrap().as_bytes();
+    let mut removed = false;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(ext) = name.as_bytes().strip_prefix(stem).and_then(|r| r.strip_prefix(b".")) else { continue };
+        if ext == b"ext4" || ext == b"conf" || ext.starts_with(b"tmp") || ext.starts_with(b"part") {
+            eprintln!("image: removing {} left by an interrupted build", entry.path().display());
+            std::fs::remove_file(entry.path())?;
+            removed = true;
+        }
+    }
+    if removed {
+        sync_dir(dir)?;
+    }
+    Ok(())
 }
 
 /// Publishes immutable files, with the completion marker last. A competing
@@ -772,8 +811,37 @@ mod tests {
         assert_eq!(std::fs::read_to_string(path.with_extension("conf")).unwrap(), "winner config");
         assert!(!cached.with_extension(format!("tmp{}", std::process::id())).exists());
         assert_eq!(cached_rootfs(&cached, |_| panic!("cache hit must not build")).unwrap(), path);
-        std::fs::remove_file(path.with_extension("ok")).unwrap();
-        assert!(cached_rootfs(&cached, |_| panic!("incomplete entry must not build")).is_err());
+        // Marked complete but missing a file: templates may use it, never rebuild.
+        std::fs::remove_file(path.with_extension("conf")).unwrap();
+        assert!(cached_rootfs(&cached, |_| panic!("marked entry must not be rebuilt")).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "winner image");
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn interrupted_publication_is_rebuilt() {
+        use std::os::unix::fs::MetadataExt;
+        let d = tmpdir("interrupted");
+        let cached = d.join("key.ext4");
+        // A build killed after the rootfs rename, mid-way through the config.
+        std::fs::write(&cached, "half published").unwrap();
+        std::fs::write(d.join("key.part123"), "partial config").unwrap();
+        std::fs::write(d.join("key.tmp456"), "abandoned build").unwrap();
+        std::fs::write(d.join("other.tmp789"), "another key's build").unwrap();
+        let old = std::fs::File::open(&cached).unwrap();
+        let path = cached_rootfs(&cached, |tmp| {
+            std::fs::write(tmp, "rebuilt image")?;
+            Ok("rebuilt config".into())
+        })
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "rebuilt image");
+        assert_eq!(std::fs::read_to_string(path.with_extension("conf")).unwrap(), "rebuilt config");
+        assert!(path.with_extension("ok").exists());
+        // The old file was unlinked, not rewritten.
+        assert_ne!(old.metadata().unwrap().ino(), std::fs::metadata(&path).unwrap().ino());
+        assert_eq!(std::io::read_to_string(old).unwrap(), "half published");
+        assert!(!d.join("key.part123").exists() && !d.join("key.tmp456").exists());
+        assert!(d.join("other.tmp789").exists());
         std::fs::remove_dir_all(d).unwrap();
     }
 
