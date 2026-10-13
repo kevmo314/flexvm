@@ -347,15 +347,16 @@ impl Template {
     /// a file changed since it was last hashed. Never call on the run path.
     pub fn verify(&self, paths: &Paths, rehash: bool) -> Result<()> {
         let cache = &mut self.verified.lock().unwrap();
-        if self.meta.verify(paths, &self.dir, cache, rehash)? {
+        // Through the handle: `dir` may name another template by now.
+        if self.meta.verify(paths, &self.fixed, cache, rehash)? {
             // Record the new stamps so the next daemon on this host need not rehash.
             let mut meta = self.meta.clone();
             for (name, stamp) in cache.iter() {
                 meta.components.get_mut(name).unwrap().metadata = stamp.clone();
             }
-            let tmp = self.dir.join(format!("meta.json.{}", std::process::id()));
+            let tmp = self.fixed.join(format!("meta.json.{}", std::process::id()));
             let _ = std::fs::write(&tmp, serde_json::to_vec_pretty(&meta)?)
-                .and_then(|_| std::fs::rename(&tmp, self.dir.join("meta.json")));
+                .and_then(|_| std::fs::rename(&tmp, self.fixed.join("meta.json")));
         }
         Ok(())
     }
@@ -550,17 +551,22 @@ fn publish(paths: &Paths, name: &str, staged: &Path) -> Result<()> {
     let tmp = paths.templates.join(format!(".{name}.link-{}", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
     std::os::unix::fs::symlink(Path::new(GENERATIONS).join(&meta.id), &tmp)?;
-    // A template from before generations is a plain directory: move it aside first.
-    let legacy = std::fs::symlink_metadata(&live).is_ok_and(|m| m.is_dir());
-    let old = paths.templates.join(format!(".{name}.old-{}", std::process::id()));
-    if legacy {
-        std::fs::rename(&live, &old)?;
+    // A template from before generations is a plain directory: it becomes a
+    // generation itself (suspended VMs and checkpoints may name its content
+    // id), or, without a usable id, is kept aside; never deleted.
+    if std::fs::symlink_metadata(&live).is_ok_and(|m| m.is_dir()) {
+        let id = std::fs::read(live.join("meta.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Meta>(&b).ok())
+            .map(|m| m.id)
+            .filter(|id| !id.is_empty() && !id.contains('/') && !gens.join(id).exists());
+        let aside = match id {
+            Some(id) => gens.join(id),
+            None => gens.join(format!("legacy-{name}-{}", std::process::id())),
+        };
+        std::fs::rename(&live, &aside)?;
     }
     std::fs::rename(&tmp, &live)?;
-    if legacy {
-        // Unlinked files stay valid for the VMs still mapping them.
-        let _ = std::fs::remove_dir_all(&old);
-    }
     Ok(())
 }
 
@@ -727,21 +733,25 @@ mod tests {
             g.sort();
             g
         };
-        // A template from before generations: a plain directory.
+        // A template from before generations: a plain directory, with an id.
         std::fs::create_dir_all(f.dir.join("t")).unwrap();
         std::fs::write(f.dir.join("t/vmstate"), "legacy").unwrap();
+        let old = Meta { id: "l".into(), ..f.meta.clone() };
+        std::fs::write(f.dir.join("t/meta.json"), serde_json::to_vec(&old).unwrap()).unwrap();
         assert_eq!(current(), "legacy");
         publish(&f.paths, "t", &stage("a")).unwrap();
         assert_eq!(current(), "a");
+        // Kept, as the generation of its own content id.
+        assert_eq!(std::fs::read_to_string(f.dir.join(GENERATIONS).join("l/vmstate")).unwrap(), "legacy");
         let a = Template::resolve(&f.paths, "t").unwrap();
         publish(&f.paths, "t", &stage("b")).unwrap();
         assert_eq!(current(), "b");
         // Whoever resolved `a` before the swap still reads a's files.
         assert_eq!(std::fs::read_to_string(a.join("vmstate")).unwrap(), "a");
-        assert_eq!(gens(), ["a", "b"]);
+        assert_eq!(gens(), ["a", "b", "l"]);
         publish(&f.paths, "t", &stage("c")).unwrap();
         assert_eq!(current(), "c");
-        assert_eq!(gens(), ["a", "b", "c"]);
+        assert_eq!(gens(), ["a", "b", "c", "l"]);
         assert_eq!(Template::generation(&f.paths, "a"), Some(f.dir.join(GENERATIONS).join("a")));
         assert_eq!(Template::generation(&f.paths, "x"), None);
     }
