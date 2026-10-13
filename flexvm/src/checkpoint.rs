@@ -128,7 +128,10 @@ fn create_at(dir: RawFd, name: &str) -> io::Result<File> {
 
 /// Opens file `name` in `dir` for reading, never through a symlink.
 fn open_at(dir: RawFd, name: &str) -> io::Result<File> {
-    let fd = unsafe { libc::openat(dir, cname(name).as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+    // O_NONBLOCK: opening a FIFO planted in its place must not block; callers
+    // check it is a regular file, where the flag changes nothing.
+    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+    let fd = unsafe { libc::openat(dir, cname(name).as_ptr(), flags) };
     check(fd)?;
     Ok(unsafe { File::from_raw_fd(fd) })
 }

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::BufReader;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, Shutdown};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -407,31 +407,52 @@ impl Vm {
     }
 
     /// Runs `cmd` in the guest and returns its exit code and (at most 64 KiB
-    /// of) output. Gives up at `deadline`, closing the session.
+    /// of) output. Everything (admission, connecting, the handshake, writing
+    /// the command and every read) ends by `deadline`; the session is closed
+    /// if it does not.
     pub fn sh(&self, cmd: &str, deadline: Instant) -> Result<(i32, String)> {
         const MAX_OUTPUT: usize = 64 << 10;
-        let left = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
-        let (mut g, id) = self.exec(|uds| crate::guest::start_exec(uds, cmd, left))?;
+        let expired = || Instant::now() >= deadline;
+        let (mut g, raw, id) = {
+            let mut execs = loop {
+                match self.execs.try_lock() {
+                    Ok(g) => break g,
+                    Err(std::sync::TryLockError::WouldBlock) if !expired() => std::thread::sleep(Duration::from_millis(1)),
+                    Err(_) => bail!("guest command {cmd:?} timed out waiting to start"),
+                }
+            };
+            if self.state() != State::Running {
+                bail!("vm {} is not running here", self.name);
+            }
+            let left = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
+            let s = crate::util::connect_unix(&self.vsock(), left)?;
+            let raw = s.try_clone()?;
+            let mut g = BufReader::new(Deadline { s, at: deadline });
+            let req = format!("CONNECT {}\nEXEC {}\n{cmd}", crate::guest::PORT, cmd.len());
+            g.get_mut().write_all(req.as_bytes())?;
+            let mut ok = String::new();
+            g.by_ref().take(64).read_line(&mut ok)?;
+            if !ok.starts_with("OK") {
+                bail!("vsock connect refused: {ok:?}");
+            }
+            let id = self.next_exec.fetch_add(1, Ordering::SeqCst);
+            execs.insert(id, raw.try_clone()?);
+            (g, raw, id)
+        };
         let mut out = Vec::new();
-        let res = loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                break Err(format!("guest command timed out: {cmd:?}").into());
-            }
-            if let Err(e) = g.get_ref().set_read_timeout(Some(left)) {
-                break Err(e.into());
-            }
+        let res: Result<i32> = loop {
+            // read_frame bounds the frame size; Deadline bounds every read.
             match crate::guest::read_frame(&mut g) {
                 Ok(Some((crate::guest::FRAME_EXIT, d))) if d.len() >= 4 => {
                     break Ok(i32::from_le_bytes(d[..4].try_into().unwrap()))
                 }
                 Ok(Some((_, d))) => out.extend_from_slice(&d[..d.len().min(MAX_OUTPUT.saturating_sub(out.len()))]),
                 Ok(None) => break Err("guest closed the connection before the command exited".into()),
-                Err(e) => break Err(e),
+                Err(e) => break Err(format!("guest command {cmd:?}: {e}").into()),
             }
         };
         if res.is_err() {
-            let _ = g.get_ref().shutdown(Shutdown::Both);
+            let _ = raw.shutdown(Shutdown::Both);
         }
         self.untrack_exec(id);
         Ok((res?, String::from_utf8_lossy(&out).into_owned()))
@@ -558,5 +579,38 @@ impl Vm {
             "max_mib": self.template.meta.max_mib,
             "pages_mib": {"base": mib(base), "present": mib(present), "zero": mib(zero), "remote": mib(remote + inflight + discarded)},
         })
+    }
+}
+
+/// A stream whose every read and write fails once `at` has passed, however
+/// slowly the other end trickles.
+struct Deadline {
+    s: UnixStream,
+    at: Instant,
+}
+
+impl Deadline {
+    fn left(&self) -> std::io::Result<Duration> {
+        match self.at.saturating_duration_since(Instant::now()) {
+            d if d.is_zero() => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "deadline passed")),
+            d => Ok(d),
+        }
+    }
+}
+
+impl Read for Deadline {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.s.set_read_timeout(Some(self.left()?))?;
+        self.s.read(buf)
+    }
+}
+
+impl Write for Deadline {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.s.set_write_timeout(Some(self.left()?))?;
+        self.s.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }

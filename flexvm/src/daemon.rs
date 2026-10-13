@@ -128,10 +128,8 @@ pub fn run(mut cfg: Config) -> Result<()> {
     let mut run_lock = lock_run_dir(&cfg.run_dir)?;
     // The state dir is this daemon's alone too (another daemon's startup
     // would clear its trees), and must survive a power loss.
-    for sub in ["suspended", "resumed", "trash"] {
-        lifecycle::create_dir_durably(&cfg.state_dir.join(sub))
-            .map_err(|e| format!("state dir {}: {e}", cfg.state_dir.display()))?;
-    }
+    lifecycle::create_dir_durably(&cfg.state_dir.join("suspended"))
+        .map_err(|e| format!("state dir {}: {e}", cfg.state_dir.display()))?;
     cfg.state_dir = cfg.state_dir.canonicalize()?;
     run_lock.extend(lock_run_dir(&cfg.state_dir)?);
     let listener = TcpListener::bind(&cfg.listen)?;
@@ -655,8 +653,11 @@ impl Daemon {
         let vm = self.vm(name)?;
         // Before pausing, so a template mismatch costs no downtime.
         crate::template::preflight(&self.cfg.paths, &vm.template, to)?;
-        // No virtio-mem request may reach the device behind the saved state.
-        vm.settle_hotplug(Instant::now() + SETTLE_WAIT)?;
+        // Before the pause (not part of the downtime): no virtio-mem resize may
+        // still be under way.
+        let settle = Instant::now();
+        vm.settle_hotplug(settle + SETTLE_WAIT)?;
+        let settle = settle.elapsed();
         let mig = migration_id();
         vm.start_source(mig)?;
         let mut t = Phases::new();
@@ -721,6 +722,7 @@ impl Daemon {
             "name": name,
             "to": to,
             "mig": mig,
+            "settle_hotplug_ms": ms(settle),
             "checkpoint_ms": ms(paused),
             "downtime_ms": ms(downtime),
             "rerouted_ms": ms(t.total()),
