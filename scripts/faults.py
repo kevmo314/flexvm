@@ -2113,8 +2113,8 @@ def plug_race():
     makes the first step plug into a slot that was never mapped."""
     n = "ft-plug-race"
     m = setup(n, mib=50, template=os.environ.get("PLUG_TEMPLATE"))
-    # (from, to, MiB to plug, delay before migrating); the last one is more
-    # than the guest can online quickly, so the migration has to cut it short.
+    # (from, to, MiB to plug, delay before migrating); the 12 GiB step and the last one are more
+    # than the guest can online quickly, so the migration has to cut them short.
     steps = [(A, B, 384, 0), (B, A, 1024, 0), (A, B, 2048, 0.05), (B, A, -1024, 0), (A, B, 384, 0.2),
              (B, A, 1024, 0.1), (A, B, 12288, 0), (B, A, None, 0)]
     for i, (src, dst, delta, gap) in enumerate(steps):
@@ -2122,7 +2122,7 @@ def plug_race():
         if delta is None:  # everything: takes the guest longer than a migration waits
             delta = v["max_mib"] - (v["guest_mib"] - v["plugged_mib"]) - v["plugged_mib"]
         want = v["plugged_mib"] + delta
-        ok(src, {"op": "hotplug", "name": n, "mib": want})
+        want = ok(src, {"op": "hotplug", "name": n, "mib": want})  # clamped to the template's hotplug region
         time.sleep(gap)
         r = rpc(src, {"op": "migrate", "name": n, "to": dst})
         check(f"plug race {i}: migrate succeeds", r["ok"], r.get("error"))

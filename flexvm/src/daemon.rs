@@ -729,15 +729,18 @@ impl Daemon {
             "release" => self.release(&name, &req),
             "migration" => self.migration_outcome(&req),
             "fault" => self.inject(&req),
-            // Test hook: set a VM's hotplug size directly, as the controller would.
+            // Test hook: set a VM's hotplug size directly, as the controller
+            // would, clamped to the template's hotplug region. Answers the size set.
             "hotplug" if self.faults.is_some() => self.reserve(&name, "resizing", Duration::from_secs(2)).and_then(|_busy| {
                 let vm = self.vm(&name)?;
-                let mib = req["mib"].as_u64().ok_or("missing mib")?;
+                let meta = &vm.template.meta;
+                let mib = req["mib"].as_u64().ok_or("missing mib")?.min(meta.max_mib - meta.mem_mib);
                 *vm.last_resize.lock().unwrap() = Instant::now();
                 if vm.state() != State::Running {
                     bail!("vm {name} is not running here");
                 }
-                vm.fc(|fc| fc.patch("/hotplug/memory", json!({"requested_size_mib": mib})))
+                vm.fc(|fc| fc.patch("/hotplug/memory", json!({"requested_size_mib": mib})))?;
+                Ok(json!(mib))
             }),
             "route" => self.route(&req),
             "lend_ip" => self.lend_ip(&req),

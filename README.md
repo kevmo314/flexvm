@@ -456,11 +456,19 @@ not wait on the host:
   reads MemTotal, and re-reads it on every reply and retry. If the host answers `full` (at the ceiling), or
   nothing arrives within 3 s, the agent lifts the throttle, and the guest
   behaves as it would without it.
-- **Boot memory for page structs.** Hot-plugged memory is movable, so the
-  page structs of every plugged block (1/64 of it) and all other kernel
-  allocations live in boot memory. A 256 MiB base ran out at ~11 GiB plugged
-  and the guest kernel OOMed. The default base is therefore 256 MiB + 1/32 of
-  the ceiling (1280 MiB on a 32 GiB host); untouched, it costs nothing.
+- **Kernel memory grows with the plug.** The page structs of plugged memory
+  (1/64 of it), page tables and all other kernel allocations need kernel
+  memory; movable memory cannot hold them. The guest onlines hot-plugged
+  blocks with the kernel's `auto-movable` policy (ratio 20:1): movable while
+  there is at least 1/20 as much kernel memory (boot memory plus hot-plugged
+  kernel blocks), otherwise as kernel memory. When every block went movable,
+  kernel memory was boot memory only: a 256 MiB base ran out at ~13 GiB
+  plugged and the guest panicked ("System is deadlocked on memory", #97).
+  Now a 256 MiB guest grows to the full ceiling. The default base is still
+  256 MiB + 1/32 of the ceiling (1280 MiB on a 32 GiB host; untouched, it
+  costs nothing), so such a guest's first ~24 GiB stay movable. Unplug takes
+  movable blocks first; kernel blocks may not unplug, but their free pages
+  go back through free page reporting like any other.
 - **Shrinking** is free page reporting (freed pages go back within seconds,
   plugged or not), plus unplugging memory above the template's plug once a
   guest has had more than three times its headroom free for 10 s.
