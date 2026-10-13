@@ -1,5 +1,6 @@
 //! A Firecracker process and a minimal client for its HTTP-over-UDS API.
 
+use std::cell::RefCell;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::net::UnixStream;
@@ -23,8 +24,8 @@ pub const SPAWN_READY: Duration = Duration::from_secs(5);
 pub const API_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A request that never reached Firecracker: its API socket would not take
-/// a connection (it is dead, say). Any other failure, an error answer
-/// included, may come after Firecracker acted on some of it.
+/// a connection, or a write failed before sending any bytes. Any other
+/// failure, an error answer included, may come after Firecracker acted on it.
 #[derive(Debug)]
 pub struct NotSent(String);
 
@@ -44,6 +45,7 @@ pub fn not_sent(e: &crate::util::Error) -> bool {
 pub struct Firecracker {
     child: Child,
     pub sockets: Sockets,
+    api: Api,
 }
 
 impl Firecracker {
@@ -61,7 +63,7 @@ impl Firecracker {
             .stdout(log.try_clone()?)
             .stderr(log)
             .spawn()?;
-        let fc = Firecracker { child, sockets };
+        let fc = Firecracker { child, sockets, api: Api::default() };
         retry(ready, || Ok(UnixStream::connect(&fc.sockets.api)?))?;
         Ok(fc)
     }
@@ -97,55 +99,7 @@ impl Firecracker {
 
     /// `request`, all of it (connecting, writing, every read) within `timeout`.
     pub fn request_within(&self, method: &str, path: &str, body: Option<Value>, timeout: Duration) -> Result<Value> {
-        if timeout.is_zero() {
-            bail!("firecracker {method} {path}: out of time");
-        }
-        let at = std::time::Instant::now() + timeout;
-        let s = crate::util::connect_unix(&self.sockets.api, timeout)
-            .map_err(|e| Box::new(NotSent(format!("firecracker {method} {path}: cannot connect: {e}"))))?;
-        self.send(crate::util::By { s, at }, method, path, body)
-    }
-
-    fn send(&self, mut stream: crate::util::By<UnixStream>, method: &str, path: &str, body: Option<Value>) -> Result<Value> {
-        let body = body.map(|b| b.to_string()).unwrap_or_default();
-        // One write, so Firecracker's API thread wakes once per request.
-        let req = format!(
-            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\n\
-             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-            body.len()
-        );
-        stream.write_all(req.as_bytes())?;
-        let mut r = BufReader::new(stream);
-        let mut status = String::new();
-        r.read_line(&mut status)?;
-        let code: u16 = status.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
-        let mut len = 0usize;
-        loop {
-            let mut h = String::new();
-            r.read_line(&mut h)?;
-            let h = h.trim_end();
-            if h.is_empty() {
-                break;
-            }
-            if let Some((k, v)) = h.split_once(':') {
-                if k.eq_ignore_ascii_case("content-length") {
-                    len = v.trim().parse().unwrap_or(0);
-                }
-            }
-        }
-        let mut buf = vec![0u8; len];
-        r.read_exact(&mut buf)?;
-        let text = String::from_utf8_lossy(&buf);
-        if code == 0 {
-            bail!("firecracker {method} {path}: no status in the answer");
-        }
-        if !(200..300).contains(&code) {
-            bail!("firecracker {method} {path}: {code} {text}");
-        }
-        if text.trim().is_empty() {
-            return Ok(Value::Null);
-        }
-        Ok(serde_json::from_str(&text).unwrap_or(Value::String(text.into_owned())))
+        self.api.request(&self.sockets.api, method, path, body, timeout)
     }
 
     /// Whether the process is still running (it has not exited or been killed).
@@ -168,10 +122,136 @@ impl Firecracker {
     }
 
     pub fn kill(&mut self) {
+        self.api.connection.get_mut().take();
         let _ = self.child.kill();
         let _ = self.child.wait();
         self.sockets.cleanup();
     }
+}
+
+/// Calls on a VM hold its `fc` mutex; standalone/pooled Firecrackers have
+/// one owner. Keep the reader too, so any buffered bytes stay with the socket.
+#[derive(Default)]
+struct Api {
+    connection: RefCell<Option<BufReader<crate::util::By<UnixStream>>>>,
+}
+
+impl Api {
+    fn request(&self, socket: &Path, method: &str, path: &str, body: Option<Value>, timeout: Duration) -> Result<Value> {
+        let at = std::time::Instant::now() + timeout;
+        let body = body.map(|b| b.to_string()).unwrap_or_default();
+        let req = format!(
+            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        // At most two tries: a cached connection Firecracker has since closed
+        // fails the write before a byte goes out; then one fresh connection.
+        loop {
+            let cached = self.connection.borrow_mut().take();
+            let reused = cached.is_some();
+            let mut r = match cached {
+                Some(mut r) => {
+                    r.get_mut().at = at;
+                    r
+                }
+                None => {
+                    let left = at.saturating_duration_since(std::time::Instant::now());
+                    let s = if left.is_zero() {
+                        Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "deadline passed"))
+                    } else {
+                        crate::util::connect_unix(socket, left)
+                    };
+                    match s {
+                        Ok(s) => BufReader::new(crate::util::By { s, at }),
+                        Err(e) => return Err(Box::new(NotSent(format!("firecracker {method} {path}: cannot connect: {e}")))),
+                    }
+                }
+            };
+            let mut sent = false;
+            let (code, buf, close) = match exchange(&mut r, req.as_bytes(), &mut sent) {
+                Ok(response) => response,
+                Err(_) if !sent && reused => continue,
+                Err(e) if !sent => return Err(Box::new(NotSent(format!("firecracker {method} {path}: {e}")))),
+                Err(e) => return Err(e),
+            };
+            // Bytes past the answer were never asked for: the stream is not
+            // in step any more.
+            if !close && r.buffer().is_empty() {
+                *self.connection.borrow_mut() = Some(r);
+            }
+            let text = String::from_utf8_lossy(&buf);
+            if !(200..300).contains(&code) {
+                bail!("firecracker {method} {path}: {code} {text}");
+            }
+            return if text.trim().is_empty() {
+                Ok(Value::Null)
+            } else {
+                Ok(serde_json::from_str(&text).unwrap_or(Value::String(text.into_owned())))
+            };
+        }
+    }
+}
+
+fn exchange(r: &mut BufReader<crate::util::By<UnixStream>>, mut req: &[u8], sent: &mut bool) -> Result<(u16, Vec<u8>, bool)> {
+    // Usually one write. A partial write means the request may have reached
+    // Firecracker, even if a later write or read fails: never replay it.
+    while !req.is_empty() {
+        match r.get_mut().write(req) {
+            Ok(0) => return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "firecracker request write returned zero").into()),
+            Ok(n) => {
+                *sent = true;
+                req = &req[n..];
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let mut status = String::new();
+    r.read_line(&mut status)?;
+    let code: u16 = status.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+    if code == 0 || !status.ends_with("\r\n") {
+        bail!("firecracker: invalid response status");
+    }
+    let mut len = None;
+    let mut close = false;
+    loop {
+        let mut h = String::new();
+        r.read_line(&mut h)?;
+        if !h.ends_with("\r\n") {
+            bail!("firecracker: incomplete response headers");
+        }
+        if h == "\r\n" {
+            break;
+        }
+        let Some((k, v)) = h.trim_end().split_once(':') else {
+            bail!("firecracker: invalid response header");
+        };
+        if k.eq_ignore_ascii_case("content-length") {
+            let n: usize = v.trim().parse()?;
+            if len.is_some_and(|previous| previous != n) {
+                bail!("firecracker: conflicting content lengths");
+            }
+            len = Some(n);
+        } else if k.eq_ignore_ascii_case("connection") {
+            close |= v.split(',').any(|v| v.trim().eq_ignore_ascii_case("close"));
+        } else if k.eq_ignore_ascii_case("transfer-encoding") {
+            bail!("firecracker: unsupported transfer encoding");
+        }
+    }
+    // micro_http omits Content-Length for 204 responses. Other responses
+    // must declare their length; reading to EOF would lose keep-alive.
+    let len = if code == 204 || code == 304 {
+        if code == 204 && len.is_some_and(|n| n != 0) {
+            bail!("firecracker: nonzero content length for 204");
+        }
+        0
+    } else {
+        len.ok_or("firecracker: missing content length")?
+    };
+    let mut buf = vec![0; len];
+    r.read_exact(&mut buf)?;
+    Ok((code, buf, close))
 }
 
 /// Reads at most the last 64 KiB, dropping the first partial line when
@@ -394,6 +474,212 @@ impl Pool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::os::unix::net::UnixListener;
+
+    struct Server {
+        path: PathBuf,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    impl Server {
+        fn new(f: impl FnOnce(UnixListener) + Send + 'static) -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!("flexvm-api-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+            let listener = UnixListener::bind(&path).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            Self { path, thread: Some(std::thread::spawn(move || f(listener))) }
+        }
+    }
+
+    impl Drop for Server {
+        fn drop(&mut self) {
+            self.thread.take().unwrap().join().unwrap();
+            std::fs::remove_file(&self.path).unwrap();
+        }
+    }
+
+    fn accept(listener: &UnixListener) -> BufReader<UnixStream> {
+        let s = retry(Duration::from_secs(2), || Ok(listener.accept()?.0)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        s.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+        BufReader::new(s)
+    }
+
+    fn read_request(r: &mut BufReader<UnixStream>) {
+        let mut line = String::new();
+        r.read_line(&mut line).unwrap();
+        assert!(line.ends_with("HTTP/1.1\r\n"));
+        let mut len = 0;
+        loop {
+            line.clear();
+            r.read_line(&mut line).unwrap();
+            assert!(line.ends_with("\r\n"));
+            if line == "\r\n" {
+                break;
+            }
+            if let Some(v) = line.strip_prefix("Content-Length:") {
+                len = v.trim().parse().unwrap();
+            }
+        }
+        r.read_exact(&mut vec![0; len]).unwrap();
+    }
+
+    fn call(api: &Api, socket: &Path) -> Result<Value> {
+        api.request(socket, "PATCH", "/vm", Some(serde_json::json!({"state": "Resumed"})), Duration::from_secs(1))
+    }
+
+    #[test]
+    fn api_reuses_connection_and_reads_exact_bodies() {
+        let server = Server::new(|listener| {
+            let mut r = accept(&listener);
+            read_request(&mut r);
+            // A non-success answer also has to be fully consumed and cached.
+            r.get_mut().write_all(b"HTTP/1.1 400 Bad Request\r\ncontent-length: 7\r\n\r\n{\"n\":1}").unwrap();
+            read_request(&mut r);
+            r.get_mut().write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\n{\"n\":2}").unwrap();
+            assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+        });
+        let api = Api::default();
+        assert!(call(&api, &server.path).unwrap_err().to_string().contains("400"));
+        assert_eq!(call(&api, &server.path).unwrap(), serde_json::json!({"n": 2}));
+    }
+
+    #[test]
+    fn api_reconnects_after_unsent_write_on_closed_connection() {
+        let (closed, wait) = std::sync::mpsc::channel();
+        let server = Server::new(move |listener| {
+            let mut r = accept(&listener);
+            read_request(&mut r);
+            r.get_mut().write_all(b"HTTP/1.1 204 No Content\r\n\r\n").unwrap();
+            drop(r);
+            closed.send(()).unwrap();
+            let mut r = accept(&listener);
+            read_request(&mut r);
+            r.get_mut().write_all(b"HTTP/1.1 204 No Content\r\n\r\n").unwrap();
+        });
+        let api = Api::default();
+        assert_eq!(call(&api, &server.path).unwrap(), Value::Null);
+        wait.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(call(&api, &server.path).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn api_honors_connection_close() {
+        let server = Server::new(|listener| {
+            let mut r = accept(&listener);
+            read_request(&mut r);
+            r.get_mut().write_all(b"HTTP/1.1 200 OK\r\ncOnNeCtIoN: keep-alive, Close\r\nContent-Length: 4\r\n\r\nnull").unwrap();
+            // Keep the old socket open: the header alone must force a new one.
+            let mut fresh = accept(&listener);
+            read_request(&mut fresh);
+            fresh.get_mut().write_all(b"HTTP/1.1 204 No Content\r\n\r\n").unwrap();
+        });
+        let api = Api::default();
+        call(&api, &server.path).unwrap();
+        assert!(api.connection.borrow().is_none());
+        call(&api, &server.path).unwrap();
+    }
+
+    #[test]
+    fn api_does_not_replay_a_request_with_a_lost_response() {
+        let server = Server::new(|listener| {
+            let mut r = accept(&listener);
+            read_request(&mut r);
+            drop(r);
+            let mut r = accept(&listener);
+            // This is the caller's next request, not a replay of the failed one.
+            read_request(&mut r);
+            r.get_mut().write_all(b"HTTP/1.1 204 No Content\r\n\r\n").unwrap();
+        });
+        let api = Api::default();
+        let e = call(&api, &server.path).unwrap_err();
+        assert!(!not_sent(&e));
+        assert!(api.connection.borrow().is_none());
+        call(&api, &server.path).unwrap();
+    }
+
+    #[test]
+    fn api_stalled_response_keeps_one_deadline_and_drops_connection() {
+        for response in [
+            &b""[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length:"[..],
+        ] {
+            let server = Server::new(move |listener| {
+                let mut r = accept(&listener);
+                read_request(&mut r);
+                std::thread::sleep(Duration::from_millis(30));
+                r.get_mut().write_all(response).unwrap();
+                std::thread::sleep(Duration::from_millis(150));
+                assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+            });
+            let api = Api::default();
+            let start = std::time::Instant::now();
+            let e = api.request(&server.path, "GET", "/vm", None, Duration::from_millis(60)).unwrap_err();
+            assert!(!not_sent(&e));
+            assert!(start.elapsed() < Duration::from_millis(150));
+            assert!(api.connection.borrow().is_none());
+        }
+    }
+
+    #[test]
+    fn api_rejects_bad_framing_and_truncated_bodies() {
+        for response in [
+            &b"HTTP/1.1 204 No Content\r\nContent-Length: 2\r\n\r\nxx"[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length: wrong\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 3\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nx"[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nTransfer-Encoding: chunked\r\n\r\n"[..],
+        ] {
+            let server = Server::new(move |listener| {
+                let mut r = accept(&listener);
+                read_request(&mut r);
+                r.get_mut().write_all(response).unwrap();
+            });
+            let api = Api::default();
+            assert!(!not_sent(&call(&api, &server.path).unwrap_err()));
+            assert!(api.connection.borrow().is_none());
+        }
+    }
+
+    #[test]
+    fn api_drops_a_connection_with_unrequested_bytes() {
+        let server = Server::new(|listener| {
+            let mut r = accept(&listener);
+            read_request(&mut r);
+            r.get_mut().write_all(b"HTTP/1.1 204 No Content\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n").unwrap();
+            let mut fresh = accept(&listener);
+            read_request(&mut fresh);
+            fresh.get_mut().write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n2").unwrap();
+        });
+        let api = Api::default();
+        call(&api, &server.path).unwrap();
+        assert!(api.connection.borrow().is_none());
+        assert_eq!(call(&api, &server.path).unwrap(), serde_json::json!(2));
+    }
+
+    #[test]
+    fn api_does_not_retry_a_fresh_connection() {
+        let server = Server::new(|listener| {
+            // Closed before reading: the request may or may not have gone out,
+            // but a fresh connection is never tried twice.
+            drop(accept(&listener));
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+        });
+        let api = Api::default();
+        assert!(call(&api, &server.path).is_err());
+    }
+
+    #[test]
+    fn api_connect_failure_and_expired_deadline_are_not_sent() {
+        let api = Api::default();
+        let missing = Path::new("/no-flexvm-api/socket");
+        assert!(not_sent(&call(&api, missing).unwrap_err()));
+        assert!(not_sent(&api.request(missing, "GET", "/vm", None, Duration::ZERO).unwrap_err()));
+    }
 
     struct Counted<R> {
         inner: R,

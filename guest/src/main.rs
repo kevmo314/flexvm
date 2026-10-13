@@ -209,6 +209,16 @@ fn wait_pid(statuses: &Statuses, pid: i32) -> i32 {
     }
 }
 
+/// Delay consecutive accept failures without spinning under resource pressure.
+fn accept_delay(backoff: &mut Duration) -> Duration {
+    *backoff = if backoff.is_zero() {
+        Duration::from_millis(10)
+    } else {
+        (*backoff * 2).min(Duration::from_secs(1))
+    };
+    *backoff
+}
+
 fn serve(statuses: Statuses) -> io::Result<()> {
     let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
     if fd < 0 {
@@ -233,11 +243,21 @@ fn serve(statuses: Statuses) -> io::Result<()> {
             session::cleanup(&sessions);
         });
     }
+    let mut backoff = Duration::ZERO;
     loop {
         let conn = unsafe { libc::accept4(fd.as_raw_fd(), std::ptr::null_mut(), std::ptr::null_mut(), libc::SOCK_CLOEXEC) };
         if conn < 0 {
+            let e = io::Error::last_os_error();
+            // A client gone before accept, or a signal, says nothing about resources.
+            if !matches!(e.kind(), io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted) {
+                if backoff.is_zero() {
+                    eprintln!("vsock accept failed: {e}; backing off");
+                }
+                thread::sleep(accept_delay(&mut backoff));
+            }
             continue;
         }
+        backoff = Duration::ZERO;
         let stream = unsafe { std::fs::File::from_raw_fd(conn as RawFd) };
         // The host sends its request with the connection; don't let a silent one stall accepting.
         receive_timeout(conn, Duration::from_secs(1));
@@ -565,6 +585,16 @@ fn pump(mut r: impl Read + Send + 'static, out: Arc<Mutex<std::fs::File>>, kind:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backoff_grows_caps_and_resets() {
+        let mut backoff = Duration::ZERO;
+        for ms in [10, 20, 40, 80, 160, 320, 640, 1000, 1000] {
+            assert_eq!(accept_delay(&mut backoff), Duration::from_millis(ms));
+        }
+        backoff = Duration::ZERO;
+        assert_eq!(accept_delay(&mut backoff), Duration::from_millis(10));
+    }
 
     #[test]
     fn body_lengths() {

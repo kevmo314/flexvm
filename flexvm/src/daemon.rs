@@ -308,8 +308,24 @@ pub fn run(mut cfg: Config) -> Result<()> {
             }
         });
     }
+    let mut backoff = Duration::ZERO;
     for conn in listener.incoming() {
-        let Ok(conn) = conn else { continue };
+        let conn = match conn {
+            Ok(conn) => {
+                backoff = Duration::ZERO;
+                conn
+            }
+            Err(e) => {
+                // A client gone before accept, or a signal, says nothing about resources.
+                if !matches!(e.kind(), std::io::ErrorKind::Interrupted | std::io::ErrorKind::ConnectionAborted) {
+                    if backoff.is_zero() {
+                        eprintln!("daemon accept failed: {e}; backing off");
+                    }
+                    thread::sleep(accept_delay(&mut backoff));
+                }
+                continue;
+            }
+        };
         let d = d.clone();
         thread::spawn(move || {
             let _ = conn.set_nodelay(true);
@@ -319,6 +335,16 @@ pub fn run(mut cfg: Config) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// Delay consecutive accept failures without spinning under resource pressure.
+fn accept_delay(backoff: &mut Duration) -> Duration {
+    *backoff = if backoff.is_zero() {
+        Duration::from_millis(10)
+    } else {
+        (*backoff * 2).min(Duration::from_secs(1))
+    };
+    *backoff
 }
 
 /// Claims `run_dir` for this daemon's lifetime: an exclusive lock on it and
@@ -2347,6 +2373,16 @@ impl Drop for IpClaim<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backoff_grows_caps_and_resets() {
+        let mut backoff = Duration::ZERO;
+        for ms in [10, 20, 40, 80, 160, 320, 640, 1000, 1000] {
+            assert_eq!(accept_delay(&mut backoff), Duration::from_millis(ms));
+        }
+        backoff = Duration::ZERO;
+        assert_eq!(accept_delay(&mut backoff), Duration::from_millis(10));
+    }
 
     /// Every fault the code checks can be armed (and nothing else can).
     #[test]
