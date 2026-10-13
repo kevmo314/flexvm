@@ -285,41 +285,6 @@ fn create_dir_durably_mode(dir: &std::path::Path, mode: u32) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::os::unix::fs::PermissionsExt;
-
-    #[test]
-    fn json_line_limit_bounds_consumption() {
-        let mut input = io::Cursor::new(vec![b' '; MAX_LINE as usize + 100]);
-        assert!(recv_json(&mut input).unwrap_err().to_string().contains("exceeds"));
-        assert_eq!(input.position(), MAX_LINE);
-        let mut line = vec![b' '; MAX_LINE as usize - 2];
-        line.extend_from_slice(b"0\n1\n");
-        let mut input = io::Cursor::new(line);
-        assert_eq!(recv_json(&mut input).unwrap(), Some(0.into()));
-        assert_eq!(recv_json(&mut input).unwrap(), Some(1.into()));
-        assert!(recv_json(&mut input).unwrap().is_none());
-        // Callers that expect more (migration headers) raise the limit.
-        let mut line = vec![b' '; MAX_LINE as usize + 100];
-        line.extend_from_slice(b"2\n");
-        assert_eq!(recv_json_max(&mut io::Cursor::new(line), 2 * MAX_LINE).unwrap(), Some(2.into()));
-    }
-
-    #[test]
-    fn state_and_suspended_directories_are_private() {
-        let root = std::env::temp_dir().join(format!("flexvm-private-{}", std::process::id()));
-        let dir = root.join("state/suspended");
-        create_private_dir_durably(&dir).unwrap();
-        for path in [&root, &root.join("state"), &dir] {
-            assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o700);
-        }
-        create_private_dir_durably(&dir).unwrap();
-        std::fs::remove_dir_all(root).unwrap();
-    }
-}
-
 /// Sends `line` (one JSON request line) on `s` with `fds` attached.
 pub fn send_with_fds(s: &UnixStream, line: &[u8], fds: &[RawFd]) -> io::Result<()> {
     let mut iov = libc::iovec { iov_base: line.as_ptr() as *mut libc::c_void, iov_len: line.len() };
@@ -418,4 +383,39 @@ pub fn wait_signal(set: &libc::sigset_t) -> i32 {
     let mut sig = 0;
     while unsafe { libc::sigwait(set, &mut sig) } != 0 {}
     sig
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn json_line_limit_bounds_consumption() {
+        let mut input = io::Cursor::new(vec![b' '; MAX_LINE as usize + 100]);
+        assert!(recv_json(&mut input).unwrap_err().to_string().contains("exceeds"));
+        assert_eq!(input.position(), MAX_LINE);
+        let mut line = vec![b' '; MAX_LINE as usize - 2];
+        line.extend_from_slice(b"0\n1\n");
+        let mut input = io::Cursor::new(line);
+        assert_eq!(recv_json(&mut input).unwrap(), Some(0.into()));
+        assert_eq!(recv_json(&mut input).unwrap(), Some(1.into()));
+        assert!(recv_json(&mut input).unwrap().is_none());
+        // Callers that expect more (migration headers) raise the limit.
+        let mut line = vec![b' '; MAX_LINE as usize + 100];
+        line.extend_from_slice(b"2\n");
+        assert_eq!(recv_json_max(&mut io::Cursor::new(line), 2 * MAX_LINE).unwrap(), Some(2.into()));
+    }
+
+    #[test]
+    fn state_and_suspended_directories_are_private() {
+        let root = std::env::temp_dir().join(format!("flexvm-private-{}", std::process::id()));
+        let dir = root.join("state/suspended");
+        create_private_dir_durably(&dir).unwrap();
+        for path in [&root, &root.join("state"), &dir] {
+            assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o700);
+        }
+        create_private_dir_durably(&dir).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

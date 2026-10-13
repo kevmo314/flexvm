@@ -454,7 +454,10 @@ impl Proc {
             libc::SIGCONT => self.resume().map(drop),
             // A migration source goes once its target has the memory; a
             // target still pulling is suspended once it has it all (`save`).
-            libc::SIGTERM if matches!(vm.state(), State::Source(_)) => Ok(eprintln!("vm {}: migrating away; it ends once the target has its memory", vm.name)),
+            libc::SIGTERM if matches!(vm.state(), State::Source(_)) => {
+                eprintln!("vm {}: migrating away; it ends once the target has its memory", vm.name);
+                Ok(())
+            }
             libc::SIGTERM => match self.suspend() {
                 Ok(v) => {
                     eprintln!("{v}");
