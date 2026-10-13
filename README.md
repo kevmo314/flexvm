@@ -176,7 +176,8 @@ of `pages` against its CRC32C as it reads it. A bad page kills the VM
 rather than letting it run on wrong memory. The checksums catch corruption,
 not deliberate tampering.
 
-The writer makes one pass over each page and one copy of it. Up to 12
+The writer copies each page once and reads it once more to checksum it and
+check it for zeroes (plus a template compare where the template has data). Up to 12
 threads take 1 MiB units of PRESENT pages in turn. A thread copies its unit
 out of Firecracker with `process_vm_readv`, compares each page with the
 template (only where the template has data) and computes its CRC32C and

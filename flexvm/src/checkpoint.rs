@@ -24,8 +24,9 @@
 //!
 //! The writer splits the PRESENT pages into units of `UNIT` pages that
 //! `writer_threads` threads take in turn. A thread copies its unit out of
-//! Firecracker (the one copy), classifies and checksums each page in a
-//! single pass, reserves room in `pages` for the unit's DATA pages and
+//! Firecracker (the one copy), checksums each page in the same pass that
+//! checks it for zeroes (pages where the template has data are compared
+//! with it first), reserves room in `pages` for the unit's DATA pages and
 //! writes them there straight from its buffer with O_DIRECT. Units take
 //! their place in `pages` as they finish, so no thread waits for another;
 //! the page map records where each run went. `pages` is preallocated before
@@ -415,7 +416,8 @@ impl GuestPages for Pager {
 fn writer_threads() -> usize {
     let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
     let n = std::env::var("FLEXVM_CKPT_THREADS").ok().and_then(|v| v.parse().ok());
-    n.unwrap_or(cpus.min(MAX_WRITERS)).max(1)
+    // The override is for benchmarking; keep it bounded either way.
+    n.unwrap_or(cpus).clamp(1, MAX_WRITERS)
 }
 
 /// What `write_pages` wrote: the page map, DATA and ZERO page counts and
@@ -594,8 +596,22 @@ fn write_pages(template: &Template, src: &dyn GuestPages, runs: &Runs, out: &Pag
     };
     let threads = threads.min(units.len()).max(1);
     std::thread::scope(|s| {
-        let handles: Vec<_> = (0..threads).map(|_| s.spawn(|| work().inspect_err(|_| failed.store(true, Ordering::Relaxed)))).collect();
-        handles.into_iter().try_for_each(|h| h.join().unwrap())
+        // A failed spawn must not panic (panic = abort with the VM paused):
+        // stop the workers already running and report it.
+        let mut handles = Vec::with_capacity(threads);
+        let mut spawned: crate::util::Result<()> = Ok(());
+        for _ in 0..threads {
+            match std::thread::Builder::new().spawn_scoped(s, || work().inspect_err(|_| failed.store(true, Ordering::Relaxed))) {
+                Ok(h) => handles.push(h),
+                Err(e) => {
+                    failed.store(true, Ordering::Relaxed);
+                    spawned = Err(e.into());
+                    break;
+                }
+            }
+        }
+        let joined = handles.into_iter().try_for_each(|h| h.join().unwrap());
+        spawned.and(joined)
     })?;
     // The page map, in page order: discarded runs and units interleave.
     let data = placed.into_inner();
