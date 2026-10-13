@@ -1504,6 +1504,45 @@ def fc_prepare():
     run("config", config_between)
 
 
+def slow_preload():
+    """The pages preloaded with the vmstate arrive late (`slow_preload`): the
+    target's load goes ahead (fetching what it needs itself), but it commits
+    and answers only once they are all in, and the held packets still follow
+    its answer on the same connection, in order."""
+    n = "ft-slow-preload"
+    m = setup(n)
+    ip = vms(A)[n]["ip"]
+    stop = threading.Event()
+
+    def flood():
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        while not stop.is_set():
+            try:
+                s.sendto(b"x" * 64, (ip, 9))
+            except OSError:
+                pass
+            time.sleep(0.0005)
+
+    t = threading.Thread(target=flood, daemon=True)
+    t.start()
+    time.sleep(0.2)
+    fault(A, "slow_preload", 10000)
+    r = rpc(A, {"op": "migrate", "name": n, "to": B})
+    fault(A, "slow_preload", 0)
+    stop.set()
+    t.join()
+    check("slow preload: migrated", r["ok"], r)
+    res = r.get("result", {})
+    check("slow preload: committed only after the late pages", res.get("downtime_ms", 0) >= 300, res.get("downtime_ms"))
+    held = res.get("held") or {}
+    check("slow preload: held packets followed the answer intact",
+          held.get("packets", 0) > 0 and held.get("injected") == held.get("packets") and held.get("dropped_target") == 0, held)
+    st = wait_released(B, n)
+    check("slow preload: released, only on B", st["released"] is True and where(n) == {B: "running"}, (st, where(n)))
+    check("slow preload: md5 intact", md5(B, n) == m)
+    cleanup(n)
+
+
 SCENARIOS = dict(basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, refused=refused, pages_blip=pages_blip,
                  pages_dead_restore=pages_dead_restore, pages_dead=pages_dead, quiet_source=quiet_source,
                  shared_run_dir=shared_run_dir, exec_race=exec_race, source_killed=source_killed,
@@ -1516,7 +1555,8 @@ SCENARIOS = dict(basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, r
                  cow_exact=cow_exact, cow_abort=cow_abort, cow_crash=cow_crash, cow_reports_held=cow_reports_held, ckpt_incremental=ckpt_incremental,
                  ckpt_failed_stop=ckpt_failed_stop, ckpt_rearm=ckpt_rearm,
                  ckpt_dir_moved=ckpt_dir_moved, prepare_disconnect=prepare_disconnect,
-                 prepare_trickle=prepare_trickle, prepare_fail=prepare_fail, fc_prepare=fc_prepare)
+                 prepare_trickle=prepare_trickle, prepare_fail=prepare_fail, fc_prepare=fc_prepare,
+                 slow_preload=slow_preload)
 safe = [s for s in SCENARIOS
         if s not in ("source_killed", "target_restart", "target_restart_symlink", "checkpoint_crash", "cow_crash",
                      "suspend_resume")]
