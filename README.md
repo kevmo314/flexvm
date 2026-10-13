@@ -825,10 +825,12 @@ firecracker/        patches on top of Firecracker v1.17.0
   kept for migration targets.
 - **vsock connections reset on migration.** `flexvm exec` reconnects for up
   to 30 seconds, trying the original daemon and its peers. Guest commands keep
-  running; each session retains up to 4 MiB of recent output (at most 4096 chunks).
-  Output waits for an attached client, and for 30 seconds after it drops; past
-  that the buffer wraps and exec reports output loss explicitly. Finished sessions
-  retain their exit until CLOSE or a five-minute expiry. The daemon's own
+  running; each session retains up to 4 MiB of recent output. Output waits for
+  the attached client, and for 30 seconds after it drops, rather than overwrite
+  anything not yet sent to it; past that the buffer wraps and exec reports output
+  loss explicitly. A finished session keeps its output and exit until the CLI
+  acknowledges it, or until its client has been gone for a minute (see below).
+  The daemon's own
   guest requests (`START`/`NET`, `PING`, `CLOCK`) go again when their
   connection is refused or drops before an answer, all I/O within one
   deadline (5 s; 2 s for a ping; `info` counts the retries): the agent
@@ -891,7 +893,9 @@ from offset zero. Reusing an ID for another command fails. IDs contain up to
 64 ASCII letters, digits, underscores or hyphens; commands are at most 1 MiB.
 
 Frames retain `[kind u8][payload length u32 LE][payload]`. SESSION and ATTACH
-first return kind 4 with the session ID. Session stdout/stderr (kinds 1/2)
+first return kind 4 with the session ID. A session has at most one attachment
+(connection streaming its output): SESSION or ATTACH replaces it, and the guest
+shuts the previous connection down, so its stream just ends. Session stdout/stderr (kinds 1/2)
 prefix their bytes with an absolute `u64 LE` offset in the combined output
 stream. Kind 3 contains the final `u64 LE` offset and `i32 LE` exit code.
 Kind 5 contains the earliest retained `u64 LE` offset and reports output loss;
@@ -903,12 +907,24 @@ so a delayed creation retry cannot execute the command again.
 
 At most 64 sessions are live (running, or finished and not yet closed); another
 SESSION fails with `error: too many sessions: ...`. A finished session whose
-client has been gone for a minute is closed by the guest. Tombstones are small
-records outside that limit: they expire after five minutes, and beyond 4096 the
-oldest one (if at least 30 s old) is dropped. Each live session's output ring
-keeps 128 KiB and grows towards 4 MiB from a shared pool, so all rings together
-hold at most 64 MiB; when the pool is spent, rings stop growing, a detached
-client may then see kind 5 sooner, and an attached one sees backpressure.
+client has been gone for a minute is closed by the guest (checked every minute,
+and whenever the limit is reached), its output freed. Closed sessions leave
+tombstones: small records outside that limit that expire five minutes after the
+close, and beyond 4096 the oldest one (if at least 30 s old) is dropped. Each
+live session's output ring keeps 128 KiB and grows towards 4 MiB from a shared
+pool, so all rings together hold at most 64 MiB; when the pool is spent, rings
+stop growing, and a detached client may then see kind 5 sooner.
+
+Backpressure: while a client is attached, and for 30 s after it drops, the
+command's output waits (its pipe fills and the command blocks) once half the
+ring is unsent to the latest attachment's offset, so nothing past that offset
+is overwritten. Consecutive output of one kind is stored in blocks of up to
+16 KiB however small the command's writes; a ring holds at most 4096 blocks,
+and output also waits once 2048 of them are unsent (output alternating between
+stdout and stderr in tiny writes), so that limit never drops unsent output
+either. Only the latest attachment's offset holds output back: a replaced
+client reattaching later gets kind 5 if its offset has meanwhile been
+overwritten.
 
 The daemon JSON exec request adds `session`, `action` (`start`, `attach`, or
 `close`), and `offset`; start also supplies `cmd`. Start/attach return the usual

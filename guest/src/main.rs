@@ -292,7 +292,15 @@ fn serve(statuses: Statuses) -> io::Result<()> {
                 // A blocked write is backpressure from a slow client; migration resets the socket.
                 if matches!(line.split_whitespace().next(), Some("SESSION" | "ATTACH" | "CLOSE")) {
                     let body = body.unwrap_or_default();
-                    let _ = session::handle(stream, body.as_slice(), &line, &sessions, &statuses);
+                    // Kept by the session, so that a later ATTACH can shut this one down.
+                    match stream.try_clone() {
+                        Ok(conn) => {
+                            let _ = session::handle(stream, body.as_slice(), Some(conn), &line, &sessions, &statuses);
+                        }
+                        Err(e) => {
+                            let _ = write_frame(&mut &stream, FRAME_MSG, format!("error: {e}").as_bytes());
+                        }
+                    }
                 } else {
                     let _ = handle(stream, body, &line, &statuses);
                 }
