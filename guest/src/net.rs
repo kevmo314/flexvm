@@ -150,7 +150,8 @@ pub fn configure(ip: Ipv4Addr, dns: Option<&str>) -> io::Result<()> {
         a[2..4].copy_from_slice(&kind.to_ne_bytes());
         a[4..].copy_from_slice(&ip.octets());
     }
-    let mut ack = [0u8; 64];
+    // An error ACK carries the request back (and may carry extended attributes).
+    let mut ack = [0u8; 1024];
     if unsafe { libc::send(fd, msg.as_ptr().cast(), msg.len(), 0) } < 0 {
         return Err(io::Error::last_os_error());
     }
