@@ -255,9 +255,14 @@ impl Holder {
     }
 
     /// Hands `e`'s queue to `sink`; then, once the reader has got past what
-    /// is in the device now (or by `end`), what that added.
+    /// is in the device now (or by `end`), what that added. Gives up at
+    /// `end` (checked between batches) however fast packets arrive: what is
+    /// left stays queued, for the caller to count.
     fn drain(&self, e: &Entry, sink: &mut dyn FnMut(&[u8]) -> bool, stats: &mut Stats, end: Instant) {
         let mut give = |stats: &mut Stats| loop {
+            if Instant::now() >= end {
+                return;
+            }
             let batch = e.q.lock().unwrap().take_batch();
             if batch.is_empty() {
                 return;
