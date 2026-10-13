@@ -75,7 +75,8 @@ VM that is busy, paused or suspended.
   working set first) until all are in. The VM is ready in about the time of
   a `run`. By default it keeps its name and address. A restore refuses an
   address a peer is using; `--ip auto` picks a new one, which also makes a
-  restore a fork of a running VM.
+  restore a fork of a running VM. `--paused` holds the restored VM paused
+  until `resume`; its memory is still paged in meanwhile.
 - **suspend** checkpoints into the daemon's `--state-dir` (default
   `/var/lib/flexvm/<listen>`). The state dir must be on disk, not tmpfs, and
   it is created durably and locked for the daemon's lifetime like `--run`.
@@ -93,26 +94,32 @@ VM that is busy, paused or suspended.
   - **Failed resume.** If it fails before the resume request reaches
     Firecracker, the VM stays suspended. If it fails after, the checkpoint
     is consumed: the VM is gone, as re-arming it would replay what it did.
-- **Device quiescing.** Stock Firecracker pausing stops the vCPUs but not
-  its device handling, which can go on writing guest memory and used rings
-  behind a saved state. `firecracker/0002-freeze-devices-on-pause.patch`
-  freezes the devices too: while the VM is paused, net (tap RX/TX), vsock,
-  balloon (including its stats timer and free page reporting), virtio-mem,
-  entropy and pmem leave their queues alone.
-  - **Deferred, not lost.** A queue notification arriving while frozen is
-    drained, so epoll does not spin, and replayed on resume.
-  - **Host-side work continues.** Rate-limiter timers and vsock backend
-    sockets are still handled, without touching the queues.
-  - **On resume** every device is kicked as before.
-
-  The older measures stay as belt and braces:
-  - **Settling virtio-mem.** Before a checkpoint or migration pauses a VM,
-    the daemon waits until virtio-mem has carried out the last resize
-    (plugged = requested). It holds the VM's reservation, so the controller
-    cannot start another. Past half the 10 s deadline it sets requested =
-    plugged.
-  - **No discards behind the snapshot.** A checkpoint is not published if
-    memory was discarded or the plugged size changed after the snapshot.
+- **Device quiescing.** An API pause (`PATCH /vm Paused`) puts Firecracker's
+  VMM thread into a loop that serves only API requests until the resume. It
+  does not return to its event loop meanwhile, so device emulation stops
+  with the vCPUs: no queue, tap, vsock backend or timer is serviced, and the
+  events wait for the resume. flexvm builds on that:
+  - **Loaded paused.** A load with `resume_vm: false` (a paused migration
+    target, `restore --paused`) stops only the vCPUs. The daemon follows it
+    at once with an API pause, so the devices are held too. The
+    `held_restore_frozen` scenario shows the difference: a held restore's
+    memory stays bit-identical while frames arrive on its tap, a host vsock
+    connection waits and the balloon timer is due. Skip the hold and the
+    same activity changes guest memory.
+  - **Every checkpoint or migration pauses through the API,** even for a VM
+    already paused.
+  - **Guest-facing requests happen only before the snapshot.** Requests
+    served inside the pause loop can still write guest memory: changing the
+    balloon statistics interval writes the stats queue, and balloon or
+    virtio-mem size changes send config interrupts. So the only one flexvm
+    sends to a paused VM (parking the balloon timer) goes before the
+    snapshot. None follows until the pages are captured (checkpoint) or the
+    source is released (migration). The controller never touches a VM that
+    is not running.
+  - **Belt and braces.** The earlier measures stay. Before a pause the
+    daemon waits for virtio-mem to carry out the last resize. A checkpoint
+    is not published if memory was discarded, or the plugged size changed,
+    after the snapshot.
 - **Clock.** A restored guest's wall clock resumes from when it was saved.
   The guest uses the TSC clocksource, whose saved value Firecracker
   restores, while `clock_realtime` only moves kvmclock. A restore or a
@@ -225,19 +232,6 @@ each failure path.
 `PUT /snapshot/create` saves only the microVM state. Stock Firecracker always
 writes all guest memory, which would make migration downtime proportional to
 RAM and double memory use on a host that is already short.
-
-`firecracker/0002-freeze-devices-on-pause.patch`: pausing the VM also
-freezes its virtio devices (see Device quiescing above). The cost, from 30
-pause/resume pairs and 10 migrations each (2 vCPU):
-
-| | stock | patched |
-|---|---|---|
-| pause | 0.56 / 0.59 ms | 0.54 / 0.54 ms |
-| resume | 0.60 / 0.60 ms | 0.64 / 0.72 ms |
-| migrate downtime (p50) | 48 / 51 ms | 50 / 57 ms |
-
-Each cell is two runs. Resume pays for replaying the notifications that
-arrived while frozen. The migration difference is within this host's noise.
 
 ## Measured (WSL2, Ryzen 9 3900X, nested KVM)
 
@@ -471,11 +465,6 @@ firecracker/        patches on top of Firecracker v1.17.0
 - The controller samples guest memory once a second (balloon stats). A very
   fast allocation burst can still hit the in-guest OOM killer; guest PSI
   triggers over vsock would react faster.
-- **The device freeze needs the patched Firecracker (0002).** Templates and
-  artifacts built before it run unfrozen, and then only the settle wait and
-  the discard check guard a snapshot. Those miss a request that writes only
-  a used ring. The freeze covers the devices flexvm uses; it does not cover
-  virtio-block or vhost-user.
 - **Checkpoints pause the VM for the whole write** (about 0.4 GB/s: reading
   memory out of Firecracker, comparing with the template, checksumming,
   fsync). Copy-on-write or pre-copy (#8) would make the pause independent of
