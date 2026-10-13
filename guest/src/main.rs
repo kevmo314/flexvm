@@ -27,6 +27,8 @@ mod net;
 mod session;
 
 const VSOCK_PORT: u32 = 52;
+/// How long a command's body (after its request line) may take to arrive.
+const BODY_TIMEOUT_S: libc::time_t = 30;
 
 const FRAME_STDOUT: u8 = 1;
 const FRAME_STDERR: u8 = 2;
@@ -243,6 +245,13 @@ fn serve(statuses: Statuses) -> io::Result<()> {
         if ["PING", "NET ", "START ", "CLOCK ", "FORKS"].iter().any(|v| line.starts_with(v)) {
             let _ = handle(stream, r, &line, &statuses);
         } else {
+            // A command's body follows the host's reply to the connect, a round
+            // trip later, which a guest still faulting in its memory after a
+            // restore or migration can stretch past a second. The accept loop
+            // no longer waits on it, so give it as long as a client retries.
+            let timeout = libc::timeval { tv_sec: BODY_TIMEOUT_S, tv_usec: 0 };
+            let opt = (&timeout as *const libc::timeval).cast();
+            unsafe { libc::setsockopt(conn, libc::SOL_SOCKET, libc::SO_RCVTIMEO, opt, std::mem::size_of_val(&timeout) as _) };
             let statuses = statuses.clone();
             let sessions = sessions.clone();
             // Out of threads: drop this connection (closing it) rather than abort PID 1.

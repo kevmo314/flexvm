@@ -4,7 +4,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::bail;
 use crate::util::Result;
@@ -19,6 +19,51 @@ pub const FRAME_LOST: u8 = 5;
 /// How long a request may wait on Firecracker or the guest agent.
 pub const TIMEOUT: Duration = Duration::from_secs(5);
 
+/// A request whose connection broke before the guest answered it:
+/// Firecracker refused or dropped it, or the guest closed it early (e.g. its
+/// vsock connections were reset by a restore or a migration). Unlike an
+/// answer, worth another try.
+#[derive(Debug)]
+pub struct Dropped(pub String);
+
+impl std::fmt::Display for Dropped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Dropped {}
+
+/// Whether `e` means the request's connection broke (see `Dropped`), as
+/// opposed to the guest answering, or not answering in time.
+pub fn dropped(e: &crate::util::Error) -> bool {
+    use std::io::ErrorKind::*;
+    e.is::<Dropped>()
+        || e.downcast_ref::<std::io::Error>().is_some_and(|e| {
+            matches!(e.kind(), ConnectionRefused | ConnectionReset | ConnectionAborted | BrokenPipe | UnexpectedEof | NotConnected)
+        })
+}
+
+/// Sends a request (`attempt`, given the time left) until the guest
+/// answers it or `deadline` passes: one whose connection dropped goes again
+/// after a short pause. Only for requests that are safe to repeat. The agent
+/// serves them one at a time in the order they connect, so an earlier try
+/// that still reached it never lands after a later one.
+pub fn answered<T>(deadline: Instant, mut attempt: impl FnMut(Duration) -> Result<T>) -> Result<T> {
+    let mut pause = Duration::from_millis(5);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
+        match attempt(left) {
+            Ok(v) => return Ok(v),
+            Err(e) if !dropped(&e) || Instant::now() + pause >= deadline => return Err(e),
+            Err(_) => {
+                std::thread::sleep(pause);
+                pause = (pause * 2).min(Duration::from_millis(100));
+            }
+        }
+    }
+}
+
 /// Opens a connection to the guest agent and sends one request line. Reads
 /// and writes on the returned stream time out after `timeout`.
 pub fn request(uds: &Path, line: &str, timeout: Duration) -> Result<BufReader<UnixStream>> {
@@ -30,6 +75,10 @@ pub fn request(uds: &Path, line: &str, timeout: Duration) -> Result<BufReader<Un
 pub fn request_on(mut s: UnixStream, line: &str, timeout: Duration) -> Result<BufReader<UnixStream>> {
     s.set_read_timeout(Some(timeout))?;
     s.set_write_timeout(Some(timeout))?;
+    if dropping() {
+        let _ = s.shutdown(std::net::Shutdown::Both);
+        return Err(Dropped("injected fault: guest connection dropped".into()).into());
+    }
     // One write: Firecracker reads the CONNECT line without blocking as soon as
     // any of it arrives, and drops the connection if the line is incomplete.
     // It reads only up to the newline, so the request rides along and is
@@ -39,9 +88,21 @@ pub fn request_on(mut s: UnixStream, line: &str, timeout: Duration) -> Result<Bu
     let mut ok = String::new();
     r.read_line(&mut ok)?;
     if !ok.starts_with("OK") {
-        bail!("vsock connect refused: {ok:?}");
+        return Err(Dropped(format!("vsock connect refused: {ok:?}")).into());
     }
     Ok(r)
+}
+
+/// Test fault `guest_drop` (see `Daemon::inject`): for this long from the
+/// first guest request after it is armed (the start, once known), every
+/// guest request's connection is cut before the request reaches the guest,
+/// as a refused or reset vsock connection would be.
+pub static DROP_FOR: std::sync::Mutex<Option<(Duration, Option<Instant>)>> = std::sync::Mutex::new(None);
+
+fn dropping() -> bool {
+    let mut armed = DROP_FOR.lock().unwrap();
+    let Some((span, start)) = armed.as_mut() else { return false };
+    start.get_or_insert_with(Instant::now).elapsed() < *span
 }
 
 /// Starts a shell command in the guest; frames follow on the returned
@@ -114,12 +175,16 @@ pub fn read_frame(r: &mut impl Read) -> Result<Option<(u8, Vec<u8>)>> {
     Ok(Some((hdr[0], buf)))
 }
 
+/// Checks that the guest agent answers, within 2 s.
 pub fn ping(uds: &Path) -> Result<()> {
-    let mut r = request(uds, "PING", Duration::from_secs(2))?;
-    match read_frame(&mut r)? {
-        Some((FRAME_MSG, m)) if m == b"pong" => Ok(()),
-        other => bail!("unexpected ping reply {other:?}"),
-    }
+    answered(Instant::now() + Duration::from_secs(2), |left| {
+        let mut r = request(uds, "PING", left)?;
+        match read_frame(&mut r)? {
+            Some((FRAME_MSG, m)) if m == b"pong" => Ok(()),
+            None => Err(Dropped("guest closed the connection before answering a ping".into()).into()),
+            other => bail!("unexpected ping reply {other:?}"),
+        }
+    })
 }
 
 /// Runs a shell command in the guest and collects its output.
@@ -139,23 +204,27 @@ pub fn exec(uds: &Path, cmd: &str) -> Result<(i32, Vec<u8>)> {
 /// Tells a just started (or resumed) guest its address, nameserver and the
 /// wall-clock time: its clock otherwise carries on from the template snapshot.
 /// Doubles as the readiness check. Agents that predate `START` get `NET`
-/// instead, and `legacy` remembers that for the template.
+/// instead, and `legacy` remembers that for the template. Bounded by
+/// `TIMEOUT`; a dropped connection is retried (see `answered`).
 pub fn start(uds: &Path, ip: std::net::Ipv4Addr, dns: Option<&str>, legacy: &AtomicBool) -> Result<()> {
-    if legacy.load(Ordering::Relaxed) {
-        return net(uds, ip, dns);
-    }
-    let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
-    let line = format!("START {ip} {}.{:09} {}", now.as_secs(), now.subsec_nanos(), dns.unwrap_or(""));
-    let mut r = request(uds, &line, TIMEOUT)?;
-    match read_frame(&mut r)? {
-        Some((FRAME_MSG, m)) if m == b"ok" => Ok(()),
-        Some((FRAME_MSG, m)) if m.starts_with(b"unknown request") => {
-            legacy.store(true, Ordering::Relaxed);
-            net(uds, ip, dns)
+    answered(Instant::now() + TIMEOUT, |left| {
+        if legacy.load(Ordering::Relaxed) {
+            return net(uds, ip, dns, left);
         }
-        Some((_, m)) => bail!("guest start: {}", String::from_utf8_lossy(&m)),
-        None => bail!("guest closed the connection during start"),
-    }
+        let started = Instant::now();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
+        let line = format!("START {ip} {}.{:09} {}", now.as_secs(), now.subsec_nanos(), dns.unwrap_or(""));
+        let mut r = request(uds, &line, left)?;
+        match read_frame(&mut r)? {
+            Some((FRAME_MSG, m)) if m == b"ok" => Ok(()),
+            Some((FRAME_MSG, m)) if m.starts_with(b"unknown request") => {
+                legacy.store(true, Ordering::Relaxed);
+                net(uds, ip, dns, left.saturating_sub(started.elapsed()).max(Duration::from_millis(1)))
+            }
+            Some((_, m)) => bail!("guest start: {}", String::from_utf8_lossy(&m)),
+            None => Err(Dropped("guest closed the connection during start".into()).into()),
+        }
+    })
 }
 
 /// Steps the guest's wall clock to the host's, e.g. after a migration (the
@@ -163,25 +232,28 @@ pub fn start(uds: &Path, ip: std::net::Ipv4Addr, dns: Option<&str>, legacy: &Ato
 /// predate it (`legacy`).
 ///
 /// Returns how far off the guest clock was (ms, guest minus host), or None
-/// if the agent cannot do it.
+/// if the agent cannot do it. Bounded by `timeout`; a dropped connection is
+/// retried, with the time then (see `answered`).
 pub fn clock(uds: &Path, legacy: &AtomicBool, timeout: Duration) -> Result<Option<f64>> {
     if legacy.load(Ordering::Relaxed) {
         return Ok(None);
     }
-    let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
-    let mut r = request(uds, &format!("CLOCK {}.{:09}", now.as_secs(), now.subsec_nanos()), timeout)?;
-    match read_frame(&mut r)? {
-        Some((FRAME_MSG, m)) if m.starts_with(b"ok") => {
-            let off: f64 = String::from_utf8_lossy(&m[2..]).trim().parse().unwrap_or(0.0);
-            Ok(Some(off / 1e6))
+    answered(Instant::now() + timeout, |left| {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
+        let mut r = request(uds, &format!("CLOCK {}.{:09}", now.as_secs(), now.subsec_nanos()), left)?;
+        match read_frame(&mut r)? {
+            Some((FRAME_MSG, m)) if m.starts_with(b"ok") => {
+                let off: f64 = String::from_utf8_lossy(&m[2..]).trim().parse().unwrap_or(0.0);
+                Ok(Some(off / 1e6))
+            }
+            Some((FRAME_MSG, m)) if m.starts_with(b"unknown request") => {
+                legacy.store(true, Ordering::Relaxed);
+                Ok(None)
+            }
+            Some((_, m)) => bail!("guest clock: {}", String::from_utf8_lossy(&m)),
+            None => Err(Dropped("guest closed the connection while setting the clock".into()).into()),
         }
-        Some((FRAME_MSG, m)) if m.starts_with(b"unknown request") => {
-            legacy.store(true, Ordering::Relaxed);
-            Ok(None)
-        }
-        Some((_, m)) => bail!("guest clock: {}", String::from_utf8_lossy(&m)),
-        None => bail!("guest closed the connection while setting the clock"),
-    }
+    })
 }
 
 /// How many times the guest kernel has reseeded its RNG for a new VMGenID
@@ -196,13 +268,14 @@ pub fn forks(uds: &Path) -> Result<Option<usize>> {
     }
 }
 
-/// Sets the guest's address (and nameserver). Doubles as the readiness check.
-pub fn net(uds: &Path, ip: std::net::Ipv4Addr, dns: Option<&str>) -> Result<()> {
-    let mut r = request(uds, &format!("NET {ip} {}", dns.unwrap_or("")), TIMEOUT)?;
+/// Sets the guest's address (and nameserver), within `timeout`: `start`
+/// for agents that predate `START`.
+fn net(uds: &Path, ip: std::net::Ipv4Addr, dns: Option<&str>, timeout: Duration) -> Result<()> {
+    let mut r = request(uds, &format!("NET {ip} {}", dns.unwrap_or("")), timeout)?;
     match read_frame(&mut r)? {
         Some((FRAME_MSG, m)) if m == b"ok" => Ok(()),
         Some((_, m)) => bail!("guest network setup: {}", String::from_utf8_lossy(&m)),
-        None => bail!("guest closed the connection during network setup"),
+        None => Err(Dropped("guest closed the connection during network setup".into()).into()),
     }
 }
 
@@ -278,6 +351,34 @@ mod tests {
         assert_eq!(session_exit(&exit, 12).unwrap(), 7);
         assert!(session_exit(&exit, 11).is_err());
         assert!(session_exit(&exit[..11], 12).is_err());
+    }
+
+    #[test]
+    fn retries_only_dropped_connections() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut tries = 0;
+        let got = answered(deadline, |_| {
+            tries += 1;
+            match tries {
+                1 => Err(Dropped("guest closed the connection".into()).into()),
+                2 => Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset).into()),
+                _ => Ok(7),
+            }
+        });
+        assert_eq!((got.unwrap(), tries), (7, 3));
+        // An answer, or no answer in time, is final.
+        for e in [|| -> Result<()> { bail!("guest clock: bad time") }, || Err(std::io::Error::from(std::io::ErrorKind::WouldBlock).into())] {
+            let mut tries = 0;
+            assert!(answered(deadline, |_| {
+                tries += 1;
+                e()
+            })
+            .is_err());
+            assert_eq!(tries, 1);
+        }
+        let start = Instant::now();
+        assert!(answered(start + Duration::from_millis(50), |_| -> Result<()> { Err(Dropped("gone".into()).into()) }).is_err());
+        assert!(start.elapsed() < Duration::from_millis(500));
     }
 
     #[test]

@@ -935,15 +935,21 @@ impl Daemon {
     /// fails), `lost_ack` (incoming migrations get no reply), `status`
     /// (migration status queries fail), `prepare_fail` (an incoming migration
     /// fails once everything is prepared), `short_incoming` (a prepared
-    /// incoming migration waits 2 s for the source, not 30) or
+    /// incoming migration waits 2 s for the source, not 30),
     /// `slow_preload` (a migration source sends the preloaded pages 300 ms
     /// after the vmstate), `kill_prepared` (an incoming migration's
-    /// prepared Firecracker dies, and its pager sees it, just before the load) or `resume_kill` (Firecracker
-    /// is killed right after a restored VM's resume is sent).
+    /// prepared Firecracker dies, and its pager sees it, just before the load), `resume_kill` (Firecracker
+    /// is killed right after a restored VM's resume is sent) or `guest_drop`
+    /// (guest requests are refused before reaching the guest, for `ms` from
+    /// the first one).
     fn inject(&self, req: &Value) -> Result<Value> {
         let Some(faults) = &self.faults else { bail!("fault injection is off (start the daemon with FLEXVM_FAULTS=1)") };
         let fault = req["fault"].as_str().ok_or("missing fault")?;
-        let until = Instant::now() + Duration::from_millis(req["ms"].as_u64().unwrap_or(1000));
+        let ms = Duration::from_millis(req["ms"].as_u64().unwrap_or(1000));
+        if fault == "guest_drop" {
+            *guest::DROP_FOR.lock().unwrap() = Some((ms, None));
+        }
+        let until = Instant::now() + ms;
         faults.lock().unwrap().insert(fault.into(), until);
         Ok(json!({"fault": fault}))
     }
