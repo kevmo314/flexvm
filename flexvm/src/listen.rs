@@ -7,7 +7,8 @@
 //! - `migrate_in`: spawns `flexvm run --incoming`, handing it the connection;
 //! - `pages`: passes the connection to the VM process named (the source of
 //!   a migration), whose page server takes it from there;
-//! - `migration`: how an incoming migration went (see `Host::mig_status`);
+//! - `migration`: how an incoming migration went (see `Host::mig_status`),
+//!   or (`done`) that its source will not ask again;
 //! - `route`: a peer announces or withdraws a VM address.
 
 use std::io::Read;
@@ -170,6 +171,10 @@ fn migration(host: &Host, req: &Value) -> Result<Value> {
         bail!("injected fault: migration status unavailable");
     }
     let mig = req["mig"].as_u64().ok_or("missing mig")?;
+    if req["done"] == json!(true) {
+        host.mig_done(mig)?;
+        return Ok(json!({"done": true}));
+    }
     let outcome = host.mig_status(mig)?;
     Ok(json!({"outcome": outcome, "underlay": host.cfg.underlay().map(|u| u.to_string())}))
 }
@@ -185,7 +190,7 @@ fn route(host: &Host, req: &Value) -> Result<Value> {
     if !host.observe(&l, ip, gen, via.is_none())? {
         return Ok(json!({"ip": ip.to_string(), "stale": true}));
     }
-    let local = host.holder(&l, ip).is_some();
+    let local = host.holder(&l, ip)?.is_some();
     if !local {
         match via {
             Some(via) => crate::net::route_via(ip, via)?,

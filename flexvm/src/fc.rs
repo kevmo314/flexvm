@@ -45,6 +45,9 @@ pub struct Firecracker {
     child: Child,
     pub sockets: Sockets,
     api: Api,
+    /// Moving it into its cgroup (see `Spawner`): joined before it is killed,
+    /// so its pid is never reused while that is under way.
+    joining: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Firecracker {
@@ -58,15 +61,25 @@ impl Firecracker {
         cmd.arg("--api-sock").arg(&sockets.api).arg("--level").arg("Warn").stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log);
         // Firecracker never outlives its VM process (whose pager serves its
         // memory). The signal comes when the spawning thread exits, so VM
-        // processes spawn from their main thread, which lives as long as they do.
+        // processes spawn from their main thread, which lives as long as they
+        // do. A parent that died before the signal was set sends none.
+        let parent = std::process::id() as i32;
         unsafe {
-            cmd.pre_exec(|| {
-                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+            cmd.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != parent {
+                    return Err(std::io::Error::other("its parent died"));
+                }
                 Ok(())
             });
         }
         let child = cmd.spawn()?;
-        let fc = Firecracker { child, sockets, api: Api::default() };
+        let fc = Firecracker { child, sockets, api: Api::default(), joining: None };
+        // Who to kill should this process die (see `host::reap`).
+        let id = crate::host::Ident::of(fc.pid()).ok_or("firecracker exited at once")?;
+        std::fs::write(dir.join("fc"), id.to_string())?;
         retry(ready, || Ok(UnixStream::connect(&fc.sockets.api)?))?;
         Ok(fc)
     }
@@ -125,6 +138,9 @@ impl Firecracker {
     }
 
     pub fn kill(&mut self) {
+        if let Some(j) = self.joining.take() {
+            let _ = j.join();
+        }
         self.api.connection.get_mut().take();
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -317,8 +333,9 @@ pub fn release(tap: &str, cgroup: Option<&Path>, dir: &Path) {
 
 /// Starts the Firecrackers of one VM process, each with a fresh directory
 /// under `root`, a tap and a cgroup of its own. The tap is made while
-/// Firecracker starts, and the cgroup joined after (that move waits for an
-/// RCU grace period: tens of milliseconds), so none of it adds up.
+/// Firecracker starts, and the cgroup joined after, in the background (that
+/// move waits for an RCU grace period: tens of milliseconds), so none of it
+/// adds up.
 ///
 /// Firecracker gets `PR_SET_PDEATHSIG` from the spawning thread: spawn from
 /// a thread that lives as long as the VM (a VM process's main thread).
@@ -362,15 +379,15 @@ impl Spawner {
         let fc = std::fs::create_dir_all(&dir).map_err(Into::into).and_then(|()| Firecracker::spawn(&self.bin, &dir, self.sockets.allocate()?, ready));
         let made = made.join().unwrap_or_else(|_| Err("tap thread panicked".into()));
         match (fc, made) {
-            (Ok(fc), Ok(())) => {
+            (Ok(mut fc), Ok(())) => {
                 if let Some(cg) = cgroup.clone() {
                     let pid = fc.pid();
-                    std::thread::spawn(move || {
-                        let joined = std::fs::create_dir_all(&cg).and_then(|()| std::fs::write(cg.join("cgroup.procs"), pid.to_string()));
+                    fc.joining = Some(std::thread::spawn(move || {
+                        let joined = std::fs::create_dir(&cg).and_then(|()| std::fs::write(cg.join("cgroup.procs"), pid.to_string()));
                         if let Err(e) = joined {
                             eprintln!("firecracker {pid}: no cgroup of its own ({}): {e}", cg.display());
                         }
-                    });
+                    }));
                 }
                 Ok(Idle { fc, dir, cgroup, tap })
             }

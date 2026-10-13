@@ -167,9 +167,8 @@ fn real_main() -> Result<()> {
         Some("run") => run(&args, name, template),
         Some("resume") => {
             let host = open_host(&args)?;
-            if let Ok(e) = host.entry(name) {
-                // A paused VM.
-                unsafe { libc::kill(e.pid as i32, libc::SIGCONT) };
+            // A paused VM.
+            if host.signal(name, libc::SIGCONT).is_ok() {
                 return Ok(());
             }
             start(&args, &host, name, Start::Resume { name: name.into() })
@@ -222,7 +221,10 @@ fn real_main() -> Result<()> {
 /// `listen`'s flags are the host's configuration (`STATE/host.json`); the
 /// ones not given keep their values.
 fn configure(host: &mut Host, args: &Args, addr: Option<&str>) -> Result<()> {
-    let c = &mut host.cfg;
+    host.configure(|c| set_config(c, args, addr))
+}
+
+fn set_config(c: &mut host::Config, args: &Args, addr: Option<&str>) -> Result<()> {
     if let Some(a) = addr {
         c.listen = Some(a.into());
     }
@@ -249,7 +251,7 @@ fn configure(host: &mut Host, args: &Args, addr: Option<&str>) -> Result<()> {
     if c.listen.as_deref().is_some_and(|l| l.starts_with("0.0.0.0")) && c.underlay.is_none() {
         return Err("listening on 0.0.0.0 needs --underlay (the address peers route VMs to)".into());
     }
-    host.save_config()
+    Ok(())
 }
 
 /// `run NAME`: claims a standby VM if there is one, else becomes the VM.
@@ -272,7 +274,8 @@ fn run(args: &Args, name: &str, template: &str) -> Result<()> {
             return print(v);
         }
         eprintln!("{v}");
-        return follow(conn, v["pid"].as_u64().unwrap_or(0) as i32);
+        let id = host::Ident { pid: v["pid"].as_u64().unwrap_or(0) as u32, start: v["start"].as_u64().unwrap_or(0) };
+        return follow(conn, id);
     }
     if detach {
         return spawn_detached(&host, name);
@@ -332,12 +335,13 @@ fn set_cloexec(fd: i32) {
 
 /// A foreground `run` that claimed a standby VM: passes its signals on to
 /// the VM process and exits with its status.
-fn follow(conn: std::os::unix::net::UnixStream, pid: i32) -> Result<()> {
+fn follow(conn: std::os::unix::net::UnixStream, id: host::Ident) -> Result<()> {
     let set = util::block_signals(&[libc::SIGTERM, libc::SIGINT, libc::SIGTSTP, libc::SIGCONT, libc::SIGHUP]);
+    let vm = host::PidFd::open(id)?.ok_or("the vm process is gone")?;
     std::thread::spawn(move || loop {
         let sig = util::wait_signal(&set);
         if sig != libc::SIGHUP {
-            unsafe { libc::kill(pid, sig) };
+            let _ = vm.signal(sig);
         }
     });
     let reply = recv_json(&mut BufReader::new(conn)).ok().flatten();
@@ -347,14 +351,9 @@ fn follow(conn: std::os::unix::net::UnixStream, pid: i32) -> Result<()> {
 /// `kill NAME`: destroys a VM, live (SIGINT, then waits for it to go) or
 /// suspended.
 fn kill(host: &Host, name: &str) -> Result<()> {
-    if let Ok(e) = host.entry(name) {
-        unsafe { libc::kill(e.pid as i32, libc::SIGINT) };
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while host.alive(name) {
-            if Instant::now() >= deadline {
-                return Err(format!("vm {name} (pid {}) is still there; see its log", e.pid).into());
-            }
-            std::thread::sleep(Duration::from_millis(10));
+    if let Ok(vm) = host.signal(name, libc::SIGINT) {
+        if !vm.wait(Duration::from_secs(30)) {
+            return Err(format!("vm {name} is still there; see its log").into());
         }
         return Ok(());
     }

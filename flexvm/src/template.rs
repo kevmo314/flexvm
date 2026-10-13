@@ -327,6 +327,18 @@ impl Template {
         Template::open_dir(name, Template::resolve(paths, name)?)
     }
 
+    /// Generation `id` of template `name`, even if the name has moved on
+    /// since, verified: what a checkpoint or a migration source was made from.
+    pub fn open_id(paths: &Paths, name: &str, id: &str) -> Result<Arc<Template>> {
+        let tpl = match Template::generation(paths, id) {
+            Some(dir) => Template::open_dir(name, dir)?,
+            None => Template::open(paths, name)?,
+        };
+        tpl.check_id(id)?;
+        tpl.verify(paths, true)?;
+        Ok(tpl)
+    }
+
     /// Opens the template files in `dir`, which `open` resolved from `name`.
     pub fn open_dir(name: &str, dir: PathBuf) -> Result<Arc<Template>> {
         // Everything is read through one handle on the directory, and so is

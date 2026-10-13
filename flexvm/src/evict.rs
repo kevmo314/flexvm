@@ -30,8 +30,8 @@ pub fn tick(host: &Host, starved_here: bool) {
     if avail < reserve {
         let mut shed = 0;
         for t in crate::standby::templates(host) {
-            for pid in crate::standby::live(host, &t) {
-                unsafe { libc::kill(pid as i32, libc::SIGINT) };
+            for id in crate::standby::live(host, &t) {
+                crate::standby::stop(id);
                 shed += 1;
             }
         }
