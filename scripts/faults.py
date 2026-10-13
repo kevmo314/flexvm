@@ -451,8 +451,9 @@ def guest_hang():
     once it is back, the VM still runs and migrates."""
     n = "ft-guest-hang"
     m = setup(n)
-    fcs = [pid for pid, d in firecrackers(run_dir(A)).items() if os.path.exists(os.path.join(d, "v.sock"))]
-    check("guest hang: found the VM's firecracker", len(fcs) == 1, fcs)
+    # By pid: the run directory also holds idle and hot-pool Firecrackers.
+    fcs = [str(vms(A)[n]["pid"])]
+    check("guest hang: found the VM's firecracker", fcs[0] in firecrackers(run_dir(A)), fcs)
     subprocess.run(["sudo", "kill", "-STOP", fcs[0]])
     times = []
 
@@ -828,11 +829,12 @@ def held_restore_frozen():
 
 
 def api_sock(host, name):
-    """The API socket of `name`'s Firecracker on `host`, its only VM."""
-    assert list(vms(host)) == [name], vms(host)
-    socks = [os.path.join(d, "api.sock") for d in firecrackers(run_dir(host)).values() if os.path.exists(os.path.join(d, "v.sock"))]
-    assert len(socks) == 1, socks
-    return socks[0]
+    """The API socket of `name`'s Firecracker on `host`, found by the pid
+    `ls` reports (the run directory also holds idle and hot-pool ones)."""
+    pid = str(vms(host)[name]["pid"])
+    d = firecrackers(run_dir(host)).get(pid)
+    assert d, (pid, firecrackers(run_dir(host)))
+    return os.path.join(d, "api.sock")
 
 
 def fc_api(sock, method, path, body=None):

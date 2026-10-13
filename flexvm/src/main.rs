@@ -6,6 +6,7 @@ mod daemon;
 mod fc;
 mod guest;
 mod image;
+mod hot;
 mod net;
 mod template;
 mod uffd;
@@ -35,6 +36,7 @@ usage:
                                                              ... from a container image
   flexvm daemon [--listen ADDR] [--advertise ADDR] [--run DIR]
                 [--peer ADDR]... [--reserve MIB] [--pool N]
+                [--hot N] [--hot-mib MIB]
                 [--vm-ips CIDR|FIRST-LAST] [--underlay IP]
                 [--announce-dev IFACE] [--dns IP] [--state-dir DIR]  run the host daemon (root)
   flexvm run NAME [--template T] [--ip IP]                   start a VM from a template
@@ -51,6 +53,7 @@ usage:
                [--template T] [--ready-port N | --ready-http N]  ... and until an image app answers
   flexvm bench --lifecycle DIR [--to ADDR] [--dirty-mib N,N..] pause/checkpoint/restore/suspend latency into bench/
   flexvm kill NAME                                           stop a VM
+  flexvm unlend IP                                           free an address lent to a VM that migrated away
 
 options:
   --host ADDR        daemon to talk to (env FLEXVM_HOST, default 127.0.0.1:7070)
@@ -178,6 +181,8 @@ fn real_main() -> Result<()> {
                 peers: args.all("peer"),
                 reserve_mib: args.num("reserve", 1024)?,
                 pool: args.num("pool", 2)? as usize,
+                hot: args.num("hot", 2)? as usize,
+                hot_mib: args.num("hot-mib", 512)?,
                 vm_ips: net::IpRange::parse(args.get("vm-ips").unwrap_or("10.200.0.0/16"))?,
                 underlay: match args.get("underlay") {
                     Some(ip) => ip.parse().map_err(|_| format!("bad --underlay {ip:?}"))?,
@@ -198,6 +203,7 @@ fn real_main() -> Result<()> {
             json!({"op": "run", "name": name, "template": args.get("template").unwrap_or("default"), "ip": args.get("ip")}),
         )?),
         Some("ls") => list(call(&host, json!({"op": "ls"}))?),
+        Some("unlend") => print(call(&host, json!({"op": "unlend", "ip": name}))?),
         Some("kill") => print(call(&host, json!({"op": "kill", "name": name}))?),
         Some(op @ ("pause" | "resume" | "suspend")) => print(call(&host, json!({"op": op, "name": name}))?),
         Some("checkpoint") => {
@@ -316,7 +322,7 @@ fn call(host: &str, req: Value) -> Result<Value> {
     rpc_reply(c, req)
 }
 
-fn call_with_timeout(host: &str, req: Value, timeout: Duration) -> Result<Value> {
+pub(crate) fn call_with_timeout(host: &str, req: Value, timeout: Duration) -> Result<Value> {
     let mut error = None;
     for addr in host.to_socket_addrs()? {
         match TcpStream::connect_timeout(&addr, timeout) {

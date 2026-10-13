@@ -33,6 +33,10 @@ use crate::util::{Phases, Result, PAGE_SIZE};
 /// Where a VM is in its lifecycle on this host. Transitions happen under the
 /// daemon's per-name operation lock (see `Daemon::reserve`); the states of a
 /// VM without a Firecracker here (starting, suspended) live in the daemon.
+/// A clock request that took longer than this may have left the guest that
+/// far behind (see `sync_clock`).
+pub const CLOCK_RTT: Duration = Duration::from_millis(5);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
     Running,
@@ -84,6 +88,10 @@ pub struct Vm {
     /// Serializes putting back device settings on a migration target
     /// (`restore_devices`) with leaving for a migration or checkpoint.
     devices: Mutex<()>,
+    /// A clock request (START or CLOCK) failed and may not have reached the
+    /// guest yet: a migration or checkpoint must first see the agent answer
+    /// (`leave`).
+    clock_unsure: AtomicBool,
     next_exec: AtomicU64,
     fc: Mutex<Option<Firecracker>>,
     cgroup: Option<PathBuf>,
@@ -130,16 +138,8 @@ impl Vm {
         load: Load,
         phases: &mut Phases,
     ) -> Result<(Arc<Vm>, Duration)> {
-        let Idle { fc, dir, cgroup, tap } = idle;
-        // Name the cgroup after the VM; renaming is free, joining is not.
-        let cgroup = cgroup.map(|cg| {
-            let named = cg.with_file_name(name);
-            let _ = std::fs::remove_dir(&named);
-            match std::fs::rename(&cg, &named) {
-                Ok(()) => named,
-                Err(_) => cg,
-            }
-        });
+        let (fc, dir, cgroup, tap) = idle.into_parts();
+        let cgroup = name_cgroup(cgroup, name);
         phases.mark("cgroup_rename");
         let pager = Pager::start(&dir.join("uffd.sock"), template.clone(), remote);
         let restored = (|| {
@@ -181,26 +181,35 @@ impl Vm {
             Err(e) => {
                 if let Ok(pager) = pager {
                     pager.stop();
+                    drop(Idle { fc, dir, cgroup, tap });
+                    pager.join();
+                    return Err(e);
                 }
-                drop(fc);
-                crate::net::delete_tap(&tap);
-                let _ = std::fs::remove_dir_all(&dir);
+                drop(Idle { fc, dir, cgroup, tap });
                 return Err(e);
             }
         };
-        let vm = Arc::new(Vm {
+        let state = if load == Load::Running { State::Running } else { State::Paused };
+        Ok((Vm::assemble(name, template, Idle { fc, dir, cgroup, tap }, ip, pager, state), took))
+    }
+
+    /// A VM made of a restored Firecracker and its resources.
+    pub fn assemble(name: &str, template: Arc<Template>, idle: Idle, ip: Ipv4Addr, pager: Arc<Pager>, state: State) -> Arc<Vm> {
+        let (fc, dir, cgroup, tap) = idle.into_parts();
+        Arc::new(Vm {
             name: name.into(),
             template,
             dir,
             ip,
             tap,
             pager,
-            state: Mutex::new(if load == Load::Running { State::Running } else { State::Paused }),
+            state: Mutex::new(state),
             last_resize: Mutex::new(Instant::now()),
             starved: AtomicBool::new(false),
             released: OnceLock::new(),
             execs: Mutex::new(HashMap::new()),
             devices: Mutex::new(()),
+            clock_unsure: AtomicBool::new(false),
             next_exec: AtomicU64::new(0),
             fc: Mutex::new(Some(fc)),
             cgroup,
@@ -208,8 +217,7 @@ impl Vm {
             clock_pending: AtomicBool::new(false),
             pending_net: Mutex::new(None),
             snapshot_discards: AtomicU64::new(0),
-        });
-        Ok((vm, took))
+        })
     }
 
     pub fn vsock(&self) -> PathBuf {
@@ -305,6 +313,14 @@ impl Vm {
         }
         if self.pending_net.lock().unwrap().is_some() {
             bail!("vm {} has not taken its new address yet; resume it first", self.name);
+        }
+        // A clock request that failed may still be on its way into the guest,
+        // and must not arrive after the snapshot (on a target, or in a
+        // checkpoint) with a stale time. The agent serves requests in order,
+        // so a ping answered now means it has been dealt with.
+        if self.clock_unsure.load(Ordering::SeqCst) {
+            crate::guest::ping(&self.vsock()).map_err(|e| format!("vm {}: guest agent not answering: {e}", self.name))?;
+            self.clock_unsure.store(false, Ordering::SeqCst);
         }
         self.was_paused.store(*st == State::Paused, Ordering::SeqCst);
         *st = to;
@@ -524,36 +540,43 @@ impl Vm {
         Ok((res?, String::from_utf8_lossy(&out).into_owned()))
     }
 
-    /// Steps the guest's wall clock to the host's if it is off by more than
-    /// `tolerance`; all of it done by `deadline`. A restore leaves the
-    /// guest's clock where it was saved (the guest's TSC clocksource resumes
-    /// from its saved value, and Firecracker's `clock_realtime` only moves
-    /// kvmclock), so it lags by however long the VM was stopped. The offset is
-    /// measured with one exec bracketed by host timestamps; the step sets an
-    /// absolute time (the host's, plus half the measured round trip for the
-    /// exec's delay), so running it twice never steps twice. Returns the
-    /// offset found (ms). Callers hold the VM's reservation. The one place
-    /// that sets the guest clock (a guest agent request would replace the
-    /// execs here).
-    pub fn sync_clock(&self, tolerance: Duration, deadline: Instant) -> Result<f64> {
-        let now = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as i128;
-        let before = now();
-        let (code, out) = self.sh("date +%s%N", deadline)?;
-        let after = now();
-        let guest: i128 = match (code, out.trim().parse()) {
-            (0, Ok(ns)) => ns,
-            _ => bail!("reading the guest clock: {out:?} (exit {code})"),
-        };
-        let offset = guest - (before + after) / 2;
-        if offset.unsigned_abs() > tolerance.as_nanos() {
-            let at = now() + (after - before) / 2;
-            let cmd = format!("date -s @{}.{:09} >/dev/null", at / 1_000_000_000, at % 1_000_000_000);
-            match self.sh(&cmd, deadline)? {
-                (0, _) => {}
-                (code, out) => bail!("setting the guest clock: {out:?} (exit {code})"),
+    /// Steps the guest's wall clock to the host's, all of it by `deadline`.
+    /// A restore leaves the guest's clock where it was saved (the guest's TSC
+    /// clocksource resumes from its saved value, and Firecracker's
+    /// `clock_realtime` only moves kvmclock), so it lags by however long the
+    /// VM was stopped. One agent request (`CLOCK`) sets the host's time and
+    /// reports how far off the clock was (ms, returned); as the guest ends up
+    /// behind by the request's transit time, it goes again (a few times at
+    /// most) until a round trip is short. The guest skips steps under 5 ms.
+    /// Callers hold the VM's reservation. An agent without `CLOCK` gets no
+    /// step (logged once): a command run through exec could be delayed past
+    /// the deadline and land after a snapshot, which nothing can fence.
+    pub fn sync_clock(&self, _tolerance: Duration, deadline: Instant) -> Result<f64> {
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        let mut first = None;
+        for _ in 0..3 {
+            let start = Instant::now();
+            let left = deadline.saturating_duration_since(start);
+            match crate::guest::clock(&self.vsock(), &self.template.legacy_agent, left) {
+                Ok(Some(off)) => {
+                    let off = *first.get_or_insert(off);
+                    if start.elapsed() < CLOCK_RTT {
+                        return Ok(off);
+                    }
+                }
+                Ok(None) => {
+                    if first.is_none() && !WARNED.swap(true, Ordering::Relaxed) {
+                        eprintln!("vm {}: its guest agent cannot set the clock (no CLOCK); clocks of such VMs are left alone", self.name);
+                    }
+                    return Ok(first.unwrap_or(0.0));
+                }
+                Err(e) => {
+                    self.clock_unsure.store(true, Ordering::SeqCst);
+                    return Err(e);
+                }
             }
         }
-        Ok(offset as f64 / 1e6)
+        Ok(first.unwrap_or(0.0))
     }
 
     /// Retries a few times; the VM keeps running regardless, only its
@@ -597,14 +620,20 @@ impl Vm {
         }
     }
 
-    /// Sets the guest's address, unless the VM is no longer running here.
-    /// Bounded by `guest::TIMEOUT`. Callers hold the VM's reservation, so no
-    /// migration or checkpoint starts meanwhile.
+    /// Sets the guest's address and wall clock (`START`; `NET` for older
+    /// agents), unless the VM is no longer running here. Bounded by
+    /// `guest::TIMEOUT`. Callers hold the VM's reservation, so no migration
+    /// or checkpoint starts meanwhile. If it fails, the clock may be anyone's
+    /// guess (see `leave`).
     pub fn guest_net(&self, ip: Ipv4Addr, dns: Option<&str>) -> Result<()> {
         if self.state() != State::Running {
             bail!("vm {} is not running here", self.name);
         }
-        crate::guest::net(&self.vsock(), ip, dns)
+        let res = crate::guest::start(&self.vsock(), ip, dns, &self.template.legacy_agent);
+        if res.is_err() {
+            self.clock_unsure.store(true, Ordering::SeqCst);
+        }
+        res
     }
 
     /// Starts an image template's app, unless the VM is no longer running
@@ -622,14 +651,12 @@ impl Vm {
 
     pub fn kill(&self) {
         self.pager.stop();
+        // First, so a Firecracker call in progress (holding `fc`) fails at once.
+        self.pager.kill_firecracker();
         let Some(mut fc) = self.fc.lock().unwrap().take() else { return };
         fc.kill();
-        crate::net::delete_tap(&self.tap);
-        if let Some(cg) = &self.cgroup {
-            // The cgroup stays busy until the kernel has finished tearing the process down.
-            let _ = crate::util::retry(Duration::from_secs(2), || Ok(std::fs::remove_dir(cg)?));
-        }
-        let _ = std::fs::remove_dir_all(&self.dir);
+        self.pager.join();
+        crate::fc::release(&self.tap, self.cgroup.as_deref(), &self.dir);
     }
 
     pub fn describe(&self) -> Value {
@@ -640,6 +667,7 @@ impl Vm {
             "name": self.name,
             "ip": self.ip.to_string(),
             "tap": self.tap,
+            "pid": self.pid(),
             "template": self.template.name,
             "template_id": self.template.meta.id,
             "state": self.state().name(),
@@ -697,4 +725,17 @@ fn lock_by<T>(m: &Mutex<T>, deadline: Instant) -> Result<std::sync::MutexGuard<'
             Err(std::sync::TryLockError::Poisoned(e)) => return Ok(e.into_inner()),
         }
     }
+}
+
+/// Names a pooled Firecracker's cgroup after its VM (renaming is free, joining is not).
+/// Best effort: cgroup v2 refuses renames, so there it keeps its pool name.
+pub fn name_cgroup(cgroup: Option<PathBuf>, name: &str) -> Option<PathBuf> {
+    cgroup.map(|cg| {
+        let named = cg.with_file_name(name);
+        let _ = std::fs::remove_dir(&named);
+        match std::fs::rename(&cg, &named) {
+            Ok(()) => named,
+            Err(_) => cg,
+        }
+    })
 }
