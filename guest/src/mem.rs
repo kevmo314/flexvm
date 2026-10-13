@@ -27,7 +27,8 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::FileExt;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -56,9 +57,9 @@ fn headroom(total: u64) -> u64 {
 pub fn start() {
     let _ = std::fs::write("/proc/sys/vm/overcommit_memory", "1");
     match setup() {
-        Ok((events, uev)) => {
+        Ok((events, uev, high)) => {
             let _ = WORK_PROCS.set(CString::new(format!("{WORK}/cgroup.procs")).unwrap());
-            thread::spawn(move || watch(events, uev));
+            thread::spawn(move || watch(events, uev, high));
         }
         Err(e) => eprintln!("flexvm-init: memory cgroup setup failed: {e}"),
     }
@@ -104,7 +105,7 @@ pub fn contain(cmd: &mut Command) {
 /// Creates the groups and subscribes to memory block uevents, then sets the
 /// mark from MemTotal (in that order: a plug in between still gets an event).
 /// Returns `/vm/memory.events`, which the kernel flags when the mark is crossed.
-fn setup() -> io::Result<(File, OwnedFd)> {
+fn setup() -> io::Result<(File, OwnedFd, High)> {
     std::fs::create_dir_all(CGROUP_ROOT)?;
     let rc = unsafe {
         libc::mount(c"cgroup2".as_ptr(), c"/sys/fs/cgroup".as_ptr(), c"cgroup2".as_ptr(), 0, std::ptr::null())
@@ -115,8 +116,10 @@ fn setup() -> io::Result<(File, OwnedFd)> {
     std::fs::write(format!("{CGROUP_ROOT}/cgroup.subtree_control"), "+memory")?;
     std::fs::create_dir_all(WORK)?;
     let uev = uevents()?;
-    set_high(meminfo().0)?;
-    Ok((File::open(format!("{CGROUP}/memory.events"))?, uev))
+    let total = meminfo().0;
+    write_high(Some(high_limit(total)))?;
+    let high = High::new(total, write_high);
+    Ok((File::open(format!("{CGROUP}/memory.events"))?, uev, high))
 }
 
 /// (MemTotal, MemAvailable) in KiB.
@@ -136,13 +139,95 @@ fn meminfo() -> (u64, u64) {
     (total, avail)
 }
 
-fn set_high(total_kib: u64) -> io::Result<()> {
+fn high_limit(total_kib: u64) -> u64 {
     let total = total_kib >> 10;
-    std::fs::write(format!("{CGROUP}/memory.high"), ((total - headroom(total)) << 20).to_string())
+    (total - headroom(total)) << 20
 }
 
-fn lift() {
-    let _ = std::fs::write(format!("{CGROUP}/memory.high"), "max");
+fn write_high(value: Option<u64>) -> io::Result<()> {
+    let path = format!("{CGROUP}/memory.high");
+    let value = value.map_or_else(|| "max".to_string(), |n| n.to_string());
+    // A concurrent lift may have already installed this value. Separate opens
+    // also keep the max write independent of a worker blocked in reclaim.
+    if std::fs::read_to_string(&path)?.trim() != value {
+        std::fs::write(path, value)?;
+    }
+    Ok(())
+}
+
+/// Numeric writes can reclaim synchronously on Linux 6.1. Keep them off the
+/// watcher, coalesce pending changes, and let emergency lifts bypass the worker.
+struct High {
+    total_kib: u64,
+    desired: Arc<Mutex<Option<u64>>>,
+    changed: mpsc::Sender<()>,
+    pending: Arc<AtomicUsize>,
+    write: Arc<dyn Fn(Option<u64>) -> io::Result<()> + Send + Sync>,
+}
+
+impl High {
+    fn new(total_kib: u64, write: impl Fn(Option<u64>) -> io::Result<()> + Send + Sync + 'static) -> Self {
+        let desired = Arc::new(Mutex::new(Some(high_limit(total_kib))));
+        let write = Arc::new(write);
+        let (changed, changes) = mpsc::channel();
+        let latest = Arc::clone(&desired);
+        let pending = Arc::new(AtomicUsize::new(0));
+        let outstanding = Arc::clone(&pending);
+        let writer = Arc::clone(&write);
+        thread::spawn(move || {
+            while changes.recv().is_ok() {
+                // Notifications carry no stale limits: always use the newest.
+                let count = 1 + changes.try_iter().count();
+                let value = *latest.lock().unwrap();
+                if let Err(e) = writer(value) {
+                    eprintln!("flexvm-init: memory.high write failed: {e}");
+                }
+                outstanding.fetch_sub(count, Ordering::Relaxed);
+            }
+        });
+        Self { total_kib, desired, changed, pending, write }
+    }
+
+    fn set_total(&mut self, total_kib: u64) {
+        if self.total_kib == total_kib {
+            return;
+        }
+        let old = high_limit(self.total_kib);
+        self.total_kib = total_kib;
+        let value = high_limit(total_kib);
+        if old != value {
+            *self.desired.lock().unwrap() = Some(value);
+            self.notify();
+        }
+    }
+
+    fn notify(&self) {
+        self.pending.fetch_add(1, Ordering::Relaxed);
+        if self.changed.send(()).is_err() {
+            self.pending.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    fn busy(&self) -> bool {
+        self.pending.load(Ordering::Relaxed) != 0
+    }
+
+    fn maintain_lift(&self) {
+        if self.desired.lock().unwrap().is_none() {
+            if let Err(e) = (self.write)(None) {
+                eprintln!("flexvm-init: memory.high lift failed: {e}");
+            }
+        }
+    }
+
+    fn lift(&self) {
+        let changed = self.desired.lock().unwrap().take().is_some();
+        self.maintain_lift();
+        if changed {
+            // Supersede queued numeric updates, and reconcile an in-flight write.
+            self.notify();
+        }
+    }
 }
 
 /// The `high` counter of memory.events.
@@ -189,7 +274,7 @@ fn memory_changed(fd: &OwnedFd) -> bool {
     }
 }
 
-fn watch(events: File, uev: OwnedFd) {
+fn watch(events: File, uev: OwnedFd, mut limit: High) {
     let mut seen = high_events(&events);
     let mut asked: Option<Instant> = None;
     // Since when we have been over the mark, waiting for memory from the host.
@@ -199,13 +284,18 @@ fn watch(events: File, uev: OwnedFd) {
             libc::pollfd { fd: events.as_raw_fd(), events: libc::POLLPRI, revents: 0 },
             libc::pollfd { fd: uev.as_raw_fd(), events: libc::POLLIN, revents: 0 },
         ];
-        let timeout = if waiting.is_some() { RETRY.as_millis() as i32 } else { -1 };
+        let timeout = if waiting.is_some() || limit.busy() { RETRY.as_millis() as i32 } else { -1 };
         if unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout) } < 0 {
             continue;
         }
+        // A numeric write can start just after a lift, then block in reclaim.
+        // Repair that race without waiting for the worker to return.
+        if limit.busy() {
+            limit.maintain_lift();
+        }
         if fds[1].revents & libc::POLLIN != 0 && memory_changed(&uev) {
             // Plugged or unplugged: move the mark. Memory arriving ends a wait.
-            let _ = set_high(meminfo().0);
+            limit.set_total(meminfo().0);
             waiting = None;
         }
         let now = Instant::now();
@@ -215,7 +305,7 @@ fn watch(events: File, uev: OwnedFd) {
             asked = Some(now);
             match ask() {
                 Reply::Full => {
-                    lift();
+                    limit.lift();
                     waiting = None;
                     continue;
                 }
@@ -224,11 +314,11 @@ fn watch(events: File, uev: OwnedFd) {
             }
         }
         if waiting.is_some_and(|t| now - t >= GIVE_UP) {
-            lift();
+            limit.lift();
             waiting = None;
         } else if waiting.is_some() || asked == Some(now) {
             // Reconcile with what is plugged now, in case an event was lost.
-            let _ = set_high(meminfo().0);
+            limit.set_total(meminfo().0);
         }
     }
 }
@@ -273,5 +363,85 @@ fn ask() -> Reply {
         Ok(r) if r.starts_with("full") => Reply::Full,
         Ok(r) if r.starts_with("ok") => Reply::Enough,
         _ => Reply::Asked,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unchanged_total_does_not_write_or_rearm_after_lift() {
+        let (sent, received) = mpsc::channel();
+        let mut high = High::new(4096 << 10, move |value| {
+            let _ = sent.send(value);
+            Ok(())
+        });
+        high.set_total(4096 << 10);
+        // KiB changes within the same MiB leave the limit unchanged too.
+        high.set_total((4096 << 10) + 1);
+        assert!(received.try_recv().is_err());
+        high.lift();
+        assert_eq!(received.recv_timeout(Duration::from_secs(1)).unwrap(), None);
+        high.set_total((4096 << 10) + 1);
+        assert_eq!(*high.desired.lock().unwrap(), None);
+    }
+
+    #[test]
+    fn lift_repairs_a_late_numeric_write_while_reclaim_is_still_blocked() {
+        let (sent, received) = mpsc::channel();
+        let (resume, blocked) = mpsc::channel();
+        let blocked = Mutex::new(blocked);
+        let installed = Arc::new(Mutex::new(Some(high_limit(4096 << 10))));
+        let current = Arc::clone(&installed);
+        let mut high = High::new(4096 << 10, move |value| {
+            if value.is_some() {
+                // Pause before the kernel installs the limit, then in reclaim.
+                let _ = sent.send("starting");
+                blocked.lock().unwrap().recv().unwrap();
+                *current.lock().unwrap() = value;
+                let _ = sent.send("reclaiming");
+                blocked.lock().unwrap().recv().unwrap();
+            } else {
+                *current.lock().unwrap() = None;
+                let _ = sent.send("lifted");
+            }
+            Ok(())
+        });
+        high.set_total(2048 << 10);
+        assert_eq!(received.recv_timeout(Duration::from_secs(1)).unwrap(), "starting");
+        high.lift();
+        assert_eq!(received.recv_timeout(Duration::from_secs(1)).unwrap(), "lifted");
+        resume.send(()).unwrap();
+        assert_eq!(received.recv_timeout(Duration::from_secs(1)).unwrap(), "reclaiming");
+        assert_eq!(*installed.lock().unwrap(), Some(high_limit(2048 << 10)));
+        assert!(high.busy());
+        high.maintain_lift();
+        assert_eq!(*installed.lock().unwrap(), None);
+        assert_eq!(received.recv_timeout(Duration::from_secs(1)).unwrap(), "lifted");
+        resume.send(()).unwrap();
+        assert_eq!(received.recv_timeout(Duration::from_secs(1)).unwrap(), "lifted");
+    }
+
+    #[test]
+    fn blocked_reclaim_does_not_block_updates_or_emergency_lift() {
+        let (sent, received) = mpsc::channel();
+        let (resume, blocked) = mpsc::channel();
+        let blocked = Mutex::new(blocked);
+        let mut high = High::new(4096 << 10, move |value| {
+            let _ = sent.send(value);
+            if value.is_some() {
+                blocked.lock().unwrap().recv().unwrap();
+            }
+            Ok(())
+        });
+        high.set_total(2048 << 10);
+        assert_eq!(received.recv_timeout(Duration::from_secs(1)).unwrap(), Some(high_limit(2048 << 10)));
+        high.set_total(1024 << 10);
+        high.lift();
+        assert_eq!(received.recv_timeout(Duration::from_secs(1)).unwrap(), None);
+        resume.send(()).unwrap();
+        // The pending numeric update was superseded by GIVE_UP's max.
+        assert_eq!(received.recv_timeout(Duration::from_secs(1)).unwrap(), None);
     }
 }

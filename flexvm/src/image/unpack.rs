@@ -457,8 +457,17 @@ impl Root {
             }
             if let Some(hidden) = name_bytes.strip_prefix(b".wh.") {
                 let hidden = whiteout_target(hidden)?;
+                let rel = parent.join(std::ffi::OsStr::from_bytes(hidden.as_bytes()));
                 if let Ok(dir) = self.resolve(&parent) {
-                    remove_at(dir.as_raw_fd(), &hidden, 0)?;
+                    if mine.contains(&rel) || ancestors.contains(&rel) {
+                        // Keep this layer's entries, but hide lower descendants.
+                        if lstat_at(dir.as_raw_fd(), &hidden).is_some_and(|st| is_dir(&st)) {
+                            let sub = open_dir_at(dir.as_raw_fd(), &hidden)?;
+                            make_opaque(sub.as_raw_fd(), &rel, &mine, &ancestors, 0)?;
+                        }
+                    } else {
+                        remove_at(dir.as_raw_fd(), &hidden, 0)?;
+                    }
                 }
                 continue;
             }
@@ -828,6 +837,25 @@ mod tests {
         assert_eq!(h.ino(), n.ino());
         assert_eq!(n.mode() & 0o7777, 0o4755);
         assert_eq!(root.read("abs/through"), Some(b"t".to_vec()));
+    }
+
+    #[test]
+    fn plain_whiteout_keeps_same_layer_file_and_descendants() {
+        let s = Sandbox::new("wh-mine");
+        let mut root = s.open();
+        root.apply_layer(&layer(&[("foo", 'f', "lower"), ("dir/old", 'f', "old"), ("gone", 'f', "gone")])[..]).unwrap();
+        root.apply_layer(&layer(&[
+            ("foo", 'f', "upper"),
+            (".wh.foo", 'f', ""),
+            ("dir/new", 'f', "new"),
+            (".wh.dir", 'f', ""),
+            (".wh.gone", 'f', ""),
+        ])[..]).unwrap();
+        assert_eq!(s.read("foo").as_deref(), Some("upper"));
+        assert_eq!(s.read("dir/new").as_deref(), Some("new"));
+        assert_eq!(s.read("dir/old"), None);
+        assert_eq!(s.read("gone"), None);
+        assert!(!s.root.join(".wh.foo").exists());
     }
 
     #[test]
