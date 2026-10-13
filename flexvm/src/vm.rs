@@ -80,6 +80,9 @@ pub struct Vm {
     pub last_resize: Mutex<Instant>,
     /// Needs more memory than this host can give it.
     pub starved: AtomicBool,
+    /// Free page reports may be held in Firecracker: a hold was sent and no
+    /// release has landed since (see `hold_reports`).
+    reports_held: AtomicBool,
     /// Migration target only: the source's answer to `release`, true or an error.
     pub released: OnceLock<Value>,
     /// Host ends of exec sessions, by id, so a checkpoint can close them.
@@ -211,6 +214,7 @@ impl Vm {
             state: Mutex::new(state),
             last_resize: Mutex::new(Instant::now()),
             starved: AtomicBool::new(false),
+            reports_held: AtomicBool::new(false),
             released: OnceLock::new(),
             execs: Mutex::new(HashMap::new()),
             devices: Mutex::new(()),
@@ -594,6 +598,54 @@ impl Vm {
         Ok(first.unwrap_or(0.0))
     }
 
+    /// Holds the guest's free page reports in the balloon's queue: held,
+    /// Firecracker does not discard reported pages, so no REMOVE reaches the
+    /// pager while a copy-on-write checkpoint still has pages to save. Needs
+    /// `firecracker/0003-hold-free-page-reporting.patch`. Until a release
+    /// lands (`release_reports`) the hold counts as in place, even if this
+    /// fails: Firecracker may have applied it and its answer been lost. Only
+    /// a Firecracker that rejects the request (unpatched) holds nothing.
+    pub fn hold_reports(&self) -> Result<()> {
+        const PATH: &str = "/balloon/reporting/hold";
+        self.reports_held.store(true, Ordering::SeqCst);
+        let res = self.fc(|fc| fc.request_within("PATCH", PATH, None, Duration::from_secs(1)));
+        if res.as_ref().is_err_and(|e| rejected(e, PATH)) {
+            self.reports_held.store(false, Ordering::SeqCst);
+        }
+        res.map(drop)
+    }
+
+    /// Carries out the free page reports a hold kept back, if one may be in
+    /// place, retrying for `within`. Until a release lands the guest's
+    /// reported pages stay off its free lists, so one that fails stays due
+    /// (`release_pending`) and the controller retries it.
+    pub fn release_reports(&self, within: Duration) -> Result<()> {
+        const PATH: &str = "/balloon/reporting/release";
+        let deadline = Instant::now() + within;
+        while self.reports_held.load(Ordering::SeqCst) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.fc(|fc| fc.request_within("PATCH", PATH, None, left)) {
+                Ok(_) => self.reports_held.store(false, Ordering::SeqCst),
+                // Nothing to release: no such endpoint, or no Firecracker.
+                Err(e) if rejected(&e, PATH) || self.pid().is_none() => {
+                    self.reports_held.store(false, Ordering::SeqCst);
+                    return Err(e);
+                }
+                Err(e) if Instant::now() >= deadline => return Err(e),
+                Err(e) => {
+                    eprintln!("vm {}: releasing free page reports: {e}; retrying", self.name);
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether a release of held free page reports is still due.
+    pub fn release_pending(&self) -> bool {
+        self.reports_held.load(Ordering::SeqCst)
+    }
+
     /// Retries a few times; the VM keeps running regardless, only its
     /// statistics go stale.
     fn unpark_balloon(&self) {
@@ -755,4 +807,27 @@ pub fn name_cgroup(cgroup: Option<PathBuf>, name: &str) -> Option<PathBuf> {
             Err(_) => cg,
         }
     })
+}
+
+/// Whether Firecracker answered a PATCH of `path` with a client error (4xx):
+/// it has no such endpoint, so the request had no effect. Anything else (a
+/// timeout, a lost answer) may have been applied.
+fn rejected(e: &crate::util::Error, path: &str) -> bool {
+    e.to_string().strip_prefix(&format!("firecracker PATCH {path}: ")).is_some_and(|r| r.starts_with('4'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_client_error_means_nothing_was_held() {
+        let p = "/balloon/reporting/hold";
+        let err = |m: &str| -> crate::util::Error { m.into() };
+        assert!(rejected(&err("firecracker PATCH /balloon/reporting/hold: 400 {\"fault_message\":\"x\"}"), p));
+        assert!(!rejected(&err("firecracker PATCH /balloon/reporting/hold: out of time"), p));
+        assert!(!rejected(&err("firecracker PATCH /balloon/reporting/hold: 500 oops"), p));
+        assert!(!rejected(&err("Resource temporarily unavailable (os error 11)"), p));
+        assert!(!rejected(&err("firecracker PATCH /balloon/reporting/release: 400 x"), p));
+    }
 }

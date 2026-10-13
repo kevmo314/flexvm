@@ -1188,6 +1188,56 @@ def ckpt_incremental():
 
 
 
+def cow_reports_held():
+    """Free page reports wait in Firecracker's balloon while a keep-running
+    checkpoint is copied (a discard of an unsaved page would stall the guest
+    while the pager saved everything left), and are carried out after it."""
+    n, path = "ft-cow-fpr", ckpt_path("ft-cow-fpr")
+    ok(A, {"op": "run", "name": n, "template": args.template})
+    start_writer(A, n, mib=16)
+    # Enough memory that the slowed copy outlasts the guest's report delay.
+    code, out = sh(A, n, "head -c 384M /dev/zero > /dev/shm/big && sleep 2 && head -c 384M /dev/zero > /dev/shm/big2 && echo ok")
+    assert code == 0, out
+    time.sleep(4)
+    fault(A, "ckpt_memhash", 120000)
+    fault(A, "ckpt_slow", 120000)
+    res = {}
+    t = threading.Thread(target=lambda: res.update(r=rpc(A, {"op": "checkpoint", "name": n, "dir": path}, timeout=300)))
+    t.start()
+    copying = wait_for(lambda: vms(A).get(n, {}).get("checkpoint_copy"), 30)
+    check("cow fpr: copy runs in the background", copying, vms(A).get(n))
+    rss0 = vms(A)[n]["rss_mib"]
+    start = time.time()
+    code, out = sh(A, n, "rm /dev/shm/big /dev/shm/big2; sleep 4; echo ok")
+    took = time.time() - start
+    rss1, still = vms(A)[n]["rss_mib"], vms(A)[n].get("checkpoint_copy")
+    check("cow fpr: guest frees memory and runs on during the copy", code == 0 and took < 6, (code, out, took))
+    check("cow fpr: freed memory not discarded during the copy", still and rss1 > rss0 - 256, (rss0, rss1, still))
+    t.join()
+    fault(A, "ckpt_slow", 0)
+    fault(A, "ckpt_memhash", 0)
+    r = res.get("r", {})
+    check("cow fpr: checkpoint written", r.get("ok"), r)
+    if r.get("ok"):
+        r = r["result"]
+        print(f"cow fpr: checkpoint {r['checkpoint_ms']} ms; copy {r['copy']}")
+        check("cow fpr: no discard held up the copy", r["copy"]["discards_held"] == 0, r["copy"])
+        h = ok(A, {"op": "ckhash", "dir": path})
+        check("cow fpr: checkpoint == memory at the pause", h["hash"] == r["pause_memhash"], (h["hash"], r["pause_memhash"]))
+    # Then the held reports are carried out, and reporting works as before.
+    check("cow fpr: reports carried out after the copy", wait_for(lambda: vms(A)[n]["rss_mib"] < rss0 - 512, 20),
+          (rss0, vms(A)[n]["rss_mib"]))
+    code, out = sh(A, n, "head -c 384M /dev/zero > /dev/shm/big && echo ok")
+    rss2 = vms(A)[n]["rss_mib"]
+    sh(A, n, "rm /dev/shm/big")
+    check("cow fpr: reporting returns memory after the copy", code == 0 and wait_for(lambda: vms(A)[n]["rss_mib"] < rss2 - 256, 20),
+          (rss2, vms(A)[n]["rss_mib"]))
+    errors, _, out = writer_check(A, n)
+    check("cow fpr: guest memory intact", errors == 0, out)
+    cleanup(n)
+    rm_ckpt(path)
+
+
 def ckpt_failed_stop():
     """A paused (--stop) checkpoint that fails after the freeze must leave
     write tracking whole: pages the guest wrote since the last checkpoint
@@ -1299,7 +1349,7 @@ SCENARIOS = dict(basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, r
                  suspend_resume=suspend_resume, checkpoint_hotplug=checkpoint_hotplug,
                  checkpoint_untrusted_dir=checkpoint_untrusted_dir, resume_failures=resume_failures,
                  state_dir_lock=state_dir_lock, held_restore_frozen=held_restore_frozen,
-                 cow_exact=cow_exact, cow_abort=cow_abort, cow_crash=cow_crash, ckpt_incremental=ckpt_incremental,
+                 cow_exact=cow_exact, cow_abort=cow_abort, cow_crash=cow_crash, cow_reports_held=cow_reports_held, ckpt_incremental=ckpt_incremental,
                  ckpt_failed_stop=ckpt_failed_stop, ckpt_rearm=ckpt_rearm,
                  ckpt_dir_moved=ckpt_dir_moved)
 safe = [s for s in SCENARIOS

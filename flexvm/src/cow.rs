@@ -314,7 +314,14 @@ impl GuestPages for CowPages<'_> {
                     crate::bail!("the checkpoint copy stopped: {}", cow.error().unwrap_or_else(|| "the vm is gone".into()));
                 }
             }
-            let bytes = cow.rescued.lock().unwrap().remove(&p).ok_or_else(|| format!("page {p}: rescued copy missing"))?;
+            // A copy that stops (abort, kill) drops the rescued copies under
+            // the writers: that is the stop, not a lost page.
+            let Some(bytes) = cow.rescued.lock().unwrap().remove(&p) else {
+                if !cow.active() {
+                    crate::bail!("the checkpoint copy stopped: {}", cow.error().unwrap_or_else(|| "the vm is gone".into()));
+                }
+                crate::bail!("page {p}: rescued copy missing");
+            };
             cow.rescued_bytes.fetch_sub(bytes.len(), Ordering::SeqCst);
             buf[k * PAGE_SIZE..(k + 1) * PAGE_SIZE].copy_from_slice(&bytes);
             cow.set(p, CLEAN);
@@ -386,6 +393,59 @@ mod tests {
         // A stopped copy fails its writer instead of writing guesses.
         cow.stop();
         assert!(pages.read(8, &mut buf[..PAGE_SIZE]).is_err());
+    }
+
+    /// Guest memory whose reads stop half way until the test lets them go.
+    struct Gate {
+        entered: std::sync::Barrier,
+        go: std::sync::Barrier,
+    }
+
+    impl GuestPages for Gate {
+        fn region_end(&self, _page: usize) -> Option<usize> {
+            Some(64)
+        }
+
+        fn read(&self, _page: usize, buf: &mut [u8]) -> Result<()> {
+            self.entered.wait();
+            self.go.wait();
+            buf.fill(0);
+            Ok(())
+        }
+    }
+
+    /// A writer that finds the rescued copy of a page gone: because the copy
+    /// was stopped under it (it says why, `aborted`), or, while the copy is
+    /// still active, an integrity error.
+    #[test]
+    fn rescued_copy_dropped_under_the_writer() {
+        for abort in [true, false] {
+            let cow = Cow::new(64, &vec![(0, 2, REMOTE)]);
+            // Page 1 was rescued by a fault; the writer reads page 0 itself.
+            assert!(cow.claim(1, PENDING, RESCUING));
+            cow.rescue(1, vec![1u8; PAGE_SIZE].into());
+            let gate = Gate { entered: std::sync::Barrier::new(2), go: std::sync::Barrier::new(2) };
+            let pages = CowPages { guest: &gate, cow: &cow, slow: false };
+            let mut buf = vec![0u8; 2 * PAGE_SIZE];
+            let e = std::thread::scope(|s| {
+                let w = s.spawn(|| pages.read(0, &mut buf));
+                gate.entered.wait();
+                // The writer is inside its read of page 0, past its check
+                // that the copy is active.
+                if abort {
+                    cow.invalidate("the copy was aborted");
+                    cow.stop();
+                } else {
+                    cow.rescued.lock().unwrap().remove(&1);
+                }
+                gate.go.wait();
+                w.join().unwrap().unwrap_err().to_string()
+            });
+            match abort {
+                true => assert!(e.contains("aborted"), "{e}"),
+                false => assert!(e.contains("rescued copy missing"), "{e}"),
+            }
+        }
     }
 
     #[test]

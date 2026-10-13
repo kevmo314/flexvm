@@ -880,7 +880,11 @@ impl Pager {
         if flags & UFFD_PAGEFAULT_FLAG_WP != 0 {
             return self.wp_fault(page, m);
         }
-        let region_left = (m.offset as usize + m.size) / PAGE_SIZE - page;
+        // Runs stay within a 2 MiB chunk: Firecracker keeps unplugged
+        // virtio-mem slots PROT_NONE, which splits the region into VMAs at
+        // slot boundaries, and a uffd copy across a VMA end fails (ENOENT).
+        let chunk = (2 << 20) / PAGE_SIZE;
+        let region_left = ((m.offset as usize + m.size) / PAGE_SIZE - page).min(chunk - (page - m.offset as usize / PAGE_SIZE) % chunk);
         let pages = self.pages();
         match pages.get(page) {
             // Normally a fault that raced the install; if the page is really
