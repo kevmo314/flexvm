@@ -206,6 +206,18 @@ impl Pages {
         self.dirty.iter().map(|w| w.swap(0, Ordering::SeqCst)).collect()
     }
 
+    /// The dirty bits, left as they are.
+    fn read_dirty(&self) -> Vec<u64> {
+        self.dirty.iter().map(|w| w.load(Ordering::SeqCst)).collect()
+    }
+
+    /// Marks dirty again what `take_dirty` returned.
+    fn restore_dirty(&self, bits: &[u64]) {
+        for (w, &b) in self.dirty.iter().zip(bits) {
+            w.fetch_or(b, Ordering::SeqCst);
+        }
+    }
+
     pub fn get(&self, page: usize) -> u8 {
         self.states[page].load(Ordering::SeqCst)
     }
@@ -369,6 +381,9 @@ pub struct Frozen {
     pub cow: Option<Arc<Cow>>,
     /// Pages dirtied since the previous checkpoint's pause.
     pub dirty: usize,
+    /// The dirty bits taken, which a checkpoint that fails gives back
+    /// (`Pager::unfreeze`).
+    taken: Vec<u64>,
     /// Ranges write-protected, and how long that took.
     pub protected: usize,
     pub protect: Duration,
@@ -939,19 +954,24 @@ impl Pager {
         let cow = self.cow.lock().unwrap().clone().filter(|c| c.active());
         if let Some(cow) = &cow {
             cow.stats.faults.fetch_add(1, Ordering::Relaxed);
-            match cow.state(page) {
-                READING => {
-                    cow.stats.deferred.fetch_add(1, Ordering::Relaxed);
+            if cow.state(page) == READING {
+                cow.stats.deferred.fetch_add(1, Ordering::Relaxed);
+                return Err(eagain());
+            }
+            // Over budget, nothing more is copied here: unsaved pages of the
+            // block stay protected, and the writers take them first.
+            if cow.over_budget() {
+                let unsaved: Vec<usize> = (first..end).filter(|&p| cow.state(p) == PENDING).collect();
+                unsaved.iter().for_each(|&p| cow.want(p));
+                if unsaved.contains(&page) {
                     return Err(eagain());
                 }
-                PENDING if cow.over_budget() => {
-                    cow.want(page);
-                    return Err(eagain());
-                }
-                _ => {}
             }
             let start = Instant::now();
-            let claimed: Vec<usize> = (first..end).filter(|&p| cow.claim(p, PENDING, RESCUING)).collect();
+            let claimed: Vec<usize> = match cow.over_budget() {
+                true => Vec::new(),
+                false => (first..end).filter(|&p| cow.claim(p, PENDING, RESCUING)).collect(),
+            };
             if !claimed.is_empty() {
                 if let Err(e) = self.rescue(cow, first, end, &claimed) {
                     claimed.iter().for_each(|&p| cow.unclaim(p));
@@ -1081,7 +1101,8 @@ impl Pager {
         let next = AtomicUsize::new(0);
         thread::scope(|s| {
             for _ in 0..threads {
-                s.spawn(|| loop {
+                // Fewer threads if they cannot be had; the writers do the rest.
+                let spawned = thread::Builder::new().spawn_scoped(s, || loop {
                     let Some(&(first, end)) = chunks.get(next.fetch_add(1, Ordering::Relaxed)) else { return };
                     if cow.left() == 0 || !cow.active() {
                         return;
@@ -1092,6 +1113,9 @@ impl Pager {
                         false => claimed.iter().for_each(|&p| cow.unclaim(p)),
                     }
                 });
+                if spawned.is_err() {
+                    break;
+                }
             }
         });
     }
@@ -1166,7 +1190,13 @@ impl Pager {
             bail!("write tracking is off");
         }
         let pages = self.pages();
-        let dirty = pages.take_dirty();
+        // A VM that stays paused for the write (and is then killed) keeps its
+        // dirty pages: if the checkpoint fails and it runs on, they still
+        // tell what is unprotected. One that runs on starts a new interval.
+        let dirty = match cow {
+            true => pages.take_dirty(),
+            false => pages.read_dirty(),
+        };
         let ndirty = dirty.iter().map(|w| w.count_ones() as usize).sum();
         // Set bits in ascending page order.
         let dirty_pages = || {
@@ -1193,7 +1223,13 @@ impl Pager {
                     ranges = vec![(from, to)];
                 }
                 for (s, e) in ranges {
-                    self.writeprotect_retry(s, e - s, true).map_err(|e| format!("write-protecting guest memory: {e}"))?;
+                    if let Err(e) = self.writeprotect_retry(s, e - s, true) {
+                        // Every page must stay protected or dirty: give the
+                        // bits back, and protect everything again next time.
+                        pages.restore_dirty(&dirty);
+                        self.tracking.store(false, Ordering::SeqCst);
+                        bail!("write-protecting guest memory: {e}");
+                    }
                     protected += 1;
                 }
             }
@@ -1220,7 +1256,18 @@ impl Pager {
         };
         let cow = cow.then(|| Arc::new(Cow::new(pages.len(), &out)));
         *self.cow.lock().unwrap() = cow.clone();
-        Ok(Frozen { runs: out, cow, dirty: ndirty, protected, protect })
+        let taken = if cow.is_some() { dirty } else { Vec::new() };
+        Ok(Frozen { runs: out, cow, dirty: ndirty, taken, protected, protect })
+    }
+
+    /// Undoes `freeze` for a checkpoint that failed: stops its copy and marks
+    /// dirty again what it took, so the previous checkpoint is still the base
+    /// of the next delta. Pages the freeze protected stay protected until
+    /// written, which marks them dirty, so nothing is lost either way.
+    pub fn unfreeze(&self, frozen: &Frozen) {
+        self.end_copy();
+        let _wp = self.wp.lock().unwrap();
+        self.pages().restore_dirty(&frozen.taken);
     }
 
     /// Ends a checkpoint copy, finished or not. Pages stay protected for tracking.

@@ -273,8 +273,11 @@ through, so the checkpoint is exactly the memory at the pause.
   delta is chosen over writing a merged full image because it costs time
   and space in proportion to what changed (35 MiB and 90–110 ms for a 4 GiB
   VM with a small writer, against 4.2 GiB and 1.5–1.9 s); the price is that
-  restores read a chain and parents must be kept. A failed checkpoint ends
-  the chain (the next must be full). `--stop` can be incremental too.
+  restores read a chain and parents must be kept. Before writing a delta
+  the whole chain is verified (and must stay under 64 links), and it is
+  checked again just before publishing. A failed checkpoint gives back the
+  dirty pages it took, so the last good one stays the base, and every page
+  stays either protected or dirty. `--stop` can be incremental too.
   Tracking costs a write fault per 64 KiB block written between
   checkpoints, and the first protect makes KVM refault each page once.
 

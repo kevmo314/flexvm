@@ -110,6 +110,8 @@ pub struct Vm {
     /// The last checkpoint taken of this VM here while write tracking ran
     /// (its directory and id), which the next one can be a delta against.
     pub last_checkpoint: Mutex<Option<(PathBuf, String)>>,
+    /// A kill is waiting: a checkpoint in progress gives up.
+    pub cancel_checkpoint: AtomicBool,
 }
 
 impl Vm {
@@ -221,6 +223,7 @@ impl Vm {
             pending_net: Mutex::new(None),
             snapshot_discards: AtomicU64::new(0),
             last_checkpoint: Mutex::new(None),
+            cancel_checkpoint: AtomicBool::new(false),
         })
     }
 

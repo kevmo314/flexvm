@@ -438,13 +438,26 @@ impl Daemon {
                 let Some((dir, id)) = last.filter(|_| vm.pager.tracking()) else {
                     bail!("vm {} has no checkpoint to build on: take a full one with --keep-running first (an incremental checkpoint builds on the last one taken of the vm on this host, since it was last restored or migrated, that the vm ran on after)", vm.name)
                 };
-                match crate::checkpoint::checkpoint_id(&dir) {
-                    Ok(now) if now == id => {}
-                    Ok(_) => bail!("the last checkpoint of vm {}, {}, has changed; take a full one", vm.name, dir.display()),
-                    Err(e) => bail!("the last checkpoint of vm {}, {}: {e}; take a full one", vm.name, dir.display()),
+                // The whole chain must restore: every link verified, and room
+                // for one more.
+                let ck = Checkpoint::open(&dir).map_err(|e| format!("the last checkpoint of vm {}: {e}; take a full one", vm.name))?;
+                if ck.id != id {
+                    bail!("the last checkpoint of vm {}, {}, has changed; take a full one", vm.name, dir.display());
                 }
-                Some(crate::checkpoint::Parent { path: crate::checkpoint::parent_path(staging.dest(), &dir), id })
+                if ck.chain.len() + 2 > crate::checkpoint::MAX_CHAIN {
+                    bail!("vm {}: a delta on {} would make a chain of more than {} checkpoints; take a full one", vm.name, dir.display(), crate::checkpoint::MAX_CHAIN);
+                }
+                let mut links = vec![(ck.dir.clone(), ck.id.clone())];
+                links.extend(ck.chain.iter().cloned().zip(ck.chain_ids.iter().cloned()));
+                let parent = crate::checkpoint::Parent { path: crate::checkpoint::parent_path(staging.dest(), &dir), id };
+                Some((parent, links))
             }
+        };
+        let cancelled = || -> Result<()> {
+            if vm.cancel_checkpoint.load(Ordering::SeqCst) {
+                bail!("vm {} is being killed", vm.name);
+            }
+            Ok(())
         };
         // A VM still pulling memory from a migration source or its own
         // checkpoint finishes that first.
@@ -470,12 +483,13 @@ impl Daemon {
             t.mark("arm_tracking");
         }
         let plugged = vm.hotplug_plugged();
+        cancelled()?;
         vm.start_checkpoint()?;
         let paused = Instant::now();
-        // From the freeze on, the dirty pages since the last checkpoint are
-        // this one's: a later delta can only build on this one.
-        let last = vm.last_checkpoint.lock().unwrap().take();
-        let (mut memhash, mut froze) = (None, false);
+        // A checkpoint that fails gives back the dirty pages it took (see
+        // `Pager::unfreeze`), so the last checkpoint stays the base of the
+        // next delta; one that succeeds becomes it.
+        let mut memhash = None;
         let frozen = (|| -> Result<Frozen> {
             let runs = vm.save_state(&staging.vmstate(), false)?;
             t.mark("snapshot");
@@ -483,24 +497,23 @@ impl Daemon {
                 memhash = Some(vm.pager.content_hash()?);
                 t.mark("memhash");
             }
-            froze = true;
             let frozen = vm.pager.freeze(&runs, incremental, cow)?;
             t.mark("freeze");
             // A discard (balloon or virtio-mem) from just before the snapshot
             // on would make the pages disagree with the saved state.
-            if vm.pager.discards() != vm.snapshot_discards.load(Ordering::SeqCst) {
-                vm.pager.end_copy();
-                bail!("guest memory changed after the vm was paused (a device discarded pages); try again");
+            let checked = match vm.pager.discards() != vm.snapshot_discards.load(Ordering::SeqCst) {
+                true => Err("guest memory changed after the vm was paused (a device discarded pages); try again".into()),
+                false => cancelled(),
+            };
+            if let Err(e) = checked {
+                vm.pager.unfreeze(&frozen);
+                return Err(e);
             }
             Ok(frozen)
         })();
         let frozen = match frozen {
             Ok(f) => f,
             Err(e) => {
-                if !froze {
-                    // The dirty pages are untouched: the last checkpoint is still a base.
-                    *vm.last_checkpoint.lock().unwrap() = last;
-                }
                 return Err(match vm.end_checkpoint() {
                     Ok(_) => e,
                     Err(r) => format!("{e}; {r}").into(),
@@ -510,7 +523,7 @@ impl Daemon {
         let mut pause = None;
         if cow {
             if let Err(e) = vm.end_checkpoint() {
-                vm.pager.end_copy();
+                vm.pager.unfreeze(&frozen);
                 return Err(e);
             }
             pause = Some(paused.elapsed());
@@ -535,7 +548,19 @@ impl Daemon {
         };
         let snapshot_discards = vm.snapshot_discards.load(Ordering::SeqCst);
         let dest = staging.dest().to_path_buf();
+        let (parent, links) = parent.unzip();
         let committed = staging.commit(vm, src, &frozen.runs, parent, plugged.unwrap_or(0), t, || {
+            cancelled()?;
+            if self.fault("ckpt_fail_write") {
+                bail!("injected fault: writing the checkpoint failed");
+            }
+            // The chain this delta needs must still be there, unchanged.
+            for (dir, id) in links.iter().flatten() {
+                match crate::checkpoint::checkpoint_id(dir) {
+                    Ok(now) if now == *id => {}
+                    _ => bail!("checkpoint {} that this delta builds on has changed or gone; take a full one", dir.display()),
+                }
+            }
             match &frozen.cow {
                 // Discards while it runs are fine once the pages they hit were saved.
                 Some(c) => {
@@ -554,13 +579,15 @@ impl Daemon {
             Ok(())
         });
         let copy = frozen.cow.as_ref().map(|c| c.report());
-        vm.pager.end_copy();
+        match &committed {
+            Ok(_) => vm.pager.end_copy(),
+            Err(_) => vm.pager.unfreeze(&frozen),
+        }
         let paused = pause.unwrap_or_else(|| paused.elapsed());
         match committed {
             Ok((manifest, id)) => {
-                if cow {
-                    *vm.last_checkpoint.lock().unwrap() = Some((dest, id.clone()));
-                }
+                // The new base of deltas, if the VM runs on with tracking.
+                *vm.last_checkpoint.lock().unwrap() = cow.then(|| (dest, id.clone()));
                 Ok(Saved { manifest, id, paused, dirty: frozen.dirty, protected: frozen.protected, protect: frozen.protect, copy, memhash })
             }
             Err(CommitError::Failed(e)) if cow => Err(e),

@@ -680,10 +680,16 @@ impl Daemon {
     fn kill(&self, name: &str) -> Result<Value> {
         // A checkpoint still writing a running VM's pages gives up rather
         // than hold the kill up.
-        if let Ok(vm) = self.vm(name) {
+        let vm = self.vm(name).ok();
+        if let Some(vm) = &vm {
+            vm.cancel_checkpoint.store(true, Ordering::SeqCst);
             vm.pager.abort_copy();
         }
-        let _busy = self.reserve(name, "killing", LIFECYCLE_WAIT)?;
+        let busy = self.reserve(name, "killing", LIFECYCLE_WAIT);
+        if let Some(vm) = &vm {
+            vm.cancel_checkpoint.store(false, Ordering::SeqCst);
+        }
+        let _busy = busy?;
         self.kill_reserved(name)
     }
 

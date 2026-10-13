@@ -746,6 +746,8 @@ pub struct Checkpoint {
     pub file: Arc<PageFile>,
     /// The checkpoints it is built on, nearest first.
     pub chain: Vec<PathBuf>,
+    /// The ids of `chain`, in the same order.
+    pub chain_ids: Vec<String>,
 }
 
 /// Opens regular file `name` in `dir` (never through a symlink) and reads up
@@ -863,6 +865,7 @@ impl Checkpoint {
         let mut files = Vec::new();
         let mut sums = Vec::new();
         let mut chain = Vec::new();
+        let mut chain_ids = Vec::new();
         let mut top = None;
         for (i, l) in links.into_iter().enumerate() {
             files.push(l.file);
@@ -871,11 +874,12 @@ impl Checkpoint {
                 top = Some((l.dir, l.manifest, l.id, l.vmstate));
             } else {
                 chain.push(l.dir);
+                chain_ids.push(l.id);
             }
         }
         let (dir, manifest, id, vmstate) = top.unwrap();
         let (runs, file) = flatten(&layers, files, sums);
-        Ok(Checkpoint { dir, manifest, id, vmstate, runs, file: Arc::new(file), chain })
+        Ok(Checkpoint { dir, manifest, id, vmstate, runs, file: Arc::new(file), chain, chain_ids })
     }
 
     /// Pages the restored VM pulls from the checkpoint files.
@@ -1331,7 +1335,7 @@ mod tests {
         let ck = Checkpoint { dir: dir.clone(), manifest: serde_json::from_value(serde_json::json!({
             "format": 2, "created_unix_ms": 0, "name": "x", "ip": "10.0.0.1", "template": "tpl", "template_id": "", "vcpus": 1,
             "mem_mib": 1, "max_mib": 1, "hotplug_mib": 0, "guest_pages": n, "data_pages": 0, "zero_pages": 0, "files": {}})).unwrap(),
-            id: String::new(), vmstate: Vec::new(), runs, file: Arc::new(file), chain: Vec::new() };
+            id: String::new(), vmstate: Vec::new(), runs, file: Arc::new(file), chain: Vec::new(), chain_ids: Vec::new() };
         assert_eq!(ck.content_hash(&tpl).unwrap(), want.finish());
         let _ = std::fs::remove_dir_all(&dir);
     }
