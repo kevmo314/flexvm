@@ -699,8 +699,9 @@ the guest can leave any cgroup); without cgroup2 their session is killed.
   are cached in `ARTIFACTS/images/rootfs/` by image config digest, flexvm-init
   and overrides, and templates attach the cached file in place, so templates of
   one image share one copy in the page cache (it is never rewritten; deleting it
-  breaks those templates). Cache entries are published with fsync and rename
-  and only count once their `.ok` marker exists. The template's content ID covers that file as its
+  breaks those templates). Builds of the same cache key are serialized with
+  a lock; entries are published with fsync and no-replace rename, with their
+  `.ok` marker last. Incomplete existing entries are refused. The template's content ID covers that file as its
   `rootfs` component plus the image's manifest and config digests and the
   app config, so it differs whenever the image does.
 - **Process.** flexvm-init stays PID 1. It starts the entrypoint in its own

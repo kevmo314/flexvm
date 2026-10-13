@@ -178,30 +178,8 @@ pub fn prepare(cache: &Path, init: &Path, o: &Options) -> Result<(PathBuf, Image
     );
     let rootfs_dir = cache.join("rootfs");
     let cached = rootfs_dir.join(format!("{}.ext4", &key["sha256:".len()..]));
-    // The app config written into it, kept beside it for the template's id;
-    // `.ok` is written last and makes the entry valid.
+    let cached = cached_rootfs(&cached, |tmp| build_rootfs(&o.staging, &img, &app, &init_bytes, tmp, &o.limits))?;
     let conf_path = cached.with_extension("conf");
-    let done = cached.with_extension("ok");
-    if done.exists() && cached.exists() && conf_path.exists() {
-        eprintln!("image: root filesystem cached at {}", cached.display());
-    } else {
-        let _ = std::fs::remove_file(&done);
-        std::fs::create_dir_all(&rootfs_dir)?;
-        let tmp = cached.with_extension(format!("tmp{}", std::process::id()));
-        let res = build_rootfs(&o.staging, &img, &app, &init_bytes, &tmp, &o.limits).and_then(|conf| {
-            File::open(&tmp)?.sync_all()?;
-            publish(&conf_path, conf.as_bytes())?;
-            std::fs::rename(&tmp, &cached)?;
-            // The image and its config are durable before the marker says so.
-            sync_dir(&rootfs_dir)?;
-            publish(&done, b"")?;
-            sync_dir(&rootfs_dir)
-        });
-        if res.is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
-        res?;
-    }
     let app_conf = std::fs::read_to_string(&conf_path)?;
     Ok((cached, ImageMeta {
         source: o.image.clone(),
@@ -261,14 +239,95 @@ pub fn read_logs(vsock: &Path) -> Result<(Vec<u8>, String)> {
     bail!("guest closed the connection while sending logs")
 }
 
-/// Writes `path` durably: a temporary file, fsynced, renamed over it.
-fn publish(path: &Path, data: &[u8]) -> Result<()> {
-    let tmp = path.with_extension(format!("part{}", std::process::id()));
-    let mut f = create_new(&tmp)?;
-    f.write_all(data)?;
-    f.sync_all()?;
-    std::fs::rename(&tmp, path)?;
+fn entry_complete(cached: &Path) -> bool {
+    cached.is_file() && cached.with_extension("conf").is_file() && cached.with_extension("ok").is_file()
+}
+
+fn require_complete(cached: &Path) -> Result<()> {
+    if !entry_complete(cached) {
+        bail!("incomplete image cache entry {}: refusing to replace it", cached.display());
+    }
     Ok(())
+}
+
+/// Holds a stable per-key lock through the cache check, build and publication.
+fn cached_rootfs(cached: &Path, build: impl FnOnce(&Path) -> Result<String>) -> Result<PathBuf> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::create_dir_all(cached.parent().unwrap())?;
+    // Never unlink the lock: waiters must all lock the same inode.
+    let lock = File::options().write(true).create(true).truncate(false).custom_flags(libc::O_NOFOLLOW).open(cached.with_extension("lock"))?;
+    loop {
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            break;
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::Interrupted {
+            return Err(e.into());
+        }
+    }
+    if entry_complete(cached) {
+        eprintln!("image: root filesystem cached at {}", cached.display());
+    } else {
+        // A crashed publication must not be repaired with a different build,
+        // or an old marker made to certify files it was never written for.
+        for path in [cached.to_path_buf(), cached.with_extension("conf"), cached.with_extension("ok")] {
+            if std::fs::symlink_metadata(path).is_ok() {
+                require_complete(cached)?;
+            }
+        }
+        let tmp = cached.with_extension(format!("tmp{}", std::process::id()));
+        let res = build(&tmp).and_then(|conf| publish_rootfs(&tmp, cached, &conf));
+        let _ = std::fs::remove_file(&tmp);
+        res?;
+    }
+    Ok(std::fs::canonicalize(cached)?)
+}
+
+/// Publishes immutable files, with the completion marker last. A competing
+/// publisher's entry may only be reused once all three files are present.
+fn publish_rootfs(tmp: &Path, cached: &Path, conf: &str) -> Result<()> {
+    File::open(tmp)?.sync_all()?;
+    if !rename_noreplace(tmp, cached)? {
+        return require_complete(cached);
+    }
+    if !publish(&cached.with_extension("conf"), conf.as_bytes())? {
+        return require_complete(cached);
+    }
+    // The image and its config are durable before the marker says so.
+    let dir = cached.parent().unwrap();
+    sync_dir(dir)?;
+    if !publish(&cached.with_extension("ok"), b"")? {
+        require_complete(cached)?;
+    }
+    sync_dir(dir)
+}
+
+/// Returns false on EEXIST, leaving the existing file untouched.
+fn rename_noreplace(tmp: &Path, path: &Path) -> Result<bool> {
+    let src = CString::new(tmp.as_os_str().as_bytes()).map_err(|_| "NUL in path")?;
+    let dest = CString::new(path.as_os_str().as_bytes()).map_err(|_| "NUL in path")?;
+    if unsafe { libc::renameat2(libc::AT_FDCWD, src.as_ptr(), libc::AT_FDCWD, dest.as_ptr(), libc::RENAME_NOREPLACE) } == 0 {
+        return Ok(true);
+    }
+    let e = std::io::Error::last_os_error();
+    if e.raw_os_error() == Some(libc::EEXIST) {
+        return Ok(false);
+    }
+    Err(e.into())
+}
+
+/// Writes `path` durably without replacing it; discards the temporary file
+/// if another publisher got there first.
+fn publish(path: &Path, data: &[u8]) -> Result<bool> {
+    let tmp = path.with_extension(format!("part{}", std::process::id()));
+    let res = (|| {
+        let mut f = create_new(&tmp)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+        rename_noreplace(&tmp, path)
+    })();
+    let _ = std::fs::remove_file(&tmp);
+    res
 }
 
 /// Creates a new file, replacing a stale one but never writing through a
@@ -661,11 +720,100 @@ mod tests {
         let d = tmpdir("nofollow");
         let victim = d.join("victim");
         std::fs::write(&victim, "keep").unwrap();
-        std::os::unix::fs::symlink(&victim, d.join("x.part")).unwrap();
+        std::os::unix::fs::symlink(&victim, d.join(format!("x.part{}", std::process::id()))).unwrap();
         std::os::unix::fs::symlink(&victim, d.join("x")).unwrap();
-        publish(&d.join("x"), b"new").unwrap();
+        assert!(!publish(&d.join("x"), b"new").unwrap());
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
-        assert_eq!(std::fs::read_to_string(d.join("x")).unwrap(), "new");
+        assert!(std::fs::symlink_metadata(d.join("x")).unwrap().file_type().is_symlink());
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn cache_publication_never_replaces_files() {
+        use std::os::unix::fs::MetadataExt;
+        let d = tmpdir("noreplace");
+        let cached = d.join("key.ext4");
+        let tmp = d.join("build");
+        std::fs::write(&tmp, "first image").unwrap();
+        publish_rootfs(&tmp, &cached, "first config").unwrap();
+        let inode = std::fs::metadata(&cached).unwrap().ino();
+        std::fs::write(&tmp, "second image").unwrap();
+        publish_rootfs(&tmp, &cached, "second config").unwrap();
+        assert_eq!(std::fs::metadata(&cached).unwrap().ino(), inode);
+        assert_eq!(std::fs::read_to_string(&cached).unwrap(), "first image");
+        assert!(!publish(&cached.with_extension("conf"), b"second config").unwrap());
+        assert!(!publish(&cached.with_extension("ok"), b"replacement marker").unwrap());
+        assert_eq!(std::fs::read_to_string(cached.with_extension("conf")).unwrap(), "first config");
+        assert_eq!(std::fs::read(cached.with_extension("ok")).unwrap(), b"");
+        // An existing image without its completion marker cannot be reused.
+        std::fs::remove_file(cached.with_extension("ok")).unwrap();
+        assert!(publish_rootfs(&tmp, &cached, "second config").is_err());
+        assert!(!cached.with_extension("ok").exists());
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn cache_reuses_the_winning_entry_and_canonical_path() {
+        let d = tmpdir("reuse");
+        let real = d.join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, d.join("alias")).unwrap();
+        let cached = d.join("alias/key.ext4");
+        let path = cached_rootfs(&cached, |tmp| {
+            std::fs::write(tmp, "loser image")?;
+            // Simulate a publisher that did not participate in the lock.
+            let winner = d.join("winner");
+            std::fs::write(&winner, "winner image")?;
+            publish_rootfs(&winner, &cached, "winner config")?;
+            Ok("loser config".into())
+        }).unwrap();
+        assert_eq!(path, std::fs::canonicalize(real.join("key.ext4")).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "winner image");
+        assert_eq!(std::fs::read_to_string(path.with_extension("conf")).unwrap(), "winner config");
+        assert!(!cached.with_extension(format!("tmp{}", std::process::id())).exists());
+        assert_eq!(cached_rootfs(&cached, |_| panic!("cache hit must not build")).unwrap(), path);
+        std::fs::remove_file(path.with_extension("ok")).unwrap();
+        assert!(cached_rootfs(&cached, |_| panic!("incomplete entry must not build")).is_err());
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn config_collision_does_not_publish_a_completion_marker() {
+        let d = tmpdir("conf-collision");
+        let cached = d.join("key.ext4");
+        let tmp = d.join("build");
+        std::fs::write(&tmp, "image").unwrap();
+        std::fs::write(cached.with_extension("conf"), "existing config").unwrap();
+        assert!(publish_rootfs(&tmp, &cached, "new config").is_err());
+        assert_eq!(std::fs::read_to_string(cached.with_extension("conf")).unwrap(), "existing config");
+        assert!(!cached.with_extension("ok").exists());
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn concurrent_cache_builds_wait_and_reuse() {
+        use std::sync::mpsc;
+        let d = tmpdir("cache-lock");
+        let cached = d.join("key.ext4");
+        let (building, started) = mpsc::channel();
+        let (release, wait) = mpsc::channel();
+        let first_path = cached.clone();
+        let first = std::thread::spawn(move || cached_rootfs(&first_path, |tmp| {
+            building.send(()).unwrap();
+            wait.recv().unwrap();
+            assert!(!first_path.with_extension("ok").exists());
+            std::fs::write(tmp, "first image")?;
+            Ok("first config".into())
+        }).unwrap());
+        started.recv().unwrap();
+        let lock = File::options().write(true).open(cached.with_extension("lock")).unwrap();
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EWOULDBLOCK));
+        let second_path = cached.clone();
+        let second = std::thread::spawn(move || cached_rootfs(&second_path, |_| panic!("waiter must reuse the first build")).unwrap());
+        release.send(()).unwrap();
+        assert_eq!(first.join().unwrap(), second.join().unwrap());
+        assert_eq!(std::fs::read_to_string(&cached).unwrap(), "first image");
         std::fs::remove_dir_all(d).unwrap();
     }
 
