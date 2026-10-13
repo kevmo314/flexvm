@@ -58,7 +58,7 @@ usage:
   flexvm bench [--to ADDR] [--iterations N] [--dirty-mib N]  per-phase run/migrate latency into bench/
                [--template T] [--ready-port N | --ready-http N]  ... and until an image app answers
   flexvm bench --lifecycle DIR [--to ADDR] [--dirty-mib N,N..] pause/checkpoint/restore/suspend latency into bench/
-  flexvm kill NAME                                           stop a VM
+  flexvm kill NAME [--force]                                 stop a VM (--force: even a migration's paused source copy)
   flexvm unlend IP                                           free an address lent to a VM that migrated away
 
 options:
@@ -69,7 +69,7 @@ options:
 ";
 
 /// Flags that take no value.
-const SWITCHES: &[&str] = &["warm", "follow", "stop", "keep-running", "paused", "incremental"];
+const SWITCHES: &[&str] = &["warm", "follow", "stop", "keep-running", "paused", "incremental", "force"];
 
 struct Args {
     positional: Vec<String>,
@@ -212,7 +212,7 @@ fn real_main() -> Result<()> {
         )?),
         Some("ls") => list(call(&host, json!({"op": "ls"}))?),
         Some("unlend") => print(call(&host, json!({"op": "unlend", "ip": name}))?),
-        Some("kill") => print(call(&host, json!({"op": "kill", "name": name}))?),
+        Some("kill") => print(call(&host, json!({"op": "kill", "name": name, "force": args.has("force")}))?),
         Some(op @ ("pause" | "resume" | "suspend")) => print(call(&host, json!({"op": op, "name": name}))?),
         Some("checkpoint") => {
             let dir = pos.get(2).ok_or("checkpoint needs NAME DIR")?;

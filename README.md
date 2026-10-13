@@ -116,8 +116,9 @@ VM that is busy, paused or suspended.
   pooled Firecracker, paused. That Firecracker's pager takes pages from the
   checkpoint's page file: on fault, and in the background (the template's
   working set first) until all are in. The VM is ready in about the time of
-  a `run`. By default it keeps its name and address. A restore refuses an
-  address a peer is using; `--ip auto` picks a new one, which also makes a
+  a `run`. By default it keeps its name and address; on another host it
+  borrows the address from its home host (see Networking), which refuses
+  one in use or lent out. `--ip auto` picks a new one, which also makes a
   restore a fork of a running VM. `--paused` holds the restored VM paused
   until `resume`; its memory is still paged in meanwhile.
 - **suspend** checkpoints into the daemon's `--state-dir` (default
@@ -505,13 +506,29 @@ the source never resumes on its own: it resumes only on an explicit refusal, or
 when the target, asked about that id, says it aborted (asking also fences the
 id off, so it can never start later). If the target committed, the source stays
 paused and serves memory until the target releases it with the same id;
-release is idempotent and ignores any other VM by that name. If the target
+release is idempotent and ignores any other VM by that name. Meanwhile `kill`
+refuses that paused copy (kill the VM where it runs); `kill --force` kills it
+anyway, without withdrawing the address, and the target loses every page it
+has not pulled. If the target
 cannot be asked, the VM stays paused on the source until it can. A daemon
 locks its run directory (refusing to start if another daemon uses it, or one
 inside or around it) and kills any Firecracker a previous instance left there,
 confirming each is dead, before it answers anything, so "never seen this id" is true of a restarted target too
 (a source resuming then rolls the VM back to the pause point; it never runs
-twice).
+twice). It also removes the run directories those Firecrackers left. A
+target forgets an aborted migration's id 10 minutes after it aborted, and a
+committed one's 10 minutes after its source answered the release, so the
+record of migrations stays bounded.
+
+The page server (`pages`) answers its request line with one JSON line,
+`{"ok": true}` or why it refuses, before the binary protocol, so a target
+reports the source's reason rather than a hang-up. It serves reads of at most
+1 MiB (the largest a pager asks for) and drops a connection that asks for
+more, that sits idle for 10 minutes, or whose VM is no longer that
+migration's source (released or killed; checked every second). Peer-sized lengths are bounded
+everywhere a daemon reads them: request lines (16 MiB), a migration's header
+(256 MiB, parsed straight into page runs), vmstate (64 MiB), preloaded pages
+(4096).
 
 `FLEXVM_FAULTS=1` lets a daemon accept `{"op": "fault", "fault": F, "ms": N}`
 for any of the faults in `FAULTS` (`flexvm/src/daemon.rs`, described at
@@ -644,14 +661,66 @@ and a second copy could repeat what it did.
   MACAddressPolicy=none
   ```
 - Addresses come from the daemon's `--vm-ips` range, which is authoritative:
-  **every host's range must be disjoint** from the others' (a daemon warns in
-  its log when a peer's overlaps). Handing one out asks no peer, so two hosts
-  can never pick the same address. An address whose VM migrated to another
-  host stays reserved ("lent", recorded in `STATE_DIR/lent-ips.json`, which
-  outlives restarts) until that VM is killed wherever it is (its host tells
-  the peers), or it migrates back. If that message is lost, the address stays
-  taken; `flexvm unlend IP` frees it. Leaks, never collisions. `flexvm run --ip` picks
-  one explicitly.
+  **every host's range must be disjoint** from the others'. That is a
+  precondition for the operator to ensure; the daemon only checks it best
+  effort. It refuses to start when a peer that answers has an overlapping
+  range (one that does not answer is not checked, and a WARNING says so),
+  and hands out no address in an overlap it learns of later (it checks
+  every 10 s).
+  **Only an address's home host hands it to a new VM**: `run --ip` is
+  refused for an address outside the host's range ("start the vm on its
+  home host, or use --ip auto"). A restore of another host's address
+  (its checkpoint's, or `--ip`) borrows it: it asks the home host (op
+  `lend_ip`), which checks the address is free (no VM there, not lent),
+  gives it a new generation, records the loan durably and answers with the
+  generation; the restore then claims the address with it, and gives it
+  back (a withdrawal) if it fails. A home host that does not answer fails
+  the restore ("restore with --ip auto"). An address leaves its home only
+  this way or with a VM that migrates away: it stays reserved there
+  ("lent", recorded in `STATE_DIR/lent-ips.json`, which outlives restarts)
+  until that VM is killed wherever it is (its host tells the peers), or it
+  migrates back. If that message is lost, the address stays taken; `flexvm
+  unlend IP` frees it. Leaks, never collisions.
+- **Generations.** Each VM's address carries a generation that orders the
+  VMs that have had it. Its home host gives a new, higher one every time it
+  hands the address out (run, restore). A VM keeps its generation through
+  migrations and suspends (`GEN` in the suspended checkpoint). Lent records
+  store it (records from before generations count as 0, older than any),
+  and route announcements and withdrawals carry it.
+  - Every host keeps the newest generation it has seen per address, and
+    whether that one was withdrawn, in `STATE_DIR/gens/` (one small file per
+    address, written before the message is acted on or answered, or before
+    a claim of a new generation exists; a failure refuses the message or
+    fails the claim), plus a high-water mark of the generations it hands
+    out (reserved 1024 at a time, so a restart never repeats one). The last
+    check that an address is free (not used, lent or in an overlapping
+    peer range) and the claim happen in one critical section.
+  - A message about an older generation, or an announcement of one already
+    withdrawn, is ignored: a late withdrawal for a VM long gone (say one an
+    operator unlent, whose address then went to a new VM that migrated away
+    too) leaves the newer VM's loan and route alone, and a late
+    announcement brings back no route for a VM that is gone, also after a
+    restart. A withdrawal frees a loan of its generation or an older one.
+  - Route messages are taken only for addresses of this host's range, a
+    peer's, or a VM here, and leave the route of an address a VM here has
+    claimed (running, starting or arriving) with that generation or a
+    newer one alone; a newer one supersedes such a claim. Deciding a route
+    and changing it in the kernel happen under that address's lock, as do
+    migration route switches (which check the VM's generation first) and
+    packet holds. An arriving VM's generation is recorded before it is
+    taken in and checked again when it commits; if it does not commit, the
+    newest route a peer announced for the address is put back. A migration
+    source that aborts does not resume a VM whose generation was withdrawn
+    or superseded meanwhile: that copy is killed, and the newest route a
+    peer announced replaces the hold.
+  - A suspended VM whose generation was withdrawn or superseded meanwhile
+    is not resumed (checked under the address's lock, held until the VM
+    has resumed). Suspend records the generation in the checkpoint before
+    publishing it; one without (or with a stale one) is quarantined at
+    startup (left on disk, logged, not brought back); its checkpoint
+    restores with `--ip auto`.
+  - Hosts of a cluster must be upgraded together: the page server's answer
+    line and the generations are part of the protocol.
 - Reachability:
   - **Peers** get a route pushed to them: `<vm-ip>/32 via <host underlay ip>`.
     Routes via an address local to the daemon's network namespace (including

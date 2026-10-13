@@ -123,8 +123,19 @@ impl Daemon {
         let _op = self.admit()?;
         let busy = self.reserve(name, "resuming", LIFECYCLE_WAIT)?;
         if let Ok(vm) = self.vm(name) {
+            // Its address's generation must still be current (a held
+            // restore's address may have been given out again meanwhile):
+            // checked under the address's lock, held through the resume.
+            let route = self.addr_lock(vm.ip).lock().unwrap();
+            let gen = self.addrs.lock().unwrap().used.get(&vm.ip).copied();
+            if gen.is_some_and(|g| !self.gens.lock().unwrap().current(vm.ip, g)) {
+                drop(route);
+                self.kill_reserved(name)?;
+                bail!("vm {name}: its address {}'s generation was withdrawn or superseded; it is not resumed, and is gone", vm.ip);
+            }
             let start = Instant::now();
             vm.unpause()?;
+            drop(route);
             let took = start.elapsed();
             // A held restore at a new address: the guest gets it now, still
             // under the reservation.
@@ -152,6 +163,16 @@ impl Daemon {
             suspended.remove(name)
         };
         let Some(s) = s else { bail!("no vm named {name:?}") };
+        // Its address's generation must still be live (see `Gens`), from the
+        // check through consuming the checkpoint and resuming the VM: no
+        // route message for the address is taken in meanwhile.
+        let ip = s.manifest.ip;
+        let route = self.addr_lock(ip).lock().unwrap();
+        let gen = self.addrs.lock().unwrap().used.get(&ip).copied();
+        if gen.is_some_and(|g| !self.gens.lock().unwrap().current(ip, g)) {
+            self.suspended.lock().unwrap().insert(name.into(), s);
+            bail!("vm {name}: its address {ip}'s generation was withdrawn or superseded; it stays suspended");
+        }
         // The checkpoint stays where it is; `restore_checkpoint` marks it
         // STARTED, durably, before any vCPU runs, and a daemon restart
         // discards started checkpoints instead of bringing them back.
@@ -159,6 +180,7 @@ impl Daemon {
             t.mark("verify_checkpoint");
             self.restore_checkpoint(name, ck, s.manifest.ip, true, false, &mut t)
         });
+        drop(route);
         match res {
             Ok(mut v) => {
                 v["from"] = json!("suspended");
@@ -263,6 +285,11 @@ impl Daemon {
         let rss = vm.rss();
         let dest = self.cfg.state_dir.join("suspended").join(name);
         let staging = Staging::new(&dest, vm.dir.join("checkpoint.vmstate"))?;
+        // Its address keeps its generation across a restart (`load_suspended`):
+        // recorded in the checkpoint, durably, before it is published, or no
+        // suspend.
+        let gen = self.addrs.lock().unwrap().used.get(&vm.ip).copied().ok_or_else(|| format!("{} is not claimed here", vm.ip))?;
+        staging.add_file(GEN, gen.to_string().as_bytes()).map_err(|e| format!("vm {name}: recording its address generation: {e}"))?;
         let manifest = self.save(&vm, staging, false, false, &mut t)?.manifest;
         // The checkpoint is durable; only now let go of the memory. The pager
         // stops before Firecracker dies, and its page states are never read
@@ -308,27 +335,39 @@ impl Daemon {
         if name.is_empty() || self.taken(&name) {
             bail!("vm name {name:?} is empty or taken");
         }
+        // A given address, the checkpoint's own included, is checked against
+        // the peers as well (`claim_given_ip`).
         let ip = match ip {
             Some("auto") => self.claim_ip_kept(None)?,
             Some(ip) => self.claim_ip_kept(Some(ip))?,
-            None => {
-                let ip = ck.manifest.ip;
-                for peer in &self.cfg.peers {
-                    let used = peer_info(peer).is_ok_and(|i| i["ips"].as_array().is_some_and(|a| a.contains(&json!(ip.to_string()))));
-                    if used {
-                        bail!("{ip} is in use on {peer}; restore with --ip");
-                    }
-                }
-                self.claim_ip_kept(Some(&ip.to_string()))?
-            }
+            None => self
+                .claim_ip_kept(Some(&ck.manifest.ip.to_string()))
+                .map_err(|e| format!("{e}; restore with --ip auto (or another address)"))?,
         };
         t.mark("claim_ip");
+        let give_back = |e: Error| {
+            let gen = self.addrs.lock().unwrap().used.remove(&ip);
+            // A borrowed address goes back to its home host.
+            if !self.cfg.vm_ips.contains(ip) {
+                self.withdraw_from_peers(ip, gen);
+            }
+            e
+        };
+        // Its address's generation must still be current when the VM runs
+        // (a borrowed one may have been withdrawn or given out again since
+        // the claim): checked under the address's lock, held through the
+        // restore and its resume, so no route message changes it meanwhile.
+        let route = self.addr_lock(ip).lock().unwrap();
+        let gen = self.addrs.lock().unwrap().used.get(&ip).copied();
+        if gen.is_some_and(|g| !self.gens.lock().unwrap().current(ip, g)) {
+            drop(route);
+            return Err(give_back(format!("{ip}'s generation was withdrawn or superseded since it was claimed; restore with --ip auto").into()));
+        }
         // A user's checkpoint is immutable and may be restored again whether
         // or not this VM got to run.
-        self.restore_checkpoint(&name, ck, ip, false, paused, &mut t).map_err(|e| {
-            self.addrs.lock().unwrap().used.remove(&ip);
-            e.error()
-        })
+        let res = self.restore_checkpoint(&name, ck, ip, false, paused, &mut t);
+        drop(route);
+        res.map_err(|e| give_back(e.error()))
     }
 
     /// Restores `ck` as VM `name` at `ip` (already claimed), its memory paged
@@ -727,8 +766,36 @@ impl Daemon {
             }
             match Checkpoint::open(&e.path()) {
                 Ok(ck) => {
-                    if !self.addrs.lock().unwrap().used.insert(ck.manifest.ip) {
-                        eprintln!("suspended vm {name}: {} is already taken", ck.manifest.ip);
+                    let ip = ck.manifest.ip;
+                    // The generation it was suspended with, unchanged. One
+                    // withdrawn or superseded meanwhile (the VM's address went
+                    // on elsewhere), or none recorded where this host may not
+                    // hand the address out, is left alone: it is not brought
+                    // back.
+                    let _route = self.addr_lock(ip).lock().unwrap();
+                    let gen = match read_gen(&e.path()) {
+                        Some(gen) if self.gens.lock().unwrap().current(ip, gen) => Ok(gen),
+                        Some(gen) => Err(format!("its address {ip}'s generation {gen} was withdrawn or superseded")),
+                        // A suspend records it before publishing; one
+                        // without (from before generations, or tampered
+                        // with) is never adopted.
+                        None => Err(format!("no generation recorded for its address {ip}")),
+                    };
+                    let gen = match gen {
+                        Ok(gen) => gen,
+                        Err(why) => {
+                            eprintln!(
+                                "QUARANTINED suspended vm {name} in {}: {why}; not brought back (its checkpoint restores with --ip auto)",
+                                e.path().display()
+                            );
+                            continue;
+                        }
+                    };
+                    match self.addrs.lock().unwrap().used.entry(ip) {
+                        std::collections::hash_map::Entry::Occupied(_) => eprintln!("suspended vm {name}: {ip} is already taken"),
+                        std::collections::hash_map::Entry::Vacant(v) => {
+                            v.insert(gen);
+                        }
                     }
                     eprintln!("suspended vm {name} ({}) found in {}", ck.manifest.ip, e.path().display());
                     self.suspended.lock().unwrap().insert(name, Suspended { dir: ck.dir, manifest: ck.manifest, quarantine: None });
@@ -869,6 +936,13 @@ impl Drop for HeldReports<'_> {
             eprintln!("vm {}: releasing free page reports failed: {e}", self.0.name);
         }
     }
+}
+
+/// In a suspended VM's checkpoint: its address's generation (see `Gens`).
+const GEN: &str = "GEN";
+
+fn read_gen(dir: &Path) -> Option<u64> {
+    std::fs::read_to_string(dir.join(GEN)).ok()?.trim().parse().ok()
 }
 
 /// Creates marker file `name` in `dir` and makes it durable.

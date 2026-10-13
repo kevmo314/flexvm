@@ -287,6 +287,15 @@ impl Staging {
         create_at(self.ck.as_raw_fd(), name)
     }
 
+    /// Adds a small file of the daemon's own to the checkpoint, durably,
+    /// published with it (a suspended VM's `GEN`).
+    pub fn add_file(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        let f = self.create(name)?;
+        (&f).write_all(bytes)?;
+        f.sync_all()?;
+        Ok(())
+    }
+
     /// Allocates disk space for about `pages` pages, ahead of the pause.
     pub fn preallocate(&mut self, pages: usize) -> Result<()> {
         let file = PagesFile::new(self.create("pages")?);
