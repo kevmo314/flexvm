@@ -215,6 +215,7 @@ impl Proc {
             "gen": gen,
             "source": source,
             "rss_mib": vm.rss() >> 20,
+            "regions": vm.pager.regions(),
         }))?;
         let reply = recv_json(&mut reader)?.ok_or_else(|| format!("{to} hung up"))?;
         if reply["ok"] != json!(true) {
@@ -546,7 +547,15 @@ impl Proc {
     /// The part of taking a VM in that needs no vmstate.
     fn prepare_in(&self, req: &Value, mig: u64, t: &mut Phases) -> Result<PreparedIn> {
         let name = req["name"].as_str().ok_or("missing name")?.to_string();
-        let source = Source { addr: req["source"].as_str().ok_or("missing source")?.into(), vm: name.clone(), mig };
+        let source = Source {
+            addr: req["source"].as_str().ok_or("missing source")?.into(),
+            vm: name.clone(),
+            mig,
+            regions: serde_json::from_value(req["regions"].clone()).map_err(|e| format!("bad regions: {e}"))?,
+        };
+        if source.regions.is_empty() {
+            bail!("the source sent no memory regions");
+        }
         self.set_name(self.host.take_name(&name, false)?);
         self.host.mig_begin(mig)?;
         *self.arrived.lock().unwrap() = Some(mig);

@@ -529,6 +529,7 @@ impl Proc {
             }
         };
         let mut pause = None;
+        let mut growth = None;
         // Free page reports wait in the balloon's queue until the copy is
         // over (released when this goes out of scope, after `end_copy` or
         // `unfreeze`): a discard of an unsaved page would make the pager
@@ -550,6 +551,8 @@ impl Proc {
             }
             pause = Some(paused.elapsed());
             t.mark("resume");
+            // Running on while the pages are copied: it may grow meanwhile.
+            growth = Some(CopyGrowth::start(vm));
             if fault("ckpt_abort") {
                 // Test: give the copy up half way through.
                 let (pager, c) = (vm.pager.clone(), frozen.cow.clone().unwrap());
@@ -572,7 +575,12 @@ impl Proc {
             }
             thread::sleep(Duration::from_millis(10));
         }
-        let cow_pages = frozen.cow.as_deref().map(|c| crate::cow::CowPages { guest: vm.pager.as_ref(), cow: c, slow: fault("ckpt_slow") });
+        let slow = match (fault("ckpt_crawl"), fault("ckpt_slow")) {
+            (true, _) => Duration::from_millis(500),
+            (false, true) => Duration::from_millis(50),
+            _ => Duration::ZERO,
+        };
+        let cow_pages = frozen.cow.as_deref().map(|c| crate::cow::CowPages { guest: vm.pager.as_ref(), cow: c, slow });
         let src: &dyn crate::checkpoint::GuestPages = match &cow_pages {
             Some(c) => c,
             None => vm.pager.as_ref(),
@@ -615,11 +623,17 @@ impl Proc {
                 }
                 None => {}
             }
-            if vm.hotplug_plugged() != plugged {
-                bail!("guest memory was resized during the checkpoint; try again");
+            // A copy-on-write copy lets the VM grow (see `Proc::resize`); what
+            // it saved is the size at the pause.
+            match vm.hotplug_plugged() {
+                Some(now) if cow && now >= plugged.unwrap_or(0) => {}
+                now if now == plugged => {}
+                _ => bail!("guest memory was resized during the checkpoint; try again"),
             }
             Ok(())
         });
+        // No resize is in progress once this returns, and none starts.
+        drop(growth);
         let copy = frozen.cow.as_ref().map(|c| c.report());
         match &committed {
             Ok(_) => vm.pager.end_copy(),
@@ -786,6 +800,23 @@ fn delete_checkpoint(dir: &Path) -> std::io::Result<()> {
     }
     std::fs::File::open(dir)?.sync_all()?;
     std::fs::remove_dir_all(dir)
+}
+
+/// While alive, `vm` may grow although its checkpoint holds its operation
+/// lock (see `Proc::resize`). Ending it waits for a resize in progress.
+struct CopyGrowth<'a>(&'a Vm);
+
+impl<'a> CopyGrowth<'a> {
+    fn start(vm: &'a Vm) -> Self {
+        *vm.cow_copy.lock().unwrap() = true;
+        CopyGrowth(vm)
+    }
+}
+
+impl Drop for CopyGrowth<'_> {
+    fn drop(&mut self) {
+        *self.0.cow_copy.lock().unwrap() = false;
+    }
 }
 
 /// After a failed resume whose STARTED marker may or may not be durable:

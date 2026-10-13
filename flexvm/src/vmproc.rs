@@ -433,6 +433,8 @@ impl Proc {
         self.serve_control();
         let p = self.clone();
         thread::spawn(move || p.controller());
+        let p = self.clone();
+        thread::spawn(move || p.serve_memory());
         if self.vm().template.meta.image.is_some() {
             let p = self.clone();
             thread::spawn(move || p.follow_app());
@@ -587,6 +589,16 @@ impl Proc {
         let vm = self.vm();
         match req["what"].as_str().unwrap_or("") {
             "memhash" => self.memhash(),
+            // Set the VM's hotplug size directly, as the controller would.
+            "hotplug" => {
+                let _op = self.op()?;
+                if vm.state() != State::Running {
+                    bail!("vm {} is not running here", vm.name);
+                }
+                *vm.last_resize.lock().unwrap() = Instant::now();
+                let mib = req["mib"].as_u64().ok_or("missing mib")?;
+                vm.fc(|fc| fc.patch("/hotplug/memory", json!({"requested_size_mib": mib})))
+            }
             "status" => Ok(json!({
                 "state": vm.state().name(),
                 "background_pull_ms": vm.pager.pull_time().map(ms),
@@ -627,17 +639,71 @@ impl Proc {
                         Err(e) => eprintln!("vm {}: releasing free page reports: {e}", vm.name),
                     }
                 }
-                if vm.state() == State::Running {
-                    let starved = vm.starved.load(Ordering::SeqCst);
-                    if let Err(e) = resize(vm, host_available_mib(), self.host.cfg.reserve_mib) {
-                        eprintln!("vm {}: resize: {e}", vm.name);
-                    }
-                    if starved != vm.starved.load(Ordering::SeqCst) {
-                        self.publish();
-                    }
-                }
+            }
+            let starved = vm.starved.load(Ordering::SeqCst);
+            if let Err(e) = self.resize(None) {
+                eprintln!("vm {}: resize: {e}", vm.name);
+            }
+            if starved != vm.starved.load(Ordering::SeqCst) {
+                self.publish();
             }
             crate::evict::tick(&self.host, vm.starved.load(Ordering::SeqCst));
+        }
+    }
+
+    /// Resizes the VM unless an operation holds it, except that a VM whose
+    /// copy-on-write checkpoint is being copied may grow: the copy only reads
+    /// the pages it had at the pause, and memory plugged after it was
+    /// unplugged then (never populated), so the copy never reads it, and the
+    /// checkpoint keeps the plugged size it saved.
+    fn resize(&self, hint: Option<u64>) -> Result<Resized> {
+        let vm = self.vm();
+        if let Ok(_op) = self.op.try_lock() {
+            return resize(vm, &self.host, hint, false);
+        }
+        let copying = vm.cow_copy.lock().unwrap();
+        match *copying {
+            true => resize(vm, &self.host, hint, true),
+            false => Ok(Resized::Busy),
+        }
+    }
+
+    /// Answers the guest agent's memory requests (sent the moment it runs
+    /// low) with an immediate resize, until the VM is gone. The guest is
+    /// untrusted: requests are bounded in size and time, malformed ones
+    /// dropped, and they are acted on at most once per `MEM_REQUEST_GAP`.
+    fn serve_memory(self: Arc<Self>) {
+        let vm = self.vm().clone();
+        let path = vm.mem_sock();
+        let _ = std::fs::remove_file(&path);
+        let listener = match UnixListener::bind(&path) {
+            Ok(l) => l,
+            Err(e) => return eprintln!("vm {}: memory requests: {e}", vm.name),
+        };
+        let mut acted: Option<Instant> = None;
+        for conn in listener.incoming() {
+            if vm.pid().is_none() {
+                break;
+            }
+            let Ok(conn) = conn else { continue };
+            let _ = conn.set_write_timeout(Some(MEM_REQUEST_DEADLINE));
+            let Some(avail) = read_mem_request(&conn) else { continue };
+            if acted.is_some_and(|t| t.elapsed() < MEM_REQUEST_GAP) {
+                let _ = (&conn).write_all(b"busy\n");
+                continue;
+            }
+            acted = Some(Instant::now());
+            let reply = match self.resize(Some(avail)) {
+                Ok(Resized::Grew) => "grow",
+                Ok(Resized::Busy) => "busy",
+                Ok(Resized::Full) => "full",
+                Ok(Resized::Same) => "ok",
+                Err(e) => {
+                    eprintln!("vm {}: resize on request: {e}", vm.name);
+                    "busy"
+                }
+            };
+            let _ = (&conn).write_all(format!("{reply}\n").as_bytes());
         }
     }
 
@@ -837,45 +903,121 @@ pub fn host_available_mib() -> u64 {
     proc_kb("/proc/meminfo", "MemAvailable").unwrap_or(0) >> 20
 }
 
-/// Grows or shrinks a VM's hotplugged memory to keep its free memory within a
-/// band. Freed pages inside plugged memory go back to the host through free
-/// page reporting, so this mostly decides how far the guest may grow. A VM
-/// that needs to grow past what this host can back is flagged as starved so
-/// that it is moved somewhere roomier.
-fn resize(vm: &Vm, host_avail: u64, reserve: u64) -> Result<()> {
+/// Free memory (MiB) the controller keeps plugged for a guest with `total`
+/// MiB. The guest agent asks for more as soon as it has less than this, and
+/// throttles allocations that outrun the plug (guest/src/mem.rs uses the same mark).
+pub fn headroom(total: u64) -> u64 {
+    (total / 4).max(1024.min(total / 2))
+}
+
+/// What a resize did, answered to the guest when it asked.
+#[derive(Debug, PartialEq)]
+pub enum Resized {
+    Grew,
+    Same,
+    /// The guest is still processing the previous request, or the VM is busy.
+    Busy,
+    /// Short on memory, and at its ceiling or refused by the host's reserve.
+    Full,
+}
+
+/// Grows or shrinks a VM's hotplugged memory to keep `headroom` of it free,
+/// never shrinking below what its template was snapshotted with. Plugged
+/// memory the guest has not touched costs the host nothing, and pages it
+/// frees go back through free page reporting, so this mostly decides how far
+/// the guest may grow before asking again.
+///
+/// The guest is untrusted: its size comes from Firecracker, and what it says
+/// it has free (`hint`, MiB, from its own request; else the balloon
+/// statistics) only steers growth, which is bounded per step and admitted
+/// against the host's reserve (`Host::admit`). A VM that is short and cannot
+/// grow here (at its ceiling, or refused) is flagged as starved, so that it
+/// is moved somewhere roomier.
+fn resize(vm: &Vm, host: &Host, hint: Option<u64>, grow_only: bool) -> Result<Resized> {
     let meta = &vm.template.meta;
     let hotplug_total = meta.max_mib - meta.mem_mib;
     if hotplug_total == 0 {
-        return Ok(());
+        return Ok(Resized::Full);
     }
-    let (stats, hp) = vm.fc(|fc| Ok((fc.get("/balloon/statistics")?, fc.get("/hotplug/memory")?)))?;
-    let avail = stats["available_memory"].as_u64().unwrap_or(0) >> 20;
-    let total = stats["total_memory"].as_u64().unwrap_or(0) >> 20;
-    let requested = hp["requested_size_mib"].as_u64().unwrap_or(0);
-    let plugged = hp["plugged_size_mib"].as_u64().unwrap_or(0);
-    if total == 0 || plugged != requested {
-        return Ok(()); // no stats yet, or the guest is still processing the last request
-    }
-    let headroom = (total / 4).max(256);
-    let round = |mib: u64| mib.div_ceil(STEP_MIB) * STEP_MIB;
+    // Callers hold the VM's operation lock (or its copy-growth lock), so no
+    // lifecycle operation runs meanwhile; only a running VM is resized.
     let mut last = vm.last_resize.lock().unwrap();
-    let new = if avail < headroom {
-        (requested + round(headroom * 2 - avail)).min(hotplug_total)
-    } else if avail > headroom * 3 && requested > 0 && last.elapsed() > Duration::from_secs(10) {
-        requested.saturating_sub((avail - headroom * 2) / STEP_MIB * STEP_MIB)
+    if vm.state() != State::Running {
+        return Ok(Resized::Busy);
+    }
+    let (stats, hp) = vm.fc(|fc| {
+        let stats = if hint.is_none() { fc.get("/balloon/statistics")? } else { Value::Null };
+        Ok((stats, fc.get("/hotplug/memory")?))
+    })?;
+    let requested = hp["requested_size_mib"].as_u64().ok_or("no hotplug state")?;
+    let plugged = hp["plugged_size_mib"].as_u64().ok_or("no hotplug state")?;
+    if plugged != requested {
+        return Ok(Resized::Busy);
+    }
+    let total = meta.mem_mib + plugged;
+    let avail = match hint {
+        Some(avail) => avail,
+        None if stats["total_memory"].as_u64().unwrap_or(0) == 0 => return Ok(Resized::Same), // no stats yet
+        None => stats["available_memory"].as_u64().unwrap_or(0) >> 20,
+    }
+    .min(total);
+    let floor = meta.plugged_mib.min(hotplug_total);
+    let headroom = headroom(total);
+    let round = |mib: u64| mib.div_ceil(STEP_MIB) * STEP_MIB;
+    // Balloon statistics lag a plug by up to a second; don't grow twice on stale numbers.
+    let stale = hint.is_none() && last.elapsed() < Duration::from_millis(1500);
+    let short = headroom.saturating_sub(avail);
+    let new = if short > 0 && !stale {
+        let step = round(headroom * 2 - avail).min(round(total / 4).max(STEP_MIB));
+        (requested + step).min(hotplug_total)
+    } else if !grow_only && avail > headroom * 3 && requested > floor && last.elapsed() > Duration::from_secs(10) {
+        requested.saturating_sub((avail - headroom * 2) / STEP_MIB * STEP_MIB).max(floor)
     } else {
         requested
     };
-    let grow = new.saturating_sub(requested);
-    // Starved: short on memory and either at its ceiling or growing into the host's reserve.
-    let starved = avail < headroom && (new == requested || host_avail.saturating_sub(grow) < reserve);
-    vm.starved.store(starved, Ordering::SeqCst);
-    if new != requested {
-        eprintln!("vm {}: available {avail}/{total} MiB, hotplug {requested} -> {new} MiB", vm.name);
-        vm.fc(|fc| fc.patch("/hotplug/memory", json!({"requested_size_mib": new})))?;
-        *last = Instant::now();
+    let refused = new > requested && !host.admit(new - requested);
+    let full = short > 0 && (requested == hotplug_total || refused);
+    vm.starved.store(full, Ordering::SeqCst);
+    if new == requested || refused {
+        return Ok(if full { Resized::Full } else { Resized::Same });
     }
-    Ok(())
+    let why = if hint.is_some() { "guest asked" } else { "tick" };
+    eprintln!("vm {}: available {avail}/{total} MiB, hotplug {requested} -> {new} MiB ({why})", vm.name);
+    vm.fc(|fc| fc.patch("/hotplug/memory", json!({"requested_size_mib": new})))?;
+    *last = Instant::now();
+    Ok(if new > requested { Resized::Grew } else { Resized::Same })
+}
+
+/// The longest memory request a guest may send, and how long it has to send it.
+const MEM_REQUEST_MAX: usize = 128;
+const MEM_REQUEST_DEADLINE: Duration = Duration::from_millis(500);
+/// Requests closer together than this are answered `busy` without acting.
+const MEM_REQUEST_GAP: Duration = Duration::from_millis(50);
+
+/// Reads one `MEM <available KiB> <total KiB>` line of at most
+/// `MEM_REQUEST_MAX` bytes within `MEM_REQUEST_DEADLINE`. Returns the
+/// available MiB; the guest's total is ignored (Firecracker knows it).
+fn read_mem_request(conn: &UnixStream) -> Option<u64> {
+    use std::io::Read;
+    let deadline = Instant::now() + MEM_REQUEST_DEADLINE;
+    let mut buf = [0u8; MEM_REQUEST_MAX];
+    let mut len = 0;
+    while !buf[..len].contains(&b'\n') {
+        let left = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero())?;
+        if len == buf.len() || conn.set_read_timeout(Some(left)).is_err() {
+            return None;
+        }
+        match (&*conn).read(&mut buf[len..]) {
+            Ok(0) | Err(_) => return None,
+            Ok(n) => len += n,
+        }
+    }
+    let line = std::str::from_utf8(&buf[..len]).ok()?.split('\n').next()?;
+    let mut f = line.split(' ');
+    match (f.next(), f.next().map(str::parse::<u64>), f.next().map(str::parse::<u64>), f.next()) {
+        (Some("MEM"), Some(Ok(avail_kib)), Some(Ok(_)), None) => Some(avail_kib >> 10),
+        _ => None,
+    }
 }
 
 /// Sends one request to a peer's listener and returns its result.
@@ -926,4 +1068,32 @@ pub fn call(host: &Host, name: &str, req: Value) -> Result<Value> {
         bail!("{}", reply["error"].as_str().unwrap_or("request failed"));
     }
     Ok(reply["result"].clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memory_requests_are_bounded_and_strict() {
+        let req = |bytes: &[u8], close: bool| {
+            let (a, mut b) = UnixStream::pair().unwrap();
+            b.write_all(bytes).unwrap();
+            if close {
+                drop(b);
+                return read_mem_request(&a);
+            }
+            read_mem_request(&a)
+        };
+        assert_eq!(req(b"MEM 2097152 4194304\n", false), Some(2048));
+        assert_eq!(req(b"MEM 1 2 3\n", false), None);
+        assert_eq!(req(b"MEM x 2\n", false), None);
+        assert_eq!(req(b"GROW 1 2\n", false), None);
+        // No newline: gives up when the peer closes, at the size cap, or at the deadline.
+        assert_eq!(req(b"MEM 1 2", true), None);
+        assert_eq!(req(&[b'7'; 4096], false), None);
+        let t = Instant::now();
+        assert_eq!(req(b"MEM 1", false), None);
+        assert!(t.elapsed() < MEM_REQUEST_DEADLINE * 2);
+    }
 }

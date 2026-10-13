@@ -53,7 +53,7 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
                 [--announce-dev IFACE] [--dns IP] [--reserve MIB] [--prefix P]
                                      configure this host and take migrations from peers
   flexvm standby [--template T] N    keep N VMs restored and paused, so run takes ~5 ms
-  flexvm template NAME [--vcpus N] [--mem MIB] [--max MIB] [--image REF ...]
+  flexvm template NAME [--vcpus N] [--mem MIB] [--max MIB] [--plug MIB] [--image REF ...]
                                      build a template (see README)
   flexvm bench ...                   latency benchmarks (see README)
 
@@ -436,7 +436,9 @@ fn build_template(args: &Args, name: &str) -> Result<()> {
             Ok::<_, util::Error>(meta)
         })
         .transpose()?;
-    template::create(&paths, name, args.num("vcpus", cpus)? as u32, args.num("mem", 256)?, args.num("max", host_mib)?, image)
+    let max = args.num("max", host_mib)?;
+    let (cpus, mem, plug) = (args.num("vcpus", cpus)? as u32, args.num("mem", template::base_mib(max))?, args.num("plug", template::PLUG_MIB)?);
+    template::create(&paths, name, cpus, mem, max, plug, image)
 }
 
 /// `template --image` and its overrides, or None for a plain template.

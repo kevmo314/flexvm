@@ -353,6 +353,33 @@ impl Host {
         self.held(&a).then_some(a.holder).flatten()
     }
 
+    /// Admits `mib` of VM growth unless it would take the host below its
+    /// reserve. Plugging costs the host nothing until the guest touches the
+    /// memory, so MemAvailable lags every grant: those of the last
+    /// `GRANT_WINDOW` (in `RUN/grants`, all VM processes') count as used.
+    /// Under the host lock, so concurrent requests cannot each see the same
+    /// free memory.
+    pub fn admit(&self, mib: u64) -> bool {
+        let Ok(_l) = self.lock() else { return false };
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        let mut grants: Vec<(u64, u64)> = std::fs::read_to_string(self.run.join("grants"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| {
+                let (t, m) = l.split_once(' ')?;
+                Some((t.parse().ok()?, m.parse().ok()?))
+            })
+            .filter(|&(t, _)| now.saturating_sub(t) <= GRANT_WINDOW.as_millis() as u64)
+            .collect();
+        let pending: u64 = grants.iter().map(|g| g.1).sum();
+        if crate::vmproc::host_available_mib() < self.cfg.reserve_mib + pending + mib {
+            return false;
+        }
+        grants.push((now, mib));
+        let text: String = grants.iter().map(|(t, m)| format!("{t} {m}\n")).collect();
+        write_file(&self.run, "grants", text.as_bytes(), false).is_ok()
+    }
+
     // Incoming migrations: `STATE/migs/ID`, durable, changed under the host
     // lock. A committed id is never forgotten (within `MIG_KEEP`), so no one
     // asking later is ever told it aborted.
@@ -427,6 +454,10 @@ impl Host {
         Ok(out.into())
     }
 }
+
+/// How long a grant of memory counts as used: the guest touches what it asked
+/// for gradually, and MemAvailable only shows it once touched.
+const GRANT_WINDOW: Duration = Duration::from_secs(10);
 
 /// How long a migration record is kept: far longer than any source waits.
 const MIG_KEEP: Duration = Duration::from_secs(7 * 24 * 3600);
@@ -732,5 +763,18 @@ mod tests {
         // Committed by a process that is gone: its VM is gone too.
         std::fs::write(h.state.join("migs/4"), "committed 999999999 1 x").unwrap();
         assert_eq!(h.mig_status(4).unwrap(), "released");
+    }
+
+    #[test]
+    fn admission_counts_recent_grants() {
+        let mut h = host("admit");
+        let free = crate::vmproc::host_available_mib();
+        // Wide margins: other processes move MemAvailable meanwhile.
+        h.cfg.reserve_mib = free.saturating_sub(3000);
+        assert!(h.admit(1000));
+        assert!(h.admit(1000));
+        assert!(!h.admit(2000), "recent grants count as used");
+        h.cfg.reserve_mib = free + 1;
+        assert!(!h.admit(1));
     }
 }
