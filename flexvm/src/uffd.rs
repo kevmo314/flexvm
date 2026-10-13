@@ -573,6 +573,8 @@ pub struct Pager {
     pagemap: OnceLock<std::fs::File>,
     /// Test fault: the next freeze fails to re-protect pages.
     pub fail_protect: AtomicBool,
+    /// Test fault: write faults during a copy dawdle before claiming pages.
+    pub wp_race: AtomicBool,
     /// Initial page states and their origin, applied when Firecracker
     /// connects (see `seed`).
     initial: Mutex<Option<(Runs, Origin)>>,
@@ -645,6 +647,7 @@ impl Pager {
             wp: Mutex::new(()),
             pagemap: OnceLock::new(),
             fail_protect: AtomicBool::new(false),
+            wp_race: AtomicBool::new(false),
             initial: Mutex::new(initial),
             seeded: Condvar::new(),
             awaiting_seed: AtomicBool::new(false),
@@ -1412,6 +1415,15 @@ impl Pager {
                 cow.stats.deferred.fetch_add(1, Ordering::Relaxed);
                 return Err(eagain());
             }
+            // Test fault `ckpt_wp_race`: a writer claims the faulting page
+            // right here (#88): have the writers take it next, and wait.
+            if self.wp_race.load(Ordering::Relaxed) && cow.state(page) == PENDING {
+                cow.want(page);
+                let t = Instant::now();
+                while cow.state(page) == PENDING && t.elapsed() < Duration::from_millis(50) {
+                    thread::sleep(Duration::from_micros(100));
+                }
+            }
             // Over budget, nothing more is copied here: unsaved pages of the
             // block stay protected, and the writers take them first.
             if cow.over_budget() {
@@ -1454,6 +1466,15 @@ impl Pager {
             (p..q).for_each(|d| self.pages().mark_dirty(d));
             self.writeprotect(p, q - p, false)?;
             p = q;
+        }
+        // A writer claimed the faulting page itself (PENDING -> READING)
+        // after the check above: it stays protected, and nothing else wakes
+        // the fault. Retry it once the writer is done with the page.
+        if keep(page) {
+            if let Some(cow) = &cow {
+                cow.stats.deferred.fetch_add(1, Ordering::Relaxed);
+            }
+            return Err(eagain());
         }
         Ok(())
     }
