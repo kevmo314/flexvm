@@ -25,7 +25,7 @@ use std::net::TcpStream;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixListener;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, RwLockWriteGuard};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -272,6 +272,7 @@ pub struct Pager {
     remote: Mutex<Option<Link>>,
     /// The checkpoint page file REMOTE pages come from, when restoring one.
     file: OnceLock<Arc<PageFile>>,
+    discards: AtomicU64,
     remote_left: AtomicUsize,
     pull_started: OnceLock<Instant>,
     pull_finished: OnceLock<Instant>,
@@ -300,6 +301,7 @@ impl Pager {
             pidfd: OnceLock::new(),
             remote: Mutex::new(None),
             file: OnceLock::new(),
+            discards: AtomicU64::new(0),
             remote_left: AtomicUsize::new(0),
             pull_started: OnceLock::new(),
             pull_finished: OnceLock::new(),
@@ -509,6 +511,16 @@ impl Pager {
         self.failed.get().map(|s| s.as_str())
     }
 
+    /// REMOVE events applied so far (balloon and virtio-mem discards).
+    pub fn discards(&self) -> u64 {
+        self.discards.load(Ordering::SeqCst)
+    }
+
+    /// Whether pages are still to come from a migration source.
+    pub fn pulling_from_peer(&self) -> bool {
+        self.remote_left() > 0 && self.file.get().is_none()
+    }
+
     pub fn remote_left(&self) -> usize {
         self.remote_left.load(Ordering::SeqCst)
     }
@@ -670,6 +682,7 @@ impl Pager {
     }
 
     fn discard(&self, removing: &RwLockWriteGuard<'_, ()>, start: u64, end: u64) {
+        self.discards.fetch_add(1, Ordering::SeqCst);
         let (mut a, mut resolved) = (start & !(PAGE_SIZE as u64 - 1), 0);
         while a < end {
             if let Some((p, _)) = self.page_of(a) {

@@ -30,11 +30,12 @@
 
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{self, BufWriter, Write};
+use std::ffi::{CStr, CString};
+use std::io::{self, BufWriter, Read, Write};
 use std::net::Ipv4Addr;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{FileExt, MetadataExt};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -44,7 +45,7 @@ use serde::{Deserialize, Serialize};
 use crate::bail;
 use crate::template::{Hash, Template};
 use crate::uffd::{Runs, REMOTE};
-use crate::util::{Phases, Result, PAGE_SIZE};
+use crate::util::{Error, Phases, Result, PAGE_SIZE};
 use crate::vm::Vm;
 
 pub const FORMAT: u64 = 1;
@@ -95,68 +96,152 @@ fn block_sum(bytes: &[u8]) -> u64 {
     h.value()
 }
 
-fn fsync_dir(dir: &Path) -> io::Result<()> {
-    File::open(dir)?.sync_all()
-}
-
 fn unix_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
 }
 
-/// A checkpoint being written: a private directory that becomes `dest` only
-/// once complete and durable. Dropped uncommitted, it is removed.
+fn cname(name: &str) -> CString {
+    CString::new(name).expect("no NUL in file names")
+}
+
+fn check(rc: libc::c_int) -> io::Result<()> {
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Opens directory `name` in `dir` without following a symlink.
+fn open_dir_at(dir: RawFd, name: &CStr) -> io::Result<OwnedFd> {
+    let fd = unsafe { libc::openat(dir, name.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+    check(fd)?;
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Creates file `name` in `dir`; never an existing file, never through a symlink.
+fn create_at(dir: RawFd, name: &str) -> io::Result<File> {
+    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let fd = unsafe { libc::openat(dir, cname(name).as_ptr(), flags, 0o600) };
+    check(fd)?;
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+/// Opens file `name` in `dir` for reading, never through a symlink.
+fn open_at(dir: RawFd, name: &str) -> io::Result<File> {
+    let fd = unsafe { libc::openat(dir, cname(name).as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+    check(fd)?;
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+fn fsync_fd(fd: RawFd) -> io::Result<()> {
+    check(unsafe { libc::fsync(fd) })
+}
+
+/// The files of a checkpoint, as `Staging` writes them.
+const FILES: [&str; 4] = ["vmstate", "pages", "pagemap", "manifest.json"];
+const STAGING_PREFIX: &str = ".flexvm-staging-";
+
+/// Why a commit failed.
+pub enum CommitError {
+    /// Nothing was published (or what was is durably unusable): the VM may resume.
+    Failed(Error),
+    /// The checkpoint was published but may not be durable, and could not be
+    /// revoked: resuming the VM could leave a stale checkpoint behind that
+    /// later restores, so it must not resume.
+    Uncertain(Error),
+}
+
+impl<E: Into<Error>> From<E> for CommitError {
+    fn from(e: E) -> Self {
+        CommitError::Failed(e.into())
+    }
+}
+
+/// A checkpoint being written, which becomes `dest` only once complete and
+/// durable. Dropped unpublished, it is removed.
+///
+/// The destination's directory may belong to an unprivileged user while the
+/// daemon runs as root, so nothing here follows a path the user can change:
+/// the destination's directory is pinned by fd, files are written inside a
+/// root-only (0700) staging directory in it, also pinned, and are created
+/// with `O_EXCL | O_NOFOLLOW`. Firecracker writes the VM state into the VM's
+/// own run directory, from where it is copied in. Publishing renames the
+/// checkpoint out of the staging directory into the destination's directory,
+/// fd to fd, never over anything.
 pub struct Staging {
     dest: PathBuf,
-    tmp: PathBuf,
-    committed: bool,
+    parent: OwnedFd,
+    base: CString,
+    /// The root-only staging directory in `parent`, and its name there.
+    outer: OwnedFd,
+    outer_name: CString,
+    /// The checkpoint directory inside `outer` (named "ck"), published as `dest`.
+    ck: OwnedFd,
+    vmstate: PathBuf,
+    published: bool,
 }
 
 impl Staging {
     /// Claims a staging directory for a checkpoint at `dest`, which must not
-    /// exist yet (checkpoints are immutable). Clears out partial directories
-    /// that daemons no longer running left for the same destination.
-    pub fn new(dest: &Path) -> Result<Staging> {
+    /// exist yet (checkpoints are immutable); Firecracker is to write the VM
+    /// state to `vmstate`, a path only root controls. Clears out staging
+    /// directories that daemons no longer running left in the same directory.
+    pub fn new(dest: &Path, vmstate: PathBuf) -> Result<Staging> {
         let parent = match dest.parent() {
             Some(p) if !p.as_os_str().is_empty() => p,
             _ => Path::new("."),
         };
         let base = dest.file_name().ok_or_else(|| format!("bad checkpoint path {}", dest.display()))?;
-        let parent = parent.canonicalize().map_err(|e| format!("checkpoint directory {}: {e}", parent.display()))?;
-        let dest = parent.join(base);
-        if dest.symlink_metadata().is_ok() {
+        let parent_path = parent.canonicalize().map_err(|e| format!("checkpoint directory {}: {e}", parent.display()))?;
+        let dest = parent_path.join(base);
+        let pfd = open_dir_at(libc::AT_FDCWD, &CString::new(parent_path.as_os_str().as_bytes())?)
+            .map_err(|e| format!("checkpoint directory {}: {e}", parent_path.display()))?;
+        let base = CString::new(base.as_bytes())?;
+        if exists_at(pfd.as_raw_fd(), &base) {
             bail!("{} already exists; checkpoints are never overwritten", dest.display());
         }
-        let prefix = format!(".{}.partial-", base.to_string_lossy());
-        for e in std::fs::read_dir(&parent)?.flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            let Some(rest) = name.strip_prefix(&prefix) else { continue };
-            let pid = rest.split('-').next().unwrap_or("");
-            if !Path::new(&format!("/proc/{pid}")).exists() {
-                let _ = std::fs::remove_dir_all(e.path());
-            }
-        }
+        clear_stale(&pfd);
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().subsec_nanos();
-        let tmp = parent.join(format!("{prefix}{}-{nanos:x}", std::process::id()));
-        std::fs::create_dir(&tmp)?;
-        Ok(Staging { dest, tmp, committed: false })
+        let outer_name = cname(&format!("{STAGING_PREFIX}{}-{nanos:x}", std::process::id()));
+        check(unsafe { libc::mkdirat(pfd.as_raw_fd(), outer_name.as_ptr(), 0o700) })?;
+        let outer = open_dir_at(pfd.as_raw_fd(), &outer_name)?;
+        // Someone could have swapped in a directory of their own meanwhile.
+        let st = fstat(outer.as_raw_fd())?;
+        if st.st_uid != unsafe { libc::geteuid() } || st.st_mode & 0o077 != 0 {
+            bail!("staging directory in {} was replaced", parent_path.display());
+        }
+        check(unsafe { libc::mkdirat(outer.as_raw_fd(), c"ck".as_ptr(), 0o700) })?;
+        let ck = open_dir_at(outer.as_raw_fd(), c"ck")?;
+        let _ = std::fs::remove_file(&vmstate);
+        Ok(Staging { dest, parent: pfd, base, outer, outer_name, ck, vmstate, published: false })
     }
 
     pub fn dest(&self) -> &Path {
         &self.dest
     }
 
-    /// Where the VM's state goes.
+    /// Where Firecracker is to write the VM's state.
     pub fn vmstate(&self) -> PathBuf {
-        self.tmp.join("vmstate")
+        self.vmstate.clone()
+    }
+
+    fn create(&self, name: &str) -> io::Result<File> {
+        create_at(self.ck.as_raw_fd(), name)
     }
 
     /// Writes the pages and metadata of `vm`, whose state is already in
     /// `vmstate` and whose pages are in the states `runs` (as exported by the
     /// pager's checkpoint barrier), then publishes the checkpoint.
-    pub fn commit(mut self, vm: &Vm, runs: &Runs, t: &mut Phases) -> Result<Manifest> {
+    pub fn commit(
+        mut self,
+        vm: &Vm,
+        runs: &Runs,
+        t: &mut Phases,
+        still_valid: impl FnOnce() -> Result<()>,
+    ) -> std::result::Result<Manifest, CommitError> {
         let hotplug = vm.fc(|fc| fc.get("/hotplug/memory")).ok();
         let hotplug_mib = hotplug.and_then(|h| h["plugged_size_mib"].as_u64()).unwrap_or(0);
-        let pages = File::create(self.tmp.join("pages"))?;
+        let pages = self.create("pages")?;
         let mut w = PageWriter::new(&vm.template, BufWriter::with_capacity(1 << 20, &pages));
         let mut buf = vec![0u8; CHUNK * PAGE_SIZE];
         for &(first, count, state) in runs {
@@ -180,10 +265,13 @@ impl Staging {
         let (map, data_pages, zero_pages, blocks) = w.finish()?;
         t.mark("write_pages");
         pages.sync_all()?;
-        drop(pages);
-        std::fs::write(self.tmp.join("pagemap"), &map)?;
-        File::open(self.tmp.join("pagemap"))?.sync_all()?;
-        let vmstate = std::fs::read(self.vmstate())?;
+        let pagemap = self.create("pagemap")?;
+        (&pagemap).write_all(&map)?;
+        pagemap.sync_all()?;
+        let vmstate = std::fs::read(&self.vmstate)?;
+        let vmstate_file = self.create("vmstate")?;
+        (&vmstate_file).write_all(&vmstate)?;
+        vmstate_file.sync_all()?;
         let mut files = BTreeMap::new();
         files.insert("vmstate".into(), FileSum { len: vmstate.len() as u64, hash: sum(&vmstate) });
         files.insert("pagemap".into(), FileSum { len: map.len() as u64, hash: sum(&map) });
@@ -211,21 +299,39 @@ impl Staging {
         let body = serde_json::to_vec_pretty(&manifest)?;
         let mut text = format!("{}\n", sum(&body)).into_bytes();
         text.extend_from_slice(&body);
-        let mf = File::create(self.tmp.join("manifest.json"))?;
+        let mf = self.create("manifest.json")?;
         (&mf).write_all(&text)?;
         mf.sync_all()?;
         // The checkpoint belongs to whoever owns the directory it was put in
         // (the daemon runs as root), so they can move and delete it.
-        let parent = std::fs::metadata(self.dest.parent().unwrap())?;
-        let owner = (Some(parent.uid()), Some(parent.gid()));
-        for f in ["manifest.json", "vmstate", "pagemap", "pages", ""] {
-            std::os::unix::fs::chown(self.tmp.join(f), owner.0, owner.1)?;
+        let owner = fstat(self.parent.as_raw_fd())?;
+        for (fd, mode) in [(pages.as_raw_fd(), 0o644), (pagemap.as_raw_fd(), 0o644), (vmstate_file.as_raw_fd(), 0o644), (mf.as_raw_fd(), 0o644), (self.ck.as_raw_fd(), 0o755)] {
+            check(unsafe { libc::fchown(fd, owner.st_uid, owner.st_gid) })?;
+            check(unsafe { libc::fchmod(fd, mode) })?;
         }
-        fsync_dir(&self.tmp)?;
+        fsync_fd(self.ck.as_raw_fd())?;
+        // Last check before it becomes visible.
+        still_valid()?;
         t.mark("fsync");
-        rename_noreplace(&self.tmp, &self.dest)?;
-        self.committed = true;
-        fsync_dir(self.dest.parent().unwrap())?;
+        let (outer, parent) = (self.outer.as_raw_fd(), self.parent.as_raw_fd());
+        let rc = unsafe { libc::renameat2(outer, c"ck".as_ptr(), parent, self.base.as_ptr(), libc::RENAME_NOREPLACE) };
+        if rc < 0 {
+            let e = io::Error::last_os_error();
+            return Err(CommitError::Failed(format!("publish checkpoint at {}: {e}", self.dest.display()).into()));
+        }
+        self.published = true;
+        if let Err(e) = fsync_fd(parent) {
+            // Published, but maybe not durably: a crash could still bring it
+            // back after the VM has run on. Revoke it, durably, or the VM
+            // must not resume.
+            let revoked = check(unsafe { libc::unlinkat(self.ck.as_raw_fd(), c"manifest.json".as_ptr(), 0) })
+                .and_then(|()| fsync_fd(self.ck.as_raw_fd()));
+            let e = format!("making checkpoint {} durable: {e}", self.dest.display());
+            return Err(match revoked {
+                Ok(()) => CommitError::Failed(format!("{e} (revoked it)").into()),
+                Err(r) => CommitError::Uncertain(format!("{e}; revoking it failed too: {r}").into()),
+            });
+        }
         t.mark("publish");
         Ok(manifest)
     }
@@ -233,20 +339,54 @@ impl Staging {
 
 impl Drop for Staging {
     fn drop(&mut self) {
-        if !self.committed {
-            let _ = std::fs::remove_dir_all(&self.tmp);
+        if !self.published {
+            for f in FILES {
+                unsafe { libc::unlinkat(self.ck.as_raw_fd(), cname(f).as_ptr(), 0) };
+            }
+            unsafe { libc::unlinkat(self.outer.as_raw_fd(), c"ck".as_ptr(), libc::AT_REMOVEDIR) };
         }
+        // Empty now; if someone swapped another directory in under its name,
+        // removing that only works if it is empty too.
+        unsafe { libc::unlinkat(self.parent.as_raw_fd(), self.outer_name.as_ptr(), libc::AT_REMOVEDIR) };
+        let _ = std::fs::remove_file(&self.vmstate);
     }
 }
 
-fn rename_noreplace(from: &Path, to: &Path) -> Result<()> {
-    let c = |p: &Path| std::ffi::CString::new(p.as_os_str().as_bytes()).unwrap();
-    let (f, t) = (c(from), c(to));
-    let rc = unsafe { libc::renameat2(libc::AT_FDCWD, f.as_ptr(), libc::AT_FDCWD, t.as_ptr(), libc::RENAME_NOREPLACE) };
-    if rc != 0 {
-        bail!("publish checkpoint at {}: {}", to.display(), io::Error::last_os_error());
+fn fstat(fd: RawFd) -> io::Result<libc::stat> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    check(unsafe { libc::fstat(fd, &mut st) })?;
+    Ok(st)
+}
+
+fn exists_at(dir: RawFd, name: &CStr) -> bool {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    unsafe { libc::fstatat(dir, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) == 0 }
+}
+
+/// Removes staging directories of daemons that are gone: only directories
+/// this user owns and nobody else may enter, as `Staging::new` makes them.
+fn clear_stale(parent: &OwnedFd) {
+    let Ok(dir) = std::fs::read_dir(format!("/proc/self/fd/{}", parent.as_raw_fd())) else { return };
+    for e in dir.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Some(rest) = name.strip_prefix(STAGING_PREFIX) else { continue };
+        let pid = rest.split('-').next().unwrap_or("");
+        if pid.is_empty() || Path::new(&format!("/proc/{pid}")).exists() {
+            continue;
+        }
+        let Ok(outer) = open_dir_at(parent.as_raw_fd(), &cname(&name)) else { continue };
+        match fstat(outer.as_raw_fd()) {
+            Ok(st) if st.st_uid == unsafe { libc::geteuid() } && st.st_mode & 0o077 == 0 => {}
+            _ => continue,
+        }
+        if let Ok(ck) = open_dir_at(outer.as_raw_fd(), c"ck") {
+            for f in FILES {
+                unsafe { libc::unlinkat(ck.as_raw_fd(), cname(f).as_ptr(), 0) };
+            }
+        }
+        unsafe { libc::unlinkat(outer.as_raw_fd(), c"ck".as_ptr(), libc::AT_REMOVEDIR) };
+        unsafe { libc::unlinkat(parent.as_raw_fd(), cname(&name).as_ptr(), libc::AT_REMOVEDIR) };
     }
-    Ok(())
 }
 
 /// Classifies pages against the template, appends DATA pages to the page
@@ -335,22 +475,35 @@ impl<'a, W: Write> PageWriter<'a, W> {
 pub struct Checkpoint {
     pub dir: PathBuf,
     pub manifest: Manifest,
+    /// The verified VM state. Load these bytes (from a file only root
+    /// controls), not the checkpoint's file, which may have changed since.
+    pub vmstate: Vec<u8>,
     /// Initial page states for the pager: DATA pages are REMOTE, read from `file`.
     pub runs: Runs,
     pub file: Arc<PageFile>,
 }
 
-impl Checkpoint {
-    pub fn vmstate(&self) -> PathBuf {
-        self.dir.join("vmstate")
+/// Opens regular file `name` in `dir` (never through a symlink) and reads up
+/// to `max` bytes of it.
+fn read_at(dir: RawFd, name: &str, max: u64) -> io::Result<(File, Vec<u8>)> {
+    let f = open_at(dir, name)?;
+    let st = fstat(f.as_raw_fd())?;
+    if st.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(io::Error::other("not a regular file"));
     }
+    let mut bytes = Vec::new();
+    io::Read::take(&f, max).read_to_end(&mut bytes)?;
+    Ok((f, bytes))
+}
 
+impl Checkpoint {
     /// Opens the checkpoint at `dir` and verifies everything but the page
     /// data itself, which is checked block by block as it is read.
     pub fn open(dir: &Path) -> Result<Checkpoint> {
         let dir = dir.canonicalize().map_err(|e| format!("checkpoint {}: {e}", dir.display()))?;
         let bad = |why: String| format!("checkpoint {} is invalid: {why}", dir.display());
-        let text = std::fs::read(dir.join("manifest.json")).map_err(|e| bad(format!("manifest.json: {e}")))?;
+        let dfd = open_dir_at(libc::AT_FDCWD, &CString::new(dir.as_os_str().as_bytes())?).map_err(|e| bad(e.to_string()))?;
+        let (_, text) = read_at(dfd.as_raw_fd(), "manifest.json", 1 << 20).map_err(|e| bad(format!("manifest.json: {e}")))?;
         let split = text.iter().position(|&b| b == b'\n').ok_or_else(|| bad("manifest has no checksum".into()))?;
         let (want, body) = (&text[..split], &text[split + 1..]);
         if want != sum(body).as_bytes() {
@@ -362,13 +515,13 @@ impl Checkpoint {
         }
         let read_checked = |name: &str| -> Result<Vec<u8>> {
             let want = manifest.files.get(name).ok_or_else(|| bad(format!("manifest lists no {name}")))?;
-            let bytes = std::fs::read(dir.join(name)).map_err(|e| bad(format!("{name}: {e}")))?;
+            let (_, bytes) = read_at(dfd.as_raw_fd(), name, want.len + 1).map_err(|e| bad(format!("{name}: {e}")))?;
             if bytes.len() as u64 != want.len || sum(&bytes) != want.hash {
                 bail!("{}", bad(format!("{name} does not match its checksum")));
             }
             Ok(bytes)
         };
-        read_checked("vmstate")?;
+        let vmstate = read_checked("vmstate")?;
         let map = read_checked("pagemap")?;
         let (runs, data_runs, blocks) = parse_pagemap(&map, manifest.guest_pages).map_err(|e| bad(e.to_string()))?;
         let data: u64 = data_runs.iter().map(|r| r.1).sum();
@@ -381,12 +534,12 @@ impl Checkpoint {
         if manifest.files["pages"].hash != blocks_sum.finish() {
             bail!("{}", bad("block checksums do not match the manifest".into()));
         }
-        let file = File::open(dir.join("pages")).map_err(|e| bad(format!("pages: {e}")))?;
+        let (file, _) = read_at(dfd.as_raw_fd(), "pages", 0).map_err(|e| bad(format!("pages: {e}")))?;
         if file.metadata()?.len() != data * PAGE_SIZE as u64 {
             bail!("{}", bad("pages has the wrong length".into()));
         }
         let file = Arc::new(PageFile { file, runs: data_runs, blocks, data_pages: data });
-        Ok(Checkpoint { dir, manifest, runs, file })
+        Ok(Checkpoint { dir, manifest, vmstate, runs, file })
     }
 }
 
@@ -594,25 +747,46 @@ mod tests {
     }
 
     #[test]
-    fn staging_never_overwrites_and_cleans_up() {
+    fn staging_is_private_never_overwrites_and_cleans_up() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
         let dir = std::env::temp_dir().join(format!("flexvm-stage-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let dest = dir.join("ck");
-        // A partial left by a daemon that is gone is cleared; ours is removed on drop.
-        let stale = dir.join(".ck.partial-999999999-1");
-        std::fs::create_dir_all(&stale).unwrap();
-        let s = Staging::new(&dest).unwrap();
+        // Staging left by a daemon that is gone is cleared, if it is private
+        // like ours; anything else with that name is left alone.
+        let stale = dir.join(format!("{STAGING_PREFIX}999999999-1"));
+        std::fs::create_dir_all(stale.join("ck")).unwrap();
+        std::fs::write(stale.join("ck/pages"), b"x").unwrap();
+        std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let foreign = dir.join(format!("{STAGING_PREFIX}999999998-1"));
+        std::fs::create_dir_all(&foreign).unwrap();
+        std::fs::set_permissions(&foreign, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let s = Staging::new(&dest, dir.join("vmstate.private")).unwrap();
         assert!(!stale.exists());
-        let tmp = s.vmstate().parent().unwrap().to_path_buf();
-        assert!(tmp.exists());
+        assert!(foreign.exists());
+        let ours: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(&format!("{STAGING_PREFIX}{}", std::process::id())))
+            .collect();
+        assert_eq!(ours.len(), 1);
+        assert_eq!(ours[0].metadata().unwrap().permissions().mode() & 0o777, 0o700);
+        // Files are never created over, or through, anything already there.
+        let f = s.create("pages").unwrap();
+        drop(f);
+        assert!(s.create("pages").is_err());
+        let ck = s.ck.as_raw_fd();
+        symlink("/etc/hostname", dir.join("link")).unwrap();
+        let pfd = s.parent.as_raw_fd();
+        assert!(create_at(pfd, "link").is_err());
+        assert!(open_at(pfd, "link").is_err());
+        assert!(create_at(ck, "pagemap").is_ok());
         drop(s);
-        assert!(!tmp.exists() && !dest.exists());
+        assert!(!dest.exists());
+        assert!(std::fs::read_dir(&dir).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().contains(&std::process::id().to_string())));
         std::fs::create_dir_all(&dest).unwrap();
-        assert!(Staging::new(&dest).is_err());
-        let a = dir.join("a");
-        std::fs::create_dir_all(&a).unwrap();
-        assert!(rename_noreplace(&a, &dest).is_err());
+        assert!(Staging::new(&dest, dir.join("vmstate.private")).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

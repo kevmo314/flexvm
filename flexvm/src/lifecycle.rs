@@ -79,50 +79,66 @@ impl Daemon {
     }
 
     /// Resumes a paused VM, or restores a suspended one from its checkpoint.
-    pub(super) fn resume(&self, name: &str) -> Result<Value> {
-        let _busy = self.reserve(name, "resuming", LIFECYCLE_WAIT)?;
+    pub(super) fn resume(self: &Arc<Self>, name: &str) -> Result<Value> {
+        let busy = self.reserve(name, "resuming", LIFECYCLE_WAIT)?;
         if let Ok(vm) = self.vm(name) {
             let start = Instant::now();
             vm.unpause()?;
             let took = start.elapsed();
+            drop(busy);
             // Off the critical path: the guest's clock keeps counting while
             // paused (its TSC runs on), so this rarely needs to change it.
-            sync_clock_later(vm);
+            self.sync_clock_later(vm);
             return Ok(json!({"name": name, "state": "running", "from": "paused", "resume_ms": ms(took)}));
         }
         let mut t = Phases::new();
         let s = self.suspended.lock().unwrap().remove(name);
         let Some(s) = s else { bail!("no vm named {name:?}") };
-        // Out of suspended/ first, so a daemon restart never brings back a
-        // copy of a VM that has run since.
-        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
-        let resumed = self.cfg.state_dir.join("resumed").join(format!("{name}-{nanos:x}"));
-        let moved = std::fs::create_dir_all(resumed.parent().unwrap()).and_then(|()| std::fs::rename(&s.dir, &resumed));
-        if let Err(e) = moved {
+        // Out of suspended/, durably, before the VM can run: a daemon restart
+        // must never bring back a copy of a VM that has run since.
+        let resumed = self.state_path("resumed", name);
+        if let Err(e) = move_durably(&s.dir, &resumed) {
             let dir = s.dir.display().to_string();
             self.suspended.lock().unwrap().insert(name.into(), s);
             bail!("moving checkpoint {dir} aside: {e}");
         }
-        let res = Checkpoint::open(&resumed).and_then(|ck| {
-            t.mark("verify_checkpoint");
-            self.restore_checkpoint(name, ck, s.manifest.ip, true, &mut t)
-        });
-        if res.is_err() {
-            let _ = std::fs::rename(&resumed, &s.dir);
-            self.suspended.lock().unwrap().insert(name.into(), s);
+        t.mark("move_aside");
+        let res = Checkpoint::open(&resumed)
+            .map_err(|e| Restore::NotRun(e))
+            .and_then(|ck| {
+                t.mark("verify_checkpoint");
+                self.restore_checkpoint(name, ck, s.manifest.ip, true, &mut t)
+            });
+        match res {
+            Ok(mut v) => {
+                v["from"] = json!("suspended");
+                Ok(v)
+            }
+            // The VM never ran: it is still suspended, as it was.
+            Err(Restore::NotRun(e)) => {
+                if let Err(r) = move_durably(&resumed, &s.dir) {
+                    // Not re-armed; it stays in resumed/ (cleared at restart).
+                    self.ips.lock().unwrap().remove(&s.manifest.ip);
+                    bail!("{e}; putting its checkpoint back failed too ({r}); vm {name} is gone");
+                }
+                self.suspended.lock().unwrap().insert(name.into(), s);
+                Err(e)
+            }
+            // It ran, so its checkpoint is consumed: re-arming it would replay
+            // whatever the VM did since. Left in resumed/ (cleared at restart).
+            Err(Restore::Ran(e)) => {
+                self.ips.lock().unwrap().remove(&s.manifest.ip);
+                bail!("vm {name} failed after it resumed: {e}; it is gone, its checkpoint is consumed")
+            }
         }
-        res.map(|mut v| {
-            v["from"] = json!("suspended");
-            v
-        })
     }
 
     /// Checkpoints `name` to `dir`, then resumes it or (`stop`) kills it.
-    pub(super) fn checkpoint(&self, name: &str, dir: &str, stop: bool) -> Result<Value> {
+    pub(super) fn checkpoint(self: &Arc<Self>, name: &str, dir: &str, stop: bool) -> Result<Value> {
         let mut t = Phases::new();
-        let _busy = self.reserve(name, "checkpointing", LIFECYCLE_WAIT)?;
+        let busy = self.reserve(name, "checkpointing", LIFECYCLE_WAIT)?;
         let vm = self.vm(name)?;
-        let staging = Staging::new(Path::new(dir))?;
+        let staging = Staging::new(Path::new(dir), vm.dir.join("checkpoint.vmstate"))?;
         let dest = staging.dest().to_path_buf();
         t.mark("prepare");
         let (m, paused) = self.save(&vm, staging, &mut t)?;
@@ -133,8 +149,9 @@ impl Daemon {
         } else {
             let s = vm.end_checkpoint()?;
             t.mark("resume");
+            drop(busy);
             if s == State::Running {
-                sync_clock_later(vm.clone());
+                self.sync_clock_later(vm.clone());
             }
             s.name()
         };
@@ -161,8 +178,7 @@ impl Daemon {
         let vm = self.vm(name)?;
         let rss = vm.rss();
         let dest = self.cfg.state_dir.join("suspended").join(name);
-        std::fs::create_dir_all(dest.parent().unwrap())?;
-        let staging = Staging::new(&dest)?;
+        let staging = Staging::new(&dest, vm.dir.join("checkpoint.vmstate"))?;
         let (manifest, _) = self.save(&vm, staging, &mut t)?;
         // The checkpoint is durable; only now let go of the memory. The pager
         // stops before Firecracker dies, and its page states are never read
@@ -181,6 +197,22 @@ impl Daemon {
             "suspend_ms": ms(t.total()),
             "timings_ms": t.json(),
         }))
+    }
+
+    /// Deletes a suspended VM's checkpoint for `kill`: first moved, durably,
+    /// to trash/ (cleared at startup), so the kill holds across a crash.
+    pub(super) fn discard_suspended(&self, name: &str, s: &Suspended) -> Result<()> {
+        let trash = self.state_path("trash", name);
+        move_durably(&s.dir, &trash).map_err(|e| format!("discarding the checkpoint of {name}: {e}"))?;
+        if let Err(e) = std::fs::remove_dir_all(&trash) {
+            eprintln!("vm {name}: removing {}: {e}", trash.display());
+        }
+        Ok(())
+    }
+
+    fn state_path(&self, sub: &str, name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+        self.cfg.state_dir.join(sub).join(format!("{name}-{nanos:x}"))
     }
 
     /// Restores the checkpoint at `dir` as a new VM, by default with the name
@@ -209,34 +241,59 @@ impl Daemon {
             }
         };
         t.mark("claim_ip");
-        self.restore_checkpoint(&name, ck, ip, false, &mut t).inspect_err(|_| {
+        // A user's checkpoint is immutable and may be restored again whether
+        // or not this VM got to run.
+        self.restore_checkpoint(&name, ck, ip, false, &mut t).map_err(|e| {
             self.ips.lock().unwrap().remove(&ip);
+            e.error()
         })
     }
 
     /// Restores `ck` as VM `name` at `ip` (already claimed), its memory paged
     /// in lazily from the checkpoint and pulled in the background, the
     /// template's working set first. `owned` checkpoints (a suspended VM's)
-    /// are deleted once the VM no longer needs them.
-    fn restore_checkpoint(&self, name: &str, ck: Checkpoint, ip: Ipv4Addr, owned: bool, t: &mut Phases) -> Result<Value> {
+    /// are deleted once the VM no longer needs them. On failure, says
+    /// whether the VM's vCPUs ran.
+    fn restore_checkpoint(&self, name: &str, ck: Checkpoint, ip: Ipv4Addr, owned: bool, t: &mut Phases) -> std::result::Result<Value, Restore> {
         let m = ck.manifest.clone();
-        let tpl = self.template(&m.template)?;
-        tpl.check_id(&m.template_id)?;
-        tpl.verify(&self.cfg.paths, true)?;
-        t.mark("verify_template");
-        let idle = self.pool.take()?;
-        t.mark("pool_take");
-        let (vmstate, dir) = (ck.vmstate(), ck.dir.clone());
-        let origin = Some((ck.runs, Origin::File(ck.file)));
-        let (vm, restore) = Vm::restore_from(idle, name, tpl, &vmstate, origin, ip, true, t)?;
+        let (vm, restore) = (|| -> Result<_> {
+            let tpl = self.template(&m.template)?;
+            tpl.check_id(&m.template_id)?;
+            tpl.verify(&self.cfg.paths, true)?;
+            t.mark("verify_template");
+            let idle = self.pool.take()?;
+            t.mark("pool_take");
+            // Load the bytes that were verified, from a file only root controls.
+            let vmstate = idle.dir.join("vmstate.in");
+            std::fs::write(&vmstate, &ck.vmstate)?;
+            let origin = Some((ck.runs, Origin::File(ck.file)));
+            // Loaded paused: everything up to the resume below can fail
+            // without the VM having run.
+            Vm::restore_from(idle, name, tpl, &vmstate, origin, ip, false, t)
+        })()
+        .map_err(Restore::NotRun)?;
+        let dir = ck.dir;
+        let kill = |e: Error| {
+            vm.kill();
+            e
+        };
+        vm.restore_devices();
+        if self.fault("restore_before_run") {
+            return Err(Restore::NotRun(kill("injected fault: restore failed before the vm ran".into())));
+        }
+        vm.unpause().map_err(|e| Restore::Ran(kill(e)))?;
+        t.mark("resume");
         self.vms.lock().unwrap().insert(name.into(), vm.clone());
         t.mark("register");
         let ready = (|| -> Result<Duration> {
-            vm.restore_devices();
+            if self.fault("restore_after_run") {
+                bail!("injected fault: restore failed after the vm ran");
+            }
             if ip != m.ip {
                 vm.guest_net(ip, self.cfg.dns.as_deref())?;
                 // The guest keeps its old address too; drop it if it has iproute2.
-                let _ = vm.sh(&format!("ip -4 addr del {}/32 dev eth0 2>/dev/null", m.ip));
+                let deadline = Instant::now() + crate::guest::TIMEOUT;
+                let _ = vm.sh(&format!("ip -4 addr del {}/32 dev eth0 2>/dev/null", m.ip), deadline);
             }
             crate::guest::ping(&vm.vsock())?;
             let ready = t.total();
@@ -247,12 +304,12 @@ impl Daemon {
             Ok(r) => r,
             Err(e) => {
                 self.vms.lock().unwrap().remove(name);
-                vm.kill();
-                return Err(e);
+                return Err(Restore::Ran(kill(e)));
             }
         };
-        // The guest's clock stopped when it was checkpointed.
-        let clock = vm.sync_clock(CLOCK_TOLERANCE);
+        // The guest's clock stopped when it was checkpointed. The caller
+        // holds the VM's reservation, as every clock step must.
+        let clock = vm.sync_clock(CLOCK_TOLERANCE, Instant::now() + CLOCK_DEADLINE);
         t.mark("clock");
         self.announce(ip);
         let to_load = (m.data_pages * PAGE_SIZE as u64) >> 20;
@@ -281,7 +338,9 @@ impl Daemon {
     }
 
     /// Checkpoints `vm` through `staging`, leaving it in `Checkpointing`
-    /// (or as it was, on failure). Returns the manifest and when it paused.
+    /// (or as it was, on failure; or failed, if a checkpoint may have been
+    /// published that could not be revoked). Returns the manifest and when
+    /// it paused.
     fn save(&self, vm: &Vm, staging: Staging, t: &mut Phases) -> Result<(Manifest, Instant)> {
         // A VM still pulling memory from a migration source or its own
         // checkpoint finishes that first.
@@ -289,39 +348,65 @@ impl Daemon {
             bail!("vm {} is still pulling its memory; try again once it has", vm.name);
         }
         t.mark("drain");
+        // Pausing stops the vCPUs, not Firecracker's device handling: a
+        // virtio-mem request still in flight could discard memory after the
+        // state is saved. The guest only sends one to follow a size change
+        // from the host, so wait until it has followed the last one (the
+        // controller cannot make another while we hold the reservation).
+        vm.settle_hotplug(Instant::now() + SETTLE_WAIT)?;
+        t.mark("settle_hotplug");
+        let plugged = vm.hotplug_plugged();
         vm.start_checkpoint()?;
         let paused = Instant::now();
-        let saved = vm.save_state(&staging.vmstate(), true).and_then(|runs| {
+        let saved = vm.save_state(&staging.vmstate(), true).map_err(CommitError::Failed).and_then(|runs| {
             t.mark("snapshot");
-            staging.commit(vm, &runs, t)
+            // A discard (balloon or virtio-mem) or resize from just before the
+            // snapshot on would make the pages disagree with the saved state:
+            // never publish such a checkpoint (the next attempt can succeed).
+            let discards = vm.snapshot_discards.load(Ordering::SeqCst);
+            staging.commit(vm, &runs, t, || {
+                if vm.pager.discards() != discards || vm.hotplug_plugged() != plugged {
+                    bail!("guest memory changed after the vm was paused (a device discarded pages); try again");
+                }
+                Ok(())
+            })
         });
         match saved {
             Ok(m) => Ok((m, paused)),
-            Err(e) => match vm.end_checkpoint() {
+            Err(CommitError::Failed(e)) => match vm.end_checkpoint() {
                 Ok(_) => Err(e),
                 Err(r) => Err(format!("{e}; {r}").into()),
             },
+            Err(CommitError::Uncertain(e)) => {
+                vm.set_failed();
+                Err(format!("{e}; vm {} stays paused and is marked failed, as the checkpoint may come back", vm.name).into())
+            }
         }
     }
 
-    /// Picks up the VMs a previous daemon left suspended in `state_dir`.
+    /// Picks up the VMs a previous daemon left suspended in `state_dir`,
+    /// which this daemon has locked.
     pub(super) fn load_suspended(&self) -> Result<()> {
         let root = self.cfg.state_dir.join("suspended");
-        std::fs::create_dir_all(&root).map_err(|e| format!("state dir {}: {e}", root.display()))?;
-        // Checkpoints of VMs that were resumed: those VMs have run since, and
-        // died with the previous daemon.
-        let _ = std::fs::remove_dir_all(self.cfg.state_dir.join("resumed"));
+        // Checkpoints of VMs that were resumed (those VMs have run since and
+        // died with the previous daemon), and of killed ones.
+        for sub in ["resumed", "trash"] {
+            for e in std::fs::read_dir(self.cfg.state_dir.join(sub))?.flatten() {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
         for e in std::fs::read_dir(&root)?.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
             if name.starts_with('.') {
-                // A suspend that never completed; its VM died with the daemon.
+                // Staging left by a suspend that never completed; its VM died
+                // with the daemon. Only root writes here.
                 let _ = std::fs::remove_dir_all(e.path());
                 continue;
             }
             match Checkpoint::open(&e.path()) {
                 Ok(ck) => {
                     if !self.ips.lock().unwrap().insert(ck.manifest.ip) {
-                        eprintln!("suspended vm {name}: {} is already taken; leaving it suspended", ck.manifest.ip);
+                        eprintln!("suspended vm {name}: {} is already taken", ck.manifest.ip);
                     }
                     eprintln!("suspended vm {name} ({}) found in {}", ck.manifest.ip, e.path().display());
                     self.suspended.lock().unwrap().insert(name, Suspended { dir: ck.dir, manifest: ck.manifest });
@@ -331,15 +416,75 @@ impl Daemon {
         }
         Ok(())
     }
+
+    /// Steps the guest's clock in the background, if it is off: under the
+    /// VM's reservation (so never inside a snapshot or on a VM that has
+    /// migrated on), and at most one at a time per VM.
+    fn sync_clock_later(self: &Arc<Self>, vm: Arc<Vm>) {
+        if vm.clock_pending.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let d = self.clone();
+        thread::spawn(move || {
+            let res = d.reserve(&vm.name, "clock", LIFECYCLE_WAIT).and_then(|_busy| {
+                let current = d.vm(&vm.name).is_ok_and(|v| Arc::ptr_eq(&v, &vm));
+                vm.clock_pending.store(false, Ordering::SeqCst);
+                if !current || vm.state() != State::Running {
+                    return Ok(None);
+                }
+                vm.sync_clock(CLOCK_TOLERANCE, Instant::now() + CLOCK_DEADLINE).map(Some)
+            });
+            vm.clock_pending.store(false, Ordering::SeqCst);
+            match res {
+                Ok(Some(off)) if off.abs() > CLOCK_TOLERANCE.as_secs_f64() * 1e3 => {
+                    eprintln!("vm {}: guest clock was {off:.1} ms off after resuming; stepped it", vm.name)
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("vm {}: checking the guest clock: {e}", vm.name),
+            }
+        });
+    }
 }
 
-/// Steps the guest's clock in the background, if it is off.
-fn sync_clock_later(vm: Arc<Vm>) {
-    thread::spawn(move || match vm.sync_clock(CLOCK_TOLERANCE) {
-        Ok(off) if off.abs() > CLOCK_TOLERANCE.as_secs_f64() * 1e3 => {
-            eprintln!("vm {}: guest clock was {off:.1} ms off after resuming; stepped it", vm.name)
+/// How a restore failed: before the VM's vCPUs ever ran, or after.
+pub(super) enum Restore {
+    NotRun(Error),
+    Ran(Error),
+}
+
+impl Restore {
+    fn error(self) -> Error {
+        match self {
+            Restore::NotRun(e) | Restore::Ran(e) => e,
         }
-        Ok(_) => {}
-        Err(e) => eprintln!("vm {}: checking the guest clock: {e}", vm.name),
-    });
+    }
+}
+
+/// Renames `from` to `to` (in another directory of the same filesystem)
+/// and makes the move durable in both directories.
+fn move_durably(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::rename(from, to)?;
+    for dir in [to.parent(), from.parent()].into_iter().flatten() {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
+}
+
+/// Creates `dir` and any missing parents, fsyncing each parent that gained
+/// an entry, so the hierarchy survives a power loss.
+pub(super) fn create_dir_durably(dir: &Path) -> std::io::Result<()> {
+    if dir.is_dir() {
+        return Ok(());
+    }
+    if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+        create_dir_durably(parent)?;
+    }
+    match std::fs::create_dir(dir) {
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e),
+        _ => {}
+    }
+    if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
 }

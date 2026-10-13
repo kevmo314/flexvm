@@ -12,6 +12,9 @@ use serde_json::{json, Value};
 use crate::bail;
 use crate::fc::{Firecracker, Idle};
 use crate::template::{Template, BALLOON_STATS_S};
+
+/// How long resuming a paused migration target waits for its memory to arrive.
+const PULL_WAIT: Duration = Duration::from_secs(30);
 use crate::uffd::{Origin, Pager, Runs, Source};
 use crate::util::{Phases, Result, PAGE_SIZE};
 
@@ -74,6 +77,11 @@ pub struct Vm {
     /// paused: `resume` then puts it back paused (and a migration target
     /// keeps it paused).
     was_paused: AtomicBool,
+    /// A background clock check is queued (see `Daemon::sync_clock_later`).
+    pub clock_pending: AtomicBool,
+    /// The pager's discard count just before the last snapshot: a discard
+    /// after it means the saved state and memory may disagree.
+    pub snapshot_discards: AtomicU64,
 }
 
 impl Vm {
@@ -172,6 +180,8 @@ impl Vm {
             fc: Mutex::new(Some(fc)),
             cgroup,
             was_paused: AtomicBool::new(false),
+            clock_pending: AtomicBool::new(false),
+            snapshot_discards: AtomicU64::new(0),
         });
         Ok((vm, took))
     }
@@ -234,6 +244,7 @@ impl Vm {
                 fc.pause()?;
             }
             fc.patch("/balloon/statistics", json!({"stats_polling_interval_s": u16::MAX}))?;
+            self.snapshot_discards.store(self.pager.discards(), Ordering::SeqCst);
             fc.put("/snapshot/create", json!({"snapshot_type": "Full", "snapshot_path": vmstate, "mem_file_path": "", "sync_snapshot_files": sync}))
         })?;
         self.pager.quiesce_export()
@@ -313,8 +324,13 @@ impl Vm {
         Ok(())
     }
 
-    /// Resumes a VM stopped by `pause`.
+    /// Resumes a VM stopped by `pause`. A paused migration target first
+    /// pulls all its memory from the source (waiting up to `PULL_WAIT`), so
+    /// it never runs split across two hosts.
     pub fn unpause(&self) -> Result<()> {
+        if self.pager.pulling_from_peer() && !self.pager.wait_pulled_for(PULL_WAIT) {
+            bail!("vm {} is still pulling its memory from its previous host; resume it once that is done", self.name);
+        }
         let mut st = self.state.lock().unwrap();
         match self.state_locked(&st) {
             State::Running => return Ok(()),
@@ -333,6 +349,52 @@ impl Vm {
         *st
     }
 
+    /// Marks the VM failed: it stays as it is until killed.
+    pub fn set_failed(&self) {
+        *self.state.lock().unwrap() = State::Failed;
+    }
+
+    /// virtio-mem memory currently plugged, if Firecracker answers.
+    pub fn hotplug_plugged(&self) -> Option<u64> {
+        let hp = self.fc(|fc| fc.request_within("GET", "/hotplug/memory", None, crate::guest::TIMEOUT)).ok()?;
+        hp["plugged_size_mib"].as_u64()
+    }
+
+    /// Waits until the guest has carried out the last virtio-mem resize
+    /// (plugged == requested), so that no request of its can still reach
+    /// the device; past half of `deadline`, stops asking for a size the
+    /// guest cannot reach (requested = plugged). Firecracker processes
+    /// virtio-mem requests on its VMM thread, paused vCPUs or not, and each
+    /// can discard memory and write the used ring; the guest driver only
+    /// sends them to follow a size change from the host. Callers keep the
+    /// controller from resizing meanwhile (the VM's reservation).
+    pub fn settle_hotplug(&self, deadline: Instant) -> Result<()> {
+        if self.template.meta.max_mib <= self.template.meta.mem_mib {
+            return Ok(());
+        }
+        let half = Instant::now() + deadline.saturating_duration_since(Instant::now()) / 2;
+        let mut gave_up = false;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
+            let hp = self.fc(|fc| fc.request_within("GET", "/hotplug/memory", None, left))?;
+            let (requested, plugged) = (hp["requested_size_mib"].as_u64(), hp["plugged_size_mib"].as_u64());
+            if requested.is_some() && requested == plugged {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                bail!("vm {}: virtio-mem did not settle (requested {requested:?} MiB, plugged {plugged:?} MiB)", self.name);
+            }
+            if !gave_up && Instant::now() >= half {
+                if let Some(p) = plugged {
+                    let body = json!({"requested_size_mib": p});
+                    self.fc(|fc| fc.request_within("PATCH", "/hotplug/memory", Some(body), left))?;
+                    gave_up = true;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// On a migration target: puts back the balloon statistics timer that the
     /// source's `checkpoint` parked, unless the VM is already migrating on
     /// (its next host does it then). Runs off the critical path; holding the
@@ -344,35 +406,52 @@ impl Vm {
         }
     }
 
-    /// Runs `cmd` in the guest and returns its exit code and output.
-    pub fn sh(&self, cmd: &str) -> Result<(i32, String)> {
-        let (mut g, id) = self.exec(|uds| crate::guest::start_exec(uds, cmd, crate::guest::TIMEOUT))?;
+    /// Runs `cmd` in the guest and returns its exit code and (at most 64 KiB
+    /// of) output. Gives up at `deadline`, closing the session.
+    pub fn sh(&self, cmd: &str, deadline: Instant) -> Result<(i32, String)> {
+        const MAX_OUTPUT: usize = 64 << 10;
+        let left = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
+        let (mut g, id) = self.exec(|uds| crate::guest::start_exec(uds, cmd, left))?;
         let mut out = Vec::new();
         let res = loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break Err(format!("guest command timed out: {cmd:?}").into());
+            }
+            if let Err(e) = g.get_ref().set_read_timeout(Some(left)) {
+                break Err(e.into());
+            }
             match crate::guest::read_frame(&mut g) {
                 Ok(Some((crate::guest::FRAME_EXIT, d))) if d.len() >= 4 => {
                     break Ok(i32::from_le_bytes(d[..4].try_into().unwrap()))
                 }
-                Ok(Some((_, d))) => out.extend_from_slice(&d),
+                Ok(Some((_, d))) => out.extend_from_slice(&d[..d.len().min(MAX_OUTPUT.saturating_sub(out.len()))]),
                 Ok(None) => break Err("guest closed the connection before the command exited".into()),
                 Err(e) => break Err(e),
             }
         };
+        if res.is_err() {
+            let _ = g.get_ref().shutdown(Shutdown::Both);
+        }
         self.untrack_exec(id);
         Ok((res?, String::from_utf8_lossy(&out).into_owned()))
     }
 
     /// Steps the guest's wall clock to the host's if it is off by more than
-    /// `tolerance`. A restore leaves the guest's clock where it was saved (the
-    /// guest's TSC clocksource resumes from its saved value, and Firecracker's
-    /// `clock_realtime` only moves kvmclock), so it lags by however long the VM
-    /// was stopped. The offset is measured with one exec bracketed by host
-    /// timestamps and corrected relative to the guest's own clock, so the
-    /// second exec's latency does not matter. Returns the offset found (ms).
-    pub fn sync_clock(&self, tolerance: Duration) -> Result<f64> {
+    /// `tolerance`; all of it done by `deadline`. A restore leaves the
+    /// guest's clock where it was saved (the guest's TSC clocksource resumes
+    /// from its saved value, and Firecracker's `clock_realtime` only moves
+    /// kvmclock), so it lags by however long the VM was stopped. The offset is
+    /// measured with one exec bracketed by host timestamps; the step sets an
+    /// absolute time (the host's, plus half the measured round trip for the
+    /// exec's delay), so running it twice never steps twice. Returns the
+    /// offset found (ms). Callers hold the VM's reservation. The one place
+    /// that sets the guest clock (a guest agent request would replace the
+    /// execs here).
+    pub fn sync_clock(&self, tolerance: Duration, deadline: Instant) -> Result<f64> {
         let now = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as i128;
         let before = now();
-        let (code, out) = self.sh("date +%s%N")?;
+        let (code, out) = self.sh("date +%s%N", deadline)?;
         let after = now();
         let guest: i128 = match (code, out.trim().parse()) {
             (0, Ok(ns)) => ns,
@@ -380,10 +459,9 @@ impl Vm {
         };
         let offset = guest - (before + after) / 2;
         if offset.unsigned_abs() > tolerance.as_nanos() {
-            let cmd = format!(
-                "n=$(( $(date +%s%N) - ({offset}) )); date -s @$((n / 1000000000)).$(printf %09d $((n % 1000000000))) >/dev/null"
-            );
-            match self.sh(&cmd)? {
+            let at = now() + (after - before) / 2;
+            let cmd = format!("date -s @{}.{:09} >/dev/null", at / 1_000_000_000, at % 1_000_000_000);
+            match self.sh(&cmd, deadline)? {
                 (0, _) => {}
                 (code, out) => bail!("setting the guest clock: {out:?} (exit {code})"),
             }

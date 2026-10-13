@@ -23,7 +23,7 @@ use crate::fc::Pool;
 use crate::guest;
 use crate::net::{self, IpRange};
 use crate::template::{Paths, Template, STEP_MIB};
-use crate::checkpoint::{Checkpoint, Manifest, Staging};
+use crate::checkpoint::{Checkpoint, CommitError, Manifest, Staging};
 use crate::uffd::{serve_pages, Origin, Runs, Source};
 use crate::util::{ms, proc_kb, recv_json, send_json, Error, Phases, Result};
 use crate::vm::{State, Vm};
@@ -60,6 +60,10 @@ const LIFECYCLE_WAIT: Duration = Duration::from_secs(30);
 const DRAIN_WAIT: Duration = Duration::from_secs(60);
 /// Guest clock error tolerated after a restore or resume.
 const CLOCK_TOLERANCE: Duration = Duration::from_millis(20);
+/// How long checking and stepping the guest clock may take.
+const CLOCK_DEADLINE: Duration = Duration::from_secs(5);
+/// How long a checkpoint waits for virtio-mem to carry out the last resize.
+const SETTLE_WAIT: Duration = Duration::from_secs(10);
 
 /// A VM suspended to a checkpoint under `state_dir/suspended`.
 struct Suspended {
@@ -121,7 +125,15 @@ pub fn run(mut cfg: Config) -> Result<()> {
     // Every Firecracker gets paths under the canonical directory, which is
     // what `kill_orphans` compares against.
     cfg.run_dir = cfg.run_dir.canonicalize()?;
-    let run_lock = lock_run_dir(&cfg.run_dir)?;
+    let mut run_lock = lock_run_dir(&cfg.run_dir)?;
+    // The state dir is this daemon's alone too (another daemon's startup
+    // would clear its trees), and must survive a power loss.
+    for sub in ["suspended", "resumed", "trash"] {
+        lifecycle::create_dir_durably(&cfg.state_dir.join(sub))
+            .map_err(|e| format!("state dir {}: {e}", cfg.state_dir.display()))?;
+    }
+    cfg.state_dir = cfg.state_dir.canonicalize()?;
+    run_lock.extend(lock_run_dir(&cfg.state_dir)?);
     let listener = TcpListener::bind(&cfg.listen)?;
     kill_orphans(&cfg.run_dir)?;
     let cgroup_root = setup_cgroups(&cfg.listen);
@@ -476,8 +488,10 @@ impl Daemon {
             None => {
                 let s = self.suspended.lock().unwrap().remove(name);
                 let Some(s) = s else { bail!("no vm named {name:?}") };
-                if let Err(e) = std::fs::remove_dir_all(&s.dir) {
-                    eprintln!("vm {name}: removing its checkpoint {}: {e}", s.dir.display());
+                // Durably gone before we say so, or it would come back after a crash.
+                if let Err(e) = self.discard_suspended(name, &s) {
+                    self.suspended.lock().unwrap().insert(name.into(), s);
+                    return Err(e);
                 }
                 s.manifest.ip
             }
@@ -641,6 +655,8 @@ impl Daemon {
         let vm = self.vm(name)?;
         // Before pausing, so a template mismatch costs no downtime.
         crate::template::preflight(&self.cfg.paths, &vm.template, to)?;
+        // No virtio-mem request may reach the device behind the saved state.
+        vm.settle_hotplug(Instant::now() + SETTLE_WAIT)?;
         let mig = migration_id();
         vm.start_source(mig)?;
         let mut t = Phases::new();
