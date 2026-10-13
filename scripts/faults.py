@@ -118,7 +118,7 @@ def check(label, cond, detail=""):
 
 
 def proc(pid, what):
-    if what in ("environ", "io"):
+    if what == "environ":
         return subprocess.run(["sudo", "cat", f"/proc/{pid}/{what}"], capture_output=True).stdout
     try:
         with open(f"/proc/{pid}/{what}", "rb") as f:
@@ -620,14 +620,28 @@ def guest_hang():
         except subprocess.TimeoutExpired:
             times.append((None, None))
 
-    execs = [threading.Thread(target=one) for _ in range(3)]
+    # The daemon's own answer, which the CLI's 30 s of retries would hide:
+    # each exec request fails within the guest timeout (5 s), concurrently.
+    raw = []
+
+    def one_raw():
+        t = time.time()
+        try:
+            r = rpc(A, {"op": "exec", "name": n, "session": os.urandom(16).hex(), "action": "start", "cmd": "echo hi"})
+            raw.append((round(time.time() - t, 1), r["ok"]))
+        except OSError as e:
+            raw.append((None, str(e)))
+
+    execs = [threading.Thread(target=f) for f in (one, one, one, one_raw, one_raw, one_raw)]
     for e in execs:
         e.start()
     for e in execs:
         e.join()
     subprocess.run(["sudo", "kill", "-CONT", fcs[0]])
+    check("guest hang: the daemon fails each exec within the guest timeout",
+          len(raw) == 3 and all(t is not None and t < 12 and r is False for t, r in raw), raw)
     # The CLI keeps retrying a VM its host knows for 30 s, then gives up.
-    check("guest hang: every exec gave up within its deadline", all(t is not None and t < 40 and c != 0 for t, c in times), times)
+    check("guest hang: every CLI exec gave up within its deadline", all(t is not None and t < 40 and c != 0 for t, c in times), times)
     check("guest hang: exec works again", sh(A, n, "echo hi") == (0, "hi"))
     ok(A, {"op": "migrate", "name": n, "to": B})
     wait_released(B, n)
@@ -803,25 +817,42 @@ def checkpoint_corrupt():
     rm_ckpt(pristine)
 
 
+_STAGED_MIB = """
+import os, sys
+d, n = sys.argv[1], 0
+for s in os.listdir(d):
+    if s.startswith(".flexvm-staging-"):
+        try:
+            fd = os.open(os.path.join(d, s, "ck", "pages"), os.O_RDONLY)
+        except OSError:
+            continue
+        n += sum(any(os.pread(fd, 4096, o)) for o in range(0, os.fstat(fd).st_size, 1 << 20))
+        os.close(fd)
+print(n)
+"""
+
+
+def staged_mib():
+    """Roughly how many MiB of page data checkpoints staged in --ckpt-dir
+    have written (staging is root-only)."""
+    out = subprocess.run(["sudo", "python3", "-I", "-c", _STAGED_MIB, args.ckpt_dir], capture_output=True, text=True).stdout
+    return int(out or 0)
+
+
 def checkpoint_crash():
     """The daemon dies while writing a checkpoint: no checkpoint appears (not
     even a partial one restores), and the next checkpoint to the same place
     clears the debris and succeeds."""
     n, path = "ft-crash", ckpt_path("ft-crash")
     setup(n, mib=1200)
-    pid = daemon_pid(A)
-
-    def written_bytes():
-        return int(dict(line.split(": ") for line in proc(pid, "io").decode().splitlines())["wchar"])
-
-    before = written_bytes()
     fault(A, "ckpt_slow", 120000)
     t = threading.Thread(target=lambda: rpc(A, {"op": "checkpoint", "name": n, "dir": path}))
     t.start()
 
     def writing():
-        # wchar counts actual write syscalls; fallocate only reserves space.
-        return written_bytes() > before + 100 * 1024 * 1024 and vms(A).get(n, {}).get("checkpoint_copy")
+        # The pages file is preallocated (fallocate reads back as zeros), so
+        # count what was written: MiB-spaced samples of it that hold data.
+        return staged_mib() > 100 and vms(A).get(n, {}).get("checkpoint_copy")
 
     caught = wait_for(writing, 30)
     check("crash: caught the checkpoint mid-write", caught)

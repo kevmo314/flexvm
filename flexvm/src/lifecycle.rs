@@ -45,7 +45,17 @@ impl Daemon {
     pub(super) fn list(&self) -> Value {
         let vms = self.vms.lock().unwrap();
         let suspended = self.suspended.lock().unwrap();
-        let mut out: Vec<Value> = vms.values().map(|v| v.describe()).collect();
+        let mut out: Vec<Value> = vms
+            .values()
+            .map(|v| {
+                let mut d = v.describe();
+                // Live copy counters, for fault tests to synchronize on.
+                if self.faults.is_some() {
+                    d["checkpoint_copy_stats"] = json!(v.pager.copy_stats());
+                }
+                d
+            })
+            .collect();
         for (name, s) in suspended.iter() {
             let m = &s.manifest;
             out.push(json!({

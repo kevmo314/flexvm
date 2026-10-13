@@ -1567,7 +1567,7 @@ impl Pager {
         self.cow.lock().unwrap().is_some()
     }
 
-    /// Live copy counters for fault-test synchronization.
+    /// The running checkpoint copy's counters (for fault tests).
     pub fn copy_stats(&self) -> Option<serde_json::Value> {
         self.cow.lock().unwrap().as_ref().map(|c| c.report())
     }
