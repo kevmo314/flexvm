@@ -1,0 +1,486 @@
+{
+  "date_utc": "2026-10-13T22-12-50Z",
+  "git_dirty": true,
+  "git_sha": "743164b29a354806d6e3a5fb73efc4c92456e642",
+  "host_context": {
+    "cpu_model": "AMD Ryzen 9 3900X 12-Core Processor",
+    "host_cpus": 24,
+    "hostname": "Chicago",
+    "kernel": "6.18.54.1-microsoft-standard-WSL2",
+    "loadavg": "11.58 12.84 12.75 5/5424 745306",
+    "nested_virt": true,
+    "template": "small"
+  },
+  "params": {
+    "date": "2026-10-13T22-12-50Z",
+    "dirty_mib": 0,
+    "iterations": 20,
+    "ready_http": false,
+    "ready_port": null,
+    "settle_ms": 100,
+    "template": "small",
+    "to": null,
+    "warmup": 3
+  },
+  "samples_ms": [
+    {
+      "hot": false,
+      "run": {
+        "announce": 0.17,
+        "claim_ip": 0.12,
+        "guest_net": 6.71,
+        "pager_start": 1.79,
+        "pool_take": 5.24,
+        "register": 0.09,
+        "resume": 0.42,
+        "route_wait": 0.0,
+        "snapshot_load": 22.57,
+        "template": 0.57,
+        "total": 37.69
+      },
+      "run_client": {
+        "total": 47.05
+      }
+    },
+    {
+      "hot": false,
+      "run": {
+        "announce": 0.18,
+        "claim_ip": 0.12,
+        "guest_net": 6.08,
+        "pager_start": 1.54,
+        "pool_take": 8.57,
+        "register": 0.06,
+        "resume": 0.49,
+        "route_wait": 0.0,
+        "snapshot_load": 18.46,
+        "template": 0.64,
+        "total": 36.13
+      },
+      "run_client": {
+        "total": 44.86
+      }
+    },
+    {
+      "hot": false,
+      "run": {
+        "announce": 0.18,
+        "claim_ip": 0.13,
+        "guest_net": 6.51,
+        "pager_start": 2.01,
+        "pool_take": 6.56,
+        "register": 0.1,
+        "resume": 0.53,
+        "route_wait": 0.01,
+        "snapshot_load": 17.68,
+        "template": 0.63,
+        "total": 34.34
+      },
+      "run_client": {
+        "total": 43.86
+      }
+    },
+    {
+      "hot": false,
+      "run": {
+        "announce": 0.14,
+        "claim_ip": 0.1,
+        "guest_net": 5.69,
+        "pager_start": 1.41,
+        "pool_take": 5.18,
+        "register": 0.05,
+        "resume": 0.41,
+        "route_wait": 0.0,
+        "snapshot_load": 16.13,
+        "template": 0.55,
+        "total": 29.66
+      },
+      "run_client": {
+        "total": 38.03
+      }
+    },
+    {
+      "hot": false,
+      "run": {
+        "announce": 0.17,
+        "claim_ip": 0.12,
+        "guest_net": 7.12,
+        "pager_start": 1.51,
+        "pool_take": 9.33,
+        "register": 0.05,
+        "resume": 0.46,
+        "route_wait": 0.0,
+        "snapshot_load": 15.38,
+        "template": 0.6,
+        "total": 34.73
+      },
+      "run_client": {
+        "total": 44.05
+      }
+    },
+    {
+      "hot": false,
+      "run": {
+        "announce": 0.15,
+        "claim_ip": 0.13,
+        "guest_net": 5.65,
+        "pager_start": 1.3,
+        "pool_take": 20.12,
+        "register": 0.05,
+        "resume": 0.4,
+        "route_wait": 0.0,
+        "snapshot_load": 14.79,
+        "template": 0.69,
+        "total": 43.3
+      },
+      "run_client": {
+        "total": 55.37
+      }
+    },
+    {
+      "hot": false,
+      "run": {
+        "announce": 0.15,
+        "claim_ip": 0.11,
+        "guest_net": 5.96,
+        "pager_start": 1.64,
+        "pool_take": 6.25,
+        "register": 0.06,
+        "resume": 0.38,
+        "route_wait": 0.0,
+        "snapshot_load": 15.16,
+        "template": 0.55,
+        "total": 30.28
+      },
+      "run_client": {
+        "total": 38.7
+      }
+    },
+    {
+      "hot": false,
+      "run": {
+        "announce": 0.17,
+        "claim_ip": 0.12,
+        "guest_net": 6.09,
+        "pager_start": 1.54,
+        "pool_take": 5.25,
+        "register": 0.06,
+        "resume": 0.39,
+        "route_wait": 0.0,
+        "snapshot_load": 16.19,
+        "template": 0.57,
+        "total": 30.38
+      },
+      "run_client": {
+        "total": 42.35
+      }
+    },
+    {
+      "hot": false,
+      "run": {
+        "announce": 0.15,
+        "claim_ip": 0.12,
+        "guest_net": 5.74,
+        "pager_start": 1.72,
+        "pool_take": 29.13,
+        "register": 0.06,
+        "resume": 0.45,
+        "route_wait": 0.01,
+        "snapshot_load": 15.48,
+        "template": 0.59,
+        "total": 53.45
+      },
+      "run_client": {
+        "total": 62.94
+      }
+    },
+    {
+      "hot": false,
+      "run": {
+        "announce": 0.16,
+        "claim_ip": 0.19,
+        "guest_net": 5.67,
+        "pager_start": 1.28,
+        "pool_take": 7.81,
+        "register": 0.05,
+        "resume": 0.38,
+        "route_wait": 0.0,
+        "snapshot_load": 15.58,
+        "template": 0.58,
+        "total": 31.7
+      },
+      "run_client": {
+        "total": 40.54
+      }
+    },
+    {
+      "hot": false,
+      "run": {
+        "announce": 0.19,
+        "claim_ip": 0.13,
+        "guest_net": 5.88,
+        "pager_start": 1.63,
+        "pool_take": 7.13,
+        "register": 0.07,
+        "resume": 0.52,
+        "route_wait": 0.0,
+        "snapshot_load": 17.02,
+        "template": 0.62,
+        "total": 33.18
+      },
+      "run_client": {
+        "total": 42.68
+      }
+    },
+    {
+      "hot": false,
+      "run": {
+        "announce": 0.2,
+        "claim_ip": 0.11,
+        "guest_net": 6.07,
+        "pager_start": 1.29,
+        "pool_take": 7.87,
+        "register": 0.06,
+        "resume": 0.65,
+        "route_wait": 0.02,
+        "snapshot_load": 18.65,
+        "template": 0.58,
+        "total": 35.49
+      },
+      "run_client": {
+        "total": 46.2
+      }
+    },
+    {
+      "hot": false,
+      "run": {
+        "announce": 0.17,
+        "claim_ip": 0.11,
+        "guest_net": 5.87,
+        "pager_start": 1.49,
+        "pool_take": 9.2,
+        "register": 0.06,
+        "resume": 0.49,
+        "route_wait": 0.01,
+        "snapshot_load": 16.6,
+        "template": 0.63,
+        "total": 34.62
+      },
+      "run_client": {
+        "total": 44.2
+      }
+    },
+    {
+      "hot": false,
+      "run": {
+        "announce": 0.14,
+        "claim_ip": 0.13,
+        "guest_net": 5.65,
+        "pager_start": 1.15,
+        "pool_take": 5.93,
+        "register": 0.06,
+        "resume": 0.38,
+        "route_wait": 0.0,
+        "snapshot_load": 17.51,
+        "template": 0.62,
+        "total": 31.57
+      },
+      "run_client": {
+        "total": 40.73
+      }
+    },
+    {
+      "hot": false,
+      "run": {
+        "announce": 0.17,
+        "claim_ip": 0.12,
+        "guest_net": 6.86,
+        "pager_start": 1.53,
+        "pool_take": 7.41,
+        "register": 0.06,
+        "resume": 0.51,
+        "route_wait": 0.0,
+        "snapshot_load": 14.75,
+        "template": 0.57,
+        "total": 31.99
+      },
+      "run_client": {
+        "total": 43.16
+      }
+    },
+    {
+      "hot": false,
+      "run": {
+        "announce": 0.14,
+        "claim_ip": 0.12,
+        "guest_net": 5.39,
+        "pager_start": 2.2,
+        "pool_take": 8.66,
+        "register": 0.06,
+        "resume": 0.44,
+        "route_wait": 0.0,
+        "snapshot_load": 46.42,
+        "template": 0.56,
+        "total": 64.01
+      },
+      "run_client": {
+        "total": 73.12
+      }
+    },
+    {
+      "hot": false,
+      "run": {
+        "announce": 0.18,
+        "claim_ip": 0.25,
+        "guest_net": 8.7,
+        "pager_start": 1.3,
+        "pool_take": 5.06,
+        "register": 0.06,
+        "resume": 0.42,
+        "route_wait": 0.0,
+        "snapshot_load": 18.34,
+        "template": 0.56,
+        "total": 34.87
+      },
+      "run_client": {
+        "total": 44.01
+      }
+    },
+    {
+      "hot": false,
+      "run": {
+        "announce": 0.15,
+        "claim_ip": 0.12,
+        "guest_net": 6.18,
+        "pager_start": 1.56,
+        "pool_take": 7.58,
+        "register": 0.05,
+        "resume": 0.38,
+        "route_wait": 0.0,
+        "snapshot_load": 17.43,
+        "template": 0.63,
+        "total": 34.1
+      },
+      "run_client": {
+        "total": 43.0
+      }
+    },
+    {
+      "hot": false,
+      "run": {
+        "announce": 0.15,
+        "claim_ip": 0.11,
+        "guest_net": 5.97,
+        "pager_start": 1.41,
+        "pool_take": 4.36,
+        "register": 0.05,
+        "resume": 0.42,
+        "route_wait": 0.0,
+        "snapshot_load": 18.0,
+        "template": 0.55,
+        "total": 31.02
+      },
+      "run_client": {
+        "total": 40.3
+      }
+    },
+    {
+      "hot": false,
+      "run": {
+        "announce": 0.17,
+        "claim_ip": 0.11,
+        "guest_net": 5.83,
+        "pager_start": 1.21,
+        "pool_take": 4.02,
+        "register": 0.07,
+        "resume": 0.41,
+        "route_wait": 0.0,
+        "snapshot_load": 17.0,
+        "template": 0.57,
+        "total": 29.38
+      },
+      "run_client": {
+        "total": 37.85
+      }
+    }
+  ],
+  "summary_ms": {
+    "run": {
+      "announce": {
+        "max": 0.2,
+        "p50": 0.17,
+        "p90": 0.18,
+        "p99": 0.2
+      },
+      "claim_ip": {
+        "max": 0.25,
+        "p50": 0.12,
+        "p90": 0.13,
+        "p99": 0.25
+      },
+      "guest_net": {
+        "max": 8.7,
+        "p50": 5.96,
+        "p90": 6.86,
+        "p99": 8.7
+      },
+      "pager_start": {
+        "max": 2.2,
+        "p50": 1.51,
+        "p90": 1.79,
+        "p99": 2.2
+      },
+      "pool_take": {
+        "max": 29.13,
+        "p50": 7.13,
+        "p90": 9.33,
+        "p99": 29.13
+      },
+      "register": {
+        "max": 0.1,
+        "p50": 0.06,
+        "p90": 0.07,
+        "p99": 0.1
+      },
+      "resume": {
+        "max": 0.65,
+        "p50": 0.42,
+        "p90": 0.52,
+        "p99": 0.65
+      },
+      "route_wait": {
+        "max": 0.02,
+        "p50": 0.0,
+        "p90": 0.01,
+        "p99": 0.02
+      },
+      "snapshot_load": {
+        "max": 46.42,
+        "p50": 17.0,
+        "p90": 18.65,
+        "p99": 46.42
+      },
+      "template": {
+        "max": 0.69,
+        "p50": 0.58,
+        "p90": 0.63,
+        "p99": 0.69
+      },
+      "total": {
+        "max": 64.01,
+        "p50": 34.1,
+        "p90": 43.3,
+        "p99": 64.01
+      }
+    },
+    "run_client": {
+      "total": {
+        "max": 73.12,
+        "p50": 43.16,
+        "p90": 55.37,
+        "p99": 73.12
+      }
+    },
+    "run_hot_hits": 0
+  }
+}

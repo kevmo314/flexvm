@@ -1,0 +1,986 @@
+{
+  "date_utc": "2026-10-13T22-12-28Z",
+  "git_dirty": false,
+  "git_sha": "743164b29a354806d6e3a5fb73efc4c92456e642",
+  "host_context": {
+    "cpu_model": "AMD Ryzen 9 3900X 12-Core Processor",
+    "host_cpus": 24,
+    "hostname": "Chicago",
+    "kernel": "6.18.54.1-microsoft-standard-WSL2",
+    "loadavg": "12.17 13.01 12.80 5/5404 743041",
+    "nested_virt": true,
+    "template": "small"
+  },
+  "params": {
+    "date": "2026-10-13T22-12-28Z",
+    "dirty_mib": 0,
+    "iterations": 20,
+    "ready_http": false,
+    "ready_port": null,
+    "settle_ms": 100,
+    "template": "small",
+    "to": "127.0.0.1:7131",
+    "warmup": 3
+  },
+  "samples_ms": [
+    {
+      "hot": true,
+      "migrate": {
+        "background_pull": 53.68,
+        "downtime": 12.89,
+        "export_runs": 0.06,
+        "hold": 0.08,
+        "link_down": 0.0,
+        "pause": 0.36,
+        "read_preload": 0.14,
+        "read_state": 0.05,
+        "reroute": 1.59,
+        "send_state": 0.25,
+        "snapshot_create": 1.78,
+        "target": 10.17,
+        "total": 14.48
+      },
+      "migrate_target": {
+        "recv_state": 0.39,
+        "register": 0.14,
+        "resume": 1.85,
+        "route_wait": 0.0,
+        "snapshot_load": 3.39,
+        "total": 6.04,
+        "write_state": 0.26
+      },
+      "run": {
+        "announce": 0.08,
+        "claim_ip": 0.14,
+        "guest_net": 2.17,
+        "register": 0.06,
+        "resume": 0.5,
+        "route": 0.25,
+        "total": 3.2
+      },
+      "run_client": {
+        "total": 9.17
+      }
+    },
+    {
+      "hot": true,
+      "migrate": {
+        "background_pull": 47.34,
+        "downtime": 12.66,
+        "export_runs": 0.04,
+        "hold": 0.08,
+        "link_down": 0.43,
+        "pause": 0.41,
+        "read_preload": 0.06,
+        "read_state": 0.03,
+        "reroute": 1.93,
+        "send_state": 0.12,
+        "snapshot_create": 1.6,
+        "target": 9.89,
+        "total": 14.6
+      },
+      "migrate_target": {
+        "recv_state": 0.3,
+        "register": 0.16,
+        "resume": 2.47,
+        "route_wait": 0.0,
+        "snapshot_load": 3.62,
+        "total": 6.9,
+        "write_state": 0.36
+      },
+      "run": {
+        "announce": 0.1,
+        "claim_ip": 0.17,
+        "guest_net": 1.98,
+        "register": 0.06,
+        "resume": 0.51,
+        "route": 0.28,
+        "total": 3.1
+      },
+      "run_client": {
+        "total": 9.21
+      }
+    },
+    {
+      "hot": true,
+      "migrate": {
+        "background_pull": 51.77,
+        "downtime": 14.62,
+        "export_runs": 0.04,
+        "hold": 0.07,
+        "link_down": 0.0,
+        "pause": 0.37,
+        "read_preload": 0.08,
+        "read_state": 0.04,
+        "reroute": 1.69,
+        "send_state": 0.16,
+        "snapshot_create": 1.93,
+        "target": 11.94,
+        "total": 16.31
+      },
+      "migrate_target": {
+        "recv_state": 0.38,
+        "register": 0.31,
+        "resume": 3.07,
+        "route_wait": 0.0,
+        "snapshot_load": 4.3,
+        "total": 8.55,
+        "write_state": 0.5
+      },
+      "run": {
+        "announce": 0.09,
+        "claim_ip": 0.16,
+        "guest_net": 2.91,
+        "register": 0.05,
+        "resume": 0.47,
+        "route": 0.29,
+        "total": 3.96
+      },
+      "run_client": {
+        "total": 9.89
+      }
+    },
+    {
+      "hot": true,
+      "migrate": {
+        "background_pull": 58.07,
+        "downtime": 13.61,
+        "export_runs": 0.05,
+        "hold": 0.08,
+        "link_down": 0.64,
+        "pause": 0.36,
+        "read_preload": 0.13,
+        "read_state": 0.03,
+        "reroute": 1.68,
+        "send_state": 0.15,
+        "snapshot_create": 1.8,
+        "target": 10.37,
+        "total": 15.29
+      },
+      "migrate_target": {
+        "recv_state": 0.37,
+        "register": 0.28,
+        "resume": 2.41,
+        "route_wait": 0.0,
+        "snapshot_load": 3.58,
+        "total": 6.95,
+        "write_state": 0.3
+      },
+      "run": {
+        "announce": 0.08,
+        "claim_ip": 0.15,
+        "guest_net": 2.45,
+        "register": 0.04,
+        "resume": 0.56,
+        "route": 0.27,
+        "total": 3.55
+      },
+      "run_client": {
+        "total": 10.92
+      }
+    },
+    {
+      "hot": true,
+      "migrate": {
+        "background_pull": 55.96,
+        "downtime": 15.65,
+        "export_runs": 0.06,
+        "hold": 0.09,
+        "link_down": 1.21,
+        "pause": 0.37,
+        "read_preload": 0.09,
+        "read_state": 0.04,
+        "reroute": 1.94,
+        "send_state": 0.44,
+        "snapshot_create": 2.0,
+        "target": 11.35,
+        "total": 17.6
+      },
+      "migrate_target": {
+        "recv_state": 0.39,
+        "register": 0.2,
+        "resume": 2.71,
+        "route_wait": 0.02,
+        "snapshot_load": 4.22,
+        "total": 7.82,
+        "write_state": 0.28
+      },
+      "run": {
+        "announce": 0.12,
+        "claim_ip": 0.14,
+        "guest_net": 2.12,
+        "register": 0.04,
+        "resume": 0.51,
+        "route": 0.28,
+        "total": 3.2
+      },
+      "run_client": {
+        "total": 9.54
+      }
+    },
+    {
+      "hot": true,
+      "migrate": {
+        "background_pull": 53.04,
+        "downtime": 13.48,
+        "export_runs": 0.04,
+        "hold": 0.09,
+        "link_down": 0.09,
+        "pause": 0.49,
+        "read_preload": 0.07,
+        "read_state": 0.04,
+        "reroute": 1.71,
+        "send_state": 0.14,
+        "snapshot_create": 1.66,
+        "target": 10.86,
+        "total": 15.19
+      },
+      "migrate_target": {
+        "recv_state": 0.43,
+        "register": 0.18,
+        "resume": 1.76,
+        "route_wait": 0.0,
+        "snapshot_load": 4.09,
+        "total": 6.75,
+        "write_state": 0.27
+      },
+      "run": {
+        "announce": 0.1,
+        "claim_ip": 0.16,
+        "guest_net": 2.18,
+        "register": 0.07,
+        "resume": 0.51,
+        "route": 0.31,
+        "total": 3.32
+      },
+      "run_client": {
+        "total": 9.85
+      }
+    },
+    {
+      "hot": true,
+      "migrate": {
+        "background_pull": 47.4,
+        "downtime": 12.62,
+        "export_runs": 0.08,
+        "hold": 0.09,
+        "link_down": 0.6,
+        "pause": 0.42,
+        "read_preload": 0.06,
+        "read_state": 0.07,
+        "reroute": 1.78,
+        "send_state": 0.13,
+        "snapshot_create": 1.68,
+        "target": 9.48,
+        "total": 14.4
+      },
+      "migrate_target": {
+        "recv_state": 0.47,
+        "register": 0.43,
+        "resume": 1.89,
+        "route_wait": 0.0,
+        "snapshot_load": 3.0,
+        "total": 6.17,
+        "write_state": 0.38
+      },
+      "run": {
+        "announce": 0.09,
+        "claim_ip": 0.17,
+        "guest_net": 1.85,
+        "register": 0.05,
+        "resume": 0.51,
+        "route": 0.27,
+        "total": 2.95
+      },
+      "run_client": {
+        "total": 9.7
+      }
+    },
+    {
+      "hot": true,
+      "migrate": {
+        "background_pull": 47.86,
+        "downtime": 11.91,
+        "export_runs": 0.04,
+        "hold": 0.08,
+        "link_down": 0.6,
+        "pause": 0.42,
+        "read_preload": 0.07,
+        "read_state": 0.04,
+        "reroute": 2.49,
+        "send_state": 0.14,
+        "snapshot_create": 1.62,
+        "target": 8.9,
+        "total": 14.4
+      },
+      "migrate_target": {
+        "recv_state": 0.29,
+        "register": 0.34,
+        "resume": 1.49,
+        "route_wait": 0.0,
+        "snapshot_load": 3.21,
+        "total": 5.72,
+        "write_state": 0.4
+      },
+      "run": {
+        "announce": 0.14,
+        "claim_ip": 0.18,
+        "guest_net": 2.22,
+        "register": 0.05,
+        "resume": 0.48,
+        "route": 0.36,
+        "total": 3.42
+      },
+      "run_client": {
+        "total": 9.99
+      }
+    },
+    {
+      "hot": true,
+      "migrate": {
+        "background_pull": 56.04,
+        "downtime": 15.5,
+        "export_runs": 0.04,
+        "hold": 0.07,
+        "link_down": 0.66,
+        "pause": 0.42,
+        "read_preload": 0.06,
+        "read_state": 0.04,
+        "reroute": 1.47,
+        "send_state": 0.14,
+        "snapshot_create": 1.5,
+        "target": 12.58,
+        "total": 16.97
+      },
+      "migrate_target": {
+        "recv_state": 0.4,
+        "register": 0.15,
+        "resume": 1.79,
+        "route_wait": 0.01,
+        "snapshot_load": 6.91,
+        "total": 9.62,
+        "write_state": 0.36
+      },
+      "run": {
+        "announce": 0.09,
+        "claim_ip": 0.15,
+        "guest_net": 2.13,
+        "register": 0.04,
+        "resume": 0.45,
+        "route": 0.25,
+        "total": 3.12
+      },
+      "run_client": {
+        "total": 9.43
+      }
+    },
+    {
+      "hot": true,
+      "migrate": {
+        "background_pull": 50.2,
+        "downtime": 14.73,
+        "export_runs": 0.04,
+        "hold": 0.09,
+        "link_down": 0.0,
+        "pause": 0.4,
+        "read_preload": 0.06,
+        "read_state": 0.04,
+        "reroute": 1.67,
+        "send_state": 0.19,
+        "snapshot_create": 1.51,
+        "target": 12.41,
+        "total": 16.4
+      },
+      "migrate_target": {
+        "recv_state": 0.44,
+        "register": 0.25,
+        "resume": 1.87,
+        "route_wait": 0.0,
+        "snapshot_load": 6.31,
+        "total": 9.18,
+        "write_state": 0.31
+      },
+      "run": {
+        "announce": 0.08,
+        "claim_ip": 0.19,
+        "guest_net": 2.09,
+        "register": 0.04,
+        "resume": 0.44,
+        "route": 0.28,
+        "total": 3.13
+      },
+      "run_client": {
+        "total": 10.7
+      }
+    },
+    {
+      "hot": true,
+      "migrate": {
+        "background_pull": 47.09,
+        "downtime": 14.1,
+        "export_runs": 0.04,
+        "hold": 0.08,
+        "link_down": 0.56,
+        "pause": 0.37,
+        "read_preload": 0.11,
+        "read_state": 0.04,
+        "reroute": 1.25,
+        "send_state": 0.17,
+        "snapshot_create": 1.97,
+        "target": 10.78,
+        "total": 15.35
+      },
+      "migrate_target": {
+        "recv_state": 0.29,
+        "register": 0.15,
+        "resume": 1.61,
+        "route_wait": 0.0,
+        "snapshot_load": 5.61,
+        "total": 7.97,
+        "write_state": 0.3
+      },
+      "run": {
+        "announce": 0.09,
+        "claim_ip": 0.18,
+        "guest_net": 2.11,
+        "register": 0.06,
+        "resume": 0.46,
+        "route": 0.27,
+        "total": 3.16
+      },
+      "run_client": {
+        "total": 9.03
+      }
+    },
+    {
+      "hot": true,
+      "migrate": {
+        "background_pull": 64.57,
+        "downtime": 15.17,
+        "export_runs": 0.06,
+        "hold": 0.12,
+        "link_down": 0.97,
+        "pause": 0.4,
+        "read_preload": 0.1,
+        "read_state": 0.07,
+        "reroute": 2.26,
+        "send_state": 0.17,
+        "snapshot_create": 1.74,
+        "target": 11.54,
+        "total": 17.44
+      },
+      "migrate_target": {
+        "recv_state": 0.28,
+        "register": 0.19,
+        "resume": 2.96,
+        "route_wait": 0.0,
+        "snapshot_load": 3.98,
+        "total": 7.88,
+        "write_state": 0.46
+      },
+      "run": {
+        "announce": 0.09,
+        "claim_ip": 0.15,
+        "guest_net": 2.12,
+        "register": 0.06,
+        "resume": 0.62,
+        "route": 0.29,
+        "total": 3.33
+      },
+      "run_client": {
+        "total": 9.19
+      }
+    },
+    {
+      "hot": true,
+      "migrate": {
+        "background_pull": 46.93,
+        "downtime": 12.14,
+        "export_runs": 0.04,
+        "hold": 0.06,
+        "link_down": 0.64,
+        "pause": 0.4,
+        "read_preload": 0.06,
+        "read_state": 0.03,
+        "reroute": 3.01,
+        "send_state": 0.13,
+        "snapshot_create": 1.71,
+        "target": 9.07,
+        "total": 15.14
+      },
+      "migrate_target": {
+        "recv_state": 0.24,
+        "register": 0.23,
+        "resume": 1.62,
+        "route_wait": 0.01,
+        "snapshot_load": 3.58,
+        "total": 6.06,
+        "write_state": 0.38
+      },
+      "run": {
+        "announce": 0.09,
+        "claim_ip": 0.18,
+        "guest_net": 2.06,
+        "register": 0.07,
+        "resume": 0.42,
+        "route": 0.25,
+        "total": 3.07
+      },
+      "run_client": {
+        "total": 8.7
+      }
+    },
+    {
+      "hot": true,
+      "migrate": {
+        "background_pull": 53.01,
+        "downtime": 12.05,
+        "export_runs": 0.04,
+        "hold": 0.14,
+        "link_down": 0.09,
+        "pause": 0.44,
+        "read_preload": 0.06,
+        "read_state": 0.04,
+        "reroute": 2.06,
+        "send_state": 0.19,
+        "snapshot_create": 1.86,
+        "target": 9.2,
+        "total": 14.1
+      },
+      "migrate_target": {
+        "recv_state": 0.34,
+        "register": 0.16,
+        "resume": 1.92,
+        "route_wait": 0.01,
+        "snapshot_load": 3.35,
+        "total": 6.08,
+        "write_state": 0.31
+      },
+      "run": {
+        "announce": 0.09,
+        "claim_ip": 0.17,
+        "guest_net": 2.21,
+        "register": 0.07,
+        "resume": 0.46,
+        "route": 0.26,
+        "total": 3.27
+      },
+      "run_client": {
+        "total": 9.75
+      }
+    },
+    {
+      "hot": true,
+      "migrate": {
+        "background_pull": 50.41,
+        "downtime": 12.27,
+        "export_runs": 0.06,
+        "hold": 0.13,
+        "link_down": 0.4,
+        "pause": 0.42,
+        "read_preload": 0.08,
+        "read_state": 0.04,
+        "reroute": 1.72,
+        "send_state": 0.15,
+        "snapshot_create": 1.6,
+        "target": 9.39,
+        "total": 13.99
+      },
+      "migrate_target": {
+        "recv_state": 0.33,
+        "register": 0.21,
+        "resume": 1.7,
+        "route_wait": 0.01,
+        "snapshot_load": 3.36,
+        "total": 5.95,
+        "write_state": 0.34
+      },
+      "run": {
+        "announce": 0.09,
+        "claim_ip": 0.15,
+        "guest_net": 2.34,
+        "register": 0.07,
+        "resume": 0.46,
+        "route": 0.25,
+        "total": 3.35
+      },
+      "run_client": {
+        "total": 11.22
+      }
+    },
+    {
+      "hot": true,
+      "migrate": {
+        "background_pull": 49.37,
+        "downtime": 11.97,
+        "export_runs": 0.05,
+        "hold": 0.08,
+        "link_down": 0.14,
+        "pause": 0.48,
+        "read_preload": 0.09,
+        "read_state": 0.05,
+        "reroute": 2.15,
+        "send_state": 0.14,
+        "snapshot_create": 1.48,
+        "target": 9.47,
+        "total": 14.12
+      },
+      "migrate_target": {
+        "recv_state": 0.32,
+        "register": 0.23,
+        "resume": 2.12,
+        "route_wait": 0.0,
+        "snapshot_load": 3.45,
+        "total": 6.43,
+        "write_state": 0.31
+      },
+      "run": {
+        "announce": 0.1,
+        "claim_ip": 0.14,
+        "guest_net": 2.01,
+        "register": 0.06,
+        "resume": 0.43,
+        "route": 0.26,
+        "total": 2.99
+      },
+      "run_client": {
+        "total": 9.3
+      }
+    },
+    {
+      "hot": true,
+      "migrate": {
+        "background_pull": 49.66,
+        "downtime": 13.89,
+        "export_runs": 0.04,
+        "hold": 0.1,
+        "link_down": 0.0,
+        "pause": 0.47,
+        "read_preload": 0.06,
+        "read_state": 0.04,
+        "reroute": 1.52,
+        "send_state": 0.15,
+        "snapshot_create": 1.95,
+        "target": 11.07,
+        "total": 15.4
+      },
+      "migrate_target": {
+        "recv_state": 0.45,
+        "register": 0.24,
+        "resume": 2.49,
+        "route_wait": 0.01,
+        "snapshot_load": 4.43,
+        "total": 7.9,
+        "write_state": 0.29
+      },
+      "run": {
+        "announce": 0.09,
+        "claim_ip": 0.21,
+        "guest_net": 2.29,
+        "register": 0.07,
+        "resume": 0.48,
+        "route": 0.27,
+        "total": 3.41
+      },
+      "run_client": {
+        "total": 9.23
+      }
+    },
+    {
+      "hot": true,
+      "migrate": {
+        "background_pull": 52.07,
+        "downtime": 12.3,
+        "export_runs": 0.05,
+        "hold": 0.06,
+        "link_down": 0.0,
+        "pause": 0.44,
+        "read_preload": 0.1,
+        "read_state": 0.05,
+        "reroute": 2.03,
+        "send_state": 0.23,
+        "snapshot_create": 1.8,
+        "target": 9.56,
+        "total": 14.33
+      },
+      "migrate_target": {
+        "recv_state": 0.5,
+        "register": 0.16,
+        "resume": 1.9,
+        "route_wait": 0.0,
+        "snapshot_load": 3.54,
+        "total": 6.41,
+        "write_state": 0.3
+      },
+      "run": {
+        "announce": 0.1,
+        "claim_ip": 0.2,
+        "guest_net": 2.39,
+        "register": 0.09,
+        "resume": 0.63,
+        "route": 0.3,
+        "total": 3.7
+      },
+      "run_client": {
+        "total": 10.85
+      }
+    },
+    {
+      "hot": true,
+      "migrate": {
+        "background_pull": 52.74,
+        "downtime": 13.09,
+        "export_runs": 0.04,
+        "hold": 0.1,
+        "link_down": 0.78,
+        "pause": 0.54,
+        "read_preload": 0.07,
+        "read_state": 0.03,
+        "reroute": 1.79,
+        "send_state": 0.13,
+        "snapshot_create": 1.47,
+        "target": 9.95,
+        "total": 14.88
+      },
+      "migrate_target": {
+        "recv_state": 0.44,
+        "register": 0.19,
+        "resume": 1.94,
+        "route_wait": 0.0,
+        "snapshot_load": 3.97,
+        "total": 6.89,
+        "write_state": 0.35
+      },
+      "run": {
+        "announce": 0.09,
+        "claim_ip": 0.17,
+        "guest_net": 2.16,
+        "register": 0.11,
+        "resume": 0.55,
+        "route": 0.39,
+        "total": 3.46
+      },
+      "run_client": {
+        "total": 10.54
+      }
+    },
+    {
+      "hot": true,
+      "migrate": {
+        "background_pull": 53.86,
+        "downtime": 11.54,
+        "export_runs": 0.04,
+        "hold": 0.09,
+        "link_down": 0.07,
+        "pause": 0.46,
+        "read_preload": 0.09,
+        "read_state": 0.03,
+        "reroute": 1.56,
+        "send_state": 0.19,
+        "snapshot_create": 1.55,
+        "target": 9.02,
+        "total": 13.1
+      },
+      "migrate_target": {
+        "recv_state": 0.37,
+        "register": 0.17,
+        "resume": 1.73,
+        "route_wait": 0.0,
+        "snapshot_load": 3.47,
+        "total": 6.08,
+        "write_state": 0.34
+      },
+      "run": {
+        "announce": 0.09,
+        "claim_ip": 0.17,
+        "guest_net": 2.15,
+        "register": 0.06,
+        "resume": 0.46,
+        "route": 0.31,
+        "total": 3.23
+      },
+      "run_client": {
+        "total": 9.76
+      }
+    }
+  ],
+  "summary_ms": {
+    "migrate": {
+      "background_pull": {
+        "max": 64.57,
+        "p50": 51.77,
+        "p90": 56.04,
+        "p99": 64.57
+      },
+      "downtime": {
+        "max": 15.65,
+        "p50": 12.89,
+        "p90": 15.17,
+        "p99": 15.65
+      },
+      "export_runs": {
+        "max": 0.08,
+        "p50": 0.04,
+        "p90": 0.06,
+        "p99": 0.08
+      },
+      "hold": {
+        "max": 0.14,
+        "p50": 0.08,
+        "p90": 0.12,
+        "p99": 0.14
+      },
+      "link_down": {
+        "max": 1.21,
+        "p50": 0.4,
+        "p90": 0.78,
+        "p99": 1.21
+      },
+      "pause": {
+        "max": 0.54,
+        "p50": 0.42,
+        "p90": 0.48,
+        "p99": 0.54
+      },
+      "read_preload": {
+        "max": 0.14,
+        "p50": 0.07,
+        "p90": 0.11,
+        "p99": 0.14
+      },
+      "read_state": {
+        "max": 0.07,
+        "p50": 0.04,
+        "p90": 0.05,
+        "p99": 0.07
+      },
+      "reroute": {
+        "max": 3.01,
+        "p50": 1.72,
+        "p90": 2.26,
+        "p99": 3.01
+      },
+      "send_state": {
+        "max": 0.44,
+        "p50": 0.15,
+        "p90": 0.23,
+        "p99": 0.44
+      },
+      "snapshot_create": {
+        "max": 2.0,
+        "p50": 1.68,
+        "p90": 1.95,
+        "p99": 2.0
+      },
+      "target": {
+        "max": 12.58,
+        "p50": 9.95,
+        "p90": 11.94,
+        "p99": 12.58
+      },
+      "total": {
+        "max": 17.6,
+        "p50": 14.88,
+        "p90": 16.97,
+        "p99": 17.6
+      }
+    },
+    "migrate_target": {
+      "recv_state": {
+        "max": 0.5,
+        "p50": 0.37,
+        "p90": 0.45,
+        "p99": 0.5
+      },
+      "register": {
+        "max": 0.43,
+        "p50": 0.19,
+        "p90": 0.31,
+        "p99": 0.43
+      },
+      "resume": {
+        "max": 3.07,
+        "p50": 1.89,
+        "p90": 2.71,
+        "p99": 3.07
+      },
+      "route_wait": {
+        "max": 0.02,
+        "p50": 0.0,
+        "p90": 0.01,
+        "p99": 0.02
+      },
+      "snapshot_load": {
+        "max": 6.91,
+        "p50": 3.58,
+        "p90": 5.61,
+        "p99": 6.91
+      },
+      "total": {
+        "max": 9.62,
+        "p50": 6.75,
+        "p90": 8.55,
+        "p99": 9.62
+      },
+      "write_state": {
+        "max": 0.5,
+        "p50": 0.31,
+        "p90": 0.4,
+        "p99": 0.5
+      }
+    },
+    "run": {
+      "announce": {
+        "max": 0.14,
+        "p50": 0.09,
+        "p90": 0.1,
+        "p99": 0.14
+      },
+      "claim_ip": {
+        "max": 0.21,
+        "p50": 0.17,
+        "p90": 0.19,
+        "p99": 0.21
+      },
+      "guest_net": {
+        "max": 2.91,
+        "p50": 2.15,
+        "p90": 2.39,
+        "p99": 2.91
+      },
+      "register": {
+        "max": 0.11,
+        "p50": 0.06,
+        "p90": 0.07,
+        "p99": 0.11
+      },
+      "resume": {
+        "max": 0.63,
+        "p50": 0.48,
+        "p90": 0.56,
+        "p99": 0.63
+      },
+      "route": {
+        "max": 0.39,
+        "p50": 0.27,
+        "p90": 0.31,
+        "p99": 0.39
+      },
+      "total": {
+        "max": 3.96,
+        "p50": 3.23,
+        "p90": 3.55,
+        "p99": 3.96
+      }
+    },
+    "run_client": {
+      "total": {
+        "max": 11.22,
+        "p50": 9.7,
+        "p90": 10.85,
+        "p99": 11.22
+      }
+    },
+    "run_hot_hits": 20
+  }
+}
