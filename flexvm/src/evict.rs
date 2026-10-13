@@ -19,7 +19,8 @@ const EVERY: Duration = Duration::from_secs(5);
 pub fn tick(host: &Host, starved_here: bool) {
     let avail = host_available_mib();
     let reserve = host.cfg.reserve_mib;
-    if avail >= reserve && !starved_here && !host.entries().iter().any(|e| e.starved) {
+    // A starved VM calls in itself, so a host with room has nothing to decide.
+    if avail >= reserve && !starved_here {
         return;
     }
     let Ok(lock) = File::options().create(true).truncate(false).write(true).open(host.state.join("evict.lock")) else { return };
