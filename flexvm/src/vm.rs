@@ -768,6 +768,43 @@ impl Prepared {
         &self.idle.as_ref().unwrap().dir
     }
 
+    /// Has Firecracker do the part of the coming load that only depends on
+    /// the template (KVM VM, vCPUs, memory slots, guest memory handed to the
+    /// pager, vsock socket, pmem mapping; `firecracker/0002-*.patch`), so the
+    /// load proper only restores vCPU, VM and device state. The pager then
+    /// waits for its seed. Returns false, changing nothing, if this
+    /// Firecracker cannot prepare a load.
+    pub fn prepare_load(&self) -> Result<bool> {
+        static UNSUPPORTED: AtomicBool = AtomicBool::new(false);
+        if UNSUPPORTED.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        let idle = self.idle.as_ref().unwrap();
+        // Before the request: Firecracker connects to the pager during it.
+        self.pager.expect_seed(true);
+        let res = idle.fc.put(
+            "/snapshot/prepare",
+            json!({
+                "snapshot_path": self.template.vmstate(),
+                "mem_backend": {"backend_type": "Uffd", "backend_path": idle.dir.join("uffd.sock")},
+                "vsock_override": {"uds_path": idle.dir.join("v.sock")},
+                "network_overrides": [{"iface_id": "eth0", "host_dev_name": idle.tap}],
+            }),
+        );
+        match res {
+            Ok(_) => Ok(true),
+            // A Firecracker without the patch rejects the path before doing anything.
+            Err(e) if e.to_string().contains("Invalid request method and/or path") => {
+                self.pager.expect_seed(false);
+                if !UNSUPPORTED.swap(true, Ordering::Relaxed) {
+                    eprintln!("firecracker cannot prepare snapshot loads ({e}); migrations load the whole snapshot while paused");
+                }
+                Ok(false)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Loads `vmstate` and starts the VM as `load` says, with `ip` routed to
     /// its tap. Seed the pager first if pages are to come from elsewhere.
     pub fn load(mut self, name: &str, vmstate: &Path, ip: Ipv4Addr, load: Load, phases: &mut Phases) -> Result<(Arc<Vm>, Duration)> {

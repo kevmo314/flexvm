@@ -439,6 +439,11 @@ pub struct Pager {
     /// Initial page states and their origin, applied when Firecracker
     /// connects (see `seed`).
     initial: Mutex<Option<(Runs, Origin)>>,
+    /// Signalled by `seed` and `stop`, for a handshake waiting for the seed.
+    seeded: Condvar,
+    /// Firecracker connects before the page states are known (a prepared
+    /// load, see `expect_seed`): the handshake waits for `seed`.
+    awaiting_seed: AtomicBool,
     /// REMOTE pages to install as soon as Firecracker connects.
     preload: Mutex<Option<Preload>>,
     /// Learning the template's load set (`learn_load_set`): faults go into
@@ -502,6 +507,8 @@ impl Pager {
             pagemap: OnceLock::new(),
             fail_protect: AtomicBool::new(false),
             initial: Mutex::new(initial),
+            seeded: Condvar::new(),
+            awaiting_seed: AtomicBool::new(false),
             preload: Mutex::new(None),
             learning: AtomicBool::new(false),
             prefetch: Mutex::new((false, false)),
@@ -552,7 +559,16 @@ impl Pager {
         }
         *self.preload.lock().unwrap() = preload;
         *self.initial.lock().unwrap() = Some((runs, origin));
+        self.seeded.notify_all();
         Ok(())
+    }
+
+    /// Firecracker will connect before `seed` (it prepares the load ahead of
+    /// the vmstate): the handshake then waits for the seed, up to
+    /// `HANDSHAKE_TIMEOUT`, before it serves a fault. Firecracker touches no
+    /// guest memory until the load itself.
+    pub fn expect_seed(&self, yes: bool) {
+        self.awaiting_seed.store(yes, Ordering::SeqCst);
     }
 
     /// Records the pages the coming snapshot load faults on into the
@@ -611,7 +627,21 @@ impl Pager {
         let mappings: Vec<Mapping> = serde_json::from_slice(&body)?;
         let total = mappings.iter().map(|m| m.offset as usize + m.size).max().unwrap_or(0) / PAGE_SIZE;
         let pages = Pages::new(total);
-        let initial = self.initial.lock().unwrap().take();
+        let initial = {
+            let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+            let mut initial = self.initial.lock().unwrap();
+            while initial.is_none() && self.awaiting_seed.load(Ordering::SeqCst) {
+                if self.stop.load(Ordering::SeqCst) {
+                    bail!("stopped before the page states arrived");
+                }
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    bail!("no page states within {HANDSHAKE_TIMEOUT:?}");
+                }
+                initial = self.seeded.wait_timeout(initial, left).unwrap().0;
+            }
+            initial.take()
+        };
         if let Some((runs, origin)) = initial {
             let _ = self.pull_started.set(Instant::now());
             let remote = remote_pages(&runs, total)?;
@@ -783,6 +813,8 @@ impl Pager {
         // Also ends a prefetch still running (e.g. for a drained hot pool's VM).
         self.quiesce.store(true, Ordering::SeqCst);
         self.notify();
+        let _initial = self.initial.lock().unwrap();
+        self.seeded.notify_all();
     }
 
     /// Gives up on the VM's memory: unless it was stopped on purpose, records

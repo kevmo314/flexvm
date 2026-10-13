@@ -1502,6 +1502,11 @@ impl Daemon {
         t.mark("pool_take");
         let load_set = tpl.load_set();
         let vm = Vm::prepare(idle, &name, tpl, t)?;
+        // Only when the source has not paused yet: preparing costs about
+        // what it saves.
+        if preflight && vm.prepare_load()? {
+            t.mark("prepare_load");
+        }
         Ok(PreparedIn { vm, claim, source, name, load_set, _busy: busy })
     }
 
