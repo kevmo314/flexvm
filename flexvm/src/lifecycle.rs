@@ -530,6 +530,7 @@ impl Daemon {
                     ck.verify_data().map_err(|e| format!("the last checkpoint of vm {}: {e}; take a full one", vm.name))?;
                     t.mark("verify_chain");
                 }
+                staging.meta_left = ck.meta_left;
                 let mut ids = vec![ck.id.clone()];
                 ids.extend(ck.chain_ids.iter().cloned());
                 let parent = crate::checkpoint::Parent { path: crate::checkpoint::parent_path(staging.dest(), &dir), id };

@@ -85,6 +85,11 @@ pub const MAX_CHAIN: usize = 64;
 const UNIT: usize = 256;
 /// Most writer threads; a few saturate the disk.
 const MAX_WRITERS: usize = 12;
+/// Most bytes of VM state a checkpoint may have.
+const MAX_VMSTATE: u64 = 64 << 20;
+/// Most bytes of metadata (manifests, VM states, page maps) opening a chain
+/// may read; its pages are read lazily.
+pub const MAX_CHAIN_META: u64 = 256 << 20;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileSum {
@@ -231,6 +236,8 @@ pub struct Staging {
     /// `pages`, once preallocated.
     pages: Option<PagesFile>,
     published: bool,
+    /// Metadata the chain this checkpoint ends may still read when opened.
+    pub meta_left: u64,
 }
 
 impl Staging {
@@ -265,7 +272,7 @@ impl Staging {
         check(unsafe { libc::mkdirat(outer.as_raw_fd(), c"ck".as_ptr(), 0o700) })?;
         let ck = open_dir_at(outer.as_raw_fd(), c"ck")?;
         let _ = std::fs::remove_file(&vmstate);
-        Ok(Staging { dest, parent: pfd, base, outer, outer_name, ck, vmstate, pages: None, published: false })
+        Ok(Staging { dest, parent: pfd, base, outer, outer_name, ck, vmstate, pages: None, published: false, meta_left: MAX_CHAIN_META })
     }
 
     pub fn dest(&self) -> &Path {
@@ -333,6 +340,9 @@ impl Staging {
         (&pagemap).write_all(map)?;
         pagemap.sync_all()?;
         let vmstate = std::fs::read(&self.vmstate)?;
+        if vmstate.len() as u64 > MAX_VMSTATE {
+            return Err(CommitError::Failed(format!("its vmstate is over {MAX_VMSTATE} bytes").into()));
+        }
         let vmstate_file = self.create("vmstate")?;
         (&vmstate_file).write_all(&vmstate)?;
         vmstate_file.sync_all()?;
@@ -362,6 +372,9 @@ impl Staging {
         let id = sum(&body);
         let mut text = format!("{id}\n").into_bytes();
         text.extend_from_slice(&body);
+        if (text.len() + vmstate.len() + map.len()) as u64 > self.meta_left {
+            return Err(CommitError::Failed(format!("its chain would have more than {MAX_CHAIN_META} bytes of metadata; take a full one").into()));
+        }
         let mf = self.create("manifest.json")?;
         (&mf).write_all(&text)?;
         mf.sync_all()?;
@@ -797,6 +810,8 @@ pub struct Checkpoint {
     pub chain: Vec<PathBuf>,
     /// The ids of `chain`, in the same order.
     pub chain_ids: Vec<String>,
+    /// Metadata a delta on this checkpoint may still add (see `MAX_CHAIN_META`).
+    pub meta_left: u64,
 }
 
 /// Opens regular file `name` in `dir` (never through a symlink) and reads up
@@ -824,7 +839,8 @@ struct Link {
 }
 
 impl Link {
-    fn open(dir: &Path) -> Result<Link> {
+    /// Reads at most `meta_left` bytes of metadata, and takes them off it.
+    fn open(dir: &Path, meta_left: &mut u64) -> Result<Link> {
         let dir = dir.canonicalize().map_err(|e| format!("checkpoint {}: {e}", dir.display()))?;
         let bad = |why: String| format!("checkpoint {} is invalid: {why}", dir.display());
         let dfd = open_dir_at(libc::AT_FDCWD, &CString::new(dir.as_os_str().as_bytes())?).map_err(|e| bad(e.to_string()))?;
@@ -839,6 +855,15 @@ impl Link {
             (FORMAT, None) | (FORMAT_INCREMENTAL, Some(_)) => {}
             (f, _) => bail!("{}", bad(format!("format {f}; this flexvm reads formats {FORMAT} and {FORMAT_INCREMENTAL}"))),
         }
+        // Bound what the manifest's lengths make us read: a page map has at
+        // most a run (32 bytes) and a checksum (4) per page.
+        let len = |name: &str| manifest.files.get(name).map_or(0, |f| f.len);
+        let map_max = manifest.guest_pages.checked_mul(36).and_then(|n| n.checked_add(24));
+        if len("vmstate") > MAX_VMSTATE || map_max.is_none_or(|m| len("pagemap") > m) {
+            bail!("{}", bad("vmstate or pagemap is too long".into()));
+        }
+        let cost = (text.len() as u64 + len("vmstate")).saturating_add(len("pagemap"));
+        *meta_left = meta_left.checked_sub(cost).ok_or_else(|| bad(format!("its chain has more than {MAX_CHAIN_META} bytes of metadata")))?;
         let read_checked = |name: &str| -> Result<Vec<u8>> {
             let want = manifest.files.get(name).ok_or_else(|| bad(format!("manifest lists no {name}")))?;
             let (_, bytes) = read_at(dfd.as_raw_fd(), name, want.len + 1).map_err(|e| bad(format!("{name}: {e}")))?;
@@ -907,7 +932,8 @@ impl Checkpoint {
     /// delta against, and verifies everything but the page data itself,
     /// which is checked page by page as it is read.
     pub fn open(dir: &Path) -> Result<Checkpoint> {
-        let top = Link::open(dir)?;
+        let mut meta_left = MAX_CHAIN_META;
+        let top = Link::open(dir, &mut meta_left)?;
         let mut links = vec![top];
         while let Some(parent) = links.last().unwrap().manifest.parent.clone() {
             let child = links.last().unwrap();
@@ -915,7 +941,7 @@ impl Checkpoint {
                 bail!("checkpoint {} is more than {MAX_CHAIN} deltas deep", dir.display());
             }
             let path = child.dir.join(&parent.path);
-            let link = Link::open(&path).map_err(|e| format!("parent of {}: {e}", child.dir.display()))?;
+            let link = Link::open(&path, &mut meta_left).map_err(|e| format!("parent of {}: {e}", child.dir.display()))?;
             let (c, p) = (&child.manifest, &link.manifest);
             if link.id != parent.id {
                 bail!("checkpoint {}: its parent {} has changed (id {} is not {})", child.dir.display(), link.dir.display(), link.id, parent.id);
@@ -943,7 +969,7 @@ impl Checkpoint {
         }
         let (dir, manifest, id, vmstate) = top.unwrap();
         let (runs, file) = flatten(&layers, files, sums);
-        Ok(Checkpoint { dir, manifest, id, vmstate, runs, file: Arc::new(file), chain, chain_ids })
+        Ok(Checkpoint { dir, manifest, id, vmstate, runs, file: Arc::new(file), chain, chain_ids, meta_left })
     }
 
     /// Reads every page the checkpoint (chain) restores from its files and
@@ -1199,6 +1225,73 @@ mod tests {
         let len = isize::MAX as usize & !(PAGE_SIZE - 1);
         assert_eq!(Buf::new(len).err().unwrap().kind(), io::ErrorKind::OutOfMemory);
     }
+
+    /// Writes a checkpoint of 256 pages, none stored, to `dir`, its manifest
+    /// changed by `edit`; returns its id.
+    fn link(dir: &Path, parent: Option<Parent>, edit: impl FnOnce(&mut Manifest)) -> String {
+        std::fs::create_dir_all(dir).unwrap();
+        let map = [MAGIC.as_slice(), &[0; 16]].concat();
+        std::fs::write(dir.join("vmstate"), b"s").unwrap();
+        std::fs::write(dir.join("pagemap"), &map).unwrap();
+        std::fs::write(dir.join("pages"), []).unwrap();
+        let mut m: Manifest = serde_json::from_value(serde_json::json!({
+            "format": if parent.is_some() { FORMAT_INCREMENTAL } else { FORMAT }, "created_unix_ms": 0, "name": "x",
+            "ip": "10.0.0.1", "template": "tpl", "template_id": "id", "vcpus": 1, "mem_mib": 1, "max_mib": 1,
+            "hotplug_mib": 0, "guest_pages": 256, "data_pages": 0, "zero_pages": 0, "parent": parent,
+            "files": {
+                "vmstate": {"len": 1, "hash": sum(b"s")},
+                "pagemap": {"len": map.len(), "hash": sum(&map)},
+                "pages": {"len": 0, "hash": sums_sum(&[])},
+            }
+        }))
+        .unwrap();
+        edit(&mut m);
+        let body = serde_json::to_vec(&m).unwrap();
+        let id = sum(&body);
+        std::fs::write(dir.join("manifest.json"), [format!("{id}\n").as_bytes(), &body].concat()).unwrap();
+        id
+    }
+
+    #[test]
+    fn manifest_lengths_are_bounded_before_reading() {
+        let dir = std::env::temp_dir().join(format!("flexvm-lengths-{}", std::process::id()));
+        type Edit = fn(&mut Manifest);
+        let cases: [(Edit, &str); 5] = [
+            (|m| m.files.get_mut("vmstate").unwrap().len = MAX_VMSTATE + 1, "too long"),
+            (|m| m.files.get_mut("vmstate").unwrap().len = u64::MAX, "too long"),
+            (|m| m.files.get_mut("pagemap").unwrap().len = 24 + 36 * 256 + 1, "too long"),
+            (|m| (m.guest_pages, m.files.get_mut("pagemap").unwrap().len) = (u64::MAX, u64::MAX), "too long"),
+            // Within what a guest this size could need, but not what a chain may read.
+            (|m| (m.guest_pages, m.files.get_mut("pagemap").unwrap().len) = (1 << 40, 1 << 40), "bytes of metadata"),
+        ];
+        for (edit, want) in cases {
+            link(&dir, None, edit);
+            let e = Checkpoint::open(&dir).err().unwrap().to_string();
+            assert!(e.contains(want), "{e}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_chain_reads_at_most_its_metadata_budget() {
+        let dir = std::env::temp_dir().join(format!("flexvm-budget-{}", std::process::id()));
+        let mut parent = None;
+        for i in 0..3 {
+            let id = link(&dir.join(format!("ck{i}")), parent, |_| {});
+            parent = Some(Parent { path: format!("../ck{i}"), id });
+        }
+        let top = dir.join("ck2");
+        let ck = Checkpoint::open(&top).unwrap();
+        assert_eq!(ck.chain.len(), 2);
+        let cost = MAX_CHAIN_META - ck.meta_left;
+        let mut left = cost;
+        Link::open(&top, &mut left).unwrap();
+        // The base is refused once the budget runs out.
+        let mut left = cost - 1;
+        let e = Link::open(&top, &mut left).and_then(|_| Link::open(&dir.join("ck1"), &mut left)).and_then(|_| Link::open(&dir.join("ck0"), &mut left));
+        assert!(e.err().unwrap().to_string().contains("bytes of metadata"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
     /// A template whose memory file has `pages` pages; `Some(b)` is a page
     /// filled with `b`, `None` a hole.
     fn template(dir: &Path, pages: &[Option<u8>]) -> Arc<Template> {
@@ -1445,7 +1538,7 @@ mod tests {
         let ck = Checkpoint { dir: dir.clone(), manifest: serde_json::from_value(serde_json::json!({
             "format": 2, "created_unix_ms": 0, "name": "x", "ip": "10.0.0.1", "template": "tpl", "template_id": "", "vcpus": 1,
             "mem_mib": 1, "max_mib": 1, "hotplug_mib": 0, "guest_pages": n, "data_pages": 0, "zero_pages": 0, "files": {}})).unwrap(),
-            id: String::new(), vmstate: Vec::new(), runs, file: Arc::new(file), chain: Vec::new(), chain_ids: Vec::new() };
+            id: String::new(), vmstate: Vec::new(), runs, file: Arc::new(file), chain: Vec::new(), chain_ids: Vec::new(), meta_left: 0 };
         assert_eq!(ck.content_hash(&tpl).unwrap(), want.finish());
         let _ = std::fs::remove_dir_all(&dir);
     }
