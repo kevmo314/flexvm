@@ -314,7 +314,14 @@ impl GuestPages for CowPages<'_> {
                     crate::bail!("the checkpoint copy stopped: {}", cow.error().unwrap_or_else(|| "the vm is gone".into()));
                 }
             }
-            let bytes = cow.rescued.lock().unwrap().remove(&p).ok_or_else(|| format!("page {p}: rescued copy missing"))?;
+            // A copy that stops (abort, kill) drops the rescued copies under
+            // the writers: that is the stop, not a lost page.
+            let Some(bytes) = cow.rescued.lock().unwrap().remove(&p) else {
+                if !cow.active() {
+                    crate::bail!("the checkpoint copy stopped: {}", cow.error().unwrap_or_else(|| "the vm is gone".into()));
+                }
+                crate::bail!("page {p}: rescued copy missing");
+            };
             cow.rescued_bytes.fetch_sub(bytes.len(), Ordering::SeqCst);
             buf[k * PAGE_SIZE..(k + 1) * PAGE_SIZE].copy_from_slice(&bytes);
             cow.set(p, CLEAN);
@@ -383,9 +390,15 @@ mod tests {
         assert_eq!(pages.wanted(), Some(30));
         assert_eq!(pages.wanted(), None);
         assert_eq!(cow.unsaved_page(), Some(8));
-        // A stopped copy fails its writer instead of writing guesses.
+        // A stopped copy fails its writer instead of writing guesses, and
+        // says why even if it dropped a rescued copy the writer was about
+        // to take.
+        assert!(cow.claim(9, PENDING, RESCUING));
+        cow.rescue(9, vec![9u8; PAGE_SIZE].into());
+        cow.invalidate("the copy was aborted");
         cow.stop();
-        assert!(pages.read(8, &mut buf[..PAGE_SIZE]).is_err());
+        let e = pages.read(8, &mut buf[..2 * PAGE_SIZE]).unwrap_err().to_string();
+        assert!(e.contains("aborted"), "{e}");
     }
 
     #[test]
