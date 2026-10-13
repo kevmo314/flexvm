@@ -1223,6 +1223,25 @@ def resume_mark_fails():
     ok(A, {"op": "resume", "name": n})
     check("unmark fails: then resumes, md5 intact", md5(A, n) == m)
 
+    # The other outcome: the marker did reach the disk (started_unmark
+    # unlinks it, so put it back as a crash could have left it). A restart
+    # then cannot tell it from a resumed VM's and deletes the checkpoint:
+    # the VM is lost, never replayed.
+    d = ok(A, {"op": "suspend", "name": n})["dir"]
+    fault(A, "started_fsync", 60000)
+    fault(A, "started_unmark", 60000)
+    rpc(A, {"op": "resume", "name": n})
+    disarm()
+    check("marker kept: quarantined", vms(A).get(n, {}).get("state") == "quarantined", vms(A).get(n))
+    subprocess.run(["sudo", "touch", os.path.join(d, "STARTED")], check=True)
+    argv, env = kill_daemon(A)
+    start_daemon(A, argv, env)
+    check("marker kept: gone after a restart, on both hosts", n not in vms(A) and n not in vms(B), (vms(A).get(n), vms(B).get(n)))
+    check("marker kept: checkpoint deleted", subprocess.run(["sudo", "test", "-e", d]).returncode != 0)
+    r = rpc(A, {"op": "resume", "name": n})
+    check("marker kept: no resume (nothing replays)", not r["ok"], r)
+    m = setup(n, mib=20)
+
     d = ok(A, {"op": "suspend", "name": n})["dir"]
     fault(A, "started_fsync", 60000)
     fault(A, "started_unmark", 60000)
