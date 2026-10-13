@@ -18,6 +18,7 @@
 //! `K=V`), `cwd`, `uid`, `gid`, `groups` (space separated).
 
 use std::collections::VecDeque;
+use std::ffi::CString;
 use std::fs::File;
 use std::io::{self, Read};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
@@ -183,8 +184,10 @@ fn read_conf() -> io::Result<Conf> {
     Ok(c)
 }
 
-/// Runs a readiness command with output discarded, killing its process
-/// group if it outlives the deadline: `ok`, `exit <code>` or `timeout`.
+/// Runs a readiness command as the app would run (its user, env, workdir and
+/// restrictions) with output discarded: `ok`, `exit <code>` or `timeout`.
+/// The command and everything it starts live in a cgroup of their own, which
+/// is killed whenever the check ends; without cgroup2, its session is.
 fn check(arg: &str, statuses: &Statuses) -> io::Result<String> {
     let (ms, hex) = arg.trim().split_once(' ').ok_or_else(|| io::Error::other("usage: CHECK <ms> <hex>"))?;
     let ms: u64 = ms.parse().map_err(|_| io::Error::other("bad timeout"))?;
@@ -193,35 +196,134 @@ fn check(arg: &str, statuses: &Statuses) -> io::Result<String> {
         .map(|i| hex.get(i..i + 2).and_then(|h| u8::from_str_radix(h, 16).ok()))
         .collect::<Option<Vec<u8>>>()
         .ok_or_else(|| io::Error::other("bad command encoding"))?;
-    let cmd = String::from_utf8_lossy(&bytes).into_owned();
-    let child = spawn(
-        Command::new("/bin/sh")
-            .args(["-c", &cmd])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .process_group(0),
-        statuses,
-        true,
-    )
-    .map_err(|e| io::Error::new(e.kind(), format!("cannot run /bin/sh: {e}")))?;
+    let c = read_conf()?;
+    let cg = CheckGroup::new();
+    let mut cmd = Command::new("/bin/sh");
+    cmd.args(["-c", &String::from_utf8_lossy(&bytes)])
+        .env_clear()
+        .envs(c.env.iter().map(|(k, v)| (k, v)))
+        .current_dir(&c.cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let procs = cg.as_ref().map(|g| g.procs.clone());
+    restrict(&mut cmd, &c, procs);
+    let child = spawn(&mut cmd, statuses, true).map_err(|e| io::Error::new(e.kind(), format!("cannot run /bin/sh: {e}")))?;
     let pid = child.id() as i32;
-    let deadline = Instant::now() + Duration::from_millis(ms);
+    let code = wait_until(statuses, pid, Instant::now() + Duration::from_millis(ms));
+    // Kill whatever is left, the leader included if it timed out.
+    match &cg {
+        Some(g) => g.kill(),
+        None => unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        },
+    }
+    let code = match code {
+        Some(code) => code,
+        None => {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            if wait_until(statuses, pid, Instant::now() + Duration::from_secs(2)).is_none() {
+                return Err(io::Error::other(format!("readiness command {pid} would not die")));
+            }
+            return Ok("timeout".into());
+        }
+    };
+    Ok(if code == 0 { "ok".into() } else { format!("exit {code}") })
+}
+
+/// Waits for `pid`'s exit status until `deadline`.
+fn wait_until(statuses: &Statuses, pid: i32, deadline: Instant) -> Option<i32> {
     let (lock, cv) = &**statuses;
     let mut map = lock.lock().unwrap();
     loop {
         if let Some(Some(code)) = map.get(&pid).copied() {
             map.remove(&pid);
-            return Ok(if code == 0 { "ok".into() } else { format!("exit {code}") });
+            return Some(code);
         }
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
-            drop(map);
-            unsafe { libc::kill(-pid, libc::SIGKILL) };
-            wait_pid(statuses, pid);
-            return Ok("timeout".into());
+            return None;
         }
         map = cv.wait_timeout(map, left).unwrap().0;
+    }
+}
+
+/// A cgroup2 group for one readiness check.
+struct CheckGroup {
+    dir: String,
+    /// `<dir>/cgroup.procs`, for the child to move itself into before exec.
+    procs: CString,
+}
+
+impl CheckGroup {
+    fn new() -> Option<CheckGroup> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        const ROOT: &str = "/sys/fs/cgroup";
+        if !std::path::Path::new(&format!("{ROOT}/cgroup.procs")).exists() {
+            let (src, dst, ty) = (c"cgroup2", c"/sys/fs/cgroup", c"cgroup2");
+            if unsafe { libc::mount(src.as_ptr(), dst.as_ptr(), ty.as_ptr(), 0, std::ptr::null()) } != 0 {
+                return None;
+            }
+        }
+        let dir = format!("{ROOT}/flexvm-check-{}", NEXT.fetch_add(1, Ordering::Relaxed));
+        std::fs::create_dir(&dir).ok()?;
+        let procs = CString::new(format!("{dir}/cgroup.procs")).ok()?;
+        Some(CheckGroup { dir, procs })
+    }
+
+    /// Kills every task in the group, waits (bounded) for it to empty, removes it.
+    fn kill(&self) {
+        let _ = std::fs::write(format!("{}/cgroup.kill", self.dir), "1");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            let events = std::fs::read_to_string(format!("{}/cgroup.events", self.dir)).unwrap_or_default();
+            if events.contains("populated 0") {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        let _ = std::fs::remove_dir(&self.dir);
+    }
+}
+
+/// Sets up a child as the app runs: its own session, in `cgroup` if given,
+/// the app's credentials and, for a non-root user, no capabilities and
+/// no_new_privs. Credentials are dropped here rather than with
+/// CommandExt::uid, which would clear the supplementary groups.
+fn restrict(cmd: &mut Command, c: &Conf, cgroup: Option<CString>) {
+    let (uid, gid, groups) = (c.uid, c.gid, c.groups.clone());
+    unsafe {
+        cmd.pre_exec(move || {
+            let fail = || Err(io::Error::last_os_error());
+            if let Some(procs) = &cgroup {
+                // "0" moves the writing process; only raw syscalls after fork.
+                let fd = libc::open(procs.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+                if fd < 0 || libc::write(fd, b"0".as_ptr().cast(), 1) != 1 {
+                    return fail();
+                }
+                libc::close(fd);
+            }
+            if libc::setsid() < 0 {
+                return fail();
+            }
+            if uid != 0 {
+                // No way back to root: drop every capability from the bounding set
+                // while we still may (EINVAL: past the kernel's last capability).
+                for cap in 0..64 {
+                    if libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0) != 0
+                        && *libc::__errno_location() != libc::EINVAL
+                    {
+                        return fail();
+                    }
+                }
+            }
+            let ok = libc::setgroups(groups.len(), groups.as_ptr()) == 0
+                && libc::setgid(gid) == 0
+                && libc::setuid(uid) == 0
+                && (uid == 0 || libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0);
+            if ok { Ok(()) } else { fail() }
+        });
     }
 }
 
@@ -240,29 +342,9 @@ fn start(statuses: &Statuses) -> io::Result<i32> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let (uid, gid, groups) = (c.uid, c.gid, c.groups.clone());
     // Keep the app (even as root) from reading flexvm-init's memory or ptracing it.
     unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
-    // Its own session, so signals for flexvm-init's console never reach it.
-    // Credentials are dropped here rather than with CommandExt::uid, which
-    // would clear the supplementary groups.
-    unsafe {
-        cmd.pre_exec(move || {
-            if uid != 0 {
-                // No way back to root: drop every capability from the bounding set
-                // while we still may, then forbid gaining privileges on exec.
-                for cap in 0..64 {
-                    libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0);
-                }
-            }
-            let ok = libc::setsid() >= 0
-                && libc::setgroups(groups.len(), groups.as_ptr()) == 0
-                && libc::setgid(gid) == 0
-                && libc::setuid(uid) == 0
-                && (uid == 0 || libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0);
-            if ok { Ok(()) } else { Err(io::Error::last_os_error()) }
-        });
-    }
+    restrict(&mut cmd, &c, None);
     let mut child = spawn(&mut cmd, statuses, true).map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", c.argv[0])))?;
     let pid = child.id() as i32;
     app.state = State::Running(pid);
