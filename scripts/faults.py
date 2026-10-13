@@ -1260,6 +1260,36 @@ def ckpt_rearm():
         rm_ckpt(f"{path}-{x}")
 
 
+
+def ckpt_dir_moved():
+    """The destination's directory is renamed while a checkpoint is written:
+    nothing is published (in either place), and a delta checks its parent in
+    the directory it is written into, not by a path that moved."""
+    n = "ft-moved"
+    top = os.path.join(args.ckpt_dir, "moved")
+    for d in (top, top + "2"):
+        rm_ckpt(d)
+    os.makedirs(top)
+    ok(A, {"op": "run", "name": n, "template": args.template})
+    start_writer(A, n, mib=32)
+    ok(A, {"op": "checkpoint", "name": n, "dir": os.path.join(top, "base")})
+    fault(A, "ckpt_slow", 120000)
+    res = {}
+    t = threading.Thread(target=lambda: res.update(r=rpc(A, {"op": "checkpoint", "name": n, "dir": os.path.join(top, "d1"), "incremental": True}, timeout=300)))
+    t.start()
+    wait_for(lambda: vms(A).get(n, {}).get("checkpoint_copy"), 30)
+    os.rename(top, top + "2")
+    t.join()
+    fault(A, "ckpt_slow", 0)
+    r = res.get("r", {})
+    check("moved dir: checkpoint refused", not r.get("ok") and "was moved or replaced" in r.get("error", ""), r)
+    check("moved dir: nothing published anywhere", not os.path.exists(os.path.join(top, "d1")) and not os.path.exists(os.path.join(top + "2", "d1")))
+    check("moved dir: VM runs on", where(n) == {A: "running"}, where(n))
+    cleanup(n)
+    for d in (top, top + "2"):
+        rm_ckpt(d)
+
+
 SCENARIOS = dict(basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, refused=refused, pages_blip=pages_blip,
                  pages_dead_restore=pages_dead_restore, pages_dead=pages_dead, quiet_source=quiet_source,
                  shared_run_dir=shared_run_dir, exec_race=exec_race, source_killed=source_killed,
@@ -1270,7 +1300,8 @@ SCENARIOS = dict(basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, r
                  checkpoint_untrusted_dir=checkpoint_untrusted_dir, resume_failures=resume_failures,
                  state_dir_lock=state_dir_lock, held_restore_frozen=held_restore_frozen,
                  cow_exact=cow_exact, cow_abort=cow_abort, cow_crash=cow_crash, ckpt_incremental=ckpt_incremental,
-                 ckpt_failed_stop=ckpt_failed_stop, ckpt_rearm=ckpt_rearm)
+                 ckpt_failed_stop=ckpt_failed_stop, ckpt_rearm=ckpt_rearm,
+                 ckpt_dir_moved=ckpt_dir_moved)
 safe = [s for s in SCENARIOS
         if s not in ("source_killed", "target_restart", "target_restart_symlink", "checkpoint_crash", "cow_crash",
                      "suspend_resume")]
