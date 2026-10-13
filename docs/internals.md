@@ -125,6 +125,17 @@ of `flexvm bench --dirty-mib 200`, 15 trials each:
 | Migration downtime p50 / p90 | 52.5 / 82.5 ms | 48.5 / 59.3 ms |
 | Background pull p50 (200 MiB dirty) | 330 ms | 303 ms |
 
+## Host compatibility
+
+A template records the host it was built on: CPU vendor, family and model,
+the CPU feature bits KVM offered its guest, the XSAVE layout, and the
+Firecracker version and build. Checkpoints and migrations pin their template
+by content id and so carry its guest CPU. Every snapshot load (run, a standby
+VM's load, restore, resume, and a migration target before its source pauses)
+refuses a host with a different CPU model or Firecracker, a missing feature
+bit or another XSAVE layout, naming the mismatch. Extra feature bits are
+fine. Templates built before this record must be rebuilt.
+
 ### Pages
 
 The userfaultfd pager (`flexvm/src/uffd.rs`) tracks every guest page as
