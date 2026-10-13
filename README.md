@@ -580,14 +580,12 @@ is waiting for every 5 s; a second signal stops the waiting and logs what that
 costs.
 
 Firecracker API, vsock and UFFD sockets live in short private directories
-under `/run/flexvm/s`, with a separate directory per daemon or template build
-and counter-named slots per Firecracker. If that location is unavailable,
-flexvm tries `/run/user/<uid>/flexvm-s`, then `/tmp/flexvm-s-<uid>`; directories
-must belong to the process's effective uid (root for the daemon) with mode
-0700, and symlinks are refused. Sockets are removed with their VM or pool
-slot. The daemon's run directory has a `sockets` symlink for inspection and
-restart cleanup. Deep artifact, template and run paths do not affect socket
-path lengths.
+under `/run/flexvm/s` (or `/tmp/flexvm-s-<uid>` if that is unusable), one per
+daemon or template build, named after a hash of its run or build directory,
+with a counter-named slot per Firecracker. They must be real directories owned
+by the process's user with mode 0700. Sockets are removed with their VM or pool
+slot, and a restarted daemon removes what its predecessor left. Deep artifact,
+template and run paths do not affect socket path lengths.
 
 ## Container images
 

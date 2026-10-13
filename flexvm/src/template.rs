@@ -586,7 +586,7 @@ fn build(
     std::fs::create_dir_all(&dir)?;
     let run = dir.join("boot");
     std::fs::create_dir_all(&run)?;
-    let sockets = SocketRoot::new()?;
+    let sockets = SocketRoot::new(&dir)?;
 
     // Pin the exact image file: artifacts/rootfs.ext4 is a symlink a rebuild
     // repoints, and this snapshot's page cache is only valid for these bytes.
