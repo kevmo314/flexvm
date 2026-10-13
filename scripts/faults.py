@@ -2308,16 +2308,28 @@ def abort_superseded():
     check("abort superseded: running on B", where(n) == {B: "running"} and md5(B, n) == m, where(n))
     old = ok(A, {"op": "info"})["lent"].get(ip)
     # A newer generation of the address, as its home host would announce it
-    # (here only to B, so that A still prepares to take the VM back).
+    # for a replacement VM: to B first, and to A only once A has prepared to
+    # take the VM back (A refuses the arrival anyway: see below).
     newer = old + 100000
-    r = ok(B, {"op": "route", "ip": ip, "via": "127.0.0.1", "gen": newer})
+    # The replacement's host: any on-link address that is not ours (the
+    # default gateway), so the route is really installed. (A and B share one
+    # routing table here.)
+    gw = subprocess.run(["ip", "route", "show", "default"], capture_output=True, text=True).stdout.split()[2]
+    announce = {"op": "route", "ip": ip, "via": gw, "gen": newer}
+    r = ok(B, announce)
     check("abort superseded: B takes the newer generation", not r["stale"], r)
-    # B's page server refuses, so A refuses the arrival after B paused, and B aborts.
+    # B's page server refuses, so A refuses the arrival after B paused (and
+    # held its packets), and B aborts.
     fault(B, "pages", 30000)
+    late = threading.Timer(2, lambda: ok(A, announce))
+    late.start()
     r = rpc(B, {"op": "migrate", "name": n, "to": A}, timeout=120)
+    late.join()
     fault(B, "pages", 0)
     check("abort superseded: migration aborted, copy not resumed", not r["ok"] and "superseded" in r.get("error", ""), r)
     check("abort superseded: running nowhere", where(n) == {}, where(n))
+    route = subprocess.run(["ip", "route", "show", f"{ip}/32"], capture_output=True, text=True).stdout.strip()
+    check("abort superseded: the address routes to the replacement, not the hold", f"via {gw}" in route, route)
     check("abort superseded: its old loan freed", wait_for(lambda: ip not in ok(A, {"op": "info"})["lent"], 10))
     cleanup(n)
     # Let A, the home host, know the newer generation too, and retire it,
@@ -2325,6 +2337,7 @@ def abort_superseded():
     for h in (A, B):
         ok(h, {"op": "route", "ip": ip, "via": "127.0.0.1", "gen": newer})
         ok(h, {"op": "route", "ip": ip, "gen": newer})
+    subprocess.run(["sudo", "ip", "route", "del", f"{ip}/32"], capture_output=True)
 
 
 def suspend_no_gen():

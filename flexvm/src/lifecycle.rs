@@ -748,13 +748,10 @@ impl Daemon {
                     let gen = match read_gen(&e.path()) {
                         Some(gen) if self.gens.lock().unwrap().current(ip, gen) => Ok(gen),
                         Some(gen) => Err(format!("its address {ip}'s generation {gen} was withdrawn or superseded")),
-                        // (A suspend records it before publishing; only a
-                        // checkpoint from before generations lacks one.)
-                        None if self.gens.lock().unwrap().seen.contains_key(&ip) => {
-                            Err(format!("no generation recorded for it, and its address {ip} has one"))
-                        }
-                        None if self.cfg.vm_ips.contains(ip) => Ok(self.new_gen(ip)?),
-                        None => Err(format!("no generation recorded for its address {ip}, which is not this host's to hand out")),
+                        // A suspend records it before publishing; one
+                        // without (from before generations, or tampered
+                        // with) is never adopted.
+                        None => Err(format!("no generation recorded for its address {ip}")),
                     };
                     let gen = match gen {
                         Ok(gen) => gen,

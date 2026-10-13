@@ -1086,8 +1086,9 @@ impl Daemon {
         Ok(json!({"ip": ip.to_string(), "local": local, "freed": freed, "stale": !fresh}))
     }
 
-    /// Puts back the route a peer announced for `ip`, once a claim of it here
-    /// that kept the route (a VM arriving) has gone without committing:
+    /// Puts back the route a peer announced for `ip`, once a claim or hold of
+    /// it here that kept the route (a VM arriving, or a superseded migration
+    /// source's held packets) has gone without the VM running here:
     /// unless something here claims it again, or the announced generation is
     /// no longer current.
     fn reinstall_route(&self, ip: Ipv4Addr) {
@@ -1691,6 +1692,9 @@ impl Daemon {
             }
             self.drop_held_in(vm);
             vm.kill();
+            // The hold had the address's route; give it back to the newer VM,
+            // as a peer announced it (`route` left it alone while held).
+            self.reinstall_route(ip);
             self.withdraw_from_peers(ip, Some(gen));
             return format!("{e}; not resumed here: generation {gen} of its address {ip} was superseded meanwhile, so this copy is gone").into();
         }

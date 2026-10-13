@@ -704,12 +704,16 @@ and a second copy could repeat what it did.
     migration route switches (which check the VM's generation first) and
     packet holds. An arriving VM's generation is recorded before it is
     taken in and checked again when it commits; if it does not commit, the
-    newest route a peer announced for the address is put back.
+    newest route a peer announced for the address is put back. A migration
+    source that aborts does not resume a VM whose generation was withdrawn
+    or superseded meanwhile: that copy is killed, and the newest route a
+    peer announced replaces the hold.
   - A suspended VM whose generation was withdrawn or superseded meanwhile
     is not resumed (checked under the address's lock, held until the VM
-    has resumed); one without a recorded generation, on a host that is not
-    its address's home, is quarantined (left on disk, logged, not brought
-    back) at startup; its checkpoint restores with `--ip auto`.
+    has resumed). Suspend records the generation in the checkpoint before
+    publishing it; one without (or with a stale one) is quarantined at
+    startup (left on disk, logged, not brought back); its checkpoint
+    restores with `--ip auto`.
   - Hosts of a cluster must be upgraded together: the page server's answer
     line and the generations are part of the protocol.
 - Reachability:
