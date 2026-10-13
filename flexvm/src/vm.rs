@@ -147,59 +147,31 @@ impl Vm {
         load: Load,
         phases: &mut Phases,
     ) -> Result<(Arc<Vm>, Duration)> {
+        let prepared = Vm::prepare(idle, name, template, phases)?;
+        if let Some((runs, origin)) = remote {
+            prepared.pager.seed(runs, origin, None)?;
+        }
+        prepared.load(name, vmstate, ip, load, phases)
+    }
+
+    /// The part of a restore that needs no vmstate: names the cgroup and
+    /// starts the pager, which gets its page states later (`Pager::seed`).
+    /// A migration target does this before its source pauses.
+    pub fn prepare(idle: Idle, name: &str, template: Arc<Template>, phases: &mut Phases) -> Result<Prepared> {
         let (fc, dir, cgroup, tap) = idle.into_parts();
-        let cgroup = name_cgroup(cgroup, name);
+        let idle = Idle { fc, dir, cgroup: name_cgroup(cgroup, name), tap };
         phases.mark("cgroup_rename");
-        let pager = Pager::start(&fc.sockets.uffd, template.clone(), remote);
-        let restored = (|| {
-            let pager = pager.as_ref().map_err(|e| e.to_string())?.clone();
-            pager.set_pid(fc.pid())?;
-            // Route the VM's address while Firecracker restores; it is not on the critical path.
-            let route = {
-                let tap = tap.clone();
-                std::thread::spawn(move || crate::net::attach(ip, &tap))
-            };
-            phases.mark("pager_start");
-            fc.put(
-                "/snapshot/load",
-                json!({
-                    "snapshot_path": vmstate,
-                    "mem_backend": {"backend_type": "Uffd", "backend_path": fc.sockets.uffd},
-                    "vsock_override": {"uds_path": fc.sockets.vsock},
-                    "network_overrides": [{"iface_id": "eth0", "host_dev_name": tap}],
-                    "clock_realtime": true,
-                    "resume_vm": load == Load::Running,
-                }),
-            )?;
-            // Includes Firecracker's resume: the load request sets resume_vm.
-            let took = phases.mark("snapshot_load");
-            if load == Load::Paused {
-                // Loaded paused, Firecracker stops only the vCPUs and goes on
-                // emulating devices; an API pause enters the loop that holds
-                // device emulation too, until the resume.
-                fc.pause()?;
-                phases.mark("hold_paused");
-            }
-            pager.wait_ready(Duration::from_secs(5))?;
-            route.join().map_err(|_| "route thread panicked")??;
-            phases.mark("route_wait");
-            Ok((pager, took))
-        })();
-        let (pager, took) = match restored {
-            Ok(r) => r,
+        let pager = match Pager::start(&idle.fc.sockets.uffd, template.clone(), None) {
+            Ok(p) => p,
             Err(e) => {
-                if let Ok(pager) = pager {
-                    pager.stop();
-                    drop(Idle { fc, dir, cgroup, tap });
-                    pager.join();
-                    return Err(e);
-                }
-                drop(Idle { fc, dir, cgroup, tap });
+                drop(idle);
                 return Err(e);
             }
         };
-        let state = if load == Load::Running { State::Running } else { State::Paused };
-        Ok((Vm::assemble(name, template, Idle { fc, dir, cgroup, tap }, ip, pager, state), took))
+        let prepared = Prepared { idle: Some(idle), pager, template };
+        prepared.pager.set_pid(prepared.idle.as_ref().unwrap().fc.pid())?;
+        phases.mark("pager_start");
+        Ok(prepared)
     }
 
     /// A VM made of a restored Firecracker and its resources.
@@ -279,17 +251,32 @@ impl Vm {
     /// queued on a tap that a paused Firecracker no longer reads and that
     /// then goes down; what the guest sends until the pause still leaves
     /// through the tap. Call after `start_source`.
+    ///
+    /// A migration parks the balloon timer itself first (`park_balloon`),
+    /// while the VM still runs, so that is not part of the pause.
     pub fn checkpoint(&self, vmstate: &Path, unroute: impl FnOnce(), t: &mut Phases) -> Result<Runs> {
-        self.save_state_timed(vmstate, false, unroute, t)
+        self.save_state_timed(vmstate, false, false, unroute, t)
     }
 
     /// `checkpoint`, with Firecracker fsyncing the state file if `sync`.
     /// Call after `start_source` or `start_checkpoint`.
     pub fn save_state(&self, vmstate: &Path, sync: bool, unroute: impl FnOnce()) -> Result<Runs> {
-        self.save_state_timed(vmstate, sync, unroute, &mut Phases::new())
+        self.save_state_timed(vmstate, sync, true, unroute, &mut Phases::new())
     }
 
-    fn save_state_timed(&self, vmstate: &Path, sync: bool, unroute: impl FnOnce(), t: &mut Phases) -> Result<Runs> {
+    /// Pushes the balloon's statistics timer out of the way (see
+    /// `checkpoint`): changing it makes Firecracker write the stats queue,
+    /// which must happen before the snapshot. Call after `start_source`;
+    /// `resume` puts it back.
+    pub fn park_balloon(&self) -> Result<()> {
+        self.fc(|fc| fc.patch("/balloon/statistics", json!({"stats_polling_interval_s": u16::MAX})).map(drop))
+    }
+
+    fn save_state_timed(&self, vmstate: &Path, sync: bool, park: bool, unroute: impl FnOnce(), t: &mut Phases) -> Result<Runs> {
+        if park {
+            self.park_balloon()?;
+            t.mark("park_balloon");
+        }
         for (_, s) in self.execs.lock().unwrap().drain() {
             let _ = s.shutdown(Shutdown::Both);
         }
@@ -297,25 +284,29 @@ impl Vm {
         t.mark("hold");
         // Always, even if already paused: Firecracker freezes device
         // emulation only while it sits in the loop an API pause enters (a VM
-        // loaded paused is not in it). The tap goes down after the pause, so
-        // the guest's last packets still leave.
+        // loaded paused is not in it). Nothing may write guest memory from
+        // here until the pages are captured or served: we send no
+        // guest-facing request (balloon, hotplug) to a paused source.
         self.fc(|fc| fc.pause())?;
         t.mark("pause");
-        crate::net::set_link_up(&self.tap, false)?;
-        t.mark("link_down");
-        self.fc(|fc| {
-            // The balloon timer is parked: changing it writes the stats
-            // queue, which has to happen before the snapshot. Nothing else
-            // may write guest memory until the pages are captured or served:
-            // we send no guest-facing request (balloon, hotplug) to a paused
-            // source.
-            fc.patch("/balloon/statistics", json!({"stats_polling_interval_s": u16::MAX}))?;
-            t.mark("park_balloon");
+        // The tap goes down after the pause, so the guest's last packets
+        // still leave. That waits for an RCU grace period (milliseconds on a
+        // busy host), so it runs alongside the snapshot: Firecracker serves
+        // the snapshot request from its pause loop, which reads no tap, and
+        // the address already routes elsewhere (`unroute`). It is down
+        // before the page states are captured, and joined on every path:
+        // `resume` must not race a late link-down.
+        let tap = self.tap.clone();
+        let down = std::thread::spawn(move || crate::net::set_link_up(&tap, false));
+        let saved = self.fc(|fc| {
             self.snapshot_discards.store(self.pager.discards(), Ordering::SeqCst);
-            fc.put("/snapshot/create", json!({"snapshot_type": "Full", "snapshot_path": vmstate, "mem_file_path": "", "sync_snapshot_files": sync}))?;
-            t.mark("snapshot_create");
-            Ok(())
-        })?;
+            fc.put("/snapshot/create", json!({"snapshot_type": "Full", "snapshot_path": vmstate, "mem_file_path": "", "sync_snapshot_files": sync}))
+        });
+        t.mark("snapshot_create");
+        let down = down.join().unwrap_or_else(|_| Err("link-down thread panicked".into()));
+        t.mark("link_down");
+        saved?;
+        down?;
         let runs = self.pager.quiesce_export()?;
         t.mark("export_runs");
         Ok(runs)
@@ -760,6 +751,75 @@ impl Vm {
             "checkpoint_copy": self.pager.copying(),
             "write_tracking": self.pager.tracking(),
         })
+    }
+}
+
+/// A pooled Firecracker set up for a restore, with its pager started but no
+/// snapshot loaded yet (`Vm::prepare`). Dropping it tears everything down.
+pub struct Prepared {
+    idle: Option<Idle>,
+    pub pager: Arc<Pager>,
+    template: Arc<Template>,
+}
+
+impl Prepared {
+    /// The Firecracker's directory, where the vmstate to load goes.
+    pub fn dir(&self) -> &Path {
+        &self.idle.as_ref().unwrap().dir
+    }
+
+    /// Loads `vmstate` and starts the VM as `load` says, with `ip` routed to
+    /// its tap. Seed the pager first if pages are to come from elsewhere.
+    pub fn load(mut self, name: &str, vmstate: &Path, ip: Ipv4Addr, load: Load, phases: &mut Phases) -> Result<(Arc<Vm>, Duration)> {
+        let idle = self.idle.as_ref().unwrap();
+        let (fc, tap) = (&idle.fc, idle.tap.clone());
+        let restored = (|| -> Result<Duration> {
+            // Route the VM's address while Firecracker restores; it is not on the critical path.
+            let route = std::thread::spawn(move || crate::net::attach(ip, &tap));
+            let loaded = fc.put(
+                "/snapshot/load",
+                json!({
+                    "snapshot_path": vmstate,
+                    "mem_backend": {"backend_type": "Uffd", "backend_path": fc.sockets.uffd},
+                    "vsock_override": {"uds_path": fc.sockets.vsock},
+                    "network_overrides": [{"iface_id": "eth0", "host_dev_name": idle.tap}],
+                    "clock_realtime": true,
+                    "resume_vm": load == Load::Running,
+                }),
+            );
+            self.pager.loaded();
+            // Includes Firecracker's resume: the load request sets resume_vm.
+            let took = phases.mark("snapshot_load");
+            let held = loaded.and_then(|_| {
+                if load == Load::Paused {
+                    // Loaded paused, Firecracker stops only the vCPUs and goes on
+                    // emulating devices; an API pause enters the loop that holds
+                    // device emulation too, until the resume.
+                    fc.pause()?;
+                    phases.mark("hold_paused");
+                }
+                self.pager.wait_ready(Duration::from_secs(5))
+            });
+            let routed = route.join().map_err(|_| "route thread panicked")?;
+            held?;
+            routed?;
+            phases.mark("route_wait");
+            Ok(took)
+        })();
+        let took = restored?;
+        let state = if load == Load::Running { State::Running } else { State::Paused };
+        let idle = self.idle.take().unwrap();
+        Ok((Vm::assemble(name, self.template.clone(), idle, ip, self.pager.clone(), state), took))
+    }
+}
+
+impl Drop for Prepared {
+    fn drop(&mut self) {
+        if let Some(idle) = self.idle.take() {
+            self.pager.stop();
+            drop(idle);
+            self.pager.join();
+        }
     }
 }
 

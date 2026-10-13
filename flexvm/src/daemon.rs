@@ -70,6 +70,10 @@ const CLOCK_TOLERANCE: Duration = Duration::from_millis(20);
 const CLOCK_DEADLINE: Duration = Duration::from_secs(5);
 /// How long an incoming migration may take to send its vmstate.
 const INCOMING_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Largest vmstate a migration target accepts.
+const MAX_VMSTATE: u64 = 64 << 20;
+/// Most pages a migration source may send along with the vmstate.
+const MAX_PRELOAD: usize = 4096;
 /// How long a migration source waits for the target's preflight answer.
 const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a checkpoint waits for virtio-mem to carry out the last resize.
@@ -554,6 +558,7 @@ impl Daemon {
                 return Ok(serve_pages(&vm.pager, &mut stream, || self.fault("pages"))?);
             }
             "exec" => return self.exec(&name, &req, w),
+            "migrate_in" => return self.migrate_in(&req, r, w),
             "logs" => return self.logs(&name, &req, w),
             "preflight" => self.migration_template(&req, true).map(|tpl| json!({"id": tpl.meta.id})),
             "incoming" => match {
@@ -1018,6 +1023,12 @@ impl Daemon {
     /// the vCPU/device state and a page map, resume on the target, then let
     /// the target pull memory from us on demand and in the background.
     ///
+    /// Everything that does not need the vmstate happens before the pause:
+    /// the target checks the template, reserves the name and address, and
+    /// sets up a pooled Firecracker with its pager (`migrate_in`), over the
+    /// connection that then carries the state. The downtime is the
+    /// checkpoint, the transfer and the target's snapshot load.
+    ///
     /// Once the target may have the state it may resume the VM, so from then
     /// on this copy is resumed only if the target says migration `mig`
     /// aborted, and never once it committed.
@@ -1026,13 +1037,16 @@ impl Daemon {
         let _busy = self.reserve(name, "migrating", LIFECYCLE_WAIT)?;
         let vm = self.vm(name)?;
         // Before pausing, so a template mismatch costs no downtime.
-        crate::template::preflight(&self.cfg.paths, &vm.template, to, PREFLIGHT_TIMEOUT)?;
+        vm.template.verify(&self.cfg.paths, true)?;
         // Before the pause (not part of the downtime): no virtio-mem resize may
         // still be under way.
         let settle = Instant::now();
         vm.settle_hotplug(settle + SETTLE_WAIT)?;
         let settle = settle.elapsed();
         let mig = migration_id();
+        let prep = Instant::now();
+        let (mut conn, mut reader, prepared) = self.prepare_target(&vm, to, mig)?;
+        let prepare = prep.elapsed();
         // Durably lent before the target can have the VM: if we crash with
         // the outcome unknown, a restart must not hand the address out. A
         // failure to record it stops the migration here. Undone only once
@@ -1049,6 +1063,10 @@ impl Daemon {
             }
             return Err(e);
         }
+        // While the VM still runs, so it is not part of the pause.
+        if let Err(e) = vm.park_balloon() {
+            return Err(self.abort_migration(&vm, mig, e));
+        }
         let mut t = Phases::new();
         let vmstate = vm.dir.join("vmstate.out");
         // Packets for the VM wait here until it runs again.
@@ -1057,20 +1075,30 @@ impl Daemon {
                 eprintln!("vm {name}: not holding packets during migration: {e}");
             }
         };
-        let prepared = (|| -> Result<_> {
+        let captured = (|| -> Result<_> {
             let runs = vm.checkpoint(&vmstate, hold, &mut t)?;
             let paused = t.total();
             let state = std::fs::read(&vmstate)?;
             t.mark("read_state");
-            let conn = crate::util::connect(to, Duration::from_secs(2))?;
-            conn.set_nodelay(true)?;
-            // A target that hangs leaves the outcome to `outcome` below.
-            conn.set_read_timeout(Some(Duration::from_secs(30)))?;
-            conn.set_write_timeout(Some(Duration::from_secs(30)))?;
-            Ok((runs, paused, state, conn))
+            // The pages the target's load will touch, so it need not fetch
+            // them one round trip at a time (see `Template::load_set`).
+            let mut wanted = vm.template.load_set();
+            if let Ok(theirs) = serde_json::from_value::<Vec<u64>>(prepared["load_set"].clone()) {
+                wanted.extend(theirs);
+                wanted.sort_unstable();
+                wanted.dedup();
+            }
+            let pages = crate::uffd::remote_among(&runs, wanted);
+            let mut data = vec![0u8; pages.len() * crate::util::PAGE_SIZE];
+            for (page, buf) in pages.iter().zip(data.chunks_exact_mut(crate::util::PAGE_SIZE)) {
+                vm.pager.read_guest(page * crate::util::PAGE_SIZE as u64, buf)?;
+            }
+            t.mark("read_preload");
+            Ok((runs, paused, state, (pages, data)))
         })();
-        let (runs, paused, state, mut conn) = match prepared {
-            Ok(p) => p,
+        let (runs, paused, state, (pages, data)) = match captured {
+            Ok(c) => c,
+            // Dropping the connection makes the target give up too.
             Err(e) => return Err(self.abort_migration(&vm, mig, e)),
         };
         let remote_pages: u64 = runs.iter().filter(|r| r.2 == crate::uffd::REMOTE).map(|r| r.1).sum();
@@ -1078,22 +1106,17 @@ impl Daemon {
             send_json(
                 &mut conn,
                 &json!({
-                    "op": "incoming",
-                    "name": name,
-                    "mig": mig,
-                    "template": vm.template.name,
-                    "id": vm.template.meta.id,
-                    "ip": vm.ip.to_string(),
-                    "source": self.cfg.advertise,
                     "runs": runs,
                     "vmstate_len": state.len(),
+                    "preload": pages,
                     // A paused VM stays paused on the target, which pulls its pages before it ever runs.
                     "paused": vm.was_paused(),
                 }),
             )?;
             conn.write_all(&state)?;
+            conn.write_all(&data)?;
             t.mark("send_state");
-            Ok(recv_json(&mut BufReader::new(&conn))?.ok_or("target hung up")?)
+            Ok(recv_json(&mut reader)?.ok_or("target hung up")?)
         })();
         let (target, answered) = match sent {
             Ok(reply) if reply["ok"] == json!(true) => (reply["result"].clone(), true),
@@ -1119,6 +1142,7 @@ impl Daemon {
             "to": to,
             "mig": mig,
             "settle_hotplug_ms": ms(settle),
+            "prepare_ms": ms(prepare),
             "checkpoint_ms": ms(paused),
             "downtime_ms": ms(downtime),
             "rerouted_ms": ms(t.total()),
@@ -1127,9 +1151,45 @@ impl Daemon {
             "target_restore_ms": target["restore_ms"],
             "timings_ms": t.json(),
             "target_timings_ms": target["timings_ms"],
+            "target_prepare_timings_ms": prepared["timings_ms"],
             "vmstate_kib": state.len() >> 10,
+            "preload_pages": pages.len(),
             "to_transfer_mib": (remote_pages * crate::util::PAGE_SIZE as u64) >> 20,
         }))
+    }
+
+    /// Asks `to` to get ready to take `vm` in as migration `mig` (see
+    /// `migrate_in`). Returns the connection to send the state over, a reader
+    /// for the target's answer, and what it said. A target that cannot take
+    /// the VM refuses here, before anything happened to it.
+    fn prepare_target(&self, vm: &Vm, to: &str, mig: u64) -> Result<(TcpStream, BufReader<TcpStream>, Value)> {
+        let conn = crate::util::connect(to, Duration::from_secs(2))?;
+        conn.set_nodelay(true)?;
+        conn.set_read_timeout(Some(PREFLIGHT_TIMEOUT))?;
+        conn.set_write_timeout(Some(PREFLIGHT_TIMEOUT))?;
+        let mut reader = BufReader::new(conn.try_clone()?);
+        let mut w = &conn;
+        send_json(
+            &mut w,
+            &json!({
+                "op": "migrate_in",
+                "name": vm.name,
+                "mig": mig,
+                "template": vm.template.name,
+                "id": vm.template.meta.id,
+                "ip": vm.ip.to_string(),
+                "source": self.cfg.advertise,
+            }),
+        )?;
+        let reply = recv_json(&mut reader)?.ok_or_else(|| format!("{to} hung up"))?;
+        if reply["ok"] != json!(true) {
+            let e = reply["error"].as_str().unwrap_or("no reason given");
+            bail!("{to} cannot take vm {}: {e}", vm.name);
+        }
+        // A target that hangs leaves the outcome to `outcome`.
+        conn.set_read_timeout(Some(Duration::from_secs(30)))?;
+        conn.set_write_timeout(Some(Duration::from_secs(30)))?;
+        Ok((conn, reader, reply["result"].clone()))
     }
 
     /// Resumes our copy after migration `mig` failed without the target ever
@@ -1340,16 +1400,124 @@ impl Daemon {
         net::route_via(ip, via)
     }
 
+    /// The target of `migrate`, in two steps on one connection. First, before
+    /// the source pauses: check the template, reserve the name and address,
+    /// and set up a pooled Firecracker with its pager; answer whether the VM
+    /// can come. Then the source pauses and sends the page states, the
+    /// vmstate and the pages the load will touch; load it and answer again.
+    /// A source that goes away in between leaves nothing behind.
+    fn migrate_in(self: &Arc<Self>, req: &Value, mut r: BufReader<TcpStream>, mut w: TcpStream) -> Result<()> {
+        let mut prep = Phases::new();
+        let prepared = self.admit().and_then(|op| Ok((op, self.prepare_in(req, true, &mut prep)?)));
+        let (_op, prepared) = match prepared {
+            Ok(p) => p,
+            Err(e) => return Ok(send_json(&mut w, &json!({"ok": false, "error": e.to_string()}))?),
+        };
+        // What this host has learned its loads touch, for the source to send along.
+        let load_set = prepared.load_set.clone();
+        send_json(&mut w, &json!({"ok": true, "result": {"timings_ms": prep.json(), "load_set": load_set}}))?;
+        // The vmstate follows once the source has paused; a source that
+        // stalls must not hold a counted operation (and so shutdown) forever.
+        r.get_ref().set_read_timeout(Some(INCOMING_READ_TIMEOUT))?;
+        let reply = (|| -> Result<Value> {
+            let hdr = recv_json(&mut r)?.ok_or("source hung up before sending the vmstate")?;
+            // The source has paused: the downtime here starts now.
+            let mut t = Phases::new();
+            let runs: Runs = serde_json::from_value(hdr["runs"].clone())?;
+            let state = read_vec(&mut r, hdr["vmstate_len"].as_u64().ok_or("missing vmstate_len")?, MAX_VMSTATE)?;
+            let pages: Vec<u64> = serde_json::from_value(hdr["preload"].clone()).unwrap_or_default();
+            if pages.len() > MAX_PRELOAD {
+                bail!("{} pages to preload, more than {MAX_PRELOAD}", pages.len());
+            }
+            let data = read_vec(&mut r, (pages.len() * crate::util::PAGE_SIZE) as u64, u64::MAX)?;
+            t.mark("recv_state");
+            let paused = hdr["paused"].as_bool().unwrap_or(false);
+            let (v, vm) = self.finish_in(prepared, runs, &state, Some((pages, data)), paused, &mut t)?;
+            // Before the answer: the held packets follow it on this connection.
+            self.after_arrival(req, &vm, r.get_ref());
+            Ok(v)
+        })();
+        let reply = match reply {
+            // Committed, but the source never hears about it. (Shut down,
+            // as the announcing thread holds a clone of the connection.)
+            Ok(_) if self.fault("lost_ack") => return Ok(w.shutdown(std::net::Shutdown::Both)?),
+            Ok(v) => json!({"ok": true, "result": v}),
+            Err(e) => json!({"ok": false, "error": e.to_string()}),
+        };
+        send_json(&mut w, &reply)?;
+        Ok(())
+    }
+
+    /// An incoming migration from a source that sends everything at once,
+    /// after pausing (`incoming`, from daemons before `migrate_in`).
     fn incoming(self: &Arc<Self>, req: &Value, r: &mut BufReader<TcpStream>) -> Result<Value> {
         let mut t = Phases::new();
         let _op = self.admit()?;
+        let runs: Runs = serde_json::from_value(req["runs"].clone())?;
+        let state = read_vec(r, req["vmstate_len"].as_u64().ok_or("missing vmstate_len")?, MAX_VMSTATE)?;
+        t.mark("recv_state");
+        let prepared = self.prepare_in(req, false, &mut t)?;
+        let (v, vm) = self.finish_in(prepared, runs, &state, None, req["paused"].as_bool().unwrap_or(false), &mut t)?;
+        self.after_arrival(req, &vm, r.get_ref());
+        Ok(v)
+    }
+
+    /// For a VM that arrived as migration `req["mig"]`: takes the packets its
+    /// source held, which follow our answer on `conn` (the migration
+    /// connection, with nothing more buffered: the source waits for the
+    /// answer), then announces the VM (`announce_after_held`).
+    fn after_arrival(self: &Arc<Self>, req: &Value, vm: &Arc<Vm>, conn: &TcpStream) {
+        let Some(mig) = req["mig"].as_u64() else { return };
+        let conn = conn.try_clone().ok();
+        let revoked = {
+            let mut held = self.held_in.lock().unwrap();
+            let right = held.get_mut(&mig).filter(|h| Arc::ptr_eq(&h.vm, vm));
+            right.map(|h| {
+                h.conn = conn.as_ref().and_then(|c| c.try_clone().ok());
+                h.revoked.clone()
+            })
+        };
+        self.announce_after_held(mig, vm.clone(), conn.zip(revoked));
+    }
+
+    /// The part of taking a VM in that needs no vmstate. `preflight`: the
+    /// template may be rehashed (the source has not paused yet).
+    fn prepare_in(&self, req: &Value, preflight: bool, t: &mut Phases) -> Result<PreparedIn<'_>> {
         let name = req["name"].as_str().ok_or("missing name")?.to_string();
         let mig = req["mig"].as_u64().ok_or("missing mig")?;
         let source = Source { addr: req["source"].as_str().ok_or("missing source")?.into(), vm: name.clone(), mig };
-        let runs: Runs = serde_json::from_value(req["runs"].clone())?;
-        let mut state = vec![0u8; req["vmstate_len"].as_u64().ok_or("missing vmstate_len")? as usize];
-        r.read_exact(&mut state)?;
-        t.mark("recv_state");
+        let busy = self.reserve(&name, "incoming", Duration::ZERO)?;
+        if self.taken(&name) {
+            bail!("vm name {name:?} is taken here");
+        }
+        // Checked again (and recorded) once the state arrives.
+        if self.migrations.lock().unwrap().contains_key(&mig) {
+            bail!("migration {mig} was already seen here");
+        }
+        let tpl = self.migration_template(req, preflight)?;
+        t.mark("template");
+        let claim = self.claim_given_ip(req["ip"].as_str().ok_or("missing ip")?, ClaimFor::Incoming)?;
+        t.mark("claim_ip");
+        let idle = self.pool.take()?;
+        t.mark("pool_take");
+        let load_set = tpl.load_set();
+        let vm = Vm::prepare(idle, &name, tpl, t)?;
+        Ok(PreparedIn { vm, claim, source, name, load_set, _busy: busy })
+    }
+
+    /// Restores and resumes a prepared incoming VM from the source's state.
+    /// Records the outcome for the source: committed once it may have run
+    /// here, aborted if it was killed before the source was answered.
+    fn finish_in(
+        self: &Arc<Self>,
+        p: PreparedIn<'_>,
+        runs: Runs,
+        state: &[u8],
+        preload: Option<crate::uffd::Preload>,
+        paused: bool,
+        t: &mut Phases,
+    ) -> Result<(Value, Arc<Vm>)> {
+        let mig = p.source.mig;
         {
             let mut migs = self.migrations.lock().unwrap();
             if migs.contains_key(&mig) {
@@ -1357,24 +1525,11 @@ impl Daemon {
             }
             migs.insert(mig, Incoming::Pending);
         }
-        let res = self.take_in(&name, req, runs, source, &state, &mut t);
-        if let Ok((_, vm)) = &res {
-            // Nothing more is buffered: the source waits for our answer.
-            let conn = r.get_ref().try_clone().ok();
-            let revoked = {
-                let mut held = self.held_in.lock().unwrap();
-                let right = held.get_mut(&mig).filter(|h| Arc::ptr_eq(&h.vm, vm));
-                right.map(|h| {
-                    h.conn = conn.as_ref().and_then(|c| c.try_clone().ok());
-                    h.revoked.clone()
-                })
-            };
-            self.announce_after_held(mig, vm.clone(), conn.zip(revoked));
-        }
+        let res = self.take_in(p, runs, state, preload, paused, t);
         // A failed restore has killed the VM, so the source may resume it.
         let outcome = if res.is_ok() { Incoming::Committed } else { Incoming::Aborted };
         self.migrations.lock().unwrap().insert(mig, outcome);
-        res.map(|(v, _)| v)
+        res
     }
 
     /// Once a VM that migrated in runs, injects the packets its source held,
@@ -1399,34 +1554,36 @@ impl Daemon {
 
     fn take_in(
         self: &Arc<Self>,
-        name: &str,
-        req: &Value,
+        p: PreparedIn<'_>,
         runs: Runs,
-        source: Source,
         state: &[u8],
+        preload: Option<crate::uffd::Preload>,
+        paused: bool,
         t: &mut Phases,
     ) -> Result<(Value, Arc<Vm>)> {
-        let _busy = self.reserve(name, "incoming", Duration::ZERO)?;
-        if self.taken(name) {
-            bail!("vm name {name:?} is taken here");
-        }
-        let tpl = self.migration_template(req, false)?;
-        let claim = self.claim_given_ip(req["ip"].as_str().ok_or("missing ip")?, ClaimFor::Incoming)?;
+        let PreparedIn { vm: prepared, claim, source, name, _busy, .. } = p;
         let ip = claim.ip;
-        t.mark("claim_ip");
-        let restored = (|| {
-            let idle = self.pool.take()?;
-            t.mark("pool_take");
-            let vmstate = idle.dir.join("vmstate.in");
-            std::fs::write(&vmstate, state)?;
-            t.mark("write_state");
-            let paused = req["paused"].as_bool().unwrap_or(false);
-            let origin = Some((runs, Origin::Peer(source.clone())));
-            let load = if paused { crate::vm::Load::Paused } else { crate::vm::Load::Running };
-            Vm::restore_from(idle, name, tpl, &vmstate, origin, ip, load, t)
-        })();
+        // Is the source's page server there? Asked alongside the load, which
+        // may not need it (preloaded pages): a VM whose memory cannot come
+        // must not be committed here.
+        let probe = runs.iter().find(|r| r.2 == crate::uffd::REMOTE).map(|r| {
+            let source = source.clone();
+            let page = r.0;
+            thread::spawn(move || crate::uffd::probe(&source, page))
+        });
+        prepared.pager.seed(runs, Origin::Peer(source.clone()), preload)?;
+        let vmstate = prepared.dir().join("vmstate.in");
+        std::fs::write(&vmstate, state)?;
+        t.mark("write_state");
+        let load = if paused { crate::vm::Load::Paused } else { crate::vm::Load::Running };
+        let restored = prepared.load(&name, &vmstate, ip, load, t);
+        let probed = probe.map_or(Ok(()), |p| p.join().unwrap_or_else(|_| Err(std::io::Error::other("probe panicked"))));
         let (vm, restore) = restored?;
-        if let Err(e) = self.publish(name, &vm) {
+        if let Err(e) = probed {
+            vm.kill();
+            bail!("migration source {} does not serve pages: {e}", source.addr);
+        }
+        if let Err(e) = self.publish(&name, &vm) {
             // Not ours after all: the source may resume its copy.
             vm.kill();
             return Err(e);
@@ -1884,6 +2041,28 @@ enum ClaimFor {
     Run,
     Restore,
     Incoming,
+}
+
+/// An incoming migration set up before its source pauses
+/// (`Daemon::prepare_in`). Dropping it gives everything back.
+struct PreparedIn<'a> {
+    vm: crate::vm::Prepared,
+    claim: IpClaim<'a>,
+    source: Source,
+    name: String,
+    /// The template's load set here (`Template::load_set`).
+    load_set: Vec<u64>,
+    _busy: Busy<'a>,
+}
+
+/// Reads `len` bytes, refusing more than `max`.
+fn read_vec(r: &mut impl Read, len: u64, max: u64) -> Result<Vec<u8>> {
+    if len > max {
+        bail!("{len} bytes, more than {max}");
+    }
+    let mut v = vec![0u8; len as usize];
+    r.read_exact(&mut v)?;
+    Ok(v)
 }
 
 /// An address reserved for a VM being started or migrated in. Unless

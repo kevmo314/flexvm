@@ -149,6 +149,10 @@ pub struct Source {
     pub mig: u64,
 }
 
+/// Pages a migration source sends along with the vmstate, with their
+/// contents (one `PAGE_SIZE` slice per page, in order).
+pub type Preload = (Vec<u64>, Vec<u8>);
+
 /// Where a VM's REMOTE pages come from.
 pub enum Origin {
     /// The paused source of an incoming migration.
@@ -432,6 +436,16 @@ pub struct Pager {
     pagemap: OnceLock<std::fs::File>,
     /// Test fault: the next freeze fails to re-protect pages.
     pub fail_protect: AtomicBool,
+    /// Initial page states and their origin, applied when Firecracker
+    /// connects (see `seed`).
+    initial: Mutex<Option<(Runs, Origin)>>,
+    /// REMOTE pages to install as soon as Firecracker connects.
+    preload: Mutex<Option<Preload>>,
+    /// Learning the template's load set (`learn_load_set`): faults go into
+    /// it until `loaded`, and the working-set prefetch waits until then.
+    learning: AtomicBool,
+    /// The prefetch, held back until `loaded` while learning: (loaded, due).
+    prefetch: Mutex<(bool, bool)>,
 }
 
 /// What `Pager::freeze` captured for a checkpoint.
@@ -454,7 +468,8 @@ pub struct Frozen {
 impl Pager {
     /// Listens on `sock` for Firecracker's UFFD handshake and serves faults in
     /// the background. `initial` seeds page states for an incoming migration
-    /// or a checkpoint restore, with where their REMOTE pages come from.
+    /// or a checkpoint restore, with where their REMOTE pages come from; it
+    /// can also be given later, with `seed`, until Firecracker connects.
     pub fn start(sock: &Path, base: Arc<Template>, initial: Option<(Runs, Origin)>) -> Result<Arc<Pager>> {
         crate::socket::check(sock)?;
         let _ = std::fs::remove_file(sock);
@@ -486,18 +501,28 @@ impl Pager {
             wp: Mutex::new(()),
             pagemap: OnceLock::new(),
             fail_protect: AtomicBool::new(false),
+            initial: Mutex::new(initial),
+            preload: Mutex::new(None),
+            learning: AtomicBool::new(false),
+            prefetch: Mutex::new((false, false)),
         });
         let p = pager.clone();
         let thread = thread::Builder::new().name("uffd".into()).spawn(move || {
-            let prefetch = match p.handshake(&listener, initial) {
+            let prefetch = match p.handshake(&listener) {
                 Ok(prefetch) => prefetch,
                 Err(e) => return p.fail(format!("uffd handshake failed: {e}")),
             };
             // Prefetch alongside fault handling: Firecracker itself touches guest
             // memory while restoring devices and must not wait behind it.
             if prefetch {
-                let p = p.clone();
-                thread::spawn(move || p.prefetch());
+                let mut state = p.prefetch.lock().unwrap();
+                match p.learning.load(Ordering::SeqCst) && !state.0 {
+                    true => state.1 = true,
+                    false => {
+                        let p = p.clone();
+                        thread::spawn(move || p.prefetch());
+                    }
+                }
             }
             p.serve();
         })?;
@@ -513,8 +538,45 @@ impl Pager {
         }
     }
 
+    /// Sets the initial page states, where their REMOTE pages come from and
+    /// pages to install right away (contents the source sent along), for a
+    /// pager started without them. Only before Firecracker loads a snapshot.
+    pub fn seed(&self, runs: Runs, origin: Origin, preload: Option<Preload>) -> Result<()> {
+        if self.pages.get().is_some() || self.initial.lock().unwrap().is_some() {
+            bail!("pager already seeded");
+        }
+        if let Some((pages, data)) = &preload {
+            if data.len() != pages.len() * PAGE_SIZE {
+                bail!("preload of {} pages has {} bytes", pages.len(), data.len());
+            }
+        }
+        *self.preload.lock().unwrap() = preload;
+        *self.initial.lock().unwrap() = Some((runs, origin));
+        Ok(())
+    }
+
+    /// Records the pages the coming snapshot load faults on into the
+    /// template's load set (see `Template::load_set`), holding the working-set
+    /// prefetch back until `loaded` so that it does not hide them. For loads
+    /// off the critical path (the hot pool's). Call before the load.
+    pub fn learn_load_set(&self) {
+        self.learning.store(true, Ordering::SeqCst);
+    }
+
+    /// The snapshot load is done (or failed): stops learning and lets a
+    /// held-back prefetch go.
+    pub fn loaded(self: &Arc<Self>) {
+        self.learning.store(false, Ordering::SeqCst);
+        let mut state = self.prefetch.lock().unwrap();
+        state.0 = true;
+        if std::mem::take(&mut state.1) {
+            let p = self.clone();
+            thread::spawn(move || p.prefetch());
+        }
+    }
+
     /// Takes over Firecracker's userfaultfd. Returns whether to prefetch the working set.
-    fn handshake(&self, listener: &UnixListener, initial: Option<(Runs, Origin)>) -> Result<bool> {
+    fn handshake(&self, listener: &UnixListener) -> Result<bool> {
         let start = Instant::now();
         let stream = loop {
             match listener.accept() {
@@ -549,6 +611,7 @@ impl Pager {
         let mappings: Vec<Mapping> = serde_json::from_slice(&body)?;
         let total = mappings.iter().map(|m| m.offset as usize + m.size).max().unwrap_or(0) / PAGE_SIZE;
         let pages = Pages::new(total);
+        let initial = self.initial.lock().unwrap().take();
         if let Some((runs, origin)) = initial {
             let _ = self.pull_started.set(Instant::now());
             let remote = remote_pages(&runs, total)?;
@@ -576,6 +639,21 @@ impl Pager {
         let _ = self.mappings.set(mappings);
         let _ = self.pages.set(pages);
         let _ = self.uffd.set(fd);
+        // Pages the source sent along, which the load would otherwise fault
+        // on one round trip at a time. Firecracker's faults wait meanwhile.
+        if let Some((list, data)) = self.preload.lock().unwrap().take() {
+            let pages = self.pages();
+            for (i, &page) in list.iter().enumerate() {
+                let page = page as usize;
+                if page >= pages.len() || pages.claim(page, 1, REMOTE, |_| true) == 0 {
+                    continue;
+                }
+                let src = &data[i * PAGE_SIZE..(i + 1) * PAGE_SIZE];
+                let (resolved, res) = pages.install(page, 1, REMOTE, None, |p, c| self.populate(p, c, Some(src)));
+                self.pulled(resolved);
+                res?;
+            }
+        }
         if self.remote_left() == 0 && self.pull_started.get().is_some() {
             let _ = self.pull_finished.set(Instant::now());
         }
@@ -883,7 +961,14 @@ impl Pager {
                         let a = u64::from_ne_bytes(msg[8..16].try_into().unwrap());
                         let b = u64::from_ne_bytes(msg[16..24].try_into().unwrap());
                         match msg[0] {
-                            UFFD_EVENT_PAGEFAULT => pending.push_back((b, a, None)),
+                            UFFD_EVENT_PAGEFAULT => {
+                                if self.learning.load(Ordering::Relaxed) {
+                                    if let Some((page, _)) = self.page_of(b) {
+                                        self.base.note_load_fault(page as u64);
+                                    }
+                                }
+                                pending.push_back((b, a, None))
+                            }
                             UFFD_EVENT_REMOVE => self.discard(&removing, a, b),
                             _ => {}
                         }
@@ -1607,6 +1692,14 @@ impl Link {
     }
 }
 
+/// Fetches `page` from a migration source's page server, retrying as a
+/// pager would (for up to `SOURCE_TIMEOUT`): whether it serves pages at all.
+pub fn probe(source: &Source, page: u64) -> io::Result<()> {
+    let stop = AtomicBool::new(false);
+    let mut buf = vec![0u8; PAGE_SIZE];
+    Link::new(source.clone()).fetch(page * PAGE_SIZE as u64, &mut buf, Some(&stop))
+}
+
 /// Client for a migration source's page server.
 pub struct PageClient {
     stream: TcpStream,
@@ -1661,6 +1754,19 @@ pub fn serve_pages(pager: &Pager, mut stream: impl Read + Write, down: impl Fn()
             }
         }
     }
+}
+
+/// The pages of `wanted` (sorted) that `runs` make REMOTE on a target.
+pub fn remote_among(runs: &Runs, wanted: impl IntoIterator<Item = u64>) -> Vec<u64> {
+    let mut remote: Vec<(u64, u64)> = runs.iter().filter(|r| r.2 == REMOTE).map(|r| (r.0, r.0 + r.1)).collect();
+    remote.sort_unstable();
+    wanted
+        .into_iter()
+        .filter(|&p| {
+            let i = remote.partition_point(|r| r.1 <= p);
+            remote.get(i).is_some_and(|r| r.0 <= p)
+        })
+        .collect()
 }
 
 /// Reads guest memory at an offset from wherever a puller pulls it.
@@ -1735,6 +1841,13 @@ mod tests {
 
     fn discard(p: &Pages, page: usize) -> bool {
         p.discard(&p.removing(), page)
+    }
+
+    #[test]
+    fn remote_among_picks_remote_pages() {
+        let runs: Runs = vec![(10, 5, REMOTE), (15, 2, ZERO), (100, 1, REMOTE), (3, 2, REMOTE)];
+        assert_eq!(remote_among(&runs, [0, 3, 4, 5, 9, 10, 14, 15, 16, 99, 100, 101]), vec![3, 4, 10, 14, 100]);
+        assert!(remote_among(&Vec::new(), [1, 2]).is_empty());
     }
 
     #[test]

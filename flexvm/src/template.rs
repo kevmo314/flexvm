@@ -2,7 +2,7 @@
 //! agent came up. Every VM is a UFFD restore of a template, so "boot" costs a
 //! snapshot load and pages are copied in only as the guest touches them.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::os::fd::AsRawFd;
@@ -223,14 +223,6 @@ impl Meta {
     }
 }
 
-/// Checks the template here, then asks `to` whether it has the same one;
-/// connecting, writing and reading each by `timeout`.
-pub fn preflight(paths: &Paths, tpl: &Template, to: &str, timeout: Duration) -> Result<()> {
-    tpl.verify(paths, true)?;
-    crate::call_with_timeout(to, json!({"op": "preflight", "template": tpl.name, "id": tpl.meta.id}), timeout)?;
-    Ok(())
-}
-
 /// Paths shared by everything that creates or runs VMs.
 #[derive(Debug, Clone)]
 pub struct Paths {
@@ -260,6 +252,13 @@ pub struct Template {
     pub working_set: Vec<(u64, u64)>,
     /// Its guest agent predates `START`, so starts use `NET` and leave the clock alone.
     pub legacy_agent: AtomicBool,
+    /// Pages Firecracker touches while loading this template's snapshot,
+    /// learned from the hot pool's loads here (`Pager::learn_load_set`): vCPU
+    /// clock pages, virtqueues and the like, at the same addresses in every
+    /// VM of the template. A migration source sends the ones it has along
+    /// with the vmstate, so the target's load need not fetch them one round
+    /// trip at a time.
+    load_set: Mutex<BTreeSet<u64>>,
     map: *const u8,
     len: usize,
     /// Bitmap of pages that hold data in the memory file (the rest are holes).
@@ -280,6 +279,9 @@ unsafe impl Sync for Template {}
 /// a symlink to the current generation, swapped atomically by `create`. A
 /// running VM keeps the generation it was restored from.
 pub const GENERATIONS: &str = ".gen";
+
+/// Most pages a template's load set holds (2 MiB).
+const MAX_LOAD_SET: usize = 512;
 
 impl Template {
     /// The directory `templates/name` currently stands for: its generation, or
@@ -334,6 +336,7 @@ impl Template {
             meta,
             working_set,
             legacy_agent: AtomicBool::new(false),
+            load_set: Mutex::default(),
             map: map as *const u8,
             len,
             data,
@@ -342,6 +345,19 @@ impl Template {
             ino,
             _handle: handle,
         }))
+    }
+
+    /// Records that a snapshot load faulted on `page` (see `load_set`).
+    pub fn note_load_fault(&self, page: u64) {
+        let mut set = self.load_set.lock().unwrap();
+        if set.len() < MAX_LOAD_SET {
+            set.insert(page);
+        }
+    }
+
+    /// The pages snapshot loads of this template touched here, sorted.
+    pub fn load_set(&self) -> Vec<u64> {
+        self.load_set.lock().unwrap().iter().copied().collect()
     }
 
     /// Checks the files against the content id: stat only, unless `rehash` and

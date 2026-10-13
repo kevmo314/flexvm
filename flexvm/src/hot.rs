@@ -66,6 +66,8 @@ impl Paused {
     /// Restores `template` into `idle`, lets it settle and pauses it.
     pub fn load(idle: Idle, template: Arc<Template>) -> Result<Paused> {
         let pager = Pager::start(&idle.fc.sockets.uffd, template.clone(), None)?;
+        // Off the request path, so it can afford to learn what a load touches.
+        pager.learn_load_set();
         let paused = Paused { idle: Some(idle), pager, template, loaded: Instant::now() };
         let idle = paused.idle.as_ref().unwrap();
         paused.pager.set_pid(idle.fc.pid())?;
@@ -77,7 +79,9 @@ impl Paused {
             "clock_realtime": true,
             "resume_vm": false,
         });
-        idle.fc.request_within("PUT", "/snapshot/load", Some(body), LOAD_TIMEOUT)?;
+        let loaded = idle.fc.request_within("PUT", "/snapshot/load", Some(body), LOAD_TIMEOUT);
+        paused.pager.loaded();
+        loaded?;
         // Loaded with resume_vm false, Firecracker still runs its devices (tap
         // RX, vsock, balloon timer) into guest memory; an API pause stops them.
         idle.fc.request_within("PATCH", "/vm", Some(json!({"state": "Paused"})), API_TIMEOUT)?;
