@@ -72,6 +72,7 @@ pub struct Paused {
 impl Paused {
     /// Restores `template` into `idle`, lets it settle and pauses it.
     pub fn load(idle: Idle, template: Arc<Template>) -> Result<Paused> {
+        crate::compat::check(&template, idle.fc.pid())?;
         let pager = Pager::start(&idle.fc.sockets.uffd, template.clone(), None)?;
         // Off the request path, so it can afford to learn what a load touches.
         pager.learn_load_set();

@@ -190,6 +190,15 @@ VM that is busy, paused or suspended.
 
 #### Checkpoint format (versions 2 and 3)
 
+A template records the host it was built on: CPU vendor, family and model,
+the CPU feature bits KVM offered its guest, the XSAVE layout, and the
+Firecracker version and build. Checkpoints and migrations pin their template
+by content id and so carry its guest CPU. Every snapshot load (run, restore,
+resume, and a migration target before its source pauses) refuses a host with
+a different CPU model or Firecracker, a missing feature bit or another XSAVE
+layout, naming the mismatch. Extra feature bits are fine. Templates built
+before this record must be rebuilt.
+
 A checkpoint is a directory that is written in full or not at all. The
 destination's directory may belong to an unprivileged user while the daemon
 runs as root, so nothing follows a path that user can change:

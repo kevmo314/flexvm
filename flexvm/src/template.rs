@@ -51,6 +51,8 @@ pub const PLUG_MIB: u64 = 4096;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Meta {
+    #[serde(default)]
+    pub compatibility: Option<crate::compat::Compat>,
     pub vcpus: u32,
     pub mem_mib: u64,
     pub max_mib: u64,
@@ -73,7 +75,7 @@ pub const FORMAT_VERSION: u64 = 2;
 /// What a component file looked like when it was last hashed. ctime catches
 /// rewrites that restore mtime; a rename or copy changes the inode.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct Stamp {
+pub(crate) struct Stamp {
     size: u64,
     mtime: i64,
     mtime_nsec: i64,
@@ -84,7 +86,7 @@ struct Stamp {
 }
 
 impl Stamp {
-    fn of(m: &std::fs::Metadata) -> Self {
+    pub(crate) fn of(m: &std::fs::Metadata) -> Self {
         Self {
             size: m.len(),
             mtime: m.mtime(),
@@ -98,9 +100,9 @@ impl Stamp {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Component {
-    hash: String,
-    metadata: Stamp,
+pub(crate) struct Component {
+    pub(crate) hash: String,
+    pub(crate) metadata: Stamp,
 }
 
 /// FNV-1a over 64-bit words, folded so high bits feed back down. An identity
@@ -163,7 +165,7 @@ fn content_hash(file: &File) -> Result<String> {
 }
 
 /// Hashes the file at `path`, failing if it changes underneath.
-fn hash_file(path: &Path) -> Result<Component> {
+pub(crate) fn hash_file(path: &Path) -> Result<Component> {
     let file = File::open(path).map_err(|e| format!("template component {}: {e}", path.display()))?;
     let metadata = Stamp::of(&file.metadata()?);
     let hash = content_hash(&file)?;
@@ -743,11 +745,13 @@ fn build(
         "/snapshot/create",
         json!({"snapshot_type": "Full", "snapshot_path": dir.join("vmstate"), "mem_file_path": dir.join("mem")}),
     )?;
+    let compatibility = crate::compat::local(fc.pid())?;
     drop(fc);
     let punched = sparsify(&dir.join("mem"))?;
     let _ = std::fs::remove_dir_all(&run);
 
     let mut meta = Meta {
+        compatibility: Some(compatibility),
         vcpus,
         mem_mib,
         max_mib: mem_mib + hotplug,
@@ -816,6 +820,7 @@ mod tests {
                 templates: dir.clone(),
             };
             let mut meta = Meta {
+                compatibility: None,
                 vcpus: 2, mem_mib: 256, max_mib: 1024, plugged_mib: 0,
                 kernel: paths.kernel.clone(), rootfs: paths.rootfs.clone(),
                 id: String::new(), components: BTreeMap::new(), image: None,
