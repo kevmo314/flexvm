@@ -149,10 +149,6 @@ pub struct Source {
     pub mig: u64,
 }
 
-/// Pages a migration source sends along with the vmstate, with their
-/// contents (one `PAGE_SIZE` slice per page, in order).
-pub type Preload = (Vec<u64>, Vec<u8>);
-
 /// Where a VM's REMOTE pages come from.
 pub enum Origin {
     /// The paused source of an incoming migration.
@@ -451,8 +447,6 @@ pub struct Pager {
     /// Firecracker connects before the page states are known (a prepared
     /// load, see `expect_seed`): the handshake waits for `seed`.
     awaiting_seed: AtomicBool,
-    /// REMOTE pages to install as soon as Firecracker connects.
-    preload: Mutex<Option<Preload>>,
     /// Learning the template's load set (`learn_load_set`): faults go into
     /// it until `loaded`, and the working-set prefetch waits until then.
     learning: AtomicBool,
@@ -516,7 +510,6 @@ impl Pager {
             initial: Mutex::new(initial),
             seeded: Condvar::new(),
             awaiting_seed: AtomicBool::new(false),
-            preload: Mutex::new(None),
             learning: AtomicBool::new(false),
             prefetch: Mutex::new((false, false)),
         });
@@ -552,19 +545,13 @@ impl Pager {
         }
     }
 
-    /// Sets the initial page states, where their REMOTE pages come from and
-    /// pages to install right away (contents the source sent along), for a
-    /// pager started without them. Only before Firecracker loads a snapshot.
-    pub fn seed(&self, runs: Runs, origin: Origin, preload: Option<Preload>) -> Result<()> {
+    /// Sets the initial page states and where their REMOTE pages come from,
+    /// for a pager started without them. Only before Firecracker loads a
+    /// snapshot.
+    pub fn seed(&self, runs: Runs, origin: Origin) -> Result<()> {
         if self.pages.get().is_some() || self.initial.lock().unwrap().is_some() {
             bail!("pager already seeded");
         }
-        if let Some((pages, data)) = &preload {
-            if data.len() != pages.len() * PAGE_SIZE {
-                bail!("preload of {} pages has {} bytes", pages.len(), data.len());
-            }
-        }
-        *self.preload.lock().unwrap() = preload;
         *self.initial.lock().unwrap() = Some((runs, origin));
         self.seeded.notify_all();
         Ok(())
@@ -676,21 +663,6 @@ impl Pager {
         let _ = self.mappings.set(mappings);
         let _ = self.pages.set(pages);
         let _ = self.uffd.set(fd);
-        // Pages the source sent along, which the load would otherwise fault
-        // on one round trip at a time. Firecracker's faults wait meanwhile.
-        if let Some((list, data)) = self.preload.lock().unwrap().take() {
-            let pages = self.pages();
-            for (i, &page) in list.iter().enumerate() {
-                let page = page as usize;
-                if page >= pages.len() || pages.claim(page, 1, REMOTE, |_| true) == 0 {
-                    continue;
-                }
-                let src = &data[i * PAGE_SIZE..(i + 1) * PAGE_SIZE];
-                let (resolved, res) = pages.install(page, 1, REMOTE, None, |p, c| self.populate(p, c, Some(src)));
-                self.pulled(resolved);
-                res?;
-            }
-        }
         if self.remote_left() == 0 && self.pull_started.get().is_some() {
             let _ = self.pull_finished.set(Instant::now());
         }
@@ -735,6 +707,37 @@ impl Pager {
             }
         }
         runs
+    }
+
+    /// Installs REMOTE pages whose contents came along with the vmstate (one
+    /// `PAGE_SIZE` slice of `data` per page of `list`), once Firecracker has
+    /// connected (and the page states are set): the load would otherwise
+    /// fault on them one round trip at a time. Runs alongside the load; a
+    /// page a fault or puller claimed first is skipped. Returns how many it
+    /// installed.
+    pub fn preload(&self, list: &[u64], data: &[u8]) -> Result<usize> {
+        if data.len() != list.len() * PAGE_SIZE {
+            bail!("preload of {} pages has {} bytes", list.len(), data.len());
+        }
+        let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+        while self.wait_ready(Duration::from_millis(10)).is_err() {
+            if self.stop.load(Ordering::SeqCst) || Instant::now() >= deadline {
+                bail!("the pager stopped or Firecracker never connected");
+            }
+        }
+        let pages = self.pages();
+        let mut installed = 0;
+        for (&page, src) in list.iter().zip(data.chunks_exact(PAGE_SIZE)) {
+            let page = page as usize;
+            if page >= pages.len() || pages.claim(page, 1, REMOTE, |_| true) == 0 {
+                continue;
+            }
+            let (resolved, res) = pages.install(page, 1, REMOTE, None, |p, c| self.populate(p, c, Some(src)));
+            self.pulled(resolved);
+            res?;
+            installed += resolved;
+        }
+        Ok(installed)
     }
 
     /// Blocks until Firecracker has handed over its userfaultfd.

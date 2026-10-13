@@ -149,7 +149,7 @@ impl Vm {
     ) -> Result<(Arc<Vm>, Duration)> {
         let prepared = Vm::prepare(idle, name, template, phases)?;
         if let Some((runs, origin)) = remote {
-            prepared.pager.seed(runs, origin, None)?;
+            prepared.pager.seed(runs, origin)?;
         }
         prepared.load(name, vmstate, ip, load, phases)
     }

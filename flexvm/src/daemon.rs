@@ -1419,24 +1419,36 @@ impl Daemon {
         // The vmstate follows once the source has paused; a source that
         // stalls must not hold a counted operation (and so shutdown) forever.
         r.get_ref().set_read_timeout(Some(INCOMING_READ_TIMEOUT))?;
-        let reply = (|| -> Result<Value> {
+        let pager = prepared.vm.pager.clone();
+        // The migration connection, for the held packets that follow our answer.
+        let conn = r.get_ref().try_clone()?;
+        let reply = thread::scope(|scope| -> Result<Value> {
             let hdr = recv_json(&mut r)?.ok_or("source hung up before sending the vmstate")?;
             // The source has paused: the downtime here starts now.
             let mut t = Phases::new();
             let runs: Runs = serde_json::from_value(hdr["runs"].clone())?;
             let state = read_vec(&mut r, hdr["vmstate_len"].as_u64().ok_or("missing vmstate_len")?, MAX_VMSTATE)?;
+            t.mark("recv_state");
             let pages: Vec<u64> = serde_json::from_value(hdr["preload"].clone()).unwrap_or_default();
             if pages.len() > MAX_PRELOAD {
                 bail!("{} pages to preload, more than {MAX_PRELOAD}", pages.len());
             }
-            let data = read_vec(&mut r, (pages.len() * crate::util::PAGE_SIZE) as u64, u64::MAX)?;
-            t.mark("recv_state");
+            // The pages the load touches follow the vmstate: received and
+            // installed while Firecracker parses the state. One missing
+            // when the load wants it is fetched like any other.
+            let r = &mut r;
+            scope.spawn(move || {
+                let len = (pages.len() * crate::util::PAGE_SIZE) as u64;
+                if let Err(e) = read_vec(r, len, u64::MAX).and_then(|data| pager.preload(&pages, &data)) {
+                    eprintln!("migration {}: preloading pages: {e}", req["mig"]);
+                }
+            });
             let paused = hdr["paused"].as_bool().unwrap_or(false);
-            let (v, vm) = self.finish_in(prepared, runs, &state, Some((pages, data)), paused, &mut t)?;
+            let (v, vm) = self.finish_in(prepared, runs, &state, paused, &mut t)?;
             // Before the answer: the held packets follow it on this connection.
-            self.after_arrival(req, &vm, r.get_ref());
+            self.after_arrival(req, &vm, &conn);
             Ok(v)
-        })();
+        });
         let reply = match reply {
             // Committed, but the source never hears about it. (Shut down,
             // as the announcing thread holds a clone of the connection.)
@@ -1457,7 +1469,7 @@ impl Daemon {
         let state = read_vec(r, req["vmstate_len"].as_u64().ok_or("missing vmstate_len")?, MAX_VMSTATE)?;
         t.mark("recv_state");
         let prepared = self.prepare_in(req, false, &mut t)?;
-        let (v, vm) = self.finish_in(prepared, runs, &state, None, req["paused"].as_bool().unwrap_or(false), &mut t)?;
+        let (v, vm) = self.finish_in(prepared, runs, &state, req["paused"].as_bool().unwrap_or(false), &mut t)?;
         self.after_arrival(req, &vm, r.get_ref());
         Ok(v)
     }
@@ -1518,7 +1530,6 @@ impl Daemon {
         p: PreparedIn<'_>,
         runs: Runs,
         state: &[u8],
-        preload: Option<crate::uffd::Preload>,
         paused: bool,
         t: &mut Phases,
     ) -> Result<(Value, Arc<Vm>)> {
@@ -1530,7 +1541,7 @@ impl Daemon {
             }
             migs.insert(mig, Incoming::Pending);
         }
-        let res = self.take_in(p, runs, state, preload, paused, t);
+        let res = self.take_in(p, runs, state, paused, t);
         // A failed restore has killed the VM, so the source may resume it.
         let outcome = if res.is_ok() { Incoming::Committed } else { Incoming::Aborted };
         self.migrations.lock().unwrap().insert(mig, outcome);
@@ -1562,7 +1573,6 @@ impl Daemon {
         p: PreparedIn<'_>,
         runs: Runs,
         state: &[u8],
-        preload: Option<crate::uffd::Preload>,
         paused: bool,
         t: &mut Phases,
     ) -> Result<(Value, Arc<Vm>)> {
@@ -1576,7 +1586,7 @@ impl Daemon {
             let page = r.0;
             thread::spawn(move || crate::uffd::probe(&source, page))
         });
-        prepared.pager.seed(runs, Origin::Peer(source.clone()), preload)?;
+        prepared.pager.seed(runs, Origin::Peer(source.clone()))?;
         let vmstate = prepared.dir().join("vmstate.in");
         std::fs::write(&vmstate, state)?;
         t.mark("write_state");
