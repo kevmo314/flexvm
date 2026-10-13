@@ -563,10 +563,10 @@ impl Daemon {
     fn exec(&self, name: &str, req: &Value, mut w: TcpStream) -> Result<()> {
         let cmd = req["cmd"].as_str().unwrap_or("");
         let guest = self.vm(name).and_then(|vm| {
-            let (g, id) = vm.exec(|uds| match req["session"].as_str() {
-                Some(id) => guest::session(uds, req["action"].as_str().unwrap_or("start"), id,
+            let (g, id) = vm.exec(|s| match req["session"].as_str() {
+                Some(id) => guest::session(s, req["action"].as_str().unwrap_or("start"), id,
                     req["offset"].as_u64().unwrap_or(0), cmd, guest::TIMEOUT),
-                None => guest::start_exec(uds, cmd, guest::TIMEOUT),
+                None => guest::start_exec(s, cmd, guest::TIMEOUT),
             })?;
             Ok((vm, g, id))
         });
@@ -599,7 +599,7 @@ impl Daemon {
         let guest = self.vm(name).and_then(|vm| {
             // Registered like an exec session, so a checkpoint closes it.
             let (offset, follow) = (req["offset"].as_u64().unwrap_or(0), req["follow"] == json!(true));
-            let (g, id) = vm.exec(|uds| guest::start_logs(uds, offset, follow, guest::TIMEOUT))?;
+            let (g, id) = vm.exec(|s| guest::start_logs(s, offset, follow, guest::TIMEOUT))?;
             Ok((vm, g, id))
         });
         match guest {
@@ -881,7 +881,8 @@ impl Daemon {
             t.mark("write_state");
             let paused = req["paused"].as_bool().unwrap_or(false);
             let origin = Some((runs, Origin::Peer(source.clone())));
-            Vm::restore_from(idle, name, tpl, &vmstate, origin, ip, !paused, t)
+            let load = if paused { crate::vm::Load::Paused } else { crate::vm::Load::Running };
+            Vm::restore_from(idle, name, tpl, &vmstate, origin, ip, load, t)
         })();
         let (vm, restore) = restored.inspect_err(|_| {
             self.ips.lock().unwrap().remove(&ip);

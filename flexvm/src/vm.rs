@@ -16,9 +16,17 @@ use crate::template::{Template, BALLOON_STATS_S};
 /// How long resuming a paused migration target waits for its memory to arrive.
 const PULL_WAIT: Duration = Duration::from_secs(30);
 
-/// Test fault `restore_no_hold`: leave VMs loaded paused out of Firecracker's
-/// pause loop (devices keep running), to show what the hold prevents.
-pub static SKIP_HOLD: AtomicBool = AtomicBool::new(false);
+/// How a restored VM starts out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Load {
+    Running,
+    /// Paused, devices included (held in Firecracker's pause loop).
+    Paused,
+    /// Test fault `restore_no_hold` only: vCPUs stopped but devices running,
+    /// as Firecracker leaves a VM loaded with `resume_vm: false`.
+    PausedUnheld,
+}
+
 use crate::uffd::{Origin, Pager, Runs, Source};
 use crate::util::{Phases, Result, PAGE_SIZE};
 
@@ -85,6 +93,9 @@ pub struct Vm {
     was_paused: AtomicBool,
     /// A background clock check is queued (see `Daemon::sync_clock_later`).
     pub clock_pending: AtomicBool,
+    /// Restored held paused at a new address: the guest still has this old
+    /// one, and gets the new one on its first resume.
+    pub pending_net: Mutex<Option<Ipv4Addr>>,
     /// The pager's discard count just before the last snapshot: a discard
     /// after it means the saved state and memory may disagree.
     pub snapshot_discards: AtomicU64,
@@ -104,10 +115,10 @@ impl Vm {
         phases: &mut Phases,
     ) -> Result<(Arc<Vm>, Duration)> {
         let origin = remote.map(|(runs, source)| (runs, Origin::Peer(source)));
-        Vm::restore_from(idle, name, template, vmstate, origin, ip, true, phases)
+        Vm::restore_from(idle, name, template, vmstate, origin, ip, Load::Running, phases)
     }
 
-    /// `restore`, from any page origin, and leaving the VM paused unless `resume`.
+    /// `restore`, from any page origin, starting the VM as `load` says.
     #[allow(clippy::too_many_arguments)]
     pub fn restore_from(
         idle: Idle,
@@ -116,7 +127,7 @@ impl Vm {
         vmstate: &Path,
         remote: Option<(Runs, Origin)>,
         ip: Ipv4Addr,
-        resume: bool,
+        load: Load,
         phases: &mut Phases,
     ) -> Result<(Arc<Vm>, Duration)> {
         let Idle { fc, dir, cgroup, tap } = idle;
@@ -148,12 +159,12 @@ impl Vm {
                     "vsock_override": {"uds_path": dir.join("v.sock")},
                     "network_overrides": [{"iface_id": "eth0", "host_dev_name": tap}],
                     "clock_realtime": true,
-                    "resume_vm": resume,
+                    "resume_vm": load == Load::Running,
                 }),
             )?;
             // Includes Firecracker's resume: the load request sets resume_vm.
             let took = phases.mark("snapshot_load");
-            if !resume && !SKIP_HOLD.load(Ordering::SeqCst) {
+            if load == Load::Paused {
                 // Loaded paused, Firecracker stops only the vCPUs and goes on
                 // emulating devices; an API pause enters the loop that holds
                 // device emulation too, until the resume.
@@ -184,7 +195,7 @@ impl Vm {
             ip,
             tap,
             pager,
-            state: Mutex::new(if resume { State::Running } else { State::Paused }),
+            state: Mutex::new(if load == Load::Running { State::Running } else { State::Paused }),
             last_resize: Mutex::new(Instant::now()),
             starved: AtomicBool::new(false),
             released: OnceLock::new(),
@@ -195,6 +206,7 @@ impl Vm {
             cgroup,
             was_paused: AtomicBool::new(false),
             clock_pending: AtomicBool::new(false),
+            pending_net: Mutex::new(None),
             snapshot_discards: AtomicU64::new(0),
         });
         Ok((vm, took))
@@ -290,6 +302,9 @@ impl Vm {
         }
         if self.pager.remote_left() > 0 {
             bail!("vm {} is still pulling its memory from its previous host or checkpoint", self.name);
+        }
+        if self.pending_net.lock().unwrap().is_some() {
+            bail!("vm {} has not taken its new address yet; resume it first", self.name);
         }
         self.was_paused.store(*st == State::Paused, Ordering::SeqCst);
         *st = to;
@@ -467,7 +482,15 @@ impl Vm {
         let s = crate::util::connect_unix(&self.vsock(), left)?;
         let raw = s.try_clone()?;
         let mut g = BufReader::new(Deadline { s, at: deadline });
-        let started = (|| -> Result<u64> {
+        // Registered (and the state rechecked) before the guest sees a byte.
+        let id = match self.track(&raw, deadline) {
+            Ok(id) => id,
+            Err(e) => {
+                let _ = raw.shutdown(Shutdown::Both);
+                return Err(e);
+            }
+        };
+        let started = (|| -> Result<()> {
             let req = format!("CONNECT {}\nEXEC {}\n{cmd}", crate::guest::PORT, cmd.len());
             g.get_mut().write_all(req.as_bytes())?;
             let mut ok = String::new();
@@ -475,15 +498,13 @@ impl Vm {
             if !ok.starts_with("OK") {
                 bail!("vsock connect refused: {ok:?}");
             }
-            self.track(&raw, deadline)
+            Ok(())
         })();
-        let id = match started {
-            Ok(id) => id,
-            Err(e) => {
-                let _ = raw.shutdown(Shutdown::Both);
-                return Err(e);
-            }
-        };
+        if let Err(e) = started {
+            let _ = raw.shutdown(Shutdown::Both);
+            self.untrack_by(id, deadline);
+            return Err(e);
+        }
         let mut out = Vec::new();
         let res: Result<i32> = loop {
             // read_frame bounds the frame size; Deadline bounds every read.
@@ -549,18 +570,29 @@ impl Vm {
             eprintln!("vm {}: balloon statistics stay off: {e}", self.name);
         }
     }
-    /// Opens an exec session with `start` and registers the session so a
-    /// checkpoint can close it. Fails unless the VM is running here. No lock
-    /// is held while `start` talks to the guest (it has its own deadline,
-    /// `guest::TIMEOUT`); the session is untimed afterwards.
-    pub fn exec(&self, start: impl FnOnce(&Path) -> Result<BufReader<UnixStream>>) -> Result<(BufReader<UnixStream>, u64)> {
+
+    /// Opens an exec session: connects to the VM's vsock socket, registers
+    /// the connection (so a checkpoint can close it) and checks the VM still
+    /// runs here, and only then lets `start` send anything to the guest. No
+    /// lock is held while `start` talks to the guest (it has its own
+    /// deadline, `guest::TIMEOUT`); the session is untimed afterwards.
+    pub fn exec(&self, start: impl FnOnce(UnixStream) -> Result<BufReader<UnixStream>>) -> Result<(BufReader<UnixStream>, u64)> {
         if self.state() != State::Running {
             bail!("vm {} is not running here", self.name);
         }
-        let g = start(&self.vsock())?;
-        let id = self.track(g.get_ref(), Instant::now() + crate::guest::TIMEOUT)?;
-        crate::guest::untimed(&g)?;
-        Ok((g, id))
+        let s = crate::util::connect_unix(&self.vsock(), crate::guest::TIMEOUT)?;
+        let id = self.track(&s, Instant::now() + crate::guest::TIMEOUT)?;
+        let started = start(s).and_then(|g| {
+            crate::guest::untimed(&g)?;
+            Ok(g)
+        });
+        match started {
+            Ok(g) => Ok((g, id)),
+            Err(e) => {
+                self.untrack_exec(id);
+                Err(e)
+            }
+        }
     }
 
     /// Sets the guest's address, unless the VM is no longer running here.

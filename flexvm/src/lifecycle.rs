@@ -110,6 +110,17 @@ impl Daemon {
             let start = Instant::now();
             vm.unpause()?;
             let took = start.elapsed();
+            // A held restore at a new address: the guest gets it now, still
+            // under the reservation.
+            let old = vm.pending_net.lock().unwrap().take();
+            if let Some(old) = old {
+                if let Err(e) = vm.guest_net(vm.ip, self.cfg.dns.as_deref()) {
+                    *vm.pending_net.lock().unwrap() = Some(old);
+                    bail!("vm {name} resumed, but setting its address {} failed: {e}", vm.ip);
+                }
+                let deadline = Instant::now() + crate::guest::TIMEOUT;
+                let _ = vm.sh(&format!("ip -4 addr del {old}/32 dev eth0 2>/dev/null"), deadline);
+            }
             drop(busy);
             // Off the critical path: the guest's clock keeps counting while
             // paused (its TSC runs on), so this rarely needs to change it.
@@ -277,10 +288,13 @@ impl Daemon {
             let vmstate = idle.dir.join("vmstate.in");
             std::fs::write(&vmstate, &ck.vmstate)?;
             let origin = Some((ck.runs, Origin::File(ck.file)));
-            crate::vm::SKIP_HOLD.store(hold && self.fault("restore_no_hold"), Ordering::SeqCst);
+            let load = match hold && self.fault("restore_no_hold") {
+                true => crate::vm::Load::PausedUnheld,
+                false => crate::vm::Load::Paused,
+            };
             // Loaded paused: everything up to the resume below can fail
             // without the VM having run.
-            Vm::restore_from(idle, name, tpl, &vmstate, origin, ip, false, t)
+            Vm::restore_from(idle, name, tpl, &vmstate, origin, ip, load, t)
         })()
         .map_err(Restore::NotRun)?;
         let dir = ck.dir;
@@ -301,7 +315,11 @@ impl Daemon {
         }
         if hold {
             // Held paused, devices frozen too (see `Vm::restore_from`), until
-            // `resume`; its memory is still paged in meanwhile.
+            // `resume`; its memory is still paged in meanwhile. A new address
+            // reaches the guest on that resume.
+            if ip != m.ip {
+                *vm.pending_net.lock().unwrap() = Some(m.ip);
+            }
             self.vms.lock().unwrap().insert(name.into(), vm.clone());
             self.announce(ip);
             return Ok(json!({"name": name, "ip": ip.to_string(), "state": "paused", "restore_ms": ms(restore), "timings_ms": t.json()}));
