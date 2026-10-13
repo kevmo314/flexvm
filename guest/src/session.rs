@@ -418,7 +418,7 @@ fn attach(output: &Session, offset: u64, conn: Option<File>) -> Attached {
     ring.attachments += 1;
     let id = ring.attachments;
     let previous = ring.attached.replace(Attachment { id, conn });
-    ring.sent = offset.min(ring.end);
+    ring.sent = offset.clamp(ring.start, ring.end);
     drop(ring);
     output.1.notify_all();
     // Unblocks its handler even mid-write to a stalled client; it then exits.
@@ -519,7 +519,7 @@ fn drain(w: &mut impl Write, output: &Session, mut offset: u64, me: u64) -> io::
                 offset += (data.len() - 8) as u64;
                 let mut ring = output.0.lock().unwrap();
                 if ring.attached.as_ref().is_some_and(|a| a.id == me) {
-                    ring.sent = offset;
+                    ring.sent = offset.clamp(ring.start, ring.end);
                 }
                 drop(ring);
                 output.1.notify_all();
@@ -546,6 +546,21 @@ mod tests {
 
     fn statuses() -> Statuses {
         Arc::new((Mutex::new(HashMap::new()), Condvar::new()))
+    }
+
+    #[test]
+    fn attachment_cursor_is_clamped_to_retained_output() {
+        let mut table = Table::default();
+        let output = finished(&mut table, "clamp", None);
+        {
+            let mut ring = output.0.lock().unwrap();
+            ring.start = 100;
+            ring.end = 200;
+        }
+        for (offset, expected) in [(0, 100), (150, 150), (300, 200)] {
+            attach(&output, offset, None);
+            assert_eq!(output.0.lock().unwrap().sent, expected);
+        }
     }
 
     #[test]

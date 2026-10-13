@@ -224,7 +224,7 @@ pub fn run(mut cfg: Config) -> Result<()> {
     let mut run_lock = lock_run_dir(&cfg.run_dir)?;
     // The state dir is this daemon's alone too (another daemon's startup
     // would clear its trees), and must survive a power loss.
-    crate::util::create_dir_durably(&cfg.state_dir.join("suspended"))
+    crate::util::create_private_dir_durably(&cfg.state_dir.join("suspended"))
         .map_err(|e| format!("state dir {}: {e}", cfg.state_dir.display()))?;
     cfg.state_dir = cfg.state_dir.canonicalize()?;
     run_lock.extend(lock_run_dir(&cfg.state_dir)?);
@@ -1544,7 +1544,7 @@ impl Daemon {
         let mut br = ByDeadline { r: &mut r, at: deadline };
         let pager = prepared.vm.pager.clone();
         let res = thread::scope(|scope| -> Result<(Value, Arc<Vm>)> {
-            let hdr = recv_json(&mut (&mut br).take(MAX_HEADER))?.ok_or("source hung up before sending the vmstate")?;
+            let hdr = crate::util::recv_json_max(&mut br, MAX_HEADER)?.ok_or("source hung up before sending the vmstate")?;
             // The source has paused: the downtime here starts now.
             let mut t = Phases::new();
             let runs: Runs = serde_json::from_value(hdr["runs"].clone())?;

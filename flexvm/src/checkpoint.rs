@@ -143,6 +143,14 @@ fn cname(name: &str) -> CString {
     CString::new(name).expect("no NUL in file names")
 }
 
+fn publish_permissions(files: &[RawFd], dir: RawFd, owner: &libc::stat) -> io::Result<()> {
+    for (fd, mode) in files.iter().copied().map(|fd| (fd, 0o600)).chain(std::iter::once((dir, 0o700))) {
+        check(unsafe { libc::fchown(fd, owner.st_uid, owner.st_gid) })?;
+        check(unsafe { libc::fchmod(fd, mode) })?;
+    }
+    Ok(())
+}
+
 fn check(rc: libc::c_int) -> io::Result<()> {
     if rc < 0 {
         return Err(io::Error::last_os_error());
@@ -351,10 +359,7 @@ impl Staging {
         // The checkpoint belongs to whoever owns the directory it was put in
         // (the daemon runs as root), so they can move and delete it.
         let owner = fstat(self.parent.as_raw_fd())?;
-        for (fd, mode) in [(pages.file.as_raw_fd(), 0o644), (pagemap.as_raw_fd(), 0o644), (vmstate_file.as_raw_fd(), 0o644), (mf.as_raw_fd(), 0o644), (self.ck.as_raw_fd(), 0o755)] {
-            check(unsafe { libc::fchown(fd, owner.st_uid, owner.st_gid) })?;
-            check(unsafe { libc::fchmod(fd, mode) })?;
-        }
+        publish_permissions(&[pages.file.as_raw_fd(), pagemap.as_raw_fd(), vmstate_file.as_raw_fd(), mf.as_raw_fd()], self.ck.as_raw_fd(), &owner)?;
         fsync_fd(self.ck.as_raw_fd())?;
         // Last check before it becomes visible.
         still_valid()?;
@@ -1324,6 +1329,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+
+    #[test]
+    fn published_files_and_directory_are_private_and_owned_by_destination() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = std::env::temp_dir().join(format!("flexvm-publish-mode-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let parent = File::open(&dir).unwrap();
+        let owner = fstat(parent.as_raw_fd()).unwrap();
+        let files: Vec<_> = ["pages", "pagemap", "vmstate", "manifest.json"].iter()
+            .map(|name| File::create(dir.join(name)).unwrap()).collect();
+        let fds: Vec<_> = files.iter().map(AsRawFd::as_raw_fd).collect();
+        publish_permissions(&fds, parent.as_raw_fd(), &owner).unwrap();
+        for file in &files {
+            let meta = file.metadata().unwrap();
+            assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+            assert_eq!((meta.uid(), meta.gid()), (owner.st_uid, owner.st_gid));
+        }
+        assert_eq!(parent.metadata().unwrap().permissions().mode() & 0o777, 0o700);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     /// Builds runs of `state` for the pages `ps` (ascending).
     fn runs_of(ps: &[(usize, u8)]) -> Runs {

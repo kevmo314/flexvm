@@ -8,7 +8,8 @@
 
 use std::io;
 use std::net::Ipv4Addr;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 pub const GATEWAY: Ipv4Addr = Ipv4Addr::new(169, 254, 1, 1);
 pub const GATEWAY_MAC: [u8; 6] = [0x06, 0x00, 0xa9, 0xfe, 0x01, 0x01];
@@ -128,12 +129,18 @@ fn pin_gateway(s: &Sock) -> io::Result<()> {
 /// leaves the gateway route and ARP entry alone, where SIOCSIFADDR plus
 /// SIOCSIFNETMASK flush them and need them put back.
 pub fn configure(ip: Ipv4Addr, dns: Option<&str>) -> io::Result<()> {
+    // One receiver owns the shared socket until its matching ACK arrives.
+    static REQUEST: Mutex<()> = Mutex::new(());
+    static SEQUENCE: AtomicU32 = AtomicU32::new(1);
+    let _request = REQUEST.lock().unwrap();
+    let seq = SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let (fd, ifindex) = *NETLINK.get().ok_or_else(|| io::Error::other("no netlink socket"))?;
     let mut msg = [0u8; 40];
     msg[..4].copy_from_slice(&40u32.to_ne_bytes());
     msg[4..6].copy_from_slice(&libc::RTM_NEWADDR.to_ne_bytes());
     let flags = libc::NLM_F_REQUEST | libc::NLM_F_ACK | libc::NLM_F_CREATE | libc::NLM_F_REPLACE;
     msg[6..8].copy_from_slice(&(flags as u16).to_ne_bytes());
+    msg[8..12].copy_from_slice(&seq.to_ne_bytes());
     // struct ifaddrmsg: family, prefixlen, flags, scope, index.
     msg[16..20].copy_from_slice(&[libc::AF_INET as u8, 32, 0, libc::RT_SCOPE_UNIVERSE]);
     msg[20..24].copy_from_slice(&ifindex.to_ne_bytes());
@@ -143,18 +150,74 @@ pub fn configure(ip: Ipv4Addr, dns: Option<&str>) -> io::Result<()> {
         a[2..4].copy_from_slice(&kind.to_ne_bytes());
         a[4..].copy_from_slice(&ip.octets());
     }
-    let mut ack = [0u8; 64];
-    if unsafe { libc::send(fd, msg.as_ptr().cast(), msg.len(), 0) } < 0
-        || unsafe { libc::recv(fd, ack.as_mut_ptr().cast(), ack.len(), 0) } < 20
-    {
+    // An error ACK carries the request back (and may carry extended attributes).
+    let mut ack = [0u8; 1024];
+    if unsafe { libc::send(fd, msg.as_ptr().cast(), msg.len(), 0) } < 0 {
         return Err(io::Error::last_os_error());
     }
-    let code = i32::from_ne_bytes(ack[16..20].try_into().unwrap());
-    if u16::from_ne_bytes([ack[4], ack[5]]) == libc::NLMSG_ERROR as u16 && code != 0 {
-        return Err(io::Error::from_raw_os_error(-code));
+    loop {
+        let n = unsafe { libc::recv(fd, ack.as_mut_ptr().cast(), ack.len(), 0) };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
+        if let Some(result) = matching_ack(&ack[..n as usize], seq) {
+            result?;
+            break;
+        }
     }
     if let Some(dns) = dns {
         std::fs::write("/etc/resolv.conf", format!("nameserver {dns}\n"))?;
     }
     Ok(())
+}
+
+// A datagram may contain several aligned netlink messages.
+fn matching_ack(mut data: &[u8], seq: u32) -> Option<io::Result<()>> {
+    while data.len() >= 16 {
+        let len = u32::from_ne_bytes(data[..4].try_into().unwrap()) as usize;
+        if len < 16 || len > data.len() {
+            return Some(Err(io::Error::new(io::ErrorKind::InvalidData, "malformed netlink ACK")));
+        }
+        if u32::from_ne_bytes(data[8..12].try_into().unwrap()) == seq
+            && u16::from_ne_bytes(data[4..6].try_into().unwrap()) == libc::NLMSG_ERROR as u16
+        {
+            if len < 20 {
+                return Some(Err(io::Error::new(io::ErrorKind::InvalidData, "short netlink ACK")));
+            }
+            let code = i32::from_ne_bytes(data[16..20].try_into().unwrap());
+            return Some(if code == 0 { Ok(()) } else { Err(io::Error::from_raw_os_error(code.saturating_neg())) });
+        }
+        let aligned = (len + 3) & !3;
+        data = data.get(aligned..).unwrap_or_default();
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ack(seq: u32, code: i32) -> Vec<u8> {
+        let mut data = vec![0; 20];
+        data[..4].copy_from_slice(&20u32.to_ne_bytes());
+        data[4..6].copy_from_slice(&(libc::NLMSG_ERROR as u16).to_ne_bytes());
+        data[8..12].copy_from_slice(&seq.to_ne_bytes());
+        data[16..20].copy_from_slice(&code.to_ne_bytes());
+        data
+    }
+
+    #[test]
+    fn ack_matches_sequence_and_reports_errors() {
+        assert!(matching_ack(&ack(1, -libc::EPERM), 2).is_none());
+        let data = [ack(1, -libc::EPERM), ack(2, 0)].concat();
+        matching_ack(&data, 2).unwrap().unwrap();
+        assert_eq!(matching_ack(&ack(2, -libc::EPERM), 2).unwrap().unwrap_err().raw_os_error(), Some(libc::EPERM));
+        let mut short = ack(2, 0);
+        short[..4].copy_from_slice(&16u32.to_ne_bytes());
+        assert!(matching_ack(&short[..16], 2).unwrap().is_err());
+    }
 }

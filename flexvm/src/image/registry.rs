@@ -171,11 +171,13 @@ impl Registry {
     /// Cached blobs are checked again where they are used.
     pub fn blob(&mut self, digest: &str, size: u64, blobs: &Path) -> Result<PathBuf> {
         let path = blob_path(blobs, digest)?;
+        let dir = path.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&dir)?;
+        // Best effort: leftovers never stand in the way of a pull.
+        sweep_parts(&dir);
         if path.exists() {
             return Ok(path);
         }
-        let dir = path.parent().unwrap().to_path_buf();
-        std::fs::create_dir_all(&dir)?;
         let tmp = path.with_extension(format!("part{}", std::process::id()));
         let resp = self.get(&format!("blobs/{digest}"), "*/*")?;
         let res = (|| {
@@ -212,6 +214,24 @@ impl Registry {
             let _ = std::fs::remove_file(&tmp);
         }
         res
+    }
+}
+
+/// Removes abandoned downloads while preserving files owned by live processes.
+fn sweep_parts(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some((hex, pid)) = name.rsplit_once(".part") else { continue };
+        if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+        let Ok(pid) = pid.parse::<libc::pid_t>() else { continue };
+        if pid <= 0 || unsafe { libc::kill(pid, 0) } == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+            continue;
+        }
+        let _ = std::fs::remove_file(entry.path());
     }
 }
 
@@ -284,6 +304,24 @@ fn user_home(user: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sweep_removes_only_dead_downloads() {
+        let dir = std::env::temp_dir().join(format!("flexvm-parts-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let hex = "a".repeat(64);
+        let stale = dir.join(format!("{hex}.part2147483647"));
+        let live = dir.join(format!("{hex}.part{}", std::process::id()));
+        let other = dir.join("unrelated.part2147483647");
+        let blob = dir.join(&hex);
+        for path in [&stale, &live, &other, &blob] {
+            std::fs::write(path, "data").unwrap();
+        }
+        sweep_parts(&dir);
+        assert!(!stale.exists());
+        assert!(live.exists() && other.exists() && blob.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn credentials_only_go_to_trusted_realms() {

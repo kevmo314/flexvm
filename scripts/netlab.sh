@@ -41,8 +41,17 @@ daemons() {
 }
 
 stop() {
-  pkill -x flexvm || true
-  pkill -x firecracker || true
+  # Restrict process cleanup to the lab's network namespaces.
+  local ns pid comm
+  for ns in fvA fvB; do
+    while read -r pid; do
+      [[ $pid =~ ^[0-9]+$ ]] || continue
+      comm=$(cat "/proc/$pid/comm" 2>/dev/null) || continue
+      case "$comm" in
+        flexvm|firecracker) kill "$pid" 2>/dev/null || true ;;
+      esac
+    done < <(ip netns pids "$ns" 2>/dev/null)
+  done
   # Capture each netns inode before down removes the namespace.
   local h inode cg
   for h in A B; do
