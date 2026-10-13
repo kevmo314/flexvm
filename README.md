@@ -47,7 +47,11 @@ aborted source put the timer back.
 
 ### Migration steps
 
-Only what needs the VM's state happens while it is paused:
+Only what needs the VM's state happens while it is paused. Everything goes
+over one connection, in this order: the target's answer to the prepare
+request; the source's header, vmstate and preloaded pages; the target's
+answer once it committed and resumed the VM; the held packets (`hold`); the
+target's reply to them.
 
 1. Before the pause, over one connection (`migrate_in`): the target checks the
    template, reserves the name and address, takes a pooled Firecracker and
@@ -56,8 +60,9 @@ Only what needs the VM's state happens while it is paused:
    guest memory handed to the pager (which then waits for the page states),
    the vsock socket and the pmem mapping. A target that cannot take the VM
    refuses here, before anything happened to it.
-2. The source parks the balloon timer, then pauses (taking the tap down
-   alongside), saves the state, exports its page states and reads the pages
+2. The source parks the balloon timer, holds the VM's packets, pauses, saves
+   the state (taking the tap down alongside: Firecracker serves the snapshot
+   from its pause loop, which reads no tap), exports its page states and reads the pages
    of the template's *load set* that it holds: pages Firecracker touches
    while loading and resuming a VM of that template (vCPU clock pages,
    virtqueues), learned from the hot pool's loads (which hold their prefetch
@@ -71,13 +76,14 @@ Only what needs the VM's state happens while it is paused:
    committed, and only then resume the VM: a VM that ran on the target is
    never handed back to the source. A source that is gone, or too slow (one
    30 s deadline for everything it sends after the pause), leaves nothing
-   behind on the target.
+   behind on the target. Once it answered, it takes in the packets the
+   source held and only then announces the VM.
 
 Downtime p50 on an idle host (`flexvm bench`, interleaved runs of 12–15
-trials): 2 vCPU 36 ms before, 27 ms with steps 1–3 on stock Firecracker,
-12 ms with the patch (pause 2 ms, snapshot 1.8 ms, transfer 0.1 ms, target
-load 4 ms, resume 1.6 ms); 24 vCPU 58 and 34 ms (its load is still 14 ms and
-its resume 6 ms: vCPU threads, state parsing).
+trials): 2 vCPU 37 ms before, 26 ms with steps 1–3 on stock Firecracker,
+10 ms with the patch (pause 0.5 ms, snapshot 1.7 ms, transfer 0.1 ms, target
+load 4 ms, resume 1.4 ms); 24 vCPU 50 and 25 ms (its load is still 11 ms and
+its resume 4 ms: vCPU threads, state parsing).
 
 ### Lifecycle: pause, checkpoint, restore, suspend
 
@@ -554,7 +560,7 @@ every queue.
 | `run` → guest agent answering with its address set, hot pool | **4–7 ms** p50, 6–14 ms p90 (resume ~2 ms, `START` ~3 ms; host load ~20) |
 | same, hot pool empty (snapshot load) | 45–54 ms p50 under the same load (36–56 ms on a quieter host) |
 | of which Firecracker snapshot load | 22–50 ms (mostly KVM memslot setup, which is slow under nested virt) |
-| Migration downtime, idle VM, idle host | **11 ms** p50, 16 ms p90 (2 vCPU); 28 / 31 ms (24 vCPU) |
+| Migration downtime, idle VM, idle host | **10 ms** p50, 14 ms p90 (2 vCPU); 25 / 31 ms (24 vCPU) |
 | TCP ping-pong through two migrations (`scripts/nettest.sh`, host load ~20 on 24 threads) | worst stall **69–158 ms**, at most 1.6x that round's downtime (12 rounds); before packets were held: 206–220 ms, one retransmit timeout every round |
 | UDP stream through the same, 5,000 datagrams/s | **0 lost**, 0–17 reordered per round (12 rounds); before: 184–770 lost per round. At 20,000/s: 0 lost, 0–14 reordered |
 | nginx image, `run` → first HTTP response from the host | **205 ms** p50 (run 56 + nginx startup 144); `--warm`: **55 ms** p50 (run 31 + first request 22) |
