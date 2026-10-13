@@ -287,6 +287,7 @@ impl Vm {
     /// starts the pager, which gets its page states later (`Pager::seed`).
     /// A migration target does this before its source pauses.
     pub fn prepare(idle: Idle, name: &str, template: Arc<Template>, phases: &mut Phases) -> Result<Prepared> {
+        crate::compat::check(&template, idle.fc.pid())?;
         let (fc, dir, cgroup, tap) = idle.into_parts();
         let idle = Idle { fc, dir, cgroup: name_cgroup(cgroup, name), tap };
         phases.mark("cgroup_rename");

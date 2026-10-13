@@ -1,6 +1,7 @@
 mod bench;
 mod bench_lifecycle;
 mod checkpoint;
+mod compat;
 mod cow;
 mod crc32c;
 mod daemon;
