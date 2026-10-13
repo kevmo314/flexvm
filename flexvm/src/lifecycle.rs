@@ -504,7 +504,7 @@ impl Daemon {
         // next delta; one that succeeds becomes it.
         let mut memhash = None;
         let frozen = (|| -> Result<Frozen> {
-            let runs = vm.save_state(&staging.vmstate(), false)?;
+            let runs = vm.save_state(&staging.vmstate(), false, || {})?;
             t.mark("snapshot");
             if self.fault("ckpt_memhash") {
                 memhash = Some(vm.pager.content_hash()?);

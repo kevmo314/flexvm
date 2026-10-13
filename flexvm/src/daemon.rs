@@ -21,6 +21,7 @@ use serde_json::{json, Value};
 use crate::bail;
 use crate::fc::Pool;
 use crate::guest;
+use crate::hold::{self, Holder};
 use crate::hot::HotPool;
 use crate::net::{self, IpRange};
 use crate::template::{Paths, Template, STEP_MIB};
@@ -111,6 +112,8 @@ pub struct Daemon {
     /// VM names with a lifecycle operation in progress, and which (see `reserve`).
     busy: (Mutex<HashMap<String, &'static str>>, Condvar),
     suspended: Mutex<HashMap<String, Suspended>>,
+    /// Holds packets for VMs paused to migrate away; None if it could not be set up.
+    holder: Option<Arc<Holder>>,
 }
 
 /// A VM name reserved for one lifecycle operation; released on drop.
@@ -136,6 +139,12 @@ enum Incoming {
     Aborted,
 }
 
+/// How long a migration target waits for the first packet its source held
+/// before announcing the VM anyway.
+const HOLD_FENCE: Duration = Duration::from_millis(250);
+/// Longest a target spends taking in held packets.
+const HELD_STREAM: Duration = Duration::from_secs(2);
+
 /// How a migration ended on its target, as seen by the source.
 enum Outcome {
     Committed(Value),
@@ -157,6 +166,9 @@ pub fn run(mut cfg: Config) -> Result<()> {
     cfg.state_dir = cfg.state_dir.canonicalize()?;
     run_lock.extend(lock_run_dir(&cfg.state_dir)?);
     let listener = TcpListener::bind(&cfg.listen)?;
+    // Its device first, before any cleanup: one daemon per port owns it.
+    let port: u16 = cfg.listen.rsplit(':').next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    let holder = Holder::new(port).inspect_err(|e| eprintln!("packets in flight during migrations will be dropped: {e}")).ok();
     kill_orphans(&cfg.run_dir)?;
     let cgroup_root = setup_cgroups(&cfg.listen);
     net::sysctl("net.ipv4.ip_forward", "1")?;
@@ -189,6 +201,7 @@ pub fn run(mut cfg: Config) -> Result<()> {
         faults: std::env::var("FLEXVM_FAULTS").is_ok_and(|v| v == "1").then(|| Mutex::new(HashMap::new())),
         busy: (Mutex::new(HashMap::new()), Condvar::new()),
         suspended: Mutex::new(HashMap::new()),
+        holder,
     });
     d.load_suspended()?;
     eprintln!("flexvm daemon listening on {} (advertised as {})", d.cfg.listen, d.cfg.advertise);
@@ -448,10 +461,14 @@ impl Daemon {
                 r.get_ref().set_read_timeout(Some(INCOMING_READ_TIMEOUT))?;
                 self.incoming(&req, &mut r)
             } {
-                // Committed, but the source never hears about it.
-                Ok(_) if self.fault("lost_ack") => return Ok(()),
+                // Committed, but the source never hears about it. (Shut down,
+                // as the announcing thread holds a clone of the connection.)
+                Ok(_) if self.fault("lost_ack") => return Ok(w.shutdown(std::net::Shutdown::Both)?),
                 res => res,
             },
+            // Packets a source held for a VM that migrated here, when the
+            // migration connection could not carry them.
+            "held" => return self.held(&name, &req, w),
             "run" => self.run_vm(&name, req["template"].as_str().unwrap_or("default"), req["ip"].as_str()),
             "ls" => Ok(self.list()),
             "kill" => self.kill(&name),
@@ -651,7 +668,9 @@ impl Daemon {
             self.addrs.lock().unwrap().unlend(ip);
         }
         let local = self.vms.lock().unwrap().values().any(|v| v.ip == ip && v.state().local());
-        if !local {
+        // A migration away from here is holding its packets; its release moves the route.
+        let held = self.holder.as_ref().is_some_and(|h| h.holding(ip));
+        if !local && !held {
             match req["via"].as_str() {
                 Some(via) => net::route_via(ip, via.parse()?)?,
                 None => net::unroute(ip),
@@ -702,6 +721,9 @@ impl Daemon {
         let ip = match vm {
             Some(vm) => {
                 vm.kill();
+                if let (State::Source(mig), Some(h)) = (vm.state(), &self.holder) {
+                    h.forget(vm.ip, mig);
+                }
                 vm.ip
             }
             None => {
@@ -905,8 +927,14 @@ impl Daemon {
         }
         let mut t = Phases::new();
         let vmstate = vm.dir.join("vmstate.out");
+        // Packets for the VM wait here until it runs again.
+        let hold = || {
+            if let Some(Err(e)) = self.holder.as_ref().map(|h| h.hold(vm.ip, mig)) {
+                eprintln!("vm {name}: not holding packets during migration: {e}");
+            }
+        };
         let prepared = (|| -> Result<_> {
-            let runs = vm.checkpoint(&vmstate)?;
+            let runs = vm.checkpoint(&vmstate, hold)?;
             let paused = t.mark("checkpoint");
             let state = std::fs::read(&vmstate)?;
             t.mark("read_state");
@@ -941,14 +969,14 @@ impl Daemon {
             )?;
             conn.write_all(&state)?;
             t.mark("send_state");
-            Ok(recv_json(&mut BufReader::new(conn))?.ok_or("target hung up")?)
+            Ok(recv_json(&mut BufReader::new(&conn))?.ok_or("target hung up")?)
         })();
-        let target = match sent {
-            Ok(reply) if reply["ok"] == json!(true) => reply["result"].clone(),
+        let (target, answered) = match sent {
+            Ok(reply) if reply["ok"] == json!(true) => (reply["result"].clone(), true),
             // A target only refuses before it resumes the VM, or after killing it.
             Ok(reply) => return Err(self.abort_migration(&vm, mig, format!("target refused: {}", reply["error"]).into())),
             Err(e) => match self.outcome(to, mig, Duration::from_secs(2)) {
-                Some(Outcome::Committed(target)) => target,
+                Some(Outcome::Committed(target)) => (target, false),
                 Some(Outcome::Aborted) => return Err(self.abort_migration(&vm, mig, e)),
                 None => {
                     self.reconcile_later(vm.clone(), mig, to.to_string());
@@ -958,8 +986,9 @@ impl Daemon {
         };
         t.mark("target");
         let downtime = t.total();
-        // The target owns the VM now; this copy only serves its memory.
-        let rerouted = self.reroute(vm.ip, &target);
+        // The target owns the VM now; this copy only serves its memory. The
+        // packets held meanwhile follow on the migration connection.
+        let (held, rerouted) = self.reroute(&vm, mig, to, &target, answered.then_some(&conn));
         t.mark("reroute");
         Ok(json!({
             "name": name,
@@ -970,6 +999,7 @@ impl Daemon {
             "downtime_ms": ms(downtime),
             "rerouted_ms": ms(t.total()),
             "reroute_error": rerouted.err().map(|e| e.to_string()),
+            "held": held.map(|s| s.json()),
             "target_restore_ms": target["restore_ms"],
             "timings_ms": t.json(),
             "target_timings_ms": target["timings_ms"],
@@ -986,6 +1016,11 @@ impl Daemon {
         // lock need not be held across the Firecracker requests.
         if *vm.state.lock().unwrap() != State::Source(mig) {
             return e;
+        }
+        // Packets held meanwhile go into the tap first: Firecracker reads
+        // them once resumed, ahead of what the restored route brings.
+        if let Some(h) = &self.holder {
+            self.release_into(h, vm.ip, mig, vm, |()| net::attach(vm.ip, &vm.tap));
         }
         let (s, e) = match vm.resume() {
             Ok(s) => (s, e),
@@ -1028,16 +1063,26 @@ impl Daemon {
         let d = self.clone();
         thread::spawn(move || {
             let mut patience = Duration::from_secs(1);
-            while vm.state() == State::Source(mig) && d.vm(&vm.name).is_ok_and(|v| Arc::ptr_eq(&v, &vm)) {
+            // Also once the paused copy is gone (the target released it):
+            // the packets held for it still wait for the outcome.
+            let here = || vm.state() == State::Source(mig) && d.vm(&vm.name).is_ok_and(|v| Arc::ptr_eq(&v, &vm));
+            let held = || d.holder.as_ref().is_some_and(|h| h.holding_for(vm.ip, mig));
+            while here() || held() {
                 match d.outcome(&to, mig, patience) {
                     Some(Outcome::Committed(target)) => {
                         eprintln!("vm {}: migration {mig} to {to} committed", vm.name);
-                        let _ = d.reroute(vm.ip, &target);
+                        let _ = d.reroute(&vm, mig, &to, &target, None);
                         return;
                     }
-                    Some(Outcome::Aborted) => {
+                    Some(Outcome::Aborted) if here() => {
                         let e = d.abort_migration(&vm, mig, format!("migration {mig} to {to} aborted").into());
                         return eprintln!("vm {}: {e}; now {}", vm.name, vm.state().name());
+                    }
+                    Some(Outcome::Aborted) => {
+                        if let Some(h) = &d.holder {
+                            h.forget(vm.ip, mig);
+                        }
+                        return;
                     }
                     None => patience = (patience * 2).min(Duration::from_secs(30)),
                 }
@@ -1045,11 +1090,54 @@ impl Daemon {
         });
     }
 
-    /// Points our route for `ip` at a migration target. On failure retries in
-    /// the background; the target owns the VM either way.
-    fn reroute(self: &Arc<Self>, ip: Ipv4Addr, target: &Value) -> Result<()> {
-        let via: Ipv4Addr = target["underlay"].as_str().ok_or("target sent no underlay")?.parse()?;
-        let res = self.route_via(ip, via);
+    /// Sends the packets held for `vm` to the target `to` of migration
+    /// `mig` (on `conn`, the migration connection, or a new one), pointing our
+    /// route for its address at the target meanwhile. On failure retries the
+    /// route in the background; the target owns the VM either way.
+    ///
+    /// If the address belongs to a newer VM here by now (the VM came back
+    /// while this migration's outcome was unknown), the held packets go to
+    /// that VM's tap and the route stays.
+    fn reroute(self: &Arc<Self>, vm: &Arc<Vm>, mig: u64, to: &str, target: &Value, conn: Option<&TcpStream>) -> (Option<hold::Stats>, Result<()>) {
+        let ip = vm.ip;
+        let newer = self.vms.lock().unwrap().values().find(|v| v.ip == ip && !Arc::ptr_eq(v, vm) && v.state().local()).cloned();
+        if let Some(newer) = newer {
+            let held = self.holder.as_ref().and_then(|h| self.release_into(h, ip, mig, &newer, Ok));
+            return (held, Ok(()));
+        }
+        let via: Ipv4Addr = match target["underlay"].as_str().and_then(|s| s.parse().ok()) {
+            Some(via) => via,
+            None => {
+                if let Some(h) = &self.holder {
+                    h.forget(ip, mig);
+                }
+                return (None, Err("target sent no underlay".into()));
+            }
+        };
+        let mut held = None;
+        let mut res = None;
+        if let Some(h) = self.holder.as_ref().filter(|h| h.holding_for(ip, mig)) {
+            let other = match conn {
+                Some(_) => None,
+                None => crate::util::connect(to, Duration::from_secs(2))
+                    .and_then(|mut c| {
+                        send_json(&mut c, &json!({"op": "held", "name": vm.name, "mig": mig}))?;
+                        Ok(c)
+                    })
+                    .inspect_err(|e| eprintln!("vm {}: cannot send held packets to {to}: {e}", vm.name))
+                    .ok(),
+            };
+            match conn.or(other.as_ref()) {
+                Some(c) => {
+                    if let Some((stats, r)) = hold::send(h, ip, mig, c, || self.route_via(ip, via)) {
+                        held = Some(stats);
+                        res = Some(r);
+                    }
+                }
+                None => h.forget(ip, mig),
+            }
+        }
+        let res = res.unwrap_or_else(|| self.route_via(ip, via));
         if let Err(e) = &res {
             eprintln!("route {ip} via {via}: {e}; retrying");
             let d = self.clone();
@@ -1069,7 +1157,43 @@ impl Daemon {
                 }
             });
         }
-        res
+        (held, res)
+    }
+
+    /// Injects what migration `mig` held for `ip` into `vm`'s tap (brought
+    /// up for it), then calls `switch`.
+    fn release_into(&self, h: &Holder, ip: Ipv4Addr, mig: u64, vm: &Vm, switch: impl FnOnce(()) -> Result<()>) -> Option<hold::Stats> {
+        if !h.holding_for(ip, mig) {
+            return None;
+        }
+        let inj = net::set_link_up(&vm.tap, true).and_then(|()| hold::Injector::new(&vm.tap));
+        let inj = match inj {
+            Ok(inj) => inj,
+            Err(e) => {
+                eprintln!("vm {}: dropping held packets: {e}", vm.name);
+                h.forget(ip, mig);
+                return None;
+            }
+        };
+        let (mut stats, _) = h.release(ip, mig, &mut |p| inj.send(p), &mut || {}, || switch(()))?;
+        stats.injected = stats.packets;
+        stats.dropped_target = inj.dropped();
+        Some(stats)
+    }
+
+    /// The source of a migration in here sends the packets it held on this
+    /// connection (when the migration connection could not carry them).
+    fn held(&self, name: &str, req: &Value, mut w: TcpStream) -> Result<()> {
+        let mig = req["mig"].as_u64().ok_or("missing mig")?;
+        let vm = self.vm(name)?;
+        if self.migrations.lock().unwrap().get(&mig) != Some(&Incoming::Committed) || !vm.state().local() {
+            bail!("vm {name} did not migrate here in migration {mig}");
+        }
+        let got = hold::receive(&w, &vm.tap, HELD_STREAM, Instant::now() + HELD_STREAM);
+        if got.ended {
+            send_json(&mut w, &json!({"injected": got.injected, "dropped": got.dropped}))?;
+        }
+        Ok(())
     }
 
     fn route_via(&self, ip: Ipv4Addr, via: Ipv4Addr) -> Result<()> {
@@ -1079,7 +1203,7 @@ impl Daemon {
         net::route_via(ip, via)
     }
 
-    fn incoming(self: &Arc<Self>, req: &Value, r: &mut impl Read) -> Result<Value> {
+    fn incoming(self: &Arc<Self>, req: &Value, r: &mut BufReader<TcpStream>) -> Result<Value> {
         let mut t = Phases::new();
         let _op = self.admit()?;
         let name = req["name"].as_str().ok_or("missing name")?.to_string();
@@ -1097,10 +1221,35 @@ impl Daemon {
             migs.insert(mig, Incoming::Pending);
         }
         let res = self.take_in(&name, req, runs, source, &state, &mut t);
+        if let Ok((_, vm)) = &res {
+            // Nothing more is buffered: the source waits for our answer.
+            self.announce_after_held(vm.clone(), r.get_ref().try_clone().ok());
+        }
         // A failed restore has killed the VM, so the source may resume it.
         let outcome = if res.is_ok() { Incoming::Committed } else { Incoming::Aborted };
         self.migrations.lock().unwrap().insert(mig, outcome);
-        res
+        res.map(|(v, _)| v)
+    }
+
+    /// Once a VM that migrated in runs, injects the packets its source held,
+    /// which follow our answer on the migration connection, then announces
+    /// the VM, so held packets come before traffic sent straight here. A
+    /// source that held nothing sends nothing; then this waits `HOLD_FENCE`.
+    /// Announces only if `vm` itself is still served from here by then (not
+    /// killed, replaced, or migrated on: its next host announces it).
+    fn announce_after_held(self: &Arc<Self>, vm: Arc<Vm>, conn: Option<TcpStream>) {
+        let d = self.clone();
+        thread::spawn(move || {
+            if let Some(mut c) = conn {
+                let got = hold::receive(&c, &vm.tap, HOLD_FENCE, Instant::now() + HELD_STREAM);
+                if got.ended {
+                    let _ = send_json(&mut c, &json!({"injected": got.injected, "dropped": got.dropped}));
+                }
+            }
+            if d.vm(&vm.name).is_ok_and(|v| Arc::ptr_eq(&v, &vm)) && vm.state().local() {
+                d.announce(vm.ip);
+            }
+        });
     }
 
     fn take_in(
@@ -1111,7 +1260,7 @@ impl Daemon {
         source: Source,
         state: &[u8],
         t: &mut Phases,
-    ) -> Result<Value> {
+    ) -> Result<(Value, Arc<Vm>)> {
         let _busy = self.reserve(name, "incoming", Duration::ZERO)?;
         if self.taken(name) {
             bail!("vm name {name:?} is taken here");
@@ -1138,8 +1287,8 @@ impl Daemon {
             return Err(e);
         }
         claim.commit();
-        self.announce(ip);
         t.mark("register");
+        let arrived = vm.clone();
         // The guest clock missed the downtime; fixed once this migration lets go of the VM.
         if vm.state() == State::Running {
             self.sync_clock_later(vm.clone());
@@ -1163,7 +1312,7 @@ impl Daemon {
             eprintln!("vm {}: pull from {} ended after {} ms (release: {released})", vm.name, source.addr, ms(pulled));
             let _ = vm.released.set(released);
         });
-        Ok(json!({"restore_ms": ms(restore), "underlay": self.cfg.underlay.to_string(), "timings_ms": t.json()}))
+        Ok((json!({"restore_ms": ms(restore), "underlay": self.cfg.underlay.to_string(), "timings_ms": t.json()}), arrived))
     }
 
     /// SIGTERM/SIGINT: stops every VM and paused or idle Firecracker, then
