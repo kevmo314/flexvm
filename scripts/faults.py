@@ -2021,8 +2021,11 @@ def plug_storm():
         check(f"plug storm {i}: only on target, running", where(n) == {dst: "running"}, where(n))
     stop.set()
     t.join()
-    dst = B if where(n).get(B) == "running" else A
-    check("plug storm: md5 intact", md5(dst, n) == m)
+    w = where(n)
+    check("plug storm: only on one host, running", list(w.values()) == ["running"], (w, {h: vms(h).get(n) for h in (A, B)}))
+    dst = B if w.get(B) == "running" else A
+    got = md5(dst, n)
+    check("plug storm: md5 intact", got == m, (dst, got))
     code, out = sh(dst, n, "python3 -c 'b=bytearray(512<<20); print(len(b)>>20)'")
     check("plug storm: guest can use its memory", code == 0 and out == "512", out)
     cleanup(n)
