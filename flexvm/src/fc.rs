@@ -392,6 +392,7 @@ mod tests {
     use super::*;
 
     use std::os::unix::net::UnixListener;
+    use std::thread::JoinHandle;
 
     struct Server {
         path: PathBuf,
