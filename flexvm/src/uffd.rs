@@ -902,6 +902,11 @@ impl Pager {
         }
     }
 
+    /// Test fault `kill_prepared`: Firecracker was killed; treat it as gone.
+    pub fn firecracker_gone(&self) {
+        self.gone();
+    }
+
     /// Whether the pager gave up on pages for its own reasons (the source,
     /// the checkpoint file), rather than because Firecracker went away.
     pub fn lost_pages(&self) -> bool {

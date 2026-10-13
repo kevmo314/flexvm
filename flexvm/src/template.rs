@@ -503,7 +503,7 @@ fn record_working_set(paths: &Paths, name: &str, tap: &str, sockets: &Arc<Socket
     // A failed earlier build may have left its logs behind.
     let _ = std::fs::remove_dir_all(&run);
     std::fs::create_dir_all(&run)?;
-    let fc = Firecracker::spawn(&paths.firecracker, &run, sockets.allocate()?)?;
+    let fc = Firecracker::spawn(&paths.firecracker, &run, sockets.allocate()?, crate::fc::SPAWN_READY)?;
     let pager = Pager::start(&fc.sockets.uffd, tpl.clone(), None)?;
     pager.set_pid(fc.pid())?;
     fc.put(
@@ -608,7 +608,7 @@ fn build(
     // repoints, and this snapshot's page cache is only valid for these bytes.
     let rootfs = std::fs::canonicalize(&paths.rootfs)?;
     let start = Instant::now();
-    let fc = Firecracker::spawn(&paths.firecracker, &run, sockets.allocate()?)?;
+    let fc = Firecracker::spawn(&paths.firecracker, &run, sockets.allocate()?, crate::fc::SPAWN_READY)?;
     let vsock = fc.sockets.vsock.clone();
     fc.put("/boot-source", json!({"kernel_image_path": paths.kernel, "boot_args": BOOT_ARGS}))?;
     fc.put("/machine-config", json!({"vcpu_count": vcpus, "mem_size_mib": mem_mib}))?;

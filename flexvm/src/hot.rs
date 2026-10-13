@@ -118,7 +118,7 @@ impl Paused {
     /// Turns this into the running VM `name` at `ip`: names its cgroup, routes
     /// the address to its tap and resumes the vCPUs. On failure, the VM is
     /// torn down, and the flag says whether the guest may have run for `name`:
-    /// unless the resume was never sent or Firecracker refused it. With
+    /// unless the resume never reached Firecracker. With
     /// `kill` (test fault `resume_kill`), Firecracker is killed right after
     /// the resume is sent.
     pub fn resume(mut self, name: &str, ip: Ipv4Addr, kill: bool, phases: &mut Phases) -> std::result::Result<Arc<Vm>, (Error, bool)> {
@@ -141,7 +141,9 @@ impl Paused {
             Ok(())
         })();
         if let Err(e) = resumed {
-            let ran = sent && !crate::fc::rejected(&e);
+            // Once the request may have reached Firecracker, some vCPUs may
+            // have run even if it answers with an error.
+            let ran = sent && !crate::fc::not_sent(&e);
             self.pager.stop();
             drop(idle);
             self.pager.join();

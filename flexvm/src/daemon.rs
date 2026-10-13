@@ -938,7 +938,7 @@ impl Daemon {
     /// incoming migration waits 2 s for the source, not 30) or
     /// `slow_preload` (a migration source sends the preloaded pages 300 ms
     /// after the vmstate), `kill_prepared` (an incoming migration's
-    /// prepared Firecracker dies just before the load) or `resume_kill` (Firecracker
+    /// prepared Firecracker dies, and its pager sees it, just before the load) or `resume_kill` (Firecracker
     /// is killed right after a restored VM's resume is sent).
     fn inject(&self, req: &Value) -> Result<Value> {
         let Some(faults) = &self.faults else { bail!("fault injection is off (start the daemon with FLEXVM_FAULTS=1)") };
@@ -1638,12 +1638,17 @@ impl Daemon {
         });
         let (tpl, runs_again) = (prepared.template(), runs.clone());
         if self.fault("kill_prepared") {
+            // Dead, and its pager has seen it go: the load fails at once, and
+            // the retry below takes over.
             prepared.kill_firecracker();
+            prepared.pager.firecracker_gone();
         }
         prepared.pager.seed(runs, Origin::Peer(source.clone()))?;
-        // A prepared load connected the pager long ago; it may have given up.
-        if let Some(why) = prepared.pager.failed() {
-            bail!("its pager failed: {why}");
+        // A prepared load connected the pager long ago; it may have given up
+        // on pages. (One whose Firecracker went is left to the load, which
+        // fails and retries on a fresh one.)
+        if prepared.pager.lost_pages() {
+            bail!("its pager failed: {}", prepared.pager.failed().unwrap_or_default());
         }
         let vmstate = prepared.dir().join("vmstate.in");
         std::fs::write(&vmstate, state)?;
@@ -1662,7 +1667,10 @@ impl Daemon {
                 eprintln!("vm {name}: loading it once more on a fresh firecracker{}", if realtime { "" } else { ", without clock_realtime" });
                 // Every byte the source sends before our answer is read first.
                 let _ = before_commit.take().unwrap()()?;
-                let fresh = Vm::prepare(self.pool.take()?, &name, tpl, t)?;
+                if Instant::now() >= deadline {
+                    bail!("no time left to load it again");
+                }
+                let fresh = Vm::prepare(self.pool.take_by(Some(deadline))?, &name, tpl, t)?;
                 fresh.pager.seed(runs_again, Origin::Peer(source.clone()))?;
                 let vmstate = fresh.dir().join("vmstate.in");
                 std::fs::write(&vmstate, state)?;

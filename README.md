@@ -388,10 +388,11 @@ into the next (`ms: 0` disarms one).
 restored in the background exactly like any other VM (same pager, so it
 migrates and checkpoints like any other), then paused. Starting it is: route
 its address to its tap, resume, `START`. When the pool is empty (or the
-paused VM's resume was never sent or Firecracker refused it), `run` falls
-back to loading the snapshot then and there. A resume that may have gone
-through (a timeout, a Firecracker that died) fails the `run` instead: the
-guest may have run, and a second copy could repeat what it did.
+paused VM's resume never reached its Firecracker), `run` falls back to
+loading the snapshot then and there. A resume that reached it and failed
+(an error answer, a timeout, a Firecracker that died) fails the `run`
+instead: Firecracker resumes vCPUs one by one, so the guest may have run,
+and a second copy could repeat what it did.
 
 - **Size.** `--hot N` per template (default 2, `0` disables) within
   `--hot-mib` of host memory for all of them together, the VM being loaded
