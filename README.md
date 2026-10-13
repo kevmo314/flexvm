@@ -61,44 +61,82 @@ VM that is busy, paused or suspended.
 
 - **pause / resume** stop and restart the vCPUs; memory and devices stay.
   Both take under a millisecond (2 vCPU) to 1.5 ms (24 vCPU).
-- **checkpoint NAME DIR** pauses the VM, quiesces its devices and pager like a
-  migration source does (a VM still pulling memory from a migration source or
-  checkpoint finishes that first), saves the vCPU/device state and writes
-  every page that differs from the template into DIR, then resumes the VM
+- **checkpoint NAME DIR** first waits for any VM still pulling memory (from a
+  migration source or its checkpoint), and for virtio-mem to settle (see
+  below). It then pauses the VM, quiesces its devices and pager like a
+  migration source does, saves the vCPU/device state and writes every page
+  that differs from the template into DIR. Finally it resumes the VM
   (`--keep-running`, the default) or kills it (`--stop`). The pause lasts as
   long as the write (about 0.4 GB/s here).
 - **restore DIR** works on any host whose template has the same content id.
-  It loads the saved state into a pooled Firecracker whose pager takes
-  pages from the checkpoint's page file: on fault, and in the background
-  (the template's working set first) until all are in, so the VM is ready
-  in about the time of a `run`. By default the VM keeps its name and
-  address; a restore refuses an address a peer is using (`--ip auto` picks a
-  new one, which also makes a restore a fork of a running VM).
+  It loads the verified state (copied to the VM's own run directory) into a
+  pooled Firecracker, paused. That Firecracker's pager takes pages from the
+  checkpoint's page file: on fault, and in the background (the template's
+  working set first) until all are in. The VM is ready in about the time of
+  a `run`. By default it keeps its name and address. A restore refuses an
+  address a peer is using; `--ip auto` picks a new one, which also makes a
+  restore a fork of a running VM.
 - **suspend** checkpoints into the daemon's `--state-dir` (default
-  `/var/lib/flexvm/<listen>`; it must be on disk, not tmpfs) and then kills
-  Firecracker, so the VM costs no memory. Memory is released only once the
-  checkpoint is durable, and the pager is stopped before Firecracker dies,
-  so no discard event can mark a saved page as zero. `resume` restores it
-  lazily like `restore`, and deletes the checkpoint once every page is in. Suspended
-  VMs survive a daemon restart.
-- **Clock.** A restored guest's wall clock resumes from when it was saved: the
-  guest uses the TSC clocksource, whose saved value Firecracker restores
-  (`clock_realtime` only moves kvmclock). A restore or a suspended VM's
-  resume steps the guest clock to the host's (measured with one bracketed
-  exec, corrected relative to the guest's own clock, residual error of a few
-  ms). Across a plain pause the TSC keeps counting, so the clock stays right
-  (measured: 0 ms drift after 20 s); `resume` still checks it in the
-  background. A paused VM can also be **migrated**: it stays paused on the
-  target, which pulls all its pages from the source with nothing faulting.
+  `/var/lib/flexvm/<listen>`). The state dir must be on disk, not tmpfs, and
+  it is created durably and locked for the daemon's lifetime like `--run`.
+  Then suspend kills Firecracker, so the VM costs no memory. Memory is
+  released only once the checkpoint is durable. The pager is stopped before
+  Firecracker dies, so no discard event can mark a saved page as zero.
+  `resume` first moves the checkpoint durably out of `suspended/`, before
+  any vCPU runs, then restores it lazily like `restore`. The checkpoint is
+  deleted once every page is in. Suspended VMs survive a daemon restart.
+  `kill` moves a suspended VM's checkpoint durably to `trash/` before it
+  answers. A resume that fails before the vCPUs ran leaves the VM
+  suspended. One that fails after they ran consumes the checkpoint: the VM
+  is gone, as re-arming it would replay what it did.
+- **Device quiescing.** Pausing stops vCPUs, not Firecracker's device
+  handling. So before a checkpoint or migration pauses a VM, the daemon
+  waits until the guest has carried out the last virtio-mem resize
+  (plugged = requested), holding the VM's reservation so the controller
+  cannot start another. After half the 10 s deadline, it sets requested =
+  plugged so the guest has nothing left to ask for.
+  The guest driver (Linux `virtio_mem_run_wq`) only sends requests to close
+  a requested/plugged gap. Two exceptions are a block left plugged after a
+  failed hot-add plus a failed rollback, and kdump. As a backstop, a
+  checkpoint is not published if any memory was discarded (balloon or
+  virtio-mem REMOVE) or the plugged size changed after the snapshot; the VM
+  resumes and the checkpoint can be retried.
+- **Clock.** A restored guest's wall clock resumes from when it was saved.
+  The guest uses the TSC clocksource, whose saved value Firecracker
+  restores, while `clock_realtime` only moves kvmclock. A restore or a
+  suspended VM's resume therefore steps the guest clock under the VM's
+  reservation, within a 5 s deadline. The step measures the offset with one
+  bracketed exec and sets an absolute time: the host's, plus half the round
+  trip. Repeating it cannot double-step, and the residual error is a few ms.
+  Across a plain pause the TSC keeps counting, so the clock stays right
+  (measured: 0 ms drift after 20 s). `resume` still checks it in the
+  background, at most one check per VM at a time.
+- **Paused migration.** A paused VM migrates and stays paused on the
+  target, which pulls all its pages from the source. Resuming it there
+  waits (up to 30 s) for that pull, so it never runs split across hosts.
 
 #### Checkpoint format (version 1)
 
-A checkpoint is a directory that is written in full or not at all. Every file
-goes into a fresh `.NAME.partial-<pid>-<n>` directory next to the target and is
-fsynced. The directory is then renamed into place (`RENAME_NOREPLACE`;
-checkpoints are never overwritten or modified) and the parent fsynced. A
-later checkpoint to the same place clears partial directories that a dead
-daemon left behind.
+A checkpoint is a directory that is written in full or not at all. The
+destination's directory may belong to an unprivileged user while the daemon
+runs as root, so nothing follows a path that user can change:
+
+- **Staging.** The destination's directory is opened and pinned by fd. Files
+  are created with `O_EXCL|O_NOFOLLOW` inside a root-only (0700)
+  `.flexvm-staging-<pid>-<n>/ck` directory in it, also pinned by fd.
+  Firecracker writes the VM state into the VM's own run directory, from
+  where it is copied in.
+- **Ownership.** Files are fchowned to the destination directory's owner.
+- **Publish.** Everything is fsynced, then renamed fd to fd into place with
+  `RENAME_NOREPLACE` (checkpoints are never overwritten or modified), and
+  the destination directory is fsynced.
+- **Durability failure.** If that last fsync fails, the manifest is
+  durably removed before the VM resumes. If that fails too, the VM stays
+  paused and is marked failed.
+- **Restore.** Every file is opened with `O_NOFOLLOW` and must be a regular
+  file.
+- **Leftovers.** A later checkpoint into the same directory clears staging
+  that a dead daemon left behind.
 
 | file | contents |
 |---|---|
@@ -107,16 +145,17 @@ daemon left behind.
 | `pagemap` | `FVPGMAP1`, then runs `(first page, count, DATA\|ZERO)` and one checksum per 64-page block of `pages` |
 | `pages` | DATA pages back to back, in guest page order |
 
-Pages the pager has PRESENT are a superset of what changed (template pages
-read in by prefetch are PRESENT too). The writer therefore compares each page
-with the template and with zero. A page equal to the template (or zero over a
-template hole) is BASE and is not stored. Zero over template data is a ZERO
-run, and anything else is DATA. A restore checks the manifest, `vmstate` and
-`pagemap` before it loads anything, and checks every block of `pages` as it
-reads it. A bad block fails the VM (it is killed) rather than letting it run on wrong memory. The
-checksum is the 64-bit content hash used for template ids. It catches
-corruption, but not deliberate tampering. A checkpoint belongs to the owner of
-the directory it was written into.
+The pager's PRESENT pages are a superset of what changed: template pages
+read in by prefetch are PRESENT too. The writer therefore compares each page
+with the template and with zero. A page equal to the template, or zero over
+a template hole, is BASE and is not stored. A zero page over template data
+is a ZERO run. Anything else is DATA.
+
+A restore checks the manifest, `vmstate` and `pagemap` before it loads
+anything, and checks every block of `pages` as it reads it. A bad block
+kills the VM rather than letting it run on wrong memory. The checksum is
+the 64-bit content hash used for template ids: it catches corruption, not
+deliberate tampering.
 
 ### Migration ownership
 
@@ -407,6 +446,13 @@ firecracker/        patches on top of Firecracker v1.17.0
 - The controller samples guest memory once a second (balloon stats). A very
   fast allocation burst can still hit the in-guest OOM killer; guest PSI
   triggers over vsock would react faster.
+- **Device activity after a snapshot is guarded, not prevented.** virtio-mem is
+  settled first, and a discard or resize after the snapshot stops a
+  checkpoint from being published. A device request already queued at the
+  pause could still write only a used ring (a failed request, or a balloon
+  statistics or report round with no discard) and go unnoticed. Closing that
+  fully needs Firecracker to freeze device processing with the vCPUs. The
+  migration path has only the settle wait, not the discard check.
 - **Checkpoints pause the VM for the whole write** (about 0.4 GB/s: reading
   memory out of Firecracker, comparing with the template, checksumming,
   fsync). Copy-on-write or pre-copy (#8) would make the pause independent of
