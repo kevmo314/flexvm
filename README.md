@@ -315,7 +315,7 @@ through, so the checkpoint is exactly the memory at the pause.
   walking that many populated pages, ~19 µs here); only when the calls
   would cost more than walking every populated page of the region is the
   whole region protected at once. A guest that rewrote 600 scattered pages
-  of 1 GiB written: pause 25–35 ms, protect 11–17 ms (was 69–84 and 53–64
+  of 1 GiB written: pause 25–35 ms, protect 11–17 ms (was 49–84 and 34–64
   ms, when more than 256 ranges meant protecting the whole region).
 - **The pause.** Pause through the API, save the state (as for a
   migration), take the dirty pages, re-protect them, arm copy-on-write for
@@ -831,7 +831,7 @@ every queue.
 | UDP stream through the same, 5,000 datagrams/s | **0 lost**, 0–17 reordered per round (12 rounds); before: 184–770 lost per round. At 20,000/s: 0 lost, 0–14 reordered |
 | nginx image, `run` → first HTTP response from the host | **205 ms** p50 (run 56 + nginx startup 144); `--warm`: **55 ms** p50 (run 31 + first request 22) |
 | Background memory pull | ~1.1 GB/s over loopback TCP |
-| Post-copy faults, 500 MiB written then read back right after the migration (host load ~15) | REMOTE fault p50 **1.3 ms** (was 4.2–5.2 ms, fetched on the event thread), p99 2.6–4.2 ms (was 15–17); template/zero faults p50 41–49 µs (was 1.3 ms, queued behind fetches); all faults blocked 0.77–0.84 s in all (was 1.3–1.6) |
+| Post-copy faults, 500 MiB written then read back right after the migration (host load ~15; 4 interleaved rounds of 8) | REMOTE fault p50 **1.0–1.3 ms** (was 4.2–5.2 ms, fetched on the event thread), p99 2.6–4.2 ms (was 12.6–16.8); template/zero faults p50 41–57 µs (was 1.3–1.6 ms, queued behind fetches); all faults blocked 0.77–0.98 s in all (was 1.33–1.6). The read itself barely changes here: most of it is KVM mapping each page again under nested virtualization |
 | Idle VM host RSS | 9–22 MiB (with 4 GiB plugged) |
 | pause / resume (daemon side; RPC round trip ~2.3 ms) | **0.6 / 0.7 ms** (2 vCPU), 1.5 ms resume (24 vCPU) |
 | checkpoint `--keep-running`, 256 / 1024 / 4096 MiB written in the guest: VM paused | **20 / 18 / 24–31 ms** (was 125 / 406–428 / 1456–1923 ms); write protection armed beforehand while it runs (first checkpoint only): 20 / 95–125 / 270–380 ms; whole checkpoint 220–250 / 450–620 / 1900–2200 ms |
