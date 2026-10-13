@@ -1646,6 +1646,9 @@ impl Daemon {
             mig,
             regions: serde_json::from_value(req["regions"].clone()).map_err(|e| format!("bad regions: {e}"))?,
         };
+        if source.regions.is_empty() {
+            bail!("the source sent no memory regions");
+        }
         let busy = self.reserve(&name, "incoming", Duration::ZERO)?;
         if self.taken(&name) {
             bail!("vm name {name:?} is taken here");

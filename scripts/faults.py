@@ -1736,14 +1736,16 @@ def ckpt_dir_moved():
 # --- two-step migration (migrate_in) ---------------------------------------
 
 
-def migrate_in_raw(host, name, ip, template_id, template=None):
-    """Asks `host` to prepare an incoming migration as a source would.
+def migrate_in_raw(host, name, ip, source, template=None):
+    """Asks `host` to prepare an incoming migration as a source would, for a
+    VM like `source` (its template id and memory regions, from `source_vm`).
     Returns the open socket and the prepare reply."""
+    template_id, regions = source
     h, port = host.rsplit(":", 1)
     s = socket.create_connection((h, int(port)), timeout=60)
     mig = int.from_bytes(os.urandom(6), "little")
     req = {"op": "migrate_in", "name": name, "mig": mig, "template": template or args.template, "id": template_id,
-           "ip": ip, "source": A}
+           "ip": ip, "source": A, "regions": regions}
     s.sendall((json.dumps(req) + "\n").encode())
     buf = b""
     while not buf.endswith(b"\n"):
@@ -1763,18 +1765,19 @@ def nothing_left(label, name, ip):
     rpc(B, {"op": "kill", "name": name})
 
 
-def template_id():
+def source_vm():
+    """The template id and memory regions a source would send for a VM of the template."""
     n = "ft-tplid"
     ok(A, {"op": "run", "name": n, "template": args.template})
-    tid = vms(A)[n]["template_id"]
+    v = vms(A)[n]
     rpc(A, {"op": "kill", "name": n})
-    return tid
+    return v["template_id"], v["regions"]
 
 
 def prepare_disconnect():
     """A source that goes away after the target prepared leaves nothing behind."""
     n, ip = "ft-prep-gone", "10.250.0.7"
-    s, r, mig = migrate_in_raw(B, n, ip, template_id())
+    s, r, mig = migrate_in_raw(B, n, ip, source_vm())
     check("prepare disconnect: target prepared", r.get("ok"), r)
     info = ok(B, {"op": "info"})
     check("prepare disconnect: address held while prepared", ip in info["ips"], (info["ips"], vms(B).get(n)))
@@ -1789,7 +1792,7 @@ def prepare_trickle():
     `short_incoming`), however much it keeps sending."""
     n, ip = "ft-prep-trickle", "10.250.0.8"
     fault(B, "short_incoming", 30000)
-    s, r, _ = migrate_in_raw(B, n, ip, template_id())
+    s, r, _ = migrate_in_raw(B, n, ip, source_vm())
     check("prepare trickle: target prepared", r.get("ok"), r)
     start, cut = time.time(), False
     try:

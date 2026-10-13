@@ -889,6 +889,7 @@ impl Vm {
             "pid": self.pid(),
             "template": self.template.name,
             "template_id": self.template.meta.id,
+            "regions": self.pager.regions(),
             "state": self.state().name(),
             "vcpus": self.template.meta.vcpus,
             "rss_mib": self.rss() >> 20,
