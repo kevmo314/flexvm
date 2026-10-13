@@ -3,9 +3,9 @@
 //!
 //! Every connection starts with one JSON request line. Most ops answer with
 //! one JSON line; `exec` then streams guest frames, `pages` switches to the
-//! binary page protocol, `migrate_in` answers twice (prepared, then loaded)
-//! around a header line, the vmstate and preloaded pages, and `incoming` (from
-//! older sources) is followed by the raw vmstate bytes.
+//! binary page protocol, and `migrate_in` answers twice (prepared, then
+//! loaded) around a header line, the vmstate and preloaded pages, then takes
+//! the held packets. Hosts of a cluster run the same version.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, Read, Write};
@@ -78,7 +78,7 @@ const MAX_VMSTATE: u64 = 64 << 20;
 const MAX_PRELOAD: usize = 4096;
 /// Largest header (page states) a migration source may send.
 const MAX_HEADER: u64 = 256 << 20;
-/// How long a migration source waits for the target's preflight answer.
+/// How long a migration source waits for the target's answer to the prepare request.
 const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a checkpoint waits for virtio-mem to carry out the last resize.
 const SETTLE_WAIT: Duration = Duration::from_secs(10);
@@ -509,9 +509,9 @@ impl Daemon {
     }
 
     /// The local template matching a migration source's: the generation with
-    /// its content id, even if `name` has moved on since. Preflight runs before
-    /// the source pauses and may rehash changed files; incoming only stats them.
-    fn migration_template(&self, req: &Value, preflight: bool) -> Result<Arc<Template>> {
+    /// its content id, even if `name` has moved on since. Runs before the
+    /// source pauses, so it may rehash changed files.
+    fn migration_template(&self, req: &Value) -> Result<Arc<Template>> {
         let name = req["template"].as_str().ok_or("missing template")?;
         let id = req["id"].as_str().unwrap_or("");
         let tpl = match Template::generation(&self.cfg.paths, id) {
@@ -519,7 +519,7 @@ impl Daemon {
             None => self.template(name)?,
         };
         tpl.check_id(req["id"].as_str().ok_or("missing template id")?)?;
-        tpl.verify(&self.cfg.paths, preflight)?;
+        tpl.verify(&self.cfg.paths, true)?;
         Ok(tpl)
     }
 
@@ -564,8 +564,6 @@ impl Daemon {
             "exec" => return self.exec(&name, &req, w),
             "migrate_in" => return self.migrate_in(&req, r, w),
             "logs" => return self.logs(&name, &req, w),
-            "preflight" => self.migration_template(&req, true).map(|tpl| json!({"id": tpl.meta.id})),
-            "incoming" => return self.incoming(&req, r, w),
             "run" => self.run_vm(&name, req["template"].as_str().unwrap_or("default"), req["ip"].as_str()),
             "ls" => Ok(self.list()),
             "kill" => self.kill(&name),
@@ -1409,7 +1407,7 @@ impl Daemon {
     /// A source that goes away in between leaves nothing behind.
     fn migrate_in(self: &Arc<Self>, req: &Value, mut r: BufReader<TcpStream>, mut w: TcpStream) -> Result<()> {
         let mut prep = Phases::new();
-        let prepared = self.admit().and_then(|op| Ok((op, self.prepare_in(req, true, &mut prep)?)));
+        let prepared = self.admit().and_then(|op| Ok((op, self.prepare_in(req, &mut prep)?)));
         let (_op, prepared) = match prepared {
             Ok(p) => p,
             Err(e) => return Ok(send_json(&mut w, &json!({"ok": false, "error": e.to_string()}))?),
@@ -1475,38 +1473,6 @@ impl Daemon {
         answered
     }
 
-    /// An incoming migration from a source that sends everything at once,
-    /// after pausing (`incoming`, from daemons before `migrate_in`).
-    fn incoming(self: &Arc<Self>, req: &Value, mut r: BufReader<TcpStream>, mut w: TcpStream) -> Result<()> {
-        // The vmstate follows; a source that stalls must not hold a counted
-        // operation (and so shutdown) forever.
-        let deadline = Instant::now() + INCOMING_READ_TIMEOUT;
-        r.get_ref().set_read_timeout(Some(INCOMING_READ_TIMEOUT))?;
-        let res = (|| {
-            let mut t = Phases::new();
-            let _op = self.admit()?;
-            let runs: Runs = serde_json::from_value(req["runs"].clone())?;
-            let state = read_vec(&mut r, req["vmstate_len"].as_u64().ok_or("missing vmstate_len")?, MAX_VMSTATE)?;
-            t.mark("recv_state");
-            let prepared = self.prepare_in(req, false, &mut t)?;
-            let paused = req["paused"].as_bool().unwrap_or(false);
-            self.finish_in(prepared, runs, &state, paused, deadline, || Ok(()), &mut t)
-        })();
-        let (reply, arrived) = match res {
-            Ok((v, vm)) => (json!({"ok": true, "result": v}), Some(vm)),
-            Err(e) => (json!({"ok": false, "error": e.to_string()}), None),
-        };
-        // Committed, but the source never hears about it.
-        let answered = match arrived.is_some() && self.fault("lost_ack") {
-            true => w.shutdown(std::net::Shutdown::Both).map_err(Error::from),
-            false => Ok(send_json(&mut w, &reply)?),
-        };
-        if let Some(vm) = arrived {
-            self.after_arrival(req, &vm, r, deadline);
-        }
-        answered
-    }
-
     /// For a VM that arrived as migration `req["mig"]`, once the source has
     /// our answer: takes the packets its source held, which follow it on `r`
     /// (the migration connection, read through the same buffer), then
@@ -1524,9 +1490,9 @@ impl Daemon {
         self.announce_after_held(mig, vm.clone(), revoked.map(|rv| (r, rv)), deadline);
     }
 
-    /// The part of taking a VM in that needs no vmstate. `preflight`: the
-    /// template may be rehashed (the source has not paused yet).
-    fn prepare_in(&self, req: &Value, preflight: bool, t: &mut Phases) -> Result<PreparedIn<'_>> {
+    /// The part of taking a VM in that needs no vmstate, before the source
+    /// pauses.
+    fn prepare_in(&self, req: &Value, t: &mut Phases) -> Result<PreparedIn<'_>> {
         let name = req["name"].as_str().ok_or("missing name")?.to_string();
         let mig = req["mig"].as_u64().ok_or("missing mig")?;
         let source = Source { addr: req["source"].as_str().ok_or("missing source")?.into(), vm: name.clone(), mig };
@@ -1538,7 +1504,7 @@ impl Daemon {
         if self.migrations.lock().unwrap().contains_key(&mig) {
             bail!("migration {mig} was already seen here");
         }
-        let tpl = self.migration_template(req, preflight)?;
+        let tpl = self.migration_template(req)?;
         t.mark("template");
         let claim = self.claim_given_ip(req["ip"].as_str().ok_or("missing ip")?, ClaimFor::Incoming)?;
         t.mark("claim_ip");
@@ -1546,9 +1512,7 @@ impl Daemon {
         t.mark("pool_take");
         let load_set = tpl.load_set();
         let vm = Vm::prepare(idle, &name, tpl, t)?;
-        // Only when the source has not paused yet: preparing costs about
-        // what it saves.
-        if preflight && vm.prepare_load()? {
+        if vm.prepare_load()? {
             t.mark("prepare_load");
         }
         if self.fault("prepare_fail") {
