@@ -1066,12 +1066,12 @@ def cow_abort():
     check("cow abort: VM still running", where(n) == {A: "running"} and not vms(A)[n]["checkpoint_copy"], vms(A).get(n))
     errors, _, out = writer_check(A, n)
     check("cow abort: guest memory intact, writes flow", errors == 0, out)
-    r = rpc(A, {"op": "checkpoint", "name": n, "dir": path, "incremental": True})
-    check("cow abort: no delta against a base the failed copy consumed", not r["ok"] and "build on" in r["error"], r)
+    # The failed copy gave its dirty pages back: the base still holds.
     fault(A, "ckpt_memhash", 60000)
-    r = ok(A, {"op": "checkpoint", "name": n, "dir": path})
+    r = ok(A, {"op": "checkpoint", "name": n, "dir": path, "incremental": True})
     fault(A, "ckpt_memhash", 0)
-    check("cow abort: next checkpoint is exact", ok(A, {"op": "ckhash", "dir": path})["hash"] == r["pause_memhash"])
+    check("cow abort: next checkpoint is an exact delta on the old base",
+          r["parent"] is not None and ok(A, {"op": "ckhash", "dir": path})["hash"] == r["pause_memhash"], r["parent"])
     # A kill gives the copy up rather than waiting for it.
     fault(A, "ckpt_slow", 60000)
     res = {}
@@ -1156,6 +1156,12 @@ def ckpt_incremental():
         errors, _, out = writer_check(B, x)
         check(f"incremental: restore of link {i} intact", errors == 0 and md5(B, x).startswith(m), out)
         cleanup(x)
+    # No delta onto a chain whose older ancestor has gone.
+    os.rename(paths[0], paths[0] + ".moved")
+    r = rpc(A, {"op": "checkpoint", "name": n, "dir": paths[2] + "x", "incremental": True})
+    check("incremental: no delta onto a broken chain", not r["ok"] and "full one" in r["error"] and not os.path.exists(paths[2] + "x"), r)
+    check("incremental: VM runs on after the refusal", where(n) == {A: "running"}, where(n))
+    os.rename(paths[0] + ".moved", paths[0])
     # A replaced parent (same path, other contents) and a missing one.
     os.rename(paths[1], paths[1] + ".moved")
     r = rpc(B, {"op": "restore", "dir": paths[2], "name": "ft-inc4", "ip": "auto"})
@@ -1171,6 +1177,39 @@ def ckpt_incremental():
         rm_ckpt(p)
 
 
+
+def ckpt_failed_stop():
+    """A paused (--stop) checkpoint that fails after the freeze must leave
+    write tracking whole: pages the guest wrote since the last checkpoint
+    stay dirty (they are unprotected), so later checkpoints, full or delta,
+    still hold exactly the memory at their pause."""
+    n, path = "ft-failstop", ckpt_path("ft-failstop")
+    ok(A, {"op": "run", "name": n, "template": args.template})
+    start_writer(A, n, mib=32)
+    ok(A, {"op": "checkpoint", "name": n, "dir": path + "-base"})
+    time.sleep(1)  # the writer unprotects (and dirties) pages
+    fault(A, "ckpt_fail_write", 60000)
+    r = rpc(A, {"op": "checkpoint", "name": n, "dir": path + "-stop", "stop": True})
+    fault(A, "ckpt_fail_write", 0)
+    check("failed stop: refused, nothing published", not r["ok"] and "injected" in r["error"] and not os.path.exists(path + "-stop"), r)
+    check("failed stop: VM runs on", where(n) == {A: "running"}, where(n))
+    time.sleep(1)
+    fault(A, "ckpt_memhash", 120000)
+    for label, inc in (("delta", True), ("full", False)):
+        p = f"{path}-{label}"
+        r = ok(A, {"op": "checkpoint", "name": n, "dir": p, "incremental": inc})
+        h = ok(A, {"op": "ckhash", "dir": p})
+        check(f"failed stop: next {label} checkpoint == memory at its pause", h["hash"] == r["pause_memhash"], (h["hash"], r["pause_memhash"]))
+        ok(B, {"op": "restore", "dir": p, "name": n + "2", "ip": "auto"})
+        errors, _, out = writer_check(B, n + "2")
+        check(f"failed stop: restored {label} intact", errors == 0, out)
+        cleanup(n + "2")
+    fault(A, "ckpt_memhash", 0)
+    cleanup(n)
+    for x in ("-base", "-stop", "-delta", "-full"):
+        rm_ckpt(path + x)
+
+
 SCENARIOS = dict(basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, refused=refused, pages_blip=pages_blip,
                  pages_dead_restore=pages_dead_restore, pages_dead=pages_dead, quiet_source=quiet_source,
                  shared_run_dir=shared_run_dir, exec_race=exec_race, source_killed=source_killed,
@@ -1180,7 +1219,8 @@ SCENARIOS = dict(basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, r
                  suspend_resume=suspend_resume, checkpoint_hotplug=checkpoint_hotplug,
                  checkpoint_untrusted_dir=checkpoint_untrusted_dir, resume_failures=resume_failures,
                  state_dir_lock=state_dir_lock, held_restore_frozen=held_restore_frozen,
-                 cow_exact=cow_exact, cow_abort=cow_abort, cow_crash=cow_crash, ckpt_incremental=ckpt_incremental)
+                 cow_exact=cow_exact, cow_abort=cow_abort, cow_crash=cow_crash, ckpt_incremental=ckpt_incremental,
+                 ckpt_failed_stop=ckpt_failed_stop)
 safe = [s for s in SCENARIOS
         if s not in ("source_killed", "target_restart", "target_restart_symlink", "checkpoint_crash", "cow_crash",
                      "suspend_resume")]
