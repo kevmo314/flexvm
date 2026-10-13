@@ -441,7 +441,13 @@ not wait on the host:
 - **Resizes stay out of lifecycle operations.** A resize, whether from a
   controller tick or from the guest asking, holds the VM's reservation, like
   migrations, checkpoints and pauses do, and only touches a running VM. A
-  guest that asks during one is told `busy`. A migration also waits for any
+  guest that asks during one is told `busy`, with one exception: while a
+  copy-on-write checkpoint copies a running VM, it may grow (never shrink).
+  The copy only reads pages the VM had at the pause, and memory plugged
+  later was unplugged then, so the copy never reads it. The checkpoint keeps
+  the plugged size it saved. Growth since the pause is dirty for the next
+  incremental checkpoint. Before, a guest that grew during a long copy was
+  OOM-killed (`cow_grow` in `scripts/faults.py`). A migration also waits for any
   plug in flight to settle (`Vm::settle_hotplug`). The target refuses a
   vmstate whose memory regions differ from its own.
 
