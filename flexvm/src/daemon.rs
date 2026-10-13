@@ -1097,8 +1097,14 @@ impl Daemon {
         if self.addrs.lock().unwrap().used.contains_key(&ip) || !self.gens.lock().unwrap().current(ip, gen) {
             return;
         }
-        if let Err(e) = net::route_via(ip, via) {
-            eprintln!("route {ip} via {via} (generation {gen}): {e}");
+        // A newer migration away from here holding the address's packets
+        // keeps the route (as in `route`); its release moves it.
+        if self.holder.as_ref().is_some_and(|h| h.holding(ip)) {
+            return;
+        }
+        match net::route_via(ip, via) {
+            Ok(()) => eprintln!("put back route {ip} via {via} (generation {gen})"),
+            Err(e) => eprintln!("route {ip} via {via} (generation {gen}): {e}"),
         }
     }
 

@@ -2295,6 +2295,14 @@ def late_withdrawal():
     check("late withdrawal: the last VM's withdrawal frees it", wait_for(lambda: ip not in lent(), 10), lent())
 
 
+def log_since(host, offset):
+    """The daemon on `host`'s log (its stderr, a file) from byte `offset`
+    on; with None, the current length instead."""
+    path = subprocess.run(["sudo", "readlink", f"/proc/{daemon_pid(host)}/fd/2"], capture_output=True, text=True).stdout.strip()
+    data = subprocess.run(["sudo", "cat", path], capture_output=True).stdout
+    return len(data) if offset is None else data[offset:].decode(errors="replace")
+
+
 def abort_superseded():
     """A migration source whose migration aborts does not resume a VM whose
     address's generation was superseded meanwhile (say the home host handed
@@ -2321,6 +2329,7 @@ def abort_superseded():
     # B's page server refuses, so A refuses the arrival after B paused (and
     # held its packets), and B aborts.
     fault(B, "pages", 30000)
+    b_log = log_since(B, None)
     late = threading.Timer(2, lambda: ok(A, announce))
     late.start()
     r = rpc(B, {"op": "migrate", "name": n, "to": A}, timeout=120)
@@ -2330,6 +2339,12 @@ def abort_superseded():
     check("abort superseded: running nowhere", where(n) == {}, where(n))
     route = subprocess.run(["ip", "route", "show", f"{ip}/32"], capture_output=True, text=True).stdout.strip()
     check("abort superseded: the address routes to the replacement, not the hold", f"via {gw}" in route, route)
+    # A and B share one routing table here, and A's own announcement and
+    # failed arrival put the same route in, so the table cannot tell whose it
+    # is: B's log says whether B itself put the route back after its abort.
+    blog = log_since(B, b_log)
+    check("abort superseded: B put the replacement's route back itself",
+          f"put back route {ip} via {gw} (generation {newer})" in blog, blog[-500:])
     check("abort superseded: its old loan freed", wait_for(lambda: ip not in ok(A, {"op": "info"})["lent"], 10))
     cleanup(n)
     # Let A, the home host, know the newer generation too, and retire it,
