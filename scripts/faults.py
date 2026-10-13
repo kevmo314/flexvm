@@ -20,6 +20,10 @@ p.add_argument("--b-dir", default="/run/fvp-b")
 p.add_argument("--a-ips", default="10.130.0.2-10.130.0.250")
 p.add_argument("--b-ips", default="10.131.0.2-10.131.0.250")
 p.add_argument("--prefix", default="fvp", help="names of taps and hold devices start with this")
+for h in "ab":
+    p.add_argument(f"--{h}-state", help=f"host {h.upper()}'s state directory (default: --{h}-dir/state)")
+    p.add_argument(f"--{h}-run", help=f"host {h.upper()}'s run directory (default: --{h}-dir/run)")
+p.add_argument("--no-listeners", action="store_true", help="use the listeners already running on --a and --b")
 p.add_argument("--bin", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "target", "release", "flexvm"))
 p.add_argument("--artifacts", default=os.environ.get("FLEXVM_ARTIFACTS", "artifacts"))
 p.add_argument("--ckpt-dir", default=os.path.join(tempfile.gettempdir(), "flexvm-checkpoints"),
@@ -34,16 +38,16 @@ scenario_vms, scenario_checkpoints = set(), set()
 
 
 class Host:
-    def __init__(self, addr, d, ips):
+    def __init__(self, addr, d, ips, state=None, run=None):
         self.addr, self.dir, self.ips = addr, d, ips
-        self.state, self.run = os.path.join(d, "state"), os.path.join(d, "run")
+        self.state, self.run = state or os.path.join(d, "state"), run or os.path.join(d, "run")
 
     def __repr__(self):
         return self.addr
 
 
-A = Host(args.a, args.a_dir, args.a_ips)
-B = Host(args.b, args.b_dir, args.b_ips)
+A = Host(args.a, args.a_dir, args.a_ips, args.a_state, args.a_run)
+B = Host(args.b, args.b_dir, args.b_ips, args.b_state, args.b_run)
 ENV = dict(os.environ, FLEXVM_FAULTS="1", FLEXVM_ARTIFACTS=os.path.abspath(args.artifacts))
 listeners = {}
 
@@ -259,10 +263,12 @@ def addr(host, ip):
 
 
 def start_listeners():
+    if args.no_listeners:
+        return
     for h, other in ((A, B), (B, A)):
         for d in (h.state, h.run):
             os.makedirs(d, exist_ok=True)
-        lg = open(os.path.join(h.dir, "listen.log"), "a")
+        lg = open(os.path.join(h.run, "listen.log"), "a")
         listeners[h.addr] = subprocess.Popen(
             [BIN, "--state", h.state, "--run", h.run, "listen", h.addr, "--peer", other.addr, "--vm-ips", h.ips,
              "--reserve", "512", "--prefix", args.prefix], stdout=lg, stderr=lg, env=ENV)
@@ -1268,7 +1274,7 @@ def signals():
     SIGINT destroys; a suspend is not undone by the SIGCONT systemd sends
     after SIGTERM."""
     n = "ft-signals"
-    setup(n, mib=1500)
+    setup(n)
     fault(A, "pages", 3000)
     ok(migrate(A, n, B))
     signal_vm(A, n, signal.SIGTERM)

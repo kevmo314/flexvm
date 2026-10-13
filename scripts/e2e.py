@@ -4,7 +4,7 @@ runs them. Run as root, after building flexvm, the patched Firecracker, the
 guest kernel and the rootfs (see README.md and .github/workflows/ci.yml).
 
 It builds a template, starts two flexvm hosts on loopback (A and B: their
-own ports, run directories, state directories and VM address ranges), and runs
+own listeners, run directories, state directories and VM address ranges), and runs
 each case below against them with fresh VMs. It touches only what it created:
 its own processes, taps, cgroups and directories.
 
@@ -20,7 +20,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 p = argparse.ArgumentParser(usage=__doc__)
 p.add_argument("--bin", default=os.path.join(ROOT, "target", "release", "flexvm"))
 p.add_argument("--artifacts", default=os.path.join(ROOT, "artifacts"))
-p.add_argument("--log-dir", default="/tmp/fvci-logs", help="daemon and Firecracker logs end up here")
+p.add_argument("--log-dir", default="/tmp/fvci-logs", help="listener, VM and Firecracker logs end up here")
 p.add_argument("--port-a", type=int, default=7140, help="host A listens here, host B on the next port")
 p.add_argument("--net-a", default="10.140.0", help="host A's VM addresses (.2-.60); B uses --net-b")
 p.add_argument("--net-b", default="10.141.0")
@@ -28,14 +28,15 @@ p.add_argument("--template", default="ci", help="name of the template the cases 
 p.add_argument("--image", default="public.ecr.aws/docker/library/busybox:1.36",
                help="container image for the image-template case")
 p.add_argument("--no-image", action="store_true", help="skip the image-template case (needs registry access)")
-# The scripts/faults.py scenarios that fit CI time (~2.5 min here): migration failure paths, checkpoint
-# corruption, copy-on-write exactness, held packets and devices. Left out: the ones that restart a daemon
-# (this script owns them), slow or heavy ones (pages_dead, quiet_source, guest_hang, cow_reports_held), and
-# guest_calls: on a 4-vCPU hosted runner an exec started on the source as the VM leaves fails with
-# "no vm named" instead of following it to the target (passes on a fast host).
+# The scripts/faults.py scenarios that fit CI time: migration failure paths and fencing, address
+# generations, checkpoint corruption, copy-on-write exactness, held packets and devices, signals,
+# standby VMs. Left out: slow or heavy ones (pages_dead, quiet_source, guest_hang, cow_reports_held,
+# guest_calls, suspend_disk_freed, source_killed: their 1.5 GB guests outgrow the CI template, and the host
+# moves them) and the ones that restart the listeners (target_killed, suspend_resume).
 FAULTS = ("basic route lost_ack unknown refused pages_blip pages_dead_restore prepared_retry resume_kill exec_race "
           "checkpoint_fork checkpoint_corrupt held_restore_frozen cow_exact cow_abort ckpt_incremental "
-          "ckpt_failed_stop ckpt_rearm prepare_fail fc_prepare slow_preload ckpt_packet_hold")
+          "ckpt_failed_stop ckpt_rearm prepare_fail fc_prepare slow_preload ckpt_packet_hold "
+          "abort_superseded gen_zero signals suspend_gen standby")
 p.add_argument("--faults", default=FAULTS, help="scripts/faults.py scenarios to run against the two hosts ('' for none)")
 p.add_argument("cases", nargs="*", help="cases to run (default: all)")
 args = p.parse_args()
@@ -46,11 +47,10 @@ os.makedirs(args.log_dir, exist_ok=True)
 
 # --- CLI wrapper ---------------------------------------------------------------
 # Everything that knows how flexvm is driven lives in this section; the cases
-# below only call these methods. Today a host is a daemon and every command an
-# RPC through the CLI. With one `flexvm run` process per VM (#85) start/stop
-# become the migration listener, `run` spawns the VM's process, and pause /
-# resume / suspend / kill turn into signals to it (SIGTSTP / SIGCONT / SIGTERM /
-# SIGINT).
+# below only call these methods. A host is a state and a run directory with a
+# peer listener (`flexvm listen`); every VM is a process of its own (`flexvm
+# run -d`), paused, resumed, suspended and destroyed with signals (SIGTSTP,
+# SIGCONT, SIGTERM, SIGINT).
 
 
 def flexvm(*argv, timeout=180, check=True, env=None):
@@ -84,61 +84,83 @@ def owns_socket(pid, inode):
         return False
 
 
+def alive(pid):
+    try:
+        return open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()[0] != "Z"
+    except OSError:
+        return False
+
+
+# FLEXVM_FAULTS lets scripts/faults.py inject failures; it changes nothing otherwise.
+ENV = {**os.environ, "FLEXVM_FAULTS": "1"}
+
+
 class Host:
     def __init__(self, label, port, peer_port, net):
         self.label, self.addr = label, f"127.0.0.1:{port}"
         self.peer = f"127.0.0.1:{peer_port}"
         self.port, self.net = port, net
-        # Inside this run's own fresh directories (see main); the daemon creates them.
+        # Inside this run's own fresh directories (see main).
         self.run_dir = os.path.join(RUN, label)
         self.state_dir = os.path.join(WORK, f"{label}-state")
-        self.log = os.path.join(args.log_dir, f"daemon-{label}.log")
+        self.prefix = f"fvci{label}"
+        self.log = os.path.join(args.log_dir, f"listen-{label}.log")
         self.proc = None
         self.vms = set()  # names of the VMs this script created here or moved here
+        self.pids = set()  # their processes, seen here
 
     # lifecycle of the host itself
     def start(self):
         if listener_inode(self.port) is not None:
             raise AssertionError(f"port {self.port} is in use; pick other ports with --port-a")
-        cmd = [BIN, "--artifacts", ARTIFACTS, "daemon", "--listen", self.addr, "--peer", self.peer,
-               "--run", self.run_dir, "--state-dir", self.state_dir, "--vm-ips", f"{self.net}.2-{self.net}.60",
-               "--hot", "1", "--pool", "1", "--reserve", "256"]
-        # FLEXVM_FAULTS lets scripts/faults.py inject failures; it changes nothing otherwise.
+        os.makedirs(self.run_dir, exist_ok=True)
+        os.makedirs(self.state_dir, exist_ok=True)
+        cmd = [BIN, "--artifacts", ARTIFACTS, "--state", self.state_dir, "--run", self.run_dir, "listen", self.addr,
+               "--peer", self.peer, "--vm-ips", f"{self.net}.2-{self.net}.60", "--reserve", "256", "--prefix", self.prefix]
         self.proc = subprocess.Popen(cmd, stdout=open(self.log, "a"), stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                                     env={**os.environ, "FLEXVM_FAULTS": "1"}, start_new_session=True)
-        # Up once our own child holds the listening socket and answers on it.
+                                     env=ENV, start_new_session=True)
+        # Up once our own child holds the listening socket.
         deadline = time.time() + 30
-        while not (owns_socket(self.proc.pid, listener_inode(self.port))
-                   and flexvm("--host", self.addr, "ls", check=False).returncode == 0):
+        while not owns_socket(self.proc.pid, listener_inode(self.port)):
             if self.proc.poll() is not None or time.time() > deadline:
                 raise AssertionError(f"host {self.label} did not come up; see {self.log}")
             time.sleep(0.2)
 
     def stop(self, timeout=60):
-        """SIGTERM and wait; raises if it died early, had to be killed or exited with an error."""
+        """Destroys what VMs are left and stops the listener; raises if it died early."""
         if not self.proc:
             return
+        for vm in sorted(self.ls()):
+            self.kill(vm, check=False)
         if self.proc.poll() is not None:
-            raise AssertionError(f"host {self.label} died early (exit {self.proc.returncode}); see {self.log}")
+            raise AssertionError(f"host {self.label}'s listener died early (exit {self.proc.returncode}); see {self.log}")
         self.proc.send_signal(signal.SIGTERM)
         try:
-            code = self.proc.wait(timeout)
+            self.proc.wait(timeout)
         except subprocess.TimeoutExpired:
             self.proc.kill()
             self.proc.wait()
-            raise AssertionError(f"host {self.label} did not stop within {timeout} s; killed it")
-        if code != 0:
-            raise AssertionError(f"host {self.label} exited {code} on SIGTERM; see {self.log}")
+            raise AssertionError(f"host {self.label}'s listener did not stop within {timeout} s; killed it")
 
     def cli(self, *argv, **kw):
-        return flexvm("--host", self.addr, *argv, **kw)
+        return flexvm("--state", self.state_dir, "--run", self.run_dir, *argv, env=ENV, **kw)
+
+    def pid(self, vm):
+        p = self.ls()[vm]["pid"]
+        self.pids.add(p)
+        return p
+
+    def wait_state(self, vm, state, timeout=60):
+        assert wait_for(lambda: self.ls().get(vm, {}).get("state") == state, timeout), (vm, self.ls().get(vm))
 
     # VM commands
     def run(self, vm, template=None, ip=None):
-        """Starts a VM; returns its address."""
+        """Starts a VM (in the background); returns its address."""
         extra = (["--template", template or args.template]) + (["--ip", ip] if ip else [])
         self.vms.add(vm)
-        return json.loads(self.cli("run", vm, *extra).stdout)["ip"]
+        r = json.loads(self.cli("run", vm, *extra, "-d").stdout)
+        self.pids.add(r["pid"])
+        return r["ip"]
 
     def exec(self, vm, cmd, timeout=120):
         """Runs a shell command in the VM; returns (exit code, stdout, stderr)."""
@@ -146,38 +168,60 @@ class Host:
         return r.returncode, r.stdout, r.stderr
 
     def ls(self):
-        """{name: {"ip", "template", "state"}} from `flexvm ls`."""
-        rows = self.cli("ls").stdout.splitlines()[1:]
-        return {f[0]: {"ip": f[1], "template": f[2], "state": f[3]} for f in (r.split() for r in rows) if len(f) >= 4}
+        """{name: {"ip", "template", "state", "pid"}} from `flexvm ls`."""
+        return {v["name"]: v for v in json.loads(self.cli("ls", "--json").stdout)}
 
     def pause(self, vm):
-        return json.loads(self.cli("pause", vm).stdout)
+        t = time.time()
+        os.kill(self.pid(vm), signal.SIGTSTP)
+        self.wait_state(vm, "paused")
+        return {"pause_ms": round((time.time() - t) * 1000, 1)}
 
     def resume(self, vm):
-        return json.loads(self.cli("resume", vm).stdout)
+        """SIGCONT for a paused VM; `flexvm resume` for a suspended one."""
+        if self.ls().get(vm, {}).get("state") == "suspended":
+            r = json.loads(self.cli("resume", vm, "-d").stdout)
+            self.pids.add(r["pid"])
+            return r
+        t = time.time()
+        os.kill(self.pid(vm), signal.SIGCONT)
+        self.wait_state(vm, "running")
+        return {"resume_ms": round((time.time() - t) * 1000, 1)}
 
     def suspend(self, vm):
-        return json.loads(self.cli("suspend", vm).stdout)
+        """SIGTERM: the VM is checkpointed to disk and its process exits."""
+        pid, t = self.pid(vm), time.time()
+        os.kill(pid, signal.SIGTERM)
+        assert wait_for(lambda: not alive(pid), 120), f"{vm} did not suspend"
+        return {"suspend_ms": round((time.time() - t) * 1000, 1)}
 
     def kill(self, vm, check=True):
         return self.cli("kill", vm, check=check)
 
     def checkpoint(self, vm, path, stop=False, incremental=False):
         extra = (["--stop"] if stop else []) + (["--incremental"] if incremental else [])
-        return json.loads(self.cli("checkpoint", vm, path, *extra).stdout)
+        r = json.loads(self.cli("checkpoint", vm, path, *extra).stdout)
+        if stop:
+            assert wait_for(lambda: vm not in self.ls(), 30), f"{vm} still listed after checkpoint --stop"
+        return r
 
     def restore(self, path, name=None, ip=None):
         extra = (["--name", name] if name else []) + (["--ip", ip] if ip else [])
-        r = json.loads(self.cli("restore", path, *extra).stdout)
+        r = json.loads(self.cli("restore", path, *extra, "-d").stdout)
         self.vms.add(r["name"])
+        self.pids.add(r["pid"])
         return r
 
     def migrate(self, vm, to):
         to.vms.add(vm)
-        return json.loads(self.cli("migrate", vm, "--to", to.addr).stdout)
+        return json.loads(self.cli("migrate", vm, to.addr).stdout)
 
     def logs(self, vm):
-        return self.cli("logs", vm).stdout
+        """A background VM's output (an image app's stdout and stderr)."""
+        try:
+            return open(os.path.join(self.run_dir, "vms", f"{vm}.log")).read()
+        except OSError:
+            return ""
 
     # what the host holds on this machine, to check that it gives it back
     def firecrackers(self):
@@ -195,26 +239,36 @@ class Host:
         return out
 
     def taps(self):
-        links = subprocess.run(["ip", "-o", "link", "show"], capture_output=True, text=True).stdout
-        names = [l.split(": ")[1].split("@")[0] for l in links.splitlines()]
-        return [n for n in names if n.startswith(f"fv{self.port}")]
+        return [n for n in os.listdir("/sys/class/net") if n.startswith(self.prefix)]
 
     def cgroups(self):
-        return glob.glob(f"/sys/fs/cgroup/flexvm/127_0_0_1_{self.port}_ns*")
+        return [c for p in self.pids for c in glob.glob(f"/sys/fs/cgroup/flexvm/idle-{p}-*")]
+
+    def processes(self):
+        """Processes on this host's state directory: its listener and VM processes."""
+        out = []
+        for pid in filter(str.isdigit, os.listdir("/proc")):
+            try:
+                argv = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")
+            except OSError:
+                continue
+            if self.state_dir.encode() in argv and alive(pid):
+                out.append(int(pid))
+        return out
 
     def leftovers(self):
         """Everything of this host's still on the machine (expected empty once it stopped)."""
         left = [f"firecracker pid {p}" for p in self.firecrackers()] + [f"tap {t}" for t in self.taps()]
         left += [f"cgroup {c}" for c in self.cgroups()]
-        left += [f"dir {d}" for d in (self.run_dir,) if os.path.exists(d)]
-        if self.proc and self.proc.poll() is None:
-            left.append(f"daemon pid {self.proc.pid}")
+        left += [f"process {p}" for p in self.processes()]
+        left += [f"vm {v}" for v in os.listdir(os.path.join(self.run_dir, "vms")) if v.endswith(".lock")] \
+            if os.path.isdir(os.path.join(self.run_dir, "vms")) else []
         return left
 
     def save_logs(self):
-        """Copies the Firecracker logs out of the run directory (stopping removes it)."""
+        """Copies the VM and Firecracker logs out of the run directory."""
         for log in glob.glob(f"{self.run_dir}/**/*.log", recursive=True):
-            dest = os.path.join(args.log_dir, f"fc-{self.label}", os.path.relpath(log, self.run_dir))
+            dest = os.path.join(args.log_dir, f"run-{self.label}", os.path.relpath(log, self.run_dir))
             os.makedirs(os.path.dirname(dest), exist_ok=True)
             shutil.copy(log, dest)
 
@@ -427,7 +481,7 @@ def migrate():
 
 @case
 def checkpoint_restore():
-    """checkpoint --stop on A, restore on B; keep-running checkpoint restored as a fork."""
+    """checkpoint --stop and restore; a keep-running checkpoint restored on B as a fork."""
     vm = "e2e-ckpt"
     ip = A.run(vm)
     m = fill(A, vm)
@@ -437,19 +491,21 @@ def checkpoint_restore():
     print(f"  checkpoint --stop: {r.get('checkpoint_ms')} ms, {r.get('data_mib')} MiB")
     check("checkpoint: manifest written", os.path.exists(os.path.join(path, "manifest.json")))
     check("checkpoint --stop: VM gone from A", vm not in A.ls(), A.ls())
-    r = B.restore(path)
+    # Its address is A's to give: B restores it only under another one.
+    check("restore on B with A's address: refused", B.cli("restore", path, "-d", check=False).returncode != 0)
+    r = A.restore(path)
     print(f"  restore: ready in {r.get('ready_ms')} ms")
-    check("restore: same name and address", B.ls().get(vm, {}).get("ip") == ip, B.ls())
-    check("restore: RAM intact", md5(B, vm) == m)
-    check("restore: same process", marker_id(B, vm) == proc)
-    c1 = count(B, vm)
-    check("restore: process runs on", wait_for(lambda: count(B, vm) > c1, 5))
-    check("restore: guest clock right", wait_for(lambda: abs(clock_error(B, vm)) < 0.5, 5), clock_error(B, vm))
+    check("restore: same name and address", A.ls().get(vm, {}).get("ip") == ip, A.ls())
+    check("restore: RAM intact", md5(A, vm) == m)
+    check("restore: same process", marker_id(A, vm) == proc)
+    c1 = count(A, vm)
+    check("restore: process runs on", wait_for(lambda: count(A, vm) > c1, 5))
+    check("restore: guest clock right", wait_for(lambda: abs(clock_error(A, vm)) < 0.5, 5), clock_error(A, vm))
     # Keep-running checkpoint: the VM goes on; its copy restores as a second VM.
     path2 = ckpt_dir(vm + "-live")
-    B.checkpoint(vm, path2)
-    check("checkpoint --keep-running: still running", B.ls()[vm]["state"] == "running")
-    must(B, vm, "echo changed > /tmp/after")
+    A.checkpoint(vm, path2)
+    check("checkpoint --keep-running: still running", A.ls()[vm]["state"] == "running")
+    must(A, vm, "echo changed > /tmp/after")
     # On B, whose address range the original's address is not from: A would hand it out again.
     fork = vm + "-fork"
     r = B.restore(path2, name=fork, ip="auto")
@@ -457,7 +513,7 @@ def checkpoint_restore():
     check("fork: RAM as at the checkpoint", md5(B, fork) == m)
     check("fork: later writes not in it", B.exec(fork, "test -e /tmp/after")[0] != 0)
     check("fork: same process", marker_id(B, fork) == proc)
-    B.kill(vm)
+    A.kill(vm)
     B.kill(fork)
     shutil.rmtree(path, ignore_errors=True)
     shutil.rmtree(path2, ignore_errors=True)
@@ -562,8 +618,10 @@ def faults():
         print("  none selected")
         return
     r = subprocess.run([sys.executable, os.path.join(ROOT, "scripts", "faults.py"), "--a", A.addr, "--b", B.addr,
-                        "--bin", BIN, "--template", args.template, "--log-dir", args.log_dir,
-                        "--ckpt-dir", os.path.join(WORK, "faults-ckpt"), *args.faults.split()], timeout=900)
+                        "--a-state", A.state_dir, "--a-run", A.run_dir, "--b-state", B.state_dir, "--b-run", B.run_dir,
+                        "--a-ips", f"{A.net}.2-{A.net}.60", "--b-ips", f"{B.net}.2-{B.net}.60",
+                        "--no-listeners", "--bin", BIN, "--artifacts", ARTIFACTS, "--template", args.template,
+                        "--ckpt-dir", os.path.join(WORK, "faults-ckpt"), *args.faults.split()], timeout=1200)
     check("faults.py: no failures", r.returncode == 0, f"exit {r.returncode}")
 
 

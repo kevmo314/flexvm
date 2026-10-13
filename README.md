@@ -126,6 +126,14 @@ flexvm bench --lifecycle /data/ckpt --to-state S --to-run R      # pause, checkp
 
 Reports land in `bench/`.
 
+## Tests
+
+`sudo scripts/e2e.py` is what CI runs on a KVM runner: two hosts on loopback,
+the commands above, then a selection of `scripts/faults.py` scenarios (every
+failure path of migration, checkpoints and suspend, by injected faults).
+`scripts/nettest.sh` migrates a VM back and forth under TCP and UDP traffic
+between network namespaces and fails on a lost datagram or a long stall.
+
 ## How it works
 
 - **A VM is a process.** It spawns its Firecracker (which dies with it), runs
