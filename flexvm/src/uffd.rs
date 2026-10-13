@@ -261,12 +261,19 @@ impl Pages {
     /// BASE (zero) states eight at a time: a VM's map is mostly BASE (the
     /// unplugged virtio-mem region alone is millions of pages), and a
     /// migration scans it with the VM paused.
-    pub fn next_not_base(&self, mut from: usize, end: usize) -> usize {
+    pub fn next_not_base(&self, from: usize, end: usize) -> usize {
+        self.next_not(BASE, from, end)
+    }
+
+    /// The first page in `[from, end)` not in `state`, or `end`; eight at a
+    /// time where it can.
+    pub fn next_not(&self, state: u8, mut from: usize, end: usize) -> usize {
         const W: usize = std::mem::size_of::<u64>();
         let end = end.min(self.states.len());
         let base = self.states.as_ptr() as usize;
+        let pattern = u64::from_ne_bytes([state; W]);
         while from < end {
-            if from % CHUNK == 0 && !self.touched(from) {
+            if state == BASE && from % CHUNK == 0 && !self.touched(from) {
                 from += CHUNK;
                 continue;
             }
@@ -274,14 +281,14 @@ impl Pages {
                 // SAFETY: in bounds and aligned; AtomicU8 has the layout of u8,
                 // and a relaxed 8-byte load of them is what x86 does anyway.
                 let word = unsafe { &*((base + from) as *const std::sync::atomic::AtomicU64) };
-                let w = word.load(Ordering::Relaxed);
+                let w = word.load(Ordering::Relaxed) ^ pattern;
                 if w == 0 {
                     from += W;
                     continue;
                 }
-                return from + (w.trailing_zeros() / 8) as usize;
+                return from + (w.to_le().trailing_zeros() / 8) as usize;
             }
-            if self.states[from].load(Ordering::Relaxed) != BASE {
+            if self.states[from].load(Ordering::Relaxed) != state {
                 return from;
             }
             from += 1;
@@ -909,20 +916,22 @@ impl Pager {
                     thread::sleep(Duration::from_micros(20));
                     s = p.load(Ordering::SeqCst);
                 }
-                let s = match s {
-                    PRESENT => REMOTE,
-                    ZERO => ZERO,
+                let (raw, s) = match s {
+                    PRESENT => (PRESENT, REMOTE),
+                    ZERO => (ZERO, ZERO),
                     BASE => {
                         i = pages.next_not_base(i + 1, end);
                         continue;
                     }
                     s => bail!("page {i} is still in state {s}; the VM is mid-migration"),
                 };
+                // The rest of a stretch in the same state, eight at a time.
+                let n = (pages.next_not(raw, i + 1, end) - i) as u64;
                 match runs.last_mut() {
-                    Some((f, n, st)) if *st == s && *f + *n == i as u64 => *n += 1,
-                    _ => runs.push((i as u64, 1, s)),
+                    Some((f, c, st)) if *st == s && *f + *c == i as u64 => *c += n,
+                    _ => runs.push((i as u64, n, s)),
                 }
-                i = pages.next_not_base(i + 1, end);
+                i = pages.next_not_base(i + n as usize, end);
             }
         }
         Ok(runs)
@@ -1896,6 +1905,12 @@ mod tests {
             }
         }
         assert_eq!(p.next_not_base(10, 1000), 63);
+        for from in 0..300 {
+            for end in from..=300 {
+                let want = (from..end).find(|&i| st[i] != PRESENT).unwrap_or(end);
+                assert_eq!(p.next_not(PRESENT, from, end), want, "PRESENT from {from} end {end}");
+            }
+        }
 
         // Untouched chunks are skipped without reading them.
         let p = Pages::new(3 * CHUNK + 5);
