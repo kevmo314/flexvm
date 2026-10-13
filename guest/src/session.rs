@@ -155,7 +155,9 @@ fn open<'a>(mut r: impl Read, line: &'a str, sessions: &Sessions, statuses: &Sta
                         .stderr(Stdio::piped()),
                     statuses,
                     true,
-                )?;
+                )
+                // Minimal images (distroless, scratch) have no shell.
+                .map_err(|e| io::Error::new(e.kind(), format!("cannot run /bin/sh: {e} (does the image have a shell?)")))?;
                 let pid = child.id() as i32;
                 let output = Arc::new((Mutex::new(Output { readers: 1, ..Default::default() }), Condvar::new()));
                 map.insert(id.to_string(), Entry { command, output: output.clone() });
