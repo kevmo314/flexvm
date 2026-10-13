@@ -87,7 +87,7 @@ def fault(host, f, ms):
 FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_before_run", "restore_after_run",
           "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "ckpt_crawl", "resume_kill",
           "prepare_fail", "short_incoming", "slow_preload", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
-          "hot_low_estimate", "started_fsync", "started_unmark", "ckpt_wp_race")
+          "hot_low_estimate", "started_fsync", "started_unmark", "ckpt_wp_race", "fetch_tail_enomem")
 
 
 def disarm():
@@ -1590,6 +1590,23 @@ def cow_wp_race():
     cleanup(n)
 
 
+def fetch_tail_enomem():
+    """A run fetched for a fault whose tail fails to install (a transient
+    error, after its first page went in and the pullers passed it) is
+    fetched again rather than left REMOTE: the pull completes and the
+    source lets go."""
+    n = "ft-tail"
+    m = setup(n, mib=200)
+    fault(B, "fetch_tail_enomem", 60000)
+    ok(A, {"op": "migrate", "name": n, "to": B})
+    check("tail: memory intact after the migration", md5(B, n) == m)
+    st = wait_released(B, n, 30)
+    check("tail: every page arrives and the source lets go",
+          st["released"] is True and st["background_pull_ms"] is not None and st["failed"] is None, st)
+    fault(B, "fetch_tail_enomem", 0)
+    cleanup(n)
+
+
 def cow_reports_held():
     """Exercise Firecracker's report hold and the pager's REMOVE fallback
     with disk writers gated until the guest has freed memory."""
@@ -2415,7 +2432,7 @@ SCENARIOS = dict(plug_race=plug_race, plug_storm=plug_storm, cow_grow=cow_grow, 
                  suspend_resume=suspend_resume, checkpoint_hotplug=checkpoint_hotplug,
                  checkpoint_untrusted_dir=checkpoint_untrusted_dir, resume_failures=resume_failures,
                  state_dir_lock=state_dir_lock, held_restore_frozen=held_restore_frozen,
-                 cow_exact=cow_exact, cow_abort=cow_abort, cow_crash=cow_crash, cow_reports_held=cow_reports_held, cow_wp_race=cow_wp_race, ckpt_incremental=ckpt_incremental,
+                 cow_exact=cow_exact, cow_abort=cow_abort, cow_crash=cow_crash, cow_reports_held=cow_reports_held, cow_wp_race=cow_wp_race, fetch_tail_enomem=fetch_tail_enomem, ckpt_incremental=ckpt_incremental,
                  ckpt_failed_stop=ckpt_failed_stop, ckpt_rearm=ckpt_rearm,
                  ckpt_dir_moved=ckpt_dir_moved, prepare_disconnect=prepare_disconnect,
                  prepare_trickle=prepare_trickle, prepare_fail=prepare_fail, fc_prepare=fc_prepare,
