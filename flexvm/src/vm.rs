@@ -284,23 +284,6 @@ impl Vm {
         crate::guest::start_app(&self.vsock())
     }
 
-    /// Opens a stream of the app's output, registered like an exec session
-    /// (release it with `untrack_exec`) so a checkpoint can close it.
-    pub fn logs(&self, offset: u64, follow: bool) -> Result<(BufReader<UnixStream>, u64)> {
-        let (g, id) = {
-            let mut execs = self.execs.lock().unwrap();
-            if self.state() != State::Running {
-                bail!("vm {} is not running here", self.name);
-            }
-            let g = crate::guest::start_logs(&self.vsock(), offset, follow, crate::guest::TIMEOUT)?;
-            let id = self.next_exec.fetch_add(1, Ordering::SeqCst);
-            execs.insert(id, g.get_ref().try_clone()?);
-            (g, id)
-        };
-        crate::guest::untimed(&g)?;
-        Ok((g, id))
-    }
-
     pub fn untrack_exec(&self, id: u64) {
         self.execs.lock().unwrap().remove(&id);
     }

@@ -514,7 +514,9 @@ impl Daemon {
     /// Streams an image app's output: `offset`, and `follow` to keep going.
     fn logs(&self, name: &str, req: &Value, mut w: TcpStream) -> Result<()> {
         let guest = self.vm(name).and_then(|vm| {
-            let (g, id) = vm.logs(req["offset"].as_u64().unwrap_or(0), req["follow"] == json!(true))?;
+            // Registered like an exec session, so a checkpoint closes it.
+            let (offset, follow) = (req["offset"].as_u64().unwrap_or(0), req["follow"] == json!(true));
+            let (g, id) = vm.exec(|uds| guest::start_logs(uds, offset, follow, guest::TIMEOUT))?;
             Ok((vm, g, id))
         });
         match guest {
