@@ -732,7 +732,7 @@ impl Proc {
             if starved != vm.starved.load(Ordering::SeqCst) {
                 self.publish();
             }
-            crate::evict::tick(&self.host, vm.starved.load(Ordering::SeqCst));
+            relieve(&self.host, vm.starved.load(Ordering::SeqCst));
         }
     }
 
@@ -1094,6 +1094,60 @@ fn read_mem_request(conn: &UnixStream) -> Option<u64> {
     match (f.next(), f.next().map(str::parse::<u64>), f.next().map(str::parse::<u64>), f.next()) {
         (Some("MEM"), Some(Ok(avail_kib)), Some(Ok(_)), None) => Some(avail_kib >> 10),
         _ => None,
+    }
+}
+
+/// Least time between two evictions from this host.
+const EVICT_EVERY: Duration = Duration::from_secs(5);
+
+/// Memory pressure: when the host goes under its reserve, or a VM cannot
+/// grow here, one VM is moved to a peer with room. Every VM process's
+/// controller calls this once a second; whichever holds `STATE/evict.lock`
+/// decides, at most once per `EVICT_EVERY`. Standby VMs go first: they are
+/// the cheapest memory to give back.
+fn relieve(host: &Host, starved_here: bool) {
+    let avail = host_available_mib();
+    let reserve = host.cfg.reserve_mib;
+    // A starved VM calls in itself, so a host with room has nothing to decide.
+    if avail >= reserve && !starved_here {
+        return;
+    }
+    let Ok(lock) = std::fs::File::options().create(true).truncate(false).write(true).open(host.state.join("evict.lock")) else { return };
+    if unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&lock), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return;
+    }
+    if avail < reserve {
+        let mut shed = 0;
+        for t in crate::standby::templates(host) {
+            for id in crate::standby::live(host, &t) {
+                crate::standby::stop(id);
+                shed += 1;
+            }
+        }
+        if shed > 0 {
+            eprintln!("host has {avail} MiB available, under its {reserve} MiB reserve: stopped {shed} standby vms");
+            return;
+        }
+    }
+    if host.cfg.peers.is_empty() {
+        return;
+    }
+    let last = host.state.join("evict.last");
+    let recent = std::fs::metadata(&last).and_then(|m| m.modified()).ok().and_then(|t| std::time::SystemTime::now().duration_since(t).ok());
+    if recent.is_some_and(|d| d < EVICT_EVERY) {
+        return;
+    }
+    let rss = |pid: Option<u32>| pid.and_then(|p| crate::util::proc_kb(&format!("/proc/{p}/status"), "VmRSS")).unwrap_or(0);
+    let running: Vec<_> = host.entries().into_iter().filter(|e| e.state == "running").collect();
+    let Some(vm) = running.iter().find(|e| e.starved).or_else(|| running.iter().max_by_key(|e| rss(e.firecracker))) else { return };
+    let _ = std::fs::write(&last, b"");
+    let why = if vm.starved { "cannot grow here" } else { "the host is low on memory" };
+    for peer in &host.cfg.peers {
+        eprintln!("vm {}: {why} ({avail} MiB available); migrating to {peer}", vm.name);
+        match call(host, &vm.name, json!({"op": "migrate", "to": peer})) {
+            Ok(_) => return eprintln!("vm {}: migrated to {peer}", vm.name),
+            Err(e) => eprintln!("vm {}: migrating to {peer}: {e}", vm.name),
+        }
     }
 }
 

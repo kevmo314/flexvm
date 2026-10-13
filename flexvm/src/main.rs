@@ -3,7 +3,6 @@ mod checkpoint;
 mod compat;
 mod cow;
 mod crc32c;
-mod evict;
 mod fc;
 mod guest;
 mod hold;
