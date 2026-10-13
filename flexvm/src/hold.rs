@@ -47,6 +47,8 @@ const MAX_FRAME: usize = 65535;
 const ACCEPT_WAIT: Duration = Duration::from_secs(1);
 /// How long a source waits for a target to confirm a sync.
 const SYNC_WAIT: Duration = Duration::from_millis(250);
+/// How long a source may take to send one buffer of the stream.
+const FLUSH_WAIT: Duration = Duration::from_millis(400);
 /// How long a source waits for the target's account of the stream.
 const REPLY_WAIT: Duration = Duration::from_secs(1);
 
@@ -58,6 +60,8 @@ pub struct Holder {
     held: Mutex<HashMap<Ipv4Addr, Arc<Entry>>>,
     /// The reader has packets in hand that it has not queued yet.
     reading: AtomicBool,
+    /// Held while the TUN route of an address is added or deleted.
+    routes: Mutex<()>,
 }
 
 struct Entry {
@@ -121,7 +125,7 @@ impl Holder {
         let _ = crate::net::sysctl(&format!("net.ipv6.conf.{dev}.disable_ipv6"), "1");
         crate::net::set_link_up(&dev, true)?;
         let ifindex = crate::net::ifindex(&dev)?;
-        let h = Arc::new(Holder { dev, ifindex, tun, held: Mutex::new(HashMap::new()), reading: AtomicBool::new(false) });
+        let h = Arc::new(Holder { dev, ifindex, tun, held: Mutex::new(HashMap::new()), reading: AtomicBool::new(false), routes: Mutex::new(()) });
         let reader = h.clone();
         std::thread::Builder::new().name("hold".into()).spawn(move || reader.read_loop())?;
         Ok(Some(h))
@@ -130,6 +134,7 @@ impl Holder {
     /// Starts holding packets for `ip` for migration `mig`: call just before
     /// the VM stops taking them.
     pub fn hold(&self, ip: Ipv4Addr, mig: u64) -> Result<()> {
+        let _routes = self.routes.lock().unwrap();
         let entry = Arc::new(Entry { mig, q: Mutex::default() });
         self.held.lock().unwrap().insert(ip, entry);
         if let Err(e) = tun_route(RTM_NEWROUTE, NLM_F_CREATE | NLM_F_REPLACE, ip, self.ifindex) {
@@ -245,6 +250,9 @@ impl Holder {
     /// packets cannot be delivered), and the address's route through the TUN
     /// device if it is still there. Returns what it dropped.
     pub fn forget(&self, ip: Ipv4Addr, mig: u64) -> Stats {
+        // With the hold check and the route deletion under `routes`, a newer
+        // migration's hold of `ip` can never lose its route to this one.
+        let _routes = self.routes.lock().unwrap();
         let gone = {
             let mut held = self.held.lock().unwrap();
             match held.get(&ip) {
@@ -560,7 +568,6 @@ pub fn start(conn: &TcpStream) -> Result<u64> {
 /// the target, it waits, up to `CATCH_UP` per round, until the target has
 /// injected everything sent so far (`SYNC`), so those come first.
 pub fn send(holder: &Holder, ip: Ipv4Addr, mig: u64, conn: &TcpStream, seq: u64, switch: impl FnOnce() -> Result<()>) -> Option<(Stats, Result<()>)> {
-    let _ = conn.set_write_timeout(Some(CATCH_UP * 4));
     let out = std::cell::RefCell::new(Out { buf: Vec::with_capacity(64 << 10), seq, broken: false, conn });
     let mut sink = |p: &[u8]| out.borrow_mut().frame(p);
     // Exactly one `s` per sync, in time, or the stream counts as broken.
@@ -568,7 +575,9 @@ pub fn send(holder: &Holder, ip: Ipv4Addr, mig: u64, conn: &TcpStream, seq: u64,
         let mut o = out.borrow_mut();
         o.buf.extend_from_slice(&SYNC.to_be_bytes());
         let mut ack = [0u8; 1];
-        let ok = o.flush() && conn.try_clone().is_ok_and(|c| read_by(&mut BufReader::with_capacity(1, c), &mut ack, Instant::now() + SYNC_WAIT).is_ok()) && ack[0] == b's';
+        // One deadline for sending the sync and reading its answer.
+        let deadline = Instant::now() + SYNC_WAIT;
+        let ok = o.flush(deadline) && conn.try_clone().is_ok_and(|c| read_by(&mut BufReader::with_capacity(1, c), &mut ack, deadline).is_ok()) && ack[0] == b's';
         if !ok {
             o.broken = true;
             eprintln!("hold {ip}: the target did not confirm the held packets; dropping the rest");
@@ -578,7 +587,7 @@ pub fn send(holder: &Holder, ip: Ipv4Addr, mig: u64, conn: &TcpStream, seq: u64,
     let (mut stats, switched) = holder.release(ip, mig, &mut sink, &mut barrier, switch)?;
     let mut o = out.into_inner();
     o.buf.extend_from_slice(&0u32.to_be_bytes());
-    let reply = o.flush().then(|| read_reply(conn, Instant::now() + REPLY_WAIT)).flatten();
+    let reply = o.flush(Instant::now() + FLUSH_WAIT).then(|| read_reply(conn, Instant::now() + REPLY_WAIT)).flatten();
     match reply {
         Some(r) => {
             stats.injected = r["injected"].as_u64().unwrap_or(0);
@@ -622,12 +631,13 @@ impl Out<'_> {
         self.buf.extend_from_slice(&self.seq.to_be_bytes());
         self.buf.extend_from_slice(p);
         self.seq += 1;
-        self.buf.len() < 48 << 10 || self.flush()
+        self.buf.len() < 48 << 10 || self.flush(Instant::now() + FLUSH_WAIT)
     }
 
-    fn flush(&mut self) -> bool {
+    /// Sends what is buffered by `deadline`, or marks the stream broken.
+    fn flush(&mut self, deadline: Instant) -> bool {
         if !self.broken {
-            self.broken = (&mut &*self.conn).write_all(&self.buf).is_err();
+            self.broken = write_by(self.conn, &self.buf, deadline).is_err();
         }
         self.buf.clear();
         !self.broken

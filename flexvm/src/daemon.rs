@@ -366,6 +366,50 @@ fn kill_orphans(run_dir: &Path) -> Result<()> {
 }
 
 /// Creates a cgroup subtree for this daemon's VMs, if cgroup v2 is writable.
+/// Removes this listen address's cgroups that no daemon can own any more:
+/// the name used before roots carried a network namespace, and roots of
+/// namespaces that no longer exist. Only empty ones: rmdir refuses a cgroup
+/// with processes or children in use, and nothing is ever killed here.
+fn prune_cgroups(root: &Path, base: &str, mine: &Path) {
+    let live = live_netns();
+    for e in std::fs::read_dir(root).into_iter().flatten().flatten() {
+        let path = e.path();
+        let name = e.file_name().to_string_lossy().into_owned();
+        let stale = match name.strip_prefix(base) {
+            Some("") => true,
+            Some(rest) => rest.strip_prefix("_ns").and_then(|n| n.parse::<u64>().ok()).is_some_and(|n| !live.contains(&n)),
+            None => false,
+        };
+        if !stale || path == mine || !path.is_dir() {
+            continue;
+        }
+        for child in std::fs::read_dir(&path).into_iter().flatten().flatten() {
+            if child.path().is_dir() {
+                let _ = std::fs::remove_dir(child.path());
+            }
+        }
+        let _ = std::fs::remove_dir(&path);
+    }
+}
+
+/// Inodes of the network namespaces that exist: those of processes and
+/// those kept by `ip netns`.
+fn live_netns() -> HashSet<u64> {
+    use std::os::unix::fs::MetadataExt;
+    let mut live = HashSet::new();
+    for e in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+        if let Ok(m) = std::fs::metadata(e.path().join("ns/net")) {
+            live.insert(m.ino());
+        }
+    }
+    for e in std::fs::read_dir("/run/netns").into_iter().flatten().flatten() {
+        if let Ok(m) = std::fs::metadata(e.path()) {
+            live.insert(m.ino());
+        }
+    }
+    live
+}
+
 fn setup_cgroups(listen: &str) -> Option<PathBuf> {
     let root = PathBuf::from("/sys/fs/cgroup/flexvm");
     std::fs::create_dir_all(&root).ok()?;
@@ -374,7 +418,9 @@ fn setup_cgroups(listen: &str) -> Option<PathBuf> {
     // and must not share a cgroup (shutdown kills everything in it).
     let netns = std::fs::read_link("/proc/self/ns/net").ok()?;
     let netns: String = netns.to_string_lossy().chars().filter(char::is_ascii_digit).collect();
-    let mine = root.join(format!("{}_ns{netns}", listen.replace([':', '.', '[', ']'], "_")));
+    let base = listen.replace([':', '.', '[', ']'], "_");
+    let mine = root.join(format!("{base}_ns{netns}"));
+    prune_cgroups(&root, &base, &mine);
     std::fs::create_dir_all(&mine).ok()?;
     // Drop leftovers from a previous run; rmdir only succeeds on empty cgroups.
     for e in std::fs::read_dir(&mine).ok()?.flatten() {
@@ -768,8 +814,8 @@ impl Daemon {
         };
         let ip = match vm {
             Some(vm) => {
-                vm.kill();
                 self.drop_held_in(&vm);
+                vm.kill();
                 if let (State::Source(mig), Some(h)) = (vm.state(), &self.holder) {
                     h.forget(vm.ip, mig);
                 }
@@ -1386,6 +1432,7 @@ impl Daemon {
             let pulled = start.elapsed();
             if let Some(why) = vm.pager.failed() {
                 eprintln!("vm {}: lost its memory ({why}); stopping it", vm.name);
+                d.drop_held_in(&vm);
                 vm.kill();
             }
             let released = release_source(&source);
@@ -1433,6 +1480,7 @@ impl Daemon {
         }
         let vms: Vec<Arc<Vm>> = self.vms.lock().unwrap().drain().map(|(_, vm)| vm).collect();
         for vm in vms {
+            self.drop_held_in(&vm);
             vm.kill();
             self.addrs.lock().unwrap().used.remove(&vm.ip);
         }

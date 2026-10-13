@@ -242,6 +242,7 @@ impl Daemon {
         // stops before Firecracker dies, and its page states are never read
         // again: a resume pages in from the checkpoint.
         self.vms.lock().unwrap().remove(name);
+        self.drop_held_in(&vm);
         vm.kill();
         t.mark("release");
         let data_mib = (manifest.data_pages * PAGE_SIZE as u64) >> 20;
