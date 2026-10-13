@@ -400,16 +400,30 @@ not wait on the host:
   touched. Under the default heuristic, `bytearray(1 << 30)` in a 230 MiB
   guest failed with ENOMEM before touching a page, which no host reaction
   could fix.
-- **Asking, not polling.** flexvm-init (`guest/src/mem.rs`) puts everything in
-  a memory cgroup whose `memory.high` sits `headroom(MemTotal)` below
-  MemTotal. That is the same mark the daemon keeps free (a quarter of the
-  guest, at least 1 GiB). Crossing it wakes the agent (a `memory.events`
-  notification, no timer), which sends `MEM <available> <total>` to the host
-  on vsock port 53. The daemon resizes at once with those fresh numbers
-  instead of waiting for its next tick.
+- **Asking, not polling.** flexvm-init (`guest/src/mem.rs`) runs everything
+  it starts under a memory cgroup, `/vm`, whose `memory.high` sits
+  `headroom(MemTotal)` below MemTotal. That is the same mark the daemon keeps
+  free (a quarter of the guest, at least 1 GiB). Commands and the image app
+  go in `/vm/work` and readiness checks in their own groups under `/vm`;
+  flexvm-init itself stays outside, so the throttle never slows the thread
+  that lifts it. Crossing the mark wakes the agent (a `memory.events`
+  notification, no timer), which sends `MEM <available KiB> <total KiB>` to
+  the host on vsock port 53. The daemon resizes at once instead of waiting
+  for its next tick.
+- **The guest is untrusted.** A request may be at most 128 bytes and must
+  arrive within 500 ms; malformed ones are dropped. Requests are acted on at
+  most every 50 ms per VM; the rest get `busy`. The guest's size comes from
+  Firecracker, not from the guest; what it says is free only steers growth.
+  Each step grows by at most a quarter of the guest. All growth, from guest
+  requests and ticks alike, is admitted against `--reserve` under one host-wide
+  lock, with the last 10 s of grants counted as used (plugged memory shows up
+  in MemAvailable only once touched). A refused guest is told `full` and
+  marked starved. Admission is not enforcement: a guest can still fill memory
+  that is already plugged, the 4 GiB pre-plug included (#54).
 - **Wait, don't die.** Allocations that outrun the plug are throttled by the
-  kernel at `memory.high` rather than OOM-killed. Memory block uevents move the
-  mark as memory arrives. If the host answers `full` (at the ceiling), or
+  kernel at `memory.high` rather than OOM-killed. Memory block uevents move
+  the mark as memory arrives. The agent subscribes to them before it first
+  reads MemTotal, and re-reads it on every reply and retry. If the host answers `full` (at the ceiling), or
   nothing arrives within 3 s, the agent lifts the throttle, and the guest
   behaves as it would without it.
 - **Boot memory for page structs.** Hot-plugged memory is movable, so the
@@ -422,8 +436,8 @@ not wait on the host:
   guest has had more than three times its headroom free for 10 s.
 - **Host accounting.** A VM is starved (and migrated by the pressure policy)
   only when it is actually short of free memory and cannot grow here: at its
-  ceiling, or with the host below `--reserve`. Plugged-but-free memory is not
-  counted as use, and the pressure policy still picks VMs by host RSS.
+  ceiling, or refused admission. Plugged-but-free memory is not counted as
+  use, and the pressure policy still picks VMs by host RSS.
 - **Resizes stay out of lifecycle operations.** A resize, whether from a
   controller tick or from the guest asking, holds the VM's reservation, like
   migrations, checkpoints and pauses do, and only touches a running VM. A
