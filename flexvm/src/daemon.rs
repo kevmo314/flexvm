@@ -36,11 +36,15 @@ use crate::vm::{State, Vm};
 mod lifecycle;
 
 /// All supported test faults (including lifecycle hooks).
+/// Longest a release of held packets into a VM here waits for those still on
+/// their way (after an aborted migration); a checkpoint's is shorter.
+const RELEASE_LOCAL: Duration = Duration::from_millis(100);
+
 const FAULTS: &[&str] = &[
     "pages", "route", "lost_ack", "status", "prepare_fail", "short_incoming", "slow_preload",
     "restore_no_hold", "restore_before_run", "restore_after_run", "ckpt_memhash", "ckpt_fail_protect",
     "ckpt_no_hold", "ckpt_abort", "ckpt_slow", "ckpt_fail_write", "ckpt_copy_wait", "resume_kill", "kill_prepared",
-    "guest_drop", "guest_lose_reply",
+    "guest_drop", "guest_lose_reply", "hot_low_estimate",
 ];
 
 pub struct Config {
@@ -493,7 +497,7 @@ impl Daemon {
     fn template(&self, name: &str) -> Result<Arc<Template>> {
         let dir = Template::resolve(&self.cfg.paths, name)?;
         let tpl = self.template_at(name, dir)?;
-        self.hot.warm(&tpl);
+        self.hot.warm(&tpl, self.fault("hot_low_estimate"));
         self.forget_old_generations(&tpl);
         Ok(tpl)
     }
@@ -570,6 +574,9 @@ impl Daemon {
         let op = req["op"].as_str().unwrap_or("").to_string();
         // A release lets a shutting-down source exit; it must still get its reply out.
         let _releasing = (op == "release").then(|| self.ops.enter());
+        // The hot pool refills only once this run has answered (dropped
+        // after the reply is sent), so its load does not slow the START.
+        let _starting = (op == "run").then(|| self.hot.starting());
         let name = req["name"].as_str().unwrap_or("").to_string();
         let reply = match op.as_str() {
             // Streaming ops write their own replies.
@@ -1257,12 +1264,17 @@ impl Daemon {
         // Packets held meanwhile go into the tap first: Firecracker reads
         // them once resumed, ahead of what the restored route brings.
         if let Some(h) = &self.holder {
-            self.release_into(h, vm.ip, mig, vm, |()| net::attach(vm.ip, &vm.tap));
+            self.release_into(h, vm.ip, mig, vm, RELEASE_LOCAL, |()| net::attach(vm.ip, &vm.tap));
         }
         let (s, e) = match vm.resume() {
             Ok(s) => (s, e),
             Err(r) => (State::Failed, format!("{e}; resuming it here failed too: {r}").into()),
         };
+        // Still held only if the route could not be switched back above
+        // (`resume` routes it again): never leave it on the hold device.
+        if let Some(h) = &self.holder {
+            h.forget(vm.ip, mig);
+        }
         *vm.state.lock().unwrap() = s;
         // The VM stays here after all: its address is no longer lent.
         if self.cfg.vm_ips.contains(vm.ip) {
@@ -1339,7 +1351,7 @@ impl Daemon {
         let ip = vm.ip;
         let newer = self.vms.lock().unwrap().values().find(|v| v.ip == ip && !Arc::ptr_eq(v, vm) && v.state().local()).cloned();
         if let Some(newer) = newer {
-            let held = self.holder.as_ref().and_then(|h| self.release_into(h, ip, mig, &newer, Ok));
+            let held = self.holder.as_ref().and_then(|h| self.release_into(h, ip, mig, &newer, RELEASE_LOCAL, Ok));
             return (held, Ok(()));
         }
         let via: Ipv4Addr = match target["underlay"].as_str().and_then(|s| s.parse().ok()) {
@@ -1396,9 +1408,20 @@ impl Daemon {
         (held, res)
     }
 
-    /// Injects what migration `mig` held for `ip` into `vm`'s tap (brought
-    /// up for it), then calls `switch`.
-    fn release_into(&self, h: &Holder, ip: Ipv4Addr, mig: u64, vm: &Vm, switch: impl FnOnce(()) -> Result<()>) -> Option<hold::Stats> {
+    /// Injects what migration (or checkpoint) `mig` held for `ip` into `vm`'s
+    /// tap (brought up for it), calls `switch`, and injects what was still on
+    /// its way, waiting at most `within` (see `Holder::release_local`). If
+    /// the switch fails, that is logged and the address stays held until
+    /// the caller `forget`s it.
+    fn release_into(
+        &self,
+        h: &Holder,
+        ip: Ipv4Addr,
+        mig: u64,
+        vm: &Vm,
+        within: Duration,
+        switch: impl FnOnce(()) -> Result<()>,
+    ) -> Option<hold::Stats> {
         if !h.holding_for(ip, mig) {
             return None;
         }
@@ -1411,9 +1434,15 @@ impl Daemon {
                 return None;
             }
         };
-        let (mut stats, _) = h.release(ip, mig, &mut |p| hold::valid(p, ip) && inj.send(p), &mut || true, || switch(()))?;
+        let (mut stats, switched) = h.release_local(ip, mig, &mut |p| hold::valid(p, ip) && inj.send(p), || switch(()), within)?;
+        if let Err(e) = switched {
+            eprintln!("vm {}: routing {ip} back to its tap after injecting the held packets: {e}", vm.name);
+        }
         stats.injected = stats.packets;
         stats.dropped_target = inj.dropped();
+        // Closing a packet socket waits for an RCU grace period (tens of ms
+        // on a busy host), which the VM, still paused, need not wait for.
+        thread::spawn(move || drop(inj));
         Some(stats)
     }
 

@@ -450,24 +450,33 @@ impl Vm {
     /// `save_state`, one registered after sees the state and closes itself.
     fn leave(&self, to: State) -> Result<()> {
         let _devices = self.devices.lock().unwrap();
-        let mut st = self.state.lock().unwrap();
-        if !matches!(*st, State::Running | State::Paused) || self.pager.failed().is_some() {
-            bail!("vm {} is not running here", self.name);
-        }
-        if self.pager.remote_left() > 0 {
-            bail!("vm {} is still pulling its memory from its previous host or checkpoint", self.name);
-        }
-        if self.pending_net.lock().unwrap().is_some() {
-            bail!("vm {} has not taken its new address yet; resume it first", self.name);
-        }
+        let leavable = |st: State| -> Result<()> {
+            if !matches!(st, State::Running | State::Paused) || self.pager.failed().is_some() {
+                bail!("vm {} is not running here", self.name);
+            }
+            if self.pager.remote_left() > 0 {
+                bail!("vm {} is still pulling its memory from its previous host or checkpoint", self.name);
+            }
+            if self.pending_net.lock().unwrap().is_some() {
+                bail!("vm {} has not taken its new address yet; resume it first", self.name);
+            }
+            Ok(())
+        };
+        leavable(*self.state.lock().unwrap())?;
         // A clock request that failed may still be on its way into the guest,
         // and must not arrive after the snapshot (on a target, or in a
         // checkpoint) with a stale time. The agent serves requests in order,
-        // so a ping answered now means it has been dealt with.
+        // so a ping answered now means it has been dealt with. Not under the
+        // state lock: a ping can take seconds, and the daemon reads `state`
+        // under its VM map's lock.
         if self.clock_unsure.load(Ordering::SeqCst) {
             crate::guest::ping(&self.vsock()).map_err(|e| format!("vm {}: guest agent not answering: {e}", self.name))?;
             self.clock_unsure.store(false, Ordering::SeqCst);
         }
+        // Transitions are serialized by the daemon's reservation; check again
+        // all the same (the pager may have failed meanwhile).
+        let mut st = self.state.lock().unwrap();
+        leavable(*st)?;
         self.was_paused.store(*st == State::Paused, Ordering::SeqCst);
         *st = to;
         Ok(())

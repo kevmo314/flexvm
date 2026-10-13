@@ -218,6 +218,7 @@ impl Daemon {
             "protect": {"ranges": saved.protected, "ms": ms(saved.protect)},
             "copy": saved.copy,
             "pause_memhash": saved.memhash,
+            "held_packets": saved.held,
             "timings_ms": t.json(),
         }))
     }
@@ -506,12 +507,15 @@ impl Daemon {
         cancelled()?;
         vm.start_checkpoint()?;
         let paused = Instant::now();
+        // Packets for the VM from just before the pause until it runs again
+        // are held, not lost on its downed tap (see `PacketHold`).
+        let mut hold = PacketHold { d: self, vm, id: migration_id(), stats: None };
         // A checkpoint that fails gives back the dirty pages it took (see
         // `Pager::unfreeze`), so the last checkpoint stays the base of the
         // next delta; one that succeeds becomes it.
         let mut memhash = None;
         let frozen = (|| -> Result<Frozen> {
-            let runs = vm.save_state(&staging.vmstate(), false, || {})?;
+            let runs = vm.save_state(&staging.vmstate(), false, || hold.hold())?;
             t.mark("snapshot");
             if self.fault("ckpt_memhash") {
                 memhash = Some(vm.pager.content_hash()?);
@@ -537,7 +541,7 @@ impl Daemon {
         let frozen = match frozen {
             Ok(f) => f,
             Err(e) => {
-                return Err(match vm.end_checkpoint() {
+                return Err(match hold.end() {
                     Ok(_) => e,
                     Err(r) => format!("{e}; {r}").into(),
                 });
@@ -559,7 +563,7 @@ impl Daemon {
             held
         });
         if cow {
-            if let Err(e) = vm.end_checkpoint() {
+            if let Err(e) = hold.end() {
                 vm.pager.unfreeze(&frozen);
                 return Err(e);
             }
@@ -645,10 +649,11 @@ impl Daemon {
             Ok((manifest, id)) => {
                 // The new base of deltas, if the VM runs on with tracking.
                 *vm.last_checkpoint.lock().unwrap() = cow.then(|| (dest, id.clone()));
-                Ok(Saved { manifest, id, paused, dirty: frozen.dirty, protected: frozen.protected, protect: frozen.protect, copy, memhash })
+                let held = hold.stats.map(|s| s.json());
+                Ok(Saved { manifest, id, paused, dirty: frozen.dirty, protected: frozen.protected, protect: frozen.protect, copy, memhash, held })
             }
             Err(CommitError::Failed(e)) if cow => Err(e),
-            Err(CommitError::Failed(e)) => match vm.end_checkpoint() {
+            Err(CommitError::Failed(e)) => match hold.end() {
                 Ok(_) => Err(e),
                 Err(r) => Err(format!("{e}; {r}").into()),
             },
@@ -737,6 +742,56 @@ pub(super) struct Saved {
     pub copy: Option<Value>,
     /// Test hook: the canonical hash of memory at the pause.
     pub memhash: Option<String>,
+    /// The packets held while it was paused, when it went back to running.
+    pub held: Option<Value>,
+}
+
+/// Packets for a VM's address while a checkpoint has it paused: held on the
+/// hold device (see `hold`) from just before the pause, as a migration
+/// does, instead of following the host's default route once the downed tap
+/// takes the VM's /32 with it (a TCP peer would wait out a retransmit
+/// timeout). `end` injects them into the VM's own tap and gives the address
+/// back to it before resuming, so they arrive ahead of newer traffic.
+/// Dropped without `end` (the VM stops here), they are forgotten.
+/// Longest a checkpoint's release waits for held packets still on their way.
+const CKPT_RELEASE: Duration = Duration::from_millis(20);
+
+struct PacketHold<'a> {
+    d: &'a Daemon,
+    vm: &'a Vm,
+    id: u64,
+    stats: Option<crate::hold::Stats>,
+}
+
+impl PacketHold<'_> {
+    /// For the `unroute` of `save_state`: just before the pause.
+    fn hold(&self) {
+        if let Some(Err(e)) = self.d.holder.as_ref().map(|h| h.hold(self.vm.ip, self.id)) {
+            eprintln!("vm {}: not holding packets during the checkpoint: {e}", self.vm.name);
+        }
+    }
+
+    /// Hands the held packets to the VM, then `Vm::end_checkpoint`. Waits at
+    /// most `CKPT_RELEASE` for packets still on their way, as the VM stays
+    /// paused meanwhile.
+    fn end(&mut self) -> Result<State> {
+        let Some(h) = &self.d.holder else { return self.vm.end_checkpoint() };
+        let (ip, tap) = (self.vm.ip, &self.vm.tap);
+        self.stats = self.d.release_into(h, ip, self.id, self.vm, CKPT_RELEASE, |()| net::attach(ip, tap));
+        let res = self.vm.end_checkpoint();
+        // Still held only if the route could not be switched back (the
+        // resume routes it again, or failed): never leave it on the device.
+        h.forget(ip, self.id);
+        res
+    }
+}
+
+impl Drop for PacketHold<'_> {
+    fn drop(&mut self) {
+        if let Some(h) = &self.d.holder {
+            h.forget(self.vm.ip, self.id);
+        }
+    }
 }
 
 /// How a restore failed: before the VM's vCPUs ever ran, or after.

@@ -53,6 +53,13 @@ const API_TIMEOUT: Duration = Duration::from_secs(5);
 const FORKS_BASELINE: usize = 0;
 /// How long the guest has to reseed after its first resume.
 const RESEED_TIMEOUT: Duration = Duration::from_secs(5);
+/// First wait before loading for a stock again after a failed load, or one
+/// that came out over the budget; doubled each time, up to `MAX_BACKOFF`.
+const BACKOFF: Duration = Duration::from_secs(5);
+const MAX_BACKOFF: Duration = Duration::from_secs(300);
+/// Longest a load waits for runs in progress to answer (`starting`): runs
+/// that keep coming must not keep the pool from ever refilling.
+const MAX_DEFER: Duration = Duration::from_secs(2);
 
 /// A VM restored from a template, run once to settle and paused again.
 pub struct Paused {
@@ -215,6 +222,19 @@ struct State {
     /// Paused VMs of superseded generations still being torn down (KiB):
     /// they count against the budget until they are gone.
     retiring_kib: u64,
+    /// Runs in progress (`starting`), and since when there have been any:
+    /// no load starts meanwhile, for up to `MAX_DEFER`.
+    starting: usize,
+    starting_since: Option<Instant>,
+    /// Loads started, for `describe`.
+    loads: u64,
+}
+
+impl State {
+    /// Whether a load should wait for the runs in progress to answer.
+    fn deferring(&self) -> bool {
+        self.starting > 0 && self.starting_since.is_some_and(|t| t.elapsed() < MAX_DEFER)
+    }
 }
 
 struct Stock {
@@ -222,8 +242,40 @@ struct Stock {
     ready: VecDeque<Paused>,
     /// Largest host memory seen for one of these VMs (KiB), or an estimate.
     cost_kib: u64,
-    /// Don't retry before this after a failed load.
+    /// Don't retry before this after a failed load, or one over the budget.
     retry_at: Option<Instant>,
+    /// The wait before the next retry.
+    backoff: Duration,
+}
+
+impl Stock {
+    fn wants(&self, per_template: usize) -> bool {
+        self.ready.len() < per_template && self.retry_at.is_none_or(|t| t <= Instant::now())
+    }
+
+    /// Waits longer before each retry, until a load is stocked. Returns the wait.
+    fn back_off(&mut self) -> Duration {
+        let wait = self.backoff;
+        self.retry_at = Some(Instant::now() + wait);
+        self.backoff = (wait * 2).min(MAX_BACKOFF);
+        wait
+    }
+}
+
+/// A run in progress (see `HotPool::starting`).
+pub struct Starting<'a>(&'a HotPool);
+
+impl Drop for Starting<'_> {
+    fn drop(&mut self) {
+        {
+            let mut s = self.0.state.lock().unwrap();
+            s.starting -= 1;
+            if s.starting == 0 {
+                s.starting_since = None;
+            }
+        }
+        self.0.wake.notify_one();
+    }
 }
 
 impl HotPool {
@@ -244,6 +296,19 @@ impl HotPool {
             *hot.worker.lock().unwrap() = Some(std::thread::spawn(move || h.refill()));
         }
         hot
+    }
+
+    /// Marks a run as in progress until the guard is dropped, once it has
+    /// answered: loading a VM alongside (a snapshot load, the guest's first
+    /// run) would slow its resume and `START`, so the worker waits, up to
+    /// `MAX_DEFER`, and refills once the last one is done.
+    pub fn starting(&self) -> Starting<'_> {
+        let mut s = self.state.lock().unwrap();
+        if s.starting == 0 {
+            s.starting_since = Some(Instant::now());
+        }
+        s.starting += 1;
+        Starting(self)
     }
 
     /// Hands out a paused VM of `template`'s generation, or None if there is
@@ -270,7 +335,8 @@ impl HotPool {
                 }
             }
         };
-        self.wake.notify_one();
+        // No wake: the run that took it holds `starting` until it answers,
+        // and lets the worker refill then.
         if !dead.is_empty() {
             eprintln!("hot pool {}: dropping {} paused vms that died", template.name, dead.len());
         }
@@ -280,7 +346,8 @@ impl HotPool {
 
     /// Starts keeping paused VMs of `template` ready, and drops the stock of
     /// any older generation of it: those VMs would come from superseded files.
-    pub fn warm(self: &Arc<Self>, template: &Arc<Template>) {
+    /// `low_estimate`: test fault `hot_low_estimate` (see `Stock::new`).
+    pub fn warm(self: &Arc<Self>, template: &Arc<Template>, low_estimate: bool) {
         if self.per_template == 0 {
             return;
         }
@@ -292,7 +359,7 @@ impl HotPool {
             }
             let old: Vec<String> =
                 s.stocks.iter().filter(|(_, k)| k.template.name == template.name).map(|(k, _)| k.clone()).collect();
-            s.stocks.insert(key, Stock::new(template.clone()));
+            s.stocks.insert(key, Stock::new(template.clone(), low_estimate));
             let stale: Vec<Stock> = old.iter().filter_map(|k| s.stocks.remove(k)).collect();
             let cost: u64 = stale.iter().map(|k| k.cost_kib * k.ready.len() as u64).sum();
             s.retiring_kib += cost;
@@ -321,38 +388,62 @@ impl HotPool {
         let s = self.state.lock().unwrap();
         let ready: HashMap<String, usize> =
             s.stocks.iter().map(|(k, v)| (format!("{}@{k}", v.template.name), v.ready.len())).collect();
-        json!({"per_template": self.per_template, "budget_mib": self.budget_kib >> 10, "ready": ready, "loading": s.loading.is_some()})
+        let cost: HashMap<String, u64> =
+            s.stocks.iter().map(|(k, v)| (format!("{}@{k}", v.template.name), v.cost_kib >> 10)).collect();
+        json!({
+            "per_template": self.per_template,
+            "budget_mib": self.budget_kib >> 10,
+            "ready": ready,
+            "cost_mib": cost,
+            "loading": s.loading.is_some(),
+            "loads": s.loads,
+        })
     }
 
     /// The worker: keeps the stocks within the memory budget, and loads one
     /// paused VM at a time for the emptiest stock while it has room.
     fn refill(&self) {
         loop {
-            let (pids, epoch) = {
+            let (pids, epoch, dead) = {
                 let s = self.state.lock().unwrap();
-                let now = Instant::now();
-                let wants = |s: &State| {
-                    s.stocks.values().any(|k| k.ready.len() < self.per_template && k.retry_at.is_none_or(|t| t <= now))
-                };
-                let (s, _) = self.wake.wait_timeout_while(s, Duration::from_secs(1), |s| !s.closed && !wants(s)).unwrap();
+                let wants = |s: &State| !s.deferring() && s.stocks.values().any(|k| k.wants(self.per_template));
+                let (mut s, _) = self.wake.wait_timeout_while(s, Duration::from_secs(1), |s| !s.closed && !wants(s)).unwrap();
                 if s.closed {
                     return;
                 }
-                let pids: Vec<(String, u32)> = s
+                // A paused VM whose Firecracker or pager died is torn down
+                // now: it would neither count against the budget (no RSS)
+                // nor ever be handed out, yet hold its stock's place.
+                let mut dead = Vec::new();
+                for k in s.stocks.values_mut() {
+                    for mut p in std::mem::take(&mut k.ready) {
+                        match p.alive() {
+                            true => k.ready.push_back(p),
+                            false => dead.push((k.template.name.clone(), p)),
+                        }
+                    }
+                }
+                let pids: Vec<(String, u32, u64)> = s
                     .stocks
                     .iter()
-                    .flat_map(|(n, k)| k.ready.iter().filter_map(|p| Some((n.clone(), p.pid()?))))
+                    .flat_map(|(n, k)| k.ready.iter().filter_map(|p| Some((n.clone(), p.pid()?, k.cost_kib))))
                     .collect();
-                (pids, (s.epoch, s.retiring_kib))
+                (pids, (s.epoch, s.retiring_kib), dead)
             };
+            for (name, _) in &dead {
+                eprintln!("hot pool {name}: dropping a paused vm that died");
+            }
+            drop(dead);
             let (epoch, retiring) = epoch;
             // What the stock costs now, measured outside the lock. Paused VMs
-            // grow a little after they are stocked (prefetch, settling).
+            // grow a little after they are stocked (prefetch, settling). One
+            // that cannot be measured (it died just now) counts as its
+            // stock's cost until it is dropped.
             let mut used = retiring;
             let mut seen: HashMap<String, u64> = HashMap::new();
-            for (key, pid) in &pids {
+            for (key, pid, cost) in &pids {
                 let kib = rss_kib(*pid);
-                used += kib;
+                used += if kib == 0 { *cost } else { kib };
                 let max = seen.entry(key.clone()).or_default();
                 *max = (*max).max(kib);
             }
@@ -371,16 +462,21 @@ impl HotPool {
                         break;
                     };
                     let p = k.ready.pop_back().unwrap();
-                    over = over.saturating_sub(p.pid().map(rss_kib).unwrap_or(k.cost_kib));
+                    over = over.saturating_sub(p.pid().map(rss_kib).filter(|&kib| kib > 0).unwrap_or(k.cost_kib));
                     excess.push(p);
                 }
-                let now = Instant::now();
-                let pick = s
-                    .stocks
-                    .values()
-                    .filter(|k| k.ready.len() < self.per_template && k.retry_at.is_none_or(|t| t <= now))
-                    .min_by_key(|k| k.ready.len())
-                    .map(|k| (k.template.clone(), k.cost_kib));
+                // While runs are starting, only the budget is kept.
+                let pick = match s.deferring() {
+                    true => None,
+                    false => s
+                        .stocks
+                        .values()
+                        .filter(|k| k.wants(self.per_template))
+                        // One that fits first: a template whose VMs never fit
+                        // must not keep the others from loading.
+                        .min_by_key(|k| (used + k.cost_kib > self.budget_kib, k.ready.len()))
+                        .map(|k| (k.template.clone(), k.cost_kib)),
+                };
                 (pick, excess)
             };
             if !excess.is_empty() {
@@ -406,13 +502,23 @@ impl HotPool {
             };
             {
                 let mut s = self.state.lock().unwrap();
+                // A run may have started since the pick (taking the idle
+                // Firecracker can take a while): wait until it has answered,
+                // keeping the Firecracker, so the load never overlaps it.
+                while !s.closed && s.epoch == epoch && s.deferring() {
+                    let left = s.starting_since.map_or(Duration::ZERO, |t| MAX_DEFER.saturating_sub(t.elapsed()));
+                    s = self.wake.wait_timeout(s, left.max(Duration::from_millis(1))).unwrap().0;
+                }
                 if s.closed || s.epoch != epoch {
                     drop(s);
                     drop(idle);
                     continue;
                 }
                 match crate::util::pidfd_open(idle.fc.pid()) {
-                    Ok(fd) => s.loading = Some(Arc::new(fd)),
+                    Ok(fd) => {
+                        s.loading = Some(Arc::new(fd));
+                        s.loads += 1;
+                    }
                     Err(e) => {
                         drop(s);
                         drop(idle);
@@ -421,18 +527,43 @@ impl HotPool {
                     }
                 }
             }
-            let loaded = Paused::load(idle, template.clone());
+            // One that died as it settled is a failed load (and has no size).
+            let loaded = Paused::load(idle, template.clone()).and_then(|mut p| match p.alive() {
+                true => Ok(p),
+                false => Err("its firecracker or pager died as it settled".into()),
+            });
             // Recheck before stocking it: its own size, and anything that
             // happened meanwhile (shed, close, a newer generation).
             let size = loaded.as_ref().ok().and_then(|p| p.pid()).map(rss_kib).unwrap_or(0);
+            // What the stock uses now: runs may have taken some meanwhile.
+            // (Only this worker adds to it.)
+            let used = self.in_use();
             let mut s = self.state.lock().unwrap();
             s.loading = None;
             let current = s.epoch == epoch && !s.closed;
             match (loaded, s.stocks.get_mut(&template.key())) {
                 (Ok(p), Some(stock)) if current && used + size <= self.budget_kib => {
                     stock.retry_at = None;
+                    stock.backoff = BACKOFF;
                     stock.cost_kib = stock.cost_kib.max(size);
                     stock.ready.push_back(p);
+                }
+                // Over the budget: what it cost is learned (the first
+                // estimate is below a paused VM's real size), so the worker
+                // waits for room rather than load the same VM again and
+                // again; and waits longer each time it still comes out over.
+                (Ok(p), Some(stock)) if current => {
+                    stock.cost_kib = stock.cost_kib.max(size);
+                    let wait = stock.back_off();
+                    drop(s);
+                    eprintln!(
+                        "hot pool {}: dropping a paused vm of {} MiB, over the {} MiB budget ({} MiB in use); next try in {wait:?} at the earliest",
+                        template.name,
+                        size >> 10,
+                        self.budget_kib >> 10,
+                        used >> 10
+                    );
+                    drop(p);
                 }
                 (Ok(p), _) => {
                     drop(s);
@@ -447,11 +578,22 @@ impl HotPool {
         }
     }
 
+    /// Host memory the stocked VMs and those being retired use (KiB),
+    /// measured outside the lock; one that cannot be measured counts as its
+    /// stock's cost.
+    fn in_use(&self) -> u64 {
+        let (pids, retiring) = {
+            let s = self.state.lock().unwrap();
+            let pids: Vec<(u32, u64)> =
+                s.stocks.values().flat_map(|k| k.ready.iter().filter_map(|p| Some((p.pid()?, k.cost_kib)))).collect();
+            (pids, s.retiring_kib)
+        };
+        retiring + pids.iter().map(|&(pid, cost)| Some(rss_kib(pid)).filter(|&k| k > 0).unwrap_or(cost)).sum::<u64>()
+    }
+
     fn failed(&self, template: &Template, why: String) {
-        eprintln!("hot pool {}: cannot load a paused vm: {why}", template.name);
-        if let Some(stock) = self.state.lock().unwrap().stocks.get_mut(&template.key()) {
-            stock.retry_at = Some(Instant::now() + Duration::from_secs(5));
-        }
+        let wait = self.state.lock().unwrap().stocks.get_mut(&template.key()).map_or(BACKOFF, Stock::back_off);
+        eprintln!("hot pool {}: cannot load a paused vm: {why}; next try in {wait:?}", template.name);
     }
 
     /// Tears down every paused VM, and a load in progress, e.g. to give their
@@ -498,9 +640,11 @@ fn rss_kib(pid: u32) -> u64 {
 }
 
 impl Stock {
-    fn new(template: Arc<Template>) -> Stock {
-        let wset: u64 = template.working_set.iter().map(|r| r.1).sum();
+    /// `low` (test fault `hot_low_estimate`) leaves the working set out of
+    /// the first estimate, so it is below what a paused VM costs.
+    fn new(template: Arc<Template>, low: bool) -> Stock {
+        let wset: u64 = if low { 0 } else { template.working_set.iter().map(|r| r.1).sum() };
         let cost_kib = wset * PAGE_SIZE as u64 / 1024 + OVERHEAD_KIB;
-        Stock { template, ready: VecDeque::new(), cost_kib, retry_at: None }
+        Stock { template, ready: VecDeque::new(), cost_kib, retry_at: None, backoff: BACKOFF }
     }
 }
