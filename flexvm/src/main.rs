@@ -417,11 +417,19 @@ fn exec_session(host: &str, name: &str, cmd: &str, stdout: &mut impl Write, stde
     let mut started = false;
     let mut deadline = Instant::now() + Duration::from_secs(30);
     let mut error = String::new();
+    // How many hosts in a row said they have no such VM.
+    let mut unknown = 0;
     for i in 0.. {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() { return Err(format!("exec recovery timed out: {error}").into()); }
-        // A VM that no daemon knows was never there; one mid-migration is known to both.
-        if !started && i == hosts.len() && error.starts_with("no vm named") {
+        // A VM that no daemon knows was never there; one mid-migration is known
+        // to both. One host failing otherwise (it timed out) says nothing.
+        if i > 0 && error.starts_with("no vm named") {
+            unknown += 1;
+        } else {
+            unknown = 0;
+        }
+        if !started && unknown >= hosts.len() {
             return Err(error.into());
         }
         if i > 0 && i % hosts.len() == 0 {

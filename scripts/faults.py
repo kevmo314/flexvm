@@ -80,7 +80,7 @@ def fault(host, f, ms):
 
 FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_before_run", "restore_after_run",
           "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "resume_kill",
-          "prepare_fail", "short_incoming", "slow_preload", "kill_prepared")
+          "prepare_fail", "short_incoming", "slow_preload", "kill_prepared", "guest_drop", "guest_lose_reply")
 
 
 def disarm():
@@ -523,6 +523,61 @@ def exec_race():
     cleanup(n)
 
 
+def guest_calls():
+    """Guest calls during and just after a migration: execs started while the
+    VM moves (on either host, the source's page server down for a while, so
+    the guest is still faulting its memory in) all finish, and the target's
+    own clock step goes through although its first guest connections drop."""
+    n = "ft-guest-calls"
+    m = setup(n)
+    # Only the target's clock step after the arrival puts this right (once
+    # the clock step that may follow the start is done).
+    time.sleep(1)
+    code, out = sh(A, n, "date -s @$(( $(date +%s) - 100 )) >/dev/null")
+    assert code == 0, out
+    stop, results = threading.Event(), {"ok": 0, "failed": []}
+
+    def worker(h):
+        while not stop.is_set():
+            try:
+                code, out = sh(h, n, "echo hi")
+            except subprocess.TimeoutExpired:
+                code, out = None, "hung"
+            if code == 0 and out == "hi":
+                results["ok"] += 1
+            else:
+                results["failed"].append((h, code, out))
+
+    workers = [threading.Thread(target=worker, args=(h,)) for h in (A, B) for _ in range(3)]
+    for w in workers:
+        w.start()
+    time.sleep(0.3)
+    fault(A, "pages", 3000)
+    fault(B, "guest_drop", 1000)
+    ok(A, {"op": "migrate", "name": n, "to": B})
+    got = md5(B, n)
+    wait_released(B, n)
+    time.sleep(0.3)
+    stop.set()
+    for w in workers:
+        w.join()
+    check("guest calls: every exec finished", results["ok"] > 0 and not results["failed"], results)
+    check("guest calls: md5 intact while paging in", got == m, got)
+    check("guest calls: only on B", where(n) == {B: "running"}, where(n))
+    err = guest_clock_error(B, n)
+    check("guest calls: target stepped the guest clock", err is not None and abs(err) < 0.5, err)
+    # A clock step the guest carried out but whose answer was lost goes again.
+    before = ok(B, {"op": "info"})["guest_retries"].get("CLOCK", 0)
+    ok(B, {"op": "pause", "name": n})
+    fault(B, "guest_lose_reply", 300)
+    ok(B, {"op": "resume", "name": n})
+    retried = lambda: ok(B, {"op": "info"})["guest_retries"].get("CLOCK", 0) > before
+    check("guest calls: a clock step with its reply lost went again", wait_for(retried, 10),
+          ok(B, {"op": "info"})["guest_retries"])
+    check("guest calls: exec after the lost reply", sh(B, n, "echo hi") == (0, "hi"))
+    cleanup(n)
+
+
 def target_restart_symlink():
     """target_restart with the target's --run given through a symlink."""
     argv, env = kill_daemon(B)
@@ -564,7 +619,8 @@ def guest_hang():
     for e in execs:
         e.join()
     subprocess.run(["sudo", "kill", "-CONT", fcs[0]])
-    check("guest hang: every exec gave up within its deadline", all(t is not None and t < 20 and c != 0 for t, c in times), times)
+    # The CLI keeps retrying a VM its host knows for 30 s, then gives up.
+    check("guest hang: every exec gave up within its deadline", all(t is not None and t < 40 and c != 0 for t, c in times), times)
     check("guest hang: exec works again", sh(A, n, "echo hi") == (0, "hi"))
     ok(A, {"op": "migrate", "name": n, "to": B})
     wait_released(B, n)
@@ -1625,7 +1681,7 @@ def slow_preload():
 
 SCENARIOS = dict(basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, refused=refused, pages_blip=pages_blip,
                  pages_dead_restore=pages_dead_restore, pages_dead=pages_dead, resume_kill=resume_kill, prepared_retry=prepared_retry, quiet_source=quiet_source,
-                 shared_run_dir=shared_run_dir, exec_race=exec_race, source_killed=source_killed,
+                 shared_run_dir=shared_run_dir, exec_race=exec_race, guest_calls=guest_calls, source_killed=source_killed,
                  target_restart=target_restart, target_restart_symlink=target_restart_symlink, guest_hang=guest_hang,
                  checkpoint_restore=checkpoint_restore, checkpoint_fork=checkpoint_fork,
                  checkpoint_corrupt=checkpoint_corrupt, checkpoint_crash=checkpoint_crash, pause_resume=pause_resume,

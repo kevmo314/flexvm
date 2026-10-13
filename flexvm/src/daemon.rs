@@ -935,15 +935,24 @@ impl Daemon {
     /// fails), `lost_ack` (incoming migrations get no reply), `status`
     /// (migration status queries fail), `prepare_fail` (an incoming migration
     /// fails once everything is prepared), `short_incoming` (a prepared
-    /// incoming migration waits 2 s for the source, not 30) or
+    /// incoming migration waits 2 s for the source, not 30),
     /// `slow_preload` (a migration source sends the preloaded pages 300 ms
     /// after the vmstate), `kill_prepared` (an incoming migration's
-    /// prepared Firecracker dies, and its pager sees it, just before the load) or `resume_kill` (Firecracker
-    /// is killed right after a restored VM's resume is sent).
+    /// prepared Firecracker dies, and its pager sees it, just before the load), `resume_kill` (Firecracker
+    /// is killed right after a restored VM's resume is sent), `guest_drop`
+    /// (the daemon's retried guest requests are refused before reaching the
+    /// guest) or `guest_lose_reply` (they are carried out but their replies
+    /// lost); those two for `ms` from the first request they hit.
     fn inject(&self, req: &Value) -> Result<Value> {
         let Some(faults) = &self.faults else { bail!("fault injection is off (start the daemon with FLEXVM_FAULTS=1)") };
         let fault = req["fault"].as_str().ok_or("missing fault")?;
-        let until = Instant::now() + Duration::from_millis(req["ms"].as_u64().unwrap_or(1000));
+        let ms = Duration::from_millis(req["ms"].as_u64().unwrap_or(1000));
+        match fault {
+            "guest_drop" => *guest::FAULT.lock().unwrap() = Some((guest::Fault::Refuse, ms, None)),
+            "guest_lose_reply" => *guest::FAULT.lock().unwrap() = Some((guest::Fault::LoseReply, ms, None)),
+            _ => {}
+        }
+        let until = Instant::now() + ms;
         faults.lock().unwrap().insert(fault.into(), until);
         Ok(json!({"fault": fault}))
     }
@@ -1023,6 +1032,7 @@ impl Daemon {
             "vms": self.vms.lock().unwrap().len(),
             "hot": self.hot.describe(),
             "loads": crate::vm::loads(),
+            "guest_retries": guest::retries(),
         })
     }
 

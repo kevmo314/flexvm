@@ -19,14 +19,25 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 mod app;
 mod net;
 mod session;
 
 const VSOCK_PORT: u32 = 52;
+/// How long a command's body (after its request line) may take to arrive,
+/// all of it.
+const BODY_TIMEOUT: Duration = Duration::from_secs(30);
+/// Longest request line and command body.
+const MAX_LINE: u64 = 4096;
+const MAX_BODY: usize = 1024 * 1024;
+/// How many command bodies may be arriving at once; more are refused.
+const MAX_BODY_READERS: usize = 16;
+static BODY_READERS: AtomicUsize = AtomicUsize::new(0);
 
 const FRAME_STDOUT: u8 = 1;
 const FRAME_STDERR: u8 = 2;
@@ -229,33 +240,127 @@ fn serve(statuses: Statuses) -> io::Result<()> {
         }
         let stream = unsafe { std::fs::File::from_raw_fd(conn as RawFd) };
         // The host sends its request with the connection; don't let a silent one stall accepting.
-        let timeout = libc::timeval { tv_sec: 1, tv_usec: 0 };
-        let opt = (&timeout as *const libc::timeval).cast();
-        unsafe { libc::setsockopt(conn, libc::SOL_SOCKET, libc::SO_RCVTIMEO, opt, std::mem::size_of_val(&timeout) as _) };
+        receive_timeout(conn, Duration::from_secs(1));
         let Ok(mut r) = stream.try_clone().map(BufReader::new) else { continue };
         let mut line = String::new();
-        if r.read_line(&mut line).is_err() {
+        if !(r.by_ref().take(MAX_LINE).read_line(&mut line).is_ok() && line.ends_with('\n')) {
             continue;
         }
         // NET is on the critical path of every start, right after restore, when a new
         // thread (stack, task, a wakeup on another vCPU) costs milliseconds. PING and
         // NET are quick, so answer them here; only commands get a thread.
         if ["PING", "NET ", "START ", "CLOCK ", "FORKS"].iter().any(|v| line.starts_with(v)) {
-            let _ = handle(stream, r, &line, &statuses);
+            let _ = handle(stream, None, &line, &statuses);
         } else {
+            // A command's body follows the host's reply to the connect, a round
+            // trip later, which a guest still faulting in its memory after a
+            // restore or migration can stretch past a second. It is read off
+            // the accept loop, by a bounded number of readers, within
+            // BODY_TIMEOUT of now.
+            let body = match body_len(&line) {
+                None => None,
+                Some(Err(e)) => {
+                    let _ = write_frame(&mut &stream, FRAME_MSG, format!("error: {e}").as_bytes());
+                    continue;
+                }
+                Some(Ok(len)) => match BodyReader::admit() {
+                    Some(reader) => Some((len, reader, Instant::now() + BODY_TIMEOUT)),
+                    None => {
+                        let _ = write_frame(&mut &stream, FRAME_MSG, b"error: too many commands arriving at once; try again");
+                        continue;
+                    }
+                },
+            };
             let statuses = statuses.clone();
             let sessions = sessions.clone();
             // Out of threads: drop this connection (closing it) rather than abort PID 1.
             let _ = thread::Builder::new().spawn(move || {
+                let body = match body {
+                    None => None,
+                    Some((len, reader, at)) => {
+                        let body = read_body(&mut r, conn, len, at);
+                        drop(reader);
+                        match body {
+                            Ok(b) => Some(b),
+                            Err(e) => {
+                                let _ = write_frame(&mut &stream, FRAME_MSG, format!("error: {e}").as_bytes());
+                                return;
+                            }
+                        }
+                    }
+                };
                 // A blocked write is backpressure from a slow client; migration resets the socket.
                 if matches!(line.split_whitespace().next(), Some("SESSION" | "ATTACH" | "CLOSE")) {
-                    let _ = session::handle(stream, r, &line, &sessions, &statuses);
+                    let body = body.unwrap_or_default();
+                    let _ = session::handle(stream, body.as_slice(), &line, &sessions, &statuses);
                 } else {
-                    let _ = handle(stream, r, &line, &statuses);
+                    let _ = handle(stream, body, &line, &statuses);
                 }
             });
         }
     }
+}
+
+/// Sets how long each receive on `fd` may wait (at least 1 us: 0 means forever).
+fn receive_timeout(fd: RawFd, t: Duration) {
+    let timeout = libc::timeval { tv_sec: t.as_secs() as _, tv_usec: t.subsec_micros().max(u32::from(t.is_zero())) as _ };
+    let opt = (&timeout as *const libc::timeval).cast();
+    unsafe { libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVTIMEO, opt, std::mem::size_of_val(&timeout) as _) };
+}
+
+/// The length of the command body that follows request `line`, if its verb
+/// takes one.
+fn body_len(line: &str) -> Option<io::Result<usize>> {
+    let mut parts = line.split_whitespace();
+    let len = match parts.next()? {
+        "EXEC" | "SPAWN" => parts.next(),
+        "SESSION" => parts.nth(1),
+        _ => return None,
+    };
+    Some(len.and_then(|n| n.parse().ok()).filter(|&n| n <= MAX_BODY).ok_or_else(|| io::Error::other("bad command length")))
+}
+
+/// One of the `MAX_BODY_READERS` slots for a command body being read.
+struct BodyReader;
+
+impl BodyReader {
+    fn admit() -> Option<BodyReader> {
+        let n = BODY_READERS.fetch_add(1, Ordering::SeqCst);
+        if n >= MAX_BODY_READERS {
+            BODY_READERS.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(BodyReader)
+    }
+}
+
+impl Drop for BodyReader {
+    fn drop(&mut self) {
+        BODY_READERS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Reads a `len`-byte command body from `r` (socket `fd`), all of it by
+/// `at`, however slowly it trickles in. Memory grows only as bytes arrive.
+fn read_body(r: &mut impl Read, fd: RawFd, len: usize, at: Instant) -> io::Result<Vec<u8>> {
+    let mut body = Vec::new();
+    let mut buf = [0u8; 16 * 1024];
+    while body.len() < len {
+        let left = at.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "the command did not arrive in time"));
+        }
+        receive_timeout(fd, left);
+        let want = (len - body.len()).min(buf.len());
+        match r.read(&mut buf[..want]) {
+            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+            Ok(n) => body.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(body)
 }
 
 fn frame(w: &Mutex<std::fs::File>, kind: u8, payload: &[u8]) -> io::Result<()> {
@@ -270,20 +375,18 @@ fn write_frame(w: &mut impl Write, kind: u8, payload: &[u8]) -> io::Result<()> {
     w.write_all(payload)
 }
 
-/// Serves one request; `line` is its first line, already read from `r`.
-fn handle(stream: std::fs::File, mut r: BufReader<std::fs::File>, line: &str, statuses: &Statuses) -> io::Result<()> {
+/// Serves one request; `line` is its first line, and `body` the command
+/// that follows it for EXEC and SPAWN.
+fn handle(stream: std::fs::File, body: Option<Vec<u8>>, line: &str, statuses: &Statuses) -> io::Result<()> {
     let line = line.trim_end();
     let out = Arc::new(Mutex::new(stream));
     let (verb, arg) = line.split_once(' ').unwrap_or((line, ""));
     // Commands may span lines, so they come as `<verb> <len>` plus raw bytes.
-    let body;
+    let text;
     let (verb, arg) = match verb {
         "EXEC" | "SPAWN" => {
-            let len: usize = arg.trim().parse().map_err(|_| io::Error::other("bad command length"))?;
-            let mut buf = vec![0u8; len];
-            r.read_exact(&mut buf)?;
-            body = String::from_utf8_lossy(&buf).into_owned();
-            (verb, body.as_str())
+            text = String::from_utf8_lossy(body.as_deref().unwrap_or_default()).into_owned();
+            (verb, text.as_str())
         }
         _ => (verb, arg),
     };
@@ -449,4 +552,36 @@ fn pump(mut r: impl Read + Send + 'static, out: Arc<Mutex<std::fs::File>>, kind:
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn body_lengths() {
+        assert_eq!(body_len("EXEC 12\n").unwrap().unwrap(), 12);
+        assert_eq!(body_len("SESSION abc 3\n").unwrap().unwrap(), 3);
+        assert!(body_len("SESSION abc 1048577\n").unwrap().is_err());
+        assert!(body_len("SPAWN x\n").unwrap().is_err());
+        assert!(body_len("ATTACH abc 0\n").is_none());
+        assert!(body_len("PING\n").is_none());
+    }
+
+    #[test]
+    fn bodies_end_by_their_deadline() {
+        let at = Instant::now() + Duration::from_secs(5);
+        assert_eq!(read_body(&mut &b"echo hi"[..], -1, 7, at).unwrap(), b"echo hi");
+        assert_eq!(read_body(&mut &b"echo"[..], -1, 7, at).unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+        let past = Instant::now() - Duration::from_millis(1);
+        assert_eq!(read_body(&mut &b"echo hi"[..], -1, 7, past).unwrap_err().kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn body_readers_are_capped() {
+        let readers: Vec<_> = std::iter::from_fn(BodyReader::admit).take(MAX_BODY_READERS + 1).collect();
+        assert_eq!(readers.len(), MAX_BODY_READERS);
+        drop(readers);
+        assert!(BodyReader::admit().is_some());
+    }
 }
