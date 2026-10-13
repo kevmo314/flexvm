@@ -393,7 +393,7 @@ impl Daemon {
     /// (or as it was, on failure; or failed, if a checkpoint may have been
     /// published that could not be revoked). Returns the manifest and when
     /// it paused.
-    fn save(&self, vm: &Vm, staging: Staging, t: &mut Phases) -> Result<(Manifest, Instant)> {
+    fn save(&self, vm: &Vm, mut staging: Staging, t: &mut Phases) -> Result<(Manifest, Instant)> {
         // A VM still pulling memory from a migration source or its own
         // checkpoint finishes that first.
         if vm.pager.remote_left() > 0 && !vm.pager.wait_pulled_for(DRAIN_WAIT) {
@@ -407,6 +407,9 @@ impl Daemon {
         // controller cannot make another while we hold the reservation).
         vm.settle_hotplug(Instant::now() + SETTLE_WAIT)?;
         t.mark("settle_hotplug");
+        // Disk space for the pages it has now, while it still runs.
+        staging.preallocate(vm.pager.census()[crate::uffd::PRESENT as usize])?;
+        t.mark("preallocate");
         let plugged = vm.hotplug_plugged();
         vm.start_checkpoint()?;
         let paused = Instant::now();
