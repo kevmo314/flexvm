@@ -967,8 +967,11 @@ impl Daemon {
         });
         match guest {
             Ok((vm, mut g, id)) => {
-                send_json(&mut w, &json!({"ok": true}))?;
-                let copied = std::io::copy(&mut g, &mut w);
+                let copied = (|| -> Result<()> {
+                    send_json(&mut w, &json!({"ok": true}))?;
+                    std::io::copy(&mut g, &mut w)?;
+                    Ok(())
+                })();
                 vm.untrack_exec(id);
                 copied?;
             }

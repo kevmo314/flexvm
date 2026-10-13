@@ -10,6 +10,12 @@ use crate::{spawn, wait_pid, write_frame, Statuses, FRAME_EXIT, FRAME_MSG, FRAME
 
 const CAPACITY: usize = 4 * 1024 * 1024;
 const MAX_CHUNKS: usize = 4096;
+const MAX_SESSIONS: usize = 64;
+const MAX_RETAINED_BYTES: usize = 64 * 1024 * 1024;
+const READ_SIZE: usize = 16 * 1024;
+// Reserve the full ring before spawning, including a partially drained chunk's
+// backing allocation, the next read, and VecDeque's capacity growth slack.
+const RING_BYTES: usize = CAPACITY + 2 * READ_SIZE + 2 * MAX_CHUNKS * std::mem::size_of::<Chunk>();
 const RETENTION: Duration = Duration::from_secs(300);
 /// How long output keeps waiting for a dropped client (the CLI retries for 30 s).
 const GRACE: Duration = Duration::from_secs(30);
@@ -19,8 +25,29 @@ type Session = Arc<(Mutex<Output>, Condvar)>;
 pub type Sessions = Arc<Mutex<HashMap<String, Entry>>>;
 
 pub struct Entry {
-    command: Vec<u8>,
+    command: Option<Vec<u8>>,
     output: Session,
+}
+
+impl Entry {
+    fn retained_bytes(&self, id: &str) -> usize {
+        std::mem::size_of::<Entry>() + std::mem::size_of::<Output>() + id.len()
+            + self.command.as_ref().map_or(0, |command| command.capacity() + RING_BYTES)
+    }
+}
+
+fn admit(map: &HashMap<String, Entry>, id: &str, command_bytes: usize) -> io::Result<()> {
+    // Tombstones count too: dropping one early would allow a delayed SESSION
+    // retry to execute again. Existing IDs are looked up before this check.
+    if map.len() >= MAX_SESSIONS {
+        return Err(io::Error::other("session limit reached (including retained ids)"));
+    }
+    let retained: usize = map.iter().map(|(id, entry)| entry.retained_bytes(id)).sum();
+    let needed = std::mem::size_of::<Entry>() + std::mem::size_of::<Output>() + id.len() + command_bytes + RING_BYTES;
+    if needed > MAX_RETAINED_BYTES.saturating_sub(retained) {
+        return Err(io::Error::other("session retained-bytes budget exceeded"));
+    }
+    Ok(())
 }
 
 struct Chunk {
@@ -105,10 +132,10 @@ pub fn parse(line: &str) -> io::Result<Request<'_>> {
 }
 
 pub fn cleanup(sessions: &Sessions) {
-    sessions
-        .lock()
-        .unwrap()
-        .retain(|_, entry| entry.output.0.lock().unwrap().exit.is_none_or(|(_, at)| at.elapsed() < RETENTION));
+    sessions.lock().unwrap().retain(|_, entry| {
+        let output = entry.output.0.lock().unwrap();
+        output.readers > 0 || output.exit.is_none_or(|(_, at)| at.elapsed() < RETENTION)
+    });
 }
 
 /// Request errors are reported as a message frame; write errors just end the stream,
@@ -141,11 +168,15 @@ fn open<'a>(mut r: impl Read, line: &'a str, sessions: &Sessions, statuses: &Sta
             // Serialize lookup and spawn: retrying a lost creation reply cannot spawn twice.
             let mut map = sessions.lock().unwrap();
             let output = if let Some(entry) = map.get(id) {
-                if entry.command != command {
+                let Some(original) = &entry.command else {
+                    return Err(io::Error::other("session closed"));
+                };
+                if *original != command {
                     return Err(io::Error::other("session id already used for another command"));
                 }
                 attach(&entry.output, 0)
             } else {
+                admit(&map, id, command.capacity())?;
                 let command_text = std::str::from_utf8(&command).map_err(io::Error::other)?;
                 let mut child = spawn(
                     Command::new("/bin/sh")
@@ -160,7 +191,7 @@ fn open<'a>(mut r: impl Read, line: &'a str, sessions: &Sessions, statuses: &Sta
                 .map_err(|e| io::Error::new(e.kind(), format!("cannot run /bin/sh: {e} (does the image have a shell?)")))?;
                 let pid = child.id() as i32;
                 let output = Arc::new((Mutex::new(Output { readers: 1, ..Default::default() }), Condvar::new()));
-                map.insert(id.to_string(), Entry { command, output: output.clone() });
+                map.insert(id.to_string(), Entry { command: Some(command), output: output.clone() });
                 let pumps = [
                     pump(child.stdout.take().unwrap(), output.clone(), FRAME_STDOUT),
                     pump(child.stderr.take().unwrap(), output.clone(), FRAME_STDERR),
@@ -184,14 +215,15 @@ fn open<'a>(mut r: impl Read, line: &'a str, sessions: &Sessions, statuses: &Sta
             (id, offset, attach(&map.get(id).ok_or_else(|| io::Error::other("unknown session"))?.output, offset))
         }
         Request::Close { id } => {
-            let map = sessions.lock().unwrap();
-            let entry = map.get(id).ok_or_else(|| io::Error::other("unknown session"))?;
+            let mut map = sessions.lock().unwrap();
+            let entry = map.get_mut(id).ok_or_else(|| io::Error::other("unknown session"))?;
             let mut output = entry.output.0.lock().unwrap();
             if output.exit.is_none() {
                 return Err(io::Error::other("session still running"));
             }
             output.closed = true;
-            output.chunks.clear();
+            output.chunks = VecDeque::new();
+            entry.command = None;
             return Ok(None);
         }
     }))
@@ -206,7 +238,7 @@ fn attach(output: &Session, offset: u64) -> Session {
 
 fn pump(mut r: impl Read + Send + 'static, output: Session, kind: u8) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        let mut buf = [0; 16 * 1024];
+        let mut buf = [0; READ_SIZE];
         loop {
             let n = match r.read(&mut buf) {
                 Ok(0) => break,
@@ -272,6 +304,95 @@ fn drain(w: &mut impl Write, output: &Session, mut offset: u64) -> io::Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn retained(map: &HashMap<String, Entry>) -> usize {
+        map.iter().map(|(id, entry)| entry.retained_bytes(id)).sum()
+    }
+
+    #[test]
+    fn aggregate_budget_reserves_output_and_releases_on_close() {
+        let mut map = HashMap::new();
+        let command = vec![b'x'; 1024 * 1024];
+        while admit(&map, "next", command.capacity()).is_ok() {
+            map.insert(map.len().to_string(), Entry {
+                command: Some(command.clone()),
+                output: Arc::new((Mutex::new(Output::default()), Condvar::new())),
+            });
+        }
+        assert!(map.len() < MAX_SESSIONS);
+        let before = retained(&map);
+        assert!(before <= MAX_RETAINED_BYTES);
+        assert!(before + command.capacity() + RING_BYTES > MAX_RETAINED_BYTES);
+        let count = map.len();
+        let output = map["0"].output.clone();
+        output.0.lock().unwrap().push(FRAME_STDOUT, b"hello", CAPACITY);
+        assert_eq!(retained(&map), before, "output already has a reservation");
+        let sessions = Arc::new(Mutex::new(map));
+        let statuses = Arc::new((Mutex::new(HashMap::new()), Condvar::new()));
+        let mut wire = Vec::new();
+        handle(&mut wire, command.as_slice(), "SESSION next 1048576", &sessions, &statuses).unwrap();
+        assert!(wire.ends_with(b"error: session retained-bytes budget exceeded"));
+        assert_eq!(sessions.lock().unwrap().len(), count);
+        // An existing ID remains attachable even when no new session fits.
+        let (_, _, attached) = open(command.as_slice(), "SESSION 0 1048576", &sessions, &statuses).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&output, &attached));
+        attached.0.lock().unwrap().readers -= 1;
+        output.0.lock().unwrap().exit = Some((0, Instant::now()));
+        handle(Vec::new(), io::empty(), "CLOSE 0", &sessions, &statuses).unwrap();
+        let map = sessions.lock().unwrap();
+        assert!(map["0"].command.is_none());
+        assert_eq!(output.0.lock().unwrap().chunks.capacity(), 0);
+        assert_eq!(retained(&map), before - command.capacity() - RING_BYTES);
+        assert!(admit(&map, "next", command.capacity()).is_ok());
+        assert!(statuses.0.lock().unwrap().is_empty(), "rejected requests must not spawn");
+        drop(map);
+        output.0.lock().unwrap().exit = Some((0, Instant::now() - RETENTION));
+        cleanup(&sessions);
+        assert_eq!(sessions.lock().unwrap().len(), count - 1);
+        assert_eq!(retained(&sessions.lock().unwrap()), before - command.capacity() - RING_BYTES
+            - std::mem::size_of::<Entry>() - std::mem::size_of::<Output>() - "0".len());
+    }
+
+    #[test]
+    fn tombstones_bound_ids_and_cleanup_keeps_live_sessions() {
+        let mut map = HashMap::new();
+        for i in 0..MAX_SESSIONS {
+            assert!(admit(&map, "next", 0).is_ok());
+            map.insert(i.to_string(), Entry {
+                command: None,
+                output: Arc::new((Mutex::new(Output {
+                    closed: true, exit: Some((0, Instant::now())), ..Default::default()
+                }), Condvar::new())),
+            });
+        }
+        let before = retained(&map);
+        assert!(admit(&map, "next", 0).unwrap_err().to_string().contains("session limit reached"));
+        assert_eq!(retained(&map), before);
+        let sessions = Arc::new(Mutex::new(map));
+        let statuses = Arc::new((Mutex::new(HashMap::new()), Condvar::new()));
+        let mut wire = Vec::new();
+        handle(&mut wire, io::empty(), "SESSION next 0", &sessions, &statuses).unwrap();
+        assert!(wire.ends_with(b"error: session limit reached (including retained ids)"));
+        wire.clear();
+        handle(&mut wire, io::empty(), "SESSION 0 0", &sessions, &statuses).unwrap();
+        assert!(wire.ends_with(b"error: session closed"));
+        cleanup(&sessions);
+        assert_eq!(sessions.lock().unwrap().len(), MAX_SESSIONS);
+        let map = sessions.lock().unwrap();
+        map["0"].output.0.lock().unwrap().exit = None;
+        let mut attached = map["1"].output.0.lock().unwrap();
+        attached.exit = Some((0, Instant::now() - RETENTION));
+        attached.readers = 1;
+        drop(attached);
+        map["2"].output.0.lock().unwrap().exit = Some((0, Instant::now() - RETENTION));
+        drop(map);
+        cleanup(&sessions);
+        let map = sessions.lock().unwrap();
+        assert!(map.contains_key("0"), "running sessions never expire");
+        assert!(map.contains_key("1"), "attached output is still retained");
+        assert!(!map.contains_key("2"));
+        assert!(admit(&map, "next", 0).is_ok());
+    }
 
     #[test]
     fn ring_offsets_and_overflow() {

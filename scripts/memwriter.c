@@ -51,19 +51,23 @@ struct meta {
 	uint64_t k, salt;
 };
 
+struct stats {
+	// continuous checks
+	uint64_t errors, first_err_page, first_err_want, first_err_got;
+	// full check results
+	uint64_t full_errors, full_first, checksum, verified_k;
+	// latency
+	uint64_t hist[NBUCKETS], max_ns, iters;
+};
+
 struct worker {
 	int id;
 	uint64_t n, s, sinv;
 	uint8_t *buf;
 	struct meta *meta;
 	uint64_t k;
-	// continuous checks
-	uint64_t errors, first_err_page, first_err_want, first_err_got;
-	// full check results
+	struct stats stats, snapshot;
 	_Atomic uint64_t done_gen;
-	uint64_t full_errors, full_first, checksum, verified_k;
-	// latency
-	uint64_t hist[NBUCKETS], max_ns, iters;
 	_Atomic int reset;
 	pthread_t th;
 };
@@ -78,6 +82,7 @@ static uint64_t now_ns(void) {
 	return t.tv_sec * 1000000000ULL + t.tv_nsec;
 }
 
+__attribute__((target("rdrnd")))
 static uint64_t rdrand(void) {
 	unsigned long long v;
 	for (int i = 0; i < 16; i++)
@@ -131,10 +136,10 @@ static void full_check(struct worker *w) {
 		uint64_t *pg = (uint64_t *)(w->buf + p * PG);
 		for (size_t i = 0; i < PG / 8; i++) sum = (sum ^ pg[i]) * 0x100000001b3ULL;
 	}
-	w->full_errors = errors;
-	w->full_first = first;
-	w->checksum = sum;
-	w->verified_k = w->k;
+	w->stats.full_errors = errors;
+	w->stats.full_first = first;
+	w->stats.checksum = sum;
+	w->stats.verified_k = w->k;
 }
 
 static uint64_t gcd(uint64_t a, uint64_t b) {
@@ -164,32 +169,35 @@ static void *run(void *arg) {
 		uint64_t g = atomic_load(&want_gen);
 		if (g != atomic_load(&w->done_gen)) {
 			full_check(w);
+			// Publish immutable stats; main requests the next generation only
+			// after finishing all reads of this snapshot.
+			w->snapshot = w->stats;
 			atomic_store(&w->done_gen, g);
 			last = now_ns();
 		}
 		if (atomic_exchange(&w->reset, 0)) {
-			memset(w->hist, 0, sizeof w->hist);
-			w->max_ns = 0;
-			w->iters = 0;
+			memset(w->stats.hist, 0, sizeof w->stats.hist);
+			w->stats.max_ns = 0;
+			w->stats.iters = 0;
 		}
 		uint64_t k = w->k + 1;
 		uint64_t p = (k % w->n) * w->s % w->n;
 		if (!page_ok(w, p)) {
-			if (!w->errors) {
-				w->first_err_page = p;
-				w->first_err_want = w->meta[p].k;
-				w->first_err_got = ((struct header *)(w->buf + p * PG))->k;
+			if (!w->stats.errors) {
+				w->stats.first_err_page = p;
+				w->stats.first_err_want = w->meta[p].k;
+				w->stats.first_err_got = ((struct header *)(w->buf + p * PG))->k;
 			}
-			w->errors++;
+			w->stats.errors++;
 		}
 		write_page(w, p, k, rdrand());
 		w->k = k;
 		uint64_t t = now_ns(), d = t - last;
 		last = t;
 		int b = d < 10000 ? 0 : d < 100000 ? 1 : d < 1000000 ? 2 : d < 10000000 ? 3 : d < 100000000 ? 4 : 5;
-		w->hist[b]++;
-		if (d > w->max_ns) w->max_ns = d;
-		w->iters++;
+		w->stats.hist[b]++;
+		if (d > w->stats.max_ns) w->stats.max_ns = d;
+		w->stats.iters++;
 	}
 	return NULL;
 }
@@ -239,7 +247,7 @@ int main(int argc, char **argv) {
 		if (!f) continue;
 		fprintf(f, "gen %llu threads %d pages %llu\n", (unsigned long long)g, nthreads, (unsigned long long)n);
 		for (int i = 0; i < nthreads; i++) {
-			struct worker *w = &workers[i];
+			const struct stats *w = &workers[i].snapshot;
 			fprintf(f, "thread %d k %llu cont_errors %llu first %llu want %llu got %llu full_errors %llu full_first %lld checksum %016llx iters %llu",
 			        i, (unsigned long long)w->verified_k, (unsigned long long)w->errors, (unsigned long long)w->first_err_page,
 			        (unsigned long long)w->first_err_want, (unsigned long long)w->first_err_got, (unsigned long long)w->full_errors,
