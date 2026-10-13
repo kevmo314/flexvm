@@ -20,6 +20,7 @@ use serde_json::{json, Value};
 
 use crate::bail;
 use crate::fc::Pool;
+use crate::guest;
 use crate::net::{self, IpRange};
 use crate::template::{Paths, Template, STEP_MIB};
 use crate::uffd::{serve_pages, Runs, Source};
@@ -277,7 +278,7 @@ impl Daemon {
                 let mut stream = ReadWrite(r, w);
                 return Ok(serve_pages(&vm.pager, &mut stream, || self.fault("pages"))?);
             }
-            "exec" => return self.exec(&name, req["cmd"].as_str().unwrap_or(""), w),
+            "exec" => return self.exec(&name, &req, w),
             "preflight" => self.migration_template(&req, true).map(|tpl| json!({"id": tpl.meta.id})),
             "incoming" => match self.incoming(&req, &mut r) {
                 // Committed, but the source never hears about it.
@@ -470,15 +471,32 @@ impl Daemon {
         self.faults.as_ref().is_some_and(|f| f.lock().unwrap().get(name).is_some_and(|t| Instant::now() < *t))
     }
 
-    fn exec(&self, name: &str, cmd: &str, mut w: TcpStream) -> Result<()> {
+    fn exec(&self, name: &str, req: &Value, mut w: TcpStream) -> Result<()> {
+        let cmd = req["cmd"].as_str().unwrap_or("");
         let guest = self.vm(name).and_then(|vm| {
-            let (g, id) = vm.exec(cmd)?;
+            let (g, id) = vm.exec(|uds| match req["session"].as_str() {
+                Some(id) => guest::session(uds, req["action"].as_str().unwrap_or("start"), id,
+                    req["offset"].as_u64().unwrap_or(0), cmd, guest::TIMEOUT),
+                None => guest::start_exec(uds, cmd, guest::TIMEOUT),
+            })?;
             Ok((vm, g, id))
         });
         match guest {
             Ok((vm, mut g, id)) => {
-                send_json(&mut w, &json!({"ok": true}))?;
-                let copied = std::io::copy(&mut g, &mut w);
+                let copied = (|| -> Result<()> {
+                    if req["action"] == "close" {
+                        g.get_ref().set_read_timeout(Some(Duration::from_secs(2)))?;
+                        let closed = matches!(guest::read_frame(&mut g)?, Some((guest::FRAME_MSG, data)) if data == b"closed");
+                        return Ok(send_json(&mut w, &json!({"ok": closed, "error": "session close failed"}))?);
+                    }
+                    if req["session"].is_string() {
+                        // The guest heartbeats every second; silence means the VM moved.
+                        g.get_ref().set_read_timeout(Some(Duration::from_secs(3)))?;
+                    }
+                    send_json(&mut w, &json!({"ok": true}))?;
+                    std::io::copy(&mut g, &mut w)?;
+                    Ok(())
+                })();
                 vm.untrack_exec(id);
                 copied?;
             }
@@ -490,6 +508,7 @@ impl Daemon {
     fn info(&self) -> Value {
         json!({
             "addr": self.cfg.advertise,
+            "peers": self.cfg.peers,
             "mem_available_mib": proc_kb("/proc/meminfo", "MemAvailable").unwrap_or(0) >> 20,
             "mem_total_mib": proc_kb("/proc/meminfo", "MemTotal").unwrap_or(0) >> 20,
             "reserve_mib": self.cfg.reserve_mib,

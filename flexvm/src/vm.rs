@@ -245,17 +245,17 @@ impl Vm {
         }
     }
 
-    /// Starts `cmd` in the guest and registers the session so a checkpoint
+    /// Opens an exec session with `start` and registers the session so a checkpoint
     /// can close it. Fails unless the VM is running here. Everything done
     /// under the admission lock has a deadline (`guest::TIMEOUT`), so a stuck
     /// guest cannot hold off migrations; the session is untimed afterwards.
-    pub fn exec(&self, cmd: &str) -> Result<(BufReader<UnixStream>, u64)> {
+    pub fn exec(&self, start: impl FnOnce(&Path) -> Result<BufReader<UnixStream>>) -> Result<(BufReader<UnixStream>, u64)> {
         let (g, id) = {
             let mut execs = self.execs.lock().unwrap();
             if self.state() != State::Running {
                 bail!("vm {} is not running here", self.name);
             }
-            let g = crate::guest::start_exec(&self.vsock(), cmd, crate::guest::TIMEOUT)?;
+            let g = start(&self.vsock())?;
             let id = self.next_exec.fetch_add(1, Ordering::SeqCst);
             execs.insert(id, g.get_ref().try_clone()?);
             (g, id)

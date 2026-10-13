@@ -13,6 +13,7 @@ pub const FRAME_STDOUT: u8 = 1;
 pub const FRAME_STDERR: u8 = 2;
 pub const FRAME_EXIT: u8 = 3;
 pub const FRAME_MSG: u8 = 4;
+pub const FRAME_LOST: u8 = 5;
 
 /// How long a request may wait on Firecracker or the guest agent.
 pub const TIMEOUT: Duration = Duration::from_secs(5);
@@ -50,16 +51,56 @@ pub fn untimed(r: &BufReader<UnixStream>) -> Result<()> {
     Ok(())
 }
 
+/// Starts, resumes or acknowledges a resumable command. Legacy EXEC remains separate.
+pub fn session(uds: &Path, action: &str, id: &str, offset: u64, cmd: &str, timeout: Duration) -> Result<BufReader<UnixStream>> {
+    if id.is_empty() || id.len() > 64 || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        bail!("bad session id");
+    }
+    let line = match action {
+        "start" => format!("SESSION {id} {}", cmd.len()),
+        "attach" => format!("ATTACH {id} {offset}"),
+        "close" => format!("CLOSE {id}"),
+        _ => bail!("bad session action"),
+    };
+    let mut r = request(uds, &line, timeout)?;
+    if action == "start" {
+        r.get_mut().write_all(cmd.as_bytes())?;
+    }
+    Ok(r)
+}
+
+/// Validates a session output frame before any bytes reach the terminal.
+pub fn session_output(data: &[u8], offset: u64) -> Result<&[u8]> {
+    let header = data.get(..8).ok_or("short session output frame")?;
+    let start = u64::from_le_bytes(header.try_into()?);
+    if start != offset {
+        bail!("session output offset {start}, expected {offset}");
+    }
+    Ok(&data[8..])
+}
+
+pub fn session_exit(data: &[u8], offset: u64) -> Result<i32> {
+    if data.len() != 12 {
+        bail!("bad session exit frame");
+    }
+    session_output(data, offset)?;
+    Ok(i32::from_le_bytes(data[8..].try_into()?))
+}
+
 /// Reads one frame. Returns None at end of stream.
 pub fn read_frame(r: &mut impl Read) -> Result<Option<(u8, Vec<u8>)>> {
     let mut hdr = [0u8; 5];
-    if let Err(e) = r.read_exact(&mut hdr) {
+    if let Err(e) = r.read_exact(&mut hdr[..1]) {
         if e.kind() == std::io::ErrorKind::UnexpectedEof {
             return Ok(None);
         }
         return Err(e.into());
     }
+    r.read_exact(&mut hdr[1..])?;
     let len = u32::from_le_bytes(hdr[1..].try_into().unwrap()) as usize;
+    if len > 1024 * 1024 {
+        bail!("guest frame too large: {len}");
+    }
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf)?;
     Ok(Some((hdr[0], buf)))
@@ -94,5 +135,33 @@ pub fn net(uds: &Path, ip: std::net::Ipv4Addr, dns: Option<&str>) -> Result<()> 
         Some((FRAME_MSG, m)) if m == b"ok" => Ok(()),
         Some((_, m)) => bail!("guest network setup: {}", String::from_utf8_lossy(&m)),
         None => bail!("guest closed the connection during network setup"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_offsets() {
+        let data = [9u64.to_le_bytes().as_slice(), b"abc"].concat();
+        assert_eq!(session_output(&data, 9).unwrap(), b"abc");
+        assert!(session_output(&data, 8).is_err());
+        assert!(session_output(&data, 10).is_err());
+        assert!(session_output(b"short", 0).is_err());
+        let exit = [12u64.to_le_bytes().as_slice(), &7i32.to_le_bytes()].concat();
+        assert_eq!(session_exit(&exit, 12).unwrap(), 7);
+        assert!(session_exit(&exit, 11).is_err());
+        assert!(session_exit(&exit[..11], 12).is_err());
+    }
+
+    #[test]
+    fn frames() {
+        let wire = [vec![FRAME_STDOUT, 3, 0, 0, 0], b"abc".to_vec()].concat();
+        assert_eq!(read_frame(&mut wire.as_slice()).unwrap(), Some((FRAME_STDOUT, b"abc".to_vec())));
+        assert!(read_frame(&mut &wire[..7]).is_err());
+        assert!(read_frame(&mut &wire[..3]).is_err());
+        assert!(read_frame(&mut &b""[..]).unwrap().is_none());
+        assert!(read_frame(&mut &[1, 255, 255, 255, 255][..]).is_err());
     }
 }

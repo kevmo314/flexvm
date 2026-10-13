@@ -4,7 +4,8 @@
 //! a tiny command protocol on vsock so the host can run things in the VM.
 //!
 //! Request: one text line, `PING`, `NET <ip> [dns]`, `EXEC <len>` or `SPAWN <len>`;
-//! the last two are followed by `len` bytes of shell command.
+//! EXEC/SPAWN are followed by `len` bytes of shell command. Resumable commands use
+//! `SESSION <id> <len>`, `ATTACH <id> <offset>` and `CLOSE <id>` (see session.rs).
 //! Response: frames of `[kind u8][len u32 LE][payload]`, where kind is
 //! 1 = stdout, 2 = stderr, 3 = exit code (i32 LE), 4 = message.
 
@@ -18,6 +19,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 mod net;
+mod session;
 
 const VSOCK_PORT: u32 = 52;
 
@@ -203,6 +205,14 @@ fn serve(statuses: Statuses) -> io::Result<()> {
     if rc != 0 || unsafe { libc::listen(fd.as_raw_fd(), 64) } != 0 {
         return Err(io::Error::last_os_error());
     }
+    let sessions: session::Sessions = Arc::new(Mutex::new(HashMap::new()));
+    {
+        let sessions = sessions.clone();
+        thread::spawn(move || loop {
+            thread::sleep(std::time::Duration::from_secs(60));
+            session::cleanup(&sessions);
+        });
+    }
     loop {
         let conn = unsafe { libc::accept4(fd.as_raw_fd(), std::ptr::null_mut(), std::ptr::null_mut(), libc::SOCK_CLOEXEC) };
         if conn < 0 {
@@ -225,16 +235,27 @@ fn serve(statuses: Statuses) -> io::Result<()> {
             let _ = handle(stream, r, &line, &statuses);
         } else {
             let statuses = statuses.clone();
-            thread::spawn(move || handle(stream, r, &line, &statuses));
+            let sessions = sessions.clone();
+            thread::spawn(move || {
+                // A blocked write is backpressure from a slow client; migration resets the socket.
+                if matches!(line.split_whitespace().next(), Some("SESSION" | "ATTACH" | "CLOSE")) {
+                    let _ = session::handle(stream, r, &line, &sessions, &statuses);
+                } else {
+                    let _ = handle(stream, r, &line, &statuses);
+                }
+            });
         }
     }
 }
 
 fn frame(w: &Mutex<std::fs::File>, kind: u8, payload: &[u8]) -> io::Result<()> {
+    write_frame(&mut *w.lock().unwrap(), kind, payload)
+}
+
+fn write_frame(w: &mut impl Write, kind: u8, payload: &[u8]) -> io::Result<()> {
     let mut hdr = [0u8; 5];
     hdr[0] = kind;
     hdr[1..].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-    let mut w = w.lock().unwrap();
     w.write_all(&hdr)?;
     w.write_all(payload)
 }
