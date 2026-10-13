@@ -583,11 +583,13 @@ fn plug(fc: &Firecracker, mib: u64) -> Result<u64> {
 /// Waits until the guest's free page reporting has gone quiet, so the memory
 /// just plugged and freed here is reported in the template rather than in
 /// every VM after restore (where reporting 4 GiB walks the page structs of all
-/// of it: ~64 MiB more RSS per VM). Returns the MiB reported.
-fn wait_reporting_done(fc: &Firecracker, metrics: &Path) -> Result<u64> {
+/// of it: ~64 MiB more RSS per VM). Done means 4 s without a report, after at
+/// least `expect_mib` were reported. Returns the MiB reported and whether it
+/// finished; the caller says so when it did not.
+fn wait_reporting_done(fc: &Firecracker, metrics: &Path, expect_mib: u64) -> Result<(u64, bool)> {
     let (start, mut quiet, mut total, mut seen) = (Instant::now(), 0, 0u64, 0usize);
     // Reporting starts 2 s after memory is freed and works through it in rounds.
-    while quiet < 4 && start.elapsed() < Duration::from_secs(120) {
+    while !(quiet >= 4 && total >> 20 >= expect_mib) && start.elapsed() < Duration::from_secs(120) {
         std::thread::sleep(Duration::from_secs(1));
         fc.put("/actions", json!({"action_type": "FlushMetrics"}))?;
         let text = std::fs::read_to_string(metrics)?;
@@ -600,7 +602,7 @@ fn wait_reporting_done(fc: &Firecracker, metrics: &Path) -> Result<u64> {
         total += freed;
         quiet = if freed == 0 { quiet + 1 } else { 0 };
     }
-    Ok(total >> 20)
+    Ok((total >> 20, quiet >= 4 && total >> 20 >= expect_mib))
 }
 
 /// Cold-boots a VM and snapshots it into `paths.templates/name`.
@@ -727,7 +729,15 @@ fn build(
             guest::exec(&vsock, "sync; echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory")?;
         }
     }
-    let reported = wait_reporting_done(&fc, &metrics)?;
+    // Nearly all of the plug is free and should be reported (the rest is the
+    // guest's own page structs and per-CPU lists).
+    let (reported, done) = wait_reporting_done(&fc, &metrics, plugged * 3 / 4)?;
+    if !done {
+        eprintln!(
+            "template {name}: free page reporting did not finish ({reported} MiB reported of {plugged} MiB \
+             plugged); VMs will report the rest after restore, at some RSS each"
+        );
+    }
     fc.pause()?;
     fc.put(
         "/snapshot/create",
