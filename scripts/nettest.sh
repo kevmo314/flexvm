@@ -244,7 +244,11 @@ progress_after() {
     kill -0 "$client_pid" 2>/dev/null || { cat "$work/client-$round.log" >&2; die 'client exited early'; }
     [[ -f $work/progress ]] && (( $(cat "$work/progress") > $1 ))
 }
-absent() { ! cli "$1" "$2" ls | awk -v n="$name" 'NR>1 && $1==n {f=1} END {exit !f}'; }
+absent() {
+    local listing
+    listing=$(cli "$1" "$2" ls) || return 1
+    awk -v n="$name" 'NR>1 && $1==n {f=1} END {exit f}' <<< "$listing"
+}
 running() { cli "$1" "$2" ls | awk -v n="$name" 'NR>1 && $1==n && $4=="running" {f=1} END {exit !f}'; }
 migrate() {
     local res

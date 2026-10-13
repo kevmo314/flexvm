@@ -45,7 +45,17 @@ impl Daemon {
     pub(super) fn list(&self) -> Value {
         let vms = self.vms.lock().unwrap();
         let suspended = self.suspended.lock().unwrap();
-        let mut out: Vec<Value> = vms.values().map(|v| v.describe()).collect();
+        let mut out: Vec<Value> = vms
+            .values()
+            .map(|v| {
+                let mut d = v.describe();
+                // Live copy counters, for fault tests to synchronize on.
+                if self.faults.is_some() {
+                    d["checkpoint_copy_stats"] = json!(v.pager.copy_stats());
+                }
+                d
+            })
+            .collect();
         for (name, s) in suspended.iter() {
             let m = &s.manifest;
             out.push(json!({
@@ -567,6 +577,15 @@ impl Daemon {
                     pager.abort_copy();
                 });
             }
+        }
+        // Test gate: resume and arm COW, but keep disk writers out until the
+        // test has freed memory and observed the hold. The fault expires too.
+        while cow && self.fault("ckpt_copy_wait") {
+            if let Err(e) = cancelled() {
+                vm.pager.unfreeze(&frozen);
+                return Err(e);
+            }
+            thread::sleep(Duration::from_millis(10));
         }
         let cow_pages = frozen.cow.as_deref().map(|c| crate::cow::CowPages { guest: vm.pager.as_ref(), cow: c, slow: self.fault("ckpt_slow") });
         let src: &dyn crate::checkpoint::GuestPages = match &cow_pages {

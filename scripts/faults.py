@@ -80,7 +80,7 @@ def fault(host, f, ms):
 
 FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_before_run", "restore_after_run",
           "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "resume_kill",
-          "prepare_fail", "short_incoming", "slow_preload", "kill_prepared", "guest_drop", "guest_lose_reply")
+          "prepare_fail", "short_incoming", "slow_preload", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait")
 
 
 def disarm():
@@ -454,6 +454,13 @@ def target_restart():
     check("target restart: outcome unknown, source paused", not r["ok"] and where(n).get(A) == "source", (r, where(n)))
     vm_fc = [pid for pid, d in firecrackers(rdir).items() if os.path.exists(os.path.join(d, "vmstate.in"))]
     check("target restart: VM running on target", len(vm_fc) == 1 and alive(vm_fc[0]), vm_fc)
+    if len(vm_fc) != 1:
+        rpc(A, {"op": "kill", "name": n})
+        try:
+            rpc(B, {"op": "kill", "name": n})
+        except OSError:
+            pass  # B may have died along with its Firecracker.
+        return
     argv, env = kill_daemon(B)
     check("target restart: orphan outlives its daemon", alive(vm_fc[0]))
     start_daemon(B, argv, env)
@@ -613,14 +620,28 @@ def guest_hang():
         except subprocess.TimeoutExpired:
             times.append((None, None))
 
-    execs = [threading.Thread(target=one) for _ in range(3)]
+    # The daemon's own answer, which the CLI's 30 s of retries would hide:
+    # each exec request fails within the guest timeout (5 s), concurrently.
+    raw = []
+
+    def one_raw():
+        t = time.time()
+        try:
+            r = rpc(A, {"op": "exec", "name": n, "session": os.urandom(16).hex(), "action": "start", "cmd": "echo hi"})
+            raw.append((round(time.time() - t, 1), r["ok"]))
+        except OSError as e:
+            raw.append((None, str(e)))
+
+    execs = [threading.Thread(target=f) for f in (one, one, one, one_raw, one_raw, one_raw)]
     for e in execs:
         e.start()
     for e in execs:
         e.join()
     subprocess.run(["sudo", "kill", "-CONT", fcs[0]])
+    check("guest hang: the daemon fails each exec within the guest timeout",
+          len(raw) == 3 and all(t is not None and t < 12 and r is False for t, r in raw), raw)
     # The CLI keeps retrying a VM its host knows for 30 s, then gives up.
-    check("guest hang: every exec gave up within its deadline", all(t is not None and t < 40 and c != 0 for t, c in times), times)
+    check("guest hang: every CLI exec gave up within its deadline", all(t is not None and t < 40 and c != 0 for t, c in times), times)
     check("guest hang: exec works again", sh(A, n, "echo hi") == (0, "hi"))
     ok(A, {"op": "migrate", "name": n, "to": B})
     wait_released(B, n)
@@ -710,7 +731,7 @@ def checkpoint_restore():
     check("checkpoint: TCP echo before", echo(conn, b"before\n"))
     r = ok(A, {"op": "checkpoint", "name": n, "dir": path, "stop": True})
     print(f"checkpoint: {r['checkpoint_ms']} ms ({r['data_mib']} MiB data), paused {r['paused_ms']} ms")
-    leftovers = [f for f in os.listdir(args.ckpt_dir) if f.startswith(".ft-ckpt.partial")]
+    leftovers = [f for f in os.listdir(args.ckpt_dir) if f.startswith(".flexvm-staging-")]
     check("checkpoint: published, no partial left", os.path.exists(os.path.join(path, "manifest.json")) and not leftovers, leftovers)
     check("checkpoint --stop: gone from A", n not in vms(A), vms(A).get(n))
     r = ok(B, {"op": "restore", "dir": path})
@@ -796,24 +817,51 @@ def checkpoint_corrupt():
     rm_ckpt(pristine)
 
 
+_STAGED_MIB = """
+import os, sys
+d, n = sys.argv[1], 0
+for s in os.listdir(d):
+    if s.startswith(".flexvm-staging-"):
+        try:
+            fd = os.open(os.path.join(d, s, "ck", "pages"), os.O_RDONLY)
+        except OSError:
+            continue
+        n += sum(any(os.pread(fd, 4096, o)) for o in range(0, os.fstat(fd).st_size, 1 << 20))
+        os.close(fd)
+print(n)
+"""
+
+
+def staged_mib():
+    """Roughly how many MiB of page data checkpoints staged in --ckpt-dir
+    have written (staging is root-only)."""
+    out = subprocess.run(["sudo", "python3", "-I", "-c", _STAGED_MIB, args.ckpt_dir], capture_output=True, text=True).stdout
+    return int(out or 0)
+
+
 def checkpoint_crash():
     """The daemon dies while writing a checkpoint: no checkpoint appears (not
     even a partial one restores), and the next checkpoint to the same place
     clears the debris and succeeds."""
     n, path = "ft-crash", ckpt_path("ft-crash")
     setup(n, mib=1200)
+    fault(A, "ckpt_slow", 120000)
     t = threading.Thread(target=lambda: rpc(A, {"op": "checkpoint", "name": n, "dir": path}))
     t.start()
 
     def writing():
-        # Staging is root-only: look in with sudo.
-        out = subprocess.run(["sudo", "find", args.ckpt_dir, "-path", "*/.flexvm-staging-*/ck/pages", "-size", "+100M"],
-                             capture_output=True, text=True).stdout
-        if out.strip():
-            return True
-        return False
+        # The pages file is preallocated (fallocate reads back as zeros), so
+        # count what was written: MiB-spaced samples of it that hold data.
+        return staged_mib() > 100 and vms(A).get(n, {}).get("checkpoint_copy")
 
-    check("crash: caught the checkpoint mid-write", wait_for(writing, 30))
+    caught = wait_for(writing, 30)
+    check("crash: caught the checkpoint mid-write", caught)
+    if not caught:
+        t.join()
+        fault(A, "ckpt_slow", 0)
+        cleanup(n)
+        rm_ckpt(path)
+        return
     argv, env = kill_daemon(A)
     t.join()
     check("crash: no checkpoint published", not os.path.exists(path))
@@ -1128,7 +1176,14 @@ def memwriter_b64():
 
 
 def start_writer(host, name, mib=64, threads=2):
-    code, out = sh(host, name, f"echo {memwriter_b64()} | base64 -d > /tmp/memwriter && chmod +x /tmp/memwriter && "
+    # Keep each argv entry well below Linux's per-argument limit, including
+    # when gcc's static libc makes the payload much larger than musl's.
+    payload = memwriter_b64()
+    for i in range(0, len(payload), 48000):
+        redir = ">" if i == 0 else ">>"
+        code, out = sh(host, name, f"printf '%s' '{payload[i:i + 48000]}' {redir} /tmp/memwriter.b64")
+        assert code == 0, out
+    code, out = sh(host, name, "base64 -d /tmp/memwriter.b64 > /tmp/memwriter && rm /tmp/memwriter.b64 && chmod +x /tmp/memwriter && "
                                f"setsid /tmp/memwriter {mib} {threads} /tmp/mw.status >/dev/null 2>&1 < /dev/null & sleep 1; pidof memwriter")
     assert code == 0 and out.strip(), out
 
@@ -1328,44 +1383,71 @@ def ckpt_incremental():
 
 
 def cow_reports_held():
-    """Free page reports wait in Firecracker's balloon while a keep-running
-    checkpoint is copied (a discard of an unsaved page would stall the guest
-    while the pager saved everything left), and are carried out after it."""
+    """Exercise Firecracker's report hold and the pager's REMOVE fallback
+    with disk writers gated until the guest has freed memory."""
     n, path = "ft-cow-fpr", ckpt_path("ft-cow-fpr")
     ok(A, {"op": "run", "name": n, "template": args.template})
     start_writer(A, n, mib=16)
-    # Enough memory that the slowed copy outlasts the guest's report delay.
-    code, out = sh(A, n, "head -c 384M /dev/zero > /dev/shm/big && sleep 2 && head -c 384M /dev/zero > /dev/shm/big2 && echo ok")
-    assert code == 0, out
-    time.sleep(4)
-    fault(A, "ckpt_memhash", 120000)
-    fault(A, "ckpt_slow", 120000)
-    res = {}
-    t = threading.Thread(target=lambda: res.update(r=rpc(A, {"op": "checkpoint", "name": n, "dir": path}, timeout=300)))
-    t.start()
-    copying = wait_for(lambda: vms(A).get(n, {}).get("checkpoint_copy"), 30)
-    check("cow fpr: copy runs in the background", copying, vms(A).get(n))
-    rss0 = vms(A)[n]["rss_mib"]
-    start = time.time()
-    code, out = sh(A, n, "rm /dev/shm/big /dev/shm/big2; sleep 4; echo ok")
-    took = time.time() - start
-    rss1, still = vms(A)[n]["rss_mib"], vms(A)[n].get("checkpoint_copy")
-    check("cow fpr: guest frees memory and runs on during the copy", code == 0 and took < 6, (code, out, took))
-    check("cow fpr: freed memory not discarded during the copy", still and rss1 > rss0 - 256, (rss0, rss1, still))
-    t.join()
-    fault(A, "ckpt_slow", 0)
-    fault(A, "ckpt_memhash", 0)
-    r = res.get("r", {})
-    check("cow fpr: checkpoint written", r.get("ok"), r)
-    if r.get("ok"):
-        r = r["result"]
-        print(f"cow fpr: checkpoint {r['checkpoint_ms']} ms; copy {r['copy']}")
-        check("cow fpr: no discard held up the copy", r["copy"]["discards_held"] == 0, r["copy"])
-        h = ok(A, {"op": "ckhash", "dir": path})
-        check("cow fpr: checkpoint == memory at the pause", h["hash"] == r["pause_memhash"], (h["hash"], r["pause_memhash"]))
-    # Then the held reports are carried out, and reporting works as before.
-    check("cow fpr: reports carried out after the copy", wait_for(lambda: vms(A)[n]["rss_mib"] < rss0 - 512, 20),
-          (rss0, vms(A)[n]["rss_mib"]))
+    for held in (True, False):
+        label = "cow fpr hold" if held else "cow fpr fallback"
+        code, out = sh(A, n, "head -c 384M /dev/zero > /dev/shm/big && sleep 2 && head -c 384M /dev/zero > /dev/shm/big2 && echo ok")
+        assert code == 0, out
+        time.sleep(4)
+        fault(A, "ckpt_memhash", 120000)
+        fault(A, "ckpt_copy_wait", 120000)
+        fault(A, "ckpt_no_hold", 0 if held else 120000)
+        res, freed = {}, {}
+        t = threading.Thread(target=lambda: res.update(r=rpc(A, {"op": "checkpoint", "name": n, "dir": path}, timeout=300)))
+        t.start()
+        def copying_and_running():
+            vm = vms(A).get(n, {})
+            return vm.get("checkpoint_copy") and vm.get("state") == "running"
+
+        copying = wait_for(copying_and_running, 30)
+        check(f"{label}: copy armed, guest running", copying, vms(A).get(n))
+        if not copying:
+            fault(A, "ckpt_copy_wait", 0)
+            t.join()
+            fault(A, "ckpt_no_hold", 0)
+            fault(A, "ckpt_memhash", 0)
+            break
+        rss0 = vms(A)[n]["rss_mib"]
+        free = threading.Thread(target=lambda: freed.update(result=sh(A, n, "rm /dev/shm/big /dev/shm/big2 && echo freed")))
+        free.start()
+        try:
+            if held:
+                free.join(timeout=30)
+                check(f"{label}: guest frees memory during the copy", freed.get("result") == (0, "freed"), freed)
+                # Allow the guest's delayed free-page reporter to enqueue work.
+                time.sleep(4)
+                vm = vms(A)[n]
+                check(f"{label}: freed memory held during the copy",
+                      vm.get("checkpoint_copy") and vm["rss_mib"] > rss0 - 256, (rss0, vm))
+            else:
+                # A queued REMOVE reaches the pager while writers cannot finish.
+                observed = wait_for(lambda: (vms(A)[n].get("checkpoint_copy_stats") or {}).get("discards_held", 0) > 0, 30)
+                check(f"{label}: discard held while the copy is running", observed and vms(A)[n].get("checkpoint_copy"), vms(A)[n])
+                free.join(timeout=30)
+                check(f"{label}: guest freed memory before writers were released",
+                      freed.get("result") == (0, "freed") and vms(A)[n].get("checkpoint_copy"), freed)
+        finally:
+            fault(A, "ckpt_copy_wait", 0)
+        free.join()
+        t.join()
+        fault(A, "ckpt_no_hold", 0)
+        fault(A, "ckpt_memhash", 0)
+        check(f"{label}: guest free completed", freed.get("result") == (0, "freed"), freed)
+        r = res.get("r", {})
+        check(f"{label}: checkpoint written", r.get("ok"), r)
+        if r.get("ok"):
+            r = r["result"]
+            check(f"{label}: expected discard path exercised",
+                  r["copy"]["discards_held"] == 0 if held else r["copy"]["discards_held"] > 0, r["copy"])
+            h = ok(A, {"op": "ckhash", "dir": path})
+            check(f"{label}: checkpoint == memory at the pause", h["hash"] == r["pause_memhash"], (h["hash"], r["pause_memhash"]))
+        check(f"{label}: reports carried out after the copy", wait_for(lambda: vms(A)[n]["rss_mib"] < rss0 - 512, 20),
+              (rss0, vms(A)[n]["rss_mib"]))
+        rm_ckpt(path)
     code, out = sh(A, n, "head -c 384M /dev/zero > /dev/shm/big && echo ok")
     rss2 = vms(A)[n]["rss_mib"]
     sh(A, n, "rm /dev/shm/big")
