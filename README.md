@@ -63,16 +63,21 @@ Only what needs the VM's state happens while it is paused:
    virtqueues), learned from the hot pool's loads (which hold their prefetch
    back until then). Header, vmstate and those pages go out on the open
    connection.
-3. The target seeds its pager, loads the state (vCPU, VM and device state
-   only, when prepared) and resumes, installing the preloaded pages while
-   Firecracker parses the state. It checks the source's page server answers
-   while loading, so a VM whose memory cannot come is never committed.
+3. The target seeds its pager and loads the state (vCPU, VM and device
+   state only, when prepared) with the vCPUs stopped, installing the
+   preloaded pages while Firecracker parses the state. Only once every check
+   that can still abort has passed (the source's page server answers, the
+   pager is healthy, the name is registered) does it record the migration
+   committed, and only then resume the VM: a VM that ran on the target is
+   never handed back to the source. A source that is gone, or too slow (one
+   30 s deadline for everything it sends after the pause), leaves nothing
+   behind on the target.
 
-Downtime p50 on an idle host (`flexvm bench`, 2 runs of 12–15 trials each,
-interleaved): 2 vCPU 36 ms before, 27 ms with steps 1–3 on stock Firecracker,
-11 ms with the patch (pause 2 ms, snapshot 1.6 ms, transfer 0.1 ms, target
-load 5 ms); 24 vCPU 48, 42 and 28 ms (its load is still 17 ms: vCPU threads,
-state parsing, resume).
+Downtime p50 on an idle host (`flexvm bench`, interleaved runs of 12–15
+trials): 2 vCPU 36 ms before, 27 ms with steps 1–3 on stock Firecracker,
+12 ms with the patch (pause 2 ms, snapshot 1.8 ms, transfer 0.1 ms, target
+load 4 ms, resume 1.6 ms); 24 vCPU 58 and 34 ms (its load is still 14 ms and
+its resume 6 ms: vCPU threads, state parsing).
 
 ### Lifecycle: pause, checkpoint, restore, suspend
 
