@@ -434,7 +434,8 @@ fn exec_session(host: &str, name: &str, cmd: &str, stdout: &mut impl Write, stde
             Ok(mut r) => match exec_frames(&mut r, &id, &mut started, &mut offset, stdout, stderr, &mut deadline)? {
                 StreamEnd::Exit(code) => {
                     // Fire and forget: the daemon acts on it after we hang up, and a lost
-                    // acknowledgement is harmless since finished sessions expire after five minutes.
+                    // acknowledgement is harmless since the guest closes a finished
+                    // session a minute after its client leaves.
                     if let Some(addr) = target.to_socket_addrs().ok().and_then(|mut a| a.next()) {
                         if let Ok(mut c) = TcpStream::connect_timeout(&addr, Duration::from_secs(1)) {
                             let _ = send_json(&mut c, &json!({"op": "exec", "name": name, "session": id, "action": "close"}));

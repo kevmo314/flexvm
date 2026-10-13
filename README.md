@@ -864,6 +864,15 @@ output ring mutex. Reading an exit does not discard it: the CLI sends CLOSE
 after receiving it, and the guest retains the ID as a tombstone until expiry
 so a delayed creation retry cannot execute the command again.
 
+At most 64 sessions are live (running, or finished and not yet closed); another
+SESSION fails with `error: too many sessions: ...`. A finished session whose
+client has been gone for a minute is closed by the guest. Tombstones are small
+records outside that limit: they expire after five minutes, and beyond 4096 the
+oldest one (if at least 30 s old) is dropped. Each live session's output ring
+keeps 128 KiB and grows towards 4 MiB from a shared pool, so all rings together
+hold at most 64 MiB; when the pool is spent, rings stop growing, a detached
+client may then see kind 5 sooner, and an attached one sees backpressure.
+
 The daemon JSON exec request adds `session`, `action` (`start`, `attach`, or
 `close`), and `offset`; start also supplies `cmd`. Start/attach return the usual
 JSON success reply followed by session frames; close returns a JSON reply.
