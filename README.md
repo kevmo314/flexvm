@@ -82,25 +82,37 @@ VM that is busy, paused or suspended.
   Then suspend kills Firecracker, so the VM costs no memory. Memory is
   released only once the checkpoint is durable. The pager is stopped before
   Firecracker dies, so no discard event can mark a saved page as zero.
-  `resume` first moves the checkpoint durably out of `suspended/`, before
-  any vCPU runs, then restores it lazily like `restore`. The checkpoint is
-  deleted once every page is in. Suspended VMs survive a daemon restart.
-  `kill` moves a suspended VM's checkpoint durably to `trash/` before it
-  answers. A resume that fails before the vCPUs ran leaves the VM
-  suspended. One that fails after they ran consumes the checkpoint: the VM
-  is gone, as re-arming it would replay what it did.
-- **Device quiescing.** Pausing stops vCPUs, not Firecracker's device
-  handling. So before a checkpoint or migration pauses a VM, the daemon
-  waits until the guest has carried out the last virtio-mem resize
-  (plugged = requested), holding the VM's reservation so the controller
-  cannot start another. After half the 10 s deadline, it sets requested =
-  plugged so the guest has nothing left to ask for.
-  The guest driver (Linux `virtio_mem_run_wq`) only sends requests to close
-  a requested/plugged gap. Two exceptions are a block left plugged after a
-  failed hot-add plus a failed rollback, and kdump. As a backstop, a
-  checkpoint is not published if any memory was discarded (balloon or
-  virtio-mem REMOVE) or the plugged size changed after the snapshot; the VM
-  resumes and the checkpoint can be retried.
+  A suspended VM's checkpoint stays in `suspended/`.
+  - **Resume** first creates a `STARTED` marker in it and fsyncs it, before
+    any vCPU runs. It then restores lazily like `restore`, and deletes the
+    checkpoint once every page is in.
+  - **Kill** creates a `DISCARDED` marker the same way before it answers.
+  - **Daemon restart** deletes marked checkpoints and brings back the rest,
+    so suspended VMs survive a restart, and a resumed or killed one never
+    comes back.
+  - **Failed resume.** If it fails before the resume request reaches
+    Firecracker, the VM stays suspended. If it fails after, the checkpoint
+    is consumed: the VM is gone, as re-arming it would replay what it did.
+- **Device quiescing.** Stock Firecracker pausing stops the vCPUs but not
+  its device handling, which can go on writing guest memory and used rings
+  behind a saved state. `firecracker/0002-freeze-devices-on-pause.patch`
+  freezes the devices too: while the VM is paused, net (tap RX/TX), vsock,
+  balloon (including its stats timer and free page reporting), virtio-mem,
+  entropy and pmem leave their queues alone.
+  - **Deferred, not lost.** A queue notification arriving while frozen is
+    drained, so epoll does not spin, and replayed on resume.
+  - **Host-side work continues.** Rate-limiter timers and vsock backend
+    sockets are still handled, without touching the queues.
+  - **On resume** every device is kicked as before.
+
+  The older measures stay as belt and braces:
+  - **Settling virtio-mem.** Before a checkpoint or migration pauses a VM,
+    the daemon waits until virtio-mem has carried out the last resize
+    (plugged = requested). It holds the VM's reservation, so the controller
+    cannot start another. Past half the 10 s deadline it sets requested =
+    plugged.
+  - **No discards behind the snapshot.** A checkpoint is not published if
+    memory was discarded or the plugged size changed after the snapshot.
 - **Clock.** A restored guest's wall clock resumes from when it was saved.
   The guest uses the TSC clocksource, whose saved value Firecracker
   restores, while `clock_realtime` only moves kvmclock. A restore or a
@@ -213,6 +225,19 @@ each failure path.
 `PUT /snapshot/create` saves only the microVM state. Stock Firecracker always
 writes all guest memory, which would make migration downtime proportional to
 RAM and double memory use on a host that is already short.
+
+`firecracker/0002-freeze-devices-on-pause.patch`: pausing the VM also
+freezes its virtio devices (see Device quiescing above). The cost, from 30
+pause/resume pairs and 10 migrations each (2 vCPU):
+
+| | stock | patched |
+|---|---|---|
+| pause | 0.56 / 0.59 ms | 0.54 / 0.54 ms |
+| resume | 0.60 / 0.60 ms | 0.64 / 0.72 ms |
+| migrate downtime (p50) | 48 / 51 ms | 50 / 57 ms |
+
+Each cell is two runs. Resume pays for replaying the notifications that
+arrived while frozen. The migration difference is within this host's noise.
 
 ## Measured (WSL2, Ryzen 9 3900X, nested KVM)
 
@@ -446,13 +471,11 @@ firecracker/        patches on top of Firecracker v1.17.0
 - The controller samples guest memory once a second (balloon stats). A very
   fast allocation burst can still hit the in-guest OOM killer; guest PSI
   triggers over vsock would react faster.
-- **Device activity after a snapshot is guarded, not prevented.** virtio-mem is
-  settled first, and a discard or resize after the snapshot stops a
-  checkpoint from being published. A device request already queued at the
-  pause could still write only a used ring (a failed request, or a balloon
-  statistics or report round with no discard) and go unnoticed. Closing that
-  fully needs Firecracker to freeze device processing with the vCPUs. The
-  migration path has only the settle wait, not the discard check.
+- **The device freeze needs the patched Firecracker (0002).** Templates and
+  artifacts built before it run unfrozen, and then only the settle wait and
+  the discard check guard a snapshot. Those miss a request that writes only
+  a used ring. The freeze covers the devices flexvm uses; it does not cover
+  virtio-block or vhost-user.
 - **Checkpoints pause the VM for the whole write** (about 0.4 GB/s: reading
   memory out of Firecracker, comparing with the template, checksumming,
   fsync). Copy-on-write or pre-copy (#8) would make the pause independent of
