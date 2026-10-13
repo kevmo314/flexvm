@@ -917,8 +917,10 @@ impl Daemon {
 
     /// Arms test fault `fault` for `ms` milliseconds: `pages` (the page
     /// server drops connections), `route` (rerouting after a migration
-    /// fails), `lost_ack` (incoming migrations get no reply) or `status`
-    /// (migration status queries fail).
+    /// fails), `lost_ack` (incoming migrations get no reply), `status`
+    /// (migration status queries fail), `prepare_fail` (an incoming migration
+    /// fails once everything is prepared) or `short_incoming` (a prepared
+    /// incoming migration waits 2 s for the source, not 30).
     fn inject(&self, req: &Value) -> Result<Value> {
         let Some(faults) = &self.faults else { bail!("fault injection is off (start the daemon with FLEXVM_FAULTS=1)") };
         let fault = req["fault"].as_str().ok_or("missing fault")?;
@@ -1526,6 +1528,9 @@ impl Daemon {
         if preflight && vm.prepare_load()? {
             t.mark("prepare_load");
         }
+        if self.fault("prepare_fail") {
+            bail!("injected fault: preparing failed");
+        }
         Ok(PreparedIn { vm, claim, source, name, load_set, _busy: busy })
     }
 
@@ -2118,10 +2123,22 @@ struct ByDeadline<'a> {
     at: Instant,
 }
 
+fn too_slow() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::TimedOut, "migration source too slow")
+}
+
+/// A read timeout firing is the deadline passing.
+fn timed_out(e: std::io::Error) -> std::io::Error {
+    match e.kind() {
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => too_slow(),
+        _ => e,
+    }
+}
+
 impl ByDeadline<'_> {
     fn arm(&self) -> std::io::Result<()> {
         match self.at.saturating_duration_since(Instant::now()) {
-            d if d.is_zero() => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "migration source too slow")),
+            d if d.is_zero() => Err(too_slow()),
             d => self.r.get_ref().set_read_timeout(Some(d)),
         }
     }
@@ -2130,14 +2147,14 @@ impl ByDeadline<'_> {
 impl Read for ByDeadline<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         self.arm()?;
-        self.r.read(buf)
+        self.r.read(buf).map_err(timed_out)
     }
 }
 
 impl std::io::BufRead for ByDeadline<'_> {
     fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
         self.arm()?;
-        self.r.fill_buf()
+        self.r.fill_buf().map_err(timed_out)
     }
     fn consume(&mut self, n: usize) {
         self.r.consume(n)
