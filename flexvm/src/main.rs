@@ -8,6 +8,8 @@ mod daemon;
 mod fc;
 mod guest;
 mod hold;
+#[allow(dead_code)]
+mod host;
 mod image;
 mod hot;
 mod net;
