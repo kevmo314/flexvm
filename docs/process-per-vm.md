@@ -15,7 +15,8 @@ flexvm run web -d         # same, detached; prints {"name","ip","pid",...} once 
 
 A VM process:
 
-1. takes its name (an exclusive `flock` on `RUN/vms/NAME.lock`, held for life),
+1. takes its name (an exclusive `flock` on `RUN/vms/NAME.lock`, held for
+   life, its pid and start time written in it),
 2. claims an address and generation (under the host lock, below),
 3. restores the template snapshot into a Firecracker it spawns itself
    (`PR_SET_PDEATHSIG`, so Firecracker never outlives the pager), or takes
@@ -25,7 +26,18 @@ A VM process:
 5. waits for signals and control requests until the VM is gone.
 
 Exit status: 0 when the VM was suspended, migrated away or killed on request;
-1 when it failed (memory lost, Firecracker died). With `-- CMD`, the VM runs
+1 when it failed (memory lost, Firecracker died).
+
+Ownership is held in guards that give back exactly what they took: the name
+lock (`NameLock`), the address claim (`AddrClaim`: dropped, it releases the
+address; a suspended VM keeps it) and an arrival's migration record
+(`MigRecord`: dropped before it commits, the record goes, which reads as
+aborted). The process ends one way only, `Proc::finish`, holding the
+operation lock: it kills the VM and waits for its Firecracker, settles the
+address by how the VM left (`End::Gone` withdraws it, `Suspended` keeps it,
+`Moved` releases it, `NotStarted` releases it or, for a generation made for
+this VM, withdraws it), deletes a consumed checkpoint, gives up the name, and
+tells a waiting client and a standby claimer before it exits. With `-- CMD`, the VM runs
 CMD in the guest, streams its output, and the process exits with CMD's status
 (the VM is destroyed afterwards).
 
@@ -41,8 +53,14 @@ CMD in the guest, streams its output, and the process exits with CMD's status
 
 They (and SIGHUP, ignored: a closed terminal leaves the VM running) are
 blocked in every thread and taken by one thread with `sigwait`, so SIGTSTP
-never stops the process. Every operation on the VM (signal, control
-request, controller resize, clock step) holds the VM's operation mutex.
+never stops the process. Every operation on the VM (starting it, signal,
+control request, controller resize, clock step, deleting a consumed
+checkpoint) holds the VM's operation mutex. Requests give up after 30 s;
+what must not be refused (SIGINT, SIGTERM, a dead VM, the end of a
+migration) waits for it, after cancelling a checkpoint in progress.
+
+`kill -KILL` on a migration source is the operator's way to give up its
+copy (the target loses the pages it has not pulled); `flexvm kill` refuses.
 
 ## On-disk state
 
@@ -52,24 +70,40 @@ Two directories, both overridable (`--state`/`FLEXVM_STATE`, `--run`/`FLEXVM_RUN
 STATE (default /var/lib/flexvm, on disk)
   host.json              host config: listen, peers, vm_ips, underlay, announce_dev, dns, reserve_mib, prefix
   lock                   the host lock (flock), held for short critical sections only
-  addrs/IP               per address: newest generation seen, withdrawn?, lent generation, holder name
+  addrs/IP               per address: newest generation seen, withdrawn?, lent generation, holder name and
+                         generation, the route a peer announced for the newest generation
   addrs/.gens            generation high-water mark, reserved 1024 at a time, with the boot id
-  suspended/NAME/        a suspended VM's checkpoint (+ STARTED, DISCARDED, QUARANTINE markers)
-  suspended/.gen-NAME    its address's generation, written durably before the checkpoint
+  suspended/NAME/        a suspended VM's checkpoint, GEN (its address's generation) published with it,
+                         + STARTED, DISCARDED, QUARANTINE markers
   standby/TEMPLATE       how many standby VMs to keep for a template
-  migs/ID                incoming migration records (fencing), fsynced
+  migs/ID                incoming migration records (fencing), JSON, fsynced
 RUN (default /run/flexvm, tmpfs)
   vms/NAME.{lock,json,sock,log}   registry entry, liveness lock, control socket, log of -d/standby VMs
   standby/T/KEY.PID.sock a standby VM of template T, generation KEY (PID.lock while it lives)
   standby/.loadset-ID    pages loads of template ID touch, learned by standby VMs, for migrations to preload
   faults.json            armed test faults (FLEXVM_FAULTS=1 only)
-  w/PID/                 a VM process's Firecracker directories and sockets
+  w/PID/                 a VM process's work directory: `owner` (pid, start time), and per
+                         Firecracker a directory with `fc` (its pid and start time)
 ```
 
 **Liveness** is the name lock: a registry entry whose `.lock` can be locked
-belongs to a dead process and is ignored (and removed by whoever notices).
-Unlinking a lock file is done holding it, and a taker re-checks after locking
-that the path still names the inode it locked.
+belongs to a dead process and is ignored; an entry is believed only for the
+process the lock names (pid and start time). Unlinking a lock file is done
+holding it, and a taker re-checks after locking that the path still names
+the inode it locked. Signals to a VM (`kill`, `resume`, a foreground `run`
+forwarding them, eviction of standby VMs) go through a pidfd opened for the
+process the registry or lock names, checked after opening.
+
+**Death evidence.** A dead process is taken for gone, its name or address
+reusable and its migration settled, only once the Firecrackers it started
+have exited: `host::reap` reads them from its work directory (whose `owner`
+must be that process), SIGKILLs each through a pidfd and waits for it.
+Firecracker also gets `PR_SET_PDEATHSIG` (checked, and the parent checked
+alive after it), so they die anyway; reaping makes the order certain.
+
+**The host lock** is a flock taken by one thread of a process at a time and
+reentrant within a thread, so a guard dropped under it (an address claim)
+never deadlocks.
 
 **Addresses and generations** keep the semantics of the generations work
 (#60): only an address's home host (whose `vm_ips` holds it) hands it out,
@@ -78,14 +112,33 @@ generation through migrations and suspends; route announcements and
 withdrawals carry it; each host keeps the newest (generation, withdrawn) seen
 per address and ignores older messages and announcements of withdrawn
 generations; a withdrawal frees a loan of its generation or older. An address
-is *taken* if its record names a holder that is alive (locked name) or
-suspended here, or it is lent. All of this is decided under the host lock, in
-one critical section with the claim. Records with a new generation, a loan or
-a withdrawal are fsynced before acting; a live holder change is not (a crash
-loses the VM too, and the high-water mark already orders generations).
+is *taken* if its record names a holder that is alive (locked name, or its
+dead process's Firecrackers not yet gone) or suspended here, or it is lent.
+All of this is decided under the host lock, in one critical section with the
+claim. Records with a new generation, a loan or a withdrawal are fsynced
+before acting; a live holder change is not (a crash loses the VM too, and the
+high-water mark already orders generations). A record that cannot be read or
+parsed is an error, never a free address.
 
-**Admission** (`reserve_mib`): an incoming migration is refused when
-MemAvailable would drop under the reserve; standby refills stop under it.
+- **Borrowing.** A restore keeping another host's address (its checkpoint's,
+  or `--ip`) asks the peers to `lend` it: the home host checks it is free
+  (no VM there, not lent), lends it out durably with a new generation and
+  answers with it; the restore claims the address with that generation, and
+  withdraws it (freeing the loan) if the VM does not start. `run --ip` takes
+  only this host's addresses.
+- **Routes.** A peer's announcement leaves the route of an address a VM here
+  holds with that generation or a newer one, or a migration's paused source,
+  alone; a newer one replaces it. The route a peer announced for the newest
+  generation is recorded, and put back when a claim or hold here that kept
+  the route goes without its VM running here: a superseded migration source,
+  an arrival that does not commit.
+- **Right before a VM runs** (a restore, a suspended resume, a `--paused`
+  restore's or SIGTSTP'd VM's SIGCONT, an arrival's commit) its generation is
+  checked again under the host lock, held until the vCPUs run.
+
+**Admission** (`reserve_mib`): growth and incoming migrations are admitted
+under the host lock against MemAvailable minus the reserve and the grants of
+the last 10 s (`RUN/grants`); standby refills stop under it.
 
 ## Migration, runner to runner
 
@@ -95,26 +148,29 @@ answer, held packets). What changed is who is at each end:
 1. The source VM process gets `migrate {to}` on its control socket and
    connects to `to`, the target's peer listener, sending `migrate_in`.
 2. The listener spawns `flexvm run --incoming` with the connection as fd 3.
-   That process takes the name lock, claims the address with the source's
-   generation, creates `STATE/migs/ID` (`pending <pid> <start time> <boot id>`, refused
-   if it exists: an id is seen once), spawns and prepares Firecracker, answers.
+   That process takes the name lock, creates `STATE/migs/ID` (`pending`
+   with its pid, start time and boot id; refused if it exists: an id is seen
+   once), claims the address with the source's generation, spawns and
+   prepares Firecracker, answers.
 3. The source pauses, sends the state; the target loads it, runs every
-   check that can abort, then under the record's lock turns `pending` into
-   `committed` (refused if it was fenced), and only then resumes.
+   check that can abort, then under the host lock turns `pending` into
+   `committed` (refused if it was fenced), and resumes before letting go of
+   the lock.
 4. Pages: the target's pager connects to the *source's* listener with
    `pages {name, mig}`; the listener passes the socket (SCM_RIGHTS) to the
    source VM process, which serves it if it is the source of that migration.
 5. Release: the source polls `migration {mig}` on the target's listener.
    The listener answers from `STATE/migs/ID`: `pending`, `committed`,
-   `released` (the target process wrote it once all pages arrived, or its VM
-   is gone, or the process is dead), or `aborted`. An unknown id, or `pending`
-   whose process is dead, is fenced: recorded `aborted` first, so it can
-   never commit later. The source resumes only on `aborted`, exits on
-   `released`, and stays paused (serving pages) otherwise.
-
-So fencing no longer depends on a daemon restart killing orphans: a target
-process that dies takes its Firecracker with it (pdeathsig), and its record
-says so.
+   `released` (the target process wrote it once all pages arrived, retrying
+   until it is recorded), or `aborted` (no record). A record whose process
+   is dead is settled first, once its Firecrackers are reaped: `pending`
+   goes (aborted: it can never commit, as committing needs its own pending
+   record), `committed` becomes `released`. A record that cannot be read
+   answers nothing. The source resumes only on `aborted`, and then under the
+   host lock and only if its generation is still current; it exits on
+   `released`, telling the target it is `done` with the id (the record goes
+   then: retention follows the protocol, not time), and stays paused,
+   serving pages, otherwise.
 
 ## Peer listener
 
@@ -128,10 +184,14 @@ one of:
 |---|---|
 | `migrate_in` | spawn `flexvm run --incoming` with the connection |
 | `pages` | pass the connection to the VM process named, over its control socket |
-| `migration` | report and fence a migration record |
+| `migration` | report and settle a migration record; `done`: forget a released one |
 | `route` | a peer's announcement/withdrawal: judge its generation, set or remove the route |
+| `lend` | lend an address of this host's range to a restoring peer, with a new generation |
 
-Restarting or not running it loses nothing but the ability to receive.
+Only connections from the configured peers' addresses are served. Request
+lines are read with a 10 s deadline and capped at 64 KiB; at most 512
+requests at once. Restarting or not running it loses nothing but the ability
+to receive.
 
 ## Standby pool
 
@@ -144,8 +204,12 @@ takes the name and address, routes, resumes, sends `START`, and becomes that
 VM. A claimed standby starts its replacement. A foreground `run` that claimed
 one forwards its signals to it and exits with the status the VM process sends
 back on the claim connection. Under memory pressure standby VMs are SIGINTed
-first. The old hot pool's per-template budget, cost learning and back-off go
-away: the count is explicit, and refills stop under the reserve.
+first. The count is explicit, and refills stop under the reserve; one refill
+of a template runs at a time (`.refill` lock), and waits until the standby
+VMs it starts are ready, so concurrent claims never overfill. A claim sent
+but not answered (the standby died, or hung up) is an uncertain outcome: the
+guest may have run, so `run` reports it (with the standby's socket, and
+whether the registry shows the VM) and starts nothing else.
 
 ## Memory controller and eviction
 
@@ -189,7 +253,8 @@ This replaces the `info` op the daemon used to find room.
 
 After: control socket `exec`, `checkpoint`, `migrate`, `claim`, `pages`
 (from the listener only), `debug` (6); peer `migrate_in`, `pages`,
-`migration`, `route` (4). 10 ops, from 23; user-facing ones: 3.
+`migration`, `route`, `lend` (5). 11 ops, from 23 (the daemon's
+`lend_ip` included); user-facing ones: 3.
 
 ### CLI, before (15 commands) and after (12)
 
@@ -224,36 +289,45 @@ reconnection within a host (checkpoint pauses, vsock resets) still works.
 From review pass 6 on #85 and the Codex review of #45/#60; each says
 where it is kept and what tests it.
 
-1. **A committed migration id is never forgotten.** Records live in
-   `STATE/migs/ID` (disk), changed only under the host lock and fsynced:
-   `committed` is durable before the VM resumes, and the listener's fence
-   write (`aborted`, for an unknown id or a pending one whose process is
-   gone) happens under the same lock. A committed record whose process is
-   gone reads `released`, never `aborted`. Records are kept 7 days.
-   Unit test `host::migrations_are_fenced`; faults `lost_ack`, `unknown`,
-   `target_killed`.
+1. **A committed migration id is never forgotten** until its source says it
+   is done with it. Records live in `STATE/migs/ID` (disk), typed
+   (`pending`, `committed`, `released`), changed only under the host lock
+   and fsynced: `committed` is durable before the VM resumes; a committed
+   record whose process is gone reads `released`, never `aborted`; reads
+   fail closed. Unit test `host::migrations_are_fenced`; faults `basic`,
+   `lost_ack`, `unknown`, `target_killed`, `incoming_killed`.
 2. **The old Firecracker is dead before an id is fenced or a name or
-   address freed.** A VM process spawns Firecracker from its main thread
-   with `PR_SET_PDEATHSIG=SIGKILL`; the main thread lives as long as the
-   process, so the process's death kills it. Fencing and freeing go by the
-   process (name lock, pid + start time + boot id), and `Vm::kill` waits for
-   Firecracker to exit. Faults `source_killed`, `target_killed`.
-3. **Instance identity.** One process is one VM instance; registry entries
-   carry a random `instance` id. Route, hold and announce decisions are made
-   in the process that owns the VM, or by the host lock plus the address
-   record's holder and generation.
+   address freed.** Firecracker is spawned from the main thread with
+   `PR_SET_PDEATHSIG=SIGKILL` (failure fails the spawn, as does a parent
+   gone meanwhile), and recorded in the work directory; a dead process's
+   Firecrackers are reaped (killed through pidfds, waited for) before its
+   name, address or migration record is settled; `Vm::kill` waits for
+   Firecracker to exit. The cgroup move is joined before Firecracker is
+   killed, so it never acts on a reused pid or recreates a removed cgroup.
+   Unit test `host::a_dead_holders_firecrackers_die_before_its_name_or_address_is_free`;
+   faults `source_killed`, `target_killed`, `incoming_killed`, `start_killed`.
+3. **Instance identity.** One process is one VM instance, named by pid and
+   start time in its name lock and registry entry; an entry is believed only
+   for the process holding the name, and signals go through pidfds checked
+   against it. Route, hold and announce decisions are made in the process
+   that owns the VM, or by the host lock plus the address record's holder
+   and generation.
 4. **No fire-and-forget work outlives the process.** Withdrawals are sent
    (and joined) before exit; a migration source polls its target until
    released and only then exits; the reroute retry gets a last attempt
    before exit; a resumed checkpoint is deleted at exit if its pull did not
    finish. Announcements are only for a VM that runs, so they may die with it.
-5. **Signals.** SIGTERM on a migration source is a no-op (it ends once the
+5. **Signals.** Startup holds the operation lock, so signals wait for the VM
+   to be up. SIGTERM on a migration source is a no-op (it ends once the
    target has its memory); on a target still pulling, the suspend waits for
-   the pull (`save` drains). SIGCONT resumes only a VM paused by SIGTSTP
-   (or held by `restore --paused`), and is ignored once a suspend or kill
-   began: the kernel sends it after any SIGSTOP, systemd right after SIGTERM.
+   the pull (`save` drains, giving up if the VM is being killed). SIGCONT
+   resumes only a VM paused by SIGTSTP (or held by `restore --paused`), and
+   is ignored once a suspend or kill began: the kernel sends it after any
+   SIGSTOP, systemd right after SIGTERM. A destroy refused because the VM is
+   migrating away (SIGINT, or `run -- CMD` ending) never ends the process.
 6. **Suspend markers and quarantine.** `STARTED` means consumed: `resume`
-   deletes such a checkpoint and `ls` does not show it. Quarantine is a file
+   deletes such a checkpoint and `ls` does not show it; deleting it holds
+   the operation lock, and a suspend deletes it first. Quarantine is a file
    (`QUARANTINE`, with the boot id). Suspended VMs keep name and address with
    no pid, and `ls` lists them.
 7. **Address state** is read fresh and changed per change under the host
@@ -273,13 +347,16 @@ where it is kept and what tests it.
 10. **Load ordering.** Each process opens its own template (its fd paths are
    its own); `Pager::set_pid` runs before any load; a standby claim whose
    resume may have reached Firecracker is never retried (`retry: false`).
-11. **Generations** (#60): aborting a migration never resumes a source whose
-   address has a newer generation (checked under the host lock; the copy is
-   destroyed instead); an arrival must carry a generation (0 is refused) no
-   older than the one recorded; a suspend records its generation durably
-   before the checkpoint is published and fails otherwise, and a suspended
-   VM without one is quarantined, never given a new generation. Faults
-   `abort_superseded`, `gen_zero`, `suspend_gen`.
+11. **Generations** (#60, #94): aborting a migration never resumes a source
+   whose address has a newer generation (checked under the host lock, held
+   through the route restore and the resume; the copy is destroyed instead,
+   and the newer VM's announced route replaces the hold); an arrival must
+   carry a generation (0 is refused) no older than the one recorded; a
+   suspend writes its generation into the checkpoint (`GEN`) before it is
+   published, and a suspended VM without one is quarantined, never given a
+   new generation; every VM start rechecks its generation under the host
+   lock until it runs. Faults `abort_superseded`, `gen_zero`, `forged_peer`,
+   `suspend_gen`, `late_withdrawal`, `checkpoint_restore`, `restore_ip_peer`.
 12. **`scripts/faults.py`** is ported to VM processes and listeners (see
    Test plan).
 
@@ -300,7 +377,10 @@ where it is kept and what tests it.
   `checkpoint_crash`/`cow_crash` (SIGKILL the VM process mid-write: no
   checkpoint appears, staging is cleared by the next one), `hot_budget`
   becomes `standby` (count, refill, claim fallback). New: `abort_superseded`,
-  `gen_zero`, `suspend_gen`, `signals`. Dropped:
+  `gen_zero`, `suspend_gen`, `signals`, `kill_source`, `forged_peer`,
+  `restore_ip_peer`, `late_withdrawal`, and processes SIGKILLed between
+  steps at test stalls (`incoming_killed`, `start_killed`, `claim_killed`).
+  Dropped:
   `target_restart_symlink`, `shared_run_dir`, `state_dir_lock` (they tested a
   daemon's run-dir locking and orphan killing on restart; there is no daemon
   to restart, and Firecracker dies with its VM process).

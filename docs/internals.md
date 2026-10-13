@@ -622,8 +622,11 @@ a second copy could repeat what it did.
   ("lent", in `STATE/addrs/IP`) until that VM is killed wherever it is (its
   host tells the peers), or it migrates back. If that message is lost, the
   address stays taken; removing `lent` from that file frees it. Leaks, never
-  collisions. Every address carries a generation that orders the VMs that
-  had it; messages about older ones are ignored (see process-per-vm.md).
+  collisions. A restore elsewhere that keeps the address borrows it the same
+  way (op `lend`). Every address carries a generation that orders the VMs
+  that had it; messages about older ones are ignored, and the route a peer
+  announced for the newest one is put back when a claim here goes without
+  its VM running (see process-per-vm.md).
 - Reachability:
   - **Peers** get a route pushed to them: `<vm-ip>/32 via <host underlay ip>`.
     Routes via an address local to the host's network namespace (including

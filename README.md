@@ -55,6 +55,10 @@ flexvm resume web               # bring a suspended VM back (in a new process)
 flexvm kill web                 # destroy it, running or suspended; Ctrl-C in the foreground
 ```
 
+A VM migrating away stays paused on its source until the target has all its
+memory; `flexvm kill` refuses that copy (kill the VM where it runs), and
+`kill -KILL PID` gives it up (the target loses the pages it has not pulled).
+
 A suspended VM keeps its name and address; `ls` shows it `suspended`.
 
 ## Checkpoint and restore
@@ -69,6 +73,9 @@ flexvm restore /data/web-1 --paused                 # held until SIGCONT
 ```
 
 A checkpoint restores on any host with the same template (by content id).
+Restored on another host with its own address, the VM borrows the address
+from its home host, which refuses one in use or lent out; `--ip auto` picks
+a new one.
 
 ## Migrate
 
@@ -86,8 +93,10 @@ flexvm listen 192.168.1.11:7070 --peer 192.168.1.10:7070 --announce-dev eth0 \
 flexvm migrate web 192.168.1.11:7070      # on A: web now runs on B, same address, connections intact
 ```
 
-Every host's `--vm-ips` must be disjoint. `--reserve MIB` (default 1024) is
-the memory a host keeps free: below it, VMs are moved to a peer with room.
+Every host's `--vm-ips` must be disjoint, and the hosts must list each other
+with `--peer`: a listener serves its peers' addresses only. `--reserve MIB`
+(default 1024) is the memory a host keeps free: below it, VMs are moved to a
+peer with room.
 
 ## Fast starts
 
@@ -167,7 +176,10 @@ copy-on-write, packet holds, clocks, Firecracker patches, measurements).
 - Until a migrated VM has pulled all its memory (~1 s per GB) it depends on
   both hosts.
 - IPv4 only; peers form a full mesh; address ranges are per host and set by hand.
-- The peer protocol is plain TCP without authentication: trusted networks only.
+- The peer protocol is plain TCP, served to the peers' addresses only, without
+  authentication: trusted networks only.
+- An address lent to a restore elsewhere stays lent if that restore's host
+  dies before it starts the VM (a leak, never a collision).
 - `exec` reaches VMs on this host; one that migrates away ends its exec
   saying where it went (the command keeps running there).
 - Templates must be identical on every host (checked by content id).
