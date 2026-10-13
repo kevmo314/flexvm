@@ -6,8 +6,9 @@ or cleanly failed.
 
 usage: scripts/faults.py [--a ADDR] [--b ADDR] [--bin FLEXVM] [--log-dir DIR] SCENARIO... | all
   'all' runs the scenarios that leave both daemons running; source_killed,
-  target_restart and target_restart_symlink kill a daemon with SIGKILL and
-  restart it with the same command line and environment (logging to --log-dir).
+  target_restart, target_restart_symlink, checkpoint_crash and suspend_resume
+  kill a daemon with SIGKILL and restart it with the same command line and
+  environment (logging to --log-dir). Checkpoint scenarios write to --ckpt-dir.
 """
 import argparse, json, os, socket, subprocess, sys, tempfile, threading, time
 
@@ -16,6 +17,9 @@ p.add_argument("--a", default="127.0.0.1:7092")
 p.add_argument("--b", default="127.0.0.1:7093")
 p.add_argument("--bin", default=os.path.join(os.path.dirname(__file__), "..", "target", "release", "flexvm"))
 p.add_argument("--log-dir", default=tempfile.gettempdir())
+p.add_argument("--ckpt-dir", default=os.path.join(tempfile.gettempdir(), "flexvm-checkpoints"),
+               help="where checkpoint scenarios write checkpoints (on disk; removed afterwards)")
+p.add_argument("--template", default="default")
 p.add_argument("scenarios", nargs="+")
 args = p.parse_args()
 A, B, BIN = args.a, args.b, args.bin
@@ -76,7 +80,7 @@ def fault(host, f, ms):
 
 def setup(name, host=None, mib=200):
     host = host or A
-    ok(host, {"op": "run", "name": name})
+    ok(host, {"op": "run", "name": name, "template": args.template})
     code, out = sh(host, name, f"dd if=/dev/urandom of=/tmp/f bs=1M count={mib} 2>/dev/null; md5sum /tmp/f")
     assert code == 0, out
     return out.split()[0]
@@ -228,7 +232,7 @@ def unknown():
 def refused():
     n = "ft-refused"
     m = setup(n)
-    ok(B, {"op": "run", "name": n})
+    ok(B, {"op": "run", "name": n, "template": args.template})
     r = rpc(A, {"op": "migrate", "name": n, "to": B})
     check("refused: migrate fails", not r["ok"], r)
     check("refused: source resumed", where(n) == {A: "running", B: "running"}, where(n))
@@ -474,11 +478,501 @@ def guest_hang():
     cleanup(n)
 
 
+# --- lifecycle: checkpoint / restore / pause / suspend -------------------------
+
+
+def ckpt_path(label):
+    os.makedirs(args.ckpt_dir, exist_ok=True)
+    path = os.path.join(args.ckpt_dir, label)
+    subprocess.run(["sudo", "rm", "-rf", path])
+    return path
+
+
+def rm_ckpt(path):
+    subprocess.run(["sudo", "rm", "-rf", path])
+
+
+def marker(host, name):
+    """Starts a long-lived guest process; returns its (pid, start time)."""
+    code, out = sh(host, name, "setsid sleep 424242 >/dev/null 2>&1 < /dev/null & echo $! > /tmp/marker.pid")
+    assert code == 0, out
+    return marker_id(host, name)
+
+
+def marker_id(host, name):
+    code, out = sh(host, name, 'p=$(cat /tmp/marker.pid); echo "$p $(cut -d" " -f2,22 /proc/$p/stat)"')
+    return out if code == 0 else None
+
+
+def guest_clock_error(host, name):
+    """Guest wall clock minus host wall clock, in seconds (+- one exec)."""
+    before = time.time()
+    code, out = sh(host, name, "date +%s.%N")
+    after = time.time()
+    return float(out) - (before + after) / 2 if code == 0 else None
+
+
+def to_tap(host, name):
+    """Daemons sharing one host share its routing table, and a peer's route
+    for a VM it just announced replaces ours: point the address at the VM's
+    tap, as its own host would."""
+    time.sleep(0.5)  # let the restoring daemon's announcement land first
+    vm = vms(host)[name]
+    # Some taps lose the gateway MAC create_tap gave them (udev racing it?),
+    # and then the host ignores the guest's frames.
+    subprocess.run(["sudo", "ip", "link", "set", "dev", vm["tap"], "address", "06:00:a9:fe:01:01"], check=True)
+    subprocess.run(["sudo", "ip", "route", "replace", f"{vm['ip']}/32", "dev", vm["tap"]], check=True)
+    return vm["ip"]
+
+
+def echo(s, msg):
+    s.sendall(msg)
+    got = b""
+    while len(got) < len(msg):
+        d = s.recv(65536)
+        if not d:
+            break
+        got += d
+    return got == msg
+
+
+def tcp_server(host, name, port=7000):
+    code, out = sh(host, name, f"setsid socat TCP-LISTEN:{port},fork,reuseaddr EXEC:cat >/dev/null 2>&1 < /dev/null &")
+    assert code == 0, out
+    time.sleep(0.3)
+
+
+FV_MASK = (1 << 64) - 1
+
+
+def fv_hash(b):
+    """flexvm's content hash (template::Hash), to forge test manifests."""
+    def word(h, w):
+        x = ((h ^ w) * 0x9E3779B97F4A7C15) & FV_MASK
+        return x ^ (x >> 29)
+    h = word(0xCBF29CE484222325, len(b))
+    n = len(b) // 8
+    for i in range(n):
+        h = word(h, int.from_bytes(b[i * 8:i * 8 + 8], "little"))
+    return f"{word(h, int.from_bytes(b[n * 8:].ljust(8, b'\0'), 'little')):016x}"
+
+
+def checkpoint_restore():
+    """checkpoint --stop on A, restore on B: file contents, a running
+    process, the address and an open TCP connection all survive."""
+    n, path = "ft-ckpt", ckpt_path("ft-ckpt")
+    m = setup(n)
+    proc_before = marker(A, n)
+    tcp_server(A, n)
+    ip = to_tap(A, n)
+    conn = socket.create_connection((ip, 7000), timeout=10)
+    check("checkpoint: TCP echo before", echo(conn, b"before\n"))
+    r = ok(A, {"op": "checkpoint", "name": n, "dir": path, "stop": True})
+    print(f"checkpoint: {r['checkpoint_ms']} ms ({r['data_mib']} MiB data), paused {r['paused_ms']} ms")
+    leftovers = [f for f in os.listdir(args.ckpt_dir) if f.startswith(".ft-ckpt.partial")]
+    check("checkpoint: published, no partial left", os.path.exists(os.path.join(path, "manifest.json")) and not leftovers, leftovers)
+    check("checkpoint --stop: gone from A", n not in vms(A), vms(A).get(n))
+    r = ok(B, {"op": "restore", "dir": path})
+    print(f"restore: ready in {r['ready_ms']} ms (snapshot load {r['restore_ms']} ms), clock was {r['clock_offset_ms']} ms off; {r['timings_ms']}")
+    to_tap(B, n)
+    check("restore: same address", r["ip"] == ip and sh(B, n, "ip -4 -o addr show eth0")[1].count(ip) == 1, r["ip"])
+    check("restore: TCP connection survived", echo(conn, b"after\n"))
+    conn.close()
+    with socket.create_connection((ip, 7000), timeout=10) as c2:
+        check("restore: new TCP connection", echo(c2, b"new\n"))
+    check("restore: md5 intact", md5(B, n) == m)
+    check("restore: process survived (pid, start time)", marker_id(B, n) == proc_before, (proc_before, marker_id(B, n)))
+    err = guest_clock_error(B, n)
+    check("restore: guest clock right", err is not None and abs(err) < 0.5, err)
+    check("restore: whole checkpoint paged in", wait_for(lambda: vms(B)[n]["pages_mib"]["remote"] == 0, 30), vms(B)[n]["pages_mib"])
+    cleanup(n)
+    rm_ckpt(path)
+
+
+def checkpoint_fork():
+    """checkpoint --keep-running: the VM goes on; the checkpoint restores as
+    a second VM elsewhere, but only under a new address."""
+    n, path = "ft-fork", ckpt_path("ft-fork")
+    m = setup(n)
+    r = ok(A, {"op": "checkpoint", "name": n, "dir": path})
+    check("fork: still running on A", r["state"] == "running" and where(n) == {A: "running"}, where(n))
+    again = rpc(A, {"op": "checkpoint", "name": n, "dir": path})
+    check("fork: a checkpoint is never overwritten", not again["ok"] and "already exists" in again["error"], again)
+    check("fork: refused before pausing", where(n) == {A: "running"}, where(n))
+    code, _ = sh(A, n, "echo changed >> /tmp/f")
+    check("fork: A keeps working", code == 0 and md5(A, n) != m)
+    taken = rpc(B, {"op": "restore", "dir": path, "name": "ft-fork2"})
+    check("fork: restore refuses an address in use on a peer", not taken["ok"] and "in use" in taken["error"], taken)
+    r = ok(B, {"op": "restore", "dir": path, "name": "ft-fork2", "ip": "auto"})
+    ip = r["ip"]
+    code, out = sh(B, "ft-fork2", "ip -4 -o addr show eth0")
+    check("fork: copy has only its new address", ip in out and vms(A)[n]["ip"] not in out, out)
+    check("fork: copy has the checkpointed file", md5(B, "ft-fork2") == m)
+    cleanup(n)
+    cleanup("ft-fork2")
+    rm_ckpt(path)
+
+
+def checkpoint_corrupt():
+    """Restores refuse a checkpoint whose metadata does not check out or whose
+    template differs, and a VM whose page data turns out corrupt fails
+    cleanly instead of running with bad memory."""
+    n, path = "ft-corrupt", ckpt_path("ft-corrupt")
+    setup(n)
+    ok(A, {"op": "checkpoint", "name": n, "dir": path, "stop": True})
+    pristine = path + ".orig"
+    subprocess.run(["sudo", "cp", "-a", path, pristine], check=True)
+
+    def poke(file, offset):
+        subprocess.run(["sudo", "python3", "-c", f"f=open('{path}/{file}','r+b'); f.seek({offset}); b=f.read(1); f.seek({offset}); f.write(bytes([b[0]^1]))"], check=True)
+
+    def reset():
+        subprocess.run(["sudo", "rm", "-rf", path], check=True)
+        subprocess.run(["sudo", "cp", "-a", pristine, path], check=True)
+
+    poke("vmstate", 100)
+    r = rpc(B, {"op": "restore", "dir": path})
+    check("corrupt vmstate: refused", not r["ok"] and "checksum" in r["error"], r)
+    reset()
+    poke("manifest.json", 40)
+    r = rpc(B, {"op": "restore", "dir": path})
+    check("corrupt manifest: refused", not r["ok"] and "invalid" in r["error"], r)
+    reset()
+    text = subprocess.run(["sudo", "cat", f"{path}/manifest.json"], capture_output=True, check=True).stdout
+    body = json.loads(text.split(b"\n", 1)[1])
+    body["template_id"] = "0123456789abcdef"
+    forged = json.dumps(body).encode()
+    subprocess.run(["sudo", "tee", f"{path}/manifest.json"], input=fv_hash(forged).encode() + b"\n" + forged,
+                   stdout=subprocess.DEVNULL, check=True)
+    r = rpc(B, {"op": "restore", "dir": path})
+    check("other template id: refused", not r["ok"] and "id mismatch" in r["error"], r)
+    reset()
+    poke("pages", 50 * 1024 * 1024)
+    r = rpc(B, {"op": "restore", "dir": path})
+    st = lambda: vms(B).get(n, {}).get("state")
+    check("corrupt page data: VM fails, never runs on", (not r["ok"]) or wait_for(lambda: st() == "failed", 30), (r, st()))
+    rpc(B, {"op": "kill", "name": n})
+    rm_ckpt(path)
+    rm_ckpt(pristine)
+
+
+def checkpoint_crash():
+    """The daemon dies while writing a checkpoint: no checkpoint appears (not
+    even a partial one restores), and the next checkpoint to the same place
+    clears the debris and succeeds."""
+    n, path = "ft-crash", ckpt_path("ft-crash")
+    setup(n, mib=1200)
+    t = threading.Thread(target=lambda: rpc(A, {"op": "checkpoint", "name": n, "dir": path}))
+    t.start()
+
+    def writing():
+        # Staging is root-only: look in with sudo.
+        out = subprocess.run(["sudo", "find", args.ckpt_dir, "-path", "*/.flexvm-staging-*/ck/pages", "-size", "+100M"],
+                             capture_output=True, text=True).stdout
+        if out.strip():
+            return True
+        return False
+
+    check("crash: caught the checkpoint mid-write", wait_for(writing, 30))
+    argv, env = kill_daemon(A)
+    t.join()
+    check("crash: no checkpoint published", not os.path.exists(path))
+    r = rpc(B, {"op": "restore", "dir": path})
+    check("crash: nothing to restore", not r["ok"], r)
+    partial = [os.path.join(f, "ck") for f in os.listdir(args.ckpt_dir) if f.startswith(".flexvm-staging-")]
+    check("crash: staging left behind (root-only)", len(partial) == 1, partial)
+    for f in partial:
+        r = rpc(B, {"op": "restore", "dir": os.path.join(args.ckpt_dir, f)})
+        check("crash: the partial directory does not restore", not r["ok"], r)
+    start_daemon(A, argv, env)
+    check("crash: the VM died with its daemon", n not in vms(A), vms(A).get(n))
+    m = setup(n, mib=50)
+    ok(A, {"op": "checkpoint", "name": n, "dir": path, "stop": True})
+    left = [f for f in os.listdir(args.ckpt_dir) if f.startswith(".flexvm-staging-")]
+    check("crash: next checkpoint cleared the debris", not left, left)
+    ok(B, {"op": "restore", "dir": path})
+    check("crash: next checkpoint restores", md5(B, n) == m)
+    cleanup(n)
+    rm_ckpt(path)
+
+
+def pause_resume():
+    n = "ft-pause"
+    m = setup(n)
+    sh(A, n, "date -s @$(date +%s)")  # fresh VMs keep the template's clock; start from a right one
+    r = ok(A, {"op": "pause", "name": n})
+    check("pause: paused", vms(A)[n]["state"] == "paused", r)
+    # Straight to the daemon: the CLI would retry on the peer for a while.
+    r = rpc(A, {"op": "exec", "name": n, "cmd": "echo hi"})
+    check("pause: exec refused while paused", not r["ok"] and "not running" in r["error"], r)
+    time.sleep(0.2)
+    controller_quiet = vms(A)[n]["state"] == "paused"
+    time.sleep(3)
+    r = ok(A, {"op": "resume", "name": n})
+    print(f"pause: {r['resume_ms']} ms to resume")
+    check("pause: controller left it alone", controller_quiet and r["from"] == "paused")
+    check("pause: resumes within 5 ms", r["resume_ms"] < 5, r["resume_ms"])
+    time.sleep(0.5)
+    err = guest_clock_error(A, n)
+    check("pause: guest clock right after 3 s paused", err is not None and abs(err) < 0.5, err)
+    check("pause: md5 intact", md5(A, n) == m)
+    ok(A, {"op": "pause", "name": n})
+    r = ok(A, {"op": "migrate", "name": n, "to": B})
+    # Stall the pull: a resume on the target must wait for all its memory.
+    fault(A, "pages", 2000)
+    t = time.time()
+    r = ok(B, {"op": "resume", "name": n})
+    waited = time.time() - t
+    st = wait_released(B, n)
+    check("paused migrate: resume waited for the whole pull", waited > 1.0 and st["background_pull_ms"] is not None
+          and st["background_pull_ms"] <= waited * 1000 + 100, (waited, st))
+    check("paused migrate: source released, only on B", where(n) == {B: "running"} and st["released"] is True, (where(n), st))
+    check("paused migrate: runs on B after resume, md5 intact", md5(B, n) == m)
+    cleanup(n)
+
+
+def busy_guest(host, name):
+    """Floods the network (UDP to the gateway) and churns memory (freed
+    pages go back through balloon free page reporting) in the background."""
+    code, out = sh(host, name, "(while :; do echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; done | socat -u - UDP:169.254.1.1:9) "
+                   ">/dev/null 2>&1 < /dev/null & "
+                   "(while :; do head -c 200M /dev/zero > /dev/shm/churn; rm -f /dev/shm/churn; done) "
+                   ">/dev/null 2>&1 < /dev/null & echo ok")
+    assert code == 0, out
+
+
+def tap_frames(host, name):
+    """Frames the VM's Firecracker has put on its tap (and taken off it)."""
+    tap = vms(host)[name]["tap"]
+    read = lambda what: int(open(f"/sys/class/net/{tap}/statistics/{what}").read())
+    return read("rx_packets"), read("tx_packets")
+
+
+def guest_healthy(host, name, label, m):
+    code, out = sh(host, name, "dmesg | grep -ciE 'virtio.*(error|bad|broken|timeout)|bug:|corrupt' ; true")
+    check(f"{label}: guest answers, no virtio errors", code == 0 and out.strip() == "0", out)
+    before = tap_frames(host, name)[0]
+    time.sleep(0.5)
+    check(f"{label}: guest network still sending", tap_frames(host, name)[0] > before + 10, (before, tap_frames(host, name)))
+    check(f"{label}: md5 intact", md5(host, name) == m)
+
+
+def vsock_path(host, name):
+    """The vsock socket of `name`'s Firecracker on `host`, its only VM."""
+    return os.path.join(os.path.dirname(api_sock(host, name)), "v.sock")
+
+
+def held_restore_frozen():
+    """A checkpoint restored with --paused (loaded with resume_vm:false) is
+    held paused with its devices frozen too: while frames arrive on its tap,
+    a host vsock connection is pending and the balloon statistics timer is
+    due, not a byte of its memory changes and no frame moves. After resume,
+    all of it proceeds. With the hold skipped (test fault restore_no_hold),
+    the same activity does change guest memory: that is the gap the hold
+    closes."""
+    n, path = "ft-held", ckpt_path("ft-held")
+    m = setup(n)
+    busy_guest(A, n)
+    time.sleep(0.5)
+    old_ip = vms(A)[n]["ip"]
+    ok(A, {"op": "checkpoint", "name": n, "dir": path, "stop": True})
+
+    def held(no_hold):
+        fault(B, "restore_no_hold", 600000 if no_hold else 0)
+        r = ok(B, {"op": "restore", "dir": path, "paused": True})
+        fault(B, "restore_no_hold", 0)
+        check(f"held{'(no hold)' if no_hold else ''}: restored paused", r["state"] == "paused" and vms(B)[n]["state"] == "paused", r)
+        wait_for(lambda: ok(B, {"op": "memhash", "name": n})["remote"] == 0, 30)
+        ip = to_tap(B, n)
+        h0, f0 = ok(B, {"op": "memhash", "name": n}), tap_frames(B, n)
+        # Pending host activity: frames on the tap, a vsock connection, and
+        # the balloon statistics timer (every second).
+        conn = subprocess.Popen(["sudo", "python3", "-c",
+                                 "import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); "
+                                 "s.sendall(b'CONNECT 52\\nPING\\n'); s.settimeout(30); d=b''\nwhile b'pong' not in d:\n c=s.recv(200)\n if not c: break\n d+=c\nprint(d)",
+                                 vsock_path(B, n)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        for _ in range(30):
+            udp.sendto(b"x" * 64, (ip, 9))
+            time.sleep(0.1)
+        h1, f1 = ok(B, {"op": "memhash", "name": n}), tap_frames(B, n)
+        return h0, h1, f0, f1, conn
+
+    h0, h1, f0, f1, conn = held(False)
+    check("held: guest memory unchanged under tap, vsock and timer activity", h0 == h1, (h0, h1))
+    check("held: no frames moved", f0 == f1, (f0, f1))
+    check("held: vsock connection waits", conn.poll() is None)
+    t = time.time()
+    ok(B, {"op": "resume", "name": n})
+    out, _ = conn.communicate(timeout=30)
+    check("held: pending vsock connection answered after resume", "OK" in out and "pong" in out, out)
+    time.sleep(0.5)
+    check("held: pending frames delivered after resume", tap_frames(B, n)[1] > f1[1], (f1, tap_frames(B, n)))
+    guest_healthy(B, n, "held after resume", m)
+    print(f"held: resumed and answered within {time.time() - t:.2f} s")
+    rpc(B, {"op": "kill", "name": n})
+    # Held at a new address: the guest takes it on resume (and only then).
+    r = ok(B, {"op": "restore", "dir": path, "paused": True, "ip": "auto"})
+    refused = rpc(B, {"op": "checkpoint", "name": n, "dir": path + "-x"})
+    check("held at a new address: no checkpoint before it takes the address", not refused["ok"], refused)
+    ok(B, {"op": "resume", "name": n})
+    code, out = sh(B, n, "ip -4 -o addr show eth0")
+    check("held at a new address: guest has it, and only it, after resume", r["ip"] in out and old_ip not in out, (r["ip"], old_ip, out))
+    rpc(B, {"op": "kill", "name": n})
+
+    h0, h1, f0, f1, conn = held(True)
+    check("no hold (control): the same activity changes guest memory", h0 != h1 or f0 != f1, (h0, h1, f0, f1))
+    conn.kill()
+    rpc(B, {"op": "kill", "name": n})
+    rm_ckpt(path)
+
+
+def api_sock(host, name):
+    """The API socket of `name`'s Firecracker on `host`, its only VM."""
+    assert list(vms(host)) == [name], vms(host)
+    socks = [os.path.join(d, "api.sock") for d in firecrackers(run_dir(host)).values() if os.path.exists(os.path.join(d, "v.sock"))]
+    assert len(socks) == 1, socks
+    return socks[0]
+
+
+def fc_api(sock, method, path, body=None):
+    cmd = ["sudo", "curl", "-s", "--unix-socket", sock, "-X", method, f"http://localhost{path}"]
+    if body is not None:
+        cmd += ["-H", "Content-Type: application/json", "-d", json.dumps(body)]
+    out = subprocess.run(cmd, capture_output=True, text=True).stdout
+    return json.loads(out) if out.strip() else None
+
+
+def checkpoint_hotplug():
+    """A virtio-mem resize still in flight when a checkpoint starts: the
+    checkpoint waits for the guest to carry it out (no device request can
+    land behind the saved state), and the result restores intact."""
+    n, path = "ft-hotplug", ckpt_path("ft-hotplug")
+    m = setup(n)
+    sock = api_sock(A, n)
+    hp = fc_api(sock, "GET", "/hotplug/memory")
+    want = hp["plugged_size_mib"] + 1024
+    fc_api(sock, "PATCH", "/hotplug/memory", {"requested_size_mib": want})
+    r = ok(A, {"op": "checkpoint", "name": n, "dir": path, "stop": True})
+    print(f"hotplug: settled in {r['timings_ms']['settle_hotplug']} ms")
+    check("hotplug: checkpoint waited for the resize", r["timings_ms"]["settle_hotplug"] > 1, r["timings_ms"])
+    text = subprocess.run(["sudo", "cat", f"{path}/manifest.json"], capture_output=True).stdout
+    plugged = json.loads(text.split(b"\n", 1)[1])["hotplug_mib"]
+    check("hotplug: saved with the resize done", plugged == want, (plugged, want))
+    ok(B, {"op": "restore", "dir": path})
+    check("hotplug: restores intact", md5(B, n) == m)
+    cleanup(n)
+    rm_ckpt(path)
+
+
+def checkpoint_untrusted_dir():
+    """Checkpoints into a user's directory: the files are theirs, nothing is
+    left behind, and a restore never follows a symlink planted in one."""
+    n, path = "ft-user", ckpt_path("ft-user")
+    setup(n, mib=20)
+    ok(A, {"op": "checkpoint", "name": n, "dir": path, "stop": True})
+    st = os.stat(path)
+    check("untrusted dir: checkpoint belongs to the directory's owner", st.st_uid == os.getuid(), st.st_uid)
+    left = [f for f in os.listdir(args.ckpt_dir) if f.startswith(".flexvm-staging")]
+    check("untrusted dir: no staging left behind", not left, left)
+    os.rename(f"{path}/vmstate", f"{path}/vmstate.real")
+    os.symlink(f"{path}/vmstate.real", f"{path}/vmstate")
+    r = rpc(B, {"op": "restore", "dir": path})
+    check("untrusted dir: restore refuses a symlinked file", not r["ok"] and "vmstate" in r["error"], r)
+    os.unlink(f"{path}/vmstate")
+    os.rename(f"{path}/vmstate.real", f"{path}/vmstate")
+    r = rpc(B, {"op": "restore", "dir": path})
+    check("untrusted dir: restores once it is a plain file again", r["ok"], r)
+    cleanup(n)
+    rm_ckpt(path)
+
+
+def resume_failures():
+    """A suspended VM whose resume fails before its vCPUs ran stays
+    suspended; one that fails after they ran is gone, never re-armed (its
+    checkpoint would replay what it did)."""
+    n = "ft-resume-fail"
+    m = setup(n)
+    ok(A, {"op": "suspend", "name": n})
+    fault(A, "restore_before_run", 60000)
+    r = rpc(A, {"op": "resume", "name": n})
+    fault(A, "restore_before_run", 0)
+    check("resume fails before running: refused", not r["ok"], r)
+    check("resume fails before running: still suspended", vms(A).get(n, {}).get("state") == "suspended", vms(A).get(n))
+    ok(A, {"op": "resume", "name": n})
+    check("resume fails before running: resumes later, md5 intact", md5(A, n) == m)
+    ok(A, {"op": "suspend", "name": n})
+    fault(A, "restore_after_run", 60000)
+    r = rpc(A, {"op": "resume", "name": n})
+    fault(A, "restore_after_run", 0)
+    check("resume fails after running: refused", not r["ok"] and "consumed" in r["error"], r)
+    check("resume fails after running: not re-armed", n not in vms(A), vms(A).get(n))
+    r = rpc(A, {"op": "resume", "name": n})
+    check("resume fails after running: no second resume", not r["ok"], r)
+    cleanup(n)
+
+
+def state_dir_lock():
+    """A second daemon on A's --state-dir (with its own run dir and port)
+    refuses to start before touching it; A's suspended VM is unharmed."""
+    n = "ft-state-lock"
+    m = setup(n, mib=20)
+    ok(A, {"op": "suspend", "name": n})
+    argv = [a.decode() for a in proc(daemon_pid(A), "cmdline").split(b"\0") if a]
+    if "--state-dir" not in argv:
+        return check("state dir lock: A runs with --state-dir", False, argv)
+    bad = argv[:]
+    bad[bad.index("--run") + 1] += "-other"
+    host, port = A.rsplit(":", 1)
+    bad[bad.index("--listen") + 1] = f"{host}:{int(port) + 50}"
+    r = subprocess.run(["sudo", *bad], capture_output=True, text=True, timeout=30)
+    check("state dir lock: second daemon refuses", r.returncode != 0 and "overlaps" in r.stderr, r.stderr.strip())
+    subprocess.run(["sudo", "rm", "-rf", bad[bad.index("--run") + 1]])
+    ok(A, {"op": "resume", "name": n})
+    check("state dir lock: suspended VM unharmed", md5(A, n) == m)
+    cleanup(n)
+
+
+def suspend_resume():
+    """suspend frees the VM's memory and survives a daemon restart; resume
+    pages it back in lazily."""
+    n = "ft-suspend"
+    m = setup(n)
+    proc_before = marker(A, n)
+    rdir = run_dir(A)
+    before = len(firecrackers(rdir))
+    r = ok(A, {"op": "suspend", "name": n})
+    print(f"suspend: {r['suspend_ms']} ms, freed {r['freed_rss_mib']} MiB RSS, {r['data_mib']} MiB on disk")
+    v = vms(A)[n]
+    check("suspend: listed suspended, RSS 0", v["state"] == "suspended" and v["rss_mib"] == 0, v)
+    check("suspend: its Firecracker is gone", len(firecrackers(rdir)) == before - 1, (before, firecrackers(rdir)))
+    code, out = sh(A, n, "echo hi")
+    check("suspend: exec refused", code != 0, out)
+    argv, env = kill_daemon(A)
+    start_daemon(A, argv, env)
+    check("suspend: still suspended after a daemon restart", vms(A).get(n, {}).get("state") == "suspended", vms(A).get(n))
+    time.sleep(2)
+    r = ok(A, {"op": "resume", "name": n})
+    print(f"suspend: resumed, ready in {r['ready_ms']} ms; clock was {r['clock_offset_ms']} ms off")
+    check("suspend: md5 intact", md5(A, n) == m)
+    check("suspend: process survived", marker_id(A, n) == proc_before, (proc_before, marker_id(A, n)))
+    err = guest_clock_error(A, n)
+    check("suspend: guest clock right", err is not None and abs(err) < 0.5, err)
+    check("suspend: paged back in", wait_for(lambda: vms(A)[n]["pages_mib"]["remote"] == 0, 30), vms(A)[n])
+    cleanup(n)
+
+
 SCENARIOS = dict(basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, refused=refused, pages_blip=pages_blip,
                  pages_dead_restore=pages_dead_restore, pages_dead=pages_dead, quiet_source=quiet_source,
                  shared_run_dir=shared_run_dir, exec_race=exec_race, source_killed=source_killed,
-                 target_restart=target_restart, target_restart_symlink=target_restart_symlink, guest_hang=guest_hang)
-safe = [s for s in SCENARIOS if s not in ("source_killed", "target_restart", "target_restart_symlink")]
+                 target_restart=target_restart, target_restart_symlink=target_restart_symlink, guest_hang=guest_hang,
+                 checkpoint_restore=checkpoint_restore, checkpoint_fork=checkpoint_fork,
+                 checkpoint_corrupt=checkpoint_corrupt, checkpoint_crash=checkpoint_crash, pause_resume=pause_resume,
+                 suspend_resume=suspend_resume, checkpoint_hotplug=checkpoint_hotplug,
+                 checkpoint_untrusted_dir=checkpoint_untrusted_dir, resume_failures=resume_failures,
+                 state_dir_lock=state_dir_lock, held_restore_frozen=held_restore_frozen)
+safe = [s for s in SCENARIOS
+        if s not in ("source_killed", "target_restart", "target_restart_symlink", "checkpoint_crash", "suspend_resume")]
 names = [n for s in args.scenarios for n in (safe if s == "all" else [s])]
 for s in names:
     SCENARIOS[s]()

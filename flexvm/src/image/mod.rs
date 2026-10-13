@@ -245,7 +245,7 @@ pub fn warm_up(vsock: &Path, meta: &ImageMeta) -> Result<()> {
 /// The last 64 KiB of the app's buffered output, and its final status line.
 pub fn read_logs(vsock: &Path) -> Result<(Vec<u8>, String)> {
     const KEEP: usize = 64 << 10;
-    let mut r = guest::start_logs(vsock, 0, false, guest::TIMEOUT)?;
+    let mut r = guest::start_logs(crate::util::connect_unix(vsock, guest::TIMEOUT)?, 0, false, guest::TIMEOUT)?;
     let mut out = Vec::new();
     while let Some((kind, data)) = guest::read_frame(&mut r)? {
         match kind {

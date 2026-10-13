@@ -6,7 +6,8 @@
 //!
 //!   BASE      -> copied from the template memory file (holes map the zero page)
 //!   ZERO      -> discarded by the guest (balloon / virtio-mem); maps the zero page
-//!   REMOTE    -> fetched from the migration source's page server
+//!   REMOTE    -> fetched from the VM's origin: the migration source's page
+//!                server, or the page file of a checkpoint being restored
 //!   INFLIGHT  -> claimed by one installer; its UFFDIO_COPY wakes any waiters
 //!   DISCARDED -> INFLIGHT, but a REMOVE hit it; its installer must not publish it
 //!   PRESENT   -> populated in this VM, the only copy is inside Firecracker
@@ -24,7 +25,7 @@ use std::net::TcpStream;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixListener;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, RwLockWriteGuard};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -32,6 +33,7 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 
 use crate::bail;
+use crate::checkpoint::PageFile;
 use crate::template::Template;
 use crate::util::{Result, PAGE_SIZE};
 
@@ -105,6 +107,15 @@ pub struct Source {
     pub addr: String,
     pub vm: String,
     pub mig: u64,
+}
+
+/// Where a VM's REMOTE pages come from.
+pub enum Origin {
+    /// The paused source of an incoming migration.
+    Peer(Source),
+    /// The page file of a checkpoint on this host. Reads are verified
+    /// against the checkpoint's block checksums; a failed read is fatal.
+    File(Arc<PageFile>),
 }
 
 fn eagain() -> io::Error {
@@ -259,6 +270,9 @@ pub struct Pager {
     /// Firecracker as a pidfd, so killing it never hits a reused pid.
     pidfd: OnceLock<OwnedFd>,
     remote: Mutex<Option<Link>>,
+    /// The checkpoint page file REMOTE pages come from, when restoring one.
+    file: OnceLock<Arc<PageFile>>,
+    discards: AtomicU64,
     remote_left: AtomicUsize,
     pull_started: OnceLock<Instant>,
     pull_finished: OnceLock<Instant>,
@@ -272,8 +286,9 @@ pub struct Pager {
 
 impl Pager {
     /// Listens on `sock` for Firecracker's UFFD handshake and serves faults in
-    /// the background. `initial` seeds page states for an incoming migration.
-    pub fn start(sock: &Path, base: Arc<Template>, initial: Option<(Runs, Source)>) -> Result<Arc<Pager>> {
+    /// the background. `initial` seeds page states for an incoming migration
+    /// or a checkpoint restore, with where their REMOTE pages come from.
+    pub fn start(sock: &Path, base: Arc<Template>, initial: Option<(Runs, Origin)>) -> Result<Arc<Pager>> {
         let _ = std::fs::remove_file(sock);
         let listener = UnixListener::bind(sock)?;
         let pager = Arc::new(Pager {
@@ -285,6 +300,8 @@ impl Pager {
             pid: AtomicU32::new(0),
             pidfd: OnceLock::new(),
             remote: Mutex::new(None),
+            file: OnceLock::new(),
+            discards: AtomicU64::new(0),
             remote_left: AtomicUsize::new(0),
             pull_started: OnceLock::new(),
             pull_finished: OnceLock::new(),
@@ -311,13 +328,13 @@ impl Pager {
     }
 
     /// Takes over Firecracker's userfaultfd. Returns whether to prefetch the working set.
-    fn handshake(&self, listener: &UnixListener, initial: Option<(Runs, Source)>) -> Result<bool> {
+    fn handshake(&self, listener: &UnixListener, initial: Option<(Runs, Origin)>) -> Result<bool> {
         let (stream, _) = listener.accept()?;
         let (body, fd) = recv_with_fd(stream.as_raw_fd())?;
         let mappings: Vec<Mapping> = serde_json::from_slice(&body)?;
         let total = mappings.iter().map(|m| m.offset as usize + m.size).max().unwrap_or(0) / PAGE_SIZE;
         let pages = Pages::new(total);
-        if let Some((runs, source)) = initial {
+        if let Some((runs, origin)) = initial {
             let _ = self.pull_started.set(Instant::now());
             let remote = remote_pages(&runs, total)?;
             for (first, count, state) in runs {
@@ -326,16 +343,25 @@ impl Pager {
                 }
             }
             self.remote_left.store(remote, Ordering::SeqCst);
-            // Connect now: the restore itself faults on remote pages.
-            let mut link = Link::new(source);
-            link.client = PageClient::connect(&link.source).ok();
-            *self.remote.lock().unwrap() = Some(link);
+            match origin {
+                Origin::Peer(source) => {
+                    // Connect now: the restore itself faults on remote pages.
+                    let mut link = Link::new(source);
+                    link.client = PageClient::connect(&link.source).ok();
+                    *self.remote.lock().unwrap() = Some(link);
+                }
+                Origin::File(file) => {
+                    let _ = self.file.set(file);
+                }
+            }
         }
-        let fresh = self.remote_left() == 0;
+        // A checkpoint restore prefetches the template's working set too: the
+        // pages the checkpoint left BASE are still the template's.
+        let fresh = self.remote_left() == 0 || self.file.get().is_some();
         let _ = self.mappings.set(mappings);
         let _ = self.pages.set(pages);
         let _ = self.uffd.set(fd);
-        if fresh && self.pull_started.get().is_some() {
+        if self.remote_left() == 0 && self.pull_started.get().is_some() {
             let _ = self.pull_finished.set(Instant::now());
         }
         *self.ready.0.lock().unwrap() = true;
@@ -419,6 +445,32 @@ impl Pager {
         }
     }
 
+    /// `wait_pulled`, giving up (false) after `timeout`.
+    pub fn wait_pulled_for(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut guard = self.done.0.lock().unwrap();
+        loop {
+            if self.remote_left() == 0 {
+                return true;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if self.stop.load(Ordering::SeqCst) || left.is_zero() {
+                return false;
+            }
+            guard = self.done.1.wait_timeout(guard, left).unwrap().0;
+        }
+    }
+
+    /// The guest's memory size in pages, once Firecracker has connected.
+    pub fn total_pages(&self) -> usize {
+        self.pages().len()
+    }
+
+    /// The first page past the guest memory region holding `page`.
+    pub fn region_end(&self, page: usize) -> Option<usize> {
+        self.locate((page * PAGE_SIZE) as u64).map(|m| (m.offset as usize + m.size) / PAGE_SIZE)
+    }
+
     fn notify(&self) {
         let _guard = self.done.0.lock().unwrap();
         self.done.1.notify_all();
@@ -457,6 +509,16 @@ impl Pager {
     /// Why the pager gave up, if it did. The VM cannot make progress then.
     pub fn failed(&self) -> Option<&str> {
         self.failed.get().map(|s| s.as_str())
+    }
+
+    /// REMOVE events applied so far (balloon and virtio-mem discards).
+    pub fn discards(&self) -> u64 {
+        self.discards.load(Ordering::SeqCst)
+    }
+
+    /// Whether pages are still to come from a migration source.
+    pub fn pulling_from_peer(&self) -> bool {
+        self.remote_left() > 0 && self.file.get().is_none()
     }
 
     pub fn remote_left(&self) -> usize {
@@ -597,7 +659,7 @@ impl Pager {
                 match self.fault(addr) {
                     Ok(()) => {}
                     Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => pending.push_back((addr, since)),
-                    Err(e) if e.kind() == io::ErrorKind::TimedOut => return self.fail(e.to_string()),
+                    Err(e) if fatal(&e) => return self.fail(e.to_string()),
                     Err(e) => match since {
                         None => {
                             eprintln!("uffd: fault at {addr:#x}: {e}; retrying");
@@ -620,6 +682,7 @@ impl Pager {
     }
 
     fn discard(&self, removing: &RwLockWriteGuard<'_, ()>, start: u64, end: u64) {
+        self.discards.fetch_add(1, Ordering::SeqCst);
         let (mut a, mut resolved) = (start & !(PAGE_SIZE as u64 - 1), 0);
         while a < end {
             if let Some((p, _)) = self.page_of(a) {
@@ -651,9 +714,12 @@ impl Pager {
                     return Err(eagain());
                 }
                 let mut buf = vec![0u8; n * PAGE_SIZE];
-                let fetched = match self.remote.lock().unwrap().as_mut() {
-                    Some(link) => link.fetch((page * PAGE_SIZE) as u64, &mut buf, None),
-                    None => Err(io::Error::other("no migration source")),
+                let fetched = match self.file.get() {
+                    Some(file) => file.read(page, &mut buf, false),
+                    None => match self.remote.lock().unwrap().as_mut() {
+                        Some(link) => link.fetch((page * PAGE_SIZE) as u64, &mut buf, None),
+                        None => Err(io::Error::other("no migration source")),
+                    },
                 };
                 if let Err(e) = fetched {
                     let resolved = pages.release(page, n, REMOTE);
@@ -715,22 +781,60 @@ impl Pager {
         Ok(())
     }
 
-    /// Pulls every REMOTE page in the background so the source can let go.
+    /// Pulls every REMOTE page in the background so the source can let go
+    /// (or, restoring a checkpoint, so the VM no longer needs its file).
     fn spawn_pullers(self: Arc<Self>) {
-        let source = self.remote.lock().unwrap().as_ref().unwrap().source.clone();
+        let file = self.file.get().cloned();
+        let source = self.remote.lock().unwrap().as_ref().map(|l| l.source.clone());
         for t in 0..PULL_THREADS {
             let p = self.clone();
-            let link = Link::new(source.clone());
+            let file = file.clone();
+            let mut fetch: Box<Fetch> = match (&file, &source) {
+                (Some(file), _) => {
+                    let file = file.clone();
+                    Box::new(move |off, buf, _| file.read(off as usize / PAGE_SIZE, buf, true))
+                }
+                (None, Some(source)) => {
+                    let mut link = Link::new(source.clone());
+                    Box::new(move |off, buf, stop| link.fetch(off, buf, Some(stop)))
+                }
+                (None, None) => return self.fail("remote pages but nowhere to pull them from".into()),
+            };
             thread::spawn(move || {
-                if let Err(e) = p.pull(t, link) {
-                    p.fail(format!("background pull {t} failed: {e}"));
+                // A checkpoint's pages come off local disk: the ones in the
+                // template's working set first, as the guest needs them soonest.
+                let pulled = match file.is_some() {
+                    true => p.pull_working_set(t, &mut fetch),
+                    false => Ok(()),
+                };
+                if let Err(e) = pulled.and_then(|()| p.pull(t, &mut fetch)) {
+                    return p.fail(format!("background pull {t} failed: {e}"));
+                }
+                if let Some(file) = file.filter(|_| p.remote_left() == 0) {
+                    file.drop_cache();
                 }
             });
         }
     }
 
-    fn pull(&self, stripe: usize, mut link: Link) -> io::Result<()> {
-        let pages = self.pages();
+    /// Pulls the REMOTE pages of every `PULL_THREADS`th range of the
+    /// template's working set, starting at range `stripe`.
+    fn pull_working_set(&self, stripe: usize, fetch: &mut Fetch) -> io::Result<()> {
+        let mut buf = vec![0u8; PULL_RUN * PAGE_SIZE];
+        for &(first, count) in self.base.working_set.iter().skip(stripe).step_by(PULL_THREADS) {
+            let (first, end) = (first as usize, (first + count) as usize);
+            for m in self.mappings() {
+                let (from, to) = (m.offset as usize / PAGE_SIZE, (m.offset as usize + m.size) / PAGE_SIZE);
+                let (mut i, end) = (first.max(from), end.min(to));
+                while i < end && !self.stop.load(Ordering::SeqCst) {
+                    i = self.pull_run(i, end, &mut buf, fetch)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn pull(&self, stripe: usize, fetch: &mut Fetch) -> io::Result<()> {
         let mut buf = vec![0u8; PULL_RUN * PAGE_SIZE];
         for m in self.mappings() {
             let first = m.offset as usize / PAGE_SIZE;
@@ -740,33 +844,37 @@ impl Pager {
                 let chunk_end = (chunk + PULL_RUN).min(end);
                 let mut i = chunk;
                 while i < chunk_end {
-                    let n = pages.claim(i, chunk_end - i, REMOTE, |_| true);
-                    if n == 0 {
-                        i += 1;
-                        continue;
-                    }
-                    let b = &mut buf[..n * PAGE_SIZE];
-                    if let Err(e) = link.fetch((i * PAGE_SIZE) as u64, b, Some(&self.stop)) {
-                        let resolved = pages.release(i, n, REMOTE);
-                        self.pulled(resolved);
-                        if resolved < n {
-                            return Err(e);
-                        }
-                        // All discarded meanwhile.
-                        i += n;
-                        continue;
-                    }
-                    let src = |p: usize, c: usize| &b[(p - i) * PAGE_SIZE..(p - i + c) * PAGE_SIZE];
-                    let (resolved, res) =
-                        pages.install(i, n, REMOTE, Some(&self.stop), |p, c| self.populate(p, c, Some(src(p, c))));
-                    self.pulled(resolved);
-                    res?;
-                    i += n;
+                    i = self.pull_run(i, chunk_end, &mut buf, fetch)?;
                 }
                 chunk += PULL_THREADS * PULL_RUN;
             }
         }
         Ok(())
+    }
+
+    /// Pulls the REMOTE pages from `i` on (up to `end`, within one region)
+    /// that it can claim in one go. Returns where to go on from.
+    fn pull_run(&self, i: usize, end: usize, buf: &mut [u8], fetch: &mut Fetch) -> io::Result<usize> {
+        let pages = self.pages();
+        let n = pages.claim(i, (end - i).min(buf.len() / PAGE_SIZE), REMOTE, |_| true);
+        if n == 0 {
+            return Ok(i + 1);
+        }
+        let b = &mut buf[..n * PAGE_SIZE];
+        if let Err(e) = fetch((i * PAGE_SIZE) as u64, b, &self.stop) {
+            let resolved = pages.release(i, n, REMOTE);
+            self.pulled(resolved);
+            if resolved < n {
+                return Err(e);
+            }
+            // All discarded meanwhile.
+            return Ok(i + n);
+        }
+        let src = |p: usize, c: usize| &b[(p - i) * PAGE_SIZE..(p - i + c) * PAGE_SIZE];
+        let (resolved, res) = pages.install(i, n, REMOTE, Some(&self.stop), |p, c| self.populate(p, c, Some(src(p, c))));
+        self.pulled(resolved);
+        res?;
+        Ok(i + n)
     }
 }
 
@@ -892,6 +1000,15 @@ pub fn serve_pages(pager: &Pager, mut stream: impl Read + Write, down: impl Fn()
             }
         }
     }
+}
+
+/// Reads guest memory at an offset from wherever a puller pulls it.
+type Fetch = dyn FnMut(u64, &mut [u8], &AtomicBool) -> io::Result<()> + Send;
+
+/// Errors after which the pager gives up on the VM: its migration source has
+/// been gone too long, or its checkpoint file is unreadable or corrupt.
+fn fatal(e: &io::Error) -> bool {
+    matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::InvalidData)
 }
 
 /// Checks page runs from a migration source (ascending, disjoint, in bounds,

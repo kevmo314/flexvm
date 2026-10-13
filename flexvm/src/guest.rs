@@ -21,7 +21,14 @@ pub const TIMEOUT: Duration = Duration::from_secs(5);
 /// Opens a connection to the guest agent and sends one request line. Reads
 /// and writes on the returned stream time out after `timeout`.
 pub fn request(uds: &Path, line: &str, timeout: Duration) -> Result<BufReader<UnixStream>> {
-    let mut s = crate::util::connect_unix(uds, timeout)?;
+    request_on(crate::util::connect_unix(uds, timeout)?, line, timeout)
+}
+
+/// `request` on `s`, a fresh connection to Firecracker's vsock socket (so a
+/// caller can register it before anything reaches the guest).
+pub fn request_on(mut s: UnixStream, line: &str, timeout: Duration) -> Result<BufReader<UnixStream>> {
+    s.set_read_timeout(Some(timeout))?;
+    s.set_write_timeout(Some(timeout))?;
     // One write: Firecracker reads the CONNECT line without blocking as soon as
     // any of it arrives, and drops the connection if the line is incomplete.
     // It reads only up to the newline, so the request rides along and is
@@ -38,8 +45,8 @@ pub fn request(uds: &Path, line: &str, timeout: Duration) -> Result<BufReader<Un
 
 /// Starts a shell command in the guest; frames follow on the returned
 /// stream, which still has `request`'s timeouts.
-pub fn start_exec(uds: &Path, cmd: &str, timeout: Duration) -> Result<BufReader<UnixStream>> {
-    let mut r = request(uds, &format!("EXEC {}", cmd.len()), timeout)?;
+pub fn start_exec(s: UnixStream, cmd: &str, timeout: Duration) -> Result<BufReader<UnixStream>> {
+    let mut r = request_on(s, &format!("EXEC {}", cmd.len()), timeout)?;
     r.get_mut().write_all(cmd.as_bytes())?;
     Ok(r)
 }
@@ -52,7 +59,7 @@ pub fn untimed(r: &BufReader<UnixStream>) -> Result<()> {
 }
 
 /// Starts, resumes or acknowledges a resumable command. Legacy EXEC remains separate.
-pub fn session(uds: &Path, action: &str, id: &str, offset: u64, cmd: &str, timeout: Duration) -> Result<BufReader<UnixStream>> {
+pub fn session(s: UnixStream, action: &str, id: &str, offset: u64, cmd: &str, timeout: Duration) -> Result<BufReader<UnixStream>> {
     if id.is_empty() || id.len() > 64 || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
         bail!("bad session id");
     }
@@ -62,7 +69,7 @@ pub fn session(uds: &Path, action: &str, id: &str, offset: u64, cmd: &str, timeo
         "close" => format!("CLOSE {id}"),
         _ => bail!("bad session action"),
     };
-    let mut r = request(uds, &line, timeout)?;
+    let mut r = request_on(s, &line, timeout)?;
     if action == "start" {
         r.get_mut().write_all(cmd.as_bytes())?;
     }
@@ -116,7 +123,7 @@ pub fn ping(uds: &Path) -> Result<()> {
 
 /// Runs a shell command in the guest and collects its output.
 pub fn exec(uds: &Path, cmd: &str) -> Result<(i32, Vec<u8>)> {
-    let mut r = start_exec(uds, cmd, TIMEOUT)?;
+    let mut r = start_exec(crate::util::connect_unix(uds, TIMEOUT)?, cmd, TIMEOUT)?;
     untimed(&r)?;
     let mut out = Vec::new();
     while let Some((kind, data)) = read_frame(&mut r)? {
@@ -191,8 +198,8 @@ pub fn quiesce(uds: &Path) -> Result<()> {
 /// Streams the app's output from `offset`; frames follow on the returned
 /// stream, which still has `request`'s timeouts, and end with a message
 /// `<status> <next offset>`.
-pub fn start_logs(uds: &Path, offset: u64, follow: bool, timeout: Duration) -> Result<BufReader<UnixStream>> {
-    request(uds, &format!("LOGS {offset} {}", follow as u8), timeout)
+pub fn start_logs(s: UnixStream, offset: u64, follow: bool, timeout: Duration) -> Result<BufReader<UnixStream>> {
+    request_on(s, &format!("LOGS {offset} {}", follow as u8), timeout)
 }
 
 #[cfg(test)]

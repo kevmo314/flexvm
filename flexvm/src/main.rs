@@ -1,4 +1,6 @@
 mod bench;
+mod bench_lifecycle;
+mod checkpoint;
 mod daemon;
 mod fc;
 mod guest;
@@ -33,14 +35,20 @@ usage:
   flexvm daemon [--listen ADDR] [--advertise ADDR] [--run DIR]
                 [--peer ADDR]... [--reserve MIB] [--pool N]
                 [--vm-ips CIDR|FIRST-LAST] [--underlay IP]
-                [--announce-dev IFACE] [--dns IP]            run the host daemon (root)
+                [--announce-dev IFACE] [--dns IP] [--state-dir DIR]  run the host daemon (root)
   flexvm run NAME [--template T] [--ip IP]                   start a VM from a template
   flexvm ls                                                  list VMs
   flexvm exec NAME CMD...                                    run a shell command in a VM
   flexvm logs NAME [-f]                                      an image app's output (-f: follow)
   flexvm migrate NAME --to ADDR                              live-migrate a VM to another daemon
+  flexvm pause NAME | resume NAME                            stop / restart a VM's vCPUs (memory kept)
+  flexvm suspend NAME                                        checkpoint to the daemon's --state-dir and free
+                                                             the VM's memory; `resume` restores it lazily
+  flexvm checkpoint NAME DIR [--keep-running | --stop]       write the VM's full state to DIR (new directory)
+  flexvm restore DIR [--name N] [--ip IP|auto] [--paused]    start a VM from a checkpoint (same template id)
   flexvm bench [--to ADDR] [--iterations N] [--dirty-mib N]  per-phase run/migrate latency into bench/
                [--template T] [--ready-port N | --ready-http N]  ... and until an image app answers
+  flexvm bench --lifecycle DIR [--to ADDR] [--dirty-mib N,N..] pause/checkpoint/restore/suspend latency into bench/
   flexvm kill NAME                                           stop a VM
 
 options:
@@ -49,6 +57,9 @@ options:
   --templates DIR    template store (default ARTIFACTS/templates)
   --image-cache DIR  image blobs and root filesystems (default ARTIFACTS/images)
 ";
+
+/// Flags that take no value.
+const SWITCHES: &[&str] = &["warm", "follow", "stop", "keep-running", "paused"];
 
 struct Args {
     positional: Vec<String>,
@@ -62,8 +73,7 @@ impl Args {
         let mut it = std::env::args().skip(1);
         while let Some(a) = it.next() {
             if let Some(flag) = a.strip_prefix("--") {
-                // Switches take no value.
-                let value = if ["warm", "follow"].contains(&flag) { "1".into() } else { it.next().unwrap_or_default() };
+                let value = if SWITCHES.contains(&flag) { "1".into() } else { it.next().unwrap_or_default() };
                 flags.push((flag.to_string(), value));
             } else {
                 positional.push(a);
@@ -74,6 +84,10 @@ impl Args {
             }
         }
         Args { positional, flags }
+    }
+
+    fn has(&self, name: &str) -> bool {
+        self.flags.iter().any(|(k, _)| k == name)
     }
 
     fn get(&self, name: &str) -> Option<&str> {
@@ -156,6 +170,9 @@ fn real_main() -> Result<()> {
                     .get("run")
                     .map(PathBuf::from)
                     .unwrap_or_else(|| PathBuf::from(format!("/run/flexvm/{}", listen.replace(':', "_")))),
+                state_dir: args.get("state-dir").map(PathBuf::from).unwrap_or_else(|| {
+                    PathBuf::from(format!("/var/lib/flexvm/{}", listen.replace([':', '.', '[', ']'], "_")))
+                }),
                 listen,
                 peers: args.all("peer"),
                 reserve_mib: args.num("reserve", 1024)?,
@@ -171,13 +188,29 @@ fn real_main() -> Result<()> {
                 dns: args.get("dns").map(String::from),
             })
         }
-        Some("bench") => bench::run(&host, &args),
+        Some("bench") => match args.get("lifecycle") {
+            Some(dir) => bench_lifecycle::run(&host, &args, dir),
+            None => bench::run(&host, &args),
+        },
         Some("run") => print(call(
             &host,
             json!({"op": "run", "name": name, "template": args.get("template").unwrap_or("default"), "ip": args.get("ip")}),
         )?),
         Some("ls") => list(call(&host, json!({"op": "ls"}))?),
         Some("kill") => print(call(&host, json!({"op": "kill", "name": name}))?),
+        Some(op @ ("pause" | "resume" | "suspend")) => print(call(&host, json!({"op": op, "name": name}))?),
+        Some("checkpoint") => {
+            let dir = pos.get(2).ok_or("checkpoint needs NAME DIR")?;
+            if args.has("stop") && args.has("keep-running") {
+                return Err("--stop and --keep-running are exclusive".into());
+            }
+            let dir = std::path::absolute(dir)?;
+            print(call(&host, json!({"op": "checkpoint", "name": name, "dir": dir, "stop": args.has("stop")}))?)
+        }
+        Some("restore") => {
+            let dir = std::path::absolute(pos.get(1).ok_or("restore needs DIR")?)?;
+            print(call(&host, json!({"op": "restore", "dir": dir, "name": args.get("name"), "ip": args.get("ip"), "paused": args.has("paused")}))?)
+        }
         Some("migrate") => {
             let to = args.get("to").ok_or("migrate needs --to ADDR")?;
             print(call(&host, json!({"op": "migrate", "name": name, "to": to}))?)
