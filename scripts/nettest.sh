@@ -54,12 +54,14 @@ wait_for() {
     done
 }
 
-# Our Firecrackers: their API sockets live under our run directories.
+# Our Firecrackers: they log (stdout) into VM directories under our run
+# directories; their sockets live elsewhere.
 our_firecrackers() {
-    local p cmd
+    local p log
     for p in /proc/[0-9]*; do
-        cmd=$(tr '\0' ' ' 2>/dev/null < "$p/cmdline") 2>/dev/null || continue
-        case $cmd in *firecracker*"--api-sock $run_A/"*|*firecracker*"--api-sock $run_B/"*) echo "${p#/proc/}" ;; esac
+        [[ $(cat "$p/comm" 2>/dev/null) == firecracker ]] || continue
+        log=$(readlink "$p/fd/1" 2>/dev/null) || continue
+        case $log in "$run_A"/*|"$run_B"/*) echo "${p#/proc/}" ;; esac
     done
 }
 
@@ -75,6 +77,7 @@ teardown() {
     # The daemons' cgroups are named after their listen address and netns.
     for cg in "/sys/fs/cgroup/flexvm/${NET//./_}_1_7070_ns$ns_A" "/sys/fs/cgroup/flexvm/${NET//./_}_2_7070_ns$ns_B"; do
         [[ -d $cg ]] || continue
+        echo 1 > "$cg/cgroup.kill" 2>/dev/null
         find "$cg" -mindepth 1 -depth -type d -exec rmdir {} + 2>/dev/null
         rmdir "$cg" 2>/dev/null
     done
@@ -106,7 +109,8 @@ for spec in A:1 B:2 C:10; do
 done
 start_daemon() {
     local ns=$1 listen=$2 peer=$3 run=$4 ips=$5
-    ip netns exec "$ns" "$flexvm" --artifacts "$artifacts" daemon --listen "$listen" --peer "$peer" \
+    # ip netns exec remounts sysfs; restore the host cgroup2 hierarchy there.
+    ip netns exec "$ns" sh -c 'mount -t cgroup2 none /sys/fs/cgroup && exec "$@"' sh "$flexvm" --artifacts "$artifacts" daemon --listen "$listen" --peer "$peer" \
         --run "$run" --announce-dev eth0 --vm-ips "$ips" > "$work/daemon-$ns.log" 2>&1 &
     daemon_pids+=($!)
 }

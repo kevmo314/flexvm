@@ -441,25 +441,41 @@ fn live_netns() -> HashSet<u64> {
 }
 
 fn setup_cgroups(listen: &str) -> Option<PathBuf> {
-    let root = PathBuf::from("/sys/fs/cgroup/flexvm");
-    std::fs::create_dir_all(&root).ok()?;
-    std::fs::write(root.join("cgroup.subtree_control"), "+cpu +memory").ok()?;
-    // Daemons in different network namespaces may share a listen address,
-    // and must not share a cgroup (shutdown kills everything in it).
-    let netns = std::fs::read_link("/proc/self/ns/net").ok()?;
-    let netns: String = netns.to_string_lossy().chars().filter(char::is_ascii_digit).collect();
-    let base = listen.replace([':', '.', '[', ']'], "_");
-    let mine = root.join(format!("{base}_ns{netns}"));
-    prune_cgroups(&root, &base, &mine);
-    std::fs::create_dir_all(&mine).ok()?;
-    // Drop leftovers from a previous run; rmdir only succeeds on empty cgroups.
-    for e in std::fs::read_dir(&mine).ok()?.flatten() {
-        if e.path().is_dir() {
-            let _ = std::fs::remove_dir(e.path());
+    let setup = || -> Result<PathBuf> {
+        // Not a cgroup2 root (cgroup v1's tmpfs would take the writes below
+        // as plain files), or none at all (`ip netns exec`'s fresh sysfs).
+        if !Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
+            bail!("no cgroup2 hierarchy mounted at /sys/fs/cgroup");
+        }
+        let root = PathBuf::from("/sys/fs/cgroup/flexvm");
+        std::fs::create_dir_all(&root).map_err(|e| format!("create {}: {e}", root.display()))?;
+        std::fs::write(root.join("cgroup.subtree_control"), "+cpu +memory")
+            .map_err(|e| format!("enable cpu/memory controllers in {}: {e}", root.display()))?;
+        // Daemons in different network namespaces may share a listen address,
+        // and must not share a cgroup (shutdown kills everything in it).
+        let netns = std::fs::read_link("/proc/self/ns/net").map_err(|e| format!("read network namespace: {e}"))?;
+        let netns: String = netns.to_string_lossy().chars().filter(char::is_ascii_digit).collect();
+        let base = listen.replace([':', '.', '[', ']'], "_");
+        let mine = root.join(format!("{base}_ns{netns}"));
+        prune_cgroups(&root, &base, &mine);
+        std::fs::create_dir_all(&mine).map_err(|e| format!("create {}: {e}", mine.display()))?;
+        // Drop leftovers from a previous run; rmdir only succeeds on empty cgroups.
+        for e in std::fs::read_dir(&mine).map_err(|e| format!("read {}: {e}", mine.display()))?.flatten() {
+            if e.path().is_dir() {
+                let _ = std::fs::remove_dir(e.path());
+            }
+        }
+        std::fs::write(mine.join("cgroup.subtree_control"), "+cpu +memory")
+            .map_err(|e| format!("enable cpu/memory controllers in {}: {e}", mine.display()))?;
+        Ok(mine)
+    };
+    match setup() {
+        Ok(root) => Some(root),
+        Err(e) => {
+            eprintln!("WARNING: per-VM cgroups unavailable: {e}; CPU/memory isolation and cgroup.kill on shutdown are disabled");
+            None
         }
     }
-    std::fs::write(mine.join("cgroup.subtree_control"), "+cpu +memory").ok()?;
-    Some(mine)
 }
 
 impl Daemon {

@@ -139,8 +139,43 @@ fn set_mac(ifindex: u32, mac: &[u8; 6]) -> Result<()> {
     netlink(RTM_SETLINK, 0, &msg)
 }
 
-/// Routes `ip` to the host at `via`, where the VM now lives.
+/// Whether an address belongs to this network namespace. Loopback's entire
+/// /8 is local, even when only 127.0.0.1 is explicitly assigned.
+fn is_local_addr(ip: Ipv4Addr) -> Result<bool> {
+    if ip.is_loopback() {
+        return Ok(true);
+    }
+    let mut addrs = std::ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut addrs) } != 0 {
+        bail!("getifaddrs: {}", std::io::Error::last_os_error());
+    }
+    let mut current = addrs;
+    let mut local = false;
+    while !current.is_null() {
+        let addr = unsafe { &*current };
+        if !addr.ifa_addr.is_null() && unsafe { (*addr.ifa_addr).sa_family } == libc::AF_INET as u16 {
+            let v4 = unsafe { &*addr.ifa_addr.cast::<libc::sockaddr_in>() };
+            if v4.sin_addr.s_addr.to_ne_bytes() == ip.octets() {
+                local = true;
+                break;
+            }
+        }
+        current = addr.ifa_next;
+    }
+    unsafe { libc::freeifaddrs(addrs) };
+    Ok(local)
+}
+
+/// Routes `ip` to the host at `via`, where the VM now lives. Daemons sharing
+/// a network namespace also share routes: never replace the target's tap
+/// route with a route through this same host.
 pub fn route_via(ip: Ipv4Addr, via: Ipv4Addr) -> Result<()> {
+    // Not knowing is no reason to leave a peer's VM unrouted.
+    if is_local_addr(via).unwrap_or(false) {
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        LOGGED.call_once(|| eprintln!("not routing {ip} via {via}: a local address (daemons sharing a host); this is logged once"));
+        return Ok(());
+    }
     let mut route = rtmsg(RT_SCOPE_UNIVERSE);
     attr(&mut route, RTA_DST, &ip.octets());
     attr(&mut route, RTA_GATEWAY, &via.octets());
@@ -343,5 +378,18 @@ impl IpRange {
     /// The first address in the range that `taken` rejects.
     pub fn allocate(&self, taken: impl Fn(Ipv4Addr) -> bool) -> Option<Ipv4Addr> {
         (self.first..=self.last).map(Ipv4Addr::from).find(|ip| !taken(*ip))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loopback_routes_are_noops() {
+        for via in [Ipv4Addr::LOCALHOST, Ipv4Addr::new(127, 42, 3, 4), Ipv4Addr::new(127, 255, 255, 255)] {
+            // Works without CAP_NET_ADMIN: no route request is sent.
+            route_via(Ipv4Addr::new(192, 0, 2, 123), via).unwrap();
+        }
     }
 }

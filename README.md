@@ -480,6 +480,9 @@ back to loading the snapshot then and there.
   one explicitly.
 - Reachability:
   - **Peers** get a route pushed to them: `<vm-ip>/32 via <host underlay ip>`.
+    Routes via an address local to the daemon's network namespace (including
+    loopback) are skipped, so test daemons sharing a host keep each other's
+    tap routes; the first skip is logged.
   - **The LAN** (`--announce-dev eth0`): the host answers ARP for its VMs
     (proxy ARP) and sends a gratuitous ARP whenever a VM arrives. Other
     machines on the LAN therefore follow a migrated VM without any

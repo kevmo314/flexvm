@@ -32,9 +32,10 @@ down() {
 }
 
 daemons() {
-  ip netns exec fvA "$flexvm" daemon --listen 192.168.100.1:7070 --peer 192.168.100.2:7070 \
+  # ip netns exec remounts sysfs; restore the host cgroup2 hierarchy there.
+  ip netns exec fvA sh -c 'mount -t cgroup2 none /sys/fs/cgroup && exec "$@"' sh "$flexvm" daemon --listen 192.168.100.1:7070 --peer 192.168.100.2:7070 \
     --announce-dev eth0 --vm-ips 192.168.100.128-192.168.100.191 > "$root/daemon-A.log" 2>&1 &
-  ip netns exec fvB "$flexvm" daemon --listen 192.168.100.2:7070 --peer 192.168.100.1:7070 \
+  ip netns exec fvB sh -c 'mount -t cgroup2 none /sys/fs/cgroup && exec "$@"' sh "$flexvm" daemon --listen 192.168.100.2:7070 --peer 192.168.100.1:7070 \
     --announce-dev eth0 --vm-ips 192.168.100.192-192.168.100.250 > "$root/daemon-B.log" 2>&1 &
   sleep 1
 }
@@ -42,6 +43,20 @@ daemons() {
 stop() {
   pkill -x flexvm || true
   pkill -x firecracker || true
+  # Capture each netns inode before down removes the namespace.
+  local h inode cg
+  for h in A B; do
+    inode=$(stat -L -c %i "/run/netns/fv$h" 2>/dev/null) || continue
+    if [[ $h == A ]]; then
+      cg=/sys/fs/cgroup/flexvm/192_168_100_1_7070_ns$inode
+    else
+      cg=/sys/fs/cgroup/flexvm/192_168_100_2_7070_ns$inode
+    fi
+    [[ -d $cg ]] || continue
+    echo 1 > "$cg/cgroup.kill" 2>/dev/null || true
+    find "$cg" -mindepth 1 -depth -type d -exec rmdir {} + 2>/dev/null || true
+    rmdir "$cg" 2>/dev/null || true
+  done
 }
 
 "${1:-up}"
