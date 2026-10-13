@@ -544,8 +544,8 @@ impl Pager {
     }
 
     /// Firecracker will connect before `seed` (it prepares the load ahead of
-    /// the vmstate): the handshake then waits for the seed, up to
-    /// `HANDSHAKE_TIMEOUT`, before it serves a fault. Firecracker touches no
+    /// the vmstate): the handshake then waits for the seed (or `stop`)
+    /// before it serves a fault. Firecracker touches no
     /// guest memory until the load itself.
     pub fn expect_seed(&self, yes: bool) {
         self.awaiting_seed.store(yes, Ordering::SeqCst);
@@ -608,17 +608,14 @@ impl Pager {
         let total = mappings.iter().map(|m| m.offset as usize + m.size).max().unwrap_or(0) / PAGE_SIZE;
         let pages = Pages::new(total);
         let initial = {
-            let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+            // No deadline of its own: the migration's protocol deadline drops
+            // the prepared VM, which stops the pager.
             let mut initial = self.initial.lock().unwrap();
             while initial.is_none() && self.awaiting_seed.load(Ordering::SeqCst) {
                 if self.stop.load(Ordering::SeqCst) {
                     bail!("stopped before the page states arrived");
                 }
-                let left = deadline.saturating_duration_since(Instant::now());
-                if left.is_zero() {
-                    bail!("no page states within {HANDSHAKE_TIMEOUT:?}");
-                }
-                initial = self.seeded.wait_timeout(initial, left).unwrap().0;
+                initial = self.seeded.wait(initial).unwrap();
             }
             initial.take()
         };
