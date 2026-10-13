@@ -568,6 +568,15 @@ impl Daemon {
                 });
             }
         }
+        // Test gate: resume and arm COW, but keep disk writers out until the
+        // test has freed memory and observed the hold. The fault expires too.
+        while cow && self.fault("ckpt_copy_wait") {
+            if let Err(e) = cancelled() {
+                vm.pager.unfreeze(&frozen);
+                return Err(e);
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
         let cow_pages = frozen.cow.as_deref().map(|c| crate::cow::CowPages { guest: vm.pager.as_ref(), cow: c, slow: self.fault("ckpt_slow") });
         let src: &dyn crate::checkpoint::GuestPages = match &cow_pages {
             Some(c) => c,

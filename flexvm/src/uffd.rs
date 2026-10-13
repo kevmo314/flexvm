@@ -1567,6 +1567,11 @@ impl Pager {
         self.cow.lock().unwrap().is_some()
     }
 
+    /// Live copy counters for fault-test synchronization.
+    pub fn copy_stats(&self) -> Option<serde_json::Value> {
+        self.cow.lock().unwrap().as_ref().map(|c| c.report())
+    }
+
     /// The canonical hash of guest memory as it is now (for a paused VM; a
     /// test hook): see `checkpoint::Canon`.
     pub fn content_hash(&self) -> Result<String> {

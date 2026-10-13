@@ -35,6 +35,13 @@ use crate::vm::{State, Vm};
 #[path = "lifecycle.rs"]
 mod lifecycle;
 
+/// All supported test faults (including lifecycle hooks).
+const FAULTS: &[&str] = &[
+    "pages", "route", "lost_ack", "status", "prepare_fail", "short_incoming", "slow_preload",
+    "restore_no_hold", "restore_before_run", "restore_after_run", "ckpt_memhash", "ckpt_fail_protect",
+    "ckpt_no_hold", "ckpt_abort", "ckpt_slow", "ckpt_fail_write", "ckpt_copy_wait",
+];
+
 pub struct Config {
     pub paths: Paths,
     pub listen: String,
@@ -946,6 +953,9 @@ impl Daemon {
     fn inject(&self, req: &Value) -> Result<Value> {
         let Some(faults) = &self.faults else { bail!("fault injection is off (start the daemon with FLEXVM_FAULTS=1)") };
         let fault = req["fault"].as_str().ok_or("missing fault")?;
+        if !FAULTS.contains(&fault) {
+            bail!("unknown fault {fault:?}; known faults: {}", FAULTS.join(", "));
+        }
         let ms = Duration::from_millis(req["ms"].as_u64().unwrap_or(1000));
         match fault {
             "guest_drop" => *guest::FAULT.lock().unwrap() = Some((guest::Fault::Refuse, ms, None)),

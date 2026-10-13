@@ -100,12 +100,20 @@ static void fill(uint64_t *w, uint64_t k, uint64_t salt, uint64_t page) {
 	}
 }
 
-// Whether page p holds what meta says was last written to it.
+// The last iteration <= k that wrote page p (0: none yet).
+static uint64_t last_write(struct worker *w, uint64_t p, uint64_t k) {
+	uint64_t base = (p * w->sinv) % w->n;  // first k with k*s = p mod n, as a residue
+	if (base == 0) base = w->n;
+	if (base > k) return 0;
+	return base + (k - base) / w->n * w->n;
+}
+
+// Check both the record against the iteration and the page against the record.
 static int page_ok(struct worker *w, uint64_t p) {
 	uint64_t buf[PG / 8];
 	struct header *h = (struct header *)(w->buf + p * PG);
 	struct meta m = w->meta[p];
-	if (h->magic != MAGIC || h->thread != (uint64_t)w->id || h->page != p || h->k != m.k || h->salt != m.salt) return 0;
+	if (m.k != last_write(w, p, w->k) || h->magic != MAGIC || h->thread != (uint64_t)w->id || h->page != p || h->k != m.k || h->salt != m.salt) return 0;
 	fill(buf, m.k, m.salt, p);
 	return memcmp((uint8_t *)h + sizeof *h, (uint8_t *)buf + sizeof *h, PG - sizeof *h) == 0;
 }
@@ -118,18 +126,10 @@ static void write_page(struct worker *w, uint64_t p, uint64_t k, uint64_t salt) 
 	w->meta[p] = (struct meta){k, salt};
 }
 
-// The last iteration <= k that wrote page p (0: none yet).
-static uint64_t last_write(struct worker *w, uint64_t p, uint64_t k) {
-	uint64_t base = (p * w->sinv) % w->n;  // first k with k*s = p mod n, as a residue
-	if (base == 0) base = w->n;
-	if (base > k) return 0;
-	return base + (k - base) / w->n * w->n;
-}
-
 static void full_check(struct worker *w) {
 	uint64_t errors = 0, first = UINT64_MAX, sum = 0xcbf29ce484222325ULL;
 	for (uint64_t p = 0; p < w->n; p++) {
-		if (w->meta[p].k != last_write(w, p, w->k) || !page_ok(w, p)) {
+		if (!page_ok(w, p)) {
 			if (!errors) first = p;
 			errors++;
 		}
@@ -185,7 +185,7 @@ static void *run(void *arg) {
 		if (!page_ok(w, p)) {
 			if (!w->stats.errors) {
 				w->stats.first_err_page = p;
-				w->stats.first_err_want = w->meta[p].k;
+				w->stats.first_err_want = last_write(w, p, w->k);
 				w->stats.first_err_got = ((struct header *)(w->buf + p * PG))->k;
 			}
 			w->stats.errors++;

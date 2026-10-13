@@ -871,6 +871,7 @@ impl Vm {
             "max_mib": self.template.meta.max_mib,
             "pages_mib": {"base": mib(base), "present": mib(present), "zero": mib(zero), "remote": mib(remote + inflight + discarded)},
             "checkpoint_copy": self.pager.copying(),
+            "checkpoint_copy_stats": self.pager.copy_stats(),
             "write_tracking": self.pager.tracking(),
         })
     }
