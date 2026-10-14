@@ -710,9 +710,11 @@ impl Proc {
             return;
         };
         let res = match sig {
-            libc::SIGTSTP => self.op_within().and_then(|_op| vm.pause()).map(|()| {
+            libc::SIGTSTP => self.op_within().and_then(|_op| {
+                vm.pause()?;
                 self.paused_by_request.store(true, Ordering::SeqCst);
-                self.publish()
+                self.publish();
+                Ok(())
             }),
             libc::SIGCONT if self.leaving.load(Ordering::SeqCst) || !self.paused_by_request.load(Ordering::SeqCst) => Ok(()),
             libc::SIGCONT => self.resume().map(drop),

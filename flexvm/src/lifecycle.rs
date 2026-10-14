@@ -89,13 +89,13 @@ impl Proc {
         drop(still);
         self.paused_by_request.store(false, Ordering::SeqCst);
         let took = start.elapsed();
+        self.publish();
         if let Some(old) = vm.pending_net.lock().unwrap().take() {
             if let Err(e) = self.readdress(vm, old) {
                 *vm.pending_net.lock().unwrap() = Some(old);
                 bail!("vm {} resumed, but setting its address {} failed: {e}", vm.name, vm.ip);
             }
         }
-        self.publish();
         drop(op);
         self.sync_clock_later();
         Ok(json!({"name": vm.name, "state": "running", "resume_ms": ms(took)}))
@@ -522,6 +522,7 @@ impl Proc {
         cancelled()?;
         let _lifted = vm.limit.lift(vm.pid());
         vm.leave(State::Checkpointing)?;
+        self.publish();
         let paused = Instant::now();
         let mut hold = PacketHold { d: self, vm, id: crate::migrate::migration_id(), stats: None };
         // Failure must `unfreeze` so the last checkpoint stays the delta base.
@@ -644,6 +645,7 @@ impl Proc {
             Ok(_) => vm.pager.end_copy(),
             Err(_) => vm.pager.unfreeze(&frozen),
         }
+        self.publish();
         let paused = pause.unwrap_or_else(|| paused.elapsed());
         match committed {
             Ok((manifest, id)) => {
@@ -666,6 +668,7 @@ impl Proc {
             Err(CommitError::Uncertain(e)) if cow => Err(format!("{e}; the checkpoint may reappear after a crash").into()),
             Err(CommitError::Uncertain(e)) => {
                 vm.set_failed();
+                self.publish();
                 Err(format!("{e}; vm {} stays paused and is marked failed, as the checkpoint may come back", vm.name).into())
             }
         }
@@ -689,11 +692,16 @@ impl PacketHold<'_> {
     }
 
     fn end(&mut self) -> Result<State> {
-        let Some(h) = self.d.holder() else { return self.vm.end_checkpoint() };
+        let holder = self.d.holder();
         let (ip, tap) = (self.vm.ip, &self.vm.tap);
-        self.stats = crate::migrate::release_into(h, ip, self.id, self.vm, Duration::ZERO, |()| crate::net::attach(ip, tap));
+        if let Some(h) = holder {
+            self.stats = crate::migrate::release_into(h, ip, self.id, self.vm, Duration::ZERO, |()| crate::net::attach(ip, tap));
+        }
         let res = self.vm.end_checkpoint();
-        h.forget(ip, self.id);
+        self.d.publish();
+        if let Some(h) = holder {
+            h.forget(ip, self.id);
+        }
         res
     }
 }

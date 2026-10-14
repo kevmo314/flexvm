@@ -452,16 +452,24 @@ impl Link {
 /// Whether a migration source serves pages at all: fetches `page`, retrying as a pager would (for up to
 /// `SOURCE_TIMEOUT`, and not past `deadline`).
 pub fn probe(source: &Source, page: u64, deadline: Instant) -> io::Result<()> {
+    probe_with_connect(source, page, deadline, |addr, timeout| {
+        let s = crate::util::connect(addr, timeout)?;
+        s.set_nodelay(true)?;
+        Ok(s)
+    })
+}
+
+fn probe_with_connect<S: crate::util::Timed>(source: &Source, page: u64, deadline: Instant, mut connect: impl FnMut(&str, Duration) -> io::Result<S>) -> io::Result<()> {
     let give_up = deadline.min(Instant::now() + SOURCE_TIMEOUT);
     let mut backoff = BACKOFF_MIN;
-    // One attempt: connecting, the request and every read by `give_up`.
-    let once = || {
+    // Bound connects separately so SYN retries cannot consume the whole outage
+    // budget. The request and every read still share the overall deadline.
+    let mut once = || {
         let left = give_up.saturating_duration_since(Instant::now());
         if left.is_zero() {
             return Err(io::Error::new(io::ErrorKind::TimedOut, "deadline passed"));
         }
-        let s = crate::util::connect(&source.addr, left)?;
-        s.set_nodelay(true)?;
+        let s = connect(&source.addr, left.min(CONNECT_TIMEOUT))?;
         let mut client = PageClient::new(s, source, give_up)?;
         client.fetch(page * PAGE_SIZE as u64, &mut [0u8; PAGE_SIZE], 0, &mut |_| true, give_up)
     };
@@ -634,4 +642,79 @@ type Job = (usize, usize, Instant);
 /// is unreadable or corrupt.
 pub(super) fn fatal(e: &io::Error) -> bool {
     matches!(fetch_failure(e), Some(FetchFailure::SourceLost(_) | FetchFailure::Checkpoint(_)))
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+
+    struct Reply(io::Cursor<Vec<u8>>);
+
+    impl Read for Reply {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.0.read(buf)
+        }
+    }
+
+    impl Write for Reply {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl crate::util::Timed for Reply {
+        fn read_timeout(&self, _: Duration) -> io::Result<()> {
+            Ok(())
+        }
+        fn write_timeout(&self, _: Duration) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn short_connect_attempts_survive_a_three_second_outage() {
+        let source = Source { addr: "source".into(), vm: "v".into(), mig: 1, regions: Vec::new() };
+        let start = Instant::now();
+        let mut attempts = 0;
+        probe_with_connect(&source, 2, start + SOURCE_TIMEOUT, |_, timeout| {
+            assert!(timeout <= CONNECT_TIMEOUT, "a connect must not consume the outage budget");
+            attempts += 1;
+            if start.elapsed() < Duration::from_secs(3) {
+                // Model a blackholed SYN consuming its entire per-attempt timeout.
+                thread::sleep(timeout);
+                Err(io::Error::new(io::ErrorKind::TimedOut, "source temporarily unreachable"))
+            } else {
+                let mut reply = b"{\"ok\": true}\n".to_vec();
+                reply.extend_from_slice(&[0u8; PAGE_SIZE + 1]);
+                Ok(Reply(io::Cursor::new(reply)))
+            }
+        })
+        .unwrap();
+        assert!(attempts > 1);
+        assert!(start.elapsed() < SOURCE_TIMEOUT);
+    }
+
+    #[test]
+    fn connects_are_bounded_by_the_remaining_deadline() {
+        let source = Source { addr: "unused".into(), vm: "v".into(), mig: 1, regions: Vec::new() };
+        let budget = Duration::from_millis(70);
+        let start = Instant::now();
+        let mut attempts = 0;
+        let err = probe_with_connect::<Reply>(&source, 0, start + budget, |_, timeout| {
+            attempts += 1;
+            assert!(timeout <= budget);
+            thread::sleep(timeout);
+            Err(io::Error::new(io::ErrorKind::TimedOut, "source unreachable"))
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(attempts, 1);
+        assert!(start.elapsed() < CONNECT_TIMEOUT);
+
+        let err = probe_with_connect::<Reply>(&source, 0, Instant::now(), |_, _| panic!("connecting after the deadline")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    }
 }
