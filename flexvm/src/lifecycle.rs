@@ -342,7 +342,7 @@ impl Proc {
         let tpl = Template::open_id(&self.paths, &ck.manifest.template, &ck.manifest.template_id)?;
         t.mark("verify_template");
         // The template's working set is prefetched too.
-        self.admit_pull(tpl.working_set_mib() + ((ck.data_pages() * PAGE_SIZE as u64) >> 20), crate::host::Floor::Reserve)?;
+        self.admit_start(tpl.working_set_mib() + ((ck.data_pages() * PAGE_SIZE as u64) >> 20), None, crate::host::Floor::Reserve)?;
         Ok(tpl)
     }
 
@@ -735,10 +735,11 @@ impl PacketHold<'_> {
     }
 
     fn end(&mut self) -> Result<State> {
-        let Some(h) = self.d.holder() else { return self.vm.end_checkpoint() };
+        let Some(h) = self.d.holder() else { return self.vm.end_checkpoint(false) };
         let (ip, tap) = (self.vm.ip, &self.vm.tap);
-        self.stats = crate::migrate::release_into(h, ip, self.id, self.vm, Duration::ZERO, |()| crate::net::attach(ip, tap)).0;
-        let res = self.vm.end_checkpoint();
+        let (stats, attached) = crate::migrate::release_into(h, ip, self.id, self.vm, Duration::ZERO, |()| crate::net::attach(ip, tap));
+        self.stats = stats;
+        let res = self.vm.end_checkpoint(stats.is_some() && attached.is_ok());
         h.forget(ip, self.id);
         res
     }
