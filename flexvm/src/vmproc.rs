@@ -870,43 +870,22 @@ fn resize(vm: &Vm, host: &Host, hint: Option<u64>, grow_only: bool) -> Result<Re
     }
     let (stats, hp) = vm.fc(|fc| Ok((if hint.is_none() { fc.get("/balloon/statistics")? } else { Value::Null }, fc.get("/hotplug/memory")?)))?;
     let (requested, plugged) = (hp["requested_size_mib"].as_u64().ok_or("no hotplug state")?, hp["plugged_size_mib"].as_u64().ok_or("no hotplug state")?);
-    // The guest may never finish a resize (kernel-zone blocks, memory in use
-    // keep it from unplugging): past RESIZE_STALL it settles for what is plugged.
-    let stalled = plugged != requested && last.elapsed() > RESIZE_STALL;
-    if plugged < requested && !stalled {
-        return Ok(Resized::Busy); // growing
-    }
-    let total = meta.mem_mib + plugged;
     let avail = match hint {
         Some(avail) => avail,
         None if stats["total_memory"].as_u64().unwrap_or(0) == 0 => return Ok(Resized::Same), // no stats yet
         None => stats["available_memory"].as_u64().unwrap_or(0) >> 20,
-    }
-    .min(total);
-    let (floor, headroom) = (meta.plugged_mib.min(hotplug_total), guest::headroom(total));
-    let round = |mib: u64| mib.div_ceil(STEP_MIB) * STEP_MIB;
-    // Balloon statistics lag a plug by up to a second.
-    let stale = hint.is_none() && last.elapsed() < Duration::from_millis(1500);
-    let short = headroom.saturating_sub(avail);
-    let urgent = short > 0 && !stale;
-    if plugged > requested && !stalled && !urgent {
-        return Ok(Resized::Busy); // shrinking
-    }
-    // Sizes count from what is plugged: urgent growth cancels a pending shrink.
-    let new = if urgent {
-        (plugged + round(headroom * 2 - avail).min(round(total / 4).max(STEP_MIB))).min(hotplug_total)
-    } else if !grow_only && avail > headroom * 3 && plugged > floor && last.elapsed() > Duration::from_secs(10) {
-        plugged.saturating_sub((avail - headroom * 2) / STEP_MIB * STEP_MIB).max(floor)
-    } else {
-        plugged
     };
-    let refused = new > plugged && !host.admit(new - plugged);
-    let full = short > 0 && (plugged == hotplug_total || refused);
+    let sizes = Sizes { mem_mib: meta.mem_mib, floor: meta.plugged_mib.min(hotplug_total), hotplug_total };
+    let Some(plan) = sizes.plan(requested, plugged, avail, last.elapsed(), hint.is_some(), grow_only) else {
+        return Ok(Resized::Busy);
+    };
+    let refused = plan.charge > 0 && !host.admit(plan.charge);
+    let full = plan.short && (plugged == hotplug_total || refused);
     vm.starved.store(full, Ordering::SeqCst);
-    let new = if refused { plugged } else { new };
+    let new = if refused { plugged } else { plan.new };
     if new != requested {
-        let why = if stalled { "stalled" } else if hint.is_some() { "guest asked" } else { "tick" };
-        eprintln!("vm {}: available {avail}/{total} MiB, hotplug {requested} (plugged {plugged}) -> {new} MiB ({why})", vm.name);
+        let why = if plan.settle { "stalled" } else if hint.is_some() { "guest asked" } else { "tick" };
+        eprintln!("vm {}: available {avail} MiB, hotplug {requested} (plugged {plugged}) -> {new} MiB ({why})", vm.name);
         vm.fc(|fc| fc.patch("/hotplug/memory", json!({"requested_size_mib": new})))?;
         *last = Instant::now();
     }
@@ -921,6 +900,60 @@ fn resize(vm: &Vm, host: &Host, hint: Option<u64>, grow_only: bool) -> Result<Re
 
 /// How long a resize may go unfinished before it settles at what is plugged.
 const RESIZE_STALL: Duration = Duration::from_secs(10);
+
+/// A VM's hotplug geometry (MiB): boot memory, the template's plug (never
+/// shrunk below) and the hotplug region.
+struct Sizes {
+    mem_mib: u64,
+    floor: u64,
+    hotplug_total: u64,
+}
+
+#[derive(Debug, PartialEq)]
+struct Plan {
+    /// A resize unfinished for RESIZE_STALL is settled first (requested =
+    /// plugged), which also restarts the delays below.
+    settle: bool,
+    new: u64,
+    /// Growth past both plugged and requested: an outstanding request is
+    /// never charged twice against the host's reserve.
+    charge: u64,
+    /// The guest has less free than its headroom.
+    short: bool,
+}
+
+impl Sizes {
+    /// None while a resize is still being carried out (`busy`).
+    fn plan(&self, requested: u64, plugged: u64, avail: u64, since: Duration, asked: bool, grow_only: bool) -> Option<Plan> {
+        // The guest may never finish a resize: kernel-zone blocks (BOOT_ARGS)
+        // or memory in use can keep it from unplugging.
+        let settle = plugged != requested && since > RESIZE_STALL;
+        let (requested, since) = if settle { (plugged, Duration::ZERO) } else { (requested, since) };
+        if plugged < requested {
+            return None; // growing
+        }
+        let total = self.mem_mib + plugged;
+        let avail = avail.min(total);
+        let headroom = guest::headroom(total);
+        let round = |mib: u64| mib.div_ceil(STEP_MIB) * STEP_MIB;
+        // Balloon statistics lag a plug by up to a second.
+        let stale = !asked && since < Duration::from_millis(1500);
+        let short = avail < headroom;
+        let urgent = short && !stale;
+        if plugged > requested && !urgent {
+            return None; // shrinking
+        }
+        // Sizes count from what is plugged: urgent growth cancels a pending shrink.
+        let new = if urgent {
+            (plugged + round(headroom * 2 - avail).min(round(total / 4).max(STEP_MIB))).min(self.hotplug_total)
+        } else if !grow_only && avail > headroom * 3 && plugged > self.floor && since > Duration::from_secs(10) {
+            plugged.saturating_sub((avail - headroom * 2) / STEP_MIB * STEP_MIB).max(self.floor)
+        } else {
+            plugged
+        };
+        Some(Plan { settle, new, charge: new.saturating_sub(requested.max(plugged)), short })
+    }
+}
 
 const MEM_REQUEST_MAX: usize = 128;
 const MEM_REQUEST_DEADLINE: Duration = Duration::from_millis(500);
@@ -1024,6 +1057,44 @@ pub fn call(host: &Host, name: &str, req: Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SIZES: Sizes = Sizes { mem_mib: 256, floor: 4096, hotplug_total: 31744 };
+
+    fn secs(s: u64) -> Duration {
+        Duration::from_secs(s)
+    }
+
+    #[test]
+    fn stalled_growth_is_settled_not_recharged() {
+        // Growth 4096 -> 5248 outstanding and short: busy, nothing charged.
+        assert_eq!(SIZES.plan(5248, 4096, 512, secs(5), false, false), None);
+        // Stalled: settled at what is plugged; a tick right after (stale stats) does not grow.
+        let p = SIZES.plan(5248, 4096, 512, secs(11), false, false).unwrap();
+        assert_eq!(p, Plan { settle: true, new: 4096, charge: 0, short: true });
+        // The guest asking grows from what is plugged, charging the growth once.
+        let p = SIZES.plan(5248, 4096, 512, secs(11), true, false).unwrap();
+        assert!(p.settle && p.new > 4096 && p.charge == p.new - 4096, "{p:?}");
+        // After the settle, the next tick charges only its own step.
+        let p = SIZES.plan(4096, 4096, 512, secs(2), false, false).unwrap();
+        assert!(!p.settle && p.new > 4096 && p.charge == p.new - 4096, "{p:?}");
+    }
+
+    #[test]
+    fn stalled_shrink_is_settled() {
+        // Shrink 8192 -> 4736 outstanding, plenty free: busy.
+        assert_eq!(SIZES.plan(4736, 8192, 7800, secs(5), false, false), None);
+        // Stalled: settled at 8192, and the shrink delay restarts (no new target yet).
+        assert_eq!(SIZES.plan(4736, 8192, 7800, secs(11), false, false), Some(Plan { settle: true, new: 8192, charge: 0, short: false }));
+        // 10 s later the shrink is chosen again, from what is plugged.
+        assert_eq!(SIZES.plan(8192, 8192, 7800, secs(11), false, false), Some(Plan { settle: false, new: 4736, charge: 0, short: false }));
+    }
+
+    #[test]
+    fn short_guest_cancels_a_pending_shrink() {
+        // Shrink 4096 -> 3072 outstanding, guest short: grow from what is plugged.
+        let p = SIZES.plan(3072, 4096, 512, secs(2), true, false).unwrap();
+        assert!(!p.settle && p.new > 4096 && p.charge == p.new - 4096, "{p:?}");
+    }
 
     #[test]
     fn memory_requests_are_bounded_and_strict() {
