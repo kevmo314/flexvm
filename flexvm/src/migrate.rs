@@ -435,7 +435,7 @@ impl Proc {
         }
         let source = Source { addr: req["source"].as_str().ok_or("missing source")?.into(), vm: name.clone(), mig, regions };
         self.set_name(self.host.take_name(&name, false)?);
-        *self.arrived.lock().unwrap() = Some(self.host.mig_begin(mig)?);
+        *self.arrived.lock().unwrap() = Some(self.host.mig_begin(mig, &source.addr, &name)?);
         let need = req["rss_mib"].as_u64().unwrap_or(0);
         if !self.host.admit(need) {
             bail!("not enough memory here for {need} MiB above the {} MiB reserve", self.host.cfg.reserve_mib);
@@ -494,7 +494,12 @@ impl Proc {
         let retry = || before_commit.take().unwrap()().map(drop);
         let restored = prepared.load(&self.spawner, &name, Snapshot::Bytes(state), seed, ip, paused, Some(deadline), retry, t);
         let probed = probe.map_or(Ok(()), |p| p.join().unwrap_or_else(|_| Err(std::io::Error::other("probe panicked"))));
-        let (vm, _) = restored.map_err(|e| format!("{e} (it never ran here)"))?;
+        // A load that fails for want of pages says less than the probe of the source does.
+        let (vm, _) = match (restored, &probed) {
+            (Ok(r), _) => r,
+            (Err(_), Err(e)) => bail!("migration source {} does not serve pages: {e} (it never ran here)", source.addr),
+            (Err(e), Ok(())) => bail!("{e} (it never ran here)"),
+        };
         let checked = match (probed, vm.pager.failed()) {
             (Err(e), _) => Err(format!("migration source {} does not serve pages: {e}", source.addr).into()),
             (_, Some(why)) => Err(format!("its memory cannot be paged in: {why}").into()),

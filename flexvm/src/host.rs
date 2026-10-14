@@ -393,13 +393,15 @@ impl Host {
         self.state.join("migs").join(id.to_string())
     }
 
-    pub fn mig_begin(&self, id: u64) -> Result<MigRecord> {
+    /// `source`: its listener, and `name`, the VM: asked whether a released
+    /// record may go when the source never says it is done.
+    pub fn mig_begin(&self, id: u64, source: &str, name: &str) -> Result<MigRecord> {
         let _l = self.lock()?;
         if load::<Mig>(&self.mig_path(id))?.is_some() {
             bail!("migration {id} was already seen here");
         }
         store(&self.mig_path(id), &Mig::Pending { owner: Ident::me() }, true)?;
-        Ok(MigRecord { host: self.clone(), id, committed: false })
+        Ok(MigRecord { host: self.clone(), id, committed: false, source: source.into(), name: name.into() })
     }
 
     /// A record whose process died becomes aborted once its Firecrackers are
@@ -409,7 +411,7 @@ impl Host {
         let path = self.mig_path(id);
         Ok(match load(&path)? {
             None => "aborted",
-            Some(Mig::Released) => "released",
+            Some(Mig::Released { .. }) => "released",
             Some(Mig::Pending { owner }) if owner.alive() => "pending",
             Some(Mig::Committed { owner }) if owner.alive() => "committed",
             Some(Mig::Pending { owner } | Mig::Committed { owner }) => {
@@ -423,8 +425,30 @@ impl Host {
     pub fn mig_done(&self, id: u64) -> Result<()> {
         let _l = self.lock()?;
         match load(&self.mig_path(id))? {
-            Some(Mig::Released) => remove(&self.mig_path(id)),
+            Some(Mig::Released { .. }) => remove(&self.mig_path(id)),
             _ => Ok(()),
+        }
+    }
+
+    /// Records no source will ask about again: a dead owner's (aborted, as
+    /// `mig_status` would answer), and released ones whose source is gone
+    /// (killed before its `done`): its listener says no VM process of that
+    /// name is a migration source.
+    pub fn retire_migrations(&self) {
+        for e in std::fs::read_dir(self.state.join("migs")).into_iter().flatten().flatten() {
+            let Some(id) = e.file_name().to_str().and_then(|n| n.parse().ok()) else { continue };
+            let Ok(Some(Mig::Released { source, name })) = load(&self.mig_path(id)) else {
+                let _ = self.mig_status(id);
+                continue;
+            };
+            if source.is_empty() {
+                continue;
+            }
+            let gone = crate::vmproc::peer_call(&source, serde_json::json!({"op": "source", "name": name}));
+            if gone.is_ok_and(|r| r["source"] == false) {
+                eprintln!("migration {id}: its source at {source} is gone; forgetting it");
+                let _ = self.mig_done(id);
+            }
         }
     }
 }
@@ -485,7 +509,12 @@ pub enum Mig {
     /// The source must never run it again.
     Committed { owner: Ident },
     /// All memory is here, or the VM is gone: the source may exit.
-    Released,
+    Released {
+        #[serde(default)]
+        source: String,
+        #[serde(default)]
+        name: String,
+    },
 }
 
 /// Dropped before it commits, the record goes (aborted).
@@ -493,6 +522,8 @@ pub struct MigRecord {
     host: Host,
     pub id: u64,
     committed: bool,
+    source: String,
+    name: String,
 }
 
 impl MigRecord {
@@ -521,7 +552,7 @@ impl MigRecord {
     pub fn release(&self, home: Option<(Ipv4Addr, u64)>) {
         let mut delay = Duration::from_millis(100);
         while let Err(e) = self.host.lock().and_then(|l| {
-            store(&self.host.mig_path(self.id), &Mig::Released, true)?;
+            store(&self.host.mig_path(self.id), &Mig::Released { source: self.source.clone(), name: self.name.clone() }, true)?;
             match home {
                 Some((ip, gen)) => self.host.update(&l, ip, true, |a| a.lent = a.lent.filter(|&lent| lent > gen)),
                 None => Ok(()),
@@ -942,11 +973,11 @@ mod tests {
         let h = host("migs");
         let rec = |id: u64| load::<Mig>(&h.mig_path(id)).unwrap();
         assert!(h.mig_status(1).unwrap() == "aborted" && rec(1).is_none());
-        let r = h.mig_begin(2).unwrap();
-        assert!(h.mig_begin(2).is_err() && h.mig_status(2).unwrap() == "pending");
+        let r = h.mig_begin(2, "", "").unwrap();
+        assert!(h.mig_begin(2, "", "").is_err() && h.mig_status(2).unwrap() == "pending");
         drop(r);
         assert_eq!(h.mig_status(2).unwrap(), "aborted");
-        let mut r = h.mig_begin(3).unwrap();
+        let mut r = h.mig_begin(3, "", "").unwrap();
         r.commit(&h.lock().unwrap()).unwrap();
         h.mig_done(3).unwrap();
         assert_eq!(h.mig_status(3).unwrap(), "committed", "only a released one is forgotten");
@@ -959,16 +990,22 @@ mod tests {
         assert!(h.mig_status(3).unwrap() == "released" && lent(&h).is_none());
         h.mig_done(3).unwrap();
         assert!(rec(3).is_none());
-        let mut r = h.mig_begin(4).unwrap();
+        let mut r = h.mig_begin(4, "", "").unwrap();
         store(&h.mig_path(4), &Mig::Pending { owner: dead_owner(&h, 999_999_904, &[]) }, false).unwrap();
         assert!(h.mig_status(4).unwrap() == "aborted" && rec(4).is_none() && r.commit(&h.lock().unwrap()).is_err());
         let fc = Sleeper::new();
         store(&h.mig_path(5), &Mig::Committed { owner: dead_owner(&h, 999_999_905, &[&fc.1]) }, false).unwrap();
         assert!(h.mig_status(5).unwrap() == "aborted" && fc.done() && rec(5).is_none());
-        let mut r = h.mig_begin(7).unwrap();
+        let mut r = h.mig_begin(7, "", "").unwrap();
         r.commit(&h.lock().unwrap()).unwrap();
         r.settle(true);
         assert_eq!(h.mig_status(7).unwrap(), "released");
+        // A source that cannot be asked keeps its released record.
+        store(&h.mig_path(8), &Mig::Released { source: "127.0.0.1:1".into(), name: "x".into() }, false).unwrap();
+        // A dead owner's goes, as asking would make it go.
+        store(&h.mig_path(9), &Mig::Committed { owner: dead_owner(&h, 999_999_909, &[]) }, false).unwrap();
+        h.retire_migrations();
+        assert!(h.mig_status(8).unwrap() == "released" && rec(9).is_none());
         std::fs::write(h.mig_path(6), "{").unwrap();
         assert!(h.mig_status(6).is_err());
     }

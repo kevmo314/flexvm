@@ -2782,7 +2782,16 @@ def arrival_overtaken():
     cleanup(n)
 
 
+def source_killed_basic():
+    """A target whose source was killed after the release (no `done` ever
+    comes) forgets the record once the source's listener says no such source
+    is left: `basic` after `source_killed`, on the same state, finds none."""
+    source_killed()
+    basic()
+
+
 SCENARIOS = dict(
+    source_killed_basic=source_killed_basic,
     arrival_overtaken=arrival_overtaken,
     pull_died=pull_died,
     cow_grow=cow_grow, plug_race=plug_race, shrink_stall=shrink_stall, plug_storm=plug_storm,

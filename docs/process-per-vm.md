@@ -194,6 +194,7 @@ one of:
 | `migration` | report and settle a migration record; `done`: forget a released one |
 | `route` | a peer's announcement/withdrawal: judge its generation, set or remove the route |
 | `lend` | lend an address of this host's range to a restoring peer, with a new generation |
+| `source` | whether a VM process of that name is a migration source here (a target retires a released record when not) |
 
 Only connections from the configured peers' addresses are served. Request
 lines are read with a 10 s deadline and capped at 64 KiB; at most 512
@@ -260,7 +261,7 @@ This replaces the `info` op the daemon used to find room.
 
 After: control socket `exec`, `checkpoint`, `migrate`, `claim`, `pages`
 (from the listener only), `debug` (6); peer `migrate_in`, `pages`,
-`migration`, `route`, `lend` (5). 11 ops, from 23 (the daemon's
+`migration`, `route`, `lend`, `source` (6). 12 ops, from 23 (the daemon's
 `lend_ip` included); user-facing ones: 3.
 
 ### CLI, before (15 commands) and after (12)
@@ -372,8 +373,12 @@ where it is kept and what tests it.
    end. Every operation that changes who owns the VM (suspend, migrating
    on, `checkpoint --stop`) settles first, waiting a bounded time, and is
    refused as "still arriving" otherwise; later operations see a settled VM.
-   A migration's rollback removes only a loan that migration made. Faults
-   `arrival_overtaken`, `pull_died`, `target_killed`.
+   A migration's rollback removes only a loan that migration made. A
+   released record whose source never says `done` (killed) is retired once
+   the source's listener says no VM process of that name is a migration
+   source there (op `source`; asked by every VM process's start-up garbage
+   collection); a source that cannot be asked keeps it. Faults
+   `arrival_overtaken`, `pull_died`, `target_killed`, `source_killed_basic`.
 13. **`scripts/faults.py`** is ported to VM processes and listeners (see
    Test plan).
 

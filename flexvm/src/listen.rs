@@ -80,6 +80,8 @@ fn handle(host: &Host, mut conn: TcpStream) -> Result<()> {
         "migration" => migration(host, &req),
         "route" => route(host, &req),
         "lend" => lend(host, &req),
+        // Whether a VM process of that name is a migration source here.
+        "source" => Ok(json!({"source": host.entry(req["name"].as_str().unwrap_or("")).is_ok_and(|e| e.state == "source")})),
         op => Err(format!("unknown op {op:?}").into()),
     };
     let reply = match reply {

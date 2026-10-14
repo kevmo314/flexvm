@@ -808,8 +808,11 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
     let signals = crate::util::block_signals(&SIGNALS);
     let _ = crate::net::sysctl("net.ipv4.ip_forward", "1");
     let p = Proc::new(host, paths)?;
-    let (run, prefix) = (p.host.run.clone(), p.host.cfg.prefix.clone());
-    thread::spawn(move || crate::host::collect_garbage(&run, &prefix));
+    let host = p.host.clone();
+    thread::spawn(move || {
+        crate::host::collect_garbage(&host.run, &host.cfg.prefix);
+        host.retire_migrations();
+    });
     let s = p.clone();
     thread::spawn(move || loop {
         s.signal(crate::util::wait_signal(&signals));
