@@ -60,6 +60,8 @@ const PULL_THREADS: usize = 4;
 /// Pages past a REMOTE fault's run that the pullers take next (32 MiB): the
 /// guest tends to read on from where it faulted.
 const STEER_AHEAD: usize = 32 * PULL_RUN;
+/// Steered runs a puller takes, at most, before each run of its own share.
+const STEER_BURST: usize = 4;
 /// Threads fetching pages for faults, each with its own connection.
 const FAULT_FETCHERS: usize = 8;
 /// Fetched pages are installed as they arrive: the first at once, then at
@@ -83,7 +85,7 @@ const FAULT_TIMEOUT: Duration = Duration::from_secs(1);
 const SOURCE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long one page request may take, writing it and reading its reply, before
 /// its connection is given up as lost (and the pager reconnects).
-const FETCH_DEADLINE: Duration = Duration::from_secs(5);
+const FETCH_DEADLINE: Duration = if cfg!(test) { Duration::from_millis(300) } else { Duration::from_secs(5) };
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 const BACKOFF_MIN: Duration = Duration::from_millis(10);
 const BACKOFF_MAX: Duration = Duration::from_secs(1);
@@ -547,8 +549,11 @@ impl Pages {
         let mut failed: Option<io::Error> = None;
         loop {
             let base = done;
+            // Pages from `first` in `buf`, installed or not.
+            let mut arrived = base;
             let fetched = fetch(((first + base) * PAGE_SIZE) as u64, &mut buf[base * PAGE_SIZE..n * PAGE_SIZE], stop, &mut |data| {
                 let ready = base + data.len() / PAGE_SIZE;
+                arrived = ready;
                 if failed.is_none() && ready > done && (done == 0 || ready - done >= STREAM_RUN) {
                     let (r, res) = install(done, ready, data, base);
                     resolved += r;
@@ -570,7 +575,18 @@ impl Pages {
                     }
                     break;
                 }
-                Err(e) if done < n && retry(&e) => {}
+                Err(e) if done < n && retry(&e) => {
+                    // What did arrive goes in, so the next try asks only for the rest.
+                    if arrived > done {
+                        let (r, res) = install(done, arrived, &buf[..n * PAGE_SIZE], 0);
+                        resolved += r;
+                        done = arrived;
+                        if let Err(e) = res {
+                            failed = Some(e);
+                            break;
+                        }
+                    }
+                }
                 Err(e) => return (resolved + self.release(first + done, n - done, REMOTE), Err(Failed::Fetch(e))),
             }
         }
@@ -2110,6 +2126,10 @@ impl Pager {
             // A link waits out a source outage itself (until it gives up,
             // which is fatal); other errors are retried for a while.
             let mut retry = |e: &io::Error| {
+                if partial(e) {
+                    // The source is slow, not gone: on with the rest.
+                    return !self.stop.load(Ordering::SeqCst);
+                }
                 let again = !fatal(e) && !self.stop.load(Ordering::SeqCst) && started.elapsed() < FAULT_TIMEOUT;
                 if again {
                     eprintln!("uffd: fetching pages {page}+{n} for a fault: {e}; retrying");
@@ -2220,7 +2240,9 @@ impl Pager {
             if !self.pulling() {
                 break;
             }
-            while let Some((a, b)) = self.steered() {
+            // At most `STEER_BURST` runs before each of its own, so faults
+            // that keep coming never hold the rest of the pull back for long.
+            for (a, b) in std::iter::from_fn(|| self.steered()).take(STEER_BURST) {
                 if !self.pull_range(t, a, b, &mut buf, fetch) {
                     return;
                 }
@@ -2267,7 +2289,9 @@ impl Pager {
                 continue;
             }
             let started = Instant::now();
-            let res = self.install_claimed(i, n, buf, fetch, &mut |_| false, |p, c, src| self.populate(p, c, Some(src)));
+            // A source that is slow, not gone: on with the rest of the run.
+            let mut retry = |e: &io::Error| partial(e) && !self.stop.load(Ordering::SeqCst);
+            let res = self.install_claimed(i, n, buf, fetch, &mut retry, |p, c, src| self.populate(p, c, Some(src)));
             self.fault_stats.record(PULL, started.elapsed());
             match res {
                 Ok(()) => i += n,
@@ -2319,6 +2343,8 @@ struct LaneQueue {
     conn: Option<TcpStream>,
     /// How many jobs, from the front, have their request out on `conn`.
     sent: usize,
+    /// The fetcher is writing requests on `conn` (see `Lane::flush`).
+    writing: bool,
 }
 
 struct Queued {
@@ -2335,7 +2361,7 @@ impl Lane {
         let mut q = self.q.lock().unwrap();
         let req = ((job.0 * PAGE_SIZE) as u64, job.1 * PAGE_SIZE);
         q.jobs.push_back(Queued { job, req });
-        if q.sent + 1 == q.jobs.len() {
+        if !q.writing && q.sent + 1 == q.jobs.len() {
             if let Some(conn) = &q.conn {
                 let (buf, len) = request(req.0, req.1, PAGE_SIZE);
                 let n = unsafe { libc::send(conn.as_raw_fd(), buf.as_ptr().cast(), len, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) };
@@ -2376,14 +2402,23 @@ impl Lane {
                 return Err(io::Error::other("refetching part of a run"));
             }
         }
-        if q.sent < q.jobs.len() {
+        // Written without holding `q`, so that queueing (the event thread)
+        // never waits for a write; it writes nothing meanwhile (`writing`),
+        // which keeps requests in order.
+        while q.sent < q.jobs.len() {
             let mut out = Vec::new();
             for j in q.jobs.range(q.sent..) {
                 let (buf, len) = request(j.req.0, j.req.1, PAGE_SIZE);
                 out.extend_from_slice(&buf[..len]);
             }
-            crate::util::By { s: conn, at: Instant::now() + FETCH_DEADLINE }.write_all(&out)?;
-            q.sent = q.jobs.len();
+            let upto = q.jobs.len();
+            q.writing = true;
+            drop(q);
+            let res = crate::util::By { s: conn, at: Instant::now() + FETCH_DEADLINE }.write_all(&out);
+            q = self.q.lock().unwrap();
+            q.writing = false;
+            res?;
+            q.sent = upto;
         }
         Ok(())
     }
@@ -2444,10 +2479,15 @@ impl Link {
                 continue;
             };
             let at = Instant::now() + FETCH_DEADLINE;
+            let mut got = 0;
+            let mut counted = |data: &[u8]| {
+                got = data.len();
+                progress(data)
+            };
             let res = match lane {
                 Some(lane) if buf.is_empty() => lane.flush(&client.stream.s, None),
-                Some(lane) => lane.flush(&client.stream.s, Some((offset, buf.len()))).and_then(|()| client.recv(buf, head, progress, at)),
-                None => client.fetch(offset, buf, head, progress, at),
+                Some(lane) => lane.flush(&client.stream.s, Some((offset, buf.len()))).and_then(|()| client.recv(buf, head, &mut counted, at)),
+                None => client.fetch(offset, buf, head, &mut counted, at),
             };
             match res {
                 Ok(()) => {
@@ -2463,6 +2503,14 @@ impl Link {
                     // Stopped by the caller: the source is fine.
                     if e.get_ref().is_some_and(|e| e.is::<Cancelled>()) {
                         return Err(e);
+                    }
+                    // Pages kept arriving, just not all in time: the source
+                    // is alive, and the caller asks for the rest (`partial`).
+                    if got >= PAGE_SIZE {
+                        self.down = None;
+                        self.backoff = BACKOFF_MIN;
+                        self.retry_at = Instant::now();
+                        return Err(io::Error::other(Partial(e.to_string())));
                     }
                     self.lost(e)?;
                 }
@@ -2640,6 +2688,24 @@ impl std::fmt::Display for Cancelled {
 }
 
 impl std::error::Error for Cancelled {}
+
+/// A fetch that delivered pages, but not all of them, before its connection
+/// failed (say, past its deadline from a slow source): the caller fetches the
+/// rest (see `Pages::fetch_install`).
+#[derive(Debug)]
+struct Partial(String);
+
+impl std::fmt::Display for Partial {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "fetch cut short after some pages arrived: {}", self.0)
+    }
+}
+
+impl std::error::Error for Partial {}
+
+fn partial(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|e| e.is::<Partial>())
+}
 
 /// Serves page reads for `pager` on an accepted page-server connection
 /// (already answered `ok`), until the client hangs up, sits idle for
@@ -3277,6 +3343,61 @@ mod tests {
         let e = c.fetch(0, &mut [0u8; PAGE_SIZE], 0, &mut |_| true, start + Duration::from_millis(200)).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::TimedOut, "{e}");
         assert!(start.elapsed() < Duration::from_millis(400), "{:?}", start.elapsed());
+    }
+
+    /// A source that delivers steadily but too slowly for any one request to
+    /// finish by its deadline: the pull goes on from what arrived, and
+    /// completes.
+    #[test]
+    fn a_slow_source_that_keeps_delivering_is_not_lost() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let conns = Arc::new(AtomicUsize::new(0));
+        let counted = conns.clone();
+        thread::spawn(move || {
+            for s in listener.incoming() {
+                counted.fetch_add(1, Ordering::SeqCst);
+                let s = s.unwrap();
+                thread::spawn(move || {
+                    let mut r = io::BufReader::new(s.try_clone().unwrap());
+                    let mut w = s;
+                    let mut hello = String::new();
+                    io::BufRead::read_line(&mut r, &mut hello).unwrap();
+                    w.write_all(b"{\"ok\": true}\n").unwrap();
+                    let mut req = [0u8; 12];
+                    while r.read_exact(&mut req).is_ok() {
+                        let (off, len) = (u64::from_le_bytes(req[..8].try_into().unwrap()), u32::from_le_bytes(req[8..].try_into().unwrap()) as u64);
+                        let _ = w.write_all(&[0]);
+                        for p in (off..off + len).step_by(PAGE_SIZE) {
+                            thread::sleep(Duration::from_millis(25));
+                            if w.write_all(&[(p / PAGE_SIZE as u64) as u8; PAGE_SIZE]).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        let n = 32;
+        let p = pages(&[REMOTE; 32]);
+        p.claim(0, n, REMOTE, |_| true);
+        let mut link = Link::new(Source { addr, vm: "v".into(), mig: 1, regions: Vec::new() });
+        let mut fetch = |off: u64, buf: &mut [u8], stop: &AtomicBool, progress: &mut dyn FnMut(&[u8]) -> bool| link.fetch(off, buf, stop, progress);
+        let stop = AtomicBool::new(false);
+        let mut got = vec![0u8; n];
+        let (resolved, res) = p.fetch_install(0, n, &mut vec![0u8; n * PAGE_SIZE], &mut fetch, &stop, &mut |e| partial(e), |pg, c, src| {
+            for i in 0..c {
+                got[pg + i] = src[i * PAGE_SIZE];
+            }
+            Ok(c)
+        });
+        assert!(res.is_ok(), "{:?}", res.err().map(|e| match e {
+            Failed::Fetch(e) | Failed::Install(e) => e.to_string(),
+        }));
+        assert_eq!(resolved, n);
+        assert!(got.iter().enumerate().all(|(i, &b)| b as usize == i), "{got:?}");
+        // 0.8 s of pages over 0.3 s deadlines: it reconnected, for the rest only.
+        assert!(conns.load(Ordering::SeqCst) > 1);
     }
 
     #[test]
