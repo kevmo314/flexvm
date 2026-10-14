@@ -158,10 +158,10 @@ struct Attachment {
 }
 
 #[derive(Default)]
-struct Output {
+pub(crate) struct Output {
     chunks: VecDeque<Chunk>,
-    start: u64,
-    end: u64,
+    pub(crate) start: u64,
+    pub(crate) end: u64,
     exit: Option<i32>,
     closed: bool,
     attached: Option<Attachment>,
@@ -189,7 +189,7 @@ impl Output {
 
     /// Appends, then drops the oldest to fit `capacity` and `MAX_CHUNKS`. Same-kind output joins the
     /// last chunk up to `BLOCK`; only the newest chunk has spare allocation.
-    fn push(&mut self, kind: u8, data: &[u8], capacity: usize) {
+    pub(crate) fn push(&mut self, kind: u8, data: &[u8], capacity: usize) {
         match self.chunks.back_mut() {
             Some(last) if last.kind == kind && last.data.len() + data.len() <= BLOCK => last.data.extend_from_slice(data),
             last => {
@@ -221,9 +221,9 @@ impl Output {
         self.start = self.chunks.front().map_or(self.end, |c| c.offset);
     }
 
-    fn read(&self, offset: u64) -> Option<(u8, Vec<u8>)> {
+    pub(crate) fn read_chunk(&self, offset: u64) -> Option<(u8, &[u8])> {
         let c = self.chunks.get(self.chunks.len() - self.chunks_from(offset))?;
-        Some((c.kind, [&offset.to_le_bytes()[..], &c.data[(offset - c.offset) as usize..]].concat()))
+        Some((c.kind, &c.data[(offset - c.offset) as usize..]))
     }
 }
 
@@ -391,8 +391,8 @@ fn drain(w: &mut impl Write, output: &Session, mut offset: u64, me: u64) -> io::
             }
             if offset < ring.start {
                 (FRAME_LOST, ring.start.to_le_bytes().to_vec())
-            } else if let Some(frame) = ring.read(offset) {
-                frame
+            } else if let Some((kind, data)) = ring.read_chunk(offset) {
+                (kind, [&offset.to_le_bytes()[..], data].concat())
             } else if let Some(code) = ring.exit {
                 (FRAME_EXIT, [offset.to_le_bytes().as_slice(), &code.to_le_bytes()].concat())
             } else {
@@ -643,26 +643,25 @@ mod tests {
 
     #[test]
     fn ring_offsets_and_overflow() {
-        let out = |offset: u64, data: &[u8]| [&offset.to_le_bytes()[..], data].concat();
         let mut ring = Output::default();
         ring.push(FRAME_STDOUT, b"abc", 5);
         ring.push(FRAME_STDERR, b"defg", 5);
         assert_eq!((ring.start, ring.end), (2, 7));
-        assert_eq!(ring.read(2), Some((FRAME_STDOUT, out(2, b"c"))));
-        assert_eq!(ring.read(5), Some((FRAME_STDERR, out(5, b"fg"))));
-        assert!(ring.read(7).is_none());
+        assert_eq!(ring.read_chunk(2), Some((FRAME_STDOUT, &b"c"[..])));
+        assert_eq!(ring.read_chunk(5), Some((FRAME_STDERR, &b"fg"[..])));
+        assert!(ring.read_chunk(7).is_none());
         ring.push(FRAME_STDOUT, b"0123456789", 5);
         assert_eq!((ring.start, ring.end), (12, 17));
-        assert_eq!(ring.read(12), Some((FRAME_STDOUT, out(12, b"56789"))));
+        assert_eq!(ring.read_chunk(12), Some((FRAME_STDOUT, &b"56789"[..])));
         let mut tiny = Output::default();
         for _ in 0..BLOCK + 1 {
             tiny.push(FRAME_STDOUT, b"x", CAPACITY);
         }
         assert_eq!(tiny.chunks.iter().map(|c| c.data.len()).collect::<Vec<_>>(), [BLOCK, 1]);
-        assert_eq!(tiny.read(BLOCK as u64 - 1), Some((FRAME_STDOUT, out(BLOCK as u64 - 1, b"x"))));
+        assert_eq!(tiny.read_chunk(BLOCK as u64 - 1), Some((FRAME_STDOUT, &b"x"[..])));
         tiny.push(FRAME_STDERR, b"y", CAPACITY);
         assert_eq!(tiny.chunks.len(), 3);
-        assert_eq!(tiny.read(BLOCK as u64 + 1), Some((FRAME_STDERR, out(BLOCK as u64 + 1, b"y"))));
+        assert_eq!(tiny.read_chunk(BLOCK as u64 + 1), Some((FRAME_STDERR, &b"y"[..])));
         let mut tiny = Output::default();
         for i in 0..MAX_CHUNKS + 1 {
             tiny.push(if i % 2 == 0 { FRAME_STDOUT } else { FRAME_STDERR }, b"x", CAPACITY);
