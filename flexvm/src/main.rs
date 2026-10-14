@@ -61,7 +61,7 @@ options: --state DIR (FLEXVM_STATE, /var/lib/flexvm), --run DIR (FLEXVM_RUN, /ru
          --artifacts DIR (FLEXVM_ARTIFACTS, ./artifacts), --templates DIR, --image-cache DIR
 ";
 
-const SWITCHES: &[&str] = &["warm", "stop", "paused", "incremental", "standby", "incoming", "json", "detach"];
+const SWITCHES: &[&str] = &["warm", "stop", "paused", "incremental", "standby", "incoming", "json", "detach", "help"];
 
 const VALUE_FLAGS: &[&str] = &[
     "state", "run", "artifacts", "templates", "image-cache", "template", "ip", "name",
@@ -107,11 +107,15 @@ impl Args {
                     a.flags.push((f.into(), value));
                 }
                 None if arg == "-d" => a.flags.push(("detach".into(), "1".into())),
+                None if arg == "-h" => a.flags.push(("help".into(), "1".into())),
                 None if arg.starts_with('-') => bail!("unknown option {arg}"),
                 None => {
                     a.positional.push(arg);
                     if a.positional.len() == 2 && a.positional[0] == "exec" {
-                        a.rest.extend(it.by_ref());
+                        // `exec NAME -- CMD` too, as with run.
+                        let mut cmd = it.by_ref().peekable();
+                        cmd.next_if_eq("--");
+                        a.rest.extend(cmd);
                         a.child_args.extend(a.rest.iter().cloned());
                     }
                 }
@@ -169,6 +173,10 @@ fn paths(args: &Args) -> Result<Paths> {
 
 fn real_main() -> Result<()> {
     let args = Args::parse(std::env::args().skip(1))?;
+    if args.has("help") {
+        print!("{USAGE}");
+        return Ok(());
+    }
     let _ = paths(&args);
     let pos: Vec<&str> = args.positional.iter().map(|s| s.as_str()).collect();
     let (name, arg2) = (pos.get(1).copied().unwrap_or(""), pos.get(2).copied());
@@ -188,9 +196,11 @@ fn real_main() -> Result<()> {
         Some("resume") => start(&args, name, Start::Resume { name: name.into() }),
         Some("restore") => {
             let dir = std::path::absolute(pos.get(1).ok_or("restore needs DIR")?)?;
+            // A detached restore logs to the VM's name, which the checkpoint has without --name.
             let label = match args.get("name") {
                 Some(name) => name.to_string(),
-                None => checkpoint::Checkpoint::open(&dir)?.manifest.name,
+                None if args.has("detach") => checkpoint::Checkpoint::open(&dir)?.manifest.name,
+                None => String::new(),
             };
             start(&args, &label, Start::Restore { dir, name: args.get("name").map(String::from), ip: args.get("ip").map(String::from), paused: args.has("paused") })
         }
@@ -484,7 +494,8 @@ pub fn exec(host: &Host, name: &str, cmd: &str) -> Result<i32> {
             }
             Ok(Ok(StreamEnd::Disconnected(why))) => error = why,
             Err(e) => {
-                if e.to_string() == format!("vm {name} is paused; resume it with flexvm resume {name}") {
+                // Paused stays paused: no point retrying.
+                if e.to_string().contains(" is paused; ") {
                     return Err(e);
                 }
                 if !host.alive(name) {
@@ -569,6 +580,12 @@ mod exec_tests {
         assert_eq!(args.positional, ["exec", "web"]);
         assert_eq!(args.rest, ["tool", "-d", "--detach", "--unknown"]);
         assert_eq!(args.child_args, ["--state", "/tmp/state", "exec", "web", "tool", "-d", "--detach", "--unknown"]);
+    }
+
+    #[test]
+    fn exec_drops_one_separator() {
+        let args = parse(&["exec", "web", "--", "ls", "--", "-d"]);
+        assert_eq!(args.rest, ["ls", "--", "-d"]);
     }
 
     #[test]

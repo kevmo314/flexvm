@@ -244,7 +244,7 @@ VM that is busy, paused or suspended.
   migration source or its checkpoint), and for virtio-mem to settle (see
   below). It then pauses the VM, quiesces its devices and pager like a
   migration source does, saves the vCPU/device state and writes every page
-  that differs from the template into DIR. With `--keep-running` (the
+  that differs from the template into DIR. Without `--stop` (the
   default) the VM resumes as soon as its memory is write-protected and the
   pages are written copy-on-write while it runs (pause 17–30 ms at any
   size, see below); with `--stop` it stays paused for the write (2–3 GB/s
@@ -393,7 +393,7 @@ parent breaks its children.
 
 #### Copy-on-write and incremental checkpoints
 
-A checkpoint of a VM that runs on (`--keep-running`) pauses it only to save
+A checkpoint of a VM that runs on (no `--stop`) pauses it only to save
 its vCPU/device state and to arm userfaultfd write protection (uffd-wp); the
 pages are written while it runs. A guest write to a page not saved yet
 faults, the pager saves that page first and only then lets the write
