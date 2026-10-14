@@ -112,6 +112,14 @@ fn unlocked(path: &Path) -> bool {
 fn standby_sockets(dir: &Path) {
     for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         let n = e.file_name().to_string_lossy().into_owned();
+        // `PID-START.claim`, unlocked, of a standby gone: its `PID.lock` gone or another process's.
+        if let Some((pid, start)) = n.strip_suffix(".claim").and_then(|s| s.split_once('-')) {
+            let lock = crate::host::load::<crate::host::Ident>(&dir.join(format!("{pid}.lock"))).ok().flatten();
+            if lock.is_none_or(|id| id.start.to_string() != start) && unlocked(&e.path()) {
+                let _ = std::fs::remove_file(e.path());
+            }
+            continue;
+        }
         let Some(pid) = n.strip_suffix(".sock").and_then(|s| s.rsplit_once('.')).map(|(_, pid)| pid.to_string()) else { continue };
         if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
             continue;
@@ -145,12 +153,17 @@ mod tests {
         let held = File::create(d.join("1.lock")).unwrap();
         flock(&held, libc::LOCK_EX).unwrap();
         File::create(d.join("2.lock")).unwrap();
-        for s in ["key.1.sock", "key.2.sock", "key.3.sock", "key.x.sock", "1.lock"] {
+        let claiming = File::create(d.join("4-1.claim")).unwrap();
+        flock(&claiming, libc::LOCK_EX).unwrap();
+        for s in ["key.1.sock", "key.2.sock", "key.3.sock", "key.x.sock", "1.lock", "3-1.claim", "5-6.claim", "5-7.claim"] {
             File::create(d.join(s)).unwrap();
         }
+        crate::host::store(&d.join("5.lock"), &crate::host::Ident { pid: 5, start: 7, boot: String::new() }, false).unwrap();
         standby_sockets(&d);
         let left = |n: &str| d.join(n).exists();
         assert!(left("key.1.sock"), "its standby holds its lock");
+        assert!(left("4-1.claim") && left("5-7.claim"), "a claim marker of a standby still here stays");
+        assert!(!left("3-1.claim") && !left("5-6.claim"), "one unlocked goes once its lock is gone or names another process");
         assert!(!left("key.2.sock") && !left("key.3.sock"), "lock free or gone");
         assert!(left("key.x.sock") && left("2.lock"));
         std::fs::remove_dir_all(d).unwrap();

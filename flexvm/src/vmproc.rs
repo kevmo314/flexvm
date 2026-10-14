@@ -244,6 +244,7 @@ impl Proc {
     /// is set apart (`start_limit`), so a migration's arrival sets it after
     /// the VM runs, outside the downtime.
     pub fn adopt(&self, vm: Arc<Vm>) {
+        let _early = self.early.lock().unwrap();
         self.charged.store(0, Ordering::SeqCst);
         let _ = self.vm.set(vm);
     }
@@ -727,7 +728,8 @@ impl Proc {
             });
         }
         // Before the main command starts: a Ctrl-Z taken during startup pauses the VM first.
-        for sig in std::mem::take(&mut *self.early.lock().unwrap()) {
+        let early = std::mem::take(&mut *self.early.lock().unwrap());
+        for sig in early {
             self.signal(sig);
         }
         if self.cmd.lock().unwrap().is_some() {
@@ -739,12 +741,14 @@ impl Proc {
     }
 
     fn signal(&self, sig: i32) {
+        let mut early = self.early.lock().unwrap();
         let Some(vm) = self.vm.get() else {
             if sig != libc::SIGHUP {
-                self.early.lock().unwrap().push(sig);
+                early.push(sig);
             }
             return;
         };
+        drop(early);
         let res = match sig {
             libc::SIGTSTP => self.op_within().and_then(|_op| {
                 let res = vm.pause();
@@ -1567,7 +1571,7 @@ fn stop_standby(host: &Host, avail: u64, reserve: u64) -> bool {
     if crate::host::flock(&lock, libc::LOCK_EX | libc::LOCK_NB).is_err() {
         return false;
     }
-    let standby: Vec<_> = crate::standby::templates(host).iter().flat_map(|t| crate::standby::live(host, t)).collect();
+    let standby: Vec<_> = crate::standby::templates(host).iter().flat_map(|t| crate::standby::stoppable(host, t)).collect();
     standby.iter().for_each(crate::standby::stop);
     if standby.is_empty() {
         return false;
@@ -1721,6 +1725,17 @@ mod tests {
             assert!(!pressure.exists() && !active.exists());
             assert!(child.try_wait().unwrap().is_none(), "a standby was stopped");
         }
+        // Mid-claim (`PID-START.claim` locked): not counted as stopped, so eviction starts.
+        let id = Ident::of(child.id()).unwrap();
+        let claim = std::fs::File::create(d.join(format!("{}-{}.claim", id.pid, id.start))).unwrap();
+        assert_eq!(unsafe { libc::flock(claim.as_raw_fd(), libc::LOCK_EX) }, 0);
+        relieve(&host, Some(0), false);
+        assert!(!pressure.exists() && active.exists());
+        assert!(child.try_wait().unwrap().is_none(), "a claiming standby was stopped");
+        std::fs::remove_file(&active).unwrap();
+        // A claim rolled back makes the standby stoppable again.
+        assert_eq!(unsafe { libc::flock(claim.as_raw_fd(), libc::LOCK_UN) }, 0);
+        drop(claim);
         relieve(&host, Some(0), false);
         use std::os::unix::process::ExitStatusExt;
         let stopped = crate::util::retry(Duration::from_secs(10), || Ok(child.try_wait()?.ok_or("running")?));
