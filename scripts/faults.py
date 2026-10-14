@@ -209,7 +209,7 @@ FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_be
           "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "resume_kill",
           "prepare_fail", "short_incoming", "slow_preload", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
           "started_fsync", "started_unmark", "start_stall", "incoming_stall", "claim_stall", "handoff_stall", "ckpt_wp_race",
-          "fetch_tail_enomem", "fetch_enomem_stuck", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo", "release_stall", "release_late", "no_plug")
+          "fetch_tail_enomem", "fetch_enomem_stuck", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo", "release_stall", "release_late", "no_plug", "pause_lost")
 
 
 def disarm():
@@ -1745,6 +1745,24 @@ def pause_resume():
     cleanup(n)
 
 
+def pause_lost():
+    """A pause whose answer is lost (it landed all the same): the VM process asks Firecracker which state it is in and
+    records it, so a SIGCONT resumes it, instead of believing it runs while it sits paused for good."""
+    n = "ft-pause-lost"
+    m = setup(n)
+    sock = api_sock(A, n)
+    fault(A, "pause_lost", 30000)
+    try:
+        check("pause lost: SIGTSTP still records the pause", pause(A, n), vms(A)[n])
+        check("pause lost: Firecracker is paused", fc_api(sock, "GET", "/")["state"] == "Paused", fc_api(sock, "GET", "/"))
+    finally:
+        fault(A, "pause_lost", 0)
+    signal_vm(A, n, signal.SIGCONT)
+    check("pause lost: SIGCONT resumes it", wait_for(lambda: vms(A)[n]["state"] == "running", 10), vms(A)[n])
+    check("pause lost: running and intact", fc_api(sock, "GET", "/")["state"] == "Running" and md5(A, n) == m, fc_api(sock, "GET", "/"))
+    cleanup(n)
+
+
 def signals():
     """SIGTERM on a migration source waits for the release (no suspend);
     SIGINT destroys; a suspend is not undone by the SIGCONT systemd sends
@@ -2364,18 +2382,20 @@ def unplug_collapsed():
     # the unplug gave back.
     sock = api_sock(B, n)
     held = fc_api(sock, "PATCH", "/balloon/reporting/hold")
-    check("huge unplug: free page reports held", held is None, held)
-    huge0, empty0, _ = guest_chunks(B, n)
-    discards0 = control(B, n, {"op": "debug", "what": "status"})["result"]["discards"]
-    t = time.time()
-    ok(hotplug(B, n, plugged + 1024))
-    # The guest may not manage to empty every block; a shrink it cannot finish settles at what is plugged.
-    hp = lambda: (vms(B)[n]["requested_mib"], vms(B)[n]["plugged_mib"])
-    done = wait_for(lambda: hp()[0] == hp()[1] < plugged + 1536, 60)
-    took = time.time() - t
-    st = control(B, n, {"op": "debug", "what": "status"})["result"]
-    huge1, empty1, _ = guest_chunks(B, n)
-    released = fc_api(sock, "PATCH", "/balloon/reporting/release")
+    try:
+        check("huge unplug: free page reports held", held is None, held)
+        huge0, empty0, _ = guest_chunks(B, n)
+        discards0 = control(B, n, {"op": "debug", "what": "status"})["result"]["discards"]
+        t = time.time()
+        ok(hotplug(B, n, plugged + 1024))
+        # The guest may not manage to empty every block; a shrink it cannot finish settles at what is plugged.
+        hp = lambda: (vms(B)[n]["requested_mib"], vms(B)[n]["plugged_mib"])
+        done = wait_for(lambda: hp()[0] == hp()[1] < plugged + 1536, 60)
+        took = time.time() - t
+        st = control(B, n, {"op": "debug", "what": "status"})["result"]
+        huge1, empty1, _ = guest_chunks(B, n)
+    finally:
+        released = fc_api(sock, "PATCH", "/balloon/reporting/release")
     rss1 = settle_rss(B, n)
     unplugged = empty1 - empty0
     freed = huge0 & unplugged
@@ -4886,7 +4906,7 @@ SCENARIOS = dict(
     quiet_source=quiet_source, exec_race=exec_race, guest_calls=guest_calls, guest_hang=guest_hang,
     source_killed=source_killed, target_killed=target_killed, abort_superseded=abort_superseded, gen_zero=gen_zero,
     checkpoint_restore=checkpoint_restore, checkpoint_fork=checkpoint_fork, checkpoint_corrupt=checkpoint_corrupt,
-    checkpoint_crash=checkpoint_crash, pause_resume=pause_resume, signals=signals, suspend_resume=suspend_resume,
+    checkpoint_crash=checkpoint_crash, pause_resume=pause_resume, signals=signals, pause_lost=pause_lost, suspend_resume=suspend_resume,
     suspend_gen=suspend_gen, checkpoint_hotplug=checkpoint_hotplug, checkpoint_untrusted_dir=checkpoint_untrusted_dir,
     resume_failures=resume_failures, held_restore_frozen=held_restore_frozen, cow_exact=cow_exact, cow_collapsed=skippable(cow_collapsed), unplug_collapsed=skippable(unplug_collapsed), cow_abort=cow_abort,
     cow_crash=cow_crash, cow_reports_held=cow_reports_held, ckpt_incremental=ckpt_incremental,

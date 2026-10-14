@@ -346,16 +346,33 @@ impl Vm {
         if pausing {
             self.pager.hold_collapse(true);
         }
-        let res = self.fc(|fc| if pausing { fc.pause() } else { fc.resume() });
-        // Collapsing goes on after a confirmed resume, or a pause Firecracker refused (a timeout or a lost answer may
-        // still have paused it: held until a resume, or the pager's end).
-        let refused = |e: &crate::util::Error| rejected(e, "/vm");
-        if (!pausing && res.is_ok()) || (pausing && res.as_ref().is_err_and(refused)) {
+        let mut res = self.fc(|fc| if pausing { fc.pause() } else { fc.resume() }).map(drop);
+        // Test fault `pause_lost`: the pause landed, but its answer is lost.
+        if pausing && res.is_ok() && crate::host::fault("pause_lost") {
+            res = Err("injected fault: the pause's answer was lost".into());
+        }
+        // A timeout or a lost answer may still have switched it: Firecracker says which state it is in. Only if that
+        // cannot be had either is it left as it was (collapsing held, after a pause: until a resume or the pager's end).
+        let now = match &res {
+            Ok(()) => Some(to),
+            Err(e) if rejected(e, "/vm") => Some(from),
+            Err(_) => self.fc(|fc| fc.get("/")).ok().and_then(|info| match info["state"].as_str() {
+                Some("Paused") => Some(State::Paused),
+                Some("Running") => Some(State::Running),
+                _ => None,
+            }),
+        };
+        if now == Some(State::Running) {
             self.pager.hold_collapse(false);
         }
-        res?;
-        *self.state.lock().unwrap() = to;
-        Ok(())
+        if now == Some(to) {
+            if let Err(e) = &res {
+                eprintln!("vm {}: {e}, but firecracker is {}", self.name, to.name());
+            }
+            *self.state.lock().unwrap() = to;
+            return Ok(());
+        }
+        res
     }
 
     fn running_here(&self) -> Result<()> {
