@@ -1,7 +1,7 @@
 //! Standby VMs: `flexvm run --standby` processes holding a restored, settled,
 //! paused VM so `run` is a resume plus `START`. Each listens on
 //! `RUN/standby/TEMPLATE/KEY.PID.sock` (KEY: template generation) and holds
-//! `PID.lock` while alive. Protocol: `run` sends `claim {name, ip, cmd}` with
+//! `PID.lock` while available. Protocol: `run` sends `claim {name, ip, cmd}` with
 //! its stdout/stderr; once the standby replies `claiming`, the claim may have
 //! started the VM and is never retried elsewhere. `{"exit": code}` follows.
 
@@ -66,8 +66,8 @@ pub fn live(host: &Host, template: &str) -> Vec<Ident> {
 }
 
 /// SIGUSR1, not SIGINT: a stop can reach the process after a claim started
-/// (it lists it until the claim is done, and its signal thread may take it
-/// late), and the VM it became must not take it for a kill.
+/// (a listing may race the claim, and its signal thread may take it late),
+/// and the VM it became must not take it for a kill.
 pub fn stop(id: &Ident) {
     if let Ok(Some(fd)) = PidFd::open(id) {
         let _ = fd.signal(libc::SIGUSR1);
@@ -214,7 +214,7 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
     crate::host::flock(&lock, libc::LOCK_EX)?;
     lock.write_all_at(&serde_json::to_vec(&me)?, 0)?;
     std::fs::rename(&tmp, &lock_path)?;
-    p.files.lock().unwrap().extend([sock.clone(), lock_path]);
+    p.files.lock().unwrap().extend([sock.clone(), lock_path.clone(), tmp.clone()]);
     let ready = load(p.spawner.take(None)?, tpl.clone())?;
     // Taken now, so a claim does not scan memory or ask Firecracker.
     *p.sizes.lock().unwrap() = Some(ready.mem_sizes());
@@ -253,7 +253,9 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
             p.finish(op, End::NotStarted, 0, None);
         }
         // From here the claim may take effect: the claimer must not retry elsewhere.
+        std::fs::rename(&lock_path, &tmp)?;
         if send_json(&mut &c, &json!({"claiming": true})).is_err() {
+            std::fs::rename(&tmp, &lock_path)?;
             continue;
         }
         // Before it is published: eviction leaves a CMD VM alone.
@@ -287,6 +289,7 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
                 if p.standby.lock().unwrap().is_none() {
                     p.finish(op, End::NotStarted, crate::vmproc::FAILED, None);
                 }
+                std::fs::rename(&tmp, &lock_path)?;
             }
         }
     }

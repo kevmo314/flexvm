@@ -244,6 +244,7 @@ impl Proc {
     /// is set apart (`start_limit`), so a migration's arrival sets it after
     /// the VM runs, outside the downtime.
     pub fn adopt(&self, vm: Arc<Vm>) {
+        let _early = self.early.lock().unwrap();
         self.charged.store(0, Ordering::SeqCst);
         let _ = self.vm.set(vm);
     }
@@ -727,7 +728,8 @@ impl Proc {
             });
         }
         // Before the main command starts: a Ctrl-Z taken during startup pauses the VM first.
-        for sig in std::mem::take(&mut *self.early.lock().unwrap()) {
+        let early = std::mem::take(&mut *self.early.lock().unwrap());
+        for sig in early {
             self.signal(sig);
         }
         if self.cmd.lock().unwrap().is_some() {
@@ -739,12 +741,14 @@ impl Proc {
     }
 
     fn signal(&self, sig: i32) {
+        let mut early = self.early.lock().unwrap();
         let Some(vm) = self.vm.get() else {
             if sig != libc::SIGHUP {
-                self.early.lock().unwrap().push(sig);
+                early.push(sig);
             }
             return;
         };
+        drop(early);
         let res = match sig {
             libc::SIGTSTP => self.op_within().and_then(|_op| {
                 let res = vm.pause();
@@ -1721,6 +1725,16 @@ mod tests {
             assert!(!pressure.exists() && !active.exists());
             assert!(child.try_wait().unwrap().is_none(), "a standby was stopped");
         }
+        // Mid-claim: still locked, but hidden from standby relief.
+        let path = d.join(format!("{}.lock", child.id()));
+        let claiming = d.join(format!(".{}.lock", child.id()));
+        std::fs::rename(&path, &claiming).unwrap();
+        relieve(&host, Some(0), false);
+        assert!(!pressure.exists() && active.exists());
+        assert!(child.try_wait().unwrap().is_none(), "a claiming standby was stopped");
+        std::fs::remove_file(&active).unwrap();
+        // A claim refused before resume makes the standby available again.
+        std::fs::rename(&claiming, &path).unwrap();
         relieve(&host, Some(0), false);
         use std::os::unix::process::ExitStatusExt;
         let stopped = crate::util::retry(Duration::from_secs(10), || Ok(child.try_wait()?.ok_or("running")?));
