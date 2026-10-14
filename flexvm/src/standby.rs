@@ -65,6 +65,14 @@ pub fn live(host: &Host, template: &str) -> Vec<Ident> {
     ids
 }
 
+/// Standbys mid-claim (`.PID.lock`, held): refill counts them, as before the
+/// claim (one that ran is replaced once it did, one refused is available again).
+fn claiming(host: &Host, template: &str) -> usize {
+    let held = |p: &std::path::Path| File::open(p).is_ok_and(|f| unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0);
+    let entries = std::fs::read_dir(dir(host, template)).into_iter().flatten().flatten();
+    entries.filter(|e| e.file_name().to_str().is_some_and(|n| n.starts_with('.') && n.ends_with(".lock")) && held(&e.path())).count()
+}
+
 /// SIGUSR1, not SIGINT: a stop can reach the process after a claim started
 /// (a listing may race the claim, and its signal thread may take it late),
 /// and the VM it became must not take it for a kill.
@@ -147,7 +155,7 @@ fn refill_by(host: &Host, template: &str, wait: bool) -> Result<usize> {
         }
         return Err(e.into());
     }
-    let want = target(host, template).saturating_sub(live(host, template).len());
+    let want = target(host, template).saturating_sub(live(host, template).len() + claiming(host, template));
     if want == 0 {
         return Ok(0);
     }
