@@ -173,8 +173,8 @@ fn os(code: i32) -> io::Error {
 #[derive(Default)]
 pub struct Pages {
     states: Vec<AtomicU8>,
-    /// One bit per `CHUNK` pages: set once any of them may have left BASE,
-    /// so scans skip untouched stretches without reading (and faulting in)
+    /// One bit per `CHUNK` pages: set once any of them may have left BASE
+    /// or been marked dirty, so scans skip untouched stretches without reading (and faulting in)
     /// their part of `states`.
     touched: Vec<AtomicU64>,
     events: RwLock<()>,
@@ -275,6 +275,7 @@ impl Pages {
         let _ = self.read_cv.wait_timeout_while(guard, Duration::from_millis(1), |_| self.read_gen.load(Ordering::SeqCst) == seen);
     }
 
+    /// Marks `page` dirty, and its chunk touched first, which `dirty_bits` relies on.
     pub fn mark_dirty(&self, page: usize) {
         if let Some(w) = self.dirty.get(page / 64) {
             self.touch(page);
@@ -284,16 +285,11 @@ impl Pages {
 
     /// The dirty bits, cleared with `take`.
     fn dirty_bits(&self, take: bool) -> Vec<u64> {
+        // Only chunks marked touched (see `mark_dirty`) can have any set.
         let mut bits = vec![0; self.dirty.len()];
-        for (chunk, dst) in bits.chunks_mut(CHUNK / 64).enumerate() {
-            if self.touched(chunk * CHUNK) {
-                for (b, w) in dst.iter_mut().zip(&self.dirty[chunk * (CHUNK / 64)..]) {
-                    *b = if take {
-                        w.swap(0, Ordering::SeqCst)
-                    } else {
-                        w.load(Ordering::SeqCst)
-                    };
-                }
+        for (chunk, dst) in bits.chunks_mut(CHUNK / 64).enumerate().filter(|&(c, _)| self.touched(c * CHUNK)) {
+            for (b, w) in dst.iter_mut().zip(&self.dirty[chunk * (CHUNK / 64)..]) {
+                *b = if take { w.swap(0, Ordering::SeqCst) } else { w.load(Ordering::SeqCst) };
             }
         }
         bits
@@ -512,18 +508,6 @@ impl Pages {
         }
         self.settled();
         (resolved, Ok(()))
-    }
-
-    fn install_preload(
-        &self,
-        first: usize,
-        n: usize,
-        data: &[u8],
-        mut populate: impl FnMut(usize, usize, &[u8]) -> io::Result<usize>,
-    ) -> (usize, io::Result<()>) {
-        self.install(first, n, REMOTE, None, |p, c| {
-            populate(p, c, &data[(p - first) * PAGE_SIZE..(p - first + c) * PAGE_SIZE])
-        })
     }
 
     /// Fetches claimed REMOTE pages `first..first + n` with `fetch` (into
@@ -1053,8 +1037,8 @@ impl Pager {
                         let n = pages.claim(page, end - index, REMOTE, |_| true);
                         if n > 0 {
                             let gen = pages.read_gen.load(Ordering::SeqCst);
-                            let src = &data[index * PAGE_SIZE..(index + n) * PAGE_SIZE];
-                            let (resolved, res) = pages.install_preload(page, n, src, |p, c, src| self.populate(p, c, Some(src)));
+                            let src = |p: usize, c: usize| &data[(index + p - page) * PAGE_SIZE..(index + p - page + c) * PAGE_SIZE];
+                            let (resolved, res) = pages.install(page, n, REMOTE, None, |p, c| self.populate(p, c, Some(src(p, c))));
                             self.pulled(resolved);
                             installed += resolved;
                             match res {
@@ -1384,15 +1368,14 @@ impl Pager {
         Ok(())
     }
 
-    /// Captures preload pages in contiguous runs, batched up to Linux's iovec limit.
+    /// Reads the pages of `list` (one page of `data` each) out of the paused
+    /// Firecracker, a run of consecutive pages at a time.
     pub fn read_preload(&self, list: &[u64], data: &mut [u8]) -> Result<()> {
         let pid = self.pid.load(Ordering::SeqCst) as libc::pid_t;
         capture_preload(self.mappings(), list, data, |local, remote| {
-            let n = unsafe { libc::process_vm_readv(pid, local.as_ptr(), local.len() as _, remote.as_ptr(), remote.len() as _, 0) };
-            if n < 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(n as usize)
+            match unsafe { libc::process_vm_readv(pid, local.as_ptr(), local.len() as _, remote.as_ptr(), remote.len() as _, 0) } {
+                n if n < 0 => Err(io::Error::last_os_error()),
+                n => Ok(n as usize),
             }
         })?;
         if self.exited() {
@@ -2511,61 +2494,45 @@ pub fn remote_among(runs: &Runs, wanted: impl IntoIterator<Item = u64>) -> Vec<u
     wanted.into_iter().filter(is_remote).collect()
 }
 
-/// Indices and lengths of contiguous listed runs within a region and virtio-mem slot.
+/// Runs of consecutive pages in `list`, as `(index, count)`, each within one
+/// region's 2 MiB chunk: a uffd copy (or a read) never crosses a VMA end (see
+/// `Pager::fault`). A page outside every region is a run of its own.
 fn page_runs<'a>(list: &'a [u64], mappings: &'a [Mapping]) -> impl Iterator<Item = (usize, usize)> + 'a {
     let mut i = 0;
     std::iter::from_fn(move || {
         let first = *list.get(i)?;
-        let end = mappings
-            .iter()
-            .find(|m| (m.span().0 as u64..m.span().1 as u64).contains(&first))
-            .map_or(first + 1, |m| {
-                let start = m.span().0 as u64;
-                (m.span().1 as u64).min(first + ARM_CHUNK as u64 - (first - start) % ARM_CHUNK as u64)
-            });
-        let n = list[i..]
-            .iter()
-            .enumerate()
-            .take_while(|&(j, &p)| p == first + j as u64 && p < end)
-            .count();
-        let index = i;
+        let end = match mappings.iter().map(Mapping::span).find(|&(a, b)| (a..b).contains(&(first as usize))) {
+            Some((a, b)) => b.min(first as usize + ARM_CHUNK - (first as usize - a) % ARM_CHUNK) as u64,
+            None => first + 1,
+        };
+        let n = list[i..].iter().zip(first..end).take_while(|(&p, q)| p == *q).count();
         i += n;
-        Some((index, n))
+        Some((i - n, n))
     })
 }
 
-fn capture_preload(
-    mappings: &[Mapping],
-    list: &[u64],
-    data: &mut [u8],
-    mut read: impl FnMut(&[libc::iovec], &[libc::iovec]) -> io::Result<usize>,
-) -> Result<()> {
+/// Reads the pages of `list` into `data` (a page each), a run per iovec and
+/// up to IOV_MAX of them per `read(local, remote)`, which returns the bytes read.
+fn capture_preload(mappings: &[Mapping], list: &[u64], data: &mut [u8], mut read: impl FnMut(&[libc::iovec], &[libc::iovec]) -> io::Result<usize>) -> Result<()> {
     if data.len() != list.len() * PAGE_SIZE {
-        bail!("preload length mismatch");
+        bail!("preload of {} pages has {} bytes", list.len(), data.len());
     }
     let mut runs = page_runs(list, mappings).peekable();
     while runs.peek().is_some() {
-        let mut local = Vec::new();
-        let mut remote = Vec::new();
-        let mut bytes = 0;
+        let (mut local, mut remote, mut bytes) = (Vec::new(), Vec::new(), 0);
         for (index, n) in runs.by_ref().take(1024) {
             let offset = list[index] * PAGE_SIZE as u64;
             let Some(m) = mappings.iter().find(|m| offset >= m.offset && offset < m.offset + m.size as u64) else {
                 bail!("offset {offset:#x} outside guest memory");
             };
             let len = n * PAGE_SIZE;
-            local.push(libc::iovec {
-                iov_base: unsafe { data.as_mut_ptr().add(index * PAGE_SIZE).cast() },
-                iov_len: len,
-            });
-            remote.push(libc::iovec {
-                iov_base: (m.base_host_virt_addr + offset - m.offset) as *mut _,
-                iov_len: len,
-            });
+            local.push(libc::iovec { iov_base: data[index * PAGE_SIZE..].as_mut_ptr().cast(), iov_len: len });
+            remote.push(libc::iovec { iov_base: (m.base_host_virt_addr + offset - m.offset) as *mut _, iov_len: len });
             bytes += len;
         }
-        if read(&local, &remote)? != bytes {
-            bail!("short process_vm_readv for preload");
+        let read = read(&local, &remote)?;
+        if read != bytes {
+            bail!("read {read} of {bytes} bytes of preloaded pages");
         }
     }
     Ok(())
@@ -2686,15 +2653,13 @@ mod tests {
     }
 
     #[test]
-    fn preload_install_uses_runs_and_offsets_after_partial_progress() {
+    fn install_runs_past_partial_copies_eexist_and_discards() {
         let p = pages(&[REMOTE; 6]);
         assert_eq!(p.claim(0, 6, REMOTE, |_| true), 6);
         discard(&p, 3);
-        let data: Vec<u8> = (0..6).flat_map(|i| vec![i; PAGE_SIZE]).collect();
         let mut calls = Vec::new();
-        let (resolved, res) = p.install_preload(0, 6, &data, |first, n, src| {
+        let (resolved, res) = p.install(0, 6, REMOTE, None, |first, n| {
             calls.push((first, n));
-            assert_eq!(src, &data[first * PAGE_SIZE..(first + n) * PAGE_SIZE]);
             if first == 0 {
                 Ok(1)
             } else if first == 1 {
