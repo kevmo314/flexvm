@@ -1286,7 +1286,7 @@ pub fn connect(host: &Host, name: &str, req: &Value, fds: &[i32]) -> Result<Unix
         } else if host.is_suspended(name) {
             format!("vm {name:?} is suspended; use flexvm resume {name} first")
         } else {
-            format!("no vm named {name:?}: {e}")
+            format!("no vm named {name:?}")
         }
     })?;
     let mut line = serde_json::to_vec(req)?;
