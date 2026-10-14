@@ -114,13 +114,6 @@ impl Pager {
     /// Fetches and installs the runs faults claimed (`lane`), so that the event thread never waits for the network or
     /// disk. The faulting thread is woken by the copy, the event thread by the pages settling.
     pub(super) fn fetch_faults(&self, lane: &Lane, fetch: &mut Fetch) {
-        struct Detach<'a>(&'a Lane);
-        impl Drop for Detach<'_> {
-            fn drop(&mut self) {
-                self.0.detach();
-            }
-        }
-        let _detach = Detach(lane);
         let mut buf = vec![0u8; REMOTE_FAULT_RUN * PAGE_SIZE];
         let pages = self.pages();
         // Connects ahead of the first fault (nothing to read).
@@ -349,7 +342,7 @@ impl Lane {
     }
 
     /// The fetcher's connection is gone: requests go out again on the next.
-    fn detach(&self) {
+    pub(super) fn detach(&self) {
         let mut q = self.q.lock().unwrap();
         q.conn = None;
         q.sent = 0;
