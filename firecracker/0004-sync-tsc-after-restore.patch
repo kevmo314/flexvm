@@ -1,0 +1,50 @@
+--- a/src/vmm/src/arch/x86_64/vcpu.rs
++++ b/src/vmm/src/arch/x86_64/vcpu.rs
+@@ -748,6 +748,30 @@
+         self.kvmclock_ctrl();
+         Ok(())
+     }
++
++    /// Sets the TSC, and the TSC deadline that counts in it, from `state` again. Called for
++    /// every vCPU right after one another once all are restored: KVM takes TSC writes less
++    /// than a second apart as meant to be in sync, and restoring one vCPU can take much longer
++    /// (its MSRs map guest pages, which may still have to be paged in), which left the vCPUs'
++    /// TSCs, the guest's clocksource, apart by as long.
++    pub fn restore_tsc(&self, state: &VcpuState) -> Result<(), KvmVcpuError> {
++        let mut entries: Vec<_> = state
++            .saved_msrs
++            .iter()
++            .flat_map(|msrs| msrs.as_slice().iter().copied())
++            .filter(|msr| msr.index == MSR_IA32_TSC || msr.index == MSR_IA32_TSC_DEADLINE)
++            .collect();
++        entries.sort_by_key(|msr| msr.index != MSR_IA32_TSC);
++        if entries.is_empty() {
++            return Ok(());
++        }
++        let msrs = Msrs::from_entries(&entries).map_err(|_| KvmVcpuError::VcpuSetMsrsIncomplete)?;
++        let nmsrs = self.fd.set_msrs(&msrs).map_err(KvmVcpuError::VcpuSetMsrs)?;
++        if nmsrs < entries.len() {
++            return Err(KvmVcpuError::VcpuSetMsrsIncomplete);
++        }
++        Ok(())
++    }
+ }
+ 
+ impl Peripherals {
+--- a/src/vmm/src/builder.rs
++++ b/src/vmm/src/builder.rs
+@@ -511,6 +511,14 @@
+             .map_err(VcpuError::VcpuResponse)
+             .map_err(BuildMicrovmFromSnapshotError::RestoreVcpus)?;
+     }
++    // The TSCs once more, back to back: KVM syncs them only if written within a second.
++    #[cfg(target_arch = "x86_64")]
++    for (vcpu, state) in vcpus.iter().zip(microvm_state.vcpu_states.iter()) {
++        vcpu.kvm_vcpu
++            .restore_tsc(state)
++            .map_err(VcpuError::VcpuResponse)
++            .map_err(BuildMicrovmFromSnapshotError::RestoreVcpus)?;
++    }
+ 
+     #[cfg(target_arch = "aarch64")]
+     {

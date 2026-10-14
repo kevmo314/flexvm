@@ -754,6 +754,10 @@ def guest_calls():
     check("guest calls: every exec finished", results["ok"] > 0 and not results["failed"], results)
     check("guest calls: md5 intact while paging in", got == m, got)
     check("guest calls: only on B", where(n) == {B: "running"}, where(n))
+    # Its vCPUs' TSCs (the guest's clocksource) in sync, however long restoring one took while
+    # the source served no pages; apart, the guest clock jumps by the difference after the step.
+    skew = tsc_skew(B, n)
+    check("guest calls: the vCPUs' TSCs agree", skew is not None and abs(skew) < 0.05, skew)
     err = guest_clock_error(B, n)
     check("guest calls: target stepped the guest clock", err is not None and abs(err) < 0.5, err)
     # A clock step the guest carried out but whose answer was lost goes again.
@@ -1284,6 +1288,37 @@ def marker(host, name):
 def marker_id(host, name):
     code, out = sh(host, name, 'p=$(cat /tmp/marker.pid); echo "$p $(cut -d" " -f2,22 /proc/$p/stat)"')
     return out if code == 0 else None
+
+
+# Reads the TSC on vCPU 0, 1, 0 (rdtsc, run from an executable page): how far vCPU 1's TSC is
+# from vCPU 0's, in seconds.
+TSC_SKEW = r"""
+import ctypes, mmap, os
+buf = mmap.mmap(-1, 4096, prot=mmap.PROT_READ | mmap.PROT_WRITE | mmap.PROT_EXEC)
+buf.write(bytes([0x0f, 0x31, 0x48, 0xc1, 0xe2, 0x20, 0x48, 0x09, 0xd0, 0xc3]))
+rdtsc = ctypes.CFUNCTYPE(ctypes.c_uint64)(ctypes.addressof(ctypes.c_char.from_buffer(buf)))
+khz = int(open("/sys/devices/system/cpu/cpu0/tsc_freq_khz").read()) if os.path.exists("/sys/devices/system/cpu/cpu0/tsc_freq_khz") else None
+mhz = khz / 1e3 if khz else float(next(l.split(":")[1] for l in open("/proc/cpuinfo") if l.startswith("cpu MHz")))
+best = None
+for _ in range(5):
+    t = []
+    for cpu in (0, 1, 0):
+        os.sched_setaffinity(0, {cpu})
+        t.append(rdtsc())
+    skew = (t[1] - (t[0] + t[2]) / 2) / (mhz * 1e6)
+    if best is None or t[2] - t[0] < best[0]:
+        best = (t[2] - t[0], skew)
+print(best[1])
+"""
+
+
+def tsc_skew(host, name):
+    """vCPU 1's TSC minus vCPU 0's in the guest, in seconds (None if it cannot be read)."""
+    code, out = sh(host, name, f"python3 -c '{TSC_SKEW}'")
+    try:
+        return float(out.split()[-1]) if code == 0 else None
+    except (ValueError, IndexError):
+        return None
 
 
 def guest_clock_error(host, name):

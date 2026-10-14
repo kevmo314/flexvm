@@ -768,6 +768,16 @@ queued. Not saved in snapshots: a restored balloon is not held, and reports
 queued at the snapshot are processed at its first resume, which kicks
 every queue.
 
+`firecracker/0004-sync-tsc-after-restore.patch`: once every vCPU is restored,
+sets each one's TSC (and TSC deadline) from the snapshot again, back to back.
+KVM takes TSC writes less than a second apart as meant to be in sync and
+gives them one offset. Restoring a vCPU can take much longer than that: its
+MSRs map guest pages (kvmclock, steal time), which a migration target may
+still be paging in, from a source that is slow or down for a while. The
+vCPUs' TSCs then ended up apart by that long. The guest's clocksource is the
+TSC, so its clock jumped by that much after the step to host time (#136,
+`guest_calls`: +3.3 s after a 3 s page server outage).
+
 ## Measured (WSL2, Ryzen 9 3900X, nested KVM; before process-per-VM unless noted)
 
 | | |
