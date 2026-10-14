@@ -684,8 +684,8 @@ struct Pending {
     /// Its kind (`KINDS`), when known before it is resolved: it waited for
     /// another installer, or had its run fetched.
     kind: Option<usize>,
-    /// Waiting for an installer or queued REMOVE event to wake the event
-    /// thread; otherwise retried every millisecond.
+    /// Waiting for claimed pages to settle, which wakes the event thread;
+    /// otherwise retried every millisecond.
     parked: bool,
     /// When it first failed other than with EAGAIN.
     since: Option<Instant>,
@@ -1431,9 +1431,9 @@ impl Pager {
                 libc::pollfd { fd, events: libc::POLLIN, revents: 0 },
                 libc::pollfd { fd: wake, events: libc::POLLIN, revents: 0 },
             ];
-            // Installers and queued REMOVE events wake retries. Errors and
-            // checkpoint writer races without a wake event use a short retry;
-            // the longer timeout bounds missed wakeups.
+            // Faults waiting for another installer are woken by it; others
+            // (EAGAIN, errors) are retried every millisecond. The timeout
+            // also bounds a missed wakeup.
             let timeout = if pending.iter().all(|p| p.parked) { 100 } else { 1 };
             if unsafe { libc::poll(pfd.as_mut_ptr(), 2, timeout) } < 0 {
                 continue;
@@ -1503,7 +1503,7 @@ impl Pager {
                             pages.park(page, p.read);
                         }
                     }
-                    Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => p.parked = p.flags & UFFD_PAGEFAULT_FLAG_WP == 0,
+                    Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => p.parked = false,
                     // Firecracker unmapped guest memory (tearing down a failed load, or exiting).
                     Err(e) if page.is_some_and(|page| self.unmapped(&e, page, 1)) => return self.gone(),
                     Err(e) if fatal(&e) => return self.fail(e.to_string()),
