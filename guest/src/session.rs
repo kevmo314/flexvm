@@ -306,7 +306,7 @@ fn open<'a>(body: &[u8], conn: Option<File>, line: &'a str, sessions: &Sessions,
             thread::Builder::new()
                 .spawn(move || {
                     if let Ok(mut child) = rx.recv() {
-                        crate::pump(child.stdout.take(), child.stderr.take(), None, |kind, data| deliver(&pumped, kind, data));
+                        crate::pump(child.stdout.take(), child.stderr.take(), |kind, data| deliver(&pumped, kind, data));
                         pumped.0.lock().unwrap().exit = wait_pid(&statuses_, child.id() as i32, None);
                         pumped.1.notify_all();
                     }

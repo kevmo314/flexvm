@@ -178,31 +178,16 @@ fn wait_pid(statuses: &Statuses, pid: i32, deadline: Option<Instant>) -> Option<
     }
 }
 
-/// EOF on `stop` gives inherited pipes two seconds to drain before closing them.
-fn pump(stdout: Option<ChildStdout>, stderr: Option<ChildStderr>, mut stop: Option<File>, mut deliver: impl FnMut(u8, &[u8])) {
+fn pump(stdout: Option<ChildStdout>, stderr: Option<ChildStderr>, mut deliver: impl FnMut(u8, &[u8])) {
     let out = stdout.map(|s| (File::from(OwnedFd::from(s)), FRAME_STDOUT));
     let mut streams: Vec<(File, u8)> = out.into_iter().chain(stderr.map(|s| (File::from(OwnedFd::from(s)), FRAME_STDERR))).collect();
     let mut buf = [0; 16 * 1024];
-    let mut deadline = None;
     while !streams.is_empty() {
         let mut fds: Vec<_> = streams.iter().map(|(f, _)| libc::pollfd { fd: f.as_raw_fd(), events: libc::POLLIN, revents: 0 }).collect();
-        if let Some(stop) = &stop {
-            fds.push(libc::pollfd { fd: stop.as_raw_fd(), events: libc::POLLIN, revents: 0 });
-        }
-        let timeout = match deadline {
-            Some(d) if Instant::now() >= d => return,
-            Some(d) => d.saturating_duration_since(Instant::now()).as_millis().max(1) as i32,
-            None => -1,
-        };
-        match os(unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) }) {
+        match os(unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) }) {
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(_) => return,
-            Ok(0) => return,
             Ok(_) => {}
-        }
-        if stop.is_some() && fds.pop().unwrap().revents != 0 {
-            stop = None;
-            deadline = Some(Instant::now() + Duration::from_secs(2));
         }
         for i in (0..fds.len()).rev().filter(|&i| fds[i].revents != 0) {
             match streams[i].0.read(&mut buf) {
