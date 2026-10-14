@@ -367,7 +367,7 @@ impl Template {
             for (name, stamp) in cache.iter() {
                 meta.components.get_mut(name).unwrap().metadata = stamp.clone();
             }
-            let _ = crate::host::write_file(&self.fixed, "meta.json", &serde_json::to_vec_pretty(&meta)?, false);
+            crate::util::write_durably(&self.fixed.join("meta.json"), &serde_json::to_vec_pretty(&meta)?).inspect_err(|_| cache.clear())?;
         }
         Ok(())
     }
@@ -575,10 +575,18 @@ pub fn create(
 fn publish(paths: &Paths, name: &str, staged: &Path) -> Result<()> {
     let meta: Meta = serde_json::from_slice(&std::fs::read(staged.join("meta.json"))?)?;
     let gens = paths.templates.join(GENERATIONS);
-    std::fs::create_dir_all(&gens)?;
+    crate::util::create_dir_durably(&gens)?;
     let gen = gens.join(&meta.id);
     if !gen.exists() {
-        std::fs::rename(staged, &gen)?;
+        // Snapshot contents and the learned working set precede generation publication.
+        for entry in std::fs::read_dir(staged)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                File::open(entry.path())?.sync_all()?;
+            }
+        }
+        crate::util::sync_dir(staged)?;
+        crate::util::publish(staged, &gen, false)?;
     }
     let live = paths.templates.join(name);
     let tmp = paths.templates.join(format!(".{name}.link-{}", std::process::id()));
@@ -595,9 +603,11 @@ fn publish(paths: &Paths, name: &str, staged: &Path) -> Result<()> {
             Some(id) => gens.join(id),
             None => gens.join(format!("legacy-{name}-{}", std::process::id())),
         };
-        std::fs::rename(&live, &aside)?;
+        crate::util::publish(&live, &aside, false)?;
     }
-    std::fs::rename(&tmp, &live)?;
+    crate::util::sync_dir(&gen)?;
+    crate::util::sync_dir(&gens)?;
+    crate::util::publish(&tmp, &live, false)?;
     Ok(())
 }
 
@@ -691,7 +701,7 @@ fn build(
         image,
     };
     meta.identify(paths, &dir)?;
-    std::fs::write(dir.join("meta.json"), serde_json::to_vec_pretty(&meta)?)?;
+    crate::util::write_durably(&dir.join("meta.json"), &serde_json::to_vec_pretty(&meta)?)?;
     let _ = std::fs::remove_file(dir.join("wset"));
     let wset = record_working_set(paths, staging, tap, &sockets)?;
     let size = std::fs::metadata(dir.join("mem"))?.len();
@@ -968,6 +978,22 @@ mod tests {
         f.replace("rootfs", b"rootfs");
         assert!(Template::open(&f.paths, "").unwrap().verify(&f.paths, false).is_err());
         Template::open(&f.paths, "").unwrap().verify(&f.paths, true).unwrap();
+        Template::open(&f.paths, "").unwrap().verify(&f.paths, false).unwrap();
+    }
+
+    #[test]
+    fn metadata_rewrite_errors_are_reported_and_retried() {
+        let f = Fixture::new();
+        f.write_meta(&f.meta, &f.dir);
+        let tpl = Template::open(&f.paths, "").unwrap();
+        f.replace("rootfs", b"rootfs");
+        let path = f.dir.join("meta.json");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(tpl.verify(&f.paths, true).is_err());
+        assert!(tpl.verify(&f.paths, true).is_err());
+        std::fs::remove_dir(&path).unwrap();
+        tpl.verify(&f.paths, true).unwrap();
         Template::open(&f.paths, "").unwrap().verify(&f.paths, false).unwrap();
     }
 

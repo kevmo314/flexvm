@@ -749,13 +749,13 @@ fn read_gen(dir: &Path) -> Option<u64> {
 
 fn mark_durably(dir: &Path, name: &str) -> std::io::Result<()> {
     std::fs::File::create(dir.join(name))?.sync_all()?;
-    std::fs::File::open(dir)?.sync_all()
+    crate::util::sync_dir(dir)
 }
 
 fn unmark_durably(dir: &Path, name: &str) -> std::io::Result<()> {
     match std::fs::remove_file(dir.join(name)) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
-        _ => std::fs::File::open(dir)?.sync_all(),
+        _ => crate::util::sync_dir(dir),
     }
 }
 
@@ -772,7 +772,7 @@ fn remove_durably(dir: &Path) -> std::io::Result<()> {
     unmark_durably(dir, "manifest.json")?;
     std::fs::remove_dir_all(dir)?;
     match dir.parent() {
-        Some(parent) => std::fs::File::open(parent)?.sync_all(),
+        Some(parent) => crate::util::sync_dir(parent),
         None => Ok(()),
     }
 }

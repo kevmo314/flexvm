@@ -82,7 +82,7 @@ pub fn templates(host: &Host) -> Vec<String> {
 }
 
 pub fn set(host: &Host, template: &str, n: usize) -> Result<Value> {
-    crate::host::write_file(&host.state.join("standby"), template, n.to_string().as_bytes(), true)?;
+    crate::util::write_file(&host.state.join("standby"), template, n.to_string().as_bytes(), true)?;
     for id in live(host, template).iter().skip(n) {
         stop(id);
     }
@@ -179,7 +179,7 @@ pub fn save_load_set(host: &Host, tpl: &Template) {
     let set = tpl.load_set();
     if !set.is_empty() {
         if let Ok(b) = serde_json::to_vec(&set) {
-            let _ = crate::host::write_file(&host.run.join("standby"), &format!(".loadset-{}", tpl.meta.id), &b, false);
+            let _ = crate::util::write_file(&host.run.join("standby"), format!(".loadset-{}", tpl.meta.id), &b, false);
         }
     }
 }
@@ -434,7 +434,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("flexvm-refill-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let mut host = Host::open(&root.join("state"), &root.join("run")).unwrap();
-        crate::host::write_file(&host.state.join("standby"), "default", b"1", true).unwrap();
+        crate::util::write_file(&host.state.join("standby"), "default", b"1", true).unwrap();
         // No runtime pool after a reboot; the persistent target is discovered.
         assert_eq!(templates(&host), vec!["default"]);
         let d = dir(&host, "default");
