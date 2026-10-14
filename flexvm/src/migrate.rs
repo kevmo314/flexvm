@@ -99,9 +99,7 @@ impl Proc {
             wanted.dedup();
             let pages = crate::uffd::remote_among(&runs, wanted);
             let mut data = vec![0u8; pages.len() * crate::util::PAGE_SIZE];
-            for (page, buf) in pages.iter().zip(data.chunks_exact_mut(crate::util::PAGE_SIZE)) {
-                vm.pager.read_guest(page * crate::util::PAGE_SIZE as u64, buf)?;
-            }
+            vm.pager.read_preload(&pages, &mut data)?;
             t.mark("read_preload");
             Ok((runs, paused, state, pages, data))
         })();

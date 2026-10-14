@@ -277,19 +277,34 @@ impl Pages {
 
     pub fn mark_dirty(&self, page: usize) {
         if let Some(w) = self.dirty.get(page / 64) {
+            self.touch(page);
             w.fetch_or(1 << (page % 64), Ordering::SeqCst);
         }
     }
 
     /// The dirty bits, cleared with `take`.
     fn dirty_bits(&self, take: bool) -> Vec<u64> {
-        self.dirty.iter().map(|w| if take { w.swap(0, Ordering::SeqCst) } else { w.load(Ordering::SeqCst) }).collect()
+        let mut bits = vec![0; self.dirty.len()];
+        for (chunk, dst) in bits.chunks_mut(CHUNK / 64).enumerate() {
+            if self.touched(chunk * CHUNK) {
+                for (b, w) in dst.iter_mut().zip(&self.dirty[chunk * (CHUNK / 64)..]) {
+                    *b = if take {
+                        w.swap(0, Ordering::SeqCst)
+                    } else {
+                        w.load(Ordering::SeqCst)
+                    };
+                }
+            }
+        }
+        bits
     }
 
     /// Marks dirty again what `dirty_bits` took.
     fn restore_dirty(&self, bits: &[u64]) {
         for (w, &b) in self.dirty.iter().zip(bits) {
-            w.fetch_or(b, Ordering::SeqCst);
+            if b != 0 {
+                w.fetch_or(b, Ordering::SeqCst);
+            }
         }
     }
 
@@ -499,6 +514,18 @@ impl Pages {
         (resolved, Ok(()))
     }
 
+    fn install_preload(
+        &self,
+        first: usize,
+        n: usize,
+        data: &[u8],
+        mut populate: impl FnMut(usize, usize, &[u8]) -> io::Result<usize>,
+    ) -> (usize, io::Result<()>) {
+        self.install(first, n, REMOTE, None, |p, c| {
+            populate(p, c, &data[(p - first) * PAGE_SIZE..(p - first + c) * PAGE_SIZE])
+        })
+    }
+
     /// Fetches claimed REMOTE pages `first..first + n` with `fetch` (into
     /// `buf`) and installs them as they arrive with `populate(page, count,
     /// data)` (as `install` does): the first one as soon as it is in, as a
@@ -657,8 +684,8 @@ struct Pending {
     /// Its kind (`KINDS`), when known before it is resolved: it waited for
     /// another installer, or had its run fetched.
     kind: Option<usize>,
-    /// Waiting for claimed pages to settle, which wakes the event thread;
-    /// otherwise retried every millisecond.
+    /// Waiting for an installer or queued REMOVE event to wake the event
+    /// thread; otherwise retried every millisecond.
     parked: bool,
     /// When it first failed other than with EAGAIN.
     since: Option<Instant>,
@@ -901,7 +928,14 @@ impl Pager {
                 Ok((stream, _)) => break stream,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     waiting("connected")?;
-                    thread::sleep(Duration::from_millis(2));
+                    let mut pfd = libc::pollfd {
+                        fd: listener.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    if unsafe { libc::poll(&mut pfd, 1, 100) } < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                        return Err(io::Error::last_os_error().into());
+                    }
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -1011,29 +1045,38 @@ impl Pager {
         }
         let pages = self.pages();
         let mut installed = 0;
-        for (&page, src) in list.iter().zip(data.chunks_exact(PAGE_SIZE)) {
-            let page = page as usize;
-            if page >= pages.len() {
-                continue;
-            }
-            // Done once the page is no longer REMOTE nor being installed by
-            // someone else (whose fetch may fail and give it back).
-            loop {
+        for (index, n) in page_runs(list, self.mappings()) {
+            let (mut index, end) = (index, index + n);
+            while index < end {
+                let page = list[index] as usize;
                 if let Some(why) = self.failed() {
                     bail!("the pager failed: {why}");
                 }
-                match pages.get(page) {
-                    REMOTE if pages.claim(page, 1, REMOTE, |_| true) == 1 => {
-                        let (resolved, res) = pages.install(page, 1, REMOTE, None, |p, c| self.populate(p, c, Some(src)));
-                        self.pulled(resolved);
-                        installed += resolved;
-                        match res {
-                            Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => {}
-                            r => break r?,
+                // Wait for other installers too: they may fail and return REMOTE.
+                match pages.states.get(page).map(|s| s.load(Ordering::SeqCst)) {
+                    Some(REMOTE) => {
+                        let n = pages.claim(page, end - index, REMOTE, |_| true);
+                        if n > 0 {
+                            let gen = pages.read_gen.load(Ordering::SeqCst);
+                            let src = &data[index * PAGE_SIZE..(index + n) * PAGE_SIZE];
+                            let (resolved, res) = pages.install_preload(page, n, src, |p, c, src| self.populate(p, c, Some(src)));
+                            self.pulled(resolved);
+                            installed += resolved;
+                            match res {
+                                Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => pages.wait_events_read(gen),
+                                r => {
+                                    r?;
+                                    index += n;
+                                    continue;
+                                }
+                            }
                         }
                     }
-                    REMOTE | INFLIGHT | DISCARDED => {}
-                    _ => break,
+                    Some(INFLIGHT | DISCARDED) => {}
+                    _ => {
+                        index += 1;
+                        continue;
+                    }
                 }
                 if self.stop.load(Ordering::SeqCst) || Instant::now() >= deadline {
                     bail!("page {page} still being installed at the deadline");
@@ -1266,7 +1309,11 @@ impl Pager {
     pub fn census(&self) -> [usize; 6] {
         let mut c = [0usize; 6];
         let pages = self.pages();
-        (0..pages.len()).for_each(|i| c[pages.get(i) as usize] += 1);
+        c[BASE as usize] = pages.len();
+        for i in pages.not_base(0, pages.len()) {
+            c[BASE as usize] -= 1;
+            c[pages.get(i) as usize] += 1;
+        }
         c
     }
 
@@ -1342,6 +1389,23 @@ impl Pager {
         Ok(())
     }
 
+    /// Captures preload pages in contiguous runs, batched up to Linux's iovec limit.
+    pub fn read_preload(&self, list: &[u64], data: &mut [u8]) -> Result<()> {
+        let pid = self.pid.load(Ordering::SeqCst) as libc::pid_t;
+        capture_preload(self.mappings(), list, data, |local, remote| {
+            let n = unsafe { libc::process_vm_readv(pid, local.as_ptr(), local.len() as _, remote.as_ptr(), remote.len() as _, 0) };
+            if n < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(n as usize)
+            }
+        })?;
+        if self.exited() {
+            bail!("firecracker exited");
+        }
+        Ok(())
+    }
+
     /// Whether Firecracker has exited (or was never named): what was just
     /// read by its pid may then be another process's.
     fn exited(&self) -> bool {
@@ -1367,9 +1431,9 @@ impl Pager {
                 libc::pollfd { fd, events: libc::POLLIN, revents: 0 },
                 libc::pollfd { fd: wake, events: libc::POLLIN, revents: 0 },
             ];
-            // Faults waiting for another installer are woken by it; others
-            // (EAGAIN, errors) are retried every millisecond. The timeout
-            // also bounds a missed wakeup.
+            // Installers and queued REMOVE events wake retries. Errors and
+            // checkpoint writer races without a wake event use a short retry;
+            // the longer timeout bounds missed wakeups.
             let timeout = if pending.iter().all(|p| p.parked) { 100 } else { 1 };
             if unsafe { libc::poll(pfd.as_mut_ptr(), 2, timeout) } < 0 {
                 continue;
@@ -1439,7 +1503,7 @@ impl Pager {
                             pages.park(page, p.read);
                         }
                     }
-                    Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => p.parked = false,
+                    Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => p.parked = p.flags & UFFD_PAGEFAULT_FLAG_WP == 0,
                     // Firecracker unmapped guest memory (tearing down a failed load, or exiting).
                     Err(e) if page.is_some_and(|page| self.unmapped(&e, page, 1)) => return self.gone(),
                     Err(e) if fatal(&e) => return self.fail(e.to_string()),
@@ -1759,9 +1823,10 @@ impl Pager {
             let res = match taken.is_some() && self.fail_protect.swap(false, Ordering::SeqCst) {
                 true => Err(io::Error::other("injected fault")),
                 false => loop {
+                    let gen = self.pages().read_gen.load(Ordering::SeqCst);
                     match self.writeprotect(first, end - first, true) {
                         Err(e) if e.raw_os_error() == Some(libc::EAGAIN) && start.elapsed() < Duration::from_secs(2) => {
-                            thread::sleep(Duration::from_micros(200))
+                            self.pages().wait_events_read(gen)
                         }
                         r => break r,
                     }
@@ -2451,6 +2516,66 @@ pub fn remote_among(runs: &Runs, wanted: impl IntoIterator<Item = u64>) -> Vec<u
     wanted.into_iter().filter(is_remote).collect()
 }
 
+/// Indices and lengths of contiguous listed runs within a region and virtio-mem slot.
+fn page_runs<'a>(list: &'a [u64], mappings: &'a [Mapping]) -> impl Iterator<Item = (usize, usize)> + 'a {
+    let mut i = 0;
+    std::iter::from_fn(move || {
+        let first = *list.get(i)?;
+        let end = mappings
+            .iter()
+            .find(|m| (m.span().0 as u64..m.span().1 as u64).contains(&first))
+            .map_or(first + 1, |m| {
+                let start = m.span().0 as u64;
+                (m.span().1 as u64).min(first + ARM_CHUNK as u64 - (first - start) % ARM_CHUNK as u64)
+            });
+        let n = list[i..]
+            .iter()
+            .enumerate()
+            .take_while(|&(j, &p)| p == first + j as u64 && p < end)
+            .count();
+        let index = i;
+        i += n;
+        Some((index, n))
+    })
+}
+
+fn capture_preload(
+    mappings: &[Mapping],
+    list: &[u64],
+    data: &mut [u8],
+    mut read: impl FnMut(&[libc::iovec], &[libc::iovec]) -> io::Result<usize>,
+) -> Result<()> {
+    if data.len() != list.len() * PAGE_SIZE {
+        bail!("preload length mismatch");
+    }
+    let mut runs = page_runs(list, mappings).peekable();
+    while runs.peek().is_some() {
+        let mut local = Vec::new();
+        let mut remote = Vec::new();
+        let mut bytes = 0;
+        for (index, n) in runs.by_ref().take(1024) {
+            let offset = list[index] * PAGE_SIZE as u64;
+            let Some(m) = mappings.iter().find(|m| offset >= m.offset && offset < m.offset + m.size as u64) else {
+                bail!("offset {offset:#x} outside guest memory");
+            };
+            let len = n * PAGE_SIZE;
+            local.push(libc::iovec {
+                iov_base: unsafe { data.as_mut_ptr().add(index * PAGE_SIZE).cast() },
+                iov_len: len,
+            });
+            remote.push(libc::iovec {
+                iov_base: (m.base_host_virt_addr + offset - m.offset) as *mut _,
+                iov_len: len,
+            });
+            bytes += len;
+        }
+        if read(&local, &remote)? != bytes {
+            bail!("short process_vm_readv for preload");
+        }
+    }
+    Ok(())
+}
+
 const ALL: [(usize, usize); 1] = [(0, usize::MAX)];
 
 /// The maximal runs `[a, b)` within `[first, end)` of pages that pass `f`
@@ -2542,6 +2667,105 @@ mod tests {
 
     fn discard(p: &Pages, page: usize) -> bool {
         p.discard(&p.removing(), page)
+    }
+
+    #[test]
+    fn preload_runs_respect_gaps_regions_and_slots() {
+        let mappings = [
+            Mapping {
+                base_host_virt_addr: 0,
+                offset: 0,
+                size: 514 * PAGE_SIZE,
+            },
+            Mapping {
+                base_host_virt_addr: 0,
+                offset: (514 * PAGE_SIZE) as u64,
+                size: 4 * PAGE_SIZE,
+            },
+        ];
+        let list = [0, 1, 3, 510, 511, 512, 513, 514, 515];
+        assert_eq!(
+            page_runs(&list, &mappings).collect::<Vec<_>>(),
+            [(0, 2), (2, 1), (3, 2), (5, 2), (7, 2)]
+        );
+    }
+
+    #[test]
+    fn preload_install_uses_runs_and_offsets_after_partial_progress() {
+        let p = pages(&[REMOTE; 6]);
+        assert_eq!(p.claim(0, 6, REMOTE, |_| true), 6);
+        discard(&p, 3);
+        let data: Vec<u8> = (0..6).flat_map(|i| vec![i; PAGE_SIZE]).collect();
+        let mut calls = Vec::new();
+        let (resolved, res) = p.install_preload(0, 6, &data, |first, n, src| {
+            calls.push((first, n));
+            assert_eq!(src, &data[first * PAGE_SIZE..(first + n) * PAGE_SIZE]);
+            if first == 0 {
+                Ok(1)
+            } else if first == 1 {
+                Err(os(libc::EEXIST))
+            } else {
+                Ok(n)
+            }
+        });
+        res.unwrap();
+        assert_eq!(calls, [(0, 3), (1, 2), (2, 1), (4, 2)]);
+        assert_eq!(resolved, 6);
+        assert_eq!(states(&p), [PRESENT, PRESENT, PRESENT, ZERO, PRESENT, PRESENT]);
+    }
+
+    #[test]
+    fn preload_capture_reads_sparse_runs_across_regions_and_iovec_batches() {
+        let source: Vec<u8> = (0..2200).flat_map(|i| vec![(i % 251) as u8; PAGE_SIZE]).collect();
+        let mappings = [
+            Mapping {
+                base_host_virt_addr: source.as_ptr() as u64,
+                offset: 0,
+                size: 1100 * PAGE_SIZE,
+            },
+            Mapping {
+                base_host_virt_addr: unsafe { source.as_ptr().add(1100 * PAGE_SIZE) } as u64,
+                offset: (1100 * PAGE_SIZE) as u64,
+                size: 1100 * PAGE_SIZE,
+            },
+        ];
+        let list: Vec<u64> = (0..2200).filter(|p| p % 2 == 0 || (1097..1103).contains(p)).collect();
+        let mut data = vec![0; list.len() * PAGE_SIZE];
+        let mut batches = Vec::new();
+        capture_preload(&mappings, &list, &mut data, |local, remote| {
+            batches.push(local.len());
+            let mut bytes = 0;
+            for (dst, src) in local.iter().zip(remote) {
+                assert_eq!(dst.iov_len, src.iov_len);
+                unsafe { std::ptr::copy_nonoverlapping(src.iov_base.cast::<u8>(), dst.iov_base.cast::<u8>(), dst.iov_len) };
+                bytes += dst.iov_len;
+            }
+            Ok(bytes)
+        })
+        .unwrap();
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0], 1024);
+        for (&p, actual) in list.iter().zip(data.chunks_exact(PAGE_SIZE)) {
+            assert_eq!(actual, &source[p as usize * PAGE_SIZE..(p as usize + 1) * PAGE_SIZE]);
+        }
+        assert!(capture_preload(&mappings, &[2200], &mut data[..PAGE_SIZE], |_, _| panic!("invalid offset")).is_err());
+        assert!(capture_preload(&mappings, &[0], &mut [], |_, _| panic!("invalid size")).is_err());
+        assert!(capture_preload(&mappings, &[0], &mut data[..PAGE_SIZE], |_, _| Ok(PAGE_SIZE - 1)).is_err());
+        assert!(capture_preload(&mappings, &[0], &mut data[..PAGE_SIZE], |_, _| Err(os(libc::ESRCH))).is_err());
+    }
+
+    #[test]
+    fn dirty_scan_skips_untouched_chunks_and_keeps_dirty_base_pages() {
+        let p = Pages::new(CHUNK * 3 + 1);
+        p.mark_dirty(CHUNK + 7);
+        p.mark_dirty(CHUNK * 3);
+        let bits = p.dirty_bits(true);
+        assert_eq!(bits.iter().map(|b| b.count_ones()).sum::<u32>(), 2);
+        assert_eq!(p.dirty_bits(false).iter().sum::<u64>(), 0);
+        p.restore_dirty(&bits);
+        assert_eq!(p.dirty_bits(false), bits);
+        assert!(!p.touched(0));
+        assert!(!p.touched(CHUNK * 2));
     }
 
     /// Streamed installs under random interleavings: the fetch delivers its
