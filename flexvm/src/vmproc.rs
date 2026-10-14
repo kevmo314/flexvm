@@ -942,6 +942,11 @@ impl Proc {
         self.early.lock().unwrap().iter().any(|&s| s == libc::SIGINT || s == libc::SIGTERM)
     }
 
+    /// Forgets the SIGINTs and SIGTERMs that came before the VM was up.
+    pub fn forget_stop(&self) {
+        self.early.lock().unwrap().retain(|&s| s != libc::SIGINT && s != libc::SIGTERM);
+    }
+
     pub fn arc(&self) -> Option<Arc<Proc>> {
         self.me.upgrade()
     }

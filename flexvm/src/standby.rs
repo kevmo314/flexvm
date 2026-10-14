@@ -204,6 +204,10 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
         let Ok((c, _)) = listener.accept() else { continue };
         let Ok((line, fds)) = crate::util::recv_with_fds(&c, 1 << 20) else { continue };
         let Ok(req) = serde_json::from_slice::<Value>(&line) else { continue };
+        // Stopped meanwhile: goes without taking it (the claimer tries another).
+        if p.stop_requested() {
+            p.finish(op, End::NotStarted, 0, None);
+        }
         // From here the claim may take effect: whoever sent it must not
         // start the VM elsewhere without hearing how it went.
         if send_json(&mut &c, &json!({"claiming": true})).is_err() {
@@ -211,6 +215,8 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
         }
         match claim(p, &req) {
             Ok(v) => {
+                // Stop signals were the standby VM's, not the claimed one's.
+                p.forget_stop();
                 crate::host::stall("claim_stall");
                 let _ = std::fs::remove_file(&sock);
                 p.serve_control();
