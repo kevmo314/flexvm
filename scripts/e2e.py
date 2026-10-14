@@ -42,8 +42,8 @@ p.add_argument("--no-image", action="store_true", help="skip the image-template 
 p.add_argument("--image-cache", help="keep the pulled image here, and build from it when it is there (no registry)")
 # The scripts/faults.py scenarios that fit CI time: migration failure paths and fencing, address
 # generations and loans, forged peers, processes killed between steps, checkpoint corruption,
-# copy-on-write exactness, growth (on a template with little pre-plugged), held packets and devices,
-# signals, standby VMs. Left out: slow or heavy ones (pages_dead, quiet_source, guest_hang,
+# copy-on-write exactness, growth and a checkpoint during a resize (on a template with little
+# pre-plugged), held packets and devices, signals, standby VMs. Left out: slow or heavy ones (pages_dead, quiet_source, guest_hang,
 # cow_reports_held, suspend_disk_freed, source_killed, kill_source, forged_peer: their
 # 1.5 GB guests outgrow the CI template, and the host moves them), evict_grower (it steers by the
 # machine's MemAvailable, which lanes running at once move) and the ones that restart the
@@ -55,7 +55,7 @@ FAULTS = ("basic route lost_ack unknown refused pages_blip pages_dead_restore pr
           "incoming_killed start_killed claim_killed fc_died cow_grow plug_race plug_storm suspend_debris revoked_publication "
           "same_host_order arrival_abort_route arrival_killed_route handoff_superseded mem_high mem_high_migrate mem_high_evict "
           "sigkill_restart listen_trickle suspend_cmd fc_died_busy pause_cmd_start suspend_died evict_latency evict_skips_cmd cmd_flag "
-          "refused_admission meminfo_unreadable")
+          "refused_admission meminfo_unreadable checkpoint_hotplug")
 p.add_argument("--faults", default=FAULTS, help="scripts/faults.py scenarios to run against the two hosts ('' for none)")
 # A worker runs its cases on one lane, against templates that are already built.
 p.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
@@ -868,7 +868,7 @@ COST = {"image_template": 30, "pause_resume": 6, "migrate": 3, "checkpoint_resto
         "faults/cow_exact": 7, "faults/prepared_retry": 7, "faults/ckpt_failed_stop": 7, "faults/exec_race": 7,
         "faults/prepare_fail": 6, "faults/route": 6, "faults/basic": 6, "faults/slow_preload": 6, "faults/refused": 6,
         "faults/resume_kill": 5, "faults/lost_ack": 5, "faults/ckpt_rearm": 5, "faults/cow_abort": 5,
-        "faults/ckpt_packet_hold": 4}
+        "faults/ckpt_packet_hold": 4, "faults/checkpoint_hotplug": 4}
 BATCH_S = 20
 
 
@@ -890,8 +890,8 @@ def main():
     scenarios = args.faults.split() if "faults" in selected else []
     # (name, templates it needs, cost): the cases, and each scenario on its own.
     work = [(c, set() if c == "image_template" else {args.template}, COST.get(c, 2)) for c in selected if c != "faults"]
-    # Growth runs on GROW; fc_prepare needs a second template to mismatch with.
-    work += [(f"faults/{s}", {args.template, GROW} if s in ("cow_grow", "plug_race", "plug_storm", "fc_prepare") else {args.template},
+    # Growth (and checkpoint_hotplug, which needs room to plug) runs on GROW; fc_prepare needs a second template to mismatch with.
+    work += [(f"faults/{s}", {args.template, GROW} if s in ("cow_grow", "plug_race", "plug_storm", "checkpoint_hotplug", "fc_prepare") else {args.template},
               COST.get(f"faults/{s}", 2)) for s in scenarios]
     work.sort(key=lambda w: -w[2])
     scheduled = list(work)
