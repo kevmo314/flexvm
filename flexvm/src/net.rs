@@ -27,6 +27,11 @@ fn socket(domain: c_int, kind: c_int, protocol: c_int, what: &str) -> Result<Own
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
+fn send_to<A>(fd: &OwnedFd, buf: &[u8], addr: &A) -> isize {
+    let len = std::mem::size_of::<A>() as libc::socklen_t;
+    unsafe { libc::sendto(fd.as_raw_fd(), buf.as_ptr().cast(), buf.len(), 0, (addr as *const A).cast(), len) }
+}
+
 /// Down, a tap takes no packets, so Firecracker writes none into guest memory.
 pub fn set_link_up(name: &str, up: bool) -> Result<()> {
     let fd = socket(libc::AF_INET, libc::SOCK_DGRAM, 0, "socket")?;
@@ -207,23 +212,12 @@ fn netlink(kind: u16, flags: c_int, body: &[u8]) -> Result<()> {
     msg.extend_from_slice(&1u32.to_ne_bytes()); // seq
     msg.extend_from_slice(&0u32.to_ne_bytes()); // pid
     msg.extend_from_slice(body);
+    let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+    addr.nl_family = libc::AF_NETLINK as u16;
     let mut ack = [0u8; 1024];
-    let res = unsafe {
-        let mut addr: libc::sockaddr_nl = std::mem::zeroed();
-        addr.nl_family = libc::AF_NETLINK as u16;
-        let sent = libc::sendto(
-            fd.as_raw_fd(),
-            msg.as_ptr().cast(),
-            msg.len(),
-            0,
-            (&addr as *const libc::sockaddr_nl).cast(),
-            std::mem::size_of::<libc::sockaddr_nl>() as u32,
-        );
-        if sent < 0 {
-            -1
-        } else {
-            libc::recv(fd.as_raw_fd(), ack.as_mut_ptr().cast(), ack.len(), 0)
-        }
+    let res = match send_to(&fd, &msg, &addr) {
+        sent if sent < 0 => -1,
+        _ => unsafe { libc::recv(fd.as_raw_fd(), ack.as_mut_ptr().cast(), ack.len(), 0) },
     };
     if res < 20 {
         bail!("netlink: {}", std::io::Error::last_os_error());
@@ -276,17 +270,7 @@ pub fn gratuitous_arp(dev: &str, ip: Ipv4Addr) -> Result<()> {
     addr.sll_ifindex = ifindex as i32;
     addr.sll_halen = 6;
     addr.sll_addr[..6].copy_from_slice(&[0xff; 6]);
-    let rc = unsafe {
-        libc::sendto(
-            fd.as_raw_fd(),
-            frame.as_ptr().cast(),
-            frame.len(),
-            0,
-            (&addr as *const libc::sockaddr_ll).cast(),
-            std::mem::size_of::<libc::sockaddr_ll>() as u32,
-        )
-    };
-    if rc < 0 {
+    if send_to(&fd, &frame, &addr) < 0 {
         bail!("send gratuitous arp: {}", std::io::Error::last_os_error());
     }
     Ok(())

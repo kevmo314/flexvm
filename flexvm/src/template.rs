@@ -362,9 +362,7 @@ impl Template {
             for (name, stamp) in cache.iter() {
                 meta.components.get_mut(name).unwrap().metadata = stamp.clone();
             }
-            let tmp = self.fixed.join(format!("meta.json.{}", std::process::id()));
-            let _ = std::fs::write(&tmp, serde_json::to_vec_pretty(&meta)?)
-                .and_then(|_| std::fs::rename(&tmp, self.fixed.join("meta.json")));
+            let _ = crate::host::write_file(&self.fixed, "meta.json", &serde_json::to_vec_pretty(&meta)?, false);
         }
         Ok(())
     }
