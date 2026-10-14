@@ -165,16 +165,17 @@ answer, held packets). What changed is who is at each end:
    source VM process, which serves it if it is the source of that migration.
 5. Release: the source polls `migration {mig}` on the target's listener.
    The listener answers from `STATE/migs/ID`: `pending`, `committed`,
-   `released` (the target process wrote it once all pages arrived, retrying
-   until it is recorded), or `aborted` (no record). A record whose process
-   is dead is settled first, once its Firecrackers are reaped: `pending`
-   goes (aborted: it can never commit, as committing needs its own pending
-   record), `committed` becomes `released`. A record that cannot be read
-   answers nothing. The source resumes only on `aborted`, and then under the
-   host lock and only if its generation is still current; it exits on
-   `released`, telling the target it is `done` with the id (the record goes
-   then: retention follows the protocol, not time), and stays paused,
-   serving pages, otherwise.
+   `released` (a live target wrote it once every page arrived, retrying
+   until it is recorded; or the VM was destroyed on purpose there), or
+   `aborted` (no record). A record whose process is dead is removed once its
+   Firecrackers are reaped, committed or not: the VM is not on the target,
+   and the source's paused copy is the only one left (#105). A record that
+   cannot be read answers nothing. The source resumes only on `aborted`, and
+   then under the host lock and only if its generation is still current
+   (after a commit, from the pause point, announcing the address again); it
+   exits only on `released`, telling the target it is `done` with the id
+   (the record goes then: retention follows the protocol, not time), and
+   stays paused, serving pages, otherwise.
 
 ## Peer listener
 
@@ -296,8 +297,9 @@ where it is kept and what tests it.
 1. **A committed migration id is never forgotten** until its source says it
    is done with it. Records live in `STATE/migs/ID` (disk), typed
    (`pending`, `committed`, `released`), changed only under the host lock
-   and fsynced: `committed` is durable before the VM resumes; a committed
-   record whose process is gone reads `released`, never `aborted`; reads
+   and fsynced: `committed` is durable before the VM resumes; `released`
+   comes only from a live target holding every page (or one that destroyed
+   the VM on purpose), so a source never lets go of the only copy; reads
    fail closed. Unit test `host::migrations_are_fenced`; faults `basic`,
    `lost_ack`, `unknown`, `target_killed`, `incoming_killed`.
 2. **The old Firecracker is dead before an id is fenced or a name or
@@ -376,8 +378,10 @@ where it is kept and what tests it.
   `guest_hang`, all checkpoint/COW/incremental/hold scenarios, suspend/resume
   and resume marker failures, `held_restore_frozen`, generations. Renamed or
   reshaped: `source_killed` (SIGKILL the source VM process), `target_restart`
-  becomes `target_killed` (SIGKILL the target VM process after commit: the
-  record says released/dead, the source exits, nothing runs twice),
+  becomes `target_killed` (SIGKILL the target VM process after commit,
+  mid-pull: the source is told `aborted` once its Firecracker is dead, and
+  runs its copy again; a target that destroys the VM on purpose releases
+  its source),
   `checkpoint_crash`/`cow_crash` (SIGKILL the VM process mid-write: no
   checkpoint appears, staging is cleared by the next one), `hot_budget`
   becomes `standby` (count, refill, claim fallback). New: `abort_superseded`,
