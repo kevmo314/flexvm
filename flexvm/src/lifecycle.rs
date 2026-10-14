@@ -820,9 +820,7 @@ pub fn discard(host: &Host, name: &str) -> Result<()> {
         if let Some(gen) = gen {
             host.observe(&l, ip, gen, None)?;
             drop(l);
-            for peer in &host.cfg.peers {
-                let _ = crate::vmproc::peer_call(peer, json!({"op": "route", "ip": ip.to_string(), "gen": gen}));
-            }
+            crate::vmproc::tell_peers(host, json!({"op": "route", "ip": ip.to_string(), "gen": gen}));
         }
     }
     Ok(())

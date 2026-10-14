@@ -1,14 +1,11 @@
 //! The VM process: `flexvm run` (and `resume`, `restore`, an incoming
-//! migration, a standby VM) is a process that is one VM. It owns the
-//! Firecracker it spawns, the pager, the tap and route, packet holds, guest
-//! sessions and checkpoints, and exits when the VM is gone.
-//!
-//! Signals: SIGTERM suspends, SIGTSTP pauses, SIGCONT resumes, SIGINT
-//! destroys. A control socket (`RUN/vms/NAME.sock`) takes `exec`,
-//! `checkpoint`, `migrate`, `debug`, page connections passed on by the peer
-//! listener (`pages`), and a standby VM's `claim`. Every operation on the VM,
-//! starting it included, holds `op`, so they never interleave; and the
-//! process ends only through `finish`, which holds it too.
+//! migration, a standby VM) is one VM. It owns its Firecracker, pager, tap,
+//! route, packet holds, guest sessions and checkpoints, and exits with the VM.
+//! SIGTERM suspends, SIGTSTP pauses, SIGCONT resumes, SIGINT destroys; the
+//! control socket (`RUN/vms/NAME.sock`) takes `exec`, `checkpoint`,
+//! `migrate`, `debug`, `pages` (from the listener) and `claim` (standby).
+//! Every operation, starting included, holds `op`; the process ends only
+//! through `finish`, which holds it too.
 
 use std::io::{BufReader, Write};
 use std::net::Ipv4Addr;
@@ -33,24 +30,22 @@ use crate::vm::{Snapshot, State, Vm};
 
 /// The exit status of a VM process whose VM died under it.
 pub const DIED: i32 = 3;
-
 /// How long a requested operation waits for another one on the same VM.
-pub const OP_WAIT: Duration = Duration::from_secs(30);
+const OP_WAIT: Duration = Duration::from_secs(30);
 /// Guest clock error tolerated after a restore or resume.
-pub const CLOCK_TOLERANCE: Duration = Duration::from_millis(20);
-/// How long checking and stepping the guest clock may take.
+const CLOCK_TOLERANCE: Duration = Duration::from_millis(20);
 pub const CLOCK_DEADLINE: Duration = Duration::from_secs(5);
-
-/// The signals a VM process takes (all others keep their defaults).
 const SIGNALS: [i32; 5] = [libc::SIGTERM, libc::SIGINT, libc::SIGTSTP, libc::SIGCONT, libc::SIGHUP];
+/// Control connections served at once.
+const MAX_CONTROL: usize = 256;
+static CONTROL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// How a VM process starts.
 pub enum Start {
     Run { name: String, template: String, ip: Option<Ipv4Addr>, cmd: Option<String> },
     /// A suspended VM.
     Resume { name: String },
     Restore { dir: PathBuf, name: Option<String>, ip: Option<String>, paused: bool },
-    /// Spawned by the peer listener with the migration connection as fd 3.
+    /// From the peer listener, the migration connection as fd 3.
     Incoming { req: Value },
     Standby { template: String },
 }
@@ -58,15 +53,15 @@ pub enum Start {
 /// The VM's operation lock, held.
 pub type Op<'a> = MutexGuard<'a, ()>;
 
-/// How the VM left this process, which decides what becomes of its address.
+/// How the VM left, which decides what becomes of its address.
 pub enum End {
-    /// Destroyed, or died: the address is withdrawn.
+    /// Destroyed or died: withdrawn.
     Gone,
-    /// Suspended to disk: the address stays held by its name.
+    /// Suspended: kept by its name.
     Suspended,
-    /// Migrated to the peer listening at `.0`, which has all its memory.
+    /// Migrated to the peer at `.0`, which has all its memory: released.
     Moved(String),
-    /// Never started here (it may still run elsewhere, or be suspended).
+    /// Never started here: released (withdrawn if its generation was made for it).
     NotStarted,
 }
 
@@ -74,7 +69,6 @@ pub struct Proc {
     pub host: Host,
     pub paths: Paths,
     pub spawner: Spawner,
-    /// This process, as the registry names it.
     ident: Ident,
     name: Mutex<Option<NameLock>>,
     addr: Mutex<Option<AddrClaim>>,
@@ -85,7 +79,7 @@ pub struct Proc {
     pub arrived: Mutex<Option<MigRecord>>,
     /// The right of that migration's source to send the packets it held.
     pub held_in: Mutex<Option<Arc<Mutex<bool>>>>,
-    /// Where the app's output has been copied up to (image templates).
+    /// How much of an image app's output has been copied.
     pub app_log: AtomicU64,
     /// Exit when the VM leaves: set while a migration away may commit.
     leaving: AtomicBool,
@@ -93,30 +87,23 @@ pub struct Proc {
     pub standby: Mutex<Option<crate::vm::Prepared>>,
     /// The `run` that claimed this standby VM: told the exit status.
     pub claimer: Mutex<Option<UnixStream>>,
-    /// The VM's one command (`run NAME -- CMD`).
+    /// `run NAME -- CMD`.
     pub cmd: Mutex<Option<String>>,
-    /// Signals that came before the VM was up, handled once it is.
+    /// Signals that came before the VM was up.
     early: Mutex<Vec<i32>>,
-    /// Paused by SIGTSTP (or held by `restore --paused`): only then does
-    /// SIGCONT resume it. The kernel sends SIGCONT after any SIGSTOP, and
-    /// systemd right after SIGTERM.
+    /// Paused by SIGTSTP (or `restore --paused`): only then does SIGCONT
+    /// resume it (the kernel sends one after any SIGSTOP, systemd after SIGTERM).
     pub paused_by_request: AtomicBool,
-    /// A resumed suspended VM's checkpoint, deleted once all its pages are
-    /// in, or when the process ends (it is marked STARTED: consumed).
+    /// A resumed suspended VM's checkpoint (marked STARTED), deleted once all
+    /// its pages are in, or at the end.
     pub consumed: Mutex<Option<PathBuf>>,
-    /// A route to a migration target that could not be set yet (retried
-    /// in the background, and once more before the process ends).
+    /// A route to a migration target not set yet (retried until the end).
     pub pending_route: Mutex<Option<Ipv4Addr>>,
-    /// Files this process owns, removed when it ends (a standby VM's socket and lock).
+    /// Removed at the end (a standby VM's socket and lock).
     pub files: Mutex<Vec<PathBuf>>,
-    /// The control socket is open.
     serving: AtomicBool,
     me: std::sync::Weak<Proc>,
 }
-
-/// Control connections served at once; more are refused.
-const MAX_CONTROL: usize = 256;
-static CONTROL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 impl Proc {
     fn new(host: Host, paths: Paths) -> Result<Arc<Proc>> {
@@ -129,9 +116,8 @@ impl Proc {
         let _ = std::fs::remove_dir_all(&work);
         std::fs::create_dir_all(&work)?;
         crate::host::store(&work.join("owner"), &ident, false)?;
-        let sockets = crate::socket::SocketRoot::new(&work)?;
         let tap_prefix = format!("{}{:x}t", host.cfg.prefix, ident.pid);
-        let spawner = Spawner::new(&paths.firecracker, &work, sockets, cgroup_root(), &tap_prefix);
+        let spawner = Spawner::new(&paths.firecracker, &work, crate::socket::SocketRoot::new(&work)?, cgroup_root(), &tap_prefix);
         Ok(Arc::new_cyclic(|me| Proc {
             host,
             paths,
@@ -175,16 +161,14 @@ impl Proc {
         *self.name.lock().unwrap() = Some(n);
     }
 
-    /// The VM's address and generation are this process's from here on.
     pub fn set_addr(&self, a: AddrClaim) -> Ipv4Addr {
         let ip = a.ip;
         *self.addr.lock().unwrap() = Some(a);
         ip
     }
 
-    /// Borrows `ip`, of another host's range, from that host, for VM `name`
-    /// (a restore keeping its checkpoint's address): its home host lends it
-    /// out, as to a VM migrating away, with a new generation.
+    /// Borrows `ip`, of a peer's range, for VM `name` (a restore keeping its
+    /// checkpoint's address): its home host lends it with a new generation.
     pub fn borrow(&self, name: &str, ip: Ipv4Addr) -> Result<AddrClaim> {
         let mut why = Vec::new();
         for peer in &self.host.cfg.peers {
@@ -195,8 +179,7 @@ impl Proc {
                     continue;
                 }
             };
-            let claimed = self.host.lock().and_then(|l| self.host.claim_incoming(&l, name, ip, gen));
-            return match claimed {
+            return match self.host.lock().and_then(|l| self.host.claim_incoming(&l, name, ip, gen)) {
                 Ok(mut c) => {
                     c.fresh = true;
                     Ok(c)
@@ -210,37 +193,33 @@ impl Proc {
         bail!("cannot borrow {ip} from its home host ({}); restore with --ip auto", why.join("; "))
     }
 
-    /// Lets the VM's name keep its address after this process (suspended).
+    /// The VM's name keeps its address after this process (suspended).
     pub fn keep_addr(&self) {
         if let Some(a) = self.addr.lock().unwrap().take() {
             a.keep();
         }
     }
 
-    /// The host lock, if the VM's address's generation is still current:
-    /// taken right before the VM runs, and held until it does, so no message
-    /// about a newer generation is taken in meanwhile.
+    /// The host lock, if the VM's generation is still current: taken right
+    /// before the VM runs and held until it does.
     pub fn still_current(&self, ip: Ipv4Addr) -> Result<crate::host::Locked> {
-        let l = self.host.lock()?;
-        let gen = self.gen();
+        let (l, gen) = (self.host.lock()?, self.gen());
         if !self.host.current(&l, ip, gen)? {
             bail!("{ip}'s generation {gen} was withdrawn or given out again meanwhile; restore with --ip auto");
         }
         Ok(l)
     }
 
-    /// The generation of the VM's address (see `host::Addr`).
     pub fn gen(&self) -> u64 {
         self.addr.lock().unwrap().as_ref().map_or(0, |a| a.gen)
     }
 
-    /// Takes the VM's operation lock, however long that takes: for what must
-    /// not be refused (starting, destroying, suspending, ending).
+    /// The operation lock, however long it takes: for what must not be refused.
     pub fn op(&self) -> Op<'_> {
         self.op.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// `op` for a request, which gives up after `OP_WAIT`.
+    /// `op` for a request: gives up after `OP_WAIT`.
     pub fn op_within(&self) -> Result<Op<'_>> {
         let deadline = Instant::now() + OP_WAIT;
         loop {
@@ -257,8 +236,7 @@ impl Proc {
     pub fn holder(&self) -> Option<&Arc<Holder>> {
         self.holder
             .get_or_init(|| {
-                let dev = format!("{}{:x}h", self.host.cfg.prefix, self.ident.pid);
-                Holder::new(&dev).unwrap_or_else(|e| {
+                Holder::new(&format!("{}{:x}h", self.host.cfg.prefix, self.ident.pid)).unwrap_or_else(|e| {
                     eprintln!("packets in flight while the vm is paused will be dropped: {e}");
                     None
                 })
@@ -268,11 +246,9 @@ impl Proc {
 
     /// Writes the VM's registry entry as it is now.
     pub fn publish(&self) {
-        let Some(vm) = self.vm.get() else { return };
-        let name = self.name.lock().unwrap();
-        let Some(n) = name.as_ref() else { return };
+        let (Some(vm), Some(n)) = (self.vm.get(), self.name.lock().unwrap().as_ref().map(|n| n.name.clone())) else { return };
         let e = Entry {
-            name: n.name.clone(),
+            name: n.clone(),
             ident: self.ident.clone(),
             ip: Some(vm.ip),
             gen: self.gen(),
@@ -284,17 +260,16 @@ impl Proc {
             firecracker: vm.pid(),
             starved: vm.starved.load(Ordering::SeqCst),
         };
-        if let Err(e) = n.publish(&e) {
-            eprintln!("vm {}: registry: {e}", n.name);
+        if let Err(e) = self.name.lock().unwrap().as_ref().map_or(Ok(()), |l| l.publish(&e)) {
+            eprintln!("vm {n}: registry: {e}");
         }
     }
 
-    /// Ends the process, the one way it ends: kills the VM, if there is one,
-    /// and waits for its Firecracker to exit; settles its address as `end`
-    /// says; forgets an arrival that never committed (one that did counts as
-    /// released once this process is gone); deletes a consumed checkpoint;
-    /// gives up the name; sends `last` on its connection, and the exit status
-    /// to a claimer; exits with `code`. Holding `op`, so nothing else runs.
+    /// The one way the process ends, holding `op`: kills the VM and waits for
+    /// its Firecracker; settles its address as `end` says; forgets an arrival
+    /// that never committed (one that did reads released once this process
+    /// is gone); deletes a consumed checkpoint; gives up the name; sends
+    /// `last` on its connection and the exit status to a claimer.
     pub fn finish(&self, _op: &Op, end: End, code: i32, last: Option<(&UnixStream, Value)>) -> ! {
         self.drop_held_in();
         self.set_leaving(true);
@@ -302,20 +277,16 @@ impl Proc {
             vm.kill();
         }
         drop(self.standby.lock().unwrap().take());
-        let addr = self.addr.lock().unwrap().take();
-        match (end, addr) {
+        match (end, self.addr.lock().unwrap().take()) {
             (End::Suspended, Some(a)) => a.keep(),
             (End::Gone, Some(a)) => self.withdraw(a),
             (End::NotStarted, Some(a)) if a.fresh => self.withdraw(a),
-            (End::Moved(to), a) => {
-                drop(a);
-                let name = self.name();
-                let _ = std::fs::write(self.host.run.join("vms").join(format!("{name}.moved")), &to);
-                eprintln!("vm {name}: moved to {to}");
+            (End::Moved(to), _) => {
+                let _ = std::fs::write(self.host.vms(&self.name(), "moved"), &to);
+                eprintln!("vm {}: moved to {to}", self.name());
             }
+            // Never ran here: a peer's route for it comes back (say its source's).
             (_, Some(a)) => {
-                // Never ran here: a peer's route for it comes back (say its
-                // migration source's, which runs it again).
                 let ip = a.ip;
                 if let Ok(l) = self.host.lock() {
                     let _ = a.release(&l);
@@ -345,10 +316,9 @@ impl Proc {
         std::process::exit(code)
     }
 
-    /// Destroys the VM (SIGINT, or its command ended) and ends the process
-    /// with `code`. A checkpoint in progress gives up first. Returns only if
-    /// refused: a VM paused here as a migration source is never killed, as
-    /// its target may still be pulling its memory.
+    /// Destroys the VM and ends the process with `code`, after a checkpoint
+    /// in progress gives up. Returns only if refused: a migration source is
+    /// never killed, as its target may still be pulling its memory.
     pub fn destroy(&self, code: i32) -> Error {
         let vm = self.vm();
         let source = || format!("vm {} is the source of a migration in progress; it ends once the target has its memory", vm.name).into();
@@ -364,14 +334,11 @@ impl Proc {
         self.finish(&op, End::Gone, code, None)
     }
 
-    /// The VM's address is free again here, and peers are told so (all of
-    /// it done before this returns, as the process is about to exit). Its
-    /// route goes, or, if a peer announced a newer generation meanwhile,
-    /// points there again.
+    /// Gives the address back and tells the peers, before returning. Its
+    /// route (only if ours) goes, or points at a newer generation's VM.
     fn withdraw(&self, a: AddrClaim) {
         let (ip, gen) = (a.ip, a.gen);
         if let Ok(l) = self.host.lock() {
-            // Only while it is ours: never another VM's route.
             let ours = self.host.holder(&l, ip).is_ok_and(|h| h.is_none_or(|h| h == self.name()));
             let _ = a.release(&l);
             let _ = self.host.observe(&l, ip, gen, None);
@@ -379,24 +346,14 @@ impl Proc {
                 crate::net::unroute(ip);
             }
         }
-        let req = json!({"op": "route", "ip": ip.to_string(), "gen": gen});
-        let sends: Vec<_> = self.host.cfg.peers.iter().cloned().map(|p| {
-            let req = req.clone();
-            thread::spawn(move || peer_call(&p, req))
-        }).collect();
-        for s in sends {
-            let _ = s.join();
-        }
+        tell_peers(&self.host, json!({"op": "route", "ip": ip.to_string(), "gen": gen}));
     }
 
-    /// Points the network at this host for the VM's address: a gratuitous
-    /// ARP for the LAN and a route for each peer, in the background, each
-    /// only while the VM is still served from here.
+    /// Points the network here for the VM's address, in the background: a
+    /// gratuitous ARP and a route for each peer, while the VM is still here.
     pub fn announce(&self) {
         let vm = self.vm().clone();
-        let (ip, gen) = (vm.ip, self.gen());
-        let peers = self.host.cfg.peers.clone();
-        let dev = self.host.cfg.announce_dev.clone();
+        let (ip, gen, peers, dev) = (vm.ip, self.gen(), self.host.cfg.peers.clone(), self.host.cfg.announce_dev.clone());
         let Some(via) = self.host.cfg.underlay() else {
             if !peers.is_empty() {
                 eprintln!("announce {ip}: no underlay address (set --listen or --underlay); peers not told");
@@ -405,38 +362,28 @@ impl Proc {
         };
         thread::spawn(move || {
             let here = || vm.state().local();
-            if let Some(dev) = dev.as_deref().filter(|_| here()) {
-                if let Err(e) = crate::net::gratuitous_arp(dev, ip) {
-                    eprintln!("announce {ip}: {e}");
+            let arp = || {
+                if let Some(dev) = dev.as_deref().filter(|_| here()) {
+                    crate::net::gratuitous_arp(dev, ip).unwrap_or_else(|e| eprintln!("announce {ip}: {e}"));
                 }
-            }
-            for peer in &peers {
-                if !here() {
-                    return;
-                }
-                let req = json!({"op": "route", "ip": ip.to_string(), "via": via.to_string(), "gen": gen});
-                if let Err(e) = peer_call(peer, req) {
+            };
+            arp();
+            for peer in peers.iter().take_while(|_| here()) {
+                if let Err(e) = peer_call(peer, json!({"op": "route", "ip": ip.to_string(), "via": via.to_string(), "gen": gen})) {
                     eprintln!("announce {ip} to {peer}: {e}");
                 }
             }
-            if let Some(dev) = &dev {
-                thread::sleep(Duration::from_millis(200));
-                if here() {
-                    let _ = crate::net::gratuitous_arp(dev, ip);
-                }
-            }
+            thread::sleep(Duration::from_millis(200));
+            arp();
         });
     }
 
-    /// Revokes the right of the migration this VM arrived by to send it held
-    /// packets (it is killed or leaving), stopping a stream in progress.
+    /// Revokes the arrival's right to send held packets, stopping a stream.
     pub fn drop_held_in(&self) {
         if let Some(revoked) = self.held_in.lock().unwrap().take() {
             *revoked.lock().unwrap() = true;
         }
     }
-
-    // Starting.
 
     /// A VM from a template, loaded here.
     fn run(&self, name: &str, template: &str, want: Option<Ipv4Addr>) -> Result<Value> {
@@ -444,15 +391,12 @@ impl Proc {
         self.set_name(self.host.take_name(name, false)?);
         let tpl = Template::open(&self.paths, template)?;
         t.mark("template");
-        let claim = {
-            let l = self.host.lock()?;
-            self.host.claim_new(&l, name, want)?
-        };
+        let claim = self.host.claim_new(&self.host.lock()?, name, want)?;
         let ip = self.set_addr(claim);
         t.mark("claim_ip");
         crate::host::stall("start_stall");
         let prepared = Vm::prepare(self.spawner.take()?, tpl.clone(), &mut t)?;
-        // The first load of a template on this host learns what loads touch.
+        // The first load of a template here learns what loads touch.
         let learn = crate::standby::load_set(&self.host, &tpl).is_empty();
         if learn {
             prepared.pager.learn_load_set();
@@ -461,7 +405,6 @@ impl Proc {
         if learn {
             crate::standby::save_load_set(&self.host, &tpl);
         }
-        // Once resumed it may have run: never loaded again.
         if let Err(e) = vm.start(fault("resume_kill")) {
             vm.kill();
             bail!("resuming the restored vm failed (it may have run, so it is not loaded again): {e}");
@@ -481,7 +424,7 @@ impl Proc {
         let running = t.total();
         vm.guest_net(vm.ip, self.host.cfg.dns.as_deref())?;
         if t.mark("guest_net") >= crate::vm::CLOCK_RTT {
-            // START's clock is behind by its transit time; fixed off this path.
+            // START's clock is behind by its transit; fixed off this path.
             self.sync_clock_later();
         }
         if vm.template.meta.image.as_ref().is_some_and(|i| !i.warm) {
@@ -501,45 +444,51 @@ impl Proc {
         }))
     }
 
-    // Steady state.
-
-    /// Opens the control socket (once): before the VM is reported ready, so
-    /// whoever started it can use it right away.
+    /// Opens the control socket, once: before the VM is reported ready.
     pub fn serve_control(self: &Arc<Self>) {
         if self.serving.swap(true, Ordering::SeqCst) {
             return;
         }
         let sock = self.host.sock(&self.name());
         let _ = std::fs::remove_file(&sock);
-        match UnixListener::bind(&sock) {
-            Ok(l) => {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600));
-                let p = self.clone();
+        let l = match UnixListener::bind(&sock) {
+            Ok(l) => l,
+            Err(e) => return eprintln!("vm {}: no control socket at {}: {e}", self.name(), sock.display()),
+        };
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600));
+        let p = self.clone();
+        thread::spawn(move || {
+            for c in l.incoming().flatten() {
+                if CONTROL.fetch_add(1, Ordering::SeqCst) >= MAX_CONTROL {
+                    CONTROL.fetch_sub(1, Ordering::SeqCst);
+                    continue;
+                }
+                let p = p.clone();
                 thread::spawn(move || {
-                    for c in l.incoming().flatten() {
-                        if CONTROL.fetch_add(1, Ordering::SeqCst) >= MAX_CONTROL {
-                            CONTROL.fetch_sub(1, Ordering::SeqCst);
-                            continue;
-                        }
-                        let p = p.clone();
-                        thread::spawn(move || {
-                            p.control(c);
-                            CONTROL.fetch_sub(1, Ordering::SeqCst);
-                        });
-                    }
+                    p.control(c);
+                    CONTROL.fetch_sub(1, Ordering::SeqCst);
                 });
             }
-            Err(e) => eprintln!("vm {}: no control socket at {}: {e}", self.name(), sock.display()),
-        }
+        });
     }
 
-    /// Runs the controller and the VM's helpers, handles the signals that
-    /// came while it started. Never returns: the process ends with the VM.
+    /// Runs the VM's helpers and the signals that came while it started.
+    /// Never returns: the main thread spawned Firecracker, which dies with it.
     fn serve(self: &Arc<Self>) -> ! {
         self.serve_control();
-        let p = self.clone();
-        thread::spawn(move || p.controller());
+        let spawn = |f: fn(Arc<Proc>)| {
+            let p = self.clone();
+            thread::spawn(move || f(p));
+        };
+        spawn(Proc::controller);
+        spawn(Proc::serve_memory);
+        if self.vm().template.meta.image.is_some() {
+            spawn(Proc::follow_app);
+        }
+        if self.cmd.lock().unwrap().is_some() {
+            spawn(Proc::main_command);
+        }
         // Firecracker's exit is noticed at once.
         if let Some(fc) = self.vm().pid().and_then(Ident::of).and_then(|id| crate::host::PidFd::open(&id).ok().flatten()) {
             let p = self.clone();
@@ -548,21 +497,9 @@ impl Proc {
                 p.died();
             });
         }
-        let p = self.clone();
-        thread::spawn(move || p.serve_memory());
-        if self.vm().template.meta.image.is_some() {
-            let p = self.clone();
-            thread::spawn(move || p.follow_app());
-        }
-        if let Some(cmd) = self.cmd.lock().unwrap().clone() {
-            let p = self.clone();
-            thread::spawn(move || p.main_command(&cmd));
-        }
-        let early = std::mem::take(&mut *self.early.lock().unwrap());
-        for sig in early {
+        for sig in std::mem::take(&mut *self.early.lock().unwrap()) {
             self.signal(sig);
         }
-        // The main thread spawned the Firecracker, which dies with the thread.
         loop {
             thread::park();
         }
@@ -570,7 +507,6 @@ impl Proc {
 
     fn signal(&self, sig: i32) {
         let Some(vm) = self.vm.get() else {
-            // Not up yet: handled once it is (a standby VM goes at once).
             if sig != libc::SIGHUP {
                 self.early.lock().unwrap().push(sig);
             }
@@ -583,8 +519,7 @@ impl Proc {
             }),
             libc::SIGCONT if self.leaving.load(Ordering::SeqCst) || !self.paused_by_request.load(Ordering::SeqCst) => Ok(()),
             libc::SIGCONT => self.resume().map(drop),
-            // A migration source goes once its target has the memory; a
-            // target still pulling is suspended once it has it all (`save`).
+            // A migration source ends once its target has the memory.
             libc::SIGTERM if matches!(vm.state(), State::Source(_)) => {
                 eprintln!("vm {}: migrating away; it ends once the target has its memory", vm.name);
                 Ok(())
@@ -598,22 +533,18 @@ impl Proc {
         }
     }
 
-    /// One control connection: a request line, possibly with fds.
+    /// One control connection: a request line (10 s to send it), maybe with fds.
     fn control(self: &Arc<Self>, c: UnixStream) {
-        // A client that never sends its request does not keep the connection.
         let _ = c.set_read_timeout(Some(Duration::from_secs(10)));
-        let (line, fds) = match crate::util::recv_with_fds(&c, 1 << 20) {
-            Ok(r) => r,
-            Err(_) => return,
-        };
+        let Ok((line, fds)) = crate::util::recv_with_fds(&c, 1 << 20) else { return };
         let _ = c.set_read_timeout(None);
         let Ok(req) = serde_json::from_slice::<Value>(&line) else { return };
         let reply = match req["op"].as_str().unwrap_or("") {
             "exec" => return self.exec(&req, c),
             "pages" => return self.pages(&req, fds),
             "checkpoint" => self.op_within().and_then(|op| {
-                let stop = req["stop"].as_bool().unwrap_or(false);
-                let v = self.checkpoint(&op, req["dir"].as_str().unwrap_or(""), stop, req["incremental"].as_bool().unwrap_or(false))?;
+                let stop = req["stop"] == true;
+                let v = self.checkpoint(&op, req["dir"].as_str().unwrap_or(""), stop, req["incremental"] == true)?;
                 if stop {
                     self.finish(&op, End::Gone, 0, Some((&c, json!({"ok": true, "result": v}))));
                 }
@@ -624,21 +555,15 @@ impl Proc {
             "claim" => Err("this vm is not a standby vm".into()),
             op => Err(format!("unknown op {op:?}").into()),
         };
-        let reply = match reply {
-            Ok(v) => json!({"ok": true, "result": v}),
-            Err(e) => json!({"ok": false, "error": e.to_string()}),
-        };
-        let _ = send_json(&mut &c, &reply);
+        let _ = send_json(&mut &c, &reply.map_or_else(|e| json!({"ok": false, "error": e.to_string()}), |v| json!({"ok": true, "result": v})));
     }
 
-    /// A page connection the peer listener passed on: answered with one
-    /// JSON line, then served (`serve_pages`) while this VM is the source of
-    /// that migration.
+    /// A page connection from the listener: answered with one JSON line,
+    /// then served while this VM is the source of that migration.
     fn pages(&self, req: &Value, fds: Vec<OwnedFd>) {
         let Some(fd) = fds.into_iter().next() else { return };
         let s = std::net::TcpStream::from(fd);
-        let vm = self.vm();
-        let source = req["mig"].as_u64().map(State::Source);
+        let (vm, source) = (self.vm(), req["mig"].as_u64().map(State::Source));
         if source != Some(vm.state()) {
             return crate::listen::refuse_pages(s, &format!("vm {} is not the source of migration {}", vm.name, req["mig"]));
         }
@@ -646,11 +571,8 @@ impl Proc {
             return crate::listen::refuse_pages(s, "injected fault: page server down");
         }
         let _ = s.set_nodelay(true);
-        let served = (|| -> Result<()> {
-            send_json(&mut &s, &json!({"ok": true}))?;
-            let r = BufReader::new(s.try_clone()?);
-            Ok(crate::uffd::serve_pages(&vm.pager, &s, ReadWrite(r, s.try_clone()?), || fault("pages") || Some(vm.state()) != source)?)
-        })();
+        let served = send_json(&mut &s, &json!({"ok": true}))
+            .and_then(|()| crate::uffd::serve_pages(&vm.pager, &s, &s, || fault("pages") || Some(vm.state()) != source));
         if let Err(e) = served {
             eprintln!("vm {}: page server: {e}", vm.name);
         }
@@ -688,7 +610,7 @@ impl Proc {
         vm.untrack_exec(id);
     }
 
-    /// Test hooks (FLEXVM_FAULTS=1).
+    /// Test hooks; all but `status` need FLEXVM_FAULTS=1.
     fn debug(&self, req: &Value) -> Result<Value> {
         if req["what"] != "status" && std::env::var("FLEXVM_FAULTS").ok().as_deref() != Some("1") {
             bail!("memhash needs FLEXVM_FAULTS=1");
@@ -696,16 +618,14 @@ impl Proc {
         let vm = self.vm();
         match req["what"].as_str().unwrap_or("") {
             "memhash" => self.memhash(),
-            // Set the VM's hotplug size directly, as the controller would.
+            // Sets the hotplug size as the controller would, up to the ceiling.
             "hotplug" => {
                 let _op = self.op_within()?;
                 if vm.state() != State::Running {
                     bail!("vm {} is not running here", vm.name);
                 }
                 *vm.last_resize.lock().unwrap() = Instant::now();
-                // At most the template's ceiling; says what it set.
-                let meta = &vm.template.meta;
-                let mib = req["mib"].as_u64().ok_or("missing mib")?.min(meta.max_mib - meta.mem_mib);
+                let mib = req["mib"].as_u64().ok_or("missing mib")?.min(vm.template.meta.max_mib - vm.template.meta.mem_mib);
                 vm.fc(|fc| fc.patch("/hotplug/memory", json!({"requested_size_mib": mib})))?;
                 Ok(json!({"requested_mib": mib}))
             }
@@ -722,12 +642,10 @@ impl Proc {
         }
     }
 
-    /// The VM died under this process (its Firecracker exited, or its memory
-    /// is lost): ends the process with `DIED`, the address withdrawn as for a
-    /// kill, why (Firecracker's exit status and the end of its log, the
-    /// guest's console) in the log and in `RUN/vms/NAME.failed`, which `ls`
-    /// shows until `kill` removes it. Not for a migration source, whose end
-    /// its target decides.
+    /// The VM died under the process (Firecracker exited, or its memory is
+    /// lost): cleaned up as a kill, exit status `DIED`, why in the log and in
+    /// `RUN/vms/NAME.failed` (for `ls`, until `kill`). Not for a migration
+    /// source, whose end its target decides.
     fn died(&self) {
         let vm = self.vm();
         if matches!(vm.state(), State::Source(_)) || self.leaving.load(Ordering::SeqCst) {
@@ -739,13 +657,12 @@ impl Proc {
         }
         let why = format!("{}; {}", vm.pager.failed().unwrap_or("its firecracker exited"), vm.post_mortem());
         eprintln!("vm {}: died: {why}", vm.name);
-        let _ = std::fs::write(self.host.run.join("vms").join(format!("{}.failed", vm.name)), &why);
+        let _ = std::fs::write(self.host.vms(&vm.name, "failed"), &why);
         self.finish(&op, End::Gone, DIED, None);
     }
 
-    /// Once a second: notices a VM that died or lost its memory, resizes
-    /// its memory, retries held report releases, and takes a turn at
-    /// relieving the host's memory pressure.
+    /// Once a second: notices a dead VM, retries held report releases,
+    /// resizes the VM, and takes a turn at relieving memory pressure.
     fn controller(self: Arc<Self>) {
         loop {
             thread::sleep(Duration::from_secs(1));
@@ -772,32 +689,27 @@ impl Proc {
         }
     }
 
-    /// Resizes the VM unless an operation holds it, except that a VM whose
-    /// copy-on-write checkpoint is being copied may grow: the copy only reads
-    /// the pages it had at the pause, and memory plugged after it was
-    /// unplugged then (never populated), so the copy never reads it, and the
-    /// checkpoint keeps the plugged size it saved.
+    /// Resizes the VM unless an operation holds it; during a copy-on-write
+    /// checkpoint's copy it may grow (memory plugged after the pause was not
+    /// populated then, so the copy never reads it).
     fn resize(&self, hint: Option<u64>) -> Result<Resized> {
         let vm = self.vm();
         if let Ok(_op) = self.op.try_lock() {
             return resize(vm, &self.host, hint, false);
         }
-        let copying = vm.cow_copy.lock().unwrap();
-        match *copying {
+        match *vm.cow_copy.lock().unwrap() {
             true => resize(vm, &self.host, hint, true),
             false => Ok(Resized::Busy),
         }
     }
 
-    /// Answers the guest agent's memory requests (sent the moment it runs
-    /// low) with an immediate resize, until the VM is gone. The guest is
+    /// Answers the guest's memory requests with a resize. The guest is
     /// untrusted: requests are bounded in size and time, malformed ones
-    /// dropped, and they are acted on at most once per `MEM_REQUEST_GAP`.
+    /// dropped, and acted on at most once per `MEM_REQUEST_GAP`.
     fn serve_memory(self: Arc<Self>) {
         let vm = self.vm().clone();
-        let path = vm.mem_sock();
-        let _ = std::fs::remove_file(&path);
-        let listener = match UnixListener::bind(&path) {
+        let _ = std::fs::remove_file(vm.mem_sock());
+        let listener = match UnixListener::bind(vm.mem_sock()) {
             Ok(l) => l,
             Err(e) => return eprintln!("vm {}: memory requests: {e}", vm.name),
         };
@@ -809,32 +721,31 @@ impl Proc {
             let Ok(conn) = conn else { continue };
             let _ = conn.set_write_timeout(Some(MEM_REQUEST_DEADLINE));
             let Some(avail) = read_mem_request(&conn) else { continue };
-            if acted.is_some_and(|t| t.elapsed() < MEM_REQUEST_GAP) {
-                let _ = (&conn).write_all(b"busy\n");
-                continue;
-            }
-            acted = Some(Instant::now());
-            let reply = match self.resize(Some(avail)) {
-                Ok(Resized::Grew) => "grow",
-                Ok(Resized::Busy) => "busy",
-                Ok(Resized::Full) => "full",
-                Ok(Resized::Same) => "ok",
-                Err(e) => {
-                    eprintln!("vm {}: resize on request: {e}", vm.name);
-                    "busy"
+            let reply = if acted.is_some_and(|t| t.elapsed() < MEM_REQUEST_GAP) {
+                "busy"
+            } else {
+                acted = Some(Instant::now());
+                match self.resize(Some(avail)) {
+                    Ok(Resized::Grew) => "grow",
+                    Ok(Resized::Full) => "full",
+                    Ok(Resized::Same) => "ok",
+                    Ok(Resized::Busy) => "busy",
+                    Err(e) => {
+                        eprintln!("vm {}: resize on request: {e}", vm.name);
+                        "busy"
+                    }
                 }
             };
             let _ = (&conn).write_all(format!("{reply}\n").as_bytes());
         }
     }
 
-    /// Copies an image app's output to this process's stdout, from where it
-    /// got to, until the app exits; reconnects when vsock resets.
+    /// Copies an image app's output to stdout until the app exits;
+    /// reconnects when vsock resets.
     fn follow_app(self: Arc<Self>) {
         let vm = self.vm().clone();
-        while vm.state().local() || vm.state() == State::Checkpointing {
-            let offset = self.app_log.load(Ordering::SeqCst);
-            let got = vm.exec(|s| guest::start_logs(s, offset, true, guest::TIMEOUT));
+        while vm.state().local() {
+            let got = vm.exec(|s| guest::start_logs(s, self.app_log.load(Ordering::SeqCst), true, guest::TIMEOUT));
             if let Ok((mut g, id)) = got {
                 let _ = g.get_ref().set_read_timeout(None);
                 while let Ok(Some((kind, data))) = guest::read_frame(&mut g) {
@@ -857,22 +768,20 @@ impl Proc {
         }
     }
 
-    /// `run NAME -- CMD`: the VM's one command. Its output goes to this
-    /// process's; when it exits the VM is destroyed and the process exits
-    /// with its status.
-    fn main_command(self: Arc<Self>, cmd: &str) {
-        let vm = self.vm().clone();
+    /// `run NAME -- CMD`: output to this process's; when it exits, the VM is
+    /// destroyed and the process exits with its status.
+    fn main_command(self: Arc<Self>) {
+        let (vm, cmd) = (self.vm().clone(), self.cmd.lock().unwrap().clone().unwrap_or_default());
         let id = format!("main-{}", std::process::id());
         let (mut offset, mut started) = (0u64, false);
         let deadline = Instant::now() + Duration::from_secs(30);
         let code = loop {
-            if !vm.state().local() && vm.state() != State::Checkpointing {
+            if !vm.state().local() {
                 // Migrated or suspended: the command goes on with the VM.
                 return;
             }
             let action = if started { "attach" } else { "start" };
-            let got = vm.exec(|s| guest::session(s, action, &id, offset, cmd, guest::TIMEOUT));
-            if let Ok((mut g, sid)) = got {
+            if let Ok((mut g, sid)) = vm.exec(|s| guest::session(s, action, &id, offset, &cmd, guest::TIMEOUT)) {
                 let _ = g.get_ref().set_read_timeout(Some(Duration::from_secs(3)));
                 let end = crate::exec_frames(&mut g, &id, &mut started, &mut offset, &mut std::io::stdout(), &mut std::io::stderr(), &mut Instant::now());
                 vm.untrack_exec(sid);
@@ -892,64 +801,12 @@ impl Proc {
         // Refused while migrating away: the process ends with the migration.
         eprintln!("vm {}: {}", vm.name, self.destroy(code));
     }
-}
 
-/// Runs a VM process until its VM is gone. `notify`, if given, gets one JSON
-/// line once the VM is ready (or failed to start), and is closed.
-pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::File>) -> Result<()> {
-    // Before any thread starts, so they all inherit the mask.
-    let signals = crate::util::block_signals(&SIGNALS);
-    let _ = crate::net::sysctl("net.ipv4.ip_forward", "1");
-    let p = Proc::new(host, paths)?;
-    let (run, prefix) = (p.host.run.clone(), p.host.cfg.prefix.clone());
-    thread::spawn(move || crate::host::collect_garbage(&run, &prefix));
-    let s = p.clone();
-    thread::spawn(move || loop {
-        let sig = crate::util::wait_signal(&signals);
-        s.signal(sig);
-    });
-    // Signals that come while it starts wait for it to be up.
-    let op = p.op();
-    let res = match start {
-        Start::Run { name, template, ip, cmd } => {
-            *p.cmd.lock().unwrap() = cmd;
-            p.run(&name, &template, ip)
-        }
-        Start::Resume { name } => p.resume_suspended(&name),
-        Start::Restore { dir, name, ip, paused } => p.restore(&dir, name.as_deref(), ip.as_deref(), paused),
-        // The migration connection, from the peer listener.
-        Start::Incoming { req } => p.migrate_in(&req, unsafe { std::net::TcpStream::from_raw_fd(3) }).map(|()| Value::Null),
-        Start::Standby { template } => crate::standby::serve(&p, &template, &mut notify, &op),
-    };
-    if res.is_ok() {
-        p.serve_control();
-    }
-    let reply = match &res {
-        Ok(v) => json!({"ok": true, "result": v}),
-        Err(e) => json!({"ok": false, "error": e.to_string()}),
-    };
-    match notify.take() {
-        Some(mut f) => {
-            let _ = send_json(&mut f, &reply);
-        }
-        None if res.is_ok() && !reply["result"].is_null() => eprintln!("{}", reply["result"]),
-        None => {}
-    }
-    if let Err(e) = res {
-        eprintln!("flexvm: {e}");
-        p.finish(&op, End::NotStarted, 1, None);
-    }
-    drop(op);
-    p.serve()
-}
-
-impl Proc {
     /// Whether SIGINT or SIGTERM came before the VM was up.
     pub fn stop_requested(&self) -> bool {
         self.early.lock().unwrap().iter().any(|&s| s == libc::SIGINT || s == libc::SIGTERM)
     }
 
-    /// Forgets the SIGINTs and SIGTERMs that came before the VM was up.
     pub fn forget_stop(&self) {
         self.early.lock().unwrap().retain(|&s| s != libc::SIGINT && s != libc::SIGTERM);
     }
@@ -962,14 +819,11 @@ impl Proc {
         self.leaving.store(v, Ordering::SeqCst);
     }
 
-    /// Steps the guest's clock in the background, if it is off: under the
-    /// VM's operation lock (so never inside a snapshot), at most one at a time.
+    /// Steps the guest's clock in the background under the operation lock
+    /// (never inside a snapshot), at most one at a time.
     pub fn sync_clock_later(&self) {
         let vm = self.vm().clone();
-        if vm.clock_pending.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        let Some(p) = self.me.upgrade() else { return };
+        let Some(p) = self.me.upgrade().filter(|_| !vm.clock_pending.swap(true, Ordering::SeqCst)) else { return };
         thread::spawn(move || {
             let res = {
                 let _op = p.op();
@@ -990,8 +844,52 @@ impl Proc {
     }
 }
 
-/// The cgroup that VMs' Firecrackers get one cgroup each in, if cgroup v2
-/// is writable.
+/// Runs a VM process until its VM is gone. `notify` gets one JSON line once
+/// the VM is ready (or failed to start).
+pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::File>) -> Result<()> {
+    // Before any thread starts, so they all inherit the mask.
+    let signals = crate::util::block_signals(&SIGNALS);
+    let _ = crate::net::sysctl("net.ipv4.ip_forward", "1");
+    let p = Proc::new(host, paths)?;
+    let (run, prefix) = (p.host.run.clone(), p.host.cfg.prefix.clone());
+    thread::spawn(move || crate::host::collect_garbage(&run, &prefix));
+    let s = p.clone();
+    thread::spawn(move || loop {
+        s.signal(crate::util::wait_signal(&signals));
+    });
+    // Signals that come while it starts wait for it to be up.
+    let op = p.op();
+    let res = match start {
+        Start::Run { name, template, ip, cmd } => {
+            *p.cmd.lock().unwrap() = cmd;
+            p.run(&name, &template, ip)
+        }
+        Start::Resume { name } => p.resume_suspended(&name),
+        Start::Restore { dir, name, ip, paused } => p.restore(&dir, name.as_deref(), ip.as_deref(), paused),
+        Start::Incoming { req } => p.migrate_in(&req, unsafe { std::net::TcpStream::from_raw_fd(3) }).map(|()| Value::Null),
+        Start::Standby { template } => crate::standby::serve(&p, &template, &mut notify, &op),
+    };
+    if res.is_ok() {
+        p.serve_control();
+    }
+    let reply = match &res {
+        Ok(v) => json!({"ok": true, "result": v}),
+        Err(e) => json!({"ok": false, "error": e.to_string()}),
+    };
+    match notify.take() {
+        Some(mut f) => drop(send_json(&mut f, &reply)),
+        None if res.is_ok() && !reply["result"].is_null() => eprintln!("{}", reply["result"]),
+        None => {}
+    }
+    if let Err(e) = res {
+        eprintln!("flexvm: {e}");
+        p.finish(&op, End::NotStarted, 1, None);
+    }
+    drop(op);
+    p.serve()
+}
+
+/// `/sys/fs/cgroup/flexvm`, where each Firecracker gets a cgroup, if cgroup v2 is writable.
 fn cgroup_root() -> Option<PathBuf> {
     let root = PathBuf::from("/sys/fs/cgroup/flexvm");
     let setup = || -> Result<()> {
@@ -1005,15 +903,14 @@ fn cgroup_root() -> Option<PathBuf> {
         }
         Ok(())
     };
+    static WARNED: AtomicBool = AtomicBool::new(false);
     match setup() {
         Ok(()) => Some(root),
-        Err(e) => {
-            static WARNED: AtomicBool = AtomicBool::new(false);
-            if !WARNED.swap(true, Ordering::Relaxed) {
-                eprintln!("WARNING: per-VM cgroups unavailable: {e}");
-            }
+        Err(e) if !WARNED.swap(true, Ordering::Relaxed) => {
+            eprintln!("WARNING: per-VM cgroups unavailable: {e}");
             None
         }
+        Err(_) => None,
     }
 }
 
@@ -1021,9 +918,8 @@ pub fn host_available_mib() -> u64 {
     proc_kb("/proc/meminfo", "MemAvailable").unwrap_or(0) >> 20
 }
 
-/// Free memory (MiB) the controller keeps plugged for a guest with `total`
-/// MiB. The guest agent asks for more as soon as it has less than this, and
-/// throttles allocations that outrun the plug (guest/src/mem.rs uses the same mark).
+/// Free memory (MiB) kept plugged for a guest of `total` MiB; the guest asks
+/// for more below it (guest/src/mem.rs uses the same mark).
 pub fn headroom(total: u64) -> u64 {
     (total / 4).max(1024.min(total / 2))
 }
@@ -1033,42 +929,31 @@ pub fn headroom(total: u64) -> u64 {
 pub enum Resized {
     Grew,
     Same,
-    /// The guest is still processing the previous request, or the VM is busy.
+    /// Still following the previous request, or the VM is busy.
     Busy,
-    /// Short on memory, and at its ceiling or refused by the host's reserve.
+    /// Short, and at its ceiling or refused by the host's reserve.
     Full,
 }
 
-/// Grows or shrinks a VM's hotplugged memory to keep `headroom` of it free,
-/// never shrinking below what its template was snapshotted with. Plugged
-/// memory the guest has not touched costs the host nothing, and pages it
-/// frees go back through free page reporting, so this mostly decides how far
-/// the guest may grow before asking again.
-///
+/// Keeps `headroom` of a VM's memory free by growing or shrinking its
+/// hotplugged memory, never below what its template was snapshotted with.
 /// The guest is untrusted: its size comes from Firecracker, and what it says
-/// it has free (`hint`, MiB, from its own request; else the balloon
-/// statistics) only steers growth, which is bounded per step and admitted
-/// against the host's reserve (`Host::admit`). A VM that is short and cannot
-/// grow here (at its ceiling, or refused) is flagged as starved, so that it
-/// is moved somewhere roomier.
+/// it has free (`hint`, MiB; else the balloon statistics) only steers growth,
+/// bounded per step and admitted against the host's reserve. A VM short and
+/// unable to grow here is flagged starved, to be moved somewhere roomier.
+/// Callers hold the operation lock (or the copy-growth lock).
 fn resize(vm: &Vm, host: &Host, hint: Option<u64>, grow_only: bool) -> Result<Resized> {
     let meta = &vm.template.meta;
     let hotplug_total = meta.max_mib - meta.mem_mib;
     if hotplug_total == 0 {
         return Ok(Resized::Full);
     }
-    // Callers hold the VM's operation lock (or its copy-growth lock), so no
-    // lifecycle operation runs meanwhile; only a running VM is resized.
     let mut last = vm.last_resize.lock().unwrap();
     if vm.state() != State::Running {
         return Ok(Resized::Busy);
     }
-    let (stats, hp) = vm.fc(|fc| {
-        let stats = if hint.is_none() { fc.get("/balloon/statistics")? } else { Value::Null };
-        Ok((stats, fc.get("/hotplug/memory")?))
-    })?;
-    let requested = hp["requested_size_mib"].as_u64().ok_or("no hotplug state")?;
-    let plugged = hp["plugged_size_mib"].as_u64().ok_or("no hotplug state")?;
+    let (stats, hp) = vm.fc(|fc| Ok((if hint.is_none() { fc.get("/balloon/statistics")? } else { Value::Null }, fc.get("/hotplug/memory")?)))?;
+    let (requested, plugged) = (hp["requested_size_mib"].as_u64().ok_or("no hotplug state")?, hp["plugged_size_mib"].as_u64().ok_or("no hotplug state")?);
     if plugged != requested {
         return Ok(Resized::Busy);
     }
@@ -1079,15 +964,13 @@ fn resize(vm: &Vm, host: &Host, hint: Option<u64>, grow_only: bool) -> Result<Re
         None => stats["available_memory"].as_u64().unwrap_or(0) >> 20,
     }
     .min(total);
-    let floor = meta.plugged_mib.min(hotplug_total);
-    let headroom = headroom(total);
+    let (floor, headroom) = (meta.plugged_mib.min(hotplug_total), headroom(total));
     let round = |mib: u64| mib.div_ceil(STEP_MIB) * STEP_MIB;
-    // Balloon statistics lag a plug by up to a second; don't grow twice on stale numbers.
+    // Balloon statistics lag a plug by up to a second.
     let stale = hint.is_none() && last.elapsed() < Duration::from_millis(1500);
     let short = headroom.saturating_sub(avail);
     let new = if short > 0 && !stale {
-        let step = round(headroom * 2 - avail).min(round(total / 4).max(STEP_MIB));
-        (requested + step).min(hotplug_total)
+        (requested + round(headroom * 2 - avail).min(round(total / 4).max(STEP_MIB))).min(hotplug_total)
     } else if !grow_only && avail > headroom * 3 && requested > floor && last.elapsed() > Duration::from_secs(10) {
         requested.saturating_sub((avail - headroom * 2) / STEP_MIB * STEP_MIB).max(floor)
     } else {
@@ -1106,20 +989,17 @@ fn resize(vm: &Vm, host: &Host, hint: Option<u64>, grow_only: bool) -> Result<Re
     Ok(if new > requested { Resized::Grew } else { Resized::Same })
 }
 
-/// The longest memory request a guest may send, and how long it has to send it.
 const MEM_REQUEST_MAX: usize = 128;
 const MEM_REQUEST_DEADLINE: Duration = Duration::from_millis(500);
-/// Requests closer together than this are answered `busy` without acting.
+/// Requests closer together than this are answered `busy`.
 const MEM_REQUEST_GAP: Duration = Duration::from_millis(50);
 
-/// Reads one `MEM <available KiB> <total KiB>` line of at most
-/// `MEM_REQUEST_MAX` bytes within `MEM_REQUEST_DEADLINE`. Returns the
-/// available MiB; the guest's total is ignored (Firecracker knows it).
+/// One `MEM <available KiB> <total KiB>` line, at most `MEM_REQUEST_MAX`
+/// bytes within `MEM_REQUEST_DEADLINE`: the available MiB.
 fn read_mem_request(conn: &UnixStream) -> Option<u64> {
     use std::io::Read;
     let deadline = Instant::now() + MEM_REQUEST_DEADLINE;
-    let mut buf = [0u8; MEM_REQUEST_MAX];
-    let mut len = 0;
+    let (mut buf, mut len) = ([0u8; MEM_REQUEST_MAX], 0);
     while !buf[..len].contains(&b'\n') {
         let left = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero())?;
         if len == buf.len() || conn.set_read_timeout(Some(left)).is_err() {
@@ -1130,55 +1010,39 @@ fn read_mem_request(conn: &UnixStream) -> Option<u64> {
             Ok(n) => len += n,
         }
     }
-    let line = std::str::from_utf8(&buf[..len]).ok()?.split('\n').next()?;
-    let mut f = line.split(' ');
+    let mut f = std::str::from_utf8(&buf[..len]).ok()?.split('\n').next()?.split(' ');
     match (f.next(), f.next().map(str::parse::<u64>), f.next().map(str::parse::<u64>), f.next()) {
         (Some("MEM"), Some(Ok(avail_kib)), Some(Ok(_)), None) => Some(avail_kib >> 10),
         _ => None,
     }
 }
 
-/// Least time between two evictions from this host.
-const EVICT_EVERY: Duration = Duration::from_secs(5);
-
-/// Memory pressure: when the host goes under its reserve, or a VM cannot
-/// grow here, one VM is moved to a peer with room. Every VM process's
-/// controller calls this once a second; whichever holds `STATE/evict.lock`
-/// decides, at most once per `EVICT_EVERY`. Standby VMs go first: they are
-/// the cheapest memory to give back.
+/// Memory pressure: when the host is under its reserve, or a VM cannot grow
+/// here, standby VMs go first, then one VM moves to a peer. Every VM process
+/// calls this once a second; whoever holds `STATE/evict.lock` decides, at
+/// most once per 5 s.
 fn relieve(host: &Host, starved_here: bool) {
-    let avail = host_available_mib();
-    let reserve = host.cfg.reserve_mib;
-    // A starved VM calls in itself, so a host with room has nothing to decide.
+    let (avail, reserve) = (host_available_mib(), host.cfg.reserve_mib);
     if avail >= reserve && !starved_here {
         return;
     }
     let Ok(lock) = std::fs::File::options().create(true).truncate(false).write(true).open(host.state.join("evict.lock")) else { return };
-    if unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&lock), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+    if crate::host::flock(&lock, libc::LOCK_EX | libc::LOCK_NB).is_err() {
         return;
     }
     if avail < reserve {
-        let mut shed = 0;
-        for t in crate::standby::templates(host) {
-            for id in crate::standby::live(host, &t) {
-                crate::standby::stop(&id);
-                shed += 1;
-            }
+        let standby: Vec<_> = crate::standby::templates(host).iter().flat_map(|t| crate::standby::live(host, t)).collect();
+        standby.iter().for_each(crate::standby::stop);
+        if !standby.is_empty() {
+            return eprintln!("host has {avail} MiB available, under its {reserve} MiB reserve: stopped {} standby vms", standby.len());
         }
-        if shed > 0 {
-            eprintln!("host has {avail} MiB available, under its {reserve} MiB reserve: stopped {shed} standby vms");
-            return;
-        }
-    }
-    if host.cfg.peers.is_empty() {
-        return;
     }
     let last = host.state.join("evict.last");
-    let recent = std::fs::metadata(&last).and_then(|m| m.modified()).ok().and_then(|t| std::time::SystemTime::now().duration_since(t).ok());
-    if recent.is_some_and(|d| d < EVICT_EVERY) {
+    let recent = std::fs::metadata(&last).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
+    if host.cfg.peers.is_empty() || recent.is_some_and(|d| d < Duration::from_secs(5)) {
         return;
     }
-    let rss = |pid: Option<u32>| pid.and_then(|p| crate::util::proc_kb(&format!("/proc/{p}/status"), "VmRSS")).unwrap_or(0);
+    let rss = |pid: Option<u32>| pid.and_then(|p| proc_kb(&format!("/proc/{p}/status"), "VmRSS")).unwrap_or(0);
     let running: Vec<_> = host.entries().into_iter().filter(|e| e.state == "running").collect();
     let Some(vm) = running.iter().find(|e| e.starved).or_else(|| running.iter().max_by_key(|e| rss(e.firecracker))) else { return };
     let _ = std::fs::write(&last, b"");
@@ -1192,35 +1056,31 @@ fn relieve(host: &Host, starved_here: bool) {
     }
 }
 
-/// Sends one request to a peer's listener and returns its result.
-pub fn peer_call(peer: &str, req: Value) -> Result<Value> {
-    let mut c = crate::util::connect(peer, Duration::from_millis(500))?;
-    c.set_read_timeout(Some(Duration::from_secs(2)))?;
-    c.set_write_timeout(Some(Duration::from_secs(2)))?;
-    send_json(&mut c, &req)?;
-    let reply = crate::util::recv_json(&mut BufReader::new(c))?.ok_or("peer hung up")?;
+/// The result of a `{"ok", "result" | "error"}` reply.
+fn answer(reply: Option<Value>, who: &str) -> Result<Value> {
+    let reply = reply.ok_or_else(|| format!("{who} hung up"))?;
     if reply["ok"] != json!(true) {
         bail!("{}", reply["error"].as_str().unwrap_or("refused"));
     }
     Ok(reply["result"].clone())
 }
 
-/// Joins a reader and writer into one Read + Write.
-pub struct ReadWrite<R, W>(pub R, pub W);
-
-impl<R: std::io::Read, W> std::io::Read for ReadWrite<R, W> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.0.read(buf)
-    }
+/// One request to a peer's listener.
+pub fn peer_call(peer: &str, req: Value) -> Result<Value> {
+    let mut c = crate::util::connect(peer, Duration::from_millis(500))?;
+    c.set_read_timeout(Some(Duration::from_secs(2)))?;
+    c.set_write_timeout(Some(Duration::from_secs(2)))?;
+    send_json(&mut c, &req)?;
+    answer(crate::util::recv_json(&mut BufReader::new(c))?, peer)
 }
 
-impl<R, W: Write> Write for ReadWrite<R, W> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.1.write(buf)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.1.flush()
-    }
+/// Sends `req` to every peer at once, and waits for them all.
+pub fn tell_peers(host: &Host, req: Value) {
+    let sends: Vec<_> = host.cfg.peers.iter().cloned().map(|p| {
+        let req = req.clone();
+        thread::spawn(move || peer_call(&p, req))
+    }).collect();
+    sends.into_iter().for_each(|s| drop(s.join()));
 }
 
 /// Connects to VM `name`'s control socket and sends `req`, with `fds`.
@@ -1234,12 +1094,7 @@ pub fn connect(host: &Host, name: &str, req: &Value, fds: &[i32]) -> Result<Unix
 
 /// Sends `req` to VM `name` and returns its result.
 pub fn call(host: &Host, name: &str, req: Value) -> Result<Value> {
-    let c = connect(host, name, &req, &[])?;
-    let reply = crate::util::recv_json(&mut BufReader::new(c))?.ok_or_else(|| format!("vm {name} hung up"))?;
-    if reply["ok"] != json!(true) {
-        bail!("{}", reply["error"].as_str().unwrap_or("request failed"));
-    }
-    Ok(reply["result"].clone())
+    answer(crate::util::recv_json(&mut BufReader::new(connect(host, name, &req, &[])?))?, &format!("vm {name}"))
 }
 
 #[cfg(test)]
@@ -1253,17 +1108,15 @@ mod tests {
             b.write_all(bytes).unwrap();
             if close {
                 drop(b);
-                return read_mem_request(&a);
             }
             read_mem_request(&a)
         };
         assert_eq!(req(b"MEM 2097152 4194304\n", false), Some(2048));
-        assert_eq!(req(b"MEM 1 2 3\n", false), None);
-        assert_eq!(req(b"MEM x 2\n", false), None);
-        assert_eq!(req(b"GROW 1 2\n", false), None);
-        // No newline: gives up when the peer closes, at the size cap, or at the deadline.
+        for bad in [&b"MEM 1 2 3\n"[..], b"MEM x 2\n", b"GROW 1 2\n", &[b'7'; 4096]] {
+            assert_eq!(req(bad, false), None);
+        }
+        // No newline: gives up when the peer closes, or at the deadline.
         assert_eq!(req(b"MEM 1 2", true), None);
-        assert_eq!(req(&[b'7'; 4096], false), None);
         let t = Instant::now();
         assert_eq!(req(b"MEM 1", false), None);
         assert!(t.elapsed() < MEM_REQUEST_DEADLINE * 2);
