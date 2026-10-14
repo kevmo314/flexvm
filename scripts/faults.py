@@ -267,26 +267,37 @@ def addr(host, ip):
         return {}
 
 
+def start_listener(h, listen=None, extra=()):
+    """`h`'s listener, on `listen` (default: its address) with `extra` flags."""
+    other = B if h is A else A
+    for d in (h.state, h.run):
+        os.makedirs(d, exist_ok=True)
+    lg = open(os.path.join(h.run, "listen.log"), "a")
+    listeners[h.addr] = subprocess.Popen(
+        [BIN, "--state", h.state, "--run", h.run, "listen", listen or h.addr, "--peer", other.addr, "--vm-ips", h.ips,
+         "--reserve", "512", "--prefix", args.prefix, *extra], stdout=lg, stderr=lg, env=ENV)
+    hp = h.addr.rsplit(":", 1)
+    up = lambda: subprocess.run(["bash", "-c", f"exec 3<>/dev/tcp/{hp[0]}/{hp[1]}"], capture_output=True).returncode == 0
+    assert wait_for(up, 10), f"listener {h} did not come up"
+
+
 def start_listeners():
     if args.no_listeners:
         return
-    for h, other in ((A, B), (B, A)):
-        for d in (h.state, h.run):
-            os.makedirs(d, exist_ok=True)
-        lg = open(os.path.join(h.run, "listen.log"), "a")
-        listeners[h.addr] = subprocess.Popen(
-            [BIN, "--state", h.state, "--run", h.run, "listen", h.addr, "--peer", other.addr, "--vm-ips", h.ips,
-             "--reserve", "512", "--prefix", args.prefix], stdout=lg, stderr=lg, env=ENV)
     for h in (A, B):
-        hp = h.addr.rsplit(":", 1)
-        up = lambda: subprocess.run(["bash", "-c", f"exec 3<>/dev/tcp/{hp[0]}/{hp[1]}"], capture_output=True).returncode == 0
-        assert wait_for(up, 10), f"listener {h} did not come up"
+        start_listener(h)
+
+
+def stop_listener(h):
+    p = listeners.pop(h.addr, None)
+    if p:
+        p.terminate()
+        p.wait()
 
 
 def stop_listeners():
-    for p in listeners.values():
-        p.terminate()
-        p.wait()
+    for h in (A, B):
+        stop_listener(h)
 
 
 def fc_pid(host, name):
@@ -2437,6 +2448,98 @@ def kill_source():
     cleanup(n)
 
 
+def kill_refused_checkpoint():
+    """A kill that waited for a migration and was refused (the VM became its
+    source) leaves nothing behind: once the target dies mid-pull and the
+    source runs its copy again, a checkpoint is not taken for killed."""
+    n = "ft-kill-refused"
+    clear_log(A, n)
+    m = setup(n, mib=1500)
+    pid = vm_pid(A, n)
+    fault(B, "incoming_stall", 2000)
+    r = [None]
+    t = threading.Thread(target=lambda: r.__setitem__(0, migrate(A, n, B)))
+    t.start()
+    # The target stalls preparing; the source holds its operation lock, not yet a source.
+    lock = os.path.join(B.run, "vms", f"{n}.lock")
+    wait_for(lambda: os.path.exists(lock) and open(lock).read().strip(), 20)
+    os.kill(pid, signal.SIGINT)
+    t.join()
+    check("kill refused: migrated", r[0]["ok"], r[0])
+    fault(A, "pages", 6000)  # the pull cannot finish
+    tpid = json.load(open(lock))["pid"]
+    os.kill(tpid, signal.SIGKILL)
+    check("kill refused: the kill was refused for the source",
+          wait_for(lambda: "source of a migration" in log(A, n), 10) and alive(pid), log(A, n)[-500:])
+    fault(A, "pages", 0)
+    check("kill refused: the source runs its copy again", wait_for(lambda: where(n) == {A: "running"}, 60), where(n))
+    c = checkpoint(A, n, ckpt_path(n))
+    check("kill refused: a checkpoint afterwards succeeds", c["ok"], c)
+    check("kill refused: still running, md5 intact", where(n) == {A: "running"} and md5(A, n) == m, where(n))
+    cleanup(n)
+
+
+def dual_stack():
+    """Whether a default [::] bind here takes IPv4 connections on loopback."""
+    try:
+        if open("/proc/sys/net/ipv6/bindv6only").read().strip() != "0":
+            return False
+        with socket.socket(socket.AF_INET6) as l:
+            l.bind(("::", 0))
+            l.listen(1)
+            with socket.create_connection(("127.0.0.1", l.getsockname()[1]), timeout=2):
+                return True
+    except OSError:
+        return False
+
+
+def wildcard_listen():
+    """A listener on a wildcard address (0.0.0.0, ::, ::ffff:0:0) or a
+    link-local one is refused without --underlay, as is port 0; with one,
+    migrations from it give the target the underlay address to pull pages
+    from, never the wildcard. On a dual-stack [::] listener, IPv4 peers
+    (arriving as ::ffff:a.b.c.d) are still peers: pages are pulled from it
+    and migrations to it arrive."""
+    if args.no_listeners:
+        return print("wildcard listen: skipped (--no-listeners)")
+    host_ip, port = A.addr.rsplit(":", 1)
+    # On a host with no configuration yet (A's keeps the --underlay given below).
+    fresh = Host(A.addr, A.dir + "-wildcard", A.ips)
+    for bad in (f"0.0.0.0:{port}", f"[::]:{port}", f"[::ffff:0:0]:{port}", f"[fe80::1%1]:{port}"):
+        subprocess.run(["rm", "-rf", fresh.dir])
+        code, out, err = cli(fresh, "listen", bad, timeout=10)
+        check(f"wildcard listen: {bad} without --underlay refused", code != 0 and "--underlay" in err, (code, err))
+    subprocess.run(["rm", "-rf", fresh.dir])
+    code, out, err = cli(fresh, "listen", f"{host_ip}:0", timeout=10)
+    check("wildcard listen: port 0 refused", code != 0 and "port" in err, (code, err))
+    subprocess.run(["rm", "-rf", fresh.dir])
+    wilds = ["0.0.0.0"] + (["[::]"] if dual_stack() else [])
+    if len(wilds) == 1:
+        print("wildcard listen: no dual-stack loopback here; [::] not tried")
+    for wild in wilds:
+        stop_listener(A)
+        try:
+            start_listener(A, f"{wild}:{port}", ["--underlay", host_ip])
+            n = "ft-wildcard"
+            clear_log(B, n)
+            m = setup(n)
+            ok(migrate(A, n, B))
+            st = wait_released(B, n)
+            check(f"wildcard listen {wild}: released", st["released"] is True and where(n) == {B: "running"}, (st, where(n)))
+            pulls = re.findall(r"pull from (\S+) ended", log(B, n))
+            check(f"wildcard listen {wild}: the target pulled from the underlay address", pulls == [A.addr], pulls)
+            check(f"wildcard listen {wild}: md5 intact", md5(B, n) == m)
+            # And back: the wildcard listener takes a migration from its IPv4 peer.
+            r = migrate(B, n, A)
+            wait_released(A, n)
+            check(f"wildcard listen {wild}: a migration to it arrives", r["ok"] and where(n) == {A: "running"}, (r, where(n)))
+            check(f"wildcard listen {wild}: md5 intact after the round trip", md5(A, n) == m)
+            cleanup(n)
+        finally:
+            stop_listener(A)
+            start_listener(A)
+
+
 def raw(host, data, timeout=10):
     """Sends `data` on a new connection to `host`'s listener; returns everything until EOF."""
     h, port = host.addr.rsplit(":", 1)
@@ -2991,6 +3094,7 @@ SCENARIOS = dict(
     prepare_disconnect=prepare_disconnect, prepare_trickle=prepare_trickle, prepare_fail=prepare_fail,
     fc_prepare=fc_prepare, slow_preload=slow_preload, ckpt_packet_hold=ckpt_packet_hold, standby=standby,
     suspend_disk_freed=suspend_disk_freed, resume_mark_fails=resume_mark_fails, kill_source=kill_source,
+    kill_refused_checkpoint=no_evict(kill_refused_checkpoint), wildcard_listen=wildcard_listen,
     forged_peer=forged_peer, restore_ip_peer=restore_ip_peer, late_withdrawal=late_withdrawal,
     incoming_killed=incoming_killed, start_killed=start_killed, claim_killed=claim_killed, fc_died=fc_died,
     cow_wp_race=cow_wp_race, fetch_tail_enomem=fetch_tail_enomem, fetch_enomem_stuck=fetch_enomem_stuck)

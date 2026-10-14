@@ -47,7 +47,7 @@ impl Proc {
     /// `if_idle` (eviction): refused at once if the VM is busy or still arriving.
     pub fn migrate(self: &Arc<Self>, to: &str, if_idle: bool) -> Result<Value> {
         let vm = self.vm().clone();
-        let Some(source) = self.host.cfg.listen.clone() else {
+        let Some(source) = self.host.cfg.advertise()? else {
             bail!("this host runs no peer listener (flexvm listen): the target fetches the vm's memory through it");
         };
         let op = match if_idle {

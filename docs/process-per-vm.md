@@ -167,8 +167,10 @@ answer, held packets). What changed is who is at each end:
    check that can abort, then under the host lock turns `pending` into
    `committed` (refused if it was fenced), and resumes before letting go of
    the lock.
-4. Pages: the target's pager connects to the *source's* listener with
-   `pages {name, mig}`; the listener passes the socket (SCM_RIGHTS) to the
+4. Pages: the target's pager connects to the *source's* listener (the
+   address the source sent: its listen address, or for a wildcard one its
+   underlay address with the listen port; `listen` refuses a wildcard
+   address without `--underlay`) with `pages {name, mig}`; the listener passes the socket (SCM_RIGHTS) to the
    source VM process, which serves it if it is the source of that migration.
 5. Release: the source polls `migration {mig}` on the target's listener.
    The listener answers from `STATE/migs/ID`: `pending`, `committed`,
@@ -347,7 +349,9 @@ where it is kept and what tests it.
    resumes only a VM paused by SIGTSTP (or held by `restore --paused`), and
    is ignored once a suspend or kill began: the kernel sends it after any
    SIGSTOP, systemd right after SIGTERM. A destroy refused because the VM is
-   migrating away (SIGINT, or `run -- CMD` ending) never ends the process.
+   migrating away (SIGINT, or `run -- CMD` ending) never ends the process,
+   and takes back the checkpoint cancel it raised (fault
+   `kill_refused_checkpoint`).
 6. **Suspend markers and quarantine.** `STARTED` means consumed: `resume`
    deletes such a checkpoint and `ls` does not show it; deleting it holds
    the operation lock, and a suspend deletes it first. Quarantine is a file
@@ -416,7 +420,8 @@ where it is kept and what tests it.
   checkpoint appears, staging is cleared by the next one), `hot_budget`
   becomes `standby` (count, refill, claim fallback). New: `abort_superseded`,
   `gen_zero`, `suspend_gen`, `signals`, `kill_source`, `forged_peer`,
-  `restore_ip_peer`, `late_withdrawal`, and processes SIGKILLed between
+  `restore_ip_peer`, `late_withdrawal`, `kill_refused_checkpoint`,
+  `wildcard_listen`, and processes SIGKILLed between
   steps at test stalls (`incoming_killed`, `start_killed`, `claim_killed`).
   Dropped:
   `target_restart_symlink`, `shared_run_dir`, `state_dir_lock` (they tested a

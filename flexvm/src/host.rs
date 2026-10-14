@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
@@ -58,8 +58,38 @@ impl Config {
         IpRange::parse(&self.vm_ips)
     }
 
+    /// Never a wildcard address.
     pub fn underlay(&self) -> Option<Ipv4Addr> {
-        self.underlay.or_else(|| self.listen.as_deref()?.rsplit_once(':')?.0.parse().ok())
+        let from_listen = || match self.listen.as_deref()?.parse::<SocketAddr>().ok()?.ip().to_canonical() {
+            IpAddr::V4(v4) => Some(v4),
+            IpAddr::V6(_) => None,
+        };
+        self.underlay.or_else(from_listen).filter(|u| !u.is_unspecified())
+    }
+
+    /// Where peers reach this host's listener (a migration target pulls
+    /// pages from it): the listen address, or for a wildcard one (0.0.0.0,
+    /// ::, ::ffff:0.0.0.0) or an IPv6 link-local one (its scope id means
+    /// nothing elsewhere) the underlay address with the listen port. None
+    /// without a listener.
+    pub fn advertise(&self) -> Result<Option<String>> {
+        let Some(listen) = self.listen.as_deref() else { return Ok(None) };
+        let Ok(addr) = listen.parse::<SocketAddr>() else { return Ok(Some(listen.into())) };
+        if addr.port() == 0 {
+            bail!("listening on {listen}: give a port; peers are told it");
+        }
+        let ip = addr.ip().to_canonical();
+        let local_only = match ip {
+            IpAddr::V4(v4) => v4.is_unspecified(),
+            IpAddr::V6(v6) => v6.is_unspecified() || v6.is_unicast_link_local(),
+        };
+        if !local_only {
+            return Ok(Some(SocketAddr::new(ip, addr.port()).to_string()));
+        }
+        match self.underlay() {
+            Some(u) => Ok(Some(SocketAddr::from((u, addr.port())).to_string())),
+            None => bail!("listening on {listen} needs --underlay: peers cannot reach a wildcard or link-local address"),
+        }
     }
 }
 
@@ -891,6 +921,36 @@ mod tests {
 
     fn ip(s: &str) -> Ipv4Addr {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn a_wildcard_listener_advertises_its_underlay() {
+        let cfg = |listen: Option<&str>, underlay: Option<&str>| Config { listen: listen.map(String::from), underlay: underlay.map(ip), ..Config::default() };
+        assert_eq!(cfg(None, None).advertise().unwrap(), None);
+        assert_eq!(cfg(Some("10.1.0.1:7070"), None).advertise().unwrap().as_deref(), Some("10.1.0.1:7070"));
+        assert_eq!(cfg(Some("10.1.0.1:7070"), Some("10.1.0.2")).advertise().unwrap().as_deref(), Some("10.1.0.1:7070"));
+        assert_eq!(cfg(Some("peer.lan:7070"), None).advertise().unwrap().as_deref(), Some("peer.lan:7070"));
+        for wild in ["0.0.0.0:7070", "[::]:7070"] {
+            assert!(cfg(Some(wild), None).advertise().is_err(), "{wild}");
+            assert_eq!(cfg(Some(wild), None).underlay(), None, "{wild}");
+            assert_eq!(cfg(Some(wild), Some("10.1.0.2")).advertise().unwrap().as_deref(), Some("10.1.0.2:7070"), "{wild}");
+        }
+        assert!(cfg(Some("0.0.0.0:7070"), Some("0.0.0.0")).advertise().is_err());
+        // An IPv4-mapped wildcard binds as 0.0.0.0; a mapped address is its IPv4 one.
+        assert!(cfg(Some("[::ffff:0:0]:7070"), None).advertise().is_err());
+        assert_eq!(cfg(Some("[::ffff:0:0]:7070"), Some("10.1.0.2")).advertise().unwrap().as_deref(), Some("10.1.0.2:7070"));
+        assert_eq!(cfg(Some("[::ffff:10.1.0.1]:7070"), None).advertise().unwrap().as_deref(), Some("10.1.0.1:7070"));
+        assert_eq!(cfg(Some("[::ffff:10.1.0.1]:7070"), None).underlay(), Some(ip("10.1.0.1")));
+        // Link-local: its scope id names an interface of this host only.
+        for ll in ["[fe80::1%3]:7070", "[fe80::1]:7070"] {
+            assert!(cfg(Some(ll), None).advertise().is_err(), "{ll}");
+            assert_eq!(cfg(Some(ll), Some("10.1.0.2")).advertise().unwrap().as_deref(), Some("10.1.0.2:7070"), "{ll}");
+        }
+        assert_eq!(cfg(Some("[2001:db8::1]:7070"), None).advertise().unwrap().as_deref(), Some("[2001:db8::1]:7070"));
+        // Port 0 would be advertised as such.
+        for p0 in ["10.1.0.1:0", "0.0.0.0:0", "[::]:0"] {
+            assert!(cfg(Some(p0), Some("10.1.0.2")).advertise().is_err(), "{p0}");
+        }
     }
 
     fn dead_owner(h: &Host, pid: u32, fcs: &[&Ident]) -> Ident {

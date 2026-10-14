@@ -5,7 +5,7 @@
 //! (status/done), `route`, `lend`.
 
 use std::io::Read;
-use std::net::{Ipv4Addr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -27,6 +27,9 @@ pub fn main(host: Host) -> Result<()> {
             TcpListener::bind(&addr).map_err(|e| format!("listen on {addr}: {e}"))?
         }
     };
+    if let Some(e) = unreachable_at(listener.local_addr()?, v6only(&listener), host.cfg.advertise()?.as_deref()) {
+        bail!("{e}");
+    }
     crate::net::sysctl("net.ipv4.ip_forward", "1")?;
     if let Some(dev) = &host.cfg.announce_dev {
         crate::net::sysctl(&format!("net.ipv4.conf.{dev}.proxy_arp"), "1")?;
@@ -36,11 +39,8 @@ pub fn main(host: Host) -> Result<()> {
     for conn in listener.incoming() {
         let conn = match conn {
             Ok(c) => c,
-            Err(e) if matches!(e.kind(), std::io::ErrorKind::Interrupted | std::io::ErrorKind::ConnectionAborted) => continue,
             Err(e) => {
-                // E.g. out of fds: wait rather than spin.
-                eprintln!("accept: {e}");
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                crate::util::accept_failed("peer listener", &e);
                 continue;
             }
         };
@@ -60,6 +60,29 @@ pub fn main(host: Host) -> Result<()> {
     Ok(())
 }
 
+fn v6only(l: &TcpListener) -> bool {
+    let (mut v, mut len) = (0i32, std::mem::size_of::<i32>() as libc::socklen_t);
+    let r = unsafe { libc::getsockopt(l.as_raw_fd(), libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, &mut v as *mut i32 as *mut libc::c_void, &mut len) };
+    r == 0 && v != 0
+}
+
+/// Why peers cannot reach a listener bound at `local` through the endpoint
+/// it advertises: an IPv6 socket takes IPv4 connections only bound to the
+/// wildcard without IPV6_V6ONLY (net.ipv6.bindv6only), or to a mapped address.
+fn unreachable_at(local: SocketAddr, v6only: bool, advertised: Option<&str>) -> Option<String> {
+    let v4 = advertised.and_then(|a| a.parse::<SocketAddr>().ok()).is_some_and(|a| a.is_ipv4());
+    let takes_v4 = local.ip().to_canonical().is_ipv4() || (local.ip().is_unspecified() && !v6only);
+    (v4 && !takes_v4).then(|| {
+        format!("{local} takes no IPv4 connections, but peers are told to reach this host at {}; listen on 0.0.0.0, a dual-stack [::] or the underlay address", advertised.unwrap_or_default())
+    })
+}
+
+/// Peers are compared by address, an IPv4 one also as it arrives on a
+/// dual-stack socket (::ffff:a.b.c.d).
+fn is_peer(peers: &[String], from: IpAddr) -> bool {
+    peers.iter().filter_map(|p| p.to_socket_addrs().ok()).flatten().any(|a| a.ip().to_canonical() == from.to_canonical())
+}
+
 fn activated() -> Option<TcpListener> {
     let pid: u32 = std::env::var("LISTEN_PID").ok()?.parse().ok()?;
     let n: u32 = std::env::var("LISTEN_FDS").ok()?.parse().ok()?;
@@ -69,7 +92,7 @@ fn activated() -> Option<TcpListener> {
 fn handle(host: &Host, mut conn: TcpStream) -> Result<()> {
     // Peers are authenticated by address only: the network between them is trusted.
     let from = conn.peer_addr()?.ip();
-    if !host.cfg.peers.iter().filter_map(|p| p.to_socket_addrs().ok()).flatten().any(|a| a.ip() == from) {
+    if !is_peer(&host.cfg.peers, from) {
         bail!("{from} is not a peer of this host (flexvm listen --peer)");
     }
     let line = read_line(&mut conn)?;
@@ -182,4 +205,44 @@ fn route(host: &Host, req: &Value) -> Result<Value> {
         }
     }
     Ok(json!({"ip": ip.to_string(), "local": local}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_ipv4_peer_on_a_dual_stack_socket_is_a_peer() {
+        let peers = vec!["10.1.0.2:7070".to_string(), "[2001:db8::2]:7070".to_string()];
+        for from in ["10.1.0.2", "::ffff:10.1.0.2", "2001:db8::2"] {
+            assert!(is_peer(&peers, from.parse().unwrap()), "{from}");
+        }
+        for from in ["10.1.0.3", "::ffff:10.1.0.3", "::1", "2001:db8::3"] {
+            assert!(!is_peer(&peers, from.parse().unwrap()), "{from}");
+        }
+        assert!(is_peer(&["[::ffff:10.1.0.2]:7070".to_string()], "10.1.0.2".parse().unwrap()));
+    }
+
+    #[test]
+    fn an_ipv6_only_listener_cannot_advertise_an_ipv4_endpoint() {
+        let at = |s: &str| s.parse::<SocketAddr>().unwrap();
+        let v4 = Some("10.1.0.2:7070");
+        assert!(unreachable_at(at("[::]:7070"), false, v4).is_none());
+        assert!(unreachable_at(at("[::]:7070"), true, v4).is_some());
+        assert!(unreachable_at(at("[fe80::1%3]:7070"), false, v4).is_some());
+        assert!(unreachable_at(at("[2001:db8::1]:7070"), false, v4).is_some());
+        assert!(unreachable_at(at("[::ffff:0.0.0.0]:7070"), true, v4).is_none());
+        assert!(unreachable_at(at("0.0.0.0:7070"), false, v4).is_none());
+        assert!(unreachable_at(at("[::]:7070"), true, Some("[2001:db8::1]:7070")).is_none());
+        assert!(unreachable_at(at("[2001:db8::1]:7070"), true, Some("[2001:db8::1]:7070")).is_none());
+        assert!(unreachable_at(at("[::]:7070"), true, None).is_none());
+    }
+
+    /// What this host's kernel does with a dual-stack wildcard bind.
+    #[test]
+    fn a_wildcard_bind_reports_its_v6only() {
+        let Ok(l) = TcpListener::bind("[::]:0") else { return };
+        let sysctl = std::fs::read_to_string("/proc/sys/net/ipv6/bindv6only").unwrap_or_default();
+        assert_eq!(v6only(&l), sysctl.trim() == "1");
+    }
 }
