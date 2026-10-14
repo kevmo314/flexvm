@@ -578,7 +578,7 @@ where it is kept and what tests it.
   becomes `standby` (count, refill, claim fallback). New: `abort_superseded`,
   `gen_zero`, `suspend_gen`, `signals`, `kill_source`, `forged_peer`, `evict_grower`, `evict_latency`, `evict_no_pingpong`, `evict_skips_cmd`,
   `restore_ip_peer`, `late_withdrawal`, `kill_refused_checkpoint`,
-  `wildcard_listen`, `same_host_order`, `same_host_slow_route`, `same_host_flood`, `arrival_abort_route`, `arrival_killed_route`, `handoff_superseded`,
+  `wildcard_listen`, `same_host_order`, `same_host_slow_route`, `same_host_flood`, `same_host_late_handover`, `arrival_abort_route`, `arrival_killed_route`, `handoff_superseded`,
   `suspend_cmd` (#134), `pause_cmd_start`, `fc_died_busy` (#122), `suspend_died`, and processes SIGKILLed between
   steps at test stalls (`incoming_killed`, `start_killed`, `claim_killed`).
   Garbage and cgroups (#115): `unit_restart` (a listener, `run -d` and

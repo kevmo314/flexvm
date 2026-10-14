@@ -480,13 +480,30 @@ impl Proc {
                 (Some(h), true) => {
                     // `release_stall`: the route change waits long (for RTNL, say).
                     let start = Instant::now();
+                    // What is routed to the tap from the switch on waits in its qdisc, in order,
+                    // until the hold has handed over all it took before the switch (which a busy
+                    // host can delay past the next packet): then it follows, in order.
+                    if fault("no_plug") {
+                        eprintln!("vm {}: injected fault: not plugging its tap", vm.name);
+                    } else if let Err(e) = crate::net::plug_tap(&vm.tap) {
+                        eprintln!("vm {}: plugging its tap: {e}", vm.name);
+                    }
                     let (released, switched) = release_into(h, vm.ip, mig, &vm, STRAGGLERS, |()| {
                         if fault("release_stall") {
                             thread::sleep(Duration::from_millis(300));
                         }
                         vm.route_here()
                     });
-                    if let Some(s) = released {
+                    // Even if plugging said it failed: it may have been done (a lost ACK).
+                    let (plug_drops, unplugged) = match fault("no_plug") {
+                        true => (0, Ok(())),
+                        false => crate::net::unplug_tap(&vm.tap),
+                    };
+                    if let Err(e) = unplugged {
+                        eprintln!("vm {}: letting {}'s packets through its tap: {e}", vm.name, vm.ip);
+                    }
+                    if let Some(mut s) = released {
+                        s.dropped_target += plug_drops;
                         eprintln!("vm {}: let go of {} after {} ms, {} packets injected", vm.name, vm.ip, ms(start.elapsed()), s.injected);
                         if s.dropped + s.dropped_target > 0 {
                             eprintln!("vm {}: dropped {} of the packets held while taking {} over", vm.name, s.dropped + s.dropped_target, vm.ip);

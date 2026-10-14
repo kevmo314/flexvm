@@ -209,7 +209,7 @@ FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_be
           "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "resume_kill",
           "prepare_fail", "short_incoming", "slow_preload", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
           "started_fsync", "started_unmark", "start_stall", "incoming_stall", "claim_stall", "handoff_stall", "ckpt_wp_race",
-          "fetch_tail_enomem", "fetch_enomem_stuck", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo", "release_stall")
+          "fetch_tail_enomem", "fetch_enomem_stuck", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo", "release_stall", "release_late", "no_plug")
 
 
 def disarm():
@@ -977,6 +977,17 @@ def same_host_slow_route():
     on a busy host: `release_stall` makes it 300 ms). Nothing it held, or that
     reached it meanwhile, is lost, and nothing is reordered."""
     udp_across_migrations("same host slow route", "ft-slow-route", "release_stall")
+
+
+def same_host_late_handover():
+    """#136: when the target lets go of its hold, packets routed to the VM
+    from the switch on wait in the kernel until the hold has handed over
+    what reached it just before, however late that is (`release_late` holds
+    the hand-over up from 20 ms before the switch to 30 ms after it, so
+    packets taken before the switch are still held when routed ones reach
+    the tap): none overtakes them. (With `no_plug` armed as well, the
+    scenario reorders.)"""
+    udp_across_migrations("same host late handover", "ft-late", "release_late")
 
 
 def same_host_flood():
@@ -4717,7 +4728,7 @@ SCENARIOS = dict(
     incoming_killed=incoming_killed, start_killed=start_killed, claim_killed=claim_killed, fc_died=fc_died,
     sigkill_restart=sigkill_restart, listen_trickle=listen_trickle,
     cow_wp_race=cow_wp_race, fetch_tail_enomem=fetch_tail_enomem, fetch_enomem_stuck=fetch_enomem_stuck,
-    same_host_order=same_host_order, same_host_slow_route=same_host_slow_route, same_host_flood=same_host_flood, rx_stall=rx_stall, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,
+    same_host_order=same_host_order, same_host_slow_route=same_host_slow_route, same_host_flood=same_host_flood, same_host_late_handover=same_host_late_handover, rx_stall=rx_stall, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,
     handoff_superseded=handoff_superseded, suspend_cmd=suspend_cmd, fc_died_busy=fc_died_busy, pause_cmd_start=pause_cmd_start, suspend_died=suspend_died)
 names = [n for s in args.scenarios for n in (list(SCENARIOS) if s == "all" else [s])]
 if os.geteuid() != 0:
