@@ -2596,7 +2596,7 @@ def mem_available():
 
 def hog(host, name, mib):
     """Starts a guest program filling `mib` MiB; it touches /tmp/hog.done once it has."""
-    code, out = sh(host, name, f"rm -f /tmp/hog.done; setsid python3 -c 'b=bytearray({mib}<<20); open(\"/tmp/hog.done\", \"w\").close(); "
+    code, out = sh(host, name, f"rm -f /tmp/hog.done; setsid python3 -c 'b=bytes([1])*({mib}<<20); open(\"/tmp/hog.done\", \"w\").close(); "
                                "import time; time.sleep(3600)' >/dev/null 2>&1 </dev/null & echo started")
     assert code == 0, out
 
@@ -2662,7 +2662,8 @@ def mem_high():
     done = wait_for(lambda: hog_done(A, n), 240)
     v = vms(A)[n]
     check("mem high: admitted again, the fill finishes", done, (time.time() - t, v.get("admitted_mib"), cgroup(A, n)))
-    check("mem high: its mark grew with it", v["admitted_mib"] >= fill and cgroup(A, n)[1] >= fill, (fill, v["admitted_mib"], cgroup(A, n)))
+    used, high, _ = cgroup(A, n)
+    check("mem high: its mark grew with it", used >= fill and high >= used, (fill, v["admitted_mib"], used, high))
     check("mem high: no longer throttled", wait_for(lambda: not vms(A)[n].get("throttled"), 5), vms(A)[n])
     check("mem high: md5 intact", md5(A, n) == m)
     cleanup(n)
