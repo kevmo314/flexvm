@@ -328,6 +328,9 @@ pub fn recv_with_fds(s: &UnixStream, max: usize) -> io::Result<(Vec<u8>, Vec<Own
                 c = libc::CMSG_NXTHDR(&msg, c);
             }
         }
+        if msg.msg_flags & libc::MSG_CTRUNC != 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "ancillary fds truncated"));
+        }
         if n == 0 {
             break;
         }
@@ -380,6 +383,18 @@ pub fn spawn_self<S: AsRef<std::ffi::OsStr>>(args: &[S], log: &std::fs::File, fd
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn truncated_fds_fail_the_receive() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let null = std::fs::File::open("/dev/null").unwrap();
+        send_with_fds(&a, b"{}\n", &[null.as_raw_fd(); 2]).unwrap();
+        assert_eq!(recv_with_fds(&b, 64).unwrap().1.len(), 2);
+        // More than the receive buffer holds: an error, not a request missing some.
+        send_with_fds(&a, b"{}\n", &[null.as_raw_fd(); 100]).unwrap();
+        let e = recv_with_fds(&b, 64).unwrap_err();
+        assert!(e.kind() == io::ErrorKind::InvalidData && e.to_string().contains("truncated"), "{e}");
+    }
 
     #[test]
     fn json_line_limit_bounds_consumption() {
