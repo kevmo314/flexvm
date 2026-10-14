@@ -2287,8 +2287,9 @@ def cow_collapsed():
 
 
 def guest_chunks(host, name):
-    """Firecracker's guest memory by 2 MiB chunk (of its userfaultfd-registered mappings): those mapped by a
-    transparent huge page, those with nothing mapped, and those Firecracker made inaccessible (unplugged slots)."""
+    """Firecracker's guest memory by 2 MiB chunk (of its userfaultfd-registered mappings): those backed by one
+    transparent huge page (512 present pages on contiguous PFNs from a 2 MiB-aligned one, each flagged THP), those with
+    nothing mapped, and those Firecracker made inaccessible (unplugged slots)."""
     pid = fc_pid(host, name)
     vmas, cur = [], None
     for l in open(f"/proc/{pid}/smaps"):
@@ -2307,10 +2308,13 @@ def guest_chunks(host, name):
                 entries = struct.unpack("512Q", pm.read(512 * 8))
                 if not any(e >> 63 & 1 or e >> 62 & 1 for e in entries):
                     empty.add(c)
-                elif entries[0] >> 63 & 1:
-                    kf.seek((entries[0] & ((1 << 55) - 1)) * 8)
-                    if struct.unpack("Q", kf.read(8))[0] >> 22 & 1:  # KPF_THP
-                        huge.add(c)
+                    continue
+                pfn = entries[0] & ((1 << 55) - 1)
+                if pfn % 512 or not all(e >> 63 & 1 and e & ((1 << 55) - 1) == pfn + i for i, e in enumerate(entries)):
+                    continue
+                kf.seek(pfn * 8)
+                if all(f >> 22 & 1 for f in struct.unpack("512Q", kf.read(512 * 8))):  # KPF_THP, every page
+                    huge.add(c)
     return huge, empty, unplugged
 
 
@@ -2356,7 +2360,12 @@ def unplug_collapsed():
     check("huge unplug: memory collapsed", c and c["collapsed"] >= 100, c)
     # Free page reporting of what the deletion freed is done before the baseline, so what follows is the unplug's.
     rss0 = settle_rss(B, n)
-    huge0, _, unplugged0 = guest_chunks(B, n)
+    # Free page reports are held (firecracker/0003) across the unplug: every chunk that empties meanwhile is in a block
+    # the unplug gave back.
+    sock = api_sock(B, n)
+    held = fc_api(sock, "PATCH", "/balloon/reporting/hold")
+    check("huge unplug: free page reports held", held is None, held)
+    huge0, empty0, _ = guest_chunks(B, n)
     discards0 = control(B, n, {"op": "debug", "what": "status"})["result"]["discards"]
     t = time.time()
     ok(hotplug(B, n, plugged + 1024))
@@ -2365,19 +2374,18 @@ def unplug_collapsed():
     done = wait_for(lambda: hp()[0] == hp()[1] < plugged + 1536, 60)
     took = time.time() - t
     st = control(B, n, {"op": "debug", "what": "status"})["result"]
+    huge1, empty1, _ = guest_chunks(B, n)
+    released = fc_api(sock, "PATCH", "/balloon/reporting/release")
     rss1 = settle_rss(B, n)
-    huge1, empty1, unplugged1 = guest_chunks(B, n)
-    # Huge pages discarded since the baseline (free page reporting had settled), and those in slots Firecracker unplugged
-    # whole (mapped inaccessible), which must all be gone.
-    slots = huge0 & (unplugged1 - unplugged0)
-    freed = huge0 & empty1
-    print(f"huge unplug: plugged {plugged + 1536} -> {hp()[1]} MiB in {took:.1f} s (settled: {done}), {len(huge0) * 2} MiB in huge pages before, "
-          f"{len(freed) * 2} MiB of them discarded, {len(slots) * 2} MiB in whole unplugged slots ({len(slots - empty1) * 2} MiB still mapped), {len(huge1) * 2} MiB left; RSS {rss0} -> {rss1} MiB, "
-          f"discards {discards0} -> {st['discards']}")
-    check("huge unplug: unplugged with collapsed memory in the blocks", done and st["discards"] > discards0 and not st["failed"],
-          (plugged, hp(), st["failed"]))
-    check("huge unplug: huge pages in the unplugged blocks were freed", len(freed) * 2 >= 64 and not slots - empty1,
-          (len(freed), len(slots), len(slots - empty1)))
+    unplugged = empty1 - empty0
+    freed = huge0 & unplugged
+    print(f"huge unplug: plugged {plugged + 1536} -> {hp()[1]} MiB in {took:.1f} s (settled: {done}); {len(unplugged) * 2} MiB "
+          f"emptied by the unplug, {len(freed) * 2} MiB of it huge pages before ({len(huge0) * 2} MiB in all, {len(huge1) * 2} MiB "
+          f"left); RSS {rss0} -> {rss1} MiB, discards {discards0} -> {st['discards']}")
+    check("huge unplug: unplugged", done and st["discards"] > discards0 and not st["failed"] and released is None,
+          (plugged, hp(), st["failed"], released))
+    check("huge unplug: the unplugged blocks held huge pages, now emptied", unplugged and len(unplugged) * 2 <= plugged + 1536 - hp()[1]
+          and len(freed) * 2 >= 32, (len(unplugged), len(freed)))
     check("huge unplug: data moved, not copied (RSS did not grow)", rss1 <= rss0 + 64, (rss0, rss1))
     errors, _, out = writer_check(B, n)
     check("huge unplug: guest memory intact", errors == 0 and md5(B, n) == m and sh(B, n, "md5sum /tmp/g")[1].split()[0] == g, out)

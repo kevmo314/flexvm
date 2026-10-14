@@ -347,7 +347,10 @@ impl Vm {
             self.pager.hold_collapse(true);
         }
         let res = self.fc(|fc| if pausing { fc.pause() } else { fc.resume() });
-        if res.is_ok() != pausing {
+        // Collapsing goes on after a confirmed resume, or a pause Firecracker refused (a timeout or a lost answer may
+        // still have paused it: held until a resume, or the pager's end).
+        let refused = |e: &crate::util::Error| rejected(e, "/vm");
+        if (!pausing && res.is_ok()) || (pausing && res.as_ref().is_err_and(refused)) {
             self.pager.hold_collapse(false);
         }
         res?;
