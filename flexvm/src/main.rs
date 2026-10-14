@@ -376,7 +376,7 @@ fn notify_fd() -> Option<std::fs::File> {
 }
 
 /// A foreground `run` that claimed a standby VM: forwards signals, exits with its status.
-fn follow(mut conn: BufReader<std::os::unix::net::UnixStream>, id: host::Ident) -> Result<()> {
+fn follow(mut conn: impl std::io::BufRead, id: host::Ident) -> Result<()> {
     let set = util::block_signals(&[libc::SIGTERM, libc::SIGINT, libc::SIGQUIT, libc::SIGTSTP, libc::SIGCONT, libc::SIGHUP]);
     // A fast command's process may be gone already: its exit frame is buffered.
     if let Ok(Some(vm)) = host::PidFd::open(&id) {
@@ -545,7 +545,7 @@ pub fn exec(host: &Host, name: &str, cmd: &str) -> Result<i32> {
     let id = session.id.clone();
     let code = exec_session(host, name, cmd, &Mutex::new(session), false)?;
     // Best effort: the guest closes it a minute after its client leaves anyway.
-    let _ = vmproc::connect(host, name, &json!({"op": "exec", "session": id, "action": "close"}), &[]);
+    let _ = vmproc::connect(host, name, &json!({"op": "exec", "session": id, "action": "close"}), &[], Instant::now() + Duration::from_secs(5));
     Ok(code)
 }
 
@@ -568,9 +568,10 @@ pub fn exec_session(host: &Host, name: &str, cmd: &str, session: &Mutex<Session>
             (s.started, s.offset)
         };
         let req = json!({"op": "exec", "session": id, "action": if started { "attach" } else { "start" }, "offset": offset, "cmd": cmd});
-        let stream = vmproc::connect(host, name, &req, &[]).and_then(|c| {
+        let at = Instant::now() + Duration::from_secs(5);
+        let stream = vmproc::connect(host, name, &req, &[], at).and_then(|c| {
             // Byte by byte: the frames after it stay unread.
-            let reply = recv_json(&mut BufReader::with_capacity(1, util::By { s: &c, at: Instant::now() + Duration::from_secs(5) }))?.ok_or("vm hung up")?;
+            let reply = recv_json(&mut BufReader::with_capacity(1, util::By { s: &c, at }))?.ok_or("vm hung up")?;
             if reply["ok"] != json!(true) {
                 return Err(reply["error"].as_str().unwrap_or("exec failed").to_string().into());
             }

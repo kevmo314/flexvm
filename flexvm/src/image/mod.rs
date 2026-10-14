@@ -309,15 +309,24 @@ fn install<T>(path: &Path, write: impl FnOnce(&mut File) -> Result<()>, rename: 
     if File::open(&tmp).is_ok_and(|f| crate::host::flock(&f, libc::LOCK_EX | libc::LOCK_NB).is_err()) {
         bail!("{} is being written by another process", tmp.display());
     }
+    let mut file = None;
     let res = (|| {
-        let mut f = create_new(&tmp)?;
-        crate::host::flock(&f, libc::LOCK_EX)?;
+        let f = file.insert(create_new(&tmp)?);
+        crate::host::flock(f, libc::LOCK_EX)?;
         crate::host::flock(&dir, libc::LOCK_UN)?;
-        write(&mut f)?;
+        write(f)?;
         f.sync_all()?;
         Ok(rename(&tmp, path)?)
     })();
-    let _ = std::fs::remove_file(&tmp);
+    // Still locked, and only ours: once renamed, a same-pid writer may have created another.
+    if let Some(f) = file.filter(|_| crate::host::flock(&dir, libc::LOCK_EX).is_ok()) {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(a), Ok(b)) = (f.metadata(), std::fs::symlink_metadata(&tmp)) {
+            if (a.dev(), a.ino()) == (b.dev(), b.ino()) {
+                let _ = std::fs::remove_file(&tmp);
+            }
+        }
+    }
     res
 }
 
@@ -531,6 +540,9 @@ mod tests {
         drop(held);
         replace(&path, bytes(b"ours")).unwrap();
         assert!(read(&path) == "ours" && !part.exists());
+        // A same-pid writer's part, created once ours was renamed, is left to it.
+        install(&path, bytes(b"ours"), |tmp, path| std::fs::rename(tmp, path).and_then(|()| std::fs::write(tmp, "theirs"))).unwrap();
+        assert_eq!(read(&part), "theirs");
     }
 
     #[test]

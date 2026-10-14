@@ -191,6 +191,14 @@ pub fn connect_unix(path: &std::path::Path, timeout: Duration) -> io::Result<Uni
     Ok(s)
 }
 
+/// Connects to `path` and sends `line` (and `fds`), both by `at`.
+pub fn send_unix(path: &std::path::Path, line: &[u8], fds: &[RawFd], at: Instant) -> io::Result<UnixStream> {
+    let s = connect_unix(path, By { s: (), at }.left()?)?;
+    s.set_write_timeout(Some(By { s: (), at }.left()?))?;
+    send_with_fds(&s, line, fds)?;
+    Ok(s)
+}
+
 pub fn pidfd_open(pid: u32) -> io::Result<OwnedFd> {
     let fd = eintr(|| unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) })?;
     Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
@@ -352,8 +360,9 @@ pub fn send_with_fds(s: &UnixStream, line: &[u8], fds: &[RawFd]) -> io::Result<(
     Ok(())
 }
 
-/// The peer must send nothing after the line until it has an answer.
-pub fn recv_with_fds(s: &UnixStream, max: usize) -> io::Result<(Vec<u8>, Vec<OwnedFd>)> {
+/// The peer must send nothing after the line until it has an answer. `ready` is
+/// called before each read: an error ends the wait.
+pub fn recv_with_fds(s: &UnixStream, max: usize, mut ready: impl FnMut() -> io::Result<()>) -> io::Result<(Vec<u8>, Vec<OwnedFd>)> {
     let mut line = Vec::new();
     let mut fds = Vec::new();
     let mut buf = [0u8; 4096];
@@ -368,6 +377,7 @@ pub fn recv_with_fds(s: &UnixStream, max: usize) -> io::Result<(Vec<u8>, Vec<Own
         msg.msg_iovlen = 1;
         msg.msg_control = cbuf.as_mut_ptr().cast();
         msg.msg_controllen = cbuf.len() as _;
+        ready()?;
         let n = eintr(|| unsafe { libc::recvmsg(s.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) })?;
         unsafe {
             let mut c = libc::CMSG_FIRSTHDR(&msg);
@@ -645,14 +655,30 @@ mod tests {
     }
 
     #[test]
+    fn a_send_to_a_full_backlog_ends_by_its_deadline() {
+        let dir = std::env::temp_dir().join(format!("flexvm-backlog-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s");
+        let _ = std::fs::remove_file(&path);
+        let l = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        assert_eq!(unsafe { libc::listen(l.as_raw_fd(), 0) }, 0);
+        let held: Vec<_> = (0..64).map_while(|_| connect_unix(&path, Duration::from_millis(1)).ok()).collect();
+        assert!(held.len() < 64);
+        let start = Instant::now();
+        let e = send_unix(&path, b"{}\n", &[], start + Duration::from_millis(200)).unwrap_err();
+        assert!(e.raw_os_error() == Some(libc::EAGAIN) && start.elapsed() < Duration::from_millis(600), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn truncated_fds_fail_the_receive() {
         let (a, b) = UnixStream::pair().unwrap();
         let null = std::fs::File::open("/dev/null").unwrap();
         send_with_fds(&a, b"{}\n", &[null.as_raw_fd(); 2]).unwrap();
-        assert_eq!(recv_with_fds(&b, 64).unwrap().1.len(), 2);
+        assert_eq!(recv_with_fds(&b, 64, || Ok(())).unwrap().1.len(), 2);
         // More than the receive buffer holds: an error, not a request missing some.
         send_with_fds(&a, b"{}\n", &[null.as_raw_fd(); 100]).unwrap();
-        let e = recv_with_fds(&b, 64).unwrap_err();
+        let e = recv_with_fds(&b, 64, || Ok(())).unwrap_err();
         assert!(e.kind() == io::ErrorKind::InvalidData && e.to_string().contains("truncated"), "{e}");
     }
 
@@ -721,7 +747,7 @@ pub mod output {
             unsafe { libc::close(p[1]) };
             let orig = unsafe { File::from_raw_fd(orig) };
             LOGS.lock().unwrap()[i] = capped(&orig);
-            TARGETS.lock().unwrap()[i] = Some(Arc::new(orig));
+            TARGETS.lock().unwrap()[i] = Some(Arc::new(own(orig)));
             let mut from = unsafe { File::from_raw_fd(p[0]) };
             RELAYS.lock().unwrap().push(std::thread::spawn(move || {
                 let mut buf = [0u8; 8192];
@@ -771,13 +797,30 @@ pub mod output {
                 break;
             }
             let piece = &data[sent..(sent + 4096).min(data.len())];
-            match unsafe { libc::write(f.as_raw_fd(), piece.as_ptr().cast(), piece.len()) } {
+            let (fd, buf, len) = (f.as_raw_fd(), piece.as_ptr().cast(), piece.len());
+            // Another relay may have filled a shared target since the poll: retried.
+            let n = match unsafe { libc::send(fd, buf, len, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) } {
+                -1 if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOTSOCK) => unsafe { libc::write(fd, buf, len) },
+                n => n,
+            };
+            match n {
                 n if n > 0 => sent += n as usize,
-                _ if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => {}
+                _ if matches!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EINTR | libc::EAGAIN)) => {}
                 _ => break,
             }
         }
         sent
+    }
+
+    /// A target's own open file, non-blocking (flags set on `f` would change
+    /// every process's sharing it); a regular file or socket is kept as is.
+    fn own(f: File) -> File {
+        use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+        if f.metadata().is_ok_and(|m| m.is_file() || m.file_type().is_socket()) {
+            return f;
+        }
+        let path = format!("/proc/self/fd/{}", f.as_raw_fd());
+        File::options().write(true).custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY).open(path).unwrap_or(f)
     }
 
     /// Where output goes once the terminal is gone.
@@ -792,7 +835,7 @@ pub mod output {
             if let Ok(dup) = super::eintr(|| unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) }) {
                 let f = unsafe { File::from_raw_fd(dup) };
                 LOGS.lock().unwrap()[i] = capped(&f);
-                targets[i] = Some(Arc::new(f));
+                targets[i] = Some(Arc::new(own(f)));
             }
         }
     }
@@ -883,5 +926,18 @@ pub mod output {
                 std::thread::sleep(Duration::from_millis(5));
             }
         }
+    }
+
+    #[test]
+    fn a_full_target_is_given_up_by_the_deadline_leaving_its_sharers_blocking() {
+        let mut p = [0; 2];
+        assert_eq!(unsafe { libc::pipe2(p.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        let (_r, w) = unsafe { (File::from_raw_fd(p[0]), File::from_raw_fd(p[1])) };
+        let t = own(w.try_clone().unwrap());
+        while (&t).write(&[0; 4096]).is_ok() {}
+        let start = Instant::now();
+        assert_eq!(write_within(&t, &[0; 100], start + Duration::from_millis(200)), 0);
+        assert!(start.elapsed() < Duration::from_millis(600));
+        assert_eq!(unsafe { libc::fcntl(w.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK, 0);
     }
 }

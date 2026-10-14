@@ -756,7 +756,7 @@ impl Proc {
 
     fn control(self: &Arc<Self>, c: UnixStream) {
         let _ = c.set_read_timeout(Some(Duration::from_secs(10)));
-        let (line, fds) = match crate::util::recv_with_fds(&c, 1 << 20) {
+        let (line, fds) = match crate::util::recv_with_fds(&c, 1 << 20, || Ok(())) {
             Ok(got) => got,
             Err(e) => return drop(send_json(&mut &c, &json!({"ok": false, "error": format!("bad request: {e}")}))),
         };
@@ -1552,9 +1552,11 @@ fn evict(host: &Host, peers: &[String], vms: &[Entry], avail: u64, deadline: Ins
             if backoff.get(&key).is_some_and(|b| !b.ready(eviction_time())) {
                 continue;
             }
-            let Some(left) = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) else { return };
+            if Instant::now() >= deadline {
+                return;
+            }
             eprintln!("vm {}: {why} ({avail} MiB available); migrating to {peer}", vm.name);
-            match call_within(host, &vm.name, json!({"op": "migrate", "to": peer, "if_idle": true, "evict": true}), left) {
+            match call_within(host, &vm.name, json!({"op": "migrate", "to": peer, "if_idle": true, "evict": true}), deadline) {
                 Ok(_) => {
                     backoff.remove(&key);
                     let _ = crate::host::store(&backoff_path, &backoff, false);
@@ -1599,8 +1601,11 @@ pub fn tell_peers(host: &Host, req: Value) {
     sends.into_iter().for_each(|s| drop(s.join()));
 }
 
-pub fn connect(host: &Host, name: &str, req: &Value, fds: &[i32]) -> Result<UnixStream> {
-    let c = UnixStream::connect(host.sock(name)).map_err(|e| {
+/// Connects and sends `req` by `at`; the stream's reads and writes then block.
+pub fn connect(host: &Host, name: &str, req: &Value, fds: &[i32], at: Instant) -> Result<UnixStream> {
+    let mut line = serde_json::to_vec(req)?;
+    line.push(b'\n');
+    let c = crate::util::send_unix(&host.sock(name), &line, fds, at).map_err(|e| {
         if host.alive(name) {
             format!("vm {name:?} is starting or its control socket is unavailable; retry once it is ready, or see {}: {e}", host.vms(name, "log").display())
         } else if host.is_suspended(name) {
@@ -1609,19 +1614,19 @@ pub fn connect(host: &Host, name: &str, req: &Value, fds: &[i32]) -> Result<Unix
             format!("no vm named {name:?}")
         }
     })?;
-    let mut line = serde_json::to_vec(req)?;
-    line.push(b'\n');
-    crate::util::send_with_fds(&c, &line, fds)?;
+    c.set_read_timeout(None)?;
+    c.set_write_timeout(None)?;
     Ok(c)
 }
 
 pub fn call(host: &Host, name: &str, req: Value) -> Result<Value> {
-    answer(crate::util::recv_json(&mut BufReader::new(connect(host, name, &req, &[])?))?, &format!("vm {name}"))
+    let c = connect(host, name, &req, &[], Instant::now() + Duration::from_secs(10))?;
+    answer(crate::util::recv_json(&mut BufReader::new(c))?, &format!("vm {name}"))
 }
 
-/// `call`, giving up on the answer after `wait`.
-fn call_within(host: &Host, name: &str, req: Value, wait: Duration) -> Result<Value> {
-    let c = crate::util::By { s: connect(host, name, &req, &[])?, at: Instant::now() + wait };
+/// `call`, connected, sent and answered by `at`.
+fn call_within(host: &Host, name: &str, req: Value, at: Instant) -> Result<Value> {
+    let c = crate::util::By { s: connect(host, name, &req, &[], at)?, at };
     answer(crate::util::recv_json(&mut BufReader::new(c))?, &format!("vm {name}"))
 }
 
