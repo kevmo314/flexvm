@@ -289,7 +289,7 @@ fn claim(p: &Arc<Proc>, req: &Value) -> std::result::Result<Value, (Error, bool)
     // Its memory is already out of MemAvailable: only the step is charged.
     let held = p.standby.lock().unwrap().as_ref().and_then(|s| crate::util::proc_kb(&format!("/proc/{}/status", s.firecracker().pid()), "VmRSS"));
     let held = held.unwrap_or(0) >> 20;
-    p.admit_start(held, held).map_err(|e| (e, true))?;
+    p.admit_start(held, held, None).map_err(|e| (e, true))?;
     let not_run = |e: Error, retry: bool| {
         p.refund_start();
         (e, retry)

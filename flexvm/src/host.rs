@@ -34,6 +34,9 @@ pub struct Config {
     pub announce_dev: Option<String>,
     pub dns: Option<String>,
     pub reserve_mib: u64,
+    /// Eviction's high-water mark (MiB available): below it VMs start moving
+    /// to peers (`evict_at`). None: the reserve plus the reserve or 512 MiB, whichever is more.
+    pub evict_mib: Option<u64>,
     /// Of taps, hold devices and cgroups.
     pub prefix: String,
 }
@@ -48,12 +51,25 @@ impl Default for Config {
             announce_dev: None,
             dns: None,
             reserve_mib: 1024,
+            evict_mib: None,
             prefix: "fv".into(),
         }
     }
 }
 
 impl Config {
+    /// MemAvailable (MiB) under which eviction starts: never below the reserve.
+    pub fn evict_at(&self) -> u64 {
+        self.evict_mib.unwrap_or(self.reserve_mib + self.reserve_mib.max(512)).max(self.reserve_mib)
+    }
+
+    /// Once started, eviction goes on until MemAvailable is back this high:
+    /// the mark plus half its height above the reserve (at least 128 MiB).
+    pub fn evict_until(&self) -> u64 {
+        let at = self.evict_at();
+        at + ((at - self.reserve_mib) / 2).max(128)
+    }
+
     pub fn range(&self) -> Result<IpRange> {
         IpRange::parse(&self.vm_ips)
     }
@@ -129,7 +145,14 @@ fn remove(path: &Path) -> Result<()> {
 pub struct Host {
     pub state: PathBuf,
     pub run: PathBuf,
+    /// As loaded; `config_now` reads host.json again once it changed.
     pub cfg: Config,
+    /// host.json's mtime when `cfg` was loaded.
+    cfg_mtime: Option<SystemTime>,
+}
+
+fn mtime(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
 static RUN_DIR: OnceLock<PathBuf> = OnceLock::new();
@@ -146,8 +169,9 @@ impl Host {
         let canon = |d: &Path| d.canonicalize().map_err(|e| format!("{}: {e} (run flexvm as root to create it)", d.display()));
         let (state, run) = (canon(state)?, canon(run)?);
         let _ = RUN_DIR.set(run.clone());
+        let cfg_mtime = mtime(&state.join("host.json"));
         let cfg = load(&state.join("host.json"))?.unwrap_or_default();
-        Ok(Host { state, run, cfg })
+        Ok(Host { state, run, cfg, cfg_mtime })
     }
 
     pub fn configure(&mut self, change: impl FnOnce(&mut Config) -> Result<()>) -> Result<()> {
@@ -157,7 +181,39 @@ impl Host {
         change(&mut cfg)?;
         store(&path, &cfg, true)?;
         self.cfg = cfg;
+        self.cfg_mtime = mtime(&path);
         Ok(())
+    }
+
+    /// The configuration as it is now: `flexvm listen` may have changed the
+    /// reserve, the eviction mark or the peers since this process started.
+    /// host.json is read again only once its mtime moved (then cached by it).
+    pub fn config_now(&self) -> Config {
+        static SEEN: Mutex<Option<(PathBuf, SystemTime, Config)>> = Mutex::new(None);
+        let path = self.state.join("host.json");
+        let Some(now) = mtime(&path).filter(|&t| Some(t) != self.cfg_mtime) else { return self.cfg.clone() };
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, _, cfg)) = seen.as_ref().filter(|(p, t, _)| *p == path && *t == now) {
+            return cfg.clone();
+        }
+        // Not cached unless read whole (a writer that is not `listen` may be mid-write).
+        let Some(cfg) = load::<Config>(&path).ok().flatten() else { return self.cfg.clone() };
+        *seen = Some((path, now, cfg.clone()));
+        cfg
+    }
+
+    /// What an arrival moved here by eviction must leave available: this
+    /// host's own eviction mark, so it is not moved straight back. Refused
+    /// while this host is evicting itself.
+    pub fn evict_floor(&self) -> Result<u64> {
+        let cfg = self.config_now();
+        // The marker outlives the last VM here that would clear it: believed while a VM runs here,
+        // below where eviction stops.
+        let evicting = self.run.join("evict.active").exists() && crate::vmproc::host_available_mib() < cfg.evict_until();
+        if evicting && self.entries().iter().any(|e| e.state == "running") {
+            bail!("this host is low on memory itself (moving vms away)");
+        }
+        Ok(cfg.evict_at())
     }
 
     /// Reentrant within a thread (so a guard dropped under it cannot
@@ -555,10 +611,16 @@ impl Host {
         self.grant(mib).is_some()
     }
 
+    /// `grant` against the current reserve.
+    pub fn grant(&self, mib: u64) -> Option<u64> {
+        self.grant_above(mib, None)
+    }
+
     /// MemAvailable lags a grant until the guest touches the memory, so all
     /// processes' grants of the last `GRANT_WINDOW` count as used. Returns
-    /// the grant's id. Test fault `no_admit`: refuses everything.
-    pub fn grant(&self, mib: u64) -> Option<u64> {
+    /// the grant's id. Leaves `floor` MiB available (default: the current
+    /// reserve; never less). Test fault `no_admit`: refuses everything.
+    pub fn grant_above(&self, mib: u64, floor: Option<u64>) -> Option<u64> {
         if fault("no_admit") {
             return None;
         }
@@ -568,7 +630,8 @@ impl Host {
         let mut grants: Vec<(u64, u64, u64)> = load(&path).ok().flatten().unwrap_or_default();
         grants.retain(|&(t, ..)| now.saturating_sub(t) <= GRANT_WINDOW.as_millis() as u64);
         let pending: u64 = grants.iter().map(|g| g.1).sum();
-        if crate::vmproc::host_available_mib() < self.cfg.reserve_mib + pending + mib {
+        let floor = floor.unwrap_or(0).max(self.config_now().reserve_mib);
+        if crate::vmproc::host_available_mib() < floor + pending + mib {
             return None;
         }
         let id = crate::migrate::migration_id().max(1);
@@ -838,6 +901,10 @@ pub struct Entry {
     pub state: String,
     pub firecracker: Option<u32>,
     pub starved: bool,
+    /// How fast its memory grew over the last few seconds (MiB/s), as last published.
+    pub growth_mib_s: u64,
+    /// Runs `run -- CMD`: its process ends with CMD's, so eviction leaves it here.
+    pub cmd: bool,
 }
 
 /// Unique however pids are reused.
@@ -1567,5 +1634,36 @@ mod tests {
         assert!(h.admit(500) && !h.admit(900));
         h.cfg.reserve_mib = free + 1;
         assert!(!h.admit(1));
+    }
+
+    #[test]
+    fn admission_and_eviction_read_the_marks_as_they_change() {
+        let mut h = host("marks");
+        let free = crate::vmproc::host_available_mib();
+        h.configure(|c| {
+            c.reserve_mib = free.saturating_sub(3000);
+            c.evict_mib = Some(free.saturating_sub(1500));
+            Ok(())
+        })
+        .unwrap();
+        let running = h.clone();
+        assert!(running.admit(100));
+        // An eviction's arrival leaves the mark available, not only the reserve.
+        let floor = running.evict_floor().unwrap();
+        assert_eq!(floor, free.saturating_sub(1500));
+        assert!(running.grant_above(2000, Some(floor)).is_none());
+        assert!(running.grant_above(200, Some(floor)).is_some());
+        // `listen` raises the reserve while this process runs: admission sees it.
+        std::thread::sleep(Duration::from_millis(20));
+        h.configure(|c| {
+            c.reserve_mib = free + 1000;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(running.config_now().reserve_mib, free + 1000);
+        assert!(!running.admit(1));
+        // A marker no VM here is left to clear (none runs) does not refuse.
+        std::fs::write(running.run.join("evict.active"), b"").unwrap();
+        assert!(running.evict_floor().is_ok());
     }
 }

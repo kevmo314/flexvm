@@ -45,7 +45,8 @@ impl Proc {
     /// pause. Once the target may have the state, this copy resumes only if
     /// the target says it aborted.
     /// `if_idle` (eviction): refused at once if the VM is busy or still arriving.
-    pub fn migrate(self: &Arc<Self>, to: &str, if_idle: bool) -> Result<Value> {
+    /// `evict`: the host moves it for memory; the target admits it only above its own eviction mark.
+    pub fn migrate(self: &Arc<Self>, to: &str, if_idle: bool, evict: bool) -> Result<Value> {
         let vm = self.vm().clone();
         let Some(source) = self.host.cfg.advertise()? else {
             bail!("this host runs no peer listener (flexvm listen): the target fetches the vm's memory through it");
@@ -54,6 +55,9 @@ impl Proc {
             true => self.op_now().ok_or_else(|| format!("vm {}: {}", vm.name, crate::vmproc::BUSY))?,
             false => self.op_within()?,
         };
+        if evict && self.cmd.lock().unwrap().is_some() {
+            bail!("vm {} runs a command here that its process ends with; {}", vm.name, crate::vmproc::BUSY);
+        }
         if if_idle && self.arrived.lock().unwrap().is_some() {
             bail!("vm {} is still arriving; {}", vm.name, crate::vmproc::BUSY);
         }
@@ -63,7 +67,7 @@ impl Proc {
         vm.settle_hotplug(settle + crate::lifecycle::SETTLE_WAIT)?;
         let settle = settle.elapsed();
         let (mig, gen, prep) = (migration_id(), self.gen(), Instant::now());
-        let (mut conn, mut reader, prepared) = self.prepare_target(&vm, to, mig, gen, &source)?;
+        let (mut conn, mut reader, prepared) = self.prepare_target(&vm, to, mig, gen, &source, evict)?;
         let prepare = prep.elapsed();
         // Only now, right before the pause: the guest runs on at its mark meanwhile.
         let unthrottle = Instant::now();
@@ -169,7 +173,7 @@ impl Proc {
         }))
     }
 
-    fn prepare_target(&self, vm: &Vm, to: &str, mig: u64, gen: u64, source: &str) -> Result<(TcpStream, BufReader<TcpStream>, Value)> {
+    fn prepare_target(&self, vm: &Vm, to: &str, mig: u64, gen: u64, source: &str, evict: bool) -> Result<(TcpStream, BufReader<TcpStream>, Value)> {
         let conn = crate::util::connect(to, Duration::from_secs(2))?;
         conn.set_nodelay(true)?;
         conn.set_read_timeout(Some(PREFLIGHT_TIMEOUT))?;
@@ -187,6 +191,7 @@ impl Proc {
             "source_ident": crate::host::Ident::me(),
             "rss_mib": vm.rss() >> 20,
             "regions": vm.pager.regions(),
+            "evict": evict,
         }))?;
         let reply = recv_json(&mut reader)?.ok_or_else(|| format!("{to} hung up"))?;
         if reply["ok"] != json!(true) {
@@ -521,7 +526,8 @@ impl Proc {
         let ip: Ipv4Addr = req["ip"].as_str().ok_or("missing ip")?.parse()?;
         *self.arrived.lock().unwrap() = Some(self.host.mig_begin(mig, &source.addr, by, Some(ip))?);
         let need = req["rss_mib"].as_u64().unwrap_or(0);
-        self.admit_start(need, 0)?;
+        let floor = if req["evict"] == true { Some(self.host.evict_floor()?) } else { None };
+        self.admit_start(need, 0, floor)?;
         let tpl = Template::open_id(&self.paths, req["template"].as_str().ok_or("missing template")?, req["id"].as_str().ok_or("missing template id")?)?;
         t.mark("template");
         let claim = self.host.claim_incoming(&self.host.lock()?, &name, ip, req["gen"].as_u64().unwrap_or(0))?;

@@ -45,7 +45,8 @@ p.add_argument("--image-cache", help="keep the pulled image here, and build from
 # copy-on-write exactness, growth (on a template with little pre-plugged), held packets and devices,
 # signals, standby VMs. Left out: slow or heavy ones (pages_dead, quiet_source, guest_hang,
 # cow_reports_held, suspend_disk_freed, source_killed, kill_source, forged_peer: their
-# 1.5 GB guests outgrow the CI template, and the host moves them) and the ones that restart the
+# 1.5 GB guests outgrow the CI template, and the host moves them), evict_grower (it steers by the
+# machine's MemAvailable, which lanes running at once move) and the ones that restart the
 # listeners (target_killed, suspend_resume).
 FAULTS = ("basic route lost_ack unknown refused pages_blip pages_dead_restore prepared_retry resume_kill exec_race guest_calls "
           "checkpoint_restore checkpoint_fork checkpoint_corrupt held_restore_frozen cow_exact cow_abort ckpt_incremental "
@@ -53,7 +54,7 @@ FAULTS = ("basic route lost_ack unknown refused pages_blip pages_dead_restore pr
           "abort_superseded gen_zero signals suspend_gen standby restore_ip_peer late_withdrawal "
           "incoming_killed start_killed claim_killed fc_died cow_grow plug_race plug_storm suspend_debris revoked_publication "
           "same_host_order arrival_abort_route arrival_killed_route handoff_superseded mem_high mem_high_migrate mem_high_evict "
-          "sigkill_restart listen_trickle suspend_cmd fc_died_busy pause_cmd_start suspend_died")
+          "sigkill_restart listen_trickle suspend_cmd fc_died_busy pause_cmd_start suspend_died evict_latency evict_skips_cmd")
 p.add_argument("--faults", default=FAULTS, help="scripts/faults.py scenarios to run against the two hosts ('' for none)")
 # A worker runs its cases on one lane, against templates that are already built.
 p.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)

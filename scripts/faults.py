@@ -2713,6 +2713,260 @@ def mem_high_evict():
     cleanup(n)
 
 
+class Watch:
+    """While eviction runs on `host`: each of `names`' controller ticks (from
+    `debug status`) and its memory requests, asked as its guest does (`MEM`,
+    for a size it needs no change at) every 250 ms; and MemAvailable."""
+    def __init__(self, host, names):
+        self.host, self.stop = host, threading.Event()
+        self.socks, self.ticks, self.asks, self.avail = {}, {n: [] for n in names}, {n: [] for n in names}, []
+        for n in names:
+            v = vms(host)[n]
+            total = v["guest_mib"]
+            headroom = max(total // 4, min(1024, total // 2))
+            self.socks[n] = (vsock_path(host, n) + "_53", f"MEM {2 * headroom << 10} {total << 10}\n".encode())
+        self.threads = [threading.Thread(target=self.ask, args=(n,), daemon=True) for n in names]
+        self.threads += [threading.Thread(target=self.tick, args=(n,), daemon=True) for n in names]
+        self.threads.append(threading.Thread(target=self.mem, daemon=True))
+
+    def __enter__(self):
+        [t.start() for t in self.threads]
+        return self
+
+    def __exit__(self, *_):
+        self.stop.set()
+        [t.join() for t in self.threads]
+
+    def ask(self, n):
+        path, req = self.socks[n]
+        while not self.stop.wait(0.25):
+            t = time.time()
+            try:
+                with socket.socket(socket.AF_UNIX) as s:
+                    s.settimeout(5)
+                    s.connect(path)
+                    s.sendall(req)
+                    reply = s.recv(64).decode().strip()
+            except OSError as e:
+                try:
+                    here = json.load(open(os.path.join(self.host.run, "vms", f"{n}.json"))).get("state") == "running"
+                except (OSError, ValueError):
+                    here = False
+                if not here:
+                    return  # moving away: its source copy serves pages only
+                reply = f"error: {e}"
+            self.asks[n].append((time.time() - t, reply))
+
+    def tick(self, n):
+        while not self.stop.wait(0.25):
+            try:
+                r = control(self.host, n, {"op": "debug", "what": "status"}, timeout=10)
+            except OSError:
+                return
+            if r.get("ok") and r["result"].get("controller"):
+                self.ticks[n].append(r["result"]["controller"])
+
+    def mem(self):
+        while not self.stop.wait(0.1):
+            self.avail.append((time.time(), mem_available()))
+
+    def report(self, label):
+        """Per VM: the longest gap between controller ticks seen, and memory requests answered (max ms)."""
+        out = {}
+        for n, seen in self.ticks.items():
+            # Each tick's gap (by its number) from the polls, from the first poll on, and
+            # the longest a tick was seen overdue (one held up never reports its gap).
+            gaps = {c["ticks"] - i: g for c in seen for i, g in enumerate(reversed(c["recent_gaps_ms"]))}
+            during = [g for t, g in gaps.items() if seen and t > seen[0]["ticks"]]
+            overdue = max((c["since_last_ms"] or 0 for c in seen), default=0)
+            lat = sorted(a[0] * 1000 for a in self.asks[n])
+            out[n] = {"tick_gap_max_ms": round(max(during + [overdue], default=0)), "ticks": len(during),
+                      "asks": len(lat), "ask_max_ms": round(max(lat, default=0), 1),
+                      "ask_p50_ms": round(lat[len(lat) // 2], 1) if lat else None,
+                      "replies": sorted(set(a[1] for a in self.asks[n]))}
+        print(f"{label}: {json.dumps(out)}", flush=True)
+        return out
+
+
+def grow(host, name, mib, rate):
+    """Starts a guest program growing by `rate` MiB/s to `mib` MiB, every page different."""
+    chunk = max(1, rate // 4)
+    prog = (f"import time\nbs=[]\nfor i in range({mib} // {chunk}):\n t=time.time()\n b=bytearray({chunk}<<20)\n"
+            f" for j in range(0, len(b), 4096): b[j:j+8]=(i*{chunk << 20}+j).to_bytes(8, 'little')\n"
+            " bs.append(b)\n time.sleep(max(0, 0.25-(time.time()-t)))\nopen('/tmp/grow.done','w').close()\ntime.sleep(3600)\n")
+    code, out = sh(host, name, f"rm -f /tmp/grow.done; echo {base64.b64encode(prog.encode()).decode()} | base64 -d > /tmp/grow.py; "
+                               "setsid python3 /tmp/grow.py >/dev/null 2>&1 </dev/null & echo started")
+    assert code == 0, out
+
+
+class marks:
+    """`host`'s reserve and eviction high-water mark set to these MiB, in its
+    host.json (running VM processes read them from it as it changes)."""
+    def __init__(self, reserve, evict_at, host=None):
+        self.reserve, self.evict_at, self.cfg = reserve, evict_at, os.path.join((host or A).state, "host.json")
+
+    def write(self, text):
+        with open(self.cfg + ".tmp", "w") as f:
+            f.write(text)
+        os.rename(self.cfg + ".tmp", self.cfg)
+
+    def set(self, reserve=None, evict_at=None):
+        c = json.loads(self.saved)
+        c.update(reserve_mib=reserve or self.reserve, evict_mib=evict_at or self.evict_at)
+        self.write(json.dumps(c))
+
+    def __enter__(self):
+        self.saved = open(self.cfg).read()
+        self.set()
+        return self
+
+    def __exit__(self, *_):
+        self.write(self.saved)
+
+
+def hosts_over(name, secs):
+    """Where `name` runs (by the registries), each time that changes, over `secs` s."""
+    def here():
+        for h in (A, B):
+            try:
+                if json.load(open(os.path.join(h.run, "vms", f"{name}.json"))).get("state") == "running":
+                    return h.addr
+            except (OSError, ValueError):
+                pass
+        return None
+    seen, end = [], time.time() + secs
+    while time.time() < end:
+        h = here()
+        if h and (not seen or seen[-1] != h):
+            seen.append(h)
+        time.sleep(0.05)
+    return seen
+
+
+def evict_no_pingpong():
+    """Two hosts near their eviction marks: a VM A evicts is not taken by a
+    B it would put under B's own mark (B would only send it back), and once
+    B has room it moves there once and stays."""
+    n = "ft-pingpong"
+    for h in (A, B):
+        clear_log(h, n)
+    m = setup(n, mib=600)
+    time.sleep(11)  # the start's grants age out
+    base, rss = mem_available(), cgroup(A, n)[0]
+    with marks(512, base + 1000, A), marks(512, base - rss // 2, B) as b:
+        seen = hosts_over(n, 25)
+        check("no ping-pong: a peer it would put under its mark refuses it", seen == [A.addr] and where(n) == {A: "running"},
+              (seen, where(n), log(A, n)[-1200:]))
+        check("no ping-pong: refused for B's eviction mark", "eviction mark" in log(A, n), log(A, n)[-1200:])
+        b.set(evict_at=max(600, base - 4 * rss - 1000))
+        seen = hosts_over(n, 45)
+        check("no ping-pong: with room on B it moves there once, and stays", seen == [A.addr, B.addr] and where(n) == {B: "running"},
+              (seen, where(n), log(B, n)[-1200:]))
+    check("no ping-pong: md5 intact", md5(B, n) == m)
+    cleanup(n)
+
+
+def evict_grower():
+    """Three VMs on a host nearing its eviction high-water mark (above its
+    reserve), one of them growing fast: that one is moved to B, ranked over
+    two bigger but static ones by its growth, before the host gets to its
+    reserve. Meanwhile each VM's controller ticks on and its memory requests
+    are answered."""
+    g, big = "ft-ev-grow", ["ft-ev-big1", "ft-ev-big2"]
+    sums = {g: setup(g, mib=1)}
+    if vms(A)[g]["max_mib"] < 3072:
+        raise Skip("its guests need room to grow past 2 GiB (one at its ceiling is starved, and moved for that)")
+    sums.update({n: setup(n, mib=900) for n in big})
+    time.sleep(11)  # the starts' grants age out
+    base = mem_available()
+    reserve, high = base - 2600, base - 700
+
+    def rss(n):
+        try:
+            return cgroup(A, n)[0]
+        except (OSError, KeyError, TypeError):
+            return None
+    with Watch(A, big + [g]) as w, marks(reserve, high):
+        grow(A, g, 1300, 100)
+        moved = None
+        end = time.time() + 120
+        while time.time() < end:
+            try:
+                st = json.load(open(os.path.join(A.run, "vms", f"{g}.json"))).get("state")
+            except (OSError, ValueError):
+                st = None
+            if moved is None and st != "running":
+                moved = (time.time(), mem_available(), {n: rss(n) for n in big + [g] if n != g or st == "source"})
+            if st is None:
+                break  # released: its copy here is gone
+            time.sleep(0.1)
+    released = time.time()
+    lows = [a for t, a in w.avail if t <= (moved or (released,))[0]]
+    print(f"evict grower: base {base} MiB, high-water {high}, reserve {reserve}; moved at {moved and moved[1]} MiB available "
+          f"(memory.current {moved and moved[2]} MiB), lowest before {min(lows, default=None)} MiB, lowest overall {min(a for _, a in w.avail)} MiB", flush=True)
+    rep = w.report("evict grower: during the eviction")
+    check("evict grower: the grower moved to B", moved is not None and wait_for(lambda: where(g) == {B: "running"}, 30), (where(g), log(A, g)[-1500:]))
+    check("evict grower: the bigger, static vms stayed", all(where(n) == {A: "running"} for n in big), {n: where(n) for n in big})
+    check("evict grower: moved under the high-water mark, above the reserve", moved is not None and reserve < moved[1] < high + 200, moved)
+    check("evict grower: the host never got to its reserve", min(a for _, a in w.avail) > reserve, min(a for _, a in w.avail))
+    check("evict grower: every controller ticked within 2.5 s", all(r["tick_gap_max_ms"] < 2500 for r in rep.values()), rep)
+    check("evict grower: memory requests answered within the guest's 2 s",
+          all(r["asks"] > 0 and r["ask_max_ms"] < 2000 and not any(x.startswith("error") for x in r["replies"]) for r in rep.values()), rep)
+    check("evict grower: md5s intact", md5(B, g) == sums[g] and all(md5(A, n) == sums[n] for n in big))
+    for n in big + [g]:
+        cleanup(n)
+
+
+def evict_skips_cmd():
+    """A host under pressure leaves a `run -- CMD` VM where it is (CMD's end
+    there ends it, with CMD's status), even starved, and moves another."""
+    n, other = "ft-ev-cmd", "ft-ev-plain"
+    scenario_vms.update({n})
+    p = subprocess.Popen([BIN, "--state", A.state, "--run", A.run, "run", n, "--template", args.template, "--", "sleep 600"],
+                         stdout=subprocess.DEVNULL, stderr=open(os.path.join(A.run, f"{n}.stderr"), "w"), env=ENV, start_new_session=True)
+    check("evict cmd: up", wait_for(lambda: vms(A).get(n, {}).get("state") == "running", 30), vms(A).get(n))
+    m = setup(other, mib=1)
+    with marks(512, mem_available() + 1000, A):
+        moved = wait_for(lambda: where(other) == {B: "running"}, 60)
+        time.sleep(8)
+    check("evict cmd: the plain vm moved", moved, (where(other), log(A, other)[-800:]))
+    check("evict cmd: the cmd vm stayed, running its command", where(n) == {A: "running"} and p.poll() is None, (where(n), p.poll()))
+    check("evict cmd: md5 intact", md5(B, other) == m)
+    os.kill(p.pid, signal.SIGINT)
+    check("evict cmd: its command's end still ends it here", p.wait(timeout=30) == 130)
+    cleanup(other)
+
+
+def evict_latency():
+    """Measures each VM's controller ticks and memory requests while a
+    starved VM is moved away to a target slow to prepare (3 s): the VM process
+    deciding the eviction (the starved one's) ticks on and answers."""
+    n, others = "ft-lat-starved", ["ft-lat-a", "ft-lat-b"]
+    sums = {n: setup(n, mib=1), **{o: setup(o, mib=100) for o in others}}
+    if not vms(A)[n]["admitted_mib"]:
+        raise Skip("no per-VM cgroups here")
+    with Watch(A, [n] + others) as w:
+        time.sleep(3)
+        fault(B, "incoming_stall", 600000)
+        fault(A, "no_admit", 600000)
+        hog(A, n, vms(A)[n]["guest_mib"] - 384)
+        moved = wait_for(lambda: where(n) == {B: "running"}, 90)
+        time.sleep(1)
+    fault(A, "no_admit", 0)
+    fault(B, "incoming_stall", 0)
+    rep = w.report("evict latency: during the eviction")
+    check("evict latency: moved to B", moved, (where(n), log(A, n)[-1500:]))
+    check("evict latency: every controller ticked within 2.5 s", all(r["tick_gap_max_ms"] < 2500 for r in rep.values()), rep)
+    check("evict latency: memory requests answered within the guest's 2 s",
+          all(r["asks"] > 0 and r["ask_max_ms"] < 2000 and not any(x.startswith("error") for x in r["replies"]) for r in rep.values()), rep)
+    # Its source, paused at its mark through the pull, is not starved: nothing else moves for it.
+    time.sleep(8)
+    check("evict latency: the others stay", all(where(o) == {A: "running"} for o in others), {o: where(o) for o in others})
+    check("evict latency: md5s intact", md5(B, n) == sums[n] and all(md5(A, o) == sums[o] for o in others))
+    for v in [n] + others:
+        cleanup(v)
+
+
 def start_admission():
     """Concurrent starts are admitted against the reserve, each with what it
     brings and a step, so together they cannot take the host below it: with
@@ -3795,7 +4049,8 @@ SCENARIOS = dict(
     pull_died=pull_died,
     uffd_err=uffd_err,
     mem_high=no_evict(skippable(mem_high)), mem_high_migrate=no_evict(skippable(mem_high_migrate)),
-    mem_high_evict=skippable(mem_high_evict), start_admission=start_admission, standby_admission=standby_admission,
+    mem_high_evict=skippable(mem_high_evict), evict_grower=skippable(evict_grower), evict_no_pingpong=evict_no_pingpong, evict_skips_cmd=evict_skips_cmd, evict_latency=skippable(evict_latency),
+    start_admission=start_admission, standby_admission=standby_admission,
     cow_grow=no_evict(cow_grow), plug_race=no_evict(plug_race), shrink_stall=no_evict(shrink_stall), plug_storm=no_evict(plug_storm),
     basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, refused=refused, pages_blip=pages_blip,
     pages_dead_restore=pages_dead_restore, pages_dead=pages_dead, resume_kill=resume_kill, prepared_retry=prepared_retry,

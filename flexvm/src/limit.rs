@@ -111,7 +111,7 @@ impl Limit {
         let more = {
             let m = self.mark.lock().unwrap();
             let s = step(m.admitted);
-            match m.admitted == 0 || m.admitted >= m.cap || used + s / 2 < m.admitted + overhead(m.admitted) {
+            match m.lifted || m.admitted == 0 || m.admitted >= m.cap || used + s / 2 < m.admitted + overhead(m.admitted) {
                 true => 0,
                 false => (m.admitted + s).min(m.cap) - m.admitted,
             }
@@ -182,12 +182,18 @@ impl Limit {
     }
 
     /// Raises the mark as the VM nears it, at once (the cgroup's `high`
-    /// events) or within `tick`, while `live`.
-    pub fn watch(&self, host: &Host, tick: Duration, live: impl Fn() -> bool) {
+    /// events) or within `tick`, while `live`; only while `running` (not
+    /// throttled otherwise: nothing is asked for it).
+    pub fn watch(&self, host: &Host, tick: Duration, live: impl Fn() -> bool, running: impl Fn() -> bool) {
         let Some(cg) = &self.cgroup else { return };
         let mut events = std::fs::File::open(cg.join("memory.events")).ok();
         while live() {
             wait_event(events.as_mut(), tick);
+            if !running() {
+                self.throttled.store(false, Ordering::SeqCst);
+                std::thread::sleep(tick);
+                continue;
+            }
             // Throttling raises an event every 10 ms; refused, no use asking again at each.
             std::thread::sleep(if self.grow(host) { Duration::from_millis(20) } else { tick });
         }
@@ -270,6 +276,12 @@ mod tests {
         // Lifted while a migration or checkpoint pauses the VM, then back.
         let lifted = l.lift(None);
         assert_eq!(high(&cg), None);
+        // Nothing is admitted for it meanwhile (no phantom grant), nor is it throttled.
+        let was = l.admitted();
+        set(&cg, was + overhead(was));
+        host.cfg.reserve_mib = u64::MAX / 4;
+        assert!(l.grow(&host) && l.admitted() == was && !l.throttled.load(Ordering::SeqCst));
+        host.cfg.reserve_mib = 0;
         drop(lifted);
         assert_eq!(high(&cg), Some(l.admitted() + overhead(l.admitted())));
     }
