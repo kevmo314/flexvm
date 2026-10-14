@@ -1542,7 +1542,7 @@ fn relieve(host: &Host, avail: Option<u64>, starved_here: bool) {
     });
 }
 
-/// Under the reserve: SIGINTs the standby VMs, under `STATE/standby.stop.lock`
+/// Under the reserve: SIGUSR1s the standby VMs, under `STATE/standby.stop.lock`
 /// (not eviction's lock, which a migration may hold for a while). True if
 /// it stopped any.
 fn stop_standby(host: &Host, avail: u64, reserve: u64) -> bool {
