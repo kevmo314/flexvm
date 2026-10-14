@@ -885,7 +885,9 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
     crate::util::output::guard()?;
     let _ = crate::net::sysctl("net.ipv4.ip_forward", "1");
     if let Some(dev) = &host.cfg.announce_dev {
-        crate::net::sysctl(&format!("net.ipv4.conf.{dev}.proxy_arp"), "1")?;
+        if let Err(e) = crate::net::sysctl(&format!("net.ipv4.conf.{dev}.proxy_arp"), "1") {
+            eprintln!("WARNING: proxy ARP on {dev}: {e}");
+        }
     }
     let p = Proc::new(host, paths)?;
     let host = p.host.clone();
