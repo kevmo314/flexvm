@@ -30,7 +30,7 @@ impl Drop for Slot {
 
 pub const PAGE_SIZE: usize = 4096;
 
-pub fn send_json(w: &mut impl Write, v: &serde_json::Value) -> io::Result<()> {
+pub fn send_json(w: &mut impl Write, v: &impl serde::Serialize) -> io::Result<()> {
     let mut buf = serde_json::to_vec(v)?;
     buf.push(b'\n');
     w.write_all(&buf)?;

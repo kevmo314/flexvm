@@ -55,12 +55,6 @@ struct Header<'a> {
 }
 
 impl Header<'_> {
-    fn send(&self, w: &mut impl Write) -> Result<()> {
-        let mut line = serde_json::to_vec(self)?;
-        line.push(b'\n');
-        Ok(w.write_all(&line)?)
-    }
-
     /// None if the source hung up first.
     fn recv(r: &mut impl BufRead) -> Result<Option<Header<'static>>> {
         let mut line = Vec::new();
@@ -163,14 +157,16 @@ impl Proc {
         };
         let remote_pages: u64 = runs.iter().filter(|r| r.2 == crate::uffd::REMOTE).map(|r| r.1).sum();
         let sent = (|| -> Result<Value> {
-            Header {
-                runs: Cow::Borrowed(&runs),
-                vmstate_len: state.len() as u64,
-                preload: Cow::Borrowed(&pages),
-                paused: vm.was_paused(),
-                app_log: self.hold_app_log(),
-            }
-            .send(&mut conn)?;
+            send_json(
+                &mut conn,
+                &Header {
+                    runs: Cow::Borrowed(&runs),
+                    vmstate_len: state.len() as u64,
+                    preload: Cow::Borrowed(&pages),
+                    paused: vm.was_paused(),
+                    app_log: self.hold_app_log(),
+                },
+            )?;
             conn.write_all(&state)?;
             if fault("slow_preload") {
                 thread::sleep(Duration::from_millis(300));

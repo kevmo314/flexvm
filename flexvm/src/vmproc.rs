@@ -1116,7 +1116,7 @@ impl Proc {
     }
 
     pub fn forget_stop(&self) {
-        self.early.lock().unwrap().retain(|&s| !is_stop(s));
+        forget_stop(&mut self.early.lock().unwrap());
     }
 
     pub fn arc(&self) -> Option<Arc<Proc>> {
@@ -1155,6 +1155,11 @@ impl Proc {
 /// the claimed VM ignores), or SIGINT or SIGTERM sent to it.
 fn is_stop(sig: i32) -> bool {
     matches!(sig, libc::SIGINT | libc::SIGTERM | libc::SIGUSR1)
+}
+
+/// A claim discards only the pool's stop; termination requests still replay.
+fn forget_stop(early: &mut Vec<i32>) {
+    early.retain(|&s| s != libc::SIGUSR1);
 }
 
 pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::File>) -> Result<()> {
@@ -1685,6 +1690,13 @@ pub fn call(host: &Host, name: &str, req: Value, at: Option<Instant>) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claim_keeps_termination_requests() {
+        let mut early = vec![libc::SIGUSR1, libc::SIGINT, libc::SIGTSTP, libc::SIGTERM, libc::SIGUSR1, libc::SIGCONT];
+        forget_stop(&mut early);
+        assert_eq!(early, [libc::SIGINT, libc::SIGTSTP, libc::SIGTERM, libc::SIGCONT]);
+    }
 
     /// MemAvailable unreadable (None) is no pressure: no standby is stopped
     /// and no eviction is tried; read as under the reserve, both are.
