@@ -112,6 +112,8 @@ pub struct Proc {
     ticks: Mutex<Ticks>,
     /// How fast the VM's memory grew lately (MiB/s), for eviction's ranking.
     growth: AtomicU64,
+    /// Held by `publish` from reading the VM's state to writing it.
+    publishing: Mutex<()>,
     me: std::sync::Weak<Proc>,
 }
 
@@ -198,6 +200,7 @@ impl Proc {
             serving: AtomicBool::new(false),
             ticks: Mutex::new(Ticks::default()),
             growth: AtomicU64::new(0),
+            publishing: Mutex::new(()),
             me: me.clone(),
         }))
     }
@@ -420,6 +423,8 @@ impl Proc {
 
     /// Best effort: the registry is for `ls`; nothing decides ownership by it.
     pub fn publish(&self) {
+        // Read and written in turn: a publish racing a state change never overwrites the newer entry.
+        let _publishing = self.publishing.lock().unwrap();
         let (Some(vm), Some(n)) = (self.vm.get(), self.name.lock().unwrap().as_ref().map(|n| n.name.clone())) else { return };
         if fault("publish") {
             return eprintln!("vm {n}: registry: injected fault: not published");
@@ -710,9 +715,11 @@ impl Proc {
             return;
         };
         let res = match sig {
-            libc::SIGTSTP => self.op_within().and_then(|_op| vm.pause()).map(|()| {
+            libc::SIGTSTP => self.op_within().and_then(|_op| {
+                vm.pause()?;
                 self.paused_by_request.store(true, Ordering::SeqCst);
-                self.publish()
+                self.publish();
+                Ok(())
             }),
             libc::SIGCONT if self.leaving.load(Ordering::SeqCst) || !self.paused_by_request.load(Ordering::SeqCst) => Ok(()),
             libc::SIGCONT => self.resume().map(drop),

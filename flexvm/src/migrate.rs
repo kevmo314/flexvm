@@ -232,6 +232,7 @@ impl Proc {
             }
             Err(r) => {
                 vm.set_failed();
+                self.publish();
                 return format!("{e}; and whether its address went to another vm cannot be told ({r}), so it stays paused, failed").into();
             }
         };

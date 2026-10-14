@@ -89,13 +89,13 @@ impl Proc {
         drop(still);
         self.paused_by_request.store(false, Ordering::SeqCst);
         let took = start.elapsed();
+        self.publish();
         if let Some(old) = vm.pending_net.lock().unwrap().take() {
             if let Err(e) = self.readdress(vm, old) {
                 *vm.pending_net.lock().unwrap() = Some(old);
                 bail!("vm {} resumed, but setting its address {} failed: {e}", vm.name, vm.ip);
             }
         }
-        self.publish();
         drop(op);
         self.sync_clock_later();
         Ok(json!({"name": vm.name, "state": "running", "resume_ms": ms(took)}))
@@ -522,6 +522,7 @@ impl Proc {
         cancelled()?;
         let _lifted = vm.limit.lift(vm.pid());
         vm.leave(State::Checkpointing)?;
+        self.publish();
         let paused = Instant::now();
         let mut hold = PacketHold { d: self, vm, id: crate::migrate::migration_id(), stats: None };
         // Failure must `unfreeze` so the last checkpoint stays the delta base.
@@ -568,6 +569,8 @@ impl Proc {
         if cow {
             hold.end().inspect_err(|_| vm.pager.unfreeze(&frozen))?;
             pause = Some(paused.elapsed());
+            // Out of the pause: `ls` shows it running while the copy goes on (#152).
+            self.publish();
             t.mark("resume");
             growth = Some(CopyGrowth::start(vm));
             if fault("ckpt_abort") {
@@ -644,6 +647,7 @@ impl Proc {
             Ok(_) => vm.pager.end_copy(),
             Err(_) => vm.pager.unfreeze(&frozen),
         }
+        self.publish();
         let paused = pause.unwrap_or_else(|| paused.elapsed());
         match committed {
             Ok((manifest, id)) => {
@@ -666,6 +670,7 @@ impl Proc {
             Err(CommitError::Uncertain(e)) if cow => Err(format!("{e}; the checkpoint may reappear after a crash").into()),
             Err(CommitError::Uncertain(e)) => {
                 vm.set_failed();
+                self.publish();
                 Err(format!("{e}; vm {} stays paused and is marked failed, as the checkpoint may come back", vm.name).into())
             }
         }
