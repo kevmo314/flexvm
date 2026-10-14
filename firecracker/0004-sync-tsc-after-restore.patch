@@ -8,7 +8,18 @@
  use std::sync::Arc;
  
  use kvm_bindings::{
-@@ -748,6 +749,70 @@
+@@ -105,6 +106,10 @@
+     VcpuSetXcrs(kvm_ioctls::Error),
+     /// Failed to set KVM vcpu xsave: {0}
+     VcpuSetXsave(kvm_ioctls::Error),
++    /// Failed to get or set the KVM vcpu TSC offset: {0}
++    VcpuTscOffset(kvm_ioctls::Error),
++    /// KVM cannot set vcpu TSC offsets (KVM_VCPU_TSC_OFFSET, Linux 5.16+): restored vcpus would keep TSCs apart
++    VcpuTscOffsetUnsupported,
+ }
+ 
+ /// Error type for [`KvmVcpu::get_tsc_khz`] and [`KvmVcpu::is_tsc_scaling_required`].
+@@ -748,6 +753,72 @@
          self.kvmclock_ctrl();
          Ok(())
      }
@@ -45,13 +56,15 @@
 +    }
 +}
 +
-+/// Once every vCPU is restored: gives them all vCPU 0's TSC offset, as they had on the
-+/// source. Each vCPU's restore wrote its TSC, and KVM takes such writes as in sync only if
-+/// they come within a second of each other, which restoring one vCPU can outlast (its MSRs map
-+/// guest pages, which may still have to be paged in): the TSCs, the guest's clocksource, then
-+/// ended up apart by as long. Exact with `KVM_VCPU_TSC_OFFSET` (Linux 5.16+), after which each
-+/// vCPU's TSC deadline, which counts in its TSC, is set again; without it, the TSCs are
-+/// written again back to back, which KVM syncs unless this is stopped for a second meanwhile.
++/// Once every vCPU is restored: gives them all one TSC offset, vCPU 0's, as they had on the
++/// source (`KVM_VCPU_TSC_OFFSET`, Linux 5.16+), then sets each one's TSC deadline, which counts
++/// in its TSC, again. Each vCPU's restore wrote its TSC, and KVM takes such writes as in sync
++/// only if they come within a second of each other, which restoring one vCPU can outlast (its
++/// MSRs map guest pages, which may still have to be paged in): the TSCs, the guest's
++/// clocksource, then ended up apart by as long. Every vCPU gets the offset, vCPU 0 too, so all
++/// are in the same KVM TSC generation (its master clock and the pvclock stable flag need it).
++/// Without the attribute a restore of more than one vCPU fails rather than risk a guest whose
++/// clock jumps.
 +pub fn sync_tscs(vcpus: &[&KvmVcpu], states: &[VcpuState]) -> Result<(), KvmVcpuError> {
 +    const KVM_SET_DEVICE_ATTR: u64 = 0xe1;
 +    const KVM_GET_DEVICE_ATTR: u64 = 0xe2;
@@ -64,15 +77,15 @@
 +        attr: u64::from(kvm_bindings::KVM_VCPU_TSC_OFFSET),
 +        addr: std::ptr::addr_of_mut!(offset) as u64,
 +    };
-+    if first.device_attr(KVM_HAS_DEVICE_ATTR, &attr).is_err() || first.device_attr(KVM_GET_DEVICE_ATTR, &attr).is_err() {
-+        warn!("KVM_VCPU_TSC_OFFSET unavailable: the vCPUs' TSCs are written again instead");
-+        for (vcpu, state) in vcpus.iter().zip(states) {
-+            vcpu.restore_msrs(state, &[MSR_IA32_TSC, MSR_IA32_TSC_DEADLINE])?;
-+        }
-+        return Ok(());
++    if first.device_attr(KVM_HAS_DEVICE_ATTR, &attr).is_err() {
++        return match vcpus.len() {
++            1 => Ok(()),
++            _ => Err(KvmVcpuError::VcpuTscOffsetUnsupported),
++        };
 +    }
-+    for (vcpu, state) in vcpus.iter().zip(states).skip(1) {
-+        vcpu.device_attr(KVM_SET_DEVICE_ATTR, &attr).map_err(KvmVcpuError::VcpuSetMsrs)?;
++    first.device_attr(KVM_GET_DEVICE_ATTR, &attr).map_err(KvmVcpuError::VcpuTscOffset)?;
++    for (vcpu, state) in vcpus.iter().zip(states) {
++        vcpu.device_attr(KVM_SET_DEVICE_ATTR, &attr).map_err(KvmVcpuError::VcpuTscOffset)?;
 +        vcpu.restore_msrs(state, &[MSR_IA32_TSC_DEADLINE])?;
 +    }
 +    Ok(())
