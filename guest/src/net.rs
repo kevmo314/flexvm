@@ -22,8 +22,10 @@ impl Sock {
 }
 
 fn sockaddr(ip: Ipv4Addr) -> libc::sockaddr {
-    let sin = libc::sockaddr_in { sin_family: libc::AF_INET as _, sin_port: 0, sin_addr: libc::in_addr { s_addr: u32::from(ip).to_be() }, sin_zero: [0; 8] };
-    unsafe { std::mem::transmute(sin) }
+    // struct sockaddr_in: family, port, address.
+    let mut sa_data = [0; 14];
+    sa_data[2..6].copy_from_slice(&ip.octets().map(|b| b as libc::c_char));
+    libc::sockaddr { sa_family: libc::AF_INET as _, sa_data }
 }
 
 fn name<const N: usize>(dst: &mut [libc::c_char; N], name: &str) {

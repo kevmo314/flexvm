@@ -379,11 +379,12 @@ impl Injector {
     pub fn new(tap: &str) -> Result<Injector> {
         // Protocol 0: it sends and never receives.
         let fd = eintr(|| unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW | libc::SOCK_CLOEXEC, 0) }).map_err(|e| format!("packet socket: {e}"))?;
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
         let mut header = [0u8; 14];
         header[..6].copy_from_slice(&crate::net::parse_mac(crate::net::GUEST_MAC)?);
         header[6..12].copy_from_slice(&crate::net::parse_mac(crate::net::GATEWAY_MAC)?);
         header[12..].copy_from_slice(&[0x08, 0x00]);
-        Ok(Injector { fd: unsafe { OwnedFd::from_raw_fd(fd) }, tap: tap.into(), ifindex: crate::net::ifindex(tap)?, header, tx_dropped: tap_tx_dropped(tap) })
+        Ok(Injector { fd, tap: tap.into(), ifindex: crate::net::ifindex(tap)?, header, tx_dropped: tap_tx_dropped(tap) })
     }
 
     pub fn send(&self, packet: &[u8]) -> bool {
@@ -614,10 +615,8 @@ fn open_tun(dev: &str) -> std::result::Result<OwnedFd, (bool, crate::util::Error
     req.ifr_ifru.ifru_metric = TXQ as i32;
     let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
     if sock >= 0 {
-        unsafe {
-            libc::ioctl(sock, libc::SIOCSIFTXQLEN as _, &req);
-            libc::close(sock);
-        }
+        let sock = unsafe { OwnedFd::from_raw_fd(sock) };
+        unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCSIFTXQLEN as _, &req) };
     }
     Ok(fd)
 }
