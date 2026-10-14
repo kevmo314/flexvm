@@ -28,7 +28,7 @@
 //! make no progress for a while, or a REMOVE slips in between the probe and
 //! the read, the checkpoint is invalidated instead of saving wrong contents.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -75,7 +75,7 @@ pub struct Cow {
     rescued_bytes: AtomicUsize,
     budget: usize,
     /// Pages faults are waiting on, for the writers to take first.
-    wanted: Mutex<(VecDeque<usize>, HashSet<usize>)>,
+    wanted: Mutex<VecDeque<usize>>,
     /// Bumped as pages are saved; drains wait on it.
     progress: (Mutex<u64>, Condvar),
     /// Where to look for an unsaved page to probe with.
@@ -93,27 +93,22 @@ impl Cow {
     pub fn new(total: usize, runs: &Runs) -> Cow {
         // CLEAN is 0: a zeroed allocation is lazily backed by the kernel.
         let states = unsafe { std::mem::transmute::<Vec<u8>, Vec<AtomicU8>>(vec![0u8; total]) };
-        let mut left = 0;
-        for &(first, count, _) in runs.iter().filter(|r| r.2 == REMOTE) {
-            for s in &states[first as usize..(first + count) as usize] {
-                s.store(PENDING, Ordering::Relaxed);
-            }
-            left += count as usize;
-        }
+        let runs: Vec<(usize, usize)> = runs.iter().filter(|r| r.2 == REMOTE).map(|r| (r.0 as usize, (r.0 + r.1) as usize)).collect();
+        runs.iter().flat_map(|&(a, b)| &states[a..b]).for_each(|s| s.store(PENDING, Ordering::Relaxed));
         let budget = std::env::var("FLEXVM_COW_BUDGET_MIB").ok().and_then(|v| v.parse().ok()).unwrap_or(BUDGET_MIB) << 20;
         Cow {
             states,
-            left: AtomicUsize::new(left),
+            left: AtomicUsize::new(runs.iter().map(|(a, b)| b - a).sum()),
             rescued: Mutex::new(HashMap::new()),
             rescued_bytes: AtomicUsize::new(0),
             budget,
-            wanted: Mutex::new((VecDeque::new(), HashSet::new())),
+            wanted: Mutex::new(VecDeque::new()),
             progress: (Mutex::new(0), Condvar::new()),
-            hint: AtomicUsize::new(runs.iter().find(|r| r.2 == REMOTE).map_or(0, |r| r.0 as usize)),
+            hint: AtomicUsize::new(runs.first().map_or(0, |r| r.0)),
             stopped: AtomicBool::new(false),
             error: Mutex::new(None),
             started: Instant::now(),
-            runs: runs.iter().filter(|r| r.2 == REMOTE).map(|r| (r.0 as usize, (r.0 + r.1) as usize)).collect(),
+            runs,
             stats: Stats::default(),
         }
     }
@@ -138,6 +133,14 @@ impl Cow {
     /// Whether faults still have to save pages before letting writes through.
     pub fn active(&self) -> bool {
         !self.stopped.load(Ordering::SeqCst)
+    }
+
+    /// Fails unless the copy is still `active`, with why it stopped.
+    fn check_active(&self) -> Result<()> {
+        if !self.active() {
+            crate::bail!("the checkpoint copy stopped: {}", self.error().unwrap_or_else(|| "the vm is gone".into()));
+        }
+        Ok(())
     }
 
     /// Pages whose pause-time contents exist only in the guest page.
@@ -171,17 +174,10 @@ impl Cow {
     /// A fault waits on `page`: writers take its unit next.
     pub fn want(&self, page: usize) {
         self.stats.deferred.fetch_add(1, Ordering::Relaxed);
-        let mut w = self.wanted.lock().unwrap();
-        if w.1.insert(page) {
-            w.0.push_back(page);
+        let mut wanted = self.wanted.lock().unwrap();
+        if !wanted.contains(&page) {
+            wanted.push_back(page);
         }
-    }
-
-    fn next_wanted(&self) -> Option<usize> {
-        let mut w = self.wanted.lock().unwrap();
-        let p = w.0.pop_front()?;
-        w.1.remove(&p);
-        Some(p)
     }
 
     /// Some page that is still protected because it is not saved yet.
@@ -277,27 +273,20 @@ impl GuestPages for CowPages<'_> {
     fn read(&self, page: usize, buf: &mut [u8]) -> Result<()> {
         let cow = self.cow;
         std::thread::sleep(self.slow);
-        if !cow.active() {
-            crate::bail!("the checkpoint copy stopped: {}", cow.error().unwrap_or_else(|| "the vm is gone".into()));
-        }
+        cow.check_active()?;
         let n = buf.len() / PAGE_SIZE;
         let mine: Vec<bool> = (0..n).map(|i| cow.claim(page + i, PENDING, READING)).collect();
         // Runs of pages claimed here, read straight out of the guest.
         for (i, j) in crate::uffd::runs_where(0, n, |i| mine[i]) {
             if let Err(e) = self.guest.read(page + i, &mut buf[i * PAGE_SIZE..j * PAGE_SIZE]) {
-                for (k, _) in mine.iter().enumerate().skip(i).filter(|m| *m.1) {
-                    cow.set(page + k, PENDING);
-                }
+                (i..n).filter(|&k| mine[k]).for_each(|k| cow.set(page + k, PENDING));
                 return Err(e);
             }
         }
-        let claimed = mine.iter().filter(|&&m| m).count();
-        for (k, _) in mine.iter().enumerate().filter(|m| *m.1) {
-            cow.set(page + k, CLEAN);
-        }
-        cow.saved(claimed);
+        (0..n).filter(|&k| mine[k]).for_each(|k| cow.set(page + k, CLEAN));
+        cow.saved(mine.iter().filter(|&&m| m).count());
         // The rest a fault saved first (or is saving right now).
-        for (k, _) in mine.iter().enumerate().filter(|m| !*m.1) {
+        for k in (0..n).filter(|&k| !mine[k]) {
             let p = page + k;
             loop {
                 match cow.state(p) {
@@ -305,16 +294,12 @@ impl GuestPages for CowPages<'_> {
                     RESCUING => std::thread::yield_now(),
                     s => crate::bail!("page {p} is in copy state {s}, not saved"),
                 }
-                if !cow.active() {
-                    crate::bail!("the checkpoint copy stopped: {}", cow.error().unwrap_or_else(|| "the vm is gone".into()));
-                }
+                cow.check_active()?;
             }
             // A copy that stops (abort, kill) drops the rescued copies under
             // the writers: that is the stop, not a lost page.
             let Some(bytes) = cow.rescued.lock().unwrap().remove(&p) else {
-                if !cow.active() {
-                    crate::bail!("the checkpoint copy stopped: {}", cow.error().unwrap_or_else(|| "the vm is gone".into()));
-                }
+                cow.check_active()?;
                 crate::bail!("page {p}: rescued copy missing");
             };
             cow.rescued_bytes.fetch_sub(bytes.len(), Ordering::SeqCst);
@@ -325,7 +310,7 @@ impl GuestPages for CowPages<'_> {
     }
 
     fn wanted(&self) -> Option<usize> {
-        self.cow.next_wanted()
+        self.cow.wanted.lock().unwrap().pop_front()
     }
 }
 

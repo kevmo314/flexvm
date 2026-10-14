@@ -2242,8 +2242,19 @@ impl Link {
 pub fn probe(source: &Source, page: u64, deadline: Instant) -> io::Result<()> {
     let give_up = deadline.min(Instant::now() + SOURCE_TIMEOUT);
     let mut backoff = BACKOFF_MIN;
+    // One attempt: connecting, the request and every read by `give_up`.
+    let once = || {
+        let left = give_up.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "deadline passed"));
+        }
+        let s = crate::util::connect(&source.addr, left)?;
+        s.set_nodelay(true)?;
+        let mut client = PageClient::new(crate::util::By { s, at: give_up }, source)?;
+        client.fetch(page * PAGE_SIZE as u64, &mut [0u8; PAGE_SIZE], 0, &mut |_| true)
+    };
     loop {
-        let e = match probe_once(source, page, give_up) {
+        let e = match once() {
             Ok(()) => return Ok(()),
             Err(e) => e,
         };
@@ -2255,55 +2266,9 @@ pub fn probe(source: &Source, page: u64, deadline: Instant) -> io::Result<()> {
     }
 }
 
-/// One `probe` attempt: connecting, the request and every read by `at`.
-fn probe_once(source: &Source, page: u64, at: Instant) -> io::Result<()> {
-    let left = at.saturating_duration_since(Instant::now());
-    if left.is_zero() {
-        return Err(io::Error::new(io::ErrorKind::TimedOut, "deadline passed"));
-    }
-    let s = crate::util::connect(&source.addr, left)?;
-    s.set_nodelay(true)?;
-    let mut s = crate::util::By { s, at };
-    let mut req = serde_json::to_vec(&serde_json::json!({"op": "pages", "name": source.vm, "mig": source.mig}))?;
-    req.push(b'\n');
-    req.extend_from_slice(&(page * PAGE_SIZE as u64).to_le_bytes());
-    req.extend_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
-    s.write_all(&req)?;
-    read_ack(&mut s)?;
-    let mut status = [0u8; 1];
-    s.read_exact(&mut status)?;
-    if status[0] != 0 {
-        return Err(io::Error::other("page server could not read guest memory"));
-    }
-    s.read_exact(&mut vec![0u8; PAGE_SIZE])
-}
-
-/// Reads the page server's answer to the `pages` request: one JSON line,
-/// `{"ok": true}` before the binary protocol, or why it refuses (then it
-/// hangs up). Read a byte at a time, so nothing after it is consumed.
-fn read_ack(s: &mut impl Read) -> io::Result<()> {
-    let mut line = Vec::new();
-    let mut b = [0u8; 1];
-    while b[0] != b'\n' {
-        if line.len() >= 4096 {
-            return Err(io::Error::other("page server sent an overlong answer"));
-        }
-        if s.read(&mut b)? == 0 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "page server hung up before answering"));
-        }
-        line.push(b[0]);
-    }
-    let v: serde_json::Value = serde_json::from_slice(&line).map_err(|e| io::Error::other(format!("page server answer: {e}")))?;
-    if v["ok"] != serde_json::json!(true) {
-        let why = v["error"].as_str().unwrap_or("no reason given");
-        return Err(io::Error::other(format!("page server refused: {why}")));
-    }
-    Ok(())
-}
-
 /// Client for a migration source's page server.
-pub struct PageClient {
-    stream: TcpStream,
+pub struct PageClient<S = TcpStream> {
+    stream: S,
     /// Whether the server's answer to the `pages` request has been read: it
     /// is read along with the first reply, so connecting costs no round trip.
     acked: bool,
@@ -2311,11 +2276,17 @@ pub struct PageClient {
 
 impl PageClient {
     pub fn connect(source: &Source) -> io::Result<Self> {
-        let mut stream = crate::util::connect(&source.addr, Duration::from_millis(500))?;
+        let stream = crate::util::connect(&source.addr, Duration::from_millis(500))?;
         stream.set_nodelay(true)?;
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-        let hello = serde_json::json!({"op": "pages", "name": source.vm, "mig": source.mig});
-        let mut hello = serde_json::to_vec(&hello)?;
+        PageClient::new(stream, source)
+    }
+}
+
+impl<S: Read + Write> PageClient<S> {
+    /// Asks the page server on `stream` for `source`'s pages.
+    fn new(mut stream: S, source: &Source) -> io::Result<Self> {
+        let mut hello = serde_json::to_vec(&serde_json::json!({"op": "pages", "name": source.vm, "mig": source.mig}))?;
         hello.push(b'\n');
         stream.write_all(&hello)?;
         Ok(PageClient { stream, acked: false })
@@ -2338,7 +2309,7 @@ impl PageClient {
         }
         self.stream.write_all(&req)?;
         if !self.acked {
-            read_ack(&mut self.stream)?;
+            self.read_ack()?;
             self.acked = true;
         }
         for (a, b) in parts {
@@ -2361,6 +2332,29 @@ impl PageClient {
                     Err(e) => return Err(e),
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Reads the page server's answer to the `pages` request: one JSON line,
+    /// `{"ok": true}` before the binary protocol, or why it refuses (then it
+    /// hangs up). Read a byte at a time, so nothing after it is consumed.
+    fn read_ack(&mut self) -> io::Result<()> {
+        let mut line = Vec::new();
+        let mut b = [0u8; 1];
+        while b[0] != b'\n' {
+            if line.len() >= 4096 {
+                return Err(io::Error::other("page server sent an overlong answer"));
+            }
+            if self.stream.read(&mut b)? == 0 {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "page server hung up before answering"));
+            }
+            line.push(b[0]);
+        }
+        let v: serde_json::Value = serde_json::from_slice(&line).map_err(|e| io::Error::other(format!("page server answer: {e}")))?;
+        if v["ok"] != serde_json::json!(true) {
+            let why = v["error"].as_str().unwrap_or("no reason given");
+            return Err(io::Error::other(format!("page server refused: {why}")));
         }
         Ok(())
     }
@@ -2390,16 +2384,12 @@ pub fn serve_pages(pager: &Pager, conn: &TcpStream, mut stream: impl Read + Writ
     conn.set_write_timeout(Some(SERVE_WRITE))?;
     let mut req = [0u8; 12];
     let mut buf = Vec::new();
-    loop {
-        if !read_request(&mut stream, &mut req, &stop) || stop() {
-            return Ok(());
-        }
+    while read_request(&mut stream, &mut req, &stop) && !stop() {
         let offset = u64::from_le_bytes(req[..8].try_into().unwrap());
         let len = u32::from_le_bytes(req[8..].try_into().unwrap()) as usize;
         if len > MAX_FETCH {
             eprintln!("page server: refusing a {len}-byte read (at most {MAX_FETCH}); dropping the connection");
-            stream.write_all(&[1])?;
-            return Ok(());
+            return stream.write_all(&[1]);
         }
         // The status byte, then the pages: sent with one write.
         buf.resize(1 + len, 0);
@@ -2412,6 +2402,7 @@ pub fn serve_pages(pager: &Pager, conn: &TcpStream, mut stream: impl Read + Writ
             }
         }
     }
+    Ok(())
 }
 
 /// Reads one 12-byte request through the socket's 1 s read timeout. False
@@ -2440,13 +2431,8 @@ fn read_request(stream: &mut impl Read, req: &mut [u8; 12], stop: &impl Fn() -> 
 pub fn remote_among(runs: &Runs, wanted: impl IntoIterator<Item = u64>) -> Vec<u64> {
     let mut remote: Vec<(u64, u64)> = runs.iter().filter(|r| r.2 == REMOTE).map(|r| (r.0, r.0 + r.1)).collect();
     remote.sort_unstable();
-    wanted
-        .into_iter()
-        .filter(|&p| {
-            let i = remote.partition_point(|r| r.1 <= p);
-            remote.get(i).is_some_and(|r| r.0 <= p)
-        })
-        .collect()
+    let is_remote = |&p: &u64| remote.get(remote.partition_point(|r| r.1 <= p)).is_some_and(|r| r.0 <= p);
+    wanted.into_iter().filter(is_remote).collect()
 }
 
 /// Every page, for `Pager::chunks`.
@@ -2469,8 +2455,7 @@ pub(crate) fn runs_where(first: usize, end: usize, f: impl Fn(usize) -> bool) ->
 type Fetch = dyn FnMut(u64, &mut [u8], &AtomicBool, &mut dyn FnMut(&[u8]) -> bool) -> io::Result<()> + Send;
 /// `Fetch`, borrowed and not necessarily `Send`.
 type FetchAny<'a> = dyn FnMut(u64, &mut [u8], &AtomicBool, &mut dyn FnMut(&[u8]) -> bool) -> io::Result<()> + 'a;
-/// A run of REMOTE pages a fault claimed, `(first, count)`, and when it
-/// was queued.
+/// A run of REMOTE pages a fault claimed, `(first, count)`, and when it was queued.
 type Job = (usize, usize, Instant);
 
 /// Errors after which the pager gives up on the VM: its migration source has
@@ -2479,12 +2464,12 @@ fn fatal(e: &io::Error) -> bool {
     matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::InvalidData)
 }
 
-/// Checks page runs from a migration source (ascending, disjoint, in bounds,
-/// and only states a source exports) and counts their REMOTE pages.
 fn regions(mappings: &[Mapping]) -> Vec<(u64, u64)> {
     mappings.iter().map(|m| (m.offset, m.size as u64)).collect()
 }
 
+/// Checks page runs from a migration source (ascending, disjoint, in bounds,
+/// and only states a source exports) and counts their REMOTE pages.
 fn remote_pages(runs: &Runs, total: usize) -> Result<usize> {
     let (mut next, mut remote) = (0, 0);
     for &(first, count, state) in runs {
