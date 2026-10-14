@@ -476,10 +476,12 @@ impl Proc {
             } else {
                 eprintln!("vm {}: no held packets from the source after {} ms", vm.name, ms(fence.elapsed()));
             }
-            let ended = p.if_current(|| match (holder.as_deref(), holding) {
+            // Only the route switch is under the host lock: the tap's plug, not the lock,
+            // keeps what the new route sends behind the held packets (#164).
+            let ended = match (holder.as_deref(), holding) {
                 (Some(h), true) => {
-                    // `release_stall`: the route change waits long (for RTNL, say).
                     let start = Instant::now();
+                    let mut current = true;
                     // What is routed to the tap from the switch on waits in its qdisc, in order,
                     // until the hold has handed over all it took before the switch (which a busy
                     // host can delay past the next packet): then it follows, in order.
@@ -489,10 +491,15 @@ impl Proc {
                         eprintln!("vm {}: plugging its tap: {e}", vm.name);
                     }
                     let (released, switched) = release_into(h, vm.ip, mig, &vm, STRAGGLERS, |()| {
-                        if fault("release_stall") {
-                            thread::sleep(Duration::from_millis(300));
-                        }
-                        vm.route_here()
+                        let routed = p.if_current(|| {
+                            // `release_stall`: the route change waits long (for RTNL, say).
+                            if fault("release_stall") {
+                                thread::sleep(Duration::from_millis(300));
+                            }
+                            vm.route_here()
+                        })?;
+                        current = routed.is_some();
+                        routed.ok_or_else(|| format!("{} went to a newer vm", vm.ip).into())
                     });
                     // Even if plugging said it failed: it may have been done (a lost ACK).
                     let (plug_drops, unplugged) = match fault("no_plug") {
@@ -502,18 +509,18 @@ impl Proc {
                     if let Err(e) = unplugged {
                         eprintln!("vm {}: letting {}'s packets through its tap: {e}", vm.name, vm.ip);
                     }
-                    if let Some(mut s) = released {
+                    if let Some(mut s) = released.filter(|_| current) {
                         s.dropped_target += plug_drops;
                         eprintln!("vm {}: let go of {} after {} ms, {} packets injected", vm.name, vm.ip, ms(start.elapsed()), s.injected);
                         if s.dropped + s.dropped_target > 0 {
                             eprintln!("vm {}: dropped {} of the packets held while taking {} over", vm.name, s.dropped + s.dropped_target, vm.ip);
                         }
                     }
-                    switched
+                    if current { switched.map(Some) } else { Ok(None) }
                 }
-                _ if !routed => vm.route_here(),
-                _ => Ok(()),
-            });
+                _ if !routed => p.if_current(|| vm.route_here()),
+                _ => p.if_current(|| Ok(())),
+            };
             match ended {
                 Ok(Some(())) => {}
                 Ok(None) => {
