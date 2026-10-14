@@ -15,8 +15,9 @@ const SERVE_IDLE: Duration = Duration::from_secs(600);
 /// Serves page reads for `pager` on an accepted page-server connection (already answered `ok`), until the client hangs
 /// up, sits idle for `SERVE_IDLE`, asks for more than `MAX_FETCH`, or `stop()` says to drop it. `stop` is asked before
 /// every request and every second meanwhile, so a connection ends soon after its VM stops being a migration source.
-/// `conn` is the socket under `stream`, for its timeouts.
-pub fn serve_pages(pager: &Pager, conn: &TcpStream, mut stream: impl Read + Write, stop: impl Fn() -> bool) -> io::Result<()> {
+/// `pace()` is called before each reply (a test fault slows the server with it). `conn` is the socket under `stream`, for
+/// its timeouts.
+pub fn serve_pages(pager: &Pager, conn: &TcpStream, mut stream: impl Read + Write, stop: impl Fn() -> bool, pace: impl Fn()) -> io::Result<()> {
     conn.set_read_timeout(Some(Duration::from_secs(1)))?;
     conn.set_write_timeout(Some(SERVE_WRITE))?;
     let mut req = [0u8; 12];
@@ -29,6 +30,7 @@ pub fn serve_pages(pager: &Pager, conn: &TcpStream, mut stream: impl Read + Writ
             return stream.write_all(&[1]);
         }
         // The status byte, then the pages: sent with one write.
+        pace();
         buf.resize(1 + len, 0);
         buf[0] = 0;
         match pager.read_guest(offset, &mut buf[1..]) {

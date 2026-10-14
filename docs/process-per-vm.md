@@ -556,7 +556,8 @@ where it is kept and what tests it.
    place (`Proc::settle_arrival`), under `op`, so it never races the VM's
    end. Every operation that changes who owns the VM (suspend, migrating
    on, `checkpoint --stop`) settles first, waiting a bounded time, and is
-   refused as "still arriving" otherwise; later operations see a settled VM.
+   refused as "still arriving" otherwise (or as failed, once the arrival's
+   pager has given up on its source); later operations see a settled VM.
    A migration's rollback removes only a loan that migration made. A
    released record whose source never says `done` (killed) is retired once
    the source's listener says no VM process of that name is a migration

@@ -109,6 +109,8 @@ pub struct Proc {
     /// A lock, not a flag: the command ending the VM and a suspend starting
     /// exclude each other (the command holds it through its `destroy`).
     pub suspending: Mutex<bool>,
+    /// While an operation waits in `settle_arrival` for the arrival's last pages (`debug status` shows it).
+    settling: AtomicBool,
     early: Mutex<Vec<i32>>,
     /// Only then does SIGCONT resume (the kernel sends one after any SIGSTOP,
     /// systemd after SIGTERM).
@@ -211,6 +213,7 @@ impl Proc {
             cmd: Mutex::new(None),
             cmd_session: OnceLock::new(),
             suspending: Mutex::new(false),
+            settling: AtomicBool::new(false),
             early: Mutex::new(Vec::new()),
             paused_by_request: AtomicBool::new(false),
             consumed: Mutex::new(None),
@@ -364,12 +367,17 @@ impl Proc {
         let vm = self.vm();
         // In slices: a kill on its way (`destroy`) is not held up by the wait.
         let deadline = Instant::now() + wait;
+        self.settling.store(true, Ordering::SeqCst);
         while !self.pulled_all() && vm.cancel_checkpoint.load(Ordering::SeqCst) == 0 && vm.pager.failed().is_none() && !vm.dead() && vm.firecracker_alive() {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 break;
             }
             vm.pager.wait_pulled(Some(left.min(Duration::from_millis(100))));
+        }
+        self.settling.store(false, Ordering::SeqCst);
+        if let Some(why) = vm.pager.failed() {
+            bail!("vm {}'s arrival failed: {why}", vm.name);
         }
         if !self.pulled_all() {
             bail!("vm {} is still arriving: not all its memory is here yet", vm.name);
@@ -811,8 +819,16 @@ impl Proc {
             return crate::listen::refuse_pages(s, "injected fault: page server down");
         }
         let _ = s.set_nodelay(true);
-        let served = send_json(&mut &s, &json!({"ok": true}))
-            .and_then(|()| crate::uffd::serve_pages(&vm.pager, &s, &s, || fault("pages") || Some(vm.state()) != source));
+        let served = send_json(&mut &s, &json!({"ok": true})).and_then(|()| {
+            // A slow source, not a lost one: every reply comes, a second late (well within the target's
+            // per-request deadline), so an arrival from here stays unfinished for as long as a test needs.
+            let pace = || {
+                if fault("pages_slow") {
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+            };
+            crate::uffd::serve_pages(&vm.pager, &s, &s, || fault("pages") || Some(vm.state()) != source, pace)
+        });
         if let Err(e) = served {
             eprintln!("vm {}: page server: {e}", vm.name);
         }
@@ -883,6 +899,7 @@ impl Proc {
                 "collapse": vm.pager.collapse_report(),
                 "host_regions": vm.pager.host_regions(),
                 "remote_left": vm.pager.remote_left(),
+                "settling": self.settling.load(Ordering::SeqCst),
                 "failed": vm.pager.failed(),
                 "checkpoint_copy_stats": vm.pager.copy_stats(),
                 "faults": vm.pager.fault_stats.report(),
