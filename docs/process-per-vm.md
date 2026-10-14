@@ -193,7 +193,10 @@ answer, held packets). What changed is who is at each end:
 
 `flexvm listen [ADDR]` is an optional helper, needed only to receive
 migrations (and page requests for VMs migrating away). It is stateless and
-socket-activatable (`LISTEN_FDS`, or binds `host.json`'s `listen`). Each
+socket-activatable (`LISTEN_FDS`, taking its address from the socket when
+no ADDR is given, or binds `host.json`'s `listen`); host.json is written only
+once the socket is bound and valid. Proxy ARP on `--announce-dev` is enabled
+by every VM process too, so it needs no listener. Each
 connection's first line (read unbuffered, so nothing after it is consumed) is
 one of:
 
@@ -219,7 +222,11 @@ that restores the template, lets the guest reseed and settle, pauses, and
 listens on `RUN/standby/KEY/PID.sock`. `flexvm run` claims one (`claim
 {name, ip, cmd}` with its stdout/stderr passed over SCM_RIGHTS): the standby
 takes the name and address, routes, resumes, sends `START`, and becomes that
-VM. A claimed standby starts its replacement. A foreground `run` that claimed
+VM. A claimed standby starts its replacement, and every 5 s the listener and
+each running VM process refill any pool below its target (skipped while
+another refill holds the lock, for a minute after memory pressure stopped
+standby VMs, and for a minute after a template's refill failed), so a pool
+comes back after a reboot, a template rebuild or a standby's death. A foreground `run` that claimed
 one forwards its signals to it and exits with the status the VM process sends
 back on the claim connection. Under memory pressure standby VMs are SIGINTed
 first. The count is explicit, and refills stop under the reserve; one refill
@@ -239,7 +246,10 @@ else the biggest RSS, and sends it `migrate` with each peer in turn until one
 accepts (`migrate_in` refuses when the target would go under its reserve).
 The request is `if_idle`: a VM busy with another operation (a checkpoint's
 copy, a migration, an arrival not yet settled) refuses at once and the next
-VM is tried; eviction never waits for or races an operation.
+VM is tried; eviction never waits for or races an operation. A refused
+VM and peer pair is not tried again for 5 s, doubling to 60 s while refusals
+continue (`RUN/evict.backoff`). A refused arrival's log is removed; an
+accepted one becomes `NAME.log`.
 This replaces the `info` op the daemon used to find room.
 
 ## API
