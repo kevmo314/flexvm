@@ -496,10 +496,17 @@ def checkpoint_restore():
     print(f"  checkpoint --stop: {r.get('checkpoint_ms')} ms, {r.get('data_mib')} MiB")
     check("checkpoint: manifest written", os.path.exists(os.path.join(path, "manifest.json")))
     check("checkpoint --stop: VM gone from A", vm not in A.ls(), A.ls())
-    # Its address is A's to give: B restores it only under another one.
-    check("restore on B with A's address: refused", B.cli("restore", path, "-d", check=False).returncode != 0)
-    r = A.restore(path)
+    # Its address is A's to give: B borrows it from A, and gives it back when the VM goes.
+    r = B.restore(path)
     print(f"  restore: ready in {r.get('ready_ms')} ms")
+    check("restore on B: borrows A's address", r.get("ip") == ip and B.ls().get(vm, {}).get("ip") == ip, r)
+    B.kill(vm)
+    def restore_home():
+        try:
+            return A.restore(path)
+        except AssertionError:
+            return None
+    check("restore on A once B let it go", wait_for(restore_home, 10))
     check("restore: same name and address", A.ls().get(vm, {}).get("ip") == ip, A.ls())
     check("restore: RAM intact", md5(A, vm) == m)
     check("restore: same process", marker_id(A, vm) == proc)
