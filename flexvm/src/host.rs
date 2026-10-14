@@ -152,14 +152,7 @@ fn lock_holder(path: &Path) -> Result<Option<Ident>> {
 
 pub fn store<T: Serialize>(path: &Path, v: &T, durable: bool) -> Result<()> {
     let (dir, name) = (path.parent().ok_or("no directory")?, path.file_name().ok_or("no name")?);
-    crate::util::write_file(dir, &*name.to_string_lossy(), &serde_json::to_vec(v)?, durable).map_err(|e| format!("{}: {e}", path.display()).into())
-}
-
-fn remove(path: &Path) -> Result<()> {
-    match std::fs::remove_file(path) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => bail!("{}: {e}", path.display()),
-        _ => Ok(crate::util::sync_dir(path.parent().ok_or("no directory")?)?),
-    }
+    crate::util::write_file(dir, &name.to_string_lossy(), &serde_json::to_vec(v)?, durable).map_err(|e| format!("{}: {e}", path.display()).into())
 }
 
 #[derive(Clone)]
@@ -860,14 +853,14 @@ impl Host {
                 return Ok("aborted");
             }
         }
-        remove(&path)?;
+        crate::util::unlink_durably(&path)?;
         Ok("aborted")
     }
 
     pub fn mig_done(&self, id: u64) -> Result<()> {
         let _l = self.lock()?;
         match load(&self.mig_path(id))? {
-            Some(Mig::Released { .. }) => remove(&self.mig_path(id)),
+            Some(Mig::Released { .. }) => Ok(crate::util::unlink_durably(&self.mig_path(id))?),
             _ => Ok(()),
         }
     }
@@ -1025,7 +1018,7 @@ impl Drop for MigRecord {
         if let (false, Ok(_l)) = (self.committed, self.host.lock()) {
             let path = self.host.mig_path(self.id);
             if matches!(load(&path), Ok(Some(Mig::Pending { owner, .. })) if owner == Ident::me()) {
-                let _ = remove(&path);
+                let _ = crate::util::unlink_durably(&path);
             }
         }
     }

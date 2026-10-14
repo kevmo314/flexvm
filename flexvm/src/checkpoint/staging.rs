@@ -190,7 +190,7 @@ impl Staging {
         // Owned by the directory's owner (we run as root), who may move and delete it.
         let owner = fstat(self.parent.as_raw_fd())?;
         publish_permissions(&[pages.file.as_raw_fd(), pagemap.as_raw_fd(), vmstate_file.as_raw_fd(), mf.as_raw_fd()], self.ck.as_raw_fd(), &owner)?;
-        crate::util::sync_dir_fd(self.ck.as_raw_fd())?;
+        check(unsafe { libc::fsync(self.ck.as_raw_fd()) })?;
         still_valid()?;
         // The pinned directory must still be the one `dest` names.
         use std::os::unix::fs::MetadataExt;
@@ -202,12 +202,12 @@ impl Staging {
         }
         t.mark("fsync");
         let (outer, parent) = (self.outer.as_raw_fd(), self.parent.as_raw_fd());
-        crate::util::rename_noreplace_at(outer, c"ck", parent, &self.base)
+        check(unsafe { libc::renameat2(outer, c"ck".as_ptr(), parent, self.base.as_ptr(), libc::RENAME_NOREPLACE) })
             .map_err(|e| format!("publish checkpoint at {}: {e}", self.dest.display()))?;
         self.published = true;
         let synced = match crate::host::fault("publish_fsync") {
             true => Err(io::Error::other("injected fault: fsync failed")),
-            false => crate::util::sync_dir_fd(parent),
+            false => check(unsafe { libc::fsync(parent) }),
         };
         if let Err(e) = synced {
             // A crash could bring it back after the VM ran on: revoke it, durably.
@@ -232,7 +232,7 @@ impl Staging {
     fn revoke(&self) -> io::Result<io::Result<()>> {
         let ck = self.ck.as_raw_fd();
         check(unsafe { libc::unlinkat(ck, c"manifest.json".as_ptr(), 0) })?;
-        crate::util::sync_dir_fd(ck)?;
+        check(unsafe { libc::fsync(ck) })?;
         let parent = self.parent.as_raw_fd();
         let removed = (|| {
             if crate::host::fault("revoke_cleanup") {
@@ -240,7 +240,7 @@ impl Staging {
             }
             empty_dir(ck)?;
             check(unsafe { libc::unlinkat(parent, self.base.as_ptr(), libc::AT_REMOVEDIR) })?;
-            crate::util::sync_dir_fd(parent)
+            check(unsafe { libc::fsync(parent) })
         })();
         Ok(removed)
     }

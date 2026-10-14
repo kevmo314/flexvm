@@ -293,16 +293,35 @@ fn publish_rootfs(tmp: &Path, cached: &Path, conf: &str, sync: impl Fn(&Path) ->
 
 /// Writes `path` durably via a temporary, never replacing it; false if another publisher won.
 pub(super) fn publish(path: &Path, write: impl FnOnce(&mut File) -> Result<()>) -> Result<bool> {
-    crate::util::install_durably(path, write, true)
+    install(path, write, rename_noreplace)
 }
 
 /// As `publish`, but replacing `path`: for content-addressed files that `write` verifies.
 pub(super) fn replace(path: &Path, write: impl FnOnce(&mut File) -> Result<()>) -> Result<()> {
-    crate::util::install_durably(path, write, false).map(drop)
+    install(path, write, |tmp, path| std::fs::rename(tmp, path))
+}
+
+fn install<T>(path: &Path, write: impl FnOnce(&mut File) -> Result<()>, rename: impl FnOnce(&Path, &Path) -> std::io::Result<T>) -> Result<T> {
+    let tmp = path.with_extension(format!("part{}", std::process::id()));
+    let res = (|| {
+        let mut f = create_new(&tmp)?;
+        write(&mut f)?;
+        f.sync_all()?;
+        Ok(rename(&tmp, path)?)
+    })();
+    let _ = std::fs::remove_file(&tmp);
+    res
 }
 
 fn bytes(data: &[u8]) -> impl FnOnce(&mut File) -> Result<()> + '_ {
     move |f| Ok(f.write_all(data)?)
+}
+
+/// Creates a new file, replacing a stale one but never writing through a symlink.
+fn create_new(path: &Path) -> Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let _ = std::fs::remove_file(path);
+    Ok(std::fs::OpenOptions::new().write(true).create_new(true).custom_flags(libc::O_NOFOLLOW).open(path)?)
 }
 
 pub const STAGING: &str = "/var/lib/flexvm/staging";
@@ -466,7 +485,7 @@ fn mkfs(dir: &Path, entries: u64, dest: &Path) -> Result<()> {
     let mib = (kib * 12 / 10 / 1024 + 64).div_ceil(2) * 2;
     let inodes = entries * 12 / 10 + 4096;
     // mkfs writes through our descriptor, so the name cannot be swapped for a symlink.
-    let image = crate::util::create_new(dest)?;
+    let image = create_new(dest)?;
     image.set_len(mib << 20)?;
     let out = Command::new("mkfs.ext4")
         .args(["-q", "-F", "-b", "4096", "-L", "flexroot", "-N", &inodes.to_string(), "-d"])

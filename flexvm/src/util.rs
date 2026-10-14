@@ -251,83 +251,38 @@ pub fn host_cpus() -> usize {
     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
 }
 
-/// Fsync a pinned directory without resolving its path again.
-pub fn sync_dir_fd(fd: RawFd) -> io::Result<()> {
-    eintr(|| unsafe { libc::fsync(fd) }).map(drop)
+pub fn sync_dir(dir: &Path) -> io::Result<()> {
+    std::fs::File::open(dir).and_then(|d| d.sync_all()).map_err(|e| io::Error::new(e.kind(), format!("fsync of directory {}: {e}", dir.display())))
 }
 
-pub fn sync_dir(path: &Path) -> io::Result<()> {
-    std::fs::File::open(path).and_then(|f| sync_dir_fd(f.as_raw_fd()))
-        .map_err(|e| io::Error::new(e.kind(), format!("fsync of directory {}: {e}", path.display())))
+/// Removes `path` if it is there, then fsyncs its directory.
+pub fn unlink_durably(path: &Path) -> io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(io::Error::new(e.kind(), format!("{}: {e}", path.display()))),
+        _ => sync_dir(path.parent().unwrap_or(Path::new("."))),
+    }
 }
 
-/// Atomic no-clobber rename, including between pinned directories. EEXIST is an error.
-pub fn rename_noreplace_at(src_dir: RawFd, src: &std::ffi::CStr, dst_dir: RawFd, dst: &std::ffi::CStr) -> io::Result<()> {
-    eintr(|| unsafe { libc::renameat2(src_dir, src.as_ptr(), dst_dir, dst.as_ptr(), libc::RENAME_NOREPLACE) }).map(drop)
-}
-
+/// False if `path` exists.
 pub fn rename_noreplace(tmp: &Path, path: &Path) -> io::Result<bool> {
     use std::os::unix::ffi::OsStrExt;
-    let (src, dst) = (std::ffi::CString::new(tmp.as_os_str().as_bytes())?, std::ffi::CString::new(path.as_os_str().as_bytes())?);
-    match rename_noreplace_at(libc::AT_FDCWD, &src, libc::AT_FDCWD, &dst) {
-        Ok(()) => Ok(true),
+    let (src, dest) = (std::ffi::CString::new(tmp.as_os_str().as_bytes())?, std::ffi::CString::new(path.as_os_str().as_bytes())?);
+    match eintr(|| unsafe { libc::renameat2(libc::AT_FDCWD, src.as_ptr(), libc::AT_FDCWD, dest.as_ptr(), libc::RENAME_NOREPLACE) }) {
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
-        Err(e) => Err(e),
+        res => res.map(|_| true),
     }
 }
 
-/// Publishes an already synced file, directory or symlink, then syncs both parents.
-/// False means a no-clobber publisher lost; a sync error may follow a successful rename.
-pub fn publish(tmp: &Path, path: &Path, no_clobber: bool) -> io::Result<bool> {
-    let won = if no_clobber { rename_noreplace(tmp, path)? } else { std::fs::rename(tmp, path)?; true };
-    let parent = |p: &std::path::Path| p.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")).to_path_buf();
-    let (src, dst) = (parent(tmp), parent(path));
-    sync_dir(&dst)?;
-    if won && src != dst {
-        sync_dir(&src)?;
-    }
-    Ok(won)
-}
-
-pub fn write_durably(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
-    let name = path.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no file name"))?;
-    write_file(dir, name, bytes, true)
-}
-
-pub fn write_file(dir: &Path, name: impl AsRef<std::ffi::OsStr>, data: &[u8], durable: bool) -> std::io::Result<()> {
-    let mut temp_name = std::ffi::OsString::from(".");
-    temp_name.push(name.as_ref());
-    temp_name.push(format!(".{}.tmp", std::process::id()));
-    let tmp = dir.join(temp_name);
+/// Durably: the file is fsynced before the rename, its directory after.
+pub fn write_file(dir: &Path, name: &str, data: &[u8], durable: bool) -> io::Result<()> {
+    let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
     let mut f = std::fs::File::create(&tmp)?;
     f.write_all(data)?;
     if durable {
         f.sync_all()?;
-        publish(&tmp, &dir.join(name.as_ref()), false)?;
-    } else {
-        std::fs::rename(&tmp, dir.join(name.as_ref()))?;
     }
-    Ok(())
-}
-
-pub fn install_durably(path: &Path, write: impl FnOnce(&mut std::fs::File) -> Result<()>, no_clobber: bool) -> Result<bool> {
-    let tmp = path.with_extension(format!("part{}", std::process::id()));
-    let res = (|| {
-        let mut f = create_new(&tmp)?;
-        write(&mut f)?;
-        f.sync_all()?;
-        Ok(publish(&tmp, path, no_clobber)?)
-    })();
-    let _ = std::fs::remove_file(&tmp);
-    res
-}
-
-/// Creates a new file, replacing a stale one but never writing through a symlink.
-pub fn create_new(path: &Path) -> Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let _ = std::fs::remove_file(path);
-    Ok(std::fs::OpenOptions::new().write(true).create_new(true).custom_flags(libc::O_NOFOLLOW).open(path)?)
+    std::fs::rename(&tmp, dir.join(name))?;
+    if durable { sync_dir(dir) } else { Ok(()) }
 }
 
 /// Fsyncs every parent each time: a crash may have lost an entry made before, or another
@@ -570,91 +525,6 @@ fn scope(prefix: &[u8], pid: u32, start: u64) -> bool {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
-
-    fn durable_test_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("flexvm-durable-{name}-{}", std::process::id()));
-        std::fs::create_dir(&dir).unwrap();
-        dir
-    }
-
-    #[test]
-    fn durable_writes_replace_inodes_and_keep_temp_permissions() {
-        use std::os::unix::fs::MetadataExt;
-        let dir = durable_test_dir("write");
-        let path = dir.join("state");
-        write_durably(&path, b"old").unwrap();
-        let old = std::fs::File::open(&path).unwrap();
-        let tmp = dir.join(format!(".state.{}.tmp", std::process::id()));
-        std::fs::write(&tmp, b"stale").unwrap();
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o640)).unwrap();
-        let before = std::fs::metadata(&tmp).unwrap();
-        write_durably(&path, b"new").unwrap();
-        let after = std::fs::metadata(&path).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"new");
-        assert_ne!(old.metadata().unwrap().ino(), after.ino());
-        assert_eq!((after.mode(), after.uid(), after.gid()), (before.mode(), before.uid(), before.gid()));
-        assert!(!tmp.exists());
-        assert!(write_durably(&dir.join("missing/state"), b"").is_err());
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn publication_preserves_metadata_and_never_clobbers() {
-        use std::os::unix::fs::MetadataExt;
-        let dir = durable_test_dir("publish");
-        let tmp = dir.join("tmp");
-        let path = dir.join("final");
-        std::fs::write(&tmp, b"first").unwrap();
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let file = std::fs::File::open(&tmp).unwrap();
-        assert_eq!(unsafe { libc::fchown(file.as_raw_fd(), libc::geteuid(), libc::getegid()) }, 0);
-        file.sync_all().unwrap();
-        let before = file.metadata().unwrap();
-        assert!(publish(&tmp, &path, true).unwrap());
-        let after = std::fs::metadata(&path).unwrap();
-        assert_eq!((after.ino(), after.mode(), after.uid(), after.gid()), (before.ino(), before.mode(), before.uid(), before.gid()));
-        std::fs::write(&tmp, b"second").unwrap();
-        assert!(!publish(&tmp, &path, true).unwrap());
-        assert_eq!(std::fs::read(&path).unwrap(), b"first");
-        assert!(tmp.exists());
-        assert!(publish(&tmp, &path, false).unwrap());
-        assert_eq!(std::fs::read(&path).unwrap(), b"second");
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn pinned_directory_helpers_survive_a_move_and_report_errors() {
-        let dir = durable_test_dir("pinned");
-        let fd = std::fs::File::open(&dir).unwrap();
-        std::fs::write(dir.join("src"), b"pinned").unwrap();
-        let moved = dir.with_extension("moved");
-        std::fs::rename(&dir, &moved).unwrap();
-        rename_noreplace_at(fd.as_raw_fd(), c"src", fd.as_raw_fd(), c"dst").unwrap();
-        sync_dir_fd(fd.as_raw_fd()).unwrap();
-        assert_eq!(std::fs::read(moved.join("dst")).unwrap(), b"pinned");
-        let err = sync_dir(&dir).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::NotFound);
-        assert!(err.to_string().contains(&dir.display().to_string()));
-        assert!(sync_dir_fd(-1).is_err());
-        std::fs::remove_dir_all(moved).unwrap();
-    }
-
-    #[test]
-    fn durable_install_cleans_up_after_writer_errors_and_collisions() {
-        let dir = durable_test_dir("install");
-        let path = dir.join("blob");
-        let tmp = path.with_extension(format!("part{}", std::process::id()));
-        let writer = |f: &mut std::fs::File| -> Result<()> { f.write_all(b"partial")?; Err("writer failed".into()) };
-        assert!(install_durably(&path, writer, true).unwrap_err().to_string().contains("writer failed"));
-        assert!(!path.exists() && !tmp.exists());
-        assert!(install_durably(&path, |f| Ok(f.write_all(b"winner")?), true).unwrap());
-        assert!(!install_durably(&path, |f| Ok(f.write_all(b"loser")?), true).unwrap());
-        assert_eq!(std::fs::read(&path).unwrap(), b"winner");
-        assert!(!tmp.exists());
-        assert!(install_durably(&path, |f| Ok(f.write_all(b"replace")?), false).unwrap());
-        assert_eq!(std::fs::read(&path).unwrap(), b"replace");
-        std::fs::remove_dir_all(dir).unwrap();
-    }
 
     #[test]
     fn a_scope_is_named_and_joined_without_allocating() {

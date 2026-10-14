@@ -179,7 +179,7 @@ pub fn save_load_set(host: &Host, tpl: &Template) {
     let set = tpl.load_set();
     if !set.is_empty() {
         if let Ok(b) = serde_json::to_vec(&set) {
-            let _ = crate::util::write_file(&host.run.join("standby"), format!(".loadset-{}", tpl.meta.id), &b, false);
+            let _ = crate::util::write_file(&host.run.join("standby"), &format!(".loadset-{}", tpl.meta.id), &b, false);
         }
     }
 }
