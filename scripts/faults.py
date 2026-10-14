@@ -3097,6 +3097,32 @@ class marks:
         self.write(self.saved)
 
 
+class pressure(marks):
+    """`host`'s eviction high-water mark kept `over` MiB above MiB available, re-set as that moves (other lanes'
+    VMs coming and going on the same machine), so the host stays under pressure however much is freed meanwhile."""
+    def __init__(self, reserve, over, host=None):
+        super().__init__(reserve, mem_available() + over, host)
+        self.over, self.done = over, threading.Event()
+
+    def follow(self):
+        while not self.done.wait(0.25):
+            want = mem_available() + self.over
+            if abs(want - self.evict_at) > 64:
+                self.evict_at = want
+                self.set()
+
+    def __enter__(self):
+        super().__enter__()
+        self.thread = threading.Thread(target=self.follow, daemon=True)
+        self.thread.start()
+        return self
+
+    def __exit__(self, *a):
+        self.done.set()
+        self.thread.join()
+        super().__exit__(*a)
+
+
 def hosts_over(name, secs):
     """Where `name` runs (by the registries), each time that changes, over `secs` s."""
     def here():
@@ -3203,7 +3229,7 @@ def evict_skips_cmd():
                          stdout=subprocess.DEVNULL, stderr=open(os.path.join(A.run, f"{n}.stderr"), "w"), env=ENV, start_new_session=True)
     check("evict cmd: up", wait_for(lambda: vms(A).get(n, {}).get("state") == "running", 30), vms(A).get(n))
     m = setup(other, mib=1)
-    with marks(512, mem_available() + 1000, A):
+    with pressure(512, 1000, A):
         moved = wait_for(lambda: where(other) == {B: "running"}, 60)
         time.sleep(8)
     check("evict cmd: the plain vm moved", moved, (where(other), log(A, other)[-800:]))
@@ -4522,19 +4548,26 @@ def log_cap():
     tail = [int(x) for x in nums]
     check("log cap: whole lines, in order, through the last", tail and tail[-1] == lines and tail == list(range(tail[0], lines + 1)),
           (tail[:1], tail[-1:], len(tail)))
-    # A migrated VM's log (its arrival's, published) is capped too: the lock the
-    # arrival held on it is gone. Past the cap, what it prints ending rotates it.
+    # A migrated VM's log (its arrival's, published) is capped too: the lock the arrival held on it is gone. Past the
+    # cap, the next write rotates it: here, what it logs as it migrates back (its end on SIGINT prints nothing). That migration is served only once its arrival is done and the log published, however long the
+    # arrival's tail (held packets, route) takes, so the pad never lands before publication matters.
     m = "ft-logcap-moved"
+    for f in (f"{m}.log", f"{m}.log.1"):
+        if os.path.exists(os.path.join(B.run, "vms", f)):
+            os.unlink(os.path.join(B.run, "vms", f))
     ok(run(A, m))
     ok(migrate(A, m, B))
     moved = os.path.join(B.run, "vms", f"{m}.log")
+    pid = vm_pid(B, m)
     with open(moved, "a") as f:
         f.write("pad\n" * (2 << 20))
-    pid = vm_pid(B, m)
-    os.kill(pid, signal.SIGINT)
-    check("log cap: the migrated vm ended", wait_for(lambda: not alive(pid), 30), pid)
+    wait_released(B, m)
+    ok(migrate(B, m, A))
+    check("log cap: the migrated vm moved on", wait_for(lambda: not alive(pid), 60), pid)
     check("log cap: a migrated vm's log rotates", size(moved + ".1") is not None and size(moved + ".1") > 8 << 20 and (size(moved) or 0) < 65536,
           (size(moved), size(moved + ".1")))
+    after = (open(moved + ".1", "rb").read()[-4096:] if size(moved + ".1") else b"") + (open(moved, "rb").read() if size(moved) else b"")
+    check("log cap: its move logged after the padding", b"moved to" in after.split(b"pad\n")[-1], after[-300:])
 
 
 def gc_debris():
