@@ -4326,6 +4326,39 @@ def claim_killed():
     cli(A, "standby", "--template", args.template, "0")
 
 
+def standby_stop_claim():
+    """A standby VM stopped (`standby 0`) while a claim of it is under way:
+    the VM the claim made runs on, and SIGTERM suspends it. The stop reaches
+    the process after the claim started (it is listed until the claim is
+    done), and must not be taken for a kill of the claimed VM."""
+    t, n = args.template, "ft-sb-stop-claim"
+    scenario_vms.add(n)
+    ok(cli_json(A, "standby", "--template", t, "1"))
+    res = {}
+    try:
+        check("standby stop claim: a standby ready", wait_for(lambda: len(standby_pids(A, t)) == 1, 60))
+        # The claim stalls 3 s once the VM is set, before the standby lets go of its lock.
+        fault(A, "claim_stall", 10000)
+        th = threading.Thread(target=lambda: res.update(r=cli_json(A, "run", n, "--template", t, "-d", "--", "sleep 600")))
+        th.start()
+        time.sleep(1)
+        ok(cli_json(A, "standby", "--template", t, "0"))
+        th.join()
+    finally:
+        fault(A, "claim_stall", 0)
+        cli(A, "standby", "--template", t, "0")
+    r = res.get("r", {})
+    check("standby stop claim: claimed", r.get("ok") and r["result"].get("standby") is True, r)
+    time.sleep(0.5)
+    check("standby stop claim: still running after the stop", vms(A).get(n, {}).get("state") == "running", (vms(A).get(n), log(A, n)[-1500:]))
+    pid = vms(A).get(n, {}).get("pid")
+    if pid:
+        os.kill(pid, signal.SIGTERM)
+        check("standby stop claim: SIGTERM suspends it", wait_for(lambda: not alive(pid), 60) and vms(A).get(n, {}).get("state") == "suspended",
+              (vms(A).get(n), log(A, n)[-1500:]))
+    cleanup(n)
+
+
 def standby_stalled():
     """A claimer that connects and stops before sending its request keeps no
     standby VM from stopping; a stopped standby VM keeps no `run` waiting
@@ -4691,10 +4724,13 @@ def cmd_flag():
         check("cmd flag: its command's end still ends it", p.wait(timeout=30) == 130)
     finally:
         ok(cli_json(A, "standby", "--template", t, "0"))
-    ok(cli_json(A, "run", r, "--template", t, "-d", "--", "sleep 600"))
+    clear_log(A, r)
+    started = ok(cli_json(A, "run", r, "--template", t, "-d", "--", "sleep 600"))
     pid = vm_pid(A, r)
     os.kill(pid, signal.SIGTERM)
-    check("cmd flag: suspended", wait_for(lambda: not alive(pid), 60) and vms(A).get(r, {}).get("state") == "suspended", vms(A).get(r))
+    standby_log = os.path.join(A.run, "standby", t, "standby.log")
+    check("cmd flag: suspended", wait_for(lambda: not alive(pid), 60) and vms(A).get(r, {}).get("state") == "suspended",
+          (vms(A).get(r), started, log(A, r)[-1500:], open(standby_log).read()[-1500:] if os.path.exists(standby_log) else ""))
     p = subprocess.Popen([BIN, "--state", A.state, "--run", A.run, "resume", r], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          env=ENV, start_new_session=True)
     e = first_entry(A, r)
@@ -5292,7 +5328,7 @@ SCENARIOS = dict(
     pull_died=pull_died,
     uffd_err=uffd_err,
     mem_high=no_evict(skippable(mem_high)), mem_high_migrate=no_evict(skippable(mem_high_migrate)),
-    mem_high_evict=skippable(mem_high_evict), evict_grower=skippable(evict_grower), evict_no_pingpong=evict_no_pingpong, evict_skips_cmd=evict_skips_cmd, cmd_flag=cmd_flag, evict_latency=skippable(evict_latency),
+    mem_high_evict=skippable(mem_high_evict), evict_grower=skippable(evict_grower), evict_no_pingpong=evict_no_pingpong, evict_skips_cmd=evict_skips_cmd, cmd_flag=cmd_flag, standby_stop_claim=standby_stop_claim, evict_latency=skippable(evict_latency),
     start_admission=start_admission, standby_admission=standby_admission,
     refused_admission=refused_admission, meminfo_unreadable=meminfo_unreadable,
     cow_grow=no_evict(cow_grow), plug_race=no_evict(plug_race), shrink_stall=no_evict(shrink_stall), plug_storm=no_evict(plug_storm),
