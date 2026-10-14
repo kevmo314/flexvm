@@ -417,10 +417,6 @@ impl Host {
         File::open(self.vms(name, "lock")).is_ok_and(|f| flock(&f, libc::LOCK_SH | libc::LOCK_NB).is_err())
     }
 
-    fn holder_of(&self, name: &str) -> Option<Ident> {
-        load(&self.vms(name, "lock")).ok().flatten()
-    }
-
     /// Whether `name`'s lock is held: None when that cannot be told (the
     /// file cannot be opened, or the probe fails other than by contention).
     pub fn name_locked(&self, name: &str) -> Option<bool> {
@@ -464,7 +460,7 @@ impl Host {
     /// Only believed if written by the process holding the name now.
     pub fn entry(&self, name: &str) -> Result<Entry> {
         match load::<Entry>(&self.vms(name, "json")) {
-            Ok(Some(e)) if self.alive(name) && self.holder_of(name) == Some(e.ident.clone()) => Ok(e),
+            Ok(Some(e)) if self.alive(name) && lock_holder(&self.vms(name, "lock")).ok().flatten() == Some(e.ident.clone()) => Ok(e),
             _ => bail!("no vm named {name:?}"),
         }
     }
@@ -630,14 +626,8 @@ impl Host {
         Ok(l)
     }
 
-    /// Lets go of `holder`'s claim, whichever instance made it (a suspended
-    /// VM's: the process that suspended it is gone).
-    pub fn release(&self, l: &Locked, ip: Ipv4Addr, holder: &str) -> Result<()> {
-        self.release_by(l, ip, holder, None)
-    }
-
-    /// With `id`, only that instance's claim: never a later one's of the same name.
-    fn release_by(&self, l: &Locked, ip: Ipv4Addr, holder: &str, id: Option<&Ident>) -> Result<()> {
+    /// Lets go of `holder`'s claim; with `id`, only that instance's.
+    pub fn release(&self, l: &Locked, ip: Ipv4Addr, holder: &str, id: Option<&Ident>) -> Result<()> {
         self.update(l, ip, false, |a| {
             let by = |h: &Ident| id.is_none_or(|id| id == h);
             if a.holder.as_deref() == Some(holder) && a.holder_id.as_ref().is_none_or(by) {
@@ -680,13 +670,8 @@ impl Host {
         Ok(self.held(&a) && (a.held >= gen || source()))
     }
 
-    pub fn reinstall(&self, l: &Locked, ip: Ipv4Addr) -> Result<bool> {
-        self.reinstall_after(l, ip, None)
-    }
-
-    /// `reinstall`, counting a holder that is `dead` (a dead process whose name
-    /// may stay locked a moment longer, by its other threads) as gone.
-    fn reinstall_after(&self, l: &Locked, ip: Ipv4Addr, dead: Option<&Ident>) -> Result<bool> {
+    /// Counts `dead` as gone even while its other threads still hold the name lock.
+    pub fn reinstall(&self, l: &Locked, ip: Ipv4Addr, dead: Option<&Ident>) -> Result<bool> {
         let a = self.addr(l, ip)?;
         let dying = dead.is_some() && a.holder_id.as_ref() == dead;
         let Some(via) = a.via.filter(|_| !a.withdrawn && (dying || !self.held(&a))) else { return Ok(false) };
@@ -762,38 +747,19 @@ impl Host {
         }
     }
 
-    /// Ok(false): refused for the reserve.
-    pub fn admit(&self, mib: u64) -> Result<bool> {
-        Ok(self.grant(mib)?.is_some())
-    }
-
-    /// `grant` against the current reserve: None if refused. An error (the
-    /// host lock, MemAvailable unreadable) is no refusal: nothing is granted.
-    pub fn grant(&self, mib: u64) -> Result<Option<u64>> {
-        self.grant_by(mib, None)
-    }
-
-    /// `grant`, giving up (an error) if the host lock is not had by `deadline`.
-    pub fn grant_by(&self, mib: u64, deadline: Option<std::time::Instant>) -> Result<Option<u64>> {
+    /// Against the reserve: None if refused; errors grant nothing.
+    pub fn grant(&self, mib: u64, deadline: Option<std::time::Instant>) -> Result<Option<u64>> {
         Ok(self.grant_inner(mib, Floor::Reserve, false, deadline, crate::vmproc::host_available_mib)?.ok().map(|g| g.0))
     }
 
-    /// A refusal is an error too, saying why.
-    pub fn grant_above(&self, mib: u64, floor: Floor) -> Result<u64> {
-        Ok(self.grant_inner(mib, floor, false, None, crate::vmproc::host_available_mib)??.0)
-    }
-
-    /// A grant held past `GRANT_WINDOW`, until the `Hold` is dropped or its
-    /// process ends, made in the same critical section: an arrival's memory
-    /// comes in only as it pulls, however long that takes.
-    pub fn grant_held(&self, mib: u64, floor: Floor) -> Result<(u64, Hold)> {
-        let (id, hold) = self.grant_inner(mib, floor, true, None, crate::vmproc::host_available_mib)??;
-        Ok((id, hold.ok_or("no hold")?))
+    /// A refusal is an error too; `hold` keeps the grant past `GRANT_WINDOW`.
+    pub fn grant_start(&self, mib: u64, floor: Floor, hold: bool) -> Result<(u64, Option<Hold>)> {
+        self.grant_inner(mib, floor, hold, None, crate::vmproc::host_available_mib)?
     }
 
     /// MemAvailable lags a grant until the guest touches the memory, so all
     /// processes' grants of the last `GRANT_WINDOW` count as used, and held
-    /// ones (`grant_held`) however old, each once. Returns the grant's id.
+    /// ones (`grant_start`) however old, each once. Returns the grant's id.
     /// Leaves `floor` available, read with the reserve under the host lock.
     /// Ok(Err(why)) if refused. Test fault `no_admit`: refuses everything.
     fn grant_inner(
@@ -889,7 +855,7 @@ impl Host {
         // announced for its address (say, back to its source) comes back. Until
         // it does, the record stays (still aborted), so the next query retries.
         if let Some(ip) = ip {
-            if let Err(e) = self.reinstall_after(&l, ip, Some(&owner)) {
+            if let Err(e) = self.reinstall(&l, ip, Some(&owner)) {
                 eprintln!("migration {id} died before its commit; putting back the route for {ip}: {e}; retried on the next query");
                 return Ok("aborted");
             }
@@ -976,14 +942,14 @@ impl AddrClaim {
 
     pub fn release(mut self, l: &Locked) -> Result<()> {
         self.kept = true;
-        self.host.release_by(l, self.ip, &self.holder, Some(&self.id))
+        self.host.release(l, self.ip, &self.holder, Some(&self.id))
     }
 }
 
 impl Drop for AddrClaim {
     fn drop(&mut self) {
         if let (false, Ok(l)) = (self.kept, self.host.lock()) {
-            let _ = self.host.release_by(&l, self.ip, &self.holder, Some(&self.id));
+            let _ = self.host.release(&l, self.ip, &self.holder, Some(&self.id));
         }
     }
 }
@@ -1213,7 +1179,7 @@ impl PidFd {
     }
 
     pub fn wait(&self, timeout: Duration) -> bool {
-        crate::util::pidfd_wait(&self.0, timeout).unwrap_or(false)
+        crate::util::readable(&self.0, timeout).unwrap_or(false)
     }
 }
 
@@ -1250,10 +1216,7 @@ pub fn reap(run: &Path, owner: &Ident) -> Result<()> {
         if let Some(fd) = PidFd::open(&fc)? {
             // It exited and was waited for since it was opened (its parent died with SIGKILL
             // pending for it): nothing left to wait for.
-            match crate::util::pidfd_signal(&fd.0, libc::SIGKILL) {
-                Err(e) if e.raw_os_error() == Some(libc::ESRCH) => continue,
-                r => r.map_err(|e| format!("signal {}: {e}", libc::SIGKILL))?,
-            }
+            crate::util::pidfd_kill(&fd.0).map_err(|e| format!("signal {}: {e}", libc::SIGKILL))?;
             if !fd.wait(Duration::from_secs(5)) {
                 bail!("firecracker {} of dead process {} will not exit", fc.pid, owner.pid);
             }
@@ -1752,7 +1715,7 @@ mod tests {
         h.put_addr(x, &a, false).unwrap();
         c.release(&l).unwrap();
         assert_eq!(h.addr(&l, x).unwrap().holder.as_deref(), Some("web"));
-        h.release(&l, x, "web").unwrap();
+        h.release(&l, x, "web", None).unwrap();
         assert_eq!(h.addr(&l, x).unwrap().holder, None, "by name: a suspended VM's, whoever suspended it");
         // Suspended here, it holds the address of its own generation only.
         std::fs::create_dir_all(h.suspended("s")).unwrap();
@@ -2204,7 +2167,7 @@ mod tests {
             let _ = release.1.recv();
         });
         held.1.recv().unwrap();
-        assert!(h.grant_by(1, Some(std::time::Instant::now() + Duration::from_millis(50))).is_err());
+        assert!(h.grant(1, Some(std::time::Instant::now() + Duration::from_millis(50))).is_err());
         release.0.send(()).unwrap();
         t.join().unwrap();
         assert_eq!(grants().len(), 1);

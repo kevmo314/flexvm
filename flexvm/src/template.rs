@@ -18,7 +18,6 @@ use crate::fc::Firecracker;
 use crate::guest;
 use crate::image::ImageMeta;
 use crate::socket::SocketRoot;
-use crate::uffd::Pager;
 use crate::util::{ms, retry, Result, PAGE_SIZE};
 
 pub const BALLOON_STATS_S: u16 = 1;
@@ -451,8 +450,8 @@ fn record_working_set(paths: &Paths, name: &str, tap: &str, sockets: &Arc<Socket
     let _ = std::fs::remove_dir_all(&run);
     std::fs::create_dir_all(&run)?;
     let fc = Firecracker::spawn(&paths.firecracker, &run, sockets.allocate()?, crate::fc::SPAWN_READY)?;
-    let pager = Pager::start(&fc.sockets.uffd, tpl.clone(), None)?;
-    pager.set_pid(fc.pid())?;
+    let p = crate::vm::Prepared::new(fc, tpl.clone())?;
+    let fc = p.firecracker();
     // Like VM restores: stepping the clock touches pages of its own.
     fc.load_snapshot(&tpl.vmstate(), tap, Some(true), crate::fc::API_TIMEOUT)?;
     fc.resume()?;
@@ -467,10 +466,8 @@ fn record_working_set(paths: &Paths, name: &str, tap: &str, sockets: &Arc<Socket
         guest::ping(&fc.sockets.vsock)?;
     }
     fc.pause()?;
-    let runs = pad_runs(pager.present_runs(), crate::uffd::FAULT_AROUND as u64);
-    pager.stop();
-    pager.join();
-    drop(fc);
+    let runs = pad_runs(p.pager.present_runs(), crate::uffd::FAULT_AROUND as u64);
+    drop(p);
     let _ = std::fs::remove_dir_all(&run);
     std::fs::write(tpl.dir.join("wset"), serde_json::to_vec(&runs)?)?;
     Ok(runs.iter().map(|r| r.1 as usize).sum::<usize>() * PAGE_SIZE)

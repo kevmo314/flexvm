@@ -100,7 +100,7 @@ impl Pager {
     /// Whether Firecracker has exited (or was never named): what was just read by its pid may then be another
     /// process's.
     pub(super) fn exited(&self) -> bool {
-        self.pidfd.get().is_none_or(|fd| crate::util::pidfd_wait(fd, Duration::ZERO).unwrap_or(true))
+        self.pidfd.get().is_none_or(|fd| crate::util::readable(fd, Duration::ZERO).unwrap_or(true))
     }
 }
 

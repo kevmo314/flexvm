@@ -22,7 +22,7 @@ mod net;
 mod proto;
 mod session;
 
-use proto::{FRAME_MSG, FRAME_STDERR, FRAME_STDOUT, MAX_BODY};
+use proto::{write_frame, FRAME_MSG, FRAME_STDERR, FRAME_STDOUT, MAX_BODY};
 
 const BODY_TIMEOUT: Duration = Duration::from_secs(30);
 /// CHECK hex-encodes a command of up to MAX_BODY bytes on its request line.
@@ -331,11 +331,6 @@ fn read_body(r: &mut impl Read, fd: RawFd, len: usize, at: Instant) -> io::Resul
         }
     }
     Ok(body)
-}
-
-fn write_frame(mut w: impl Write, kind: u8, payload: &[u8]) -> io::Result<()> {
-    w.write_all(&[&[kind][..], &(payload.len() as u32).to_le_bytes()].concat())?;
-    w.write_all(payload)
 }
 
 fn msg(w: impl Write, m: impl AsRef<[u8]>) -> io::Result<()> {

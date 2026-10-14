@@ -220,7 +220,7 @@ const TCQ_PLUG_RELEASE_INDEFINITE: i32 = 2;
 const PLUG_LIMIT: u32 = 16 << 20;
 const TCA_STATS: u16 = 3;
 
-/// struct tcmsg (family, pads, ifindex, handle, parent, info) for `tap`'s root qdisc, handle 1:.
+/// struct tcmsg (family, pads, ifindex, handle, parent, info) for the root qdisc at `ifindex`, with `handle`.
 fn tcmsg(ifindex: u32, handle: u32) -> Vec<u8> {
     [&[libc::AF_UNSPEC as u8, 0, 0, 0][..], &ifindex.to_ne_bytes(), &handle.to_ne_bytes(), &TC_H_ROOT.to_ne_bytes(), &0u32.to_ne_bytes()].concat()
 }
@@ -275,23 +275,10 @@ fn remove_plug(ifindex: u32) -> Result<()> {
 pub fn unplug_tap(tap: &str) -> (u64, Result<()>) {
     let Ok(ifindex) = ifindex(tap) else { return (0, Err(format!("no tap {tap}").into())) };
     let stats = || qdisc_stats(ifindex).unwrap_or_default();
-    let mut released = Err("not tried".into());
-    for _ in 0..3 {
-        released = netlink(libc::RTM_NEWQDISC, 0, &plug_msg(ifindex, TCQ_PLUG_RELEASE_INDEFINITE));
-        if released.is_ok() {
-            return (stats().0, Ok(()));
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    let Err(e) = retry3(|| netlink(libc::RTM_NEWQDISC, 0, &plug_msg(ifindex, TCQ_PLUG_RELEASE_INDEFINITE))) else { return (stats().0, Ok(())) };
     let (drops, queued) = stats();
     let remove = move || remove_plug(ifindex);
-    let Err(e) = released else { unreachable!() };
-    if (0..3).any(|_| {
-        remove().is_ok() || {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            false
-        }
-    }) {
+    if retry3(remove).is_ok() {
         return (drops + queued, Err(format!("{e}; removed the plug instead").into()));
     }
     let tap = tap.to_string();
@@ -311,6 +298,18 @@ pub fn unplug_tap(tap: &str) -> (u64, Result<()>) {
     (drops + queued, Err(format!("{e}; removing the plug failed too, retrying").into()))
 }
 
+fn retry3(mut f: impl FnMut() -> Result<()>) -> Result<()> {
+    let mut res = Ok(());
+    for _ in 0..3 {
+        res = f();
+        if res.is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    res
+}
+
 /// The root qdisc's (drops, queued packets), from RTM_GETQDISC on a socket of its own: the
 /// qdisc echoed back (NLM_F_ECHO; a get without it answers nothing), no ACK, waited for up to
 /// a second.
@@ -323,16 +322,8 @@ fn qdisc_stats(ifindex: u32) -> Option<(u64, u64)> {
         return None;
     }
     let body = tcmsg(ifindex, 0x1_0000);
-    let flags = ((NLM_F_REQUEST | NLM_F_ECHO) as u16).to_ne_bytes();
-    let msg = [&((16 + body.len()) as u32).to_ne_bytes()[..], &libc::RTM_GETQDISC.to_ne_bytes(), &flags, &[1, 0, 0, 0, 0, 0, 0, 0], &body].concat();
-    let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
-    addr.nl_family = libc::AF_NETLINK as u16;
-    let mut buf = vec![0u8; 8192];
-    if send_to(&sock, &msg, &addr) < 0 {
-        return None;
-    }
-    let n = unsafe { libc::recv(sock.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
-    let reply = buf.get(..usize::try_from(n).ok()?)?;
+    let mut buf = [0u8; 8192];
+    let reply = exchange(&sock, libc::RTM_GETQDISC, NLM_F_ECHO, &body, &mut buf).ok()?;
     if reply.len() < 36 || u16::from_ne_bytes([reply[4], reply[5]]) != libc::RTM_NEWQDISC {
         return None;
     }
@@ -451,21 +442,10 @@ fn netlink(kind: u16, flags: c_int, body: &[u8]) -> Result<()> {
 fn request(kind: u16, flags: c_int, body: &[u8]) -> std::result::Result<(), Failed> {
     thread_local!(static FD: std::cell::Cell<Option<OwnedFd>> = const { std::cell::Cell::new(None) });
     let sock = FD.take().map_or_else(|| socket(libc::AF_NETLINK, libc::SOCK_RAW, libc::NETLINK_ROUTE, "netlink socket"), Ok).map_err(Failed::Unsent)?;
-    let flags = ((flags | NLM_F_REQUEST | NLM_F_ACK) as u16).to_ne_bytes();
-    // struct nlmsghdr: length, type, flags, seq, pid.
-    let msg = [&((16 + body.len()) as u32).to_ne_bytes()[..], &kind.to_ne_bytes(), &flags, &[1, 0, 0, 0, 0, 0, 0, 0], body].concat();
-    let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
-    addr.nl_family = libc::AF_NETLINK as u16;
     let mut ack = [0u8; 1024];
-    if send_to(&sock, &msg, &addr) < 0 {
-        return Err(Failed::Unsent(format!("netlink: {}", std::io::Error::last_os_error()).into()));
-    }
-    let res = unsafe { libc::recv(sock.as_raw_fd(), ack.as_mut_ptr().cast(), ack.len(), 0) };
-    if res < 0 {
-        return Err(Failed::Unanswered(format!("netlink: {}", std::io::Error::last_os_error()).into()));
-    }
-    if res < 20 {
-        return Err(Failed::Unanswered(format!("netlink: short reply ({res} bytes)").into()));
+    let reply = exchange(&sock, kind, flags | NLM_F_ACK, body, &mut ack)?;
+    if reply.len() < 20 {
+        return Err(Failed::Unanswered(format!("netlink: short reply ({} bytes)", reply.len()).into()));
     }
     FD.set(Some(sock));
     let kind = u16::from_ne_bytes([ack[4], ack[5]]);
@@ -474,6 +454,22 @@ fn request(kind: u16, flags: c_int, body: &[u8]) -> std::result::Result<(), Fail
         return Err(Failed::Refused(format!("netlink: {}", std::io::Error::from_raw_os_error(-code)).into()));
     }
     Ok(())
+}
+
+fn exchange<'a>(sock: &OwnedFd, kind: u16, flags: c_int, body: &[u8], buf: &'a mut [u8]) -> std::result::Result<&'a [u8], Failed> {
+    let flags = ((flags | NLM_F_REQUEST) as u16).to_ne_bytes();
+    // struct nlmsghdr: length, type, flags, seq, pid.
+    let msg = [&((16 + body.len()) as u32).to_ne_bytes()[..], &kind.to_ne_bytes(), &flags, &[1, 0, 0, 0, 0, 0, 0, 0], body].concat();
+    let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+    addr.nl_family = libc::AF_NETLINK as u16;
+    if send_to(sock, &msg, &addr) < 0 {
+        return Err(Failed::Unsent(format!("netlink: {}", std::io::Error::last_os_error()).into()));
+    }
+    let n = unsafe { libc::recv(sock.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
+    if n < 0 {
+        return Err(Failed::Unanswered(format!("netlink: {}", std::io::Error::last_os_error()).into()));
+    }
+    Ok(&buf[..n as usize])
 }
 
 pub fn ifindex(dev: &str) -> Result<u32> {

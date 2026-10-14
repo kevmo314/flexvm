@@ -162,8 +162,7 @@ impl<S: Timed> Write for By<S> {
     }
 }
 
-/// Reads and writes time out after `timeout` too. (A blocking connect waits for as long
-/// as the listener's backlog stays full.)
+/// Connects within `timeout`: a blocking connect waits while the listener's backlog is full.
 pub fn connect_unix(path: &std::path::Path, timeout: Duration) -> io::Result<UnixStream> {
     use std::os::unix::ffi::OsStrExt;
     let deadline = Instant::now() + timeout;
@@ -187,8 +186,6 @@ pub fn connect_unix(path: &std::path::Path, timeout: Duration) -> io::Result<Uni
     }
     let s = UnixStream::from(fd);
     s.set_nonblocking(false)?;
-    s.set_read_timeout(Some(timeout))?;
-    s.set_write_timeout(Some(timeout))?;
     Ok(s)
 }
 
@@ -210,10 +207,6 @@ pub fn pidfd_signal(pidfd: &OwnedFd, sig: i32) -> io::Result<()> {
 
 pub fn pidfd_kill(pidfd: &OwnedFd) -> io::Result<()> {
     pidfd_signal(pidfd, libc::SIGKILL).or_else(|e| if e.raw_os_error() == Some(libc::ESRCH) { Ok(()) } else { Err(e) })
-}
-
-pub fn pidfd_wait(pidfd: &OwnedFd, timeout: Duration) -> io::Result<bool> {
-    readable(pidfd, timeout)
 }
 
 /// Whether `fd` has input (or hung up) within `timeout`.

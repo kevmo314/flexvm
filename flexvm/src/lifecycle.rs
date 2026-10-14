@@ -844,7 +844,7 @@ pub fn remove_debris(host: &Host, name: &str) -> Result<()> {
     remove_durably(&dir).map_err(|e| format!("vm {name}: removing what is left of its suspended checkpoint {}: {e}", dir.display()))?;
     if let Some(ip) = ip {
         let l = host.lock()?;
-        host.release(&l, ip, name)?;
+        host.release(&l, ip, name, None)?;
     }
     Ok(())
 }
@@ -868,7 +868,7 @@ fn revoke(host: &Host, name: &str) -> Result<Result<()>> {
 fn free_address(host: &Host, name: &str, ip: Option<Ipv4Addr>, gen: Option<u64>) -> Result<()> {
     if let Some(ip) = ip {
         let l = host.lock()?;
-        host.release(&l, ip, name)?;
+        host.release(&l, ip, name, None)?;
         if let Some(gen) = gen {
             host.observe(&l, ip, gen, None)?;
             drop(l);

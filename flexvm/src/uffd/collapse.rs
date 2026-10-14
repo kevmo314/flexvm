@@ -21,7 +21,7 @@
 use std::io;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, MutexGuard};
+use std::sync::MutexGuard;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -67,7 +67,6 @@ pub struct CollapseReport {
     pub busy: Duration,
     pub cpu: Duration,
     pub wall: Duration,
-    pub done: bool,
     /// Why the pass ended early, if it did.
     pub stopped: Option<String>,
 }
@@ -81,7 +80,7 @@ impl CollapseReport {
             "busy_ms": crate::util::ms(self.busy),
             "cpu_ms": crate::util::ms(self.cpu),
             "wall_ms": crate::util::ms(self.wall),
-            "done": self.done,
+            "done": true,
             "stopped": self.stopped,
         })
     }
@@ -148,16 +147,6 @@ impl Batches {
 }
 
 impl Pager {
-    /// Starts the collapse pass for when every REMOTE page has arrived (unless test fault `no_collapse` is on then).
-    pub(super) fn collapse_when_pulled(self: &Arc<Self>) {
-        let p = self.clone();
-        thread::spawn(move || {
-            if p.wait_pulled(None) && !crate::host::fault("no_collapse") {
-                p.collapse();
-            }
-        });
-    }
-
     /// The collapse pass: runs of collapsible chunks, `BATCH` at most per call, using at most half a core: after each
     /// call it sleeps as long as the call took (mostly waiting for other CPUs to drain their caches, work this thread's
     /// CPU time does not show). Ends early when the pager stops, a checkpoint or migration starts (`quiesce`), or write
@@ -237,7 +226,6 @@ impl Pager {
         report.collapsed = b.collapsed;
         report.wall = started.elapsed();
         report.cpu = thread_cpu().saturating_sub(cpu0);
-        report.done = true;
         if report.tried > 0 {
             eprintln!(
                 "uffd: collapsed {} of {} fully paged-in 2 MiB chunks into huge pages in {} calls, {:.0} ms ({:.0} ms in the kernel, {:.0} ms CPU){}",

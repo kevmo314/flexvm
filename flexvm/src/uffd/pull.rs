@@ -21,7 +21,12 @@ impl Pager {
         if file.is_none() && self.from_file.load(Ordering::SeqCst) {
             return;
         }
-        self.collapse_when_pulled();
+        let p = self.clone();
+        thread::spawn(move || {
+            if p.wait_pulled(None) && !crate::host::fault("no_collapse") {
+                p.collapse();
+            }
+        });
         // The connection made for the snapshot load goes to a fault fetcher.
         let mut link = self.remote.lock().unwrap().take();
         let source = link.as_ref().map(|l| l.source.clone());

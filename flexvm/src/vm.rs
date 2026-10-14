@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use crate::bail;
-use crate::fc::{Firecracker, Idle, Spawner, API_TIMEOUT};
+use crate::fc::{Firecracker, Spawner, API_TIMEOUT};
 use crate::template::{Template, BALLOON_STATS_S};
 use crate::uffd::{Origin, Pager, Runs};
 use crate::util::{Phases, Result, PAGE_SIZE};
@@ -129,11 +129,9 @@ impl Vm {
     }
 
     /// The part of a restore that needs no vmstate, done by a migration target before its source pauses.
-    pub fn prepare(idle: Idle, template: Arc<Template>, phases: &mut Phases) -> Result<Prepared> {
-        crate::compat::check(&template, idle.pid())?;
-        let pager = Pager::start(&idle.sockets.uffd, template.clone(), None)?;
-        let prepared = Prepared { idle: Some(idle), pager, template, route: true };
-        prepared.pager.set_pid(prepared.firecracker().pid())?;
+    pub fn prepare(fc: Firecracker, template: Arc<Template>, phases: &mut Phases) -> Result<Prepared> {
+        crate::compat::check(&template, fc.pid())?;
+        let prepared = Prepared::new(fc, template)?;
         phases.mark("pager_start");
         Ok(prepared)
     }
@@ -159,7 +157,7 @@ impl Vm {
         if more == 0 {
             return;
         }
-        match host.grant_by(more, Some(Instant::now() + ADMIT_WAIT)) {
+        match host.grant(more, Some(Instant::now() + ADMIT_WAIT)) {
             Ok(Some(_)) => self.limit.plug(cap, more),
             Ok(None) => {}
             Err(e) => eprintln!("vm {}: admitting {more} MiB: {e}", self.name),
@@ -185,7 +183,7 @@ impl Vm {
     }
 
     pub fn post_mortem(&self) -> String {
-        match self.fc.lock().unwrap().as_mut() {
+        match self.fc.lock().unwrap().as_ref() {
             Some(fc) => fc.post_mortem(),
             None => "no firecracker".into(),
         }
@@ -207,7 +205,7 @@ impl Vm {
 
     /// One busy with a request counts as alive.
     pub fn firecracker_alive(&self) -> bool {
-        self.fc.try_lock().map_or(true, |mut fc| fc.as_mut().is_some_and(|f| f.alive()))
+        self.fc.try_lock().map_or(true, |fc| fc.as_ref().is_some_and(|f| f.alive()))
     }
 
     pub fn pid(&self) -> Option<u32> {
@@ -737,31 +735,28 @@ impl Vm {
     }
 
     pub fn kill(&self) {
-        self.pager.stop();
-        // First, so a call in progress (holding `fc`) fails at once.
-        self.pager.kill_firecracker();
-        let Some(fc) = self.fc.lock().unwrap().take() else { return };
-        // Before the tap goes (`fc::release`) with its counters: a full queue drops frames
-        // (a guest not keeping up), counted only there.
-        if let Some(n) = self.tap_dropped().filter(|&n| n > 0) {
-            eprintln!("vm {}: its tap dropped {n} frames (its queue full, or no Firecracker reading it)", self.name);
-        }
-        // Before the tap goes too, which purges its queue; not keeping it after.
-        if let Some((_, fd)) = self.tap_watch.lock().unwrap().take() {
-            if self.tap_stuck.swap(false, Ordering::SeqCst) {
-                // Gone (not reaped, so its pid is not reused), so no read of its races these.
-                let gone = crate::util::pidfd_open(fc.pid()).and_then(|p| crate::util::pidfd_wait(&p, Duration::from_secs(2)));
-                if !matches!(gone, Ok(true)) {
-                    eprintln!("vm {}: firecracker not seen gone ({gone:?}); counting what is left on its tap anyway", self.name);
-                }
-                let n = crate::net::discard_tap_queue(&fd);
-                eprintln!("vm {}: dropped {n} frames still queued on its tap when it left (its guest was not taking them)", self.name);
+        teardown(&self.pager, || {
+            let fc = self.fc.lock().unwrap().take()?;
+            // Before the tap goes (`fc::release`) with its counters: a full queue drops frames
+            // (a guest not keeping up), counted only there.
+            if let Some(n) = self.tap_dropped().filter(|&n| n > 0) {
+                eprintln!("vm {}: its tap dropped {n} frames (its queue full, or no Firecracker reading it)", self.name);
             }
-        }
-        let _ = UnixStream::connect(self.mem_sock());
-        // Reaped only once the pager has stopped, so its pid is not reused under the pager.
-        self.pager.join();
-        drop(fc);
+            // Before the tap goes too, which purges its queue; not keeping it after.
+            if let Some((_, fd)) = self.tap_watch.lock().unwrap().take() {
+                if self.tap_stuck.swap(false, Ordering::SeqCst) {
+                    // Gone (not reaped, so its pid is not reused), so no read of its races these.
+                    let gone = crate::util::pidfd_open(fc.pid()).and_then(|p| crate::util::readable(&p, Duration::from_secs(2)));
+                    if !matches!(gone, Ok(true)) {
+                        eprintln!("vm {}: firecracker not seen gone ({gone:?}); counting what is left on its tap anyway", self.name);
+                    }
+                    let n = crate::net::discard_tap_queue(&fd);
+                    eprintln!("vm {}: dropped {n} frames still queued on its tap when it left (its guest was not taking them)", self.name);
+                }
+            }
+            let _ = UnixStream::connect(self.mem_sock());
+            Some(fc)
+        });
     }
 
     pub fn describe(&self) -> Value {
@@ -802,7 +797,7 @@ fn mem_sizes(pager: &Pager, tpl: &Template, plugged: Option<u64>) -> (u64, u64) 
 
 /// A Firecracker with its pager started and no VM of its own yet; torn down when dropped.
 pub struct Prepared {
-    idle: Option<Idle>,
+    fc: Option<Firecracker>,
     pub pager: Arc<Pager>,
     template: Arc<Template>,
     /// Routes the VM's /32 to its tap while loading; a migration target does it at commit.
@@ -810,12 +805,19 @@ pub struct Prepared {
 }
 
 impl Prepared {
+    pub fn new(fc: Firecracker, template: Arc<Template>) -> Result<Self> {
+        let pager = Pager::start(&fc.sockets.uffd, template.clone(), None)?;
+        let p = Prepared { fc: Some(fc), pager, template, route: true };
+        p.pager.set_pid(p.firecracker().pid())?;
+        Ok(p)
+    }
+
     pub fn template(&self) -> Arc<Template> {
         self.template.clone()
     }
 
     pub fn firecracker(&self) -> &Firecracker {
-        self.idle.as_ref().unwrap()
+        self.fc.as_ref().unwrap()
     }
 
     /// The load leaves the address's route alone (a migration target routes it at commit).
@@ -824,26 +826,18 @@ impl Prepared {
         self
     }
 
-    pub fn tap(&self) -> &str {
-        &self.idle.as_ref().unwrap().tap
-    }
-
     /// As `Vm::mem_sizes`, for a loaded one.
     pub fn mem_sizes(&self) -> (u64, u64) {
         let plugged = self.firecracker().get("/hotplug/memory").ok().and_then(|h| h["plugged_size_mib"].as_u64());
         mem_sizes(&self.pager, &self.template, plugged)
     }
 
-    pub fn dir(&self) -> &Path {
-        &self.idle.as_ref().unwrap().dir
-    }
-
-    pub fn firecracker_alive(&mut self) -> bool {
-        self.idle.as_mut().is_some_and(|i| i.alive())
+    pub fn firecracker_alive(&self) -> bool {
+        self.fc.as_ref().is_some_and(|i| i.alive())
     }
 
     pub fn into_vm(mut self, name: &str, ip: Ipv4Addr, state: State) -> Arc<Vm> {
-        let idle = self.idle.take().unwrap();
+        let idle = self.fc.take().unwrap();
         Arc::new(Vm {
             name: name.into(),
             template: self.template.clone(),
@@ -886,7 +880,7 @@ impl Prepared {
         }
         // Before the request: Firecracker connects to the pager during it.
         self.pager.expect_seed(true);
-        match self.firecracker().load_snapshot(&self.template.vmstate(), self.tap(), None, API_TIMEOUT) {
+        match self.firecracker().load_snapshot(&self.template.vmstate(), &self.firecracker().tap, None, API_TIMEOUT) {
             Ok(_) => Ok(true),
             Err(e) if e.to_string().contains("Invalid request method and/or path") => {
                 self.pager.expect_seed(false);
@@ -926,7 +920,7 @@ impl Prepared {
         fresh.route = route;
         if !route {
             // The route waits, but everything else about it goes on the fresh tap.
-            crate::net::neighbour(ip, fresh.tap())?;
+            crate::net::neighbour(ip, &fresh.firecracker().tap)?;
         }
         fresh.load_once(name, vmstate, seed, ip, hold, realtime, deadline, t).map_err(|(e, _)| e)
     }
@@ -934,7 +928,7 @@ impl Prepared {
     /// On failure, whether another (and with `clock_realtime`) may work.
     #[allow(clippy::too_many_arguments)]
     fn load_once(
-        mut self,
+        self,
         name: &str,
         vmstate: Snapshot,
         seed: Option<(Runs, Origin)>,
@@ -953,16 +947,19 @@ impl Prepared {
             let path = match vmstate {
                 Snapshot::Path(p) => p.to_path_buf(),
                 Snapshot::Bytes(b) => {
-                    let p = self.dir().join("vmstate.in");
+                    let p = self.firecracker().dir.join("vmstate.in");
                     std::fs::write(&p, b)?;
                     t.mark("write_state");
                     p
                 }
             };
             let fc = self.firecracker();
-            let tap = self.tap().to_string();
+            let tap = fc.tap.clone();
             let route = self.route.then(|| std::thread::spawn(move || crate::net::attach(ip, &tap)));
-            let loaded = fc.load_snapshot(&path, self.tap(), Some(clock_realtime), left(API_TIMEOUT));
+            let loaded = fc.load_snapshot(&path, &fc.tap, Some(clock_realtime), left(API_TIMEOUT));
+            if matches!(vmstate, Snapshot::Bytes(_)) {
+                let _ = std::fs::remove_file(&path);
+            }
             self.pager.loaded();
             let took = t.mark("snapshot_load");
             if let Err(e) = &loaded {
@@ -986,7 +983,7 @@ impl Prepared {
         match loaded {
             Ok(took) => Ok((self.into_vm(name, ip, State::Paused), took)),
             Err(e) => {
-                let idle = self.idle.as_mut().unwrap();
+                let idle = self.fc.as_ref().unwrap();
                 let retry = match &load_failed {
                     Some(why) if why.contains(NO_REALTIME) && clock_realtime => Some(false),
                     // Died on its own, with no page given up.
@@ -1002,14 +999,19 @@ impl Prepared {
 
 impl Drop for Prepared {
     fn drop(&mut self) {
-        if let Some(idle) = self.idle.take() {
-            self.pager.stop();
-            self.pager.kill_firecracker();
-            // Reaped only once the pager has stopped (see `Vm::kill`).
-            self.pager.join();
-            drop(idle);
+        if self.fc.is_some() {
+            teardown(&self.pager, || self.fc.take());
         }
     }
+}
+
+/// Kills before taking the API lock; reaps only once the pager has stopped.
+fn teardown(pager: &Pager, take: impl FnOnce() -> Option<Firecracker>) {
+    pager.stop();
+    pager.kill_firecracker();
+    let Some(fc) = take() else { return };
+    pager.join();
+    drop(fc);
 }
 
 /// A 4xx to a PATCH of `path` means it had no effect; anything else may have been applied.

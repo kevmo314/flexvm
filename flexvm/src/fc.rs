@@ -43,8 +43,8 @@ pub struct Firecracker {
     /// Empty for image builders, which own their directory and network.
     pub tap: String,
     api: Api,
-    /// The cgroup move: joined before the kill, so its pid is never reused meanwhile.
-    joining: Option<std::thread::JoinHandle<()>>,
+    /// The cgroup move: joined before a load or reap.
+    joining: RefCell<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl Firecracker {
@@ -74,7 +74,7 @@ impl Firecracker {
             });
         }
         let child = cmd.spawn()?;
-        let fc = Firecracker { child, sockets, dir: dir.into(), cgroup: None, tap: String::new(), api: Api::default(), joining: None };
+        let fc = Firecracker { child, sockets, dir: dir.into(), cgroup: None, tap: String::new(), api: Api::default(), joining: RefCell::new(None) };
         let id = crate::host::Ident::of(fc.pid()).ok_or("firecracker exited at once")?;
         crate::host::store(&dir.join("fc"), &id, false)?;
         retry(ready, || Ok(UnixStream::connect(&fc.sockets.api)?))?;
@@ -99,6 +99,7 @@ impl Firecracker {
 
     /// With no `clock_realtime`, only prepares the load (`firecracker/0002-*.patch`).
     pub fn load_snapshot(&self, vmstate: &Path, tap: &str, clock_realtime: Option<bool>, timeout: Duration) -> Result<Value> {
+        self.join_cgroup();
         let mut body = serde_json::json!({
             "snapshot_path": vmstate,
             "mem_backend": {"backend_type": "Uffd", "backend_path": self.sockets.uffd},
@@ -124,11 +125,11 @@ impl Firecracker {
         self.api.request(&self.sockets.api, method, path, body, timeout)
     }
 
-    pub fn alive(&mut self) -> bool {
+    pub fn alive(&self) -> bool {
         matches!(exited(&self.child), Ok(None))
     }
 
-    pub fn post_mortem(&mut self) -> String {
+    pub fn post_mortem(&self) -> String {
         let status = match exited(&self.child) {
             Ok(Some(st)) => format!("exited ({st})"),
             Ok(None) => "still running".into(),
@@ -139,19 +140,14 @@ impl Firecracker {
         format!("firecracker {} {status}; log: {}", self.pid(), lines[lines.len().saturating_sub(5)..].join(" | "))
     }
 
-    /// Reaps it: callers stop its pager first, which reads its memory by pid.
-    pub fn kill(&mut self) {
-        if let Some(j) = self.joining.take() {
+    fn join_cgroup(&self) {
+        if let Some(j) = self.joining.borrow_mut().take() {
             let _ = j.join();
         }
-        self.api.connection.get_mut().take();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        self.sockets.cleanup();
     }
 }
 
-/// `child`'s exit status once it exited, leaving it unreaped: only `kill` reaps Firecracker,
+/// `child`'s exit status once it exited, leaving it unreaped: only `Drop` reaps Firecracker,
 /// after the cgroup move, so nothing acting on its pid meanwhile can meet a reused one.
 fn exited(child: &Child) -> std::io::Result<Option<ExitStatus>> {
     use std::os::unix::process::ExitStatusExt;
@@ -311,17 +307,19 @@ fn log_tail(r: &mut (impl Read + Seek)) -> std::io::Result<String> {
 
 impl Drop for Firecracker {
     fn drop(&mut self) {
-        self.kill();
+        // Reaped only once its pager has stopped.
+        self.join_cgroup();
+        self.api.connection.get_mut().take();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
         if !self.tap.is_empty() {
             release(&self.tap, self.cgroup.as_deref(), &self.dir);
         }
     }
 }
 
-pub type Idle = Firecracker;
-
 /// Its Firecracker must be gone.
-pub fn release(tap: &str, cgroup: Option<&Path>, dir: &Path) {
+fn release(tap: &str, cgroup: Option<&Path>, dir: &Path) {
     crate::net::delete_tap(tap);
     if let Some(cg) = cgroup {
         let _ = remove_cgroup(cg);
@@ -360,7 +358,7 @@ impl Spawner {
         Spawner { bin: bin.into(), root: root.into(), sockets, cgroups, tap_prefix: tap_prefix.into(), tap_owner: tap_owner.into(), next: AtomicU64::new(0) }
     }
 
-    pub fn take(&self, deadline: Option<std::time::Instant>) -> Result<Idle> {
+    pub fn take(&self, deadline: Option<std::time::Instant>) -> Result<Firecracker> {
         let ready = deadline.map_or(SPAWN_READY, |d| d.saturating_duration_since(std::time::Instant::now()).min(SPAWN_READY));
         if ready.is_zero() {
             bail!("out of time to start firecracker");
@@ -397,7 +395,7 @@ impl Spawner {
         }
         if let Some(cg) = cgroup.clone() {
             let pid = fc.pid();
-            fc.joining = Some(std::thread::spawn(move || {
+            *fc.joining.get_mut() = Some(std::thread::spawn(move || {
                 // Never swapped: at its mark the VM is throttled (sleeps a migration's or
                 // checkpoint's lift waits out), not paged out to swap, whose reads would hold
                 // up its pauses. Without swap accounting the file is missing: nothing to do.

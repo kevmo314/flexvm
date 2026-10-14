@@ -122,7 +122,7 @@ impl Limit {
         }
         // Admitted without `mark` held; another raise meanwhile only adds to it.
         // An error is no refusal: the mark stays, and the VM is not throttled for it.
-        let id = match host.grant(more) {
+        let id = match host.grant(more, None) {
             Ok(Some(id)) => id,
             Ok(None) => {
                 self.throttled.store(true, Ordering::SeqCst);

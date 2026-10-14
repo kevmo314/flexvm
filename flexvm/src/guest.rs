@@ -177,11 +177,6 @@ pub fn session_exit(data: &[u8], offset: u64) -> Result<i32> {
     Ok(i32::from_le_bytes(session_output(data, offset)?.try_into()?))
 }
 
-pub fn write_frame(w: &mut impl Write, kind: u8, payload: &[u8]) -> std::io::Result<()> {
-    w.write_all(&[&[kind][..], &(payload.len() as u32).to_le_bytes()].concat())?;
-    w.write_all(payload)
-}
-
 pub fn read_frame(r: &mut impl Read) -> Result<Option<(u8, Vec<u8>)>> {
     let mut hdr = [0u8; 5];
     match r.read_exact(&mut hdr[..1]) {

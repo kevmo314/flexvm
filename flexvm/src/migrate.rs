@@ -105,9 +105,15 @@ impl Proc {
             None => false,
         };
         let captured = (|| -> Result<_> {
-            let runs = vm.save_state(&vmstate, false, false, hold, &mut t)?;
+            let saved = vm.save_state(&vmstate, false, false, hold, &mut t);
+            if saved.is_err() {
+                let _ = std::fs::remove_file(&vmstate);
+            }
+            let runs = saved?;
             let paused = t.total();
-            let state = std::fs::read(&vmstate)?;
+            let state = std::fs::read(&vmstate);
+            let _ = std::fs::remove_file(&vmstate);
+            let state = state?;
             t.mark("read_state");
             let mut wanted = crate::standby::load_set(&self.host, &vm.template);
             wanted.extend(serde_json::from_value::<Vec<u64>>(prepared["load_set"].clone()).unwrap_or_default());
@@ -623,7 +629,7 @@ impl Proc {
         let load_set = crate::standby::load_set(&self.host, &tpl);
         let vm = Vm::prepare(idle, tpl, t)?;
         // All of routing the address here but the route itself, which waits for the commit.
-        crate::net::neighbour(ip, vm.tap())?;
+        crate::net::neighbour(ip, &vm.firecracker().tap)?;
         t.mark("neighbour");
         if shares_routes(&source.addr) {
             // Ready before the source pauses: it takes the address over from the source's hold.
