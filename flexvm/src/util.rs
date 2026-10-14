@@ -286,31 +286,22 @@ fn open_dir(dir: &Path) -> io::Result<std::fs::File> {
     std::fs::File::options().read(true).custom_flags(libc::O_DIRECTORY).open(dir)
 }
 
-/// (a directory or symlink, the directory holding it): that entry, and all above it, are durable.
-type Edges = std::collections::BTreeSet<((u64, u64), (u64, u64))>;
-/// This process syncs each chain once, again only once an entry on it is moved or replaced.
-static SYNCED: std::sync::Mutex<Edges> = std::sync::Mutex::new(Edges::new());
+/// Directories synced and links followed in one walk, by (dev, ino).
+type Seen = std::collections::HashSet<(u64, u64)>;
 
 /// Syncs every directory above `dir` up to `/`, and the one holding each symlink its path or a
 /// link's target resolves through. Run when publishing in `dir`: an existing directory may have
 /// been made by a process that died before syncing it.
 fn sync_ancestors(dir: &Path) -> io::Result<()> {
-    once(|seen| sync_ancestors_with(dir, seen, &mut |d| d.sync_all()))
+    sync_ancestors_with(dir, &mut Seen::new(), &mut |d| d.sync_all())
 }
 
 /// As `sync_ancestors`, from a pinned directory: never by a path, which may since name another.
 pub fn sync_ancestors_fd(dir: RawFd) -> io::Result<()> {
-    once(|seen| walk_up(dir, seen, &mut |d| d.sync_all()))
+    walk_up(dir, &mut Seen::new(), &mut |d| d.sync_all())
 }
 
-/// A walk's edges are recorded only once all of it succeeded.
-fn once(walk: impl FnOnce(&mut Edges) -> io::Result<()>) -> io::Result<()> {
-    let mut synced = SYNCED.lock().unwrap_or_else(|e| e.into_inner());
-    let mut seen = synced.clone();
-    walk(&mut seen).map(|()| *synced = seen)
-}
-
-fn sync_ancestors_with(dir: &Path, seen: &mut Edges, sync: &mut impl FnMut(&std::fs::File) -> io::Result<()>) -> io::Result<()> {
+fn sync_ancestors_with(dir: &Path, seen: &mut Seen, sync: &mut impl FnMut(&std::fs::File) -> io::Result<()>) -> io::Result<()> {
     let named = |e: io::Error| io::Error::new(e.kind(), format!("fsync of the directories above {}: {e}", dir.display()));
     let dir = std::path::absolute(dir).map_err(named)?;
     sync_links(&dir, seen, sync).map_err(named)?;
@@ -318,23 +309,26 @@ fn sync_ancestors_with(dir: &Path, seen: &mut Edges, sync: &mut impl FnMut(&std:
 }
 
 /// The directory holding each symlink `path` resolves through, then the links in its target.
-fn sync_links(path: &Path, seen: &mut Edges, sync: &mut impl FnMut(&std::fs::File) -> io::Result<()>) -> io::Result<()> {
+fn sync_links(path: &Path, seen: &mut Seen, sync: &mut impl FnMut(&std::fs::File) -> io::Result<()>) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
     for (link, m) in path.ancestors().filter_map(|p| Some((p, std::fs::symlink_metadata(p).ok().filter(|m| m.is_symlink())?))) {
+        // Each link once, which ends a loop of them.
+        if !seen.insert((m.dev(), m.ino())) {
+            continue;
+        }
         let at = link.parent().unwrap_or(Path::new("/"));
         let holder = open_dir(at)?;
-        // Each link once, which ends a loop of them.
-        if seen.insert(((m.dev(), m.ino()), dir_id(holder.as_raw_fd())?)) {
+        if seen.insert(dir_id(holder.as_raw_fd())?) {
             sync(&holder)?;
             walk_up(holder.as_raw_fd(), seen, sync)?;
-            sync_links(&at.join(std::fs::read_link(link)?), seen, sync)?;
         }
+        sync_links(&at.join(std::fs::read_link(link)?), seen, sync)?;
     }
     Ok(())
 }
 
-/// Syncs the directories above `dir` by "..", up to the root (its own ".."), stopping at an edge in `seen`.
-fn walk_up(dir: RawFd, seen: &mut Edges, sync: &mut impl FnMut(&std::fs::File) -> io::Result<()>) -> io::Result<()> {
+/// Syncs the directories above `dir` by "..", up to the root (its own ".."), stopping at one in `seen`.
+fn walk_up(dir: RawFd, seen: &mut Seen, sync: &mut impl FnMut(&std::fs::File) -> io::Result<()>) -> io::Result<()> {
     let (mut cur, mut id) = (None::<std::fs::File>, dir_id(dir)?);
     loop {
         let fd = cur.as_ref().map_or(dir, |f| f.as_raw_fd());
@@ -344,7 +338,7 @@ fn walk_up(dir: RawFd, seen: &mut Edges, sync: &mut impl FnMut(&std::fs::File) -
         }
         let up = unsafe { std::fs::File::from_raw_fd(up) };
         let up_id = dir_id(up.as_raw_fd())?;
-        if up_id == id || !seen.insert((id, up_id)) {
+        if up_id == id || !seen.insert(up_id) {
             return Ok(());
         }
         sync(&up)?;
@@ -795,7 +789,7 @@ mod tests {
         std::os::unix::fs::symlink("../real/a", root.join("l/link")).unwrap();
         let root = root.canonicalize().unwrap();
         let id = |p: &Path| std::fs::metadata(p).map(|m| (m.dev(), m.ino())).unwrap();
-        let walk = |p: &Path, seen: &mut Edges| {
+        let walk = |p: &Path, seen: &mut Seen| {
             let mut synced = vec![];
             sync_ancestors_with(p, seen, &mut |d| dir_id(d.as_raw_fd()).map(|id| synced.push(id))).map(|()| synced)
         };
@@ -804,6 +798,7 @@ mod tests {
         let mut want: Vec<_> = [root.join("l"), root.join("real/a"), root.join("real")].iter().map(|p| id(p)).collect();
         want.extend(root.ancestors().map(id));
         let set: std::collections::HashSet<_> = synced.iter().copied().collect();
+        assert_eq!(synced.len(), set.len(), "each once: {synced:?}");
         assert_eq!(set, want.iter().copied().collect(), "{synced:?}");
         assert!(synced.contains(&id(Path::new("/"))));
 
@@ -812,7 +807,7 @@ mod tests {
         std::fs::create_dir_all(root.join("q")).unwrap();
         std::os::unix::fs::symlink(root.join("q/l2"), root.join("p/l1")).unwrap();
         std::os::unix::fs::symlink("../real/a", root.join("q/l2")).unwrap();
-        let mut seen = Edges::new();
+        let mut seen = Seen::new();
         let synced = walk(&root.join("p/l1/b"), &mut seen).unwrap();
         for d in ["p", "q", "real/a", "real"] {
             assert!(synced.contains(&id(&root.join(d))), "{d}: {synced:?}");

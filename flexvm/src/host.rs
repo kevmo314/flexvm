@@ -181,13 +181,16 @@ pub fn run_dir() -> Option<&'static Path> {
 }
 
 impl Host {
-    /// Synced up to `/` once per state root, not on every command: `.synced` is made after the syncs.
+    /// Synced up to `/` once per state root, not on every command: `.synced` names the root
+    /// (dev, inode), so a copy syncs again; it goes before a repair and comes back after the syncs.
     pub fn open(state: &Path, run: &Path) -> Result<Host> {
         let dirs = [("addrs", 0o777), ("standby", 0o777), ("migs", 0o777), ("suspended", 0o700)];
-        if !state.join(".synced").exists() || dirs.iter().any(|(d, _)| !state.join(d).is_dir()) {
+        let (marker, id) = (state.join(".synced"), || std::fs::metadata(state).map(|m| format!("{} {}", m.dev(), m.ino())));
+        if id().ok().is_none_or(|id| std::fs::read_to_string(&marker).ok() != Some(id)) || dirs.iter().any(|(d, _)| !state.join(d).is_dir()) {
+            let _ = std::fs::remove_file(&marker);
             dirs.iter()
                 .try_for_each(|(d, mode)| crate::util::create_dir_durably(&state.join(d), *mode))
-                .and_then(|()| std::fs::File::create(state.join(".synced")).map(drop))
+                .and_then(|()| std::fs::write(&marker, id()?))
                 .map_err(|e| format!("{e} (run flexvm as root to create it)"))?;
         }
         for d in ["vms", "standby", "w"] {
@@ -1512,10 +1515,13 @@ mod tests {
     #[test]
     fn state_directories_are_synced_once_and_remade() {
         let h = host("synced");
-        assert!(h.state.join(".synced").is_file());
+        let marker = std::fs::read_to_string(h.state.join(".synced")).unwrap();
         std::fs::remove_dir(h.state.join("standby")).unwrap();
+        // Copied from another root: synced again.
+        std::fs::write(h.state.join(".synced"), "1 2").unwrap();
         Host::open(&h.state, &h.run).unwrap();
         assert!(h.state.join("standby").is_dir());
+        assert_eq!(std::fs::read_to_string(h.state.join(".synced")).unwrap(), marker);
         std::fs::remove_dir_all(h.state.parent().unwrap()).unwrap();
     }
 

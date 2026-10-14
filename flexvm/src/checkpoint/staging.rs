@@ -76,7 +76,7 @@ impl Staging {
             .map_err(|e| format!("checkpoint directory {}: {e}", parent_path.display()))?;
         let base = CString::new(base.as_bytes())?;
         ensure!(!exists_at(pfd.as_raw_fd(), &base), "{} already exists; checkpoints are never overwritten", dest.display());
-        // Its directory's own entry, up to the root, ahead of the pause; `commit` checks it is still there.
+        // Its directory's own entry, up to the root, ahead of the pause; `commit` walks again, as then.
         crate::util::sync_ancestors_fd(pfd.as_raw_fd()).map_err(|e| format!("checkpoint directory {}: {e}", parent_path.display()))?;
         check(unsafe { libc::flock(pfd.as_raw_fd(), libc::LOCK_EX) })?;
         clear_stale(&pfd);
@@ -218,6 +218,8 @@ impl Staging {
         if named.dev() != pinned.st_dev as u64 || named.ino() != pinned.st_ino as u64 {
             return Err(moved.into());
         }
+        // Again from the pinned directory: an ancestor may have been moved since (cheap if not).
+        crate::util::sync_ancestors_fd(self.parent.as_raw_fd())?;
         t.mark("fsync");
         let (outer, parent) = (self.outer.as_raw_fd(), self.parent.as_raw_fd());
         check(unsafe { libc::renameat2(outer, c"ck".as_ptr(), parent, self.base.as_ptr(), libc::RENAME_NOREPLACE) })
