@@ -4559,6 +4559,8 @@ def log_cap():
     ok(migrate(A, m, B))
     moved = os.path.join(B.run, "vms", f"{m}.log")
     pid = vm_pid(B, m)
+    # migrate can return before B publishes the arrival's log (renamed over NAME.log): pad only once it is there.
+    check("log cap: the arrival's log published", wait_for(lambda: os.path.exists(moved), 30), moved)
     with open(moved, "a") as f:
         f.write("pad\n" * (2 << 20))
     wait_released(B, m)
