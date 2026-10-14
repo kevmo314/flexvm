@@ -105,7 +105,7 @@ pub fn fetch(cache: &Path, src: &str, limits: &Limits) -> Result<Image> {
     let img = if path.is_dir() {
         let path = std::fs::canonicalize(path)?;
         let in_dir = |p: &str| {
-            let f = std::fs::canonicalize(path.join(lexical(Path::new(p))))?;
+            let f = std::fs::canonicalize(path.join(lexical(Path::new(p)))).map_err(|e| format!("{path:?} has no {p:?}: {e}"))?;
             if !f.starts_with(&path) {
                 bail!("{p:?} escapes image directory {path:?}");
             }

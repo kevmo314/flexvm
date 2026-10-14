@@ -301,12 +301,21 @@ fn rename_noreplace(tmp: &Path, path: &Path) -> Result<bool> {
 
 /// Writes `path` durably via a temporary, never replacing it; false if another publisher won.
 pub(super) fn publish(path: &Path, write: impl FnOnce(&mut File) -> Result<()>) -> Result<bool> {
+    install(path, write, rename_noreplace)
+}
+
+/// As `publish`, but replacing `path`: for content-addressed files that `write` verifies.
+pub(super) fn replace(path: &Path, write: impl FnOnce(&mut File) -> Result<()>) -> Result<()> {
+    install(path, write, |tmp, path| Ok(std::fs::rename(tmp, path)?))
+}
+
+fn install<T>(path: &Path, write: impl FnOnce(&mut File) -> Result<()>, rename: impl FnOnce(&Path, &Path) -> Result<T>) -> Result<T> {
     let tmp = path.with_extension(format!("part{}", std::process::id()));
     let res = (|| {
         let mut f = create_new(&tmp)?;
         write(&mut f)?;
         f.sync_all()?;
-        rename_noreplace(&tmp, path)
+        rename(&tmp, path)
     })();
     let _ = std::fs::remove_file(&tmp);
     res

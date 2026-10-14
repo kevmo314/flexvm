@@ -148,7 +148,8 @@ impl Registry {
         Ok((serde_json::from_slice(&body)?, digest))
     }
 
-    /// Checks cached blobs before reuse; corrupt entries get one fresh download.
+    /// Checks cached blobs before reuse; a corrupt one gets one fresh download, renamed over it so that
+    /// concurrent pulls never see the path missing.
     pub fn blob(&mut self, digest: &str, size: u64, blobs: &Path) -> Result<PathBuf> {
         cached_blob(digest, size, blobs, || Ok(self.get(&format!("blobs/{digest}"), "*/*")?.into_reader()))
     }
@@ -167,11 +168,10 @@ fn cached_blob<R: Read>(digest: &str, size: u64, blobs: &Path, download: impl Fn
             sync_dir(&dir)?;
             return Ok(path);
         }
-        std::fs::remove_file(&path)?;
-        sync_dir(&dir)?;
+        eprintln!("image: cached blob {digest} is corrupt; downloading it again");
     }
     let mut r = Hashed::new(download()?.take(size.saturating_add(1)));
-    super::publish(&path, |f| {
+    super::replace(&path, |f| {
         std::io::copy(&mut r, f)?;
         if r.n != size {
             bail!("blob {digest} does not have its descriptor's {size} bytes");
@@ -259,7 +259,6 @@ mod tests {
             let mut downloads = 0;
             let result = cached_blob(&digest, 4, &dir, || {
                 downloads += 1;
-                assert!(!path.exists(), "evict before downloading");
                 Ok(downloaded)
             });
             assert_eq!(downloads, 1);
@@ -270,7 +269,7 @@ mod tests {
             } else {
                 let err = result.unwrap_err().to_string();
                 assert!(err.contains(if downloaded.len() == 4 { "downloaded with digest" } else { "descriptor's 4 bytes" }), "{err}");
-                assert!(!path.exists());
+                assert_eq!(std::fs::read(&path).unwrap(), cached, "a failed download keeps what was there");
             }
             assert!(!path.with_extension(format!("part{}", std::process::id())).exists());
         }
