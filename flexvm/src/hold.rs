@@ -330,14 +330,6 @@ const START: u32 = u32::MAX - 1;
 const MAX_RECEIVERS: usize = 8;
 static RECEIVERS: AtomicUsize = AtomicUsize::new(0);
 
-#[derive(Debug, Default)]
-pub struct Received {
-    pub injected: u64,
-    pub dropped: u64,
-    pub ended: bool,
-    pub next: u64,
-}
-
 fn read_by(r: &mut BufReader<By<TcpStream>>, buf: &mut [u8], deadline: Instant) -> std::io::Result<()> {
     r.get_mut().at = deadline;
     r.read_exact(buf)
@@ -352,57 +344,51 @@ pub fn wait_start(r: &mut BufReader<By<TcpStream>>, deadline: Instant) -> bool {
     read_by(r, &mut head, deadline).is_ok() && u32::from_be_bytes(head) == START
 }
 
-/// Injects only while `revoked` is false. None if too many streams are being received.
-pub fn receive(r: &mut BufReader<By<TcpStream>>, ip: Ipv4Addr, tap: &str, revoked: &Mutex<bool>, deadline: Instant) -> Option<Received> {
-    RECEIVERS.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n < MAX_RECEIVERS).then_some(n + 1)).ok()?;
-    let got = receive_counted(r, ip, tap, revoked, deadline);
-    RECEIVERS.fetch_sub(1, Ordering::SeqCst);
-    Some(got)
+/// Injects only while `revoked` is false. Refused if too many streams are being received.
+pub fn receive(r: &mut BufReader<By<TcpStream>>, ip: Ipv4Addr, tap: &str, revoked: &Mutex<bool>, deadline: Instant) {
+    if RECEIVERS.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n < MAX_RECEIVERS).then_some(n + 1)).is_ok() {
+        receive_counted(r, ip, tap, revoked, deadline);
+        RECEIVERS.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
-fn receive_counted(r: &mut BufReader<By<TcpStream>>, ip: Ipv4Addr, tap: &str, revoked: &Mutex<bool>, deadline: Instant) -> Received {
-    let mut got = Received::default();
-    let (Ok(conn), Ok(inj)) = (r.get_ref().s.try_clone(), Injector::new(tap)) else { return got };
+fn receive_counted(r: &mut BufReader<By<TcpStream>>, ip: Ipv4Addr, tap: &str, revoked: &Mutex<bool>, deadline: Instant) {
+    let (Ok(conn), Ok(inj)) = (r.get_ref().s.try_clone(), Injector::new(tap)) else { return };
     if write_by(&conn, &[&b"a"[..], &0u64.to_be_bytes()].concat(), deadline).is_err() {
-        return got;
+        return;
     }
-    let mut buf = vec![0u8; MAX_FRAME];
-    loop {
+    let (mut buf, mut next, mut injected, mut dropped) = (vec![0u8; MAX_FRAME], 0, 0, 0);
+    let ended = loop {
         let mut head = [0u8; 4];
         if read_by(r, &mut head, deadline).is_err() {
-            break;
+            break false;
         }
         let len = match u32::from_be_bytes(head) {
             SYNC if write_by(&conn, b"s", deadline).is_ok() => continue,
-            SYNC => break,
-            0 => {
-                got.ended = true;
-                break;
-            }
+            SYNC => break false,
+            0 => break true,
             len => len as usize,
         };
         let mut seq = [0u8; 8];
         if len > MAX_FRAME || read_by(r, &mut seq, deadline).is_err() || read_by(r, &mut buf[..len], deadline).is_err() {
-            break;
+            break false;
         }
         let seq = u64::from_be_bytes(seq);
-        if seq < got.next {
-            got.dropped += 1;
+        if seq < next {
+            dropped += 1;
             continue;
         }
-        got.dropped += seq - got.next;
-        got.next = seq + 1;
+        dropped += seq - next;
+        next = seq + 1;
         match !*revoked.lock().unwrap() && valid(&buf[..len], ip) && inj.send(&buf[..len]) {
-            true => got.injected += 1,
-            false => got.dropped += 1,
+            true => injected += 1,
+            false => dropped += 1,
         }
-    }
-    got.dropped += inj.dropped();
-    if got.ended {
-        let reply = json!({"injected": got.injected, "dropped": got.dropped});
+    };
+    if ended {
+        let reply = json!({"injected": injected, "dropped": dropped + inj.dropped()});
         let _ = write_by(&conn, format!("{reply}\n").as_bytes(), deadline);
     }
-    got
 }
 
 /// A whole IPv4 packet for `ip`: all a guest is ever handed.
@@ -447,16 +433,9 @@ pub fn send(holder: &Holder, ip: Ipv4Addr, mig: u64, conn: &TcpStream, seq: u64,
     Some((stats, switched))
 }
 
+/// A byte at a time: nothing after the line is consumed.
 fn read_reply(conn: &TcpStream, deadline: Instant) -> Option<Value> {
-    let (mut line, mut b, mut r) = (Vec::new(), [0u8; 1], By { s: conn, at: deadline });
-    while line.len() < 256 {
-        r.read_exact(&mut b).ok()?;
-        if b[0] == b'\n' {
-            return serde_json::from_slice(&line).ok();
-        }
-        line.push(b[0]);
-    }
-    None
+    crate::util::recv_json_max(&mut BufReader::with_capacity(1, By { s: conn, at: deadline }), 257).ok().flatten()
 }
 
 struct Out<'a> {
