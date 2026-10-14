@@ -2349,11 +2349,25 @@ def settle_rss(host, name, timeout=60):
     return last
 
 
+def guest_blocks(host, name):
+    """The guest's hotplugged memory blocks: (hotplug region's guest address, block size, online block ids)."""
+    code, out = sh(host, name, "cat /proc/iomem; echo; cat /sys/devices/system/memory/block_size_bytes; "
+                               "for d in /sys/devices/system/memory/memory*; do echo $d $(cat $d/state); done")
+    assert code == 0, out
+    lines = out.splitlines()
+    i = next(i for i, l in enumerate(lines) if "(virtio_mem)" in l)
+    base = int(next(l for l in reversed(lines[:i]) if not l.startswith(" ")).split("-")[0], 16)
+    bs = int(next(l for l in lines if re.fullmatch(r"[0-9a-f]+", l.strip())), 16)
+    online = [int(l.split()[0].rsplit("memory", 1)[1]) for l in lines if l.startswith("/sys/") and l.endswith(" online")]
+    return base, bs, sorted(b for b in online if b * bs >= base)
+
+
 def unplug_collapsed():
-    """virtio-mem unplug of memory collapsed into huge pages after a migration (#141): the guest moves its data out of
-    the blocks it gives back, Firecracker discards them (2 MiB blocks, whole huge pages), the huge pages there are
-    freed, and the guest's memory stays intact. PLUG_TEMPLATE picks a template with at least 1.5 GiB of unplugged
-    hotplug room (the unplug must leave the guest its headroom, or the controller grows it right back)."""
+    """virtio-mem unplug of memory collapsed into huge pages after a migration (#141): the guest moves the data out of
+    the blocks it gives back, Firecracker discards them (2 MiB blocks, whole huge pages), every huge page in them is
+    gone, and the guest's memory stays intact. Deterministic: the guest offlines the hotplugged blocks that hold the
+    most huge pages, and virtio-mem unplugs offline blocks first. PLUG_TEMPLATE picks a template with at least
+    1.5 GiB of unplugged hotplug room."""
     n = "ft-huge-unplug"
     m = setup(n, template=os.environ.get("PLUG_TEMPLATE"))
     v = vms(A)[n]
@@ -2364,10 +2378,8 @@ def unplug_collapsed():
     ok(hotplug(A, n, plugged + 1536))
     grown = wait_for(lambda: (vms(A)[n]["requested_mib"], vms(A)[n]["plugged_mib"]) == (plugged + 1536,) * 2, 60)
     check("huge unplug: plugged 1.5 GiB more", grown, vms(A)[n])
-    # Data in the blocks the unplug will empty (the highest): what the guest wrote first sits low and is deleted.
-    code, out = sh(A, n, "dd if=/dev/urandom of=/tmp/h bs=1M count=550 2>/dev/null && dd if=/dev/urandom of=/tmp/g bs=1M count=400 "
-                         "2>/dev/null && rm /tmp/h && md5sum /tmp/g")
-    check("huge unplug: guest filled the new memory", code == 0, out)
+    code, out = sh(A, n, "dd if=/dev/urandom of=/tmp/g bs=1M count=500 2>/dev/null && md5sum /tmp/g")
+    check("huge unplug: guest wrote 500 MiB more", code == 0, out)
     g = out.split()[0] if code == 0 else None
     start_writer(A, n, mib=64)
     ok(migrate(A, n, B))
@@ -2376,36 +2388,46 @@ def unplug_collapsed():
     wait_for(lambda: (collapse_report(B, n) or {}).get("done"), 120)
     c = collapse_report(B, n)
     check("huge unplug: memory collapsed", c and c["collapsed"] >= 100, c)
-    # Free page reporting of what the deletion freed is done before the baseline, so what follows is the unplug's.
     rss0 = settle_rss(B, n)
-    # Free page reports are held (firecracker/0003) across the unplug: every chunk that empties meanwhile is in a block
-    # the unplug gave back.
+    # Host address of each hotplugged block (the hotplug region is the last guest memory region).
+    offset, _, host_base = control(B, n, {"op": "debug", "what": "status"})["result"]["host_regions"][-1]
+    hp_gpa, bs, online = guest_blocks(B, n)
+    chunks_of = lambda blk: {host_base + blk * bs - hp_gpa + i for i in range(0, bs, 2 << 20)}
+    # Growth is refused meanwhile (and eviction is off), so the controller never plugs back what the test takes away.
+    fault(B, "no_admit", 120000)
     sock = api_sock(B, n)
+    # Free page reports are held (firecracker/0003) across the unplug: every chunk that empties then is the unplug's.
     held = fc_api(sock, "PATCH", "/balloon/reporting/hold")
     try:
         check("huge unplug: free page reports held", held is None, held)
         huge0, empty0, _ = guest_chunks(B, n)
-        discards0 = control(B, n, {"op": "debug", "what": "status"})["result"]["discards"]
-        t = time.time()
-        ok(hotplug(B, n, plugged + 1024))
-        # The guest may not manage to empty every block; a shrink it cannot finish settles at what is plugged.
+        ranked = sorted(online, key=lambda blk: -len(chunks_of(blk) & huge0))
+        chosen = []
+        for blk in ranked[:6]:
+            if len(chunks_of(blk) & huge0) >= 16 and len(chosen) < 2:
+                code, out = sh(B, n, f"echo offline > /sys/devices/system/memory/memory{blk}/state")
+                if code == 0:
+                    chosen.append(blk)
+        target = {c for blk in chosen for c in chunks_of(blk)} & huge0
+        print(f"huge unplug: blocks of {bs >> 20} MiB at {hp_gpa:#x}; offlined {chosen}, holding {len(target) * 2} MiB of huge pages "
+              f"(of {len(huge0) * 2} MiB)")
+        check("huge unplug: offlined blocks that hold huge pages", chosen and len(target) * 2 >= 64, (chosen, ranked[:6]))
+        now = vms(B)[n]["plugged_mib"]
+        ok(hotplug(B, n, now - len(chosen) * (bs >> 20)))
         hp = lambda: (vms(B)[n]["requested_mib"], vms(B)[n]["plugged_mib"])
-        done = wait_for(lambda: hp()[0] == hp()[1] < plugged + 1536, 60)
-        took = time.time() - t
+        done = wait_for(lambda: hp() == (now - len(chosen) * (bs >> 20),) * 2, 60)
+        gone = all(sh(B, n, f"test -e /sys/devices/system/memory/memory{blk}")[0] != 0 for blk in chosen)
         st = control(B, n, {"op": "debug", "what": "status"})["result"]
         huge1, empty1, _ = guest_chunks(B, n)
     finally:
         released = fc_api(sock, "PATCH", "/balloon/reporting/release")
+        fault(B, "no_admit", 0)
     rss1 = settle_rss(B, n)
-    unplugged = empty1 - empty0
-    freed = huge0 & unplugged
-    print(f"huge unplug: plugged {plugged + 1536} -> {hp()[1]} MiB in {took:.1f} s (settled: {done}); {len(unplugged) * 2} MiB "
-          f"emptied by the unplug, {len(freed) * 2} MiB of it huge pages before ({len(huge0) * 2} MiB in all, {len(huge1) * 2} MiB "
-          f"left); RSS {rss0} -> {rss1} MiB, discards {discards0} -> {st['discards']}")
-    check("huge unplug: unplugged", done and st["discards"] > discards0 and not st["failed"] and released is None,
-          (plugged, hp(), st["failed"], released))
-    check("huge unplug: the unplugged blocks held huge pages, now emptied", unplugged and len(unplugged) * 2 <= plugged + 1536 - hp()[1]
-          and len(freed) * 2 >= 32, (len(unplugged), len(freed)))
+    print(f"huge unplug: plugged {now} -> {hp()[1]} MiB (settled: {done}, blocks gone: {gone}); {len(target - empty1) * 2} MiB of the "
+          f"targeted huge pages still mapped; {len(empty1 - empty0) * 2} MiB emptied in all; RSS {rss0} -> {rss1} MiB")
+    check("huge unplug: the offlined blocks were unplugged", done and gone and not st["failed"] and released is None,
+          (hp(), gone, st["failed"], released))
+    check("huge unplug: every huge page in them is gone", target and not target - empty1, (len(target), len(target - empty1)))
     check("huge unplug: data moved, not copied (RSS did not grow)", rss1 <= rss0 + 64, (rss0, rss1))
     errors, _, out = writer_check(B, n)
     check("huge unplug: guest memory intact", errors == 0 and md5(B, n) == m and sh(B, n, "md5sum /tmp/g")[1].split()[0] == g, out)
@@ -4908,7 +4930,7 @@ SCENARIOS = dict(
     checkpoint_restore=checkpoint_restore, checkpoint_fork=checkpoint_fork, checkpoint_corrupt=checkpoint_corrupt,
     checkpoint_crash=checkpoint_crash, pause_resume=pause_resume, signals=signals, pause_lost=pause_lost, suspend_resume=suspend_resume,
     suspend_gen=suspend_gen, checkpoint_hotplug=checkpoint_hotplug, checkpoint_untrusted_dir=checkpoint_untrusted_dir,
-    resume_failures=resume_failures, held_restore_frozen=held_restore_frozen, cow_exact=cow_exact, cow_collapsed=skippable(cow_collapsed), unplug_collapsed=skippable(unplug_collapsed), cow_abort=cow_abort,
+    resume_failures=resume_failures, held_restore_frozen=held_restore_frozen, cow_exact=cow_exact, cow_collapsed=skippable(cow_collapsed), unplug_collapsed=no_evict(skippable(unplug_collapsed)), cow_abort=cow_abort,
     cow_crash=cow_crash, cow_reports_held=cow_reports_held, ckpt_incremental=ckpt_incremental,
     ckpt_failed_stop=ckpt_failed_stop, ckpt_rearm=ckpt_rearm, ckpt_dir_moved=ckpt_dir_moved,
     prepare_disconnect=prepare_disconnect, prepare_trickle=prepare_trickle, prepare_fail=prepare_fail,

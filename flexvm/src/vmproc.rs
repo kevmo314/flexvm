@@ -865,6 +865,7 @@ impl Proc {
                 "state": vm.state().name(),
                 "background_pull_ms": vm.pager.pull_time().map(ms),
                 "collapse": vm.pager.collapse_report(),
+                "host_regions": vm.pager.host_regions(),
                 "remote_left": vm.pager.remote_left(),
                 "failed": vm.pager.failed(),
                 "checkpoint_copy_stats": vm.pager.copy_stats(),

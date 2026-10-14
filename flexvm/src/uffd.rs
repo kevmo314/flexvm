@@ -756,6 +756,11 @@ impl Pager {
         regions(self.mappings())
     }
 
+    /// Guest memory regions as `(offset, size, host address in Firecracker)` (for tests that inspect its mappings).
+    pub fn host_regions(&self) -> Vec<(u64, u64, u64)> {
+        self.mappings().iter().map(|m| (m.offset, m.size as u64, m.base_host_virt_addr)).collect()
+    }
+
     fn mappings(&self) -> &[Mapping] {
         self.mappings.get().map(|m| m.as_slice()).unwrap_or(&[])
     }

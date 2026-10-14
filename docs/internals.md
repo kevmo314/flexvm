@@ -219,9 +219,10 @@ write tracking is registered, or when the kernel has no huge page to give
   a missing fault, as before.
 - `scripts/faults.py cow_collapsed` checks checkpoints, deltas, a restore and free
   page reporting on collapsed memory with the guest rewriting it, and
-  `unplug_collapsed` checks that a virtio-mem unplug frees the huge pages in the
-  blocks it empties (measured after free page reporting settled, from
-  Firecracker's pagemap and kpageflags), and moves their data intact.
+  `unplug_collapsed` has the guest offline the hotplugged blocks holding the most
+  huge pages (virtio-mem unplugs offline blocks first) and checks, with free page
+  reports held and from Firecracker's pagemap and kpageflags, that every huge
+  page in them is gone after the unplug and the data moved intact.
 
 Pausing Firecracker stops only the vCPUs, so before the state-only snapshot the
 source also brings the VM's tap down (no RX into guest memory), closes host
