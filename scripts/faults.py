@@ -622,8 +622,9 @@ def target_killed():
     r = migrate(A, n, B)
     # Killed at once, from its lock and work directory alone (no `ls`): the
     # pull must still be under way.
-    pid = json.load(open(os.path.join(B.run, "vms", f"{n}.lock")))["pid"]
-    work = os.path.join(B.run, "w", str(pid))
+    holder = json.load(open(os.path.join(B.run, "vms", f"{n}.lock")))
+    pid = holder["pid"]
+    work = os.path.join(B.run, "w", f"{pid}-{holder['start']}")
     fcs = [json.load(open(os.path.join(work, d, "fc")))["pid"] for d in os.listdir(work) if os.path.exists(os.path.join(work, d, "fc"))]
     os.kill(pid, signal.SIGKILL)
     stall.join()
@@ -3507,10 +3508,11 @@ def incoming_killed():
     pid = None
     lock = os.path.join(B.run, "vms", f"{n}.lock")
     wait_for(lambda: os.path.exists(lock) and open(lock).read().strip(), 20)
-    pid = json.load(open(lock))["pid"]
+    holder = json.load(open(lock))
+    pid, work = holder["pid"], os.path.join(B.run, "w", f"{holder['pid']}-{holder['start']}")
     time.sleep(1)
     fcs = [json.load(open(os.path.join(d, "fc")))["pid"] for d in
-           [os.path.join(B.run, "w", str(pid), e) for e in os.listdir(os.path.join(B.run, "w", str(pid)))] if os.path.exists(os.path.join(d, "fc"))]
+           [os.path.join(work, e) for e in os.listdir(work)] if os.path.exists(os.path.join(d, "fc"))]
     os.kill(pid, signal.SIGKILL)
     t.join()
     fault(B, "incoming_stall", 0)

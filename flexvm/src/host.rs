@@ -1113,6 +1113,12 @@ impl Ident {
     }
 
     /// Alive, gone on proof, or unknown (an unreadable `/proc`, say: never proof).
+    /// Its work directory (`RUN/w/PID-START`): the instance's own, never another process's
+    /// that got its pid, so removing it once this one is reaped removes nothing alive.
+    pub fn work_dir(&self, run: &Path) -> PathBuf {
+        run.join("w").join(format!("{}-{}", self.pid, self.start))
+    }
+
     pub fn liveness(&self) -> Liveness {
         liveness_by(self, boot_id(), |pid| std::fs::read_to_string(format!("/proc/{pid}/stat")))
     }
@@ -1179,7 +1185,7 @@ pub fn reap(run: &Path, owner: &Ident) -> Result<()> {
         Liveness::Alive => bail!("process {} is alive", owner.pid),
         Liveness::Unknown => bail!("cannot tell whether process {} is gone", owner.pid),
     }
-    let dir = run.join("w").join(owner.pid.to_string());
+    let dir = owner.work_dir(run);
     if owner.boot != boot_id() || load::<Ident>(&dir.join("owner"))?.as_ref() != Some(owner) {
         return Ok(());
     }
@@ -1293,14 +1299,17 @@ fn collect_owned(run: &Path) {
         if path.extension().is_none_or(|x| x != "lock") {
             continue;
         }
-        let Ok(_held) = lock_path(&path, libc::LOCK_EX | libc::LOCK_NB) else { continue };
-        let free = match lock_holder(&path) {
-            Ok(None) => true,
-            Ok(Some(o)) => reap(run, &o).is_ok(),
-            // Unreadable: kept, never taken for an empty lock.
-            Err(_) => false,
+        // Reaped first, without the lock: a start may take the name meanwhile (`take_name`
+        // waits only briefly for a sweep), and then the holder read again under it differs.
+        let reaped = match lock_holder(&path) {
+            Ok(Some(o)) if o.liveness() == Liveness::Gone && reap(run, &o).is_ok() => Some(Some(o)),
+            Ok(None) => Some(None),
+            // Alive, unknown, or unreadable: kept, never taken for an empty lock.
+            _ => None,
         };
-        if free {
+        let Some(reaped) = reaped else { continue };
+        let Ok(_held) = lock_path(&path, libc::LOCK_EX | libc::LOCK_NB) else { continue };
+        if lock_holder(&path).is_ok_and(|now| now == reaped) {
             for ext in ["json", "sock", "lock"] {
                 let _ = std::fs::remove_file(path.with_extension(ext));
             }
@@ -1353,6 +1362,13 @@ fn liveness_by(id: &Ident, boot: &str, stat: impl Fn(u32) -> std::io::Result<Str
     if id.boot != boot {
         return Liveness::Gone;
     }
+    // Opened while it was exiting, read once it was gone: the task the read was for no longer
+    // exists, so neither does `id` (a new process with its pid would be another one). For a
+    // bare pid (`pid_gone`) it proves nothing: the pid may already be someone else's.
+    let stat = |pid| match stat(pid) {
+        Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        r => r,
+    };
     match pid_liveness_by(id.pid, stat) {
         (Liveness::Alive, Some(start)) if start != id.start => Liveness::Gone,
         (l, _) => l,
@@ -1363,9 +1379,6 @@ fn liveness_by(id: &Ident, boot: &str, stat: impl Fn(u32) -> std::io::Result<Str
 fn pid_liveness_by(pid: u32, stat: impl Fn(u32) -> std::io::Result<String>) -> (Liveness, Option<u64>) {
     match stat(pid) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Liveness::Gone, None),
-        // Opened while it was exiting, read once it was gone: /proc says its task no longer
-        // exists (a new process with its pid would be another one anyway).
-        Err(e) if e.raw_os_error() == Some(libc::ESRCH) => (Liveness::Gone, None),
         Err(_) => (Liveness::Unknown, None),
         Ok(text) => match parse_stat(&text) {
             None => (Liveness::Unknown, None),
@@ -1479,7 +1492,7 @@ mod tests {
 
     fn dead_owner(h: &Host, pid: u32, fcs: &[&Ident]) -> Ident {
         let dead = Ident { pid, start: 1, boot: boot_id().into() };
-        let dir = h.run.join("w").join(pid.to_string());
+        let dir = dead.work_dir(&h.run);
         for (i, fc) in fcs.iter().enumerate() {
             std::fs::create_dir_all(dir.join(i.to_string())).unwrap();
             store(&dir.join(i.to_string()).join("fc"), fc, false).unwrap();
@@ -1684,13 +1697,13 @@ mod tests {
         let h = host("unreadable");
         // A dead owner whose work directory's owner record cannot be read: not reaped.
         let dead = dead_owner(&h, 999_999_921, &[]);
-        let owner = h.run.join("w").join("999999921").join("owner");
+        let owner = dead.work_dir(&h.run).join("owner");
         std::fs::remove_file(&owner).unwrap();
         std::fs::create_dir(&owner).unwrap();
         assert!(reap(&h.run, &dead).is_err());
         // Nor one with an unreadable Firecracker record.
         let dead = dead_owner(&h, 999_999_922, &[]);
-        std::fs::create_dir_all(h.run.join("w/999999922/0/fc")).unwrap();
+        std::fs::create_dir_all(dead.work_dir(&h.run).join("0/fc")).unwrap();
         assert!(reap(&h.run, &dead).is_err());
         // A name whose lock cannot be read is not free, and its address stays held.
         std::fs::write(h.vms("u", "lock"), "{").unwrap();
@@ -1926,7 +1939,7 @@ mod tests {
         assert_eq!(pid_liveness_by(1, emfile).0, Liveness::Unknown, "a tap or cgroup of an unreadable pid is kept");
         // /proc/PID/stat of a process that finished exiting between open and read.
         let esrch = |_| Err(std::io::Error::from_raw_os_error(libc::ESRCH));
-        assert_eq!(pid_liveness_by(1, esrch).0, Liveness::Gone);
+        assert_eq!(pid_liveness_by(1, esrch).0, Liveness::Unknown, "a bare pid may be another process's by now");
         assert_eq!(liveness_by(&me, boot_id(), esrch), Liveness::Gone);
         // A dead owner's goes, as asking would make it go.
         store(&h.mig_path(9), &Mig::Committed { owner: dead_owner(&h, 999_999_909, &[]) }, false).unwrap();
