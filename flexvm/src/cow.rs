@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use crate::checkpoint::GuestPages;
-use crate::uffd::{Runs, REMOTE};
+use crate::uffd::{zeroed_atomics, Runs, REMOTE};
 use crate::util::{Result, PAGE_SIZE};
 
 pub const CLEAN: u8 = 0;
@@ -59,8 +59,8 @@ pub struct Stats {
     pub rescued_pages: AtomicU64,
     pub rescue_ns: AtomicU64,
     pub rescue_max_ns: AtomicU64,
-    /// Faults that waited for a writer (over budget, or the page was being read).
-    pub deferred: AtomicU64,
+    /// Retries waiting for a writer (over budget, or the page was being read).
+    pub retries: AtomicU64,
     /// Discards held back until the copy was done, and for how long in all.
     pub drains: AtomicU64,
     pub drain_ns: AtomicU64,
@@ -92,7 +92,7 @@ impl Cow {
     /// Copy-on-write for the REMOTE pages of `runs`, in a guest of `total` pages.
     pub fn new(total: usize, runs: &Runs) -> Cow {
         // CLEAN is 0: a zeroed allocation is lazily backed by the kernel.
-        let states = unsafe { std::mem::transmute::<Vec<u8>, Vec<AtomicU8>>(vec![0u8; total]) };
+        let states: Vec<AtomicU8> = zeroed_atomics(total);
         let runs: Vec<(usize, usize)> = runs.iter().filter(|r| r.2 == REMOTE).map(|r| (r.0 as usize, (r.0 + r.1) as usize)).collect();
         runs.iter().flat_map(|&(a, b)| &states[a..b]).for_each(|s| s.store(PENDING, Ordering::Relaxed));
         let budget = std::env::var("FLEXVM_COW_BUDGET_MIB").ok().and_then(|v| v.parse().ok()).unwrap_or(BUDGET_MIB) << 20;
@@ -173,7 +173,7 @@ impl Cow {
 
     /// A fault waits on `page`: writers take its unit next.
     pub fn want(&self, page: usize) {
-        self.stats.deferred.fetch_add(1, Ordering::Relaxed);
+        self.stats.retries.fetch_add(1, Ordering::Relaxed);
         let mut wanted = self.wanted.lock().unwrap();
         if !wanted.contains(&page) {
             wanted.push_back(page);
@@ -250,7 +250,7 @@ impl Cow {
             "rescued_mib": (get(&s.rescued_pages) * PAGE_SIZE as u64) as f64 / (1 << 20) as f64,
             "rescue_avg_us": if rescues > 0 { get(&s.rescue_ns) as f64 / rescues as f64 / 1e3 } else { 0.0 },
             "rescue_max_us": get(&s.rescue_max_ns) as f64 / 1e3,
-            "deferred": get(&s.deferred),
+            "retries": get(&s.retries),
             "discards_held": get(&s.drains),
             "discards_held_ms": get(&s.drain_ns) as f64 / 1e6,
             "saved_while_held_mib": (get(&s.held_pages) * PAGE_SIZE as u64) >> 20,
