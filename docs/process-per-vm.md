@@ -52,15 +52,16 @@ CMD in the guest, streams its output, and the process exits with CMD's status
 
 | signal | effect |
 |---|---|
-| SIGTERM | suspend: checkpoint to `STATE/suspended/NAME`, free everything, exit 0. `flexvm resume NAME` restores it in a new process |
+| SIGTERM | suspend: checkpoint to `STATE/suspended/NAME`, free everything, exit 143. `flexvm resume NAME` restores it in a new process |
 | SIGTSTP | pause the vCPUs (the process keeps running and serving pages; Ctrl-Z works) |
 | SIGCONT | resume the vCPUs of a VM paused by SIGTSTP (ignored otherwise: the kernel sends it after any SIGSTOP, systemd after SIGTERM) |
-| SIGINT | destroy the VM, withdraw its address, exit 0 (Ctrl-C works) |
+| SIGINT | destroy the VM, withdraw its address, exit 130 (Ctrl-C works) |
+| SIGQUIT | ignored (Ctrl-\ leaves the VM running) |
 | SIGSTOP | cannot be caught: freezes the pager, so the guest stalls. Unsupported |
 
-They (and SIGHUP, ignored: a closed terminal leaves the VM running) are
-blocked in every thread and taken by one thread with `sigwait`, so SIGTSTP
-never stops the process. Every operation on the VM (starting it, signal,
+SIGTERM, SIGTSTP, SIGCONT, SIGINT and SIGHUP (a closed terminal leaves the VM
+running) are blocked in every thread and taken by one thread with `sigwait`,
+so SIGTSTP never stops the process. SIGQUIT is ignored before threads start. Every operation on the VM (starting it, signal,
 control request, controller resize, clock step, deleting a consumed
 checkpoint) holds the VM's operation mutex. Requests give up after 30 s;
 what must not be refused (SIGINT, SIGTERM, a dead VM, the end of a
@@ -255,7 +256,7 @@ to receive.
 `flexvm standby [--template T] N` records N in `STATE/standby/T` and starts
 standby VMs until there are N: each is `flexvm run --standby`, a VM process
 that restores the template, lets the guest reseed and settle, pauses, and
-listens on `RUN/standby/KEY/PID.sock`. `flexvm run` claims one (`claim
+listens on `RUN/standby/TEMPLATE/KEY.PID.sock`. `flexvm run` claims one (`claim
 {name, ip, cmd}` with its stdout/stderr passed over SCM_RIGHTS): the standby
 takes the name and address, routes, resumes, sends `START`, and becomes that
 VM. A claimed standby starts its replacement, and every 5 s the listener and
@@ -348,7 +349,7 @@ hidden `flexvm debug`.
 ### Exec across hosts
 
 There is no remote control channel any more. An exec whose VM migrates away
-ends with `vm NAME moved to HOST (session ID keeps running there)`, exit 255;
+ends with `vm NAME moved to HOST (session ID keeps running there)`, exit 1;
 reconnection within a host (checkpoint pauses, vsock resets) still works.
 
 ## Invariants

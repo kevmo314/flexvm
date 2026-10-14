@@ -1276,7 +1276,15 @@ pub fn tell_peers(host: &Host, req: Value) {
 }
 
 pub fn connect(host: &Host, name: &str, req: &Value, fds: &[i32]) -> Result<UnixStream> {
-    let c = UnixStream::connect(host.sock(name)).map_err(|_| format!("no vm named {name:?}"))?;
+    let c = UnixStream::connect(host.sock(name)).map_err(|e| {
+        if host.alive(name) {
+            format!("vm {name:?} is starting or its control socket is unavailable; retry once it is ready, or see {}: {e}", host.vms(name, "log").display())
+        } else if host.is_suspended(name) {
+            format!("vm {name:?} is suspended; use flexvm resume {name} first")
+        } else {
+            format!("no vm named {name:?}: {e}")
+        }
+    })?;
     let mut line = serde_json::to_vec(req)?;
     line.push(b'\n');
     crate::util::send_with_fds(&c, &line, fds)?;

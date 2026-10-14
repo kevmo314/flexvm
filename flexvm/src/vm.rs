@@ -308,8 +308,10 @@ impl Vm {
     }
 
     fn running_here(&self) -> Result<()> {
-        if self.state() != State::Running {
-            bail!("vm {} is not running here", self.name);
+        match self.state() {
+            State::Running => {}
+            State::Paused => bail!("vm {} is paused; resume it with flexvm resume {}", self.name, self.name),
+            _ => bail!("vm {} is not running here", self.name),
         }
         Ok(())
     }

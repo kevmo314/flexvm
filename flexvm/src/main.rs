@@ -38,7 +38,7 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
 
   flexvm run NAME [--template T] [--ip IP] [-d] [-- CMD...]
                                      start a VM; the process is the VM (-d: in the background)
-  flexvm ls                          list VMs (with their pids)
+  flexvm ls [--json]                 list VMs (with their pids)
   flexvm exec NAME CMD...            run a shell command in a VM
   kill -TSTP PID / kill -CONT PID    pause / resume a VM (Ctrl-Z works in the foreground)
   kill PID                           suspend a VM to disk (SIGTERM); its memory is freed
@@ -61,36 +61,63 @@ options: --state DIR (FLEXVM_STATE, /var/lib/flexvm), --run DIR (FLEXVM_RUN, /ru
          --artifacts DIR (FLEXVM_ARTIFACTS, ./artifacts), --templates DIR, --image-cache DIR
 ";
 
-const SWITCHES: &[&str] = &["warm", "stop", "paused", "incremental", "standby", "incoming", "json"];
+const SWITCHES: &[&str] = &["warm", "stop", "paused", "incremental", "standby", "incoming", "json", "detach"];
+
+const VALUE_FLAGS: &[&str] = &[
+    "state", "run", "artifacts", "templates", "image-cache", "template", "ip", "name",
+    "peer", "vm-ips", "underlay", "announce-dev", "dns", "reserve", "prefix",
+    "vcpus", "mem", "max", "plug", "image", "init", "entrypoint", "cmd", "env",
+    "workdir", "user", "ready-port", "ready-cmd", "ready-timeout", "image-staging",
+    "max-download-mib", "max-unpacked-mib", "max-file-mib", "max-entries",
+    "to", "to-state", "to-run", "timeout", "lifecycle", "iterations", "warmup",
+    "dirty-mib", "settle-ms", "ready-http",
+];
 
 /// `--flag value`s: last wins. `rest` follows `--` (or `exec NAME`).
 pub struct Args {
     positional: Vec<String>,
     flags: Vec<(String, String)>,
     rest: Vec<String>,
+    child_args: Vec<String>,
 }
 
 impl Args {
-    fn parse() -> Args {
-        let mut a = Args { positional: Vec::new(), flags: Vec::new(), rest: Vec::new() };
-        let mut it = std::env::args().skip(1);
+    fn parse(it: impl IntoIterator<Item = String>) -> Result<Args> {
+        let mut a = Args { positional: Vec::new(), flags: Vec::new(), rest: Vec::new(), child_args: Vec::new() };
+        let mut it = it.into_iter();
         while let Some(arg) = it.next() {
+            if arg != "-d" && arg != "--detach" {
+                a.child_args.push(arg.clone());
+            }
             match arg.strip_prefix("--") {
-                Some("") => a.rest.extend(it.by_ref()),
+                Some("") => {
+                    a.rest.extend(it.by_ref());
+                    a.child_args.extend(a.rest.iter().cloned());
+                }
                 Some(f) => {
-                    let value = if SWITCHES.contains(&f) { "1".into() } else { it.next().unwrap_or_default() };
+                    let value = if SWITCHES.contains(&f) {
+                        "1".into()
+                    } else if VALUE_FLAGS.contains(&f) {
+                        let value = it.next().ok_or_else(|| format!("--{f} needs a value"))?;
+                        a.child_args.push(value.clone());
+                        value
+                    } else {
+                        bail!("unknown option --{f}");
+                    };
                     a.flags.push((f.into(), value));
                 }
                 None if arg == "-d" => a.flags.push(("detach".into(), "1".into())),
+                None if arg.starts_with('-') => bail!("unknown option {arg}"),
                 None => {
                     a.positional.push(arg);
                     if a.positional.len() == 2 && a.positional[0] == "exec" {
                         a.rest.extend(it.by_ref());
+                        a.child_args.extend(a.rest.iter().cloned());
                     }
                 }
             }
         }
-        a
+        Ok(a)
     }
 
     pub fn has(&self, name: &str) -> bool {
@@ -141,7 +168,11 @@ fn paths(args: &Args) -> Result<Paths> {
 }
 
 fn real_main() -> Result<()> {
-    let args = Args::parse();
+    // Ignore Ctrl-\ before starting threads or VM children.
+    if unsafe { libc::signal(libc::SIGQUIT, libc::SIG_IGN) } == libc::SIG_ERR {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let args = Args::parse(std::env::args().skip(1))?;
     let _ = paths(&args);
     let pos: Vec<&str> = args.positional.iter().map(|s| s.as_str()).collect();
     let (name, arg2) = (pos.get(1).copied().unwrap_or(""), pos.get(2).copied());
@@ -161,7 +192,10 @@ fn real_main() -> Result<()> {
         Some("resume") => start(&args, name, Start::Resume { name: name.into() }),
         Some("restore") => {
             let dir = std::path::absolute(pos.get(1).ok_or("restore needs DIR")?)?;
-            let label = args.get("name").map_or(format!("restore-{}", std::process::id()), String::from);
+            let label = match args.get("name") {
+                Some(name) => name.to_string(),
+                None => checkpoint::Checkpoint::open(&dir)?.manifest.name,
+            };
             start(&args, &label, Start::Restore { dir, name: args.get("name").map(String::from), ip: args.get("ip").map(String::from), paused: args.has("paused") })
         }
         Some("ls") => list(&open_host(&args)?, args.has("json")),
@@ -255,14 +289,14 @@ fn run(args: &Args, name: &str, template: &str) -> Result<()> {
             let id = host::Ident { pid: v["pid"].as_u64().unwrap_or(0) as u32, start: v["start"].as_u64().unwrap_or(0), boot: host::boot_id().into() };
             follow(conn, id)
         }
-        None if log.is_some() => spawn_detached(&host, name),
+        None if log.is_some() => spawn_detached(&host, name, args),
         None => vmproc::main(host, paths, Start::Run { name: name.into(), template: template.into(), ip, cmd }, notify_fd()),
     }
 }
 
 fn start(args: &Args, name: &str, s: Start) -> Result<()> {
     if args.has("detach") {
-        return spawn_detached(&open_host(args)?, name);
+        return spawn_detached(&open_host(args)?, name, args);
     }
     vmproc::main(open_host(args)?, paths(args)?, s, notify_fd())
 }
@@ -272,10 +306,9 @@ fn log_file(host: &Host, name: &str) -> Result<std::fs::File> {
     Ok(std::fs::OpenOptions::new().create(true).append(true).open(host.vms(name, "log"))?)
 }
 
-fn spawn_detached(host: &Host, name: &str) -> Result<()> {
-    let argv: Vec<String> = std::env::args().skip(1).filter(|a| a != "-d").collect();
+fn spawn_detached(host: &Host, name: &str, args: &Args) -> Result<()> {
     let (r, w) = std::os::unix::net::UnixStream::pair()?;
-    util::spawn_self(&argv, &log_file(host, name)?, w.as_raw_fd(), &[("FLEXVM_NOTIFY_FD", "3")])?;
+    util::spawn_self(&args.child_args, &log_file(host, name)?, w.as_raw_fd(), &[("FLEXVM_NOTIFY_FD", "3")])?;
     drop(w);
     let reply = recv_json(&mut BufReader::new(r))?.ok_or_else(|| format!("the vm process failed to start (see {})", host.vms(name, "log").display()))?;
     if reply["ok"] != json!(true) {
@@ -330,6 +363,9 @@ fn kill(host: &Host, name: &str) -> Result<()> {
     }
     if !host.alive(name) && std::fs::remove_file(host.vms(name, "failed")).is_ok() {
         return Ok(());
+    }
+    if host.alive(name) {
+        return Err(format!("vm {name:?} is starting or its registry is unavailable; retry flexvm kill {name} once it is ready, or see {}", host.vms(name, "log").display()).into());
     }
     Err(format!("no vm named {name:?}").into())
 }
@@ -452,6 +488,9 @@ pub fn exec(host: &Host, name: &str, cmd: &str) -> Result<i32> {
             }
             Ok(Ok(StreamEnd::Disconnected(why))) => error = why,
             Err(e) => {
+                if e.to_string() == format!("vm {name} is paused; resume it with flexvm resume {name}") {
+                    return Err(e);
+                }
                 if !host.alive(name) {
                     if let Ok(to) = std::fs::read_to_string(host.vms(name, "moved")) {
                         return Err(format!("vm {name} moved to {to}; the command keeps running there (session {id})").into());
@@ -510,6 +549,53 @@ fn exec_frames(r: &mut impl Read, id: &str, started: &mut bool, offset: &mut u64
 mod exec_tests {
     use super::*;
 
+    fn parse(args: &[&str]) -> Args {
+        Args::parse(args.iter().map(|a| a.to_string())).unwrap()
+    }
+
+    #[test]
+    fn detach_only_removes_flexvm_options_from_child_arguments() {
+        let args = parse(&["run", "web", "-d", "--detach", "--cmd", "-d", "--", "tool", "-d", "--detach", "--unknown"]);
+        assert!(args.has("detach"));
+        assert_eq!(args.get("cmd"), Some("-d"));
+        assert_eq!(args.rest, ["tool", "-d", "--detach", "--unknown"]);
+        assert_eq!(args.child_args, ["run", "web", "--cmd", "-d", "--", "tool", "-d", "--detach", "--unknown"]);
+        let child = Args::parse(args.child_args).unwrap();
+        assert!(!child.has("detach"));
+        assert_eq!(child.rest, args.rest);
+    }
+
+    #[test]
+    fn exec_preserves_guest_flags_without_a_separator() {
+        let args = parse(&["--state", "/tmp/state", "exec", "web", "tool", "-d", "--detach", "--unknown"]);
+        assert_eq!(args.get("state"), Some("/tmp/state"));
+        assert!(!args.has("detach"));
+        assert_eq!(args.positional, ["exec", "web"]);
+        assert_eq!(args.rest, ["tool", "-d", "--detach", "--unknown"]);
+        assert_eq!(args.child_args, ["--state", "/tmp/state", "exec", "web", "tool", "-d", "--detach", "--unknown"]);
+    }
+
+    #[test]
+    fn unknown_options_and_missing_values_are_errors() {
+        for option in ["--typo", "-x", "--detach=yes", "--keep-running"] {
+            let error = Args::parse(["run", option, "web"].map(String::from)).err().unwrap();
+            assert_eq!(error.to_string(), format!("unknown option {option}"));
+        }
+        let error = Args::parse(["run", "web", "--ip"].map(String::from)).err().unwrap();
+        assert_eq!(error.to_string(), "--ip needs a value");
+    }
+
+    #[test]
+    fn switches_repeated_values_and_internal_flags_parse() {
+        let args = parse(&["listen", "--peer", "a:1", "--json", "--peer", "b:2", "--reserve", "123", "--reserve", "456"]);
+        assert!(args.has("json"));
+        assert_eq!(args.all("peer"), ["a:1", "b:2"]);
+        assert_eq!(args.num("reserve", 0).unwrap(), 456);
+        let args = parse(&["run", "--incoming", "--standby", "--paused"]);
+        assert!(args.has("incoming") && args.has("standby") && args.has("paused"));
+        assert!(args.rest.is_empty());
+    }
+
     #[test]
     fn listener_configuration_is_published_only_after_binding_and_validation() {
         use std::net::TcpListener;
@@ -520,7 +606,7 @@ mod exec_tests {
         let before = std::fs::read(host.state.join("host.json")).unwrap();
         let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = occupied.local_addr().unwrap().to_string();
-        let args = Args { positional: vec![], flags: vec![("reserve".into(), "456".into())], rest: vec![] };
+        let args = parse(&["--reserve", "456"]);
         assert!(configure_listener(&mut host, &args, Some(&addr), None).is_err());
         assert_eq!(std::fs::read(host.state.join("host.json")).unwrap(), before);
         assert_eq!(host.cfg.reserve_mib, 321);

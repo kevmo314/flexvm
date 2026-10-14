@@ -235,7 +235,7 @@ impl Proc {
             unmark_durably(&dir, QUARANTINE)?;
         }
         let gen = read_gen(&dir).ok_or_else(|| {
-            format!("vm {name} is quarantined: its address generation was never recorded, so it cannot be resumed with its address; restore its checkpoint with --ip auto")
+            format!("vm {name} is quarantined: its address generation was never recorded, so it cannot be resumed with its address; restore {dir:?} with --name NEW --ip auto (choose an unused name), or flexvm kill {name} to discard it")
         })?;
         let ck = Checkpoint::open(&dir)?;
         t.mark("verify_checkpoint");
@@ -243,7 +243,7 @@ impl Proc {
         let claim = {
             let l = self.host.lock()?;
             if !self.host.current(&l, ip, gen)? {
-                bail!("vm {name}: {ip} generation {gen} was withdrawn or given out again meanwhile; restore its checkpoint with --ip auto");
+                bail!("vm {name}: {ip} generation {gen} was withdrawn or given out again meanwhile; restore {dir:?} with --name NEW --ip auto (choose an unused name), or flexvm kill {name} to discard it");
             }
             self.host.claim_incoming(&l, name, ip, gen)?
         };
@@ -406,7 +406,7 @@ impl Proc {
             false => None,
             true => {
                 let Some((dir, id)) = vm.last_checkpoint.lock().unwrap().clone().filter(|_| vm.pager.tracking()) else {
-                    bail!("vm {} has no checkpoint to build on: take a full one with --keep-running first (an incremental checkpoint builds on the last one taken of the vm on this host, since it was last restored or migrated, that the vm ran on after)", vm.name)
+                    bail!("vm {} has no checkpoint to build on: take a full one with flexvm checkpoint NAME DIR first (without --stop) (an incremental checkpoint builds on the last one taken of the vm on this host, since it was last restored or migrated, that the vm ran on after)", vm.name)
                 };
                 let ck = Checkpoint::open(&dir).map_err(|e| last(&e))?;
                 if ck.id != id {
