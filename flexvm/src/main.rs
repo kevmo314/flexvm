@@ -366,20 +366,29 @@ fn run(args: &Args, name: &str, template: &str) -> Result<()> {
     let ip: Option<std::net::Ipv4Addr> = args.get("ip").map(|s| s.parse()).transpose().map_err(|_| "bad --ip")?;
     let cmd = (!args.rest.is_empty()).then(|| args.rest.join(" "));
     host::check_name(name)?;
+    if args.has("detach") {
+        return spawn_detached(&host, name, args);
+    }
     let req = json!({"op": "claim", "name": name, "ip": ip.map(|i| i.to_string()), "cmd": cmd});
-    // A claimed standby VM writes where this process would.
-    let log = args.has("detach").then(|| log_file(&host, name)).transpose()?;
-    let fds = log.as_ref().map_or([1, 2], |f| [f.as_raw_fd(); 2]);
-    // A detached run's VM process (it answers on FLEXVM_NOTIFY_FD): its parent tried them.
+    // A detached run's VM process answers on FLEXVM_NOTIFY_FD, without trying standbys.
     let tried = std::env::var_os("FLEXVM_NOTIFY_FD").is_some();
-    match if tried { None } else { standby::take(&host, &paths, template, &req, &fds)? } {
-        Some((v, _)) if log.is_some() => print(v),
+    let taken = if tried {
+        None
+    } else {
+        // Reopen /dev/tty here, while we still have the controlling terminal.
+        let outputs = [1, 2].map(|fd| {
+            util::eintr(|| unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) }).map(|fd| util::output::own(unsafe { std::fs::File::from_raw_fd(fd) }))
+        });
+        let [out, err] = outputs;
+        let (out, err) = (out?, err?);
+        standby::take(&host, &paths, template, &req, &[out.as_raw_fd(), err.as_raw_fd()])?
+    };
+    match taken {
         Some((v, conn)) => {
             eprintln!("{v}");
             let id = host::Ident { pid: v["pid"].as_u64().unwrap_or(0) as u32, start: v["start"].as_u64().unwrap_or(0), boot: host::boot_id().into() };
             follow(conn, id)
         }
-        None if log.is_some() => spawn_detached(&host, name, args),
         None => vmproc::main(host, paths, Start::Run { name: name.into(), template: template.into(), ip, cmd }, notify_fd()),
     }
 }

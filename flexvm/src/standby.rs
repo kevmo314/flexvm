@@ -333,6 +333,7 @@ fn claim(p: &Arc<Proc>, req: &Value) -> std::result::Result<Value, (Error, bool)
 /// `run`'s side. Once a standby said `claiming` it may have started the VM:
 /// no answer (by `CLAIM_TIMEOUT`) is then an error, never a reason to start it again.
 pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]) -> Result<Option<(Value, BufReader<UnixStream>)>> {
+    let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     let Ok(key) = key(paths, template) else { return Ok(None) };
     let mut socks: Vec<PathBuf> = std::fs::read_dir(dir(host, template))
         .into_iter()
@@ -346,7 +347,10 @@ pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]
     line.push(b'\n');
     let name = req["name"].as_str().unwrap_or("");
     for sock in socks {
-        let at = Instant::now() + HANDSHAKE_TIMEOUT;
+        if Instant::now() >= deadline {
+            break;
+        }
+        let at = (Instant::now() + HANDSHAKE_TIMEOUT).min(deadline);
         let c = match crate::util::send_unix(&sock, &line, fds, at) {
             Ok(c) => c,
             // Refused: stale. (A full backlog is a stopped standby's.)
@@ -463,6 +467,29 @@ fn wait_for_reseed(vsock: &std::path::Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stopped_standbys_share_one_handshake_budget() {
+        let root = std::env::temp_dir().join(format!("flexvm-standby-budget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        std::fs::create_dir_all(root.join("templates/default")).unwrap();
+        let paths = Paths::new(&root, None).unwrap();
+        let d = dir(&host, "default");
+        std::fs::create_dir_all(&d).unwrap();
+        let sockets: Vec<_> = (0..3).map(|n| UnixListener::bind(d.join(format!("default.{n}.sock"))).unwrap()).collect();
+        let start = Instant::now();
+        assert!(take(&host, &paths, "default", &json!({"name": "test"}), &[]).unwrap().is_none());
+        assert!(start.elapsed() < HANDSHAKE_TIMEOUT + Duration::from_secs(2), "{:?}", start.elapsed());
+        // The first late claim is refused; the other sockets were never tried.
+        let (mut first, _) = sockets[0].accept().unwrap();
+        assert!(send_json(&mut first, &json!({"claiming": true})).is_err());
+        for s in &sockets[1..] {
+            s.set_nonblocking(true).unwrap();
+            assert_eq!(s.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn recovery_finds_persistent_targets_and_respects_refill_lock_and_reserve() {
