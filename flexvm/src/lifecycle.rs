@@ -442,12 +442,13 @@ impl Proc {
         thread::spawn(move || {
             let pulled = vm.pager.wait_pulled(None);
             eprintln!("vm {}: {to_load} MiB paged in from {} (complete: {pulled}, {:?} ms)", vm.name, dir.display(), vm.pager.pull_time().map(ms));
-            // Under the op lock: a suspend may be about to write here.
             if let Some(p) = p {
-                let _op = p.op();
+                // Not under `op`: the memory is in, whatever operation runs.
                 if pulled && p.pulled_all() {
                     p.release_hold();
                 }
+                // Under the op lock: a suspend may be about to write here.
+                let _op = p.op();
                 if let Some(dir) = p.consumed.lock().unwrap().take() {
                     delete_consumed(&vm.name, &dir);
                 }
