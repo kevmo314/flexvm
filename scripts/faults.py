@@ -974,12 +974,20 @@ def same_host_slow_route():
     udp_across_migrations("same host slow route", "ft-slow-route", "release_stall")
 
 
-def udp_across_migrations(label, n, target_fault=None):
-    """A 1 kHz UDP sequence stream to `n` across migrations A to B, back and
-    to B again, `target_fault` armed on each target, arrives whole and in
-    order. The guest's socket buffer is made large enough for any burst of
-    held packets, so a datagram missing was lost by flexvm (the guest's own
-    drops are shown)."""
+def same_host_flood():
+    """#136: traffic that keeps arriving while the target lets go of its hold
+    (10k datagrams/s, its route change made slow by `release_stall`) never
+    holds the release up: it ends within a bound, and nothing is lost but
+    what flexvm or the guest says it dropped."""
+    udp_across_migrations("same host flood", "ft-flood", "release_stall", burst=10)
+
+
+def udp_across_migrations(label, n, target_fault=None, burst=1):
+    """A UDP sequence stream to `n` (`burst` datagrams every millisecond)
+    across migrations A to B, back and to B again, `target_fault` armed on
+    each target, arrives whole and, at 1 kHz, in order. The guest's socket
+    buffer is made large enough for any burst of held packets, so a datagram
+    missing was lost by flexvm (the guest's own drops are shown)."""
     for h in (A, B):
         clear_log(h, n)
     ok(run(A, n))
@@ -993,8 +1001,9 @@ def udp_across_migrations(label, n, target_fault=None):
     def stream():
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         while not stop.is_set():
-            s.sendto(b"%08d\n" % sent[0], (ip, 9000))
-            sent[0] += 1
+            for _ in range(burst):
+                s.sendto(b"%08d\n" % sent[0], (ip, 9000))
+                sent[0] += 1
             time.sleep(0.001)
 
     t = threading.Thread(target=stream, daemon=True)
@@ -1025,14 +1034,22 @@ def udp_across_migrations(label, n, target_fault=None):
                                   [m for i, m in enumerate(missing) if i + 1 == len(missing) or missing[i + 1] != m + 1])]
     udp = sh(B, n, "grep Udp: /proc/net/snmp; pidof socat >/dev/null && echo receiving")[1].splitlines()
     guest = {k: v for k, v in zip(udp[0].split()[1:], udp[1].split()[1:]) if k in ("InDatagrams", "NoPorts", "RcvbufErrors")} if len(udp) >= 2 else udp
-    check(f"{label}: no udp datagram lost", not missing,
-          f"sent {sent[0]}, migrations began at {at}, {len(missing)} missing, runs {runs[:10]}; the guest: {guest}, "
-          f"{'socat receiving' if udp[-1:] == ['receiving'] else 'socat gone'}")
-    late = [got[max(0, i - 3):i + 12] for i, (a, b) in enumerate(zip(got, got[1:])) if b <= a]
-    check(f"{label}: none reordered", not late, late[:10])
-    for h in (A, B):
-        dropped = [l for l in log(h, n).splitlines() if "dropped" in l or "dropping" in l]
-        check(f"{label}: no held packets dropped on {h}", not dropped, dropped[-3:])
+    detail = (f"sent {sent[0]}, migrations began at {at}, {len(missing)} missing, runs {runs[:10]}; the guest: {guest}, "
+              f"{'socat receiving' if udp[-1:] == ['receiving'] else 'socat gone'}")
+    dropped = {h: [l for l in log(h, n).splitlines() if "dropped" in l or "dropping" in l] for h in (A, B)}
+    if burst == 1:
+        check(f"{label}: no udp datagram lost", not missing, detail)
+        late = [got[max(0, i - 3):i + 12] for i, (a, b) in enumerate(zip(got, got[1:])) if b <= a]
+        check(f"{label}: none reordered", not late, late[:10])
+        for h in (A, B):
+            check(f"{label}: no held packets dropped on {h}", not dropped[h], dropped[h][-3:])
+    else:
+        # Overload may drop, but only what is counted: by the holds, or by the guest's socket.
+        said = sum(int(m) for h in (A, B) for l in dropped[h] for m in re.findall(r"dropped (\d+)", l))
+        said += int(guest.get("RcvbufErrors", 0)) if isinstance(guest, dict) else 0
+        check(f"{label}: nothing lost that was not counted", len(missing) <= said, (detail, dropped))
+        let_go = [float(m) for h in (A, B) for m in re.findall(r"let go of \S+ after ([\d.]+) ms", log(h, n))]
+        check(f"{label}: each release ended within 2 s of its 300 ms route change", let_go and max(let_go) < 2000, let_go)
     cleanup(n)
 
 
@@ -4240,7 +4257,7 @@ SCENARIOS = dict(
     incoming_killed=incoming_killed, start_killed=start_killed, claim_killed=claim_killed, fc_died=fc_died,
     sigkill_restart=sigkill_restart, listen_trickle=listen_trickle,
     cow_wp_race=cow_wp_race, fetch_tail_enomem=fetch_tail_enomem, fetch_enomem_stuck=fetch_enomem_stuck,
-    same_host_order=same_host_order, same_host_slow_route=same_host_slow_route, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,
+    same_host_order=same_host_order, same_host_slow_route=same_host_slow_route, same_host_flood=same_host_flood, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,
     handoff_superseded=handoff_superseded, suspend_cmd=suspend_cmd, fc_died_busy=fc_died_busy, pause_cmd_start=pause_cmd_start, suspend_died=suspend_died)
 names = [n for s in args.scenarios for n in (list(SCENARIOS) if s == "all" else [s])]
 if os.geteuid() != 0:

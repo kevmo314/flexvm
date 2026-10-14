@@ -486,14 +486,18 @@ impl Proc {
             let ended = p.if_current(|| match (holder.as_deref(), holding) {
                 (Some(h), true) => {
                     // `release_stall`: the route change waits long (for RTNL, say).
+                    let start = Instant::now();
                     let released = release_into(h, vm.ip, mig, &vm, STRAGGLERS, |()| {
                         if fault("release_stall") {
                             thread::sleep(Duration::from_millis(300));
                         }
                         vm.route_here()
                     });
-                    if let Some(s) = released.filter(|s| s.dropped + s.dropped_target > 0) {
-                        eprintln!("vm {}: dropped {} of the packets held while taking {} over", vm.name, s.dropped + s.dropped_target, vm.ip);
+                    if let Some(s) = released {
+                        eprintln!("vm {}: let go of {} after {} ms, {} packets injected", vm.name, vm.ip, ms(start.elapsed()), s.injected);
+                        if s.dropped + s.dropped_target > 0 {
+                            eprintln!("vm {}: dropped {} of the packets held while taking {} over", vm.name, s.dropped + s.dropped_target, vm.ip);
+                        }
                     }
                     Ok(())
                 }

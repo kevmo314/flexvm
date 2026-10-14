@@ -23,6 +23,10 @@ pub const CAP: usize = 4 << 20;
 /// Per round of `release`; past it (a flood faster than the sink) packets are dropped.
 const CATCH_UP: Duration = Duration::from_millis(100);
 const MAX_FRAME: usize = 65535;
+/// Packets read off the device at a time before what was read is handed over.
+const PASS: usize = 256;
+/// The hold device's queue length (`open_tun`).
+const TXQ: usize = 10000;
 const ACCEPT_WAIT: Duration = Duration::from_secs(1);
 const SYNC_WAIT: Duration = Duration::from_millis(250);
 /// For the target to take the address over: a route change, which waits for RTNL. The
@@ -173,14 +177,16 @@ impl Holder {
     }
 
     /// `release` into a VM here. `switch` (a route change) may wait long, for RTNL: a helper
-    /// thread hands over what arrives meanwhile as it comes, and once it is done, all the
-    /// device took before it is read off the device and handed over right away (not waiting
-    /// for the reader thread or the helper, which a busy host may not run for a while), so
-    /// the packets routed to the VM from then on have as little as possible to overtake.
-    /// Nothing held is dropped for taking long. A sender that looked the old route up just
-    /// before the switch may still be putting a packet on the device: with `linger`, the device
-    /// is watched that long more for one. If `switch` fails the address stays held until
-    /// `forget`.
+    /// thread hands over what arrives meanwhile. Once it is done, what the device took before
+    /// it is read off it right away (not waiting for the reader thread, which a busy host may
+    /// not run for a while), so the packets routed to the VM from then on have as little as
+    /// possible to overtake, and handed over a pass at a time, so a backlog is delivered
+    /// rather than dropped at `CAP`. Nothing held is dropped for taking long, and traffic that
+    /// keeps arriving never holds the switch up: each hand-over takes only what was queued when
+    /// it began, and reading after the switch stops at the device's queue length. With
+    /// `linger`, the device is then watched that long more for a packet from a sender that
+    /// looked the old route up just before the switch. If `switch` fails the address stays
+    /// held until `forget`.
     pub fn release_local(
         &self,
         ip: Ipv4Addr,
@@ -191,44 +197,50 @@ impl Holder {
     ) -> Option<(Stats, Result<()>)> {
         let e = self.releasing(ip, mig)?;
         let out = Mutex::new((sink, Stats::default()));
-        let give = |o: &mut (LocalSink, Stats)| self.give_all(&e, &mut *o.0, &mut o.1);
+        let give = |o: &mut (LocalSink, Stats)| self.give_queued(&e, &mut *o.0, &mut o.1);
         give(&mut out.lock().unwrap());
         let switching = AtomicBool::new(true);
+        let mut buf = vec![0u8; MAX_FRAME];
         let switched = std::thread::scope(|sc| {
             sc.spawn(|| {
-                let _rt = Realtime::new();
                 while switching.load(Ordering::SeqCst) {
                     if !give(&mut out.lock().unwrap()) {
                         std::thread::sleep(Duration::from_micros(200));
                     }
                 }
             });
-            // From the switch to the last packet the device took before it handed over, packets
-            // routed to the VM race those: not preempted by the busy host's other work meanwhile.
-            let rt = Realtime::new();
             let switched = switch();
+            // Right away, here: the helper may be asleep, or not running at all.
             let mut o = out.lock().unwrap();
             if switched.is_ok() {
-                // Nothing reaches the device for this address any more: this ends.
-                let mut buf = vec![0u8; MAX_FRAME];
-                while self.read_one(&mut buf) {}
+                // Nothing reaches the device for this address any more.
+                let mut read = 0;
+                loop {
+                    let n = (0..PASS).take_while(|_| self.read_one(&mut buf)).count();
+                    give(&mut o);
+                    read += n;
+                    if n < PASS || read >= TXQ {
+                        break;
+                    }
+                }
             }
-            give(&mut o);
-            drop(rt);
             switching.store(false, Ordering::SeqCst);
             switched
         });
-        let end = Instant::now() + linger;
-        while switched.is_ok() && Instant::now() < end {
-            let mut pfd = libc::pollfd { fd: self.tun.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-            let wait = end.saturating_duration_since(Instant::now()).as_millis().max(1) as i32;
-            if unsafe { libc::poll(&mut pfd, 1, wait) } > 0 {
-                let mut buf = vec![0u8; MAX_FRAME];
-                while self.read_one(&mut buf) {}
+        let mut o = out.into_inner().unwrap();
+        if switched.is_ok() {
+            let end = Instant::now() + linger;
+            while Instant::now() < end {
+                let mut pfd = libc::pollfd { fd: self.tun.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+                let wait = end.saturating_duration_since(Instant::now()).as_millis().max(1) as i32;
+                if unsafe { libc::poll(&mut pfd, 1, wait) } > 0 {
+                    (0..PASS).take_while(|_| self.read_one(&mut buf)).count();
+                }
+                give(&mut o);
             }
-            give(&mut out.lock().unwrap());
         }
-        let (_, mut stats) = out.into_inner().unwrap();
+        give(&mut o);
+        let mut stats = o.1;
         if switched.is_ok() {
             self.unhold(ip, &e);
         }
@@ -240,17 +252,19 @@ impl Holder {
         Some((stats, switched))
     }
 
-    /// Hands over all queued; false if there was none.
-    fn give_all(&self, e: &Entry, sink: &mut dyn FnMut(&[u8]) -> bool, stats: &mut Stats) -> bool {
-        let mut any = false;
-        loop {
+    /// Hands over what is queued now, not what arrives meanwhile; false if there was none.
+    fn give_queued(&self, e: &Entry, sink: &mut dyn FnMut(&[u8]) -> bool, stats: &mut Stats) -> bool {
+        let mut left = e.q.lock().unwrap().packets.len();
+        let any = left > 0;
+        while left > 0 {
             let batch = e.q.lock().unwrap().take_batch();
             if batch.is_empty() {
-                return any;
+                break;
             }
-            any = true;
+            left = left.saturating_sub(batch.len());
             batch.iter().for_each(|p| stats.give(sink, p));
         }
+        any
     }
 
     fn hand_over(&self, e: &Entry, sink: &mut dyn FnMut(&[u8]) -> bool, stats: &mut Stats) {
@@ -568,25 +582,6 @@ impl Out<'_> {
     }
 }
 
-/// The calling thread runs `SCHED_FIFO` (lowest priority) until this goes, if it may.
-struct Realtime(bool);
-
-impl Realtime {
-    fn new() -> Realtime {
-        let p = libc::sched_param { sched_priority: 1 };
-        Realtime(unsafe { libc::sched_setscheduler(0, libc::SCHED_FIFO, &p) } == 0)
-    }
-}
-
-impl Drop for Realtime {
-    fn drop(&mut self) {
-        if self.0 {
-            let p = libc::sched_param { sched_priority: 0 };
-            unsafe { libc::sched_setscheduler(0, libc::SCHED_OTHER, &p) };
-        }
-    }
-}
-
 fn readable(fd: &OwnedFd) -> bool {
     let mut pfd = libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
     unsafe { libc::poll(&mut pfd, 1, 0) > 0 }
@@ -608,7 +603,7 @@ fn open_tun(dev: &str) -> std::result::Result<OwnedFd, (bool, crate::util::Error
         return Err((busy, format!("{dev}: {e}{}", if busy { " (another process has it)" } else { "" }).into()));
     }
     // Room for what arrives while a release catches up (default 500).
-    req.ifr_ifru.ifru_metric = 10000;
+    req.ifr_ifru.ifru_metric = TXQ as i32;
     let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
     if sock >= 0 {
         unsafe {
