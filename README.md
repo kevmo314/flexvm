@@ -169,7 +169,10 @@ between network namespaces and fails on a lost datagram or a long stall.
   sparse image. Standby VMs are restored ahead of time.
 - **Memory**: templates come with 4 GiB plugged (free until touched); past
   that the guest asks for more over vsock the moment it runs low, admitted
-  against the host's reserve. Freed pages go back through free page reporting.
+  against the host's reserve. The host holds each VM to what it admitted
+  (`memory.high` on its cgroup), raised a step at a time as the guest touches
+  memory: a VM refused more is throttled there, not killed, and moved to a
+  peer with room. Freed pages go back through free page reporting.
 - **Migration** is post-copy: the target is prepared first, then the source
   pauses, sends only vCPU and device state (~20-200 KiB), the target resumes
   and pulls pages on fault and in the background. Packets that arrive during

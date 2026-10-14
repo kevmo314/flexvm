@@ -65,6 +65,10 @@ impl Proc {
         let (mig, gen, prep) = (migration_id(), self.gen(), Instant::now());
         let (mut conn, mut reader, prepared) = self.prepare_target(&vm, to, mig, gen, &source)?;
         let prepare = prep.elapsed();
+        // Only now, right before the pause: the guest runs on at its mark meanwhile.
+        let unthrottle = Instant::now();
+        let _lifted = vm.limit.lift(vm.pid());
+        let unthrottle = unthrottle.elapsed();
         let holder = self.holder().cloned();
         // Lent durably first: a crash with the outcome unknown must not hand the address out.
         self.lent_here.store(self.host.lend(&self.host.lock()?, vm.ip, gen)?, Ordering::SeqCst);
@@ -149,6 +153,7 @@ impl Proc {
             "mig": mig,
             "settle_hotplug_ms": ms(settle),
             "prepare_ms": ms(prepare),
+            "unthrottle_ms": ms(unthrottle),
             "checkpoint_ms": ms(paused),
             "downtime_ms": ms(downtime),
             "rerouted_ms": ms(t.total()),
@@ -516,9 +521,7 @@ impl Proc {
         let ip: Ipv4Addr = req["ip"].as_str().ok_or("missing ip")?.parse()?;
         *self.arrived.lock().unwrap() = Some(self.host.mig_begin(mig, &source.addr, by, Some(ip))?);
         let need = req["rss_mib"].as_u64().unwrap_or(0);
-        if !self.host.admit(need) {
-            bail!("not enough memory here for {need} MiB above the {} MiB reserve", self.host.cfg.reserve_mib);
-        }
+        self.admit_start(need, 0)?;
         let tpl = Template::open_id(&self.paths, req["template"].as_str().ok_or("missing template")?, req["id"].as_str().ok_or("missing template id")?)?;
         t.mark("template");
         let claim = self.host.claim_incoming(&self.host.lock()?, &name, ip, req["gen"].as_u64().unwrap_or(0))?;

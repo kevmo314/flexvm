@@ -92,6 +92,12 @@ pub struct Proc {
     pub consumed: Mutex<Option<PathBuf>>,
     pub pending_route: Mutex<Option<Ipv4Addr>>,
     pub files: Mutex<Vec<PathBuf>>,
+    /// What the VM's start was admitted against the reserve (MiB): its first memory mark.
+    granted: AtomicU64,
+    /// The grant of this start (refunded if the VM never starts).
+    charged: AtomicU64,
+    /// A standby's (MiB held or to page in, guest size), taken while it waits, so a claim need not.
+    pub sizes: Mutex<Option<(u64, u64)>>,
     serving: AtomicBool,
     me: std::sync::Weak<Proc>,
 }
@@ -131,6 +137,9 @@ impl Proc {
             consumed: Mutex::new(None),
             pending_route: Mutex::new(None),
             files: Mutex::new(Vec::new()),
+            granted: AtomicU64::new(0),
+            charged: AtomicU64::new(0),
+            sizes: Mutex::new(None),
             serving: AtomicBool::new(false),
             me: me.clone(),
         }))
@@ -141,6 +150,9 @@ impl Proc {
     }
 
     pub fn set_vm(&self, vm: Arc<Vm>) {
+        let sizes = self.sizes.lock().unwrap().take().unwrap_or_else(|| vm.mem_sizes());
+        vm.start_limit(self.granted.load(Ordering::SeqCst), sizes, &self.host);
+        self.charged.store(0, Ordering::SeqCst);
         let _ = self.vm.set(vm);
     }
 
@@ -151,6 +163,29 @@ impl Proc {
     pub fn set_name(&self, n: NameLock) {
         crate::util::output::fall_back_to(self.host.vms(&n.name, "log"));
         *self.name.lock().unwrap() = Some(n);
+    }
+
+    /// Every start, before it loads: what the VM brings (`need` MiB, held or
+    /// to page in) and a step, against the host's reserve, less what it
+    /// already holds here (`held`: a standby's memory is out of MemAvailable).
+    pub fn admit_start(&self, need: u64, held: u64) -> Result<()> {
+        let mib = crate::limit::allowance(need);
+        let charge = mib.saturating_sub(held);
+        let Some(id) = self.host.grant(charge) else {
+            bail!("not enough memory here for {charge} MiB above the {} MiB reserve", self.host.cfg.reserve_mib);
+        };
+        self.granted.store(mib, Ordering::SeqCst);
+        self.charged.store(id, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// A start that did not happen gives its admission back.
+    pub fn refund_start(&self) {
+        let id = self.charged.swap(0, Ordering::SeqCst);
+        self.granted.store(0, Ordering::SeqCst);
+        if id > 0 {
+            self.host.refund(id);
+        }
     }
 
     pub fn set_addr(&self, a: AddrClaim) -> Ipv4Addr {
@@ -293,7 +328,7 @@ impl Proc {
             max_mib: vm.template.meta.max_mib,
             state: vm.state().name().into(),
             firecracker: vm.pid(),
-            starved: vm.starved.load(Ordering::SeqCst),
+            starved: vm.starving(),
         };
         if let Err(e) = self.name.lock().unwrap().as_ref().map_or(Ok(()), |l| l.publish(&e)) {
             eprintln!("vm {n}: registry: {e}");
@@ -302,6 +337,9 @@ impl Proc {
 
     /// The one way the process ends, holding `op`.
     pub fn finish(&self, _op: &Op, end: End, code: i32, last: Option<(&UnixStream, Value)>) -> ! {
+        if matches!(end, End::NotStarted) {
+            self.refund_start();
+        }
         self.drop_held_in();
         self.set_leaving(true);
         if let Some(vm) = self.vm.get() {
@@ -427,6 +465,7 @@ impl Proc {
         let ip = self.set_addr(claim);
         t.mark("claim_ip");
         crate::host::stall("start_stall");
+        self.admit_start(tpl.working_set_mib(), 0)?;
         let prepared = Vm::prepare(self.spawner.take(None)?, tpl.clone(), &mut t)?;
         let learn = crate::standby::load_set(&self.host, &tpl).is_empty();
         if learn {
@@ -519,6 +558,7 @@ impl Proc {
         };
         spawn(Proc::controller);
         spawn(Proc::serve_memory);
+        spawn(Proc::watch_memory);
         if self.vm().template.meta.image.is_some() {
             spawn(Proc::follow_app);
         }
@@ -674,6 +714,7 @@ impl Proc {
                 }
                 *vm.last_resize.lock().unwrap() = Instant::now();
                 let mib = req["mib"].as_u64().ok_or("missing mib")?.min(vm.template.meta.max_mib - vm.template.meta.mem_mib);
+                vm.limit.plug(vm.template.meta.mem_mib + mib, 0);
                 vm.fc(|fc| fc.patch("/hotplug/memory", json!({"requested_size_mib": mib})))?;
                 Ok(json!(mib))
             }
@@ -710,6 +751,7 @@ impl Proc {
     }
 
     fn controller(self: Arc<Self>) {
+        let mut published = false;
         loop {
             thread::sleep(Duration::from_secs(1));
             let vm = self.vm();
@@ -724,14 +766,15 @@ impl Proc {
                     }
                 }
             }
-            let starved = vm.starved.load(Ordering::SeqCst);
             if let Err(e) = self.resize(None) {
                 eprintln!("vm {}: resize: {e}", vm.name);
             }
-            if starved != vm.starved.load(Ordering::SeqCst) {
+            // Throttling (`watch_memory`) changes it between ticks too.
+            if published != vm.starving() {
+                published = !published;
                 self.publish();
             }
-            relieve(&self.host, vm.starved.load(Ordering::SeqCst));
+            relieve(&self.host, vm.starving());
         }
     }
 
@@ -746,6 +789,11 @@ impl Proc {
             true => resize(vm, &self.host, hint, true),
             false => Ok(Resized::Busy),
         }
+    }
+
+    fn watch_memory(self: Arc<Self>) {
+        let vm = self.vm().clone();
+        vm.limit.watch(&self.host, Duration::from_secs(1), || vm.pid().is_some());
     }
 
     /// The guest is untrusted: requests are bounded in size and time and
@@ -1010,8 +1058,13 @@ fn resize(vm: &Vm, host: &Host, hint: Option<u64>, grow_only: bool) -> Result<Re
     if new != requested {
         let why = if plan.settle { "stalled" } else if hint.is_some() { "guest asked" } else { "tick" };
         eprintln!("vm {}: available {avail} MiB, hotplug {requested} (plugged {plugged}) -> {new} MiB ({why})", vm.name);
+        if new > requested {
+            vm.limit.plug(meta.mem_mib + new, if refused { 0 } else { plan.charge });
+        }
         vm.fc(|fc| fc.patch("/hotplug/memory", json!({"requested_size_mib": new})))?;
         *last = Instant::now();
+    } else if requested == plugged {
+        vm.limit.settled(meta.mem_mib + plugged);
     }
     Ok(if new > plugged {
         Resized::Grew

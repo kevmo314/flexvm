@@ -300,6 +300,8 @@ impl Proc {
         let (vm, restore) = (|| -> Result<_> {
             let tpl = Template::open_id(&self.paths, &m.template, &m.template_id)?;
             t.mark("verify_template");
+            // The template's working set is prefetched too.
+            self.admit_start(tpl.working_set_mib() + to_load, 0)?;
             let seed = Some((ck.runs, Origin::File(ck.file)));
             let prepared = Vm::prepare(self.spawner.take(None)?, tpl, t)?;
             prepared.load(&self.spawner, name, Snapshot::Bytes(&ck.vmstate), seed, ip, !(hold && fault("restore_no_hold")), None, || Ok(()), t)
@@ -457,6 +459,7 @@ impl Proc {
         }
         let plugged = vm.hotplug_plugged();
         cancelled()?;
+        let _lifted = vm.limit.lift(vm.pid());
         vm.leave(State::Checkpointing)?;
         let paused = Instant::now();
         let mut hold = PacketHold { d: self, vm, id: crate::migrate::migration_id(), stats: None };

@@ -148,9 +148,33 @@ parsed is an error, never a free address.
   restore's or SIGTSTP'd VM's SIGCONT, an arrival's commit) its generation is
   checked again under the host lock, held until the vCPUs run.
 
-**Admission** (`reserve_mib`): growth and incoming migrations are admitted
-under the host lock against MemAvailable minus the reserve and the grants of
-the last 10 s (`RUN/grants`); standby refills stop under it.
+**Admission** (`reserve_mib`): every start (run, restore, resume, standby
+claim, arrival: what the VM brings or pages in, and a step), growth and
+incoming migrations are admitted under the host lock against MemAvailable
+minus the reserve and the grants of the last 10 s (`RUN/grants`); a start
+refused fails before it loads anything. Standby refills stop under it.
+
+**Memory marks** (`limit.rs`): each VM's Firecracker cgroup has a
+`memory.high` at the memory admitted for it plus Firecracker's overhead
+(64 MiB + 1/64). It starts at what the start was admitted (a cold run: the
+template's working set; a restore or resume: that and the checkpoint's
+pages; an arrival: the source's RSS; a claim: the standby's memory, of
+which only the step is charged; each plus a step), and a start that never
+runs refunds its grant. It is raised a step
+(a quarter, 256 MiB to 2 GiB) when the cgroup's usage comes within half a
+step of it (its `high` events, or each second), each step admitted first
+(the mark's lock is never held across admission, whose host lock a
+migration's rollback holds while it restores the mark);
+never past the guest's size, raised before a grow's PATCH by what the grow
+was charged, lowered only once a shrink settles and never below what is in
+use. Refused, the VM is throttled at its mark (the kernel slows its vCPUs;
+`memory.high`, never `memory.max`: nothing is OOM-killed) and counts as
+starved, so eviction moves it. The pager's installs are charged to the
+cgroup but throttled by the VM process's own, so pulls and checkpoint copies
+never wait on the mark; a migration (once its target is prepared) or a
+checkpoint lifts it right before it pauses the VM, first waiting out vCPUs
+already asleep in throttling (the kernel's sleeps last up to 2 s; the wait
+gives up after 2.5 s), so the pause is not held up.
 
 ## Migration, runner to runner
 

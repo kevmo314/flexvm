@@ -450,20 +450,41 @@ impl Host {
         Ok(self.held(&a).then_some(a.holder).flatten())
     }
 
-    /// MemAvailable lags a grant until the guest touches the memory, so all
-    /// processes' grants of the last `GRANT_WINDOW` count as used.
+    /// Gives back grant `id` (from `grant`) that was not used.
+    pub fn refund(&self, id: u64) {
+        let Ok(_l) = self.lock() else { return };
+        let path = self.run.join("grants");
+        let mut grants: Vec<(u64, u64, u64)> = load(&path).ok().flatten().unwrap_or_default();
+        let n = grants.len();
+        grants.retain(|g| g.2 != id);
+        if grants.len() != n {
+            let _ = store(&path, &grants, false);
+        }
+    }
+
     pub fn admit(&self, mib: u64) -> bool {
-        let Ok(_l) = self.lock() else { return false };
+        self.grant(mib).is_some()
+    }
+
+    /// MemAvailable lags a grant until the guest touches the memory, so all
+    /// processes' grants of the last `GRANT_WINDOW` count as used. Returns
+    /// the grant's id. Test fault `no_admit`: refuses everything.
+    pub fn grant(&self, mib: u64) -> Option<u64> {
+        if fault("no_admit") {
+            return None;
+        }
+        let _l = self.lock().ok()?;
         let path = self.run.join("grants");
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
-        let mut grants: Vec<(u64, u64)> = load(&path).ok().flatten().unwrap_or_default();
-        grants.retain(|&(t, _)| now.saturating_sub(t) <= GRANT_WINDOW.as_millis() as u64);
+        let mut grants: Vec<(u64, u64, u64)> = load(&path).ok().flatten().unwrap_or_default();
+        grants.retain(|&(t, ..)| now.saturating_sub(t) <= GRANT_WINDOW.as_millis() as u64);
         let pending: u64 = grants.iter().map(|g| g.1).sum();
         if crate::vmproc::host_available_mib() < self.cfg.reserve_mib + pending + mib {
-            return false;
+            return None;
         }
-        grants.push((now, mib));
-        store(&path, &grants, false).is_ok()
+        let id = crate::migrate::migration_id().max(1);
+        grants.push((now, mib, id));
+        store(&path, &grants, false).ok().map(|()| id)
     }
 
     // Incoming migrations: `STATE/migs/ID`, durable, under the host lock.
@@ -1240,6 +1261,12 @@ mod tests {
         h.cfg.reserve_mib = free.saturating_sub(3000);
         assert!(h.admit(1000) && h.admit(1000));
         assert!(!h.admit(2000), "recent grants count as used");
+        // A start that did not happen gives its grant back, by id: only its own.
+        let id = h.grant(900).unwrap();
+        assert!(!h.admit(500));
+        h.refund(id);
+        h.refund(u64::MAX);
+        assert!(h.admit(500) && !h.admit(900));
         h.cfg.reserve_mib = free + 1;
         assert!(!h.admit(1));
     }

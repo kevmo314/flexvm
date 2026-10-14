@@ -349,6 +349,11 @@ impl Template {
         }
     }
 
+    /// What a cold start pages in up front (`Pager::prefetch`), MiB.
+    pub fn working_set_mib(&self) -> u64 {
+        (self.working_set.iter().map(|r| r.1).sum::<u64>() * crate::util::PAGE_SIZE as u64) >> 20
+    }
+
     pub fn load_set(&self) -> Vec<u64> {
         self.load_set.lock().unwrap().iter().copied().collect()
     }

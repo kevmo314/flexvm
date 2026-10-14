@@ -66,6 +66,7 @@ pub struct Vm {
     pub state: Mutex<State>,
     pub last_resize: Mutex<Instant>,
     pub starved: AtomicBool,
+    pub limit: crate::limit::Limit,
     reports_held: AtomicBool,
     /// During a copy-on-write checkpoint the VM may grow, not shrink: resizes hold this.
     pub cow_copy: Mutex<bool>,
@@ -114,6 +115,25 @@ impl Vm {
         prepared.pager.set_pid(prepared.firecracker().pid())?;
         phases.mark("pager_start");
         Ok(prepared)
+    }
+
+    /// Cannot grow here: refused a plug, or throttled at its memory mark.
+    pub fn starving(&self) -> bool {
+        self.starved.load(Ordering::SeqCst) || self.limit.throttled.load(Ordering::SeqCst)
+    }
+
+    /// (MiB it holds or still pages in, the guest's size).
+    pub fn mem_sizes(&self) -> (u64, u64) {
+        mem_sizes(&self.pager, &self.template, self.hotplug_plugged())
+    }
+
+    /// Sets its memory mark once it runs here: what its start was admitted
+    /// (`granted`); what it holds and still pages in beyond that (`sizes`)
+    /// is admitted first (refused, it is throttled until a step is).
+    pub fn start_limit(&self, granted: u64, (need, cap): (u64, u64), host: &crate::host::Host) {
+        let more = need.saturating_sub(granted);
+        let admitted = if more > 0 && host.admit(more) { need } else { granted };
+        self.limit.start(admitted, cap);
     }
 
     pub fn mem_sock(&self) -> PathBuf {
@@ -229,6 +249,7 @@ impl Vm {
         // The link-down took the VM's /32 route with it.
         crate::net::attach(self.ip, &self.tap)?;
         self.unpark_balloon();
+        self.limit.restore();
         if self.was_paused.swap(false, Ordering::SeqCst) {
             return Ok(State::Paused);
         }
@@ -523,12 +544,21 @@ impl Vm {
             "guest_mib": self.template.meta.mem_mib + hotplug["plugged_size_mib"].as_u64().unwrap_or(0),
             "max_mib": self.template.meta.max_mib,
             "plugged_mib": hotplug["plugged_size_mib"],
+            "admitted_mib": self.limit.admitted(),
+            "cgroup_mib": self.limit.used(),
+            "throttled": self.limit.throttled.load(Ordering::SeqCst),
             "requested_mib": hotplug["requested_size_mib"],
             "pages_mib": {"base": mib(base), "present": mib(present), "zero": mib(zero), "remote": mib(remote + inflight + discarded)},
             "checkpoint_copy": self.pager.copying(),
             "write_tracking": self.pager.tracking(),
         })
     }
+}
+
+fn mem_sizes(pager: &Pager, tpl: &Template, plugged: Option<u64>) -> (u64, u64) {
+    let [_, present, _, remote, inflight, discarded] = pager.census();
+    let need = ((present + remote + inflight + discarded) * PAGE_SIZE) as u64 >> 20;
+    (need, tpl.meta.mem_mib + plugged.unwrap_or(tpl.meta.max_mib - tpl.meta.mem_mib))
 }
 
 /// A Firecracker with its pager started and no VM of its own yet; torn down when dropped.
@@ -559,6 +589,12 @@ impl Prepared {
         &self.idle.as_ref().unwrap().tap
     }
 
+    /// As `Vm::mem_sizes`, for a loaded one.
+    pub fn mem_sizes(&self) -> (u64, u64) {
+        let plugged = self.firecracker().get("/hotplug/memory").ok().and_then(|h| h["plugged_size_mib"].as_u64());
+        mem_sizes(&self.pager, &self.template, plugged)
+    }
+
     pub fn dir(&self) -> &Path {
         &self.idle.as_ref().unwrap().dir
     }
@@ -579,6 +615,7 @@ impl Prepared {
             state: Mutex::new(state),
             last_resize: Mutex::new(Instant::now()),
             starved: AtomicBool::new(false),
+            limit: crate::limit::Limit::new(cgroup.clone()),
             reports_held: AtomicBool::new(false),
             cow_copy: Mutex::new(false),
             execs: Mutex::new(HashMap::new()),
