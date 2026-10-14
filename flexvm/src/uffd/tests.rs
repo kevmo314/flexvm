@@ -336,6 +336,8 @@ fn eagain_waits_for_events_read() {
 fn fetch_asks_for_the_head_first() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
+    let (headed, head_seen) = std::sync::mpsc::channel();
+    // The rest is sent only once the head was reported (or never will be, without the rest): no clock to race.
     let server = thread::spawn(move || {
         let (s, _) = listener.accept().unwrap();
         let mut r = io::BufReader::new(s.try_clone().unwrap());
@@ -351,24 +353,22 @@ fn fetch_asks_for_the_head_first() {
         let mut s = s;
         s.write_all(b"{\"ok\": true}\n").unwrap();
         s.write_all(&[&[0u8][..], &[1u8; 4096]].concat()).unwrap();
-        thread::sleep(Duration::from_millis(50));
+        let reported = head_seen.recv_timeout(Duration::from_secs(10)).is_ok();
         s.write_all(&[&[0u8][..], &[2u8; 3 * 4096]].concat()).unwrap();
+        reported
     });
     let source = Source { addr, vm: "v".into(), mig: 1, regions: Vec::new() };
     let mut c = PageClient::connect(&source).unwrap();
     let mut buf = vec![0u8; 4 * PAGE_SIZE];
-    let start = Instant::now();
-    let mut head_at = None;
     let mut progress = |data: &[u8]| {
-        if data.len() >= PAGE_SIZE && head_at.is_none() {
-            head_at = Some(start.elapsed());
+        if data.len() >= PAGE_SIZE {
+            let _ = headed.send(());
         }
         true
     };
-    c.fetch(8192, &mut buf, PAGE_SIZE, &mut progress, start + Duration::from_secs(5)).unwrap();
-    assert!(head_at.unwrap() < Duration::from_millis(40), "head reported before the rest arrived");
+    c.fetch(8192, &mut buf, PAGE_SIZE, &mut progress, Instant::now() + Duration::from_secs(30)).unwrap();
+    assert!(server.join().unwrap(), "head reported before the rest was sent");
     assert!(buf[..PAGE_SIZE].iter().all(|&b| b == 1) && buf[PAGE_SIZE..].iter().all(|&b| b == 2));
-    server.join().unwrap();
 }
 
 /// A page server whose page `p` is all `p as u8`. Its first connection answers `first` requests only, then hangs up its
