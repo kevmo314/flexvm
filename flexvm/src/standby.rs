@@ -182,23 +182,23 @@ fn refill_by(host: &Host, template: &str, wait: bool) -> Result<usize> {
     Ok(started)
 }
 
-/// What standby loads of a template touch, saved for migrations to preload.
-fn load_set_file(host: &Host, tpl: &Template) -> PathBuf {
-    host.run.join("standby").join(format!(".loadset-{}", tpl.meta.id))
+/// Where what standby loads of a template touch is saved, for migrations to preload: in `host.run`/standby.
+fn load_set_name(tpl: &Template) -> String {
+    format!(".loadset-{}", tpl.meta.id)
 }
 
 pub fn save_load_set(host: &Host, tpl: &Template) {
     let set = tpl.load_set();
     if !set.is_empty() {
         if let Ok(b) = serde_json::to_vec(&set) {
-            let _ = crate::util::write_file(&host.run.join("standby"), &format!(".loadset-{}", tpl.meta.id), &b, false);
+            let _ = crate::util::write_file(&host.run.join("standby"), &load_set_name(tpl), &b, false);
         }
     }
 }
 
 pub fn load_set(host: &Host, tpl: &Template) -> Vec<u64> {
     let mut set = tpl.load_set();
-    if let Some(saved) = std::fs::read(load_set_file(host, tpl)).ok().and_then(|b| serde_json::from_slice::<Vec<u64>>(&b).ok()) {
+    if let Some(saved) = std::fs::read(host.run.join("standby").join(load_set_name(tpl))).ok().and_then(|b| serde_json::from_slice::<Vec<u64>>(&b).ok()) {
         set.extend(saved);
         set.sort_unstable();
         set.dedup();
@@ -239,7 +239,7 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
         if unsafe { libc::poll(&mut pfd, 1, 100) } <= 0 {
             let current = key(&p.paths, template).ok();
             let extra = live(host, template).iter().position(|id| *id == me).is_some_and(|i| i >= target(host, template));
-            let dead = p.standby.lock().unwrap().as_ref().is_none_or(|s| s.pager.failed().is_some() || !s.firecracker_alive());
+            let dead = p.standby.lock().unwrap().as_ref().is_none_or(|s| s.pager.failed().is_some() || !s.firecracker().alive());
             if p.stop_requested() || current.as_deref() != Some(&mine) || extra || dead {
                 p.finish(op, End::NotStarted, 0, None);
             }

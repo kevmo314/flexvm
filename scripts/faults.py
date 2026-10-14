@@ -1064,8 +1064,8 @@ def ckpt_backlog():
 
 def ckpt_paused_backlog():
     """A paused VM's checkpoint (#207): its Firecracker reads nothing from the tap while paused, so frames sent to it
-    stay queued past the drain; the checkpoint returns it to paused with them still there, and a kill afterwards counts
-    them as dropped rather than forgetting them."""
+    stay queued, and the drain does not wait for them (#219); the checkpoint returns it to paused with them still there,
+    and a kill afterwards counts them as dropped rather than forgetting them."""
     n, path = "ft-ckpt-pbacklog", ckpt_path("ft-ckpt-pbacklog")
     rm_ckpt(path)
     clear_log(A, n)
@@ -1079,7 +1079,8 @@ def ckpt_paused_backlog():
     time.sleep(0.2)
     r = checkpoint(A, n, path)
     check("paused backlog: checkpoint written, still paused", r["ok"] and r["result"]["state"] == "paused" and vms(A)[n]["state"] == "paused", (r, vms(A).get(n)))
-    check("paused backlog: the drain gave up on its tap's queue", "frames still queued on its tap" in log(A, n), log(A, n)[-2000:])
+    gave_up = re.search(r"frames still queued on its tap (\d+) ms after", log(A, n))
+    check("paused backlog: the drain gave up on its tap's queue at once", gave_up and int(gave_up.group(1)) < 100, log(A, n)[-2000:])
     ok(kill(A, n))
     left = re.compile(r"dropped (\d+) frames still queued on its tap when it left")
     found = wait_for(lambda: left.search(log(A, n)), 10)
@@ -1931,6 +1932,8 @@ def pause_lost():
         unknown_pause("unknown before a checkpoint")
         r = checkpoint(A, n, path)
         check("unknown before a checkpoint: refused while Firecracker cannot say", not r["ok"] and "ended unknown" in r["error"] and not os.path.exists(path), r)
+        st = control(A, n, {"op": "debug", "what": "status"})["result"]["describe"]
+        check("unknown before a checkpoint: refused before arming write tracking (#219)", st["write_tracking"] is False, st)
         r = migrate(A, n, B)
         check("unknown before a migration: refused too", not r["ok"] and "ended unknown" in r["error"] and where(n) == {A: "running"}, (r, where(n)))
     finally:

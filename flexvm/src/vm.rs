@@ -123,8 +123,7 @@ impl Vm {
             }
             res
         })?;
-        self.running_again();
-        *self.state.lock().unwrap() = State::Running;
+        self.record(State::Running);
         Ok(())
     }
 
@@ -317,7 +316,8 @@ impl Vm {
                     return true;
                 }
             }
-            if start.elapsed() >= TAP_DRAIN_WAIT {
+            // Paused, its guest takes nothing: no use waiting.
+            if self.was_paused() || start.elapsed() >= TAP_DRAIN_WAIT {
                 eprintln!("vm {}: frames still queued on its tap {} ms after its address was held; pausing it anyway", self.name, start.elapsed().as_millis());
                 return false;
             }
@@ -348,40 +348,51 @@ impl Vm {
     /// For a migration (`Source`) or a checkpoint.
     pub fn leave(&self, to: State) -> Result<()> {
         let _devices = self.devices.lock().unwrap();
-        let leavable = |st: State| -> Result<()> {
-            if !matches!(st, State::Running | State::Paused) || self.pager.failed().is_some() {
-                bail!("vm {} is not running here", self.name);
-            }
-            if self.pager.remote_left() > 0 {
-                bail!("vm {} is still pulling its memory from its previous host or checkpoint", self.name);
-            }
-            if self.pending_net.lock().unwrap().is_some() {
-                bail!("vm {} has not taken its new address yet; resume it first", self.name);
-            }
-            Ok(())
-        };
-        leavable(*self.state.lock().unwrap())?;
-        // Whether it was paused is recorded below and kept (a checkpoint returns it to that, a migration's target
-        // starts so): after a pause or resume that ended unknown, Firecracker must say which.
-        if self.switch_unsure.load(Ordering::SeqCst) {
-            if self.reconcile().is_none() {
-                bail!(
-                    "vm {}: an earlier pause or resume ended unknown and firecracker cannot say whether it is paused; pause or resume it, then try again",
-                    self.name
-                );
-            }
-            self.switch_unsure.store(false, Ordering::SeqCst);
+        self.can_leave()?;
+        let mut st = self.state.lock().unwrap();
+        self.leavable(*st)?;
+        self.was_paused.store(*st == State::Paused, Ordering::SeqCst);
+        *st = to;
+        Ok(())
+    }
+
+    /// `leave`'s checks, also run before a keep-running checkpoint arms write tracking.
+    pub fn can_leave(&self) -> Result<()> {
+        self.leavable(self.state())?;
+        // Whether it was paused is recorded by `leave` and kept (a checkpoint returns it to that, a migration's
+        // target starts so): after a pause or resume that ended unknown, Firecracker must say which.
+        if self.reconcile().is_none() {
+            bail!(
+                "vm {}: an earlier pause or resume ended unknown and firecracker cannot say whether it is paused; pause or resume it, then try again",
+                self.name
+            );
         }
         // The agent serves in order, so an answered ping means a lost clock request landed.
         if self.clock_unsure.load(Ordering::SeqCst) {
             crate::guest::ping(&self.vsock).map_err(|e| format!("vm {}: guest agent not answering: {e}", self.name))?;
             self.clock_unsure.store(false, Ordering::SeqCst);
         }
-        let mut st = self.state.lock().unwrap();
-        leavable(*st)?;
-        self.was_paused.store(*st == State::Paused, Ordering::SeqCst);
-        *st = to;
         Ok(())
+    }
+
+    fn leavable(&self, st: State) -> Result<()> {
+        if !matches!(st, State::Running | State::Paused) || self.pager.failed().is_some() {
+            bail!("vm {} is not running here", self.name);
+        }
+        if self.pager.remote_left() > 0 {
+            bail!("vm {} is still pulling its memory from its previous host or checkpoint", self.name);
+        }
+        if self.pending_net.lock().unwrap().is_some() {
+            bail!("vm {} has not taken its new address yet; resume it first", self.name);
+        }
+        Ok(())
+    }
+
+    /// Back in service (Running or Paused), undoes `quiesce_export`: the prefetch and collapse it cut short go on.
+    pub fn back_here(&self) {
+        if matches!(self.state(), State::Running | State::Paused) {
+            self.pager.unquiesce();
+        }
     }
 
     pub fn was_paused(&self) -> bool {
@@ -464,9 +475,9 @@ impl Vm {
 
     fn switch(&self, from: State, to: State) -> Result<()> {
         let mut state = self.state();
-        // After an unknown outcome, Firecracker says where it is; if it still cannot, the request is sent all the same.
-        if matches!(state, State::Running | State::Paused) && self.switch_unsure.swap(false, Ordering::SeqCst) {
-            // Recorded whichever it is, so a failure below leaves the record right.
+        // After an unknown outcome, Firecracker says where it is (recorded, so a failure below leaves the record
+        // right); if it still cannot, the request is sent all the same.
+        if matches!(state, State::Running | State::Paused) {
             state = self.reconcile().unwrap_or(from);
         }
         match state {
@@ -491,14 +502,11 @@ impl Vm {
             Err(e) if rejected(e, "/vm") => Some(from),
             Err(_) => self.fc_state(),
         };
-        match now {
-            None => self.switch_unsure.store(true, Ordering::SeqCst),
-            // Recorded whichever it is (a failed resume may find it still paused).
-            Some(s) => *self.state.lock().unwrap() = s,
+        // Recorded whichever it is (a failed resume may find it still paused).
+        if let Some(s) = now {
+            self.record(s);
         }
-        if now == Some(State::Running) {
-            self.running_again();
-        }
+        self.switch_unsure.store(now.is_none(), Ordering::SeqCst);
         if now == Some(to) {
             if let Err(e) = &res {
                 eprintln!("vm {}: {e}, but firecracker is {}", self.name, to.name());
@@ -513,15 +521,21 @@ impl Vm {
         self.switch_unsure.load(Ordering::SeqCst)
     }
 
-    /// After a pause or resume that ended unknown: records where Firecracker says it is (None if it cannot say). The
-    /// caller clears `switch_unsure`.
+    /// Its state, after a pause or resume that ended unknown first recorded as Firecracker has it (clearing
+    /// `switch_unsure`); None if Firecracker cannot say.
     fn reconcile(&self) -> Option<State> {
-        let now = self.fc_state()?;
-        *self.state.lock().unwrap() = now;
-        if now == State::Running {
+        if self.switch_unsure.load(Ordering::SeqCst) {
+            self.record(self.fc_state()?);
+            self.switch_unsure.store(false, Ordering::SeqCst);
+        }
+        Some(self.state())
+    }
+
+    fn record(&self, s: State) {
+        *self.state.lock().unwrap() = s;
+        if s == State::Running {
             self.running_again();
         }
-        Some(now)
     }
 
     /// Its vCPUs run again: collapsing goes on, and its Firecracker delivers what is still queued on its tap.
@@ -850,10 +864,6 @@ impl Prepared {
         mem_sizes(&self.pager, &self.template, plugged)
     }
 
-    pub fn firecracker_alive(&self) -> bool {
-        self.fc.as_ref().is_some_and(|i| i.alive())
-    }
-
     pub fn into_vm(mut self, name: &str, ip: Ipv4Addr, state: State) -> Arc<Vm> {
         let idle = self.fc.take().unwrap();
         Arc::new(Vm {
@@ -972,6 +982,8 @@ impl Prepared {
                 }
             };
             let fc = self.firecracker();
+            // Its cgroup move is waited for within the deadline.
+            fc.join_cgroup();
             let tap = fc.tap.clone();
             let route = self.route.then(|| std::thread::spawn(move || crate::net::attach(ip, &tap)));
             let loaded = fc.load_snapshot(&path, &fc.tap, Some(clock_realtime), left(API_TIMEOUT));

@@ -147,15 +147,9 @@ impl Proc {
             None => false,
         };
         let captured = (|| -> Result<_> {
-            let saved = vm.save_state(&vmstate, false, false, hold, &mut t);
-            if saved.is_err() {
-                let _ = std::fs::remove_file(&vmstate);
-            }
-            let runs = saved?;
-            let paused = t.total();
-            let state = std::fs::read(&vmstate);
+            let saved = vm.save_state(&vmstate, false, false, hold, &mut t).and_then(|r| Ok((r, t.total(), std::fs::read(&vmstate)?)));
             let _ = std::fs::remove_file(&vmstate);
-            let state = state?;
+            let (runs, paused, state) = saved?;
             t.mark("read_state");
             let pages = crate::uffd::remote_among(&runs, wanted);
             let mut data = vec![0u8; pages.len() * crate::util::PAGE_SIZE];
@@ -286,8 +280,6 @@ impl Proc {
             let (stats, res) = release_into(h, vm.ip, mig, vm, Duration::ZERO, |()| crate::net::attach(vm.ip, &vm.tap));
             stats.is_some() && res.is_ok()
         });
-        // It runs here again: so do the collapse pass and prefetch the save cut short.
-        vm.pager.unquiesce();
         let (s, e) = match vm.resume(attached) {
             Ok(s) => (s, e),
             Err(r) => (State::Failed, format!("{e}; resuming it here failed too: {r}").into()),
@@ -296,6 +288,8 @@ impl Proc {
             h.forget(vm.ip, mig);
         }
         *vm.state.lock().unwrap() = s;
+        // Running here again, so do the collapse pass and prefetch the save cut short.
+        vm.back_here();
         self.release_app_log();
         if self.lent_here.swap(false, Ordering::SeqCst) {
             let _ = self.host.unlend(&l, vm.ip, gen);
@@ -391,17 +385,9 @@ impl Proc {
             eprintln!("route {ip} via {via}: {e}; retrying");
             *self.pending_route.lock().unwrap() = Some(via);
             thread::spawn(move || {
-                let mut delay = Duration::from_millis(100);
-                for _ in 0..10 {
-                    thread::sleep(delay);
-                    match p.switch_route(via) {
-                        Ok(()) => {
-                            p.pending_route.lock().unwrap().take();
-                            return eprintln!("route {ip} via {via}: done");
-                        }
-                        Err(e) => eprintln!("route {ip} via {via}: {e}"),
-                    }
-                    delay = (delay * 2).min(Duration::from_secs(5));
+                if retry(&format!("route {ip} via {via}"), || p.switch_route(via)) {
+                    p.pending_route.lock().unwrap().take();
+                    eprintln!("route {ip} via {via}: done");
                 }
             });
         }
@@ -603,15 +589,7 @@ impl Proc {
                     if let Some(h) = holder.as_deref() {
                         h.forget(vm.ip, mig);
                     }
-                    let mut delay = Duration::from_millis(100);
-                    for _ in 0..10 {
-                        thread::sleep(delay);
-                        match p.if_current(|| vm.route_here()) {
-                            Ok(_) => break,
-                            Err(e) => eprintln!("vm {}: routing {} to its tap: {e}", vm.name, vm.ip),
-                        }
-                        delay = (delay * 2).min(Duration::from_secs(5));
-                    }
+                    retry(&format!("vm {}: routing {} to its tap", vm.name, vm.ip), || p.if_current(|| vm.route_here()).map(drop));
                 }
             }
             p.held_in.lock().unwrap().take();
@@ -790,6 +768,21 @@ fn shares_routes(addr: &str) -> bool {
         Err(_) => return false,
     };
     crate::net::is_local_addr(ip).unwrap_or(false)
+}
+
+/// Tries `f` up to 10 times, 100 ms after the last and doubling to 5 s apart, logging failures as `what`; whether it
+/// succeeded.
+fn retry(what: &str, mut f: impl FnMut() -> Result<()>) -> bool {
+    let mut delay = Duration::from_millis(100);
+    for _ in 0..10 {
+        thread::sleep(delay);
+        match f() {
+            Ok(()) => return true,
+            Err(e) => eprintln!("{what}: {e}"),
+        }
+        delay = (delay * 2).min(Duration::from_secs(5));
+    }
+    false
 }
 
 fn outcome(to: &str, mig: u64, patience: Duration) -> Option<Outcome> {
