@@ -20,7 +20,7 @@ use crate::bail;
 use crate::net::IpRange;
 use crate::util::{Error, Result};
 
-/// A held grant (`Host::grant_held`): counted while this lives, and not a
+/// A held grant (`Host::grant_start`): counted while this lives, and not a
 /// moment after its process does (the kernel drops the flock). Dropping it
 /// removes the file; if that fails, the free lock tells admission it is gone.
 pub struct Hold {
