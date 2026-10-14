@@ -206,7 +206,7 @@ FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_be
           "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "resume_kill",
           "prepare_fail", "short_incoming", "slow_preload", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
           "started_fsync", "started_unmark", "start_stall", "incoming_stall", "claim_stall", "ckpt_wp_race",
-          "fetch_tail_enomem", "fetch_enomem_stuck", "publish", "no_evict", "suspend_stall")
+          "fetch_tail_enomem", "fetch_enomem_stuck", "publish", "no_evict", "suspend_stall", "uffd_err")
 
 
 def disarm():
@@ -2935,6 +2935,30 @@ def source_killed_basic():
     basic()
 
 
+def uffd_err():
+    """The pager's userfaultfd stops being pollable (POLLERR): the pager
+    fails, saying why, rather than stopping silently with every vCPU left
+    waiting for pages; the VM is reported failed at once, not hung."""
+    n = "ft-uffd-err"
+    scenario_vms.add(n)
+    p = subprocess.Popen([BIN, "--state", A.state, "--run", A.run, "run", n, "--template", args.template],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=ENV)
+    check("uffd err: up", wait_for(lambda: vms(A).get(n, {}).get("state") == "running", 30), vms(A).get(n))
+    fault(A, "uffd_err", 2000)
+    t = time.time()
+    try:
+        code = p.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        code = None
+    took = time.time() - t
+    fault(A, "uffd_err", 0)
+    check("uffd err: noticed at once, exit status 124", code == 124 and took < 3, (code, took))
+    failed = vms(A).get(n, {})
+    check("uffd err: ls shows it failed, saying why", failed.get("state") == "failed" and "userfaultfd" in failed.get("error", ""), failed)
+    ok(kill(A, n))
+    check("uffd err: kill clears it", n not in vms(A), vms(A).get(n))
+
+
 SCENARIOS = dict(
     unread_output=unread_output,
     run_status=run_status,
@@ -2944,6 +2968,7 @@ SCENARIOS = dict(
     source_killed_basic=source_killed_basic,
     arrival_overtaken=arrival_overtaken,
     pull_died=pull_died,
+    uffd_err=uffd_err,
     cow_grow=no_evict(cow_grow), plug_race=no_evict(plug_race), shrink_stall=no_evict(shrink_stall), plug_storm=no_evict(plug_storm),
     basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, refused=refused, pages_blip=pages_blip,
     pages_dead_restore=pages_dead_restore, pages_dead=pages_dead, resume_kill=resume_kill, prepared_retry=prepared_retry,

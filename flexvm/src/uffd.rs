@@ -685,7 +685,10 @@ pub struct Pager {
     mappings: OnceLock<Vec<Mapping>>,
     pages: OnceLock<Pages>,
     uffd: OnceLock<OwnedFd>,
-    /// Firecracker pid, for reading pages out when acting as a migration source.
+    /// Firecracker pid, for reading its memory (`read_guest`, `populated`,
+    /// `unmapped`). Firecracker is reaped only after the pager has stopped
+    /// (`Vm::kill`), so it is not reused meanwhile; and each read by pid is
+    /// believed only if Firecracker had not exited after it (`exited`).
     pid: AtomicU32,
     /// Firecracker as a pidfd, so killing it never hits a reused pid.
     pidfd: OnceLock<OwnedFd>,
@@ -1161,6 +1164,9 @@ impl Pager {
         };
         let pid = self.pid.load(Ordering::SeqCst);
         let Ok(maps) = std::fs::read_to_string(format!("/proc/{pid}/maps")) else { return true };
+        if self.exited() {
+            return true;
+        }
         let end = addr + (n * PAGE_SIZE) as u64;
         !maps.lines().any(|l| {
             let (a, b) = l.split_whitespace().next().unwrap_or("").split_once('-').unwrap_or(("", ""));
@@ -1198,8 +1204,13 @@ impl Pager {
         }
     }
 
-    /// Test fault `kill_prepared`: Firecracker was killed; treat it as gone.
+    /// Test fault `kill_prepared`: kills Firecracker (left unreaped, see
+    /// `pid`) and treats it as gone.
     pub fn firecracker_gone(&self) {
+        self.kill_firecracker();
+        if let Some(fd) = self.pidfd.get() {
+            let _ = crate::util::pidfd_wait(fd, Duration::from_secs(5));
+        }
         self.gone();
     }
 
@@ -1325,7 +1336,16 @@ impl Pager {
         if unsafe { libc::process_vm_readv(pid, &local, 1, &remote, 1, 0) } != buf.len() as isize {
             bail!("process_vm_readv: {}", io::Error::last_os_error());
         }
+        if self.exited() {
+            bail!("firecracker exited");
+        }
         Ok(())
+    }
+
+    /// Whether Firecracker has exited (or was never named): what was just
+    /// read by its pid may then be another process's.
+    fn exited(&self) -> bool {
+        self.pidfd.get().is_none_or(|fd| crate::util::pidfd_wait(fd, Duration::ZERO).unwrap_or(true))
     }
 
     fn serve(self: Arc<Self>) {
@@ -1354,8 +1374,12 @@ impl Pager {
             if unsafe { libc::poll(pfd.as_mut_ptr(), 2, timeout) } < 0 {
                 continue;
             }
-            if pfd[0].revents & (libc::POLLERR | libc::POLLHUP) != 0 {
-                break;
+            // Test fault `uffd_err`: the uffd turns blocking, which the kernel reports as POLLERR.
+            if pfd[0].revents == 0 && crate::host::fault("uffd_err") {
+                unsafe { libc::fcntl(fd, libc::F_SETFL, libc::fcntl(fd, libc::F_GETFL) & !libc::O_NONBLOCK) };
+            }
+            if pfd[0].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                return self.fail(format!("the userfaultfd cannot be polled (revents {:#x})", pfd[0].revents));
             }
             if pfd[1].revents & libc::POLLIN != 0 {
                 unsafe { libc::read(wake, (&mut 0u64 as *mut u64).cast(), 8) };
@@ -1632,7 +1656,11 @@ impl Pager {
         let f = match self.pagemap.get() {
             Some(f) => f,
             None => {
+                // Bound to the memory of the process it was opened for.
                 let f = std::fs::File::open(format!("/proc/{}/pagemap", self.pid.load(Ordering::SeqCst)))?;
+                if self.exited() {
+                    return Err(io::Error::other("firecracker exited"));
+                }
                 self.pagemap.get_or_init(|| f)
             }
         };
@@ -1852,7 +1880,6 @@ impl Pager {
     pub fn abort_copy(&self) {
         if let Some(cow) = self.cow.lock().unwrap().as_ref() {
             cow.invalidate("the copy was aborted");
-            cow.stop();
         }
     }
 

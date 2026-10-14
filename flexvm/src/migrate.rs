@@ -482,7 +482,7 @@ impl Proc {
     #[allow(clippy::too_many_arguments)]
     fn take_in(
         &self,
-        (mut prepared, ip, source, name, _): (crate::vm::Prepared, Ipv4Addr, Source, String, Vec<u64>),
+        (prepared, ip, source, name, _): (crate::vm::Prepared, Ipv4Addr, Source, String, Vec<u64>),
         runs: Runs,
         state: &[u8],
         paused: bool,
@@ -496,7 +496,6 @@ impl Proc {
             thread::spawn(move || crate::uffd::probe(&source, page, deadline))
         });
         if fault("kill_prepared") {
-            prepared.kill_firecracker();
             prepared.pager.firecracker_gone();
         }
         if fault("fetch_tail_enomem") {

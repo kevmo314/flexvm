@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -121,11 +121,11 @@ impl Firecracker {
     }
 
     pub fn alive(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(None))
+        matches!(exited(&self.child), Ok(None))
     }
 
     pub fn post_mortem(&mut self, dir: &Path) -> String {
-        let status = match self.child.try_wait() {
+        let status = match exited(&self.child) {
             Ok(Some(st)) => format!("exited ({st})"),
             Ok(None) => "still running".into(),
             Err(e) => format!("unknown ({e})"),
@@ -135,6 +135,7 @@ impl Firecracker {
         format!("firecracker {} {status}; log: {}", self.pid(), lines[lines.len().saturating_sub(5)..].join(" | "))
     }
 
+    /// Reaps it: callers stop its pager first, which reads its memory by pid.
     pub fn kill(&mut self) {
         if let Some(j) = self.joining.take() {
             let _ = j.join();
@@ -144,6 +145,22 @@ impl Firecracker {
         let _ = self.child.wait();
         self.sockets.cleanup();
     }
+}
+
+/// `child`'s exit status once it exited, leaving it unreaped: only `kill` reaps Firecracker,
+/// after the cgroup move, so nothing acting on its pid meanwhile can meet a reused one.
+fn exited(child: &Child) -> std::io::Result<Option<ExitStatus>> {
+    use std::os::unix::process::ExitStatusExt;
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    if unsafe { libc::waitid(libc::P_PID, child.id(), &mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let (pid, st) = unsafe { (info.si_pid(), info.si_status()) };
+    Ok((pid != 0).then(|| match info.si_code {
+        libc::CLD_EXITED => ExitStatus::from_raw((st & 0xff) << 8),
+        libc::CLD_DUMPED => ExitStatus::from_raw(st | 0x80),
+        _ => ExitStatus::from_raw(st),
+    }))
 }
 
 /// Calls on a VM hold its `fc` mutex; idle Firecrackers have one owner.
@@ -606,6 +623,19 @@ mod tests {
     impl<R: Seek> Seek for Counted<R> {
         fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
             self.inner.seek(pos)
+        }
+    }
+
+    /// Liveness checks never reap, so the pid stays Firecracker's until `kill` waits for it.
+    #[test]
+    fn exit_status_leaves_the_child_unreaped() {
+        for (script, want) in [("exit 3", "exit status: 3"), ("kill -9 $$", "signal: 9")] {
+            let mut child = Command::new("sh").args(["-c", script]).spawn().unwrap();
+            let st = retry(Duration::from_secs(5), || Ok(exited(&child)?.ok_or("running")?)).unwrap();
+            assert!(st.to_string().contains(want), "{st}");
+            assert!(exited(&child).unwrap().is_some(), "still there to ask again");
+            assert!(Path::new(&format!("/proc/{}", child.id())).exists(), "a zombie, its pid not free");
+            assert_eq!(child.wait().unwrap(), st);
         }
     }
 
