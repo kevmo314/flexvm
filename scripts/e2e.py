@@ -52,7 +52,7 @@ FAULTS = ("basic route lost_ack unknown refused pages_blip pages_dead_restore pr
           "checkpoint_restore checkpoint_fork checkpoint_corrupt held_restore_frozen cow_exact cow_collapsed unplug_collapsed cow_abort ckpt_incremental "
           "ckpt_failed_stop ckpt_rearm prepare_fail fc_prepare slow_preload ckpt_packet_hold "
           "abort_superseded gen_zero signals suspend_gen standby restore_ip_peer late_withdrawal "
-          "incoming_killed start_killed claim_killed fc_died cow_grow plug_race plug_storm suspend_debris revoked_publication "
+          "incoming_killed start_killed claim_killed standby_stalled fc_died cow_grow plug_race plug_storm suspend_debris revoked_publication "
           "same_host_order same_host_slow_route same_host_flood same_host_late_handover rx_stall arrival_abort_route arrival_killed_route handoff_superseded mem_high mem_high_migrate mem_high_evict "
           "sigkill_restart listen_trickle suspend_cmd fc_died_busy pause_cmd_start suspend_died evict_latency evict_skips_cmd cmd_flag "
           "refused_admission meminfo_unreadable checkpoint_hotplug log_cap gc_debris arrival_log template_tap prefix_change")
