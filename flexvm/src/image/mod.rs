@@ -301,12 +301,21 @@ fn rename_noreplace(tmp: &Path, path: &Path) -> Result<bool> {
 
 /// Writes `path` durably via a temporary, never replacing it; false if another publisher won.
 pub(super) fn publish(path: &Path, write: impl FnOnce(&mut File) -> Result<()>) -> Result<bool> {
+    install(path, write, rename_noreplace)
+}
+
+/// As `publish`, but replacing `path`: for content-addressed files that `write` verifies.
+pub(super) fn replace(path: &Path, write: impl FnOnce(&mut File) -> Result<()>) -> Result<()> {
+    install(path, write, |tmp, path| Ok(std::fs::rename(tmp, path)?))
+}
+
+fn install<T>(path: &Path, write: impl FnOnce(&mut File) -> Result<()>, rename: impl FnOnce(&Path, &Path) -> Result<T>) -> Result<T> {
     let tmp = path.with_extension(format!("part{}", std::process::id()));
     let res = (|| {
         let mut f = create_new(&tmp)?;
         write(&mut f)?;
         f.sync_all()?;
-        rename_noreplace(&tmp, path)
+        rename(&tmp, path)
     })();
     let _ = std::fs::remove_file(&tmp);
     res
@@ -567,6 +576,38 @@ mod tests {
         assert_eq!(unpack(&d.join("img.tar"), &d.join("out")).unwrap(), "good");
         let e = fetch(&d.join("img.tar"), &Limits { entries: 2, ..Limits::default() }).err().unwrap().to_string();
         assert!(e.contains("--max-entries"), "{e}");
+    }
+
+    #[test]
+    fn docker_save_directory_links_stay_inside() {
+        let d = tmpdir("docker-links");
+        let saved = d.join("saved");
+        std::fs::create_dir_all(saved.join("original")).unwrap();
+        std::fs::create_dir(saved.join("dedup")).unwrap();
+        let tar = layer(&[("a", 'f', "good")]);
+        std::fs::write(saved.join("config.json"), config(&tar)).unwrap();
+        std::fs::write(saved.join("original/layer.tar"), &tar).unwrap();
+        std::fs::write(saved.join("manifest.json"), r#"[{"Config": "config.json", "Layers": ["dedup/layer.tar"]}]"#).unwrap();
+        let link = saved.join("dedup/layer.tar");
+        symlink("../original/layer.tar", &link).unwrap();
+        // Also accept a symlink naming the docker-save directory itself.
+        symlink(&saved, d.join("alias")).unwrap();
+        assert_eq!(unpack(&d.join("alias"), &d.join("out")).unwrap(), "good");
+        std::fs::remove_file(&link).unwrap();
+        symlink(saved.join("original/layer.tar"), &link).unwrap();
+        assert_eq!(unpack(&saved, &d.join("absolute-out")).unwrap(), "good");
+
+        // Prefix siblings, absolute targets and links through directories must not escape.
+        let outside = d.join("saved-other");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("layer.tar"), &tar).unwrap();
+        symlink(&outside, saved.join("escape")).unwrap();
+        for target in [PathBuf::from("../../saved-other/layer.tar"), outside.join("layer.tar"), PathBuf::from("../escape/layer.tar")] {
+            std::fs::remove_file(&link).unwrap();
+            symlink(target, &link).unwrap();
+            let err = fetch(&saved, &Limits::default()).err().unwrap().to_string();
+            assert!(err.contains("escapes image directory"), "{err}");
+        }
     }
 
     fn oci_layout(dir: &Path, layer: &[u8]) -> (String, String) {

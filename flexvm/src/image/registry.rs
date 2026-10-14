@@ -148,29 +148,41 @@ impl Registry {
         Ok((serde_json::from_slice(&body)?, digest))
     }
 
-    /// Size and digest are checked before the fsynced rename; cached blobs are checked where used.
+    /// Checks cached blobs before reuse; a corrupt one gets one fresh download, renamed over it so that
+    /// concurrent pulls never see the path missing.
     pub fn blob(&mut self, digest: &str, size: u64, blobs: &Path) -> Result<PathBuf> {
-        let path = blob_path(blobs, digest)?;
-        let dir = path.parent().unwrap().to_path_buf();
-        std::fs::create_dir_all(&dir)?;
-        sweep_parts(&dir);
-        if path.exists() {
+        cached_blob(digest, size, blobs, || Ok(self.get(&format!("blobs/{digest}"), "*/*")?.into_reader()))
+    }
+}
+
+fn cached_blob<R: Read>(digest: &str, size: u64, blobs: &Path, download: impl FnOnce() -> Result<R>) -> Result<PathBuf> {
+    let path = blob_path(blobs, digest)?;
+    let dir = path.parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(&dir)?;
+    sweep_parts(&dir);
+    if path.exists() {
+        let (reader, len) = super::source::Blob::File(path.clone()).open()?;
+        let mut cached = Hashed::new(reader.take(size.saturating_add(1)));
+        std::io::copy(&mut cached, &mut std::io::sink())?;
+        if len == size && cached.n == size && cached.digest() == digest {
+            sync_dir(&dir)?;
             return Ok(path);
         }
-        let mut r = Hashed::new(self.get(&format!("blobs/{digest}"), "*/*")?.into_reader().take(size + 1));
-        super::publish(&path, |f| {
-            std::io::copy(&mut r, f)?;
-            if r.n != size {
-                bail!("blob {digest} does not have its descriptor's {size} bytes");
-            }
-            if r.digest() != digest {
-                bail!("blob {digest} downloaded with digest {}", r.digest());
-            }
-            Ok(())
-        })?;
-        sync_dir(&dir)?;
-        Ok(path)
+        eprintln!("image: cached blob {digest} is corrupt; downloading it again");
     }
+    let mut r = Hashed::new(download()?.take(size.saturating_add(1)));
+    super::replace(&path, |f| {
+        std::io::copy(&mut r, f)?;
+        if r.n != size {
+            bail!("blob {digest} does not have its descriptor's {size} bytes");
+        }
+        if r.digest() != digest {
+            bail!("blob {digest} downloaded with digest {}", r.digest());
+        }
+        Ok(())
+    })?;
+    sync_dir(&dir)?;
+    Ok(path)
 }
 
 fn sweep_parts(dir: &Path) {
@@ -234,6 +246,34 @@ fn docker_credentials(registry: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn corrupt_cached_blobs_are_downloaded_once() {
+        let digest = sha256_hex(b"good");
+        let cases: &[(&[u8], &[u8])] = &[(b"evil", b"good"), (b"x", b"good"), (b"good-extra", b"good"), (b"evil", b"evil"), (b"evil", b"x")];
+        for (i, &(cached, downloaded)) in cases.iter().enumerate() {
+            let dir = super::super::unpack::tests::tmpdir(&format!("blob-retry{i}"));
+            let path = blob_path(&dir, &digest).unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, cached).unwrap();
+            let mut downloads = 0;
+            let result = cached_blob(&digest, 4, &dir, || {
+                downloads += 1;
+                Ok(downloaded)
+            });
+            assert_eq!(downloads, 1);
+            if downloaded == b"good" {
+                assert_eq!(result.unwrap(), path);
+                assert_eq!(std::fs::read(&path).unwrap(), b"good");
+                assert_eq!(cached_blob::<&[u8]>(&digest, 4, &dir, || panic!("must reuse the repaired blob")).unwrap(), path);
+            } else {
+                let err = result.unwrap_err().to_string();
+                assert!(err.contains(if downloaded.len() == 4 { "downloaded with digest" } else { "descriptor's 4 bytes" }), "{err}");
+                assert_eq!(std::fs::read(&path).unwrap(), cached, "a failed download keeps what was there");
+            }
+            assert!(!path.with_extension(format!("part{}", std::process::id())).exists());
+        }
+    }
 
     #[test]
     fn sweep_removes_only_dead_downloads() {

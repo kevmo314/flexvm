@@ -37,7 +37,7 @@ pub enum Blob {
 }
 
 impl Blob {
-    fn open(&self) -> Result<(Box<dyn Read>, u64)> {
+    pub(super) fn open(&self) -> Result<(Box<dyn Read>, u64)> {
         Ok(match self {
             Blob::File(p) => {
                 use std::os::unix::fs::OpenOptionsExt;
@@ -103,8 +103,12 @@ impl Layer {
 pub fn fetch(cache: &Path, src: &str, limits: &Limits) -> Result<Image> {
     let path = Path::new(src);
     let img = if path.is_dir() {
+        let path = std::fs::canonicalize(path)?;
         let in_dir = |p: &str| {
-            let f = path.join(lexical(Path::new(p)));
+            let f = std::fs::canonicalize(path.join(lexical(Path::new(p)))).map_err(|e| format!("{path:?} has no {p:?}: {e}"))?;
+            if !f.starts_with(&path) {
+                bail!("{p:?} escapes image directory {path:?}");
+            }
             match f.is_file() {
                 true => Ok(Blob::File(f)),
                 false => bail!("{path:?} has no {p:?}"),
