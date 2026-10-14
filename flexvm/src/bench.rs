@@ -1,10 +1,6 @@
-//! `flexvm bench`: runs (and optionally migrates) fresh VMs and writes
-//! per-phase latency percentiles to `bench/`. `--lifecycle DIR` instead times
-//! pause/resume, checkpoint, restore and suspend/resume.
-//!
-//! The VMs are driven like a user would: `flexvm run -d`, signals, the
-//! control socket. Migrations go to another host on this machine
-//! (`--to ADDR` with its `--to-state` and `--to-run`).
+//! `flexvm bench`: runs (and optionally migrates) fresh VMs and writes per-phase latency
+//! percentiles to `bench/`; `--lifecycle DIR` times pause, checkpoint, restore and suspend.
+//! VMs are driven as a user would; migrations go to another host on this machine.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -18,17 +14,10 @@ use crate::host::Host;
 use crate::util::{ms, Result};
 use crate::{bail, Args};
 
-/// The two hosts a bench uses: VMs start on `a`; migrations and restores go
-/// to `b` (the same as `a` without `--to`).
-struct Hosts {
-    a: Host,
-    b: Host,
-    to: Option<String>,
-    timeout: Duration,
-}
+/// VMs start on `a`; migrations and restores go to `b` (`a` again without `--to`).
+struct Hosts { a: Host, b: Host, to: Option<String>, timeout: Duration }
 
 impl Hosts {
-    /// Runs this binary's `args` against `host`, returning its JSON output.
     fn cli(&self, host: &Host, args: &[&str]) -> Result<Value> {
         let out = Command::new("/proc/self/exe").arg("--state").arg(&host.state).arg("--run").arg(&host.run).args(args).output()?;
         if !out.status.success() {
@@ -37,11 +26,8 @@ impl Hosts {
         Ok(serde_json::from_slice(&out.stdout).unwrap_or(Value::Null))
     }
 
-    fn state(host: &Host, name: &str) -> String {
-        host.entry(name).map(|e| e.state).unwrap_or_default()
-    }
+    fn state(host: &Host, name: &str) -> String { host.entry(name).map(|e| e.state).unwrap_or_default() }
 
-    /// Waits for `cond`, up to the bench's timeout.
     fn wait(&self, what: &str, cond: impl Fn() -> bool) -> Result<()> {
         let deadline = Instant::now() + self.timeout;
         while !cond() {
@@ -53,7 +39,6 @@ impl Hosts {
         Ok(())
     }
 
-    /// Waits for `name` on `host` to have all its memory in; how long that took.
     fn pulled(&self, host: &Host, name: &str) -> Result<Value> {
         let deadline = Instant::now() + self.timeout;
         loop {
@@ -111,7 +96,6 @@ fn runs(h: &Hosts, args: &Args, template: &str, date: &str) -> Result<Value> {
     let warmup = args.num("warmup", 3)?;
     let dirty_mib = args.num("dirty-mib", 0)?;
     let settle = Duration::from_millis(args.num("settle-ms", 100)?);
-    // Image apps: also time, from the client, until the app answers.
     let ready = match (args.get("ready-port"), args.get("ready-http")) {
         (Some(p), None) => Some((p.parse().map_err(|_| "bad --ready-port")?, false)),
         (None, Some(p)) => Some((p.parse().map_err(|_| "bad --ready-http")?, true)),
@@ -156,8 +140,6 @@ fn runs(h: &Hosts, args: &Args, template: &str, date: &str) -> Result<Value> {
     }))
 }
 
-/// One trial: run `name`, optionally dirty its memory and migrate it, then
-/// kill it. Returns its phase timings grouped by op.
 fn iteration(h: &Hosts, name: &str, template: &str, dirty_mib: u64, ready: Option<(u16, bool)>) -> Result<Value> {
     let start = Instant::now();
     let run = h.cli(&h.a, &["run", name, "--template", template, "-d"])?;
@@ -177,7 +159,6 @@ fn iteration(h: &Hosts, name: &str, template: &str, dirty_mib: u64, ready: Optio
             }
         }
         let migrated = crate::vmproc::call(&h.a, name, json!({"op": "migrate", "to": to}))?;
-        // The source process exits once the target has every page.
         h.wait("the source to let go", || !h.a.alive(name))?;
         let pull = h.pulled(&h.b, name)?;
         sample["migrate"] = migrated["timings_ms"].clone();
@@ -244,15 +225,12 @@ fn lifecycle(h: &Hosts, args: &Args, template: &str, dir: &str, date: &str) -> R
     }))
 }
 
-/// One VM with `mib` MiB written to its /tmp: ten pause/resume cycles,
-/// checkpoint --stop, restore on the other host, then suspend and resume
-/// there.
+/// Ten pause/resume cycles, checkpoint --stop, restore on `b`, then suspend and resume.
 fn trial(h: &Hosts, name: &str, template: &str, mib: u64, ck: &std::path::Path) -> Result<Value> {
     h.cli(&h.a, &["run", name, "--template", template, "-d"])?;
     if mib > 0 && crate::exec(&h.a, name, &format!("dd if=/dev/urandom of=/tmp/f bs=1M count={mib} 2>/dev/null"))? != 0 {
         bail!("dirtying guest memory failed");
     }
-    // A signal, until the registry shows its effect.
     let (mut p, mut r) = (Vec::new(), Vec::new());
     for _ in 0..10 {
         let t = Instant::now();
@@ -311,13 +289,11 @@ fn host_context(template: &str) -> Value {
         "loadavg": read("/proc/loadavg"),
         "cpu_model": model.map(|(_, v)| v.trim()),
         "host_cpus": crate::util::host_cpus(),
-        // This host is itself a guest, so VMs here run nested.
         "nested_virt": cpuinfo.split_whitespace().any(|f| f == "hypervisor"),
         "template": template,
     })
 }
 
-/// Waits until `addr` accepts a TCP connection or, with `http`, answers a GET.
 fn wait_ready(addr: SocketAddr, http: bool, deadline: Instant) -> Result<()> {
     loop {
         let attempt = (|| -> std::io::Result<()> {
@@ -340,9 +316,8 @@ fn wait_ready(addr: SocketAddr, http: bool, deadline: Instant) -> Result<()> {
     }
 }
 
-/// Nearest-rank p50/p90/p99/max of every phase in `group`. A phase only some
-/// samples went through (e.g. the snapshot load of a cold run) counts as 0
-/// in the others, so the phases still add up to each sample's total.
+/// Nearest-rank percentiles; a phase only some samples have counts as 0 in the others, so
+/// phases still add up to each sample's total.
 fn summarize(samples: &[Value], group: &str) -> Result<Value> {
     let mut phases: Vec<&String> = Vec::new();
     for s in samples {

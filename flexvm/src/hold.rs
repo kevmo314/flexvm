@@ -1,15 +1,9 @@
-//! Holds packets for a VM while a migration or checkpoint has it paused, and
-//! delivers them once it runs again, instead of letting them hit a downed tap
-//! (TCP peers would wait out a retransmit timeout).
+//! Holds packets for a paused VM and delivers them once it runs again, instead of letting
+//! them hit a downed tap (TCP peers would wait out a retransmit timeout).
 //!
-//! Each VM process has one TUN device, `<prefix><pid>h`. Just before the
-//! pause, `hold` routes the VM's /32 to it; a thread queues what arrives, per
-//! address, up to `CAP` bytes. `release` hands the queue (and what still
-//! arrives) to a sink, switches the route, and hands over the rest. A
-//! migration's sink streams them to the target (`send`), which injects each
-//! as an Ethernet frame out of the VM's tap (`Injector`), byte for byte, and
-//! announces the VM only after the stream ends, so held packets come first.
-//! A checkpoint, or an aborted migration, injects into the VM's own tap.
+//! `hold` routes the VM's /32 to this process's TUN device; `release` hands the queue to a
+//! sink and switches the route. A migration streams them to the target (`send`), which
+//! injects them out of the VM's tap and announces the VM only after, so they come first.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufReader, Read, Write};
@@ -24,14 +18,11 @@ use serde_json::{json, Value};
 use crate::bail;
 use crate::util::{By, Result};
 
-/// Bytes held per address; packets beyond it are dropped and counted.
+/// Bytes held per address; packets beyond it are dropped.
 pub const CAP: usize = 4 << 20;
-/// How long `release` hands over packets still on their way, on each side of
-/// the route switch; past it (a flood faster than the sink) they are dropped.
+/// Per round of `release`; past it (a flood faster than the sink) packets are dropped.
 const CATCH_UP: Duration = Duration::from_millis(100);
 const MAX_FRAME: usize = 65535;
-/// How long a source waits for a target to accept the stream, confirm a
-/// sync, take one buffer, and account for the stream.
 const ACCEPT_WAIT: Duration = Duration::from_secs(1);
 const SYNC_WAIT: Duration = Duration::from_millis(250);
 const FLUSH_WAIT: Duration = Duration::from_millis(400);
@@ -45,38 +36,24 @@ pub struct Holder {
     held: Mutex<HashMap<Ipv4Addr, Arc<Entry>>>,
     /// The reader has packets in hand not queued yet.
     reading: AtomicBool,
-    /// Times the reader found the device empty: once it moves on, what was in
-    /// the device before is queued.
+    /// Times the reader emptied the device: once it moves on, what was there is queued.
     passes: AtomicU64,
     /// Held while an address's TUN route is added or deleted.
     routes: Mutex<()>,
 }
 
-struct Entry {
-    mig: u64,
-    q: Mutex<Queue>,
-}
+struct Entry { mig: u64, q: Mutex<Queue> }
 
 #[derive(Default)]
-struct Queue {
-    packets: VecDeque<Vec<u8>>,
-    bytes: usize,
-    /// Being released: `holding_for` no longer reports it.
-    releasing: bool,
-    dropped: u64,
-}
+struct Queue { packets: VecDeque<Vec<u8>>, bytes: usize, releasing: bool, dropped: u64 }
 
-/// What became of the held packets.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Stats {
     /// Handed to the sink.
     pub packets: u64,
     pub bytes: u64,
-    /// Dropped here: over `CAP`, not handed over in time, or the sink failed.
     pub dropped: u64,
-    /// Injected by the target.
     pub injected: u64,
-    /// Lost on the target (injection failed, tap queue full, stream broke).
     pub dropped_target: u64,
 }
 
@@ -94,8 +71,7 @@ impl Stats {
 }
 
 impl Holder {
-    /// Creates TUN device `dev`, this process's alone. None, with a warning,
-    /// without TUN support: then nothing is held.
+    /// None, with a warning, without TUN support: then nothing is held.
     pub fn new(dev: &str) -> Result<Option<Arc<Holder>>> {
         let dev = dev.to_string();
         let tun = match open_tun(&dev) {
@@ -115,7 +91,6 @@ impl Holder {
         Ok(Some(h))
     }
 
-    /// Starts holding packets for `ip` for `mig`, just before the VM stops taking them.
     pub fn hold(&self, ip: Ipv4Addr, mig: u64) -> Result<()> {
         let _routes = self.routes.lock().unwrap();
         self.held.lock().unwrap().insert(ip, Arc::new(Entry { mig, q: Mutex::default() }));
@@ -126,18 +101,16 @@ impl Holder {
         self.entry(ip).is_some_and(|e| e.mig == mig && !e.q.lock().unwrap().releasing)
     }
 
-    fn entry(&self, ip: Ipv4Addr) -> Option<Arc<Entry>> {
-        self.held.lock().unwrap().get(&ip).cloned()
-    }
+    fn entry(&self, ip: Ipv4Addr) -> Option<Arc<Entry>> { self.held.lock().unwrap().get(&ip).cloned() }
 
-    /// `mig`'s entry for `ip`, marked releasing; None if not held or already being released.
+    /// None if not held or already being released.
     fn releasing(&self, ip: Ipv4Addr, mig: u64) -> Option<Arc<Entry>> {
         let e = self.entry(ip).filter(|e| e.mig == mig)?;
         let first = !std::mem::replace(&mut e.q.lock().unwrap().releasing, true);
         first.then_some(e)
     }
 
-    /// Stops holding `e` for `ip` (unless a newer hold replaced it).
+    /// Unless a newer hold replaced it.
     fn unhold(&self, ip: Ipv4Addr, e: &Arc<Entry>) {
         let mut held = self.held.lock().unwrap();
         if held.get(&ip).is_some_and(|x| Arc::ptr_eq(x, e)) {
@@ -145,12 +118,8 @@ impl Holder {
         }
     }
 
-    /// Hands what `mig` held for `ip` to `sink` in order, and what reaches
-    /// the device meanwhile, then `barrier` (the far end catching up; what
-    /// arrives meanwhile goes in another round, up to four); `switch`es the
-    /// route and hands over what entered the device during it. `sink` false:
-    /// a packet lost; `barrier` false: the far end is lost, nothing more is
-    /// handed over, but the route still switches. None if not held.
+    /// Hands the queue to `sink` then `barrier`s (far end catching up), up to four rounds, then
+    /// `switch`es and hands over the rest. `barrier` false: far end lost, but the route switches.
     pub fn release(
         &self,
         ip: Ipv4Addr,
@@ -183,10 +152,8 @@ impl Holder {
         Some((stats, switched))
     }
 
-    /// `release` into a VM here, for a VM paused only briefly: waits only for
-    /// `ip`'s own packets (never for the device to go quiet: another VM's may
-    /// keep it busy), at most `within` in all. If `switch` fails the address
-    /// stays held, until the caller `forget`s it.
+    /// `release` into a VM here: never waits for the device to go quiet (another VM's packets
+    /// may keep it busy). If `switch` fails the address stays held until `forget`.
     pub fn release_local(
         &self,
         ip: Ipv4Addr,
@@ -213,9 +180,6 @@ impl Holder {
         Some((stats, switched))
     }
 
-    /// Hands `e`'s queue to `sink`, then, once the reader is past what is in
-    /// the device now, what that added; gives up at `end`, checked between
-    /// batches however fast packets arrive (the rest stays queued).
     fn drain(&self, e: &Entry, sink: &mut dyn FnMut(&[u8]) -> bool, stats: &mut Stats, end: Instant) {
         let mut give = |stats: &mut Stats| {
             while Instant::now() < end {
@@ -234,8 +198,6 @@ impl Holder {
         give(stats);
     }
 
-    /// Hands queued packets to `sink` until the queue and the device are
-    /// empty, or for at most `CATCH_UP` (checked between packets).
     fn hand_over(&self, e: &Entry, sink: &mut dyn FnMut(&[u8]) -> bool, stats: &mut Stats) {
         let end = Instant::now() + CATCH_UP;
         while Instant::now() < end {
@@ -258,14 +220,11 @@ impl Holder {
         }
     }
 
-    /// Drops what `mig` held for `ip`, and its route through the TUN device
-    /// if still there; returns what it dropped.
     pub fn forget(&self, ip: Ipv4Addr, mig: u64) -> Stats {
         // Under `routes`: a newer hold of `ip` never loses its route to this one.
         let _routes = self.routes.lock().unwrap();
         let Some(e) = self.entry(ip).filter(|e| e.mig == mig) else { return Stats::default() };
         self.unhold(ip, &e);
-        // Matches the TUN device as the route's interface: never another route.
         let _ = crate::net::route_dev(false, ip, self.ifindex);
         let mut q = e.q.lock().unwrap();
         let dropped = q.dropped + q.packets.len() as u64;
@@ -273,8 +232,6 @@ impl Holder {
         Stats { dropped, ..Stats::default() }
     }
 
-    /// Reads the device and queues each packet on its address's entry; no
-    /// other I/O.
     fn read_loop(&self) {
         let mut pfd = libc::pollfd { fd: self.tun.as_raw_fd(), events: libc::POLLIN, revents: 0 };
         let mut buf = vec![0u8; 65536];
@@ -322,8 +279,7 @@ impl Queue {
     }
 }
 
-/// Sends IP packets to a guest as Ethernet frames out of its tap, from the
-/// gateway's MAC to the guest's, as Firecracker would deliver them.
+/// Sends IP packets to a guest as Ethernet frames out of its tap, as Firecracker would.
 pub struct Injector {
     fd: OwnedFd,
     tap: String,
@@ -346,7 +302,6 @@ impl Injector {
         Ok(Injector { fd: unsafe { OwnedFd::from_raw_fd(fd) }, tap: tap.into(), ifindex: crate::net::ifindex(tap)?, header, tx_dropped: tap_tx_dropped(tap) })
     }
 
-    /// Queues one packet for the guest; false if the kernel refused it.
     pub fn send(&self, packet: &[u8]) -> bool {
         let frame = [&self.header[..], packet].concat();
         let mut addr: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
@@ -359,61 +314,38 @@ impl Injector {
         unsafe { libc::sendto(self.fd.as_raw_fd(), frame.as_ptr().cast(), frame.len(), libc::MSG_DONTWAIT, (&addr as *const libc::sockaddr_ll).cast(), size) >= 0 }
     }
 
-    /// Frames the tap dropped (queue full) since this was made, the guest's
-    /// own traffic included.
-    pub fn dropped(&self) -> u64 {
-        tap_tx_dropped(&self.tap).saturating_sub(self.tx_dropped)
-    }
+    /// Includes the guest's own traffic.
+    pub fn dropped(&self) -> u64 { tap_tx_dropped(&self.tap).saturating_sub(self.tx_dropped) }
 }
 
 fn tap_tx_dropped(tap: &str) -> u64 {
     std::fs::read_to_string(format!("/sys/class/net/{tap}/statistics/tx_dropped")).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0)
 }
 
-// The stream, on the migration connection after the target's answer: the
-// source sends `START`; the receiver answers `b'a'` and the first sequence
-// number it expects (u64, 0); only then are packets taken off the queue.
-// Frames: u32 big-endian length, u64 sequence number, the IP packet. `SYNC`
-// asks for `b's'` once everything before it is injected (a missing answer
-// breaks the stream). Length 0 ends it; the receiver answers one JSON line.
-// Nothing is resent: what a broken stream loses is counted.
+// Stream: `START`, answered `b'a'` + first expected seq (u64). Frames: u32 BE length, u64
+// seq, packet. `SYNC` gets `b's'` once all before it is injected. Length 0 ends it and gets
+// one JSON line. Nothing is resent.
 const SYNC: u32 = u32::MAX;
 const START: u32 = u32::MAX - 1;
-/// Receivers at once, all migrations together.
 const MAX_RECEIVERS: usize = 8;
 static RECEIVERS: AtomicUsize = AtomicUsize::new(0);
 
-/// What a target did with a stream of held packets.
 #[derive(Debug, Default)]
-pub struct Received {
-    pub injected: u64,
-    /// Malformed, not for the VM, duplicated, missing, refused, or lost to a full tap queue.
-    pub dropped: u64,
-    /// The stream ended properly.
-    pub ended: bool,
-    pub next: u64,
-}
+pub struct Received { pub injected: u64, pub dropped: u64, pub ended: bool, pub next: u64 }
 
-/// Fills `buf` from `r` by `deadline`, however the bytes trickle in.
 fn read_by(r: &mut BufReader<By<TcpStream>>, buf: &mut [u8], deadline: Instant) -> std::io::Result<()> {
     r.get_mut().at = deadline;
     r.read_exact(buf)
 }
 
-/// Writes all of `buf` to `w` by `deadline`.
-fn write_by(w: &TcpStream, buf: &[u8], deadline: Instant) -> std::io::Result<()> {
-    By { s: w, at: deadline }.write_all(buf)
-}
+fn write_by(w: &TcpStream, buf: &[u8], deadline: Instant) -> std::io::Result<()> { By { s: w, at: deadline }.write_all(buf) }
 
-/// Waits until `deadline` for a source to open a stream (`START`).
 pub fn wait_start(r: &mut BufReader<By<TcpStream>>, deadline: Instant) -> bool {
     let mut head = [0u8; 4];
     read_by(r, &mut head, deadline).is_ok() && u32::from_be_bytes(head) == START
 }
 
-/// Accepts a stream and injects its packets, all for `ip`, into `tap`
-/// until it ends or `deadline`; each injection only while `revoked` is
-/// false. None if too many streams are being received already.
+/// Injects only while `revoked` is false. None if too many streams are being received.
 pub fn receive(r: &mut BufReader<By<TcpStream>>, ip: Ipv4Addr, tap: &str, revoked: &Mutex<bool>, deadline: Instant) -> Option<Received> {
     RECEIVERS.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n < MAX_RECEIVERS).then_some(n + 1)).ok()?;
     let got = receive_counted(r, ip, tap, revoked, deadline);
@@ -472,8 +404,6 @@ pub fn valid(p: &[u8], ip: Ipv4Addr) -> bool {
     p.len() >= 20 && p[0] >> 4 == 4 && ihl >= 20 && ihl <= p.len() && u16::from_be_bytes([p[2], p[3]]) as usize == p.len() && p[16..20] == ip.octets()
 }
 
-/// Opens a stream on `conn` and waits for the receiver to accept it; the
-/// sequence number to start at.
 pub fn start(conn: &TcpStream) -> Result<u64> {
     let deadline = Instant::now() + ACCEPT_WAIT;
     write_by(conn, &START.to_be_bytes(), deadline)?;
@@ -485,10 +415,7 @@ pub fn start(conn: &TcpStream) -> Result<u64> {
     Ok(u64::from_be_bytes(ack[1..].try_into().unwrap()))
 }
 
-/// Streams what `mig` held for `ip` to a target over `conn`, after `start`
-/// (from `seq`), and reads back what it did with them. Before `switch`
-/// moves the route there, waits (`SYNC`, up to `CATCH_UP` a round) until the
-/// target has injected everything sent so far, so those come first.
+/// Before `switch` moves the route, `SYNC`s until the target injected all sent so far.
 pub fn send(holder: &Holder, ip: Ipv4Addr, mig: u64, conn: &TcpStream, seq: u64, switch: impl FnOnce() -> Result<()>) -> Option<(Stats, Result<()>)> {
     let out = std::cell::RefCell::new(Out { buf: Vec::with_capacity(64 << 10), seq, broken: false, conn });
     let mut sink = |p: &[u8]| out.borrow_mut().frame(p);
@@ -508,13 +435,11 @@ pub fn send(holder: &Holder, ip: Ipv4Addr, mig: u64, conn: &TcpStream, seq: u64,
     o.buf.extend_from_slice(&0u32.to_be_bytes());
     match o.flush(Instant::now() + FLUSH_WAIT).then(|| read_reply(conn, Instant::now() + REPLY_WAIT)).flatten() {
         Some(r) => (stats.injected, stats.dropped_target) = (r["injected"].as_u64().unwrap_or(0), r["dropped"].as_u64().unwrap_or(0)),
-        // Unaccounted for: count it lost.
         None => stats.dropped_target = stats.packets,
     }
     Some((stats, switched))
 }
 
-/// The receiver's closing JSON line: at most 256 bytes, by `deadline`.
 fn read_reply(conn: &TcpStream, deadline: Instant) -> Option<Value> {
     let (mut line, mut b, mut r) = (Vec::new(), [0u8; 1], By { s: conn, at: deadline });
     while line.len() < 256 {
@@ -527,7 +452,6 @@ fn read_reply(conn: &TcpStream, deadline: Instant) -> Option<Value> {
     None
 }
 
-/// The sending end of a stream, buffered.
 struct Out<'a> {
     buf: Vec<u8>,
     seq: u64,
@@ -547,7 +471,6 @@ impl Out<'_> {
         self.buf.len() < 48 << 10 || self.flush(Instant::now() + FLUSH_WAIT)
     }
 
-    /// Sends what is buffered by `deadline`, or marks the stream broken.
     fn flush(&mut self, deadline: Instant) -> bool {
         if !self.broken {
             self.broken = write_by(self.conn, &self.buf, deadline).is_err();
@@ -562,8 +485,7 @@ fn readable(fd: &OwnedFd) -> bool {
     unsafe { libc::poll(&mut pfd, 1, 0) > 0 }
 }
 
-/// Opens TUN device `dev`; the flag says whether it failed because another
-/// process has it (rather than no TUN support).
+/// The error flag: another process has it (rather than no TUN support).
 fn open_tun(dev: &str) -> std::result::Result<OwnedFd, (bool, crate::util::Error)> {
     const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
     let fd = unsafe { libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC | libc::O_NONBLOCK) };

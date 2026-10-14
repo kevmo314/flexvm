@@ -13,7 +13,6 @@ macro_rules! bail {
 
 pub const PAGE_SIZE: usize = 4096;
 
-/// Writes one JSON value as a line.
 pub fn send_json(w: &mut impl Write, v: &serde_json::Value) -> io::Result<()> {
     let mut buf = serde_json::to_vec(v)?;
     buf.push(b'\n');
@@ -21,16 +20,12 @@ pub fn send_json(w: &mut impl Write, v: &serde_json::Value) -> io::Result<()> {
     w.flush()
 }
 
-/// Longest JSON line `recv_json` accepts: room for an exec command of the
-/// guest's 1 MiB limit even when escaping inflates it.
+/// Room for an exec command of the guest's 1 MiB limit even when escaping inflates it.
 const MAX_LINE: u64 = 8 << 20;
 
-/// Reads one JSON line. Returns None on EOF.
-pub fn recv_json(r: &mut impl BufRead) -> Result<Option<serde_json::Value>> {
-    recv_json_max(r, MAX_LINE)
-}
+/// None on EOF.
+pub fn recv_json(r: &mut impl BufRead) -> Result<Option<serde_json::Value>> { recv_json_max(r, MAX_LINE) }
 
-/// Reads one JSON line of at most `max` bytes. Returns None on EOF.
 pub fn recv_json_max(r: &mut impl BufRead, max: u64) -> Result<Option<serde_json::Value>> {
     let mut line = String::new();
     if r.take(max).read_line(&mut line)? == 0 {
@@ -42,7 +37,6 @@ pub fn recv_json_max(r: &mut impl BufRead, max: u64) -> Result<Option<serde_json
     Ok(Some(serde_json::from_str(&line)?))
 }
 
-/// Retries `f` until it succeeds or `timeout` elapses.
 pub fn retry<T>(timeout: Duration, mut f: impl FnMut() -> Result<T>) -> Result<T> {
     let start = Instant::now();
     loop {
@@ -54,8 +48,7 @@ pub fn retry<T>(timeout: Duration, mut f: impl FnMut() -> Result<T>) -> Result<T
     }
 }
 
-/// Connects to `addr` within `timeout`, splitting what is left of it evenly
-/// across the addresses not tried yet, so a blackholed one cannot use it all.
+/// Splits the timeout across the addresses so a blackholed one cannot use it all.
 pub fn connect(addr: &str, timeout: Duration) -> io::Result<std::net::TcpStream> {
     use std::net::ToSocketAddrs;
     let deadline = Instant::now() + timeout;
@@ -74,7 +67,6 @@ pub fn connect(addr: &str, timeout: Duration) -> io::Result<std::net::TcpStream>
     Err(last)
 }
 
-/// A socket whose timeouts can be set per operation.
 pub trait Timed: Read + Write {
     fn read_timeout(&self, t: Duration) -> io::Result<()>;
     fn write_timeout(&self, t: Duration) -> io::Result<()>;
@@ -83,19 +75,14 @@ pub trait Timed: Read + Write {
 macro_rules! timed {
     ($($t:ty),*) => {$(
         impl Timed for $t {
-            fn read_timeout(&self, t: Duration) -> io::Result<()> {
-                self.set_read_timeout(Some(t))
-            }
-            fn write_timeout(&self, t: Duration) -> io::Result<()> {
-                self.set_write_timeout(Some(t))
-            }
+            fn read_timeout(&self, t: Duration) -> io::Result<()> { self.set_read_timeout(Some(t)) }
+            fn write_timeout(&self, t: Duration) -> io::Result<()> { self.set_write_timeout(Some(t)) }
         }
     )*};
 }
 timed!(std::net::TcpStream, &std::net::TcpStream, UnixStream);
 
-/// `s`, with every read and write (each partial one) ending by `at`,
-/// however slowly the other end trickles.
+/// Every read and write (each partial one) ends by `at`, however slowly the peer trickles.
 pub struct By<S> {
     pub s: S,
     pub at: Instant,
@@ -129,14 +116,11 @@ impl<S: Timed> Write for By<S> {
         self.s.write_timeout(self.left()?)?;
         self.s.write(buf).map_err(timed_out)
     }
-    fn flush(&mut self) -> io::Result<()> {
-        self.s.flush()
-    }
+    fn flush(&mut self) -> io::Result<()> { self.s.flush() }
 }
 
-/// Connects to the unix socket at `path` within `timeout`, with reads and
-/// writes on it timing out after `timeout` too. (A blocking connect waits
-/// for as long as the listener's backlog stays full.)
+/// Reads and writes time out after `timeout` too. (A blocking connect waits for as long
+/// as the listener's backlog stays full.)
 pub fn connect_unix(path: &std::path::Path, timeout: Duration) -> io::Result<UnixStream> {
     use std::os::unix::ffi::OsStrExt;
     let deadline = Instant::now() + timeout;
@@ -168,7 +152,6 @@ pub fn connect_unix(path: &std::path::Path, timeout: Duration) -> io::Result<Uni
     Ok(s)
 }
 
-/// A pidfd for `pid`: it keeps naming that process even once the pid is reused.
 pub fn pidfd_open(pid: u32) -> io::Result<OwnedFd> {
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
     if fd < 0 {
@@ -177,7 +160,6 @@ pub fn pidfd_open(pid: u32) -> io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
 }
 
-/// Sends `sig` to the process behind `pidfd`.
 pub fn pidfd_signal(pidfd: &OwnedFd, sig: i32) -> io::Result<()> {
     match unsafe { libc::syscall(libc::SYS_pidfd_send_signal, pidfd.as_raw_fd(), sig, std::ptr::null::<libc::siginfo_t>(), 0) } {
         0 => Ok(()),
@@ -185,12 +167,10 @@ pub fn pidfd_signal(pidfd: &OwnedFd, sig: i32) -> io::Result<()> {
     }
 }
 
-/// SIGKILLs the process behind `pidfd`; one that already exited is fine.
 pub fn pidfd_kill(pidfd: &OwnedFd) -> io::Result<()> {
     pidfd_signal(pidfd, libc::SIGKILL).or_else(|e| if e.raw_os_error() == Some(libc::ESRCH) { Ok(()) } else { Err(e) })
 }
 
-/// Waits up to `timeout` for the process behind `pidfd` to exit.
 pub fn pidfd_wait(pidfd: &OwnedFd, timeout: Duration) -> io::Result<bool> {
     let mut pfd = libc::pollfd { fd: pidfd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
     let end = Instant::now() + timeout;
@@ -203,17 +183,10 @@ pub fn pidfd_wait(pidfd: &OwnedFd, timeout: Duration) -> io::Result<bool> {
     }
 }
 
-pub fn ms(d: Duration) -> f64 {
-    (d.as_secs_f64() * 1e5).round() / 100.0
-}
+pub fn ms(d: Duration) -> f64 { (d.as_secs_f64() * 1e5).round() / 100.0 }
 
-/// Back-to-back phase timings: each mark covers the time since the previous
-/// one, so the phases sum to the total.
-pub struct Phases {
-    start: Instant,
-    last: Instant,
-    marks: serde_json::Map<String, serde_json::Value>,
-}
+/// Back-to-back phase timings that sum to the total.
+pub struct Phases { start: Instant, last: Instant, marks: serde_json::Map<String, serde_json::Value> }
 
 impl Phases {
     pub fn new() -> Phases {
@@ -221,7 +194,6 @@ impl Phases {
         Phases { start: now, last: now, marks: serde_json::Map::new() }
     }
 
-    /// Ends phase `name` now and returns its length.
     pub fn mark(&mut self, name: &str) -> Duration {
         let now = Instant::now();
         let d = now - self.last;
@@ -230,10 +202,7 @@ impl Phases {
         d
     }
 
-    /// Time from the start to the last mark.
-    pub fn total(&self) -> Duration {
-        self.last - self.start
-    }
+    pub fn total(&self) -> Duration { self.last - self.start }
 
     pub fn json(&self) -> serde_json::Value {
         let mut marks = self.marks.clone();
@@ -242,7 +211,7 @@ impl Phases {
     }
 }
 
-/// Reads a `Key: value kB` field from a /proc style file, in bytes.
+/// A `Key: value kB` field from a /proc style file, in bytes.
 pub fn proc_kb(path: &str, key: &str) -> Option<u64> {
     let s = std::fs::read_to_string(path).ok()?;
     s.lines()
@@ -252,22 +221,13 @@ pub fn proc_kb(path: &str, key: &str) -> Option<u64> {
         .map(|kb| kb * 1024)
 }
 
-pub fn host_cpus() -> usize {
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
-}
+pub fn host_cpus() -> usize { std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) }
 
-/// Creates `dir` and any missing parents, and fsyncs every parent along the
-/// way (each time, as a crash may have lost an entry made before, or another
-/// process made it without syncing), so the hierarchy survives a power loss.
-/// Errors name the directory.
-pub fn create_dir_durably(dir: &std::path::Path) -> io::Result<()> {
-    create_dir_durably_mode(dir, 0o777)
-}
+/// Fsyncs every parent each time: a crash may have lost an entry made before, or another
+/// process made it without syncing.
+pub fn create_dir_durably(dir: &std::path::Path) -> io::Result<()> { create_dir_durably_mode(dir, 0o777) }
 
-/// Creates private state directories, including missing parents.
-pub fn create_private_dir_durably(dir: &std::path::Path) -> io::Result<()> {
-    create_dir_durably_mode(dir, 0o700)
-}
+pub fn create_private_dir_durably(dir: &std::path::Path) -> io::Result<()> { create_dir_durably_mode(dir, 0o700) }
 
 fn create_dir_durably_mode(dir: &std::path::Path, mode: u32) -> io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
@@ -286,7 +246,6 @@ fn create_dir_durably_mode(dir: &std::path::Path, mode: u32) -> io::Result<()> {
     Ok(())
 }
 
-/// Sends `line` (one JSON request line) on `s` with `fds` attached.
 pub fn send_with_fds(s: &UnixStream, line: &[u8], fds: &[RawFd]) -> io::Result<()> {
     let mut iov = libc::iovec { iov_base: line.as_ptr() as *mut libc::c_void, iov_len: line.len() };
     let space = unsafe { libc::CMSG_SPACE(std::mem::size_of_val(fds) as u32) } as usize;
@@ -320,8 +279,7 @@ pub fn send_with_fds(s: &UnixStream, line: &[u8], fds: &[RawFd]) -> io::Result<(
     Ok(())
 }
 
-/// Reads one request line from `s`, and the fds that came with it. The
-/// peer sends nothing after the line until it has an answer.
+/// The peer must send nothing after the line until it has an answer.
 pub fn recv_with_fds(s: &UnixStream, max: usize) -> io::Result<(Vec<u8>, Vec<OwnedFd>)> {
     let mut line = Vec::new();
     let mut fds = Vec::new();
@@ -366,8 +324,7 @@ pub fn recv_with_fds(s: &UnixStream, max: usize) -> io::Result<(Vec<u8>, Vec<Own
     Ok((line, fds))
 }
 
-/// Blocks `sigs` in this thread and every thread it starts afterwards, so
-/// only `wait_signal` sees them.
+/// Also in threads started afterwards, so only `wait_signal` sees them.
 pub fn block_signals(sigs: &[i32]) -> libc::sigset_t {
     unsafe {
         let mut set: libc::sigset_t = std::mem::zeroed();
@@ -386,9 +343,7 @@ pub fn wait_signal(set: &libc::sigset_t) -> i32 {
     sig
 }
 
-/// Starts this binary with `args` in a session of its own (it outlives the
-/// caller), stdin empty, output to `log`, `fd3` as its fd 3, with `env`;
-/// reaped in the background.
+/// In a session of its own (it outlives the caller), with `fd3` as its fd 3.
 pub fn spawn_self<S: AsRef<std::ffi::OsStr>>(args: &[S], log: &std::fs::File, fd3: RawFd, env: &[(&str, &str)]) -> io::Result<()> {
     use std::os::unix::process::CommandExt;
     let mut cmd = std::process::Command::new("/proc/self/exe");
@@ -425,7 +380,6 @@ mod tests {
         assert_eq!(recv_json(&mut input).unwrap(), Some(0.into()));
         assert_eq!(recv_json(&mut input).unwrap(), Some(1.into()));
         assert!(recv_json(&mut input).unwrap().is_none());
-        // Callers that expect more (migration headers) raise the limit.
         let mut line = vec![b' '; MAX_LINE as usize + 100];
         line.extend_from_slice(b"2\n");
         assert_eq!(recv_json_max(&mut io::Cursor::new(line), 2 * MAX_LINE).unwrap(), Some(2.into()));

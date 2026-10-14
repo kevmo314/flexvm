@@ -1,12 +1,8 @@
-//! Snapshot compatibility preflight. A template records the host it was built
-//! on: the CPU model, the CPU features KVM offered (Firecracker passes them
-//! to the guest; no CPU template is configured), the XSAVE layout and the
-//! Firecracker build. Checkpoints and migrations carry that template's guest
-//! CPU (their template is pinned by content id), so the template's record
-//! covers them too. A host may load the snapshot only with the same CPU model,
-//! every recorded feature bit, the same XSAVE layout and the same Firecracker.
-//! Topology, cache and leaf-limit words are not compared: Firecracker rewrites
-//! the first, and the others do not change what the guest can run.
+//! Snapshot compatibility preflight. A template records its build host's CPU model, the
+//! features KVM offered (passed through: no CPU template), XSAVE layout and Firecracker;
+//! checkpoints and migrations pin their template, so this covers them too. Topology, cache
+//! and leaf-limit words are not compared: Firecracker rewrites the first, the rest do not
+//! change what the guest can run.
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::os::fd::AsRawFd;
@@ -20,41 +16,25 @@ use crate::{bail, util::Result};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Compat {
-    /// Vendor, family and model.
     pub cpu: String,
     /// `firecracker --version` and the binary's content hash.
     pub firecracker: String,
-    /// Feature bitmaps, by "leaf.subleaf.register".
+    /// By "leaf.subleaf.register".
     pub features: BTreeMap<String, u32>,
-    /// XSAVE state component -> [size, offset].
+    /// Component -> [size, offset].
     pub xsave: BTreeMap<u32, [u32; 2]>,
 }
 
 /// CPUID words that are feature bitmaps: (leaf, subleaf, register).
+#[rustfmt::skip]
 const FEATURES: [(u32, u32, usize); 18] = [
-    (0x1, 0, 2),
-    (0x1, 0, 3),
-    (0x7, 0, 1),
-    (0x7, 0, 2),
-    (0x7, 0, 3),
-    (0x7, 1, 0),
-    (0x7, 1, 3),
-    (0x7, 2, 3),
-    (0xd, 0, 0),
-    (0xd, 0, 3),
-    (0xd, 1, 0),
-    (0xd, 1, 2),
-    (0xd, 1, 3),
-    (0x4000_0001, 0, 0),
-    (0x8000_0001, 0, 2),
-    (0x8000_0001, 0, 3),
-    (0x8000_0008, 0, 1),
-    (0x8000_0021, 0, 0),
+    (0x1, 0, 2), (0x1, 0, 3), (0x7, 0, 1), (0x7, 0, 2), (0x7, 0, 3), (0x7, 1, 0), (0x7, 1, 3), (0x7, 2, 3),
+    (0xd, 0, 0), (0xd, 0, 3), (0xd, 1, 0), (0xd, 1, 2), (0xd, 1, 3),
+    (0x4000_0001, 0, 0), (0x8000_0001, 0, 2), (0x8000_0001, 0, 3), (0x8000_0008, 0, 1), (0x8000_0021, 0, 0),
 ];
 const REGS: [&str; 4] = ["eax", "ebx", "ecx", "edx"];
 
 impl Compat {
-    /// Whether a snapshot recorded as `self` may be loaded on `host`.
     pub fn check(&self, host: &Self) -> Result<()> {
         for (what, snapshot, here) in [("CPU", &self.cpu, &host.cpu), ("Firecracker", &self.firecracker, &host.firecracker)] {
             if snapshot != here {
@@ -94,8 +74,7 @@ impl Compat {
     }
 }
 
-/// This host, with the binary of Firecracker process `pid`. Cached while that
-/// file is unchanged.
+/// Cached while the Firecracker binary is unchanged.
 pub fn local(pid: u32) -> Result<Compat> {
     static CACHE: Mutex<Option<(Stamp, Compat)>> = Mutex::new(None);
     let firecracker = PathBuf::from(format!("/proc/{pid}/exe"));
@@ -113,8 +92,6 @@ pub fn local(pid: u32) -> Result<Compat> {
     Ok(compat)
 }
 
-/// Fails unless Firecracker process `pid` on this host may load snapshots of
-/// `template` (or of its VMs).
 pub fn check(template: &Template, pid: u32) -> Result<()> {
     let record = template.meta.compatibility.as_ref();
     let record = record.ok_or_else(|| format!("template {:?} has no compatibility record; rebuild it with `flexvm template`", template.name))?;
@@ -175,24 +152,19 @@ mod tests {
     #[test]
     fn rejects_each_mismatch_with_its_name() {
         let snapshot = host();
-        let expect = |h: Compat, expected: &str| {
+        type Change = fn(&mut Compat);
+        let cases: [(Change, &str); 5] = [
+            (|h| h.cpu = "GenuineIntel family 0x6 model 0x55".into(), "CPU differs"),
+            (|h| h.firecracker = "Firecracker v1.18.0 (content a)".into(), "Firecracker differs"),
+            (|h| *h.features.get_mut("0x1.0.ecx").unwrap() &= !1, "CPUID 0x1.0.ecx 0x1 "),
+            (|h| { h.features.remove("0x7.0.ebx"); }, "CPUID 0x7.0.ebx 0x219c01ab"),
+            (|h| { h.xsave.insert(2, [0x100, 0x400]); }, "XSAVE component 2"),
+        ];
+        for (change, expected) in cases {
+            let mut h = snapshot.clone();
+            change(&mut h);
             let e = snapshot.check(&h).unwrap_err().to_string();
             assert!(e.contains(expected), "{e}");
-        };
-        let mut h = snapshot.clone();
-        h.cpu = "GenuineIntel family 0x6 model 0x55".into();
-        expect(h, "CPU differs");
-        let mut h = snapshot.clone();
-        h.firecracker = "Firecracker v1.18.0 (content a)".into();
-        expect(h, "Firecracker differs");
-        let mut h = snapshot.clone();
-        *h.features.get_mut("0x1.0.ecx").unwrap() &= !1;
-        expect(h, "CPUID 0x1.0.ecx 0x1 ");
-        let mut h = snapshot.clone();
-        h.features.remove("0x7.0.ebx");
-        expect(h, "CPUID 0x7.0.ebx 0x219c01ab");
-        let mut h = snapshot.clone();
-        h.xsave.insert(2, [0x100, 0x400]);
-        expect(h, "XSAVE component 2");
+        }
     }
 }

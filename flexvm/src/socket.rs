@@ -27,7 +27,6 @@ fn denied(path: &Path, what: &str) -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, format!("socket directory {}: {what}", path.display()))
 }
 
-/// A real directory (not a symlink) owned by us with mode 0700.
 fn private(path: &Path) -> io::Result<()> {
     let m = fs::symlink_metadata(path)?;
     if !m.is_dir() || m.uid() != unsafe { libc::geteuid() } || m.mode() & 0o7777 != 0o700 {
@@ -36,9 +35,8 @@ fn private(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Creates `base` as a private directory, or checks the one that is there.
-/// Its parent must be one only root or we can rename it out of (sticky
-/// directories like /tmp included), so nobody can swap it later.
+/// Its parent must be one only root or we can rename it out of (sticky /tmp included), so
+/// nobody can swap it later.
 fn base_dir(base: &Path) -> io::Result<()> {
     let parent = base.parent().unwrap();
     let _ = DirBuilder::new().mode(0o700).create(parent);
@@ -54,15 +52,10 @@ fn base_dir(base: &Path) -> io::Result<()> {
     private(base)
 }
 
-fn bases() -> [PathBuf; 2] {
-    [PathBuf::from("/run/flexvm/s"), PathBuf::from(format!("/tmp/flexvm-s-{}", unsafe { libc::geteuid() }))]
-}
+fn bases() -> [PathBuf; 2] { [PathBuf::from("/run/flexvm/s"), PathBuf::from(format!("/tmp/flexvm-s-{}", unsafe { libc::geteuid() }))] }
 
-/// The socket root a `SocketRoot::new(key)` would use under each base. Named
-/// after the key, so a process with the same key finds what its predecessor left.
-pub fn roots(key: &Path) -> Vec<PathBuf> {
-    roots_in(&bases(), key)
-}
+/// Named after the key, so a process with the same key finds what its predecessor left.
+pub fn roots(key: &Path) -> Vec<PathBuf> { roots_in(&bases(), key) }
 
 fn roots_in(bases: &[PathBuf], key: &Path) -> Vec<PathBuf> {
     let h = Sha256::digest(key.as_os_str().as_bytes());
@@ -71,7 +64,7 @@ fn roots_in(bases: &[PathBuf], key: &Path) -> Vec<PathBuf> {
     bases.iter().filter(|b| private(b).is_ok()).map(|b| b.join(&name)).collect()
 }
 
-/// Removes every socket root of `key`; their Firecrackers must be gone.
+/// Their Firecrackers must be gone.
 pub fn remove(key: &Path) {
     for dir in roots(key) {
         let _ = fs::remove_dir_all(dir);
@@ -79,17 +72,10 @@ pub fn remove(key: &Path) {
 }
 
 /// One VM process or template build. Slots keep it alive until their cleanup.
-pub struct SocketRoot {
-    pub dir: PathBuf,
-    next: AtomicU64,
-}
+pub struct SocketRoot { pub dir: PathBuf, next: AtomicU64 }
 
 impl SocketRoot {
-    /// A fresh root for `key` (a VM process's work directory, or a
-    /// template build's directory), replacing a stale one of the same key.
-    pub fn new(key: &Path) -> Result<Arc<Self>> {
-        Self::from_bases(&bases(), key)
-    }
+    pub fn new(key: &Path) -> Result<Arc<Self>> { Self::from_bases(&bases(), key) }
 
     fn from_bases(bases: &[PathBuf], key: &Path) -> Result<Arc<Self>> {
         let mut errors = Vec::new();
@@ -120,9 +106,7 @@ impl SocketRoot {
 }
 
 impl Drop for SocketRoot {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir(&self.dir);
-    }
+    fn drop(&mut self) { let _ = fs::remove_dir(&self.dir); }
 }
 
 /// One Firecracker's sockets; removing the directory also removes its vsock port UDSes.
@@ -135,15 +119,11 @@ pub struct Sockets {
 }
 
 impl Sockets {
-    pub fn cleanup(&self) {
-        let _ = fs::remove_dir_all(&self.dir);
-    }
+    pub fn cleanup(&self) { let _ = fs::remove_dir_all(&self.dir); }
 }
 
 impl Drop for Sockets {
-    fn drop(&mut self) {
-        self.cleanup();
-    }
+    fn drop(&mut self) { self.cleanup(); }
 }
 
 #[cfg(test)]
@@ -202,7 +182,6 @@ mod tests {
             assert!(roots_in(&[base], &t).is_empty());
         }
         assert_eq!(fs::read_dir(&shared).unwrap().count(), 0);
-        // Falls back to the next base.
         let root = SocketRoot::from_bases(&[shared.clone(), t.join("ok")], &t).unwrap();
         assert_eq!(root.dir.parent().unwrap(), t.join("ok"));
         drop(root);

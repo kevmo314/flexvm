@@ -1,6 +1,5 @@
-//! Templates: a VM cold-booted once and snapshotted right after the guest
-//! agent came up. Every VM is a UFFD restore of a template, so "boot" costs a
-//! snapshot load and pages are copied in only as the guest touches them.
+//! Templates: a VM cold-booted once and snapshotted once its agent is up. Every VM is a
+//! UFFD restore of one, so "boot" costs a snapshot load plus the pages the guest touches.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -22,7 +21,6 @@ use crate::socket::SocketRoot;
 use crate::uffd::Pager;
 use crate::util::{ms, retry, Result, PAGE_SIZE};
 
-/// How often Firecracker refreshes the guest's balloon statistics.
 pub const BALLOON_STATS_S: u16 = 1;
 
 pub const BOOT_ARGS: &str = "console=ttyS0 quiet reboot=k panic=1 pci=off \
@@ -30,28 +28,15 @@ pub const BOOT_ARGS: &str = "console=ttyS0 quiet reboot=k panic=1 pci=off \
     rootflags=dax init=/sbin/flexvm-init psi=1 \
     memhp_default_state=online memory_hotplug.online_policy=auto-movable memory_hotplug.auto_movable_ratio=2000";
 
-/// KVM memslot size for the virtio-mem region (MiB). Restores pay per slot,
-/// and plugged but untouched memory costs the host nothing, so slots are big.
+/// Restores pay per KVM memslot and untouched memory is free, so slots are big.
 pub const SLOT_MIB: u64 = 1024;
-/// Step the controller grows and shrinks guests by (MiB).
 pub const STEP_MIB: u64 = 128;
-/// Default boot memory (MiB) for a guest that may grow to `max_mib`. The page
-/// structs of hot-plugged memory (1/64 of it), page tables and every other
-/// kernel allocation need kernel (not movable) memory. The guest onlines
-/// hot-plugged blocks `auto-movable` (BOOT_ARGS): movable while it has at
-/// least 1/20 as much kernel memory, else as kernel memory, so kernel memory
-/// grows with the plug whatever the base. (All movable, a 256 MiB base ran out
-/// at ~13 GiB plugged and the guest panicked, #97.) This base keeps a guest's
-/// first ~20x of it movable. Boot memory the guest does not touch costs the
-/// host nothing either.
-pub fn base_mib(max_mib: u64) -> u64 {
-    (256 + max_mib / 32).div_ceil(STEP_MIB) * STEP_MIB
-}
+/// Hot-plugged memory is movable, so the page structs of all of it (1/64) must fit in boot
+/// memory: a 256 MiB base OOMs near 11 GiB plugged.
+pub fn base_mib(max_mib: u64) -> u64 { (256 + max_mib / 32).div_ceil(STEP_MIB) * STEP_MIB }
 
-/// Hotplug memory a template is snapshotted with, so every VM starts with it
-/// plugged (MiB). Plugged memory the guest never touches costs the host
-/// nothing, so a burst of allocations right after `run` never waits on the
-/// host. The controller never shrinks a VM below this.
+/// Plugged in the snapshot (untouched, it costs nothing), so early allocations never wait
+/// on the host; the controller never shrinks a VM below it.
 pub const PLUG_MIB: u64 = 4096;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,7 +46,6 @@ pub struct Meta {
     pub vcpus: u32,
     pub mem_mib: u64,
     pub max_mib: u64,
-    /// Hotplug memory plugged in the snapshot (MiB).
     #[serde(default)]
     pub plugged_mib: u64,
     pub kernel: PathBuf,
@@ -70,15 +54,13 @@ pub struct Meta {
     pub id: String,
     #[serde(default)]
     components: BTreeMap<String, Component>,
-    /// Set for templates built from a container image; part of the content id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<ImageMeta>,
 }
 
 pub const FORMAT_VERSION: u64 = 2;
 
-/// What a component file looked like when it was last hashed. ctime catches
-/// rewrites that restore mtime; a rename or copy changes the inode.
+/// ctime catches rewrites that restore mtime; a rename or copy changes the inode.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Stamp {
     size: u64,
@@ -92,32 +74,18 @@ pub(crate) struct Stamp {
 
 impl Stamp {
     pub(crate) fn of(m: &std::fs::Metadata) -> Self {
-        Self {
-            size: m.len(),
-            mtime: m.mtime(),
-            mtime_nsec: m.mtime_nsec(),
-            ctime: m.ctime(),
-            ctime_nsec: m.ctime_nsec(),
-            inode: m.ino(),
-            device: m.dev(),
-        }
+        Self { size: m.len(), mtime: m.mtime(), mtime_nsec: m.mtime_nsec(), ctime: m.ctime(), ctime_nsec: m.ctime_nsec(), inode: m.ino(), device: m.dev() }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct Component {
-    pub(crate) hash: String,
-    pub(crate) metadata: Stamp,
-}
+pub(crate) struct Component { pub(crate) hash: String, pub(crate) metadata: Stamp }
 
-/// FNV-1a over 64-bit words, folded so high bits feed back down. An identity
-/// check for trusted files, not protection against tampering.
+/// An identity check for trusted files, not protection against tampering.
 pub(crate) struct Hash(u64);
 
 impl Hash {
-    pub(crate) fn new() -> Self {
-        Self(0xcbf29ce484222325)
-    }
+    pub(crate) fn new() -> Self { Self(0xcbf29ce484222325) }
 
     pub(crate) fn word(&mut self, w: u64) {
         let h = (self.0 ^ w).wrapping_mul(0x9e3779b97f4a7c15);
@@ -135,13 +103,10 @@ impl Hash {
         self.word(u64::from_le_bytes(tail));
     }
 
-    pub(crate) fn finish(self) -> String {
-        format!("{:016x}", self.0)
-    }
+    pub(crate) fn finish(self) -> String { format!("{:016x}", self.0) }
 }
 
-/// Hashes a file's logical content: its length and every page that is not all
-/// zeroes, so sparse and fully allocated copies of the same bytes match.
+/// Length plus non-zero pages, so sparse and dense copies of the same bytes match.
 fn content_hash(file: &File) -> Result<String> {
     let len = file.metadata()?.len();
     let page = PAGE_SIZE as u64;
@@ -169,7 +134,6 @@ fn content_hash(file: &File) -> Result<String> {
     Ok(hash.finish())
 }
 
-/// Hashes the file at `path`, failing if it changes underneath.
 pub(crate) fn hash_file(path: &Path) -> Result<Component> {
     let file = File::open(path).map_err(|e| format!("template component {}: {e}", path.display()))?;
     let metadata = Stamp::of(&file.metadata()?);
@@ -180,8 +144,6 @@ pub(crate) fn hash_file(path: &Path) -> Result<Component> {
     Ok(Component { hash, metadata })
 }
 
-/// Image templates also cover the image's identity and the app config; the
-/// root filesystem built from the image is the `rootfs` component.
 fn content_id(components: &BTreeMap<String, Component>, image: Option<&ImageMeta>) -> String {
     let mut hash = Hash::new();
     hash.word(FORMAT_VERSION);
@@ -217,8 +179,7 @@ impl Meta {
         Ok(())
     }
 
-    /// Checks the files still match the recorded hashes. Files whose stat
-    /// matches `cache` (or the stamp from creation) are trusted; others are
+    /// Files whose stat matches `cache` (or the creation stamp) are trusted; others are
     /// rehashed if `rehash`, else rejected. Returns whether anything was rehashed.
     fn verify(&self, paths: &Paths, dir: &Path, cache: &mut BTreeMap<String, Stamp>, rehash: bool) -> Result<bool> {
         if self.id.is_empty() || self.components.len() != 5 || content_id(&self.components, self.image.as_ref()) != self.id {
@@ -227,9 +188,7 @@ impl Meta {
         let mut rehashed = false;
         for (name, path) in self.files(paths, dir) {
             let component = &self.components[name];
-            let stamp = Stamp::of(
-                &std::fs::metadata(&path).map_err(|e| format!("template component {}: {e}", path.display()))?,
-            );
+            let stamp = Stamp::of(&std::fs::metadata(&path).map_err(|e| format!("template component {}: {e}", path.display()))?);
             if cache.get(name).unwrap_or(&component.metadata) == &stamp {
                 continue;
             }
@@ -247,7 +206,6 @@ impl Meta {
     }
 }
 
-/// Paths shared by everything that creates or runs VMs.
 #[derive(Debug, Clone)]
 pub struct Paths {
     pub firecracker: PathBuf,
@@ -272,20 +230,15 @@ pub struct Template {
     pub name: String,
     pub dir: PathBuf,
     pub meta: Meta,
-    /// Pages a fresh VM touches on its way to ready, as `(first_page, count)`.
+    /// `(first_page, count)` runs a fresh VM touches on its way to ready.
     pub working_set: Vec<(u64, u64)>,
     /// Its guest agent predates `START`, so starts use `NET` and leave the clock alone.
     pub legacy_agent: AtomicBool,
-    /// Pages Firecracker touches while loading this template's snapshot,
-    /// learned from the standby VMs' loads here (`Pager::learn_load_set`): vCPU
-    /// clock pages, virtqueues and the like, at the same addresses in every
-    /// VM of the template. A migration source sends the ones it has along
-    /// with the vmstate, so the target's load need not fetch them one round
-    /// trip at a time.
+    /// Pages Firecracker touches loading the snapshot, the same in every VM: a migration
+    /// source sends them with the vmstate so the target need not fault them one by one.
     load_set: Mutex<BTreeSet<u64>>,
     map: *const u8,
     len: usize,
-    /// Bitmap of pages that hold data in the memory file (the rest are holes).
     data: Vec<u64>,
     verified: Mutex<BTreeMap<String, Stamp>>,
     /// The directory as opened, through `_handle`, whatever its path refers to now.
@@ -296,18 +249,13 @@ pub struct Template {
 unsafe impl Send for Template {}
 unsafe impl Sync for Template {}
 
-/// Published templates live in `templates/.gen/<content id>/` and never change
-/// afterwards (apart from cached file stamps in meta.json); `templates/NAME` is
-/// a symlink to the current generation, swapped atomically by `create`. A
-/// running VM keeps the generation it was restored from.
+/// `templates/.gen/<content id>/` never changes (bar cached stamps); `templates/NAME` is a
+/// symlink to the current one, swapped atomically by `create`.
 pub const GENERATIONS: &str = ".gen";
 
-/// Most pages a template's load set holds (2 MiB).
 const MAX_LOAD_SET: usize = 512;
 
 impl Template {
-    /// The directory `templates/name` currently stands for: its generation, or
-    /// the directory itself for a template made before generations existed.
     pub fn resolve(paths: &Paths, name: &str) -> Result<PathBuf> {
         let link = paths.templates.join(name);
         match std::fs::read_link(&link) {
@@ -317,18 +265,14 @@ impl Template {
         }
     }
 
-    /// Generation `id` of template `name`, if this host has it.
     pub fn generation(paths: &Paths, id: &str) -> Option<PathBuf> {
         let dir = paths.templates.join(GENERATIONS).join(id);
         (!id.is_empty() && !id.contains('/') && dir.is_dir()).then_some(dir)
     }
 
-    pub fn open(paths: &Paths, name: &str) -> Result<Arc<Template>> {
-        Template::open_dir(name, Template::resolve(paths, name)?)
-    }
+    pub fn open(paths: &Paths, name: &str) -> Result<Arc<Template>> { Template::open_dir(name, Template::resolve(paths, name)?) }
 
-    /// Generation `id` of template `name`, even if the name has moved on
-    /// since, verified: what a checkpoint or a migration source was made from.
+    /// Generation `id`, even if the name has moved on since, verified.
     pub fn open_id(paths: &Paths, name: &str, id: &str) -> Result<Arc<Template>> {
         let tpl = match Template::generation(paths, id) {
             Some(dir) => Template::open_dir(name, dir)?,
@@ -339,17 +283,12 @@ impl Template {
         Ok(tpl)
     }
 
-    /// Opens the template files in `dir`, which `open` resolved from `name`.
     pub fn open_dir(name: &str, dir: PathBuf) -> Result<Arc<Template>> {
-        // Everything is read through one handle on the directory, and so is
-        // the vmstate Firecracker loads later (`vmstate`): a template from
-        // before generations is replaced by renaming another directory over
-        // its path, and this one must keep reading the files it started with.
+        // All reads, the vmstate Firecracker loads included, go through one directory handle:
+        // a pre-generations template is replaced by renaming over its path.
         let handle = File::open(&dir).map_err(|e| format!("template {name:?}: {e}"))?;
         let fixed = PathBuf::from(format!("/proc/{}/fd/{}", std::process::id(), handle.as_raw_fd()));
-        let meta: Meta = serde_json::from_slice(
-            &std::fs::read(fixed.join("meta.json")).map_err(|e| format!("template {name:?}: {e}"))?,
-        )?;
+        let meta: Meta = serde_json::from_slice(&std::fs::read(fixed.join("meta.json")).map_err(|e| format!("template {name:?}: {e}"))?)?;
         let file = File::open(fixed.join("mem"))?;
         let len = file.metadata()?.len() as usize;
         let data = data_bitmap(&file, len)?;
@@ -379,7 +318,6 @@ impl Template {
         }))
     }
 
-    /// Records that a snapshot load faulted on `page` (see `load_set`).
     pub fn note_load_fault(&self, page: u64) {
         let mut set = self.load_set.lock().unwrap();
         if set.len() < MAX_LOAD_SET {
@@ -387,18 +325,13 @@ impl Template {
         }
     }
 
-    /// The pages snapshot loads of this template touched here, sorted.
-    pub fn load_set(&self) -> Vec<u64> {
-        self.load_set.lock().unwrap().iter().copied().collect()
-    }
+    pub fn load_set(&self) -> Vec<u64> { self.load_set.lock().unwrap().iter().copied().collect() }
 
-    /// Checks the files against the content id: stat only, unless `rehash` and
-    /// a file changed since it was last hashed. Never call on the run path.
+    /// Stat only unless `rehash` and a file changed. Never call on the run path.
     pub fn verify(&self, paths: &Paths, rehash: bool) -> Result<()> {
         let cache = &mut self.verified.lock().unwrap();
         // Through the handle: `dir` may name another template by now.
         if self.meta.verify(paths, &self.fixed, cache, rehash)? {
-            // Record the new stamps so the next process on this host need not rehash.
             let mut meta = self.meta.clone();
             for (name, stamp) in cache.iter() {
                 meta.components.get_mut(name).unwrap().metadata = stamp.clone();
@@ -420,16 +353,11 @@ impl Template {
         Ok(())
     }
 
+    pub fn vmstate(&self) -> PathBuf { self.fixed.join("vmstate") }
 
-    pub fn vmstate(&self) -> PathBuf {
-        self.fixed.join("vmstate")
-    }
+    pub fn has_data(&self, page: usize) -> bool { self.data.get(page / 64).is_some_and(|w| w & (1 << (page % 64)) != 0) }
 
-    pub fn has_data(&self, page: usize) -> bool {
-        self.data.get(page / 64).is_some_and(|w| w & (1 << (page % 64)) != 0)
-    }
-
-    /// The template's bytes for `n` pages starting at `page`. They must all have data.
+    /// The pages must all have data.
     pub fn pages(&self, page: usize, n: usize) -> &[u8] {
         let start = page * PAGE_SIZE;
         assert!(start + n * PAGE_SIZE <= self.len);
@@ -438,12 +366,9 @@ impl Template {
 }
 
 impl Drop for Template {
-    fn drop(&mut self) {
-        unsafe { libc::munmap(self.map as *mut _, self.len.max(1)) };
-    }
+    fn drop(&mut self) { unsafe { libc::munmap(self.map as *mut _, self.len.max(1)) }; }
 }
 
-/// Finds the data extents of a sparse file with SEEK_DATA / SEEK_HOLE.
 fn data_bitmap(file: &File, len: usize) -> Result<Vec<u64>> {
     let pages = len.div_ceil(PAGE_SIZE);
     let mut bits = vec![0u64; pages.div_ceil(64)];
@@ -483,7 +408,6 @@ fn data_extents(file: &File, len: u64) -> Result<Vec<(u64, u64)>> {
     Ok(extents)
 }
 
-/// Punches holes over all-zero pages so they cost nothing to store or serve.
 fn sparsify(path: &Path) -> Result<u64> {
     use std::os::unix::fs::FileExt;
     let f = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
@@ -519,12 +443,10 @@ fn sparsify(path: &Path) -> Result<u64> {
     Ok(punched)
 }
 
-/// Restores the template once and records which pages the guest touches
-/// until its agent answers; restores prefetch exactly those.
+/// Records the pages a restore touches until its agent answers; restores prefetch them.
 fn record_working_set(paths: &Paths, name: &str, tap: &str, sockets: &Arc<SocketRoot>) -> Result<usize> {
     let tpl = Template::open(paths, name)?;
     let run = tpl.dir.join("record");
-    // A failed earlier build may have left its logs behind.
     let _ = std::fs::remove_dir_all(&run);
     std::fs::create_dir_all(&run)?;
     let fc = Firecracker::spawn(&paths.firecracker, &run, sockets.allocate()?, crate::fc::SPAWN_READY)?;
@@ -535,7 +457,6 @@ fn record_working_set(paths: &Paths, name: &str, tap: &str, sockets: &Arc<Socket
     fc.resume()?;
     retry(Duration::from_secs(10), || guest::ping(&fc.sockets.vsock))?;
     guest::start(&fc.sockets.vsock, "10.255.255.254".parse()?, None, &tpl.legacy_agent)?;
-    // Like `run`: start a cold image template's app.
     if tpl.meta.image.as_ref().is_some_and(|i| !i.warm) {
         guest::start_app(&fc.sockets.vsock)?;
     }
@@ -549,9 +470,7 @@ fn record_working_set(paths: &Paths, name: &str, tap: &str, sockets: &Arc<Socket
     Ok(runs.iter().map(|r| r.1 as usize).sum::<usize>() * PAGE_SIZE)
 }
 
-/// Widens each run to `align`-page boundaries (merging overlaps): a fresh VM
-/// touches pages near the recorded ones too, and prefetching them in bulk is
-/// cheaper than faulting them in one by one later.
+/// A fresh VM touches pages near the recorded ones too; bulk prefetch beats faulting.
 fn pad_runs(runs: Vec<(u64, u64)>, align: u64) -> Vec<(u64, u64)> {
     let mut out: Vec<(u64, u64)> = Vec::new();
     for (first, count) in runs {
@@ -564,8 +483,6 @@ fn pad_runs(runs: Vec<(u64, u64)>, align: u64) -> Vec<(u64, u64)> {
     out
 }
 
-/// Plugs `mib` of hotplug memory into a booted template VM and waits until
-/// the guest has onlined it. Returns the plugged size.
 fn plug(fc: &Firecracker, mib: u64) -> Result<u64> {
     if mib == 0 {
         return Ok(0);
@@ -578,12 +495,8 @@ fn plug(fc: &Firecracker, mib: u64) -> Result<u64> {
     Ok(mib)
 }
 
-/// Waits until the guest's free page reporting has gone quiet, so the memory
-/// just plugged and freed here is reported in the template rather than in
-/// every VM after restore (where reporting 4 GiB walks the page structs of all
-/// of it: ~64 MiB more RSS per VM). Done means 4 s without a report, after at
-/// least `expect_mib` were reported. Returns the MiB reported and whether it
-/// finished; the caller says so when it did not.
+/// So freed plug memory is reported in the template, not in every VM after restore (~64 MiB
+/// RSS each). Done: 4 s quiet after `expect_mib` reported. Returns (MiB, done).
 fn wait_reporting_done(fc: &Firecracker, metrics: &Path, expect_mib: u64) -> Result<(u64, bool)> {
     let (start, mut quiet, mut total, mut seen) = (Instant::now(), 0, 0u64, 0usize);
     // Reporting starts 2 s after memory is freed and works through it in rounds.
@@ -603,22 +516,11 @@ fn wait_reporting_done(fc: &Firecracker, metrics: &Path, expect_mib: u64) -> Res
     Ok((total >> 20, quiet >= 4 && total >> 20 >= expect_mib))
 }
 
-/// Cold-boots a VM and snapshots it into `paths.templates/name`.
 #[allow(clippy::too_many_arguments)]
-pub fn create(
-    paths: &Paths,
-    name: &str,
-    vcpus: u32,
-    mem_mib: u64,
-    max_mib: u64,
-    plug_mib: u64,
-    image: Option<ImageMeta>,
-) -> Result<()> {
-    // Restores swap in each VM's own tap; this one only exists while building.
+pub fn create(paths: &Paths, name: &str, vcpus: u32, mem_mib: u64, max_mib: u64, plug_mib: u64, image: Option<ImageMeta>) -> Result<()> {
     let tap = format!("fvtpl{}", std::process::id());
     crate::net::create_tap(&tap)?;
-    // Build next to the live template and swap it in at the end: running VMs
-    // map the old files, which must not be truncated or rewritten under them.
+    // Running VMs map the old files, which must not be rewritten under them.
     let staging = format!(".{name}.new-{}", std::process::id());
     let _ = std::fs::remove_dir_all(paths.templates.join(&staging));
     let res = build(paths, &staging, name, vcpus, mem_mib, max_mib, plug_mib, &tap, image);
@@ -629,11 +531,8 @@ pub fn create(
     res
 }
 
-/// Moves a finished build into its generation directory and points
-/// `templates/name` at it with one atomic rename of a symlink. Nothing is ever
-/// deleted here: running and suspended VMs, migrations, standby VMs and
-/// checkpoints refer to generations by content id, so old generations stay
-/// until an operator removes them (see the README).
+/// Nothing is deleted: VMs and checkpoints refer to generations by content id, so old ones
+/// stay until an operator removes them.
 fn publish(paths: &Paths, name: &str, staged: &Path) -> Result<()> {
     let meta: Meta = serde_json::from_slice(&std::fs::read(staged.join("meta.json"))?)?;
     let gens = paths.templates.join(GENERATIONS);
@@ -646,9 +545,7 @@ fn publish(paths: &Paths, name: &str, staged: &Path) -> Result<()> {
     let tmp = paths.templates.join(format!(".{name}.link-{}", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
     std::os::unix::fs::symlink(Path::new(GENERATIONS).join(&meta.id), &tmp)?;
-    // A template from before generations is a plain directory: it becomes a
-    // generation itself (suspended VMs and checkpoints may name its content
-    // id), or, without a usable id, is kept aside; never deleted.
+    // A pre-generations directory becomes a generation itself, or is kept aside without an id.
     if std::fs::symlink_metadata(&live).is_ok_and(|m| m.is_dir()) {
         let id = std::fs::read(live.join("meta.json"))
             .ok()
@@ -666,25 +563,14 @@ fn publish(paths: &Paths, name: &str, staged: &Path) -> Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build(
-    paths: &Paths,
-    staging: &str,
-    name: &str,
-    vcpus: u32,
-    mem_mib: u64,
-    max_mib: u64,
-    plug_mib: u64,
-    tap: &str,
-    image: Option<ImageMeta>,
-) -> Result<()> {
+fn build(paths: &Paths, staging: &str, name: &str, vcpus: u32, mem_mib: u64, max_mib: u64, plug_mib: u64, tap: &str, image: Option<ImageMeta>) -> Result<()> {
     let dir = paths.templates.join(staging);
     std::fs::create_dir_all(&dir)?;
     let run = dir.join("boot");
     std::fs::create_dir_all(&run)?;
     let sockets = SocketRoot::new(&dir)?;
 
-    // Pin the exact image file: artifacts/rootfs.ext4 is a symlink a rebuild
-    // repoints, and this snapshot's page cache is only valid for these bytes.
+    // rootfs.ext4 is a symlink a rebuild repoints; the snapshot's page cache needs these bytes.
     let rootfs = std::fs::canonicalize(&paths.rootfs)?;
     let start = Instant::now();
     let fc = Firecracker::spawn(&paths.firecracker, &run, sockets.allocate()?, crate::fc::SPAWN_READY)?;
@@ -695,26 +581,19 @@ fn build(
     fc.put("/boot-source", json!({"kernel_image_path": paths.kernel, "boot_args": BOOT_ARGS}))?;
     fc.put("/machine-config", json!({"vcpu_count": vcpus, "mem_size_mib": mem_mib}))?;
     fc.put("/pmem/root", json!({"id": "root", "path_on_host": rootfs, "root_device": true, "read_only": true}))?;
-    fc.put(
-        "/balloon",
-        json!({"amount_mib": 0, "deflate_on_oom": false, "stats_polling_interval_s": BALLOON_STATS_S, "free_page_reporting": true}),
-    )?;
+    fc.put("/balloon", json!({"amount_mib": 0, "deflate_on_oom": false, "stats_polling_interval_s": BALLOON_STATS_S, "free_page_reporting": true}))?;
     let hotplug = max_mib.saturating_sub(mem_mib) / SLOT_MIB * SLOT_MIB;
     if hotplug > 0 {
         fc.put("/hotplug/memory", json!({"total_size_mib": hotplug, "slot_size_mib": SLOT_MIB}))?;
     }
     fc.put("/vsock", json!({"guest_cid": 3, "uds_path": vsock}))?;
-    fc.put(
-        "/network-interfaces/eth0",
-        json!({"iface_id": "eth0", "host_dev_name": tap, "guest_mac": crate::net::GUEST_MAC}),
-    )?;
+    fc.put("/network-interfaces/eth0", json!({"iface_id": "eth0", "host_dev_name": tap, "guest_mac": crate::net::GUEST_MAC}))?;
     fc.put("/entropy", json!({}))?;
     fc.put("/actions", json!({"action_type": "InstanceStart"}))?;
     retry(Duration::from_secs(30), || guest::ping(&vsock))?;
     let booted = start.elapsed();
     let plugged = plug(&fc, plug_mib.min(hotplug) / STEP_MIB * STEP_MIB)?;
 
-    // Leave as little as possible in the snapshot.
     match &image {
         Some(img) => {
             if img.warm {
@@ -727,8 +606,6 @@ fn build(
             guest::exec(&vsock, "sync; echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory")?;
         }
     }
-    // Nearly all of the plug is free and should be reported (the rest is the
-    // guest's own page structs and per-CPU lists).
     let (reported, done) = wait_reporting_done(&fc, &metrics, plugged * 3 / 4)?;
     if !done {
         eprintln!(
@@ -737,26 +614,15 @@ fn build(
         );
     }
     fc.pause()?;
-    fc.put(
-        "/snapshot/create",
-        json!({"snapshot_type": "Full", "snapshot_path": dir.join("vmstate"), "mem_file_path": dir.join("mem")}),
-    )?;
+    fc.put("/snapshot/create", json!({"snapshot_type": "Full", "snapshot_path": dir.join("vmstate"), "mem_file_path": dir.join("mem")}))?;
     let compatibility = crate::compat::local(fc.pid())?;
     drop(fc);
     let punched = sparsify(&dir.join("mem"))?;
     let _ = std::fs::remove_dir_all(&run);
 
     let mut meta = Meta {
-        compatibility: Some(compatibility),
-        vcpus,
-        mem_mib,
-        max_mib: mem_mib + hotplug,
-        plugged_mib: plugged,
-        kernel: paths.kernel.clone(),
-        rootfs,
-        id: String::new(),
-        components: BTreeMap::new(),
-        image,
+        compatibility: Some(compatibility), vcpus, mem_mib, max_mib: mem_mib + hotplug, plugged_mib: plugged,
+        kernel: paths.kernel.clone(), rootfs, id: String::new(), components: BTreeMap::new(), image,
     };
     meta.identify(paths, &dir)?;
     std::fs::write(dir.join("meta.json"), serde_json::to_vec_pretty(&meta)?)?;
@@ -766,11 +632,7 @@ fn build(
     println!(
         "template {name} (id {}): {vcpus} vCPUs, {mem_mib} MiB base + {hotplug} MiB hotplug ({plugged} MiB plugged, \
          {reported} MiB reported free), booted in {} ms, memory file {} MiB ({} MiB of zeroes punched out), working set {} MiB",
-        meta.id,
-        ms(booted),
-        size >> 20,
-        punched >> 20,
-        wset >> 20
+        meta.id, ms(booted), size >> 20, punched >> 20, wset >> 20
     );
     Ok(())
 }
@@ -796,25 +658,14 @@ mod tests {
         }
     }
 
-    struct Fixture {
-        paths: Paths,
-        dir: PathBuf,
-        meta: Meta,
-    }
+    struct Fixture { paths: Paths, dir: PathBuf, meta: Meta }
 
     impl Fixture {
         fn new() -> Self {
             static NEXT: AtomicU64 = AtomicU64::new(0);
-            let dir = std::env::temp_dir().join(format!(
-                "flexvm-identity-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
+            let dir = std::env::temp_dir().join(format!("flexvm-identity-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
             std::fs::create_dir_all(&dir).unwrap();
-            let paths = Paths {
-                firecracker: dir.join("firecracker"),
-                kernel: dir.join("kernel"),
-                rootfs: dir.join("rootfs"),
-                templates: dir.clone(),
-            };
+            let paths = Paths { firecracker: dir.join("firecracker"), kernel: dir.join("kernel"), rootfs: dir.join("rootfs"), templates: dir.clone() };
             let mut meta = Meta {
                 compatibility: None,
                 vcpus: 2, mem_mib: 256, max_mib: 1024, plugged_mib: 0,
@@ -834,12 +685,23 @@ mod tests {
             std::fs::write(&tmp, bytes).unwrap();
             std::fs::rename(tmp, path).unwrap();
         }
+
+        fn verify(&self, meta: &Meta, cache: &mut BTreeMap<String, Stamp>, rehash: bool) -> Result<bool> {
+            meta.verify(&self.paths, &self.dir, cache, rehash)
+        }
+
+        fn fresh(&self, rehash: bool) -> Result<bool> { self.verify(&self.meta, &mut BTreeMap::new(), rehash) }
+
+        fn write_meta(&self, meta: &Meta, dir: &Path) { std::fs::write(dir.join("meta.json"), serde_json::to_vec(meta).unwrap()).unwrap(); }
     }
 
     impl Drop for Fixture {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.dir);
-        }
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.dir); }
+    }
+
+    fn set_mtime(file: &File, sec: i64, nsec: i64) {
+        let times = [libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_OMIT }, libc::timespec { tv_sec: sec, tv_nsec: nsec }];
+        assert_eq!(unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) }, 0);
     }
 
     #[test]
@@ -848,25 +710,20 @@ mod tests {
         let stage = |id: &str| {
             let dir = f.dir.join(format!(".t.new-{id}"));
             std::fs::create_dir_all(&dir).unwrap();
-            let meta = Meta { id: id.into(), ..f.meta.clone() };
-            std::fs::write(dir.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+            f.write_meta(&Meta { id: id.into(), ..f.meta.clone() }, &dir);
             std::fs::write(dir.join("vmstate"), id).unwrap();
             dir
         };
         let current = || std::fs::read_to_string(Template::resolve(&f.paths, "t").unwrap().join("vmstate")).unwrap();
         let gens = || {
-            let mut g: Vec<String> = std::fs::read_dir(f.dir.join(GENERATIONS))
-                .unwrap()
-                .map(|e| e.unwrap().file_name().into_string().unwrap())
-                .collect();
+            let mut g: Vec<String> = std::fs::read_dir(f.dir.join(GENERATIONS)).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
             g.sort();
             g
         };
         // A template from before generations: a plain directory, with an id.
         std::fs::create_dir_all(f.dir.join("t")).unwrap();
         std::fs::write(f.dir.join("t/vmstate"), "legacy").unwrap();
-        let old = Meta { id: "l".into(), ..f.meta.clone() };
-        std::fs::write(f.dir.join("t/meta.json"), serde_json::to_vec(&old).unwrap()).unwrap();
+        f.write_meta(&Meta { id: "l".into(), ..f.meta.clone() }, &f.dir.join("t"));
         assert_eq!(current(), "legacy");
         publish(&f.paths, "t", &stage("a")).unwrap();
         assert_eq!(current(), "a");
@@ -886,7 +743,7 @@ mod tests {
     }
 
     #[test]
-    fn identity_roundtrip_and_metadata_independence() {
+    fn identity_roundtrip_metadata_independence_and_old_templates() {
         let f = Fixture::new();
         let mut meta: Meta = serde_json::from_slice(&serde_json::to_vec(&f.meta).unwrap()).unwrap();
         for component in meta.components.values_mut() {
@@ -894,9 +751,13 @@ mod tests {
             component.metadata.mtime += 1;
         }
         assert_eq!(content_id(&meta.components, None), f.meta.id);
-        meta.verify(&f.paths, &f.dir, &mut BTreeMap::new(), true).unwrap();
+        f.verify(&meta, &mut BTreeMap::new(), true).unwrap();
         meta.id = "wrong".into();
-        assert!(meta.verify(&f.paths, &f.dir, &mut BTreeMap::new(), true).is_err());
+        assert!(f.verify(&meta, &mut BTreeMap::new(), true).is_err());
+        // Templates from before content ids must be recreated.
+        meta.id.clear();
+        meta.components.clear();
+        assert!(f.verify(&meta, &mut BTreeMap::new(), true).is_err());
     }
 
     #[test]
@@ -920,9 +781,9 @@ mod tests {
         let mut meta = f.meta.clone();
         meta.image = Some(image("sha256:a", "arg /x\n"));
         meta.identify(&f.paths, &f.dir).unwrap();
-        meta.verify(&f.paths, &f.dir, &mut BTreeMap::new(), false).unwrap();
+        f.verify(&meta, &mut BTreeMap::new(), false).unwrap();
         meta.image.as_mut().unwrap().digest = "sha256:b".into();
-        assert!(meta.verify(&f.paths, &f.dir, &mut BTreeMap::new(), false).is_err());
+        assert!(f.verify(&meta, &mut BTreeMap::new(), false).is_err());
     }
 
     #[test]
@@ -930,10 +791,10 @@ mod tests {
         for name in ["vmstate", "mem", "rootfs", "kernel", "firecracker"] {
             let f = Fixture::new();
             let mut cache = BTreeMap::new();
-            f.meta.verify(&f.paths, &f.dir, &mut cache, true).unwrap();
+            f.verify(&f.meta, &mut cache, true).unwrap();
             // Replacement changes inode even for equal-size content.
             f.replace(name, &vec![b'x'; name.len()]);
-            let error = f.meta.verify(&f.paths, &f.dir, &mut cache, true).unwrap_err().to_string();
+            let error = f.verify(&f.meta, &mut cache, true).unwrap_err().to_string();
             assert!(error.contains("does not match"), "{error}");
         }
     }
@@ -942,14 +803,14 @@ mod tests {
     fn cache_refresh_requires_preflight() {
         let f = Fixture::new();
         let mut cache = BTreeMap::new();
-        f.meta.verify(&f.paths, &f.dir, &mut cache, false).unwrap();
+        f.verify(&f.meta, &mut cache, false).unwrap();
         f.replace("rootfs", b"rootfs");
-        assert!(f.meta.verify(&f.paths, &f.dir, &mut cache, false).is_err());
-        f.meta.verify(&f.paths, &f.dir, &mut cache, true).unwrap();
-        f.meta.verify(&f.paths, &f.dir, &mut cache, false).unwrap();
+        assert!(f.verify(&f.meta, &mut cache, false).is_err());
+        f.verify(&f.meta, &mut cache, true).unwrap();
+        f.verify(&f.meta, &mut cache, false).unwrap();
         f.replace("rootfs", b"broken");
-        assert!(f.meta.verify(&f.paths, &f.dir, &mut cache, true).is_err());
-        assert!(f.meta.verify(&f.paths, &f.dir, &mut cache, false).is_err());
+        assert!(f.verify(&f.meta, &mut cache, true).is_err());
+        assert!(f.verify(&f.meta, &mut cache, false).is_err());
     }
 
     #[test]
@@ -980,7 +841,7 @@ mod tests {
     #[test]
     fn open_does_not_verify() {
         let f = Fixture::new();
-        std::fs::write(f.dir.join("meta.json"), serde_json::to_vec(&f.meta).unwrap()).unwrap();
+        f.write_meta(&f.meta, &f.dir);
         let tpl = Template::open(&f.paths, "").unwrap();
         tpl.check_id(&f.meta.id).unwrap();
         let error = tpl.check_id("wrong").unwrap_err().to_string();
@@ -995,27 +856,22 @@ mod tests {
     #[test]
     fn size_and_mtime_invalidate_cache() {
         let f = Fixture::new();
-        let path = f.dir.join("kernel");
-        let file = File::options().read(true).write(true).open(path).unwrap();
+        let file = File::options().read(true).write(true).open(f.dir.join("kernel")).unwrap();
         let original = Stamp::of(&file.metadata().unwrap());
         file.set_len(original.size + 1).unwrap();
         assert_ne!(Stamp::of(&file.metadata().unwrap()).size, original.size);
-        assert!(f.meta.verify(&f.paths, &f.dir, &mut BTreeMap::new(), false).is_err());
+        assert!(f.fresh(false).is_err());
         file.set_len(original.size).unwrap();
-        let times = [
-            libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_OMIT },
-            libc::timespec { tv_sec: original.mtime + 1, tv_nsec: original.mtime_nsec },
-        ];
-        assert_eq!(unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) }, 0);
+        set_mtime(&file, original.mtime + 1, original.mtime_nsec);
         assert_ne!(Stamp::of(&file.metadata().unwrap()).mtime, original.mtime);
-        assert!(f.meta.verify(&f.paths, &f.dir, &mut BTreeMap::new(), false).is_err());
-        f.meta.verify(&f.paths, &f.dir, &mut BTreeMap::new(), true).unwrap();
+        assert!(f.fresh(false).is_err());
+        f.fresh(true).unwrap();
     }
 
     #[test]
     fn rehash_is_remembered_across_opens() {
         let f = Fixture::new();
-        std::fs::write(f.dir.join("meta.json"), serde_json::to_vec(&f.meta).unwrap()).unwrap();
+        f.write_meta(&f.meta, &f.dir);
         f.replace("rootfs", b"rootfs");
         assert!(Template::open(&f.paths, "").unwrap().verify(&f.paths, false).is_err());
         Template::open(&f.paths, "").unwrap().verify(&f.paths, true).unwrap();
@@ -1026,27 +882,14 @@ mod tests {
     fn same_size_rewrite_with_restored_mtime_is_caught() {
         let f = Fixture::new();
         let mut cache = BTreeMap::new();
-        f.meta.verify(&f.paths, &f.dir, &mut cache, true).unwrap();
+        f.verify(&f.meta, &mut cache, true).unwrap();
         let file = File::options().write(true).open(f.dir.join("kernel")).unwrap();
         let before = Stamp::of(&file.metadata().unwrap());
         std::thread::sleep(Duration::from_millis(10));
         file.write_all_at(b"KERNEL", 0).unwrap();
-        let times = [
-            libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_OMIT },
-            libc::timespec { tv_sec: before.mtime, tv_nsec: before.mtime_nsec },
-        ];
-        assert_eq!(unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) }, 0);
-        assert!(f.meta.verify(&f.paths, &f.dir, &mut cache, false).is_err());
-        let error = f.meta.verify(&f.paths, &f.dir, &mut cache, true).unwrap_err().to_string();
+        set_mtime(&file, before.mtime, before.mtime_nsec);
+        assert!(f.verify(&f.meta, &mut cache, false).is_err());
+        let error = f.verify(&f.meta, &mut cache, true).unwrap_err().to_string();
         assert!(error.contains("does not match"), "{error}");
-    }
-
-    #[test]
-    fn old_templates_require_recreation() {
-        let f = Fixture::new();
-        let mut meta = f.meta.clone();
-        meta.id.clear();
-        meta.components.clear();
-        assert!(meta.verify(&f.paths, &f.dir, &mut BTreeMap::new(), true).is_err());
     }
 }

@@ -1,10 +1,6 @@
-//! CRC32C (Castagnoli), the checksum of checkpoint pages.
-//!
-//! On x86_64 with SSE4.2 a page is checksummed as three interleaved streams
-//! (the `crc32` instruction has a 3-cycle latency but issues every cycle),
-//! which are then combined with precomputed shift tables. The OR of every
-//! word comes for free in the same pass, so one read of a page both
-//! checksums it and tells whether it is all zero.
+//! CRC32C, the checksum of checkpoint pages. With SSE4.2 a page is three interleaved streams
+//! (`crc32` has 3-cycle latency but issues every cycle) combined with shift tables; the same
+//! pass tells whether the page is all zero.
 
 use std::sync::OnceLock;
 
@@ -25,7 +21,7 @@ fn table() -> &'static [u32; 256] {
     })
 }
 
-/// The CRC register after feeding `bytes` (no pre- or post-inversion).
+/// No pre- or post-inversion.
 fn update_sw(mut c: u32, bytes: &[u8]) -> u32 {
     let t = table();
     for &b in bytes {
@@ -35,14 +31,10 @@ fn update_sw(mut c: u32, bytes: &[u8]) -> u32 {
 }
 
 #[cfg(target_arch = "x86_64")]
-fn has_sse42() -> bool {
-    std::arch::is_x86_feature_detected!("sse4.2")
-}
+fn has_sse42() -> bool { std::arch::is_x86_feature_detected!("sse4.2") }
 
 #[cfg(not(target_arch = "x86_64"))]
-fn has_sse42() -> bool {
-    false
-}
+fn has_sse42() -> bool { false }
 
 fn update(c: u32, bytes: &[u8]) -> u32 {
     #[cfg(target_arch = "x86_64")]
@@ -53,17 +45,12 @@ fn update(c: u32, bytes: &[u8]) -> u32 {
     update_sw(c, bytes)
 }
 
-/// CRC32C of `bytes`.
-pub fn crc32c(bytes: &[u8]) -> u32 {
-    !update(!0, bytes)
-}
+pub fn crc32c(bytes: &[u8]) -> u32 { !update(!0, bytes) }
 
-/// Bytes per stream when a page is checksummed as three interleaved streams.
 #[cfg(target_arch = "x86_64")]
 const STREAM: usize = crate::util::PAGE_SIZE / 24 * 8;
 
-/// Tables that advance a CRC register over `STREAM` zero bytes, a byte of
-/// the register at a time (the register update is linear).
+/// Advance a CRC register over `STREAM` zero bytes, a register byte at a time (it is linear).
 #[cfg(target_arch = "x86_64")]
 fn shift_tables() -> &'static [[u32; 256]; 4] {
     static T: OnceLock<[[u32; 256]; 4]> = OnceLock::new();
@@ -80,7 +67,6 @@ fn shift_tables() -> &'static [[u32; 256]; 4] {
     })
 }
 
-/// CRC32C of a page, and whether it is all zero, in one pass over it.
 pub fn page(p: &[u8]) -> (u32, bool) {
     debug_assert_eq!(p.len(), crate::util::PAGE_SIZE);
     #[cfg(target_arch = "x86_64")]
