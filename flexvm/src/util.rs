@@ -321,7 +321,8 @@ pub fn write_file(dir: &Path, name: &str, data: &[u8], durable: bool) -> io::Res
     }
 }
 
-/// Fsyncs the parent of each directory created.
+/// Creating any directory fsyncs every parent: an existing one may have been made without syncing
+/// (`create_dir_all`). Nothing to create, nothing synced.
 pub fn create_dir_durably(dir: &std::path::Path) -> io::Result<()> {
     create_dir_durably_mode(dir, 0o777)
 }
@@ -331,16 +332,20 @@ pub fn create_dir_durably_mode(dir: &std::path::Path, mode: u32) -> io::Result<(
     let named = |p: &std::path::Path, what: &str, e: io::Error| io::Error::new(e.kind(), format!("{what} {}: {e}", p.display()));
     let dir = std::path::absolute(dir).map_err(|e| named(dir, "resolving", e))?;
     let mut path = std::path::PathBuf::from("/");
+    let (mut parents, mut created) = (vec![], false);
     for part in dir.components().skip(1) {
-        let parent = path.clone();
+        parents.push(path.clone());
         path.push(part);
         match std::fs::DirBuilder::new().mode(mode).create(&path) {
-            Ok(()) => sync_dir(&parent)?,
+            Ok(()) => created = true,
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(named(&path, "creating", e)),
         }
     }
-    Ok(())
+    match created {
+        true => parents.iter().try_for_each(|p| sync_dir(p)),
+        false => Ok(()),
+    }
 }
 
 /// Sent by `at`.
