@@ -89,8 +89,7 @@ impl Registry {
                 Err(ureq::Error::Status(code, resp)) => {
                     let mut body = Vec::new();
                     let _ = resp.into_reader().take(300).read_to_end(&mut body);
-                    let body = String::from_utf8_lossy(&body);
-                    bail!("GET {url}: HTTP {code}: {}", body.chars().take(300).collect::<String>().trim())
+                    bail!("GET {url}: HTTP {code}: {}", String::from_utf8_lossy(&body).trim())
                 }
                 Err(e) => bail!("GET {url}: {e}"),
             }

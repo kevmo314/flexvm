@@ -7,6 +7,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+use serde::Deserialize;
 use serde_json::Value;
 
 use super::reference::Reference;
@@ -124,12 +125,7 @@ pub fn fetch(cache: &Path, src: &str, limits: &Limits) -> Result<Image> {
 
 fn image(digest: String, config_digest: String, config: Vec<u8>, layers: Vec<Layer>) -> Result<Image> {
     let v: Value = serde_json::from_slice(&config)?;
-    let diff_ids: Vec<String> = v["rootfs"]["diff_ids"]
-        .as_array()
-        .ok_or("image config has no rootfs.diff_ids")?
-        .iter()
-        .map(|d| d.as_str().map(String::from).ok_or("bad diff_id"))
-        .collect::<std::result::Result<_, _>>()?;
+    let diff_ids = Vec::<String>::deserialize(&v["rootfs"]["diff_ids"]).map_err(|e| format!("image config rootfs.diff_ids: {e}"))?;
     if diff_ids.len() != layers.len() {
         bail!("image config lists {} layers, the manifest {}", diff_ids.len(), layers.len());
     }
@@ -285,17 +281,12 @@ fn from_files(blob: &dyn Fn(&str) -> Result<Blob>, limits: &Limits) -> Result<Im
     let m: Value = serde_json::from_slice(&read("manifest.json")?)?;
     let m = m.get(0).ok_or("empty manifest.json")?;
     let config = read(m["Config"].as_str().ok_or("manifest.json has no Config")?)?;
-    let mut total = 0u64;
-    let layers = m["Layers"]
-        .as_array()
-        .ok_or("manifest.json has no Layers")?
-        .iter()
-        .map(|l| {
-            let src = blob(l.as_str().ok_or("bad layer path")?)?;
-            total = total.saturating_add(src.open()?.1);
-            Ok(Layer { src, digest: None, size: None })
-        })
-        .collect::<Result<_>>()?;
+    let (mut layers, mut total) = (Vec::new(), 0u64);
+    for l in m["Layers"].as_array().ok_or("manifest.json has no Layers")? {
+        let src = blob(l.as_str().ok_or("bad layer path")?)?;
+        total = total.saturating_add(src.open()?.1);
+        layers.push(Layer { src, digest: None, size: None });
+    }
     check_download(total, limits)?;
     let digest = sha256_hex(&config);
     image(digest.clone(), digest, config, layers)

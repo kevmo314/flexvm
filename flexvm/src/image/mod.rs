@@ -19,6 +19,7 @@ use serde_json::{json, Value};
 
 use crate::bail;
 use crate::guest;
+use crate::host::flock;
 use crate::util::{ms, Result};
 use registry::{sha256_hex, sync_dir};
 pub use unpack::Limits;
@@ -210,18 +211,6 @@ fn entry_complete(cached: &Path) -> bool {
     ["ext4", "conf", "ok"].iter().all(|ext| cached.with_extension(ext).is_file())
 }
 
-fn flock(f: &File, op: libc::c_int) -> std::io::Result<()> {
-    loop {
-        if unsafe { libc::flock(f.as_raw_fd(), op) } == 0 {
-            return Ok(());
-        }
-        let e = std::io::Error::last_os_error();
-        if e.kind() != std::io::ErrorKind::Interrupted {
-            return Err(e);
-        }
-    }
-}
-
 /// Holds a per-key lock through the cache check, build and publication.
 fn cached_rootfs(cached: &Path, build: impl FnOnce(&Path) -> Result<String>, sync: impl Fn(&Path) -> Result<()>) -> Result<PathBuf> {
     use std::os::unix::fs::OpenOptionsExt;
@@ -304,10 +293,9 @@ fn rename_noreplace(tmp: &Path, path: &Path) -> Result<bool> {
     if unsafe { libc::renameat2(libc::AT_FDCWD, src.as_ptr(), libc::AT_FDCWD, dest.as_ptr(), libc::RENAME_NOREPLACE) } == 0 {
         return Ok(true);
     }
-    let e = std::io::Error::last_os_error();
-    match e.raw_os_error() {
-        Some(libc::EEXIST) => Ok(false),
-        _ => Err(e.into()),
+    match std::io::Error::last_os_error() {
+        e if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        e => Err(e.into()),
     }
 }
 
