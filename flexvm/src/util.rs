@@ -742,14 +742,19 @@ pub mod output {
 
     /// Appends `data` to `log`, whatever file `current` is by now: every
     /// write to a capped log, by any writer in any process, is made under the
-    /// directory's `.rotate.lock`, to the file at `log` then (`current` if it
+    /// run directory's `.rotate.lock`, to the file at `log` then (`current` if it
     /// still is, else `log` reopened), so none goes to a rotated or removed
     /// generation. Past `cap`, `log` is renamed `log.1` (replacing the one
     /// before) and a new `log` is started. Returns the file the writer goes
     /// on with, if not `current`.
     pub fn append_capped(log: &Path, current: &File, data: &[u8], cap: u64) -> std::io::Result<Option<File>> {
         let open = || File::options().create(true).append(true).open(log);
-        let lock = File::create(log.with_file_name(".rotate.lock"))?;
+        // One for the run directory's logs (kept out of `vms/`, which holds names only).
+        let lock = match crate::host::run_dir().filter(|r| log.starts_with(r)) {
+            Some(run) => run.join(".rotate.lock"),
+            None => log.with_file_name(".rotate.lock"),
+        };
+        let lock = File::create(lock)?;
         crate::host::flock(&lock, libc::LOCK_EX)?;
         let mut next = (!same_file(current, log)).then(open).transpose()?;
         let mut f = next.as_ref().unwrap_or(current);

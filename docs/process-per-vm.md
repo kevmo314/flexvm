@@ -164,7 +164,7 @@ while it opens and marks its log (whether a VM holds the name is read from its l
 Released migration records are retired as below. Logs are capped by their
 writers, not swept (`output::append_capped`): every write a VM process's
 output relay makes to a log in the run directory, whichever process and
-stream, is made under the directory's `.rotate.lock` to the file at the
+stream, is made under `RUN/.rotate.lock` to the file at the
 log's path then (reopened if another writer rotated it), and past 8 MiB
 renames it `NAME.log.1` and starts a new one. No write goes to a rotated
 or removed generation, and none is cut.
