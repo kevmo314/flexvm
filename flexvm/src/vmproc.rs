@@ -797,6 +797,15 @@ impl Proc {
             if let Ok((mut g, id)) = got {
                 let _ = g.get_ref().set_read_timeout(None);
                 while let Ok(Some((kind, data))) = guest::read_frame(&mut g) {
+                    // The guest's ring moved past us (or we asked past its end): it goes on from there.
+                    if let (guest::FRAME_LOST, Ok(at)) = (kind, <[u8; 8]>::try_from(&data[..data.len().min(8)])) {
+                        let (at, was) = (u64::from_le_bytes(at), self.app_log.load(Ordering::SeqCst));
+                        if at > was {
+                            eprintln!("vm {}: {} bytes of app output lost (the guest keeps its last 1 MiB)", vm.name, at - was);
+                        }
+                        self.app_log.store(at, Ordering::SeqCst);
+                        continue;
+                    }
                     if kind == guest::FRAME_MSG {
                         let status = String::from_utf8_lossy(&data);
                         if !status.starts_with("running") {
@@ -807,6 +816,11 @@ impl Proc {
                         break;
                     }
                     let mut out = std::io::stdout().lock();
+                    while crate::lifecycle::APP_LOG_HELD.load(Ordering::SeqCst) {
+                        drop(out);
+                        thread::sleep(Duration::from_millis(10));
+                        out = std::io::stdout().lock();
+                    }
                     let _ = out.write_all(&data).and_then(|()| out.flush());
                     self.app_log.fetch_add(data.len() as u64, Ordering::SeqCst);
                 }

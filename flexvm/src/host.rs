@@ -202,15 +202,31 @@ impl Host {
         self.state.join("suspended").join(name)
     }
 
-    /// What a dead holder left running is reaped first.
+    /// Whether a suspended VM of this name may still be resumed (or is
+    /// quarantined): its checkpoint is published and not consumed. Anything
+    /// else in its place is debris of an interrupted suspend, resume or
+    /// discard, removed by the next holder of the name.
+    pub fn is_suspended(&self, name: &str) -> bool {
+        let dir = self.suspended(name);
+        dir.join("manifest.json").is_file() && !dir.join("STARTED").exists() && !dir.join("DISCARDED").exists()
+    }
+
+    /// What a dead holder left running is reaped first, then debris in its
+    /// suspended directory is removed.
     pub fn take_name(&self, name: &str, resuming: bool) -> Result<NameLock> {
         check_name(name)?;
-        if !resuming && self.suspended(name).exists() {
+        if !resuming && self.is_suspended(name) {
             bail!("vm {name:?} exists (suspended); resume or kill it");
         }
         let f = lock_path(&self.vms(name, "lock"), libc::LOCK_EX | libc::LOCK_NB).map_err(|_| format!("vm name {name:?} is taken"))?;
         if let Some(old) = self.holder_of(name).filter(|o| !o.alive()) {
             reap(&self.run, &old)?;
+        }
+        if self.suspended(name).exists() && !self.is_suspended(name) {
+            crate::lifecycle::remove_debris(self, name)?;
+        }
+        if !resuming && self.suspended(name).exists() {
+            bail!("vm {name:?} exists (suspended); resume or kill it");
         }
         for ext in ["json", "sock", "moved", "failed"] {
             let _ = std::fs::remove_file(self.vms(name, ext));
@@ -284,7 +300,7 @@ impl Host {
     }
 
     fn held(&self, a: &Addr) -> bool {
-        a.holder.as_deref().is_some_and(|h| !self.gone(h) || self.suspended(h).exists())
+        a.holder.as_deref().is_some_and(|h| !self.gone(h) || self.is_suspended(h))
     }
 
     pub fn claim_new(&self, l: &Locked, holder: &str, want: Option<Ipv4Addr>) -> Result<AddrClaim> {
@@ -997,7 +1013,39 @@ mod tests {
             assert!(h.take_name(bad, false).is_err());
         }
         std::fs::create_dir_all(h.suspended("s")).unwrap();
+        std::fs::write(h.suspended("s").join("manifest.json"), "").unwrap();
         assert!(h.take_name("s", false).is_err() && h.take_name("s", true).is_ok());
+    }
+
+    #[test]
+    fn suspend_debris_is_removed_by_the_names_next_holder() {
+        let h = host("debris");
+        let dir = |n: &str, files: &[&str]| {
+            std::fs::create_dir_all(h.suspended(n)).unwrap();
+            files.iter().for_each(|f| std::fs::write(h.suspended(n).join(f), "").unwrap());
+        };
+        // No manifest (an interrupted removal or revoke), consumed, discarded.
+        dir("bare", &["GEN", "pages"]);
+        dir("started", &["manifest.json", "STARTED"]);
+        dir("discarded", &["manifest.json", "DISCARDED"]);
+        dir("quarantined", &["manifest.json", "STARTED", "QUARANTINE"]);
+        for n in ["bare", "started", "discarded", "quarantined"] {
+            assert!(!h.is_suspended(n));
+            drop(h.take_name(n, false).unwrap());
+            assert!(!h.suspended(n).exists(), "{n}");
+        }
+        // A suspended VM, quarantined or not, stays.
+        dir("kept", &["manifest.json"]);
+        dir("held", &["manifest.json", "QUARANTINE"]);
+        for n in ["kept", "held"] {
+            assert!(h.is_suspended(n) && h.take_name(n, false).is_err());
+            drop(h.take_name(n, true).unwrap());
+            assert!(h.suspended(n).exists());
+        }
+        // Held by a live process, it is not touched.
+        let _live = h.take_name("live", true).unwrap();
+        dir("live", &["GEN"]);
+        assert!(h.take_name("live", false).is_err() && h.suspended("live").exists());
     }
 
     #[test]

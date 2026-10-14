@@ -339,9 +339,10 @@ runs as root, so nothing follows a path that user can change:
 - **Publish.** Everything is fsynced, then renamed fd to fd into place with
   `RENAME_NOREPLACE` (checkpoints are never overwritten or modified), and
   the destination directory is fsynced.
-- **Durability failure.** If that last fsync fails, the manifest is
-  durably removed before the VM resumes. If that fails too, the VM stays
-  paused and is marked failed.
+- **Durability failure.** If that last fsync fails, the checkpoint is
+  revoked before the VM resumes: its manifest durably removed, then the rest
+  of the directory. If that fails too, the VM stays paused and is marked
+  failed.
 - **Restore.** Every file is opened with `O_NOFOLLOW` and must be a regular
   file.
 - **Leftovers.** A later checkpoint into the same directory clears staging
@@ -349,7 +350,7 @@ runs as root, so nothing follows a path that user can change:
 
 | file | contents |
 |---|---|
-| `manifest.json` | line 1: checksum of the rest; then JSON with the format version, name, address, template name and content id, machine (vCPUs, base/max/hotplugged MiB), guest page count, page counts and the length and checksum of each file |
+| `manifest.json` | line 1: checksum of the rest; then JSON with the format version, name, address, template name and content id, machine (vCPUs, base/max/hotplugged MiB), guest page count, page counts, the length and checksum of each file, and how much of the app log was passed on (`app_log`, image templates) |
 | `vmstate` | Firecracker's state-only snapshot |
 | `pagemap` | `FVPGMAP2`, run and data page counts, then runs `(first page, count, DATA\|ZERO, index in pages)` and the CRC32C of every page in `pages` |
 | `pages` | DATA pages back to back, in roughly guest page order |

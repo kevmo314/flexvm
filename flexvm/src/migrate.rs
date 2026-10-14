@@ -116,7 +116,7 @@ impl Proc {
                 "vmstate_len": state.len(),
                 "preload": pages,
                 "paused": vm.was_paused(),
-                "app_log": self.app_log.load(Ordering::SeqCst),
+                "app_log": self.hold_app_log(),
             }))?;
             conn.write_all(&state)?;
             if fault("slow_preload") {
@@ -227,6 +227,7 @@ impl Proc {
             h.forget(vm.ip, mig);
         }
         *vm.state.lock().unwrap() = s;
+        self.release_app_log();
         if self.lent_here.swap(false, Ordering::SeqCst) {
             let _ = self.host.unlend(&l, vm.ip, gen);
         }

@@ -16,6 +16,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::{fail, mem, msg, session::Output, spawn, wait_pid, write_frame, Statuses, FRAME_STDOUT};
+use crate::proto::FRAME_LOST;
 
 const CONF: &str = "/etc/flexvm/app.conf";
 const RING_BYTES: usize = 1 << 20;
@@ -315,22 +316,29 @@ fn start(statuses: &Statuses) -> io::Result<i32> {
 }
 
 /// Output from `offset` (clamped to the ring), then `<status> <next offset>`; with `follow`, until exit.
+/// Following, a clamp is told first (FRAME_LOST, the offset output goes on from, u64 LE), so a
+/// reader that fell behind the ring keeps its offset right.
 fn logs(mut out: impl Write, mut offset: u64, follow: bool) -> io::Result<()> {
     let stop = {
         let app = APP.lock().unwrap();
         if follow { u64::MAX } else { app.output.end }
     };
     loop {
-        let (chunk, status, done) = {
+        let (chunk, status, done, moved) = {
             let (app, _) = CHANGED.wait_timeout_while(APP.lock().unwrap(), Duration::from_secs(5), |a| {
                 follow && offset >= a.output.end && matches!(a.state, State::Running(_))
             }).unwrap();
-            offset = offset.clamp(app.output.start, app.output.end);
+            let clamped = offset.clamp(app.output.start, app.output.end);
+            let moved = clamped != offset;
+            offset = clamped;
             let chunk = app.output.read_chunk(offset).map_or_else(Vec::new, |(_, data)| {
                 data[..data.len().min(64 * 1024).min(stop.saturating_sub(offset) as usize)].to_vec()
             });
-            (chunk, app.status(), !follow || !matches!(app.state, State::Running(_)))
+            (chunk, app.status(), !follow || !matches!(app.state, State::Running(_)), moved)
         };
+        if follow && moved {
+            write_frame(&mut out, FRAME_LOST, &offset.to_le_bytes())?;
+        }
         offset += chunk.len() as u64;
         // An empty frame doubles as a keepalive that notices a closed connection.
         write_frame(&mut out, FRAME_STDOUT, &chunk)?;
@@ -382,12 +390,17 @@ mod tests {
         let end = app.output.end;
         drop(app);
         let frames = reader.join().unwrap().unwrap();
-        let (mut data, mut rest) = (Vec::new(), &frames[..]);
-        while rest[0] == FRAME_STDOUT {
+        // Asked from 0, behind the ring: told where it goes on from (FRAME_LOST, u64 LE) first.
+        let (mut data, mut rest, mut lost) = (Vec::new(), &frames[..], Vec::new());
+        while rest[0] == FRAME_STDOUT || rest[0] == FRAME_LOST {
             let n = u32::from_le_bytes(rest[1..5].try_into().unwrap()) as usize;
-            data.extend_from_slice(&rest[5..5 + n]);
+            match rest[0] {
+                FRAME_LOST => lost.push(u64::from_le_bytes(rest[5..5 + n].try_into().unwrap())),
+                _ => data.extend_from_slice(&rest[5..5 + n]),
+            }
             rest = &rest[5 + n..];
         }
+        assert!(frames[0] == FRAME_LOST && lost.iter().all(|&at| at == 10 || at == 21), "{lost:?}");
         assert_eq!(&rest[5..], format!("exited 7 {end}").as_bytes());
         assert_eq!(data, [vec![b'x'; RING_BYTES - 11], b"crash-tail\n".to_vec()].concat());
     }

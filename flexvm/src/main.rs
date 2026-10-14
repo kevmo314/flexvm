@@ -298,6 +298,10 @@ fn kill(host: &Host, name: &str) -> Result<()> {
     }
     if host.suspended(name).exists() {
         let _lock = host.take_name(name, true)?;
+        // Taking the name removed it if it was not a suspended VM (an interrupted suspend's or resume's).
+        if !host.suspended(name).exists() {
+            return Ok(());
+        }
         return lifecycle::discard(host, name);
     }
     if !host.alive(name) && std::fs::remove_file(host.vms(name, "failed")).is_ok() {

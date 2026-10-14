@@ -77,6 +77,14 @@ pub struct Manifest {
     /// The checkpoint this one is a delta against (format 3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<Parent>,
+    /// How much of the guest's app log the VM process had passed on: a
+    /// restore follows it from there, not from the start of the ring again.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub app_log: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -166,6 +174,8 @@ pub struct Staging {
     pages: Option<PagesFile>,
     published: bool,
     pub meta_left: u64,
+    /// `Manifest::app_log`.
+    pub app_log: u64,
 }
 
 impl Staging {
@@ -188,7 +198,7 @@ impl Staging {
         check(unsafe { libc::mkdirat(outer.as_raw_fd(), c"ck".as_ptr(), 0o700) })?;
         let ck = open_dir_at(outer.as_raw_fd(), c"ck")?;
         let _ = std::fs::remove_file(&vmstate);
-        Ok(Staging { dest, parent: pfd, base, outer, outer_name, ck, vmstate, pages: None, published: false, meta_left: chain_meta_budget() })
+        Ok(Staging { dest, parent: pfd, base, outer, outer_name, ck, vmstate, pages: None, published: false, meta_left: chain_meta_budget(), app_log: 0 })
     }
 
     pub fn dest(&self) -> &Path {
@@ -269,6 +279,7 @@ impl Staging {
             zero_pages: out.zero,
             files,
             parent,
+            app_log: self.app_log,
         };
         let body = serde_json::to_vec_pretty(&manifest)?;
         let id = sum(&body);
@@ -300,18 +311,46 @@ impl Staging {
         check(unsafe { libc::renameat2(outer, c"ck".as_ptr(), parent, self.base.as_ptr(), libc::RENAME_NOREPLACE) })
             .map_err(|e| format!("publish checkpoint at {}: {e}", self.dest.display()))?;
         self.published = true;
-        if let Err(e) = check(unsafe { libc::fsync(parent) }) {
+        let synced = match crate::host::fault("publish_fsync") {
+            true => Err(io::Error::other("injected fault: fsync failed")),
+            false => check(unsafe { libc::fsync(parent) }),
+        };
+        if let Err(e) = synced {
             // A crash could bring it back after the VM ran on: revoke it, durably.
-            let revoked = check(unsafe { libc::unlinkat(self.ck.as_raw_fd(), c"manifest.json".as_ptr(), 0) })
-                .and_then(|()| check(unsafe { libc::fsync(self.ck.as_raw_fd()) }));
+            let revoked = self.revoke();
             let e = format!("making checkpoint {} durable: {e}", self.dest.display());
             return Err(match revoked {
-                Ok(()) => CommitError::Failed(format!("{e} (revoked it)").into()),
+                Ok(Ok(())) => CommitError::Failed(format!("{e} (revoked it)").into()),
+                // Unloadable for good; in the way of that path until removed (a suspend's, by the name's next holder).
+                Ok(Err(r)) => CommitError::Failed(format!("{e} (revoked it, but removing its directory failed: {r}; remove {} by hand if it stays)", self.dest.display()).into()),
                 Err(r) => CommitError::Uncertain(format!("{e}; revoking it failed too: {r}").into()),
             });
         }
         t.mark("publish");
         Ok((manifest, id))
+    }
+}
+
+impl Staging {
+    /// Unpublishes `dest`. The outer error: its manifest (what makes it a
+    /// checkpoint) may still be there. Once that is durably gone, the rest
+    /// goes, durably; the inner error: some of it may stay, or come back
+    /// after a crash, as a directory without a manifest (debris, which a
+    /// suspended VM's name's next holder removes).
+    fn revoke(&self) -> io::Result<io::Result<()>> {
+        let ck = self.ck.as_raw_fd();
+        check(unsafe { libc::unlinkat(ck, c"manifest.json".as_ptr(), 0) })?;
+        check(unsafe { libc::fsync(ck) })?;
+        let parent = self.parent.as_raw_fd();
+        let removed = (|| {
+            if crate::host::fault("revoke_cleanup") {
+                return Err(io::Error::other("injected fault: removal failed"));
+            }
+            empty_dir(ck)?;
+            check(unsafe { libc::unlinkat(parent, self.base.as_ptr(), libc::AT_REMOVEDIR) })?;
+            check(unsafe { libc::fsync(parent) })
+        })();
+        Ok(removed)
     }
 }
 
@@ -324,14 +363,19 @@ impl Drop for Staging {
 }
 
 fn remove_staging(parent: RawFd, name: &CStr, outer: RawFd, ck: Option<RawFd>) {
-    // Every file in it (only we write there; `add_file` adds more than the four).
     if let Some(ck) = ck {
-        for f in std::fs::read_dir(format!("/proc/self/fd/{ck}")).into_iter().flatten().flatten() {
-            unsafe { libc::unlinkat(ck, cname(&f.file_name().to_string_lossy()).as_ptr(), 0) };
-        }
+        let _ = empty_dir(ck);
     }
     unsafe { libc::unlinkat(outer, c"ck".as_ptr(), libc::AT_REMOVEDIR) };
     unsafe { libc::unlinkat(parent, name.as_ptr(), libc::AT_REMOVEDIR) };
+}
+
+/// Every file in it (only we write there; `add_file` adds more than the four).
+fn empty_dir(dir: RawFd) -> io::Result<()> {
+    for f in std::fs::read_dir(format!("/proc/self/fd/{dir}"))? {
+        check(unsafe { libc::unlinkat(dir, cname(&f?.file_name().to_string_lossy()).as_ptr(), 0) })?;
+    }
+    Ok(())
 }
 
 fn fstat(fd: RawFd) -> io::Result<libc::stat> {

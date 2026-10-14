@@ -29,6 +29,8 @@ p.add_argument("--artifacts", default=os.environ.get("FLEXVM_ARTIFACTS", "artifa
 p.add_argument("--ckpt-dir", default=os.path.join(tempfile.gettempdir(), "flexvm-checkpoints"),
                help="where checkpoint scenarios write checkpoints (removed afterwards)")
 p.add_argument("--template", default="small")
+p.add_argument("--image", default="public.ecr.aws/docker/library/busybox:1.36",
+               help="container image of the app_log scenario's template (APP_TEMPLATE names a built one instead)")
 p.add_argument("scenarios", nargs="+")
 args = p.parse_args()
 BIN = os.path.abspath(args.bin)
@@ -206,7 +208,7 @@ FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_be
           "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "resume_kill",
           "prepare_fail", "short_incoming", "slow_preload", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
           "started_fsync", "started_unmark", "start_stall", "incoming_stall", "claim_stall", "ckpt_wp_race",
-          "fetch_tail_enomem", "fetch_enomem_stuck", "publish", "no_evict", "suspend_stall", "uffd_err")
+          "fetch_tail_enomem", "fetch_enomem_stuck", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup")
 
 
 def disarm():
@@ -3003,6 +3005,169 @@ def suspend_killed():
     check("suspend killed: kill after a suspend destroys it", r["ok"] and n not in vms(A) and not os.path.exists(d), (r, vms(A).get(n)))
 
 
+def suspend_debris():
+    """A suspend directory that is not a suspended VM (no manifest: a revoke
+    or a removal cut short; or marked STARTED by a resume killed outright) is
+    debris: `ls` never lists it, and the name's next holder removes it, so
+    run, suspend, resume and kill of that name work as if it were not there."""
+    n = "ft-debris"
+    d = os.path.join(A.state, "suspended", n)
+    gone = lambda: not os.path.exists(d)
+
+    def plant(*files):
+        os.makedirs(d, exist_ok=True)
+        for f in files:
+            open(os.path.join(d, f), "w").write("1")
+
+    plant("GEN", "pages")
+    check("debris: not listed", n not in vms(A), vms(A).get(n))
+    m = setup(n, mib=20)
+    check("debris: run takes the name and removes it", gone(), os.listdir(d) if not gone() else None)
+    plant("GEN", "pages")
+    s = suspend(A, n)
+    check("debris: suspend over it", vms(A).get(n, {}).get("state") == "suspended", (s, vms(A).get(n)))
+    ok(resume_suspended(A, n))
+    check("debris: resumes, md5 intact", md5(A, n) == m)
+    suspend(A, n)
+    os.unlink(os.path.join(d, "manifest.json"))
+    check("debris: a suspended vm without its manifest is not listed", n not in vms(A), vms(A).get(n))
+    r = resume_suspended(A, n)
+    check("debris: resume says there is none and removes it", not r["ok"] and "no vm named" in r["error"] and gone(), r)
+    plant("GEN")
+    r = kill(A, n)
+    check("debris: kill removes it", r["ok"] and gone(), r)
+    # A resume SIGKILLed after it marked the checkpoint STARTED: consumed.
+    m = setup(n, mib=20)
+    ip = vms(A)[n]["ip"]
+    suspend(A, n)
+    open(os.path.join(d, "STARTED"), "w").close()
+    check("debris: a consumed checkpoint is not listed", n not in vms(A), vms(A).get(n))
+    r = run(A, n + "-ip", ip=ip)
+    check("debris: nor does it hold its address", r["ok"] and vms(A).get(n + "-ip", {}).get("ip") == ip, r)
+    cleanup(n + "-ip")
+    r = run(A, n)
+    check("debris: run of the name removes it", r["ok"] and gone(), (r, os.path.exists(d)))
+    cleanup(n)
+
+
+def revoked_publication():
+    """A checkpoint published but not made durable (the directory's fsync
+    fails) is revoked, the whole directory removed: a suspend fails with the
+    VM running on and nothing left in the name's way; a checkpoint fails with
+    nothing at its path. Both work once the fault is gone. If removing the
+    revoked directory fails too, that is said; what is left never loads, is
+    not listed, and the next suspend of the name removes it."""
+    n = "ft-revoked"
+    m = setup(n, mib=20)
+    d = os.path.join(A.state, "suspended", n)
+    pid = vm_pid(A, n)
+    seen = len(log(A, n))
+    fault(A, "publish_fsync", 120000)
+    os.kill(pid, signal.SIGTERM)
+    check("revoked suspend: reported", wait_for(lambda: "revoked it" in log(A, n)[seen:], 60), log(A, n)[-2000:])
+    check("revoked suspend: the vm runs on", alive(pid) and vms(A).get(n, {}).get("state") == "running" and md5(A, n) == m, vms(A).get(n))
+    check("revoked suspend: its directory is gone", not os.path.exists(d), os.listdir(d) if os.path.exists(d) else None)
+    path = ckpt_path("revoked")
+    r = checkpoint(A, n, path)
+    check("revoked checkpoint: refused, nothing left", not r["ok"] and "revoked it" in r["error"] and not os.path.exists(path), r)
+    leftovers = [f for f in os.listdir(os.path.dirname(path)) if f.startswith(".flexvm-staging-")]
+    check("revoked checkpoint: no staging left", not leftovers, leftovers)
+    fault(A, "revoke_cleanup", 120000)
+    seen = len(log(A, n))
+    os.kill(pid, signal.SIGTERM)
+    check("revoked, not removed: reported", wait_for(lambda: "removing its directory failed" in log(A, n)[seen:], 60), log(A, n)[-2000:])
+    check("revoked, not removed: the vm runs on", alive(pid) and vms(A).get(n, {}).get("state") == "running", vms(A).get(n))
+    check("revoked, not removed: no manifest left, not listed",
+          os.path.isdir(d) and not os.path.exists(os.path.join(d, "manifest.json")) and n not in [k for k, v in vms(A).items() if not v.get("pid")],
+          os.listdir(d) if os.path.exists(d) else None)
+    left = ckpt_path("revoked-left")
+    r = checkpoint(A, n, left)
+    check("revoked checkpoint, not removed: reported", not r["ok"] and "removing its directory failed" in r["error"], r)
+    r = restore(A, left, name=n + "-left", ip="auto")
+    check("revoked checkpoint, not removed: does not restore", not r["ok"], r)
+    fault(A, "revoke_cleanup", 0)
+    fault(A, "publish_fsync", 0)
+    ok(checkpoint(A, n, path))
+    suspend(A, n)
+    check("revoked: suspends once it can, over what was left", vms(A).get(n, {}).get("state") == "suspended", vms(A).get(n))
+    ok(resume_suspended(A, n))
+    check("revoked: resumes, md5 intact", md5(A, n) == m)
+    cleanup(n)
+
+
+def app_template():
+    """A template whose app floods its log past the guest's 1 MiB ring, then
+    prints numbered lines (built from --image, cached in IMAGE_CACHE if set)."""
+    name = os.environ.get("APP_TEMPLATE")
+    if name:
+        return name
+    name = args.template + "-applog"
+    templates = os.environ.get("FLEXVM_TEMPLATES") or os.path.join(os.path.abspath(args.artifacts), "templates")
+    if not os.path.isdir(os.path.join(templates, name)):
+        cmd = ["sh", "-c", "head -c 8000000 /dev/zero | tr '\\0' x; echo; i=0; while :; do echo applog-$i; i=$((i+1)); sleep 0.05; done"]
+        cache = ["--image-cache", os.environ["IMAGE_CACHE"]] if os.environ.get("IMAGE_CACHE") else []
+        code, out, err = cli(A, "template", name, "--image", args.image, *cache, "--vcpus", "2", "--max", "2048", "--cmd", json.dumps(cmd), timeout=600)
+        assert code == 0, err or out
+    return name
+
+
+def app_lines(text):
+    return [int(x) for x in re.findall(r"^applog-(\d+)$", text, re.M)]
+
+
+def app_log():
+    """An app's output is never repeated in its VM's log across a suspend and
+    resume, or a checkpoint --stop and restore (the offset in the guest's log
+    ring is saved with the checkpoint), nor after the host's reader fell
+    behind the ring (it goes on from where the ring does); a fork restored
+    from a running VM's checkpoint goes on from the pause."""
+    n = "ft-applog"
+    tpl = app_template()
+    clear_log(A, n)
+    clear_log(B, n)
+    ok(run(A, n, template=tpl))
+    upto = lambda k: wait_for(lambda: max(app_lines(log(A, n)), default=-1) >= k, 60)
+    check("app log: printing", upto(20), log(A, n)[-500:])
+    suspend(A, n)
+    ok(resume_suspended(A, n))
+    last = max(app_lines(log(A, n)))
+    check("app log: printing after a resume", upto(last + 20), log(A, n)[-500:])
+    path = ckpt_path("applog-stop")
+    ok(checkpoint(A, n, path, stop=True))
+    ok(restore(A, path, name=n))  # without --name its output goes to restore-PID.log
+    last = max(app_lines(log(A, n)))
+    check("app log: printing after a restore", upto(last + 20), log(A, n)[-500:])
+    text = log(A, n)
+    lines = app_lines(text)
+    dups = sorted({x for x in lines if lines.count(x) > 1})
+    check("app log: no line printed twice", not dups, dups[:20])
+    missing = sorted(set(range(min(lines), max(lines) + 1)) - set(lines))
+    check("app log: none lost", min(lines) == 0 and not missing, (min(lines), missing[:20]))
+    check("app log: the flood printed once", text.count("x" * 1000) <= 8000000 // 1000 + 1 and "x" * 1000 in text)
+    print(f"app log: {len(lines)} lines; reader fell behind: {'bytes of app output lost' in text}")
+    # A fork of a running VM goes on from the pause: nothing from before it.
+    path = ckpt_path("applog-cow")
+    ok(checkpoint(A, n, path))
+    fork = n + "-fork"
+    clear_log(A, fork)
+    ok(restore(A, path, name=fork, ip="auto"))
+    check("app log: the fork prints", wait_for(lambda: app_lines(log(A, fork)), 30), log(A, fork)[-500:])
+    first = min(app_lines(log(A, fork)))
+    check("app log: the fork starts at the pause", first >= last and "x" * 1000 not in log(A, fork), (first, last))
+    cleanup(fork)
+    # Migrated, the target goes on where the source stopped.
+    ok(migrate(A, n, B))
+    wait_released(B, n)
+    last = max(app_lines(log(A, n)))
+    check("app log: printing after a migration", wait_for(lambda: max(app_lines(log(B, n)), default=-1) >= last + 20, 60), log(B, n)[-500:])
+    lines = app_lines(log(A, n)) + app_lines(log(B, n))
+    dups = sorted({x for x in lines if lines.count(x) > 1})
+    check("app log: no line printed twice across the migration", not dups, dups[:20])
+    missing = sorted(set(range(min(lines), max(lines) + 1)) - set(lines))
+    check("app log: none lost across the migration", not missing, missing[:20])
+    cleanup(n)
+
+
 def no_evict(scenario):
     """Runs a scenario that grows guests on purpose with pressure eviction
     off on both hosts: how much the host has free must not move its VMs."""
@@ -3082,6 +3247,9 @@ SCENARIOS = dict(
     run_status=run_status,
     terminal=terminal,
     suspend_killed=suspend_killed,
+    suspend_debris=suspend_debris,
+    revoked_publication=revoked_publication,
+    app_log=app_log,
     source_unpublished=source_unpublished,
     source_killed_basic=source_killed_basic,
     arrival_overtaken=arrival_overtaken,
