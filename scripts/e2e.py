@@ -3,17 +3,22 @@
 runs them. Run as root, after building flexvm, the patched Firecracker, the
 guest kernel and the rootfs (see README.md and .github/workflows/ci.yml).
 
-It builds a template, starts two flexvm hosts on loopback (A and B: their
-own listeners, run directories, state directories and VM address ranges), and runs
-each case below against them with fresh VMs. It touches only what it created:
-its own processes, taps, cgroups and directories.
+It builds the templates, then runs the cases below and the selected
+scripts/faults.py scenarios, with fresh VMs, in --jobs lanes at once. Each
+lane has two flexvm hosts on loopback (A and B: their own listeners, run
+directories, state directories and VM address ranges); a lane runs its work
+in batches, each a worker process (this script with --worker) that starts the
+lane's hosts, runs its cases against them, stops them and checks that nothing
+is left. It touches only what it created: its own processes, taps, cgroups
+and directories.
 
 usage: sudo scripts/e2e.py [--bin FLEXVM] [--artifacts DIR] [--log-dir DIR]
                            [--port-a N] [--net-a A.B.C] [--net-b A.B.C]
+                           [--jobs N] [--lanes "PORT:NET-A:NET-B ..."]
                            [--image REF | --no-image] [--faults "SCENARIO ..."]
                            [CASE ...]
 """
-import argparse, glob, hashlib, json, os, re, shutil, signal, socket, subprocess, sys, tempfile, time, traceback
+import argparse, glob, hashlib, json, os, re, shutil, signal, socket, subprocess, sys, tempfile, threading, time, traceback
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -21,9 +26,15 @@ p = argparse.ArgumentParser(usage=__doc__)
 p.add_argument("--bin", default=os.path.join(ROOT, "target", "release", "flexvm"))
 p.add_argument("--artifacts", default=os.path.join(ROOT, "artifacts"))
 p.add_argument("--log-dir", default="/tmp/fvci-logs", help="listener, VM and Firecracker logs end up here")
-p.add_argument("--port-a", type=int, default=7140, help="host A listens here, host B on the next port")
-p.add_argument("--net-a", default="10.140.0", help="host A's VM addresses (.2-.60); B uses --net-b")
+p.add_argument("--port-a", type=int, default=7140, help="lane 0's host A listens here, its host B on the next port; "
+               "each further lane takes the next two")
+p.add_argument("--net-a", default="10.140.0", help="lane 0's host A's VM addresses (.2-.60); B uses --net-b; "
+               "each further lane adds 2 to their second octet")
 p.add_argument("--net-b", default="10.141.0")
+p.add_argument("--jobs", type=int, default=4, help="lanes that run at once")
+p.add_argument("--lanes", help="the lanes' ports and address ranges, as PORT:NET-A:NET-B each (overrides --port-a, "
+               "--net-a, --net-b and --jobs)")
+p.add_argument("--tag", default="fvci", help="prefix of this run's own directories under /run and /var/tmp")
 p.add_argument("--template", default="ci", help="name of the template the cases build and use")
 p.add_argument("--image", default="public.ecr.aws/docker/library/busybox:1.36",
                help="container image for the image-template case")
@@ -41,6 +52,11 @@ FAULTS = ("basic route lost_ack unknown refused pages_blip pages_dead_restore pr
           "abort_superseded gen_zero signals suspend_gen standby restore_ip_peer late_withdrawal "
           "incoming_killed start_killed claim_killed fc_died cow_grow plug_storm")
 p.add_argument("--faults", default=FAULTS, help="scripts/faults.py scenarios to run against the two hosts ('' for none)")
+# A worker runs its cases on one lane, against templates that are already built.
+p.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+p.add_argument("--templates", help=argparse.SUPPRESS)
+p.add_argument("--lane", type=int, default=0, help=argparse.SUPPRESS)
+p.add_argument("--results", help=argparse.SUPPRESS)
 p.add_argument("cases", nargs="*", help="cases to run (default: all)")
 args = p.parse_args()
 BIN = os.path.abspath(args.bin)
@@ -106,7 +122,7 @@ class Host:
         # Inside this run's own fresh directories (see main).
         self.run_dir = os.path.join(RUN, label)
         self.state_dir = os.path.join(WORK, f"{label}-state")
-        self.prefix = f"fvci{label}"
+        self.prefix = f"fvci{args.lane}{label}"
         self.log = os.path.join(args.log_dir, f"listen-{label}.log")
         self.proc = None
         self.vms = set()  # names of the VMs this script created here or moved here
@@ -644,35 +660,25 @@ def faults():
 
 # Directories of this run's own, shared with nothing else: run directories under /run
 # (tmpfs), state and checkpoints under /var/tmp (suspend needs a disk).
-RUN = tempfile.mkdtemp(prefix="fvci-", dir="/run")
-WORK = tempfile.mkdtemp(prefix="fvci-", dir="/var/tmp")
-# Templates of this run's own: never another's `ci` or the shared image cache.
-os.environ["FLEXVM_TEMPLATES"] = ENV["FLEXVM_TEMPLATES"] = os.path.join(WORK, "templates")
+RUN = tempfile.mkdtemp(prefix=args.tag + "-", dir="/run")
+WORK = tempfile.mkdtemp(prefix=args.tag + "-", dir="/var/tmp")
+# Templates of this run's own (a worker's are its run's): never another's `ci` or the shared image
+# cache. On tmpfs: building one writes out all of the guest's memory and reads it back to hash it,
+# which a CI runner's disk makes slow; what stays (sparse) is small.
+TEMPLATES = args.templates or tempfile.mkdtemp(prefix=args.tag + "-", dir="/dev/shm" if os.path.isdir("/dev/shm") else WORK)
+os.environ["FLEXVM_TEMPLATES"] = ENV["FLEXVM_TEMPLATES"] = TEMPLATES
 A = Host("a", args.port_a, args.port_a + 1, args.net_a)
 GROW = args.template + "-grow"
 B = Host("b", args.port_a + 1, args.port_a, args.net_b)
 
 
-def main():
-    assert os.geteuid() == 0, "run as root"
-    selected = args.cases or list(CASES)
-    for c in selected:
-        assert c in CASES, f"unknown case {c}; have {', '.join(CASES)}"
-    started = time.time()
+def worker():
+    """Runs the given cases against this lane's two hosts; writes their results to --results."""
     failed, clean = [], False
-    try:
-        t = time.time()
-        template(args.template, "--vcpus", "2", "--max", "2048")
-        # A larger ceiling with little plugged at the start: VMs must grow.
-        template(GROW, "--vcpus", "2", "--max", "6144", "--plug", "128")
-        print(f"PASS templates ({time.time() - t:.1f} s)", flush=True)
-    except Exception as e:
-        print(f"FAIL template: {e}", flush=True)
-        return 1
     try:
         A.start()
         B.start()
-        for c in selected:
+        for c in args.cases:
             print(f"--- {c}: {CASES[c].__doc__.strip().splitlines()[0]}", flush=True)
             t = time.time()
             try:
@@ -701,6 +707,15 @@ def main():
                     print(f"saving {h.label}'s logs: {e}", flush=True)
         t = time.time()
         problems = []
+        # What a SIGKILLed VM process leaves (its tap, its name) is collected by the next VM
+        # process to start on its host, as later cases' VMs would: start one on each.
+        for h in (A, B):
+            try:
+                if h.proc:
+                    h.run("e2e-collect")
+                    h.kill("e2e-collect")
+            except Exception as e:
+                problems.append(f"host {h.label}: a VM to collect garbage: {e}")
         for h in (A, B):
             try:
                 h.stop()
@@ -712,10 +727,151 @@ def main():
         if problems:
             failed.append("teardown")
             print("\n".join(problems))
-        shutil.rmtree(WORK, ignore_errors=True)
-        shutil.rmtree(RUN, ignore_errors=True)
-    print("\n" + "\n".join(f"{s} {c} ({d:.1f} s)" for c, s, d in results))
-    print(f"{len(results) - len(failed)} passed, {len(failed)} failed in {time.time() - started:.0f} s")
+        if args.results:
+            json.dump(results, open(args.results, "w"))
+    return 1 if failed else 0
+
+
+# About how many seconds each case and scenario takes on a CI runner (4 lanes): the long ones
+# start first, and the short ones go in batches of about BATCH_S (each batch is a worker, with
+# hosts of its own). Unlisted ones count as 2 s.
+COST = {"image_template": 30, "pause_resume": 6, "migrate": 3, "checkpoint_restore": 3, "suspend_resume": 3,
+        "faults/cow_grow": 70, "faults/held_restore_frozen": 19, "faults/pages_blip": 18, "faults/ckpt_incremental": 18,
+        "faults/pages_dead_restore": 14, "faults/abort_superseded": 13, "faults/plug_storm": 11, "faults/unknown": 10,
+        "faults/checkpoint_corrupt": 10, "faults/checkpoint_fork": 9, "faults/signals": 9, "faults/checkpoint_restore": 7,
+        "faults/cow_exact": 7, "faults/prepared_retry": 7, "faults/ckpt_failed_stop": 7, "faults/exec_race": 7,
+        "faults/prepare_fail": 6, "faults/route": 6, "faults/basic": 6, "faults/slow_preload": 6, "faults/refused": 6,
+        "faults/resume_kill": 5, "faults/lost_ack": 5, "faults/ckpt_rearm": 5, "faults/cow_abort": 5,
+        "faults/ckpt_packet_hold": 4}
+BATCH_S = 20
+
+
+def lanes():
+    """(port, net A, net B) of each lane."""
+    if args.lanes:
+        return [(int(port), a, b) for port, a, b in (lane.split(":") for lane in args.lanes.split())]
+    bump = lambda net, i: ".".join(str(int(o) + 2 * i) if k == 1 else o for k, o in enumerate(net.split(".")))
+    return [(args.port_a + 2 * i, bump(args.net_a, i), bump(args.net_b, i)) for i in range(max(1, args.jobs))]
+
+
+def main():
+    assert os.geteuid() == 0, "run as root"
+    if args.worker:
+        return worker()
+    selected = args.cases or list(CASES)
+    for c in selected:
+        assert c in CASES, f"unknown case {c}; have {', '.join(CASES)}"
+    scenarios = args.faults.split() if "faults" in selected else []
+    # (name, templates it needs, cost): the cases, and each scenario on its own.
+    work = [(c, set() if c == "image_template" else {args.template}, COST.get(c, 2)) for c in selected if c != "faults"]
+    # Growth runs on GROW; fc_prepare needs a second template to mismatch with.
+    work += [(f"faults/{s}", {args.template, GROW} if s in ("cow_grow", "plug_storm", "fc_prepare") else {args.template},
+              COST.get(f"faults/{s}", 2)) for s in scenarios]
+    work.sort(key=lambda w: -w[2])
+    lock, out_lock = threading.Condition(), threading.Lock()
+    built, broken, procs, summary = set(), set(), [], []
+    started = time.time()
+
+    def say(line):
+        with out_lock:
+            print(line, flush=True)
+
+    def build(name, *extra):
+        t = time.time()
+        try:
+            r = flexvm("template", name, *extra, timeout=600)
+            out, ok = (r.stdout + r.stderr).strip(), True
+        except Exception as e:
+            out, ok = str(e), False
+        with lock:
+            (built if ok else broken).add(name)
+            summary.append((f"template {name}", "PASS" if ok else "FAIL", time.time() - t, "-"))
+            lock.notify_all()
+        say(f"{'PASS' if ok else 'FAIL'} template {name} ({time.time() - t:.1f} s): {out}")
+
+    def take():
+        """The next batch whose templates are built; None once there is no more."""
+        with lock:
+            while True:
+                for w in [w for w in work if w[1] & broken]:
+                    work.remove(w)
+                    summary.append((w[0], "FAIL", 0.0, "-"))
+                    say(f"FAIL {w[0]}: its template failed")
+                ready = [w for w in work if w[1] <= built]
+                if ready or not work:
+                    break
+                lock.wait()
+            if not ready:
+                return None
+            batch = [ready[0]]
+            for w in reversed(ready[1:]):
+                if sum(b[2] for b in batch) + w[2] > BATCH_S:
+                    break
+                batch.append(w)
+            for w in batch:
+                work.remove(w)
+            return [w[0] for w in batch]
+
+    def lane(i, port, net_a, net_b):
+        n = 0
+        while (batch := take()) is not None:
+            n += 1
+            label = f"{i}.{n}"
+            cases = [c for c in batch if not c.startswith("faults/")]
+            scens = [c.split("/", 1)[1] for c in batch if c.startswith("faults/")]
+            res = os.path.join(WORK, f"results-{label}.json")
+            cmd = [sys.executable, "-u", os.path.abspath(__file__), "--worker", "--lane", str(i), "--bin", BIN,
+                   "--artifacts", ARTIFACTS, "--log-dir", os.path.join(args.log_dir, f"lane-{label}"),
+                   "--port-a", str(port), "--net-a", net_a, "--net-b", net_b, "--tag", args.tag,
+                   "--template", args.template, "--templates", TEMPLATES, "--image", args.image, "--results", res,
+                   "--faults", " ".join(scens), *(["--no-image"] if args.no_image else []),
+                   *cases, *(["faults"] if scens else [])]
+            say(f"[{label}] {' '.join(batch)}")
+            t = time.time()
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, text=True)
+            with lock:
+                procs.append(p)
+            got = []
+            for line in p.stdout:
+                say(f"[{label}] {line.rstrip()}")
+                m = re.match(r"scenario (\S+): (ok|FAILED) in ([\d.]+) s$", line.strip())
+                if m:
+                    got.append((f"faults/{m.group(1)}", "PASS" if m.group(2) == "ok" else "FAIL", float(m.group(3)), label))
+            code = p.wait()
+            try:
+                got += [(c, st, d, label) for c, st, d in json.load(open(res)) if c != "faults" or st == "FAIL"]
+            except (OSError, ValueError):
+                got.append((f"worker {label}", "FAIL", time.time() - t, label))
+            if code != 0 and not any(g[1] == "FAIL" for g in got):
+                got.append((f"worker {label} (exit {code})", "FAIL", time.time() - t, label))
+            with lock:
+                summary.extend(got)
+
+    builders = [threading.Thread(target=build, args=(args.template, "--vcpus", "2", "--max", "2048")),
+                # A larger ceiling with little plugged at the start: VMs must grow.
+                threading.Thread(target=build, args=(GROW, "--vcpus", "2", "--max", "6144", "--plug", "128"))]
+    runners = [threading.Thread(target=lane, args=(i, *l), daemon=True) for i, l in enumerate(lanes())]
+    try:
+        for t in builders + runners:
+            t.start()
+        for t in builders + runners:
+            t.join()
+    finally:
+        # Interrupted: the workers tear down what they made.
+        with lock:
+            for p in procs:
+                if p.poll() is None:
+                    p.send_signal(signal.SIGINT)
+        for p in procs:
+            try:
+                p.wait(60)
+            except subprocess.TimeoutExpired:
+                p.kill()
+    summary.sort(key=lambda r: -r[2])
+    failed = [r for r in summary if r[1] != "PASS"]
+    print("\n" + "\n".join(f"{s} {c} ({d:.1f} s, batch {b})" for c, s, d, b in summary))
+    print(f"{len(summary) - len(failed)} passed, {len(failed)} failed in {time.time() - started:.0f} s "
+          f"({sum(r[2] for r in summary):.0f} s of work in {len(lanes())} lanes)")
     return 1 if failed else 0
 
 
@@ -725,4 +881,6 @@ if __name__ == "__main__":
     finally:
         shutil.rmtree(WORK, ignore_errors=True)
         shutil.rmtree(RUN, ignore_errors=True)
+        if not args.templates:
+            shutil.rmtree(TEMPLATES, ignore_errors=True)
     sys.exit(code)

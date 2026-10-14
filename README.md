@@ -150,9 +150,10 @@ back before and right after the migration; `post_copy` has the difference
 
 ## Tests
 
-`sudo scripts/e2e.py` is what CI runs on a KVM runner: two hosts on loopback,
-the commands above, then a selection of `scripts/faults.py` scenarios (every
-failure path of migration, checkpoints and suspend, by injected faults).
+`sudo scripts/e2e.py` is what CI runs on a KVM runner: the commands above
+and a selection of `scripts/faults.py` scenarios (every failure path of
+migration, checkpoints and suspend, by injected faults), in `--jobs` lanes at
+once, each with two hosts of its own on loopback.
 `scripts/nettest.sh` migrates a VM back and forth under TCP and UDP traffic
 between network namespaces and fails on a lost datagram or a long stall.
 
