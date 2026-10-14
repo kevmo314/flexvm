@@ -509,18 +509,17 @@ fn resolve_user(root: &Root, user: &str) -> Result<(u32, u32, String, Vec<u32>)>
     Ok((uid, gid, home, groups))
 }
 
-/// Sized to content plus headroom, rounded up to 2 MiB as virtio-pmem requires.
+/// Sized to content and 256-byte inodes plus headroom, rounded up to 2 MiB as virtio-pmem requires.
 fn mkfs(dir: &Path, entries: u64, dest: &Path) -> Result<()> {
     let du = Command::new("du").arg("-sk").arg(dir).output()?;
     let kib: u64 = String::from_utf8_lossy(&du.stdout).split_whitespace().next().and_then(|s| s.parse().ok()).ok_or("du failed")?;
     let inodes = entries * 12 / 10 + 4096;
-    // Content and inode tables, with headroom, plus a 32 MiB journal.
-    let mib = (((kib * 1024 + inodes * 256) * 12 / 10).div_ceil(1 << 20) + 64 + 32).div_ceil(2) * 2;
+    let mib = ((kib + inodes / 4) * 12 / 10 / 1024 + 64).div_ceil(2) * 2;
     // mkfs writes through our descriptor, so the name cannot be swapped for a symlink.
     let image = create_new(dest)?;
     image.set_len(mib << 20)?;
     let out = Command::new("mkfs.ext4")
-        .args(["-q", "-F", "-b", "4096", "-I", "256", "-J", "size=32", "-L", "flexroot", "-N", &inodes.to_string(), "-d"])
+        .args(["-q", "-F", "-b", "4096", "-L", "flexroot", "-N", &inodes.to_string(), "-d"])
         .arg(dir)
         .arg(format!("/proc/{}/fd/{}", std::process::id(), image.as_raw_fd()))
         .output()

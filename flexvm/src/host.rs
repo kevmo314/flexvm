@@ -164,14 +164,13 @@ pub struct Host {
     /// As loaded; `config_now` reads host.json again once it changed.
     pub cfg: Config,
     /// host.json's mtime and inode when `cfg` was loaded.
-    cfg_stamp: Option<FileStamp>,
+    cfg_stamp: Option<Stamp>,
 }
 
-type FileStamp = (SystemTime, u64);
-
-fn file_stamp(path: &Path) -> Option<FileStamp> {
-    let m = std::fs::metadata(path).ok()?;
-    Some((m.modified().ok()?, m.ino()))
+/// mtime and inode: `store` renames, so a rewrite in the same mtime tick differs too.
+type Stamp = (SystemTime, u64);
+fn stamp(path: &Path) -> Option<Stamp> {
+    std::fs::metadata(path).ok().and_then(|m| Some((m.modified().ok()?, m.ino())))
 }
 
 static RUN_DIR: OnceLock<PathBuf> = OnceLock::new();
@@ -193,7 +192,7 @@ impl Host {
         let canon = |d: &Path| d.canonicalize().map_err(|e| format!("{}: {e} (run flexvm as root to create it)", d.display()));
         let (state, run) = (canon(state)?, canon(run)?);
         let _ = RUN_DIR.set(run.clone());
-        let cfg_stamp = file_stamp(&state.join("host.json"));
+        let cfg_stamp = stamp(&state.join("host.json"));
         let cfg = load(&state.join("host.json"))?.unwrap_or_default();
         Ok(Host { state, run, cfg, cfg_stamp })
     }
@@ -211,7 +210,7 @@ impl Host {
         }
         store(&path, &cfg, true)?;
         self.cfg = cfg;
-        self.cfg_stamp = file_stamp(&path);
+        self.cfg_stamp = stamp(&path);
         Ok(())
     }
 
@@ -259,9 +258,9 @@ impl Host {
     /// reserve, the eviction mark or the peers since this process started.
     /// host.json is read again once its mtime or inode changed (then cached by both).
     pub fn config_now(&self) -> Config {
-        static SEEN: Mutex<Option<(PathBuf, FileStamp, Config)>> = Mutex::new(None);
+        static SEEN: Mutex<Option<(PathBuf, Stamp, Config)>> = Mutex::new(None);
         let path = self.state.join("host.json");
-        let Some(now) = file_stamp(&path).filter(|&t| Some(t) != self.cfg_stamp) else { return self.cfg.clone() };
+        let Some(now) = stamp(&path).filter(|&t| Some(t) != self.cfg_stamp) else { return self.cfg.clone() };
         let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((_, _, cfg)) = seen.as_ref().filter(|(p, t, _)| *p == path && *t == now) {
             return cfg.clone();
@@ -588,19 +587,17 @@ impl Host {
         }
         let g = load::<Gens>(&path)?.unwrap_or(Gens { next: 1, reserved: 0, boot: String::new() });
         let next = if g.boot == boot_id() { g.next } else { g.next.max(g.reserved) };
-        let gen = next.max(seen.checked_add(1).ok_or("generations exhausted")?);
-        let (reserved, durable) = if gen >= g.reserved { (gen.checked_add(GEN_BLOCK).ok_or("generations exhausted")?, true) } else { (g.reserved, false) };
-        store(&path, &Gens { next: gen.checked_add(1).ok_or("generations exhausted")?, reserved, boot: boot_id().into() }, durable)?;
+        let gen = next.max(seen + 1);
+        let (reserved, durable) = if gen >= g.reserved { (gen + GEN_BLOCK, true) } else { (g.reserved, false) };
+        store(&path, &Gens { next: gen + 1, reserved, boot: boot_id().into() }, durable)?;
         Ok(gen)
     }
 
     pub fn claim_incoming(&self, l: &Locked, holder: &str, ip: Ipv4Addr, gen: u64) -> Result<AddrClaim> {
-        if gen > u64::MAX / 2 {
-            bail!("{ip}: generation {gen} is too large");
-        }
         let mut a = self.addr(l, ip)?;
-        if gen == 0 {
-            bail!("{ip}: an arrival must carry its address's generation");
+        // Bounded, so `next_gen` cannot overflow on a peer's value.
+        if gen == 0 || gen > u64::MAX / 2 {
+            bail!("{ip}: an arrival must carry its address's generation (not {gen})");
         }
         if self.held(&a) && a.holder.as_deref() != Some(holder) {
             bail!("{ip} is in use here");
@@ -661,11 +658,8 @@ impl Host {
     /// `via` None is a withdrawal. False if stale (older, or announcing a
     /// withdrawn generation). A withdrawal frees a loan of that gen or older.
     pub fn observe(&self, l: &Locked, ip: Ipv4Addr, gen: u64, via: Option<Ipv4Addr>) -> Result<bool> {
-        if gen > u64::MAX / 2 {
-            bail!("{ip}: generation {gen} is too large");
-        }
         self.update(l, ip, true, |a| {
-            if gen < a.seen || (gen == a.seen && a.withdrawn && via.is_some()) {
+            if gen < a.seen || gen > u64::MAX / 2 || (gen == a.seen && a.withdrawn && via.is_some()) {
                 return false;
             }
             (a.seen, a.withdrawn, a.via) = (gen, via.is_none(), via);
@@ -815,14 +809,9 @@ impl Host {
             Floor::EvictMark => (cfg.evict_at(), "eviction mark"),
         };
         let path = self.run.join("grants");
-        let now = boottime_ms()?;
-        if boot_id().is_empty() {
-            bail!("cannot read the boot id: admission needs a per-boot clock");
-        }
-        // Without a matching boot marker, these are old-boot or wall-clock grants.
-        let boot = self.run.join("grants.boot");
-        let same_boot = load::<String>(&boot)?.as_deref() == Some(boot_id());
-        let mut grants: Vec<(u64, u64, u64)> = if same_boot { load(&path)?.unwrap_or_default() } else { Vec::new() };
+        let now = boottime_ms();
+        let mut grants: Vec<(u64, u64, u64)> = load(&path)?.unwrap_or_default();
+        // A stamp in the future is another boot's or an older build's wall clock.
         grants.retain(|&(t, ..)| t <= now && now - t <= GRANT_WINDOW.as_millis() as u64);
         let held = self.holds(&l);
         let held_ids: HashSet<_> = held.iter().map(|h| h.0).collect();
@@ -851,9 +840,6 @@ impl Host {
         if let Err(e) = store(&path, &grants, false) {
             drop(hold);
             return Err(e);
-        }
-        if !same_boot {
-            store(&boot, &boot_id(), false)?;
         }
         Ok(Ok((id, hold)))
     }
@@ -935,13 +921,11 @@ impl Host {
 
 const GRANT_WINDOW: Duration = Duration::from_secs(10);
 
-/// Shared across processes, unaffected by wall-clock steps; includes suspend.
-fn boottime_ms() -> Result<u64> {
+/// Shared by all processes (RUN is per boot) and unaffected by wall-clock steps.
+fn boottime_ms() -> u64 {
     let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut t) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    Ok(t.tv_sec as u64 * 1000 + t.tv_nsec as u64 / 1_000_000)
+    unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut t) };
+    t.tv_sec as u64 * 1000 + t.tv_nsec as u64 / 1_000_000
 }
 const ALLOC_HINT: &str = ".next";
 
@@ -2044,8 +2028,8 @@ mod tests {
             })
             .unwrap();
             File::open(&path).unwrap().set_times(times).unwrap();
-            assert_eq!(file_stamp(&path).unwrap().0, time);
-            assert_ne!(file_stamp(&path).unwrap().1, previous.metadata().unwrap().ino());
+            assert_eq!(stamp(&path).unwrap().0, time);
+            assert_ne!(stamp(&path).unwrap().1, previous.metadata().unwrap().ino());
             assert_eq!(running.config_now().reserve_mib, reserve);
         }
     }
@@ -2057,39 +2041,38 @@ mod tests {
         let addr = ip("10.9.0.1");
         for gen in [u64::MAX / 2 + 1, u64::MAX] {
             assert!(h.claim_incoming(&l, "incoming", addr, gen).is_err());
-            assert!(h.observe(&l, addr, gen, Some(ip("10.1.0.2"))).is_err());
-            assert!(h.observe(&l, addr, gen, None).is_err());
+            assert!(!h.observe(&l, addr, gen, Some(ip("10.1.0.2"))).unwrap());
+            assert!(!h.observe(&l, addr, gen, None).unwrap());
             assert_eq!(h.addr(&l, addr).unwrap(), Addr::default());
         }
         assert!(h.observe(&l, addr, u64::MAX / 2, None).unwrap());
         assert_eq!(h.lend_new(&l, addr).unwrap(), u64::MAX / 2 + 1);
-        assert!(h.next_gen(u64::MAX).is_err());
-        store(&h.state.join("addrs/.gens"), &serde_json::json!({"next": u64::MAX, "reserved": u64::MAX, "boot": boot_id()}), false).unwrap();
-        assert!(h.next_gen(0).is_err());
     }
 
     #[test]
     fn admission_uses_this_boots_clock_and_drops_future_grants() {
         let mut h = host("grant-clock");
         h.cfg.reserve_mib = AVAIL - 1000;
-        let before = boottime_ms().unwrap();
+        let before = boottime_ms();
         grant_at(&h, 1000, Floor::Reserve, false).unwrap();
         let path = h.run.join("grants");
         let grants: Vec<(u64, u64, u64)> = load(&path).unwrap().unwrap();
-        assert!(grants[0].0 >= before && grants[0].0 <= boottime_ms().unwrap());
+        assert!(grants[0].0 >= before && grants[0].0 <= boottime_ms());
         let mut other = Host::open(&h.state, &h.run).unwrap();
         other.cfg.reserve_mib = h.cfg.reserve_mib;
         assert!(grant_at(&other, 1, Floor::Reserve, false).is_err(), "another host handle sees the pending grant");
-        // Neither a future timestamp nor a previous boot's grant counts.
-        store(&path, &vec![(u64::MAX, 1000u64, 1u64)], false).unwrap();
-        grant_at(&h, 1000, Floor::Reserve, false).unwrap();
-        store(&h.run.join("grants.boot"), &"other-boot", false).unwrap();
-        grant_at(&h, 1000, Floor::Reserve, false).unwrap();
-        // The old wall-clock format has no boot marker.
-        std::fs::remove_file(h.run.join("grants.boot")).unwrap();
-        store(&path, &vec![(u64::MAX, 1000u64, 1u64)], false).unwrap();
-        grant_at(&h, 1000, Floor::Reserve, false).unwrap();
+        // A wall-clock stamp (an older build's, at any wall time) is in the future: dropped, not held forever.
+        let wall = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        for t in [wall, wall - 3_600_000, u64::MAX] {
+            store(&path, &vec![(t, 1000u64, 1u64)], false).unwrap();
+            grant_at(&h, 1000, Floor::Reserve, false).unwrap();
+        }
+        // A recent boottime stamp counts; one older than the window does not.
+        let now = boottime_ms();
+        store(&path, &vec![(now - 1000, 1000u64, 1u64)], false).unwrap();
         assert!(grant_at(&h, 1, Floor::Reserve, false).is_err());
+        store(&path, &vec![(now - GRANT_WINDOW.as_millis() as u64 - 1000, 1000u64, 1u64)], false).unwrap();
+        grant_at(&h, 1000, Floor::Reserve, false).unwrap();
     }
 
     #[test]
