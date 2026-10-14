@@ -450,6 +450,17 @@ impl Host {
         Ok(self.held(&a).then_some(a.holder).flatten())
     }
 
+    /// Gives back a grant of `mib` (its newest) that was not used.
+    pub fn refund(&self, mib: u64) {
+        let Ok(_l) = self.lock() else { return };
+        let path = self.run.join("grants");
+        let mut grants: Vec<(u64, u64)> = load(&path).ok().flatten().unwrap_or_default();
+        if let Some(i) = grants.iter().rposition(|g| g.1 == mib) {
+            grants.remove(i);
+            let _ = store(&path, &grants, false);
+        }
+    }
+
     /// MemAvailable lags a grant until the guest touches the memory, so all
     /// processes' grants of the last `GRANT_WINDOW` count as used.
     /// Test fault `no_admit`: refuses everything.
@@ -1244,6 +1255,9 @@ mod tests {
         h.cfg.reserve_mib = free.saturating_sub(3000);
         assert!(h.admit(1000) && h.admit(1000));
         assert!(!h.admit(2000), "recent grants count as used");
+        // A start that did not happen gives its grant back.
+        h.refund(1000);
+        assert!(h.admit(1500));
         h.cfg.reserve_mib = free + 1;
         assert!(!h.admit(1));
     }

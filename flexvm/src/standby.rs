@@ -274,15 +274,22 @@ fn claim(p: &Arc<Proc>, req: &Value) -> std::result::Result<Value, (Error, bool)
         None => None,
     };
     let mut t = Phases::new();
-    let held = p.standby.lock().unwrap().as_ref().and_then(|s| crate::util::proc_kb(&format!("/proc/{}/status", s.firecracker().pid()), "VmRSS"));
-    p.admit_start(held.unwrap_or(0) >> 20).map_err(|e| (e, true))?;
     let lock = host.take_name(name, false).map_err(|e| (e, false))?;
     let claim = host.lock().and_then(|l| host.claim_new(&l, name, want)).map_err(|e| (e, false))?;
     t.mark("claim_ip");
-    let still = host.fence(claim.ip, claim.gen).map_err(|e| (e, false))?;
-    let paused = p.standby.lock().unwrap().take().ok_or_else(|| ("standby vm gone".into(), true))?;
+    // Its memory is already out of MemAvailable: only the step is charged.
+    let held = p.standby.lock().unwrap().as_ref().and_then(|s| crate::util::proc_kb(&format!("/proc/{}/status", s.firecracker().pid()), "VmRSS"));
+    let held = held.unwrap_or(0) >> 20;
+    p.admit_start(held, held).map_err(|e| (e, true))?;
+    let not_run = |e: Error, retry: bool| {
+        p.refund_start();
+        (e, retry)
+    };
+    let still = host.fence(claim.ip, claim.gen).map_err(|e| not_run(e, false))?;
+    let paused = p.standby.lock().unwrap().take().ok_or_else(|| not_run("standby vm gone".into(), true))?;
     let vm = resume(paused, name, claim.ip, fault("resume_kill"), &mut t).map_err(|(e, ran)| {
-        (format!("resuming a standby vm failed{}: {e}", if ran { ", and it may have run" } else { "" }).into(), !ran)
+        let e = format!("resuming a standby vm failed{}: {e}", if ran { ", and it may have run" } else { "" }).into();
+        if ran { (e, false) } else { not_run(e, true) }
     })?;
     drop(still);
     p.set_name(lock);

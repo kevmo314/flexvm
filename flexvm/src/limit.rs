@@ -88,19 +88,18 @@ impl Limit {
         }
     }
 
-    /// Once the VM runs here: what its start was admitted (`granted`, MiB),
-    /// never less than it holds or still pages in (`need`), and up to the
-    /// guest's size otherwise. The cgroup may still be being made (`Spawner::take`).
-    pub fn start(&self, granted: u64, need: u64, cap: u64) {
+    /// Once the VM runs here: what its start was admitted (MiB), up to the
+    /// guest's size. Above it from the start, the VM is throttled until a
+    /// step is admitted. The cgroup may still be being made (`Spawner::take`).
+    pub fn start(&self, admitted: u64, cap: u64) {
         let Some(cg) = &self.cgroup else { return };
         let made = Instant::now();
         while !cg.join("memory.high").exists() && made.elapsed() < Duration::from_secs(2) {
             std::thread::sleep(Duration::from_millis(5));
         }
-        let need = need.max(self.used().unwrap_or(0));
         let mut m = self.mark.lock().unwrap();
         m.cap = cap;
-        m.admitted = granted.min(cap).max(need);
+        m.admitted = admitted.min(cap);
         self.write(&m);
     }
 
@@ -244,7 +243,7 @@ mod tests {
         let (l, cg, mut host) = cgroup("follow");
         set(&cg, 20);
         // What it holds and still pages in, and a step.
-        l.start(allowance(100), 100, 1000);
+        l.start(allowance(100), 1000);
         assert_eq!((l.admitted(), high(&cg)), (100 + 256, Some(356 + overhead(356))));
         // Far from the mark: nothing; near it, a step more.
         assert!(l.grow(&host) && l.admitted() == 356);
@@ -279,7 +278,7 @@ mod tests {
     #[test]
     fn admission_never_holds_the_mark() {
         let (l, cg, host) = cgroup("order");
-        l.start(512, 100, 5000);
+        l.start(512, 5000);
         set(&cg, 512 + overhead(512));
         let held = host.lock().unwrap();
         let (l, host) = (&l, &host);

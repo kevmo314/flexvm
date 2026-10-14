@@ -2595,8 +2595,11 @@ def mem_available():
 
 
 def hog(host, name, mib):
-    """Starts a guest program filling `mib` MiB; it touches /tmp/hog.done once it has."""
-    code, out = sh(host, name, f"rm -f /tmp/hog.done; setsid python3 -c 'b=bytes([1])*({mib}<<20); open(\"/tmp/hog.done\", \"w\").close(); "
+    """Starts a guest program filling `mib` MiB, every page different (so the
+    host cannot merge them, as KSM on CI runners does); it touches
+    /tmp/hog.done once it has."""
+    fill = f"b=bytearray({mib}<<20); [b.__setitem__(slice(i, i + 8), i.to_bytes(8, \"little\")) for i in range(0, len(b), 4096)]"
+    code, out = sh(host, name, f"rm -f /tmp/hog.done; setsid python3 -c '{fill}; open(\"/tmp/hog.done\", \"w\").close(); "
                                "import time; time.sleep(3600)' >/dev/null 2>&1 </dev/null & echo started")
     assert code == 0, out
 
@@ -2714,35 +2717,78 @@ def start_admission():
     saying why, and a restore is refused the same way."""
     n, path = "ft-admit", ckpt_path("ft-admit")
     setup(n, mib=1)
+    # A cold start is admitted for the template's working set (paged in up front) and a step.
+    each = vms(A)[n]["admitted_mib"]
     ok(checkpoint(A, n, path))
     cleanup(n)
-    cfg = os.path.join(A.state, "host.json")
-    saved = open(cfg).read()
     names = [f"ft-admit-{i}" for i in range(8)]
     res = {}
-    try:
-        time.sleep(11)  # earlier grants age out
-        c = json.loads(saved)
-        c["reserve_mib"] = mem_available() - 3 * 256 - 128
-        with open(cfg, "w") as f:
-            json.dump(c, f)
+    with tight_reserve(3 * each + each // 2):
         threads = [threading.Thread(target=lambda i=i: res.update({i: run(A, i)})) for i in names]
         [t.start() for t in threads]
         [t.join() for t in threads]
         started = [i for i in names if res[i]["ok"]]
         refused = [i for i in names if not res[i]["ok"]]
-        check("start admission: at most three start", 1 <= len(started) <= 3, (started, [res[i].get("error") for i in refused][:2]))
+        check(f"start admission: at most three start ({each} MiB each)", 1 <= len(started) <= 3,
+              (started, [res[i].get("error") for i in refused][:2]))
         check("start admission: the others are refused for the reserve",
               all("above the" in res[i]["error"] and "reserve" in res[i]["error"] for i in refused), [res[i]["error"] for i in refused])
-        check("start admission: each started at its allowance", all(vms(A)[i]["admitted_mib"] >= 256 for i in started), started)
+        marks = {i: (vms(A)[i]["admitted_mib"], cgroup(A, i)[0]) for i in started}
+        check("start admission: each started at its allowance, holding no more", all(a == each and u <= a + 64 for a, u in marks.values()), marks)
         r = restore(A, path, name="ft-admit-r", ip="auto")
         check("start admission: a restore is refused too", not r["ok"] and "reserve" in r["error"], r)
+    for i in names + ["ft-admit-r"]:
+        kill(A, i)
+    rm_ckpt(path)
+
+
+class tight_reserve:
+    """Host A's reserve set to leave `room` MiB above it, once earlier grants aged out."""
+    def __init__(self, room):
+        self.room, self.cfg = room, os.path.join(A.state, "host.json")
+
+    def __enter__(self):
+        self.saved = open(self.cfg).read()
+        time.sleep(11)
+        c = json.loads(self.saved)
+        c["reserve_mib"] = mem_available() - self.room
+        with open(self.cfg, "w") as f:
+            json.dump(c, f)
+
+    def __exit__(self, *_):
+        with open(self.cfg, "w") as f:
+            f.write(self.saved)
+
+
+def grants(host):
+    """Admission grants of the last 10 s on `host` (MiB each)."""
+    try:
+        g = json.load(open(os.path.join(host.run, "grants")))
+    except (OSError, ValueError):
+        return []
+    return [m for t, m in g if time.time() * 1000 - t <= 10000]
+
+
+def standby_admission():
+    """A standby claim is charged only the step it may grow by (its memory is
+    already in use), so it succeeds with little room above the reserve; a
+    claim refused before it starts anything (its name is taken) leaves no grant."""
+    t = args.template
+    ok(run(A, "ft-sbadm-dup"))
+    try:
+        ok(cli_json(A, "standby", "--template", t, "1"))
+        live = lambda: len([f for f in os.listdir(os.path.join(A.run, "standby", t)) if f.endswith(".lock") and alive(f[:-5])])
+        check("standby admission: one ready", wait_for(lambda: live() == 1, 60), live())
+        with tight_reserve(256 + 48):
+            r = run(A, "ft-sbadm-dup")
+            check("standby admission: a taken name is refused", not r["ok"], r)
+            check("standby admission: and leaves no grant", grants(A) == [], grants(A))
+            r = run(A, "ft-sbadm")
+            check("standby admission: claimed with room for a step only", r["ok"] and r["result"]["standby"] is True, r)
     finally:
-        with open(cfg, "w") as f:
-            f.write(saved)
-        for i in names + ["ft-admit-r"]:
-            kill(A, i)
-        rm_ckpt(path)
+        ok(cli_json(A, "standby", "--template", t, "0"))
+        cleanup("ft-sbadm")
+        cleanup("ft-sbadm-dup")
 
 
 def kill_source():
@@ -3562,7 +3608,7 @@ SCENARIOS = dict(
     pull_died=pull_died,
     uffd_err=uffd_err,
     mem_high=no_evict(skippable(mem_high)), mem_high_migrate=no_evict(skippable(mem_high_migrate)),
-    mem_high_evict=skippable(mem_high_evict), start_admission=start_admission,
+    mem_high_evict=skippable(mem_high_evict), start_admission=start_admission, standby_admission=standby_admission,
     cow_grow=no_evict(cow_grow), plug_race=no_evict(plug_race), shrink_stall=no_evict(shrink_stall), plug_storm=no_evict(plug_storm),
     basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, refused=refused, pages_blip=pages_blip,
     pages_dead_restore=pages_dead_restore, pages_dead=pages_dead, resume_kill=resume_kill, prepared_retry=prepared_retry,

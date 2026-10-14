@@ -94,6 +94,8 @@ pub struct Proc {
     pub files: Mutex<Vec<PathBuf>>,
     /// What the VM's start was admitted against the reserve (MiB): its first memory mark.
     granted: AtomicU64,
+    /// What of it this start charged (refunded if the VM never starts).
+    charged: AtomicU64,
     serving: AtomicBool,
     me: std::sync::Weak<Proc>,
 }
@@ -134,6 +136,7 @@ impl Proc {
             pending_route: Mutex::new(None),
             files: Mutex::new(Vec::new()),
             granted: AtomicU64::new(0),
+            charged: AtomicU64::new(0),
             serving: AtomicBool::new(false),
             me: me.clone(),
         }))
@@ -144,7 +147,8 @@ impl Proc {
     }
 
     pub fn set_vm(&self, vm: Arc<Vm>) {
-        vm.start_limit(self.granted.load(Ordering::SeqCst));
+        vm.start_limit(self.granted.load(Ordering::SeqCst), &self.host);
+        self.charged.store(0, Ordering::SeqCst);
         let _ = self.vm.set(vm);
     }
 
@@ -158,14 +162,26 @@ impl Proc {
     }
 
     /// Every start, before it loads: what the VM brings (`need` MiB, held or
-    /// to page in) and a step, against the host's reserve.
-    pub fn admit_start(&self, need: u64) -> Result<()> {
+    /// to page in) and a step, against the host's reserve, less what it
+    /// already holds here (`held`: a standby's memory is out of MemAvailable).
+    pub fn admit_start(&self, need: u64, held: u64) -> Result<()> {
         let mib = crate::limit::allowance(need);
-        if !self.host.admit(mib) {
-            bail!("not enough memory here for {mib} MiB above the {} MiB reserve", self.host.cfg.reserve_mib);
+        let charge = mib.saturating_sub(held);
+        if !self.host.admit(charge) {
+            bail!("not enough memory here for {charge} MiB above the {} MiB reserve", self.host.cfg.reserve_mib);
         }
         self.granted.store(mib, Ordering::SeqCst);
+        self.charged.store(charge, Ordering::SeqCst);
         Ok(())
+    }
+
+    /// A start that did not happen gives its admission back.
+    pub fn refund_start(&self) {
+        let charge = self.charged.swap(0, Ordering::SeqCst);
+        self.granted.store(0, Ordering::SeqCst);
+        if charge > 0 {
+            self.host.refund(charge);
+        }
     }
 
     pub fn set_addr(&self, a: AddrClaim) -> Ipv4Addr {
@@ -442,7 +458,7 @@ impl Proc {
         let ip = self.set_addr(claim);
         t.mark("claim_ip");
         crate::host::stall("start_stall");
-        self.admit_start(0)?;
+        self.admit_start(tpl.working_set_mib(), 0)?;
         let prepared = Vm::prepare(self.spawner.take(None)?, tpl.clone(), &mut t)?;
         let learn = crate::standby::load_set(&self.host, &tpl).is_empty();
         if learn {
@@ -961,6 +977,7 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
     }
     if let Err(e) = res {
         eprintln!("flexvm: {e}");
+        p.refund_start();
         p.finish(&op, End::NotStarted, FAILED, None);
     }
     drop(op);
