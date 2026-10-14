@@ -216,6 +216,8 @@ impl Staging {
         if named.dev() != pinned.st_dev as u64 || named.ino() != pinned.st_ino as u64 {
             return Err(moved.into());
         }
+        // Its directory's own entry too, up to the root, before anything is published.
+        crate::util::sync_ancestors_fd(self.parent.as_raw_fd())?;
         t.mark("fsync");
         let (outer, parent) = (self.outer.as_raw_fd(), self.parent.as_raw_fd());
         check(unsafe { libc::renameat2(outer, c"ck".as_ptr(), parent, self.base.as_ptr(), libc::RENAME_NOREPLACE) })
