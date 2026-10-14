@@ -480,9 +480,10 @@ impl Vm {
         // First, so a call in progress (holding `fc`) fails at once.
         self.pager.kill_firecracker();
         let Some(mut fc) = self.fc.lock().unwrap().take() else { return };
-        fc.kill();
         let _ = UnixStream::connect(self.mem_sock());
+        // Reaped only once the pager has stopped, so its pid is not reused under the pager.
         self.pager.join();
+        fc.kill();
         crate::fc::release(&self.tap, self.cgroup.as_deref(), &self.dir);
     }
 
@@ -695,8 +696,10 @@ impl Drop for Prepared {
     fn drop(&mut self) {
         if let Some(idle) = self.idle.take() {
             self.pager.stop();
-            drop(idle);
+            self.pager.kill_firecracker();
+            // Reaped only once the pager has stopped (see `Vm::kill`).
             self.pager.join();
+            drop(idle);
         }
     }
 }

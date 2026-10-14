@@ -135,6 +135,7 @@ impl Firecracker {
         format!("firecracker {} {status}; log: {}", self.pid(), lines[lines.len().saturating_sub(5)..].join(" | "))
     }
 
+    /// Reaps it: callers stop its pager first, which reads its memory by pid.
     pub fn kill(&mut self) {
         if let Some(j) = self.joining.take() {
             let _ = j.join();

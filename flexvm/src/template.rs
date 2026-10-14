@@ -477,6 +477,7 @@ fn record_working_set(paths: &Paths, name: &str, tap: &str, sockets: &Arc<Socket
     fc.pause()?;
     let runs = pad_runs(pager.present_runs(), crate::uffd::FAULT_AROUND as u64);
     pager.stop();
+    pager.join();
     drop(fc);
     let _ = std::fs::remove_dir_all(&run);
     std::fs::write(tpl.dir.join("wset"), serde_json::to_vec(&runs)?)?;
