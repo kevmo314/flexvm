@@ -175,9 +175,11 @@ parsed is an error, never a free address.
 claim, arrival: what the VM brings or pages in, and a step), growth and
 incoming migrations are admitted under the host lock against MemAvailable
 minus the reserve and the grants of the last 10 s (`RUN/grants`); an
-arrival's grant is held past that until all its memory is here, or it ends
-(`RUN/grants.held`, with its owner: dropped once the owner is proven gone),
-as it comes in only as the pull goes. A start refused fails before it loads
+arrival's grant is held past that until all its memory is here, or it ends,
+as it comes in only as the pull goes: made with the grant in one critical
+section, it is a file (`RUN/holds/ID-MIB`) its process keeps flocked, so it
+goes with the process whatever becomes of the file (admission removes one
+whose lock is free). A start refused fails before it loads
 anything. Standby refills stop under it.
 
 **Memory marks** (`limit.rs`): each VM's Firecracker cgroup has a
@@ -322,7 +324,8 @@ sends the first candidate `migrate` with each peer in turn until one accepts
 (`migrate` with `evict`: the target admits such an arrival only if it
 leaves the target's own eviction mark available, read with the reserve
 under the host lock, and refuses it while an eviction runs there (its
-thread holds `STATE/evict.worker.lock`), so a VM is not moved straight back), then waits
+thread holds `STATE/evict.worker.lock`, taken under the host lock that
+admission probes it under), so a VM is not moved straight back), then waits
 for that VM's copy here to exit (its target has all its memory), so the next
 decision sees the memory freed; all within 60 s, past which it lets go (an
 unanswered migration is not a refusal: the VM, still migrating, is busy to

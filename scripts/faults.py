@@ -2708,6 +2708,8 @@ def mem_high_evict():
     check("mem high evict: moved to B", wait_for(lambda: where(n) == {B: "running"}, 60), (where(n), log(A, n)[-2000:]))
     st = wait_released(B, n, timeout=60)
     check("mem high evict: pulled and released", st["released"] is True and st["failed"] is None, st)
+    holds = lambda: [f for f in os.listdir(os.path.join(B.run, "holds")) if not f.startswith(".")] if os.path.isdir(os.path.join(B.run, "holds")) else []
+    check("mem high evict: the arrival's held grant goes once its memory is in", wait_for(lambda: not holds(), 10), holds())
     check("mem high evict: the fill finishes there", wait_for(lambda: hog_done(B, n), 240), cgroup(B, n))
     check("mem high evict: md5 intact", md5(B, n) == m)
     cleanup(n)
@@ -2853,10 +2855,11 @@ def evict_no_pingpong():
     m = setup(n, mib=600)
     time.sleep(11)  # the start's grants age out
     base, rss = mem_available(), cgroup(A, n)[0]
-    # B at its own mark (just under it, so this host's MemAvailable moving
-    # meanwhile, as other work does, cannot give it room): taking the VM
-    # would leave it under, and it would only move it back.
-    with marks(512, base + 1000, A), marks(512, base + 300, B) as b:
+    # B under its own mark (by a margin: this host's MemAvailable moves by a
+    # GiB or more as other work comes and goes, and must not give it room):
+    # taking the VM would leave it under, and it would only move it back. A's
+    # mark is further up, so A keeps trying.
+    with marks(512, base + 4000, A), marks(512, base + 3000, B) as b:
         seen = hosts_over(n, 25)
         check("no ping-pong: a peer it would put under its mark refuses it", seen == [A.addr] and where(n) == {A: "running"},
               (seen, where(n), log(A, n)[-1200:]))
