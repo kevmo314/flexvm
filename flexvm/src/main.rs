@@ -198,14 +198,18 @@ fn configure_listener(host: &mut Host, args: &Args, addr: Option<&str>, activate
     host.configure(|c| {
         configure(c, args, addr)?;
         let bound = match activated {
-            Some(l) => l,
+            // Without ADDR, an activated socket says where this host listens.
+            Some(l) => {
+                if addr.is_none() {
+                    c.listen = Some(l.local_addr()?.to_string());
+                }
+                l
+            }
             None => {
                 let addr = c.listen.as_deref().ok_or("listen needs an address (flexvm listen ADDR)")?;
                 std::net::TcpListener::bind(addr).map_err(|e| format!("listen on {addr}: {e}"))?
             }
         };
-        // getsockname is authoritative, including with socket activation.
-        c.listen = Some(bound.local_addr()?.to_string());
         listen::validate(&bound, c)?;
         listener = Some(bound);
         Ok(())
@@ -530,6 +534,9 @@ mod exec_tests {
         let before = std::fs::read(host.state.join("host.json")).unwrap();
         let wildcard = TcpListener::bind("0.0.0.0:0").unwrap();
         assert!(configure_listener(&mut host, &args, None, Some(wildcard)).is_err());
+        assert_eq!(std::fs::read(host.state.join("host.json")).unwrap(), before);
+        // Port 0 binds, but peers could not be told the port.
+        assert!(configure_listener(&mut host, &args, Some("127.0.0.1:0"), None).is_err());
         assert_eq!(std::fs::read(host.state.join("host.json")).unwrap(), before);
         std::fs::remove_dir_all(root).unwrap();
     }
