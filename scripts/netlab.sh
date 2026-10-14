@@ -52,13 +52,15 @@ listeners() {
 stop() {
   # The lab's listeners and VM processes, by their state directories (each
   # VM's Firecracker dies with its process).
-  local p pids=
+  local p pids= ids=
   for p in /proc/[0-9]*; do
     { tr '\0' ' ' < "$p/cmdline"; } 2>/dev/null | grep -q -- "--state /run/flexvm-lab-" && pids+=" ${p#/proc/}"
   done
+  # PID-START, read before the kill: the cgroups are named after the instance (`idle-PID-START-N`).
+  for p in $pids; do ids+=" $p-$(sed 's/.*) //' "/proc/$p/stat" 2>/dev/null | cut -d' ' -f20)"; done
   for p in $pids; do kill -9 "$p" 2>/dev/null || true; done
   sleep 1
-  for p in $pids; do
+  for p in $ids; do
     for cg in /sys/fs/cgroup/flexvm/idle-"$p"-*; do
       [[ -d $cg ]] && rmdir "$cg" 2>/dev/null || true
     done

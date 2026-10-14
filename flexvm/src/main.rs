@@ -309,9 +309,9 @@ fn configure(c: &mut host::Config, args: &Args, addr: Option<&str>) -> Result<()
         c.evict_mib = Some(args.num("evict-at", 0)?);
     }
     if let Some(p) = args.get("prefix") {
-        // Tap names are 15 bytes at most: PREFIX, a pid in hex (up to 6) and a suffix.
-        if p.is_empty() || p.len() > 8 || !p.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)) {
-            bail!("bad --prefix {p:?}: 1 to 8 letters, digits, '-', '_' or '.'");
+        // Tap names are 15 bytes at most: PREFIX, a pid in hex (up to 6), `t` and a counter.
+        if p.is_empty() || p.len() > 6 || !p.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)) {
+            bail!("bad --prefix {p:?}: 1 to 6 letters, digits, '-', '_' or '.'");
         }
         c.prefix = p.into();
     }
@@ -474,7 +474,9 @@ fn build_template(args: &Args, name: &str) -> Result<()> {
     let host = open_host(args)?;
     let tap = {
         let _l = host.lock()?;
-        let tap = template::tap(&host.tap_prefix()?);
+        let prefix = host.tap_prefix()?;
+        host::clear_taps(&prefix, std::process::id());
+        let tap = template::tap(&prefix);
         net::create_tap(&tap)?;
         tap
     };

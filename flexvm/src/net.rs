@@ -35,7 +35,7 @@ fn send_to<A>(fd: &OwnedFd, buf: &[u8], addr: &A) -> isize {
 /// Down, a tap takes no packets, so Firecracker writes none into guest memory.
 pub fn set_link_up(name: &str, up: bool) -> Result<()> {
     let fd = socket(libc::AF_INET, libc::SOCK_DGRAM, 0, "socket")?;
-    let mut req = ifreq(name);
+    let mut req = ifreq(name)?;
     let done = unsafe {
         libc::ioctl(fd.as_raw_fd(), libc::SIOCGIFFLAGS, &mut req) >= 0 && {
             let flags = &mut req.ifr_ifru.ifru_flags;
@@ -58,13 +58,14 @@ pub const TAP_QUEUE: u32 = 4096;
 
 /// Ioctls and rtnetlink, as spawning `ip` costs tens of milliseconds.
 pub fn create_tap(name: &str) -> Result<()> {
+    let mut req = ifreq(name)?;
     let fd = unsafe { libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
     if fd < 0 {
         bail!("/dev/net/tun: {}", std::io::Error::last_os_error());
     }
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    let mut req = ifreq(name);
-    req.ifr_ifru.ifru_flags = (libc::IFF_TAP | libc::IFF_NO_PI) as libc::c_short;
+    // Never a leaked tap of a dead process with this name, nor its routes.
+    req.ifr_ifru.ifru_flags = (libc::IFF_TAP | libc::IFF_NO_PI | libc::IFF_TUN_EXCL) as libc::c_short;
     if unsafe { libc::ioctl(fd.as_raw_fd(), libc::TUNSETIFF, &req) } < 0 || unsafe { libc::ioctl(fd.as_raw_fd(), libc::TUNSETPERSIST, 1) } < 0 {
         bail!("create tap {name}: {}", std::io::Error::last_os_error());
     }
@@ -77,7 +78,7 @@ pub fn create_tap(name: &str) -> Result<()> {
         attr(&mut addr, IFA_ADDRESS, &local.octets());
         netlink(RTM_NEWADDR, NLM_F_CREATE | NLM_F_REPLACE, &addr)?;
         set_mac(index, &parse_mac(GATEWAY_MAC)?)?;
-        let mut q = ifreq(name);
+        let mut q = ifreq(name)?;
         q.ifr_ifru.ifru_metric = TAP_QUEUE as i32;
         let sock = socket(libc::AF_INET, libc::SOCK_DGRAM, 0, "socket")?;
         if unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCSIFTXQLEN as _, &q) } < 0 {
@@ -93,16 +94,32 @@ pub fn create_tap(name: &str) -> Result<()> {
 }
 
 pub fn delete_tap(name: &str) {
-    let Ok(index) = ifindex(name) else { return };
-    let _ = netlink(RTM_DELLINK, 0, &ifinfomsg(index));
+    if let Ok(index) = ifindex(name) {
+        delete_link(index, name);
+    }
 }
 
-fn ifreq(name: &str) -> libc::ifreq {
+/// By index, while it still has `name`: a tap made since under the name has another
+/// index, and one renamed or moved away (its index reused) another name. A rename in
+/// between the check and the delete is not caught.
+pub fn delete_link(ifindex: u32, name: &str) {
+    let mut now = [0 as libc::c_char; libc::IFNAMSIZ];
+    let named = unsafe { libc::if_indextoname(ifindex, now.as_mut_ptr()) };
+    if !named.is_null() && unsafe { std::ffi::CStr::from_ptr(named) }.to_bytes() == name.as_bytes() {
+        let _ = netlink(RTM_DELLINK, 0, &ifinfomsg(ifindex));
+    }
+}
+
+/// A longer name is refused: the kernel would take it truncated.
+pub fn ifreq(name: &str) -> Result<libc::ifreq> {
+    if name.len() >= libc::IFNAMSIZ {
+        bail!("interface name {name:?} is over {} bytes", libc::IFNAMSIZ - 1);
+    }
     let mut req: libc::ifreq = unsafe { std::mem::zeroed() };
-    for (d, s) in req.ifr_name.iter_mut().zip(name.bytes().take(libc::IFNAMSIZ - 1)) {
+    for (d, s) in req.ifr_name.iter_mut().zip(name.bytes()) {
         *d = s as libc::c_char;
     }
-    req
+    Ok(req)
 }
 
 /// Puts the gateway MAC back first: udev (`MACAddressPolicy=persistent`) may have replaced
@@ -206,12 +223,12 @@ fn attr(buf: &mut Vec<u8>, kind: u16, data: &[u8]) {
     buf.resize(buf.len().next_multiple_of(4), 0);
 }
 
-/// One socket per process, its requests serialized, so each recv is the ACK of the request
-/// just sent; any failure drops it, so no stale ACK is left for the next.
+/// One socket per thread, so each recv is the ACK of the request just sent and a slow one
+/// (a tap's teardown) holds up no other thread; any failure drops it, so no stale ACK is
+/// left for the next.
 fn netlink(kind: u16, flags: c_int, body: &[u8]) -> Result<()> {
-    static FD: std::sync::Mutex<Option<OwnedFd>> = std::sync::Mutex::new(None);
-    let mut fd = FD.lock().unwrap();
-    let sock = fd.take().map_or_else(|| socket(libc::AF_NETLINK, libc::SOCK_RAW, libc::NETLINK_ROUTE, "netlink socket"), Ok)?;
+    thread_local!(static FD: std::cell::Cell<Option<OwnedFd>> = const { std::cell::Cell::new(None) });
+    let sock = FD.take().map_or_else(|| socket(libc::AF_NETLINK, libc::SOCK_RAW, libc::NETLINK_ROUTE, "netlink socket"), Ok)?;
     let flags = ((flags | NLM_F_REQUEST | NLM_F_ACK) as u16).to_ne_bytes();
     // struct nlmsghdr: length, type, flags, seq, pid.
     let msg = [&((16 + body.len()) as u32).to_ne_bytes()[..], &kind.to_ne_bytes(), &flags, &[1, 0, 0, 0, 0, 0, 0, 0], body].concat();
@@ -225,7 +242,7 @@ fn netlink(kind: u16, flags: c_int, body: &[u8]) -> Result<()> {
     if res < 20 {
         bail!("netlink: {}", std::io::Error::last_os_error());
     }
-    *fd = Some(sock);
+    FD.set(Some(sock));
     let kind = u16::from_ne_bytes([ack[4], ack[5]]);
     let code = i32::from_ne_bytes(ack[16..20].try_into().unwrap());
     if kind == NLMSG_ERROR as u16 && code != 0 {
@@ -352,6 +369,14 @@ mod tests {
         assert_eq!(probe(Some(2), &[1, 2, 3, 4]), (None, vec![2, 3, 4, 1]), "each address once");
         assert_eq!(probe(Some(9), &[]), (Some(1), vec![1]), "a hint out of range starts at the start");
         assert_eq!((r.after(ip(2)), r.after(ip(4)), r.after(ip(9))), (ip(3), ip(1), ip(1)));
+    }
+
+    #[test]
+    fn long_interface_names_are_refused() {
+        assert!(ifreq("fvci0A3fffffhff").is_ok(), "15 bytes");
+        // Refused before /dev/net/tun is opened (no CAP_NET_ADMIN needed).
+        let e = create_tap("fvci0A3fffffta00").unwrap_err().to_string();
+        assert!(e.contains("over 15 bytes"), "{e}");
     }
 
     #[test]

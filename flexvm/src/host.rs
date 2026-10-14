@@ -1256,9 +1256,11 @@ fn tap_owner(name: &str, prefix: &str) -> Option<u32> {
     rest.split_once('t').and_then(|(p, _)| u32::from_str_radix(p, 16).ok())
 }
 
-/// The VM process a Firecracker's cgroup (`idle-PID-N`) was made by.
-fn cgroup_owner(name: &str) -> Option<u32> {
-    name.strip_prefix("idle-")?.split('-').next()?.parse().ok()
+/// The VM process a Firecracker's cgroup (`idle-PID-START-N`) was made by.
+fn cgroup_owner(name: &str) -> Option<Ident> {
+    let parts: Vec<&str> = name.strip_prefix("idle-")?.split('-').collect();
+    let [pid, start, _] = parts[..] else { return None };
+    Some(Ident { pid: pid.parse().ok()?, start: start.parse().ok()?, boot: boot_id().into() })
 }
 
 /// A detached VM process's own cgroup (`vm-PID-START`, `util::spawn_self`)
@@ -1277,31 +1279,53 @@ impl Host {
     /// Taps are read under the prefix host.json has now, under the host lock,
     /// so a prefix change cannot come in between.
     pub fn collect_garbage(&self) -> Result<()> {
-        {
+        let dead = {
             let _l = self.lock()?;
             let prefix = self.tap_prefix()?;
+            let mut gone = HashMap::new();
+            let mut dead = Vec::new();
             for e in std::fs::read_dir("/sys/class/net").into_iter().flatten().flatten() {
                 let n = e.file_name().to_string_lossy().into_owned();
-                if tap_owner(&n, &prefix).is_some_and(pid_gone) {
-                    crate::net::delete_tap(&n);
+                if tap_owner(&n, &prefix).is_some_and(|pid| *gone.entry(pid).or_insert_with(|| pid_gone(pid))) {
+                    if let Ok(index) = crate::net::ifindex(&n) {
+                        dead.push((n, index));
+                    }
                 }
             }
+            dead
+        };
+        // Deleted unlocked, by index and name: a tap made since under a dead one's name is another.
+        for (name, index) in dead {
+            crate::net::delete_link(index, &name);
         }
         collect_owned(&self.run);
         Ok(())
     }
 }
 
+/// Taps dead processes with `pid` left (a template build's too), which
+/// would pass for its own: their names cannot hold a start time. Only for
+/// the process that has `pid` now, before it makes any; no sweep frees them
+/// while it lives.
+pub fn clear_taps(prefix: &str, pid: u32) {
+    for e in std::fs::read_dir("/sys/class/net").into_iter().flatten().flatten() {
+        let n = e.file_name().to_string_lossy().into_owned();
+        if tap_owner(&n, prefix) == Some(pid) {
+            eprintln!("removing tap {n}, a dead process's with this pid");
+            crate::net::delete_tap(&n);
+        }
+    }
+}
+
 /// Cgroups, work directories and names of dead processes.
 fn collect_owned(run: &Path) {
-    let gone = |pid: Option<u32>| pid.is_some_and(pid_gone);
+    // Firecrackers' by identity: once their process is gone no other makes one under their name.
     for e in std::fs::read_dir("/sys/fs/cgroup/flexvm").into_iter().flatten().flatten() {
         let n = e.file_name().to_string_lossy().into_owned();
         if n.starts_with("vm-") {
             sweep_scope(&e.path());
-        } else if gone(cgroup_owner(&n)) {
-            let _ = std::fs::write(e.path().join("cgroup.kill"), "1");
-            let _ = std::fs::remove_dir(e.path());
+        } else if cgroup_owner(&n).is_some_and(|o| o.liveness() == Liveness::Gone) {
+            let _ = crate::fc::remove_cgroup(&e.path());
         }
     }
     for e in std::fs::read_dir(run.join("w")).into_iter().flatten().flatten() {
@@ -1745,8 +1769,8 @@ mod tests {
         for (tap, prefix) in [("fvtpl61612", "fc"), ("fvtpl", "fv"), ("fvtpl12x", "fv"), ("fvtpl+1", "fv"), ("fvx", "fv"), ("fvx+1", "fv"), ("fvxg", "fv"), ("eth0", "fv"), ("fvxyz", "fv")] {
             assert_eq!(tap_owner(tap, prefix), None, "{tap} under {prefix}");
         }
-        assert_eq!(cgroup_owner("idle-4242-3"), Some(4242));
-        for cg in ["vm-4242", "vm-4242-77", "other-42", "idle-", "cgroup.procs", "memory.max"] {
+        assert_eq!(cgroup_owner("idle-4242-77-3"), Some(Ident { pid: 4242, start: 77, boot: boot_id().into() }));
+        for cg in ["vm-4242", "vm-4242-77", "other-42", "idle-", "idle-4242-3", "idle-4242-x-3", "idle-1-2-3-4", "cgroup.procs", "memory.max"] {
             assert_eq!(cgroup_owner(cg), None, "{cg}");
         }
     }

@@ -3320,11 +3320,16 @@ def refused_admission():
     n, path = "ft-refused-adm", ckpt_path("ft-refused-adm")
     m = setup(n, mib=1)
     migs = lambda: sorted(os.listdir(os.path.join(B.state, "migs"))) if os.path.isdir(os.path.join(B.state, "migs")) else []
+    # The start announces its generation to B in the background: in before the snapshot.
+    v = vms(A)[n]
+    check("refused admission: b saw the start", wait_for(lambda: addr(B, v["ip"]).get("seen", 0) >= v["gen"], 10), addr(B, v["ip"]))
     before, recorded = addr_records(), migs()
     fault(B, "no_admit", 600000)
     r = migrate(A, n, B)
     check("refused admission: a migration is refused", not r["ok"] and "not enough memory" in r["error"], r)
-    check("refused admission: and records nothing", migs() == recorded and addr_records() == before, (recorded, migs()))
+    after, now = addr_records(), migs()
+    changed = {k: (before.get(k), after.get(k)) for k in before.keys() | after.keys() if before.get(k) != after.get(k)}
+    check("refused admission: and records nothing", now == recorded and not changed, (recorded, now, changed))
     check("refused admission: the vm runs on at A", where(n) == {A: "running"} and md5(A, n) == m, where(n))
     ok(checkpoint(A, n, path, stop=True))
     before = addr_records()
@@ -4572,7 +4577,7 @@ def prefix_change():
         prefix = json.load(open(os.path.join(A.state, "host.json")))["prefix"]
     except (OSError, ValueError, KeyError):
         prefix = "fv"
-    other = (prefix + "z")[:8] if not prefix.endswith("z") else prefix[:-1] + "y"
+    other = prefix[:-1] + ("y" if prefix.endswith("z") else "z")
     ok(run(A, n))
     r = cli_json(A, "config", "--prefix", other)
     check("prefix change: refused while a vm runs", not r["ok"] and "cannot change the tap prefix" in r["error"], r)
@@ -4622,9 +4627,10 @@ def arrival_log():
 
 
 def template_tap():
-    """A template build SIGKILLed after making its tap (PREFIX x PID): the
-    tap outlives it until a sweep finds the pid gone. A build tap whose pid
-    lives is kept."""
+    """A template build SIGKILLed after making its tap (PREFIX x PID): a sweep
+    removes the tap once the pid is gone (any process's periodic sweep may be
+    first, so it is not looked for in between). A build tap whose pid lives
+    is kept."""
     name = f"ft-tpltap-{os.getpid()}"
     tdir = os.environ.get("FLEXVM_TEMPLATES") or os.path.join(os.path.abspath(args.artifacts), "templates")
     try:
@@ -4638,7 +4644,6 @@ def template_tap():
     p.kill()
     p.wait()
     check("template tap: made by the build", up, tap)
-    check("template tap: left by the killed build", os.path.exists(f"/sys/class/net/{tap}"))
     live = f"{prefix}x{os.getpid():x}"
     subprocess.run(["ip", "tuntap", "add", "dev", live, "mode", "tap"], check=True)
     try:
