@@ -287,7 +287,9 @@ impl Proc {
         if let Some(h) = self.holder() {
             h.forget(vm.ip, mig);
         }
+        // Under the host lock: a route retry still running sees it is no longer this migration's source.
         *vm.state.lock().unwrap() = s;
+        self.pending_route.lock().unwrap().take();
         // Running here again, so do the collapse pass and prefetch the save cut short.
         vm.back_here();
         self.release_app_log();
@@ -345,7 +347,7 @@ impl Proc {
                 delay = (delay * 2).min(Duration::from_secs(5));
             }
             if let Some(via) = p.pending_route.lock().unwrap().take() {
-                if let Err(e) = p.switch_route(via) {
+                if let Err(e) = p.switch_route(mig, via) {
                     eprintln!("route {} via {via}: {e}; giving up", p.vm().ip);
                 }
             }
@@ -370,7 +372,7 @@ impl Proc {
                 Some((c, Ok(seq))) => {
                     // Sharing our routes, the target takes the address over itself, after the held packets.
                     let handoff = switch && crate::net::is_local_addr(via).unwrap_or(false);
-                    (held, res) = hold::send(h, ip, mig, c, seq, handoff, || self.switch_route(via)).map(|(s, r)| (Some(s), Some(r))).unwrap_or_default()
+                    (held, res) = hold::send(h, ip, mig, c, seq, handoff, || self.switch_route(mig, via)).map(|(s, r)| (Some(s), Some(r))).unwrap_or_default()
                 }
                 started => {
                     if let Some((_, Err(e))) = started {
@@ -380,14 +382,20 @@ impl Proc {
                 }
             }
         }
-        let res = res.unwrap_or_else(|| self.switch_route(via));
+        let res = res.unwrap_or_else(|| self.switch_route(mig, via));
         if let (Err(e), Some(p)) = (&res, self.arc()) {
             eprintln!("route {ip} via {via}: {e}; retrying");
             *self.pending_route.lock().unwrap() = Some(via);
             thread::spawn(move || {
-                if retry(&format!("route {ip} via {via}"), || p.switch_route(via)) {
+                if !retry(&format!("route {ip} via {via}"), || p.switch_route(mig, via)) {
+                    return;
+                }
+                // Once this migration is over, `pending_route` is an abort's or a later migration's.
+                if *p.vm().state.lock().unwrap() == State::Source(mig) {
                     p.pending_route.lock().unwrap().take();
                     eprintln!("route {ip} via {via}: done");
+                } else {
+                    eprintln!("route {ip} via {via}: dropped, migration {mig} was aborted");
                 }
             });
         }
@@ -406,10 +414,14 @@ impl Proc {
         Ok(Some(out))
     }
 
-    /// Under the host lock, so a later claim of the address routes after.
-    fn switch_route(&self, via: Ipv4Addr) -> Result<()> {
+    /// Under the host lock, so a later claim of the address routes after; only while this VM is
+    /// still the source of migration `mig`, since an abort resumes it here and keeps its route.
+    fn switch_route(&self, mig: u64, via: Ipv4Addr) -> Result<()> {
         let (ip, gen, l) = (self.vm().ip, self.gen(), self.host.lock()?);
-        if self.host.holder(&l, ip)?.is_some_and(|h| h != self.name()) || !self.host.current(&l, ip, gen)? {
+        if *self.vm().state.lock().unwrap() != State::Source(mig)
+            || self.host.holder(&l, ip)?.is_some_and(|h| h != self.name())
+            || !self.host.current(&l, ip, gen)?
+        {
             return Ok(());
         }
         if fault("route") {
