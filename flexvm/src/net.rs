@@ -64,7 +64,7 @@ pub fn tap_queued(fd: &OwnedFd) -> Result<bool> {
 }
 
 /// Reads off and counts the frames queued on a tap (`tap_fd_of`, non-blocking as Firecracker
-/// opened it): for a VM paused with frames its guest would not take, so their loss is counted.
+/// opened it): for a VM leaving with frames its guest would not take, so their loss is counted.
 pub fn discard_tap_queue(fd: &OwnedFd) -> u64 {
     // A frame with its virtio-net header, up to the 64 KiB a GSO frame can be.
     let mut buf = vec![0u8; 65562 + 64];

@@ -463,7 +463,10 @@ through, so the checkpoint is exactly the memory at the pause.
   It watches the ring through a copy of Firecracker's tap descriptor
   (`pidfd_getfd`, polled), found once per Firecracker and before the hold,
   as reading a tun fdinfo takes RTNL. What the guest has not taken by then
-  is read off after the pause and logged as dropped, so it is counted.
+  stays queued: a VM that resumes (a keep-running checkpoint, an aborted
+  migration) gets it from its Firecracker, and one that leaves has it read
+  off before its tap is deleted and logged as dropped, so it is counted
+  (`ckpt_backlog` checks that a checkpoint loses none).
   `scripts/faults.py same_host_backlog` stops Firecracker for 200 ms at 10k
   datagrams/s and holds the address before it goes on, so every migration
   starts its pause with a queue: about 1,500 datagrams were lost per
