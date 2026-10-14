@@ -3106,7 +3106,8 @@ def sigkill_restart():
     address is the new instance's to take (`--ip` the same one), and
     automatic allocations after more crashes leave nothing reserved."""
     n = "ft-sigkill-restart"
-    ip = A.ips.split("-")[1].rsplit(".", 1)[0] + ".248"
+    net, last = A.ips.split("-")[1].rsplit(".", 1)
+    ip = f"{net}.{int(last) - 1}"  # next to start_killed's, the last of the range
     used = {ip}
 
     def crash():
