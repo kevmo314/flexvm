@@ -241,6 +241,7 @@ fn resolve_index(mut v: Value, mut digest: String, mut get: impl FnMut(&str) -> 
             bail!("no linux/amd64 image in the index (has {})", have.join(", "))
         };
         digest = m["digest"].as_str().ok_or("index entry without digest")?.to_string();
+        blob_path(Path::new(""), &digest)?;
         v = get(&digest)?;
     }
     Ok((v, digest))
@@ -395,6 +396,24 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Barrier, Mutex};
+
+    #[test]
+    fn index_children_must_be_sha256_digests() {
+        for digest in ["latest", "sha512:abcd", "sha256:abcd", "sha256:../../manifest"] {
+            let index = serde_json::json!({"manifests": [{"digest": digest, "platform": {"os": "linux", "architecture": "amd64"}}]});
+            assert!(resolve_index(index, String::new(), |_| panic!("invalid digest must not be fetched")).is_err());
+        }
+        let digest = sha256_hex(b"manifest");
+        let index = serde_json::json!({"manifests": [{"digest": digest}]});
+        let (_, resolved) = resolve_index(index, String::new(), |d| {
+            assert_eq!(d, digest);
+            Ok(serde_json::json!({"layers": []}))
+        })
+        .unwrap();
+        assert_eq!(resolved, digest);
+        let nested = serde_json::json!({"manifests": [{"digest": digest}]});
+        assert!(resolve_index(nested, String::new(), |_| Ok(serde_json::json!({"manifests": [{"digest": "latest"}]}))).is_err());
+    }
 
     #[test]
     fn cached_layers_are_read_once_and_evicted_if_corrupt() {

@@ -343,7 +343,7 @@ mod tests {
             drop(held);
             assert!(grower.join().unwrap());
             assert_eq!(l.admitted(), 512);
-            let grants: Vec<(u64, u64, u64)> = crate::host::load(&host.run.join("grants")).unwrap().unwrap_or_default();
+            let grants: Vec<(u64, u64, u64)> = crate::host::load(&host.grants()).unwrap().unwrap_or_default();
             assert!(grants.is_empty(), "{grants:?}");
             drop(lifted);
         });
