@@ -477,6 +477,13 @@ impl Proc {
             prepared.kill_firecracker();
             prepared.pager.firecracker_gone();
         }
+        if fault("fetch_tail_enomem") {
+            prepared.pager.tail_fail.store(1, Ordering::SeqCst);
+        }
+        if fault("fetch_enomem_stuck") {
+            // Late enough for the load (and the resume) to get their pages.
+            *prepared.pager.stuck_from.lock().unwrap() = Some(Instant::now() + Duration::from_millis(500));
+        }
         // A retry first drains the preload off the connection (the source still serves those pages).
         let seed = Some((runs, Origin::Peer(source.clone())));
         let retry = || before_commit.take().unwrap()().map(drop);

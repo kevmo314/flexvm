@@ -165,9 +165,21 @@ fn iteration(h: &Hosts, name: &str, template: &str, dirty_mib: u64, ready: Optio
                 bail!("dirtying guest memory failed");
             }
         }
+        // The guest reads what it wrote, here and right after the migration
+        // (pages still being pulled): the difference is the post-copy stall.
+        let read = |host: &Host| -> Result<Option<f64>> {
+            let t = Instant::now();
+            if dirty_mib > 0 && crate::exec(host, name, "cat /tmp/dirty > /dev/null")? != 0 {
+                bail!("reading guest memory back failed");
+            }
+            Ok((dirty_mib > 0).then(|| ms(t.elapsed())))
+        };
+        let read_local = read(&h.a)?;
         let migrated = crate::vmproc::call(&h.a, name, json!({"op": "migrate", "to": to}))?;
+        let read_after = read(&h.b)?;
         h.wait("the source to let go", || !h.a.alive(name))?;
         let pull = h.pulled(&h.b, name)?;
+        let status = crate::vmproc::call(&h.b, name, json!({"op": "debug", "what": "status"}))?;
         sample["migrate"] = migrated["timings_ms"].clone();
         sample["migrate"]["downtime"] = migrated["downtime_ms"].clone();
         sample["migrate"]["background_pull"] = pull;

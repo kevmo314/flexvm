@@ -205,7 +205,8 @@ def fault(host, f, ms):
 FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_before_run", "restore_after_run",
           "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "resume_kill",
           "prepare_fail", "short_incoming", "slow_preload", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
-          "started_fsync", "started_unmark", "start_stall", "incoming_stall", "claim_stall")
+          "started_fsync", "started_unmark", "start_stall", "incoming_stall", "claim_stall", "ckpt_wp_race",
+          "fetch_tail_enomem", "fetch_enomem_stuck")
 
 
 def disarm():
@@ -239,6 +240,7 @@ def check(label, cond, detail=""):
     global failures
     print(("PASS " if cond else "FAIL ") + label + (f"  [{detail}]" if detail else ""), flush=True)
     failures += not cond
+    return cond
     return cond
 
 
@@ -1923,12 +1925,12 @@ def cow_wp_race():
     (ckpt_wp_race), keep-running checkpoints of a guest rewriting its memory
     must leave every writer thread making progress."""
     n = "ft-wprace"
-    ok(A, {"op": "run", "name": n, "template": args.template})
+    ok(run(A, n))
     start_writer(A, n, mib=64, threads=2)
     fault(A, "ckpt_wp_race", 600000)
     for i in range(8):
         path = ckpt_path(f"ft-wprace{i}")
-        r = rpc(A, {"op": "checkpoint", "name": n, "dir": path}, timeout=120)
+        r = checkpoint(A, n, path, timeout=120)
         rm_ckpt(path)
         check(f"wp race {i}: checkpoint written", r.get("ok"), r)
         if not r.get("ok"):
@@ -1951,9 +1953,9 @@ def fetch_tail_enomem():
     n = "ft-tail"
     m = setup(n, mib=200)
     fault(B, "fetch_tail_enomem", 60000)
-    ok(A, {"op": "migrate", "name": n, "to": B})
+    ok(migrate(A, n, B))
     check("tail: memory intact after the migration", md5(B, n) == m)
-    st = wait_released(B, n, 30)
+    st = wait_released(B, n, timeout=30)
     check("tail: every page arrives and the source lets go",
           st["released"] is True and st["background_pull_ms"] is not None and st["failed"] is None, st)
     fault(B, "fetch_tail_enomem", 0)
@@ -1965,27 +1967,29 @@ def fetch_enomem_stuck():
     copy, the pullers held off) make the target give up within the fault
     deadline and report the VM failed, however the pages get claimed again
     (by the waiting fault or by the requeue), instead of leaving the vCPU
-    blocked for good."""
+    blocked for good. The source, never released, runs its copy again."""
     n = "ft-stuck"
-    setup(n, mib=400)
+    m = setup(n, mib=400)
     fault(B, "fetch_enomem_stuck", 60000)
-    ok(A, {"op": "migrate", "name": n, "to": B})
+    ok(migrate(A, n, B))
     t0 = time.time()
     threading.Thread(target=lambda: sh(B, n, "md5sum /tmp/f"), daemon=True).start()
     st = {}
 
     def failed():
-        st.update(rpc(B, {"op": "migration_status", "name": n}).get("result") or {})
+        st.update(vms(B).get(n) or {})
         return st.get("state") == "failed"
 
     gave_up = wait_for(failed, 20)
     took = time.time() - t0
     fault(B, "fetch_enomem_stuck", 0)
-    check(f"stuck: target gave up ({took:.1f} s) and reports the vm failed", gave_up and "installing pages" in (st.get("failed") or ""),
-          {k: st.get(k) for k in ("state", "failed", "released")})
+    why = (st.get("failed") or st.get("error") or "")
+    check(f"stuck: target gave up ({took:.1f} s) and reports the vm failed", gave_up and "installing pages" in why, (st.get("state"), why[:300]))
     # Copies fail from 0.5 s after the target took the VM on, and the fault
     # deadline is 1 s: nothing (a stalled fetch, a requeue) may stretch it.
     check("stuck: within the fault deadline (< 3 s)", gave_up and took < 3, f"{took:.1f} s")
+    check("stuck: the source runs its copy again", wait_for(lambda: where(n) == {A: "running"}, 60), where(n))
+    check("stuck: md5 intact on A", md5(A, n) == m)
     cleanup(n)
 
 
@@ -2653,7 +2657,8 @@ SCENARIOS = dict(
     fc_prepare=fc_prepare, slow_preload=slow_preload, ckpt_packet_hold=ckpt_packet_hold, standby=standby,
     suspend_disk_freed=suspend_disk_freed, resume_mark_fails=resume_mark_fails, kill_source=kill_source,
     forged_peer=forged_peer, restore_ip_peer=restore_ip_peer, late_withdrawal=late_withdrawal,
-    incoming_killed=incoming_killed, start_killed=start_killed, claim_killed=claim_killed, fc_died=fc_died)
+    incoming_killed=incoming_killed, start_killed=start_killed, claim_killed=claim_killed, fc_died=fc_died,
+    cow_wp_race=cow_wp_race, fetch_tail_enomem=fetch_tail_enomem, fetch_enomem_stuck=fetch_enomem_stuck)
 names = [n for s in args.scenarios for n in (list(SCENARIOS) if s == "all" else [s])]
 if os.geteuid() != 0:
     sys.exit("run as root (sudo)")
