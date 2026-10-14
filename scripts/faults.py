@@ -10,7 +10,7 @@ usage: scripts/faults.py [--a ADDR] [--b ADDR] [--a-dir DIR] [--b-dir DIR]
 The script starts both listeners (FLEXVM_FAULTS=1, VMs log to DIR/run/vms)
 and stops them at the end. Checkpoint scenarios write to --ckpt-dir.
 """
-import argparse, base64, json, os, signal, socket, subprocess, sys, tempfile, threading, time, traceback
+import argparse, base64, json, os, re, signal, socket, subprocess, sys, tempfile, threading, time, traceback
 
 p = argparse.ArgumentParser(usage=__doc__)
 p.add_argument("--a", default="127.0.0.1:7130")
@@ -459,7 +459,8 @@ def pages_dead():
     fault(A, "pages", 30000)
     check("pages dead: the target's vm died", wait_for(lambda: vms(B).get(n, {}).get("state") == "failed" and not vms(B)[n].get("pid"), 60), vms(B).get(n))
     fault(A, "pages", 0)
-    check("pages dead: the target said why", "died: background pull" in log(B, n), log(B, n)[-300:])
+    said = log(B, n)
+    check("pages dead: the target said why", re.search(r"died: (background pull|fetching pages for a fault)", said), said[-300:])
     check("pages dead: the source runs its copy again", wait_for(lambda: where(n) == {A: "running"}, 60), where(n))
     check("pages dead: md5 intact on A", md5(A, n) == m)
     cleanup(n)
