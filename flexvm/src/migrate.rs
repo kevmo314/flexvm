@@ -179,12 +179,7 @@ impl Proc {
     }
 
     fn prepare_target(&self, vm: &Vm, to: &str, mig: u64, gen: u64, source: &str, evict: bool) -> Result<(TcpStream, BufReader<TcpStream>, Value)> {
-        let conn = crate::util::connect(to, Duration::from_secs(2))?;
-        conn.set_nodelay(true)?;
-        conn.set_read_timeout(Some(PREFLIGHT_TIMEOUT))?;
-        conn.set_write_timeout(Some(PREFLIGHT_TIMEOUT))?;
-        let mut reader = BufReader::new(conn.try_clone()?);
-        send_json(&mut &conn, &json!({
+        let (conn, prepared) = crate::util::rpc(to, Duration::from_secs(2), Instant::now() + PREFLIGHT_TIMEOUT, &json!({
             "op": "migrate_in",
             "name": vm.name,
             "mig": mig,
@@ -199,14 +194,12 @@ impl Proc {
             "plugged_mib": vm.hotplug_plugged(),
             "regions": vm.pager.regions(),
             "evict": evict,
-        }))?;
-        let reply = recv_json(&mut reader)?.ok_or_else(|| format!("{to} hung up"))?;
-        if reply["ok"] != json!(true) {
-            bail!("{to} cannot take vm {}: {}", vm.name, reply["error"].as_str().unwrap_or("no reason given"));
-        }
+        })).map_err(|e| format!("cannot move vm {} to {e}", vm.name))?;
+        // The target says nothing more until it has the state.
+        conn.set_nodelay(true)?;
         conn.set_read_timeout(Some(Duration::from_secs(30)))?;
         conn.set_write_timeout(Some(Duration::from_secs(30)))?;
-        Ok((conn, reader, reply["result"].clone()))
+        Ok((conn.try_clone()?, BufReader::new(conn), prepared))
     }
 
     /// Resumes this copy. Holds the host lock from the generation check to the

@@ -84,6 +84,25 @@ pub fn connect(addr: &str, timeout: Duration) -> io::Result<std::net::TcpStream>
     Err(last)
 }
 
+/// Connects within `wait`, sends `req` and reads its answer, all by `at`; any failure names `addr`.
+/// The stream stays open for whatever follows.
+pub fn rpc(addr: &str, wait: Duration, at: Instant, req: &serde_json::Value) -> Result<(std::net::TcpStream, serde_json::Value)> {
+    (|| -> Result<_> {
+        let s = connect(addr, wait)?;
+        send_json(&mut By { s: &s, at }, req)?;
+        let reply = recv_json(&mut io::BufReader::new(By { s: &s, at }))?;
+        Ok((s, answer(reply, "it")?))
+    })().map_err(|e| format!("{addr}: {e}").into())
+}
+
+pub fn answer(reply: Option<serde_json::Value>, who: &str) -> Result<serde_json::Value> {
+    let reply = reply.ok_or_else(|| format!("{who} hung up"))?;
+    if reply["ok"] != true {
+        bail!("{}", reply["error"].as_str().unwrap_or("refused"));
+    }
+    Ok(reply["result"].clone())
+}
+
 pub trait Timed: Read + Write {
     fn read_timeout(&self, t: Duration) -> io::Result<()>;
     fn write_timeout(&self, t: Duration) -> io::Result<()>;
@@ -525,6 +544,28 @@ fn scope(prefix: &[u8], pid: u32, start: u64) -> bool {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn rpc_names_the_peer_and_a_trickled_reply_cannot_outlast_its_deadline() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let server = std::thread::spawn(move || {
+            let (c, _) = l.accept().unwrap();
+            recv_json(&mut io::BufReader::new(&c)).unwrap();
+            send_json(&mut &c, &serde_json::json!({"ok": false, "error": "no room"})).unwrap();
+            let (c, _) = l.accept().unwrap();
+            while (&c).write_all(b" ").is_ok() {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let wait = Duration::from_secs(1);
+        let e = rpc(&addr, wait, Instant::now() + wait, &serde_json::json!({})).unwrap_err();
+        assert_eq!(e.to_string(), format!("{addr}: no room"));
+        let start = Instant::now();
+        let e = rpc(&addr, wait, start + Duration::from_millis(200), &serde_json::json!({})).unwrap_err();
+        assert!(start.elapsed() < Duration::from_millis(600) && e.to_string() == format!("{addr}: deadline passed"), "{e}");
+        server.join().unwrap();
+    }
 
     #[test]
     fn a_scope_is_named_and_joined_without_allocating() {
