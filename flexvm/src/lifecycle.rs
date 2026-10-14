@@ -728,9 +728,15 @@ struct PacketHold<'a> {
 }
 
 impl PacketHold<'_> {
-    fn hold(&self) {
-        if let Some(Err(e)) = self.d.holder().map(|h| h.hold(self.vm.ip, self.id)) {
-            eprintln!("vm {}: not holding packets during the checkpoint: {e}", self.vm.name);
+    /// Whether the address is held.
+    fn hold(&self) -> bool {
+        match self.d.holder().map(|h| h.hold(self.vm.ip, self.id)) {
+            Some(Ok(())) => true,
+            Some(Err(e)) => {
+                eprintln!("vm {}: not holding packets during the checkpoint: {e}", self.vm.name);
+                false
+            }
+            None => false,
         }
     }
 

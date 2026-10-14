@@ -453,6 +453,28 @@ through, so the checkpoint is exactly the memory at the pause.
   reports them as `held_packets`. A 1 kHz UDP stream through 6 checkpoints
   lost 59 datagrams (7–11 per pause) before, none now
   (`scripts/faults.py ckpt_packet_hold`).
+- **The tap's queue is taken before the pause.** Frames already routed to
+  the tap wait in tun's ring until the guest posts rx buffers, and paused
+  vCPUs post none, so whatever is queued there at the pause dies with the
+  tap when the VM leaves (a migration, `checkpoint --stop`, a suspend),
+  uncounted. A guest slow to refill under load leaves hundreds (#136). Once
+  the address is held nothing new reaches the tap, so the VM process waits,
+  up to 500 ms, for the running guest to empty the ring before pausing it.
+  It watches the ring through a copy of Firecracker's tap descriptor
+  (`pidfd_getfd`, polled), found once per Firecracker and before the hold,
+  as reading a tun fdinfo takes RTNL. What the guest has not taken by then
+  stays queued: a VM that resumes (a keep-running checkpoint, an aborted
+  migration) gets it from its Firecracker, and one that leaves has it read
+  off before its tap is deleted and logged as dropped, so it is counted
+  (`ckpt_backlog` keeps Firecracker stopped until the wait gives up and checks
+  that a checkpoint loses none). A tap whose queue is full drops frames
+  itself and counts them only in its `tx_dropped`, which goes with it: a VM
+  reports those beyond what was reported with injected held packets as
+  `tap_dropped` in its status and logs them when it leaves.
+  `scripts/faults.py same_host_backlog` stops Firecracker for 200 ms at 10k
+  datagrams/s and holds the address before it goes on, so every migration
+  starts its pause with a queue: about 1,500 datagrams were lost per
+  migration before, none now.
 - **No Firecracker change for write tracking.** The pager registers write-protect mode
   (`UFFDIO_REGISTER` with `MODE_MISSING|MODE_WP`) on Firecracker's existing
   userfaultfd and its ranges. Nothing has to be requested at `UFFDIO_API`

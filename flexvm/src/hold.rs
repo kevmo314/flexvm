@@ -422,9 +422,11 @@ impl Injector {
         }
     }
 
-    /// Includes the guest's own traffic.
-    pub fn dropped(&self) -> u64 {
-        tap_tx_dropped(&self.tap).saturating_sub(self.tx_dropped)
+    /// Dropped by the tap since this was made (with the guest's own traffic), and the tap's
+    /// count that says so: what it dropped up to then is reported with the injected packets.
+    pub fn dropped(&self) -> (u64, u64) {
+        let now = tap_tx_dropped(&self.tap);
+        (now.saturating_sub(self.tx_dropped), now)
     }
 }
 
@@ -458,17 +460,34 @@ pub fn wait_start(r: &mut BufReader<By<TcpStream>>, deadline: Instant) -> bool {
 
 /// Injects only while `revoked` is false; on `SWITCH`, `take_over` takes the address. Refused if
 /// too many streams are being received.
-pub fn receive(r: &mut BufReader<By<TcpStream>>, ip: Ipv4Addr, tap: &str, revoked: &Mutex<bool>, deadline: Instant, take_over: &mut dyn FnMut()) {
+/// Returns how many tap drops were reported with them (`Injector::dropped`), if they were.
+pub fn receive(
+    r: &mut BufReader<By<TcpStream>>,
+    ip: Ipv4Addr,
+    tap: &str,
+    revoked: &Mutex<bool>,
+    deadline: Instant,
+    take_over: &mut dyn FnMut(),
+) -> Option<u64> {
     if RECEIVERS.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n < MAX_RECEIVERS).then_some(n + 1)).is_ok() {
-        receive_counted(r, ip, tap, revoked, deadline, take_over);
+        let reported = receive_counted(r, ip, tap, revoked, deadline, take_over);
         RECEIVERS.fetch_sub(1, Ordering::SeqCst);
+        return reported;
     }
+    None
 }
 
-fn receive_counted(r: &mut BufReader<By<TcpStream>>, ip: Ipv4Addr, tap: &str, revoked: &Mutex<bool>, deadline: Instant, take_over: &mut dyn FnMut()) {
-    let (Ok(conn), Ok(inj)) = (r.get_ref().s.try_clone(), Injector::new(tap)) else { return };
+fn receive_counted(
+    r: &mut BufReader<By<TcpStream>>,
+    ip: Ipv4Addr,
+    tap: &str,
+    revoked: &Mutex<bool>,
+    deadline: Instant,
+    take_over: &mut dyn FnMut(),
+) -> Option<u64> {
+    let (Ok(conn), Ok(inj)) = (r.get_ref().s.try_clone(), Injector::new(tap)) else { return None };
     if write_by(&conn, &[&b"a"[..], &0u64.to_be_bytes()].concat(), deadline).is_err() {
-        return;
+        return None;
     }
     let (mut buf, mut next, mut injected, mut dropped) = (vec![0u8; MAX_FRAME], 0, 0, 0);
     let ended = loop {
@@ -506,10 +525,12 @@ fn receive_counted(r: &mut BufReader<By<TcpStream>>, ip: Ipv4Addr, tap: &str, re
             false => dropped += 1,
         }
     };
-    if ended {
-        let reply = json!({"injected": injected, "dropped": dropped + inj.dropped()});
-        let _ = write_by(&conn, format!("{reply}\n").as_bytes(), deadline);
+    if !ended {
+        return None;
     }
+    let (tap_dropped, _) = inj.dropped();
+    let reply = json!({"injected": injected, "dropped": dropped + tap_dropped});
+    write_by(&conn, format!("{reply}\n").as_bytes(), deadline).ok().map(|()| tap_dropped)
 }
 
 /// A whole IPv4 packet for `ip`: all a guest is ever handed.

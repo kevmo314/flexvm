@@ -150,7 +150,7 @@ def vms(host):
                 v.update(tap=d["describe"]["tap"], pages_mib=d["describe"]["pages_mib"], regions=d["describe"]["regions"],
                          plugged_mib=d["describe"]["plugged_mib"], requested_mib=d["describe"]["requested_mib"],
                          guest_mib=d["describe"]["guest_mib"], admitted_mib=d["describe"]["admitted_mib"],
-                         throttled=d["describe"]["throttled"],
+                         throttled=d["describe"]["throttled"], tap_dropped=d["describe"].get("tap_dropped"),
                          checkpoint_copy=d["describe"]["checkpoint_copy"], checkpoint_copy_stats=d["checkpoint_copy_stats"],
                          background_pull_ms=d["background_pull_ms"], failed=d["failed"], guest_retries=d["guest_retries"])
     return out
@@ -209,7 +209,7 @@ FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_be
           "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "resume_kill",
           "prepare_fail", "short_incoming", "slow_preload", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
           "started_fsync", "started_unmark", "start_stall", "incoming_stall", "claim_stall", "handoff_stall", "ckpt_wp_race",
-          "fetch_tail_enomem", "fetch_enomem_stuck", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo", "release_stall", "release_late", "no_plug", "pause_lost")
+          "fetch_tail_enomem", "fetch_enomem_stuck", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo", "release_stall", "release_late", "no_plug", "pause_lost", "tap_backlog", "tap_backlog_stuck")
 
 
 def disarm():
@@ -1005,6 +1005,62 @@ def same_host_flood():
     udp_across_migrations("same host flood", "ft-flood", "release_stall", burst=10)
 
 
+def same_host_backlog():
+    """#136: frames queued on the source's tap when its VM pauses went with the tap,
+    uncounted. `tap_backlog` stops the source's Firecracker for 200 ms at 10k datagrams/s
+    (more than the guest has buffers for) and holds the address before it goes on, so
+    each migration starts its pause with a queue: the guest takes it first, and nothing is
+    lost that was not counted (a loaded guest can still fill a tap, which counts that)."""
+    udp_across_migrations("same host backlog", "ft-backlog", burst=10, source_fault="tap_backlog")
+
+
+def ckpt_backlog():
+    """#136: a keep-running checkpoint whose VM is paused with frames still queued on its
+    tap (`tap_backlog_stuck`: its Firecracker stopped until the wait for the guest to take
+    them has given up) loses none of them: they are left for it to take after the resume,
+    not discarded (that happens only when a VM leaves its tap for good). At 2k datagrams/s,
+    so that queue and the packets held meanwhile fit the tap's together."""
+    n = "ft-ckpt-backlog"
+    clear_log(A, n)
+    ok(run(A, n))
+    ip = vm_ip(A, n)
+    udp_receiver(A, n)
+    stop, sent = threading.Event(), [0]
+
+    def stream():
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        while not stop.is_set():
+            for _ in range(2):
+                s.sendto(b"%08d\n" % sent[0], (ip, 9000))
+                sent[0] += 1
+            time.sleep(0.001)
+
+    t = threading.Thread(target=stream, daemon=True)
+    t.start()
+    time.sleep(0.5)
+    results = []
+    for i in range(3):
+        fault(A, "tap_backlog_stuck", 60000)
+        results.append(checkpoint(A, n, ckpt_path(f"{n}-{i}")))
+        fault(A, "tap_backlog_stuck", 0)
+        time.sleep(0.3)
+    stop.set()
+    t.join(10)
+    time.sleep(0.5)
+    check("ckpt backlog: checkpoints written, still running", all(r["ok"] for r in results) and where(n) == {A: "running"}, (results, where(n)))
+    code, out = sh(A, n, "cat /tmp/udp")
+    got = set(int(x) for x in out.split()) if code == 0 else set()
+    missing = sorted(set(range(sent[0])) - got)
+    vm_log = log(A, n)
+    check("ckpt backlog: no udp datagram lost", not missing,
+          (sent[0], len(missing), missing[:5], [(r.get("result") or {}).get("held_packets") for r in results], vms(A).get(n, {}).get("tap_dropped")))
+    check("ckpt backlog: each pause came with a queue on its tap, which the wait gave up on",
+          vm_log.count("injected fault: stopping firecracker") == 3 and vm_log.count("frames still queued on its tap") == 3,
+          [l for l in vm_log.splitlines() if "tap" in l][-8:])
+    check("ckpt backlog: nothing discarded from its tap", "dropped" not in vm_log, [l for l in vm_log.splitlines() if "dropped" in l])
+    cleanup(n)
+
+
 def udp_receiver(host, n):
     """Starts socat in the guest appending what UDP port 9000 receives to /tmp/udp (its socket
     buffer large enough for any burst of held packets), and waits until the port is bound:
@@ -1015,7 +1071,7 @@ def udp_receiver(host, n):
     assert code == 0, f"socat did not bind UDP port 9000 in the guest: {out}"
 
 
-def udp_across_migrations(label, n, target_fault=None, burst=1):
+def udp_across_migrations(label, n, target_fault=None, burst=1, source_fault=None):
     """A UDP sequence stream to `n` (`burst` datagrams every millisecond)
     across migrations A to B, back and to B again, `target_fault` armed on
     each target, arrives whole and, at 1 kHz, in order. The guest's socket
@@ -1039,14 +1095,27 @@ def udp_across_migrations(label, n, target_fault=None, burst=1):
     t = threading.Thread(target=stream, daemon=True)
     t.start()
     time.sleep(0.5)
-    held, at = [], []
-    for src, dst in ((A, B), (B, A), (A, B)):
+    held, at, took, logs = [], [], [], []
+    hops = ((A, B), (B, A), (A, B))
+    for i, (src, dst) in enumerate(hops):
         if target_fault:
             fault(dst, target_fault, 60000)
+        if source_fault:
+            fault(src, source_fault, 60000)
         at.append(sent[0])
         r = migrate(src, n, dst)
+        if source_fault:
+            fault(src, source_fault, 0)
         held.append((r.get("result") or {}).get("held") or r.get("error"))
         wait_released(dst, n, src)
+        # The source's log once its process is gone (what it dropped as it left is in it),
+        # before the VM arrives there again and starts a new one (each host's last log is
+        # read at the end).
+        src_log = log(src, n)
+        if any(d is src for _, d in hops[i + 1:]):
+            logs.append(src_log)
+        if source_fault:
+            took.append([l for l in src_log.splitlines() if "took what was queued on its tap" in l])
         if target_fault:
             fault(dst, target_fault, 0)
         time.sleep(0.3)
@@ -1067,17 +1136,27 @@ def udp_across_migrations(label, n, target_fault=None, burst=1):
     detail = (f"sent {sent[0]}, migrations began at {at}, {len(missing)} missing, runs {runs[:10]}; the guest: {guest}, "
               f"{'socat receiving' if udp[-1:] == ['receiving'] else 'socat gone'}")
     dropped = {h: [l for l in log(h, n).splitlines() if "dropped" in l or "dropping" in l] for h in (A, B)}
+    dropped["earlier sources"] = [l for t in logs for l in t.splitlines() if "dropped" in l or "dropping" in l]
     if burst == 1:
         check(f"{label}: no udp datagram lost", not missing, detail)
         late = [got[max(0, i - 3):i + 12] for i, (a, b) in enumerate(zip(got, got[1:])) if b <= a]
         check(f"{label}: none reordered", not late, late[:10])
-        for h in (A, B):
+        for h in dropped:
             check(f"{label}: no held packets dropped on {h}", not dropped[h], dropped[h][-3:])
     else:
-        # Overload may drop, but only what is counted: by the holds, or by the guest's socket.
-        said = sum(int(m) for h in (A, B) for l in dropped[h] for m in re.findall(r"dropped (\d+)", l))
+        # Overload may drop, but only what is counted: by the holds, the guest's socket or a tap.
+        said = sum(int(m) for ls in dropped.values() for l in ls for m in re.findall(r"dropped (\d+)", l))
         said += int(guest.get("RcvbufErrors", 0)) if isinstance(guest, dict) else 0
-        check(f"{label}: nothing lost that was not counted", len(missing) <= said, (detail, dropped))
+        # Or by its tap, full (a guest not keeping up), beyond what was reported with injected
+        # packets: the VM logs it as it leaves a tap, so only the last one's is asked for here.
+        said += vms(B).get(n, {}).get("tap_dropped") or 0
+        diag = {}
+        if len(missing) > said:
+            diag = rx_state(B, n)
+            diag["lines"] = sh(B, n, "wc -l < /tmp/udp; cat /proc/net/softnet_stat")[1]
+        check(f"{label}: nothing lost that was not counted", len(missing) <= said, (detail, dropped, diag))
+        if source_fault:
+            check(f"{label}: each source paused with a queue on its tap, which its guest took first", all(len(t) == 1 for t in took), took)
         let_go = [float(m) for h in (A, B) for m in re.findall(r"let go of \S+ after ([\d.]+) ms", log(h, n))]
         check(f"{label}: each release ended within 2 s of its 300 ms route change", let_go and max(let_go) < 2000, let_go)
     cleanup(n)
@@ -5030,7 +5109,7 @@ SCENARIOS = dict(
     incoming_killed=incoming_killed, start_killed=start_killed, claim_killed=claim_killed, standby_stalled=standby_stalled, fc_died=fc_died,
     sigkill_restart=sigkill_restart, listen_trickle=listen_trickle,
     cow_wp_race=cow_wp_race, fetch_tail_enomem=fetch_tail_enomem, fetch_enomem_stuck=fetch_enomem_stuck,
-    same_host_order=same_host_order, same_host_slow_route=same_host_slow_route, same_host_flood=same_host_flood, same_host_late_handover=same_host_late_handover, rx_stall=rx_stall, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,
+    same_host_order=same_host_order, same_host_slow_route=same_host_slow_route, same_host_flood=same_host_flood, same_host_late_handover=same_host_late_handover, same_host_backlog=same_host_backlog, ckpt_backlog=ckpt_backlog, rx_stall=rx_stall, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,
     handoff_superseded=handoff_superseded, suspend_cmd=suspend_cmd, fc_died_busy=fc_died_busy, pause_cmd_start=pause_cmd_start, suspend_died=suspend_died)
 names = [n for s in args.scenarios for n in (list(SCENARIOS) if s == "all" else [s])]
 if os.geteuid() != 0:

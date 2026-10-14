@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io::{BufReader, Write};
 use std::net::{Ipv4Addr, Shutdown};
+use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -14,6 +15,10 @@ use crate::fc::{Firecracker, Idle, Spawner, API_TIMEOUT};
 use crate::template::{Template, BALLOON_STATS_S};
 use crate::uffd::{Origin, Pager, Runs};
 use crate::util::{Phases, Result, PAGE_SIZE};
+
+/// How long a VM about to be paused gets to take what is queued on its tap (`Vm::drain_tap`).
+/// It runs meanwhile; only what reaches its held address waits.
+const TAP_DRAIN_WAIT: Duration = Duration::from_millis(500);
 
 const PULL_WAIT: Duration = Duration::from_secs(30);
 /// A clock request slower than this may have left the guest that far behind.
@@ -84,6 +89,12 @@ pub struct Vm {
     clock_unsure: AtomicBool,
     next_exec: AtomicU64,
     fc: Mutex<Option<Firecracker>>,
+    /// Its Firecracker's (pid) tap descriptor, copied (`tap_watch`).
+    tap_watch: Mutex<Option<(u32, Arc<OwnedFd>)>>,
+    /// Paused with frames still queued on its tap that its guest did not take (`drain_tap`).
+    tap_stuck: AtomicBool,
+    /// How many of the tap's drops were reported with injected packets (`tap_drops_reported`).
+    tap_drops_reported: AtomicU64,
     pub vsock: PathBuf,
     was_paused: AtomicBool,
     pub clock_pending: AtomicBool,
@@ -207,8 +218,9 @@ impl Vm {
 
     /// Saves device and vCPU state and returns page states matching it. Paused vCPUs do not
     /// stop devices writing memory, so execs close, `unroute` holds packets and the tap goes
-    /// down. `resume` undoes this; a target calls `restore_devices`.
-    pub fn save_state(&self, vmstate: &Path, sync: bool, park: bool, unroute: impl FnOnce(), t: &mut Phases) -> Result<Runs> {
+    /// down. `resume` undoes this; a target calls `restore_devices`. Once `unroute` says the
+    /// address is held, the guest takes what is still queued on its tap before the pause.
+    pub fn save_state(&self, vmstate: &Path, sync: bool, park: bool, unroute: impl FnOnce() -> bool, t: &mut Phases) -> Result<Runs> {
         // No huge-page collapse in flight or starting during the pause (`resume` lets it go on).
         self.pager.hold_collapse(true);
         if park {
@@ -218,8 +230,38 @@ impl Vm {
         for (_, s) in self.execs.lock().unwrap().drain() {
             let _ = s.shutdown(Shutdown::Both);
         }
-        unroute();
+        // Before the hold: finding it can wait on RTNL (`net::tap_fd_of`).
+        let watch = self.tap_watch();
+        // `tap_backlog_stuck` keeps it stopped until the wait for the queue gave up too.
+        let stuck = crate::host::fault("tap_backlog_stuck");
+        let stopped = (stuck || crate::host::fault("tap_backlog")).then(|| self.pid()).flatten();
+        if let Some(pid) = stopped {
+            // Frames pile up on the tap while Firecracker is stopped, more than the guest has
+            // buffers for, and the address is held before it goes on: a queue to take.
+            eprintln!("vm {}: injected fault: stopping firecracker for 200 ms, holding its address meanwhile", self.name);
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGSTOP) };
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let go_on = || {
+            if let Some(pid) = stopped {
+                unsafe { libc::kill(pid as libc::pid_t, libc::SIGCONT) };
+            }
+        };
+        let held = unroute();
+        if !stuck {
+            go_on();
+        }
         t.mark("hold");
+        if let (true, Some(fd)) = (held, watch) {
+            // Not read off here: resumed (a checkpoint, an aborted migration), its Firecracker
+            // delivers them once the guest posts buffers. `kill` counts what is left.
+            let emptied = self.drain_tap(&fd);
+            self.tap_stuck.store(!emptied, Ordering::SeqCst);
+            t.mark("drain_tap");
+        }
+        if stuck {
+            go_on();
+        }
         // Even if paused: only an API pause freezes device emulation.
         self.fc(|fc| fc.pause())?;
         t.mark("pause");
@@ -238,6 +280,64 @@ impl Vm {
         let runs = self.pager.quiesce_export()?;
         t.mark("export_runs");
         Ok(runs)
+    }
+
+    /// A copy of its Firecracker's descriptor of its tap (`net::tap_fd_of`), found once per
+    /// Firecracker; None (said why) if it cannot be had.
+    fn tap_watch(&self) -> Option<Arc<OwnedFd>> {
+        let pid = self.pid()?;
+        let mut w = self.tap_watch.lock().unwrap();
+        if let Some((_, fd)) = w.as_ref().filter(|(p, _)| *p == pid) {
+            return Some(fd.clone());
+        }
+        match crate::net::tap_fd_of(pid, &self.tap) {
+            Ok(fd) => {
+                let fd = Arc::new(fd);
+                *w = Some((pid, fd.clone()));
+                Some(fd)
+            }
+            Err(e) => {
+                eprintln!("vm {}: not waiting for its tap's queue before the pause: {e}", self.name);
+                None
+            }
+        }
+    }
+
+    /// With its address held nothing new reaches the tap, so the running guest empties its
+    /// queue unless it stops taking frames; false if it has not by `TAP_DRAIN_WAIT`.
+    fn drain_tap(&self, fd: &OwnedFd) -> bool {
+        let start = Instant::now();
+        let mut queued = false;
+        loop {
+            match crate::net::tap_queued(fd) {
+                Ok(false) => break,
+                Ok(true) => queued = true,
+                Err(e) => {
+                    eprintln!("vm {}: not waiting for its tap's queue before the pause: {e}", self.name);
+                    return true;
+                }
+            }
+            if start.elapsed() >= TAP_DRAIN_WAIT {
+                eprintln!("vm {}: frames still queued on its tap {} ms after its address was held; pausing it anyway", self.name, start.elapsed().as_millis());
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if queued {
+            eprintln!("vm {}: its guest took what was queued on its tap in {:.1} ms before the pause", self.name, start.elapsed().as_secs_f64() * 1e3);
+        }
+        true
+    }
+
+    /// `n` of the tap's drops were reported (with packets a hold injected); `tap_dropped` leaves them out.
+    pub fn tap_drops_reported(&self, n: u64) {
+        self.tap_drops_reported.fetch_add(n, Ordering::SeqCst);
+    }
+
+    /// Frames the tap dropped, its queue full, that were not reported with injected packets.
+    pub fn tap_dropped(&self) -> Option<u64> {
+        let n = std::fs::read_to_string(format!("/sys/class/net/{}/statistics/tx_dropped", self.tap)).ok()?.trim().parse::<u64>().ok()?;
+        Some(n.saturating_sub(self.tap_drops_reported.load(Ordering::SeqCst)))
     }
 
     /// Its write must precede the snapshot.
@@ -292,6 +392,8 @@ impl Vm {
         }
         // Out of the pause, but with the mark still lifted: Firecracker throttled at it could time this out.
         if resumed.is_ok() {
+            // Its Firecracker delivers what is still queued on the tap.
+            self.tap_stuck.store(false, Ordering::SeqCst);
             self.unpark_balloon();
         }
         self.limit.restore();
@@ -591,6 +693,23 @@ impl Vm {
         // First, so a call in progress (holding `fc`) fails at once.
         self.pager.kill_firecracker();
         let Some(fc) = self.fc.lock().unwrap().take() else { return };
+        // Before the tap goes (`fc::release`) with its counters: a full queue drops frames
+        // (a guest not keeping up), counted only there.
+        if let Some(n) = self.tap_dropped().filter(|&n| n > 0) {
+            eprintln!("vm {}: its tap dropped {n} frames with its queue full (its guest was not keeping up)", self.name);
+        }
+        // Before the tap goes too, which purges its queue; not keeping it after.
+        if let Some((_, fd)) = self.tap_watch.lock().unwrap().take() {
+            if self.tap_stuck.swap(false, Ordering::SeqCst) {
+                // Gone (not reaped, so its pid is not reused), so no read of its races these.
+                let gone = crate::util::pidfd_open(fc.pid()).and_then(|p| crate::util::pidfd_wait(&p, Duration::from_secs(2)));
+                if !matches!(gone, Ok(true)) {
+                    eprintln!("vm {}: firecracker not seen gone ({gone:?}); counting what is left on its tap anyway", self.name);
+                }
+                let n = crate::net::discard_tap_queue(&fd);
+                eprintln!("vm {}: dropped {n} frames still queued on its tap when it left (its guest was not taking them)", self.name);
+            }
+        }
         let _ = UnixStream::connect(self.mem_sock());
         // Reaped only once the pager has stopped, so its pid is not reused under the pager.
         self.pager.join();
@@ -618,6 +737,7 @@ impl Vm {
             "admitted_mib": self.limit.admitted(),
             "cgroup_mib": self.limit.used(),
             "throttled": self.limit.throttled.load(Ordering::SeqCst),
+            "tap_dropped": self.tap_dropped(),
             "requested_mib": hotplug["requested_size_mib"],
             "pages_mib": {"base": mib(base), "present": mib(present), "zero": mib(zero), "remote": mib(remote + inflight + discarded)},
             "checkpoint_copy": self.pager.copying(),
@@ -695,6 +815,9 @@ impl Prepared {
             next_exec: AtomicU64::new(0),
             vsock: idle.sockets.vsock.clone(),
             fc: Mutex::new(Some(idle)),
+            tap_watch: Mutex::new(None),
+            tap_stuck: AtomicBool::new(false),
+            tap_drops_reported: AtomicU64::new(0),
             was_paused: AtomicBool::new(false),
             clock_pending: AtomicBool::new(false),
             pending_net: Mutex::new(None),

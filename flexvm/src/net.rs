@@ -48,6 +48,58 @@ pub fn set_link_up(name: &str, up: bool) -> Result<()> {
     Ok(())
 }
 
+/// Whether frames wait on a tap for its guest, through a copy of Firecracker's descriptor of
+/// it (`tap_fd_of`): tun's ring is not empty. Paused vCPUs post no rx buffers, so a VM paused
+/// with frames there loses them when the tap goes (a migration, `checkpoint --stop`, a
+/// suspend), and no counter shows it: a guest slow to refill under load leaves hundreds (#136).
+pub fn tap_queued(fd: &OwnedFd) -> Result<bool> {
+    loop {
+        let mut pfd = libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        match unsafe { libc::poll(&mut pfd, 1, 0) } {
+            n if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => continue,
+            n if n < 0 => bail!("poll: {}", std::io::Error::last_os_error()),
+            n => return Ok(n > 0 && pfd.revents & libc::POLLIN != 0),
+        }
+    }
+}
+
+/// Reads off and counts the frames queued on a tap (`tap_fd_of`, non-blocking as Firecracker
+/// opened it): for a VM leaving with frames its guest would not take, so their loss is counted.
+pub fn discard_tap_queue(fd: &OwnedFd) -> u64 {
+    // A frame with its virtio-net header, up to the 64 KiB a GSO frame can be.
+    let mut buf = vec![0u8; 65562 + 64];
+    let mut n = 0;
+    // Bounded by the ring (TAP_QUEUE) and in case the descriptor were blocking after all.
+    while n < u64::from(TAP_QUEUE) && tap_queued(fd).unwrap_or(false) {
+        if unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) } < 0 {
+            break;
+        }
+        n += 1;
+    }
+    n
+}
+
+/// Process `pid`'s descriptor attached to `tap` (its fdinfo says `iff: TAP`), duplicated here
+/// (`pidfd_getfd`), to watch its queue. Reading a tun fdinfo takes RTNL, so this can wait on
+/// other network changes: done before the VM's address is held.
+pub fn tap_fd_of(pid: u32, tap: &str) -> Result<OwnedFd> {
+    let pidfd = crate::util::pidfd_open(pid).map_err(|e| format!("pidfd_open {pid}: {e}"))?;
+    let want = format!("iff:\t{tap}\n");
+    for entry in std::fs::read_dir(format!("/proc/{pid}/fdinfo"))? {
+        let entry = entry?;
+        let Some(target) = entry.file_name().to_str().and_then(|s| s.parse::<c_int>().ok()) else { continue };
+        if !std::fs::read_to_string(entry.path()).is_ok_and(|s| s.contains(&want)) {
+            continue;
+        }
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd.as_raw_fd(), target, 0) };
+        if fd < 0 {
+            bail!("pidfd_getfd {pid} {target}: {}", std::io::Error::last_os_error());
+        }
+        return Ok(unsafe { OwnedFd::from_raw_fd(fd as c_int) });
+    }
+    bail!("process {pid} has no descriptor attached to {tap}")
+}
+
 /// Without an address on the tap, rp_filter (even loose) drops what the guest sends while
 /// its address is routed elsewhere (`hold`); a per-tap `rp_filter=0` loses to `all`=2.
 pub const TAP_ADDR: &str = "169.254.1.2/32";
