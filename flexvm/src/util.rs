@@ -793,7 +793,8 @@ pub mod output {
     /// another writer is rotating or removing. Past `cap`, `log` is renamed
     /// `log.1` (replacing the one before); the next write starts a new `log`.
     /// A lock not had within `STALL` of the call (a stopped holder) is done
-    /// without: the append is made unlocked and nothing rotated. Whether
+    /// without: the append is made unlocked and nothing rotated (a rotation
+    /// racing it may take it to `log.1`). Whether
     /// `data` was written; it is never written twice.
     pub fn append_capped(log: &Path, data: &[u8], cap: u64) -> bool {
         let deadline = Instant::now() + STALL;
@@ -809,7 +810,7 @@ pub mod output {
                     r => break r.is_ok(),
                 }
             };
-            if same_file(&f, log) {
+            if same_file(&f, log) || !locked && Instant::now() >= deadline {
                 break (f, locked);
             }
         };
