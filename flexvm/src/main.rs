@@ -173,8 +173,8 @@ fn real_main() -> Result<()> {
         Some("migrate") => call(json!({"op": "migrate", "to": arg2.ok_or("migrate needs NAME HOST:PORT")?})),
         Some("listen") => {
             let mut host = open_host(&args)?;
-            host.configure(|c| configure(c, &args, pos.get(1).copied()))?;
-            listen::main(host)
+            let listener = configure_listener(&mut host, &args, pos.get(1).copied(), listen::activated())?;
+            listen::main(host, listener)
         }
         Some("standby") => print(standby::set(&open_host(&args)?, template, name.parse().map_err(|_| "standby wants a count")?)?),
         Some("bench") => bench::run(&args),
@@ -190,6 +190,31 @@ fn real_main() -> Result<()> {
             std::process::exit(2);
         }
     }
+}
+
+/// Bind and validate before publishing any host configuration.
+fn configure_listener(host: &mut Host, args: &Args, addr: Option<&str>, activated: Option<std::net::TcpListener>) -> Result<std::net::TcpListener> {
+    let mut listener = None;
+    host.configure(|c| {
+        configure(c, args, addr)?;
+        let bound = match activated {
+            // Without ADDR, an activated socket says where this host listens.
+            Some(l) => {
+                if addr.is_none() {
+                    c.listen = Some(l.local_addr()?.to_string());
+                }
+                l
+            }
+            None => {
+                let addr = c.listen.as_deref().ok_or("listen needs an address (flexvm listen ADDR)")?;
+                std::net::TcpListener::bind(addr).map_err(|e| format!("listen on {addr}: {e}"))?
+            }
+        };
+        listen::validate(&bound, c)?;
+        listener = Some(bound);
+        Ok(())
+    })?;
+    Ok(listener.unwrap())
 }
 
 /// Flags not given keep their configured values.
@@ -209,8 +234,6 @@ fn configure(c: &mut host::Config, args: &Args, addr: Option<&str>) -> Result<()
     c.dns = args.get("dns").map(String::from).or(c.dns.take());
     c.reserve_mib = args.num("reserve", c.reserve_mib)?;
     c.prefix = args.get("prefix").map_or(c.prefix.clone(), String::from);
-    // A wildcard listen address needs a concrete one to advertise.
-    c.advertise()?;
     Ok(())
 }
 
@@ -485,6 +508,38 @@ fn exec_frames(r: &mut impl Read, id: &str, started: &mut bool, offset: &mut u64
 #[cfg(test)]
 mod exec_tests {
     use super::*;
+
+    #[test]
+    fn listener_configuration_is_published_only_after_binding_and_validation() {
+        use std::net::TcpListener;
+        let root = std::env::temp_dir().join(format!("flexvm-listen-config-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        host.configure(|c| { c.reserve_mib = 321; Ok(()) }).unwrap();
+        let before = std::fs::read(host.state.join("host.json")).unwrap();
+        let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = occupied.local_addr().unwrap().to_string();
+        let args = Args { positional: vec![], flags: vec![("reserve".into(), "456".into())], rest: vec![] };
+        assert!(configure_listener(&mut host, &args, Some(&addr), None).is_err());
+        assert_eq!(std::fs::read(host.state.join("host.json")).unwrap(), before);
+        assert_eq!(host.cfg.reserve_mib, 321);
+        // An activated socket supplies the endpoint even without ADDR.
+        let listener = configure_listener(&mut host, &args, None, Some(occupied)).unwrap();
+        let saved = Host::open(&host.state, &host.run).unwrap();
+        assert_eq!(saved.cfg.listen.as_deref(), Some(addr.as_str()));
+        assert_eq!(saved.cfg.advertise().unwrap().as_deref(), Some(addr.as_str()));
+        assert_eq!(saved.cfg.underlay(), Some("127.0.0.1".parse().unwrap()));
+        assert_eq!(saved.cfg.reserve_mib, 456);
+        drop(listener);
+        let before = std::fs::read(host.state.join("host.json")).unwrap();
+        let wildcard = TcpListener::bind("0.0.0.0:0").unwrap();
+        assert!(configure_listener(&mut host, &args, None, Some(wildcard)).is_err());
+        assert_eq!(std::fs::read(host.state.join("host.json")).unwrap(), before);
+        // Port 0 binds, but peers could not be told the port.
+        assert!(configure_listener(&mut host, &args, Some("127.0.0.1:0"), None).is_err());
+        assert_eq!(std::fs::read(host.state.join("host.json")).unwrap(), before);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn frames(fs: &[(u8, &[u8])]) -> Vec<u8> {
         fs.iter().flat_map(|(kind, data)| [&[*kind][..], &(data.len() as u32).to_le_bytes(), data].concat()).collect()

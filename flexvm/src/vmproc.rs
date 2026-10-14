@@ -884,6 +884,11 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
     let signals = crate::util::block_signals(&SIGNALS);
     crate::util::output::guard()?;
     let _ = crate::net::sysctl("net.ipv4.ip_forward", "1");
+    if let Some(dev) = &host.cfg.announce_dev {
+        if let Err(e) = crate::net::sysctl(&format!("net.ipv4.conf.{dev}.proxy_arp"), "1") {
+            eprintln!("WARNING: proxy ARP on {dev}: {e}");
+        }
+    }
     let p = Proc::new(host, paths)?;
     let host = p.host.clone();
     thread::spawn(move || {
@@ -902,11 +907,23 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
         }
         Start::Resume { name } => p.resume_suspended(&name),
         Start::Restore { dir, name, ip, paused } => p.restore(&dir, name.as_deref(), ip.as_deref(), paused),
-        Start::Incoming { req } => p.migrate_in(&req, unsafe { std::net::TcpStream::from_raw_fd(3) }).map(|()| Value::Null),
+        Start::Incoming { req } => {
+            let log = std::env::var_os("FLEXVM_INCOMING_LOG").map(PathBuf::from);
+            std::env::remove_var("FLEXVM_INCOMING_LOG");
+            let res = p.migrate_in(&req, unsafe { std::net::TcpStream::from_raw_fd(3) });
+            if let Some(log) = log {
+                if let Err(e) = crate::listen::finish_incoming_log(&p.host, &p.name(), &log, res.is_ok()) {
+                    eprintln!("arrival log {}: {e}", log.display());
+                }
+            }
+            res.map(|()| Value::Null)
+        }
         Start::Standby { template } => crate::standby::serve(&p, &template, &mut notify, &op),
     };
     if res.is_ok() {
         p.serve_control();
+        // Once running (a standby once claimed), so a start never competes with a refill.
+        crate::standby::maintain(p.host.clone());
     }
     let reply = match &res {
         Ok(v) => json!({"ok": true, "result": v}),
@@ -1088,6 +1105,30 @@ fn read_mem_request(conn: &UnixStream) -> Option<u64> {
     }
 }
 
+/// Per VM and peer (a peer may refuse a big VM but take a small one), in
+/// RUN/evict.backoff under evict.lock, so changing deciders share it and a
+/// reboot clears it. An entry a minute past its cooldown is forgotten.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct PeerBackoff {
+    delay: u64,
+    until: u64,
+}
+
+impl PeerBackoff {
+    fn ready(&self, now: u64) -> bool {
+        now >= self.until
+    }
+
+    fn refuse(&mut self, now: u64) {
+        self.delay = self.delay.saturating_mul(2).clamp(5, 60);
+        self.until = now.saturating_add(self.delay);
+    }
+}
+
+fn eviction_time() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
+}
+
 /// Under pressure standby VMs go first, then one VM moves to a peer. Every
 /// VM process calls this; the `STATE/evict.lock` holder decides, at most every 5 s.
 fn relieve(host: &Host, starved_here: bool) {
@@ -1103,6 +1144,7 @@ fn relieve(host: &Host, starved_here: bool) {
         let standby: Vec<_> = crate::standby::templates(host).iter().flat_map(|t| crate::standby::live(host, t)).collect();
         standby.iter().for_each(crate::standby::stop);
         if !standby.is_empty() {
+            let _ = std::fs::write(crate::standby::pressure(host), b"");
             return eprintln!("host has {avail} MiB available, under its {reserve} MiB reserve: stopped {} standby vms", standby.len());
         }
     }
@@ -1119,16 +1161,35 @@ fn relieve(host: &Host, starved_here: bool) {
     // Starved first, then the biggest.
     running.sort_by_key(|e| (!e.starved, std::cmp::Reverse(rss(e.firecracker))));
     let _ = std::fs::write(&last, b"");
+    let backoff_path = host.run.join("evict.backoff");
+    let Ok(saved) = crate::host::load::<std::collections::HashMap<String, PeerBackoff>>(&backoff_path) else { return };
+    let mut backoff = saved.unwrap_or_default();
+    let now = eviction_time();
+    backoff.retain(|_, b| now < b.until.saturating_add(60));
     // A VM busy with anything (a checkpoint's copy, a migration, an arrival
     // settling) is skipped, never waited for: `if_idle`.
     for vm in &running {
         let why = if vm.starved { "cannot grow here" } else { "the host is low on memory" };
         for peer in &host.cfg.peers {
+            let key = format!("{} {peer}", vm.name);
+            if backoff.get(&key).is_some_and(|b| !b.ready(eviction_time())) {
+                continue;
+            }
             eprintln!("vm {}: {why} ({avail} MiB available); migrating to {peer}", vm.name);
             match call(host, &vm.name, json!({"op": "migrate", "to": peer, "if_idle": true})) {
-                Ok(_) => return eprintln!("vm {}: migrated to {peer}", vm.name),
+                Ok(_) => {
+                    backoff.remove(&key);
+                    let _ = crate::host::store(&backoff_path, &backoff, false);
+                    return eprintln!("vm {}: migrated to {peer}", vm.name);
+                }
                 Err(e) if e.to_string().contains(BUSY) => break,
-                Err(e) => eprintln!("vm {}: migrating to {peer}: {e}", vm.name),
+                Err(e) => {
+                    eprintln!("vm {}: migrating to {peer}: {e}", vm.name);
+                    backoff.entry(key).or_default().refuse(eviction_time());
+                    if crate::host::store(&backoff_path, &backoff, false).is_err() {
+                        return;
+                    }
+                }
             }
         }
     }
@@ -1176,6 +1237,24 @@ pub fn call(host: &Host, name: &str, req: Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refused_peers_back_off_independently_and_survive_a_new_decider() {
+        let mut peers = std::collections::HashMap::<String, PeerBackoff>::new();
+        let mut now = 100;
+        for delay in [5, 10, 20, 40, 60, 60] {
+            let peer = peers.entry("peer-a".into()).or_default();
+            assert!(peer.ready(now));
+            peer.refuse(now);
+            assert_eq!(peer.delay, delay);
+            assert!(!peer.ready(now + delay - 1));
+            assert!(peer.ready(now + delay));
+            assert!(peers.entry("peer-b".into()).or_default().ready(now));
+            peers = serde_json::from_slice(&serde_json::to_vec(&peers).unwrap()).unwrap();
+            assert!(!peers["peer-a"].ready(now));
+            now += delay;
+        }
+    }
 
     const SIZES: Sizes = Sizes { mem_mib: 256, floor: 4096, hotplug_total: 31744 };
 

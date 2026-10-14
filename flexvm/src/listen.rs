@@ -19,22 +19,20 @@ use crate::util::{send_json, Result};
 const MAX_ACTIVE: usize = 512;
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 
-pub fn main(host: Host) -> Result<()> {
-    let listener = match activated() {
-        Some(l) => l,
-        None => {
-            let addr = host.cfg.listen.clone().ok_or("listen needs an address (flexvm listen ADDR)")?;
-            TcpListener::bind(&addr).map_err(|e| format!("listen on {addr}: {e}"))?
-        }
-    };
-    if let Some(e) = unreachable_at(listener.local_addr()?, v6only(&listener), host.cfg.advertise()?.as_deref()) {
+pub fn validate(listener: &TcpListener, cfg: &crate::host::Config) -> Result<()> {
+    if let Some(e) = unreachable_at(listener.local_addr()?, v6only(listener), cfg.advertise()?.as_deref()) {
         bail!("{e}");
     }
+    Ok(())
+}
+
+pub fn main(host: Host, listener: TcpListener) -> Result<()> {
     crate::net::sysctl("net.ipv4.ip_forward", "1")?;
     if let Some(dev) = &host.cfg.announce_dev {
         crate::net::sysctl(&format!("net.ipv4.conf.{dev}.proxy_arp"), "1")?;
     }
     eprintln!("flexvm listening on {}", listener.local_addr()?);
+    crate::standby::maintain(host.clone());
     let host = std::sync::Arc::new(host);
     for conn in listener.incoming() {
         let conn = match conn {
@@ -83,7 +81,7 @@ fn is_peer(peers: &[String], from: IpAddr) -> bool {
     peers.iter().filter_map(|p| p.to_socket_addrs().ok()).flatten().any(|a| a.ip().to_canonical() == from.to_canonical())
 }
 
-fn activated() -> Option<TcpListener> {
+pub fn activated() -> Option<TcpListener> {
     let pid: u32 = std::env::var("LISTEN_PID").ok()?.parse().ok()?;
     let n: u32 = std::env::var("LISTEN_FDS").ok()?.parse().ok()?;
     (pid == std::process::id() && n >= 1).then(|| unsafe { TcpListener::from_raw_fd(3) })
@@ -143,10 +141,26 @@ fn incoming(host: &Host, req: &Value, line: &[u8], conn: TcpStream) -> Result<()
         refuse(&conn, e.to_string())?;
         return Ok(());
     }
-    let log = std::fs::OpenOptions::new().create(true).append(true).open(host.run.join("vms").join(format!("{name}.log")))?;
+    // Each arrival owns its log until accepted; refusing a duplicate name
+    // must not remove the running VM's log.
+    static ARRIVAL: AtomicUsize = AtomicUsize::new(0);
+    let log_path = host.run.join("vms").join(format!(".incoming-{}-{}.log", std::process::id(), ARRIVAL.fetch_add(1, Ordering::Relaxed)));
+    let log = std::fs::OpenOptions::new().create_new(true).append(true).open(&log_path)?;
     let args = ["--state".as_ref(), host.state.as_os_str(), "--run".as_ref(), host.run.as_os_str(), "run".as_ref(), "--incoming".as_ref()];
-    if let Err(e) = crate::util::spawn_self(&args, &log, conn.as_raw_fd(), &[("FLEXVM_INCOMING", std::str::from_utf8(line)?)]) {
+    if let Err(e) = crate::util::spawn_self(&args, &log, conn.as_raw_fd(), &[("FLEXVM_INCOMING", std::str::from_utf8(line)?), ("FLEXVM_INCOMING_LOG", log_path.to_str().ok_or("non-UTF8 log path")?)]) {
+        let _ = std::fs::remove_file(log_path);
         refuse(&conn, format!("cannot start the vm process: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Publish only an accepted arrival's log. A refused arrival owns only its
+/// temporary file, even when the requested name already belongs to a VM.
+pub fn finish_incoming_log(host: &Host, name: &str, log: &std::path::Path, accepted: bool) -> Result<()> {
+    if accepted {
+        std::fs::rename(log, host.vms(name, "log"))?;
+    } else {
+        std::fs::remove_file(log)?;
     }
     Ok(())
 }
@@ -210,6 +224,25 @@ fn route(host: &Host, req: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refused_arrival_removes_only_its_own_log() {
+        let root = std::env::temp_dir().join(format!("flexvm-arrival-log-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let arrival = host.run.join("vms/.incoming.log");
+        let existing = host.vms("web", "log");
+        std::fs::write(&existing, b"existing vm").unwrap();
+        std::fs::write(&arrival, b"refused").unwrap();
+        finish_incoming_log(&host, "web", &arrival, false).unwrap();
+        assert!(!arrival.exists());
+        assert_eq!(std::fs::read(&existing).unwrap(), b"existing vm");
+        std::fs::write(&arrival, b"accepted").unwrap();
+        finish_incoming_log(&host, "web", &arrival, true).unwrap();
+        assert!(!arrival.exists());
+        assert_eq!(std::fs::read(&existing).unwrap(), b"accepted");
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn an_ipv4_peer_on_a_dual_stack_socket_is_a_peer() {
