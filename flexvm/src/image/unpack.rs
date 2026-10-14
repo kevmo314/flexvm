@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
@@ -412,7 +412,8 @@ impl Root {
                 if e.size() > self.limits.unpacked - self.unpacked {
                     bail!("image exceeds the unpacked size limit (--max-unpacked-mib)");
                 }
-                io::copy(e, &mut at.create()?).map_err(|err| format!("write {rel:?}: {err}"))?;
+                let mut file = BufWriter::with_capacity(256 << 10, at.create()?);
+                io::copy(e, &mut file).and_then(|_| file.flush()).map_err(|err| format!("write {rel:?}: {err}"))?;
             }
             T::Symlink => {
                 let target = m.link.as_ref().ok_or("symlink without target")?;
@@ -648,6 +649,14 @@ pub(super) mod tests {
         fn drop(&mut self) {
             assert_eq!(std::fs::read_to_string(self.dir.join("outside")).ok().as_deref(), Some("keep"), "escaped the root");
         }
+    }
+
+    #[test]
+    fn large_files_flush_the_final_partial_buffer() {
+        let s = Sandbox::new("large-file");
+        let data = "x".repeat((512 << 10) + 123);
+        s.open().apply_layer(&layer(&[("large", 'f', &data)])[..]).unwrap();
+        assert_eq!(s.read("large").unwrap(), data);
     }
 
     #[test]

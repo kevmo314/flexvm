@@ -18,6 +18,7 @@ pub const MANIFEST_TYPES: &str = "application/vnd.oci.image.index.v1+json, \
     application/vnd.oci.image.manifest.v1+json, \
     application/vnd.docker.distribution.manifest.v2+json";
 
+#[derive(Clone)]
 pub struct Registry {
     agent: ureq::Agent,
     pub r: Reference,
@@ -148,6 +149,16 @@ impl Registry {
         Ok((serde_json::from_slice(&body)?, digest))
     }
 
+    /// Defers checking cached layers until unpacking actually opens them.
+    pub fn layer_blob(&mut self, digest: &str, size: u64, blobs: &Path) -> Result<PathBuf> {
+        let path = blob_path(blobs, digest)?;
+        if path.exists() {
+            sync_dir(path.parent().unwrap())?;
+            return Ok(path);
+        }
+        self.blob(digest, size, blobs)
+    }
+
     /// Checks cached blobs before reuse; a corrupt one gets one fresh download, renamed over it so that
     /// concurrent pulls never see the path missing.
     pub fn blob(&mut self, digest: &str, size: u64, blobs: &Path) -> Result<PathBuf> {
@@ -159,7 +170,6 @@ fn cached_blob<R: Read>(digest: &str, size: u64, blobs: &Path, download: impl Fn
     let path = blob_path(blobs, digest)?;
     let dir = path.parent().unwrap().to_path_buf();
     std::fs::create_dir_all(&dir)?;
-    sweep_parts(&dir);
     if path.exists() {
         let (reader, len) = super::source::Blob::File(path.clone()).open()?;
         let mut cached = Hashed::new(reader.take(size.saturating_add(1)));
@@ -185,7 +195,7 @@ fn cached_blob<R: Read>(digest: &str, size: u64, blobs: &Path, download: impl Fn
     Ok(path)
 }
 
-fn sweep_parts(dir: &Path) {
+pub(super) fn sweep_parts(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         let name = entry.file_name();
@@ -248,6 +258,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cached_layers_are_not_verified_until_needed() {
+        let dir = super::super::unpack::tests::tmpdir("blob-lazy");
+        let digest = sha256_hex(b"good");
+        let path = blob_path(&dir, &digest).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"evil").unwrap();
+        let mut reg = Registry::new(Reference::parse("localhost:1/test").unwrap());
+        // No server: returning a corrupt cached layer must not attempt a download.
+        assert_eq!(reg.layer_blob(&digest, 4, &dir).unwrap(), path);
+        assert_eq!(std::fs::read(&path).unwrap(), b"evil");
+        assert_eq!(cached_blob(&digest, 4, &dir, || Ok(&b"good"[..])).unwrap(), path);
+        assert_eq!(std::fs::read(&path).unwrap(), b"good");
+    }
+
+    #[test]
     fn corrupt_cached_blobs_are_downloaded_once() {
         let digest = sha256_hex(b"good");
         let cases: &[(&[u8], &[u8])] = &[(b"evil", b"good"), (b"x", b"good"), (b"good-extra", b"good"), (b"evil", b"evil"), (b"evil", b"x")];
@@ -277,8 +302,7 @@ mod tests {
 
     #[test]
     fn sweep_removes_only_dead_downloads() {
-        let dir = std::env::temp_dir().join(format!("flexvm-parts-{}", std::process::id()));
-        std::fs::create_dir(&dir).unwrap();
+        let dir = super::super::unpack::tests::tmpdir("parts");
         let hex = "a".repeat(64);
         let stale = dir.join(format!("{hex}.part2147483647"));
         let live = dir.join(format!("{hex}.part{}", std::process::id()));
@@ -290,7 +314,6 @@ mod tests {
         sweep_parts(&dir);
         assert!(!stale.exists());
         assert!(live.exists() && other.exists() && blob.exists());
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
