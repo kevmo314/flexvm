@@ -31,7 +31,7 @@ joins a cgroup of its own, `/sys/fs/cgroup/flexvm/vm-PID-START` (`util::spawn_se
 named after the instance, so one that exists is refused, never joined),
 so stopping its starter's cgroup (a systemd unit's restart with
 `KillMode=control-group`, a oneshot unit's end, logind's `KillUserProcesses`)
-does not reach it. Its Firecrackers move on to `flexvm/idle-PID-N`. Without
+does not reach it. Its Firecrackers move on to `flexvm/idle-PID-START-N`. Without
 cgroup2 it stays where it was started, and says so in its log. A foreground
 VM process stays in its caller's cgroup.
 
@@ -149,13 +149,15 @@ reaping and garbage collection never reclaim on it.
 Firecracker also gets `PR_SET_PDEATHSIG` (checked, and the parent checked
 alive after it), so they die anyway; reaping makes the order certain.
 
-**Garbage collection** (`host::collect_garbage`, `gc::sweep`) runs as each
-VM process starts and, from every listener and VM process, about every 30 s
-(whichever process finds `RUN/.gc` older than that sweeps; one sweep at a
-time under `RUN/.gc.lock`), so a host with no VM starting still sweeps.
+**Garbage collection** (`host::collect_garbage`, `gc::sweep`) runs from
+every listener and VM process about every 30 s, a VM process's first as it
+starts (whichever process finds `RUN/.gc` older than that sweeps, so a start
+right after another sweep does not; one sweep at a time under
+`RUN/.gc.lock`), so a host with no VM starting still sweeps.
 What a process owns goes once that process is proven gone: taps
-(`<prefix><pid hex>t<n>`, and a template build's `<prefix>x<pid hex>`),
-Firecrackers' cgroups (`idle-<pid>-<n>`), work directories, names, a standby
+(`<prefix><pid hex>t<n>`, and a template build's `<prefix>x<pid hex>`;
+no room for a start time, so a process with a reused pid removes them as it
+starts, `host::clear_taps`), Firecrackers' cgroups (`idle-<pid>-<start>-<n>`, by the process's identity), work directories, names, a standby
 VM's socket (its `PID.lock` free), an arrival's log (no lock on it, 5 s
 old). A VM process's own cgroup (`vm-PID-START`) goes once empty, never
 killed (`rmdir` refuses a populated cgroup). The logs of a name with no
@@ -522,7 +524,7 @@ where it is kept and what tests it.
    only as the source of the migration id they name.
 9. **Shared resources have one owner.** Socket roots, work directories, taps
    (`<prefix><pid>t<n>`, a template build's `<prefix>x<pid>`) and cgroups
-   (`idle-<pid>-<n>`; a VM process's own `vm-<pid>-<start>`, swept once empty) are named after the owning process and only swept once it is gone; each process has its own
+   (`idle-<pid>-<start>-<n>`; a VM process's own `vm-<pid>-<start>`, swept once empty) are named after the owning process and only swept once it is gone; each process has its own
    hold TUN (not persistent: it goes with the process); `unroute` happens
    under the host lock and only for an address the process still holds;
    checkpoint staging is cleared by owner pid; suspended directories are
