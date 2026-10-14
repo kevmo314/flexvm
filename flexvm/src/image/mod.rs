@@ -130,7 +130,7 @@ fn app_config(config: &Value, o: &Options) -> Result<App> {
 }
 
 pub fn prepare(cache: &Path, init: &Path, o: &Options) -> Result<(PathBuf, ImageMeta)> {
-    let img = source::fetch(cache, &o.image, &o.limits)?;
+    let mut img = source::resolve(cache, &o.image, &o.limits)?;
     let config: Value = serde_json::from_slice(&img.config)?;
     let (os, arch) = (config["os"].as_str().unwrap_or("linux"), config["architecture"].as_str().unwrap_or("amd64"));
     if os != "linux" || arch != "amd64" {
@@ -152,7 +152,10 @@ pub fn prepare(cache: &Path, init: &Path, o: &Options) -> Result<(PathBuf, Image
     });
     let key = sha256_hex(key.to_string().as_bytes());
     let cached = cache.join("rootfs").join(format!("{}.ext4", &key["sha256:".len()..]));
-    let cached = cached_rootfs(&cached, |tmp| build_rootfs(&o.staging, &img, &app, &init_bytes, tmp, &o.limits), sync_dir)?;
+    let cached = cached_rootfs(&cached, |tmp| {
+        img.download_layers()?;
+        build_rootfs(&o.staging, &img, &app, &init_bytes, tmp, &o.limits)
+    }, sync_dir)?;
     let app_conf = std::fs::read_to_string(cached.with_extension("conf"))?;
     let meta = ImageMeta {
         source: o.image.clone(),
@@ -556,7 +559,7 @@ mod tests {
     }
 
     fn fetch(src: &Path, limits: &Limits) -> Result<source::Image> {
-        source::fetch(Path::new("/nonexistent"), src.to_str().unwrap(), limits)
+        source::resolve(Path::new("/nonexistent"), src.to_str().unwrap(), limits)
     }
 
     fn unpack(src: &Path, out: &Path) -> Result<String> {
@@ -757,6 +760,47 @@ mod tests {
             publish_rootfs(&winner, &cached, "winner config", sync_dir)?;
             build("loser")(tmp)
         }
+    }
+
+    #[test]
+    fn rootfs_cache_hit_resolves_config_without_downloading_layers() {
+        use std::io::{BufRead, BufReader};
+        let d = tmpdir("rootfs-no-download");
+        let config = config(b"missing layer");
+        let cd = sha256_hex(config.as_bytes());
+        let ld = sha256_hex(b"missing compressed layer");
+        let manifest = json!({"schemaVersion": 2, "config": {"digest": cd, "size": config.len()}, "layers": [{"digest": ld, "size": 24}]}).to_string();
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let image = format!("{}/test", server.local_addr().unwrap());
+        let config_body = config.clone();
+        let serving = std::thread::spawn(move || {
+            for body in [manifest, config_body] {
+                let (mut socket, _) = server.accept().unwrap();
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                let mut request = String::new();
+                reader.read_line(&mut request).unwrap();
+                assert!(!request.contains(&ld), "a rootfs cache hit requested a layer");
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" { break; }
+                }
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            }
+            // Further requests fail: the layer is absent locally and remotely.
+        });
+        let init = d.join("init");
+        std::fs::write(&init, b"init").unwrap();
+        let o = Options { image, ..Options::default() };
+        let config_value: Value = serde_json::from_str(&config).unwrap();
+        let key = json!({"v": 2, "config": cd, "diff_ids": config_value["rootfs"]["diff_ids"], "init": sha256_hex(b"init"), "options": o});
+        let key = sha256_hex(key.to_string().as_bytes());
+        let cached = d.join("rootfs").join(format!("{}.ext4", &key[7..]));
+        cached_rootfs(&cached, build("cached"), sync_dir).unwrap();
+        let (path, meta) = prepare(&d, &init, &o).unwrap();
+        serving.join().unwrap();
+        assert_eq!(read(path), "cached image");
+        assert_eq!(meta.app_conf, "cached config");
     }
 
     #[test]

@@ -552,7 +552,7 @@ impl Proc {
         let ip: Ipv4Addr = req["ip"].as_str().ok_or("missing ip")?.parse()?;
         // Before the record (fsynced) and the claim: a refusal leaves nothing to undo.
         let floor = if req["evict"] == true { crate::host::Floor::EvictMark } else { crate::host::Floor::Reserve };
-        self.admit_arrival(req["rss_mib"].as_u64().unwrap_or(0), floor)?;
+        self.admit_pull(req["rss_mib"].as_u64().unwrap_or(0), floor)?;
         *self.arrived.lock().unwrap() = Some(self.host.mig_begin(mig, &source.addr, by, Some(ip))?);
         let tpl = Template::open_id(&self.paths, req["template"].as_str().ok_or("missing template")?, req["id"].as_str().ok_or("missing template id")?)?;
         t.mark("template");

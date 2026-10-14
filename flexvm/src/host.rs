@@ -4,7 +4,7 @@
 //! sections. A VM process holds `RUN/vms/NAME.lock` for life; a dead one
 //! counts as gone only once its Firecrackers have exited (`reap`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -711,7 +711,8 @@ impl Host {
         let mut grants: Vec<(u64, u64, u64)> = load(&path)?.unwrap_or_default();
         grants.retain(|&(t, ..)| now.saturating_sub(t) <= GRANT_WINDOW.as_millis() as u64);
         let held = self.holds(&l);
-        let pending: u64 = grants.iter().filter(|g| !held.iter().any(|h| h.0 == g.2)).map(|g| g.1).sum::<u64>() + held.iter().map(|h| h.1).sum::<u64>();
+        let held_ids: HashSet<_> = held.iter().map(|h| h.0).collect();
+        let pending: u64 = grants.iter().filter(|g| !held_ids.contains(&g.2)).map(|g| g.1).sum::<u64>() + held.iter().map(|h| h.1).sum::<u64>();
         let avail = available().ok_or("cannot read MemAvailable from /proc/meminfo")?;
         if avail < floor + pending + mib {
             return Ok(Err(format!("not enough memory here for {mib} MiB above the {floor} MiB {what}").into()));
@@ -1786,6 +1787,24 @@ mod tests {
         .unwrap();
         assert_eq!(running.config_now().reserve_mib, free + 1000);
         assert!(!running.admit(1).unwrap());
+    }
+
+    #[test]
+    fn disk_restore_reservation_survives_expiry_and_can_be_completed_or_refunded() {
+        let h = host("disk-restore-hold");
+        let charge = crate::limit::allowance(1600);
+        let grant = |mib, held| h.grant_inner(mib, Floor::Reserve, held, None, || Some(h.cfg.reserve_mib + charge)).unwrap();
+        let (id, hold) = grant(charge, true).unwrap();
+        let path = h.run.join("grants");
+        store(&path, &vec![(0u64, charge, id)], false).unwrap();
+        assert!(grant(1, false).is_err(), "disk pull reservation counts after ten seconds");
+        drop(hold); // Pull completed: its pages now count in MemAvailable.
+        assert!(grant(1, false).is_ok());
+        store(&path, &Vec::<(u64, u64, u64)>::new(), false).unwrap();
+        let (id, hold) = grant(charge, true).unwrap();
+        drop(hold);
+        h.refund(id); // Start failed: refund the recent grant as well as its hold.
+        assert!(grant(charge, false).is_ok());
     }
 
     #[test]

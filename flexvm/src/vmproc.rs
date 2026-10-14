@@ -103,7 +103,7 @@ pub struct Proc {
     granted: AtomicU64,
     /// The grant of this start (refunded if the VM never starts).
     charged: AtomicU64,
-    /// An arrival's grant, held until all its memory is here.
+    /// A disk restore or arrival grant, held until all its memory is here.
     held_grant: Mutex<Option<crate::host::Hold>>,
     /// A standby's (MiB held or to page in, guest size), taken while it waits, so a claim need not.
     pub sizes: Mutex<Option<(u64, u64)>>,
@@ -244,9 +244,9 @@ impl Proc {
         Ok(())
     }
 
-    /// An arrival's admission: its grant counts until all its memory is here
-    /// (`settle_arrival`) or it ends, however long the pull takes.
-    pub fn admit_arrival(&self, need: u64, floor: crate::host::Floor) -> Result<()> {
+    /// A disk restore or arrival's admission: its grant counts until all its
+    /// memory is here or it ends, however long the pull takes.
+    pub fn admit_pull(&self, need: u64, floor: crate::host::Floor) -> Result<()> {
         let mib = crate::limit::allowance(need);
         let (id, hold) = self.host.grant_held(mib, floor)?;
         self.granted.store(mib, Ordering::SeqCst);
@@ -255,12 +255,13 @@ impl Proc {
         Ok(())
     }
 
-    fn release_hold(&self) {
+    pub(crate) fn release_hold(&self) {
         drop(self.held_grant.lock().unwrap().take());
     }
 
     /// A start that did not happen gives its admission back.
     pub fn refund_start(&self) {
+        self.release_hold();
         let id = self.charged.swap(0, Ordering::SeqCst);
         self.granted.store(0, Ordering::SeqCst);
         if id > 0 {
@@ -442,12 +443,12 @@ impl Proc {
         if matches!(end, End::NotStarted) {
             self.refund_start();
         }
-        self.release_hold();
         self.drop_held_in();
         self.set_leaving(true);
         if let Some(vm) = self.vm.get() {
             vm.kill();
         }
+        self.release_hold();
         drop(self.standby.lock().unwrap().take());
         // An arrival still pulling that dies leaves its source's copy to run
         // again (see `Host::mig_status`): its address is not withdrawn.
@@ -1528,7 +1529,7 @@ fn evict(host: &Host, peers: &[String], vms: &[Entry], avail: u64, deadline: Ins
                     backoff.remove(&key);
                     let _ = crate::host::store(&backoff_path, &backoff, false);
                     eprintln!("vm {}: migrated to {peer}", vm.name);
-                    while host.entries().iter().any(|e| e.ident == vm.ident) {
+                    while host.entry(&vm.name).is_ok_and(|e| e.ident == vm.ident) {
                         if Instant::now() >= deadline {
                             return eprintln!("vm {}: its copy here still serves pages to {peer} at the eviction's deadline", vm.name);
                         }

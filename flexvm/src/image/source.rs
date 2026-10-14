@@ -24,6 +24,37 @@ pub struct Image {
     pub diff_ids: Vec<String>,
 }
 
+impl Image {
+    /// Download missing registry layers only when the derived rootfs needs building.
+    pub fn download_layers(&mut self) -> Result<()> {
+        let sources: HashMap<_, _> = self.layers.iter().filter_map(|l| match &l.src {
+            Blob::Cached { digest, .. } => Some((digest.as_str(), &l.src)),
+            _ => None,
+        }).collect();
+        let descs: Vec<_> = self.layers.iter().filter_map(|l| match &l.src {
+            Blob::Cached { digest, size, .. } => Some((digest.clone(), *size)),
+            _ => None,
+        }).collect();
+        let fresh = std::sync::Mutex::new(HashMap::new());
+        download_layers(&descs, |d, size| {
+            if let Some(Blob::Cached { blobs, registry, .. }) = sources.get(d) {
+                if !blob_path(blobs, d)?.exists() {
+                    let path = registry.as_ref().clone().blob(d, size, blobs)?;
+                    fresh.lock().unwrap().insert(d.to_string(), path);
+                }
+            }
+            Ok(())
+        })?;
+        let fresh = fresh.into_inner().unwrap();
+        for layer in &mut self.layers {
+            if let Some(path) = layer.digest.as_ref().and_then(|d| fresh.get(d)) {
+                layer.src = Blob::File(path.clone());
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Digest and size are the descriptor's; a legacy `docker save` has neither and relies on `diff_ids`.
 pub struct Layer {
     pub src: Blob,
@@ -122,7 +153,7 @@ impl Layer {
     }
 }
 
-pub fn fetch(cache: &Path, src: &str, limits: &Limits) -> Result<Image> {
+pub fn resolve(cache: &Path, src: &str, limits: &Limits) -> Result<Image> {
     let path = Path::new(src);
     let img = if path.is_dir() {
         let path = std::fs::canonicalize(path)?;
@@ -230,21 +261,8 @@ fn pull(cache: &Path, mut reg: Registry, limits: &Limits) -> Result<Image> {
         let cached = if blob_path(&blobs, d)?.exists() { " (cached)" } else { "" };
         eprintln!("image: layer {}/{} {d} {:.1} MiB{cached}", i + 1, descs.len(), *size as f64 / 1048576.0);
     }
-    // Downloads are verified as they land; cached blobs only once unpacking needs them.
-    let fresh = std::sync::Mutex::new(HashMap::new());
-    download_layers(&descs, |d, size| {
-        if !blob_path(&blobs, d)?.exists() {
-            let path = reg.clone().blob(d, size, &blobs)?;
-            fresh.lock().unwrap().insert(d.to_string(), path);
-        }
-        Ok(())
-    })?;
-    let fresh = fresh.into_inner().unwrap();
     let layers = descs.into_iter().map(|(d, size)| Layer {
-        src: match fresh.get(&d).cloned() {
-            Some(path) => Blob::File(path),
-            None => Blob::Cached { blobs: blobs.clone(), registry: Box::new(reg.clone()), digest: d.clone(), size },
-        },
+        src: Blob::Cached { blobs: blobs.clone(), registry: Box::new(reg.clone()), digest: d.clone(), size },
         digest: Some(d),
         size: Some(size),
     }).collect();
