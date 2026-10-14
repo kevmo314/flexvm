@@ -530,6 +530,10 @@ impl Daemon {
                     ck.verify_data().map_err(|e| format!("the last checkpoint of vm {}: {e}; take a full one", vm.name))?;
                     t.mark("verify_chain");
                 }
+                // A delta has about its parent's VM state: refuse it before the pause.
+                if ck.meta_left < ck.vmstate.len() as u64 {
+                    bail!("vm {}: the chain of {} has no metadata budget left; take a full one", vm.name, dir.display());
+                }
                 staging.meta_left = ck.meta_left;
                 let mut ids = vec![ck.id.clone()];
                 ids.extend(ck.chain_ids.iter().cloned());

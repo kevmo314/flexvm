@@ -148,6 +148,16 @@ fn setup_root() -> io::Result<()> {
     Ok(())
 }
 
+/// Waits for an exit without consuming it: std may still be waiting for a
+/// child whose exec failed inside spawn, while it holds our lock.
+fn exited_child() -> io::Result<i32> {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    if unsafe { libc::waitid(libc::P_ALL, 0, &mut info, libc::WEXITED | libc::WNOWAIT) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { info.si_pid() })
+}
+
 /// Reaps every child (we are PID 1, so orphans land here too) and records
 /// exit codes for the EXEC handlers waiting on them.
 fn reap(statuses: Statuses) {
@@ -159,14 +169,19 @@ fn reap(statuses: Statuses) {
         let mut pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
         if pid == 0 {
             drop(map);
-            pid = unsafe { libc::waitpid(-1, &mut status, 0) };
-            if pid < 0 {
-                match io::Error::last_os_error().raw_os_error() {
+            let exited = match exited_child() {
+                Ok(pid) => pid,
+                Err(e) => match e.raw_os_error() {
                     Some(libc::ECHILD) | Some(libc::EINTR) => continue,
                     _ => return,
-                }
-            }
+                },
+            };
             map = lock.lock().unwrap();
+            pid = unsafe { libc::waitpid(exited, &mut status, libc::WNOHANG) };
+            // spawn may already have consumed this failed-exec child.
+            if pid == 0 || (pid < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)) {
+                continue;
+            }
         }
         if pid < 0 {
             match io::Error::last_os_error().raw_os_error() {
@@ -612,6 +627,34 @@ fn request_line(r: &mut impl BufRead) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[allow(clippy::zombie_processes)] // reap() consumes children; wait_pid receives their statuses.
+    fn failed_exec_does_not_race_the_reaper() {
+        // Isolate waitpid(P_ALL) from children of the other tests.
+        const CHILD: &str = "FLEXVM_REAPER_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            assert!(Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "tests::failed_exec_does_not_race_the_reaper"])
+                .env(CHILD, "1").status().unwrap().success());
+            return;
+        }
+        let statuses: Statuses = Arc::new((Mutex::new(HashMap::new()), Condvar::new()));
+        let reaper = statuses.clone();
+        thread::spawn(move || reap(reaper));
+        let child = spawn(Command::new("/bin/sleep").arg("0.2"), &statuses, true).unwrap();
+        // Let the reaper reach its blocking wait before failed execs exit.
+        thread::sleep(Duration::from_millis(10));
+        for _ in 0..200 {
+            // A pre_exec makes std fork and reap a failed exec itself, as with the throttle cgroup.
+            let mut missing = Command::new("/flexvm/nonexistent-executable");
+            unsafe { missing.pre_exec(|| Ok(())) };
+            assert!(spawn(&mut missing, &statuses, true).is_err());
+        }
+        assert_eq!(wait_pid(&statuses, child.id() as i32), 0);
+        let child = spawn(Command::new("/bin/sh").args(["-c", "exit 7"]), &statuses, true).unwrap();
+        assert_eq!(wait_pid(&statuses, child.id() as i32), 7);
+    }
 
     #[test]
     fn backoff_grows_caps_and_resets() {

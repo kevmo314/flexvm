@@ -87,9 +87,16 @@ const UNIT: usize = 256;
 const MAX_WRITERS: usize = 12;
 /// Most bytes of VM state a checkpoint may have.
 const MAX_VMSTATE: u64 = 64 << 20;
-/// Most bytes of metadata (manifests, VM states, page maps) opening a chain
-/// may read; its pages are read lazily.
-pub const MAX_CHAIN_META: u64 = 256 << 20;
+/// Least metadata (manifests, VM states, page maps) opening a chain may read;
+/// its pages are read lazily.
+const MAX_CHAIN_META: u64 = 256 << 20;
+
+/// Most metadata opening a chain may read: it scales with the host, never
+/// with what a (possibly forged) manifest claims. A page map costs at most
+/// 36 bytes per guest page, under 1% of the guest.
+pub fn chain_meta_budget() -> u64 {
+    MAX_CHAIN_META.max(crate::util::proc_kb("/proc/meminfo", "MemTotal").unwrap_or(0) / 16)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileSum {
@@ -192,8 +199,6 @@ fn fsync_fd(fd: RawFd) -> io::Result<()> {
     check(unsafe { libc::fsync(fd) })
 }
 
-/// The files of a checkpoint, as `Staging` writes them.
-const FILES: [&str; 4] = ["vmstate", "pages", "pagemap", "manifest.json"];
 const STAGING_PREFIX: &str = ".flexvm-staging-";
 
 /// Why a commit failed.
@@ -272,7 +277,7 @@ impl Staging {
         check(unsafe { libc::mkdirat(outer.as_raw_fd(), c"ck".as_ptr(), 0o700) })?;
         let ck = open_dir_at(outer.as_raw_fd(), c"ck")?;
         let _ = std::fs::remove_file(&vmstate);
-        Ok(Staging { dest, parent: pfd, base, outer, outer_name, ck, vmstate, pages: None, published: false, meta_left: MAX_CHAIN_META })
+        Ok(Staging { dest, parent: pfd, base, outer, outer_name, ck, vmstate, pages: None, published: false, meta_left: chain_meta_budget() })
     }
 
     pub fn dest(&self) -> &Path {
@@ -373,7 +378,11 @@ impl Staging {
         let mut text = format!("{id}\n").into_bytes();
         text.extend_from_slice(&body);
         if (text.len() + vmstate.len() + map.len()) as u64 > self.meta_left {
-            return Err(CommitError::Failed(format!("its chain would have more than {MAX_CHAIN_META} bytes of metadata; take a full one").into()));
+            let budget = chain_meta_budget();
+            return Err(CommitError::Failed(match manifest.parent {
+                Some(_) => format!("its chain would have more than {budget} bytes of metadata; take a full one"),
+                None => format!("it would have more than {budget} bytes of metadata"),
+            }.into()));
         }
         let mf = self.create("manifest.json")?;
         (&mf).write_all(&text)?;
@@ -422,10 +431,7 @@ impl Staging {
 impl Drop for Staging {
     fn drop(&mut self) {
         if !self.published {
-            for f in FILES {
-                unsafe { libc::unlinkat(self.ck.as_raw_fd(), cname(f).as_ptr(), 0) };
-            }
-            unsafe { libc::unlinkat(self.outer.as_raw_fd(), c"ck".as_ptr(), libc::AT_REMOVEDIR) };
+            remove_ck(&self.outer, &self.ck);
         }
         // Empty now; if someone swapped another directory in under its name,
         // removing that only works if it is empty too.
@@ -445,6 +451,14 @@ fn exists_at(dir: RawFd, name: &CStr) -> bool {
     unsafe { libc::fstatat(dir, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) == 0 }
 }
 
+/// Removes `ck` from `outer`, with every file in it (only we write there).
+fn remove_ck(outer: &OwnedFd, ck: &OwnedFd) {
+    for f in std::fs::read_dir(format!("/proc/self/fd/{}", ck.as_raw_fd())).into_iter().flatten().flatten() {
+        unsafe { libc::unlinkat(ck.as_raw_fd(), cname(&f.file_name().to_string_lossy()).as_ptr(), 0) };
+    }
+    unsafe { libc::unlinkat(outer.as_raw_fd(), c"ck".as_ptr(), libc::AT_REMOVEDIR) };
+}
+
 /// Removes staging directories of daemons that are gone: only directories
 /// this user owns and nobody else may enter, as `Staging::new` makes them.
 fn clear_stale(parent: &OwnedFd) {
@@ -462,11 +476,8 @@ fn clear_stale(parent: &OwnedFd) {
             _ => continue,
         }
         if let Ok(ck) = open_dir_at(outer.as_raw_fd(), c"ck") {
-            for f in FILES {
-                unsafe { libc::unlinkat(ck.as_raw_fd(), cname(f).as_ptr(), 0) };
-            }
+            remove_ck(&outer, &ck);
         }
-        unsafe { libc::unlinkat(outer.as_raw_fd(), c"ck".as_ptr(), libc::AT_REMOVEDIR) };
         unsafe { libc::unlinkat(parent.as_raw_fd(), cname(&name).as_ptr(), libc::AT_REMOVEDIR) };
     }
 }
@@ -863,7 +874,7 @@ impl Link {
             bail!("{}", bad("vmstate or pagemap is too long".into()));
         }
         let cost = (text.len() as u64 + len("vmstate")).saturating_add(len("pagemap"));
-        *meta_left = meta_left.checked_sub(cost).ok_or_else(|| bad(format!("its chain has more than {MAX_CHAIN_META} bytes of metadata")))?;
+        *meta_left = meta_left.checked_sub(cost).ok_or_else(|| bad(format!("its chain has more than {} bytes of metadata", chain_meta_budget())))?;
         let read_checked = |name: &str| -> Result<Vec<u8>> {
             let want = manifest.files.get(name).ok_or_else(|| bad(format!("manifest lists no {name}")))?;
             let (_, bytes) = read_at(dfd.as_raw_fd(), name, want.len + 1).map_err(|e| bad(format!("{name}: {e}")))?;
@@ -932,7 +943,7 @@ impl Checkpoint {
     /// delta against, and verifies everything but the page data itself,
     /// which is checked page by page as it is read.
     pub fn open(dir: &Path) -> Result<Checkpoint> {
-        let mut meta_left = MAX_CHAIN_META;
+        let mut meta_left = chain_meta_budget();
         let top = Link::open(dir, &mut meta_left)?;
         let mut links = vec![top];
         while let Some(parent) = links.last().unwrap().manifest.parent.clone() {
@@ -1283,7 +1294,7 @@ mod tests {
         let top = dir.join("ck2");
         let ck = Checkpoint::open(&top).unwrap();
         assert_eq!(ck.chain.len(), 2);
-        let cost = MAX_CHAIN_META - ck.meta_left;
+        let cost = chain_meta_budget() - ck.meta_left;
         let mut left = cost;
         Link::open(&top, &mut left).unwrap();
         // The base is refused once the budget runs out.
@@ -1567,6 +1578,7 @@ mod tests {
         let stale = dir.join(format!("{STAGING_PREFIX}999999999-1"));
         std::fs::create_dir_all(stale.join("ck")).unwrap();
         std::fs::write(stale.join("ck/pages"), b"x").unwrap();
+        std::fs::write(stale.join("ck/GEN"), b"generation").unwrap();
         std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o700)).unwrap();
         let foreign = dir.join(format!("{STAGING_PREFIX}999999998-1"));
         std::fs::create_dir_all(&foreign).unwrap();
@@ -1585,12 +1597,12 @@ mod tests {
         let f = s.create("pages").unwrap();
         drop(f);
         assert!(s.create("pages").is_err());
-        let ck = s.ck.as_raw_fd();
         symlink("/etc/hostname", dir.join("link")).unwrap();
         let pfd = s.parent.as_raw_fd();
         assert!(create_at(pfd, "link").is_err());
         assert!(open_at(pfd, "link").is_err());
-        assert!(create_at(ck, "pagemap").is_ok());
+        assert!(s.create("pagemap").is_ok());
+        s.add_file("GEN", b"generation").unwrap();
         drop(s);
         assert!(!dest.exists());
         assert!(std::fs::read_dir(&dir).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().contains(&std::process::id().to_string())));

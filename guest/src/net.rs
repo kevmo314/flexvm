@@ -148,9 +148,13 @@ fn update_address(
     mut request: impl FnMut(u16, Ipv4Addr) -> io::Result<()>,
 ) -> io::Result<()> {
     request(libc::RTM_NEWADDR, ip)?;
-    match address.replace(ip).filter(|old| *old != ip).map(|old| request(libc::RTM_DELADDR, old)) {
+    // Keep the old address until it is gone, so a failed delete is retried.
+    match address.filter(|old| *old != ip).map(|old| request(libc::RTM_DELADDR, old)) {
         Some(Err(e)) if e.raw_os_error() != Some(libc::EADDRNOTAVAIL) => Err(e),
-        _ => Ok(()),
+        _ => {
+            *address = Some(ip);
+            Ok(())
+        }
     }
 }
 
@@ -241,6 +245,15 @@ mod tests {
         // A failed add keeps the old address; one already gone is not an error.
         assert!(update_address(&mut address, old, |_, _| Err(io::Error::other("add failed"))).is_err());
         assert_eq!(address, Some(new));
+        // A failed delete must remain retryable on the next configure.
+        assert!(update_address(&mut address, old, |kind, _| {
+            if kind == libc::RTM_DELADDR { Err(io::Error::from_raw_os_error(libc::EPERM)) } else { Ok(()) }
+        }).is_err());
+        assert_eq!(address, Some(new));
+        let mut retry = Vec::new();
+        update_address(&mut address, old, |kind, ip| { retry.push((kind, ip)); Ok(()) }).unwrap();
+        assert_eq!(retry, vec![(libc::RTM_NEWADDR, old), (libc::RTM_DELADDR, new)]);
+        address = Some(new);
         let gone = |kind, _| if kind == libc::RTM_DELADDR { Err(io::Error::from_raw_os_error(libc::EADDRNOTAVAIL)) } else { Ok(()) };
         update_address(&mut address, old, gone).unwrap();
         assert_eq!(address, Some(old));
