@@ -83,6 +83,8 @@ pub struct Cow {
     stopped: AtomicBool,
     error: Mutex<Option<String>>,
     started: Instant,
+    /// The pages to save, as `[first, end)` runs.
+    runs: Vec<(usize, usize)>,
     pub stats: Stats,
 }
 
@@ -111,8 +113,14 @@ impl Cow {
             stopped: AtomicBool::new(false),
             error: Mutex::new(None),
             started: Instant::now(),
+            runs: runs.iter().filter(|r| r.2 == REMOTE).map(|r| (r.0 as usize, (r.0 + r.1) as usize)).collect(),
             stats: Stats::default(),
         }
+    }
+
+    /// The pages to save, as `[first, end)` runs.
+    pub fn runs(&self) -> &[(usize, usize)] {
+        &self.runs
     }
 
     pub fn state(&self, page: usize) -> u8 {

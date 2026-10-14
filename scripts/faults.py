@@ -87,7 +87,7 @@ def fault(host, f, ms):
 FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_before_run", "restore_after_run",
           "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "ckpt_crawl", "resume_kill",
           "prepare_fail", "short_incoming", "slow_preload", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
-          "hot_low_estimate", "started_fsync", "started_unmark")
+          "hot_low_estimate", "started_fsync", "started_unmark", "ckpt_wp_race", "fetch_tail_enomem", "fetch_enomem_stuck")
 
 
 def disarm():
@@ -122,6 +122,7 @@ def check(label, cond, detail=""):
     global failures
     print(("PASS " if cond else "FAIL ") + label + (f"  [{detail}]" if detail else ""), flush=True)
     failures += not cond
+    return cond
 
 
 def proc(pid, what):
@@ -1562,6 +1563,79 @@ def ckpt_incremental():
 
 
 
+def cow_wp_race():
+    """#88: a write fault on a page that a checkpoint writer claims while
+    the fault is being handled is retried once the page is saved, not
+    dropped (which left the vCPU asleep for good). With the window widened
+    (ckpt_wp_race), keep-running checkpoints of a guest rewriting its memory
+    must leave every writer thread making progress."""
+    n = "ft-wprace"
+    ok(A, {"op": "run", "name": n, "template": args.template})
+    start_writer(A, n, mib=64, threads=2)
+    fault(A, "ckpt_wp_race", 600000)
+    for i in range(8):
+        path = ckpt_path(f"ft-wprace{i}")
+        r = rpc(A, {"op": "checkpoint", "name": n, "dir": path}, timeout=120)
+        rm_ckpt(path)
+        check(f"wp race {i}: checkpoint written", r.get("ok"), r)
+        if not r.get("ok"):
+            break
+        _, k0, _ = writer_check(A, n)
+        time.sleep(0.5)
+        errors, k1, out = writer_check(A, n)
+        print(f"wp race {i}: paused {r['result']['paused_ms']} ms, copy {r['result']['copy']}")
+        if not check(f"wp race {i}: every writer thread still runs, memory intact", errors == 0 and k1 > k0, (k0, k1, out)):
+            break
+    fault(A, "ckpt_wp_race", 0)
+    cleanup(n)
+
+
+def fetch_tail_enomem():
+    """A run fetched for a fault whose tail fails to install (a transient
+    error, after its first page went in and the pullers passed it) is
+    fetched again rather than left REMOTE: the pull completes and the
+    source lets go."""
+    n = "ft-tail"
+    m = setup(n, mib=200)
+    fault(B, "fetch_tail_enomem", 60000)
+    ok(A, {"op": "migrate", "name": n, "to": B})
+    check("tail: memory intact after the migration", md5(B, n) == m)
+    st = wait_released(B, n, 30)
+    check("tail: every page arrives and the source lets go",
+          st["released"] is True and st["background_pull_ms"] is not None and st["failed"] is None, st)
+    fault(B, "fetch_tail_enomem", 0)
+    cleanup(n)
+
+
+def fetch_enomem_stuck():
+    """Pages a fault needs that keep failing to install (ENOMEM on every
+    copy, the pullers held off) make the target give up within the fault
+    deadline and report the VM failed, however the pages get claimed again
+    (by the waiting fault or by the requeue), instead of leaving the vCPU
+    blocked for good."""
+    n = "ft-stuck"
+    setup(n, mib=400)
+    fault(B, "fetch_enomem_stuck", 60000)
+    ok(A, {"op": "migrate", "name": n, "to": B})
+    t0 = time.time()
+    threading.Thread(target=lambda: sh(B, n, "md5sum /tmp/f"), daemon=True).start()
+    st = {}
+
+    def failed():
+        st.update(rpc(B, {"op": "migration_status", "name": n}).get("result") or {})
+        return st.get("state") == "failed"
+
+    gave_up = wait_for(failed, 20)
+    took = time.time() - t0
+    fault(B, "fetch_enomem_stuck", 0)
+    check(f"stuck: target gave up ({took:.1f} s) and reports the vm failed", gave_up and "installing pages" in (st.get("failed") or ""),
+          {k: st.get(k) for k in ("state", "failed", "released")})
+    # Copies fail from 0.5 s after the target took the VM on, and the fault
+    # deadline is 1 s: nothing (a stalled fetch, a requeue) may stretch it.
+    check("stuck: within the fault deadline (< 3 s)", gave_up and took < 3, f"{took:.1f} s")
+    cleanup(n)
+
+
 def cow_reports_held():
     """Exercise Firecracker's report hold and the pager's REMOVE fallback
     with disk writers gated until the guest has freed memory."""
@@ -2387,7 +2461,7 @@ SCENARIOS = dict(plug_race=plug_race, plug_storm=plug_storm, cow_grow=cow_grow, 
                  suspend_resume=suspend_resume, checkpoint_hotplug=checkpoint_hotplug,
                  checkpoint_untrusted_dir=checkpoint_untrusted_dir, resume_failures=resume_failures,
                  state_dir_lock=state_dir_lock, held_restore_frozen=held_restore_frozen,
-                 cow_exact=cow_exact, cow_abort=cow_abort, cow_crash=cow_crash, cow_reports_held=cow_reports_held, ckpt_incremental=ckpt_incremental,
+                 cow_exact=cow_exact, cow_abort=cow_abort, cow_crash=cow_crash, cow_reports_held=cow_reports_held, cow_wp_race=cow_wp_race, fetch_tail_enomem=fetch_tail_enomem, fetch_enomem_stuck=fetch_enomem_stuck, ckpt_incremental=ckpt_incremental,
                  ckpt_failed_stop=ckpt_failed_stop, ckpt_rearm=ckpt_rearm,
                  ckpt_dir_moved=ckpt_dir_moved, prepare_disconnect=prepare_disconnect,
                  prepare_trickle=prepare_trickle, prepare_fail=prepare_fail, fc_prepare=fc_prepare,

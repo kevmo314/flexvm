@@ -43,7 +43,8 @@ const RELEASE_LOCAL: Duration = Duration::from_millis(100);
 const FAULTS: &[&str] = &[
     "pages", "route", "lost_ack", "status", "prepare_fail", "short_incoming", "slow_preload",
     "restore_no_hold", "restore_before_run", "restore_after_run", "ckpt_memhash", "ckpt_fail_protect",
-    "ckpt_no_hold", "ckpt_abort", "ckpt_slow", "ckpt_crawl", "ckpt_fail_write", "ckpt_copy_wait", "resume_kill", "kill_prepared",
+    "ckpt_no_hold", "ckpt_abort", "ckpt_slow", "ckpt_crawl", "ckpt_fail_write", "ckpt_copy_wait", "ckpt_wp_race", "resume_kill",
+    "kill_prepared", "fetch_tail_enomem", "fetch_enomem_stuck",
     "guest_drop", "guest_lose_reply", "hot_low_estimate", "started_fsync", "started_unmark",
 ];
 
@@ -753,6 +754,9 @@ impl Daemon {
                     "released": vm.released.get(),
                     "state": vm.state().name(),
                     "failed": vm.pager.failed(),
+                    "faults": vm.pager.fault_stats.report(),
+                    "discards": vm.pager.discards(),
+                    "install_eagain": vm.pager.install_eagain(),
                 })
             }),
             _ => Err(format!("unknown op {op:?}").into()),
@@ -2238,6 +2242,13 @@ impl Daemon {
             // the retry below takes over.
             prepared.kill_firecracker();
             prepared.pager.firecracker_gone();
+        }
+        if self.fault("fetch_tail_enomem") {
+            prepared.pager.tail_fail.store(1, Ordering::SeqCst);
+        }
+        if self.fault("fetch_enomem_stuck") {
+            // Late enough for the load (and the resume) to get their pages.
+            *prepared.pager.stuck_from.lock().unwrap() = Some(Instant::now() + Duration::from_millis(500));
         }
         prepared.pager.seed(runs, Origin::Peer(source.clone()))?;
         // A prepared load connected the pager long ago; it may have given up

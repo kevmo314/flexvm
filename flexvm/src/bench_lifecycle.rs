@@ -22,6 +22,7 @@ pub fn run(host: &str, args: &Args, dir: &str) -> Result<()> {
         .split(',')
         .map(|s| s.trim().parse().map_err(|_| format!("bad --dirty-mib {s:?}")))
         .collect::<std::result::Result<_, _>>()?;
+    let scatter = args.num("scatter-pages", 0)?;
     let timeout = Duration::from_secs(args.num("timeout", 300)?.max(1));
     let dir = std::path::absolute(dir)?;
     std::fs::create_dir_all(&dir)?;
@@ -34,16 +35,19 @@ pub fn run(host: &str, args: &Args, dir: &str) -> Result<()> {
         for i in 0..iterations {
             let name = format!("lcbench-{}-{mib}-{i}", std::process::id());
             let ck = dir.join(&name);
-            let res = trial(&rpc, host, &to, &name, template, mib, &ck);
+            let res = trial(&rpc, host, &to, &name, template, mib, scatter, &ck);
             for h in [host, to.as_str()] {
                 let _ = rpc(h, json!({"op": "kill", "name": name}));
             }
-            let _ = std::fs::remove_dir_all(&ck);
+            for d in ["", "-cow0", "-cow1", "-cow2"] {
+                let _ = std::fs::remove_dir_all(format!("{}{d}", ck.display()));
+            }
             samples.push(res.map_err(|e| format!("{mib} MiB, trial {}: {e}", i + 1))?);
             eprintln!("bench: {mib} MiB {}/{iterations}", i + 1);
         }
         let mut s = Map::new();
-        for group in ["pause", "checkpoint", "restore", "suspend", "resume_suspended"] {
+        let cow = (scatter > 0).then_some("cow");
+        for group in ["pause", "checkpoint", "restore", "suspend", "resume_suspended"].into_iter().chain(cow) {
             s.insert(group.into(), summarize(&samples, group)?);
         }
         summary.insert(format!("{mib}_mib"), s.into());
@@ -54,7 +58,7 @@ pub fn run(host: &str, args: &Args, dir: &str) -> Result<()> {
         "date_utc": date,
         "git_sha": sha,
         "git_dirty": !command("git", &["status", "--porcelain"])?.is_empty(),
-        "params": {"host": host, "to": to, "template": template, "iterations": iterations, "dirty_mib": sizes},
+        "params": {"host": host, "to": to, "template": template, "iterations": iterations, "dirty_mib": sizes, "scatter_pages": scatter},
         "host_context": rpc(host, json!({"op": "bench_info", "template": template}))?,
         "summary_ms": summary,
         "samples_ms": all,
@@ -68,7 +72,11 @@ pub fn run(host: &str, args: &Args, dir: &str) -> Result<()> {
 }
 
 /// One VM with `mib` MiB written to its /tmp: ten pause/resume cycles,
-/// checkpoint --stop, restore on `to`, then suspend and resume there.
+/// checkpoint --stop, restore on `to`, then suspend and resume there. With
+/// `scatter` pages, keep-running checkpoints first: one that arms write
+/// tracking, one with nothing written since, and one after the guest
+/// rewrote `scatter` pages spread evenly over /tmp/f.
+#[allow(clippy::too_many_arguments)]
 fn trial(
     rpc: &dyn Fn(&str, Value) -> Result<Value>,
     host: &str,
@@ -76,11 +84,39 @@ fn trial(
     name: &str,
     template: &str,
     mib: u64,
+    scatter: u64,
     ck: &Path,
 ) -> Result<Value> {
     rpc(host, json!({"op": "run", "name": name, "template": template}))?;
     if mib > 0 && crate::exec(host, name, &format!("dd if=/dev/urandom of=/tmp/f bs=1M count={mib} 2>/dev/null"))? != 0 {
         bail!("dirtying guest memory failed");
+    }
+    let mut cow = Map::new();
+    if scatter > 0 {
+        if mib == 0 {
+            bail!("--scatter-pages needs a nonzero --dirty-mib");
+        }
+        let checkpoint = |sub: &str, incremental: bool| {
+            let dir = format!("{}-{sub}", ck.display());
+            rpc(host, json!({"op": "checkpoint", "name": name, "dir": dir, "incremental": incremental}))
+        };
+        cow.insert("arm_paused".into(), checkpoint("cow0", false)?["paused_ms"].clone());
+        let idle = checkpoint("cow1", true)?;
+        cow.insert("idle_paused".into(), idle["paused_ms"].clone());
+        cow.insert("idle_protect".into(), idle["protect"]["ms"].clone());
+        let stride = (mib * 256 / scatter).max(1);
+        let cmd = format!(
+            "i=0; while [ $i -lt {scatter} ]; do dd if=/dev/zero of=/tmp/f bs=4096 count=1 seek=$((i * {stride})) conv=notrunc 2>/dev/null; i=$((i + 1)); done"
+        );
+        if crate::exec(host, name, &cmd)? != 0 {
+            bail!("scattered writes failed");
+        }
+        let s = checkpoint("cow2", true)?;
+        cow.insert("scatter_paused".into(), s["paused_ms"].clone());
+        cow.insert("scatter_protect".into(), s["protect"]["ms"].clone());
+        cow.insert("scatter_ranges".into(), s["protect"]["ranges"].clone());
+        cow.insert("scatter_dirty_mib".into(), s["dirty_mib"].clone());
+        cow.insert("scatter_checkpoint".into(), s["checkpoint_ms"].clone());
     }
     let mut pause = Map::new();
     let (mut p, mut r, mut rtt) = (Vec::new(), Vec::new(), Vec::new());
@@ -116,7 +152,7 @@ fn trial(
     let mut resume_suspended = rr["timings_ms"].clone();
     resume_suspended["ready"] = rr["ready_ms"].clone();
     resume_suspended["pull"] = wait_pull(rpc, to, name)?;
-    Ok(json!({"pause": pause, "checkpoint": checkpoint, "restore": restore, "suspend": suspend, "resume_suspended": resume_suspended}))
+    Ok(json!({"pause": pause, "checkpoint": checkpoint, "restore": restore, "suspend": suspend, "resume_suspended": resume_suspended, "cow": cow}))
 }
 
 /// Waits for a restored VM to have paged in its whole checkpoint; returns how long that took (ms).
