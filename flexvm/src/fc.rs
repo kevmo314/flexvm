@@ -527,7 +527,12 @@ mod tests {
     fn api_reconnects_after_unsent_write_on_closed_connection() {
         let (closed, wait) = std::sync::mpsc::channel();
         let server = Server::new(move |listener| {
-            answer(&mut accept(&listener), NO_CONTENT);
+            let mut r = accept(&listener);
+            answer(&mut r, NO_CONTENT);
+            // Shut down, not only dropped: a child another test forks meanwhile shares the socket until it execs,
+            // and the connection would stay open for that long.
+            r.get_ref().shutdown(std::net::Shutdown::Both).unwrap();
+            drop(r);
             closed.send(()).unwrap();
             answer(&mut accept(&listener), NO_CONTENT);
         });
