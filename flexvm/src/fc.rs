@@ -158,7 +158,9 @@ impl Api {
         );
         // A cached connection Firecracker closed fails before a byte goes out: one fresh retry.
         loop {
-            let cached = self.connection.borrow_mut().take();
+            // Anything readable on an idle connection (stray bytes, or the close
+            // of a Firecracker that died) means it is never used again (#109).
+            let cached = self.connection.borrow_mut().take().filter(|r| !readable(&r.get_ref().s));
             let reused = cached.is_some();
             let mut r = match cached {
                 Some(mut r) => {
@@ -216,7 +218,9 @@ fn exchange(r: &mut BufReader<crate::util::By<UnixStream>>, mut req: &[u8], sent
         }
     }
     let mut status = String::new();
-    r.read_line(&mut status)?;
+    if r.read_line(&mut status)? == 0 {
+        bail!("firecracker closed the connection without answering");
+    }
     let code: u16 = status.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
     if code == 0 || !status.ends_with("\r\n") {
         bail!("firecracker: invalid response status");
@@ -259,6 +263,12 @@ fn exchange(r: &mut BufReader<crate::util::By<UnixStream>>, mut req: &[u8], sent
     let mut buf = vec![0; len];
     r.read_exact(&mut buf)?;
     Ok((code, buf, close))
+}
+
+fn readable(s: &UnixStream) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut p = libc::pollfd { fd: s.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+    unsafe { libc::poll(&mut p, 1, 0) != 0 }
 }
 
 /// At most the last 64 KiB, without the first partial line.
@@ -484,6 +494,22 @@ mod tests {
             assert!(api.connection.borrow().is_none());
             assert_eq!(call(&api, &server.path).unwrap(), want);
         }
+    }
+
+    #[test]
+    fn api_never_reads_bytes_that_arrive_on_an_idle_connection() {
+        let (stray, wait) = std::sync::mpsc::channel();
+        let server = Server::new(move |listener| {
+            let mut r = accept(&listener);
+            answer(&mut r, NO_CONTENT);
+            r.get_mut().write_all(b"HTTP/1.1 500 Late\r\n\r\n").unwrap();
+            stray.send(()).unwrap();
+            answer(&mut accept(&listener), b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n3");
+        });
+        let api = Api::default();
+        call(&api, &server.path).unwrap();
+        wait.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(call(&api, &server.path).unwrap(), serde_json::json!(3));
     }
 
     #[test]
