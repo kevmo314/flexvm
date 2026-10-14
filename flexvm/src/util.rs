@@ -321,8 +321,7 @@ pub fn write_file(dir: &Path, name: &str, data: &[u8], durable: bool) -> io::Res
     }
 }
 
-/// Fsyncs every parent each time: a crash may have lost an entry made before, or another
-/// process made it without syncing.
+/// Fsyncs the parent of each directory created.
 pub fn create_dir_durably(dir: &std::path::Path) -> io::Result<()> {
     create_dir_durably_mode(dir, 0o777)
 }
@@ -336,10 +335,10 @@ pub fn create_dir_durably_mode(dir: &std::path::Path, mode: u32) -> io::Result<(
         let parent = path.clone();
         path.push(part);
         match std::fs::DirBuilder::new().mode(mode).create(&path) {
-            Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(named(&path, "creating", e)),
-            _ => {}
+            Ok(()) => sync_dir(&parent)?,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(named(&path, "creating", e)),
         }
-        sync_dir(&parent)?;
     }
     Ok(())
 }
