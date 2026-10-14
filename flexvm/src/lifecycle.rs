@@ -272,6 +272,7 @@ impl Proc {
         let ck = Checkpoint::open(&dir)?;
         let cmd = read_cmd(&dir).map_err(|e| format!("vm {name}: its command's record {}: {e}", dir.join(CMD).display()))?;
         t.mark("verify_checkpoint");
+        let tpl = self.admit_checkpoint(&ck, &mut t)?;
         let ip = ck.manifest.ip;
         let claim = {
             let l = self.host.lock()?;
@@ -283,7 +284,7 @@ impl Proc {
         self.set_addr(claim);
         // Before it is published: eviction leaves a CMD VM alone.
         *self.cmd.lock().unwrap() = cmd.as_ref().map(|(c, _)| c.clone());
-        match self.restore_checkpoint(name, ck, ip, true, false, &mut t) {
+        match self.restore_checkpoint(name, ck, tpl, ip, true, false, &mut t) {
             Ok(mut v) => {
                 v["from"] = json!("suspended");
                 // Its command runs on in the guest: the process reattaches it and ends with it.
@@ -318,6 +319,7 @@ impl Proc {
         t.mark("verify_checkpoint");
         let name = name.unwrap_or(&ck.manifest.name).to_string();
         self.set_name(self.host.take_name(&name, false)?);
+        let tpl = self.admit_checkpoint(&ck, &mut t)?;
         let want = match ip {
             Some("auto") => None,
             Some(ip) => Some(ip.parse().map_err(|_| format!("bad address {ip:?}"))?),
@@ -329,20 +331,27 @@ impl Proc {
         };
         let ip = self.set_addr(claim);
         t.mark("claim_ip");
-        self.restore_checkpoint(&name, ck, ip, false, paused, &mut t).map_err(|(Restore::NotRun(e) | Restore::Ran(e) | Restore::Uncertain(e))| e)
+        self.restore_checkpoint(&name, ck, tpl, ip, false, paused, &mut t).map_err(|(Restore::NotRun(e) | Restore::Ran(e) | Restore::Uncertain(e))| e)
+    }
+
+    /// Its template, once the restore is admitted: before any address is
+    /// claimed or borrowed, so a refusal leaves nothing to give back.
+    fn admit_checkpoint(&self, ck: &Checkpoint, t: &mut Phases) -> Result<Arc<Template>> {
+        let tpl = Template::open_id(&self.paths, &ck.manifest.template, &ck.manifest.template_id)?;
+        t.mark("verify_template");
+        // The template's working set is prefetched too.
+        self.admit_start(tpl.working_set_mib() + ((ck.data_pages() * PAGE_SIZE as u64) >> 20), 0, crate::host::Floor::Reserve)?;
+        Ok(tpl)
     }
 
     /// An `owned` (suspended) checkpoint is durably marked STARTED before the
     /// VM runs and deleted once not needed. `hold`: left paused until SIGCONT.
-    fn restore_checkpoint(&self, name: &str, ck: Checkpoint, ip: Ipv4Addr, owned: bool, hold: bool, t: &mut Phases) -> std::result::Result<Value, Restore> {
+    #[allow(clippy::too_many_arguments)]
+    fn restore_checkpoint(&self, name: &str, ck: Checkpoint, tpl: Arc<Template>, ip: Ipv4Addr, owned: bool, hold: bool, t: &mut Phases) -> std::result::Result<Value, Restore> {
         let m = ck.manifest.clone();
         let to_load = (ck.data_pages() * PAGE_SIZE as u64) >> 20;
         self.app_log.store(m.app_log, Ordering::SeqCst);
         let (vm, restore) = (|| -> Result<_> {
-            let tpl = Template::open_id(&self.paths, &m.template, &m.template_id)?;
-            t.mark("verify_template");
-            // The template's working set is prefetched too.
-            self.admit_start(tpl.working_set_mib() + to_load, 0, crate::host::Floor::Reserve)?;
             let seed = Some((ck.runs, Origin::File(ck.file)));
             let prepared = Vm::prepare(self.spawner.take(None)?, tpl, t)?;
             prepared.load(&self.spawner, name, Snapshot::Bytes(&ck.vmstate), seed, ip, !(hold && fault("restore_no_hold")), None, || Ok(()), t)
@@ -532,8 +541,11 @@ impl Proc {
             Err(r) => format!("{e}; {r}").into(),
         })?;
         // What of the app log was passed on while paused: a restore follows on from there.
-        // A VM running on writes more, which its ring at the snapshot does not have.
-        staging.app_log = self.app_log_written(false).0;
+        // A VM running on writes more, which its ring at the snapshot does not have
+        // (one staying paused counts it below, holding the reader).
+        if cow {
+            staging.app_log = self.app_log_written(false).0;
+        }
         let (mut pause, mut growth) = (None, None);
         // Hold free page reports during the copy (discarding an unsaved page
         // would stall the guest). Guard first: a lost answer may still apply.

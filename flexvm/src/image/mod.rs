@@ -373,20 +373,35 @@ fn build_rootfs(staging: &Path, img: &source::Image, app: &App, init: &[u8], des
     let cname = cpath(Path::new(&name))?;
     // Everything relative to the staging fd, never through its path again.
     unpack::remove_at(staging.as_raw_fd(), &cname, 0)?;
-    check(unsafe { libc::mkdirat(staging.as_raw_fd(), cname.as_ptr(), 0o755) }, "mkdir", Path::new(&name))?;
-    let res = (|| {
-        let work = unpack::open_dir_at(staging.as_raw_fd(), &cname)?;
-        // mkdirat applied the umask.
-        check(unsafe { libc::fchmod(work.as_raw_fd(), 0o755) }, "chmod", Path::new(&name))?;
-        let path = PathBuf::from(format!("/proc/{}/fd/{}/{name}", std::process::id(), staging.as_raw_fd()));
-        let mut root = Root::from_fd(work, *limits);
-        unpack_layers(&mut root, img)?;
-        let conf = inject(&mut root, app, init)?;
-        mkfs(&path, root.entries, dest)?;
-        Ok(conf)
-    })();
-    let _ = unpack::remove_at(staging.as_raw_fd(), &cname, 0);
-    res
+    let attempt = || {
+        check(unsafe { libc::mkdirat(staging.as_raw_fd(), cname.as_ptr(), 0o755) }, "mkdir", Path::new(&name))?;
+        let res = (|| {
+            let work = unpack::open_dir_at(staging.as_raw_fd(), &cname)?;
+            // mkdirat applied the umask.
+            check(unsafe { libc::fchmod(work.as_raw_fd(), 0o755) }, "chmod", Path::new(&name))?;
+            let path = PathBuf::from(format!("/proc/{}/fd/{}/{name}", std::process::id(), staging.as_raw_fd()));
+            let mut root = Root::from_fd(work, *limits);
+            unpack_layers(&mut root, img)?;
+            let conf = inject(&mut root, app, init)?;
+            mkfs(&path, root.entries, dest)?;
+            Ok(conf)
+        })();
+        let _ = unpack::remove_at(staging.as_raw_fd(), &cname, 0);
+        res
+    };
+    // Cached blobs are read once, as they are unpacked: one found corrupt is
+    // evicted, and the unpack starts over with it downloaded (and checked)
+    // again; at most once per layer, however many turn out corrupt.
+    let mut tries = img.layers.len();
+    loop {
+        match attempt() {
+            Err(e) if tries > 0 && img.layers.iter().any(|l| l.src.evicted()) => {
+                eprintln!("image: {e}; downloading it again");
+                tries -= 1;
+            }
+            res => return res,
+        }
+    }
 }
 
 /// Checks each blob against its descriptor and its contents against the config's diff_ids.

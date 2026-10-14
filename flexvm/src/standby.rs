@@ -149,7 +149,7 @@ fn refill_by(host: &Host, template: &str, wait: bool) -> Result<usize> {
     let log = std::fs::OpenOptions::new().create(true).append(true).open(d.join("standby.log"))?;
     let args = [host.state.as_os_str(), host.run.as_os_str(), template.as_ref()];
     for _ in 0..want {
-        if !host.admit(256) {
+        if !host.admit(256)? {
             break;
         }
         let (r, w) = std::os::unix::net::UnixStream::pair()?;
@@ -286,16 +286,16 @@ fn claim(p: &Arc<Proc>, req: &Value) -> std::result::Result<Value, (Error, bool)
     };
     let mut t = Phases::new();
     let lock = host.take_name(name, false).map_err(|e| (e, false))?;
-    let claim = host.lock().and_then(|l| host.claim_new(&l, name, want)).map_err(|e| (e, false))?;
-    t.mark("claim_ip");
-    // Its memory is already out of MemAvailable: only the step is charged.
-    let held = p.standby.lock().unwrap().as_ref().and_then(|s| crate::util::proc_kb(&format!("/proc/{}/status", s.firecracker().pid()), "VmRSS"));
-    let held = held.unwrap_or(0) >> 20;
+    // Its memory is already out of MemAvailable: only the step is charged. Sized
+    // as it was loaded (`serve`), and admitted before the address is claimed.
+    let held = p.sizes.lock().unwrap().map_or(0, |(held, _)| held);
     p.admit_start(held, held, crate::host::Floor::Reserve).map_err(|e| (e, true))?;
     let not_run = |e: Error, retry: bool| {
         p.refund_start();
         (e, retry)
     };
+    let claim = host.lock().and_then(|l| host.claim_new(&l, name, want)).map_err(|e| not_run(e, false))?;
+    t.mark("claim_ip");
     let still = host.fence(claim.ip, claim.gen).map_err(|e| not_run(e, false))?;
     let paused = p.standby.lock().unwrap().take().ok_or_else(|| not_run("standby vm gone".into(), true))?;
     let vm = resume(paused, name, claim.ip, fault("resume_kill"), &mut t).map_err(|(e, ran)| {

@@ -121,9 +121,17 @@ impl Limit {
             return true;
         }
         // Admitted without `mark` held; another raise meanwhile only adds to it.
-        let Some(id) = host.grant(more) else {
-            self.throttled.store(true, Ordering::SeqCst);
-            return false;
+        // An error is no refusal: the mark stays, and the VM is not throttled for it.
+        let id = match host.grant(more) {
+            Ok(Some(id)) => id,
+            Ok(None) => {
+                self.throttled.store(true, Ordering::SeqCst);
+                return false;
+            }
+            Err(e) => {
+                eprintln!("admitting {more} MiB: {e}");
+                return false;
+            }
         };
         let mut m = self.mark.lock().unwrap();
         // Lifted meanwhile (a migration or checkpoint pauses it): nothing to raise, the grant goes back.

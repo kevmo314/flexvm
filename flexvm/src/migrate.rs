@@ -193,6 +193,8 @@ impl Proc {
             "source": source,
             "source_ident": crate::host::Ident::me(),
             "rss_mib": vm.rss() >> 20,
+            // Settled: the arrival's memory mark is sized by it without asking its Firecracker.
+            "plugged_mib": vm.hotplug_plugged(),
             "regions": vm.pager.regions(),
             "evict": evict,
         }))?;
@@ -212,6 +214,9 @@ impl Proc {
         if *vm.state.lock().unwrap() != State::Source(mig) {
             return e;
         }
+        // A late abort (`abort_later`) comes after `migrate` restored the mark:
+        // the resume's balloon unpark must not wait on Firecracker throttled at it.
+        let _lifted = vm.limit.lift(vm.pid());
         let gen = self.gen();
         let l = match self.host.lock().and_then(|l| Ok((self.host.current(&l, vm.ip, gen)?, l))) {
             Ok((true, l)) => l,
@@ -396,6 +401,7 @@ impl Proc {
             let hdr = crate::util::recv_json_max(&mut r, MAX_HEADER)?.ok_or("source hung up before sending the vmstate")?;
             let mut t = Phases::new();
             let runs: Runs = serde_json::from_value(hdr["runs"].clone())?;
+            *self.sizes.lock().unwrap() = Some(arrival_sizes(&runs, &prepared.0.template(), req["plugged_mib"].as_u64()));
             let state = read_vec(&mut r, hdr["vmstate_len"].as_u64().ok_or("missing vmstate_len")?, MAX_VMSTATE)?;
             t.mark("recv_state");
             let pages: Vec<u64> = serde_json::from_value(hdr["preload"].clone()).unwrap_or_default();
@@ -433,6 +439,8 @@ impl Proc {
                 "resume_error": (vm.state() == State::Failed).then_some("resuming failed"),
             }}));
         }
+        // Off the downtime: the source waits for the answer above to reroute.
+        self.start_limit();
         if vm.state() == State::Running {
             self.sync_clock_later();
         }
@@ -527,10 +535,10 @@ impl Proc {
         self.set_name(self.host.take_name(&name, false)?);
         let by = serde_json::from_value(req["source_ident"].clone()).ok();
         let ip: Ipv4Addr = req["ip"].as_str().ok_or("missing ip")?.parse()?;
-        *self.arrived.lock().unwrap() = Some(self.host.mig_begin(mig, &source.addr, by, Some(ip))?);
-        let need = req["rss_mib"].as_u64().unwrap_or(0);
+        // Before the record (fsynced) and the claim: a refusal leaves nothing to undo.
         let floor = if req["evict"] == true { crate::host::Floor::EvictMark } else { crate::host::Floor::Reserve };
-        self.admit_arrival(need, floor)?;
+        self.admit_arrival(req["rss_mib"].as_u64().unwrap_or(0), floor)?;
+        *self.arrived.lock().unwrap() = Some(self.host.mig_begin(mig, &source.addr, by, Some(ip))?);
         let tpl = Template::open_id(&self.paths, req["template"].as_str().ok_or("missing template")?, req["id"].as_str().ok_or("missing template id")?)?;
         t.mark("template");
         let claim = self.host.claim_incoming(&self.host.lock()?, &name, ip, req["gen"].as_u64().unwrap_or(0))?;
@@ -629,7 +637,8 @@ impl Proc {
             }
         };
         t.mark("register");
-        self.set_vm(vm.clone());
+        // Its memory mark is set once the source has its answer (`migrate_in`).
+        self.adopt(vm.clone());
         if !paused {
             if let Err(e) = vm.start(fault("resume_kill")) {
                 eprintln!("vm {name}: resuming after migration {} failed: {e}", source.mig);
@@ -641,6 +650,15 @@ impl Proc {
         self.publish();
         Ok(vm)
     }
+}
+
+/// An arrival's (MiB to page in, guest size) from what its source sent: the
+/// pages it pulls, and its boot memory plus what is plugged (all of the
+/// hotplug region from a source that does not say).
+fn arrival_sizes(runs: &Runs, tpl: &Template, plugged: Option<u64>) -> (u64, u64) {
+    let remote: u64 = runs.iter().filter(|r| r.2 == crate::uffd::REMOTE).map(|r| r.1).sum();
+    let meta = &tpl.meta;
+    ((remote * crate::util::PAGE_SIZE as u64) >> 20, meta.mem_mib + plugged.unwrap_or(meta.max_mib - meta.mem_mib).min(meta.max_mib - meta.mem_mib))
 }
 
 /// Whether the host at `addr` (a listener's) is this one, routes and all.
