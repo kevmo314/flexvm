@@ -181,11 +181,15 @@ pub fn run_dir() -> Option<&'static Path> {
 }
 
 impl Host {
+    /// Synced up to `/` once per state root, not on every command: `.synced` is made after the syncs.
     pub fn open(state: &Path, run: &Path) -> Result<Host> {
-        for d in ["addrs", "standby", "migs"] {
-            let _ = crate::util::create_dir_durably(&state.join(d));
+        let dirs = [("addrs", 0o777), ("standby", 0o777), ("migs", 0o777), ("suspended", 0o700)];
+        if !state.join(".synced").exists() || dirs.iter().any(|(d, _)| !state.join(d).is_dir()) {
+            dirs.iter()
+                .try_for_each(|(d, mode)| crate::util::create_dir_durably(&state.join(d), *mode))
+                .and_then(|()| std::fs::File::create(state.join(".synced")).map(drop))
+                .map_err(|e| format!("{e} (run flexvm as root to create it)"))?;
         }
-        let _ = crate::util::create_dir_durably_mode(&state.join("suspended"), 0o700);
         for d in ["vms", "standby", "w"] {
             let _ = std::fs::create_dir_all(run.join(d));
         }
@@ -1503,6 +1507,16 @@ mod tests {
 
     fn ip(s: &str) -> Ipv4Addr {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn state_directories_are_synced_once_and_remade() {
+        let h = host("synced");
+        assert!(h.state.join(".synced").is_file());
+        std::fs::remove_dir(h.state.join("standby")).unwrap();
+        Host::open(&h.state, &h.run).unwrap();
+        assert!(h.state.join("standby").is_dir());
+        std::fs::remove_dir_all(h.state.parent().unwrap()).unwrap();
     }
 
     #[test]
