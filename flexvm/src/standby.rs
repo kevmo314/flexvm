@@ -15,7 +15,7 @@
 //! The first run after a restore is slow (Firecracker's first resume, the
 //! guest catching up and handling the new VMGenID), so a standby VM runs
 //! once until the guest has reseeded its RNG for this load, then pauses
-//! (see `Paused::load`).
+//! (see `load`).
 
 use std::fs::File;
 use std::io::BufReader;
@@ -182,7 +182,7 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
     unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
     lock.write_all_at(me.to_string().as_bytes(), 0)?;
     p.files.lock().unwrap().extend([sock.clone(), lock_path]);
-    *p.standby.lock().unwrap() = Some(Paused::load(p.spawner.take()?, tpl.clone())?);
+    *p.standby.lock().unwrap() = Some(load(p.spawner.take()?, tpl.clone())?);
     save_load_set(host, &tpl);
     let listener = UnixListener::bind(&sock)?;
     if let Some(mut f) = notify.take() {
@@ -195,7 +195,7 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
             // (the newest go first), or dead: go.
             let current = Template::resolve(&p.paths, template).ok().and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()));
             let extra = live(host, template).iter().position(|&id| id == me).is_some_and(|i| i >= target(host, template));
-            let dead = p.standby.lock().unwrap().as_mut().is_none_or(|s| !s.alive());
+            let dead = p.standby.lock().unwrap().as_mut().is_none_or(|s| s.pager.failed().is_some() || !s.firecracker_alive());
             if p.stop_requested() || current.as_deref() != Some(&key) || extra || dead {
                 p.finish(op, End::NotStarted, 0, None);
             }
@@ -265,7 +265,7 @@ fn claim(p: &Arc<Proc>, req: &Value) -> std::result::Result<Value, (Error, bool)
     let claim = host.lock().and_then(|l| host.claim_new(&l, name, want)).map_err(|e| (e, false))?;
     t.mark("claim_ip");
     let paused = p.standby.lock().unwrap().take().ok_or_else(|| ("standby vm gone".into(), true))?;
-    let vm = paused.resume(name, claim.ip, fault("resume_kill"), &mut t).map_err(|(e, ran)| {
+    let vm = resume(paused, name, claim.ip, fault("resume_kill"), &mut t).map_err(|(e, ran)| {
         (format!("resuming a standby vm failed{}: {e}", if ran { ", and it may have run" } else { "" }).into(), !ran)
     })?;
     p.set_name(lock);
@@ -324,104 +324,65 @@ pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]
     Ok(None)
 }
 
-/// How long a standby VM keeps running after the guest has reseeded, for the
-/// rest of its post-restore work to finish.
+/// How long a standby VM keeps running after the guest has reseeded.
 const SETTLE: Duration = Duration::from_millis(50);
-/// Deadlines for the Firecracker API calls of a load.
 const LOAD_TIMEOUT: Duration = Duration::from_secs(30);
 const API_TIMEOUT: Duration = Duration::from_secs(5);
-/// Fork reseeds in a template's own kernel log (see `wait_for_reseed`).
-const FORKS_BASELINE: usize = 0;
 /// How long the guest has to reseed after its first resume.
 const RESEED_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// A VM restored from a template, run once to settle and paused again.
-/// Dropping it tears it down.
-pub struct Paused(Prepared);
-
-impl Paused {
-    /// Restores `template` into `idle`, lets it settle and pauses it.
-    pub fn load(idle: Idle, template: Arc<Template>) -> Result<Paused> {
-        let p = Vm::prepare(idle, template, &mut Phases::new())?;
-        // Off the request path, so it can afford to learn what a load touches.
-        p.pager.learn_load_set();
-        let fc = p.firecracker();
-        let body = crate::vm::load_body(&p.template().vmstate(), fc, p.tap(), true);
-        fc.request_within("PUT", "/snapshot/load", Some(body), LOAD_TIMEOUT)?;
-        // Loaded with resume_vm false, Firecracker still runs its devices (tap
-        // RX, vsock, balloon timer) into guest memory; an API pause stops them.
-        fc.request_within("PATCH", "/vm", Some(json!({"state": "Paused"})), API_TIMEOUT)?;
-        p.pager.wait_ready(Duration::from_secs(5))?;
-        // Get the slow first run after a restore out of the way, off the request path.
-        let resumed = fc.request_within("PATCH", "/vm", Some(json!({"state": "Resumed"})), API_TIMEOUT);
-        // The load set includes what resuming touches (Firecracker kicks the
-        // virtqueues), as a migration target's load resumes the VM too.
-        p.pager.loaded();
-        resumed?;
-        wait_for_reseed(&fc.sockets.vsock)?;
-        // Step the wall clock now: it keeps time while paused, so START at
-        // take finds it right and skips clock_settime, which can take tens of
-        // ms in a 24-vCPU guest (it IPIs the vCPUs). Best effort: START steps
-        // it otherwise.
-        let _ = guest::clock(&fc.sockets.vsock, &p.template().legacy_agent, guest::TIMEOUT);
-        std::thread::sleep(SETTLE);
-        fc.request_within("PATCH", "/vm", Some(json!({"state": "Paused"})), API_TIMEOUT)?;
-        Ok(Paused(p))
-    }
-
-    /// Whether its Firecracker still runs and its pager has not given up.
-    pub fn alive(&mut self) -> bool {
-        self.0.pager.failed().is_none() && self.0.firecracker_alive()
-    }
-
-    /// Turns this into the running VM `name` at `ip`: routes the address to
-    /// its tap and resumes the vCPUs. On failure, the VM is torn down, and
-    /// the flag says whether the guest may have run for `name`: unless the
-    /// resume never reached Firecracker. With `kill` (test fault
-    /// `resume_kill`), Firecracker is killed right after the resume is sent.
-    pub fn resume(self, name: &str, ip: Ipv4Addr, kill: bool, phases: &mut Phases) -> std::result::Result<Arc<Vm>, (Error, bool)> {
-        let p = self.0;
-        let mut sent = false;
-        let resumed = (|| -> Result<()> {
-            // Route before the guest can send anything; one netlink round trip.
-            crate::net::attach(ip, p.tap())?;
-            phases.mark("route");
-            sent = true;
-            let res = p.firecracker().request_within("PATCH", "/vm", Some(json!({"state": "Resumed"})), API_TIMEOUT);
-            if kill {
-                p.pager.kill_firecracker();
-                bail!("injected fault: firecracker killed after the resume was sent");
-            }
-            res?;
-            phases.mark("resume");
-            Ok(())
-        })();
-        match resumed {
-            Ok(()) => Ok(p.into_vm(name, ip, crate::vm::State::Running)),
-            // Once the request may have reached Firecracker, some vCPUs may
-            // have run even if it answers with an error.
-            Err(e) => {
-                let ran = sent && !crate::fc::not_sent(&e);
-                Err((e, ran))
-            }
-        }
-    }
+/// Restores `template` into `idle`, runs it once to settle (the slow first
+/// run after a restore, off the request path) and pauses it again.
+fn load(idle: Idle, template: Arc<Template>) -> Result<Prepared> {
+    let p = Vm::prepare(idle, template, &mut Phases::new())?;
+    p.pager.learn_load_set();
+    let fc = p.firecracker();
+    fc.load_snapshot(&p.template().vmstate(), p.tap(), Some(true), LOAD_TIMEOUT)?;
+    // Only an API pause stops the devices writing guest memory.
+    fc.request_within("PATCH", "/vm", Some(json!({"state": "Paused"})), API_TIMEOUT)?;
+    p.pager.wait_ready(Duration::from_secs(5))?;
+    let resumed = fc.request_within("PATCH", "/vm", Some(json!({"state": "Resumed"})), API_TIMEOUT);
+    // The load set includes what resuming touches, as a migration's load resumes too.
+    p.pager.loaded();
+    resumed?;
+    wait_for_reseed(&fc.sockets.vsock)?;
+    // The clock keeps time while paused, so START at the claim can skip
+    // clock_settime (tens of ms in a big guest). Best effort.
+    let _ = guest::clock(&fc.sockets.vsock, &p.template().legacy_agent, guest::TIMEOUT);
+    std::thread::sleep(SETTLE);
+    fc.request_within("PATCH", "/vm", Some(json!({"state": "Paused"})), API_TIMEOUT)?;
+    Ok(p)
 }
 
-/// Waits until the guest kernel has reseeded its RNG for a new VMGenID (see
-/// the module comment). An agent without `FORKS` only gets to answer.
-///
-/// Assumes the template's kernel log has no fork reseed in it (a baseline of
-/// 0), which holds for templates cold-booted by `flexvm template`. A template
-/// made from a restored VM (a checkpoint) would need its own count, taken
-/// when it was snapshotted, as the baseline.
+/// Turns standby VM `p` into the running VM `name` at `ip`. On failure it is
+/// torn down, and the flag says whether the guest may have run for `name`
+/// (the resume may have reached Firecracker). `kill`: test fault `resume_kill`.
+fn resume(p: Prepared, name: &str, ip: Ipv4Addr, kill: bool, t: &mut Phases) -> std::result::Result<Arc<Vm>, (Error, bool)> {
+    crate::net::attach(ip, p.tap()).map_err(|e| (e, false))?;
+    t.mark("route");
+    let res = p.firecracker().request_within("PATCH", "/vm", Some(json!({"state": "Resumed"})), API_TIMEOUT);
+    if kill {
+        p.pager.kill_firecracker();
+        return Err(("injected fault: firecracker killed after the resume was sent".into(), true));
+    }
+    if let Err(e) = res {
+        let ran = !crate::fc::not_sent(&e);
+        return Err((e, ran));
+    }
+    t.mark("resume");
+    Ok(p.into_vm(name, ip, crate::vm::State::Running))
+}
+
+/// Waits until the guest kernel has reseeded its RNG for the new VMGenID (a
+/// cold-booted template's log has no reseed yet). An agent without `FORKS`
+/// only gets to answer.
 fn wait_for_reseed(vsock: &std::path::Path) -> Result<()> {
     static WARNED: AtomicBool = AtomicBool::new(false);
     let deadline = Instant::now() + RESEED_TIMEOUT;
     loop {
         let res = guest::forks(vsock);
         match res {
-            Ok(Some(n)) if n > FORKS_BASELINE => return Ok(()),
+            Ok(Some(n)) if n > 0 => return Ok(()),
             Ok(None) => {
                 if !WARNED.swap(true, Ordering::Relaxed) {
                     eprintln!("standby: guest agent cannot report RNG reseeds (no FORKS); standby vms are only checked to answer");

@@ -29,7 +29,7 @@ use crate::hold::Holder;
 use crate::host::{fault, AddrClaim, Entry, Host, Ident, MigRecord, NameLock};
 use crate::template::{Paths, Template, STEP_MIB};
 use crate::util::{ms, proc_kb, send_json, Error, Phases, Result};
-use crate::vm::{State, Vm};
+use crate::vm::{Snapshot, State, Vm};
 
 /// The exit status of a VM process whose VM died under it.
 pub const DIED: i32 = 3;
@@ -90,7 +90,7 @@ pub struct Proc {
     /// Exit when the VM leaves: set while a migration away may commit.
     leaving: AtomicBool,
     /// A standby VM not claimed yet.
-    pub standby: Mutex<Option<crate::standby::Paused>>,
+    pub standby: Mutex<Option<crate::vm::Prepared>>,
     /// The `run` that claimed this standby VM: told the exit status.
     pub claimer: Mutex<Option<UnixStream>>,
     /// The VM's one command (`run NAME -- CMD`).
@@ -452,13 +452,22 @@ impl Proc {
         let ip = self.set_addr(claim);
         t.mark("claim_ip");
         crate::host::stall("start_stall");
-        let load = if fault("resume_kill") { crate::vm::Load::RunningKilled } else { crate::vm::Load::Running };
+        let prepared = Vm::prepare(self.spawner.take()?, tpl.clone(), &mut t)?;
         // The first load of a template on this host learns what loads touch.
         let learn = crate::standby::load_set(&self.host, &tpl).is_empty();
-        let (vm, _) = Vm::restore(&self.spawner, name, tpl.clone(), crate::vm::Snapshot::Path(&tpl.vmstate()), None, ip, load, learn, &mut t)?;
+        if learn {
+            prepared.pager.learn_load_set();
+        }
+        let (vm, _) = prepared.load(&self.spawner, name, Snapshot::Path(&tpl.vmstate()), None, ip, false, None, || Ok(()), &mut t)?;
         if learn {
             crate::standby::save_load_set(&self.host, &tpl);
         }
+        // Once resumed it may have run: never loaded again.
+        if let Err(e) = vm.start(fault("resume_kill")) {
+            vm.kill();
+            bail!("resuming the restored vm failed (it may have run, so it is not loaded again): {e}");
+        }
+        t.mark("resume");
         self.set_vm(vm);
         let mut v = self.start_guest(&mut t)?;
         v["standby"] = json!(false);
@@ -708,7 +717,6 @@ impl Proc {
                 "failed": vm.pager.failed(),
                 "checkpoint_copy_stats": vm.pager.copy_stats(),
                 "describe": vm.describe(),
-                "loads": crate::vm::loads(),
                 "guest_retries": guest::retries(),
             })),
             w => bail!("unknown debug request {w:?}"),

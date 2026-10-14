@@ -100,6 +100,22 @@ impl Firecracker {
         self.request("GET", path, None)
     }
 
+    /// Loads `vmstate`, memory from the pager on this Firecracker's uffd
+    /// socket, the vCPUs stopped; with no `clock_realtime`, only prepares
+    /// the load (`/snapshot/prepare`, `firecracker/0002-*.patch`).
+    pub fn load_snapshot(&self, vmstate: &Path, tap: &str, clock_realtime: Option<bool>, timeout: Duration) -> Result<Value> {
+        let mut body = serde_json::json!({
+            "snapshot_path": vmstate,
+            "mem_backend": {"backend_type": "Uffd", "backend_path": self.sockets.uffd},
+            "vsock_override": {"uds_path": self.sockets.vsock},
+            "network_overrides": [{"iface_id": "eth0", "host_dev_name": tap}],
+        });
+        let Some(realtime) = clock_realtime else { return self.request_within("PUT", "/snapshot/prepare", Some(body), timeout) };
+        body["clock_realtime"] = realtime.into();
+        body["resume_vm"] = false.into();
+        self.request_within("PUT", "/snapshot/load", Some(body), timeout)
+    }
+
     pub fn pause(&self) -> Result<()> {
         self.patch("/vm", serde_json::json!({"state": "Paused"})).map(|_| ())
     }

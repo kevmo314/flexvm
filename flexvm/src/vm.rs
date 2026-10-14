@@ -10,33 +10,17 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use crate::bail;
-use crate::fc::{Firecracker, Idle, Spawner};
+use crate::fc::{Firecracker, Idle, Spawner, API_TIMEOUT};
 use crate::template::{Template, BALLOON_STATS_S};
+use crate::uffd::{Origin, Pager, Runs};
+use crate::util::{Phases, Result, PAGE_SIZE};
 
 /// How long resuming a paused migration target waits for its memory to arrive.
 const PULL_WAIT: Duration = Duration::from_secs(30);
-
-/// How a restored VM starts out.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Load {
-    Running,
-    /// Paused, devices included (held in Firecracker's pause loop).
-    Paused,
-    /// vCPUs stopped but devices running, as Firecracker leaves a VM loaded
-    /// with `resume_vm: false`: a migration target about to resume it once
-    /// it owns the VM, and test fault `restore_no_hold`.
-    PausedUnheld,
-    /// Test fault `resume_kill` only: `Running`, but Firecracker is killed
-    /// right after the resume request is sent, as if it crashed with the
-    /// guest already running.
-    RunningKilled,
-}
-
-impl Load {
-    fn running(self) -> bool {
-        matches!(self, Load::Running | Load::RunningKilled)
-    }
-}
+/// A clock request slower than this may have left the guest that far behind.
+pub const CLOCK_RTT: Duration = Duration::from_millis(5);
+/// Firecracker's error for a snapshot without KVM's realtime clock loaded with `clock_realtime`.
+const NO_REALTIME: &str = "clock_realtime requested but not present in the snapshot state";
 
 /// The vmstate a VM is restored from.
 #[derive(Clone, Copy)]
@@ -47,69 +31,16 @@ pub enum Snapshot<'a> {
     Bytes(&'a [u8]),
 }
 
-/// Firecracker's error for a snapshot saved without KVM's realtime clock,
-/// loaded with `clock_realtime`.
-const NO_REALTIME: &str = "clock_realtime requested but not present in the snapshot state";
-
-/// Why another load, on a fresh Firecracker, could succeed where one failed.
-/// Every load stops the vCPUs (`resume_vm: false`), so a failed one never ran
-/// the guest.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Retry {
-    /// The Firecracker died on its own before the load, nothing given up.
-    Fresh,
-    /// The snapshot has no realtime clock: load it without `clock_realtime`.
-    WithoutRealtime,
-}
-
-/// A snapshot load that failed, and whether another Firecracker could do it.
-#[derive(Debug)]
-pub struct LoadFailed {
-    error: String,
-    pub retry: Option<Retry>,
-}
-
-impl std::fmt::Display for LoadFailed {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.write_str(&self.error)
-    }
-}
-
-impl std::error::Error for LoadFailed {}
-
-/// The retry `e` (from `Prepared::load`) allows, if any.
-pub fn retry_of(e: &crate::util::Error) -> Option<Retry> {
-    e.downcast_ref::<LoadFailed>().and_then(|l| l.retry)
-}
-
-/// Snapshot loads started (`Prepared::load`, retries included), for tests to count.
-static LOADS: AtomicU64 = AtomicU64::new(0);
-
-pub fn loads() -> u64 {
-    LOADS.load(Ordering::SeqCst)
-}
-
-use crate::uffd::{Origin, Pager, Runs};
-use crate::util::{Phases, Result, PAGE_SIZE};
-
-/// Where a VM is in its lifecycle on this host. Transitions happen under its
-/// process's operation lock (`Proc::op`).
-/// A clock request that took longer than this may have left the guest that
-/// far behind (see `sync_clock`).
-pub const CLOCK_RTT: Duration = Duration::from_millis(5);
-
+/// Where a VM is; transitions happen under its process's operation lock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
     Running,
-    /// vCPUs stopped by `pause`, memory and devices kept.
     Paused,
     /// Paused for a checkpoint to disk; goes back to Running or Paused.
     Checkpointing,
-    /// Paused here for migration `.0`: the target may own the VM from the
-    /// moment it gets the state, so this copy is never resumed unless the
-    /// target confirms the migration aborted.
+    /// Paused here for migration `.0`: never resumed unless the target says it aborted.
     Source(u64),
-    /// Its memory is lost (the pager gave up) or it could not be resumed.
+    /// Its memory is lost, or it could not be resumed.
     Failed,
 }
 
@@ -141,121 +72,39 @@ pub struct Vm {
     pub last_resize: Mutex<Instant>,
     /// Needs more memory than this host can give it.
     pub starved: AtomicBool,
-    /// Free page reports may be held in Firecracker: a hold was sent and no
-    /// release has landed since (see `hold_reports`).
+    /// A hold of free page reports may be in place (see `hold_reports`).
     reports_held: AtomicBool,
-    /// True while a copy-on-write checkpoint copies this VM's memory with
-    /// the VM running: its operation lock is held, but it may still grow
-    /// (not shrink). Resizes then hold this lock, and the checkpoint takes it
-    /// to end the copy, so none is in progress once the operation ends.
+    /// While a copy-on-write checkpoint copies the running VM it may grow
+    /// (not shrink): resizes hold this, and the checkpoint takes it to end.
     pub cow_copy: Mutex<bool>,
-    /// Host ends of exec sessions, by id, so a checkpoint can close them.
-    /// Held only for map operations, never across I/O.
+    /// Host ends of exec sessions, so a checkpoint can close them.
     execs: Mutex<HashMap<u64, UnixStream>>,
-    /// Serializes putting back device settings on a migration target
-    /// (`restore_devices`) with leaving for a migration or checkpoint.
+    /// Serializes `restore_devices` with leaving for a migration or checkpoint.
     devices: Mutex<()>,
-    /// A clock request (START or CLOCK) failed and may not have reached the
-    /// guest yet: a migration or checkpoint must first see the agent answer
-    /// (`leave`).
+    /// A clock request failed and may still reach the guest: `leave` waits it out.
     clock_unsure: AtomicBool,
     next_exec: AtomicU64,
     fc: Mutex<Option<Firecracker>>,
     vsock: PathBuf,
     cgroup: Option<PathBuf>,
-    /// Set by `start_source` and `start_checkpoint` for a VM that was
-    /// paused: `resume` then puts it back paused (and a migration target
-    /// keeps it paused).
+    /// Paused when its current migration or checkpoint began.
     was_paused: AtomicBool,
-    /// A background clock check is queued (see `Proc::sync_clock_later`).
+    /// A background clock check is queued.
     pub clock_pending: AtomicBool,
-    /// Restored held paused at a new address: the guest still has this old
-    /// one, and gets the new one on its first resume.
+    /// Restored held paused at a new address: the guest still has this old one.
     pub pending_net: Mutex<Option<Ipv4Addr>>,
-    /// The pager's discard count just before the last snapshot: a discard
-    /// after it means the saved state and memory may disagree.
+    /// The pager's discard count at the last snapshot: one after it means
+    /// the saved state and memory may disagree.
     pub snapshot_discards: AtomicU64,
-    /// The last checkpoint taken of this VM here while write tracking ran
-    /// (its directory and id), which the next one can be a delta against.
+    /// The last checkpoint taken with write tracking (dir, id): a delta's base.
     pub last_checkpoint: Mutex<Option<(PathBuf, String)>>,
-    /// Kills waiting: a checkpoint in progress gives up (and clears it).
+    /// A kill is waiting: a checkpoint in progress gives up (and clears it).
     pub cancel_checkpoint: AtomicUsize,
 }
 
 impl Vm {
-    /// Restores `vmstate` into a fresh Firecracker, its memory served by a
-    /// pager over the template plus `remote` pages (from a migration source
-    /// or a checkpoint), with `ip` routed to its tap, starting it as `load`
-    /// says. Marks each step in `phases`.
-    ///
-    /// The snapshot is loaded with the vCPUs stopped, so a load that fails
-    /// never ran the guest and is tried once more, on a fresh Firecracker,
-    /// when `Prepared::load` says it may (see `Retry`). A running VM is
-    /// resumed only once loaded, and never retried after that: once the
-    /// resume is sent the guest may have run, and running the snapshot again
-    /// could repeat what it did.
-    #[allow(clippy::too_many_arguments)]
-    pub fn restore(
-        spawner: &Spawner,
-        name: &str,
-        template: Arc<Template>,
-        vmstate: Snapshot,
-        remote: Option<(Runs, Origin)>,
-        ip: Ipv4Addr,
-        load: Load,
-        learn: bool,
-        phases: &mut Phases,
-    ) -> Result<(Arc<Vm>, Duration)> {
-        let mut clock_realtime = true;
-        let mut retried = false;
-        let (vm, took) = loop {
-            let idle = spawner.take()?;
-            phases.mark("spawn");
-            let prepared = Vm::prepare(idle, template.clone(), phases)?;
-            if learn {
-                // What the load touches (`Template::load_set`), for migrations to preload.
-                prepared.pager.learn_load_set();
-            }
-            let path = match vmstate {
-                Snapshot::Path(p) => p.to_path_buf(),
-                Snapshot::Bytes(b) => {
-                    let p = prepared.dir().join("vmstate.in");
-                    std::fs::write(&p, b)?;
-                    phases.mark("write_state");
-                    p
-                }
-            };
-            if let Some((runs, origin)) = &remote {
-                prepared.pager.seed(runs.clone(), origin.clone())?;
-            }
-            let held = if load.running() { Load::PausedUnheld } else { load };
-            match prepared.load(name, &path, ip, held, clock_realtime, None, phases) {
-                Ok(r) => break r,
-                Err(e) => match retry_of(&e) {
-                    Some(Retry::WithoutRealtime) if !retried => {
-                        eprintln!("vm {name}: snapshot saved without KVM's realtime clock; loading it without clock_realtime");
-                        clock_realtime = false;
-                    }
-                    Some(Retry::Fresh) if !retried => eprintln!("vm {name}: restore failed ({e}); once more on a fresh firecracker"),
-                    _ => return Err(e),
-                },
-            }
-            retried = true;
-        };
-        if load.running() {
-            if let Err(e) = vm.start(load == Load::RunningKilled) {
-                vm.kill();
-                bail!("resuming the restored vm failed (it may have run, so it is not loaded again): {e}");
-            }
-            *vm.state.lock().unwrap() = State::Running;
-            phases.mark("resume");
-        }
-        Ok((vm, took))
-    }
-
-    /// Resumes the vCPUs of a VM just loaded with them stopped. With `kill`
-    /// (test fault `resume_kill`), Firecracker is killed right after the
-    /// request is sent.
+    /// Resumes vCPUs stopped since the load. With `kill` (test fault
+    /// `resume_kill`), Firecracker is killed right after the request is sent.
     pub fn start(&self, kill: bool) -> Result<()> {
         self.fc(|fc| {
             let res = fc.resume();
@@ -264,56 +113,20 @@ impl Vm {
                 bail!("injected fault: firecracker killed after the resume was sent");
             }
             res
-        })
+        })?;
+        *self.state.lock().unwrap() = State::Running;
+        Ok(())
     }
 
-    /// The part of a restore that needs no vmstate: names the cgroup and
-    /// starts the pager, which gets its page states later (`Pager::seed`).
-    /// A migration target does this before its source pauses.
+    /// The part of a restore that needs no vmstate: checks the host, starts
+    /// the pager (seeded later). A migration target does it before its source pauses.
     pub fn prepare(idle: Idle, template: Arc<Template>, phases: &mut Phases) -> Result<Prepared> {
         crate::compat::check(&template, idle.fc.pid())?;
-        let pager = match Pager::start(&idle.fc.sockets.uffd, template.clone(), None) {
-            Ok(p) => p,
-            Err(e) => {
-                drop(idle);
-                return Err(e);
-            }
-        };
+        let pager = Pager::start(&idle.fc.sockets.uffd, template.clone(), None)?;
         let prepared = Prepared { idle: Some(idle), pager, template };
-        prepared.pager.set_pid(prepared.idle.as_ref().unwrap().fc.pid())?;
+        prepared.pager.set_pid(prepared.firecracker().pid())?;
         phases.mark("pager_start");
         Ok(prepared)
-    }
-
-    /// A VM made of a restored Firecracker and its resources.
-    pub fn assemble(name: &str, template: Arc<Template>, idle: Idle, ip: Ipv4Addr, pager: Arc<Pager>, state: State) -> Arc<Vm> {
-        let (fc, dir, cgroup, tap) = idle.into_parts();
-        Arc::new(Vm {
-            name: name.into(),
-            template,
-            dir,
-            ip,
-            tap,
-            pager,
-            state: Mutex::new(state),
-            last_resize: Mutex::new(Instant::now()),
-            starved: AtomicBool::new(false),
-            reports_held: AtomicBool::new(false),
-            cow_copy: Mutex::new(false),
-            execs: Mutex::new(HashMap::new()),
-            devices: Mutex::new(()),
-            clock_unsure: AtomicBool::new(false),
-            next_exec: AtomicU64::new(0),
-            vsock: fc.sockets.vsock.clone(),
-            fc: Mutex::new(Some(fc)),
-            cgroup,
-            was_paused: AtomicBool::new(false),
-            clock_pending: AtomicBool::new(false),
-            pending_net: Mutex::new(None),
-            snapshot_discards: AtomicU64::new(0),
-            last_checkpoint: Mutex::new(None),
-            cancel_checkpoint: AtomicUsize::new(0),
-        })
     }
 
     pub fn vsock(&self) -> PathBuf {
@@ -339,8 +152,6 @@ impl Vm {
         }
     }
 
-    /// Whether its Firecracker still runs. A Firecracker busy with a request
-    /// counts as running.
     /// How its Firecracker exited, and the end of its log.
     pub fn post_mortem(&self) -> String {
         match self.fc.lock().unwrap().as_mut() {
@@ -349,11 +160,9 @@ impl Vm {
         }
     }
 
+    /// Whether its Firecracker still runs (one busy with a request does).
     pub fn firecracker_alive(&self) -> bool {
-        match self.fc.try_lock() {
-            Ok(mut fc) => fc.as_mut().is_some_and(|f| f.alive()),
-            Err(_) => true,
-        }
+        self.fc.try_lock().map_or(true, |mut fc| fc.as_mut().is_some_and(|f| f.alive()))
     }
 
     pub fn pid(&self) -> Option<u32> {
@@ -362,32 +171,18 @@ impl Vm {
 
     /// Host memory this VM is actually using.
     pub fn rss(&self) -> u64 {
-        self.pid()
-            .and_then(|p| crate::util::proc_kb(&format!("/proc/{p}/status"), "VmRSS"))
-            .unwrap_or(0)
+        self.pid().and_then(|p| crate::util::proc_kb(&format!("/proc/{p}/status"), "VmRSS")).unwrap_or(0)
     }
 
-    /// Pauses the VM and saves only its device/vCPU state (memory stays put
-    /// and is served by the pager). Returns the page states a target needs,
-    /// taken behind the pager's barrier so they match the saved state.
+    /// Pauses the VM and saves its device and vCPU state (memory stays with
+    /// the pager); returns the page states, taken so they match it.
     ///
-    /// Pausing stops only the vCPUs; Firecracker's devices would go on
-    /// writing guest memory (and their rings) behind the saved state, which
-    /// the target then pulls. So first the tap goes down (no RX), host exec
-    /// sessions are closed (vsock RX is gated after the snapshot, but host
-    /// socket events still walk the TX queue), and the balloon's statistics
-    /// timer is pushed out of the way (its next round happens now, before the
-    /// snapshot). `resume` undoes this; a target calls `restore_devices`.
-    ///
-    /// `unroute` runs just before the pause and moves the VM's address off
-    /// the tap (`hold`), so packets for it from then on are held rather than
-    /// queued on a tap that a paused Firecracker no longer reads and that
-    /// then goes down; what the guest sends until the pause still leaves
-    /// through the tap. Call after `start_source`.
-    ///
-    /// `park`s the balloon timer first, unless a migration did that already
-    /// (`park_balloon`, while the VM still ran, so that is not part of the
-    /// pause). Firecracker fsyncs the state file if `sync`.
+    /// Paused vCPUs do not stop devices writing guest memory, so first exec
+    /// sessions close, `unroute` moves the address off the tap (packets are
+    /// held from then on), and after the pause the tap goes down; the balloon
+    /// statistics timer is parked unless `park` was done already. `resume`
+    /// undoes this; a target calls `restore_devices`. Firecracker fsyncs the
+    /// state if `sync`.
     pub fn save_state(&self, vmstate: &Path, sync: bool, park: bool, unroute: impl FnOnce(), t: &mut Phases) -> Result<Runs> {
         if park {
             self.park_balloon()?;
@@ -398,20 +193,11 @@ impl Vm {
         }
         unroute();
         t.mark("hold");
-        // Always, even if already paused: Firecracker freezes device
-        // emulation only while it sits in the loop an API pause enters (a VM
-        // loaded paused is not in it). Nothing may write guest memory from
-        // here until the pages are captured or served: we send no
-        // guest-facing request (balloon, hotplug) to a paused source.
+        // Even if paused: only an API pause freezes device emulation.
         self.fc(|fc| fc.pause())?;
         t.mark("pause");
-        // The tap goes down after the pause, so the guest's last packets
-        // still leave. That waits for an RCU grace period (milliseconds on a
-        // busy host), so it runs alongside the snapshot: Firecracker serves
-        // the snapshot request from its pause loop, which reads no tap, and
-        // the address already routes elsewhere (`unroute`). It is down
-        // before the page states are captured, and joined on every path:
-        // `resume` must not race a late link-down.
+        // Link-down waits for an RCU grace period: alongside the snapshot,
+        // joined on every path so `resume` never races it.
         let tap = self.tap.clone();
         let down = std::thread::spawn(move || crate::net::set_link_up(&tap, false));
         let saved = self.fc(|fc| {
@@ -428,28 +214,21 @@ impl Vm {
         Ok(runs)
     }
 
-    /// Pushes the balloon's statistics timer out of the way (see
-    /// `save_state`): changing it makes Firecracker write the stats queue,
-    /// which must happen before the snapshot. Call after `start_source`;
-    /// `resume` puts it back.
+    /// Parks the balloon statistics timer (its write must precede the snapshot).
     pub fn park_balloon(&self) -> Result<()> {
         self.fc(|fc| fc.patch("/balloon/statistics", json!({"stats_polling_interval_s": u16::MAX})).map(drop))
     }
 
-    /// Marks the VM as the source of migration `mig`. From then on no host
-    /// vsock session opens (see `exec`), so `checkpoint` can close them all.
+    /// Marks the VM the source of migration `mig`; no exec session opens after.
     pub fn start_source(&self, mig: u64) -> Result<()> {
         self.leave(State::Source(mig))
     }
 
-    /// Marks the VM as being checkpointed to disk, like `start_source`.
     pub fn start_checkpoint(&self) -> Result<()> {
         self.leave(State::Checkpointing)
     }
 
-    /// Leaves Running or Paused for a migration or checkpoint. Exec sessions
-    /// need no lock against this: one registered before is closed by
-    /// `save_state`, one registered after sees the state and closes itself.
+    /// Leaves Running or Paused for a migration or checkpoint.
     fn leave(&self, to: State) -> Result<()> {
         let _devices = self.devices.lock().unwrap();
         let leavable = |st: State| -> Result<()> {
@@ -465,17 +244,12 @@ impl Vm {
             Ok(())
         };
         leavable(*self.state.lock().unwrap())?;
-        // A clock request that failed may still be on its way into the guest,
-        // and must not arrive after the snapshot (on a target, or in a
-        // checkpoint) with a stale time. The agent serves requests in order,
-        // so a ping answered now means it has been dealt with. Not under the
-        // state lock: a ping can take seconds, and `state` is read often.
+        // A failed clock request may still be on its way: the agent serves in
+        // order, so an answered ping means it landed before the snapshot.
         if self.clock_unsure.load(Ordering::SeqCst) {
             crate::guest::ping(&self.vsock()).map_err(|e| format!("vm {}: guest agent not answering: {e}", self.name))?;
             self.clock_unsure.store(false, Ordering::SeqCst);
         }
-        // Transitions are serialized by the operation lock; check again
-        // all the same (the pager may have failed meanwhile).
         let mut st = self.state.lock().unwrap();
         leavable(*st)?;
         self.was_paused.store(*st == State::Paused, Ordering::SeqCst);
@@ -483,16 +257,14 @@ impl Vm {
         Ok(())
     }
 
-    /// Whether the VM was paused when its current migration or checkpoint began.
     pub fn was_paused(&self) -> bool {
         self.was_paused.load(Ordering::SeqCst)
     }
 
-    /// Undoes `checkpoint`: puts the devices back and resumes the vCPUs,
-    /// unless the VM was paused before. Returns the state to go back to.
+    /// Undoes `save_state`: devices back, vCPUs resumed unless it was paused.
     pub fn resume(&self) -> Result<State> {
         crate::net::set_link_up(&self.tap, true)?;
-        // Taking the tap down deleted the VM's /32 route; put it back.
+        // The link-down took the VM's /32 route with it.
         crate::net::attach(self.ip, &self.tap)?;
         self.unpark_balloon();
         if self.was_paused.swap(false, Ordering::SeqCst) {
@@ -502,10 +274,7 @@ impl Vm {
         Ok(State::Running)
     }
 
-    /// Ends a checkpoint to disk that keeps the VM here: back to running or
-    /// paused, or failed if it cannot be resumed. (Transitions are serialized
-    /// by the operation lock; the state lock is never held across a
-    /// Firecracker request, so readers never wait on one.)
+    /// Ends a checkpoint that keeps the VM here: running, paused, or failed.
     pub fn end_checkpoint(&self) -> Result<State> {
         if *self.state.lock().unwrap() != State::Checkpointing {
             bail!("vm {} is not being checkpointed", self.name);
@@ -518,7 +287,6 @@ impl Vm {
         res
     }
 
-    /// Stops the vCPUs; memory and devices stay as they are.
     pub fn pause(&self) -> Result<()> {
         match self.state() {
             State::Paused => return Ok(()),
@@ -530,9 +298,8 @@ impl Vm {
         Ok(())
     }
 
-    /// Resumes a VM stopped by `pause`. A paused migration target first
-    /// pulls all its memory from the source (waiting up to `PULL_WAIT`), so
-    /// it never runs split across two hosts.
+    /// Resumes a paused VM; a paused migration target first pulls all its
+    /// memory, so it never runs split across two hosts.
     pub fn unpause(&self) -> Result<()> {
         if self.pager.pulling_from_peer() && !self.pager.wait_pulled_for(PULL_WAIT) {
             bail!("vm {} is still pulling its memory from its previous host; resume it once that is done", self.name);
@@ -547,27 +314,19 @@ impl Vm {
         Ok(())
     }
 
-
-
-    /// Marks the VM failed: it stays as it is until killed.
     pub fn set_failed(&self) {
         *self.state.lock().unwrap() = State::Failed;
     }
 
-    /// virtio-mem memory currently plugged, if Firecracker answers.
     pub fn hotplug_plugged(&self) -> Option<u64> {
         let hp = self.fc(|fc| fc.request_within("GET", "/hotplug/memory", None, crate::guest::TIMEOUT)).ok()?;
         hp["plugged_size_mib"].as_u64()
     }
 
-    /// Waits until the guest has carried out the last virtio-mem resize
-    /// (plugged == requested), so that no request of its can still reach
-    /// the device; past half of `deadline`, stops asking for a size the
-    /// guest cannot reach (requested = plugged). Firecracker processes
-    /// virtio-mem requests on its VMM thread, paused vCPUs or not, and each
-    /// can discard memory and write the used ring; the guest driver only
-    /// sends them to follow a size change from the host. Callers keep the
-    /// controller from resizing meanwhile (the VM's operation lock).
+    /// Waits until the guest has carried out the last virtio-mem resize, so
+    /// none of its requests (which discard memory, paused vCPUs or not) can
+    /// still come; past half of `deadline`, stops asking for a size the guest
+    /// cannot reach (requested = plugged). Callers hold the operation lock.
     pub fn settle_hotplug(&self, deadline: Instant) -> Result<()> {
         if self.template.meta.max_mib <= self.template.meta.mem_mib {
             return Ok(());
@@ -584,21 +343,16 @@ impl Vm {
             if Instant::now() >= deadline {
                 bail!("vm {}: virtio-mem did not settle (requested {requested:?} MiB, plugged {plugged:?} MiB)", self.name);
             }
-            if !gave_up && Instant::now() >= half {
-                if let Some(p) = plugged {
-                    let body = json!({"requested_size_mib": p});
-                    self.fc(|fc| fc.request_within("PATCH", "/hotplug/memory", Some(body), left))?;
-                    gave_up = true;
-                }
+            if let Some(p) = plugged.filter(|_| !gave_up && Instant::now() >= half) {
+                self.fc(|fc| fc.request_within("PATCH", "/hotplug/memory", Some(json!({"requested_size_mib": p})), left))?;
+                gave_up = true;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
     }
 
-    /// On a migration target: puts back the balloon statistics timer that the
-    /// source's `checkpoint` parked, unless the VM is already migrating on
-    /// (its next host does it then). Runs off the critical path; holding the
-    /// devices lock keeps a new migration from parking the timer meanwhile.
+    /// On a migration target: puts back the balloon timer the source parked,
+    /// unless it is migrating on already.
     pub fn restore_devices(&self) {
         let _devices = self.devices.lock().unwrap();
         if matches!(self.state(), State::Running | State::Paused) {
@@ -606,9 +360,7 @@ impl Vm {
         }
     }
 
-    /// Registers a new exec session, then checks the VM still runs here: if
-    /// it no longer does (a migration or checkpoint started meanwhile), the
-    /// session is closed again.
+    /// Registers an exec session, then checks the VM still runs here.
     fn track(&self, s: &UnixStream) -> Result<u64> {
         let id = self.next_exec.fetch_add(1, Ordering::SeqCst);
         self.execs.lock().unwrap().insert(id, s.try_clone()?);
@@ -620,91 +372,57 @@ impl Vm {
         Ok(id)
     }
 
-    /// Runs `cmd` in the guest and returns its exit code and (at most 64 KiB
-    /// of) output. Everything (admission, connecting, the handshake, writing
-    /// the command, every read and the bookkeeping) ends by `deadline`; the
-    /// session is closed if it does not.
+    /// Runs `cmd` in the guest; its exit code and (at most 64 KiB of) output,
+    /// all by `deadline`.
     pub fn sh(&self, cmd: &str, deadline: Instant) -> Result<(i32, String)> {
         const MAX_OUTPUT: usize = 64 << 10;
-        if Instant::now() >= deadline {
-            bail!("guest command {cmd:?}: deadline already passed");
-        }
-        if self.state() != State::Running {
-            bail!("vm {} is not running here", self.name);
+        if self.state() != State::Running || Instant::now() >= deadline {
+            bail!("vm {} is not running here, or no time is left", self.name);
         }
         let left = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
         let s = crate::util::connect_unix(&self.vsock(), left)?;
         let raw = s.try_clone()?;
         let mut g = BufReader::new(crate::util::By { s, at: deadline });
-        // Registered (and the state rechecked) before the guest sees a byte.
-        let id = match self.track(&raw) {
-            Ok(id) => id,
-            Err(e) => {
-                let _ = raw.shutdown(Shutdown::Both);
-                return Err(e);
-            }
-        };
-        let started = (|| -> Result<()> {
-            let req = format!("CONNECT {}\nEXEC {}\n{cmd}", crate::guest::PORT, cmd.len());
-            g.get_mut().write_all(req.as_bytes())?;
+        let id = self.track(&raw)?;
+        let res = (|| -> Result<(i32, String)> {
+            g.get_mut().write_all(format!("CONNECT {}\nEXEC {}\n{cmd}", crate::guest::PORT, cmd.len()).as_bytes())?;
             let mut ok = String::new();
             g.by_ref().take(64).read_line(&mut ok)?;
             if !ok.starts_with("OK") {
                 bail!("vsock connect refused: {ok:?}");
             }
-            Ok(())
-        })();
-        if let Err(e) = started {
-            let _ = raw.shutdown(Shutdown::Both);
-            self.untrack_exec(id);
-            return Err(e);
-        }
-        let mut out = Vec::new();
-        let res: Result<i32> = loop {
-            // read_frame bounds the frame size; By bounds every read.
-            match crate::guest::read_frame(&mut g) {
-                Ok(Some((crate::guest::FRAME_EXIT, d))) if d.len() >= 4 => {
-                    break Ok(i32::from_le_bytes(d[..4].try_into().unwrap()))
+            let mut out = Vec::new();
+            loop {
+                match crate::guest::read_frame(&mut g).map_err(|e| format!("guest command {cmd:?}: {e}"))? {
+                    Some((crate::guest::FRAME_EXIT, d)) if d.len() >= 4 => {
+                        return Ok((i32::from_le_bytes(d[..4].try_into().unwrap()), String::from_utf8_lossy(&out).into_owned()))
+                    }
+                    Some((_, d)) => out.extend_from_slice(&d[..d.len().min(MAX_OUTPUT.saturating_sub(out.len()))]),
+                    None => bail!("guest closed the connection before the command exited"),
                 }
-                Ok(Some((_, d))) => out.extend_from_slice(&d[..d.len().min(MAX_OUTPUT.saturating_sub(out.len()))]),
-                Ok(None) => break Err("guest closed the connection before the command exited".into()),
-                Err(e) => break Err(format!("guest command {cmd:?}: {e}").into()),
             }
-        };
+        })();
         let _ = raw.shutdown(Shutdown::Both);
         self.untrack_exec(id);
-        Ok((res?, String::from_utf8_lossy(&out).into_owned()))
+        res
     }
 
-    /// Steps the guest's wall clock to the host's, all of it by `deadline`.
-    /// A restore leaves the guest's clock where it was saved (the guest's TSC
-    /// clocksource resumes from its saved value, and Firecracker's
-    /// `clock_realtime` only moves kvmclock), so it lags by however long the
-    /// VM was stopped. One agent request (`CLOCK`) sets the host's time and
-    /// reports how far off the clock was (ms, returned); as the guest ends up
-    /// behind by the request's transit time, it goes again (a few times at
-    /// most) until a round trip is short. The guest skips steps under 5 ms.
-    /// Callers hold the VM's operation lock. An agent without `CLOCK` gets no
-    /// step (logged once): a command run through exec could be delayed past
-    /// the deadline and land after a snapshot, which nothing can fence.
+    /// Steps the guest's wall clock to the host's by `deadline` (a restore
+    /// leaves it where it was saved); returns how far off it was (ms). The
+    /// guest ends up behind by a request's transit, so slow round trips are
+    /// repeated. An agent without `CLOCK` gets no step.
     pub fn sync_clock(&self, deadline: Instant) -> Result<f64> {
         static WARNED: AtomicBool = AtomicBool::new(false);
         let mut first = None;
         for tries in 1.. {
             let start = Instant::now();
-            let left = deadline.saturating_duration_since(start);
-            match crate::guest::clock(&self.vsock(), &self.template.legacy_agent, left) {
+            match crate::guest::clock(&self.vsock(), &self.template.legacy_agent, deadline.saturating_duration_since(start)) {
                 Ok(Some(off)) => {
                     let off = *first.get_or_insert(off);
-                    if start.elapsed() < CLOCK_RTT {
+                    if start.elapsed() < CLOCK_RTT || Instant::now() + Duration::from_millis(200) >= deadline {
                         return Ok(off);
                     }
-                    // A guest still faulting its memory in answers slowly: past
-                    // three tries, keep going (a little apart) while time is
-                    // left, as each slow step leaves it behind by its transit.
-                    if Instant::now() + Duration::from_millis(200) >= deadline {
-                        break;
-                    }
+                    // A guest still faulting its memory in answers slowly.
                     if tries >= 3 {
                         std::thread::sleep(Duration::from_millis(100));
                     }
@@ -721,16 +439,12 @@ impl Vm {
                 }
             }
         }
-        Ok(first.unwrap_or(0.0))
+        unreachable!()
     }
 
-    /// Holds the guest's free page reports in the balloon's queue: held,
-    /// Firecracker does not discard reported pages, so no REMOVE reaches the
-    /// pager while a copy-on-write checkpoint still has pages to save. Needs
-    /// `firecracker/0003-hold-free-page-reporting.patch`. Until a release
-    /// lands (`release_reports`) the hold counts as in place, even if this
-    /// fails: Firecracker may have applied it and its answer been lost. Only
-    /// a Firecracker that rejects the request (unpatched) holds nothing.
+    /// Holds the guest's free page reports (`firecracker/0003-*.patch`), so no
+    /// discard reaches the pager while a copy-on-write checkpoint copies.
+    /// Counts as held until a release lands, unless Firecracker rejects it.
     pub fn hold_reports(&self) -> Result<()> {
         const PATH: &str = "/balloon/reporting/hold";
         self.reports_held.store(true, Ordering::SeqCst);
@@ -741,16 +455,13 @@ impl Vm {
         res.map(drop)
     }
 
-    /// Carries out the free page reports a hold kept back, if one may be in
-    /// place, retrying for `within`. Until a release lands the guest's
-    /// reported pages stay off its free lists, so one that fails stays due
-    /// (`release_pending`) and the controller retries it.
+    /// Releases held free page reports, retrying for `within`; one that fails
+    /// stays due (`release_pending`) for the controller.
     pub fn release_reports(&self, within: Duration) -> Result<()> {
         const PATH: &str = "/balloon/reporting/release";
         let deadline = Instant::now() + within;
         while self.reports_held.load(Ordering::SeqCst) {
-            let left = deadline.saturating_duration_since(Instant::now());
-            match self.fc(|fc| fc.request_within("PATCH", PATH, None, left)) {
+            match self.fc(|fc| fc.request_within("PATCH", PATH, None, deadline.saturating_duration_since(Instant::now()))) {
                 Ok(_) => self.reports_held.store(false, Ordering::SeqCst),
                 // Nothing to release: no such endpoint, or no Firecracker.
                 Err(e) if rejected(&e, PATH) || self.pid().is_none() => {
@@ -767,19 +478,16 @@ impl Vm {
         Ok(())
     }
 
-    /// Whether a release of held free page reports is still due.
     pub fn release_pending(&self) -> bool {
         self.reports_held.load(Ordering::SeqCst)
     }
 
-    /// Retries a few times; the VM keeps running regardless, only its
-    /// statistics go stale.
+    /// Best effort: only the balloon statistics go stale.
     fn unpark_balloon(&self) {
         let deadline = Instant::now() + Duration::from_millis(500);
+        let body = json!({"stats_polling_interval_s": BALLOON_STATS_S});
         let res = loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            let body = json!({"stats_polling_interval_s": BALLOON_STATS_S});
-            match self.fc(|fc| fc.request_within("PATCH", "/balloon/statistics", Some(body), left)) {
+            match self.fc(|fc| fc.request_within("PATCH", "/balloon/statistics", Some(body.clone()), deadline.saturating_duration_since(Instant::now()))) {
                 Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
                 r => break r,
             }
@@ -789,22 +497,15 @@ impl Vm {
         }
     }
 
-    /// Opens an exec session: connects to the VM's vsock socket, registers
-    /// the connection (so a checkpoint can close it) and checks the VM still
-    /// runs here, and only then lets `start` send anything to the guest. No
-    /// lock is held while `start` talks to the guest (it has its own
-    /// deadline, `guest::TIMEOUT`); the session is untimed afterwards.
+    /// Opens an exec session: connects, registers it (so a checkpoint can
+    /// close it), and only then lets `start` talk to the guest.
     pub fn exec(&self, start: impl FnOnce(UnixStream) -> Result<BufReader<UnixStream>>) -> Result<(BufReader<UnixStream>, u64)> {
         if self.state() != State::Running {
             bail!("vm {} is not running here", self.name);
         }
         let s = crate::util::connect_unix(&self.vsock(), crate::guest::TIMEOUT)?;
         let id = self.track(&s)?;
-        let started = start(s).and_then(|g| {
-            crate::guest::untimed(&g)?;
-            Ok(g)
-        });
-        match started {
+        match start(s).and_then(|g| crate::guest::untimed(&g).map(|()| g)) {
             Ok(g) => Ok((g, id)),
             Err(e) => {
                 self.untrack_exec(id);
@@ -813,11 +514,8 @@ impl Vm {
         }
     }
 
-    /// Sets the guest's address and wall clock (`START`; `NET` for older
-    /// agents), unless the VM is no longer running here. Bounded by
-    /// `guest::TIMEOUT`. Callers hold the VM's operation lock, so no migration
-    /// or checkpoint starts meanwhile. If it fails, the clock may be anyone's
-    /// guess (see `leave`).
+    /// Sets the guest's address and wall clock (`START`). A failure leaves
+    /// the clock unsure (see `leave`).
     pub fn guest_net(&self, ip: Ipv4Addr, dns: Option<&str>) -> Result<()> {
         if self.state() != State::Running {
             bail!("vm {} is not running here", self.name);
@@ -829,8 +527,7 @@ impl Vm {
         res
     }
 
-    /// Starts an image template's app, unless the VM is no longer running
-    /// here. Bounded by `guest::TIMEOUT`; callers hold the VM's operation lock.
+    /// Starts an image template's app.
     pub fn start_app(&self) -> Result<u32> {
         if self.state() != State::Running {
             bail!("vm {} is not running here", self.name);
@@ -848,7 +545,7 @@ impl Vm {
         self.pager.kill_firecracker();
         let Some(mut fc) = self.fc.lock().unwrap().take() else { return };
         fc.kill();
-        // Wake the listener for guest memory requests, so it sees the VM is gone.
+        // Wakes the listener for guest memory requests.
         let _ = UnixStream::connect(self.mem_sock());
         self.pager.join();
         crate::fc::release(&self.tap, self.cgroup.as_deref(), &self.dir);
@@ -880,8 +577,9 @@ impl Vm {
     }
 }
 
-/// A Firecracker set up for a restore, with its pager started but no
-/// snapshot loaded yet (`Vm::prepare`). Dropping it tears everything down.
+/// A Firecracker with its pager started and no VM of its own yet: about to
+/// load one, or (a standby VM) holding one loaded and paused. Dropped, it is
+/// torn down.
 pub struct Prepared {
     idle: Option<Idle>,
     pub pager: Arc<Pager>,
@@ -901,14 +599,12 @@ impl Prepared {
         &self.idle.as_ref().unwrap().tap
     }
 
-    pub fn firecracker_alive(&mut self) -> bool {
-        self.idle.as_mut().is_some_and(|i| i.fc.alive())
+    pub fn dir(&self) -> &Path {
+        &self.idle.as_ref().unwrap().dir
     }
 
-    /// The VM `name` at `ip`, now loaded into this Firecracker.
-    pub fn into_vm(mut self, name: &str, ip: Ipv4Addr, state: State) -> Arc<Vm> {
-        let idle = self.idle.take().unwrap();
-        Vm::assemble(name, self.template.clone(), idle, ip, self.pager.clone(), state)
+    pub fn firecracker_alive(&mut self) -> bool {
+        self.idle.as_mut().is_some_and(|i| i.fc.alive())
     }
 
     /// Test fault `kill_prepared`: kills the Firecracker (and waits for it).
@@ -916,37 +612,49 @@ impl Prepared {
         self.idle.as_mut().unwrap().fc.kill();
     }
 
-    /// The Firecracker's directory, where the vmstate to load goes.
-    pub fn dir(&self) -> &Path {
-        &self.idle.as_ref().unwrap().dir
+    /// The VM `name` at `ip`, loaded into this Firecracker.
+    pub fn into_vm(mut self, name: &str, ip: Ipv4Addr, state: State) -> Arc<Vm> {
+        let (fc, dir, cgroup, tap) = self.idle.take().unwrap().into_parts();
+        Arc::new(Vm {
+            name: name.into(),
+            template: self.template.clone(),
+            dir,
+            ip,
+            tap,
+            pager: self.pager.clone(),
+            state: Mutex::new(state),
+            last_resize: Mutex::new(Instant::now()),
+            starved: AtomicBool::new(false),
+            reports_held: AtomicBool::new(false),
+            cow_copy: Mutex::new(false),
+            execs: Mutex::new(HashMap::new()),
+            devices: Mutex::new(()),
+            clock_unsure: AtomicBool::new(false),
+            next_exec: AtomicU64::new(0),
+            vsock: fc.sockets.vsock.clone(),
+            fc: Mutex::new(Some(fc)),
+            cgroup,
+            was_paused: AtomicBool::new(false),
+            clock_pending: AtomicBool::new(false),
+            pending_net: Mutex::new(None),
+            snapshot_discards: AtomicU64::new(0),
+            last_checkpoint: Mutex::new(None),
+            cancel_checkpoint: AtomicUsize::new(0),
+        })
     }
 
-    /// Has Firecracker do the part of the coming load that only depends on
-    /// the template (KVM VM, vCPUs, memory slots, guest memory handed to the
-    /// pager, vsock socket, pmem mapping; `firecracker/0002-*.patch`), so the
-    /// load proper only restores vCPU, VM and device state. The pager then
-    /// waits for its seed. Returns false, changing nothing, if this
-    /// Firecracker cannot prepare a load.
+    /// Has Firecracker do the template-only part of the coming load
+    /// (`firecracker/0002-*.patch`), so the load proper restores only vCPU,
+    /// VM and device state. False, changing nothing, if it cannot.
     pub fn prepare_load(&self) -> Result<bool> {
         static UNSUPPORTED: AtomicBool = AtomicBool::new(false);
         if UNSUPPORTED.load(Ordering::Relaxed) {
             return Ok(false);
         }
-        let idle = self.idle.as_ref().unwrap();
         // Before the request: Firecracker connects to the pager during it.
         self.pager.expect_seed(true);
-        let res = idle.fc.put(
-            "/snapshot/prepare",
-            json!({
-                "snapshot_path": self.template.vmstate(),
-                "mem_backend": {"backend_type": "Uffd", "backend_path": idle.fc.sockets.uffd},
-                "vsock_override": {"uds_path": idle.fc.sockets.vsock},
-                "network_overrides": [{"iface_id": "eth0", "host_dev_name": idle.tap}],
-            }),
-        );
-        match res {
+        match self.firecracker().load_snapshot(&self.template.vmstate(), self.tap(), None, API_TIMEOUT) {
             Ok(_) => Ok(true),
-            // A Firecracker without the patch rejects the path before doing anything.
             Err(e) if e.to_string().contains("Invalid request method and/or path") => {
                 self.pager.expect_seed(false);
                 if !UNSUPPORTED.swap(true, Ordering::Relaxed) {
@@ -958,74 +666,103 @@ impl Prepared {
         }
     }
 
-    /// Loads `vmstate`, the vCPUs stopped, held paused as `load` says (a
-    /// running VM is resumed by the caller: see `Vm::restore`), with
-    /// `ip` routed to its tap. Seed the pager first if pages are to come from
-    /// elsewhere. Every Firecracker request and wait ends by `deadline`, if
-    /// given. A failure (`LoadFailed` for a failed load request) says whether
-    /// a fresh Firecracker could do it: the guest never ran here either way.
+    /// Loads `vmstate` as VM `name` at `ip` (routed to its tap), its pager
+    /// seeded with `seed`, its vCPUs stopped and, with `hold`, its devices
+    /// too; everything by `deadline`. The caller resumes it (`Vm::start`).
+    /// A failed load never ran the guest: if a fresh Firecracker could do it
+    /// (this one died on its own, or the snapshot has no realtime clock), it
+    /// is tried once more on one from `spawner`, after `before_retry`.
     #[allow(clippy::too_many_arguments)]
     pub fn load(
+        self,
+        spawner: &Spawner,
+        name: &str,
+        vmstate: Snapshot,
+        seed: Option<(Runs, Origin)>,
+        ip: Ipv4Addr,
+        hold: bool,
+        deadline: Option<Instant>,
+        before_retry: impl FnOnce() -> Result<()>,
+        t: &mut Phases,
+    ) -> Result<(Arc<Vm>, Duration)> {
+        let tpl = self.template.clone();
+        let (e, realtime) = match self.load_once(name, vmstate, seed.clone(), ip, hold, true, deadline, t) {
+            Ok(r) => return Ok(r),
+            Err((e, None)) => return Err(e),
+            Err((e, Some(realtime))) => (e, realtime),
+        };
+        eprintln!("vm {name}: load failed ({e}); once more on a fresh firecracker{}", if realtime { "" } else { ", without clock_realtime" });
+        before_retry()?;
+        let fresh = Vm::prepare(spawner.take_by(deadline)?, tpl, t)?;
+        fresh.load_once(name, vmstate, seed, ip, hold, realtime, deadline, t).map_err(|(e, _)| e)
+    }
+
+    /// One load; on failure, whether another (and with `clock_realtime`) may work.
+    #[allow(clippy::too_many_arguments)]
+    fn load_once(
         mut self,
         name: &str,
-        vmstate: &Path,
+        vmstate: Snapshot,
+        seed: Option<(Runs, Origin)>,
         ip: Ipv4Addr,
-        load: Load,
+        hold: bool,
         clock_realtime: bool,
         deadline: Option<Instant>,
-        phases: &mut Phases,
-    ) -> Result<(Arc<Vm>, Duration)> {
-        LOADS.fetch_add(1, Ordering::SeqCst);
-        let idle = self.idle.as_ref().unwrap();
-        let (fc, tap) = (&idle.fc, idle.tap.clone());
+        t: &mut Phases,
+    ) -> std::result::Result<(Arc<Vm>, Duration), (crate::util::Error, Option<bool>)> {
         let left = |most: Duration| deadline.map_or(most, |d| d.saturating_duration_since(Instant::now()).min(most));
         let mut load_failed = None;
-        let restored = (|| -> Result<Duration> {
-            // Route the VM's address while Firecracker restores; it is not on the critical path.
+        let loaded = (|| -> Result<Duration> {
+            if let Some((runs, origin)) = seed {
+                self.pager.seed(runs, origin)?;
+            }
+            let path = match vmstate {
+                Snapshot::Path(p) => p.to_path_buf(),
+                Snapshot::Bytes(b) => {
+                    let p = self.dir().join("vmstate.in");
+                    std::fs::write(&p, b)?;
+                    t.mark("write_state");
+                    p
+                }
+            };
+            let fc = self.firecracker();
+            // Routed while Firecracker restores.
+            let tap = self.tap().to_string();
             let route = std::thread::spawn(move || crate::net::attach(ip, &tap));
-            let body = load_body(vmstate, fc, &idle.tap, clock_realtime);
-            let loaded = fc.request_within("PUT", "/snapshot/load", Some(body), left(crate::fc::API_TIMEOUT));
+            let loaded = fc.load_snapshot(&path, self.tap(), Some(clock_realtime), left(API_TIMEOUT));
             self.pager.loaded();
-            let took = phases.mark("snapshot_load");
+            let took = t.mark("snapshot_load");
             if let Err(e) = &loaded {
                 load_failed = Some(e.to_string());
             }
             let held = loaded.and_then(|_| {
-                if load == Load::Paused {
-                    // Loaded paused, Firecracker stops only the vCPUs and goes on
-                    // emulating devices; an API pause enters the loop that holds
-                    // device emulation too, until the resume.
-                    fc.request_within("PATCH", "/vm", Some(json!({"state": "Paused"})), left(crate::fc::API_TIMEOUT))?;
-                    phases.mark("hold_paused");
+                if hold {
+                    // Only an API pause holds device emulation too.
+                    fc.request_within("PATCH", "/vm", Some(json!({"state": "Paused"})), left(API_TIMEOUT))?;
+                    t.mark("hold_paused");
                 }
                 self.pager.wait_ready(left(Duration::from_secs(5)))
             });
             let routed = route.join().map_err(|_| "route thread panicked")?;
             held?;
             routed?;
-            phases.mark("route_wait");
+            t.mark("route_wait");
             Ok(took)
         })();
-        let took = match restored {
-            Ok(took) => took,
+        match loaded {
+            Ok(took) => Ok((self.into_vm(name, ip, State::Paused), took)),
             Err(e) => {
                 let idle = self.idle.as_mut().unwrap();
                 let retry = match &load_failed {
-                    Some(why) if why.contains(NO_REALTIME) => Some(Retry::WithoutRealtime),
+                    Some(why) if why.contains(NO_REALTIME) && clock_realtime => Some(false),
                     // Died on its own, with no page given up.
-                    Some(_) if !self.pager.lost_pages() && !idle.fc.alive() => Some(Retry::Fresh),
+                    Some(_) if !self.pager.lost_pages() && !idle.fc.alive() => Some(clock_realtime),
                     _ => None,
                 };
                 eprintln!("vm {name}: restore failed: {e} ({})", idle.fc.post_mortem(&idle.dir));
-                if load_failed.is_some() {
-                    return Err(Box::new(LoadFailed { error: e.to_string(), retry }));
-                }
-                return Err(e);
+                Err((e, retry))
             }
-        };
-        // Its vCPUs are stopped: running once the caller resumes it.
-        let state = if load.running() { State::Running } else { State::Paused };
-        Ok((self.into_vm(name, ip, state), took))
+        }
     }
 }
 
@@ -1039,38 +776,22 @@ impl Drop for Prepared {
     }
 }
 
-/// The body of a `PUT /snapshot/load` of `vmstate` into `fc`, with the
-/// vCPUs stopped (they are resumed only once nothing can fail any more).
-pub fn load_body(vmstate: &Path, fc: &Firecracker, tap: &str, clock_realtime: bool) -> Value {
-    json!({
-        "snapshot_path": vmstate,
-        "mem_backend": {"backend_type": "Uffd", "backend_path": fc.sockets.uffd},
-        "vsock_override": {"uds_path": fc.sockets.vsock},
-        "network_overrides": [{"iface_id": "eth0", "host_dev_name": tap}],
-        "clock_realtime": clock_realtime,
-        "resume_vm": false,
-    })
-}
-
-/// Whether Firecracker answered a PATCH of `path` with a client error (4xx):
-/// it has no such endpoint, so the request had no effect. Anything else (a
-/// timeout, a lost answer) may have been applied.
+/// Whether Firecracker answered a PATCH of `path` with a 4xx: no such
+/// endpoint, so it had no effect. Anything else may have been applied.
 fn rejected(e: &crate::util::Error, path: &str) -> bool {
     e.to_string().strip_prefix(&format!("firecracker PATCH {path}: ")).is_some_and(|r| r.starts_with('4'))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn only_a_client_error_means_nothing_was_held() {
         let p = "/balloon/reporting/hold";
-        let err = |m: &str| -> crate::util::Error { m.into() };
-        assert!(rejected(&err("firecracker PATCH /balloon/reporting/hold: 400 {\"fault_message\":\"x\"}"), p));
-        assert!(!rejected(&err("firecracker PATCH /balloon/reporting/hold: out of time"), p));
-        assert!(!rejected(&err("firecracker PATCH /balloon/reporting/hold: 500 oops"), p));
-        assert!(!rejected(&err("Resource temporarily unavailable (os error 11)"), p));
-        assert!(!rejected(&err("firecracker PATCH /balloon/reporting/release: 400 x"), p));
+        let rejected = |m: &str| super::rejected(&m.into(), p);
+        assert!(rejected("firecracker PATCH /balloon/reporting/hold: 400 {\"fault_message\":\"x\"}"));
+        for m in ["firecracker PATCH /balloon/reporting/hold: out of time", "firecracker PATCH /balloon/reporting/hold: 500 oops",
+                  "Resource temporarily unavailable (os error 11)", "firecracker PATCH /balloon/reporting/release: 400 x"] {
+            assert!(!rejected(m));
+        }
     }
 }

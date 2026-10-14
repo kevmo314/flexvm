@@ -25,7 +25,7 @@ use crate::template::Template;
 use crate::host::{fault, Host};
 use crate::uffd::{Frozen, Origin};
 use crate::util::{ms, Error, Phases, Result, PAGE_SIZE};
-use crate::vm::{State, Vm};
+use crate::vm::{Snapshot, State, Vm};
 use crate::vmproc::{End, Op, Proc, CLOCK_DEADLINE};
 
 /// How long a checkpoint waits for a VM to finish pulling its memory.
@@ -268,15 +268,11 @@ impl Proc {
         let (vm, restore) = (|| -> Result<_> {
             let tpl = Template::open_id(&self.paths, &m.template, &m.template_id)?;
             t.mark("verify_template");
-            let origin = Some((ck.runs, Origin::File(ck.file)));
-            let load = match hold && fault("restore_no_hold") {
-                true => crate::vm::Load::PausedUnheld,
-                false => crate::vm::Load::Paused,
-            };
+            let seed = Some((ck.runs, Origin::File(ck.file)));
             // Loaded paused: everything up to the resume below can fail
-            // without the VM having run. The bytes that were verified are
-            // loaded, from a file only root controls.
-            Vm::restore(&self.spawner, name, tpl, crate::vm::Snapshot::Bytes(&ck.vmstate), origin, ip, load, false, t)
+            // without the VM having run. The verified bytes are loaded.
+            let prepared = Vm::prepare(self.spawner.take()?, tpl, t)?;
+            prepared.load(&self.spawner, name, Snapshot::Bytes(&ck.vmstate), seed, ip, !(hold && fault("restore_no_hold")), None, || Ok(()), t)
         })()
         .map_err(Restore::NotRun)?;
         let dir = ck.dir;

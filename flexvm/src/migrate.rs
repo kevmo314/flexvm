@@ -30,7 +30,7 @@ use crate::host::fault;
 use crate::template::Template;
 use crate::uffd::{Origin, Runs, Source};
 use crate::util::{ms, recv_json, send_json, Error, Phases, Result};
-use crate::vm::{State, Vm};
+use crate::vm::{Snapshot, State, Vm};
 use crate::vmproc::{peer_call, End, Op, Proc};
 
 /// Longest a release of held packets into a VM here waits for those still on
@@ -587,41 +587,19 @@ impl Proc {
             let page = r.0;
             thread::spawn(move || crate::uffd::probe(&source, page, deadline))
         });
-        let (tpl, runs_again) = (prepared.template(), runs.clone());
         if fault("kill_prepared") {
             // Dead, and its pager has seen it go: the load fails at once, and
-            // the retry below takes over.
+            // the retry takes over.
             prepared.kill_firecracker();
             prepared.pager.firecracker_gone();
         }
-        prepared.pager.seed(runs, Origin::Peer(source.clone()))?;
-        if prepared.pager.lost_pages() {
-            bail!("its pager failed: {}", prepared.pager.failed().unwrap_or_default());
-        }
-        let vmstate = prepared.dir().join("vmstate.in");
-        std::fs::write(&vmstate, state)?;
-        t.mark("write_state");
         // Loaded with its vCPUs stopped: it must not run here before every
-        // check that can still abort the migration has passed.
-        let load = if paused { crate::vm::Load::Paused } else { crate::vm::Load::PausedUnheld };
-        let restored = match prepared.load(&name, &vmstate, ip, load, true, Some(deadline), t) {
-            // Once more on a fresh Firecracker (see `Retry`): the failed load
-            // never ran the guest, and the source, paused, still serves every page.
-            Err(e) if crate::vm::retry_of(&e).is_some() => (|| {
-                let realtime = crate::vm::retry_of(&e) != Some(crate::vm::Retry::WithoutRealtime);
-                eprintln!("vm {name}: loading it once more on a fresh firecracker{}", if realtime { "" } else { ", without clock_realtime" });
-                let _ = before_commit.take().unwrap()()?;
-                if Instant::now() >= deadline {
-                    bail!("no time left to load it again");
-                }
-                let fresh = Vm::prepare(self.spawner.take_by(Some(deadline))?, tpl, t)?;
-                fresh.pager.seed(runs_again, Origin::Peer(source.clone()))?;
-                let vmstate = fresh.dir().join("vmstate.in");
-                std::fs::write(&vmstate, state)?;
-                fresh.load(&name, &vmstate, ip, load, realtime, Some(deadline), t)
-            })(),
-            r => r,
-        };
+        // check that can still abort the migration has passed. A retry waits
+        // for the preload to be read off the connection (its pages went to
+        // the first pager; the source, paused, still serves them all).
+        let seed = Some((runs, Origin::Peer(source.clone())));
+        let retry = || before_commit.take().unwrap()().map(drop);
+        let restored = prepared.load(&self.spawner, &name, Snapshot::Bytes(state), seed, ip, paused, Some(deadline), retry, t);
         let probed = probe.map_or(Ok(()), |p| p.join().unwrap_or_else(|_| Err(std::io::Error::other("probe panicked"))));
         let (vm, _restore) = restored.map_err(|e| format!("{e} (it never ran here)"))?;
         let checked = match (probed, vm.pager.failed()) {
@@ -654,13 +632,10 @@ impl Proc {
         t.mark("register");
         self.set_vm(vm.clone());
         if !paused {
-            match vm.start(fault("resume_kill")) {
-                Ok(()) => *vm.state.lock().unwrap() = State::Running,
-                Err(e) => {
-                    // It may have run: the migration stays committed.
-                    eprintln!("vm {name}: resuming after migration {} failed: {e}", source.mig);
-                    vm.set_failed();
-                }
+            if let Err(e) = vm.start(fault("resume_kill")) {
+                // It may have run: the migration stays committed.
+                eprintln!("vm {name}: resuming after migration {} failed: {e}", source.mig);
+                vm.set_failed();
             }
             t.mark("resume");
         }

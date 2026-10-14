@@ -530,18 +530,9 @@ fn record_working_set(paths: &Paths, name: &str, tap: &str, sockets: &Arc<Socket
     let fc = Firecracker::spawn(&paths.firecracker, &run, sockets.allocate()?, crate::fc::SPAWN_READY)?;
     let pager = Pager::start(&fc.sockets.uffd, tpl.clone(), None)?;
     pager.set_pid(fc.pid())?;
-    fc.put(
-        "/snapshot/load",
-        json!({
-            "snapshot_path": tpl.vmstate(),
-            "mem_backend": {"backend_type": "Uffd", "backend_path": fc.sockets.uffd},
-            "vsock_override": {"uds_path": fc.sockets.vsock},
-            "network_overrides": [{"iface_id": "eth0", "host_dev_name": tap}],
-            // Like VM restores: stepping the clock touches pages of its own.
-            "clock_realtime": true,
-            "resume_vm": true,
-        }),
-    )?;
+    // Like VM restores: stepping the clock touches pages of its own.
+    fc.load_snapshot(&tpl.vmstate(), tap, Some(true), crate::fc::API_TIMEOUT)?;
+    fc.resume()?;
     retry(Duration::from_secs(10), || guest::ping(&fc.sockets.vsock))?;
     guest::start(&fc.sockets.vsock, "10.255.255.254".parse()?, None, &tpl.legacy_agent)?;
     // Like `run`: start a cold image template's app.
