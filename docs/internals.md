@@ -667,8 +667,12 @@ a second copy could repeat what it did.
     machines on the LAN therefore follow a migrated VM without any
     configuration. Give VMs addresses from the LAN's subnet and they can use
     the LAN's normal gateway for internet access.
-- On migration, the target routes the address to its new tap before the VM
-  resumes. The guest keeps its address and TCP state, so connections
+- On migration, the target routes the address to its new tap at the commit,
+  right before the VM resumes (its neighbour entry goes on the tap while it
+  prepares): an arrival that fails or dies before leaves this host's route
+  to the address, say back to its source, as it was. A dead arrival's
+  record (`STATE/migs/ID`) names the address, and once it reads as aborted
+  the route a peer announced for it is put back, in case it went missing. The guest keeps its address and TCP state, so connections
   continue, and packets that arrive during the downtime are held, not lost
   (`hold.rs`):
   - Just before pausing the VM, the source routes its address to a TUN
@@ -679,7 +683,15 @@ a second copy could repeat what it did.
     queue (length, sequence number, packet), then whatever reached the TUN
     device meanwhile. It waits until the target has injected all of it,
     points its own route at the target, and sends the few packets that were
-    still on their way. The target takes one stream per migration, on that
+    still on their way. If that route cannot be set, the TUN's route goes
+    too (instead of taking the address's packets with nowhere to send them)
+    while the switch is retried. Hosts sharing a network namespace (tests
+    on one machine) share that route: the target does not route the
+    address at its commit; at the point the source would switch the route,
+    it sends `SWITCH`, and the target, with all before it injected, points
+    the route at a hold of its own; the source's last packets follow, and
+    once the stream ends the target releases its hold into the VM, so the
+    held packets stay first and in order (#78). The target takes one stream per migration, on that
     connection, for that VM instance only, and stops it if the VM is killed
     or moves on. Nothing is resent: a stream that breaks off, or a source
     whose answer was lost, loses the rest (counted). Sequence numbers count

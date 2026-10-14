@@ -304,7 +304,11 @@ impl Proc {
         let (mut held, mut res) = (None, None);
         if let Some(h) = self.holder().filter(|h| h.holding_for(ip, mig)) {
             match conn.map(|c| (c, hold::start(c))) {
-                Some((c, Ok(seq))) => (held, res) = hold::send(h, ip, mig, c, seq, || self.switch_route(via)).map(|(s, r)| (Some(s), Some(r))).unwrap_or_default(),
+                Some((c, Ok(seq))) => {
+                    // Sharing our routes, the target takes the address over itself, after the held packets.
+                    let handoff = crate::net::is_local_addr(via).unwrap_or(false);
+                    (held, res) = hold::send(h, ip, mig, c, seq, handoff, || self.switch_route(via)).map(|(s, r)| (Some(s), Some(r))).unwrap_or_default()
+                }
                 started => {
                     if let Some((_, Err(e))) = started {
                         eprintln!("vm {}: {to} did not take the held packets: {e}", self.name());
@@ -411,12 +415,42 @@ impl Proc {
         let revoked = Arc::new(Mutex::new(false));
         *self.held_in.lock().unwrap() = Some(revoked.clone());
         let p = self.clone();
+        let shared = shares_routes(req["source"].as_str().unwrap_or(""));
+        let holder = self.holder().cloned().filter(|_| shared);
         thread::spawn(move || {
+            // Sharing the source's routes, the address is routed here only once the
+            // packets its hold took first are in (#78). When the source hands it over,
+            // this process's hold takes it (what the source still has comes first),
+            // and lets go of it once the stream ends; without a handover, the end
+            // of the stream routes it.
+            let (mut routed, mut holding) = (!shared, false);
+            let mut take_over = || {
+                if std::mem::replace(&mut routed, true) {
+                    return;
+                }
+                let took = match holder.as_deref() {
+                    Some(h) => vm.if_here(|| h.hold(vm.ip, mig)).inspect(|&t| holding = t),
+                    None => vm.route_here().map(|()| true),
+                };
+                if let Err(e) = took {
+                    eprintln!("vm {}: taking over {}: {e}", vm.name, vm.ip);
+                    routed = false;
+                }
+            };
             let fence = Instant::now();
             if hold::wait_start(&mut r, (fence + HOLD_FENCE).min(deadline)) {
-                hold::receive(&mut r, vm.ip, &vm.tap, &revoked, (Instant::now() + HELD_STREAM).min(deadline));
+                hold::receive(&mut r, vm.ip, &vm.tap, &revoked, (Instant::now() + HELD_STREAM).min(deadline), &mut take_over);
             } else {
                 eprintln!("vm {}: no held packets from the source after {} ms", vm.name, ms(fence.elapsed()));
+            }
+            match (holder.as_deref(), holding) {
+                (Some(h), true) => drop(release_into(h, vm.ip, mig, &vm, RELEASE_LOCAL, |()| vm.route_here())),
+                _ if !routed => {
+                    if let Err(e) = vm.route_here() {
+                        eprintln!("vm {}: routing {} to its tap: {e}", vm.name, vm.ip);
+                    }
+                }
+                _ => {}
             }
             p.held_in.lock().unwrap().take();
             p.announce();
@@ -453,14 +487,14 @@ impl Proc {
         let source = Source { addr: req["source"].as_str().ok_or("missing source")?.into(), vm: name.clone(), mig, regions };
         self.set_name(self.host.take_name(&name, false)?);
         let by = serde_json::from_value(req["source_ident"].clone()).ok();
-        *self.arrived.lock().unwrap() = Some(self.host.mig_begin(mig, &source.addr, by)?);
+        let ip: Ipv4Addr = req["ip"].as_str().ok_or("missing ip")?.parse()?;
+        *self.arrived.lock().unwrap() = Some(self.host.mig_begin(mig, &source.addr, by, Some(ip))?);
         let need = req["rss_mib"].as_u64().unwrap_or(0);
         if !self.host.admit(need) {
             bail!("not enough memory here for {need} MiB above the {} MiB reserve", self.host.cfg.reserve_mib);
         }
         let tpl = Template::open_id(&self.paths, req["template"].as_str().ok_or("missing template")?, req["id"].as_str().ok_or("missing template id")?)?;
         t.mark("template");
-        let ip: Ipv4Addr = req["ip"].as_str().ok_or("missing ip")?.parse()?;
         let claim = self.host.claim_incoming(&self.host.lock()?, &name, ip, req["gen"].as_u64().unwrap_or(0))?;
         self.set_addr(claim);
         t.mark("claim_ip");
@@ -469,6 +503,14 @@ impl Proc {
         t.mark("spawn");
         let load_set = crate::standby::load_set(&self.host, &tpl);
         let vm = Vm::prepare(idle, tpl, t)?;
+        // All of routing the address here but the route itself, which waits for the commit.
+        crate::net::neighbour(ip, vm.tap())?;
+        t.mark("neighbour");
+        if shares_routes(&source.addr) {
+            // Ready before the source pauses: it takes the address over from the source's hold.
+            self.holder();
+            t.mark("holder");
+        }
         if vm.prepare_load()? {
             t.mark("prepare_load");
         }
@@ -509,7 +551,10 @@ impl Proc {
         // A retry first drains the preload off the connection (the source still serves those pages).
         let seed = Some((runs, Origin::Peer(source.clone())));
         let retry = || before_commit.take().unwrap()().map(drop);
-        let restored = prepared.load(&self.spawner, &name, Snapshot::Bytes(state), seed, ip, paused, Some(deadline), retry, t);
+        // Routed here at the commit (sharing the source's routes, after the held packets):
+        // until then the route back to the source stays, whatever happens to this arrival.
+        let shared = shares_routes(&source.addr);
+        let restored = prepared.unrouted().load(&self.spawner, &name, Snapshot::Bytes(state), seed, ip, paused, Some(deadline), retry, t);
         let probed = probe.map_or(Ok(()), |p| p.join().unwrap_or_else(|_| Err(std::io::Error::other("probe panicked"))));
         // A load that fails for want of pages says less than the probe of the source does.
         let (vm, _) = match (restored, &probed) {
@@ -528,6 +573,11 @@ impl Proc {
                 }
                 if !self.host.current(&l, ip, self.gen())? {
                     bail!("generation {} of {ip} was withdrawn or superseded meanwhile", self.gen());
+                }
+                // A failed commit takes the tap, and this route, with it; `finish` puts the peer's back.
+                if !shared {
+                    crate::net::route_dev(true, ip, crate::net::ifindex(&vm.tap)?)?;
+                    t.mark("route");
                 }
                 self.arrived.lock().unwrap().as_mut().ok_or("no migration record")?.commit(&l)?;
                 Ok(l)
@@ -553,6 +603,19 @@ impl Proc {
         self.publish();
         Ok(vm)
     }
+}
+
+/// Whether the host at `addr` (a listener's) is this one, routes and all.
+fn shares_routes(addr: &str) -> bool {
+    let ip = match addr.parse::<std::net::SocketAddr>().map(|a| a.ip()) {
+        Ok(std::net::IpAddr::V4(ip)) => ip,
+        Ok(std::net::IpAddr::V6(ip)) => match ip.to_ipv4_mapped() {
+            Some(ip) => ip,
+            None => return ip.is_loopback(),
+        },
+        Err(_) => return false,
+    };
+    crate::net::is_local_addr(ip).unwrap_or(false)
 }
 
 fn outcome(to: &str, mig: u64, patience: Duration) -> Option<Outcome> {

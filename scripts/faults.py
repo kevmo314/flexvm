@@ -954,6 +954,121 @@ def abort_superseded():
     subprocess.run(["ip", "route", "del", f"{ip}/32"], capture_output=True)
 
 
+def same_host_order():
+    """#78: hosts sharing a network namespace share routes, so the target must
+    not route the VM's address to its tap before the packets the source's
+    hold took first are in. A 1 kHz UDP sequence stream across migrations
+    there and back arrives whole and in order."""
+    n = "ft-same-host"
+    ok(run(A, n))
+    ip = vm_ip(A, n)
+    code, out = sh(A, n, "setsid socat -u UDP-RECV:9000 OPEN:/tmp/udp,creat,append >/dev/null 2>&1 < /dev/null &")
+    assert code == 0, out
+    time.sleep(0.3)
+    stop, sent = threading.Event(), [0]
+
+    def stream():
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        while not stop.is_set():
+            s.sendto(b"%08d\n" % sent[0], (ip, 9000))
+            sent[0] += 1
+            time.sleep(0.001)
+
+    t = threading.Thread(target=stream, daemon=True)
+    t.start()
+    time.sleep(0.5)
+    held = []
+    for src, dst in ((A, B), (B, A), (A, B)):
+        r = migrate(src, n, dst)
+        held.append((r.get("result") or {}).get("held") or r.get("error"))
+        wait_released(dst, n, src)
+        time.sleep(0.3)
+    stop.set()
+    t.join(10)
+    time.sleep(0.3)
+    check("same host order: migrated, running on B", where(n) == {B: "running"}, where(n))
+    check("same host order: packets held each time, all injected",
+          all(isinstance(h, dict) and h.get("packets", 0) > 0 and h.get("injected") == h.get("packets") and h.get("dropped") == 0
+              and h.get("dropped_target") == 0 for h in held), held)
+    code, out = sh(B, n, "cat /tmp/udp")
+    got = [int(x) for x in out.split()] if code == 0 else []
+    missing = sorted(set(range(sent[0])) - set(got))
+    check("same host order: no udp datagram lost", not missing, f"sent {sent[0]}, missing {missing[:40]}")
+    late = [got[max(0, i - 3):i + 12] for i, (a, b) in enumerate(zip(got, got[1:])) if b <= a]
+    check("same host order: none reordered", not late, late[:10])
+    cleanup(n)
+
+
+def peer_route(ip):
+    """The kernel's route for `ip`: shared by A and B."""
+    return subprocess.run(["ip", "route", "show", f"{ip}/32"], capture_output=True, text=True).stdout.strip()
+
+
+def arrival_with_peer_route(n, ip):
+    """B learns that an address of A's is routed via a peer (an on-link
+    address that is not ours, the default gateway, so the route is really
+    installed), then takes an arrival of it that sends a vmstate that cannot
+    load and preloaded pages it never sends. Returns (socket, mig, gateway)."""
+    gw = subprocess.run(["ip", "route", "show", "default"], capture_output=True, text=True).stdout.split()[2]
+    gen = addr(B, ip).get("seen", 0) + 1
+    r = peer(B, {"op": "route", "ip": ip, "via": gw, "gen": gen})
+    assert r.get("ok"), r
+    assert f"via {gw}" in peer_route(ip), peer_route(ip)
+    s, r, mig = migrate_in_raw(B, n, ip, source_vm(), gen=gen)
+    assert r.get("ok"), r
+    bad = os.urandom(4096)
+    s.sendall((json.dumps({"runs": [], "vmstate_len": len(bad), "preload": [0], "paused": False}) + "\n").encode() + bad)
+    return s, mig, gw, gen
+
+
+def forget_peer_route(ip, gen):
+    peer(B, {"op": "route", "ip": ip, "gen": gen})
+    subprocess.run(["ip", "route", "del", f"{ip}/32"], capture_output=True)
+
+
+def arrival_abort_route():
+    """#90: an arrival that fails before it commits leaves the target host's
+    route back to its peer alone; the address never routes to its tap."""
+    n, ip = "ft-abort-route", A.ips.split("-")[1].rsplit(".", 1)[0] + ".201"
+    scenario_vms.add(n)
+    s, mig, gw, gen = arrival_with_peer_route(n, ip)
+    seen, lock = set(), os.path.join(B.run, "vms", f"{n}.lock")
+    # Until it gives up (its preload never comes), watch the route.
+    end = time.time() + 5
+    while time.time() < end:
+        seen.add(peer_route(ip))
+        time.sleep(0.005)
+    s.close()
+    check("arrival abort route: gone from B", wait_for(lambda: n not in vms(B) and not os.path.exists(lock), 40), vms(B).get(n))
+    seen.add(peer_route(ip))
+    check("arrival abort route: the route via the peer stayed throughout", seen == {r for r in seen if f"via {gw}" in r}, seen)
+    st = ok(peer(B, {"op": "migration", "mig": mig}))
+    check("arrival abort route: aborted", st["outcome"] == "aborted", st)
+    forget_peer_route(ip, gen)
+
+
+def arrival_killed_route():
+    """#90: an arrival SIGKILLed before it commits (no cleanup runs) leaves
+    the route back to its peer; one lost meanwhile is put back once its
+    migration reads as aborted."""
+    n, ip = "ft-killed-route", A.ips.split("-")[1].rsplit(".", 1)[0] + ".202"
+    scenario_vms.add(n)
+    s, mig, gw, gen = arrival_with_peer_route(n, ip)
+    lock = os.path.join(B.run, "vms", f"{n}.lock")
+    pid = json.load(open(lock))["pid"]
+    # Its load failed; it waits for the preloaded pages.
+    time.sleep(2)
+    check("arrival killed route: the route via the peer stays while it waits", f"via {gw}" in peer_route(ip), peer_route(ip))
+    subprocess.run(["ip", "route", "del", f"{ip}/32"], capture_output=True)
+    os.kill(pid, signal.SIGKILL)
+    s.close()
+    check("arrival killed route: dead", wait_for(lambda: not alive(pid), 10), pid)
+    st = ok(peer(B, {"op": "migration", "mig": mig}))
+    check("arrival killed route: aborted", st["outcome"] == "aborted", st)
+    check("arrival killed route: the route via the peer is put back", f"via {gw}" in peer_route(ip), (peer_route(ip), addr(B, ip)))
+    forget_peer_route(ip, gen)
+
+
 def fc_prepare():
     """Firecracker's prepared load (firecracker/0002-*.patch): refuses a second
     prepare, a snapshot of another layout, and a load after boot config."""
@@ -3272,7 +3387,8 @@ SCENARIOS = dict(
     kill_refused_checkpoint=no_evict(kill_refused_checkpoint), wildcard_listen=wildcard_listen,
     forged_peer=forged_peer, restore_ip_peer=restore_ip_peer, late_withdrawal=late_withdrawal,
     incoming_killed=incoming_killed, start_killed=start_killed, claim_killed=claim_killed, fc_died=fc_died,
-    cow_wp_race=cow_wp_race, fetch_tail_enomem=fetch_tail_enomem, fetch_enomem_stuck=fetch_enomem_stuck)
+    cow_wp_race=cow_wp_race, fetch_tail_enomem=fetch_tail_enomem, fetch_enomem_stuck=fetch_enomem_stuck,
+    same_host_order=same_host_order, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route)
 names = [n for s in args.scenarios for n in (list(SCENARIOS) if s == "all" else [s])]
 if os.geteuid() != 0:
     sys.exit("run as root (sudo)")

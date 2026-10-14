@@ -14,7 +14,8 @@
 #
 # env: FLEXVM (binary), ARTIFACTS, P (namespace prefix, default fv5), NET
 #      (default 192.168.155), ROUNDS (default 3), UDP_PPS (default 5000),
-#      MAX_UDP_LOSS (default 0)
+#      MAX_UDP_LOSS (default 0), PORT (listeners, default 7070), PREFIX (taps, default
+#      fvn), WORK (keep logs under this directory, default /tmp), TEMPLATE (default default)
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -25,12 +26,14 @@ NET=${NET:-192.168.155}
 ROUNDS=${ROUNDS:-3}
 UDP_PPS=${UDP_PPS:-5000}
 MAX_UDP_LOSS=${MAX_UDP_LOSS:-0}
-host_A=$NET.1:7070
-host_B=$NET.2:7070
+PORT=${PORT:-7070}
+host_A=$NET.1:$PORT
+host_B=$NET.2:$PORT
 dir_A=/run/$P-a
 dir_B=/run/$P-b
 name=nettest-$$
-work=$(mktemp -d /tmp/flexvm-nettest.XXXXXX)
+work=${WORK:+$(mkdir -p "$WORK" && mktemp -d "$WORK/nettest.XXXXXX")}
+work=${work:-$(mktemp -d /tmp/flexvm-nettest.XXXXXX)}
 listener_pids=()
 bg_pids=()
 failed=0
@@ -109,7 +112,7 @@ done
 start_listener() {
     local ns=$1 dir=$2 listen=$3 peer=$4 ips=$5
     mkdir -p "$dir/state" "$dir/run"
-    cli "$ns" "$dir" listen "$listen" --peer "$peer" --announce-dev eth0 --vm-ips "$ips" --prefix fvn > "$work/listen-$ns.log" 2>&1 &
+    cli "$ns" "$dir" listen "$listen" --peer "$peer" --announce-dev eth0 --vm-ips "$ips" --prefix "${PREFIX:-fvn}" > "$work/listen-$ns.log" 2>&1 &
     listener_pids+=($!)
 }
 start_listener "${P}A" "$dir_A" "$host_A" "$host_B" "$NET.128-$NET.191"

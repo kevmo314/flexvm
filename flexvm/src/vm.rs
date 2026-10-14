@@ -110,7 +110,7 @@ impl Vm {
     pub fn prepare(idle: Idle, template: Arc<Template>, phases: &mut Phases) -> Result<Prepared> {
         crate::compat::check(&template, idle.fc.pid())?;
         let pager = Pager::start(&idle.fc.sockets.uffd, template.clone(), None)?;
-        let prepared = Prepared { idle: Some(idle), pager, template };
+        let prepared = Prepared { idle: Some(idle), pager, template, route: true };
         prepared.pager.set_pid(prepared.firecracker().pid())?;
         phases.mark("pager_start");
         Ok(prepared)
@@ -234,6 +234,24 @@ impl Vm {
         }
         self.fc(|fc| fc.resume())?;
         Ok(State::Running)
+    }
+
+    /// Routes the address to the tap (its neighbour entry is there: `net::neighbour`)
+    /// unless the VM left meanwhile (a checkpoint's or migration's hold routes it then).
+    /// Under `state` (not `devices`, which a slow balloon request may hold): `leave` changes
+    /// it before the hold routes the address elsewhere.
+    pub fn route_here(&self) -> Result<()> {
+        self.if_here(|| crate::net::route_dev(true, self.ip, crate::net::ifindex(&self.tap)?)).map(drop)
+    }
+
+    /// Runs `f` (which routes the address) unless the VM left; false if it had.
+    pub fn if_here(&self, f: impl FnOnce() -> Result<()>) -> Result<bool> {
+        let st = self.state.lock().unwrap();
+        if !matches!(*st, State::Running | State::Paused) || self.pager.failed().is_some() {
+            return Ok(false);
+        }
+        f()?;
+        Ok(true)
     }
 
     pub fn end_checkpoint(&self) -> Result<State> {
@@ -518,6 +536,8 @@ pub struct Prepared {
     idle: Option<Idle>,
     pub pager: Arc<Pager>,
     template: Arc<Template>,
+    /// Routes the VM's /32 to its tap while loading; a migration target does it at commit.
+    route: bool,
 }
 
 impl Prepared {
@@ -527,6 +547,12 @@ impl Prepared {
 
     pub fn firecracker(&self) -> &Firecracker {
         &self.idle.as_ref().unwrap().fc
+    }
+
+    /// The load leaves the address's route alone (a migration target routes it at commit).
+    pub fn unrouted(mut self) -> Prepared {
+        self.route = false;
+        self
     }
 
     pub fn tap(&self) -> &str {
@@ -608,7 +634,7 @@ impl Prepared {
         before_retry: impl FnOnce() -> Result<()>,
         t: &mut Phases,
     ) -> Result<(Arc<Vm>, Duration)> {
-        let tpl = self.template.clone();
+        let (tpl, route) = (self.template.clone(), self.route);
         let (e, realtime) = match self.load_once(name, vmstate, seed.clone(), ip, hold, true, deadline, t) {
             Ok(r) => return Ok(r),
             Err((e, None)) => return Err(e),
@@ -616,7 +642,12 @@ impl Prepared {
         };
         eprintln!("vm {name}: load failed ({e}); once more on a fresh firecracker{}", if realtime { "" } else { ", without clock_realtime" });
         before_retry()?;
-        let fresh = Vm::prepare(spawner.take(deadline)?, tpl, t)?;
+        let mut fresh = Vm::prepare(spawner.take(deadline)?, tpl, t)?;
+        fresh.route = route;
+        if !route {
+            // The route waits, but everything else about it goes on the fresh tap.
+            crate::net::neighbour(ip, fresh.tap())?;
+        }
         fresh.load_once(name, vmstate, seed, ip, hold, realtime, deadline, t).map_err(|(e, _)| e)
     }
 
@@ -650,7 +681,7 @@ impl Prepared {
             };
             let fc = self.firecracker();
             let tap = self.tap().to_string();
-            let route = std::thread::spawn(move || crate::net::attach(ip, &tap));
+            let route = self.route.then(|| std::thread::spawn(move || crate::net::attach(ip, &tap)));
             let loaded = fc.load_snapshot(&path, self.tap(), Some(clock_realtime), left(API_TIMEOUT));
             self.pager.loaded();
             let took = t.mark("snapshot_load");
@@ -665,7 +696,7 @@ impl Prepared {
                 }
                 self.pager.wait_ready(left(Duration::from_secs(5)))
             });
-            let routed = route.join().map_err(|_| "route thread panicked")?;
+            let routed = route.map_or(Ok(Ok(())), |r| r.join()).map_err(|_| "route thread panicked")?;
             held?;
             routed?;
             t.mark("route_wait");

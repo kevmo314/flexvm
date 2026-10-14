@@ -109,9 +109,14 @@ fn ifreq(name: &str) -> libc::ifreq {
 /// Puts the gateway MAC back first: udev (`MACAddressPolicy=persistent`) may have replaced
 /// it, leaving the guest's pinned gateway ARP entry pointing nowhere.
 pub fn attach(ip: Ipv4Addr, tap: &str) -> Result<()> {
+    route_dev(true, ip, neighbour(ip, tap)?)
+}
+
+/// `attach` but the route, which a migration target installs at its commit; returns the
+/// tap's index.
+pub fn neighbour(ip: Ipv4Addr, tap: &str) -> Result<u32> {
     let ifindex = ifindex(tap)?;
     set_mac(ifindex, &parse_mac(GATEWAY_MAC)?)?;
-    route_dev(true, ip, ifindex)?;
     let mut neigh = Vec::with_capacity(32);
     neigh.extend_from_slice(&[libc::AF_INET as u8, 0, 0, 0]);
     neigh.extend_from_slice(&ifindex.to_ne_bytes());
@@ -119,7 +124,8 @@ pub fn attach(ip: Ipv4Addr, tap: &str) -> Result<()> {
     neigh.extend_from_slice(&[0, 0]); // flags, type
     attr(&mut neigh, NDA_DST, &ip.octets());
     attr(&mut neigh, NDA_LLADDR, &parse_mac(GUEST_MAC)?);
-    netlink(RTM_NEWNEIGH, NLM_F_CREATE | NLM_F_REPLACE, &neigh)
+    netlink(RTM_NEWNEIGH, NLM_F_CREATE | NLM_F_REPLACE, &neigh)?;
+    Ok(ifindex)
 }
 
 /// struct ifinfomsg: family, pad, type, index, flags, change.
@@ -136,7 +142,7 @@ fn set_mac(ifindex: u32, mac: &[u8; 6]) -> Result<()> {
     netlink(RTM_SETLINK, 0, &msg)
 }
 
-fn is_local_addr(ip: Ipv4Addr) -> Result<bool> {
+pub fn is_local_addr(ip: Ipv4Addr) -> Result<bool> {
     if ip.is_loopback() {
         return Ok(true);
     }
