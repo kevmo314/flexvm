@@ -9,15 +9,16 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
 
+target=${CARGO_TARGET_DIR:-$root/target}
 RUSTFLAGS="-C target-feature=+crt-static" cargo build --release -p flexvm-init --target x86_64-unknown-linux-gnu
 # Also injected into templates built from container images (flexvm template --image).
-install -m 755 target/x86_64-unknown-linux-gnu/release/flexvm-init artifacts/flexvm-init
+install -m 755 "$target"/x86_64-unknown-linux-gnu/release/flexvm-init artifacts/flexvm-init
 
 work=$root/build/rootfs
 sudo rm -rf "$work"
 mkdir -p "$(dirname "$work")"
 sudo unsquashfs -q -d "$work" artifacts/base.squashfs
-sudo install -m 755 target/x86_64-unknown-linux-gnu/release/flexvm-init "$work/sbin/flexvm-init"
+sudo install -m 755 "$target"/x86_64-unknown-linux-gnu/release/flexvm-init "$work/sbin/flexvm-init"
 
 # Size to the content plus headroom, rounded up to 2 MiB as virtio-pmem requires.
 kib=$(sudo du -sk "$work" | cut -f1)

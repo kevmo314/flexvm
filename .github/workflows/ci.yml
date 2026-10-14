@@ -23,7 +23,8 @@ env:
 
 jobs:
   check:
-    name: fmt, clippy, unit tests, release build
+    # The release build is the e2e job's: it builds the binary that the tests run.
+    name: fmt, clippy, unit tests
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -47,8 +48,6 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: unit tests
         run: cargo test --workspace
-      - name: release build
-        run: cargo build --release --workspace
 
   e2e:
     name: end-to-end (KVM)
@@ -70,11 +69,6 @@ jobs:
           python3 -c 'import fcntl, os; fd = os.open("/dev/kvm", os.O_RDWR); v = fcntl.ioctl(fd, 0xAE00); vm = fcntl.ioctl(fd, 0xAE01, 0); print("KVM API", v, "vm fd", vm); assert v == 12'
           nproc; free -m; uname -r
 
-      - name: Host packages
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q --no-install-recommends musl-tools libseccomp-dev squashfs-tools e2fsprogs
-
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-09
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -82,6 +76,12 @@ jobs:
         with:
           key: e2e
           cache-on-failure: true
+
+      # flexvm builds in the background (its release profile: fat LTO, one codegen unit,
+      # as shipped) while the steps below restore or build the rest; "Build flexvm" waits.
+      - name: Start building flexvm
+        run: |
+          nohup sh -c 'cargo build --release -p flexvm; echo $? > "$RUNNER_TEMP/build.status"' > "$RUNNER_TEMP/build.log" 2>&1 &
 
       # Cache keys: the build inputs in the repo, what fetch.sh resolves (versions and
       # URLs, plus the ETags of the unversioned S3 objects), and the build environment
@@ -113,7 +113,10 @@ jobs:
           key: firecracker-${{ steps.keys.outputs.env }}-${{ steps.keys.outputs.fc }}-${{ hashFiles('firecracker/*.patch', 'scripts/build-firecracker.sh') }}
       - name: Build Firecracker
         if: steps.fc-cache.outputs.cache-hit != 'true'
-        run: ./scripts/build-firecracker.sh
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends musl-tools libseccomp-dev
+          ./scripts/build-firecracker.sh
       - name: Save Firecracker
         if: steps.fc-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -157,7 +160,12 @@ jobs:
           key: rootfs-${{ steps.keys.outputs.env }}-rust${{ env.RUST_TOOLCHAIN }}-base${{ steps.fetch.outputs.base }}-${{ hashFiles('guest/**', 'scripts/build-rootfs.sh', 'Cargo.lock', 'Cargo.toml') }}
       - name: Build rootfs
         if: steps.rootfs-cache.outputs.cache-hit != 'true'
-        run: ./scripts/build-rootfs.sh
+        # A target directory of its own: it builds while flexvm does.
+        env:
+          CARGO_TARGET_DIR: target/guest
+        run: |
+          command -v unsquashfs > /dev/null || { sudo apt-get update -q; sudo apt-get install -y -q --no-install-recommends squashfs-tools; }
+          ./scripts/build-rootfs.sh
       - name: Save rootfs
         if: steps.rootfs-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -169,10 +177,13 @@ jobs:
           key: ${{ steps.rootfs-cache.outputs.cache-primary-key }}
 
       - name: Build flexvm
-        run: cargo build --release -p flexvm
+        run: |
+          while [ ! -e "$RUNNER_TEMP/build.status" ]; do sleep 1; done
+          cat "$RUNNER_TEMP/build.log"
+          exit "$(cat "$RUNNER_TEMP/build.status")"
 
       - name: End-to-end tests
-        run: sudo python3 -u scripts/e2e.py --log-dir "$RUNNER_TEMP/e2e-logs"
+        run: sudo python3 -u scripts/e2e.py --jobs 4 --log-dir "$RUNNER_TEMP/e2e-logs"
 
       - name: Collect logs
         if: failure() || cancelled()
