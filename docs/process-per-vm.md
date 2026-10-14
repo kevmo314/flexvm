@@ -111,6 +111,11 @@ process the registry or lock names, checked after opening.
 reusable and its migration settled, only once the Firecrackers it started
 have exited: `host::reap` reads them from its work directory (whose `owner`
 must be that process), SIGKILLs each through a pidfd and waits for it.
+Whether a process is gone has one answer (`Ident::liveness`): alive, gone
+on proof (another boot, no such pid, a zombie, another process with its pid),
+or unknown (`/proc` or a record could not be read, say out of fds), which
+counts as alive everywhere: names, address holders, migration records,
+reaping and garbage collection never reclaim on it.
 Firecracker also gets `PR_SET_PDEATHSIG` (checked, and the parent checked
 alive after it), so they die anyway; reaping makes the order certain.
 
