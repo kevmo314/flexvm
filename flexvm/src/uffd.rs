@@ -309,8 +309,7 @@ impl Pager {
 
     /// Starts the working-set prefetch once it is `due` and, while learning the load set, the snapshot is `loaded`.
     fn start_prefetch(self: &Arc<Self>, loaded: bool, due: bool) {
-        let mut state = self.prefetch.lock().unwrap();
-        if state.request(loaded, due) {
+        if self.prefetch.lock().unwrap().request(loaded, due) {
             let p = self.clone();
             thread::spawn(move || p.prefetch());
         }
