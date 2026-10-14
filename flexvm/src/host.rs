@@ -284,15 +284,15 @@ impl Host {
         cfg
     }
 
-    fn worker_flock(&self) -> Option<File> {
+    fn worker_flock(&self) -> Option<Flock> {
         let f = File::options().create(true).truncate(false).write(true).open(self.state.join("evict.worker.lock")).ok()?;
-        flock(&f, libc::LOCK_EX | libc::LOCK_NB).ok().map(|()| f)
+        Flock::new(f, libc::LOCK_EX | libc::LOCK_NB).ok()
     }
 
     /// `STATE/evict.worker.lock`, held by the thread running an eviction for
     /// as long as it runs (and let go with its process). Taken under the
     /// host lock, as `evicting` probes it, so the two never meet.
-    pub fn evict_worker_lock(&self) -> Result<File> {
+    pub fn evict_worker_lock(&self) -> Result<Flock> {
         let _l = self.lock()?;
         self.worker_flock().ok_or_else(|| "another eviction runs here".into())
     }
@@ -1056,7 +1056,27 @@ pub struct Locked(#[allow(dead_code)] Option<(File, std::sync::MutexGuard<'stati
 
 impl Drop for Locked {
     fn drop(&mut self) {
+        if let Some((f, _)) = &self.0 {
+            let _ = flock(f, libc::LOCK_UN); // Before the threads' mutex: see `Flock`.
+        }
         DEPTH.with(|d| d.set(d.get() - 1));
+    }
+}
+
+/// An exclusive flock, let go of when dropped. Unlocked, not only closed: a
+/// child another thread forks meanwhile shares the open file until it execs,
+/// and the lock would be held that long.
+pub struct Flock(File);
+
+impl Flock {
+    pub fn new(f: File, how: i32) -> std::io::Result<Flock> {
+        flock(&f, how).map(|()| Flock(f))
+    }
+}
+
+impl Drop for Flock {
+    fn drop(&mut self) {
+        let _ = flock(&self.0, libc::LOCK_UN);
     }
 }
 
@@ -2055,7 +2075,9 @@ mod tests {
         assert!(h.lock_by(Some(start + Duration::from_millis(50))).is_err() && start.elapsed() < Duration::from_secs(1));
         release.0.send(()).unwrap();
         t.join().unwrap();
-        assert!(h.lock_by(Some(std::time::Instant::now() + Duration::from_secs(1))).is_ok());
+        // Had once let go of; not within 1 s, as other tests' host locks take the same
+        // per-process mutex, and one may hold it for longer than that.
+        assert!(h.lock_by(Some(std::time::Instant::now() + Duration::from_secs(30))).is_ok());
         // Errors and garbage are unknown, never gone; a zombie is gone.
         let emfile = |_| Err(std::io::Error::from_raw_os_error(libc::EMFILE));
         assert_eq!(liveness_by(&me, boot_id(), emfile), Liveness::Unknown);
@@ -2136,7 +2158,11 @@ mod tests {
             } else {
                 assert!(h.observe(&l, addr, gen, Some(ip("10.1.0.2"))).unwrap());
             }
+            drop(l);
             for _ in 0..2048 {
+                // Taken per round: held across them all, the lock's per-process mutex would
+                // keep other tests' host locks waiting for seconds.
+                let l = h.lock().unwrap();
                 for addr in [addr, ip("10.9.0.2"), ip("10.9.0.3")] {
                     let claim = h.claim_new(&l, "new", Some(addr)).unwrap();
                     assert!(claim.gen > gen && claim.gen <= GEN_MAX);

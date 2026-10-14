@@ -187,10 +187,8 @@ fn cached_blob<R: Read>(digest: &str, size: u64, blobs: &Path, download: impl Fn
 }
 
 pub(super) fn sweep_parts(dir: &Path) {
-    let Ok(lock) = std::fs::File::open(dir) else { return };
-    if crate::host::flock(&lock, libc::LOCK_EX | libc::LOCK_NB).is_err() {
-        return;
-    }
+    let Ok(dir_lock) = std::fs::File::open(dir) else { return };
+    let Ok(_lock) = crate::host::Flock::new(dir_lock, libc::LOCK_EX | libc::LOCK_NB) else { return };
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         let name = entry.file_name();
@@ -297,6 +295,8 @@ mod tests {
         sweep_parts(&dir);
         assert!(!stale.exists());
         assert!(live.exists() && other.exists() && blob.exists());
+        // Unlocked, not only closed: a child another test forks meanwhile shares the lock until it execs.
+        crate::host::flock(&lock, libc::LOCK_UN).unwrap();
         drop(lock);
         sweep_parts(&dir);
         assert!(!live.exists());
