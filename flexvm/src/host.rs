@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::net::Ipv4Addr;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -695,37 +695,21 @@ pub struct PidFd(OwnedFd);
 impl PidFd {
     /// A pidfd for `id`, or None if that process is gone.
     pub fn open(id: &Ident) -> Result<Option<PidFd>> {
-        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, id.pid, 0) };
-        if fd < 0 {
-            let e = std::io::Error::last_os_error();
-            if e.raw_os_error() == Some(libc::ESRCH) {
-                return Ok(None);
-            }
-            bail!("pidfd_open {}: {e}", id.pid);
+        match crate::util::pidfd_open(id.pid) {
+            // Opened first, then checked: if it is `id` now, the fd is `id`'s.
+            Ok(fd) => Ok(id.alive().then_some(PidFd(fd))),
+            Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Ok(None),
+            Err(e) => bail!("pidfd_open {}: {e}", id.pid),
         }
-        let fd = PidFd(unsafe { OwnedFd::from_raw_fd(fd as i32) });
-        // Opened first, then checked: if it is `id` now, the fd is `id`'s.
-        Ok(id.alive().then_some(fd))
     }
 
     pub fn signal(&self, sig: i32) -> Result<()> {
-        if unsafe { libc::syscall(libc::SYS_pidfd_send_signal, self.0.as_raw_fd(), sig, std::ptr::null::<libc::siginfo_t>(), 0) } < 0 {
-            bail!("signal {sig}: {}", std::io::Error::last_os_error());
-        }
-        Ok(())
+        Ok(crate::util::pidfd_signal(&self.0, sig).map_err(|e| format!("signal {sig}: {e}"))?)
     }
 
     /// Waits up to `timeout` for the process to exit.
     pub fn wait(&self, timeout: Duration) -> bool {
-        let mut pfd = libc::pollfd { fd: self.0.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-        let end = std::time::Instant::now() + timeout;
-        loop {
-            match unsafe { libc::poll(&mut pfd, 1, end.saturating_duration_since(std::time::Instant::now()).as_millis() as i32) } {
-                n if n > 0 => return true,
-                n if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => {}
-                _ => return false,
-            }
-        }
+        crate::util::pidfd_wait(&self.0, timeout).unwrap_or(false)
     }
 }
 

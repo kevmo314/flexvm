@@ -177,24 +177,29 @@ pub fn pidfd_open(pid: u32) -> io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
 }
 
+/// Sends `sig` to the process behind `pidfd`.
+pub fn pidfd_signal(pidfd: &OwnedFd, sig: i32) -> io::Result<()> {
+    match unsafe { libc::syscall(libc::SYS_pidfd_send_signal, pidfd.as_raw_fd(), sig, std::ptr::null::<libc::siginfo_t>(), 0) } {
+        0 => Ok(()),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
 /// SIGKILLs the process behind `pidfd`; one that already exited is fine.
 pub fn pidfd_kill(pidfd: &OwnedFd) -> io::Result<()> {
-    let null = std::ptr::null::<libc::siginfo_t>();
-    if unsafe { libc::syscall(libc::SYS_pidfd_send_signal, pidfd.as_raw_fd(), libc::SIGKILL, null, 0) } < 0 {
-        let e = io::Error::last_os_error();
-        if e.raw_os_error() != Some(libc::ESRCH) {
-            return Err(e);
-        }
-    }
-    Ok(())
+    pidfd_signal(pidfd, libc::SIGKILL).or_else(|e| if e.raw_os_error() == Some(libc::ESRCH) { Ok(()) } else { Err(e) })
 }
 
 /// Waits up to `timeout` for the process behind `pidfd` to exit.
 pub fn pidfd_wait(pidfd: &OwnedFd, timeout: Duration) -> io::Result<bool> {
     let mut pfd = libc::pollfd { fd: pidfd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-    match unsafe { libc::poll(&mut pfd, 1, timeout.as_millis().min(i32::MAX as u128) as i32) } {
-        n if n < 0 => Err(io::Error::last_os_error()),
-        n => Ok(n > 0),
+    let end = Instant::now() + timeout;
+    loop {
+        match unsafe { libc::poll(&mut pfd, 1, end.saturating_duration_since(Instant::now()).as_millis().min(i32::MAX as u128) as i32) } {
+            n if n >= 0 => return Ok(n > 0),
+            _ if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => {}
+            _ => return Err(io::Error::last_os_error()),
+        }
     }
 }
 
