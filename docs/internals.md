@@ -769,14 +769,17 @@ queued at the snapshot are processed at its first resume, which kicks
 every queue.
 
 `firecracker/0004-sync-tsc-after-restore.patch`: once every vCPU is restored,
-sets each one's TSC (and TSC deadline) from the snapshot again, back to back.
-KVM takes TSC writes less than a second apart as meant to be in sync and
-gives them one offset. Restoring a vCPU can take much longer than that: its
-MSRs map guest pages (kvmclock, steal time), which a migration target may
-still be paging in, from a source that is slow or down for a while. The
-vCPUs' TSCs then ended up apart by that long. The guest's clocksource is the
-TSC, so its clock jumped by that much after the step to host time (#136,
-`guest_calls`: +3.3 s after a 3 s page server outage).
+gives them all vCPU 0's TSC offset (`KVM_VCPU_TSC_OFFSET`, Linux 5.16+), as
+they had on the source, and sets each one's TSC deadline, which counts in its
+TSC, again. Each vCPU's restore writes its TSC. KVM takes such writes as in
+sync only if they come within a second of each other, and restoring a vCPU can
+take much longer than that: its MSRs map guest pages (kvmclock, steal time),
+which a migration target may still be paging in from a source that is slow or
+down for a while. The vCPUs' TSCs then ended up apart by that long. The
+guest's clocksource is the TSC, so its clock jumped by that much after the
+step to host time (#136, `guest_calls`: +3.3 s after a 3 s page server
+outage). Without the attribute, the TSCs are written again back to back,
+which KVM syncs unless Firecracker is stopped for a second meanwhile.
 
 ## Measured (WSL2, Ryzen 9 3900X, nested KVM; before process-per-VM unless noted)
 
