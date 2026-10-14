@@ -152,7 +152,8 @@ def vms(host):
                          guest_mib=d["describe"]["guest_mib"], admitted_mib=d["describe"]["admitted_mib"],
                          throttled=d["describe"]["throttled"], tap_dropped=d["describe"].get("tap_dropped"),
                          checkpoint_copy=d["describe"]["checkpoint_copy"], checkpoint_copy_stats=d["checkpoint_copy_stats"],
-                         background_pull_ms=d["background_pull_ms"], failed=d["failed"], guest_retries=d["guest_retries"])
+                         background_pull_ms=d["background_pull_ms"], failed=d["failed"], guest_retries=d["guest_retries"],
+                         remote_left=d["remote_left"], settling=d.get("settling"))
     return out
 
 
@@ -209,7 +210,7 @@ FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_be
           "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "resume_kill",
           "prepare_fail", "short_incoming", "slow_preload", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
           "started_fsync", "started_unmark", "start_stall", "incoming_stall", "claim_stall", "handoff_stall", "ckpt_wp_race",
-          "fetch_tail_enomem", "fetch_enomem_stuck", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo", "release_stall", "release_late", "no_plug", "pause_lost", "tap_backlog", "tap_backlog_stuck", "pause_unknown", "no_collapse", "collapse_slow")
+          "fetch_tail_enomem", "fetch_enomem_stuck", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo", "release_stall", "release_late", "no_plug", "pause_lost", "tap_backlog", "tap_backlog_stuck", "pause_unknown", "no_collapse", "collapse_slow", "pages_slow")
 
 
 def disarm():
@@ -4638,17 +4639,27 @@ def arrival_overtaken():
     """Operations that change who owns a VM wait for its arrival to settle
     (every page in, the migration released, a home loan taken back), or are
     refused: a suspend mid-arrival, and migrating on mid-arrival, refused or
-    not. Each time one copy runs, and the home host's loan is right."""
+    not. Each time one copy runs, and the home host's loan is right.
+    The source's page server is slowed (`pages_slow`: every reply comes, a
+    second late), not stopped, so the arrival stays unfinished for as long as
+    a step needs without its source ever looking lost. Each operation is
+    caught waiting for the arrival (`settling`) before the slowing ends."""
     lent = lambda ip: addr(A, ip).get("lent")
+    arriving = lambda h, n: (lambda v: v.get("remote_left", 0) > 0 and not v.get("failed"))(vms(h).get(n, {}))
+    settling = lambda h, n: vms(h).get(n, {}).get("settling")
+    mib = 400
     # Suspended mid-arrival on B: it settles first, so A lets go.
     n = "ft-arrive-suspend"
-    m = setup(n, mib=1500)
+    m = setup(n, mib=mib)
     ip = vms(A)[n]["ip"]
-    stall = threading.Timer(0.2, lambda: fault(A, "pages", 3000))
-    stall.start()
+    fault(A, "pages_slow", 120000)
     ok(migrate(A, n, B))
-    stall.join()
-    suspend(B, n)
+    check("suspend mid-arrival: caught arriving on B", arriving(B, n), vms(B).get(n))
+    pid = vm_pid(B, n)
+    os.kill(pid, signal.SIGTERM)
+    check("suspend mid-arrival: the suspend waits for the arrival", wait_for(lambda: settling(B, n), 30), vms(B).get(n))
+    fault(A, "pages_slow", 0)
+    check("suspend mid-arrival: the suspend finishes", wait_for(lambda: not alive(pid), 120), vms(B).get(n))
     check("suspend mid-arrival: suspended on B", vms(B).get(n, {}).get("state") == "suspended", vms(B).get(n))
     check("suspend mid-arrival: the source let go", wait_for(lambda: n not in vms(A), 30), vms(A).get(n))
     check("suspend mid-arrival: still lent by its home host", lent(ip) is not None, addr(A, ip))
@@ -4657,39 +4668,48 @@ def arrival_overtaken():
     cleanup(n)
     # Coming home to A, and sent on again before all its memory is back: refused.
     n = "ft-arrive-refused"
-    m = setup(n, mib=1500)
+    m = setup(n, mib=mib)
     ip = vms(A)[n]["ip"]
     ok(migrate(A, n, B))
     wait_released(B, n)
-    stall = threading.Timer(0.2, lambda: fault(B, "pages", 15000))
-    stall.start()
+    fault(B, "pages_slow", 120000)
     ok(migrate(B, n, A))
-    stall.join()
+    check("migrate on mid-arrival: caught arriving on A", arriving(A, n), vms(A).get(n))
     r = migrate(A, n, B)
     check("migrate on mid-arrival: refused", not r["ok"] and "still arriving" in r.get("error", ""), r)
+    check("migrate on mid-arrival: the arrival goes on", arriving(A, n), vms(A).get(n))
     check("migrate on mid-arrival: the loan stays until it settles", lent(ip) is not None, addr(A, ip))
-    fault(B, "pages", 0)
+    fault(B, "pages_slow", 0)
     wait_released(A, n, source=B)
     check("migrate on mid-arrival: one copy, home on A", where(n) == {A: "running"} and md5(A, n) == m, where(n))
     check("migrate on mid-arrival: home, so no longer lent", wait_for(lambda: lent(ip) is None, 10), addr(A, ip))
     cleanup(n)
     # Sent on again mid-arrival, and it goes once the arrival settled.
     n = "ft-arrive-onward"
-    m = setup(n, mib=1500)
+    m = setup(n, mib=mib)
     ip = vms(A)[n]["ip"]
     ok(migrate(A, n, B))
     wait_released(B, n)
-    stall = threading.Timer(0.2, lambda: fault(B, "pages", 2000))
-    stall.start()
+    fault(B, "pages_slow", 120000)
     ok(migrate(B, n, A))
-    stall.join()
-    r = migrate(A, n, B)
-    # B may still be letting go of its source copy, holding the name a moment.
-    end = time.time() + 30
-    while not r["ok"] and "taken" in r.get("error", "") and time.time() < end:
-        time.sleep(0.5)
+    check("migrate on after the arrival: caught arriving on A", arriving(A, n), vms(A).get(n))
+    res = {}
+
+    def onward():
         r = migrate(A, n, B)
-    check("migrate on after the arrival: it goes", r["ok"], r)
+        # B may still be letting go of its source copy, holding the name a moment.
+        end = time.time() + 30
+        while not r["ok"] and "taken" in r.get("error", "") and time.time() < end:
+            time.sleep(0.5)
+            r = migrate(A, n, B)
+        res["r"] = r
+
+    t = threading.Thread(target=onward)
+    t.start()
+    check("migrate on after the arrival: it waits for the arrival", wait_for(lambda: settling(A, n), 30), vms(A).get(n))
+    fault(B, "pages_slow", 0)
+    t.join(180)
+    check("migrate on after the arrival: it goes", res.get("r", {}).get("ok"), res)
     wait_released(B, n, source=A)
     check("migrate on after the arrival: one copy, on B", where(n) == {B: "running"} and md5(B, n) == m, where(n))
     check("migrate on after the arrival: lent by its home host", lent(ip) is not None, addr(A, ip))
