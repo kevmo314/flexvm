@@ -260,12 +260,11 @@ impl Pages {
         self.read_cv.notify_all();
     }
 
-    /// After an install hit EAGAIN (a REMOVE is queued, and the kernel fails
+    /// After a copy or protect hit EAGAIN (a REMOVE is queued, and the kernel fails
     /// copies until the event thread has read it): waits until events were
     /// read since `seen` (`read_gen` before the copy), or if they were
     /// already, briefly, for the kernel to finish with them.
     fn wait_events_read(&self, seen: u64) {
-        self.install_eagain.fetch_add(1, Ordering::Relaxed);
         if self.read_gen.load(Ordering::SeqCst) != seen {
             thread::sleep(Duration::from_micros(20));
             return;
@@ -496,6 +495,7 @@ impl Pages {
                 }
                 Err(e) if e.raw_os_error() == Some(libc::EAGAIN) && stop.is_some_and(|s| !s.load(Ordering::SeqCst)) => {
                     drop(installing);
+                    self.install_eagain.fetch_add(1, Ordering::Relaxed);
                     self.wait_events_read(gen)
                 }
                 Err(e) => {
