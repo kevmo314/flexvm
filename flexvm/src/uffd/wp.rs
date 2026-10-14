@@ -1,4 +1,5 @@
-use super::{os, Mapping, Pager, Runs, ALL, ARM_CHUNK, BASE, PREFETCH_RUN, PRESENT};
+use super::event::{Served, WP};
+use super::{Mapping, Pager, Runs, ALL, ARM_CHUNK, BASE, PREFETCH_RUN, PRESENT};
 use crate::bail;
 use crate::cow::{Cow, PENDING, READING, RESCUING};
 use crate::util::{Result, PAGE_SIZE};
@@ -61,8 +62,9 @@ pub struct Frozen {
 impl Pager {
     /// A write to a write-protected page. During a checkpoint copy, saves the pages around it (`WP_SAVE`) that the
     /// copy has not saved yet; then unprotects the pages of its block (`wp_block`) around it that need not stay
-    /// protected for the copy, and marks them dirty.
-    pub(super) fn wp_fault(&self, page: usize, m: &Mapping) -> io::Result<()> {
+    /// protected for the copy, and marks them dirty. Unless it must wait for a writer to save the page first
+    /// (`Served::Writer`).
+    pub(super) fn wp_fault(&self, page: usize, m: &Mapping) -> io::Result<Served> {
         let cow = self.cow();
         // Already unprotected: by the fault of another thread (each one that writes it queues one, and the first
         // unprotect wakes them all), or one on a page of the same block. Its thread may still wait, if it faulted after
@@ -70,7 +72,7 @@ impl Pager {
         // unprotect (which makes KVM drop its mappings of the range and flush the vCPUs' TLBs). Only an optimization:
         // a failure to read the pagemap leaves it to the unprotect.
         if self.pagemap(page, 1).is_ok_and(|e| e[0] & PM_PRESENT != 0 && e[0] & PM_UFFD_WP == 0) {
-            return self.wake(page);
+            return self.wake(page).map(|()| Served::Done(WP));
         }
         // Over budget, nothing more is copied here, and only the least block is unprotected.
         let over = cow.as_ref().is_some_and(|c| c.over_budget());
@@ -78,9 +80,8 @@ impl Pager {
         if let Some(cow) = &cow {
             cow.stats.faults.fetch_add(1, Ordering::Relaxed);
             if cow.state(page) == READING {
-                cow.stats.retries.fetch_add(1, Ordering::Relaxed);
-                cow.wait_for(page);
-                return Err(os(libc::EAGAIN));
+                cow.wait_for(page, READING);
+                return Ok(Served::Writer);
             }
             // Test fault `ckpt_wp_race`: a writer claims the faulting page right here (#88): have the writers take it
             // next, and wait. Only once they run: before, nothing can claim it, and the faults of the resume (vCPUs,
@@ -99,9 +100,8 @@ impl Pager {
                 let unsaved: Vec<usize> = (first..end).filter(|&p| cow.state(p) == PENDING).collect();
                 unsaved.iter().for_each(|&p| cow.want(p));
                 if unsaved.contains(&page) {
-                    cow.stats.retries.fetch_add(1, Ordering::Relaxed);
-                    cow.wait_for(page);
-                    return Err(os(libc::EAGAIN));
+                    cow.wait_for(page, PENDING);
+                    return Ok(Served::Writer);
                 }
             }
             let start = Instant::now();
@@ -149,18 +149,14 @@ impl Pager {
                 thread::sleep(Duration::from_micros(100));
             }
         }
-        // A writer claimed the faulting page itself (PENDING -> READING)
-        // after the check above, so it stayed protected, and nothing else
-        // wakes the fault (writers never unprotect, even once they are done
-        // with it): retry it once the writer is done, and unprotect it then.
-        if !woken {
-            if let Some(cow) = &cow {
-                cow.stats.retries.fetch_add(1, Ordering::Relaxed);
-                cow.wait_for(page);
-            }
-            return Err(os(libc::EAGAIN));
+        // A writer claimed the faulting page itself (PENDING -> READING) after the check above, so it stayed protected,
+        // and nothing else wakes the fault (writers never unprotect, even once they are done with it): retry it once the
+        // writer is done, and unprotect it then. (Only with a copy: nothing is kept protected without one.)
+        if woken {
+            return Ok(Served::Done(WP));
         }
-        Ok(())
+        cow.iter().for_each(|c| c.wait_for(page, c.state(page)));
+        Ok(Served::Writer)
     }
 
     /// The pages a write fault on `page` unprotects: an aligned block of its 2 MiB chunk within its region, the larger

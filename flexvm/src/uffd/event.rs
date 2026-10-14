@@ -116,13 +116,15 @@ struct Pending {
 }
 
 /// What became of a fault the event thread looked at.
-enum Served {
+pub(super) enum Served {
     /// Resolved, as this kind (`KINDS`).
     Done(usize),
     /// Its page is claimed by another installer.
     Waiting,
     /// Its run was claimed and handed to a fetcher.
     Fetching,
+    /// A write to a page the checkpoint copy has yet to save, which waits for a writer to save it (`Cow::wait_for`).
+    Writer,
 }
 
 impl Pager {
@@ -142,8 +144,8 @@ impl Pager {
         let mut buf = [0u8; 32 * 64];
         while !self.stop.load(Ordering::SeqCst) {
             let mut pfd = [libc::pollfd { fd, events: libc::POLLIN, revents: 0 }, libc::pollfd { fd: wake, events: libc::POLLIN, revents: 0 }];
-            // Faults waiting for another installer are woken by it; others (EAGAIN, errors) are retried every
-            // millisecond. The timeout also bounds a missed wakeup.
+            // Faults waiting for another installer or a checkpoint writer are woken by it; others (EAGAIN, errors) are
+            // retried every millisecond. The timeout also bounds a missed wakeup.
             let timeout = if pending.iter().all(|p| p.parked) { 100 } else { 1 };
             if unsafe { libc::poll(pfd.as_mut_ptr(), 2, timeout) } < 0 {
                 continue;
@@ -205,6 +207,8 @@ impl Pager {
                         self.fault_stats.record(kind, woke.unwrap_or_else(Instant::now) - p.read);
                         continue;
                     }
+                    // Woken through the copy's waker (`Cow::wait_for`).
+                    Ok(Served::Writer) => p.parked = true,
                     Ok(served) => {
                         p.parked = true;
                         match served {
@@ -268,7 +272,7 @@ impl Pager {
         };
         let _wp = self.wp.lock().unwrap();
         if flags & UFFD_PAGEFAULT_FLAG_WP != 0 {
-            return self.wp_fault(page, m).map(|()| Served::Done(WP));
+            return self.wp_fault(page, m);
         }
         // Runs stay within a 2 MiB chunk: Firecracker keeps unplugged virtio-mem slots PROT_NONE, which splits the
         // region into VMAs at slot boundaries, and a uffd copy across a VMA end fails (ENOENT).

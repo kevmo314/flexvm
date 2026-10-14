@@ -3264,13 +3264,25 @@ def kvm_stats(d, names=("pf_taken", "pf_fixed", "exits", "remote_tlb_flush")):
         return {}
 
 
+def uffd_cpu_ms(pid):
+    """CPU time the VM process's uffd thread has used, in ms (None if not found)."""
+    for t in os.listdir(f"/proc/{pid}/task"):
+        try:
+            if open(f"/proc/{pid}/task/{t}/comm").read().strip() == "uffd":
+                return int(open(f"/proc/{pid}/task/{t}/schedstat").read().split()[0]) / 1e6
+        except OSError:
+            pass
+    return None
+
+
 def ckpt_stall():
     """#214: how long a keep-running checkpoint stops the guest as the guest
     sees it: the pause, and the time it loses after the resume to write
-    faults on pages protected for the copy. A probe in the guest (2 threads,
-    one per vCPU) spins writing its working set (STALL_KIB per thread, 4 MiB)
-    and logs every gap in its progress; STALL_N checkpoints (8), STALL_LOAD
-    host spinners (0) meanwhile. Prints a table; checks only that the
+    faults on pages protected for the copy. A probe in the guest (STALL_THREADS
+    threads, 2, one per vCPU) spins writing its working set (STALL_KIB per
+    thread, 4 MiB) and logs every gap in its progress; STALL_N checkpoints (8),
+    STALL_LOAD host spinners (0) meanwhile. Prints a table, with the CPU time
+    the uffd thread used over each checkpoint; checks only that the
     checkpoints are written and the guest goes on."""
     n = "ft-stall"
     count, load = int(os.environ.get("STALL_N", "8")), int(os.environ.get("STALL_LOAD", "0"))
@@ -3279,7 +3291,9 @@ def ckpt_stall():
     # Its KVM counters, if it is the only VM that came meanwhile.
     new = kvm_vms() - kvms
     kvm = new.pop() if len(new) == 1 else None
-    start_probe(A, n, int(os.environ.get("STALL_KIB", "4096")), 2)
+    threads = int(os.environ.get("STALL_THREADS", "2"))
+    start_probe(A, n, int(os.environ.get("STALL_KIB", "4096")), threads)
+    pid = vm_pid(A, n)
     spinners = [subprocess.Popen(["sh", "-c", "while :; do :; done"]) for _ in range(load)]
     rows = []
     try:
@@ -3290,7 +3304,9 @@ def ckpt_stall():
             before = control(A, n, {"op": "debug", "what": "status"})["result"]["faults"]["wp"]
             k0 = kvm_stats(kvm)
             path = ckpt_path(f"{n}-{i}")
+            c0 = uffd_cpu_ms(pid)
             r = checkpoint(A, n, path)
+            c1 = uffd_cpu_ms(pid)
             time.sleep(1)
             after = control(A, n, {"op": "debug", "what": "status"})["result"]["faults"]["wp"]
             k1 = kvm_stats(kvm)
@@ -3300,7 +3316,8 @@ def ckpt_stall():
             res = r["result"]
             rows.append({"paused_ms": res["paused_ms"], "wp_faults": after["count"] - before["count"],
                          "wp_serve_ms": round(after["sum_ms"] - before["sum_ms"], 2), "copy": res.get("copy") or {},
-                         "kvm": {k: k1[k] - k0.get(k, 0) for k in k1}, "dirty_mib": res.get("dirty_mib")})
+                         "kvm": {k: k1[k] - k0.get(k, 0) for k in k1}, "dirty_mib": res.get("dirty_mib"),
+                         "uffd_ms": c1 - c0 if c0 is not None and c1 is not None else float("nan")})
     finally:
         for s in spinners:
             s.kill()
@@ -3308,7 +3325,7 @@ def ckpt_stall():
     markers, gaps = probe_dump(A, n)
     check("stall: a marker per checkpoint, gaps logged", len(markers) >= len(rows) and gaps, (len(markers), len(rows)))
     print(f"{'#':>2} {'paused_ms':>9} {'guest_gap':>9} {'lost_ms':>8} {'stall_ms':>8} {'wp_faults':>9} {'serve_ms':>8} "
-          f"{'rescues':>7} {'retries':>7} {'dirty':>5} {'kvm_pf':>6} {'tlb_fl':>6}")
+          f"{'rescues':>7} {'retries':>7} {'dirty':>5} {'kvm_pf':>6} {'tlb_fl':>6} {'uffd_ms':>7}")
     tot, posts = [], []
     for i, row in enumerate(rows):
         until = markers[i + 1] if i + 1 < len(markers) else float("inf")
@@ -3320,16 +3337,17 @@ def ckpt_stall():
         posts.extend(post)
         # What the guest lost in all: the gap of the slowest thread, and what it lost after.
         stall = max(p[0] + p[1] for p in per)
-        tot.append((row["paused_ms"], gap, lost, stall))
+        tot.append((row["paused_ms"], gap, lost, stall, row["uffd_ms"], (row["copy"] or {}).get("retries", 0)))
         c = row["copy"]
         print(f"{i:>2} {row['paused_ms']:>9.1f} {gap:>9.1f} {lost:>8.1f} {stall:>8.1f} {row['wp_faults']:>9} "
               f"{row['wp_serve_ms']:>8.1f} {c.get('rescues', 0):>7} {c.get('retries', 0):>7} {row['dirty_mib']:>5} "
-              f"{row['kvm'].get('pf_taken', '-'):>6} {row['kvm'].get('remote_tlb_flush', '-'):>6}")
+              f"{row['kvm'].get('pf_taken', '-'):>6} {row['kvm'].get('remote_tlb_flush', '-'):>6} {row['uffd_ms']:>7.1f}")
     if tot:
         med = lambda xs: sorted(xs)[len(xs) // 2]
-        print("median: paused %.1f ms, guest gap %.1f ms, lost after resume %.1f ms, stall %.1f ms (max %.1f)"
+        print("median: paused %.1f ms, guest gap %.1f ms, lost after resume %.1f ms, stall %.1f ms (max %.1f), "
+              "uffd thread %.1f ms CPU, %d retries"
               % (med([t[0] for t in tot]), med([t[1] for t in tot]), med([t[2] for t in tot]), med([t[3] for t in tot]),
-                 max(t[3] for t in tot)))
+                 max(t[3] for t in tot), med([t[4] for t in tot]), med([t[5] for t in tot])))
     if posts:
         posts.sort()
         q = lambda f: posts[min(len(posts) - 1, int(len(posts) * f))] / 1e3
