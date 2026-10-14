@@ -551,7 +551,7 @@ impl Proc {
         vm.leave(State::Checkpointing)?;
         self.publish();
         let paused = Instant::now();
-        let mut hold = PacketHold { d: self, vm, id: crate::migrate::migration_id(), stats: None };
+        let mut hold = PacketHold { d: self, vm, id: crate::migrate::migration_id(), stats: None, resumed: None, rearm: None };
         // Failure must `unfreeze` so the last checkpoint stays the delta base.
         let mut memhash = None;
         let frozen = (|| -> Result<Frozen> {
@@ -595,7 +595,8 @@ impl Proc {
         });
         if cow {
             hold.end().inspect_err(|_| vm.pager.unfreeze(&frozen))?;
-            pause = Some(paused.elapsed());
+            // Up to the vCPUs running: the balloon re-arm after it is the guest's time (#190).
+            pause = Some(hold.resumed.unwrap_or_else(Instant::now).duration_since(paused));
             // Out of the pause: `ls` shows it running while the copy goes on (#152).
             self.publish();
             t.mark("resume");
@@ -695,6 +696,7 @@ impl Proc {
                     json!({
                         "id": id,
                         "paused_ms": ms(paused),
+                        "balloon_rearm_ms": hold.rearm.map(ms),
                         "dirty_mib": (frozen.dirty * PAGE_SIZE) >> 20,
                         "protect": {"ranges": frozen.protected, "ms": ms(frozen.protect)},
                         "copy": copy,
@@ -725,6 +727,9 @@ struct PacketHold<'a> {
     vm: &'a Vm,
     id: u64,
     stats: Option<crate::hold::Stats>,
+    /// When `end` had the vCPUs running again, and how long re-arming the balloon took after that.
+    resumed: Option<Instant>,
+    rearm: Option<Duration>,
 }
 
 impl PacketHold<'_> {
@@ -741,12 +746,21 @@ impl PacketHold<'_> {
     }
 
     fn end(&mut self) -> Result<State> {
-        let Some(h) = self.d.holder() else { return self.vm.end_checkpoint(false) };
-        let (ip, tap) = (self.vm.ip, &self.vm.tap);
-        let (stats, attached) = crate::migrate::release_into(h, ip, self.id, self.vm, Duration::ZERO, |()| crate::net::attach(ip, tap));
-        self.stats = stats;
-        let res = self.vm.end_checkpoint(stats.is_some() && attached.is_ok());
-        h.forget(ip, self.id);
+        let res = match self.d.holder() {
+            None => self.vm.end_checkpoint(false),
+            Some(h) => {
+                let (ip, tap) = (self.vm.ip, &self.vm.tap);
+                let (stats, attached) = crate::migrate::release_into(h, ip, self.id, self.vm, Duration::ZERO, |()| crate::net::attach(ip, tap));
+                self.stats = stats;
+                let res = self.vm.end_checkpoint(stats.is_some() && attached.is_ok());
+                h.forget(ip, self.id);
+                res
+            }
+        };
+        let resumed = Instant::now();
+        self.resumed = Some(resumed);
+        self.vm.after_resume(res.is_ok());
+        self.rearm = Some(resumed.elapsed());
         res
     }
 }

@@ -380,6 +380,13 @@ impl Vm {
     }
 
     pub fn resume(&self, attached: bool) -> Result<State> {
+        let resumed = self.resume_vcpus(attached);
+        self.after_resume(resumed.is_ok());
+        resumed
+    }
+
+    /// The part of `resume` the guest waits for: its devices back and its vCPUs running (unless it was paused before).
+    fn resume_vcpus(&self, attached: bool) -> Result<State> {
         // A successful held-packet release already raised the link and attached it.
         if !attached {
             crate::net::set_link_up(&self.tap, true)?;
@@ -392,14 +399,21 @@ impl Vm {
         if matches!(resumed, Ok(State::Running)) {
             self.pager.hold_collapse(false);
         }
-        // Out of the pause, but with the mark still lifted: Firecracker throttled at it could time this out.
         if resumed.is_ok() {
             // Its Firecracker delivers what is still queued on the tap.
             self.tap_stuck.store(false, Ordering::SeqCst);
+        }
+        resumed
+    }
+
+    /// The rest of `resume`, with the guest already running: balloon statistics back on (slow, behind Firecracker's
+    /// post-resume queue processing, #190) and the memory mark restored.
+    pub fn after_resume(&self, resumed: bool) {
+        // Out of the pause, but with the mark still lifted: Firecracker throttled at it could time this out.
+        if resumed {
             self.unpark_balloon();
         }
         self.limit.restore();
-        resumed
     }
 
     /// Routes the address to the tap (its neighbour entry is there: `net::neighbour`)
@@ -420,11 +434,12 @@ impl Vm {
         Ok(true)
     }
 
+    /// `resume_vcpus` after a checkpoint; the caller does `after_resume`.
     pub fn end_checkpoint(&self, attached: bool) -> Result<State> {
         if *self.state.lock().unwrap() != State::Checkpointing {
             bail!("vm {} is not being checkpointed", self.name);
         }
-        let res: Result<State> = self.resume(attached).map_err(|e| format!("resuming vm {} after its checkpoint failed: {e}", self.name).into());
+        let res: Result<State> = self.resume_vcpus(attached).map_err(|e| format!("resuming vm {} after its checkpoint failed: {e}", self.name).into());
         *self.state.lock().unwrap() = *res.as_ref().unwrap_or(&State::Failed);
         res
     }
