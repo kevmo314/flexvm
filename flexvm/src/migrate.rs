@@ -411,7 +411,7 @@ impl Proc {
             let vm = p.vm().clone();
             vm.restore_devices();
             let start = Instant::now();
-            vm.pager.wait_pulled();
+            vm.pager.wait_pulled(None);
             eprintln!("vm {}: pull from {source} ended after {} ms", vm.name, ms(start.elapsed()));
             let arrived = p.arrived.lock().unwrap().take();
             match (vm.pager.failed(), arrived) {

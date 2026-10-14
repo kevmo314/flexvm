@@ -251,7 +251,7 @@ impl Vm {
 
     /// A migration target first pulls all its memory, so it never runs split across two hosts.
     pub fn unpause(&self) -> Result<()> {
-        if self.pager.pulling_from_peer() && !self.pager.wait_pulled_for(PULL_WAIT) {
+        if self.pager.pulling_from_peer() && !self.pager.wait_pulled(Some(PULL_WAIT)) {
             bail!("vm {} is still pulling its memory from its previous host; resume it once that is done", self.name);
         }
         self.switch(State::Paused, State::Running)

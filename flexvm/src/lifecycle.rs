@@ -308,7 +308,7 @@ impl Proc {
         let state = vm.state().name();
         let p = self.arc();
         thread::spawn(move || {
-            let pulled = vm.pager.wait_pulled();
+            let pulled = vm.pager.wait_pulled(None);
             eprintln!("vm {}: {to_load} MiB paged in from {} (complete: {pulled}, {:?} ms)", vm.name, dir.display(), vm.pager.pull_time().map(ms));
             // Under the op lock: a suspend may be about to write here.
             if let Some(p) = p {
@@ -371,7 +371,7 @@ impl Proc {
             Ok(())
         };
         let drained = Instant::now() + DRAIN_WAIT;
-        while vm.pager.remote_left() > 0 && !vm.pager.wait_pulled_for(Duration::from_millis(100)) {
+        while vm.pager.remote_left() > 0 && !vm.pager.wait_pulled(Some(Duration::from_millis(100))) {
             cancelled()?;
             if Instant::now() >= drained {
                 bail!("vm {} is still pulling its memory; try again once it has", vm.name);
