@@ -286,8 +286,9 @@ fn open_dir(dir: &Path) -> io::Result<std::fs::File> {
     std::fs::File::options().read(true).custom_flags(libc::O_DIRECTORY).open(dir)
 }
 
-/// Directories synced and links followed in one walk, by (dev, ino).
-type Seen = std::collections::HashSet<(u64, u64)>;
+/// In one walk, by (dev, ino): directories synced, and links followed (with their directory,
+/// which a relative target resolves from: a hard-linked symlink may be in several).
+type Seen = std::collections::HashSet<((u64, u64), Option<(u64, u64)>)>;
 
 /// Syncs every directory above `dir` up to `/`, and the one holding each symlink its path or a
 /// link's target resolves through. Run when publishing in `dir`: an existing directory may have
@@ -312,13 +313,14 @@ fn sync_ancestors_with(dir: &Path, seen: &mut Seen, sync: &mut impl FnMut(&std::
 fn sync_links(path: &Path, seen: &mut Seen, sync: &mut impl FnMut(&std::fs::File) -> io::Result<()>) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
     for (link, m) in path.ancestors().filter_map(|p| Some((p, std::fs::symlink_metadata(p).ok().filter(|m| m.is_symlink())?))) {
-        // Each link once, which ends a loop of them.
-        if !seen.insert((m.dev(), m.ino())) {
-            continue;
-        }
         let at = link.parent().unwrap_or(Path::new("/"));
         let holder = open_dir(at)?;
-        if seen.insert(dir_id(holder.as_raw_fd())?) {
+        let holder_id = dir_id(holder.as_raw_fd())?;
+        // Each link once, which ends a loop of them.
+        if !seen.insert(((m.dev(), m.ino()), Some(holder_id))) {
+            continue;
+        }
+        if seen.insert((holder_id, None)) {
             sync(&holder)?;
             walk_up(holder.as_raw_fd(), seen, sync)?;
         }
@@ -338,7 +340,7 @@ fn walk_up(dir: RawFd, seen: &mut Seen, sync: &mut impl FnMut(&std::fs::File) ->
         }
         let up = unsafe { std::fs::File::from_raw_fd(up) };
         let up_id = dir_id(up.as_raw_fd())?;
-        if up_id == id || !seen.insert(up_id) {
+        if up_id == id || !seen.insert((up_id, None)) {
             return Ok(());
         }
         sync(&up)?;

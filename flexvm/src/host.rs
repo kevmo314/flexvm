@@ -181,17 +181,20 @@ pub fn run_dir() -> Option<&'static Path> {
 }
 
 impl Host {
-    /// Synced up to `/` once per state root, not on every command: `.synced` names the root
-    /// (dev, inode), so a copy syncs again; it goes before a repair and comes back after the syncs.
+    /// Synced up to `/` once per state root, not per command: under the root's flock, `.synced` names the
+    /// root (dev, inode), so a copy syncs again; it goes before a repair and comes back after the syncs.
     pub fn open(state: &Path, run: &Path) -> Result<Host> {
         let dirs = [("addrs", 0o777), ("standby", 0o777), ("migs", 0o777), ("suspended", 0o700)];
         let (marker, id) = (state.join(".synced"), || std::fs::metadata(state).map(|m| format!("{} {}", m.dev(), m.ino())));
+        let root = |e: std::io::Error| format!("{}: {e} (run flexvm as root to create it)", state.display());
+        let held = std::fs::create_dir_all(state).and_then(|()| std::fs::File::open(state)).map_err(root)?;
+        crate::util::eintr(|| unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }).map_err(root)?;
         if id().ok().is_none_or(|id| std::fs::read_to_string(&marker).ok() != Some(id)) || dirs.iter().any(|(d, _)| !state.join(d).is_dir()) {
             let _ = std::fs::remove_file(&marker);
             dirs.iter()
                 .try_for_each(|(d, mode)| crate::util::create_dir_durably(&state.join(d), *mode))
                 .and_then(|()| std::fs::write(&marker, id()?))
-                .map_err(|e| format!("{e} (run flexvm as root to create it)"))?;
+                .map_err(root)?;
         }
         for d in ["vms", "standby", "w"] {
             let _ = std::fs::create_dir_all(run.join(d));
