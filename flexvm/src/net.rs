@@ -136,6 +136,10 @@ pub fn create_tap(name: &str) -> Result<()> {
             bail!("txqueuelen of {name}: {}", std::io::Error::last_os_error());
         }
         sysctl(&format!("net.ipv4.conf.{name}.arp_ignore"), "3")?;
+        // The guest is IPv4 only. With IPv6, the host sends an MLD report out of the tap as
+        // it comes up: dropped (tx_dropped) when no Firecracker reads it yet (an arrival's),
+        // which reads as a frame lost on its way to the guest. As for the hold device.
+        let _ = sysctl(&format!("net.ipv6.conf.{name}.disable_ipv6"), "1");
         set_link_up(name, true)
     })();
     if made.is_err() {

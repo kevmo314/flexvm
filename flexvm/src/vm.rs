@@ -696,7 +696,7 @@ impl Vm {
         // Before the tap goes (`fc::release`) with its counters: a full queue drops frames
         // (a guest not keeping up), counted only there.
         if let Some(n) = self.tap_dropped().filter(|&n| n > 0) {
-            eprintln!("vm {}: its tap dropped {n} frames with its queue full (its guest was not keeping up)", self.name);
+            eprintln!("vm {}: its tap dropped {n} frames (its queue full, or no Firecracker reading it)", self.name);
         }
         // Before the tap goes too, which purges its queue; not keeping it after.
         if let Some((_, fd)) = self.tap_watch.lock().unwrap().take() {
