@@ -40,8 +40,12 @@ pub enum Blob {
 impl Blob {
     pub(super) fn open(&self) -> Result<(Box<dyn Read>, u64)> {
         Ok(match self {
+            // Read as it is: unpacking checks it (`Layer::verify`, which evicts a corrupt one).
             Blob::Cached { blobs, registry, digest, size } => {
-                let path = registry.as_ref().clone().blob(digest, *size, blobs)?;
+                let path = match blob_path(blobs, digest)? {
+                    p if p.exists() => p,
+                    _ => registry.as_ref().clone().blob(digest, *size, blobs)?,
+                };
                 return Blob::File(path).open();
             }
             Blob::File(p) => {
@@ -60,6 +64,11 @@ impl Blob {
                 (Box::new(f.take(*len)), *len)
             }
         })
+    }
+
+    /// A cached blob that `Layer::verify` found corrupt and removed: opening it downloads it again.
+    pub(super) fn evicted(&self) -> bool {
+        matches!(self, Blob::Cached { blobs, digest, .. } if blob_path(blobs, digest).is_ok_and(|p| !p.exists()))
     }
 
     fn read_document(&self) -> Result<Vec<u8>> {
@@ -85,7 +94,7 @@ impl Layer {
 
     pub fn open(&self) -> Result<Hashed<Box<dyn Read>>> {
         let (inner, len) = self.src.open()?;
-        self.check_size(len)?;
+        self.check_size(len).inspect_err(|_| self.evict())?;
         Ok(Hashed::new(inner))
     }
 
@@ -96,12 +105,19 @@ impl Layer {
         }
     }
 
+    /// A cached blob that does not match its descriptor is evicted.
     pub fn verify(&self, mut r: Hashed<Box<dyn Read>>) -> Result<()> {
         std::io::copy(&mut r, &mut std::io::sink())?;
-        self.check_size(r.n)?;
-        match &self.digest {
+        let res = self.check_size(r.n).and_then(|()| match &self.digest {
             Some(d) if *d != r.digest() => bail!("layer blob {d} has digest {}", r.digest()),
             _ => Ok(()),
+        });
+        res.inspect_err(|_| self.evict())
+    }
+
+    fn evict(&self) {
+        if let Blob::Cached { blobs, digest, .. } = &self.src {
+            let _ = blob_path(blobs, digest).map(std::fs::remove_file);
         }
     }
 }
@@ -360,7 +376,7 @@ mod tests {
     use std::sync::{Barrier, Mutex};
 
     #[test]
-    fn cached_layers_are_verified_when_opened() {
+    fn cached_layers_are_read_once_and_evicted_if_corrupt() {
         let dir = super::super::unpack::tests::tmpdir("blob-lazy");
         let digest = sha256_hex(b"good");
         let path = blob_path(&dir, &digest).unwrap();
@@ -369,13 +385,25 @@ mod tests {
         let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let registry = Registry::new(Reference::parse(&format!("{}/test", server.local_addr().unwrap())).unwrap());
         std::thread::spawn(move || server.incoming().for_each(drop));
-        let blob = Blob::Cached { blobs: dir.to_path_buf(), registry: Box::new(registry), digest, size: 4 };
+        let layer = Layer { src: Blob::Cached { blobs: dir.to_path_buf(), registry: Box::new(registry), digest: digest.clone(), size: 4 }, digest: Some(digest), size: Some(4) };
+        let read = |layer: &Layer| {
+            let mut r = layer.open()?;
+            let mut data = String::new();
+            r.read_to_string(&mut data)?;
+            layer.verify(r).map(|()| data)
+        };
         std::fs::write(&path, b"good").unwrap();
-        let mut data = String::new();
-        blob.open().unwrap().0.read_to_string(&mut data).unwrap();
-        assert_eq!(data, "good");
+        assert_eq!(read(&layer).unwrap(), "good");
+        assert!(!layer.src.evicted());
+        // Read as it is; the check as it is unpacked evicts it.
         std::fs::write(&path, b"evil").unwrap();
-        assert!(blob.open().is_err());
+        assert!(read(&layer).unwrap_err().to_string().contains("has digest"));
+        assert!(layer.src.evicted() && !path.exists());
+        // Opening it again downloads it (here the registry hangs up).
+        assert!(layer.open().is_err());
+        // A blob of the wrong size goes too.
+        std::fs::write(&path, b"good!").unwrap();
+        assert!(layer.open().is_err() && layer.src.evicted());
     }
 
     #[test]

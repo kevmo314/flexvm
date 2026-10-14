@@ -209,7 +209,7 @@ FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_be
           "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "resume_kill",
           "prepare_fail", "short_incoming", "slow_preload", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
           "started_fsync", "started_unmark", "start_stall", "incoming_stall", "claim_stall", "handoff_stall", "ckpt_wp_race",
-          "fetch_tail_enomem", "fetch_enomem_stuck", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit")
+          "fetch_tail_enomem", "fetch_enomem_stuck", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo")
 
 
 def disarm():
@@ -3032,6 +3032,71 @@ def grants(host):
     return [m for t, m, *_ in g if time.time() * 1000 - t <= 10000]
 
 
+def addr_records():
+    """Every address record on both hosts (generations, loans, holders)."""
+    out = {}
+    for h in (A, B):
+        d = os.path.join(h.state, "addrs")
+        for f in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+            out[(h.addr, f)] = open(os.path.join(d, f)).read()
+    return out
+
+
+def refused_admission():
+    """A start refused for the reserve is refused before it claims anything:
+    a run mints no generation (so none is withdrawn and broadcast), a restore
+    borrows no address from its home host, an arrival records no migration."""
+    n, path = "ft-refused-adm", ckpt_path("ft-refused-adm")
+    m = setup(n, mib=1)
+    migs = lambda: sorted(os.listdir(os.path.join(B.state, "migs"))) if os.path.isdir(os.path.join(B.state, "migs")) else []
+    before, recorded = addr_records(), migs()
+    fault(B, "no_admit", 600000)
+    r = migrate(A, n, B)
+    check("refused admission: a migration is refused", not r["ok"] and "not enough memory" in r["error"], r)
+    check("refused admission: and records nothing", migs() == recorded and addr_records() == before, (recorded, migs()))
+    check("refused admission: the vm runs on at A", where(n) == {A: "running"} and md5(A, n) == m, where(n))
+    ok(checkpoint(A, n, path, stop=True))
+    before = addr_records()
+    # Its address is A's: a restore on B borrows it.
+    r = restore(B, path)
+    check("refused admission: a restore is refused", not r["ok"] and "not enough memory" in r["error"], r)
+    check("refused admission: and borrows nothing", addr_records() == before, before)
+    r = run(B, "ft-refused-adm-run")
+    check("refused admission: a run is refused", not r["ok"] and "not enough memory" in r["error"], r)
+    check("refused admission: and mints no generation", addr_records() == before)
+    fault(B, "no_admit", 0)
+    r = restore(B, path)
+    check("refused admission: admitted, the restore borrows it", r["ok"] and md5(B, n) == m, r)
+    cleanup(n)
+    rm_ckpt(path)
+
+
+def meminfo_unreadable():
+    """/proc/meminfo unreadable (injected) is not 0 MiB available: no standby
+    is stopped and nothing is evicted, and a start is refused saying why."""
+    t, n = args.template, "ft-meminfo"
+    setup(n, mib=1)
+    pressure = os.path.join(A.run, "standby", ".pressure")
+    mtime = lambda p: os.stat(p).st_mtime if os.path.exists(p) else None
+    try:
+        ok(cli_json(A, "standby", "--template", t, "1"))
+        locks = lambda: [f for f in os.listdir(os.path.join(A.run, "standby", t)) if f.endswith(".lock") and alive(f[:-5])]
+        check("meminfo: a standby ready", wait_for(lambda: len(locks()) == 1, 60), locks())
+        ready, pressed = locks(), mtime(pressure)
+        fault(A, "no_meminfo", 600000)
+        # The VM process weighs relief every second.
+        time.sleep(4)
+        check("meminfo: the standby stays", locks() == ready and mtime(pressure) == pressed, (ready, locks()))
+        check("meminfo: the vm stays", where(n) == {A: "running"}, where(n))
+        r = run(A, "ft-meminfo-run")
+        check("meminfo: a start is refused, saying why", not r["ok"] and "MemAvailable" in r["error"], r)
+        check("meminfo: still the standby", locks() == ready, locks())
+    finally:
+        fault(A, "no_meminfo", 0)
+        ok(cli_json(A, "standby", "--template", t, "0"))
+        cleanup(n)
+
+
 def standby_admission():
     """A standby claim is charged only the step it may grow by (its memory is
     already in use), so it succeeds with little room above the reserve; a
@@ -4103,6 +4168,7 @@ SCENARIOS = dict(
     mem_high=no_evict(skippable(mem_high)), mem_high_migrate=no_evict(skippable(mem_high_migrate)),
     mem_high_evict=skippable(mem_high_evict), evict_grower=skippable(evict_grower), evict_no_pingpong=evict_no_pingpong, evict_skips_cmd=evict_skips_cmd, cmd_flag=cmd_flag, evict_latency=skippable(evict_latency),
     start_admission=start_admission, standby_admission=standby_admission,
+    refused_admission=refused_admission, meminfo_unreadable=meminfo_unreadable,
     cow_grow=no_evict(cow_grow), plug_race=no_evict(plug_race), shrink_stall=no_evict(shrink_stall), plug_storm=no_evict(plug_storm),
     basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, refused=refused, pages_blip=pages_blip,
     pages_dead_restore=pages_dead_restore, pages_dead=pages_dead, resume_kill=resume_kill, prepared_retry=prepared_retry,

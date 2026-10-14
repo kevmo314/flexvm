@@ -201,10 +201,24 @@ impl Proc {
     }
 
     pub fn set_vm(&self, vm: Arc<Vm>) {
-        let sizes = self.sizes.lock().unwrap().take().unwrap_or_else(|| vm.mem_sizes());
-        vm.start_limit(self.granted.load(Ordering::SeqCst), sizes, &self.host);
+        self.adopt(vm);
+        self.start_limit();
+    }
+
+    /// The VM is this process's: its start's grant is spent. Its memory mark
+    /// is set apart (`start_limit`), so a migration's arrival sets it after
+    /// the VM runs, outside the downtime.
+    pub fn adopt(&self, vm: Arc<Vm>) {
         self.charged.store(0, Ordering::SeqCst);
         let _ = self.vm.set(vm);
+    }
+
+    /// From the sizes taken ahead (a standby's, an arrival's from the runs
+    /// its source sent), else measured now.
+    pub fn start_limit(&self) {
+        let vm = self.vm();
+        let sizes = self.sizes.lock().unwrap().take().unwrap_or_else(|| vm.mem_sizes());
+        vm.start_limit(self.granted.load(Ordering::SeqCst), sizes, &self.host);
     }
 
     pub fn name(&self) -> String {
@@ -517,7 +531,7 @@ impl Proc {
         let (ip, gen, peers, dev) = (vm.ip, self.gen(), self.host.cfg.peers.clone(), self.host.cfg.announce_dev.clone());
         let Some(via) = self.host.cfg.underlay() else {
             if !peers.is_empty() {
-                eprintln!("announce {ip}: no underlay address (set --listen or --underlay); peers not told");
+                eprintln!("announce {ip}: no underlay address (give flexvm listen an ADDR peers can reach, or --underlay IP); peers not told");
             }
             return;
         };
@@ -560,11 +574,12 @@ impl Proc {
         self.set_name(self.host.take_name(name, false)?);
         let tpl = Template::open(&self.paths, template)?;
         t.mark("template");
+        // Before the claim: a refused start mints no generation (nor withdraws one).
+        self.admit_start(tpl.working_set_mib(), 0, crate::host::Floor::Reserve)?;
         let claim = self.host.claim_new(&self.host.lock()?, name, want)?;
         let ip = self.set_addr(claim);
         t.mark("claim_ip");
         crate::host::stall("start_stall");
-        self.admit_start(tpl.working_set_mib(), 0, crate::host::Floor::Reserve)?;
         let prepared = Vm::prepare(self.spawner.take(None)?, tpl.clone(), &mut t)?;
         let learn = crate::standby::load_set(&self.host, &tpl).is_empty();
         if learn {
@@ -892,7 +907,7 @@ impl Proc {
                 published = vm.starving();
                 self.publish();
             }
-            relieve(&self.host, vm.starving());
+            relieve(&self.host, host_available_mib(), vm.starving());
         }
     }
 
@@ -1163,8 +1178,12 @@ fn cgroup_root() -> Option<PathBuf> {
     }
 }
 
-pub fn host_available_mib() -> u64 {
-    proc_kb("/proc/meminfo", "MemAvailable").unwrap_or(0) >> 20
+/// None if it cannot be read: never taken for 0 (pressure). Test fault `no_meminfo`.
+pub fn host_available_mib() -> Option<u64> {
+    if fault("no_meminfo") {
+        return None;
+    }
+    Some(proc_kb("/proc/meminfo", "MemAvailable")? >> 20)
 }
 
 #[derive(Debug, PartialEq)]
@@ -1200,7 +1219,7 @@ fn resize(vm: &Vm, host: &Host, hint: Option<u64>, grow_only: bool) -> Result<Re
     let Some(plan) = sizes.plan(requested, plugged, avail, last.elapsed(), hint.is_some(), grow_only) else {
         return Ok(Resized::Busy);
     };
-    let refused = plan.charge > 0 && !host.admit(plan.charge);
+    let refused = plan.charge > 0 && !host.admit(plan.charge)?;
     let full = plan.short && (plugged == hotplug_total || refused);
     // Starved only when the host refused it: at its own ceiling, moving it cannot help.
     vm.starved.store(plan.short && refused, Ordering::SeqCst);
@@ -1397,10 +1416,12 @@ static EVICTING: AtomicBool = AtomicBool::new(false);
 /// Pressure starts when MemAvailable falls under the high-water mark
 /// (`evict_at`, above the reserve) and lasts until it is back to
 /// `evict_until` (`RUN/evict.active` while it lasts). A starved VM is moved
-/// whenever it asks, pressure or not.
-fn relieve(host: &Host, starved_here: bool) {
+/// whenever it asks, pressure or not. Nothing is done when MemAvailable
+/// cannot be read (`avail` None): that is no pressure.
+fn relieve(host: &Host, avail: Option<u64>, starved_here: bool) {
+    let Some(avail) = avail else { return };
     let cfg = host.config_now();
-    let (avail, reserve, at, until) = (host_available_mib(), cfg.reserve_mib, cfg.evict_at(), cfg.evict_until());
+    let (reserve, at, until) = (cfg.reserve_mib, cfg.evict_at(), cfg.evict_until());
     // Standby VMs go under the reserve whatever eviction is doing (a slow migration holds its lock).
     if avail < reserve && stop_standby(host, avail, reserve) {
         return;
@@ -1586,6 +1607,39 @@ fn call_within(host: &Host, name: &str, req: Value, wait: Duration) -> Result<Va
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MemAvailable unreadable (None) is no pressure: no standby is stopped
+    /// and no eviction is tried; read as under the reserve, both are.
+    #[test]
+    fn unreadable_meminfo_relieves_nothing() {
+        use std::os::fd::AsRawFd;
+        let base = std::env::temp_dir().join(format!("flexvm-relieve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let mut host = Host::open(&base.join("state"), &base.join("run")).unwrap();
+        host.cfg.reserve_mib = 1024;
+        host.cfg.peers = vec!["127.0.0.1:1".into()];
+        // A standby of template t: its lock held, naming a live process.
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let d = host.run.join("standby").join("t");
+        std::fs::create_dir_all(&d).unwrap();
+        let lock = std::fs::File::create(d.join(format!("{}.lock", child.id()))).unwrap();
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+        std::fs::write(d.join(format!("{}.lock", child.id())), serde_json::to_vec(&Ident::of(child.id()).unwrap()).unwrap()).unwrap();
+        assert_eq!(crate::standby::live(&host, "t").len(), 1);
+        let (pressure, active) = (crate::standby::pressure(&host), host.run.join("evict.active"));
+        for starved in [false, true] {
+            relieve(&host, None, starved);
+            assert!(!pressure.exists() && !active.exists());
+            assert!(child.try_wait().unwrap().is_none(), "a standby was stopped");
+        }
+        relieve(&host, Some(0), false);
+        use std::os::unix::process::ExitStatusExt;
+        assert!(pressure.exists() && child.wait().unwrap().signal() == Some(libc::SIGINT));
+        drop(lock);
+        relieve(&host, Some(0), false);
+        assert!(active.exists(), "with no standby left, eviction starts");
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn refused_peers_back_off_independently_and_survive_a_new_decider() {

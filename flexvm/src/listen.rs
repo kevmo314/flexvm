@@ -149,7 +149,7 @@ fn handle(host: &Host, peers: &Peers, mut conn: TcpStream, deadline: Instant) ->
         // Whether a migration's source process is proven gone (never from published state).
         "source" => serde_json::from_value(req["ident"].clone())
             .map_err(|e| format!("bad ident: {e}").into())
-            .map(|id| json!({"gone": crate::host::gone(&id)})),
+            .map(|id: crate::host::Ident| json!({"gone": id.liveness() == crate::host::Liveness::Gone})),
         op => Err(format!("unknown op {op:?}").into()),
     };
     let reply = match reply {

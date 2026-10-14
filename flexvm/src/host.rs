@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::bail;
 use crate::net::IpRange;
-use crate::util::Result;
+use crate::util::{Error, Result};
 
 /// A held grant (`Host::grant_held`): counted while this lives, and not a
 /// moment after its process does (the kernel drops the flock). Dropping it
@@ -602,12 +602,12 @@ impl Host {
         self.reinstall_after(l, ip, None)
     }
 
-    /// `reinstall`, counting a holder whose name `dead` (a dead process) still locks as
-    /// gone: its other threads may hold the lock a moment longer.
+    /// `reinstall`, counting a holder that is `dead` (a dead process whose name
+    /// may stay locked a moment longer, by its other threads) as gone.
     fn reinstall_after(&self, l: &Locked, ip: Ipv4Addr, dead: Option<&Ident>) -> Result<bool> {
         let a = self.addr(l, ip)?;
-        let dying = || a.holder.as_deref().is_some_and(|h| dead.is_some() && self.holder_of(h).as_ref() == dead);
-        let Some(via) = a.via.filter(|_| !a.withdrawn && (dying() || !self.held(&a))) else { return Ok(false) };
+        let dying = dead.is_some() && a.holder_id.as_ref() == dead;
+        let Some(via) = a.via.filter(|_| !a.withdrawn && (dying || !self.held(&a))) else { return Ok(false) };
         crate::net::route_via(ip, via)?;
         eprintln!("put back route {ip} via {via} (generation {})", a.seen);
         Ok(true)
@@ -652,24 +652,32 @@ impl Host {
         }
     }
 
-    pub fn admit(&self, mib: u64) -> bool {
-        self.grant(mib).is_some()
+    /// Ok(false): refused for the reserve.
+    pub fn admit(&self, mib: u64) -> Result<bool> {
+        Ok(self.grant(mib)?.is_some())
     }
 
-    /// `grant` against the current reserve.
-    pub fn grant(&self, mib: u64) -> Option<u64> {
-        self.grant_above(mib, Floor::Reserve).ok()
+    /// `grant` against the current reserve: None if refused. An error (the
+    /// host lock, MemAvailable unreadable) is no refusal: nothing is granted.
+    pub fn grant(&self, mib: u64) -> Result<Option<u64>> {
+        self.grant_by(mib, None)
     }
 
+    /// `grant`, giving up (an error) if the host lock is not had by `deadline`.
+    pub fn grant_by(&self, mib: u64, deadline: Option<std::time::Instant>) -> Result<Option<u64>> {
+        Ok(self.grant_inner(mib, Floor::Reserve, false, deadline, crate::vmproc::host_available_mib)?.ok().map(|g| g.0))
+    }
+
+    /// A refusal is an error too, saying why.
     pub fn grant_above(&self, mib: u64, floor: Floor) -> Result<u64> {
-        self.grant_inner(mib, floor, false).map(|g| g.0)
+        Ok(self.grant_inner(mib, floor, false, None, crate::vmproc::host_available_mib)??.0)
     }
 
     /// A grant held past `GRANT_WINDOW`, until the `Hold` is dropped or its
     /// process ends, made in the same critical section: an arrival's memory
     /// comes in only as it pulls, however long that takes.
     pub fn grant_held(&self, mib: u64, floor: Floor) -> Result<(u64, Hold)> {
-        let (id, hold) = self.grant_inner(mib, floor, true)?;
+        let (id, hold) = self.grant_inner(mib, floor, true, None, crate::vmproc::host_available_mib)??;
         Ok((id, hold.ok_or("no hold")?))
     }
 
@@ -677,28 +685,36 @@ impl Host {
     /// processes' grants of the last `GRANT_WINDOW` count as used, and held
     /// ones (`grant_held`) however old, each once. Returns the grant's id.
     /// Leaves `floor` available, read with the reserve under the host lock.
-    /// Test fault `no_admit`: refuses everything.
-    fn grant_inner(&self, mib: u64, floor: Floor, hold: bool) -> Result<(u64, Option<Hold>)> {
+    /// Ok(Err(why)) if refused. Test fault `no_admit`: refuses everything.
+    fn grant_inner(
+        &self,
+        mib: u64,
+        floor: Floor,
+        hold: bool,
+        deadline: Option<std::time::Instant>,
+        available: impl FnOnce() -> Option<u64>,
+    ) -> Result<std::result::Result<(u64, Option<Hold>), Error>> {
         if fault("no_admit") {
-            bail!("not enough memory here for {mib} MiB (injected fault)");
+            return Ok(Err(format!("not enough memory here for {mib} MiB (injected fault)").into()));
         }
-        let l = self.lock()?;
+        let l = self.lock_by(deadline)?;
         let cfg = self.config_now();
         let (floor, what) = match floor {
             Floor::Reserve => (cfg.reserve_mib, "reserve"),
             // An eviction's arrival: never while this host evicts itself, and it
             // leaves this host's own mark, so it is not moved straight back.
-            Floor::EvictMark if self.evicting(&l) => bail!("this host is moving vms away itself"),
+            Floor::EvictMark if self.evicting(&l) => return Ok(Err("this host is moving vms away itself".into())),
             Floor::EvictMark => (cfg.evict_at(), "eviction mark"),
         };
         let path = self.run.join("grants");
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
-        let mut grants: Vec<(u64, u64, u64)> = load(&path).ok().flatten().unwrap_or_default();
+        let mut grants: Vec<(u64, u64, u64)> = load(&path)?.unwrap_or_default();
         grants.retain(|&(t, ..)| now.saturating_sub(t) <= GRANT_WINDOW.as_millis() as u64);
         let held = self.holds(&l);
         let pending: u64 = grants.iter().filter(|g| !held.iter().any(|h| h.0 == g.2)).map(|g| g.1).sum::<u64>() + held.iter().map(|h| h.1).sum::<u64>();
-        if crate::vmproc::host_available_mib() < floor + pending + mib {
-            bail!("not enough memory here for {mib} MiB above the {floor} MiB {what}");
+        let avail = available().ok_or("cannot read MemAvailable from /proc/meminfo")?;
+        if avail < floor + pending + mib {
+            return Ok(Err(format!("not enough memory here for {mib} MiB above the {floor} MiB {what}").into()));
         }
         let id = crate::migrate::migration_id().max(1);
         // Locked before it is visible (renamed in): a probe never takes it for an owner's.
@@ -719,7 +735,7 @@ impl Host {
             drop(hold);
             return Err(e);
         }
-        Ok((id, hold))
+        Ok(Ok((id, hold)))
     }
 
     // Incoming migrations: `STATE/migs/ID`, durable, under the host lock.
@@ -999,10 +1015,11 @@ pub struct Ident {
 }
 
 impl Ident {
-    /// Panics without a boot id or `/proc/self/stat`: a process that cannot
-    /// name itself must not take a name, an address or a migration.
+    /// Read once. Panics without a boot id or `/proc/self/stat`: a process
+    /// that cannot name itself must not take a name, an address or a migration.
     pub fn me() -> Ident {
-        Ident::of(std::process::id()).expect("cannot read this process's identity (/proc/self/stat, boot id)")
+        static ME: OnceLock<Ident> = OnceLock::new();
+        ME.get_or_init(|| Ident::of(std::process::id()).expect("cannot read this process's identity (/proc/self/stat, boot id)")).clone()
     }
 
     /// None without a boot id: an identity without one would read as another boot's, i.e. gone.
@@ -1180,15 +1197,6 @@ pub fn write_file(dir: &Path, name: &str, data: &[u8], durable: bool) -> std::io
         File::open(dir)?.sync_all()?;
     }
     Ok(())
-}
-
-/// Some(true) only on proof the process is gone; None when that cannot be told.
-pub fn gone(id: &Ident) -> Option<bool> {
-    match id.liveness() {
-        Liveness::Alive => Some(false),
-        Liveness::Gone => Some(true),
-        Liveness::Unknown => None,
-    }
 }
 
 /// Every error, and anything unparsable, is unknown.
@@ -1664,9 +1672,9 @@ mod tests {
         store(&h.mig_path(8), &Mig::Released { source: "127.0.0.1:1".into(), by: Some(Ident::me()) }, false).unwrap();
         // Only proof retires: another boot, no such pid, or another process with the pid.
         let me = Ident::me();
-        assert_eq!(gone(&me), Some(false));
+        assert_eq!(me.liveness(), Liveness::Alive);
         for other in [Ident { boot: "other".into(), ..me.clone() }, Ident { pid: 999_999_999, ..me.clone() }, Ident { start: me.start + 1, ..me.clone() }] {
-            assert_eq!(gone(&other), Some(true), "{other:?}");
+            assert_eq!(other.liveness(), Liveness::Gone, "{other:?}");
         }
         // A bounded lock gives up while another thread holds it.
         let (held, release) = (std::sync::mpsc::channel(), std::sync::mpsc::channel::<()>());
@@ -1704,25 +1712,53 @@ mod tests {
     #[test]
     fn admission_counts_recent_grants() {
         let mut h = host("admit");
-        let free = crate::vmproc::host_available_mib();
+        let free = crate::vmproc::host_available_mib().unwrap();
+        let admit = |h: &Host, mib| h.admit(mib).unwrap();
         // Wide margins: other processes move MemAvailable meanwhile.
         h.cfg.reserve_mib = free.saturating_sub(3000);
-        assert!(h.admit(1000) && h.admit(1000));
-        assert!(!h.admit(2000), "recent grants count as used");
+        assert!(admit(&h, 1000) && admit(&h, 1000));
+        assert!(!admit(&h, 2000), "recent grants count as used");
         // A start that did not happen gives its grant back, by id: only its own.
-        let id = h.grant(900).unwrap();
-        assert!(!h.admit(500));
+        let id = h.grant(900).unwrap().unwrap();
+        assert!(!admit(&h, 500));
         h.refund(id);
         h.refund(u64::MAX);
-        assert!(h.admit(500) && !h.admit(900));
+        assert!(admit(&h, 500) && !admit(&h, 900));
         h.cfg.reserve_mib = free + 1;
-        assert!(!h.admit(1));
+        assert!(!admit(&h, 1));
+    }
+
+    /// An unreadable MemAvailable, or a host lock not had in time, is an
+    /// error, never a refusal (which marks a VM throttled) nor 0 MiB
+    /// available; nothing is granted.
+    #[test]
+    fn admission_errors_are_not_refusals() {
+        let mut h = host("admit-err");
+        h.cfg.reserve_mib = 0;
+        let grants = || load::<Vec<(u64, u64, u64)>>(&h.run.join("grants")).unwrap().unwrap_or_default();
+        let grant = |avail: Option<u64>| h.grant_inner(1, Floor::Reserve, false, None, || avail).map(|r| r.ok().map(|g| g.0));
+        assert!(grant(None).unwrap_err().to_string().contains("MemAvailable"));
+        assert!(grants().is_empty());
+        assert_eq!(grant(Some(0)).unwrap(), None);
+        assert!(grant(Some(10)).unwrap().is_some() && grants().len() == 1);
+        let (held, release) = (std::sync::mpsc::channel(), std::sync::mpsc::channel::<()>());
+        let other = h.clone();
+        let t = std::thread::spawn(move || {
+            let _l = other.lock().unwrap();
+            held.0.send(()).unwrap();
+            let _ = release.1.recv();
+        });
+        held.1.recv().unwrap();
+        assert!(h.grant_by(1, Some(std::time::Instant::now() + Duration::from_millis(50))).is_err());
+        release.0.send(()).unwrap();
+        t.join().unwrap();
+        assert_eq!(grants().len(), 1);
     }
 
     #[test]
     fn admission_and_eviction_read_the_marks_as_they_change() {
         let mut h = host("marks");
-        let free = crate::vmproc::host_available_mib();
+        let free = crate::vmproc::host_available_mib().unwrap();
         h.configure(|c| {
             c.reserve_mib = free.saturating_sub(3000);
             c.evict_mib = Some(free.saturating_sub(1500));
@@ -1730,7 +1766,7 @@ mod tests {
         })
         .unwrap();
         let running = h.clone();
-        assert!(running.admit(100));
+        assert!(running.admit(100).unwrap());
         // An eviction's arrival leaves the mark available, not only the reserve.
         assert!(running.grant_above(2000, Floor::EvictMark).unwrap_err().to_string().contains("eviction mark"));
         assert!(running.grant_above(200, Floor::EvictMark).is_ok());
@@ -1749,26 +1785,26 @@ mod tests {
         })
         .unwrap();
         assert_eq!(running.config_now().reserve_mib, free + 1000);
-        assert!(!running.admit(1));
+        assert!(!running.admit(1).unwrap());
     }
 
     #[test]
     fn held_grants_count_past_the_window_until_dropped_or_their_owner_is_gone() {
         let mut h = host("held");
-        let free = crate::vmproc::host_available_mib();
+        let free = crate::vmproc::host_available_mib().unwrap();
         h.cfg.reserve_mib = free.saturating_sub(3000);
         let (_, hold) = h.grant_held(2000, Floor::Reserve).unwrap();
         // The window passes (the grant ages out): held, it still counts, once.
         let path = h.run.join("grants");
         let aged: Vec<(u64, u64, u64)> = load::<Vec<(u64, u64, u64)>>(&path).unwrap().unwrap().into_iter().map(|g| (0, g.1, g.2)).collect();
         store(&path, &aged, false).unwrap();
-        assert!(!h.admit(1500), "a held grant counts after the window");
+        assert!(!h.admit(1500).unwrap(), "a held grant counts after the window");
         drop(hold);
-        assert!(h.admit(1500));
+        assert!(h.admit(1500).unwrap());
         // A hold whose lock nobody has (its process died; or its removal failed) goes.
         store(&path, &Vec::<(u64, u64, u64)>::new(), false).unwrap();
         std::fs::write(h.run.join("holds").join("99-2000"), b"").unwrap();
-        assert!(h.admit(2500));
+        assert!(h.admit(2500).unwrap());
         assert!(!h.run.join("holds").join("99-2000").exists());
     }
 }

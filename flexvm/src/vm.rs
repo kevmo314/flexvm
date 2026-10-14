@@ -59,6 +59,9 @@ impl State {
     }
 }
 
+/// How long setting a VM's first memory mark waits for the host lock to admit more.
+const ADMIT_WAIT: Duration = Duration::from_millis(500);
+
 pub struct Vm {
     pub name: String,
     pub template: Arc<Template>,
@@ -133,13 +136,21 @@ impl Vm {
         mem_sizes(&self.pager, &self.template, self.hotplug_plugged())
     }
 
-    /// Sets its memory mark once it runs here: what its start was admitted
-    /// (`granted`); what it holds and still pages in beyond that (`sizes`)
-    /// is admitted first (refused, it is throttled until a step is).
+    /// Sets its memory mark once it runs here: at once what its start was
+    /// admitted (`granted`), then what it holds and still pages in beyond
+    /// that (`sizes`), if admitted within `ADMIT_WAIT` (refused, or not
+    /// answered by then, it stays at its mark until the watcher admits a step).
     pub fn start_limit(&self, granted: u64, (need, cap): (u64, u64), host: &crate::host::Host) {
+        self.limit.start(granted, cap);
         let more = need.saturating_sub(granted);
-        let admitted = if more > 0 && host.admit(more) { need } else { granted };
-        self.limit.start(admitted, cap);
+        if more == 0 {
+            return;
+        }
+        match host.grant_by(more, Some(Instant::now() + ADMIT_WAIT)) {
+            Ok(Some(_)) => self.limit.plug(cap, more),
+            Ok(None) => {}
+            Err(e) => eprintln!("vm {}: admitting {more} MiB: {e}", self.name),
+        }
     }
 
     pub fn mem_sock(&self) -> PathBuf {
