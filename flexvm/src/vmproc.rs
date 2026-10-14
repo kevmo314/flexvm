@@ -1614,8 +1614,7 @@ pub fn call(host: &Host, name: &str, req: Value) -> Result<Value> {
 
 /// `call`, giving up on the answer after `wait`.
 fn call_within(host: &Host, name: &str, req: Value, wait: Duration) -> Result<Value> {
-    let c = connect(host, name, &req, &[])?;
-    c.set_read_timeout(Some(wait))?;
+    let c = crate::util::By { s: connect(host, name, &req, &[])?, at: Instant::now() + wait };
     answer(crate::util::recv_json(&mut BufReader::new(c))?, &format!("vm {name}"))
 }
 

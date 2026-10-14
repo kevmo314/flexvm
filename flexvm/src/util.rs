@@ -84,11 +84,11 @@ pub fn connect(addr: &str, timeout: Duration) -> io::Result<std::net::TcpStream>
     Err(last)
 }
 
-/// Connects within `wait`, sends `req` and reads its answer, all by `at`; any failure names `addr`.
-/// The stream stays open for whatever follows.
+/// Connects within `wait`, sends `req` and reads its answer, all by `at` (a hostname's lookup aside);
+/// any failure names `addr`. The stream stays open for whatever follows.
 pub fn rpc(addr: &str, wait: Duration, at: Instant, req: &serde_json::Value) -> Result<(std::net::TcpStream, serde_json::Value)> {
     (|| -> Result<_> {
-        let s = connect(addr, wait)?;
+        let s = connect(addr, wait.min(By { s: (), at }.left()?))?;
         send_json(&mut By { s: &s, at }, req)?;
         let reply = recv_json(&mut io::BufReader::new(By { s: &s, at }))?;
         Ok((s, answer(reply, "it")?))
@@ -120,7 +120,7 @@ macro_rules! timed {
         }
     )*};
 }
-timed!(std::net::TcpStream, &std::net::TcpStream, UnixStream);
+timed!(std::net::TcpStream, &std::net::TcpStream, UnixStream, &UnixStream);
 
 /// Every read and write (each partial one) ends by `at`, however slowly the peer trickles.
 pub struct By<S> {
