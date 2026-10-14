@@ -782,38 +782,16 @@ impl Proc {
         }
     }
 
-    /// `run NAME -- CMD`: output to this process's; when it exits, the VM is
-    /// destroyed and the process exits with its status.
+    /// `run NAME -- CMD`, through this VM's own control socket: output to
+    /// this process's; when it exits the VM is destroyed and the process
+    /// exits with its status (unless migrating away: it ends with that).
     fn main_command(self: Arc<Self>) {
-        let (vm, cmd) = (self.vm().clone(), self.cmd.lock().unwrap().clone().unwrap_or_default());
-        let id = format!("main-{}", std::process::id());
-        let (mut offset, mut started) = (0u64, false);
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let code = loop {
-            if !vm.state().local() {
-                // Migrated or suspended: the command goes on with the VM.
-                return;
-            }
-            let action = if started { "attach" } else { "start" };
-            if let Ok((mut g, sid)) = vm.exec(|s| guest::session(s, action, &id, offset, &cmd, guest::TIMEOUT)) {
-                let _ = g.get_ref().set_read_timeout(Some(Duration::from_secs(3)));
-                let end = crate::exec_frames(&mut g, &id, &mut started, &mut offset, &mut std::io::stdout(), &mut std::io::stderr(), &mut Instant::now());
-                vm.untrack_exec(sid);
-                match end {
-                    Ok(crate::StreamEnd::Exit(code)) => break code,
-                    Ok(crate::StreamEnd::Disconnected(_)) => {}
-                    Err(e) => {
-                        eprintln!("vm {}: {e}", vm.name);
-                        break 255;
-                    }
-                }
-            } else if !started && Instant::now() > deadline {
-                break 255;
-            }
-            thread::sleep(Duration::from_millis(100));
-        };
-        // Refused while migrating away: the process ends with the migration.
-        eprintln!("vm {}: {}", vm.name, self.destroy(code));
+        let cmd = self.cmd.lock().unwrap().clone().unwrap_or_default();
+        let code = crate::exec(&self.host, &self.name(), &cmd).unwrap_or_else(|e| {
+            eprintln!("vm {}: {e}", self.name());
+            255
+        });
+        eprintln!("vm {}: {}", self.name(), self.destroy(code));
     }
 
     /// Whether SIGINT or SIGTERM came before the VM was up.
