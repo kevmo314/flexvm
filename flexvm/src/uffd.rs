@@ -610,8 +610,9 @@ impl Pager {
     /// already reading, through clones of their own.
     fn pulled(&self, n: usize) {
         if n > 0 && self.remote_left.fetch_sub(n, Ordering::SeqCst) == n {
+            // Off the calling thread, which may be the one serving faults: it walks the whole chain's page cache.
             if let Some(file) = self.file.lock().unwrap().take() {
-                file.drop_cache();
+                std::thread::spawn(move || file.drop_cache());
             }
             let _ = self.pull_finished.set(Instant::now());
             self.notify();
