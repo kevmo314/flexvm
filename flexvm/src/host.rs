@@ -212,15 +212,15 @@ impl Host {
         Ok(())
     }
 
-    /// Why the tap prefix cannot become `new` now, under the host lock:
-    /// garbage collection will read taps' owners from their names under
-    /// `new`. So no VM process of this host may be left to make taps under
-    /// the old one: any whose work directory's owner is not proven gone,
-    /// whatever it is doing (it reads the prefix only once its work directory
-    /// exists, `tap_prefix`). And no tap may already read as one of `new`'s,
-    /// whoever made it, live or leaked. (Taps under the old prefix that do
-    /// not read under `new` are left alone by this host's sweeps from then on.)
-    /// What cannot be read is a reason too: never taken for nothing in use.
+    /// Why the tap prefix cannot become `new` now, under the host lock: so
+    /// that this host's taps all have one prefix, no VM process of this host
+    /// may be left to make taps under the old one: any whose work directory's
+    /// owner is not proven gone, whatever it is doing (it reads the prefix
+    /// only once its work directory exists, `tap_prefix`). And no tap may
+    /// already read as one of `new`'s, whoever made it, live or leaked: a
+    /// VM process's tap would be refused its name. (Sweeps go by a tap's
+    /// owner, `tap_alias`, never its name or the prefix.) What cannot be
+    /// read is a reason too: never taken for nothing in use.
     fn prefix_in_use(&self, new: &str) -> Option<String> {
         self.prefix_in_use_at(new, Path::new("/sys/class/net"))
     }
@@ -248,8 +248,11 @@ impl Host {
     /// The prefix of the taps of a VM process whose work directory exists:
     /// read from host.json now, not as it was when the process started, so
     /// a prefix change either sees the work directory or is seen here.
+    /// Checked here, as host.json may hold one saved under an older limit.
     pub fn tap_prefix(&self) -> Result<String> {
-        Ok(load::<Config>(&self.state.join("host.json"))?.unwrap_or_default().prefix)
+        let prefix = load::<Config>(&self.state.join("host.json"))?.unwrap_or_default().prefix;
+        check_prefix(&prefix).map_err(|e| format!("host.json's tap prefix: {e} (set one with `flexvm config --prefix`)"))?;
+        Ok(prefix)
     }
 
     /// The configuration as it is now: `flexvm listen` may have changed the
@@ -1243,9 +1246,11 @@ pub fn reap(run: &Path, owner: &Ident) -> Result<()> {
     Ok(())
 }
 
-/// The process a tap was made for: a VM process's (PREFIX, its pid in hex,
-/// `t`, a counter) or a template build's (PREFIX `x` pid in hex,
-/// `template::tap`; earlier builds' PREFIX `tpl` pid in decimal).
+/// The process a tap's name reads as made for: a VM process's (PREFIX, its
+/// pid in hex, `t`, a counter) or a template build's (PREFIX `x` pid in hex,
+/// `template::tap`; earlier builds' PREFIX `tpl` pid in decimal). Only to
+/// keep names apart (`Host::prefix_in_use`): a name proves nothing about
+/// whose a tap is (another host's prefix may extend this one's).
 fn tap_owner(name: &str, prefix: &str) -> Option<u32> {
     let rest = name.strip_prefix(prefix)?;
     let number = |s: &str, radix| (!s.is_empty() && s.chars().all(|c| c.is_digit(radix))).then(|| u32::from_str_radix(s, radix).ok()).flatten();
@@ -1259,10 +1264,49 @@ fn tap_owner(name: &str, prefix: &str) -> Option<u32> {
 }
 
 /// The VM process a Firecracker's cgroup (`idle-PID-START-N`) was made by.
+/// Earlier builds' (`idle-PID-N`) are left alone, as their owner cannot be
+/// told by identity: emptied when their Firecrackers exit, gone at a reboot.
 fn cgroup_owner(name: &str) -> Option<Ident> {
     let parts: Vec<&str> = name.strip_prefix("idle-")?.split('-').collect();
     let [pid, start, _] = parts[..] else { return None };
     Some(Ident { pid: pid.parse().ok()?, start: start.parse().ok()?, boot: boot_id().into() })
+}
+
+/// A tap's alias, naming its owner (`net::create_tap`): `flexvm PID START RUN`,
+/// the process that made it and its host's run directory, which no other host
+/// shares. Sweeps go by it alone, never by a tap's name.
+pub fn tap_alias(run: &Path, owner: &Ident) -> String {
+    format!("flexvm {} {} {}", owner.pid, owner.start, run.display())
+}
+
+fn parse_tap_alias(alias: &str) -> Option<(Ident, &str)> {
+    let mut parts = alias.strip_prefix("flexvm ")?.splitn(3, ' ');
+    let (pid, start, run) = (parts.next()?.parse().ok()?, parts.next()?.parse().ok()?, parts.next()?);
+    (!run.is_empty()).then(|| (Ident { pid, start, boot: boot_id().into() }, run))
+}
+
+/// This host's taps: tun devices whose alias names its run directory (`tap_alias`), with
+/// their index (read before the alias: a tap made since under the name has another) and
+/// owner. A tap without such an alias (another host's, an earlier build's, anyone's) is
+/// never this host's.
+fn taps_of(run: &Path) -> Vec<(String, u32, Ident)> {
+    taps_of_at(run, Path::new("/sys/class/net"))
+}
+
+fn taps_of_at(run: &Path, net: &Path) -> Vec<(String, u32, Ident)> {
+    let run = run.to_string_lossy();
+    let mut taps = Vec::new();
+    for e in std::fs::read_dir(net).into_iter().flatten().flatten() {
+        let dir = e.path();
+        let read = |f: &str| std::fs::read_to_string(dir.join(f)).ok();
+        let Some(index) = read("ifindex").and_then(|i| i.trim().parse().ok()) else { continue };
+        let Some(alias) = read("ifalias") else { continue };
+        let Some((owner, of)) = parse_tap_alias(alias.trim_end_matches('\n')) else { continue };
+        if of == run && dir.join("tun_flags").exists() {
+            taps.push((e.file_name().to_string_lossy().into_owned(), index, owner));
+        }
+    }
+    taps
 }
 
 /// A detached VM process's own cgroup (`vm-PID-START`, `util::spawn_self`)
@@ -1278,43 +1322,27 @@ fn sweep_scope(dir: &Path) {
 impl Host {
     /// What dead processes left: taps (a template build's too), cgroups, work
     /// directories and names. Only proof of death (`Liveness::Gone`) frees any.
-    /// Taps are read under the prefix host.json has now, under the host lock,
-    /// so a prefix change cannot come in between.
+    /// Taps are this host's by their alias (`taps_of`), whatever their name.
     pub fn collect_garbage(&self) -> Result<()> {
-        let dead = {
-            let _l = self.lock()?;
-            let prefix = self.tap_prefix()?;
-            let mut gone = HashMap::new();
-            let mut dead = Vec::new();
-            for e in std::fs::read_dir("/sys/class/net").into_iter().flatten().flatten() {
-                let n = e.file_name().to_string_lossy().into_owned();
-                if tap_owner(&n, &prefix).is_some_and(|pid| *gone.entry(pid).or_insert_with(|| pid_gone(pid))) {
-                    if let Ok(index) = crate::net::ifindex(&n) {
-                        dead.push((n, index));
-                    }
-                }
+        // Deleted by index and name: a tap made since under a dead one's name is another.
+        for (name, index, owner) in taps_of(&self.run) {
+            if owner.liveness() == Liveness::Gone {
+                crate::net::delete_link(index, &name);
             }
-            dead
-        };
-        // Deleted unlocked, by index and name: a tap made since under a dead one's name is another.
-        for (name, index) in dead {
-            crate::net::delete_link(index, &name);
         }
         collect_owned(&self.run);
         Ok(())
     }
 }
 
-/// Taps dead processes with `pid` left (a template build's too), which
-/// would pass for its own: their names cannot hold a start time. Only for
-/// the process that has `pid` now, before it makes any; no sweep frees them
-/// while it lives.
-pub fn clear_taps(prefix: &str, pid: u32) {
-    for e in std::fs::read_dir("/sys/class/net").into_iter().flatten().flatten() {
-        let n = e.file_name().to_string_lossy().into_owned();
-        if tap_owner(&n, prefix) == Some(pid) {
-            eprintln!("removing tap {n}, a dead process's with this pid");
-            crate::net::delete_tap(&n);
+/// Taps that dead processes of this host with `me`'s pid left (a template
+/// build's too), whose names `me` would be refused: for `me`, before it
+/// makes any, as a sweep may not have run since.
+pub fn clear_taps(run: &Path, me: &Ident) {
+    for (name, index, owner) in taps_of(run) {
+        if owner.pid == me.pid && owner.liveness() == Liveness::Gone {
+            eprintln!("removing tap {name}, a dead process's with this pid");
+            crate::net::delete_link(index, &name);
         }
     }
 }
@@ -1362,6 +1390,14 @@ fn collect_owned(run: &Path) {
     }
 }
 
+/// Tap names are 15 bytes at most: PREFIX, a pid in hex (up to 6), `t` and a counter.
+pub fn check_prefix(p: &str) -> Result<()> {
+    if p.is_empty() || p.len() > 6 || !p.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)) {
+        bail!("bad prefix {p:?}: 1 to 6 letters, digits, '-', '_' or '.'");
+    }
+    Ok(())
+}
+
 pub fn check_name(name: &str) -> Result<()> {
     if name.is_empty() || name.len() > 64 || name.starts_with('.') || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)) {
         bail!("bad vm name {name:?}: up to 64 letters, digits, '-', '_' or '.', not starting with '.'");
@@ -1394,8 +1430,7 @@ fn liveness_by(id: &Ident, boot: &str, stat: impl Fn(u32) -> std::io::Result<Str
         return Liveness::Gone;
     }
     // Opened while it was exiting, read once it was gone: the task the read was for no longer
-    // exists, so neither does `id` (a new process with its pid would be another one). For a
-    // bare pid (`pid_gone`) it proves nothing: the pid may already be someone else's.
+    // exists, so neither does `id` (a new process with its pid would be another one).
     let stat = |pid| match stat(pid) {
         Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
         r => r,
@@ -1417,11 +1452,6 @@ fn pid_liveness_by(pid: u32, stat: impl Fn(u32) -> std::io::Result<String>) -> (
             Some((_, start)) => (Liveness::Alive, Some(start)),
         },
     }
-}
-
-/// Proof that no process has `pid` (for resources named by pid alone).
-pub fn pid_gone(pid: u32) -> bool {
-    pid_liveness_by(pid, |pid| std::fs::read_to_string(format!("/proc/{pid}/stat"))).0 == Liveness::Gone
 }
 
 /// State and start time from `/proc/PID/stat`.
@@ -1787,10 +1817,9 @@ mod tests {
         }
     }
 
-    /// Garbage collection reads tap owners under the prefix: it never
-    /// changes while a VM process (any work directory not proven gone) may
-    /// have taps under the old one, and a process reads it only after its
-    /// work directory is there.
+    /// The tap prefix never changes while a VM process (any work directory
+    /// not proven gone) may have taps under the old one, and a process reads
+    /// it only after its work directory is there.
     #[test]
     fn the_tap_prefix_never_changes_under_a_vm_process() {
         fn prefix(p: &str) -> impl FnOnce(&mut Config) -> Result<()> + '_ {
@@ -1827,6 +1856,59 @@ mod tests {
         // The work directories unreadable.
         std::fs::remove_dir_all(h.run.join("w")).unwrap();
         assert!(h.prefix_in_use_at("zq3", &net).is_some());
+    }
+
+    /// A tap is this host's by its alias alone, whatever its name: hosts
+    /// whose prefixes overlap (`fq`, `fq2`) never take each other's.
+    #[test]
+    fn taps_are_this_hosts_by_their_alias() {
+        let h = host("alias");
+        let me = Ident::me();
+        let alias = tap_alias(&h.run, &me);
+        assert_eq!(parse_tap_alias(&alias), Some((me.clone(), &*h.run.to_string_lossy())));
+        for bad in ["", "flexvm", "flexvm 1 2", "flexvm 1 2 ", "flexvm x 2 /r", "flexvm 1 y /r", "flexvm1 2 /r", "other 1 2 /r"] {
+            assert_eq!(parse_tap_alias(bad), None, "{bad:?}");
+        }
+        assert_eq!(parse_tap_alias("flexvm 1 2 /run/a b").map(|(o, r)| (o.pid, o.start, r)), Some((1, 2, "/run/a b")));
+        let net = h.run.join("net");
+        let other = h.run.join("other");
+        let dead = Ident { pid: 999_999_931, start: 1, boot: boot_id().into() };
+        let dev = |name: &str, index: u32, alias: &str, tun: bool| {
+            let d = net.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("ifindex"), format!("{index}\n")).unwrap();
+            std::fs::write(d.join("ifalias"), format!("{alias}\n")).unwrap();
+            if tun {
+                std::fs::write(d.join("tun_flags"), "0x1802\n").unwrap();
+            }
+        };
+        dev("fq3e7t0", 10, &tap_alias(&h.run, &dead), true);
+        dev("fqx3e7", 11, &tap_alias(&h.run, &me), true);
+        // Host `fq2`'s live and dead taps, which read under `fq` as pids 0x21a2b, 0x21a2c.
+        dev("fq21a2bt0", 12, &tap_alias(&other, &me), true);
+        dev("fq21a2ct0", 13, &tap_alias(&other, &dead), true);
+        dev("fq1t0", 14, "", true);
+        dev("fq2t0", 15, &tap_alias(&h.run, &dead), false);
+        let mut got = taps_of_at(&h.run, &net);
+        got.sort_by_key(|t| t.1);
+        assert_eq!(got, vec![("fq3e7t0".into(), 10, dead.clone()), ("fqx3e7".into(), 11, me.clone())]);
+        let mut theirs = taps_of_at(&other, &net);
+        theirs.sort_by_key(|t| t.1);
+        assert_eq!(theirs, vec![("fq21a2bt0".into(), 12, me), ("fq21a2ct0".into(), 13, dead)]);
+    }
+
+    /// One saved under the earlier 8-character limit is refused where it is read.
+    #[test]
+    fn a_stored_prefix_is_checked_where_read() {
+        let h = host("oldprefix");
+        for (p, ok) in [("fv", true), ("fvci0a", true), ("fvci10a", false), ("fvci0.1a", false), ("", false), ("f/v", false)] {
+            store(&h.state.join("host.json"), &Config { prefix: p.into(), ..Config::default() }, false).unwrap();
+            let got = h.tap_prefix();
+            assert_eq!(got.is_ok(), ok, "{p:?}: {got:?}");
+            if let Err(e) = got {
+                assert!(e.to_string().contains("flexvm config --prefix"), "{e}");
+            }
+        }
     }
 
     /// A VM process's own cgroup goes only once empty, whatever its pid

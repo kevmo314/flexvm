@@ -350,12 +350,14 @@ pub struct Spawner {
     sockets: Arc<SocketRoot>,
     cgroups: Option<PathBuf>,
     tap_prefix: String,
+    /// Each tap's alias (`host::tap_alias`).
+    tap_owner: String,
     next: AtomicU64,
 }
 
 impl Spawner {
-    pub fn new(bin: &Path, root: &Path, sockets: Arc<SocketRoot>, cgroups: Option<PathBuf>, tap_prefix: &str) -> Spawner {
-        Spawner { bin: bin.into(), root: root.into(), sockets, cgroups, tap_prefix: tap_prefix.into(), next: AtomicU64::new(0) }
+    pub fn new(bin: &Path, root: &Path, sockets: Arc<SocketRoot>, cgroups: Option<PathBuf>, tap_prefix: &str, tap_owner: &str) -> Spawner {
+        Spawner { bin: bin.into(), root: root.into(), sockets, cgroups, tap_prefix: tap_prefix.into(), tap_owner: tap_owner.into(), next: AtomicU64::new(0) }
     }
 
     pub fn take(&self, deadline: Option<std::time::Instant>) -> Result<Idle> {
@@ -371,8 +373,8 @@ impl Spawner {
         let dir = self.root.join(&id);
         let cgroup = self.cgroups.as_ref().map(|root| root.join(&id));
         let made = {
-            let t = tap.clone();
-            std::thread::spawn(move || crate::net::create_tap(&t))
+            let (t, owner) = (tap.clone(), self.tap_owner.clone());
+            std::thread::spawn(move || crate::net::create_tap(&t, &owner))
         };
         let fc = std::fs::create_dir_all(&dir).map_err(Into::into).and_then(|()| Firecracker::spawn(&self.bin, &dir, self.sockets.allocate()?, ready));
         let made = made.join().unwrap_or_else(|_| Err("tap thread panicked".into()));

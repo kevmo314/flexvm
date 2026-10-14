@@ -772,7 +772,15 @@ a second copy could repeat what it did.
     everything through, in order, as a FIFO; it stays the tap's qdisc,
     a pass-through, for the rest of the VM's life on that tap (instead of
     the default `fq_codel`; a tap never queues there anyway, its driver
-    takes every packet or drops it). However late the hand-over after
+    takes every packet into its ring, `TAP_QUEUE`, or drops it). Putting
+    the default back would cost more: any root qdisc change on a running
+    tap first points it at `noop_qdisc` for an RCU grace period, dropping
+    what is routed to the VM meanwhile (about ten packets per change at
+    35k packets/s, measured); the plug goes in before the route, when
+    nothing does. Only a plug that may be installed is unplugged (also
+    after a lost ACK), never after the kernel refused it, and only our
+    plug (`1:`, kind `plug`) is ever released or removed, never another
+    root qdisc. However late the hand-over after
     the switch runs on a busy host, nothing routed overtakes a held packet
     (scenario `same_host_late_handover`). A source likewise reads its hold
     device itself once the route moved, and hands all of it over, not

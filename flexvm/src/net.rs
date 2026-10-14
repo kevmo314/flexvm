@@ -7,9 +7,9 @@ use std::net::Ipv4Addr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use libc::{
-    c_int, IFA_ADDRESS, IFA_LOCAL, IFLA_ADDRESS, NDA_DST, NDA_LLADDR, NLMSG_ERROR, NLM_F_ACK, NLM_F_CREATE, NLM_F_REPLACE, NLM_F_REQUEST, NUD_PERMANENT,
-    RTA_DST, RTA_GATEWAY, RTA_OIF, RTM_DELLINK, RTM_DELROUTE, RTM_NEWADDR, RTM_NEWNEIGH, RTM_NEWROUTE, RTM_SETLINK, RTN_UNICAST, RTPROT_STATIC, RT_SCOPE_HOST,
-    RT_SCOPE_LINK, RT_SCOPE_NOWHERE, RT_SCOPE_UNIVERSE, RT_TABLE_MAIN,
+    c_int, IFA_ADDRESS, IFA_LOCAL, IFLA_ADDRESS, IFLA_IFALIAS, NDA_DST, NDA_LLADDR, NLMSG_ERROR, NLM_F_ACK, NLM_F_CREATE, NLM_F_REPLACE, NLM_F_REQUEST,
+    NUD_PERMANENT, RTA_DST, RTA_GATEWAY, RTA_OIF, RTM_DELLINK, RTM_DELROUTE, RTM_NEWADDR, RTM_NEWNEIGH, RTM_NEWROUTE, RTM_SETLINK, RTN_UNICAST, RTPROT_STATIC,
+    RT_SCOPE_HOST, RT_SCOPE_LINK, RT_SCOPE_NOWHERE, RT_SCOPE_UNIVERSE, RT_TABLE_MAIN,
 };
 
 use crate::bail;
@@ -107,8 +107,13 @@ pub const TAP_ADDR: &str = "169.254.1.2/32";
 /// Room for the packets a migration held, injected all at once (default 1000).
 pub const TAP_QUEUE: u32 = 4096;
 
-/// Ioctls and rtnetlink, as spawning `ip` costs tens of milliseconds.
-pub fn create_tap(name: &str) -> Result<()> {
+/// Ioctls and rtnetlink, as spawning `ip` costs tens of milliseconds. `owner` becomes the
+/// tap's alias (`host::tap_alias`), set before the tap is made persistent: a tap left
+/// behind always names its owner, and garbage collection goes by that, never by the name.
+pub fn create_tap(name: &str, owner: &str) -> Result<()> {
+    if owner.len() >= 256 {
+        bail!("tap {name}: owner {owner:?} is over 255 bytes (a shorter run directory)");
+    }
     let mut req = ifreq(name)?;
     let fd = unsafe { libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
     if fd < 0 {
@@ -117,7 +122,14 @@ pub fn create_tap(name: &str) -> Result<()> {
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
     // Never a leaked tap of a dead process with this name, nor its routes.
     req.ifr_ifru.ifru_flags = (libc::IFF_TAP | libc::IFF_NO_PI | libc::IFF_TUN_EXCL) as libc::c_short;
-    if unsafe { libc::ioctl(fd.as_raw_fd(), libc::TUNSETIFF, &req) } < 0 || unsafe { libc::ioctl(fd.as_raw_fd(), libc::TUNSETPERSIST, 1) } < 0 {
+    if unsafe { libc::ioctl(fd.as_raw_fd(), libc::TUNSETIFF, &req) } < 0 {
+        bail!("create tap {name}: {}", std::io::Error::last_os_error());
+    }
+    // Until TUNSETPERSIST the tap goes with `fd`, so with this process.
+    let mut alias = ifinfomsg(ifindex(name)?);
+    attr(&mut alias, IFLA_IFALIAS, owner.as_bytes());
+    netlink(RTM_SETLINK, 0, &alias).map_err(|e| format!("tap {name}: its owner: {e}"))?;
+    if unsafe { libc::ioctl(fd.as_raw_fd(), libc::TUNSETPERSIST, 1) } < 0 {
         bail!("create tap {name}: {}", std::io::Error::last_os_error());
     }
     drop(fd);
@@ -223,18 +235,43 @@ fn plug_msg(ifindex: u32, action: i32) -> Vec<u8> {
 
 /// Packets the host routes out of `tap` wait in its qdisc, in their order, until
 /// `unplug_tap`; frames a packet socket sends past the qdisc (`hold::Injector`) do not.
-/// Whatever this returns, the plug may be installed (an ACK can be lost after the change):
-/// `unplug_tap` is due either way.
-pub fn plug_tap(tap: &str) -> Result<()> {
-    netlink(libc::RTM_NEWQDISC, NLM_F_CREATE | NLM_F_REPLACE, &plug_msg(ifindex(tap)?, TCQ_PLUG_BUFFER))
+/// Returns whether the plug may be installed, which `unplug_tap` is then due for: when it
+/// is, and when the kernel's answer was lost (the change may have been made). Not when the
+/// kernel refused it (no `sch_plug`, a root qdisc of another kind at 1:): then there is
+/// nothing of ours to let go of, and an unplug would only cost its retries.
+pub fn plug_tap(tap: &str) -> (bool, Result<()>) {
+    let Ok(ifindex) = ifindex(tap) else { return (false, Err(format!("no tap {tap}").into())) };
+    match request(libc::RTM_NEWQDISC, NLM_F_CREATE | NLM_F_REPLACE, &plug_msg(ifindex, TCQ_PLUG_BUFFER)) {
+        Ok(()) => (true, Ok(())),
+        Err(Failed::Refused(e)) | Err(Failed::Unsent(e)) => (false, Err(e)),
+        Err(Failed::Unanswered(e)) => (true, Err(e)),
+    }
+}
+
+/// Our plug at the tap's root (handle 1:, kind "plug"), and nothing else: the kernel
+/// refuses the delete if the root qdisc is not that one.
+fn remove_plug(ifindex: u32) -> Result<()> {
+    let mut m = tcmsg(ifindex, 0x1_0000);
+    attr(&mut m, TCA_KIND, b"plug\0");
+    netlink(libc::RTM_DELQDISC, 0, &m)
 }
 
 /// What waited goes out, in order, and the qdisc lets everything through from then on, a
 /// FIFO: a packet arriving meanwhile queues behind the waiting ones. Failing that (tried
-/// three times), the root qdisc goes, the tap's default coming back, and what waited with
+/// three times), the plug goes, the tap's default qdisc coming back, and what waited with
 /// it; failing that too, that is retried in the background for a minute, so the tap never
-/// stays plugged. Returns the packets the plug dropped (past `PLUG_LIMIT`, or discarded with
-/// it), and whether it let them through.
+/// stays plugged. Only our plug is released or removed (`remove_plug`), never another root
+/// qdisc. Returns the packets the plug dropped (past `PLUG_LIMIT`, or discarded with it),
+/// and whether it let them through.
+///
+/// Released, the plug stays the tap's root qdisc, in place of its default (fq_codel), and
+/// never holds anything: tun never stops its queue, taking each packet into its ring (of
+/// `TAP_QUEUE`, the tap's txqueuelen) or dropping it there (the tap's tx_dropped), so a
+/// root qdisc only ever passes packets straight through, the default as well. Putting the
+/// default back would cost more than it gives: any root qdisc change on a running tap
+/// first points its queues at noop_qdisc for an RCU grace period (`dev_deactivate`), which
+/// drops what the new route sends the VM meanwhile. The plug is put in place before the
+/// route, so nothing is routed to the tap yet then.
 pub fn unplug_tap(tap: &str) -> (u64, Result<()>) {
     let Ok(ifindex) = ifindex(tap) else { return (0, Err(format!("no tap {tap}").into())) };
     let stats = || qdisc_stats(ifindex).unwrap_or_default();
@@ -247,7 +284,7 @@ pub fn unplug_tap(tap: &str) -> (u64, Result<()>) {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     let (drops, queued) = stats();
-    let remove = move || netlink(libc::RTM_DELQDISC, 0, &tcmsg(ifindex, 0));
+    let remove = move || remove_plug(ifindex);
     let Err(e) = released else { unreachable!() };
     if (0..3).any(|_| {
         remove().is_ok() || {
@@ -396,33 +433,45 @@ fn attr(buf: &mut Vec<u8>, kind: u16, data: &[u8]) {
     buf.resize(buf.len().next_multiple_of(4), 0);
 }
 
+/// Why a request failed: the kernel answered no (nothing changed), it was never sent, or its
+/// answer was lost after it was sent (the change may have been made).
+enum Failed {
+    Refused(crate::util::Error),
+    Unsent(crate::util::Error),
+    Unanswered(crate::util::Error),
+}
+
+fn netlink(kind: u16, flags: c_int, body: &[u8]) -> Result<()> {
+    request(kind, flags, body).map_err(|(Failed::Refused(e) | Failed::Unsent(e) | Failed::Unanswered(e))| e)
+}
+
 /// One socket per thread, so each recv is the ACK of the request just sent and a slow one
 /// (a tap's teardown) holds up no other thread; any failure drops it, so no stale ACK is
 /// left for the next.
-fn netlink(kind: u16, flags: c_int, body: &[u8]) -> Result<()> {
+fn request(kind: u16, flags: c_int, body: &[u8]) -> std::result::Result<(), Failed> {
     thread_local!(static FD: std::cell::Cell<Option<OwnedFd>> = const { std::cell::Cell::new(None) });
-    let sock = FD.take().map_or_else(|| socket(libc::AF_NETLINK, libc::SOCK_RAW, libc::NETLINK_ROUTE, "netlink socket"), Ok)?;
+    let sock = FD.take().map_or_else(|| socket(libc::AF_NETLINK, libc::SOCK_RAW, libc::NETLINK_ROUTE, "netlink socket"), Ok).map_err(Failed::Unsent)?;
     let flags = ((flags | NLM_F_REQUEST | NLM_F_ACK) as u16).to_ne_bytes();
     // struct nlmsghdr: length, type, flags, seq, pid.
     let msg = [&((16 + body.len()) as u32).to_ne_bytes()[..], &kind.to_ne_bytes(), &flags, &[1, 0, 0, 0, 0, 0, 0, 0], body].concat();
     let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
     addr.nl_family = libc::AF_NETLINK as u16;
     let mut ack = [0u8; 1024];
-    let res = match send_to(&sock, &msg, &addr) {
-        sent if sent < 0 => -1,
-        _ => unsafe { libc::recv(sock.as_raw_fd(), ack.as_mut_ptr().cast(), ack.len(), 0) },
-    };
+    if send_to(&sock, &msg, &addr) < 0 {
+        return Err(Failed::Unsent(format!("netlink: {}", std::io::Error::last_os_error()).into()));
+    }
+    let res = unsafe { libc::recv(sock.as_raw_fd(), ack.as_mut_ptr().cast(), ack.len(), 0) };
     if res < 0 {
-        bail!("netlink: {}", std::io::Error::last_os_error());
+        return Err(Failed::Unanswered(format!("netlink: {}", std::io::Error::last_os_error()).into()));
     }
     if res < 20 {
-        bail!("netlink: short reply ({res} bytes)");
+        return Err(Failed::Unanswered(format!("netlink: short reply ({res} bytes)").into()));
     }
     FD.set(Some(sock));
     let kind = u16::from_ne_bytes([ack[4], ack[5]]);
     let code = i32::from_ne_bytes(ack[16..20].try_into().unwrap());
     if kind == NLMSG_ERROR as u16 && code != 0 {
-        bail!("netlink: {}", std::io::Error::from_raw_os_error(-code));
+        return Err(Failed::Refused(format!("netlink: {}", std::io::Error::from_raw_os_error(-code)).into()));
     }
     Ok(())
 }
@@ -551,8 +600,35 @@ mod tests {
     fn long_interface_names_are_refused() {
         assert!(ifreq("fvci0A3fffffhff").is_ok(), "15 bytes");
         // Refused before /dev/net/tun is opened (no CAP_NET_ADMIN needed).
-        let e = create_tap("fvci0A3fffffta00").unwrap_err().to_string();
+        let e = create_tap("fvci0A3fffffta00", "").unwrap_err().to_string();
         assert!(e.contains("over 15 bytes"), "{e}");
+    }
+
+    /// Needs root: `sudo cargo test -- --ignored`. A tap names its owner; a plug the kernel
+    /// refuses is told apart (nothing to unplug), and only our plug is ever removed.
+    #[test]
+    #[ignore]
+    fn taps_name_their_owner_and_only_our_plug_goes() {
+        let tap = format!("tw4p{:x}", std::process::id());
+        let tc = |args: &str| std::process::Command::new("tc").args(args.split(' ')).output().unwrap();
+        let root = || String::from_utf8_lossy(&tc(&format!("qdisc show dev {tap} root")).stdout).into_owned();
+        create_tap(&tap, "flexvm 1 2 /run/x").unwrap();
+        let alias = std::fs::read_to_string(format!("/sys/class/net/{tap}/ifalias")).unwrap();
+        assert_eq!(alias.trim_end(), "flexvm 1 2 /run/x");
+        assert!(tc(&format!("qdisc add dev {tap} root handle 1: fq_codel")).status.success());
+        let (plugged, res) = plug_tap(&tap);
+        assert!(!plugged && res.is_err(), "another kind at 1: refuses the plug");
+        assert!(remove_plug(ifindex(&tap).unwrap()).is_err());
+        assert!(root().contains("fq_codel 1:"), "{}", root());
+        assert!(tc(&format!("qdisc del dev {tap} root")).status.success());
+        let (plugged, res) = plug_tap(&tap);
+        assert!(plugged && res.is_ok(), "{res:?}");
+        assert!(root().contains("plug 1:"), "{}", root());
+        let (drops, res) = unplug_tap(&tap);
+        assert!(drops == 0 && res.is_ok(), "{res:?}");
+        remove_plug(ifindex(&tap).unwrap()).unwrap();
+        assert!(!root().contains("plug"), "{}", root());
+        delete_tap(&tap);
     }
 
     #[test]
