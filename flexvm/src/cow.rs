@@ -81,6 +81,8 @@ pub struct Cow {
     /// Where to look for an unsaved page to probe with.
     hint: AtomicUsize,
     stopped: AtomicBool,
+    /// Whether a writer has started reading pages (`CowPages::read`).
+    writing: AtomicBool,
     error: Mutex<Option<String>>,
     started: Instant,
     /// The pages to save, as `[first, end)` runs.
@@ -106,6 +108,7 @@ impl Cow {
             progress: (Mutex::new(0), Condvar::new()),
             hint: AtomicUsize::new(runs.first().map_or(0, |r| r.0)),
             stopped: AtomicBool::new(false),
+            writing: AtomicBool::new(false),
             error: Mutex::new(None),
             started: Instant::now(),
             runs,
@@ -128,6 +131,11 @@ impl Cow {
 
     fn set(&self, page: usize, state: u8) {
         self.states[page].store(state, Ordering::SeqCst)
+    }
+
+    /// Whether the writers have started, so may claim pages under a fault.
+    pub fn writing(&self) -> bool {
+        self.writing.load(Ordering::SeqCst)
     }
 
     /// Whether faults still have to save pages before letting writes through.
@@ -276,6 +284,7 @@ impl GuestPages for CowPages<'_> {
 
     fn read(&self, page: usize, buf: &mut [u8]) -> Result<()> {
         let cow = self.cow;
+        cow.writing.store(true, Ordering::SeqCst);
         std::thread::sleep((self.slow)());
         cow.check_active()?;
         let n = buf.len() / PAGE_SIZE;
