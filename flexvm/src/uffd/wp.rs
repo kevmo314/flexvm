@@ -1,12 +1,12 @@
+use super::{os, runs_where, Mapping, Pager, Runs, ALL, ARM_CHUNK, BASE, PREFETCH_RUN, PRESENT};
+use crate::bail;
+use crate::cow::{Cow, PENDING, READING, RESCUING};
+use crate::util::{Result, PAGE_SIZE};
 use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
-use crate::bail;
-use crate::cow::{Cow, PENDING, READING, RESCUING};
-use crate::util::{Result, PAGE_SIZE};
-use super::{os, runs_where, Mapping, Pager, Runs, ALL, ARM_CHUNK, BASE, PRESENT, PREFETCH_RUN};
 
 /// Threads copying unsaved pages into memory while a discard is held back.
 const SAVE_REST_THREADS: usize = 8;
@@ -241,9 +241,7 @@ impl Pager {
                 false => loop {
                     let gen = self.pages().read_gen.load(Ordering::SeqCst);
                     match self.writeprotect(first, end - first, true) {
-                        Err(e) if e.raw_os_error() == Some(libc::EAGAIN) && start.elapsed() < Duration::from_secs(2) => {
-                            self.pages().wait_events_read(gen)
-                        }
+                        Err(e) if e.raw_os_error() == Some(libc::EAGAIN) && start.elapsed() < Duration::from_secs(2) => self.pages().wait_events_read(gen),
                         r => break r,
                     }
                 },
@@ -285,8 +283,7 @@ impl Pager {
         // Set bits in ascending page order.
         let dirty_pages = || {
             dirty.iter().enumerate().flat_map(|(w, &bits)| {
-                std::iter::successors((bits != 0).then_some(bits), |b| Some(b & (b - 1)).filter(|&b| b != 0))
-                    .map(move |b| w * 64 + b.trailing_zeros() as usize)
+                std::iter::successors((bits != 0).then_some(bits), |b| Some(b & (b - 1)).filter(|&b| b != 0)).map(move |b| w * 64 + b.trailing_zeros() as usize)
             })
         };
         let start = Instant::now();

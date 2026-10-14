@@ -1,9 +1,9 @@
-use super::*;
-use super::fetch::*;
 use super::event::{bucket, bucket_floor, FETCHED, WAITED};
-use std::io::{Read, Write};
+use super::fetch::*;
 use super::pages::CHUNK;
 use super::server::capture_preload;
+use super::*;
+use std::io::{Read, Write};
 
 fn pages(states: &[u8]) -> Pages {
     let p = Pages::new(states.len());
@@ -24,22 +24,11 @@ fn discard(p: &Pages, page: usize) -> bool {
 #[test]
 fn preload_runs_respect_gaps_regions_and_slots() {
     let mappings = [
-        Mapping {
-            base_host_virt_addr: 0,
-            offset: 0,
-            size: 514 * PAGE_SIZE,
-        },
-        Mapping {
-            base_host_virt_addr: 0,
-            offset: (514 * PAGE_SIZE) as u64,
-            size: 4 * PAGE_SIZE,
-        },
+        Mapping { base_host_virt_addr: 0, offset: 0, size: 514 * PAGE_SIZE },
+        Mapping { base_host_virt_addr: 0, offset: (514 * PAGE_SIZE) as u64, size: 4 * PAGE_SIZE },
     ];
     let list = [0, 1, 3, 510, 511, 512, 513, 514, 515];
-    assert_eq!(
-        page_runs(&list, &mappings).collect::<Vec<_>>(),
-        [(0, 2), (2, 1), (3, 2), (5, 2), (7, 2)]
-    );
+    assert_eq!(page_runs(&list, &mappings).collect::<Vec<_>>(), [(0, 2), (2, 1), (3, 2), (5, 2), (7, 2)]);
 }
 
 #[test]
@@ -68,16 +57,8 @@ fn install_runs_past_partial_copies_eexist_and_discards() {
 fn preload_capture_reads_sparse_runs_across_regions_and_iovec_batches() {
     let source: Vec<u8> = (0..2200).flat_map(|i| vec![(i % 251) as u8; PAGE_SIZE]).collect();
     let mappings = [
-        Mapping {
-            base_host_virt_addr: source.as_ptr() as u64,
-            offset: 0,
-            size: 1100 * PAGE_SIZE,
-        },
-        Mapping {
-            base_host_virt_addr: unsafe { source.as_ptr().add(1100 * PAGE_SIZE) } as u64,
-            offset: (1100 * PAGE_SIZE) as u64,
-            size: 1100 * PAGE_SIZE,
-        },
+        Mapping { base_host_virt_addr: source.as_ptr() as u64, offset: 0, size: 1100 * PAGE_SIZE },
+        Mapping { base_host_virt_addr: unsafe { source.as_ptr().add(1100 * PAGE_SIZE) } as u64, offset: (1100 * PAGE_SIZE) as u64, size: 1100 * PAGE_SIZE },
     ];
     let list: Vec<u64> = (0..2200).filter(|p| p % 2 == 0 || (1097..1103).contains(p)).collect();
     let mut data = vec![0; list.len() * PAGE_SIZE];
@@ -210,7 +191,19 @@ fn streamed_installs_add_up() {
 #[test]
 fn failure_history_follows_the_pages() {
     let p = pages(&[REMOTE; 8]);
-    let enomem = |fail: usize| move |pg: usize, c: usize| if (pg..pg + c).contains(&fail) { if pg == fail { Err(os(libc::ENOMEM)) } else { Ok(fail - pg) } } else { Ok(c) };
+    let enomem = |fail: usize| {
+        move |pg: usize, c: usize| {
+            if (pg..pg + c).contains(&fail) {
+                if pg == fail {
+                    Err(os(libc::ENOMEM))
+                } else {
+                    Ok(fail - pg)
+                }
+            } else {
+                Ok(c)
+            }
+        }
+    };
     p.claim(0, 4, REMOTE, |_| true);
     assert!(p.install(0, 4, REMOTE, None, enomem(2)).1.is_err());
     assert_eq!(states(&p)[..4], [PRESENT, PRESENT, REMOTE, REMOTE]);
@@ -499,9 +492,13 @@ fn a_slow_source_that_keeps_delivering_is_not_lost() {
         }
         Ok(c)
     });
-    assert!(res.is_ok(), "{:?}", res.err().map(|e| match e {
-        Failed::Fetch(e) | Failed::Install(e) => e.to_string(),
-    }));
+    assert!(
+        res.is_ok(),
+        "{:?}",
+        res.err().map(|e| match e {
+            Failed::Fetch(e) | Failed::Install(e) => e.to_string(),
+        })
+    );
     assert_eq!(resolved, n);
     assert!(got.iter().enumerate().all(|(i, &b)| b as usize == i), "{got:?}");
     // 0.8 s of pages over 0.3 s deadlines: it reconnected, for the rest only.

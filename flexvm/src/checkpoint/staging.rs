@@ -1,12 +1,25 @@
 //! Private staging, overlapping fsyncs, publication and revocation.
-use std::{
-    collections::BTreeMap, ffi::{CStr, CString}, fs::File, io::{self, Write}, os::fd::{AsRawFd, OwnedFd, RawFd}, os::unix::ffi::OsStrExt,
-    path::{Path, PathBuf}, time::{SystemTime, UNIX_EPOCH},
-};
-use crate::{util::{Error, Phases, Result, PAGE_SIZE}, vm::Vm, uffd::Runs};
 use super::{
-    chain_meta_budget, check, cname, create_at, fstat, open_dir_at, FileSum, Manifest, Parent, FORMAT, FORMAT_INCREMENTAL,
-    format::{sum, sums_sum, MAX_VMSTATE}, write::{write_pages, writer_threads, GuestPages, PagesFile},
+    chain_meta_budget, check, cname, create_at,
+    format::{sum, sums_sum, MAX_VMSTATE},
+    fstat, open_dir_at,
+    write::{write_pages, writer_threads, GuestPages, PagesFile},
+    FileSum, Manifest, Parent, FORMAT, FORMAT_INCREMENTAL,
+};
+use crate::{
+    uffd::Runs,
+    util::{Error, Phases, Result, PAGE_SIZE},
+    vm::Vm,
+};
+use std::{
+    collections::BTreeMap,
+    ffi::{CStr, CString},
+    fs::File,
+    io::{self, Write},
+    os::fd::{AsRawFd, OwnedFd, RawFd},
+    os::unix::ffi::OsStrExt,
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 pub(super) fn publish_permissions(files: &[RawFd], dir: RawFd, owner: &libc::stat) -> io::Result<()> {
@@ -219,7 +232,9 @@ impl Staging {
             return Err(match revoked {
                 Ok(Ok(())) => CommitError::Failed(format!("{e} (revoked it)").into()),
                 // Unloadable for good; in the way of that path until removed (a suspend's, by the name's next holder).
-                Ok(Err(r)) => CommitError::Failed(format!("{e} (revoked it, but removing its directory failed: {r}; remove {} by hand if it stays)", self.dest.display()).into()),
+                Ok(Err(r)) => CommitError::Failed(
+                    format!("{e} (revoked it, but removing its directory failed: {r}; remove {} by hand if it stays)", self.dest.display()).into(),
+                ),
                 Err(r) => CommitError::Uncertain(format!("{e}; revoking it failed too: {r}").into()),
             });
         }

@@ -1,8 +1,11 @@
 //! On-disk manifest and pagemap parsing, and canonical memory hashes.
-use std::{collections::BTreeMap, net::Ipv4Addr};
-use serde::{Deserialize, Serialize};
-use crate::{template::{Hash, Template}, util::{Result, PAGE_SIZE}};
 use super::bail;
+use crate::{
+    template::{Hash, Template},
+    util::{Result, PAGE_SIZE},
+};
+use serde::{Deserialize, Serialize};
+use std::{collections::BTreeMap, net::Ipv4Addr};
 
 pub const FORMAT: u64 = 2;
 pub const FORMAT_INCREMENTAL: u64 = 3;
@@ -103,9 +106,7 @@ pub(super) type Run = (u64, u64, u64, usize, u64);
 
 /// TEMPLATE runs are allowed only in a delta.
 pub(super) fn parse_pagemap(map: &[u8], guest_pages: u64, delta: bool, ck: usize) -> Result<(Vec<Run>, Vec<u32>)> {
-    let word = |i: usize| -> Result<u64> {
-        Ok(u64::from_le_bytes(map.get(i * 8..i * 8 + 8).ok_or("pagemap truncated")?.try_into()?))
-    };
+    let word = |i: usize| -> Result<u64> { Ok(u64::from_le_bytes(map.get(i * 8..i * 8 + 8).ok_or("pagemap truncated")?.try_into()?)) };
     ensure!(map.len() >= 24 && &map[..8] == MAGIC, "bad pagemap header");
     let (nruns, ndata) = (word(1)?, word(2)?);
     ensure!(Some(map.len() as u64) == nruns.checked_mul(32).zip(ndata.checked_mul(4)).and_then(|(r, d)| (24 + r).checked_add(d)), "bad pagemap length");

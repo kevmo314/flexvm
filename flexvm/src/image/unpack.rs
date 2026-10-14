@@ -435,7 +435,11 @@ impl Root {
             }
             T::Char | T::Block | T::Fifo => {
                 at.remove()?;
-                let fmt = match kind { T::Char => libc::S_IFCHR, T::Block => libc::S_IFBLK, _ => libc::S_IFIFO };
+                let fmt = match kind {
+                    T::Char => libc::S_IFCHR,
+                    T::Block => libc::S_IFBLK,
+                    _ => libc::S_IFIFO,
+                };
                 let dev = libc::makedev(h.device_major()?.unwrap_or(0), h.device_minor()?.unwrap_or(0));
                 check(unsafe { libc::mknodat(dfd, name, fmt | 0o600, dev) }, "mknod", rel)?;
             }
@@ -567,7 +571,13 @@ pub(super) mod tests {
             h.set_size(if kind == 'f' { data.len() as u64 } else { 0 });
             h.set_device_major(0).unwrap();
             h.set_device_minor(0).unwrap();
-            h.set_entry_type(match kind { 'd' => T::Directory, 'p' => T::Fifo, 'l' => T::Symlink, 'h' => T::Link, _ => T::Regular });
+            h.set_entry_type(match kind {
+                'd' => T::Directory,
+                'p' => T::Fifo,
+                'l' => T::Symlink,
+                'h' => T::Link,
+                _ => T::Regular,
+            });
             match kind {
                 'l' | 'h' => b.append_link(&mut h, path, data),
                 _ => b.append_data(&mut h, path, data.as_bytes()),
@@ -691,21 +701,41 @@ pub(super) mod tests {
         type Layer<'a> = &'a [(&'a str, char, &'a str)];
         type Want<'a> = &'a [(&'a str, Option<&'a str>)];
         let cases: &[(Layer, Layer, Want)] = &[
-            (&[("foo", 'f', "lower"), ("dir/old", 'f', "old"), ("gone", 'f', "gone")],
-             &[("foo", 'f', "upper"), (".wh.foo", 'f', ""), ("dir/new", 'f', "new"), (".wh.dir", 'f', ""), (".wh.gone", 'f', "")],
-             &[("foo", Some("upper")), ("dir/new", Some("new")), ("dir/old", None), ("gone", None), (".wh.foo", None)]),
-            (&[("a/b/c/old", 'f', "old"), ("a/b/x", 'f', "x"), ("pre", 'f', "lower"), ("o/old", 'f', "o")],
-             &[(".wh.pre", 'f', ""), ("pre", 'f', "upper"),              // before the same layer's pre
-               ("a/b/c/new", 'f', "new"), ("a/b/.wh.c", 'f', ""),       // nested: keeps c/new, drops c/old
-               ("a/b/link", 'h', "a/b/x"), ("a/b/.wh.link", 'f', ""),   // hard link to a lower file, kept
-               ("a/b/.wh.x", 'f', ""),                                  // lower: removed, the link keeps its data
-               ("o/new", 'f', "n"), ("o/.wh..wh..opq", 'f', ""), ("o/.wh.new", 'f', "")],
-             &[("pre", Some("upper")), ("a/b/c/new", Some("new")), ("a/b/c/old", None), ("a/b/link", Some("x")), ("a/b/x", None),
-               ("o/new", Some("n")), ("o/old", None)]),
+            (
+                &[("foo", 'f', "lower"), ("dir/old", 'f', "old"), ("gone", 'f', "gone")],
+                &[("foo", 'f', "upper"), (".wh.foo", 'f', ""), ("dir/new", 'f', "new"), (".wh.dir", 'f', ""), (".wh.gone", 'f', "")],
+                &[("foo", Some("upper")), ("dir/new", Some("new")), ("dir/old", None), ("gone", None), (".wh.foo", None)],
+            ),
+            (
+                &[("a/b/c/old", 'f', "old"), ("a/b/x", 'f', "x"), ("pre", 'f', "lower"), ("o/old", 'f', "o")],
+                &[
+                    (".wh.pre", 'f', ""),
+                    ("pre", 'f', "upper"), // before the same layer's pre
+                    ("a/b/c/new", 'f', "new"),
+                    ("a/b/.wh.c", 'f', ""), // nested: keeps c/new, drops c/old
+                    ("a/b/link", 'h', "a/b/x"),
+                    ("a/b/.wh.link", 'f', ""), // hard link to a lower file, kept
+                    ("a/b/.wh.x", 'f', ""),    // lower: removed, the link keeps its data
+                    ("o/new", 'f', "n"),
+                    ("o/.wh..wh..opq", 'f', ""),
+                    ("o/.wh.new", 'f', ""),
+                ],
+                &[
+                    ("pre", Some("upper")),
+                    ("a/b/c/new", Some("new")),
+                    ("a/b/c/old", None),
+                    ("a/b/link", Some("x")),
+                    ("a/b/x", None),
+                    ("o/new", Some("n")),
+                    ("o/old", None),
+                ],
+            ),
             // Opaque directories keep this layer's descendants, written before the markers.
-            (&[("a/x", 'f', "x"), ("a/sub/y", 'f', "y"), ("old", 'f', "o"), ("low/f", 'f', "f")],
-             &[("a/b/new", 'f', "n"), ("a/sub/z", 'f', "z"), ("keep/me", 'f', "m"), ("a/.wh..wh..opq", 'f', ""), (".wh..wh..opq", 'f', "")],
-             &[("a/b/new", Some("n")), ("a/sub/z", Some("z")), ("keep/me", Some("m")), ("a/sub/y", None), ("a/x", None), ("old", None), ("low", None)]),
+            (
+                &[("a/x", 'f', "x"), ("a/sub/y", 'f', "y"), ("old", 'f', "o"), ("low/f", 'f', "f")],
+                &[("a/b/new", 'f', "n"), ("a/sub/z", 'f', "z"), ("keep/me", 'f', "m"), ("a/.wh..wh..opq", 'f', ""), (".wh..wh..opq", 'f', "")],
+                &[("a/b/new", Some("n")), ("a/sub/z", Some("z")), ("keep/me", Some("m")), ("a/sub/y", None), ("a/x", None), ("old", None), ("low", None)],
+            ),
         ];
         for (i, (lower, upper, want)) in cases.iter().enumerate() {
             let s = Sandbox::new(&format!("wh{i}"));

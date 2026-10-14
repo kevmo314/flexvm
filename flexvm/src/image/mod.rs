@@ -152,10 +152,14 @@ pub fn prepare(cache: &Path, init: &Path, o: &Options) -> Result<(PathBuf, Image
     });
     let key = sha256_hex(key.to_string().as_bytes());
     let cached = cache.join("rootfs").join(format!("{}.ext4", &key["sha256:".len()..]));
-    let cached = cached_rootfs(&cached, |tmp| {
-        img.download_layers()?;
-        build_rootfs(&o.staging, &img, &app, &init_bytes, tmp, &o.limits)
-    }, sync_dir)?;
+    let cached = cached_rootfs(
+        &cached,
+        |tmp| {
+            img.download_layers()?;
+            build_rootfs(&o.staging, &img, &app, &init_bytes, tmp, &o.limits)
+        },
+        sync_dir,
+    )?;
     let app_conf = std::fs::read_to_string(cached.with_extension("conf"))?;
     let meta = ImageMeta {
         source: o.image.clone(),
@@ -435,7 +439,17 @@ fn escape(s: &str) -> String {
 }
 
 fn inject(root: &mut Root, app: &App, init: &[u8]) -> Result<String> {
-    for (dir, mode) in [("proc", 0o555), ("sys", 0o555), ("dev", 0o755), ("run", 0o755), ("tmp", 0o1777), ("mnt", 0o755), ("root", 0o700), ("etc/flexvm", 0o755), ("sbin", 0o755)] {
+    for (dir, mode) in [
+        ("proc", 0o555),
+        ("sys", 0o555),
+        ("dev", 0o755),
+        ("run", 0o755),
+        ("tmp", 0o1777),
+        ("mnt", 0o755),
+        ("root", 0o700),
+        ("etc/flexvm", 0o755),
+        ("sbin", 0o755),
+    ] {
         root.ensure_dir(dir, mode)?;
     }
     root.write_file("sbin/flexvm-init", init, 0o755)?;
@@ -693,10 +707,14 @@ mod tests {
         assert!(e.contains("has digest"), "{e}");
         assert_eq!(read(d.join("out/a")), "data");
         let cached = d.join("cache/key.ext4");
-        let e = cached_rootfs(&cached, |_| {
-            unpack(&d, &d.join("staging"))?;
-            panic!("a corrupt layer must fail before building the rootfs");
-        }, sync_dir);
+        let e = cached_rootfs(
+            &cached,
+            |_| {
+                unpack(&d, &d.join("staging"))?;
+                panic!("a corrupt layer must fail before building the rootfs");
+            },
+            sync_dir,
+        );
         assert!(e.unwrap_err().to_string().contains("has digest"));
         assert!(["ext4", "conf", "ok"].iter().all(|e| !cached.with_extension(e).exists()));
 
@@ -809,7 +827,9 @@ mod tests {
                 loop {
                     let mut line = String::new();
                     reader.read_line(&mut line).unwrap();
-                    if line == "\r\n" { break; }
+                    if line == "\r\n" {
+                        break;
+                    }
                 }
                 write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
             }
@@ -903,12 +923,16 @@ mod tests {
         let ((building, started), (release, wait)) = (mpsc::channel(), mpsc::channel());
         let first_path = cached.clone();
         let first = std::thread::spawn(move || {
-            cached_rootfs(&first_path, |tmp| {
-                building.send(()).unwrap();
-                wait.recv().unwrap();
-                assert!(!first_path.with_extension("ok").exists());
-                build("first")(tmp)
-            }, sync_dir)
+            cached_rootfs(
+                &first_path,
+                |tmp| {
+                    building.send(()).unwrap();
+                    wait.recv().unwrap();
+                    assert!(!first_path.with_extension("ok").exists());
+                    build("first")(tmp)
+                },
+                sync_dir,
+            )
             .unwrap()
         });
         started.recv().unwrap();

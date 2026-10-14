@@ -39,13 +39,7 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: cargo fmt --check
-        # The tree predates rustfmt; enforce once it has been formatted in one go.
-        continue-on-error: true
-        run: |
-          if ! cargo fmt --all --check > fmt.diff; then
-            echo "::warning title=cargo fmt::$(grep -c '^Diff in' fmt.diff) hunks differ from rustfmt (not enforced yet)"
-            exit 1
-          fi
+        run: cargo fmt --all --check
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: unit tests

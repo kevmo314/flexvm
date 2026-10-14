@@ -157,9 +157,7 @@ fn matching_ack(mut data: &[u8], seq: u32) -> Option<io::Result<()>> {
         if len < 16 || len > data.len() {
             return Some(Err(io::Error::new(io::ErrorKind::InvalidData, "malformed netlink ACK")));
         }
-        if u32::from_ne_bytes(data[8..12].try_into().unwrap()) == seq
-            && u16::from_ne_bytes(data[4..6].try_into().unwrap()) == libc::NLMSG_ERROR as u16
-        {
+        if u32::from_ne_bytes(data[8..12].try_into().unwrap()) == seq && u16::from_ne_bytes(data[4..6].try_into().unwrap()) == libc::NLMSG_ERROR as u16 {
             if len < 20 {
                 return Some(Err(io::Error::new(io::ErrorKind::InvalidData, "short netlink ACK")));
             }
@@ -181,13 +179,15 @@ mod tests {
         let old = Ipv4Addr::new(10, 0, 0, 1);
         let new = Ipv4Addr::new(10, 0, 0, 2);
         let mut address = None;
-        for (ip, expected) in [
-            (old, vec![(libc::RTM_NEWADDR, old)]),
-            (old, vec![(libc::RTM_NEWADDR, old)]),
-            (new, vec![(libc::RTM_NEWADDR, new), (libc::RTM_DELADDR, old)]),
-        ] {
+        for (ip, expected) in
+            [(old, vec![(libc::RTM_NEWADDR, old)]), (old, vec![(libc::RTM_NEWADDR, old)]), (new, vec![(libc::RTM_NEWADDR, new), (libc::RTM_DELADDR, old)])]
+        {
             let mut sent = Vec::new();
-            update_address(&mut address, ip, |kind, ip| { sent.push((kind, ip)); Ok(()) }).unwrap();
+            update_address(&mut address, ip, |kind, ip| {
+                sent.push((kind, ip));
+                Ok(())
+            })
+            .unwrap();
             assert_eq!(sent, expected);
             assert_eq!(address, Some(ip));
         }
@@ -196,11 +196,20 @@ mod tests {
         assert_eq!(address, Some(new));
         // A failed delete must remain retryable on the next configure.
         assert!(update_address(&mut address, old, |kind, _| {
-            if kind == libc::RTM_DELADDR { Err(io::Error::from_raw_os_error(libc::EPERM)) } else { Ok(()) }
-        }).is_err());
+            if kind == libc::RTM_DELADDR {
+                Err(io::Error::from_raw_os_error(libc::EPERM))
+            } else {
+                Ok(())
+            }
+        })
+        .is_err());
         assert_eq!(address, Some(new));
         let mut retry = Vec::new();
-        update_address(&mut address, old, |kind, ip| { retry.push((kind, ip)); Ok(()) }).unwrap();
+        update_address(&mut address, old, |kind, ip| {
+            retry.push((kind, ip));
+            Ok(())
+        })
+        .unwrap();
         assert_eq!(retry, vec![(libc::RTM_NEWADDR, old), (libc::RTM_DELADDR, new)]);
         address = Some(new);
         let gone = |kind, _| if kind == libc::RTM_DELADDR { Err(io::Error::from_raw_os_error(libc::EADDRNOTAVAIL)) } else { Ok(()) };

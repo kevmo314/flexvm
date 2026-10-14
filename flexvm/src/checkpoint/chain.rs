@@ -1,12 +1,24 @@
 //! Budgeted chain opening, overlay flattening and checked page reads.
-use std::{
-    ffi::CString, fs::File, io::{self, Read}, os::fd::{AsRawFd, RawFd}, os::unix::ffi::OsStrExt, os::unix::fs::FileExt, path::{Path, PathBuf},
-    sync::Arc,
-};
-use crate::{crc32c, template::Template, uffd::{Runs, REMOTE}, util::{Result, PAGE_SIZE}};
 use super::{
-    bail, fstat, open_at, open_dir_at,
-    format::{parse_pagemap, sum, sums_sum, Canon, Manifest, Run, DATA, TEMPLATE, FORMAT, FORMAT_INCREMENTAL, MAX_VMSTATE},
+    bail,
+    format::{parse_pagemap, sum, sums_sum, Canon, Manifest, Run, DATA, FORMAT, FORMAT_INCREMENTAL, MAX_VMSTATE, TEMPLATE},
+    fstat, open_at, open_dir_at,
+};
+use crate::{
+    crc32c,
+    template::Template,
+    uffd::{Runs, REMOTE},
+    util::{Result, PAGE_SIZE},
+};
+use std::{
+    ffi::CString,
+    fs::File,
+    io::{self, Read},
+    os::fd::{AsRawFd, RawFd},
+    os::unix::ffi::OsStrExt,
+    os::unix::fs::FileExt,
+    path::{Path, PathBuf},
+    sync::Arc,
 };
 
 pub const MAX_CHAIN: usize = 64;
@@ -89,7 +101,11 @@ impl Link {
         let vmstate = read_checked("vmstate")?;
         let (map, sums) = parse_pagemap(&read_checked("pagemap")?, manifest.guest_pages, manifest.parent.is_some(), ck).map_err(|e| bad(e.to_string()))?;
         let data: u64 = map.iter().filter(|r| r.2 == DATA).map(|r| r.1).sum();
-        ensure!(data == manifest.data_pages && manifest.files.get("pages").map(|f| f.len) == Some(data * PAGE_SIZE as u64), "{}", bad("page counts do not add up".into()));
+        ensure!(
+            data == manifest.data_pages && manifest.files.get("pages").map(|f| f.len) == Some(data * PAGE_SIZE as u64),
+            "{}",
+            bad("page counts do not add up".into())
+        );
         ensure!(manifest.files["pages"].hash == sums_sum(&sums), "{}", bad("page checksums do not match the manifest".into()));
         let (file, _) = read_at(dfd.as_raw_fd(), "pages", 0).map_err(|e| bad(format!("pages: {e}")))?;
         ensure!(file.metadata()?.len() == data * PAGE_SIZE as u64, "{}", bad("pages has the wrong length".into()));
@@ -107,8 +123,20 @@ fn open_chain(dir: &Path, full: bool) -> Result<(Vec<Link>, u64)> {
         ensure!(links.len() < MAX_CHAIN, "checkpoint {} is more than {MAX_CHAIN} deltas deep", dir.display());
         let link = Link::open(&child.dir.join(&parent.path), links.len(), full.then_some(&mut meta_left))
             .map_err(|e| format!("parent of {}: {e}", child.dir.display()))?;
-        ensure!(link.id == parent.id, "checkpoint {}: its parent {} has changed (id {} is not {})", child.dir.display(), link.dir.display(), link.id, parent.id);
-        ensure!(child.manifest.template_id == link.manifest.template_id && child.manifest.guest_pages == link.manifest.guest_pages, "checkpoint {}: its parent {} is of another template or size", child.dir.display(), link.dir.display());
+        ensure!(
+            link.id == parent.id,
+            "checkpoint {}: its parent {} has changed (id {} is not {})",
+            child.dir.display(),
+            link.dir.display(),
+            link.id,
+            parent.id
+        );
+        ensure!(
+            child.manifest.template_id == link.manifest.template_id && child.manifest.guest_pages == link.manifest.guest_pages,
+            "checkpoint {}: its parent {} is of another template or size",
+            child.dir.display(),
+            link.dir.display()
+        );
         links.push(link);
     }
     Ok((links, meta_left))

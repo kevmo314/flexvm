@@ -16,9 +16,10 @@ use crate::util::Result;
 pub fn check(path: &Path) -> io::Result<()> {
     let bytes = path.as_os_str().as_bytes();
     if bytes.len() >= 108 || bytes.contains(&0) {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!(
-            "Unix socket path {} ({} bytes) must be shorter than 108 bytes and contain no NUL", path.display(), bytes.len()
-        )));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Unix socket path {} ({} bytes) must be shorter than 108 bytes and contain no NUL", path.display(), bytes.len()),
+        ));
     }
     Ok(())
 }

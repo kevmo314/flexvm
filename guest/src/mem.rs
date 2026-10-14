@@ -54,7 +54,11 @@ pub fn enter(cmd: &mut Command, procs: CString, required: bool) {
             if fd >= 0 {
                 libc::close(fd);
             }
-            if moved || !required { Ok(()) } else { Err(io::Error::last_os_error()) }
+            if moved || !required {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
         });
     }
 }

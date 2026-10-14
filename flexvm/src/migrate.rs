@@ -122,13 +122,16 @@ impl Proc {
         };
         let remote_pages: u64 = runs.iter().filter(|r| r.2 == crate::uffd::REMOTE).map(|r| r.1).sum();
         let sent = (|| -> Result<Value> {
-            send_json(&mut conn, &json!({
-                "runs": runs,
-                "vmstate_len": state.len(),
-                "preload": pages,
-                "paused": vm.was_paused(),
-                "app_log": self.hold_app_log(),
-            }))?;
+            send_json(
+                &mut conn,
+                &json!({
+                    "runs": runs,
+                    "vmstate_len": state.len(),
+                    "preload": pages,
+                    "paused": vm.was_paused(),
+                    "app_log": self.hold_app_log(),
+                }),
+            )?;
             conn.write_all(&state)?;
             if fault("slow_preload") {
                 thread::sleep(Duration::from_millis(300));
@@ -179,22 +182,28 @@ impl Proc {
     }
 
     fn prepare_target(&self, vm: &Vm, to: &str, mig: u64, gen: u64, source: &str, evict: bool) -> Result<(TcpStream, Value)> {
-        let (conn, prepared) = crate::util::rpc(to, Duration::from_secs(2), Instant::now() + PREFLIGHT_TIMEOUT, &json!({
-            "op": "migrate_in",
-            "name": vm.name,
-            "mig": mig,
-            "template": vm.template.name,
-            "id": vm.template.meta.id,
-            "ip": vm.ip.to_string(),
-            "gen": gen,
-            "source": source,
-            "source_ident": crate::host::Ident::me(),
-            "rss_mib": vm.rss() >> 20,
-            // Settled: the arrival's memory mark is sized by it without asking its Firecracker.
-            "plugged_mib": vm.hotplug_plugged(),
-            "regions": vm.pager.regions(),
-            "evict": evict,
-        })).map_err(|e| format!("cannot move vm {} to {e}", vm.name))?;
+        let (conn, prepared) = crate::util::rpc(
+            to,
+            Duration::from_secs(2),
+            Instant::now() + PREFLIGHT_TIMEOUT,
+            &json!({
+                "op": "migrate_in",
+                "name": vm.name,
+                "mig": mig,
+                "template": vm.template.name,
+                "id": vm.template.meta.id,
+                "ip": vm.ip.to_string(),
+                "gen": gen,
+                "source": source,
+                "source_ident": crate::host::Ident::me(),
+                "rss_mib": vm.rss() >> 20,
+                // Settled: the arrival's memory mark is sized by it without asking its Firecracker.
+                "plugged_mib": vm.hotplug_plugged(),
+                "regions": vm.pager.regions(),
+                "evict": evict,
+            }),
+        )
+        .map_err(|e| format!("cannot move vm {} to {e}", vm.name))?;
         conn.set_nodelay(true)?;
         conn.set_read_timeout(Some(Duration::from_secs(30)))?;
         conn.set_write_timeout(Some(Duration::from_secs(30)))?;
@@ -516,7 +525,11 @@ impl Proc {
                             eprintln!("vm {}: dropped {} of the packets held while taking {} over", vm.name, s.dropped + s.dropped_target, vm.ip);
                         }
                     }
-                    if current { switched.map(Some) } else { Ok(None) }
+                    if current {
+                        switched.map(Some)
+                    } else {
+                        Ok(None)
+                    }
                 }
                 _ if !routed => p.if_current(|| vm.route_here()),
                 _ => p.if_current(|| Ok(())),

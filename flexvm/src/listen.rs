@@ -78,7 +78,10 @@ fn unreachable_at(local: SocketAddr, v6only: bool, advertised: Option<&str>) -> 
     let v4 = advertised.and_then(|a| a.parse::<SocketAddr>().ok()).is_some_and(|a| a.is_ipv4());
     let takes_v4 = local.ip().to_canonical().is_ipv4() || (local.ip().is_unspecified() && !v6only);
     (v4 && !takes_v4).then(|| {
-        format!("{local} takes no IPv4 connections, but peers are told to reach this host at {}; listen on 0.0.0.0, a dual-stack [::] or the underlay address", advertised.unwrap_or_default())
+        format!(
+            "{local} takes no IPv4 connections, but peers are told to reach this host at {}; listen on 0.0.0.0, a dual-stack [::] or the underlay address",
+            advertised.unwrap_or_default()
+        )
     })
 }
 
@@ -219,7 +222,12 @@ fn incoming(host: &Host, req: &Value, line: &[u8], conn: TcpStream) -> Result<()
     let log = std::fs::OpenOptions::new().create_new(true).append(true).open(&log_path)?;
     crate::host::flock(&log, libc::LOCK_SH)?;
     let args = ["--state".as_ref(), host.state.as_os_str(), "--run".as_ref(), host.run.as_os_str(), "run".as_ref(), "--incoming".as_ref()];
-    if let Err(e) = crate::util::spawn_self(&args, &log, conn.as_raw_fd(), &[("FLEXVM_INCOMING", std::str::from_utf8(line)?), ("FLEXVM_INCOMING_LOG", log_path.to_str().ok_or("non-UTF8 log path")?)]) {
+    if let Err(e) = crate::util::spawn_self(
+        &args,
+        &log,
+        conn.as_raw_fd(),
+        &[("FLEXVM_INCOMING", std::str::from_utf8(line)?), ("FLEXVM_INCOMING_LOG", log_path.to_str().ok_or("non-UTF8 log path")?)],
+    ) {
         let _ = std::fs::remove_file(log_path);
         refuse(&conn, format!("cannot start the vm process: {e}"))?;
     }

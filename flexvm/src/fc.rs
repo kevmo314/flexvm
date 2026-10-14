@@ -221,11 +221,7 @@ impl Api {
             if !(200..300).contains(&code) {
                 bail!("firecracker {method} {path}: {code} {text}");
             }
-            return if text.trim().is_empty() {
-                Ok(Value::Null)
-            } else {
-                Ok(serde_json::from_str(&text).unwrap_or(Value::String(text.into_owned())))
-            };
+            return if text.trim().is_empty() { Ok(Value::Null) } else { Ok(serde_json::from_str(&text).unwrap_or(Value::String(text.into_owned()))) };
         }
     }
 }
@@ -535,7 +531,11 @@ mod tests {
         for (first, second, want) in [
             // The header alone must force a new connection (the old one stays open).
             (&b"HTTP/1.1 200 OK\r\ncOnNeCtIoN: keep-alive, Close\r\nContent-Length: 4\r\n\r\nnull"[..], NO_CONTENT, Value::Null),
-            (&b"HTTP/1.1 204 No Content\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n"[..], &b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n2"[..], serde_json::json!(2)),
+            (
+                &b"HTTP/1.1 204 No Content\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n"[..],
+                &b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n2"[..],
+                serde_json::json!(2),
+            ),
         ] {
             let server = Server::new(move |listener| {
                 let mut r = accept(&listener);
@@ -580,11 +580,7 @@ mod tests {
 
     #[test]
     fn api_stalled_response_keeps_one_deadline_and_drops_connection() {
-        for response in [
-            &b""[..],
-            &b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n"[..],
-            &b"HTTP/1.1 200 OK\r\nContent-Length:"[..],
-        ] {
+        for response in [&b""[..], &b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n"[..], &b"HTTP/1.1 200 OK\r\nContent-Length:"[..]] {
             let server = Server::new(move |listener| {
                 let mut r = accept(&listener);
                 read_request(&mut r);

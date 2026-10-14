@@ -40,12 +40,28 @@ const MAX_CONTROL: usize = 256;
 static CONTROL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 pub enum Start {
-    Run { name: String, template: String, ip: Option<Ipv4Addr>, cmd: Option<String> },
-    Resume { name: String },
-    Restore { dir: PathBuf, name: Option<String>, ip: Option<String>, paused: bool },
+    Run {
+        name: String,
+        template: String,
+        ip: Option<Ipv4Addr>,
+        cmd: Option<String>,
+    },
+    Resume {
+        name: String,
+    },
+    Restore {
+        dir: PathBuf,
+        name: Option<String>,
+        ip: Option<String>,
+        paused: bool,
+    },
     /// The migration connection is fd 3.
-    Incoming { req: Value },
-    Standby { template: String },
+    Incoming {
+        req: Value,
+    },
+    Standby {
+        template: String,
+    },
 }
 
 pub type Op<'a> = MutexGuard<'a, ()>;
@@ -305,10 +321,12 @@ impl Proc {
             .peers
             .iter()
             .cloned()
-            .map(|peer| thread::spawn(move || {
-                let r = peer_call(&peer, json!({"op": "lend", "ip": ip.to_string()}));
-                (peer, r)
-            }))
+            .map(|peer| {
+                thread::spawn(move || {
+                    let r = peer_call(&peer, json!({"op": "lend", "ip": ip.to_string()}));
+                    (peer, r)
+                })
+            })
             .collect();
         let (mut lent, mut why) = (Vec::new(), Vec::new());
         for (peer, r) in asks.into_iter().filter_map(|a| a.join().ok()) {
@@ -1259,7 +1277,13 @@ fn resize(vm: &Vm, host: &Host, hint: Option<u64>, grow_only: bool) -> Result<Re
     vm.starved.store(plan.short && refused, Ordering::SeqCst);
     let new = if refused { plugged } else { plan.new };
     if new != requested {
-        let why = if plan.settle { "stalled" } else if hint.is_some() { "guest asked" } else { "tick" };
+        let why = if plan.settle {
+            "stalled"
+        } else if hint.is_some() {
+            "guest asked"
+        } else {
+            "tick"
+        };
         eprintln!("vm {}: available {avail} MiB, hotplug {requested} (plugged {plugged}) -> {new} MiB ({why})", vm.name);
         if new > requested {
             vm.limit.plug(meta.mem_mib + new, if refused { 0 } else { plan.charge });
@@ -1489,7 +1513,8 @@ fn relieve(host: &Host, avail: Option<u64>, starved_here: bool) {
         return;
     }
     let rss = |e: &Entry| e.firecracker.and_then(|p| proc_kb(&format!("/proc/{p}/status"), "VmRSS")).unwrap_or(0) >> 10;
-    let mut vms = rank(host.entries(), rss);    if !pressure {
+    let mut vms = rank(host.entries(), rss);
+    if !pressure {
         vms.retain(|e| e.starved);
     }
     if vms.is_empty() {
@@ -1594,10 +1619,16 @@ pub fn peer_call(peer: &str, req: Value) -> Result<Value> {
 }
 
 pub fn tell_peers(host: &Host, req: Value) {
-    let sends: Vec<_> = host.cfg.peers.iter().cloned().map(|p| {
-        let req = req.clone();
-        thread::spawn(move || peer_call(&p, req))
-    }).collect();
+    let sends: Vec<_> = host
+        .cfg
+        .peers
+        .iter()
+        .cloned()
+        .map(|p| {
+            let req = req.clone();
+            thread::spawn(move || peer_call(&p, req))
+        })
+        .collect();
     sends.into_iter().for_each(|s| drop(s.join()));
 }
 

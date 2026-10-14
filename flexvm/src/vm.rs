@@ -850,8 +850,12 @@ mod tests {
         let p = "/balloon/reporting/hold";
         let rejected = |m: &str| super::rejected(&m.into(), p);
         assert!(rejected("firecracker PATCH /balloon/reporting/hold: 400 {\"fault_message\":\"x\"}"));
-        for m in ["firecracker PATCH /balloon/reporting/hold: out of time", "firecracker PATCH /balloon/reporting/hold: 500 oops",
-                  "Resource temporarily unavailable (os error 11)", "firecracker PATCH /balloon/reporting/release: 400 x"] {
+        for m in [
+            "firecracker PATCH /balloon/reporting/hold: out of time",
+            "firecracker PATCH /balloon/reporting/hold: 500 oops",
+            "Resource temporarily unavailable (os error 11)",
+            "firecracker PATCH /balloon/reporting/release: 400 x",
+        ] {
             assert!(!rejected(m));
         }
     }

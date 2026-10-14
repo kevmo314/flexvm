@@ -25,9 +25,7 @@ impl Reference {
             }
             d => (d.to_string(), path),
         };
-        if repository.is_empty()
-            || !repository.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "._-/".contains(c))
-        {
+        if repository.is_empty() || !repository.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "._-/".contains(c)) {
             bail!("bad image reference {s:?}");
         }
         let reference = match (digest, tag) {

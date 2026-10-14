@@ -204,14 +204,7 @@ impl Holder {
     /// `linger`, the device is then watched that long more for a packet from a sender that
     /// looked the old route up just before the switch. If `switch` fails the address stays
     /// held until `forget`.
-    pub fn release_local(
-        &self,
-        ip: Ipv4Addr,
-        mig: u64,
-        sink: LocalSink,
-        switch: impl FnOnce() -> Result<()>,
-        linger: Duration,
-    ) -> Option<(Stats, Result<()>)> {
+    pub fn release_local(&self, ip: Ipv4Addr, mig: u64, sink: LocalSink, switch: impl FnOnce() -> Result<()>, linger: Duration) -> Option<(Stats, Result<()>)> {
         let e = self.releasing(ip, mig)?;
         let out = Mutex::new((sink, Stats::default()));
         let give = |o: &mut (LocalSink, Stats)| self.give_queued(&e, &mut *o.0, &mut o.1);
@@ -405,7 +398,9 @@ impl Injector {
         const SOL_PACKET: libc::c_int = 263;
         const PACKET_QDISC_BYPASS: libc::c_int = 20;
         let one: libc::c_int = 1;
-        unsafe { libc::setsockopt(fd.as_raw_fd(), SOL_PACKET, PACKET_QDISC_BYPASS, (&one as *const libc::c_int).cast(), std::mem::size_of::<libc::c_int>() as u32) };
+        unsafe {
+            libc::setsockopt(fd.as_raw_fd(), SOL_PACKET, PACKET_QDISC_BYPASS, (&one as *const libc::c_int).cast(), std::mem::size_of::<libc::c_int>() as u32)
+        };
         let mut header = [0u8; 14];
         header[..6].copy_from_slice(&crate::net::parse_mac(crate::net::GUEST_MAC)?);
         header[6..12].copy_from_slice(&crate::net::parse_mac(crate::net::GATEWAY_MAC)?);
@@ -422,7 +417,9 @@ impl Injector {
         addr.sll_halen = 6;
         addr.sll_addr[..6].copy_from_slice(&self.header[..6]);
         let size = std::mem::size_of::<libc::sockaddr_ll>() as u32;
-        unsafe { libc::sendto(self.fd.as_raw_fd(), frame.as_ptr().cast(), frame.len(), libc::MSG_DONTWAIT, (&addr as *const libc::sockaddr_ll).cast(), size) >= 0 }
+        unsafe {
+            libc::sendto(self.fd.as_raw_fd(), frame.as_ptr().cast(), frame.len(), libc::MSG_DONTWAIT, (&addr as *const libc::sockaddr_ll).cast(), size) >= 0
+        }
     }
 
     /// Includes the guest's own traffic.
