@@ -256,6 +256,8 @@ fn cached_rootfs(cached: &Path, build: impl FnOnce(&Path) -> Result<String>, syn
         let _ = std::fs::remove_file(&tmp);
         res?;
     }
+    // Existing directories were not synced above; one may have been made by a builder that died first.
+    crate::util::sync_ancestors(dir, &sync)?;
     Ok(std::fs::canonicalize(cached)?)
 }
 
@@ -889,6 +891,27 @@ mod tests {
         assert!(cached_rootfs(&cached, losing_build(&d, &cached), eio).is_err());
         assert!(entry_complete(&cached));
         assert!(cached_rootfs(&cached, never, sync_dir).is_ok());
+    }
+
+    #[test]
+    fn publishing_syncs_existing_parents() {
+        // Made without syncing, as by a builder that died: create_dir_durably finds nothing to do.
+        let d = tmpdir("parents").canonicalize().unwrap();
+        let dir = d.join("cache/rootfs");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cached = dir.join("key.ext4");
+        let synced = std::sync::Mutex::new(vec![]);
+        let record = |p: &Path| {
+            synced.lock().unwrap().push(p.to_path_buf());
+            Ok(())
+        };
+        cached_rootfs(&cached, build("first"), record).unwrap();
+        let want: Vec<_> = dir.ancestors().map(Path::to_path_buf).collect();
+        assert!(want.iter().all(|p| synced.lock().unwrap().contains(p)), "{synced:?}");
+        // So does a cache hit, which hands the same path out.
+        synced.lock().unwrap().clear();
+        cached_rootfs(&cached, never, record).unwrap();
+        assert!(want.iter().all(|p| synced.lock().unwrap().contains(p)), "{synced:?}");
     }
 
     #[test]

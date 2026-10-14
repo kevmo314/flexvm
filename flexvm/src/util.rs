@@ -277,7 +277,21 @@ pub fn host_cpus() -> usize {
 }
 
 pub fn sync_dir(dir: &Path) -> io::Result<()> {
-    std::fs::File::open(dir).and_then(|d| d.sync_all()).map_err(|e| io::Error::new(e.kind(), format!("fsync of directory {}: {e}", dir.display())))
+    use std::os::unix::fs::OpenOptionsExt;
+    // Never blocks opening a FIFO put in its place.
+    std::fs::File::options()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY)
+        .open(dir)
+        .and_then(|d| d.sync_all())
+        .map_err(|e| io::Error::new(e.kind(), format!("fsync of directory {}: {e}", dir.display())))
+}
+
+/// Syncs every directory above `dir`, up to `/`. Run when publishing in `dir`: an existing directory
+/// is not synced by `create_dir_durably`, and may have been made by a process that died before syncing it.
+pub fn sync_ancestors(dir: &Path, sync: impl FnMut(&Path) -> io::Result<()>) -> io::Result<()> {
+    let dir = dir.canonicalize().map_err(|e| io::Error::new(e.kind(), format!("resolving {}: {e}", dir.display())))?;
+    dir.ancestors().skip(1).try_for_each(sync)
 }
 
 /// Removes `path` if it is there, then fsyncs its directory.
@@ -723,6 +737,29 @@ mod tests {
             assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o700);
         }
         create_dir_durably_mode(&dir, 0o700).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ancestors_are_synced_up_to_the_root() {
+        let root = std::env::temp_dir().join(format!("flexvm-ancestors-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let mut synced = vec![];
+        sync_ancestors(&root.join("a/./b"), |p| {
+            synced.push(p.to_path_buf());
+            Ok(())
+        })
+        .unwrap();
+        let mut want: Vec<_> = root.ancestors().map(Path::to_path_buf).collect();
+        want.insert(0, root.join("a"));
+        assert_eq!(synced, want);
+        assert_eq!(synced.last().unwrap(), Path::new("/"));
+        assert!(sync_ancestors(&root.join("missing"), |_| Ok(())).is_err());
+        assert!(sync_ancestors(&root.join("a/b"), |p| Err(io::Error::other(p.display().to_string()))).is_err());
+        assert!(sync_dir(&root.join("a/b")).is_ok());
+        std::fs::write(root.join("f"), "").unwrap();
+        assert!(sync_dir(&root.join("f")).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 }
