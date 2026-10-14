@@ -38,6 +38,10 @@ pub fn not_sent(e: &crate::util::Error) -> bool {
 pub struct Firecracker {
     child: Child,
     pub sockets: Sockets,
+    pub dir: PathBuf,
+    pub cgroup: Option<PathBuf>,
+    /// Empty for image builders, which own their directory and network.
+    pub tap: String,
     api: Api,
     /// The cgroup move: joined before the kill, so its pid is never reused meanwhile.
     joining: Option<std::thread::JoinHandle<()>>,
@@ -70,7 +74,7 @@ impl Firecracker {
             });
         }
         let child = cmd.spawn()?;
-        let fc = Firecracker { child, sockets, api: Api::default(), joining: None };
+        let fc = Firecracker { child, sockets, dir: dir.into(), cgroup: None, tap: String::new(), api: Api::default(), joining: None };
         let id = crate::host::Ident::of(fc.pid()).ok_or("firecracker exited at once")?;
         crate::host::store(&dir.join("fc"), &id, false)?;
         retry(ready, || Ok(UnixStream::connect(&fc.sockets.api)?))?;
@@ -124,13 +128,13 @@ impl Firecracker {
         matches!(exited(&self.child), Ok(None))
     }
 
-    pub fn post_mortem(&mut self, dir: &Path) -> String {
+    pub fn post_mortem(&mut self) -> String {
         let status = match exited(&self.child) {
             Ok(Some(st)) => format!("exited ({st})"),
             Ok(None) => "still running".into(),
             Err(e) => format!("unknown ({e})"),
         };
-        let log = File::open(dir.join("firecracker.log")).and_then(|mut f| log_tail(&mut f)).unwrap_or_default();
+        let log = File::open(self.dir.join("firecracker.log")).and_then(|mut f| log_tail(&mut f)).unwrap_or_default();
         let lines: Vec<&str> = log.lines().collect();
         format!("firecracker {} {status}; log: {}", self.pid(), lines[lines.len().saturating_sub(5)..].join(" | "))
     }
@@ -312,31 +316,13 @@ fn log_tail(r: &mut (impl Read + Seek)) -> std::io::Result<String> {
 impl Drop for Firecracker {
     fn drop(&mut self) {
         self.kill();
+        if !self.tap.is_empty() {
+            release(&self.tap, self.cgroup.as_deref(), &self.dir);
+        }
     }
 }
 
-/// Dropping it kills the Firecracker and removes its directory, cgroup and tap.
-pub struct Idle {
-    pub fc: Firecracker,
-    pub dir: PathBuf,
-    pub cgroup: Option<PathBuf>,
-    pub tap: String,
-}
-
-impl Idle {
-    pub fn into_parts(self) -> (Firecracker, PathBuf, Option<PathBuf>, String) {
-        let me = std::mem::ManuallyDrop::new(self);
-        // SAFETY: `me` is never used or dropped again, so each field is moved out exactly once.
-        unsafe { (std::ptr::read(&me.fc), std::ptr::read(&me.dir), std::ptr::read(&me.cgroup), std::ptr::read(&me.tap)) }
-    }
-}
-
-impl Drop for Idle {
-    fn drop(&mut self) {
-        self.fc.kill();
-        release(&self.tap, self.cgroup.as_deref(), &self.dir);
-    }
-}
+pub type Idle = Firecracker;
 
 /// Its Firecracker must be gone.
 pub fn release(tap: &str, cgroup: Option<&Path>, dir: &Path) {
@@ -431,7 +417,9 @@ impl Spawner {
                 }
             }));
         }
-        Ok(Idle { fc, dir, cgroup, tap })
+        fc.cgroup = cgroup;
+        fc.tap = tap;
+        Ok(fc)
     }
 }
 

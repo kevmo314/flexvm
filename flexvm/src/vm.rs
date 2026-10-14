@@ -85,7 +85,6 @@ pub struct Vm {
     next_exec: AtomicU64,
     fc: Mutex<Option<Firecracker>>,
     pub vsock: PathBuf,
-    cgroup: Option<PathBuf>,
     was_paused: AtomicBool,
     pub clock_pending: AtomicBool,
     /// Restored held paused at a new address: the guest still has this old one.
@@ -118,8 +117,8 @@ impl Vm {
 
     /// The part of a restore that needs no vmstate, done by a migration target before its source pauses.
     pub fn prepare(idle: Idle, template: Arc<Template>, phases: &mut Phases) -> Result<Prepared> {
-        crate::compat::check(&template, idle.fc.pid())?;
-        let pager = Pager::start(&idle.fc.sockets.uffd, template.clone(), None)?;
+        crate::compat::check(&template, idle.pid())?;
+        let pager = Pager::start(&idle.sockets.uffd, template.clone(), None)?;
         let prepared = Prepared { idle: Some(idle), pager, template, route: true };
         prepared.pager.set_pid(prepared.firecracker().pid())?;
         phases.mark("pager_start");
@@ -174,7 +173,7 @@ impl Vm {
 
     pub fn post_mortem(&self) -> String {
         match self.fc.lock().unwrap().as_mut() {
-            Some(fc) => fc.post_mortem(&self.dir),
+            Some(fc) => fc.post_mortem(),
             None => "no firecracker".into(),
         }
     }
@@ -589,12 +588,11 @@ impl Vm {
         self.pager.stop();
         // First, so a call in progress (holding `fc`) fails at once.
         self.pager.kill_firecracker();
-        let Some(mut fc) = self.fc.lock().unwrap().take() else { return };
+        let Some(fc) = self.fc.lock().unwrap().take() else { return };
         let _ = UnixStream::connect(self.mem_sock());
         // Reaped only once the pager has stopped, so its pid is not reused under the pager.
         self.pager.join();
-        fc.kill();
-        crate::fc::release(&self.tap, self.cgroup.as_deref(), &self.dir);
+        drop(fc);
     }
 
     pub fn describe(&self) -> Value {
@@ -647,7 +645,7 @@ impl Prepared {
     }
 
     pub fn firecracker(&self) -> &Firecracker {
-        &self.idle.as_ref().unwrap().fc
+        self.idle.as_ref().unwrap()
     }
 
     /// The load leaves the address's route alone (a migration target routes it at commit).
@@ -671,31 +669,30 @@ impl Prepared {
     }
 
     pub fn firecracker_alive(&mut self) -> bool {
-        self.idle.as_mut().is_some_and(|i| i.fc.alive())
+        self.idle.as_mut().is_some_and(|i| i.alive())
     }
 
     pub fn into_vm(mut self, name: &str, ip: Ipv4Addr, state: State) -> Arc<Vm> {
-        let (fc, dir, cgroup, tap) = self.idle.take().unwrap().into_parts();
+        let idle = self.idle.take().unwrap();
         Arc::new(Vm {
             name: name.into(),
             template: self.template.clone(),
-            dir,
+            dir: idle.dir.clone(),
             ip,
-            tap,
+            tap: idle.tap.clone(),
             pager: self.pager.clone(),
             state: Mutex::new(state),
             last_resize: Mutex::new(Instant::now()),
             starved: AtomicBool::new(false),
-            limit: crate::limit::Limit::new(cgroup.clone()),
+            limit: crate::limit::Limit::new(idle.cgroup.clone()),
             reports_held: AtomicBool::new(false),
             cow_copy: Mutex::new(false),
             execs: Mutex::new(HashMap::new()),
             devices: Mutex::new(()),
             clock_unsure: AtomicBool::new(false),
             next_exec: AtomicU64::new(0),
-            vsock: fc.sockets.vsock.clone(),
-            fc: Mutex::new(Some(fc)),
-            cgroup,
+            vsock: idle.sockets.vsock.clone(),
+            fc: Mutex::new(Some(idle)),
             was_paused: AtomicBool::new(false),
             clock_pending: AtomicBool::new(false),
             pending_net: Mutex::new(None),
@@ -819,10 +816,10 @@ impl Prepared {
                 let retry = match &load_failed {
                     Some(why) if why.contains(NO_REALTIME) && clock_realtime => Some(false),
                     // Died on its own, with no page given up.
-                    Some(_) if !self.pager.lost_pages() && !idle.fc.alive() => Some(clock_realtime),
+                    Some(_) if !self.pager.lost_pages() && !idle.alive() => Some(clock_realtime),
                     _ => None,
                 };
-                eprintln!("vm {name}: restore failed: {e} ({})", idle.fc.post_mortem(&idle.dir));
+                eprintln!("vm {name}: restore failed: {e} ({})", idle.post_mortem());
                 Err((e, retry))
             }
         }
