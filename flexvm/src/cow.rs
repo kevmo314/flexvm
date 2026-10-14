@@ -18,8 +18,9 @@
 //! `Pager::freeze`). A write fault on a page being READ parks until the
 //! reader has saved it, which wakes the event thread (`wait_for`).
 //!
-//! Rescued copies are kept in memory up to a budget; past it, a fault on a
-//! PENDING page asks the writers to take that page's unit next and waits for
+//! Rescued copies are kept in memory up to a budget; past it (once the writers
+//! have started), a fault on a PENDING page asks the writers to take that
+//! page's unit next and waits for
 //! them instead.
 //!
 //! Discards: the kernel zaps a page right after the pager reads the REMOVE
@@ -197,11 +198,12 @@ impl Cow {
         }
     }
 
-    /// A fault on `page` waits for a writer to save it (it is READING, or wanted while over budget), parked: the event
-    /// thread is woken once a writer has saved it (or given it back), or the copy stops; at once if it is saved already.
-    /// No wakeup is lost: a writer sets a page's state before it looks at the flag, and this sets the flag (with the
-    /// page listed) before it looks at the state.
-    pub fn wait_for(&self, page: usize) {
+    /// A fault on `page`, which it saw in state `seen` (READING, or PENDING while over budget), waits for a writer to
+    /// save it, parked: the event thread is woken once a writer has saved it or given it back, or the copy stops. At
+    /// once if any of that happened already, or the reason to wait is gone (no longer over budget): the fault is
+    /// retried then. No wakeup is lost: a writer (or `stop`) changes the state before it looks at the flag, and this
+    /// sets the flag (with the page listed) before it looks at the state.
+    pub fn wait_for(&self, page: usize, seen: u8) {
         self.stats.retries.fetch_add(1, Ordering::Relaxed);
         {
             let mut waits = self.waits.lock().unwrap();
@@ -210,13 +212,21 @@ impl Cow {
             }
             self.fault_waits.store(true, Ordering::SeqCst);
         }
-        if !matches!(self.state(page), PENDING | READING | RESCUING) {
+        let still = match self.state(page) {
+            s if s != seen => false,
+            READING | RESCUING => true,
+            PENDING => self.over_budget(),
+            _ => false,
+        };
+        if !still || !self.active() {
             self.wake();
         }
     }
 
+    /// Whether rescued copies fill the budget, so faults wait for the writers rather than save more. Never before the
+    /// writers have started: the faults of the resume would wait for writers that start only after it.
     pub fn over_budget(&self) -> bool {
-        self.rescued_bytes.load(Ordering::SeqCst) >= self.budget
+        self.writing() && self.rescued_bytes.load(Ordering::SeqCst) >= self.budget
     }
 
     /// Keeps `bytes`, the pause-time contents of `page` (claimed RESCUING).
@@ -491,8 +501,8 @@ mod tests {
     }
 
     /// A fault waiting for a writer (`wait_for`) is woken through the waker once a writer saves its page or gives it
-    /// back, or the copy stops, or at once if the page is done with already; nothing wakes it while the page is still
-    /// being read, or for other pages saved meanwhile. Each wait counts as a retry.
+    /// back, or the copy stops, or at once if any of that happened before it waited; nothing wakes it while the page is
+    /// still being read, or for other pages saved meanwhile. Each wait counts as a retry.
     #[test]
     fn faults_waiting_for_a_writer_are_woken() {
         use std::os::fd::FromRawFd;
@@ -503,10 +513,11 @@ mod tests {
             let mut n = 0u64;
             unsafe { libc::read(efd.as_raw_fd(), (&mut n as *mut u64).cast(), 8) == 8 }
         };
-        let cow = Cow::new(8, &vec![(0, 6, REMOTE)]);
+        let mut cow = Cow::new(8, &vec![(0, 8, REMOTE)]);
+        cow.budget = 0;
         cow.set_waker(efd.try_clone().unwrap());
         assert!(cow.claim(1, PENDING, READING));
-        cow.wait_for(1);
+        cow.wait_for(1, READING);
         assert!(!woken(), "page 1 is still being read");
         assert!(cow.claim(2, PENDING, READING));
         cow.set(2, CLEAN);
@@ -517,22 +528,36 @@ mod tests {
         assert!(woken(), "saving it wakes the fault");
         cow.saved(0, 8, 0);
         assert!(!woken(), "once: nothing waits any more");
-        cow.wait_for(1);
+        cow.wait_for(1, READING);
         assert!(woken(), "page 1 is done with already");
         assert_eq!(cow.report()["retries"], 2, "each wait is a retry");
+        // Before the writers start, nothing is over budget: a fault on a pending page saves it itself.
+        assert!(!cow.over_budget());
+        cow.wait_for(4, PENDING);
+        assert!(woken(), "no reason to wait before the writers start");
+        cow.writing.store(true, Ordering::SeqCst);
+        assert!(cow.over_budget());
         // A writer whose read fails gives its pages back, which wakes faults waiting on them.
         let fail = Fail;
         let pages = CowPages { guest: &fail, cow: &cow, slow: || Duration::ZERO };
-        cow.wait_for(4);
-        assert!(!woken(), "page 4 is pending");
+        cow.wait_for(4, PENDING);
+        assert!(!woken(), "page 4 is wanted while over budget");
         assert!(pages.read(3, &mut vec![0u8; 2 * PAGE_SIZE]).is_err());
         assert_eq!((cow.state(3), cow.state(4)), (PENDING, PENDING), "given back");
         assert!(woken(), "giving page 4 back wakes the fault");
-        // The copy stopping wakes a fault waiting on a page nobody will save now.
-        cow.wait_for(5);
+        // Given back before the fault that saw it being read waits: woken at once all the same.
+        assert!(cow.claim(5, PENDING, READING));
+        cow.unclaim(5);
+        cow.wait_for(5, READING);
+        assert!(woken(), "page 5 was given back before the wait");
+        // The copy stopping wakes a fault waiting on a page nobody will save now; and one that waits after the stop.
+        assert!(cow.claim(6, PENDING, READING));
+        cow.wait_for(6, READING);
         assert!(!woken());
         cow.stop();
         assert!(woken(), "the stop wakes the fault");
+        cow.wait_for(6, READING);
+        assert!(woken(), "the copy stopped before the wait");
     }
 
     /// Guest memory that cannot be read.

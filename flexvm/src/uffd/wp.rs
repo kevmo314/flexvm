@@ -80,7 +80,7 @@ impl Pager {
         if let Some(cow) = &cow {
             cow.stats.faults.fetch_add(1, Ordering::Relaxed);
             if cow.state(page) == READING {
-                cow.wait_for(page);
+                cow.wait_for(page, READING);
                 return Ok(Served::Writer);
             }
             // Test fault `ckpt_wp_race`: a writer claims the faulting page right here (#88): have the writers take it
@@ -100,7 +100,7 @@ impl Pager {
                 let unsaved: Vec<usize> = (first..end).filter(|&p| cow.state(p) == PENDING).collect();
                 unsaved.iter().for_each(|&p| cow.want(p));
                 if unsaved.contains(&page) {
-                    cow.wait_for(page);
+                    cow.wait_for(page, PENDING);
                     return Ok(Served::Writer);
                 }
             }
@@ -155,7 +155,7 @@ impl Pager {
         if woken {
             return Ok(Served::Done(WP));
         }
-        cow.iter().for_each(|c| c.wait_for(page));
+        cow.iter().for_each(|c| c.wait_for(page, c.state(page)));
         Ok(Served::Writer)
     }
 
