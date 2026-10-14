@@ -128,8 +128,12 @@ no default DNS server; configure one with `flexvm listen ... --dns IP`.
 
 Every host's `--vm-ips` must be disjoint, and the hosts must list each other
 with `--peer`: a listener serves its peers' addresses only. `--reserve MIB`
-(default 1024) is the memory a host keeps free: below it, VMs are moved to a
-peer with room.
+(default 1024) is the memory a host keeps free: starts and growth that would
+take it below are refused. VMs start moving to peers with room earlier, once
+the host has less than `--evict-at MIB` available (default: the reserve
+plus the reserve or 512, whichever is more), the fastest growing first,
+until it is back above the mark by half the mark's height over the reserve. Running VMs pick up both from
+`host.json` as it changes.
 
 ## Fast starts
 

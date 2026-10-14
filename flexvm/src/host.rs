@@ -34,6 +34,9 @@ pub struct Config {
     pub announce_dev: Option<String>,
     pub dns: Option<String>,
     pub reserve_mib: u64,
+    /// Eviction's high-water mark (MiB available): below it VMs start moving
+    /// to peers (`evict_at`). None: the reserve plus the reserve or 512 MiB, whichever is more.
+    pub evict_mib: Option<u64>,
     /// Of taps, hold devices and cgroups.
     pub prefix: String,
 }
@@ -48,12 +51,25 @@ impl Default for Config {
             announce_dev: None,
             dns: None,
             reserve_mib: 1024,
+            evict_mib: None,
             prefix: "fv".into(),
         }
     }
 }
 
 impl Config {
+    /// MemAvailable (MiB) under which eviction starts: never below the reserve.
+    pub fn evict_at(&self) -> u64 {
+        self.evict_mib.unwrap_or(self.reserve_mib + self.reserve_mib.max(512)).max(self.reserve_mib)
+    }
+
+    /// Once started, eviction goes on until MemAvailable is back this high:
+    /// the mark plus half its height above the reserve (at least 128 MiB).
+    pub fn evict_until(&self) -> u64 {
+        let at = self.evict_at();
+        at + ((at - self.reserve_mib) / 2).max(128)
+    }
+
     pub fn range(&self) -> Result<IpRange> {
         IpRange::parse(&self.vm_ips)
     }
@@ -838,6 +854,8 @@ pub struct Entry {
     pub state: String,
     pub firecracker: Option<u32>,
     pub starved: bool,
+    /// How fast its memory grew over the last few seconds (MiB/s), as last published.
+    pub growth_mib_s: u64,
 }
 
 /// Unique however pids are reused.

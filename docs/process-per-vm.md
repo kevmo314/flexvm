@@ -93,7 +93,7 @@ Two directories, both overridable (`--state`/`FLEXVM_STATE`, `--run`/`FLEXVM_RUN
 
 ```
 STATE (default /var/lib/flexvm, on disk)
-  host.json              host config: listen, peers, vm_ips, underlay, announce_dev, dns, reserve_mib, prefix
+  host.json              host config: listen, peers, vm_ips, underlay, announce_dev, dns, reserve_mib, evict_mib, prefix
   lock                   the host lock (flock), held for short critical sections only
   addrs/IP               per address: newest generation seen, withdrawn?, lent generation, holder name, instance
                          (pid, start time) and generation, the route a peer announced for the newest generation
@@ -289,17 +289,34 @@ whether the registry shows the VM) and starts nothing else.
 ## Memory controller and eviction
 
 Each VM process resizes its own VM once a second exactly as before
-(virtio-mem steps, starved flag). Pressure relief needs one decider per host:
-every second each VM process tries `STATE/evict.lock` (non-blocking); the
-holder, at most once per 5 s, reads the registry, picks the starved VM first,
-else the biggest RSS, and sends it `migrate` with each peer in turn until one
-accepts (`migrate_in` refuses when the target would go under its reserve).
-The request is `if_idle`: a VM busy with another operation (a checkpoint's
-copy, a migration, an arrival not yet settled) refuses at once and the next
-VM is tried; eviction never waits for or races an operation. A refused
-VM and peer pair is not tried again for 5 s, doubling to 60 s while refusals
-continue (`RUN/evict.backoff`). A refused arrival's log is removed; an
-accepted one becomes `NAME.log`.
+(virtio-mem steps, starved flag), and publishes how fast its memory
+(`memory.current`) grew over the last 5 s (`growth_mib_s`, republished when
+it moves to another power of two; an arrival's pull does not count).
+Pressure relief needs one decider per host: every second each VM process
+whose host is under pressure, or whose VM is starved, tries
+`STATE/evict.lock` (non-blocking). Pressure starts when MemAvailable falls
+under the high-water mark (`evict_mib`, `listen --evict-at`; default the
+reserve plus the reserve or 512 MiB, whichever is more) and lasts until it is
+back above the mark by half the mark's height over the reserve (at least
+128 MiB), marked by `RUN/evict.active`; the marks are read from `host.json`
+as it changes. Under the reserve, standby VMs are stopped first. The lock's
+holder, at most once per 5 s, reads the registry and ranks running VMs: the
+starved first, then the fastest growing (by power of two, under 8 MiB/s is
+none), then the biggest RSS (without pressure, only starved VMs are
+candidates). It runs the eviction on a thread of its own that keeps the lock,
+so its controller keeps ticking and its VM's memory requests are answered: it
+sends the first candidate `migrate` with each peer in turn until one accepts
+(`migrate_in` refuses when the target would go under its reserve), then waits
+for that VM's copy here to exit (its target has all its memory), so the next
+decision sees the memory freed; all within 60 s, past which it lets go (an
+unanswered migration is not a refusal: the VM, still migrating, is busy to
+the next decider). The request is `if_idle`: a VM busy with another
+operation (a checkpoint's copy, a migration, an arrival not yet settled)
+refuses at once and the next VM is tried; eviction never waits for or races
+an operation. A refused VM and peer pair is not tried again for 5 s, doubling
+to 60 s while refusals continue (`RUN/evict.backoff`). A refused arrival's
+log is removed; an accepted one becomes `NAME.log`.
+Announcements and `lend` requests go to all peers at once.
 This replaces the `info` op the daemon used to find room.
 
 ## API
@@ -489,7 +506,7 @@ where it is kept and what tests it.
   `checkpoint_crash`/`cow_crash` (SIGKILL the VM process mid-write: no
   checkpoint appears, staging is cleared by the next one), `hot_budget`
   becomes `standby` (count, refill, claim fallback). New: `abort_superseded`,
-  `gen_zero`, `suspend_gen`, `signals`, `kill_source`, `forged_peer`,
+  `gen_zero`, `suspend_gen`, `signals`, `kill_source`, `forged_peer`, `evict_grower`, `evict_latency`,
   `restore_ip_peer`, `late_withdrawal`, `kill_refused_checkpoint`,
   `wildcard_listen`, `same_host_order`, `arrival_abort_route`, `arrival_killed_route`, `handoff_superseded`,
   `suspend_cmd` (#134), `pause_cmd_start`, `fc_died_busy` (#122), `suspend_died`, and processes SIGKILLed between

@@ -106,7 +106,44 @@ pub struct Proc {
     /// A standby's (MiB held or to page in, guest size), taken while it waits, so a claim need not.
     pub sizes: Mutex<Option<(u64, u64)>>,
     serving: AtomicBool,
+    /// The controller's tick gaps, for `debug status`.
+    ticks: Mutex<Ticks>,
+    /// How fast the VM's memory grew lately (MiB/s), for eviction's ranking.
+    growth: AtomicU64,
     me: std::sync::Weak<Proc>,
+}
+
+/// How regularly the controller ticks (every second when nothing holds it up).
+#[derive(Default)]
+struct Ticks {
+    last: Option<Instant>,
+    count: u64,
+    max_gap: Duration,
+    recent: std::collections::VecDeque<Duration>,
+}
+
+impl Ticks {
+    fn tick(&mut self) {
+        let now = Instant::now();
+        if let Some(gap) = self.last.map(|l| now - l) {
+            self.max_gap = self.max_gap.max(gap);
+            if self.recent.len() == 32 {
+                self.recent.pop_front();
+            }
+            self.recent.push_back(gap);
+        }
+        self.last = Some(now);
+        self.count += 1;
+    }
+
+    fn json(&self) -> Value {
+        json!({
+            "ticks": self.count,
+            "max_gap_ms": ms(self.max_gap),
+            "since_last_ms": self.last.map(|l| ms(l.elapsed())),
+            "recent_gaps_ms": self.recent.iter().map(|&g| ms(g)).collect::<Vec<_>>(),
+        })
+    }
 }
 
 impl Proc {
@@ -150,6 +187,8 @@ impl Proc {
             charged: AtomicU64::new(0),
             sizes: Mutex::new(None),
             serving: AtomicBool::new(false),
+            ticks: Mutex::new(Ticks::default()),
+            growth: AtomicU64::new(0),
             me: me.clone(),
         }))
     }
@@ -204,23 +243,41 @@ impl Proc {
     }
 
     /// The peer whose range holds `ip` lends it with a new generation.
+    /// All peers are asked at once; only the home host lends (should two, the
+    /// loan of every one but the first is given back).
     pub fn borrow(&self, name: &str, ip: Ipv4Addr) -> Result<AddrClaim> {
-        let mut why = Vec::new();
-        for peer in &self.host.cfg.peers {
-            let gen = match peer_call(peer, json!({"op": "lend", "ip": ip.to_string()})) {
-                Ok(r) => r["gen"].as_u64().filter(|&g| g > 0).ok_or_else(|| format!("{peer} lent {ip} without a generation"))?,
-                Err(e) => {
-                    why.push(format!("{peer}: {e}"));
-                    continue;
-                }
-            };
+        let asks: Vec<_> = self
+            .host
+            .cfg
+            .peers
+            .iter()
+            .cloned()
+            .map(|peer| thread::spawn(move || {
+                let r = peer_call(&peer, json!({"op": "lend", "ip": ip.to_string()}));
+                (peer, r)
+            }))
+            .collect();
+        let (mut lent, mut why) = (Vec::new(), Vec::new());
+        for (peer, r) in asks.into_iter().filter_map(|a| a.join().ok()) {
+            match r.map(|r| r["gen"].as_u64().filter(|&g| g > 0)) {
+                Ok(Some(gen)) => lent.push((peer, gen)),
+                Ok(None) => why.push(format!("{peer} lent {ip} without a generation")),
+                Err(e) => why.push(format!("{peer}: {e}")),
+            }
+        }
+        let mut lent = lent.into_iter();
+        let first = lent.next();
+        for (peer, gen) in lent {
+            let _ = peer_call(&peer, json!({"op": "route", "ip": ip.to_string(), "gen": gen}));
+        }
+        if let Some((peer, gen)) = first {
             return match self.host.lock().and_then(|l| self.host.claim_incoming(&l, name, ip, gen)) {
                 Ok(mut c) => {
                     c.fresh = true;
                     Ok(c)
                 }
                 Err(e) => {
-                    let _ = peer_call(peer, json!({"op": "route", "ip": ip.to_string(), "gen": gen}));
+                    let _ = peer_call(&peer, json!({"op": "route", "ip": ip.to_string(), "gen": gen}));
                     bail!("cannot take {ip} borrowed from {peer}: {e}; restore with --ip auto")
                 }
             };
@@ -338,6 +395,7 @@ impl Proc {
             state: vm.state().name().into(),
             firecracker: vm.pid(),
             starved: vm.starving(),
+            growth_mib_s: self.growth.load(Ordering::SeqCst),
         };
         if let Err(e) = self.name.lock().unwrap().as_ref().map_or(Ok(()), |l| l.publish(&e)) {
             eprintln!("vm {n}: registry: {e}");
@@ -449,11 +507,21 @@ impl Proc {
                 }
             };
             arp();
-            for peer in peers.iter().take_while(|_| here()) {
-                if let Err(e) = peer_call(peer, json!({"op": "route", "ip": ip.to_string(), "via": via.to_string(), "gen": gen})) {
-                    eprintln!("announce {ip} to {peer}: {e}");
-                }
-            }
+            // All peers at once: one slow or down peer does not hold up the others.
+            let req = json!({"op": "route", "ip": ip.to_string(), "via": via.to_string(), "gen": gen});
+            let sends: Vec<_> = peers
+                .into_iter()
+                .filter(|_| here())
+                .map(|peer| {
+                    let req = req.clone();
+                    thread::spawn(move || {
+                        if let Err(e) = peer_call(&peer, req) {
+                            eprintln!("announce {ip} to {peer}: {e}");
+                        }
+                    })
+                })
+                .collect();
+            sends.into_iter().for_each(|s| drop(s.join()));
             thread::sleep(Duration::from_millis(200));
             arp();
         });
@@ -739,6 +807,7 @@ impl Proc {
                 "install_eagain": vm.pager.install_eagain(),
                 "describe": vm.describe(),
                 "guest_retries": guest::retries(),
+                "controller": self.ticks.lock().unwrap().json(),
             })),
             w => bail!("unknown debug request {w:?}"),
         }
@@ -773,9 +842,10 @@ impl Proc {
     }
 
     fn controller(self: Arc<Self>) {
-        let mut published = false;
+        let (mut published, mut growth) = (false, Growth::default());
         loop {
             thread::sleep(Duration::from_secs(1));
+            self.ticks.lock().unwrap().tick();
             let vm = self.vm();
             if !vm.firecracker_alive() || vm.pager.failed().is_some() {
                 self.died();
@@ -791,9 +861,13 @@ impl Proc {
             if let Err(e) = self.resize(None) {
                 eprintln!("vm {}: resize: {e}", vm.name);
             }
+            // An arrival's pull is not growth.
+            let used = vm.limit.used().unwrap_or_else(|| vm.rss() >> 20);
+            let rate = growth.sample(Instant::now(), used, self.arrived.lock().unwrap().is_some());
+            let was = self.growth.swap(rate, Ordering::SeqCst);
             // Throttling (`watch_memory`) changes it between ticks too.
-            if published != vm.starving() {
-                published = !published;
+            if published != vm.starving() || growth_bucket(rate) != growth_bucket(was) {
+                published = vm.starving();
                 self.publish();
             }
             relieve(&self.host, vm.starving());
@@ -1209,6 +1283,59 @@ fn read_mem_request(conn: &UnixStream) -> Option<u64> {
     }
 }
 
+/// How long one eviction may take: from asking a VM to migrate until its
+/// copy here exits (once the target has all its memory), freeing it.
+const EVICT_DEADLINE: Duration = Duration::from_secs(60);
+/// Growth is measured over the controller's ticks of the last 5 s.
+const GROWTH_WINDOW: Duration = Duration::from_secs(5);
+/// Slower growth (MiB/s) is noise, not a trend.
+const GROWTH_FLOOR: u64 = 8;
+
+/// A VM's memory (MiB) over the last `GROWTH_WINDOW`.
+#[derive(Default)]
+struct Growth {
+    samples: std::collections::VecDeque<(Instant, u64)>,
+}
+
+impl Growth {
+    /// MiB/s over the window; 0 until it spans half a second, and while
+    /// `reset` (an arrival's pull is not growth).
+    fn sample(&mut self, now: Instant, mib: u64, reset: bool) -> u64 {
+        if reset {
+            self.samples.clear();
+            return 0;
+        }
+        while self.samples.front().is_some_and(|&(t, _)| now.saturating_duration_since(t) > GROWTH_WINDOW) {
+            self.samples.pop_front();
+        }
+        self.samples.push_back((now, mib));
+        let (t0, m0) = self.samples[0];
+        let secs = now.saturating_duration_since(t0).as_secs_f64();
+        if secs < 0.5 {
+            return 0;
+        }
+        (mib.saturating_sub(m0) as f64 / secs) as u64
+    }
+}
+
+/// Growth in powers of two above the floor: what is published and ranked,
+/// so the registry is not rewritten for every small change.
+fn growth_bucket(mib_s: u64) -> u32 {
+    if mib_s < GROWTH_FLOOR {
+        0
+    } else {
+        mib_s.ilog2()
+    }
+}
+
+/// Eviction's candidates, in order: the starved (refused here, throttled),
+/// then the fastest growing, then the biggest (`rss`, MiB).
+fn rank(mut vms: Vec<Entry>, rss: impl Fn(&Entry) -> u64) -> Vec<Entry> {
+    vms.retain(|e| e.state == "running");
+    vms.sort_by_cached_key(|e| (!e.starved, std::cmp::Reverse(growth_bucket(e.growth_mib_s)), std::cmp::Reverse(rss(e))));
+    vms
+}
+
 /// Per VM and peer (a peer may refuse a big VM but take a small one), in
 /// RUN/evict.backoff under evict.lock, so changing deciders share it and a
 /// reboot clears it. An entry a minute past its cooldown is forgotten.
@@ -1233,15 +1360,54 @@ fn eviction_time() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
-/// Under pressure standby VMs go first, then one VM moves to a peer. Every
-/// VM process calls this; the `STATE/evict.lock` holder decides, at most every 5 s.
+/// `STATE/host.json` as it is now, re-read when it changes: `flexvm listen`
+/// may have moved the marks or the peers since this process started.
+fn current_config(host: &Host) -> crate::host::Config {
+    static SEEN: Mutex<Option<(std::time::SystemTime, crate::host::Config)>> = Mutex::new(None);
+    let path = host.state.join("host.json");
+    let Ok(mtime) = std::fs::metadata(&path).and_then(|m| m.modified()) else { return host.cfg.clone() };
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, cfg)) = seen.as_ref().filter(|(t, _)| *t == mtime) {
+        return cfg.clone();
+    }
+    let cfg = crate::host::load::<crate::host::Config>(&path).ok().flatten().unwrap_or_else(|| host.cfg.clone());
+    *seen = Some((mtime, cfg.clone()));
+    cfg
+}
+
+/// Whether this process is running an eviction (on its own thread).
+static EVICTING: AtomicBool = AtomicBool::new(false);
+
+/// Under pressure standby VMs go first, then VMs move to peers. Every VM
+/// process calls this each tick; the `STATE/evict.lock` holder decides, at
+/// most every 5 s, and runs the eviction on a thread of its own that keeps
+/// the lock until it is done, so the controller ticks on meanwhile.
+///
+/// Pressure starts when MemAvailable falls under the high-water mark
+/// (`evict_at`, above the reserve) and lasts until it is back to
+/// `evict_until` (`RUN/evict.active` while it lasts). A starved VM is moved
+/// whenever it asks, pressure or not.
 fn relieve(host: &Host, starved_here: bool) {
-    let (avail, reserve) = (host_available_mib(), host.cfg.reserve_mib);
-    if avail >= reserve && !starved_here {
+    let cfg = current_config(host);
+    let (avail, reserve, at, until) = (host_available_mib(), cfg.reserve_mib, cfg.evict_at(), cfg.evict_until());
+    let active = host.run.join("evict.active");
+    let evicting = active.exists();
+    if (avail >= at && !evicting && !starved_here) || EVICTING.load(Ordering::SeqCst) {
         return;
     }
     let Ok(lock) = std::fs::File::options().create(true).truncate(false).write(true).open(host.state.join("evict.lock")) else { return };
     if crate::host::flock(&lock, libc::LOCK_EX | libc::LOCK_NB).is_err() {
+        return;
+    }
+    let pressure = avail < until && (evicting || avail < at);
+    if pressure && !evicting {
+        let _ = std::fs::write(&active, b"");
+        eprintln!("host has {avail} MiB available, under its {at} MiB high-water mark ({reserve} MiB reserve): moving vms to peers until it has {until} MiB");
+    } else if !pressure && evicting {
+        let _ = std::fs::remove_file(&active);
+        eprintln!("host has {avail} MiB available, {until} MiB or more: eviction stops");
+    }
+    if !pressure && !starved_here {
         return;
     }
     if avail < reserve {
@@ -1254,39 +1420,71 @@ fn relieve(host: &Host, starved_here: bool) {
     }
     let last = host.state.join("evict.last");
     let recent = std::fs::metadata(&last).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
-    if host.cfg.peers.is_empty() || recent.is_some_and(|d| d < Duration::from_secs(5)) {
+    if cfg.peers.is_empty() || recent.is_some_and(|d| d < Duration::from_secs(5)) {
         return;
     }
     if fault("no_evict") {
         return;
     }
-    let rss = |pid: Option<u32>| pid.and_then(|p| proc_kb(&format!("/proc/{p}/status"), "VmRSS")).unwrap_or(0);
-    let mut running: Vec<_> = host.entries().into_iter().filter(|e| e.state == "running").collect();
-    // Starved first, then the biggest.
-    running.sort_by_key(|e| (!e.starved, std::cmp::Reverse(rss(e.firecracker))));
+    let rss = |e: &Entry| e.firecracker.and_then(|p| proc_kb(&format!("/proc/{p}/status"), "VmRSS")).unwrap_or(0) >> 10;
+    let mut vms = rank(host.entries(), rss);
+    if !pressure {
+        vms.retain(|e| e.starved);
+    }
+    if vms.is_empty() {
+        return;
+    }
     let _ = std::fs::write(&last, b"");
+    EVICTING.store(true, Ordering::SeqCst);
+    let host = host.clone();
+    thread::spawn(move || {
+        let _lock = lock;
+        evict(&host, &cfg.peers, &vms, avail, Instant::now() + EVICT_DEADLINE);
+        EVICTING.store(false, Ordering::SeqCst);
+    });
+}
+
+/// Moves the first of `vms` that a peer takes, and waits (until `deadline`)
+/// for its copy here to go, so the next decision sees its memory freed.
+/// A VM busy with anything (a checkpoint's copy, a migration, an arrival
+/// settling) is skipped, never waited for: `if_idle`.
+fn evict(host: &Host, peers: &[String], vms: &[Entry], avail: u64, deadline: Instant) {
     let backoff_path = host.run.join("evict.backoff");
     let Ok(saved) = crate::host::load::<std::collections::HashMap<String, PeerBackoff>>(&backoff_path) else { return };
     let mut backoff = saved.unwrap_or_default();
     let now = eviction_time();
     backoff.retain(|_, b| now < b.until.saturating_add(60));
-    // A VM busy with anything (a checkpoint's copy, a migration, an arrival
-    // settling) is skipped, never waited for: `if_idle`.
-    for vm in &running {
-        let why = if vm.starved { "cannot grow here" } else { "the host is low on memory" };
-        for peer in &host.cfg.peers {
+    for vm in vms {
+        let why = match (vm.starved, growth_bucket(vm.growth_mib_s)) {
+            (true, _) => "cannot grow here".to_string(),
+            (false, 0) => "the host is low on memory".to_string(),
+            (false, _) => format!("the host is low on memory and it grows {} MiB/s", vm.growth_mib_s),
+        };
+        for peer in peers {
             let key = format!("{} {peer}", vm.name);
             if backoff.get(&key).is_some_and(|b| !b.ready(eviction_time())) {
                 continue;
             }
+            let Some(left) = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) else { return };
             eprintln!("vm {}: {why} ({avail} MiB available); migrating to {peer}", vm.name);
-            match call(host, &vm.name, json!({"op": "migrate", "to": peer, "if_idle": true})) {
+            match call_within(host, &vm.name, json!({"op": "migrate", "to": peer, "if_idle": true}), left) {
                 Ok(_) => {
                     backoff.remove(&key);
                     let _ = crate::host::store(&backoff_path, &backoff, false);
-                    return eprintln!("vm {}: migrated to {peer}", vm.name);
+                    eprintln!("vm {}: migrated to {peer}", vm.name);
+                    while host.entries().iter().any(|e| e.ident == vm.ident) {
+                        if Instant::now() >= deadline {
+                            return eprintln!("vm {}: its copy here still serves pages to {peer} at the eviction's deadline", vm.name);
+                        }
+                        thread::sleep(Duration::from_millis(100));
+                    }
+                    return;
                 }
                 Err(e) if e.to_string().contains(BUSY) => break,
+                // No answer is no refusal: the VM may still be migrating (busy to the next decider).
+                Err(e) if Instant::now() >= deadline => {
+                    return eprintln!("vm {}: migrating to {peer}: no answer by the eviction's deadline: {e}", vm.name);
+                }
                 Err(e) => {
                     eprintln!("vm {}: migrating to {peer}: {e}", vm.name);
                     backoff.entry(key).or_default().refuse(eviction_time());
@@ -1346,6 +1544,13 @@ pub fn call(host: &Host, name: &str, req: Value) -> Result<Value> {
     answer(crate::util::recv_json(&mut BufReader::new(connect(host, name, &req, &[])?))?, &format!("vm {name}"))
 }
 
+/// `call`, giving up on the answer after `wait`.
+fn call_within(host: &Host, name: &str, req: Value, wait: Duration) -> Result<Value> {
+    let c = connect(host, name, &req, &[])?;
+    c.set_read_timeout(Some(wait))?;
+    answer(crate::util::recv_json(&mut BufReader::new(c))?, &format!("vm {name}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1366,6 +1571,60 @@ mod tests {
             assert!(!peers["peer-a"].ready(now));
             now += delay;
         }
+    }
+
+    #[test]
+    fn eviction_takes_the_starved_then_the_fastest_growing_then_the_biggest() {
+        let vm = |name: &str, starved, growth_mib_s, rss: u64| {
+            (Entry { name: name.into(), state: "running".into(), starved, growth_mib_s, firecracker: Some(rss as u32), ..Entry::default() }, rss)
+        };
+        let vms = [
+            vm("big", false, 0, 4000),
+            vm("noisy", false, 5, 3000),
+            vm("grower", false, 120, 800),
+            vm("slow-grower", false, 20, 2000),
+            vm("starved", true, 0, 300),
+            (Entry { name: "moving".into(), state: "source".into(), growth_mib_s: 500, ..Entry::default() }, 9000),
+        ];
+        let ranked = rank(vms.iter().map(|v| v.0.clone()).collect(), |e| e.firecracker.unwrap_or(0) as u64);
+        let names: Vec<_> = ranked.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["starved", "grower", "slow-grower", "big", "noisy"]);
+        // Growth within the same power of two ranks by size.
+        let ranked = rank(vec![vm("a", false, 70, 100).0, vm("b", false, 100, 200).0], |e| e.firecracker.unwrap_or(0) as u64);
+        assert_eq!(ranked[0].name, "b");
+    }
+
+    #[test]
+    fn growth_is_measured_over_the_window_and_not_while_arriving() {
+        let (mut g, t) = (Growth::default(), Instant::now());
+        assert_eq!(g.sample(t, 1000, false), 0);
+        assert_eq!(g.sample(t + secs(1), 1100, false), 100);
+        assert_eq!(g.sample(t + secs(2), 1300, false), 150);
+        // Older samples than the window drop out: flat for 5 s is no growth.
+        for s in 3..=8 {
+            g.sample(t + secs(s), 1300, false);
+        }
+        assert_eq!(g.sample(t + secs(9), 1300, false), 0);
+        // Shrinking is not growth; an arrival's pull starts it over.
+        assert_eq!(g.sample(t + secs(10), 900, false), 0);
+        assert_eq!(g.sample(t + secs(11), 2000, true), 0);
+        assert_eq!(g.sample(t + secs(12), 2100, false), 0);
+        assert_eq!(growth_bucket(7), 0);
+        assert_eq!(growth_bucket(8), 3);
+        assert_eq!(growth_bucket(100), growth_bucket(127));
+    }
+
+    #[test]
+    fn eviction_starts_at_its_high_water_mark_and_stops_above_it() {
+        let mut c = crate::host::Config::default();
+        assert_eq!((c.reserve_mib, c.evict_at(), c.evict_until()), (1024, 2048, 2560));
+        c.reserve_mib = 256;
+        assert_eq!((c.evict_at(), c.evict_until()), (768, 1024));
+        c.evict_mib = Some(5000);
+        assert_eq!((c.evict_at(), c.evict_until()), (5000, 7372));
+        // Never under the reserve; a mark at it still stops a little above.
+        c.evict_mib = Some(100);
+        assert_eq!((c.evict_at(), c.evict_until()), (256, 384));
     }
 
     const SIZES: Sizes = Sizes { mem_mib: 256, floor: 4096, hotplug_total: 31744 };

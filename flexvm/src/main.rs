@@ -51,7 +51,7 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
                                      start a VM from a checkpoint
   flexvm migrate NAME HOST:PORT      live-migrate a VM to the host listening there
   flexvm listen [ADDR] [--peer ADDR]... [--vm-ips CIDR|FIRST-LAST] [--underlay IP]
-                [--announce-dev IFACE] [--dns IP] [--reserve MIB] [--prefix P]
+                [--announce-dev IFACE] [--dns IP] [--reserve MIB] [--evict-at MIB] [--prefix P]
                                      configure this host and take migrations from peers
   flexvm standby [--template T] N    keep N VMs restored and paused, so run takes ~5 ms
   flexvm template NAME [--vcpus N] [--mem MIB] [--max MIB] [--plug MIB] [--image REF ...]
@@ -275,6 +275,9 @@ fn configure(c: &mut host::Config, args: &Args, addr: Option<&str>) -> Result<()
     c.announce_dev = args.get("announce-dev").map(String::from).or(c.announce_dev.take());
     c.dns = args.get("dns").map(String::from).or(c.dns.take());
     c.reserve_mib = args.num("reserve", c.reserve_mib)?;
+    if args.has("evict-at") {
+        c.evict_mib = Some(args.num("evict-at", 0)?);
+    }
     c.prefix = args.get("prefix").map_or(c.prefix.clone(), String::from);
     Ok(())
 }
