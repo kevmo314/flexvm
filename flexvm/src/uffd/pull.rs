@@ -13,7 +13,8 @@ const STEER_BURST: usize = 4;
 const PULL_THREADS: usize = 4;
 
 impl Pager {
-    /// Starts fault fetchers and background pullers. Each has its own source connection or checkpoint-file clone.
+    /// Starts the threads that fetch pages for faults (`fetch_faults`) and that pull every REMOTE page in the
+    /// background (`pull`), so the source can let go (or, restoring a checkpoint, the VM no longer needs its file).
     pub(super) fn spawn_pullers(self: Arc<Self>) {
         let file = self.file.lock().unwrap().clone();
         // Released already: every page is in.
@@ -48,8 +49,9 @@ impl Pager {
         }
     }
 
-    /// Pulls thread `t`'s share of REMOTEs, taking steered runs before each ordinary run. Drops its file clone when
-    /// finished; checkpoint working-set pages come first.
+    /// Background puller `t` of `PULL_THREADS`: pulls its share of the REMOTE pages, a run at a time, and before each
+    /// run, the pages past the latest REMOTE fault (`steered`). `fetch` holds the file (if any) too: let go as the
+    /// thread ends, as soon as nothing is left to pull.
     fn pull(&self, t: usize, file: Option<Arc<PageFile>>, fetch: &mut Fetch) {
         // A checkpoint's pages come off local disk: the ones in the template's working set first, as the guest needs
         // them soonest.

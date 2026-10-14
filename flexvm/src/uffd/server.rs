@@ -12,8 +12,10 @@ const SERVE_WRITE: Duration = Duration::from_secs(30);
 /// just reconnects.
 const SERVE_IDLE: Duration = Duration::from_secs(600);
 
-/// Serves the binary page protocol on an accepted, acknowledged connection. Ends on hangup, idle timeout, oversized
-/// request or `stop`, checked before requests and every second while idle. `conn` sets timeouts.
+/// Serves page reads for `pager` on an accepted page-server connection (already answered `ok`), until the client hangs
+/// up, sits idle for `SERVE_IDLE`, asks for more than `MAX_FETCH`, or `stop()` says to drop it. `stop` is asked before
+/// every request and every second meanwhile, so a connection ends soon after its VM stops being a migration source.
+/// `conn` is the socket under `stream`, for its timeouts.
 pub fn serve_pages(pager: &Pager, conn: &TcpStream, mut stream: impl Read + Write, stop: impl Fn() -> bool) -> io::Result<()> {
     conn.set_read_timeout(Some(Duration::from_secs(1)))?;
     conn.set_write_timeout(Some(SERVE_WRITE))?;

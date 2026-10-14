@@ -29,9 +29,11 @@ pub(super) enum Failed {
 }
 
 impl Pages {
-    /// Fetches claimed REMOTE pages and installs them as they arrive: the first immediately, then at least `STREAM_RUN`
-    /// at a time. Retries only unreceived pages while `retry` permits, giving back the rest. Returns the REMOTE pages
-    /// resolved and the error that stopped it.
+    /// Fetches claimed REMOTE pages `first..first + n` with `fetch` (into `buf`) and installs them as they arrive with
+    /// `populate(page, count, data)` (as `install` does): the first one as soon as it is in, as a fault waits for it,
+    /// then at least `STREAM_RUN` at a time, so that a fault on any of them waits only for its part of the transfer. A
+    /// failed fetch is tried again, for what has yet to arrive, while `retry` says so. Pages it does not install are
+    /// given back. Returns the REMOTE pages resolved, and the error that stopped it.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn fetch_install(
         &self,
@@ -109,7 +111,8 @@ impl Pager {
         lane.push(job);
     }
 
-    /// Fetches and installs fault claims in FIFO order. Copies wake guest threads; settling wakes the event loop.
+    /// Fetches and installs the runs faults claimed (`lane`), so that the event thread never waits for the network or
+    /// disk. The faulting thread is woken by the copy, the event thread by the pages settling.
     pub(super) fn fetch_faults(&self, lane: &Lane, fetch: &mut Fetch) {
         let mut buf = vec![0u8; REMOTE_FAULT_RUN * PAGE_SIZE];
         let pages = self.pages();
@@ -224,7 +227,8 @@ impl Pager {
         }
     }
 
-    /// Counts REMOTEs resolved by `fetch_install`; a failed fetch after every page resolved is harmless.
+    /// `Pages::fetch_install`, counting the REMOTE pages resolved. A fetch that failed once every page was resolved
+    /// anyway (discarded meanwhile) is no failure.
     pub(super) fn install_claimed(
         &self,
         first: usize,
@@ -243,8 +247,10 @@ impl Pager {
     }
 }
 
-/// A fault fetcher's FIFO. `push` writes requests on its connection before waking it, pipelined behind replies still
-/// arriving; `flush` completes writes and replies are read in queue order.
+/// A fault fetcher's queue: the runs faults claimed (`Job`s), oldest first, which it fetches in order. From a migration
+/// source, each run's request goes out on the fetcher's connection as it is queued (`push`, by the event thread), so it
+/// is on its way before the fetcher wakes, and behind replies still arriving: requests are pipelined, and replies come
+/// in their order.
 #[derive(Default)]
 pub(super) struct Lane {
     pub(super) q: Mutex<LaneQueue>,
@@ -300,8 +306,9 @@ impl Lane {
         q.sent = q.sent.saturating_sub(1);
     }
 
-    /// Completes queued request writes by `at`, resending them after reconnect; each job keeps one attempt deadline for
-    /// its request and reply.
+    /// Takes `conn` for requests, and writes those not out yet. Before reading the reply to `req`, the front job's:
+    /// fails if its request was out asking for something else (the connection must go). Every write ends by `at`, the
+    /// deadline of the fetcher's attempt.
     fn flush(&self, conn: &TcpStream, req: Option<(u64, usize)>, at: Instant) -> io::Result<()> {
         let mut q = self.q.lock().unwrap();
         if q.conn.is_none() {
@@ -358,13 +365,15 @@ impl Link {
         Link { source, client: None, down: None, retry_at: Instant::now(), backoff: BACKOFF_MIN }
     }
 
-    /// Reads guest memory from the source, reporting progress from the start after reconnects. Retries until stopped or
-    /// the source outage reaches `SOURCE_TIMEOUT`.
+    /// Reads guest memory at `offset` from the source, reporting `progress` as `PageClient::fetch` does (from the start
+    /// again after a reconnect). Waiting to reconnect, it sleeps until `stop` is set. Fails with TimedOut once the
+    /// outage is too long.
     pub(super) fn fetch(&mut self, offset: u64, buf: &mut [u8], stop: &AtomicBool, progress: &mut dyn FnMut(&[u8]) -> bool) -> io::Result<()> {
         self.fetch_with(None, offset, buf, stop, progress)
     }
 
-    /// Fetches the lane's front job (possibly already requested), head first; an empty buffer only connects.
+    /// `fetch` for a fault fetcher: reads the reply to the front job of `lane`, whose request may be out already, the
+    /// faulting page first. With nothing to read, only connects.
     pub(super) fn fetch_queued(&mut self, lane: &Lane, offset: u64, buf: &mut [u8], stop: &AtomicBool, progress: &mut dyn FnMut(&[u8]) -> bool) -> io::Result<()> {
         self.fetch_with(Some(lane), offset, buf, stop, progress)
     }
@@ -440,7 +449,8 @@ impl Link {
     }
 }
 
-/// Probes the source by fetching one page, retrying within `SOURCE_TIMEOUT` and `deadline`.
+/// Whether a migration source serves pages at all: fetches `page`, retrying as a pager would (for up to
+/// `SOURCE_TIMEOUT`, and not past `deadline`).
 pub fn probe(source: &Source, page: u64, deadline: Instant) -> io::Result<()> {
     let give_up = deadline.min(Instant::now() + SOURCE_TIMEOUT);
     let mut backoff = BACKOFF_MIN;
@@ -468,8 +478,9 @@ pub fn probe(source: &Source, page: u64, deadline: Instant) -> io::Result<()> {
     }
 }
 
-/// Requests `len` bytes at `offset`, with the first `head` bytes requested separately so the server sends them before
-/// reading the rest. Returns the request and its length.
+/// The request for `len` bytes of guest memory at `offset`: with `head` (bytes, less than `len`), the first `head`
+/// bytes are asked for on their own, ahead of the rest, so the server reads and sends them without waiting to read the
+/// rest out of guest memory. Returns it and its length.
 fn request(offset: u64, len: usize, head: usize) -> ([u8; 24], usize) {
     let mut req = [0u8; 24];
     for (i, (a, b)) in parts(len, head).enumerate() {
@@ -512,7 +523,8 @@ impl<S: crate::util::Timed> PageClient<S> {
         Ok(PageClient { stream, acked: false })
     }
 
-    /// Fetches into `buf` by `at`, reporting received bytes; the first `head` bytes are requested separately.
+    /// Reads guest memory at `offset` into `buf` by `at`, calling `progress` with what has arrived so far as it does,
+    /// the first `head` bytes asked for on their own (see `request`).
     pub fn fetch(&mut self, offset: u64, buf: &mut [u8], head: usize, progress: &mut dyn FnMut(&[u8]) -> bool, at: Instant) -> io::Result<()> {
         let (req, len) = request(offset, buf.len(), head);
         self.stream.at = at;
@@ -551,7 +563,8 @@ impl<S: crate::util::Timed> PageClient<S> {
         Ok(())
     }
 
-    /// Reads the JSON acknowledgement byte by byte, consuming nothing from the following binary reply.
+    /// Reads the page server's answer to the `pages` request: one JSON line, `{"ok": true}` before the binary protocol,
+    /// or why it refuses (then it hangs up). Read a byte at a time, so nothing after it is consumed.
     fn read_ack(&mut self) -> io::Result<()> {
         let mut line = Vec::new();
         let mut b = [0u8; 1];
@@ -576,9 +589,15 @@ impl<S: crate::util::Timed> PageClient<S> {
 /// Fetch outcomes carried through the public client's `io::Result` API.
 #[derive(Debug)]
 pub(super) enum FetchFailure {
+    /// A fetch its caller stopped part way (`progress` said so); what was left of the reply is unread, so the
+    /// connection goes.
     Cancelled,
+    /// A fetch that delivered pages, but not all of them, before its connection failed (say, past its deadline from a
+    /// slow source): the caller fetches the rest (see `Pages::fetch_install`).
     Partial(String),
+    /// The migration source has been unreachable for `SOURCE_TIMEOUT` (fatal).
     SourceLost(String),
+    /// A read of the checkpoint page file failed or did not match its checksums (fatal).
     Checkpoint(io::Error),
 }
 

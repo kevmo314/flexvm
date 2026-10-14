@@ -13,13 +13,17 @@ mod sealed {
 
 /// Zeroed atomic storage, lazily backed by the kernel, with each type's alignment.
 pub(crate) fn zeroed_atomics<T: sealed::ZeroAtomic>(n: usize) -> Vec<T> {
-    if n == 0 { return Vec::new(); }
+    if n == 0 {
+        return Vec::new();
+    }
     let layout = std::alloc::Layout::array::<T>(n).expect("atomic array too large");
     // Only AtomicU8 and AtomicU64 implement the sealed trait; zero is valid for both, and the allocation's layout is
     // exactly that of Vec<T>.
     unsafe {
         let ptr = std::alloc::alloc_zeroed(layout).cast::<T>();
-        if ptr.is_null() { std::alloc::handle_alloc_error(layout); }
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
         Vec::from_raw_parts(ptr, n, n)
     }
 }
@@ -31,11 +35,16 @@ pub const REMOTE: u8 = 3; // Migration source or checkpoint file.
 pub const INFLIGHT: u8 = 4; // Claimed by one installer.
 pub const DISCARDED: u8 = 5; // REMOVE hit a claim; never install stale bytes.
 
-/// The page state machine: installers claim INFLIGHT pages, populate them and settle them. REMOVE turns claims
-/// DISCARDED, so installers skip stale contents. Copies hold `events` shared; REMOVE reads and applies events under it
-/// exclusively, and queued REMOVEs make copies fail EAGAIN. Removed pages settle ZERO. The kernel's zap follows the
-/// event read outside our lock, so even a settled PRESENT page can go missing; a subsequent missing-page fault
-/// zero-fills it.
+/// The page state machine. Installers claim pages (-> INFLIGHT), populate them and settle them; a REMOVE on a claimed
+/// page turns it DISCARDED, and its installer then skips it.
+///
+/// No data copy can land in a page after a REMOVE of it: the kernel fails copies with EAGAIN while a REMOVE event is
+/// queued, the event is read and applied under `events` held exclusively, and installers hold it shared from checking a
+/// page's state until they have settled it. After that a removed page is ZERO, which only ever gets zero-filled.
+///
+/// The kernel zaps the range only after the event is read, though, and not under any lock of ours, so a page can still
+/// go missing after it settled PRESENT (say a zero-fill that hit EEXIST on the old mapping just before the zap). That
+/// can only happen to a page the guest gave back, so a fault on a PRESENT page zero-fills it if it is missing.
 #[derive(Default)]
 pub struct Pages {
     pub(super) states: Vec<AtomicU8>,
@@ -192,8 +201,9 @@ impl Pages {
         self.states.len()
     }
 
-    /// First page at or after `from` that differs from `state`, or `end`. Untouched chunks imply BASE and can be
-    /// skipped without faulting their state bytes in.
+    /// The first page in `[from, end)` not in `state`, or `end`. For BASE, skips chunks that never left it without
+    /// reading them: a VM's map is mostly BASE (the unplugged virtio-mem region alone is millions of pages), and a
+    /// migration scans it with the VM paused.
     pub fn next_not(&self, state: u8, mut from: usize, end: usize) -> usize {
         let end = end.min(self.states.len());
         while from < end {
@@ -231,8 +241,8 @@ impl Pages {
         self.events.write().unwrap()
     }
 
-    /// Claims up to `max` consecutive pages from `first` in state `from` while `ok` holds. One installer owns each
-    /// claim; a fault on it waits for that install instead of copying it again.
+    /// Claims up to `max` consecutive pages from `first` that are in state `from` and pass `ok`. Returns how many it
+    /// claimed.
     pub fn claim(&self, first: usize, max: usize, from: u8, ok: impl Fn(usize) -> bool) -> usize {
         let mut n = 0;
         while n < max && first + n < self.states.len() && ok(first + n) {
@@ -287,8 +297,8 @@ impl Pages {
         failing.iter().filter(|(p, _)| (first..first + n).contains(p)).map(|(_, t)| *t).min()
     }
 
-    /// Settles an install only if its claim survived REMOVE; discarded claims become ZERO. Returns whether it resolved
-    /// a REMOTE page, including one discarded meanwhile.
+    /// Settles claimed `page`, claimed from state `from`. Returns whether a REMOTE page got resolved, for the pager's
+    /// count of pages to pull.
     fn settle(&self, page: usize, populated: bool, from: u8) -> bool {
         let old = self.states[page]
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |s| {
@@ -310,15 +320,17 @@ impl Pages {
         from == REMOTE && (populated || old == DISCARDED)
     }
 
-    /// Gives uninstalled claims back to `from`, except DISCARDED pages become ZERO. Returns REMOTEs resolved.
+    /// Gives back claimed pages without installing them.
     pub fn release(&self, first: usize, n: usize, from: u8) -> usize {
         let resolved = (first..first + n).filter(|&p| self.settle(p, false, from)).count();
         self.settled();
         resolved
     }
 
-    /// Installs a claim in runs, handling partial copies, EEXIST and DISCARDED pages. With `stop`, EAGAIN waits for
-    /// events to be read; other errors give claims back. Returns resolved REMOTE pages and error.
+    /// Installs claimed pages `[first, first + n)` with `populate(page, count)`, which returns how many pages from
+    /// `page` it populated (UFFDIO_COPY may stop part way) and wakes their waiters. Pages discarded before their copy
+    /// are skipped; EEXIST counts as populated. EAGAIN is retried until `stop` is set, or without `stop` ends the
+    /// install. Unfinished pages are given back. Returns the REMOTE pages resolved and the error, if any.
     pub fn install(
         &self,
         first: usize,

@@ -1,5 +1,29 @@
 //! Userfaultfd pager for Firecracker guest memory.
 //!
+//! Every page of guest memory is in one of a few states, so a VM can be backed
+//! by any mix of a shared template image, zero pages and pages still living on
+//! its origin:
+//!
+//!   BASE      -> copied from the template memory file (holes map the zero page)
+//!   ZERO      -> discarded by the guest (balloon / virtio-mem); maps the zero page
+//!   REMOTE    -> fetched from the migration source's page server, or the page
+//!                file of a checkpoint being restored
+//!   INFLIGHT  -> claimed by one installer; its UFFDIO_COPY wakes any waiters
+//!   DISCARDED -> INFLIGHT, but a REMOVE hit it; its installer must not publish it
+//!   PRESENT   -> populated in this VM, the only copy is inside Firecracker
+//!
+//! A page leaves BASE, ZERO or REMOTE only by being claimed; its claimant
+//! installs it and then settles it, so an install that raced a REMOVE never
+//! overwrites the newer state (see `Pages`). PRESENT pages are read out of the
+//! paused Firecracker with process_vm_readv when this host is a migration source.
+//!
+//! Write tracking: once a VM has been checkpointed while running, its memory is
+//! also registered for write-protect faults (no UFFDIO_API feature needed), and
+//! every populated page is protected at each checkpoint's pause. Write faults,
+//! installs and discards mark pages dirty, so the next checkpoint can save only
+//! those, and a running VM's checkpoint saves pages before the guest overwrites
+//! them (see `cow`).
+//!
 //! Page states, claims and bitmaps live in `pages`; `event` handles faults, `fetch` services their remote runs, and
 //! `pull` brings the rest in. `server` reads the paused source, and `wp` handles write tracking and COW.
 
@@ -83,7 +107,6 @@ impl Mapping {
 pub type Runs = Vec<(u64, u64, u8)>;
 
 /// The migration source VM process, reached through its peer listener.
-
 #[derive(Debug, Clone)]
 pub struct Source {
     pub addr: String,
@@ -107,18 +130,26 @@ fn os(code: i32) -> io::Error {
     io::Error::from_raw_os_error(code)
 }
 
+/// Why a pager gave up on guest memory.
 enum PagerFailure {
+    /// Firecracker unmapped guest memory or exited.
     Gone,
+    /// Pages could not be had (the source, the checkpoint file): why.
     Lost(String),
 }
 
-/// Prefetch is held only while learning before the load completes.
+/// The working-set prefetch and load-set learning (`learn_load_set`): while learning, faults go into the load set, and
+/// a prefetch that comes due before the snapshot is loaded is held back until it is.
 #[derive(Clone, Copy)]
 enum PrefetchState {
     Idle,
+    /// Learning, the snapshot not loaded yet.
     Learning,
+    /// Learning, with a prefetch due once the snapshot is loaded.
     Held,
+    /// The snapshot is loaded: a prefetch starts as soon as it is due.
     Loaded,
+    /// Learning again after a load.
     LoadedLearning,
 }
 
@@ -137,8 +168,14 @@ impl PrefetchState {
 
     fn request(&mut self, loaded: bool, due: bool) -> bool {
         match (loaded, due, *self) {
-            (true, due, state) => { *self = Self::Loaded; due || matches!(state, Self::Held) }
-            (false, true, Self::Learning | Self::Held) => { *self = Self::Held; false }
+            (true, due, state) => {
+                *self = Self::Loaded;
+                due || matches!(state, Self::Held)
+            }
+            (false, true, Self::Learning | Self::Held) => {
+                *self = Self::Held;
+                false
+            }
             (_, due, _) => due,
         }
     }
@@ -208,8 +245,9 @@ pub struct Pager {
 }
 
 impl Pager {
-    /// Serves faults after Firecracker's UFFD handshake on `sock`. Incoming page states and their origin can be passed
-    /// in `initial` or supplied with `seed` before Firecracker connects.
+    /// Listens on `sock` for Firecracker's UFFD handshake and serves faults in the background. `initial` seeds page
+    /// states for an incoming migration or a checkpoint restore, with where their REMOTE pages come from; it can also
+    /// be given later, with `seed`, until Firecracker connects.
     pub fn start(sock: &Path, base: Arc<Template>, initial: Option<(Runs, Origin)>) -> Result<Arc<Pager>> {
         crate::socket::check(sock)?;
         let _ = std::fs::remove_file(sock);
@@ -269,7 +307,7 @@ impl Pager {
         Ok(pager)
     }
 
-    /// Starts due working-set prefetch unless held for load-set learning.
+    /// Starts the working-set prefetch once it is `due` and, while learning the load set, the snapshot is `loaded`.
     fn start_prefetch(self: &Arc<Self>, loaded: bool, due: bool) {
         let mut state = self.prefetch.lock().unwrap();
         if state.request(loaded, due) {
@@ -297,13 +335,15 @@ impl Pager {
         Ok(())
     }
 
-    /// A prepared load connects before `seed`, without touching memory; its handshake waits for seed or stop.
+    /// Firecracker will connect before `seed` (it prepares the load ahead of the vmstate, touching no guest memory
+    /// until the load itself): the handshake then waits for the seed (or `stop`).
     pub fn expect_seed(&self, yes: bool) {
         self.awaiting_seed.store(yes, Ordering::SeqCst);
     }
 
-    /// Learns the coming load's faults in `Template::load_set`, holding prefetch until `loaded`. Call before an
-    /// off-path load (a standby VM).
+    /// Records the pages the coming snapshot load faults on into the template's load set (see `Template::load_set`),
+    /// holding the working-set prefetch back until `loaded` so that it does not hide them. For loads off the critical
+    /// path (a standby VM's). Call before the load.
     pub fn learn_load_set(&self) {
         self.prefetch.lock().unwrap().learn();
     }
@@ -424,8 +464,10 @@ impl Pager {
         runs_where(0, pages.len(), |p| pages.get(p) == PRESENT).map(|(a, b)| (a as u64, (b - a) as u64)).collect()
     }
 
-    /// Installs preloaded REMOTE pages alongside the snapshot load, one `PAGE_SIZE` slice per list entry. Waits by
-    /// `deadline` for any pages another installer claimed; returns how many it installed.
+    /// Installs REMOTE pages whose contents came along with the vmstate (one `PAGE_SIZE` slice of `data` per page of
+    /// `list`), once Firecracker has connected: the load would otherwise fault on them one round trip at a time. Runs
+    /// alongside the load; a page a fault or puller claimed first is waited for (by `deadline`), so all of them are in
+    /// when it returns. Returns how many it installed.
     pub fn preload(&self, list: &[u64], data: &[u8], deadline: Instant) -> Result<usize> {
         if data.len() != list.len() * PAGE_SIZE {
             bail!("preload of {} pages has {} bytes", list.len(), data.len());
@@ -482,7 +524,8 @@ impl Pager {
         Ok(installed)
     }
 
-    /// Waits for `cond`, rechecking on connect, pull completion and stop. False on timeout or stop.
+    /// Waits (up to `timeout`) for `cond`, checked again whenever Firecracker connects, the pull finishes or the pager
+    /// stops. False if the pager stopped or time ran out first.
     fn wait_for(&self, timeout: Option<Duration>, cond: impl Fn() -> bool) -> bool {
         let deadline = timeout.map(|t| Instant::now() + t);
         let mut guard = self.done.0.lock().unwrap();
@@ -520,8 +563,9 @@ impl Pager {
         Some(self.pull_finished.get()?.duration_since(*self.pull_started.get()?))
     }
 
-    /// Counts resolved REMOTE pages; the last one releases the checkpoint file. Claims count until settled, so only
-    /// readers already holding their own clones can still read it.
+    /// Counts `n` remote pages as resolved. With the last one, lets go of the checkpoint file: every claim on a REMOTE
+    /// page has settled (a claimed page counts until its claimant settles it), so nothing reads it any more but those
+    /// already reading, through clones of their own.
     fn pulled(&self, n: usize) {
         if n > 0 && self.remote_left.fetch_sub(n, Ordering::SeqCst) == n {
             drop(self.file.lock().unwrap().take());
@@ -530,7 +574,8 @@ impl Pager {
         }
     }
 
-    /// Notifies readiness/pull waiters and fault fetchers, which release their file when the pull finishes.
+    /// Wakes whoever waits on `done` or for fault runs: Firecracker connected, the pull finished or the pager stopped.
+    /// Fault fetchers end once the pull is done, letting go of the file too.
     fn notify(&self) {
         drop(self.done.0.lock().unwrap());
         self.done.1.notify_all();
@@ -568,7 +613,8 @@ impl Pager {
         self.seeded.notify_all();
     }
 
-    /// Records memory loss unless stopped deliberately, then kills Firecracker to unblock its vCPUs/load.
+    /// Gives up on the VM's memory: unless it was stopped on purpose, records why and kills Firecracker, whose vCPUs
+    /// (or snapshot load) may be blocked on pages that will never come.
     fn fail(&self, why: String) {
         if !self.stop.load(Ordering::SeqCst) {
             eprintln!("uffd: {why}; killing the vm");
@@ -582,8 +628,9 @@ impl Pager {
         self.stop();
     }
 
-    /// Whether an ENOENT/ESRCH from a uffd call means all `n` pages are unmapped or Firecracker exited. ENOENT across
-    /// an unplugged virtio-mem VMA boundary with memory still mapped is retriable.
+    /// Whether `e`, from a uffd call on `n` pages from `page`, means that nothing at all is mapped there in Firecracker
+    /// any more (or it is gone): ENOENT outside a registered VMA, ESRCH once its memory is gone. ENOENT also comes
+    /// across a VMA boundary, e.g. into an unplugged virtio-mem slot, where memory is still mapped: that is not this.
     fn unmapped(&self, e: &io::Error, page: usize, n: usize) -> bool {
         let Some((addr, _)) = self.host_addr(page).filter(|_| matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ESRCH))) else {
             return false;
@@ -603,8 +650,9 @@ impl Pager {
         })
     }
 
-    /// Stops when Firecracker unmapped memory, allowing `UNMAPPED_GRACE` to answer a failed load or exit before killing
-    /// it.
+    /// Gives up on guest memory that Firecracker has unmapped: it is most likely tearing down a load that failed, and
+    /// about to answer the load request with why. Like `fail`, but Firecracker gets `UNMAPPED_GRACE` to do that (or
+    /// exit) before it is killed.
     fn gone(&self) {
         // Once, though every puller runs into it.
         if !self.stop.load(Ordering::SeqCst) && self.failed.set(PagerFailure::Gone).is_ok() {
@@ -697,9 +745,13 @@ impl Pager {
         c
     }
 
-    /// For a paused VM: stops prefetch, waits for REMOVEs and claims to settle, and exports page states. Later installs
-    /// only materialize existing template/zero contents, since the guest cannot write. PRESENT becomes REMOTE on the
-    /// target, ZERO stays ZERO, and BASE is implied.
+    /// Checkpoint barrier, for a paused VM: stops prefetching, waits for REMOVE events already read to be applied and
+    /// for in-flight installs to settle, then exports page states that match the saved device state. A page installed
+    /// behind the scan only gains the contents its old state already implied (template or zero), as the paused guest
+    /// cannot write it.
+    ///
+    /// The export is the run-length encoded page states a migration target needs: PRESENT pages become REMOTE there,
+    /// ZERO stays ZERO and BASE is implied.
     pub fn quiesce_export(&self) -> Result<Runs> {
         self.quiesce.store(true, Ordering::SeqCst);
         drop(self.pages().removing());

@@ -43,7 +43,8 @@ pub struct Frozen {
 }
 
 impl Pager {
-    /// Rescues unsaved pages in the fault's block, then unprotects and dirties pages writers no longer need.
+    /// A write to a write-protected page. During a checkpoint copy, saves the pages of its block that the copy has not
+    /// saved yet; then unprotects the block (except pages still to be saved by a writer) and marks it dirty.
     pub(super) fn wp_fault(&self, page: usize, m: &Mapping) -> io::Result<()> {
         let block = page - page % WP_BLOCK;
         let (first, end) = (block.max(m.span().0), (block + WP_BLOCK).min(m.span().1));
@@ -112,8 +113,9 @@ impl Pager {
         Ok(())
     }
 
-    /// Rescues unsaved pages in `first..end`. Only reads populated pages (missing pages were zero at pause), avoiding a
-    /// missing-page fault back to this event thread.
+    /// Saves the pages of `first..end` (within one region) that the copy has yet to save out of the guest into `cow`.
+    /// Returns how many. Never reads a page that may be missing, which would fault back to the event thread: only pages
+    /// the pagemap shows populated are read (a missing one was missing, so zero, at the pause).
     fn rescue(&self, cow: &Cow, first: usize, end: usize) -> io::Result<usize> {
         let claimed: Vec<usize> = (first..end).filter(|&p| cow.claim(p, PENDING, RESCUING)).collect();
         if claimed.is_empty() {
@@ -155,8 +157,10 @@ impl Pager {
         Ok(raw.chunks(8).map(|e| u64::from_le_bytes(e.try_into().unwrap()) & (3 << 62) != 0).collect())
     }
 
-    /// Saves remaining checkpoint pages in memory while REMOVE is held back, using up to eight threads when they fit in
-    /// a quarter of host memory; otherwise the checkpoint writers finish them.
+    /// While a REMOVE is held back (and with it every fault, as the kernel refuses our ioctls until it is read): copies
+    /// the pages the checkpoint has yet to save into memory with several threads, so the guest waits for memory
+    /// bandwidth rather than for the disk. Only if they fit in a quarter of the host's available memory; else the
+    /// writers finish.
     pub(super) fn save_rest(&self, cow: &Cow) {
         let avail = crate::util::proc_kb("/proc/meminfo", "MemAvailable").unwrap_or(0) as usize;
         if cow.left() * PAGE_SIZE > avail / 4 {
@@ -193,8 +197,8 @@ impl Pager {
         matches!(self.writeprotect(p, 1, true), Err(e) if e.raw_os_error() == Some(libc::EAGAIN))
     }
 
-    /// Registers write-protect faults once and arms tracking in 2 MiB chunks while the VM runs. The next checkpoint
-    /// only re-protects pages changed since.
+    /// Turns write tracking on, while the VM runs: registers guest memory for write-protect faults (once) and protects
+    /// all of it, so the pause of the checkpoint that follows only re-protects what changed meanwhile.
     pub fn arm_tracking(&self) -> Result<Duration> {
         let start = Instant::now();
         if self.tracking() {
@@ -225,7 +229,9 @@ impl Pager {
         Ok(start.elapsed())
     }
 
-    /// Protects runs split at regions, restoring dirty bits if protection fails so a later checkpoint cannot miss them.
+    /// Write-protects `ranges`, retrying for a while each one a queued REMOVE fails. For a freeze, which took the dirty
+    /// bits `taken`, a failure gives them back: every page must stay protected or dirty. Either way it turns tracking
+    /// off, so everything is protected again next time. Returns how many ranges it protected.
     fn protect(&self, ranges: impl IntoIterator<Item = (usize, usize)>, taken: Option<&[u64]>) -> Result<usize> {
         let mut n = 0;
         for (first, end) in ranges {
@@ -261,9 +267,11 @@ impl Pager {
         self.pages().dirty.iter().map(|w| w.load(Ordering::Relaxed).count_ones() as usize).sum()
     }
 
-    /// Freezes a paused VM's memory for checkpointing: takes dirty bits, protects pages, and optionally arms COW.
-    /// Incremental exports include dirty BASE pages, which may need to replace a parent's data. On protection failure,
-    /// bits are restored; subsequent writes and installs remain dirty.
+    /// Captures memory for a checkpoint of the paused VM, after `quiesce_export` gave `runs`: takes the pages dirtied
+    /// since the last checkpoint's pause (starting a new interval), picks the pages to write (all populated ones, or
+    /// with `incremental` only the dirty ones, plus explicit runs for dirty pages now discarded or the template's), and
+    /// with `cow` arms copy-on-write for them so the VM can run on: whatever was unprotected since the last pause is
+    /// write-protected again first.
     pub fn freeze(&self, runs: &Runs, incremental: bool, cow: bool) -> Result<Frozen> {
         let _wp = self.wp.lock().unwrap();
         if (cow || incremental) && !self.tracking() {
@@ -328,7 +336,9 @@ impl Pager {
         Ok(Frozen { runs: out, cow, dirty: ndirty, taken, protected, protect })
     }
 
-    /// Undoes a failed freeze: stops COW and restores taken dirty bits. Any writes since pause stay dirty.
+    /// Undoes `freeze` for a checkpoint that failed: stops its copy and marks dirty again what it took, so the previous
+    /// checkpoint is still the base of the next delta. Pages the freeze protected stay protected until written, which
+    /// marks them dirty, so nothing is lost either way.
     pub fn unfreeze(&self, frozen: &Frozen) {
         self.end_copy();
         let _wp = self.wp.lock().unwrap();
