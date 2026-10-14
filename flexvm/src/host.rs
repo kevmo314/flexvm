@@ -2124,7 +2124,7 @@ mod tests {
         let before = std::fs::read(&path).unwrap();
         for gen in [GEN_MAX - 1024, GEN_MAX - 1, GEN_MAX] {
             h.claim_incoming(&l, "incoming", addr, gen).unwrap().keep();
-            h.release(&l, addr, "incoming").unwrap();
+            h.release(&l, addr, "incoming", None).unwrap();
             assert!(h.observe(&l, addr, gen, None).unwrap());
             assert!(h.lend_new(&l, addr).unwrap_err().to_string().contains("generations exhausted"));
             assert!(h.claim_new(&l, "new", Some(addr)).err().unwrap().to_string().contains("generations exhausted"));
