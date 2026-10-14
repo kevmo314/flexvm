@@ -15,14 +15,8 @@ pub struct Reference {
 
 impl Reference {
     pub fn parse(s: &str) -> Result<Reference> {
-        let (name, digest) = match s.split_once('@') {
-            Some((n, d)) => (n, Some(d)),
-            None => (s, None),
-        };
-        let (name, tag) = match name.rsplit_once(':') {
-            Some((n, t)) if !t.contains('/') => (n, Some(t)),
-            _ => (name, None),
-        };
+        let (name, digest) = s.split_once('@').map_or((s, None), |(n, d)| (n, Some(d)));
+        let (name, tag) = name.rsplit_once(':').filter(|(_, t)| !t.contains('/')).map_or((name, None), |(n, t)| (n, Some(t)));
         let (domain, path) = match name.split_once('/') {
             Some((d, p)) if d.contains('.') || d.contains(':') || d == "localhost" => (d, p.to_string()),
             _ => ("docker.io", name.to_string()),
@@ -40,14 +34,8 @@ impl Reference {
             bail!("bad image reference {s:?}");
         }
         let reference = match (digest, tag) {
-            (Some(d), _) => {
-                if !d.starts_with("sha256:") || d.len() != 71 {
-                    bail!("bad digest in {s:?}: only sha256 digests are supported");
-                }
-                d.to_string()
-            }
-            (None, Some(t)) => t.to_string(),
-            (None, None) => "latest".to_string(),
+            (Some(d), _) if !d.starts_with("sha256:") || d.len() != 71 => bail!("bad digest in {s:?}: only sha256 digests are supported"),
+            (d, t) => d.or(t).unwrap_or("latest").to_string(),
         };
         Ok(Reference { registry, repository, reference })
     }
