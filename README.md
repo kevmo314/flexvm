@@ -133,7 +133,9 @@ flexvm bench --to 127.0.0.1:7131 --to-state S --to-run R --dirty-mib 500   # run
 flexvm bench --lifecycle /data/ckpt --to-state S --to-run R      # pause, checkpoint, restore, suspend
 ```
 
-Reports land in `bench/`.
+Reports land in `bench/`. With `--dirty-mib`, the guest reads its memory
+back before and right after the migration; `post_copy` has the difference
+(`stall`) and the target's fault service per kind.
 
 ## Tests
 
