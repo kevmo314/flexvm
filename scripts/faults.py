@@ -2800,22 +2800,70 @@ def grow(host, name, mib, rate):
 
 
 class marks:
-    """Host A's reserve and eviction high-water mark set to these MiB, in its
-    host.json (running VM processes read the marks from it as it changes)."""
-    def __init__(self, reserve, evict_at):
-        self.reserve, self.evict_at, self.cfg = reserve, evict_at, os.path.join(A.state, "host.json")
+    """`host`'s reserve and eviction high-water mark set to these MiB, in its
+    host.json (running VM processes read them from it as it changes)."""
+    def __init__(self, reserve, evict_at, host=None):
+        self.reserve, self.evict_at, self.cfg = reserve, evict_at, os.path.join((host or A).state, "host.json")
+
+    def write(self, text):
+        with open(self.cfg + ".tmp", "w") as f:
+            f.write(text)
+        os.rename(self.cfg + ".tmp", self.cfg)
+
+    def set(self, reserve=None, evict_at=None):
+        c = json.loads(self.saved)
+        c.update(reserve_mib=reserve or self.reserve, evict_mib=evict_at or self.evict_at)
+        self.write(json.dumps(c))
 
     def __enter__(self):
         self.saved = open(self.cfg).read()
-        c = json.loads(self.saved)
-        c.update(reserve_mib=self.reserve, evict_mib=self.evict_at)
-        with open(self.cfg, "w") as f:
-            json.dump(c, f)
+        self.set()
         return self
 
     def __exit__(self, *_):
-        with open(self.cfg, "w") as f:
-            f.write(self.saved)
+        self.write(self.saved)
+
+
+def hosts_over(name, secs):
+    """Where `name` runs (by the registries), each time that changes, over `secs` s."""
+    def here():
+        for h in (A, B):
+            try:
+                if json.load(open(os.path.join(h.run, "vms", f"{name}.json"))).get("state") == "running":
+                    return h.addr
+            except (OSError, ValueError):
+                pass
+        return None
+    seen, end = [], time.time() + secs
+    while time.time() < end:
+        h = here()
+        if h and (not seen or seen[-1] != h):
+            seen.append(h)
+        time.sleep(0.05)
+    return seen
+
+
+def evict_no_pingpong():
+    """Two hosts near their eviction marks: a VM A evicts is not taken by a
+    B it would put under B's own mark (B would only send it back), and once
+    B has room it moves there once and stays."""
+    n = "ft-pingpong"
+    for h in (A, B):
+        clear_log(h, n)
+    m = setup(n, mib=600)
+    time.sleep(11)  # the start's grants age out
+    base, rss = mem_available(), cgroup(A, n)[0]
+    with marks(512, base + 1000, A), marks(512, base - rss // 2, B) as b:
+        seen = hosts_over(n, 25)
+        check("no ping-pong: a peer it would put under its mark refuses it", seen == [A.addr] and where(n) == {A: "running"},
+              (seen, where(n), log(A, n)[-1200:]))
+        check("no ping-pong: refused for B's eviction mark", "eviction mark" in log(A, n), log(A, n)[-1200:])
+        b.set(evict_at=max(600, base - 4 * rss - 1000))
+        seen = hosts_over(n, 45)
+        check("no ping-pong: with room on B it moves there once, and stays", seen == [A.addr, B.addr] and where(n) == {B: "running"},
+              (seen, where(n), log(B, n)[-1200:]))
+    check("no ping-pong: md5 intact", md5(B, n) == m)
+    cleanup(n)
 
 
 def evict_grower():
@@ -2869,6 +2917,26 @@ def evict_grower():
         cleanup(n)
 
 
+def evict_skips_cmd():
+    """A host under pressure leaves a `run -- CMD` VM where it is (CMD's end
+    there ends it, with CMD's status), even starved, and moves another."""
+    n, other = "ft-ev-cmd", "ft-ev-plain"
+    scenario_vms.update({n})
+    p = subprocess.Popen([BIN, "--state", A.state, "--run", A.run, "run", n, "--template", args.template, "--", "sleep 600"],
+                         stdout=subprocess.DEVNULL, stderr=open(os.path.join(A.run, f"{n}.stderr"), "w"), env=ENV, start_new_session=True)
+    check("evict cmd: up", wait_for(lambda: vms(A).get(n, {}).get("state") == "running", 30), vms(A).get(n))
+    m = setup(other, mib=1)
+    with marks(512, mem_available() + 1000, A):
+        moved = wait_for(lambda: where(other) == {B: "running"}, 60)
+        time.sleep(8)
+    check("evict cmd: the plain vm moved", moved, (where(other), log(A, other)[-800:]))
+    check("evict cmd: the cmd vm stayed, running its command", where(n) == {A: "running"} and p.poll() is None, (where(n), p.poll()))
+    check("evict cmd: md5 intact", md5(B, other) == m)
+    os.kill(p.pid, signal.SIGINT)
+    check("evict cmd: its command's end still ends it here", p.wait(timeout=30) == 130)
+    cleanup(other)
+
+
 def evict_latency():
     """Measures each VM's controller ticks and memory requests while a
     starved VM is moved away to a target slow to prepare (3 s): the VM process
@@ -2891,6 +2959,9 @@ def evict_latency():
     check("evict latency: every controller ticked within 2.5 s", all(r["tick_gap_max_ms"] < 2500 for r in rep.values()), rep)
     check("evict latency: memory requests answered within the guest's 2 s",
           all(r["asks"] > 0 and r["ask_max_ms"] < 2000 and not any(x.startswith("error") for x in r["replies"]) for r in rep.values()), rep)
+    # Its source, paused at its mark through the pull, is not starved: nothing else moves for it.
+    time.sleep(8)
+    check("evict latency: the others stay", all(where(o) == {A: "running"} for o in others), {o: where(o) for o in others})
     check("evict latency: md5s intact", md5(B, n) == sums[n] and all(md5(A, o) == sums[o] for o in others))
     for v in [n] + others:
         cleanup(v)
@@ -3978,7 +4049,7 @@ SCENARIOS = dict(
     pull_died=pull_died,
     uffd_err=uffd_err,
     mem_high=no_evict(skippable(mem_high)), mem_high_migrate=no_evict(skippable(mem_high_migrate)),
-    mem_high_evict=skippable(mem_high_evict), evict_grower=skippable(evict_grower), evict_latency=skippable(evict_latency),
+    mem_high_evict=skippable(mem_high_evict), evict_grower=skippable(evict_grower), evict_no_pingpong=evict_no_pingpong, evict_skips_cmd=evict_skips_cmd, evict_latency=skippable(evict_latency),
     start_admission=start_admission, standby_admission=standby_admission,
     cow_grow=no_evict(cow_grow), plug_race=no_evict(plug_race), shrink_stall=no_evict(shrink_stall), plug_storm=no_evict(plug_storm),
     basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, refused=refused, pages_blip=pages_blip,

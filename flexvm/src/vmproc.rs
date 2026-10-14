@@ -216,11 +216,16 @@ impl Proc {
     /// Every start, before it loads: what the VM brings (`need` MiB, held or
     /// to page in) and a step, against the host's reserve, less what it
     /// already holds here (`held`: a standby's memory is out of MemAvailable).
-    pub fn admit_start(&self, need: u64, held: u64) -> Result<()> {
+    /// An arrival moved here by eviction leaves this host's eviction mark
+    /// (`floor`) available instead of only the reserve.
+    pub fn admit_start(&self, need: u64, held: u64, floor: Option<u64>) -> Result<()> {
         let mib = crate::limit::allowance(need);
         let charge = mib.saturating_sub(held);
-        let Some(id) = self.host.grant(charge) else {
-            bail!("not enough memory here for {charge} MiB above the {} MiB reserve", self.host.cfg.reserve_mib);
+        let Some(id) = self.host.grant_above(charge, floor) else {
+            match floor {
+                Some(f) => bail!("not enough memory here for {charge} MiB above its {f} MiB eviction mark"),
+                None => bail!("not enough memory here for {charge} MiB above the {} MiB reserve", self.host.config_now().reserve_mib),
+            }
         };
         self.granted.store(mib, Ordering::SeqCst);
         self.charged.store(id, Ordering::SeqCst);
@@ -396,6 +401,7 @@ impl Proc {
             firecracker: vm.pid(),
             starved: vm.starving(),
             growth_mib_s: self.growth.load(Ordering::SeqCst),
+            cmd: self.cmd.lock().unwrap().is_some(),
         };
         if let Err(e) = self.name.lock().unwrap().as_ref().map_or(Ok(()), |l| l.publish(&e)) {
             eprintln!("vm {n}: registry: {e}");
@@ -542,7 +548,7 @@ impl Proc {
         let ip = self.set_addr(claim);
         t.mark("claim_ip");
         crate::host::stall("start_stall");
-        self.admit_start(tpl.working_set_mib(), 0)?;
+        self.admit_start(tpl.working_set_mib(), 0, None)?;
         let prepared = Vm::prepare(self.spawner.take(None)?, tpl.clone(), &mut t)?;
         let learn = crate::standby::load_set(&self.host, &tpl).is_empty();
         if learn {
@@ -711,7 +717,7 @@ impl Proc {
                 }
                 Ok(v)
             }),
-            "migrate" => self.migrate(req["to"].as_str().unwrap_or(""), req["if_idle"] == true),
+            "migrate" => self.migrate(req["to"].as_str().unwrap_or(""), req["if_idle"] == true, req["evict"] == true),
             "debug" => self.debug(&req),
             "claim" => Err("this vm is not a standby vm".into()),
             op => Err(format!("unknown op {op:?}").into()),
@@ -889,7 +895,9 @@ impl Proc {
 
     fn watch_memory(self: Arc<Self>) {
         let vm = self.vm().clone();
-        vm.limit.watch(&self.host, Duration::from_secs(1), || vm.pid().is_some());
+        // Only while it runs here: a paused or migrating VM touches nothing, and a
+        // source sitting at its mark through the pull is not starved.
+        vm.limit.watch(&self.host, Duration::from_secs(1), || vm.pid().is_some(), || vm.state() == State::Running);
     }
 
     /// The guest is untrusted: requests are bounded in size and time and
@@ -1178,7 +1186,8 @@ fn resize(vm: &Vm, host: &Host, hint: Option<u64>, grow_only: bool) -> Result<Re
     };
     let refused = plan.charge > 0 && !host.admit(plan.charge);
     let full = plan.short && (plugged == hotplug_total || refused);
-    vm.starved.store(full, Ordering::SeqCst);
+    // Starved only when the host refused it: at its own ceiling, moving it cannot help.
+    vm.starved.store(plan.short && refused, Ordering::SeqCst);
     let new = if refused { plugged } else { plan.new };
     if new != requested {
         let why = if plan.settle { "stalled" } else if hint.is_some() { "guest asked" } else { "tick" };
@@ -1330,8 +1339,9 @@ fn growth_bucket(mib_s: u64) -> u32 {
 
 /// Eviction's candidates, in order: the starved (refused here, throttled),
 /// then the fastest growing, then the biggest (`rss`, MiB).
+/// A VM running `run -- CMD` is not one: CMD's end there would not end it.
 fn rank(mut vms: Vec<Entry>, rss: impl Fn(&Entry) -> u64) -> Vec<Entry> {
-    vms.retain(|e| e.state == "running");
+    vms.retain(|e| e.state == "running" && !e.cmd);
     vms.sort_by_cached_key(|e| (!e.starved, std::cmp::Reverse(growth_bucket(e.growth_mib_s)), std::cmp::Reverse(rss(e))));
     vms
 }
@@ -1360,21 +1370,6 @@ fn eviction_time() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
-/// `STATE/host.json` as it is now, re-read when it changes: `flexvm listen`
-/// may have moved the marks or the peers since this process started.
-fn current_config(host: &Host) -> crate::host::Config {
-    static SEEN: Mutex<Option<(std::time::SystemTime, crate::host::Config)>> = Mutex::new(None);
-    let path = host.state.join("host.json");
-    let Ok(mtime) = std::fs::metadata(&path).and_then(|m| m.modified()) else { return host.cfg.clone() };
-    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, cfg)) = seen.as_ref().filter(|(t, _)| *t == mtime) {
-        return cfg.clone();
-    }
-    let cfg = crate::host::load::<crate::host::Config>(&path).ok().flatten().unwrap_or_else(|| host.cfg.clone());
-    *seen = Some((mtime, cfg.clone()));
-    cfg
-}
-
 /// Whether this process is running an eviction (on its own thread).
 static EVICTING: AtomicBool = AtomicBool::new(false);
 
@@ -1388,8 +1383,12 @@ static EVICTING: AtomicBool = AtomicBool::new(false);
 /// `evict_until` (`RUN/evict.active` while it lasts). A starved VM is moved
 /// whenever it asks, pressure or not.
 fn relieve(host: &Host, starved_here: bool) {
-    let cfg = current_config(host);
+    let cfg = host.config_now();
     let (avail, reserve, at, until) = (host_available_mib(), cfg.reserve_mib, cfg.evict_at(), cfg.evict_until());
+    // Standby VMs go under the reserve whatever eviction is doing (a slow migration holds its lock).
+    if avail < reserve && stop_standby(host, avail, reserve) {
+        return;
+    }
     let active = host.run.join("evict.active");
     let evicting = active.exists();
     if (avail >= at && !evicting && !starved_here) || EVICTING.load(Ordering::SeqCst) {
@@ -1410,14 +1409,6 @@ fn relieve(host: &Host, starved_here: bool) {
     if !pressure && !starved_here {
         return;
     }
-    if avail < reserve {
-        let standby: Vec<_> = crate::standby::templates(host).iter().flat_map(|t| crate::standby::live(host, t)).collect();
-        standby.iter().for_each(crate::standby::stop);
-        if !standby.is_empty() {
-            let _ = std::fs::write(crate::standby::pressure(host), b"");
-            return eprintln!("host has {avail} MiB available, under its {reserve} MiB reserve: stopped {} standby vms", standby.len());
-        }
-    }
     let last = host.state.join("evict.last");
     let recent = std::fs::metadata(&last).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
     if cfg.peers.is_empty() || recent.is_some_and(|d| d < Duration::from_secs(5)) {
@@ -1427,8 +1418,7 @@ fn relieve(host: &Host, starved_here: bool) {
         return;
     }
     let rss = |e: &Entry| e.firecracker.and_then(|p| proc_kb(&format!("/proc/{p}/status"), "VmRSS")).unwrap_or(0) >> 10;
-    let mut vms = rank(host.entries(), rss);
-    if !pressure {
+    let mut vms = rank(host.entries(), rss);    if !pressure {
         vms.retain(|e| e.starved);
     }
     if vms.is_empty() {
@@ -1442,6 +1432,24 @@ fn relieve(host: &Host, starved_here: bool) {
         evict(&host, &cfg.peers, &vms, avail, Instant::now() + EVICT_DEADLINE);
         EVICTING.store(false, Ordering::SeqCst);
     });
+}
+
+/// Under the reserve: SIGINTs the standby VMs, under `STATE/standby.stop.lock`
+/// (not eviction's lock, which a migration may hold for a while). True if
+/// it stopped any.
+fn stop_standby(host: &Host, avail: u64, reserve: u64) -> bool {
+    let Ok(lock) = std::fs::File::options().create(true).truncate(false).write(true).open(host.state.join("standby.stop.lock")) else { return false };
+    if crate::host::flock(&lock, libc::LOCK_EX | libc::LOCK_NB).is_err() {
+        return false;
+    }
+    let standby: Vec<_> = crate::standby::templates(host).iter().flat_map(|t| crate::standby::live(host, t)).collect();
+    standby.iter().for_each(crate::standby::stop);
+    if standby.is_empty() {
+        return false;
+    }
+    let _ = std::fs::write(crate::standby::pressure(host), b"");
+    eprintln!("host has {avail} MiB available, under its {reserve} MiB reserve: stopped {} standby vms", standby.len());
+    true
 }
 
 /// Moves the first of `vms` that a peer takes, and waits (until `deadline`)
@@ -1467,7 +1475,7 @@ fn evict(host: &Host, peers: &[String], vms: &[Entry], avail: u64, deadline: Ins
             }
             let Some(left) = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) else { return };
             eprintln!("vm {}: {why} ({avail} MiB available); migrating to {peer}", vm.name);
-            match call_within(host, &vm.name, json!({"op": "migrate", "to": peer, "if_idle": true}), left) {
+            match call_within(host, &vm.name, json!({"op": "migrate", "to": peer, "if_idle": true, "evict": true}), left) {
                 Ok(_) => {
                     backoff.remove(&key);
                     let _ = crate::host::store(&backoff_path, &backoff, false);
@@ -1585,6 +1593,7 @@ mod tests {
             vm("slow-grower", false, 20, 2000),
             vm("starved", true, 0, 300),
             (Entry { name: "moving".into(), state: "source".into(), growth_mib_s: 500, ..Entry::default() }, 9000),
+            (Entry { name: "cmd".into(), state: "running".into(), starved: true, cmd: true, ..Entry::default() }, 9000),
         ];
         let ranked = rank(vms.iter().map(|v| v.0.clone()).collect(), |e| e.firecracker.unwrap_or(0) as u64);
         let names: Vec<_> = ranked.iter().map(|e| e.name.as_str()).collect();

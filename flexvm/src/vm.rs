@@ -123,8 +123,9 @@ impl Vm {
     }
 
     /// Cannot grow here: refused a plug, or throttled at its memory mark.
+    /// Only while it runs here (a migration's source sits at its mark through the pull).
     pub fn starving(&self) -> bool {
-        self.starved.load(Ordering::SeqCst) || self.limit.throttled.load(Ordering::SeqCst)
+        self.state() == State::Running && (self.starved.load(Ordering::SeqCst) || self.limit.throttled.load(Ordering::SeqCst))
     }
 
     /// (MiB it holds or still pages in, the guest's size).
