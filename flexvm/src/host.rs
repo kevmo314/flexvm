@@ -305,15 +305,14 @@ impl Host {
         Ok(AddrClaim { host: self.clone(), ip, gen, holder: holder.into(), kept: false, fresh: false })
     }
 
-    /// Also takes back a loan of it (the VM came home).
-    pub fn commit_incoming(&self, l: &Locked, ip: Ipv4Addr, gen: u64) -> Result<()> {
-        self.update(l, ip, true, |a| {
-            if !a.current(gen) {
-                bail!("generation {gen} of {ip} was withdrawn or superseded meanwhile");
-            }
-            a.lent = a.lent.filter(|&lent| lent > gen);
-            Ok(())
-        })?
+    /// The host lock, if `gen` of `ip` is still current: held from this
+    /// final check until the VM runs.
+    pub fn fence(&self, ip: Ipv4Addr, gen: u64) -> Result<Locked> {
+        let l = self.lock()?;
+        if !self.current(&l, ip, gen)? {
+            bail!("{ip}'s generation {gen} was withdrawn or given out again meanwhile");
+        }
+        Ok(l)
     }
 
     pub fn release(&self, l: &Locked, ip: Ipv4Addr, holder: &str) -> Result<()> {
@@ -513,14 +512,22 @@ impl MigRecord {
     /// otherwise it reads aborted once this process is dead.
     pub fn settle(self, gone: bool) {
         if gone && self.committed {
-            self.release();
+            self.release(None);
         }
     }
 
-    /// Retried until recorded: the source waits for it.
-    pub fn release(self) {
+    /// Retried until recorded: the source waits for it. `home`: the VM's
+    /// address and generation, whose loan (if this is its home host) is
+    /// taken back only after, so a crash in between leaves it lent, never free.
+    pub fn release(&self, home: Option<(Ipv4Addr, u64)>) {
         let mut delay = Duration::from_millis(100);
-        while let Err(e) = self.host.lock().and_then(|_l| store(&self.host.mig_path(self.id), &Mig::Released, true)) {
+        while let Err(e) = self.host.lock().and_then(|l| {
+            store(&self.host.mig_path(self.id), &Mig::Released, true)?;
+            match home {
+                Some((ip, gen)) => self.host.update(&l, ip, true, |a| a.lent = a.lent.filter(|&lent| lent > gen)),
+                None => Ok(()),
+            }
+        }) {
             eprintln!("migration {}: {e}; retrying", self.id);
             std::thread::sleep(delay);
             delay = (delay * 2).min(Duration::from_secs(5));
@@ -896,7 +903,7 @@ mod tests {
         assert!(h.observe(&l, a_ip, g1 + 5, via).unwrap() && h.addr(&l, a_ip).unwrap().via == via);
         assert!(h.claim_incoming(&l, "y", a_ip, g1).is_err() && h.claim_incoming(&l, "y", a_ip, 0).is_err());
         h.claim_incoming(&l, "y", a_ip, g1 + 5).unwrap().keep();
-        h.commit_incoming(&l, a_ip, g1 + 5).unwrap();
+        drop(h.fence(a_ip, g1 + 5).unwrap());
         assert!(h.observe(&l, a_ip, g1 + 5, None).unwrap());
         h.claim_incoming(&l, "y", a_ip, g1 + 6).unwrap().keep();
         assert!(h.current(&l, a_ip, g1 + 6).unwrap());
@@ -944,8 +951,12 @@ mod tests {
         r.commit(&h.lock().unwrap()).unwrap();
         h.mig_done(3).unwrap();
         assert_eq!(h.mig_status(3).unwrap(), "committed", "only a released one is forgotten");
-        r.release();
-        assert_eq!(h.mig_status(3).unwrap(), "released");
+        // A VM back home: its loan stays through the commit, and goes with the release.
+        let (home, lent) = (ip("10.9.0.3"), |h: &Host| h.addr(&h.lock().unwrap(), ip("10.9.0.3")).unwrap().lent);
+        h.lend(&h.lock().unwrap(), home, 9).unwrap();
+        assert_eq!(lent(&h), Some(9));
+        r.release(Some((home, 9)));
+        assert!(h.mig_status(3).unwrap() == "released" && lent(&h).is_none());
         h.mig_done(3).unwrap();
         assert!(rec(3).is_none());
         let mut r = h.mig_begin(4).unwrap();

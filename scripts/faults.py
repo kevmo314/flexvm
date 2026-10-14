@@ -2680,7 +2680,48 @@ def fc_died():
     check("fc died: kill clears it", n not in vms(A), vms(A).get(n))
 
 
+def pull_died():
+    """An arrival whose Firecracker dies mid-pull never releases its source,
+    which runs its copy again. A VM coming home whose arrival dies mid-pull
+    leaves its home host's loan in place: the address stays lent while the
+    source runs on, and is not handed out again."""
+    n = "ft-pull-fc-died"
+    m = setup(n, mib=1500)
+    stall = threading.Timer(0.2, lambda: fault(A, "pages", 6000))
+    stall.start()
+    ok(migrate(A, n, B))
+    stall.join()
+    fc = vms(B)[n]["firecracker"]
+    os.kill(fc, signal.SIGKILL)
+    check("pull died: the target fails", wait_for(lambda: vms(B).get(n, {}).get("state") == "failed", 10), vms(B).get(n))
+    fault(A, "pages", 0)
+    check("pull died: the source never lets go, and runs its copy again",
+          wait_for(lambda: vms(A).get(n, {}).get("state") == "running", 60), where(n))
+    check("pull died: md5 intact on A", md5(A, n) == m)
+    kill(B, n)
+    cleanup(n)
+    n = "ft-home-died"
+    m = setup(n, mib=1500)
+    ip = vms(A)[n]["ip"]
+    ok(migrate(A, n, B))
+    wait_released(B, n)
+    stall = threading.Timer(0.2, lambda: fault(B, "pages", 6000))
+    stall.start()
+    ok(migrate(B, n, A))
+    stall.join()
+    pid = json.load(open(os.path.join(A.run, "vms", f"{n}.lock")))["pid"]
+    os.kill(pid, signal.SIGKILL)
+    fault(B, "pages", 0)
+    check("home died: the source runs its copy again", wait_for(lambda: vms(B).get(n, {}).get("state") == "running", 60), where(n))
+    check("home died: md5 intact on B", md5(B, n) == m)
+    check("home died: the address is still lent on its home host", addr(A, ip).get("lent") is not None, addr(A, ip))
+    r = run(A, "ft-home-x", ip=ip)
+    check("home died: and not handed out again", not r["ok"] and "lent" in r.get("error", ""), r)
+    cleanup(n)
+
+
 SCENARIOS = dict(
+    pull_died=pull_died,
     cow_grow=cow_grow, plug_race=plug_race, shrink_stall=shrink_stall, plug_storm=plug_storm,
     basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, refused=refused, pages_blip=pages_blip,
     pages_dead_restore=pages_dead_restore, pages_dead=pages_dead, resume_kill=resume_kill, prepared_retry=prepared_retry,

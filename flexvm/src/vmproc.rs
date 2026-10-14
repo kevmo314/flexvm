@@ -182,11 +182,7 @@ impl Proc {
 
     /// The host lock, if the generation is still current: hold it until the VM runs.
     pub fn still_current(&self, ip: Ipv4Addr) -> Result<crate::host::Locked> {
-        let (l, gen) = (self.host.lock()?, self.gen());
-        if !self.host.current(&l, ip, gen)? {
-            bail!("{ip}'s generation {gen} was withdrawn or given out again meanwhile; restore with --ip auto");
-        }
-        Ok(l)
+        self.host.fence(ip, self.gen()).map_err(|e| format!("{e}; restore with --ip auto").into())
     }
 
     pub fn gen(&self) -> u64 {
@@ -373,10 +369,12 @@ impl Proc {
         if learn {
             crate::standby::save_load_set(&self.host, &tpl);
         }
+        let still = self.host.fence(ip, self.gen()).inspect_err(|_| vm.kill())?;
         if let Err(e) = vm.start(fault("resume_kill")) {
             vm.kill();
             bail!("resuming the restored vm failed (it may have run, so it is not loaded again): {e}");
         }
+        drop(still);
         t.mark("resume");
         self.set_vm(vm);
         let mut v = self.start_guest(&mut t)?;

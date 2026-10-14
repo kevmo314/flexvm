@@ -269,7 +269,7 @@ fn notify_fd() -> Option<std::fs::File> {
 }
 
 /// A foreground `run` that claimed a standby VM: forwards signals, exits with its status.
-fn follow(conn: std::os::unix::net::UnixStream, id: host::Ident) -> Result<()> {
+fn follow(mut conn: BufReader<std::os::unix::net::UnixStream>, id: host::Ident) -> Result<()> {
     let set = util::block_signals(&[libc::SIGTERM, libc::SIGINT, libc::SIGTSTP, libc::SIGCONT, libc::SIGHUP]);
     let vm = host::PidFd::open(&id)?.ok_or("the vm process is gone")?;
     std::thread::spawn(move || loop {
@@ -278,7 +278,7 @@ fn follow(conn: std::os::unix::net::UnixStream, id: host::Ident) -> Result<()> {
             sig => drop(vm.signal(sig)),
         }
     });
-    let reply = recv_json(&mut BufReader::new(conn)).ok().flatten();
+    let reply = recv_json(&mut conn).ok().flatten();
     std::process::exit(reply.and_then(|r| r["exit"].as_i64()).unwrap_or(1) as i32)
 }
 

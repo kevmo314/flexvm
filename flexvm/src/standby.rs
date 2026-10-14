@@ -235,10 +235,12 @@ fn claim(p: &Arc<Proc>, req: &Value) -> std::result::Result<Value, (Error, bool)
     let lock = host.take_name(name, false).map_err(|e| (e, false))?;
     let claim = host.lock().and_then(|l| host.claim_new(&l, name, want)).map_err(|e| (e, false))?;
     t.mark("claim_ip");
+    let still = host.fence(claim.ip, claim.gen).map_err(|e| (e, false))?;
     let paused = p.standby.lock().unwrap().take().ok_or_else(|| ("standby vm gone".into(), true))?;
     let vm = resume(paused, name, claim.ip, fault("resume_kill"), &mut t).map_err(|(e, ran)| {
         (format!("resuming a standby vm failed{}: {e}", if ran { ", and it may have run" } else { "" }).into(), !ran)
     })?;
+    drop(still);
     p.set_name(lock);
     p.set_addr(claim);
     p.set_vm(vm);
@@ -249,7 +251,7 @@ fn claim(p: &Arc<Proc>, req: &Value) -> std::result::Result<Value, (Error, bool)
 
 /// `run`'s side. Once a standby said `claiming` it may have started the VM:
 /// no answer is then an error, never a reason to start it again.
-pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]) -> Result<Option<(Value, UnixStream)>> {
+pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]) -> Result<Option<(Value, BufReader<UnixStream>)>> {
     let Ok(key) = key(paths, template) else { return Ok(None) };
     let mut socks: Vec<PathBuf> = std::fs::read_dir(dir(host, template))
         .into_iter()
@@ -267,8 +269,9 @@ pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]
             let _ = std::fs::remove_file(&sock);
             continue;
         };
-        let mut r = BufReader::new(&c);
-        let taken = crate::util::send_with_fds(&c, &line, fds).ok().and_then(|()| crate::util::recv_json(&mut r).ok().flatten());
+        // Kept for the caller: it may have buffered the exit frame already.
+        let mut r = BufReader::new(c);
+        let taken = crate::util::send_with_fds(r.get_ref(), &line, fds).ok().and_then(|()| crate::util::recv_json(&mut r).ok().flatten());
         if taken.is_none_or(|t| t["claiming"] != json!(true)) {
             continue;
         }
@@ -281,7 +284,7 @@ pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]
             }
         };
         if reply["ok"] == json!(true) {
-            return Ok(Some((reply["result"].clone(), c)));
+            return Ok(Some((reply["result"].clone(), r)));
         }
         if reply["retry"] != json!(true) {
             bail!("{}", reply["error"].as_str().unwrap_or("claim failed"));

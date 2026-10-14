@@ -411,13 +411,20 @@ impl Proc {
             let vm = p.vm().clone();
             vm.restore_devices();
             let start = Instant::now();
-            vm.pager.wait_pulled(None);
+            let pulled = vm.pager.wait_pulled(None);
             eprintln!("vm {}: pull from {source} ended after {} ms", vm.name, ms(start.elapsed()));
-            let arrived = p.arrived.lock().unwrap().take();
-            match (vm.pager.failed(), arrived) {
-                (None, Some(rec)) => rec.release(),
-                (_, rec) => *p.arrived.lock().unwrap() = rec,
+            // Under `op`, as `finish` is: either the VM ends first (the source's
+            // copy runs again), or the record stays here until Released is durable.
+            let _op = p.op();
+            // A stopped pager (its Firecracker died) wakes this without a failure.
+            if !pulled || vm.pager.remote_left() > 0 || vm.pager.failed().is_some() || !vm.firecracker_alive() {
+                return;
             }
+            let mut arrived = p.arrived.lock().unwrap();
+            if let Some(rec) = arrived.as_ref() {
+                rec.release(Some((vm.ip, p.gen())));
+            }
+            *arrived = None;
         });
         Ok(())
     }
@@ -499,7 +506,9 @@ impl Proc {
                 if Instant::now() >= deadline {
                     bail!("the migration ran past its deadline");
                 }
-                self.host.commit_incoming(&l, ip, self.gen())?;
+                if !self.host.current(&l, ip, self.gen())? {
+                    bail!("generation {} of {ip} was withdrawn or superseded meanwhile", self.gen());
+                }
                 self.arrived.lock().unwrap().as_mut().ok_or("no migration record")?.commit(&l)?;
                 Ok(l)
             }),
