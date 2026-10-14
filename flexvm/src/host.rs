@@ -586,16 +586,19 @@ impl Host {
         }
         let g = load::<Gens>(&path)?.unwrap_or(Gens { next: 1, reserved: 0, boot: String::new() });
         let next = if g.boot == boot_id() { g.next } else { g.next.max(g.reserved) };
-        let gen = next.max(seen + 1);
-        let (reserved, durable) = if gen >= g.reserved { (gen + GEN_BLOCK, true) } else { (g.reserved, false) };
-        store(&path, &Gens { next: gen + 1, reserved, boot: boot_id().into() }, durable)?;
+        let gen = next.max(seen.checked_add(1).ok_or("generations exhausted")?);
+        let next = gen.checked_add(1).filter(|&n| n <= GEN_MAX).ok_or("generations exhausted")?;
+        let (reserved, durable) = if gen >= g.reserved { (gen.checked_add(GEN_BLOCK).ok_or("generations exhausted")?, true) } else { (g.reserved, false) };
+        if reserved > GEN_MAX {
+            bail!("generations exhausted");
+        }
+        store(&path, &Gens { next, reserved, boot: boot_id().into() }, durable)?;
         Ok(gen)
     }
 
     pub fn claim_incoming(&self, l: &Locked, holder: &str, ip: Ipv4Addr, gen: u64) -> Result<AddrClaim> {
         let mut a = self.addr(l, ip)?;
-        // Bounded, so `next_gen` cannot overflow on a peer's value.
-        if gen == 0 || gen > u64::MAX / 2 {
+        if gen == 0 || gen > GEN_MAX {
             bail!("{ip}: an arrival must carry its address's generation (not {gen})");
         }
         if self.held(&a) && a.holder.as_deref() != Some(holder) {
@@ -652,7 +655,7 @@ impl Host {
     /// withdrawn generation). A withdrawal frees a loan of that gen or older.
     pub fn observe(&self, l: &Locked, ip: Ipv4Addr, gen: u64, via: Option<Ipv4Addr>) -> Result<bool> {
         self.update(l, ip, true, |a| {
-            if gen < a.seen || gen > u64::MAX / 2 || (gen == a.seen && a.withdrawn && via.is_some()) {
+            if gen == 0 || gen > GEN_MAX || gen < a.seen || (gen == a.seen && a.withdrawn && via.is_some()) {
                 return false;
             }
             (a.seen, a.withdrawn, a.via) = (gen, via.is_none(), via);
@@ -902,6 +905,7 @@ fn boottime_ms() -> u64 {
     t.tv_sec as u64 * 1000 + t.tv_nsec as u64 / 1_000_000
 }
 const ALLOC_HINT: &str = ".next";
+const GEN_MAX: u64 = u64::MAX / 2;
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Addr {
@@ -2089,14 +2093,34 @@ mod tests {
         let h = host("gen-bound");
         let l = h.lock().unwrap();
         let addr = ip("10.9.0.1");
-        for gen in [u64::MAX / 2 + 1, u64::MAX] {
+        for gen in [0, GEN_MAX + 1, u64::MAX] {
             assert!(h.claim_incoming(&l, "incoming", addr, gen).is_err());
             assert!(!h.observe(&l, addr, gen, Some(ip("10.1.0.2"))).unwrap());
             assert!(!h.observe(&l, addr, gen, None).unwrap());
             assert_eq!(h.addr(&l, addr).unwrap(), Addr::default());
         }
-        assert!(h.observe(&l, addr, u64::MAX / 2, None).unwrap());
-        assert_eq!(h.lend_new(&l, addr).unwrap(), u64::MAX / 2 + 1);
+    }
+
+    #[test]
+    fn near_bound_peer_generations_do_not_poison_allocation() {
+        let h = host("gen-exhausted");
+        let l = h.lock().unwrap();
+        let addr = ip("10.9.0.1");
+        let path = h.state.join("addrs/.gens");
+        h.lend_new(&l, ip("10.9.0.2")).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        for gen in [GEN_MAX - 1024, GEN_MAX - 1, GEN_MAX] {
+            h.claim_incoming(&l, "incoming", addr, gen).unwrap().keep();
+            h.release(&l, addr, "incoming").unwrap();
+            assert!(h.observe(&l, addr, gen, None).unwrap());
+            assert!(h.lend_new(&l, addr).unwrap_err().to_string().contains("generations exhausted"));
+            assert!(h.claim_new(&l, "new", Some(addr)).err().unwrap().to_string().contains("generations exhausted"));
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert_eq!(h.addr(&l, addr).unwrap().seen, gen);
+        }
+        let gen = h.lend_new(&l, ip("10.9.0.3")).unwrap();
+        assert!(gen <= GEN_MAX);
+        assert!(h.observe(&l, ip("10.9.0.3"), gen, None).unwrap());
     }
 
     #[test]
