@@ -208,8 +208,11 @@ pub struct Pager {
     pull_finished: OnceLock<Instant>,
     /// Signalled when Firecracker connects, the pull finishes or the pager stops.
     done: (Mutex<()>, Condvar),
-    /// Set by the checkpoint barrier: no new prefetch.
+    /// Set by the checkpoint barrier: no new prefetch, and the collapse pass ends; cleared if a migration aborts
+    /// (`unquiesce`).
     quiesce: AtomicBool,
+    /// The working-set prefetch ended for `quiesce` before it was done.
+    prefetch_cut: AtomicBool,
     /// The page after the last template fault: only sequential template reads copy `FAULT_AROUND` pages, avoiding
     /// sixteenfold amplification for strided reads of guest page structs.
     template_next: AtomicUsize,
@@ -252,10 +255,9 @@ pub struct Pager {
     steer: Mutex<(usize, usize)>,
     /// What the pass collapsing paged-in memory into huge pages did, once done (see `collapse`).
     collapse_report: Mutex<Option<collapse::CollapseReport>>,
-    /// Set while the VM is (about to be) paused: no collapse starts (see `hold_collapse`).
-    collapse_held: AtomicBool,
-    /// Held across each collapse call, so `hold_collapse` can wait one out.
-    collapse_gate: Mutex<()>,
+    /// Held across each collapse call, so `hold_collapse` can wait one out; signalled when the hold is lifted or the
+    /// pager stops.
+    collapse_gate: (Mutex<collapse::Gate>, Condvar),
 }
 
 impl Pager {
@@ -284,6 +286,7 @@ impl Pager {
             pull_finished: OnceLock::new(),
             done: (Mutex::new(()), Condvar::new()),
             quiesce: AtomicBool::new(false),
+            prefetch_cut: AtomicBool::new(false),
             template_next: AtomicUsize::new(usize::MAX),
             prefetching: AtomicU8::new(0),
             failed: OnceLock::new(),
@@ -306,8 +309,7 @@ impl Pager {
             lanes: Default::default(),
             steer: Mutex::new((0, 0)),
             collapse_report: Mutex::new(None),
-            collapse_held: AtomicBool::new(false),
-            collapse_gate: Mutex::new(()),
+            collapse_gate: Default::default(),
         });
         let p = pager.clone();
         let thread = thread::Builder::new().name("uffd".into()).spawn(move || {
@@ -464,9 +466,23 @@ impl Pager {
     /// Copies the template's recorded working set in up front, while the vCPUs are still being restored, instead of one
     /// fault at a time.
     fn prefetch(&self) {
+        while self.prefetch_pass() {
+            self.prefetching.store(RUNNING, Ordering::SeqCst);
+        }
+        self.notify();
+    }
+
+    /// One prefetch pass; true if it was cut short by `quiesce` but an abort has cleared that meanwhile and left it to
+    /// this to go on (`unquiesce` takes `prefetch_cut` only once it is published).
+    fn prefetch_pass(&self) -> bool {
         let pages = self.pages();
+        let mut cut = false;
         for (mut i, end) in self.chunks(self.working_set(0, 1), PREFETCH_RUN) {
-            while i < end && !self.quiesce.load(Ordering::SeqCst) {
+            while i < end {
+                if self.quiesce.load(Ordering::SeqCst) {
+                    cut = true;
+                    break;
+                }
                 // Holes were zero at snapshot time (mostly free memory the guest allocates again); map them too, or
                 // each one costs a fault.
                 let data = self.base.has_data(i);
@@ -478,8 +494,12 @@ impl Pager {
                 i += n.max(1);
             }
         }
+        // Done (for now) first, so a prefetch `unquiesce` starts again is not counted as done.
         self.prefetching.store(0, Ordering::SeqCst);
-        self.notify();
+        let cut = cut && !self.stop.load(Ordering::SeqCst);
+        self.prefetch_cut.store(cut, Ordering::SeqCst);
+        // Whichever of this and `unquiesce` takes the cut back goes on.
+        cut && !self.quiesce.load(Ordering::SeqCst) && self.prefetch_cut.swap(false, Ordering::SeqCst)
     }
 
     /// Runs of pages populated so far, as `(first_page, count)`.
@@ -654,8 +674,26 @@ impl Pager {
         // Also ends a prefetch still running (e.g. for a drained hot pool's VM).
         self.quiesce.store(true, Ordering::SeqCst);
         self.notify();
+        self.wake_collapse();
         let _initial = self.initial.lock().unwrap();
         self.seeded.notify_all();
+    }
+
+    /// A migration aborted and the VM runs here again: undoes `quiesce_export`, starting again the working-set prefetch
+    /// and the collapse pass if it cut them short.
+    pub fn unquiesce(self: &Arc<Self>) {
+        if self.stop.load(Ordering::SeqCst) || !self.quiesce.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        if self.prefetch_cut.swap(false, Ordering::SeqCst) {
+            self.prefetching.store(RUNNING, Ordering::SeqCst);
+            let p = self.clone();
+            thread::spawn(move || p.prefetch());
+        }
+        if self.collapse_quiesced() {
+            let p = self.clone();
+            thread::spawn(move || p.collapse());
+        }
     }
 
     /// Gives up on the VM's memory: unless it was stopped on purpose, records why and kills Firecracker, whose vCPUs
@@ -807,6 +845,8 @@ impl Pager {
     /// ZERO stays ZERO and BASE is implied.
     pub fn quiesce_export(&self) -> Result<Runs> {
         self.quiesce.store(true, Ordering::SeqCst);
+        // A pass held asleep (the VM paused) sees it now, not at the next resume.
+        self.wake_collapse();
         drop(self.pages().removing());
         let start = Instant::now();
         let mut runs: Runs = Vec::new();

@@ -244,6 +244,8 @@ impl Proc {
             let (stats, res) = release_into(h, vm.ip, mig, vm, Duration::ZERO, |()| crate::net::attach(vm.ip, &vm.tap));
             stats.is_some() && res.is_ok()
         });
+        // It runs here again: so do the collapse pass and prefetch the save cut short.
+        vm.pager.unquiesce();
         let (s, e) = match vm.resume(attached) {
             Ok(s) => (s, e),
             Err(r) => (State::Failed, format!("{e}; resuming it here failed too: {r}").into()),

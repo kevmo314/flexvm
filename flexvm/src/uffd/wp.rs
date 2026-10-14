@@ -208,6 +208,9 @@ impl Pager {
             return Ok(Duration::ZERO);
         }
         if !self.registered_wp.load(Ordering::SeqCst) {
+            // No collapse in flight while memory becomes write-protectable, and none after: the pass looks at
+            // `registered_wp` under this gate before each call.
+            let _collapse = self.collapse_barrier();
             for m in self.mappings() {
                 // struct uffdio_register: range, mode, ioctls (out).
                 let mut r = [m.base_host_virt_addr, m.size as u64, UFFDIO_REGISTER_MODE_MISSING | UFFDIO_REGISTER_MODE_WP, 0];
