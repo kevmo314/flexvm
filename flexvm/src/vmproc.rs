@@ -248,12 +248,15 @@ impl Proc {
             vm.kill();
         }
         drop(self.standby.lock().unwrap().take());
+        // An arrival still pulling that dies leaves its source's copy to run
+        // again (see `Host::mig_status`): its address is not withdrawn.
+        let source_runs = matches!(end, End::Died) && self.arrived.lock().unwrap().is_some();
         if let Some(rec) = self.arrived.lock().unwrap().take() {
             rec.settle(matches!(end, End::Gone));
         }
         match (end, self.addr.lock().unwrap().take()) {
             (End::Suspended, Some(a)) => a.keep(),
-            (End::Gone | End::Died, Some(a)) => self.withdraw(a),
+            (End::Gone | End::Died, Some(a)) if !source_runs => self.withdraw(a),
             (End::NotStarted, Some(a)) if a.fresh => self.withdraw(a),
             (End::Moved(to), _) => {
                 let _ = std::fs::write(self.host.vms(&self.name(), "moved"), &to);

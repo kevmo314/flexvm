@@ -154,7 +154,8 @@ def vms(host):
 
 
 def where(name):
-    return {h: v[name]["state"] for h in (A, B) for v in [vms(h)] if name in v}
+    """Where `name` is, and in what state (not counting records of VMs that died)."""
+    return {h: v[name]["state"] for h in (A, B) for v in [vms(h)] if name in v and v[name].get("pid")}
 
 
 def alive(pid):
@@ -448,34 +449,37 @@ def pages_dead_restore():
 
 
 def pages_dead():
+    """The source's page server stays down mid-pull: the target's VM dies
+    without its memory, and the source, never released, runs its copy again."""
     n = "ft-pages-dead"
-    setup(n, mib=1500)
+    m = setup(n, mib=1500)
     ok(migrate(A, n, B))
     fault(A, "pages", 30000)
-    st = wait_released(B, n)
+    check("pages dead: the target's vm died", wait_for(lambda: vms(B).get(n, {}).get("state") == "failed" and not vms(B)[n].get("pid"), 60), vms(B).get(n))
     fault(A, "pages", 0)
-    check("pages dead: target failed cleanly, its process gone", st["state"] == "gone" and n not in vms(B), (st, vms(B).get(n)))
-    check("pages dead: source copy released", st["released"] is True, st)
-    check("pages dead: running nowhere", where(n) == {}, where(n))
-    check("pages dead: the target said why", "lost its memory" in log(B, n) or "gone (" in log(B, n), log(B, n)[-300:])
+    check("pages dead: the target said why", "died: background pull" in log(B, n), log(B, n)[-300:])
+    check("pages dead: the source runs its copy again", wait_for(lambda: where(n) == {A: "running"}, 60), where(n))
+    check("pages dead: md5 intact on A", md5(A, n) == m)
+    cleanup(n)
 
 
 def resume_kill():
     """Firecracker dies right after a restored VM's resume was sent, so the
-    guest may have run: nothing loads the VM again (that could repeat what
-    the guest did). A migration target has committed before it resumes, so
-    the VM is lost there and the source never resumes its copy; a run that
-    claims a standby VM fails without a fallback load."""
+    guest may have run: nothing loads the VM again there (that could repeat
+    what the guest did). A migration target dies before it has its memory,
+    so its source, never released, runs its copy (from the pause) again; a
+    run that claims a standby VM fails without a fallback load."""
     n = "ft-resume-kill"
-    setup(n)
+    m = setup(n)
     clear_log(B, n)
     fault(B, "resume_kill", 60000)
     r = migrate(A, n, B)
     fault(B, "resume_kill", 0)
     check("resume kill: migration committed", r["ok"], r)
-    st = wait_released(B, n)
+    check("resume kill: the source runs its copy again", wait_for(lambda: where(n) == {A: "running"}, 60), where(n))
     check("resume kill: target loaded the vm once, no retry", "once more" not in log(B, n), log(B, n)[-300:])
-    check("resume kill: running nowhere", where(n) == {}, (where(n), st))
+    check("resume kill: md5 intact on A", md5(A, n) == m)
+    cleanup(n)
     n = "ft-resume-kill-hot"
     ok(cli_json(A, "standby", "--template", args.template, "1"))
     fault(A, "resume_kill", 60000)
@@ -576,11 +580,9 @@ def source_killed():
     ok(migrate(A, n, B))
     os.kill(pid, signal.SIGKILL)
     check("source killed: its firecracker died with it", wait_for(lambda: not alive(src_fc), 5), src_fc)
-    st = wait_released(B, n)
-    wait_for(lambda: n not in vms(B), 30)
-    st["state"] = vms(B).get(n, {}).get("state", "gone")
-    check("source killed: target failed cleanly", st["state"] == "gone" and n not in vms(B), st)
+    check("source killed: target failed cleanly", wait_for(lambda: B not in where(n), 60), where(n))
     check("source killed: running nowhere", where(n) == {}, where(n))
+    kill(B, n)
 
 
 def target_killed():
@@ -1212,7 +1214,7 @@ def checkpoint_corrupt():
     reset()
     poke("pages", 50 * 1024 * 1024)
     r = restore(B, path, ip="auto")
-    check("corrupt page data: VM fails, never runs on", (not r["ok"]) or wait_for(lambda: n not in vms(B), 30), (r, vms(B).get(n)))
+    check("corrupt page data: VM fails, never runs on", (not r["ok"]) or wait_for(lambda: B not in where(n), 30), (r, vms(B).get(n)))
     kill(B, n)
     rm_ckpt(path)
     rm_ckpt(pristine)
