@@ -1645,7 +1645,15 @@ mod tests {
         host.cfg.reserve_mib = 1024;
         host.cfg.peers = vec!["127.0.0.1:1".into()];
         // A standby of template t: its lock held, naming a live process.
-        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        // A shell runs a background job with SIGINT ignored, and the child would inherit that: the standby must not.
+        let mut child = std::process::Command::new("sleep");
+        unsafe {
+            std::os::unix::process::CommandExt::pre_exec(&mut child, || {
+                libc::signal(libc::SIGINT, libc::SIG_DFL);
+                Ok(())
+            });
+        }
+        let mut child = child.arg("30").spawn().unwrap();
         let d = host.run.join("standby").join("t");
         std::fs::create_dir_all(&d).unwrap();
         let lock = std::fs::File::create(d.join(format!("{}.lock", child.id()))).unwrap();
@@ -1660,7 +1668,12 @@ mod tests {
         }
         relieve(&host, Some(0), false);
         use std::os::unix::process::ExitStatusExt;
-        assert!(pressure.exists() && child.wait().unwrap().signal() == Some(libc::SIGINT));
+        let stopped = crate::util::retry(Duration::from_secs(10), || Ok(child.try_wait()?.ok_or("running")?));
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(pressure.exists() && stopped.unwrap().signal() == Some(libc::SIGINT));
+        // Unlocked, not only closed: a child another test forks meanwhile shares the lock until it execs.
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
         drop(lock);
         relieve(&host, Some(0), false);
         assert!(active.exists(), "with no standby left, eviction starts");
