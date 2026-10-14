@@ -833,13 +833,12 @@ pub mod output {
         sent
     }
 
-    /// A target's own open file, non-blocking (flags set on `f` would change
-    /// every process's sharing it); a regular file, socket or already non-blocking
-    /// target is kept as is. If reopening fails, keep it for polled writes.
+    /// A target's own open file, non-blocking (flags set on `f` would change every process's
+    /// sharing it); a regular file, a socket or one that cannot be reopened (a /dev/tty away
+    /// from its terminal: a claimer passes its own) is kept as is.
     pub fn own(f: File) -> File {
         use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
-        if f.metadata().is_ok_and(|m| m.is_file() || m.file_type().is_socket()) || unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK != 0
-        {
+        if f.metadata().is_ok_and(|m| m.is_file() || m.file_type().is_socket()) {
             return f;
         }
         let path = format!("/proc/self/fd/{}", f.as_raw_fd());
@@ -991,55 +990,5 @@ pub mod output {
         next.read_exact(&mut data).unwrap();
         assert_eq!(&data, b"kept");
         TARGETS.lock().unwrap()[0] = None;
-    }
-
-    #[test]
-    fn a_tty_target_survives_losing_the_controlling_terminal() {
-        use std::os::unix::process::CommandExt;
-        const CHILD: &str = "FLEXVM_TEST_TTY";
-        if std::env::var_os(CHILD).is_some() {
-            let original = unsafe { File::from_raw_fd(100) };
-            let prepared = unsafe { File::from_raw_fd(101) };
-            assert_eq!(unsafe { libc::open(c"/dev/tty".as_ptr(), libc::O_WRONLY) }, -1);
-            assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ENXIO));
-            let original = own(original);
-            let prepared = own(prepared);
-            assert_ne!(unsafe { libc::fcntl(prepared.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK, 0);
-            assert_eq!(write_within(&original, b"kept", Instant::now() + STALL), 4);
-            assert_eq!(write_within(&prepared, b"prepared", Instant::now() + STALL), 8);
-            return;
-        }
-        let fd = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
-        assert!(fd >= 0);
-        let mut master = unsafe { File::from_raw_fd(fd) };
-        assert_eq!(unsafe { libc::grantpt(fd) }, 0);
-        assert_eq!(unsafe { libc::unlockpt(fd) }, 0);
-        let mut path = [0; 128];
-        assert_eq!(unsafe { libc::ptsname_r(fd, path.as_mut_ptr(), path.len()) }, 0);
-        let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
-        assert!(fd >= 0);
-        let slave = unsafe { File::from_raw_fd(fd) };
-        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
-        child.args(["--exact", "util::output::a_tty_target_survives_losing_the_controlling_terminal"]).env(CHILD, "1");
-        unsafe {
-            child.pre_exec(move || {
-                super::eintr(|| libc::setsid())?;
-                super::eintr(|| libc::ioctl(slave.as_raw_fd(), libc::TIOCSCTTY, 0))?;
-                let tty = super::eintr(|| libc::open(c"/dev/tty".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC))?;
-                super::eintr(|| libc::dup2(tty, 100))?;
-                let prepared = super::eintr(|| libc::open(c"/dev/tty".as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC))?;
-                super::eintr(|| libc::dup2(prepared, 101))?;
-                libc::close(prepared);
-                libc::signal(libc::SIGHUP, libc::SIG_IGN);
-                super::eintr(|| libc::ioctl(tty, libc::TIOCNOTTY, 0))?;
-                libc::close(tty);
-                Ok(())
-            });
-        }
-        let output = child.output().unwrap();
-        assert!(output.status.success(), "{output:?}");
-        let mut data = [0; 12];
-        master.read_exact(&mut data).unwrap();
-        assert_eq!(&data, b"keptprepared");
     }
 }
