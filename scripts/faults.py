@@ -4622,9 +4622,10 @@ def arrival_log():
 
 
 def template_tap():
-    """A template build SIGKILLed after making its tap (PREFIX x PID): the
-    tap outlives it until a sweep finds the pid gone. A build tap whose pid
-    lives is kept."""
+    """A template build SIGKILLed after making its tap (PREFIX x PID): a sweep
+    removes the tap once the pid is gone (any process's periodic sweep may be
+    first, so it is not looked for in between). A build tap whose pid lives
+    is kept."""
     name = f"ft-tpltap-{os.getpid()}"
     tdir = os.environ.get("FLEXVM_TEMPLATES") or os.path.join(os.path.abspath(args.artifacts), "templates")
     try:
@@ -4638,7 +4639,6 @@ def template_tap():
     p.kill()
     p.wait()
     check("template tap: made by the build", up, tap)
-    check("template tap: left by the killed build", os.path.exists(f"/sys/class/net/{tap}"))
     live = f"{prefix}x{os.getpid():x}"
     subprocess.run(["ip", "tuntap", "add", "dev", live, "mode", "tap"], check=True)
     try:
