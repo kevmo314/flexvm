@@ -700,7 +700,10 @@ impl Proc {
 
     fn control(self: &Arc<Self>, c: UnixStream) {
         let _ = c.set_read_timeout(Some(Duration::from_secs(10)));
-        let Ok((line, fds)) = crate::util::recv_with_fds(&c, 1 << 20) else { return };
+        let (line, fds) = match crate::util::recv_with_fds(&c, 1 << 20) {
+            Ok(got) => got,
+            Err(e) => return drop(send_json(&mut &c, &json!({"ok": false, "error": format!("bad request: {e}")}))),
+        };
         let _ = c.set_read_timeout(None);
         let Ok(req) = serde_json::from_slice::<Value>(&line) else { return };
         let reply = match req["op"].as_str().unwrap_or("") {
