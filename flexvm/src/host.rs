@@ -102,6 +102,17 @@ pub fn load<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
     }
 }
 
+/// Who a name lock says holds it: None for an empty lock (created, never
+/// written: no VM started under it); unreadable or corrupt is an error.
+fn lock_holder(path: &Path) -> Result<Option<Ident>> {
+    match std::fs::read(path) {
+        Ok(b) if b.is_empty() => Ok(None),
+        Ok(b) => Ok(Some(serde_json::from_slice(&b).map_err(|e| format!("{}: {e}", path.display()))?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => bail!("{}: {e}", path.display()),
+    }
+}
+
 pub fn store<T: Serialize>(path: &Path, v: &T, durable: bool) -> Result<()> {
     let (dir, name) = (path.parent().ok_or("no directory")?, path.file_name().ok_or("no name")?);
     write_file(dir, &name.to_string_lossy(), &serde_json::to_vec(v)?, durable).map_err(|e| format!("{}: {e}", path.display()).into())
@@ -219,7 +230,9 @@ impl Host {
             bail!("vm {name:?} exists (suspended); resume or kill it");
         }
         let f = lock_path(&self.vms(name, "lock"), libc::LOCK_EX | libc::LOCK_NB).map_err(|_| format!("vm name {name:?} is taken"))?;
-        if let Some(old) = self.holder_of(name).filter(|o| !o.alive()) {
+        // Locked, so its holder no longer runs it; its Firecrackers are reaped on
+        // proof of death only, and an unreadable lock is an error, never no holder.
+        if let Some(old) = lock_holder(&self.vms(name, "lock"))?.filter(|o| *o != Ident::me()) {
             reap(&self.run, &old)?;
         }
         if self.suspended(name).exists() && !self.is_suspended(name) {
@@ -244,9 +257,33 @@ impl Host {
         load(&self.vms(name, "lock")).ok().flatten()
     }
 
+    /// Whether `name`'s lock is held: None when that cannot be told (the
+    /// file cannot be opened, or the probe fails other than by contention).
+    fn name_locked(&self, name: &str) -> Option<bool> {
+        let f = match File::open(self.vms(name, "lock")) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(false),
+            Err(_) => return None,
+        };
+        match flock(&f, libc::LOCK_SH | libc::LOCK_NB) {
+            Ok(()) => Some(false),
+            Err(e) if e.raw_os_error() == Some(libc::EWOULDBLOCK) => Some(true),
+            Err(_) => None,
+        }
+    }
+
+    /// Whether `id` holds `name` now: None when that cannot be told (the lock
+    /// or its record unreadable, or held but not yet written).
+    fn held_by(&self, name: &str, id: &Ident) -> Option<bool> {
+        if !self.name_locked(name)? {
+            return Some(false);
+        }
+        lock_holder(&self.vms(name, "lock")).ok()?.map(|h| h == *id)
+    }
+
     /// Also requires the last holder's Firecrackers to have exited.
     fn gone(&self, name: &str) -> bool {
-        !self.alive(name) && self.holder_of(name).is_none_or(|id| !id.alive() && reap(&self.run, &id).is_ok())
+        self.name_locked(name) == Some(false) && lock_holder(&self.vms(name, "lock")).is_ok_and(|id| id.is_none_or(|id| reap(&self.run, &id).is_ok()))
     }
 
     pub fn entries(&self) -> Vec<Entry> {
@@ -299,8 +336,31 @@ impl Host {
         Ok(out)
     }
 
+    /// Held by the VM instance that claimed it: while that process holds the
+    /// name, until its Firecrackers are reaped once it is dead, or while it is
+    /// suspended here with this generation. Another instance of the same name
+    /// (a restart after a SIGKILL) does not hold it.
     fn held(&self, a: &Addr) -> bool {
-        a.holder.as_deref().is_some_and(|h| !self.gone(h) || self.is_suspended(h))
+        let Some(h) = a.holder.as_deref() else { return false };
+        let instance = match &a.holder_id {
+            // Written before instances were recorded.
+            None => !self.gone(h),
+            Some(id) => match id.liveness() {
+                // What cannot be read about its name keeps it held.
+                Liveness::Alive => self.held_by(h, id).unwrap_or(true),
+                // Until its Firecrackers are reaped.
+                Liveness::Gone => reap(&self.run, id).is_err(),
+                Liveness::Unknown => true,
+            },
+        };
+        instance || self.suspended_with(h, a.held)
+    }
+
+    /// A suspended VM `name` with generation `gen` (or one whose generation was
+    /// never recorded: quarantined, it keeps what it held).
+    fn suspended_with(&self, name: &str, gen: u64) -> bool {
+        let recorded = || std::fs::read_to_string(self.suspended(name).join("GEN")).ok().and_then(|g| g.trim().parse::<u64>().ok());
+        self.is_suspended(name) && recorded().is_none_or(|g| g == gen)
     }
 
     pub fn claim_new(&self, l: &Locked, holder: &str, want: Option<Ipv4Addr>) -> Result<AddrClaim> {
@@ -313,12 +373,25 @@ impl Host {
             Some(ip) if self.addr(l, ip)?.lent.is_some() => bail!("{ip} is lent out, with a vm that migrated away"),
             Some(ip) if taken(ip) => bail!("{ip} is in use"),
             Some(ip) => ip,
-            None => range.allocate(taken).ok_or("no free addresses left")?,
+            None => {
+                // From where the last allocation stopped, wrapping around: not a
+                // rescan of every resident VM's address per start.
+                let hint = std::fs::read_to_string(self.alloc_hint()).ok().and_then(|s| s.trim().parse().ok());
+                let ip = range.allocate(hint, taken).ok_or("no free addresses left")?;
+                let _ = write_file(&self.state.join("addrs"), ALLOC_HINT, range.after(ip).to_string().as_bytes(), false);
+                ip
+            }
         };
         let a = self.addr(l, ip)?;
         let gen = self.next_gen(a.seen)?;
-        self.put_addr(ip, &Addr { seen: gen, holder: Some(holder.into()), held: gen, lent: a.lent, ..Addr::default() }, false)?;
-        Ok(AddrClaim { host: self.clone(), ip, gen, holder: holder.into(), kept: false, fresh: true })
+        let me = Ident::me();
+        self.put_addr(ip, &Addr { seen: gen, holder: Some(holder.into()), holder_id: Some(me.clone()), held: gen, lent: a.lent, ..Addr::default() }, false)?;
+        Ok(AddrClaim { host: self.clone(), ip, gen, holder: holder.into(), id: me, kept: false, fresh: true })
+    }
+
+    /// Where the next automatic allocation starts looking: a hint, never a claim.
+    fn alloc_hint(&self) -> PathBuf {
+        self.state.join("addrs").join(ALLOC_HINT)
     }
 
     pub fn lend_new(&self, l: &Locked, ip: Ipv4Addr) -> Result<u64> {
@@ -348,6 +421,9 @@ impl Host {
             boot: String,
         }
         let path = self.state.join("addrs").join(".gens");
+        if boot_id().is_empty() {
+            bail!("cannot read the boot id: generations would not be ordered across a reboot");
+        }
         let g = load::<Gens>(&path)?.unwrap_or(Gens { next: 1, reserved: 0, boot: String::new() });
         let next = if g.boot == boot_id() { g.next } else { g.next.max(g.reserved) };
         let gen = next.max(seen + 1);
@@ -373,9 +449,10 @@ impl Host {
         if gen > a.seen {
             (a.seen, a.withdrawn, a.via) = (gen, false, None);
         }
-        (a.holder, a.held) = (Some(holder.into()), gen);
+        let me = Ident::me();
+        (a.holder, a.holder_id, a.held) = (Some(holder.into()), Some(me.clone()), gen);
         self.put_addr(ip, &a, true)?;
-        Ok(AddrClaim { host: self.clone(), ip, gen, holder: holder.into(), kept: false, fresh: false })
+        Ok(AddrClaim { host: self.clone(), ip, gen, holder: holder.into(), id: me, kept: false, fresh: false })
     }
 
     /// The host lock, if `gen` of `ip` is still current: held from this
@@ -388,8 +465,20 @@ impl Host {
         Ok(l)
     }
 
+    /// Lets go of `holder`'s claim, whichever instance made it (a suspended
+    /// VM's: the process that suspended it is gone).
     pub fn release(&self, l: &Locked, ip: Ipv4Addr, holder: &str) -> Result<()> {
-        self.update(l, ip, false, |a| a.holder = a.holder.take().filter(|h| h != holder))
+        self.release_by(l, ip, holder, None)
+    }
+
+    /// With `id`, only that instance's claim: never a later one's of the same name.
+    fn release_by(&self, l: &Locked, ip: Ipv4Addr, holder: &str, id: Option<&Ident>) -> Result<()> {
+        self.update(l, ip, false, |a| {
+            let by = |h: &Ident| id.is_none_or(|id| id == h);
+            if a.holder.as_deref() == Some(holder) && a.holder_id.as_ref().is_none_or(by) {
+                (a.holder, a.holder_id) = (None, None);
+            }
+        })
     }
 
     /// True if this made the loan (only then may its maker undo it).
@@ -563,6 +652,7 @@ impl Host {
 }
 
 const GRANT_WINDOW: Duration = Duration::from_secs(10);
+const ALLOC_HINT: &str = ".next";
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Addr {
@@ -571,6 +661,9 @@ pub struct Addr {
     /// Gone with a VM of this generation: not handed out until withdrawn or back.
     pub lent: Option<u64>,
     pub holder: Option<String>,
+    /// The instance (process) of `holder` that claimed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder_id: Option<Ident>,
     pub held: u64,
     pub via: Option<Ipv4Addr>,
 }
@@ -587,6 +680,7 @@ pub struct AddrClaim {
     pub ip: Ipv4Addr,
     pub gen: u64,
     holder: String,
+    id: Ident,
     kept: bool,
     /// A generation made for this VM: withdrawn even if the VM never ran.
     pub fresh: bool,
@@ -599,14 +693,14 @@ impl AddrClaim {
 
     pub fn release(mut self, l: &Locked) -> Result<()> {
         self.kept = true;
-        self.host.release(l, self.ip, &self.holder)
+        self.host.release_by(l, self.ip, &self.holder, Some(&self.id))
     }
 }
 
 impl Drop for AddrClaim {
     fn drop(&mut self) {
         if let (false, Ok(l)) = (self.kept, self.host.lock()) {
-            let _ = self.host.release(&l, self.ip, &self.holder);
+            let _ = self.host.release_by(&l, self.ip, &self.holder, Some(&self.id));
         }
     }
 }
@@ -755,22 +849,53 @@ pub struct Ident {
 }
 
 impl Ident {
+    /// Panics without a boot id or `/proc/self/stat`: a process that cannot
+    /// name itself must not take a name, an address or a migration.
     pub fn me() -> Ident {
-        Ident::of(std::process::id()).expect("no /proc/self/stat")
+        Ident::of(std::process::id()).expect("cannot read this process's identity (/proc/self/stat, boot id)")
     }
 
+    /// None without a boot id: an identity without one would read as another boot's, i.e. gone.
     pub fn of(pid: u32) -> Option<Ident> {
-        Some(Ident { pid, start: starttime(pid)?, boot: boot_id().into() })
+        let boot = boot_id();
+        if boot.is_empty() {
+            return None;
+        }
+        Some(Ident { pid, start: starttime(pid)?, boot: boot.into() })
     }
 
+    /// Alive, gone on proof, or unknown (an unreadable `/proc`, say: never proof).
+    pub fn liveness(&self) -> Liveness {
+        liveness_by(self, boot_id(), |pid| std::fs::read_to_string(format!("/proc/{pid}/stat")))
+    }
+
+    /// Not proven gone: what may still be running is treated as running.
     pub fn alive(&self) -> bool {
-        self.boot == boot_id() && starttime(self.pid) == Some(self.start)
+        self.liveness() != Liveness::Gone
     }
 }
 
+/// The one account of whether a process is gone. Only `Gone` lets its name,
+/// address, migration record or work directory be reclaimed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Liveness {
+    Alive,
+    /// Proof: another boot, no such pid, a zombie, or another process with its pid.
+    Gone,
+    /// It cannot be told (a read error, unparsable data): treated as alive.
+    Unknown,
+}
+
+/// "" when it cannot be read; only a successful read is cached, so a later call retries.
 pub fn boot_id() -> &'static str {
     static BOOT: OnceLock<String> = OnceLock::new();
-    BOOT.get_or_init(|| std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap_or_default().trim().into())
+    if let Some(b) = BOOT.get() {
+        return b;
+    }
+    match std::fs::read_to_string("/proc/sys/kernel/random/boot_id").map(|s| s.trim().to_string()) {
+        Ok(b) if !b.is_empty() => BOOT.get_or_init(|| b),
+        _ => "",
+    }
 }
 
 pub struct PidFd(OwnedFd);
@@ -779,7 +904,11 @@ impl PidFd {
     pub fn open(id: &Ident) -> Result<Option<PidFd>> {
         match crate::util::pidfd_open(id.pid) {
             // Opened, then checked: if it is `id` now, the fd is `id`'s.
-            Ok(fd) => Ok(id.alive().then_some(PidFd(fd))),
+            Ok(fd) => match id.liveness() {
+                Liveness::Alive => Ok(Some(PidFd(fd))),
+                Liveness::Gone => Ok(None),
+                Liveness::Unknown => bail!("cannot tell whether process {} is still the one meant", id.pid),
+            },
             Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Ok(None),
             Err(e) => bail!("pidfd_open {}: {e}", id.pid),
         }
@@ -795,16 +924,23 @@ impl PidFd {
 }
 
 /// Kills and waits for a dead process's Firecrackers: they die with it, but not at once.
+/// Anything it cannot read is an error, never nothing to reap.
 pub fn reap(run: &Path, owner: &Ident) -> Result<()> {
-    if owner.alive() {
-        bail!("process {} is alive", owner.pid);
+    match owner.liveness() {
+        Liveness::Gone => {}
+        Liveness::Alive => bail!("process {} is alive", owner.pid),
+        Liveness::Unknown => bail!("cannot tell whether process {} is gone", owner.pid),
     }
     let dir = run.join("w").join(owner.pid.to_string());
-    if owner.boot != boot_id() || load::<Ident>(&dir.join("owner")).ok().flatten().as_ref() != Some(owner) {
+    if owner.boot != boot_id() || load::<Ident>(&dir.join("owner"))?.as_ref() != Some(owner) {
         return Ok(());
     }
-    for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-        let Some(fc) = load::<Ident>(&e.path().join("fc")).ok().flatten() else { continue };
+    for e in std::fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))? {
+        let e = e.map_err(|e| format!("{}: {e}", dir.display()))?;
+        if !e.file_type()?.is_dir() {
+            continue;
+        }
+        let Some(fc) = load::<Ident>(&e.path().join("fc"))? else { continue };
         if let Some(fd) = PidFd::open(&fc)? {
             fd.signal(libc::SIGKILL)?;
             if !fd.wait(Duration::from_secs(5)) {
@@ -816,7 +952,7 @@ pub fn reap(run: &Path, owner: &Ident) -> Result<()> {
 }
 
 pub fn collect_garbage(run: &Path, prefix: &str) {
-    let gone = |pid: Option<u32>| pid.is_some_and(|p| starttime(p).is_none());
+    let gone = |pid: Option<u32>| pid.is_some_and(pid_gone);
     for e in std::fs::read_dir("/sys/class/net").into_iter().flatten().flatten() {
         let n = e.file_name().to_string_lossy().into_owned();
         let pid = n.strip_prefix(prefix).and_then(|r| r.split_once('t')).and_then(|(p, _)| u32::from_str_radix(p, 16).ok());
@@ -833,7 +969,7 @@ pub fn collect_garbage(run: &Path, prefix: &str) {
     }
     for e in std::fs::read_dir(run.join("w")).into_iter().flatten().flatten() {
         let owner = load::<Ident>(&e.path().join("owner")).ok().flatten();
-        if owner.is_some_and(|o| !o.alive() && reap(run, &o).is_ok()) {
+        if owner.is_some_and(|o| reap(run, &o).is_ok()) {
             crate::socket::remove(&e.path());
             let _ = std::fs::remove_dir_all(e.path());
         }
@@ -846,7 +982,13 @@ pub fn collect_garbage(run: &Path, prefix: &str) {
             continue;
         }
         let Ok(_held) = lock_path(&path, libc::LOCK_EX | libc::LOCK_NB) else { continue };
-        if load::<Ident>(&path).ok().flatten().is_none_or(|o| reap(run, &o).is_ok()) {
+        let free = match lock_holder(&path) {
+            Ok(None) => true,
+            Ok(Some(o)) => reap(run, &o).is_ok(),
+            // Unreadable: kept, never taken for an empty lock.
+            Err(_) => false,
+        };
+        if free {
             for ext in ["json", "sock", "lock"] {
                 let _ = std::fs::remove_file(path.with_extension(ext));
             }
@@ -890,28 +1032,46 @@ pub fn write_file(dir: &Path, name: &str, data: &[u8], durable: bool) -> std::io
     Ok(())
 }
 
-/// Some(true) only on proof the process is gone (another boot, no such pid,
-/// a zombie, or another process with its pid); None when that cannot be told.
+/// Some(true) only on proof the process is gone; None when that cannot be told.
 pub fn gone(id: &Ident) -> Option<bool> {
-    gone_by(id, boot_id(), |pid| std::fs::read_to_string(format!("/proc/{pid}/stat")))
+    match id.liveness() {
+        Liveness::Alive => Some(false),
+        Liveness::Gone => Some(true),
+        Liveness::Unknown => None,
+    }
 }
 
 /// Every error, and anything unparsable, is unknown.
-fn gone_by(id: &Ident, boot: &str, stat: impl Fn(u32) -> std::io::Result<String>) -> Option<bool> {
-    if boot.is_empty() {
-        return None;
+fn liveness_by(id: &Ident, boot: &str, stat: impl Fn(u32) -> std::io::Result<String>) -> Liveness {
+    // Without either boot id, a mismatch proves nothing.
+    if boot.is_empty() || id.boot.is_empty() {
+        return Liveness::Unknown;
     }
     if id.boot != boot {
-        return Some(true);
+        return Liveness::Gone;
     }
-    match stat(id.pid) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(true),
-        Err(_) => None,
-        Ok(text) => match parse_stat(&text)? {
-            ("Z", _) => Some(true),
-            (_, start) => Some(start != id.start),
+    match pid_liveness_by(id.pid, stat) {
+        (Liveness::Alive, Some(start)) if start != id.start => Liveness::Gone,
+        (l, _) => l,
+    }
+}
+
+/// Whether any process has `pid` (a zombie counts as gone), and its start time.
+fn pid_liveness_by(pid: u32, stat: impl Fn(u32) -> std::io::Result<String>) -> (Liveness, Option<u64>) {
+    match stat(pid) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Liveness::Gone, None),
+        Err(_) => (Liveness::Unknown, None),
+        Ok(text) => match parse_stat(&text) {
+            None => (Liveness::Unknown, None),
+            Some(("Z", _)) => (Liveness::Gone, None),
+            Some((_, start)) => (Liveness::Alive, Some(start)),
         },
     }
+}
+
+/// Proof that no process has `pid` (for resources named by pid alone).
+fn pid_gone(pid: u32) -> bool {
+    pid_liveness_by(pid, |pid| std::fs::read_to_string(format!("/proc/{pid}/stat"))).0 == Liveness::Gone
 }
 
 /// State and start time from `/proc/PID/stat`.
@@ -1162,6 +1322,140 @@ mod tests {
     }
 
     #[test]
+    fn an_address_is_held_by_the_instance_that_claimed_it() {
+        let h = host("instances");
+        let (x, y) = (ip("10.9.0.1"), ip("10.9.0.2"));
+        // `web` SIGKILLed at x (its Firecracker still running), and an earlier crash's claim at y.
+        let fc = Sleeper::new();
+        let dead = dead_owner(&h, 999_999_911, &[&fc.1]);
+        store(&h.vms("web", "lock"), &dead, false).unwrap();
+        let l = h.lock().unwrap();
+        h.put_addr(x, &Addr { seen: 1, holder: Some("web".into()), holder_id: Some(dead.clone()), held: 1, ..Addr::default() }, false).unwrap();
+        let older = Ident { pid: 999_999_912, ..dead.clone() };
+        h.put_addr(y, &Addr { seen: 2, holder: Some("web".into()), holder_id: Some(older), held: 2, ..Addr::default() }, false).unwrap();
+        // The restart takes the name (reaping it), then the same address.
+        let _web = h.take_name("web", false).unwrap();
+        assert!(fc.done());
+        assert_eq!(h.holder(&l, y).unwrap(), None, "a dead instance's claim is not the new one's");
+        assert_eq!(h.holder(&l, x).unwrap(), None);
+        let c = h.claim_new(&l, "web", Some(x)).unwrap();
+        assert!(c.gen > 1 && h.addr(&l, x).unwrap().holder_id == Some(Ident::me()));
+        assert_eq!(h.holder(&l, x).unwrap().as_deref(), Some("web"));
+        // Automatic allocation takes the stale claim's address too.
+        let d = h.claim_new(&l, "web", None).unwrap();
+        assert_eq!(d.ip, y);
+        d.keep();
+        // A live process that does not hold the name holds nothing.
+        let other = Sleeper::new();
+        h.put_addr(y, &Addr { seen: 3, holder: Some("web".into()), holder_id: Some(other.1.clone()), held: 3, ..Addr::default() }, false).unwrap();
+        assert_eq!(h.holder(&l, y).unwrap(), None);
+        assert!(!other.done());
+        // An instance lets go of its own claim only, never a later one's of the same name.
+        let mut a = h.addr(&l, x).unwrap();
+        a.holder_id = Some(Ident { start: 1, ..Ident::me() });
+        h.put_addr(x, &a, false).unwrap();
+        c.release(&l).unwrap();
+        assert_eq!(h.addr(&l, x).unwrap().holder.as_deref(), Some("web"));
+        h.release(&l, x, "web").unwrap();
+        assert_eq!(h.addr(&l, x).unwrap().holder, None, "by name: a suspended VM's, whoever suspended it");
+        // Suspended here, it holds the address of its own generation only.
+        std::fs::create_dir_all(h.suspended("s")).unwrap();
+        std::fs::write(h.suspended("s").join("manifest.json"), "").unwrap();
+        let gone = Ident { pid: 999_999_913, ..dead };
+        h.put_addr(x, &Addr { seen: 5, holder: Some("s".into()), holder_id: Some(gone), held: 5, ..Addr::default() }, false).unwrap();
+        assert_eq!(h.holder(&l, x).unwrap().as_deref(), Some("s"), "quarantined (no GEN): kept");
+        std::fs::write(h.suspended("s").join("GEN"), "5").unwrap();
+        assert_eq!(h.holder(&l, x).unwrap().as_deref(), Some("s"));
+        std::fs::write(h.suspended("s").join("GEN"), "6").unwrap();
+        assert_eq!(h.holder(&l, x).unwrap(), None, "suspended with another address");
+        // Records from before instances were recorded go by the name.
+        h.put_addr(x, &Addr { seen: 7, holder: Some("web".into()), held: 7, ..Addr::default() }, false).unwrap();
+        assert_eq!(h.holder(&l, x).unwrap().as_deref(), Some("web"));
+    }
+
+    #[test]
+    fn what_cannot_be_read_is_never_proof_of_death() {
+        let h = host("unreadable");
+        // A dead owner whose work directory's owner record cannot be read: not reaped.
+        let dead = dead_owner(&h, 999_999_921, &[]);
+        let owner = h.run.join("w").join("999999921").join("owner");
+        std::fs::remove_file(&owner).unwrap();
+        std::fs::create_dir(&owner).unwrap();
+        assert!(reap(&h.run, &dead).is_err());
+        // Nor one with an unreadable Firecracker record.
+        let dead = dead_owner(&h, 999_999_922, &[]);
+        std::fs::create_dir_all(h.run.join("w/999999922/0/fc")).unwrap();
+        assert!(reap(&h.run, &dead).is_err());
+        // A name whose lock cannot be read is not free, and its address stays held.
+        std::fs::write(h.vms("u", "lock"), "{").unwrap();
+        let l = h.lock().unwrap();
+        h.put_addr(ip("10.9.0.1"), &Addr { seen: 1, holder: Some("u".into()), held: 1, ..Addr::default() }, false).unwrap();
+        assert!(h.take_name("u", false).is_err() && !h.gone("u"));
+        assert_eq!(h.holder(&l, ip("10.9.0.1")).unwrap().as_deref(), Some("u"));
+        collect_garbage(&h.run, "none");
+        assert!(h.vms("u", "lock").exists(), "kept by the garbage collector too");
+        // An empty lock (created, never written) is no holder.
+        std::fs::write(h.vms("e", "lock"), "").unwrap();
+        assert!(h.take_name("e", false).is_ok());
+        // A live holder whose lock record cannot be read keeps its address.
+        let _v = h.take_name("v", false).unwrap();
+        let x = h.claim_new(&l, "v", Some(ip("10.9.0.2"))).unwrap();
+        for unreadable in ["{", ""] {
+            std::fs::write(h.vms("v", "lock"), unreadable).unwrap();
+            assert_eq!(h.holder(&l, x.ip).unwrap().as_deref(), Some("v"), "{unreadable:?}");
+            assert!(h.claim_new(&l, "w", Some(x.ip)).is_err() && h.lend_new(&l, x.ip).is_err());
+        }
+        // Read, and naming another instance: not this claim's holder.
+        store(&h.vms("v", "lock"), &Ident { start: 1, ..Ident::me() }, false).unwrap();
+        assert_eq!(h.holder(&l, x.ip).unwrap(), None);
+        x.keep();
+    }
+
+    #[test]
+    fn an_empty_boot_id_is_never_proof_of_death() {
+        let me = Ident::me();
+        let running = format!("1 (x) S {}", "0 ".repeat(18) + &me.start.to_string());
+        let stat = |_| Ok(running.clone());
+        // Recorded without one: not "another boot".
+        assert_eq!(liveness_by(&Ident { boot: String::new(), ..me.clone() }, boot_id(), stat), Liveness::Unknown);
+        // Ours unreadable: nothing can be told.
+        assert_eq!(liveness_by(&me, "", stat), Liveness::Unknown);
+        assert_eq!(liveness_by(&Ident { boot: "other".into(), ..me.clone() }, boot_id(), stat), Liveness::Gone);
+        let h = host("noboot");
+        let dead = Ident { pid: 999_999_931, start: 1, boot: String::new() };
+        assert!(reap(&h.run, &dead).is_err(), "never reaped as another boot's");
+        assert!(!boot_id().is_empty() && Ident::of(std::process::id()).is_some_and(|i| i.boot == boot_id()));
+    }
+
+    #[test]
+    fn automatic_allocation_goes_on_from_the_last_one() {
+        let h = host("hint");
+        let l = h.lock().unwrap();
+        let a = h.claim_new(&l, "a", None).unwrap();
+        assert_eq!(a.ip, ip("10.9.0.1"));
+        drop(a);
+        // Free again, but the next allocation starts after it.
+        let b = h.claim_new(&l, "b", None).unwrap();
+        assert_eq!(b.ip, ip("10.9.0.2"));
+        b.keep();
+        let _c = h.take_name("c", false).unwrap();
+        let c = h.claim_new(&l, "c", None).unwrap();
+        assert_eq!(c.ip, ip("10.9.0.3"));
+        // Wraps around, skipping what is taken (b's name is not held: its claim is stale).
+        let _d = h.take_name("d", false).unwrap();
+        let d = h.claim_new(&l, "d", None).unwrap();
+        assert_eq!(d.ip, ip("10.9.0.1"));
+        let _e = h.take_name("e", false).unwrap();
+        let e = h.claim_new(&l, "e", None).unwrap();
+        assert_eq!(e.ip, ip("10.9.0.2"));
+        // A garbled hint is only a hint.
+        std::fs::write(h.alloc_hint(), "junk").unwrap();
+        assert!(h.claim_new(&l, "e", None).is_err(), "all taken");
+        drop((c, d, e));
+        assert_eq!(h.claim_new(&l, "e", None).unwrap().ip, ip("10.9.0.1"));
+    }
+
+    #[test]
     fn addresses_are_lent_to_restoring_peers_only_when_free() {
         let h = host("lend");
         let l = h.lock().unwrap();
@@ -1240,11 +1534,15 @@ mod tests {
         assert!(h.lock_by(Some(std::time::Instant::now() + Duration::from_secs(1))).is_ok());
         // Errors and garbage are unknown, never gone; a zombie is gone.
         let emfile = |_| Err(std::io::Error::from_raw_os_error(libc::EMFILE));
-        assert_eq!(gone_by(&me, boot_id(), emfile), None);
-        assert_eq!(gone_by(&me, boot_id(), |_| Ok("garbage".into())), None);
-        assert_eq!(gone_by(&me, "", |_| Ok(String::new())), None);
+        assert_eq!(liveness_by(&me, boot_id(), emfile), Liveness::Unknown);
+        assert_eq!(liveness_by(&me, boot_id(), |_| Ok("garbage".into())), Liveness::Unknown);
+        assert_eq!(liveness_by(&me, "", |_| Ok(String::new())), Liveness::Unknown);
         let zombie = format!("1 (x) Z {}", "0 ".repeat(18) + &me.start.to_string());
-        assert_eq!(gone_by(&me, boot_id(), |_| Ok(zombie.clone())), Some(true));
+        assert_eq!(liveness_by(&me, boot_id(), |_| Ok(zombie.clone())), Liveness::Gone);
+        let running = |start: u64| format!("1 (x) S {}", "0 ".repeat(18) + &start.to_string());
+        assert_eq!(liveness_by(&me, boot_id(), |_| Ok(running(me.start))), Liveness::Alive);
+        assert_eq!(liveness_by(&me, boot_id(), |_| Ok(running(me.start + 1))), Liveness::Gone, "pid reused");
+        assert_eq!(pid_liveness_by(1, emfile).0, Liveness::Unknown, "a tap or cgroup of an unreadable pid is kept");
         // A dead owner's goes, as asking would make it go.
         store(&h.mig_path(9), &Mig::Committed { owner: dead_owner(&h, 999_999_909, &[]) }, false).unwrap();
         h.retire_migrations();

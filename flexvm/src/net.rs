@@ -318,14 +318,43 @@ impl IpRange {
         (self.first..=self.last).contains(&u32::from(ip))
     }
 
-    pub fn allocate(&self, taken: impl Fn(Ipv4Addr) -> bool) -> Option<Ipv4Addr> {
-        (self.first..=self.last).map(Ipv4Addr::from).find(|ip| !taken(*ip))
+    /// The first address not `taken`, looking from `hint` (if in range) to the
+    /// end, then from the start: each address at most once.
+    pub fn allocate(&self, hint: Option<Ipv4Addr>, taken: impl Fn(Ipv4Addr) -> bool) -> Option<Ipv4Addr> {
+        let start = hint.map(u32::from).filter(|h| (self.first..=self.last).contains(h)).unwrap_or(self.first);
+        (start..=self.last).chain(self.first..start).map(Ipv4Addr::from).find(|ip| !taken(*ip))
+    }
+
+    /// The address after `ip`, wrapping around.
+    pub fn after(&self, ip: Ipv4Addr) -> Ipv4Addr {
+        let n = u32::from(ip);
+        Ipv4Addr::from(if n >= self.last || n < self.first { self.first } else { n + 1 })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn allocation_starts_at_the_hint_and_wraps() {
+        let r = IpRange::parse("10.9.0.1-10.9.0.4").unwrap();
+        let ip = |n: u8| Ipv4Addr::new(10, 9, 0, n);
+        let probe = |hint: Option<u8>, used: &[u8]| {
+            let probed = std::cell::RefCell::new(Vec::new());
+            let got = r.allocate(hint.map(ip), |a| {
+                probed.borrow_mut().push(a.octets()[3]);
+                used.contains(&a.octets()[3])
+            });
+            (got.map(|a| a.octets()[3]), probed.into_inner())
+        };
+        assert_eq!(probe(None, &[]), (Some(1), vec![1]));
+        assert_eq!(probe(Some(3), &[]), (Some(3), vec![3]), "no rescan from the start");
+        assert_eq!(probe(Some(3), &[3, 4]), (Some(1), vec![3, 4, 1]), "wraps around");
+        assert_eq!(probe(Some(2), &[1, 2, 3, 4]), (None, vec![2, 3, 4, 1]), "each address once");
+        assert_eq!(probe(Some(9), &[]), (Some(1), vec![1]), "a hint out of range starts at the start");
+        assert_eq!((r.after(ip(2)), r.after(ip(4)), r.after(ip(9))), (ip(3), ip(1), ip(1)));
+    }
 
     #[test]
     fn loopback_routes_are_noops() {

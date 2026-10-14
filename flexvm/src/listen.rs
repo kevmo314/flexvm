@@ -1,6 +1,6 @@
 //! The peer listener (`flexvm listen`): a stateless, restartable helper
 //! (socket-activatable) that serves only configured peers. Each connection
-//! starts with one JSON line, read unbuffered so nothing after it is consumed:
+//! starts with one JSON line, consumed exactly through its newline so nothing after it is:
 //! `migrate_in`, `pages` (handed to the source VM process), `migration`
 //! (status/done), `route`, `lend`.
 
@@ -8,6 +8,8 @@ use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -33,8 +35,12 @@ pub fn main(host: Host, listener: TcpListener) -> Result<()> {
     }
     eprintln!("flexvm listening on {}", listener.local_addr()?);
     crate::standby::maintain(host.clone());
+    let peers = Peers::watch(host.cfg.peers.clone());
     let host = std::sync::Arc::new(host);
     for conn in listener.incoming() {
+        // Everything a request does before it is read, checking its peer
+        // included, counts against its deadline.
+        let deadline = Instant::now() + REQUEST_DEADLINE;
         let conn = match conn {
             Ok(c) => c,
             Err(e) => {
@@ -46,10 +52,10 @@ pub fn main(host: Host, listener: TcpListener) -> Result<()> {
             ACTIVE.fetch_sub(1, Ordering::SeqCst);
             continue;
         }
-        let host = host.clone();
+        let (host, peers) = (host.clone(), peers.clone());
         std::thread::spawn(move || {
             let _ = conn.set_nodelay(true);
-            if let Err(e) = handle(&host, conn) {
+            if let Err(e) = handle(&host, &peers, conn, deadline) {
                 eprintln!("peer request: {e}");
             }
             ACTIVE.fetch_sub(1, Ordering::SeqCst);
@@ -77,8 +83,47 @@ fn unreachable_at(local: SocketAddr, v6only: bool, advertised: Option<&str>) -> 
 
 /// Peers are compared by address, an IPv4 one also as it arrives on a
 /// dual-stack socket (::ffff:a.b.c.d).
-fn is_peer(peers: &[String], from: IpAddr) -> bool {
-    peers.iter().filter_map(|p| p.to_socket_addrs().ok()).flatten().any(|a| a.ip().to_canonical() == from.to_canonical())
+fn is_peer(peers: &[IpAddr], from: IpAddr) -> bool {
+    peers.iter().any(|a| a.to_canonical() == from.to_canonical())
+}
+
+/// The configured peers' addresses, resolved off the request path: at start,
+/// then every `PEER_REFRESH` in the background. A name that fails to resolve
+/// keeps the addresses it last had.
+#[derive(Clone)]
+struct Peers(Arc<RwLock<Vec<Peer>>>);
+
+/// A configured peer and the addresses it last resolved to.
+type Peer = (String, Vec<IpAddr>);
+
+const PEER_REFRESH: Duration = Duration::from_secs(30);
+
+impl Peers {
+    fn watch(names: Vec<String>) -> Peers {
+        let peers = Peers(Arc::new(RwLock::new(names.into_iter().map(|n| (n, Vec::new())).collect())));
+        peers.refresh();
+        let p = peers.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(PEER_REFRESH);
+            p.refresh();
+        });
+        peers
+    }
+
+    fn refresh(&self) {
+        let names: Vec<String> = self.0.read().unwrap().iter().map(|(n, _)| n.clone()).collect();
+        let resolved: Vec<_> = names.iter().map(|n| n.to_socket_addrs().ok().map(|a| a.map(|a| a.ip()).collect::<Vec<_>>())).collect();
+        let mut w = self.0.write().unwrap();
+        for ((_, addrs), new) in w.iter_mut().zip(resolved) {
+            if let Some(new) = new {
+                *addrs = new;
+            }
+        }
+    }
+
+    fn addrs(&self) -> Vec<IpAddr> {
+        self.0.read().unwrap().iter().flat_map(|(_, a)| a.iter().copied()).collect()
+    }
 }
 
 pub fn activated() -> Option<TcpListener> {
@@ -87,13 +132,13 @@ pub fn activated() -> Option<TcpListener> {
     (pid == std::process::id() && n >= 1).then(|| unsafe { TcpListener::from_raw_fd(3) })
 }
 
-fn handle(host: &Host, mut conn: TcpStream) -> Result<()> {
+fn handle(host: &Host, peers: &Peers, mut conn: TcpStream, deadline: Instant) -> Result<()> {
     // Peers are authenticated by address only: the network between them is trusted.
     let from = conn.peer_addr()?.ip();
-    if !is_peer(&host.cfg.peers, from) {
+    if !is_peer(&peers.addrs(), from) {
         bail!("{from} is not a peer of this host (flexvm listen --peer)");
     }
-    let line = read_line(&mut conn)?;
+    let line = read_line_by(&conn, deadline)?;
     let req: Value = serde_json::from_slice(&line)?;
     let reply = match req["op"].as_str().unwrap_or("") {
         "migrate_in" => return incoming(host, &req, &line, conn),
@@ -115,20 +160,43 @@ fn handle(host: &Host, mut conn: TcpStream) -> Result<()> {
     Ok(())
 }
 
-/// Byte by byte: whatever follows belongs to whoever gets the connection next.
-fn read_line(conn: &mut TcpStream) -> Result<Vec<u8>> {
-    conn.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+/// The whole request line must arrive within this, however it trickles in.
+const REQUEST_DEADLINE: Duration = Duration::from_secs(10);
+const MAX_LINE: usize = 64 << 10;
+
+/// Peeks in chunks and consumes exactly through the newline: whatever
+/// follows stays in the socket for whoever gets the connection next. Each
+/// wait gets only what is left until `deadline`.
+fn read_line_by(conn: &TcpStream, deadline: Instant) -> Result<Vec<u8>> {
     let mut line = Vec::new();
-    let mut b = [0u8; 1];
-    while line.len() < 64 << 10 {
-        if conn.read(&mut b)? == 0 {
-            bail!("peer hung up");
+    let mut buf = [0u8; 4096];
+    while line.len() < MAX_LINE {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            bail!("request line not received in time");
         }
-        if b[0] == b'\n' {
+        conn.set_read_timeout(Some(left))?;
+        let want = buf.len().min(MAX_LINE + 1 - line.len());
+        let n = match conn.peek(&mut buf[..want]) {
+            Ok(0) => bail!("peer hung up"),
+            Ok(n) => n,
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                bail!("request line not received in time")
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        };
+        let (take, done) = match buf[..n].iter().position(|&b| b == b'\n') {
+            Some(i) => (i + 1, true),
+            None => (n, false),
+        };
+        // Already queued, so this does not wait.
+        (&*conn).read_exact(&mut buf[..take])?;
+        line.extend_from_slice(&buf[..take - done as usize]);
+        if done {
             conn.set_read_timeout(None)?;
             return Ok(line);
         }
-        line.push(b[0]);
     }
     bail!("request line too long")
 }
@@ -244,16 +312,71 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    fn pair() -> (TcpStream, TcpStream) {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let c = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        (c, l.accept().unwrap().0)
+    }
+
+    #[test]
+    fn a_request_line_is_read_exactly_through_its_newline() {
+        use std::io::Write;
+        let (mut c, mut s) = pair();
+        c.write_all(b"{\"op\":\"x\"}\nafter").unwrap();
+        // In pieces too: a line split across chunks.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert_eq!(read_line_by(&s, deadline).unwrap(), b"{\"op\":\"x\"}");
+        let mut rest = [0u8; 5];
+        s.read_exact(&mut rest).unwrap();
+        assert_eq!(&rest, b"after", "nothing after the line is consumed");
+        let long = vec![b'a'; 10_000];
+        c.write_all(&long).unwrap();
+        c.write_all(b"\nnext").unwrap();
+        assert_eq!(read_line_by(&s, deadline).unwrap(), long);
+        s.read_exact(&mut rest[..4]).unwrap();
+        assert_eq!(&rest[..4], b"next");
+        c.write_all(&vec![b'a'; MAX_LINE + 1]).unwrap();
+        assert!(read_line_by(&s, deadline).unwrap_err().to_string().contains("too long"));
+    }
+
+    #[test]
+    fn a_slow_sender_gets_one_deadline_for_the_whole_line() {
+        use std::io::Write;
+        let (mut c, s) = pair();
+        let sender = std::thread::spawn(move || {
+            // Each byte well within a per-read timeout of the whole deadline.
+            for _ in 0..20 {
+                if c.write_all(b"x").is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            let _ = c.write_all(b"\n");
+        });
+        let start = Instant::now();
+        let e = read_line_by(&s, start + Duration::from_millis(400)).unwrap_err();
+        assert!(e.to_string().contains("in time"), "{e}");
+        assert!(start.elapsed() < Duration::from_millis(1000), "{:?}", start.elapsed());
+        drop(s);
+        sender.join().unwrap();
+    }
+
     #[test]
     fn an_ipv4_peer_on_a_dual_stack_socket_is_a_peer() {
         let peers = vec!["10.1.0.2:7070".to_string(), "[2001:db8::2]:7070".to_string()];
+        let peers = Peers::watch(peers).addrs();
         for from in ["10.1.0.2", "::ffff:10.1.0.2", "2001:db8::2"] {
             assert!(is_peer(&peers, from.parse().unwrap()), "{from}");
         }
         for from in ["10.1.0.3", "::ffff:10.1.0.3", "::1", "2001:db8::3"] {
             assert!(!is_peer(&peers, from.parse().unwrap()), "{from}");
         }
-        assert!(is_peer(&["[::ffff:10.1.0.2]:7070".to_string()], "10.1.0.2".parse().unwrap()));
+        assert!(is_peer(&Peers::watch(vec!["[::ffff:10.1.0.2]:7070".to_string()]).addrs(), "10.1.0.2".parse().unwrap()));
+        // Unresolvable now: kept as last resolved.
+        let p = Peers::watch(vec!["10.1.0.2:7070".to_string()]);
+        p.0.write().unwrap()[0].0 = "no-such-host.invalid:7070".into();
+        p.refresh();
+        assert!(is_peer(&p.addrs(), "10.1.0.2".parse().unwrap()));
     }
 
     #[test]

@@ -224,9 +224,12 @@ def disarm():
 def setup(name, host=None, mib=200, template=None):
     host = host or A
     ok(run(host, name, template=template))
-    code, out = sh(host, name, f"dd if=/dev/urandom of=/tmp/f bs=1M count={mib} 2>/dev/null; md5sum /tmp/f")
+    # iflag=fullblock: a short read of /dev/urandom would otherwise make a short file.
+    code, out = sh(host, name, f"dd if=/dev/urandom of=/tmp/f bs=1M count={mib} iflag=fullblock 2>/dev/null && wc -c </tmp/f && md5sum /tmp/f")
     assert code == 0, out
-    return out.split()[0]
+    size, digest = out.split()[:2]
+    assert int(size) == mib << 20, f"dirty workload wrote {size} bytes, not {mib} MiB"
+    return digest
 
 
 def md5(host, name):
@@ -3098,6 +3101,74 @@ def start_killed():
     scenario_vms.add(n + "2")
 
 
+def sigkill_restart():
+    """A VM process SIGKILLed and started again under the same name: its
+    address is the new instance's to take (`--ip` the same one), and
+    automatic allocations after more crashes leave nothing reserved."""
+    n = "ft-sigkill-restart"
+    net, last = A.ips.split("-")[1].rsplit(".", 1)
+    ip = f"{net}.{int(last) - 1}"  # next to start_killed's, the last of the range
+    used = {ip}
+
+    def crash():
+        pid = vm_pid(A, n)
+        os.kill(pid, signal.SIGKILL)
+        return wait_for(lambda: not alive(pid), 10)
+
+    r = run(A, n, ip=ip)
+    check("sigkill restart: started", r["ok"], r)
+    if not r["ok"]:
+        return
+    gen = vms(A)[n]["gen"]
+    check("sigkill restart: killed", crash())
+    r = run(A, n, ip=ip)
+    check("sigkill restart: same name, same --ip", r["ok"] and r["result"]["ip"] == ip, r)
+    if not r["ok"]:
+        return
+    check("sigkill restart: a newer generation", vms(A)[n]["gen"] > gen, (vms(A)[n], gen))
+    for i in range(3):
+        if not check(f"sigkill restart: killed again ({i})", crash()):
+            return
+        r = run(A, n)
+        if not check(f"sigkill restart: restarted with an automatic address ({i})", r["ok"], r):
+            return
+        used.add(r["result"]["ip"])
+    ok(kill(A, n))
+    held = {i: addr(A, i) for i in sorted(used)}
+    check("sigkill restart: no address held after the kill", all(not a.get("lent") for a in held.values()), held)
+    # Every address it ever had is free for another VM.
+    for i in sorted(used):
+        r = run(A, n + "2", ip=i)
+        check(f"sigkill restart: {i} free again", r["ok"], r)
+        kill(A, n + "2")
+
+
+def listen_trickle():
+    """A peer that trickles its request line (a byte every 2 s, each within a
+    per-read timeout) is cut off by one 10 s deadline for the whole line."""
+    h, port = A.addr.rsplit(":", 1)
+    s = socket.create_connection((h, int(port)), timeout=5)
+    start, closed = time.time(), None
+    try:
+        for c in b'{"op": "migration", "mig": 1' + b" " * 20:
+            s.sendall(bytes([c]))
+            s.settimeout(2)
+            try:
+                if s.recv(1) == b"":
+                    closed = time.time() - start
+                    break
+            except socket.timeout:
+                pass
+            if time.time() - start > 25:
+                break
+    except OSError:
+        closed = time.time() - start
+    s.close()
+    check("listen trickle: cut off by the deadline", closed is not None and 9 <= closed <= 15, closed)
+    r = peer(A, {"op": "migration", "mig": 1})
+    check("listen trickle: the listener still answers", r.get("ok"), r)
+
+
 def claim_killed():
     """A standby VM SIGKILLed after it resumed the VM for a claim, before it
     answered: `run` says the claim is uncertain and starts nothing else."""
@@ -3626,6 +3697,7 @@ SCENARIOS = dict(
     kill_refused_checkpoint=no_evict(kill_refused_checkpoint), wildcard_listen=wildcard_listen,
     forged_peer=forged_peer, restore_ip_peer=restore_ip_peer, late_withdrawal=late_withdrawal,
     incoming_killed=incoming_killed, start_killed=start_killed, claim_killed=claim_killed, fc_died=fc_died,
+    sigkill_restart=sigkill_restart, listen_trickle=listen_trickle,
     cow_wp_race=cow_wp_race, fetch_tail_enomem=fetch_tail_enomem, fetch_enomem_stuck=fetch_enomem_stuck,
     same_host_order=same_host_order, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,
     handoff_superseded=handoff_superseded)

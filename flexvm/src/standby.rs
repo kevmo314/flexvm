@@ -33,8 +33,12 @@ fn dir(host: &Host, template: &str) -> PathBuf {
 }
 
 fn key(paths: &Paths, template: &str) -> Result<String> {
-    let dir = Template::resolve(paths, template)?;
-    Ok(dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
+    Ok(dir_key(&Template::resolve(paths, template)?))
+}
+
+/// A template generation's key: its directory's name (`.gen/<content id>`).
+fn dir_key(dir: &std::path::Path) -> String {
+    dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
 pub fn target(host: &Host, template: &str) -> usize {
@@ -192,11 +196,13 @@ pub fn load_set(host: &Host, tpl: &Template) -> Vec<u64> {
 pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) -> Result<Value> {
     let host = &p.host;
     let tpl = Template::open(&p.paths, template)?;
-    let key = key(&p.paths, template)?;
+    // The key of the generation opened, not of whatever the name resolves to now: a
+    // rebuild in between would publish this snapshot under the new generation's key.
+    let mine = dir_key(&tpl.dir);
     let d = dir(host, template);
     std::fs::create_dir_all(&d)?;
     let me = Ident::me();
-    let (lock_path, sock) = (d.join(format!("{}.lock", me.pid)), d.join(format!("{key}.{}.sock", me.pid)));
+    let (lock_path, sock) = (d.join(format!("{}.lock", me.pid)), d.join(format!("{mine}.{}.sock", me.pid)));
     let lock = File::create(&lock_path)?;
     unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
     lock.write_all_at(&serde_json::to_vec(&me)?, 0)?;
@@ -213,10 +219,10 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
     loop {
         let mut pfd = libc::pollfd { fd: listener.as_raw_fd(), events: libc::POLLIN, revents: 0 };
         if unsafe { libc::poll(&mut pfd, 1, 100) } <= 0 {
-            let current = Template::resolve(&p.paths, template).ok().and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()));
+            let current = key(&p.paths, template).ok();
             let extra = live(host, template).iter().position(|id| *id == me).is_some_and(|i| i >= target(host, template));
             let dead = p.standby.lock().unwrap().as_mut().is_none_or(|s| s.pager.failed().is_some() || !s.firecracker_alive());
-            if p.stop_requested() || current.as_deref() != Some(&key) || extra || dead {
+            if p.stop_requested() || current.as_deref() != Some(&mine) || extra || dead {
                 p.finish(op, End::NotStarted, 0, None);
             }
             continue;
