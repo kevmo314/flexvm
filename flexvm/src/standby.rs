@@ -1,21 +1,9 @@
-//! Standby VMs: processes that hold a VM restored from a template, settled
-//! and paused, so `run` is a resume and a `START` (a few ms) instead of a
-//! snapshot load. `flexvm standby [--template T] N` keeps N of them; each
-//! one claimed starts its replacement.
-//!
-//! A standby VM is `flexvm run --standby` waiting on
-//! `RUN/standby/TEMPLATE/KEY.PID.sock` (KEY: the template generation) and
-//! holding `RUN/standby/TEMPLATE/PID.lock`, its identity in it, while it
-//! lives. `run` claims one with `claim {name, ip, cmd}`, passing its stdout
-//! and stderr: the standby process takes the name and address and becomes
-//! that VM. It answers on the claim connection, and once it ends, sends
-//! `{"exit": code}` there. A claim it said it is taking (`claiming`) but did
-//! not answer may have started the VM: it is never tried again elsewhere.
-//!
-//! The first run after a restore is slow (Firecracker's first resume, the
-//! guest catching up and handling the new VMGenID), so a standby VM runs
-//! once until the guest has reseeded its RNG for this load, then pauses
-//! (see `load`).
+//! Standby VMs: `flexvm run --standby` processes holding a restored, settled,
+//! paused VM so `run` is a resume plus `START`. Each listens on
+//! `RUN/standby/TEMPLATE/KEY.PID.sock` (KEY: template generation) and holds
+//! `PID.lock` while alive. Protocol: `run` sends `claim {name, ip, cmd}` with
+//! its stdout/stderr; once the standby replies `claiming`, the claim may have
+//! started the VM and is never retried elsewhere. `{"exit": code}` follows.
 
 use std::fs::File;
 use std::io::BufReader;
@@ -44,13 +32,11 @@ fn dir(host: &Host, template: &str) -> PathBuf {
     host.run.join("standby").join(template)
 }
 
-/// The key of `template`'s current generation.
 fn key(paths: &Paths, template: &str) -> Result<String> {
     let dir = Template::resolve(paths, template)?;
     Ok(dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
 }
 
-/// How many standby VMs `template` should have.
 pub fn target(host: &Host, template: &str) -> usize {
     std::fs::read_to_string(host.state.join("standby").join(template)).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0)
 }
@@ -73,14 +59,12 @@ pub fn live(host: &Host, template: &str) -> Vec<Ident> {
     ids
 }
 
-/// Stops standby process `id`, if it is still that process.
 pub fn stop(id: &Ident) {
     if let Ok(Some(fd)) = PidFd::open(id) {
         let _ = fd.signal(libc::SIGINT);
     }
 }
 
-/// Every template that has or wants standby VMs.
 pub fn templates(host: &Host) -> Vec<String> {
     let mut t: Vec<String> = [host.state.join("standby"), host.run.join("standby")]
         .iter()
@@ -93,8 +77,6 @@ pub fn templates(host: &Host) -> Vec<String> {
     t
 }
 
-/// `flexvm standby N`: records N and makes it so, waiting until new standby
-/// VMs are ready.
 pub fn set(host: &Host, template: &str, n: usize) -> Result<Value> {
     crate::host::write_file(&host.state.join("standby"), template, n.to_string().as_bytes(), true)?;
     for id in live(host, template).iter().skip(n) {
@@ -104,9 +86,8 @@ pub fn set(host: &Host, template: &str, n: usize) -> Result<Value> {
     Ok(json!({"template": template, "standby": n, "started": started}))
 }
 
-/// Starts standby VMs of `template` up to its target, unless the host is
-/// under its memory reserve, and waits until they are ready. One refill of
-/// a template at a time, so the ones starting are counted.
+/// Starts standby VMs up to the target and waits for them. Serialised per
+/// template so the ones starting are counted.
 pub fn refill(host: &Host, template: &str) -> Result<usize> {
     let d = dir(host, template);
     std::fs::create_dir_all(&d)?;
@@ -140,8 +121,7 @@ pub fn refill(host: &Host, template: &str) -> Result<usize> {
     Ok(want)
 }
 
-/// Where this host keeps what a template's loads touch (`Template::load_set`),
-/// as standby VMs learn it, for migrations to preload.
+/// What standby loads of a template touch, saved for migrations to preload.
 fn load_set_file(host: &Host, tpl: &Template) -> PathBuf {
     host.run.join("standby").join(format!(".loadset-{}", tpl.meta.id))
 }
@@ -155,8 +135,6 @@ pub fn save_load_set(host: &Host, tpl: &Template) {
     }
 }
 
-/// The pages loads of `tpl` touch, as this process and this host's standby
-/// VMs have seen them.
 pub fn load_set(host: &Host, tpl: &Template) -> Vec<u64> {
     let mut set = tpl.load_set();
     if let Some(saved) = std::fs::read(load_set_file(host, tpl)).ok().and_then(|b| serde_json::from_slice::<Vec<u64>>(&b).ok()) {
@@ -167,9 +145,8 @@ pub fn load_set(host: &Host, tpl: &Template) -> Vec<u64> {
     set
 }
 
-/// `run --standby`: loads a standby VM of `template`, then waits to be
-/// claimed. Returns once it has become a claimed VM; ends the process if it
-/// is stopped, out of date, extra, or its VM died.
+/// `run --standby`: returns once claimed; ends the process if stopped,
+/// out of date, extra, or its VM died.
 pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) -> Result<Value> {
     let host = &p.host;
     let tpl = Template::open(&p.paths, template)?;
@@ -191,8 +168,6 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
     loop {
         let mut pfd = libc::pollfd { fd: listener.as_raw_fd(), events: libc::POLLIN, revents: 0 };
         if unsafe { libc::poll(&mut pfd, 1, 100) } <= 0 {
-            // Stopped, a newer generation of the template, too many of us
-            // (the newest go first), or dead: go.
             let current = Template::resolve(&p.paths, template).ok().and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()));
             let extra = live(host, template).iter().position(|id| *id == me).is_some_and(|i| i >= target(host, template));
             let dead = p.standby.lock().unwrap().as_mut().is_none_or(|s| s.pager.failed().is_some() || !s.firecracker_alive());
@@ -204,18 +179,16 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
         let Ok((c, _)) = listener.accept() else { continue };
         let Ok((line, fds)) = crate::util::recv_with_fds(&c, 1 << 20) else { continue };
         let Ok(req) = serde_json::from_slice::<Value>(&line) else { continue };
-        // Stopped meanwhile: goes without taking it (the claimer tries another).
+        // Not yet `claiming`, so the claimer tries another.
         if p.stop_requested() {
             p.finish(op, End::NotStarted, 0, None);
         }
-        // From here the claim may take effect: whoever sent it must not
-        // start the VM elsewhere without hearing how it went.
+        // From here the claim may take effect: the claimer must not retry elsewhere.
         if send_json(&mut &c, &json!({"claiming": true})).is_err() {
             continue;
         }
         match claim(p, &req) {
             Ok(v) => {
-                // Stop signals were the standby VM's, not the claimed one's.
                 p.forget_stop();
                 crate::host::stall("claim_stall");
                 let _ = std::fs::remove_file(&sock);
@@ -230,7 +203,6 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
                     let _ = std::fs::remove_file(f);
                 }
                 drop(lock);
-                // Off the claim's path: a replacement.
                 let (h, t) = (host.clone(), template.to_string());
                 std::thread::spawn(move || {
                     if let Err(e) = refill(&h, &t) {
@@ -242,7 +214,6 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
             Err((e, retry)) => {
                 let _ = send_json(&mut &c, &json!({"ok": false, "error": e.to_string(), "retry": retry}));
                 if p.standby.lock().unwrap().is_none() {
-                    // Its VM was used up by the failed claim.
                     p.finish(op, End::NotStarted, 1, None);
                 }
             }
@@ -250,8 +221,8 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
     }
 }
 
-/// Becomes VM `req.name`. On failure, says whether another standby VM (or
-/// a cold start) may do it instead: the VM never ran for that name.
+/// On failure, the flag says whether another standby (or a cold start) may
+/// retry: true only if the VM never ran for that name.
 fn claim(p: &Arc<Proc>, req: &Value) -> std::result::Result<Value, (Error, bool)> {
     let host = &p.host;
     let name = req["name"].as_str().unwrap_or("");
@@ -276,10 +247,8 @@ fn claim(p: &Arc<Proc>, req: &Value) -> std::result::Result<Value, (Error, bool)
     Ok(v)
 }
 
-/// `run`'s side: claims a standby VM of `template` as `name`, passing it
-/// `fds` for its stdout and stderr. None if there is none to claim. Once a
-/// request may have reached a standby VM, it may have started the VM:
-/// without an answer that is an error, never a reason to start it again.
+/// `run`'s side. Once a standby said `claiming` it may have started the VM:
+/// no answer is then an error, never a reason to start it again.
 pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]) -> Result<Option<(Value, UnixStream)>> {
     let Ok(key) = key(paths, template) else { return Ok(None) };
     let mut socks: Vec<PathBuf> = std::fs::read_dir(dir(host, template))
@@ -298,8 +267,6 @@ pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]
             let _ = std::fs::remove_file(&sock);
             continue;
         };
-        // A standby VM that goes without taking the request (it was on its
-        // way out) never says it is claiming.
         let mut r = BufReader::new(&c);
         let taken = crate::util::send_with_fds(&c, &line, fds).ok().and_then(|()| crate::util::recv_json(&mut r).ok().flatten());
         if taken.is_none_or(|t| t["claiming"] != json!(true)) {
@@ -324,15 +291,13 @@ pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]
     Ok(None)
 }
 
-/// How long a standby VM keeps running after the guest has reseeded.
 const SETTLE: Duration = Duration::from_millis(50);
 const LOAD_TIMEOUT: Duration = Duration::from_secs(30);
 const API_TIMEOUT: Duration = Duration::from_secs(5);
-/// How long the guest has to reseed after its first resume.
 const RESEED_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Restores `template` into `idle`, runs it once to settle (the slow first
-/// run after a restore, off the request path) and pauses it again.
+/// Runs the restored VM once (the slow first resume, off the request path)
+/// until the guest reseeds, then pauses it.
 fn load(idle: Idle, template: Arc<Template>) -> Result<Prepared> {
     let p = Vm::prepare(idle, template, &mut Phases::new())?;
     p.pager.learn_load_set();
@@ -342,21 +307,18 @@ fn load(idle: Idle, template: Arc<Template>) -> Result<Prepared> {
     fc.request_within("PATCH", "/vm", Some(json!({"state": "Paused"})), API_TIMEOUT)?;
     p.pager.wait_ready(Duration::from_secs(5))?;
     let resumed = fc.request_within("PATCH", "/vm", Some(json!({"state": "Resumed"})), API_TIMEOUT);
-    // The load set includes what resuming touches, as a migration's load resumes too.
     p.pager.loaded();
     resumed?;
     wait_for_reseed(&fc.sockets.vsock)?;
-    // The clock keeps time while paused, so START at the claim can skip
-    // clock_settime (tens of ms in a big guest). Best effort.
+    // Set the clock now so START at the claim can skip clock_settime (slow in big guests).
     let _ = guest::clock(&fc.sockets.vsock, &p.template().legacy_agent, guest::TIMEOUT);
     std::thread::sleep(SETTLE);
     fc.request_within("PATCH", "/vm", Some(json!({"state": "Paused"})), API_TIMEOUT)?;
     Ok(p)
 }
 
-/// Turns standby VM `p` into the running VM `name` at `ip`. On failure it is
-/// torn down, and the flag says whether the guest may have run for `name`
-/// (the resume may have reached Firecracker). `kill`: test fault `resume_kill`.
+/// On failure the flag says whether the guest may have run for `name` (the
+/// resume may have reached Firecracker).
 fn resume(p: Prepared, name: &str, ip: Ipv4Addr, kill: bool, t: &mut Phases) -> std::result::Result<Arc<Vm>, (Error, bool)> {
     crate::net::attach(ip, p.tap()).map_err(|e| (e, false))?;
     t.mark("route");
@@ -373,9 +335,8 @@ fn resume(p: Prepared, name: &str, ip: Ipv4Addr, kill: bool, t: &mut Phases) -> 
     Ok(p.into_vm(name, ip, crate::vm::State::Running))
 }
 
-/// Waits until the guest kernel has reseeded its RNG for the new VMGenID (a
-/// cold-booted template's log has no reseed yet). An agent without `FORKS`
-/// only gets to answer.
+/// Waits for the guest RNG reseed for the new VMGenID; an agent without
+/// `FORKS` need only answer.
 fn wait_for_reseed(vsock: &std::path::Path) -> Result<()> {
     static WARNED: AtomicBool = AtomicBool::new(false);
     let deadline = Instant::now() + RESEED_TIMEOUT;

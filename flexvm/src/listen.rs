@@ -1,18 +1,8 @@
-//! The peer listener (`flexvm listen`): an optional, stateless helper that
-//! receives migrations. It can be socket-activated (`LISTEN_FDS`) and
-//! restarted at any time; everything it knows is in the host's files.
-//!
-//! Each connection starts with one JSON line, read unbuffered so nothing
-//! after it is consumed:
-//! - `migrate_in`: spawns `flexvm run --incoming`, handing it the connection;
-//! - `pages`: passes the connection to the VM process named (the source of
-//!   a migration), whose page server takes it from there;
-//! - `migration`: how an incoming migration went (see `Host::mig_status`),
-//!   or (`done`) that its source will not ask again;
-//! - `route`: a peer announces or withdraws a VM address;
-//! - `lend`: a peer restoring a checkpoint borrows an address of this host.
-//!
-//! Only the configured peers' addresses are served.
+//! The peer listener (`flexvm listen`): a stateless, restartable helper
+//! (socket-activatable) that serves only configured peers. Each connection
+//! starts with one JSON line, read unbuffered so nothing after it is consumed:
+//! `migrate_in`, `pages` (handed to the source VM process), `migration`
+//! (status/done), `route`, `lend`.
 
 use std::io::Read;
 use std::net::{Ipv4Addr, TcpListener, TcpStream, ToSocketAddrs};
@@ -25,8 +15,7 @@ use crate::bail;
 use crate::host::{fault, Host};
 use crate::util::{send_json, Result};
 
-/// Requests handled at once; more connections are closed unanswered. Each
-/// has 10 s to send its request line.
+/// Requests handled at once; more connections are closed unanswered.
 const MAX_ACTIVE: usize = 512;
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 
@@ -47,10 +36,9 @@ pub fn main(host: Host) -> Result<()> {
     for conn in listener.incoming() {
         let conn = match conn {
             Ok(c) => c,
-            // A client gone before accept, or a signal, says nothing about resources.
             Err(e) if matches!(e.kind(), std::io::ErrorKind::Interrupted | std::io::ErrorKind::ConnectionAborted) => continue,
             Err(e) => {
-                // Out of fds, say: wait rather than spin.
+                // E.g. out of fds: wait rather than spin.
                 eprintln!("accept: {e}");
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 continue;
@@ -72,7 +60,6 @@ pub fn main(host: Host) -> Result<()> {
     Ok(())
 }
 
-/// The listening socket systemd passed, if any.
 fn activated() -> Option<TcpListener> {
     let pid: u32 = std::env::var("LISTEN_PID").ok()?.parse().ok()?;
     let n: u32 = std::env::var("LISTEN_FDS").ok()?.parse().ok()?;
@@ -80,8 +67,7 @@ fn activated() -> Option<TcpListener> {
 }
 
 fn handle(host: &Host, mut conn: TcpStream) -> Result<()> {
-    // Only this host's peers (by address: the network between them is
-    // trusted) may send it VMs, take their memory or move addresses.
+    // Peers are authenticated by address only: the network between them is trusted.
     let from = conn.peer_addr()?.ip();
     if !host.cfg.peers.iter().filter_map(|p| p.to_socket_addrs().ok()).flatten().any(|a| a.ip() == from) {
         bail!("{from} is not a peer of this host (flexvm listen --peer)");
@@ -104,8 +90,7 @@ fn handle(host: &Host, mut conn: TcpStream) -> Result<()> {
     Ok(())
 }
 
-/// One line, byte by byte: whatever follows belongs to whoever gets the
-/// connection next.
+/// Byte by byte: whatever follows belongs to whoever gets the connection next.
 fn read_line(conn: &mut TcpStream) -> Result<Vec<u8>> {
     conn.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
     let mut line = Vec::new();
@@ -123,8 +108,7 @@ fn read_line(conn: &mut TcpStream) -> Result<Vec<u8>> {
     bail!("request line too long")
 }
 
-/// Starts the VM process that takes in a migration, with the connection as
-/// its fd 3. It answers the source itself.
+/// Spawns the incoming VM process with the connection as fd 3; it answers the source.
 fn incoming(host: &Host, req: &Value, line: &[u8], conn: TcpStream) -> Result<()> {
     let name = req["name"].as_str().unwrap_or("");
     let refuse = |mut c: &TcpStream, e: String| send_json(&mut c, &json!({"ok": false, "error": e}));
@@ -140,7 +124,6 @@ fn incoming(host: &Host, req: &Value, line: &[u8], conn: TcpStream) -> Result<()
     Ok(())
 }
 
-/// Hands a page connection to the VM process it is for.
 fn pages(host: &Host, req: &Value, conn: TcpStream) -> Result<()> {
     let name = req["name"].as_str().unwrap_or("");
     let fwd = json!({"op": "pages", "mig": req["mig"]});
@@ -150,11 +133,9 @@ fn pages(host: &Host, req: &Value, conn: TcpStream) -> Result<()> {
     Ok(())
 }
 
-/// Refuses a page connection with one JSON line, which its pager reports.
 pub fn refuse_pages(mut conn: TcpStream, why: &str) {
     let _ = send_json(&mut conn, &json!({"ok": false, "error": why}));
-    // Take what the client sent meanwhile (its first request), so closing
-    // does not reset the connection before it reads why.
+    // Drain the client's request so closing does not RST before it reads why.
     let _ = conn.shutdown(std::net::Shutdown::Write);
     let _ = conn.set_read_timeout(Some(std::time::Duration::from_secs(1)));
     let _ = std::io::copy(&mut (&mut conn).take(1 << 20), &mut std::io::sink());
@@ -173,16 +154,14 @@ fn migration(host: &Host, req: &Value) -> Result<Value> {
     Ok(json!({"outcome": outcome, "underlay": host.cfg.underlay().map(|u| u.to_string())}))
 }
 
-/// A peer restores a checkpoint with an address of this host's range.
 fn lend(host: &Host, req: &Value) -> Result<Value> {
     let ip: Ipv4Addr = req["ip"].as_str().ok_or("missing ip")?.parse()?;
     let gen = host.lend_new(&host.lock()?, ip)?;
     Ok(json!({"ip": ip.to_string(), "gen": gen}))
 }
 
-/// A peer tells us where a VM's address lives now (`via`), or that the VM is
-/// gone. Stale messages (older generations, see `host::Addr`) are ignored;
-/// an address a VM here holds keeps its route.
+/// Stale generations (see `host::Addr`) are ignored; an address a VM here
+/// holds keeps its local route.
 fn route(host: &Host, req: &Value) -> Result<Value> {
     let ip: Ipv4Addr = req["ip"].as_str().ok_or("missing ip")?.parse()?;
     let gen = req["gen"].as_u64().filter(|&g| g > 0).ok_or("route messages carry the address's generation")?;

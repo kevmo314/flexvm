@@ -1,6 +1,4 @@
-//! Pause and resume, checkpoints, restores, and suspend (a checkpoint to the
-//! host's disk, after which the process exits):
-//!
+//! Pause/resume, checkpoints, restores and suspend:
 //!   running <-> paused                                  (SIGTSTP / SIGCONT)
 //!   running | paused -> checkpointing -> running | paused (checkpoint)
 //!                                     -> gone            (checkpoint --stop)
@@ -25,23 +23,18 @@ use crate::util::{ms, Error, Phases, Result, PAGE_SIZE};
 use crate::vm::{Snapshot, State, Vm};
 use crate::vmproc::{End, Op, Proc, CLOCK_DEADLINE};
 
-/// How long a checkpoint waits for a VM to finish pulling its memory.
 const DRAIN_WAIT: Duration = Duration::from_secs(60);
-/// How long a checkpoint waits for virtio-mem to carry out the last resize.
 pub const SETTLE_WAIT: Duration = Duration::from_secs(10);
-/// Longest a checkpoint's release waits for held packets still on their way.
 const CKPT_RELEASE: Duration = Duration::from_millis(20);
-/// Markers in a suspended VM's checkpoint: resumed (its VM may have run
-/// since: never again); killed; its address's generation; and, after a resume
-/// whose STARTED may or may not be durable, `<boot id> <why>` (not resumed
-/// until a reboot shows what the disk holds).
+/// Suspended-checkpoint markers: STARTED (may have run: never resume again),
+/// DISCARDED, GEN (address generation), and QUARANTINE `<boot id> <why>` when
+/// STARTED's durability is unknown (held until a reboot shows the disk).
 const STARTED: &str = "STARTED";
 const DISCARDED: &str = "DISCARDED";
 const GEN: &str = "GEN";
 const QUARANTINE: &str = "QUARANTINE";
 
-/// How a restore failed: before the vCPUs ever ran, after, or before but
-/// with its (owned) checkpoint maybe marked STARTED.
+/// Uncertain: never ran, but an owned checkpoint may be marked STARTED.
 pub enum Restore {
     NotRun(Error),
     Ran(Error),
@@ -49,8 +42,7 @@ pub enum Restore {
 }
 
 impl Proc {
-    /// Test hook: a hash of every page of the VM's memory in place, read out
-    /// of Firecracker, with their count.
+    /// Test hook.
     pub fn memhash(&self) -> Result<Value> {
         let vm = self.vm();
         let mut hash = crate::template::Hash::new();
@@ -71,7 +63,7 @@ impl Proc {
         Ok(json!({"name": vm.name, "hash": hash.finish(), "pages": pages, "remote": vm.pager.remote_left()}))
     }
 
-    /// SIGCONT: resumes a paused VM (a held restore at a new address gets it now).
+    /// SIGCONT; a held restore at a new address gets it now.
     pub fn resume(&self) -> Result<Value> {
         let vm = self.vm();
         let op = self.op_within()?;
@@ -89,21 +81,17 @@ impl Proc {
         }
         self.publish();
         drop(op);
-        // Off the critical path; the guest's clock runs on while paused anyway.
         self.sync_clock_later();
         Ok(json!({"name": vm.name, "state": "running", "resume_ms": ms(took)}))
     }
 
-    /// Gives the guest its new address, and drops the `old` one if it has iproute2.
     fn readdress(&self, vm: &Vm, old: Ipv4Addr) -> Result<()> {
         vm.guest_net(vm.ip, self.host.cfg.dns.as_deref())?;
         let _ = vm.sh(&format!("ip -4 addr del {old}/32 dev eth0 2>/dev/null"), Instant::now() + crate::guest::TIMEOUT);
         Ok(())
     }
 
-    /// Checkpoints the VM to `dir`; it runs on (paused only to save its state
-    /// and arm copy-on-write) or, `stop`, stays paused for the caller to
-    /// destroy. `incremental`: only what changed since its last checkpoint.
+    /// With `stop` the VM stays paused for the caller to destroy.
     pub fn checkpoint(&self, _op: &Op, dir: &str, stop: bool, incremental: bool) -> Result<Value> {
         let vm = self.vm();
         let mut t = Phases::new();
@@ -137,9 +125,7 @@ impl Proc {
         Ok(v)
     }
 
-    /// SIGTERM: checkpoints the VM into the host's state directory, frees it
-    /// and ends the process (`flexvm resume` brings it back). Returns only if
-    /// that failed; the VM runs on.
+    /// SIGTERM. Returns only on failure, with the VM running on.
     pub fn suspend(&self) -> Error {
         let vm = self.vm();
         let mut t = Phases::new();
@@ -148,19 +134,17 @@ impl Proc {
             if !matches!(vm.state(), State::Running | State::Paused) {
                 bail!("vm {} is {}; not suspending it", vm.name, vm.state().name());
             }
-            // The checkpoint it was resumed from goes first: this one goes there.
+            // This one goes where the checkpoint it was resumed from is.
             if let Some(dir) = self.consumed.lock().unwrap().take() {
                 delete_consumed(&vm.name, &dir);
             }
             let staging = Staging::new(&self.host.suspended(&vm.name), vm.dir.join("checkpoint.vmstate"))?;
-            // Its address's generation, published with the checkpoint.
             staging.add_file(GEN, self.gen().to_string().as_bytes())?;
             let saved = self.save(vm, staging, false, false, &mut t);
             self.publish();
             saved
         })();
         match saved {
-            // Durable: only now let go of the memory.
             Ok((m, _)) => {
                 let data = (m.data_pages * PAGE_SIZE as u64) >> 20;
                 eprintln!("{}", json!({"name": vm.name, "state": "suspended", "dir": self.host.suspended(&vm.name), "freed_rss_mib": vm.rss() >> 20, "data_mib": data, "suspend_ms": ms(t.total()), "timings_ms": t.json()}));
@@ -170,7 +154,6 @@ impl Proc {
         }
     }
 
-    /// `flexvm resume NAME`: restores a suspended VM from its checkpoint.
     pub fn resume_suspended(&self, name: &str) -> Result<Value> {
         let mut t = Phases::new();
         self.set_name(self.host.take_name(name, true)?);
@@ -187,7 +170,6 @@ impl Proc {
             if boot == crate::host::boot_id() {
                 bail!("vm {name} is quarantined: {why}; kill it to discard its checkpoint");
             }
-            // Rebooted since: the disk holds no STARTED marker, so it never ran.
             unmark_durably(&dir, QUARANTINE)?;
         }
         let gen = read_gen(&dir).ok_or_else(|| {
@@ -209,7 +191,6 @@ impl Proc {
                 v["from"] = json!("suspended");
                 Ok(v)
             }
-            // Never ran: still suspended, as it was.
             Err(Restore::NotRun(e)) => {
                 self.keep_addr();
                 Err(e)
@@ -219,7 +200,7 @@ impl Proc {
                 let _ = std::fs::write(dir.join(QUARANTINE), format!("{} {e}", crate::host::boot_id()));
                 bail!("vm {name} is quarantined: {e}; kill it to discard its checkpoint")
             }
-            // May have run: re-arming the checkpoint would replay what it did since.
+            // Re-arming the checkpoint would replay what it did since.
             Err(Restore::Ran(e)) => {
                 let _ = discard(&self.host, name);
                 bail!("vm {name} failed after it resumed: {e}; it is gone, its checkpoint is consumed")
@@ -227,8 +208,7 @@ impl Proc {
         }
     }
 
-    /// `flexvm restore DIR`: a new VM from a checkpoint, by default with the
-    /// name and address it was checkpointed with (another host's is borrowed).
+    /// Another host's address is borrowed.
     pub fn restore(&self, dir: &Path, name: Option<&str>, ip: Option<&str>, paused: bool) -> Result<Value> {
         let mut t = Phases::new();
         let ck = Checkpoint::open(dir)?;
@@ -246,14 +226,11 @@ impl Proc {
         };
         let ip = self.set_addr(claim);
         t.mark("claim_ip");
-        // A user's checkpoint is immutable: restorable again, run or not.
         self.restore_checkpoint(&name, ck, ip, false, paused, &mut t).map_err(|(Restore::NotRun(e) | Restore::Ran(e) | Restore::Uncertain(e))| e)
     }
 
-    /// Restores `ck` as VM `name` at `ip` (claimed), its memory paged in from
-    /// the checkpoint and pulled in the background. An `owned` checkpoint (a
-    /// suspended VM's) is marked STARTED before the VM runs and deleted once
-    /// it is not needed. `hold`: left paused until SIGCONT.
+    /// An `owned` (suspended) checkpoint is durably marked STARTED before the
+    /// VM runs and deleted once not needed. `hold`: left paused until SIGCONT.
     fn restore_checkpoint(&self, name: &str, ck: Checkpoint, ip: Ipv4Addr, owned: bool, hold: bool, t: &mut Phases) -> std::result::Result<Value, Restore> {
         let m = ck.manifest.clone();
         let to_load = (ck.data_pages() * PAGE_SIZE as u64) >> 20;
@@ -279,7 +256,6 @@ impl Proc {
         };
         ready.map_err(|e| Restore::NotRun(kill(e)))?;
         if hold {
-            // Held paused, devices too, until SIGCONT; memory still paged in.
             if ip != m.ip {
                 *vm.pending_net.lock().unwrap() = Some(m.ip);
             }
@@ -291,14 +267,13 @@ impl Proc {
         }
         let still = self.still_current(ip).map_err(|e| Restore::NotRun(kill(e)))?;
         if owned {
-            // Durably consumed before it can run: a crash must not bring it back.
+            // A crash must not bring it back once it may have run.
             let failing = |e: &str| std::fs::remove_file(dir.join(STARTED)).and(Err(std::io::Error::other(format!("injected fault: {e}"))));
             let marked = match fault("started_fsync") {
                 true => std::fs::File::create(dir.join(STARTED)).and(Err(std::io::Error::other("injected fault: fsync failed"))),
                 false => mark_durably(&dir, STARTED),
             };
             if let Err(e) = marked {
-                // It may be on disk, or get there: take it back durably.
                 vm.kill();
                 let unmarked = if fault("started_unmark") { failing("fsync failed") } else { unmark_durably(&dir, STARTED) };
                 return Err(match unmarked {
@@ -308,7 +283,6 @@ impl Proc {
             }
             *self.consumed.lock().unwrap() = Some(dir.clone());
         }
-        // From the resume request on, the vCPUs may have run.
         vm.unpause().map_err(|e| Restore::Ran(kill(e)))?;
         drop(still);
         t.mark("resume");
@@ -328,7 +302,6 @@ impl Proc {
             Ok(ready)
         })()
         .map_err(|e| Restore::Ran(kill(e)))?;
-        // The guest's clock stopped when it was checkpointed.
         let clock = vm.sync_clock(Instant::now() + CLOCK_DEADLINE);
         t.mark("clock");
         self.announce();
@@ -337,7 +310,7 @@ impl Proc {
         thread::spawn(move || {
             let pulled = vm.pager.wait_pulled();
             eprintln!("vm {}: {to_load} MiB paged in from {} (complete: {pulled}, {:?} ms)", vm.name, dir.display(), vm.pager.pull_time().map(ms));
-            // Under the operation lock: a suspend may be about to write here.
+            // Under the op lock: a suspend may be about to write here.
             if let Some(p) = p {
                 let _op = p.op();
                 if let Some(dir) = p.consumed.lock().unwrap().take() {
@@ -359,12 +332,9 @@ impl Proc {
         }))
     }
 
-    /// Checkpoints `vm` through `staging`: its manifest, and what to report.
-    /// Without `cow` the VM stays paused for the write, left `Checkpointing`
-    /// (as it was on failure; failed if a checkpoint may have been published
-    /// that could not be revoked). With `cow` it is paused only until memory
-    /// is write-protected, and runs on while the pages are written.
-    /// `incremental`: a delta on its last checkpoint here.
+    /// Without `cow` the VM stays paused (`Checkpointing`) for the write, and
+    /// is marked failed if a checkpoint that could not be revoked may have been
+    /// published. With `cow` it runs on once memory is write-protected.
     fn save(&self, vm: &Arc<Vm>, mut staging: Staging, cow: bool, incremental: bool, t: &mut Phases) -> Result<(Manifest, Value)> {
         let last = |e: &dyn std::fmt::Display| format!("the last checkpoint of vm {}: {e}; take a full one", vm.name);
         let parent = match incremental {
@@ -373,7 +343,6 @@ impl Proc {
                 let Some((dir, id)) = vm.last_checkpoint.lock().unwrap().clone().filter(|_| vm.pager.tracking()) else {
                     bail!("vm {} has no checkpoint to build on: take a full one with --keep-running first (an incremental checkpoint builds on the last one taken of the vm on this host, since it was last restored or migrated, that the vm ran on after)", vm.name)
                 };
-                // The whole chain must restore, with room for one more.
                 let ck = Checkpoint::open(&dir).map_err(|e| last(&e))?;
                 if ck.id != id {
                     bail!("{}", last(&format!("{} has changed", dir.display())));
@@ -381,8 +350,7 @@ impl Proc {
                 if ck.chain.len() + 2 > crate::checkpoint::MAX_CHAIN {
                     bail!("vm {}: a delta on {} would make a chain of more than {} checkpoints; take a full one", vm.name, dir.display(), crate::checkpoint::MAX_CHAIN);
                 }
-                // A VM that stops after this is never stopped onto a chain
-                // that cannot restore: read the pages it inherits now.
+                // Never stop a VM onto a chain that cannot restore.
                 if !cow {
                     ck.verify_data().map_err(|e| last(&e))?;
                     t.mark("verify_chain");
@@ -402,7 +370,6 @@ impl Proc {
             }
             Ok(())
         };
-        // A VM still pulling its memory finishes first, unless being killed.
         let drained = Instant::now() + DRAIN_WAIT;
         while vm.pager.remote_left() > 0 && !vm.pager.wait_pulled_for(Duration::from_millis(100)) {
             cancelled()?;
@@ -411,16 +378,14 @@ impl Proc {
             }
         }
         t.mark("drain");
-        // A virtio-mem request in flight could discard memory after the state
-        // is saved (paused vCPUs do not stop the device): let it settle.
+        // Paused vCPUs do not stop virtio-mem discarding memory after the save.
         vm.settle_hotplug(Instant::now() + SETTLE_WAIT)?;
         t.mark("settle_hotplug");
         let present = vm.pager.census()[crate::uffd::PRESENT as usize];
         staging.preallocate(if incremental { present.min(vm.pager.dirty_count()) } else { present })?;
         t.mark("preallocate");
         if cow {
-            // Write-protected while it still runs, so the pause only re-protects
-            // what it writes from now. Arming starts the dirty history afresh.
+            // Arm while running so the pause only re-protects what it writes from now.
             if !vm.pager.tracking() {
                 *vm.last_checkpoint.lock().unwrap() = None;
             }
@@ -432,8 +397,7 @@ impl Proc {
         vm.start_checkpoint()?;
         let paused = Instant::now();
         let mut hold = PacketHold { d: self, vm, id: crate::migrate::migration_id(), stats: None };
-        // A failed checkpoint gives back the dirty pages it took
-        // (`Pager::unfreeze`), so the last one stays the base of the next delta.
+        // Failure must `unfreeze` so the last checkpoint stays the delta base.
         let mut memhash = None;
         let frozen = (|| -> Result<Frozen> {
             let runs = vm.save_state(&staging.vmstate(), false, true, || hold.hold(), &mut Phases::new())?;
@@ -447,8 +411,6 @@ impl Proc {
             }
             let frozen = vm.pager.freeze(&runs, incremental, cow)?;
             t.mark("freeze");
-            // A device discard from just before the snapshot on would make
-            // the pages disagree with the saved state.
             let checked = match vm.pager.discards() != vm.snapshot_discards.load(Ordering::SeqCst) {
                 true => Err("guest memory changed after the vm was paused (a device discarded pages); try again".into()),
                 false => cancelled(),
@@ -460,9 +422,8 @@ impl Proc {
             Err(r) => format!("{e}; {r}").into(),
         })?;
         let (mut pause, mut growth) = (None, None);
-        // Free page reports wait in the balloon's queue until the copy is over
-        // (released when this drops): a discard of an unsaved page would stall
-        // the guest. The guard first: a hold whose answer is lost may still apply.
+        // Hold free page reports during the copy (discarding an unsaved page
+        // would stall the guest). Guard first: a lost answer may still apply.
         let _held = (cow && !fault("ckpt_no_hold")).then(|| {
             let held = HeldReports(vm);
             if let Err(e) = vm.hold_reports() {
@@ -474,10 +435,8 @@ impl Proc {
             hold.end().inspect_err(|_| vm.pager.unfreeze(&frozen))?;
             pause = Some(paused.elapsed());
             t.mark("resume");
-            // Running on during the copy: it may grow meanwhile.
             growth = Some(CopyGrowth::start(vm));
             if fault("ckpt_abort") {
-                // Test: give the copy up half way through.
                 let (pager, c) = (vm.pager.clone(), frozen.cow.clone().unwrap());
                 let half = c.left() / 2;
                 thread::spawn(move || {
@@ -489,7 +448,6 @@ impl Proc {
                 });
             }
         }
-        // Test gate: COW armed, disk writers held off until the test is done.
         while cow && fault("ckpt_copy_wait") {
             cancelled().inspect_err(|_| vm.pager.unfreeze(&frozen))?;
             thread::sleep(Duration::from_millis(10));
@@ -510,8 +468,7 @@ impl Proc {
             if fault("ckpt_fail_write") {
                 bail!("injected fault: writing the checkpoint failed");
             }
-            // The chain this delta needs must still be there, unchanged, walked
-            // as a restore will (this one's `../NAME` is NAME in the pinned dir).
+            // The parent chain must be unchanged, walked as a restore will.
             if let (Some(p), Some(ids)) = (&parent_ref, &links) {
                 let first = p.path.strip_prefix("../").map_or_else(|| PathBuf::from(&p.path), |name| pinned.join(name));
                 let now = crate::checkpoint::chain_ids(&first);
@@ -520,7 +477,6 @@ impl Proc {
                 }
             }
             match &frozen.cow {
-                // Discards while it runs are fine once their pages were saved.
                 Some(c) => {
                     if let Some(why) = c.error() {
                         bail!("{why}; try again");
@@ -531,14 +487,12 @@ impl Proc {
                 }
                 None => {}
             }
-            // A copy-on-write copy lets the VM grow; it saved the size at the pause.
             match vm.hotplug_plugged() {
                 Some(now) if cow && now >= plugged.unwrap_or(0) => Ok(()),
                 now if now == plugged => Ok(()),
                 now => bail!("guest memory was resized during the checkpoint ({plugged:?} -> {now:?} MiB plugged); try again"),
             }
         });
-        // No resize is in progress once this drops, and none starts.
         drop(growth);
         let copy = frozen.cow.as_ref().map(|c| c.report());
         match &committed {
@@ -548,7 +502,6 @@ impl Proc {
         let paused = pause.unwrap_or_else(|| paused.elapsed());
         match committed {
             Ok((manifest, id)) => {
-                // The new base of deltas, if the VM runs on with tracking.
                 *vm.last_checkpoint.lock().unwrap() = cow.then(|| (dest, id.clone()));
                 Ok((manifest, json!({
                     "id": id,
@@ -565,7 +518,6 @@ impl Proc {
                 Ok(_) => Err(e),
                 Err(r) => Err(format!("{e}; {r}").into()),
             },
-            // Running on already: like any checkpoint of a VM that ran on.
             Err(CommitError::Uncertain(e)) if cow => Err(format!("{e}; the checkpoint may reappear after a crash").into()),
             Err(CommitError::Uncertain(e)) => {
                 vm.set_failed();
@@ -575,9 +527,8 @@ impl Proc {
     }
 }
 
-/// Packets for the VM while a checkpoint has it paused, held as a migration
-/// does (see `hold`); `end` injects them into its tap and routes the address
-/// back before it resumes, ahead of newer traffic. Dropped, they are forgotten.
+/// Packets held while a checkpoint pauses the VM; `end` injects them before
+/// it resumes, ahead of newer traffic. Dropped, they are forgotten.
 struct PacketHold<'a> {
     d: &'a Proc,
     vm: &'a Vm,
@@ -586,20 +537,17 @@ struct PacketHold<'a> {
 }
 
 impl PacketHold<'_> {
-    /// `save_state`'s `unroute`: just before the pause.
     fn hold(&self) {
         if let Some(Err(e)) = self.d.holder().map(|h| h.hold(self.vm.ip, self.id)) {
             eprintln!("vm {}: not holding packets during the checkpoint: {e}", self.vm.name);
         }
     }
 
-    /// Hands the held packets to the VM, then `Vm::end_checkpoint`.
     fn end(&mut self) -> Result<State> {
         let Some(h) = self.d.holder() else { return self.vm.end_checkpoint() };
         let (ip, tap) = (self.vm.ip, &self.vm.tap);
         self.stats = crate::migrate::release_into(h, ip, self.id, self.vm, CKPT_RELEASE, |()| crate::net::attach(ip, tap));
         let res = self.vm.end_checkpoint();
-        // Never left on the device, even if the route could not be switched back.
         h.forget(ip, self.id);
         res
     }
@@ -613,8 +561,6 @@ impl Drop for PacketHold<'_> {
     }
 }
 
-/// Releases the free page reports a copy-on-write checkpoint held (else the
-/// controller retries).
 struct HeldReports<'a>(&'a Vm);
 
 impl Drop for HeldReports<'_> {
@@ -625,8 +571,7 @@ impl Drop for HeldReports<'_> {
     }
 }
 
-/// While alive, the VM may grow although its checkpoint holds the operation
-/// lock (see `Proc::resize`); dropping it waits for a resize in progress.
+/// While alive the VM may grow despite the checkpoint's op lock (`Proc::resize`).
 struct CopyGrowth<'a>(&'a Vm);
 
 impl<'a> CopyGrowth<'a> {
@@ -651,7 +596,6 @@ fn mark_durably(dir: &Path, name: &str) -> std::io::Result<()> {
     std::fs::File::open(dir)?.sync_all()
 }
 
-/// Removes `dir/name` (or `dir/manifest.json`: `delete_checkpoint`), if there, durably.
 fn unmark_durably(dir: &Path, name: &str) -> std::io::Result<()> {
     match std::fs::remove_file(dir.join(name)) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
@@ -659,17 +603,15 @@ fn unmark_durably(dir: &Path, name: &str) -> std::io::Result<()> {
     }
 }
 
-/// Deletes a checkpoint marked STARTED or DISCARDED: the manifest first,
-/// durably (what is left cannot load), then the rest, so a crash midway
-/// never leaves a complete checkpoint without its marker.
+/// Manifest first, durably, so a crash midway never leaves a loadable
+/// checkpoint without its marker.
 pub fn delete_consumed(name: &str, dir: &Path) {
     if let Err(e) = unmark_durably(dir, "manifest.json").and_then(|()| std::fs::remove_dir_all(dir)) {
         eprintln!("vm {name}: removing {}: {e}", dir.display());
     }
 }
 
-/// Deletes suspended VM `name` (killed, or its checkpoint consumed): marked
-/// DISCARDED durably first, then its address freed and withdrawn.
+/// Marked DISCARDED durably before the address is freed and withdrawn.
 pub fn discard(host: &Host, name: &str) -> Result<()> {
     let dir = host.suspended(name);
     let (ip, gen) = (manifest(&dir).map(|m| m.ip), read_gen(&dir));
@@ -687,13 +629,11 @@ pub fn discard(host: &Host, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// A checkpoint's manifest, unverified.
 fn manifest(dir: &Path) -> Option<Manifest> {
     let text = std::fs::read(dir.join("manifest.json")).ok()?;
     serde_json::from_slice(text.splitn(2, |&b| b == b'\n').nth(1)?).ok()
 }
 
-/// What `ls` shows of a suspended VM; not one consumed or discarded.
 pub fn describe_suspended(host: &Host, name: &str) -> Option<Value> {
     let dir = host.suspended(name);
     if dir.join(STARTED).exists() || dir.join(DISCARDED).exists() {
@@ -708,7 +648,7 @@ pub fn describe_suspended(host: &Host, name: &str) -> Option<Value> {
     }))
 }
 
-/// Test hook: the canonical hash of the memory a checkpoint (chain) restores.
+/// Test hook.
 pub fn ckhash(paths: &crate::template::Paths, dir: &Path) -> Result<Value> {
     let ck = Checkpoint::open(dir)?;
     let tpl = Template::open(paths, &ck.manifest.template)?;

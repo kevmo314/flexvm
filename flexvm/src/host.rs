@@ -1,11 +1,8 @@
-//! Host-wide state in files, shared by VM processes and the peer listener:
-//! configuration, the VM registry, address generations and loans, incoming
-//! migration records, memory grants and test faults. Acquisitions (names,
-//! addresses, migration records) are guards that give back exactly what they
-//! took. Short critical sections take the host lock (`STATE/lock`); nothing
-//! slow happens under it. A VM process holds `RUN/vms/NAME.lock`, its
-//! identity in it, for life. A dead process counts as gone only once the
-//! Firecrackers it started have exited (`reap`).
+//! Host-wide state in files, shared by VM processes and the listener.
+//! Acquisitions (names, addresses, migration records) are guards that give
+//! back exactly what they took. The host lock (`STATE/lock`) covers only short
+//! sections. A VM process holds `RUN/vms/NAME.lock` for life; a dead one
+//! counts as gone only once its Firecrackers have exited (`reap`).
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -24,23 +21,20 @@ use crate::bail;
 use crate::net::IpRange;
 use crate::util::Result;
 
-/// The host's configuration (`STATE/host.json`, written by `flexvm listen`).
+/// `STATE/host.json`, written by `flexvm listen`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// The peer listener's address, as peers reach it.
     pub listen: Option<String>,
     pub peers: Vec<String>,
-    /// The addresses this host hands to new VMs; disjoint across hosts.
+    /// Disjoint across hosts.
     pub vm_ips: String,
-    /// This host's address for peers' routes (default: the listen address's).
+    /// Default: the listen address's.
     pub underlay: Option<Ipv4Addr>,
-    /// Answer ARP for local VMs on this interface, announce arrivals there.
     pub announce_dev: Option<String>,
     pub dns: Option<String>,
-    /// Memory to keep free (MiB).
     pub reserve_mib: u64,
-    /// Names of taps, hold devices and cgroups start with this.
+    /// Of taps, hold devices and cgroups.
     pub prefix: String,
 }
 
@@ -69,7 +63,7 @@ impl Config {
     }
 }
 
-/// A JSON record: None if absent; unreadable or corrupt is an error.
+/// Unreadable or corrupt is an error, never None.
 pub fn load<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
     match std::fs::read(path) {
         Ok(b) => Ok(Some(serde_json::from_slice(&b).map_err(|e| format!("{}: {e}", path.display()))?)),
@@ -78,13 +72,11 @@ pub fn load<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
     }
 }
 
-/// Replaces a JSON record atomically; `durable`, it survives a power loss.
 pub fn store<T: Serialize>(path: &Path, v: &T, durable: bool) -> Result<()> {
     let (dir, name) = (path.parent().ok_or("no directory")?, path.file_name().ok_or("no name")?);
     write_file(dir, &name.to_string_lossy(), &serde_json::to_vec(v)?, durable).map_err(|e| format!("{}: {e}", path.display()).into())
 }
 
-/// Removes a record (absent is fine), durably.
 fn remove(path: &Path) -> Result<()> {
     match std::fs::remove_file(path) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => bail!("{}: {e}", path.display()),
@@ -103,7 +95,6 @@ static RUN_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 impl Host {
     pub fn open(state: &Path, run: &Path) -> Result<Host> {
-        // Made if we can (root); a reader such as `ls` does without.
         for d in ["addrs", "standby", "migs"] {
             let _ = crate::util::create_dir_durably(&state.join(d));
         }
@@ -118,7 +109,6 @@ impl Host {
         Ok(Host { state, run, cfg })
     }
 
-    /// Changes the configuration as it is on disk now, under the host lock.
     pub fn configure(&mut self, change: impl FnOnce(&mut Config) -> Result<()>) -> Result<()> {
         let _l = self.lock()?;
         let path = self.state.join("host.json");
@@ -129,8 +119,8 @@ impl Host {
         Ok(())
     }
 
-    /// The host lock. Reentrant within a thread (so a guard dropped under it
-    /// cannot deadlock); other threads wait as other processes do.
+    /// Reentrant within a thread (so a guard dropped under it cannot
+    /// deadlock); other threads wait as other processes do.
     pub fn lock(&self) -> Result<Locked> {
         if DEPTH.with(|d| d.get()) > 0 {
             DEPTH.with(|d| d.set(d.get() + 1));
@@ -147,7 +137,6 @@ impl Host {
         self.vms(name, "sock")
     }
 
-    /// `RUN/vms/NAME.EXT`.
     pub fn vms(&self, name: &str, ext: &str) -> PathBuf {
         self.run.join("vms").join(format!("{name}.{ext}"))
     }
@@ -156,9 +145,7 @@ impl Host {
         self.state.join("suspended").join(name)
     }
 
-    /// Takes `name` for this process while the lock lives. Refused if a live
-    /// process has it, or a suspended VM (unless `resuming` it). What a dead
-    /// holder left running goes first.
+    /// What a dead holder left running is reaped first.
     pub fn take_name(&self, name: &str, resuming: bool) -> Result<NameLock> {
         check_name(name)?;
         if !resuming && self.suspended(name).exists() {
@@ -176,7 +163,6 @@ impl Host {
         Ok(NameLock { name: name.into(), host: self.clone(), _file: f })
     }
 
-    /// Whether a live process holds `name`.
     pub fn alive(&self, name: &str) -> bool {
         File::open(self.vms(name, "lock")).is_ok_and(|f| flock(&f, libc::LOCK_SH | libc::LOCK_NB).is_err())
     }
@@ -185,13 +171,11 @@ impl Host {
         load(&self.vms(name, "lock")).ok().flatten()
     }
 
-    /// Whether nothing of VM `name` runs here: no process holds the name, and
-    /// the Firecrackers of the last one that did have exited.
+    /// Also requires the last holder's Firecrackers to have exited.
     fn gone(&self, name: &str) -> bool {
         !self.alive(name) && self.holder_of(name).is_none_or(|id| !id.alive() && reap(&self.run, &id).is_ok())
     }
 
-    /// The registry entries of live VMs.
     pub fn entries(&self) -> Vec<Entry> {
         let mut out: Vec<Entry> = std::fs::read_dir(self.run.join("vms"))
             .into_iter()
@@ -203,8 +187,7 @@ impl Host {
         out
     }
 
-    /// The registry entry of live VM `name`, written by the process that
-    /// holds the name now.
+    /// Only believed if written by the process holding the name now.
     pub fn entry(&self, name: &str) -> Result<Entry> {
         match load::<Entry>(&self.vms(name, "json")) {
             Ok(Some(e)) if self.alive(name) && self.holder_of(name) == Some(e.ident.clone()) => Ok(e),
@@ -212,14 +195,13 @@ impl Host {
         }
     }
 
-    /// Sends `sig` to live VM `name`; the pidfd stays that process's.
     pub fn signal(&self, name: &str, sig: i32) -> Result<PidFd> {
         let fd = PidFd::open(&self.entry(name)?.ident)?.ok_or_else(|| format!("no vm named {name:?}"))?;
         fd.signal(sig)?;
         Ok(fd)
     }
 
-    // Addresses and generations. Every function here wants the host lock.
+    // Addresses and generations: all under the host lock.
 
     fn addr_path(&self, ip: Ipv4Addr) -> PathBuf {
         self.state.join("addrs").join(ip.to_string())
@@ -233,13 +215,10 @@ impl Host {
         store(&self.addr_path(ip), a, durable)
     }
 
-    /// Whether `a`'s holder is a VM here: running, or suspended.
     fn held(&self, a: &Addr) -> bool {
         a.holder.as_deref().is_some_and(|h| !self.gone(h) || self.suspended(h).exists())
     }
 
-    /// Hands an address of this host's range (`want`, or the first free one)
-    /// to new VM `holder`, with a new generation.
     pub fn claim_new(&self, l: &Locked, holder: &str, want: Option<Ipv4Addr>) -> Result<AddrClaim> {
         let range = self.cfg.range()?;
         let taken = |ip| self.addr(l, ip).map_or(true, |a| a.lent.is_some() || self.held(&a));
@@ -254,13 +233,10 @@ impl Host {
         };
         let a = self.addr(l, ip)?;
         let gen = self.next_gen(a.seen)?;
-        // The high-water mark orders generations: this need not be durable.
         self.put_addr(ip, &Addr { seen: gen, holder: Some(holder.into()), held: gen, lent: a.lent, ..Addr::default() }, false)?;
         Ok(AddrClaim { host: self.clone(), ip, gen, holder: holder.into(), kept: false, fresh: true })
     }
 
-    /// Lends `ip`, of this host's range, to a peer restoring a checkpoint
-    /// with it, if free here: durably, with a new generation (returned).
     pub fn lend_new(&self, l: &Locked, ip: Ipv4Addr) -> Result<u64> {
         if !self.cfg.range()?.contains(ip) {
             bail!("{ip} is not from this host's range {}", self.cfg.vm_ips);
@@ -277,8 +253,8 @@ impl Host {
         Ok(gen)
     }
 
-    /// A generation newer than `seen` and any handed out here before, across
-    /// crashes and reboots: a high-water mark reserved `GEN_BLOCK` at a time.
+    /// Monotonic across crashes and reboots: a high-water mark reserved
+    /// durably `GEN_BLOCK` at a time.
     fn next_gen(&self, seen: u64) -> Result<u64> {
         const GEN_BLOCK: u64 = 1024;
         #[derive(Serialize, Deserialize)]
@@ -296,9 +272,6 @@ impl Host {
         Ok(gen)
     }
 
-    /// Takes in `ip` for a VM arriving (or resumed) with generation `gen`.
-    /// Refused if a VM here holds it, if that generation was superseded or
-    /// withdrawn, or if it is lent out with a newer one.
     pub fn claim_incoming(&self, l: &Locked, holder: &str, ip: Ipv4Addr, gen: u64) -> Result<AddrClaim> {
         let mut a = self.addr(l, ip)?;
         if gen == 0 {
@@ -321,8 +294,7 @@ impl Host {
         Ok(AddrClaim { host: self.clone(), ip, gen, holder: holder.into(), kept: false, fresh: false })
     }
 
-    /// An arrival commits: its generation must still be current. Takes back
-    /// a loan of it (the VM came home).
+    /// Also takes back a loan of it (the VM came home).
     pub fn commit_incoming(&self, l: &Locked, ip: Ipv4Addr, gen: u64) -> Result<()> {
         let mut a = self.addr(l, ip)?;
         if !a.current(gen) {
@@ -344,8 +316,6 @@ impl Host {
         Ok(())
     }
 
-    /// Records `ip`, if of this host's range, as lent with generation `gen`
-    /// (its VM is about to leave), durably.
     pub fn lend(&self, l: &Locked, ip: Ipv4Addr, gen: u64) -> Result<()> {
         if !self.cfg.range()?.contains(ip) {
             return Ok(());
@@ -355,7 +325,6 @@ impl Host {
         self.put_addr(ip, &a, true)
     }
 
-    /// Takes back a loan of generation `gen` (the migration aborted).
     pub fn unlend(&self, l: &Locked, ip: Ipv4Addr, gen: u64) -> Result<()> {
         let mut a = self.addr(l, ip)?;
         if a.lent == Some(gen) {
@@ -365,10 +334,8 @@ impl Host {
         Ok(())
     }
 
-    /// Takes in a message about generation `gen` of `ip`: its VM is at `via`,
-    /// or (None) withdrawn. False if stale (an older generation, or an
-    /// announcement of a withdrawn one). A withdrawal frees a loan of its
-    /// generation or an older one.
+    /// `via` None is a withdrawal. False if stale (older, or announcing a
+    /// withdrawn generation). A withdrawal frees a loan of that gen or older.
     pub fn observe(&self, l: &Locked, ip: Ipv4Addr, gen: u64, via: Option<Ipv4Addr>) -> Result<bool> {
         let mut a = self.addr(l, ip)?;
         if gen < a.seen || (gen == a.seen && a.withdrawn && via.is_some()) {
@@ -385,17 +352,13 @@ impl Host {
         Ok(true)
     }
 
-    /// Whether the VM here holding `ip` keeps its route against a peer's
-    /// message about generation `gen`: it has that one or newer, or is a
-    /// migration's paused source (whose release moves the route).
+    /// A paused migration source keeps its route too: its release moves it.
     pub fn keeps_route(&self, l: &Locked, ip: Ipv4Addr, gen: u64) -> Result<bool> {
         let a = self.addr(l, ip)?;
         let source = || a.holder.as_deref().and_then(|h| self.entry(h).ok()).is_some_and(|e| e.state == "source");
         Ok(self.held(&a) && (a.held >= gen || source()))
     }
 
-    /// Puts back the route a peer announced for `ip`'s current generation
-    /// once nothing here holds the address. Whether it did.
     pub fn reinstall(&self, l: &Locked, ip: Ipv4Addr) -> Result<bool> {
         let a = self.addr(l, ip)?;
         let Some(via) = a.via.filter(|_| !a.withdrawn && !self.held(&a)) else { return Ok(false) };
@@ -408,16 +371,13 @@ impl Host {
         Ok(self.addr(l, ip)?.current(gen))
     }
 
-    /// The VM here holding `ip`, if any.
     pub fn holder(&self, l: &Locked, ip: Ipv4Addr) -> Result<Option<String>> {
         let a = self.addr(l, ip)?;
         Ok(self.held(&a).then_some(a.holder).flatten())
     }
 
-    /// Admits `mib` of VM memory unless it would take the host below its
-    /// reserve. MemAvailable lags a grant until the guest touches the
-    /// memory, so grants of the last `GRANT_WINDOW` (`RUN/grants`, all
-    /// processes') count as used.
+    /// MemAvailable lags a grant until the guest touches the memory, so all
+    /// processes' grants of the last `GRANT_WINDOW` count as used.
     pub fn admit(&self, mib: u64) -> bool {
         let Ok(_l) = self.lock() else { return false };
         let path = self.run.join("grants");
@@ -432,16 +392,13 @@ impl Host {
         store(&path, &grants, false).is_ok()
     }
 
-    // Incoming migrations: `STATE/migs/ID`, durable, changed under the host
-    // lock. No record means aborted: one is made by `mig_begin` and goes when
-    // its process gives up before committing, is found dead before
-    // committing, or once the source says it is done with it.
+    // Incoming migrations: `STATE/migs/ID`, durable, under the host lock.
+    // No record means aborted.
 
     fn mig_path(&self, id: u64) -> PathBuf {
         self.state.join("migs").join(id.to_string())
     }
 
-    /// Records migration `id` as pending here, for this process; once only.
     pub fn mig_begin(&self, id: u64) -> Result<MigRecord> {
         let _l = self.lock()?;
         if load::<Mig>(&self.mig_path(id))?.is_some() {
@@ -451,11 +408,8 @@ impl Host {
         Ok(MigRecord { host: self.clone(), id, committed: false })
     }
 
-    /// How migration `id` went here: `pending`, `committed`, `released` (a
-    /// live target had every page, or destroyed the VM on purpose) or
-    /// `aborted`. One whose process died is aborted (its record goes) once
-    /// its Firecrackers are dead: committed or not, the VM is not here, and
-    /// its source's paused copy is the only one left.
+    /// A record whose process died becomes aborted once its Firecrackers are
+    /// dead: committed or not, the source's paused copy is the only one left.
     pub fn mig_status(&self, id: u64) -> Result<&'static str> {
         let _l = self.lock()?;
         let path = self.mig_path(id);
@@ -472,7 +426,6 @@ impl Host {
         })
     }
 
-    /// The source of migration `id` will never ask about it again.
     pub fn mig_done(&self, id: u64) -> Result<()> {
         let _l = self.lock()?;
         match load(&self.mig_path(id))? {
@@ -482,42 +435,33 @@ impl Host {
     }
 }
 
-/// How long a grant of memory counts as used.
 const GRANT_WINDOW: Duration = Duration::from_secs(10);
 
-/// What a host knows about one of the addresses it has seen.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Addr {
-    /// The newest generation seen, and whether it was withdrawn.
     pub seen: u64,
     pub withdrawn: bool,
-    /// Of this host's range, gone with a VM of this generation (migrated, or
-    /// restored elsewhere): not handed out until that VM is withdrawn or back.
+    /// Gone with a VM of this generation: not handed out until withdrawn or back.
     pub lent: Option<u64>,
-    /// The VM here using it (alive or suspended), and with what generation.
     pub holder: Option<String>,
     pub held: u64,
-    /// Where a peer said the newest generation's VM is (see `reinstall`).
     pub via: Option<Ipv4Addr>,
 }
 
 impl Addr {
-    /// Whether generation `gen` may still be live: none newer, not withdrawn.
     pub fn current(&self, gen: u64) -> bool {
         gen > self.seen || (gen == self.seen && !self.withdrawn)
     }
 }
 
-/// A VM's claim on an address and generation. Dropped, it gives the address
-/// back; a suspended VM `keep`s it.
+/// Dropped, it gives the address back; a suspended VM `keep`s it.
 pub struct AddrClaim {
     host: Host,
     pub ip: Ipv4Addr,
     pub gen: u64,
     holder: String,
     kept: bool,
-    /// A generation made for this VM (not brought along): withdrawn even if
-    /// the VM never ran.
+    /// A generation made for this VM: withdrawn even if the VM never ran.
     pub fresh: bool,
 }
 
@@ -540,20 +484,17 @@ impl Drop for AddrClaim {
     }
 }
 
-/// An incoming migration's record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "lowercase")]
 pub enum Mig {
-    /// Being taken in by `owner`; the VM has not run here.
     Pending { owner: Ident },
-    /// The VM is `owner`'s, here: its source must never run it again.
+    /// The source must never run it again.
     Committed { owner: Ident },
-    /// The VM has all its memory here, or is gone: its source may go.
+    /// All memory is here, or the VM is gone: the source may exit.
     Released,
 }
 
-/// A migration record this process made; dropped before it commits, the
-/// record goes (aborted).
+/// Dropped before it commits, the record goes (aborted).
 pub struct MigRecord {
     host: Host,
     pub id: u64,
@@ -561,8 +502,7 @@ pub struct MigRecord {
 }
 
 impl MigRecord {
-    /// Pending to committed: from here on this host owns the VM. Refused if
-    /// the source's query fenced it off meanwhile.
+    /// From here this host owns the VM. Refused if a source query fenced it off.
     pub fn commit(&mut self, _: &Locked) -> Result<()> {
         let path = self.host.mig_path(self.id);
         match load(&path)? {
@@ -573,17 +513,15 @@ impl MigRecord {
         Ok(())
     }
 
-    /// At this process's end: a committed migration whose VM was destroyed
-    /// on purpose (`gone`) is released, so its source goes too; otherwise it
-    /// reads aborted once this process is dead (see `mig_status`).
+    /// Destroyed on purpose (`gone`): released so the source goes too;
+    /// otherwise it reads aborted once this process is dead.
     pub fn settle(self, gone: bool) {
         if gone && self.committed {
             self.release();
         }
     }
 
-    /// Committed to released (the VM has all its memory), retried until it
-    /// is recorded: the source waits for it.
+    /// Retried until recorded: the source waits for it.
     pub fn release(self) {
         let mut delay = Duration::from_millis(100);
         while let Err(e) = self.host.lock().and_then(|_l| store(&self.host.mig_path(self.id), &Mig::Released, true)) {
@@ -605,7 +543,6 @@ impl Drop for MigRecord {
     }
 }
 
-/// The host lock, held until dropped (by its first taker in this thread).
 pub struct Locked(#[allow(dead_code)] Option<(File, std::sync::MutexGuard<'static, ()>)>);
 
 impl Drop for Locked {
@@ -619,7 +556,6 @@ thread_local! {
     static DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// A VM process's claim on its name. Dropping it removes the registry entry.
 pub struct NameLock {
     pub name: String,
     host: Host,
@@ -641,7 +577,6 @@ impl Drop for NameLock {
     }
 }
 
-/// A VM in the registry (`RUN/vms/NAME.json`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Entry {
@@ -654,14 +589,12 @@ pub struct Entry {
     pub template_id: String,
     pub vcpus: u32,
     pub max_mib: u64,
-    /// running, paused, checkpointing, source, failed
     pub state: String,
     pub firecracker: Option<u32>,
-    /// Needs more memory than this host can give it.
     pub starved: bool,
 }
 
-/// A process, by pid, start time and boot: one process, however pids are reused.
+/// Unique however pids are reused.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ident {
     pub pid: u32,
@@ -674,7 +607,6 @@ impl Ident {
         Ident::of(std::process::id()).expect("no /proc/self/stat")
     }
 
-    /// Process `pid` as it is now, if alive.
     pub fn of(pid: u32) -> Option<Ident> {
         Some(Ident { pid, start: starttime(pid)?, boot: boot_id().into() })
     }
@@ -689,14 +621,12 @@ pub fn boot_id() -> &'static str {
     BOOT.get_or_init(|| std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap_or_default().trim().into())
 }
 
-/// A pidfd: signals through it reach the process it was opened for or none.
 pub struct PidFd(OwnedFd);
 
 impl PidFd {
-    /// A pidfd for `id`, or None if that process is gone.
     pub fn open(id: &Ident) -> Result<Option<PidFd>> {
         match crate::util::pidfd_open(id.pid) {
-            // Opened first, then checked: if it is `id` now, the fd is `id`'s.
+            // Opened, then checked: if it is `id` now, the fd is `id`'s.
             Ok(fd) => Ok(id.alive().then_some(PidFd(fd))),
             Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Ok(None),
             Err(e) => bail!("pidfd_open {}: {e}", id.pid),
@@ -707,15 +637,12 @@ impl PidFd {
         Ok(crate::util::pidfd_signal(&self.0, sig).map_err(|e| format!("signal {sig}: {e}"))?)
     }
 
-    /// Waits up to `timeout` for the process to exit.
     pub fn wait(&self, timeout: Duration) -> bool {
         crate::util::pidfd_wait(&self.0, timeout).unwrap_or(false)
     }
 }
 
-/// Kills the Firecrackers dead VM process `owner` left (recorded in its work
-/// directory `RUN/w/PID`, if `owner` is still its owner) and waits for them
-/// to exit. They die with the process anyway, but not at once.
+/// Kills and waits for a dead process's Firecrackers: they die with it, but not at once.
 pub fn reap(run: &Path, owner: &Ident) -> Result<()> {
     if owner.alive() {
         bail!("process {} is alive", owner.pid);
@@ -736,8 +663,6 @@ pub fn reap(run: &Path, owner: &Ident) -> Result<()> {
     Ok(())
 }
 
-/// Removes what dead VM processes left: taps, cgroups and work directories
-/// named after them (only names this host's `prefix` makes).
 pub fn collect_garbage(run: &Path, prefix: &str) {
     let gone = |pid: Option<u32>| pid.is_some_and(|p| starttime(p).is_none());
     for e in std::fs::read_dir("/sys/class/net").into_iter().flatten().flatten() {
@@ -780,8 +705,7 @@ pub fn flock(f: &File, how: i32) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Opens and locks `path`, making sure the lock is on the file the path
-/// names (a holder may unlink it just before we lock).
+/// A holder may unlink the file just before we lock: retry until it is the path's.
 fn lock_path(path: &Path, how: i32) -> std::io::Result<File> {
     loop {
         let f = File::options().create(true).truncate(false).read(true).write(true).open(path)?;
@@ -792,7 +716,6 @@ fn lock_path(path: &Path, how: i32) -> std::io::Result<File> {
     }
 }
 
-/// Replaces `dir/name` atomically; with `durable`, survives a power loss.
 pub fn write_file(dir: &Path, name: &str, data: &[u8], durable: bool) -> std::io::Result<()> {
     let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
     let mut f = File::create(&tmp)?;
@@ -807,7 +730,6 @@ pub fn write_file(dir: &Path, name: &str, data: &[u8], durable: bool) -> std::io
     Ok(())
 }
 
-/// The start time (field 22 of /proc/PID/stat) of a live process.
 pub fn starttime(pid: u32) -> Option<u64> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
@@ -815,8 +737,7 @@ pub fn starttime(pid: u32) -> Option<u64> {
     fields.get(19)?.parse().ok()
 }
 
-/// Whether test fault `name` (`flexvm debug fault`, in `RUN/faults.json`) is
-/// armed; only with FLEXVM_FAULTS=1.
+/// Test faults (`RUN/faults.json`); only with FLEXVM_FAULTS=1.
 pub fn fault(name: &str) -> bool {
     static CACHE: Mutex<Option<(SystemTime, HashMap<String, u64>)>> = Mutex::new(None);
     static ON: OnceLock<bool> = OnceLock::new();
@@ -833,14 +754,13 @@ pub fn fault(name: &str) -> bool {
     c.as_ref().is_some_and(|(_, armed)| armed.get(name).is_some_and(|&until| now < until))
 }
 
-/// Test hook: waits 3 s where `name` is armed, for a test to kill the process there.
+/// Test hook: a window for a test to kill the process here.
 pub fn stall(name: &str) {
     if fault(name) {
         std::thread::sleep(Duration::from_secs(3));
     }
 }
 
-/// Arms `name` for `ms` (0 disarms it).
 pub fn arm(host: &Host, name: &str, ms: u64) -> Result<()> {
     let _l = host.lock()?;
     let path = host.run.join("faults.json");
@@ -852,7 +772,7 @@ pub fn arm(host: &Host, name: &str, ms: u64) -> Result<()> {
         _ => armed.insert(name.into(), now + ms),
     };
     store(&path, &armed, false)?;
-    // A cached copy is reread on the next mtime change; make sure there is one.
+    // Ensure the next write changes the mtime the cache keys on.
     std::thread::sleep(Duration::from_millis(10));
     Ok(())
 }
@@ -873,7 +793,6 @@ mod tests {
         s.parse().unwrap()
     }
 
-    /// A dead process whose work directory records `fcs` as its Firecrackers.
     fn dead_owner(h: &Host, pid: u32, fcs: &[&Ident]) -> Ident {
         let dead = Ident { pid, start: 1, boot: boot_id().into() };
         let dir = h.run.join("w").join(pid.to_string());
@@ -886,7 +805,6 @@ mod tests {
         dead
     }
 
-    /// A process standing in for a Firecracker; reaped by `done`.
     struct Sleeper(std::process::Child, Ident);
 
     impl Sleeper {
@@ -910,7 +828,6 @@ mod tests {
         assert!(h.take_name("a", false).is_err());
         a.publish(&Entry { name: "a".into(), ident: Ident::me(), ..Entry::default() }).unwrap();
         assert!(h.alive("a") && h.entries().len() == 1);
-        // An entry is only believed for the process holding the name.
         a.publish(&Entry { name: "a".into(), ident: Ident { start: 1, ..Ident::me() }, ..Entry::default() }).unwrap();
         assert!(h.entry("a").is_err() && h.signal("a", 0).is_err());
         drop(a);
@@ -926,19 +843,16 @@ mod tests {
     #[test]
     fn a_dead_holders_firecrackers_die_before_its_name_or_address_is_free() {
         let h = host("reap");
-        // Its address is free only once its Firecracker has exited.
         let fc = Sleeper::new();
         store(&h.vms("d", "lock"), &dead_owner(&h, 999_999_901, &[&fc.1]), false).unwrap();
         let l = h.lock().unwrap();
         h.put_addr(ip("10.9.0.1"), &Addr { seen: 1, holder: Some("d".into()), ..Addr::default() }, false).unwrap();
         assert!(fc.1.alive());
         assert!(h.claim_new(&l, "x", Some(ip("10.9.0.1"))).unwrap().gen > 1 && fc.done());
-        // The same for its name, taken over.
         let fc = Sleeper::new();
         store(&h.vms("e", "lock"), &dead_owner(&h, 999_999_902, &[&fc.1]), false).unwrap();
         let _e = h.take_name("e", false).unwrap();
         assert!(fc.done());
-        // A work directory another process owns now is left alone.
         let fc = Sleeper::new();
         dead_owner(&h, 999_999_903, &[&fc.1]);
         reap(&h.run, &Ident { pid: 999_999_903, start: 2, boot: boot_id().into() }).unwrap();
@@ -953,47 +867,37 @@ mod tests {
         let a = h.claim_new(&l, "a", None).unwrap();
         let (a_ip, g1) = (a.ip, a.gen);
         assert_eq!(a_ip, ip("10.9.0.1"));
-        // Held by a live VM: the next claim gets another address.
         let b = h.claim_new(&l, "b-dead", None).unwrap();
         assert!(b.ip == ip("10.9.0.2") && b.gen > g1);
-        // b-dead is not alive: its address is free again, with a newer generation.
         let c = h.claim_new(&l, "c", Some(b.ip)).unwrap();
         assert!(c.gen > b.gen);
         b.keep();
         c.keep();
         assert!(h.claim_new(&l, "x", Some(a_ip)).is_err() && h.claim_new(&l, "x", Some(ip("10.9.9.9"))).is_err());
-        // a leaves: lent until withdrawn with its generation or a newer one.
         h.lend(&l, a_ip, g1).unwrap();
         a.release(&l).unwrap();
         assert!(h.claim_new(&l, "x", Some(a_ip)).is_err());
         assert!(!h.observe(&l, a_ip, g1 - 1, None).unwrap(), "older withdrawal is stale");
         assert!(h.addr(&l, a_ip).unwrap().lent.is_some());
         assert!(h.observe(&l, a_ip, g1, None).unwrap() && h.addr(&l, a_ip).unwrap().lent.is_none());
-        // An announcement of a withdrawn generation is stale; a newer one is not.
         let via = Some(ip("192.0.2.1"));
         assert!(!h.observe(&l, a_ip, g1, via).unwrap() && !h.current(&l, a_ip, g1).unwrap());
         assert!(h.observe(&l, a_ip, g1 + 5, via).unwrap() && h.addr(&l, a_ip).unwrap().via == via);
-        // An arrival with an old or no generation is refused, a current one taken in.
         assert!(h.claim_incoming(&l, "y", a_ip, g1).is_err() && h.claim_incoming(&l, "y", a_ip, 0).is_err());
         h.claim_incoming(&l, "y", a_ip, g1 + 5).unwrap().keep();
         h.commit_incoming(&l, a_ip, g1 + 5).unwrap();
-        // A newer generation than a withdrawn one is current again.
         assert!(h.observe(&l, a_ip, g1 + 5, None).unwrap());
         h.claim_incoming(&l, "y", a_ip, g1 + 6).unwrap().keep();
         assert!(h.current(&l, a_ip, g1 + 6).unwrap());
-        // A refused claim of a held address gives nothing back.
         let _w = h.take_name("w", false).unwrap();
         let wc = h.claim_new(&l, "w", Some(ip("10.9.0.3"))).unwrap();
         assert!(h.claim_incoming(&l, "w2", wc.ip, wc.gen).is_err());
         assert_eq!(h.holder(&l, wc.ip).unwrap().as_deref(), Some("w"));
-        // Another VM's claim, dropped, gives back nothing of w's either.
         drop(h.claim_new(&l, "v", None));
         assert_eq!(h.holder(&l, wc.ip).unwrap().as_deref(), Some("w"));
         wc.keep();
-        // A record that cannot be read is an error, never a free address.
         std::fs::write(h.addr_path(ip("10.9.0.3")), "{").unwrap();
         assert!(h.addr(&l, ip("10.9.0.3")).is_err() && h.claim_new(&l, "z", Some(ip("10.9.0.3"))).is_err());
-        // Generations survive a "reboot": a new boot id jumps to the reserved mark.
         std::fs::write(h.state.join("addrs/.gens"), r#"{"next": 7, "reserved": 2048, "boot": "other"}"#).unwrap();
         assert!(h.claim_new(&l, "z", None).unwrap().gen >= 2048);
         std::fs::write(h.state.join("addrs/.gens"), "x").unwrap();
@@ -1009,7 +913,6 @@ mod tests {
         let g = h.lend_new(&l, x).unwrap();
         assert!(h.lend_new(&l, x).unwrap_err().to_string().contains("lent"));
         assert!(h.claim_new(&l, "x", Some(x)).err().unwrap().to_string().contains("lent"));
-        // The borrower's withdrawal gives it back, with newer generations after.
         assert!(h.observe(&l, x, g, None).unwrap());
         let _x = h.take_name("x", false).unwrap();
         let c = h.claim_new(&l, "x", Some(x)).unwrap();
@@ -1021,14 +924,11 @@ mod tests {
     fn migrations_are_fenced() {
         let h = host("migs");
         let rec = |id: u64| load::<Mig>(&h.mig_path(id)).unwrap();
-        // Unknown: aborted, and nothing is recorded.
         assert!(h.mig_status(1).unwrap() == "aborted" && rec(1).is_none());
-        // Given up before committing: aborted.
         let r = h.mig_begin(2).unwrap();
         assert!(h.mig_begin(2).is_err() && h.mig_status(2).unwrap() == "pending");
         drop(r);
         assert_eq!(h.mig_status(2).unwrap(), "aborted");
-        // Committed, released, forgotten once its source is done with it.
         let mut r = h.mig_begin(3).unwrap();
         r.commit(&h.lock().unwrap()).unwrap();
         h.mig_done(3).unwrap();
@@ -1037,21 +937,16 @@ mod tests {
         assert_eq!(h.mig_status(3).unwrap(), "released");
         h.mig_done(3).unwrap();
         assert!(rec(3).is_none());
-        // Fenced off by a query that found its owner dead: no commit.
         let mut r = h.mig_begin(4).unwrap();
         store(&h.mig_path(4), &Mig::Pending { owner: dead_owner(&h, 999_999_904, &[]) }, false).unwrap();
         assert!(h.mig_status(4).unwrap() == "aborted" && rec(4).is_none() && r.commit(&h.lock().unwrap()).is_err());
-        // Committed by a process that died before releasing: aborted (its
-        // source runs its copy again), once its Firecracker is gone.
         let fc = Sleeper::new();
         store(&h.mig_path(5), &Mig::Committed { owner: dead_owner(&h, 999_999_905, &[&fc.1]) }, false).unwrap();
         assert!(h.mig_status(5).unwrap() == "aborted" && fc.done() && rec(5).is_none());
-        // Destroyed on purpose: released.
         let mut r = h.mig_begin(7).unwrap();
         r.commit(&h.lock().unwrap()).unwrap();
         r.settle(true);
         assert_eq!(h.mig_status(7).unwrap(), "released");
-        // A record that cannot be read answers nothing.
         std::fs::write(h.mig_path(6), "{").unwrap();
         assert!(h.mig_status(6).is_err());
     }
