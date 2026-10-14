@@ -4,19 +4,18 @@
 //! `CHECK <timeout ms> <hex shell command>`, `QUIESCE`. A non-root app runs with no_new_privs and an
 //! empty bounding set, so setuid binaries and file capabilities cannot take it back to root.
 
-use std::collections::VecDeque;
 use std::ffi::CString;
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::os::fd::AsRawFd;
-use std::os::unix::process::CommandExt;
+use std::os::unix::{net::UnixStream, process::CommandExt};
 use std::process::{Command, Stdio};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Condvar, LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::{fail, mem, msg, spawn, wait_pid, write_frame, Statuses, FRAME_STDOUT};
+use crate::{fail, mem, msg, session::Output, spawn, wait_pid, write_frame, Statuses, FRAME_STDOUT};
 
 const CONF: &str = "/etc/flexvm/app.conf";
 const RING_BYTES: usize = 1 << 20;
@@ -32,22 +31,16 @@ enum State {
 
 struct App {
     state: State,
-    ring: VecDeque<u8>,
-    /// Stream offset of `ring[0]`: output dropped so far.
-    dropped: u64,
+    output: Output,
+    drained: bool,
 }
 
-static APP: Mutex<App> = Mutex::new(App { state: State::Idle, ring: VecDeque::new(), dropped: 0 });
+static APP: LazyLock<Mutex<App>> = LazyLock::new(|| Mutex::new(App { state: State::Idle, output: Output::default(), drained: true }));
 static CHANGED: Condvar = Condvar::new();
 
 impl App {
     fn push(&mut self, data: &[u8]) {
-        self.ring.extend(data);
-        if self.ring.len() > RING_BYTES {
-            let n = self.ring.len() - RING_BYTES;
-            self.ring.drain(..n);
-            self.dropped += n as u64;
-        }
+        self.output.push(FRAME_STDOUT, data, RING_BYTES);
         CHANGED.notify_all();
     }
 
@@ -232,12 +225,26 @@ impl CheckGroup {
     fn cleanup(&mut self) -> io::Result<()> {
         self.done = true;
         std::fs::write(format!("{}/cgroup.kill", self.dir), "1")?;
+        let mut events = File::open(format!("{}/cgroup.events", self.dir))?;
         let deadline = Instant::now() + Duration::from_secs(2);
-        while !std::fs::read_to_string(format!("{}/cgroup.events", self.dir))?.lines().any(|l| l == "populated 0") {
+        loop {
+            events.rewind()?;
+            let mut state = String::new();
+            events.read_to_string(&mut state)?;
+            if state.lines().any(|l| l == "populated 0") {
+                break;
+            }
             if Instant::now() >= deadline {
                 return Err(io::Error::other(format!("{} still has tasks after 2 s", self.dir)));
             }
-            thread::sleep(Duration::from_millis(5));
+            let mut fd = libc::pollfd { fd: events.as_raw_fd(), events: libc::POLLPRI | libc::POLLERR, revents: 0 };
+            let timeout = deadline.saturating_duration_since(Instant::now()).as_millis().max(1) as i32;
+            if unsafe { libc::poll(&mut fd, 1, timeout) } < 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() != io::ErrorKind::Interrupted {
+                    return Err(e);
+                }
+            }
         }
         std::fs::remove_dir(&self.dir)
     }
@@ -294,64 +301,52 @@ fn start(statuses: &Statuses) -> io::Result<i32> {
         mem::enter(&mut cmd, work, true);
     }
     restrict(&mut cmd, &c);
+    let (stop, exited) = UnixStream::pair()?;
     let mut child = spawn(&mut cmd, statuses).map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", c.argv[0])))?;
     let pid = child.id() as i32;
     app.state = State::Running(pid);
+    app.drained = false;
     app.push(format!("flexvm-init: started {:?} as pid {pid}\n", c.argv).as_bytes());
     drop(app);
     let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
-    let pumped = thread::spawn(move || crate::pump(stdout, stderr, |_, data| APP.lock().unwrap().push(data)));
+    thread::spawn(move || {
+        crate::pump(stdout, stderr, Some(File::from(std::os::fd::OwnedFd::from(stop))), |_, data| APP.lock().unwrap().push(data));
+        APP.lock().unwrap().drained = true;
+        CHANGED.notify_all();
+    });
     let statuses = statuses.clone();
     thread::spawn(move || {
         let code = wait_pid(&statuses, pid, None).unwrap_or(-1);
-        join_within(pumped, Duration::from_secs(2));
-        let mut app = APP.lock().unwrap();
+        drop(exited);
+        let mut app = CHANGED.wait_while(APP.lock().unwrap(), |app| !app.drained).unwrap();
         app.state = State::Exited(code);
         app.push(format!("flexvm-init: pid {pid} exited with status {code}\n").as_bytes());
     });
     Ok(pid)
 }
 
-/// Descendants may hold the app's pipes after it exits; never wait indefinitely.
-fn join_within(t: thread::JoinHandle<()>, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
-    while !t.is_finished() && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(5));
-    }
-    if t.is_finished() {
-        let _ = t.join();
-    }
-}
-
 /// Output from `offset` (clamped to the ring), then `<status> <next offset>`; with `follow`, until exit.
-fn logs(out: &File, mut offset: u64, follow: bool) -> io::Result<()> {
+fn logs(mut out: impl Write, mut offset: u64, follow: bool) -> io::Result<()> {
     let stop = {
         let app = APP.lock().unwrap();
-        if follow { u64::MAX } else { app.dropped + app.ring.len() as u64 }
+        if follow { u64::MAX } else { app.output.end }
     };
     loop {
         let (chunk, status, done) = {
-            let mut app = APP.lock().unwrap();
-            loop {
-                let end = app.dropped + app.ring.len() as u64;
-                offset = offset.clamp(app.dropped, end);
-                if offset < end || !follow || !matches!(app.state, State::Running(_)) {
-                    break;
-                }
-                let (a, timeout) = CHANGED.wait_timeout(app, Duration::from_secs(5)).unwrap();
-                app = a;
-                if timeout.timed_out() {
-                    break;
-                }
-            }
-            let start = (offset - app.dropped) as usize;
-            let n = ((app.ring.len() - start) as u64).min(stop.saturating_sub(offset)).min(64 * 1024) as usize;
-            let chunk: Vec<u8> = app.ring.range(start..start + n).copied().collect();
+            let app = APP.lock().unwrap();
+            let (app, _) = CHANGED.wait_timeout_while(app, Duration::from_secs(5), |a| {
+                offset = offset.clamp(a.output.start, a.output.end);
+                follow && offset == a.output.end && matches!(a.state, State::Running(_))
+            }).unwrap();
+            offset = offset.clamp(app.output.start, app.output.end);
+            let chunk = app.output.read_chunk(offset).map_or_else(Vec::new, |(_, data)| {
+                data[..data.len().min(64 * 1024).min(stop.saturating_sub(offset) as usize)].to_vec()
+            });
             (chunk, app.status(), !follow || !matches!(app.state, State::Running(_)))
         };
         offset += chunk.len() as u64;
         // An empty frame doubles as a keepalive that notices a closed connection.
-        write_frame(out, FRAME_STDOUT, &chunk)?;
+        write_frame(&mut out, FRAME_STDOUT, &chunk)?;
         if done && chunk.is_empty() {
             return msg(out, format!("{status} {offset}"));
         }
@@ -371,25 +366,59 @@ mod tests {
     }
 
     #[test]
-    fn pumps_drain_output_and_wait_is_bounded() {
-        let mut child = Command::new("/bin/sh")
-            .args(["-c", "echo app pump marker; echo err >&2"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+    fn pumps_drain_crash_tail_and_bound_inherited_pipes() {
+        let (stop, exited) = UnixStream::pair().unwrap();
+        let mut child = Command::new("/bin/sh");
+        child.args(["-c", "sleep 10 & echo $!; head -c 131072 /dev/zero; echo crash-tail >&2; kill -KILL $$"])
+            .stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = child.spawn().unwrap();
         let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
-        let pumped = thread::spawn(move || crate::pump(stdout, stderr, |_, data| APP.lock().unwrap().push(data)));
-        join_within(pumped, Duration::from_secs(5));
-        child.wait().unwrap();
-        let ring = APP.lock().unwrap().ring.make_contiguous().to_vec();
-        assert!(ring.windows(15).any(|w| w == b"app pump marker") && ring.windows(4).any(|w| w == b"err\n"));
-        let (tx, rx) = std::sync::mpsc::channel::<()>();
-        let blocked = thread::spawn(move || { let _ = rx.recv(); });
+        let pumped = thread::spawn(move || {
+            let mut output = [Vec::new(), Vec::new()];
+            crate::pump(stdout, stderr, Some(File::from(std::os::fd::OwnedFd::from(stop))), |kind, data| {
+                output[usize::from(kind == crate::FRAME_STDERR)].extend_from_slice(data);
+            });
+            output
+        });
+        assert!(!child.wait().unwrap().success());
         let start = Instant::now();
-        join_within(blocked, Duration::from_millis(20));
-        assert!(start.elapsed() < Duration::from_secs(1));
-        tx.send(()).unwrap();
+        drop(exited);
+        let [stdout, stderr] = pumped.join().unwrap();
+        // Clean up the descendant without waiting for its sleep to finish.
+        let newline = stdout.iter().position(|&b| b == b'\n').unwrap();
+        let pid = std::str::from_utf8(&stdout[..newline]).unwrap().parse::<i32>().unwrap();
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        assert_eq!(&stdout[newline + 1..], vec![0; 131072]);
+        assert_eq!(stderr, b"crash-tail\n");
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn logs_catch_up_and_deliver_retained_tail_before_exit() {
+        let mut app = APP.lock().unwrap();
+        app.output = Output::default();
+        app.push(&vec![b'x'; RING_BYTES + 10]);
+        app.push(b"crash-tail\n");
+        app.state = State::Exited(7);
+        let end = app.output.end;
+        assert_eq!(app.output.end - app.output.start, RING_BYTES as u64);
+        drop(app);
+        let mut frames = Vec::new();
+        logs(&mut frames, 0, true).unwrap();
+        let mut reader = io::Cursor::new(frames);
+        let mut data = Vec::new();
+        loop {
+            let mut header = [0; 5];
+            reader.read_exact(&mut header).unwrap();
+            let mut chunk = vec![0; u32::from_le_bytes(header[1..].try_into().unwrap()) as usize];
+            reader.read_exact(&mut chunk).unwrap();
+            if header[0] == crate::FRAME_MSG {
+                assert_eq!(chunk, format!("exited 7 {end}").as_bytes());
+                break;
+            }
+            data.extend(chunk);
+        }
+        assert_eq!(data, [vec![b'x'; RING_BYTES - 11], b"crash-tail\n".to_vec()].concat());
     }
 
     #[test]
