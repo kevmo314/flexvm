@@ -328,6 +328,9 @@ pub fn recv_with_fds(s: &UnixStream, max: usize) -> io::Result<(Vec<u8>, Vec<Own
                 c = libc::CMSG_NXTHDR(&msg, c);
             }
         }
+        if msg.msg_flags & libc::MSG_CTRUNC != 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "ancillary fds truncated"));
+        }
         if n == 0 {
             break;
         }
