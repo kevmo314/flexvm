@@ -21,6 +21,14 @@ use crate::bail;
 use crate::net::IpRange;
 use crate::util::Result;
 
+/// What a grant must leave available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Floor {
+    Reserve,
+    /// The eviction mark (`Config::evict_at`): an arrival moved here by eviction.
+    EvictMark,
+}
+
 /// `STATE/host.json`, written by `flexvm listen`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -202,18 +210,16 @@ impl Host {
         cfg
     }
 
-    /// What an arrival moved here by eviction must leave available: this
-    /// host's own eviction mark, so it is not moved straight back. Refused
-    /// while this host is evicting itself.
-    pub fn evict_floor(&self) -> Result<u64> {
-        let cfg = self.config_now();
-        // The marker outlives the last VM here that would clear it: believed while a VM runs here,
-        // below where eviction stops.
-        let evicting = self.run.join("evict.active").exists() && crate::vmproc::host_available_mib() < cfg.evict_until();
-        if evicting && self.entries().iter().any(|e| e.state == "running") {
-            bail!("this host is low on memory itself (moving vms away)");
-        }
-        Ok(cfg.evict_at())
+    /// `STATE/evict.worker.lock`, held by the thread running an eviction for
+    /// as long as it runs (and let go with its process).
+    pub fn evict_worker_lock(&self) -> Option<File> {
+        let f = File::options().create(true).truncate(false).write(true).open(self.state.join("evict.worker.lock")).ok()?;
+        flock(&f, libc::LOCK_EX | libc::LOCK_NB).ok().map(|()| f)
+    }
+
+    /// Whether an eviction runs here now (not merely that the host was under pressure).
+    pub fn evicting(&self) -> bool {
+        self.evict_worker_lock().is_none() && self.state.join("evict.worker.lock").exists()
     }
 
     /// Reentrant within a thread (so a guard dropped under it cannot
@@ -595,6 +601,28 @@ impl Host {
         Ok(self.held(&a).then_some(a.holder).flatten())
     }
 
+    /// Keeps grant `id` (`mib`) counted past `GRANT_WINDOW`, until
+    /// `release_hold` or this process is proven gone: an arrival's memory
+    /// comes in only as it pulls, however long that takes.
+    pub fn hold(&self, id: u64, mib: u64) -> Result<()> {
+        let _l = self.lock()?;
+        let path = self.run.join("grants.held");
+        let mut held: Vec<(u64, u64, Ident)> = load(&path)?.unwrap_or_default();
+        held.push((id, mib, Ident::me()));
+        store(&path, &held, false)
+    }
+
+    pub fn release_hold(&self, id: u64) {
+        let Ok(_l) = self.lock() else { return };
+        let path = self.run.join("grants.held");
+        let mut held: Vec<(u64, u64, Ident)> = load(&path).ok().flatten().unwrap_or_default();
+        let n = held.len();
+        held.retain(|h| h.0 != id);
+        if held.len() != n {
+            let _ = store(&path, &held, false);
+        }
+    }
+
     /// Gives back grant `id` (from `grant`) that was not used.
     pub fn refund(&self, id: u64) {
         let Ok(_l) = self.lock() else { return };
@@ -613,30 +641,46 @@ impl Host {
 
     /// `grant` against the current reserve.
     pub fn grant(&self, mib: u64) -> Option<u64> {
-        self.grant_above(mib, None)
+        self.grant_above(mib, Floor::Reserve).ok()
     }
 
     /// MemAvailable lags a grant until the guest touches the memory, so all
     /// processes' grants of the last `GRANT_WINDOW` count as used. Returns
-    /// the grant's id. Leaves `floor` MiB available (default: the current
-    /// reserve; never less). Test fault `no_admit`: refuses everything.
-    pub fn grant_above(&self, mib: u64, floor: Option<u64>) -> Option<u64> {
+    /// the grant's id; so do held ones (`hold`), however old. Leaves `floor`
+    /// available, read with the reserve under the host lock. Test fault
+    /// `no_admit`: refuses everything.
+    pub fn grant_above(&self, mib: u64, floor: Floor) -> Result<u64> {
         if fault("no_admit") {
-            return None;
+            bail!("not enough memory here for {mib} MiB (injected fault)");
         }
-        let _l = self.lock().ok()?;
+        let _l = self.lock()?;
+        let cfg = self.config_now();
+        let (floor, what) = match floor {
+            Floor::Reserve => (cfg.reserve_mib, "reserve"),
+            // An eviction's arrival: never while this host evicts itself, and it
+            // leaves this host's own mark, so it is not moved straight back.
+            Floor::EvictMark if self.evicting() => bail!("this host is moving vms away itself"),
+            Floor::EvictMark => (cfg.evict_at(), "eviction mark"),
+        };
         let path = self.run.join("grants");
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
         let mut grants: Vec<(u64, u64, u64)> = load(&path).ok().flatten().unwrap_or_default();
         grants.retain(|&(t, ..)| now.saturating_sub(t) <= GRANT_WINDOW.as_millis() as u64);
-        let pending: u64 = grants.iter().map(|g| g.1).sum();
-        let floor = floor.unwrap_or(0).max(self.config_now().reserve_mib);
+        let held_path = self.run.join("grants.held");
+        let mut held: Vec<(u64, u64, Ident)> = load(&held_path).ok().flatten().unwrap_or_default();
+        let n = held.len();
+        held.retain(|h| h.2.liveness() != Liveness::Gone);
+        if held.len() != n {
+            let _ = store(&held_path, &held, false);
+        }
+        let pending: u64 = grants.iter().filter(|g| !held.iter().any(|h| h.0 == g.2)).map(|g| g.1).sum::<u64>() + held.iter().map(|h| h.1).sum::<u64>();
         if crate::vmproc::host_available_mib() < floor + pending + mib {
-            return None;
+            bail!("not enough memory here for {mib} MiB above the {floor} MiB {what}");
         }
         let id = crate::migrate::migration_id().max(1);
         grants.push((now, mib, id));
-        store(&path, &grants, false).ok().map(|()| id)
+        store(&path, &grants, false)?;
+        Ok(id)
     }
 
     // Incoming migrations: `STATE/migs/ID`, durable, under the host lock.
@@ -1649,10 +1693,14 @@ mod tests {
         let running = h.clone();
         assert!(running.admit(100));
         // An eviction's arrival leaves the mark available, not only the reserve.
-        let floor = running.evict_floor().unwrap();
-        assert_eq!(floor, free.saturating_sub(1500));
-        assert!(running.grant_above(2000, Some(floor)).is_none());
-        assert!(running.grant_above(200, Some(floor)).is_some());
+        assert!(running.grant_above(2000, Floor::EvictMark).unwrap_err().to_string().contains("eviction mark"));
+        assert!(running.grant_above(200, Floor::EvictMark).is_ok());
+        // Not while an eviction runs here; a pressure marker alone does not refuse.
+        std::fs::write(running.run.join("evict.active"), b"").unwrap();
+        let worker = running.evict_worker_lock().unwrap();
+        assert!(running.grant_above(1, Floor::EvictMark).unwrap_err().to_string().contains("moving vms away"));
+        drop(worker);
+        assert!(running.grant_above(1, Floor::EvictMark).is_ok());
         // `listen` raises the reserve while this process runs: admission sees it.
         std::thread::sleep(Duration::from_millis(20));
         h.configure(|c| {
@@ -1662,8 +1710,27 @@ mod tests {
         .unwrap();
         assert_eq!(running.config_now().reserve_mib, free + 1000);
         assert!(!running.admit(1));
-        // A marker no VM here is left to clear (none runs) does not refuse.
-        std::fs::write(running.run.join("evict.active"), b"").unwrap();
-        assert!(running.evict_floor().is_ok());
+    }
+
+    #[test]
+    fn held_grants_count_past_the_window_until_released_or_their_owner_is_gone() {
+        let mut h = host("held");
+        let free = crate::vmproc::host_available_mib();
+        h.cfg.reserve_mib = free.saturating_sub(3000);
+        let id = h.grant(2000).unwrap();
+        h.hold(id, 2000).unwrap();
+        // The window passes (the grant ages out): held, it still counts, once.
+        let path = h.run.join("grants");
+        let aged: Vec<(u64, u64, u64)> = load::<Vec<(u64, u64, u64)>>(&path).unwrap().unwrap().into_iter().map(|g| (0, g.1, g.2)).collect();
+        store(&path, &aged, false).unwrap();
+        assert!(!h.admit(1500), "a held grant counts after the window");
+        h.release_hold(id);
+        assert!(h.admit(1500));
+        // A dead owner's hold goes.
+        let dead = Ident { pid: u32::MAX - 7, start: 1, boot: boot_id().to_string() };
+        store(&h.run.join("grants.held"), &vec![(99u64, 2000u64, dead)], false).unwrap();
+        store(&path, &Vec::<(u64, u64, u64)>::new(), false).unwrap();
+        assert!(h.admit(2500));
+        assert!(load::<Vec<(u64, u64, Ident)>>(&h.run.join("grants.held")).unwrap().unwrap().is_empty());
     }
 }

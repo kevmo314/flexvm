@@ -116,16 +116,25 @@ impl Limit {
                 false => (m.admitted + s).min(m.cap) - m.admitted,
             }
         };
+        if more == 0 {
+            self.throttled.store(false, Ordering::SeqCst);
+            return true;
+        }
         // Admitted without `mark` held; another raise meanwhile only adds to it.
-        if more > 0 && !host.admit(more) {
+        let Some(id) = host.grant(more) else {
             self.throttled.store(true, Ordering::SeqCst);
             return false;
+        };
+        let mut m = self.mark.lock().unwrap();
+        // Lifted meanwhile (a migration or checkpoint pauses it): nothing to raise, the grant goes back.
+        if m.lifted {
+            drop(m);
+            host.refund(id);
+            return true;
         }
-        if more > 0 {
-            let mut m = self.mark.lock().unwrap();
-            m.admitted = (m.admitted + more).min(m.cap.max(m.admitted));
-            self.write(&m);
-        }
+        m.admitted = (m.admitted + more).min(m.cap.max(m.admitted));
+        self.write(&m);
+        drop(m);
         self.throttled.store(false, Ordering::SeqCst);
         true
     }
@@ -309,6 +318,28 @@ mod tests {
             assert!(grower.join().unwrap());
         });
         assert_eq!(l.admitted(), 512 + step(512));
+    }
+
+    /// Lifted while the watcher's admission waits: nothing is raised, and the grant goes back.
+    #[test]
+    fn a_mark_lifted_during_admission_is_not_raised() {
+        let (l, cg, host) = cgroup("lifted");
+        l.start(512, 5000);
+        set(&cg, 512 + overhead(512));
+        let held = host.lock().unwrap();
+        let (l, host) = (&l, &host);
+        std::thread::scope(|sc| {
+            let grower = sc.spawn(|| l.grow(host));
+            std::thread::sleep(Duration::from_millis(100));
+            let lifted = l.lift(None);
+            drop(held);
+            assert!(grower.join().unwrap());
+            assert_eq!(l.admitted(), 512);
+            let grants: Vec<(u64, u64, u64)> = crate::host::load(&host.run.join("grants")).unwrap().unwrap_or_default();
+            assert!(grants.is_empty(), "{grants:?}");
+            drop(lifted);
+        });
+        assert_eq!(high(&cg), Some(512 + overhead(512)));
     }
 
     #[test]

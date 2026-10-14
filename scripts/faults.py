@@ -2853,7 +2853,10 @@ def evict_no_pingpong():
     m = setup(n, mib=600)
     time.sleep(11)  # the start's grants age out
     base, rss = mem_available(), cgroup(A, n)[0]
-    with marks(512, base + 1000, A), marks(512, base - rss // 2, B) as b:
+    # B at its own mark (just under it, so this host's MemAvailable moving
+    # meanwhile, as other work does, cannot give it room): taking the VM
+    # would leave it under, and it would only move it back.
+    with marks(512, base + 1000, A), marks(512, base + 300, B) as b:
         seen = hosts_over(n, 25)
         check("no ping-pong: a peer it would put under its mark refuses it", seen == [A.addr] and where(n) == {A: "running"},
               (seen, where(n), log(A, n)[-1200:]))
@@ -3743,6 +3746,52 @@ def suspend_cmd():
     check("suspend cmd: gone after it", n not in vms(A), vms(A).get(n))
 
 
+def first_entry(host, name, timeout=60):
+    """`name`'s registry entry as first published (polled every 5 ms)."""
+    path = os.path.join(host.run, "vms", f"{name}.json")
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            return json.load(open(path))
+        except (OSError, ValueError):
+            time.sleep(0.005)
+    return None
+
+
+def cmd_flag():
+    """A `run -- CMD` VM is published as one from its first entry, whether it
+    claimed a standby VM or was resumed with its command (eviction leaves it
+    alone), and `migrate` refuses it, saying why."""
+    t = args.template
+    n, r = "ft-cmd-flag", "ft-cmd-flag-resumed"
+    scenario_vms.update({n, r})
+    ok(cli_json(A, "standby", "--template", t, "1"))
+    try:
+        live = lambda: len([f for f in os.listdir(os.path.join(A.run, "standby", t)) if f.endswith(".lock") and alive(f[:-5])])
+        check("cmd flag: a standby ready", wait_for(lambda: live() == 1, 60), live())
+        p = subprocess.Popen([BIN, "--state", A.state, "--run", A.run, "run", n, "--template", t, "--", "sleep 600"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=ENV, start_new_session=True)
+        e = first_entry(A, n)
+        check("cmd flag: a claimed standby is published as a cmd vm", e is not None and e.get("cmd") is True, e)
+        wait_for(lambda: vms(A).get(n, {}).get("state") == "running", 30)
+        m = migrate(A, n, B)
+        check("cmd flag: migrate refuses it, saying why", not m["ok"] and "cannot migrate" in m["error"], m)
+        os.kill(p.pid, signal.SIGINT)
+        check("cmd flag: its command's end still ends it", p.wait(timeout=30) == 130)
+    finally:
+        ok(cli_json(A, "standby", "--template", t, "0"))
+    ok(cli_json(A, "run", r, "--template", t, "-d", "--", "sleep 600"))
+    pid = vm_pid(A, r)
+    os.kill(pid, signal.SIGTERM)
+    check("cmd flag: suspended", wait_for(lambda: not alive(pid), 60) and vms(A).get(r, {}).get("state") == "suspended", vms(A).get(r))
+    p = subprocess.Popen([BIN, "--state", A.state, "--run", A.run, "resume", r], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         env=ENV, start_new_session=True)
+    e = first_entry(A, r)
+    check("cmd flag: a resumed one too", e is not None and e.get("cmd") is True, e)
+    os.kill(p.pid, signal.SIGINT)
+    check("cmd flag: and ends with it", p.wait(timeout=30) == 130)
+
+
 def pause_cmd_start():
     """Ctrl-Z while a `run -- CMD` VM starts pauses it before its command
     is under way, which waits for the VM instead of failing (and destroying
@@ -4049,7 +4098,7 @@ SCENARIOS = dict(
     pull_died=pull_died,
     uffd_err=uffd_err,
     mem_high=no_evict(skippable(mem_high)), mem_high_migrate=no_evict(skippable(mem_high_migrate)),
-    mem_high_evict=skippable(mem_high_evict), evict_grower=skippable(evict_grower), evict_no_pingpong=evict_no_pingpong, evict_skips_cmd=evict_skips_cmd, evict_latency=skippable(evict_latency),
+    mem_high_evict=skippable(mem_high_evict), evict_grower=skippable(evict_grower), evict_no_pingpong=evict_no_pingpong, evict_skips_cmd=evict_skips_cmd, cmd_flag=cmd_flag, evict_latency=skippable(evict_latency),
     start_admission=start_admission, standby_admission=standby_admission,
     cow_grow=no_evict(cow_grow), plug_race=no_evict(plug_race), shrink_stall=no_evict(shrink_stall), plug_storm=no_evict(plug_storm),
     basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, refused=refused, pages_blip=pages_blip,
