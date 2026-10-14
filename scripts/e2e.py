@@ -44,14 +44,14 @@ p.add_argument("--image-cache", help="keep the pulled image here, and build from
 # generations and loans, forged peers, processes killed between steps, checkpoint corruption,
 # copy-on-write exactness, growth (on a template with little pre-plugged), held packets and devices,
 # signals, standby VMs. Left out: slow or heavy ones (pages_dead, quiet_source, guest_hang,
-# cow_reports_held, guest_calls, suspend_disk_freed, source_killed, kill_source, forged_peer: their
+# cow_reports_held, suspend_disk_freed, source_killed, kill_source, forged_peer: their
 # 1.5 GB guests outgrow the CI template, and the host moves them) and the ones that restart the
 # listeners (target_killed, suspend_resume).
-FAULTS = ("basic route lost_ack unknown refused pages_blip pages_dead_restore prepared_retry resume_kill exec_race "
+FAULTS = ("basic route lost_ack unknown refused pages_blip pages_dead_restore prepared_retry resume_kill exec_race guest_calls "
           "checkpoint_restore checkpoint_fork checkpoint_corrupt held_restore_frozen cow_exact cow_abort ckpt_incremental "
           "ckpt_failed_stop ckpt_rearm prepare_fail fc_prepare slow_preload ckpt_packet_hold "
           "abort_superseded gen_zero signals suspend_gen standby restore_ip_peer late_withdrawal "
-          "incoming_killed start_killed claim_killed fc_died cow_grow plug_storm")
+          "incoming_killed start_killed claim_killed fc_died cow_grow plug_race plug_storm")
 p.add_argument("--faults", default=FAULTS, help="scripts/faults.py scenarios to run against the two hosts ('' for none)")
 # A worker runs its cases on one lane, against templates that are already built.
 p.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
@@ -779,11 +779,12 @@ def faults():
 # Directories of this run's own, shared with nothing else: run directories under /run
 # (tmpfs), state and checkpoints under /var/tmp (suspend needs a disk).
 RUN = tempfile.mkdtemp(prefix=args.tag + "-", dir=None if args.selftest else "/run")
-WORK = tempfile.mkdtemp(prefix=args.tag + "-", dir="/var/tmp")
+WORK = tempfile.mkdtemp(prefix=args.tag + "-", dir=None if args.selftest else "/var/tmp")
 # Templates of this run's own (a worker's are its run's): never another's `ci` or the shared image
 # cache. On tmpfs: building one writes out all of the guest's memory and reads it back to hash it,
 # which a CI runner's disk makes slow; what stays (sparse) is small.
-TEMPLATES = args.templates or tempfile.mkdtemp(prefix=args.tag + "-", dir="/dev/shm" if os.path.isdir("/dev/shm") else WORK)
+TEMPLATES = args.templates or tempfile.mkdtemp(prefix=args.tag + "-",
+                                            dir="/dev/shm" if not args.selftest and os.path.isdir("/dev/shm") else WORK)
 os.environ["FLEXVM_TEMPLATES"] = ENV["FLEXVM_TEMPLATES"] = TEMPLATES
 A = Host("a", args.port_a, args.port_a + 1, args.net_a)
 GROW = args.template + "-grow"
@@ -855,9 +856,11 @@ def worker():
 # start first, and the short ones go in batches of about BATCH_S (each batch is a worker, with
 # hosts of its own). Unlisted ones count as 2 s.
 COST = {"image_template": 30, "pause_resume": 6, "migrate": 3, "checkpoint_restore": 3, "suspend_resume": 3,
-        "faults/cow_grow": 70, "faults/held_restore_frozen": 19, "faults/pages_blip": 18, "faults/ckpt_incremental": 18,
+        "faults/cow_grow": 70, "faults/plug_race": 40, "faults/held_restore_frozen": 19,
+        "faults/pages_blip": 18, "faults/ckpt_incremental": 18,
         "faults/pages_dead_restore": 14, "faults/abort_superseded": 13, "faults/plug_storm": 11, "faults/unknown": 10,
-        "faults/checkpoint_corrupt": 10, "faults/checkpoint_fork": 9, "faults/signals": 9, "faults/checkpoint_restore": 7,
+        "faults/checkpoint_corrupt": 10, "faults/guest_calls": 10, "faults/checkpoint_fork": 9,
+        "faults/signals": 9, "faults/checkpoint_restore": 7,
         "faults/cow_exact": 7, "faults/prepared_retry": 7, "faults/ckpt_failed_stop": 7, "faults/exec_race": 7,
         "faults/prepare_fail": 6, "faults/route": 6, "faults/basic": 6, "faults/slow_preload": 6, "faults/refused": 6,
         "faults/resume_kill": 5, "faults/lost_ack": 5, "faults/ckpt_rearm": 5, "faults/cow_abort": 5,
@@ -884,7 +887,7 @@ def main():
     # (name, templates it needs, cost): the cases, and each scenario on its own.
     work = [(c, set() if c == "image_template" else {args.template}, COST.get(c, 2)) for c in selected if c != "faults"]
     # Growth runs on GROW; fc_prepare needs a second template to mismatch with.
-    work += [(f"faults/{s}", {args.template, GROW} if s in ("cow_grow", "plug_storm", "fc_prepare") else {args.template},
+    work += [(f"faults/{s}", {args.template, GROW} if s in ("cow_grow", "plug_race", "plug_storm", "fc_prepare") else {args.template},
               COST.get(f"faults/{s}", 2)) for s in scenarios]
     work.sort(key=lambda w: -w[2])
     scheduled = list(work)
