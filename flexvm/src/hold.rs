@@ -64,6 +64,9 @@ struct Queue {
     packets: VecDeque<Vec<u8>>,
     bytes: usize,
     releasing: bool,
+    /// Routed away from the device: what is still on it is bounded by the device's queue, and
+    /// queued whatever `CAP` says, to be handed over.
+    switched: bool,
     dropped: u64,
 }
 
@@ -134,6 +137,9 @@ impl Holder {
 
     /// Unless a newer hold replaced it.
     fn unhold(&self, ip: Ipv4Addr, e: &Arc<Entry>) {
+        // Under `rx`: no read is between finding `e` and queuing on it, so nothing reaches its
+        // queue once it is gone from `held` (what is there is then counted or handed over).
+        let _rx = self.rx.lock().unwrap();
         let mut held = self.held.lock().unwrap();
         if held.get(&ip).is_some_and(|x| Arc::ptr_eq(x, e)) {
             held.remove(&ip);
@@ -214,12 +220,14 @@ impl Holder {
             let mut o = out.lock().unwrap();
             if switched.is_ok() {
                 // Nothing reaches the device for this address any more.
+                e.q.lock().unwrap().switched = true;
                 let mut read = 0;
-                loop {
-                    let n = (0..PASS).take_while(|_| self.read_one(&mut buf)).count();
+                while read < TXQ {
+                    let pass = PASS.min(TXQ - read);
+                    let n = (0..pass).take_while(|_| self.read_one(&mut buf)).count();
                     give(&mut o);
                     read += n;
-                    if n < PASS || read >= TXQ {
+                    if n < pass {
                         break;
                     }
                 }
@@ -332,7 +340,7 @@ impl Holder {
         }
         if let Some(e) = self.entry(Ipv4Addr::new(p[16], p[17], p[18], p[19])) {
             let mut q = e.q.lock().unwrap();
-            if q.bytes + p.len() > CAP {
+            if q.bytes + p.len() > CAP && !q.switched {
                 q.dropped += 1;
             } else {
                 q.bytes += p.len();
