@@ -1,9 +1,6 @@
-//! Guest networking, done with ioctls and rtnetlink so the image needs no iproute2.
-//!
-//! Every VM is a clone of one template, so everything but the VM's own address
-//! is set up once at template boot: eth0 talks to a fixed link-local gateway
-//! whose MAC is pinned with a static ARP entry (the host gives every tap that
-//! MAC, so this survives migration). The address is set per VM with `NET`.
+//! Guest networking via ioctls and rtnetlink, so images need no iproute2. All but the VM's own
+//! address is set up at template boot: eth0 talks to a fixed link-local gateway whose MAC is pinned
+//! by a static ARP entry (every host tap has that MAC, so it survives migration).
 
 use std::io;
 use std::net::Ipv4Addr;
@@ -29,7 +26,6 @@ fn sockaddr(ip: Ipv4Addr) -> libc::sockaddr {
     unsafe { std::mem::transmute(sin) }
 }
 
-/// Copies `name` into a fixed-size C name field.
 fn name<const N: usize>(dst: &mut [libc::c_char; N], name: &str) {
     for (d, s) in dst.iter_mut().zip(name.bytes()) {
         *d = s as libc::c_char;
@@ -67,11 +63,8 @@ fn add_route(s: &Sock, dst: Ipv4Addr, mask: Ipv4Addr, gw: Option<Ipv4Addr>) -> i
     }
 }
 
-/// rtnetlink socket and eth0's index, kept from template boot for `configure`.
 static NETLINK: OnceLock<(libc::c_int, u32)> = OnceLock::new();
 
-/// Template-time setup: lo and eth0 up, the gateway route and its static ARP
-/// entry (the host never answers ARP for the gateway).
 pub fn setup() -> io::Result<()> {
     let s = Sock(unsafe { std::os::fd::FromRawFd::from_raw_fd(os(libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0))?) });
     link_up(&s, "lo")?;
@@ -92,14 +85,9 @@ pub fn setup() -> io::Result<()> {
     Ok(())
 }
 
-/// Gives eth0 its per-VM /32 address, and optionally a nameserver.
-///
-/// This runs on every start right after restore, when each page the kernel
-/// touches first costs a nested fault: so it is one RTM_NEWADDR on a socket
-/// opened at template boot, plus an RTM_DELADDR of the previous address when a
-/// fork brings a new one. Adding an address leaves the gateway route and ARP
-/// entry alone (SIOCSIFADDR would flush them); the add goes first, as deleting
-/// eth0's last address would flush them too.
+/// Gives eth0 its per-VM /32 (and optionally a nameserver). Runs right after every restore, so it is
+/// one RTM_NEWADDR on a socket opened at template boot (then RTM_DELADDR of a fork's old address):
+/// SIOCSIFADDR, or deleting eth0's last address first, would flush the gateway route and ARP entry.
 pub fn configure(ip: Ipv4Addr, dns: Option<&str>) -> io::Result<()> {
     // The managed address, kept in snapshot state under the socket's ACK lock.
     static ADDRESS: Mutex<Option<Ipv4Addr>> = Mutex::new(None);
@@ -161,7 +149,6 @@ fn address_request(fd: libc::c_int, ifindex: u32, kind: u16, ip: Ipv4Addr) -> io
     }
 }
 
-// A datagram may contain several aligned netlink messages.
 fn matching_ack(mut data: &[u8], seq: u32) -> Option<io::Result<()>> {
     while data.len() >= 16 {
         let len = u32::from_ne_bytes(data[..4].try_into().unwrap()) as usize;

@@ -1,15 +1,8 @@
-//! The container image's entrypoint, supervised by flexvm-init.
-//!
-//! Image templates carry `/etc/flexvm/app.conf`, written at build time from the
-//! image config: one `key value` per line, values escaping `\` and newline as
-//! `\\` and `\n`. Keys: `arg` (repeated, argv in order), `env` (repeated, `K=V`),
-//! `cwd`, `uid`, `gid`, `groups` (space separated).
-//!
-//! Requests: `APP` (start it), `APPSTATUS`, `LOGS <offset> <follow 0|1>`,
-//! `PROBE <port>`, `CHECK <timeout ms> <hex shell command>` and `QUIESCE`.
-//!
-//! An app with a non-root user runs with no_new_privs and an empty capability
-//! bounding set, so setuid binaries and file capabilities cannot take it back to root.
+//! The image's entrypoint, supervised by flexvm-init. `/etc/flexvm/app.conf` (written at build) has one
+//! `key value` per line, `\` and newline escaped as `\\` and `\n`: `arg`/`env` (repeated), `cwd`, `uid`,
+//! `gid`, `groups`. Requests: `APP`, `APPSTATUS`, `LOGS <offset> <follow 0|1>`, `PROBE <port>`,
+//! `CHECK <timeout ms> <hex shell command>`, `QUIESCE`. A non-root app runs with no_new_privs and an
+//! empty bounding set, so setuid binaries and file capabilities cannot take it back to root.
 
 use std::collections::VecDeque;
 use std::ffi::CString;
@@ -26,7 +19,6 @@ use std::time::{Duration, Instant};
 use crate::{fail, mem, msg, spawn, wait_pid, write_frame, Statuses, FRAME_STDOUT};
 
 const CONF: &str = "/etc/flexvm/app.conf";
-/// Bytes of app output kept for `LOGS`; older output is dropped.
 const RING_BYTES: usize = 1 << 20;
 
 pub const VERBS: [&str; 6] = ["APP", "APPSTATUS", "LOGS", "PROBE", "CHECK", "QUIESCE"];
@@ -150,21 +142,15 @@ fn parse_conf(text: &str) -> io::Result<Conf> {
     Ok(c)
 }
 
-/// `argv` with the app's environment and workdir.
 fn command<S: AsRef<std::ffi::OsStr>>(c: &Conf, argv: &[S]) -> Command {
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..]).env_clear().envs(c.env.iter().map(|(k, v)| (k, v))).current_dir(&c.cwd).stdin(Stdio::null());
     cmd
 }
 
-/// Runs a readiness command as the app would run, output discarded: `ok`,
-/// `exit <code>` or `timeout`.
-///
-/// The command and everything it starts live in a cgroup of their own, which
-/// is killed, checked empty and removed whenever the check ends; a check whose
-/// cleanup fails is an error, never `ok`. A non-root check requires that cgroup
-/// and fails closed without it. A root check is trusted (it could leave any
-/// cgroup): without cgroup2 its session is killed instead.
+/// Runs a readiness command as the app would (`ok`, `exit <code>` or `timeout`) in its own cgroup, killed,
+/// checked empty and removed at the end; failed cleanup is an error, never `ok`. A non-root check fails
+/// closed without that cgroup; a root check is trusted, and without cgroup2 its session is killed instead.
 fn check(arg: &str, statuses: &Statuses) -> io::Result<String> {
     let (ms, hex) = arg.trim().split_once(' ').ok_or_else(|| io::Error::other("usage: CHECK <ms> <hex>"))?;
     let ms: u64 = ms.parse().map_err(|_| io::Error::other("bad timeout"))?;
@@ -183,7 +169,6 @@ fn check(arg: &str, statuses: &Statuses) -> io::Result<String> {
         None => mem::work_procs().into_iter().for_each(|work| mem::enter(&mut cmd, work, false)),
     }
     restrict(&mut cmd, &c);
-    // On error the guard removes the (empty) group.
     let pid = spawn(&mut cmd, statuses).map_err(|e| io::Error::new(e.kind(), format!("cannot run /bin/sh: {e}")))?.id() as i32;
     let code = wait_pid(statuses, pid, Some(Instant::now() + Duration::from_millis(ms)));
     // Kill whatever is left, the leader included if it timed out.
@@ -212,8 +197,7 @@ fn read_conf() -> io::Result<String> {
     std::fs::read_to_string(CONF).map_err(|e| io::Error::new(e.kind(), format!("{CONF}: {e}")))
 }
 
-/// A cgroup2 group for one readiness check. Dropping it without `cleanup`
-/// (an early return) still kills and removes it, within the same bound.
+/// Dropped without `cleanup` (an early return), it is still killed and removed.
 struct CheckGroup {
     dir: String,
     procs: CString,
@@ -245,7 +229,6 @@ impl CheckGroup {
         Ok(g)
     }
 
-    /// Kills every task in the group, checks it emptied within 2 s, and removes it.
     fn cleanup(&mut self) -> io::Result<()> {
         self.done = true;
         std::fs::write(format!("{}/cgroup.kill", self.dir), "1")?;
@@ -270,10 +253,8 @@ impl Drop for CheckGroup {
     }
 }
 
-/// Gives a child (after any `mem::enter`) its own session, the app's
-/// credentials and, for a non-root user, no capabilities and no_new_privs.
-/// Done here rather than with CommandExt::uid, which would clear the
-/// supplementary groups.
+/// Own session, the app's credentials and, if non-root, no capabilities and no_new_privs; done by
+/// hand because CommandExt::uid would clear the supplementary groups.
 fn restrict(cmd: &mut Command, c: &Conf) {
     let (uid, gid, groups) = (c.uid, c.gid, c.groups.clone());
     unsafe {
@@ -283,8 +264,7 @@ fn restrict(cmd: &mut Command, c: &Conf) {
                 return fail();
             }
             if uid != 0 {
-                // No way back to root: drop the whole bounding set while we still may
-                // (EINVAL: past the kernel's last capability).
+                // No way back to root: drop the bounding set (EINVAL: past the kernel's last capability).
                 for cap in 0..64 {
                     if libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0) != 0 && *libc::__errno_location() != libc::EINVAL {
                         return fail();
@@ -300,7 +280,6 @@ fn restrict(cmd: &mut Command, c: &Conf) {
     }
 }
 
-/// Starts the app unless it is already running. Returns its pid.
 fn start(statuses: &Statuses) -> io::Result<i32> {
     let mut app = APP.lock().unwrap();
     if let State::Running(pid) = app.state {
@@ -309,8 +288,7 @@ fn start(statuses: &Statuses) -> io::Result<i32> {
     let c = parse_conf(&read_conf()?)?;
     let mut cmd = command(&c, &c.argv);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    // Keep the app from reading flexvm-init's memory or ptracing it (a root
-    // app with CAP_SYS_PTRACE still can: root in the guest owns the guest).
+    // Keep the app from reading or ptracing flexvm-init (a root app with CAP_SYS_PTRACE still can).
     unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
     if let Some(work) = mem::work_procs() {
         mem::enter(&mut cmd, work, true);
@@ -345,11 +323,8 @@ fn join_within(t: thread::JoinHandle<()>, timeout: Duration) {
     }
 }
 
-/// Sends the app's output from stream offset `offset` (clamped to what the
-/// ring still holds), then `<status> <next offset>`. With `follow`, keeps
-/// sending new output until the app has exited.
+/// Output from `offset` (clamped to the ring), then `<status> <next offset>`; with `follow`, until exit.
 fn logs(out: &File, mut offset: u64, follow: bool) -> io::Result<()> {
-    // Without `follow`, only what was there when asked.
     let stop = {
         let app = APP.lock().unwrap();
         if follow { u64::MAX } else { app.dropped + app.ring.len() as u64 }

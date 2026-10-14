@@ -1,16 +1,9 @@
-//! Elastic memory, guest side. The host plugs virtio-mem memory ahead of
-//! demand but samples the guest only once a second; this keeps an allocation
-//! burst from reaching the OOM killer in between:
-//!
-//! - Overcommit is always allowed; the host plugs more as memory is touched.
-//! - Everything flexvm-init starts runs under `/vm`, whose `memory.high` sits
-//!   `headroom(MemTotal)` below MemTotal (the mark the host keeps free).
-//!   flexvm-init itself stays outside, so the throttle never slows the thread
-//!   that has to lift it.
-//! - Crossing the mark wakes the watcher (`memory.events`), which asks the host
-//!   for memory; allocations that outrun the plug are throttled meanwhile.
-//! - Plugs and unplugs (memory block uevents) move the mark. If the host cannot
-//!   grow the VM, or nothing arrives within `GIVE_UP`, the throttle is lifted.
+//! Elastic memory, guest side. The host plugs virtio-mem ahead of demand but samples only once a
+//! second, so this keeps a burst from the OOM killer: overcommit is on; everything flexvm-init starts runs
+//! under `/vm`, whose `memory.high` sits `headroom(MemTotal)` below MemTotal (flexvm-init stays outside,
+//! so the throttle never slows the thread that lifts it); crossing it wakes the watcher, which asks the
+//! host for memory while allocations are throttled. Memory block uevents move the mark; if the host
+//! cannot grow the VM or nothing arrives within `GIVE_UP`, the throttle is lifted.
 
 use std::ffi::CString;
 use std::fs::File;
@@ -30,12 +23,9 @@ pub const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 /// The throttled parent: its `memory.high` is the mark.
 pub const CGROUP: &str = "/sys/fs/cgroup/vm";
 const WORK: &str = "/sys/fs/cgroup/vm/work";
-/// Lift the throttle when no memory has arrived this long after asking.
 const GIVE_UP: Duration = Duration::from_secs(3);
-/// Minimum gap between requests while still over the mark.
 const RETRY: Duration = Duration::from_millis(250);
 
-/// `<WORK>/cgroup.procs`, once the cgroups are set up.
 static WORK_PROCS: OnceLock<CString> = OnceLock::new();
 
 /// Sets up the cgroups and the watcher, subscribed to memory changes before it returns.
@@ -50,13 +40,11 @@ pub fn start() {
     }
 }
 
-/// `cgroup.procs` of the throttled group for workloads.
 pub fn work_procs() -> Option<CString> {
     WORK_PROCS.get().cloned()
 }
 
-/// Moves `cmd`'s child into the group whose `cgroup.procs` is `procs` before
-/// exec (register it before dropping privileges). Fails the spawn only if `required`.
+/// Moves the child into `procs`' group before exec (and before dropping privileges); fails the spawn only if `required`.
 pub fn enter(cmd: &mut Command, procs: CString, required: bool) {
     unsafe {
         cmd.pre_exec(move || {
@@ -71,8 +59,7 @@ pub fn enter(cmd: &mut Command, procs: CString, required: bool) {
     }
 }
 
-/// Subscribes to memory block uevents before reading MemTotal for the mark, so
-/// a plug in between still gets an event. Returns `/vm/memory.events`.
+/// Subscribes to uevents before reading MemTotal, so a plug in between still gets an event.
 fn setup() -> io::Result<(File, OwnedFd, High)> {
     std::fs::create_dir_all(CGROUP_ROOT)?;
     crate::mount("cgroup2", CGROUP_ROOT, "cgroup2", 0, "")?;
@@ -85,7 +72,6 @@ fn setup() -> io::Result<(File, OwnedFd, High)> {
     Ok((File::open(format!("{CGROUP}/memory.events"))?, uev, high))
 }
 
-/// (MemTotal, MemAvailable) in KiB.
 fn meminfo() -> (u64, u64) {
     let text = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
     let kib = |key| text.lines().find_map(|l| l.strip_prefix(key)?.split_whitespace().next()?.parse().ok()).unwrap_or(0);
@@ -110,8 +96,7 @@ fn write_high(value: Option<u64>, raise_only: bool) -> io::Result<()> {
     Ok(())
 }
 
-/// Numeric writes can reclaim synchronously (Linux 6.1), so a worker makes
-/// them, coalesced; lifts bypass it.
+/// Numeric writes can reclaim synchronously (Linux 6.1), so a worker makes them, coalesced; lifts bypass it.
 struct High {
     total_kib: u64,
     desired: Arc<Mutex<Option<u64>>>,
@@ -178,14 +163,12 @@ impl High {
     }
 }
 
-/// The `high` counter of memory.events.
 fn high_events(f: &File) -> u64 {
     let mut buf = [0u8; 256];
     let n = f.read_at(&mut buf, 0).unwrap_or(0);
     String::from_utf8_lossy(&buf[..n]).lines().find_map(|l| l.strip_prefix("high ")?.trim().parse().ok()).unwrap_or(0)
 }
 
-/// A socket that receives the kernel's device uevents.
 fn uevents() -> io::Result<OwnedFd> {
     let flags = libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK;
     let fd = unsafe { OwnedFd::from_raw_fd(os(libc::socket(libc::AF_NETLINK, flags, libc::NETLINK_KOBJECT_UEVENT))?) };
@@ -195,7 +178,6 @@ fn uevents() -> io::Result<OwnedFd> {
     Ok(fd)
 }
 
-/// Drains pending uevents; true if any was about a memory block.
 fn memory_changed(fd: &OwnedFd) -> bool {
     let mut buf = [0u8; 4096];
     let mut changed = false;
@@ -211,7 +193,6 @@ fn memory_changed(fd: &OwnedFd) -> bool {
 fn watch(events: File, uev: OwnedFd, mut limit: High) {
     let mut seen = high_events(&events);
     let mut asked: Option<Instant> = None;
-    // Since when we have been over the mark, waiting for memory from the host.
     let mut waiting: Option<Instant> = None;
     loop {
         let mut fds = [
@@ -262,12 +243,10 @@ enum Reply {
     Asked,
     /// The host sees enough free memory (the mark was crossed by reclaimable memory).
     Enough,
-    /// The host cannot grow this VM.
     Full,
 }
 
-/// Sends `MEM <available KiB> <total KiB>`; the host answers `grow`, `busy`
-/// (a plug is in flight), `ok` or `full`.
+/// Sends `MEM <available KiB> <total KiB>`; the host answers `grow`, `busy` (plug in flight), `ok` or `full`.
 fn ask() -> Reply {
     let (total, avail) = meminfo();
     let reply = (|| -> io::Result<String> {
@@ -293,8 +272,7 @@ mod tests {
 
     type Writes = mpsc::Receiver<(&'static str, Option<u64>)>;
 
-    /// A `High` for 4 GiB whose writes are reported, numeric ones pausing (until
-    /// resumed) before the limit is installed and again "in reclaim".
+    /// A 4 GiB `High` reporting writes; numeric ones pause (until resumed) before installing and "in reclaim".
     fn high() -> (High, Writes, mpsc::Sender<()>, Arc<Mutex<Option<u64>>>) {
         let (sent, writes) = mpsc::channel();
         let (resume, blocked) = mpsc::channel::<()>();
@@ -324,7 +302,6 @@ mod tests {
     #[test]
     fn unchanged_total_does_not_write_or_rearm_after_lift() {
         let (mut high, writes, _resume, _) = high();
-        // KiB changes within the same MiB leave the limit unchanged too.
         high.set_total(4096 << 10);
         high.set_total((4096 << 10) + 1);
         assert!(writes.try_recv().is_err());
@@ -350,7 +327,6 @@ mod tests {
         assert!(high.busy());
         high.maintain_lift();
         assert_eq!((*installed.lock().unwrap(), next(&writes)), (None, ("lifted", None)));
-        // The queued update was superseded: the worker writes max again.
         resume.send(()).unwrap();
         assert_eq!(next(&writes), ("lifted", None));
     }

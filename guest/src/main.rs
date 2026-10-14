@@ -1,11 +1,7 @@
-//! flexvm-init: PID 1 inside the guest.
-//!
-//! Sets up a writable overlay on top of the read-only (DAX) root, then serves
-//! a tiny command protocol on vsock so the host can run things in the VM.
-//! Requests are one text line: `PING`, `NET <ip> [dns]`, `START <ip> <secs.nanos> [dns]`
-//! (NET plus the host's wall clock), `CLOCK <secs.nanos>`, `FORKS`, the session
-//! requests in session.rs and the app requests in app.rs. Replies are frames
-//! (see proto.rs).
+//! flexvm-init, PID 1 in the guest: sets up a writable overlay on the read-only (DAX) root, then
+//! serves one-line requests on vsock: `PING`, `NET <ip> [dns]`, `START <ip> <secs.nanos> [dns]`
+//! (NET plus the host's clock), `CLOCK <secs.nanos>`, `FORKS`, and those in session.rs and app.rs.
+//! Replies are frames (proto.rs).
 
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -28,11 +24,9 @@ mod session;
 
 use proto::{FRAME_MSG, FRAME_STDERR, FRAME_STDOUT, MAX_BODY};
 
-/// How long a command body may take to arrive, all of it.
 const BODY_TIMEOUT: Duration = Duration::from_secs(30);
 /// CHECK hex-encodes a command of up to MAX_BODY bytes on its request line.
 const MAX_LINE: u64 = 2 * MAX_BODY as u64 + 128;
-/// How many command bodies may be arriving at once; more are refused.
 const MAX_BODY_READERS: usize = 16;
 static BODY_READERS: AtomicUsize = AtomicUsize::new(0);
 
@@ -65,7 +59,6 @@ fn log(msg: &str) {
     let _ = writeln!(io::stderr(), "flexvm-init: {msg}");
 }
 
-/// A syscall's result, or its error if it returned a negative value.
 fn os<T: Default + PartialOrd>(rc: T) -> io::Result<T> {
     if rc < T::default() { Err(io::Error::last_os_error()) } else { Ok(rc) }
 }
@@ -80,14 +73,12 @@ fn mount(src: &str, target: &str, fstype: &str, flags: libc::c_ulong, data: &str
     }
 }
 
-/// Mounts the pseudo filesystems and pivots into an overlay whose upper layer
-/// is a tmpfs, so guest writes live in guest RAM and migrate with it.
+/// Pivots into an overlay whose tmpfs upper layer keeps guest writes in RAM, so they migrate.
 fn setup_root() -> io::Result<()> {
     mount("proc", "/proc", "proc", 0, "")?;
     mount("sysfs", "/sys", "sysfs", 0, "")?;
     mount("devtmpfs", "/dev", "devtmpfs", 0, "")?;
-    // tmpfs defaults to half of RAM *at mount time*; memory grows by hotplug
-    // later, so leave the size unbounded and let the host decide.
+    // tmpfs sizes to half of RAM at mount time and memory is hotplugged later: leave it unbounded.
     mount("tmpfs", "/run", "tmpfs", 0, "mode=755,size=0")?;
     for d in ["/run/ovl/upper", "/run/ovl/work", "/run/root"] {
         std::fs::create_dir_all(d)?;
@@ -117,18 +108,7 @@ fn setup_root() -> io::Result<()> {
     Ok(())
 }
 
-/// Waits for an exit without consuming it: std may still be waiting for a
-/// child whose exec failed inside spawn, while it holds our lock.
-fn exited_child() -> io::Result<i32> {
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    if unsafe { libc::waitid(libc::P_ALL, 0, &mut info, libc::WEXITED | libc::WNOWAIT) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(unsafe { info.si_pid() })
-}
-
-/// Reaps every child (we are PID 1, so orphans land here too) and records
-/// the exit codes that `spawn` registered.
+/// Reaps every child (orphans too, as PID 1), recording the exit codes `spawn` registered.
 fn reap(statuses: Statuses) {
     let (lock, cv) = &*statuses;
     loop {
@@ -161,7 +141,6 @@ fn reap(statuses: Statuses) {
     }
 }
 
-/// Spawns a child whose exit code `wait_pid` can collect.
 fn spawn(command: &mut Command, statuses: &Statuses) -> io::Result<Child> {
     let (lock, cv) = &**statuses;
     // Held through spawn and registration, even if the child exits at once.
@@ -172,7 +151,6 @@ fn spawn(command: &mut Command, statuses: &Statuses) -> io::Result<Child> {
     Ok(child)
 }
 
-/// Waits for `pid`'s exit code, until `deadline` if one is given.
 fn wait_pid(statuses: &Statuses, pid: i32, deadline: Option<Instant>) -> Option<i32> {
     let (lock, cv) = &**statuses;
     let mut map = lock.lock().unwrap();
@@ -189,8 +167,6 @@ fn wait_pid(statuses: &Statuses, pid: i32, deadline: Option<Instant>) -> Option<
     }
 }
 
-/// Hands a child's stdout and stderr to `deliver` (frame kind, bytes) as they
-/// come, from one thread, until both are closed.
 fn pump(stdout: Option<ChildStdout>, stderr: Option<ChildStderr>, mut deliver: impl FnMut(u8, &[u8])) {
     let out = stdout.map(|s| (File::from(OwnedFd::from(s)), FRAME_STDOUT));
     let mut streams: Vec<(File, u8)> = out.into_iter().chain(stderr.map(|s| (File::from(OwnedFd::from(s)), FRAME_STDERR))).collect();
@@ -213,7 +189,6 @@ fn pump(stdout: Option<ChildStdout>, stderr: Option<ChildStderr>, mut deliver: i
     }
 }
 
-/// Delay consecutive accept failures without spinning under resource pressure.
 fn accept_delay(backoff: &mut Duration) -> Duration {
     *backoff = if backoff.is_zero() { Duration::from_millis(10) } else { (*backoff * 2).min(Duration::from_secs(1)) };
     *backoff
@@ -271,8 +246,7 @@ fn serve(statuses: Statuses) -> io::Result<()> {
                 continue;
             }
         };
-        // START is on the critical path of every start, right after restore, when a
-        // new thread costs milliseconds; the quick requests are answered right here.
+        // START is on every start's critical path, where a new thread costs ms: quick requests are answered inline.
         if ["PING", "NET ", "START ", "CLOCK ", "FORKS"].iter().any(|v| line.starts_with(v)) {
             let _ = handle(&stream, &line, &statuses);
             continue;
@@ -284,8 +258,7 @@ fn serve(statuses: Statuses) -> io::Result<()> {
             if !matches!(line.split_whitespace().next(), Some("SESSION" | "ATTACH" | "CLOSE")) {
                 return drop(handle(&stream, &line, &statuses));
             }
-            // A session's command follows a round trip later (the host's reply to the
-            // connect), which a guest faulting in its memory can stretch past a second.
+            // A session's command arrives a round trip later, which a guest faulting in memory can stretch past a second.
             let body = match session::parse(&line) {
                 Ok(session::Request::Start { len, .. }) => match BodyReader::admit() {
                     Some(_reader) => read_body(&mut r, conn, len, at),
@@ -308,7 +281,6 @@ fn sock_timeout(fd: RawFd, opt: libc::c_int, t: Duration) {
     unsafe { libc::setsockopt(fd, libc::SOL_SOCKET, opt, (&tv as *const libc::timeval).cast(), std::mem::size_of_val(&tv) as _) };
 }
 
-/// One of the `MAX_BODY_READERS` slots for a command body being read.
 struct BodyReader;
 
 impl BodyReader {
@@ -325,8 +297,7 @@ impl Drop for BodyReader {
     }
 }
 
-/// Reads a `len`-byte command body from `r` (socket `fd`), all of it by
-/// `at`, however slowly it trickles in. Memory grows only as bytes arrive.
+/// The whole body must arrive by `at`, however slowly; memory grows only as bytes arrive.
 fn read_body(r: &mut impl Read, fd: RawFd, len: usize, at: Instant) -> io::Result<Vec<u8>> {
     let mut body = Vec::new();
     let mut buf = [0u8; 16 * 1024];
@@ -360,7 +331,6 @@ fn fail(w: impl Write, e: impl std::fmt::Display) -> io::Result<()> {
     msg(w, format!("error: {e}"))
 }
 
-/// Serves one request other than the session ones; `line` is all of it.
 fn handle(out: &File, line: &str, statuses: &Statuses) -> io::Result<()> {
     let line = line.trim_end();
     let (verb, arg) = line.split_once(' ').unwrap_or((line, ""));
@@ -378,7 +348,6 @@ fn handle(out: &File, line: &str, statuses: &Statuses) -> io::Result<()> {
             }
             _ => Err(format!("bad start request {arg:?}")),
         },
-        // Answers how far off the clock was (ns, guest minus host).
         "CLOCK" => parse_time(arg.trim()).ok_or_else(|| format!("bad time {arg:?}")).and_then(set_clock).map(|off| format!("ok {off}")),
         "FORKS" => forks().map(|n| format!("ok {n}")).map_err(|e| e.to_string()),
         v if app::VERBS.contains(&v) => return app::handle(v, arg, out, statuses),
@@ -390,15 +359,13 @@ fn handle(out: &File, line: &str, statuses: &Statuses) -> io::Result<()> {
     }
 }
 
-/// Parses `secs.nanos` (nanos zero-padded to 9 digits).
 fn parse_time(s: &str) -> Option<libc::timespec> {
     let (secs, nanos) = s.split_once('.')?;
     let nanos: i64 = nanos.parse().ok().filter(|n| (0..1_000_000_000).contains(n) && nanos.len() == 9)?;
     Some(libc::timespec { tv_sec: secs.parse().ok()?, tv_nsec: nanos as _ })
 }
 
-/// Steps CLOCK_REALTIME to `now` unless it is already within a few ms (the
-/// request's own transit time). Returns how far off it was (ns, guest minus `now`).
+/// Steps CLOCK_REALTIME unless within a few ms (transit time); returns the offset (ns, guest minus `now`).
 fn set_clock(now: libc::timespec) -> Result<i128, String> {
     let ns = |t: &libc::timespec| t.tv_sec as i128 * 1_000_000_000 + t.tv_nsec as i128;
     let mut cur = libc::timespec { tv_sec: 0, tv_nsec: 0 };
@@ -410,11 +377,8 @@ fn set_clock(now: libc::timespec) -> Result<i128, String> {
     Ok(off)
 }
 
-/// Counts the kernel's "crng reseeded due to virtual machine fork" messages,
-/// printed right after it reseeds for a new VMGenID: once the count has gone up
-/// since a snapshot, the RNG has fresh state. (vmgenid sends no uevent, and
-/// /dev/sysgenid is not ordered against the reseed.) Reads the whole ring
-/// buffer, so it needs no state from before the snapshot.
+/// Counts "crng reseeded due to virtual machine fork" in the whole kmsg ring: a rise since a snapshot
+/// means fresh RNG state (vmgenid sends no uevent; /dev/sysgenid isn't ordered against the reseed).
 fn forks() -> io::Result<usize> {
     const FORK_MSG: &[u8] = b"crng reseeded due to virtual machine fork";
     let mut kmsg = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open("/dev/kmsg")?;

@@ -1,17 +1,9 @@
-//! Resumable commands: `SESSION <id> <len>` (plus `len` bytes of shell
-//! command), `ATTACH <id> <offset>` and `CLOSE <id>`. Output frames carry their
-//! stream offset (u64 LE) before the bytes; the exit frame is offset plus code.
-//!
-//! At most `MAX_LIVE` sessions are live (running, or finished and not yet
-//! closed); closed ones leave a tombstone so a delayed retry of their `SESSION`
-//! cannot run the command again. Each ring keeps `BASE` bytes and grows towards
-//! `CAPACITY` only out of a shared pool, so all of them together retain at most
-//! `MAX_LIVE * BASE + POOL` bytes (plus one partly filled `BLOCK` each).
-//!
-//! A session has at most one attachment, a connection streaming its output; a
-//! new `ATTACH` (or a retried `SESSION`) shuts the previous one down. Output
-//! waits for the attachment rather than overwrite what it has not been sent.
-//! Socket writers never hold the ring's lock.
+//! Resumable commands: `SESSION <id> <len>` (then `len` bytes of shell command), `ATTACH <id> <offset>`,
+//! `CLOSE <id>`. Output frames start with their stream offset (u64 LE); the exit frame is offset plus code.
+//! At most `MAX_LIVE` sessions are live; closed ones leave a tombstone so a delayed `SESSION` retry cannot
+//! rerun the command. Rings keep `BASE` bytes and grow towards `CAPACITY` from a shared pool: at most
+//! `MAX_LIVE * BASE + POOL` (plus a partial `BLOCK` each). One attachment per session; a new one shuts the
+//! old one down. Output waits for it rather than overwrite unsent bytes; writers never hold the ring lock.
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::hash::{Hash, Hasher};
@@ -32,16 +24,13 @@ const MAX_CHUNKS: usize = 4096;
 const BLOCK: usize = 16 * 1024;
 const MAX_LIVE: usize = 64;
 const MAX_TOMBSTONES: usize = 4096;
-/// Output every live session may keep without drawing on the pool.
 const BASE: usize = 128 * 1024;
-/// Shared by all rings for growth beyond `BASE`, in `STEP`s.
 const POOL: usize = 64 * 1024 * 1024 - MAX_LIVE * BASE;
 const STEP: usize = 256 * 1024;
 const RETENTION: Duration = Duration::from_secs(300);
 /// How long output keeps waiting for a dropped client (the CLI retries for 30 s).
 const GRACE: Duration = Duration::from_secs(30);
-/// A finished session whose client has been gone this long will not be resumed
-/// (the CLI gives up 30 s after its last frame): it becomes a tombstone.
+/// A finished session whose client has been gone this long (the CLI gives up after 30 s) becomes a tombstone.
 const ABANDONED: Duration = Duration::from_secs(60);
 
 type Session = Arc<(Mutex<Output>, Condvar)>;
@@ -53,7 +42,6 @@ fn session(output: Output) -> Session {
 
 pub struct Table {
     live: HashMap<String, Entry>,
-    /// Closed (or abandoned) session ids, and when they were closed.
     closed: HashMap<String, Instant>,
     pool: Arc<AtomicUsize>,
 }
@@ -65,8 +53,7 @@ impl Default for Table {
 }
 
 struct Entry {
-    /// Recognises a retried SESSION without keeping up to a megabyte of command;
-    /// ids are random, so this is only a check.
+    /// Recognises a retried SESSION without keeping the command; ids are random, so this is only a check.
     command: (usize, u64),
     output: Session,
 }
@@ -82,7 +69,6 @@ impl Table {
         Output { reservation: Reservation { pool: Some(self.pool.clone()), bytes: 0 }, ..Default::default() }
     }
 
-    /// Turns a live session into a tombstone, freeing its output.
     fn close(&mut self, id: &str) {
         if let Some(entry) = self.live.remove(id) {
             let mut output = entry.output.0.lock().unwrap();
@@ -96,7 +82,6 @@ impl Table {
         }
     }
 
-    /// Closes finished sessions whose client went away and did not come back.
     fn reclaim(&mut self) {
         let abandoned: Vec<String> = self
             .live
@@ -136,8 +121,7 @@ struct Chunk {
     data: Vec<u8>,
 }
 
-/// Bytes a ring holds beyond `BASE`, taken from the table's pool and given
-/// back when the session is closed or its output dropped, whichever is first.
+/// Pool bytes beyond `BASE`, given back on close or drop, whichever is first.
 #[derive(Default)]
 struct Reservation {
     pool: Option<Arc<AtomicUsize>>,
@@ -145,7 +129,6 @@ struct Reservation {
 }
 
 impl Reservation {
-    /// Tries to make room for `need` bytes; growth is best effort.
     fn grow(&mut self, need: usize) {
         let Some(pool) = &self.pool else { return };
         let have = BASE + self.bytes;
@@ -171,7 +154,6 @@ impl Drop for Reservation {
     }
 }
 
-/// The connection currently streaming a session's output.
 struct Attachment {
     id: u64,
     /// A duplicate of the connection, to shut it down when it is replaced.
@@ -186,7 +168,6 @@ struct Output {
     exit: Option<i32>,
     closed: bool,
     attached: Option<Attachment>,
-    /// Attachments so far, to number them.
     attachments: u64,
     /// The attachment's cursor: everything before it has been sent.
     sent: u64,
@@ -199,21 +180,18 @@ impl Output {
         BASE + self.reservation.bytes
     }
 
-    /// Chunks holding output at or after `offset`.
     fn chunks_from(&self, offset: u64) -> usize {
         self.chunks.len() - self.chunks.partition_point(|c| c.offset + c.data.len() as u64 <= offset)
     }
 
-    /// Whether output must wait for the attached client (or one that just left)
-    /// before more can be stored; half the ring is slack for bytes in flight.
+    /// Whether output must wait for the (just) attached client; half the ring is slack for bytes in flight.
     fn must_wait(&self) -> bool {
         let unsent = self.end.saturating_sub(self.sent) >= self.capacity() as u64 / 2 || self.chunks_from(self.sent) >= MAX_CHUNKS / 2;
         unsent && (self.attached.is_some() || self.detached.is_some_and(|t| t.elapsed() < GRACE))
     }
 
-    /// Appends output, then drops the oldest so at most `capacity` bytes and
-    /// `MAX_CHUNKS` chunks remain. Output continuing a chunk of the same kind
-    /// joins it, up to `BLOCK` bytes; only the newest chunk has spare allocation.
+    /// Appends, then drops the oldest to fit `capacity` and `MAX_CHUNKS`. Same-kind output joins the
+    /// last chunk up to `BLOCK`; only the newest chunk has spare allocation.
     fn push(&mut self, kind: u8, data: &[u8], capacity: usize) {
         match self.chunks.back_mut() {
             Some(last) if last.kind == kind && last.data.len() + data.len() <= BLOCK => last.data.extend_from_slice(data),
@@ -275,17 +253,14 @@ pub fn parse(line: &str) -> io::Result<Request<'_>> {
     }
 }
 
-/// Runs every minute: abandoned sessions become tombstones, which expire.
 pub fn cleanup(sessions: &Sessions) {
     let mut table = sessions.lock().unwrap();
     table.reclaim();
     table.closed.retain(|_, at| at.elapsed() < RETENTION);
 }
 
-/// Serves one session request; `body` is a `SESSION`'s command. Request errors
-/// are reported as a message frame; write errors just end the stream, since a
-/// frame may have been cut short. `conn` duplicates the connection behind `w`,
-/// so that a later attachment to the same session can shut it down.
+/// Request errors become a message frame; write errors just end the stream (a frame may be cut short).
+/// `conn` duplicates `w`'s connection so a later attachment can shut it down.
 pub fn handle(mut w: impl Write, body: &[u8], conn: Option<File>, line: &str, sessions: &Sessions, statuses: &Statuses) -> io::Result<()> {
     match open(body, conn, line, sessions, statuses) {
         Ok(Some((id, offset, (output, me)))) => {
@@ -373,8 +348,7 @@ fn open<'a>(body: &[u8], conn: Option<File>, line: &'a str, sessions: &Sessions,
     }))
 }
 
-/// Makes `conn` the session's only attachment, streaming from `offset`, and shuts
-/// down the one it replaces. Returns the new attachment's number.
+/// Makes `conn` the only attachment, streaming from `offset`; shuts down the one it replaces.
 fn attach(output: &Session, offset: u64, conn: Option<File>) -> Attached {
     let mut ring = output.0.lock().unwrap();
     ring.attachments += 1;
@@ -390,7 +364,6 @@ fn attach(output: &Session, offset: u64, conn: Option<File>) -> Attached {
     (output.clone(), id)
 }
 
-/// Copies the command's stdout and stderr into its ring, then records its exit.
 fn run(mut child: Child, output: Session, statuses: &Statuses) {
     crate::pump(child.stdout.take(), child.stderr.take(), |kind, data| deliver(&output, kind, data));
     output.0.lock().unwrap().exit = wait_pid(statuses, child.id() as i32, None);
@@ -410,7 +383,6 @@ fn deliver(output: &Session, kind: u8, data: &[u8]) {
     output.1.notify_all();
 }
 
-/// Streams output from `offset` for as long as attachment `me` is the session's.
 fn drain(w: &mut impl Write, output: &Session, mut offset: u64, me: u64) -> io::Result<()> {
     loop {
         let (kind, data) = {
@@ -460,7 +432,6 @@ mod tests {
     use super::*;
     use std::os::unix::net::UnixStream;
 
-    /// Adds a live session for `true` to `table`.
     fn live(table: &mut Table, id: &str, output: Output) -> Session {
         let output = session(Output { reservation: table.new_output().reservation, ..output });
         table.live.insert(id.to_string(), Entry { command: fingerprint(b"true"), output: output.clone() });
@@ -479,15 +450,13 @@ mod tests {
         Arc::new((Mutex::new(HashMap::new()), Condvar::new()))
     }
 
-    /// Runs one request against `sessions`; returns what was written.
     fn request(sessions: &Sessions, statuses: &Statuses, line: &str, body: &[u8]) -> Vec<u8> {
         let mut wire = Vec::new();
         handle(&mut wire, body, None, line, sessions, statuses).unwrap();
         wire
     }
 
-    /// Pumps `n` reads of `data` from a thread (alternating stdout and stderr if
-    /// `kinds`); returns once the pump has stopped making progress.
+    /// Pumps `n` reads of `data` (alternating kinds if `kinds`); returns once it stops making progress.
     fn pump(output: &Session, n: usize, data: &'static [u8], kinds: bool) -> thread::JoinHandle<()> {
         let pumped = output.clone();
         let t = thread::spawn(move || {
@@ -547,7 +516,6 @@ mod tests {
     #[test]
     fn live_limit_is_explicit_and_abandoned_sessions_are_reclaimed() {
         let mut table = Table::default();
-        // Detached only just now: the client may come back.
         let outputs: Vec<_> = (0..MAX_LIVE).map(|i| {
             table.admit().unwrap();
             finished(&mut table, &i.to_string(), Some(Instant::now()))
@@ -623,7 +591,6 @@ mod tests {
     #[test]
     fn attached_readers_apply_backpressure_instead_of_evicting() {
         let table = Table::default();
-        // Full blocks wait at half the (pool-grown) ring.
         let output = attached(table.new_output());
         let t = pump(&output, 2 * CAPACITY / BLOCK, &[b'x'; BLOCK], false);
         let ring = output.0.lock().unwrap();
@@ -632,8 +599,7 @@ mod tests {
         drop(ring);
         detach_and_join(&output, t);
         assert_eq!(output.0.lock().unwrap().start, CAPACITY as u64);
-        // One-byte reads of one kind are coalesced and wait at the byte threshold;
-        // alternating kinds cannot be, and wait at half the chunk limit.
+        // Same-kind one-byte reads coalesce and wait at the byte threshold; alternating kinds at half the chunk limit.
         for (n, kinds, end, chunks) in [(BASE, false, BASE as u64 / 2, BASE / 2 / BLOCK), (MAX_CHUNKS * 2, true, MAX_CHUNKS as u64 / 2, MAX_CHUNKS / 2)] {
             let output = attached(Output::default());
             let t = pump(&output, n, b"x", kinds);
@@ -702,7 +668,6 @@ mod tests {
         ring.push(FRAME_STDOUT, b"0123456789", 5);
         assert_eq!((ring.start, ring.end), (12, 17));
         assert_eq!(ring.read(12), Some((FRAME_STDOUT, out(12, b"56789"))));
-        // Small reads of one kind join a block; a full block, or the other kind, starts a new one.
         let mut tiny = Output::default();
         for _ in 0..BLOCK + 1 {
             tiny.push(FRAME_STDOUT, b"x", CAPACITY);
@@ -712,7 +677,6 @@ mod tests {
         tiny.push(FRAME_STDERR, b"y", CAPACITY);
         assert_eq!(tiny.chunks.len(), 3);
         assert_eq!(tiny.read(BLOCK as u64 + 1), Some((FRAME_STDERR, out(BLOCK as u64 + 1, b"y"))));
-        // Alternating kinds still bound the chunk count.
         let mut tiny = Output::default();
         for i in 0..MAX_CHUNKS + 1 {
             tiny.push(if i % 2 == 0 { FRAME_STDOUT } else { FRAME_STDERR }, b"x", CAPACITY);
@@ -738,7 +702,6 @@ mod tests {
         let (first, first_peer) = attach(0);
         thread::sleep(Duration::from_millis(200));
         assert!(!first.is_finished());
-        // Many more, at once: each replaces the one before and ends it.
         let (handlers, peers): (Vec<_>, Vec<_>) = (0..50).map(attach).unzip();
         let deadline = Instant::now() + Duration::from_secs(5);
         while handlers.iter().filter(|h| !h.is_finished()).count() > 1 && Instant::now() < deadline {

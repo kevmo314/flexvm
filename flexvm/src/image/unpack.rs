@@ -1,6 +1,5 @@
-//! Applies untrusted image layers as a container runtime does. Paths resolve
-//! with `openat2(RESOLVE_IN_ROOT)`, then act on one final component through
-//! `*at` calls that never follow it; `Limits` apply before anything is written.
+//! Applies untrusted image layers as a container runtime does: paths resolve with `openat2(RESOLVE_IN_ROOT)`,
+//! final components via `*at` calls that never follow them; `Limits` apply before anything is written.
 
 use std::collections::HashSet;
 use std::ffi::{CStr, CString, OsStr, OsString};
@@ -15,8 +14,7 @@ use sha2::{Digest, Sha256};
 use crate::bail;
 use crate::util::Result;
 
-/// Budgets for one image build: compressed and uncompressed bytes of all
-/// layers, bytes of one file, tar entries of all layers.
+/// Budgets for one image build: bytes compressed, uncompressed and per file, and tar entries.
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
     pub download: u64,
@@ -31,7 +29,6 @@ impl Default for Limits {
     }
 }
 
-/// Largest manifest, index or config document accepted.
 pub const MAX_DOCUMENT: u64 = 4 << 20;
 /// Most tar metadata (PAX header, GNU long name and link) for one entry, together.
 const MAX_META: u64 = 1 << 20;
@@ -62,7 +59,6 @@ pub fn lexical(p: &Path) -> PathBuf {
     out
 }
 
-/// Splits a layer path into its parent and final component; `None` for the root.
 fn split(p: &Path) -> Result<Option<(PathBuf, CString)>> {
     if p.components().any(|c| c == Component::ParentDir) {
         bail!("layer path {p:?} contains '..'");
@@ -72,7 +68,6 @@ fn split(p: &Path) -> Result<Option<(PathBuf, CString)>> {
     Ok(Some((p.parent().unwrap().to_path_buf(), cpath(Path::new(name))?)))
 }
 
-/// `openat` with O_CLOEXEC, creating files 0600.
 pub fn open_at(dir: RawFd, name: &CStr, flags: i32) -> Result<OwnedFd> {
     let fd = unsafe { libc::openat(dir, name.as_ptr(), flags | libc::O_CLOEXEC, 0o600) };
     if fd < 0 {
@@ -85,12 +80,10 @@ pub fn open_dir_at(dir: RawFd, name: &CStr) -> Result<OwnedFd> {
     open_at(dir, name, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW)
 }
 
-/// The magic link that names exactly the inode `fd` refers to.
 fn proc_path(fd: &OwnedFd) -> CString {
     CString::new(format!("/proc/self/fd/{}", fd.as_raw_fd())).unwrap()
 }
 
-/// `lstat` of `name` in `dir`, or of `dir` itself when `name` is empty.
 pub fn stat_at(dir: RawFd, name: &CStr) -> Option<libc::stat> {
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     let rc = unsafe { libc::fstatat(dir, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW | libc::AT_EMPTY_PATH) };
@@ -101,7 +94,6 @@ pub fn is_type(dir: RawFd, name: &CStr, fmt: libc::mode_t) -> bool {
     stat_at(dir, name).is_some_and(|st| st.st_mode & libc::S_IFMT == fmt)
 }
 
-/// The names in directory `dir`, read through the fd's own magic link.
 fn list_dir(dir: RawFd) -> Result<Vec<CString>> {
     let names = std::fs::read_dir(format!("/proc/self/fd/{dir}"))?;
     names.map(|e| Ok(CString::new(e?.file_name().into_vec()).unwrap())).collect()
@@ -126,8 +118,7 @@ pub fn remove_at(dir: RawFd, name: &CStr, depth: u32) -> Result<()> {
     }
 }
 
-/// Hides what lower layers put under directory `fd` (at `dir`), keeping
-/// `layer`: this layer's paths and their ancestors.
+/// Hides lower layers' entries under `fd`, keeping `layer` (this layer's paths and ancestors).
 fn opaque(fd: RawFd, dir: &Path, layer: &HashSet<PathBuf>, depth: u32) -> Result<()> {
     for name in list_dir(fd)? {
         hide(fd, dir, &name, layer, depth)?;
@@ -150,7 +141,6 @@ fn hide(fd: RawFd, dir: &Path, name: &CStr, layer: &HashSet<PathBuf>, depth: u32
     }
 }
 
-/// A resolved parent directory and the final component inside it.
 struct At {
     dir: OwnedFd,
     name: CString,
@@ -161,7 +151,6 @@ impl At {
         remove_at(self.dir.as_raw_fd(), &self.name, 0)
     }
 
-    /// Replaces the entry with a new empty file.
     fn create(&self) -> Result<File> {
         self.remove()?;
         let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW;
@@ -177,7 +166,6 @@ impl At {
     }
 }
 
-/// Hashes and counts the bytes read through it.
 pub struct Hashed<R> {
     inner: R,
     hash: Sha256,
@@ -203,7 +191,6 @@ impl<R: Read> Read for Hashed<R> {
     }
 }
 
-/// What one tar entry asks for, after GNU long names and PAX records.
 pub struct Meta {
     pub path: PathBuf,
     pub link: Option<PathBuf>,
@@ -286,9 +273,7 @@ fn describe<R: Read>(e: &tar::Entry<R>, name: Option<Vec<u8>>, link: Option<Vec<
 pub struct Root {
     fd: OwnedFd,
     limits: Limits,
-    /// Entries written, to size the filesystem's inode table.
     pub entries: u64,
-    /// Tar entries and uncompressed bytes read, against `limits`.
     seen: u64,
     unpacked: u64,
 }
@@ -315,12 +300,10 @@ impl Root {
         Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
     }
 
-    /// Opens directory `rel` with symlinks resolved inside the root.
     fn resolve(&self, rel: &Path) -> io::Result<OwnedFd> {
         self.openat2(rel.as_os_str().as_bytes(), libc::O_PATH | libc::O_DIRECTORY)
     }
 
-    /// Resolves directory `rel`, creating missing directories (root, 0755).
     fn mkdir_p(&mut self, rel: &Path, depth: u32) -> Result<OwnedFd> {
         if depth > 40 {
             bail!("too many levels of symbolic links creating {rel:?}");
@@ -341,8 +324,7 @@ impl Root {
                     if unsafe { libc::mkdirat(fd.as_raw_fd(), name.as_ptr(), 0o755) } == 0 {
                         self.entries += 1;
                     } else {
-                        // A dangling symlink (say var/run -> /run): create its
-                        // target, as container runtimes do.
+                        // A dangling symlink (say var/run -> /run): create its target, as container runtimes do.
                         let mut buf = vec![0u8; 4096];
                         let n = unsafe { libc::readlinkat(fd.as_raw_fd(), name.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
                         check(n as i32, "mkdir", &cur)?;
@@ -362,8 +344,7 @@ impl Root {
         Ok(At { dir: self.mkdir_p(&parent, 0)?, name })
     }
 
-    /// Applies one decompressed layer tarball, read to its end, and returns
-    /// its digest (the config's `diff_id` for it).
+    /// Applies one decompressed layer, read to its end; returns its digest (the config's diff_id).
     pub fn apply_layer(&mut self, layer: impl Read) -> Result<String> {
         let limit = self.limits.unpacked.saturating_sub(self.unpacked);
         let mut r = Hashed::new(layer.take(limit.saturating_add(1)));
@@ -382,7 +363,6 @@ impl Root {
     }
 
     fn apply<R: Read>(&mut self, e: &mut tar::Entry<R>, m: Meta, mine: &mut HashSet<PathBuf>) -> Result<()> {
-        // The root directory itself: keep ours.
         let Some((parent, name)) = split(&m.path)? else { return Ok(()) };
         let name = name.as_bytes();
         if let Some(rest) = name.strip_prefix(b".wh.") {
@@ -476,7 +456,6 @@ impl Root {
         Ok(())
     }
 
-    /// Creates directory `rel` (and parents) if missing, with `mode` if new.
     pub fn ensure_dir(&mut self, rel: &str, mode: u32) -> Result<()> {
         let at = self.at(Path::new(rel))?;
         if stat_at(at.dir.as_raw_fd(), &at.name).is_none() {
@@ -488,7 +467,6 @@ impl Root {
         Ok(())
     }
 
-    /// Replaces `rel` with a root-owned regular file.
     pub fn write_file(&mut self, rel: &str, data: &[u8], mode: u32) -> Result<()> {
         let mut f = self.at(Path::new(rel))?.create()?;
         f.write_all(data)?;
@@ -497,14 +475,12 @@ impl Root {
         Ok(())
     }
 
-    /// Whether `rel` is a regular file (not following a final symlink).
     pub fn is_file(&mut self, rel: &str) -> bool {
         let Ok(Some((parent, name))) = split(Path::new(rel)) else { return false };
         self.resolve(&parent).is_ok_and(|dir| is_type(dir.as_raw_fd(), &name, libc::S_IFREG))
     }
 
-    /// Reads at most 1 MiB of a regular file, following symlinks inside the
-    /// root. Anything else (a FIFO, a device node) is never opened for reading.
+    /// At most 1 MiB of a regular file; anything else (a FIFO, a device) is never opened.
     pub fn read(&self, rel: &str) -> Option<Vec<u8>> {
         let fd = self.openat2(rel.trim_start_matches('/').as_bytes(), libc::O_PATH).ok()?;
         if !is_type(fd.as_raw_fd(), c"", libc::S_IFREG) {
@@ -518,7 +494,6 @@ impl Root {
     }
 }
 
-/// Wraps a layer blob in the decompressor its magic bytes call for.
 pub fn decompress<'a>(r: impl Read + 'a) -> Result<Box<dyn Read + 'a>> {
     let mut r = BufReader::with_capacity(256 << 10, r);
     let magic = r.fill_buf()?.get(..4).map(|m| m.to_vec()).unwrap_or_default();
@@ -529,8 +504,7 @@ pub fn decompress<'a>(r: impl Read + 'a) -> Result<Box<dyn Read + 'a>> {
     })
 }
 
-/// Decodes every zstd frame, skipping skippable ones, so all of a layer is
-/// counted (a `StreamingDecoder` stops after the first frame).
+/// Decodes every zstd frame (a `StreamingDecoder` stops after the first), so all of a layer counts.
 struct ZstdFrames<R> {
     src: R,
     dec: ruzstd::decoding::FrameDecoder,
@@ -579,8 +553,7 @@ pub(super) mod tests {
     use super::*;
     use tar::EntryType as T;
 
-    /// A layer of (path, kind, data or link target). Kinds: d(ir), f(ile),
-    /// l (symlink), h(ard link), p (FIFO).
+    /// A layer of (path, kind, data or link target); kinds d, f, l(symlink), h(ard link), p(FIFO).
     pub fn layer(entries: &[(&str, char, &str)]) -> Vec<u8> {
         let mut b = tar::Builder::new(Vec::new());
         for &(path, kind, data) in entries {
@@ -622,7 +595,6 @@ pub(super) mod tests {
         v
     }
 
-    /// A scratch directory, removed on drop.
     pub struct Tmp(PathBuf);
 
     impl std::ops::Deref for Tmp {
@@ -645,7 +617,6 @@ pub(super) mod tests {
         Tmp(d)
     }
 
-    /// `dir/root` to unpack into, with `dir/outside` next to it.
     struct Sandbox {
         dir: Tmp,
         root: PathBuf,
@@ -690,7 +661,6 @@ pub(super) mod tests {
             (".wh.c", 'f', ""),
             // Through an absolute symlink: must land inside the root.
             ("abs/through", 'f', "t"),
-            // Through a dangling one: creates its target.
             ("var/run/pid", 'f', "1"),
             ("hard", 'h', "a/x"),
         ]);
@@ -711,7 +681,6 @@ pub(super) mod tests {
         type Layer<'a> = &'a [(&'a str, char, &'a str)];
         type Want<'a> = &'a [(&'a str, Option<&'a str>)];
         let cases: &[(Layer, Layer, Want)] = &[
-            // Plain whiteouts keep a same-layer file and descendants.
             (&[("foo", 'f', "lower"), ("dir/old", 'f', "old"), ("gone", 'f', "gone")],
              &[("foo", 'f', "upper"), (".wh.foo", 'f', ""), ("dir/new", 'f', "new"), (".wh.dir", 'f', ""), (".wh.gone", 'f', "")],
              &[("foo", Some("upper")), ("dir/new", Some("new")), ("dir/old", None), ("gone", None), (".wh.foo", None)]),
@@ -806,7 +775,6 @@ pub(super) mod tests {
         let tar = layer(&[("a", 'f', "first"), ("b", 'f', "second")]);
         let (one, two) = tar.split_at(1024);
         let mut z = compress_to_vec(one, CompressionLevel::Fastest);
-        // A skippable frame between the two data frames.
         z.extend_from_slice(&0x184D2A50u32.to_le_bytes());
         z.extend_from_slice(&3u32.to_le_bytes());
         z.extend_from_slice(b"abc");
@@ -818,7 +786,6 @@ pub(super) mod tests {
         let diff = s.open().apply_layer(decompress(io::Cursor::new(z)).unwrap()).unwrap();
         assert_eq!(diff, format!("sha256:{:x}", Sha256::digest(&tar)));
         assert_eq!(s.read("b").as_deref(), Some("second"));
-        // Garbage after the last frame is an error, not ignored.
         let mut bad = compress_to_vec(&tar[..], CompressionLevel::Fastest);
         bad.extend_from_slice(b"trailing junk");
         assert!(decompress(io::Cursor::new(bad)).unwrap().read_to_end(&mut Vec::new()).is_err());

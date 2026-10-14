@@ -16,25 +16,20 @@ use crate::bail;
 use crate::util::Result;
 
 pub struct Image {
-    /// Manifest digest (the config digest for a legacy `docker save`).
     pub digest: String,
     pub config_digest: String,
-    /// Checked against `config_digest`.
     pub config: Vec<u8>,
     pub layers: Vec<Layer>,
-    /// Digests of the uncompressed layers, from the config.
     pub diff_ids: Vec<String>,
 }
 
-/// A layer blob with its descriptor's digest and size; a legacy `docker
-/// save` has neither and relies on the config's `diff_ids` alone.
+/// Digest and size are the descriptor's; a legacy `docker save` has neither and relies on `diff_ids`.
 pub struct Layer {
     pub src: Blob,
     pub digest: Option<String>,
     pub size: Option<u64>,
 }
 
-/// A whole file, or a member of an uncompressed tar archive.
 pub enum Blob {
     File(PathBuf),
     Slice { file: PathBuf, offset: u64, len: u64 },
@@ -81,7 +76,6 @@ impl Layer {
         }
     }
 
-    /// The blob, hashed as the decompressor reads it.
     pub fn open(&self) -> Result<Hashed<Box<dyn Read>>> {
         let (inner, len) = self.src.open()?;
         self.check_size(len)?;
@@ -95,7 +89,6 @@ impl Layer {
         }
     }
 
-    /// Checks the blob hashed while unpacking, including any remaining bytes.
     pub fn verify(&self, mut r: Hashed<Box<dyn Read>>) -> Result<()> {
         std::io::copy(&mut r, &mut std::io::sink())?;
         self.check_size(r.n)?;
@@ -106,7 +99,6 @@ impl Layer {
     }
 }
 
-/// `src` is a local OCI layout directory, a local archive, or a registry reference.
 pub fn fetch(cache: &Path, src: &str, limits: &Limits) -> Result<Image> {
     let path = Path::new(src);
     let img = if path.is_dir() {
@@ -130,7 +122,6 @@ pub fn fetch(cache: &Path, src: &str, limits: &Limits) -> Result<Image> {
     Ok(img)
 }
 
-/// Completes an image with the config's `rootfs.diff_ids`, one per layer.
 fn image(digest: String, config_digest: String, config: Vec<u8>, layers: Vec<Layer>) -> Result<Image> {
     let v: Value = serde_json::from_slice(&config)?;
     let diff_ids: Vec<String> = v["rootfs"]["diff_ids"]
@@ -148,8 +139,7 @@ fn image(digest: String, config_digest: String, config: Vec<u8>, layers: Vec<Lay
     Ok(Image { digest, config_digest, config, layers, diff_ids })
 }
 
-/// Reads a cached document: a regular file of exactly `size` bytes (at most
-/// `MAX_DOCUMENT`) whose contents match `digest`.
+/// A cached document: a regular file of exactly `size` bytes (at most `MAX_DOCUMENT`) matching `digest`.
 pub(super) fn read_verified(path: &Path, size: u64, digest: &str) -> Result<Vec<u8>> {
     let data = Blob::File(path.to_path_buf()).read_document()?;
     if data.len() as u64 != size || sha256_hex(&data) != digest {
@@ -165,7 +155,6 @@ fn check_download(total: u64, limits: &Limits) -> Result<()> {
     Ok(())
 }
 
-/// Layer digests and sizes from a manifest, within the download budget.
 fn descriptors(manifest: &Value, limits: &Limits) -> Result<Vec<(String, u64)>> {
     let mut out = Vec::new();
     for l in manifest["layers"].as_array().ok_or("manifest has no layers")? {
@@ -177,7 +166,6 @@ fn descriptors(manifest: &Value, limits: &Limits) -> Result<Vec<(String, u64)>> 
     Ok(out)
 }
 
-/// Follows image indexes, at most four deep, down to their linux/amd64 manifest.
 fn resolve_index(mut v: Value, mut digest: String, mut get: impl FnMut(&str) -> Result<Value>) -> Result<(Value, String)> {
     let mut depth = 0;
     while let Some(manifests) = v["manifests"].as_array() {
@@ -229,7 +217,6 @@ enum Member {
     Link(PathBuf),
 }
 
-/// Locates the members of an uncompressed tar archive without extracting it.
 fn tar_index(file: &Path, limits: &Limits) -> Result<impl Fn(&str) -> Result<Blob>> {
     let mut f = File::open(file)?;
     let mut magic = [0u8; 2];
@@ -269,7 +256,6 @@ fn tar_index(file: &Path, limits: &Limits) -> Result<impl Fn(&str) -> Result<Blo
     })
 }
 
-/// An OCI layout or `docker save` output, its files found by `blob`.
 fn from_files(blob: &dyn Fn(&str) -> Result<Blob>, limits: &Limits) -> Result<Image> {
     let read = |path: &str| blob(path)?.read_document();
     let by_digest = |d: &str| -> Result<String> { Ok(blob_path(Path::new("blobs"), d)?.to_string_lossy().into_owned()) };
@@ -295,8 +281,7 @@ fn from_files(blob: &dyn Fn(&str) -> Result<Blob>, limits: &Limits) -> Result<Im
     if blob("manifest.json").is_err() {
         bail!("not an OCI layout or docker save archive: no index.json or manifest.json");
     }
-    // Legacy `docker save`: [{"Config": path, "Layers": [paths]}]. The config
-    // is identified by its own hash, layers by its diff_ids.
+    // Legacy `docker save`: the config is identified by its own hash, layers by its diff_ids.
     let m: Value = serde_json::from_slice(&read("manifest.json")?)?;
     let m = m.get(0).ok_or("empty manifest.json")?;
     let config = read(m["Config"].as_str().ok_or("manifest.json has no Config")?)?;

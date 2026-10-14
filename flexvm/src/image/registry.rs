@@ -40,16 +40,14 @@ impl Registry {
         Registry { agent, r, basic, auth: None }
     }
 
-    /// Whether `url` may receive this registry's credentials: HTTPS, and the
-    /// registry itself or its well-known token service.
+    /// Credentials go only over HTTPS to the registry itself or its well-known token service.
     fn trusted(&self, url: &str) -> bool {
         let Some(rest) = url.strip_prefix("https://") else { return false };
         let host = rest.split(['/', '?', '#']).next().unwrap_or("");
         host == self.r.registry || (self.r.registry == "registry-1.docker.io" && host == "auth.docker.io")
     }
 
-    /// GETs `path` under the repository, authenticating on a 401 and retrying
-    /// once. Up to five redirects (blob storage) are followed without credentials.
+    /// Authenticates on a 401 and retries once; redirects (blob storage) are followed without credentials.
     fn get(&mut self, path: &str, accept: &str) -> Result<ureq::Response> {
         let base = format!("{}/{path}", self.r.base_url());
         let (mut url, mut redirects, mut authenticated) = (base.clone(), 0, false);
@@ -137,7 +135,6 @@ impl Registry {
         Ok(())
     }
 
-    /// Fetches a manifest or index by tag or digest; returns it with its digest.
     pub fn manifest(&mut self, reference: &str) -> Result<(Value, String)> {
         let resp = self.get(&format!("manifests/{reference}"), MANIFEST_TYPES)?;
         let mut body = Vec::new();
@@ -152,9 +149,7 @@ impl Registry {
         Ok((serde_json::from_slice(&body)?, digest))
     }
 
-    /// Downloads blob `digest` into `blobs/sha256/<hex>` unless already
-    /// there, checking size and digest before the fsynced rename. Cached
-    /// blobs are checked again where they are used.
+    /// Size and digest are checked before the fsynced rename; cached blobs are checked where used.
     pub fn blob(&mut self, digest: &str, size: u64, blobs: &Path) -> Result<PathBuf> {
         let path = blob_path(blobs, digest)?;
         let dir = path.parent().unwrap().to_path_buf();
@@ -179,7 +174,6 @@ impl Registry {
     }
 }
 
-/// Removes abandoned downloads while preserving files owned by live processes.
 fn sweep_parts(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
@@ -193,7 +187,6 @@ fn sweep_parts(dir: &Path) {
     }
 }
 
-/// Makes renames into `dir` durable.
 pub fn sync_dir(dir: &Path) -> Result<()> {
     Ok(std::fs::File::open(dir).and_then(|d| d.sync_all()).map_err(|e| format!("fsync of directory {}: {e}", dir.display()))?)
 }
@@ -210,9 +203,7 @@ pub fn blob_path(blobs: &Path, digest: &str) -> Result<PathBuf> {
     }
 }
 
-/// Basic credentials for `registry` from the Docker config (`$DOCKER_CONFIG`,
-/// `~/.docker/config.json`, or the invoking user's under sudo). Credential
-/// helpers are not supported.
+/// From `$DOCKER_CONFIG`, `~/.docker` or the sudo user's; credential helpers are not supported.
 fn docker_credentials(registry: &str) -> Option<String> {
     let sudo_home = std::env::var("SUDO_USER").ok().and_then(|user| {
         std::fs::read_to_string("/etc/passwd").ok()?.lines().find_map(|l| {
@@ -274,7 +265,6 @@ mod tests {
         let ghcr = Registry::new(Reference::parse("ghcr.io/o/a").unwrap());
         assert!(ghcr.trusted("https://ghcr.io/token"));
         assert!(!ghcr.trusted("https://auth.docker.io/token"));
-        // A plain-HTTP registry never gets credentials at all.
         assert!(Registry::new(Reference::parse("localhost:5000/a").unwrap()).basic.is_none());
     }
 }

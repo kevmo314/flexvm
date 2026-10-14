@@ -1,15 +1,12 @@
-//! Registry references, with Docker's defaulting rules:
-//! `nginx` = `docker.io/library/nginx:latest`.
+//! Registry references, with Docker's defaulting rules: `nginx` = `docker.io/library/nginx:latest`.
 
 use crate::bail;
 use crate::util::Result;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reference {
-    /// Host (and port) to talk to, e.g. `registry-1.docker.io` or `ghcr.io`.
     pub registry: String,
     pub repository: String,
-    /// A tag or a `sha256:` digest.
     pub reference: String,
 }
 

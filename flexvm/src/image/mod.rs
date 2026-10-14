@@ -1,6 +1,5 @@
-//! Templates from container images, as read-only ext4 root filesystems cached
-//! by digest (`blobs/sha256/<hex>`, `rootfs/<key>.ext4`). Templates attach the
-//! cached filesystem in place, so deleting it breaks them.
+//! Templates from container images: read-only ext4 root filesystems cached by digest
+//! (`blobs/sha256/<hex>`, `rootfs/<key>.ext4`), attached in place, so deleting one breaks its templates.
 
 mod reference;
 mod registry;
@@ -25,17 +24,13 @@ use registry::{sha256_hex, sync_dir};
 pub use unpack::Limits;
 use unpack::{check, cpath, open_at, stat_at, Root};
 
-/// What a template records about its image.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageMeta {
-    /// The reference or path the template was built from.
     pub source: String,
     /// Manifest digest (the config digest for a legacy `docker save`).
     pub digest: String,
     pub config_digest: String,
-    /// `/etc/flexvm/app.conf` as written into the root filesystem.
     pub app_conf: String,
-    /// Entrypoint followed by command.
     pub argv: Vec<String>,
     /// Started before the snapshot (true) or on every `run` (false).
     pub warm: bool,
@@ -45,13 +40,10 @@ pub struct ImageMeta {
     pub ready_timeout: Duration,
 }
 
-/// When a warm template's app counts as ready to snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Ready {
-    /// Something accepts TCP connections on 127.0.0.1:port in the guest.
     Port(u16),
-    /// A shell command in the guest exits 0.
     Cmd(String),
 }
 
@@ -86,7 +78,6 @@ pub fn parse_argv(s: &str) -> Result<Vec<String>> {
     Ok(s.split_whitespace().map(String::from).collect())
 }
 
-/// The image config's fields we use, with overrides applied.
 struct App {
     argv: Vec<String>,
     env: Vec<String>,
@@ -137,8 +128,6 @@ fn app_config(config: &Value, o: &Options) -> Result<App> {
     })
 }
 
-/// Builds (or finds in the cache) the root filesystem for `o.image`.
-/// `init` is the static flexvm-init binary.
 pub fn prepare(cache: &Path, init: &Path, o: &Options) -> Result<(PathBuf, ImageMeta)> {
     let img = source::fetch(cache, &o.image, &o.limits)?;
     let config: Value = serde_json::from_slice(&img.config)?;
@@ -177,7 +166,6 @@ pub fn prepare(cache: &Path, init: &Path, o: &Options) -> Result<(PathBuf, Image
     Ok((cached, meta))
 }
 
-/// Starts the app in a warm template's VM and waits until it is ready.
 pub fn warm_up(vsock: &Path, meta: &ImageMeta) -> Result<()> {
     let start = Instant::now();
     guest::start_app(vsock)?;
@@ -202,7 +190,6 @@ pub fn warm_up(vsock: &Path, meta: &ImageMeta) -> Result<()> {
     }
 }
 
-/// At least the last 64 KiB of the app's buffered output.
 fn read_logs(vsock: &Path) -> Result<Vec<u8>> {
     const KEEP: usize = 64 << 10;
     let mut r = guest::start_logs(crate::util::connect_unix(vsock, guest::TIMEOUT)?, 0, false, guest::TIMEOUT)?;
@@ -276,7 +263,6 @@ fn cached_rootfs(cached: &Path, build: impl FnOnce(&Path) -> Result<String>, syn
     Ok(std::fs::canonicalize(cached)?)
 }
 
-/// Unlinks an unmarked entry's files and its crashed builds' temporaries.
 fn remove_leftovers(cached: &Path) -> Result<()> {
     let dir = cached.parent().unwrap();
     let stem = cached.file_stem().unwrap().as_bytes();
@@ -313,7 +299,6 @@ fn publish_rootfs(tmp: &Path, cached: &Path, conf: &str, sync: impl Fn(&Path) ->
     sync(dir)
 }
 
-/// Returns false on EEXIST, leaving the existing file untouched.
 fn rename_noreplace(tmp: &Path, path: &Path) -> Result<bool> {
     let (src, dest) = (cpath(tmp)?, cpath(path)?);
     if unsafe { libc::renameat2(libc::AT_FDCWD, src.as_ptr(), libc::AT_FDCWD, dest.as_ptr(), libc::RENAME_NOREPLACE) } == 0 {
@@ -326,8 +311,7 @@ fn rename_noreplace(tmp: &Path, path: &Path) -> Result<bool> {
     }
 }
 
-/// Writes `path` durably through a temporary file, never replacing it;
-/// false if another publisher got there first.
+/// Writes `path` durably via a temporary, never replacing it; false if another publisher won.
 pub(super) fn publish(path: &Path, write: impl FnOnce(&mut File) -> Result<()>) -> Result<bool> {
     let tmp = path.with_extension(format!("part{}", std::process::id()));
     let res = (|| {
@@ -351,11 +335,9 @@ fn create_new(path: &Path) -> Result<File> {
     Ok(std::fs::OpenOptions::new().write(true).create_new(true).custom_flags(libc::O_NOFOLLOW).open(path)?)
 }
 
-/// Default for `--image-staging`.
 pub const STAGING: &str = "/var/lib/flexvm/staging";
 
-/// Checks that only root can change what `path` names: it and every ancestor
-/// are root-owned and not group/other writable (sticky directories excepted).
+/// Only root may change what `path` names (sticky directories excepted).
 fn check_ancestry(path: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
     for dir in path.ancestors() {
@@ -388,7 +370,6 @@ fn staging_dir(path: &Path) -> Result<OwnedFd> {
     Ok(fd)
 }
 
-/// Unpacks the image into `dest` (an ext4 image); returns the app.conf it wrote.
 fn build_rootfs(staging: &Path, img: &source::Image, app: &App, init: &[u8], dest: &Path, limits: &Limits) -> Result<String> {
     let staging = staging_dir(staging)?;
     let name = format!("rootfs-{}", std::process::id());
@@ -400,7 +381,6 @@ fn build_rootfs(staging: &Path, img: &source::Image, app: &App, init: &[u8], des
         let work = unpack::open_dir_at(staging.as_raw_fd(), &cname)?;
         // mkdirat applied the umask.
         check(unsafe { libc::fchmod(work.as_raw_fd(), 0o755) }, "chmod", Path::new(&name))?;
-        // mkfs.ext4 and du reach the same directory through our fd.
         let path = PathBuf::from(format!("/proc/{}/fd/{}/{name}", std::process::id(), staging.as_raw_fd()));
         let mut root = Root::from_fd(work, *limits);
         unpack_layers(&mut root, img)?;
@@ -412,8 +392,7 @@ fn build_rootfs(staging: &Path, img: &source::Image, app: &App, init: &[u8], des
     res
 }
 
-/// Applies the layers in order, checking each blob against its descriptor
-/// and its uncompressed contents against the config's diff_ids.
+/// Checks each blob against its descriptor and its contents against the config's diff_ids.
 fn unpack_layers(root: &mut Root, img: &source::Image) -> Result<()> {
     for (i, layer) in img.layers.iter().enumerate() {
         eprintln!("image: applying layer {}/{} {}", i + 1, img.layers.len(), layer.name());
@@ -434,8 +413,6 @@ fn escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\n', "\\n")
 }
 
-/// Adds flexvm-init, its mount points, `/etc/flexvm/app.conf`, `/etc/hosts`
-/// and `/etc/resolv.conf`.
 fn inject(root: &mut Root, app: &App, init: &[u8]) -> Result<String> {
     for (dir, mode) in [("proc", 0o555), ("sys", 0o555), ("dev", 0o755), ("run", 0o755), ("tmp", 0o1777), ("mnt", 0o755), ("root", 0o700), ("etc/flexvm", 0o755), ("sbin", 0o755)] {
         root.ensure_dir(dir, mode)?;
@@ -464,8 +441,7 @@ fn inject(root: &mut Root, app: &App, init: &[u8]) -> Result<String> {
     Ok(conf)
 }
 
-/// Resolves an image `User` (`name`, `uid`, `name:group`, `uid:gid`) against
-/// the image's own /etc/passwd and /etc/group.
+/// Resolves an image `User` against the image's own /etc/passwd and /etc/group.
 fn resolve_user(root: &Root, user: &str) -> Result<(u32, u32, String, Vec<u32>)> {
     let rows = |p| -> Vec<Vec<String>> {
         let text = String::from_utf8_lossy(&root.read(p).unwrap_or_default()).into_owned();
@@ -498,8 +474,7 @@ fn resolve_user(root: &Root, user: &str) -> Result<(u32, u32, String, Vec<u32>)>
     Ok((uid, gid, home, groups))
 }
 
-/// Writes `dir` into a new ext4 image at `dest`, sized to its content plus
-/// headroom and rounded up to 2 MiB as virtio-pmem requires.
+/// Sized to content plus headroom, rounded up to 2 MiB as virtio-pmem requires.
 fn mkfs(dir: &Path, entries: u64, dest: &Path) -> Result<()> {
     let du = Command::new("du").arg("-sk").arg(dir).output()?;
     let kib: u64 = String::from_utf8_lossy(&du.stdout).split_whitespace().next().and_then(|s| s.parse().ok()).ok_or("du failed")?;
@@ -564,7 +539,6 @@ mod tests {
         assert!(e.contains("file/x"), "{e}");
     }
 
-    /// An image config whose one layer has `layer`'s diff_id.
     fn config(layer: &[u8]) -> String {
         json!({"architecture": "amd64", "os": "linux", "config": {"Cmd": ["/x"]}, "rootfs": {"type": "layers", "diff_ids": [sha256_hex(layer)]}}).to_string()
     }
@@ -573,7 +547,6 @@ mod tests {
         source::fetch(Path::new("/nonexistent"), src.to_str().unwrap(), limits)
     }
 
-    /// Unpacks `src` into `out`, returning `out/a`.
     fn unpack(src: &Path, out: &Path) -> Result<String> {
         let img = fetch(src, &Limits::default())?;
         std::fs::create_dir_all(out).unwrap();
@@ -585,7 +558,6 @@ mod tests {
     fn docker_save_layers_must_match_the_config_diff_ids() {
         let (good, evil) = (layer(&[("a", 'f', "good")]), layer(&[("a", 'f', "evil")]));
         for (i, held) in [&good, &evil].into_iter().enumerate() {
-            // A directory whose config claims `good` while the layer file holds `held`.
             let d = tmpdir(&format!("diffid{i}"));
             std::fs::create_dir(d.join("l")).unwrap();
             std::fs::write(d.join("config.json"), config(&good)).unwrap();
@@ -596,7 +568,6 @@ mod tests {
                 Err(e) => assert!(i == 1 && e.to_string().contains("the image config says"), "{e}"),
             }
         }
-        // The same as a tarball, naming its layer through a symlink.
         let d = tmpdir("archive");
         let tar = layer(&[
             ("config.json", 'f', &config(&good)),
@@ -610,7 +581,6 @@ mod tests {
         assert!(e.contains("--max-entries"), "{e}");
     }
 
-    /// An OCI layout with one gzip'd layer; returns the config and layer digests.
     fn oci_layout(dir: &Path, layer: &[u8]) -> (String, String) {
         let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
         gz.write_all(layer).unwrap();
@@ -649,7 +619,6 @@ mod tests {
         let e = unpack(&d, &d.join("out")).unwrap_err().to_string();
         assert!(e.contains("has digest"), "{e}");
         assert_eq!(read(d.join("out/a")), "data");
-        // So nothing is published.
         let cached = d.join("cache/key.ext4");
         let e = cached_rootfs(&cached, |_| {
             unpack(&d, &d.join("staging"))?;
@@ -658,7 +627,6 @@ mod tests {
         assert!(e.unwrap_err().to_string().contains("has digest"));
         assert!(["ext4", "conf", "ok"].iter().all(|e| !cached.with_extension(e).exists()));
 
-        // A tampered config is refused outright.
         let d = tmpdir("oci-config");
         let (cd, _) = oci_layout(&d, &layer);
         let p = registry::blob_path(&d.join("blobs"), &cd).unwrap();
@@ -684,7 +652,6 @@ mod tests {
     #[test]
     fn staging_needs_a_root_only_ancestry() {
         use std::os::unix::fs::PermissionsExt;
-        // Whoever runs it: a group writable directory and a symlink never qualify.
         let d = tmpdir("ancestry");
         std::fs::set_permissions(&*d, std::fs::Permissions::from_mode(0o775)).unwrap();
         assert!(check_ancestry(&d).unwrap_err().to_string().contains("must be root-owned"));
@@ -693,7 +660,6 @@ mod tests {
         assert!(check_ancestry(&d.join("link")).is_err());
     }
 
-    /// A build writing "`what` image" and returning "`what` config".
     fn build(what: &'static str) -> impl FnOnce(&Path) -> Result<String> {
         move |tmp| {
             std::fs::write(tmp, format!("{what} image"))?;
@@ -708,7 +674,6 @@ mod tests {
     #[test]
     fn publication_never_replaces_or_follows() {
         let d = tmpdir("noreplace");
-        // Neither through a planted temporary nor a planted target.
         let victim = d.join("victim");
         std::fs::write(&victim, "keep").unwrap();
         symlink(&victim, d.join(format!("x.part{}", std::process::id()))).unwrap();
@@ -741,7 +706,6 @@ mod tests {
         assert!(!cached.with_extension("ok").exists());
     }
 
-    /// A build that loses to a publisher that did not take the lock.
     fn losing_build(d: &Path, cached: &Path) -> impl FnOnce(&Path) -> Result<String> {
         let (winner, cached) = (d.join("winner"), cached.to_path_buf());
         move |tmp| {
@@ -763,7 +727,6 @@ mod tests {
         assert_eq!(read(path.with_extension("conf")), "winner config");
         assert!(!cached.with_extension(format!("tmp{}", std::process::id())).exists());
         assert_eq!(cached_rootfs(&cached, never, sync_dir).unwrap(), path);
-        // Marked complete but missing a file: templates may use it, never rebuild.
         std::fs::remove_file(path.with_extension("conf")).unwrap();
         assert!(cached_rootfs(&cached, never, sync_dir).is_err());
         assert_eq!(read(&path), "winner image");
@@ -787,7 +750,6 @@ mod tests {
             }
             sync_dir(dir)
         };
-        // Publication reaches the marker rename, but must not return a path.
         assert!(cached_rootfs(&cached, build("first"), fail_after_marker).is_err());
         assert!(entry_complete(&cached));
         let inode = std::fs::metadata(&cached).unwrap().ino();
@@ -795,7 +757,6 @@ mod tests {
         assert!(cached_rootfs(&cached, never, fail_after_marker).is_err());
         let path = cached_rootfs(&cached, never, sync_dir).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
-        // Once handed out, even a damaged marked entry cannot be cleaned up.
         std::fs::remove_file(cached.with_extension("conf")).unwrap();
         assert!(cached_rootfs(&cached, never, sync_dir).is_err());
         assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
@@ -814,7 +775,6 @@ mod tests {
         assert_eq!(read(&path), "rebuilt image");
         assert_eq!(read(path.with_extension("conf")), "rebuilt config");
         assert!(path.with_extension("ok").exists());
-        // The old file was unlinked, not rewritten.
         assert_ne!(old.metadata().unwrap().ino(), std::fs::metadata(&path).unwrap().ino());
         assert_eq!(std::io::read_to_string(old).unwrap(), "half published");
         assert!(!d.join("key.part123").exists() && !d.join("key.tmp456").exists());
