@@ -15,7 +15,7 @@ and directories.
 usage: sudo scripts/e2e.py [--bin FLEXVM] [--artifacts DIR] [--log-dir DIR]
                            [--port-a N] [--net-a A.B.C] [--net-b A.B.C]
                            [--jobs N] [--lanes "PORT:NET-A:NET-B ..."]
-                           [--image REF | --no-image] [--faults "SCENARIO ..."]
+                           [--image REF [--image-cache DIR] | --no-image] [--faults "SCENARIO ..."]
                            [CASE ...]
 """
 import argparse, glob, hashlib, json, os, re, shutil, signal, socket, subprocess, sys, tempfile, threading, time, traceback
@@ -39,6 +39,7 @@ p.add_argument("--template", default="ci", help="name of the template the cases 
 p.add_argument("--image", default="public.ecr.aws/docker/library/busybox:1.36",
                help="container image for the image-template case")
 p.add_argument("--no-image", action="store_true", help="skip the image-template case (needs registry access)")
+p.add_argument("--image-cache", help="keep the pulled image here, and build from it when it is there (no registry)")
 # The scripts/faults.py scenarios that fit CI time: migration failure paths and fencing, address
 # generations and loans, forged peers, processes killed between steps, checkpoint corruption,
 # copy-on-write exactness, growth (on a template with little pre-plugged), held packets and devices,
@@ -594,6 +595,121 @@ def kill_releases():
     check("kill: second kill of the name fails", A.kill(vm, check=False).returncode != 0)
 
 
+# --- the image case's registry pull and its cache --------------------------------
+# With --image-cache, a pull's blobs stay in that directory and an OCI layout of the
+# image is kept beside them (oci/REF/), which later runs build from without the registry.
+# CI keeps the directory in actions/cache; a cold cache pulls from the registry.
+
+
+def image_ref():
+    """(registry host, repository, tag) of --image, with Docker's defaults."""
+    name, _, tag = args.image.rpartition(":") if ":" in args.image.rsplit("/", 1)[-1] else (args.image, "", "latest")
+    first, _, rest = name.partition("/")
+    if rest and ("." in first or ":" in first or first == "localhost"):
+        host, repo = first, rest
+    else:
+        host, repo = "registry-1.docker.io", name if "/" in name else f"library/{name}"
+    return ("registry-1.docker.io" if host in ("docker.io", "index.docker.io") else host), repo, tag
+
+
+def image_dir():
+    return os.path.join(args.image_cache, "oci", re.sub(r"[^A-Za-z0-9._-]", "_", args.image)) if args.image_cache else None
+
+
+def image_layout():
+    d = image_dir()
+    return d if d and os.path.exists(os.path.join(d, "index.json")) else None
+
+
+def image_digest(layout):
+    return json.load(open(os.path.join(layout, "index.json")))["manifests"][0]["digest"]
+
+
+MANIFEST_TYPES = ("application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json, "
+                  "application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json")
+
+
+def registry_get(path):
+    """(status, headers, body) of GET /v2/REPO/PATH, with an anonymous bearer token if asked for one."""
+    import urllib.error, urllib.parse, urllib.request
+    host, repo, _ = image_ref()
+    scheme = "http" if host.split(":")[0] in ("localhost", "127.0.0.1") else "https"
+    url, auth = f"{scheme}://{host}/v2/{repo}/{path}", None
+    for _ in range(2):
+        req = urllib.request.Request(url, headers={"Accept": MANIFEST_TYPES, **({"Authorization": auth} if auth else {})})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return resp.status, resp.headers, resp.read(4 << 20)
+        except urllib.error.HTTPError as e:
+            if e.code != 401 or auth:
+                return e.code, e.headers, e.read(300)
+            params = dict(re.findall(r'(\w+)="([^"]*)"', e.headers.get("WWW-Authenticate", "")))
+            q = urllib.parse.urlencode({k: v for k, v in params.items() if k in ("service", "scope")})
+            with urllib.request.urlopen(f"{params.get('realm')}?{q}", timeout=30) as t:
+                tok = json.load(t)
+            auth = f"Bearer {tok.get('token') or tok.get('access_token')}"
+    return 401, {}, b""
+
+
+def retry_after():
+    """Seconds the registry asks a client to wait now (Retry-After on a 429), or None."""
+    try:
+        status, headers, _ = registry_get(f"manifests/{image_ref()[2]}")
+        v = headers.get("Retry-After") if status == 429 else None
+        return min(int(v), 300) if v and v.isdigit() else None
+    except Exception:
+        return None
+
+
+def pull_template(name, opts):
+    """Builds the template from the registry. HTTP 429s are retried with longer and longer
+    waits (or what Retry-After asks); a registry that stays rate limited fails as that."""
+    cache = args.image_cache or os.path.join(WORK, "images")
+    waits = (15, 30, 60, 120)
+    for i in range(len(waits) + 1):
+        r = flexvm("template", name, "--image", args.image, "--image-cache", cache, *opts, timeout=600, check=False)
+        if r.returncode == 0:
+            return r
+        if "HTTP 429" not in r.stderr:
+            raise AssertionError(f"flexvm template --image {args.image} exited {r.returncode}: {r.stderr.strip()}")
+        if i == len(waits):
+            break
+        wait = retry_after() or waits[i]
+        print(f"  registry rate limited (HTTP 429); retrying in {wait} s", flush=True)
+        time.sleep(wait)
+    raise AssertionError(f"registry rate-limited: {args.image} still answers HTTP 429 after {len(waits) + 1} tries "
+                         f"(not a flexvm failure): {r.stderr.strip()[-300:]}")
+
+
+def save_layout(stderr):
+    """Keeps the pulled image as an OCI layout: its blobs, and its manifest fetched again by digest."""
+    d = image_dir()
+    m = re.search(r"^image: .* -> (sha256:[0-9a-f]{64})$", stderr, re.M)
+    if not d or not m:
+        return
+    try:
+        status, _, body = registry_get(f"manifests/{m.group(1)}")
+        if status != 200 or "sha256:" + hashlib.sha256(body).hexdigest() != m.group(1):
+            return print(f"  not caching the image: its manifest came back HTTP {status}")
+        manifest = json.loads(body)
+        tmp = d + ".new"
+        shutil.rmtree(tmp, ignore_errors=True)
+        os.makedirs(os.path.join(tmp, "blobs", "sha256"))
+        for desc in [manifest["config"], *manifest["layers"]]:
+            hexd = desc["digest"].split(":", 1)[1]
+            shutil.copy(os.path.join(args.image_cache, "blobs", "sha256", hexd), os.path.join(tmp, "blobs", "sha256", hexd))
+        open(os.path.join(tmp, "blobs", "sha256", m.group(1).split(":", 1)[1]), "wb").write(body)
+        json.dump({"imageLayoutVersion": "1.0.0"}, open(os.path.join(tmp, "oci-layout"), "w"))
+        json.dump({"schemaVersion": 2, "manifests": [{"mediaType": manifest.get("mediaType", "application/vnd.oci.image.manifest.v1+json"),
+                                                      "digest": m.group(1), "size": len(body)}]},
+                  open(os.path.join(tmp, "index.json"), "w"))
+        shutil.rmtree(d, ignore_errors=True)
+        os.rename(tmp, d)
+        print(f"  cached {args.image} ({m.group(1)}) as an OCI layout")
+    except Exception as e:
+        print(f"  not caching the image: {e}")
+
+
 @case
 def image_template():
     """template --image: a container image becomes a template whose VMs run its entrypoint."""
@@ -604,17 +720,17 @@ def image_template():
     t = time.time()
     cmd = ["sh", "-c", "mkdir -p /tmp/www && echo hello-from-image > /tmp/www/index.html && "
                        "echo app-started && exec httpd -f -p 8080 -h /tmp/www"]
-    # Anonymous registry pulls get rate limited (HTTP 429); only that is retried.
-    for delay in (5, 15, 30, None):
-        try:
-            template(name, "--image", args.image, "--image-cache", os.path.join(WORK, "images"), "--vcpus", "2", "--max", "2048", "--cmd", json.dumps(cmd))
-            break
-        except AssertionError as e:
-            if delay is None or "HTTP 429" not in str(e):
-                raise
-            print(f"  registry rate limit; retrying in {delay} s")
-            time.sleep(delay)
-    print(f"  template from {args.image}: {time.time() - t:.1f} s")
+    opts = ["--vcpus", "2", "--max", "2048", "--cmd", json.dumps(cmd)]
+    layout = image_layout()
+    if layout:
+        # Cached (CI): the image as an OCI layout of the blobs an earlier pull fetched. No
+        # registry; flexvm checks every blob against its digest as it would after a pull.
+        flexvm("template", name, "--image", layout, "--image-cache", os.path.join(WORK, "images"), *opts, timeout=600)
+        print(f"  template from the cached {args.image} ({image_digest(layout)}): {time.time() - t:.1f} s")
+    else:
+        r = pull_template(name, opts)
+        print(f"  template from {args.image}, pulled: {time.time() - t:.1f} s")
+        save_layout(r.stderr)
     vm = "e2e-img"
     ip = A.run(vm, template=name)
     check("image vm: app's output in logs", wait_for(lambda: "\napp-started\n" in A.logs(vm), 15), A.logs(vm))
@@ -710,10 +826,11 @@ def worker():
         t = time.time()
         problems = []
         # What a SIGKILLed VM process leaves (its tap, its name) is collected by the next VM
-        # process to start on its host, as later cases' VMs would: start one on each.
+        # process to start on its host, as later cases' VMs would: after scenarios (which kill
+        # VM processes so), start one on each.
         for h in (A, B):
             try:
-                if h.proc:
+                if h.proc and "faults" in args.cases:
                     h.run("e2e-collect")
                     h.kill("e2e-collect")
             except Exception as e:
@@ -838,6 +955,7 @@ def main():
                "--artifacts", ARTIFACTS, "--log-dir", os.path.join(args.log_dir, f"lane-{label}"),
                "--port-a", str(port), "--net-a", net_a, "--net-b", net_b, "--tag", args.tag,
                "--template", args.template, "--templates", TEMPLATES, "--image", args.image, "--results", res,
+               *(["--image-cache", os.path.abspath(args.image_cache)] if args.image_cache else []),
                "--faults", " ".join(scens), *(["--no-image"] if args.no_image else []),
                *cases, *(["faults"] if scens else [])]
         say(f"[{label}] {' '.join(batch)}")
