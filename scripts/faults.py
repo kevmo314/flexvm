@@ -4228,7 +4228,7 @@ def unit_restart():
     listener, a `run -d` and a `standby` started from the unit's cgroup, and
     everything in that cgroup killed (cgroup.kill). The VM that migrated in
     through the listener, the detached VM and the standby are each in a
-    cgroup of their own (flexvm/vm-PID), so they run on; a new listener
+    cgroup of their own (flexvm/vm-PID-START), so they run on; a new listener
     takes them back."""
     t, n, d = args.template, "ft-unit-in", "ft-unit-d"
     unit = f"/sys/fs/cgroup/{args.prefix}-unit-{os.getpid()}"
@@ -4259,7 +4259,7 @@ def unit_restart():
             sbs = standby_pids(B, t)
             pids = {n: vm_pid(B, n), d: vm_pid(B, d), "standby": sbs[0] if sbs else None}
             cgs = {k: cgroup_of(p) for k, p in pids.items()}
-            check("unit restart: each in a cgroup of its own", all(cg == f"/flexvm/vm-{pids[k]}" for k, cg in cgs.items()), cgs)
+            check("unit restart: each in a cgroup of its own", all((cg or "").startswith(f"/flexvm/vm-{pids[k]}-") for k, cg in cgs.items()), cgs)
             open(os.path.join(unit, "cgroup.kill"), "w").write("1")
             listeners.pop(B.addr).wait(timeout=10)
             time.sleep(1)
@@ -4269,6 +4269,10 @@ def unit_restart():
             start_listener(B)
             ok(migrate(B, n, A))
             check("unit restart: a new listener serves it", wait_for(lambda: where(n) == {A: "running"}, 60) and md5(A, n) == m, where(n))
+            ok(kill(B, d))
+            swept = lambda: ok(cli_json(B, "debug", "gc")) is None and not os.path.exists(f"/sys/fs/cgroup{cgs[d]}")
+            check("unit restart: an empty cgroup is swept", wait_for(swept, 10), cgs[d])
+            check("unit restart: a populated one is kept", os.path.exists(f"/sys/fs/cgroup{cgs['standby']}"), cgs["standby"])
         finally:
             cli_json(B, "standby", "--template", t, "0")
             wait_for(lambda: not standby_pids(B, t), 30)
@@ -4282,37 +4286,34 @@ def unit_restart():
 
 
 def log_cap():
-    """A VM's log past its cap is trimmed to its tail by the periodic sweep
-    (a listener's or a VM process's), with no VM starting; standby logs too."""
+    """A detached VM's log is capped by its writer: past 8 MiB, NAME.log
+    becomes NAME.log.1 and a new one goes on. Every line of the output is in
+    one or the other, whole and in order, up to the rotations."""
     n = "ft-logcap"
-    ok(run(A, n))
-    path = os.path.join(A.run, "vms", f"{n}.log")
-    with open(path, "a") as f:
-        for i in range(200_000):
-            f.write(f"filler {i:06} {'x' * 60}\n")
-    big = os.path.getsize(path)
-    check("log cap: grown past the cap", big > 8 << 20, big)
-    # Nothing starts meanwhile: only periodic sweeps run.
-    check("log cap: trimmed without a vm starting", wait_for(lambda: os.path.getsize(path) <= (2 << 20) + 64, 90), os.path.getsize(path))
-    text = open(path).read()
-    check("log cap: kept the tail, whole lines", text.startswith("[flexvm: earlier output dropped]\nfiller ") and text.endswith(f"filler 199999 {'x' * 60}\n"), text[:80])
-    check("log cap: the vm runs on", sh(A, n, "echo hi") == (0, "hi"))
-    sb = os.path.join(A.run, "standby", "ft-logcap-tpl")
-    os.makedirs(sb, exist_ok=True)
-    with open(os.path.join(sb, "standby.log"), "w") as f:
-        f.write("y" * (9 << 20) + "\nlast\n")
-    ok(cli_json(A, "debug", "gc"))
-    size = os.path.getsize(os.path.join(sb, "standby.log"))
-    check("log cap: a standby log too", size <= (2 << 20) + 64 and open(os.path.join(sb, "standby.log")).read().endswith("\nlast\n"), size)
-    subprocess.run(["rm", "-rf", sb])
-    cleanup(n)
+    scenario_vms.add(n)
+    vd = os.path.join(A.run, "vms")
+    for f in (f"{n}.log", f"{n}.log.1"):
+        if os.path.exists(os.path.join(vd, f)):
+            os.unlink(os.path.join(vd, f))
+    lines = 1_500_000  # ~11 MiB
+    r = cli_json(A, "run", n, "--template", args.template, "-d", "--", f"seq 1 {lines}")
+    check("log cap: started", r["ok"], r)
+    pid = r["result"]["pid"] if r["ok"] else None
+    check("log cap: its command ran out", wait_for(lambda: not alive(pid), 120), pid)
+    log, prev = os.path.join(vd, f"{n}.log"), os.path.join(vd, f"{n}.log.1")
+    size = lambda p: os.path.getsize(p) if os.path.exists(p) else None
+    check("log cap: rotated, neither past the cap", size(prev) is not None and size(prev) <= (8 << 20) + 65536 and size(log) <= 8 << 20,
+          (size(prev), size(log)))
+    nums = [l for l in (open(prev).read() + open(log).read()).splitlines() if l.isdigit()]
+    tail = [int(x) for x in nums]
+    check("log cap: whole lines, in order, through the last", tail and tail[-1] == lines and tail == list(range(tail[0], lines + 1)),
+          (tail[:1], tail[-1:], len(tail)))
 
 
 def gc_debris():
     """What the sweep removes and what it keeps: old `.moved` markers, the
     log of a name with nothing left here once quiet, a SIGKILLed standby's
-    socket, load sets of generations nothing uses; not a fresh log, a live
-    VM's log, or the current template's load set."""
+    socket; not a fresh log or a live VM's log."""
     vd = os.path.join(A.run, "vms")
     old = time.time() - 7200
     def made(path, t=None):
@@ -4328,23 +4329,41 @@ def gc_debris():
     sbd = os.path.join(A.run, "standby", args.template)
     os.makedirs(sbd, exist_ok=True)
     sock = made(os.path.join(sbd, "deadbeef.999999990.sock"))
-    sd = os.path.join(A.run, "standby")
-    tid = vms(A)[n]["template_id"]
-    stale, current = made(os.path.join(sd, ".loadset-ft0000000000"), old), os.path.join(sd, f".loadset-{tid}")
-    had_current = os.path.exists(current)
-    if not had_current:
-        made(current)
     ok(cli_json(A, "debug", "gc"))
     gone = lambda p: not os.path.exists(p)
     check("gc: an old .moved marker goes, a recent one stays", gone(moved) and not gone(moved_new))
     check("gc: a quiet orphan log goes, a fresh one stays", gone(orphan) and not gone(fresh))
     check("gc: a live vm's log stays", not gone(os.path.join(vd, f"{n}.log")))
     check("gc: a dead standby's socket goes", gone(sock))
-    check("gc: an unused load set goes, the current one stays", gone(stale) and not gone(current))
-    for p in (moved_new, fresh) + (() if had_current else (current,)):
+    for p in (moved_new, fresh):
         if os.path.exists(p):
             os.unlink(p)
     cleanup(n)
+
+
+def prefix_change():
+    """The tap prefix (which garbage collection reads taps' owners by) does
+    not change while a VM process runs, through `config` or `listen`; once
+    none runs, it does, and back."""
+    n = "ft-prefix"
+    try:
+        prefix = json.load(open(os.path.join(A.state, "host.json")))["prefix"]
+    except (OSError, ValueError, KeyError):
+        prefix = "fv"
+    other = (prefix + "z")[:8] if not prefix.endswith("z") else prefix[:-1] + "y"
+    ok(run(A, n))
+    r = cli_json(A, "config", "--prefix", other)
+    check("prefix change: refused while a vm runs", not r["ok"] and "cannot change the tap prefix" in r["error"], r)
+    r = cli_json(A, "listen", "127.0.0.1:1", "--prefix", other)
+    check("prefix change: through listen too", not r["ok"] and "cannot change the tap prefix" in r["error"], r)
+    cfg = ok(cli_json(A, "config"))
+    check("prefix change: unchanged", cfg["prefix"] == prefix, cfg)
+    ok(kill(A, n))
+    ok(cli_json(A, "debug", "gc"))
+    r = cli_json(A, "config", "--prefix", other)
+    check("prefix change: made once none runs", r["ok"] and r["result"]["prefix"] == other, r)
+    r = cli_json(A, "config", "--prefix", prefix)
+    check("prefix change: and back", r["ok"] and r["result"]["prefix"] == prefix, r)
 
 
 def arrival_log():
@@ -4467,7 +4486,7 @@ SCENARIOS = dict(
     suspend_disk_freed=suspend_disk_freed, resume_mark_fails=resume_mark_fails, kill_source=kill_source,
     kill_refused_checkpoint=no_evict(kill_refused_checkpoint), wildcard_listen=wildcard_listen,
     forged_peer=forged_peer, restore_ip_peer=restore_ip_peer, late_withdrawal=late_withdrawal,
-    unit_restart=unit_restart, log_cap=log_cap, gc_debris=gc_debris, arrival_log=arrival_log, template_tap=template_tap,
+    unit_restart=unit_restart, log_cap=log_cap, gc_debris=gc_debris, prefix_change=prefix_change, arrival_log=arrival_log, template_tap=template_tap,
     incoming_killed=incoming_killed, start_killed=start_killed, claim_killed=claim_killed, fc_died=fc_died,
     sigkill_restart=sigkill_restart, listen_trickle=listen_trickle,
     cow_wp_race=cow_wp_race, fetch_tail_enomem=fetch_tail_enomem, fetch_enomem_stuck=fetch_enomem_stuck,

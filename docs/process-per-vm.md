@@ -27,7 +27,8 @@ A VM process:
 
 A VM process started in the background (`-d`, an arrival the listener
 spawns, a standby VM) is in a session of its own and, between fork and exec,
-joins a cgroup of its own, `/sys/fs/cgroup/flexvm/vm-PID` (`util::spawn_self`),
+joins a cgroup of its own, `/sys/fs/cgroup/flexvm/vm-PID-START` (`util::spawn_self`;
+named after the instance, so one that exists is refused, never joined),
 so stopping its starter's cgroup (a systemd unit's restart with
 `KillMode=control-group`, a oneshot unit's end, logind's `KillUserProcesses`)
 does not reach it. Its Firecrackers move on to `flexvm/idle-PID-N`. Without
@@ -121,6 +122,7 @@ RUN (default /run/flexvm, tmpfs)
   standby/T/KEY.PID.sock a standby VM of template T, generation KEY (PID.lock while it lives)
   standby/T/standby.log  the standby VMs' output and refill errors
   standby/.loadset-ID    pages loads of template ID touch, learned by standby VMs, for migrations to preload
+                         (one per generation, never swept: whether one is in use cannot be told)
   faults.json            armed test faults (FLEXVM_FAULTS=1 only)
   w/PID/                 a VM process's work directory: `owner` (pid, start time), and per
                          Firecracker a directory with `fc` (its pid and start time)
@@ -152,15 +154,26 @@ VM process starts and, from every listener and VM process, about every 30 s
 time under `RUN/.gc.lock`), so a host with no VM starting still sweeps.
 What a process owns goes once that process is proven gone: taps
 (`<prefix><pid hex>t<n>`, and a template build's `<prefix>x<pid hex>`),
-cgroups (`idle-<pid>-<n>`, `vm-<pid>`), work directories, names, a standby
+Firecrackers' cgroups (`idle-<pid>-<n>`), work directories, names, a standby
 VM's socket (its `PID.lock` free), an arrival's log (no lock on it, 5 s
-old). Logs in `RUN/vms` and `standby.log`s past 8 MiB are cut, in place, to
-their last 2 MiB (writers append, so they go on at the new end); a log
-whose name has no VM, suspended VM, `failed` or `moved` record goes once
-unwritten for an hour, and `NAME.moved` after an hour. `.loadset-ID`s go
-once no template name points to generation ID and no VM here runs it (any
-template that cannot be read keeps them all). Released migration records
-are retired as below.
+old). A VM process's own cgroup (`vm-PID-START`) goes once empty, never
+killed (`rmdir` refuses a populated cgroup). The logs of a name with no
+VM, suspended VM, `failed` or `moved` record go once unwritten for an hour,
+decided and removed holding the name's lock, which a start holds (shared)
+while it opens and marks its log; `NAME.moved` goes after an hour.
+Released migration records are retired as below. Logs are capped by their
+writers, not swept: a VM process's output relay, writing to a log in the
+run directory, renames it `NAME.log.1` once past 8 MiB (under the
+directory's `.rotate.lock`) and starts a new one; another writer of the
+same log follows to it.
+
+**The tap prefix** names taps (and garbage collection reads their owners by
+it), so it changes only while nothing uses the old one: `Host::configure`
+refuses a change, under the host lock, while any work directory's owner is
+not proven gone or any tap under the old prefix exists. A VM process makes
+its work directory and then reads the prefix from host.json under the host
+lock; a template build names and makes its tap under it; the tap sweep reads
+the prefix under it.
 
 **The host lock** is a flock taken by one thread of a process at a time and
 reentrant within a thread, so a guard dropped under it (an address claim)
@@ -506,7 +519,7 @@ where it is kept and what tests it.
    only as the source of the migration id they name.
 9. **Shared resources have one owner.** Socket roots, work directories, taps
    (`<prefix><pid>t<n>`, a template build's `<prefix>x<pid>`) and cgroups
-   (`idle-<pid>-<n>`, `vm-<pid>`) are named after the owning process and only swept once it is gone; each process has its own
+   (`idle-<pid>-<n>`; a VM process's own `vm-<pid>-<start>`, swept once empty) are named after the owning process and only swept once it is gone; each process has its own
    hold TUN (not persistent: it goes with the process); `unroute` happens
    under the host lock and only for an address the process still holds;
    checkpoint staging is cleared by owner pid; suspended directories are
@@ -566,7 +579,7 @@ where it is kept and what tests it.
   Garbage and cgroups (#115): `unit_restart` (a listener, `run -d` and
   `standby` started in a cgroup standing in for a systemd unit, which is
   then killed whole: the arrival, the detached VM and the standby run on),
-  `log_cap` (trimmed by the periodic sweep, no VM starting), `gc_debris`,
+  `log_cap` (rotated by its writer, no line cut or lost), `prefix_change`, `gc_debris`,
   `arrival_log`, `template_tap`.
   Dropped:
   `target_restart_symlink`, `shared_run_dir`, `state_dir_lock` (they tested a

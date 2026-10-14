@@ -28,14 +28,14 @@ pub fn validate(listener: &TcpListener, cfg: &crate::host::Config) -> Result<()>
     Ok(())
 }
 
-pub fn main(host: Host, listener: TcpListener, templates: Option<std::path::PathBuf>) -> Result<()> {
+pub fn main(host: Host, listener: TcpListener) -> Result<()> {
     crate::net::sysctl("net.ipv4.ip_forward", "1")?;
     if let Some(dev) = &host.cfg.announce_dev {
         crate::net::sysctl(&format!("net.ipv4.conf.{dev}.proxy_arp"), "1")?;
     }
     eprintln!("flexvm listening on {}", listener.local_addr()?);
     crate::standby::maintain(host.clone());
-    crate::gc::periodic(host.clone(), templates);
+    crate::gc::periodic(host.clone());
     let peers = Peers::watch(host.cfg.peers.clone());
     let host = std::sync::Arc::new(host);
     for conn in listener.incoming() {

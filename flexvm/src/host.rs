@@ -179,6 +179,11 @@ fn mtime(path: &Path) -> Option<SystemTime> {
 
 static RUN_DIR: OnceLock<PathBuf> = OnceLock::new();
 
+/// This process's run directory (canonical), once a host is open.
+pub fn run_dir() -> Option<&'static Path> {
+    RUN_DIR.get().map(PathBuf::as_path)
+}
+
 impl Host {
     pub fn open(state: &Path, run: &Path) -> Result<Host> {
         for d in ["addrs", "standby", "migs"] {
@@ -199,12 +204,48 @@ impl Host {
     pub fn configure(&mut self, change: impl FnOnce(&mut Config) -> Result<()>) -> Result<()> {
         let _l = self.lock()?;
         let path = self.state.join("host.json");
-        let mut cfg = load(&path)?.unwrap_or_default();
+        let mut cfg: Config = load(&path)?.unwrap_or_default();
+        let prefix = cfg.prefix.clone();
         change(&mut cfg)?;
+        if cfg.prefix != prefix {
+            if let Some(why) = self.prefix_in_use(&prefix) {
+                bail!("cannot change the tap prefix from {prefix:?} to {:?}: {why}", cfg.prefix);
+            }
+        }
         store(&path, &cfg, true)?;
         self.cfg = cfg;
         self.cfg_mtime = mtime(&path);
         Ok(())
+    }
+
+    /// Why the tap prefix cannot change now, under the host lock: garbage
+    /// collection reads a tap's owner from its name under the prefix, so
+    /// none may be named under the old one. Any VM process not proven gone
+    /// (its work directory), whatever it is doing, may make taps; it takes
+    /// its prefix from host.json only after its work directory exists
+    /// (`tap_prefix`). Any tap under the old prefix, live or leaked, too.
+    fn prefix_in_use(&self, prefix: &str) -> Option<String> {
+        for e in std::fs::read_dir(self.run.join("w")).into_iter().flatten().flatten() {
+            let owner = load::<Ident>(&e.path().join("owner"));
+            if !matches!(owner, Ok(Some(ref o)) if o.liveness() == Liveness::Gone) {
+                return Some(format!("vm process {} runs (stop this host's VMs first)", e.file_name().to_string_lossy()));
+            }
+        }
+        let taps: Vec<String> = std::fs::read_dir("/sys/class/net")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(prefix) && Path::new("/sys/class/net").join(n).join("tun_flags").exists())
+            .collect();
+        (!taps.is_empty()).then(|| format!("taps {} exist (stop their VMs or builds, and let garbage collection remove them)", taps.join(", ")))
+    }
+
+    /// The prefix of the taps of a VM process whose work directory exists:
+    /// read from host.json now, not as it was when the process started, so
+    /// a prefix change either sees the work directory or is seen here.
+    pub fn tap_prefix(&self) -> Result<String> {
+        Ok(load::<Config>(&self.state.join("host.json"))?.unwrap_or_default().prefix)
     }
 
     /// The configuration as it is now: `flexvm listen` may have changed the
@@ -330,6 +371,13 @@ impl Host {
         f.set_len(0)?;
         f.write_all_at(&serde_json::to_vec(&Ident::me())?, 0)?;
         Ok(NameLock { name: name.into(), host: self.clone(), _file: f })
+    }
+
+    /// Runs `f` holding `name`'s lock (`how`: LOCK_SH or LOCK_EX), never
+    /// waiting: None while a VM, or anyone else, holds it the other way.
+    pub fn unheld<T>(&self, name: &str, how: i32, f: impl FnOnce() -> T) -> Option<T> {
+        let _held = lock_path(&self.vms(name, "lock"), how | libc::LOCK_NB).ok()?;
+        Some(f())
     }
 
     pub fn alive(&self, name: &str) -> bool {
@@ -1134,29 +1182,50 @@ fn tap_owner(name: &str, prefix: &str) -> Option<u32> {
     rest.split_once('t').and_then(|(p, _)| u32::from_str_radix(p, 16).ok())
 }
 
-/// The process a cgroup under `flexvm/` was made for: a Firecracker's
-/// (`idle-PID-N`, PID its VM process's) or a detached VM process's own (`vm-PID`).
+/// The VM process a Firecracker's cgroup (`idle-PID-N`) was made by.
 fn cgroup_owner(name: &str) -> Option<u32> {
-    match name.split_once('-')? {
-        ("idle", rest) => rest.split('-').next()?.parse().ok(),
-        ("vm", pid) => pid.parse().ok(),
-        _ => None,
+    name.strip_prefix("idle-")?.split('-').next()?.parse().ok()
+}
+
+/// A detached VM process's own cgroup (`vm-PID-START`, `util::spawn_self`)
+/// goes once nothing is in it: never killed, so a process that just joined
+/// one is never touched. (`rmdir` refuses a populated cgroup anyway.)
+fn sweep_scope(dir: &Path) {
+    let events = std::fs::read_to_string(dir.join("cgroup.events")).unwrap_or_default();
+    if events.lines().any(|l| l == "populated 0") {
+        let _ = std::fs::remove_dir(dir);
     }
 }
 
-/// What dead processes left: taps (a template build's too), cgroups, work
-/// directories and names. Only proof of death (`Liveness::Gone`) frees any.
-pub fn collect_garbage(run: &Path, prefix: &str) {
-    let gone = |pid: Option<u32>| pid.is_some_and(pid_gone);
-    for e in std::fs::read_dir("/sys/class/net").into_iter().flatten().flatten() {
-        let n = e.file_name().to_string_lossy().into_owned();
-        if gone(tap_owner(&n, prefix)) {
-            crate::net::delete_tap(&n);
+impl Host {
+    /// What dead processes left: taps (a template build's too), cgroups, work
+    /// directories and names. Only proof of death (`Liveness::Gone`) frees any.
+    /// Taps are read under the prefix host.json has now, under the host lock,
+    /// so a prefix change cannot come in between.
+    pub fn collect_garbage(&self) -> Result<()> {
+        {
+            let _l = self.lock()?;
+            let prefix = self.tap_prefix()?;
+            for e in std::fs::read_dir("/sys/class/net").into_iter().flatten().flatten() {
+                let n = e.file_name().to_string_lossy().into_owned();
+                if tap_owner(&n, &prefix).is_some_and(pid_gone) {
+                    crate::net::delete_tap(&n);
+                }
+            }
         }
+        collect_owned(&self.run);
+        Ok(())
     }
+}
+
+/// Cgroups, work directories and names of dead processes.
+fn collect_owned(run: &Path) {
+    let gone = |pid: Option<u32>| pid.is_some_and(pid_gone);
     for e in std::fs::read_dir("/sys/fs/cgroup/flexvm").into_iter().flatten().flatten() {
         let n = e.file_name().to_string_lossy().into_owned();
-        if gone(cgroup_owner(&n)) {
+        if n.starts_with("vm-") {
+            sweep_scope(&e.path());
+        } else if gone(cgroup_owner(&n)) {
             let _ = std::fs::write(e.path().join("cgroup.kill"), "1");
             let _ = std::fs::remove_dir(e.path());
         }
@@ -1456,7 +1525,7 @@ mod tests {
         let fc = Sleeper::new();
         store(&h.vms("k", "lock"), &dead_owner(&h, 999_999_904, &[&fc.1]), false).unwrap();
         std::fs::write(h.vms("k", "failed"), "why").unwrap();
-        collect_garbage(&h.run, "none");
+        collect_owned(&h.run);
         assert!(fc.done() && !h.vms("k", "lock").exists() && h.vms("k", "failed").exists());
         assert!(h.vms("e", "lock").exists());
     }
@@ -1577,7 +1646,7 @@ mod tests {
         h.put_addr(ip("10.9.0.1"), &Addr { seen: 1, holder: Some("u".into()), held: 1, ..Addr::default() }, false).unwrap();
         assert!(h.take_name("u", false).is_err() && !h.gone("u"));
         assert_eq!(h.holder(&l, ip("10.9.0.1")).unwrap().as_deref(), Some("u"));
-        collect_garbage(&h.run, "none");
+        collect_owned(&h.run);
         assert!(h.vms("u", "lock").exists(), "kept by the garbage collector too");
         // An empty lock (created, never written) is no holder.
         std::fs::write(h.vms("e", "lock"), "").unwrap();
@@ -1607,10 +1676,59 @@ mod tests {
             assert_eq!(tap_owner(tap, prefix), None, "{tap} under {prefix}");
         }
         assert_eq!(cgroup_owner("idle-4242-3"), Some(4242));
-        assert_eq!(cgroup_owner("vm-4242"), Some(4242));
-        for cg in ["vm-", "vm-42x", "other-42", "idle-", "cgroup.procs", "memory.max"] {
+        for cg in ["vm-4242", "vm-4242-77", "other-42", "idle-", "cgroup.procs", "memory.max"] {
             assert_eq!(cgroup_owner(cg), None, "{cg}");
         }
+    }
+
+    /// Garbage collection reads tap owners under the prefix: it never
+    /// changes while a VM process (any work directory not proven gone) may
+    /// have taps under the old one, and a process reads it only after its
+    /// work directory is there.
+    #[test]
+    fn the_tap_prefix_never_changes_under_a_vm_process() {
+        fn prefix(p: &str) -> impl FnOnce(&mut Config) -> Result<()> + '_ {
+            move |c| {
+                c.prefix = p.into();
+                Ok(())
+            }
+        }
+        let mut h = host("prefix");
+        // Not from the default (`fv`), whose taps this machine may have.
+        store(&h.state.join("host.json"), &Config { prefix: "zq1".into(), ..Config::default() }, false).unwrap();
+        let w = h.run.join("w").join("4242");
+        std::fs::create_dir_all(&w).unwrap();
+        // Not yet written: a process just starting.
+        let e = h.configure(prefix("zq")).unwrap_err().to_string();
+        assert!(e.contains("vm process 4242"), "{e}");
+        store(&w.join("owner"), &Ident::me(), false).unwrap();
+        assert!(h.configure(prefix("zq")).is_err(), "a live one");
+        assert_eq!(h.tap_prefix().unwrap(), "zq1");
+        h.configure(|c| {
+            c.reserve_mib = 7;
+            Ok(())
+        }).unwrap();
+        store(&w.join("owner"), &Ident { pid: 999_999_930, start: 1, boot: boot_id().into() }, false).unwrap();
+        h.configure(prefix("zq")).unwrap();
+        assert_eq!(h.tap_prefix().unwrap(), "zq");
+    }
+
+    /// A VM process's own cgroup goes only once empty, whatever its pid
+    /// (a reused one may have joined it): never killed.
+    #[test]
+    fn a_scope_goes_only_once_empty() {
+        let d = std::env::temp_dir().join(format!("flexvm-scope-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let (busy, unread) = (d.join("vm-1-1"), d.join("vm-2-2"));
+        for cg in [&busy, &unread] {
+            std::fs::create_dir_all(cg).unwrap();
+        }
+        std::fs::write(busy.join("cgroup.events"), "populated 1\nfrozen 0\n").unwrap();
+        sweep_scope(&busy);
+        sweep_scope(&unread);
+        assert!(busy.exists() && unread.exists(), "populated or unreadable: kept");
+        assert!(!busy.join("cgroup.kill").exists(), "never killed");
+        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]

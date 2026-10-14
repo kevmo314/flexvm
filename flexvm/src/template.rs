@@ -555,10 +555,10 @@ pub fn create(
     max_mib: u64,
     plug_mib: u64,
     image: Option<ImageMeta>,
-    tap_prefix: &str,
+    tap: &str,
 ) -> Result<()> {
-    let tap = tap(tap_prefix);
-    crate::net::create_tap(&tap)?;
+    // `tap` is made (under the host lock, `Host::tap_prefix`) and removed here.
+    let tap = tap.to_string();
     // Running VMs map the old files, which must not be rewritten under them.
     let staging = format!(".{name}.new-{}", std::process::id());
     let _ = std::fs::remove_dir_all(paths.templates.join(&staging));

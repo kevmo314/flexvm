@@ -51,10 +51,11 @@ belong to CMD.
 `-d` and `--detach` are equivalent for `run`, `restore`, and `resume`.
 
 A background VM's output (an image app's stdout and stderr, flexvm's own
-messages) goes to `/run/flexvm/vms/web.log`. Logs live on tmpfs: one past
-8 MiB is cut to its last 2 MiB, and the log of a name with nothing left on
-the host (no VM, suspended VM, `failed` or moved record) is removed once
-unwritten for an hour. These sweeps run when a VM starts and about every
+messages) goes to `/run/flexvm/vms/web.log`. Logs live on tmpfs: past
+8 MiB, `NAME.log` becomes `NAME.log.1` (replacing the one before) and a new
+one is started; the logs of a name with nothing left on
+the host (no VM, suspended VM, `failed` or moved record) are removed once
+unwritten for an hour, by sweeps that run when a VM starts and about every
 30 s while a listener or any VM process runs.
 
 ## Pause, suspend, destroy
@@ -149,9 +150,9 @@ flexvm config                    # show it
 flexvm config --dns ''           # unset (--underlay and --announce-dev too)
 ```
 
-`--prefix P` (up to 8 letters, digits, `-`, `_` or `.`; default `fv`) names the host's taps
-and cgroups; `config` refuses to change it while VMs run, whose taps keep
-the old name.
+`--prefix P` (up to 8 letters, digits, `-`, `_` or `.`; default `fv`) names the host's taps;
+`config` and `listen` refuse to change it while any VM process runs or any
+tap under the old one is left.
 
 ### Under systemd
 
@@ -182,7 +183,7 @@ Restart=on-failure
 ```
 
 The VM processes a listener starts (arrivals, standby VMs) move into
-cgroups of their own (`/sys/fs/cgroup/flexvm/vm-PID`) as they start, and so
+cgroups of their own (`/sys/fs/cgroup/flexvm/vm-PID-START`) as they start, and so
 do VMs started with `-d` (`run`, `resume`, `restore`) and standby VMs from
 any command. So stopping or restarting the unit, with the default
 `KillMode=control-group`, stops only the listener; `KillMode=process` is not

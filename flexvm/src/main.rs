@@ -220,23 +220,16 @@ fn real_main() -> Result<()> {
         Some("listen") => {
             let mut host = open_host(&args)?;
             let listener = configure_listener(&mut host, &args, pos.get(1).copied(), listen::activated())?;
-            listen::main(host, listener, paths(&args).ok().map(|p| p.templates))
+            listen::main(host, listener)
         }
         Some("config") => {
             if let Some(extra) = pos.get(1) {
                 return Err(format!("config takes only flags, not {extra:?}; the listen address is flexvm listen's").into());
             }
             let mut host = open_host(&args)?;
+            // A prefix change is refused while any VM process or tap may use the old one (`Host::configure`).
             if CONFIG_FLAGS.iter().any(|f| args.has(f)) {
-                let running = host.entries().len();
-                host.configure(|c| {
-                    let prefix = c.prefix.clone();
-                    configure(c, &args, None)?;
-                    if c.prefix != prefix && running > 0 {
-                        bail!("{running} vm(s) run with taps named {prefix}...; change --prefix once they are gone");
-                    }
-                    Ok(())
-                })?;
+                host.configure(|c| configure(c, &args, None))?;
             }
             print(serde_json::to_value(&host.cfg)?)
         }
@@ -246,7 +239,7 @@ fn real_main() -> Result<()> {
         Some("debug") => match name {
             "gc" => {
                 let host = open_host(&args)?;
-                gc::sweep(&host, paths(&args).ok().map(|p| p.templates).as_deref());
+                gc::sweep(&host);
                 Ok(())
             }
             "fault" => host::arm(&open_host(&args)?, arg2.ok_or("debug fault NAME MS")?, pos.get(3).and_then(|m| m.parse().ok()).unwrap_or(1000)),
@@ -356,7 +349,22 @@ fn start(args: &Args, name: &str, s: Start) -> Result<()> {
 
 fn log_file(host: &Host, name: &str) -> Result<std::fs::File> {
     host::check_name(name)?;
-    Ok(std::fs::OpenOptions::new().create(true).append(true).open(host.vms(name, "log"))?)
+    // Opened and marked written holding the name's lock (shared), so garbage
+    // collection, which removes a quiet log only holding it exclusively, keeps
+    // it. A VM running under the name holds it for good: it keeps the log too.
+    let open = || {
+        let f = std::fs::OpenOptions::new().create(true).append(true).open(host.vms(name, "log"))?;
+        f.set_modified(std::time::SystemTime::now())?;
+        Ok::<_, std::io::Error>(f)
+    };
+    let until = Instant::now() + Duration::from_millis(200);
+    loop {
+        match host.unheld(name, libc::LOCK_SH, open) {
+            Some(f) => return Ok(f?),
+            None if Instant::now() >= until => return Ok(open()?),
+            None => std::thread::sleep(Duration::from_millis(2)),
+        }
+    }
 }
 
 fn spawn_detached(host: &Host, name: &str, args: &Args) -> Result<()> {
@@ -472,8 +480,15 @@ fn build_template(args: &Args, name: &str) -> Result<()> {
         .transpose()?;
     let max = args.num("max", proc_kb("/proc/meminfo", "MemTotal").unwrap_or(0) >> 20)?;
     let (cpus, mem, plug) = (args.num("vcpus", cpus)? as u32, args.num("mem", template::base_mib(max))?, args.num("plug", template::PLUG_MIB)?);
-    let prefix = open_host(args).map_or_else(|_| host::Config::default().prefix, |h| h.cfg.prefix);
-    template::create(&paths, name, cpus, mem, max, plug, image, &prefix)
+    // Named and made under the host lock, so a prefix change sees it (`Host::prefix_in_use`).
+    let host = open_host(args)?;
+    let tap = {
+        let _l = host.lock()?;
+        let tap = template::tap(&host.tap_prefix()?);
+        net::create_tap(&tap)?;
+        tap
+    };
+    template::create(&paths, name, cpus, mem, max, plug, image, &tap)
 }
 
 fn image_options(args: &Args) -> Result<Option<image::Options>> {
