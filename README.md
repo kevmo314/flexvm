@@ -18,6 +18,8 @@ cargo build --release
 sudo ./target/release/flexvm template default   # cold-boot and snapshot a template (all CPUs, ceiling = host RAM, 4 GiB plugged)
 ```
 
+The host needs Linux 5.16+: Firecracker patch `0004` uses `KVM_VCPU_TSC_OFFSET`.
+
 flexvm runs as root (KVM, userfaultfd, routes, cgroups). Commands below
 assume `flexvm` is on the PATH and `FLEXVM_ARTIFACTS` points at `artifacts/`.
 sudo drops `FLEXVM_ARTIFACTS`: keep it with `sudo --preserve-env=FLEXVM_ARTIFACTS`

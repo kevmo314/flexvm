@@ -691,7 +691,7 @@ impl PacketHold<'_> {
     fn end(&mut self) -> Result<State> {
         let Some(h) = self.d.holder() else { return self.vm.end_checkpoint() };
         let (ip, tap) = (self.vm.ip, &self.vm.tap);
-        self.stats = crate::migrate::release_into(h, ip, self.id, self.vm, Duration::ZERO, |()| crate::net::attach(ip, tap));
+        self.stats = crate::migrate::release_into(h, ip, self.id, self.vm, Duration::ZERO, |()| crate::net::attach(ip, tap)).0;
         let res = self.vm.end_checkpoint();
         h.forget(ip, self.id);
         res

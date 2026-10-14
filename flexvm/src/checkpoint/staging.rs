@@ -63,11 +63,14 @@ impl Staging {
             .map_err(|e| format!("checkpoint directory {}: {e}", parent_path.display()))?;
         let base = CString::new(base.as_bytes())?;
         ensure!(!exists_at(pfd.as_raw_fd(), &base), "{} already exists; checkpoints are never overwritten", dest.display());
+        check(unsafe { libc::flock(pfd.as_raw_fd(), libc::LOCK_EX) })?;
         clear_stale(&pfd);
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().subsec_nanos();
         let outer_name = cname(&format!("{STAGING_PREFIX}{}-{nanos:x}", std::process::id()));
         check(unsafe { libc::mkdirat(pfd.as_raw_fd(), outer_name.as_ptr(), 0o700) })?;
         let outer = open_dir_at(pfd.as_raw_fd(), &outer_name)?;
+        check(unsafe { libc::flock(outer.as_raw_fd(), libc::LOCK_EX) })?;
+        check(unsafe { libc::flock(pfd.as_raw_fd(), libc::LOCK_UN) })?;
         ensure!(private_dir(outer.as_raw_fd()), "staging directory in {} was replaced", parent_path.display());
         check(unsafe { libc::mkdirat(outer.as_raw_fd(), c"ck".as_ptr(), 0o700) })?;
         let ck = open_dir_at(outer.as_raw_fd(), c"ck")?;
@@ -284,13 +287,11 @@ fn clear_stale(parent: &OwnedFd) {
     let Ok(dir) = std::fs::read_dir(format!("/proc/self/fd/{}", parent.as_raw_fd())) else { return };
     for e in dir.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
-        let Some(rest) = name.strip_prefix(STAGING_PREFIX) else { continue };
-        let pid = rest.split('-').next().unwrap_or("");
-        if pid.is_empty() || Path::new(&format!("/proc/{pid}")).exists() {
+        if !name.starts_with(STAGING_PREFIX) {
             continue;
         }
         let Ok(outer) = open_dir_at(parent.as_raw_fd(), &cname(&name)) else { continue };
-        if !private_dir(outer.as_raw_fd()) {
+        if !private_dir(outer.as_raw_fd()) || unsafe { libc::flock(outer.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             continue;
         }
         let ck = open_dir_at(outer.as_raw_fd(), c"ck").ok();

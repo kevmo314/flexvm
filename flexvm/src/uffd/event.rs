@@ -169,12 +169,13 @@ impl Pager {
                 }
                 let removing = pages.removing();
                 let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+                let learning = self.prefetch.lock().unwrap().learning();
                 for msg in buf[..n.max(0) as usize].chunks_exact(32) {
                     let a = u64::from_ne_bytes(msg[8..16].try_into().unwrap());
                     let b = u64::from_ne_bytes(msg[16..24].try_into().unwrap());
                     match msg[0] {
                         UFFD_EVENT_PAGEFAULT => {
-                            if let Some((page, _)) = self.page_of(b).filter(|_| self.prefetch.lock().unwrap().learning()) {
+                            if let Some((page, _)) = self.page_of(b).filter(|_| learning) {
                                 self.base.note_load_fault(page as u64);
                             }
                             pending.push_back(Pending { addr: b, flags: a, read: Instant::now(), kind: None, parked: false, since: None })

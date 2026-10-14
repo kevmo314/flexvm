@@ -303,8 +303,12 @@ pub(super) fn replace(path: &Path, write: impl FnOnce(&mut File) -> Result<()>) 
 
 fn install<T>(path: &Path, write: impl FnOnce(&mut File) -> Result<()>, rename: impl FnOnce(&Path, &Path) -> std::io::Result<T>) -> Result<T> {
     let tmp = path.with_extension(format!("part{}", std::process::id()));
+    let dir = File::open(path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")))?;
+    crate::host::flock(&dir, libc::LOCK_EX)?;
     let res = (|| {
         let mut f = create_new(&tmp)?;
+        crate::host::flock(&f, libc::LOCK_EX)?;
+        crate::host::flock(&dir, libc::LOCK_UN)?;
         write(&mut f)?;
         f.sync_all()?;
         Ok(rename(&tmp, path)?)
