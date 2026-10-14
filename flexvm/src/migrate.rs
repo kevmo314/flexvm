@@ -502,11 +502,18 @@ impl Proc {
                     // What is routed to the tap from the switch on waits in its qdisc, in order,
                     // until the hold has handed over all it took before the switch (which a busy
                     // host can delay past the next packet): then it follows, in order.
-                    if fault("no_plug") {
+                    // Whether our plug may be on the tap (also when the kernel's answer was
+                    // lost): only then is it unplugged, never after a refusal.
+                    let plugged = if fault("no_plug") {
                         eprintln!("vm {}: injected fault: not plugging its tap", vm.name);
-                    } else if let Err(e) = crate::net::plug_tap(&vm.tap) {
-                        eprintln!("vm {}: plugging its tap: {e}", vm.name);
-                    }
+                        false
+                    } else {
+                        let (plugged, res) = crate::net::plug_tap(&vm.tap);
+                        if let Err(e) = res {
+                            eprintln!("vm {}: plugging its tap: {e}", vm.name);
+                        }
+                        plugged
+                    };
                     let (released, switched) = release_into(h, vm.ip, mig, &vm, STRAGGLERS, |()| {
                         let routed = p.if_current(|| {
                             // `release_stall`: the route change waits long (for RTNL, say).
@@ -518,10 +525,9 @@ impl Proc {
                         current = routed.is_some();
                         routed.ok_or_else(|| format!("{} went to a newer vm", vm.ip).into())
                     });
-                    // Even if plugging said it failed: it may have been done (a lost ACK).
-                    let (plug_drops, unplugged) = match fault("no_plug") {
-                        true => (0, Ok(())),
-                        false => crate::net::unplug_tap(&vm.tap),
+                    let (plug_drops, unplugged) = match plugged {
+                        true => crate::net::unplug_tap(&vm.tap),
+                        false => (0, Ok(())),
                     };
                     if let Err(e) = unplugged {
                         eprintln!("vm {}: letting {}'s packets through its tap: {e}", vm.name, vm.ip);

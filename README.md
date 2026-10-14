@@ -152,9 +152,12 @@ flexvm config                    # show it
 flexvm config --dns ''           # unset (--underlay and --announce-dev too)
 ```
 
-`--prefix P` (up to 8 letters, digits, `-`, `_` or `.`; default `fv`) names the host's taps;
+`--prefix P` (up to 6 letters, digits, `-`, `_` or `.`; default `fv`) names the host's taps;
 `config` and `listen` refuse to change it while any VM process runs here, or
-while a tap already has a name under the new one.
+while a tap already has a name under the new one. A longer one saved by an
+earlier version is refused when a VM starts: set a new one. Each tap's alias
+(`ip link show`) names its owner, `flexvm PID START RUN-DIR`: hosts sharing a
+network namespace, whatever their prefixes, only ever sweep their own taps.
 
 ### Under systemd
 

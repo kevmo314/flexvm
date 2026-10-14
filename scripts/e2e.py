@@ -129,7 +129,8 @@ class Host:
         # Inside this run's own fresh directories (see main).
         self.run_dir = os.path.join(RUN, label)
         self.state_dir = os.path.join(WORK, f"{label}-state")
-        self.prefix = f"fvci{args.lane}{label}"
+        # Tap prefixes are 6 characters at most: lanes 0-99.
+        self.prefix = f"fvc{args.lane}{label}"
         self.log = os.path.join(args.log_dir, f"listen-{label}.log")
         self.proc = None
         self.vms = set()  # names of the VMs this script created here or moved here

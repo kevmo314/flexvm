@@ -5067,10 +5067,12 @@ def arrival_log():
 
 
 def template_tap():
-    """A template build SIGKILLed after making its tap (PREFIX x PID): a sweep
-    removes the tap once the pid is gone (any process's periodic sweep may be
-    first, so it is not looked for in between). A build tap whose pid lives
-    is kept."""
+    """A template build SIGKILLed after making its tap (PREFIX x PID, its
+    owner in its alias): a sweep removes the tap once the build is gone (any
+    process's periodic sweep may be first, so it is not looked for in
+    between). A sweep goes by a tap's alias, never its name: one whose owner
+    lives is kept, as are another host's (a prefix extending this one's,
+    #193) and a tap with no owner, whatever their names read as."""
     name = f"ft-tpltap-{os.getpid()}"
     tdir = os.environ.get("FLEXVM_TEMPLATES") or os.path.join(os.path.abspath(args.artifacts), "templates")
     try:
@@ -5080,20 +5082,47 @@ def template_tap():
     p = subprocess.Popen([BIN, "--state", A.state, "--run", A.run, "template", name, "--vcpus", "1", "--max", "512"],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=ENV)
     tap = f"{prefix}x{p.pid:x}"
-    up = wait_for(lambda: os.path.exists(f"/sys/class/net/{tap}"), 30)
+    def ifalias(dev):
+        try:
+            return open(f"/sys/class/net/{dev}/ifalias").read().strip()
+        except OSError:
+            return None
+    # Its alias is set just after the tap is made.
+    up = wait_for(lambda: ifalias(tap), 30)
+    start, alias = starttime_of(p.pid), ifalias(tap)
     p.kill()
     p.wait()
+    run = os.path.realpath(A.run)
     check("template tap: made by the build", up, tap)
-    live = f"{prefix}x{os.getpid():x}"
-    subprocess.run(["ip", "tuntap", "add", "dev", live, "mode", "tap"], check=True)
+    check("template tap: its alias names the build and this host", alias == f"flexvm {p.pid} {start} {run}", alias)
+    me = f"{os.getpid()} {starttime_of(os.getpid())}"
+    dead = f"{p.pid} 1"
+    # (name, alias, kept): this script lives; another host's and an unowned tap read as dead pids here.
+    made = [(f"{prefix}x{os.getpid():x}", f"flexvm {me} {run}", True),
+            (f"{prefix}1t0", f"flexvm {dead} {run}.other", True),
+            (f"{prefix}2t0", "", True),
+            (f"{prefix}3t0", f"flexvm {dead} {run}", False)]
     try:
+        for dev, al, _ in made:
+            subprocess.run(["ip", "tuntap", "add", "dev", dev, "mode", "tap"], check=True)
+            if al:
+                subprocess.run(["ip", "link", "set", "dev", dev, "alias", al], check=True)
         ok(cli_json(A, "debug", "gc"))
         check("template tap: swept once its build is gone", not os.path.exists(f"/sys/class/net/{tap}"))
-        check("template tap: a live build's kept", os.path.exists(f"/sys/class/net/{live}"))
+        for dev, al, kept in made:
+            check(f"template tap: {dev} ({al or 'no alias'}) {'kept' if kept else 'swept'}", os.path.exists(f"/sys/class/net/{dev}") == kept)
     finally:
-        subprocess.run(["ip", "link", "del", live], capture_output=True)
+        for dev, _, _ in made:
+            subprocess.run(["ip", "link", "del", dev], capture_output=True)
         subprocess.run(["ip", "link", "del", tap], capture_output=True)
         subprocess.run(["rm", "-rf", os.path.join(tdir, f".{name}.new-{p.pid}")])
+
+
+def starttime_of(pid):
+    try:
+        return int(open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()[19])
+    except (OSError, ValueError, IndexError):
+        return None
 
 
 def uffd_err():

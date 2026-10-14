@@ -351,10 +351,7 @@ fn configure(c: &mut host::Config, args: &Args, addr: Option<&str>) -> Result<()
         c.evict_mib = Some(args.num("evict-at", 0)?);
     }
     if let Some(p) = args.get("prefix") {
-        // Tap names are 15 bytes at most: PREFIX, a pid in hex (up to 6), `t` and a counter.
-        if p.is_empty() || p.len() > 6 || !p.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)) {
-            bail!("bad --prefix {p:?}: 1 to 6 letters, digits, '-', '_' or '.'");
-        }
+        host::check_prefix(p).map_err(|e| format!("--prefix: {e}"))?;
         c.prefix = p.into();
     }
     Ok(())
@@ -525,12 +522,13 @@ fn build_template(args: &Args, name: &str) -> Result<()> {
     let (cpus, mem, plug) = (args.num("vcpus", cpus)? as u32, args.num("mem", template::base_mib(max))?, args.num("plug", template::PLUG_MIB)?);
     // Named and made under the host lock, so a prefix change sees it (`Host::prefix_in_use`).
     let host = open_host(args)?;
+    let me = host::Ident::me();
+    // Unlocked, as these are this host's taps of dead processes (by their alias).
+    host::clear_taps(&host.run, &me);
     let tap = {
         let _l = host.lock()?;
-        let prefix = host.tap_prefix()?;
-        host::clear_taps(&prefix, std::process::id());
-        let tap = template::tap(&prefix);
-        net::create_tap(&tap)?;
+        let tap = template::tap(&host.tap_prefix()?);
+        net::create_tap(&tap, &host::tap_alias(&host.run, &me))?;
         tap
     };
     template::create(&paths, name, cpus, mem, max, plug, image, &tap)

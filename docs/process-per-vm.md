@@ -155,12 +155,18 @@ starts (whichever process finds `RUN/.gc` older than that sweeps, so a start
 right after another sweep does not; one sweep at a time under
 `RUN/.gc.lock`), so a host with no VM starting still sweeps.
 What a process owns goes once that process is proven gone: taps
-(`<prefix><pid hex>t<n>`, and a template build's `<prefix>x<pid hex>`;
-no room for a start time, so a process with a reused pid removes them as it
-starts, `host::clear_taps`), Firecrackers' cgroups (`idle-<pid>-<start>-<n>`, by the process's identity), work directories, names, a standby
+(`<prefix><pid hex>t<n>`, and a template build's `<prefix>x<pid hex>`),
+by their alias, never their name: `flexvm PID START RUN`, set before the
+tap is made persistent (`host::tap_alias`), so a sweep takes only tun
+devices whose alias names its run directory and an owner proven gone
+(another host's taps, whatever their names read as under this prefix, and
+taps with no such alias, an earlier version's say, are never touched); a
+process with a reused pid removes its dead namesake's as it starts, as their
+names would be its own (`host::clear_taps`), Firecrackers' cgroups (`idle-<pid>-<start>-<n>`, by the process's identity), work directories, names, a standby
 VM's socket (its `PID.lock` free), an arrival's log (no lock on it, 5 s
 old). A VM process's own cgroup (`vm-PID-START`) goes once empty, never
-killed (`rmdir` refuses a populated cgroup). The logs of a name with no
+killed (`rmdir` refuses a populated cgroup). An earlier version's
+Firecracker cgroups (`idle-PID-N`, no start time) are left alone. The logs of a name with no
 VM, suspended VM, `failed` or `moved` record go once unwritten for an hour,
 decided and removed holding `RUN/.logs.lock`, which a start holds (shared)
 while it opens and marks its log (whether a VM holds the name is read from its lock's record, never by probing the lock a start takes without waiting); `NAME.moved` goes after an hour.
@@ -172,13 +178,14 @@ log's path then (reopened if another writer rotated it), and past 8 MiB
 renames it `NAME.log.1` and starts a new one. No write goes to a rotated
 or removed generation, and none is cut.
 
-**The tap prefix** names taps (and garbage collection reads their owners by
-it), so it changes only while nothing uses the old one: `Host::configure`
+**The tap prefix** names taps (garbage collection goes by their alias, not
+by it), and changes only while nothing uses the old one: `Host::configure`
 refuses a change, under the host lock, while any work directory's owner is
 not proven gone, or any tap already reads as named under the new prefix (`tap_owner`), whoever made it. A VM process makes
 its work directory and then reads the prefix from host.json under the host
-lock; a template build names and makes its tap under it; the tap sweep reads
-the prefix under it.
+lock; a template build names and makes its tap under it. The prefix is
+checked (1 to 6 characters) where it is read (`Host::tap_prefix`), as
+host.json may hold one saved under an earlier limit.
 
 **The host lock** is a flock taken by one thread of a process at a time and
 reentrant within a thread, so a guard dropped under it (an address claim)
@@ -523,7 +530,7 @@ where it is kept and what tests it.
    when it passes the socket on. Page connections are passed to the VM named, which serves them
    only as the source of the migration id they name.
 9. **Shared resources have one owner.** Socket roots, work directories, taps
-   (`<prefix><pid>t<n>`, a template build's `<prefix>x<pid>`) and cgroups
+   (`<prefix><pid>t<n>`, a template build's `<prefix>x<pid>`, owned by their alias) and cgroups
    (`idle-<pid>-<start>-<n>`; a VM process's own `vm-<pid>-<start>`, swept once empty) are named after the owning process and only swept once it is gone; each process has its own
    hold TUN (not persistent: it goes with the process); `unroute` happens
    under the host lock and only for an address the process still holds;
