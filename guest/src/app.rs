@@ -391,18 +391,28 @@ mod tests {
         drop(app);
         let frames = reader.join().unwrap().unwrap();
         // Asked from 0, behind the ring: told where it goes on from (FRAME_LOST, u64 LE) first.
-        let (mut data, mut rest, mut lost) = (Vec::new(), &frames[..], Vec::new());
+        // The reader may get ahead of the second push or fall behind it again, so walk the
+        // frames: a FRAME_LOST jumps to where it goes on from, data moves on by its length.
+        let (mut data, mut rest, mut lost, mut at) = (Vec::new(), &frames[..], Vec::new(), 0);
         while rest[0] == FRAME_STDOUT || rest[0] == FRAME_LOST {
             let n = u32::from_le_bytes(rest[1..5].try_into().unwrap()) as usize;
             match rest[0] {
-                FRAME_LOST => lost.push(u64::from_le_bytes(rest[5..5 + n].try_into().unwrap())),
-                _ => data.extend_from_slice(&rest[5..5 + n]),
+                FRAME_LOST => {
+                    at = u64::from_le_bytes(rest[5..5 + n].try_into().unwrap());
+                    lost.push(at);
+                }
+                _ => {
+                    data.extend_from_slice(&rest[5..5 + n]);
+                    at += n as u64;
+                }
             }
             rest = &rest[5 + n..];
         }
         assert!(frames[0] == FRAME_LOST && lost.iter().all(|&at| at == 10 || at == 21), "{lost:?}");
         assert_eq!(&rest[5..], format!("exited 7 {end}").as_bytes());
-        assert_eq!(data, [vec![b'x'; RING_BYTES - 11], b"crash-tail\n".to_vec()].concat());
+        assert_eq!(at, end, "the reader ends exactly where the output does");
+        let tail = data.len() - b"crash-tail\n".len();
+        assert!(data[..tail].iter().all(|&b| b == b'x') && &data[tail..] == b"crash-tail\n");
     }
 
     #[test]
