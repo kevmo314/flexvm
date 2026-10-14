@@ -7,7 +7,7 @@
 
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -33,6 +33,20 @@ const STARTED: &str = "STARTED";
 const DISCARDED: &str = "DISCARDED";
 const GEN: &str = "GEN";
 const QUARANTINE: &str = "QUARANTINE";
+
+/// Set while a suspend or `checkpoint --stop` saves the VM, and for good once
+/// it did: the app log follower writes nothing past the offset the checkpoint
+/// records (what the reader still drains, the restored VM prints). One VM per process.
+pub static APP_LOG_HELD: AtomicBool = AtomicBool::new(false);
+
+/// Clears `APP_LOG_HELD` when dropped: the VM runs on, printing what was held.
+struct AppLogHeld;
+
+impl Drop for AppLogHeld {
+    fn drop(&mut self) {
+        APP_LOG_HELD.store(false, Ordering::SeqCst);
+    }
+}
 
 /// Uncertain: never ran, but an owned checkpoint may be marked STARTED.
 pub enum Restore {
@@ -83,6 +97,28 @@ impl Proc {
         drop(op);
         self.sync_clock_later();
         Ok(json!({"name": vm.name, "state": "running", "resume_ms": ms(took)}))
+    }
+
+    /// The app log offset, counting only output written out: the follower
+    /// writes a chunk and counts it under the stdout lock. `hold`: nothing
+    /// more is written until the guard is dropped.
+    fn app_log_written(&self, hold: bool) -> (u64, Option<AppLogHeld>) {
+        let _out = std::io::stdout().lock();
+        APP_LOG_HELD.fetch_or(hold, Ordering::SeqCst);
+        (self.app_log.load(Ordering::SeqCst), hold.then_some(AppLogHeld))
+    }
+
+    /// For a migration: the offset sent to the target, with the follower
+    /// held from then on, so the source prints nothing the target will
+    /// (`release_app_log` when the source runs on after all).
+    pub(crate) fn hold_app_log(&self) -> u64 {
+        let (at, held) = self.app_log_written(true);
+        std::mem::forget(held);
+        at
+    }
+
+    pub(crate) fn release_app_log(&self) {
+        APP_LOG_HELD.store(false, Ordering::SeqCst);
     }
 
     fn readdress(&self, vm: &Vm, old: Ipv4Addr) -> Result<()> {
@@ -139,7 +175,12 @@ impl Proc {
             if let Some(dir) = self.consumed.lock().unwrap().take() {
                 delete_consumed(&vm.name, &dir);
             }
-            let staging = Staging::new(&self.host.suspended(&vm.name), vm.dir.join("checkpoint.vmstate"))?;
+            // What an earlier removal of it left (its address is this VM's).
+            let dir = self.host.suspended(&vm.name);
+            if dir.exists() && !self.host.is_suspended(&vm.name) {
+                remove_durably(&dir).map_err(|e| format!("removing what is left of {}: {e}", dir.display()))?;
+            }
+            let staging = Staging::new(&dir, vm.dir.join("checkpoint.vmstate"))?;
             staging.add_file(GEN, self.gen().to_string().as_bytes())?;
             let saved = self.save(vm, staging, false, false, &mut t);
             self.publish();
@@ -177,6 +218,7 @@ impl Proc {
     pub fn resume_suspended(&self, name: &str) -> Result<Value> {
         let mut t = Phases::new();
         self.set_name(self.host.take_name(name, true)?);
+        // Taking the name removed what an interrupted suspend, resume or discard left.
         let dir = self.host.suspended(name);
         if !dir.exists() {
             bail!("no vm named {name:?}");
@@ -254,6 +296,7 @@ impl Proc {
     fn restore_checkpoint(&self, name: &str, ck: Checkpoint, ip: Ipv4Addr, owned: bool, hold: bool, t: &mut Phases) -> std::result::Result<Value, Restore> {
         let m = ck.manifest.clone();
         let to_load = (ck.data_pages() * PAGE_SIZE as u64) >> 20;
+        self.app_log.store(m.app_log, Ordering::SeqCst);
         let (vm, restore) = (|| -> Result<_> {
             let tpl = Template::open_id(&self.paths, &m.template, &m.template_id)?;
             t.mark("verify_template");
@@ -442,6 +485,9 @@ impl Proc {
             Ok(_) => e,
             Err(r) => format!("{e}; {r}").into(),
         })?;
+        // What of the app log was passed on while paused: a restore follows on from there.
+        // A VM running on writes more, which its ring at the snapshot does not have.
+        staging.app_log = self.app_log_written(false).0;
         let (mut pause, mut growth) = (None, None);
         // Hold free page reports during the copy (discarding an unsaved page
         // would stall the guest). Guard first: a lost answer may still apply.
@@ -484,6 +530,12 @@ impl Proc {
         let (parent, links) = parent.unzip();
         let pinned = staging.pinned_dir();
         let parent_ref = parent.clone();
+        // Still paused: what the reader drained since counts too, and from
+        // now on what it drains is left to the restored VM.
+        let held = (!cow).then(|| self.app_log_written(true)).map(|(at, held)| {
+            staging.app_log = at;
+            held
+        });
         let committed = staging.commit(vm, src, &frozen.runs, parent, plugged.unwrap_or(0), t, || {
             cancelled()?;
             if fault("ckpt_fail_write") {
@@ -515,6 +567,10 @@ impl Proc {
             }
         });
         drop(growth);
+        if committed.is_ok() {
+            // The VM ends here; the checkpoint prints the rest.
+            std::mem::forget(held);
+        }
         let copy = frozen.cow.as_ref().map(|c| c.report());
         match &committed {
             Ok(_) => vm.pager.end_copy(),
@@ -625,11 +681,36 @@ fn unmark_durably(dir: &Path, name: &str) -> std::io::Result<()> {
 }
 
 /// Manifest first, durably, so a crash midway never leaves a loadable
-/// checkpoint without its marker.
+/// checkpoint without its marker (what it may leave is debris, removed by the
+/// name's next holder).
 pub fn delete_consumed(name: &str, dir: &Path) {
-    if let Err(e) = unmark_durably(dir, "manifest.json").and_then(|()| std::fs::remove_dir_all(dir)) {
+    if let Err(e) = remove_durably(dir) {
         eprintln!("vm {name}: removing {}: {e}", dir.display());
     }
+}
+
+fn remove_durably(dir: &Path) -> std::io::Result<()> {
+    unmark_durably(dir, "manifest.json")?;
+    std::fs::remove_dir_all(dir)?;
+    match dir.parent() {
+        Some(parent) => std::fs::File::open(parent)?.sync_all(),
+        None => Ok(()),
+    }
+}
+
+/// A suspended directory that is not a suspended VM (`Host::is_suspended`):
+/// one with no manifest, or consumed, or discarded. Its name's holder
+/// removes it and lets go of its address here, without withdrawing its
+/// generation: a consumed checkpoint's VM may run on elsewhere.
+pub fn remove_debris(host: &Host, name: &str) -> Result<()> {
+    let dir = host.suspended(name);
+    let ip = manifest(&dir).map(|m| m.ip);
+    remove_durably(&dir).map_err(|e| format!("vm {name}: removing what is left of its suspended checkpoint {}: {e}", dir.display()))?;
+    if let Some(ip) = ip {
+        let l = host.lock()?;
+        host.release(&l, ip, name)?;
+    }
+    Ok(())
 }
 
 /// Marked DISCARDED durably before the address is freed and withdrawn.
@@ -667,10 +748,10 @@ fn manifest(dir: &Path) -> Option<Manifest> {
 }
 
 pub fn describe_suspended(host: &Host, name: &str) -> Option<Value> {
-    let dir = host.suspended(name);
-    if dir.join(STARTED).exists() || dir.join(DISCARDED).exists() {
+    if !host.is_suspended(name) {
         return None;
     }
+    let dir = host.suspended(name);
     let m = manifest(&dir)?;
     let state = if read_gen(&dir).is_none() || dir.join(QUARANTINE).exists() { "quarantined" } else { "suspended" };
     Some(json!({

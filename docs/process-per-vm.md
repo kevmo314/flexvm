@@ -85,7 +85,8 @@ STATE (default /var/lib/flexvm, on disk)
                          generation, the route a peer announced for the newest generation
   addrs/.gens            generation high-water mark, reserved 1024 at a time, with the boot id
   suspended/NAME/        a suspended VM's checkpoint, GEN (its address's generation) published with it,
-                         + STARTED, DISCARDED, QUARANTINE markers
+                         + STARTED, DISCARDED, QUARANTINE markers; without a manifest, or STARTED or
+                         DISCARDED, it is debris: never listed, removed by the name's next holder
   standby/TEMPLATE       how many standby VMs to keep for a template
   migs/ID                incoming migration records (fencing), JSON, fsynced
 RUN (default /run/flexvm, tmpfs)
@@ -354,7 +355,16 @@ where it is kept and what tests it.
    `kill_refused_checkpoint`).
 6. **Suspend markers and quarantine.** `STARTED` means consumed: `resume`
    deletes such a checkpoint and `ls` does not show it; deleting it holds
-   the operation lock, and a suspend deletes it first. Quarantine is a file
+   the operation lock, and a suspend deletes it first. A suspended directory
+   without a manifest (a revoke or a removal cut short), or marked `STARTED`
+   (a resume killed outright) or `DISCARDED`, is debris: it holds neither
+   name nor address, `ls` does not show it, and whoever takes the name next
+   (`run`, `resume`, `restore`, `kill`, an arrival; a suspend for its own
+   VM) removes it durably and lets go of its address (without withdrawing
+   its generation: a consumed checkpoint's VM may run on elsewhere). A
+   revoked checkpoint is removed whole. Unit test
+   `host::suspend_debris_is_removed_by_the_names_next_holder`; faults
+   `suspend_debris`, `revoked_publication`. Quarantine is a file
    (`QUARANTINE`, with the boot id). Suspended VMs keep name and address with
    no pid, and `ls` lists them.
 7. **Address state** is read fresh and changed per change under the host
