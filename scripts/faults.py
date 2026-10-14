@@ -3913,11 +3913,14 @@ def suspend_cmd():
     and exits with its status."""
     n = "ft-susp-cmd"
     scenario_vms.add(n)
-    cmd = "echo before; sleep 6; echo after; exit 7"
+    # Markers no flexvm message contains (its own lines, such as "guest clock was
+    # ... off after resuming", go to the same log), counted as whole lines.
+    before, after = "susp-cmd-out-1", "susp-cmd-out-2"
+    cmd = f"echo {before}; sleep 6; echo {after}; exit 7"
     clear_log(A, n)
     ok(cli_json(A, "run", n, "--template", args.template, "-d", "--", cmd))
     pid = vm_pid(A, n)
-    check("suspend cmd: started", wait_for(lambda: "before" in log(A, n), 30), log(A, n)[-300:])
+    check("suspend cmd: started", wait_for(lambda: before in log(A, n).splitlines(), 30), log(A, n)[-300:])
     t = time.time()
     os.kill(pid, signal.SIGTERM)
     gone = wait_for(lambda: not alive(pid), 60)
@@ -3926,8 +3929,11 @@ def suspend_cmd():
     check("suspend cmd: the command was not given up", "timed out" not in log(A, n) and "being killed" not in log(A, n), log(A, n)[-500:])
     r = subprocess.run([BIN, "--state", A.state, "--run", A.run, "resume", n], capture_output=True, text=True, timeout=120, env=ENV)
     check("suspend cmd: resumed, the command's status", r.returncode == 7, (r.returncode, r.stderr[-500:]))
-    out = log(A, n) + r.stdout
-    check("suspend cmd: its output, once", out.count("before") == 1 and out.count("after") == 1, (log(A, n)[-300:], r.stdout))
+    # Whatever printed it: the suspended process, or the resumed one (if the suspend outlasted the sleep).
+    lines = log(A, n).splitlines() + r.stdout.splitlines()
+    check("suspend cmd: its output, once", lines.count(before) == 1 and lines.count(after) == 1, (log(A, n), r.stdout))
+    check("suspend cmd: the resumed process's stdout is the command's output alone",
+          set(r.stdout.splitlines()) <= {after}, r.stdout)
     check("suspend cmd: gone after it", n not in vms(A), vms(A).get(n))
 
 
