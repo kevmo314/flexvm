@@ -1799,7 +1799,8 @@ def busy_guest(host, name):
     MiB at most): tmpfs cannot be reclaimed, so more would have the guest's
     OOM killer take the guest's own processes, or panic it, on a template
     without hot-plugged memory (#189)."""
-    code, out = sh(host, name, "(while :; do echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; done | socat -u - UDP:169.254.1.1:9) "
+    # The kernel log starts empty, so guest_healthy counts only what this run logs, not the template's.
+    code, out = sh(host, name, "dmesg -c >/dev/null; (while :; do echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; done | socat -u - UDP:169.254.1.1:9) "
                    ">/dev/null 2>&1 < /dev/null & "
                    "c=$(awk '/MemAvailable/ { m = int($2 / 2048); print (m < 200 ? m : 200) }' /proc/meminfo); "
                    "(while :; do head -c ${c}M /dev/zero > /dev/shm/churn; rm -f /dev/shm/churn; done) "
