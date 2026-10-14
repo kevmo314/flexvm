@@ -57,6 +57,8 @@ p.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
 p.add_argument("--templates", help=argparse.SUPPRESS)
 p.add_argument("--lane", type=int, default=0, help=argparse.SUPPRESS)
 p.add_argument("--results", help=argparse.SUPPRESS)
+p.add_argument("--selftest", action="store_true",
+               help="check the scheduler without KVM: fake templates and workers, one worker that cannot be spawned")
 p.add_argument("cases", nargs="*", help="cases to run (default: all)")
 args = p.parse_args()
 BIN = os.path.abspath(args.bin)
@@ -660,7 +662,7 @@ def faults():
 
 # Directories of this run's own, shared with nothing else: run directories under /run
 # (tmpfs), state and checkpoints under /var/tmp (suspend needs a disk).
-RUN = tempfile.mkdtemp(prefix=args.tag + "-", dir="/run")
+RUN = tempfile.mkdtemp(prefix=args.tag + "-", dir=None if args.selftest else "/run")
 WORK = tempfile.mkdtemp(prefix=args.tag + "-", dir="/var/tmp")
 # Templates of this run's own (a worker's are its run's): never another's `ci` or the shared image
 # cache. On tmpfs: building one writes out all of the guest's memory and reads it back to hash it,
@@ -755,7 +757,7 @@ def lanes():
 
 
 def main():
-    assert os.geteuid() == 0, "run as root"
+    assert args.selftest or os.geteuid() == 0, "run as root"
     if args.worker:
         return worker()
     selected = args.cases or list(CASES)
@@ -768,6 +770,7 @@ def main():
     work += [(f"faults/{s}", {args.template, GROW} if s in ("cow_grow", "plug_storm", "fc_prepare") else {args.template},
               COST.get(f"faults/{s}", 2)) for s in scenarios]
     work.sort(key=lambda w: -w[2])
+    scheduled = list(work)
     lock, out_lock = threading.Condition(), threading.Lock()
     built, broken, procs, summary = set(), set(), [], []
     started = time.time()
@@ -779,8 +782,8 @@ def main():
     def build(name, *extra):
         t = time.time()
         try:
-            r = flexvm("template", name, *extra, timeout=600)
-            out, ok = (r.stdout + r.stderr).strip(), True
+            r = flexvm("template", name, *extra, timeout=600) if not args.selftest else None
+            out, ok = (r.stdout + r.stderr).strip() if r else "(selftest)", True
         except Exception as e:
             out, ok = str(e), False
         with lock:
@@ -812,38 +815,62 @@ def main():
                 work.remove(w)
             return [w[0] for w in batch]
 
+    spawned = []
+
+    def spawn(cmd, cases, scens, res):
+        """A worker process; under --selftest a fake one, and the second spawn fails as with EMFILE."""
+        if args.selftest:
+            with lock:
+                spawned.append((cases, scens))
+                if len(spawned) == 2:
+                    raise OSError(24, "Too many open files (selftest)")
+            fake = ("import json, sys; c, s, res = json.loads(sys.argv[1]); [print(f'scenario {x}: ok in 0.0 s') for x in s]; "
+                    "json.dump([[x, 'PASS', 0.0] for x in c] + ([['faults', 'PASS', 0.0]] if s else []), open(res, 'w'))")
+            cmd = [sys.executable, "-c", fake, json.dumps([cases, scens, res])]
+        return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, text=True)
+
+    def run_batch(i, label, batch, port, net_a, net_b):
+        """Runs one batch in a worker; returns its results."""
+        cases = [c for c in batch if not c.startswith("faults/")]
+        scens = [c.split("/", 1)[1] for c in batch if c.startswith("faults/")]
+        res = os.path.join(WORK, f"results-{label}.json")
+        cmd = [sys.executable, "-u", os.path.abspath(__file__), "--worker", "--lane", str(i), "--bin", BIN,
+               "--artifacts", ARTIFACTS, "--log-dir", os.path.join(args.log_dir, f"lane-{label}"),
+               "--port-a", str(port), "--net-a", net_a, "--net-b", net_b, "--tag", args.tag,
+               "--template", args.template, "--templates", TEMPLATES, "--image", args.image, "--results", res,
+               "--faults", " ".join(scens), *(["--no-image"] if args.no_image else []),
+               *cases, *(["faults"] if scens else [])]
+        say(f"[{label}] {' '.join(batch)}")
+        t = time.time()
+        p = spawn(cmd, cases, scens, res)
+        with lock:
+            procs.append(p)
+        got = []
+        for line in p.stdout:
+            say(f"[{label}] {line.rstrip()}")
+            m = re.match(r"scenario (\S+): (ok|FAILED) in ([\d.]+) s$", line.strip())
+            if m:
+                got.append((f"faults/{m.group(1)}", "PASS" if m.group(2) == "ok" else "FAIL", float(m.group(3)), label))
+        code = p.wait()
+        try:
+            got += [(c, st, d, label) for c, st, d in json.load(open(res)) if c != "faults" or st == "FAIL"]
+        except (OSError, ValueError):
+            got.append((f"worker {label}", "FAIL", time.time() - t, label))
+        if code != 0 and not any(g[1] == "FAIL" for g in got):
+            got.append((f"worker {label} (exit {code})", "FAIL", time.time() - t, label))
+        return got
+
     def lane(i, port, net_a, net_b):
         n = 0
         while (batch := take()) is not None:
             n += 1
             label = f"{i}.{n}"
-            cases = [c for c in batch if not c.startswith("faults/")]
-            scens = [c.split("/", 1)[1] for c in batch if c.startswith("faults/")]
-            res = os.path.join(WORK, f"results-{label}.json")
-            cmd = [sys.executable, "-u", os.path.abspath(__file__), "--worker", "--lane", str(i), "--bin", BIN,
-                   "--artifacts", ARTIFACTS, "--log-dir", os.path.join(args.log_dir, f"lane-{label}"),
-                   "--port-a", str(port), "--net-a", net_a, "--net-b", net_b, "--tag", args.tag,
-                   "--template", args.template, "--templates", TEMPLATES, "--image", args.image, "--results", res,
-                   "--faults", " ".join(scens), *(["--no-image"] if args.no_image else []),
-                   *cases, *(["faults"] if scens else [])]
-            say(f"[{label}] {' '.join(batch)}")
-            t = time.time()
-            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, text=True)
-            with lock:
-                procs.append(p)
-            got = []
-            for line in p.stdout:
-                say(f"[{label}] {line.rstrip()}")
-                m = re.match(r"scenario (\S+): (ok|FAILED) in ([\d.]+) s$", line.strip())
-                if m:
-                    got.append((f"faults/{m.group(1)}", "PASS" if m.group(2) == "ok" else "FAIL", float(m.group(3)), label))
-            code = p.wait()
             try:
-                got += [(c, st, d, label) for c, st, d in json.load(open(res)) if c != "faults" or st == "FAIL"]
-            except (OSError, ValueError):
-                got.append((f"worker {label}", "FAIL", time.time() - t, label))
-            if code != 0 and not any(g[1] == "FAIL" for g in got):
-                got.append((f"worker {label} (exit {code})", "FAIL", time.time() - t, label))
+                got = run_batch(i, label, batch, port, net_a, net_b)
+            except Exception as e:
+                # Whatever went wrong, the batch failed: none of it may pass unrun.
+                say(f"[{label}] FAIL batch: {type(e).__name__}: {e}")
+                got = [(c, "FAIL", 0.0, label) for c in batch]
             with lock:
                 summary.extend(got)
 
@@ -867,11 +894,20 @@ def main():
                 p.wait(60)
             except subprocess.TimeoutExpired:
                 p.kill()
+    # Every case and scenario has a result, or it failed (a lane that died, say).
+    done = {r[0] for r in summary}
+    summary.extend((name, "FAIL", 0.0, "not run") for name, _, _ in scheduled if name not in done)
     summary.sort(key=lambda r: -r[2])
     failed = [r for r in summary if r[1] != "PASS"]
     print("\n" + "\n".join(f"{s} {c} ({d:.1f} s, batch {b})" for c, s, d, b in summary))
     print(f"{len(summary) - len(failed)} passed, {len(failed)} failed in {time.time() - started:.0f} s "
           f"({sum(r[2] for r in summary):.0f} s of work in {len(lanes())} lanes)")
+    if args.selftest:
+        # The second batch could not be spawned: exactly its cases and scenarios fail, the rest pass.
+        bad = sorted(r[0] for r in failed)
+        want = sorted(spawned[1][0] + [f"faults/{x}" for x in spawned[1][1]]) if len(spawned) > 1 else ["(no second batch)"]
+        print(f"selftest: failed {bad}, expected {want}")
+        return 0 if bad == want and len(summary) == len(scheduled) + 2 else 1
     return 1 if failed else 0
 
 

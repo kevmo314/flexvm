@@ -48,6 +48,9 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: unit tests
         run: cargo test --workspace
+      - name: e2e scheduler self-test
+        # Fake templates and workers, one of which cannot be spawned: its cases must fail.
+        run: python3 scripts/e2e.py --selftest --log-dir "$RUNNER_TEMP/e2e-selftest"
 
   e2e:
     name: end-to-end (KVM)
@@ -191,6 +194,8 @@ jobs:
           mkdir -p "$RUNNER_TEMP/e2e-logs"
           sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/e2e-logs" || true
           sudo dmesg | tail -200 > "$RUNNER_TEMP/e2e-logs/dmesg.txt" || true
+          # The background release build's output, also when "Build flexvm" never ran.
+          cp "$RUNNER_TEMP/build.log" "$RUNNER_TEMP/e2e-logs/build.log" || true
       - name: Upload logs
         if: failure() || cancelled()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
