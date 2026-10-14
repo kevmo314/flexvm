@@ -29,6 +29,8 @@ const MADV_COLLAPSE: libc::c_int = 25;
 /// Calls that all fail with EINVAL before the pass concludes that the kernel cannot collapse here (THP disabled, or a
 /// kernel before 6.1).
 const EINVAL_GIVE_UP: usize = 16;
+/// How often a held pass looks whether it may go on.
+const HELD_POLL: Duration = Duration::from_millis(10);
 
 /// What the collapse pass did, for `debug VM status`.
 #[derive(Default, Clone)]
@@ -92,9 +94,18 @@ impl Pager {
                     report.stopped = Some(why.into());
                     break 'regions;
                 }
+                let gate = self.collapse_gate.lock().unwrap();
+                if self.collapse_held.load(Ordering::SeqCst) {
+                    // Paused (or about to be): wait for the resume, or for the halt that follows a checkpoint or
+                    // migration.
+                    drop(gate);
+                    thread::sleep(HELD_POLL);
+                    continue;
+                }
                 if pages.next_not(PRESENT, p, p + ARM_CHUNK) == p + ARM_CHUNK {
                     let (t, cpu) = (Instant::now(), thread_cpu());
                     let res = self.collapse_chunk(pidfd.as_raw_fd(), p);
+                    drop(gate);
                     let took = t.elapsed();
                     report.tried += 1;
                     report.busy += took;
@@ -151,6 +162,14 @@ impl Pager {
             n if n >= 0 => Err(io::Error::from_raw_os_error(libc::EBUSY)),
             _ => Err(io::Error::last_os_error()),
         }
+    }
+
+    /// Holds the collapse pass off (`true`), waiting out a collapse in flight, or lets it go on (`false`). Before any
+    /// pause: a collapse takes the mmap write lock and may compact memory, which a pause must not wait behind. A
+    /// checkpoint or migration then ends the pass for good (`quiesce`).
+    pub fn hold_collapse(&self, hold: bool) {
+        self.collapse_held.store(hold, Ordering::SeqCst);
+        drop(self.collapse_gate.lock().unwrap());
     }
 
     /// What the collapse pass did, once it ran.

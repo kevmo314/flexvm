@@ -111,6 +111,7 @@ impl Vm {
             }
             res
         })?;
+        self.pager.hold_collapse(false);
         *self.state.lock().unwrap() = State::Running;
         Ok(())
     }
@@ -209,6 +210,8 @@ impl Vm {
     /// stop devices writing memory, so execs close, `unroute` holds packets and the tap goes
     /// down. `resume` undoes this; a target calls `restore_devices`.
     pub fn save_state(&self, vmstate: &Path, sync: bool, park: bool, unroute: impl FnOnce(), t: &mut Phases) -> Result<Runs> {
+        // No huge-page collapse in flight or starting during the pause (`resume` lets it go on).
+        self.pager.hold_collapse(true);
         if park {
             self.park_balloon()?;
             t.mark("park_balloon");
@@ -283,6 +286,9 @@ impl Vm {
             true => Ok(State::Paused),
             false => self.fc(|fc| fc.resume()).map(|()| State::Running),
         };
+        if matches!(resumed, Ok(State::Running)) {
+            self.pager.hold_collapse(false);
+        }
         // Out of the pause, but with the mark still lifted: Firecracker throttled at it could time this out.
         if resumed.is_ok() {
             self.unpark_balloon();
@@ -336,7 +342,15 @@ impl Vm {
             s if s != from => bail!("vm {} is {}, not {}", self.name, s.name(), from.name()),
             _ => {}
         }
-        self.fc(|fc| if to == State::Paused { fc.pause() } else { fc.resume() })?;
+        let pausing = to == State::Paused;
+        if pausing {
+            self.pager.hold_collapse(true);
+        }
+        let res = self.fc(|fc| if pausing { fc.pause() } else { fc.resume() });
+        if res.is_ok() != pausing {
+            self.pager.hold_collapse(false);
+        }
+        res?;
         *self.state.lock().unwrap() = to;
         Ok(())
     }
@@ -765,6 +779,7 @@ impl Prepared {
             }
             let held = loaded.and_then(|_| {
                 if hold {
+                    self.pager.hold_collapse(true);
                     // Only an API pause holds device emulation.
                     fc.request_within("PATCH", "/vm", Some(json!({"state": "Paused"})), left(API_TIMEOUT))?;
                     t.mark("hold_paused");

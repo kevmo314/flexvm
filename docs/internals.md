@@ -198,9 +198,13 @@ second time. Once the pull is done, one thread collapses each 2 MiB chunk whose
 pages are all PRESENT into a transparent huge page
 (`process_madvise(MADV_COLLAPSE)` on Firecracker), which KVM then maps with one
 entry. It uses at most half a core (it sleeps as long as each collapse took CPU).
-It stops when the pager stops, at a checkpoint or migration barrier, once write
-tracking is registered, or when the kernel has no huge page to give (ENOMEM).
-Nothing else changes:
+Before every pause (migration, checkpoint, suspend, `kill -TSTP`, the paused
+start of an arriving VM) the VM process holds the pass and waits out a collapse
+in flight, so no pause waits behind a collapse's mmap write lock or compaction
+(0.05–2.9 ms before the pause, while the guest still runs); a resume lets it go
+on. It ends when the pager stops, at a checkpoint or migration barrier, once
+write tracking is registered, or when the kernel has no huge page to give
+(ENOMEM). Nothing else changes:
 
 - The kernel collapses a chunk of a userfaultfd-registered range only if all 512
   pages are mapped, none of them the zero page and none write-protected. It checks
@@ -215,7 +219,9 @@ Nothing else changes:
   a missing fault, as before.
 - `scripts/faults.py cow_collapsed` checks checkpoints, deltas, a restore and free
   page reporting on collapsed memory with the guest rewriting it, and
-  `unplug_collapsed` checks a virtio-mem unplug of it.
+  `unplug_collapsed` checks that a virtio-mem unplug frees the huge pages in the
+  blocks it empties (measured after free page reporting settled, from
+  Firecracker's pagemap and kpageflags), and moves their data intact.
 
 Pausing Firecracker stops only the vCPUs, so before the state-only snapshot the
 source also brings the VM's tap down (no RX into guest memory), closes host

@@ -10,7 +10,7 @@ usage: scripts/faults.py [--a ADDR] [--b ADDR] [--a-dir DIR] [--b-dir DIR]
 The script starts both listeners (FLEXVM_FAULTS=1, VMs log to DIR/run/vms)
 and stops them at the end. Checkpoint scenarios write to --ckpt-dir.
 """
-import argparse, base64, json, os, re, signal, socket, subprocess, sys, tempfile, threading, time, traceback
+import argparse, base64, json, struct, os, re, signal, socket, subprocess, sys, tempfile, threading, time, traceback
 
 p = argparse.ArgumentParser(usage=__doc__)
 p.add_argument("--a", default="127.0.0.1:7130")
@@ -2286,44 +2286,101 @@ def cow_collapsed():
         rm_ckpt(p)
 
 
+def guest_chunks(host, name):
+    """Firecracker's guest memory by 2 MiB chunk (of its userfaultfd-registered mappings): those mapped by a
+    transparent huge page, those with nothing mapped, and those Firecracker made inaccessible (unplugged slots)."""
+    pid = fc_pid(host, name)
+    vmas, cur = [], None
+    for l in open(f"/proc/{pid}/smaps"):
+        head = l.split()
+        if "-" in head[0] and ":" not in head[0]:
+            cur = (*(int(x, 16) for x in head[0].split("-")), head[1].startswith("---"))
+        elif l.startswith("VmFlags:") and " um" in l:
+            vmas.append(cur)
+    huge, empty, unplugged = set(), set(), set()
+    with open(f"/proc/{pid}/pagemap", "rb") as pm, open("/proc/kpageflags", "rb") as kf:
+        for a, b, none in vmas:
+            for c in range((a + (2 << 20) - 1) & ~((2 << 20) - 1), b - (2 << 20) + 1, 2 << 20):
+                if none:
+                    unplugged.add(c)
+                pm.seek(c // 4096 * 8)
+                entries = struct.unpack("512Q", pm.read(512 * 8))
+                if not any(e >> 63 & 1 or e >> 62 & 1 for e in entries):
+                    empty.add(c)
+                elif entries[0] >> 63 & 1:
+                    kf.seek((entries[0] & ((1 << 55) - 1)) * 8)
+                    if struct.unpack("Q", kf.read(8))[0] >> 22 & 1:  # KPF_THP
+                        huge.add(c)
+    return huge, empty, unplugged
+
+
+def settle_rss(host, name, timeout=60):
+    """Waits for Firecracker's RSS to hold still for 3 s (free page reporting done)."""
+    last, since, end = None, time.time(), time.time() + timeout
+    while time.time() < end:
+        rss = huge_mib(host, name)[1]
+        if last is None or abs(rss - last) > 4:
+            last, since = rss, time.time()
+        elif time.time() - since >= 3:
+            return rss
+        time.sleep(0.5)
+    return last
+
+
 def unplug_collapsed():
-    """virtio-mem unplug of memory collapsed into huge pages after a migration (#141): the guest moves its pages out of
-    the blocks it gives back, Firecracker discards them (2 MiB blocks, whole huge pages), and the guest's memory stays
-    intact. PLUG_TEMPLATE picks a template with at least 1 GiB of unplugged hotplug room."""
+    """virtio-mem unplug of memory collapsed into huge pages after a migration (#141): the guest moves its data out of
+    the blocks it gives back, Firecracker discards them (2 MiB blocks, whole huge pages), the huge pages there are
+    freed, and the guest's memory stays intact. PLUG_TEMPLATE picks a template with at least 1.5 GiB of unplugged
+    hotplug room (the unplug must leave the guest its headroom, or the controller grows it right back)."""
     n = "ft-huge-unplug"
     m = setup(n, template=os.environ.get("PLUG_TEMPLATE"))
     v = vms(A)[n]
     plugged = v["plugged_mib"]
-    if v["max_mib"] - v["guest_mib"] < 1024:
+    if v["max_mib"] - v["guest_mib"] < 1536:
         cleanup(n)
-        raise Skip(f"template too small to plug 1 GiB more ({v['guest_mib']} of {v['max_mib']} MiB)")
-    ok(hotplug(A, n, plugged + 1024))
-    grown = wait_for(lambda: (vms(A)[n]["requested_mib"], vms(A)[n]["plugged_mib"]) == (plugged + 1024,) * 2, 60)
-    check("huge unplug: plugged 1 GiB more", grown, vms(A)[n])
-    code, out = sh(A, n, "dd if=/dev/urandom of=/tmp/g bs=1M count=1200 2>/dev/null && echo done")
+        raise Skip(f"template too small to plug 1.5 GiB more ({v['guest_mib']} of {v['max_mib']} MiB)")
+    ok(hotplug(A, n, plugged + 1536))
+    grown = wait_for(lambda: (vms(A)[n]["requested_mib"], vms(A)[n]["plugged_mib"]) == (plugged + 1536,) * 2, 60)
+    check("huge unplug: plugged 1.5 GiB more", grown, vms(A)[n])
+    # Data in the blocks the unplug will empty (the highest): what the guest wrote first sits low and is deleted.
+    code, out = sh(A, n, "dd if=/dev/urandom of=/tmp/h bs=1M count=550 2>/dev/null && dd if=/dev/urandom of=/tmp/g bs=1M count=400 "
+                         "2>/dev/null && rm /tmp/h && md5sum /tmp/g")
     check("huge unplug: guest filled the new memory", code == 0, out)
+    g = out.split()[0] if code == 0 else None
     start_writer(A, n, mib=64)
     ok(migrate(A, n, B))
     st = wait_released(B, n)
     check("huge unplug: migrated and pulled", st["released"] and st["state"] == "running", st)
-    wait_for(lambda: (collapse_report(B, n) or {}).get("done"), 60)
+    wait_for(lambda: (collapse_report(B, n) or {}).get("done"), 120)
     c = collapse_report(B, n)
-    huge0, rss0 = huge_mib(B, n)
-    check("huge unplug: memory collapsed", c and c["collapsed"] >= 200, (c, huge0))
+    check("huge unplug: memory collapsed", c and c["collapsed"] >= 100, c)
+    # Free page reporting of what the deletion freed is done before the baseline, so what follows is the unplug's.
+    rss0 = settle_rss(B, n)
+    huge0, _, unplugged0 = guest_chunks(B, n)
     discards0 = control(B, n, {"op": "debug", "what": "status"})["result"]["discards"]
-    sh(B, n, "rm /tmp/g")
-    ok(hotplug(B, n, plugged))
+    t = time.time()
+    ok(hotplug(B, n, plugged + 1024))
     # The guest may not manage to empty every block; a shrink it cannot finish settles at what is plugged.
     hp = lambda: (vms(B)[n]["requested_mib"], vms(B)[n]["plugged_mib"])
-    done = wait_for(lambda: hp()[0] == hp()[1] <= plugged + 512, 60)
+    done = wait_for(lambda: hp()[0] == hp()[1] < plugged + 1536, 60)
+    took = time.time() - t
     st = control(B, n, {"op": "debug", "what": "status"})["result"]
-    huge1, rss1 = huge_mib(B, n)
-    print(f"huge unplug: {huge0} -> {huge1} MiB huge, RSS {rss0} -> {rss1} MiB, discards {discards0} -> {st['discards']}")
-    check("huge unplug: unplugged at least half the collapsed memory", done and st["discards"] > discards0 and not st["failed"],
+    rss1 = settle_rss(B, n)
+    huge1, empty1, unplugged1 = guest_chunks(B, n)
+    # Huge pages discarded since the baseline (free page reporting had settled), and those in slots Firecracker unplugged
+    # whole (mapped inaccessible), which must all be gone.
+    slots = huge0 & (unplugged1 - unplugged0)
+    freed = huge0 & empty1
+    print(f"huge unplug: plugged {plugged + 1536} -> {hp()[1]} MiB in {took:.1f} s (settled: {done}), {len(huge0) * 2} MiB in huge pages before, "
+          f"{len(freed) * 2} MiB of them discarded, {len(slots) * 2} MiB in whole unplugged slots ({len(slots - empty1) * 2} MiB still mapped), {len(huge1) * 2} MiB left; RSS {rss0} -> {rss1} MiB, "
+          f"discards {discards0} -> {st['discards']}")
+    check("huge unplug: unplugged with collapsed memory in the blocks", done and st["discards"] > discards0 and not st["failed"],
           (plugged, hp(), st["failed"]))
-    check("huge unplug: memory went back to the host", rss1 < rss0 - 500, (rss0, rss1))
+    check("huge unplug: huge pages in the unplugged blocks were freed", len(freed) * 2 >= 64 and not slots - empty1,
+          (len(freed), len(slots), len(slots - empty1)))
+    check("huge unplug: data moved, not copied (RSS did not grow)", rss1 <= rss0 + 64, (rss0, rss1))
     errors, _, out = writer_check(B, n)
-    check("huge unplug: guest memory intact", errors == 0 and md5(B, n) == m, out)
+    check("huge unplug: guest memory intact", errors == 0 and md5(B, n) == m and sh(B, n, "md5sum /tmp/g")[1].split()[0] == g, out)
     cleanup(n)
 
 

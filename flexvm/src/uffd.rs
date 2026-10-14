@@ -252,6 +252,10 @@ pub struct Pager {
     steer: Mutex<(usize, usize)>,
     /// What the pass collapsing paged-in memory into huge pages did, once done (see `collapse`).
     collapse_report: Mutex<Option<collapse::CollapseReport>>,
+    /// Set while the VM is (about to be) paused: no collapse starts (see `hold_collapse`).
+    collapse_held: AtomicBool,
+    /// Held across each collapse call, so `hold_collapse` can wait one out.
+    collapse_gate: Mutex<()>,
 }
 
 impl Pager {
@@ -302,6 +306,8 @@ impl Pager {
             lanes: Default::default(),
             steer: Mutex::new((0, 0)),
             collapse_report: Mutex::new(None),
+            collapse_held: AtomicBool::new(false),
+            collapse_gate: Mutex::new(()),
         });
         let p = pager.clone();
         let thread = thread::Builder::new().name("uffd".into()).spawn(move || {
