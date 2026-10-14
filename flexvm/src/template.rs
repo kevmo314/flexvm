@@ -27,18 +27,23 @@ pub const BALLOON_STATS_S: u16 = 1;
 
 pub const BOOT_ARGS: &str = "console=ttyS0 quiet reboot=k panic=1 pci=off \
     i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd \
-    rootflags=dax init=/sbin/flexvm-init memhp_default_state=online_movable psi=1";
+    rootflags=dax init=/sbin/flexvm-init psi=1 \
+    memhp_default_state=online memory_hotplug.online_policy=auto-movable memory_hotplug.auto_movable_ratio=2000";
 
 /// KVM memslot size for the virtio-mem region (MiB). Restores pay per slot,
 /// and plugged but untouched memory costs the host nothing, so slots are big.
 pub const SLOT_MIB: u64 = 1024;
 /// Step the controller grows and shrinks guests by (MiB).
 pub const STEP_MIB: u64 = 128;
-/// Default boot memory (MiB) for a guest that may grow to `max_mib`. Hot-plugged
-/// memory is movable, so the kernel's own allocations, including the page
-/// structs of every hot-plugged block (1/64 of it), must fit in boot memory: a
-/// 256 MiB base runs out near 11 GiB plugged and the guest kernel OOMs. Boot
-/// memory the guest does not touch costs the host nothing either.
+/// Default boot memory (MiB) for a guest that may grow to `max_mib`. The page
+/// structs of hot-plugged memory (1/64 of it), page tables and every other
+/// kernel allocation need kernel (not movable) memory. The guest onlines
+/// hot-plugged blocks `auto-movable` (BOOT_ARGS): movable while it has at
+/// least 1/20 as much kernel memory, else as kernel memory, so kernel memory
+/// grows with the plug whatever the base. (All movable, a 256 MiB base ran out
+/// at ~13 GiB plugged and the guest panicked, #97.) This base keeps a guest's
+/// first ~20x of it movable. Boot memory the guest does not touch costs the
+/// host nothing either.
 pub fn base_mib(max_mib: u64) -> u64 {
     (256 + max_mib / 32).div_ceil(STEP_MIB) * STEP_MIB
 }
