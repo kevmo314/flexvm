@@ -1,6 +1,6 @@
 //! The VM process: one process per VM, owning its Firecracker, pager, tap,
 //! route and holds, exiting with the VM. SIGTERM suspends, SIGTSTP pauses,
-//! SIGCONT resumes, SIGINT (and SIGQUIT) destroys; `RUN/vms/NAME.sock` takes control ops.
+//! SIGCONT resumes, SIGINT (and SIGQUIT) destroys, SIGUSR1 stops a standby; `RUN/vms/NAME.sock` takes control ops.
 //! Every operation, starting included, holds `op`; the process ends only
 //! through `finish`, which holds it too.
 
@@ -22,7 +22,7 @@ use crate::guest;
 use crate::hold::Holder;
 use crate::host::{fault, AddrClaim, Entry, Host, Ident, MigRecord, NameLock};
 use crate::template::{Paths, Template, STEP_MIB};
-use crate::util::{answer, ms, proc_kb, send_json, Error, Phases, Result};
+use crate::util::{answer, ms, proc_kb, send_json, Error, Phases, Result, Slot};
 use crate::vm::{Snapshot, State, Vm};
 
 /// A VM process's own exit statuses (`run -- CMD` passes CMD's through):
@@ -694,14 +694,11 @@ impl Proc {
                         continue;
                     }
                 };
-                if CONTROL.fetch_add(1, Ordering::SeqCst) >= MAX_CONTROL {
-                    CONTROL.fetch_sub(1, Ordering::SeqCst);
-                    continue;
-                }
+                let Some(slot) = Slot::take(&CONTROL, MAX_CONTROL) else { continue };
                 let p = p.clone();
                 thread::spawn(move || {
+                    let _slot = slot;
                     p.control(c);
-                    CONTROL.fetch_sub(1, Ordering::SeqCst);
                 });
             }
         });
@@ -1705,10 +1702,6 @@ mod tests {
         unsafe {
             std::os::unix::process::CommandExt::pre_exec(&mut child, || {
                 libc::signal(libc::SIGUSR1, libc::SIG_DFL);
-                let mut set: libc::sigset_t = std::mem::zeroed();
-                libc::sigemptyset(&mut set);
-                libc::sigaddset(&mut set, libc::SIGUSR1);
-                libc::sigprocmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
                 Ok(())
             });
         }

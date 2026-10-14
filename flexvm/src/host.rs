@@ -596,13 +596,12 @@ impl Host {
         }
         let g = load::<Gens>(&path)?.unwrap_or(Gens { next: 1, reserved: 0, boot: String::new() });
         let next = if g.boot == boot_id() { g.next } else { g.next.max(g.reserved) };
-        let gen = next.max(seen.checked_add(1).ok_or("generations exhausted")?);
-        let next = gen.checked_add(1).filter(|&n| n <= GEN_MAX).ok_or("generations exhausted")?;
-        let (reserved, durable) = if gen >= g.reserved { (gen.checked_add(GEN_BLOCK).ok_or("generations exhausted")?, true) } else { (g.reserved, false) };
+        let gen = next.max(seen.saturating_add(1));
+        let (reserved, durable) = if gen >= g.reserved { (gen.saturating_add(GEN_BLOCK), true) } else { (g.reserved, false) };
         if reserved > GEN_MAX {
             bail!("generations exhausted");
         }
-        store(&path, &Gens { next, reserved, boot: boot_id().into() }, durable)?;
+        store(&path, &Gens { next: gen + 1, reserved, boot: boot_id().into() }, durable)?;
         Ok(gen)
     }
 
@@ -2084,7 +2083,7 @@ mod tests {
     /// every other process, so no margin is ever safe.
     const AVAIL: u64 = 10_000;
 
-    /// `grant_inner`, as `grant`, `grant_above` and `grant_held` call it, but against `AVAIL`.
+    /// `grant_inner` against `AVAIL`.
     fn grant_at(h: &Host, mib: u64, floor: Floor, hold: bool) -> std::result::Result<(u64, Option<Hold>), Error> {
         h.grant_inner(mib, floor, hold, None, || Some(AVAIL)).unwrap()
     }

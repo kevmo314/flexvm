@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 
 use crate::bail;
 use crate::host::{fault, Host};
-use crate::util::{send_json, Result};
+use crate::util::{send_json, Result, Slot};
 
 /// Requests handled at once; more connections are closed unanswered.
 const MAX_ACTIVE: usize = 512;
@@ -49,17 +49,14 @@ pub fn main(host: Host, listener: TcpListener) -> Result<()> {
                 continue;
             }
         };
-        if ACTIVE.fetch_add(1, Ordering::SeqCst) >= MAX_ACTIVE {
-            ACTIVE.fetch_sub(1, Ordering::SeqCst);
-            continue;
-        }
+        let Some(slot) = Slot::take(&ACTIVE, MAX_ACTIVE) else { continue };
         let (host, peers) = (host.clone(), peers.clone());
         std::thread::spawn(move || {
+            let _slot = slot;
             let _ = conn.set_nodelay(true);
             if let Err(e) = handle(&host, &peers, conn, deadline) {
                 eprintln!("peer request: {e}");
             }
-            ACTIVE.fetch_sub(1, Ordering::SeqCst);
         });
     }
     Ok(())

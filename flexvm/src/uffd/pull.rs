@@ -1,5 +1,5 @@
 use super::event::PULL;
-use super::fetch::{partial, Failed, Fetch, FetchFailure, Link, BACKOFF_MIN};
+use super::fetch::{Failed, Fetch, FetchFailure, Link, BACKOFF_MIN};
 use super::{os, Pager, ALL, FAULT_FETCHERS, FAULT_TIMEOUT, PAGE_SIZE, PULL_RUN, REMOTE};
 use crate::checkpoint::PageFile;
 use std::io;
@@ -40,12 +40,12 @@ impl Pager {
                 }),
                 (None, Some(source)) if puller => {
                     let mut link = Link::new(source.clone());
-                    Box::new(move |off, buf, stop, progress| link.fetch(off, buf, stop, progress))
+                    Box::new(move |off, buf, stop, progress| link.fetch_with(None, off, buf, stop, progress))
                 }
                 (None, Some(source)) => {
                     let mut link = link.take().unwrap_or_else(|| Link::new(source.clone()));
                     let p = self.clone();
-                    Box::new(move |off, buf, stop, progress| link.fetch_queued(&p.lanes[i], off, buf, stop, progress))
+                    Box::new(move |off, buf, stop, progress| link.fetch_with(Some(&p.lanes[i]), off, buf, stop, progress))
                 }
                 (None, None) => return self.fail("remote pages but nowhere to pull them from".into()),
             };
@@ -120,7 +120,7 @@ impl Pager {
             }
             let started = Instant::now();
             // A source that is slow, not gone: on with the rest of the run.
-            let mut retry = |e: &io::Error| partial(e) && !self.stop.load(Ordering::SeqCst);
+            let mut retry = |e: &io::Error| self.retry_fetch(e);
             let res = self.install_claimed(i, n, buf, fetch, &mut retry, |p, c, src| {
                 // Test fault `pull_enomem`.
                 if self.pull_fail.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |k| k.checked_sub(1)).is_ok() {

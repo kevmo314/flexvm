@@ -103,6 +103,10 @@ impl Pages {
 }
 
 impl Pager {
+    pub(super) fn retry_fetch(&self, e: &io::Error) -> bool {
+        partial(e) && !self.stop.load(Ordering::SeqCst)
+    }
+
     /// Queues a run of REMOTE pages a fault claimed for the fault fetcher with the fewest runs queued (see `Lane`),
     /// passing over one busy writing requests.
     pub(super) fn queue_fault(&self, job: Job) {
@@ -146,20 +150,7 @@ impl Pager {
                 return self.fail(format!("installing pages {page}+{n} for a fault kept failing for {FAULT_TIMEOUT:?}"));
             }
             let started = Instant::now();
-            // A link waits out a source outage itself (until it gives up, which is fatal); other errors are retried for
-            // a while.
-            let mut retry = |e: &io::Error| {
-                if partial(e) {
-                    // The source is slow, not gone: on with the rest.
-                    return !self.stop.load(Ordering::SeqCst);
-                }
-                let again = !fatal(e) && !self.stop.load(Ordering::SeqCst) && started.elapsed() < FAULT_TIMEOUT;
-                if again {
-                    eprintln!("uffd: fetching pages {page}+{n} for a fault: {e}; retrying");
-                    thread::sleep(BACKOFF_MIN);
-                }
-                again
-            };
+            let mut retry = |e: &io::Error| self.retry_fetch(e);
             // Test fault `fetch_tail_enomem`: once the pullers are past this run, a copy of its tail fails as if memory
             // were short.
             let tail_fail = self.tail_fail.load(Ordering::SeqCst) > 0;
@@ -365,27 +356,15 @@ impl Link {
         Link { source, client: None, down: None, retry_at: Instant::now(), backoff: BACKOFF_MIN }
     }
 
-    /// Reads guest memory at `offset` from the source, reporting `progress` as `PageClient::fetch` does (from the start
-    /// again after a reconnect). Waiting to reconnect, it sleeps until `stop` is set. Fails with TimedOut once the
-    /// outage is too long.
-    pub(super) fn fetch(&mut self, offset: u64, buf: &mut [u8], stop: &AtomicBool, progress: &mut dyn FnMut(&[u8]) -> bool) -> io::Result<()> {
-        self.fetch_with(None, offset, buf, stop, progress)
-    }
-
-    /// `fetch` for a fault fetcher: reads the reply to the front job of `lane`, whose request may be out already, the
-    /// faulting page first. With nothing to read, only connects.
-    pub(super) fn fetch_queued(
+    /// Reads guest memory, optionally from `lane`'s queued request. Reconnects until stopped or the outage is too long.
+    pub(super) fn fetch_with(
         &mut self,
-        lane: &Lane,
+        lane: Option<&Lane>,
         offset: u64,
         buf: &mut [u8],
         stop: &AtomicBool,
         progress: &mut dyn FnMut(&[u8]) -> bool,
     ) -> io::Result<()> {
-        self.fetch_with(Some(lane), offset, buf, stop, progress)
-    }
-
-    fn fetch_with(&mut self, lane: Option<&Lane>, offset: u64, buf: &mut [u8], stop: &AtomicBool, progress: &mut dyn FnMut(&[u8]) -> bool) -> io::Result<()> {
         // A fault waits for the first page of its run: it is asked for first.
         let head = if lane.is_some() { PAGE_SIZE } else { 0 };
         loop {
