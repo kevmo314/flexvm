@@ -528,6 +528,8 @@ mod tests {
         flock(&held, libc::LOCK_EX).unwrap();
         assert!(replace(&path, bytes(b"ours")).is_err());
         assert_eq!(read(&part), "theirs");
+        // Unlocked, not only closed: a child another test forks meanwhile shares the lock until it execs.
+        flock(&held, libc::LOCK_UN).unwrap();
         drop(held);
         replace(&path, bytes(b"ours")).unwrap();
         assert!(read(&path) == "ours" && !part.exists());
