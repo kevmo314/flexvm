@@ -72,7 +72,7 @@ the guest can leave any cgroup); without cgroup2 their session is killed.
   twice; a reader that fell behind the ring goes on from its start, saying
   how much was lost). There is no restart policy. Nothing beyond the entrypoint is
   assumed: distroless and scratch images work, and `flexvm exec` on an image
-  without `/bin/sh` exits 127 with a message saying so. `/dev/stdout` and
+  without `/bin/sh` fails (exit 1) with a message saying so. `/dev/stdout` and
   friends exist, so images that log to them work. With a non-root `--user`
   (or image `User`), the app runs with `no_new_privs` and no capabilities in
   its bounding set, so setuid binaries and file capabilities in the image do

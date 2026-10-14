@@ -473,7 +473,11 @@ fn record_working_set(paths: &Paths, name: &str, tap: &str, sockets: &Arc<Socket
     if tpl.meta.image.as_ref().is_some_and(|i| !i.warm) {
         guest::start_app(&fc.sockets.vsock)?;
     }
-    guest::exec(&fc.sockets.vsock, "true")?;
+    // An exec records the session path's pages, so the first exec after a restore is fast;
+    // an image with no shell can't run one, and an agent round trip stands in.
+    if guest::exec(&fc.sockets.vsock, "true").is_err() {
+        guest::ping(&fc.sockets.vsock)?;
+    }
     fc.pause()?;
     let runs = pad_runs(pager.present_runs(), crate::uffd::FAULT_AROUND as u64);
     pager.stop();
