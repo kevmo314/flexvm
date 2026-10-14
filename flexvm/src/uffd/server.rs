@@ -29,12 +29,16 @@ pub fn serve_pages(pager: &Pager, conn: &TcpStream, mut stream: impl Read + Writ
             eprintln!("page server: refusing a {len}-byte read (at most {MAX_FETCH}); dropping the connection");
             return stream.write_all(&[1]);
         }
-        // The status byte, then the pages: sent with one write.
+        // The status byte, then the pages: sent with one write. The buffer only grows (zeroed once): `read_guest`
+        // overwrites what is sent.
         pace();
-        buf.resize(1 + len, 0);
-        buf[0] = 0;
-        match pager.read_guest(offset, &mut buf[1..]) {
-            Ok(()) => stream.write_all(&buf)?,
+        if buf.len() < 1 + len {
+            buf.resize(1 + len, 0);
+        }
+        let reply = &mut buf[..1 + len];
+        reply[0] = 0;
+        match pager.read_guest(offset, &mut reply[1..]) {
+            Ok(()) => stream.write_all(reply)?,
             Err(e) => {
                 eprintln!("page server: {e}");
                 stream.write_all(&[1])?;
