@@ -466,6 +466,15 @@ impl Pager {
     /// Copies the template's recorded working set in up front, while the vCPUs are still being restored, instead of one
     /// fault at a time.
     fn prefetch(&self) {
+        while self.prefetch_pass() {
+            self.prefetching.store(RUNNING, Ordering::SeqCst);
+        }
+        self.notify();
+    }
+
+    /// One prefetch pass; true if it was cut short by `quiesce` but an abort has cleared that meanwhile and left it to
+    /// this to go on (`unquiesce` takes `prefetch_cut` only once it is published).
+    fn prefetch_pass(&self) -> bool {
         let pages = self.pages();
         let mut cut = false;
         for (mut i, end) in self.chunks(self.working_set(0, 1), PREFETCH_RUN) {
@@ -485,9 +494,12 @@ impl Pager {
                 i += n.max(1);
             }
         }
-        self.prefetch_cut.store(cut && !self.stop.load(Ordering::SeqCst), Ordering::SeqCst);
+        // Done (for now) first, so a prefetch `unquiesce` starts again is not counted as done.
         self.prefetching.store(0, Ordering::SeqCst);
-        self.notify();
+        let cut = cut && !self.stop.load(Ordering::SeqCst);
+        self.prefetch_cut.store(cut, Ordering::SeqCst);
+        // Whichever of this and `unquiesce` takes the cut back goes on.
+        cut && !self.quiesce.load(Ordering::SeqCst) && self.prefetch_cut.swap(false, Ordering::SeqCst)
     }
 
     /// Runs of pages populated so far, as `(first_page, count)`.

@@ -163,12 +163,18 @@ impl Pager {
     /// CPU time does not show). Ends early when the pager stops, a checkpoint or migration starts (`quiesce`), or write
     /// tracking is armed (the kernel refuses write-protected chunks). Once only, unless it ended for `QUIESCED`.
     pub(super) fn collapse(&self) {
-        let Some(pidfd) = self.pidfd.get() else { return };
+        while self.collapse_pass() {}
+    }
+
+    /// One pass; true if it ended for `QUIESCED` but an abort has cleared that meanwhile (`unquiesce`, finding the pass
+    /// still running, left the restart to it).
+    fn collapse_pass(&self) -> bool {
+        let Some(pidfd) = self.pidfd.get() else { return false };
         {
             let mut g = self.collapse_gate.0.lock().unwrap();
             let mut report = self.collapse_report.lock().unwrap();
             if g.running || report.as_ref().is_some_and(|r| r.stopped.as_deref() != Some(QUIESCED)) {
-                return;
+                return false;
             }
             // Until this pass ends, there is no report: as before the first.
             *report = None;
@@ -244,9 +250,12 @@ impl Pager {
                 report.stopped.as_deref().map(|s| format!("; stopped: {s}")).unwrap_or_default(),
             );
         }
+        let quiesced = report.stopped.as_deref() == Some(QUIESCED);
         let mut g = self.collapse_gate.0.lock().unwrap();
         *self.collapse_report.lock().unwrap() = Some(report);
         g.running = false;
+        // Under the gate, as `collapse_quiesced`: either `unquiesce` sees this report, or this sees its cleared flag.
+        quiesced && self.collapse_halt().is_none()
     }
 
     /// Waits while the pass is held (paused, or about to be), until it may make a call (holding the gate meanwhile),

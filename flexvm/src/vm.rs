@@ -460,12 +460,16 @@ impl Vm {
         let mut state = self.state();
         // After an unknown outcome, Firecracker says where it is; if it still cannot, the request is sent all the same.
         if matches!(state, State::Running | State::Paused) && self.switch_unsure.swap(false, Ordering::SeqCst) {
-            state = self.fc_state().unwrap_or(from);
-            if state == State::Running {
-                self.pager.hold_collapse(false);
-            }
-            if state == to {
-                *self.state.lock().unwrap() = to;
+            match self.fc_state() {
+                // Recorded whichever it is, so a failure below leaves the record right.
+                Some(now) => {
+                    state = now;
+                    *self.state.lock().unwrap() = now;
+                    if now == State::Running {
+                        self.pager.hold_collapse(false);
+                    }
+                }
+                None => state = from,
             }
         }
         match state {
@@ -491,8 +495,10 @@ impl Vm {
             Err(_) if pausing && crate::host::fault("pause_unknown") => None,
             Err(_) => self.fc_state(),
         };
-        if now.is_none() {
-            self.switch_unsure.store(true, Ordering::SeqCst);
+        match now {
+            None => self.switch_unsure.store(true, Ordering::SeqCst),
+            // Recorded whichever it is (a failed resume may find it still paused).
+            Some(s) => *self.state.lock().unwrap() = s,
         }
         if now == Some(State::Running) {
             self.pager.hold_collapse(false);
@@ -501,7 +507,6 @@ impl Vm {
             if let Err(e) = &res {
                 eprintln!("vm {}: {e}, but firecracker is {}", self.name, to.name());
             }
-            *self.state.lock().unwrap() = to;
             return Ok(());
         }
         res
