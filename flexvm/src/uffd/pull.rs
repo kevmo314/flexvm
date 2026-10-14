@@ -21,6 +21,7 @@ impl Pager {
         if file.is_none() && self.from_file.load(Ordering::SeqCst) {
             return;
         }
+        self.collapse_when_pulled();
         // The connection made for the snapshot load goes to a fault fetcher.
         let mut link = self.remote.lock().unwrap().take();
         let source = link.as_ref().map(|l| l.source.clone());

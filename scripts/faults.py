@@ -2220,6 +2220,113 @@ def cow_exact():
     rm_ckpt(path)
 
 
+def huge_mib(host, name):
+    """MiB of guest memory Firecracker holds in transparent huge pages, and its RSS."""
+    out = {}
+    for l in open(f"/proc/{fc_pid(host, name)}/smaps_rollup"):
+        k, _, v = l.partition(":")
+        if k in ("Rss", "AnonHugePages"):
+            out[k] = int(v.split()[0]) // 1024
+    return out.get("AnonHugePages", 0), out.get("Rss", 0)
+
+
+def collapse_report(host, name):
+    r = control(host, name, {"op": "debug", "what": "status"}, timeout=10)
+    return r.get("result", {}).get("collapse") if r.get("ok") else None
+
+
+def cow_collapsed():
+    """Memory a migration paged in is collapsed into huge pages once the pull is done (#141), and keeps what 4 KiB
+    pages guarantee: with the guest rewriting it, a keep-running checkpoint and a delta each hold exactly the memory at
+    their pause, the restored copy (collapsed in turn) is intact, and free page reporting still returns memory."""
+    if "[never]" in open("/sys/kernel/mm/transparent_hugepage/enabled").read():
+        raise Skip("transparent huge pages are disabled here")
+    n, paths = "ft-huge", [ckpt_path("ft-huge0"), ckpt_path("ft-huge1")]
+    ok(run(A, n))
+    code, out = sh(A, n, "dd if=/dev/urandom of=/tmp/f bs=1M count=200 2>/dev/null; md5sum /tmp/f")
+    m = out.split()[0]
+    start_writer(A, n, mib=64)
+    ok(migrate(A, n, B))
+    st = wait_released(B, n)
+    check("huge: migrated and pulled", st["released"] and st["state"] == "running", st)
+    wait_for(lambda: (collapse_report(B, n) or {}).get("done"), 60)
+    c = collapse_report(B, n)
+    huge, _ = huge_mib(B, n)
+    print(f"huge: collapse {c}, {huge} MiB in huge pages")
+    check("huge: paged-in memory collapsed into huge pages", c and c["collapsed"] >= 100 and huge >= 200, (c, huge))
+    errors, _, out = writer_check(B, n)
+    check("huge: guest memory intact after the collapse", errors == 0 and md5(B, n) == m, out)
+    fault(B, "ckpt_memhash", 120000)
+    res = [ok(checkpoint(B, n, paths[0]))]
+    time.sleep(1)
+    res.append(ok(checkpoint(B, n, paths[1], incremental=True)))
+    fault(B, "ckpt_memhash", 0)
+    print(f"huge: checkpoints paused {[r['paused_ms'] for r in res]} ms, rescues {[r['copy'].get('rescues') for r in res]}")
+    for i, p in enumerate(paths):
+        h = ckhash(B, p)
+        check(f"huge: checkpoint {i} == memory at its pause", h["hash"] == res[i]["pause_memhash"], (h["hash"], res[i]["pause_memhash"]))
+    errors, _, out = writer_check(B, n)
+    check("huge: the original is intact after the checkpoints", errors == 0, out)
+    ok(restore(A, paths[1], name="ft-huge2", ip="auto"))
+    wait_for(lambda: (collapse_report(A, "ft-huge2") or {}).get("done"), 60)
+    c = collapse_report(A, "ft-huge2")
+    errors, _, out = writer_check(A, "ft-huge2")
+    check("huge: the restored copy collapsed and intact", c and c["collapsed"] > 0 and errors == 0 and md5(A, "ft-huge2") == m, (c, out))
+    # Free page reporting discards whole 2 MiB blocks, each a whole huge page: RSS falls as before.
+    huge0, rss0 = huge_mib(A, "ft-huge2")
+    sh(A, "ft-huge2", "rm /tmp/f")
+    returned = wait_for(lambda: huge_mib(A, "ft-huge2")[1] < rss0 - 150, 30)
+    huge1, rss1 = huge_mib(A, "ft-huge2")
+    check("huge: freed memory goes back to the host", returned and huge1 < huge0, (rss0, rss1, huge0, huge1))
+    errors, _, out = writer_check(A, "ft-huge2")
+    check("huge: guest memory intact after the discards", errors == 0, out)
+    cleanup(n)
+    cleanup("ft-huge2")
+    for p in paths:
+        rm_ckpt(p)
+
+
+def unplug_collapsed():
+    """virtio-mem unplug of memory collapsed into huge pages after a migration (#141): the guest moves its pages out of
+    the blocks it gives back, Firecracker discards them (2 MiB blocks, whole huge pages), and the guest's memory stays
+    intact. PLUG_TEMPLATE picks a template with at least 1 GiB of unplugged hotplug room."""
+    n = "ft-huge-unplug"
+    m = setup(n, template=os.environ.get("PLUG_TEMPLATE"))
+    v = vms(A)[n]
+    plugged = v["plugged_mib"]
+    if v["max_mib"] - v["guest_mib"] < 1024:
+        cleanup(n)
+        raise Skip(f"template too small to plug 1 GiB more ({v['guest_mib']} of {v['max_mib']} MiB)")
+    ok(hotplug(A, n, plugged + 1024))
+    grown = wait_for(lambda: (vms(A)[n]["requested_mib"], vms(A)[n]["plugged_mib"]) == (plugged + 1024,) * 2, 60)
+    check("huge unplug: plugged 1 GiB more", grown, vms(A)[n])
+    code, out = sh(A, n, "dd if=/dev/urandom of=/tmp/g bs=1M count=1200 2>/dev/null && echo done")
+    check("huge unplug: guest filled the new memory", code == 0, out)
+    start_writer(A, n, mib=64)
+    ok(migrate(A, n, B))
+    st = wait_released(B, n)
+    check("huge unplug: migrated and pulled", st["released"] and st["state"] == "running", st)
+    wait_for(lambda: (collapse_report(B, n) or {}).get("done"), 60)
+    c = collapse_report(B, n)
+    huge0, rss0 = huge_mib(B, n)
+    check("huge unplug: memory collapsed", c and c["collapsed"] >= 200, (c, huge0))
+    discards0 = control(B, n, {"op": "debug", "what": "status"})["result"]["discards"]
+    sh(B, n, "rm /tmp/g")
+    ok(hotplug(B, n, plugged))
+    # The guest may not manage to empty every block; a shrink it cannot finish settles at what is plugged.
+    hp = lambda: (vms(B)[n]["requested_mib"], vms(B)[n]["plugged_mib"])
+    done = wait_for(lambda: hp()[0] == hp()[1] <= plugged + 512, 60)
+    st = control(B, n, {"op": "debug", "what": "status"})["result"]
+    huge1, rss1 = huge_mib(B, n)
+    print(f"huge unplug: {huge0} -> {huge1} MiB huge, RSS {rss0} -> {rss1} MiB, discards {discards0} -> {st['discards']}")
+    check("huge unplug: unplugged at least half the collapsed memory", done and st["discards"] > discards0 and not st["failed"],
+          (plugged, hp(), st["failed"]))
+    check("huge unplug: memory went back to the host", rss1 < rss0 - 500, (rss0, rss1))
+    errors, _, out = writer_check(B, n)
+    check("huge unplug: guest memory intact", errors == 0 and md5(B, n) == m, out)
+    cleanup(n)
+
+
 def cow_abort():
     """A copy that fails half way (and one that a kill cuts short) publishes
     nothing; the VM runs on unharmed, and the next checkpoint is complete."""
@@ -4716,7 +4823,7 @@ SCENARIOS = dict(
     checkpoint_restore=checkpoint_restore, checkpoint_fork=checkpoint_fork, checkpoint_corrupt=checkpoint_corrupt,
     checkpoint_crash=checkpoint_crash, pause_resume=pause_resume, signals=signals, suspend_resume=suspend_resume,
     suspend_gen=suspend_gen, checkpoint_hotplug=checkpoint_hotplug, checkpoint_untrusted_dir=checkpoint_untrusted_dir,
-    resume_failures=resume_failures, held_restore_frozen=held_restore_frozen, cow_exact=cow_exact, cow_abort=cow_abort,
+    resume_failures=resume_failures, held_restore_frozen=held_restore_frozen, cow_exact=cow_exact, cow_collapsed=skippable(cow_collapsed), unplug_collapsed=skippable(unplug_collapsed), cow_abort=cow_abort,
     cow_crash=cow_crash, cow_reports_held=cow_reports_held, ckpt_incremental=ckpt_incremental,
     ckpt_failed_stop=ckpt_failed_stop, ckpt_rearm=ckpt_rearm, ckpt_dir_moved=ckpt_dir_moved,
     prepare_disconnect=prepare_disconnect, prepare_trickle=prepare_trickle, prepare_fail=prepare_fail,

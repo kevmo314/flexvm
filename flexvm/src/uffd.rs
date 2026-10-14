@@ -25,7 +25,8 @@
 //! them (see `cow`).
 //!
 //! Page states, claims and bitmaps live in `pages`; `event` handles faults, `fetch` services their remote runs, and
-//! `pull` brings the rest in. `server` reads the paused source, and `wp` handles write tracking and COW.
+//! `pull` brings the rest in, and `collapse` turns what was paged in into huge pages afterwards. `server` reads the
+//! paused source, and `wp` handles write tracking and COW.
 
 use std::io::{self, IoSliceMut};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -44,6 +45,7 @@ use crate::cow::Cow;
 use crate::template::Template;
 use crate::util::{Result, PAGE_SIZE};
 
+mod collapse;
 mod event;
 mod fetch;
 mod pages;
@@ -248,6 +250,8 @@ pub struct Pager {
     /// Pages `[next, end)` past the latest REMOTE fault, which the pullers take before going on with their share
     /// (`steered`).
     steer: Mutex<(usize, usize)>,
+    /// What the pass collapsing paged-in memory into huge pages did, once done (see `collapse`).
+    collapse_report: Mutex<Option<collapse::CollapseReport>>,
 }
 
 impl Pager {
@@ -297,6 +301,7 @@ impl Pager {
             fault_stats: FaultStats::new(),
             lanes: Default::default(),
             steer: Mutex::new((0, 0)),
+            collapse_report: Mutex::new(None),
         });
         let p = pager.clone();
         let thread = thread::Builder::new().name("uffd".into()).spawn(move || {
