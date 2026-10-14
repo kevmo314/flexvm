@@ -4664,6 +4664,55 @@ def pull_died():
     cleanup(n)
 
 
+def route_abort():
+    """#231: a source whose route switch failed retries it in the background. Its target
+    then dies mid-pull, so the source aborts and runs its copy again; the retry, which the
+    abort left with the same holder and generation, must not route the address to the dead
+    target afterwards. B advertises an underlay that is not a local address (the default
+    gateway), so the source's switch is a real route the kernel keeps."""
+    n = "ft-route-abort"
+    scenario_vms.add(n)
+    gw = subprocess.run(["ip", "route", "show", "default"], capture_output=True, text=True).stdout.split()[2]
+    code, out, err = cli(B, "config", "--underlay", gw)
+    assert code == 0, err
+    ip = None
+    try:
+        m = setup(n, mib=1000)
+        ip = vm_ip(A, n)
+        tcp_server(A, n)
+        fault(A, "route", 120000)
+        stall = threading.Timer(0.2, lambda: fault(A, "pages", 120000))
+        stall.start()
+        r = ok(migrate(A, n, B))
+        stall.join()
+        check("route abort: the route switch failed, so it is retried", r["reroute_error"] is not None, r["reroute_error"])
+        os.kill(vms(B)[n]["firecracker"], signal.SIGKILL)
+        check("route abort: the target fails", wait_for(lambda: vms(B).get(n, {}).get("state") == "failed", 10), vms(B).get(n))
+        fault(A, "pages", 0)
+        check("route abort: the source runs its copy again", wait_for(lambda: vms(A).get(n, {}).get("state") == "running", 60), where(n))
+        # The retry's next try (at most 5 s away) goes through now; watch past it.
+        fault(A, "route", 0)
+        routes, unreached, end = set(), [], time.time() + 12
+        while time.time() < end:
+            routes.add(peer_route(ip))
+            try:
+                with socket.create_connection((ip, 7000), timeout=1) as c:
+                    c.settimeout(1)
+                    if not echo(c, b"ping\n"):
+                        unreached.append(round(end - time.time(), 1))
+            except OSError:
+                unreached.append(round(end - time.time(), 1))
+            time.sleep(0.2)
+        check("route abort: the address never routes to the dead target", not any(f"via {gw}" in r for r in routes), routes)
+        check("route abort: the resumed vm stays reachable", not unreached, unreached)
+        check("route abort: the retry stopped with the abort", "dropped, migration" in log(A, n), log(A, n)[-1500:])
+        check("route abort: md5 intact on A", md5(A, n) == m)
+    finally:
+        cli(B, "config", "--underlay", "")
+        if ip and f"via {gw}" in peer_route(ip):
+            subprocess.run(["ip", "route", "del", f"{ip}/32"], capture_output=True)
+
+
 def arrival_overtaken():
     """Operations that change who owns a VM wait for its arrival to settle
     (every page in, the migration released, a home loan taken back), or are
@@ -5514,6 +5563,7 @@ SCENARIOS = dict(
     source_killed_basic=source_killed_basic,
     arrival_overtaken=arrival_overtaken,
     pull_died=pull_died,
+    route_abort=route_abort,
     uffd_err=uffd_err,
     mem_high=no_evict(skippable(mem_high)), mem_high_migrate=no_evict(skippable(mem_high_migrate)),
     mem_high_evict=skippable(mem_high_evict), evict_grower=skippable(evict_grower), evict_no_pingpong=evict_no_pingpong, evict_skips_cmd=evict_skips_cmd, cmd_flag=cmd_flag, standby_stop_claim=standby_stop_claim, evict_latency=skippable(evict_latency),
