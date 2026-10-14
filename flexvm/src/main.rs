@@ -289,10 +289,13 @@ fn kill(host: &Host, name: &str) -> Result<()> {
         return Err(format!("vm {name} is the source of a migration in progress; it ends once the target has its memory (kill it where it runs)").into());
     }
     if let Ok(vm) = host.signal(name, libc::SIGINT) {
-        return match vm.wait(Duration::from_secs(30)) {
-            true => Ok(()),
-            false => Err(format!("vm {name} is still there; see its log").into()),
-        };
+        if !vm.wait(Duration::from_secs(30)) {
+            return Err(format!("vm {name} is still there; see its log").into());
+        }
+        // A suspend that finished first is undone: the kill wins.
+        if !host.suspended(name).exists() {
+            return Ok(());
+        }
     }
     if host.suspended(name).exists() {
         let _lock = host.take_name(name, true)?;

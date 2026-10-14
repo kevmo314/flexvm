@@ -54,8 +54,10 @@ impl Proc {
             true => self.op_now().ok_or_else(|| format!("vm {}: {}", vm.name, crate::vmproc::BUSY))?,
             false => self.op_within()?,
         };
-        let settled = self.settle_arrival(&op, if if_idle { Duration::ZERO } else { ARRIVAL_WAIT });
-        settled.map_err(|e| if if_idle { format!("{e}; {}", crate::vmproc::BUSY).into() } else { e })?;
+        if if_idle && self.arrived.lock().unwrap().is_some() {
+            bail!("vm {} is still arriving; {}", vm.name, crate::vmproc::BUSY);
+        }
+        self.settle_arrival(&op, ARRIVAL_WAIT)?;
         vm.template.verify(&self.paths, true)?;
         let settle = Instant::now();
         vm.settle_hotplug(settle + crate::lifecycle::SETTLE_WAIT)?;

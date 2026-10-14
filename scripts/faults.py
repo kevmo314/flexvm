@@ -206,7 +206,7 @@ FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_be
           "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "resume_kill",
           "prepare_fail", "short_incoming", "slow_preload", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
           "started_fsync", "started_unmark", "start_stall", "incoming_stall", "claim_stall", "ckpt_wp_race",
-          "fetch_tail_enomem", "fetch_enomem_stuck", "publish", "no_evict")
+          "fetch_tail_enomem", "fetch_enomem_stuck", "publish", "no_evict", "suspend_stall")
 
 
 def disarm():
@@ -2782,6 +2782,32 @@ def arrival_overtaken():
     cleanup(n)
 
 
+def suspend_killed():
+    """SIGINT means destroy, and it wins over a suspend: a kill that comes
+    while the suspend is publishing its checkpoint revokes the checkpoint
+    (no suspended VM is left, its address is withdrawn), and `kill` undoes a
+    suspend that finished first."""
+    n = "ft-susp-killed"
+    setup(n, mib=20)
+    ip = vms(A)[n]["ip"]
+    pid = vm_pid(A, n)
+    fault(A, "suspend_stall", 10000)
+    os.kill(pid, signal.SIGTERM)
+    d = os.path.join(A.state, "suspended", n)
+    check("suspend killed: published", wait_for(lambda: os.path.exists(os.path.join(d, "manifest.json")), 30), d)
+    os.kill(pid, signal.SIGINT)
+    check("suspend killed: the process ends", wait_for(lambda: not alive(pid), 30), pid)
+    fault(A, "suspend_stall", 0)
+    check("suspend killed: no suspended vm left", n not in vms(A) and not os.path.exists(d), (vms(A).get(n), os.path.exists(d)))
+    check("suspend killed: address withdrawn", not addr(A, ip).get("holder") and addr(A, ip).get("withdrawn"), addr(A, ip))
+    # A suspend that is done before the kill: `kill` still destroys it.
+    setup(n, mib=20)
+    pid = vm_pid(A, n)
+    os.kill(pid, signal.SIGTERM)
+    r = kill(A, n)
+    check("suspend killed: kill after a suspend destroys it", r["ok"] and n not in vms(A) and not os.path.exists(d), (r, vms(A).get(n)))
+
+
 def no_evict(scenario):
     """Runs a scenario that grows guests on purpose with pressure eviction
     off on both hosts: how much the host has free must not move its VMs."""
@@ -2833,6 +2859,7 @@ def source_killed_basic():
 
 
 SCENARIOS = dict(
+    suspend_killed=suspend_killed,
     source_unpublished=source_unpublished,
     source_killed_basic=source_killed_basic,
     arrival_overtaken=arrival_overtaken,

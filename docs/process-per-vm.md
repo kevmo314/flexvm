@@ -62,6 +62,10 @@ control request, controller resize, clock step, deleting a consumed
 checkpoint) holds the VM's operation mutex. Requests give up after 30 s;
 what must not be refused (SIGINT, SIGTERM, a dead VM, the end of a
 migration) waits for it, after cancelling a checkpoint in progress.
+SIGTERM's suspend runs off the signal thread, so a SIGINT after it is still
+taken; SIGINT wins: a suspend that published its checkpoint meanwhile
+revokes it (discarded, address withdrawn) and the process exits destroyed,
+and `flexvm kill` discards one that finished first (`suspend_killed`).
 
 `kill -KILL` on a migration source is the operator's way to give up its
 copy (the target loses the pages it has not pulled); `flexvm kill` refuses.

@@ -145,6 +145,16 @@ impl Proc {
             self.publish();
             saved
         })();
+        // A kill asked for meanwhile (SIGINT means destroy) revokes what was published.
+        if saved.is_ok() {
+            crate::host::stall("suspend_stall");
+        }
+        if saved.is_ok() && vm.cancel_checkpoint.load(Ordering::SeqCst) > 0 {
+            if let Err(e) = discard(&self.host, &vm.name) {
+                eprintln!("vm {}: killed while suspending; revoking its checkpoint: {e}", vm.name);
+            }
+            self.finish(&op, End::Gone, 0, None)
+        }
         match saved {
             Ok((m, _)) => {
                 let data = (m.data_pages * PAGE_SIZE as u64) >> 20;

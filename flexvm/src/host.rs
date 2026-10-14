@@ -122,13 +122,40 @@ impl Host {
     /// Reentrant within a thread (so a guard dropped under it cannot
     /// deadlock); other threads wait as other processes do.
     pub fn lock(&self) -> Result<Locked> {
+        self.lock_by(None)
+    }
+
+    /// Gives up at `deadline`, if any.
+    pub fn lock_by(&self, deadline: Option<std::time::Instant>) -> Result<Locked> {
         if DEPTH.with(|d| d.get()) > 0 {
             DEPTH.with(|d| d.set(d.get() + 1));
             return Ok(Locked(None));
         }
-        let threads = THREADS.lock().unwrap_or_else(|e| e.into_inner());
+        let past = || deadline.is_some_and(|d| std::time::Instant::now() >= d);
+        let threads = match deadline {
+            None => THREADS.lock().unwrap_or_else(|e| e.into_inner()),
+            Some(_) => loop {
+                match THREADS.try_lock() {
+                    Ok(g) => break g,
+                    Err(std::sync::TryLockError::Poisoned(e)) => break e.into_inner(),
+                    Err(_) if past() => bail!("the host lock is busy"),
+                    Err(_) => std::thread::sleep(Duration::from_millis(2)),
+                }
+            },
+        };
         let f = File::options().create(true).truncate(false).write(true).open(self.state.join("lock"))?;
-        flock(&f, libc::LOCK_EX)?;
+        match deadline {
+            None => flock(&f, libc::LOCK_EX)?,
+            Some(_) => while let Err(e) = flock(&f, libc::LOCK_EX | libc::LOCK_NB) {
+                if e.raw_os_error() != Some(libc::EWOULDBLOCK) {
+                    return Err(e.into());
+                }
+                if past() {
+                    bail!("the host lock is busy");
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            },
+        }
         DEPTH.with(|d| d.set(1));
         Ok(Locked(Some((f, threads))))
     }
@@ -552,7 +579,7 @@ impl MigRecord {
     pub fn release(&self, home: Option<(Ipv4Addr, u64)>, within: Option<Duration>) -> Result<()> {
         let (mut delay, start) = (Duration::from_millis(100), std::time::Instant::now());
         loop {
-            let done = self.host.lock().and_then(|l| {
+            let done = self.host.lock_by(within.map(|w| start + w)).and_then(|l| {
                 store(&self.host.mig_path(self.id), &Mig::Released { source: self.source.clone(), by: self.by.clone() }, true)?;
                 match home {
                     Some((ip, gen)) => self.host.update(&l, ip, true, |a| a.lent = a.lent.filter(|&lent| lent > gen)),
@@ -778,24 +805,36 @@ pub fn write_file(dir: &Path, name: &str, data: &[u8], durable: bool) -> std::io
 /// Some(true) only on proof the process is gone (another boot, no such pid,
 /// a zombie, or another process with its pid); None when that cannot be told.
 pub fn gone(id: &Ident) -> Option<bool> {
-    if boot_id().is_empty() {
+    gone_by(id, boot_id(), |pid| std::fs::read_to_string(format!("/proc/{pid}/stat")))
+}
+
+/// Every error, and anything unparsable, is unknown.
+fn gone_by(id: &Ident, boot: &str, stat: impl Fn(u32) -> std::io::Result<String>) -> Option<bool> {
+    if boot.is_empty() {
         return None;
     }
-    if id.boot != boot_id() {
+    if id.boot != boot {
         return Some(true);
     }
-    match std::fs::read_to_string(format!("/proc/{}/stat", id.pid)) {
+    match stat(id.pid) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(true),
         Err(_) => None,
-        Ok(_) => starttime(id.pid).map(|s| s != id.start).or(Some(true)),
+        Ok(text) => match parse_stat(&text)? {
+            ("Z", _) => Some(true),
+            (_, start) => Some(start != id.start),
+        },
     }
+}
+
+/// State and start time from `/proc/PID/stat`.
+fn parse_stat(stat: &str) -> Option<(&str, u64)> {
+    let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+    Some((fields.first()?, fields.get(19)?.parse().ok()?))
 }
 
 pub fn starttime(pid: u32) -> Option<u64> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
-    (fields.first() != Some(&"Z")).then_some(())?;
-    fields.get(19)?.parse().ok()
+    parse_stat(&stat).filter(|(state, _)| *state != "Z").map(|(_, start)| start)
 }
 
 /// Test faults (`RUN/faults.json`); only with FLEXVM_FAULTS=1.
@@ -1028,6 +1067,27 @@ mod tests {
         for other in [Ident { boot: "other".into(), ..me.clone() }, Ident { pid: 999_999_999, ..me.clone() }, Ident { start: me.start + 1, ..me.clone() }] {
             assert_eq!(gone(&other), Some(true), "{other:?}");
         }
+        // A bounded lock gives up while another thread holds it.
+        let (held, release) = (std::sync::mpsc::channel(), std::sync::mpsc::channel::<()>());
+        let other = h.clone();
+        let t = std::thread::spawn(move || {
+            let _l = other.lock().unwrap();
+            held.0.send(()).unwrap();
+            release.1.recv().unwrap();
+        });
+        held.1.recv().unwrap();
+        let start = std::time::Instant::now();
+        assert!(h.lock_by(Some(start + Duration::from_millis(50))).is_err() && start.elapsed() < Duration::from_secs(1));
+        release.0.send(()).unwrap();
+        t.join().unwrap();
+        assert!(h.lock_by(Some(std::time::Instant::now() + Duration::from_secs(1))).is_ok());
+        // Errors and garbage are unknown, never gone; a zombie is gone.
+        let emfile = |_| Err(std::io::Error::from_raw_os_error(libc::EMFILE));
+        assert_eq!(gone_by(&me, boot_id(), emfile), None);
+        assert_eq!(gone_by(&me, boot_id(), |_| Ok("garbage".into())), None);
+        assert_eq!(gone_by(&me, "", |_| Ok(String::new())), None);
+        let zombie = format!("1 (x) Z {}", "0 ".repeat(18) + &me.start.to_string());
+        assert_eq!(gone_by(&me, boot_id(), |_| Ok(zombie.clone())), Some(true));
         // A dead owner's goes, as asking would make it go.
         store(&h.mig_path(9), &Mig::Committed { owner: dead_owner(&h, 999_999_909, &[]) }, false).unwrap();
         h.retire_migrations();
