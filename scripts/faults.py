@@ -1890,16 +1890,23 @@ def ckpt_incremental():
         errors, _, out = writer_check(B, x)
         check(f"incremental: restore of link {i} intact", errors == 0 and md5(B, x).startswith(m), out)
         cleanup(x)
-    # A VM that stops is never stopped onto a chain whose page data is bad.
+    # A VM that stops is never stopped onto a chain whose page data is bad. Every 64th page
+    # of the base is: the deltas replace some of its pages, never all of these (/tmp/f's).
     pages = os.path.join(paths[0], "pages")
-    good = open(pages, "rb").read(4096)
+    good = {}
     with open(pages, "r+b") as f:
-        f.write(bytes([good[0] ^ 1]) + good[1:])
+        for off in range(0, os.path.getsize(pages), 64 * 4096):
+            f.seek(off)
+            good[off] = f.read(1)
+            f.seek(off)
+            f.write(bytes([good[off][0] ^ 1]))
     r = checkpoint(A, n, paths[2] + "s", stop=True, incremental=True)
     check("incremental: no --stop delta onto corrupt parent data", not r["ok"] and "checksum" in r["error"] and not os.path.exists(paths[2] + "s"), r)
     check("incremental: VM runs on after that refusal", where(n) == {A: "running"}, where(n))
     with open(pages, "r+b") as f:
-        f.write(good)
+        for off, b in good.items():
+            f.seek(off)
+            f.write(b)
     # No delta onto a chain whose older ancestor has gone.
     os.rename(paths[0], paths[0] + ".moved")
     r = checkpoint(A, n, paths[2] + "x", incremental=True)
@@ -2313,11 +2320,12 @@ def cow_grow():
     still = vms(A).get(n, {}).get("checkpoint_copy")
     stop.set()
     w.join()
+    # The copy needed to crawl only while the guest grew; the rest goes at full speed.
+    fault(A, "ckpt_crawl", 0)
     check("cow grow: the guest filled 2 GiB more than it had, no OOM", code == 0 and out == str(fill // 64 * 64), (code, out[-200:]))
     check("cow grow: it grew while the copy ran", seen["max"] >= plugged0 + 1024, (plugged0, seen))
     print(f"cow grow: plugged {plugged0} -> {seen['max']} MiB during the copy; copy still running after the fill: {still}")
     t.join()
-    fault(A, "ckpt_crawl", 0)
     fault(A, "ckpt_memhash", 0)
     r = res.get("r", {})
     check("cow grow: checkpoint written", r.get("ok"), r)
@@ -2999,6 +3007,7 @@ try:
     for s in names:
         scenario_vms.clear()
         scenario_checkpoints.clear()
+        started, before = time.time(), failures
         try:
             SCENARIOS[s]()
         except Exception as e:
@@ -3011,6 +3020,7 @@ try:
                     kill(h, n)
             for path in scenario_checkpoints:
                 rm_ckpt(path)
+            print(f"scenario {s}: {'ok' if failures == before else 'FAILED'} in {time.time() - started:.1f} s", flush=True)
 finally:
     stop_listeners()
 print("failures:", failures)
