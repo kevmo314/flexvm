@@ -24,12 +24,16 @@ pub const API_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct NotSent(String);
 
 impl std::fmt::Display for NotSent {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { f.write_str(&self.0) }
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 impl std::error::Error for NotSent {}
 
-pub fn not_sent(e: &crate::util::Error) -> bool { e.downcast_ref::<NotSent>().is_some() }
+pub fn not_sent(e: &crate::util::Error) -> bool {
+    e.downcast_ref::<NotSent>().is_some()
+}
 
 pub struct Firecracker {
     child: Child,
@@ -68,13 +72,21 @@ impl Firecracker {
         Ok(fc)
     }
 
-    pub fn pid(&self) -> u32 { self.child.id() }
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
 
-    pub fn put(&self, path: &str, body: Value) -> Result<Value> { self.request("PUT", path, Some(body)) }
+    pub fn put(&self, path: &str, body: Value) -> Result<Value> {
+        self.request("PUT", path, Some(body))
+    }
 
-    pub fn patch(&self, path: &str, body: Value) -> Result<Value> { self.request("PATCH", path, Some(body)) }
+    pub fn patch(&self, path: &str, body: Value) -> Result<Value> {
+        self.request("PATCH", path, Some(body))
+    }
 
-    pub fn get(&self, path: &str) -> Result<Value> { self.request("GET", path, None) }
+    pub fn get(&self, path: &str) -> Result<Value> {
+        self.request("GET", path, None)
+    }
 
     /// With no `clock_realtime`, only prepares the load (`firecracker/0002-*.patch`).
     pub fn load_snapshot(&self, vmstate: &Path, tap: &str, clock_realtime: Option<bool>, timeout: Duration) -> Result<Value> {
@@ -90,9 +102,13 @@ impl Firecracker {
         self.request_within("PUT", "/snapshot/load", Some(body), timeout)
     }
 
-    pub fn pause(&self) -> Result<()> { self.patch("/vm", serde_json::json!({"state": "Paused"})).map(|_| ()) }
+    pub fn pause(&self) -> Result<()> {
+        self.patch("/vm", serde_json::json!({"state": "Paused"})).map(|_| ())
+    }
 
-    pub fn resume(&self) -> Result<()> { self.patch("/vm", serde_json::json!({"state": "Resumed"})).map(|_| ()) }
+    pub fn resume(&self) -> Result<()> {
+        self.patch("/vm", serde_json::json!({"state": "Resumed"})).map(|_| ())
+    }
 
     /// Every call has a deadline, so none can hold a VM's API lock forever.
     fn request(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value> {
@@ -103,7 +119,9 @@ impl Firecracker {
         self.api.request(&self.sockets.api, method, path, body, timeout)
     }
 
-    pub fn alive(&mut self) -> bool { matches!(self.child.try_wait(), Ok(None)) }
+    pub fn alive(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
 
     pub fn post_mortem(&mut self, dir: &Path) -> String {
         let status = match self.child.try_wait() {
@@ -130,7 +148,9 @@ impl Firecracker {
 
 /// Calls on a VM hold its `fc` mutex; idle Firecrackers have one owner.
 #[derive(Default)]
-struct Api { connection: RefCell<Option<BufReader<crate::util::By<UnixStream>>>> }
+struct Api {
+    connection: RefCell<Option<BufReader<crate::util::By<UnixStream>>>>,
+}
 
 impl Api {
     fn request(&self, socket: &Path, method: &str, path: &str, body: Option<Value>, timeout: Duration) -> Result<Value> {
@@ -263,11 +283,18 @@ fn log_tail(r: &mut (impl Read + Seek)) -> std::io::Result<String> {
 }
 
 impl Drop for Firecracker {
-    fn drop(&mut self) { self.kill(); }
+    fn drop(&mut self) {
+        self.kill();
+    }
 }
 
 /// Dropping it kills the Firecracker and removes its directory, cgroup and tap.
-pub struct Idle { pub fc: Firecracker, pub dir: PathBuf, pub cgroup: Option<PathBuf>, pub tap: String }
+pub struct Idle {
+    pub fc: Firecracker,
+    pub dir: PathBuf,
+    pub cgroup: Option<PathBuf>,
+    pub tap: String,
+}
 
 impl Idle {
     pub fn into_parts(self) -> (Firecracker, PathBuf, Option<PathBuf>, String) {
@@ -310,7 +337,9 @@ impl Spawner {
         Spawner { bin: bin.into(), root: root.into(), sockets, cgroups, tap_prefix: tap_prefix.into(), next: AtomicU64::new(0) }
     }
 
-    pub fn take(&self) -> Result<Idle> { self.take_by(None) }
+    pub fn take(&self) -> Result<Idle> {
+        self.take_by(None)
+    }
 
     pub fn take_by(&self, deadline: Option<std::time::Instant>) -> Result<Idle> {
         let ready = match deadline {
@@ -363,7 +392,10 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::thread::JoinHandle;
 
-    struct Server { path: PathBuf, thread: Option<JoinHandle<()>> }
+    struct Server {
+        path: PathBuf,
+        thread: Option<JoinHandle<()>>,
+    }
 
     impl Server {
         fn new(f: impl FnOnce(UnixListener) + Send + 'static) -> Self {
@@ -413,7 +445,9 @@ mod tests {
         r.get_mut().write_all(response).unwrap();
     }
 
-    fn no_more(listener: &UnixListener) { assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock)); }
+    fn no_more(listener: &UnixListener) {
+        assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+    }
 
     const NO_CONTENT: &[u8] = b"HTTP/1.1 204 No Content\r\n\r\n";
 
@@ -483,7 +517,11 @@ mod tests {
 
     #[test]
     fn api_stalled_response_keeps_one_deadline_and_drops_connection() {
-        for response in [&b""[..], &b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n"[..], &b"HTTP/1.1 200 OK\r\nContent-Length:"[..]] {
+        for response in [
+            &b""[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length:"[..],
+        ] {
             let server = Server::new(move |listener| {
                 let mut r = accept(&listener);
                 read_request(&mut r);
@@ -551,7 +589,9 @@ mod tests {
     }
 
     impl<R: Seek> Seek for Counted<R> {
-        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> { self.inner.seek(pos) }
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(pos)
+        }
     }
 
     #[test]

@@ -31,10 +31,14 @@ fn update_sw(mut c: u32, bytes: &[u8]) -> u32 {
 }
 
 #[cfg(target_arch = "x86_64")]
-fn has_sse42() -> bool { std::arch::is_x86_feature_detected!("sse4.2") }
+fn has_sse42() -> bool {
+    std::arch::is_x86_feature_detected!("sse4.2")
+}
 
 #[cfg(not(target_arch = "x86_64"))]
-fn has_sse42() -> bool { false }
+fn has_sse42() -> bool {
+    false
+}
 
 fn update(c: u32, bytes: &[u8]) -> u32 {
     #[cfg(target_arch = "x86_64")]
@@ -45,7 +49,9 @@ fn update(c: u32, bytes: &[u8]) -> u32 {
     update_sw(c, bytes)
 }
 
-pub fn crc32c(bytes: &[u8]) -> u32 { !update(!0, bytes) }
+pub fn crc32c(bytes: &[u8]) -> u32 {
+    !update(!0, bytes)
+}
 
 #[cfg(target_arch = "x86_64")]
 const STREAM: usize = crate::util::PAGE_SIZE / 24 * 8;

@@ -42,10 +42,18 @@ pub struct Holder {
     routes: Mutex<()>,
 }
 
-struct Entry { mig: u64, q: Mutex<Queue> }
+struct Entry {
+    mig: u64,
+    q: Mutex<Queue>,
+}
 
 #[derive(Default)]
-struct Queue { packets: VecDeque<Vec<u8>>, bytes: usize, releasing: bool, dropped: u64 }
+struct Queue {
+    packets: VecDeque<Vec<u8>>,
+    bytes: usize,
+    releasing: bool,
+    dropped: u64,
+}
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Stats {
@@ -101,7 +109,9 @@ impl Holder {
         self.entry(ip).is_some_and(|e| e.mig == mig && !e.q.lock().unwrap().releasing)
     }
 
-    fn entry(&self, ip: Ipv4Addr) -> Option<Arc<Entry>> { self.held.lock().unwrap().get(&ip).cloned() }
+    fn entry(&self, ip: Ipv4Addr) -> Option<Arc<Entry>> {
+        self.held.lock().unwrap().get(&ip).cloned()
+    }
 
     /// None if not held or already being released.
     fn releasing(&self, ip: Ipv4Addr, mig: u64) -> Option<Arc<Entry>> {
@@ -315,7 +325,9 @@ impl Injector {
     }
 
     /// Includes the guest's own traffic.
-    pub fn dropped(&self) -> u64 { tap_tx_dropped(&self.tap).saturating_sub(self.tx_dropped) }
+    pub fn dropped(&self) -> u64 {
+        tap_tx_dropped(&self.tap).saturating_sub(self.tx_dropped)
+    }
 }
 
 fn tap_tx_dropped(tap: &str) -> u64 {
@@ -331,14 +343,21 @@ const MAX_RECEIVERS: usize = 8;
 static RECEIVERS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Default)]
-pub struct Received { pub injected: u64, pub dropped: u64, pub ended: bool, pub next: u64 }
+pub struct Received {
+    pub injected: u64,
+    pub dropped: u64,
+    pub ended: bool,
+    pub next: u64,
+}
 
 fn read_by(r: &mut BufReader<By<TcpStream>>, buf: &mut [u8], deadline: Instant) -> std::io::Result<()> {
     r.get_mut().at = deadline;
     r.read_exact(buf)
 }
 
-fn write_by(w: &TcpStream, buf: &[u8], deadline: Instant) -> std::io::Result<()> { By { s: w, at: deadline }.write_all(buf) }
+fn write_by(w: &TcpStream, buf: &[u8], deadline: Instant) -> std::io::Result<()> {
+    By { s: w, at: deadline }.write_all(buf)
+}
 
 pub fn wait_start(r: &mut BufReader<By<TcpStream>>, deadline: Instant) -> bool {
     let mut head = [0u8; 4];

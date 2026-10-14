@@ -20,7 +20,9 @@ pub const TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The connection broke before the guest answered (e.g. a restore reset vsock): unlike an
 /// answer, worth another try.
-fn lost(why: impl Into<String>) -> Error { std::io::Error::new(ErrorKind::ConnectionAborted, why.into()).into() }
+fn lost(why: impl Into<String>) -> Error {
+    std::io::Error::new(ErrorKind::ConnectionAborted, why.into()).into()
+}
 
 /// As opposed to the guest answering, or not answering in time.
 pub fn dropped(e: &Error) -> bool {
@@ -48,7 +50,9 @@ pub fn answered<T>(what: &'static str, deadline: Instant, mut attempt: impl FnMu
 
 static RETRIES: Mutex<BTreeMap<&'static str, u64>> = Mutex::new(BTreeMap::new());
 
-pub fn retries() -> BTreeMap<&'static str, u64> { RETRIES.lock().unwrap().clone() }
+pub fn retries() -> BTreeMap<&'static str, u64> {
+    RETRIES.lock().unwrap().clone()
+}
 
 /// Sends `line` in the same write as CONNECT: Firecracker forwards what follows its newline
 /// once the guest accepts, saving a round trip.
@@ -276,9 +280,13 @@ pub fn start_app(uds: &Path) -> Result<u32> {
 }
 
 /// `idle`, `running <pid>` or `exited <code>`.
-pub fn app_status(uds: &Path) -> Result<String> { message(uds, "APPSTATUS", TIMEOUT) }
+pub fn app_status(uds: &Path) -> Result<String> {
+    message(uds, "APPSTATUS", TIMEOUT)
+}
 
-pub fn probe(uds: &Path, port: u16) -> Result<bool> { Ok(message(uds, &format!("PROBE {port}"), TIMEOUT)? == "ok") }
+pub fn probe(uds: &Path, port: u16) -> Result<bool> {
+    Ok(message(uds, &format!("PROBE {port}"), TIMEOUT)? == "ok")
+}
 
 pub fn check(uds: &Path, cmd: &str, timeout: Duration) -> Result<bool> {
     let hex: String = cmd.bytes().map(|b| format!("{b:02x}")).collect();
@@ -311,7 +319,9 @@ mod tests {
         wire
     }
 
-    fn at(offset: u64, data: &[u8]) -> Vec<u8> { [&offset.to_le_bytes()[..], data].concat() }
+    fn at(offset: u64, data: &[u8]) -> Vec<u8> {
+        [&offset.to_le_bytes()[..], data].concat()
+    }
 
     #[test]
     fn exec_output_follows_a_session_to_its_exit() {

@@ -33,7 +33,9 @@ pub const SLOT_MIB: u64 = 1024;
 pub const STEP_MIB: u64 = 128;
 /// Hot-plugged memory is movable, so the page structs of all of it (1/64) must fit in boot
 /// memory: a 256 MiB base OOMs near 11 GiB plugged.
-pub fn base_mib(max_mib: u64) -> u64 { (256 + max_mib / 32).div_ceil(STEP_MIB) * STEP_MIB }
+pub fn base_mib(max_mib: u64) -> u64 {
+    (256 + max_mib / 32).div_ceil(STEP_MIB) * STEP_MIB
+}
 
 /// Plugged in the snapshot (untouched, it costs nothing), so early allocations never wait
 /// on the host; the controller never shrinks a VM below it.
@@ -74,18 +76,31 @@ pub(crate) struct Stamp {
 
 impl Stamp {
     pub(crate) fn of(m: &std::fs::Metadata) -> Self {
-        Self { size: m.len(), mtime: m.mtime(), mtime_nsec: m.mtime_nsec(), ctime: m.ctime(), ctime_nsec: m.ctime_nsec(), inode: m.ino(), device: m.dev() }
+        Self {
+            size: m.len(),
+            mtime: m.mtime(),
+            mtime_nsec: m.mtime_nsec(),
+            ctime: m.ctime(),
+            ctime_nsec: m.ctime_nsec(),
+            inode: m.ino(),
+            device: m.dev(),
+        }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct Component { pub(crate) hash: String, pub(crate) metadata: Stamp }
+pub(crate) struct Component {
+    pub(crate) hash: String,
+    pub(crate) metadata: Stamp,
+}
 
 /// An identity check for trusted files, not protection against tampering.
 pub(crate) struct Hash(u64);
 
 impl Hash {
-    pub(crate) fn new() -> Self { Self(0xcbf29ce484222325) }
+    pub(crate) fn new() -> Self {
+        Self(0xcbf29ce484222325)
+    }
 
     pub(crate) fn word(&mut self, w: u64) {
         let h = (self.0 ^ w).wrapping_mul(0x9e3779b97f4a7c15);
@@ -103,7 +118,9 @@ impl Hash {
         self.word(u64::from_le_bytes(tail));
     }
 
-    pub(crate) fn finish(self) -> String { format!("{:016x}", self.0) }
+    pub(crate) fn finish(self) -> String {
+        format!("{:016x}", self.0)
+    }
 }
 
 /// Length plus non-zero pages, so sparse and dense copies of the same bytes match.
@@ -188,7 +205,9 @@ impl Meta {
         let mut rehashed = false;
         for (name, path) in self.files(paths, dir) {
             let component = &self.components[name];
-            let stamp = Stamp::of(&std::fs::metadata(&path).map_err(|e| format!("template component {}: {e}", path.display()))?);
+            let stamp = Stamp::of(
+                &std::fs::metadata(&path).map_err(|e| format!("template component {}: {e}", path.display()))?,
+            );
             if cache.get(name).unwrap_or(&component.metadata) == &stamp {
                 continue;
             }
@@ -270,7 +289,9 @@ impl Template {
         (!id.is_empty() && !id.contains('/') && dir.is_dir()).then_some(dir)
     }
 
-    pub fn open(paths: &Paths, name: &str) -> Result<Arc<Template>> { Template::open_dir(name, Template::resolve(paths, name)?) }
+    pub fn open(paths: &Paths, name: &str) -> Result<Arc<Template>> {
+        Template::open_dir(name, Template::resolve(paths, name)?)
+    }
 
     /// Generation `id`, even if the name has moved on since, verified.
     pub fn open_id(paths: &Paths, name: &str, id: &str) -> Result<Arc<Template>> {
@@ -288,7 +309,9 @@ impl Template {
         // a pre-generations template is replaced by renaming over its path.
         let handle = File::open(&dir).map_err(|e| format!("template {name:?}: {e}"))?;
         let fixed = PathBuf::from(format!("/proc/{}/fd/{}", std::process::id(), handle.as_raw_fd()));
-        let meta: Meta = serde_json::from_slice(&std::fs::read(fixed.join("meta.json")).map_err(|e| format!("template {name:?}: {e}"))?)?;
+        let meta: Meta = serde_json::from_slice(
+            &std::fs::read(fixed.join("meta.json")).map_err(|e| format!("template {name:?}: {e}"))?,
+        )?;
         let file = File::open(fixed.join("mem"))?;
         let len = file.metadata()?.len() as usize;
         let data = data_bitmap(&file, len)?;
@@ -325,7 +348,9 @@ impl Template {
         }
     }
 
-    pub fn load_set(&self) -> Vec<u64> { self.load_set.lock().unwrap().iter().copied().collect() }
+    pub fn load_set(&self) -> Vec<u64> {
+        self.load_set.lock().unwrap().iter().copied().collect()
+    }
 
     /// Stat only unless `rehash` and a file changed. Never call on the run path.
     pub fn verify(&self, paths: &Paths, rehash: bool) -> Result<()> {
@@ -353,9 +378,13 @@ impl Template {
         Ok(())
     }
 
-    pub fn vmstate(&self) -> PathBuf { self.fixed.join("vmstate") }
+    pub fn vmstate(&self) -> PathBuf {
+        self.fixed.join("vmstate")
+    }
 
-    pub fn has_data(&self, page: usize) -> bool { self.data.get(page / 64).is_some_and(|w| w & (1 << (page % 64)) != 0) }
+    pub fn has_data(&self, page: usize) -> bool {
+        self.data.get(page / 64).is_some_and(|w| w & (1 << (page % 64)) != 0)
+    }
 
     /// The pages must all have data.
     pub fn pages(&self, page: usize, n: usize) -> &[u8] {
@@ -366,7 +395,9 @@ impl Template {
 }
 
 impl Drop for Template {
-    fn drop(&mut self) { unsafe { libc::munmap(self.map as *mut _, self.len.max(1)) }; }
+    fn drop(&mut self) {
+        unsafe { libc::munmap(self.map as *mut _, self.len.max(1)) };
+    }
 }
 
 fn data_bitmap(file: &File, len: usize) -> Result<Vec<u64>> {
@@ -517,7 +548,15 @@ fn wait_reporting_done(fc: &Firecracker, metrics: &Path, expect_mib: u64) -> Res
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn create(paths: &Paths, name: &str, vcpus: u32, mem_mib: u64, max_mib: u64, plug_mib: u64, image: Option<ImageMeta>) -> Result<()> {
+pub fn create(
+    paths: &Paths,
+    name: &str,
+    vcpus: u32,
+    mem_mib: u64,
+    max_mib: u64,
+    plug_mib: u64,
+    image: Option<ImageMeta>,
+) -> Result<()> {
     let tap = format!("fvtpl{}", std::process::id());
     crate::net::create_tap(&tap)?;
     // Running VMs map the old files, which must not be rewritten under them.
@@ -563,7 +602,17 @@ fn publish(paths: &Paths, name: &str, staged: &Path) -> Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build(paths: &Paths, staging: &str, name: &str, vcpus: u32, mem_mib: u64, max_mib: u64, plug_mib: u64, tap: &str, image: Option<ImageMeta>) -> Result<()> {
+fn build(
+    paths: &Paths,
+    staging: &str,
+    name: &str,
+    vcpus: u32,
+    mem_mib: u64,
+    max_mib: u64,
+    plug_mib: u64,
+    tap: &str,
+    image: Option<ImageMeta>,
+) -> Result<()> {
     let dir = paths.templates.join(staging);
     std::fs::create_dir_all(&dir)?;
     let run = dir.join("boot");
@@ -581,13 +630,19 @@ fn build(paths: &Paths, staging: &str, name: &str, vcpus: u32, mem_mib: u64, max
     fc.put("/boot-source", json!({"kernel_image_path": paths.kernel, "boot_args": BOOT_ARGS}))?;
     fc.put("/machine-config", json!({"vcpu_count": vcpus, "mem_size_mib": mem_mib}))?;
     fc.put("/pmem/root", json!({"id": "root", "path_on_host": rootfs, "root_device": true, "read_only": true}))?;
-    fc.put("/balloon", json!({"amount_mib": 0, "deflate_on_oom": false, "stats_polling_interval_s": BALLOON_STATS_S, "free_page_reporting": true}))?;
+    fc.put(
+        "/balloon",
+        json!({"amount_mib": 0, "deflate_on_oom": false, "stats_polling_interval_s": BALLOON_STATS_S, "free_page_reporting": true}),
+    )?;
     let hotplug = max_mib.saturating_sub(mem_mib) / SLOT_MIB * SLOT_MIB;
     if hotplug > 0 {
         fc.put("/hotplug/memory", json!({"total_size_mib": hotplug, "slot_size_mib": SLOT_MIB}))?;
     }
     fc.put("/vsock", json!({"guest_cid": 3, "uds_path": vsock}))?;
-    fc.put("/network-interfaces/eth0", json!({"iface_id": "eth0", "host_dev_name": tap, "guest_mac": crate::net::GUEST_MAC}))?;
+    fc.put(
+        "/network-interfaces/eth0",
+        json!({"iface_id": "eth0", "host_dev_name": tap, "guest_mac": crate::net::GUEST_MAC}),
+    )?;
     fc.put("/entropy", json!({}))?;
     fc.put("/actions", json!({"action_type": "InstanceStart"}))?;
     retry(Duration::from_secs(30), || guest::ping(&vsock))?;
@@ -614,15 +669,26 @@ fn build(paths: &Paths, staging: &str, name: &str, vcpus: u32, mem_mib: u64, max
         );
     }
     fc.pause()?;
-    fc.put("/snapshot/create", json!({"snapshot_type": "Full", "snapshot_path": dir.join("vmstate"), "mem_file_path": dir.join("mem")}))?;
+    fc.put(
+        "/snapshot/create",
+        json!({"snapshot_type": "Full", "snapshot_path": dir.join("vmstate"), "mem_file_path": dir.join("mem")}),
+    )?;
     let compatibility = crate::compat::local(fc.pid())?;
     drop(fc);
     let punched = sparsify(&dir.join("mem"))?;
     let _ = std::fs::remove_dir_all(&run);
 
     let mut meta = Meta {
-        compatibility: Some(compatibility), vcpus, mem_mib, max_mib: mem_mib + hotplug, plugged_mib: plugged,
-        kernel: paths.kernel.clone(), rootfs, id: String::new(), components: BTreeMap::new(), image,
+        compatibility: Some(compatibility),
+        vcpus,
+        mem_mib,
+        max_mib: mem_mib + hotplug,
+        plugged_mib: plugged,
+        kernel: paths.kernel.clone(),
+        rootfs,
+        id: String::new(),
+        components: BTreeMap::new(),
+        image,
     };
     meta.identify(paths, &dir)?;
     std::fs::write(dir.join("meta.json"), serde_json::to_vec_pretty(&meta)?)?;
@@ -632,7 +698,11 @@ fn build(paths: &Paths, staging: &str, name: &str, vcpus: u32, mem_mib: u64, max
     println!(
         "template {name} (id {}): {vcpus} vCPUs, {mem_mib} MiB base + {hotplug} MiB hotplug ({plugged} MiB plugged, \
          {reported} MiB reported free), booted in {} ms, memory file {} MiB ({} MiB of zeroes punched out), working set {} MiB",
-        meta.id, ms(booted), size >> 20, punched >> 20, wset >> 20
+        meta.id,
+        ms(booted),
+        size >> 20,
+        punched >> 20,
+        wset >> 20
     );
     Ok(())
 }
@@ -658,14 +728,25 @@ mod tests {
         }
     }
 
-    struct Fixture { paths: Paths, dir: PathBuf, meta: Meta }
+    struct Fixture {
+        paths: Paths,
+        dir: PathBuf,
+        meta: Meta,
+    }
 
     impl Fixture {
         fn new() -> Self {
             static NEXT: AtomicU64 = AtomicU64::new(0);
-            let dir = std::env::temp_dir().join(format!("flexvm-identity-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+            let dir = std::env::temp_dir().join(format!(
+                "flexvm-identity-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
             std::fs::create_dir_all(&dir).unwrap();
-            let paths = Paths { firecracker: dir.join("firecracker"), kernel: dir.join("kernel"), rootfs: dir.join("rootfs"), templates: dir.clone() };
+            let paths = Paths {
+                firecracker: dir.join("firecracker"),
+                kernel: dir.join("kernel"),
+                rootfs: dir.join("rootfs"),
+                templates: dir.clone(),
+            };
             let mut meta = Meta {
                 compatibility: None,
                 vcpus: 2, mem_mib: 256, max_mib: 1024, plugged_mib: 0,
@@ -690,17 +771,26 @@ mod tests {
             meta.verify(&self.paths, &self.dir, cache, rehash)
         }
 
-        fn fresh(&self, rehash: bool) -> Result<bool> { self.verify(&self.meta, &mut BTreeMap::new(), rehash) }
+        fn fresh(&self, rehash: bool) -> Result<bool> {
+            self.verify(&self.meta, &mut BTreeMap::new(), rehash)
+        }
 
-        fn write_meta(&self, meta: &Meta, dir: &Path) { std::fs::write(dir.join("meta.json"), serde_json::to_vec(meta).unwrap()).unwrap(); }
+        fn write_meta(&self, meta: &Meta, dir: &Path) {
+            std::fs::write(dir.join("meta.json"), serde_json::to_vec(meta).unwrap()).unwrap();
+        }
     }
 
     impl Drop for Fixture {
-        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.dir); }
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
     }
 
     fn set_mtime(file: &File, sec: i64, nsec: i64) {
-        let times = [libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_OMIT }, libc::timespec { tv_sec: sec, tv_nsec: nsec }];
+        let times = [
+            libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_OMIT },
+            libc::timespec { tv_sec: sec, tv_nsec: nsec },
+        ];
         assert_eq!(unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) }, 0);
     }
 
@@ -716,7 +806,10 @@ mod tests {
         };
         let current = || std::fs::read_to_string(Template::resolve(&f.paths, "t").unwrap().join("vmstate")).unwrap();
         let gens = || {
-            let mut g: Vec<String> = std::fs::read_dir(f.dir.join(GENERATIONS)).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+            let mut g: Vec<String> = std::fs::read_dir(f.dir.join(GENERATIONS))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect();
             g.sort();
             g
         };

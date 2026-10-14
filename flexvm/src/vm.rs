@@ -51,7 +51,9 @@ impl State {
     }
 
     /// Whether the VM's address is served from this host.
-    pub fn local(self) -> bool { matches!(self, State::Running | State::Paused | State::Checkpointing) }
+    pub fn local(self) -> bool {
+        matches!(self, State::Running | State::Paused | State::Checkpointing)
+    }
 }
 
 pub struct Vm {
@@ -114,9 +116,13 @@ impl Vm {
         Ok(prepared)
     }
 
-    pub fn vsock(&self) -> PathBuf { self.vsock.clone() }
+    pub fn vsock(&self) -> PathBuf {
+        self.vsock.clone()
+    }
 
-    pub fn mem_sock(&self) -> PathBuf { PathBuf::from(format!("{}_{}", self.vsock.display(), crate::guest::MEM_PORT)) }
+    pub fn mem_sock(&self) -> PathBuf {
+        PathBuf::from(format!("{}_{}", self.vsock.display(), crate::guest::MEM_PORT))
+    }
 
     pub fn state(&self) -> State {
         match self.pager.failed() {
@@ -140,11 +146,17 @@ impl Vm {
     }
 
     /// One busy with a request counts as alive.
-    pub fn firecracker_alive(&self) -> bool { self.fc.try_lock().map_or(true, |mut fc| fc.as_mut().is_some_and(|f| f.alive())) }
+    pub fn firecracker_alive(&self) -> bool {
+        self.fc.try_lock().map_or(true, |mut fc| fc.as_mut().is_some_and(|f| f.alive()))
+    }
 
-    pub fn pid(&self) -> Option<u32> { self.fc.lock().unwrap().as_ref().map(|f| f.pid()) }
+    pub fn pid(&self) -> Option<u32> {
+        self.fc.lock().unwrap().as_ref().map(|f| f.pid())
+    }
 
-    pub fn rss(&self) -> u64 { self.pid().and_then(|p| crate::util::proc_kb(&format!("/proc/{p}/status"), "VmRSS")).unwrap_or(0) }
+    pub fn rss(&self) -> u64 {
+        self.pid().and_then(|p| crate::util::proc_kb(&format!("/proc/{p}/status"), "VmRSS")).unwrap_or(0)
+    }
 
     /// Saves device and vCPU state and returns page states matching it. Paused vCPUs do not
     /// stop devices writing memory, so execs close, `unroute` holds packets and the tap goes
@@ -184,9 +196,13 @@ impl Vm {
         self.fc(|fc| fc.patch("/balloon/statistics", json!({"stats_polling_interval_s": u16::MAX})).map(drop))
     }
 
-    pub fn start_source(&self, mig: u64) -> Result<()> { self.leave(State::Source(mig)) }
+    pub fn start_source(&self, mig: u64) -> Result<()> {
+        self.leave(State::Source(mig))
+    }
 
-    pub fn start_checkpoint(&self) -> Result<()> { self.leave(State::Checkpointing) }
+    pub fn start_checkpoint(&self) -> Result<()> {
+        self.leave(State::Checkpointing)
+    }
 
     fn leave(&self, to: State) -> Result<()> {
         let _devices = self.devices.lock().unwrap();
@@ -215,7 +231,9 @@ impl Vm {
         Ok(())
     }
 
-    pub fn was_paused(&self) -> bool { self.was_paused.load(Ordering::SeqCst) }
+    pub fn was_paused(&self) -> bool {
+        self.was_paused.load(Ordering::SeqCst)
+    }
 
     pub fn resume(&self) -> Result<State> {
         crate::net::set_link_up(&self.tap, true)?;
@@ -267,7 +285,9 @@ impl Vm {
         Ok(())
     }
 
-    pub fn set_failed(&self) { *self.state.lock().unwrap() = State::Failed; }
+    pub fn set_failed(&self) {
+        *self.state.lock().unwrap() = State::Failed;
+    }
 
     pub fn hotplug_plugged(&self) -> Option<u64> {
         let hp = self.fc(|fc| fc.request_within("GET", "/hotplug/memory", None, crate::guest::TIMEOUT)).ok()?;
@@ -416,7 +436,9 @@ impl Vm {
         Ok(())
     }
 
-    pub fn release_pending(&self) -> bool { self.reports_held.load(Ordering::SeqCst) }
+    pub fn release_pending(&self) -> bool {
+        self.reports_held.load(Ordering::SeqCst)
+    }
 
     fn unpark_balloon(&self) {
         let deadline = Instant::now() + Duration::from_millis(500);
@@ -467,7 +489,9 @@ impl Vm {
         crate::guest::start_app(&self.vsock())
     }
 
-    pub fn untrack_exec(&self, id: u64) { self.execs.lock().unwrap().remove(&id); }
+    pub fn untrack_exec(&self, id: u64) {
+        self.execs.lock().unwrap().remove(&id);
+    }
 
     pub fn kill(&self) {
         self.pager.stop();
@@ -507,31 +531,64 @@ impl Vm {
 }
 
 /// A Firecracker with its pager started and no VM of its own yet; torn down when dropped.
-pub struct Prepared { idle: Option<Idle>, pub pager: Arc<Pager>, template: Arc<Template> }
+pub struct Prepared {
+    idle: Option<Idle>,
+    pub pager: Arc<Pager>,
+    template: Arc<Template>,
+}
 
 impl Prepared {
-    pub fn template(&self) -> Arc<Template> { self.template.clone() }
+    pub fn template(&self) -> Arc<Template> {
+        self.template.clone()
+    }
 
-    pub fn firecracker(&self) -> &Firecracker { &self.idle.as_ref().unwrap().fc }
+    pub fn firecracker(&self) -> &Firecracker {
+        &self.idle.as_ref().unwrap().fc
+    }
 
-    pub fn tap(&self) -> &str { &self.idle.as_ref().unwrap().tap }
+    pub fn tap(&self) -> &str {
+        &self.idle.as_ref().unwrap().tap
+    }
 
-    pub fn dir(&self) -> &Path { &self.idle.as_ref().unwrap().dir }
+    pub fn dir(&self) -> &Path {
+        &self.idle.as_ref().unwrap().dir
+    }
 
-    pub fn firecracker_alive(&mut self) -> bool { self.idle.as_mut().is_some_and(|i| i.fc.alive()) }
+    pub fn firecracker_alive(&mut self) -> bool {
+        self.idle.as_mut().is_some_and(|i| i.fc.alive())
+    }
 
-    pub fn kill_firecracker(&mut self) { self.idle.as_mut().unwrap().fc.kill(); }
+    pub fn kill_firecracker(&mut self) {
+        self.idle.as_mut().unwrap().fc.kill();
+    }
 
     pub fn into_vm(mut self, name: &str, ip: Ipv4Addr, state: State) -> Arc<Vm> {
         let (fc, dir, cgroup, tap) = self.idle.take().unwrap().into_parts();
         Arc::new(Vm {
-            name: name.into(), template: self.template.clone(), dir, ip, tap, pager: self.pager.clone(),
-            state: Mutex::new(state), last_resize: Mutex::new(Instant::now()), starved: AtomicBool::new(false),
-            reports_held: AtomicBool::new(false), cow_copy: Mutex::new(false), execs: Mutex::new(HashMap::new()),
-            devices: Mutex::new(()), clock_unsure: AtomicBool::new(false), next_exec: AtomicU64::new(0),
-            vsock: fc.sockets.vsock.clone(), fc: Mutex::new(Some(fc)), cgroup, was_paused: AtomicBool::new(false),
-            clock_pending: AtomicBool::new(false), pending_net: Mutex::new(None), snapshot_discards: AtomicU64::new(0),
-            last_checkpoint: Mutex::new(None), cancel_checkpoint: AtomicUsize::new(0),
+            name: name.into(),
+            template: self.template.clone(),
+            dir,
+            ip,
+            tap,
+            pager: self.pager.clone(),
+            state: Mutex::new(state),
+            last_resize: Mutex::new(Instant::now()),
+            starved: AtomicBool::new(false),
+            reports_held: AtomicBool::new(false),
+            cow_copy: Mutex::new(false),
+            execs: Mutex::new(HashMap::new()),
+            devices: Mutex::new(()),
+            clock_unsure: AtomicBool::new(false),
+            next_exec: AtomicU64::new(0),
+            vsock: fc.sockets.vsock.clone(),
+            fc: Mutex::new(Some(fc)),
+            cgroup,
+            was_paused: AtomicBool::new(false),
+            clock_pending: AtomicBool::new(false),
+            pending_net: Mutex::new(None),
+            snapshot_discards: AtomicU64::new(0),
+            last_checkpoint: Mutex::new(None),
+            cancel_checkpoint: AtomicUsize::new(0),
         })
     }
 
@@ -561,8 +618,16 @@ impl Prepared {
     /// so if a fresh Firecracker could do it, it is retried once after `before_retry`.
     #[allow(clippy::too_many_arguments)]
     pub fn load(
-        self, spawner: &Spawner, name: &str, vmstate: Snapshot, seed: Option<(Runs, Origin)>, ip: Ipv4Addr, hold: bool,
-        deadline: Option<Instant>, before_retry: impl FnOnce() -> Result<()>, t: &mut Phases,
+        self,
+        spawner: &Spawner,
+        name: &str,
+        vmstate: Snapshot,
+        seed: Option<(Runs, Origin)>,
+        ip: Ipv4Addr,
+        hold: bool,
+        deadline: Option<Instant>,
+        before_retry: impl FnOnce() -> Result<()>,
+        t: &mut Phases,
     ) -> Result<(Arc<Vm>, Duration)> {
         let tpl = self.template.clone();
         let (e, realtime) = match self.load_once(name, vmstate, seed.clone(), ip, hold, true, deadline, t) {
@@ -579,8 +644,15 @@ impl Prepared {
     /// On failure, whether another (and with `clock_realtime`) may work.
     #[allow(clippy::too_many_arguments)]
     fn load_once(
-        mut self, name: &str, vmstate: Snapshot, seed: Option<(Runs, Origin)>, ip: Ipv4Addr, hold: bool, clock_realtime: bool,
-        deadline: Option<Instant>, t: &mut Phases,
+        mut self,
+        name: &str,
+        vmstate: Snapshot,
+        seed: Option<(Runs, Origin)>,
+        ip: Ipv4Addr,
+        hold: bool,
+        clock_realtime: bool,
+        deadline: Option<Instant>,
+        t: &mut Phases,
     ) -> std::result::Result<(Arc<Vm>, Duration), (crate::util::Error, Option<bool>)> {
         let left = |most: Duration| deadline.map_or(most, |d| d.saturating_duration_since(Instant::now()).min(most));
         let mut load_failed = None;

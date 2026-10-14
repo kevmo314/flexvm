@@ -63,7 +63,11 @@ options: --state DIR (FLEXVM_STATE, /var/lib/flexvm), --run DIR (FLEXVM_RUN, /ru
 const SWITCHES: &[&str] = &["warm", "stop", "paused", "incremental", "standby", "incoming", "json"];
 
 /// `--flag value`s: last wins. `rest` follows `--` (or `exec NAME`).
-pub struct Args { positional: Vec<String>, flags: Vec<(String, String)>, rest: Vec<String> }
+pub struct Args {
+    positional: Vec<String>,
+    flags: Vec<(String, String)>,
+    rest: Vec<String>,
+}
 
 impl Args {
     fn parse() -> Args {
@@ -88,17 +92,25 @@ impl Args {
         a
     }
 
-    pub fn has(&self, name: &str) -> bool { self.get(name).is_some() }
+    pub fn has(&self, name: &str) -> bool {
+        self.get(name).is_some()
+    }
 
-    pub fn get(&self, name: &str) -> Option<&str> { self.flags.iter().rev().find(|(k, _)| k == name).map(|(_, v)| v.as_str()) }
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.flags.iter().rev().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+    }
 
-    fn all(&self, name: &str) -> Vec<String> { self.flags.iter().filter(|(k, _)| k == name).map(|(_, v)| v.clone()).collect() }
+    fn all(&self, name: &str) -> Vec<String> {
+        self.flags.iter().filter(|(k, _)| k == name).map(|(_, v)| v.clone()).collect()
+    }
 
     pub fn parse_or<T: std::str::FromStr>(&self, name: &str, default: T) -> Result<T> {
         self.get(name).map_or(Ok(default), |v| v.parse().map_err(|_| format!("bad --{name} {v:?}").into()))
     }
 
-    pub fn num(&self, name: &str, default: u64) -> Result<u64> { self.parse_or(name, default) }
+    pub fn num(&self, name: &str, default: u64) -> Result<u64> {
+        self.parse_or(name, default)
+    }
 
     fn path(&self, flag: &str, env: &str, default: &str) -> PathBuf {
         self.get(flag).map(PathBuf::from).or_else(|| std::env::var_os(env).map(PathBuf::from)).unwrap_or_else(|| default.into())
@@ -432,7 +444,10 @@ fn exec_session(host: &Host, name: &str, cmd: &str, stdout: &mut impl Write, std
     Err(format!("exec recovery timed out: {error}").into())
 }
 
-pub enum StreamEnd { Exit(i32), Disconnected(String) }
+pub enum StreamEnd {
+    Exit(i32),
+    Disconnected(String),
+}
 
 /// Tracks `offset` so a reattach resumes without duplicates.
 pub fn exec_frames(r: &mut impl Read, id: &str, started: &mut bool, offset: &mut u64, stdout: &mut impl Write, stderr: &mut impl Write, deadline: &mut Instant) -> Result<StreamEnd> {

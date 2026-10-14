@@ -15,7 +15,12 @@ use crate::util::{ms, Result};
 use crate::{bail, Args};
 
 /// VMs start on `a`; migrations and restores go to `b` (`a` again without `--to`).
-struct Hosts { a: Host, b: Host, to: Option<String>, timeout: Duration }
+struct Hosts {
+    a: Host,
+    b: Host,
+    to: Option<String>,
+    timeout: Duration,
+}
 
 impl Hosts {
     fn cli(&self, host: &Host, args: &[&str]) -> Result<Value> {
@@ -26,7 +31,9 @@ impl Hosts {
         Ok(serde_json::from_slice(&out.stdout).unwrap_or(Value::Null))
     }
 
-    fn state(host: &Host, name: &str) -> String { host.entry(name).map(|e| e.state).unwrap_or_default() }
+    fn state(host: &Host, name: &str) -> String {
+        host.entry(name).map(|e| e.state).unwrap_or_default()
+    }
 
     fn wait(&self, what: &str, cond: impl Fn() -> bool) -> Result<()> {
         let deadline = Instant::now() + self.timeout;

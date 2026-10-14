@@ -315,7 +315,14 @@ pub fn gratuitous_arp(dev: &str, ip: Ipv4Addr) -> Result<()> {
     addr.sll_halen = 6;
     addr.sll_addr[..6].copy_from_slice(&[0xff; 6]);
     let rc = unsafe {
-        libc::sendto(fd, frame.as_ptr().cast(), frame.len(), 0, (&addr as *const libc::sockaddr_ll).cast(), std::mem::size_of::<libc::sockaddr_ll>() as u32)
+        libc::sendto(
+            fd,
+            frame.as_ptr().cast(),
+            frame.len(),
+            0,
+            (&addr as *const libc::sockaddr_ll).cast(),
+            std::mem::size_of::<libc::sockaddr_ll>() as u32,
+        )
     };
     let err = std::io::Error::last_os_error();
     unsafe { libc::close(fd) };
@@ -327,7 +334,10 @@ pub fn gratuitous_arp(dev: &str, ip: Ipv4Addr) -> Result<()> {
 
 /// `a.b.c.d/len` or `first-last`.
 #[derive(Debug, Clone)]
-pub struct IpRange { first: u32, last: u32 }
+pub struct IpRange {
+    first: u32,
+    last: u32,
+}
 
 impl std::fmt::Display for IpRange {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -354,9 +364,13 @@ impl IpRange {
         Ok(IpRange { first: base + 1, last: (base | !mask) - 1 })
     }
 
-    pub fn contains(&self, ip: Ipv4Addr) -> bool { (self.first..=self.last).contains(&u32::from(ip)) }
+    pub fn contains(&self, ip: Ipv4Addr) -> bool {
+        (self.first..=self.last).contains(&u32::from(ip))
+    }
 
-    pub fn overlaps(&self, other: &IpRange) -> bool { self.first <= other.last && other.first <= self.last }
+    pub fn overlaps(&self, other: &IpRange) -> bool {
+        self.first <= other.last && other.first <= self.last
+    }
 
     pub fn allocate(&self, taken: impl Fn(Ipv4Addr) -> bool) -> Option<Ipv4Addr> {
         (self.first..=self.last).map(Ipv4Addr::from).find(|ip| !taken(*ip))

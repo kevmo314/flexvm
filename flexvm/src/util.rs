@@ -24,7 +24,9 @@ pub fn send_json(w: &mut impl Write, v: &serde_json::Value) -> io::Result<()> {
 const MAX_LINE: u64 = 8 << 20;
 
 /// None on EOF.
-pub fn recv_json(r: &mut impl BufRead) -> Result<Option<serde_json::Value>> { recv_json_max(r, MAX_LINE) }
+pub fn recv_json(r: &mut impl BufRead) -> Result<Option<serde_json::Value>> {
+    recv_json_max(r, MAX_LINE)
+}
 
 pub fn recv_json_max(r: &mut impl BufRead, max: u64) -> Result<Option<serde_json::Value>> {
     let mut line = String::new();
@@ -75,8 +77,12 @@ pub trait Timed: Read + Write {
 macro_rules! timed {
     ($($t:ty),*) => {$(
         impl Timed for $t {
-            fn read_timeout(&self, t: Duration) -> io::Result<()> { self.set_read_timeout(Some(t)) }
-            fn write_timeout(&self, t: Duration) -> io::Result<()> { self.set_write_timeout(Some(t)) }
+            fn read_timeout(&self, t: Duration) -> io::Result<()> {
+                self.set_read_timeout(Some(t))
+            }
+            fn write_timeout(&self, t: Duration) -> io::Result<()> {
+                self.set_write_timeout(Some(t))
+            }
         }
     )*};
 }
@@ -116,7 +122,9 @@ impl<S: Timed> Write for By<S> {
         self.s.write_timeout(self.left()?)?;
         self.s.write(buf).map_err(timed_out)
     }
-    fn flush(&mut self) -> io::Result<()> { self.s.flush() }
+    fn flush(&mut self) -> io::Result<()> {
+        self.s.flush()
+    }
 }
 
 /// Reads and writes time out after `timeout` too. (A blocking connect waits for as long
@@ -183,10 +191,16 @@ pub fn pidfd_wait(pidfd: &OwnedFd, timeout: Duration) -> io::Result<bool> {
     }
 }
 
-pub fn ms(d: Duration) -> f64 { (d.as_secs_f64() * 1e5).round() / 100.0 }
+pub fn ms(d: Duration) -> f64 {
+    (d.as_secs_f64() * 1e5).round() / 100.0
+}
 
 /// Back-to-back phase timings that sum to the total.
-pub struct Phases { start: Instant, last: Instant, marks: serde_json::Map<String, serde_json::Value> }
+pub struct Phases {
+    start: Instant,
+    last: Instant,
+    marks: serde_json::Map<String, serde_json::Value>,
+}
 
 impl Phases {
     pub fn new() -> Phases {
@@ -202,7 +216,9 @@ impl Phases {
         d
     }
 
-    pub fn total(&self) -> Duration { self.last - self.start }
+    pub fn total(&self) -> Duration {
+        self.last - self.start
+    }
 
     pub fn json(&self) -> serde_json::Value {
         let mut marks = self.marks.clone();
@@ -221,13 +237,19 @@ pub fn proc_kb(path: &str, key: &str) -> Option<u64> {
         .map(|kb| kb * 1024)
 }
 
-pub fn host_cpus() -> usize { std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) }
+pub fn host_cpus() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+}
 
 /// Fsyncs every parent each time: a crash may have lost an entry made before, or another
 /// process made it without syncing.
-pub fn create_dir_durably(dir: &std::path::Path) -> io::Result<()> { create_dir_durably_mode(dir, 0o777) }
+pub fn create_dir_durably(dir: &std::path::Path) -> io::Result<()> {
+    create_dir_durably_mode(dir, 0o777)
+}
 
-pub fn create_private_dir_durably(dir: &std::path::Path) -> io::Result<()> { create_dir_durably_mode(dir, 0o700) }
+pub fn create_private_dir_durably(dir: &std::path::Path) -> io::Result<()> {
+    create_dir_durably_mode(dir, 0o700)
+}
 
 fn create_dir_durably_mode(dir: &std::path::Path, mode: u32) -> io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;

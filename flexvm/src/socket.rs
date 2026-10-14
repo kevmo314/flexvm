@@ -52,10 +52,14 @@ fn base_dir(base: &Path) -> io::Result<()> {
     private(base)
 }
 
-fn bases() -> [PathBuf; 2] { [PathBuf::from("/run/flexvm/s"), PathBuf::from(format!("/tmp/flexvm-s-{}", unsafe { libc::geteuid() }))] }
+fn bases() -> [PathBuf; 2] {
+    [PathBuf::from("/run/flexvm/s"), PathBuf::from(format!("/tmp/flexvm-s-{}", unsafe { libc::geteuid() }))]
+}
 
 /// Named after the key, so a process with the same key finds what its predecessor left.
-pub fn roots(key: &Path) -> Vec<PathBuf> { roots_in(&bases(), key) }
+pub fn roots(key: &Path) -> Vec<PathBuf> {
+    roots_in(&bases(), key)
+}
 
 fn roots_in(bases: &[PathBuf], key: &Path) -> Vec<PathBuf> {
     let h = Sha256::digest(key.as_os_str().as_bytes());
@@ -72,10 +76,15 @@ pub fn remove(key: &Path) {
 }
 
 /// One VM process or template build. Slots keep it alive until their cleanup.
-pub struct SocketRoot { pub dir: PathBuf, next: AtomicU64 }
+pub struct SocketRoot {
+    pub dir: PathBuf,
+    next: AtomicU64,
+}
 
 impl SocketRoot {
-    pub fn new(key: &Path) -> Result<Arc<Self>> { Self::from_bases(&bases(), key) }
+    pub fn new(key: &Path) -> Result<Arc<Self>> {
+        Self::from_bases(&bases(), key)
+    }
 
     fn from_bases(bases: &[PathBuf], key: &Path) -> Result<Arc<Self>> {
         let mut errors = Vec::new();
@@ -106,7 +115,9 @@ impl SocketRoot {
 }
 
 impl Drop for SocketRoot {
-    fn drop(&mut self) { let _ = fs::remove_dir(&self.dir); }
+    fn drop(&mut self) {
+        let _ = fs::remove_dir(&self.dir);
+    }
 }
 
 /// One Firecracker's sockets; removing the directory also removes its vsock port UDSes.
@@ -119,11 +130,15 @@ pub struct Sockets {
 }
 
 impl Sockets {
-    pub fn cleanup(&self) { let _ = fs::remove_dir_all(&self.dir); }
+    pub fn cleanup(&self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
 }
 
 impl Drop for Sockets {
-    fn drop(&mut self) { self.cleanup(); }
+    fn drop(&mut self) {
+        self.cleanup();
+    }
 }
 
 #[cfg(test)]
