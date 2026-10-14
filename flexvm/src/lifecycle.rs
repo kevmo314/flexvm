@@ -473,7 +473,7 @@ impl Proc {
             cancelled().inspect_err(|_| vm.pager.unfreeze(&frozen))?;
             thread::sleep(Duration::from_millis(10));
         }
-        let slow = Duration::from_millis(if fault("ckpt_crawl") { 500 } else if fault("ckpt_slow") { 50 } else { 0 });
+        let slow = || Duration::from_millis(if fault("ckpt_crawl") { 500 } else if fault("ckpt_slow") { 50 } else { 0 });
         let cow_pages = frozen.cow.as_deref().map(|c| crate::cow::CowPages { guest: vm.pager.as_ref(), cow: c, slow });
         let src: &dyn crate::checkpoint::GuestPages = match &cow_pages {
             Some(c) => c,
