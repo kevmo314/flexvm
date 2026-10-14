@@ -1102,10 +1102,10 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
         }
     }
     let p = Proc::new(host, paths)?;
-    let host = p.host.clone();
+    let (host, templates) = (p.host.clone(), p.paths.templates.clone());
     thread::spawn(move || {
-        crate::host::collect_garbage(&host.run, &host.cfg.prefix);
-        host.retire_migrations();
+        crate::gc::sweep(&host, Some(&templates));
+        crate::gc::periodic(host, Some(templates));
     });
     let s = p.clone();
     thread::spawn(move || loop {
@@ -1126,6 +1126,8 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
         Start::Incoming { req } => {
             let log = std::env::var_os("FLEXVM_INCOMING_LOG").map(PathBuf::from);
             std::env::remove_var("FLEXVM_INCOMING_LOG");
+            // Its own lock as well as its stdout's, until the log is published or removed.
+            let _held = log.as_ref().and_then(|l| std::fs::File::open(l).ok()).filter(|f| crate::host::flock(f, libc::LOCK_SH).is_ok());
             let res = p.migrate_in(&req, unsafe { std::net::TcpStream::from_raw_fd(3) });
             if let Some(log) = log {
                 if let Err(e) = crate::listen::finish_incoming_log(&p.host, &p.name(), &log, res.is_ok()) {
@@ -1158,7 +1160,7 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
     p.serve()
 }
 
-fn cgroup_root() -> Option<PathBuf> {
+pub fn cgroup_root() -> Option<PathBuf> {
     let root = PathBuf::from("/sys/fs/cgroup/flexvm");
     let setup = || -> Result<()> {
         if !std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {

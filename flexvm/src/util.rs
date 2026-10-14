@@ -358,14 +358,26 @@ pub fn wait_signal(set: &libc::sigset_t) -> i32 {
     sig
 }
 
-/// In a session of its own (it outlives the caller), with `fd3` as its fd 3.
+/// A VM process in the background, with `fd3` as its fd 3: it outlives the
+/// caller, so it is in a session of its own and, where flexvm's cgroup tree
+/// is available, a cgroup of its own (`flexvm/vm-PID`, `scope`), out of
+/// reach of whatever stops the caller's: a systemd unit's restart or stop
+/// (`KillMode=control-group`), logind's `KillUserProcesses`.
 pub fn spawn_self<S: AsRef<std::ffi::OsStr>>(args: &[S], log: &std::fs::File, fd3: RawFd, env: &[(&str, &str)]) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::process::CommandExt;
+    let cgroups = crate::vmproc::cgroup_root().map(|r| r.join("vm-").as_os_str().as_bytes().to_vec());
     let mut cmd = std::process::Command::new("/proc/self/exe");
     cmd.args(args).envs(env.iter().copied()).stdin(std::process::Stdio::null()).stdout(log.try_clone()?).stderr(log.try_clone()?);
     unsafe {
         cmd.pre_exec(move || {
             libc::setsid();
+            if let Some(prefix) = &cgroups {
+                if !scope(prefix, libc::getpid() as u32) {
+                    let warn = b"flexvm: WARNING: no cgroup of its own: stopping the caller's cgroup stops this vm\n";
+                    libc::write(2, warn.as_ptr().cast(), warn.len());
+                }
+            }
             // dup2 onto itself would leave it close-on-exec.
             let moved = if fd3 == 3 { libc::fcntl(3, libc::F_SETFD, 0) } else { libc::dup2(fd3, 3) };
             if moved < 0 {
@@ -379,10 +391,81 @@ pub fn spawn_self<S: AsRef<std::ffi::OsStr>>(args: &[S], log: &std::fs::File, fd
     Ok(())
 }
 
+/// `PREFIX` `PID` `SUFFIX` NUL in `buf`, without allocating (after fork); false if it does not fit.
+fn scope_path(buf: &mut [u8], prefix: &[u8], pid: u32, suffix: &[u8]) -> bool {
+    let mut digits = [0u8; 10];
+    let (mut n, mut i) = (pid, digits.len());
+    loop {
+        i -= 1;
+        digits[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    let parts: [&[u8]; 3] = [prefix, &digits[i..], suffix];
+    let len: usize = parts.iter().map(|p| p.len()).sum();
+    if len + 1 > buf.len() || prefix.contains(&0) {
+        return false;
+    }
+    let mut at = 0;
+    for p in parts {
+        buf[at..at + p.len()].copy_from_slice(p);
+        at += p.len();
+    }
+    buf[at] = 0;
+    true
+}
+
+/// Moves this process into a new cgroup `PREFIX` `pid`. Only system calls:
+/// it runs between fork and exec.
+fn scope(prefix: &[u8], pid: u32) -> bool {
+    let mut path = [0u8; 512];
+    unsafe {
+        if !scope_path(&mut path, prefix, pid, b"") || (libc::mkdir(path.as_ptr().cast(), 0o755) != 0 && *libc::__errno_location() != libc::EEXIST) {
+            return false;
+        }
+        if !scope_path(&mut path, prefix, pid, b"/cgroup.procs") {
+            return false;
+        }
+        let fd = libc::open(path.as_ptr().cast(), libc::O_WRONLY | libc::O_CLOEXEC);
+        if fd < 0 {
+            return false;
+        }
+        // "0": the writing process.
+        let ok = libc::write(fd, b"0".as_ptr().cast(), 1) == 1;
+        libc::close(fd);
+        ok
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn a_scope_is_named_and_joined_without_allocating() {
+        let mut buf = [0u8; 64];
+        assert!(scope_path(&mut buf, b"/sys/fs/cgroup/flexvm/vm-", 4194304, b"/cgroup.procs"));
+        assert_eq!(std::ffi::CStr::from_bytes_until_nul(&buf).unwrap().to_bytes(), b"/sys/fs/cgroup/flexvm/vm-4194304/cgroup.procs");
+        assert!(scope_path(&mut buf, b"vm-", 0, b""));
+        assert_eq!(std::ffi::CStr::from_bytes_until_nul(&buf).unwrap().to_bytes(), b"vm-0");
+        assert!(!scope_path(&mut [0u8; 8], b"vm-", 123456, b""), "no room for the NUL");
+        assert!(!scope_path(&mut buf, b"v\0m-", 1, b""));
+        // In a plain directory standing in for the cgroup tree.
+        let root = std::env::temp_dir().join(format!("flexvm-scope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let prefix = root.join("vm-");
+        let prefix = prefix.as_os_str().as_encoded_bytes();
+        assert!(!scope(prefix, 7), "made, but no cgroup.procs to join");
+        assert!(root.join("vm-7").is_dir());
+        std::fs::write(root.join("vm-7/cgroup.procs"), b"").unwrap();
+        assert!(scope(prefix, 7), "an existing one is joined");
+        assert_eq!(std::fs::read(root.join("vm-7/cgroup.procs")).unwrap(), b"0");
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn truncated_fds_fail_the_receive() {

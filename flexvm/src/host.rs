@@ -342,7 +342,7 @@ impl Host {
 
     /// Whether `name`'s lock is held: None when that cannot be told (the
     /// file cannot be opened, or the probe fails other than by contention).
-    fn name_locked(&self, name: &str) -> Option<bool> {
+    pub fn name_locked(&self, name: &str) -> Option<bool> {
         let f = match File::open(self.vms(name, "lock")) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(false),
@@ -1119,18 +1119,39 @@ pub fn reap(run: &Path, owner: &Ident) -> Result<()> {
     Ok(())
 }
 
+/// The process a tap was made for: a VM process's (PREFIX, its pid in hex,
+/// `t`, a counter) or a template build's (PREFIX `tpl` pid, `template::tap`).
+fn tap_owner(name: &str, prefix: &str) -> Option<u32> {
+    let rest = name.strip_prefix(prefix)?;
+    if let Some(pid) = rest.strip_prefix("tpl") {
+        return pid.bytes().all(|b| b.is_ascii_digit()).then(|| pid.parse().ok()).flatten();
+    }
+    rest.split_once('t').and_then(|(p, _)| u32::from_str_radix(p, 16).ok())
+}
+
+/// The process a cgroup under `flexvm/` was made for: a Firecracker's
+/// (`idle-PID-N`, PID its VM process's) or a detached VM process's own (`vm-PID`).
+fn cgroup_owner(name: &str) -> Option<u32> {
+    match name.split_once('-')? {
+        ("idle", rest) => rest.split('-').next()?.parse().ok(),
+        ("vm", pid) => pid.parse().ok(),
+        _ => None,
+    }
+}
+
+/// What dead processes left: taps (a template build's too), cgroups, work
+/// directories and names. Only proof of death (`Liveness::Gone`) frees any.
 pub fn collect_garbage(run: &Path, prefix: &str) {
     let gone = |pid: Option<u32>| pid.is_some_and(pid_gone);
     for e in std::fs::read_dir("/sys/class/net").into_iter().flatten().flatten() {
         let n = e.file_name().to_string_lossy().into_owned();
-        let pid = n.strip_prefix(prefix).and_then(|r| r.split_once('t')).and_then(|(p, _)| u32::from_str_radix(p, 16).ok());
-        if gone(pid) {
+        if gone(tap_owner(&n, prefix)) {
             crate::net::delete_tap(&n);
         }
     }
     for e in std::fs::read_dir("/sys/fs/cgroup/flexvm").into_iter().flatten().flatten() {
         let n = e.file_name().to_string_lossy().into_owned();
-        if gone(n.strip_prefix("idle-").and_then(|r| r.split('-').next()).and_then(|p| p.parse().ok())) {
+        if gone(cgroup_owner(&n)) {
             let _ = std::fs::write(e.path().join("cgroup.kill"), "1");
             let _ = std::fs::remove_dir(e.path());
         }
@@ -1229,7 +1250,7 @@ fn pid_liveness_by(pid: u32, stat: impl Fn(u32) -> std::io::Result<String>) -> (
 }
 
 /// Proof that no process has `pid` (for resources named by pid alone).
-fn pid_gone(pid: u32) -> bool {
+pub fn pid_gone(pid: u32) -> bool {
     pid_liveness_by(pid, |pid| std::fs::read_to_string(format!("/proc/{pid}/stat"))).0 == Liveness::Gone
 }
 
@@ -1568,6 +1589,22 @@ mod tests {
         store(&h.vms("v", "lock"), &Ident { start: 1, ..Ident::me() }, false).unwrap();
         assert_eq!(h.holder(&l, x.ip).unwrap(), None);
         x.keep();
+    }
+
+    #[test]
+    fn taps_and_cgroups_name_their_process() {
+        assert_eq!(tap_owner("fv1a2bt0", "fv"), Some(0x1a2b));
+        assert_eq!(tap_owner("fv1a2bt1f", "fv"), Some(0x1a2b));
+        assert_eq!(tap_owner("fvtpl61612", "fv"), Some(61612), "a template build's");
+        assert_eq!(tap_owner("fctpl61612", "fc"), Some(61612));
+        for (tap, prefix) in [("fvtpl61612", "fc"), ("fvtpl", "fv"), ("fvtpl12x", "fv"), ("fvtpl+1", "fv"), ("eth0", "fv"), ("fvxyz", "fv")] {
+            assert_eq!(tap_owner(tap, prefix), None, "{tap} under {prefix}");
+        }
+        assert_eq!(cgroup_owner("idle-4242-3"), Some(4242));
+        assert_eq!(cgroup_owner("vm-4242"), Some(4242));
+        for cg in ["vm-", "vm-42x", "other-42", "idle-", "cgroup.procs", "memory.max"] {
+            assert_eq!(cgroup_owner(cg), None, "{cg}");
+        }
     }
 
     #[test]

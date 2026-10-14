@@ -25,6 +25,15 @@ A VM process:
    socket `RUN/vms/NAME.sock`,
 5. waits for signals and control requests until the VM is gone.
 
+A VM process started in the background (`-d`, an arrival the listener
+spawns, a standby VM) is in a session of its own and, between fork and exec,
+joins a cgroup of its own, `/sys/fs/cgroup/flexvm/vm-PID` (`util::spawn_self`),
+so stopping its starter's cgroup (a systemd unit's restart with
+`KillMode=control-group`, a oneshot unit's end, logind's `KillUserProcesses`)
+does not reach it. Its Firecrackers move on to `flexvm/idle-PID-N`. Without
+cgroup2 it stays where it was started, and says so in its log. A foreground
+VM process stays in its caller's cgroup.
+
 Exit status: with `-- CMD`, CMD's; else 0 when it migrated away or was
 stopped by `checkpoint --stop`; 128 + the signal when one ended it (130:
 SIGINT destroyed it, 143: SIGTERM suspended it); 125 when flexvm failed (it
@@ -106,7 +115,11 @@ STATE (default /var/lib/flexvm, on disk)
   migs/ID                incoming migration records (fencing), JSON, fsynced
 RUN (default /run/flexvm, tmpfs)
   vms/NAME.{lock,json,sock,log}   registry entry, liveness lock, control socket, log of -d/standby VMs
+  vms/NAME.{failed,moved}         why a VM died (until `flexvm kill`); where it migrated to (an hour)
+  vms/.incoming-LPID-N.log        an arrival's log until it is accepted (as NAME.log) or refused; locked by the arrival
+  .gc, .gc.lock          when garbage was last swept periodically; one sweep at a time
   standby/T/KEY.PID.sock a standby VM of template T, generation KEY (PID.lock while it lives)
+  standby/T/standby.log  the standby VMs' output and refill errors
   standby/.loadset-ID    pages loads of template ID touch, learned by standby VMs, for migrations to preload
   faults.json            armed test faults (FLEXVM_FAULTS=1 only)
   w/PID/                 a VM process's work directory: `owner` (pid, start time), and per
@@ -132,6 +145,22 @@ counts as alive everywhere: names, address holders, migration records,
 reaping and garbage collection never reclaim on it.
 Firecracker also gets `PR_SET_PDEATHSIG` (checked, and the parent checked
 alive after it), so they die anyway; reaping makes the order certain.
+
+**Garbage collection** (`host::collect_garbage`, `gc::sweep`) runs as each
+VM process starts and, from every listener and VM process, about every 30 s
+(whichever process finds `RUN/.gc` older than that sweeps; one sweep at a
+time under `RUN/.gc.lock`), so a host with no VM starting still sweeps.
+What a process owns goes once that process is proven gone: taps
+(`<prefix><pid hex>t<n>`, and a template build's `<prefix>tpl<pid>`),
+cgroups (`idle-<pid>-<n>`, `vm-<pid>`), work directories, names, a standby
+VM's socket (its `PID.lock` free), an arrival's log (no lock on it, 5 s
+old). Logs in `RUN/vms` and `standby.log`s past 8 MiB are cut, in place, to
+their last 2 MiB (writers append, so they go on at the new end); a log
+whose name has no VM, suspended VM, `failed` or `moved` record goes once
+unwritten for an hour, and `NAME.moved` after an hour. `.loadset-ID`s go
+once no template name points to generation ID and no VM here runs it (any
+template that cannot be read keeps them all). Released migration records
+are retired as below.
 
 **The host lock** is a flock taken by one thread of a process at a time and
 reentrant within a thread, so a guard dropped under it (an address claim)
@@ -377,7 +406,7 @@ After: control socket `exec`, `checkpoint`, `migrate`, `claim`, `pages`
 `migration`, `route`, `lend`, `source` (6). 12 ops, from 23 (the daemon's
 `lend_ip` included); user-facing ones: 3.
 
-### CLI, before (15 commands) and after (12)
+### CLI, before (15 commands) and after (13)
 
 ```
 flexvm template NAME ...                      (unchanged)
@@ -391,6 +420,7 @@ flexvm migrate NAME ADDR
 flexvm kill NAME                              destroy (live: SIGINT; suspended: discard)
 flexvm standby [--template T] N
 flexvm listen [ADDR] [--peer ADDR]... [--vm-ips R] [...]   writes host.json, serves peers
+flexvm config [--peer ADDR]... [--vm-ips R] [...]          writes host.json (no listener)
 flexvm bench ...
 ```
 
@@ -475,8 +505,8 @@ where it is kept and what tests it.
    when it passes the socket on. Page connections are passed to the VM named, which serves them
    only as the source of the migration id they name.
 9. **Shared resources have one owner.** Socket roots, work directories, taps
-   (`<prefix><pid>t<n>`) and cgroups (`idle-<pid>-<n>`) are named after the
-   owning process and only swept once it is gone; each process has its own
+   (`<prefix><pid>t<n>`, a template build's `<prefix>tpl<pid>`) and cgroups
+   (`idle-<pid>-<n>`, `vm-<pid>`) are named after the owning process and only swept once it is gone; each process has its own
    hold TUN (not persistent: it goes with the process); `unroute` happens
    under the host lock and only for an address the process still holds;
    checkpoint staging is cleared by owner pid; suspended directories are
@@ -504,8 +534,7 @@ where it is kept and what tests it.
    A migration's rollback removes only a loan that migration made. A
    released record whose source never says `done` (killed) is retired once
    the source's listener says no VM process of that name is a migration
-   source there (op `source`; asked by every VM process's start-up garbage
-   collection); a source that cannot be asked keeps it. Faults
+   source there (op `source`; asked by garbage collection); a source that cannot be asked keeps it. Faults
    `arrival_overtaken`, `pull_died`, `target_killed`, `source_killed_basic`.
 13. **`scripts/faults.py`** is ported to VM processes and listeners (see
    Test plan).
@@ -534,6 +563,11 @@ where it is kept and what tests it.
   `wildcard_listen`, `same_host_order`, `same_host_slow_route`, `same_host_flood`, `arrival_abort_route`, `arrival_killed_route`, `handoff_superseded`,
   `suspend_cmd` (#134), `pause_cmd_start`, `fc_died_busy` (#122), `suspend_died`, and processes SIGKILLed between
   steps at test stalls (`incoming_killed`, `start_killed`, `claim_killed`).
+  Garbage and cgroups (#115): `unit_restart` (a listener, `run -d` and
+  `standby` started in a cgroup standing in for a systemd unit, which is
+  then killed whole: the arrival, the detached VM and the standby run on),
+  `log_cap` (trimmed by the periodic sweep, no VM starting), `gc_debris`,
+  `arrival_log`, `template_tap`.
   Dropped:
   `target_restart_symlink`, `shared_run_dir`, `state_dir_lock` (they tested a
   daemon's run-dir locking and orphan killing on restart; there is no daemon

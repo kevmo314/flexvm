@@ -47,7 +47,7 @@ p.add_argument("--image-cache", help="keep the pulled image here, and build from
 # cow_reports_held, suspend_disk_freed, source_killed, kill_source, forged_peer: their
 # 1.5 GB guests outgrow the CI template, and the host moves them), evict_grower (it steers by the
 # machine's MemAvailable, which lanes running at once move) and the ones that restart the
-# listeners (target_killed, suspend_resume).
+# listeners (target_killed, suspend_resume, unit_restart).
 FAULTS = ("basic route lost_ack unknown refused pages_blip pages_dead_restore prepared_retry resume_kill exec_race guest_calls "
           "checkpoint_restore checkpoint_fork checkpoint_corrupt held_restore_frozen cow_exact cow_abort ckpt_incremental "
           "ckpt_failed_stop ckpt_rearm prepare_fail fc_prepare slow_preload ckpt_packet_hold "
@@ -55,7 +55,7 @@ FAULTS = ("basic route lost_ack unknown refused pages_blip pages_dead_restore pr
           "incoming_killed start_killed claim_killed fc_died cow_grow plug_race plug_storm suspend_debris revoked_publication "
           "same_host_order same_host_slow_route same_host_flood arrival_abort_route arrival_killed_route handoff_superseded mem_high mem_high_migrate mem_high_evict "
           "sigkill_restart listen_trickle suspend_cmd fc_died_busy pause_cmd_start suspend_died evict_latency evict_skips_cmd cmd_flag "
-          "refused_admission meminfo_unreadable checkpoint_hotplug")
+          "refused_admission meminfo_unreadable checkpoint_hotplug log_cap gc_debris arrival_log template_tap")
 p.add_argument("--faults", default=FAULTS, help="scripts/faults.py scenarios to run against the two hosts ('' for none)")
 # A worker runs its cases on one lane, against templates that are already built.
 p.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
@@ -868,7 +868,7 @@ COST = {"image_template": 30, "pause_resume": 6, "migrate": 3, "checkpoint_resto
         "faults/cow_exact": 7, "faults/prepared_retry": 7, "faults/ckpt_failed_stop": 7, "faults/exec_race": 7,
         "faults/prepare_fail": 6, "faults/route": 6, "faults/basic": 6, "faults/slow_preload": 6, "faults/refused": 6,
         "faults/resume_kill": 5, "faults/lost_ack": 5, "faults/ckpt_rearm": 5, "faults/cow_abort": 5,
-        "faults/ckpt_packet_hold": 4, "faults/checkpoint_hotplug": 4}
+        "faults/ckpt_packet_hold": 4, "faults/checkpoint_hotplug": 4, "faults/log_cap": 35, "faults/arrival_log": 13}
 BATCH_S = 20
 
 

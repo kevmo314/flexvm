@@ -51,7 +51,11 @@ belong to CMD.
 `-d` and `--detach` are equivalent for `run`, `restore`, and `resume`.
 
 A background VM's output (an image app's stdout and stderr, flexvm's own
-messages) goes to `/run/flexvm/vms/web.log`.
+messages) goes to `/run/flexvm/vms/web.log`. Logs live on tmpfs: one past
+8 MiB is cut to its last 2 MiB, and the log of a name with nothing left on
+the host (no VM, suspended VM, `failed` or moved record) is removed once
+unwritten for an hour. These sweeps run when a VM starts and about every
+30 s while a listener or any VM process runs.
 
 ## Pause, suspend, destroy
 
@@ -124,7 +128,7 @@ flexvm migrate web 192.168.1.11:7070      # on A: web now runs on B, same addres
 
 Networking is routed IPv4: flexvm provides no NAT or automatic internet
 egress. Arrange upstream routes or NAT yourself if guests need it. There is
-no default DNS server; configure one with `flexvm listen ... --dns IP`.
+no default DNS server; configure one with `--dns IP`.
 
 Every host's `--vm-ips` must be disjoint, and the hosts must list each other
 with `--peer`: a listener serves its peers' addresses only. `--reserve MIB`
@@ -135,6 +139,59 @@ plus the reserve or 512, whichever is more), the fastest growing first,
 until it is back above the mark by half the mark's height over the reserve.
 A peer takes such a VM only if it stays above its own mark. Running VMs pick
 up both from `host.json` as it changes.
+
+A host that only runs VMs needs no listener. `flexvm config` sets the same
+flags (all but the listen address), and prints the configuration:
+
+```sh
+flexvm config --vm-ips 10.0.5.0/24 --dns 10.0.5.1 --reserve 2048
+flexvm config                    # show it
+flexvm config --dns ''           # unset (--underlay and --announce-dev too)
+```
+
+`--prefix P` (1 to 5 letters or digits, default `fv`) names the host's taps
+and cgroups; `config` refuses to change it while VMs run, whose taps keep
+the old name.
+
+### Under systemd
+
+Run the listener as a socket-activated service; without ADDR it takes its
+address from the socket:
+
+```ini
+# /etc/systemd/system/flexvm-listen.socket
+[Socket]
+ListenStream=192.168.1.10:7070
+
+[Install]
+WantedBy=sockets.target
+```
+
+```ini
+# /etc/systemd/system/flexvm-listen.service
+[Unit]
+Requires=flexvm-listen.socket
+After=flexvm-listen.socket
+
+[Service]
+Environment=FLEXVM_ARTIFACTS=/opt/flexvm/artifacts
+ExecStart=/usr/local/bin/flexvm listen --peer 192.168.1.11:7070 --announce-dev eth0 \
+    --vm-ips 192.168.1.128-192.168.1.191 --dns 192.168.1.1
+Restart=on-failure
+# The default KillMode=control-group is right: see below.
+```
+
+The VM processes a listener starts (arrivals, standby VMs) move into
+cgroups of their own (`/sys/fs/cgroup/flexvm/vm-PID`) as they start, and so
+do VMs started with `-d` (`run`, `resume`, `restore`) and standby VMs from
+any command. So stopping or restarting the unit, with the default
+`KillMode=control-group`, stops only the listener; `KillMode=process` is not
+needed. Likewise logind's `KillUserProcesses`, or the end of a
+`Type=oneshot` unit that runs `flexvm run NAME -d`, leaves those VMs
+running. A foreground `flexvm run NAME` stays in its caller's cgroup, so a
+service whose `ExecStart` is one is supervised like any process: stopping it
+sends SIGTERM, which suspends the VM to disk (give it `TimeoutStopSec` for
+that), and `KillSignal=SIGINT` destroys it instead.
 
 ## Fast starts
 
