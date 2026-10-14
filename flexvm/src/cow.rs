@@ -192,13 +192,17 @@ impl Cow {
         Some(found)
     }
 
-    /// The checkpoint cannot be trusted any more: say why (the first reason sticks).
+    /// The checkpoint cannot be trusted any more: say why (the first reason
+    /// sticks) and stop the copy, so no fault reads a page out of the guest
+    /// for it again (a discarded one would fault back to the event thread).
     pub fn invalidate(&self, why: &str) {
         let mut e = self.error.lock().unwrap();
         if e.is_none() {
             eprintln!("uffd: checkpoint copy invalidated: {why}");
             *e = Some(why.into());
         }
+        drop(e);
+        self.stop();
     }
 
     pub fn error(&self) -> Option<String> {
@@ -370,9 +374,11 @@ mod tests {
         assert_eq!(pages.wanted(), Some(30));
         assert_eq!(pages.wanted(), None);
         assert_eq!(cow.unsaved_page(), Some(8));
-        // A stopped copy fails its writer instead of writing guesses.
-        cow.stop();
-        assert!(pages.read(8, &mut buf[..PAGE_SIZE]).is_err());
+        // An invalidated copy stops: faults no longer save pages for it, and
+        // its writer fails, saying why, instead of writing guesses.
+        cow.invalidate("page 8 was discarded before it was saved");
+        assert!(!cow.active());
+        assert!(pages.read(8, &mut buf[..PAGE_SIZE]).unwrap_err().to_string().contains("page 8 was discarded"));
     }
 
     /// Guest memory whose reads stop half way until the test lets them go.
@@ -414,7 +420,6 @@ mod tests {
                 // that the copy is active.
                 if abort {
                     cow.invalidate("the copy was aborted");
-                    cow.stop();
                 } else {
                     cow.rescued.lock().unwrap().remove(&1);
                 }

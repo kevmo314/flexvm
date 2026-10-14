@@ -322,7 +322,11 @@ where it is kept and what tests it.
    Firecrackers are reaped (killed through pidfds, waited for) before its
    name, address or migration record is settled; `Vm::kill` waits for
    Firecracker to exit. The cgroup move is joined before Firecracker is
-   killed, so it never acts on a reused pid or recreates a removed cgroup.
+   killed, so it never acts on a reused pid or recreates a removed cgroup;
+   liveness checks never reap (`waitid` with `WNOWAIT`), only that kill does.
+   The pager reads guest memory and the pagemap through `/proc/PID/mem` and
+   `/proc/PID/pagemap` opened at `set_pid`, which stay bound to Firecracker's
+   memory whatever happens to its pid.
    Unit test `host::a_dead_holders_firecrackers_die_before_its_name_or_address_is_free`;
    faults `source_killed`, `target_killed`, `incoming_killed`, `start_killed`.
 3. **Instance identity.** One process is one VM instance, named by pid and

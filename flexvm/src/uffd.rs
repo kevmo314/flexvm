@@ -15,7 +15,7 @@
 //! A page leaves BASE, ZERO or REMOTE only by being claimed; its claimant
 //! installs it and then settles it, so an install that raced a REMOVE never
 //! overwrites the newer state (see `Pages`). PRESENT pages are read out of the
-//! paused Firecracker with process_vm_readv when this host is a migration source.
+//! paused Firecracker through its /proc/PID/mem when this host is a migration source.
 //!
 //! Write tracking: once a VM has been checkpointed while running, its memory is
 //! also registered for write-protect faults (no UFFDIO_API feature needed), and
@@ -720,8 +720,10 @@ pub struct Pager {
     /// Held while handling a fault and while a checkpoint freezes memory, so
     /// a fault read before the freeze cannot unprotect a page after it.
     wp: Mutex<()>,
-    /// Firecracker's /proc/PID/pagemap, to tell populated pages apart.
-    pagemap: OnceLock<std::fs::File>,
+    /// Firecracker's /proc/PID/mem and /proc/PID/pagemap (to tell populated
+    /// pages apart), opened while it was known alive: they stay bound to its
+    /// memory, so reads never reach a process that reused its pid.
+    mem: OnceLock<(std::fs::File, std::fs::File)>,
     /// Test fault: the next freeze fails to re-protect pages.
     pub fail_protect: AtomicBool,
     /// Test fault: write faults during a copy dawdle before claiming pages.
@@ -800,7 +802,7 @@ impl Pager {
             registered_wp: AtomicBool::new(false),
             cow: Mutex::new(None),
             wp: Mutex::new(()),
-            pagemap: OnceLock::new(),
+            mem: OnceLock::new(),
             fail_protect: AtomicBool::new(false),
             wp_race: AtomicBool::new(false),
             tail_fail: AtomicU32::new(0),
@@ -1121,6 +1123,12 @@ impl Pager {
     pub fn set_pid(&self, pid: u32) -> Result<()> {
         self.pid.store(pid, Ordering::SeqCst);
         let fd = crate::util::pidfd_open(pid).map_err(|e| format!("pidfd_open({pid}): {e}"))?;
+        let open = |f: &str| std::fs::File::open(format!("/proc/{pid}/{f}")).map_err(|e| format!("/proc/{pid}/{f}: {e}"));
+        let mem = (open("mem")?, open("pagemap")?);
+        if crate::util::pidfd_wait(&fd, Duration::ZERO)? {
+            bail!("firecracker {pid} exited");
+        }
+        let _ = self.mem.set(mem);
         let _ = self.pidfd.set(fd);
         Ok(())
     }
@@ -1161,6 +1169,10 @@ impl Pager {
         };
         let pid = self.pid.load(Ordering::SeqCst);
         let Ok(maps) = std::fs::read_to_string(format!("/proc/{pid}/maps")) else { return true };
+        // Read by pid: only Firecracker's while it has not exited.
+        if self.pidfd.get().is_none_or(|fd| crate::util::pidfd_wait(fd, Duration::ZERO).unwrap_or(true)) {
+            return true;
+        }
         let end = addr + (n * PAGE_SIZE) as u64;
         !maps.lines().any(|l| {
             let (a, b) = l.split_whitespace().next().unwrap_or("").split_once('-').unwrap_or(("", ""));
@@ -1319,12 +1331,8 @@ impl Pager {
         if offset + buf.len() as u64 > m.offset + m.size as u64 {
             bail!("read crosses a region boundary");
         }
-        let local = libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() };
-        let remote = libc::iovec { iov_base: (m.base_host_virt_addr + (offset - m.offset)) as *mut _, iov_len: buf.len() };
-        let pid = self.pid.load(Ordering::SeqCst) as libc::pid_t;
-        if unsafe { libc::process_vm_readv(pid, &local, 1, &remote, 1, 0) } != buf.len() as isize {
-            bail!("process_vm_readv: {}", io::Error::last_os_error());
-        }
+        let Some((mem, _)) = self.mem.get() else { bail!("no firecracker to read guest memory from") };
+        std::os::unix::fs::FileExt::read_exact_at(mem, buf, m.base_host_virt_addr + (offset - m.offset)).map_err(|e| format!("reading guest memory: {e}"))?;
         Ok(())
     }
 
@@ -1354,8 +1362,12 @@ impl Pager {
             if unsafe { libc::poll(pfd.as_mut_ptr(), 2, timeout) } < 0 {
                 continue;
             }
-            if pfd[0].revents & (libc::POLLERR | libc::POLLHUP) != 0 {
-                break;
+            // Test fault `uffd_err`: the uffd turns blocking, which the kernel reports as POLLERR.
+            if pfd[0].revents == 0 && crate::host::fault("uffd_err") {
+                unsafe { libc::fcntl(fd, libc::F_SETFL, libc::fcntl(fd, libc::F_GETFL) & !libc::O_NONBLOCK) };
+            }
+            if pfd[0].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                return self.fail(format!("the userfaultfd cannot be polled (revents {:#x})", pfd[0].revents));
             }
             if pfd[1].revents & libc::POLLIN != 0 {
                 unsafe { libc::read(wake, (&mut 0u64 as *mut u64).cast(), 8) };
@@ -1629,13 +1641,7 @@ impl Pager {
 
     /// Which of `n` pages from `page` are populated (or swapped out) in Firecracker.
     fn populated(&self, page: usize, n: usize) -> io::Result<Vec<bool>> {
-        let f = match self.pagemap.get() {
-            Some(f) => f,
-            None => {
-                let f = std::fs::File::open(format!("/proc/{}/pagemap", self.pid.load(Ordering::SeqCst)))?;
-                self.pagemap.get_or_init(|| f)
-            }
-        };
+        let Some((_, f)) = self.mem.get() else { return Err(io::Error::other("no firecracker pagemap")) };
         let mut raw = vec![0u8; n * 8];
         std::os::unix::fs::FileExt::read_exact_at(f, &mut raw, self.addr(page)? / PAGE_SIZE as u64 * 8)?;
         Ok(raw.chunks(8).map(|e| u64::from_le_bytes(e.try_into().unwrap()) & (3 << 62) != 0).collect())
@@ -1852,7 +1858,6 @@ impl Pager {
     pub fn abort_copy(&self) {
         if let Some(cow) = self.cow.lock().unwrap().as_ref() {
             cow.invalidate("the copy was aborted");
-            cow.stop();
         }
     }
 
