@@ -754,6 +754,10 @@ def guest_calls():
     check("guest calls: every exec finished", results["ok"] > 0 and not results["failed"], results)
     check("guest calls: md5 intact while paging in", got == m, got)
     check("guest calls: only on B", where(n) == {B: "running"}, where(n))
+    # Its vCPUs' TSCs (the guest's clocksource) in sync, however long restoring one took while
+    # the source served no pages; apart, the guest clock jumps by the difference after the step.
+    skews = tsc_skews(B, n)
+    check("guest calls: the vCPUs' TSCs agree", tscs_agree(skews), skews)
     err = guest_clock_error(B, n)
     check("guest calls: target stepped the guest clock", err is not None and abs(err) < 0.5, err)
     # A clock step the guest carried out but whose answer was lost goes again.
@@ -1284,6 +1288,45 @@ def marker(host, name):
 def marker_id(host, name):
     code, out = sh(host, name, 'p=$(cat /tmp/marker.pid); echo "$p $(cut -d" " -f2,22 /proc/$p/stat)"')
     return out if code == 0 else None
+
+
+# For each vCPU k after the first, reads the TSC on vCPU 0, k, 0 (rdtsc, run from an executable
+# page), ten times, and prints the tightest bracket: "k skew bracket", in seconds, where skew is
+# vCPU k's TSC minus the midpoint of vCPU 0's two readings around it. The read on k happened
+# somewhere in the bracket, so the true difference is within bracket/2 of skew.
+TSC_SKEW = r"""
+import ctypes, mmap, os
+buf = mmap.mmap(-1, 4096, prot=mmap.PROT_READ | mmap.PROT_WRITE | mmap.PROT_EXEC)
+buf.write(bytes([0x0f, 0x31, 0x48, 0xc1, 0xe2, 0x20, 0x48, 0x09, 0xd0, 0xc3]))
+rdtsc = ctypes.CFUNCTYPE(ctypes.c_uint64)(ctypes.addressof(ctypes.c_char.from_buffer(buf)))
+f = "/sys/devices/system/cpu/cpu0/tsc_freq_khz"
+hz = int(open(f).read()) * 1e3 if os.path.exists(f) else float(next(l.split(":")[1] for l in open("/proc/cpuinfo") if l.startswith("cpu MHz"))) * 1e6
+for k in sorted(os.sched_getaffinity(0) - {0}):
+    best = None
+    for _ in range(10):
+        t = []
+        for cpu in (0, k, 0):
+            os.sched_setaffinity(0, {cpu})
+            t.append(rdtsc())
+        if best is None or t[2] - t[0] < best[1]:
+            best = ((t[1] - (t[0] + t[2]) / 2) / hz, (t[2] - t[0]) / hz)
+    print(k, best[0], best[1])
+"""
+
+
+def tsc_skews(host, name):
+    """{vCPU: (its TSC minus vCPU 0's, bracket)} in the guest, in seconds (None if unreadable)."""
+    code, out = sh(host, name, f"python3 -c '{TSC_SKEW}'")
+    try:
+        return {int(k): (float(skew), float(bracket)) for k, skew, bracket in (l.split() for l in out.splitlines())} if code == 0 else None
+    except ValueError:
+        return None
+
+
+def tscs_agree(skews, within=0.05):
+    """Every vCPU's TSC is within `within` s of vCPU 0's, measured with a bracket narrow enough
+    to tell (a read on vCPU k delayed by scheduling widens it, never shifts it past it)."""
+    return bool(skews) and all(bracket < within and abs(skew) <= within + bracket / 2 for skew, bracket in skews.values())
 
 
 def guest_clock_error(host, name):
