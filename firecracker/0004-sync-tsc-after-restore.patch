@@ -1,21 +1,36 @@
 --- a/src/vmm/src/arch/x86_64/vcpu.rs
 +++ b/src/vmm/src/arch/x86_64/vcpu.rs
-@@ -748,6 +748,30 @@
+@@ -7,6 +7,7 @@
+ 
+ use std::collections::BTreeMap;
+ use std::fmt::Debug;
++use std::os::fd::AsRawFd;
+ use std::sync::Arc;
+ 
+ use kvm_bindings::{
+@@ -748,6 +749,70 @@
          self.kvmclock_ctrl();
          Ok(())
      }
 +
-+    /// Sets the TSC, and the TSC deadline that counts in it, from `state` again. Called for
-+    /// every vCPU right after one another once all are restored: KVM takes TSC writes less
-+    /// than a second apart as meant to be in sync, and restoring one vCPU can take much longer
-+    /// (its MSRs map guest pages, which may still have to be paged in), which left the vCPUs'
-+    /// TSCs, the guest's clocksource, apart by as long.
-+    pub fn restore_tsc(&self, state: &VcpuState) -> Result<(), KvmVcpuError> {
++    /// `KVM_{HAS,GET,SET}_DEVICE_ATTR` on this vCPU (kvm-ioctls has them for aarch64 only).
++    fn device_attr(&self, nr: u64, attr: &kvm_bindings::kvm_device_attr) -> Result<(), kvm_ioctls::Error> {
++        // _IOW(KVMIO, nr, struct kvm_device_attr)
++        let req = (1u64 << 30) | ((std::mem::size_of::<kvm_bindings::kvm_device_attr>() as u64) << 16) | (0xae << 8) | nr;
++        // SAFETY: a vCPU fd and a kvm_device_attr whose addr points at a live u64.
++        match unsafe { libc::ioctl(self.fd.as_raw_fd(), req as _, attr as *const _) } {
++            0 => Ok(()),
++            _ => Err(kvm_ioctls::Error::last()),
++        }
++    }
++
++    /// Sets the given MSRs, of those `state` saved, again (TSC before TSC deadline).
++    fn restore_msrs(&self, state: &VcpuState, which: &[u32]) -> Result<(), KvmVcpuError> {
 +        let mut entries: Vec<_> = state
 +            .saved_msrs
 +            .iter()
 +            .flat_map(|msrs| msrs.as_slice().iter().copied())
-+            .filter(|msr| msr.index == MSR_IA32_TSC || msr.index == MSR_IA32_TSC_DEADLINE)
++            .filter(|msr| which.contains(&msr.index))
 +            .collect();
 +        entries.sort_by_key(|msr| msr.index != MSR_IA32_TSC);
 +        if entries.is_empty() {
@@ -28,6 +43,39 @@
 +        }
 +        Ok(())
 +    }
++}
++
++/// Once every vCPU is restored: gives them all vCPU 0's TSC offset, as they had on the
++/// source. Each vCPU's restore wrote its TSC, and KVM takes such writes as in sync only if
++/// they come within a second of each other, which restoring one vCPU can outlast (its MSRs map
++/// guest pages, which may still have to be paged in): the TSCs, the guest's clocksource, then
++/// ended up apart by as long. Exact with `KVM_VCPU_TSC_OFFSET` (Linux 5.16+), after which each
++/// vCPU's TSC deadline, which counts in its TSC, is set again; without it, the TSCs are
++/// written again back to back, which KVM syncs unless this is stopped for a second meanwhile.
++pub fn sync_tscs(vcpus: &[&KvmVcpu], states: &[VcpuState]) -> Result<(), KvmVcpuError> {
++    const KVM_SET_DEVICE_ATTR: u64 = 0xe1;
++    const KVM_GET_DEVICE_ATTR: u64 = 0xe2;
++    const KVM_HAS_DEVICE_ATTR: u64 = 0xe3;
++    let Some(first) = vcpus.first() else { return Ok(()) };
++    let mut offset = 0u64;
++    let attr = kvm_bindings::kvm_device_attr {
++        flags: 0,
++        group: kvm_bindings::KVM_VCPU_TSC_CTRL,
++        attr: u64::from(kvm_bindings::KVM_VCPU_TSC_OFFSET),
++        addr: std::ptr::addr_of_mut!(offset) as u64,
++    };
++    if first.device_attr(KVM_HAS_DEVICE_ATTR, &attr).is_err() || first.device_attr(KVM_GET_DEVICE_ATTR, &attr).is_err() {
++        warn!("KVM_VCPU_TSC_OFFSET unavailable: the vCPUs' TSCs are written again instead");
++        for (vcpu, state) in vcpus.iter().zip(states) {
++            vcpu.restore_msrs(state, &[MSR_IA32_TSC, MSR_IA32_TSC_DEADLINE])?;
++        }
++        return Ok(());
++    }
++    for (vcpu, state) in vcpus.iter().zip(states).skip(1) {
++        vcpu.device_attr(KVM_SET_DEVICE_ATTR, &attr).map_err(KvmVcpuError::VcpuSetMsrs)?;
++        vcpu.restore_msrs(state, &[MSR_IA32_TSC_DEADLINE])?;
++    }
++    Ok(())
  }
  
  impl Peripherals {
@@ -37,14 +85,14 @@
              .map_err(VcpuError::VcpuResponse)
              .map_err(BuildMicrovmFromSnapshotError::RestoreVcpus)?;
      }
-+    // The TSCs once more, back to back: KVM syncs them only if written within a second.
++    // One TSC offset for all, however long restoring each took.
 +    #[cfg(target_arch = "x86_64")]
-+    for (vcpu, state) in vcpus.iter().zip(microvm_state.vcpu_states.iter()) {
-+        vcpu.kvm_vcpu
-+            .restore_tsc(state)
-+            .map_err(VcpuError::VcpuResponse)
-+            .map_err(BuildMicrovmFromSnapshotError::RestoreVcpus)?;
-+    }
++    crate::arch::x86_64::vcpu::sync_tscs(
++        &vcpus.iter().map(|vcpu| &vcpu.kvm_vcpu).collect::<Vec<_>>(),
++        &microvm_state.vcpu_states,
++    )
++    .map_err(VcpuError::VcpuResponse)
++    .map_err(BuildMicrovmFromSnapshotError::RestoreVcpus)?;
  
      #[cfg(target_arch = "aarch64")]
      {
