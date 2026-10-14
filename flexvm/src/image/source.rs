@@ -214,12 +214,21 @@ fn pull(cache: &Path, mut reg: Registry, limits: &Limits) -> Result<Image> {
         let cached = if blob_path(&blobs, d)?.exists() { " (cached)" } else { "" };
         eprintln!("image: layer {}/{} {d} {:.1} MiB{cached}", i + 1, descs.len(), *size as f64 / 1048576.0);
     }
+    // Downloads are verified as they land; cached blobs only once unpacking needs them.
+    let fresh = std::sync::Mutex::new(HashMap::new());
     download_layers(&descs, |d, size| {
-        reg.clone().layer_blob(d, size, &blobs)?;
+        if !blob_path(&blobs, d)?.exists() {
+            let path = reg.clone().blob(d, size, &blobs)?;
+            fresh.lock().unwrap().insert(d.to_string(), path);
+        }
         Ok(())
     })?;
+    let fresh = fresh.into_inner().unwrap();
     let layers = descs.into_iter().map(|(d, size)| Layer {
-        src: Blob::Cached { blobs: blobs.clone(), registry: Box::new(reg.clone()), digest: d.clone(), size },
+        src: match fresh.get(&d).cloned() {
+            Some(path) => Blob::File(path),
+            None => Blob::Cached { blobs: blobs.clone(), registry: Box::new(reg.clone()), digest: d.clone(), size },
+        },
         digest: Some(d),
         size: Some(size),
     }).collect();
@@ -349,6 +358,25 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Barrier, Mutex};
+
+    #[test]
+    fn cached_layers_are_verified_when_opened() {
+        let dir = super::super::unpack::tests::tmpdir("blob-lazy");
+        let digest = sha256_hex(b"good");
+        let path = blob_path(&dir, &digest).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // A registry that hangs up at once: a corrupt blob cannot be repaired.
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let registry = Registry::new(Reference::parse(&format!("{}/test", server.local_addr().unwrap())).unwrap());
+        std::thread::spawn(move || server.incoming().for_each(drop));
+        let blob = Blob::Cached { blobs: dir.to_path_buf(), registry: Box::new(registry), digest, size: 4 };
+        std::fs::write(&path, b"good").unwrap();
+        let mut data = String::new();
+        blob.open().unwrap().0.read_to_string(&mut data).unwrap();
+        assert_eq!(data, "good");
+        std::fs::write(&path, b"evil").unwrap();
+        assert!(blob.open().is_err());
+    }
 
     #[test]
     fn layer_downloads_are_parallel_bounded_and_deduplicated() {

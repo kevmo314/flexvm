@@ -149,16 +149,6 @@ impl Registry {
         Ok((serde_json::from_slice(&body)?, digest))
     }
 
-    /// Defers checking cached layers until unpacking actually opens them.
-    pub fn layer_blob(&mut self, digest: &str, size: u64, blobs: &Path) -> Result<PathBuf> {
-        let path = blob_path(blobs, digest)?;
-        if path.exists() {
-            sync_dir(path.parent().unwrap())?;
-            return Ok(path);
-        }
-        self.blob(digest, size, blobs)
-    }
-
     /// Checks cached blobs before reuse; a corrupt one gets one fresh download, renamed over it so that
     /// concurrent pulls never see the path missing.
     pub fn blob(&mut self, digest: &str, size: u64, blobs: &Path) -> Result<PathBuf> {
@@ -256,21 +246,6 @@ fn docker_credentials(registry: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn cached_layers_are_not_verified_until_needed() {
-        let dir = super::super::unpack::tests::tmpdir("blob-lazy");
-        let digest = sha256_hex(b"good");
-        let path = blob_path(&dir, &digest).unwrap();
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, b"evil").unwrap();
-        let mut reg = Registry::new(Reference::parse("localhost:1/test").unwrap());
-        // No server: returning a corrupt cached layer must not attempt a download.
-        assert_eq!(reg.layer_blob(&digest, 4, &dir).unwrap(), path);
-        assert_eq!(std::fs::read(&path).unwrap(), b"evil");
-        assert_eq!(cached_blob(&digest, 4, &dir, || Ok(&b"good"[..])).unwrap(), path);
-        assert_eq!(std::fs::read(&path).unwrap(), b"good");
-    }
 
     #[test]
     fn corrupt_cached_blobs_are_downloaded_once() {
