@@ -565,29 +565,30 @@ mod tests {
         let open = || std::fs::File::options().create(true).append(true).open(&log).unwrap();
         let read = |n: &str| String::from_utf8(std::fs::read(d.join(n)).unwrap()).unwrap();
         assert!(output::append_capped(&log, b"one\n", 10), "under the cap");
-        // Past it: rotated, and the writer goes on in the new log.
+        // Past it: rotated; the next write starts a new log.
         assert!(output::append_capped(&log, b"two two two\n", 10));
         assert_eq!(read("vm.log.1"), "one\ntwo two two\n");
-        // Another writer's rotation is followed: no write goes to a stale file.
-        std::fs::rename(&log, d.join("vm.log.1")).unwrap();
-        assert!(output::append_capped(&log, b"three\n", 10));
-        assert_eq!(read("vm.log"), "three\n");
+        assert!(output::append_capped(&log, b"three\n", 10) && read("vm.log") == "three\n");
         // A whole write is never cut, even past the cap.
         output::append_capped(&log, &[b'x'; 100], 10);
         assert_eq!(read("vm.log.1").len(), "three\n".len() + 100);
         // A log that is gone (garbage collection's) is made again.
-        std::fs::remove_file(&log).unwrap();
         assert!(output::append_capped(&log, b"four\n", 10) && read("vm.log") == "four\n");
-        // A stopped holder of the lock holds a write up only for `STALL`: made
-        // unlocked, and the log, not the holder's to rotate meanwhile, is kept.
+        std::fs::remove_file(&log).unwrap();
+        assert!(output::append_capped(&log, b"five\n", 10) && read("vm.log") == "five\n");
+        // Another holder of its lock (stopped, or an arrival's shared one) holds
+        // writes up for at most `STALL` from each call, together, not in turn:
+        // made unlocked, and nothing rotated meanwhile.
         let held = open();
-        crate::host::flock(&held, libc::LOCK_EX).unwrap();
+        crate::host::flock(&held, libc::LOCK_SH).unwrap();
         let start = std::time::Instant::now();
-        assert!(output::append_capped(&log, b"five five\n", 10));
-        assert!(start.elapsed() < std::time::Duration::from_secs(3));
-        assert_eq!(read("vm.log"), "four\nfive five\n");
-        drop(held);
-        assert!(output::append_capped(&log, b"six\n", 10) && read("vm.log.1") == "four\nfive five\nsix\n");
+        let (l1, l2) = (log.clone(), log.clone());
+        let w = std::thread::spawn(move || output::append_capped(&l1, b"six six\n", 10));
+        assert!(output::append_capped(&l2, b"six six\n", 10) && w.join().unwrap());
+        assert!(start.elapsed() < std::time::Duration::from_millis(1800), "{:?}", start.elapsed());
+        assert_eq!(read("vm.log"), "five\nsix six\nsix six\n");
+        crate::host::flock(&held, libc::LOCK_UN).unwrap();
+        assert!(output::append_capped(&log, b"seven\n", 10) && read("vm.log.1") == "five\nsix six\nsix six\nseven\n");
         std::fs::remove_dir_all(d).unwrap();
     }
 
@@ -749,7 +750,9 @@ pub mod output {
         let targets = TARGETS.lock().unwrap();
         let mut logs = LOGS.lock().unwrap();
         for (i, t) in targets.iter().enumerate() {
-            if t.as_ref().is_some_and(|t| same_file(t, log)) {
+            if let Some(t) = t.as_ref().filter(|t| same_file(t, log)) {
+                // The arrival's lock on it (gc's sign of one alive) would keep it from rotating.
+                let _ = crate::host::flock(t, libc::LOCK_UN);
                 logs[i] = Some(log.into());
             }
         }
@@ -773,56 +776,35 @@ pub mod output {
         (path.starts_with(crate::host::run_dir()?) && !hidden && same_file(f, &path)).then_some(path)
     }
 
-    /// This process's own open of each capped log it writes: locking it
-    /// excludes other processes (a description they share, as an inherited
-    /// stdout, would not), the mutex this process's threads.
-    static OWN: Mutex<Vec<(PathBuf, File)>> = Mutex::new(Vec::new());
-
-    /// Appends `data` to the file at `log`, under that file's `flock`, so no
-    /// write goes to a generation another writer is rotating or removing.
-    /// Past `cap`, `log` is renamed `log.1` (replacing the one before) and a
-    /// new `log` is started. A lock not had within `STALL` (a stopped holder)
-    /// is done without: the append is made unlocked and nothing rotated.
-    /// Whether `data` was written; it is never written twice, and a failed
-    /// open is retried at the next call.
+    /// Appends `data` to the file at `log`, under that file's `flock` (taken
+    /// on an open of this call's own: one shared, as an inherited stdout, would
+    /// not exclude the others sharing it), so no write goes to a generation
+    /// another writer is rotating or removing. Past `cap`, `log` is renamed
+    /// `log.1` (replacing the one before); the next write starts a new `log`.
+    /// A lock not had within `STALL` of the call (a stopped holder) is done
+    /// without: the append is made unlocked and nothing rotated. Whether
+    /// `data` was written; it is never written twice.
     pub fn append_capped(log: &Path, data: &[u8], cap: u64) -> bool {
-        let open = || File::options().create(true).append(true).open(log);
-        let mut own = OWN.lock().unwrap();
-        let i = match own.iter().position(|(p, _)| p == log) {
-            Some(i) => i,
-            None => match open() {
-                Ok(f) => {
-                    own.push((log.into(), f));
-                    own.len() - 1
-                }
-                Err(_) => return false,
-            },
-        };
         let deadline = Instant::now() + STALL;
-        let locked = loop {
-            if !same_file(&own[i].1, log) {
-                // Rotated or removed: the old generation's lock goes with it.
-                let Ok(f) = open() else { return false };
-                own[i].1 = f;
-            }
-            match crate::host::flock(&own[i].1, libc::LOCK_EX | libc::LOCK_NB) {
-                Ok(()) if same_file(&own[i].1, log) => break true,
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline => std::thread::sleep(Duration::from_millis(1)),
-                Err(_) => break false,
+        let (f, locked) = loop {
+            let Ok(f) = File::options().create(true).append(true).open(log) else { return false };
+            let locked = loop {
+                match crate::host::flock(&f, libc::LOCK_EX | libc::LOCK_NB) {
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline => std::thread::sleep(Duration::from_millis(1)),
+                    r => break r.is_ok(),
+                }
+            };
+            // Rotated or removed while waiting: again, at the file there now.
+            if !locked || same_file(&f, log) {
+                break (f, locked);
             }
         };
-        let written = (&own[i].1).write_all(data).is_ok();
-        if locked && own[i].1.metadata().is_ok_and(|m| m.len() > cap) {
+        let written = (&f).write_all(data).is_ok();
+        if locked && f.metadata().is_ok_and(|m| m.len() > cap) {
             let mut old = log.as_os_str().to_owned();
             old.push(".1");
-            if std::fs::rename(log, old).is_ok() {
-                if let Ok(f) = open() {
-                    own[i].1 = f;
-                }
-            }
+            let _ = std::fs::rename(log, old);
         }
-        let _ = crate::host::flock(&own[i].1, libc::LOCK_UN);
         written
     }
 
