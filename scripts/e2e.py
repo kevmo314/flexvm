@@ -50,7 +50,7 @@ p.add_argument("--image-cache", help="keep the pulled image here, and build from
 # listeners (target_killed, suspend_resume, unit_restart).
 FAULTS = ("basic route lost_ack unknown refused pages_blip pages_dead_restore prepared_retry resume_kill exec_race guest_calls "
           "checkpoint_restore checkpoint_fork checkpoint_corrupt held_restore_frozen cow_exact cow_collapsed unplug_collapsed cow_abort ckpt_incremental "
-          "ckpt_failed_stop ckpt_rearm prepare_fail fc_prepare slow_preload ckpt_packet_hold "
+          "ckpt_failed_stop ckpt_rearm prepare_fail fc_prepare slow_preload pull_enomem ckpt_packet_hold "
           "abort_superseded gen_zero signals suspend_gen standby restore_ip_peer late_withdrawal "
           "incoming_killed start_killed claim_killed standby_stalled standby_stop_claim fc_died cow_grow plug_race plug_storm suspend_debris revoked_publication "
           "same_host_order same_host_slow_route same_host_flood same_host_late_handover same_host_backlog ckpt_backlog ckpt_paused_backlog rx_stall arrival_abort_route arrival_killed_route handoff_superseded mem_high mem_high_migrate mem_high_evict "

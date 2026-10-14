@@ -210,7 +210,7 @@ FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_be
           "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "resume_kill",
           "prepare_fail", "short_incoming", "slow_preload", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
           "started_fsync", "started_unmark", "start_stall", "incoming_stall", "claim_stall", "handoff_stall", "ckpt_wp_race",
-          "fetch_tail_enomem", "fetch_enomem_stuck", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo", "release_stall", "release_late", "no_plug", "pause_lost", "tap_backlog", "tap_backlog_stuck", "pause_unknown", "no_collapse", "collapse_slow", "pages_slow")
+          "fetch_tail_enomem", "fetch_enomem_stuck", "pull_enomem", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo", "release_stall", "release_late", "no_plug", "pause_lost", "tap_backlog", "tap_backlog_stuck", "pause_unknown", "no_collapse", "collapse_slow", "pages_slow")
 
 
 def disarm():
@@ -2889,6 +2889,25 @@ def fetch_tail_enomem():
     cleanup(n)
 
 
+def pull_enomem():
+    """Background pull copies that fail for a while (ENOMEM, a transient
+    error) are retried as a fault's are, within the fault deadline, instead
+    of failing the VM at the first: the pull completes and the source lets
+    go."""
+    n = "ft-pullnomem"
+    m = setup(n, mib=200)
+    clear_log(B, n)
+    fault(B, "pull_enomem", 60000)
+    ok(migrate(A, n, B))
+    st = wait_released(B, n, timeout=30)
+    fault(B, "pull_enomem", 0)
+    check("pull enomem: every page arrives and the source lets go",
+          st["released"] is True and st["background_pull_ms"] is not None and st["failed"] is None, st)
+    check("pull enomem: the pullers retried", "background pull" in log(B, n) and "retrying" in log(B, n), log(B, n)[-500:])
+    check("pull enomem: memory intact", md5(B, n) == m)
+    cleanup(n)
+
+
 def fetch_enomem_stuck():
     """Pages a fault needs that keep failing to install (ENOMEM on every
     copy, the pullers held off) make the target give up within the fault
@@ -5509,7 +5528,7 @@ SCENARIOS = dict(
     unit_restart=unit_restart, log_cap=log_cap, gc_debris=gc_debris, prefix_change=prefix_change, arrival_log=arrival_log, template_tap=template_tap,
     incoming_killed=incoming_killed, start_killed=start_killed, claim_killed=claim_killed, standby_stalled=standby_stalled, fc_died=fc_died,
     sigkill_restart=sigkill_restart, listen_trickle=listen_trickle,
-    cow_wp_race=cow_wp_race, fetch_tail_enomem=fetch_tail_enomem, fetch_enomem_stuck=fetch_enomem_stuck,
+    cow_wp_race=cow_wp_race, fetch_tail_enomem=fetch_tail_enomem, fetch_enomem_stuck=fetch_enomem_stuck, pull_enomem=pull_enomem,
     collapse_abort=collapse_abort, collapse_ckpt_fail=collapse_ckpt_fail, ckpt_paused_backlog=ckpt_paused_backlog, same_host_order=same_host_order, same_host_slow_route=same_host_slow_route, same_host_flood=same_host_flood, same_host_late_handover=same_host_late_handover, same_host_backlog=same_host_backlog, ckpt_backlog=ckpt_backlog, rx_stall=rx_stall, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,
     handoff_superseded=handoff_superseded, suspend_cmd=suspend_cmd, fc_died_busy=fc_died_busy, pause_cmd_start=pause_cmd_start, suspend_died=suspend_died)
 names = [n for s in args.scenarios for n in (list(SCENARIOS) if s == "all" else [s])]

@@ -241,6 +241,8 @@ pub struct Pager {
     pub tail_fail: AtomicU32,
     /// Test fault: from then on every copy of a fault-fetched run fails (ENOMEM), and the pullers wait.
     pub stuck_from: Mutex<Option<Instant>>,
+    /// Test fault: this many background pull copies fail (ENOMEM), one after another.
+    pub pull_fail: AtomicU32,
     /// Initial page states and their origin, applied when Firecracker connects (see `seed`).
     initial: Mutex<Option<(Runs, Origin)>>,
     /// Signalled by `seed` and `stop`, for a handshake waiting for the seed.
@@ -304,6 +306,7 @@ impl Pager {
             wp_race: AtomicBool::new(false),
             tail_fail: AtomicU32::new(0),
             stuck_from: Mutex::new(None),
+            pull_fail: AtomicU32::new(0),
             initial: Mutex::new(initial),
             seeded: Condvar::new(),
             awaiting_seed: AtomicBool::new(false),

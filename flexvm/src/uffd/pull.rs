@@ -1,6 +1,6 @@
 use super::event::PULL;
-use super::fetch::{partial, Failed, Fetch, FetchFailure, Link};
-use super::{Pager, ALL, FAULT_FETCHERS, PAGE_SIZE, PULL_RUN, REMOTE};
+use super::fetch::{partial, Failed, Fetch, FetchFailure, Link, BACKOFF_MIN};
+use super::{os, Pager, ALL, FAULT_FETCHERS, FAULT_TIMEOUT, PAGE_SIZE, PULL_RUN, REMOTE};
 use crate::checkpoint::PageFile;
 use std::io;
 use std::sync::atomic::Ordering;
@@ -121,7 +121,13 @@ impl Pager {
             let started = Instant::now();
             // A source that is slow, not gone: on with the rest of the run.
             let mut retry = |e: &io::Error| partial(e) && !self.stop.load(Ordering::SeqCst);
-            let res = self.install_claimed(i, n, buf, fetch, &mut retry, |p, c, src| self.populate(p, c, Some(src)));
+            let res = self.install_claimed(i, n, buf, fetch, &mut retry, |p, c, src| {
+                // Test fault `pull_enomem`.
+                if self.pull_fail.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |k| k.checked_sub(1)).is_ok() {
+                    return Err(os(libc::ENOMEM));
+                }
+                self.populate(p, c, Some(src))
+            });
             self.fault_stats.record(PULL, started.elapsed());
             match res {
                 Ok(()) => i += n,
@@ -129,7 +135,18 @@ impl Pager {
                     self.gone();
                     return false;
                 }
-                Err(Failed::Fetch(e) | Failed::Install(e)) => {
+                Err(Failed::Install(e)) => {
+                    // As for a fault's fetch: an install that fails (memory short, say) gave its pages back, and is
+                    // tried again until some of them have kept failing for `FAULT_TIMEOUT`, whoever claimed them.
+                    let since = pages.failing_since(i, n).unwrap_or_else(Instant::now);
+                    if since.elapsed() >= FAULT_TIMEOUT {
+                        self.fail(format!("background pull {t}: installing pages {i}+{n}: {e}"));
+                        return false;
+                    }
+                    eprintln!("uffd: background pull {t}: installing pages {i}+{n}: {e}; retrying");
+                    thread::sleep(BACKOFF_MIN);
+                }
+                Err(Failed::Fetch(e)) => {
                     self.fail(format!("background pull {t} failed: {e}"));
                     return false;
                 }

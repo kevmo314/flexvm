@@ -15,7 +15,7 @@ const SOURCE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Fetched pages are installed as they arrive: the first at once, then at least this many at a time.
 pub(super) const STREAM_RUN: usize = 16;
 const BACKOFF_MAX: Duration = Duration::from_secs(1);
-const BACKOFF_MIN: Duration = Duration::from_millis(10);
+pub(super) const BACKOFF_MIN: Duration = Duration::from_millis(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// How long one page request may take, writing it and reading its reply, before its connection is given up as lost (and

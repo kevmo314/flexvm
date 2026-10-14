@@ -705,6 +705,9 @@ impl Proc {
         if fault("fetch_tail_enomem") {
             prepared.pager.tail_fail.store(1, Ordering::SeqCst);
         }
+        if fault("pull_enomem") {
+            prepared.pager.pull_fail.store(40, Ordering::SeqCst);
+        }
         if fault("fetch_enomem_stuck") {
             // Late enough for the load (and the resume) to get their pages.
             *prepared.pager.stuck_from.lock().unwrap() = Some(Instant::now() + Duration::from_millis(500));
