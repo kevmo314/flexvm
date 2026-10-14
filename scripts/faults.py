@@ -609,13 +609,14 @@ def target_killed():
     fcs = [json.load(open(os.path.join(work, d, "fc")))["pid"] for d in os.listdir(work) if os.path.exists(os.path.join(work, d, "fc"))]
     os.kill(pid, signal.SIGKILL)
     stall.join()
+    # The status fault still keeps the source from hearing anything.
+    w = where(n)
+    check("target killed: the source still holds its paused copy", not r["ok"] and w.get(A) == "source", (r, w or "gone everywhere"))
     migs = os.path.join(B.state, "migs")
     newest = max(os.listdir(migs), key=lambda m: os.path.getmtime(os.path.join(migs, m)))
     # Asked at once, before the Firecracker can have died of its own accord.
     fault(B, "status", 0)
     st = peer(B, {"op": "migration", "mig": int(newest)})
-    w = where(n)
-    check("target killed: the source still holds its paused copy", not r["ok"] and w.get(A) == "source", (r, w or "gone everywhere"))
     check("target killed: aborted, only once its firecracker is dead",
           st.get("ok") and st["result"]["outcome"] == "aborted" and not any(alive(p) for p in fcs), (st, fcs))
     # The listener restarts too: nothing it knows is in memory.
