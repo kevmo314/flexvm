@@ -574,12 +574,6 @@ impl Host {
     /// durably `GEN_BLOCK` at a time.
     fn next_gen(&self, seen: u64) -> Result<u64> {
         const GEN_BLOCK: u64 = 1024;
-        #[derive(Serialize, Deserialize)]
-        struct Gens {
-            next: u64,
-            reserved: u64,
-            boot: String,
-        }
         let path = self.state.join("addrs").join(".gens");
         if boot_id().is_empty() {
             bail!("cannot read the boot id: generations would not be ordered across a reboot");
@@ -596,9 +590,16 @@ impl Host {
         Ok(gen)
     }
 
+    /// The newest generation taken from a peer or a record: within
+    /// `GEN_WINDOW` of this host's own, so one bad value cannot exhaust them.
+    fn gen_ceiling(&self) -> Result<u64> {
+        let g = load::<Gens>(&self.state.join("addrs").join(".gens"))?.map_or(0, |g| g.next.max(g.reserved));
+        Ok(g.saturating_add(GEN_WINDOW).min(GEN_MAX))
+    }
+
     pub fn claim_incoming(&self, l: &Locked, holder: &str, ip: Ipv4Addr, gen: u64) -> Result<AddrClaim> {
         let mut a = self.addr(l, ip)?;
-        if gen == 0 || gen > GEN_MAX {
+        if gen == 0 || gen > self.gen_ceiling()? {
             bail!("{ip}: an arrival must carry its address's generation (not {gen})");
         }
         if self.held(&a) && a.holder.as_deref() != Some(holder) {
@@ -654,8 +655,9 @@ impl Host {
     /// `via` None is a withdrawal. False if stale (older, or announcing a
     /// withdrawn generation). A withdrawal frees a loan of that gen or older.
     pub fn observe(&self, l: &Locked, ip: Ipv4Addr, gen: u64, via: Option<Ipv4Addr>) -> Result<bool> {
+        let ceiling = self.gen_ceiling()?;
         self.update(l, ip, true, |a| {
-            if gen == 0 || gen > GEN_MAX || gen < a.seen || (gen == a.seen && a.withdrawn && via.is_some()) {
+            if gen == 0 || gen > ceiling || gen < a.seen || (gen == a.seen && a.withdrawn && via.is_some()) {
                 return false;
             }
             (a.seen, a.withdrawn, a.via) = (gen, via.is_none(), via);
@@ -906,6 +908,15 @@ fn boottime_ms() -> u64 {
 }
 const ALLOC_HINT: &str = ".next";
 const GEN_MAX: u64 = u64::MAX / 2;
+/// Far more generations than any host hands out ahead of another.
+const GEN_WINDOW: u64 = 1 << 32;
+
+#[derive(Serialize, Deserialize)]
+struct Gens {
+    next: u64,
+    reserved: u64,
+    boot: String,
+}
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Addr {
@@ -2093,7 +2104,7 @@ mod tests {
         let h = host("gen-bound");
         let l = h.lock().unwrap();
         let addr = ip("10.9.0.1");
-        for gen in [0, GEN_MAX + 1, u64::MAX] {
+        for gen in [0, GEN_WINDOW + 1, GEN_MAX + 1, u64::MAX] {
             assert!(h.claim_incoming(&l, "incoming", addr, gen).is_err());
             assert!(!h.observe(&l, addr, gen, Some(ip("10.1.0.2"))).unwrap());
             assert!(!h.observe(&l, addr, gen, None).unwrap());
@@ -2107,6 +2118,8 @@ mod tests {
         let l = h.lock().unwrap();
         let addr = ip("10.9.0.1");
         let path = h.state.join("addrs/.gens");
+        let top = Gens { next: GEN_MAX - GEN_WINDOW, reserved: GEN_MAX - GEN_WINDOW, boot: boot_id().into() };
+        store(&path, &top, true).unwrap();
         h.lend_new(&l, ip("10.9.0.2")).unwrap();
         let before = std::fs::read(&path).unwrap();
         for gen in [GEN_MAX - 1024, GEN_MAX - 1, GEN_MAX] {
