@@ -316,9 +316,9 @@ fn configure(c: &mut host::Config, args: &Args, addr: Option<&str>) -> Result<()
         c.evict_mib = Some(args.num("evict-at", 0)?);
     }
     if let Some(p) = args.get("prefix") {
-        // A template build's tap is PREFIX tpl PID: 15 bytes at most.
-        if p.is_empty() || p.len() > 5 || !p.bytes().all(|b| b.is_ascii_alphanumeric()) {
-            bail!("bad --prefix {p:?}: 1 to 5 letters or digits");
+        // Tap names are 15 bytes at most: PREFIX, a pid in hex (up to 6) and a suffix.
+        if p.is_empty() || p.len() > 8 || !p.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)) {
+            bail!("bad --prefix {p:?}: 1 to 8 letters, digits, '-', '_' or '.'");
         }
         c.prefix = p.into();
     }

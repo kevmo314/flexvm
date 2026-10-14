@@ -539,10 +539,11 @@ fn wait_reporting_done(fc: &Firecracker, metrics: &Path, expect_mib: u64) -> Res
     Ok((total >> 20, quiet >= 4 && total >> 20 >= expect_mib))
 }
 
-/// A template build's tap: the host's tap prefix, `tpl` and the build's pid,
-/// which garbage collection sweeps once that pid is proven gone.
+/// A template build's tap: the host's tap prefix, `x` and the build's pid
+/// in hex (a VM process's taps have a `t` after theirs), which garbage
+/// collection sweeps once that pid is proven gone.
 pub fn tap(prefix: &str) -> String {
-    format!("{prefix}tpl{}", std::process::id())
+    format!("{prefix}x{:x}", std::process::id())
 }
 
 #[allow(clippy::too_many_arguments)]

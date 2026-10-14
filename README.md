@@ -149,7 +149,7 @@ flexvm config                    # show it
 flexvm config --dns ''           # unset (--underlay and --announce-dev too)
 ```
 
-`--prefix P` (1 to 5 letters or digits, default `fv`) names the host's taps
+`--prefix P` (up to 8 letters, digits, `-`, `_` or `.`; default `fv`) names the host's taps
 and cgroups; `config` refuses to change it while VMs run, whose taps keep
 the old name.
 

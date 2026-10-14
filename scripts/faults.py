@@ -4381,7 +4381,7 @@ def arrival_log():
 
 
 def template_tap():
-    """A template build SIGKILLed after making its tap (PREFIX tpl PID): the
+    """A template build SIGKILLed after making its tap (PREFIX x PID): the
     tap outlives it until a sweep finds the pid gone. A build tap whose pid
     lives is kept."""
     name = f"ft-tpltap-{os.getpid()}"
@@ -4392,13 +4392,13 @@ def template_tap():
         prefix = "fv"
     p = subprocess.Popen([BIN, "--state", A.state, "--run", A.run, "template", name, "--vcpus", "1", "--max", "512"],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=ENV)
-    tap = f"{prefix}tpl{p.pid}"
+    tap = f"{prefix}x{p.pid:x}"
     up = wait_for(lambda: os.path.exists(f"/sys/class/net/{tap}"), 30)
     p.kill()
     p.wait()
     check("template tap: made by the build", up, tap)
     check("template tap: left by the killed build", os.path.exists(f"/sys/class/net/{tap}"))
-    live = f"{prefix}tpl{os.getpid()}"
+    live = f"{prefix}x{os.getpid():x}"
     subprocess.run(["ip", "tuntap", "add", "dev", live, "mode", "tap"], check=True)
     try:
         ok(cli_json(A, "debug", "gc"))

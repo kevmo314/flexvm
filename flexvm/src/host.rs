@@ -1120,11 +1120,16 @@ pub fn reap(run: &Path, owner: &Ident) -> Result<()> {
 }
 
 /// The process a tap was made for: a VM process's (PREFIX, its pid in hex,
-/// `t`, a counter) or a template build's (PREFIX `tpl` pid, `template::tap`).
+/// `t`, a counter) or a template build's (PREFIX `x` pid in hex,
+/// `template::tap`; earlier builds' PREFIX `tpl` pid in decimal).
 fn tap_owner(name: &str, prefix: &str) -> Option<u32> {
     let rest = name.strip_prefix(prefix)?;
+    let number = |s: &str, radix| (!s.is_empty() && s.chars().all(|c| c.is_digit(radix))).then(|| u32::from_str_radix(s, radix).ok()).flatten();
     if let Some(pid) = rest.strip_prefix("tpl") {
-        return pid.bytes().all(|b| b.is_ascii_digit()).then(|| pid.parse().ok()).flatten();
+        return number(pid, 10);
+    }
+    if let Some(pid) = rest.strip_prefix('x') {
+        return number(pid, 16);
     }
     rest.split_once('t').and_then(|(p, _)| u32::from_str_radix(p, 16).ok())
 }
@@ -1595,9 +1600,10 @@ mod tests {
     fn taps_and_cgroups_name_their_process() {
         assert_eq!(tap_owner("fv1a2bt0", "fv"), Some(0x1a2b));
         assert_eq!(tap_owner("fv1a2bt1f", "fv"), Some(0x1a2b));
-        assert_eq!(tap_owner("fvtpl61612", "fv"), Some(61612), "a template build's");
-        assert_eq!(tap_owner("fctpl61612", "fc"), Some(61612));
-        for (tap, prefix) in [("fvtpl61612", "fc"), ("fvtpl", "fv"), ("fvtpl12x", "fv"), ("fvtpl+1", "fv"), ("eth0", "fv"), ("fvxyz", "fv")] {
+        assert_eq!(tap_owner("fvxf0ac", "fv"), Some(0xf0ac), "a template build's");
+        assert_eq!(tap_owner("fvci0.1ax3fffff", "fvci0.1a"), Some(0x3fffff));
+        assert_eq!(tap_owner("fvtpl61612", "fv"), Some(61612), "an earlier template build's");
+        for (tap, prefix) in [("fvtpl61612", "fc"), ("fvtpl", "fv"), ("fvtpl12x", "fv"), ("fvtpl+1", "fv"), ("fvx", "fv"), ("fvx+1", "fv"), ("fvxg", "fv"), ("eth0", "fv"), ("fvxyz", "fv")] {
             assert_eq!(tap_owner(tap, prefix), None, "{tap} under {prefix}");
         }
         assert_eq!(cgroup_owner("idle-4242-3"), Some(4242));

@@ -151,7 +151,7 @@ VM process starts and, from every listener and VM process, about every 30 s
 (whichever process finds `RUN/.gc` older than that sweeps; one sweep at a
 time under `RUN/.gc.lock`), so a host with no VM starting still sweeps.
 What a process owns goes once that process is proven gone: taps
-(`<prefix><pid hex>t<n>`, and a template build's `<prefix>tpl<pid>`),
+(`<prefix><pid hex>t<n>`, and a template build's `<prefix>x<pid hex>`),
 cgroups (`idle-<pid>-<n>`, `vm-<pid>`), work directories, names, a standby
 VM's socket (its `PID.lock` free), an arrival's log (no lock on it, 5 s
 old). Logs in `RUN/vms` and `standby.log`s past 8 MiB are cut, in place, to
@@ -505,7 +505,7 @@ where it is kept and what tests it.
    when it passes the socket on. Page connections are passed to the VM named, which serves them
    only as the source of the migration id they name.
 9. **Shared resources have one owner.** Socket roots, work directories, taps
-   (`<prefix><pid>t<n>`, a template build's `<prefix>tpl<pid>`) and cgroups
+   (`<prefix><pid>t<n>`, a template build's `<prefix>x<pid>`) and cgroups
    (`idle-<pid>-<n>`, `vm-<pid>`) are named after the owning process and only swept once it is gone; each process has its own
    hold TUN (not persistent: it goes with the process); `unroute` happens
    under the host lock and only for an address the process still holds;
