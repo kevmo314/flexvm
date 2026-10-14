@@ -86,39 +86,60 @@ pub fn set(host: &Host, template: &str, n: usize) -> Result<Value> {
     Ok(json!({"template": template, "standby": n, "started": started}))
 }
 
+/// Periodic recovery runs in listeners and non-standby VM processes. A
+/// nonblocking refill lock avoids piling up workers behind a slow restore.
+pub fn maintain(host: Host) {
+    std::thread::spawn(move || loop {
+        for template in templates(&host) {
+            if let Err(e) = refill_by(&host, &template, false) {
+                eprintln!("standby {template}: {e}");
+            }
+        }
+        std::thread::sleep(Duration::from_secs(5));
+    });
+}
+
 /// Starts standby VMs up to the target and waits for them. Serialised per
 /// template so the ones starting are counted.
 pub fn refill(host: &Host, template: &str) -> Result<usize> {
+    refill_by(host, template, true)
+}
+
+fn refill_by(host: &Host, template: &str, wait: bool) -> Result<usize> {
     let d = dir(host, template);
     std::fs::create_dir_all(&d)?;
     let lock = File::create(d.join(".refill"))?;
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        bail!("standby {template}: {}", std::io::Error::last_os_error());
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | if wait { 0 } else { libc::LOCK_NB }) } != 0 {
+        let e = std::io::Error::last_os_error();
+        if !wait && e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            return Ok(0);
+        }
+        return Err(e.into());
     }
     let want = target(host, template).saturating_sub(live(host, template).len());
     if want == 0 {
-        return Ok(0);
-    }
-    if crate::vmproc::host_available_mib() < host.cfg.reserve_mib + 256 {
-        eprintln!("standby {template}: not starting {want} standby vms, the host is low on memory");
         return Ok(0);
     }
     let mut ready = Vec::new();
     let log = std::fs::OpenOptions::new().create(true).append(true).open(d.join("standby.log"))?;
     let args = [host.state.as_os_str(), host.run.as_os_str(), template.as_ref()];
     for _ in 0..want {
+        if !host.admit(256) {
+            break;
+        }
         let (r, w) = std::os::unix::net::UnixStream::pair()?;
         let args = ["--state".as_ref(), args[0], "--run".as_ref(), args[1], "run".as_ref(), "--standby".as_ref(), "--template".as_ref(), args[2]];
         crate::util::spawn_self(&args, &log, w.as_raw_fd(), &[("FLEXVM_NOTIFY_FD", "3")])?;
         ready.push(r);
     }
+    let started = ready.len();
     for r in ready {
         let reply = crate::util::recv_json(&mut BufReader::new(r))?.ok_or("a standby vm failed to start (see its log)")?;
         if reply["ok"] != json!(true) {
             bail!("a standby vm failed to start: {}", reply["error"]);
         }
     }
-    Ok(want)
+    Ok(started)
 }
 
 /// What standby loads of a template touch, saved for migrations to preload.
@@ -360,3 +381,27 @@ fn wait_for_reseed(vsock: &std::path::Path) -> Result<()> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recovery_finds_persistent_targets_and_respects_refill_lock_and_reserve() {
+        let root = std::env::temp_dir().join(format!("flexvm-refill-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        crate::host::write_file(&host.state.join("standby"), "default", b"1", true).unwrap();
+        // No runtime pool after a reboot; the persistent target is discovered.
+        assert_eq!(templates(&host), vec!["default"]);
+        let d = dir(&host, "default");
+        std::fs::create_dir_all(&d).unwrap();
+        let lock = File::create(d.join(".refill")).unwrap();
+        crate::host::flock(&lock, libc::LOCK_EX).unwrap();
+        assert_eq!(refill_by(&host, "default", false).unwrap(), 0);
+        drop(lock);
+        host.cfg.reserve_mib = u64::MAX / 2;
+        assert_eq!(refill_by(&host, "default", false).unwrap(), 0);
+        assert!(live(&host, "default").is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
