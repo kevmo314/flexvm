@@ -1,4 +1,4 @@
-//! On-disk manifest and pagemap validation, and canonical memory hashes.
+//! On-disk manifest and pagemap parsing, and canonical memory hashes.
 use std::{collections::BTreeMap, net::Ipv4Addr};
 use serde::{Deserialize, Serialize};
 use crate::{template::{Hash, Template}, util::{Result, PAGE_SIZE}};
@@ -100,28 +100,6 @@ impl<'a> Canon<'a> {
 /// A page map run: (first page, count, kind, checkpoint's index in its
 /// chain, index of the first in that checkpoint's `pages`).
 pub(super) type Run = (u64, u64, u64, usize, u64);
-
-pub(super) fn overlay(base: &[Run], top: &[Run]) -> Vec<Run> {
-    let mut out: Vec<Run> = Vec::with_capacity(base.len() + top.len());
-    for &(first, count, kind, ck, at) in base {
-        let end = first + count;
-        let mut pos = first;
-        let mut t = top.partition_point(|r| r.0 + r.1 <= first);
-        while pos < end {
-            let next = top.get(t).filter(|r| r.0 < end);
-            let gap_end = next.map_or(end, |r| r.0.max(pos));
-            if gap_end > pos {
-                let skip = pos - first;
-                out.push((pos, gap_end - pos, kind, ck, if kind == DATA { at + skip } else { 0 }));
-            }
-            pos = next.map_or(end, |r| (r.0 + r.1).max(pos));
-            t += 1;
-        }
-    }
-    out.extend_from_slice(top);
-    out.sort_unstable_by_key(|r| r.0);
-    out
-}
 
 /// TEMPLATE runs are allowed only in a delta.
 pub(super) fn parse_pagemap(map: &[u8], guest_pages: u64, delta: bool, ck: usize) -> Result<(Vec<Run>, Vec<u32>)> {

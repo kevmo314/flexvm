@@ -6,7 +6,7 @@ use std::{
 use crate::{crc32c, template::Template, uffd::{Runs, REMOTE}, util::{Result, PAGE_SIZE}};
 use super::{
     bail, fstat, open_at, open_dir_at,
-    format::{overlay, parse_pagemap, sum, sums_sum, Canon, Manifest, Run, DATA, TEMPLATE, FORMAT, FORMAT_INCREMENTAL, MAX_VMSTATE},
+    format::{parse_pagemap, sum, sums_sum, Canon, Manifest, Run, DATA, TEMPLATE, FORMAT, FORMAT_INCREMENTAL, MAX_VMSTATE},
 };
 
 pub const MAX_CHAIN: usize = 64;
@@ -174,6 +174,29 @@ impl Checkpoint {
         Ok(canon.finish())
     }
 }
+
+pub(super) fn overlay(base: &[Run], top: &[Run]) -> Vec<Run> {
+    let mut out: Vec<Run> = Vec::with_capacity(base.len() + top.len());
+    for &(first, count, kind, ck, at) in base {
+        let end = first + count;
+        let mut pos = first;
+        let mut t = top.partition_point(|r| r.0 + r.1 <= first);
+        while pos < end {
+            let next = top.get(t).filter(|r| r.0 < end);
+            let gap_end = next.map_or(end, |r| r.0.max(pos));
+            if gap_end > pos {
+                let skip = pos - first;
+                out.push((pos, gap_end - pos, kind, ck, if kind == DATA { at + skip } else { 0 }));
+            }
+            pos = next.map_or(end, |r| (r.0 + r.1).max(pos));
+            t += 1;
+        }
+    }
+    out.extend_from_slice(top);
+    out.sort_unstable_by_key(|r| r.0);
+    out
+}
+
 pub(super) fn flatten(layers: &[Vec<Run>], files: Vec<File>, sums: Vec<Vec<u32>>) -> (Runs, PageFile) {
     let mut runs: Vec<Run> = Vec::new();
     for layer in layers {

@@ -1,5 +1,5 @@
 use super::{
-    *, chain::{flatten, read_at, Link}, format::{overlay, parse_pagemap, sum, sums_sum, Run, MAGIC, DATA, ZERO, TEMPLATE, MAX_VMSTATE},
+    *, chain::{flatten, overlay, read_at, Link}, format::{parse_pagemap, sum, sums_sum, Run, MAGIC, DATA, ZERO, TEMPLATE, MAX_VMSTATE},
     staging::{exists_at, publish_permissions, STAGING_PREFIX}, write::{aligned, as_bytes, write_pages, PagesFile},
 };
 use crate::{template::{Paths, Template}, uffd::{Runs, REMOTE, BASE as P_BASE, ZERO as P_ZERO}, util::{Result, PAGE_SIZE}};
