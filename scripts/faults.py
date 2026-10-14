@@ -1850,14 +1850,14 @@ def pause_lost():
     check("pause lost: running and intact", fc_api(sock, "GET", "/")["state"] == "Running" and md5(A, n) == m, fc_api(sock, "GET", "/"))
     # Neither the answer nor Firecracker's state can be had (#191): it stays recorded as running, but unsure, so a
     # SIGCONT still resumes it.
-    for f in ("pause_lost", "pause_unknown", "no_collapse"):
+    for f in ("pause_lost", "pause_unknown"):
         fault(A, f, 30000)
     try:
         signal_vm(A, n, signal.SIGTSTP)
         check("pause unknown: Firecracker is paused", wait_for(lambda: fc_api(sock, "GET", "/")["state"] == "Paused", 10), fc_api(sock, "GET", "/"))
         time.sleep(0.5)
     finally:
-        for f in ("pause_lost", "pause_unknown", "no_collapse"):
+        for f in ("pause_lost", "pause_unknown"):
             fault(A, f, 0)
     signal_vm(A, n, signal.SIGCONT)
     check("pause unknown: SIGCONT resumes it", wait_for(lambda: fc_api(sock, "GET", "/")["state"] == "Running", 10), fc_api(sock, "GET", "/"))
