@@ -18,6 +18,7 @@ pub const MANIFEST_TYPES: &str = "application/vnd.oci.image.index.v1+json, \
     application/vnd.oci.image.manifest.v1+json, \
     application/vnd.docker.distribution.manifest.v2+json";
 
+#[derive(Clone)]
 pub struct Registry {
     agent: ureq::Agent,
     pub r: Reference,
@@ -159,7 +160,6 @@ fn cached_blob<R: Read>(digest: &str, size: u64, blobs: &Path, download: impl Fn
     let path = blob_path(blobs, digest)?;
     let dir = path.parent().unwrap().to_path_buf();
     std::fs::create_dir_all(&dir)?;
-    sweep_parts(&dir);
     if path.exists() {
         let (reader, len) = super::source::Blob::File(path.clone()).open()?;
         let mut cached = Hashed::new(reader.take(size.saturating_add(1)));
@@ -185,7 +185,7 @@ fn cached_blob<R: Read>(digest: &str, size: u64, blobs: &Path, download: impl Fn
     Ok(path)
 }
 
-fn sweep_parts(dir: &Path) {
+pub(super) fn sweep_parts(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         let name = entry.file_name();
@@ -277,8 +277,7 @@ mod tests {
 
     #[test]
     fn sweep_removes_only_dead_downloads() {
-        let dir = std::env::temp_dir().join(format!("flexvm-parts-{}", std::process::id()));
-        std::fs::create_dir(&dir).unwrap();
+        let dir = super::super::unpack::tests::tmpdir("parts");
         let hex = "a".repeat(64);
         let stale = dir.join(format!("{hex}.part2147483647"));
         let live = dir.join(format!("{hex}.part{}", std::process::id()));
@@ -290,7 +289,6 @@ mod tests {
         sweep_parts(&dir);
         assert!(!stale.exists());
         assert!(live.exists() && other.exists() && blob.exists());
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
