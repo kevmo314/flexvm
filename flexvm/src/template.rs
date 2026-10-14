@@ -547,7 +547,7 @@ fn publish(paths: &Paths, name: &str, staged: &Path) -> Result<()> {
     let meta: Meta = serde_json::from_slice(&std::fs::read(staged.join("meta.json"))?)?;
     let gens = paths.templates.join(GENERATIONS);
     crate::util::create_dir_durably(&gens)?;
-    crate::util::sync_ancestors(&paths.templates, crate::util::sync_dir)?;
+    crate::util::sync_ancestors(&paths.templates)?;
     let gen = gens.join(&meta.id);
     if !gen.exists() {
         // Its files and their names are durable before the generation is published.

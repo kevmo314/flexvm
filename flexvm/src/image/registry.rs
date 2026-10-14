@@ -161,7 +161,7 @@ fn cached_blob<R: Read>(digest: &str, size: u64, blobs: &Path, download: impl Fn
     let dir = path.parent().unwrap().to_path_buf();
     std::fs::create_dir_all(&dir)?;
     // The path handed out must survive a crash, whoever made its directories.
-    crate::util::sync_ancestors(&dir, sync_dir)?;
+    crate::util::sync_ancestors(&dir)?;
     if path.exists() {
         let (reader, len) = super::source::Blob::File(path.clone()).open()?;
         let mut cached = Hashed::new(reader.take(size.saturating_add(1)));
