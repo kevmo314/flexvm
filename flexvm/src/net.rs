@@ -352,8 +352,11 @@ fn netlink(kind: u16, flags: c_int, body: &[u8]) -> Result<()> {
         sent if sent < 0 => -1,
         _ => unsafe { libc::recv(sock.as_raw_fd(), ack.as_mut_ptr().cast(), ack.len(), 0) },
     };
-    if res < 20 {
+    if res < 0 {
         bail!("netlink: {}", std::io::Error::last_os_error());
+    }
+    if res < 20 {
+        bail!("netlink: short reply ({res} bytes)");
     }
     FD.set(Some(sock));
     let kind = u16::from_ne_bytes([ack[4], ack[5]]);

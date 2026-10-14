@@ -27,21 +27,19 @@ pub struct Image {
 impl Image {
     /// Download missing registry layers only when the derived rootfs needs building.
     pub fn download_layers(&mut self) -> Result<()> {
-        let sources: HashMap<_, _> = self.layers.iter().filter_map(|l| match &l.src {
-            Blob::Cached { digest, .. } => Some((digest.as_str(), &l.src)),
-            _ => None,
-        }).collect();
         let descs: Vec<_> = self.layers.iter().filter_map(|l| match &l.src {
-            Blob::Cached { digest, size, .. } => Some((digest.clone(), *size)),
+            Blob::Cached { digest, size, blobs, registry } => Some((digest.clone(), *size, (blobs, registry))),
             _ => None,
         }).collect();
+        for (i, (d, size, (blobs, _))) in descs.iter().enumerate() {
+            let cached = if blob_path(blobs, d)?.exists() { " (cached)" } else { "" };
+            eprintln!("image: layer {}/{} {d} {:.1} MiB{cached}", i + 1, descs.len(), *size as f64 / 1048576.0);
+        }
         let fresh = std::sync::Mutex::new(HashMap::new());
-        download_layers(&descs, |d, size| {
-            if let Some(Blob::Cached { blobs, registry, .. }) = sources.get(d) {
-                if !blob_path(blobs, d)?.exists() {
-                    let path = registry.as_ref().clone().blob(d, size, blobs)?;
-                    fresh.lock().unwrap().insert(d.to_string(), path);
-                }
+        download_layers(&descs, |d, size, (blobs, registry)| {
+            if !blob_path(blobs, d)?.exists() {
+                let path = registry.as_ref().clone().blob(d, size, blobs)?;
+                fresh.lock().unwrap().insert(d.to_string(), path);
             }
             Ok(())
         })?;
@@ -257,10 +255,6 @@ fn pull(cache: &Path, mut reg: Registry, limits: &Limits) -> Result<Image> {
     }
     let config = read_verified(&reg.blob(&config_digest, config_size, &blobs)?, config_size, &config_digest)?;
     let descs = descriptors(&manifest, limits)?;
-    for (i, (d, size)) in descs.iter().enumerate() {
-        let cached = if blob_path(&blobs, d)?.exists() { " (cached)" } else { "" };
-        eprintln!("image: layer {}/{} {d} {:.1} MiB{cached}", i + 1, descs.len(), *size as f64 / 1048576.0);
-    }
     let layers = descs.into_iter().map(|(d, size)| Layer {
         src: Blob::Cached { blobs: blobs.clone(), registry: Box::new(reg.clone()), digest: d.clone(), size },
         digest: Some(d),
@@ -269,17 +263,17 @@ fn pull(cache: &Path, mut reg: Registry, limits: &Limits) -> Result<Image> {
     image(digest, config_digest, config, layers)
 }
 
-fn download_layers(descs: &[(String, u64)], download: impl Fn(&str, u64) -> Result<()> + Sync) -> Result<()> {
+fn download_layers<T: Sync>(descs: &[(String, u64, T)], download: impl Fn(&str, u64, &T) -> Result<()> + Sync) -> Result<()> {
     // One download per digest: concurrent writes share a PID-based .part name.
     let mut unique = HashMap::new();
-    for (d, size) in descs {
-        if unique.insert(d, *size).is_some_and(|previous| previous != *size) {
+    for (d, size, src) in descs {
+        if unique.insert(d, (*size, src)).is_some_and(|(previous, _)| previous != *size) {
             bail!("layer {d} has conflicting sizes");
         }
     }
     // Largest first, so the last one to finish is a small one.
     let mut unique: Vec<_> = unique.into_iter().collect();
-    unique.sort_by_key(|&(_, size)| std::cmp::Reverse(size));
+    unique.sort_by_key(|&(_, (size, _))| std::cmp::Reverse(size));
     let workers = unique.len().min(4);
     let pending = std::sync::Mutex::new(unique.into_iter());
     std::thread::scope(|scope| -> Result<()> {
@@ -287,8 +281,8 @@ fn download_layers(descs: &[(String, u64)], download: impl Fn(&str, u64) -> Resu
             scope.spawn(|| -> Result<()> {
                 loop {
                     let next = pending.lock().unwrap().next();
-                    let Some((d, size)) = next else { return Ok(()) };
-                    if let Err(e) = download(d, size) {
+                    let Some((d, (size, src))) = next else { return Ok(()) };
+                    if let Err(e) = download(d, size, src) {
                         // Start nothing more; downloads in flight finish.
                         pending.lock().unwrap().by_ref().for_each(drop);
                         return Err(e);
@@ -426,13 +420,13 @@ mod tests {
 
     #[test]
     fn layer_downloads_are_parallel_bounded_and_deduplicated() {
-        let mut descs: Vec<_> = (0..8).map(|i| (format!("layer{i}"), i)).collect();
+        let mut descs: Vec<_> = (0..8).map(|i| (format!("layer{i}"), i, ())).collect();
         descs.push(descs[0].clone());
         let barrier = Barrier::new(4);
         let active = AtomicUsize::new(0);
         let peak = AtomicUsize::new(0);
         let downloaded = Mutex::new(HashMap::new());
-        download_layers(&descs, |d, size| {
+        download_layers(&descs, |d, size, _| {
             let n = active.fetch_add(1, Ordering::SeqCst) + 1;
             peak.fetch_max(n, Ordering::SeqCst);
             barrier.wait();
@@ -441,16 +435,16 @@ mod tests {
             Ok(())
         }).unwrap();
         assert_eq!(peak.load(Ordering::SeqCst), 4);
-        assert_eq!(*downloaded.lock().unwrap(), descs.into_iter().collect());
+        assert_eq!(*downloaded.lock().unwrap(), descs.into_iter().map(|(d, size, _)| (d, size)).collect());
     }
 
     #[test]
     fn layer_download_failures_and_conflicting_sizes_are_reported() {
         // The largest goes first; once it fails, only the three already in flight run.
-        let descs: Vec<_> = (0..10).map(|i| (format!("l{i}"), i)).collect();
+        let descs: Vec<_> = (0..10).map(|i| (format!("l{i}"), i, ())).collect();
         let started = AtomicUsize::new(0);
         let barrier = Barrier::new(4);
-        let err = download_layers(&descs, |d, _| {
+        let err = download_layers(&descs, |d, _, _| {
             started.fetch_add(1, Ordering::SeqCst);
             barrier.wait();
             if d == "l9" { bail!("failed download"); }
@@ -459,7 +453,7 @@ mod tests {
         }).unwrap_err();
         assert!(err.to_string().contains("failed download"));
         assert_eq!(started.load(Ordering::SeqCst), 4);
-        let err = download_layers(&[("a".to_string(), 1), ("a".to_string(), 2)], |_, _| panic!("invalid descriptors must not download")).unwrap_err();
+        let err = download_layers(&[("a".to_string(), 1, ()), ("a".to_string(), 2, ())], |_, _, _| panic!("invalid descriptors must not download")).unwrap_err();
         assert!(err.to_string().contains("conflicting sizes"));
     }
 }
