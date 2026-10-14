@@ -845,6 +845,8 @@ impl Pager {
     /// ZERO stays ZERO and BASE is implied.
     pub fn quiesce_export(&self) -> Result<Runs> {
         self.quiesce.store(true, Ordering::SeqCst);
+        // A pass held asleep (the VM paused) sees it now, not at the next resume.
+        self.wake_collapse();
         drop(self.pages().removing());
         let start = Instant::now();
         let mut runs: Runs = Vec::new();
