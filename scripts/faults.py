@@ -232,9 +232,16 @@ def setup(name, host=None, mib=200, template=None):
     return digest
 
 
-def md5(host, name):
-    code, out = sh(host, name, "md5sum /tmp/f")
-    return out.split()[0] if code == 0 else out
+def md5(host, name, tries=1):
+    """The md5 of the guest's /tmp/f or, if exec never gave one in `tries`
+    tries (a second apart), what it answered instead."""
+    for i in range(tries):
+        code, out = sh(host, name, "md5sum /tmp/f")
+        if code == 0:
+            return out.split()[0]
+        if i + 1 < tries:
+            time.sleep(1)
+    return out
 
 
 def cleanup(name):
@@ -1787,10 +1794,16 @@ def signals():
 
 def busy_guest(host, name):
     """Floods the network (UDP to the gateway) and churns memory (freed
-    pages go back through balloon free page reporting) in the background."""
-    code, out = sh(host, name, "(while :; do echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; done | socat -u - UDP:169.254.1.1:9) "
+    pages go back through balloon free page reporting) in the background.
+    The churn file takes at most half of what the guest has available (200
+    MiB at most): tmpfs cannot be reclaimed, so more would have the guest's
+    OOM killer take the guest's own processes, or panic it, on a template
+    without hot-plugged memory (#189)."""
+    # The kernel log starts empty, so guest_healthy counts only what this run logs, not the template's.
+    code, out = sh(host, name, "dmesg -c >/dev/null; (while :; do echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; done | socat -u - UDP:169.254.1.1:9) "
                    ">/dev/null 2>&1 < /dev/null & "
-                   "(while :; do head -c 200M /dev/zero > /dev/shm/churn; rm -f /dev/shm/churn; done) "
+                   "c=$(awk '/MemAvailable/ { m = int($2 / 2048); print (m < 200 ? m : 200) }' /proc/meminfo); "
+                   "(while :; do head -c ${c}M /dev/zero > /dev/shm/churn; rm -f /dev/shm/churn; done) "
                    ">/dev/null 2>&1 < /dev/null & echo ok")
     assert code == 0, out
 
@@ -1808,7 +1821,15 @@ def guest_healthy(host, name, label, m):
     before = tap_frames(host, name)[0]
     time.sleep(0.5)
     check(f"{label}: guest network still sending", tap_frames(host, name)[0] > before + 10, (before, tap_frames(host, name)))
-    check(f"{label}: md5 intact", md5(host, name) == m)
+    # An exec that fails (a timeout, the guest gone) is not a wrong hash: say which it was.
+    got = md5(host, name, tries=3)
+    if re.fullmatch(r"[0-9a-f]{32}", got):
+        check(f"{label}: md5 intact", got == m, f"want {m}, got {got}")
+    else:
+        died = [l for l in log(host, name).splitlines() if "died" in l]
+        check(f"{label}: md5 intact", False, f"md5sum gave no hash: {got!r}" + (f"; {died[-1]}" if died else ""))
+    code, out = sh(host, name, "dmesg | grep -c 'Out of memory' ; true")
+    check(f"{label}: no OOM kills in the guest", code == 0 and out.strip() == "0", out)
 
 
 def held_restore_frozen():
