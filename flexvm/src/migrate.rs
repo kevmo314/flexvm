@@ -289,7 +289,7 @@ impl Proc {
         }
         // Under the host lock: a route retry still running sees it is no longer this migration's source.
         *vm.state.lock().unwrap() = s;
-        self.pending_route.lock().unwrap().take();
+        self.take_pending_route(mig);
         // Running here again, so do the collapse pass and prefetch the save cut short.
         vm.back_here();
         self.release_app_log();
@@ -346,7 +346,7 @@ impl Proc {
                 }
                 delay = (delay * 2).min(Duration::from_secs(5));
             }
-            if let Some(via) = p.pending_route.lock().unwrap().take() {
+            if let Some(via) = p.take_pending_route(mig) {
                 if let Err(e) = p.switch_route(mig, via) {
                     eprintln!("route {} via {via}: {e}; giving up", p.vm().ip);
                 }
@@ -385,21 +385,25 @@ impl Proc {
         let res = res.unwrap_or_else(|| self.switch_route(mig, via));
         if let (Err(e), Some(p)) = (&res, self.arc()) {
             eprintln!("route {ip} via {via}: {e}; retrying");
-            *self.pending_route.lock().unwrap() = Some(via);
+            *self.pending_route.lock().unwrap() = Some((mig, via));
             thread::spawn(move || {
                 if !retry(&format!("route {ip} via {via}"), || p.switch_route(mig, via)) {
                     return;
                 }
-                // Once this migration is over, `pending_route` is an abort's or a later migration's.
-                if *p.vm().state.lock().unwrap() == State::Source(mig) {
-                    p.pending_route.lock().unwrap().take();
-                    eprintln!("route {ip} via {via}: done");
-                } else {
-                    eprintln!("route {ip} via {via}: dropped, migration {mig} was aborted");
+                match p.take_pending_route(mig) {
+                    Some(_) => eprintln!("route {ip} via {via}: done"),
+                    None => eprintln!("route {ip} via {via}: dropped, migration {mig} no longer owes it"),
                 }
             });
         }
         (held, res)
+    }
+
+    /// Migration `mig`'s pending route, taken: never a later migration's, which an old retry or
+    /// an abort must leave for that migration's own `wait_release`.
+    fn take_pending_route(&self, mig: u64) -> Option<Ipv4Addr> {
+        let mut pending = self.pending_route.lock().unwrap();
+        pending.take_if(|(m, _)| *m == mig).map(|(_, via)| via)
     }
 
     /// Runs `f`, a route change for this VM's address, under the host lock and only while
