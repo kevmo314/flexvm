@@ -1,8 +1,8 @@
 //! Garbage collection beyond what dead processes hold (`Host::collect_garbage`):
 //! logs on the run directory's tmpfs, `NAME.moved` markers and standby
-//! sockets. `sweep` runs as a VM process starts and, through `periodic`,
-//! about every `EVERY` on a host with a listener or any VM process, whether
-//! or not VMs start. Logs are capped by their writers (`util::output`).
+//! sockets. `sweep` runs about every `EVERY` on a host with a listener or
+//! any VM process (as one starts, then through `periodic`), whether or not
+//! VMs start. Logs are capped by their writers (`util::output`).
 
 use std::fs::File;
 use std::path::Path;
@@ -30,13 +30,17 @@ pub fn periodic(host: Host) {
     std::thread::spawn(move || loop {
         let jitter = Duration::from_millis(std::process::id() as u64 % 5000);
         std::thread::sleep(EVERY + jitter);
-        let stamp = host.run.join(".gc");
-        let recent = age(&stamp).is_some_and(|a| a < EVERY);
-        if !recent {
-            let _ = std::fs::write(&stamp, b"");
-            sweep(&host);
-        }
+        sweep_due(&host);
     });
+}
+
+/// A sweep if no process on the host swept within `EVERY`.
+pub fn sweep_due(host: &Host) {
+    let stamp = host.run.join(".gc");
+    if age(&stamp).is_none_or(|a| a >= EVERY) {
+        let _ = std::fs::write(&stamp, b"");
+        sweep(host);
+    }
 }
 
 /// Everything collectable now. Sweeps are one at a time (`RUN/.gc.lock`);

@@ -830,16 +830,15 @@ def worker():
                     print(f"saving {h.label}'s logs: {e}", flush=True)
         t = time.time()
         problems = []
-        # What a SIGKILLed VM process leaves (its tap, its name) is collected by the next VM
-        # process to start on its host, as later cases' VMs would: after scenarios (which kill
-        # VM processes so), start one on each.
+        # What a SIGKILLed VM process leaves (its tap, its name) is collected by a sweep, which
+        # some process on its host runs every 30 s: after scenarios (which kill VM processes
+        # so), sweep each host now.
         for h in (A, B):
             try:
                 if h.proc and "faults" in args.cases:
-                    h.run("e2e-collect")
-                    h.kill("e2e-collect")
+                    h.cli("debug", "gc")
             except Exception as e:
-                problems.append(f"host {h.label}: a VM to collect garbage: {e}")
+                problems.append(f"host {h.label}: collecting garbage: {e}")
         for h in (A, B):
             try:
                 h.stop()

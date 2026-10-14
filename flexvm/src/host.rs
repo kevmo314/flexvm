@@ -1277,18 +1277,47 @@ impl Host {
     /// Taps are read under the prefix host.json has now, under the host lock,
     /// so a prefix change cannot come in between.
     pub fn collect_garbage(&self) -> Result<()> {
-        {
+        let dead = {
             let _l = self.lock()?;
             let prefix = self.tap_prefix()?;
+            let mut gone = HashMap::new();
+            let mut dead = Vec::new();
             for e in std::fs::read_dir("/sys/class/net").into_iter().flatten().flatten() {
                 let n = e.file_name().to_string_lossy().into_owned();
-                if tap_owner(&n, &prefix).is_some_and(pid_gone) {
-                    crate::net::delete_tap(&n);
+                if tap_owner(&n, &prefix).is_some_and(|pid| *gone.entry(pid).or_insert_with(|| pid_gone(pid))) {
+                    dead.extend(crate::net::ifindex(&n));
                 }
             }
+            dead
+        };
+        // Deleted unlocked, by index: a tap made since under a dead one's name is another.
+        for index in dead {
+            crate::net::delete_link(index);
         }
         collect_owned(&self.run);
         Ok(())
+    }
+}
+
+/// What dead processes with `pid` left that would pass for its own: their
+/// Firecrackers' cgroups and their taps (a template build's too). Only for
+/// the process that has `pid` now, before it makes any; no sweep frees them
+/// while it lives.
+pub fn clear_pid(prefix: &str, pid: u32) {
+    for e in std::fs::read_dir("/sys/fs/cgroup/flexvm").into_iter().flatten().flatten() {
+        if cgroup_owner(&e.file_name().to_string_lossy()) == Some(pid) {
+            eprintln!("removing {}, a dead process's with this pid", e.path().display());
+            if let Err(err) = crate::fc::remove_cgroup(&e.path()) {
+                eprintln!("{}: {err}", e.path().display());
+            }
+        }
+    }
+    for e in std::fs::read_dir("/sys/class/net").into_iter().flatten().flatten() {
+        let n = e.file_name().to_string_lossy().into_owned();
+        if tap_owner(&n, prefix) == Some(pid) {
+            eprintln!("removing tap {n}, a dead process's with this pid");
+            crate::net::delete_tap(&n);
+        }
     }
 }
 
@@ -1300,8 +1329,7 @@ fn collect_owned(run: &Path) {
         if n.starts_with("vm-") {
             sweep_scope(&e.path());
         } else if gone(cgroup_owner(&n)) {
-            let _ = std::fs::write(e.path().join("cgroup.kill"), "1");
-            let _ = std::fs::remove_dir(e.path());
+            let _ = crate::fc::remove_cgroup(&e.path());
         }
     }
     for e in std::fs::read_dir(run.join("w")).into_iter().flatten().flatten() {

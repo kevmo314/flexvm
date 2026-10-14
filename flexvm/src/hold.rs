@@ -596,16 +596,13 @@ fn readable(fd: &OwnedFd) -> bool {
     unsafe { libc::poll(&mut pfd, 1, 0) > 0 }
 }
 
-/// The error flag: another process has it (rather than no TUN support).
+/// The error flag: another process has it, or the name is too long (rather than no TUN support).
 fn open_tun(dev: &str) -> std::result::Result<OwnedFd, (bool, crate::util::Error)> {
     const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
     let fd = eintr(|| unsafe { libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC | libc::O_NONBLOCK) })
         .map_err(|e| (false, format!("/dev/net/tun: {e}").into()))?;
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    let mut req: libc::ifreq = unsafe { std::mem::zeroed() };
-    for (d, s) in req.ifr_name.iter_mut().zip(dev.bytes().take(libc::IFNAMSIZ - 1)) {
-        *d = s as libc::c_char;
-    }
+    let mut req = crate::net::ifreq(dev).map_err(|e| (true, e))?;
     req.ifr_ifru.ifru_flags = (libc::IFF_TUN | libc::IFF_NO_PI) as libc::c_short;
     if let Err(e) = eintr(|| unsafe { libc::ioctl(fd.as_raw_fd(), TUNSETIFF as _, &req) }) {
         let busy = matches!(e.raw_os_error(), Some(libc::EBUSY | libc::EEXIST | libc::EPERM));

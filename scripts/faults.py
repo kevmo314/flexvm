@@ -4572,7 +4572,7 @@ def prefix_change():
         prefix = json.load(open(os.path.join(A.state, "host.json")))["prefix"]
     except (OSError, ValueError, KeyError):
         prefix = "fv"
-    other = (prefix + "z")[:8] if not prefix.endswith("z") else prefix[:-1] + "y"
+    other = prefix[:-1] + ("y" if prefix.endswith("z") else "z")
     ok(run(A, n))
     r = cli_json(A, "config", "--prefix", other)
     check("prefix change: refused while a vm runs", not r["ok"] and "cannot change the tap prefix" in r["error"], r)

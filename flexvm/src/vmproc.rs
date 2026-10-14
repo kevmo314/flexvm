@@ -65,6 +65,8 @@ pub struct Proc {
     pub host: Host,
     pub paths: Paths,
     pub spawner: Spawner,
+    /// The tap prefix, as read once the work directory was there (`Host::tap_prefix`).
+    prefix: String,
     ident: Ident,
     name: Mutex<Option<NameLock>>,
     addr: Mutex<Option<AddrClaim>>,
@@ -166,12 +168,15 @@ impl Proc {
             crate::host::store(&work.join("owner"), &ident, false)?;
             host.tap_prefix()?
         };
+        // Unlocked: our work directory holds the prefix, and no sweep frees them while we live.
+        crate::host::clear_pid(&prefix, ident.pid);
         let tap_prefix = format!("{prefix}{:x}t", ident.pid);
         let spawner = Spawner::new(&paths.firecracker, &work, crate::socket::SocketRoot::new(&work)?, cgroup_root(), &tap_prefix);
         Ok(Arc::new_cyclic(|me| Proc {
             host,
             paths,
             spawner,
+            prefix,
             ident,
             name: Mutex::new(None),
             addr: Mutex::new(None),
@@ -419,7 +424,7 @@ impl Proc {
     pub fn holder(&self) -> Option<&Arc<Holder>> {
         self.holder
             .get_or_init(|| {
-                Holder::new(&format!("{}{:x}h", self.host.cfg.prefix, self.ident.pid)).unwrap_or_else(|e| {
+                Holder::new(&format!("{}{:x}h", self.prefix, self.ident.pid)).unwrap_or_else(|e| {
                     eprintln!("packets in flight while the vm is paused will be dropped: {e}");
                     None
                 })
@@ -1123,7 +1128,7 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
     let p = Proc::new(host, paths)?;
     let host = p.host.clone();
     thread::spawn(move || {
-        crate::gc::sweep(&host);
+        crate::gc::sweep_due(&host);
         crate::gc::periodic(host);
     });
     let s = p.clone();

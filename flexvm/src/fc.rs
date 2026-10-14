@@ -341,11 +341,23 @@ impl Drop for Idle {
 /// Its Firecracker must be gone.
 pub fn release(tap: &str, cgroup: Option<&Path>, dir: &Path) {
     crate::net::delete_tap(tap);
-    if let Some(cg) = cgroup.filter(|cg| cg.exists()) {
-        // Busy until the kernel has torn the process down.
-        let _ = retry(Duration::from_secs(2), || Ok(std::fs::remove_dir(cg)?));
+    if let Some(cg) = cgroup {
+        let _ = remove_cgroup(cg);
     }
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Kills what is in it and removes it, busy until the kernel has torn those down.
+pub fn remove_cgroup(cg: &Path) -> std::io::Result<()> {
+    let _ = std::fs::write(cg.join("cgroup.kill"), "1");
+    let until = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        match std::fs::remove_dir(cg) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if e.raw_os_error() == Some(libc::EBUSY) && std::time::Instant::now() < until => std::thread::sleep(Duration::from_millis(1)),
+            r => return r,
+        }
+    }
 }
 
 /// Starts Firecrackers, each with its own directory, tap and cgroup; the cgroup is joined in
@@ -403,7 +415,13 @@ impl Spawner {
                 // Never swapped: at its mark the VM is throttled (sleeps a migration's or
                 // checkpoint's lift waits out), not paged out to swap, whose reads would hold
                 // up its pauses. Without swap accounting the file is missing: nothing to do.
-                let joined = std::fs::create_dir(&cg).and_then(|()| {
+                // One already there is a dead process's with this pid (`Proc::new` clears
+                // them): never shared, as its limits would not be this VM's.
+                let made = std::fs::create_dir(&cg).or_else(|e| match e.kind() {
+                    std::io::ErrorKind::AlreadyExists => remove_cgroup(&cg).and_then(|()| std::fs::create_dir(&cg)),
+                    _ => Err(e),
+                });
+                let joined = made.and_then(|()| {
                     if let Err(e) = std::fs::write(cg.join("memory.swap.max"), "0").or_else(|e| match e.kind() {
                         std::io::ErrorKind::NotFound => Ok(()),
                         _ => Err(e),
