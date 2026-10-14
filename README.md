@@ -20,7 +20,8 @@ sudo ./target/release/flexvm template default   # cold-boot and snapshot a templ
 
 flexvm runs as root (KVM, userfaultfd, routes, cgroups). Commands below
 assume `flexvm` is on the PATH and `FLEXVM_ARTIFACTS` points at `artifacts/`.
-Use `sudo -E` to preserve `FLEXVM_ARTIFACTS`, or pass `--artifacts DIR`;
+sudo drops `FLEXVM_ARTIFACTS`: keep it with `sudo --preserve-env=FLEXVM_ARTIFACTS`
+(`sudo -E` is refused by some sudo builds, e.g. sudo-rs), or pass `--artifacts DIR`;
 without either, the default is `./artifacts` relative to the working directory.
 
 ## Run a VM
@@ -41,6 +42,11 @@ web              10.200.0.1      default    running        41522   24       27  
 ```sh
 flexvm exec web 'free -m'       # a shell command in the guest; exits with its status
 ```
+
+As with ssh, the words of `run -- CMD` and `exec NAME CMD` are joined with
+spaces for the guest's shell, so quote a command that has its own quoting:
+`flexvm run job -- "sh -c 'echo -d'"`. Flags after `--` (or after `exec NAME`)
+belong to CMD.
 
 `-d` and `--detach` are equivalent for `run`, `restore`, and `resume`.
 
