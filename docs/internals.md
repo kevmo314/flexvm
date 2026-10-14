@@ -648,7 +648,8 @@ a second copy could repeat what it did.
   address's home host hands it out, so two hosts can never pick the same
   address. An address whose VM migrated to another host stays reserved
   ("lent", in `STATE/addrs/IP`) until that VM is killed wherever it is (its
-  host tells the peers), or it migrates back. If that message is lost, the
+  host tells the peers), or it migrates back and has all its memory there again
+  (released; an arrival that dies before leaves the loan in place). If that message is lost, the
   address stays taken; removing `lent` from that file frees it. Leaks, never
   collisions. A restore elsewhere that keeps the address borrows it the same
   way (op `lend`). Every address carries a generation that orders the VMs

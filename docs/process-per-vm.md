@@ -165,7 +165,9 @@ answer, held packets). What changed is who is at each end:
    source VM process, which serves it if it is the source of that migration.
 5. Release: the source polls `migration {mig}` on the target's listener.
    The listener answers from `STATE/migs/ID`: `pending`, `committed`,
-   `released` (a live target wrote it once every page arrived, retrying
+   `released` (a live target wrote it once every page arrived, under the VM's
+   operation lock so it never races the VM's end; a home host takes its loan back
+   only after; retrying
    until it is recorded; or the VM was destroyed on purpose there), or
    `aborted` (no record). A record whose process is dead is removed once its
    Firecrackers are reaped, committed or not: the VM is not on the target,
