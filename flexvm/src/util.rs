@@ -123,6 +123,53 @@ macro_rules! timed {
 }
 timed!(std::net::TcpStream, &std::net::TcpStream, UnixStream, &UnixStream);
 
+/// A socket for `By` that sets its read timeout again only when the one it has would end a read before `By`'s deadline,
+/// or past it by more than a sixteenth of the time left: a page client's many small reads skip nearly every setsockopt,
+/// and none waits much past its deadline. Its read timeout must be set through it alone.
+pub struct ReadTimeoutCache<S> {
+    pub s: S,
+    timeout: std::cell::Cell<Option<Duration>>,
+}
+
+impl<S> ReadTimeoutCache<S> {
+    pub fn new(s: S) -> Self {
+        ReadTimeoutCache { s, timeout: std::cell::Cell::new(None) }
+    }
+}
+
+impl<S: Timed> Timed for ReadTimeoutCache<S> {
+    fn read_timeout(&self, left: Duration) -> io::Result<()> {
+        if self.timeout.get().is_some_and(|t| t >= left && t - left <= left / 16) {
+            return Ok(());
+        }
+        self.timeout.set(None);
+        self.s.read_timeout(left)?;
+        self.timeout.set(Some(left));
+        Ok(())
+    }
+    fn write_timeout(&self, t: Duration) -> io::Result<()> {
+        self.s.write_timeout(t)
+    }
+}
+
+impl<S: Read> Read for ReadTimeoutCache<S> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.s.read(buf)
+    }
+    fn read_vectored(&mut self, bufs: &mut [io::IoSliceMut<'_>]) -> io::Result<usize> {
+        self.s.read_vectored(bufs)
+    }
+}
+
+impl<S: Write> Write for ReadTimeoutCache<S> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.s.write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.s.flush()
+    }
+}
+
 /// Every read and write (each partial one) ends by `at`, however slowly the peer trickles.
 pub struct By<S> {
     pub s: S,
@@ -149,6 +196,10 @@ impl<S: Timed> Read for By<S> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.s.read_timeout(self.left()?)?;
         self.s.read(buf).map_err(timed_out)
+    }
+    fn read_vectored(&mut self, bufs: &mut [io::IoSliceMut<'_>]) -> io::Result<usize> {
+        self.s.read_timeout(self.left()?)?;
+        self.s.read_vectored(bufs).map_err(timed_out)
     }
 }
 
@@ -615,6 +666,30 @@ fn scope(prefix: &[u8], pid: u32, start: u64) -> bool {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn read_timeout_is_set_again_only_when_it_drifts() {
+        let (a, mut b) = UnixStream::pair().unwrap();
+        let c = ReadTimeoutCache::new(a);
+        let ms = Duration::from_millis;
+        let now = || c.s.read_timeout().unwrap().unwrap();
+        c.read_timeout(ms(1000)).unwrap();
+        assert_eq!(now(), ms(1000));
+        // Ends a read at most a sixteenth of the time left past the deadline: kept.
+        c.read_timeout(ms(950)).unwrap();
+        assert_eq!(now(), ms(1000));
+        // Would end it before the deadline, or too long after: set again.
+        c.read_timeout(ms(2000)).unwrap();
+        assert_eq!(now(), ms(2000));
+        c.read_timeout(ms(1000)).unwrap();
+        assert_eq!(now(), ms(1000));
+        // Reads (vectored too) pass through.
+        b.write_all(b"xyz").unwrap();
+        let mut by = By { s: c, at: Instant::now() + ms(1000) };
+        let (mut x, mut yz) = ([0u8; 1], [0u8; 2]);
+        assert_eq!(by.read_vectored(&mut [io::IoSliceMut::new(&mut x), io::IoSliceMut::new(&mut yz)]).unwrap(), 3);
+        assert_eq!((&x, &yz), (b"x", b"yz"));
+    }
 
     #[test]
     fn rpc_names_the_peer_and_a_trickled_reply_cannot_outlast_its_deadline() {
