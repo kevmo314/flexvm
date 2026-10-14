@@ -273,7 +273,7 @@ fn run(args: &Args, name: &str, template: &str) -> Result<()> {
             return print(v);
         }
         eprintln!("{v}");
-        let id = host::Ident { pid: v["pid"].as_u64().unwrap_or(0) as u32, start: v["start"].as_u64().unwrap_or(0) };
+        let id = host::Ident { pid: v["pid"].as_u64().unwrap_or(0) as u32, start: v["start"].as_u64().unwrap_or(0), boot: host::boot_id().into() };
         return follow(conn, id);
     }
     if detach {
@@ -325,7 +325,7 @@ fn set_cloexec(fd: i32) {
 /// the VM process and exits with its status.
 fn follow(conn: std::os::unix::net::UnixStream, id: host::Ident) -> Result<()> {
     let set = util::block_signals(&[libc::SIGTERM, libc::SIGINT, libc::SIGTSTP, libc::SIGCONT, libc::SIGHUP]);
-    let vm = host::PidFd::open(id)?.ok_or("the vm process is gone")?;
+    let vm = host::PidFd::open(&id)?.ok_or("the vm process is gone")?;
     std::thread::spawn(move || loop {
         let sig = util::wait_signal(&set);
         if sig != libc::SIGHUP {

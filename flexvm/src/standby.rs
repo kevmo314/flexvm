@@ -65,7 +65,7 @@ pub fn live(host: &Host, template: &str) -> Vec<Ident> {
         let Ok(f) = File::open(e.path()) else { continue };
         if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } == 0 {
             let _ = std::fs::remove_file(e.path());
-        } else if let Some(id) = std::fs::read_to_string(e.path()).ok().and_then(|s| s.parse::<Ident>().ok()) {
+        } else if let Some(id) = crate::host::load::<Ident>(&e.path()).ok().flatten() {
             ids.push(id);
         }
     }
@@ -74,7 +74,7 @@ pub fn live(host: &Host, template: &str) -> Vec<Ident> {
 }
 
 /// Stops standby process `id`, if it is still that process.
-pub fn stop(id: Ident) {
+pub fn stop(id: &Ident) {
     if let Ok(Some(fd)) = PidFd::open(id) {
         let _ = fd.signal(libc::SIGINT);
     }
@@ -97,7 +97,7 @@ pub fn templates(host: &Host) -> Vec<String> {
 /// VMs are ready.
 pub fn set(host: &Host, template: &str, n: usize) -> Result<Value> {
     crate::host::write_file(&host.state.join("standby"), template, n.to_string().as_bytes(), true)?;
-    for &id in live(host, template).iter().skip(n) {
+    for id in live(host, template).iter().skip(n) {
         stop(id);
     }
     let started = refill(host, template)?;
@@ -180,7 +180,7 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
     let (lock_path, sock) = (d.join(format!("{}.lock", me.pid)), d.join(format!("{key}.{}.sock", me.pid)));
     let lock = File::create(&lock_path)?;
     unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
-    lock.write_all_at(me.to_string().as_bytes(), 0)?;
+    lock.write_all_at(&serde_json::to_vec(&me)?, 0)?;
     p.files.lock().unwrap().extend([sock.clone(), lock_path]);
     *p.standby.lock().unwrap() = Some(load(p.spawner.take()?, tpl.clone())?);
     save_load_set(host, &tpl);
@@ -194,7 +194,7 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
             // Stopped, a newer generation of the template, too many of us
             // (the newest go first), or dead: go.
             let current = Template::resolve(&p.paths, template).ok().and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()));
-            let extra = live(host, template).iter().position(|&id| id == me).is_some_and(|i| i >= target(host, template));
+            let extra = live(host, template).iter().position(|id| *id == me).is_some_and(|i| i >= target(host, template));
             let dead = p.standby.lock().unwrap().as_mut().is_none_or(|s| s.pager.failed().is_some() || !s.firecracker_alive());
             if p.stop_requested() || current.as_deref() != Some(&key) || extra || dead {
                 p.finish(op, End::NotStarted, 0, None);
@@ -309,7 +309,7 @@ pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]
         let reply = match answer {
             Ok(r) => r,
             Err(e) => {
-                let started = host.entry(name).map(|e| format!("it did: pid {}", e.pid)).unwrap_or_else(|_| "see flexvm ls".into());
+                let started = host.entry(name).map(|e| format!("it did: pid {}", e.ident.pid)).unwrap_or_else(|_| "see flexvm ls".into());
                 bail!("claiming standby vm {} as {name}: {e}; it may have started the vm ({started}), so it is not started again", sock.display());
             }
         };

@@ -2529,9 +2529,9 @@ def incoming_killed():
     pid = None
     lock = os.path.join(B.run, "vms", f"{n}.lock")
     wait_for(lambda: os.path.exists(lock) and open(lock).read().strip(), 20)
-    pid = int(open(lock).read().split()[0])
+    pid = json.load(open(lock))["pid"]
     time.sleep(1)
-    fcs = [int(open(os.path.join(d, "fc")).read().split()[0]) for d in
+    fcs = [json.load(open(os.path.join(d, "fc")))["pid"] for d in
            [os.path.join(B.run, "w", str(pid), e) for e in os.listdir(os.path.join(B.run, "w", str(pid)))] if os.path.exists(os.path.join(d, "fc"))]
     os.kill(pid, signal.SIGKILL)
     t.join()
@@ -2574,7 +2574,7 @@ def claim_killed():
     check("claim killed: a standby vm", code == 0, err)
     fault(A, "claim_stall", 10000)
     lockdir = os.path.join(A.run, "standby", args.template)
-    pids = [int(open(os.path.join(lockdir, f)).read().split()[0]) for f in os.listdir(lockdir) if f.endswith(".lock")]
+    pids = [json.load(open(os.path.join(lockdir, f)))["pid"] for f in os.listdir(lockdir) if f.endswith(".lock")]
     res = {}
     t = threading.Thread(target=lambda: res.update(r=cli_json(A, "run", n, "--template", args.template, "-d")))
     t.start()

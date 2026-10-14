@@ -123,12 +123,12 @@ impl Proc {
         let ident = Ident::me();
         let work = host.run.join("w").join(ident.pid.to_string());
         // A dead process with this pid left it: what it ran goes first.
-        if let Some(old) = std::fs::read_to_string(work.join("owner")).ok().and_then(|s| s.parse().ok()) {
-            crate::host::reap(&host.run, old)?;
+        if let Some(old) = crate::host::load(&work.join("owner"))? {
+            crate::host::reap(&host.run, &old)?;
         }
         let _ = std::fs::remove_dir_all(&work);
         std::fs::create_dir_all(&work)?;
-        std::fs::write(work.join("owner"), ident.to_string())?;
+        crate::host::store(&work.join("owner"), &ident, false)?;
         let sockets = crate::socket::SocketRoot::new(&work)?;
         let tap_prefix = format!("{}{:x}t", host.cfg.prefix, ident.pid);
         let spawner = Spawner::new(&paths.firecracker, &work, sockets, cgroup_root(), &tap_prefix);
@@ -273,8 +273,7 @@ impl Proc {
         let Some(n) = name.as_ref() else { return };
         let e = Entry {
             name: n.name.clone(),
-            pid: self.ident.pid,
-            start: self.ident.start,
+            ident: self.ident.clone(),
             ip: Some(vm.ip),
             gen: self.gen(),
             template: vm.template.name.clone(),
@@ -542,7 +541,7 @@ impl Proc {
         let p = self.clone();
         thread::spawn(move || p.controller());
         // Firecracker's exit is noticed at once.
-        if let Some(fc) = self.vm().pid().and_then(Ident::of).and_then(|id| crate::host::PidFd::open(id).ok().flatten()) {
+        if let Some(fc) = self.vm().pid().and_then(Ident::of).and_then(|id| crate::host::PidFd::open(&id).ok().flatten()) {
             let p = self.clone();
             thread::spawn(move || {
                 while !fc.wait(Duration::from_secs(3600)) {}
@@ -1162,7 +1161,7 @@ fn relieve(host: &Host, starved_here: bool) {
         let mut shed = 0;
         for t in crate::standby::templates(host) {
             for id in crate::standby::live(host, &t) {
-                crate::standby::stop(id);
+                crate::standby::stop(&id);
                 shed += 1;
             }
         }

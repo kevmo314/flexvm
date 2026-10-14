@@ -79,7 +79,7 @@ impl Firecracker {
         let fc = Firecracker { child, sockets, api: Api::default(), joining: None };
         // Who to kill should this process die (see `host::reap`).
         let id = crate::host::Ident::of(fc.pid()).ok_or("firecracker exited at once")?;
-        std::fs::write(dir.join("fc"), id.to_string())?;
+        crate::host::store(&dir.join("fc"), &id, false)?;
         retry(ready, || Ok(UnixStream::connect(&fc.sockets.api)?))?;
         Ok(fc)
     }
