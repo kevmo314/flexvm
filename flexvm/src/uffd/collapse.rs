@@ -219,6 +219,10 @@ impl Pager {
                             break 'regions;
                         }
                     }
+                    // Test fault `collapse_slow`: a pass that lasts, for a checkpoint or migration to cut short.
+                    if crate::host::fault("collapse_slow") {
+                        self.collapse_pause(Duration::from_millis(300));
+                    }
                 }
             }
         }
@@ -260,10 +264,11 @@ impl Pager {
         }
     }
 
-    /// Sleeps `d`, or less if the pager stops.
+    /// Sleeps `d`, or less if the pass must end (the pager stops, or `quiesce_export` wakes it): so the pass ends at
+    /// the checkpoint or migration that quiesced it, not once a failed one has undone that.
     fn collapse_pause(&self, d: Duration) {
         let g = self.collapse_gate.0.lock().unwrap();
-        let _ = self.collapse_gate.1.wait_timeout_while(g, d, |_| !self.stop.load(Ordering::SeqCst));
+        let _ = self.collapse_gate.1.wait_timeout_while(g, d, |_| self.collapse_halt().is_none());
     }
 
     fn collapse_halt(&self) -> Option<&'static str> {

@@ -209,7 +209,7 @@ FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_be
           "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "resume_kill",
           "prepare_fail", "short_incoming", "slow_preload", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
           "started_fsync", "started_unmark", "start_stall", "incoming_stall", "claim_stall", "handoff_stall", "ckpt_wp_race",
-          "fetch_tail_enomem", "fetch_enomem_stuck", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo", "release_stall", "release_late", "no_plug", "pause_lost", "tap_backlog", "tap_backlog_stuck", "pause_unknown", "no_collapse")
+          "fetch_tail_enomem", "fetch_enomem_stuck", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo", "release_stall", "release_late", "no_plug", "pause_lost", "tap_backlog", "tap_backlog_stuck", "pause_unknown", "no_collapse", "collapse_slow")
 
 
 def disarm():
@@ -2524,6 +2524,9 @@ def collapse_ckpt_fail():
     n, path = "ft-collapse-ckpt", ckpt_path("ft-collapse-ckpt")
     rm_ckpt(path)
     m = setup(n, mib=600)
+    # Slowed (300 ms after each call, about 20 calls), the pass is still going when the checkpoint pauses the VM.
+    fault(B, "collapse_slow", 60000)
+    clear_log(B, n)
     ok(migrate(A, n, B))
     st = wait_released(B, n)
     check("collapse ckpt fail: migrated and pulled", st["released"] and st["state"] == "running", st)
@@ -2531,7 +2534,11 @@ def collapse_ckpt_fail():
     fault(B, "ckpt_fail_write", 60000)
     r = checkpoint(B, n, path, stop=True)
     fault(B, "ckpt_fail_write", 0)
+    fault(B, "collapse_slow", 0)
     check("collapse ckpt fail: refused as injected, VM runs on", not r["ok"] and "injected" in r["error"] and where(n) == {B: "running"}, (r, where(n)))
+    passes = lambda: [l for l in log(B, n).splitlines() if "huge pages in" in l]
+    check("collapse ckpt fail: the checkpoint stopped the pass mid-way", wait_for(lambda: passes(), 10) and passes()[0].endswith("stopped: checkpoint or migration"),
+          passes())
     wait_for(lambda: collapse_report(B, n) is not None, 120)
     c = collapse_report(B, n)
     huge, _ = huge_mib(B, n)
