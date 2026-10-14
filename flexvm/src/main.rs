@@ -328,7 +328,9 @@ fn run(args: &Args, name: &str, template: &str) -> Result<()> {
     // A claimed standby VM writes where this process would.
     let log = args.has("detach").then(|| log_file(&host, name)).transpose()?;
     let fds = log.as_ref().map_or([1, 2], |f| [f.as_raw_fd(); 2]);
-    match standby::take(&host, &paths, template, &req, &fds)? {
+    // A detached run's VM process (it answers on FLEXVM_NOTIFY_FD): its parent tried them.
+    let tried = std::env::var_os("FLEXVM_NOTIFY_FD").is_some();
+    match if tried { None } else { standby::take(&host, &paths, template, &req, &fds)? } {
         Some((v, _)) if log.is_some() => print(v),
         Some((v, conn)) => {
             eprintln!("{v}");
@@ -376,7 +378,7 @@ fn notify_fd() -> Option<std::fs::File> {
 }
 
 /// A foreground `run` that claimed a standby VM: forwards signals, exits with its status.
-fn follow(mut conn: impl std::io::BufRead, id: host::Ident) -> Result<()> {
+fn follow(mut conn: BufReader<std::os::unix::net::UnixStream>, id: host::Ident) -> Result<()> {
     let set = util::block_signals(&[libc::SIGTERM, libc::SIGINT, libc::SIGQUIT, libc::SIGTSTP, libc::SIGCONT, libc::SIGHUP]);
     // A fast command's process may be gone already: its exit frame is buffered.
     if let Ok(Some(vm)) = host::PidFd::open(&id) {

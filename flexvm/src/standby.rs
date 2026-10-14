@@ -6,7 +6,7 @@
 //! started the VM and is never retried elsewhere. `{"exit": code}` follows.
 
 use std::fs::File;
-use std::io::{BufReader, Chain, Cursor, Read};
+use std::io::BufReader;
 use std::net::Ipv4Addr;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
@@ -234,13 +234,12 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
         }
         let Ok((c, _)) = listener.accept() else { continue };
         // In short waits, minding stops: a claimer stopped mid-request must not keep this one.
-        let at = Instant::now() + REQUEST_TIMEOUT;
+        let at = Instant::now() + HANDSHAKE_TIMEOUT;
         let ready = || loop {
             if p.stop_requested() || Instant::now() >= at {
                 return Err(std::io::ErrorKind::TimedOut.into());
             }
-            let mut pfd = libc::pollfd { fd: c.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-            if unsafe { libc::poll(&mut pfd, 1, 100) } > 0 {
+            if crate::util::readable(&c, Duration::from_millis(100)).unwrap_or(true) {
                 return Ok(());
             }
         };
@@ -327,12 +326,9 @@ fn claim(p: &Arc<Proc>, req: &Value) -> std::result::Result<Value, (Error, bool)
     Ok(v)
 }
 
-/// A claimed standby's connection, after what its handshake buffered.
-pub type Conn = BufReader<Chain<Cursor<Vec<u8>>, UnixStream>>;
-
 /// `run`'s side. Once a standby said `claiming` it may have started the VM:
 /// no answer (by `CLAIM_TIMEOUT`) is then an error, never a reason to start it again.
-pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]) -> Result<Option<(Value, Conn)>> {
+pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]) -> Result<Option<(Value, BufReader<UnixStream>)>> {
     let Ok(key) = key(paths, template) else { return Ok(None) };
     let mut socks: Vec<PathBuf> = std::fs::read_dir(dir(host, template))
         .into_iter()
@@ -357,11 +353,16 @@ pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]
                 continue;
             }
         };
-        let mut r = BufReader::new(crate::util::By { s: c, at });
+        // Not `claiming` by `at`: reads are shut down, so one sent later fails (and
+        // claims nothing), and one sent already is read (and is no reason to retry).
+        if !crate::util::readable(&c, at.saturating_duration_since(Instant::now())).unwrap_or(false) {
+            let _ = c.shutdown(std::net::Shutdown::Read);
+        }
+        // Byte by byte: what follows stays unread, for the caller.
+        let mut r = BufReader::with_capacity(1, crate::util::By { s: &c, at: Instant::now() + CLAIM_TIMEOUT });
         if crate::util::recv_json(&mut r).ok().flatten().is_none_or(|t| t["claiming"] != json!(true)) {
             continue;
         }
-        r.get_mut().at = Instant::now() + CLAIM_TIMEOUT;
         let answer = crate::util::recv_json(&mut r).and_then(|a| a.ok_or_else(|| "it hung up".into()));
         let reply = match answer {
             Ok(r) => r,
@@ -371,11 +372,8 @@ pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]
             }
         };
         if reply["ok"] == json!(true) {
-            // Kept for the caller, with what was buffered (the exit frame, maybe).
-            let rest = Cursor::new(r.buffer().to_vec());
-            let c = r.into_inner().s;
             c.set_read_timeout(None)?;
-            return Ok(Some((reply["result"].clone(), BufReader::new(rest.chain(c)))));
+            return Ok(Some((reply["result"].clone(), BufReader::new(c))));
         }
         if reply["retry"] != json!(true) {
             bail!("{}", reply["error"].as_str().unwrap_or("claim failed"));
@@ -385,7 +383,6 @@ pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]
     Ok(None)
 }
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const CLAIM_TIMEOUT: Duration = Duration::from_secs(60);
 const SETTLE: Duration = Duration::from_millis(50);
