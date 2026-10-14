@@ -159,8 +159,8 @@ VM's socket (its `PID.lock` free), an arrival's log (no lock on it, 5 s
 old). A VM process's own cgroup (`vm-PID-START`) goes once empty, never
 killed (`rmdir` refuses a populated cgroup). The logs of a name with no
 VM, suspended VM, `failed` or `moved` record go once unwritten for an hour,
-decided and removed holding the name's lock, which a start holds (shared)
-while it opens and marks its log; `NAME.moved` goes after an hour.
+decided and removed holding `RUN/.logs.lock`, which a start holds (shared)
+while it opens and marks its log (whether a VM holds the name is read from its lock's record, never by probing the lock a start takes without waiting); `NAME.moved` goes after an hour.
 Released migration records are retired as below. Logs are capped by their
 writers, not swept: a VM process's output relay, writing to a log in the
 run directory, renames it `NAME.log.1` once past 8 MiB (under the

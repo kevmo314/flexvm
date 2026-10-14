@@ -76,7 +76,7 @@ fn vm_files(host: &Host) {
     // Markers first: a log is kept for its VM's.
     for (file, path) in files() {
         let Some(name) = file.strip_suffix(".moved").filter(|_| !file.starts_with('.')) else { continue };
-        if age(&path).is_some_and(|a| a > MOVED_TTL) && host.name_locked(name) == Some(false) {
+        if age(&path).is_some_and(|a| a > MOVED_TTL) && host.holder_gone(name) {
             let _ = std::fs::remove_file(&path);
         }
     }
@@ -92,14 +92,14 @@ fn vm_files(host: &Host) {
         if !quiet() {
             continue;
         }
-        // Decided and removed holding the name: a start opens its log holding
-        // it too (shared), and marks it written (`main::log_file`).
-        host.unheld(name, libc::LOCK_EX, || {
-            let orphan = !host.suspended(name).exists() && !["failed", "moved"].iter().any(|ext| host.vms(name, ext).exists());
-            if orphan && quiet() {
-                let _ = std::fs::remove_file(&path);
-            }
-        });
+        // Decided and removed holding the logs lock: a start opens its log
+        // holding it too (shared) and marks it written (`main::log_file`), so
+        // a log being opened is never quiet here. Busy: left for the next sweep.
+        let Ok(_logs) = host.logs_lock(libc::LOCK_EX | libc::LOCK_NB) else { return };
+        let orphan = host.holder_gone(name) && !host.suspended(name).exists() && !["failed", "moved"].iter().any(|ext| host.vms(name, ext).exists());
+        if orphan && quiet() {
+            let _ = std::fs::remove_file(&path);
+        }
     }
 }
 
@@ -157,6 +157,10 @@ mod tests {
         std::fs::remove_dir_all(d).unwrap();
     }
 
+    fn store_holder(host: &Host, name: &str, id: &crate::host::Ident) {
+        crate::host::store(&host.vms(name, "lock"), id, false).unwrap();
+    }
+
     #[test]
     fn dead_arrivals_logs_and_old_markers_go() {
         let d = dir("vmfiles");
@@ -180,13 +184,18 @@ mod tests {
         let quiet = at("new.log", SystemTime::now());
         let failed_log = at("bad.log", old);
         at("bad.failed", old);
-        // A start opening its log holds the name: the log is not decided on meanwhile.
-        let starting = at("starting.log", old);
-        let opening = host.unheld("starting", libc::LOCK_SH, || {
-            vm_files(&host);
-            starting.exists()
-        });
-        assert_eq!(opening, Some(true), "kept while its name is held");
+        // A start opening a log holds the logs lock: no log is decided on meanwhile.
+        let opening = host.logs_lock(libc::LOCK_SH).unwrap();
+        vm_files(&host);
+        assert!(orphan.exists(), "kept while a log is being opened");
+        drop(opening);
+        // A name whose holder lives keeps its log, however quiet.
+        let live_name = at("held.log", old);
+        store_holder(&host, "held", &crate::host::Ident::me());
+        let dead_name = at("dead.log", old);
+        store_holder(&host, "dead", &crate::host::Ident { pid: 999_999_940, start: 1, boot: crate::host::boot_id().into() });
+        vm_files(&host);
+        assert!(live_name.exists() && !dead_name.exists(), "by the name's holder");
         assert!(!dead.exists() && fresh.exists() && live.exists(), "arrivals");
         assert!(!moved.exists() && recent_moved.exists(), "markers");
         assert!(!orphan.exists() && !orphan_prev.exists() && kept_by_moved.exists() && quiet.exists() && failed_log.exists(), "logs");

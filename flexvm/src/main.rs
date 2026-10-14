@@ -349,22 +349,12 @@ fn start(args: &Args, name: &str, s: Start) -> Result<()> {
 
 fn log_file(host: &Host, name: &str) -> Result<std::fs::File> {
     host::check_name(name)?;
-    // Opened and marked written holding the name's lock (shared), so garbage
-    // collection, which removes a quiet log only holding it exclusively, keeps
-    // it. A VM running under the name holds it for good: it keeps the log too.
-    let open = || {
-        let f = std::fs::OpenOptions::new().create(true).append(true).open(host.vms(name, "log"))?;
-        f.set_modified(std::time::SystemTime::now())?;
-        Ok::<_, std::io::Error>(f)
-    };
-    let until = Instant::now() + Duration::from_millis(200);
-    loop {
-        match host.unheld(name, libc::LOCK_SH, open) {
-            Some(f) => return Ok(f?),
-            None if Instant::now() >= until => return Ok(open()?),
-            None => std::thread::sleep(Duration::from_millis(2)),
-        }
-    }
+    // Opened and marked written holding the logs lock (shared): garbage
+    // collection removes only a quiet log, holding it exclusively.
+    let _logs = host.logs_lock(libc::LOCK_SH)?;
+    let f = std::fs::OpenOptions::new().create(true).append(true).open(host.vms(name, "log"))?;
+    f.set_modified(std::time::SystemTime::now())?;
+    Ok(f)
 }
 
 fn spawn_detached(host: &Host, name: &str, args: &Args) -> Result<()> {

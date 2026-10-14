@@ -355,7 +355,16 @@ impl Host {
         if !resuming && self.is_suspended(name) {
             bail!("vm {name:?} exists (suspended); resume or kill it");
         }
-        let f = lock_path(&self.vms(name, "lock"), libc::LOCK_EX | libc::LOCK_NB).map_err(|_| format!("vm name {name:?} is taken"))?;
+        // A sweep holds a dead holder's lock for a moment (`collect_owned`):
+        // not taken, so tried again briefly.
+        let until = std::time::Instant::now() + Duration::from_millis(250);
+        let f = loop {
+            match lock_path(&self.vms(name, "lock"), libc::LOCK_EX | libc::LOCK_NB) {
+                Ok(f) => break f,
+                Err(_) if std::time::Instant::now() < until && self.holder_gone(name) => std::thread::sleep(Duration::from_millis(2)),
+                Err(_) => bail!("vm name {name:?} is taken"),
+            }
+        };
         // Locked, so its holder no longer runs it; its Firecrackers are reaped on
         // proof of death only, and an unreadable lock is an error, never no holder.
         if let Some(old) = lock_holder(&self.vms(name, "lock"))?.filter(|o| *o != Ident::me()) {
@@ -375,11 +384,24 @@ impl Host {
         Ok(NameLock { name: name.into(), host: self.clone(), _file: f })
     }
 
-    /// Runs `f` holding `name`'s lock (`how`: LOCK_SH or LOCK_EX), never
-    /// waiting: None while a VM, or anyone else, holds it the other way.
-    pub fn unheld<T>(&self, name: &str, how: i32, f: impl FnOnce() -> T) -> Option<T> {
-        let _held = lock_path(&self.vms(name, "lock"), how | libc::LOCK_NB).ok()?;
-        Some(f())
+    /// Whether no process runs `name`, by its lock's record alone (never a
+    /// probe of the lock, which a start takes without waiting): none, or one
+    /// proven gone.
+    pub fn holder_gone(&self, name: &str) -> bool {
+        match lock_holder(&self.vms(name, "lock")) {
+            Ok(None) => true,
+            Ok(Some(id)) => id.liveness() == Liveness::Gone,
+            Err(_) => false,
+        }
+    }
+
+    /// `RUN/.logs.lock`: held shared while a log is opened for a start,
+    /// exclusively while garbage collection decides on one and removes it.
+    /// Never a name's lock, which a start takes without waiting.
+    pub fn logs_lock(&self, how: i32) -> Result<File> {
+        let f = File::create(self.run.join(".logs.lock"))?;
+        flock(&f, how)?;
+        Ok(f)
     }
 
     pub fn alive(&self, name: &str) -> bool {
