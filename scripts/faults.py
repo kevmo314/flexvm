@@ -1703,7 +1703,7 @@ def pause_resume():
     sh(A, n, "date -s @$(date +%s)")  # fresh VMs keep the template's clock; start from a right one
     check("pause: SIGTSTP pauses (the process keeps running)", pause(A, n) and alive(vm_pid(A, n)), vms(A)[n])
     r = control(A, n, {"op": "exec", "cmd": "echo hi"})
-    check("pause: exec refused while paused", not r["ok"] and "not running" in r["error"], r)
+    check("pause: exec refused while paused", not r["ok"] and "is paused" in r["error"], r)
     time.sleep(0.2)
     controller_quiet = vms(A)[n]["state"] == "paused"
     time.sleep(3)
