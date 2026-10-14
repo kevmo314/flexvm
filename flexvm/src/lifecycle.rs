@@ -263,7 +263,7 @@ impl Proc {
             if boot == crate::host::boot_id() {
                 bail!("vm {name} is quarantined: {why}; kill it to discard its checkpoint");
             }
-            unmark_durably(&dir, QUARANTINE)?;
+            crate::util::unlink_durably(&dir.join(QUARANTINE))?;
         }
         let gen = read_gen(&dir).ok_or_else(|| {
             format!("vm {name} is quarantined: its address generation was never recorded, so it cannot be resumed with its address; restore {dir:?} with --name NEW --ip auto (choose an unused name), or flexvm kill {name} to discard it")
@@ -390,7 +390,7 @@ impl Proc {
             };
             if let Err(e) = marked {
                 vm.kill();
-                let unmarked = if fault("started_unmark") { failing("fsync failed") } else { unmark_durably(&dir, STARTED) };
+                let unmarked = if fault("started_unmark") { failing("fsync failed") } else { crate::util::unlink_durably(&dir.join(STARTED)) };
                 return Err(match unmarked {
                     Ok(()) => Restore::NotRun(format!("marking the checkpoint started: {e}").into()),
                     Err(r) => Restore::Uncertain(format!("marking the checkpoint started: {e}; removing the mark: {r}").into()),
@@ -749,14 +749,7 @@ fn read_gen(dir: &Path) -> Option<u64> {
 
 fn mark_durably(dir: &Path, name: &str) -> std::io::Result<()> {
     std::fs::File::create(dir.join(name))?.sync_all()?;
-    std::fs::File::open(dir)?.sync_all()
-}
-
-fn unmark_durably(dir: &Path, name: &str) -> std::io::Result<()> {
-    match std::fs::remove_file(dir.join(name)) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
-        _ => std::fs::File::open(dir)?.sync_all(),
-    }
+    crate::util::sync_dir(dir)
 }
 
 /// Manifest first, durably, so a crash midway never leaves a loadable
@@ -769,12 +762,9 @@ pub fn delete_consumed(name: &str, dir: &Path) {
 }
 
 fn remove_durably(dir: &Path) -> std::io::Result<()> {
-    unmark_durably(dir, "manifest.json")?;
+    crate::util::unlink_durably(&dir.join("manifest.json"))?;
     std::fs::remove_dir_all(dir)?;
-    match dir.parent() {
-        Some(parent) => std::fs::File::open(parent)?.sync_all(),
-        None => Ok(()),
-    }
+    crate::util::sync_dir(dir.parent().unwrap_or(Path::new("/")))
 }
 
 /// A suspended directory that is not a suspended VM (`Host::is_suspended`):

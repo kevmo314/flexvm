@@ -20,8 +20,8 @@ use serde_json::{json, Value};
 use crate::bail;
 use crate::guest;
 use crate::host::flock;
-use crate::util::{ms, Result};
-use registry::{sha256_hex, sync_dir};
+use crate::util::{ms, rename_noreplace, sync_dir, Result};
+use registry::sha256_hex;
 pub use unpack::Limits;
 use unpack::{check, cpath, open_at, stat_at, Root};
 
@@ -215,7 +215,7 @@ fn entry_complete(cached: &Path) -> bool {
 }
 
 /// Holds a per-key lock through the cache check, build and publication.
-fn cached_rootfs(cached: &Path, build: impl FnOnce(&Path) -> Result<String>, sync: impl Fn(&Path) -> Result<()>) -> Result<PathBuf> {
+fn cached_rootfs(cached: &Path, build: impl FnOnce(&Path) -> Result<String>, sync: impl Fn(&Path) -> std::io::Result<()>) -> Result<PathBuf> {
     use std::os::unix::fs::OpenOptionsExt;
     let dir = cached.parent().unwrap();
     // Entries handed out must survive a crash right after the first build.
@@ -277,7 +277,7 @@ fn remove_leftovers(cached: &Path) -> Result<()> {
 
 /// Publishes immutable files, the completion marker last. A competing
 /// publisher's entry is only reused once all three files are durable.
-fn publish_rootfs(tmp: &Path, cached: &Path, conf: &str, sync: impl Fn(&Path) -> Result<()>) -> Result<()> {
+fn publish_rootfs(tmp: &Path, cached: &Path, conf: &str, sync: impl Fn(&Path) -> std::io::Result<()>) -> Result<()> {
     File::open(tmp)?.sync_all()?;
     let dir = cached.parent().unwrap();
     let won = rename_noreplace(tmp, cached)? && publish(&cached.with_extension("conf"), bytes(conf.as_bytes()))? && {
@@ -288,18 +288,7 @@ fn publish_rootfs(tmp: &Path, cached: &Path, conf: &str, sync: impl Fn(&Path) ->
         bail!("incomplete image cache entry {}: refusing to replace it", cached.display());
     }
     // Even a collision winner may still need its marker synced.
-    sync(dir)
-}
-
-fn rename_noreplace(tmp: &Path, path: &Path) -> Result<bool> {
-    let (src, dest) = (cpath(tmp)?, cpath(path)?);
-    if unsafe { libc::renameat2(libc::AT_FDCWD, src.as_ptr(), libc::AT_FDCWD, dest.as_ptr(), libc::RENAME_NOREPLACE) } == 0 {
-        return Ok(true);
-    }
-    match std::io::Error::last_os_error() {
-        e if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-        e => Err(e.into()),
-    }
+    Ok(sync(dir)?)
 }
 
 /// Writes `path` durably via a temporary, never replacing it; false if another publisher won.
@@ -309,16 +298,16 @@ pub(super) fn publish(path: &Path, write: impl FnOnce(&mut File) -> Result<()>) 
 
 /// As `publish`, but replacing `path`: for content-addressed files that `write` verifies.
 pub(super) fn replace(path: &Path, write: impl FnOnce(&mut File) -> Result<()>) -> Result<()> {
-    install(path, write, |tmp, path| Ok(std::fs::rename(tmp, path)?))
+    install(path, write, |tmp, path| std::fs::rename(tmp, path))
 }
 
-fn install<T>(path: &Path, write: impl FnOnce(&mut File) -> Result<()>, rename: impl FnOnce(&Path, &Path) -> Result<T>) -> Result<T> {
+fn install<T>(path: &Path, write: impl FnOnce(&mut File) -> Result<()>, rename: impl FnOnce(&Path, &Path) -> std::io::Result<T>) -> Result<T> {
     let tmp = path.with_extension(format!("part{}", std::process::id()));
     let res = (|| {
         let mut f = create_new(&tmp)?;
         write(&mut f)?;
         f.sync_all()?;
-        rename(&tmp, path)
+        Ok(rename(&tmp, path)?)
     })();
     let _ = std::fs::remove_file(&tmp);
     res
@@ -821,7 +810,7 @@ mod tests {
 
         // Reusing a collision winner needs its directory synced too.
         let cached = d.join("key2.ext4");
-        let eio = |_: &Path| Err(std::io::Error::from_raw_os_error(libc::EIO).into());
+        let eio = |_: &Path| Err(std::io::Error::from_raw_os_error(libc::EIO));
         assert!(cached_rootfs(&cached, losing_build(&d, &cached), eio).is_err());
         assert!(entry_complete(&cached));
         assert!(cached_rootfs(&cached, never, sync_dir).is_ok());
@@ -834,7 +823,7 @@ mod tests {
         let fail_after_marker = |dir: &Path| {
             assert_eq!(dir, &*d);
             if cached.with_extension("ok").exists() {
-                return Err(std::io::Error::from_raw_os_error(libc::EIO).into());
+                return Err(std::io::Error::from_raw_os_error(libc::EIO));
             }
             sync_dir(dir)
         };

@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use super::reference::Reference;
 use super::unpack::{Hashed, MAX_DOCUMENT};
 use crate::bail;
-use crate::util::Result;
+use crate::util::{sync_dir, Result};
 
 pub const MANIFEST_TYPES: &str = "application/vnd.oci.image.index.v1+json, \
     application/vnd.docker.distribution.manifest.list.v2+json, \
@@ -196,10 +196,6 @@ pub(super) fn sweep_parts(dir: &Path) {
             let _ = std::fs::remove_file(entry.path());
         }
     }
-}
-
-pub fn sync_dir(dir: &Path) -> Result<()> {
-    Ok(std::fs::File::open(dir).and_then(|d| d.sync_all()).map_err(|e| format!("fsync of directory {}: {e}", dir.display()))?)
 }
 
 pub fn sha256_hex(data: &[u8]) -> String {

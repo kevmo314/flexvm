@@ -6,7 +6,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::{FileExt, MetadataExt};
@@ -153,14 +152,7 @@ fn lock_holder(path: &Path) -> Result<Option<Ident>> {
 
 pub fn store<T: Serialize>(path: &Path, v: &T, durable: bool) -> Result<()> {
     let (dir, name) = (path.parent().ok_or("no directory")?, path.file_name().ok_or("no name")?);
-    write_file(dir, &name.to_string_lossy(), &serde_json::to_vec(v)?, durable).map_err(|e| format!("{}: {e}", path.display()).into())
-}
-
-fn remove(path: &Path) -> Result<()> {
-    match std::fs::remove_file(path) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => bail!("{}: {e}", path.display()),
-        _ => Ok(File::open(path.parent().ok_or("no directory")?)?.sync_all()?),
-    }
+    crate::util::write_file(dir, &name.to_string_lossy(), &serde_json::to_vec(v)?, durable).map_err(|e| format!("{}: {e}", path.display()).into())
 }
 
 #[derive(Clone)]
@@ -541,7 +533,7 @@ impl Host {
                 // rescan of every resident VM's address per start.
                 let hint = std::fs::read_to_string(self.alloc_hint()).ok().and_then(|s| s.trim().parse().ok());
                 let ip = range.allocate(hint, taken).ok_or("no free addresses left")?;
-                let _ = write_file(&self.state.join("addrs"), ALLOC_HINT, range.after(ip).to_string().as_bytes(), false);
+                let _ = crate::util::write_file(&self.state.join("addrs"), ALLOC_HINT, range.after(ip).to_string().as_bytes(), false);
                 ip
             }
         };
@@ -861,14 +853,14 @@ impl Host {
                 return Ok("aborted");
             }
         }
-        remove(&path)?;
+        crate::util::unlink_durably(&path)?;
         Ok("aborted")
     }
 
     pub fn mig_done(&self, id: u64) -> Result<()> {
         let _l = self.lock()?;
         match load(&self.mig_path(id))? {
-            Some(Mig::Released { .. }) => remove(&self.mig_path(id)),
+            Some(Mig::Released { .. }) => Ok(crate::util::unlink_durably(&self.mig_path(id))?),
             _ => Ok(()),
         }
     }
@@ -1026,7 +1018,7 @@ impl Drop for MigRecord {
         if let (false, Ok(_l)) = (self.committed, self.host.lock()) {
             let path = self.host.mig_path(self.id);
             if matches!(load(&path), Ok(Some(Mig::Pending { owner, .. })) if owner == Ident::me()) {
-                let _ = remove(&path);
+                let _ = crate::util::unlink_durably(&path);
             }
         }
     }
@@ -1311,20 +1303,6 @@ fn lock_path(path: &Path, how: i32) -> std::io::Result<File> {
             return Ok(f);
         }
     }
-}
-
-pub fn write_file(dir: &Path, name: &str, data: &[u8], durable: bool) -> std::io::Result<()> {
-    let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
-    let mut f = File::create(&tmp)?;
-    f.write_all(data)?;
-    if durable {
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, dir.join(name))?;
-    if durable {
-        File::open(dir)?.sync_all()?;
-    }
-    Ok(())
 }
 
 /// Every error, and anything unparsable, is unknown.

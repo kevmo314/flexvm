@@ -1,6 +1,7 @@
 use std::io::{self, BufRead, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -250,6 +251,40 @@ pub fn host_cpus() -> usize {
     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
 }
 
+pub fn sync_dir(dir: &Path) -> io::Result<()> {
+    std::fs::File::open(dir).and_then(|d| d.sync_all()).map_err(|e| io::Error::new(e.kind(), format!("fsync of directory {}: {e}", dir.display())))
+}
+
+/// Removes `path` if it is there, then fsyncs its directory.
+pub fn unlink_durably(path: &Path) -> io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(io::Error::new(e.kind(), format!("{}: {e}", path.display()))),
+        _ => sync_dir(path.parent().unwrap_or(Path::new("."))),
+    }
+}
+
+/// False if `path` exists.
+pub fn rename_noreplace(tmp: &Path, path: &Path) -> io::Result<bool> {
+    use std::os::unix::ffi::OsStrExt;
+    let (src, dest) = (std::ffi::CString::new(tmp.as_os_str().as_bytes())?, std::ffi::CString::new(path.as_os_str().as_bytes())?);
+    match eintr(|| unsafe { libc::renameat2(libc::AT_FDCWD, src.as_ptr(), libc::AT_FDCWD, dest.as_ptr(), libc::RENAME_NOREPLACE) }) {
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        res => res.map(|_| true),
+    }
+}
+
+/// Durably: the file is fsynced before the rename, its directory after.
+pub fn write_file(dir: &Path, name: &str, data: &[u8], durable: bool) -> io::Result<()> {
+    let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(data)?;
+    if durable {
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, dir.join(name))?;
+    if durable { sync_dir(dir) } else { Ok(()) }
+}
+
 /// Fsyncs every parent each time: a crash may have lost an entry made before, or another
 /// process made it without syncing.
 pub fn create_dir_durably(dir: &std::path::Path) -> io::Result<()> {
@@ -268,7 +303,7 @@ pub fn create_dir_durably_mode(dir: &std::path::Path, mode: u32) -> io::Result<(
             Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(named(&path, "creating", e)),
             _ => {}
         }
-        std::fs::File::open(&parent).and_then(|f| f.sync_all()).map_err(|e| named(&parent, "fsync of directory", e))?;
+        sync_dir(&parent)?;
     }
     Ok(())
 }
