@@ -589,6 +589,17 @@ mod tests {
         assert_eq!(read("vm.log"), "five\nsix six\nsix six\n");
         crate::host::flock(&held, libc::LOCK_UN).unwrap();
         assert!(output::append_capped(&log, b"seven\n", 10) && read("vm.log.1") == "five\nsix six\nsix six\nseven\n");
+        // A holder that rotates and stalls before letting go: a writer waiting on
+        // the old generation goes on at once in the new log, never into `.1`.
+        assert!(output::append_capped(&log, b"eight\n", 10));
+        let held = open();
+        crate::host::flock(&held, libc::LOCK_EX).unwrap();
+        let (l, start) = (log.clone(), std::time::Instant::now());
+        let w = std::thread::spawn(move || output::append_capped(&l, b"nine\n", 10));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::fs::rename(&log, d.join("vm.log.1")).unwrap();
+        assert!(w.join().unwrap() && start.elapsed() < std::time::Duration::from_millis(900), "{:?}", start.elapsed());
+        assert_eq!((read("vm.log.1"), read("vm.log")), ("eight\n".into(), "nine\n".into()));
         std::fs::remove_dir_all(d).unwrap();
     }
 
@@ -788,14 +799,17 @@ pub mod output {
         let deadline = Instant::now() + STALL;
         let (f, locked) = loop {
             let Ok(f) = File::options().create(true).append(true).open(log) else { return false };
+            // Waited for only while it is the file at `log`: once rotated or
+            // removed, again at the one there now (written unlocked past the bound).
             let locked = loop {
                 match crate::host::flock(&f, libc::LOCK_EX | libc::LOCK_NB) {
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline => std::thread::sleep(Duration::from_millis(1)),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline && same_file(&f, log) => {
+                        std::thread::sleep(Duration::from_millis(1))
+                    }
                     r => break r.is_ok(),
                 }
             };
-            // Rotated or removed while waiting: again, at the file there now.
-            if !locked || same_file(&f, log) {
+            if same_file(&f, log) {
                 break (f, locked);
             }
         };
