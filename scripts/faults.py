@@ -4073,7 +4073,7 @@ def standby_stalled():
         start = time.time()
         r = run(A, n)
         check("standby stalled: run starts cold past a stopped one", r.get("ok") and r["result"]["standby"] is False, r)
-        check("standby stalled: within the handshake's bound", time.time() - start < 30, time.time() - start)
+        check("standby stalled: within the handshake's bound", time.time() - start < 15, time.time() - start)
     finally:
         os.kill(pid, signal.SIGCONT)
     cli(A, "standby", "--template", t, "0")
