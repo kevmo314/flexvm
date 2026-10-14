@@ -103,6 +103,7 @@ impl Pages {
 }
 
 impl Pager {
+    /// Only a partial fetch is retried: a link waits out a source outage itself, and its other errors are final.
     pub(super) fn retry_fetch(&self, e: &io::Error) -> bool {
         partial(e) && !self.stop.load(Ordering::SeqCst)
     }
