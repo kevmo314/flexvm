@@ -569,6 +569,38 @@ mod tests {
         assert!(e.contains("--max-entries"), "{e}");
     }
 
+    #[test]
+    fn docker_save_directory_links_stay_inside() {
+        let d = tmpdir("docker-links");
+        let saved = d.join("saved");
+        std::fs::create_dir_all(saved.join("original")).unwrap();
+        std::fs::create_dir(saved.join("dedup")).unwrap();
+        let tar = layer(&[("a", 'f', "good")]);
+        std::fs::write(saved.join("config.json"), config(&tar)).unwrap();
+        std::fs::write(saved.join("original/layer.tar"), &tar).unwrap();
+        std::fs::write(saved.join("manifest.json"), r#"[{"Config": "config.json", "Layers": ["dedup/layer.tar"]}]"#).unwrap();
+        let link = saved.join("dedup/layer.tar");
+        symlink("../original/layer.tar", &link).unwrap();
+        // Also accept a symlink naming the docker-save directory itself.
+        symlink(&saved, d.join("alias")).unwrap();
+        assert_eq!(unpack(&d.join("alias"), &d.join("out")).unwrap(), "good");
+        std::fs::remove_file(&link).unwrap();
+        symlink(saved.join("original/layer.tar"), &link).unwrap();
+        assert_eq!(unpack(&saved, &d.join("absolute-out")).unwrap(), "good");
+
+        // Prefix siblings, absolute targets and links through directories must not escape.
+        let outside = d.join("saved-other");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("layer.tar"), &tar).unwrap();
+        symlink(&outside, saved.join("escape")).unwrap();
+        for target in [PathBuf::from("../../saved-other/layer.tar"), outside.join("layer.tar"), PathBuf::from("../escape/layer.tar")] {
+            std::fs::remove_file(&link).unwrap();
+            symlink(target, &link).unwrap();
+            let err = fetch(&saved, &Limits::default()).err().unwrap().to_string();
+            assert!(err.contains("escapes image directory"), "{err}");
+        }
+    }
+
     fn oci_layout(dir: &Path, layer: &[u8]) -> (String, String) {
         let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
         gz.write_all(layer).unwrap();
