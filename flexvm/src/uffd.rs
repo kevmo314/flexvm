@@ -2389,8 +2389,9 @@ impl Lane {
 
     /// Takes `conn` for requests, and writes those not out yet. Before
     /// reading the reply to `req`, the front job's: fails if its request was
-    /// out asking for something else (the connection must go).
-    fn flush(&self, conn: &TcpStream, req: Option<(u64, usize)>) -> io::Result<()> {
+    /// out asking for something else (the connection must go). Every write
+    /// ends by `at`, the deadline of the fetcher's attempt.
+    fn flush(&self, conn: &TcpStream, req: Option<(u64, usize)>, at: Instant) -> io::Result<()> {
         let mut q = self.q.lock().unwrap();
         if q.conn.is_none() {
             q.conn = Some(conn.try_clone()?);
@@ -2414,7 +2415,7 @@ impl Lane {
             let upto = q.jobs.len();
             q.writing = true;
             drop(q);
-            let res = crate::util::By { s: conn, at: Instant::now() + FETCH_DEADLINE }.write_all(&out);
+            let res = crate::util::By { s: conn, at }.write_all(&out);
             q = self.q.lock().unwrap();
             q.writing = false;
             res?;
@@ -2485,8 +2486,8 @@ impl Link {
                 progress(data)
             };
             let res = match lane {
-                Some(lane) if buf.is_empty() => lane.flush(&client.stream.s, None),
-                Some(lane) => lane.flush(&client.stream.s, Some((offset, buf.len()))).and_then(|()| client.recv(buf, head, &mut counted, at)),
+                Some(lane) if buf.is_empty() => lane.flush(&client.stream.s, None, at),
+                Some(lane) => lane.flush(&client.stream.s, Some((offset, buf.len())), at).and_then(|()| client.recv(buf, head, &mut counted, at)),
                 None => client.fetch(offset, buf, head, &mut counted, at),
             };
             match res {
