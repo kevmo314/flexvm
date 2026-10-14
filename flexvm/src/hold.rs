@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use crate::bail;
-use crate::util::{By, Result};
+use crate::util::{eintr, By, Result};
 
 /// Bytes held per address; packets beyond it are dropped.
 pub const CAP: usize = 4 << 20;
@@ -156,9 +156,7 @@ impl Holder {
             self.hand_over(&e, sink, &mut stats);
         }
         self.unhold(ip, &e);
-        let mut q = e.q.lock().unwrap();
-        stats.dropped += q.dropped + q.packets.len() as u64;
-        q.packets.clear();
+        stats.dropped += e.q.lock().unwrap().discard();
         Some((stats, switched))
     }
 
@@ -182,11 +180,10 @@ impl Holder {
             self.unhold(ip, &e);
         }
         let mut q = e.q.lock().unwrap();
-        stats.dropped += std::mem::take(&mut q.dropped);
-        if switched.is_ok() {
-            stats.dropped += q.packets.len() as u64;
-            q.packets.clear();
-        }
+        stats.dropped += match switched {
+            Ok(()) => q.discard(),
+            Err(_) => std::mem::take(&mut q.dropped),
+        };
         Some((stats, switched))
     }
 
@@ -236,9 +233,7 @@ impl Holder {
         let Some(e) = self.entry(ip).filter(|e| e.mig == mig) else { return Stats::default() };
         self.unhold(ip, &e);
         let _ = crate::net::route_dev(false, ip, self.ifindex);
-        let mut q = e.q.lock().unwrap();
-        let dropped = q.dropped + q.packets.len() as u64;
-        q.packets.clear();
+        let dropped = e.q.lock().unwrap().discard();
         Stats { dropped, ..Stats::default() }
     }
 
@@ -246,22 +241,11 @@ impl Holder {
         let mut pfd = libc::pollfd { fd: self.tun.as_raw_fd(), events: libc::POLLIN, revents: 0 };
         let mut buf = vec![0u8; 65536];
         loop {
-            if unsafe { libc::poll(&mut pfd, 1, -1) } < 0 {
-                let e = std::io::Error::last_os_error();
-                if e.kind() == std::io::ErrorKind::Interrupted {
-                    continue;
-                }
+            if let Err(e) = eintr(|| unsafe { libc::poll(&mut pfd, 1, -1) }) {
                 return eprintln!("hold device {}: {e}", self.dev);
             }
             self.reading.store(true, Ordering::SeqCst);
-            loop {
-                let n = unsafe { libc::read(self.tun.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
-                if n < 0 {
-                    if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    break;
-                }
+            while let Ok(n) = eintr(|| unsafe { libc::read(self.tun.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) }) {
                 let p = &buf[..n as usize];
                 if p.len() < 20 || p[0] >> 4 != 4 {
                     continue;
@@ -287,6 +271,13 @@ impl Queue {
         self.bytes -= batch.iter().map(Vec::len).sum::<usize>();
         batch
     }
+
+    /// Empties it, counting what is thrown away as dropped.
+    fn discard(&mut self) -> u64 {
+        let n = std::mem::take(&mut self.dropped) + self.packets.len() as u64;
+        (self.packets, self.bytes) = Default::default();
+        n
+    }
 }
 
 /// Sends IP packets to a guest as Ethernet frames out of its tap, as Firecracker would.
@@ -301,10 +292,7 @@ pub struct Injector {
 impl Injector {
     pub fn new(tap: &str) -> Result<Injector> {
         // Protocol 0: it sends and never receives.
-        let fd = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW | libc::SOCK_CLOEXEC, 0) };
-        if fd < 0 {
-            bail!("packet socket: {}", std::io::Error::last_os_error());
-        }
+        let fd = eintr(|| unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW | libc::SOCK_CLOEXEC, 0) }).map_err(|e| format!("packet socket: {e}"))?;
         let mut header = [0u8; 14];
         header[..6].copy_from_slice(&crate::net::parse_mac(crate::net::GUEST_MAC)?);
         header[6..12].copy_from_slice(&crate::net::parse_mac(crate::net::GATEWAY_MAC)?);
@@ -507,18 +495,15 @@ fn readable(fd: &OwnedFd) -> bool {
 /// The error flag: another process has it (rather than no TUN support).
 fn open_tun(dev: &str) -> std::result::Result<OwnedFd, (bool, crate::util::Error)> {
     const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
-    let fd = unsafe { libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC | libc::O_NONBLOCK) };
-    if fd < 0 {
-        return Err((false, format!("/dev/net/tun: {}", std::io::Error::last_os_error()).into()));
-    }
+    let fd = eintr(|| unsafe { libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC | libc::O_NONBLOCK) })
+        .map_err(|e| (false, format!("/dev/net/tun: {e}").into()))?;
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
     let mut req: libc::ifreq = unsafe { std::mem::zeroed() };
     for (d, s) in req.ifr_name.iter_mut().zip(dev.bytes().take(libc::IFNAMSIZ - 1)) {
         *d = s as libc::c_char;
     }
     req.ifr_ifru.ifru_flags = (libc::IFF_TUN | libc::IFF_NO_PI) as libc::c_short;
-    if unsafe { libc::ioctl(fd.as_raw_fd(), TUNSETIFF as _, &req) } < 0 {
-        let e = std::io::Error::last_os_error();
+    if let Err(e) = eintr(|| unsafe { libc::ioctl(fd.as_raw_fd(), TUNSETIFF as _, &req) }) {
         let busy = matches!(e.raw_os_error(), Some(libc::EBUSY | libc::EEXIST | libc::EPERM));
         return Err((busy, format!("{dev}: {e}{}", if busy { " (another process has it)" } else { "" }).into()));
     }

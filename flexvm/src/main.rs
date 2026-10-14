@@ -124,13 +124,8 @@ fn main() {
     }
 }
 
-pub fn dirs(args: &Args) -> (PathBuf, PathBuf) {
-    (args.path("state", "FLEXVM_STATE", "/var/lib/flexvm"), args.path("run", "FLEXVM_RUN", "/run/flexvm"))
-}
-
 pub fn open_host(args: &Args) -> Result<Host> {
-    let (state, run) = dirs(args);
-    Host::open(&state, &run)
+    Host::open(&args.path("state", "FLEXVM_STATE", "/var/lib/flexvm"), &args.path("run", "FLEXVM_RUN", "/run/flexvm"))
 }
 
 /// Exported for the VM processes this one starts.
@@ -399,10 +394,7 @@ fn image_options(args: &Args) -> Result<Option<image::Options>> {
 
 /// Reattaches when the connection drops (a checkpoint's pause resets vsock).
 pub fn exec(host: &Host, name: &str, cmd: &str) -> Result<i32> {
-    exec_session(host, name, cmd, &mut std::io::stdout().lock(), &mut std::io::stderr().lock())
-}
-
-fn exec_session(host: &Host, name: &str, cmd: &str, stdout: &mut impl Write, stderr: &mut impl Write) -> Result<i32> {
+    let (stdout, stderr) = (&mut std::io::stdout().lock(), &mut std::io::stderr().lock());
     let id = guest::session_id()?;
     let (mut offset, mut started, mut error) = (0, false, String::new());
     let mut deadline = Instant::now() + Duration::from_secs(30);
@@ -444,13 +436,13 @@ fn exec_session(host: &Host, name: &str, cmd: &str, stdout: &mut impl Write, std
     Err(format!("exec recovery timed out: {error}").into())
 }
 
-pub enum StreamEnd {
+enum StreamEnd {
     Exit(i32),
     Disconnected(String),
 }
 
 /// Tracks `offset` so a reattach resumes without duplicates.
-pub fn exec_frames(r: &mut impl Read, id: &str, started: &mut bool, offset: &mut u64, stdout: &mut impl Write, stderr: &mut impl Write, deadline: &mut Instant) -> Result<StreamEnd> {
+fn exec_frames(r: &mut impl Read, id: &str, started: &mut bool, offset: &mut u64, stdout: &mut impl Write, stderr: &mut impl Write, deadline: &mut Instant) -> Result<StreamEnd> {
     loop {
         let (kind, data) = match guest::read_frame(r) {
             Ok(Some(frame)) => frame,

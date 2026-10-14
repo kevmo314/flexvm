@@ -79,12 +79,11 @@ pub fn run(args: &Args) -> Result<()> {
     let hosts = Hosts { a, b, to, timeout };
     let template = args.get("template").unwrap_or("default");
     let date = command("date", &["-u", "+%Y-%m-%dT%H-%M-%SZ"])?;
-    let (report, suffix) = match args.get("lifecycle") {
+    let (mut report, suffix) = match args.get("lifecycle") {
         Some(dir) => (lifecycle(&hosts, args, template, dir, &date)?, "-lifecycle"),
         None => (runs(&hosts, args, template, &date)?, ""),
     };
     let sha = command("git", &["rev-parse", "HEAD"])?;
-    let mut report = report;
     report["date_utc"] = json!(date);
     report["git_sha"] = json!(sha);
     report["git_dirty"] = json!(!command("git", &["status", "--porcelain"])?.is_empty());
@@ -275,26 +274,25 @@ fn trial(h: &Hosts, name: &str, template: &str, mib: u64, ck: &std::path::Path) 
     checkpoint["data_mib"] = c["data_mib"].clone();
     h.wait("the checkpointed vm to go", || !h.a.alive(name))?;
 
-    // Another host gives it an address of its own (its own is the first host's to give).
-    let ip = if h.to.is_some() { "auto" } else { "" };
+    let restored = |reply: Value| -> Result<Value> {
+        let mut t = reply["timings_ms"].clone();
+        t["ready"] = reply["ready_ms"].clone();
+        t["pull"] = h.pulled(&h.b, name)?;
+        Ok(t)
+    };
     let ck = ck.to_string_lossy();
     let mut argv = vec!["restore", &ck, "--name", name, "-d"];
-    if !ip.is_empty() {
-        argv.extend(["--ip", ip]);
+    if h.to.is_some() {
+        // Another host gives it an address of its own (its own is the first host's to give).
+        argv.extend(["--ip", "auto"]);
     }
-    let rs = h.cli(&h.b, &argv)?;
-    let mut restore = rs["timings_ms"].clone();
-    restore["ready"] = rs["ready_ms"].clone();
-    restore["pull"] = h.pulled(&h.b, name)?;
+    let restore = restored(h.cli(&h.b, &argv)?)?;
 
     let t = Instant::now();
     h.b.signal(name, libc::SIGTERM)?;
     h.wait("suspend", || !h.b.alive(name))?;
     let suspend = json!({"total": ms(t.elapsed())});
-    let rr = h.cli(&h.b, &["resume", name, "-d"])?;
-    let mut resume_suspended = rr["timings_ms"].clone();
-    resume_suspended["ready"] = rr["ready_ms"].clone();
-    resume_suspended["pull"] = h.pulled(&h.b, name)?;
+    let resume_suspended = restored(h.cli(&h.b, &["resume", name, "-d"])?)?;
     Ok(json!({"pause": pause, "checkpoint": checkpoint, "restore": restore, "suspend": suspend, "resume_suspended": resume_suspended}))
 }
 

@@ -39,6 +39,20 @@ pub fn recv_json_max(r: &mut impl BufRead, max: u64) -> Result<Option<serde_json
     Ok(Some(serde_json::from_str(&line)?))
 }
 
+/// Retries on EINTR; a negative return is the OS error.
+pub fn eintr<T: Copy + Default + PartialOrd>(mut f: impl FnMut() -> T) -> io::Result<T> {
+    loop {
+        let n = f();
+        if n >= T::default() {
+            return Ok(n);
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
+}
+
 pub fn retry<T>(timeout: Duration, mut f: impl FnMut() -> Result<T>) -> Result<T> {
     let start = Instant::now();
     loop {
@@ -139,10 +153,7 @@ pub fn connect_unix(path: &std::path::Path, timeout: Duration) -> io::Result<Uni
     for (d, s) in sa.sun_path.iter_mut().zip(bytes) {
         *d = *s as libc::c_char;
     }
-    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK, 0) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
+    let fd = eintr(|| unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK, 0) })?;
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
     let len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
     // A non-blocking unix connect fails with EAGAIN while the backlog is full.
@@ -161,18 +172,12 @@ pub fn connect_unix(path: &std::path::Path, timeout: Duration) -> io::Result<Uni
 }
 
 pub fn pidfd_open(pid: u32) -> io::Result<OwnedFd> {
-    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
+    let fd = eintr(|| unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) })?;
     Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
 }
 
 pub fn pidfd_signal(pidfd: &OwnedFd, sig: i32) -> io::Result<()> {
-    match unsafe { libc::syscall(libc::SYS_pidfd_send_signal, pidfd.as_raw_fd(), sig, std::ptr::null::<libc::siginfo_t>(), 0) } {
-        0 => Ok(()),
-        _ => Err(io::Error::last_os_error()),
-    }
+    eintr(|| unsafe { libc::syscall(libc::SYS_pidfd_send_signal, pidfd.as_raw_fd(), sig, std::ptr::null::<libc::siginfo_t>(), 0) }).map(drop)
 }
 
 pub fn pidfd_kill(pidfd: &OwnedFd) -> io::Result<()> {
@@ -182,13 +187,8 @@ pub fn pidfd_kill(pidfd: &OwnedFd) -> io::Result<()> {
 pub fn pidfd_wait(pidfd: &OwnedFd, timeout: Duration) -> io::Result<bool> {
     let mut pfd = libc::pollfd { fd: pidfd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
     let end = Instant::now() + timeout;
-    loop {
-        match unsafe { libc::poll(&mut pfd, 1, end.saturating_duration_since(Instant::now()).as_millis().min(i32::MAX as u128) as i32) } {
-            n if n >= 0 => return Ok(n > 0),
-            _ if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => {}
-            _ => return Err(io::Error::last_os_error()),
-        }
-    }
+    let left = || end.saturating_duration_since(Instant::now()).as_millis().min(i32::MAX as u128) as i32;
+    Ok(eintr(|| unsafe { libc::poll(&mut pfd, 1, left()) })? > 0)
 }
 
 pub fn ms(d: Duration) -> f64 {
@@ -247,11 +247,7 @@ pub fn create_dir_durably(dir: &std::path::Path) -> io::Result<()> {
     create_dir_durably_mode(dir, 0o777)
 }
 
-pub fn create_private_dir_durably(dir: &std::path::Path) -> io::Result<()> {
-    create_dir_durably_mode(dir, 0o700)
-}
-
-fn create_dir_durably_mode(dir: &std::path::Path, mode: u32) -> io::Result<()> {
+pub fn create_dir_durably_mode(dir: &std::path::Path, mode: u32) -> io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     let named = |p: &std::path::Path, what: &str, e: io::Error| io::Error::new(e.kind(), format!("{what} {}: {e}", p.display()));
     let dir = std::path::absolute(dir).map_err(|e| named(dir, "resolving", e))?;
@@ -286,17 +282,9 @@ pub fn send_with_fds(s: &UnixStream, line: &[u8], fds: &[RawFd]) -> io::Result<(
             std::ptr::copy_nonoverlapping(fds.as_ptr(), libc::CMSG_DATA(c) as *mut RawFd, fds.len());
         }
     }
-    let n = loop {
-        let n = unsafe { libc::sendmsg(s.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) };
-        if n >= 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
-            break n;
-        }
-    };
-    if n < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if (n as usize) < line.len() {
-        (&*s).write_all(&line[n as usize..])?;
+    let n = eintr(|| unsafe { libc::sendmsg(s.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) })? as usize;
+    if n < line.len() {
+        (&*s).write_all(&line[n..])?;
     }
     Ok(())
 }
@@ -317,14 +305,7 @@ pub fn recv_with_fds(s: &UnixStream, max: usize) -> io::Result<(Vec<u8>, Vec<Own
         msg.msg_iovlen = 1;
         msg.msg_control = cbuf.as_mut_ptr().cast();
         msg.msg_controllen = cbuf.len() as _;
-        let n = unsafe { libc::recvmsg(s.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) };
-        if n < 0 {
-            let e = io::Error::last_os_error();
-            if e.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(e);
-        }
+        let n = eintr(|| unsafe { libc::recvmsg(s.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) })?;
         unsafe {
             let mut c = libc::CMSG_FIRSTHDR(&msg);
             while !c.is_null() {
@@ -411,11 +392,11 @@ mod tests {
     fn state_and_suspended_directories_are_private() {
         let root = std::env::temp_dir().join(format!("flexvm-private-{}", std::process::id()));
         let dir = root.join("state/suspended");
-        create_private_dir_durably(&dir).unwrap();
+        create_dir_durably_mode(&dir, 0o700).unwrap();
         for path in [&root, &root.join("state"), &dir] {
             assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o700);
         }
-        create_private_dir_durably(&dir).unwrap();
+        create_dir_durably_mode(&dir, 0o700).unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 }

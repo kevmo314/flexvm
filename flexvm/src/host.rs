@@ -98,7 +98,7 @@ impl Host {
         for d in ["addrs", "standby", "migs"] {
             let _ = crate::util::create_dir_durably(&state.join(d));
         }
-        let _ = crate::util::create_private_dir_durably(&state.join("suspended"));
+        let _ = crate::util::create_dir_durably_mode(&state.join("suspended"), 0o700);
         for d in ["vms", "standby", "w"] {
             let _ = std::fs::create_dir_all(run.join(d));
         }
@@ -215,6 +215,17 @@ impl Host {
         store(&self.addr_path(ip), a, durable)
     }
 
+    /// Stores the record only if `change` changed it.
+    fn update<T>(&self, l: &Locked, ip: Ipv4Addr, durable: bool, change: impl FnOnce(&mut Addr) -> T) -> Result<T> {
+        let mut a = self.addr(l, ip)?;
+        let before = a.clone();
+        let out = change(&mut a);
+        if a != before {
+            self.put_addr(ip, &a, durable)?;
+        }
+        Ok(out)
+    }
+
     fn held(&self, a: &Addr) -> bool {
         a.holder.as_deref().is_some_and(|h| !self.gone(h) || self.suspended(h).exists())
     }
@@ -296,24 +307,17 @@ impl Host {
 
     /// Also takes back a loan of it (the VM came home).
     pub fn commit_incoming(&self, l: &Locked, ip: Ipv4Addr, gen: u64) -> Result<()> {
-        let mut a = self.addr(l, ip)?;
-        if !a.current(gen) {
-            bail!("generation {gen} of {ip} was withdrawn or superseded meanwhile");
-        }
-        if a.lent.is_some_and(|lent| lent <= gen) {
-            a.lent = None;
-            self.put_addr(ip, &a, true)?;
-        }
-        Ok(())
+        self.update(l, ip, true, |a| {
+            if !a.current(gen) {
+                bail!("generation {gen} of {ip} was withdrawn or superseded meanwhile");
+            }
+            a.lent = a.lent.filter(|&lent| lent > gen);
+            Ok(())
+        })?
     }
 
     pub fn release(&self, l: &Locked, ip: Ipv4Addr, holder: &str) -> Result<()> {
-        let mut a = self.addr(l, ip)?;
-        if a.holder.as_deref() == Some(holder) {
-            a.holder = None;
-            self.put_addr(ip, &a, false)?;
-        }
-        Ok(())
+        self.update(l, ip, false, |a| a.holder = a.holder.take().filter(|h| h != holder))
     }
 
     pub fn lend(&self, l: &Locked, ip: Ipv4Addr, gen: u64) -> Result<()> {
@@ -326,30 +330,22 @@ impl Host {
     }
 
     pub fn unlend(&self, l: &Locked, ip: Ipv4Addr, gen: u64) -> Result<()> {
-        let mut a = self.addr(l, ip)?;
-        if a.lent == Some(gen) {
-            a.lent = None;
-            self.put_addr(ip, &a, true)?;
-        }
-        Ok(())
+        self.update(l, ip, true, |a| a.lent = a.lent.filter(|&lent| lent != gen))
     }
 
     /// `via` None is a withdrawal. False if stale (older, or announcing a
     /// withdrawn generation). A withdrawal frees a loan of that gen or older.
     pub fn observe(&self, l: &Locked, ip: Ipv4Addr, gen: u64, via: Option<Ipv4Addr>) -> Result<bool> {
-        let mut a = self.addr(l, ip)?;
-        if gen < a.seen || (gen == a.seen && a.withdrawn && via.is_some()) {
-            return Ok(false);
-        }
-        let before = a.clone();
-        (a.seen, a.withdrawn, a.via) = (gen, via.is_none(), via);
-        if via.is_none() && a.lent.is_some_and(|lent| lent <= gen) {
-            a.lent = None;
-        }
-        if a != before {
-            self.put_addr(ip, &a, true)?;
-        }
-        Ok(true)
+        self.update(l, ip, true, |a| {
+            if gen < a.seen || (gen == a.seen && a.withdrawn && via.is_some()) {
+                return false;
+            }
+            (a.seen, a.withdrawn, a.via) = (gen, via.is_none(), via);
+            if via.is_none() && a.lent.is_some_and(|lent| lent <= gen) {
+                a.lent = None;
+            }
+            true
+        })
     }
 
     /// A paused migration source keeps its route too: its release moves it.
@@ -696,13 +692,7 @@ pub fn check_name(name: &str) -> Result<()> {
 }
 
 pub fn flock(f: &File, how: i32) -> std::io::Result<()> {
-    while unsafe { libc::flock(f.as_raw_fd(), how) } != 0 {
-        let e = std::io::Error::last_os_error();
-        if e.kind() != std::io::ErrorKind::Interrupted {
-            return Err(e);
-        }
-    }
-    Ok(())
+    crate::util::eintr(|| unsafe { libc::flock(f.as_raw_fd(), how) }).map(drop)
 }
 
 /// A holder may unlink the file just before we lock: retry until it is the path's.
