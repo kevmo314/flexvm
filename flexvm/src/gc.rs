@@ -95,7 +95,8 @@ fn vm_files(host: &Host) {
         // Decided and removed holding the logs lock: a start opens its log
         // holding it too (shared) and marks it written (`main::log_file`), so
         // a log being opened is never quiet here. Busy: left for the next sweep.
-        let Ok(_logs) = host.logs_lock(libc::LOCK_EX | libc::LOCK_NB) else { return };
+        // (Only this log is left: the arrivals' and the other names' logs are still decided on.)
+        let Ok(_logs) = host.logs_lock(libc::LOCK_EX | libc::LOCK_NB) else { continue };
         let orphan = host.holder_gone(name) && !host.suspended(name).exists() && !["failed", "moved"].iter().any(|ext| host.vms(name, ext).exists());
         if orphan && quiet() {
             let _ = std::fs::remove_file(&path);
@@ -194,7 +195,16 @@ mod tests {
         store_holder(&host, "held", &crate::host::Ident::me());
         let dead_name = at("dead.log", old);
         store_holder(&host, "dead", &crate::host::Ident { pid: 999_999_940, start: 1, boot: crate::host::boot_id().into() });
-        vm_files(&host);
+        // The logs lock is busy while another test's child, forked but not yet exec'd, still has
+        // it open (its fd inherited for that moment): busy is left for the next sweep, so sweep
+        // until it was free once.
+        for _ in 0..200 {
+            vm_files(&host);
+            if !dead_name.exists() && !orphan.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(live_name.exists() && !dead_name.exists(), "by the name's holder");
         assert!(!dead.exists() && fresh.exists() && live.exists(), "arrivals");
         assert!(!moved.exists() && recent_moved.exists(), "markers");

@@ -153,7 +153,7 @@ impl Ticks {
 impl Proc {
     fn new(host: Host, paths: Paths) -> Result<Arc<Proc>> {
         let ident = Ident::me();
-        let work = host.run.join("w").join(ident.pid.to_string());
+        let work = ident.work_dir(&host.run);
         if let Some(old) = crate::host::load(&work.join("owner"))? {
             crate::host::reap(&host.run, &old)?;
         }
@@ -504,7 +504,7 @@ impl Proc {
         if let Some(c) = self.claimer.lock().unwrap().take() {
             let _ = send_json(&mut &c, &json!({"exit": code}));
         }
-        let work = self.host.run.join("w").join(self.ident.pid.to_string());
+        let work = self.ident.work_dir(&self.host.run);
         crate::socket::remove(&work);
         let _ = std::fs::remove_dir_all(&work);
         crate::util::output::drain();

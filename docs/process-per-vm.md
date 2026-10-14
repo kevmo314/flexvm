@@ -124,7 +124,8 @@ RUN (default /run/flexvm, tmpfs)
   standby/.loadset-ID    pages loads of template ID touch, learned by standby VMs, for migrations to preload
                          (one per generation, never swept: whether one is in use cannot be told)
   faults.json            armed test faults (FLEXVM_FAULTS=1 only)
-  w/PID/                 a VM process's work directory: `owner` (pid, start time), and per
+  w/PID-START/           a VM process's work directory, named by its whole identity (a later
+                         process with its pid never shares it): `owner` (pid, start time), and per
                          Firecracker a directory with `fc` (its pid and start time)
 ```
 
