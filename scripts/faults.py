@@ -209,7 +209,7 @@ FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_be
           "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "resume_kill",
           "prepare_fail", "short_incoming", "slow_preload", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
           "started_fsync", "started_unmark", "start_stall", "incoming_stall", "claim_stall", "handoff_stall", "ckpt_wp_race",
-          "fetch_tail_enomem", "fetch_enomem_stuck", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo")
+          "fetch_tail_enomem", "fetch_enomem_stuck", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo", "release_stall")
 
 
 def disarm():
@@ -963,10 +963,37 @@ def same_host_order():
     not route the VM's address to its tap before the packets the source's
     hold took first are in. A 1 kHz UDP sequence stream across migrations
     there and back arrives whole and in order."""
-    n = "ft-same-host"
+    udp_across_migrations("same host order", "ft-same-host")
+
+
+def same_host_slow_route():
+    """#136: the target's own hold, which takes the address over from the
+    source's, lets go of it with a route change that can wait long (for RTNL,
+    on a busy host: `release_stall` makes it 300 ms). Nothing it held, or that
+    reached it meanwhile, is lost, and nothing is reordered."""
+    udp_across_migrations("same host slow route", "ft-slow-route", "release_stall")
+
+
+def same_host_flood():
+    """#136: traffic that keeps arriving while the target lets go of its hold
+    (10k datagrams/s, its route change made slow by `release_stall`) never
+    holds the release up: it ends within a bound, and nothing is lost but
+    what flexvm or the guest says it dropped."""
+    udp_across_migrations("same host flood", "ft-flood", "release_stall", burst=10)
+
+
+def udp_across_migrations(label, n, target_fault=None, burst=1):
+    """A UDP sequence stream to `n` (`burst` datagrams every millisecond)
+    across migrations A to B, back and to B again, `target_fault` armed on
+    each target, arrives whole and, at 1 kHz, in order. The guest's socket
+    buffer is made large enough for any burst of held packets, so a datagram
+    missing was lost by flexvm (the guest's own drops are shown)."""
+    for h in (A, B):
+        clear_log(h, n)
     ok(run(A, n))
     ip = vm_ip(A, n)
-    code, out = sh(A, n, "setsid socat -u UDP-RECV:9000 OPEN:/tmp/udp,creat,append >/dev/null 2>&1 < /dev/null &")
+    code, out = sh(A, n, "echo 16777216 > /proc/sys/net/core/rmem_max; "
+                   "setsid socat -u UDP-RECV:9000,rcvbuf=16777216 OPEN:/tmp/udp,creat,append >/dev/null 2>&1 < /dev/null &")
     assert code == 0, out
     time.sleep(0.3)
     stop, sent = threading.Event(), [0]
@@ -974,32 +1001,55 @@ def same_host_order():
     def stream():
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         while not stop.is_set():
-            s.sendto(b"%08d\n" % sent[0], (ip, 9000))
-            sent[0] += 1
+            for _ in range(burst):
+                s.sendto(b"%08d\n" % sent[0], (ip, 9000))
+                sent[0] += 1
             time.sleep(0.001)
 
     t = threading.Thread(target=stream, daemon=True)
     t.start()
     time.sleep(0.5)
-    held = []
+    held, at = [], []
     for src, dst in ((A, B), (B, A), (A, B)):
+        if target_fault:
+            fault(dst, target_fault, 60000)
+        at.append(sent[0])
         r = migrate(src, n, dst)
         held.append((r.get("result") or {}).get("held") or r.get("error"))
         wait_released(dst, n, src)
+        if target_fault:
+            fault(dst, target_fault, 0)
         time.sleep(0.3)
     stop.set()
     t.join(10)
     time.sleep(0.3)
-    check("same host order: migrated, running on B", where(n) == {B: "running"}, where(n))
-    check("same host order: packets held each time, all injected",
+    check(f"{label}: migrated, running on B", where(n) == {B: "running"}, where(n))
+    check(f"{label}: packets held each time, all injected",
           all(isinstance(h, dict) and h.get("packets", 0) > 0 and h.get("injected") == h.get("packets") and h.get("dropped") == 0
               and h.get("dropped_target") == 0 for h in held), held)
     code, out = sh(B, n, "cat /tmp/udp")
     got = [int(x) for x in out.split()] if code == 0 else []
     missing = sorted(set(range(sent[0])) - set(got))
-    check("same host order: no udp datagram lost", not missing, f"sent {sent[0]}, missing {missing[:40]}")
-    late = [got[max(0, i - 3):i + 12] for i, (a, b) in enumerate(zip(got, got[1:])) if b <= a]
-    check("same host order: none reordered", not late, late[:10])
+    runs = [[a, b] for a, b in zip([m for i, m in enumerate(missing) if i == 0 or missing[i - 1] != m - 1],
+                                  [m for i, m in enumerate(missing) if i + 1 == len(missing) or missing[i + 1] != m + 1])]
+    udp = sh(B, n, "grep Udp: /proc/net/snmp; pidof socat >/dev/null && echo receiving")[1].splitlines()
+    guest = {k: v for k, v in zip(udp[0].split()[1:], udp[1].split()[1:]) if k in ("InDatagrams", "NoPorts", "RcvbufErrors")} if len(udp) >= 2 else udp
+    detail = (f"sent {sent[0]}, migrations began at {at}, {len(missing)} missing, runs {runs[:10]}; the guest: {guest}, "
+              f"{'socat receiving' if udp[-1:] == ['receiving'] else 'socat gone'}")
+    dropped = {h: [l for l in log(h, n).splitlines() if "dropped" in l or "dropping" in l] for h in (A, B)}
+    if burst == 1:
+        check(f"{label}: no udp datagram lost", not missing, detail)
+        late = [got[max(0, i - 3):i + 12] for i, (a, b) in enumerate(zip(got, got[1:])) if b <= a]
+        check(f"{label}: none reordered", not late, late[:10])
+        for h in (A, B):
+            check(f"{label}: no held packets dropped on {h}", not dropped[h], dropped[h][-3:])
+    else:
+        # Overload may drop, but only what is counted: by the holds, or by the guest's socket.
+        said = sum(int(m) for h in (A, B) for l in dropped[h] for m in re.findall(r"dropped (\d+)", l))
+        said += int(guest.get("RcvbufErrors", 0)) if isinstance(guest, dict) else 0
+        check(f"{label}: nothing lost that was not counted", len(missing) <= said, (detail, dropped))
+        let_go = [float(m) for h in (A, B) for m in re.findall(r"let go of \S+ after ([\d.]+) ms", log(h, n))]
+        check(f"{label}: each release ended within 2 s of its 300 ms route change", let_go and max(let_go) < 2000, let_go)
     cleanup(n)
 
 
@@ -2365,7 +2415,8 @@ def ckpt_packet_hold():
     n = "ft-ckpt-pkt"
     ok(run(A, n))
     ip = vm_ip(A, n)
-    code, out = sh(A, n, "setsid socat -u UDP-RECV:9000 OPEN:/tmp/udp,creat,append >/dev/null 2>&1 < /dev/null &")
+    code, out = sh(A, n, "echo 16777216 > /proc/sys/net/core/rmem_max; "
+                   "setsid socat -u UDP-RECV:9000,rcvbuf=16777216 OPEN:/tmp/udp,creat,append >/dev/null 2>&1 < /dev/null &")
     assert code == 0, out
     tcp_server(A, n)
     conn = socket.create_connection((ip, 7000), timeout=10)
@@ -2600,6 +2651,15 @@ def cgroup(host, name):
     return int(open(os.path.join(path, "memory.current")).read()) >> 20, None if high == "max" else int(high) >> 20, events
 
 
+def swapped(host, name):
+    """MiB of `name`'s memory in swap (None without swap accounting)."""
+    path = "/sys/fs/cgroup" + open(f"/proc/{fc_pid(host, name)}/cgroup").read().strip().split(":", 2)[2]
+    try:
+        return int(open(os.path.join(path, "memory.swap.current")).read()) >> 20
+    except OSError:
+        return None
+
+
 def mem_available():
     return next(int(l.split()[1]) >> 10 for l in open("/proc/meminfo") if l.startswith("MemAvailable:"))
 
@@ -2641,6 +2701,8 @@ def throttle(label, host, n, reserve=512):
     check(f"{label}: throttled at its mark", high_now == high and peak <= high * 1.15 + 32 and events.get("high", "0") != "0",
           (high, peak, seen[::8], events))
     check(f"{label}: the fill did not finish", not hog_done(host, n))
+    # Swapped out instead, its vCPUs would wait for swap reads, which a pause cannot cut short.
+    check(f"{label}: throttled, not swapped", swapped(host, n) in (0, None), swapped(host, n))
     check(f"{label}: host stays above its reserve", low_avail > reserve, low_avail)
     check(f"{label}: nothing OOM-killed", events.get("oom_kill") == "0" and alive(fc_pid(host, n)) and alive(vm_pid(host, n)), events)
     check(f"{label}: throttled and starved, so the host would move it",
@@ -4195,7 +4257,7 @@ SCENARIOS = dict(
     incoming_killed=incoming_killed, start_killed=start_killed, claim_killed=claim_killed, fc_died=fc_died,
     sigkill_restart=sigkill_restart, listen_trickle=listen_trickle,
     cow_wp_race=cow_wp_race, fetch_tail_enomem=fetch_tail_enomem, fetch_enomem_stuck=fetch_enomem_stuck,
-    same_host_order=same_host_order, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,
+    same_host_order=same_host_order, same_host_slow_route=same_host_slow_route, same_host_flood=same_host_flood, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,
     handoff_superseded=handoff_superseded, suspend_cmd=suspend_cmd, fc_died_busy=fc_died_busy, pause_cmd_start=pause_cmd_start, suspend_died=suspend_died)
 names = [n for s in args.scenarios for n in (list(SCENARIOS) if s == "all" else [s])]
 if os.geteuid() != 0:

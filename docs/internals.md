@@ -703,7 +703,13 @@ a second copy could repeat what it did.
     it sends `SWITCH`, and the target, with all before it injected, points
     the route at a hold of its own; the source's last packets follow, and
     once the stream ends the target releases its hold into the VM, so the
-    held packets stay first and in order (#78). A target that takes
+    held packets stay first and in order (#78). Releasing a hold into a VM
+    here (that target's, an aborted source's, a checkpoint's) never drops
+    what it took because the route change was slow (it waits for RTNL,
+    which a busy host's tap and TUN teardowns hold): what arrives while the
+    route changes is injected as it comes, and once it changed everything
+    the TUN device took before is injected, the device read to its end
+    (#136; scenario `same_host_slow_route`). A target that takes
     `SWITCH` says so in its prepare answer (`hold_switch`); a source sends it
     to no other. Each of these late route changes happens under the host
     lock and only while the address is still this VM's with a current
