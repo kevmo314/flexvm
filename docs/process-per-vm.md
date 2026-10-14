@@ -81,9 +81,10 @@ Two directories, both overridable (`--state`/`FLEXVM_STATE`, `--run`/`FLEXVM_RUN
 STATE (default /var/lib/flexvm, on disk)
   host.json              host config: listen, peers, vm_ips, underlay, announce_dev, dns, reserve_mib, prefix
   lock                   the host lock (flock), held for short critical sections only
-  addrs/IP               per address: newest generation seen, withdrawn?, lent generation, holder name and
-                         generation, the route a peer announced for the newest generation
+  addrs/IP               per address: newest generation seen, withdrawn?, lent generation, holder name, instance
+                         (pid, start time) and generation, the route a peer announced for the newest generation
   addrs/.gens            generation high-water mark, reserved 1024 at a time, with the boot id
+  addrs/.next            where the next automatic allocation starts looking (a hint, wrapping around)
   suspended/NAME/        a suspended VM's checkpoint, GEN (its address's generation) published with it,
                          + STARTED, DISCARDED, QUARANTINE markers; without a manifest, or STARTED or
                          DISCARDED, it is debris: never listed, removed by the name's next holder
@@ -124,8 +125,11 @@ generation through migrations and suspends; route announcements and
 withdrawals carry it; each host keeps the newest (generation, withdrawn) seen
 per address and ignores older messages and announcements of withdrawn
 generations; a withdrawal frees a loan of its generation or older. An address
-is *taken* if its record names a holder that is alive (locked name, or its
-dead process's Firecrackers not yet gone) or suspended here, or it is lent.
+is *taken* if its record names a holder instance that is alive (holding the
+name, or dead with its Firecrackers not yet gone) or a holder suspended here
+with that generation, or it is lent. Another instance of the same name (a
+restart after a SIGKILL) does not hold it, and an instance releases only its
+own claim.
 All of this is decided under the host lock, in one critical section with the
 claim. Records with a new generation, a loan or a withdrawal are fsynced
 before acting; a live holder change is not (a crash loses the VM too, and the
@@ -224,7 +228,7 @@ socket-activatable (`LISTEN_FDS`, taking its address from the socket when
 no ADDR is given, or binds `host.json`'s `listen`); host.json is written only
 once the socket is bound and valid. Proxy ARP on `--announce-dev` is enabled
 by every VM process too, so it needs no listener. Each
-connection's first line (read unbuffered, so nothing after it is consumed) is
+connection's first line (peeked, then consumed exactly through its newline, so nothing after it is consumed) is
 one of:
 
 | op | |
@@ -237,7 +241,7 @@ one of:
 | `source` | whether a VM process of that name is a migration source here (a target retires a released record when not) |
 
 Only connections from the configured peers' addresses are served. Request
-lines are read with a 10 s deadline and capped at 64 KiB; at most 512
+lines must arrive whole within 10 s of the connection (one deadline, however the line trickles in) and are capped at 64 KiB; at most 512
 requests at once. Restarting or not running it loses nothing but the ability
 to receive.
 
@@ -407,9 +411,9 @@ where it is kept and what tests it.
 7. **Address state** is read fresh and changed per change under the host
    lock, durable where it orders anything. The listener's skip-local check
    reads the holder under that lock.
-8. **The `migrate_in` hand-off loses no bytes**: the listener reads the first
-   line one byte at a time, so nothing is buffered when it passes the
-   socket on. Page connections are passed to the VM named, which serves them
+8. **The `migrate_in` hand-off loses no bytes**: the listener peeks at the first
+   line and consumes exactly through its newline, so nothing is buffered
+   when it passes the socket on. Page connections are passed to the VM named, which serves them
    only as the source of the migration id they name.
 9. **Shared resources have one owner.** Socket roots, work directories, taps
    (`<prefix><pid>t<n>`) and cgroups (`idle-<pid>-<n>`) are named after the

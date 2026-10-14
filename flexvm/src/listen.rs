@@ -1,6 +1,6 @@
 //! The peer listener (`flexvm listen`): a stateless, restartable helper
 //! (socket-activatable) that serves only configured peers. Each connection
-//! starts with one JSON line, read unbuffered so nothing after it is consumed:
+//! starts with one JSON line, consumed exactly through its newline so nothing after it is:
 //! `migrate_in`, `pages` (handed to the source VM process), `migration`
 //! (status/done), `route`, `lend`.
 
@@ -8,6 +8,7 @@ use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -115,20 +116,47 @@ fn handle(host: &Host, mut conn: TcpStream) -> Result<()> {
     Ok(())
 }
 
-/// Byte by byte: whatever follows belongs to whoever gets the connection next.
+/// The whole request line must arrive within this, however it trickles in.
+const REQUEST_DEADLINE: Duration = Duration::from_secs(10);
+const MAX_LINE: usize = 64 << 10;
+
 fn read_line(conn: &mut TcpStream) -> Result<Vec<u8>> {
-    conn.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+    read_line_by(conn, Instant::now() + REQUEST_DEADLINE)
+}
+
+/// Peeks in chunks and consumes exactly through the newline: whatever
+/// follows stays in the socket for whoever gets the connection next. Each
+/// wait gets only what is left until `deadline`.
+fn read_line_by(conn: &TcpStream, deadline: Instant) -> Result<Vec<u8>> {
     let mut line = Vec::new();
-    let mut b = [0u8; 1];
-    while line.len() < 64 << 10 {
-        if conn.read(&mut b)? == 0 {
-            bail!("peer hung up");
+    let mut buf = [0u8; 4096];
+    while line.len() < MAX_LINE {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            bail!("request line not received in time");
         }
-        if b[0] == b'\n' {
+        conn.set_read_timeout(Some(left))?;
+        let want = buf.len().min(MAX_LINE + 1 - line.len());
+        let n = match conn.peek(&mut buf[..want]) {
+            Ok(0) => bail!("peer hung up"),
+            Ok(n) => n,
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                bail!("request line not received in time")
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        };
+        let (take, done) = match buf[..n].iter().position(|&b| b == b'\n') {
+            Some(i) => (i + 1, true),
+            None => (n, false),
+        };
+        // Already queued, so this does not wait.
+        (&*conn).read_exact(&mut buf[..take])?;
+        line.extend_from_slice(&buf[..take - done as usize]);
+        if done {
             conn.set_read_timeout(None)?;
             return Ok(line);
         }
-        line.push(b[0]);
     }
     bail!("request line too long")
 }
@@ -242,6 +270,55 @@ mod tests {
         assert!(!arrival.exists());
         assert_eq!(std::fs::read(&existing).unwrap(), b"accepted");
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn pair() -> (TcpStream, TcpStream) {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let c = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        (c, l.accept().unwrap().0)
+    }
+
+    #[test]
+    fn a_request_line_is_read_exactly_through_its_newline() {
+        use std::io::Write;
+        let (mut c, mut s) = pair();
+        c.write_all(b"{\"op\":\"x\"}\nafter").unwrap();
+        // In pieces too: a line split across chunks.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert_eq!(read_line_by(&s, deadline).unwrap(), b"{\"op\":\"x\"}");
+        let mut rest = [0u8; 5];
+        s.read_exact(&mut rest).unwrap();
+        assert_eq!(&rest, b"after", "nothing after the line is consumed");
+        let long = vec![b'a'; 10_000];
+        c.write_all(&long).unwrap();
+        c.write_all(b"\nnext").unwrap();
+        assert_eq!(read_line_by(&s, deadline).unwrap(), long);
+        s.read_exact(&mut rest[..4]).unwrap();
+        assert_eq!(&rest[..4], b"next");
+        c.write_all(&vec![b'a'; MAX_LINE + 1]).unwrap();
+        assert!(read_line_by(&s, deadline).unwrap_err().to_string().contains("too long"));
+    }
+
+    #[test]
+    fn a_slow_sender_gets_one_deadline_for_the_whole_line() {
+        use std::io::Write;
+        let (mut c, s) = pair();
+        let sender = std::thread::spawn(move || {
+            // Each byte well within a per-read timeout of the whole deadline.
+            for _ in 0..20 {
+                if c.write_all(b"x").is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            let _ = c.write_all(b"\n");
+        });
+        let start = Instant::now();
+        let e = read_line_by(&s, start + Duration::from_millis(400)).unwrap_err();
+        assert!(e.to_string().contains("in time"), "{e}");
+        assert!(start.elapsed() < Duration::from_millis(1000), "{:?}", start.elapsed());
+        drop(s);
+        sender.join().unwrap();
     }
 
     #[test]

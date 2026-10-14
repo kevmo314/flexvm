@@ -299,8 +299,26 @@ impl Host {
         Ok(out)
     }
 
+    /// Held by the VM instance that claimed it: while that process holds the
+    /// name, until its Firecrackers are reaped once it is dead, or while it is
+    /// suspended here with this generation. Another instance of the same name
+    /// (a restart after a SIGKILL) does not hold it.
     fn held(&self, a: &Addr) -> bool {
-        a.holder.as_deref().is_some_and(|h| !self.gone(h) || self.is_suspended(h))
+        let Some(h) = a.holder.as_deref() else { return false };
+        let instance = match &a.holder_id {
+            // Written before instances were recorded.
+            None => !self.gone(h),
+            Some(id) if id.alive() => self.alive(h) && self.holder_of(h).as_ref() == Some(id),
+            Some(id) => reap(&self.run, id).is_err(),
+        };
+        instance || self.suspended_with(h, a.held)
+    }
+
+    /// A suspended VM `name` with generation `gen` (or one whose generation was
+    /// never recorded: quarantined, it keeps what it held).
+    fn suspended_with(&self, name: &str, gen: u64) -> bool {
+        let recorded = || std::fs::read_to_string(self.suspended(name).join("GEN")).ok().and_then(|g| g.trim().parse::<u64>().ok());
+        self.is_suspended(name) && recorded().is_none_or(|g| g == gen)
     }
 
     pub fn claim_new(&self, l: &Locked, holder: &str, want: Option<Ipv4Addr>) -> Result<AddrClaim> {
@@ -313,12 +331,25 @@ impl Host {
             Some(ip) if self.addr(l, ip)?.lent.is_some() => bail!("{ip} is lent out, with a vm that migrated away"),
             Some(ip) if taken(ip) => bail!("{ip} is in use"),
             Some(ip) => ip,
-            None => range.allocate(taken).ok_or("no free addresses left")?,
+            None => {
+                // From where the last allocation stopped, wrapping around: not a
+                // rescan of every resident VM's address per start.
+                let hint = std::fs::read_to_string(self.alloc_hint()).ok().and_then(|s| s.trim().parse().ok());
+                let ip = range.allocate(hint, taken).ok_or("no free addresses left")?;
+                let _ = write_file(&self.state.join("addrs"), ALLOC_HINT, range.after(ip).to_string().as_bytes(), false);
+                ip
+            }
         };
         let a = self.addr(l, ip)?;
         let gen = self.next_gen(a.seen)?;
-        self.put_addr(ip, &Addr { seen: gen, holder: Some(holder.into()), held: gen, lent: a.lent, ..Addr::default() }, false)?;
-        Ok(AddrClaim { host: self.clone(), ip, gen, holder: holder.into(), kept: false, fresh: true })
+        let me = Ident::me();
+        self.put_addr(ip, &Addr { seen: gen, holder: Some(holder.into()), holder_id: Some(me.clone()), held: gen, lent: a.lent, ..Addr::default() }, false)?;
+        Ok(AddrClaim { host: self.clone(), ip, gen, holder: holder.into(), id: me, kept: false, fresh: true })
+    }
+
+    /// Where the next automatic allocation starts looking: a hint, never a claim.
+    fn alloc_hint(&self) -> PathBuf {
+        self.state.join("addrs").join(ALLOC_HINT)
     }
 
     pub fn lend_new(&self, l: &Locked, ip: Ipv4Addr) -> Result<u64> {
@@ -373,9 +404,10 @@ impl Host {
         if gen > a.seen {
             (a.seen, a.withdrawn, a.via) = (gen, false, None);
         }
-        (a.holder, a.held) = (Some(holder.into()), gen);
+        let me = Ident::me();
+        (a.holder, a.holder_id, a.held) = (Some(holder.into()), Some(me.clone()), gen);
         self.put_addr(ip, &a, true)?;
-        Ok(AddrClaim { host: self.clone(), ip, gen, holder: holder.into(), kept: false, fresh: false })
+        Ok(AddrClaim { host: self.clone(), ip, gen, holder: holder.into(), id: me, kept: false, fresh: false })
     }
 
     /// The host lock, if `gen` of `ip` is still current: held from this
@@ -388,8 +420,20 @@ impl Host {
         Ok(l)
     }
 
+    /// Lets go of `holder`'s claim, whichever instance made it (a suspended
+    /// VM's: the process that suspended it is gone).
     pub fn release(&self, l: &Locked, ip: Ipv4Addr, holder: &str) -> Result<()> {
-        self.update(l, ip, false, |a| a.holder = a.holder.take().filter(|h| h != holder))
+        self.release_by(l, ip, holder, None)
+    }
+
+    /// With `id`, only that instance's claim: never a later one's of the same name.
+    fn release_by(&self, l: &Locked, ip: Ipv4Addr, holder: &str, id: Option<&Ident>) -> Result<()> {
+        self.update(l, ip, false, |a| {
+            let by = |h: &Ident| id.is_none_or(|id| id == h);
+            if a.holder.as_deref() == Some(holder) && a.holder_id.as_ref().is_none_or(by) {
+                (a.holder, a.holder_id) = (None, None);
+            }
+        })
     }
 
     /// True if this made the loan (only then may its maker undo it).
@@ -563,6 +607,7 @@ impl Host {
 }
 
 const GRANT_WINDOW: Duration = Duration::from_secs(10);
+const ALLOC_HINT: &str = ".next";
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Addr {
@@ -571,6 +616,9 @@ pub struct Addr {
     /// Gone with a VM of this generation: not handed out until withdrawn or back.
     pub lent: Option<u64>,
     pub holder: Option<String>,
+    /// The instance (process) of `holder` that claimed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder_id: Option<Ident>,
     pub held: u64,
     pub via: Option<Ipv4Addr>,
 }
@@ -587,6 +635,7 @@ pub struct AddrClaim {
     pub ip: Ipv4Addr,
     pub gen: u64,
     holder: String,
+    id: Ident,
     kept: bool,
     /// A generation made for this VM: withdrawn even if the VM never ran.
     pub fresh: bool,
@@ -599,14 +648,14 @@ impl AddrClaim {
 
     pub fn release(mut self, l: &Locked) -> Result<()> {
         self.kept = true;
-        self.host.release(l, self.ip, &self.holder)
+        self.host.release_by(l, self.ip, &self.holder, Some(&self.id))
     }
 }
 
 impl Drop for AddrClaim {
     fn drop(&mut self) {
         if let (false, Ok(l)) = (self.kept, self.host.lock()) {
-            let _ = self.host.release(&l, self.ip, &self.holder);
+            let _ = self.host.release_by(&l, self.ip, &self.holder, Some(&self.id));
         }
     }
 }
@@ -1159,6 +1208,86 @@ mod tests {
         assert!(h.claim_new(&l, "z", None).unwrap().gen >= 2048);
         std::fs::write(h.state.join("addrs/.gens"), "x").unwrap();
         assert!(h.claim_new(&l, "z", None).is_err());
+    }
+
+    #[test]
+    fn an_address_is_held_by_the_instance_that_claimed_it() {
+        let h = host("instances");
+        let (x, y) = (ip("10.9.0.1"), ip("10.9.0.2"));
+        // `web` SIGKILLed at x (its Firecracker still running), and an earlier crash's claim at y.
+        let fc = Sleeper::new();
+        let dead = dead_owner(&h, 999_999_911, &[&fc.1]);
+        store(&h.vms("web", "lock"), &dead, false).unwrap();
+        let l = h.lock().unwrap();
+        h.put_addr(x, &Addr { seen: 1, holder: Some("web".into()), holder_id: Some(dead.clone()), held: 1, ..Addr::default() }, false).unwrap();
+        let older = Ident { pid: 999_999_912, ..dead.clone() };
+        h.put_addr(y, &Addr { seen: 2, holder: Some("web".into()), holder_id: Some(older), held: 2, ..Addr::default() }, false).unwrap();
+        // The restart takes the name (reaping it), then the same address.
+        let _web = h.take_name("web", false).unwrap();
+        assert!(fc.done());
+        assert_eq!(h.holder(&l, y).unwrap(), None, "a dead instance's claim is not the new one's");
+        assert_eq!(h.holder(&l, x).unwrap(), None);
+        let c = h.claim_new(&l, "web", Some(x)).unwrap();
+        assert!(c.gen > 1 && h.addr(&l, x).unwrap().holder_id == Some(Ident::me()));
+        assert_eq!(h.holder(&l, x).unwrap().as_deref(), Some("web"));
+        // Automatic allocation takes the stale claim's address too.
+        let d = h.claim_new(&l, "web", None).unwrap();
+        assert_eq!(d.ip, y);
+        d.keep();
+        // A live process that does not hold the name holds nothing.
+        let other = Sleeper::new();
+        h.put_addr(y, &Addr { seen: 3, holder: Some("web".into()), holder_id: Some(other.1.clone()), held: 3, ..Addr::default() }, false).unwrap();
+        assert_eq!(h.holder(&l, y).unwrap(), None);
+        assert!(!other.done());
+        // An instance lets go of its own claim only, never a later one's of the same name.
+        let mut a = h.addr(&l, x).unwrap();
+        a.holder_id = Some(Ident { start: 1, ..Ident::me() });
+        h.put_addr(x, &a, false).unwrap();
+        c.release(&l).unwrap();
+        assert_eq!(h.addr(&l, x).unwrap().holder.as_deref(), Some("web"));
+        h.release(&l, x, "web").unwrap();
+        assert_eq!(h.addr(&l, x).unwrap().holder, None, "by name: a suspended VM's, whoever suspended it");
+        // Suspended here, it holds the address of its own generation only.
+        std::fs::create_dir_all(h.suspended("s")).unwrap();
+        std::fs::write(h.suspended("s").join("manifest.json"), "").unwrap();
+        let gone = Ident { pid: 999_999_913, ..dead };
+        h.put_addr(x, &Addr { seen: 5, holder: Some("s".into()), holder_id: Some(gone), held: 5, ..Addr::default() }, false).unwrap();
+        assert_eq!(h.holder(&l, x).unwrap().as_deref(), Some("s"), "quarantined (no GEN): kept");
+        std::fs::write(h.suspended("s").join("GEN"), "5").unwrap();
+        assert_eq!(h.holder(&l, x).unwrap().as_deref(), Some("s"));
+        std::fs::write(h.suspended("s").join("GEN"), "6").unwrap();
+        assert_eq!(h.holder(&l, x).unwrap(), None, "suspended with another address");
+        // Records from before instances were recorded go by the name.
+        h.put_addr(x, &Addr { seen: 7, holder: Some("web".into()), held: 7, ..Addr::default() }, false).unwrap();
+        assert_eq!(h.holder(&l, x).unwrap().as_deref(), Some("web"));
+    }
+
+    #[test]
+    fn automatic_allocation_goes_on_from_the_last_one() {
+        let h = host("hint");
+        let l = h.lock().unwrap();
+        let a = h.claim_new(&l, "a", None).unwrap();
+        assert_eq!(a.ip, ip("10.9.0.1"));
+        drop(a);
+        // Free again, but the next allocation starts after it.
+        let b = h.claim_new(&l, "b", None).unwrap();
+        assert_eq!(b.ip, ip("10.9.0.2"));
+        b.keep();
+        let _c = h.take_name("c", false).unwrap();
+        let c = h.claim_new(&l, "c", None).unwrap();
+        assert_eq!(c.ip, ip("10.9.0.3"));
+        // Wraps around, skipping what is taken (b's name is not held: its claim is stale).
+        let _d = h.take_name("d", false).unwrap();
+        let d = h.claim_new(&l, "d", None).unwrap();
+        assert_eq!(d.ip, ip("10.9.0.1"));
+        let _e = h.take_name("e", false).unwrap();
+        let e = h.claim_new(&l, "e", None).unwrap();
+        assert_eq!(e.ip, ip("10.9.0.2"));
+        // A garbled hint is only a hint.
+        std::fs::write(h.alloc_hint(), "junk").unwrap();
+        assert!(h.claim_new(&l, "e", None).is_err(), "all taken");
+        drop((c, d, e));
+        assert_eq!(h.claim_new(&l, "e", None).unwrap().ip, ip("10.9.0.1"));
     }
 
     #[test]
