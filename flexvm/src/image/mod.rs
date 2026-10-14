@@ -222,8 +222,8 @@ fn entry_complete(cached: &Path) -> bool {
 fn cached_rootfs(cached: &Path, build: impl FnOnce(&Path) -> Result<String>, sync: impl Fn(&Path) -> std::io::Result<()>) -> Result<PathBuf> {
     use std::os::unix::fs::OpenOptionsExt;
     let dir = cached.parent().unwrap();
-    // Entries handed out must survive a crash right after the first build.
-    crate::util::create_dir_durably(dir)?;
+    // Entries handed out must survive a crash right after the first build, whoever made the directories.
+    crate::util::create_dir_durably(dir, 0o777)?;
     // Never unlink the lock: waiters must all lock the same inode.
     let lock = File::options().write(true).create(true).truncate(false).custom_flags(libc::O_NOFOLLOW).open(cached.with_extension("lock"))?;
     if let Err(e) = flock(&lock, libc::LOCK_EX | libc::LOCK_NB) {
@@ -237,8 +237,6 @@ fn cached_rootfs(cached: &Path, build: impl FnOnce(&Path) -> Result<String>, syn
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
         res => res.map(|_| true)?,
     };
-    // Before anything is published: existing directories may have been made by a builder that died before syncing.
-    crate::util::sync_ancestors(dir)?;
     if entry_complete(cached) {
         // A previous publisher may have failed its fsync after renaming .ok.
         sync(dir)?;
@@ -605,12 +603,12 @@ mod tests {
     #[test]
     fn cache_directories_are_created_durably_and_errors_name_them() {
         let d = tmpdir("durable");
-        crate::util::create_dir_durably(&d.join("images/rootfs")).unwrap();
+        crate::util::create_dir_durably(&d.join("images/rootfs"), 0o777).unwrap();
         assert!(d.join("images/rootfs").is_dir());
         let e = sync_dir(&d.join("missing")).unwrap_err().to_string();
         assert!(e.contains(&d.join("missing").display().to_string()), "{e}");
         std::fs::write(d.join("file"), b"").unwrap();
-        let e = crate::util::create_dir_durably(&d.join("file/x")).unwrap_err().to_string();
+        let e = crate::util::create_dir_durably(&d.join("file/x"), 0o777).unwrap_err().to_string();
         assert!(e.contains("file/x"), "{e}");
     }
 

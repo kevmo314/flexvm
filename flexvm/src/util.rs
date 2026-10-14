@@ -277,46 +277,60 @@ pub fn host_cpus() -> usize {
 }
 
 pub fn sync_dir(dir: &Path) -> io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    // Never blocks opening a FIFO put in its place.
-    std::fs::File::options()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY)
-        .open(dir)
-        .and_then(|d| d.sync_all())
-        .map_err(|e| io::Error::new(e.kind(), format!("fsync of directory {}: {e}", dir.display())))
+    open_dir(dir).and_then(|d| d.sync_all()).map_err(|e| io::Error::new(e.kind(), format!("fsync of directory {}: {e}", dir.display())))
 }
 
-/// Syncs every directory above `dir` up to `/`, and the one holding each symlink on `dir`'s path.
-/// Run when publishing in `dir`: an existing directory is not synced by `create_dir_durably`, and
-/// may have been made by a process that died before syncing it.
-pub fn sync_ancestors(dir: &Path) -> io::Result<()> {
-    sync_ancestors_with(dir, |d| d.sync_all())
+/// Never blocks opening a FIFO put in its place.
+fn open_dir(dir: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::File::options().read(true).custom_flags(libc::O_DIRECTORY).open(dir)
+}
+
+/// In one walk, by (dev, ino): directories synced, and links followed (with their directory,
+/// which a relative target resolves from: a hard-linked symlink may be in several).
+type Seen = std::collections::HashSet<((u64, u64), Option<(u64, u64)>)>;
+
+/// Syncs every directory above `dir` up to `/`, and the one holding each symlink its path or a
+/// link's target resolves through. Run when publishing in `dir`: an existing directory may have
+/// been made by a process that died before syncing it.
+fn sync_ancestors(dir: &Path) -> io::Result<()> {
+    sync_ancestors_with(dir, &mut Seen::new(), &mut |d| d.sync_all())
 }
 
 /// As `sync_ancestors`, from a pinned directory: never by a path, which may since name another.
 pub fn sync_ancestors_fd(dir: RawFd) -> io::Result<()> {
-    walk_up(dir, &mut Default::default(), &mut |d| d.sync_all())
+    walk_up(dir, &mut Seen::new(), &mut |d| d.sync_all())
 }
 
-fn sync_ancestors_with(dir: &Path, mut sync: impl FnMut(&std::fs::File) -> io::Result<()>) -> io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
+fn sync_ancestors_with(dir: &Path, seen: &mut Seen, sync: &mut impl FnMut(&std::fs::File) -> io::Result<()>) -> io::Result<()> {
     let named = |e: io::Error| io::Error::new(e.kind(), format!("fsync of the directories above {}: {e}", dir.display()));
-    let open = |p: &Path| std::fs::File::options().read(true).custom_flags(libc::O_DIRECTORY).open(p);
     let dir = std::path::absolute(dir).map_err(named)?;
-    let mut seen = std::collections::HashSet::new();
-    for link in dir.ancestors().filter(|p| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_symlink())) {
-        let holder = open(link.parent().unwrap_or(Path::new("/"))).map_err(named)?;
-        if seen.insert(dir_id(holder.as_raw_fd())?) {
-            sync(&holder).map_err(named)?;
-            walk_up(holder.as_raw_fd(), &mut seen, &mut sync).map_err(named)?;
+    sync_links(&dir, seen, sync).map_err(named)?;
+    walk_up(open_dir(&dir).map_err(named)?.as_raw_fd(), seen, sync).map_err(named)
+}
+
+/// The directory holding each symlink `path` resolves through, then the links in its target.
+fn sync_links(path: &Path, seen: &mut Seen, sync: &mut impl FnMut(&std::fs::File) -> io::Result<()>) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    for (link, m) in path.ancestors().filter_map(|p| Some((p, std::fs::symlink_metadata(p).ok().filter(|m| m.is_symlink())?))) {
+        let at = link.parent().unwrap_or(Path::new("/"));
+        let holder = open_dir(at)?;
+        let holder_id = dir_id(holder.as_raw_fd())?;
+        // Each link once, which ends a loop of them.
+        if !seen.insert(((m.dev(), m.ino()), Some(holder_id))) {
+            continue;
         }
+        if seen.insert((holder_id, None)) {
+            sync(&holder)?;
+            walk_up(holder.as_raw_fd(), seen, sync)?;
+        }
+        sync_links(&at.join(std::fs::read_link(link)?), seen, sync)?;
     }
-    walk_up(open(&dir).map_err(named)?.as_raw_fd(), &mut seen, &mut sync).map_err(named)
+    Ok(())
 }
 
 /// Syncs the directories above `dir` by "..", up to the root (its own ".."), stopping at one in `seen`.
-fn walk_up(dir: RawFd, seen: &mut std::collections::HashSet<(u64, u64)>, sync: &mut impl FnMut(&std::fs::File) -> io::Result<()>) -> io::Result<()> {
+fn walk_up(dir: RawFd, seen: &mut Seen, sync: &mut impl FnMut(&std::fs::File) -> io::Result<()>) -> io::Result<()> {
     let (mut cur, mut id) = (None::<std::fs::File>, dir_id(dir)?);
     loop {
         let fd = cur.as_ref().map_or(dir, |f| f.as_raw_fd());
@@ -326,7 +340,7 @@ fn walk_up(dir: RawFd, seen: &mut std::collections::HashSet<(u64, u64)>, sync: &
         }
         let up = unsafe { std::fs::File::from_raw_fd(up) };
         let up_id = dir_id(up.as_raw_fd())?;
-        if up_id == id || !seen.insert(up_id) {
+        if up_id == id || !seen.insert((up_id, None)) {
             return Ok(());
         }
         sync(&up)?;
@@ -375,31 +389,12 @@ pub fn write_file(dir: &Path, name: &str, data: &[u8], durable: bool) -> io::Res
     }
 }
 
-/// Creating any directory fsyncs every parent: an existing one may have been made without syncing
-/// (`create_dir_all`). Nothing to create, nothing synced.
-pub fn create_dir_durably(dir: &std::path::Path) -> io::Result<()> {
-    create_dir_durably_mode(dir, 0o777)
-}
-
-pub fn create_dir_durably_mode(dir: &std::path::Path, mode: u32) -> io::Result<()> {
+/// Creates `dir` and its parents with `mode`, then `sync_ancestors`, existing or not.
+pub fn create_dir_durably(dir: &Path, mode: u32) -> io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
-    let named = |p: &std::path::Path, what: &str, e: io::Error| io::Error::new(e.kind(), format!("{what} {}: {e}", p.display()));
-    let dir = std::path::absolute(dir).map_err(|e| named(dir, "resolving", e))?;
-    let mut path = std::path::PathBuf::from("/");
-    let (mut parents, mut created) = (vec![], false);
-    for part in dir.components().skip(1) {
-        parents.push(path.clone());
-        path.push(part);
-        match std::fs::DirBuilder::new().mode(mode).create(&path) {
-            Ok(()) => created = true,
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(named(&path, "creating", e)),
-        }
-    }
-    match created {
-        true => parents.iter().try_for_each(|p| sync_dir(p)),
-        false => Ok(()),
-    }
+    let named = |e: io::Error| io::Error::new(e.kind(), format!("creating {}: {e}", dir.display()));
+    std::fs::DirBuilder::new().recursive(true).mode(mode).create(dir).map_err(named)?;
+    sync_ancestors(dir)
 }
 
 /// Sent by `at`.
@@ -779,11 +774,11 @@ mod tests {
     fn state_and_suspended_directories_are_private() {
         let root = std::env::temp_dir().join(format!("flexvm-private-{}", std::process::id()));
         let dir = root.join("state/suspended");
-        create_dir_durably_mode(&dir, 0o700).unwrap();
+        create_dir_durably(&dir, 0o700).unwrap();
         for path in [&root, &root.join("state"), &dir] {
             assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o700);
         }
-        create_dir_durably_mode(&dir, 0o700).unwrap();
+        create_dir_durably(&dir, 0o700).unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -796,26 +791,37 @@ mod tests {
         std::os::unix::fs::symlink("../real/a", root.join("l/link")).unwrap();
         let root = root.canonicalize().unwrap();
         let id = |p: &Path| std::fs::metadata(p).map(|m| (m.dev(), m.ino())).unwrap();
-        let mut synced = vec![];
-        let mut record = |d: &std::fs::File| {
-            synced.push(dir_id(d.as_raw_fd())?);
-            Ok(())
+        let walk = |p: &Path, seen: &mut Seen| {
+            let mut synced = vec![];
+            sync_ancestors_with(p, seen, &mut |d| dir_id(d.as_raw_fd()).map(|id| synced.push(id))).map(|()| synced)
         };
-        // Each once: the link's directory (not on the physical chain) and everything above both.
-        sync_ancestors_with(&root.join("l/link/b"), &mut record).unwrap();
+        // The link's directory (not on the physical chain) and everything above both.
+        let synced = walk(&root.join("l/link/b"), &mut Default::default()).unwrap();
         let mut want: Vec<_> = [root.join("l"), root.join("real/a"), root.join("real")].iter().map(|p| id(p)).collect();
         want.extend(root.ancestors().map(id));
         let set: std::collections::HashSet<_> = synced.iter().copied().collect();
-        assert_eq!(synced.len(), set.len(), "{synced:?}");
+        assert_eq!(synced.len(), set.len(), "each once: {synced:?}");
         assert_eq!(set, want.iter().copied().collect(), "{synced:?}");
         assert!(synced.contains(&id(Path::new("/"))));
+
+        // A link in a link's target: p/l1 -> q/l2 -> real/a; q holds l2. Then nothing twice.
+        std::fs::create_dir_all(root.join("p")).unwrap();
+        std::fs::create_dir_all(root.join("q")).unwrap();
+        std::os::unix::fs::symlink(root.join("q/l2"), root.join("p/l1")).unwrap();
+        std::os::unix::fs::symlink("../real/a", root.join("q/l2")).unwrap();
+        let mut seen = Seen::new();
+        let synced = walk(&root.join("p/l1/b"), &mut seen).unwrap();
+        for d in ["p", "q", "real/a", "real"] {
+            assert!(synced.contains(&id(&root.join(d))), "{d}: {synced:?}");
+        }
+        assert_eq!(walk(&root.join("p/l1/b"), &mut seen).unwrap(), []);
 
         // From a pinned directory, a swapped-in path is never followed.
         let pinned = std::fs::File::open(root.join("real/a/b")).unwrap();
         std::fs::rename(root.join("real"), root.join("moved")).unwrap();
         std::fs::create_dir_all(root.join("other/a")).unwrap();
         std::os::unix::fs::symlink("other", root.join("real")).unwrap();
-        synced.clear();
+        let mut synced = vec![];
         walk_up(pinned.as_raw_fd(), &mut Default::default(), &mut |d| {
             synced.push(dir_id(d.as_raw_fd())?);
             Ok(())
@@ -825,7 +831,7 @@ mod tests {
         assert!(!synced.contains(&id(&root.join("other/a"))));
 
         assert!(sync_ancestors(&root.join("missing")).is_err());
-        assert!(sync_ancestors_with(&root.join("moved/a/b"), |_| Err(io::Error::other("eio"))).is_err());
+        assert!(sync_ancestors_with(&root.join("moved/a/b"), &mut Default::default(), &mut |_| Err(io::Error::other("eio"))).is_err());
         assert!(sync_ancestors(&root.join("real/a")).is_ok());
         assert!(sync_dir(&root.join("moved/a/b")).is_ok());
         std::fs::write(root.join("f"), "").unwrap();

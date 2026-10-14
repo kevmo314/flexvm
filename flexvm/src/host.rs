@@ -181,11 +181,21 @@ pub fn run_dir() -> Option<&'static Path> {
 }
 
 impl Host {
+    /// Synced up to `/` once per state root, not per command: under the root's flock, `.synced` names the
+    /// root (dev, inode), so a copy syncs again; it goes before a repair and comes back after the syncs.
     pub fn open(state: &Path, run: &Path) -> Result<Host> {
-        for d in ["addrs", "standby", "migs"] {
-            let _ = crate::util::create_dir_durably(&state.join(d));
+        let dirs = [("addrs", 0o777), ("standby", 0o777), ("migs", 0o777), ("suspended", 0o700)];
+        let (marker, id) = (state.join(".synced"), || std::fs::metadata(state).map(|m| format!("{} {}", m.dev(), m.ino())));
+        let root = |e: std::io::Error| format!("{}: {e} (run flexvm as root to create it)", state.display());
+        let held = std::fs::create_dir_all(state).and_then(|()| std::fs::File::open(state)).map_err(root)?;
+        crate::util::eintr(|| unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }).map_err(root)?;
+        if id().ok().is_none_or(|id| std::fs::read_to_string(&marker).ok() != Some(id)) || dirs.iter().any(|(d, _)| !state.join(d).is_dir()) {
+            let _ = std::fs::remove_file(&marker);
+            dirs.iter()
+                .try_for_each(|(d, mode)| crate::util::create_dir_durably(&state.join(d), *mode))
+                .and_then(|()| std::fs::write(&marker, id()?))
+                .map_err(root)?;
         }
-        let _ = crate::util::create_dir_durably_mode(&state.join("suspended"), 0o700);
         for d in ["vms", "standby", "w"] {
             let _ = std::fs::create_dir_all(run.join(d));
         }
@@ -1503,6 +1513,19 @@ mod tests {
 
     fn ip(s: &str) -> Ipv4Addr {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn state_directories_are_synced_once_and_remade() {
+        let h = host("synced");
+        let marker = std::fs::read_to_string(h.state.join(".synced")).unwrap();
+        std::fs::remove_dir(h.state.join("standby")).unwrap();
+        // Copied from another root: synced again.
+        std::fs::write(h.state.join(".synced"), "1 2").unwrap();
+        Host::open(&h.state, &h.run).unwrap();
+        assert!(h.state.join("standby").is_dir());
+        assert_eq!(std::fs::read_to_string(h.state.join(".synced")).unwrap(), marker);
+        std::fs::remove_dir_all(h.state.parent().unwrap()).unwrap();
     }
 
     #[test]
