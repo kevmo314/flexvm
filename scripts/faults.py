@@ -2191,6 +2191,10 @@ def shrink_stall():
     n = "ft-shrink-stall"
     setup(n, mib=1, template=os.environ.get("PLUG_TEMPLATE"))
     v = vms(A)[n]
+    if v["guest_mib"] < 4096 or v["max_mib"] - v["guest_mib"] < 4096:
+        print(f"shrink stall: skipped, template too small ({v['guest_mib']} of {v['max_mib']} MiB)", flush=True)
+        cleanup(n)
+        return
     hold = v["guest_mib"] - 1536
     touch = "b=bytearray({}<<20)\\nfor i in range(0, len(b), 4096): b[i] = 1\\n"
     holder = "python3 -c \"exec('" + touch.format(hold) + "'); open('/tmp/held', 'w').close(); import time; time.sleep(3600)\""
