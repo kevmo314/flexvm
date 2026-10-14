@@ -118,11 +118,22 @@ fn reap(statuses: Statuses) {
         let mut pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
         if pid == 0 {
             drop(map);
-            pid = unsafe { libc::waitpid(-1, &mut status, 0) };
+            // Waits without consuming the exit: std may still be waiting for a
+            // child whose exec failed inside `spawn`, holding our lock.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let waited = os(unsafe { libc::waitid(libc::P_ALL, 0, &mut info, libc::WEXITED | libc::WNOWAIT) });
             map = lock.lock().unwrap();
-            pid = unsafe { libc::waitpid(exited, &mut status, libc::WNOHANG) };
-            // spawn may already have consumed this failed-exec child.
-            if pid == 0 || (pid < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)) {
+            match waited.map_err(|e| e.raw_os_error()) {
+                Ok(_) => pid = unsafe { libc::waitpid(info.si_pid(), &mut status, libc::WNOHANG) },
+                Err(Some(libc::ECHILD)) => {
+                    drop(cv.wait(map).unwrap());
+                    continue;
+                }
+                Err(Some(libc::EINTR)) => continue,
+                Err(_) => return,
+            }
+            // `spawn` may already have consumed this failed-exec child.
+            if pid <= 0 {
                 continue;
             }
         }
@@ -426,18 +437,18 @@ mod tests {
         let statuses: Statuses = Arc::new((Mutex::new(HashMap::new()), Condvar::new()));
         let reaper = statuses.clone();
         thread::spawn(move || reap(reaper));
-        let child = spawn(Command::new("/bin/sleep").arg("0.2"), &statuses, true).unwrap();
+        let child = spawn(Command::new("/bin/sleep").arg("0.2"), &statuses).unwrap();
         // Let the reaper reach its blocking wait before failed execs exit.
         thread::sleep(Duration::from_millis(10));
         for _ in 0..200 {
             // A pre_exec makes std fork and reap a failed exec itself, as with the throttle cgroup.
             let mut missing = Command::new("/flexvm/nonexistent-executable");
-            unsafe { missing.pre_exec(|| Ok(())) };
-            assert!(spawn(&mut missing, &statuses, true).is_err());
+            unsafe { std::os::unix::process::CommandExt::pre_exec(&mut missing, || Ok(())) };
+            assert!(spawn(&mut missing, &statuses).is_err());
         }
-        assert_eq!(wait_pid(&statuses, child.id() as i32), 0);
-        let child = spawn(Command::new("/bin/sh").args(["-c", "exit 7"]), &statuses, true).unwrap();
-        assert_eq!(wait_pid(&statuses, child.id() as i32), 7);
+        assert_eq!(wait_pid(&statuses, child.id() as i32, None), Some(0));
+        let child = spawn(Command::new("/bin/sh").args(["-c", "exit 7"]), &statuses).unwrap();
+        assert_eq!(wait_pid(&statuses, child.id() as i32, None), Some(7));
     }
 
     #[test]

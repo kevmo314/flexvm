@@ -88,15 +88,18 @@ fn high_limit(total_kib: u64) -> u64 {
 /// independent of a worker blocked in reclaim.
 fn write_high(value: Option<u64>, raise_only: bool) -> io::Result<()> {
     let path = format!("{CGROUP}/memory.high");
-    let value = value.map_or_else(|| "max".to_string(), |n| n.to_string());
-    // A concurrent lift may have installed it already.
-    if std::fs::read_to_string(&path)?.trim() != value {
-        std::fs::write(path, value)?;
+    let installed = std::fs::read_to_string(&path)?.trim().parse().unwrap_or(u64::MAX);
+    let value = value.unwrap_or(u64::MAX);
+    if value != installed && !(raise_only && value < installed) {
+        std::fs::write(path, if value == u64::MAX { "max".to_string() } else { value.to_string() })?;
     }
     Ok(())
 }
 
-/// Numeric writes can reclaim synchronously (Linux 6.1), so a worker makes them, coalesced; lifts bypass it.
+type WriteHigh = dyn Fn(Option<u64>, bool) -> io::Result<()> + Send + Sync;
+
+/// Lowering the mark can reclaim synchronously (Linux 6.1), so a worker makes
+/// those writes, coalesced; raises and lifts bypass it.
 struct High {
     total_kib: u64,
     desired: Arc<Mutex<Option<u64>>>,
@@ -106,7 +109,7 @@ struct High {
 }
 
 impl High {
-    fn new(total_kib: u64, write: impl Fn(Option<u64>) -> io::Result<()> + Send + Sync + 'static) -> Self {
+    fn new(total_kib: u64, write: impl Fn(Option<u64>, bool) -> io::Result<()> + Send + Sync + 'static) -> Self {
         let (desired, pending, write) = (Arc::new(Mutex::new(Some(high_limit(total_kib)))), Arc::new(AtomicUsize::new(0)), Arc::new(write));
         let (latest, outstanding, writer) = (desired.clone(), pending.clone(), write.clone());
         let (changed, changes) = mpsc::channel();
@@ -145,7 +148,7 @@ impl High {
     }
 
     /// Installs the newest mark at once if it is above the one in place,
-    /// including after a stale lower write by the worker.
+    /// also after a stale lower write by the worker.
     fn relieve(&self) {
         let value = *self.desired.lock().unwrap();
         if let Err(e) = (self.write)(value, true) {
@@ -203,7 +206,7 @@ fn watch(events: File, uev: OwnedFd, mut limit: High) {
         if unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout) } < 0 {
             continue;
         }
-        // A numeric write that started just after a lift may be blocked in reclaim.
+        // A lowering write that started just after a raise or lift may be blocked in reclaim.
         if limit.busy() {
             limit.relieve();
         }
@@ -270,64 +273,102 @@ fn ask() -> Reply {
 mod tests {
     use super::*;
 
-    type Writes = mpsc::Receiver<(&'static str, Option<u64>)>;
+    type Writes = mpsc::Receiver<&'static str>;
 
-    /// A 4 GiB `High` reporting writes; numeric ones pause (until resumed) before installing and "in reclaim".
-    fn high() -> (High, Writes, mpsc::Sender<()>, Arc<Mutex<Option<u64>>>) {
+    /// A 4 GiB `High` over a memory.high that honors `raise_only`. The worker's
+    /// write of `low` pauses (until resumed) before installing and again "in
+    /// reclaim"; other writes report "raised".
+    fn high(low: u64) -> (High, Writes, mpsc::Sender<()>, Arc<Mutex<Option<u64>>>) {
         let (sent, writes) = mpsc::channel();
         let (resume, blocked) = mpsc::channel::<()>();
         let blocked = Mutex::new(blocked);
         let installed = Arc::new(Mutex::new(Some(high_limit(4096 << 10))));
         let current = Arc::clone(&installed);
-        let high = High::new(4096 << 10, move |value| {
-            if value.is_some() {
-                let _ = sent.send(("starting", value));
+        let high = High::new(4096 << 10, move |value, raise_only| {
+            let now = *current.lock().unwrap();
+            if value == now || (raise_only && value.unwrap_or(u64::MAX) < now.unwrap_or(u64::MAX)) {
+                return Ok(());
+            }
+            if value == Some(low) {
+                let _ = sent.send("starting");
                 let _ = blocked.lock().unwrap().recv();
                 *current.lock().unwrap() = value;
-                let _ = sent.send(("reclaiming", value));
+                let _ = sent.send("reclaiming");
                 let _ = blocked.lock().unwrap().recv();
             } else {
-                *current.lock().unwrap() = None;
-                let _ = sent.send(("lifted", None));
+                *current.lock().unwrap() = value;
+                let _ = sent.send("raised");
             }
             Ok(())
         });
         (high, writes, resume, installed)
     }
 
-    fn next(writes: &Writes) -> (&'static str, Option<u64>) {
+    fn next(writes: &Writes) -> &'static str {
         writes.recv_timeout(Duration::from_secs(1)).unwrap()
+    }
+
+    fn settle(high: &High) {
+        let end = Instant::now() + Duration::from_secs(1);
+        while high.busy() {
+            assert!(Instant::now() < end);
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 
     #[test]
     fn unchanged_total_does_not_write_or_rearm_after_lift() {
-        let (mut high, writes, _resume, _) = high();
+        let (mut high, writes, _resume, installed) = high(0);
         high.set_total(4096 << 10);
         high.set_total((4096 << 10) + 1);
         assert!(writes.try_recv().is_err());
         high.lift();
-        assert_eq!(next(&writes), ("lifted", None));
+        assert_eq!((next(&writes), *installed.lock().unwrap()), ("raised", None));
         high.set_total((4096 << 10) + 2);
         assert_eq!(*high.desired.lock().unwrap(), None);
     }
 
     #[test]
-    fn lift_overrides_blocked_and_queued_numeric_writes() {
-        let (mut high, writes, resume, installed) = high();
+    fn lift_bypasses_and_repairs_a_blocked_numeric_write() {
+        let (mut high, writes, resume, installed) = high(high_limit(2048 << 10));
         high.set_total(2048 << 10);
-        assert_eq!(next(&writes), ("starting", Some(high_limit(2048 << 10))));
-        // Neither the blocked write nor a queued update holds up the lift.
+        assert_eq!(next(&writes), "starting");
+        // GIVE_UP's lift supersedes the queued numeric update.
         high.set_total(1024 << 10);
         high.lift();
-        assert_eq!(next(&writes), ("lifted", None));
+        assert_eq!(next(&writes), "raised");
         // The blocked write lands late; the watcher repairs it while it reclaims.
         resume.send(()).unwrap();
-        assert_eq!(next(&writes).0, "reclaiming");
+        assert_eq!(next(&writes), "reclaiming");
         assert_eq!(*installed.lock().unwrap(), Some(high_limit(2048 << 10)));
         assert!(high.busy());
-        high.maintain_lift();
-        assert_eq!((*installed.lock().unwrap(), next(&writes)), (None, ("lifted", None)));
+        high.relieve();
+        assert_eq!(*installed.lock().unwrap(), None);
         resume.send(()).unwrap();
-        assert_eq!(next(&writes), ("lifted", None));
+        settle(&high);
+        assert_eq!(*installed.lock().unwrap(), None);
+    }
+
+    #[test]
+    fn raises_bypass_a_blocked_lowering_write_but_never_lower_the_mark() {
+        let (mut high, writes, resume, installed) = high(high_limit(2048 << 10));
+        high.set_total(2048 << 10);
+        assert_eq!(next(&writes), "starting");
+        // Above the last desired mark but below the installed one: a direct
+        // write would reclaim on the watcher, so the worker gets it.
+        high.set_total(1024 << 10);
+        high.set_total(3072 << 10);
+        assert!(writes.try_recv().is_err());
+        assert_eq!(*installed.lock().unwrap(), Some(high_limit(4096 << 10)));
+        high.set_total(8192 << 10);
+        assert_eq!(next(&writes), "raised");
+        resume.send(()).unwrap();
+        assert_eq!(next(&writes), "reclaiming");
+        high.relieve();
+        assert_eq!(*installed.lock().unwrap(), Some(high_limit(8192 << 10)));
+        assert_eq!(next(&writes), "raised");
+        resume.send(()).unwrap();
+        settle(&high);
+        assert_eq!(*installed.lock().unwrap(), Some(high_limit(8192 << 10)));
     }
 }

@@ -43,7 +43,14 @@ const UNIT: usize = 256;
 /// Most writer threads; a few saturate the disk.
 const MAX_WRITERS: usize = 12;
 const MAX_VMSTATE: u64 = 64 << 20;
-pub const MAX_CHAIN_META: u64 = 256 << 20;
+const MAX_CHAIN_META: u64 = 256 << 20;
+
+/// Most metadata (manifests, VM states, page maps) opening a chain may read:
+/// it scales with the host, never with what a (possibly forged) manifest
+/// claims. A page map costs at most 36 bytes per guest page, under 1% of it.
+pub fn chain_meta_budget() -> u64 {
+    MAX_CHAIN_META.max(crate::util::proc_kb("/proc/meminfo", "MemTotal").unwrap_or(0) / 16)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileSum {
@@ -128,7 +135,6 @@ fn open_at(dir: RawFd, name: &str) -> io::Result<File> {
     openat(dir, &cname(name), libc::O_RDONLY | libc::O_NONBLOCK).map(File::from)
 }
 
-const FILES: [&str; 4] = ["vmstate", "pages", "pagemap", "manifest.json"];
 const STAGING_PREFIX: &str = ".flexvm-staging-";
 
 pub enum CommitError {
@@ -268,7 +274,12 @@ impl Staging {
         let id = sum(&body);
         let text = [format!("{id}\n").as_bytes(), &body].concat();
         if (text.len() + vmstate.len() + map.len()) as u64 > self.meta_left {
-            return Err(format!("its chain would have more than {MAX_CHAIN_META} bytes of metadata; take a full one").into());
+            let budget = chain_meta_budget();
+            return Err(match manifest.parent {
+                Some(_) => format!("its chain would have more than {budget} bytes of metadata; take a full one"),
+                None => format!("it would have more than {budget} bytes of metadata"),
+            }
+            .into());
         }
         let mf = self.add_file("manifest.json", &text)?;
         // Owned by the directory's owner (we run as root), who may move and delete it.
@@ -313,9 +324,10 @@ impl Drop for Staging {
 }
 
 fn remove_staging(parent: RawFd, name: &CStr, outer: RawFd, ck: Option<RawFd>) {
+    // Every file in it (only we write there; `add_file` adds more than the four).
     if let Some(ck) = ck {
-        for f in FILES {
-            unsafe { libc::unlinkat(ck, cname(f).as_ptr(), 0) };
+        for f in std::fs::read_dir(format!("/proc/self/fd/{ck}")).into_iter().flatten().flatten() {
+            unsafe { libc::unlinkat(ck, cname(&f.file_name().to_string_lossy()).as_ptr(), 0) };
         }
     }
     unsafe { libc::unlinkat(outer, c"ck".as_ptr(), libc::AT_REMOVEDIR) };
@@ -680,9 +692,9 @@ impl Link {
 }
 
 /// The chain ending at `dir`, nearest first; `full` verifies all metadata within
-/// `MAX_CHAIN_META` (returning what is left), else only manifests.
+/// `chain_meta_budget` (returning what is left), else only manifests.
 fn open_chain(dir: &Path, full: bool) -> Result<(Vec<Link>, u64)> {
-    let mut meta_left = MAX_CHAIN_META;
+    let mut meta_left = chain_meta_budget();
     let mut links = vec![Link::open(dir, 0, full.then_some(&mut meta_left))?];
     while let Some(parent) = links.last().unwrap().manifest.parent.clone() {
         let child = links.last().unwrap();
@@ -972,7 +984,7 @@ mod tests {
         let top = dir.join("ck2");
         let ck = Checkpoint::open(&top).unwrap();
         assert_eq!((ck.chain.len(), &ck.chain_ids[..], chain_ids(&top).unwrap()), (2, &ids[1..], ids.clone()));
-        let cost = MAX_CHAIN_META - ck.meta_left;
+        let cost = chain_meta_budget() - ck.meta_left;
         Link::open(&top, 0, Some(&mut { cost })).unwrap();
         let mut left = cost - 1;
         let e = (0..3).rev().try_for_each(|i| Link::open(&dir.join(format!("ck{i}")), 0, Some(&mut left)).map(drop));
@@ -1166,6 +1178,7 @@ mod tests {
         let (stale, foreign) = (dir.join(format!("{STAGING_PREFIX}999999999-1")), dir.join(format!("{STAGING_PREFIX}999999998-1")));
         fs::create_dir_all(stale.join("ck")).unwrap();
         fs::write(stale.join("ck/pages"), b"x").unwrap();
+        fs::write(stale.join("ck/GEN"), b"generation").unwrap();
         fs::create_dir_all(&foreign).unwrap();
         fs::set_permissions(&stale, fs::Permissions::from_mode(0o700)).unwrap();
         fs::set_permissions(&foreign, fs::Permissions::from_mode(0o755)).unwrap();
@@ -1179,6 +1192,7 @@ mod tests {
         symlink("/etc/hostname", dir.join("link")).unwrap();
         assert!(create_at(s.parent.as_raw_fd(), "link").is_err() && open_at(s.parent.as_raw_fd(), "link").is_err());
         let files: Vec<_> = ["vmstate", "pagemap", "manifest.json"].map(|f| s.create(f).unwrap()).into();
+        s.add_file("GEN", b"generation").unwrap();
         let owner = fstat(s.parent.as_raw_fd()).unwrap();
         publish_permissions(&files.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>(), s.ck.as_raw_fd(), &owner).unwrap();
         for m in files.iter().map(|f| f.metadata().unwrap()) {
