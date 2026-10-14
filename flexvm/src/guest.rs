@@ -304,6 +304,33 @@ pub fn start_logs(s: UnixStream, offset: u64, follow: bool, timeout: Duration) -
 mod tests {
     use super::*;
 
+    #[test]
+    fn ping_waits_for_pong_without_a_session() {
+        let path = std::env::temp_dir().join(format!("flexvm-ping-{}.sock", std::process::id()));
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        for reply in [b"pong".as_slice(), b"error: no shell"] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let uds = path.clone();
+            let client = std::thread::spawn(move || tx.send(ping(&uds).is_ok()).unwrap());
+            let (stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).unwrap();
+            assert_eq!(line, format!("CONNECT {PORT}\n"));
+            line.clear();
+            stream.read_line(&mut line).unwrap();
+            assert_eq!(line, "PING\n");
+            stream.get_mut().write_all(b"OK 1\n").unwrap();
+            assert!(matches!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+            write_frame(stream.get_mut(), FRAME_MSG, reply).unwrap();
+            assert_eq!(rx.recv_timeout(TIMEOUT).unwrap(), reply == b"pong");
+            client.join().unwrap();
+        }
+        drop(listener);
+        std::fs::remove_file(path).unwrap();
+    }
+
     fn wire(frames: &[(u8, Vec<u8>)]) -> Vec<u8> {
         let mut wire = Vec::new();
         frames.iter().for_each(|(kind, data)| write_frame(&mut wire, *kind, data).unwrap());
