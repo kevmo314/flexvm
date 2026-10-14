@@ -41,7 +41,7 @@ pub(super) struct Written {
 
 const BASE: u8 = 0;
 
-fn classify(template: &Template, page: usize, bytes: &[u8]) -> (u8, u32) {
+pub(super) fn classify(template: &Template, page: usize, bytes: &[u8]) -> (u8, u32) {
     let tpl = template.has_data(page);
     if tpl && bytes == template.pages(page, 1) {
         return (BASE, 0);

@@ -1,6 +1,6 @@
 use super::{
     *, chain::{flatten, overlay, read_at, Link}, format::{parse_pagemap, sum, sums_sum, Run, MAGIC, DATA, ZERO, TEMPLATE, MAX_VMSTATE},
-    staging::{exists_at, publish_permissions, STAGING_PREFIX}, write::{aligned, as_bytes, write_pages, PagesFile},
+    staging::{exists_at, publish_permissions, STAGING_PREFIX}, write::{aligned, as_bytes, classify, write_pages, PagesFile},
 };
 use crate::{template::{Paths, Template}, uffd::{Runs, REMOTE, BASE as P_BASE, ZERO as P_ZERO}, util::{Result, PAGE_SIZE}};
 use std::{os::fd::AsRawFd, os::unix::fs::FileExt, path::{Path, PathBuf}, sync::Arc, io::Write, fs};
@@ -309,5 +309,79 @@ fn staging_is_private_never_overwrites_and_cleans_up() {
     assert!(!dest.exists() && mine().is_empty());
     fs::create_dir_all(&dest).unwrap();
     assert!(Staging::new(&dest, dir.join("vmstate.private")).is_err());
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The page map as built before BASE runs were pushed whole: a page at a time.
+fn per_page_map(tpl: &Template, guest: &Guest, runs: &Runs, explicit: bool) -> (Vec<[u64; 4]>, u64) {
+    let (mut map, mut zero, mut at): (Vec<[u64; 4]>, u64, u64) = (Vec::new(), 0, 0);
+    let mut push = |page: usize, kind: u64, at: u64| {
+        let kind = match kind {
+            ZERO | DATA => kind,
+            _ if explicit => TEMPLATE,
+            _ => return,
+        };
+        zero += (kind == ZERO) as u64;
+        match map.last_mut() {
+            Some([f, n, k, a]) if *k == kind && *f + *n == page as u64 && (kind != DATA || *a + *n == at) => *n += 1,
+            _ => map.push([page as u64, 1, kind, at]),
+        }
+    };
+    for &(first, count, state) in runs {
+        for p in (first..first + count).map(|p| p as usize) {
+            let kind = match state {
+                REMOTE => classify(tpl, p, &guest.0[p]).0 as u64,
+                P_ZERO if tpl.has_data(p) => ZERO,
+                _ => P_BASE as u64,
+            };
+            push(p, kind, if state == REMOTE { at } else { 0 });
+            at += (kind == DATA) as u64;
+        }
+    }
+    (map, zero)
+}
+
+#[test]
+fn whole_base_runs_build_the_per_page_map() {
+    let dir = tmp("baseruns");
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut rand = move |n: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % n
+    };
+    let n = 700;
+    let tpl_pages: Vec<Option<u8>> = (0..n).map(|i| (rand(3) != 0).then_some(i as u8 | 1)).collect();
+    let tpl = template(&dir, &tpl_pages);
+    let states = [P_BASE, crate::uffd::PRESENT, P_ZERO, REMOTE];
+    for round in 0..300 {
+        let pages: Vec<Vec<u8>> = (0..n)
+            .map(|i| match rand(3) {
+                0 => tpl_pages[i].map_or(vec![0; PAGE_SIZE], |b| vec![b; PAGE_SIZE]),
+                1 => vec![0; PAGE_SIZE],
+                _ => page(i + round),
+            })
+            .collect();
+        let guest = Guest(pages, 1 + rand(300) as usize, None);
+        // Random runs, sometimes adjacent with the same state, sometimes with gaps.
+        let (mut runs, mut p): (Runs, u64) = (Vec::new(), rand(5));
+        while p < n as u64 {
+            let long = rand(4) == 0;
+            let count = (1 + rand(if long { 200 } else { 8 })).min(n as u64 - p);
+            runs.push((p, count, states[rand(4) as usize]));
+            let gap = rand(3) == 0;
+            p += count + if gap { rand(10) } else { 0 };
+        }
+        let explicit = round % 2 == 1;
+        let w = write_pages(&tpl, &guest, &runs, &pages_file(&dir.join(format!("p{round}"))), 1, explicit).unwrap();
+        let (map, zero) = per_page_map(&tpl, &guest, &runs, explicit);
+        let mut want = MAGIC.to_vec();
+        let words = [map.len() as u64, w.data].into_iter().chain(map.into_iter().flatten());
+        want.extend(words.flat_map(u64::to_le_bytes));
+        want.extend(w.sums.iter().flat_map(|s| s.to_le_bytes()));
+        assert!(w.map == want && w.zero == zero, "round {round}: runs {runs:?}");
+        fs::remove_file(dir.join(format!("p{round}"))).unwrap();
+    }
     fs::remove_dir_all(&dir).unwrap();
 }
