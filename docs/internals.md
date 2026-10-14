@@ -166,12 +166,19 @@ migration source stays unreachable for 10 s (fetches reconnect with backoff
 until then), the target kills the VM and reports it `failed`.
 
 One thread reads uffd events, but it never waits for the network or disk:
-a fault on a REMOTE page claims a 64-page run and hands it to one of 8
+a fault on a REMOTE page claims a 64-page run and queues it for one of 8
 fetcher threads (each with its own connection to the source), so faults on
-template and zero pages, and REMOVEs, are served meanwhile. Fetchers and the
+template and zero pages, and REMOVEs, are served meanwhile. The event thread
+writes the run's request on the least busy fetcher's connection as it queues
+it (without blocking; the fetcher writes what did not go out), so the request
+is on its way while the fetcher wakes, and several can be outstanding on one
+connection, answered in order. Fetchers and the
 4 background pullers install pages as they arrive (16 at a time), and a
 fetcher asks for the faulting page on its own, pipelined ahead of the rest of
-its run. A fault on a page someone else is installing waits for that copy,
+its run. Each request has 5 s to be written and answered in full before its
+connection counts as lost. A REMOTE fault also steers the pullers: they pull
+the 32 MiB after its run before going on with their share, as the guest tends
+to read on from where it faulted. A fault on a page someone else is installing waits for that copy,
 which wakes the faulting thread; installers signal the event thread (an
 eventfd) when pages settle, and an install that hits EAGAIN (a REMOVE is
 queued) waits until the event thread has read events, instead of polling.
