@@ -3169,6 +3169,145 @@ def ckpt_packet_hold():
         rm_ckpt(p)
 
 
+_stallprobe = None
+
+
+def start_probe(host, name, kib, threads):
+    """Starts scripts/stallprobe.c in the guest (see there)."""
+    global _stallprobe
+    if _stallprobe is None:
+        src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stallprobe.c")
+        out = os.path.join(tempfile.mkdtemp(prefix="stallprobe-"), "stallprobe")
+        cc = "musl-gcc" if subprocess.run(["which", "musl-gcc"], capture_output=True).returncode == 0 else "gcc"
+        subprocess.run([cc, "-O2", "-static", "-pthread", "-o", out, src], check=True)
+        _stallprobe = base64.b64encode(open(out, "rb").read()).decode()
+    for i in range(0, len(_stallprobe), 48000):
+        code, out = sh(host, name, f"printf '%s' '{_stallprobe[i:i + 48000]}' {'>' if i == 0 else '>>'} /tmp/sp.b64")
+        assert code == 0, out
+    code, out = sh(host, name, "base64 -d /tmp/sp.b64 > /tmp/stallprobe && rm /tmp/sp.b64 && chmod +x /tmp/stallprobe && "
+                               f"setsid /tmp/stallprobe {kib} {threads} /tmp/sp.out >/dev/null 2>&1 < /dev/null & sleep 1; pidof stallprobe")
+    assert code == 0 and out.strip(), out
+
+
+def probe_dump(host, name):
+    """The probe's markers and, per thread, its gaps as (start, len), in ns."""
+    code, out = sh(host, name, "rm -f /tmp/sp.out; kill -USR1 $(pidof stallprobe); "
+                               "for i in $(seq 1 200); do [ -f /tmp/sp.out ] && break; sleep 0.05; done; cat /tmp/sp.out")
+    assert code == 0 and out.endswith("done"), out[-500:]
+    markers, gaps = [], {}
+    for line in out.splitlines():
+        f = line.split()
+        if f[0] == "m":
+            markers.append(int(f[1]))
+        elif f[0] == "g":
+            gaps.setdefault(int(f[1]), []).append((int(f[2]), int(f[3])))
+    return markers, gaps
+
+
+def stall_of(gaps, marker, until, window=300e6):
+    """For one thread's gaps around a checkpoint between `marker` and `until`: the longest gap (the pause, as the
+    guest saw it), and the time the thread lost to gaps in the `window` after it, less what it lost in as long before
+    it."""
+    near = [g for g in gaps if marker <= g[0] < until]
+    if not near:
+        return None
+    pause = max(near, key=lambda g: g[1])
+    end = pause[0] + pause[1]
+    post = [l for s, l in gaps if end <= s < end + window]
+    before = sum(l for s, l in gaps if pause[0] - window - 50e6 <= s < pause[0] - 50e6)
+    return pause[1] / 1e6, max(0, sum(post) - before) / 1e6, post
+
+
+KVM_DEBUG = "/sys/kernel/debug/kvm"
+
+
+def kvm_vms():
+    """KVM's debugfs directories, one per VM (named by a pid this namespace may not see)."""
+    return {e for e in os.listdir(KVM_DEBUG) if "-" in e} if os.path.isdir(KVM_DEBUG) else set()
+
+
+def kvm_stats(d, names=("pf_taken", "pf_fixed", "exits", "remote_tlb_flush")):
+    """KVM's counters for the VM of debugfs directory `d`, if known."""
+    try:
+        return {k: int(open(f"{KVM_DEBUG}/{d}/{k}").read()) for k in names} if d else {}
+    except OSError:
+        return {}
+
+
+def ckpt_stall():
+    """#214: how long a keep-running checkpoint stops the guest as the guest
+    sees it: the pause, and the time it loses after the resume to write
+    faults on pages protected for the copy. A probe in the guest (2 threads,
+    one per vCPU) spins writing its working set (STALL_KIB per thread, 4 MiB)
+    and logs every gap in its progress; STALL_N checkpoints (8), STALL_LOAD
+    host spinners (0) meanwhile. Prints a table; checks only that the
+    checkpoints are written and the guest goes on."""
+    n = "ft-stall"
+    count, load = int(os.environ.get("STALL_N", "8")), int(os.environ.get("STALL_LOAD", "0"))
+    kvms = kvm_vms()
+    ok(run(A, n))
+    # Its KVM counters, if it is the only VM that came meanwhile.
+    new = kvm_vms() - kvms
+    kvm = new.pop() if len(new) == 1 else None
+    start_probe(A, n, int(os.environ.get("STALL_KIB", "4096")), 2)
+    spinners = [subprocess.Popen(["sh", "-c", "while :; do :; done"]) for _ in range(load)]
+    rows = []
+    try:
+        time.sleep(1)
+        for i in range(count):
+            sh(A, n, "kill -USR2 $(pidof stallprobe)")
+            time.sleep(0.5)
+            before = control(A, n, {"op": "debug", "what": "status"})["result"]["faults"]["wp"]
+            k0 = kvm_stats(kvm)
+            path = ckpt_path(f"{n}-{i}")
+            r = checkpoint(A, n, path)
+            time.sleep(1)
+            after = control(A, n, {"op": "debug", "what": "status"})["result"]["faults"]["wp"]
+            k1 = kvm_stats(kvm)
+            rm_ckpt(path)
+            if not check(f"stall {i}: checkpoint written", r.get("ok"), r):
+                break
+            res = r["result"]
+            rows.append({"paused_ms": res["paused_ms"], "wp_faults": after["count"] - before["count"],
+                         "wp_serve_ms": round(after["sum_ms"] - before["sum_ms"], 2), "copy": res.get("copy") or {},
+                         "kvm": {k: k1[k] - k0.get(k, 0) for k in k1}, "dirty_mib": res.get("dirty_mib")})
+    finally:
+        for s in spinners:
+            s.kill()
+            s.wait()
+    markers, gaps = probe_dump(A, n)
+    check("stall: a marker per checkpoint, gaps logged", len(markers) >= len(rows) and gaps, (len(markers), len(rows)))
+    print(f"{'#':>2} {'paused_ms':>9} {'guest_gap':>9} {'lost_ms':>8} {'stall_ms':>8} {'wp_faults':>9} {'serve_ms':>8} "
+          f"{'rescues':>7} {'retries':>7} {'dirty':>5} {'kvm_pf':>6} {'tlb_fl':>6}")
+    tot, posts = [], []
+    for i, row in enumerate(rows):
+        until = markers[i + 1] if i + 1 < len(markers) else float("inf")
+        per = [s for s in (stall_of(g, markers[i], until) for g in gaps.values()) if s]
+        if not per:
+            continue
+        gap, lost = max(p[0] for p in per), max(p[1] for p in per)
+        post = sorted(l for p in per for l in p[2])
+        posts.extend(post)
+        # What the guest lost in all: the gap of the slowest thread, and what it lost after.
+        stall = max(p[0] + p[1] for p in per)
+        tot.append((row["paused_ms"], gap, lost, stall))
+        c = row["copy"]
+        print(f"{i:>2} {row['paused_ms']:>9.1f} {gap:>9.1f} {lost:>8.1f} {stall:>8.1f} {row['wp_faults']:>9} "
+              f"{row['wp_serve_ms']:>8.1f} {c.get('rescues', 0):>7} {c.get('retries', 0):>7} {row['dirty_mib']:>5} "
+              f"{row['kvm'].get('pf_taken', '-'):>6} {row['kvm'].get('remote_tlb_flush', '-'):>6}")
+    if tot:
+        med = lambda xs: sorted(xs)[len(xs) // 2]
+        print("median: paused %.1f ms, guest gap %.1f ms, lost after resume %.1f ms, stall %.1f ms (max %.1f)"
+              % (med([t[0] for t in tot]), med([t[1] for t in tot]), med([t[2] for t in tot]), med([t[3] for t in tot]),
+                 max(t[3] for t in tot)))
+    if posts:
+        posts.sort()
+        q = lambda f: posts[min(len(posts) - 1, int(len(posts) * f))] / 1e3
+        print(f"guest gaps > 20 us in the 300 ms after each resume, per thread: {len(posts) / max(1, len(tot)) / 2:.0f} a "
+              f"checkpoint, p50 {q(0.5):.0f} us, p90 {q(0.9):.0f} us, p99 {q(0.99):.0f} us, sum {sum(posts) / 1e6 / max(1, len(tot)):.1f} ms")
+    check("stall: the guest runs on", where(n) == {A: "running"} and sh(A, n, "pidof stallprobe")[0] == 0)
+    cleanup(n)
+
 
 def hotplug(host, name, mib):
     """Sets a VM's hotplug size directly, as the controller would."""
@@ -5343,7 +5482,7 @@ SCENARIOS = dict(
     cow_crash=cow_crash, cow_reports_held=cow_reports_held, ckpt_incremental=ckpt_incremental,
     ckpt_failed_stop=ckpt_failed_stop, ckpt_rearm=ckpt_rearm, ckpt_dir_moved=ckpt_dir_moved,
     prepare_disconnect=prepare_disconnect, prepare_trickle=prepare_trickle, prepare_fail=prepare_fail,
-    fc_prepare=fc_prepare, slow_preload=slow_preload, ckpt_packet_hold=ckpt_packet_hold, standby=standby,
+    fc_prepare=fc_prepare, slow_preload=slow_preload, ckpt_packet_hold=ckpt_packet_hold, ckpt_stall=ckpt_stall, standby=standby,
     suspend_disk_freed=suspend_disk_freed, resume_mark_fails=resume_mark_fails, kill_source=kill_source,
     kill_refused_checkpoint=no_evict(kill_refused_checkpoint), wildcard_listen=wildcard_listen,
     forged_peer=forged_peer, restore_ip_peer=restore_ip_peer, late_withdrawal=late_withdrawal,
