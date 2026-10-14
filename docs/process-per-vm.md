@@ -80,6 +80,7 @@ takes that status) and exits with its status.
 | SIGCONT | resume the vCPUs of a VM paused by SIGTSTP (ignored otherwise: the kernel sends it after any SIGSTOP, systemd after SIGTERM) |
 | SIGINT | destroy the VM, withdraw its address, exit 130 (Ctrl-C works) |
 | SIGQUIT | as SIGINT (Ctrl-\ destroys the VM rather than dumping core) |
+| SIGUSR1 | stop a standby VM (`flexvm standby`, memory pressure); a claimed VM ignores it, so a stop that lands after a claim started never destroys the VM the claim made |
 | SIGSTOP | cannot be caught: freezes the pager, so the guest stalls. Unsupported |
 
 They (and SIGHUP, ignored: a closed terminal leaves the VM running) are
@@ -341,8 +342,8 @@ another refill holds the lock, for a minute after memory pressure stopped
 standby VMs, and for a minute after a template's refill failed), so a pool
 comes back after a reboot, a template rebuild or a standby's death. A foreground `run` that claimed
 one forwards its signals to it and exits with the status the VM process sends
-back on the claim connection. Under memory pressure standby VMs are SIGINTed
-first. The count is explicit, and refills stop under the reserve; one refill
+back on the claim connection. Under memory pressure standby VMs are stopped
+(SIGUSR1) first. The count is explicit, and refills stop under the reserve; one refill
 of a template runs at a time (`.refill` lock), and waits until the standby
 VMs it starts are ready, so concurrent claims never overfill. A claim sent
 but not answered (the standby died, or hung up) is an uncertain outcome: the

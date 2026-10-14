@@ -35,7 +35,8 @@ const OP_WAIT: Duration = Duration::from_secs(30);
 const RELEASE_WAIT: Duration = Duration::from_secs(10);
 const CLOCK_TOLERANCE: Duration = Duration::from_millis(20);
 pub const CLOCK_DEADLINE: Duration = Duration::from_secs(5);
-const SIGNALS: [i32; 6] = [libc::SIGTERM, libc::SIGINT, libc::SIGQUIT, libc::SIGTSTP, libc::SIGCONT, libc::SIGHUP];
+/// SIGUSR1 is `standby::stop`'s: it stops a standby VM, and a claimed one ignores it.
+const SIGNALS: [i32; 7] = [libc::SIGTERM, libc::SIGINT, libc::SIGQUIT, libc::SIGTSTP, libc::SIGCONT, libc::SIGHUP, libc::SIGUSR1];
 const MAX_CONTROL: usize = 256;
 static CONTROL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -1093,11 +1094,11 @@ impl Proc {
     }
 
     pub fn stop_requested(&self) -> bool {
-        self.early.lock().unwrap().iter().any(|&s| s == libc::SIGINT || s == libc::SIGTERM)
+        self.early.lock().unwrap().iter().any(|&s| is_stop(s))
     }
 
     pub fn forget_stop(&self) {
-        self.early.lock().unwrap().retain(|&s| s != libc::SIGINT && s != libc::SIGTERM);
+        self.early.lock().unwrap().retain(|&s| !is_stop(s));
     }
 
     pub fn arc(&self) -> Option<Arc<Proc>> {
@@ -1130,6 +1131,12 @@ impl Proc {
             }
         });
     }
+}
+
+/// What stops a standby VM before its claim: SIGUSR1 (`standby::stop`'s, which
+/// the claimed VM ignores), or SIGINT or SIGTERM sent to it.
+fn is_stop(sig: i32) -> bool {
+    matches!(sig, libc::SIGINT | libc::SIGTERM | libc::SIGUSR1)
 }
 
 pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::File>) -> Result<()> {
@@ -1535,7 +1542,7 @@ fn relieve(host: &Host, avail: Option<u64>, starved_here: bool) {
     });
 }
 
-/// Under the reserve: SIGINTs the standby VMs, under `STATE/standby.stop.lock`
+/// Under the reserve: SIGUSR1s the standby VMs, under `STATE/standby.stop.lock`
 /// (not eviction's lock, which a migration may hold for a while). True if
 /// it stopped any.
 fn stop_standby(host: &Host, avail: u64, reserve: u64) -> bool {
@@ -1672,11 +1679,15 @@ mod tests {
         host.cfg.reserve_mib = 1024;
         host.cfg.peers = vec!["127.0.0.1:1".into()];
         // A standby of template t: its lock held, naming a live process.
-        // A shell runs a background job with SIGINT ignored, and the child would inherit that: the standby must not.
+        // Stopped by SIGUSR1's default action, which an ignored or blocked SIGUSR1 inherited from here would defeat.
         let mut child = std::process::Command::new("sleep");
         unsafe {
             std::os::unix::process::CommandExt::pre_exec(&mut child, || {
-                libc::signal(libc::SIGINT, libc::SIG_DFL);
+                libc::signal(libc::SIGUSR1, libc::SIG_DFL);
+                let mut set: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut set);
+                libc::sigaddset(&mut set, libc::SIGUSR1);
+                libc::sigprocmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
                 Ok(())
             });
         }
@@ -1698,7 +1709,7 @@ mod tests {
         let stopped = crate::util::retry(Duration::from_secs(10), || Ok(child.try_wait()?.ok_or("running")?));
         let _ = child.kill();
         let _ = child.wait();
-        assert!(pressure.exists() && stopped.unwrap().signal() == Some(libc::SIGINT));
+        assert!(pressure.exists() && stopped.unwrap().signal() == Some(libc::SIGUSR1));
         // Unlocked, not only closed: a child another test forks meanwhile shares the lock until it execs.
         assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
         drop(lock);
