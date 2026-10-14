@@ -148,15 +148,14 @@ fn update_address(
     mut request: impl FnMut(u16, Ipv4Addr) -> io::Result<()>,
 ) -> io::Result<()> {
     request(libc::RTM_NEWADDR, ip)?;
-    if let Some(old) = address.filter(|old| *old != ip) {
-        if let Err(e) = request(libc::RTM_DELADDR, old) {
-            if e.raw_os_error() != Some(libc::EADDRNOTAVAIL) {
-                return Err(e);
-            }
+    // Keep the old address until it is gone, so a failed delete is retried.
+    match address.filter(|old| *old != ip).map(|old| request(libc::RTM_DELADDR, old)) {
+        Some(Err(e)) if e.raw_os_error() != Some(libc::EADDRNOTAVAIL) => Err(e),
+        _ => {
+            *address = Some(ip);
+            Ok(())
         }
     }
-    *address = Some(ip);
-    Ok(())
 }
 
 fn address_request(fd: libc::c_int, ifindex: u32, kind: u16, ip: Ipv4Addr) -> io::Result<()> {
