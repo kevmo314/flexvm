@@ -5,13 +5,15 @@
 //! The source resumes only on a refusal or `aborted` (never committed, or the
 //! target died without every page), and exits only on `released`.
 
-use std::io::{BufReader, Read, Write};
+use std::borrow::Cow;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, TcpStream};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::bail;
@@ -36,6 +38,41 @@ const HELD_STREAM: Duration = Duration::from_secs(2);
 const STRAGGLERS: Duration = Duration::from_millis(5);
 /// How long migrating on waits for an arrival still pulling.
 const ARRIVAL_WAIT: Duration = Duration::from_secs(10);
+
+/// What the source sends once paused, as one JSON line: the page states, then the vmstate's and the preloaded pages'
+/// lengths (their bytes follow the line). Deserialized directly from the bounded line: no `Value` tree, which for a long
+/// `runs` would be many times the line's size.
+#[derive(Serialize, Deserialize)]
+struct Header<'a> {
+    runs: Cow<'a, [(u64, u64, u8)]>,
+    vmstate_len: u64,
+    #[serde(default)]
+    preload: Cow<'a, [u64]>,
+    #[serde(default)]
+    paused: bool,
+    #[serde(default)]
+    app_log: u64,
+}
+
+impl Header<'_> {
+    fn send(&self, w: &mut impl Write) -> Result<()> {
+        let mut line = serde_json::to_vec(self)?;
+        line.push(b'\n');
+        Ok(w.write_all(&line)?)
+    }
+
+    /// None if the source hung up first.
+    fn recv(r: &mut impl BufRead) -> Result<Option<Header<'static>>> {
+        let mut line = Vec::new();
+        if r.take(MAX_HEADER).read_until(b'\n', &mut line)? == 0 {
+            return Ok(None);
+        }
+        if line.len() as u64 == MAX_HEADER && line.last() != Some(&b'\n') {
+            bail!("migration header exceeds {MAX_HEADER} bytes");
+        }
+        Ok(Some(serde_json::from_slice(&line)?))
+    }
+}
 
 enum Outcome {
     Committed(Value),
@@ -74,6 +111,11 @@ impl Proc {
         let (mig, gen, prep) = (migration_id(), self.gen(), Instant::now());
         let (mut conn, prepared) = self.prepare_target(&vm, to, mig, gen, &source, evict)?;
         let prepare = prep.elapsed();
+        // The pages worth sending with the state, ours and the target's: read and sorted before the pause.
+        let mut wanted = crate::standby::load_set(&self.host, &vm.template);
+        wanted.extend(serde_json::from_value::<Vec<u64>>(prepared["load_set"].clone()).unwrap_or_default());
+        wanted.sort_unstable();
+        wanted.dedup();
         // Only now, right before the pause: the guest runs on at its mark meanwhile.
         let unthrottle = Instant::now();
         let _lifted = vm.limit.lift(vm.pid());
@@ -115,10 +157,6 @@ impl Proc {
             let _ = std::fs::remove_file(&vmstate);
             let state = state?;
             t.mark("read_state");
-            let mut wanted = crate::standby::load_set(&self.host, &vm.template);
-            wanted.extend(serde_json::from_value::<Vec<u64>>(prepared["load_set"].clone()).unwrap_or_default());
-            wanted.sort_unstable();
-            wanted.dedup();
             let pages = crate::uffd::remote_among(&runs, wanted);
             let mut data = vec![0u8; pages.len() * crate::util::PAGE_SIZE];
             vm.pager.read_preload(&pages, &mut data)?;
@@ -131,16 +169,14 @@ impl Proc {
         };
         let remote_pages: u64 = runs.iter().filter(|r| r.2 == crate::uffd::REMOTE).map(|r| r.1).sum();
         let sent = (|| -> Result<Value> {
-            send_json(
-                &mut conn,
-                &json!({
-                    "runs": runs,
-                    "vmstate_len": state.len(),
-                    "preload": pages,
-                    "paused": vm.was_paused(),
-                    "app_log": self.hold_app_log(),
-                }),
-            )?;
+            Header {
+                runs: Cow::Borrowed(&runs),
+                vmstate_len: state.len() as u64,
+                preload: Cow::Borrowed(&pages),
+                paused: vm.was_paused(),
+                app_log: self.hold_app_log(),
+            }
+            .send(&mut conn)?;
             conn.write_all(&state)?;
             if fault("slow_preload") {
                 thread::sleep(Duration::from_millis(300));
@@ -414,17 +450,17 @@ impl Proc {
         let mut r = BufReader::new(By { s: w.try_clone()?, at: deadline });
         let pager = prepared.0.pager.clone();
         let res = thread::scope(|scope| -> Result<(Arc<Vm>, Value)> {
-            let hdr = crate::util::recv_json_max(&mut r, MAX_HEADER)?.ok_or("source hung up before sending the vmstate")?;
+            let hdr = Header::recv(&mut r)?.ok_or("source hung up before sending the vmstate")?;
             let mut t = Phases::new();
-            let runs: Runs = serde_json::from_value(hdr["runs"].clone())?;
+            let runs: Runs = hdr.runs.into_owned();
             *self.sizes.lock().unwrap() = Some(arrival_sizes(&runs, &prepared.0.template(), req["plugged_mib"].as_u64()));
-            let state = read_vec(&mut r, hdr["vmstate_len"].as_u64().ok_or("missing vmstate_len")?, MAX_VMSTATE)?;
+            let state = read_vec(&mut r, hdr.vmstate_len, MAX_VMSTATE)?;
             t.mark("recv_state");
-            let pages: Vec<u64> = serde_json::from_value(hdr["preload"].clone()).unwrap_or_default();
+            let pages: Vec<u64> = hdr.preload.into_owned();
             if pages.len() > MAX_PRELOAD {
                 bail!("{} pages to preload, more than {MAX_PRELOAD}", pages.len());
             }
-            self.app_log.store(hdr["app_log"].as_u64().unwrap_or(0), Ordering::SeqCst);
+            self.app_log.store(hdr.app_log, Ordering::SeqCst);
             // Preload installed while Firecracker parses the state; all in, or no commit.
             let r = &mut r;
             let preload = scope.spawn(move || -> Result<Result<()>> {
@@ -432,7 +468,7 @@ impl Proc {
                 Ok(pager.preload(&pages, &data, deadline).map(drop).map_err(|e| format!("preloading pages: {e}").into()))
             });
             let preloaded = move || preload.join().unwrap_or_else(|_| Err("preloading panicked".into()));
-            let paused = hdr["paused"] == true;
+            let paused = hdr.paused;
             self.paused_by_request.store(paused, Ordering::SeqCst);
             let vm = self.take_in(prepared, runs, &state, paused, deadline, preloaded, &mut t)?;
             Ok((vm, t.json()))
@@ -668,6 +704,9 @@ impl Proc {
         }
         if fault("fetch_tail_enomem") {
             prepared.pager.tail_fail.store(1, Ordering::SeqCst);
+        }
+        if fault("pull_enomem") {
+            prepared.pager.pull_fail.store(40, Ordering::SeqCst);
         }
         if fault("fetch_enomem_stuck") {
             // Late enough for the load (and the resume) to get their pages.

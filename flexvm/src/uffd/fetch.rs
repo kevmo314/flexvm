@@ -1,7 +1,7 @@
 use super::event::{FETCH, FIRST, QUEUED};
 use super::{os, Pager, Pages, Source, FAULT_TIMEOUT, PAGE_SIZE, REMOTE, REMOTE_FAULT_RUN};
 use std::collections::VecDeque;
-use std::io::{self, Read, Write};
+use std::io::{self, IoSliceMut, Read, Write};
 use std::net::TcpStream;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,7 +15,7 @@ const SOURCE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Fetched pages are installed as they arrive: the first at once, then at least this many at a time.
 pub(super) const STREAM_RUN: usize = 16;
 const BACKOFF_MAX: Duration = Duration::from_secs(1);
-const BACKOFF_MIN: Duration = Duration::from_millis(10);
+pub(super) const BACKOFF_MIN: Duration = Duration::from_millis(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// How long one page request may take, writing it and reading its reply, before its connection is given up as lost (and
@@ -407,8 +407,8 @@ impl Link {
                 progress(data)
             };
             let res = match lane {
-                Some(lane) if buf.is_empty() => lane.flush(&client.stream.s, None, at),
-                Some(lane) => lane.flush(&client.stream.s, Some((offset, buf.len())), at).and_then(|()| client.recv(buf, head, &mut counted, at)),
+                Some(lane) if buf.is_empty() => lane.flush(&client.stream.s.s, None, at),
+                Some(lane) => lane.flush(&client.stream.s.s, Some((offset, buf.len())), at).and_then(|()| client.recv(buf, head, &mut counted, at)),
                 None => client.fetch(offset, buf, head, &mut counted, at),
             };
             match res {
@@ -520,7 +520,7 @@ fn parts(len: usize, head: usize) -> impl Iterator<Item = (usize, usize)> {
 /// Client for a migration source's page server. Every write and read of a request ends by the deadline it is given,
 /// however slowly the server trickles.
 pub struct PageClient<S = TcpStream> {
-    stream: crate::util::By<S>,
+    stream: crate::util::By<crate::util::ReadTimeoutCache<S>>,
     /// Whether the server's answer to the `pages` request has been read: it is read along with the first reply, so
     /// connecting costs no round trip.
     acked: bool,
@@ -538,7 +538,7 @@ impl<S: crate::util::Timed> PageClient<S> {
     pub(super) fn new(stream: S, source: &Source, at: Instant) -> io::Result<Self> {
         let mut hello = serde_json::to_vec(&serde_json::json!({"op": "pages", "name": source.vm, "mig": source.mig}))?;
         hello.push(b'\n');
-        let mut stream = crate::util::By { s: stream, at };
+        let mut stream = crate::util::By { s: crate::util::ReadTimeoutCache::new(stream), at };
         stream.write_all(&hello)?;
         Ok(PageClient { stream, acked: false })
     }
@@ -560,23 +560,33 @@ impl<S: crate::util::Timed> PageClient<S> {
             self.acked = true;
         }
         for (a, b) in parts(buf.len(), head) {
-            let mut status = [0u8; 1];
-            self.stream.read_exact(&mut status)?;
-            if status[0] != 0 {
-                return Err(io::Error::other("page server could not read guest memory"));
-            }
-            let mut filled = a;
-            while filled < b {
-                match self.stream.read(&mut buf[filled..b]) {
+            // The status byte is read along with the first of the data, in one read. After a failed status the
+            // connection is dropped, so whatever followed it in `buf` goes unreported.
+            let (mut status_read, mut filled) = (false, a);
+            while !status_read || filled < b {
+                let mut status = [0u8; 1];
+                let res = match status_read {
+                    false => self.stream.read_vectored(&mut [IoSliceMut::new(&mut status), IoSliceMut::new(&mut buf[filled..b])]),
+                    true => self.stream.read(&mut buf[filled..b]),
+                };
+                let mut n = match res {
                     Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
-                    Ok(n) => {
-                        filled += n;
-                        if !progress(&buf[..filled]) {
-                            return Err(io::Error::other(FetchFailure::Cancelled));
-                        }
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Ok(n) => n,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                     Err(e) => return Err(e),
+                };
+                if !status_read {
+                    if status[0] != 0 {
+                        return Err(io::Error::other("page server could not read guest memory"));
+                    }
+                    status_read = true;
+                    n -= 1;
+                }
+                if n > 0 {
+                    filled += n;
+                    if !progress(&buf[..filled]) {
+                        return Err(io::Error::other(FetchFailure::Cancelled));
+                    }
                 }
             }
         }

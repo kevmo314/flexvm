@@ -178,9 +178,20 @@ impl Pages {
         self.states[page].load(Ordering::SeqCst)
     }
 
-    pub(super) fn set(&self, page: usize, state: u8) {
-        self.touch(page);
-        self.states[page].store(state, Ordering::SeqCst)
+    /// Seeds pages `[first, first + n)` with `state` before the map is shared: plain stores (a memset), and each chunk's
+    /// `touched` bit once, instead of an atomic store and touch per page. Out-of-bounds pages are ignored.
+    pub(super) fn fill(&mut self, first: usize, n: usize, state: u8) {
+        let end = first.saturating_add(n).min(self.states.len());
+        if first >= end {
+            return;
+        }
+        // Exclusive access: no other thread can see these atomics, so writing them as plain bytes (AtomicU8 has u8's
+        // layout) races with nothing.
+        let states = unsafe { std::slice::from_raw_parts_mut(self.states.as_mut_ptr().cast::<u8>(), self.states.len()) };
+        states[first..end].fill(state);
+        for c in first / CHUNK..=(end - 1) / CHUNK {
+            *self.touched[c / 64].get_mut() |= 1 << (c % 64);
+        }
     }
 
     /// Marks `page`'s chunk before its state leaves BASE.
