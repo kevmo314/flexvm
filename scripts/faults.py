@@ -2837,6 +2837,28 @@ def run_status():
     ok(cli_json(A, "standby", "--template", args.template, "0"))
 
 
+def unread_output():
+    """`run -- CMD` whose stdout is a pipe nobody reads (output stuck) still
+    ends at once on SIGINT, with status 130: printing never holds it up."""
+    n = "ft-unread"
+    scenario_vms.add(n)
+    p = subprocess.Popen([BIN, "--state", A.state, "--run", A.run, "run", n, "--template", args.template, "--",
+                          "head -c 1000000 /dev/zero | tr '\\0' x; sleep 600"],
+                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=ENV, start_new_session=True)
+    check("unread output: up", wait_for(lambda: vms(A).get(n, {}).get("state") == "running", 30), vms(A).get(n))
+    time.sleep(3)
+    t = time.time()
+    os.kill(p.pid, signal.SIGINT)
+    try:
+        code = p.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        code = None
+    took = time.time() - t
+    p.stdout.close()
+    check("unread output: SIGINT ends it within 2 s, status 130", code == 130 and took < 2.5, (code, took))
+    check("unread output: what it printed went to its log", "xxxx" in log(A, n), len(log(A, n)))
+
+
 def suspend_killed():
     """SIGINT means destroy, and it wins over a suspend: a kill that comes
     while the suspend is publishing its checkpoint revokes the checkpoint
@@ -2914,6 +2936,7 @@ def source_killed_basic():
 
 
 SCENARIOS = dict(
+    unread_output=unread_output,
     run_status=run_status,
     terminal=terminal,
     suspend_killed=suspend_killed,

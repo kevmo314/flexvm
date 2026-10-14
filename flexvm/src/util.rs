@@ -402,18 +402,21 @@ mod tests {
 }
 
 /// A VM process's stdout and stderr: pipes that relay threads copy to the
-/// terminal (or the claimer's, `retarget_output`). A write that fails there
-/// (a closed terminal, a broken pipe) switches that relay to the VM's log
-/// file, so printing never fails and never aborts the VM.
+/// terminal (or the claimer's, `retarget`). A target that fails or does not
+/// take output within `STALL` (a closed terminal, a broken or stalled pipe)
+/// is given up for the VM's log file, so printing never fails, never aborts
+/// the VM and never holds it up for long; nothing is locked across a write.
 pub mod output {
     use std::fs::File;
     use std::io::{Read, Write};
-    use std::os::fd::{FromRawFd, RawFd};
+    use std::os::fd::{AsRawFd, FromRawFd, RawFd};
     use std::path::PathBuf;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use std::thread::JoinHandle;
+    use std::time::{Duration, Instant};
 
-    static TARGETS: Mutex<[Option<File>; 2]> = Mutex::new([None, None]);
+    const STALL: Duration = Duration::from_secs(1);
+    static TARGETS: Mutex<[Option<Arc<File>>; 2]> = Mutex::new([None, None]);
     static LOG: Mutex<Option<PathBuf>> = Mutex::new(None);
     static RELAYS: Mutex<Vec<JoinHandle<()>>> = Mutex::new(Vec::new());
 
@@ -424,22 +427,56 @@ pub mod output {
             super::eintr(|| unsafe { libc::pipe2(p.as_mut_ptr(), libc::O_CLOEXEC) })?;
             super::eintr(|| unsafe { libc::dup2(p[1], fd) })?;
             unsafe { libc::close(p[1]) };
-            TARGETS.lock().unwrap()[i] = Some(unsafe { File::from_raw_fd(orig) });
+            TARGETS.lock().unwrap()[i] = Some(Arc::new(unsafe { File::from_raw_fd(orig) }));
             let mut from = unsafe { File::from_raw_fd(p[0]) };
             RELAYS.lock().unwrap().push(std::thread::spawn(move || {
                 let mut buf = [0u8; 8192];
                 while let Ok(n @ 1..) = from.read(&mut buf) {
-                    let mut targets = TARGETS.lock().unwrap();
-                    if targets[i].as_mut().is_some_and(|t| t.write_all(&buf[..n]).is_err()) {
-                        targets[i] = LOG.lock().unwrap().as_ref().and_then(|p| File::options().create(true).append(true).open(p).ok());
-                        if let Some(t) = targets[i].as_mut() {
-                            let _ = t.write_all(&buf[..n]);
-                        }
-                    }
+                    relay(i, &buf[..n]);
                 }
             }));
         }
         Ok(())
+    }
+
+    fn relay(i: usize, data: &[u8]) {
+        let target = TARGETS.lock().unwrap()[i].clone();
+        let sent = target.as_ref().map_or(0, |t| write_within(t, data, Instant::now() + STALL));
+        if sent == data.len() {
+            return;
+        }
+        // Given up, unless a retarget replaced it meanwhile.
+        let log = || LOG.lock().unwrap().as_ref().and_then(|p| File::options().create(true).append(true).open(p).ok()).map(Arc::new);
+        let fallback = {
+            let mut targets = TARGETS.lock().unwrap();
+            if targets[i].as_ref().map(Arc::as_ptr) == target.as_ref().map(Arc::as_ptr) {
+                targets[i] = log();
+            }
+            targets[i].clone()
+        };
+        if let Some(mut f) = fallback.as_deref() {
+            let _ = f.write_all(&data[sent..]);
+        }
+    }
+
+    /// What was written by `deadline`: in pieces no bigger than a pipe takes
+    /// at once, each only once the target is ready for it.
+    fn write_within(f: &File, data: &[u8], deadline: Instant) -> usize {
+        let mut sent = 0;
+        while sent < data.len() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let mut p = libc::pollfd { fd: f.as_raw_fd(), events: libc::POLLOUT, revents: 0 };
+            if left.is_zero() || unsafe { libc::poll(&mut p, 1, left.as_millis().max(1) as i32) } <= 0 || p.revents & libc::POLLOUT == 0 {
+                break;
+            }
+            let piece = &data[sent..(sent + 4096).min(data.len())];
+            match unsafe { libc::write(f.as_raw_fd(), piece.as_ptr().cast(), piece.len()) } {
+                n if n > 0 => sent += n as usize,
+                _ if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => {}
+                _ => break,
+            }
+        }
+        sent
     }
 
     /// Where output goes once the terminal is gone.
@@ -452,14 +489,16 @@ pub mod output {
         let mut targets = TARGETS.lock().unwrap();
         for (i, fd) in fds.into_iter().enumerate() {
             if let Ok(dup) = super::eintr(|| unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) }) {
-                targets[i] = Some(unsafe { File::from_raw_fd(dup) });
+                targets[i] = Some(Arc::new(unsafe { File::from_raw_fd(dup) }));
             }
         }
     }
 
-    /// Before exit: everything printed reaches its target (bounded by a second).
+    /// Before exit, bounded by a second from the start: what was printed
+    /// reaches its target if it can. No output lock is taken (a thread may
+    /// hold stdout's for good); what std still buffers, exit flushes if free.
     pub fn drain() {
-        let _ = std::io::stdout().flush();
+        let deadline = Instant::now() + STALL;
         let null = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
         if null >= 0 {
             unsafe {
@@ -468,11 +507,10 @@ pub mod output {
                 libc::close(null);
             }
         }
-        let relays: Vec<_> = RELAYS.lock().unwrap().drain(..).collect();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let Ok(relays) = RELAYS.try_lock().map(|mut r| std::mem::take(&mut *r)) else { return };
         for r in relays {
-            while !r.is_finished() && std::time::Instant::now() < deadline {
-                std::thread::sleep(std::time::Duration::from_millis(5));
+            while !r.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
             }
         }
     }

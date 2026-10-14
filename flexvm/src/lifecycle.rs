@@ -151,8 +151,13 @@ impl Proc {
         }
         // As `flexvm kill` does to a suspended VM; one that cannot be revoked stays suspended.
         if saved.is_ok() && vm.cancel_checkpoint.load(Ordering::SeqCst) > 0 {
-            match discard(&self.host, &vm.name) {
-                Ok(()) => self.finish(&op, End::Gone, 128 + libc::SIGINT, None),
+            match revoke(&self.host, &vm.name) {
+                Ok(freed) => {
+                    if let Err(e) = freed {
+                        eprintln!("vm {}: killed while suspending, its checkpoint revoked; freeing its address: {e}", vm.name);
+                    }
+                    self.finish(&op, End::Gone, 128 + libc::SIGINT, None)
+                }
                 Err(e) => {
                     eprintln!("vm {}: killed while suspending, but its checkpoint stays: {e}", vm.name);
                     self.finish(&op, End::Suspended, crate::vmproc::FAILED, None)
@@ -629,10 +634,21 @@ pub fn delete_consumed(name: &str, dir: &Path) {
 
 /// Marked DISCARDED durably before the address is freed and withdrawn.
 pub fn discard(host: &Host, name: &str) -> Result<()> {
+    revoke(host, name)?
+}
+
+/// The outer error: not revoked (still resumable). The inner one: revoked,
+/// but freeing its address failed (a later `kill` or the address's next
+/// claim finishes that).
+fn revoke(host: &Host, name: &str) -> Result<Result<()>> {
     let dir = host.suspended(name);
     let (ip, gen) = (manifest(&dir).map(|m| m.ip), read_gen(&dir));
     mark_durably(&dir, DISCARDED).map_err(|e| format!("discarding the checkpoint of {name}: {e}"))?;
     delete_consumed(name, &dir);
+    Ok(free_address(host, name, ip, gen))
+}
+
+fn free_address(host: &Host, name: &str, ip: Option<Ipv4Addr>, gen: Option<u64>) -> Result<()> {
     if let Some(ip) = ip {
         let l = host.lock()?;
         host.release(&l, ip, name)?;
