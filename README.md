@@ -85,7 +85,9 @@ memory; `flexvm kill` refuses that copy (kill the VM where it runs), and
 
 A suspended VM keeps its name and address; `ls` shows it `suspended`.
 `resume` restores a suspended VM in the foreground, even if it was originally
-started with `-d`; use `flexvm resume web -d` to detach it again.
+started with `-d`; use `flexvm resume web -d` to detach it again. A
+`run -- CMD` VM suspends with its command, which keeps running once resumed:
+the resumed process prints the rest of its output and exits with its status.
 Resuming a paused VM leaves its existing process in place.
 
 ## Checkpoint and restore

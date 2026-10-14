@@ -5,6 +5,7 @@
 //!                                     -> suspended       (SIGTERM; `flexvm resume`)
 //!   running | paused -> source (migrating) -> gone | running | paused
 
+use std::io::Write;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,6 +34,8 @@ const STARTED: &str = "STARTED";
 const DISCARDED: &str = "DISCARDED";
 const GEN: &str = "GEN";
 const QUARANTINE: &str = "QUARANTINE";
+/// A suspended `run -- CMD` VM's command and its session (`{"cmd", "session"}`), reattached on resume.
+const CMD: &str = "CMD";
 
 /// Set while a suspend or `checkpoint --stop` saves the VM, and for good once
 /// it did: the app log follower writes nothing past the offset the checkpoint
@@ -134,7 +137,7 @@ impl Proc {
         let staging = Staging::new(Path::new(dir), vm.dir.join("checkpoint.vmstate"))?;
         let dest = staging.dest().to_path_buf();
         t.mark("prepare");
-        let saved = self.save(vm, staging, !stop, incremental, &mut t);
+        let saved = self.save(vm, staging, !stop, incremental, &mut t, || Ok(()));
         self.publish();
         let (m, mut v) = saved?;
         let state = match vm.state() {
@@ -165,7 +168,9 @@ impl Proc {
     pub fn suspend(&self) -> Error {
         let vm = self.vm();
         let mut t = Phases::new();
+        *self.suspending.lock().unwrap() = true;
         let op = self.op();
+        let mut cmd_held = None;
         let saved = (|| -> Result<(Manifest, Value)> {
             if !matches!(vm.state(), State::Running | State::Paused) {
                 bail!("vm {} is {}; not suspending it", vm.name, vm.state().name());
@@ -182,7 +187,22 @@ impl Proc {
             }
             let staging = Staging::new(&dir, vm.dir.join("checkpoint.vmstate"))?;
             staging.add_file(GEN, self.gen().to_string().as_bytes())?;
-            let saved = self.save(vm, staging, false, false, &mut t);
+            let cmd = match self.cmd.lock().unwrap().clone() {
+                Some(cmd) => Some((cmd, self.cmd_session()?, staging.create(CMD)?)),
+                None => None,
+            };
+            // With the VM paused (its guest can no longer end or forget the session), held from
+            // here on: nothing more of its output is written here, the resumed VM goes on from what was.
+            let record = || -> Result<()> {
+                if let Some((cmd, session, f)) = cmd {
+                    let session = session.lock().unwrap();
+                    (&f).write_all(&serde_json::to_vec(&json!({"cmd": cmd, "session": *session}))?)?;
+                    f.sync_all()?;
+                    cmd_held = Some(session);
+                }
+                Ok(())
+            };
+            let saved = self.save(vm, staging, false, false, &mut t, record);
             self.publish();
             saved
         })();
@@ -191,8 +211,16 @@ impl Proc {
             crate::host::stall("suspend_stall");
         }
         // As `flexvm kill` does to a suspended VM; one that cannot be revoked stays suspended.
+        // Its Firecracker dying meanwhile cancels it too: then it ends as a death does.
         if saved.is_ok() && vm.cancel_checkpoint.load(Ordering::SeqCst) > 0 {
+            let how = if vm.dead() { "died" } else { "killed" };
             match revoke(&self.host, &vm.name) {
+                Ok(freed) if vm.dead() => {
+                    if let Err(e) = freed {
+                        eprintln!("vm {}: died while suspending, its checkpoint revoked; freeing its address: {e}", vm.name);
+                    }
+                    self.end_died(&op)
+                }
                 Ok(freed) => {
                     if let Err(e) = freed {
                         eprintln!("vm {}: killed while suspending, its checkpoint revoked; freeing its address: {e}", vm.name);
@@ -200,7 +228,7 @@ impl Proc {
                     self.finish(&op, End::Gone, 128 + libc::SIGINT, None)
                 }
                 Err(e) => {
-                    eprintln!("vm {}: killed while suspending, but its checkpoint stays: {e}", vm.name);
+                    eprintln!("vm {}: {how} while suspending, but its checkpoint stays: {e}", vm.name);
                     self.finish(&op, End::Suspended, crate::vmproc::FAILED, None)
                 }
             }
@@ -211,7 +239,11 @@ impl Proc {
                 eprintln!("{}", json!({"name": vm.name, "state": "suspended", "dir": self.host.suspended(&vm.name), "freed_rss_mib": vm.rss() >> 20, "data_mib": data, "suspend_ms": ms(t.total()), "timings_ms": t.json()}));
                 self.finish(&op, End::Suspended, 128 + libc::SIGTERM, None)
             }
-            Err(e) => e,
+            Err(e) => {
+                drop(cmd_held);
+                *self.suspending.lock().unwrap() = false;
+                e
+            }
         }
     }
 
@@ -238,6 +270,7 @@ impl Proc {
             format!("vm {name} is quarantined: its address generation was never recorded, so it cannot be resumed with its address; restore {dir:?} with --name NEW --ip auto (choose an unused name), or flexvm kill {name} to discard it")
         })?;
         let ck = Checkpoint::open(&dir)?;
+        let cmd = read_cmd(&dir).map_err(|e| format!("vm {name}: its command's record {}: {e}", dir.join(CMD).display()))?;
         t.mark("verify_checkpoint");
         let ip = ck.manifest.ip;
         let claim = {
@@ -251,6 +284,11 @@ impl Proc {
         match self.restore_checkpoint(name, ck, ip, true, false, &mut t) {
             Ok(mut v) => {
                 v["from"] = json!("suspended");
+                // Its command runs on in the guest: the process reattaches it and ends with it.
+                if let Some((cmd, session)) = cmd {
+                    *self.cmd.lock().unwrap() = Some(cmd);
+                    let _ = self.cmd_session.set(std::sync::Mutex::new(session));
+                }
                 Ok(v)
             }
             Err(Restore::NotRun(e)) => {
@@ -400,7 +438,9 @@ impl Proc {
     /// Without `cow` the VM stays paused (`Checkpointing`) for the write, and
     /// is marked failed if a checkpoint that could not be revoked may have been
     /// published. With `cow` it runs on once memory is write-protected.
-    fn save(&self, vm: &Arc<Vm>, mut staging: Staging, cow: bool, incremental: bool, t: &mut Phases) -> Result<(Manifest, Value)> {
+    /// `before_publish` runs once the checkpoint's pages are written, before it is
+    /// published (with the VM still paused, without `cow`); failing, it fails the checkpoint.
+    fn save(&self, vm: &Arc<Vm>, mut staging: Staging, cow: bool, incremental: bool, t: &mut Phases, before_publish: impl FnOnce() -> Result<()>) -> Result<(Manifest, Value)> {
         let last = |e: &dyn std::fmt::Display| format!("the last checkpoint of vm {}: {e}; take a full one", vm.name);
         let parent = match incremental {
             false => None,
@@ -541,6 +581,7 @@ impl Proc {
         });
         let committed = staging.commit(vm, src, &frozen.runs, parent, plugged.unwrap_or(0), t, || {
             cancelled()?;
+            before_publish()?;
             if fault("ckpt_fail_write") {
                 bail!("injected fault: writing the checkpoint failed");
             }
@@ -665,6 +706,17 @@ impl Drop for CopyGrowth<'_> {
     fn drop(&mut self) {
         *self.0.cow_copy.lock().unwrap() = false;
     }
+}
+
+fn read_cmd(dir: &Path) -> Result<Option<(String, crate::Session)>> {
+    let bytes = match std::fs::read(dir.join(CMD)) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let v: Value = serde_json::from_slice(&bytes)?;
+    let cmd = v["cmd"].as_str().ok_or("no command")?.to_string();
+    Ok(Some((cmd, serde_json::from_value(v["session"].clone())?)))
 }
 
 fn read_gen(dir: &Path) -> Option<u64> {

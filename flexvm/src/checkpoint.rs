@@ -214,7 +214,7 @@ impl Staging {
         self.vmstate.clone()
     }
 
-    fn create(&self, name: &str) -> io::Result<File> {
+    pub fn create(&self, name: &str) -> io::Result<File> {
         create_at(self.ck.as_raw_fd(), name)
     }
 

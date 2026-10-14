@@ -83,6 +83,13 @@ pub struct Proc {
     pub standby: Mutex<Option<crate::vm::Prepared>>,
     pub claimer: Mutex<Option<UnixStream>>,
     pub cmd: Mutex<Option<String>>,
+    /// The main command's session: a suspend holds it, so what it records is
+    /// what was written out, and the resumed VM reattaches from there.
+    pub cmd_session: OnceLock<Mutex<crate::Session>>,
+    /// While a suspend runs: the main command neither gives up nor ends the VM.
+    /// A lock, not a flag: the command ending the VM and a suspend starting
+    /// exclude each other (the command holds it through its `destroy`).
+    pub suspending: Mutex<bool>,
     early: Mutex<Vec<i32>>,
     /// Only then does SIGCONT resume (the kernel sends one after any SIGSTOP,
     /// systemd after SIGTERM).
@@ -132,6 +139,8 @@ impl Proc {
             standby: Mutex::new(None),
             claimer: Mutex::new(None),
             cmd: Mutex::new(None),
+            cmd_session: OnceLock::new(),
+            suspending: Mutex::new(false),
             early: Mutex::new(Vec::new()),
             paused_by_request: AtomicBool::new(false),
             consumed: Mutex::new(None),
@@ -233,7 +242,7 @@ impl Proc {
         let vm = self.vm();
         // In slices: a kill on its way (`destroy`) is not held up by the wait.
         let deadline = Instant::now() + wait;
-        while !self.pulled_all() && vm.cancel_checkpoint.load(Ordering::SeqCst) == 0 && vm.pager.failed().is_none() && vm.firecracker_alive() {
+        while !self.pulled_all() && vm.cancel_checkpoint.load(Ordering::SeqCst) == 0 && vm.pager.failed().is_none() && !vm.dead() && vm.firecracker_alive() {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 break;
@@ -562,9 +571,6 @@ impl Proc {
         if self.vm().template.meta.image.is_some() {
             spawn(Proc::follow_app);
         }
-        if self.cmd.lock().unwrap().is_some() {
-            spawn(Proc::main_command);
-        }
         if let Some(fc) = self.vm().pid().and_then(Ident::of).and_then(|id| crate::host::PidFd::open(&id).ok().flatten()) {
             let p = self.clone();
             thread::spawn(move || {
@@ -572,8 +578,12 @@ impl Proc {
                 p.died();
             });
         }
+        // Before the main command starts: a Ctrl-Z taken during startup pauses the VM first.
         for sig in std::mem::take(&mut *self.early.lock().unwrap()) {
             self.signal(sig);
+        }
+        if self.cmd.lock().unwrap().is_some() {
+            spawn(Proc::main_command);
         }
         loop {
             thread::park();
@@ -734,20 +744,32 @@ impl Proc {
         }
     }
 
-    /// Not for a migration source, whose end its target decides.
+    /// Not for a migration source, whose end its target decides. An operation
+    /// in progress is interrupted, not waited out (#122): its calls on the
+    /// guest, Firecracker and pager fail at once and a checkpoint is cancelled,
+    /// so `op` comes free promptly.
     fn died(&self) {
         let vm = self.vm();
         if matches!(vm.state(), State::Source(_)) || self.leaving.load(Ordering::SeqCst) {
             return;
         }
+        vm.mark_dead();
+        vm.cancel_checkpoint.fetch_add(1, Ordering::SeqCst);
+        vm.pager.abort_copy();
         let op = self.op();
         if self.leaving.load(Ordering::SeqCst) {
             return;
         }
+        self.end_died(&op)
+    }
+
+    /// Death's end: why goes in `RUN/vms/NAME.failed`, exit 124.
+    pub fn end_died(&self, op: &Op) -> ! {
+        let vm = self.vm();
         let why = format!("{}; {}", vm.pager.failed().unwrap_or("its firecracker exited"), vm.post_mortem());
         eprintln!("vm {}: died: {why}", vm.name);
         let _ = std::fs::write(self.host.vms(&vm.name, "failed"), &why);
-        self.finish(&op, End::Died, DIED, None);
+        self.finish(op, End::Died, DIED, None)
     }
 
     fn controller(self: Arc<Self>) {
@@ -878,13 +900,38 @@ impl Proc {
         }
     }
 
+    /// A suspend takes the command along: while one runs the command is never
+    /// given up, nor the VM ended; the suspend ends the process, or fails and
+    /// the command goes on (reattaching, or ending the VM if it exited meanwhile).
     fn main_command(self: Arc<Self>) {
         let cmd = self.cmd.lock().unwrap().clone().unwrap_or_default();
-        let code = crate::exec(&self.host, &self.name(), &cmd).unwrap_or_else(|e| {
-            eprintln!("vm {}: {e}", self.name());
-            FAILED
-        });
-        eprintln!("vm {}: {}", self.name(), self.destroy(code));
+        loop {
+            let res = self.cmd_session().and_then(|s| crate::exec_session(&self.host, &self.name(), &cmd, s, true));
+            let suspending = self.suspending.lock().unwrap();
+            if *suspending {
+                // Afterwards an exit status already received is in the session: the next try returns it.
+                drop(suspending);
+                while *self.suspending.lock().unwrap() {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                continue;
+            }
+            let code = res.unwrap_or_else(|e| {
+                eprintln!("vm {}: {e}", self.name());
+                FAILED
+            });
+            // Holding `suspending`: no suspend starts until the VM is gone (or the kill refused).
+            return eprintln!("vm {}: {}", self.name(), self.destroy(code));
+        }
+    }
+
+    /// One per VM, whoever asks first (the command, or a suspend before it started).
+    pub fn cmd_session(&self) -> Result<&Mutex<crate::Session>> {
+        if let Some(s) = self.cmd_session.get() {
+            return Ok(s);
+        }
+        let new = crate::Session::new()?;
+        Ok(self.cmd_session.get_or_init(|| Mutex::new(new)))
     }
 
     pub fn stop_requested(&self) -> bool {

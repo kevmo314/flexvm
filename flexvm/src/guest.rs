@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -67,12 +67,22 @@ pub fn handshake<S: Read + Write>(s: S, line: &str) -> Result<BufReader<S>> {
     Ok(r)
 }
 
+/// Vsock sockets of Firecrackers that died: calls on them fail at once, never retried.
+static ABANDONED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+pub fn abandon(uds: &Path) {
+    ABANDONED.lock().unwrap().push(uds.to_path_buf());
+}
+
 /// All I/O by `deadline`; nothing is sent once it has passed. Test faults: `guest_drop`,
 /// `guest_lose_reply`.
 fn ask(uds: &Path, line: &str, deadline: Instant) -> Result<(u8, Vec<u8>)> {
     let left = deadline.saturating_duration_since(Instant::now());
     if left.is_zero() {
         return Err(std::io::Error::new(ErrorKind::TimedOut, format!("no time left for {line:?}")).into());
+    }
+    if ABANDONED.lock().unwrap().iter().any(|p| p == uds) {
+        bail!("its firecracker exited");
     }
     let s = crate::util::connect_unix(uds, left)?;
     if fault("guest_drop") {
@@ -406,6 +416,23 @@ mod tests {
         let e = ask(Path::new("/nonexistent/v.sock"), "PING", Instant::now()).unwrap_err();
         assert_eq!(e.downcast_ref::<std::io::Error>().map(|e| e.kind()), Some(ErrorKind::TimedOut));
         assert!(!dropped(&e));
+    }
+
+    #[test]
+    fn a_dead_firecrackers_guest_is_not_retried() {
+        // A listener that refuses everything, as a dead Firecracker's leftover socket does.
+        let dir = std::env::temp_dir().join(format!("flexvm-abandon-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let uds = dir.join("v.sock");
+        drop(std::os::unix::net::UnixListener::bind(&uds).unwrap());
+        let start = Instant::now();
+        assert!(ping(&uds).is_err());
+        assert!(start.elapsed() > Duration::from_millis(500), "refused connections are retried");
+        abandon(&uds);
+        let start = Instant::now();
+        let e = ping(&uds).unwrap_err();
+        assert!(start.elapsed() < Duration::from_millis(100) && !dropped(&e), "{e}");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

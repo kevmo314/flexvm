@@ -53,7 +53,7 @@ FAULTS = ("basic route lost_ack unknown refused pages_blip pages_dead_restore pr
           "abort_superseded gen_zero signals suspend_gen standby restore_ip_peer late_withdrawal "
           "incoming_killed start_killed claim_killed fc_died cow_grow plug_race plug_storm suspend_debris revoked_publication "
           "same_host_order arrival_abort_route arrival_killed_route handoff_superseded mem_high mem_high_migrate mem_high_evict "
-          "sigkill_restart listen_trickle")
+          "sigkill_restart listen_trickle suspend_cmd fc_died_busy pause_cmd_start suspend_died")
 p.add_argument("--faults", default=FAULTS, help="scripts/faults.py scenarios to run against the two hosts ('' for none)")
 # A worker runs its cases on one lane, against templates that are already built.
 p.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
@@ -862,7 +862,7 @@ COST = {"image_template": 30, "pause_resume": 6, "migrate": 3, "checkpoint_resto
         "faults/pages_blip": 18, "faults/ckpt_incremental": 18,
         "faults/pages_dead_restore": 14, "faults/abort_superseded": 13, "faults/plug_storm": 11, "faults/unknown": 10,
         "faults/checkpoint_corrupt": 10, "faults/guest_calls": 10, "faults/checkpoint_fork": 9,
-        "faults/signals": 9, "faults/checkpoint_restore": 7,
+        "faults/signals": 9, "faults/checkpoint_restore": 7, "faults/suspend_cmd": 7, "faults/fc_died_busy": 5, "faults/pause_cmd_start": 6, "faults/suspend_died": 4,
         "faults/cow_exact": 7, "faults/prepared_retry": 7, "faults/ckpt_failed_stop": 7, "faults/exec_race": 7,
         "faults/prepare_fail": 6, "faults/route": 6, "faults/basic": 6, "faults/slow_preload": 6, "faults/refused": 6,
         "faults/resume_kill": 5, "faults/lost_ack": 5, "faults/ckpt_rearm": 5, "faults/cow_abort": 5,

@@ -18,6 +18,9 @@ use crate::util::{Phases, Result, PAGE_SIZE};
 const PULL_WAIT: Duration = Duration::from_secs(30);
 /// A clock request slower than this may have left the guest that far behind.
 pub const CLOCK_RTT: Duration = Duration::from_millis(5);
+/// What a guest call is refused with while a checkpoint (a suspend's too) has
+/// the VM paused: a running command's reattach waits it out.
+pub const CHECKPOINTING: &str = " is being checkpointed; try again once it is done";
 const NO_REALTIME: &str = "clock_realtime requested but not present in the snapshot state";
 
 /// The vmstate a VM is restored from.
@@ -90,6 +93,8 @@ pub struct Vm {
     pub last_checkpoint: Mutex<Option<(PathBuf, String)>>,
     /// A kill is waiting: a checkpoint in progress gives up (and clears it).
     pub cancel_checkpoint: AtomicUsize,
+    /// Its Firecracker died (`mark_dead`): waits on it end at once.
+    dead: AtomicBool,
 }
 
 impl Vm {
@@ -159,6 +164,20 @@ impl Vm {
             Some(fc) => fc.post_mortem(&self.dir),
             None => "no firecracker".into(),
         }
+    }
+
+    /// Its Firecracker died: whatever operation is in progress is cut short
+    /// rather than waited out. Guest calls fail without retrying, waits on
+    /// Firecracker give up, and the pager stops (`kill` still reaps
+    /// Firecracker only once the pager has stopped).
+    pub fn mark_dead(&self) {
+        self.dead.store(true, Ordering::SeqCst);
+        crate::guest::abandon(&self.vsock);
+        self.pager.stop();
+    }
+
+    pub fn dead(&self) -> bool {
+        self.dead.load(Ordering::SeqCst)
     }
 
     /// One busy with a request counts as alive.
@@ -314,6 +333,7 @@ impl Vm {
         match self.state() {
             State::Running => {}
             State::Paused => bail!("vm {} is paused; resume it with flexvm resume {}", self.name, self.name),
+            State::Checkpointing => bail!("vm {}{CHECKPOINTING}", self.name),
             _ => bail!("vm {} is not running here", self.name),
         }
         Ok(())
@@ -454,7 +474,7 @@ impl Vm {
         while self.reports_held.load(Ordering::SeqCst) {
             match self.fc(|fc| fc.request_within("PATCH", PATH, None, deadline.saturating_duration_since(Instant::now()))) {
                 Ok(_) => self.reports_held.store(false, Ordering::SeqCst),
-                Err(e) if rejected(&e, PATH) || self.pid().is_none() => {
+                Err(e) if rejected(&e, PATH) || self.pid().is_none() || self.dead() => {
                     self.reports_held.store(false, Ordering::SeqCst);
                     return Err(e);
                 }
@@ -636,6 +656,7 @@ impl Prepared {
             snapshot_discards: AtomicU64::new(0),
             last_checkpoint: Mutex::new(None),
             cancel_checkpoint: AtomicUsize::new(0),
+            dead: AtomicBool::new(false),
         })
     }
 
