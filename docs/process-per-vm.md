@@ -28,7 +28,9 @@ A VM process:
 A VM process started in the background (`-d`, an arrival the listener
 spawns, a standby VM) is in a session of its own and, between fork and exec,
 joins a cgroup of its own, `/sys/fs/cgroup/flexvm/vm-PID-START` (`util::spawn_self`;
-named after the instance, so one that exists is refused, never joined),
+named after the instance, so one that exists is refused, never joined; its
+`cpu.weight` is 10000, so the pager and packet holds come before its
+siblings, the Firecrackers' cgroups, as they did in the caller's cgroup),
 so stopping its starter's cgroup (a systemd unit's restart with
 `KillMode=control-group`, a oneshot unit's end, logind's `KillUserProcesses`)
 does not reach it. Its Firecrackers move on to `flexvm/idle-PID-N`. Without

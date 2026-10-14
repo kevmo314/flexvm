@@ -461,6 +461,16 @@ fn scope(prefix: &[u8], pid: u32, start: u64) -> bool {
             if !scope_path(&mut path, prefix, pid, start, b"") || libc::mkdir(path.as_ptr().cast(), 0o755) != 0 {
                 return false;
             }
+            // Its siblings are Firecrackers (`idle-*`, weight 100): the pager
+            // and packet holds come before guest vCPUs, as they did in the
+            // caller's cgroup. Best effort.
+            if scope_path(&mut path, prefix, pid, start, b"/cpu.weight") {
+                let fd = libc::open(path.as_ptr().cast(), libc::O_WRONLY | libc::O_CLOEXEC);
+                if fd >= 0 {
+                    libc::write(fd, b"10000".as_ptr().cast(), 5);
+                    libc::close(fd);
+                }
+            }
             if !scope_path(&mut path, prefix, pid, start, b"/cgroup.procs") {
                 return false;
             }
