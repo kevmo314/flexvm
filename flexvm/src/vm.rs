@@ -108,6 +108,8 @@ pub struct Vm {
     pub cancel_checkpoint: AtomicUsize,
     /// Its Firecracker died (`mark_dead`): waits on it end at once.
     dead: AtomicBool,
+    /// A pause or resume whose outcome Firecracker could not tell: `state` may be wrong, so the next `switch` asks.
+    switch_unsure: AtomicBool,
 }
 
 impl Vm {
@@ -440,7 +442,18 @@ impl Vm {
     }
 
     fn switch(&self, from: State, to: State) -> Result<()> {
-        match self.state() {
+        let mut state = self.state();
+        // After an unknown outcome, Firecracker says where it is; if it still cannot, the request is sent all the same.
+        if matches!(state, State::Running | State::Paused) && self.switch_unsure.swap(false, Ordering::SeqCst) {
+            state = self.fc_state().unwrap_or(from);
+            if state == State::Running {
+                self.pager.hold_collapse(false);
+            }
+            if state == to {
+                *self.state.lock().unwrap() = to;
+            }
+        }
+        match state {
             s if s == to => return Ok(()),
             s if s != from => bail!("vm {} is {}, not {}", self.name, s.name(), from.name()),
             _ => {}
@@ -454,17 +467,18 @@ impl Vm {
         if pausing && res.is_ok() && crate::host::fault("pause_lost") {
             res = Err("injected fault: the pause's answer was lost".into());
         }
-        // A timeout or a lost answer may still have switched it: Firecracker says which state it is in. Only if that
-        // cannot be had either is it left as it was (collapsing held, after a pause: until a resume or the pager's end).
+        // A timeout or a lost answer may still have switched it: Firecracker says which state it is in. If that cannot
+        // be had either, it is recorded as it was but unsure (collapsing held, after a pause), so the next pause or
+        // resume asks again or sends its request whatever the record says.
         let now = match &res {
             Ok(()) => Some(to),
             Err(e) if rejected(e, "/vm") => Some(from),
-            Err(_) => self.fc(|fc| fc.get("/")).ok().and_then(|info| match info["state"].as_str() {
-                Some("Paused") => Some(State::Paused),
-                Some("Running") => Some(State::Running),
-                _ => None,
-            }),
+            Err(_) if pausing && crate::host::fault("pause_unknown") => None,
+            Err(_) => self.fc_state(),
         };
+        if now.is_none() {
+            self.switch_unsure.store(true, Ordering::SeqCst);
+        }
         if now == Some(State::Running) {
             self.pager.hold_collapse(false);
         }
@@ -476,6 +490,20 @@ impl Vm {
             return Ok(());
         }
         res
+    }
+
+    /// Whether a pause or resume ended unknown (see `switch`).
+    pub fn switch_unsure(&self) -> bool {
+        self.switch_unsure.load(Ordering::SeqCst)
+    }
+
+    /// Paused or Running, as Firecracker has it.
+    fn fc_state(&self) -> Option<State> {
+        self.fc(|fc| fc.get("/")).ok().and_then(|info| match info["state"].as_str() {
+            Some("Paused") => Some(State::Paused),
+            Some("Running") => Some(State::Running),
+            _ => None,
+        })
     }
 
     fn running_here(&self) -> Result<()> {
@@ -825,6 +853,7 @@ impl Prepared {
             last_checkpoint: Mutex::new(None),
             cancel_checkpoint: AtomicUsize::new(0),
             dead: AtomicBool::new(false),
+            switch_unsure: AtomicBool::new(false),
         })
     }
 

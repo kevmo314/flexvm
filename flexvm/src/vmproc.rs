@@ -739,8 +739,12 @@ impl Proc {
         };
         let res = match sig {
             libc::SIGTSTP => self.op_within().and_then(|_op| {
-                vm.pause()?;
-                self.paused_by_request.store(true, Ordering::SeqCst);
+                let res = vm.pause();
+                // A pause that may have landed counts as requested, so SIGCONT resumes it.
+                if res.is_ok() || vm.switch_unsure() {
+                    self.paused_by_request.store(true, Ordering::SeqCst);
+                }
+                res?;
                 self.publish();
                 Ok(())
             }),

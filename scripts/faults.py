@@ -209,7 +209,7 @@ FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_be
           "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "resume_kill",
           "prepare_fail", "short_incoming", "slow_preload", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
           "started_fsync", "started_unmark", "start_stall", "incoming_stall", "claim_stall", "handoff_stall", "ckpt_wp_race",
-          "fetch_tail_enomem", "fetch_enomem_stuck", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo", "release_stall", "release_late", "no_plug", "pause_lost", "tap_backlog", "tap_backlog_stuck")
+          "fetch_tail_enomem", "fetch_enomem_stuck", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo", "release_stall", "release_late", "no_plug", "pause_lost", "tap_backlog", "tap_backlog_stuck", "pause_unknown", "no_collapse")
 
 
 def disarm():
@@ -1848,6 +1848,24 @@ def pause_lost():
     signal_vm(A, n, signal.SIGCONT)
     check("pause lost: SIGCONT resumes it", wait_for(lambda: vms(A)[n]["state"] == "running", 10), vms(A)[n])
     check("pause lost: running and intact", fc_api(sock, "GET", "/")["state"] == "Running" and md5(A, n) == m, fc_api(sock, "GET", "/"))
+    # Neither the answer nor Firecracker's state can be had (#191): it stays recorded as running, but unsure, so a
+    # SIGCONT still resumes it.
+    for f in ("pause_lost", "pause_unknown", "no_collapse"):
+        fault(A, f, 30000)
+    try:
+        signal_vm(A, n, signal.SIGTSTP)
+        check("pause unknown: Firecracker is paused", wait_for(lambda: fc_api(sock, "GET", "/")["state"] == "Paused", 10), fc_api(sock, "GET", "/"))
+        time.sleep(0.5)
+    finally:
+        for f in ("pause_lost", "pause_unknown", "no_collapse"):
+            fault(A, f, 0)
+    signal_vm(A, n, signal.SIGCONT)
+    check("pause unknown: SIGCONT resumes it", wait_for(lambda: fc_api(sock, "GET", "/")["state"] == "Running", 10), fc_api(sock, "GET", "/"))
+    check("pause unknown: running and intact", vms(A)[n]["state"] == "running" and md5(A, n) == m, vms(A)[n])
+    # And a pause and resume after it work as ever.
+    check("pause unknown: pauses again", pause(A, n) and fc_api(sock, "GET", "/")["state"] == "Paused", vms(A)[n])
+    ok(cli_json(A, "resume", n))
+    check("pause unknown: resumes again", fc_api(sock, "GET", "/")["state"] == "Running" and md5(A, n) == m, vms(A)[n])
     cleanup(n)
 
 
@@ -2404,6 +2422,33 @@ def cow_collapsed():
     cleanup("ft-huge2")
     for p in paths:
         rm_ckpt(p)
+
+
+def collapse_abort():
+    """A migration that aborts after its source paused, its collapse pass mid-way (#191): the source runs its copy
+    again, and the pass goes on to the end instead of leaving the VM on 4 KiB pages for good."""
+    if "[never]" in open("/sys/kernel/mm/transparent_hugepage/enabled").read():
+        raise Skip("transparent huge pages are disabled here")
+    n = "ft-collapse-abort"
+    m = setup(n, mib=600)
+    ok(migrate(A, n, B))
+    st = wait_released(B, n)
+    check("collapse abort: migrated and pulled", st["released"] and st["state"] == "running", st)
+    # Hundreds of chunks: the pass runs for seconds, so it is still going when the migration back pauses the VM.
+    mid = collapse_report(B, n)
+    fault(A, "resume_kill", 60000)
+    r = migrate(B, n, A)
+    fault(A, "resume_kill", 0)
+    check("collapse abort: migration committed, then the target died", r["ok"], r)
+    check("collapse abort: the source runs its copy again", wait_for(lambda: where(n) == {B: "running"}, 60), where(n))
+    wait_for(lambda: (collapse_report(B, n) or {}).get("done"), 120)
+    c = collapse_report(B, n)
+    huge, _ = huge_mib(B, n)
+    print(f"collapse abort: before the migration {mid}, after {c}, {huge} MiB in huge pages")
+    check("collapse abort: the pass was mid-way when the source paused", mid is None, mid)
+    check("collapse abort: the pass went on to the end", c and c["stopped"] is None and c["collapsed"] >= 200 and huge >= 400, (c, huge))
+    check("collapse abort: md5 intact", md5(B, n) == m)
+    cleanup(n)
 
 
 def guest_chunks(host, name):
@@ -5111,7 +5156,7 @@ SCENARIOS = dict(
     incoming_killed=incoming_killed, start_killed=start_killed, claim_killed=claim_killed, standby_stalled=standby_stalled, fc_died=fc_died,
     sigkill_restart=sigkill_restart, listen_trickle=listen_trickle,
     cow_wp_race=cow_wp_race, fetch_tail_enomem=fetch_tail_enomem, fetch_enomem_stuck=fetch_enomem_stuck,
-    same_host_order=same_host_order, same_host_slow_route=same_host_slow_route, same_host_flood=same_host_flood, same_host_late_handover=same_host_late_handover, same_host_backlog=same_host_backlog, ckpt_backlog=ckpt_backlog, rx_stall=rx_stall, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,
+    collapse_abort=collapse_abort, same_host_order=same_host_order, same_host_slow_route=same_host_slow_route, same_host_flood=same_host_flood, same_host_late_handover=same_host_late_handover, same_host_backlog=same_host_backlog, ckpt_backlog=ckpt_backlog, rx_stall=rx_stall, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,
     handoff_superseded=handoff_superseded, suspend_cmd=suspend_cmd, fc_died_busy=fc_died_busy, pause_cmd_start=pause_cmd_start, suspend_died=suspend_died)
 names = [n for s in args.scenarios for n in (list(SCENARIOS) if s == "all" else [s])]
 if os.geteuid() != 0:
