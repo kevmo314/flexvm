@@ -26,7 +26,8 @@ use std::time::{Duration, Instant};
 use crate::host::Host;
 use crate::template::STEP_MIB;
 
-/// The kernel's longest throttling sleep (2 s), and some.
+/// How long `lift` waits for throttled threads: the kernel's longest
+/// throttling sleep (2 s) and some.
 const THROTTLE_MAX: Duration = Duration::from_millis(2500);
 
 /// Firecracker's own memory (VMM, KVM page tables, page cache it reads) on
@@ -155,8 +156,8 @@ impl Limit {
 
     /// Off until the guard goes (or `restore`): Firecracker's threads
     /// throttled at the mark would hold up the pause and the snapshot. A
-    /// thread already throttled sleeps on (up to 2 s): waited for here, so
-    /// the pause does not.
+    /// thread already throttled sleeps on (up to 2 s): waited for here (up
+    /// to `THROTTLE_MAX`, 2.5 s), so the pause does not.
     pub fn lift(&self, firecracker: Option<u32>) -> Lifted<'_> {
         let mut m = self.mark.lock().unwrap();
         m.lifted = true;

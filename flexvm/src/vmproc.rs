@@ -94,8 +94,10 @@ pub struct Proc {
     pub files: Mutex<Vec<PathBuf>>,
     /// What the VM's start was admitted against the reserve (MiB): its first memory mark.
     granted: AtomicU64,
-    /// What of it this start charged (refunded if the VM never starts).
+    /// The grant of this start (refunded if the VM never starts).
     charged: AtomicU64,
+    /// A standby's (MiB held or to page in, guest size), taken while it waits, so a claim need not.
+    pub sizes: Mutex<Option<(u64, u64)>>,
     serving: AtomicBool,
     me: std::sync::Weak<Proc>,
 }
@@ -137,6 +139,7 @@ impl Proc {
             files: Mutex::new(Vec::new()),
             granted: AtomicU64::new(0),
             charged: AtomicU64::new(0),
+            sizes: Mutex::new(None),
             serving: AtomicBool::new(false),
             me: me.clone(),
         }))
@@ -147,7 +150,8 @@ impl Proc {
     }
 
     pub fn set_vm(&self, vm: Arc<Vm>) {
-        vm.start_limit(self.granted.load(Ordering::SeqCst), &self.host);
+        let sizes = self.sizes.lock().unwrap().take().unwrap_or_else(|| vm.mem_sizes());
+        vm.start_limit(self.granted.load(Ordering::SeqCst), sizes, &self.host);
         self.charged.store(0, Ordering::SeqCst);
         let _ = self.vm.set(vm);
     }
@@ -167,20 +171,20 @@ impl Proc {
     pub fn admit_start(&self, need: u64, held: u64) -> Result<()> {
         let mib = crate::limit::allowance(need);
         let charge = mib.saturating_sub(held);
-        if !self.host.admit(charge) {
+        let Some(id) = self.host.grant(charge) else {
             bail!("not enough memory here for {charge} MiB above the {} MiB reserve", self.host.cfg.reserve_mib);
-        }
+        };
         self.granted.store(mib, Ordering::SeqCst);
-        self.charged.store(charge, Ordering::SeqCst);
+        self.charged.store(id, Ordering::SeqCst);
         Ok(())
     }
 
     /// A start that did not happen gives its admission back.
     pub fn refund_start(&self) {
-        let charge = self.charged.swap(0, Ordering::SeqCst);
+        let id = self.charged.swap(0, Ordering::SeqCst);
         self.granted.store(0, Ordering::SeqCst);
-        if charge > 0 {
-            self.host.refund(charge);
+        if id > 0 {
+            self.host.refund(id);
         }
     }
 
@@ -333,6 +337,9 @@ impl Proc {
 
     /// The one way the process ends, holding `op`.
     pub fn finish(&self, _op: &Op, end: End, code: i32, last: Option<(&UnixStream, Value)>) -> ! {
+        if matches!(end, End::NotStarted) {
+            self.refund_start();
+        }
         self.drop_held_in();
         self.set_leaving(true);
         if let Some(vm) = self.vm.get() {
@@ -977,7 +984,6 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
     }
     if let Err(e) = res {
         eprintln!("flexvm: {e}");
-        p.refund_start();
         p.finish(&op, End::NotStarted, FAILED, None);
     }
     drop(op);

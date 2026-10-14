@@ -2681,7 +2681,7 @@ def mem_high_migrate():
     throttle("mem high migrate", A, n)
     used = cgroup(A, n)[0]
     r = ok(migrate(A, n, B))
-    print(f"mem high migrate: {used} MiB; settle (throttle wait) {r['settle_hotplug_ms']} ms, pause {r['timings_ms']['pause']} ms, "
+    print(f"mem high migrate: {used} MiB; throttle wait {r['unthrottle_ms']} ms, pause {r['timings_ms']['pause']} ms, "
           f"downtime {r['downtime_ms']} ms", flush=True)
     check("mem high migrate: the pause is not held up", r["timings_ms"]["pause"] < 50 and r["downtime_ms"] < 1000, r["timings_ms"])
     st = wait_released(B, n, timeout=60)
@@ -2766,7 +2766,7 @@ def grants(host):
         g = json.load(open(os.path.join(host.run, "grants")))
     except (OSError, ValueError):
         return []
-    return [m for t, m in g if time.time() * 1000 - t <= 10000]
+    return [m for t, m, *_ in g if time.time() * 1000 - t <= 10000]
 
 
 def standby_admission():

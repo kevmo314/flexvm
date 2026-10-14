@@ -60,13 +60,15 @@ impl Proc {
         self.settle_arrival(&op, ARRIVAL_WAIT)?;
         vm.template.verify(&self.paths, true)?;
         let settle = Instant::now();
-        // Waits out throttling (counted in settle_hotplug_ms).
-        let _lifted = vm.limit.lift(vm.pid());
         vm.settle_hotplug(settle + crate::lifecycle::SETTLE_WAIT)?;
         let settle = settle.elapsed();
         let (mig, gen, prep) = (migration_id(), self.gen(), Instant::now());
         let (mut conn, mut reader, prepared) = self.prepare_target(&vm, to, mig, gen, &source)?;
         let prepare = prep.elapsed();
+        // Only now, right before the pause: the guest runs on at its mark meanwhile.
+        let unthrottle = Instant::now();
+        let _lifted = vm.limit.lift(vm.pid());
+        let unthrottle = unthrottle.elapsed();
         let holder = self.holder().cloned();
         // Lent durably first: a crash with the outcome unknown must not hand the address out.
         self.lent_here.store(self.host.lend(&self.host.lock()?, vm.ip, gen)?, Ordering::SeqCst);
@@ -151,6 +153,7 @@ impl Proc {
             "mig": mig,
             "settle_hotplug_ms": ms(settle),
             "prepare_ms": ms(prepare),
+            "unthrottle_ms": ms(unthrottle),
             "checkpoint_ms": ms(paused),
             "downtime_ms": ms(downtime),
             "rerouted_ms": ms(t.total()),

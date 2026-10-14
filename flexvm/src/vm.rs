@@ -122,13 +122,15 @@ impl Vm {
         self.starved.load(Ordering::SeqCst) || self.limit.throttled.load(Ordering::SeqCst)
     }
 
+    /// (MiB it holds or still pages in, the guest's size).
+    pub fn mem_sizes(&self) -> (u64, u64) {
+        mem_sizes(&self.pager, &self.template, self.hotplug_plugged())
+    }
+
     /// Sets its memory mark once it runs here: what its start was admitted
-    /// (`granted`); what it holds and still pages in beyond that is admitted
-    /// first (refused, it is throttled until a step is).
-    pub fn start_limit(&self, granted: u64, host: &crate::host::Host) {
-        let [_, present, _, remote, inflight, discarded] = self.pager.census();
-        let need = ((present + remote + inflight + discarded) * PAGE_SIZE) as u64 >> 20;
-        let cap = self.template.meta.mem_mib + self.hotplug_plugged().unwrap_or(self.template.meta.max_mib - self.template.meta.mem_mib);
+    /// (`granted`); what it holds and still pages in beyond that (`sizes`)
+    /// is admitted first (refused, it is throttled until a step is).
+    pub fn start_limit(&self, granted: u64, (need, cap): (u64, u64), host: &crate::host::Host) {
         let more = need.saturating_sub(granted);
         let admitted = if more > 0 && host.admit(more) { need } else { granted };
         self.limit.start(admitted, cap);
@@ -553,6 +555,12 @@ impl Vm {
     }
 }
 
+fn mem_sizes(pager: &Pager, tpl: &Template, plugged: Option<u64>) -> (u64, u64) {
+    let [_, present, _, remote, inflight, discarded] = pager.census();
+    let need = ((present + remote + inflight + discarded) * PAGE_SIZE) as u64 >> 20;
+    (need, tpl.meta.mem_mib + plugged.unwrap_or(tpl.meta.max_mib - tpl.meta.mem_mib))
+}
+
 /// A Firecracker with its pager started and no VM of its own yet; torn down when dropped.
 pub struct Prepared {
     idle: Option<Idle>,
@@ -579,6 +587,12 @@ impl Prepared {
 
     pub fn tap(&self) -> &str {
         &self.idle.as_ref().unwrap().tap
+    }
+
+    /// As `Vm::mem_sizes`, for a loaded one.
+    pub fn mem_sizes(&self) -> (u64, u64) {
+        let plugged = self.firecracker().get("/hotplug/memory").ok().and_then(|h| h["plugged_size_mib"].as_u64());
+        mem_sizes(&self.pager, &self.template, plugged)
     }
 
     pub fn dir(&self) -> &Path {

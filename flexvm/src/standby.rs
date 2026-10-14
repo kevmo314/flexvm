@@ -201,7 +201,10 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
     unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
     lock.write_all_at(&serde_json::to_vec(&me)?, 0)?;
     p.files.lock().unwrap().extend([sock.clone(), lock_path]);
-    *p.standby.lock().unwrap() = Some(load(p.spawner.take(None)?, tpl.clone())?);
+    let ready = load(p.spawner.take(None)?, tpl.clone())?;
+    // Taken now, so a claim does not scan memory or ask Firecracker.
+    *p.sizes.lock().unwrap() = Some(ready.mem_sizes());
+    *p.standby.lock().unwrap() = Some(ready);
     save_load_set(host, &tpl);
     let listener = UnixListener::bind(&sock)?;
     if let Some(mut f) = notify.take() {
