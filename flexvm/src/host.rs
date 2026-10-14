@@ -1954,22 +1954,29 @@ mod tests {
         assert!(h.mig_status(6).is_err());
     }
 
+    /// MemAvailable for admission tests, fixed: the host's own moves with
+    /// every other process, so no margin is ever safe.
+    const AVAIL: u64 = 10_000;
+
+    /// `grant_inner`, as `grant`, `grant_above` and `grant_held` call it, but against `AVAIL`.
+    fn grant_at(h: &Host, mib: u64, floor: Floor, hold: bool) -> std::result::Result<(u64, Option<Hold>), Error> {
+        h.grant_inner(mib, floor, hold, None, || Some(AVAIL)).unwrap()
+    }
+
     #[test]
     fn admission_counts_recent_grants() {
         let mut h = host("admit");
-        let free = crate::vmproc::host_available_mib().unwrap();
-        let admit = |h: &Host, mib| h.admit(mib).unwrap();
-        // Wide margins: other processes move MemAvailable meanwhile.
-        h.cfg.reserve_mib = free.saturating_sub(3000);
+        let admit = |h: &Host, mib| grant_at(h, mib, Floor::Reserve, false).is_ok();
+        h.cfg.reserve_mib = AVAIL - 3000;
         assert!(admit(&h, 1000) && admit(&h, 1000));
-        assert!(!admit(&h, 2000), "recent grants count as used");
+        assert!(!admit(&h, 1001), "recent grants count as used");
         // A start that did not happen gives its grant back, by id: only its own.
-        let id = h.grant(900).unwrap().unwrap();
-        assert!(!admit(&h, 500));
+        let id = grant_at(&h, 900, Floor::Reserve, false).unwrap().0;
+        assert!(!admit(&h, 101));
         h.refund(id);
         h.refund(u64::MAX);
-        assert!(admit(&h, 500) && !admit(&h, 900));
-        h.cfg.reserve_mib = free + 1;
+        assert!(admit(&h, 500) && !admit(&h, 501));
+        h.cfg.reserve_mib = AVAIL + 1;
         assert!(!admit(&h, 1));
     }
 
@@ -2003,34 +2010,34 @@ mod tests {
     #[test]
     fn admission_and_eviction_read_the_marks_as_they_change() {
         let mut h = host("marks");
-        let free = crate::vmproc::host_available_mib().unwrap();
         h.configure(|c| {
-            c.reserve_mib = free.saturating_sub(3000);
-            c.evict_mib = Some(free.saturating_sub(1500));
+            c.reserve_mib = AVAIL - 3000;
+            c.evict_mib = Some(AVAIL - 1500);
             Ok(())
         })
         .unwrap();
         let running = h.clone();
-        assert!(running.admit(100).unwrap());
+        let above = |mib| grant_at(&running, mib, Floor::EvictMark, false).map(|g| g.0);
+        assert!(grant_at(&running, 100, Floor::Reserve, false).is_ok());
         // An eviction's arrival leaves the mark available, not only the reserve.
-        assert!(running.grant_above(2000, Floor::EvictMark).unwrap_err().to_string().contains("eviction mark"));
-        assert!(running.grant_above(200, Floor::EvictMark).is_ok());
+        assert!(above(1401).unwrap_err().to_string().contains("eviction mark"));
+        assert!(above(200).is_ok());
         // Not while an eviction runs here; a pressure marker alone does not refuse.
         std::fs::write(running.run.join("evict.active"), b"").unwrap();
         let worker = running.evict_worker_lock().unwrap();
         assert!(running.evict_worker_lock().is_err(), "one eviction at a time");
-        assert!(running.grant_above(1, Floor::EvictMark).unwrap_err().to_string().contains("moving vms away"));
+        assert!(above(1).unwrap_err().to_string().contains("moving vms away"));
         drop(worker);
-        assert!(running.grant_above(1, Floor::EvictMark).is_ok());
+        assert!(above(1).is_ok());
         // `listen` raises the reserve while this process runs: admission sees it.
         std::thread::sleep(Duration::from_millis(20));
         h.configure(|c| {
-            c.reserve_mib = free + 1000;
+            c.reserve_mib = AVAIL - 1000;
             Ok(())
         })
         .unwrap();
-        assert_eq!(running.config_now().reserve_mib, free + 1000);
-        assert!(!running.admit(1).unwrap());
+        assert_eq!(running.config_now().reserve_mib, AVAIL - 1000);
+        assert!(grant_at(&running, 700, Floor::Reserve, false).is_err() && grant_at(&running, 699, Floor::Reserve, false).is_ok());
     }
 
     #[test]
@@ -2067,20 +2074,20 @@ mod tests {
     #[test]
     fn held_grants_count_past_the_window_until_dropped_or_their_owner_is_gone() {
         let mut h = host("held");
-        let free = crate::vmproc::host_available_mib().unwrap();
-        h.cfg.reserve_mib = free.saturating_sub(3000);
-        let (_, hold) = h.grant_held(2000, Floor::Reserve).unwrap();
+        let admit = |h: &Host, mib| grant_at(h, mib, Floor::Reserve, false).is_ok();
+        h.cfg.reserve_mib = AVAIL - 3000;
+        let hold = grant_at(&h, 2000, Floor::Reserve, true).unwrap().1.unwrap();
         // The window passes (the grant ages out): held, it still counts, once.
         let path = h.run.join("grants");
         let aged: Vec<(u64, u64, u64)> = load::<Vec<(u64, u64, u64)>>(&path).unwrap().unwrap().into_iter().map(|g| (0, g.1, g.2)).collect();
         store(&path, &aged, false).unwrap();
-        assert!(!h.admit(1500).unwrap(), "a held grant counts after the window");
+        assert!(!admit(&h, 1001) && admit(&h, 1000), "a held grant counts after the window, once");
         drop(hold);
-        assert!(h.admit(1500).unwrap());
+        assert!(admit(&h, 1500));
         // A hold whose lock nobody has (its process died; or its removal failed) goes.
         store(&path, &Vec::<(u64, u64, u64)>::new(), false).unwrap();
         std::fs::write(h.run.join("holds").join("99-2000"), b"").unwrap();
-        assert!(h.admit(2500).unwrap());
+        assert!(admit(&h, 2500));
         assert!(!h.run.join("holds").join("99-2000").exists());
     }
 }
