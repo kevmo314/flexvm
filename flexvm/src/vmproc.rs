@@ -55,8 +55,11 @@ pub type Op<'a> = MutexGuard<'a, ()>;
 
 /// How the VM left, which decides what becomes of its address.
 pub enum End {
-    /// Destroyed or died: withdrawn.
+    /// Destroyed: withdrawn; an arrival still pulling lets its source go too.
     Gone,
+    /// Died under the process: withdrawn; an arrival still pulling lets its
+    /// source run its copy again (`host::Host::mig_status`).
+    Died,
     /// Suspended: kept by its name.
     Suspended,
     /// Migrated to the peer at `.0`, which has all its memory: released.
@@ -266,9 +269,8 @@ impl Proc {
     }
 
     /// The one way the process ends, holding `op`: kills the VM and waits for
-    /// its Firecracker; settles its address as `end` says; forgets an arrival
-    /// that never committed (one that did reads released once this process
-    /// is gone); deletes a consumed checkpoint; gives up the name; sends
+    /// its Firecracker; settles an arrival's record and the address as `end`
+    /// says; deletes a consumed checkpoint; gives up the name; sends
     /// `last` on its connection and the exit status to a claimer.
     pub fn finish(&self, _op: &Op, end: End, code: i32, last: Option<(&UnixStream, Value)>) -> ! {
         self.drop_held_in();
@@ -277,9 +279,12 @@ impl Proc {
             vm.kill();
         }
         drop(self.standby.lock().unwrap().take());
+        if let Some(rec) = self.arrived.lock().unwrap().take() {
+            rec.settle(matches!(end, End::Gone));
+        }
         match (end, self.addr.lock().unwrap().take()) {
             (End::Suspended, Some(a)) => a.keep(),
-            (End::Gone, Some(a)) => self.withdraw(a),
+            (End::Gone | End::Died, Some(a)) => self.withdraw(a),
             (End::NotStarted, Some(a)) if a.fresh => self.withdraw(a),
             (End::Moved(to), _) => {
                 let _ = std::fs::write(self.host.vms(&self.name(), "moved"), &to);
@@ -295,7 +300,6 @@ impl Proc {
             }
             (_, None) => {}
         }
-        drop(self.arrived.lock().unwrap().take());
         if let Some(dir) = self.consumed.lock().unwrap().take() {
             crate::lifecycle::delete_consumed(&self.name(), &dir);
         }
@@ -658,7 +662,7 @@ impl Proc {
         let why = format!("{}; {}", vm.pager.failed().unwrap_or("its firecracker exited"), vm.post_mortem());
         eprintln!("vm {}: died: {why}", vm.name);
         let _ = std::fs::write(self.host.vms(&vm.name, "failed"), &why);
-        self.finish(&op, End::Gone, DIED, None);
+        self.finish(&op, End::Died, DIED, None);
     }
 
     /// Once a second: notices a dead VM, retries held report releases,

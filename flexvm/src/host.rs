@@ -451,10 +451,11 @@ impl Host {
         Ok(MigRecord { host: self.clone(), id, committed: false })
     }
 
-    /// How migration `id` went here: `pending`, `committed`, `released` (the
-    /// VM has all its pages, or is gone) or `aborted`. One whose process died
-    /// is settled first, once its Firecrackers are dead: aborted (the record
-    /// goes) if it never committed, else released.
+    /// How migration `id` went here: `pending`, `committed`, `released` (a
+    /// live target had every page, or destroyed the VM on purpose) or
+    /// `aborted`. One whose process died is aborted (its record goes) once
+    /// its Firecrackers are dead: committed or not, the VM is not here, and
+    /// its source's paused copy is the only one left.
     pub fn mig_status(&self, id: u64) -> Result<&'static str> {
         let _l = self.lock()?;
         let path = self.mig_path(id);
@@ -463,15 +464,10 @@ impl Host {
             Some(Mig::Released) => "released",
             Some(Mig::Pending { owner }) if owner.alive() => "pending",
             Some(Mig::Committed { owner }) if owner.alive() => "committed",
-            Some(Mig::Pending { owner }) => {
+            Some(Mig::Pending { owner } | Mig::Committed { owner }) => {
                 reap(&self.run, &owner)?;
                 remove(&path)?;
                 "aborted"
-            }
-            Some(Mig::Committed { owner }) => {
-                reap(&self.run, &owner)?;
-                store(&path, &Mig::Released, true)?;
-                "released"
             }
         })
     }
@@ -575,6 +571,15 @@ impl MigRecord {
         }
         self.committed = true;
         Ok(())
+    }
+
+    /// At this process's end: a committed migration whose VM was destroyed
+    /// on purpose (`gone`) is released, so its source goes too; otherwise it
+    /// reads aborted once this process is dead (see `mig_status`).
+    pub fn settle(self, gone: bool) {
+        if gone && self.committed {
+            self.release();
+        }
     }
 
     /// Committed to released (the VM has all its memory), retried until it
@@ -1052,10 +1057,16 @@ mod tests {
         let mut r = h.mig_begin(4).unwrap();
         store(&h.mig_path(4), &Mig::Pending { owner: dead_owner(&h, 999_999_904, &[]) }, false).unwrap();
         assert!(h.mig_status(4).unwrap() == "aborted" && rec(4).is_none() && r.commit(&h.lock().unwrap()).is_err());
-        // Committed by a process that is gone: released once its Firecracker is.
+        // Committed by a process that died before releasing: aborted (its
+        // source runs its copy again), once its Firecracker is gone.
         let fc = Sleeper::new();
         store(&h.mig_path(5), &Mig::Committed { owner: dead_owner(&h, 999_999_905, &[&fc.1]) }, false).unwrap();
-        assert!(h.mig_status(5).unwrap() == "released" && fc.done());
+        assert!(h.mig_status(5).unwrap() == "aborted" && fc.done() && rec(5).is_none());
+        // Destroyed on purpose: released.
+        let mut r = h.mig_begin(7).unwrap();
+        r.commit(&h.lock().unwrap()).unwrap();
+        r.settle(true);
+        assert_eq!(h.mig_status(7).unwrap(), "released");
         // A record that cannot be read answers nothing.
         std::fs::write(h.mig_path(6), "{").unwrap();
         assert!(h.mig_status(6).is_err());

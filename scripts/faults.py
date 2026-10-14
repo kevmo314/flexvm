@@ -584,13 +584,14 @@ def source_killed():
 
 
 def target_killed():
-    """The target VM process is SIGKILLed after it resumed the VM, before
-    the source knew. The committed record survives the process (and the
-    listener), so the source is told `released`, never `aborted`: it does not
-    resurrect the VM (that would roll it back). The answer comes only once
-    the dead process's Firecracker is gone too, however soon it is asked."""
+    """The target VM process is SIGKILLed after it resumed the VM, before it
+    had all the memory and before the source knew. The source must never let
+    go then: it is told `aborted` (only once the dead process's Firecracker
+    is gone, however soon it asks, and also after the listener restarts) and
+    runs its paused copy again. A target that destroys the VM on purpose
+    mid-pull releases its source instead."""
     n = "ft-target-killed"
-    setup(n, mib=1500)
+    m = setup(n, mib=1500)
     fault(B, "lost_ack", 2000)
     fault(B, "status", 4000)
     # Once the target has resumed, stall its pull so it cannot finish.
@@ -609,13 +610,27 @@ def target_killed():
         # Asked at once, before the Firecracker can have died of its own accord.
         fault(B, "status", 0)
         st = peer(B, {"op": "migration", "mig": int(newest)})
-        check("target killed: released only once its firecracker is dead",
-              st.get("ok") and st["result"]["outcome"] == "released" and not alive(fc), (st, alive(fc)))
+        check("target killed: aborted, only once its firecracker is dead",
+              st.get("ok") and st["result"]["outcome"] == "aborted" and not alive(fc), (st, alive(fc)))
     # The listener restarts too: nothing it knows is in memory.
     stop_listeners()
     start_listeners()
-    check("target killed: source let go, never resumed", wait_for(lambda: n not in vms(A), 60), where(n))
-    check("target killed: running nowhere", where(n) == {}, where(n))
+    fault(A, "pages", 0)
+    check("target killed: the source never lets go, and runs its copy again",
+          wait_for(lambda: where(n) == {A: "running"}, 60), where(n))
+    check("target killed: md5 intact on A", md5(A, n) == m)
+    cleanup(n)
+    # Destroyed on purpose on the target mid-pull: the source goes too.
+    n = "ft-target-destroyed"
+    setup(n, mib=1500)
+    stall = threading.Timer(0.2, lambda: fault(A, "pages", 6000))
+    stall.start()
+    ok(migrate(A, n, B))
+    stall.join()
+    ok(kill(B, n))
+    fault(A, "pages", 0)
+    check("target destroyed: the source lets go", wait_for(lambda: n not in vms(A), 60), where(n))
+    check("target destroyed: running nowhere", where(n) == {}, where(n))
 
 
 def exec_race():

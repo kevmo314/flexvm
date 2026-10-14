@@ -80,23 +80,19 @@ pub trait Timed: Read + Write {
     fn write_timeout(&self, t: Duration) -> io::Result<()>;
 }
 
-impl Timed for std::net::TcpStream {
-    fn read_timeout(&self, t: Duration) -> io::Result<()> {
-        self.set_read_timeout(Some(t))
-    }
-    fn write_timeout(&self, t: Duration) -> io::Result<()> {
-        self.set_write_timeout(Some(t))
-    }
+macro_rules! timed {
+    ($($t:ty),*) => {$(
+        impl Timed for $t {
+            fn read_timeout(&self, t: Duration) -> io::Result<()> {
+                self.set_read_timeout(Some(t))
+            }
+            fn write_timeout(&self, t: Duration) -> io::Result<()> {
+                self.set_write_timeout(Some(t))
+            }
+        }
+    )*};
 }
-
-impl Timed for UnixStream {
-    fn read_timeout(&self, t: Duration) -> io::Result<()> {
-        self.set_read_timeout(Some(t))
-    }
-    fn write_timeout(&self, t: Duration) -> io::Result<()> {
-        self.set_write_timeout(Some(t))
-    }
-}
+timed!(std::net::TcpStream, &std::net::TcpStream, UnixStream);
 
 /// `s`, with every read and write (each partial one) ending by `at`,
 /// however slowly the other end trickles.
