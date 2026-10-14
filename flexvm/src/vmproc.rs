@@ -87,7 +87,9 @@ pub struct Proc {
     /// what was written out, and the resumed VM reattaches from there.
     pub cmd_session: OnceLock<Mutex<crate::Session>>,
     /// While a suspend runs: the main command neither gives up nor ends the VM.
-    pub suspending: AtomicBool,
+    /// A lock, not a flag: the command ending the VM and a suspend starting
+    /// exclude each other (the command holds it through its `destroy`).
+    pub suspending: Mutex<bool>,
     early: Mutex<Vec<i32>>,
     /// Only then does SIGCONT resume (the kernel sends one after any SIGSTOP,
     /// systemd after SIGTERM).
@@ -138,7 +140,7 @@ impl Proc {
             claimer: Mutex::new(None),
             cmd: Mutex::new(None),
             cmd_session: OnceLock::new(),
-            suspending: AtomicBool::new(false),
+            suspending: Mutex::new(false),
             early: Mutex::new(Vec::new()),
             paused_by_request: AtomicBool::new(false),
             consumed: Mutex::new(None),
@@ -569,9 +571,6 @@ impl Proc {
         if self.vm().template.meta.image.is_some() {
             spawn(Proc::follow_app);
         }
-        if self.cmd.lock().unwrap().is_some() {
-            spawn(Proc::main_command);
-        }
         if let Some(fc) = self.vm().pid().and_then(Ident::of).and_then(|id| crate::host::PidFd::open(&id).ok().flatten()) {
             let p = self.clone();
             thread::spawn(move || {
@@ -579,8 +578,12 @@ impl Proc {
                 p.died();
             });
         }
+        // Before the main command starts: a Ctrl-Z taken during startup pauses the VM first.
         for sig in std::mem::take(&mut *self.early.lock().unwrap()) {
             self.signal(sig);
+        }
+        if self.cmd.lock().unwrap().is_some() {
+            spawn(Proc::main_command);
         }
         loop {
             thread::park();
@@ -757,10 +760,16 @@ impl Proc {
         if self.leaving.load(Ordering::SeqCst) {
             return;
         }
+        self.end_died(&op)
+    }
+
+    /// Death's end: why goes in `RUN/vms/NAME.failed`, exit 124.
+    pub fn end_died(&self, op: &Op) -> ! {
+        let vm = self.vm();
         let why = format!("{}; {}", vm.pager.failed().unwrap_or("its firecracker exited"), vm.post_mortem());
         eprintln!("vm {}: died: {why}", vm.name);
         let _ = std::fs::write(self.host.vms(&vm.name, "failed"), &why);
-        self.finish(&op, End::Died, DIED, None);
+        self.finish(op, End::Died, DIED, None)
     }
 
     fn controller(self: Arc<Self>) {
@@ -897,19 +906,21 @@ impl Proc {
     fn main_command(self: Arc<Self>) {
         let cmd = self.cmd.lock().unwrap().clone().unwrap_or_default();
         loop {
-            let res = self.cmd_session().and_then(|s| crate::exec_session(&self.host, &self.name(), &cmd, s));
-            let suspended = self.suspending.load(Ordering::SeqCst);
-            while self.suspending.load(Ordering::SeqCst) {
-                thread::sleep(Duration::from_millis(20));
-            }
-            let code = match res {
-                Err(_) if suspended => continue,
-                Ok(code) => code,
-                Err(e) => {
-                    eprintln!("vm {}: {e}", self.name());
-                    FAILED
+            let res = self.cmd_session().and_then(|s| crate::exec_session(&self.host, &self.name(), &cmd, s, true));
+            let suspending = self.suspending.lock().unwrap();
+            if *suspending {
+                // Afterwards an exit status already received is in the session: the next try returns it.
+                drop(suspending);
+                while *self.suspending.lock().unwrap() {
+                    thread::sleep(Duration::from_millis(20));
                 }
-            };
+                continue;
+            }
+            let code = res.unwrap_or_else(|e| {
+                eprintln!("vm {}: {e}", self.name());
+                FAILED
+            });
+            // Holding `suspending`: no suspend starts until the VM is gone (or the kill refused).
             return eprintln!("vm {}: {}", self.name(), self.destroy(code));
         }
     }

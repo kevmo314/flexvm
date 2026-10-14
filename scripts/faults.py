@@ -3489,6 +3489,61 @@ def suspend_cmd():
     check("suspend cmd: gone after it", n not in vms(A), vms(A).get(n))
 
 
+def pause_cmd_start():
+    """Ctrl-Z while a `run -- CMD` VM starts pauses it before its command
+    is under way, which waits for the VM instead of failing (and destroying
+    it); once resumed, the command runs and the process exits with its status."""
+    n = "ft-pause-cmd"
+    scenario_vms.add(n)
+    # Its start stalls (3 s) once it holds its name: the Ctrl-Z comes before the VM runs.
+    fault(A, "start_stall", 10000)
+    p = subprocess.Popen([BIN, "--state", A.state, "--run", A.run, "run", n, "--template", args.template, "--",
+                          "echo started; exit 9"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=ENV, text=True)
+    # Once it holds its name its signals are taken (blocked from its first instruction).
+    lock = os.path.join(A.run, "vms", f"{n}.lock")
+    check("pause cmd: starting", wait_for(lambda: os.path.exists(lock) and open(lock).read().strip(), 30))
+    os.kill(p.pid, signal.SIGTSTP)
+    fault(A, "start_stall", 0)
+    check("pause cmd: paused", wait_for(lambda: vms(A).get(n, {}).get("state") == "paused", 30), vms(A).get(n))
+    time.sleep(2)
+    check("pause cmd: still there, paused", p.poll() is None and vms(A).get(n, {}).get("state") == "paused", (p.poll(), vms(A).get(n)))
+    code, out, err = cli(A, "resume", n)
+    check("pause cmd: resumed", code == 0, err)
+    try:
+        code = p.wait(timeout=60)
+    except subprocess.TimeoutExpired:
+        code = None
+    out = p.stdout.read()
+    check("pause cmd: the command ran, its status", code == 9 and out.count("started") == 1, (code, out))
+
+
+def suspend_died():
+    """A Firecracker that dies after a suspend published its checkpoint (but
+    before the suspend ended) is a death, not a kill: the checkpoint is
+    revoked and the process exits 124 with why in `.failed`, not 130."""
+    n = "ft-susp-died"
+    scenario_vms.add(n)
+    p = subprocess.Popen([BIN, "--state", A.state, "--run", A.run, "run", n, "--template", args.template],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=ENV)
+    check("suspend died: up", wait_for(lambda: vms(A).get(n, {}).get("state") == "running", 30), vms(A).get(n))
+    v = vms(A)[n]
+    fault(A, "suspend_stall", 10000)
+    os.kill(p.pid, signal.SIGTERM)
+    d = os.path.join(A.state, "suspended", n)
+    check("suspend died: published", wait_for(lambda: os.path.exists(os.path.join(d, "manifest.json")), 30), d)
+    os.kill(v["firecracker"], signal.SIGKILL)
+    try:
+        code = p.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        code = None
+    fault(A, "suspend_stall", 0)
+    check("suspend died: exit status 124", code == 124, code)
+    failed = vms(A).get(n, {})
+    check("suspend died: ls shows it failed, no suspended vm", failed.get("state") == "failed" and not os.path.exists(d), (failed, os.path.exists(d)))
+    check("suspend died: address withdrawn", not addr(A, v["ip"]).get("holder") and addr(A, v["ip"]).get("withdrawn"), addr(A, v["ip"]))
+    ok(kill(A, n))
+
+
 def suspend_debris():
     """A suspend directory that is not a suspended VM (no manifest: a revoke
     or a removal cut short; or marked STARTED by a resume killed outright) is
@@ -3761,7 +3816,7 @@ SCENARIOS = dict(
     sigkill_restart=sigkill_restart, listen_trickle=listen_trickle,
     cow_wp_race=cow_wp_race, fetch_tail_enomem=fetch_tail_enomem, fetch_enomem_stuck=fetch_enomem_stuck,
     same_host_order=same_host_order, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,
-    handoff_superseded=handoff_superseded, suspend_cmd=suspend_cmd, fc_died_busy=fc_died_busy)
+    handoff_superseded=handoff_superseded, suspend_cmd=suspend_cmd, fc_died_busy=fc_died_busy, pause_cmd_start=pause_cmd_start, suspend_died=suspend_died)
 names = [n for s in args.scenarios for n in (list(SCENARIOS) if s == "all" else [s])]
 if os.geteuid() != 0:
     sys.exit("run as root (sudo)")

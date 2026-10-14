@@ -474,11 +474,14 @@ pub struct Session {
     pub id: String,
     pub started: bool,
     pub offset: u64,
+    /// Its exit status, once the guest sent it (a suspend records it too).
+    #[serde(default)]
+    pub exit: Option<i32>,
 }
 
 impl Session {
     pub fn new() -> Result<Session> {
-        Ok(Session { id: guest::session_id()?, started: false, offset: 0 })
+        Ok(Session { id: guest::session_id()?, started: false, offset: 0, exit: None })
     }
 }
 
@@ -486,7 +489,7 @@ impl Session {
 pub fn exec(host: &Host, name: &str, cmd: &str) -> Result<i32> {
     let session = Session::new()?;
     let id = session.id.clone();
-    let code = exec_session(host, name, cmd, &Mutex::new(session))?;
+    let code = exec_session(host, name, cmd, &Mutex::new(session), false)?;
     // Best effort: the guest closes it a minute after its client leaves anyway.
     let _ = vmproc::connect(host, name, &json!({"op": "exec", "session": id, "action": "close"}), &[]);
     Ok(code)
@@ -496,14 +499,18 @@ pub fn exec(host: &Host, name: &str, cmd: &str) -> Result<i32> {
 /// and its offset counted, under the session's lock: whoever holds it knows
 /// exactly what was written (a suspend records it for the resumed VM). The
 /// session is left open: a VM's main command may be reattached after a
-/// suspend, and its VM goes with it anyway.
-pub fn exec_session(host: &Host, name: &str, cmd: &str, session: &Mutex<Session>) -> Result<i32> {
+/// suspend, and its VM goes with it anyway. `patient` (a VM's main command):
+/// a paused or checkpointing VM is waited for even before the command started.
+pub fn exec_session(host: &Host, name: &str, cmd: &str, session: &Mutex<Session>, patient: bool) -> Result<i32> {
     let id = session.lock().unwrap().id.clone();
     let mut error = String::new();
     let mut deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         let (started, offset) = {
             let s = session.lock().unwrap();
+            if let Some(code) = s.exit {
+                return Ok(code);
+            }
             (s.started, s.offset)
         };
         let req = json!({"op": "exec", "session": id, "action": if started { "attach" } else { "start" }, "offset": offset, "cmd": cmd});
@@ -524,11 +531,12 @@ pub fn exec_session(host: &Host, name: &str, cmd: &str, session: &Mutex<Session>
             Ok(Ok(StreamEnd::Exit(code))) => return Ok(code),
             Ok(Ok(StreamEnd::Disconnected(why))) => error = why,
             Err(e) => {
-                // A new command fails at once; a running one waits for its VM to
-                // resume, or for a checkpoint (a suspend's too) to finish.
+                // A new interactive command fails at once; a running one (or a VM's
+                // main command) waits for its VM to resume, or for a checkpoint (a
+                // suspend's too) to finish.
                 let msg = e.to_string();
                 if msg.contains(" is paused; ") || msg.contains(vm::CHECKPOINTING) {
-                    if !started {
+                    if !started && !patient {
                         return Err(e);
                     }
                     deadline = Instant::now() + Duration::from_secs(30);
@@ -573,7 +581,11 @@ fn exec_frames(r: &mut impl Read, session: &Mutex<Session>, stdout: &mut impl Wr
                 s.offset += bytes.len() as u64;
             }
             guest::FRAME_STDOUT | guest::FRAME_STDERR => return Err("session output before session id".into()),
-            guest::FRAME_EXIT => return Ok(StreamEnd::Exit(guest::session_exit(&data, s.offset)?)),
+            guest::FRAME_EXIT => {
+                let code = guest::session_exit(&data, s.offset)?;
+                s.exit = Some(code);
+                return Ok(StreamEnd::Exit(code));
+            }
             guest::FRAME_LOST => {
                 let start = u64::from_le_bytes(data.as_slice().try_into().map_err(|_| "bad output-lost frame")?);
                 return Err(format!("session output lost: needed offset {}, retained output starts at {start}", s.offset).into());
@@ -688,13 +700,13 @@ mod exec_tests {
         let mut first = frames(&[(guest::FRAME_MSG, b"test-id"), (guest::FRAME_STDOUT, &at(0, b"abc"))]);
         first.extend_from_slice(&[guest::FRAME_STDERR, 11, 0, 0, 0]);
         first.extend_from_slice(&at(3, b"d"));
-        let session = Mutex::new(Session { id: "test-id".into(), started: false, offset: 0 });
+        let session = Mutex::new(Session { id: "test-id".into(), started: false, offset: 0, exit: None });
         let (mut stdout, mut stderr, mut deadline) = (Vec::new(), Vec::new(), Instant::now());
         let mut run = |input: Vec<u8>| exec_frames(&mut input.as_slice(), &session, &mut stdout, &mut stderr, &mut deadline).unwrap();
         assert!(matches!(run(first), StreamEnd::Disconnected(_)));
         let resumed = frames(&[(guest::FRAME_MSG, b"test-id"), (guest::FRAME_STDERR, &at(3, b"def")), (guest::FRAME_EXIT, &[&6u64.to_le_bytes()[..], &7i32.to_le_bytes()].concat())]);
         assert!(matches!(run(resumed), StreamEnd::Exit(7)));
         let s = session.lock().unwrap();
-        assert!(s.started && s.offset == 6 && stdout == b"abc" && stderr == b"def");
+        assert!(s.started && s.offset == 6 && s.exit == Some(7) && stdout == b"abc" && stderr == b"def");
     }
 }
