@@ -782,6 +782,30 @@ step to host time (#136, `guest_calls`: +3.3 s after a 3 s page server
 outage). Without the attribute, loading a snapshot of more than one vCPU
 fails, rather than run a guest whose clock may jump.
 
+`firecracker/0005-reraise-pending-interrupts.patch`: every resume raises
+again the interrupt of each virtio device whose interrupt status is still
+set (raised, not yet acknowledged by the guest). A virtio-mmio interrupt
+reaches KVM through an irqfd on an IOAPIC pin, and KVM injects those from a
+workqueue, not when Firecracker writes the eventfd. A snapshot taken before
+that worker ran saves the device's status set but no interrupt in the IOAPIC
+or any LAPIC, and the restored VM never gets it. With `EVENT_IDX` the device
+interrupts again only once the guest moves `used_event`, which it does from
+that interrupt's handler, so the queue stalls for good: a guest that only
+receives (a UDP sink) stops receiving after a migration, restore or resume
+until it sends something itself (#149). Measured with a save-time check of
+the IOAPIC and LAPIC state, about 1% of saves (19 of ~1,900 under load) had
+an interrupt lost that way, mostly the balloon's (flexvm parks the balloon
+timer right before the snapshot, which raises one). With a debug Firecracker
+(not in the tree) that drops a pending virtio-net interrupt from the saved
+LAPIC the same way, `scripts/faults.py rx_stall` stalled 26 of 200
+operations without the patch and none with it. One eventfd notification
+covers both pending kinds (queue and config), whose status bits are already
+set. If the guest already had the interrupt, the re-raise costs it at most
+one spurious interrupt per device and resume: the handler reads and
+acknowledges the status, finds nothing new and returns. The patch has a
+unit test of the re-raise; there is no deterministic end-to-end case, as
+losing the interrupt on purpose would need a debug hook in Firecracker.
+
 ## Measured (WSL2, Ryzen 9 3900X, nested KVM; before process-per-VM unless noted)
 
 | | |

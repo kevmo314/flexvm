@@ -1064,6 +1064,157 @@ def udp_across_migrations(label, n, target_fault=None, burst=1):
     cleanup(n)
 
 
+def udp_in(host, name):
+    """The guest's Udp InDatagrams, or None if it did not answer."""
+    code, out = sh(host, name, "grep ^Udp: /proc/net/snmp | tail -1 | cut -d' ' -f2")
+    return int(out) if code == 0 and out.isdigit() else None
+
+
+def receiving(host, name, timeout=3.0):
+    """Whether the guest's InDatagrams goes up within `timeout` s."""
+    first = udp_in(host, name)
+    return first is not None and wait_for(lambda: (udp_in(host, name) or 0) > first + 5, timeout)
+
+
+def rx_state(host, name):
+    """What the guest, its Firecracker and its tap say about the guest's
+    receive path (#149)."""
+    st = {}
+    code, out = sh(host, name, "grep -E '^(Udp|Ip):' /proc/net/snmp; grep -E 'virtio|LOC|SPU' /proc/interrupts; "
+                   "cd /sys/class/net/eth0/statistics && for f in rx_packets rx_dropped rx_errors tx_packets; do echo $f $(cat $f); done")
+    st["guest"] = out
+    try:
+        sock = api_sock(host, name)
+        fc_api(sock, "PUT", "/actions", {"action_type": "FlushMetrics"})
+        fc_dir = os.path.dirname(os.readlink(f"/proc/{fc_pid(host, name)}/fd/1"))  # its firecracker.log
+        lines = open(os.path.join(fc_dir, "metrics.json")).read().splitlines()
+        # Each flush holds the counts since the previous one: add them up.
+        net = {}
+        for line in lines:
+            for k, v in json.loads(line).get("net", {}).items():
+                if isinstance(v, (int, float)):
+                    net[k] = net.get(k, 0) + v
+        st["fc_net"] = {k: v for k, v in net.items() if v}
+        st["fc_flushes"] = len(lines)
+    except Exception as e:
+        st["fc_net"] = f"unavailable: {e}"
+    tap = vms(host)[name].get("tap")
+    st["tap"] = subprocess.run(["ip", "-s", "link", "show", tap], capture_output=True, text=True).stdout if tap else None
+    return st
+
+
+def rx_stall():
+    """#149: a guest stopped receiving altogether after a handoff. Under a
+    steady inbound UDP stream, migrate, checkpoint, checkpoint --stop and
+    restore, suspend and resume, and pause and resume a VM over and over;
+    after each, the guest's InDatagrams must go up again. On a stall it
+    records the guest's, Firecracker's and the tap's view, then has the
+    guest send one datagram
+    (an interrupt on the same line) to see whether that wakes its receive.
+    RX_ITERS (default 25), RX_RATE (datagrams/s, default 2000) and
+    RX_TAP_RATE (frames/s written onto its tap, default 1000) scale it."""
+    n = "ft-rx-stall"
+    iters, rate = int(os.environ.get("RX_ITERS") or 25), int(os.environ.get("RX_RATE") or 2000)
+    ok(run(A, n))
+    ip = vm_ip(A, n)
+    receiver = "setsid socat -u UDP-RECV:9000,rcvbuf=16777216 OPEN:/dev/null >/dev/null 2>&1 < /dev/null &"
+    code, out = sh(A, n, receiver)
+    assert code == 0, out
+    stop, sent = threading.Event(), [0]
+
+    def stream():
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        per_ms, tick = max(1, rate // 1000), time.time()
+        while not stop.is_set():
+            for _ in range(per_ms):
+                try:
+                    s.sendto(b"%08d\n" % sent[0], (ip, 9000))
+                except OSError:
+                    pass
+                sent[0] += 1
+            tick += 0.001
+            time.sleep(max(0, tick - time.time()))
+
+    # Frames written straight onto the VM's tap (as a target injects held packets) are
+    # not diverted by the hold's route, so they arrive right up to each pause and the
+    # device often has an interrupt in flight when the state is saved.
+    tap_rate, cur_tap = int(os.environ.get("RX_TAP_RATE") or 1000), [vms(A)[n]["tap"]]
+
+    def tap_stream():
+        dst = bytes(int(x, 16) for x in "06:00:ac:10:00:02".split(":"))
+        src = bytes(int(x, 16) for x in "06:00:a9:fe:01:01".split(":"))
+        payload = b"tap-frame\n"
+        udp = (40000).to_bytes(2, "big") + (9000).to_bytes(2, "big") + (8 + len(payload)).to_bytes(2, "big") + b"\0\0" + payload
+        hdr = bytearray(b"\x45\0" + (20 + len(udp)).to_bytes(2, "big") + b"\0\0\x40\0\x40\x11\0\0"
+                        + socket.inet_aton("169.254.1.1") + socket.inet_aton(ip))
+        csum = sum(int.from_bytes(hdr[i:i + 2], "big") for i in range(0, 20, 2))
+        csum = (csum & 0xffff) + (csum >> 16)
+        hdr[10:12] = (~((csum & 0xffff) + (csum >> 16)) & 0xffff).to_bytes(2, "big")
+        frame = dst + src + b"\x08\x00" + bytes(hdr) + udp
+        s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
+        tick = time.time()
+        while not stop.is_set():
+            try:
+                s.sendto(frame, (cur_tap[0], 0))
+            except OSError:
+                pass
+            tick += 1 / tap_rate
+            time.sleep(max(0, tick - time.time()))
+
+    threads = [threading.Thread(target=stream, daemon=True)] + ([threading.Thread(target=tap_stream, daemon=True)] if tap_rate else [])
+    for t in threads:
+        t.start()
+    cur, stalls, done = A, [], {}
+    started = receiving(cur, n)
+    check("rx stall: receiving at the start", started, "" if started else rx_state(cur, n))
+    for i in range(iters):
+        op = ("migrate", "checkpoint", "restore", "suspend", "pause")[i % 5]
+        other = B if cur is A else A
+        if op == "migrate":
+            r = migrate(cur, n, other)
+            if not r["ok"]:
+                check(f"rx stall: migration {i} succeeded", False, r)
+                break
+            wait_released(other, n, cur)
+            cur = other
+        elif op == "checkpoint":
+            r = checkpoint(cur, n, ckpt_path(f"{n}-{i}"))
+        elif op == "restore":
+            path = ckpt_path(f"{n}-{i}")
+            r = checkpoint(cur, n, path, stop=True)
+            if r["ok"]:
+                r = restore(cur, path)
+        elif op == "suspend":
+            suspend(cur, n)
+            r = resume_suspended(cur, n)
+        else:
+            # A plain pause (SIGTSTP) and resume: no snapshot, but the same resume path.
+            r = {"ok": pause(cur, n)}
+            if r["ok"]:
+                time.sleep(0.05)
+                resume(cur, n)
+        if not r["ok"]:
+            check(f"rx stall: {op} {i} succeeded", False, r)
+            break
+        done[op] = done.get(op, 0) + 1
+        cur_tap[0] = vms(cur)[n].get("tap") or cur_tap[0]
+        if not receiving(cur, n):
+            before = rx_state(cur, n)
+            code, out = sh(cur, n, "echo wake | socat -u - UDP-SENDTO:169.254.1.1:9")
+            woke = receiving(cur, n)
+            stalls.append({"iteration": i, "after": op, "woken_by_guest_send": woke, "state": before,
+                           "after_send": rx_state(cur, n)})
+            print(f"rx stall after {op} (iteration {i}): {json.dumps(stalls[-1], indent=1)}", flush=True)
+            if not woke:
+                break
+    stop.set()
+    for t in threads:
+        t.join(10)
+    check("rx stall: the guest kept receiving after every operation", not stalls,
+          f"{len(stalls)} stalls in {sum(done.values())} operations {done}, sent {sent[0]}")
+    cleanup(n)
+
+
 def handoff_superseded():
     """A same-host arrival routes its address only after the held packets
     (`handoff_stall` delays that by 3 s). A newer generation of the address
@@ -4538,7 +4689,7 @@ SCENARIOS = dict(
     incoming_killed=incoming_killed, start_killed=start_killed, claim_killed=claim_killed, fc_died=fc_died,
     sigkill_restart=sigkill_restart, listen_trickle=listen_trickle,
     cow_wp_race=cow_wp_race, fetch_tail_enomem=fetch_tail_enomem, fetch_enomem_stuck=fetch_enomem_stuck,
-    same_host_order=same_host_order, same_host_slow_route=same_host_slow_route, same_host_flood=same_host_flood, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,
+    same_host_order=same_host_order, same_host_slow_route=same_host_slow_route, same_host_flood=same_host_flood, rx_stall=rx_stall, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,
     handoff_superseded=handoff_superseded, suspend_cmd=suspend_cmd, fc_died_busy=fc_died_busy, pause_cmd_start=pause_cmd_start, suspend_died=suspend_died)
 names = [n for s in args.scenarios for n in (list(SCENARIOS) if s == "all" else [s])]
 if os.geteuid() != 0:

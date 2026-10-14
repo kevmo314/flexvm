@@ -388,6 +388,15 @@ impl Spawner {
                 return Err(e);
             }
         };
+        // Under test, each VM's Firecracker keeps its device metrics (`metrics.json` in its
+        // directory, appended every 60 s and on `FlushMetrics`), so a test can see what a
+        // device did (#149). Metrics can only be configured before a load.
+        if std::env::var("FLEXVM_FAULTS").is_ok_and(|v| v == "1") {
+            let path = dir.join("metrics.json");
+            if let Err(e) = File::create(&path).map_err(Into::into).and_then(|_| fc.put("/metrics", serde_json::json!({"metrics_path": path}))) {
+                eprintln!("firecracker {}: no metrics: {e}", fc.pid());
+            }
+        }
         if let Some(cg) = cgroup.clone() {
             let pid = fc.pid();
             fc.joining = Some(std::thread::spawn(move || {
