@@ -65,9 +65,12 @@ pub fn live(host: &Host, template: &str) -> Vec<Ident> {
     ids
 }
 
+/// SIGUSR1, not SIGINT: a stop can reach the process after a claim started
+/// (it lists it until the claim is done, and its signal thread may take it
+/// late), and the VM it became must not take it for a kill.
 pub fn stop(id: &Ident) {
     if let Ok(Some(fd)) = PidFd::open(id) {
-        let _ = fd.signal(libc::SIGINT);
+        let _ = fd.signal(libc::SIGUSR1);
     }
 }
 
