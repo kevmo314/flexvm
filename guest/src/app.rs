@@ -15,8 +15,8 @@ use std::sync::{Condvar, LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::{fail, mem, msg, session::Output, spawn, wait_pid, write_frame, Statuses, FRAME_STDOUT};
 use crate::proto::FRAME_LOST;
+use crate::{fail, mem, msg, session::Output, spawn, wait_pid, write_frame, Statuses, FRAME_STDOUT};
 
 const CONF: &str = "/etc/flexvm/app.conf";
 const RING_BYTES: usize = 1 << 20;
@@ -71,8 +71,7 @@ pub fn handle(verb: &str, arg: &str, out: &File, statuses: &Statuses) -> io::Res
             return logs(out, offset, a.next() == Some("1"));
         }
         "PROBE" => match arg.trim().parse::<u16>() {
-            Ok(port) => TcpStream::connect_timeout(&SocketAddr::from((Ipv4Addr::LOCALHOST, port)), Duration::from_millis(500))
-                .map(|_| "ok".into()),
+            Ok(port) => TcpStream::connect_timeout(&SocketAddr::from((Ipv4Addr::LOCALHOST, port)), Duration::from_millis(500)).map(|_| "ok".into()),
             Err(_) => Err(io::Error::other(format!("bad port {arg:?}"))),
         },
         // Before a template snapshot; needs no shell in the image.
@@ -274,7 +273,11 @@ fn restrict(cmd: &mut Command, c: &Conf) {
                 && libc::setgid(gid) == 0
                 && libc::setuid(uid) == 0
                 && (uid == 0 || libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0);
-            if ok { Ok(()) } else { fail() }
+            if ok {
+                Ok(())
+            } else {
+                fail()
+            }
         });
     }
 }
@@ -321,19 +324,24 @@ fn start(statuses: &Statuses) -> io::Result<i32> {
 fn logs(mut out: impl Write, mut offset: u64, follow: bool) -> io::Result<()> {
     let stop = {
         let app = APP.lock().unwrap();
-        if follow { u64::MAX } else { app.output.end }
+        if follow {
+            u64::MAX
+        } else {
+            app.output.end
+        }
     };
     loop {
         let (chunk, status, done, moved) = {
-            let (app, _) = CHANGED.wait_timeout_while(APP.lock().unwrap(), Duration::from_secs(5), |a| {
-                follow && offset >= a.output.end && matches!(a.state, State::Running(_))
-            }).unwrap();
+            let (app, _) = CHANGED
+                .wait_timeout_while(APP.lock().unwrap(), Duration::from_secs(5), |a| follow && offset >= a.output.end && matches!(a.state, State::Running(_)))
+                .unwrap();
             let clamped = offset.clamp(app.output.start, app.output.end);
             let moved = clamped != offset;
             offset = clamped;
-            let chunk = app.output.read_chunk(offset).map_or_else(Vec::new, |(_, data)| {
-                data[..data.len().min(64 * 1024).min(stop.saturating_sub(offset) as usize)].to_vec()
-            });
+            let chunk = app
+                .output
+                .read_chunk(offset)
+                .map_or_else(Vec::new, |(_, data)| data[..data.len().min(64 * 1024).min(stop.saturating_sub(offset) as usize)].to_vec());
             (chunk, app.status(), !follow || !matches!(app.state, State::Running(_)), moved)
         };
         if follow && moved {

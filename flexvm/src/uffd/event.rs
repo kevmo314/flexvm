@@ -1,12 +1,15 @@
+use super::fetch::fatal;
+use super::{
+    os, Mapping, Pager, BASE, DISCARDED, FAULT_AROUND, FAULT_TIMEOUT, INFLIGHT, PAGE_SIZE, PRESENT, PULL_RUN, REMOTE, REMOTE_FAULT_RUN, UFFDIO_COPY_MODE_WP,
+    ZERO, ZEROES,
+};
+use crate::cow::{PENDING, READING, RESCUING};
 use std::collections::VecDeque;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLockWriteGuard};
 use std::time::{Duration, Instant};
-use crate::cow::{PENDING, READING, RESCUING};
-use super::fetch::fatal;
-use super::{os, Mapping, Pager, BASE, DISCARDED, FAULT_AROUND, FAULT_TIMEOUT, INFLIGHT, PAGE_SIZE, PULL_RUN, PRESENT, REMOTE, REMOTE_FAULT_RUN, UFFDIO_COPY_MODE_WP, ZERO, ZEROES};
 
 /// Pages past a REMOTE fault's run that the pullers take next (32 MiB): the guest tends to read on from where it
 /// faulted.
@@ -138,10 +141,7 @@ impl Pager {
         let mut pending: VecDeque<Pending> = VecDeque::new();
         let mut buf = [0u8; 32 * 64];
         while !self.stop.load(Ordering::SeqCst) {
-            let mut pfd = [
-                libc::pollfd { fd, events: libc::POLLIN, revents: 0 },
-                libc::pollfd { fd: wake, events: libc::POLLIN, revents: 0 },
-            ];
+            let mut pfd = [libc::pollfd { fd, events: libc::POLLIN, revents: 0 }, libc::pollfd { fd: wake, events: libc::POLLIN, revents: 0 }];
             // Faults waiting for another installer are woken by it; others (EAGAIN, errors) are retried every
             // millisecond. The timeout also bounds a missed wakeup.
             let timeout = if pending.iter().all(|p| p.parked) { 100 } else { 1 };

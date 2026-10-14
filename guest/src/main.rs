@@ -60,7 +60,11 @@ fn log(msg: &str) {
 }
 
 fn os<T: Default + PartialOrd>(rc: T) -> io::Result<T> {
-    if rc < T::default() { Err(io::Error::last_os_error()) } else { Ok(rc) }
+    if rc < T::default() {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(rc)
+    }
 }
 
 fn mount(src: &str, target: &str, fstype: &str, flags: libc::c_ulong, data: &str) -> io::Result<()> {
@@ -354,9 +358,7 @@ fn handle(out: &File, line: &str, statuses: &Statuses) -> io::Result<()> {
         },
         // Acked only once the clock is set, so "ok" means it is.
         "START" => match (parts.next().map(|ip| ip.parse()), parts.next().and_then(parse_time)) {
-            (Some(Ok(ip)), Some(now)) => {
-                net::configure(ip, parts.next()).map_err(|e| e.to_string()).and_then(|()| set_clock(now)).map(|_| "ok".into())
-            }
+            (Some(Ok(ip)), Some(now)) => net::configure(ip, parts.next()).map_err(|e| e.to_string()).and_then(|()| set_clock(now)).map(|_| "ok".into()),
             _ => Err(format!("bad start request {arg:?}")),
         },
         "CLOCK" => parse_time(arg.trim()).ok_or_else(|| format!("bad time {arg:?}")).and_then(set_clock).map(|off| format!("ok {off}")),
@@ -431,7 +433,10 @@ mod tests {
         if std::env::var_os(CHILD).is_none() {
             assert!(Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "tests::failed_exec_does_not_race_the_reaper"])
-                .env(CHILD, "1").status().unwrap().success());
+                .env(CHILD, "1")
+                .status()
+                .unwrap()
+                .success());
             return;
         }
         let statuses: Statuses = Arc::new((Mutex::new(HashMap::new()), Condvar::new()));

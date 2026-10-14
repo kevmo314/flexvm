@@ -74,9 +74,7 @@ fn log_name(file: &str) -> Option<&str> {
 /// In `RUN/vms`: a dead arrival's log; the logs of a name with nothing left
 /// here, once quiet; old `.moved` markers.
 fn vm_files(host: &Host) {
-    let files = || {
-        std::fs::read_dir(host.run.join("vms")).into_iter().flatten().flatten().filter_map(|e| Some((e.file_name().into_string().ok()?, e.path())))
-    };
+    let files = || std::fs::read_dir(host.run.join("vms")).into_iter().flatten().flatten().filter_map(|e| Some((e.file_name().into_string().ok()?, e.path())));
     // Markers first: a log is kept for its VM's.
     for (file, path) in files() {
         let Some(name) = file.strip_suffix(".moved").filter(|_| !file.starts_with('.')) else { continue };

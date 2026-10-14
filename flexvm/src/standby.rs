@@ -315,7 +315,11 @@ fn claim(p: &Arc<Proc>, req: &Value) -> std::result::Result<Value, (Error, bool)
     let paused = p.standby.lock().unwrap().take().ok_or_else(|| not_run("standby vm gone".into(), true))?;
     let vm = resume(paused, name, claim.ip, fault("resume_kill"), &mut t).map_err(|(e, ran)| {
         let e = format!("resuming a standby vm failed{}: {e}", if ran { ", and it may have run" } else { "" }).into();
-        if ran { (e, false) } else { not_run(e, true) }
+        if ran {
+            (e, false)
+        } else {
+            not_run(e, true)
+        }
     })?;
     drop(still);
     p.set_name(lock);

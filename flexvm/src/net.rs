@@ -7,10 +7,9 @@ use std::net::Ipv4Addr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use libc::{
-    c_int, IFA_ADDRESS, IFA_LOCAL, IFLA_ADDRESS, NDA_DST, NDA_LLADDR, NLMSG_ERROR, NLM_F_ACK, NLM_F_CREATE,
-    NLM_F_REPLACE, NLM_F_REQUEST, NUD_PERMANENT, RTA_DST, RTA_GATEWAY, RTA_OIF, RTM_DELLINK, RTM_DELROUTE,
-    RTM_NEWADDR, RTM_NEWNEIGH, RTM_NEWROUTE, RTM_SETLINK, RTN_UNICAST, RTPROT_STATIC, RT_SCOPE_HOST, RT_SCOPE_LINK,
-    RT_SCOPE_NOWHERE, RT_SCOPE_UNIVERSE, RT_TABLE_MAIN,
+    c_int, IFA_ADDRESS, IFA_LOCAL, IFLA_ADDRESS, NDA_DST, NDA_LLADDR, NLMSG_ERROR, NLM_F_ACK, NLM_F_CREATE, NLM_F_REPLACE, NLM_F_REQUEST, NUD_PERMANENT,
+    RTA_DST, RTA_GATEWAY, RTA_OIF, RTM_DELLINK, RTM_DELROUTE, RTM_NEWADDR, RTM_NEWNEIGH, RTM_NEWROUTE, RTM_SETLINK, RTN_UNICAST, RTPROT_STATIC, RT_SCOPE_HOST,
+    RT_SCOPE_LINK, RT_SCOPE_NOWHERE, RT_SCOPE_UNIVERSE, RT_TABLE_MAIN,
 };
 
 use crate::bail;
@@ -194,7 +193,12 @@ pub fn unplug_tap(tap: &str) -> (u64, Result<()>) {
     let (drops, queued) = stats();
     let remove = move || netlink(libc::RTM_DELQDISC, 0, &tcmsg(ifindex, 0));
     let Err(e) = released else { unreachable!() };
-    if (0..3).any(|_| remove().is_ok() || { std::thread::sleep(std::time::Duration::from_millis(10)); false }) {
+    if (0..3).any(|_| {
+        remove().is_ok() || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            false
+        }
+    }) {
         return (drops + queued, Err(format!("{e}; removed the plug instead").into()));
     }
     let tap = tap.to_string();

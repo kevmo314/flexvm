@@ -315,15 +315,17 @@ impl Host {
         let f = File::options().create(true).truncate(false).write(true).open(self.state.join("lock"))?;
         match deadline {
             None => flock(&f, libc::LOCK_EX)?,
-            Some(_) => while let Err(e) = flock(&f, libc::LOCK_EX | libc::LOCK_NB) {
-                if e.raw_os_error() != Some(libc::EWOULDBLOCK) {
-                    return Err(e.into());
+            Some(_) => {
+                while let Err(e) = flock(&f, libc::LOCK_EX | libc::LOCK_NB) {
+                    if e.raw_os_error() != Some(libc::EWOULDBLOCK) {
+                        return Err(e.into());
+                    }
+                    if past() {
+                        bail!("the host lock is busy");
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
                 }
-                if past() {
-                    bail!("the host lock is busy");
-                }
-                std::thread::sleep(Duration::from_millis(2));
-            },
+            }
         }
         DEPTH.with(|d| d.set(1));
         Ok(Locked(Some((f, threads))))
@@ -1766,7 +1768,17 @@ mod tests {
         assert_eq!(tap_owner("fvxf0ac", "fv"), Some(0xf0ac), "a template build's");
         assert_eq!(tap_owner("fvci0.1ax3fffff", "fvci0.1a"), Some(0x3fffff));
         assert_eq!(tap_owner("fvtpl61612", "fv"), Some(61612), "an earlier template build's");
-        for (tap, prefix) in [("fvtpl61612", "fc"), ("fvtpl", "fv"), ("fvtpl12x", "fv"), ("fvtpl+1", "fv"), ("fvx", "fv"), ("fvx+1", "fv"), ("fvxg", "fv"), ("eth0", "fv"), ("fvxyz", "fv")] {
+        for (tap, prefix) in [
+            ("fvtpl61612", "fc"),
+            ("fvtpl", "fv"),
+            ("fvtpl12x", "fv"),
+            ("fvtpl+1", "fv"),
+            ("fvx", "fv"),
+            ("fvx+1", "fv"),
+            ("fvxg", "fv"),
+            ("eth0", "fv"),
+            ("fvxyz", "fv"),
+        ] {
             assert_eq!(tap_owner(tap, prefix), None, "{tap} under {prefix}");
         }
         assert_eq!(cgroup_owner("idle-4242-77-3"), Some(Ident { pid: 4242, start: 77, boot: boot_id().into() }));
@@ -1801,7 +1813,8 @@ mod tests {
         h.configure(|c| {
             c.reserve_mib = 7;
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
         store(&w.join("owner"), &Ident { pid: 999_999_930, start: 1, boot: boot_id().into() }, false).unwrap();
         assert!(h.prefix_in_use_at("zq", &h.run.join("no-such-net")).is_some(), "the taps unreadable");
         h.configure(prefix("zq")).unwrap();

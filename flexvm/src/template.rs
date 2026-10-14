@@ -3,8 +3,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::os::unix::fs::{FileExt, MetadataExt};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -77,15 +77,7 @@ pub(crate) struct Stamp {
 
 impl Stamp {
     pub(crate) fn of(m: &std::fs::Metadata) -> Self {
-        Self {
-            size: m.len(),
-            mtime: m.mtime(),
-            mtime_nsec: m.mtime_nsec(),
-            ctime: m.ctime(),
-            ctime_nsec: m.ctime_nsec(),
-            inode: m.ino(),
-            device: m.dev(),
-        }
+        Self { size: m.len(), mtime: m.mtime(), mtime_nsec: m.mtime_nsec(), ctime: m.ctime(), ctime_nsec: m.ctime_nsec(), inode: m.ino(), device: m.dev() }
     }
 }
 
@@ -206,9 +198,7 @@ impl Meta {
         let mut rehashed = false;
         for (name, path) in self.files(paths, dir) {
             let component = &self.components[name];
-            let stamp = Stamp::of(
-                &std::fs::metadata(&path).map_err(|e| format!("template component {}: {e}", path.display()))?,
-            );
+            let stamp = Stamp::of(&std::fs::metadata(&path).map_err(|e| format!("template component {}: {e}", path.display()))?);
             if cache.get(name).unwrap_or(&component.metadata) == &stamp {
                 continue;
             }
@@ -310,22 +300,15 @@ impl Template {
         // a pre-generations template is replaced by renaming over its path.
         let handle = File::open(&dir).map_err(|e| format!("template {name:?}: {e}"))?;
         let fixed = PathBuf::from(format!("/proc/{}/fd/{}", std::process::id(), handle.as_raw_fd()));
-        let meta: Meta = serde_json::from_slice(
-            &std::fs::read(fixed.join("meta.json")).map_err(|e| format!("template {name:?}: {e}"))?,
-        )?;
+        let meta: Meta = serde_json::from_slice(&std::fs::read(fixed.join("meta.json")).map_err(|e| format!("template {name:?}: {e}"))?)?;
         let file = File::open(fixed.join("mem"))?;
         let len = file.metadata()?.len() as usize;
         let data = data_bitmap(&file, len)?;
-        let map = unsafe {
-            libc::mmap(std::ptr::null_mut(), len.max(1), libc::PROT_READ, libc::MAP_SHARED, file.as_raw_fd(), 0)
-        };
+        let map = unsafe { libc::mmap(std::ptr::null_mut(), len.max(1), libc::PROT_READ, libc::MAP_SHARED, file.as_raw_fd(), 0) };
         if map == libc::MAP_FAILED {
             bail!("mmap template memory: {}", std::io::Error::last_os_error());
         }
-        let working_set = std::fs::read(fixed.join("wset"))
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default();
+        let working_set = std::fs::read(fixed.join("wset")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         Ok(Arc::new(Template {
             name: name.into(),
             dir,
@@ -547,16 +530,7 @@ pub fn tap(prefix: &str) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn create(
-    paths: &Paths,
-    name: &str,
-    vcpus: u32,
-    mem_mib: u64,
-    max_mib: u64,
-    plug_mib: u64,
-    image: Option<ImageMeta>,
-    tap: &str,
-) -> Result<()> {
+pub fn create(paths: &Paths, name: &str, vcpus: u32, mem_mib: u64, max_mib: u64, plug_mib: u64, image: Option<ImageMeta>, tap: &str) -> Result<()> {
     // `tap` is made (under the host lock, `Host::tap_prefix`) and removed here.
     let tap = tap.to_string();
     // Running VMs map the old files, which must not be rewritten under them.
@@ -611,17 +585,7 @@ fn publish(paths: &Paths, name: &str, staged: &Path) -> Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build(
-    paths: &Paths,
-    staging: &str,
-    name: &str,
-    vcpus: u32,
-    mem_mib: u64,
-    max_mib: u64,
-    plug_mib: u64,
-    tap: &str,
-    image: Option<ImageMeta>,
-) -> Result<()> {
+fn build(paths: &Paths, staging: &str, name: &str, vcpus: u32, mem_mib: u64, max_mib: u64, plug_mib: u64, tap: &str, image: Option<ImageMeta>) -> Result<()> {
     let dir = paths.templates.join(staging);
     std::fs::create_dir_all(&dir)?;
     let run = dir.join("boot");
@@ -639,19 +603,13 @@ fn build(
     fc.put("/boot-source", json!({"kernel_image_path": paths.kernel, "boot_args": BOOT_ARGS}))?;
     fc.put("/machine-config", json!({"vcpu_count": vcpus, "mem_size_mib": mem_mib}))?;
     fc.put("/pmem/root", json!({"id": "root", "path_on_host": rootfs, "root_device": true, "read_only": true}))?;
-    fc.put(
-        "/balloon",
-        json!({"amount_mib": 0, "deflate_on_oom": false, "stats_polling_interval_s": BALLOON_STATS_S, "free_page_reporting": true}),
-    )?;
+    fc.put("/balloon", json!({"amount_mib": 0, "deflate_on_oom": false, "stats_polling_interval_s": BALLOON_STATS_S, "free_page_reporting": true}))?;
     let hotplug = max_mib.saturating_sub(mem_mib) / SLOT_MIB * SLOT_MIB;
     if hotplug > 0 {
         fc.put("/hotplug/memory", json!({"total_size_mib": hotplug, "slot_size_mib": SLOT_MIB}))?;
     }
     fc.put("/vsock", json!({"guest_cid": 3, "uds_path": vsock}))?;
-    fc.put(
-        "/network-interfaces/eth0",
-        json!({"iface_id": "eth0", "host_dev_name": tap, "guest_mac": crate::net::GUEST_MAC}),
-    )?;
+    fc.put("/network-interfaces/eth0", json!({"iface_id": "eth0", "host_dev_name": tap, "guest_mac": crate::net::GUEST_MAC}))?;
     fc.put("/entropy", json!({}))?;
     fc.put("/actions", json!({"action_type": "InstanceStart"}))?;
     retry(Duration::from_secs(30), || guest::ping(&vsock))?;
@@ -678,10 +636,7 @@ fn build(
         );
     }
     fc.pause()?;
-    fc.put(
-        "/snapshot/create",
-        json!({"snapshot_type": "Full", "snapshot_path": dir.join("vmstate"), "mem_file_path": dir.join("mem")}),
-    )?;
+    fc.put("/snapshot/create", json!({"snapshot_type": "Full", "snapshot_path": dir.join("vmstate"), "mem_file_path": dir.join("mem")}))?;
     let compatibility = crate::compat::local(fc.pid())?;
     drop(fc);
     let punched = sparsify(&dir.join("mem"))?;
@@ -746,21 +701,20 @@ mod tests {
     impl Fixture {
         fn new() -> Self {
             static NEXT: AtomicU64 = AtomicU64::new(0);
-            let dir = std::env::temp_dir().join(format!(
-                "flexvm-identity-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
+            let dir = std::env::temp_dir().join(format!("flexvm-identity-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
             std::fs::create_dir_all(&dir).unwrap();
-            let paths = Paths {
-                firecracker: dir.join("firecracker"),
-                kernel: dir.join("kernel"),
-                rootfs: dir.join("rootfs"),
-                templates: dir.clone(),
-            };
+            let paths = Paths { firecracker: dir.join("firecracker"), kernel: dir.join("kernel"), rootfs: dir.join("rootfs"), templates: dir.clone() };
             let mut meta = Meta {
                 compatibility: None,
-                vcpus: 2, mem_mib: 256, max_mib: 1024, plugged_mib: 0,
-                kernel: paths.kernel.clone(), rootfs: paths.rootfs.clone(),
-                id: String::new(), components: BTreeMap::new(), image: None,
+                vcpus: 2,
+                mem_mib: 256,
+                max_mib: 1024,
+                plugged_mib: 0,
+                kernel: paths.kernel.clone(),
+                rootfs: paths.rootfs.clone(),
+                id: String::new(),
+                components: BTreeMap::new(),
+                image: None,
             };
             for (name, path) in meta.files(&paths, &dir) {
                 std::fs::write(path, name.as_bytes()).unwrap();
@@ -796,10 +750,7 @@ mod tests {
     }
 
     fn set_mtime(file: &File, sec: i64, nsec: i64) {
-        let times = [
-            libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_OMIT },
-            libc::timespec { tv_sec: sec, tv_nsec: nsec },
-        ];
+        let times = [libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_OMIT }, libc::timespec { tv_sec: sec, tv_nsec: nsec }];
         assert_eq!(unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) }, 0);
     }
 
@@ -815,10 +766,7 @@ mod tests {
         };
         let current = || std::fs::read_to_string(Template::resolve(&f.paths, "t").unwrap().join("vmstate")).unwrap();
         let gens = || {
-            let mut g: Vec<String> = std::fs::read_dir(f.dir.join(GENERATIONS))
-                .unwrap()
-                .map(|e| e.unwrap().file_name().into_string().unwrap())
-                .collect();
+            let mut g: Vec<String> = std::fs::read_dir(f.dir.join(GENERATIONS)).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
             g.sort();
             g
         };

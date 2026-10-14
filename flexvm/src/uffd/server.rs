@@ -1,10 +1,10 @@
+use super::{page_runs, Mapping, Pager, MAX_FETCH};
+use crate::bail;
+use crate::util::{Result, PAGE_SIZE};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
-use crate::bail;
-use crate::util::{Result, PAGE_SIZE};
-use super::{page_runs, Mapping, Pager, MAX_FETCH};
 
 const SERVE_WRITE: Duration = Duration::from_secs(30);
 
@@ -106,7 +106,12 @@ impl Pager {
 
 /// Reads the pages of `list` into `data` (a page each), a run per iovec and up to IOV_MAX of them per `read(local,
 /// remote)`, which returns the bytes read.
-pub(super) fn capture_preload(mappings: &[Mapping], list: &[u64], data: &mut [u8], mut read: impl FnMut(&[libc::iovec], &[libc::iovec]) -> io::Result<usize>) -> Result<()> {
+pub(super) fn capture_preload(
+    mappings: &[Mapping],
+    list: &[u64],
+    data: &mut [u8],
+    mut read: impl FnMut(&[libc::iovec], &[libc::iovec]) -> io::Result<usize>,
+) -> Result<()> {
     if data.len() != list.len() * PAGE_SIZE {
         bail!("preload of {} pages has {} bytes", list.len(), data.len());
     }

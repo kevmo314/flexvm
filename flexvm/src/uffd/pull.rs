@@ -1,12 +1,12 @@
+use super::event::PULL;
+use super::fetch::{partial, Failed, Fetch, FetchFailure, Link};
+use super::{Pager, ALL, FAULT_FETCHERS, PAGE_SIZE, PULL_RUN, REMOTE};
+use crate::checkpoint::PageFile;
 use std::io;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
-use crate::checkpoint::PageFile;
-use super::event::PULL;
-use super::fetch::{partial, Failed, Fetch, FetchFailure, Link};
-use super::{Pager, ALL, FAULT_FETCHERS, PAGE_SIZE, PULL_RUN, REMOTE};
 
 /// Steered runs a puller takes, at most, before each run of its own share.
 const STEER_BURST: usize = 4;
@@ -30,7 +30,9 @@ impl Pager {
             // Reads from the checkpoint file (evicting what it read, for a puller) or over a source connection of its
             // own.
             let mut fetch: Box<Fetch> = match (file.clone(), &source) {
-                (Some(file), _) => Box::new(move |off, buf, _, _| file.read(off as usize / PAGE_SIZE, buf, puller).map_err(|e| io::Error::new(e.kind(), FetchFailure::Checkpoint(e)))),
+                (Some(file), _) => Box::new(move |off, buf, _, _| {
+                    file.read(off as usize / PAGE_SIZE, buf, puller).map_err(|e| io::Error::new(e.kind(), FetchFailure::Checkpoint(e)))
+                }),
                 (None, Some(source)) if puller => {
                     let mut link = Link::new(source.clone());
                     Box::new(move |off, buf, stop, progress| link.fetch(off, buf, stop, progress))

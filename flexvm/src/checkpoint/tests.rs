@@ -1,10 +1,24 @@
 use super::{
-    *, chain::{flatten, overlay, read_at, Link}, format::{parse_pagemap, sum, sums_sum, Run, MAGIC, DATA, ZERO, TEMPLATE, MAX_VMSTATE},
-    staging::{exists_at, publish_permissions, STAGING_PREFIX}, write::{aligned, as_bytes, classify, write_pages, PagesFile},
+    chain::{flatten, overlay, read_at, Link},
+    format::{parse_pagemap, sum, sums_sum, Run, DATA, MAGIC, MAX_VMSTATE, TEMPLATE, ZERO},
+    staging::{exists_at, publish_permissions, STAGING_PREFIX},
+    write::{aligned, as_bytes, classify, write_pages, PagesFile},
+    *,
 };
-use crate::{template::{Paths, Template}, uffd::{Runs, REMOTE, BASE as P_BASE, ZERO as P_ZERO}, util::{Result, PAGE_SIZE}};
-use std::{os::fd::AsRawFd, os::unix::fs::FileExt, path::{Path, PathBuf}, sync::Arc, io::Write, fs};
+use crate::{
+    template::{Paths, Template},
+    uffd::{Runs, BASE as P_BASE, REMOTE, ZERO as P_ZERO},
+    util::{Result, PAGE_SIZE},
+};
 use serde_json::json;
+use std::{
+    fs,
+    io::Write,
+    os::fd::AsRawFd,
+    os::unix::fs::FileExt,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 fn tmp(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("flexvm-{name}-{}", std::process::id()));
@@ -142,11 +156,31 @@ fn pages_roundtrip_against_the_template() {
     let tpl_pages: Vec<Option<u8>> = (0..n).map(|i| (i % 2 == 0).then_some(i as u8 | 1)).collect();
     let tpl = template(&dir, &tpl_pages);
     let zero = || vec![0; PAGE_SIZE];
-    let pages: Vec<Vec<u8>> = (0..n).map(|i| [tpl_pages[i].map_or(zero(), |b| vec![b; PAGE_SIZE]), zero()].get(i % 5).cloned().unwrap_or_else(|| page(i))).collect();
+    let pages: Vec<Vec<u8>> =
+        (0..n).map(|i| [tpl_pages[i].map_or(zero(), |b| vec![b; PAGE_SIZE]), zero()].get(i % 5).cloned().unwrap_or_else(|| page(i))).collect();
     // Pages 7 and 300..320 were discarded by the guest; 900.. were never touched.
     let discarded = |i: usize| i == 7 || (300..320).contains(&i);
-    let input = runs_of((0..n).map(|i| (i, if i >= 900 { P_BASE } else if discarded(i) { P_ZERO } else { REMOTE })));
-    let want = |i: usize| if discarded(i) { zero() } else if i < 900 { pages[i].clone() } else { tpl.pages(i, 1).to_vec() };
+    let input = runs_of((0..n).map(|i| {
+        (
+            i,
+            if i >= 900 {
+                P_BASE
+            } else if discarded(i) {
+                P_ZERO
+            } else {
+                REMOTE
+            },
+        )
+    }));
+    let want = |i: usize| {
+        if discarded(i) {
+            zero()
+        } else if i < 900 {
+            pages[i].clone()
+        } else {
+            tpl.pages(i, 1).to_vec()
+        }
+    };
     let guest = Guest(pages.clone(), 333, None);
     let want_data = (0..900).filter(|&i| i % 5 >= 2 && !discarded(i)).count() as u64;
     let want_zero = (0..900).filter(|&i| i % 2 == 0 && (i % 5 == 1 || discarded(i))).count() as u64;
@@ -226,7 +260,8 @@ fn deltas_flatten_over_their_parents() {
     let mut want = Canon::new(&tpl);
     v2.iter().enumerate().for_each(|(i, p)| want.page(i, p));
     let (manifest, file) = (manifest(n, None, json!({})), Arc::new(file));
-    let ck = Checkpoint { dir: dir.clone(), manifest, id: String::new(), vmstate: Vec::new(), runs, file, chain: Vec::new(), chain_ids: Vec::new(), meta_left: 0 };
+    let ck =
+        Checkpoint { dir: dir.clone(), manifest, id: String::new(), vmstate: Vec::new(), runs, file, chain: Vec::new(), chain_ids: Vec::new(), meta_left: 0 };
     assert_eq!(ck.content_hash(&tpl).unwrap(), want.finish());
     ck.verify_data().unwrap();
     fs::remove_dir_all(&dir).unwrap();
@@ -236,7 +271,15 @@ fn deltas_flatten_over_their_parents() {
 fn overlays_buffers_and_parent_paths() {
     let base: Vec<Run> = vec![(0, 10, DATA, 1, 100), (20, 5, ZERO, 1, 0)];
     let top: Vec<Run> = vec![(2, 2, ZERO, 0, 0), (5, 1, TEMPLATE, 0, 0), (9, 13, DATA, 0, 7)];
-    let want = [(0, 2, DATA, 1, 100), (2, 2, ZERO, 0, 0), (4, 1, DATA, 1, 104), (5, 1, TEMPLATE, 0, 0), (6, 3, DATA, 1, 106), (9, 13, DATA, 0, 7), (22, 3, ZERO, 1, 0)];
+    let want = [
+        (0, 2, DATA, 1, 100),
+        (2, 2, ZERO, 0, 0),
+        (4, 1, DATA, 1, 104),
+        (5, 1, TEMPLATE, 0, 0),
+        (6, 3, DATA, 1, 106),
+        (9, 13, DATA, 0, 7),
+        (22, 3, ZERO, 1, 0),
+    ];
     assert_eq!(overlay(&base, &top), want);
     assert_eq!(parent_path(Path::new("/d/ck2"), Path::new("/d/ck1")), "../ck1");
     assert_eq!(parent_path(Path::new("/e/ck2"), Path::new("/d/ck1")), "/d/ck1");
@@ -293,7 +336,8 @@ fn staging_is_private_never_overwrites_and_cleans_up() {
     let other = Staging::new(&dir.join("other"), dir.join("other.vmstate")).unwrap();
     drop(other);
     let ours = format!("{STAGING_PREFIX}{}", std::process::id());
-    let mine = || fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()).filter(|p| p.file_name().unwrap().to_string_lossy().starts_with(&ours)).collect::<Vec<_>>();
+    let mine =
+        || fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()).filter(|p| p.file_name().unwrap().to_string_lossy().starts_with(&ours)).collect::<Vec<_>>();
     assert_eq!(mine().iter().map(|p| mode(p)).collect::<Vec<_>>(), [0o700]);
     drop(s.create("pages").unwrap());
     assert!(s.create("pages").is_err());

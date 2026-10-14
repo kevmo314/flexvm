@@ -235,7 +235,10 @@ impl Proc {
         match saved {
             Ok((m, _)) => {
                 let data = (m.data_pages * PAGE_SIZE as u64) >> 20;
-                eprintln!("{}", json!({"name": vm.name, "state": "suspended", "dir": self.host.suspended(&vm.name), "freed_rss_mib": vm.rss() >> 20, "data_mib": data, "suspend_ms": ms(t.total()), "timings_ms": t.json()}));
+                eprintln!(
+                    "{}",
+                    json!({"name": vm.name, "state": "suspended", "dir": self.host.suspended(&vm.name), "freed_rss_mib": vm.rss() >> 20, "data_mib": data, "suspend_ms": ms(t.total()), "timings_ms": t.json()})
+                );
                 self.finish(&op, End::Suspended, 128 + libc::SIGTERM, None)
             }
             Err(e) => {
@@ -346,7 +349,16 @@ impl Proc {
     /// An `owned` (suspended) checkpoint is durably marked STARTED before the
     /// VM runs and deleted once not needed. `hold`: left paused until SIGCONT.
     #[allow(clippy::too_many_arguments)]
-    fn restore_checkpoint(&self, name: &str, ck: Checkpoint, tpl: Arc<Template>, ip: Ipv4Addr, owned: bool, hold: bool, t: &mut Phases) -> std::result::Result<Value, Restore> {
+    fn restore_checkpoint(
+        &self,
+        name: &str,
+        ck: Checkpoint,
+        tpl: Arc<Template>,
+        ip: Ipv4Addr,
+        owned: bool,
+        hold: bool,
+        t: &mut Phases,
+    ) -> std::result::Result<Value, Restore> {
         let m = ck.manifest.clone();
         let to_load = (ck.data_pages() * PAGE_SIZE as u64) >> 20;
         self.app_log.store(m.app_log, Ordering::SeqCst);
@@ -378,7 +390,9 @@ impl Proc {
             self.publish();
             self.announce();
             self.watch_checkpoint_pull(vm.clone(), dir, to_load);
-            return Ok(json!({"name": name, "ip": ip.to_string(), "pid": std::process::id(), "state": "paused", "restore_ms": ms(restore), "timings_ms": t.json()}));
+            return Ok(
+                json!({"name": name, "ip": ip.to_string(), "pid": std::process::id(), "state": "paused", "restore_ms": ms(restore), "timings_ms": t.json()}),
+            );
         }
         let still = self.still_current(ip).map_err(|e| Restore::NotRun(kill(e)))?;
         if owned {
@@ -461,7 +475,15 @@ impl Proc {
     /// published. With `cow` it runs on once memory is write-protected.
     /// `before_publish` runs once the checkpoint's pages are written, before it is
     /// published (with the VM still paused, without `cow`); failing, it fails the checkpoint.
-    fn save(&self, vm: &Arc<Vm>, mut staging: Staging, cow: bool, incremental: bool, t: &mut Phases, before_publish: impl FnOnce() -> Result<()>) -> Result<(Manifest, Value)> {
+    fn save(
+        &self,
+        vm: &Arc<Vm>,
+        mut staging: Staging,
+        cow: bool,
+        incremental: bool,
+        t: &mut Phases,
+        before_publish: impl FnOnce() -> Result<()>,
+    ) -> Result<(Manifest, Value)> {
         let last = |e: &dyn std::fmt::Display| format!("the last checkpoint of vm {}: {e}; take a full one", vm.name);
         let parent = match incremental {
             false => None,
@@ -474,7 +496,12 @@ impl Proc {
                     bail!("{}", last(&format!("{} has changed", dir.display())));
                 }
                 if ck.chain.len() + 2 > crate::checkpoint::MAX_CHAIN {
-                    bail!("vm {}: a delta on {} would make a chain of more than {} checkpoints; take a full one", vm.name, dir.display(), crate::checkpoint::MAX_CHAIN);
+                    bail!(
+                        "vm {}: a delta on {} would make a chain of more than {} checkpoints; take a full one",
+                        vm.name,
+                        dir.display(),
+                        crate::checkpoint::MAX_CHAIN
+                    );
                 }
                 // Never stop a VM onto a chain that cannot restore.
                 if !cow {
@@ -589,7 +616,15 @@ impl Proc {
             cancelled().inspect_err(|_| vm.pager.unfreeze(&frozen))?;
             thread::sleep(Duration::from_millis(10));
         }
-        let slow = || Duration::from_millis(if fault("ckpt_crawl") { 500 } else if fault("ckpt_slow") { 50 } else { 0 });
+        let slow = || {
+            Duration::from_millis(if fault("ckpt_crawl") {
+                500
+            } else if fault("ckpt_slow") {
+                50
+            } else {
+                0
+            })
+        };
         let cow_pages = frozen.cow.as_deref().map(|c| crate::cow::CowPages { guest: vm.pager.as_ref(), cow: c, slow });
         let src: &dyn crate::checkpoint::GuestPages = match &cow_pages {
             Some(c) => c,
@@ -617,7 +652,10 @@ impl Proc {
                 let first = p.path.strip_prefix("../").map_or_else(|| PathBuf::from(&p.path), |name| pinned.join(name));
                 let now = crate::checkpoint::chain_ids(&first);
                 if now.as_ref().ok() != Some(ids) {
-                    bail!("the checkpoints this delta builds on changed or went ({}); take a full one", now.err().map_or("other ids".into(), |e| e.to_string()));
+                    bail!(
+                        "the checkpoints this delta builds on changed or went ({}); take a full one",
+                        now.err().map_or("other ids".into(), |e| e.to_string())
+                    );
                 }
             }
             match &frozen.cow {
@@ -652,15 +690,18 @@ impl Proc {
         match committed {
             Ok((manifest, id)) => {
                 *vm.last_checkpoint.lock().unwrap() = cow.then(|| (dest, id.clone()));
-                Ok((manifest, json!({
-                    "id": id,
-                    "paused_ms": ms(paused),
-                    "dirty_mib": (frozen.dirty * PAGE_SIZE) >> 20,
-                    "protect": {"ranges": frozen.protected, "ms": ms(frozen.protect)},
-                    "copy": copy,
-                    "pause_memhash": memhash,
-                    "held_packets": hold.stats.map(|s| s.json()),
-                })))
+                Ok((
+                    manifest,
+                    json!({
+                        "id": id,
+                        "paused_ms": ms(paused),
+                        "dirty_mib": (frozen.dirty * PAGE_SIZE) >> 20,
+                        "protect": {"ranges": frozen.protected, "ms": ms(frozen.protect)},
+                        "copy": copy,
+                        "pause_memhash": memhash,
+                        "held_packets": hold.stats.map(|s| s.json()),
+                    }),
+                ))
             }
             Err(CommitError::Failed(e)) if cow => Err(e),
             Err(CommitError::Failed(e)) => match hold.end() {

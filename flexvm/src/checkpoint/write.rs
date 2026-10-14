@@ -1,7 +1,21 @@
 //! Parallel guest-page classification, aligned writes and pagemap construction.
-use std::{fs::File, io, os::fd::AsRawFd, sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}, sync::Mutex};
-use crate::{crc32c, template::Template, uffd::{Pager, Runs, REMOTE}, util::{Result, PAGE_SIZE}};
-use super::{check, format::{MAGIC, DATA, ZERO, TEMPLATE}};
+use super::{
+    check,
+    format::{DATA, MAGIC, TEMPLATE, ZERO},
+};
+use crate::{
+    crc32c,
+    template::Template,
+    uffd::{Pager, Runs, REMOTE},
+    util::{Result, PAGE_SIZE},
+};
+use std::{
+    fs::File,
+    io,
+    os::fd::AsRawFd,
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    sync::Mutex,
+};
 
 const UNIT: usize = 256;
 /// Most writer threads; a few saturate the disk.
@@ -216,7 +230,9 @@ pub(super) fn write_pages(template: &Template, src: &dyn GuestPages, runs: &Runs
     let mut w = Written { map: MAGIC.to_vec(), data, zero: 0, sums: vec![0; data as usize] };
     let mut map: Vec<[u64; 4]> = Vec::new();
     let mut push = |page: u64, count: u64, kind: u64, at: u64| {
-        if count == 0 { return; }
+        if count == 0 {
+            return;
+        }
         let kind = match kind {
             ZERO | DATA => kind,
             _ if explicit => TEMPLATE,

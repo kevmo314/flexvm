@@ -164,8 +164,18 @@ mod tests {
             (|h| h.cpu = "GenuineIntel family 0x6 model 0x55".into(), "CPU differs"),
             (|h| h.firecracker = "Firecracker v1.18.0 (content a)".into(), "Firecracker differs"),
             (|h| *h.features.get_mut("0x1.0.ecx").unwrap() &= !1, "CPUID 0x1.0.ecx 0x1 "),
-            (|h| { h.features.remove("0x7.0.ebx"); }, "CPUID 0x7.0.ebx 0x219c01ab"),
-            (|h| { h.xsave.insert(2, [0x100, 0x400]); }, "XSAVE component 2"),
+            (
+                |h| {
+                    h.features.remove("0x7.0.ebx");
+                },
+                "CPUID 0x7.0.ebx 0x219c01ab",
+            ),
+            (
+                |h| {
+                    h.xsave.insert(2, [0x100, 0x400]);
+                },
+                "XSAVE component 2",
+            ),
         ];
         for (change, expected) in cases {
             let mut h = snapshot.clone();

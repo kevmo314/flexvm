@@ -69,13 +69,51 @@ options: --state DIR (FLEXVM_STATE, /var/lib/flexvm), --run DIR (FLEXVM_RUN, /ru
 const SWITCHES: &[&str] = &["warm", "stop", "paused", "incremental", "standby", "incoming", "json", "detach", "help"];
 
 const VALUE_FLAGS: &[&str] = &[
-    "state", "run", "artifacts", "templates", "image-cache", "template", "ip", "name",
-    "peer", "vm-ips", "underlay", "announce-dev", "dns", "reserve", "evict-at", "prefix",
-    "vcpus", "mem", "max", "plug", "image", "init", "entrypoint", "cmd", "env",
-    "workdir", "user", "ready-port", "ready-cmd", "ready-timeout", "image-staging",
-    "max-download-mib", "max-unpacked-mib", "max-file-mib", "max-entries",
-    "to", "to-state", "to-run", "timeout", "lifecycle", "iterations", "warmup",
-    "dirty-mib", "settle-ms", "ready-http",
+    "state",
+    "run",
+    "artifacts",
+    "templates",
+    "image-cache",
+    "template",
+    "ip",
+    "name",
+    "peer",
+    "vm-ips",
+    "underlay",
+    "announce-dev",
+    "dns",
+    "reserve",
+    "evict-at",
+    "prefix",
+    "vcpus",
+    "mem",
+    "max",
+    "plug",
+    "image",
+    "init",
+    "entrypoint",
+    "cmd",
+    "env",
+    "workdir",
+    "user",
+    "ready-port",
+    "ready-cmd",
+    "ready-timeout",
+    "image-staging",
+    "max-download-mib",
+    "max-unpacked-mib",
+    "max-file-mib",
+    "max-entries",
+    "to",
+    "to-state",
+    "to-run",
+    "timeout",
+    "lifecycle",
+    "iterations",
+    "warmup",
+    "dirty-mib",
+    "settle-ms",
+    "ready-http",
 ];
 
 /// `--flag value`s: last wins. `rest` follows `--` (or `exec NAME`).
@@ -207,7 +245,11 @@ fn real_main() -> Result<()> {
                 None if args.has("detach") => checkpoint::Checkpoint::open(&dir)?.manifest.name,
                 None => String::new(),
             };
-            start(&args, &label, Start::Restore { dir, name: args.get("name").map(String::from), ip: args.get("ip").map(String::from), paused: args.has("paused") })
+            start(
+                &args,
+                &label,
+                Start::Restore { dir, name: args.get("name").map(String::from), ip: args.get("ip").map(String::from), paused: args.has("paused") },
+            )
         }
         Some("ls") => list(&open_host(&args)?, args.has("json")),
         Some("exec") => std::process::exit(exec(&open_host(&args)?, name, &args.rest.join(" "))?),
@@ -418,18 +460,26 @@ fn kill(host: &Host, name: &str) -> Result<()> {
         return Ok(());
     }
     if host.alive(name) {
-        return Err(format!("vm {name:?} is starting or its registry is unavailable; retry flexvm kill {name} once it is ready, or see {}", host.vms(name, "log").display()).into());
+        return Err(format!(
+            "vm {name:?} is starting or its registry is unavailable; retry flexvm kill {name} once it is ready, or see {}",
+            host.vms(name, "log").display()
+        )
+        .into());
     }
     Err(format!("no vm named {name:?}").into())
 }
 
 fn list(host: &Host, as_json: bool) -> Result<()> {
     let rss = |pid: Option<u32>| pid.and_then(|p| proc_kb(&format!("/proc/{p}/status"), "VmRSS")).unwrap_or(0) >> 20;
-    let mut vms: Vec<Value> = host.entries().into_iter().map(|e| {
-        let mut v = serde_json::to_value(&e).unwrap_or_default();
-        v["rss_mib"] = json!(rss(e.firecracker));
-        v
-    }).collect();
+    let mut vms: Vec<Value> = host
+        .entries()
+        .into_iter()
+        .map(|e| {
+            let mut v = serde_json::to_value(&e).unwrap_or_default();
+            v["rss_mib"] = json!(rss(e.firecracker));
+            v
+        })
+        .collect();
     let names = |dir: PathBuf| std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.file_name().to_string_lossy().into_owned());
     vms.extend(names(host.state.join("suspended")).filter(|n| !n.starts_with('.') && !host.alive(n)).filter_map(|n| lifecycle::describe_suspended(host, &n)));
     for n in names(host.run.join("vms")).filter_map(|n| n.strip_suffix(".failed").map(String::from)).filter(|n| !host.alive(n)) {
@@ -720,7 +770,11 @@ mod exec_tests {
         let root = std::env::temp_dir().join(format!("flexvm-listen-config-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let mut host = Host::open(&root.join("state"), &root.join("run")).unwrap();
-        host.configure(|c| { c.reserve_mib = 321; Ok(()) }).unwrap();
+        host.configure(|c| {
+            c.reserve_mib = 321;
+            Ok(())
+        })
+        .unwrap();
         let before = std::fs::read(host.state.join("host.json")).unwrap();
         let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = occupied.local_addr().unwrap().to_string();
@@ -760,7 +814,11 @@ mod exec_tests {
         let (mut stdout, mut stderr, mut deadline) = (Vec::new(), Vec::new(), Instant::now());
         let mut run = |input: Vec<u8>| exec_frames(&mut input.as_slice(), &session, &mut stdout, &mut stderr, &mut deadline).unwrap();
         assert!(matches!(run(first), StreamEnd::Disconnected(_)));
-        let resumed = frames(&[(guest::FRAME_MSG, b"test-id"), (guest::FRAME_STDERR, &at(3, b"def")), (guest::FRAME_EXIT, &[&6u64.to_le_bytes()[..], &7i32.to_le_bytes()].concat())]);
+        let resumed = frames(&[
+            (guest::FRAME_MSG, b"test-id"),
+            (guest::FRAME_STDERR, &at(3, b"def")),
+            (guest::FRAME_EXIT, &[&6u64.to_le_bytes()[..], &7i32.to_le_bytes()].concat()),
+        ]);
         assert!(matches!(run(resumed), StreamEnd::Exit(7)));
         let s = session.lock().unwrap();
         assert!(s.started && s.offset == 6 && s.exit == Some(7) && stdout == b"abc" && stderr == b"def");

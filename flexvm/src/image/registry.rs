@@ -223,7 +223,11 @@ fn docker_credentials(registry: &str) -> Option<String> {
             (f.len() > 5 && f[0] == user).then(|| PathBuf::from(f[5]))
         })
     });
-    let homes = [std::env::var_os("DOCKER_CONFIG").map(PathBuf::from), std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".docker")), sudo_home.map(|h| h.join(".docker"))];
+    let homes = [
+        std::env::var_os("DOCKER_CONFIG").map(PathBuf::from),
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".docker")),
+        sudo_home.map(|h| h.join(".docker")),
+    ];
     let hub = ["index.docker.io", "docker.io", "registry-1.docker.io"];
     let wanted: &[&str] = if registry == hub[2] { &hub } else { &[registry] };
     for dir in homes.into_iter().flatten() {

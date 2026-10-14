@@ -1,3 +1,5 @@
+use super::event::{FETCH, FIRST, QUEUED};
+use super::{os, Pager, Pages, Source, FAULT_TIMEOUT, PAGE_SIZE, REMOTE, REMOTE_FAULT_RUN};
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
@@ -6,8 +8,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use super::event::{FETCH, FIRST, QUEUED};
-use super::{os, Pager, Pages, Source, FAULT_TIMEOUT, PAGE_SIZE, REMOTE, REMOTE_FAULT_RUN};
 
 /// How long the migration source may stay unreachable before the pager gives up.
 const SOURCE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -374,7 +374,14 @@ impl Link {
 
     /// `fetch` for a fault fetcher: reads the reply to the front job of `lane`, whose request may be out already, the
     /// faulting page first. With nothing to read, only connects.
-    pub(super) fn fetch_queued(&mut self, lane: &Lane, offset: u64, buf: &mut [u8], stop: &AtomicBool, progress: &mut dyn FnMut(&[u8]) -> bool) -> io::Result<()> {
+    pub(super) fn fetch_queued(
+        &mut self,
+        lane: &Lane,
+        offset: u64,
+        buf: &mut [u8],
+        stop: &AtomicBool,
+        progress: &mut dyn FnMut(&[u8]) -> bool,
+    ) -> io::Result<()> {
         self.fetch_with(Some(lane), offset, buf, stop, progress)
     }
 
@@ -459,7 +466,12 @@ pub fn probe(source: &Source, page: u64, deadline: Instant) -> io::Result<()> {
     })
 }
 
-fn probe_with_connect<S: crate::util::Timed>(source: &Source, page: u64, deadline: Instant, mut connect: impl FnMut(&str, Duration) -> io::Result<S>) -> io::Result<()> {
+fn probe_with_connect<S: crate::util::Timed>(
+    source: &Source,
+    page: u64,
+    deadline: Instant,
+    mut connect: impl FnMut(&str, Duration) -> io::Result<S>,
+) -> io::Result<()> {
     let give_up = deadline.min(Instant::now() + SOURCE_TIMEOUT);
     let mut backoff = BACKOFF_MIN;
     // Bound connects separately so SYN retries cannot consume the whole outage

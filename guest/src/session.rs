@@ -318,8 +318,7 @@ fn open<'a>(body: &[u8], conn: Option<File>, line: &'a str, sessions: &Sessions,
                 crate::mem::enter(&mut cmd, work, false);
             }
             // Minimal images (distroless, scratch) have no shell.
-            let child = spawn(&mut cmd, statuses)
-                .map_err(|e| io::Error::new(e.kind(), format!("cannot run /bin/sh: {e} (does the image have a shell?)")))?;
+            let child = spawn(&mut cmd, statuses).map_err(|e| io::Error::new(e.kind(), format!("cannot run /bin/sh: {e} (does the image have a shell?)")))?;
             table.live.insert(id.to_string(), Entry { command: fingerprint, output: output.clone() });
             // Attached before any output, so none is overwritten before it is sent.
             let attached = attach(&output, 0, conn);
@@ -509,10 +508,12 @@ mod tests {
     #[test]
     fn live_limit_is_explicit_and_abandoned_sessions_are_reclaimed() {
         let mut table = Table::default();
-        let outputs: Vec<_> = (0..MAX_LIVE).map(|i| {
-            table.admit().unwrap();
-            finished(&mut table, &i.to_string(), Some(Instant::now()))
-        }).collect();
+        let outputs: Vec<_> = (0..MAX_LIVE)
+            .map(|i| {
+                table.admit().unwrap();
+                finished(&mut table, &i.to_string(), Some(Instant::now()))
+            })
+            .collect();
         assert!(table.admit().unwrap_err().to_string().contains("too many sessions"));
         let old = Some(Instant::now() - ABANDONED);
         outputs[3].0.lock().unwrap().detached = old;
@@ -554,20 +555,28 @@ mod tests {
     #[test]
     fn ring_memory_comes_from_the_pool_and_returns() {
         let mut table = Table::default();
-        let outputs: Vec<_> = (0..MAX_LIVE).map(|i| {
-            table.admit().unwrap();
-            let output = live(&mut table, &i.to_string(), Output::default());
-            for _ in 0..2 * CAPACITY / BLOCK {
-                deliver(&output, FRAME_STDOUT, &[b'x'; BLOCK]);
-            }
-            let ring = output.0.lock().unwrap();
-            assert_eq!(ring.chunks.iter().map(|c| c.data.capacity()).sum::<usize>() as u64, ring.end - ring.start);
-            assert!((ring.end - ring.start) as usize <= ring.capacity());
-            drop(ring);
-            output
-        }).collect();
+        let outputs: Vec<_> = (0..MAX_LIVE)
+            .map(|i| {
+                table.admit().unwrap();
+                let output = live(&mut table, &i.to_string(), Output::default());
+                for _ in 0..2 * CAPACITY / BLOCK {
+                    deliver(&output, FRAME_STDOUT, &[b'x'; BLOCK]);
+                }
+                let ring = output.0.lock().unwrap();
+                assert_eq!(ring.chunks.iter().map(|c| c.data.capacity()).sum::<usize>() as u64, ring.end - ring.start);
+                assert!((ring.end - ring.start) as usize <= ring.capacity());
+                drop(ring);
+                output
+            })
+            .collect();
         assert_eq!(table.pool.load(Ordering::Acquire), 0);
-        let retained: usize = outputs.iter().map(|o| { let r = o.0.lock().unwrap(); (r.end - r.start) as usize }).sum();
+        let retained: usize = outputs
+            .iter()
+            .map(|o| {
+                let r = o.0.lock().unwrap();
+                (r.end - r.start) as usize
+            })
+            .sum();
         assert!(retained <= MAX_LIVE * BASE + POOL, "{retained}");
         let full = outputs.iter().filter(|o| o.0.lock().unwrap().capacity() == CAPACITY).count();
         assert!(full > 0 && full < MAX_LIVE);

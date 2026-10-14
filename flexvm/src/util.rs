@@ -92,7 +92,8 @@ pub fn rpc(addr: &str, wait: Duration, at: Instant, req: &serde_json::Value) -> 
         send_json(&mut By { s: &s, at }, req)?;
         let reply = recv_json(&mut io::BufReader::new(By { s: &s, at }))?;
         Ok((s, answer(reply, "it")?))
-    })().map_err(|e| format!("{addr}: {e}").into())
+    })()
+    .map_err(|e| format!("{addr}: {e}").into())
 }
 
 pub fn answer(reply: Option<serde_json::Value>, who: &str) -> Result<serde_json::Value> {
@@ -313,7 +314,11 @@ pub fn write_file(dir: &Path, name: &str, data: &[u8], durable: bool) -> io::Res
         f.sync_all()?;
     }
     std::fs::rename(&tmp, dir.join(name))?;
-    if durable { sync_dir(dir) } else { Ok(()) }
+    if durable {
+        sync_dir(dir)
+    } else {
+        Ok(())
+    }
 }
 
 /// Fsyncs every parent each time: a crash may have lost an entry made before, or another

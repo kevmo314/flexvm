@@ -27,10 +27,14 @@ pub struct Image {
 impl Image {
     /// Download missing registry layers only when the derived rootfs needs building.
     pub fn download_layers(&mut self) -> Result<()> {
-        let descs: Vec<_> = self.layers.iter().filter_map(|l| match &l.src {
-            Blob::Cached { digest, size, blobs, registry } => Some((digest.clone(), *size, (blobs, registry))),
-            _ => None,
-        }).collect();
+        let descs: Vec<_> = self
+            .layers
+            .iter()
+            .filter_map(|l| match &l.src {
+                Blob::Cached { digest, size, blobs, registry } => Some((digest.clone(), *size, (blobs, registry))),
+                _ => None,
+            })
+            .collect();
         for (i, (d, size, (blobs, _))) in descs.iter().enumerate() {
             let cached = if blob_path(blobs, d)?.exists() { " (cached)" } else { "" };
             eprintln!("image: layer {}/{} {d} {:.1} MiB{cached}", i + 1, descs.len(), *size as f64 / 1048576.0);
@@ -255,11 +259,14 @@ fn pull(cache: &Path, mut reg: Registry, limits: &Limits) -> Result<Image> {
     }
     let config = read_verified(&reg.blob(&config_digest, config_size, &blobs)?, config_size, &config_digest)?;
     let descs = descriptors(&manifest, limits)?;
-    let layers = descs.into_iter().map(|(d, size)| Layer {
-        src: Blob::Cached { blobs: blobs.clone(), registry: Box::new(reg.clone()), digest: d.clone(), size },
-        digest: Some(d),
-        size: Some(size),
-    }).collect();
+    let layers = descs
+        .into_iter()
+        .map(|(d, size)| Layer {
+            src: Blob::Cached { blobs: blobs.clone(), registry: Box::new(reg.clone()), digest: d.clone(), size },
+            digest: Some(d),
+            size: Some(size),
+        })
+        .collect();
     image(digest, config_digest, config, layers)
 }
 
@@ -277,19 +284,21 @@ fn download_layers<T: Sync>(descs: &[(String, u64, T)], download: impl Fn(&str, 
     let workers = unique.len().min(4);
     let pending = std::sync::Mutex::new(unique.into_iter());
     std::thread::scope(|scope| -> Result<()> {
-        let jobs: Vec<_> = (0..workers).map(|_| {
-            scope.spawn(|| -> Result<()> {
-                loop {
-                    let next = pending.lock().unwrap().next();
-                    let Some((d, (size, src))) = next else { return Ok(()) };
-                    if let Err(e) = download(d, size, src) {
-                        // Start nothing more; downloads in flight finish.
-                        pending.lock().unwrap().by_ref().for_each(drop);
-                        return Err(e);
+        let jobs: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| -> Result<()> {
+                    loop {
+                        let next = pending.lock().unwrap().next();
+                        let Some((d, (size, src))) = next else { return Ok(()) };
+                        if let Err(e) = download(d, size, src) {
+                            // Start nothing more; downloads in flight finish.
+                            pending.lock().unwrap().by_ref().for_each(drop);
+                            return Err(e);
+                        }
                     }
-                }
+                })
             })
-        }).collect();
+            .collect();
         for job in jobs {
             job.join().map_err(|_| "layer download panicked")??;
         }
@@ -397,7 +406,11 @@ mod tests {
         let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let registry = Registry::new(Reference::parse(&format!("{}/test", server.local_addr().unwrap())).unwrap());
         std::thread::spawn(move || server.incoming().for_each(drop));
-        let layer = Layer { src: Blob::Cached { blobs: dir.to_path_buf(), registry: Box::new(registry), digest: digest.clone(), size: 4 }, digest: Some(digest), size: Some(4) };
+        let layer = Layer {
+            src: Blob::Cached { blobs: dir.to_path_buf(), registry: Box::new(registry), digest: digest.clone(), size: 4 },
+            digest: Some(digest),
+            size: Some(4),
+        };
         let read = |layer: &Layer| {
             let mut r = layer.open()?;
             let mut data = String::new();
@@ -433,7 +446,8 @@ mod tests {
             assert!(downloaded.lock().unwrap().insert(d.to_string(), size).is_none());
             active.fetch_sub(1, Ordering::SeqCst);
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(peak.load(Ordering::SeqCst), 4);
         assert_eq!(*downloaded.lock().unwrap(), descs.into_iter().map(|(d, size, _)| (d, size)).collect());
     }
@@ -447,13 +461,17 @@ mod tests {
         let err = download_layers(&descs, |d, _, _| {
             started.fetch_add(1, Ordering::SeqCst);
             barrier.wait();
-            if d == "l9" { bail!("failed download"); }
+            if d == "l9" {
+                bail!("failed download");
+            }
             std::thread::sleep(std::time::Duration::from_millis(50));
             Ok(())
-        }).unwrap_err();
+        })
+        .unwrap_err();
         assert!(err.to_string().contains("failed download"));
         assert_eq!(started.load(Ordering::SeqCst), 4);
-        let err = download_layers(&[("a".to_string(), 1, ()), ("a".to_string(), 2, ())], |_, _, _| panic!("invalid descriptors must not download")).unwrap_err();
+        let err =
+            download_layers(&[("a".to_string(), 1, ()), ("a".to_string(), 2, ())], |_, _, _| panic!("invalid descriptors must not download")).unwrap_err();
         assert!(err.to_string().contains("conflicting sizes"));
     }
 }

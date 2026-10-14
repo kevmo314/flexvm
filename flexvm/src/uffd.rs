@@ -51,15 +51,15 @@ mod fetch;
 mod pages;
 mod pull;
 mod server;
-mod wp;
 #[cfg(test)]
 mod tests;
+mod wp;
 
-use fetch::{Lane, Link};
 pub use event::FaultStats;
 pub use fetch::{probe, PageClient};
-pub use pages::{Pages, BASE, DISCARDED, INFLIGHT, PRESENT, REMOTE, ZERO};
+use fetch::{Lane, Link};
 pub(crate) use pages::zeroed_atomics;
+pub use pages::{Pages, BASE, DISCARDED, INFLIGHT, PRESENT, REMOTE, ZERO};
 pub use server::serve_pages;
 pub use wp::Frozen;
 
@@ -489,7 +489,8 @@ impl Pager {
             let a = pages.next_in(PRESENT, p, pages.len());
             p = pages.next_not(PRESENT, a, pages.len());
             (a < p).then_some((a as u64, (p - a) as u64))
-        }).collect()
+        })
+        .collect()
     }
 
     /// Installs REMOTE pages whose contents came along with the vmstate (one `PAGE_SIZE` slice of `data` per page of
@@ -736,7 +737,10 @@ impl Pager {
 
     /// Why the pager gave up, if it did. The VM cannot make progress then.
     pub fn failed(&self) -> Option<&str> {
-        self.failed.get().map(|s| match s { PagerFailure::Gone => "firecracker unmapped guest memory", PagerFailure::Lost(why) => why.as_str() })
+        self.failed.get().map(|s| match s {
+            PagerFailure::Gone => "firecracker unmapped guest memory",
+            PagerFailure::Lost(why) => why.as_str(),
+        })
     }
 
     /// REMOVE events applied so far (balloon and virtio-mem discards).

@@ -6,16 +6,21 @@
 //! (format 3) names a `parent` and adds TEMPLATE runs. Directories are staged root-only,
 //! fsynced and renamed into place, never over anything: complete or absent, never changed.
 
-use std::{ffi::{CStr, CString}, fs::File, io, os::fd::{FromRawFd, OwnedFd, RawFd}};
 use crate::bail;
+use std::{
+    ffi::{CStr, CString},
+    fs::File,
+    io,
+    os::fd::{FromRawFd, OwnedFd, RawFd},
+};
 
 macro_rules! ensure {
     ($ok:expr, $($why:tt)*) => { if !$ok { crate::bail!($($why)*) } };
 }
+mod chain;
 mod format;
 mod staging;
 mod write;
-mod chain;
 
 pub use chain::{chain_ids, chain_meta_budget, parent_path, Checkpoint, PageFile, MAX_CHAIN};
 pub use format::{Canon, FileSum, Manifest, Parent, FORMAT, FORMAT_INCREMENTAL};
