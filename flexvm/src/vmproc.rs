@@ -260,8 +260,8 @@ impl Proc {
     }
 
     /// A start that did not happen gives its admission back.
+    /// A hold is left to `finish`, which drops it once the VM is killed.
     pub fn refund_start(&self) {
-        self.release_hold();
         let id = self.charged.swap(0, Ordering::SeqCst);
         self.granted.store(0, Ordering::SeqCst);
         if id > 0 {
