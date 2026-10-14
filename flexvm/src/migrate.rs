@@ -518,9 +518,7 @@ impl Proc {
         let ip: Ipv4Addr = req["ip"].as_str().ok_or("missing ip")?.parse()?;
         *self.arrived.lock().unwrap() = Some(self.host.mig_begin(mig, &source.addr, by, Some(ip))?);
         let need = req["rss_mib"].as_u64().unwrap_or(0);
-        if !self.host.admit(need) {
-            bail!("not enough memory here for {need} MiB above the {} MiB reserve", self.host.cfg.reserve_mib);
-        }
+        self.admit_start(need)?;
         let tpl = Template::open_id(&self.paths, req["template"].as_str().ok_or("missing template")?, req["id"].as_str().ok_or("missing template id")?)?;
         t.mark("template");
         let claim = self.host.claim_incoming(&self.host.lock()?, &name, ip, req["gen"].as_u64().unwrap_or(0))?;

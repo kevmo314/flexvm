@@ -274,6 +274,8 @@ fn claim(p: &Arc<Proc>, req: &Value) -> std::result::Result<Value, (Error, bool)
         None => None,
     };
     let mut t = Phases::new();
+    let held = p.standby.lock().unwrap().as_ref().and_then(|s| crate::util::proc_kb(&format!("/proc/{}/status", s.firecracker().pid()), "VmRSS"));
+    p.admit_start(held.unwrap_or(0) >> 20).map_err(|e| (e, true))?;
     let lock = host.take_name(name, false).map_err(|e| (e, false))?;
     let claim = host.lock().and_then(|l| host.claim_new(&l, name, want)).map_err(|e| (e, false))?;
     t.mark("claim_ip");

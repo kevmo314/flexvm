@@ -148,16 +148,20 @@ parsed is an error, never a free address.
   restore's or SIGTSTP'd VM's SIGCONT, an arrival's commit) its generation is
   checked again under the host lock, held until the vCPUs run.
 
-**Admission** (`reserve_mib`): growth and incoming migrations are admitted
-under the host lock against MemAvailable minus the reserve and the grants of
-the last 10 s (`RUN/grants`); standby refills stop under it.
+**Admission** (`reserve_mib`): every start (run, restore, resume, standby
+claim, arrival: what the VM brings or pages in, and a step), growth and
+incoming migrations are admitted under the host lock against MemAvailable
+minus the reserve and the grants of the last 10 s (`RUN/grants`); a start
+refused fails before it loads anything. Standby refills stop under it.
 
 **Memory marks** (`limit.rs`): each VM's Firecracker cgroup has a
 `memory.high` at the memory admitted for it plus Firecracker's overhead
-(64 MiB + 1/64). It starts at what the VM holds or still pages in (an
-arrival's or restore's remote pages too) plus a step, and is raised a step
+(64 MiB + 1/64). It starts at what the start was admitted, never below what
+the VM holds or still pages in, and is raised a step
 (a quarter, 256 MiB to 2 GiB) when the cgroup's usage comes within half a
-step of it (its `high` events, or each second), each step admitted first;
+step of it (its `high` events, or each second), each step admitted first
+(the mark's lock is never held across admission, whose host lock a
+migration's rollback holds while it restores the mark);
 never past the guest's size, raised before a grow's PATCH by what the grow
 was charged, lowered only once a shrink settles and never below what is in
 use. Refused, the VM is throttled at its mark (the kernel slows its vCPUs;

@@ -92,6 +92,8 @@ pub struct Proc {
     pub consumed: Mutex<Option<PathBuf>>,
     pub pending_route: Mutex<Option<Ipv4Addr>>,
     pub files: Mutex<Vec<PathBuf>>,
+    /// What the VM's start was admitted against the reserve (MiB): its first memory mark.
+    granted: AtomicU64,
     serving: AtomicBool,
     me: std::sync::Weak<Proc>,
 }
@@ -131,6 +133,7 @@ impl Proc {
             consumed: Mutex::new(None),
             pending_route: Mutex::new(None),
             files: Mutex::new(Vec::new()),
+            granted: AtomicU64::new(0),
             serving: AtomicBool::new(false),
             me: me.clone(),
         }))
@@ -141,7 +144,7 @@ impl Proc {
     }
 
     pub fn set_vm(&self, vm: Arc<Vm>) {
-        vm.start_limit();
+        vm.start_limit(self.granted.load(Ordering::SeqCst));
         let _ = self.vm.set(vm);
     }
 
@@ -152,6 +155,17 @@ impl Proc {
     pub fn set_name(&self, n: NameLock) {
         crate::util::output::fall_back_to(self.host.vms(&n.name, "log"));
         *self.name.lock().unwrap() = Some(n);
+    }
+
+    /// Every start, before it loads: what the VM brings (`need` MiB, held or
+    /// to page in) and a step, against the host's reserve.
+    pub fn admit_start(&self, need: u64) -> Result<()> {
+        let mib = crate::limit::allowance(need);
+        if !self.host.admit(mib) {
+            bail!("not enough memory here for {mib} MiB above the {} MiB reserve", self.host.cfg.reserve_mib);
+        }
+        self.granted.store(mib, Ordering::SeqCst);
+        Ok(())
     }
 
     pub fn set_addr(&self, a: AddrClaim) -> Ipv4Addr {
@@ -428,6 +442,7 @@ impl Proc {
         let ip = self.set_addr(claim);
         t.mark("claim_ip");
         crate::host::stall("start_stall");
+        self.admit_start(0)?;
         let prepared = Vm::prepare(self.spawner.take(None)?, tpl.clone(), &mut t)?;
         let learn = crate::standby::load_set(&self.host, &tpl).is_empty();
         if learn {
@@ -1021,7 +1036,7 @@ fn resize(vm: &Vm, host: &Host, hint: Option<u64>, grow_only: bool) -> Result<Re
         let why = if plan.settle { "stalled" } else if hint.is_some() { "guest asked" } else { "tick" };
         eprintln!("vm {}: available {avail} MiB, hotplug {requested} (plugged {plugged}) -> {new} MiB ({why})", vm.name);
         if new > requested {
-            vm.limit.plug(meta.mem_mib + new, plan.charge);
+            vm.limit.plug(meta.mem_mib + new, if refused { 0 } else { plan.charge });
         }
         vm.fc(|fc| fc.patch("/hotplug/memory", json!({"requested_size_mib": new})))?;
         *last = Instant::now();

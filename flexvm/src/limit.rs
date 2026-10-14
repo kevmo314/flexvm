@@ -11,6 +11,10 @@
 //! the VM process, whose own cgroup the kernel throttles them by, so a pull
 //! or a checkpoint's copy never waits on this mark. Firecracker's own threads
 //! do: a migration or checkpoint lifts the mark while it pauses the VM.
+//!
+//! Starts are admitted here too (`allowance`): what the VM brings or pages
+//! in, and a step. `mark` is a leaf lock, never held across admission (the
+//! host lock), which callers may hold around `restore`.
 
 use std::io::{Read, Seek};
 use std::os::fd::AsRawFd;
@@ -29,6 +33,11 @@ const THROTTLE_MAX: Duration = Duration::from_millis(2500);
 /// top of the guest's.
 fn overhead(mib: u64) -> u64 {
     64 + mib / 64
+}
+
+/// What a VM starting with `need` MiB in it, or still to page in, is admitted.
+pub fn allowance(need: u64) -> u64 {
+    need + step(need)
 }
 
 /// How much more is admitted at a time: a quarter of what the VM has, 256 MiB to 2 GiB.
@@ -79,10 +88,10 @@ impl Limit {
         }
     }
 
-    /// Once the VM runs here: what it holds or still pages in (`need`, MiB)
-    /// and a step more, up to the guest's size. The cgroup may still be
-    /// being made (`Spawner::take`).
-    pub fn start(&self, need: u64, cap: u64) {
+    /// Once the VM runs here: what its start was admitted (`granted`, MiB),
+    /// never less than it holds or still pages in (`need`), and up to the
+    /// guest's size otherwise. The cgroup may still be being made (`Spawner::take`).
+    pub fn start(&self, granted: u64, need: u64, cap: u64) {
         let Some(cg) = &self.cgroup else { return };
         let made = Instant::now();
         while !cg.join("memory.high").exists() && made.elapsed() < Duration::from_secs(2) {
@@ -91,7 +100,7 @@ impl Limit {
         let need = need.max(self.used().unwrap_or(0));
         let mut m = self.mark.lock().unwrap();
         m.cap = cap;
-        m.admitted = (need + step(need)).min(cap).max(need);
+        m.admitted = granted.min(cap).max(need);
         self.write(&m);
     }
 
@@ -99,19 +108,24 @@ impl Limit {
     /// False if the host refused (the VM stays throttled).
     pub fn grow(&self, host: &Host) -> bool {
         let Some(used) = self.used() else { return true };
-        let mut m = self.mark.lock().unwrap();
-        let s = step(m.admitted);
-        if m.admitted == 0 || m.admitted >= m.cap || used + s / 2 < m.admitted + overhead(m.admitted) {
-            self.throttled.store(false, Ordering::SeqCst);
-            return true;
-        }
-        let new = (m.admitted + s).min(m.cap);
-        if !host.admit(new - m.admitted) {
+        let more = {
+            let m = self.mark.lock().unwrap();
+            let s = step(m.admitted);
+            match m.admitted == 0 || m.admitted >= m.cap || used + s / 2 < m.admitted + overhead(m.admitted) {
+                true => 0,
+                false => (m.admitted + s).min(m.cap) - m.admitted,
+            }
+        };
+        // Admitted without `mark` held; another raise meanwhile only adds to it.
+        if more > 0 && !host.admit(more) {
             self.throttled.store(true, Ordering::SeqCst);
             return false;
         }
-        m.admitted = new;
-        self.write(&m);
+        if more > 0 {
+            let mut m = self.mark.lock().unwrap();
+            m.admitted = (m.admitted + more).min(m.cap.max(m.admitted));
+            self.write(&m);
+        }
         self.throttled.store(false, Ordering::SeqCst);
         true
     }
@@ -230,7 +244,7 @@ mod tests {
         let (l, cg, mut host) = cgroup("follow");
         set(&cg, 20);
         // What it holds and still pages in, and a step.
-        l.start(100, 1000);
+        l.start(allowance(100), 100, 1000);
         assert_eq!((l.admitted(), high(&cg)), (100 + 256, Some(356 + overhead(356))));
         // Far from the mark: nothing; near it, a step more.
         assert!(l.grow(&host) && l.admitted() == 356);
@@ -258,6 +272,31 @@ mod tests {
         assert_eq!(high(&cg), None);
         drop(lifted);
         assert_eq!(high(&cg), Some(l.admitted() + overhead(l.admitted())));
+    }
+
+    /// A migration's rollback holds the host lock while it resumes the VM
+    /// (`restore`); the watcher admitting meanwhile must not hold `mark`.
+    #[test]
+    fn admission_never_holds_the_mark() {
+        let (l, cg, host) = cgroup("order");
+        l.start(512, 100, 5000);
+        set(&cg, 512 + overhead(512));
+        let held = host.lock().unwrap();
+        let (l, host) = (&l, &host);
+        std::thread::scope(|sc| {
+            let grower = sc.spawn(|| l.grow(host));
+            std::thread::sleep(Duration::from_millis(100));
+            let (tx, rx) = std::sync::mpsc::channel();
+            sc.spawn(move || {
+                let lifted = l.lift(None);
+                drop(lifted);
+                let _ = tx.send(());
+            });
+            assert!(rx.recv_timeout(Duration::from_secs(5)).is_ok(), "restore waited for admission");
+            drop(held);
+            assert!(grower.join().unwrap());
+        });
+        assert_eq!(l.admitted(), 512 + step(512));
     }
 
     #[test]

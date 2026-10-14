@@ -122,12 +122,13 @@ impl Vm {
         self.starved.load(Ordering::SeqCst) || self.limit.throttled.load(Ordering::SeqCst)
     }
 
-    /// Sets its memory mark once it runs here: what it holds and still pages in, and a step.
-    pub fn start_limit(&self) {
+    /// Sets its memory mark once it runs here: what its start was admitted
+    /// (`granted`), never less than it holds and still pages in.
+    pub fn start_limit(&self, granted: u64) {
         let [_, present, _, remote, inflight, discarded] = self.pager.census();
         let need = ((present + remote + inflight + discarded) * PAGE_SIZE) as u64 >> 20;
         let cap = self.template.meta.mem_mib + self.hotplug_plugged().unwrap_or(self.template.meta.max_mib - self.template.meta.mem_mib);
-        self.limit.start(need, cap);
+        self.limit.start(granted, need, cap);
     }
 
     pub fn mem_sock(&self) -> PathBuf {

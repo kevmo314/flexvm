@@ -2706,6 +2706,44 @@ def mem_high_evict():
     cleanup(n)
 
 
+def start_admission():
+    """Concurrent starts are admitted against the reserve, each with what it
+    brings and a step, so together they cannot take the host below it: with
+    room for three steps, at most three of eight start, the rest are refused
+    saying why, and a restore is refused the same way."""
+    n, path = "ft-admit", ckpt_path("ft-admit")
+    setup(n, mib=1)
+    ok(checkpoint(A, n, path))
+    cleanup(n)
+    cfg = os.path.join(A.state, "host.json")
+    saved = open(cfg).read()
+    names = [f"ft-admit-{i}" for i in range(8)]
+    res = {}
+    try:
+        time.sleep(11)  # earlier grants age out
+        c = json.loads(saved)
+        c["reserve_mib"] = mem_available() - 3 * 256 - 128
+        with open(cfg, "w") as f:
+            json.dump(c, f)
+        threads = [threading.Thread(target=lambda i=i: res.update({i: run(A, i)})) for i in names]
+        [t.start() for t in threads]
+        [t.join() for t in threads]
+        started = [i for i in names if res[i]["ok"]]
+        refused = [i for i in names if not res[i]["ok"]]
+        check("start admission: at most three start", 1 <= len(started) <= 3, (started, [res[i].get("error") for i in refused][:2]))
+        check("start admission: the others are refused for the reserve",
+              all("above the" in res[i]["error"] and "reserve" in res[i]["error"] for i in refused), [res[i]["error"] for i in refused])
+        check("start admission: each started at its allowance", all(vms(A)[i]["admitted_mib"] >= 256 for i in started), started)
+        r = restore(A, path, name="ft-admit-r", ip="auto")
+        check("start admission: a restore is refused too", not r["ok"] and "reserve" in r["error"], r)
+    finally:
+        with open(cfg, "w") as f:
+            f.write(saved)
+        for i in names + ["ft-admit-r"]:
+            kill(A, i)
+        rm_ckpt(path)
+
+
 def kill_source():
     """A migration's paused source copy cannot be killed (the target still
     pulls from it and releases it); the VM lives on at the target."""
@@ -3523,7 +3561,7 @@ SCENARIOS = dict(
     pull_died=pull_died,
     uffd_err=uffd_err,
     mem_high=no_evict(skippable(mem_high)), mem_high_migrate=no_evict(skippable(mem_high_migrate)),
-    mem_high_evict=skippable(mem_high_evict),
+    mem_high_evict=skippable(mem_high_evict), start_admission=start_admission,
     cow_grow=no_evict(cow_grow), plug_race=no_evict(plug_race), shrink_stall=no_evict(shrink_stall), plug_storm=no_evict(plug_storm),
     basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, refused=refused, pages_blip=pages_blip,
     pages_dead_restore=pages_dead_restore, pages_dead=pages_dead, resume_kill=resume_kill, prepared_retry=prepared_retry,
