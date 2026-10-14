@@ -170,6 +170,7 @@ impl Pager {
                 let removing = pages.removing();
                 let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
                 let learning = self.prefetch.lock().unwrap().learning();
+                let mut resolved = 0;
                 for msg in buf[..n.max(0) as usize].chunks_exact(32) {
                     let a = u64::from_ne_bytes(msg[8..16].try_into().unwrap());
                     let b = u64::from_ne_bytes(msg[16..24].try_into().unwrap());
@@ -180,12 +181,13 @@ impl Pager {
                             }
                             pending.push_back(Pending { addr: b, flags: a, read: Instant::now(), kind: None, parked: false, since: None })
                         }
-                        UFFD_EVENT_REMOVE => self.discard(&removing, a, b),
+                        UFFD_EVENT_REMOVE => resolved += self.discard(&removing, a, b),
                         _ => {}
                     }
                 }
                 drop(removing);
                 pages.events_read();
+                self.pulled(resolved);
             }
             // Before the faults look at page states: an installer that settles a page after that sees it set, and wakes
             // this thread.
@@ -195,7 +197,7 @@ impl Pager {
             for _ in 0..pending.len() {
                 let mut p = pending.pop_front().unwrap();
                 let page = self.page_of(p.addr).map(|(page, _)| page);
-                match self.fault(p.addr, p.flags) {
+                match self.fault(p.addr, p.flags, p.kind.is_some()) {
                     Ok(Served::Done(kind)) => {
                         // A fault that waited was resolved by the copy that woke its thread.
                         let woke = page.filter(|_| p.kind.is_some()).and_then(|page| pages.unpark(page, p.read));
@@ -243,7 +245,7 @@ impl Pager {
         Some((((addr - m.base_host_virt_addr + m.offset) as usize) / PAGE_SIZE, m))
     }
 
-    fn discard(&self, removing: &RwLockWriteGuard<'_, ()>, start: u64, end: u64) {
+    fn discard(&self, removing: &RwLockWriteGuard<'_, ()>, start: u64, end: u64) -> usize {
         self.discards.fetch_add(1, Ordering::SeqCst);
         let cow = self.cow();
         let mut resolved = 0;
@@ -255,12 +257,12 @@ impl Pager {
                 resolved += self.pages().discard(removing, p) as usize;
             }
         }
-        self.pulled(resolved);
+        resolved
     }
 
     /// Serves a fault, without waiting for the network or disk: a REMOTE page's run goes to a fetcher (`fetch_faults`),
     /// and the fault waits.
-    fn fault(&self, addr: u64, flags: u64) -> io::Result<Served> {
+    fn fault(&self, addr: u64, flags: u64, waiting: bool) -> io::Result<Served> {
         let Some((page, m)) = self.page_of(addr) else {
             return Err(io::Error::other("fault outside guest memory"));
         };
@@ -274,6 +276,8 @@ impl Pager {
         let region_left = (m.span().1 - page).min(chunk - (page - m.span().0) % chunk);
         let pages = self.pages();
         match pages.get(page) {
+            // Its install already woke this fault; a REMOVE since then would have made it ZERO.
+            PRESENT if waiting => Ok(Served::Done(LOCAL)),
             // Normally a fault that raced the install; if the page is really missing, a REMOVE zapped it after it
             // settled (see `Pages`). Missing at a checkpoint's pause too, so zero then: if the copy has yet to save it,
             // keep it protected until it has.
