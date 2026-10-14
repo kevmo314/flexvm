@@ -207,7 +207,7 @@ class Host:
         """SIGCONT for a paused VM; `flexvm resume` for a suspended one."""
         if self.ls().get(vm, {}).get("state") == "suspended":
             r = json.loads(self.cli("resume", vm, "-d").stdout)
-            self.pids.add((r["pid"], r["start"]))
+            self.pid(vm)
             return r
         t = time.time()
         os.kill(self.pid(vm), signal.SIGCONT)
@@ -235,7 +235,7 @@ class Host:
         extra = (["--name", name] if name else []) + (["--ip", ip] if ip else [])
         r = json.loads(self.cli("restore", path, *extra, "-d").stdout)
         self.vms.add(r["name"])
-        self.pids.add((r["pid"], r["start"]))
+        self.pid(r["name"])
         return r
 
     def migrate(self, vm, to):
