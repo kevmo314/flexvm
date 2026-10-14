@@ -406,7 +406,7 @@ fn queued_requests_are_pipelined_and_resent_after_a_reconnect() {
     let source = Source { addr: fake_source(2, tx), vm: "v".into(), mig: 1, regions: Vec::new() };
     let (lane, stop) = (Lane::default(), AtomicBool::new(false));
     let mut link = Link::new(source);
-    link.fetch_queued(&lane, 0, &mut [], &stop, &mut |_| true).unwrap();
+    link.fetch_with(Some(&lane), 0, &mut [], &stop, &mut |_| true).unwrap();
     // Written as they are queued, before the fetcher reads any reply.
     for job in [(3, 2), (7, 1), (10, 3)] {
         lane.push((job.0, job.1, Instant::now()));
@@ -414,7 +414,7 @@ fn queued_requests_are_pipelined_and_resent_after_a_reconnect() {
     assert_eq!(lane.q.lock().unwrap().sent, 3);
     for (first, n) in [(3usize, 2usize), (7, 1), (10, 3)] {
         let mut buf = vec![0u8; n * PAGE_SIZE];
-        link.fetch_queued(&lane, (first * PAGE_SIZE) as u64, &mut buf, &stop, &mut |_| true).unwrap();
+        link.fetch_with(Some(&lane), (first * PAGE_SIZE) as u64, &mut buf, &stop, &mut |_| true).unwrap();
         assert!(buf.chunks(PAGE_SIZE).enumerate().all(|(i, p)| p.iter().all(|&b| b as usize == first + i)), "run {first}+{n}");
         lane.pop();
     }
@@ -483,7 +483,7 @@ fn a_slow_source_that_keeps_delivering_is_not_lost() {
     let p = pages(&[REMOTE; 32]);
     p.claim(0, n, REMOTE, |_| true);
     let mut link = Link::new(Source { addr, vm: "v".into(), mig: 1, regions: Vec::new() });
-    let mut fetch = |off: u64, buf: &mut [u8], stop: &AtomicBool, progress: &mut dyn FnMut(&[u8]) -> bool| link.fetch(off, buf, stop, progress);
+    let mut fetch = |off: u64, buf: &mut [u8], stop: &AtomicBool, progress: &mut dyn FnMut(&[u8]) -> bool| link.fetch_with(None, off, buf, stop, progress);
     let stop = AtomicBool::new(false);
     let mut got = vec![0u8; n];
     let (resolved, res) = p.fetch_install(0, n, &mut vec![0u8; n * PAGE_SIZE], &mut fetch, &stop, &mut |e| partial(e), |pg, c, src| {

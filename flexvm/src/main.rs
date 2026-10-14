@@ -342,9 +342,9 @@ fn configure(c: &mut host::Config, args: &Args, addr: Option<&str>) -> Result<()
     if let Some(d) = args.get("dns") {
         c.dns = (!d.is_empty()).then(|| d.parse::<std::net::IpAddr>().map(|_| d.into())).transpose().map_err(|_| format!("bad --dns {d:?}"))?;
     }
-    c.reserve_mib = args.parse_or::<u64>("reserve", c.reserve_mib)?;
+    c.reserve_mib = args.parse_or("reserve", c.reserve_mib)?;
     if args.has("evict-at") {
-        c.evict_mib = Some(args.parse_or::<u64>("evict-at", 0)?);
+        c.evict_mib = Some(args.parse_or("evict-at", 0)?);
     }
     if let Some(p) = args.get("prefix") {
         host::check_prefix(p).map_err(|e| format!("--prefix: {e}"))?;
@@ -514,9 +514,8 @@ fn build_template(args: &Args, name: &str) -> Result<()> {
             Ok::<_, util::Error>(meta)
         })
         .transpose()?;
-    let max = args.parse_or::<u64>("max", proc_kb("/proc/meminfo", "MemTotal").unwrap_or(0) >> 20)?;
-    let (cpus, mem, plug) =
-        (args.parse_or::<u64>("vcpus", cpus)? as u32, args.parse_or::<u64>("mem", template::base_mib(max))?, args.parse_or::<u64>("plug", template::PLUG_MIB)?);
+    let max = args.parse_or("max", proc_kb("/proc/meminfo", "MemTotal").unwrap_or(0) >> 20)?;
+    let (cpus, mem, plug) = (args.parse_or("vcpus", cpus)? as u32, args.parse_or("mem", template::base_mib(max))?, args.parse_or("plug", template::PLUG_MIB)?);
     // Named and made under the host lock, so a prefix change sees it (`Host::prefix_in_use`).
     let host = open_host(args)?;
     let me = host::Ident::me();
@@ -558,13 +557,13 @@ fn image_options(args: &Args) -> Result<Option<image::Options>> {
         user: args.get("user").map(String::from),
         warm,
         ready,
-        ready_timeout: Duration::from_secs(args.parse_or::<u64>("ready-timeout", 120)?),
+        ready_timeout: Duration::from_secs(args.parse_or("ready-timeout", 120)?),
         staging: args.get("image-staging").unwrap_or(image::STAGING).into(),
         limits: image::Limits {
-            download: args.parse_or::<u64>("max-download-mib", d.download >> 20)? << 20,
-            unpacked: args.parse_or::<u64>("max-unpacked-mib", d.unpacked >> 20)? << 20,
-            file: args.parse_or::<u64>("max-file-mib", d.file >> 20)? << 20,
-            entries: args.parse_or::<u64>("max-entries", d.entries)?,
+            download: args.parse_or("max-download-mib", d.download >> 20)? << 20,
+            unpacked: args.parse_or("max-unpacked-mib", d.unpacked >> 20)? << 20,
+            file: args.parse_or("max-file-mib", d.file >> 20)? << 20,
+            entries: args.parse_or("max-entries", d.entries)?,
         },
     }))
 }

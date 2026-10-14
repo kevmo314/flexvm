@@ -2,6 +2,7 @@ use std::io::{self, BufRead, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -10,6 +11,21 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[macro_export]
 macro_rules! bail {
     ($($arg:tt)*) => { return Err(format!($($arg)*).into()) };
+}
+
+/// One bounded counter slot, released on drop.
+pub struct Slot(&'static AtomicUsize);
+
+impl Slot {
+    pub fn take(count: &'static AtomicUsize, max: usize) -> Option<Self> {
+        count.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n < max).then_some(n + 1)).ok().map(|_| Self(count))
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 pub const PAGE_SIZE: usize = 4096;

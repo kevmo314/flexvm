@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use crate::bail;
-use crate::util::{eintr, By, Result};
+use crate::util::{eintr, By, Result, Slot};
 
 /// Bytes held per address; packets beyond it are dropped.
 pub const CAP: usize = 4 << 20;
@@ -467,22 +467,7 @@ pub fn receive(
     deadline: Instant,
     take_over: &mut dyn FnMut(),
 ) -> Option<u64> {
-    if RECEIVERS.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n < MAX_RECEIVERS).then_some(n + 1)).is_ok() {
-        let reported = receive_counted(r, ip, tap, revoked, deadline, take_over);
-        RECEIVERS.fetch_sub(1, Ordering::SeqCst);
-        return reported;
-    }
-    None
-}
-
-fn receive_counted(
-    r: &mut BufReader<By<TcpStream>>,
-    ip: Ipv4Addr,
-    tap: &str,
-    revoked: &Mutex<bool>,
-    deadline: Instant,
-    take_over: &mut dyn FnMut(),
-) -> Option<u64> {
+    let _slot = Slot::take(&RECEIVERS, MAX_RECEIVERS)?;
     let (Ok(conn), Ok(inj)) = (r.get_ref().s.try_clone(), Injector::new(tap)) else { return None };
     if write_by(&conn, &[&b"a"[..], &0u64.to_be_bytes()].concat(), deadline).is_err() {
         return None;
