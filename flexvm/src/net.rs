@@ -145,7 +145,7 @@ pub fn is_local_addr(ip: Ipv4Addr) -> Result<bool> {
     // At most a second old: listen checks one per route it installs.
     static LOCAL: std::sync::Mutex<(Option<std::time::Instant>, Vec<Ipv4Addr>)> = std::sync::Mutex::new((None, Vec::new()));
     let mut local = LOCAL.lock().unwrap();
-    if !local.0.is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(1)) {
+    if local.0.is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(1)) {
         let mut addrs = std::ptr::null_mut();
         if unsafe { libc::getifaddrs(&mut addrs) } != 0 {
             bail!("getifaddrs: {}", std::io::Error::last_os_error());
