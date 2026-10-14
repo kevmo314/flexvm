@@ -15,6 +15,10 @@ use crate::template::{Template, BALLOON_STATS_S};
 use crate::uffd::{Origin, Pager, Runs};
 use crate::util::{Phases, Result, PAGE_SIZE};
 
+/// How long a VM about to be paused gets to take what is queued on its tap (`Vm::drain_tap`).
+/// It runs meanwhile; only what reaches its held address waits.
+const TAP_DRAIN_WAIT: Duration = Duration::from_millis(500);
+
 const PULL_WAIT: Duration = Duration::from_secs(30);
 /// A clock request slower than this may have left the guest that far behind.
 pub const CLOCK_RTT: Duration = Duration::from_millis(5);
@@ -207,8 +211,9 @@ impl Vm {
 
     /// Saves device and vCPU state and returns page states matching it. Paused vCPUs do not
     /// stop devices writing memory, so execs close, `unroute` holds packets and the tap goes
-    /// down. `resume` undoes this; a target calls `restore_devices`.
-    pub fn save_state(&self, vmstate: &Path, sync: bool, park: bool, unroute: impl FnOnce(), t: &mut Phases) -> Result<Runs> {
+    /// down. `resume` undoes this; a target calls `restore_devices`. Once `unroute` says the
+    /// address is held, the guest takes what is still queued on its tap before the pause.
+    pub fn save_state(&self, vmstate: &Path, sync: bool, park: bool, unroute: impl FnOnce() -> bool, t: &mut Phases) -> Result<Runs> {
         // No huge-page collapse in flight or starting during the pause (`resume` lets it go on).
         self.pager.hold_collapse(true);
         if park {
@@ -218,8 +223,22 @@ impl Vm {
         for (_, s) in self.execs.lock().unwrap().drain() {
             let _ = s.shutdown(Shutdown::Both);
         }
-        unroute();
+        if crate::host::fault("tap_backlog") {
+            // Frames pile up on the tap while Firecracker is stopped (more than the guest has
+            // buffers for), so the pause comes with a queue on it.
+            if let Some(pid) = self.pid() {
+                eprintln!("vm {}: injected fault: stopping firecracker for 200 ms before holding its address", self.name);
+                unsafe { libc::kill(pid as libc::pid_t, libc::SIGSTOP) };
+                std::thread::sleep(Duration::from_millis(200));
+                unsafe { libc::kill(pid as libc::pid_t, libc::SIGCONT) };
+            }
+        }
+        let held = unroute();
         t.mark("hold");
+        if held {
+            self.drain_tap();
+            t.mark("drain_tap");
+        }
         // Even if paused: only an API pause freezes device emulation.
         self.fc(|fc| fc.pause())?;
         t.mark("pause");
@@ -238,6 +257,20 @@ impl Vm {
         let runs = self.pager.quiesce_export()?;
         t.mark("export_runs");
         Ok(runs)
+    }
+
+    /// With its address held nothing new reaches the tap, so this ends unless the guest stops
+    /// taking frames (`net::drain_tap`); what it has not taken by the pause is lost if it leaves.
+    fn drain_tap(&self) {
+        let Some(pid) = self.pid() else { return };
+        let start = Instant::now();
+        match crate::net::drain_tap(pid, &self.tap, TAP_DRAIN_WAIT) {
+            Ok(true) => {}
+            Ok(false) => {
+                eprintln!("vm {}: frames still queued on its tap {} ms after its address was held; pausing it anyway", self.name, start.elapsed().as_millis())
+            }
+            Err(e) => eprintln!("vm {}: not waiting for its tap's queue before the pause: {e}", self.name),
+        }
     }
 
     /// Its write must precede the snapshot.

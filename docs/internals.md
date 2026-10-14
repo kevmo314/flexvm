@@ -453,6 +453,17 @@ through, so the checkpoint is exactly the memory at the pause.
   reports them as `held_packets`. A 1 kHz UDP stream through 6 checkpoints
   lost 59 datagrams (7–11 per pause) before, none now
   (`scripts/faults.py ckpt_packet_hold`).
+- **The tap's queue is taken before the pause.** Frames already routed to
+  the tap wait in tun's ring until the guest posts rx buffers, and paused
+  vCPUs post none, so whatever is queued there at the pause dies with the
+  tap when the VM leaves (a migration, `checkpoint --stop`, a suspend),
+  uncounted. A guest slow to refill under load leaves hundreds (#136). Once
+  the address is held nothing new reaches the tap, so the VM process waits,
+  up to 500 ms, for the running guest to empty the ring before pausing it.
+  It watches the ring through a copy of Firecracker's tap descriptor
+  (`pidfd_getfd`, polled, never read). `scripts/faults.py same_host_backlog`
+  stops Firecracker for 200 ms before each migration's hold at 10k
+  datagrams/s: about 1,500 datagrams were lost per migration before, none now.
 - **No Firecracker change for write tracking.** The pager registers write-protect mode
   (`UFFDIO_REGISTER` with `MODE_MISSING|MODE_WP`) on Firecracker's existing
   userfaultfd and its ranges. Nothing has to be requested at `UFFDIO_API`

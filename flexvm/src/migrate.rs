@@ -96,10 +96,13 @@ impl Proc {
         }
         let mut t = Phases::new();
         let vmstate = vm.dir.join("vmstate.out");
-        let hold = || {
-            if let Some(Err(e)) = holder.as_ref().map(|h| h.hold(vm.ip, mig)) {
+        let hold = || match holder.as_ref().map(|h| h.hold(vm.ip, mig)) {
+            Some(Ok(())) => true,
+            Some(Err(e)) => {
                 eprintln!("vm {}: not holding packets during migration: {e}", vm.name);
+                false
             }
+            None => false,
         };
         let captured = (|| -> Result<_> {
             let runs = vm.save_state(&vmstate, false, false, hold, &mut t)?;
