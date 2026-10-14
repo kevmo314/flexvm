@@ -466,7 +466,11 @@ through, so the checkpoint is exactly the memory at the pause.
   stays queued: a VM that resumes (a keep-running checkpoint, an aborted
   migration) gets it from its Firecracker, and one that leaves has it read
   off before its tap is deleted and logged as dropped, so it is counted
-  (`ckpt_backlog` checks that a checkpoint loses none).
+  (`ckpt_backlog` keeps Firecracker stopped until the wait gives up and checks
+  that a checkpoint loses none). A tap whose queue is full drops frames
+  itself and counts them only in its `tx_dropped`, which goes with it: a VM
+  reports those beyond what was reported with injected held packets as
+  `tap_dropped` in its status and logs them when it leaves.
   `scripts/faults.py same_host_backlog` stops Firecracker for 200 ms at 10k
   datagrams/s and holds the address before it goes on, so every migration
   starts its pause with a queue: about 1,500 datagrams were lost per

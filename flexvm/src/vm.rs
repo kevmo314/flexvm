@@ -93,6 +93,8 @@ pub struct Vm {
     tap_watch: Mutex<Option<(u32, Arc<OwnedFd>)>>,
     /// Paused with frames still queued on its tap that its guest did not take (`drain_tap`).
     tap_stuck: AtomicBool,
+    /// The tap's drop count up to which its drops were reported (`tap_drops_reported`).
+    tap_drops_reported: AtomicU64,
     pub vsock: PathBuf,
     was_paused: AtomicBool,
     pub clock_pending: AtomicBool,
@@ -230,7 +232,9 @@ impl Vm {
         }
         // Before the hold: finding it can wait on RTNL (`net::tap_fd_of`).
         let watch = self.tap_watch();
-        let stopped = crate::host::fault("tap_backlog").then(|| self.pid()).flatten();
+        // `tap_backlog_stuck` keeps it stopped until the wait for the queue gave up too.
+        let stuck = crate::host::fault("tap_backlog_stuck");
+        let stopped = (stuck || crate::host::fault("tap_backlog")).then(|| self.pid()).flatten();
         if let Some(pid) = stopped {
             // Frames pile up on the tap while Firecracker is stopped, more than the guest has
             // buffers for, and the address is held before it goes on: a queue to take.
@@ -238,9 +242,14 @@ impl Vm {
             unsafe { libc::kill(pid as libc::pid_t, libc::SIGSTOP) };
             std::thread::sleep(Duration::from_millis(200));
         }
+        let go_on = || {
+            if let Some(pid) = stopped {
+                unsafe { libc::kill(pid as libc::pid_t, libc::SIGCONT) };
+            }
+        };
         let held = unroute();
-        if let Some(pid) = stopped {
-            unsafe { libc::kill(pid as libc::pid_t, libc::SIGCONT) };
+        if !stuck {
+            go_on();
         }
         t.mark("hold");
         if let (true, Some(fd)) = (held, watch) {
@@ -249,6 +258,9 @@ impl Vm {
             let emptied = self.drain_tap(&fd);
             self.tap_stuck.store(!emptied, Ordering::SeqCst);
             t.mark("drain_tap");
+        }
+        if stuck {
+            go_on();
         }
         // Even if paused: only an API pause freezes device emulation.
         self.fc(|fc| fc.pause())?;
@@ -317,6 +329,18 @@ impl Vm {
         true
     }
 
+    /// The tap's own count of what it dropped up to `through` was reported (with packets a
+    /// hold injected); `tap_dropped` counts from there.
+    pub fn tap_drops_reported(&self, through: u64) {
+        self.tap_drops_reported.fetch_max(through, Ordering::SeqCst);
+    }
+
+    /// Frames the tap dropped, its queue full, that were not reported with injected packets.
+    pub fn tap_dropped(&self) -> Option<u64> {
+        let n = std::fs::read_to_string(format!("/sys/class/net/{}/statistics/tx_dropped", self.tap)).ok()?.trim().parse::<u64>().ok()?;
+        Some(n.saturating_sub(self.tap_drops_reported.load(Ordering::SeqCst)))
+    }
+
     /// Its write must precede the snapshot.
     pub fn park_balloon(&self) -> Result<()> {
         self.fc(|fc| fc.patch("/balloon/statistics", json!({"stats_polling_interval_s": u16::MAX})).map(drop))
@@ -355,8 +379,6 @@ impl Vm {
     }
 
     pub fn resume(&self) -> Result<State> {
-        // Its Firecracker delivers what is still queued on the tap.
-        self.tap_stuck.store(false, Ordering::SeqCst);
         crate::net::set_link_up(&self.tap, true)?;
         // The link-down took the VM's /32 route with it.
         crate::net::attach(self.ip, &self.tap)?;
@@ -369,6 +391,8 @@ impl Vm {
         }
         // Out of the pause, but with the mark still lifted: Firecracker throttled at it could time this out.
         if resumed.is_ok() {
+            // Its Firecracker delivers what is still queued on the tap.
+            self.tap_stuck.store(false, Ordering::SeqCst);
             self.unpark_balloon();
         }
         self.limit.restore();
@@ -670,13 +694,17 @@ impl Vm {
         let Some(fc) = self.fc.lock().unwrap().take() else { return };
         // Before the tap goes (`fc::release`) with its counters: a full queue drops frames
         // (a guest not keeping up), counted only there.
-        let full = std::fs::read_to_string(format!("/sys/class/net/{}/statistics/tx_dropped", self.tap)).ok().and_then(|s| s.trim().parse::<u64>().ok());
-        if let Some(n) = full.filter(|&n| n > 0) {
+        if let Some(n) = self.tap_dropped().filter(|&n| n > 0) {
             eprintln!("vm {}: its tap dropped {n} frames with its queue full (its guest was not keeping up)", self.name);
         }
-        // Before the tap goes, which purges its queue; not keeping it after.
+        // Before the tap goes too, which purges its queue; not keeping it after.
         if let Some((_, fd)) = self.tap_watch.lock().unwrap().take() {
             if self.tap_stuck.swap(false, Ordering::SeqCst) {
+                // Gone (not reaped, so its pid is not reused), so no read of its races these.
+                let gone = crate::util::pidfd_open(fc.pid()).and_then(|p| crate::util::pidfd_wait(&p, Duration::from_secs(2)));
+                if !matches!(gone, Ok(true)) {
+                    eprintln!("vm {}: firecracker not seen gone ({gone:?}); counting what is left on its tap anyway", self.name);
+                }
                 let n = crate::net::discard_tap_queue(&fd);
                 eprintln!("vm {}: dropped {n} frames still queued on its tap when it left (its guest was not taking them)", self.name);
             }
@@ -708,6 +736,7 @@ impl Vm {
             "admitted_mib": self.limit.admitted(),
             "cgroup_mib": self.limit.used(),
             "throttled": self.limit.throttled.load(Ordering::SeqCst),
+            "tap_dropped": self.tap_dropped(),
             "requested_mib": hotplug["requested_size_mib"],
             "pages_mib": {"base": mib(base), "present": mib(present), "zero": mib(zero), "remote": mib(remote + inflight + discarded)},
             "checkpoint_copy": self.pager.copying(),
@@ -787,6 +816,7 @@ impl Prepared {
             fc: Mutex::new(Some(idle)),
             tap_watch: Mutex::new(None),
             tap_stuck: AtomicBool::new(false),
+            tap_drops_reported: AtomicU64::new(0),
             was_paused: AtomicBool::new(false),
             clock_pending: AtomicBool::new(false),
             pending_net: Mutex::new(None),
