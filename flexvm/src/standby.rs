@@ -1,7 +1,7 @@
 //! Standby VMs: `flexvm run --standby` processes holding a restored, settled,
 //! paused VM so `run` is a resume plus `START`. Each listens on
 //! `RUN/standby/TEMPLATE/KEY.PID.sock` (KEY: template generation) and holds
-//! `PID.lock` while available. Protocol: `run` sends `claim {name, ip, cmd}` with
+//! `PID.lock` while alive, and `PID.claim` locked while a claim is under way. Protocol: `run` sends `claim {name, ip, cmd}` with
 //! its stdout/stderr; once the standby replies `claiming`, the claim may have
 //! started the VM and is never retried elsewhere. `{"exit": code}` follows.
 
@@ -65,17 +65,17 @@ pub fn live(host: &Host, template: &str) -> Vec<Ident> {
     ids
 }
 
-/// Standbys mid-claim (`.PID.lock`, held): refill counts them, as before the
-/// claim (one that ran is replaced once it did, one refused is available again).
-fn claiming(host: &Host, template: &str) -> usize {
-    let held = |p: &std::path::Path| File::open(p).is_ok_and(|f| unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0);
-    let entries = std::fs::read_dir(dir(host, template)).into_iter().flatten().flatten();
-    entries.filter(|e| e.file_name().to_str().is_some_and(|n| n.starts_with('.') && n.ends_with(".lock")) && held(&e.path())).count()
+/// `live`, less those mid-claim (`PID.claim` locked): a stop would not end them.
+pub fn stoppable(host: &Host, template: &str) -> Vec<Ident> {
+    let d = dir(host, template);
+    let claiming =
+        |id: &Ident| File::open(d.join(format!("{}.claim", id.pid))).is_ok_and(|f| unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0);
+    live(host, template).into_iter().filter(|id| !claiming(id)).collect()
 }
 
 /// SIGUSR1, not SIGINT: a stop can reach the process after a claim started
-/// (a listing may race the claim, and its signal thread may take it late),
-/// and the VM it became must not take it for a kill.
+/// (it lists it until the claim is done, and its signal thread may take it
+/// late), and the VM it became must not take it for a kill.
 pub fn stop(id: &Ident) {
     if let Ok(Some(fd)) = PidFd::open(id) {
         let _ = fd.signal(libc::SIGUSR1);
@@ -155,7 +155,7 @@ fn refill_by(host: &Host, template: &str, wait: bool) -> Result<usize> {
         }
         return Err(e.into());
     }
-    let want = target(host, template).saturating_sub(live(host, template).len() + claiming(host, template));
+    let want = target(host, template).saturating_sub(live(host, template).len());
     if want == 0 {
         return Ok(0);
     }
@@ -222,7 +222,8 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
     crate::host::flock(&lock, libc::LOCK_EX)?;
     lock.write_all_at(&serde_json::to_vec(&me)?, 0)?;
     std::fs::rename(&tmp, &lock_path)?;
-    p.files.lock().unwrap().extend([sock.clone(), lock_path.clone(), tmp.clone()]);
+    let claim_path = d.join(format!("{}.claim", me.pid));
+    p.files.lock().unwrap().extend([sock.clone(), lock_path, claim_path.clone()]);
     let ready = load(p.spawner.take(None)?, tpl.clone())?;
     // Taken now, so a claim does not scan memory or ask Firecracker.
     *p.sizes.lock().unwrap() = Some(ready.mem_sizes());
@@ -256,14 +257,15 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
         };
         let Ok((line, fds)) = crate::util::recv_with_fds(&c, 1 << 20, ready) else { continue };
         let Ok(req) = serde_json::from_slice::<Value>(&line) else { continue };
+        // Locked until the claim succeeds or rolls back (dropped): relief does not count it stopped.
+        let claiming = File::options().create(true).truncate(false).write(true).open(&claim_path)?;
+        crate::host::flock(&claiming, libc::LOCK_EX)?;
         // Not yet `claiming`, so the claimer tries another.
         if p.stop_requested() {
             p.finish(op, End::NotStarted, 0, None);
         }
         // From here the claim may take effect: the claimer must not retry elsewhere.
-        std::fs::rename(&lock_path, &tmp)?;
         if send_json(&mut &c, &json!({"claiming": true})).is_err() {
-            std::fs::rename(&tmp, &lock_path)?;
             continue;
         }
         // Before it is published: eviction leaves a CMD VM alone.
@@ -297,7 +299,6 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
                 if p.standby.lock().unwrap().is_none() {
                     p.finish(op, End::NotStarted, crate::vmproc::FAILED, None);
                 }
-                std::fs::rename(&tmp, &lock_path)?;
             }
         }
     }

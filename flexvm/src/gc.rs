@@ -112,9 +112,9 @@ fn unlocked(path: &Path) -> bool {
 fn standby_sockets(dir: &Path) {
     for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         let n = e.file_name().to_string_lossy().into_owned();
-        // `.PID.lock` nobody holds: a standby killed mid-claim (one starting locks it at once).
-        if n.starts_with('.') && n.ends_with(".lock") {
-            if age(&e.path()).is_some_and(|a| a > ARRIVAL_GRACE) && unlocked(&e.path()) {
+        // `PID.claim` of a standby gone (`PID.lock` too), or killed mid-claim, unlocked.
+        if let Some(pid) = n.strip_suffix(".claim") {
+            if !dir.join(format!("{pid}.lock")).exists() && unlocked(&e.path()) {
                 let _ = std::fs::remove_file(e.path());
             }
             continue;
@@ -123,11 +123,11 @@ fn standby_sockets(dir: &Path) {
         if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
             continue;
         }
-        // Mid-claim the lock is `.PID.lock`; `PID.lock` again after it, so a rename in between is seen.
-        let free = [format!("{pid}.lock"), format!(".{pid}.lock"), format!("{pid}.lock")].iter().all(|l| match File::open(dir.join(l)) {
+        let lock = dir.join(format!("{pid}.lock"));
+        let free = match File::open(&lock) {
             Ok(f) => flock(&f, libc::LOCK_SH | libc::LOCK_NB).is_ok(),
             Err(e) => e.kind() == std::io::ErrorKind::NotFound,
-        });
+        };
         if free {
             let _ = std::fs::remove_file(e.path());
         }
@@ -152,20 +152,15 @@ mod tests {
         let held = File::create(d.join("1.lock")).unwrap();
         flock(&held, libc::LOCK_EX).unwrap();
         File::create(d.join("2.lock")).unwrap();
-        let claiming = File::create(d.join(".4.lock")).unwrap();
+        let claiming = File::create(d.join("4.claim")).unwrap();
         flock(&claiming, libc::LOCK_EX).unwrap();
-        for s in ["key.1.sock", "key.2.sock", "key.3.sock", "key.4.sock", "key.x.sock", "1.lock", ".5.lock", ".6.lock"] {
+        for s in ["key.1.sock", "key.2.sock", "key.3.sock", "key.x.sock", "1.lock", "1.claim", "3.claim"] {
             File::create(d.join(s)).unwrap();
-        }
-        let old = SystemTime::now() - Duration::from_secs(60);
-        for s in [".4.lock", ".5.lock"] {
-            File::options().write(true).open(d.join(s)).unwrap().set_modified(old).unwrap();
         }
         standby_sockets(&d);
         let left = |n: &str| d.join(n).exists();
         assert!(left("key.1.sock"), "its standby holds its lock");
-        assert!(left("key.4.sock") && left(".4.lock"), "mid-claim, its standby holds its lock as .4.lock");
-        assert!(!left(".5.lock") && left(".6.lock"), "an old free .PID.lock goes, a new one stays");
+        assert!(left("1.claim") && left("4.claim") && !left("3.claim"), "a claim marker goes once unlocked and its standby's lock is gone");
         assert!(!left("key.2.sock") && !left("key.3.sock"), "lock free or gone");
         assert!(left("key.x.sock") && left("2.lock"));
         std::fs::remove_dir_all(d).unwrap();
