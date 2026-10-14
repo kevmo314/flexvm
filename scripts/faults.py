@@ -4245,6 +4245,238 @@ def source_killed_basic():
     basic()
 
 
+# --- what a unit's cgroup and garbage collection leave alone, and what they take ---
+
+def cgroup_of(pid):
+    try:
+        return open(f"/proc/{pid}/cgroup").read().strip().split("::", 1)[-1]
+    except OSError:
+        return None
+
+
+def in_cgroup(cg):
+    """A preexec_fn: the child joins cgroup `cg` (as a unit's processes are)."""
+    return lambda: open(os.path.join(cg, "cgroup.procs"), "w").write("0")
+
+
+def standby_pids(host, t):
+    d = os.path.join(host.run, "standby", t)
+    pids = []
+    for f in os.listdir(d) if os.path.isdir(d) else []:
+        if f.endswith(".lock"):
+            try:
+                pids.append(json.load(open(os.path.join(d, f)))["pid"])
+            except (OSError, ValueError, KeyError):
+                pass
+    return [p for p in pids if alive(p)]
+
+
+def unit_restart():
+    """A systemd unit restarted with KillMode=control-group, emulated: B's
+    listener, a `run -d` and a `standby` started from the unit's cgroup, and
+    everything in that cgroup killed (cgroup.kill). The VM that migrated in
+    through the listener, the detached VM and the standby are each in a
+    cgroup of their own (flexvm/vm-PID-START), so they run on; a new listener
+    takes them back."""
+    t, n, d = args.template, "ft-unit-in", "ft-unit-d"
+    unit = f"/sys/fs/cgroup/{args.prefix}-unit-{os.getpid()}"
+    if not os.path.exists("/sys/fs/cgroup/cgroup.controllers"):
+        print("SKIP unit restart: no cgroup2 hierarchy")
+        return
+    os.mkdir(unit)
+    scenario_vms.update([n, d])
+    try:
+        stop_listener(B)
+        lg = open(os.path.join(B.run, "listen.log"), "a")
+        listeners[B.addr] = subprocess.Popen(
+            [BIN, "--state", B.state, "--run", B.run, "listen", B.addr, "--peer", A.addr, "--vm-ips", B.ips,
+             "--reserve", "512", "--prefix", args.prefix], stdout=lg, stderr=lg, env=ENV, preexec_fn=in_cgroup(unit))
+        hp = B.addr.rsplit(":", 1)
+        up = lambda: subprocess.run(["bash", "-c", f"exec 3<>/dev/tcp/{hp[0]}/{hp[1]}"], capture_output=True).returncode == 0
+        check("unit restart: listener up in the unit", wait_for(up, 10) and cgroup_of(listeners[B.addr].pid) == unit[len("/sys/fs/cgroup"):])
+        m = setup(n, mib=50)
+        ok(migrate(A, n, B))
+        check("unit restart: migrated in", wait_for(lambda: where(n) == {B: "running"}, 60), where(n))
+        r = subprocess.run([BIN, "--state", B.state, "--run", B.run, "run", d, "--template", t, "-d"], capture_output=True,
+                           text=True, timeout=120, env=ENV, preexec_fn=in_cgroup(unit))
+        check("unit restart: run -d from the unit", r.returncode == 0, r.stderr)
+        try:
+            r = subprocess.run([BIN, "--state", B.state, "--run", B.run, "standby", "--template", t, "1"], capture_output=True,
+                               text=True, timeout=120, env=ENV, preexec_fn=in_cgroup(unit))
+            check("unit restart: standby from the unit", r.returncode == 0, r.stderr)
+            sbs = standby_pids(B, t)
+            pids = {n: vm_pid(B, n), d: vm_pid(B, d), "standby": sbs[0] if sbs else None}
+            cgs = {k: cgroup_of(p) for k, p in pids.items()}
+            check("unit restart: each in a cgroup of its own", all((cg or "").startswith(f"/flexvm/vm-{pids[k]}-") for k, cg in cgs.items()), cgs)
+            open(os.path.join(unit, "cgroup.kill"), "w").write("1")
+            listeners.pop(B.addr).wait(timeout=10)
+            time.sleep(1)
+            check("unit restart: all of them run on", all(p and alive(p) for p in pids.values()), pids)
+            check("unit restart: the arrival intact", where(n) == {B: "running"} and md5(B, n) == m, where(n))
+            check("unit restart: the detached vm answers", sh(B, d, "echo hi") == (0, "hi"))
+            start_listener(B)
+            ok(migrate(B, n, A))
+            check("unit restart: a new listener serves it", wait_for(lambda: where(n) == {A: "running"}, 60) and md5(A, n) == m, where(n))
+            ok(kill(B, d))
+            swept = lambda: ok(cli_json(B, "debug", "gc")) is None and not os.path.exists(f"/sys/fs/cgroup{cgs[d]}")
+            check("unit restart: an empty cgroup is swept", wait_for(swept, 10), cgs[d])
+            check("unit restart: a populated one is kept", os.path.exists(f"/sys/fs/cgroup{cgs['standby']}"), cgs["standby"])
+        finally:
+            cli_json(B, "standby", "--template", t, "0")
+            wait_for(lambda: not standby_pids(B, t), 30)
+    finally:
+        if B.addr not in listeners:
+            start_listener(B)
+        cleanup(n)
+        cleanup(d)
+        wait_for(lambda: not open(os.path.join(unit, "cgroup.procs")).read().strip(), 10)
+        os.rmdir(unit)
+
+
+def log_cap():
+    """A detached VM's log is capped by its writer: past 8 MiB, NAME.log
+    becomes NAME.log.1 and a new one goes on. Every line of the output is in
+    one or the other, whole and in order, up to the rotations."""
+    n = "ft-logcap"
+    scenario_vms.add(n)
+    vd = os.path.join(A.run, "vms")
+    for f in (f"{n}.log", f"{n}.log.1"):
+        if os.path.exists(os.path.join(vd, f)):
+            os.unlink(os.path.join(vd, f))
+    lines = 1_500_000  # ~11 MiB
+    r = cli_json(A, "run", n, "--template", args.template, "-d", "--", f"seq 1 {lines}")
+    check("log cap: started", r["ok"], r)
+    pid = r["result"]["pid"] if r["ok"] else None
+    check("log cap: its command ran out", wait_for(lambda: not alive(pid), 120), pid)
+    log, prev = os.path.join(vd, f"{n}.log"), os.path.join(vd, f"{n}.log.1")
+    size = lambda p: os.path.getsize(p) if os.path.exists(p) else None
+    check("log cap: rotated, neither past the cap", size(prev) is not None and size(prev) <= (8 << 20) + 65536 and size(log) <= 8 << 20,
+          (size(prev), size(log)))
+    nums = [l for l in (open(prev).read() + open(log).read()).splitlines() if l.isdigit()]
+    tail = [int(x) for x in nums]
+    check("log cap: whole lines, in order, through the last", tail and tail[-1] == lines and tail == list(range(tail[0], lines + 1)),
+          (tail[:1], tail[-1:], len(tail)))
+
+
+def gc_debris():
+    """What the sweep removes and what it keeps: old `.moved` markers, the
+    log of a name with nothing left here once quiet, a SIGKILLed standby's
+    socket; not a fresh log or a live VM's log."""
+    vd = os.path.join(A.run, "vms")
+    old = time.time() - 7200
+    def made(path, t=None):
+        open(path, "w").close()
+        if t:
+            os.utime(path, (t, t))
+        return path
+    n = "ft-gc-live"
+    ok(run(A, n))
+    os.utime(os.path.join(vd, f"{n}.log"), (old, old))
+    moved, moved_new = made(os.path.join(vd, "ft-gc-moved.moved"), old), made(os.path.join(vd, "ft-gc-moved2.moved"))
+    orphan, fresh = made(os.path.join(vd, "ft-gc-orphan.log"), old), made(os.path.join(vd, "ft-gc-fresh.log"))
+    sbd = os.path.join(A.run, "standby", args.template)
+    os.makedirs(sbd, exist_ok=True)
+    sock = made(os.path.join(sbd, "deadbeef.999999990.sock"))
+    ok(cli_json(A, "debug", "gc"))
+    gone = lambda p: not os.path.exists(p)
+    check("gc: an old .moved marker goes, a recent one stays", gone(moved) and not gone(moved_new))
+    check("gc: a quiet orphan log goes, a fresh one stays", gone(orphan) and not gone(fresh))
+    check("gc: a live vm's log stays", not gone(os.path.join(vd, f"{n}.log")))
+    check("gc: a dead standby's socket goes", gone(sock))
+    for p in (moved_new, fresh):
+        if os.path.exists(p):
+            os.unlink(p)
+    cleanup(n)
+
+
+def prefix_change():
+    """The tap prefix (which garbage collection reads taps' owners by) does
+    not change while a VM process runs, through `config` or `listen`; once
+    none runs, it does, and back."""
+    n = "ft-prefix"
+    try:
+        prefix = json.load(open(os.path.join(A.state, "host.json")))["prefix"]
+    except (OSError, ValueError, KeyError):
+        prefix = "fv"
+    other = (prefix + "z")[:8] if not prefix.endswith("z") else prefix[:-1] + "y"
+    ok(run(A, n))
+    r = cli_json(A, "config", "--prefix", other)
+    check("prefix change: refused while a vm runs", not r["ok"] and "cannot change the tap prefix" in r["error"], r)
+    r = cli_json(A, "listen", "127.0.0.1:1", "--prefix", other)
+    check("prefix change: through listen too", not r["ok"] and "cannot change the tap prefix" in r["error"], r)
+    cfg = ok(cli_json(A, "config"))
+    check("prefix change: unchanged", cfg["prefix"] == prefix, cfg)
+    ok(kill(A, n))
+    ok(cli_json(A, "debug", "gc"))
+    r = cli_json(A, "config", "--prefix", other)
+    check("prefix change: made once none runs", r["ok"] and r["result"]["prefix"] == other, r)
+    r = cli_json(A, "config", "--prefix", prefix)
+    check("prefix change: and back", r["ok"] and r["result"]["prefix"] == prefix, r)
+
+
+def arrival_log():
+    """An arrival's log stays while it runs and goes once it is killed (it
+    is never published as NAME.log): the sweep tells them apart by the
+    lock the arrival holds on it."""
+    n, ip = "ft-arrival-log", B.ips.split("-")[1].rsplit(".", 1)[0] + ".212"
+    scenario_vms.add(n)
+    src = source_vm()
+    vd = os.path.join(B.run, "vms")
+    arrivals = lambda: {f for f in os.listdir(vd) if f.startswith(".incoming-")}
+    before = arrivals()
+    fault(B, "incoming_stall", 20000)
+    res = {}
+    t = threading.Thread(target=lambda: res.update(r=migrate_in_raw(B, n, ip, src)))
+    t.start()
+    lock = os.path.join(vd, f"{n}.lock")
+    wait_for(lambda: os.path.exists(lock) and open(lock).read().strip(), 20)
+    pid = json.load(open(lock))["pid"]
+    mine = arrivals() - before
+    time.sleep(6)
+    ok(cli_json(B, "debug", "gc"))
+    check("arrival log: a live arrival's log stays", len(mine) == 1 and mine <= arrivals(), (mine, arrivals()))
+    os.kill(pid, signal.SIGKILL)
+    t.join()
+    fault(B, "incoming_stall", 0)
+    check("arrival log: left by the killed arrival", mine <= arrivals(), arrivals())
+    check("arrival log: never published as its name's", not os.path.exists(os.path.join(vd, f"{n}.log")))
+    time.sleep(6)
+    ok(cli_json(B, "debug", "gc"))
+    check("arrival log: swept once its arrival is dead", not (mine & arrivals()), arrivals())
+    if "r" in res:
+        res["r"][0].close()
+
+
+def template_tap():
+    """A template build SIGKILLed after making its tap (PREFIX x PID): the
+    tap outlives it until a sweep finds the pid gone. A build tap whose pid
+    lives is kept."""
+    name = f"ft-tpltap-{os.getpid()}"
+    tdir = os.environ.get("FLEXVM_TEMPLATES") or os.path.join(os.path.abspath(args.artifacts), "templates")
+    try:
+        prefix = json.load(open(os.path.join(A.state, "host.json")))["prefix"]
+    except (OSError, ValueError, KeyError):
+        prefix = "fv"
+    p = subprocess.Popen([BIN, "--state", A.state, "--run", A.run, "template", name, "--vcpus", "1", "--max", "512"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=ENV)
+    tap = f"{prefix}x{p.pid:x}"
+    up = wait_for(lambda: os.path.exists(f"/sys/class/net/{tap}"), 30)
+    p.kill()
+    p.wait()
+    check("template tap: made by the build", up, tap)
+    check("template tap: left by the killed build", os.path.exists(f"/sys/class/net/{tap}"))
+    live = f"{prefix}x{os.getpid():x}"
+    subprocess.run(["ip", "tuntap", "add", "dev", live, "mode", "tap"], check=True)
+    try:
+        ok(cli_json(A, "debug", "gc"))
+        check("template tap: swept once its build is gone", not os.path.exists(f"/sys/class/net/{tap}"))
+        check("template tap: a live build's kept", os.path.exists(f"/sys/class/net/{live}"))
+    finally:
+        subprocess.run(["ip", "link", "del", live], capture_output=True)
+        subprocess.run(["ip", "link", "del", tap], capture_output=True)
+        subprocess.run(["rm", "-rf", os.path.join(tdir, f".{name}.new-{p.pid}")])
+
+
 def uffd_err():
     """The pager's userfaultfd stops being pollable (POLLERR): the pager
     fails, saying why, rather than stopping silently with every vCPU left
@@ -4302,6 +4534,7 @@ SCENARIOS = dict(
     suspend_disk_freed=suspend_disk_freed, resume_mark_fails=resume_mark_fails, kill_source=kill_source,
     kill_refused_checkpoint=no_evict(kill_refused_checkpoint), wildcard_listen=wildcard_listen,
     forged_peer=forged_peer, restore_ip_peer=restore_ip_peer, late_withdrawal=late_withdrawal,
+    unit_restart=unit_restart, log_cap=log_cap, gc_debris=gc_debris, prefix_change=prefix_change, arrival_log=arrival_log, template_tap=template_tap,
     incoming_killed=incoming_killed, start_killed=start_killed, claim_killed=claim_killed, fc_died=fc_died,
     sigkill_restart=sigkill_restart, listen_trickle=listen_trickle,
     cow_wp_race=cow_wp_race, fetch_tail_enomem=fetch_tail_enomem, fetch_enomem_stuck=fetch_enomem_stuck,

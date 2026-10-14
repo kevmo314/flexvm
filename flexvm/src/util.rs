@@ -358,14 +358,26 @@ pub fn wait_signal(set: &libc::sigset_t) -> i32 {
     sig
 }
 
-/// In a session of its own (it outlives the caller), with `fd3` as its fd 3.
+/// A VM process in the background, with `fd3` as its fd 3: it outlives the
+/// caller, so it is in a session of its own and, where flexvm's cgroup tree
+/// is available, a cgroup of its own (`flexvm/vm-PID-START`, `scope`), out of
+/// reach of whatever stops the caller's: a systemd unit's restart or stop
+/// (`KillMode=control-group`), logind's `KillUserProcesses`.
 pub fn spawn_self<S: AsRef<std::ffi::OsStr>>(args: &[S], log: &std::fs::File, fd3: RawFd, env: &[(&str, &str)]) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::process::CommandExt;
+    let cgroups = crate::vmproc::cgroup_root().map(|r| r.join("vm-").as_os_str().as_bytes().to_vec());
     let mut cmd = std::process::Command::new("/proc/self/exe");
     cmd.args(args).envs(env.iter().copied()).stdin(std::process::Stdio::null()).stdout(log.try_clone()?).stderr(log.try_clone()?);
     unsafe {
         cmd.pre_exec(move || {
             libc::setsid();
+            if let Some(prefix) = &cgroups {
+                if !own_start().is_some_and(|start| scope(prefix, libc::getpid() as u32, start)) {
+                    let warn = b"flexvm: WARNING: no cgroup of its own: stopping the caller's cgroup stops this vm\n";
+                    libc::write(2, warn.as_ptr().cast(), warn.len());
+                }
+            }
             // dup2 onto itself would leave it close-on-exec.
             let moved = if fd3 == 3 { libc::fcntl(3, libc::F_SETFD, 0) } else { libc::dup2(fd3, 3) };
             if moved < 0 {
@@ -379,10 +391,166 @@ pub fn spawn_self<S: AsRef<std::ffi::OsStr>>(args: &[S], log: &std::fs::File, fd
     Ok(())
 }
 
+/// `PREFIX` `PID` `-` `START` `SUFFIX` NUL in `buf`, without allocating
+/// (after fork); false if it does not fit.
+fn scope_path(buf: &mut [u8], prefix: &[u8], pid: u32, start: u64, suffix: &[u8]) -> bool {
+    fn digits(mut n: u64, out: &mut [u8; 20]) -> &[u8] {
+        let mut i = out.len();
+        loop {
+            i -= 1;
+            out[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+            if n == 0 {
+                return &out[i..];
+            }
+        }
+    }
+    let (mut p, mut s) = ([0u8; 20], [0u8; 20]);
+    let parts: [&[u8]; 5] = [prefix, digits(pid as u64, &mut p), b"-", digits(start, &mut s), suffix];
+    let len: usize = parts.iter().map(|p| p.len()).sum();
+    if len + 1 > buf.len() || prefix.contains(&0) {
+        return false;
+    }
+    let mut at = 0;
+    for p in parts {
+        buf[at..at + p.len()].copy_from_slice(p);
+        at += p.len();
+    }
+    buf[at] = 0;
+    true
+}
+
+/// A process's start time from its `/proc/PID/stat` text (field 22).
+fn stat_start(stat: &[u8]) -> Option<u64> {
+    let close = stat.iter().rposition(|&b| b == b')')?;
+    let field = stat[close + 1..].split(|&b| b == b' ').filter(|f| !f.is_empty()).nth(19)?;
+    let mut n: u64 = 0;
+    for &b in field {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        n = n.checked_mul(10)?.checked_add((b - b'0') as u64)?;
+    }
+    Some(n)
+}
+
+/// This process's start time, without allocating.
+fn own_start() -> Option<u64> {
+    let mut buf = [0u8; 1024];
+    unsafe {
+        let fd = libc::open(c"/proc/self/stat".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
+        if fd < 0 {
+            return None;
+        }
+        let n = libc::read(fd, buf.as_mut_ptr().cast(), buf.len());
+        libc::close(fd);
+        stat_start(&buf[..usize::try_from(n).ok()?])
+    }
+}
+
+/// Moves this process into a new cgroup `PREFIX` `pid-start`, named after
+/// this instance: never one a dead process left (one that exists is
+/// refused, not joined). Only system calls: it runs between fork and exec.
+/// Garbage collection removes empty ones, so one removed between its
+/// making and its joining is made again.
+fn scope(prefix: &[u8], pid: u32, start: u64) -> bool {
+    let mut path = [0u8; 512];
+    let errno = || unsafe { *libc::__errno_location() };
+    for _ in 0..3 {
+        unsafe {
+            if !scope_path(&mut path, prefix, pid, start, b"") || libc::mkdir(path.as_ptr().cast(), 0o755) != 0 {
+                return false;
+            }
+            if !scope_path(&mut path, prefix, pid, start, b"/cgroup.procs") {
+                return false;
+            }
+            let fd = libc::open(path.as_ptr().cast(), libc::O_WRONLY | libc::O_CLOEXEC);
+            if fd < 0 {
+                if errno() == libc::ENOENT {
+                    continue;
+                }
+                return false;
+            }
+            // "0": the writing process.
+            let ok = libc::write(fd, b"0".as_ptr().cast(), 1) == 1;
+            let e = errno();
+            libc::close(fd);
+            if ok {
+                return true;
+            }
+            if e != libc::ENOENT && e != libc::ENODEV {
+                return false;
+            }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn a_scope_is_named_and_joined_without_allocating() {
+        let mut buf = [0u8; 64];
+        assert!(scope_path(&mut buf, b"/sys/fs/cgroup/flexvm/vm-", 4194304, 1234567, b"/cgroup.procs"));
+        assert_eq!(std::ffi::CStr::from_bytes_until_nul(&buf).unwrap().to_bytes(), b"/sys/fs/cgroup/flexvm/vm-4194304-1234567/cgroup.procs");
+        assert!(scope_path(&mut buf, b"vm-", 0, 0, b""));
+        assert_eq!(std::ffi::CStr::from_bytes_until_nul(&buf).unwrap().to_bytes(), b"vm-0-0");
+        assert!(!scope_path(&mut [0u8; 8], b"vm-", 123, 4, b""), "no room for the NUL");
+        assert!(!scope_path(&mut buf, b"v\0m-", 1, 1, b""));
+        // Named after this instance: its start time as /proc says.
+        assert_eq!(own_start(), crate::host::starttime(std::process::id()));
+        assert_eq!(stat_start(b"9 (a) b) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 777 1"), Some(777), "a ')' in the name");
+        assert_eq!(stat_start(b"9 (a) S 1"), None);
+        // In a plain directory standing in for the cgroup tree.
+        let root = std::env::temp_dir().join(format!("flexvm-scope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let prefix = root.join("vm-");
+        let prefix = prefix.as_os_str().as_encoded_bytes();
+        assert!(!scope(prefix, 7, 9), "made, but no cgroup.procs to join");
+        assert!(root.join("vm-7-9").is_dir());
+        // One that exists (say a dead process's, its pid now reused) is never joined.
+        std::fs::write(root.join("vm-7-9/cgroup.procs"), b"").unwrap();
+        assert!(!scope(prefix, 7, 9));
+        assert_eq!(std::fs::read(root.join("vm-7-9/cgroup.procs")).unwrap(), b"");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Past the cap a log moves to `.1` whole and its writers go on in a new
+    /// one: nothing written is cut or lost, and a second writer follows.
+    #[test]
+    fn a_full_log_is_rotated_by_its_writers() {
+        let d = std::env::temp_dir().join(format!("flexvm-rotate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let log = d.join("vm.log");
+        let open = || std::fs::File::options().create(true).append(true).open(&log).unwrap();
+        let read = |n: &str| String::from_utf8(std::fs::read(d.join(n)).unwrap()).unwrap();
+        let (a, b) = (open(), open());
+        assert!(output::append_capped(&log, &a, b"one\n", 10).unwrap().is_none(), "under the cap");
+        // Past it: rotated, and the writer goes on in the new log.
+        let b1 = output::append_capped(&log, &b, b"two two two\n", 10).unwrap().expect("rotated");
+        assert_eq!(read("vm.log.1"), "one\ntwo two two\n");
+        // B rotates again while A still has the first generation, now removed:
+        // A's next write goes to the log as it is, never to a stale file.
+        let b2 = output::append_capped(&log, &b1, b"three three\n", 10).unwrap().expect("rotated again");
+        assert_eq!(read("vm.log.1"), "three three\n");
+        let a1 = output::append_capped(&log, &a, b"four\n", 10).unwrap().expect("follows");
+        assert!(output::append_capped(&log, &b2, b"five\n", 10).unwrap().is_none());
+        assert_eq!(read("vm.log"), "four\nfive\n");
+        a1.sync_all().unwrap();
+        // A whole write is never cut, even past the cap.
+        let big = vec![b'x'; 100];
+        output::append_capped(&log, &a1, &big, 10).unwrap();
+        assert_eq!(read("vm.log.1").len(), "four\nfive\n".len() + 100);
+        // A log that is gone (garbage collection's) is made again.
+        std::fs::remove_file(&log).unwrap();
+        assert!(output::append_capped(&log, &b2, b"six\n", 10).unwrap().is_some() && read("vm.log") == "six\n");
+        std::fs::remove_dir_all(d).unwrap();
+    }
 
     #[test]
     fn truncated_fds_fail_the_receive() {
@@ -430,17 +598,25 @@ mod tests {
 /// take output within `STALL` (a closed terminal, a broken or stalled pipe)
 /// is given up for the VM's log file, so printing never fails, never aborts
 /// the VM and never holds it up for long; nothing is locked across a write.
+/// A target that is a log in the run directory is kept under `LOG_CAP` by
+/// its writers: past it, `NAME.log` becomes `NAME.log.1` and a new one is
+/// started (`rotate`); a writer whose log was rotated by another follows.
 pub mod output {
     use std::fs::File;
     use std::io::{Read, Write};
     use std::os::fd::{AsRawFd, FromRawFd, RawFd};
-    use std::path::PathBuf;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
     use std::thread::JoinHandle;
     use std::time::{Duration, Instant};
 
     const STALL: Duration = Duration::from_secs(1);
+    /// A log is rotated once past this.
+    pub const LOG_CAP: u64 = 8 << 20;
     static TARGETS: Mutex<[Option<Arc<File>>; 2]> = Mutex::new([None, None]);
+    /// The capped log each target writes to, if it is one.
+    static LOGS: Mutex<[Option<PathBuf>; 2]> = Mutex::new([None, None]);
     static LOG: Mutex<Option<PathBuf>> = Mutex::new(None);
     static RELAYS: Mutex<Vec<JoinHandle<()>>> = Mutex::new(Vec::new());
 
@@ -451,7 +627,9 @@ pub mod output {
             super::eintr(|| unsafe { libc::pipe2(p.as_mut_ptr(), libc::O_CLOEXEC) })?;
             super::eintr(|| unsafe { libc::dup2(p[1], fd) })?;
             unsafe { libc::close(p[1]) };
-            TARGETS.lock().unwrap()[i] = Some(Arc::new(unsafe { File::from_raw_fd(orig) }));
+            let orig = unsafe { File::from_raw_fd(orig) };
+            LOGS.lock().unwrap()[i] = capped(&orig);
+            TARGETS.lock().unwrap()[i] = Some(Arc::new(orig));
             let mut from = unsafe { File::from_raw_fd(p[0]) };
             RELAYS.lock().unwrap().push(std::thread::spawn(move || {
                 let mut buf = [0u8; 8192];
@@ -465,6 +643,18 @@ pub mod output {
 
     fn relay(i: usize, data: &[u8]) {
         let target = TARGETS.lock().unwrap()[i].clone();
+        let log = LOGS.lock().unwrap()[i].clone();
+        if let (Some(log), Some(t)) = (&log, &target) {
+            if let Ok(next) = append_capped(log, t, data, LOG_CAP) {
+                if let Some(next) = next {
+                    let mut targets = TARGETS.lock().unwrap();
+                    if targets[i].as_ref().map(Arc::as_ptr) == Some(Arc::as_ptr(t)) {
+                        targets[i] = Some(Arc::new(next));
+                    }
+                }
+                return;
+            }
+        }
         let sent = target.as_ref().map_or(0, |t| write_within(t, data, Instant::now() + STALL));
         if sent == data.len() {
             return;
@@ -475,6 +665,7 @@ pub mod output {
             let mut targets = TARGETS.lock().unwrap();
             if targets[i].as_ref().map(Arc::as_ptr) == target.as_ref().map(Arc::as_ptr) {
                 targets[i] = log();
+                LOGS.lock().unwrap()[i] = targets[i].as_ref().and_then(|f| capped(f));
             }
             targets[i].clone()
         };
@@ -513,9 +704,68 @@ pub mod output {
         let mut targets = TARGETS.lock().unwrap();
         for (i, fd) in fds.into_iter().enumerate() {
             if let Ok(dup) = super::eintr(|| unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) }) {
-                targets[i] = Some(Arc::new(unsafe { File::from_raw_fd(dup) }));
+                let f = unsafe { File::from_raw_fd(dup) };
+                LOGS.lock().unwrap()[i] = capped(&f);
+                targets[i] = Some(Arc::new(f));
             }
         }
+    }
+
+    /// An arrival's log was published as `log` (renamed): capped there from now on.
+    pub fn published(log: &Path) {
+        let targets = TARGETS.lock().unwrap();
+        let mut logs = LOGS.lock().unwrap();
+        for (i, t) in targets.iter().enumerate() {
+            if t.as_ref().is_some_and(|t| same_file(t, log)) {
+                logs[i] = Some(log.into());
+            }
+        }
+    }
+
+    fn same_file(f: &File, path: &Path) -> bool {
+        match (f.metadata(), std::fs::metadata(path)) {
+            (Ok(a), Ok(b)) => a.ino() == b.ino() && a.dev() == b.dev(),
+            _ => false,
+        }
+    }
+
+    /// The path of `f` if it is a log this process caps: a regular file in
+    /// the run directory, not an arrival's (hidden: renamed once accepted).
+    fn capped(f: &File) -> Option<PathBuf> {
+        if !f.metadata().ok()?.is_file() {
+            return None;
+        }
+        let path = std::fs::read_link(format!("/proc/self/fd/{}", f.as_raw_fd())).ok()?;
+        let hidden = path.file_name()?.to_str()?.starts_with('.');
+        (path.starts_with(crate::host::run_dir()?) && !hidden && same_file(f, &path)).then_some(path)
+    }
+
+    /// Appends `data` to `log`, whatever file `current` is by now: every
+    /// write to a capped log, by any writer in any process, is made under the
+    /// run directory's `.rotate.lock`, to the file at `log` then (`current` if it
+    /// still is, else `log` reopened), so none goes to a rotated or removed
+    /// generation. Past `cap`, `log` is renamed `log.1` (replacing the one
+    /// before) and a new `log` is started. Returns the file the writer goes
+    /// on with, if not `current`.
+    pub fn append_capped(log: &Path, current: &File, data: &[u8], cap: u64) -> std::io::Result<Option<File>> {
+        let open = || File::options().create(true).append(true).open(log);
+        // One for the run directory's logs (kept out of `vms/`, which holds names only).
+        let lock = match crate::host::run_dir().filter(|r| log.starts_with(r)) {
+            Some(run) => run.join(".rotate.lock"),
+            None => log.with_file_name(".rotate.lock"),
+        };
+        let lock = File::create(lock)?;
+        crate::host::flock(&lock, libc::LOCK_EX)?;
+        let mut next = (!same_file(current, log)).then(open).transpose()?;
+        let mut f = next.as_ref().unwrap_or(current);
+        f.write_all(data)?;
+        if f.metadata()?.len() > cap {
+            let mut old = log.as_os_str().to_owned();
+            old.push(".1");
+            std::fs::rename(log, old)?;
+            next = Some(open()?);
+        }
+        Ok(next)
     }
 
     /// Before exit, bounded by a second from the start: what was printed

@@ -4,6 +4,7 @@ mod compat;
 mod cow;
 mod crc32c;
 mod fc;
+mod gc;
 mod guest;
 mod hold;
 mod host;
@@ -53,6 +54,9 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
   flexvm listen [ADDR] [--peer ADDR]... [--vm-ips CIDR|FIRST-LAST] [--underlay IP]
                 [--announce-dev IFACE] [--dns IP] [--reserve MIB] [--evict-at MIB] [--prefix P]
                                      configure this host and take migrations from peers
+  flexvm config [--peer ADDR]... [--vm-ips ...] [--underlay IP] [--announce-dev IFACE] [--dns IP]
+                [--reserve MIB] [--evict-at MIB] [--prefix P]
+                                     configure this host without a listener (no flags: show it)
   flexvm standby [--template T] N    keep N VMs restored and paused, so run takes ~5 ms
   flexvm template NAME [--vcpus N] [--mem MIB] [--max MIB] [--plug MIB] [--image REF ...]
                                      build a template (see README)
@@ -66,7 +70,7 @@ const SWITCHES: &[&str] = &["warm", "stop", "paused", "incremental", "standby", 
 
 const VALUE_FLAGS: &[&str] = &[
     "state", "run", "artifacts", "templates", "image-cache", "template", "ip", "name",
-    "peer", "vm-ips", "underlay", "announce-dev", "dns", "reserve", "prefix",
+    "peer", "vm-ips", "underlay", "announce-dev", "dns", "reserve", "evict-at", "prefix",
     "vcpus", "mem", "max", "plug", "image", "init", "entrypoint", "cmd", "env",
     "workdir", "user", "ready-port", "ready-cmd", "ready-timeout", "image-staging",
     "max-download-mib", "max-unpacked-mib", "max-file-mib", "max-entries",
@@ -218,13 +222,29 @@ fn real_main() -> Result<()> {
             let listener = configure_listener(&mut host, &args, pos.get(1).copied(), listen::activated())?;
             listen::main(host, listener)
         }
+        Some("config") => {
+            if let Some(extra) = pos.get(1) {
+                return Err(format!("config takes only flags, not {extra:?}; the listen address is flexvm listen's").into());
+            }
+            let mut host = open_host(&args)?;
+            // A prefix change is refused while any VM process or tap may use the old one (`Host::configure`).
+            if CONFIG_FLAGS.iter().any(|f| args.has(f)) {
+                host.configure(|c| configure(c, &args, None))?;
+            }
+            print(serde_json::to_value(&host.cfg)?)
+        }
         Some("standby") => print(standby::set(&open_host(&args)?, template, name.parse().map_err(|_| "standby wants a count")?)?),
         Some("bench") => bench::run(&args),
         // Test hooks: arm a fault for MS ms (0 disarms), hash a checkpoint, or ask a VM.
         Some("debug") => match name {
+            "gc" => {
+                let host = open_host(&args)?;
+                gc::sweep(&host);
+                Ok(())
+            }
             "fault" => host::arm(&open_host(&args)?, arg2.ok_or("debug fault NAME MS")?, pos.get(3).and_then(|m| m.parse().ok()).unwrap_or(1000)),
             "ckhash" => print(lifecycle::ckhash(&paths(&args)?, std::path::Path::new(arg2.ok_or("debug ckhash DIR")?))?),
-            "" => Err("debug fault|ckhash|VM ...".into()),
+            "" => Err("debug fault|ckhash|gc|VM ...".into()),
             _ => call(json!({"op": "debug", "what": arg2.unwrap_or("status")})),
         },
         _ => {
@@ -259,7 +279,11 @@ fn configure_listener(host: &mut Host, args: &Args, addr: Option<&str>, activate
     Ok(listener.unwrap())
 }
 
-/// Flags not given keep their configured values.
+/// What `configure` sets, besides the listen address.
+const CONFIG_FLAGS: &[&str] = &["peer", "vm-ips", "underlay", "announce-dev", "dns", "reserve", "evict-at", "prefix"];
+
+/// Flags not given keep their configured values; an empty --underlay,
+/// --announce-dev or --dns unsets it.
 fn configure(c: &mut host::Config, args: &Args, addr: Option<&str>) -> Result<()> {
     if let Some(a) = addr {
         c.listen = Some(a.into());
@@ -271,14 +295,26 @@ fn configure(c: &mut host::Config, args: &Args, addr: Option<&str>) -> Result<()
         net::IpRange::parse(r)?;
         c.vm_ips = r.into();
     }
-    c.underlay = args.get("underlay").map(|u| u.parse()).transpose().map_err(|_| "bad --underlay")?.or(c.underlay);
-    c.announce_dev = args.get("announce-dev").map(String::from).or(c.announce_dev.take());
-    c.dns = args.get("dns").map(String::from).or(c.dns.take());
+    if let Some(u) = args.get("underlay") {
+        c.underlay = (!u.is_empty()).then(|| u.parse()).transpose().map_err(|_| format!("bad --underlay {u:?}"))?;
+    }
+    if let Some(d) = args.get("announce-dev") {
+        c.announce_dev = (!d.is_empty()).then(|| d.into());
+    }
+    if let Some(d) = args.get("dns") {
+        c.dns = (!d.is_empty()).then(|| d.parse::<std::net::IpAddr>().map(|_| d.into())).transpose().map_err(|_| format!("bad --dns {d:?}"))?;
+    }
     c.reserve_mib = args.num("reserve", c.reserve_mib)?;
     if args.has("evict-at") {
         c.evict_mib = Some(args.num("evict-at", 0)?);
     }
-    c.prefix = args.get("prefix").map_or(c.prefix.clone(), String::from);
+    if let Some(p) = args.get("prefix") {
+        // Tap names are 15 bytes at most: PREFIX, a pid in hex (up to 6) and a suffix.
+        if p.is_empty() || p.len() > 8 || !p.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)) {
+            bail!("bad --prefix {p:?}: 1 to 8 letters, digits, '-', '_' or '.'");
+        }
+        c.prefix = p.into();
+    }
     Ok(())
 }
 
@@ -313,7 +349,12 @@ fn start(args: &Args, name: &str, s: Start) -> Result<()> {
 
 fn log_file(host: &Host, name: &str) -> Result<std::fs::File> {
     host::check_name(name)?;
-    Ok(std::fs::OpenOptions::new().create(true).append(true).open(host.vms(name, "log"))?)
+    // Opened and marked written holding the logs lock (shared): garbage
+    // collection removes only a quiet log, holding it exclusively.
+    let _logs = host.logs_lock(libc::LOCK_SH)?;
+    let f = std::fs::OpenOptions::new().create(true).append(true).open(host.vms(name, "log"))?;
+    f.set_modified(std::time::SystemTime::now())?;
+    Ok(f)
 }
 
 fn spawn_detached(host: &Host, name: &str, args: &Args) -> Result<()> {
@@ -429,7 +470,15 @@ fn build_template(args: &Args, name: &str) -> Result<()> {
         .transpose()?;
     let max = args.num("max", proc_kb("/proc/meminfo", "MemTotal").unwrap_or(0) >> 20)?;
     let (cpus, mem, plug) = (args.num("vcpus", cpus)? as u32, args.num("mem", template::base_mib(max))?, args.num("plug", template::PLUG_MIB)?);
-    template::create(&paths, name, cpus, mem, max, plug, image)
+    // Named and made under the host lock, so a prefix change sees it (`Host::prefix_in_use`).
+    let host = open_host(args)?;
+    let tap = {
+        let _l = host.lock()?;
+        let tap = template::tap(&host.tap_prefix()?);
+        net::create_tap(&tap)?;
+        tap
+    };
+    template::create(&paths, name, cpus, mem, max, plug, image, &tap)
 }
 
 fn image_options(args: &Args) -> Result<Option<image::Options>> {

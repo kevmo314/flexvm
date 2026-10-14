@@ -539,6 +539,13 @@ fn wait_reporting_done(fc: &Firecracker, metrics: &Path, expect_mib: u64) -> Res
     Ok((total >> 20, quiet >= 4 && total >> 20 >= expect_mib))
 }
 
+/// A template build's tap: the host's tap prefix, `x` and the build's pid
+/// in hex (a VM process's taps have a `t` after theirs), which garbage
+/// collection sweeps once that pid is proven gone.
+pub fn tap(prefix: &str) -> String {
+    format!("{prefix}x{:x}", std::process::id())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn create(
     paths: &Paths,
@@ -548,9 +555,10 @@ pub fn create(
     max_mib: u64,
     plug_mib: u64,
     image: Option<ImageMeta>,
+    tap: &str,
 ) -> Result<()> {
-    let tap = format!("fvtpl{}", std::process::id());
-    crate::net::create_tap(&tap)?;
+    // `tap` is made (under the host lock, `Host::tap_prefix`) and removed here.
+    let tap = tap.to_string();
     // Running VMs map the old files, which must not be rewritten under them.
     let staging = format!(".{name}.new-{}", std::process::id());
     let _ = std::fs::remove_dir_all(paths.templates.join(&staging));

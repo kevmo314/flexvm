@@ -35,6 +35,7 @@ pub fn main(host: Host, listener: TcpListener) -> Result<()> {
     }
     eprintln!("flexvm listening on {}", listener.local_addr()?);
     crate::standby::maintain(host.clone());
+    crate::gc::periodic(host.clone());
     let peers = Peers::watch(host.cfg.peers.clone());
     let host = std::sync::Arc::new(host);
     for conn in listener.incoming() {
@@ -212,8 +213,11 @@ fn incoming(host: &Host, req: &Value, line: &[u8], conn: TcpStream) -> Result<()
     // Each arrival owns its log until accepted; refusing a duplicate name
     // must not remove the running VM's log.
     static ARRIVAL: AtomicUsize = AtomicUsize::new(0);
-    let log_path = host.run.join("vms").join(format!(".incoming-{}-{}.log", std::process::id(), ARRIVAL.fetch_add(1, Ordering::Relaxed)));
+    // Locked for the arrival's life (its stdout shares the lock), so a dead
+    // arrival's log is told from a live one's and swept (`gc`).
+    let log_path = host.run.join("vms").join(format!("{}{}-{}.log", crate::gc::ARRIVAL_LOG, std::process::id(), ARRIVAL.fetch_add(1, Ordering::Relaxed)));
     let log = std::fs::OpenOptions::new().create_new(true).append(true).open(&log_path)?;
+    crate::host::flock(&log, libc::LOCK_SH)?;
     let args = ["--state".as_ref(), host.state.as_os_str(), "--run".as_ref(), host.run.as_os_str(), "run".as_ref(), "--incoming".as_ref()];
     if let Err(e) = crate::util::spawn_self(&args, &log, conn.as_raw_fd(), &[("FLEXVM_INCOMING", std::str::from_utf8(line)?), ("FLEXVM_INCOMING_LOG", log_path.to_str().ok_or("non-UTF8 log path")?)]) {
         let _ = std::fs::remove_file(log_path);

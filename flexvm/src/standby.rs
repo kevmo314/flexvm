@@ -6,7 +6,7 @@
 //! started the VM and is never retried elsewhere. `{"exit": code}` follows.
 
 use std::fs::File;
-use std::io::{BufReader, Write};
+use std::io::BufReader;
 use std::net::Ipv4Addr;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
@@ -107,8 +107,11 @@ pub fn maintain(host: Host) {
             }
             if let Err(e) = refill_by(&host, &template, false) {
                 let _ = std::fs::write(&failed, b"");
-                if let Ok(mut log) = std::fs::OpenOptions::new().create(true).append(true).open(dir(&host, &template).join("standby.log")) {
-                    let _ = writeln!(log, "standby {template}: refill: {e}");
+                // As its standby VMs write it: capped, to whichever file is current.
+                let path = dir(&host, &template).join("standby.log");
+                if let Ok(log) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                    let line = format!("standby {template}: refill: {e}\n");
+                    let _ = crate::util::output::append_capped(&path, &log, line.as_bytes(), crate::util::output::LOG_CAP);
                 }
             }
         }
