@@ -6,7 +6,7 @@
 //! old one down. Output waits for it rather than overwrite unsent bytes; writers never hold the ring lock.
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasher, BuildHasherDefault};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::process::{Child, Command, Stdio};
@@ -59,9 +59,7 @@ struct Entry {
 }
 
 fn fingerprint(command: &[u8]) -> (usize, u64) {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    command.hash(&mut h);
-    (command.len(), h.finish())
+    (command.len(), BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default().hash_one(command))
 }
 
 impl Table {
@@ -86,11 +84,10 @@ impl Table {
         let abandoned: Vec<String> = self
             .live
             .iter()
-            .filter(|(_, entry)| {
+            .filter_map(|(id, entry)| {
                 let o = entry.output.0.lock().unwrap();
-                o.exit.is_some() && o.attached.is_none() && o.detached.is_some_and(|t| t.elapsed() >= ABANDONED)
+                (o.exit.is_some() && o.attached.is_none() && o.detached.is_some_and(|t| t.elapsed() >= ABANDONED)).then(|| id.clone())
             })
-            .map(|(id, _)| id.clone())
             .collect();
         for id in abandoned {
             self.close(&id);
@@ -615,19 +612,12 @@ mod tests {
 
     #[test]
     fn lost_creation_reply_does_not_spawn_twice() {
-        struct Disconnected;
-        impl Write for Disconnected {
-            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
-                Err(io::ErrorKind::BrokenPipe.into())
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
         let (sessions, statuses) = (Sessions::default(), statuses());
         let command = b"printf hello; printf err >&2; exit 7";
         let line = format!("SESSION retry {}", command.len());
-        assert!(handle(Disconnected, command, None, &line, &sessions, &statuses).is_err());
+        // The client is gone before the reply.
+        let disconnected = UnixStream::pair().unwrap().0;
+        assert!(handle(disconnected, command, None, &line, &sessions, &statuses).is_err());
         // Simulate PID 1's reaper, without leaving a reaper thread in the test process.
         let pid = *statuses.0.lock().unwrap().keys().next().unwrap();
         let mut status = 0;
