@@ -798,9 +798,13 @@ an interrupt lost that way, mostly the balloon's (flexvm parks the balloon
 timer right before the snapshot, which raises one). With a debug Firecracker
 (not in the tree) that drops a pending virtio-net interrupt from the saved
 LAPIC the same way, `scripts/faults.py rx_stall` stalled 26 of 200
-operations without the patch and none with it. A re-raised interrupt the
-guest already had costs one spurious interrupt at most: the handler reads
-the status first.
+operations without the patch and none with it. One eventfd notification
+covers both pending kinds (queue and config), whose status bits are already
+set. If the guest already had the interrupt, the re-raise costs it at most
+one spurious interrupt per device and resume: the handler reads and
+acknowledges the status, finds nothing new and returns. The patch has a
+unit test of the re-raise; there is no deterministic end-to-end case, as
+losing the interrupt on purpose would need a debug hook in Firecracker.
 
 ## Measured (WSL2, Ryzen 9 3900X, nested KVM; before process-per-VM unless noted)
 

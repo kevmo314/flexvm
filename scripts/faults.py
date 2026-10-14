@@ -1106,14 +1106,15 @@ def rx_state(host, name):
 def rx_stall():
     """#149: a guest stopped receiving altogether after a handoff. Under a
     steady inbound UDP stream, migrate, checkpoint, checkpoint --stop and
-    restore, and suspend and resume a VM over and over; after each, the
-    guest's InDatagrams must go up again. On a stall it records the guest's,
-    Firecracker's and the tap's view, then has the guest send one datagram
+    restore, suspend and resume, and pause and resume a VM over and over;
+    after each, the guest's InDatagrams must go up again. On a stall it
+    records the guest's, Firecracker's and the tap's view, then has the
+    guest send one datagram
     (an interrupt on the same line) to see whether that wakes its receive.
-    RX_ITERS (default 24), RX_RATE (datagrams/s, default 2000) and
+    RX_ITERS (default 25), RX_RATE (datagrams/s, default 2000) and
     RX_TAP_RATE (frames/s written onto its tap, default 1000) scale it."""
     n = "ft-rx-stall"
-    iters, rate = int(os.environ.get("RX_ITERS") or 24), int(os.environ.get("RX_RATE") or 2000)
+    iters, rate = int(os.environ.get("RX_ITERS") or 25), int(os.environ.get("RX_RATE") or 2000)
     ok(run(A, n))
     ip = vm_ip(A, n)
     receiver = "setsid socat -u UDP-RECV:9000,rcvbuf=16777216 OPEN:/dev/null >/dev/null 2>&1 < /dev/null &"
@@ -1167,7 +1168,7 @@ def rx_stall():
     started = receiving(cur, n)
     check("rx stall: receiving at the start", started, "" if started else rx_state(cur, n))
     for i in range(iters):
-        op = ("migrate", "checkpoint", "restore", "suspend")[i % 4]
+        op = ("migrate", "checkpoint", "restore", "suspend", "pause")[i % 5]
         other = B if cur is A else A
         if op == "migrate":
             r = migrate(cur, n, other)
@@ -1183,9 +1184,15 @@ def rx_stall():
             r = checkpoint(cur, n, path, stop=True)
             if r["ok"]:
                 r = restore(cur, path)
-        else:
+        elif op == "suspend":
             suspend(cur, n)
             r = resume_suspended(cur, n)
+        else:
+            # A plain pause (SIGTSTP) and resume: no snapshot, but the same resume path.
+            r = {"ok": pause(cur, n)}
+            if r["ok"]:
+                time.sleep(0.05)
+                resume(cur, n)
         if not r["ok"]:
             check(f"rx stall: {op} {i} succeeded", False, r)
             break
