@@ -234,6 +234,9 @@ fn download_layers(descs: &[(String, u64)], download: impl Fn(&str, u64) -> Resu
             bail!("layer {d} has conflicting sizes");
         }
     }
+    // Largest first, so the last one to finish is a small one.
+    let mut unique: Vec<_> = unique.into_iter().collect();
+    unique.sort_by_key(|&(_, size)| std::cmp::Reverse(size));
     let workers = unique.len().min(4);
     let pending = std::sync::Mutex::new(unique.into_iter());
     std::thread::scope(|scope| -> Result<()> {
@@ -242,7 +245,11 @@ fn download_layers(descs: &[(String, u64)], download: impl Fn(&str, u64) -> Resu
                 loop {
                     let next = pending.lock().unwrap().next();
                     let Some((d, size)) = next else { return Ok(()) };
-                    download(d, size)?;
+                    if let Err(e) = download(d, size) {
+                        // Start nothing more; downloads in flight finish.
+                        pending.lock().unwrap().by_ref().for_each(drop);
+                        return Err(e);
+                    }
                 }
             })
         }).collect();
@@ -365,15 +372,19 @@ mod tests {
 
     #[test]
     fn layer_download_failures_and_conflicting_sizes_are_reported() {
-        let descs = vec![("a".to_string(), 1), ("b".to_string(), 2)];
-        let completed = AtomicUsize::new(0);
+        // The largest goes first; once it fails, only the three already in flight run.
+        let descs: Vec<_> = (0..10).map(|i| (format!("l{i}"), i)).collect();
+        let started = AtomicUsize::new(0);
+        let barrier = Barrier::new(4);
         let err = download_layers(&descs, |d, _| {
-            completed.fetch_add(1, Ordering::SeqCst);
-            if d == "a" { bail!("failed download"); }
+            started.fetch_add(1, Ordering::SeqCst);
+            barrier.wait();
+            if d == "l9" { bail!("failed download"); }
+            std::thread::sleep(std::time::Duration::from_millis(50));
             Ok(())
         }).unwrap_err();
         assert!(err.to_string().contains("failed download"));
-        assert_eq!(completed.load(Ordering::SeqCst), 2);
+        assert_eq!(started.load(Ordering::SeqCst), 4);
         let err = download_layers(&[("a".to_string(), 1), ("a".to_string(), 2)], |_, _| panic!("invalid descriptors must not download")).unwrap_err();
         assert!(err.to_string().contains("conflicting sizes"));
     }
