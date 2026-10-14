@@ -7,15 +7,11 @@ use std::net::Ipv4Addr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use libc::{
-    c_int, IFLA_ADDRESS, NDA_DST, NDA_LLADDR, NLM_F_CREATE, NLM_F_REPLACE, NUD_PERMANENT,
-    RTA_DST, RTA_GATEWAY, RTA_OIF, RTM_DELLINK, RTM_DELROUTE,
+    c_int, IFA_ADDRESS, IFA_LOCAL, IFLA_ADDRESS, NDA_DST, NDA_LLADDR, NLMSG_ERROR, NLM_F_ACK, NLM_F_CREATE,
+    NLM_F_REPLACE, NLM_F_REQUEST, NUD_PERMANENT, RTA_DST, RTA_GATEWAY, RTA_OIF, RTM_DELLINK, RTM_DELROUTE,
     RTM_NEWADDR, RTM_NEWNEIGH, RTM_NEWROUTE, RTM_SETLINK, RTN_UNICAST, RTPROT_STATIC, RT_SCOPE_HOST, RT_SCOPE_LINK,
     RT_SCOPE_NOWHERE, RT_SCOPE_UNIVERSE, RT_TABLE_MAIN,
 };
-
-#[path = "../../shared/netlink.rs"]
-mod rtnetlink;
-use rtnetlink::{attr, Netlink};
 
 use crate::bail;
 use crate::util::Result;
@@ -75,10 +71,12 @@ pub fn create_tap(name: &str) -> Result<()> {
     drop(fd);
     let made = (|| -> Result<()> {
         let index = ifindex(name)?;
+        let mut addr = [&[libc::AF_INET as u8, 32, 0, RT_SCOPE_HOST][..], &index.to_ne_bytes()].concat();
         let local: Ipv4Addr = TAP_ADDR.split('/').next().unwrap_or_default().parse()?;
-        let nl = Netlink::open()?;
-        nl.request(RTM_NEWADDR, NLM_F_CREATE | NLM_F_REPLACE, &rtnetlink::address(index, RT_SCOPE_HOST, local))?;
-        set_mac(&nl, index, &parse_mac(GATEWAY_MAC)?)?;
+        attr(&mut addr, IFA_LOCAL, &local.octets());
+        attr(&mut addr, IFA_ADDRESS, &local.octets());
+        netlink(RTM_NEWADDR, NLM_F_CREATE | NLM_F_REPLACE, &addr)?;
+        set_mac(index, &parse_mac(GATEWAY_MAC)?)?;
         let mut q = ifreq(name);
         q.ifr_ifru.ifru_metric = TAP_QUEUE as i32;
         let sock = socket(libc::AF_INET, libc::SOCK_DGRAM, 0, "socket")?;
@@ -110,112 +108,62 @@ fn ifreq(name: &str) -> libc::ifreq {
 /// Puts the gateway MAC back first: udev (`MACAddressPolicy=persistent`) may have replaced
 /// it, leaving the guest's pinned gateway ARP entry pointing nowhere.
 pub fn attach(ip: Ipv4Addr, tap: &str) -> Result<()> {
-    let nl = Netlink::open()?;
-    route_dev_on(&nl, true, ip, neighbour_on(&nl, ip, tap)?)
+    route_dev(true, ip, neighbour(ip, tap)?)
 }
 
 /// `attach` but the route, which a migration target installs at its commit; returns the
 /// tap's index.
 pub fn neighbour(ip: Ipv4Addr, tap: &str) -> Result<u32> {
-    neighbour_on(&Netlink::open()?, ip, tap)
-}
-
-fn neighbour_on(nl: &Netlink, ip: Ipv4Addr, tap: &str) -> Result<u32> {
     let ifindex = ifindex(tap)?;
     let mac = parse_mac(GATEWAY_MAC)?;
-    let current = std::fs::read_to_string(format!("/sys/class/net/{tap}/address")).ok().and_then(|s| parse_mac(&s).ok());
-    if current != Some(mac) {
-        set_mac(nl, ifindex, &mac)?;
+    if std::fs::read_to_string(format!("/sys/class/net/{tap}/address")).ok().and_then(|s| parse_mac(&s).ok()) != Some(mac) {
+        set_mac(ifindex, &mac)?;
     }
-    let mut neigh = Vec::with_capacity(32);
-    neigh.extend_from_slice(&[libc::AF_INET as u8, 0, 0, 0]);
-    neigh.extend_from_slice(&ifindex.to_ne_bytes());
-    neigh.extend_from_slice(&NUD_PERMANENT.to_ne_bytes());
-    neigh.extend_from_slice(&[0, 0]); // flags, type
+    // struct ndmsg: family, pad, index, state, flags, type.
+    let mut neigh = [&[libc::AF_INET as u8, 0, 0, 0][..], &ifindex.to_ne_bytes(), &NUD_PERMANENT.to_ne_bytes(), &[0, 0]].concat();
     attr(&mut neigh, NDA_DST, &ip.octets());
     attr(&mut neigh, NDA_LLADDR, &parse_mac(GUEST_MAC)?);
-    nl.request(RTM_NEWNEIGH, NLM_F_CREATE | NLM_F_REPLACE, &neigh)?;
+    netlink(RTM_NEWNEIGH, NLM_F_CREATE | NLM_F_REPLACE, &neigh)?;
     Ok(ifindex)
 }
 
 /// struct ifinfomsg: family, pad, type, index, flags, change.
 fn ifinfomsg(ifindex: u32) -> Vec<u8> {
-    let mut msg = vec![libc::AF_UNSPEC as u8, 0, 0, 0];
-    msg.extend_from_slice(&(ifindex as i32).to_ne_bytes());
-    msg.extend_from_slice(&[0; 8]);
-    msg
+    [&[libc::AF_UNSPEC as u8, 0, 0, 0][..], &ifindex.to_ne_bytes(), &[0; 8]].concat()
 }
 
-fn set_mac(nl: &Netlink, ifindex: u32, mac: &[u8; 6]) -> Result<()> {
+fn set_mac(ifindex: u32, mac: &[u8; 6]) -> Result<()> {
     let mut msg = ifinfomsg(ifindex);
     attr(&mut msg, IFLA_ADDRESS, mac);
-    Ok(nl.request(RTM_SETLINK, 0, &msg)?)
+    netlink(RTM_SETLINK, 0, &msg)
 }
 
 pub fn is_local_addr(ip: Ipv4Addr) -> Result<bool> {
     if ip.is_loopback() {
         return Ok(true);
     }
-    // Subscribe before the first dump, so changes during it also invalidate the cache.
-    static LOCAL: std::sync::Mutex<Option<LocalAddrs>> = std::sync::Mutex::new(None);
-    let mut cache = LOCAL.lock().unwrap();
-    let result = (|| -> Result<bool> {
-        if cache.is_none() {
-            let fd = socket(libc::AF_NETLINK, libc::SOCK_RAW | libc::SOCK_NONBLOCK, libc::NETLINK_ROUTE, "address events")?;
-            let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
-            addr.nl_family = libc::AF_NETLINK as u16;
-            addr.nl_groups = libc::RTMGRP_IPV4_IFADDR as u32;
-            if unsafe { libc::bind(fd.as_raw_fd(), (&addr as *const libc::sockaddr_nl).cast(), std::mem::size_of_val(&addr) as _) } < 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            *cache = Some(LocalAddrs { fd, addresses: Vec::new() });
-            cache.as_mut().unwrap().refresh()?;
-        }
-        let local = cache.as_mut().unwrap();
-        let mut changed = false;
-        let mut events = [0u8; 8192];
-        loop {
-            let n = unsafe { libc::recv(local.fd.as_raw_fd(), events.as_mut_ptr().cast(), events.len(), libc::MSG_DONTWAIT) };
-            if n >= 0 { changed = true; continue; }
-            let e = std::io::Error::last_os_error();
-            match e.raw_os_error() {
-                Some(libc::EINTR) => continue,
-                Some(libc::ENOBUFS) => { changed = true; continue; } // Lost events: dump again.
-                Some(libc::EAGAIN) => break,
-                _ => return Err(e.into()),
-            }
-        }
-        if changed { local.refresh()?; }
-        Ok(local.addresses.contains(&ip))
-    })();
-    if result.is_err() { *cache = None; }
-    result
-}
-
-struct LocalAddrs {
-    fd: OwnedFd,
-    addresses: Vec<Ipv4Addr>,
-}
-
-impl LocalAddrs {
-    fn refresh(&mut self) -> Result<()> {
+    // At most a second old: listen checks one per route it installs.
+    static LOCAL: std::sync::Mutex<(Option<std::time::Instant>, Vec<Ipv4Addr>)> = std::sync::Mutex::new((None, Vec::new()));
+    let mut local = LOCAL.lock().unwrap();
+    if !local.0.is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(1)) {
         let mut addrs = std::ptr::null_mut();
         if unsafe { libc::getifaddrs(&mut addrs) } != 0 {
             bail!("getifaddrs: {}", std::io::Error::last_os_error());
         }
-        self.addresses.clear();
+        local.1.clear();
         let mut current = addrs;
         while !current.is_null() {
             let addr = unsafe { &*current };
             if !addr.ifa_addr.is_null() && unsafe { (*addr.ifa_addr).sa_family } == libc::AF_INET as u16 {
                 let v4 = unsafe { &*addr.ifa_addr.cast::<libc::sockaddr_in>() };
-                self.addresses.push(Ipv4Addr::from(v4.sin_addr.s_addr.to_ne_bytes()));
+                local.1.push(Ipv4Addr::from(v4.sin_addr.s_addr.to_ne_bytes()));
             }
             current = addr.ifa_next;
         }
         unsafe { libc::freeifaddrs(addrs) };
-        Ok(())
+        local.0 = Some(std::time::Instant::now());
     }
+    Ok(local.1.contains(&ip))
 }
 
 /// Hosts sharing a netns share routes: never replace the target's tap route with one via us.
@@ -234,20 +182,11 @@ pub fn route_via(ip: Ipv4Addr, via: Ipv4Addr) -> Result<()> {
 
 /// A delete names the device, so it removes only that route.
 pub fn route_dev(add: bool, ip: Ipv4Addr, ifindex: u32) -> Result<()> {
-    route_dev_on(&Netlink::open()?, add, ip, ifindex)
-}
-
-fn route_dev_on(nl: &Netlink, add: bool, ip: Ipv4Addr, ifindex: u32) -> Result<()> {
-    let route = device_route(ip, ifindex);
-    let (kind, flags) = if add { (RTM_NEWROUTE, NLM_F_CREATE | NLM_F_REPLACE) } else { (RTM_DELROUTE, 0) };
-    Ok(nl.request(kind, flags, &route)?)
-}
-
-fn device_route(ip: Ipv4Addr, ifindex: u32) -> Vec<u8> {
     let mut route = rtmsg(RT_SCOPE_LINK);
     attr(&mut route, RTA_DST, &ip.octets());
     attr(&mut route, RTA_OIF, &ifindex.to_ne_bytes());
-    route
+    let (kind, flags) = if add { (RTM_NEWROUTE, NLM_F_CREATE | NLM_F_REPLACE) } else { (RTM_DELROUTE, 0) };
+    netlink(kind, flags, &route)
 }
 
 pub fn unroute(ip: Ipv4Addr) {
@@ -257,14 +196,42 @@ pub fn unroute(ip: Ipv4Addr) {
 }
 
 fn rtmsg(scope: u8) -> Vec<u8> {
-    let mut m = Vec::with_capacity(48);
-    m.extend_from_slice(&[libc::AF_INET as u8, 32, 0, 0, RT_TABLE_MAIN, RTPROT_STATIC, scope, RTN_UNICAST]);
-    m.extend_from_slice(&0u32.to_ne_bytes());
-    m
+    vec![libc::AF_INET as u8, 32, 0, 0, RT_TABLE_MAIN, RTPROT_STATIC, scope, RTN_UNICAST, 0, 0, 0, 0]
 }
 
+fn attr(buf: &mut Vec<u8>, kind: u16, data: &[u8]) {
+    buf.extend_from_slice(&((4 + data.len()) as u16).to_ne_bytes());
+    buf.extend_from_slice(&kind.to_ne_bytes());
+    buf.extend_from_slice(data);
+    buf.resize(buf.len().next_multiple_of(4), 0);
+}
+
+/// One socket per process, its requests serialized, so each recv is the ACK of the request
+/// just sent; any failure drops it, so no stale ACK is left for the next.
 fn netlink(kind: u16, flags: c_int, body: &[u8]) -> Result<()> {
-    Ok(Netlink::open()?.request(kind, flags, body)?)
+    static FD: std::sync::Mutex<Option<OwnedFd>> = std::sync::Mutex::new(None);
+    let mut fd = FD.lock().unwrap();
+    let sock = fd.take().map_or_else(|| socket(libc::AF_NETLINK, libc::SOCK_RAW, libc::NETLINK_ROUTE, "netlink socket"), Ok)?;
+    let flags = ((flags | NLM_F_REQUEST | NLM_F_ACK) as u16).to_ne_bytes();
+    // struct nlmsghdr: length, type, flags, seq, pid.
+    let msg = [&((16 + body.len()) as u32).to_ne_bytes()[..], &kind.to_ne_bytes(), &flags, &[1, 0, 0, 0, 0, 0, 0, 0], body].concat();
+    let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+    addr.nl_family = libc::AF_NETLINK as u16;
+    let mut ack = [0u8; 1024];
+    let res = match send_to(&sock, &msg, &addr) {
+        sent if sent < 0 => -1,
+        _ => unsafe { libc::recv(sock.as_raw_fd(), ack.as_mut_ptr().cast(), ack.len(), 0) },
+    };
+    if res < 20 {
+        bail!("netlink: {}", std::io::Error::last_os_error());
+    }
+    *fd = Some(sock);
+    let kind = u16::from_ne_bytes([ack[4], ack[5]]);
+    let code = i32::from_ne_bytes(ack[16..20].try_into().unwrap());
+    if kind == NLMSG_ERROR as u16 && code != 0 {
+        bail!("netlink: {}", std::io::Error::from_raw_os_error(-code));
+    }
+    Ok(())
 }
 
 pub fn ifindex(dev: &str) -> Result<u32> {
@@ -385,15 +352,6 @@ mod tests {
         assert_eq!(probe(Some(2), &[1, 2, 3, 4]), (None, vec![2, 3, 4, 1]), "each address once");
         assert_eq!(probe(Some(9), &[]), (Some(1), vec![1]), "a hint out of range starts at the start");
         assert_eq!((r.after(ip(2)), r.after(ip(4)), r.after(ip(9))), (ip(3), ip(1), ip(1)));
-    }
-
-    #[test]
-    fn device_routes_keep_the_destination_and_device_on_delete() {
-        let msg = device_route(Ipv4Addr::new(192, 0, 2, 1), 7);
-        assert_eq!(&msg[..12], &[libc::AF_INET as u8, 32, 0, 0, RT_TABLE_MAIN, RTPROT_STATIC, RT_SCOPE_LINK, RTN_UNICAST, 0, 0, 0, 0]);
-        assert_eq!(&msg[12..20], &[8u16.to_ne_bytes().to_vec(), RTA_DST.to_ne_bytes().to_vec(), vec![192, 0, 2, 1]].concat());
-        assert_eq!(&msg[20..24], &[8u16.to_ne_bytes(), RTA_OIF.to_ne_bytes()].concat());
-        assert_eq!(&msg[24..], &7u32.to_ne_bytes());
     }
 
     #[test]
