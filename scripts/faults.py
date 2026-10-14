@@ -4517,6 +4517,19 @@ def log_cap():
     tail = [int(x) for x in nums]
     check("log cap: whole lines, in order, through the last", tail and tail[-1] == lines and tail == list(range(tail[0], lines + 1)),
           (tail[:1], tail[-1:], len(tail)))
+    # A migrated VM's log (its arrival's, published) is capped too: the lock the
+    # arrival held on it is gone. Past the cap, what it prints ending rotates it.
+    m = "ft-logcap-moved"
+    ok(run(A, m))
+    ok(migrate(A, m, B))
+    moved = os.path.join(B.run, "vms", f"{m}.log")
+    with open(moved, "a") as f:
+        f.write("pad\n" * (2 << 20))
+    pid = vm_pid(B, m)
+    os.kill(pid, signal.SIGINT)
+    check("log cap: the migrated vm ended", wait_for(lambda: not alive(pid), 30), pid)
+    check("log cap: a migrated vm's log rotates", size(moved + ".1") is not None and size(moved + ".1") > 8 << 20 and (size(moved) or 0) < 65536,
+          (size(moved), size(moved + ".1")))
 
 
 def gc_debris():

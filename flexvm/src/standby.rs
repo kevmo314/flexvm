@@ -111,10 +111,8 @@ pub fn maintain(host: Host) {
                 let _ = std::fs::write(&failed, b"");
                 // As its standby VMs write it: capped, to whichever file is current.
                 let path = dir(&host, &template).join("standby.log");
-                if let Ok(log) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-                    let line = format!("standby {template}: refill: {e}\n");
-                    let _ = crate::util::output::append_capped(&path, &log, line.as_bytes(), crate::util::output::LOG_CAP);
-                }
+                let line = format!("standby {template}: refill: {e}\n");
+                crate::util::output::append_capped(&path, line.as_bytes(), crate::util::output::LOG_CAP);
             }
         }
     });
