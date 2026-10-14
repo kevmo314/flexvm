@@ -709,7 +709,18 @@ a second copy could repeat what it did.
     which a busy host's tap and TUN teardowns hold): what arrives while the
     route changes is injected as it comes, and once it changed everything
     the TUN device took before is injected, the device read to its end
-    (#136; scenario `same_host_slow_route`). A target that takes
+    (#136; scenario `same_host_slow_route`). A target letting go of its
+    hold first plugs its tap's qdisc (`sch_plug`): what the route sends to
+    the tap from the switch on waits there, while the held packets go past
+    it (the injector's packet socket bypasses the qdisc); then the plug lets
+    everything through, in order, as a FIFO; it stays the tap's qdisc,
+    a pass-through, for the rest of the VM's life on that tap (instead of
+    the default `fq_codel`; a tap never queues there anyway, its driver
+    takes every packet or drops it). However late the hand-over after
+    the switch runs on a busy host, nothing routed overtakes a held packet
+    (scenario `same_host_late_handover`). A source likewise reads its hold
+    device itself once the route moved, and hands all of it over, not
+    bounded by time. A target that takes
     `SWITCH` says so in its prepare answer (`hold_switch`); a source sends it
     to no other. Each of these late route changes happens under the host
     lock and only while the address is still this VM's with a current

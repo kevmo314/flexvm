@@ -170,8 +170,21 @@ impl Holder {
             }
         }
         let switched = switch();
-        if !lost {
-            self.hand_over(&e, sink, &mut stats);
+        match (lost, &switched) {
+            (true, _) => {}
+            // Nothing reaches the device for this address any more: what it took is read off it
+            // here (the reader thread may not run for a while on a busy host) and all of it goes,
+            // however long that takes, since no flood can make it more.
+            (false, Ok(())) => {
+                e.q.lock().unwrap().switched = true;
+                let mut buf = vec![0u8; MAX_FRAME];
+                let mut read = 0;
+                while read < TXQ && self.read_one(&mut buf) {
+                    read += 1;
+                }
+                while self.give_queued(&e, sink, &mut stats) {}
+            }
+            (false, Err(_)) => self.hand_over(&e, sink, &mut stats),
         }
         match switched {
             Ok(()) => self.unhold(ip, &e),
@@ -205,7 +218,14 @@ impl Holder {
         let out = Mutex::new((sink, Stats::default()));
         let give = |o: &mut (LocalSink, Stats)| self.give_queued(&e, &mut *o.0, &mut o.1);
         give(&mut out.lock().unwrap());
-        let switching = AtomicBool::new(true);
+        // `release_late`: the hand-over is held up from 20 ms before the switch to 30 ms after
+        // it, as a busy host may (packets the device took before the switch are still here
+        // when routed ones reach the VM).
+        let late = crate::host::fault("release_late");
+        if late {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let switching = AtomicBool::new(!late);
         let mut buf = vec![0u8; MAX_FRAME];
         let switched = std::thread::scope(|sc| {
             sc.spawn(|| {
@@ -216,6 +236,9 @@ impl Holder {
                 }
             });
             let switched = switch();
+            if late {
+                std::thread::sleep(Duration::from_millis(30));
+            }
             // Right away, here: the helper may be asleep, or not running at all.
             let mut o = out.lock().unwrap();
             if switched.is_ok() {
@@ -380,6 +403,12 @@ impl Injector {
         // Protocol 0: it sends and never receives.
         let fd = eintr(|| unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW | libc::SOCK_CLOEXEC, 0) }).map_err(|e| format!("packet socket: {e}"))?;
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        // Past the tap's qdisc, straight to the tap: ahead of what a plugged qdisc holds back
+        // (`net::plug_tap`). Without it (older kernels) the frames queue there too.
+        const SOL_PACKET: libc::c_int = 263;
+        const PACKET_QDISC_BYPASS: libc::c_int = 20;
+        let one: libc::c_int = 1;
+        unsafe { libc::setsockopt(fd.as_raw_fd(), SOL_PACKET, PACKET_QDISC_BYPASS, (&one as *const libc::c_int).cast(), std::mem::size_of::<libc::c_int>() as u32) };
         let mut header = [0u8; 14];
         header[..6].copy_from_slice(&crate::net::parse_mac(crate::net::GUEST_MAC)?);
         header[6..12].copy_from_slice(&crate::net::parse_mac(crate::net::GATEWAY_MAC)?);

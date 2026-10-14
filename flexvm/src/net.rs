@@ -127,6 +127,119 @@ pub fn neighbour(ip: Ipv4Addr, tap: &str) -> Result<u32> {
     Ok(ifindex)
 }
 
+const TC_H_ROOT: u32 = 0xffff_ffff;
+const TCA_KIND: u16 = 1;
+const TCA_OPTIONS: u16 = 2;
+const TCQ_PLUG_BUFFER: i32 = 0;
+const TCQ_PLUG_RELEASE_INDEFINITE: i32 = 2;
+/// Bytes a plugged tap buffers: `sch_plug` drops beyond (counted by `unplug_tap`).
+const PLUG_LIMIT: u32 = 16 << 20;
+const TCA_STATS: u16 = 3;
+
+/// struct tcmsg (family, pads, ifindex, handle, parent, info) for `tap`'s root qdisc, handle 1:.
+fn tcmsg(ifindex: u32, handle: u32) -> Vec<u8> {
+    [&[libc::AF_UNSPEC as u8, 0, 0, 0][..], &ifindex.to_ne_bytes(), &handle.to_ne_bytes(), &TC_H_ROOT.to_ne_bytes(), &0u32.to_ne_bytes()].concat()
+}
+
+/// The root plug qdisc, with TCA_KIND "plug" and its struct tc_plug_qopt (action, limit).
+fn plug_msg(ifindex: u32, action: i32) -> Vec<u8> {
+    let mut m = tcmsg(ifindex, 0x1_0000);
+    attr(&mut m, TCA_KIND, b"plug\0");
+    attr(&mut m, TCA_OPTIONS, &[&action.to_ne_bytes()[..], &PLUG_LIMIT.to_ne_bytes()].concat());
+    m
+}
+
+/// Packets the host routes out of `tap` wait in its qdisc, in their order, until
+/// `unplug_tap`; frames a packet socket sends past the qdisc (`hold::Injector`) do not.
+/// Whatever this returns, the plug may be installed (an ACK can be lost after the change):
+/// `unplug_tap` is due either way.
+pub fn plug_tap(tap: &str) -> Result<()> {
+    netlink(libc::RTM_NEWQDISC, NLM_F_CREATE | NLM_F_REPLACE, &plug_msg(ifindex(tap)?, TCQ_PLUG_BUFFER))
+}
+
+/// What waited goes out, in order, and the qdisc lets everything through from then on, a
+/// FIFO: a packet arriving meanwhile queues behind the waiting ones. Failing that (tried
+/// three times), the root qdisc goes, the tap's default coming back, and what waited with
+/// it; failing that too, that is retried in the background for a minute, so the tap never
+/// stays plugged. Returns the packets the plug dropped (past `PLUG_LIMIT`, or discarded with
+/// it), and whether it let them through.
+pub fn unplug_tap(tap: &str) -> (u64, Result<()>) {
+    let Ok(ifindex) = ifindex(tap) else { return (0, Err(format!("no tap {tap}").into())) };
+    let stats = || qdisc_stats(ifindex).unwrap_or_default();
+    let mut released = Err("not tried".into());
+    for _ in 0..3 {
+        released = netlink(libc::RTM_NEWQDISC, 0, &plug_msg(ifindex, TCQ_PLUG_RELEASE_INDEFINITE));
+        if released.is_ok() {
+            return (stats().0, Ok(()));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let (drops, queued) = stats();
+    let remove = move || netlink(libc::RTM_DELQDISC, 0, &tcmsg(ifindex, 0));
+    let Err(e) = released else { unreachable!() };
+    if (0..3).any(|_| remove().is_ok() || { std::thread::sleep(std::time::Duration::from_millis(10)); false }) {
+        return (drops + queued, Err(format!("{e}; removed the plug instead").into()));
+    }
+    let tap = tap.to_string();
+    std::thread::spawn(move || {
+        for _ in 0..60 {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            // Only while the index is still this tap's.
+            if crate::net::ifindex(&tap).ok() != Some(ifindex) {
+                return;
+            }
+            if remove().is_ok() {
+                return eprintln!("tap {tap}: plug removed");
+            }
+        }
+        eprintln!("tap {tap}: could not remove its plug");
+    });
+    (drops + queued, Err(format!("{e}; removing the plug failed too, retrying").into()))
+}
+
+/// The root qdisc's (drops, queued packets), from RTM_GETQDISC on a socket of its own: the
+/// qdisc echoed back (NLM_F_ECHO; a get without it answers nothing), no ACK, waited for up to
+/// a second.
+fn qdisc_stats(ifindex: u32) -> Option<(u64, u64)> {
+    const NLM_F_ECHO: c_int = 8;
+    let sock = socket(libc::AF_NETLINK, libc::SOCK_RAW, libc::NETLINK_ROUTE, "netlink socket").ok()?;
+    let timeout = libc::timeval { tv_sec: 1, tv_usec: 0 };
+    let size = std::mem::size_of::<libc::timeval>() as libc::socklen_t;
+    if unsafe { libc::setsockopt(sock.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVTIMEO, (&timeout as *const libc::timeval).cast(), size) } != 0 {
+        return None;
+    }
+    let body = tcmsg(ifindex, 0x1_0000);
+    let flags = ((NLM_F_REQUEST | NLM_F_ECHO) as u16).to_ne_bytes();
+    let msg = [&((16 + body.len()) as u32).to_ne_bytes()[..], &libc::RTM_GETQDISC.to_ne_bytes(), &flags, &[1, 0, 0, 0, 0, 0, 0, 0], &body].concat();
+    let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+    addr.nl_family = libc::AF_NETLINK as u16;
+    let mut buf = vec![0u8; 8192];
+    if send_to(&sock, &msg, &addr) < 0 {
+        return None;
+    }
+    let n = unsafe { libc::recv(sock.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
+    let reply = buf.get(..usize::try_from(n).ok()?)?;
+    if reply.len() < 36 || u16::from_ne_bytes([reply[4], reply[5]]) != libc::RTM_NEWQDISC {
+        return None;
+    }
+    // After nlmsghdr (16) and tcmsg (20): attributes (length, type, data, padded to 4).
+    let mut at = 36;
+    while at + 4 <= reply.len() {
+        let len = u16::from_ne_bytes([reply[at], reply[at + 1]]) as usize;
+        let kind = u16::from_ne_bytes([reply[at + 2], reply[at + 3]]);
+        if len < 4 || at + len > reply.len() {
+            return None;
+        }
+        // struct tc_stats: bytes u64, packets, drops, overlimits, bps, pps, qlen, backlog (u32).
+        if kind == TCA_STATS && len >= 4 + 36 {
+            let u32_at = |o: usize| u64::from(u32::from_ne_bytes(reply[at + 4 + o..at + 8 + o].try_into().unwrap()));
+            return Some((u32_at(12), u32_at(28)));
+        }
+        at += len.next_multiple_of(4);
+    }
+    None
+}
+
 /// struct ifinfomsg: family, pad, type, index, flags, change.
 fn ifinfomsg(ifindex: u32) -> Vec<u8> {
     [&[libc::AF_UNSPEC as u8, 0, 0, 0][..], &ifindex.to_ne_bytes(), &[0; 8]].concat()
