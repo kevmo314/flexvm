@@ -1615,6 +1615,25 @@ def echo(s, msg):
     return got == msg
 
 
+def tcp_retrans(conn):
+    """A connection's retransmits and the duplicates its peer reported (DSACKs: retransmits it
+    had already received, so spurious) from TCP_INFO (tcpi_total_retrans, tcpi_dsack_dups)."""
+    info = conn.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 232)
+    field = lambda at: int.from_bytes(info[at:at + 4], "little") if len(info) >= at + 4 else 0
+    return field(100), field(216)
+
+
+def guest_tcp_counters(host, name):
+    """The guest's TCP RetransSegs and TCPDSACKRecv (retransmits its peers reported as duplicates)."""
+    code, out = sh(host, name, "cat /proc/net/snmp /proc/net/netstat")
+    assert code == 0, out
+    # Each table is a line of names then a line of values, both "Tcp: ..." (or "TcpExt: ...").
+    stats, lines = {}, [l.split() for l in out.splitlines()]
+    for names, values in zip(lines[::2], lines[1::2]):
+        stats.update(zip(names[1:], values[1:]))
+    return int(stats["RetransSegs"]), int(stats.get("TCPDSACKRecv", 0))
+
+
 def tcp_server(host, name, port=7000):
     code, out = sh(host, name, f"setsid socat TCP-LISTEN:{port},fork,reuseaddr EXEC:cat >/dev/null 2>&1 < /dev/null &")
     assert code == 0, out
@@ -2985,15 +3004,20 @@ def ckpt_packet_hold():
     """Packets for a VM that arrive while a keep-running checkpoint has it
     paused are held and handed to it, not lost on its downed tap: a 1 kHz
     UDP sequence stream across three checkpoints arrives whole, and a TCP
-    connection keeps echoing without a retransmit."""
+    connection keeps echoing and loses nothing. The guest runs slowly for a
+    while after each pause (its first writes fault on the write protection
+    of the copy), so on a loaded host an echo can take longer than the
+    retransmit timeout: a retransmit the receiver reports as a duplicate
+    (DSACK) is spurious and allowed, one it does not would be a lost segment."""
     n = "ft-ckpt-pkt"
     ok(run(A, n))
     ip = vm_ip(A, n)
     udp_receiver(A, n)
     tcp_server(A, n)
+    guest0 = guest_tcp_counters(A, n)
     conn = socket.create_connection((ip, 7000), timeout=10)
     conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    stop, sent, echoes = threading.Event(), [0], [True]
+    stop, sent, echoes, slowest = threading.Event(), [0], [True], [0.0]
 
     def stream():
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -3004,7 +3028,9 @@ def ckpt_packet_hold():
 
     def pingpong():
         while not stop.is_set() and echoes[0]:
+            t = time.monotonic()
             echoes[0] = echo(conn, b"x" * 32)
+            slowest[0] = max(slowest[0], time.monotonic() - t)
             time.sleep(0.002)
 
     threads = [threading.Thread(target=stream, daemon=True), threading.Thread(target=pingpong, daemon=True)]
@@ -3019,8 +3045,7 @@ def ckpt_packet_hold():
     stop.set()
     for t in threads:
         t.join(10)
-    info = conn.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 104)
-    retrans = int.from_bytes(info[100:104], "little")
+    retrans, dsacks = tcp_retrans(conn)
     conn.close()
     time.sleep(0.3)
     check("ckpt packet hold: checkpoints taken, vm running", all(r["ok"] for r in results) and where(n) == {A: "running"},
@@ -3034,7 +3059,12 @@ def ckpt_packet_hold():
     code, out = sh(A, n, "sort -u /tmp/udp | wc -l")
     got = int(out) if code == 0 and out.isdigit() else -1
     check("ckpt packet hold: no udp datagram lost", got == sent[0], f"sent {sent[0]}, received {got}")
-    check("ckpt packet hold: tcp echoed throughout, no retransmit", echoes[0] and retrans == 0, f"retransmits {retrans}")
+    guest = [b - a for a, b in zip(guest0, guest_tcp_counters(A, n))]
+    pauses = [(r.get("result") or {}).get("paused_ms") for r in results]
+    check("ckpt packet hold: tcp echoed throughout, no segment lost (any retransmit a duplicate)",
+          echoes[0] and retrans <= dsacks and guest[0] <= guest[1],
+          f"retransmits {retrans} (duplicates {dsacks}), the guest's {guest[0]} (duplicates {guest[1]}); "
+          f"slowest echo {slowest[0] * 1e3:.0f} ms, pauses {pauses} ms")
     cleanup(n)
     for p in paths:
         rm_ckpt(p)
@@ -5219,3 +5249,4 @@ finally:
     stop_listeners()
 print("failures:", failures)
 sys.exit(1 if failures else 0)
+
