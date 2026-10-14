@@ -653,7 +653,6 @@ fn bucket_floor(i: usize) -> u64 {
 struct Pending {
     addr: u64,
     flags: u64,
-    /// When its event was read.
     read: Instant,
     /// Its kind (`KINDS`), when known before it is resolved: it waited for
     /// another installer, or had its run fetched.
@@ -712,7 +711,6 @@ pub struct Pager {
     template_next: AtomicUsize,
     failed: OnceLock<String>,
     stop: AtomicBool,
-    /// The fault-serving thread, joined by `join`.
     thread: Mutex<Option<thread::JoinHandle<()>>>,
     /// Memory is registered for write-protect faults and write tracking is on.
     tracking: AtomicBool,
@@ -763,7 +761,6 @@ pub struct Frozen {
     /// The dirty bits taken, which a checkpoint that fails gives back
     /// (`Pager::unfreeze`).
     taken: Vec<u64>,
-    /// Ranges write-protected, and how long that took.
     pub protected: usize,
     pub protect: Duration,
 }
@@ -851,9 +848,8 @@ impl Pager {
         }
     }
 
-    /// Sets the initial page states and where their REMOTE pages come from,
-    /// for a pager started without them. Only before Firecracker loads a
-    /// snapshot.
+    /// Sets the initial page states and their origin, for a pager started
+    /// without them. Only before Firecracker loads a snapshot.
     pub fn seed(&self, runs: Runs, origin: Origin) -> Result<()> {
         if self.pages.get().is_some() || self.initial.lock().unwrap().is_some() {
             bail!("pager already seeded");
@@ -1256,7 +1252,6 @@ impl Pager {
         self.cow.lock().unwrap().clone().filter(|c| c.active())
     }
 
-    /// Counts pages per state.
     pub fn census(&self) -> [usize; 6] {
         let mut c = [0usize; 6];
         let pages = self.pages();
@@ -1319,7 +1314,6 @@ impl Pager {
         Some((m.base_host_virt_addr + (off - m.offset), m))
     }
 
-    /// Reads guest memory at `offset` out of the Firecracker process.
     pub fn read_guest(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
         let Some(m) = self.locate(offset) else { bail!("offset {offset:#x} outside guest memory") };
         if offset + buf.len() as u64 > m.offset + m.size as u64 {
@@ -1755,7 +1749,6 @@ impl Pager {
         Ok(n)
     }
 
-    /// Whether write tracking is on (see `arm_tracking`).
     pub fn tracking(&self) -> bool {
         self.tracking.load(Ordering::SeqCst)
     }
@@ -1981,10 +1974,8 @@ impl Pager {
     }
 
     /// Fetches and installs the runs faults claimed (`demand`), so that the
-    /// event thread never waits for the network or disk: faults on other
-    /// pages, and REMOVEs, are served meanwhile. The faulting thread is
-    /// woken by the copy, the event thread by the pages settling. Returns
-    /// once no REMOTE page is left, or the pager stops or gives up.
+    /// event thread never waits for the network or disk. The faulting thread
+    /// is woken by the copy, the event thread by the pages settling.
     fn fetch_faults(&self, fetch: &mut Fetch) {
         let mut buf = vec![0u8; REMOTE_FAULT_RUN * PAGE_SIZE];
         let pages = self.pages();
@@ -2236,9 +2227,8 @@ impl Link {
     }
 }
 
-/// Fetches `page` from a migration source's page server, retrying as a
-/// pager would (for up to `SOURCE_TIMEOUT`, and not past `deadline`):
-/// whether it serves pages at all.
+/// Whether a migration source serves pages at all: fetches `page`, retrying
+/// as a pager would (for up to `SOURCE_TIMEOUT`, and not past `deadline`).
 pub fn probe(source: &Source, page: u64, deadline: Instant) -> io::Result<()> {
     let give_up = deadline.min(Instant::now() + SOURCE_TIMEOUT);
     let mut backoff = BACKOFF_MIN;
@@ -2284,7 +2274,6 @@ impl PageClient {
 }
 
 impl<S: Read + Write> PageClient<S> {
-    /// Asks the page server on `stream` for `source`'s pages.
     fn new(mut stream: S, source: &Source) -> io::Result<Self> {
         let mut hello = serde_json::to_vec(&serde_json::json!({"op": "pages", "name": source.vm, "mig": source.mig}))?;
         hello.push(b'\n');
@@ -2435,7 +2424,6 @@ pub fn remote_among(runs: &Runs, wanted: impl IntoIterator<Item = u64>) -> Vec<u
     wanted.into_iter().filter(is_remote).collect()
 }
 
-/// Every page, for `Pager::chunks`.
 const ALL: [(usize, usize); 1] = [(0, usize::MAX)];
 
 /// The maximal runs `[a, b)` within `[first, end)` of pages that pass `f`
