@@ -225,6 +225,16 @@ impl Staging {
         Ok(f)
     }
 
+    /// The map depends on the page copy, but its write can overlap the pages' fsync.
+    fn sync_pages_and_pagemap(&self, pages: &File, map: &[u8]) -> Result<File> {
+        std::thread::scope(|s| {
+            let syncing = std::thread::Builder::new().spawn_scoped(s, || pages.sync_all())?;
+            let pagemap = self.add_file("pagemap", map);
+            syncing.join().map_err(|_| "pages fsync thread panicked")??;
+            Ok(pagemap?)
+        })
+    }
+
     /// Allocates disk space ahead of the pause.
     pub fn preallocate(&mut self, pages: usize) -> Result<()> {
         let file = PagesFile::new(self.create("pages")?);
@@ -247,16 +257,26 @@ impl Staging {
         still_valid: impl FnOnce() -> Result<()>,
     ) -> std::result::Result<(Manifest, String), CommitError> {
         let pages = if let Some(p) = self.pages.take() { p } else { PagesFile::new(self.create("pages")?) };
-        let out = write_pages(&vm.template, src, runs, &pages, writer_threads(), parent.is_some())?;
-        t.mark("write_pages");
-        pages.file.sync_all()?;
+        // Join every writer before creating the manifest, including on failure.
+        let written: Result<_> = std::thread::scope(|s| {
+            let state = std::thread::Builder::new().spawn_scoped(s, || -> Result<_> {
+                let vmstate = std::fs::read(&self.vmstate)?;
+                ensure!(vmstate.len() as u64 <= MAX_VMSTATE, "its vmstate is over {MAX_VMSTATE} bytes");
+                let file = self.add_file("vmstate", &vmstate)?;
+                Ok((vmstate, file))
+            })?;
+            let copied = (|| -> Result<_> {
+                let out = write_pages(&vm.template, src, runs, &pages, writer_threads(), parent.is_some())?;
+                t.mark("write_pages");
+                let pagemap = self.sync_pages_and_pagemap(&pages.file, &out.map)?;
+                Ok((out, pagemap))
+            })();
+            let (vmstate, vmstate_file) = state.join().map_err(|_| "vmstate writer thread panicked")??;
+            let (out, pagemap) = copied?;
+            Ok((out, pagemap, vmstate, vmstate_file))
+        });
+        let (out, pagemap, vmstate, vmstate_file) = written?;
         let map = &out.map;
-        let pagemap = self.add_file("pagemap", map)?;
-        let vmstate = std::fs::read(&self.vmstate)?;
-        if vmstate.len() as u64 > MAX_VMSTATE {
-            return Err(format!("its vmstate is over {MAX_VMSTATE} bytes").into());
-        }
-        let vmstate_file = self.add_file("vmstate", &vmstate)?;
         let files = BTreeMap::from([
             ("vmstate".into(), FileSum { len: vmstate.len() as u64, hash: sum(&vmstate) }),
             ("pagemap".into(), FileSum { len: map.len() as u64, hash: sum(map) }),
@@ -1210,6 +1230,33 @@ mod tests {
         assert_eq!(buf.as_ptr() as usize % PAGE_SIZE, 0);
         assert!(as_bytes(&mut buf).len() == 2 * PAGE_SIZE && as_bytes(&mut buf).iter().all(|&b| b == 0));
         assert_eq!(aligned(isize::MAX as usize / PAGE_SIZE).err().unwrap().kind(), io::ErrorKind::OutOfMemory);
+    }
+
+    #[test]
+    fn page_sync_and_pagemap_errors_leave_staging_unpublished() {
+        let dir = tmp("parallel-sync");
+        let dest = dir.join("ck");
+        {
+            let s = Staging::new(&dest, dir.join("vmstate.private")).unwrap();
+            let pages = s.create("pages").unwrap();
+            (&pages).write_all(b"pages").unwrap();
+            let map = s.sync_pages_and_pagemap(&pages, b"map").unwrap();
+            assert_eq!(map.metadata().unwrap().len(), 3);
+            assert_eq!(read_at(s.ck.as_raw_fd(), "pagemap", 10).unwrap().1, b"map");
+            // O_EXCL failure must still join the pages' fsync.
+            assert!(s.sync_pages_and_pagemap(&pages, b"replacement").is_err());
+            assert!(!exists_at(s.ck.as_raw_fd(), c"manifest.json"));
+            assert!(!dest.exists());
+        }
+        {
+            let s = Staging::new(&dest, dir.join("vmstate.private")).unwrap();
+            // /dev/null accepts writes but cannot be fsynced: propagate the worker's error.
+            let pages = File::options().write(true).open("/dev/null").unwrap();
+            assert!(s.sync_pages_and_pagemap(&pages, b"map").is_err());
+            assert!(!exists_at(s.ck.as_raw_fd(), c"manifest.json"));
+            assert!(!dest.exists());
+        }
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

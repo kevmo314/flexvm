@@ -248,12 +248,13 @@ impl Vm {
         crate::net::set_link_up(&self.tap, true)?;
         // The link-down took the VM's /32 route with it.
         crate::net::attach(self.ip, &self.tap)?;
-        self.unpark_balloon();
         self.limit.restore();
         if self.was_paused.swap(false, Ordering::SeqCst) {
+            self.unpark_balloon();
             return Ok(State::Paused);
         }
         self.fc(|fc| fc.resume())?;
+        self.unpark_balloon();
         Ok(State::Running)
     }
 
