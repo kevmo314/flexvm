@@ -519,7 +519,7 @@ fn mkfs(dir: &Path, entries: u64, dest: &Path) -> Result<()> {
     let image = create_new(dest)?;
     image.set_len(mib << 20)?;
     let out = Command::new("mkfs.ext4")
-        .args(["-q", "-F", "-b", "4096", "-L", "flexroot", "-N", &inodes.to_string(), "-d"])
+        .args(["-q", "-F", "-b", "4096", "-I", "256", "-L", "flexroot", "-N", &inodes.to_string(), "-d"])
         .arg(dir)
         .arg(format!("/proc/{}/fd/{}", std::process::id(), image.as_raw_fd()))
         .output()
