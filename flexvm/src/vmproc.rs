@@ -1105,8 +1105,9 @@ fn read_mem_request(conn: &UnixStream) -> Option<u64> {
     }
 }
 
-/// Kept under evict.lock in RUN so changing deciders shares peer cooldowns,
-/// while a reboot clears them.
+/// Per VM and peer (a peer may refuse a big VM but take a small one), in
+/// RUN/evict.backoff under evict.lock, so changing deciders share it and a
+/// reboot clears it. An entry a minute past its cooldown is forgotten.
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct PeerBackoff {
     delay: u64,
@@ -1163,25 +1164,28 @@ fn relieve(host: &Host, starved_here: bool) {
     let backoff_path = host.run.join("evict.backoff");
     let Ok(saved) = crate::host::load::<std::collections::HashMap<String, PeerBackoff>>(&backoff_path) else { return };
     let mut backoff = saved.unwrap_or_default();
+    let now = eviction_time();
+    backoff.retain(|_, b| now < b.until.saturating_add(60));
     // A VM busy with anything (a checkpoint's copy, a migration, an arrival
     // settling) is skipped, never waited for: `if_idle`.
     for vm in &running {
         let why = if vm.starved { "cannot grow here" } else { "the host is low on memory" };
         for peer in &host.cfg.peers {
-            if backoff.get(peer).is_some_and(|b| !b.ready(eviction_time())) {
+            let key = format!("{} {peer}", vm.name);
+            if backoff.get(&key).is_some_and(|b| !b.ready(eviction_time())) {
                 continue;
             }
             eprintln!("vm {}: {why} ({avail} MiB available); migrating to {peer}", vm.name);
             match call(host, &vm.name, json!({"op": "migrate", "to": peer, "if_idle": true})) {
                 Ok(_) => {
-                    backoff.remove(peer);
+                    backoff.remove(&key);
                     let _ = crate::host::store(&backoff_path, &backoff, false);
                     return eprintln!("vm {}: migrated to {peer}", vm.name);
                 }
                 Err(e) if e.to_string().contains(BUSY) => break,
                 Err(e) => {
                     eprintln!("vm {}: migrating to {peer}: {e}", vm.name);
-                    backoff.entry(peer.clone()).or_default().refuse(eviction_time());
+                    backoff.entry(key).or_default().refuse(eviction_time());
                     if crate::host::store(&backoff_path, &backoff, false).is_err() {
                         return;
                     }
