@@ -484,15 +484,12 @@ impl Pager {
 
     /// Runs of pages populated so far, as `(first_page, count)`.
     pub fn present_runs(&self) -> Vec<(u64, u64)> {
-        let pages = self.pages();
-        let mut runs: Vec<(u64, u64)> = Vec::new();
-        for p in pages.not_base(0, pages.len()).filter(|&p| pages.get(p) == PRESENT) {
-            match runs.last_mut() {
-                Some((f, n)) if *f + *n == p as u64 => *n += 1,
-                _ => runs.push((p as u64, 1)),
-            }
-        }
-        runs
+        let (pages, mut p) = (self.pages(), 0);
+        std::iter::from_fn(|| {
+            let a = pages.next_in(PRESENT, p, pages.len());
+            p = pages.next_not(PRESENT, a, pages.len());
+            (a < p).then_some((a as u64, (p - a) as u64))
+        }).collect()
     }
 
     /// Installs REMOTE pages whose contents came along with the vmstate (one `PAGE_SIZE` slice of `data` per page of
