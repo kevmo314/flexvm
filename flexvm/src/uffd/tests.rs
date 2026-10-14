@@ -6,9 +6,9 @@ use super::*;
 use std::io::{Read, Write};
 
 fn pages(states: &[u8]) -> Pages {
-    let p = Pages::new(states.len());
+    let mut p = Pages::new(states.len());
     for (i, &s) in states.iter().enumerate() {
-        p.set(i, s);
+        p.fill(i, 1, s);
     }
     p
 }
@@ -557,13 +557,37 @@ fn next_not_base_finds_every_state() {
     }
 
     // Untouched chunks are skipped without reading them.
-    let p = Pages::new(3 * CHUNK + 5);
+    let mut p = Pages::new(3 * CHUNK + 5);
     assert_eq!(p.next_not(BASE, 0, p.len()), p.len());
-    p.set(2 * CHUNK + 7, ZERO);
+    p.fill(2 * CHUNK + 7, 1, ZERO);
     assert_eq!(p.next_not(BASE, 0, p.len()), 2 * CHUNK + 7);
     assert_eq!(p.claim(CHUNK + 3, 2, BASE, |_| true), 2);
     assert_eq!(p.next_not(BASE, 0, p.len()), CHUNK + 3);
     assert_eq!(p.next_not(BASE, CHUNK + 5, p.len()), 2 * CHUNK + 7);
+}
+
+#[test]
+fn fill_seeds_runs_and_marks_their_chunks() {
+    let n = 64 * CHUNK + 3 * CHUNK + 9;
+    let mut p = Pages::new(n);
+    let runs = [(CHUNK - 2, 4, REMOTE), (3 * CHUNK, CHUNK, ZERO), (64 * CHUNK + 5, 2 * CHUNK, REMOTE), (n - 1, 1, ZERO)];
+    for &(first, count, state) in &runs {
+        p.fill(first, count, state);
+    }
+    // Out of bounds: ignored.
+    p.fill(n, 5, REMOTE);
+    p.fill(n - 1, usize::MAX, ZERO);
+    let want = |i: usize| runs.iter().find(|&&(f, c, _)| (f..f + c).contains(&i)).map_or(BASE, |r| r.2);
+    for i in 0..n {
+        assert_eq!(p.get(i), want(i), "page {i}");
+    }
+    for c in 0..n.div_ceil(CHUNK) {
+        let any = (c * CHUNK..((c + 1) * CHUNK).min(n)).any(|i| want(i) != BASE);
+        assert_eq!(p.touched(c * CHUNK), any, "chunk {c}");
+    }
+    assert_eq!(p.count(REMOTE, 0, n), 4 + 2 * CHUNK);
+    assert_eq!(p.next_in(ZERO, 0, n), 3 * CHUNK);
+    assert_eq!(p.next_not(BASE, 4 * CHUNK, n), 64 * CHUNK + 5);
 }
 
 #[test]
@@ -685,7 +709,17 @@ fn prefetch_racing_remove() {
 
 #[test]
 fn incoming_runs_are_validated() {
-    assert_eq!(remote_pages(&vec![(0, 2, REMOTE), (2, 3, ZERO), (8, 2, REMOTE)], 10).unwrap(), 4);
+    let map = |spans: &[(usize, usize)]| -> Vec<Mapping> {
+        spans.iter().map(|&(a, b)| Mapping { base_host_virt_addr: 0, offset: (a * PAGE_SIZE) as u64, size: (b - a) * PAGE_SIZE }).collect()
+    };
+    let one = map(&[(0, 10)]);
+    assert_eq!(remote_pages(&vec![(0, 2, REMOTE), (2, 3, ZERO), (8, 2, REMOTE)], &one).unwrap(), 4);
+    // Regions [0, 4) and [4, 6) (adjacent) and [8, 10), listed in any order: runs may cross adjacent regions, not gaps.
+    let gapped = map(&[(8, 10), (4, 6), (0, 4)]);
+    assert_eq!(remote_pages(&vec![(0, 6, REMOTE), (8, 2, ZERO)], &gapped).unwrap(), 6);
+    for bad in [vec![(5, 2, REMOTE)], vec![(6, 2, REMOTE)], vec![(7, 2, ZERO)], vec![(9, 2, REMOTE)], vec![(10, 1, REMOTE)]] {
+        assert!(remote_pages(&bad, &gapped).is_err(), "{bad:?}");
+    }
     for bad in [
         vec![(0, 2, REMOTE), (1, 2, REMOTE)],
         vec![(4, 2, REMOTE), (0, 2, REMOTE)],
@@ -696,7 +730,7 @@ fn incoming_runs_are_validated() {
         vec![(0, 1, DISCARDED)],
         vec![(0, 1, PRESENT)],
     ] {
-        assert!(remote_pages(&bad, 10).is_err(), "{bad:?}");
+        assert!(remote_pages(&bad, &one).is_err(), "{bad:?}");
     }
 }
 

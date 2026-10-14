@@ -412,7 +412,7 @@ impl Pager {
         let (body, fd) = recv_with_fd(stream.as_raw_fd())?;
         let mappings: Vec<Mapping> = serde_json::from_slice(&body)?;
         let total = mappings.iter().map(|m| m.offset as usize + m.size).max().unwrap_or(0) / PAGE_SIZE;
-        let pages = Pages::new(total);
+        let mut pages = Pages::new(total);
         let initial = {
             // No deadline of its own: the migration's protocol deadline drops the prepared VM, which stops the pager.
             let mut initial = self.initial.lock().unwrap();
@@ -432,9 +432,9 @@ impl Pager {
                 }
             }
             let _ = self.pull_started.set(Instant::now());
-            let remote = remote_pages(&runs, total)?;
+            let remote = remote_pages(&runs, &mappings)?;
             for (first, count, state) in runs {
-                (first as usize..(first + count) as usize).for_each(|p| pages.set(p, state));
+                pages.fill(first as usize, count as usize, state);
             }
             self.remote_left.store(remote, Ordering::SeqCst);
             match origin {
@@ -1011,13 +1011,25 @@ fn regions(mappings: &[Mapping]) -> Vec<(u64, u64)> {
     mappings.iter().map(|m| (m.offset, m.size as u64)).collect()
 }
 
-/// Checks page runs from a migration source (ascending, disjoint, in bounds, and only states a source exports) and
-/// counts their REMOTE pages.
-fn remote_pages(runs: &Runs, total: usize) -> Result<usize> {
+/// Checks page runs from a migration source or checkpoint (ascending, disjoint, each inside guest memory, and only
+/// states a source exports) and counts their REMOTE pages. A run in a gap between regions would never be pulled (the
+/// pullers walk the regions), so the source would never be released.
+fn remote_pages(runs: &Runs, mappings: &[Mapping]) -> Result<usize> {
+    // The regions' pages, adjacent ones merged: a run may cross from one into the next.
+    let mut spans: Vec<(u64, u64)> = mappings.iter().map(|m| m.span()).map(|(a, b)| (a as u64, b as u64)).filter(|s| s.0 < s.1).collect();
+    spans.sort_unstable();
+    spans.dedup_by(|b, a| {
+        let merge = b.0 <= a.1;
+        if merge {
+            a.1 = a.1.max(b.1);
+        }
+        merge
+    });
+    let inside = |first: u64, end: u64| spans.get(spans.partition_point(|s| s.1 <= first)).is_some_and(|s| s.0 <= first && end <= s.1);
     let (mut next, mut remote) = (0, 0);
     for &(first, count, state) in runs {
         match first.checked_add(count) {
-            Some(end) if first >= next && count > 0 && end <= total as u64 && (state == REMOTE || state == ZERO) => {
+            Some(end) if first >= next && count > 0 && inside(first, end) && (state == REMOTE || state == ZERO) => {
                 next = end;
                 if state == REMOTE {
                     remote += count as usize;
