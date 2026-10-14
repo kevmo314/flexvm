@@ -281,7 +281,7 @@ fn staging_is_private_never_overwrites_and_cleans_up() {
     let dest = dir.join("ck");
     let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
     // Staging left by a process that is gone is cleared if it is private like ours; anything else is left alone.
-    let (stale, foreign) = (dir.join(format!("{STAGING_PREFIX}999999999-1")), dir.join(format!("{STAGING_PREFIX}999999998-1")));
+    let (stale, foreign) = (dir.join(format!("{STAGING_PREFIX}{}-stale", std::process::id())), dir.join(format!("{STAGING_PREFIX}999999998-1")));
     fs::create_dir_all(stale.join("ck")).unwrap();
     fs::write(stale.join("ck/pages"), b"x").unwrap();
     fs::write(stale.join("ck/GEN"), b"generation").unwrap();
@@ -290,6 +290,8 @@ fn staging_is_private_never_overwrites_and_cleans_up() {
     fs::set_permissions(&foreign, fs::Permissions::from_mode(0o755)).unwrap();
     let s = Staging::new(&dest, dir.join("vmstate.private")).unwrap();
     assert!(!stale.exists() && foreign.exists());
+    let other = Staging::new(&dir.join("other"), dir.join("other.vmstate")).unwrap();
+    drop(other);
     let ours = format!("{STAGING_PREFIX}{}", std::process::id());
     let mine = || fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()).filter(|p| p.file_name().unwrap().to_string_lossy().starts_with(&ours)).collect::<Vec<_>>();
     assert_eq!(mine().iter().map(|p| mode(p)).collect::<Vec<_>>(), [0o700]);

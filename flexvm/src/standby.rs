@@ -49,7 +49,9 @@ pub fn target(host: &Host, template: &str) -> usize {
 pub fn live(host: &Host, template: &str) -> Vec<Ident> {
     let mut ids = Vec::new();
     for e in std::fs::read_dir(dir(host, template)).into_iter().flatten().flatten() {
-        if !e.file_name().to_string_lossy().ends_with(".lock") {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('.') || !name.ends_with(".lock") {
             continue;
         }
         let Ok(f) = File::open(e.path()) else { continue };
@@ -206,9 +208,11 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
     std::fs::create_dir_all(&d)?;
     let me = Ident::me();
     let (lock_path, sock) = (d.join(format!("{}.lock", me.pid)), d.join(format!("{mine}.{}.sock", me.pid)));
-    let lock = File::create(&lock_path)?;
-    unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
+    let tmp = d.join(format!(".{}.lock", me.pid));
+    let lock = File::create(&tmp)?;
+    crate::host::flock(&lock, libc::LOCK_EX)?;
     lock.write_all_at(&serde_json::to_vec(&me)?, 0)?;
+    std::fs::rename(&tmp, &lock_path)?;
     p.files.lock().unwrap().extend([sock.clone(), lock_path]);
     let ready = load(p.spawner.take(None)?, tpl.clone())?;
     // Taken now, so a claim does not scan memory or ask Firecracker.

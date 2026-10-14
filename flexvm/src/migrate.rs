@@ -237,7 +237,7 @@ impl Proc {
             }
         };
         if let Some(h) = self.holder() {
-            release_into(h, vm.ip, mig, vm, Duration::ZERO, |()| crate::net::attach(vm.ip, &vm.tap));
+            let _ = release_into(h, vm.ip, mig, vm, Duration::ZERO, |()| crate::net::attach(vm.ip, &vm.tap));
         }
         let (s, e) = match vm.resume() {
             Ok(s) => (s, e),
@@ -488,7 +488,7 @@ impl Proc {
                 (Some(h), true) => {
                     // `release_stall`: the route change waits long (for RTNL, say).
                     let start = Instant::now();
-                    let released = release_into(h, vm.ip, mig, &vm, STRAGGLERS, |()| {
+                    let (released, switched) = release_into(h, vm.ip, mig, &vm, STRAGGLERS, |()| {
                         if fault("release_stall") {
                             thread::sleep(Duration::from_millis(300));
                         }
@@ -500,7 +500,7 @@ impl Proc {
                             eprintln!("vm {}: dropped {} of the packets held while taking {} over", vm.name, s.dropped + s.dropped_target, vm.ip);
                         }
                     }
-                    Ok(())
+                    switched
                 }
                 _ if !routed => vm.route_here(),
                 _ => Ok(()),
@@ -513,7 +513,21 @@ impl Proc {
                     }
                     eprintln!("vm {}: {} went to a newer vm; not routing it here", vm.name, vm.ip);
                 }
-                Err(e) => eprintln!("vm {}: routing {} to its tap: {e}", vm.name, vm.ip),
+                Err(e) => {
+                    eprintln!("vm {}: routing {} to its tap: {e}; retrying", vm.name, vm.ip);
+                    if let Some(h) = holder.as_deref() {
+                        h.forget(vm.ip, mig);
+                    }
+                    let mut delay = Duration::from_millis(100);
+                    for _ in 0..10 {
+                        thread::sleep(delay);
+                        match p.if_current(|| vm.route_here()) {
+                            Ok(_) => break,
+                            Err(e) => eprintln!("vm {}: routing {} to its tap: {e}", vm.name, vm.ip),
+                        }
+                        delay = (delay * 2).min(Duration::from_secs(5));
+                    }
+                }
             }
             p.held_in.lock().unwrap().take();
             p.announce();
@@ -708,27 +722,30 @@ fn outcome(to: &str, mig: u64, patience: Duration) -> Option<Outcome> {
 }
 
 /// Injects held packets, `switch`es the route, then injects stragglers. A
-/// failed switch leaves the address held until the caller `forget`s it.
-pub fn release_into(h: &Holder, ip: Ipv4Addr, mig: u64, vm: &Vm, linger: Duration, switch: impl FnOnce(()) -> Result<()>) -> Option<hold::Stats> {
+/// failed switch forgets the hold; the caller retries the route.
+pub fn release_into(h: &Holder, ip: Ipv4Addr, mig: u64, vm: &Vm, linger: Duration, switch: impl FnOnce(()) -> Result<()>) -> (Option<hold::Stats>, Result<()>) {
     if !h.holding_for(ip, mig) {
-        return None;
+        return (None, Ok(()));
     }
     let inj = match crate::net::set_link_up(&vm.tap, true).and_then(|()| hold::Injector::new(&vm.tap)) {
         Ok(inj) => inj,
         Err(e) => {
             eprintln!("vm {}: dropping held packets: {e}", vm.name);
             h.forget(ip, mig);
-            return None;
+            return (None, Err(e));
         }
     };
-    let (mut stats, switched) = h.release_local(ip, mig, &mut |p| hold::valid(p, ip) && inj.send(p), || switch(()), linger)?;
-    if let Err(e) = switched {
+    let Some((mut stats, switched)) = h.release_local(ip, mig, &mut |p| hold::valid(p, ip) && inj.send(p), || switch(()), linger) else {
+        return (None, Ok(()));
+    };
+    if let Err(e) = &switched {
+        h.forget(ip, mig);
         eprintln!("vm {}: routing {ip} back to its tap after injecting the held packets: {e}", vm.name);
     }
     (stats.injected, stats.dropped_target) = (stats.packets, inj.dropped());
     // Closing a packet socket waits for an RCU grace period; the VM need not.
     thread::spawn(move || drop(inj));
-    Some(stats)
+    (Some(stats), switched)
 }
 
 /// 53 bits, so any JSON parser keeps it.

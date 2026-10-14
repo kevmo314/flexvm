@@ -186,14 +186,19 @@ fn cached_blob<R: Read>(digest: &str, size: u64, blobs: &Path, download: impl Fn
 }
 
 pub(super) fn sweep_parts(dir: &Path) {
+    let Ok(lock) = std::fs::File::open(dir) else { return };
+    if crate::host::flock(&lock, libc::LOCK_EX | libc::LOCK_NB).is_err() {
+        return;
+    }
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some((hex, pid)) = name.to_str().and_then(|n| n.rsplit_once(".part")) else { continue };
-        let pid = pid.parse::<libc::pid_t>().unwrap_or(0);
-        let dead = pid > 0 && unsafe { libc::kill(pid, 0) } != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
-        if dead && hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-            let _ = std::fs::remove_file(entry.path());
+        if pid.parse::<u32>().is_ok_and(|p| p > 0) && hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            let Ok(f) = std::fs::File::open(entry.path()) else { continue };
+            if crate::host::flock(&f, libc::LOCK_EX | libc::LOCK_NB).is_ok() {
+                let _ = std::fs::remove_file(entry.path());
+            }
         }
     }
 }
@@ -272,7 +277,7 @@ mod tests {
     }
 
     #[test]
-    fn sweep_removes_only_dead_downloads() {
+    fn sweep_removes_only_unlocked_downloads() {
         let dir = super::super::unpack::tests::tmpdir("parts");
         let hex = "a".repeat(64);
         let stale = dir.join(format!("{hex}.part2147483647"));
@@ -282,9 +287,14 @@ mod tests {
         for path in [&stale, &live, &other, &blob] {
             std::fs::write(path, "data").unwrap();
         }
+        let lock = std::fs::File::open(&live).unwrap();
+        crate::host::flock(&lock, libc::LOCK_EX).unwrap();
         sweep_parts(&dir);
         assert!(!stale.exists());
         assert!(live.exists() && other.exists() && blob.exists());
+        drop(lock);
+        sweep_parts(&dir);
+        assert!(!live.exists());
     }
 
     #[test]

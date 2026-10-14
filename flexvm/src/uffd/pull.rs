@@ -43,7 +43,11 @@ impl Pager {
             };
             let file = file.clone();
             thread::spawn(move || match puller {
-                false => p.fetch_faults(&p.lanes[i], &mut fetch),
+                false => {
+                    p.fetch_faults(&p.lanes[i], &mut fetch);
+                    // Its connection, else left in CLOSE_WAIT for the VM's life.
+                    p.lanes[i].detach();
+                }
                 true => p.pull(i - FAULT_FETCHERS, file, &mut fetch),
             });
         }

@@ -342,7 +342,7 @@ impl Lane {
     }
 
     /// The fetcher's connection is gone: requests go out again on the next.
-    fn detach(&self) {
+    pub(super) fn detach(&self) {
         let mut q = self.q.lock().unwrap();
         q.conn = None;
         q.sent = 0;
