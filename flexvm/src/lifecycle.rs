@@ -569,6 +569,8 @@ impl Proc {
         if cow {
             hold.end().inspect_err(|_| vm.pager.unfreeze(&frozen))?;
             pause = Some(paused.elapsed());
+            // Out of the pause: `ls` shows it running while the copy goes on (#152).
+            self.publish();
             t.mark("resume");
             growth = Some(CopyGrowth::start(vm));
             if fault("ckpt_abort") {
@@ -692,16 +694,11 @@ impl PacketHold<'_> {
     }
 
     fn end(&mut self) -> Result<State> {
-        let holder = self.d.holder();
+        let Some(h) = self.d.holder() else { return self.vm.end_checkpoint() };
         let (ip, tap) = (self.vm.ip, &self.vm.tap);
-        if let Some(h) = holder {
-            self.stats = crate::migrate::release_into(h, ip, self.id, self.vm, Duration::ZERO, |()| crate::net::attach(ip, tap));
-        }
+        self.stats = crate::migrate::release_into(h, ip, self.id, self.vm, Duration::ZERO, |()| crate::net::attach(ip, tap));
         let res = self.vm.end_checkpoint();
-        self.d.publish();
-        if let Some(h) = holder {
-            h.forget(ip, self.id);
-        }
+        h.forget(ip, self.id);
         res
     }
 }
