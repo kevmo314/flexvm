@@ -537,6 +537,7 @@ impl Daemon {
                 Some((parent, ids))
             }
         };
+        staging.prepare_metadata(vm.pager.total_pages() as u64, incremental)?;
         let cancelled = || -> Result<()> {
             if vm.cancel_checkpoint.swap(0, Ordering::SeqCst) > 0 {
                 bail!("vm {} is being killed", vm.name);

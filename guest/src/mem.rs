@@ -148,18 +148,19 @@ fn write_high(value: Option<u64>) -> io::Result<()> {
     let path = format!("{CGROUP}/memory.high");
     let value = value.map_or_else(|| "max".to_string(), |n| n.to_string());
     // A concurrent lift may have already installed this value. Separate opens
-    // also keep the max write independent of a worker blocked in reclaim.
+    // also keep raises and max writes independent of a worker blocked in reclaim.
     if std::fs::read_to_string(&path)?.trim() != value {
         std::fs::write(path, value)?;
     }
     Ok(())
 }
 
-/// Numeric writes can reclaim synchronously on Linux 6.1. Keep them off the
-/// watcher, coalesce pending changes, and let emergency lifts bypass the worker.
+/// Lowering writes can reclaim synchronously on Linux 6.1. Keep them off the
+/// watcher, coalesce pending changes, and let raises and lifts bypass the worker.
 struct High {
     total_kib: u64,
-    desired: Arc<Mutex<Option<u64>>>,
+    // Latest limit, and whether the watcher may write it directly for relief.
+    desired: Arc<Mutex<(Option<u64>, bool)>>,
     changed: mpsc::Sender<()>,
     pending: Arc<AtomicUsize>,
     write: Arc<dyn Fn(Option<u64>) -> io::Result<()> + Send + Sync>,
@@ -167,7 +168,7 @@ struct High {
 
 impl High {
     fn new(total_kib: u64, write: impl Fn(Option<u64>) -> io::Result<()> + Send + Sync + 'static) -> Self {
-        let desired = Arc::new(Mutex::new(Some(high_limit(total_kib))));
+        let desired = Arc::new(Mutex::new((Some(high_limit(total_kib)), false)));
         let write = Arc::new(write);
         let (changed, changes) = mpsc::channel();
         let latest = Arc::clone(&desired);
@@ -178,7 +179,7 @@ impl High {
             while changes.recv().is_ok() {
                 // Notifications carry no stale limits: always use the newest.
                 let count = 1 + changes.try_iter().count();
-                let value = *latest.lock().unwrap();
+                let value = latest.lock().unwrap().0;
                 if let Err(e) = writer(value) {
                     eprintln!("flexvm-init: memory.high write failed: {e}");
                 }
@@ -196,7 +197,12 @@ impl High {
         self.total_kib = total_kib;
         let value = high_limit(total_kib);
         if old != value {
-            *self.desired.lock().unwrap() = Some(value);
+            {
+                let mut desired = self.desired.lock().unwrap();
+                let raised = desired.0.is_some_and(|previous| value > previous);
+                *desired = (Some(value), raised);
+            }
+            self.maintain_relief();
             self.notify();
         }
     }
@@ -212,17 +218,23 @@ impl High {
         self.pending.load(Ordering::Relaxed) != 0
     }
 
-    fn maintain_lift(&self) {
-        if self.desired.lock().unwrap().is_none() {
-            if let Err(e) = (self.write)(None) {
-                eprintln!("flexvm-init: memory.high lift failed: {e}");
+    fn maintain_relief(&self) {
+        let (value, direct) = *self.desired.lock().unwrap();
+        if direct {
+            if let Err(e) = (self.write)(value) {
+                eprintln!("flexvm-init: memory.high relief failed: {e}");
             }
         }
     }
 
     fn lift(&self) {
-        let changed = self.desired.lock().unwrap().take().is_some();
-        self.maintain_lift();
+        let changed = {
+            let mut desired = self.desired.lock().unwrap();
+            let changed = desired.0.take().is_some();
+            desired.1 = true;
+            changed
+        };
+        self.maintain_relief();
         if changed {
             // Supersede queued numeric updates, and reconcile an in-flight write.
             self.notify();
@@ -288,10 +300,10 @@ fn watch(events: File, uev: OwnedFd, mut limit: High) {
         if unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout) } < 0 {
             continue;
         }
-        // A numeric write can start just after a lift, then block in reclaim.
+        // A lowering write can start just after a raise or lift, then reclaim.
         // Repair that race without waiting for the worker to return.
         if limit.busy() {
-            limit.maintain_lift();
+            limit.maintain_relief();
         }
         if fds[1].revents & libc::POLLIN != 0 && memory_changed(&uev) {
             // Plugged or unplugged: move the mark. Memory arriving ends a wait.
@@ -384,7 +396,7 @@ mod tests {
         high.lift();
         assert_eq!(received.recv_timeout(Duration::from_secs(1)).unwrap(), None);
         high.set_total((4096 << 10) + 1);
-        assert_eq!(*high.desired.lock().unwrap(), None);
+        assert_eq!(high.desired.lock().unwrap().0, None);
     }
 
     #[test]
@@ -416,11 +428,46 @@ mod tests {
         assert_eq!(received.recv_timeout(Duration::from_secs(1)).unwrap(), "reclaiming");
         assert_eq!(*installed.lock().unwrap(), Some(high_limit(2048 << 10)));
         assert!(high.busy());
-        high.maintain_lift();
+        high.maintain_relief();
         assert_eq!(*installed.lock().unwrap(), None);
         assert_eq!(received.recv_timeout(Duration::from_secs(1)).unwrap(), "lifted");
         resume.send(()).unwrap();
         assert_eq!(received.recv_timeout(Duration::from_secs(1)).unwrap(), "lifted");
+    }
+
+    #[test]
+    fn raise_bypasses_and_repairs_a_blocked_lowering_write() {
+        let (sent, received) = mpsc::channel();
+        let (resume, blocked) = mpsc::channel();
+        let blocked = Mutex::new(blocked);
+        let installed = Arc::new(Mutex::new(Some(high_limit(4096 << 10))));
+        let current = installed.clone();
+        let low = Some(high_limit(2048 << 10));
+        let mut high = High::new(4096 << 10, move |value| {
+            if value == low {
+                sent.send("starting").unwrap();
+                blocked.lock().unwrap().recv().unwrap();
+                *current.lock().unwrap() = value;
+                sent.send("reclaiming").unwrap();
+                blocked.lock().unwrap().recv().unwrap();
+            } else {
+                *current.lock().unwrap() = value;
+                let _ = sent.send("raised");
+            }
+            Ok(())
+        });
+        high.set_total(2048 << 10);
+        assert_eq!(received.recv_timeout(Duration::from_secs(1)).unwrap(), "starting");
+        high.set_total(8192 << 10);
+        assert_eq!(received.recv_timeout(Duration::from_secs(1)).unwrap(), "raised");
+        resume.send(()).unwrap();
+        assert_eq!(received.recv_timeout(Duration::from_secs(1)).unwrap(), "reclaiming");
+        assert_eq!(*installed.lock().unwrap(), low);
+        high.maintain_relief();
+        assert_eq!(*installed.lock().unwrap(), Some(high_limit(8192 << 10)));
+        assert_eq!(received.recv_timeout(Duration::from_secs(1)).unwrap(), "raised");
+        resume.send(()).unwrap();
+        assert_eq!(received.recv_timeout(Duration::from_secs(1)).unwrap(), "raised");
     }
 
     #[test]

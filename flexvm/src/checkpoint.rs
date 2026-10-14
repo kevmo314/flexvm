@@ -87,9 +87,24 @@ const UNIT: usize = 256;
 const MAX_WRITERS: usize = 12;
 /// Most bytes of VM state a checkpoint may have.
 const MAX_VMSTATE: u64 = 64 << 20;
-/// Most bytes of metadata (manifests, VM states, page maps) opening a chain
-/// may read; its pages are read lazily.
+/// Minimum metadata budget for a chain; large guests get room for a full
+/// page map as well as VM state and a manifest. Pages are read lazily.
 pub const MAX_CHAIN_META: u64 = 256 << 20;
+
+fn chain_meta_budget(guest_pages: u64) -> Result<u64> {
+    let full = guest_pages.checked_mul(36)
+        .and_then(|n| n.checked_add(24 + MAX_VMSTATE + (1 << 20)))
+        .ok_or("guest has too many pages for its metadata budget")?;
+    Ok(MAX_CHAIN_META.max(full))
+}
+
+fn metadata_room(left: u64, cost: u64, incremental: bool) -> Result<()> {
+    if cost > left {
+        let advice = if incremental { "; take a full one" } else { "" };
+        bail!("its chain has insufficient bytes of metadata budget ({cost} needed, {left} remaining){advice}");
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileSum {
@@ -192,8 +207,6 @@ fn fsync_fd(fd: RawFd) -> io::Result<()> {
     check(unsafe { libc::fsync(fd) })
 }
 
-/// The files of a checkpoint, as `Staging` writes them.
-const FILES: [&str; 4] = ["vmstate", "pages", "pagemap", "manifest.json"];
 const STAGING_PREFIX: &str = ".flexvm-staging-";
 
 /// Why a commit failed.
@@ -236,6 +249,8 @@ pub struct Staging {
     /// `pages`, once preallocated.
     pages: Option<PagesFile>,
     published: bool,
+    /// Every file created, including additions such as GEN.
+    created: Mutex<Vec<CString>>,
     /// Metadata the chain this checkpoint ends may still read when opened.
     pub meta_left: u64,
 }
@@ -272,7 +287,7 @@ impl Staging {
         check(unsafe { libc::mkdirat(outer.as_raw_fd(), c"ck".as_ptr(), 0o700) })?;
         let ck = open_dir_at(outer.as_raw_fd(), c"ck")?;
         let _ = std::fs::remove_file(&vmstate);
-        Ok(Staging { dest, parent: pfd, base, outer, outer_name, ck, vmstate, pages: None, published: false, meta_left: MAX_CHAIN_META })
+        Ok(Staging { dest, parent: pfd, base, outer, outer_name, ck, vmstate, pages: None, published: false, created: Mutex::new(Vec::new()), meta_left: MAX_CHAIN_META })
     }
 
     pub fn dest(&self) -> &Path {
@@ -291,7 +306,18 @@ impl Staging {
     }
 
     fn create(&self, name: &str) -> io::Result<File> {
-        create_at(self.ck.as_raw_fd(), name)
+        let file = create_at(self.ck.as_raw_fd(), name)?;
+        self.created.lock().unwrap().push(cname(name));
+        Ok(file)
+    }
+
+    /// Sets the full checkpoint budget, or checks the unavoidable page-map
+    /// header of a delta before pausing. Its exact cost is checked at commit.
+    pub fn prepare_metadata(&mut self, guest_pages: u64, incremental: bool) -> Result<()> {
+        if !incremental {
+            self.meta_left = chain_meta_budget(guest_pages)?;
+        }
+        metadata_room(self.meta_left, 24, incremental)
     }
 
     /// Adds a small file of the daemon's own to the checkpoint, durably,
@@ -372,9 +398,8 @@ impl Staging {
         let id = sum(&body);
         let mut text = format!("{id}\n").into_bytes();
         text.extend_from_slice(&body);
-        if (text.len() + vmstate.len() + map.len()) as u64 > self.meta_left {
-            return Err(CommitError::Failed(format!("its chain would have more than {MAX_CHAIN_META} bytes of metadata; take a full one").into()));
-        }
+        let budget = if manifest.parent.is_some() { self.meta_left } else { chain_meta_budget(manifest.guest_pages)? };
+        metadata_room(budget, (text.len() + vmstate.len() + map.len()) as u64, manifest.parent.is_some())?;
         let mf = self.create("manifest.json")?;
         (&mf).write_all(&text)?;
         mf.sync_all()?;
@@ -422,8 +447,8 @@ impl Staging {
 impl Drop for Staging {
     fn drop(&mut self) {
         if !self.published {
-            for f in FILES {
-                unsafe { libc::unlinkat(self.ck.as_raw_fd(), cname(f).as_ptr(), 0) };
+            for name in self.created.get_mut().unwrap() {
+                unsafe { libc::unlinkat(self.ck.as_raw_fd(), name.as_ptr(), 0) };
             }
             unsafe { libc::unlinkat(self.outer.as_raw_fd(), c"ck".as_ptr(), libc::AT_REMOVEDIR) };
         }
@@ -462,8 +487,12 @@ fn clear_stale(parent: &OwnedFd) {
             _ => continue,
         }
         if let Ok(ck) = open_dir_at(outer.as_raw_fd(), c"ck") {
-            for f in FILES {
-                unsafe { libc::unlinkat(ck.as_raw_fd(), cname(f).as_ptr(), 0) };
+            if let Ok(files) = std::fs::read_dir(format!("/proc/self/fd/{}", ck.as_raw_fd())) {
+                for file in files.flatten() {
+                    if let Ok(name) = CString::new(file.file_name().as_bytes()) {
+                        unsafe { libc::unlinkat(ck.as_raw_fd(), name.as_ptr(), 0) };
+                    }
+                }
             }
         }
         unsafe { libc::unlinkat(outer.as_raw_fd(), c"ck".as_ptr(), libc::AT_REMOVEDIR) };
@@ -840,7 +869,7 @@ struct Link {
 
 impl Link {
     /// Reads at most `meta_left` bytes of metadata, and takes them off it.
-    fn open(dir: &Path, meta_left: &mut u64) -> Result<Link> {
+    fn open(dir: &Path, meta_left: &mut Option<u64>) -> Result<Link> {
         let dir = dir.canonicalize().map_err(|e| format!("checkpoint {}: {e}", dir.display()))?;
         let bad = |why: String| format!("checkpoint {} is invalid: {why}", dir.display());
         let dfd = open_dir_at(libc::AT_FDCWD, &CString::new(dir.as_os_str().as_bytes())?).map_err(|e| bad(e.to_string()))?;
@@ -863,7 +892,12 @@ impl Link {
             bail!("{}", bad("vmstate or pagemap is too long".into()));
         }
         let cost = (text.len() as u64 + len("vmstate")).saturating_add(len("pagemap"));
-        *meta_left = meta_left.checked_sub(cost).ok_or_else(|| bad(format!("its chain has more than {MAX_CHAIN_META} bytes of metadata")))?;
+        let left = match *meta_left {
+            Some(left) => left,
+            None => chain_meta_budget(manifest.guest_pages).map_err(|e| bad(e.to_string()))?,
+        };
+        metadata_room(left, cost, manifest.parent.is_some()).map_err(|e| bad(e.to_string()))?;
+        *meta_left = Some(left - cost);
         let read_checked = |name: &str| -> Result<Vec<u8>> {
             let want = manifest.files.get(name).ok_or_else(|| bad(format!("manifest lists no {name}")))?;
             let (_, bytes) = read_at(dfd.as_raw_fd(), name, want.len + 1).map_err(|e| bad(format!("{name}: {e}")))?;
@@ -932,7 +966,7 @@ impl Checkpoint {
     /// delta against, and verifies everything but the page data itself,
     /// which is checked page by page as it is read.
     pub fn open(dir: &Path) -> Result<Checkpoint> {
-        let mut meta_left = MAX_CHAIN_META;
+        let mut meta_left = None;
         let top = Link::open(dir, &mut meta_left)?;
         let mut links = vec![top];
         while let Some(parent) = links.last().unwrap().manifest.parent.clone() {
@@ -969,7 +1003,7 @@ impl Checkpoint {
         }
         let (dir, manifest, id, vmstate) = top.unwrap();
         let (runs, file) = flatten(&layers, files, sums);
-        Ok(Checkpoint { dir, manifest, id, vmstate, runs, file: Arc::new(file), chain, chain_ids, meta_left })
+        Ok(Checkpoint { dir, manifest, id, vmstate, runs, file: Arc::new(file), chain, chain_ids, meta_left: meta_left.unwrap() })
     }
 
     /// Reads every page the checkpoint (chain) restores from its files and
@@ -1256,13 +1290,11 @@ mod tests {
     fn manifest_lengths_are_bounded_before_reading() {
         let dir = std::env::temp_dir().join(format!("flexvm-lengths-{}", std::process::id()));
         type Edit = fn(&mut Manifest);
-        let cases: [(Edit, &str); 5] = [
+        let cases: [(Edit, &str); 4] = [
             (|m| m.files.get_mut("vmstate").unwrap().len = MAX_VMSTATE + 1, "too long"),
             (|m| m.files.get_mut("vmstate").unwrap().len = u64::MAX, "too long"),
             (|m| m.files.get_mut("pagemap").unwrap().len = 24 + 36 * 256 + 1, "too long"),
             (|m| (m.guest_pages, m.files.get_mut("pagemap").unwrap().len) = (u64::MAX, u64::MAX), "too long"),
-            // Within what a guest this size could need, but not what a chain may read.
-            (|m| (m.guest_pages, m.files.get_mut("pagemap").unwrap().len) = (1 << 40, 1 << 40), "bytes of metadata"),
         ];
         for (edit, want) in cases {
             link(&dir, None, edit);
@@ -1283,15 +1315,42 @@ mod tests {
         let top = dir.join("ck2");
         let ck = Checkpoint::open(&top).unwrap();
         assert_eq!(ck.chain.len(), 2);
-        let cost = MAX_CHAIN_META - ck.meta_left;
-        let mut left = cost;
+        let cost = chain_meta_budget(ck.manifest.guest_pages).unwrap() - ck.meta_left;
+        let mut left = Some(cost);
         Link::open(&top, &mut left).unwrap();
         // The base is refused once the budget runs out.
-        let mut left = cost - 1;
+        let mut left = Some(cost - 1);
         let e = Link::open(&top, &mut left).and_then(|_| Link::open(&dir.join("ck1"), &mut left)).and_then(|_| Link::open(&dir.join("ck0"), &mut left));
         assert!(e.err().unwrap().to_string().contains("bytes of metadata"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
+    #[test]
+    fn metadata_budget_scales_with_guest_pages_and_checks_before_pause() {
+        let pages = (128u64 << 30) / PAGE_SIZE as u64;
+        let cost = 24 + 36 * pages + MAX_VMSTATE + (1 << 20);
+        assert!(cost > MAX_CHAIN_META);
+        assert_eq!(chain_meta_budget(pages).unwrap(), cost);
+        metadata_room(cost, cost, false).unwrap();
+        assert!(!metadata_room(cost, cost + 1, false).unwrap_err().to_string().contains("take a full one"));
+        assert!(chain_meta_budget(u64::MAX).is_err());
+
+        let dir = std::env::temp_dir().join(format!("flexvm-scaled-budget-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut staging = Staging::new(&dir.join("ck"), dir.join("vmstate.private")).unwrap();
+        staging.prepare_metadata(pages, false).unwrap();
+        assert_eq!(staging.meta_left, cost);
+        staging.meta_left = 23;
+        assert!(staging.prepare_metadata(pages, true).unwrap_err().to_string().contains("take a full one"));
+        drop(staging);
+        // Opening initializes the same scaled budget from the top manifest.
+        link(&dir.join("ck"), None, |m| m.guest_pages = pages);
+        let ck = Checkpoint::open(&dir.join("ck")).unwrap();
+        assert!(ck.meta_left > MAX_CHAIN_META);
+        let mut left = Some(0);
+        assert!(Link::open(&dir.join("ck"), &mut left).is_err(), "an exhausted budget is never reset");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// A template whose memory file has `pages` pages; `Some(b)` is a page
     /// filled with `b`, `None` a hole.
     fn template(dir: &Path, pages: &[Option<u8>]) -> Arc<Template> {
@@ -1567,6 +1626,8 @@ mod tests {
         let stale = dir.join(format!("{STAGING_PREFIX}999999999-1"));
         std::fs::create_dir_all(stale.join("ck")).unwrap();
         std::fs::write(stale.join("ck/pages"), b"x").unwrap();
+        std::fs::write(stale.join("ck/GEN"), b"generation").unwrap();
+        std::fs::write(stale.join("ck/extra"), b"extra").unwrap();
         std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o700)).unwrap();
         let foreign = dir.join(format!("{STAGING_PREFIX}999999998-1"));
         std::fs::create_dir_all(&foreign).unwrap();
@@ -1585,12 +1646,13 @@ mod tests {
         let f = s.create("pages").unwrap();
         drop(f);
         assert!(s.create("pages").is_err());
-        let ck = s.ck.as_raw_fd();
         symlink("/etc/hostname", dir.join("link")).unwrap();
         let pfd = s.parent.as_raw_fd();
         assert!(create_at(pfd, "link").is_err());
         assert!(open_at(pfd, "link").is_err());
-        assert!(create_at(ck, "pagemap").is_ok());
+        assert!(s.create("pagemap").is_ok());
+        s.add_file("GEN", b"generation").unwrap();
+        s.add_file("extra", b"extra").unwrap();
         drop(s);
         assert!(!dest.exists());
         assert!(std::fs::read_dir(&dir).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().contains(&std::process::id().to_string())));
