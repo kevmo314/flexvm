@@ -1301,7 +1301,7 @@ fn taps_of_at(run: &Path, net: &Path) -> Vec<(String, u32, Ident)> {
         let read = |f: &str| std::fs::read_to_string(dir.join(f)).ok();
         let Some(index) = read("ifindex").and_then(|i| i.trim().parse().ok()) else { continue };
         let Some(alias) = read("ifalias") else { continue };
-        let Some((owner, of)) = parse_tap_alias(alias.trim_end_matches('\n')) else { continue };
+        let Some((owner, of)) = parse_tap_alias(alias.strip_suffix('\n').unwrap_or(&alias)) else { continue };
         if of == run && dir.join("tun_flags").exists() {
             taps.push((e.file_name().to_string_lossy().into_owned(), index, owner));
         }
