@@ -240,7 +240,7 @@ pub fn finish_incoming_log(host: &Host, name: &str, log: &std::path::Path, accep
 fn pages(host: &Host, req: &Value, conn: TcpStream) -> Result<()> {
     let name = req["name"].as_str().unwrap_or("");
     let fwd = json!({"op": "pages", "mig": req["mig"]});
-    if let Err(e) = crate::vmproc::connect(host, name, &fwd, &[conn.as_raw_fd()]) {
+    if let Err(e) = crate::vmproc::connect(host, name, &fwd, &[conn.as_raw_fd()], std::time::Instant::now() + std::time::Duration::from_secs(5)) {
         refuse_pages(conn, &format!("vm {name} is not the source of migration {}: {e}", req["mig"]));
     }
     Ok(())

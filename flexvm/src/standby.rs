@@ -233,7 +233,17 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
             continue;
         }
         let Ok((c, _)) = listener.accept() else { continue };
-        let Ok((line, fds)) = crate::util::recv_with_fds(&c, 1 << 20) else { continue };
+        // In short waits, minding stops: a claimer stopped mid-request must not keep this one.
+        let at = Instant::now() + HANDSHAKE_TIMEOUT;
+        let ready = || loop {
+            if p.stop_requested() || Instant::now() >= at {
+                return Err(std::io::ErrorKind::TimedOut.into());
+            }
+            if crate::util::readable(&c, Duration::from_millis(100)).unwrap_or(true) {
+                return Ok(());
+            }
+        };
+        let Ok((line, fds)) = crate::util::recv_with_fds(&c, 1 << 20, ready) else { continue };
         let Ok(req) = serde_json::from_slice::<Value>(&line) else { continue };
         // Not yet `claiming`, so the claimer tries another.
         if p.stop_requested() {
@@ -317,7 +327,7 @@ fn claim(p: &Arc<Proc>, req: &Value) -> std::result::Result<Value, (Error, bool)
 }
 
 /// `run`'s side. Once a standby said `claiming` it may have started the VM:
-/// no answer is then an error, never a reason to start it again.
+/// no answer (by `CLAIM_TIMEOUT`) is then an error, never a reason to start it again.
 pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]) -> Result<Option<(Value, BufReader<UnixStream>)>> {
     let Ok(key) = key(paths, template) else { return Ok(None) };
     let mut socks: Vec<PathBuf> = std::fs::read_dir(dir(host, template))
@@ -332,17 +342,33 @@ pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]
     line.push(b'\n');
     let name = req["name"].as_str().unwrap_or("");
     for sock in socks {
-        let Ok(c) = UnixStream::connect(&sock) else {
-            let _ = std::fs::remove_file(&sock);
-            continue;
+        let at = Instant::now() + HANDSHAKE_TIMEOUT;
+        let c = match crate::util::send_unix(&sock, &line, fds, at) {
+            Ok(c) => c,
+            // Refused: stale. (A full backlog is a stopped standby's.)
+            Err(e) => {
+                if e.raw_os_error() == Some(libc::ECONNREFUSED) {
+                    let _ = std::fs::remove_file(&sock);
+                }
+                continue;
+            }
         };
-        // Kept for the caller: it may have buffered the exit frame already.
-        let mut r = BufReader::new(c);
-        let taken = crate::util::send_with_fds(r.get_ref(), &line, fds).ok().and_then(|()| crate::util::recv_json(&mut r).ok().flatten());
-        if taken.is_none_or(|t| t["claiming"] != json!(true)) {
+        // Not `claiming` by `at`: reads are shut down, so one sent later fails (and
+        // claims nothing), and one sent already is read (and is uncertain: no answer
+        // can follow on a shut stream, even one sent before).
+        let shut = !crate::util::readable(&c, at.saturating_duration_since(Instant::now())).unwrap_or(false);
+        if shut {
+            let _ = c.shutdown(std::net::Shutdown::Read);
+        }
+        // Byte by byte: what follows stays unread, for the caller.
+        let mut r = BufReader::with_capacity(1, crate::util::By { s: &c, at: Instant::now() + CLAIM_TIMEOUT });
+        if crate::util::recv_json(&mut r).ok().flatten().is_none_or(|t| t["claiming"] != json!(true)) {
             continue;
         }
-        let answer = crate::util::recv_json(&mut r).and_then(|a| a.ok_or_else(|| "it hung up".into()));
+        let answer = match shut {
+            true => Err("its claiming came too late".into()),
+            false => crate::util::recv_json(&mut r).and_then(|a| a.ok_or_else(|| "it hung up".into())),
+        };
         let reply = match answer {
             Ok(r) => r,
             Err(e) => {
@@ -351,7 +377,8 @@ pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]
             }
         };
         if reply["ok"] == json!(true) {
-            return Ok(Some((reply["result"].clone(), r)));
+            c.set_read_timeout(None)?;
+            return Ok(Some((reply["result"].clone(), BufReader::new(c))));
         }
         if reply["retry"] != json!(true) {
             bail!("{}", reply["error"].as_str().unwrap_or("claim failed"));
@@ -361,6 +388,8 @@ pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]
     Ok(None)
 }
 
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const CLAIM_TIMEOUT: Duration = Duration::from_secs(60);
 const SETTLE: Duration = Duration::from_millis(50);
 const LOAD_TIMEOUT: Duration = Duration::from_secs(30);
 const API_TIMEOUT: Duration = Duration::from_secs(5);

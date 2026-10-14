@@ -328,7 +328,9 @@ fn run(args: &Args, name: &str, template: &str) -> Result<()> {
     // A claimed standby VM writes where this process would.
     let log = args.has("detach").then(|| log_file(&host, name)).transpose()?;
     let fds = log.as_ref().map_or([1, 2], |f| [f.as_raw_fd(); 2]);
-    match standby::take(&host, &paths, template, &req, &fds)? {
+    // A detached run's VM process (it answers on FLEXVM_NOTIFY_FD): its parent tried them.
+    let tried = std::env::var_os("FLEXVM_NOTIFY_FD").is_some();
+    match if tried { None } else { standby::take(&host, &paths, template, &req, &fds)? } {
         Some((v, _)) if log.is_some() => print(v),
         Some((v, conn)) => {
             eprintln!("{v}");
@@ -545,7 +547,7 @@ pub fn exec(host: &Host, name: &str, cmd: &str) -> Result<i32> {
     let id = session.id.clone();
     let code = exec_session(host, name, cmd, &Mutex::new(session), false)?;
     // Best effort: the guest closes it a minute after its client leaves anyway.
-    let _ = vmproc::connect(host, name, &json!({"op": "exec", "session": id, "action": "close"}), &[]);
+    let _ = vmproc::connect(host, name, &json!({"op": "exec", "session": id, "action": "close"}), &[], Instant::now() + Duration::from_secs(5));
     Ok(code)
 }
 
@@ -568,9 +570,10 @@ pub fn exec_session(host: &Host, name: &str, cmd: &str, session: &Mutex<Session>
             (s.started, s.offset)
         };
         let req = json!({"op": "exec", "session": id, "action": if started { "attach" } else { "start" }, "offset": offset, "cmd": cmd});
-        let stream = vmproc::connect(host, name, &req, &[]).and_then(|c| {
+        let at = Instant::now() + Duration::from_secs(5);
+        let stream = vmproc::connect(host, name, &req, &[], at).and_then(|c| {
             // Byte by byte: the frames after it stay unread.
-            let reply = recv_json(&mut BufReader::with_capacity(1, util::By { s: &c, at: Instant::now() + Duration::from_secs(5) }))?.ok_or("vm hung up")?;
+            let reply = recv_json(&mut BufReader::with_capacity(1, util::By { s: &c, at }))?.ok_or("vm hung up")?;
             if reply["ok"] != json!(true) {
                 return Err(reply["error"].as_str().unwrap_or("exec failed").to_string().into());
             }

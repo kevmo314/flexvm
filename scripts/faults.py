@@ -4049,6 +4049,38 @@ def claim_killed():
     cli(A, "standby", "--template", args.template, "0")
 
 
+def standby_stalled():
+    """A claimer that connects and stops before sending its request keeps no
+    standby VM from stopping; a stopped standby VM keeps no `run` waiting
+    (it starts cold once the handshake times out)."""
+    t, n = args.template, "ft-sb-stalled"
+    ok(cli_json(A, "standby", "--template", t, "1"))
+    check("standby stalled: one ready", wait_for(lambda: len(standby_pids(A, t)) == 1, 60))
+    pid = standby_pids(A, t)[0]
+    d = os.path.join(A.run, "standby", t)
+    c = socket.socket(socket.AF_UNIX)
+    c.connect(os.path.join(d, next(f for f in os.listdir(d) if f.endswith(f".{pid}.sock"))))
+    c.send(b'{"name"')
+    time.sleep(0.5)
+    os.kill(pid, signal.SIGTERM)
+    check("standby stalled: stops under a half-sent claim", wait_for(lambda: not alive(pid), 10))
+    c.close()
+    ok(cli_json(A, "standby", "--template", t, "1"))
+    check("standby stalled: another ready", wait_for(lambda: len(standby_pids(A, t)) == 1, 60))
+    pid = standby_pids(A, t)[0]
+    os.kill(pid, signal.SIGSTOP)
+    try:
+        start = time.time()
+        r = run(A, n)
+        check("standby stalled: run starts cold past a stopped one", r.get("ok") and r["result"]["standby"] is False, r)
+        check("standby stalled: within the handshake's bound", time.time() - start < 15, time.time() - start)
+    finally:
+        os.kill(pid, signal.SIGCONT)
+    cli(A, "standby", "--template", t, "0")
+    check("standby stalled: stopped", wait_for(lambda: not standby_pids(A, t), 30))
+    cleanup(n)
+
+
 def fc_died():
     """A VM's Firecracker dies under it (a guest panic, an OOM kill): its
     process notices at once, cleans up as a kill would (address withdrawn,
@@ -4974,7 +5006,7 @@ SCENARIOS = dict(
     kill_refused_checkpoint=no_evict(kill_refused_checkpoint), wildcard_listen=wildcard_listen,
     forged_peer=forged_peer, restore_ip_peer=restore_ip_peer, late_withdrawal=late_withdrawal,
     unit_restart=unit_restart, log_cap=log_cap, gc_debris=gc_debris, prefix_change=prefix_change, arrival_log=arrival_log, template_tap=template_tap,
-    incoming_killed=incoming_killed, start_killed=start_killed, claim_killed=claim_killed, fc_died=fc_died,
+    incoming_killed=incoming_killed, start_killed=start_killed, claim_killed=claim_killed, standby_stalled=standby_stalled, fc_died=fc_died,
     sigkill_restart=sigkill_restart, listen_trickle=listen_trickle,
     cow_wp_race=cow_wp_race, fetch_tail_enomem=fetch_tail_enomem, fetch_enomem_stuck=fetch_enomem_stuck,
     same_host_order=same_host_order, same_host_slow_route=same_host_slow_route, same_host_flood=same_host_flood, same_host_late_handover=same_host_late_handover, rx_stall=rx_stall, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,
