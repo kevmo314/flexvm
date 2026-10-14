@@ -422,11 +422,9 @@ impl Injector {
         }
     }
 
-    /// Dropped by the tap since this was made (with the guest's own traffic), and the tap's
-    /// count that says so: what it dropped up to then is reported with the injected packets.
-    pub fn dropped(&self) -> (u64, u64) {
-        let now = tap_tx_dropped(&self.tap);
-        (now.saturating_sub(self.tx_dropped), now)
+    /// Dropped by the tap since this was made (with the guest's own traffic): reported with the injected packets.
+    pub fn dropped(&self) -> u64 {
+        tap_tx_dropped(&self.tap).saturating_sub(self.tx_dropped)
     }
 }
 
@@ -528,7 +526,7 @@ fn receive_counted(
     if !ended {
         return None;
     }
-    let (tap_dropped, _) = inj.dropped();
+    let tap_dropped = inj.dropped();
     let reply = json!({"injected": injected, "dropped": dropped + tap_dropped});
     write_by(&conn, format!("{reply}\n").as_bytes(), deadline).ok().map(|()| tap_dropped)
 }

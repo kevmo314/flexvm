@@ -679,8 +679,8 @@ impl Pager {
         self.seeded.notify_all();
     }
 
-    /// A migration aborted and the VM runs here again: undoes `quiesce_export`, starting again the working-set prefetch
-    /// and the collapse pass if it cut them short.
+    /// A migration aborted, or a checkpoint ended with the VM still here: undoes `quiesce_export`, starting again the
+    /// working-set prefetch and the collapse pass if it cut them short.
     pub fn unquiesce(self: &Arc<Self>) {
         if self.stop.load(Ordering::SeqCst) || !self.quiesce.swap(false, Ordering::SeqCst) {
             return;

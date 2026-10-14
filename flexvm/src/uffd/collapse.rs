@@ -42,7 +42,7 @@ const EINVAL_GIVE_UP: usize = 16;
 const ENOMEM_BACKOFF: Duration = Duration::from_millis(100);
 const ENOMEM_BACKOFF_MAX: Duration = Duration::from_secs(2);
 const ENOMEM_GIVE_UP: usize = 8;
-/// Why a pass ends at a checkpoint or migration; one that aborts (`Pager::unquiesce`) starts it again.
+/// Why a pass ends at a checkpoint or migration; one that leaves the VM here (`Pager::unquiesce`) starts it again.
 pub(super) const QUIESCED: &str = "checkpoint or migration";
 
 /// The collapse pass's gate, under `Pager::collapse_gate`'s mutex, which the pass holds across each call.
@@ -80,7 +80,6 @@ impl CollapseReport {
             "busy_ms": crate::util::ms(self.busy),
             "cpu_ms": crate::util::ms(self.cpu),
             "wall_ms": crate::util::ms(self.wall),
-            "done": true,
             "stopped": self.stopped,
         })
     }
@@ -220,6 +219,10 @@ impl Pager {
                             break 'regions;
                         }
                     }
+                    // Test fault `collapse_slow`: a pass that lasts, for a checkpoint or migration to cut short.
+                    if crate::host::fault("collapse_slow") {
+                        self.collapse_pause(Duration::from_millis(300));
+                    }
                 }
             }
         }
@@ -261,10 +264,11 @@ impl Pager {
         }
     }
 
-    /// Sleeps `d`, or less if the pager stops.
+    /// Sleeps `d`, or less if the pass must end (the pager stops, or `quiesce_export` wakes it): so the pass ends at
+    /// the checkpoint or migration that quiesced it, not once a failed one has undone that.
     fn collapse_pause(&self, d: Duration) {
         let g = self.collapse_gate.0.lock().unwrap();
-        let _ = self.collapse_gate.1.wait_timeout_while(g, d, |_| !self.stop.load(Ordering::SeqCst));
+        let _ = self.collapse_gate.1.wait_timeout_while(g, d, |_| self.collapse_halt().is_none());
     }
 
     fn collapse_halt(&self) -> Option<&'static str> {
