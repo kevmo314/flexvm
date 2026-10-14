@@ -305,6 +305,10 @@ fn install<T>(path: &Path, write: impl FnOnce(&mut File) -> Result<()>, rename: 
     let tmp = path.with_extension(format!("part{}", std::process::id()));
     let dir = File::open(path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")))?;
     crate::host::flock(&dir, libc::LOCK_EX)?;
+    // Same pid, another namespace: its writer holds it.
+    if File::open(&tmp).is_ok_and(|f| crate::host::flock(&f, libc::LOCK_EX | libc::LOCK_NB).is_err()) {
+        bail!("{} is being written by another process", tmp.display());
+    }
     let res = (|| {
         let mut f = create_new(&tmp)?;
         crate::host::flock(&f, libc::LOCK_EX)?;
@@ -512,6 +516,21 @@ mod tests {
 
     fn read(p: impl AsRef<Path>) -> String {
         std::fs::read_to_string(p).unwrap()
+    }
+
+    #[test]
+    fn install_leaves_a_live_writers_part() {
+        let dir = tmpdir("install");
+        let path = dir.join("blob");
+        let part = path.with_extension(format!("part{}", std::process::id()));
+        std::fs::write(&part, "theirs").unwrap();
+        let held = File::open(&part).unwrap();
+        flock(&held, libc::LOCK_EX).unwrap();
+        assert!(replace(&path, bytes(b"ours")).is_err());
+        assert_eq!(read(&part), "theirs");
+        drop(held);
+        replace(&path, bytes(b"ours")).unwrap();
+        assert!(read(&path) == "ours" && !part.exists());
     }
 
     #[test]
