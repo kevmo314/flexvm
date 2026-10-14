@@ -887,9 +887,6 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
     if let Some(dev) = &host.cfg.announce_dev {
         crate::net::sysctl(&format!("net.ipv4.conf.{dev}.proxy_arp"), "1")?;
     }
-    if !matches!(start, Start::Standby { .. }) {
-        crate::standby::maintain(host.clone());
-    }
     let p = Proc::new(host, paths)?;
     let host = p.host.clone();
     thread::spawn(move || {
@@ -923,6 +920,8 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
     };
     if res.is_ok() {
         p.serve_control();
+        // Once running (a standby once claimed), so a start never competes with a refill.
+        crate::standby::maintain(p.host.clone());
     }
     let reply = match &res {
         Ok(v) => json!({"ok": true, "result": v}),
@@ -1142,6 +1141,7 @@ fn relieve(host: &Host, starved_here: bool) {
         let standby: Vec<_> = crate::standby::templates(host).iter().flat_map(|t| crate::standby::live(host, t)).collect();
         standby.iter().for_each(crate::standby::stop);
         if !standby.is_empty() {
+            let _ = std::fs::write(crate::standby::pressure(host), b"");
             return eprintln!("host has {avail} MiB available, under its {reserve} MiB reserve: stopped {} standby vms", standby.len());
         }
     }

@@ -6,7 +6,7 @@
 //! started the VM and is never retried elsewhere. `{"exit": code}` follows.
 
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Write};
 use std::net::Ipv4Addr;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
@@ -86,17 +86,38 @@ pub fn set(host: &Host, template: &str, n: usize) -> Result<Value> {
     Ok(json!({"template": template, "standby": n, "started": started}))
 }
 
-/// Periodic recovery runs in listeners and non-standby VM processes. A
+/// Periodic recovery, run by listeners and running VM processes. A
 /// nonblocking refill lock avoids piling up workers behind a slow restore.
+/// No refill for a minute after pressure stopped standby VMs (so they do not
+/// cycle) or after a template's refill failed (its error is in standby.log).
 pub fn maintain(host: Host) {
     std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(5));
+        if recent(&pressure(&host)) {
+            continue;
+        }
         for template in templates(&host) {
+            let failed = dir(&host, &template).join(".failed");
+            if recent(&failed) {
+                continue;
+            }
             if let Err(e) = refill_by(&host, &template, false) {
-                eprintln!("standby {template}: {e}");
+                let _ = std::fs::write(&failed, b"");
+                if let Ok(mut log) = std::fs::OpenOptions::new().create(true).append(true).open(dir(&host, &template).join("standby.log")) {
+                    let _ = writeln!(log, "standby {template}: refill: {e}");
+                }
             }
         }
-        std::thread::sleep(Duration::from_secs(5));
     });
+}
+
+/// Touched when memory pressure stops standby VMs.
+pub fn pressure(host: &Host) -> PathBuf {
+    host.run.join("standby").join(".pressure")
+}
+
+fn recent(path: &std::path::Path) -> bool {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|d| d < Duration::from_secs(60))
 }
 
 /// Starts standby VMs up to the target and waits for them. Serialised per
@@ -402,6 +423,9 @@ mod tests {
         host.cfg.reserve_mib = u64::MAX / 2;
         assert_eq!(refill_by(&host, "default", false).unwrap(), 0);
         assert!(live(&host, "default").is_empty());
+        assert!(!recent(&pressure(&host)));
+        std::fs::write(pressure(&host), b"").unwrap();
+        assert!(recent(&pressure(&host)));
         std::fs::remove_dir_all(root).unwrap();
     }
 }
