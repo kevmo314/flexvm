@@ -151,8 +151,8 @@ flexvm config --dns ''           # unset (--underlay and --announce-dev too)
 ```
 
 `--prefix P` (up to 8 letters, digits, `-`, `_` or `.`; default `fv`) names the host's taps;
-`config` and `listen` refuse to change it while any VM process runs or any
-tap under the old one is left.
+`config` and `listen` refuse to change it while any VM process runs here, or
+while a tap already has a name under the new one.
 
 ### Under systemd
 

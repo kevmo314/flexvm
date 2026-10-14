@@ -170,7 +170,7 @@ same log follows to it.
 **The tap prefix** names taps (and garbage collection reads their owners by
 it), so it changes only while nothing uses the old one: `Host::configure`
 refuses a change, under the host lock, while any work directory's owner is
-not proven gone or any tap under the old prefix exists. A VM process makes
+not proven gone, or any tap already reads as named under the new prefix (`tap_owner`), whoever made it. A VM process makes
 its work directory and then reads the prefix from host.json under the host
 lock; a template build names and makes its tap under it; the tap sweep reads
 the prefix under it.

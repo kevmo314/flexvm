@@ -208,7 +208,7 @@ impl Host {
         let prefix = cfg.prefix.clone();
         change(&mut cfg)?;
         if cfg.prefix != prefix {
-            if let Some(why) = self.prefix_in_use(&prefix) {
+            if let Some(why) = self.prefix_in_use(&cfg.prefix) {
                 bail!("cannot change the tap prefix from {prefix:?} to {:?}: {why}", cfg.prefix);
             }
         }
@@ -218,13 +218,15 @@ impl Host {
         Ok(())
     }
 
-    /// Why the tap prefix cannot change now, under the host lock: garbage
-    /// collection reads a tap's owner from its name under the prefix, so
-    /// none may be named under the old one. Any VM process not proven gone
-    /// (its work directory), whatever it is doing, may make taps; it takes
-    /// its prefix from host.json only after its work directory exists
-    /// (`tap_prefix`). Any tap under the old prefix, live or leaked, too.
-    fn prefix_in_use(&self, prefix: &str) -> Option<String> {
+    /// Why the tap prefix cannot become `new` now, under the host lock:
+    /// garbage collection will read taps' owners from their names under
+    /// `new`. So no VM process of this host may be left to make taps under
+    /// the old one: any whose work directory's owner is not proven gone,
+    /// whatever it is doing (it reads the prefix only once its work directory
+    /// exists, `tap_prefix`). And no tap may already read as one of `new`'s,
+    /// whoever made it, live or leaked. (Taps under the old prefix that do
+    /// not read under `new` are left alone by this host's sweeps from then on.)
+    fn prefix_in_use(&self, new: &str) -> Option<String> {
         for e in std::fs::read_dir(self.run.join("w")).into_iter().flatten().flatten() {
             let owner = load::<Ident>(&e.path().join("owner"));
             if !matches!(owner, Ok(Some(ref o)) if o.liveness() == Liveness::Gone) {
@@ -236,9 +238,9 @@ impl Host {
             .flatten()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.starts_with(prefix) && Path::new("/sys/class/net").join(n).join("tun_flags").exists())
+            .filter(|n| tap_owner(n, new).is_some())
             .collect();
-        (!taps.is_empty()).then(|| format!("taps {} exist (stop their VMs or builds, and let garbage collection remove them)", taps.join(", ")))
+        (!taps.is_empty()).then(|| format!("taps {} already read as named under it", taps.join(", ")))
     }
 
     /// The prefix of the taps of a VM process whose work directory exists:
