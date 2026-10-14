@@ -25,26 +25,18 @@ pub struct Compat {
     pub xsave: BTreeMap<u32, [u32; 2]>,
 }
 
-/// CPUID words that are feature bitmaps: (leaf, subleaf, register).
-const FEATURES: [(u32, u32, usize); 18] = [
-    (0x1, 0, 2),
-    (0x1, 0, 3),
-    (0x7, 0, 1),
-    (0x7, 0, 2),
-    (0x7, 0, 3),
-    (0x7, 1, 0),
-    (0x7, 1, 3),
-    (0x7, 2, 3),
-    (0xd, 0, 0),
-    (0xd, 0, 3),
-    (0xd, 1, 0),
-    (0xd, 1, 2),
-    (0xd, 1, 3),
-    (0x4000_0001, 0, 0),
-    (0x8000_0001, 0, 2),
-    (0x8000_0001, 0, 3),
-    (0x8000_0008, 0, 1),
-    (0x8000_0021, 0, 0),
+/// CPUID words that are feature bitmaps: (leaf, subleaf, registers).
+const FEATURES: [(u32, u32, &[usize]); 10] = [
+    (0x1, 0, &[2, 3]),
+    (0x7, 0, &[1, 2, 3]),
+    (0x7, 1, &[0, 3]),
+    (0x7, 2, &[3]),
+    (0xd, 0, &[0, 3]),
+    (0xd, 1, &[0, 2, 3]),
+    (0x4000_0001, 0, &[0]),
+    (0x8000_0001, 0, &[2, 3]),
+    (0x8000_0008, 0, &[1]),
+    (0x8000_0021, 0, &[0]),
 ];
 const REGS: [&str; 4] = ["eax", "ebx", "ecx", "edx"];
 
@@ -81,7 +73,8 @@ impl Compat {
             firecracker,
             features: FEATURES
                 .iter()
-                .filter_map(|&(l, s, r)| Some((format!("{l:#x}.{s}.{}", REGS[r]), word(l, s, r)?)))
+                .flat_map(|&(l, s, regs)| regs.iter().map(move |&r| (l, s, r)))
+                .filter_map(|(l, s, r)| Some((format!("{l:#x}.{s}.{}", REGS[r]), word(l, s, r)?)))
                 .collect(),
             xsave: entries.iter().filter(|e| e[0] == 0xd && e[1] >= 2 && e[2] != 0).map(|e| (e[1], [e[2], e[3]])).collect(),
         })
