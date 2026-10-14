@@ -3650,10 +3650,11 @@ class tight_reserve:
 def grants(host):
     """Admission grants of the last 10 s on `host` (MiB each)."""
     try:
-        g = json.load(open(os.path.join(host.run, "grants")))
+        boot = open("/proc/sys/kernel/random/boot_id").read().strip()
+        g = json.load(open(os.path.join(host.run, f"grants-{boot}")))
     except (OSError, ValueError):
         return []
-    return [m for t, m, *_ in g if time.time() * 1000 - t <= 10000]
+    return [m for t, m, *_ in g if time.clock_gettime(time.CLOCK_BOOTTIME) * 1000 - t <= 10000]
 
 
 def addr_records():

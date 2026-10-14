@@ -742,10 +742,15 @@ impl Host {
         Ok(())
     }
 
+    /// Per boot by name: RUN need not be a tmpfs. An unreadable boot id still counts grants.
+    pub fn grants(&self) -> PathBuf {
+        self.run.join(format!("grants-{}", boot_id()))
+    }
+
     /// Gives back grant `id` (from `grant`) that was not used.
     pub fn refund(&self, id: u64) {
         let Ok(_l) = self.lock() else { return };
-        let path = self.run.join("grants");
+        let path = self.grants();
         let mut grants: Vec<(u64, u64, u64)> = load(&path).ok().flatten().unwrap_or_default();
         let n = grants.len();
         grants.retain(|g| g.2 != id);
@@ -808,10 +813,10 @@ impl Host {
             Floor::EvictMark if self.evicting(&l) => return Ok(Err("this host is moving vms away itself".into())),
             Floor::EvictMark => (cfg.evict_at(), "eviction mark"),
         };
-        let path = self.run.join("grants");
+        let path = self.grants();
         let now = boottime_ms();
         let mut grants: Vec<(u64, u64, u64)> = load(&path)?.unwrap_or_default();
-        // A stamp in the future is another boot's or an older build's wall clock.
+        // A stamp in the future is an older build's wall clock.
         grants.retain(|&(t, ..)| t <= now && now - t <= GRANT_WINDOW.as_millis() as u64);
         let held = self.holds(&l);
         let held_ids: HashSet<_> = held.iter().map(|h| h.0).collect();
@@ -2055,7 +2060,7 @@ mod tests {
         h.cfg.reserve_mib = AVAIL - 1000;
         let before = boottime_ms();
         grant_at(&h, 1000, Floor::Reserve, false).unwrap();
-        let path = h.run.join("grants");
+        let path = h.grants();
         let grants: Vec<(u64, u64, u64)> = load(&path).unwrap().unwrap();
         assert!(grants[0].0 >= before && grants[0].0 <= boottime_ms());
         let mut other = Host::open(&h.state, &h.run).unwrap();
@@ -2067,6 +2072,10 @@ mod tests {
             store(&path, &vec![(t, 1000u64, 1u64)], false).unwrap();
             grant_at(&h, 1000, Floor::Reserve, false).unwrap();
         }
+        // Another boot's grants (a persistent RUN) are another file.
+        store(&h.run.join("grants-other-boot"), &vec![(boottime_ms(), 1000u64, 1u64)], false).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        grant_at(&h, 1000, Floor::Reserve, false).unwrap();
         // A recent boottime stamp counts; one older than the window does not.
         let now = boottime_ms();
         store(&path, &vec![(now - 1000, 1000u64, 1u64)], false).unwrap();
@@ -2099,7 +2108,7 @@ mod tests {
     fn admission_errors_are_not_refusals() {
         let mut h = host("admit-err");
         h.cfg.reserve_mib = 0;
-        let grants = || load::<Vec<(u64, u64, u64)>>(&h.run.join("grants")).unwrap().unwrap_or_default();
+        let grants = || load::<Vec<(u64, u64, u64)>>(&h.grants()).unwrap().unwrap_or_default();
         let grant = |avail: Option<u64>| h.grant_inner(1, Floor::Reserve, false, None, || avail).map(|r| r.ok().map(|g| g.0));
         assert!(grant(None).unwrap_err().to_string().contains("MemAvailable"));
         assert!(grants().is_empty());
@@ -2159,7 +2168,7 @@ mod tests {
         let grant = |mib, held| h.grant_inner(mib, Floor::Reserve, held, None, || Some(h.cfg.reserve_mib + charge)).unwrap();
         let (id, hold) = grant(charge, true).unwrap();
         let hold = Mutex::new(hold);
-        let path = h.run.join("grants");
+        let path = h.grants();
         store(&path, &vec![(0u64, charge, id)], false).unwrap();
         assert!(grant(1, false).is_err(), "disk pull reservation counts after ten seconds");
         // Pages come in: it counts only what is still to come, never more again.
@@ -2190,7 +2199,7 @@ mod tests {
         h.cfg.reserve_mib = AVAIL - 3000;
         let hold = grant_at(&h, 2000, Floor::Reserve, true).unwrap().1.unwrap();
         // The window passes (the grant ages out): held, it still counts, once.
-        let path = h.run.join("grants");
+        let path = h.grants();
         let aged: Vec<(u64, u64, u64)> = load::<Vec<(u64, u64, u64)>>(&path).unwrap().unwrap().into_iter().map(|g| (0, g.1, g.2)).collect();
         store(&path, &aged, false).unwrap();
         assert!(!admit(&h, 1001) && admit(&h, 1000), "a held grant counts after the window, once");
