@@ -60,7 +60,7 @@ impl Proc {
         self.host.lend(&self.host.lock()?, vm.ip, gen)?;
         self.drop_held_in();
         self.set_leaving(true);
-        if let Err(e) = vm.start_source(mig) {
+        if let Err(e) = vm.leave(State::Source(mig)) {
             let _ = self.host.unlend(&self.host.lock()?, vm.ip, gen);
             self.set_leaving(false);
             return Err(e);
@@ -441,7 +441,7 @@ impl Proc {
         let claim = self.host.claim_incoming(&self.host.lock()?, &name, ip, req["gen"].as_u64().unwrap_or(0))?;
         self.set_addr(claim);
         t.mark("claim_ip");
-        let idle = self.spawner.take()?;
+        let idle = self.spawner.take(None)?;
         crate::host::stall("incoming_stall");
         t.mark("spawn");
         let load_set = crate::standby::load_set(&self.host, &tpl);

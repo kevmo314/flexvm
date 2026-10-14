@@ -3,8 +3,15 @@
 //! All taps share one MAC, as do all guests, so moving a VM between hosts is just moving
 //! its route (plus, with `--announce-dev`, a gratuitous ARP for proxy-ARP LAN peers).
 
-use std::os::fd::{AsRawFd, FromRawFd};
 use std::net::Ipv4Addr;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+use libc::{
+    c_int, IFA_ADDRESS, IFA_LOCAL, IFLA_ADDRESS, NDA_DST, NDA_LLADDR, NLMSG_ERROR, NLM_F_ACK, NLM_F_CREATE,
+    NLM_F_REPLACE, NLM_F_REQUEST, NUD_PERMANENT, RTA_DST, RTA_GATEWAY, RTA_OIF, RTM_DELLINK, RTM_DELROUTE,
+    RTM_NEWADDR, RTM_NEWNEIGH, RTM_NEWROUTE, RTM_SETLINK, RTN_UNICAST, RTPROT_STATIC, RT_SCOPE_HOST, RT_SCOPE_LINK,
+    RT_SCOPE_NOWHERE, RT_SCOPE_UNIVERSE, RT_TABLE_MAIN,
+};
 
 use crate::bail;
 use crate::util::Result;
@@ -12,26 +19,27 @@ use crate::util::Result;
 pub const GATEWAY_MAC: &str = "06:00:a9:fe:01:01";
 pub const GUEST_MAC: &str = "06:00:ac:10:00:02";
 
+fn socket(domain: c_int, kind: c_int, protocol: c_int, what: &str) -> Result<OwnedFd> {
+    let fd = unsafe { libc::socket(domain, kind | libc::SOCK_CLOEXEC, protocol) };
+    if fd < 0 {
+        bail!("{what}: {}", std::io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
 /// Down, a tap takes no packets, so Firecracker writes none into guest memory.
 pub fn set_link_up(name: &str, up: bool) -> Result<()> {
-    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
-    if fd < 0 {
-        bail!("socket: {}", std::io::Error::last_os_error());
-    }
+    let fd = socket(libc::AF_INET, libc::SOCK_DGRAM, 0, "socket")?;
     let mut req = ifreq(name);
-    let res = unsafe {
-        if libc::ioctl(fd, libc::SIOCGIFFLAGS, &mut req) < 0 {
-            -1
-        } else {
+    let done = unsafe {
+        libc::ioctl(fd.as_raw_fd(), libc::SIOCGIFFLAGS, &mut req) >= 0 && {
             let flags = &mut req.ifr_ifru.ifru_flags;
             *flags = if up { *flags | libc::IFF_UP as libc::c_short } else { *flags & !(libc::IFF_UP as libc::c_short) };
-            libc::ioctl(fd, libc::SIOCSIFFLAGS, &req)
+            libc::ioctl(fd.as_raw_fd(), libc::SIOCSIFFLAGS, &req) >= 0
         }
     };
-    let err = std::io::Error::last_os_error();
-    unsafe { libc::close(fd) };
-    if res < 0 {
-        bail!("set {name} {}: {err}", if up { "up" } else { "down" });
+    if !done {
+        bail!("set {name} {}: {}", if up { "up" } else { "down" }, std::io::Error::last_os_error());
     }
     Ok(())
 }
@@ -45,16 +53,14 @@ pub const TAP_QUEUE: u32 = 4096;
 
 /// Ioctls and rtnetlink, as spawning `ip` costs tens of milliseconds.
 pub fn create_tap(name: &str) -> Result<()> {
-    const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
-    const TUNSETPERSIST: libc::c_ulong = 0x4004_54cb;
     let fd = unsafe { libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
     if fd < 0 {
         bail!("/dev/net/tun: {}", std::io::Error::last_os_error());
     }
-    let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
     let mut req = ifreq(name);
     req.ifr_ifru.ifru_flags = (libc::IFF_TAP | libc::IFF_NO_PI) as libc::c_short;
-    if unsafe { libc::ioctl(fd.as_raw_fd(), TUNSETIFF as _, &req) } < 0 || unsafe { libc::ioctl(fd.as_raw_fd(), TUNSETPERSIST as _, 1) } < 0 {
+    if unsafe { libc::ioctl(fd.as_raw_fd(), libc::TUNSETIFF, &req) } < 0 || unsafe { libc::ioctl(fd.as_raw_fd(), libc::TUNSETPERSIST, 1) } < 0 {
         bail!("create tap {name}: {}", std::io::Error::last_os_error());
     }
     drop(fd);
@@ -67,12 +73,10 @@ pub fn create_tap(name: &str) -> Result<()> {
         attr(&mut addr, IFA_ADDRESS, &local.octets());
         netlink(RTM_NEWADDR, NLM_F_CREATE | NLM_F_REPLACE, &addr)?;
         set_mac(index, &parse_mac(GATEWAY_MAC)?)?;
-        let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
         let mut q = ifreq(name);
         q.ifr_ifru.ifru_metric = TAP_QUEUE as i32;
-        let rc = unsafe { libc::ioctl(sock, libc::SIOCSIFTXQLEN as _, &q) };
-        unsafe { libc::close(sock) };
-        if rc < 0 {
+        let sock = socket(libc::AF_INET, libc::SOCK_DGRAM, 0, "socket")?;
+        if unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCSIFTXQLEN as _, &q) } < 0 {
             bail!("txqueuelen of {name}: {}", std::io::Error::last_os_error());
         }
         sysctl(&format!("net.ipv4.conf.{name}.arp_ignore"), "3")?;
@@ -86,10 +90,7 @@ pub fn create_tap(name: &str) -> Result<()> {
 
 pub fn delete_tap(name: &str) {
     let Ok(index) = ifindex(name) else { return };
-    let mut msg = vec![libc::AF_UNSPEC as u8, 0, 0, 0];
-    msg.extend_from_slice(&(index as i32).to_ne_bytes());
-    msg.extend_from_slice(&[0; 8]);
-    let _ = netlink(RTM_DELLINK, 0, &msg);
+    let _ = netlink(RTM_DELLINK, 0, &ifinfomsg(index));
 }
 
 fn ifreq(name: &str) -> libc::ifreq {
@@ -105,10 +106,7 @@ fn ifreq(name: &str) -> libc::ifreq {
 pub fn attach(ip: Ipv4Addr, tap: &str) -> Result<()> {
     let ifindex = ifindex(tap)?;
     set_mac(ifindex, &parse_mac(GATEWAY_MAC)?)?;
-    let mut route = rtmsg(RT_SCOPE_LINK);
-    attr(&mut route, RTA_DST, &ip.octets());
-    attr(&mut route, RTA_OIF, &ifindex.to_ne_bytes());
-    netlink(RTM_NEWROUTE, NLM_F_CREATE | NLM_F_REPLACE, &route)?;
+    route_dev(true, ip, ifindex)?;
     let mut neigh = Vec::with_capacity(32);
     neigh.extend_from_slice(&[libc::AF_INET as u8, 0, 0, 0]);
     neigh.extend_from_slice(&ifindex.to_ne_bytes());
@@ -119,13 +117,16 @@ pub fn attach(ip: Ipv4Addr, tap: &str) -> Result<()> {
     netlink(RTM_NEWNEIGH, NLM_F_CREATE | NLM_F_REPLACE, &neigh)
 }
 
-fn set_mac(ifindex: u32, mac: &[u8; 6]) -> Result<()> {
-    // struct ifinfomsg: family, pad, type, index, flags, change.
-    let mut msg = Vec::with_capacity(28);
-    msg.extend_from_slice(&[libc::AF_UNSPEC as u8, 0, 0, 0]);
+/// struct ifinfomsg: family, pad, type, index, flags, change.
+fn ifinfomsg(ifindex: u32) -> Vec<u8> {
+    let mut msg = vec![libc::AF_UNSPEC as u8, 0, 0, 0];
     msg.extend_from_slice(&(ifindex as i32).to_ne_bytes());
-    msg.extend_from_slice(&0u32.to_ne_bytes());
-    msg.extend_from_slice(&0u32.to_ne_bytes());
+    msg.extend_from_slice(&[0; 8]);
+    msg
+}
+
+fn set_mac(ifindex: u32, mac: &[u8; 6]) -> Result<()> {
+    let mut msg = ifinfomsg(ifindex);
     attr(&mut msg, IFLA_ADDRESS, mac);
     netlink(RTM_SETLINK, 0, &msg)
 }
@@ -140,14 +141,11 @@ fn is_local_addr(ip: Ipv4Addr) -> Result<bool> {
     }
     let mut current = addrs;
     let mut local = false;
-    while !current.is_null() {
+    while !current.is_null() && !local {
         let addr = unsafe { &*current };
         if !addr.ifa_addr.is_null() && unsafe { (*addr.ifa_addr).sa_family } == libc::AF_INET as u16 {
             let v4 = unsafe { &*addr.ifa_addr.cast::<libc::sockaddr_in>() };
-            if v4.sin_addr.s_addr.to_ne_bytes() == ip.octets() {
-                local = true;
-                break;
-            }
+            local = v4.sin_addr.s_addr.to_ne_bytes() == ip.octets();
         }
         current = addr.ifa_next;
     }
@@ -186,34 +184,6 @@ pub fn unroute(ip: Ipv4Addr) {
     let _ = netlink(RTM_DELROUTE, 0, &route);
 }
 
-const RTM_DELLINK: u16 = 17;
-const RTM_SETLINK: u16 = 19;
-const RTM_NEWADDR: u16 = 20;
-const IFA_ADDRESS: u16 = 1;
-const IFA_LOCAL: u16 = 2;
-const RT_SCOPE_HOST: u8 = 254;
-const RTM_NEWROUTE: u16 = 24;
-const RTM_DELROUTE: u16 = 25;
-const RTM_NEWNEIGH: u16 = 28;
-const NLMSG_ERROR: u16 = 2;
-const NLM_F_REQUEST: u16 = 0x1;
-const NLM_F_ACK: u16 = 0x4;
-const NLM_F_REPLACE: u16 = 0x100;
-const NLM_F_CREATE: u16 = 0x400;
-const IFLA_ADDRESS: u16 = 1;
-const RTA_DST: u16 = 1;
-const RTA_OIF: u16 = 4;
-const RTA_GATEWAY: u16 = 5;
-const NDA_DST: u16 = 1;
-const NDA_LLADDR: u16 = 2;
-const RT_TABLE_MAIN: u8 = 254;
-const RTPROT_STATIC: u8 = 4;
-const RT_SCOPE_UNIVERSE: u8 = 0;
-const RT_SCOPE_LINK: u8 = 253;
-const RT_SCOPE_NOWHERE: u8 = 255;
-const RTN_UNICAST: u8 = 1;
-const NUD_PERMANENT: u16 = 0x80;
-
 fn rtmsg(scope: u8) -> Vec<u8> {
     let mut m = Vec::with_capacity(48);
     m.extend_from_slice(&[libc::AF_INET as u8, 32, 0, 0, RT_TABLE_MAIN, RTPROT_STATIC, scope, RTN_UNICAST]);
@@ -228,15 +198,12 @@ fn attr(buf: &mut Vec<u8>, kind: u16, data: &[u8]) {
     buf.resize(buf.len().next_multiple_of(4), 0);
 }
 
-fn netlink(kind: u16, flags: u16, body: &[u8]) -> Result<()> {
-    let fd = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW | libc::SOCK_CLOEXEC, libc::NETLINK_ROUTE) };
-    if fd < 0 {
-        bail!("netlink socket: {}", std::io::Error::last_os_error());
-    }
+fn netlink(kind: u16, flags: c_int, body: &[u8]) -> Result<()> {
+    let fd = socket(libc::AF_NETLINK, libc::SOCK_RAW, libc::NETLINK_ROUTE, "netlink socket")?;
     let mut msg = Vec::with_capacity(16 + body.len());
     msg.extend_from_slice(&((16 + body.len()) as u32).to_ne_bytes());
     msg.extend_from_slice(&kind.to_ne_bytes());
-    msg.extend_from_slice(&(flags | NLM_F_REQUEST | NLM_F_ACK).to_ne_bytes());
+    msg.extend_from_slice(&((flags | NLM_F_REQUEST | NLM_F_ACK) as u16).to_ne_bytes());
     msg.extend_from_slice(&1u32.to_ne_bytes()); // seq
     msg.extend_from_slice(&0u32.to_ne_bytes()); // pid
     msg.extend_from_slice(body);
@@ -245,7 +212,7 @@ fn netlink(kind: u16, flags: u16, body: &[u8]) -> Result<()> {
         let mut addr: libc::sockaddr_nl = std::mem::zeroed();
         addr.nl_family = libc::AF_NETLINK as u16;
         let sent = libc::sendto(
-            fd,
+            fd.as_raw_fd(),
             msg.as_ptr().cast(),
             msg.len(),
             0,
@@ -255,17 +222,15 @@ fn netlink(kind: u16, flags: u16, body: &[u8]) -> Result<()> {
         if sent < 0 {
             -1
         } else {
-            libc::recv(fd, ack.as_mut_ptr().cast(), ack.len(), 0)
+            libc::recv(fd.as_raw_fd(), ack.as_mut_ptr().cast(), ack.len(), 0)
         }
     };
-    let err = std::io::Error::last_os_error();
-    unsafe { libc::close(fd) };
     if res < 20 {
-        bail!("netlink: {err}");
+        bail!("netlink: {}", std::io::Error::last_os_error());
     }
     let kind = u16::from_ne_bytes([ack[4], ack[5]]);
     let code = i32::from_ne_bytes(ack[16..20].try_into().unwrap());
-    if kind == NLMSG_ERROR && code != 0 {
+    if kind == NLMSG_ERROR as u16 && code != 0 {
         bail!("netlink: {}", std::io::Error::from_raw_os_error(-code));
     }
     Ok(())
@@ -296,10 +261,7 @@ pub fn sysctl(key: &str, value: &str) -> Result<()> {
 pub fn gratuitous_arp(dev: &str, ip: Ipv4Addr) -> Result<()> {
     let ifindex = ifindex(dev)?;
     let mac = parse_mac(&std::fs::read_to_string(format!("/sys/class/net/{dev}/address"))?)?;
-    let fd = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW | libc::SOCK_CLOEXEC, 0x0806u16.to_be() as i32) };
-    if fd < 0 {
-        bail!("packet socket: {}", std::io::Error::last_os_error());
-    }
+    let fd = socket(libc::AF_PACKET, libc::SOCK_RAW, 0x0806u16.to_be() as i32, "packet socket")?;
     let mut frame = Vec::with_capacity(42);
     frame.extend_from_slice(&[0xff; 6]);
     frame.extend_from_slice(&mac);
@@ -316,7 +278,7 @@ pub fn gratuitous_arp(dev: &str, ip: Ipv4Addr) -> Result<()> {
     addr.sll_addr[..6].copy_from_slice(&[0xff; 6]);
     let rc = unsafe {
         libc::sendto(
-            fd,
+            fd.as_raw_fd(),
             frame.as_ptr().cast(),
             frame.len(),
             0,
@@ -324,10 +286,8 @@ pub fn gratuitous_arp(dev: &str, ip: Ipv4Addr) -> Result<()> {
             std::mem::size_of::<libc::sockaddr_ll>() as u32,
         )
     };
-    let err = std::io::Error::last_os_error();
-    unsafe { libc::close(fd) };
     if rc < 0 {
-        bail!("send gratuitous arp: {err}");
+        bail!("send gratuitous arp: {}", std::io::Error::last_os_error());
     }
     Ok(())
 }
@@ -366,10 +326,6 @@ impl IpRange {
 
     pub fn contains(&self, ip: Ipv4Addr) -> bool {
         (self.first..=self.last).contains(&u32::from(ip))
-    }
-
-    pub fn overlaps(&self, other: &IpRange) -> bool {
-        self.first <= other.last && other.first <= self.last
     }
 
     pub fn allocate(&self, taken: impl Fn(Ipv4Addr) -> bool) -> Option<Ipv4Addr> {

@@ -441,36 +441,19 @@ fn data_extents(file: &File, len: u64) -> Result<Vec<(u64, u64)>> {
 }
 
 fn sparsify(path: &Path) -> Result<u64> {
-    use std::os::unix::fs::FileExt;
     let f = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
-    let len = f.metadata()?.len() as i64;
-    let fd = f.as_raw_fd();
     let mut buf = vec![0u8; PAGE_SIZE];
     let mut punched = 0u64;
-    let mut off: i64 = 0;
-    while off < len {
-        let data = unsafe { libc::lseek(fd, off, libc::SEEK_DATA) };
-        if data < 0 {
-            break;
-        }
-        let end = match unsafe { libc::lseek(fd, data, libc::SEEK_HOLE) } {
-            h if h < 0 => len,
-            h => h,
-        };
-        let mut p = data;
-        while p < end {
-            let n = f.read_at(&mut buf, p as u64)?;
+    for (data, end) in data_extents(&f, f.metadata()?.len())? {
+        for p in (data..end).step_by(PAGE_SIZE) {
+            let n = f.read_at(&mut buf, p)?;
             if n > 0 && buf[..n].iter().all(|&b| b == 0) {
-                let rc = unsafe {
-                    libc::fallocate(fd, libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE, p, n as i64)
-                };
-                if rc == 0 {
+                let mode = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
+                if unsafe { libc::fallocate(f.as_raw_fd(), mode, p as i64, n as i64) } == 0 {
                     punched += n as u64;
                 }
             }
-            p += PAGE_SIZE as i64;
         }
-        off = end;
     }
     Ok(punched)
 }

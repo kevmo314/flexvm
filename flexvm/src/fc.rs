@@ -77,15 +77,15 @@ impl Firecracker {
     }
 
     pub fn put(&self, path: &str, body: Value) -> Result<Value> {
-        self.request("PUT", path, Some(body))
+        self.request_within("PUT", path, Some(body), API_TIMEOUT)
     }
 
     pub fn patch(&self, path: &str, body: Value) -> Result<Value> {
-        self.request("PATCH", path, Some(body))
+        self.request_within("PATCH", path, Some(body), API_TIMEOUT)
     }
 
     pub fn get(&self, path: &str) -> Result<Value> {
-        self.request("GET", path, None)
+        self.request_within("GET", path, None, API_TIMEOUT)
     }
 
     /// With no `clock_realtime`, only prepares the load (`firecracker/0002-*.patch`).
@@ -111,10 +111,6 @@ impl Firecracker {
     }
 
     /// Every call has a deadline, so none can hold a VM's API lock forever.
-    fn request(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value> {
-        self.request_within(method, path, body, API_TIMEOUT)
-    }
-
     pub fn request_within(&self, method: &str, path: &str, body: Option<Value>, timeout: Duration) -> Result<Value> {
         self.api.request(&self.sockets.api, method, path, body, timeout)
     }
@@ -130,9 +126,8 @@ impl Firecracker {
             Err(e) => format!("unknown ({e})"),
         };
         let log = File::open(dir.join("firecracker.log")).and_then(|mut f| log_tail(&mut f)).unwrap_or_default();
-        let tail: Vec<&str> = log.lines().rev().take(5).collect();
-        let tail: Vec<&str> = tail.into_iter().rev().collect();
-        format!("firecracker {} {status}; log: {}", self.pid(), tail.join(" | "))
+        let lines: Vec<&str> = log.lines().collect();
+        format!("firecracker {} {status}; log: {}", self.pid(), lines[lines.len().saturating_sub(5)..].join(" | "))
     }
 
     pub fn kill(&mut self) {
@@ -337,15 +332,8 @@ impl Spawner {
         Spawner { bin: bin.into(), root: root.into(), sockets, cgroups, tap_prefix: tap_prefix.into(), next: AtomicU64::new(0) }
     }
 
-    pub fn take(&self) -> Result<Idle> {
-        self.take_by(None)
-    }
-
-    pub fn take_by(&self, deadline: Option<std::time::Instant>) -> Result<Idle> {
-        let ready = match deadline {
-            Some(d) => d.saturating_duration_since(std::time::Instant::now()).min(SPAWN_READY),
-            None => SPAWN_READY,
-        };
+    pub fn take(&self, deadline: Option<std::time::Instant>) -> Result<Idle> {
+        let ready = deadline.map_or(SPAWN_READY, |d| d.saturating_duration_since(std::time::Instant::now()).min(SPAWN_READY));
         if ready.is_zero() {
             bail!("out of time to start firecracker");
         }
@@ -360,28 +348,24 @@ impl Spawner {
         };
         let fc = std::fs::create_dir_all(&dir).map_err(Into::into).and_then(|()| Firecracker::spawn(&self.bin, &dir, self.sockets.allocate()?, ready));
         let made = made.join().unwrap_or_else(|_| Err("tap thread panicked".into()));
-        match (fc, made) {
-            (Ok(mut fc), Ok(())) => {
-                if let Some(cg) = cgroup.clone() {
-                    let pid = fc.pid();
-                    fc.joining = Some(std::thread::spawn(move || {
-                        let joined = std::fs::create_dir(&cg).and_then(|()| std::fs::write(cg.join("cgroup.procs"), pid.to_string()));
-                        if let Err(e) = joined {
-                            eprintln!("firecracker {pid}: no cgroup of its own ({}): {e}", cg.display());
-                        }
-                    }));
-                }
-                Ok(Idle { fc, dir, cgroup, tap })
-            }
-            (fc, made) => {
-                let e = match (fc, made) {
-                    (Err(e), _) | (_, Err(e)) => e,
-                    _ => unreachable!(),
-                };
+        // A Firecracker without its tap is dropped (killed) here, before `release`.
+        let mut fc = match fc.and_then(|fc| made.map(|()| fc)) {
+            Ok(fc) => fc,
+            Err(e) => {
                 release(&tap, cgroup.as_deref(), &dir);
-                Err(e)
+                return Err(e);
             }
+        };
+        if let Some(cg) = cgroup.clone() {
+            let pid = fc.pid();
+            fc.joining = Some(std::thread::spawn(move || {
+                let joined = std::fs::create_dir(&cg).and_then(|()| std::fs::write(cg.join("cgroup.procs"), pid.to_string()));
+                if let Err(e) = joined {
+                    eprintln!("firecracker {pid}: no cgroup of its own ({}): {e}", cg.display());
+                }
+            }));
         }
+        Ok(Idle { fc, dir, cgroup, tap })
     }
 }
 

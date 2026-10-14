@@ -30,27 +30,13 @@ fn update_sw(mut c: u32, bytes: &[u8]) -> u32 {
     c
 }
 
-#[cfg(target_arch = "x86_64")]
-fn has_sse42() -> bool {
-    std::arch::is_x86_feature_detected!("sse4.2")
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-fn has_sse42() -> bool {
-    false
-}
-
-fn update(c: u32, bytes: &[u8]) -> u32 {
-    #[cfg(target_arch = "x86_64")]
-    if has_sse42() {
-        // SAFETY: the CPU has SSE4.2.
-        return unsafe { hw::update(c, bytes) };
-    }
-    update_sw(c, bytes)
-}
-
 pub fn crc32c(bytes: &[u8]) -> u32 {
-    !update(!0, bytes)
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("sse4.2") {
+        // SAFETY: the CPU has SSE4.2.
+        return !unsafe { hw::update(!0, bytes) };
+    }
+    !update_sw(!0, bytes)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -76,7 +62,7 @@ fn shift_tables() -> &'static [[u32; 256]; 4] {
 pub fn page(p: &[u8]) -> (u32, bool) {
     debug_assert_eq!(p.len(), crate::util::PAGE_SIZE);
     #[cfg(target_arch = "x86_64")]
-    if has_sse42() {
+    if std::arch::is_x86_feature_detected!("sse4.2") {
         // SAFETY: the CPU has SSE4.2.
         return unsafe { hw::page(p, shift_tables()) };
     }

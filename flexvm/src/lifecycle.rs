@@ -238,7 +238,7 @@ impl Proc {
             let tpl = Template::open_id(&self.paths, &m.template, &m.template_id)?;
             t.mark("verify_template");
             let seed = Some((ck.runs, Origin::File(ck.file)));
-            let prepared = Vm::prepare(self.spawner.take()?, tpl, t)?;
+            let prepared = Vm::prepare(self.spawner.take(None)?, tpl, t)?;
             prepared.load(&self.spawner, name, Snapshot::Bytes(&ck.vmstate), seed, ip, !(hold && fault("restore_no_hold")), None, || Ok(()), t)
         })()
         .map_err(Restore::NotRun)?;
@@ -296,7 +296,7 @@ impl Proc {
             if ip != m.ip {
                 self.readdress(&vm, m.ip)?;
             }
-            crate::guest::ping(&vm.vsock())?;
+            crate::guest::ping(&vm.vsock)?;
             let ready = t.total();
             t.mark("guest_ready");
             Ok(ready)
@@ -394,7 +394,7 @@ impl Proc {
         }
         let plugged = vm.hotplug_plugged();
         cancelled()?;
-        vm.start_checkpoint()?;
+        vm.leave(State::Checkpointing)?;
         let paused = Instant::now();
         let mut hold = PacketHold { d: self, vm, id: crate::migrate::migration_id(), stats: None };
         // Failure must `unfreeze` so the last checkpoint stays the delta base.

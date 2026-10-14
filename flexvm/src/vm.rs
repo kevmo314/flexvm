@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufReader, Write};
 use std::net::{Ipv4Addr, Shutdown};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -77,7 +77,7 @@ pub struct Vm {
     clock_unsure: AtomicBool,
     next_exec: AtomicU64,
     fc: Mutex<Option<Firecracker>>,
-    vsock: PathBuf,
+    pub vsock: PathBuf,
     cgroup: Option<PathBuf>,
     was_paused: AtomicBool,
     pub clock_pending: AtomicBool,
@@ -114,10 +114,6 @@ impl Vm {
         prepared.pager.set_pid(prepared.firecracker().pid())?;
         phases.mark("pager_start");
         Ok(prepared)
-    }
-
-    pub fn vsock(&self) -> PathBuf {
-        self.vsock.clone()
     }
 
     pub fn mem_sock(&self) -> PathBuf {
@@ -196,15 +192,8 @@ impl Vm {
         self.fc(|fc| fc.patch("/balloon/statistics", json!({"stats_polling_interval_s": u16::MAX})).map(drop))
     }
 
-    pub fn start_source(&self, mig: u64) -> Result<()> {
-        self.leave(State::Source(mig))
-    }
-
-    pub fn start_checkpoint(&self) -> Result<()> {
-        self.leave(State::Checkpointing)
-    }
-
-    fn leave(&self, to: State) -> Result<()> {
+    /// For a migration (`Source`) or a checkpoint.
+    pub fn leave(&self, to: State) -> Result<()> {
         let _devices = self.devices.lock().unwrap();
         let leavable = |st: State| -> Result<()> {
             if !matches!(st, State::Running | State::Paused) || self.pager.failed().is_some() {
@@ -221,7 +210,7 @@ impl Vm {
         leavable(*self.state.lock().unwrap())?;
         // The agent serves in order, so an answered ping means a lost clock request landed.
         if self.clock_unsure.load(Ordering::SeqCst) {
-            crate::guest::ping(&self.vsock()).map_err(|e| format!("vm {}: guest agent not answering: {e}", self.name))?;
+            crate::guest::ping(&self.vsock).map_err(|e| format!("vm {}: guest agent not answering: {e}", self.name))?;
             self.clock_unsure.store(false, Ordering::SeqCst);
         }
         let mut st = self.state.lock().unwrap();
@@ -251,23 +240,13 @@ impl Vm {
         if *self.state.lock().unwrap() != State::Checkpointing {
             bail!("vm {} is not being checkpointed", self.name);
         }
-        let (s, res) = match self.resume() {
-            Ok(s) => (s, Ok(s)),
-            Err(e) => (State::Failed, Err(format!("resuming vm {} after its checkpoint failed: {e}", self.name).into())),
-        };
-        *self.state.lock().unwrap() = s;
+        let res: Result<State> = self.resume().map_err(|e| format!("resuming vm {} after its checkpoint failed: {e}", self.name).into());
+        *self.state.lock().unwrap() = *res.as_ref().unwrap_or(&State::Failed);
         res
     }
 
     pub fn pause(&self) -> Result<()> {
-        match self.state() {
-            State::Paused => return Ok(()),
-            State::Running => {}
-            s => bail!("vm {} is {}, not running", self.name, s.name()),
-        }
-        self.fc(|fc| fc.pause())?;
-        *self.state.lock().unwrap() = State::Paused;
-        Ok(())
+        self.switch(State::Running, State::Paused)
     }
 
     /// A migration target first pulls all its memory, so it never runs split across two hosts.
@@ -275,13 +254,24 @@ impl Vm {
         if self.pager.pulling_from_peer() && !self.pager.wait_pulled_for(PULL_WAIT) {
             bail!("vm {} is still pulling its memory from its previous host; resume it once that is done", self.name);
         }
+        self.switch(State::Paused, State::Running)
+    }
+
+    fn switch(&self, from: State, to: State) -> Result<()> {
         match self.state() {
-            State::Running => return Ok(()),
-            State::Paused => {}
-            s => bail!("vm {} is {}, not paused", self.name, s.name()),
+            s if s == to => return Ok(()),
+            s if s != from => bail!("vm {} is {}, not {}", self.name, s.name(), from.name()),
+            _ => {}
         }
-        self.fc(|fc| fc.resume())?;
-        *self.state.lock().unwrap() = State::Running;
+        self.fc(|fc| if to == State::Paused { fc.pause() } else { fc.resume() })?;
+        *self.state.lock().unwrap() = to;
+        Ok(())
+    }
+
+    fn running_here(&self) -> Result<()> {
+        if self.state() != State::Running {
+            bail!("vm {} is not running here", self.name);
+        }
         Ok(())
     }
 
@@ -290,8 +280,11 @@ impl Vm {
     }
 
     pub fn hotplug_plugged(&self) -> Option<u64> {
-        let hp = self.fc(|fc| fc.request_within("GET", "/hotplug/memory", None, crate::guest::TIMEOUT)).ok()?;
-        hp["plugged_size_mib"].as_u64()
+        self.hotplug(crate::guest::TIMEOUT).ok()?["plugged_size_mib"].as_u64()
+    }
+
+    fn hotplug(&self, within: Duration) -> Result<Value> {
+        self.fc(|fc| fc.request_within("GET", "/hotplug/memory", None, within))
     }
 
     /// Waits out the last virtio-mem resize, whose requests discard memory even with vCPUs
@@ -304,7 +297,7 @@ impl Vm {
         let mut gave_up = false;
         loop {
             let left = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
-            let hp = self.fc(|fc| fc.request_within("GET", "/hotplug/memory", None, left))?;
+            let hp = self.hotplug(left)?;
             let (requested, plugged) = (hp["requested_size_mib"].as_u64(), hp["plugged_size_mib"].as_u64());
             if requested.is_some() && requested == plugged {
                 return Ok(());
@@ -330,10 +323,10 @@ impl Vm {
     fn track(&self, s: &UnixStream) -> Result<u64> {
         let id = self.next_exec.fetch_add(1, Ordering::SeqCst);
         self.execs.lock().unwrap().insert(id, s.try_clone()?);
-        if self.state() != State::Running {
+        if let Err(e) = self.running_here() {
             self.untrack_exec(id);
             let _ = s.shutdown(Shutdown::Both);
-            bail!("vm {} is not running here", self.name);
+            return Err(e);
         }
         Ok(id)
     }
@@ -344,25 +337,20 @@ impl Vm {
             bail!("vm {} is not running here, or no time is left", self.name);
         }
         let left = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
-        let s = crate::util::connect_unix(&self.vsock(), left)?;
-        let raw = s.try_clone()?;
-        let mut g = BufReader::new(crate::util::By { s, at: deadline });
+        let raw = crate::util::connect_unix(&self.vsock, left)?;
         let id = self.track(&raw)?;
         let sid = crate::guest::session_id()?;
         let res = (|| -> Result<(i32, String)> {
-            g.get_mut().write_all(format!("CONNECT {}\nSESSION {sid} {}\n{cmd}", crate::guest::PORT, cmd.len()).as_bytes())?;
-            let mut ok = String::new();
-            g.by_ref().take(64).read_line(&mut ok)?;
-            if !ok.starts_with("OK") {
-                bail!("vsock connect refused: {ok:?}");
-            }
+            let s = crate::util::By { s: raw.try_clone()?, at: deadline };
+            let mut g = crate::guest::handshake(s, &format!("SESSION {sid} {}", cmd.len()))?;
+            g.get_mut().write_all(cmd.as_bytes())?;
             let mut out = Vec::new();
             let code = crate::guest::exec_output(&mut g, &sid, |_, d| {
                 out.extend_from_slice(&d[..d.len().min(MAX_OUTPUT.saturating_sub(out.len()))]);
                 Ok(())
             })
             .map_err(|e| format!("guest command {cmd:?}: {e}"))?;
-            let _ = crate::guest::close(&self.vsock(), &sid, deadline);
+            let _ = crate::guest::close(&self.vsock, &sid, deadline);
             Ok((code, String::from_utf8_lossy(&out).into_owned()))
         })();
         let _ = raw.shutdown(Shutdown::Both);
@@ -377,7 +365,7 @@ impl Vm {
         let mut first = None;
         for tries in 1.. {
             let start = Instant::now();
-            match crate::guest::clock(&self.vsock(), &self.template.legacy_agent, deadline.saturating_duration_since(start)) {
+            match crate::guest::clock(&self.vsock, &self.template.legacy_agent, deadline.saturating_duration_since(start)) {
                 Ok(Some(off)) => {
                     let off = *first.get_or_insert(off);
                     if start.elapsed() < CLOCK_RTT || Instant::now() + Duration::from_millis(200) >= deadline {
@@ -456,10 +444,8 @@ impl Vm {
 
     /// Registers the session (so a checkpoint can close it) before `start` talks to the guest.
     pub fn exec(&self, start: impl FnOnce(UnixStream) -> Result<BufReader<UnixStream>>) -> Result<(BufReader<UnixStream>, u64)> {
-        if self.state() != State::Running {
-            bail!("vm {} is not running here", self.name);
-        }
-        let s = crate::util::connect_unix(&self.vsock(), crate::guest::TIMEOUT)?;
+        self.running_here()?;
+        let s = crate::util::connect_unix(&self.vsock, crate::guest::TIMEOUT)?;
         let id = self.track(&s)?;
         match start(s).and_then(|g| crate::guest::untimed(&g).map(|()| g)) {
             Ok(g) => Ok((g, id)),
@@ -472,10 +458,8 @@ impl Vm {
 
     /// A failure leaves the clock unsure (see `leave`).
     pub fn guest_net(&self, ip: Ipv4Addr, dns: Option<&str>) -> Result<()> {
-        if self.state() != State::Running {
-            bail!("vm {} is not running here", self.name);
-        }
-        let res = crate::guest::start(&self.vsock(), ip, dns, &self.template.legacy_agent);
+        self.running_here()?;
+        let res = crate::guest::start(&self.vsock, ip, dns, &self.template.legacy_agent);
         if res.is_err() {
             self.clock_unsure.store(true, Ordering::SeqCst);
         }
@@ -483,10 +467,8 @@ impl Vm {
     }
 
     pub fn start_app(&self) -> Result<u32> {
-        if self.state() != State::Running {
-            bail!("vm {} is not running here", self.name);
-        }
-        crate::guest::start_app(&self.vsock())
+        self.running_here()?;
+        crate::guest::start_app(&self.vsock)
     }
 
     pub fn untrack_exec(&self, id: u64) {
@@ -507,7 +489,7 @@ impl Vm {
     pub fn describe(&self) -> Value {
         let [base, present, zero, remote, inflight, discarded] = self.pager.census();
         let mib = |pages: usize| (pages * PAGE_SIZE) as u64 >> 20;
-        let hotplug = self.fc(|fc| fc.request_within("GET", "/hotplug/memory", None, Duration::from_millis(500))).unwrap_or(Value::Null);
+        let hotplug = self.hotplug(Duration::from_millis(500)).unwrap_or(Value::Null);
         json!({
             "name": self.name,
             "ip": self.ip.to_string(),
@@ -637,7 +619,7 @@ impl Prepared {
         };
         eprintln!("vm {name}: load failed ({e}); once more on a fresh firecracker{}", if realtime { "" } else { ", without clock_realtime" });
         before_retry()?;
-        let fresh = Vm::prepare(spawner.take_by(deadline)?, tpl, t)?;
+        let fresh = Vm::prepare(spawner.take(deadline)?, tpl, t)?;
         fresh.load_once(name, vmstate, seed, ip, hold, realtime, deadline, t).map_err(|(e, _)| e)
     }
 

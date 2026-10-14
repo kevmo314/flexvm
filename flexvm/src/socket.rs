@@ -46,10 +46,9 @@ fn base_dir(base: &Path) -> io::Result<()> {
         return Err(denied(parent, "must be a real directory that only root or this user can change"));
     }
     match DirBuilder::new().mode(0o700).create(base) {
-        Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(e),
-        _ => {}
+        Err(e) if e.kind() != io::ErrorKind::AlreadyExists => Err(e),
+        _ => private(base),
     }
-    private(base)
 }
 
 fn bases() -> [PathBuf; 2] {
@@ -57,10 +56,6 @@ fn bases() -> [PathBuf; 2] {
 }
 
 /// Named after the key, so a process with the same key finds what its predecessor left.
-pub fn roots(key: &Path) -> Vec<PathBuf> {
-    roots_in(&bases(), key)
-}
-
 fn roots_in(bases: &[PathBuf], key: &Path) -> Vec<PathBuf> {
     let h = Sha256::digest(key.as_os_str().as_bytes());
     let name: String = h[..8].iter().map(|b| format!("{b:02x}")).collect();
@@ -70,7 +65,7 @@ fn roots_in(bases: &[PathBuf], key: &Path) -> Vec<PathBuf> {
 
 /// Their Firecrackers must be gone.
 pub fn remove(key: &Path) {
-    for dir in roots(key) {
+    for dir in roots_in(&bases(), key) {
         let _ = fs::remove_dir_all(dir);
     }
 }

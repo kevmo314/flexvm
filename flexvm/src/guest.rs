@@ -56,7 +56,7 @@ pub fn retries() -> BTreeMap<&'static str, u64> {
 
 /// Sends `line` in the same write as CONNECT: Firecracker forwards what follows its newline
 /// once the guest accepts, saving a round trip.
-fn handshake<S: Read + Write>(s: S, line: &str) -> Result<BufReader<S>> {
+pub fn handshake<S: Read + Write>(s: S, line: &str) -> Result<BufReader<S>> {
     let mut r = BufReader::new(s);
     r.get_mut().write_all(format!("CONNECT {PORT}\n{line}\n").as_bytes())?;
     let mut ok = String::new();
@@ -84,10 +84,6 @@ fn ask(uds: &Path, line: &str, deadline: Instant) -> Result<(u8, Vec<u8>)> {
         return Err(lost("injected fault: guest reply lost"));
     }
     Ok(reply)
-}
-
-pub fn request(uds: &Path, line: &str, timeout: Duration) -> Result<BufReader<UnixStream>> {
-    request_on(crate::util::connect_unix(uds, timeout)?, line, timeout)
 }
 
 /// On a fresh connection, so a caller can register it before anything reaches the guest.
@@ -221,21 +217,16 @@ fn now() -> Result<String> {
 pub fn start(uds: &Path, ip: std::net::Ipv4Addr, dns: Option<&str>, legacy: &AtomicBool) -> Result<()> {
     let dns = dns.unwrap_or("");
     answered("START", Instant::now() + TIMEOUT, |by| {
-        let reply = match legacy.load(Ordering::Relaxed) {
-            true => None,
-            false => Some(ask(uds, &format!("START {ip} {} {dns}", now()?), by)?),
-        };
-        match reply {
-            Some((FRAME_MSG, m)) if m == b"ok" => Ok(()),
-            Some((FRAME_MSG, m)) if !m.starts_with(b"unknown request") => bail!("guest start: {}", String::from_utf8_lossy(&m)),
-            Some((FRAME_MSG, _)) | None => {
-                legacy.store(true, Ordering::Relaxed);
-                match ask(uds, &format!("NET {ip} {dns}"), by)? {
-                    (FRAME_MSG, m) if m == b"ok" => Ok(()),
-                    (_, m) => bail!("guest network setup: {}", String::from_utf8_lossy(&m)),
-                }
+        if !legacy.load(Ordering::Relaxed) {
+            match ask(uds, &format!("START {ip} {} {dns}", now()?), by)? {
+                (FRAME_MSG, m) if m == b"ok" => return Ok(()),
+                (FRAME_MSG, m) if m.starts_with(b"unknown request") => legacy.store(true, Ordering::Relaxed),
+                (_, m) => bail!("guest start: {}", String::from_utf8_lossy(&m)),
             }
-            Some((_, m)) => bail!("guest start: {}", String::from_utf8_lossy(&m)),
+        }
+        match ask(uds, &format!("NET {ip} {dns}"), by)? {
+            (FRAME_MSG, m) if m == b"ok" => Ok(()),
+            (_, m) => bail!("guest network setup: {}", String::from_utf8_lossy(&m)),
         }
     })
 }
@@ -256,7 +247,7 @@ pub fn clock(uds: &Path, legacy: &AtomicBool, timeout: Duration) -> Result<Optio
 }
 
 fn message(uds: &Path, line: &str, timeout: Duration) -> Result<String> {
-    match read_frame(&mut request(uds, line, timeout)?)? {
+    match read_frame(&mut request_on(crate::util::connect_unix(uds, timeout)?, line, timeout)?)? {
         Some((FRAME_MSG, m)) => Ok(String::from_utf8_lossy(&m).into_owned()),
         Some((_, m)) => bail!("unexpected reply to {line}: {}", String::from_utf8_lossy(&m)),
         None => bail!("guest closed the connection during {line}"),

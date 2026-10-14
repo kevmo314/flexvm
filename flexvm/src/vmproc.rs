@@ -364,7 +364,7 @@ impl Proc {
         let ip = self.set_addr(claim);
         t.mark("claim_ip");
         crate::host::stall("start_stall");
-        let prepared = Vm::prepare(self.spawner.take()?, tpl.clone(), &mut t)?;
+        let prepared = Vm::prepare(self.spawner.take(None)?, tpl.clone(), &mut t)?;
         let learn = crate::standby::load_set(&self.host, &tpl).is_empty();
         if learn {
             prepared.pager.learn_load_set();
@@ -570,7 +570,7 @@ impl Proc {
             if let Some(id) = &once {
                 let code = guest::exec_output(&mut g, id, |kind, data| Ok(guest::write_frame(&mut w, kind, data)?))?;
                 guest::write_frame(&mut w, guest::FRAME_EXIT, &code.to_le_bytes())?;
-                return guest::close(&vm.vsock(), id, Instant::now() + guest::TIMEOUT);
+                return guest::close(&vm.vsock, id, Instant::now() + guest::TIMEOUT);
             }
             std::io::copy(&mut g, &mut w)?;
             Ok(())
