@@ -28,9 +28,7 @@ A VM process:
 A VM process started in the background (`-d`, an arrival the listener
 spawns, a standby VM) is in a session of its own and, between fork and exec,
 joins a cgroup of its own, `/sys/fs/cgroup/flexvm/vm-PID-START` (`util::spawn_self`;
-named after the instance, so one that exists is refused, never joined; its
-`cpu.weight` is 10000, so the pager and packet holds come before its
-siblings, the Firecrackers' cgroups, as they did in the caller's cgroup),
+named after the instance, so one that exists is refused, never joined),
 so stopping its starter's cgroup (a systemd unit's restart with
 `KillMode=control-group`, a oneshot unit's end, logind's `KillUserProcesses`)
 does not reach it. Its Firecrackers move on to `flexvm/idle-PID-N`. Without
@@ -164,10 +162,12 @@ VM, suspended VM, `failed` or `moved` record go once unwritten for an hour,
 decided and removed holding `RUN/.logs.lock`, which a start holds (shared)
 while it opens and marks its log (whether a VM holds the name is read from its lock's record, never by probing the lock a start takes without waiting); `NAME.moved` goes after an hour.
 Released migration records are retired as below. Logs are capped by their
-writers, not swept: a VM process's output relay, writing to a log in the
-run directory, renames it `NAME.log.1` once past 8 MiB (under the
-directory's `.rotate.lock`) and starts a new one; another writer of the
-same log follows to it.
+writers, not swept (`output::append_capped`): every write a VM process's
+output relay makes to a log in the run directory, whichever process and
+stream, is made under the directory's `.rotate.lock` to the file at the
+log's path then (reopened if another writer rotated it), and past 8 MiB
+renames it `NAME.log.1` and starts a new one. No write goes to a rotated
+or removed generation, and none is cut.
 
 **The tap prefix** names taps (and garbage collection reads their owners by
 it), so it changes only while nothing uses the old one: `Host::configure`

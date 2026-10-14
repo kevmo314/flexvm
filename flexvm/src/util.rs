@@ -461,16 +461,6 @@ fn scope(prefix: &[u8], pid: u32, start: u64) -> bool {
             if !scope_path(&mut path, prefix, pid, start, b"") || libc::mkdir(path.as_ptr().cast(), 0o755) != 0 {
                 return false;
             }
-            // Its siblings are Firecrackers (`idle-*`, weight 100): the pager
-            // and packet holds come before guest vCPUs, as they did in the
-            // caller's cgroup. Best effort.
-            if scope_path(&mut path, prefix, pid, start, b"/cpu.weight") {
-                let fd = libc::open(path.as_ptr().cast(), libc::O_WRONLY | libc::O_CLOEXEC);
-                if fd >= 0 {
-                    libc::write(fd, b"10000".as_ptr().cast(), 5);
-                    libc::close(fd);
-                }
-            }
             if !scope_path(&mut path, prefix, pid, start, b"/cgroup.procs") {
                 return false;
             }
@@ -533,27 +523,32 @@ mod tests {
     /// one: nothing written is cut or lost, and a second writer follows.
     #[test]
     fn a_full_log_is_rotated_by_its_writers() {
-        use std::io::Write;
         let d = std::env::temp_dir().join(format!("flexvm-rotate-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         let log = d.join("vm.log");
         let open = || std::fs::File::options().create(true).append(true).open(&log).unwrap();
-        let (mut a, mut b) = (open(), open());
-        a.write_all(b"one\n").unwrap();
-        assert!(output::rotate(&log, &a, 10).unwrap().is_none(), "under the cap");
-        b.write_all(b"two two two\n").unwrap();
-        let mut a2 = output::rotate(&log, &a, 10).unwrap().expect("rotated");
-        assert_eq!(std::fs::read(d.join("vm.log.1")).unwrap(), b"one\ntwo two two\n");
-        a2.write_all(b"three\n").unwrap();
-        // The other writer, still on the old file, follows to the new one.
-        let mut b2 = output::rotate(&log, &b, 10).unwrap().expect("follows");
-        b2.write_all(b"four\n").unwrap();
-        assert_eq!(std::fs::read(&log).unwrap(), b"three\nfour\n");
-        assert_eq!(std::fs::read(d.join("vm.log.1")).unwrap(), b"one\ntwo two two\n", "not rotated twice");
-        // A log that is gone is left to whoever removed it.
+        let read = |n: &str| String::from_utf8(std::fs::read(d.join(n)).unwrap()).unwrap();
+        let (a, b) = (open(), open());
+        assert!(output::append_capped(&log, &a, b"one\n", 10).unwrap().is_none(), "under the cap");
+        // Past it: rotated, and the writer goes on in the new log.
+        let b1 = output::append_capped(&log, &b, b"two two two\n", 10).unwrap().expect("rotated");
+        assert_eq!(read("vm.log.1"), "one\ntwo two two\n");
+        // B rotates again while A still has the first generation, now removed:
+        // A's next write goes to the log as it is, never to a stale file.
+        let b2 = output::append_capped(&log, &b1, b"three three\n", 10).unwrap().expect("rotated again");
+        assert_eq!(read("vm.log.1"), "three three\n");
+        let a1 = output::append_capped(&log, &a, b"four\n", 10).unwrap().expect("follows");
+        assert!(output::append_capped(&log, &b2, b"five\n", 10).unwrap().is_none());
+        assert_eq!(read("vm.log"), "four\nfive\n");
+        a1.sync_all().unwrap();
+        // A whole write is never cut, even past the cap.
+        let big = vec![b'x'; 100];
+        output::append_capped(&log, &a1, &big, 10).unwrap();
+        assert_eq!(read("vm.log.1").len(), "four\nfive\n".len() + 100);
+        // A log that is gone (garbage collection's) is made again.
         std::fs::remove_file(&log).unwrap();
-        assert!(output::rotate(&log, &a2, 0).unwrap().is_none() && !log.exists());
+        assert!(output::append_capped(&log, &b2, b"six\n", 10).unwrap().is_some() && read("vm.log") == "six\n");
         std::fs::remove_dir_all(d).unwrap();
     }
 
@@ -648,10 +643,19 @@ pub mod output {
 
     fn relay(i: usize, data: &[u8]) {
         let target = TARGETS.lock().unwrap()[i].clone();
-        let sent = target.as_ref().map_or(0, |t| write_within(t, data, Instant::now() + STALL));
-        if let Some(t) = &target {
-            keep_capped(i, t);
+        let log = LOGS.lock().unwrap()[i].clone();
+        if let (Some(log), Some(t)) = (&log, &target) {
+            if let Ok(next) = append_capped(log, t, data, LOG_CAP) {
+                if let Some(next) = next {
+                    let mut targets = TARGETS.lock().unwrap();
+                    if targets[i].as_ref().map(Arc::as_ptr) == Some(Arc::as_ptr(t)) {
+                        targets[i] = Some(Arc::new(next));
+                    }
+                }
+                return;
+            }
         }
+        let sent = target.as_ref().map_or(0, |t| write_within(t, data, Instant::now() + STALL));
         if sent == data.len() {
             return;
         }
@@ -736,41 +740,27 @@ pub mod output {
         (path.starts_with(crate::host::run_dir()?) && !hidden && same_file(f, &path)).then_some(path)
     }
 
-    fn keep_capped(i: usize, target: &Arc<File>) {
-        let Some(log) = LOGS.lock().unwrap()[i].clone() else { return };
-        if let Ok(Some(next)) = rotate(&log, target, LOG_CAP) {
-            let mut targets = TARGETS.lock().unwrap();
-            if targets[i].as_ref().map(Arc::as_ptr) == Some(Arc::as_ptr(target)) {
-                targets[i] = Some(Arc::new(next));
-            }
-        }
-    }
-
-    /// The file `current`'s writer goes on with, if not `current`: once it is
-    /// past `cap`, `log` is renamed `log.1` (replacing an older one) and a new
-    /// `log` is started; once another writer did that, the new `log`. Rotation
-    /// is under the directory's `.rotate.lock`, so a log is renamed once.
-    /// Whole writes go to one file or the next: none is cut.
-    pub fn rotate(log: &Path, current: &File, cap: u64) -> std::io::Result<Option<File>> {
-        let reopen = || File::options().create(true).append(true).open(log).map(Some);
-        let mine = current.metadata()?;
-        match std::fs::metadata(log) {
-            Ok(m) if m.ino() == mine.ino() && m.dev() == mine.dev() => {
-                if mine.len() <= cap {
-                    return Ok(None);
-                }
-            }
-            Ok(_) => return reopen(),
-            Err(_) => return Ok(None),
-        }
+    /// Appends `data` to `log`, whatever file `current` is by now: every
+    /// write to a capped log, by any writer in any process, is made under the
+    /// directory's `.rotate.lock`, to the file at `log` then (`current` if it
+    /// still is, else `log` reopened), so none goes to a rotated or removed
+    /// generation. Past `cap`, `log` is renamed `log.1` (replacing the one
+    /// before) and a new `log` is started. Returns the file the writer goes
+    /// on with, if not `current`.
+    pub fn append_capped(log: &Path, current: &File, data: &[u8], cap: u64) -> std::io::Result<Option<File>> {
+        let open = || File::options().create(true).append(true).open(log);
         let lock = File::create(log.with_file_name(".rotate.lock"))?;
         crate::host::flock(&lock, libc::LOCK_EX)?;
-        if same_file(current, log) {
+        let mut next = (!same_file(current, log)).then(open).transpose()?;
+        let mut f = next.as_ref().unwrap_or(current);
+        f.write_all(data)?;
+        if f.metadata()?.len() > cap {
             let mut old = log.as_os_str().to_owned();
             old.push(".1");
             std::fs::rename(log, old)?;
+            next = Some(open()?);
         }
-        reopen()
+        Ok(next)
     }
 
     /// Before exit, bounded by a second from the start: what was printed

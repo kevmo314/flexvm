@@ -226,20 +226,28 @@ impl Host {
     /// exists, `tap_prefix`). And no tap may already read as one of `new`'s,
     /// whoever made it, live or leaked. (Taps under the old prefix that do
     /// not read under `new` are left alone by this host's sweeps from then on.)
+    /// What cannot be read is a reason too: never taken for nothing in use.
     fn prefix_in_use(&self, new: &str) -> Option<String> {
-        for e in std::fs::read_dir(self.run.join("w")).into_iter().flatten().flatten() {
-            let owner = load::<Ident>(&e.path().join("owner"));
+        self.prefix_in_use_at(new, Path::new("/sys/class/net"))
+    }
+
+    fn prefix_in_use_at(&self, new: &str, net: &Path) -> Option<String> {
+        let names = |dir: &Path| -> std::io::Result<Vec<std::ffi::OsString>> { std::fs::read_dir(dir)?.map(|e| e.map(|e| e.file_name())).collect() };
+        let w = self.run.join("w");
+        let work = match names(&w) {
+            Ok(w) => w,
+            Err(e) => return Some(format!("{}: {e}", w.display())),
+        };
+        for pid in work {
+            let owner = load::<Ident>(&w.join(&pid).join("owner"));
             if !matches!(owner, Ok(Some(ref o)) if o.liveness() == Liveness::Gone) {
-                return Some(format!("vm process {} runs (stop this host's VMs first)", e.file_name().to_string_lossy()));
+                return Some(format!("vm process {} runs, or may (stop this host's VMs first)", pid.to_string_lossy()));
             }
         }
-        let taps: Vec<String> = std::fs::read_dir("/sys/class/net")
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| tap_owner(n, new).is_some())
-            .collect();
+        let taps: Vec<String> = match names(net) {
+            Ok(n) => n.iter().map(|n| n.to_string_lossy().into_owned()).filter(|n| tap_owner(n, new).is_some()).collect(),
+            Err(e) => return Some(format!("{}: {e}", net.display())),
+        };
         (!taps.is_empty()).then(|| format!("taps {} already read as named under it", taps.join(", ")))
     }
 
@@ -1733,8 +1741,17 @@ mod tests {
             Ok(())
         }).unwrap();
         store(&w.join("owner"), &Ident { pid: 999_999_930, start: 1, boot: boot_id().into() }, false).unwrap();
+        assert!(h.prefix_in_use_at("zq", &h.run.join("no-such-net")).is_some(), "the taps unreadable");
         h.configure(prefix("zq")).unwrap();
         assert_eq!(h.tap_prefix().unwrap(), "zq");
+        // A tap already read as one under the new prefix.
+        let net = h.run.join("net");
+        std::fs::create_dir_all(net.join("zq21t0")).unwrap();
+        assert!(h.prefix_in_use_at("zq2", &net).unwrap().contains("zq21t0"));
+        assert!(h.prefix_in_use_at("zq3", &net).is_none());
+        // The work directories unreadable.
+        std::fs::remove_dir_all(h.run.join("w")).unwrap();
+        assert!(h.prefix_in_use_at("zq3", &net).is_some());
     }
 
     /// A VM process's own cgroup goes only once empty, whatever its pid
