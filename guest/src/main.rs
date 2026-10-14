@@ -639,11 +639,6 @@ mod tests {
                 .env(CHILD, "1").status().unwrap().success());
             return;
         }
-        // Deterministically verify that the unlocked wait leaves the child
-        // available for std to consume, as it does after an exec failure.
-        let mut observed = Command::new("/bin/sh").args(["-c", "exit 17"]).spawn().unwrap();
-        assert_eq!(exited_child().unwrap(), observed.id() as i32);
-        assert_eq!(observed.wait().unwrap().code(), Some(17));
         let statuses: Statuses = Arc::new((Mutex::new(HashMap::new()), Condvar::new()));
         let reaper = statuses.clone();
         thread::spawn(move || reap(reaper));
@@ -651,7 +646,10 @@ mod tests {
         // Let the reaper reach its blocking wait before failed execs exit.
         thread::sleep(Duration::from_millis(10));
         for _ in 0..200 {
-            assert!(spawn(&mut Command::new("/flexvm/nonexistent-executable"), &statuses, true).is_err());
+            // A pre_exec makes std fork and reap a failed exec itself, as with the throttle cgroup.
+            let mut missing = Command::new("/flexvm/nonexistent-executable");
+            unsafe { missing.pre_exec(|| Ok(())) };
+            assert!(spawn(&mut missing, &statuses, true).is_err());
         }
         assert_eq!(wait_pid(&statuses, child.id() as i32), 0);
         let child = spawn(Command::new("/bin/sh").args(["-c", "exit 7"]), &statuses, true).unwrap();
