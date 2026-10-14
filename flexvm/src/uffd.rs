@@ -31,7 +31,7 @@ use std::io::{self, IoSliceMut};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixListener;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -60,6 +60,10 @@ pub use pages::{Pages, BASE, DISCARDED, INFLIGHT, PRESENT, REMOTE, ZERO};
 pub(crate) use pages::zeroed_atomics;
 pub use server::serve_pages;
 pub use wp::Frozen;
+
+/// `Pager::prefetching`.
+const DUE: u8 = 1;
+const RUNNING: u8 = 2;
 
 /// Pages copied per sequential template fault (see `Pager::template_next`).
 pub const FAULT_AROUND: usize = 16;
@@ -207,6 +211,8 @@ pub struct Pager {
     /// The page after the last template fault: only sequential template reads copy `FAULT_AROUND` pages, avoiding
     /// sixteenfold amplification for strided reads of guest page structs.
     template_next: AtomicUsize,
+    /// The working-set prefetch: 0, `DUE` or `RUNNING` (its pages still to come).
+    prefetching: AtomicU8,
     failed: OnceLock<PagerFailure>,
     stop: AtomicBool,
     thread: Mutex<Option<thread::JoinHandle<()>>>,
@@ -271,6 +277,7 @@ impl Pager {
             done: (Mutex::new(()), Condvar::new()),
             quiesce: AtomicBool::new(false),
             template_next: AtomicUsize::new(usize::MAX),
+            prefetching: AtomicU8::new(0),
             failed: OnceLock::new(),
             stop: AtomicBool::new(false),
             thread: Mutex::new(None),
@@ -298,7 +305,10 @@ impl Pager {
             match handshake {
                 // Alongside fault handling: Firecracker itself touches guest memory while restoring devices and must
                 // not wait behind it.
-                Ok(prefetch) => p.start_prefetch(false, prefetch),
+                Ok(prefetch) => {
+                    p.prefetching.store(if prefetch { DUE } else { 0 }, Ordering::SeqCst);
+                    p.start_prefetch(false, prefetch)
+                }
                 Err(e) => return p.fail(format!("uffd handshake failed: {e}")),
             }
             p.serve();
@@ -310,6 +320,7 @@ impl Pager {
     /// Starts the working-set prefetch once it is `due` and, while learning the load set, the snapshot is `loaded`.
     fn start_prefetch(self: &Arc<Self>, loaded: bool, due: bool) {
         if self.prefetch.lock().unwrap().request(loaded, due) {
+            self.prefetching.store(RUNNING, Ordering::SeqCst);
             let p = self.clone();
             thread::spawn(move || p.prefetch());
         }
@@ -455,6 +466,8 @@ impl Pager {
                 i += n.max(1);
             }
         }
+        self.prefetching.store(0, Ordering::SeqCst);
+        self.notify();
     }
 
     /// Runs of pages populated so far, as `(first_page, count)`.
@@ -555,6 +568,19 @@ impl Pager {
     /// first (false).
     pub fn wait_pulled(&self, timeout: Option<Duration>) -> bool {
         self.wait_for(timeout, || self.remote_left() == 0)
+    }
+
+    /// `wait_pulled(None)`, and for a working-set prefetch that runs (one never started does not hold it up), telling
+    /// `tick` every `every` meanwhile how many MiB are still to come: remote pages, and the working set while due.
+    pub fn wait_pulled_every(&self, every: Duration, mut tick: impl FnMut(u64)) -> bool {
+        while !self.wait_for(Some(every), || self.remote_left() == 0 && self.prefetching.load(Ordering::SeqCst) != RUNNING) {
+            if self.stop.load(Ordering::SeqCst) {
+                return false;
+            }
+            let ws = if self.prefetching.load(Ordering::SeqCst) > 0 { self.base.working_set_mib() } else { 0 };
+            tick((self.remote_left() as u64 * PAGE_SIZE as u64).div_ceil(1 << 20) + ws);
+        }
+        true
     }
 
     /// How long an incoming migration took to pull every remote page, once done.
