@@ -248,13 +248,16 @@ impl Vm {
         crate::net::set_link_up(&self.tap, true)?;
         // The link-down took the VM's /32 route with it.
         crate::net::attach(self.ip, &self.tap)?;
-        self.unpark_balloon();
-        self.limit.restore();
-        if self.was_paused.swap(false, Ordering::SeqCst) {
-            return Ok(State::Paused);
+        let resumed = match self.was_paused.swap(false, Ordering::SeqCst) {
+            true => Ok(State::Paused),
+            false => self.fc(|fc| fc.resume()).map(|()| State::Running),
+        };
+        // Out of the pause, but with the mark still lifted: Firecracker throttled at it could time this out.
+        if resumed.is_ok() {
+            self.unpark_balloon();
         }
-        self.fc(|fc| fc.resume())?;
-        Ok(State::Running)
+        self.limit.restore();
+        resumed
     }
 
     /// Routes the address to the tap (its neighbour entry is there: `net::neighbour`)
