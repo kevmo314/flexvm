@@ -1204,8 +1204,13 @@ impl Pager {
         }
     }
 
-    /// Test fault `kill_prepared`: Firecracker was killed; treat it as gone.
+    /// Test fault `kill_prepared`: kills Firecracker (left unreaped, see
+    /// `pid`) and treats it as gone.
     pub fn firecracker_gone(&self) {
+        self.kill_firecracker();
+        if let Some(fd) = self.pidfd.get() {
+            let _ = crate::util::pidfd_wait(fd, Duration::from_secs(5));
+        }
         self.gone();
     }
 

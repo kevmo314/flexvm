@@ -541,10 +541,6 @@ impl Prepared {
         self.idle.as_mut().is_some_and(|i| i.fc.alive())
     }
 
-    pub fn kill_firecracker(&mut self) {
-        self.idle.as_mut().unwrap().fc.kill();
-    }
-
     pub fn into_vm(mut self, name: &str, ip: Ipv4Addr, state: State) -> Arc<Vm> {
         let (fc, dir, cgroup, tap) = self.idle.take().unwrap().into_parts();
         Arc::new(Vm {

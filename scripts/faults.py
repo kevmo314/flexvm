@@ -2952,7 +2952,7 @@ def uffd_err():
         code = None
     took = time.time() - t
     fault(A, "uffd_err", 0)
-    check("uffd err: noticed at once, exit status 3", code == 3 and took < 3, (code, took))
+    check("uffd err: noticed at once, exit status 124", code == 124 and took < 3, (code, took))
     failed = vms(A).get(n, {})
     check("uffd err: ls shows it failed, saying why", failed.get("state") == "failed" and "userfaultfd" in failed.get("error", ""), failed)
     ok(kill(A, n))
