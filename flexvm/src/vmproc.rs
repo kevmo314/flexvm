@@ -27,6 +27,7 @@ use crate::vm::{Snapshot, State, Vm};
 
 pub const DIED: i32 = 3;
 const OP_WAIT: Duration = Duration::from_secs(30);
+const RELEASE_WAIT: Duration = Duration::from_secs(10);
 const CLOCK_TOLERANCE: Duration = Duration::from_millis(20);
 pub const CLOCK_DEADLINE: Duration = Duration::from_secs(5);
 const SIGNALS: [i32; 5] = [libc::SIGTERM, libc::SIGINT, libc::SIGTSTP, libc::SIGCONT, libc::SIGHUP];
@@ -182,22 +183,39 @@ impl Proc {
     /// operation that changes who owns the VM (suspend, migrating on,
     /// checkpoint --stop) settles first, waiting up to `wait`, and is refused
     /// while the VM is still arriving.
+    /// Recording the release is bounded too (`RELEASE_WAIT`): on a failure
+    /// the arrival stays unsettled, for the pull's worker to retry.
     pub fn settle_arrival(&self, _op: &Op, wait: Duration) -> Result<()> {
         if self.arrived.lock().unwrap().is_none() {
             return Ok(());
         }
         let vm = self.vm();
-        // A stopped pager (its Firecracker died) ends the wait without a failure.
-        let pulled = vm.pager.wait_pulled(Some(wait));
-        if !pulled || vm.pager.remote_left() > 0 || vm.pager.failed().is_some() || !vm.firecracker_alive() {
+        // In slices: a kill on its way (`destroy`) is not held up by the wait.
+        let deadline = Instant::now() + wait;
+        while !self.pulled_all() && vm.cancel_checkpoint.load(Ordering::SeqCst) == 0 && vm.pager.failed().is_none() && vm.firecracker_alive() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            vm.pager.wait_pulled(Some(left.min(Duration::from_millis(100))));
+        }
+        if !self.pulled_all() {
             bail!("vm {} is still arriving: not all its memory is here yet", vm.name);
         }
         let mut arrived = self.arrived.lock().unwrap();
         if let Some(rec) = arrived.as_ref() {
-            rec.release(Some((vm.ip, self.gen())));
+            rec.release(Some((vm.ip, self.gen())), Some(RELEASE_WAIT))
+                .map_err(|e| format!("vm {}: recording that all its memory arrived: {e}; try again", vm.name))?;
         }
         *arrived = None;
         Ok(())
+    }
+
+    /// Every page is here and the VM can still run (a stopped pager, as when
+    /// its Firecracker died, ends a wait for the pull without a failure).
+    pub fn pulled_all(&self) -> bool {
+        let vm = self.vm();
+        vm.pager.remote_left() == 0 && vm.pager.failed().is_none() && vm.firecracker_alive()
     }
 
     pub fn keep_addr(&self) {
@@ -217,6 +235,15 @@ impl Proc {
 
     pub fn op(&self) -> Op<'_> {
         self.op.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Without waiting: None if another operation holds it.
+    pub fn op_now(&self) -> Option<Op<'_>> {
+        match self.op.try_lock() {
+            Ok(g) => Some(g),
+            Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner()),
+            Err(_) => None,
+        }
     }
 
     pub fn op_within(&self) -> Result<Op<'_>> {
@@ -242,8 +269,12 @@ impl Proc {
             .as_ref()
     }
 
+    /// Best effort: the registry is for `ls`; nothing decides ownership by it.
     pub fn publish(&self) {
         let (Some(vm), Some(n)) = (self.vm.get(), self.name.lock().unwrap().as_ref().map(|n| n.name.clone())) else { return };
+        if fault("publish") {
+            return eprintln!("vm {n}: registry: injected fault: not published");
+        }
         let e = Entry {
             name: n.clone(),
             ident: self.ident.clone(),
@@ -510,7 +541,14 @@ impl Proc {
                 eprintln!("vm {}: migrating away; it ends once the target has its memory", vm.name);
                 Ok(())
             }
-            libc::SIGTERM => Err(self.suspend()),
+            libc::SIGTERM => match self.arc() {
+                // Off the signal thread, which a later SIGINT needs.
+                Some(p) => {
+                    thread::spawn(move || eprintln!("vm {}: signal {sig}: {}", p.name(), p.suspend()));
+                    Ok(())
+                }
+                None => Err(self.suspend()),
+            },
             libc::SIGINT => Err(self.destroy(0)),
             _ => Ok(()),
         };
@@ -538,7 +576,7 @@ impl Proc {
                 }
                 Ok(v)
             }),
-            "migrate" => self.migrate(req["to"].as_str().unwrap_or("")),
+            "migrate" => self.migrate(req["to"].as_str().unwrap_or(""), req["if_idle"] == true),
             "debug" => self.debug(&req),
             "claim" => Err("this vm is not a standby vm".into()),
             op => Err(format!("unknown op {op:?}").into()),
@@ -1034,19 +1072,31 @@ fn relieve(host: &Host, starved_here: bool) {
     if host.cfg.peers.is_empty() || recent.is_some_and(|d| d < Duration::from_secs(5)) {
         return;
     }
+    if fault("no_evict") {
+        return;
+    }
     let rss = |pid: Option<u32>| pid.and_then(|p| proc_kb(&format!("/proc/{p}/status"), "VmRSS")).unwrap_or(0);
-    let running: Vec<_> = host.entries().into_iter().filter(|e| e.state == "running").collect();
-    let Some(vm) = running.iter().find(|e| e.starved).or_else(|| running.iter().max_by_key(|e| rss(e.firecracker))) else { return };
+    let mut running: Vec<_> = host.entries().into_iter().filter(|e| e.state == "running").collect();
+    // Starved first, then the biggest.
+    running.sort_by_key(|e| (!e.starved, std::cmp::Reverse(rss(e.firecracker))));
     let _ = std::fs::write(&last, b"");
-    let why = if vm.starved { "cannot grow here" } else { "the host is low on memory" };
-    for peer in &host.cfg.peers {
-        eprintln!("vm {}: {why} ({avail} MiB available); migrating to {peer}", vm.name);
-        match call(host, &vm.name, json!({"op": "migrate", "to": peer})) {
-            Ok(_) => return eprintln!("vm {}: migrated to {peer}", vm.name),
-            Err(e) => eprintln!("vm {}: migrating to {peer}: {e}", vm.name),
+    // A VM busy with anything (a checkpoint's copy, a migration, an arrival
+    // settling) is skipped, never waited for: `if_idle`.
+    for vm in &running {
+        let why = if vm.starved { "cannot grow here" } else { "the host is low on memory" };
+        for peer in &host.cfg.peers {
+            eprintln!("vm {}: {why} ({avail} MiB available); migrating to {peer}", vm.name);
+            match call(host, &vm.name, json!({"op": "migrate", "to": peer, "if_idle": true})) {
+                Ok(_) => return eprintln!("vm {}: migrated to {peer}", vm.name),
+                Err(e) if e.to_string().contains(BUSY) => break,
+                Err(e) => eprintln!("vm {}: migrating to {peer}: {e}", vm.name),
+            }
         }
     }
 }
+
+/// What `migrate` with `if_idle` answers for a VM busy with something else.
+pub const BUSY: &str = "busy with another operation";
 
 fn answer(reply: Option<Value>, who: &str) -> Result<Value> {
     let reply = reply.ok_or_else(|| format!("{who} hung up"))?;

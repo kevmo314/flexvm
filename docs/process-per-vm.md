@@ -227,6 +227,9 @@ every second each VM process tries `STATE/evict.lock` (non-blocking); the
 holder, at most once per 5 s, reads the registry, picks the starved VM first,
 else the biggest RSS, and sends it `migrate` with each peer in turn until one
 accepts (`migrate_in` refuses when the target would go under its reserve).
+The request is `if_idle`: a VM busy with another operation (a checkpoint's
+copy, a migration, an arrival not yet settled) refuses at once and the next
+VM is tried; eviction never waits for or races an operation.
 This replaces the `info` op the daemon used to find room.
 
 ## API

@@ -393,15 +393,15 @@ impl Host {
         self.state.join("migs").join(id.to_string())
     }
 
-    /// `source`: its listener, and `name`, the VM: asked whether a released
-    /// record may go when the source never says it is done.
-    pub fn mig_begin(&self, id: u64, source: &str, name: &str) -> Result<MigRecord> {
+    /// `source`: its listener, asked whether the source process `by` is gone
+    /// when it never says it is done with a released record.
+    pub fn mig_begin(&self, id: u64, source: &str, by: Option<Ident>) -> Result<MigRecord> {
         let _l = self.lock()?;
         if load::<Mig>(&self.mig_path(id))?.is_some() {
             bail!("migration {id} was already seen here");
         }
         store(&self.mig_path(id), &Mig::Pending { owner: Ident::me() }, true)?;
-        Ok(MigRecord { host: self.clone(), id, committed: false, source: source.into(), name: name.into() })
+        Ok(MigRecord { host: self.clone(), id, committed: false, source: source.into(), by })
     }
 
     /// A record whose process died becomes aborted once its Firecrackers are
@@ -431,21 +431,19 @@ impl Host {
     }
 
     /// Records no source will ask about again: a dead owner's (aborted, as
-    /// `mig_status` would answer), and released ones whose source is gone
-    /// (killed before its `done`): its listener says no VM process of that
-    /// name is a migration source.
+    /// `mig_status` would answer), and released ones whose source process is
+    /// proven gone (killed before its `done`) by its own host's listener. Any
+    /// doubt keeps the record: a source that still waits must find it.
     pub fn retire_migrations(&self) {
         for e in std::fs::read_dir(self.state.join("migs")).into_iter().flatten().flatten() {
             let Some(id) = e.file_name().to_str().and_then(|n| n.parse().ok()) else { continue };
-            let Ok(Some(Mig::Released { source, name })) = load(&self.mig_path(id)) else {
+            let Ok(Some(Mig::Released { source, by })) = load(&self.mig_path(id)) else {
                 let _ = self.mig_status(id);
                 continue;
             };
-            if source.is_empty() {
-                continue;
-            }
-            let gone = crate::vmproc::peer_call(&source, serde_json::json!({"op": "source", "name": name}));
-            if gone.is_ok_and(|r| r["source"] == false) {
+            let Some(by) = by.filter(|_| !source.is_empty()) else { continue };
+            let gone = crate::vmproc::peer_call(&source, serde_json::json!({"op": "source", "ident": by}));
+            if gone.is_ok_and(|r| r["gone"] == true) {
                 eprintln!("migration {id}: its source at {source} is gone; forgetting it");
                 let _ = self.mig_done(id);
             }
@@ -512,8 +510,9 @@ pub enum Mig {
     Released {
         #[serde(default)]
         source: String,
+        /// The source's VM process.
         #[serde(default)]
-        name: String,
+        by: Option<Ident>,
     },
 }
 
@@ -523,7 +522,7 @@ pub struct MigRecord {
     pub id: u64,
     committed: bool,
     source: String,
-    name: String,
+    by: Option<Ident>,
 }
 
 impl MigRecord {
@@ -542,23 +541,28 @@ impl MigRecord {
     /// otherwise it reads aborted once this process is dead.
     pub fn settle(self, gone: bool) {
         if gone && self.committed {
-            self.release(None);
+            let _ = self.release(None, None);
         }
     }
 
-    /// Retried until recorded: the source waits for it. `home`: the VM's
-    /// address and generation, whose loan (if this is its home host) is
-    /// taken back only after, so a crash in between leaves it lent, never free.
-    pub fn release(&self, home: Option<(Ipv4Addr, u64)>) {
-        let mut delay = Duration::from_millis(100);
-        while let Err(e) = self.host.lock().and_then(|l| {
-            store(&self.host.mig_path(self.id), &Mig::Released { source: self.source.clone(), name: self.name.clone() }, true)?;
-            match home {
-                Some((ip, gen)) => self.host.update(&l, ip, true, |a| a.lent = a.lent.filter(|&lent| lent > gen)),
-                None => Ok(()),
+    /// Retried until recorded (the source waits for it), or `within` passes.
+    /// `home`: the VM's address and generation, whose loan (if this is its
+    /// home host) is taken back only after, so a crash in between leaves it
+    /// lent, never free.
+    pub fn release(&self, home: Option<(Ipv4Addr, u64)>, within: Option<Duration>) -> Result<()> {
+        let (mut delay, start) = (Duration::from_millis(100), std::time::Instant::now());
+        loop {
+            let done = self.host.lock().and_then(|l| {
+                store(&self.host.mig_path(self.id), &Mig::Released { source: self.source.clone(), by: self.by.clone() }, true)?;
+                match home {
+                    Some((ip, gen)) => self.host.update(&l, ip, true, |a| a.lent = a.lent.filter(|&lent| lent > gen)),
+                    None => Ok(()),
+                }
+            });
+            match done {
+                Err(e) if within.is_none_or(|w| start.elapsed() + delay < w) => eprintln!("migration {}: {e}; retrying", self.id),
+                done => return done,
             }
-        }) {
-            eprintln!("migration {}: {e}; retrying", self.id);
             std::thread::sleep(delay);
             delay = (delay * 2).min(Duration::from_secs(5));
         }
@@ -771,6 +775,22 @@ pub fn write_file(dir: &Path, name: &str, data: &[u8], durable: bool) -> std::io
     Ok(())
 }
 
+/// Some(true) only on proof the process is gone (another boot, no such pid,
+/// a zombie, or another process with its pid); None when that cannot be told.
+pub fn gone(id: &Ident) -> Option<bool> {
+    if boot_id().is_empty() {
+        return None;
+    }
+    if id.boot != boot_id() {
+        return Some(true);
+    }
+    match std::fs::read_to_string(format!("/proc/{}/stat", id.pid)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(true),
+        Err(_) => None,
+        Ok(_) => starttime(id.pid).map(|s| s != id.start).or(Some(true)),
+    }
+}
+
 pub fn starttime(pid: u32) -> Option<u64> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
@@ -973,11 +993,11 @@ mod tests {
         let h = host("migs");
         let rec = |id: u64| load::<Mig>(&h.mig_path(id)).unwrap();
         assert!(h.mig_status(1).unwrap() == "aborted" && rec(1).is_none());
-        let r = h.mig_begin(2, "", "").unwrap();
-        assert!(h.mig_begin(2, "", "").is_err() && h.mig_status(2).unwrap() == "pending");
+        let r = h.mig_begin(2, "", None).unwrap();
+        assert!(h.mig_begin(2, "", None).is_err() && h.mig_status(2).unwrap() == "pending");
         drop(r);
         assert_eq!(h.mig_status(2).unwrap(), "aborted");
-        let mut r = h.mig_begin(3, "", "").unwrap();
+        let mut r = h.mig_begin(3, "", None).unwrap();
         r.commit(&h.lock().unwrap()).unwrap();
         h.mig_done(3).unwrap();
         assert_eq!(h.mig_status(3).unwrap(), "committed", "only a released one is forgotten");
@@ -986,22 +1006,28 @@ mod tests {
         assert!(h.lend(&h.lock().unwrap(), home, 9).unwrap(), "made the loan");
         assert!(!h.lend(&h.lock().unwrap(), home, 9).unwrap(), "a loan it did not make is not its to undo");
         assert_eq!(lent(&h), Some(9));
-        r.release(Some((home, 9)));
+        r.release(Some((home, 9)), None).unwrap();
         assert!(h.mig_status(3).unwrap() == "released" && lent(&h).is_none());
         h.mig_done(3).unwrap();
         assert!(rec(3).is_none());
-        let mut r = h.mig_begin(4, "", "").unwrap();
+        let mut r = h.mig_begin(4, "", None).unwrap();
         store(&h.mig_path(4), &Mig::Pending { owner: dead_owner(&h, 999_999_904, &[]) }, false).unwrap();
         assert!(h.mig_status(4).unwrap() == "aborted" && rec(4).is_none() && r.commit(&h.lock().unwrap()).is_err());
         let fc = Sleeper::new();
         store(&h.mig_path(5), &Mig::Committed { owner: dead_owner(&h, 999_999_905, &[&fc.1]) }, false).unwrap();
         assert!(h.mig_status(5).unwrap() == "aborted" && fc.done() && rec(5).is_none());
-        let mut r = h.mig_begin(7, "", "").unwrap();
+        let mut r = h.mig_begin(7, "", None).unwrap();
         r.commit(&h.lock().unwrap()).unwrap();
         r.settle(true);
         assert_eq!(h.mig_status(7).unwrap(), "released");
         // A source that cannot be asked keeps its released record.
-        store(&h.mig_path(8), &Mig::Released { source: "127.0.0.1:1".into(), name: "x".into() }, false).unwrap();
+        store(&h.mig_path(8), &Mig::Released { source: "127.0.0.1:1".into(), by: Some(Ident::me()) }, false).unwrap();
+        // Only proof retires: another boot, no such pid, or another process with the pid.
+        let me = Ident::me();
+        assert_eq!(gone(&me), Some(false));
+        for other in [Ident { boot: "other".into(), ..me.clone() }, Ident { pid: 999_999_999, ..me.clone() }, Ident { start: me.start + 1, ..me.clone() }] {
+            assert_eq!(gone(&other), Some(true), "{other:?}");
+        }
         // A dead owner's goes, as asking would make it go.
         store(&h.mig_path(9), &Mig::Committed { owner: dead_owner(&h, 999_999_909, &[]) }, false).unwrap();
         h.retire_migrations();

@@ -44,13 +44,18 @@ impl Proc {
     /// Everything not needing vmstate is prepared on the target before the
     /// pause. Once the target may have the state, this copy resumes only if
     /// the target says it aborted.
-    pub fn migrate(self: &Arc<Self>, to: &str) -> Result<Value> {
+    /// `if_idle` (eviction): refused at once if the VM is busy or still arriving.
+    pub fn migrate(self: &Arc<Self>, to: &str, if_idle: bool) -> Result<Value> {
         let vm = self.vm().clone();
         let Some(source) = self.host.cfg.listen.clone() else {
             bail!("this host runs no peer listener (flexvm listen): the target fetches the vm's memory through it");
         };
-        let op = self.op_within()?;
-        self.settle_arrival(&op, ARRIVAL_WAIT)?;
+        let op = match if_idle {
+            true => self.op_now().ok_or_else(|| format!("vm {}: {}", vm.name, crate::vmproc::BUSY))?,
+            false => self.op_within()?,
+        };
+        let settled = self.settle_arrival(&op, if if_idle { Duration::ZERO } else { ARRIVAL_WAIT });
+        settled.map_err(|e| if if_idle { format!("{e}; {}", crate::vmproc::BUSY).into() } else { e })?;
         vm.template.verify(&self.paths, true)?;
         let settle = Instant::now();
         vm.settle_hotplug(settle + crate::lifecycle::SETTLE_WAIT)?;
@@ -173,6 +178,7 @@ impl Proc {
             "ip": vm.ip.to_string(),
             "gen": gen,
             "source": source,
+            "source_ident": crate::host::Ident::me(),
             "rss_mib": vm.rss() >> 20,
             "regions": vm.pager.regions(),
         }))?;
@@ -420,9 +426,17 @@ impl Proc {
             let start = Instant::now();
             vm.pager.wait_pulled(None);
             eprintln!("vm {}: pull from {source} ended after {} ms", vm.name, ms(start.elapsed()));
-            // Unless an operation settled it first, or the VM ended (its source's copy runs again).
-            let op = p.op();
-            let _ = p.settle_arrival(&op, Duration::ZERO);
+            // Unless an operation settled it first, or the VM ended (its source's
+            // copy runs again). `op` is let go between tries, for a kill.
+            loop {
+                let op = p.op();
+                match p.settle_arrival(&op, Duration::ZERO) {
+                    Err(e) if p.pulled_all() => eprintln!("{e}"),
+                    _ => return,
+                }
+                drop(op);
+                thread::sleep(Duration::from_secs(1));
+            }
         });
         Ok(())
     }
@@ -435,7 +449,8 @@ impl Proc {
         }
         let source = Source { addr: req["source"].as_str().ok_or("missing source")?.into(), vm: name.clone(), mig, regions };
         self.set_name(self.host.take_name(&name, false)?);
-        *self.arrived.lock().unwrap() = Some(self.host.mig_begin(mig, &source.addr, &name)?);
+        let by = serde_json::from_value(req["source_ident"].clone()).ok();
+        *self.arrived.lock().unwrap() = Some(self.host.mig_begin(mig, &source.addr, by)?);
         let need = req["rss_mib"].as_u64().unwrap_or(0);
         if !self.host.admit(need) {
             bail!("not enough memory here for {need} MiB above the {} MiB reserve", self.host.cfg.reserve_mib);

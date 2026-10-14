@@ -206,7 +206,7 @@ FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_be
           "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "resume_kill",
           "prepare_fail", "short_incoming", "slow_preload", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
           "started_fsync", "started_unmark", "start_stall", "incoming_stall", "claim_stall", "ckpt_wp_race",
-          "fetch_tail_enomem", "fetch_enomem_stuck")
+          "fetch_tail_enomem", "fetch_enomem_stuck", "publish", "no_evict")
 
 
 def disarm():
@@ -2782,6 +2782,48 @@ def arrival_overtaken():
     cleanup(n)
 
 
+def no_evict(scenario):
+    """Runs a scenario that grows guests on purpose with pressure eviction
+    off on both hosts: how much the host has free must not move its VMs."""
+    def run_it():
+        for h in (A, B):
+            fault(h, "no_evict", 3_600_000)
+        try:
+            scenario()
+        finally:
+            for h in (A, B):
+                fault(h, "no_evict", 0)
+    run_it.__doc__ = scenario.__doc__
+    return run_it
+
+
+def source_unpublished():
+    """A released record stays while its source process lives, whatever the
+    source's registry says: with its state never published (still `running`)
+    and the target's status answers held back, garbage collection on the
+    target (a VM starting there) keeps the record, and the source, once it
+    hears `released`, goes; one copy runs."""
+    n = "ft-unpublished"
+    m = setup(n, mib=200)
+    migs = lambda: os.listdir(os.path.join(B.state, "migs"))
+    fault(A, "publish", 60000)
+    fault(B, "status", 60000)
+    ok(migrate(A, n, B))
+    check("unpublished: the source's registry still says running", vms(A).get(n, {}).get("state") == "running", vms(A).get(n))
+    check("unpublished: released on the target", wait_for(lambda: vms(B).get(n, {}).get("background_pull_ms") is not None, 30), vms(B).get(n))
+    before = migs()
+    setup("ft-unpublished-gc", host=B, mib=1)
+    time.sleep(2)
+    check("unpublished: garbage collection kept the record", migs() == before and before, (before, migs()))
+    fault(A, "publish", 0)
+    fault(B, "status", 0)
+    check("unpublished: the source let go", wait_for(lambda: n not in vms(A), 30), vms(A).get(n))
+    check("unpublished: one copy, on B", where(n) == {B: "running"} and md5(B, n) == m, where(n))
+    check("unpublished: the record goes once the source is done", wait_for(lambda: not migs(), 10), migs())
+    cleanup(n)
+    cleanup("ft-unpublished-gc")
+
+
 def source_killed_basic():
     """A target whose source was killed after the release (no `done` ever
     comes) forgets the record once the source's listener says no such source
@@ -2791,10 +2833,11 @@ def source_killed_basic():
 
 
 SCENARIOS = dict(
+    source_unpublished=source_unpublished,
     source_killed_basic=source_killed_basic,
     arrival_overtaken=arrival_overtaken,
     pull_died=pull_died,
-    cow_grow=cow_grow, plug_race=plug_race, shrink_stall=shrink_stall, plug_storm=plug_storm,
+    cow_grow=no_evict(cow_grow), plug_race=no_evict(plug_race), shrink_stall=no_evict(shrink_stall), plug_storm=no_evict(plug_storm),
     basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, refused=refused, pages_blip=pages_blip,
     pages_dead_restore=pages_dead_restore, pages_dead=pages_dead, resume_kill=resume_kill, prepared_retry=prepared_retry,
     quiet_source=quiet_source, exec_race=exec_race, guest_calls=guest_calls, guest_hang=guest_hang,

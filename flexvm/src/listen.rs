@@ -80,8 +80,10 @@ fn handle(host: &Host, mut conn: TcpStream) -> Result<()> {
         "migration" => migration(host, &req),
         "route" => route(host, &req),
         "lend" => lend(host, &req),
-        // Whether a VM process of that name is a migration source here.
-        "source" => Ok(json!({"source": host.entry(req["name"].as_str().unwrap_or("")).is_ok_and(|e| e.state == "source")})),
+        // Whether a migration's source process is proven gone (never from published state).
+        "source" => serde_json::from_value(req["ident"].clone())
+            .map_err(|e| format!("bad ident: {e}").into())
+            .map(|id| json!({"gone": crate::host::gone(&id)})),
         op => Err(format!("unknown op {op:?}").into()),
     };
     let reply = match reply {
