@@ -1606,13 +1606,20 @@ def fc_api(sock, method, path, body=None):
 def checkpoint_hotplug():
     """A virtio-mem resize still in flight when a checkpoint starts: the
     checkpoint waits for the guest to carry it out (no device request can
-    land behind the saved state), and the result restores intact."""
+    land behind the saved state), and the result restores intact. The
+    template needs unplugged room in its hotplug region: PLUG_TEMPLATE picks
+    it (one fully plugged has nothing to resize, issue #145)."""
     n, path = "ft-hotplug", ckpt_path("ft-hotplug")
-    m = setup(n)
+    m = setup(n, template=os.environ.get("PLUG_TEMPLATE"))
     sock = api_sock(A, n)
     hp = fc_api(sock, "GET", "/hotplug/memory")
-    want = hp["plugged_size_mib"] + 1024
-    fc_api(sock, "PATCH", "/hotplug/memory", {"requested_size_mib": want})
+    room = hp["total_size_mib"] - hp["plugged_size_mib"]
+    assert room >= 256, f"template {os.environ.get('PLUG_TEMPLATE') or args.template} has {room} MiB of hotplug room, too little to resize: {hp}"
+    want = hp["plugged_size_mib"] + min(1024, room)
+    r = fc_api(sock, "PATCH", "/hotplug/memory", {"requested_size_mib": want})
+    assert r is None, f"resize to {want} MiB refused: {r}"
+    hp = fc_api(sock, "GET", "/hotplug/memory")
+    check("hotplug: resize in flight when the checkpoint starts", hp["plugged_size_mib"] < want, hp)
     r = ok(checkpoint(A, n, path, stop=True))
     print(f"hotplug: settled in {r['timings_ms']['settle_hotplug']} ms")
     check("hotplug: checkpoint waited for the resize", r["timings_ms"]["settle_hotplug"] > 1, r["timings_ms"])
