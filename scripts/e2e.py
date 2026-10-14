@@ -133,7 +133,7 @@ class Host:
         self.log = os.path.join(args.log_dir, f"listen-{label}.log")
         self.proc = None
         self.vms = set()  # names of the VMs this script created here or moved here
-        self.pids = set()  # their processes, seen here
+        self.pids = set()  # their processes (pid, start), seen here
 
     # lifecycle of the host itself
     def start(self):
@@ -172,9 +172,9 @@ class Host:
         return flexvm("--state", self.state_dir, "--run", self.run_dir, *argv, env=ENV, **kw)
 
     def pid(self, vm):
-        p = self.ls()[vm]["pid"]
-        self.pids.add(p)
-        return p
+        v = self.ls()[vm]
+        self.pids.add((v["pid"], v["start"]))
+        return v["pid"]
 
     def wait_state(self, vm, state, timeout=60):
         assert wait_for(lambda: self.ls().get(vm, {}).get("state") == state, timeout), (vm, self.ls().get(vm))
@@ -185,7 +185,7 @@ class Host:
         extra = (["--template", template or args.template]) + (["--ip", ip] if ip else [])
         self.vms.add(vm)
         r = json.loads(self.cli("run", vm, *extra, "-d").stdout)
-        self.pids.add(r["pid"])
+        self.pids.add((r["pid"], r["start"]))
         return r["ip"]
 
     def exec(self, vm, cmd, timeout=120):
@@ -207,7 +207,7 @@ class Host:
         """SIGCONT for a paused VM; `flexvm resume` for a suspended one."""
         if self.ls().get(vm, {}).get("state") == "suspended":
             r = json.loads(self.cli("resume", vm, "-d").stdout)
-            self.pids.add(r["pid"])
+            self.pids.add((r["pid"], r["start"]))
             return r
         t = time.time()
         os.kill(self.pid(vm), signal.SIGCONT)
@@ -235,7 +235,7 @@ class Host:
         extra = (["--name", name] if name else []) + (["--ip", ip] if ip else [])
         r = json.loads(self.cli("restore", path, *extra, "-d").stdout)
         self.vms.add(r["name"])
-        self.pids.add(r["pid"])
+        self.pids.add((r["pid"], r["start"]))
         return r
 
     def migrate(self, vm, to):
@@ -268,7 +268,8 @@ class Host:
         return [n for n in os.listdir("/sys/class/net") if n.startswith(self.prefix)]
 
     def cgroups(self):
-        return [c for p in self.pids for c in glob.glob(f"/sys/fs/cgroup/flexvm/idle-{p}-*")]
+        # By identity (`idle-PID-START-N`): never a later process's that got a pid.
+        return [c for p, start in self.pids for c in glob.glob(f"/sys/fs/cgroup/flexvm/idle-{p}-{start}-*")]
 
     def processes(self):
         """Processes on this host's state directory: its listener and VM processes."""

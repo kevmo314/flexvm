@@ -1256,16 +1256,11 @@ fn tap_owner(name: &str, prefix: &str) -> Option<u32> {
     rest.split_once('t').and_then(|(p, _)| u32::from_str_radix(p, 16).ok())
 }
 
-/// The VM process a Firecracker's cgroup (`idle-PID-START-N`) was made by:
-/// its pid and start time, or only its pid (an earlier version's `idle-PID-N`).
-fn cgroup_owner(name: &str) -> Option<(u32, Option<u64>)> {
+/// The VM process a Firecracker's cgroup (`idle-PID-START-N`) was made by.
+fn cgroup_owner(name: &str) -> Option<Ident> {
     let parts: Vec<&str> = name.strip_prefix("idle-")?.split('-').collect();
-    let pid = parts.first()?.parse().ok()?;
-    match parts.len() {
-        2 => Some((pid, None)),
-        3 => Some((pid, Some(parts[1].parse().ok()?))),
-        _ => None,
-    }
+    let [pid, start, _] = parts[..] else { return None };
+    Some(Ident { pid: pid.parse().ok()?, start: start.parse().ok()?, boot: boot_id().into() })
 }
 
 /// A detached VM process's own cgroup (`vm-PID-START`, `util::spawn_self`)
@@ -1324,16 +1319,12 @@ pub fn clear_taps(prefix: &str, pid: u32) {
 
 /// Cgroups, work directories and names of dead processes.
 fn collect_owned(run: &Path) {
-    // By identity: once its process is gone no other can make one under its name.
-    let gone = |(pid, start)| match start {
-        Some(start) => Ident { pid, start, boot: boot_id().into() }.liveness() == Liveness::Gone,
-        None => pid_gone(pid),
-    };
+    // Firecrackers' by identity: once their process is gone no other makes one under their name.
     for e in std::fs::read_dir("/sys/fs/cgroup/flexvm").into_iter().flatten().flatten() {
         let n = e.file_name().to_string_lossy().into_owned();
         if n.starts_with("vm-") {
             sweep_scope(&e.path());
-        } else if cgroup_owner(&n).is_some_and(gone) {
+        } else if cgroup_owner(&n).is_some_and(|o| o.liveness() == Liveness::Gone) {
             let _ = crate::fc::remove_cgroup(&e.path());
         }
     }
@@ -1778,9 +1769,8 @@ mod tests {
         for (tap, prefix) in [("fvtpl61612", "fc"), ("fvtpl", "fv"), ("fvtpl12x", "fv"), ("fvtpl+1", "fv"), ("fvx", "fv"), ("fvx+1", "fv"), ("fvxg", "fv"), ("eth0", "fv"), ("fvxyz", "fv")] {
             assert_eq!(tap_owner(tap, prefix), None, "{tap} under {prefix}");
         }
-        assert_eq!(cgroup_owner("idle-4242-77-3"), Some((4242, Some(77))));
-        assert_eq!(cgroup_owner("idle-4242-3"), Some((4242, None)), "an earlier version's");
-        for cg in ["vm-4242", "vm-4242-77", "other-42", "idle-", "idle-4242-x-3", "idle-1-2-3-4", "cgroup.procs", "memory.max"] {
+        assert_eq!(cgroup_owner("idle-4242-77-3"), Some(Ident { pid: 4242, start: 77, boot: boot_id().into() }));
+        for cg in ["vm-4242", "vm-4242-77", "other-42", "idle-", "idle-4242-3", "idle-4242-x-3", "idle-1-2-3-4", "cgroup.procs", "memory.max"] {
             assert_eq!(cgroup_owner(cg), None, "{cg}");
         }
     }

@@ -68,17 +68,19 @@ our_processes() {
 }
 
 teardown() {
-    local pid cg pids
+    local pid cg pids ids=
     trap - EXIT INT TERM
     set +e
     for pid in "${bg_pids[@]}"; do kill "$pid" 2>/dev/null; done
     for pid in "${bg_pids[@]}"; do wait "$pid" 2>/dev/null; done
     pids=$(our_processes)
+    # PID-START, read before the kill: the cgroups are named after the instance.
+    for pid in $pids; do ids+=" $pid-$(sed 's/.*) //' "/proc/$pid/stat" 2>/dev/null | cut -d' ' -f20)"; done
     for pid in $pids; do kill -9 "$pid" 2>/dev/null; done
     sleep 1
     for ns in "${P}A" "${P}B" "${P}C" "${P}lan"; do ip netns del "$ns" 2>/dev/null; done
-    # Each VM process's Firecracker had a cgroup named after the process.
-    for pid in $pids; do
+    # Each VM process's Firecracker had a cgroup named after the process (`idle-PID-START-N`).
+    for pid in $ids; do
         for cg in /sys/fs/cgroup/flexvm/idle-"$pid"-*; do
             [[ -d $cg ]] && rmdir "$cg" 2>/dev/null
         done
