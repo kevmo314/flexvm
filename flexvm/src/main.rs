@@ -567,15 +567,14 @@ pub fn exec_session(host: &Host, name: &str, cmd: &str, session: &Mutex<Session>
         };
         let req = json!({"op": "exec", "session": id, "action": if started { "attach" } else { "start" }, "offset": offset, "cmd": cmd});
         let stream = vmproc::connect(host, name, &req, &[]).and_then(|c| {
-            c.set_read_timeout(Some(Duration::from_secs(5)))?;
-            let mut r = BufReader::new(c);
-            let reply = recv_json(&mut r)?.ok_or("vm hung up")?;
+            // Byte by byte: the frames after it stay unread.
+            let reply = recv_json(&mut BufReader::with_capacity(1, util::By { s: &c, at: Instant::now() + Duration::from_secs(5) }))?.ok_or("vm hung up")?;
             if reply["ok"] != json!(true) {
                 return Err(reply["error"].as_str().unwrap_or("exec failed").to_string().into());
             }
             // The guest heartbeats every second, even for silent commands.
-            r.get_ref().set_read_timeout(Some(Duration::from_secs(3)))?;
-            Ok(r)
+            c.set_read_timeout(Some(Duration::from_secs(3)))?;
+            Ok(BufReader::new(c))
         });
         // Locked per write, never across a read: a checkpoint takes stdout's lock too.
         match stream.map(|mut r| exec_frames(&mut r, session, &mut std::io::stdout(), &mut std::io::stderr(), &mut deadline)) {

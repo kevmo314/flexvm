@@ -22,7 +22,7 @@ use crate::guest;
 use crate::hold::Holder;
 use crate::host::{fault, AddrClaim, Entry, Host, Ident, MigRecord, NameLock};
 use crate::template::{Paths, Template, STEP_MIB};
-use crate::util::{ms, proc_kb, send_json, Error, Phases, Result};
+use crate::util::{answer, ms, proc_kb, send_json, Error, Phases, Result};
 use crate::vm::{Snapshot, State, Vm};
 
 /// A VM process's own exit statuses (`run -- CMD` passes CMD's through):
@@ -310,7 +310,7 @@ impl Proc {
             match r.map(|r| r["gen"].as_u64().filter(|&g| g > 0)) {
                 Ok(Some(gen)) => lent.push((peer, gen)),
                 Ok(None) => why.push(format!("{peer} lent {ip} without a generation")),
-                Err(e) => why.push(format!("{peer}: {e}")),
+                Err(e) => why.push(e.to_string()),
             }
         }
         let mut lent = lent.into_iter();
@@ -1580,20 +1580,8 @@ fn evict(host: &Host, peers: &[String], vms: &[Entry], avail: u64, deadline: Ins
 /// What `migrate` with `if_idle` answers for a VM busy with something else.
 pub const BUSY: &str = "busy with another operation";
 
-fn answer(reply: Option<Value>, who: &str) -> Result<Value> {
-    let reply = reply.ok_or_else(|| format!("{who} hung up"))?;
-    if reply["ok"] != json!(true) {
-        bail!("{}", reply["error"].as_str().unwrap_or("refused"));
-    }
-    Ok(reply["result"].clone())
-}
-
 pub fn peer_call(peer: &str, req: Value) -> Result<Value> {
-    let mut c = crate::util::connect(peer, Duration::from_millis(500))?;
-    c.set_read_timeout(Some(Duration::from_secs(2)))?;
-    c.set_write_timeout(Some(Duration::from_secs(2)))?;
-    send_json(&mut c, &req)?;
-    answer(crate::util::recv_json(&mut BufReader::new(c))?, peer)
+    Ok(crate::util::rpc(peer, Duration::from_millis(500), Instant::now() + Duration::from_secs(2), &req)?.1)
 }
 
 pub fn tell_peers(host: &Host, req: Value) {
@@ -1626,8 +1614,7 @@ pub fn call(host: &Host, name: &str, req: Value) -> Result<Value> {
 
 /// `call`, giving up on the answer after `wait`.
 fn call_within(host: &Host, name: &str, req: Value, wait: Duration) -> Result<Value> {
-    let c = connect(host, name, &req, &[])?;
-    c.set_read_timeout(Some(wait))?;
+    let c = crate::util::By { s: connect(host, name, &req, &[])?, at: Instant::now() + wait };
     answer(crate::util::recv_json(&mut BufReader::new(c))?, &format!("vm {name}"))
 }
 
