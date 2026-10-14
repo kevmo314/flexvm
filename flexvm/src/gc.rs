@@ -84,6 +84,8 @@ fn vm_files(host: &Host) {
             let _ = std::fs::remove_file(&path);
         }
     }
+    // A start opens and marks its log holding this lock shared; busy logs wait for the next sweep.
+    let logs = host.logs_lock(libc::LOCK_EX | libc::LOCK_NB).ok();
     for (file, path) in files() {
         if file.starts_with(ARRIVAL_LOG) && file.ends_with(".log") {
             if age(&path).is_some_and(|a| a > ARRIVAL_GRACE) && unlocked(&path) {
@@ -92,17 +94,11 @@ fn vm_files(host: &Host) {
             continue;
         }
         let Some(name) = log_name(&file) else { continue };
-        let quiet = || age(&path).is_some_and(|a| a > ORPHAN_LOG_TTL);
-        if !quiet() {
+        if logs.is_none() || age(&path).is_none_or(|a| a <= ORPHAN_LOG_TTL) {
             continue;
         }
-        // Decided and removed holding the logs lock: a start opens its log
-        // holding it too (shared) and marks it written (`main::log_file`), so
-        // a log being opened is never quiet here. Busy: left for the next sweep.
-        // (Only this log is left: the arrivals' and the other names' logs are still decided on.)
-        let Ok(_logs) = host.logs_lock(libc::LOCK_EX | libc::LOCK_NB) else { continue };
         let orphan = host.holder_gone(name) && !host.suspended(name).exists() && !["failed", "moved"].iter().any(|ext| host.vms(name, ext).exists());
-        if orphan && quiet() {
+        if orphan {
             let _ = std::fs::remove_file(&path);
         }
     }

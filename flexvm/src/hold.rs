@@ -9,7 +9,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{BufReader, Read, Write};
 use std::net::{Ipv4Addr, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -46,8 +46,6 @@ pub struct Holder {
     held: Mutex<HashMap<Ipv4Addr, Arc<Entry>>>,
     /// The reader has packets in hand not queued yet.
     reading: AtomicBool,
-    /// Times the reader emptied the device: once it moves on, what was there is queued.
-    passes: AtomicU64,
     /// Held while an address's TUN route is added or deleted.
     routes: Mutex<()>,
     /// Held while a packet is read off the device and queued.
@@ -108,7 +106,7 @@ impl Holder {
         let _ = crate::net::sysctl(&format!("net.ipv6.conf.{dev}.disable_ipv6"), "1");
         crate::net::set_link_up(&dev, true)?;
         let ifindex = crate::net::ifindex(&dev)?;
-        let h = Arc::new(Holder { dev, ifindex, tun, held: Mutex::default(), reading: AtomicBool::new(false), passes: AtomicU64::new(0), routes: Mutex::new(()), rx: Mutex::new(()) });
+        let h = Arc::new(Holder { dev, ifindex, tun, held: Mutex::default(), reading: AtomicBool::new(false), routes: Mutex::new(()), rx: Mutex::new(()) });
         let reader = h.clone();
         std::thread::Builder::new().name("hold".into()).spawn(move || reader.read_loop())?;
         Ok(Some(h))
@@ -346,7 +344,6 @@ impl Holder {
             }
             self.reading.store(true, Ordering::SeqCst);
             while self.read_one(&mut buf) {}
-            self.passes.fetch_add(1, Ordering::SeqCst);
             self.reading.store(false, Ordering::SeqCst);
         }
     }

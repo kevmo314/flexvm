@@ -348,10 +348,11 @@ impl Pager {
     /// Sets the initial page states and their origin, for a pager started without them. Only before Firecracker loads a
     /// snapshot.
     pub fn seed(&self, runs: Runs, origin: Origin) -> Result<()> {
-        if self.pages.get().is_some() || self.initial.lock().unwrap().is_some() {
+        let mut initial = self.initial.lock().unwrap();
+        if self.pages.get().is_some() || initial.is_some() {
             bail!("pager already seeded");
         }
-        *self.initial.lock().unwrap() = Some((runs, origin));
+        *initial = Some((runs, origin));
         self.seeded.notify_all();
         Ok(())
     }
@@ -484,7 +485,14 @@ impl Pager {
     /// Runs of pages populated so far, as `(first_page, count)`.
     pub fn present_runs(&self) -> Vec<(u64, u64)> {
         let pages = self.pages();
-        runs_where(0, pages.len(), |p| pages.get(p) == PRESENT).map(|(a, b)| (a as u64, (b - a) as u64)).collect()
+        let mut runs: Vec<(u64, u64)> = Vec::new();
+        for p in pages.not_base(0, pages.len()).filter(|&p| pages.get(p) == PRESENT) {
+            match runs.last_mut() {
+                Some((f, n)) if *f + *n == p as u64 => *n += 1,
+                _ => runs.push((p as u64, 1)),
+            }
+        }
+        runs
     }
 
     /// Installs REMOTE pages whose contents came along with the vmstate (one `PAGE_SIZE` slice of `data` per page of
@@ -604,7 +612,9 @@ impl Pager {
     /// already reading, through clones of their own.
     fn pulled(&self, n: usize) {
         if n > 0 && self.remote_left.fetch_sub(n, Ordering::SeqCst) == n {
-            drop(self.file.lock().unwrap().take());
+            if let Some(file) = self.file.lock().unwrap().take() {
+                file.drop_cache();
+            }
             let _ = self.pull_finished.set(Instant::now());
             self.notify();
         }

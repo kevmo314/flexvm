@@ -78,9 +78,6 @@ impl Pager {
                 return;
             }
         }
-        if let Some(file) = file.filter(|_| self.remote_left() == 0) {
-            file.drop_cache();
-        }
     }
 
     fn pulling(&self) -> bool {
