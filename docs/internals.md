@@ -461,9 +461,13 @@ through, so the checkpoint is exactly the memory at the pause.
   the address is held nothing new reaches the tap, so the VM process waits,
   up to 500 ms, for the running guest to empty the ring before pausing it.
   It watches the ring through a copy of Firecracker's tap descriptor
-  (`pidfd_getfd`, polled, never read). `scripts/faults.py same_host_backlog`
-  stops Firecracker for 200 ms before each migration's hold at 10k
-  datagrams/s: about 1,500 datagrams were lost per migration before, none now.
+  (`pidfd_getfd`, polled), found once per Firecracker and before the hold,
+  as reading a tun fdinfo takes RTNL. What the guest has not taken by then
+  is read off after the pause and logged as dropped, so it is counted.
+  `scripts/faults.py same_host_backlog` stops Firecracker for 200 ms at 10k
+  datagrams/s and holds the address before it goes on, so every migration
+  starts its pause with a queue: about 1,500 datagrams were lost per
+  migration before, none now.
 - **No Firecracker change for write tracking.** The pager registers write-protect mode
   (`UFFDIO_REGISTER` with `MODE_MISSING|MODE_WP`) on Firecracker's existing
   userfaultfd and its ranges. Nothing has to be requested at `UFFDIO_API`

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io::{BufReader, Write};
 use std::net::{Ipv4Addr, Shutdown};
+use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -88,6 +89,8 @@ pub struct Vm {
     clock_unsure: AtomicBool,
     next_exec: AtomicU64,
     fc: Mutex<Option<Firecracker>>,
+    /// Its Firecracker's (pid) tap descriptor, copied (`tap_watch`).
+    tap_watch: Mutex<Option<(u32, Arc<OwnedFd>)>>,
     pub vsock: PathBuf,
     was_paused: AtomicBool,
     pub clock_pending: AtomicBool,
@@ -223,25 +226,38 @@ impl Vm {
         for (_, s) in self.execs.lock().unwrap().drain() {
             let _ = s.shutdown(Shutdown::Both);
         }
-        if crate::host::fault("tap_backlog") {
-            // Frames pile up on the tap while Firecracker is stopped (more than the guest has
-            // buffers for), so the pause comes with a queue on it.
-            if let Some(pid) = self.pid() {
-                eprintln!("vm {}: injected fault: stopping firecracker for 200 ms before holding its address", self.name);
-                unsafe { libc::kill(pid as libc::pid_t, libc::SIGSTOP) };
-                std::thread::sleep(Duration::from_millis(200));
-                unsafe { libc::kill(pid as libc::pid_t, libc::SIGCONT) };
-            }
+        // Before the hold: finding it can wait on RTNL (`net::tap_fd_of`).
+        let watch = self.tap_watch();
+        let stopped = crate::host::fault("tap_backlog").then(|| self.pid()).flatten();
+        if let Some(pid) = stopped {
+            // Frames pile up on the tap while Firecracker is stopped, more than the guest has
+            // buffers for, and the address is held before it goes on: a queue to take.
+            eprintln!("vm {}: injected fault: stopping firecracker for 200 ms, holding its address meanwhile", self.name);
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGSTOP) };
+            std::thread::sleep(Duration::from_millis(200));
         }
         let held = unroute();
-        t.mark("hold");
-        if held {
-            self.drain_tap();
-            t.mark("drain_tap");
+        if let Some(pid) = stopped {
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGCONT) };
         }
+        t.mark("hold");
+        let left = match (held, watch) {
+            (true, Some(fd)) => {
+                let emptied = self.drain_tap(&fd);
+                t.mark("drain_tap");
+                (!emptied).then_some(fd)
+            }
+            _ => None,
+        };
         // Even if paused: only an API pause freezes device emulation.
         self.fc(|fc| fc.pause())?;
         t.mark("pause");
+        if let Some(fd) = left {
+            // The guest takes no more: what it did not take is lost, counted.
+            let n = crate::net::discard_tap_queue(&fd);
+            eprintln!("vm {}: dropped {n} frames still queued on its tap at the pause (its guest was not taking them)", self.name);
+            t.mark("discard_tap");
+        }
         // Link-down waits for an RCU grace period; joined on every path so `resume` never races it.
         let tap = self.tap.clone();
         let down = std::thread::spawn(move || crate::net::set_link_up(&tap, false));
@@ -259,18 +275,50 @@ impl Vm {
         Ok(runs)
     }
 
-    /// With its address held nothing new reaches the tap, so this ends unless the guest stops
-    /// taking frames (`net::drain_tap`); what it has not taken by the pause is lost if it leaves.
-    fn drain_tap(&self) {
-        let Some(pid) = self.pid() else { return };
-        let start = Instant::now();
-        match crate::net::drain_tap(pid, &self.tap, TAP_DRAIN_WAIT) {
-            Ok(true) => {}
-            Ok(false) => {
-                eprintln!("vm {}: frames still queued on its tap {} ms after its address was held; pausing it anyway", self.name, start.elapsed().as_millis())
-            }
-            Err(e) => eprintln!("vm {}: not waiting for its tap's queue before the pause: {e}", self.name),
+    /// A copy of its Firecracker's descriptor of its tap (`net::tap_fd_of`), found once per
+    /// Firecracker; None (said why) if it cannot be had.
+    fn tap_watch(&self) -> Option<Arc<OwnedFd>> {
+        let pid = self.pid()?;
+        let mut w = self.tap_watch.lock().unwrap();
+        if let Some((_, fd)) = w.as_ref().filter(|(p, _)| *p == pid) {
+            return Some(fd.clone());
         }
+        match crate::net::tap_fd_of(pid, &self.tap) {
+            Ok(fd) => {
+                let fd = Arc::new(fd);
+                *w = Some((pid, fd.clone()));
+                Some(fd)
+            }
+            Err(e) => {
+                eprintln!("vm {}: not waiting for its tap's queue before the pause: {e}", self.name);
+                None
+            }
+        }
+    }
+
+    /// With its address held nothing new reaches the tap, so the running guest empties its
+    /// queue unless it stops taking frames; false if it has not by `TAP_DRAIN_WAIT`.
+    fn drain_tap(&self, fd: &OwnedFd) -> bool {
+        let start = Instant::now();
+        let mut queued = false;
+        loop {
+            match crate::net::tap_queued(fd) {
+                Ok(false) => break,
+                Ok(true) => queued = true,
+                Err(e) => {
+                    eprintln!("vm {}: not waiting for its tap's queue before the pause: {e}", self.name);
+                    return true;
+                }
+            }
+            if start.elapsed() >= TAP_DRAIN_WAIT {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if queued {
+            eprintln!("vm {}: its guest took what was queued on its tap in {:.1} ms before the pause", self.name, start.elapsed().as_secs_f64() * 1e3);
+        }
+        true
     }
 
     /// Its write must precede the snapshot.
@@ -726,6 +774,7 @@ impl Prepared {
             next_exec: AtomicU64::new(0),
             vsock: idle.sockets.vsock.clone(),
             fc: Mutex::new(Some(idle)),
+            tap_watch: Mutex::new(None),
             was_paused: AtomicBool::new(false),
             clock_pending: AtomicBool::new(false),
             pending_net: Mutex::new(None),

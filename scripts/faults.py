@@ -999,9 +999,10 @@ def same_host_flood():
 
 
 def same_host_backlog():
-    """#136: frames queued on the source's tap when its VM pauses (`tap_backlog` stops its
-    Firecracker for 200 ms first, at 10k datagrams/s: more than the guest has buffers for)
-    went with the tap, uncounted. The guest takes them before the pause: none is lost."""
+    """#136: frames queued on the source's tap when its VM pauses went with the tap,
+    uncounted. `tap_backlog` stops the source's Firecracker for 200 ms at 10k datagrams/s
+    (more than the guest has buffers for) and holds the address before it goes on, so
+    each migration starts its pause with a queue: the guest takes it first, none is lost."""
     udp_across_migrations("same host backlog", "ft-backlog", burst=10, source_fault="tap_backlog")
 
 
@@ -1039,16 +1040,23 @@ def udp_across_migrations(label, n, target_fault=None, burst=1, source_fault=Non
     t = threading.Thread(target=stream, daemon=True)
     t.start()
     time.sleep(0.5)
-    held, at = [], []
-    for src, dst in ((A, B), (B, A), (A, B)):
+    held, at, took, logs = [], [], [], []
+    hops = ((A, B), (B, A), (A, B))
+    for i, (src, dst) in enumerate(hops):
         if target_fault:
             fault(dst, target_fault, 60000)
         if source_fault:
             fault(src, source_fault, 60000)
         at.append(sent[0])
         r = migrate(src, n, dst)
+        # The source's log, before the VM arrives there again and starts a new one (the
+        # last log on each host is read at the end).
+        src_log = log(src, n)
+        if any(d is src for _, d in hops[i + 1:]):
+            logs.append(src_log)
         if source_fault:
             fault(src, source_fault, 0)
+            took.append([l for l in src_log.splitlines() if "took what was queued on its tap" in l])
         held.append((r.get("result") or {}).get("held") or r.get("error"))
         wait_released(dst, n, src)
         if target_fault:
@@ -1071,15 +1079,16 @@ def udp_across_migrations(label, n, target_fault=None, burst=1, source_fault=Non
     detail = (f"sent {sent[0]}, migrations began at {at}, {len(missing)} missing, runs {runs[:10]}; the guest: {guest}, "
               f"{'socat receiving' if udp[-1:] == ['receiving'] else 'socat gone'}")
     dropped = {h: [l for l in log(h, n).splitlines() if "dropped" in l or "dropping" in l] for h in (A, B)}
+    dropped["earlier sources"] = [l for t in logs for l in t.splitlines() if "dropped" in l or "dropping" in l]
     if burst == 1:
         check(f"{label}: no udp datagram lost", not missing, detail)
         late = [got[max(0, i - 3):i + 12] for i, (a, b) in enumerate(zip(got, got[1:])) if b <= a]
         check(f"{label}: none reordered", not late, late[:10])
-        for h in (A, B):
+        for h in dropped:
             check(f"{label}: no held packets dropped on {h}", not dropped[h], dropped[h][-3:])
     else:
         # Overload may drop, but only what is counted: by the holds, or by the guest's socket.
-        said = sum(int(m) for h in (A, B) for l in dropped[h] for m in re.findall(r"dropped (\d+)", l))
+        said = sum(int(m) for ls in dropped.values() for l in ls for m in re.findall(r"dropped (\d+)", l))
         said += int(guest.get("RcvbufErrors", 0)) if isinstance(guest, dict) else 0
         diag = {}
         if len(missing) > said:
@@ -1088,6 +1097,7 @@ def udp_across_migrations(label, n, target_fault=None, burst=1, source_fault=Non
         check(f"{label}: nothing lost that was not counted", len(missing) <= said, (detail, dropped, diag))
         if source_fault:
             check(f"{label}: no udp datagram lost", not missing, detail)
+            check(f"{label}: each source paused with a queue on its tap, which its guest took first", all(len(t) == 1 for t in took), took)
         let_go = [float(m) for h in (A, B) for m in re.findall(r"let go of \S+ after ([\d.]+) ms", log(h, n))]
         check(f"{label}: each release ended within 2 s of its 300 ms route change", let_go and max(let_go) < 2000, let_go)
     cleanup(n)
