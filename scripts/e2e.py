@@ -664,7 +664,7 @@ def main():
         t = time.time()
         template(args.template, "--vcpus", "2", "--max", "2048")
         # A larger ceiling with little plugged at the start: VMs must grow.
-        template(GROW, "--vcpus", "2", "--max", "4096", "--plug", "128")
+        template(GROW, "--vcpus", "2", "--max", "6144", "--plug", "128")
         print(f"PASS templates ({time.time() - t:.1f} s)", flush=True)
     except Exception as e:
         print(f"FAIL template: {e}", flush=True)

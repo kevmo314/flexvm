@@ -2610,7 +2610,7 @@ def start_killed():
     VM: the address is free again, for a VM with a newer generation."""
     n = "ft-start-killed"
     scenario_vms.add(n)
-    ip = A.ips.split("-")[1].rsplit(".", 1)[0] + ".212"
+    ip = A.ips.split("-")[1]  # the last of the range: free
     fault(A, "start_stall", 10000)
     p = subprocess.Popen([BIN, "--state", A.state, "--run", A.run, "run", n, "--template", args.template, "--ip", ip],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=ENV)

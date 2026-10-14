@@ -682,6 +682,20 @@ pub fn collect_garbage(run: &Path, prefix: &str) {
             let _ = std::fs::remove_dir_all(e.path());
         }
     }
+    // Names whose holder was killed: taken (so no one else holds them) and let go,
+    // as `NameLock` would have. `failed` and `moved` records stay for `ls`.
+    for e in std::fs::read_dir(run.join("vms")).into_iter().flatten().flatten() {
+        let path = e.path();
+        if path.extension().is_none_or(|x| x != "lock") {
+            continue;
+        }
+        let Ok(_held) = lock_path(&path, libc::LOCK_EX | libc::LOCK_NB) else { continue };
+        if load::<Ident>(&path).ok().flatten().is_none_or(|o| reap(run, &o).is_ok()) {
+            for ext in ["json", "sock", "lock"] {
+                let _ = std::fs::remove_file(path.with_extension(ext));
+            }
+        }
+    }
 }
 
 pub fn check_name(name: &str) -> Result<()> {
@@ -847,6 +861,13 @@ mod tests {
         dead_owner(&h, 999_999_903, &[&fc.1]);
         reap(&h.run, &Ident { pid: 999_999_903, start: 2, boot: boot_id().into() }).unwrap();
         assert!(!fc.done());
+        // A killed holder's name is let go of by the garbage collector; a live one's is not.
+        let fc = Sleeper::new();
+        store(&h.vms("k", "lock"), &dead_owner(&h, 999_999_904, &[&fc.1]), false).unwrap();
+        std::fs::write(h.vms("k", "failed"), "why").unwrap();
+        collect_garbage(&h.run, "none");
+        assert!(fc.done() && !h.vms("k", "lock").exists() && h.vms("k", "failed").exists());
+        assert!(h.vms("e", "lock").exists());
     }
 
     #[test]
