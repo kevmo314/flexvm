@@ -118,7 +118,8 @@ pub struct Proc {
     /// A resumed suspended VM's checkpoint (marked STARTED), deleted once all
     /// its pages are in, or at the end.
     pub consumed: Mutex<Option<PathBuf>>,
-    pub pending_route: Mutex<Option<Ipv4Addr>>,
+    /// A source's route switch still owed: the migration's id and the target's underlay.
+    pub pending_route: Mutex<Option<(u64, Ipv4Addr)>>,
     pub files: Mutex<Vec<PathBuf>>,
     /// What the VM's start was admitted against the reserve (MiB): its first memory mark.
     granted: AtomicU64,
