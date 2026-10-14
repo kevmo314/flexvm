@@ -412,7 +412,8 @@ impl Root {
                 if e.size() > self.limits.unpacked - self.unpacked {
                     bail!("image exceeds the unpacked size limit (--max-unpacked-mib)");
                 }
-                let mut file = BufWriter::with_capacity(256 << 10, at.create()?);
+                // No bigger than the file: most are small, and a 256 KiB buffer each would be an mmap.
+                let mut file = BufWriter::with_capacity((e.size() as usize).min(256 << 10), at.create()?);
                 io::copy(e, &mut file).and_then(|_| file.flush()).map_err(|err| format!("write {rel:?}: {err}"))?;
             }
             T::Symlink => {
