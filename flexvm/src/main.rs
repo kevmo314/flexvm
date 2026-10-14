@@ -43,7 +43,7 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
   kill -TSTP PID / kill -CONT PID    pause / resume a VM (Ctrl-Z works in the foreground)
   kill PID                           suspend a VM to disk (SIGTERM); its memory is freed
   flexvm resume NAME [-d]            bring a suspended VM back
-  flexvm kill NAME                   destroy a VM, running or suspended (Ctrl-C works too)
+  flexvm kill NAME                   destroy a VM, running or suspended (Ctrl-C or Ctrl-\\ works too)
   flexvm checkpoint NAME DIR [--stop] [--incremental]
                                      write the VM's state to DIR (a new directory)
   flexvm restore DIR [--name N] [--ip IP|auto] [--paused] [-d]
@@ -168,10 +168,6 @@ fn paths(args: &Args) -> Result<Paths> {
 }
 
 fn real_main() -> Result<()> {
-    // Ignore Ctrl-\ before starting threads or VM children.
-    if unsafe { libc::signal(libc::SIGQUIT, libc::SIG_IGN) } == libc::SIG_ERR {
-        return Err(std::io::Error::last_os_error().into());
-    }
     let args = Args::parse(std::env::args().skip(1))?;
     let _ = paths(&args);
     let pos: Vec<&str> = args.positional.iter().map(|s| s.as_str()).collect();
@@ -326,7 +322,7 @@ fn notify_fd() -> Option<std::fs::File> {
 
 /// A foreground `run` that claimed a standby VM: forwards signals, exits with its status.
 fn follow(mut conn: BufReader<std::os::unix::net::UnixStream>, id: host::Ident) -> Result<()> {
-    let set = util::block_signals(&[libc::SIGTERM, libc::SIGINT, libc::SIGTSTP, libc::SIGCONT, libc::SIGHUP]);
+    let set = util::block_signals(&[libc::SIGTERM, libc::SIGINT, libc::SIGQUIT, libc::SIGTSTP, libc::SIGCONT, libc::SIGHUP]);
     // A fast command's process may be gone already: its exit frame is buffered.
     if let Ok(Some(vm)) = host::PidFd::open(&id) {
         std::thread::spawn(move || loop {

@@ -59,7 +59,8 @@ flexvm resume web               # bring a suspended VM back (in a new process)
 flexvm kill web                 # destroy it, running or suspended; Ctrl-C in the foreground
 ```
 
-Ctrl-\ (SIGQUIT) is ignored; use Ctrl-C to destroy the VM.
+Ctrl-\ (SIGQUIT) destroys the VM like Ctrl-C. A VM paused with Ctrl-Z keeps
+its terminal: resume it from another one with `flexvm resume web`.
 
 A closed terminal (SIGHUP) leaves a foreground VM running; its output then
 goes to `/run/flexvm/vms/NAME.log`.

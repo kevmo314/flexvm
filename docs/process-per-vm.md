@@ -56,12 +56,12 @@ CMD in the guest, streams its output, and the process exits with CMD's status
 | SIGTSTP | pause the vCPUs (the process keeps running and serving pages; Ctrl-Z works) |
 | SIGCONT | resume the vCPUs of a VM paused by SIGTSTP (ignored otherwise: the kernel sends it after any SIGSTOP, systemd after SIGTERM) |
 | SIGINT | destroy the VM, withdraw its address, exit 130 (Ctrl-C works) |
-| SIGQUIT | ignored (Ctrl-\ leaves the VM running) |
+| SIGQUIT | as SIGINT (Ctrl-\ destroys the VM rather than dumping core) |
 | SIGSTOP | cannot be caught: freezes the pager, so the guest stalls. Unsupported |
 
-SIGTERM, SIGTSTP, SIGCONT, SIGINT and SIGHUP (a closed terminal leaves the VM
-running) are blocked in every thread and taken by one thread with `sigwait`,
-so SIGTSTP never stops the process. SIGQUIT is ignored before threads start. Every operation on the VM (starting it, signal,
+They (and SIGHUP, ignored: a closed terminal leaves the VM running) are
+blocked in every thread and taken by one thread with `sigwait`, so SIGTSTP
+never stops the process. Every operation on the VM (starting it, signal,
 control request, controller resize, clock step, deleting a consumed
 checkpoint) holds the VM's operation mutex. Requests give up after 30 s;
 what must not be refused (SIGINT, SIGTERM, a dead VM, the end of a
