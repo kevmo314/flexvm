@@ -304,7 +304,7 @@ fn claim(p: &Arc<Proc>, req: &Value) -> std::result::Result<Value, (Error, bool)
     // Its memory is already out of MemAvailable: only the step is charged. Sized
     // as it was loaded (`serve`), and admitted before the address is claimed.
     let held = p.sizes.lock().unwrap().map_or(0, |(held, _)| held);
-    p.admit_start(held, held, crate::host::Floor::Reserve).map_err(|e| (e, true))?;
+    p.admit_start(held, Some(held), crate::host::Floor::Reserve).map_err(|e| (e, true))?;
     let not_run = |e: Error, retry: bool| {
         p.refund_start();
         (e, retry)

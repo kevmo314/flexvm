@@ -70,6 +70,7 @@ impl Pager {
                 let unsaved: Vec<usize> = (first..end).filter(|&p| cow.state(p) == PENDING).collect();
                 unsaved.iter().for_each(|&p| cow.want(p));
                 if unsaved.contains(&page) {
+                    cow.stats.retries.fetch_add(1, Ordering::Relaxed);
                     return Err(os(libc::EAGAIN));
                 }
             }

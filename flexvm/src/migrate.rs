@@ -237,10 +237,11 @@ impl Proc {
                 return format!("{e}; and whether its address went to another vm cannot be told ({r}), so it stays paused, failed").into();
             }
         };
-        if let Some(h) = self.holder() {
-            let _ = release_into(h, vm.ip, mig, vm, Duration::ZERO, |()| crate::net::attach(vm.ip, &vm.tap));
-        }
-        let (s, e) = match vm.resume() {
+        let attached = self.holder().is_some_and(|h| {
+            let (stats, res) = release_into(h, vm.ip, mig, vm, Duration::ZERO, |()| crate::net::attach(vm.ip, &vm.tap));
+            stats.is_some() && res.is_ok()
+        });
+        let (s, e) = match vm.resume(attached) {
             Ok(s) => (s, e),
             Err(r) => (State::Failed, format!("{e}; resuming it here failed too: {r}").into()),
         };
@@ -596,7 +597,7 @@ impl Proc {
         let ip: Ipv4Addr = req["ip"].as_str().ok_or("missing ip")?.parse()?;
         // Before the record (fsynced) and the claim: a refusal leaves nothing to undo.
         let floor = if req["evict"] == true { crate::host::Floor::EvictMark } else { crate::host::Floor::Reserve };
-        self.admit_pull(req["rss_mib"].as_u64().unwrap_or(0), floor)?;
+        self.admit_start(req["rss_mib"].as_u64().unwrap_or(0), None, floor)?;
         *self.arrived.lock().unwrap() = Some(self.host.mig_begin(mig, &source.addr, by, Some(ip))?);
         let tpl = Template::open_id(&self.paths, req["template"].as_str().ok_or("missing template")?, req["id"].as_str().ok_or("missing template id")?)?;
         t.mark("template");

@@ -173,7 +173,6 @@ impl Cow {
 
     /// A fault waits on `page`: writers take its unit next.
     pub fn want(&self, page: usize) {
-        self.stats.retries.fetch_add(1, Ordering::Relaxed);
         let mut wanted = self.wanted.lock().unwrap();
         if !wanted.contains(&page) {
             wanted.push_back(page);
@@ -372,6 +371,7 @@ mod tests {
         // Faults wait on pages; writers take those units first.
         cow.want(30);
         cow.want(30);
+        assert_eq!(cow.report()["retries"], 0, "queueing pages does not count fault retries");
         assert_eq!(pages.wanted(), Some(30));
         assert_eq!(pages.wanted(), None);
         assert_eq!(cow.unsaved_page(), Some(8));

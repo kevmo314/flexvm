@@ -260,28 +260,22 @@ impl Proc {
         *self.name.lock().unwrap() = Some(n);
     }
 
-    /// Every start, before it loads: what the VM brings (`need` MiB, held or
-    /// to page in) and a step, against the host's reserve, less what it
-    /// already holds here (`held`: a standby's memory is out of MemAvailable).
-    /// An arrival moved here by eviction leaves this host's eviction mark
-    /// available instead of only the reserve (`floor`).
-    pub fn admit_start(&self, need: u64, held: u64, floor: crate::host::Floor) -> Result<()> {
+    /// Admits a start against the host's floor. `held` is memory already here;
+    /// None holds the grant until a disk restore or arrival finishes pulling.
+    pub fn admit_start(&self, need: u64, held: Option<u64>, floor: crate::host::Floor) -> Result<()> {
         let mib = crate::limit::allowance(need);
-        let charge = mib.saturating_sub(held);
-        let id = self.host.grant_above(charge, floor)?;
+        let (id, hold) = match held {
+            Some(held) => (self.host.grant_above(mib.saturating_sub(held), floor)?, None),
+            None => {
+                let (id, hold) = self.host.grant_held(mib, floor)?;
+                (id, Some(hold))
+            }
+        };
         self.granted.store(mib, Ordering::SeqCst);
         self.charged.store(id, Ordering::SeqCst);
-        Ok(())
-    }
-
-    /// A disk restore or arrival's admission: its grant counts until all its
-    /// memory is here or it ends, however long the pull takes.
-    pub fn admit_pull(&self, need: u64, floor: crate::host::Floor) -> Result<()> {
-        let mib = crate::limit::allowance(need);
-        let (id, hold) = self.host.grant_held(mib, floor)?;
-        self.granted.store(mib, Ordering::SeqCst);
-        self.charged.store(id, Ordering::SeqCst);
-        *self.held_grant.lock().unwrap() = Some(hold);
+        if hold.is_some() {
+            *self.held_grant.lock().unwrap() = hold;
+        }
         Ok(())
     }
 
@@ -616,7 +610,7 @@ impl Proc {
         let tpl = Template::open(&self.paths, template)?;
         t.mark("template");
         // Before the claim: a refused start mints no generation (nor withdraws one).
-        self.admit_start(tpl.working_set_mib(), 0, crate::host::Floor::Reserve)?;
+        self.admit_start(tpl.working_set_mib(), Some(0), crate::host::Floor::Reserve)?;
         let claim = self.host.claim_new(&self.host.lock()?, name, want)?;
         let ip = self.set_addr(claim);
         t.mark("claim_ip");

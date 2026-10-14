@@ -277,10 +277,12 @@ impl Vm {
         self.was_paused.load(Ordering::SeqCst)
     }
 
-    pub fn resume(&self) -> Result<State> {
-        crate::net::set_link_up(&self.tap, true)?;
-        // The link-down took the VM's /32 route with it.
-        crate::net::attach(self.ip, &self.tap)?;
+    pub fn resume(&self, attached: bool) -> Result<State> {
+        // A successful held-packet release already raised the link and attached it.
+        if !attached {
+            crate::net::set_link_up(&self.tap, true)?;
+            crate::net::attach(self.ip, &self.tap)?;
+        }
         let resumed = match self.was_paused.swap(false, Ordering::SeqCst) {
             true => Ok(State::Paused),
             false => self.fc(|fc| fc.resume()).map(|()| State::Running),
@@ -314,11 +316,11 @@ impl Vm {
         Ok(true)
     }
 
-    pub fn end_checkpoint(&self) -> Result<State> {
+    pub fn end_checkpoint(&self, attached: bool) -> Result<State> {
         if *self.state.lock().unwrap() != State::Checkpointing {
             bail!("vm {} is not being checkpointed", self.name);
         }
-        let res: Result<State> = self.resume().map_err(|e| format!("resuming vm {} after its checkpoint failed: {e}", self.name).into());
+        let res: Result<State> = self.resume(attached).map_err(|e| format!("resuming vm {} after its checkpoint failed: {e}", self.name).into());
         *self.state.lock().unwrap() = *res.as_ref().unwrap_or(&State::Failed);
         res
     }
