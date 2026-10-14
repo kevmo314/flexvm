@@ -598,7 +598,7 @@ impl Host {
 
     pub fn claim_incoming(&self, l: &Locked, holder: &str, ip: Ipv4Addr, gen: u64) -> Result<AddrClaim> {
         let mut a = self.addr(l, ip)?;
-        if gen == 0 || gen > GEN_MAX {
+        if gen == 0 || gen > RECV_MAX {
             bail!("{ip}: an arrival must carry its address's generation (not {gen})");
         }
         if self.held(&a) && a.holder.as_deref() != Some(holder) {
@@ -655,7 +655,7 @@ impl Host {
     /// withdrawn generation). A withdrawal frees a loan of that gen or older.
     pub fn observe(&self, l: &Locked, ip: Ipv4Addr, gen: u64, via: Option<Ipv4Addr>) -> Result<bool> {
         self.update(l, ip, true, |a| {
-            if gen == 0 || gen > GEN_MAX || gen < a.seen || (gen == a.seen && a.withdrawn && via.is_some()) {
+            if gen == 0 || gen > RECV_MAX || gen < a.seen || (gen == a.seen && a.withdrawn && via.is_some()) {
                 return false;
             }
             (a.seen, a.withdrawn, a.via) = (gen, via.is_none(), via);
@@ -906,6 +906,7 @@ fn boottime_ms() -> u64 {
 }
 const ALLOC_HINT: &str = ".next";
 const GEN_MAX: u64 = u64::MAX / 2;
+const RECV_MAX: u64 = 1 << 62; // Leave allocation headroom above any peer generation.
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Addr {
@@ -2093,7 +2094,7 @@ mod tests {
         let h = host("gen-bound");
         let l = h.lock().unwrap();
         let addr = ip("10.9.0.1");
-        for gen in [0, GEN_MAX + 1, u64::MAX] {
+        for gen in [0, RECV_MAX + 1, GEN_MAX - 1025, GEN_MAX - 1024, GEN_MAX - 1, GEN_MAX, GEN_MAX + 1, u64::MAX] {
             assert!(h.claim_incoming(&l, "incoming", addr, gen).is_err());
             assert!(!h.observe(&l, addr, gen, Some(ip("10.1.0.2"))).unwrap());
             assert!(!h.observe(&l, addr, gen, None).unwrap());
@@ -2103,24 +2104,25 @@ mod tests {
 
     #[test]
     fn near_bound_peer_generations_do_not_poison_allocation() {
-        let h = host("gen-exhausted");
-        let l = h.lock().unwrap();
-        let addr = ip("10.9.0.1");
-        let path = h.state.join("addrs/.gens");
-        h.lend_new(&l, ip("10.9.0.2")).unwrap();
-        let before = std::fs::read(&path).unwrap();
-        for gen in [GEN_MAX - 1024, GEN_MAX - 1, GEN_MAX] {
-            h.claim_incoming(&l, "incoming", addr, gen).unwrap().keep();
-            h.release(&l, addr, "incoming", None).unwrap();
-            assert!(h.observe(&l, addr, gen, None).unwrap());
-            assert!(h.lend_new(&l, addr).unwrap_err().to_string().contains("generations exhausted"));
-            assert!(h.claim_new(&l, "new", Some(addr)).err().unwrap().to_string().contains("generations exhausted"));
-            assert_eq!(std::fs::read(&path).unwrap(), before);
-            assert_eq!(h.addr(&l, addr).unwrap().seen, gen);
+        for (tag, incoming) in [("gen-observe", false), ("gen-incoming", true)] {
+            let h = host(tag);
+            let l = h.lock().unwrap();
+            let addr = ip("10.9.0.1");
+            let mut gen = RECV_MAX - 1025;
+            if incoming {
+                h.claim_incoming(&l, "incoming", addr, gen).unwrap().release(&l).unwrap();
+            } else {
+                assert!(h.observe(&l, addr, gen, Some(ip("10.1.0.2"))).unwrap());
+            }
+            for _ in 0..2048 {
+                for addr in [addr, ip("10.9.0.2"), ip("10.9.0.3")] {
+                    let claim = h.claim_new(&l, "new", Some(addr)).unwrap();
+                    assert!(claim.gen > gen && claim.gen <= GEN_MAX);
+                    gen = claim.gen;
+                    claim.release(&l).unwrap();
+                }
+            }
         }
-        let gen = h.lend_new(&l, ip("10.9.0.3")).unwrap();
-        assert!(gen <= GEN_MAX);
-        assert!(h.observe(&l, ip("10.9.0.3"), gen, None).unwrap());
     }
 
     #[test]
