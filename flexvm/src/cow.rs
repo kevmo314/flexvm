@@ -50,6 +50,9 @@ pub const RESCUED: u8 = 4;
 
 /// Rescued copies kept in memory before faults wait for the writers.
 const BUDGET_MIB: usize = 256;
+/// The least budget until the writers have started: the faults of the resume, which comes first, must not wait for
+/// them. It touches a few pages (vCPU clocks, virtio rings).
+const PRE_WRITER_MIB: usize = 64;
 /// How long a drain waits for the writers to make any progress.
 const DRAIN_STALL: Duration = Duration::from_secs(1);
 
@@ -223,10 +226,12 @@ impl Cow {
         }
     }
 
-    /// Whether rescued copies fill the budget, so faults wait for the writers rather than save more. Never before the
-    /// writers have started: the faults of the resume would wait for writers that start only after it.
+    /// Whether rescued copies fill the budget, so faults wait for the writers rather than save more. At least
+    /// `PRE_WRITER_MIB` before the writers have started: the faults of the resume would wait for writers that start
+    /// only after it.
     pub fn over_budget(&self) -> bool {
-        self.writing() && self.rescued_bytes.load(Ordering::SeqCst) >= self.budget
+        let budget = if self.writing() { self.budget } else { self.budget.max(PRE_WRITER_MIB << 20) };
+        self.rescued_bytes.load(Ordering::SeqCst) >= budget
     }
 
     /// Keeps `bytes`, the pause-time contents of `page` (claimed RESCUING).
@@ -531,10 +536,13 @@ mod tests {
         cow.wait_for(1, READING);
         assert!(woken(), "page 1 is done with already");
         assert_eq!(cow.report()["retries"], 2, "each wait is a retry");
-        // Before the writers start, nothing is over budget: a fault on a pending page saves it itself.
+        // Before the writers start, the budget is at least `PRE_WRITER_MIB`: a fault on a pending page saves it itself.
         assert!(!cow.over_budget());
         cow.wait_for(4, PENDING);
         assert!(woken(), "no reason to wait before the writers start");
+        cow.rescued_bytes.store(PRE_WRITER_MIB << 20, Ordering::SeqCst);
+        assert!(cow.over_budget(), "bounded before the writers start too");
+        cow.rescued_bytes.store(0, Ordering::SeqCst);
         cow.writing.store(true, Ordering::SeqCst);
         assert!(cow.over_budget());
         // A writer whose read fails gives its pages back, which wakes faults waiting on them.
