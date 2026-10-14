@@ -58,8 +58,24 @@ impl Config {
         IpRange::parse(&self.vm_ips)
     }
 
+    /// Never a wildcard address.
     pub fn underlay(&self) -> Option<Ipv4Addr> {
-        self.underlay.or_else(|| self.listen.as_deref()?.rsplit_once(':')?.0.parse().ok())
+        self.underlay.or_else(|| self.listen.as_deref()?.rsplit_once(':')?.0.parse().ok()).filter(|u| !u.is_unspecified())
+    }
+
+    /// Where peers reach this host's listener (a migration target pulls
+    /// pages from it): the listen address, or for a wildcard one (0.0.0.0,
+    /// ::) the underlay address with the listen port. None without a listener.
+    pub fn advertise(&self) -> Result<Option<String>> {
+        let Some(listen) = self.listen.as_deref() else { return Ok(None) };
+        let Ok(addr) = listen.parse::<std::net::SocketAddr>() else { return Ok(Some(listen.into())) };
+        if !addr.ip().is_unspecified() {
+            return Ok(Some(listen.into()));
+        }
+        match self.underlay() {
+            Some(u) => Ok(Some(std::net::SocketAddr::from((u, addr.port())).to_string())),
+            None => bail!("listening on {listen} needs --underlay: peers cannot reach a wildcard address"),
+        }
     }
 }
 
@@ -891,6 +907,21 @@ mod tests {
 
     fn ip(s: &str) -> Ipv4Addr {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn a_wildcard_listener_advertises_its_underlay() {
+        let cfg = |listen: Option<&str>, underlay: Option<&str>| Config { listen: listen.map(String::from), underlay: underlay.map(ip), ..Config::default() };
+        assert_eq!(cfg(None, None).advertise().unwrap(), None);
+        assert_eq!(cfg(Some("10.1.0.1:7070"), None).advertise().unwrap().as_deref(), Some("10.1.0.1:7070"));
+        assert_eq!(cfg(Some("10.1.0.1:7070"), Some("10.1.0.2")).advertise().unwrap().as_deref(), Some("10.1.0.1:7070"));
+        assert_eq!(cfg(Some("peer.lan:7070"), None).advertise().unwrap().as_deref(), Some("peer.lan:7070"));
+        for wild in ["0.0.0.0:7070", "[::]:7070"] {
+            assert!(cfg(Some(wild), None).advertise().is_err(), "{wild}");
+            assert_eq!(cfg(Some(wild), None).underlay(), None, "{wild}");
+            assert_eq!(cfg(Some(wild), Some("10.1.0.2")).advertise().unwrap().as_deref(), Some("10.1.0.2:7070"), "{wild}");
+        }
+        assert!(cfg(Some("0.0.0.0:7070"), Some("0.0.0.0")).advertise().is_err());
     }
 
     fn dead_owner(h: &Host, pid: u32, fcs: &[&Ident]) -> Ident {

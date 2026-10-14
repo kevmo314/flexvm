@@ -267,26 +267,37 @@ def addr(host, ip):
         return {}
 
 
+def start_listener(h, listen=None, extra=()):
+    """`h`'s listener, on `listen` (default: its address) with `extra` flags."""
+    other = B if h is A else A
+    for d in (h.state, h.run):
+        os.makedirs(d, exist_ok=True)
+    lg = open(os.path.join(h.run, "listen.log"), "a")
+    listeners[h.addr] = subprocess.Popen(
+        [BIN, "--state", h.state, "--run", h.run, "listen", listen or h.addr, "--peer", other.addr, "--vm-ips", h.ips,
+         "--reserve", "512", "--prefix", args.prefix, *extra], stdout=lg, stderr=lg, env=ENV)
+    hp = h.addr.rsplit(":", 1)
+    up = lambda: subprocess.run(["bash", "-c", f"exec 3<>/dev/tcp/{hp[0]}/{hp[1]}"], capture_output=True).returncode == 0
+    assert wait_for(up, 10), f"listener {h} did not come up"
+
+
 def start_listeners():
     if args.no_listeners:
         return
-    for h, other in ((A, B), (B, A)):
-        for d in (h.state, h.run):
-            os.makedirs(d, exist_ok=True)
-        lg = open(os.path.join(h.run, "listen.log"), "a")
-        listeners[h.addr] = subprocess.Popen(
-            [BIN, "--state", h.state, "--run", h.run, "listen", h.addr, "--peer", other.addr, "--vm-ips", h.ips,
-             "--reserve", "512", "--prefix", args.prefix], stdout=lg, stderr=lg, env=ENV)
     for h in (A, B):
-        hp = h.addr.rsplit(":", 1)
-        up = lambda: subprocess.run(["bash", "-c", f"exec 3<>/dev/tcp/{hp[0]}/{hp[1]}"], capture_output=True).returncode == 0
-        assert wait_for(up, 10), f"listener {h} did not come up"
+        start_listener(h)
+
+
+def stop_listener(h):
+    p = listeners.pop(h.addr, None)
+    if p:
+        p.terminate()
+        p.wait()
 
 
 def stop_listeners():
-    for p in listeners.values():
-        p.terminate()
-        p.wait()
+    for h in (A, B):
+        stop_listener(h)
 
 
 def fc_pid(host, name):
@@ -2429,6 +2440,69 @@ def kill_source():
     cleanup(n)
 
 
+def kill_refused_checkpoint():
+    """A kill that waited for a migration and was refused (the VM became its
+    source) leaves nothing behind: once the target dies mid-pull and the
+    source runs its copy again, a checkpoint is not taken for killed."""
+    n = "ft-kill-refused"
+    clear_log(A, n)
+    m = setup(n, mib=1500)
+    pid = vm_pid(A, n)
+    fault(B, "incoming_stall", 2000)
+    r = [None]
+    t = threading.Thread(target=lambda: r.__setitem__(0, migrate(A, n, B)))
+    t.start()
+    # The target stalls preparing; the source holds its operation lock, not yet a source.
+    lock = os.path.join(B.run, "vms", f"{n}.lock")
+    wait_for(lambda: os.path.exists(lock) and open(lock).read().strip(), 20)
+    os.kill(pid, signal.SIGINT)
+    t.join()
+    check("kill refused: migrated", r[0]["ok"], r[0])
+    fault(A, "pages", 6000)  # the pull cannot finish
+    tpid = json.load(open(lock))["pid"]
+    os.kill(tpid, signal.SIGKILL)
+    check("kill refused: the kill was refused for the source",
+          wait_for(lambda: "source of a migration" in log(A, n), 10) and alive(pid), log(A, n)[-500:])
+    fault(A, "pages", 0)
+    check("kill refused: the source runs its copy again", wait_for(lambda: where(n) == {A: "running"}, 60), where(n))
+    c = checkpoint(A, n, ckpt_path(n))
+    check("kill refused: a checkpoint afterwards succeeds", c["ok"], c)
+    check("kill refused: still running, md5 intact", where(n) == {A: "running"} and md5(A, n) == m, where(n))
+    cleanup(n)
+
+
+def wildcard_listen():
+    """A listener on a wildcard address (0.0.0.0, ::) is refused without
+    --underlay; with one, migrations from it give the target the underlay
+    address to pull pages from, never the wildcard."""
+    if args.no_listeners:
+        return print("wildcard listen: skipped (--no-listeners)")
+    port = A.addr.rsplit(":", 1)[1]
+    # On a host with no configuration yet (A's keeps the --underlay given below).
+    fresh = Host(A.addr, A.dir + "-wildcard", A.ips)
+    for wild in (f"0.0.0.0:{port}", f"[::]:{port}"):
+        subprocess.run(["rm", "-rf", fresh.dir])
+        code, out, err = cli(fresh, "listen", wild, timeout=10)
+        check(f"wildcard listen: {wild} without --underlay refused", code != 0 and "--underlay" in err, (code, err))
+    subprocess.run(["rm", "-rf", fresh.dir])
+    stop_listener(A)
+    try:
+        start_listener(A, f"0.0.0.0:{port}", ["--underlay", A.addr.rsplit(":", 1)[0]])
+        n = "ft-wildcard"
+        clear_log(B, n)
+        m = setup(n)
+        ok(migrate(A, n, B))
+        st = wait_released(B, n)
+        check("wildcard listen: released", st["released"] is True and where(n) == {B: "running"}, (st, where(n)))
+        pulls = re.findall(r"pull from (\S+) ended", log(B, n))
+        check("wildcard listen: the target pulled from the underlay address", pulls == [A.addr], pulls)
+        check("wildcard listen: md5 intact", md5(B, n) == m)
+        cleanup(n)
+    finally:
+        stop_listener(A)
+        start_listener(A)
+
+
 def raw(host, data, timeout=10):
     """Sends `data` on a new connection to `host`'s listener; returns everything until EOF."""
     h, port = host.addr.rsplit(":", 1)
@@ -2958,6 +3032,7 @@ SCENARIOS = dict(
     prepare_disconnect=prepare_disconnect, prepare_trickle=prepare_trickle, prepare_fail=prepare_fail,
     fc_prepare=fc_prepare, slow_preload=slow_preload, ckpt_packet_hold=ckpt_packet_hold, standby=standby,
     suspend_disk_freed=suspend_disk_freed, resume_mark_fails=resume_mark_fails, kill_source=kill_source,
+    kill_refused_checkpoint=no_evict(kill_refused_checkpoint), wildcard_listen=wildcard_listen,
     forged_peer=forged_peer, restore_ip_peer=restore_ip_peer, late_withdrawal=late_withdrawal,
     incoming_killed=incoming_killed, start_killed=start_killed, claim_killed=claim_killed, fc_died=fc_died,
     cow_wp_race=cow_wp_race, fetch_tail_enomem=fetch_tail_enomem, fetch_enomem_stuck=fetch_enomem_stuck)

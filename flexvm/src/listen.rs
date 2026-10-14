@@ -36,11 +36,8 @@ pub fn main(host: Host) -> Result<()> {
     for conn in listener.incoming() {
         let conn = match conn {
             Ok(c) => c,
-            Err(e) if matches!(e.kind(), std::io::ErrorKind::Interrupted | std::io::ErrorKind::ConnectionAborted) => continue,
             Err(e) => {
-                // E.g. out of fds: wait rather than spin.
-                eprintln!("accept: {e}");
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                crate::util::accept_failed("peer listener", &e);
                 continue;
             }
         };

@@ -191,6 +191,15 @@ pub fn pidfd_wait(pidfd: &OwnedFd, timeout: Duration) -> io::Result<bool> {
     Ok(eintr(|| unsafe { libc::poll(&mut pfd, 1, left()) })? > 0)
 }
 
+/// After a failed `accept`: one worth retrying at once (interrupted, the
+/// peer gone) returns; anything else (out of fds) waits rather than spins.
+pub fn accept_failed(what: &str, e: &io::Error) {
+    if !matches!(e.kind(), io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted) {
+        eprintln!("{what}: accept: {e}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 pub fn ms(d: Duration) -> f64 {
     (d.as_secs_f64() * 1e5).round() / 100.0
 }

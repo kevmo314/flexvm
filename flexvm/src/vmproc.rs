@@ -364,6 +364,9 @@ impl Proc {
         vm.pager.abort_copy();
         let op = self.op();
         if matches!(vm.state(), State::Source(_)) {
+            // Refused: the next checkpoint must not take this kill for its own
+            // (one it already cancelled consumed it).
+            let _ = vm.cancel_checkpoint.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
             return source();
         }
         self.finish(&op, End::Gone, code, None)
@@ -486,7 +489,14 @@ impl Proc {
         let _ = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600));
         let p = self.clone();
         thread::spawn(move || {
-            for c in l.incoming().flatten() {
+            for c in l.incoming() {
+                let c = match c {
+                    Ok(c) => c,
+                    Err(e) => {
+                        crate::util::accept_failed("control socket", &e);
+                        continue;
+                    }
+                };
                 if CONTROL.fetch_add(1, Ordering::SeqCst) >= MAX_CONTROL {
                     CONTROL.fetch_sub(1, Ordering::SeqCst);
                     continue;
@@ -752,7 +762,13 @@ impl Proc {
             if vm.pid().is_none() {
                 break;
             }
-            let Ok(conn) = conn else { continue };
+            let conn = match conn {
+                Ok(c) => c,
+                Err(e) => {
+                    crate::util::accept_failed("memory requests", &e);
+                    continue;
+                }
+            };
             let _ = conn.set_write_timeout(Some(MEM_REQUEST_DEADLINE));
             let Some(avail) = read_mem_request(&conn) else { continue };
             let reply = if acted.is_some_and(|t| t.elapsed() < MEM_REQUEST_GAP) {

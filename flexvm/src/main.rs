@@ -209,9 +209,8 @@ fn configure(c: &mut host::Config, args: &Args, addr: Option<&str>) -> Result<()
     c.dns = args.get("dns").map(String::from).or(c.dns.take());
     c.reserve_mib = args.num("reserve", c.reserve_mib)?;
     c.prefix = args.get("prefix").map_or(c.prefix.clone(), String::from);
-    if c.listen.as_deref().is_some_and(|l| l.starts_with("0.0.0.0")) && c.underlay.is_none() {
-        return Err("listening on 0.0.0.0 needs --underlay (the address peers route VMs to)".into());
-    }
+    // A wildcard listen address needs a concrete one to advertise.
+    c.advertise()?;
     Ok(())
 }
 
