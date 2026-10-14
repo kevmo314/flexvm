@@ -93,7 +93,7 @@ pub struct Vm {
     tap_watch: Mutex<Option<(u32, Arc<OwnedFd>)>>,
     /// Paused with frames still queued on its tap that its guest did not take (`drain_tap`).
     tap_stuck: AtomicBool,
-    /// The tap's drop count up to which its drops were reported (`tap_drops_reported`).
+    /// How many of the tap's drops were reported with injected packets (`tap_drops_reported`).
     tap_drops_reported: AtomicU64,
     pub vsock: PathBuf,
     was_paused: AtomicBool,
@@ -329,10 +329,9 @@ impl Vm {
         true
     }
 
-    /// The tap's own count of what it dropped up to `through` was reported (with packets a
-    /// hold injected); `tap_dropped` counts from there.
-    pub fn tap_drops_reported(&self, through: u64) {
-        self.tap_drops_reported.fetch_max(through, Ordering::SeqCst);
+    /// `n` of the tap's drops were reported (with packets a hold injected); `tap_dropped` leaves them out.
+    pub fn tap_drops_reported(&self, n: u64) {
+        self.tap_drops_reported.fetch_add(n, Ordering::SeqCst);
     }
 
     /// Frames the tap dropped, its queue full, that were not reported with injected packets.

@@ -484,8 +484,8 @@ impl Proc {
             let fence = Instant::now();
             crate::host::stall("handoff_stall");
             if hold::wait_start(&mut r, (fence + HOLD_FENCE).min(deadline)) {
-                if let Some(through) = hold::receive(&mut r, vm.ip, &vm.tap, &revoked, (Instant::now() + HELD_STREAM).min(deadline), &mut take_over) {
-                    vm.tap_drops_reported(through);
+                if let Some(reported) = hold::receive(&mut r, vm.ip, &vm.tap, &revoked, (Instant::now() + HELD_STREAM).min(deadline), &mut take_over) {
+                    vm.tap_drops_reported(reported);
                 }
             } else {
                 eprintln!("vm {}: no held packets from the source after {} ms", vm.name, ms(fence.elapsed()));
@@ -776,9 +776,9 @@ pub fn release_into(h: &Holder, ip: Ipv4Addr, mig: u64, vm: &Vm, linger: Duratio
         h.forget(ip, mig);
         eprintln!("vm {}: routing {ip} back to its tap after injecting the held packets: {e}", vm.name);
     }
-    let (tap_dropped, through) = inj.dropped();
+    let (tap_dropped, _) = inj.dropped();
     (stats.injected, stats.dropped_target) = (stats.packets, tap_dropped);
-    vm.tap_drops_reported(through);
+    vm.tap_drops_reported(tap_dropped);
     // Closing a packet socket waits for an RCU grace period; the VM need not.
     thread::spawn(move || drop(inj));
     (Some(stats), switched)

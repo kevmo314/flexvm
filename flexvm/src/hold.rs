@@ -460,7 +460,7 @@ pub fn wait_start(r: &mut BufReader<By<TcpStream>>, deadline: Instant) -> bool {
 
 /// Injects only while `revoked` is false; on `SWITCH`, `take_over` takes the address. Refused if
 /// too many streams are being received.
-/// Returns the tap's drop count reported with them (`Injector::dropped`), if they were.
+/// Returns how many tap drops were reported with them (`Injector::dropped`), if they were.
 pub fn receive(
     r: &mut BufReader<By<TcpStream>>,
     ip: Ipv4Addr,
@@ -528,9 +528,9 @@ fn receive_counted(
     if !ended {
         return None;
     }
-    let (tap_dropped, through) = inj.dropped();
+    let (tap_dropped, _) = inj.dropped();
     let reply = json!({"injected": injected, "dropped": dropped + tap_dropped});
-    write_by(&conn, format!("{reply}\n").as_bytes(), deadline).ok().map(|()| through)
+    write_by(&conn, format!("{reply}\n").as_bytes(), deadline).ok().map(|()| tap_dropped)
 }
 
 /// A whole IPv4 packet for `ip`: all a guest is ever handed.
