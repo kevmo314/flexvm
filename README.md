@@ -132,8 +132,9 @@ with `--peer`: a listener serves its peers' addresses only. `--reserve MIB`
 take it below are refused. VMs start moving to peers with room earlier, once
 the host has less than `--evict-at MIB` available (default: the reserve
 plus the reserve or 512, whichever is more), the fastest growing first,
-until it is back above the mark by half the mark's height over the reserve. Running VMs pick up both from
-`host.json` as it changes.
+until it is back above the mark by half the mark's height over the reserve.
+A peer takes such a VM only if it stays above its own mark. Running VMs pick
+up both from `host.json` as it changes.
 
 ## Fast starts
 
