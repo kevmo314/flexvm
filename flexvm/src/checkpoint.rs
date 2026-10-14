@@ -257,25 +257,25 @@ impl Staging {
         still_valid: impl FnOnce() -> Result<()>,
     ) -> std::result::Result<(Manifest, String), CommitError> {
         let pages = if let Some(p) = self.pages.take() { p } else { PagesFile::new(self.create("pages")?) };
-        // Join every writer before creating the manifest, including on failure.
-        let written: Result<_> = std::thread::scope(|s| {
+        // The scope joins every writer before the manifest, including on failure.
+        let (out, pagemap, vmstate, vmstate_file) = std::thread::scope(|s| -> Result<_> {
             let state = std::thread::Builder::new().spawn_scoped(s, || -> Result<_> {
                 let vmstate = std::fs::read(&self.vmstate)?;
                 ensure!(vmstate.len() as u64 <= MAX_VMSTATE, "its vmstate is over {MAX_VMSTATE} bytes");
                 let file = self.add_file("vmstate", &vmstate)?;
                 Ok((vmstate, file))
             })?;
-            let copied = (|| -> Result<_> {
-                let out = write_pages(&vm.template, src, runs, &pages, writer_threads(), parent.is_some())?;
+            let copied = write_pages(&vm.template, src, runs, &pages, writer_threads(), parent.is_some()).and_then(|out| {
                 t.mark("write_pages");
                 let pagemap = self.sync_pages_and_pagemap(&pages.file, &out.map)?;
                 Ok((out, pagemap))
-            })();
-            let (vmstate, vmstate_file) = state.join().map_err(|_| "vmstate writer thread panicked")??;
+            });
+            let state = state.join().map_err(|_| "vmstate writer thread panicked")?;
+            // The copy's error says more than the VM state's.
             let (out, pagemap) = copied?;
+            let (vmstate, vmstate_file) = state?;
             Ok((out, pagemap, vmstate, vmstate_file))
-        });
-        let (out, pagemap, vmstate, vmstate_file) = written?;
+        })?;
         let map = &out.map;
         let files = BTreeMap::from([
             ("vmstate".into(), FileSum { len: vmstate.len() as u64, hash: sum(&vmstate) }),
