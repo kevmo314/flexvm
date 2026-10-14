@@ -163,6 +163,13 @@ pub struct Mapping {
     pub offset: u64,
 }
 
+impl Mapping {
+    /// Its pages, as `[first, end)`.
+    fn span(&self) -> (usize, usize) {
+        (self.offset as usize / PAGE_SIZE, (self.offset as usize + self.size) / PAGE_SIZE)
+    }
+}
+
 /// Initial page states for a VM migrating in: runs of `[first_page, count, state]`.
 pub type Runs = Vec<(u64, u64, u8)>;
 
@@ -1083,15 +1090,12 @@ impl Pager {
     /// vCPUs are still being restored, instead of one fault at a time.
     fn prefetch(&self) {
         let pages = self.pages();
-        for &(first, count) in &self.base.working_set {
-            let (mut i, end) = (first as usize, ((first + count) as usize).min(pages.len()));
+        for (mut i, end) in self.chunks(self.working_set(0, 1), PREFETCH_RUN) {
             while i < end && !self.quiesce.load(Ordering::SeqCst) {
                 // Holes were zero at snapshot time (mostly free memory the guest
                 // allocates again); map them too, or each one costs a fault.
                 let data = self.base.has_data(i);
-                let region_end = self.locate((i * PAGE_SIZE) as u64).map_or(i + 1, |m| (m.offset as usize + m.size) / PAGE_SIZE);
-                let max = PREFETCH_RUN.min(end.min(region_end) - i);
-                let n = pages.claim(i, max, BASE, |p| self.base.has_data(p) == data);
+                let n = pages.claim(i, end - i, BASE, |p| self.base.has_data(p) == data);
                 if n > 0 {
                     let src = |p: usize, c: usize| data.then(|| self.base.pages(p, c));
                     let _ = pages.install(i, n, BASE, None, |p, c| self.populate(p, c, src(p, c)));
@@ -1103,18 +1107,8 @@ impl Pager {
 
     /// Runs of pages populated so far, as `(first_page, count)`.
     pub fn present_runs(&self) -> Vec<(u64, u64)> {
-        let mut runs: Vec<(u64, u64)> = Vec::new();
         let pages = self.pages();
-        for i in 0..pages.len() {
-            if pages.get(i) != PRESENT {
-                continue;
-            }
-            match runs.last_mut() {
-                Some((f, n)) if *f + *n == i as u64 => *n += 1,
-                _ => runs.push((i as u64, 1)),
-            }
-        }
-        runs
+        runs_where(0, pages.len(), |p| pages.get(p) == PRESENT).map(|(a, b)| (a as u64, (b - a) as u64)).collect()
     }
 
     /// Installs REMOTE pages whose contents came along with the vmstate (one
@@ -1239,7 +1233,7 @@ impl Pager {
 
     /// The first page past the guest memory region holding `page`.
     pub fn region_end(&self, page: usize) -> Option<usize> {
-        self.locate((page * PAGE_SIZE) as u64).map(|m| (m.offset as usize + m.size) / PAGE_SIZE)
+        self.locate((page * PAGE_SIZE) as u64).map(|m| m.span().1)
     }
 
     fn notify(&self) {
@@ -1407,8 +1401,7 @@ impl Pager {
         let mut runs: Runs = Vec::new();
         let pages = self.pages();
         for m in self.mappings() {
-            let first = m.offset as usize / PAGE_SIZE;
-            let end = first + m.size / PAGE_SIZE;
+            let (first, end) = m.span();
             let mut i = pages.next_not_base(first, end);
             while i < end {
                 let p = &pages.states[i];
@@ -1691,7 +1684,7 @@ impl Pager {
     /// to this thread: only pages the pagemap shows populated are read (a
     /// missing one was missing, so zero, at the pause).
     fn wp_fault(&self, page: usize, m: &Mapping) -> io::Result<()> {
-        let (region_first, region_end) = (m.offset as usize / PAGE_SIZE, (m.offset as usize + m.size) / PAGE_SIZE);
+        let (region_first, region_end) = m.span();
         let block = page - page % WP_BLOCK;
         let (first, end) = (block.max(region_first), (block + WP_BLOCK).min(region_end));
         let cow = self.cow.lock().unwrap().clone().filter(|c| c.active());
@@ -1741,20 +1734,10 @@ impl Pager {
         let keep = |p: usize| cow.as_ref().is_some_and(|c| matches!(c.state(p), PENDING | READING | RESCUING));
         // Whether this call unprotected the faulting page, which wakes it.
         let mut woken = false;
-        let mut p = first;
-        while p < end {
-            if keep(p) {
-                p += 1;
-                continue;
-            }
-            let mut q = p + 1;
-            while q < end && !keep(q) {
-                q += 1;
-            }
+        for (p, q) in runs_where(first, end, |p| !keep(p)) {
             (p..q).for_each(|d| self.pages().mark_dirty(d));
             self.writeprotect(p, q - p, false)?;
             woken |= (p..q).contains(&page);
-            p = q;
         }
         // Test fault `ckpt_wp_race`: the writer that claimed the page is
         // done with it before the fault is settled.
@@ -1782,18 +1765,9 @@ impl Pager {
     fn rescue(&self, cow: &Cow, first: usize, end: usize, claimed: &[usize]) -> io::Result<()> {
         let present = self.populated(first, end - first)?;
         let mut buf = vec![0u8; (end - first) * PAGE_SIZE];
-        let mut i = 0;
-        while i < claimed.len() {
-            let mut j = i + 1;
-            while j < claimed.len() && claimed[j] == claimed[j - 1] + 1 && present[claimed[j] - first] == present[claimed[i] - first] {
-                j += 1;
-            }
-            let (a, b) = (claimed[i] - first, claimed[j - 1] + 1 - first);
-            if present[a] {
-                let off = (claimed[i] * PAGE_SIZE) as u64;
-                self.read_guest(off, &mut buf[a * PAGE_SIZE..b * PAGE_SIZE]).map_err(|e| io::Error::other(e.to_string()))?;
-            }
-            i = j;
+        for (a, b) in runs_where(first, end, |p| present[p - first] && claimed.binary_search(&p).is_ok()) {
+            let dst = &mut buf[(a - first) * PAGE_SIZE..(b - first) * PAGE_SIZE];
+            self.read_guest((a * PAGE_SIZE) as u64, dst).map_err(|e| io::Error::other(e.to_string()))?;
         }
         for &p in claimed {
             cow.rescue(p, buf[(p - first) * PAGE_SIZE..(p - first + 1) * PAGE_SIZE].into());
@@ -1865,15 +1839,7 @@ impl Pager {
         let threads = thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, SAVE_REST_THREADS);
         // Only the runs to save (not every page of guest memory: a VM's
         // unplugged virtio-mem region alone is millions), within a region.
-        let mut chunks: Vec<(usize, usize)> = Vec::new();
-        for &(first, end) in cow.runs() {
-            let mut c = first;
-            while c < end {
-                let e = (c + PREFETCH_RUN).min(end).min(self.region_end(c).unwrap_or(c + 1));
-                chunks.push((c, e));
-                c = e;
-            }
-        }
+        let chunks: Vec<(usize, usize)> = self.chunks(cow.runs().iter().copied(), PREFETCH_RUN).collect();
         let next = AtomicUsize::new(0);
         thread::scope(|s| {
             for _ in 0..threads {
@@ -1936,15 +1902,10 @@ impl Pager {
         // In chunks: while the kernel changes a range, KVM retries guest
         // faults anywhere in it, so one call over a whole region would stall
         // the vCPUs for as long as it takes.
-        for m in self.mappings() {
-            let (mut p, end) = (m.offset as usize / PAGE_SIZE, (m.offset as usize + m.size) / PAGE_SIZE);
-            while p < end {
-                let n = ARM_CHUNK.min(end - p);
-                if let Err(e) = self.writeprotect_retry(p, n, true) {
-                    self.tracking.store(false, Ordering::SeqCst);
-                    bail!("write-protecting guest memory: {e}");
-                }
-                p += n;
+        for (p, end) in self.chunks(ALL, ARM_CHUNK) {
+            if let Err(e) = self.writeprotect_retry(p, end - p, true) {
+                self.tracking.store(false, Ordering::SeqCst);
+                bail!("write-protecting guest memory: {e}");
             }
         }
         Ok(start.elapsed())
@@ -1994,7 +1955,7 @@ impl Pager {
             // Everything populated was protected at the last pause (or when
             // tracking began); since then only dirty pages were unprotected.
             for m in self.mappings() {
-                let (from, to) = (m.offset as usize / PAGE_SIZE, (m.offset as usize + m.size) / PAGE_SIZE);
+                let (from, to) = m.span();
                 let mut ranges: Vec<(usize, usize)> = Vec::new();
                 for p in dirty_pages().filter(|&p| p >= from && p < to && pages.get(p) == PRESENT) {
                     match ranges.last_mut() {
@@ -2092,28 +2053,15 @@ impl Pager {
         let pages = self.pages();
         let mut canon = crate::checkpoint::Canon::new(&self.base);
         let mut buf = vec![0u8; 256 * PAGE_SIZE];
-        for m in self.mappings() {
-            let (mut p, end) = (m.offset as usize / PAGE_SIZE, (m.offset as usize + m.size) / PAGE_SIZE);
-            while p < end {
+        for (first, end) in self.chunks(ALL, 256) {
+            for (a, b) in runs_where(first, end, |p| pages.get(p) == PRESENT) {
+                self.read_guest((a * PAGE_SIZE) as u64, &mut buf[(a - first) * PAGE_SIZE..(b - first) * PAGE_SIZE])?;
+            }
+            for p in first..end {
                 match pages.get(p) {
-                    BASE => p += 1,
-                    ZERO => {
-                        canon.page(p, &buf[..0]);
-                        p += 1;
-                    }
-                    PRESENT => {
-                        let mut q = p + 1;
-                        while q < end && q - p < 256 && pages.get(q) == PRESENT {
-                            q += 1;
-                        }
-                        let b = &mut buf[..(q - p) * PAGE_SIZE];
-                        self.read_guest((p * PAGE_SIZE) as u64, b)?;
-                        for (i, page) in b.chunks(PAGE_SIZE).enumerate() {
-                            canon.page(p + i, page);
-                        }
-                        buf[..(q - p) * PAGE_SIZE].fill(0);
-                        p = q;
-                    }
+                    BASE => {}
+                    ZERO => canon.page(p, &[]),
+                    PRESENT => canon.page(p, &buf[(p - first) * PAGE_SIZE..(p - first + 1) * PAGE_SIZE]),
                     s => bail!("page {p} is in state {s}"),
                 }
             }
@@ -2197,11 +2145,9 @@ impl Pager {
             thread::spawn(move || {
                 // A checkpoint's pages come off local disk: the ones in the
                 // template's working set first, as the guest needs them soonest.
-                let pulled = match file.is_some() {
-                    true => p.pull_working_set(t, &mut fetch),
-                    false => Ok(()),
-                };
-                match pulled.and_then(|()| p.pull(t, &mut fetch)) {
+                let first = p.chunks(p.working_set(t, PULL_THREADS).filter(|_| file.is_some()), usize::MAX);
+                let all = p.chunks(ALL, PULL_RUN).skip(t).step_by(PULL_THREADS);
+                match p.pull(first.chain(all), &mut fetch) {
                     Err(e) if unmapped(&e) => return p.gone(),
                     Err(e) => return p.fail(format!("background pull {t} failed: {e}")),
                     Ok(()) => {}
@@ -2346,39 +2292,30 @@ impl Pager {
     ) -> (usize, std::result::Result<(), Failed>) {
         self.pages().fetch_install(first, n, buf, fetch, &self.stop, retry, |p, c, src| self.populate(p, c, Some(src)))
     }
-    /// Pulls the REMOTE pages of every `PULL_THREADS`th range of the
-    /// template's working set, starting at range `stripe`.
-    fn pull_working_set(&self, stripe: usize, fetch: &mut Fetch) -> io::Result<()> {
+    /// Pulls the REMOTE pages of `ranges`, each within one region.
+    fn pull(&self, ranges: impl Iterator<Item = (usize, usize)>, fetch: &mut Fetch) -> io::Result<()> {
         let mut buf = vec![0u8; PULL_RUN * PAGE_SIZE];
-        for &(first, count) in self.base.working_set.iter().skip(stripe).step_by(PULL_THREADS) {
-            let (first, end) = (first as usize, (first + count) as usize);
-            for m in self.mappings() {
-                let (from, to) = (m.offset as usize / PAGE_SIZE, (m.offset as usize + m.size) / PAGE_SIZE);
-                let (mut i, end) = (first.max(from), end.min(to));
-                while i < end && !self.stop.load(Ordering::SeqCst) && self.remote_left() > 0 {
-                    i = self.pull_run(i, end, &mut buf, fetch)?;
-                }
+        for (mut i, end) in ranges {
+            while i < end && !self.stop.load(Ordering::SeqCst) && self.remote_left() > 0 {
+                i = self.pull_run(i, end, &mut buf, fetch)?;
             }
         }
         Ok(())
     }
 
-    fn pull(&self, stripe: usize, fetch: &mut Fetch) -> io::Result<()> {
-        let mut buf = vec![0u8; PULL_RUN * PAGE_SIZE];
-        for m in self.mappings() {
-            let first = m.offset as usize / PAGE_SIZE;
-            let end = first + m.size / PAGE_SIZE;
-            let mut chunk = first + stripe * PULL_RUN;
-            while chunk < end && !self.stop.load(Ordering::SeqCst) && self.remote_left() > 0 {
-                let chunk_end = (chunk + PULL_RUN).min(end);
-                let mut i = chunk;
-                while i < chunk_end {
-                    i = self.pull_run(i, chunk_end, &mut buf, fetch)?;
-                }
-                chunk += PULL_THREADS * PULL_RUN;
-            }
-        }
-        Ok(())
+    /// Every `step`th range of the template's working set from range `skip`, as `[first, end)`.
+    fn working_set(&self, skip: usize, step: usize) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.base.working_set.iter().skip(skip).step_by(step).map(|&(f, n)| (f as usize, (f + n) as usize))
+    }
+
+    /// `ranges` (as `[first, end)`) cut at region ends and into pieces of at most `max` pages.
+    fn chunks<'a>(&'a self, ranges: impl IntoIterator<Item = (usize, usize)> + 'a, max: usize) -> impl Iterator<Item = (usize, usize)> + 'a {
+        ranges.into_iter().flat_map(move |(a, b)| {
+            self.mappings().iter().flat_map(move |m| {
+                let (from, to) = (a.max(m.span().0), b.min(m.span().1));
+                (from..to).step_by(max).map(move |c| (c, c.saturating_add(max).min(to)))
+            })
+        })
     }
 
     /// Pulls the REMOTE pages from `i` on (up to `end`, within one region)
@@ -2694,6 +2631,20 @@ pub fn remote_among(runs: &Runs, wanted: impl IntoIterator<Item = u64>) -> Vec<u
             remote.get(i).is_some_and(|r| r.0 <= p)
         })
         .collect()
+}
+
+/// Every page, for `Pager::chunks`.
+const ALL: [(usize, usize); 1] = [(0, usize::MAX)];
+
+/// The maximal runs `[a, b)` within `[first, end)` of pages that pass `f`
+/// (asked once per page).
+pub(crate) fn runs_where(first: usize, end: usize, f: impl Fn(usize) -> bool) -> impl Iterator<Item = (usize, usize)> {
+    let mut p = first;
+    std::iter::from_fn(move || {
+        let a = (p..end).find(|&i| f(i))?;
+        p = (a + 1..end).find(|&i| !f(i)).unwrap_or(end);
+        Some((a, p))
+    })
 }
 
 /// Reads guest memory at an offset from wherever REMOTE pages come from,

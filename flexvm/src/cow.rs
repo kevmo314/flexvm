@@ -283,24 +283,13 @@ impl GuestPages for CowPages<'_> {
         let n = buf.len() / PAGE_SIZE;
         let mine: Vec<bool> = (0..n).map(|i| cow.claim(page + i, PENDING, READING)).collect();
         // Runs of pages claimed here, read straight out of the guest.
-        let mut i = 0;
-        while i < n {
-            if !mine[i] {
-                i += 1;
-                continue;
-            }
-            let mut j = i + 1;
-            while j < n && mine[j] {
-                j += 1;
-            }
-            let read = self.guest.read(page + i, &mut buf[i * PAGE_SIZE..j * PAGE_SIZE]);
-            if let Err(e) = read {
+        for (i, j) in crate::uffd::runs_where(0, n, |i| mine[i]) {
+            if let Err(e) = self.guest.read(page + i, &mut buf[i * PAGE_SIZE..j * PAGE_SIZE]) {
                 for (k, _) in mine.iter().enumerate().skip(i).filter(|m| *m.1) {
                     cow.set(page + k, PENDING);
                 }
                 return Err(e);
             }
-            i = j;
         }
         let claimed = mine.iter().filter(|&&m| m).count();
         for (k, _) in mine.iter().enumerate().filter(|m| *m.1) {
