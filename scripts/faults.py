@@ -982,6 +982,16 @@ def same_host_flood():
     udp_across_migrations("same host flood", "ft-flood", "release_stall", burst=10)
 
 
+def udp_receiver(host, n):
+    """Starts socat in the guest appending what UDP port 9000 receives to /tmp/udp (its socket
+    buffer large enough for any burst of held packets), and waits until the port is bound:
+    a datagram sent before would be dropped by the guest (NoPorts)."""
+    code, out = sh(host, n, "echo 16777216 > /proc/sys/net/core/rmem_max; "
+                   "setsid socat -u UDP-RECV:9000,rcvbuf=16777216 OPEN:/tmp/udp,creat,append >/dev/null 2>&1 < /dev/null & "
+                   "for i in $(seq 200); do grep -qs ':2328 ' /proc/net/udp /proc/net/udp6 && exit 0; sleep 0.05; done; exit 1")
+    assert code == 0, f"socat did not bind UDP port 9000 in the guest: {out}"
+
+
 def udp_across_migrations(label, n, target_fault=None, burst=1):
     """A UDP sequence stream to `n` (`burst` datagrams every millisecond)
     across migrations A to B, back and to B again, `target_fault` armed on
@@ -992,10 +1002,7 @@ def udp_across_migrations(label, n, target_fault=None, burst=1):
         clear_log(h, n)
     ok(run(A, n))
     ip = vm_ip(A, n)
-    code, out = sh(A, n, "echo 16777216 > /proc/sys/net/core/rmem_max; "
-                   "setsid socat -u UDP-RECV:9000,rcvbuf=16777216 OPEN:/tmp/udp,creat,append >/dev/null 2>&1 < /dev/null &")
-    assert code == 0, out
-    time.sleep(0.3)
+    udp_receiver(A, n)
     stop, sent = threading.Event(), [0]
 
     def stream():
@@ -2415,9 +2422,7 @@ def ckpt_packet_hold():
     n = "ft-ckpt-pkt"
     ok(run(A, n))
     ip = vm_ip(A, n)
-    code, out = sh(A, n, "echo 16777216 > /proc/sys/net/core/rmem_max; "
-                   "setsid socat -u UDP-RECV:9000,rcvbuf=16777216 OPEN:/tmp/udp,creat,append >/dev/null 2>&1 < /dev/null &")
-    assert code == 0, out
+    udp_receiver(A, n)
     tcp_server(A, n)
     conn = socket.create_connection((ip, 7000), timeout=10)
     conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
