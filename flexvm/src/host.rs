@@ -499,14 +499,16 @@ impl Host {
             Some(Mig::Committed { owner }) => (owner, None),
         };
         reap(&self.run, &owner)?;
-        remove(&path)?;
         // Killed before it committed, it never ran here: the newest route a peer
-        // announced for its address (say, back to its source) comes back.
+        // announced for its address (say, back to its source) comes back. Until
+        // it does, the record stays (still aborted), so the next query retries.
         if let Some(ip) = ip {
             if let Err(e) = self.reinstall_after(&l, ip, Some(&owner)) {
-                eprintln!("migration {id} died before its commit; putting back the route for {ip}: {e}");
+                eprintln!("migration {id} died before its commit; putting back the route for {ip}: {e}; retried on the next query");
+                return Ok("aborted");
             }
         }
+        remove(&path)?;
         Ok("aborted")
     }
 
@@ -1179,6 +1181,13 @@ mod tests {
         let mut r = h.mig_begin(4, "", None, None).unwrap();
         store(&h.mig_path(4), &Mig::Pending { owner: dead_owner(&h, 999_999_904, &[]), ip: None }, false).unwrap();
         assert!(h.mig_status(4).unwrap() == "aborted" && rec(4).is_none() && r.commit(&h.lock().unwrap()).is_err());
+        // A dead arrival's route that cannot be put back yet keeps its record, for the next query.
+        let back = ip("10.9.0.4");
+        std::fs::write(h.addr_path(back), "{").unwrap();
+        store(&h.mig_path(10), &Mig::Pending { owner: dead_owner(&h, 999_999_910, &[]), ip: Some(back) }, false).unwrap();
+        assert!(h.mig_status(10).unwrap() == "aborted" && rec(10).is_some(), "kept while its route cannot be put back");
+        std::fs::remove_file(h.addr_path(back)).unwrap();
+        assert!(h.mig_status(10).unwrap() == "aborted" && rec(10).is_none());
         let fc = Sleeper::new();
         store(&h.mig_path(5), &Mig::Committed { owner: dead_owner(&h, 999_999_905, &[&fc.1]) }, false).unwrap();
         assert!(h.mig_status(5).unwrap() == "aborted" && fc.done() && rec(5).is_none());

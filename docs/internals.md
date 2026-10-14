@@ -672,7 +672,8 @@ a second copy could repeat what it did.
   prepares): an arrival that fails or dies before leaves this host's route
   to the address, say back to its source, as it was. A dead arrival's
   record (`STATE/migs/ID`) names the address, and once it reads as aborted
-  the route a peer announced for it is put back, in case it went missing. The guest keeps its address and TCP state, so connections
+  the route a peer announced for it is put back, in case it went missing
+  (the record stays until that succeeds, so a later query retries it). The guest keeps its address and TCP state, so connections
   continue, and packets that arrive during the downtime are held, not lost
   (`hold.rs`):
   - Just before pausing the VM, the source routes its address to a TUN
@@ -691,7 +692,11 @@ a second copy could repeat what it did.
     it sends `SWITCH`, and the target, with all before it injected, points
     the route at a hold of its own; the source's last packets follow, and
     once the stream ends the target releases its hold into the VM, so the
-    held packets stay first and in order (#78). The target takes one stream per migration, on that
+    held packets stay first and in order (#78). A target that takes
+    `SWITCH` says so in its prepare answer (`hold_switch`); a source sends it
+    to no other. Each of these late route changes happens under the host
+    lock and only while the address is still this VM's with a current
+    generation: a newer VM's route, announced meanwhile, stays. The target takes one stream per migration, on that
     connection, for that VM instance only, and stops it if the VM is killed
     or moves on. Nothing is resent: a stream that breaks off, or a source
     whose answer was lost, loses the rest (counted). Sequence numbers count

@@ -444,7 +444,7 @@ where it is kept and what tests it.
   becomes `standby` (count, refill, claim fallback). New: `abort_superseded`,
   `gen_zero`, `suspend_gen`, `signals`, `kill_source`, `forged_peer`,
   `restore_ip_peer`, `late_withdrawal`, `kill_refused_checkpoint`,
-  `wildcard_listen`, `same_host_order`, `arrival_abort_route`, `arrival_killed_route`, and processes SIGKILLed between
+  `wildcard_listen`, `same_host_order`, `arrival_abort_route`, `arrival_killed_route`, `handoff_superseded`, and processes SIGKILLed between
   steps at test stalls (`incoming_killed`, `start_killed`, `claim_killed`).
   Dropped:
   `target_restart_symlink`, `shared_run_dir`, `state_dir_lock` (they tested a

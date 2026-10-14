@@ -141,7 +141,8 @@ impl Proc {
         };
         t.mark("target");
         let downtime = t.total();
-        let (held, rerouted) = self.reroute(mig, to, &target, answered.then_some(&conn));
+        // A target that takes `SWITCH` says so (`hold_switch`); with any other, the hold switches as before.
+        let (held, rerouted) = self.reroute(mig, to, &target, answered.then_some(&conn), prepared["hold_switch"] == true);
         t.mark("reroute");
         self.wait_release(mig, to.to_string());
         Ok(json!({
@@ -248,7 +249,7 @@ impl Proc {
                 match outcome(&to, mig, patience) {
                     Some(Outcome::Committed(target)) => {
                         eprintln!("vm {}: migration {mig} to {to} committed", p.name());
-                        let _ = p.reroute(mig, &to, &target, None);
+                        let _ = p.reroute(mig, &to, &target, None, false);
                         return p.wait_release(mig, to);
                     }
                     Some(Outcome::Aborted) => return p.abort_later(mig, &format!("migration {mig} to {to} aborted")),
@@ -293,7 +294,7 @@ impl Proc {
     }
 
     /// A failed route is retried in the background: the target owns the VM either way.
-    fn reroute(&self, mig: u64, to: &str, target: &Value, conn: Option<&TcpStream>) -> (Option<hold::Stats>, Result<()>) {
+    fn reroute(&self, mig: u64, to: &str, target: &Value, conn: Option<&TcpStream>, switch: bool) -> (Option<hold::Stats>, Result<()>) {
         let ip = self.vm().ip;
         let Some(via) = target["underlay"].as_str().and_then(|s| s.parse::<Ipv4Addr>().ok()) else {
             if let Some(h) = self.holder() {
@@ -306,7 +307,7 @@ impl Proc {
             match conn.map(|c| (c, hold::start(c))) {
                 Some((c, Ok(seq))) => {
                     // Sharing our routes, the target takes the address over itself, after the held packets.
-                    let handoff = crate::net::is_local_addr(via).unwrap_or(false);
+                    let handoff = switch && crate::net::is_local_addr(via).unwrap_or(false);
                     (held, res) = hold::send(h, ip, mig, c, seq, handoff, || self.switch_route(via)).map(|(s, r)| (Some(s), Some(r))).unwrap_or_default()
                 }
                 started => {
@@ -339,6 +340,18 @@ impl Proc {
         (held, res)
     }
 
+    /// Runs `f`, a route change for this VM's address, under the host lock and only while
+    /// this process holds the address with a current generation; None, doing nothing, if not.
+    fn if_current<R>(&self, f: impl FnOnce() -> Result<R>) -> Result<Option<R>> {
+        let (ip, gen, l) = (self.vm().ip, self.gen(), self.host.lock()?);
+        if self.host.holder(&l, ip)?.is_none_or(|h| h != self.name()) || !self.host.current(&l, ip, gen)? {
+            return Ok(None);
+        }
+        let out = f()?;
+        drop(l);
+        Ok(Some(out))
+    }
+
     /// Under the host lock, so a later claim of the address routes after.
     fn switch_route(&self, via: Ipv4Addr) -> Result<()> {
         let (ip, gen, l) = (self.vm().ip, self.gen(), self.host.lock()?);
@@ -364,7 +377,7 @@ impl Proc {
                 return Err(e);
             }
         };
-        send_json(&mut w, &json!({"ok": true, "result": {"timings_ms": prep.json(), "load_set": prepared.4}}))?;
+        send_json(&mut w, &json!({"ok": true, "result": {"timings_ms": prep.json(), "load_set": prepared.4, "hold_switch": true}}))?;
         let deadline = Instant::now() + if fault("short_incoming") { Duration::from_secs(2) } else { INCOMING_WAIT };
         let mut r = BufReader::new(By { s: w.try_clone()?, at: deadline });
         let pager = prepared.0.pager.clone();
@@ -422,35 +435,50 @@ impl Proc {
             // packets its hold took first are in (#78). When the source hands it over,
             // this process's hold takes it (what the source still has comes first),
             // and lets go of it once the stream ends; without a handover, the end
-            // of the stream routes it.
+            // of the stream routes it. Each step only while the address is still
+            // this VM's: a newer one's route, announced meanwhile, stays.
             let (mut routed, mut holding) = (!shared, false);
             let mut take_over = || {
                 if std::mem::replace(&mut routed, true) {
                     return;
                 }
-                let took = match holder.as_deref() {
-                    Some(h) => vm.if_here(|| h.hold(vm.ip, mig)).inspect(|&t| holding = t),
-                    None => vm.route_here().map(|()| true),
-                };
-                if let Err(e) = took {
-                    eprintln!("vm {}: taking over {}: {e}", vm.name, vm.ip);
-                    routed = false;
+                let took = p.if_current(|| match holder.as_deref() {
+                    Some(h) => vm.if_here(|| h.hold(vm.ip, mig)),
+                    None => vm.route_here().map(|()| false),
+                });
+                match took {
+                    Ok(Some(held)) => holding = held,
+                    Ok(None) => eprintln!("vm {}: {} went to a newer vm; not taking it over", vm.name, vm.ip),
+                    Err(e) => {
+                        eprintln!("vm {}: taking over {}: {e}", vm.name, vm.ip);
+                        routed = false;
+                    }
                 }
             };
             let fence = Instant::now();
+            crate::host::stall("handoff_stall");
             if hold::wait_start(&mut r, (fence + HOLD_FENCE).min(deadline)) {
                 hold::receive(&mut r, vm.ip, &vm.tap, &revoked, (Instant::now() + HELD_STREAM).min(deadline), &mut take_over);
             } else {
                 eprintln!("vm {}: no held packets from the source after {} ms", vm.name, ms(fence.elapsed()));
             }
-            match (holder.as_deref(), holding) {
-                (Some(h), true) => drop(release_into(h, vm.ip, mig, &vm, RELEASE_LOCAL, |()| vm.route_here())),
-                _ if !routed => {
-                    if let Err(e) = vm.route_here() {
-                        eprintln!("vm {}: routing {} to its tap: {e}", vm.name, vm.ip);
-                    }
+            let ended = p.if_current(|| match (holder.as_deref(), holding) {
+                (Some(h), true) => {
+                    let _ = release_into(h, vm.ip, mig, &vm, RELEASE_LOCAL, |()| vm.route_here());
+                    Ok(())
                 }
-                _ => {}
+                _ if !routed => vm.route_here(),
+                _ => Ok(()),
+            });
+            match ended {
+                Ok(Some(())) => {}
+                Ok(None) => {
+                    if let Some(h) = holder.as_deref().filter(|_| holding) {
+                        h.forget(vm.ip, mig);
+                    }
+                    eprintln!("vm {}: {} went to a newer vm; not routing it here", vm.name, vm.ip);
+                }
+                Err(e) => eprintln!("vm {}: routing {} to its tap: {e}", vm.name, vm.ip),
             }
             p.held_in.lock().unwrap().take();
             p.announce();

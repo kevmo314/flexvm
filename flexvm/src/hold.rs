@@ -465,6 +465,7 @@ pub fn send(
             if !(o.flush(deadline) && By { s: conn, at: deadline }.read_exact(&mut ack).is_ok() && ack[0] == b'w') {
                 o.broken = true;
                 eprintln!("hold {ip}: the target did not take the address over; dropping the rest");
+                bail!("the target did not take {ip} over (its held packets after this are lost)");
             }
             Ok(())
         }

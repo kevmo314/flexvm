@@ -207,7 +207,7 @@ def fault(host, f, ms):
 FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_before_run", "restore_after_run",
           "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "resume_kill",
           "prepare_fail", "short_incoming", "slow_preload", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
-          "started_fsync", "started_unmark", "start_stall", "incoming_stall", "claim_stall", "ckpt_wp_race",
+          "started_fsync", "started_unmark", "start_stall", "incoming_stall", "claim_stall", "handoff_stall", "ckpt_wp_race",
           "fetch_tail_enomem", "fetch_enomem_stuck", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup")
 
 
@@ -999,6 +999,30 @@ def same_host_order():
     cleanup(n)
 
 
+def handoff_superseded():
+    """A same-host arrival routes its address only after the held packets
+    (`handoff_stall` delays that by 3 s). A newer generation of the address
+    announced meanwhile keeps its route: the late handoff leaves it alone."""
+    n = "ft-handoff-superseded"
+    ok(run(A, n))
+    v = vms(A)[n]
+    ip, gen = v["ip"], v["gen"]
+    gw = subprocess.run(["ip", "route", "show", "default"], capture_output=True, text=True).stdout.split()[2]
+    fault(B, "handoff_stall", 30000)
+    clear_log(B, n)
+    r = migrate(A, n, B)
+    check("handoff superseded: migrated", r["ok"] and where(n).get(B) == "running", (r, where(n)))
+    r = peer(B, {"op": "route", "ip": ip, "via": gw, "gen": gen + 1})
+    check("handoff superseded: the newer generation is taken", r.get("ok") and not r["result"].get("stale"), r)
+    check("handoff superseded: the late handoff says it left the address alone",
+          wait_for(lambda: "went to a newer vm" in log(B, n), 10), log(B, n)[-300:])
+    fault(B, "handoff_stall", 0)
+    time.sleep(0.5)
+    check("handoff superseded: the address routes to the newer vm's host", f"via {gw}" in peer_route(ip), peer_route(ip))
+    kill(B, n)
+    forget_peer_route(ip, gen + 1)
+
+
 def peer_route(ip):
     """The kernel's route for `ip`: shared by A and B."""
     return subprocess.run(["ip", "route", "show", f"{ip}/32"], capture_output=True, text=True).stdout.strip()
@@ -1022,7 +1046,10 @@ def arrival_with_peer_route(n, ip):
 
 
 def forget_peer_route(ip, gen):
-    peer(B, {"op": "route", "ip": ip, "gen": gen})
+    """Withdraws generation `gen` of `ip` on both hosts (so its home host hands
+    the address out only with a newer one) and removes its route."""
+    for h in (A, B):
+        peer(h, {"op": "route", "ip": ip, "gen": gen})
     subprocess.run(["ip", "route", "del", f"{ip}/32"], capture_output=True)
 
 
@@ -3388,7 +3415,8 @@ SCENARIOS = dict(
     forged_peer=forged_peer, restore_ip_peer=restore_ip_peer, late_withdrawal=late_withdrawal,
     incoming_killed=incoming_killed, start_killed=start_killed, claim_killed=claim_killed, fc_died=fc_died,
     cow_wp_race=cow_wp_race, fetch_tail_enomem=fetch_tail_enomem, fetch_enomem_stuck=fetch_enomem_stuck,
-    same_host_order=same_host_order, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route)
+    same_host_order=same_host_order, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,
+    handoff_superseded=handoff_superseded)
 names = [n for s in args.scenarios for n in (list(SCENARIOS) if s == "all" else [s])]
 if os.geteuid() != 0:
     sys.exit("run as root (sudo)")
