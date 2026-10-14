@@ -384,23 +384,22 @@ impl Vm {
         let raw = s.try_clone()?;
         let mut g = BufReader::new(crate::util::By { s, at: deadline });
         let id = self.track(&raw)?;
+        let sid = crate::guest::session_id()?;
         let res = (|| -> Result<(i32, String)> {
-            g.get_mut().write_all(format!("CONNECT {}\nEXEC {}\n{cmd}", crate::guest::PORT, cmd.len()).as_bytes())?;
+            g.get_mut().write_all(format!("CONNECT {}\nSESSION {sid} {}\n{cmd}", crate::guest::PORT, cmd.len()).as_bytes())?;
             let mut ok = String::new();
             g.by_ref().take(64).read_line(&mut ok)?;
             if !ok.starts_with("OK") {
                 bail!("vsock connect refused: {ok:?}");
             }
             let mut out = Vec::new();
-            loop {
-                match crate::guest::read_frame(&mut g).map_err(|e| format!("guest command {cmd:?}: {e}"))? {
-                    Some((crate::guest::FRAME_EXIT, d)) if d.len() >= 4 => {
-                        return Ok((i32::from_le_bytes(d[..4].try_into().unwrap()), String::from_utf8_lossy(&out).into_owned()))
-                    }
-                    Some((_, d)) => out.extend_from_slice(&d[..d.len().min(MAX_OUTPUT.saturating_sub(out.len()))]),
-                    None => bail!("guest closed the connection before the command exited"),
-                }
-            }
+            let code = crate::guest::exec_output(&mut g, &sid, |_, d| {
+                out.extend_from_slice(&d[..d.len().min(MAX_OUTPUT.saturating_sub(out.len()))]);
+                Ok(())
+            })
+            .map_err(|e| format!("guest command {cmd:?}: {e}"))?;
+            let _ = crate::guest::close(&self.vsock(), &sid, deadline);
+            Ok((code, String::from_utf8_lossy(&out).into_owned()))
         })();
         let _ = raw.shutdown(Shutdown::Both);
         self.untrack_exec(id);

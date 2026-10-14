@@ -2,23 +2,18 @@
 //!
 //! Sets up a writable overlay on top of the read-only (DAX) root, then serves
 //! a tiny command protocol on vsock so the host can run things in the VM.
-//!
-//! Request: one text line, `PING`, `NET <ip> [dns]`, `START <ip> <secs.nanos> [dns]`,
-//! `EXEC <len>` or `SPAWN <len>`; EXEC/SPAWN are followed by `len` bytes of shell
-//! command. `START` is `NET` plus the host's wall clock, sent on every start;
-//! `CLOCK <secs.nanos>` sets just the clock, after a migration or a resume;
-//! `FORKS` counts the RNG reseeds for new VMGenIDs the kernel has done.
-//! Resumable commands use `SESSION <id> <len>`, `ATTACH <id> <offset>` and
-//! `CLOSE <id>` (see session.rs). Image templates add the app requests in `app.rs`.
-//! Response: frames of `[kind u8][len u32 LE][payload]`, where kind is
-//! 1 = stdout, 2 = stderr, 3 = exit code (i32 LE), 4 = message.
+//! Requests are one text line: `PING`, `NET <ip> [dns]`, `START <ip> <secs.nanos> [dns]`
+//! (NET plus the host's wall clock), `CLOCK <secs.nanos>`, `FORKS`, the session
+//! requests in session.rs and the app requests in app.rs. Replies are frames
+//! (see proto.rs).
 
 use std::collections::HashMap;
 use std::ffi::CString;
+use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::process::CommandExt;
-use std::process::{Child, Command, Stdio};
+use std::os::unix::fs::OpenOptionsExt;
+use std::process::{Child, ChildStderr, ChildStdout, Command};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -27,25 +22,21 @@ use std::time::{Duration, Instant};
 mod app;
 mod mem;
 mod net;
+#[allow(dead_code)]
+mod proto;
 mod session;
 
-const VSOCK_PORT: u32 = 52;
-/// How long a command's body (after its request line) may take to arrive,
-/// all of it.
+use proto::{FRAME_MSG, FRAME_STDERR, FRAME_STDOUT, MAX_BODY};
+
+/// How long a command body may take to arrive, all of it.
 const BODY_TIMEOUT: Duration = Duration::from_secs(30);
-/// Longest request line and command body.
-// CHECK hex-encodes a command of up to MAX_BODY bytes.
+/// CHECK hex-encodes a command of up to MAX_BODY bytes on its request line.
 const MAX_LINE: u64 = 2 * MAX_BODY as u64 + 128;
-const MAX_BODY: usize = 1024 * 1024;
 /// How many command bodies may be arriving at once; more are refused.
 const MAX_BODY_READERS: usize = 16;
 static BODY_READERS: AtomicUsize = AtomicUsize::new(0);
 
-const FRAME_STDOUT: u8 = 1;
-const FRAME_STDERR: u8 = 2;
-const FRAME_EXIT: u8 = 3;
-const FRAME_MSG: u8 = 4;
-
+/// Exit codes of children someone waits for, by pid (None while running).
 type Statuses = Arc<(Mutex<HashMap<i32, Option<i32>>>, Condvar)>;
 
 fn main() {
@@ -59,10 +50,8 @@ fn main() {
         mem::start();
     }
     let statuses: Statuses = Arc::new((Mutex::new(HashMap::new()), Condvar::new()));
-    {
-        let statuses = statuses.clone();
-        thread::spawn(move || reap(statuses));
-    }
+    let reaped = statuses.clone();
+    thread::spawn(move || reap(reaped));
     log("ready");
     if let Err(e) = serve(statuses) {
         log(&format!("vsock server failed: {e}"));
@@ -76,29 +65,18 @@ fn log(msg: &str) {
     let _ = writeln!(io::stderr(), "flexvm-init: {msg}");
 }
 
-fn cstr(s: &str) -> CString {
-    CString::new(s).unwrap()
+/// A syscall's result, or its error if it returned a negative value.
+fn os<T: Default + PartialOrd>(rc: T) -> io::Result<T> {
+    if rc < T::default() { Err(io::Error::last_os_error()) } else { Ok(rc) }
 }
 
 fn mount(src: &str, target: &str, fstype: &str, flags: libc::c_ulong, data: &str) -> io::Result<()> {
-    let (src_c, target_c, fstype_c, data_c) = (cstr(src), cstr(target), cstr(fstype), cstr(data));
-    let rc = unsafe {
-        libc::mount(
-            src_c.as_ptr(),
-            target_c.as_ptr(),
-            if fstype.is_empty() { std::ptr::null() } else { fstype_c.as_ptr() },
-            flags,
-            data_c.as_ptr().cast(),
-        )
-    };
-    if rc == 0 {
-        Ok(())
-    } else {
-        let err = io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::EBUSY) {
-            return Ok(());
-        }
-        Err(io::Error::new(err.kind(), format!("mount {target}: {err}")))
+    let c = |s: &str| CString::new(s).unwrap();
+    let (src_c, target_c, fstype_c, data_c) = (c(src), c(target), c(fstype), c(data));
+    let fstype = if fstype.is_empty() { std::ptr::null() } else { fstype_c.as_ptr() };
+    match os(unsafe { libc::mount(src_c.as_ptr(), target_c.as_ptr(), fstype, flags, data_c.as_ptr().cast()) }) {
+        Err(e) if e.raw_os_error() != Some(libc::EBUSY) => Err(io::Error::new(e.kind(), format!("mount {target}: {e}"))),
+        _ => Ok(()),
     }
 }
 
@@ -111,25 +89,16 @@ fn setup_root() -> io::Result<()> {
     // tmpfs defaults to half of RAM *at mount time*; memory grows by hotplug
     // later, so leave the size unbounded and let the host decide.
     mount("tmpfs", "/run", "tmpfs", 0, "mode=755,size=0")?;
-    for d in ["/run/ovl", "/run/ovl/upper", "/run/ovl/work", "/run/root"] {
+    for d in ["/run/ovl/upper", "/run/ovl/work", "/run/root"] {
         std::fs::create_dir_all(d)?;
     }
-    mount(
-        "overlay",
-        "/run/root",
-        "overlay",
-        0,
-        "lowerdir=/,upperdir=/run/ovl/upper,workdir=/run/ovl/work",
-    )?;
+    mount("overlay", "/run/root", "overlay", 0, "lowerdir=/,upperdir=/run/ovl/upper,workdir=/run/ovl/work")?;
     for d in ["/proc", "/sys", "/dev"] {
         mount(d, &format!("/run/root{d}"), "", libc::MS_MOVE, "")?;
     }
     std::env::set_current_dir("/run/root")?;
     std::fs::create_dir_all("/run/root/mnt/oldroot")?;
-    let rc = unsafe { libc::syscall(libc::SYS_pivot_root, c".".as_ptr(), c"mnt/oldroot".as_ptr()) };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
+    os(unsafe { libc::syscall(libc::SYS_pivot_root, c".".as_ptr(), c"mnt/oldroot".as_ptr()) })?;
     std::env::set_current_dir("/")?;
     unsafe { libc::umount2(c"/mnt/oldroot".as_ptr(), libc::MNT_DETACH) };
     mount("tmpfs", "/run", "tmpfs", 0, "mode=755,size=0")?;
@@ -159,23 +128,17 @@ fn exited_child() -> io::Result<i32> {
 }
 
 /// Reaps every child (we are PID 1, so orphans land here too) and records
-/// exit codes for the EXEC handlers waiting on them.
+/// the exit codes that `spawn` registered.
 fn reap(statuses: Statuses) {
     let (lock, cv) = &*statuses;
     loop {
         let mut map = lock.lock().unwrap();
         let mut status = 0;
-        // Check for children under the spawn lock so a notification cannot be missed.
+        // Checked under the lock `spawn` holds, so a new child cannot be missed.
         let mut pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
         if pid == 0 {
             drop(map);
-            let exited = match exited_child() {
-                Ok(pid) => pid,
-                Err(e) => match e.raw_os_error() {
-                    Some(libc::ECHILD) | Some(libc::EINTR) => continue,
-                    _ => return,
-                },
-            };
+            pid = unsafe { libc::waitpid(-1, &mut status, 0) };
             map = lock.lock().unwrap();
             pid = unsafe { libc::waitpid(exited, &mut status, libc::WNOHANG) };
             // spawn may already have consumed this failed-exec child.
@@ -183,196 +146,166 @@ fn reap(statuses: Statuses) {
                 continue;
             }
         }
-        if pid < 0 {
-            match io::Error::last_os_error().raw_os_error() {
-                Some(libc::ECHILD) => drop(cv.wait(map).unwrap()),
-                Some(libc::EINTR) => {}
-                _ => return,
+        match os(pid).map_err(|e| e.raw_os_error()) {
+            Err(Some(libc::ECHILD)) => drop(cv.wait(map).unwrap()),
+            Err(Some(libc::EINTR)) => {}
+            Err(_) => return,
+            Ok(pid) => {
+                let code = if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { 128 + libc::WTERMSIG(status) };
+                if let Some(exit) = map.get_mut(&pid) {
+                    *exit = Some(code);
+                    cv.notify_all();
+                }
             }
-            continue;
-        }
-        let code = if libc::WIFEXITED(status) {
-            libc::WEXITSTATUS(status)
-        } else {
-            128 + libc::WTERMSIG(status)
-        };
-        if let Some(exit) = map.get_mut(&pid) {
-            *exit = Some(code);
-            cv.notify_all();
         }
     }
 }
 
-fn spawn(command: &mut Command, statuses: &Statuses, deliver_exit: bool) -> io::Result<Child> {
-    mem::contain(command);
+/// Spawns a child whose exit code `wait_pid` can collect.
+fn spawn(command: &mut Command, statuses: &Statuses) -> io::Result<Child> {
     let (lock, cv) = &**statuses;
-    // Hold the lock through spawn and registration, even if the child exits immediately.
+    // Held through spawn and registration, even if the child exits at once.
     let mut map = lock.lock().unwrap();
     let child = command.spawn()?;
-    if deliver_exit {
-        map.insert(child.id() as i32, None);
-    }
+    map.insert(child.id() as i32, None);
     cv.notify_all();
     Ok(child)
 }
 
-fn wait_pid(statuses: &Statuses, pid: i32) -> i32 {
+/// Waits for `pid`'s exit code, until `deadline` if one is given.
+fn wait_pid(statuses: &Statuses, pid: i32, deadline: Option<Instant>) -> Option<i32> {
     let (lock, cv) = &**statuses;
     let mut map = lock.lock().unwrap();
     loop {
         if let Some(Some(code)) = map.get(&pid).copied() {
             map.remove(&pid);
-            return code;
+            return Some(code);
         }
-        map = cv.wait(map).unwrap();
+        map = match deadline.map(|d| d.saturating_duration_since(Instant::now())) {
+            None => cv.wait(map).unwrap(),
+            Some(left) if left.is_zero() => return None,
+            Some(left) => cv.wait_timeout(map, left).unwrap().0,
+        };
+    }
+}
+
+/// Hands a child's stdout and stderr to `deliver` (frame kind, bytes) as they
+/// come, from one thread, until both are closed.
+fn pump(stdout: Option<ChildStdout>, stderr: Option<ChildStderr>, mut deliver: impl FnMut(u8, &[u8])) {
+    let out = stdout.map(|s| (File::from(OwnedFd::from(s)), FRAME_STDOUT));
+    let mut streams: Vec<(File, u8)> = out.into_iter().chain(stderr.map(|s| (File::from(OwnedFd::from(s)), FRAME_STDERR))).collect();
+    let mut buf = [0; 16 * 1024];
+    while !streams.is_empty() {
+        let mut fds: Vec<_> = streams.iter().map(|(f, _)| libc::pollfd { fd: f.as_raw_fd(), events: libc::POLLIN, revents: 0 }).collect();
+        match os(unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) }) {
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return,
+            Ok(_) => {}
+        }
+        for i in (0..fds.len()).rev().filter(|&i| fds[i].revents != 0) {
+            match streams[i].0.read(&mut buf) {
+                Ok(0) => drop(streams.remove(i)),
+                Ok(n) => deliver(streams[i].1, &buf[..n]),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => drop(streams.remove(i)),
+            }
+        }
     }
 }
 
 /// Delay consecutive accept failures without spinning under resource pressure.
 fn accept_delay(backoff: &mut Duration) -> Duration {
-    *backoff = if backoff.is_zero() {
-        Duration::from_millis(10)
-    } else {
-        (*backoff * 2).min(Duration::from_secs(1))
-    };
+    *backoff = if backoff.is_zero() { Duration::from_millis(10) } else { (*backoff * 2).min(Duration::from_secs(1)) };
     *backoff
 }
 
-fn serve(statuses: Statuses) -> io::Result<()> {
-    let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+fn vsock_addr(cid: u32, port: u32) -> libc::sockaddr_vm {
     let mut addr: libc::sockaddr_vm = unsafe { std::mem::zeroed() };
-    addr.svm_family = libc::AF_VSOCK as _;
-    addr.svm_port = VSOCK_PORT;
-    addr.svm_cid = libc::VMADDR_CID_ANY;
-    let rc = unsafe {
-        libc::bind(fd.as_raw_fd(), (&addr as *const libc::sockaddr_vm).cast(), std::mem::size_of_val(&addr) as _)
-    };
-    if rc != 0 || unsafe { libc::listen(fd.as_raw_fd(), 64) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
+    (addr.svm_family, addr.svm_port, addr.svm_cid) = (libc::AF_VSOCK as _, port, cid);
+    addr
+}
+
+fn vsock_socket() -> io::Result<OwnedFd> {
+    Ok(unsafe { OwnedFd::from_raw_fd(os(libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0))?) })
+}
+
+fn serve(statuses: Statuses) -> io::Result<()> {
+    let fd = vsock_socket()?;
+    let addr = vsock_addr(libc::VMADDR_CID_ANY, proto::PORT);
+    os(unsafe { libc::bind(fd.as_raw_fd(), (&addr as *const libc::sockaddr_vm).cast(), std::mem::size_of_val(&addr) as _) })?;
+    os(unsafe { libc::listen(fd.as_raw_fd(), 64) })?;
     let sessions = session::Sessions::default();
-    {
-        let sessions = sessions.clone();
-        thread::spawn(move || loop {
-            thread::sleep(std::time::Duration::from_secs(60));
-            session::cleanup(&sessions);
-        });
-    }
+    let swept = sessions.clone();
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_secs(60));
+        session::cleanup(&swept);
+    });
     let mut backoff = Duration::ZERO;
     loop {
         let mut peer: libc::sockaddr_vm = unsafe { std::mem::zeroed() };
         let mut peer_len = std::mem::size_of_val(&peer) as libc::socklen_t;
-        let conn = unsafe { libc::accept4(fd.as_raw_fd(), (&mut peer as *mut libc::sockaddr_vm).cast(), &mut peer_len, libc::SOCK_CLOEXEC) };
-        if conn < 0 {
-            let e = io::Error::last_os_error();
+        let conn = match os(unsafe { libc::accept4(fd.as_raw_fd(), (&mut peer as *mut libc::sockaddr_vm).cast(), &mut peer_len, libc::SOCK_CLOEXEC) }) {
+            Ok(conn) => conn,
             // A client gone before accept, or a signal, says nothing about resources.
-            if !matches!(e.kind(), io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted) {
+            Err(e) if matches!(e.kind(), io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted) => continue,
+            Err(e) => {
                 if backoff.is_zero() {
-                    eprintln!("vsock accept failed: {e}; backing off");
+                    log(&format!("vsock accept failed: {e}; backing off"));
                 }
                 thread::sleep(accept_delay(&mut backoff));
+                continue;
             }
-            continue;
-        }
+        };
         backoff = Duration::ZERO;
-        let stream = unsafe { std::fs::File::from_raw_fd(conn as RawFd) };
+        let stream = unsafe { File::from_raw_fd(conn) };
         if !host_peer(&peer, peer_len) {
             continue;
         }
         // The host sends its request with the connection; don't let a silent one stall accepting.
-        receive_timeout(conn, Duration::from_secs(1));
+        sock_timeout(conn, libc::SO_RCVTIMEO, Duration::from_secs(1));
         let Ok(mut r) = stream.try_clone().map(BufReader::new) else { continue };
         let line = match request_line(&mut r) {
             Ok(line) => line,
             Err(e) => {
-                let _ = write_frame(&mut &stream, FRAME_MSG, format!("error: {e}").as_bytes());
+                let _ = fail(&stream, e);
                 continue;
             }
         };
-        // NET is on the critical path of every start, right after restore, when a new
-        // thread (stack, task, a wakeup on another vCPU) costs milliseconds. PING and
-        // NET are quick, so answer them here; only commands get a thread.
+        // START is on the critical path of every start, right after restore, when a
+        // new thread costs milliseconds; the quick requests are answered right here.
         if ["PING", "NET ", "START ", "CLOCK ", "FORKS"].iter().any(|v| line.starts_with(v)) {
-            let _ = handle(stream, None, &line, &statuses);
-        } else {
-            // A command's body follows the host's reply to the connect, a round
-            // trip later, which a guest still faulting in its memory after a
-            // restore or migration can stretch past a second. It is read off
-            // the accept loop, by a bounded number of readers, within
-            // BODY_TIMEOUT of now.
-            let body = match body_len(&line) {
-                None => None,
-                Some(Err(e)) => {
-                    let _ = write_frame(&mut &stream, FRAME_MSG, format!("error: {e}").as_bytes());
-                    continue;
-                }
-                Some(Ok(len)) => match BodyReader::admit() {
-                    Some(reader) => Some((len, reader, Instant::now() + BODY_TIMEOUT)),
-                    None => {
-                        let _ = write_frame(&mut &stream, FRAME_MSG, b"error: too many commands arriving at once; try again");
-                        continue;
-                    }
-                },
-            };
-            let statuses = statuses.clone();
-            let sessions = sessions.clone();
-            // Out of threads: drop this connection (closing it) rather than abort PID 1.
-            let _ = thread::Builder::new().spawn(move || {
-                let body = match body {
-                    None => None,
-                    Some((len, reader, at)) => {
-                        let body = read_body(&mut r, conn, len, at);
-                        drop(reader);
-                        match body {
-                            Ok(b) => Some(b),
-                            Err(e) => {
-                                let _ = write_frame(&mut &stream, FRAME_MSG, format!("error: {e}").as_bytes());
-                                return;
-                            }
-                        }
-                    }
-                };
-                // A blocked write is backpressure from a slow client; migration resets the socket.
-                if matches!(line.split_whitespace().next(), Some("SESSION" | "ATTACH" | "CLOSE")) {
-                    let body = body.unwrap_or_default();
-                    // Kept by the session, so that a later ATTACH can shut this one down.
-                    match stream.try_clone() {
-                        Ok(conn) => {
-                            let _ = session::handle(stream, body.as_slice(), Some(conn), &line, &sessions, &statuses);
-                        }
-                        Err(e) => {
-                            let _ = write_frame(&mut &stream, FRAME_MSG, format!("error: {e}").as_bytes());
-                        }
-                    }
-                } else {
-                    let _ = handle(stream, body, &line, &statuses);
-                }
-            });
+            let _ = handle(&stream, &line, &statuses);
+            continue;
         }
+        let (statuses, sessions) = (statuses.clone(), sessions.clone());
+        let at = Instant::now() + BODY_TIMEOUT;
+        // Out of threads: drop this connection (closing it) rather than abort PID 1.
+        let _ = thread::Builder::new().spawn(move || {
+            if !matches!(line.split_whitespace().next(), Some("SESSION" | "ATTACH" | "CLOSE")) {
+                return drop(handle(&stream, &line, &statuses));
+            }
+            // A session's command follows a round trip later (the host's reply to the
+            // connect), which a guest faulting in its memory can stretch past a second.
+            let body = match session::parse(&line) {
+                Ok(session::Request::Start { len, .. }) => match BodyReader::admit() {
+                    Some(_reader) => read_body(&mut r, conn, len, at),
+                    None => Err(io::Error::other("too many commands arriving at once; try again")),
+                },
+                _ => Ok(Vec::new()),
+            };
+            // Kept by the session, so that a later ATTACH can shut this one down.
+            let _ = match body.and_then(|body| Ok((body, stream.try_clone()?))) {
+                Ok((body, conn)) => session::handle(&stream, &body, Some(conn), &line, &sessions, &statuses),
+                Err(e) => fail(&stream, e),
+            };
+        });
     }
 }
 
-/// Sets how long each receive on `fd` may wait (at least 1 us: 0 means forever).
-fn receive_timeout(fd: RawFd, t: Duration) {
-    let timeout = libc::timeval { tv_sec: t.as_secs() as _, tv_usec: t.subsec_micros().max(u32::from(t.is_zero())) as _ };
-    let opt = (&timeout as *const libc::timeval).cast();
-    unsafe { libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVTIMEO, opt, std::mem::size_of_val(&timeout) as _) };
-}
-
-/// The length of the command body that follows request `line`, if its verb
-/// takes one.
-fn body_len(line: &str) -> Option<io::Result<usize>> {
-    let mut parts = line.split_whitespace();
-    let len = match parts.next()? {
-        "EXEC" | "SPAWN" => parts.next(),
-        "SESSION" => parts.nth(1),
-        _ => return None,
-    };
-    Some(len.and_then(|n| n.parse().ok()).filter(|&n| n <= MAX_BODY).ok_or_else(|| io::Error::other("bad command length")))
+/// Sets a socket's SO_RCVTIMEO or SO_SNDTIMEO (at least 1 us: 0 means forever).
+fn sock_timeout(fd: RawFd, opt: libc::c_int, t: Duration) {
+    let tv = libc::timeval { tv_sec: t.as_secs() as _, tv_usec: t.subsec_micros().max(u32::from(t.is_zero())) as _ };
+    unsafe { libc::setsockopt(fd, libc::SOL_SOCKET, opt, (&tv as *const libc::timeval).cast(), std::mem::size_of_val(&tv) as _) };
 }
 
 /// One of the `MAX_BODY_READERS` slots for a command body being read.
@@ -380,12 +313,9 @@ struct BodyReader;
 
 impl BodyReader {
     fn admit() -> Option<BodyReader> {
-        let n = BODY_READERS.fetch_add(1, Ordering::SeqCst);
-        if n >= MAX_BODY_READERS {
-            BODY_READERS.fetch_sub(1, Ordering::SeqCst);
-            return None;
-        }
-        Some(BodyReader)
+        // Counted from here: dropped when refused, it gives the slot back.
+        let slot = BodyReader;
+        (BODY_READERS.fetch_add(1, Ordering::SeqCst) < MAX_BODY_READERS).then_some(slot)
     }
 }
 
@@ -405,133 +335,58 @@ fn read_body(r: &mut impl Read, fd: RawFd, len: usize, at: Instant) -> io::Resul
         if left.is_zero() {
             return Err(io::Error::new(io::ErrorKind::TimedOut, "the command did not arrive in time"));
         }
-        receive_timeout(fd, left);
+        sock_timeout(fd, libc::SO_RCVTIMEO, left);
         let want = (len - body.len()).min(buf.len());
         match r.read(&mut buf[..want]) {
             Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
             Ok(n) => body.extend_from_slice(&buf[..n]),
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            Err(e) if matches!(e.kind(), io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock) => {}
             Err(e) => return Err(e),
         }
     }
     Ok(body)
 }
 
-fn frame(w: &Mutex<std::fs::File>, kind: u8, payload: &[u8]) -> io::Result<()> {
-    write_frame(&mut *w.lock().unwrap(), kind, payload)
-}
-
-fn write_frame(w: &mut impl Write, kind: u8, payload: &[u8]) -> io::Result<()> {
-    let mut hdr = [0u8; 5];
-    hdr[0] = kind;
-    hdr[1..].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-    w.write_all(&hdr)?;
+fn write_frame(mut w: impl Write, kind: u8, payload: &[u8]) -> io::Result<()> {
+    w.write_all(&[&[kind][..], &(payload.len() as u32).to_le_bytes()].concat())?;
     w.write_all(payload)
 }
 
-/// Serves one request; `line` is its first line, and `body` the command
-/// that follows it for EXEC and SPAWN.
-fn handle(stream: std::fs::File, body: Option<Vec<u8>>, line: &str, statuses: &Statuses) -> io::Result<()> {
+fn msg(w: impl Write, m: impl AsRef<[u8]>) -> io::Result<()> {
+    write_frame(w, FRAME_MSG, m.as_ref())
+}
+
+fn fail(w: impl Write, e: impl std::fmt::Display) -> io::Result<()> {
+    msg(w, format!("error: {e}"))
+}
+
+/// Serves one request other than the session ones; `line` is all of it.
+fn handle(out: &File, line: &str, statuses: &Statuses) -> io::Result<()> {
     let line = line.trim_end();
-    let out = Arc::new(Mutex::new(stream));
     let (verb, arg) = line.split_once(' ').unwrap_or((line, ""));
-    // Commands may span lines, so they come as `<verb> <len>` plus raw bytes.
-    let text;
-    let (verb, arg) = match verb {
-        "EXEC" | "SPAWN" => {
-            text = String::from_utf8_lossy(body.as_deref().unwrap_or_default()).into_owned();
-            (verb, text.as_str())
-        }
-        _ => (verb, arg),
+    let mut parts = arg.split_whitespace();
+    let reply = match verb {
+        "PING" => Ok("pong".to_string()),
+        "NET" => match parts.next().map(|ip| ip.parse()) {
+            Some(Ok(ip)) => net::configure(ip, parts.next()).map(|()| "ok".into()).map_err(|e| e.to_string()),
+            _ => Err(format!("bad address {arg:?}")),
+        },
+        // Acked only once the clock is set, so "ok" means it is.
+        "START" => match (parts.next().map(|ip| ip.parse()), parts.next().and_then(parse_time)) {
+            (Some(Ok(ip)), Some(now)) => {
+                net::configure(ip, parts.next()).map_err(|e| e.to_string()).and_then(|()| set_clock(now)).map(|_| "ok".into())
+            }
+            _ => Err(format!("bad start request {arg:?}")),
+        },
+        // Answers how far off the clock was (ns, guest minus host).
+        "CLOCK" => parse_time(arg.trim()).ok_or_else(|| format!("bad time {arg:?}")).and_then(set_clock).map(|off| format!("ok {off}")),
+        "FORKS" => forks().map(|n| format!("ok {n}")).map_err(|e| e.to_string()),
+        v if app::VERBS.contains(&v) => return app::handle(v, arg, out, statuses),
+        _ => return msg(out, format!("unknown request {verb:?}")),
     };
-    match verb {
-        "PING" => frame(&out, FRAME_MSG, b"pong"),
-        // NET <ipv4> [nameserver]
-        "NET" => {
-            let mut parts = arg.split_whitespace();
-            let res = match parts.next().map(|ip| ip.parse()) {
-                Some(Ok(ip)) => net::configure(ip, parts.next()).map_err(|e| e.to_string()),
-                _ => Err(format!("bad address {arg:?}")),
-            };
-            match res {
-                Ok(()) => frame(&out, FRAME_MSG, b"ok"),
-                Err(e) => frame(&out, FRAME_MSG, format!("error: {e}").as_bytes()),
-            }
-        }
-        // START <ipv4> <unix time secs.nanos> [nameserver]: NET for a VM that was just
-        // restored or resumed, plus the host's wall clock. The guest clock otherwise
-        // carries on from the moment the template was snapshotted.
-        "START" => {
-            let mut parts = arg.split_whitespace();
-            let (ip, now, dns) = (parts.next(), parts.next(), parts.next());
-            let res = match (ip.map(|ip| ip.parse()), now.and_then(parse_time)) {
-                (Some(Ok(ip)), Some(now)) => net::configure(ip, dns).map_err(|e| e.to_string()).map(|()| now),
-                _ => Err(format!("bad start request {arg:?}")),
-            };
-            // Acked only once the clock is set, so "ok" means it is.
-            match res.and_then(set_clock) {
-                Ok(_) => frame(&out, FRAME_MSG, b"ok"),
-                Err(e) => frame(&out, FRAME_MSG, format!("error: {e}").as_bytes()),
-            }
-        }
-        // CLOCK <unix time secs.nanos>: the host's wall clock, after a VM resumed
-        // from a pause or arrived by migration (which costs it the downtime).
-        // Answers `ok <ns>`: how far off the clock was (guest minus host).
-        "CLOCK" => match parse_time(arg.trim()).ok_or_else(|| format!("bad time {arg:?}")).and_then(set_clock) {
-            Ok(off) => frame(&out, FRAME_MSG, format!("ok {off}").as_bytes()),
-            Err(e) => frame(&out, FRAME_MSG, format!("error: {e}").as_bytes()),
-        },
-        // FORKS: how many times the kernel has reseeded its RNG for a new
-        // VMGenID, i.e. how many snapshot restores this guest has finished
-        // processing. See `forks`.
-        "FORKS" => match forks() {
-            Ok(n) => frame(&out, FRAME_MSG, format!("ok {n}").as_bytes()),
-            Err(e) => frame(&out, FRAME_MSG, format!("error: {e}").as_bytes()),
-        },
-        "SPAWN" => {
-            let child = spawn(
-                Command::new("/bin/sh")
-                    .args(["-c", arg])
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .process_group(0),
-                statuses, false,
-            )?;
-            frame(&out, FRAME_MSG, child.id().to_string().as_bytes())
-        }
-        "EXEC" => {
-            let spawned = spawn(
-                Command::new("/bin/sh")
-                    .args(["-c", arg])
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped()),
-                statuses, true,
-            );
-            // Minimal images (distroless, scratch) have no shell.
-            let mut child = match spawned {
-                Ok(c) => c,
-                Err(e) => {
-                    let msg = format!("flexvm-init: cannot run /bin/sh: {e} (does the image have a shell?)\n");
-                    frame(&out, FRAME_STDERR, msg.as_bytes())?;
-                    return frame(&out, FRAME_EXIT, &127i32.to_le_bytes());
-                }
-            };
-            let pid = child.id() as i32;
-            let pumps = [
-                pump(child.stdout.take().unwrap(), out.clone(), FRAME_STDOUT),
-                pump(child.stderr.take().unwrap(), out.clone(), FRAME_STDERR),
-            ];
-            for p in pumps {
-                let _ = p.join();
-            }
-            let code = wait_pid(statuses, pid);
-            frame(&out, FRAME_EXIT, &code.to_le_bytes())
-        }
-        v if app::VERBS.contains(&v) => app::handle(v, arg, &out, statuses),
-        _ => frame(&out, FRAME_MSG, format!("unknown request {verb:?}").as_bytes()),
+    match reply {
+        Ok(m) => msg(out, m),
+        Err(e) => fail(out, e),
     }
 }
 
@@ -543,76 +398,41 @@ fn parse_time(s: &str) -> Option<libc::timespec> {
 }
 
 /// Steps CLOCK_REALTIME to `now` unless it is already within a few ms (the
-/// request's own transit time), which leaves a clock that is right alone.
-/// (The host makes sure no clock request is still in flight when it
-/// snapshots the VM; see `Vm::start_source`.)
-/// Returns how far off the clock was (ns, guest minus `now`).
+/// request's own transit time). Returns how far off it was (ns, guest minus `now`).
 fn set_clock(now: libc::timespec) -> Result<i128, String> {
     let ns = |t: &libc::timespec| t.tv_sec as i128 * 1_000_000_000 + t.tv_nsec as i128;
     let mut cur = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut cur) };
     let off = ns(&cur) - ns(&now);
-    if off.abs() < 5_000_000 {
-        return Ok(off);
-    }
-    if unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &now) } != 0 {
+    if off.abs() >= 5_000_000 && unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &now) } != 0 {
         return Err(format!("set clock: {}", io::Error::last_os_error()));
     }
     Ok(off)
 }
 
-/// Counts "crng reseeded due to virtual machine fork" in the kernel log.
-/// The kernel prints it in add_vmfork_randomness() right after crng_reseed()
-/// for a new VMGenID, so once the count has gone up since a snapshot was
-/// taken, everything that reads the RNG from then on gets fresh state. (This
-/// kernel's vmgenid sends no uevent, and /dev/sysgenid's counter is not
-/// ordered against the reseed.) Reads the whole ring buffer, so it needs no
-/// state from before the snapshot.
+/// Counts the kernel's "crng reseeded due to virtual machine fork" messages,
+/// printed right after it reseeds for a new VMGenID: once the count has gone up
+/// since a snapshot, the RNG has fresh state. (vmgenid sends no uevent, and
+/// /dev/sysgenid is not ordered against the reseed.) Reads the whole ring
+/// buffer, so it needs no state from before the snapshot.
 fn forks() -> io::Result<usize> {
-    let fd = unsafe { libc::open(c"/dev/kmsg".as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    let mut buf = vec![0u8; 8192];
-    let mut n = 0;
+    const FORK_MSG: &[u8] = b"crng reseeded due to virtual machine fork";
+    let mut kmsg = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open("/dev/kmsg")?;
+    let (mut buf, mut n) = (vec![0u8; 8192], 0);
     loop {
-        let r = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
-        if r < 0 {
-            match io::Error::last_os_error().raw_os_error() {
-                // Records overwritten while reading; carry on with the next.
-                Some(libc::EPIPE) => continue,
-                Some(libc::EAGAIN) => return Ok(n),
-                _ => return Err(io::Error::last_os_error()),
-            }
-        }
-        if r == 0 {
-            return Ok(n);
-        }
-        let record = &buf[..r as usize];
-        if record.windows(FORK_MSG.len()).any(|w| w == FORK_MSG) {
-            n += 1;
+        match kmsg.read(&mut buf) {
+            Ok(0) => return Ok(n),
+            Ok(r) => n += buf[..r].windows(FORK_MSG.len()).any(|w| w == FORK_MSG) as usize,
+            // Records overwritten while reading; carry on with the next.
+            Err(e) if e.raw_os_error() == Some(libc::EPIPE) => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(n),
+            Err(e) => return Err(e),
         }
     }
-}
-
-const FORK_MSG: &[u8] = b"crng reseeded due to virtual machine fork";
-
-fn pump(mut r: impl Read + Send + 'static, out: Arc<Mutex<std::fs::File>>, kind: u8) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        let mut buf = [0u8; 16 * 1024];
-        while let Ok(n) = r.read(&mut buf) {
-            if n == 0 || frame(&out, kind, &buf[..n]).is_err() {
-                break;
-            }
-        }
-    })
 }
 
 fn host_peer(peer: &libc::sockaddr_vm, len: libc::socklen_t) -> bool {
-    len as usize == std::mem::size_of_val(peer)
-        && peer.svm_family == libc::AF_VSOCK as libc::sa_family_t
-        && peer.svm_cid == libc::VMADDR_CID_HOST
+    len as usize == std::mem::size_of_val(peer) && peer.svm_family == libc::AF_VSOCK as libc::sa_family_t && peer.svm_cid == libc::VMADDR_CID_HOST
 }
 
 fn request_line(r: &mut impl BufRead) -> io::Result<String> {
@@ -667,36 +487,17 @@ mod tests {
     }
 
     #[test]
-    fn body_lengths() {
-        assert_eq!(body_len("EXEC 12\n").unwrap().unwrap(), 12);
-        assert_eq!(body_len("SESSION abc 3\n").unwrap().unwrap(), 3);
-        assert!(body_len("SESSION abc 1048577\n").unwrap().is_err());
-        assert!(body_len("SPAWN x\n").unwrap().is_err());
-        assert!(body_len("ATTACH abc 0\n").is_none());
-        assert!(body_len("PING\n").is_none());
-    }
-
-    #[test]
-    fn bodies_end_by_their_deadline() {
+    fn bodies_end_by_their_deadline_and_readers_are_capped() {
         let at = Instant::now() + Duration::from_secs(5);
         assert_eq!(read_body(&mut &b"echo hi"[..], -1, 7, at).unwrap(), b"echo hi");
         assert_eq!(read_body(&mut &b"echo"[..], -1, 7, at).unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
         let past = Instant::now() - Duration::from_millis(1);
         assert_eq!(read_body(&mut &b"echo hi"[..], -1, 7, past).unwrap_err().kind(), io::ErrorKind::TimedOut);
-    }
-
-    #[test]
-    fn body_readers_are_capped() {
         let readers: Vec<_> = std::iter::from_fn(BodyReader::admit).take(MAX_BODY_READERS + 1).collect();
         assert_eq!(readers.len(), MAX_BODY_READERS);
         drop(readers);
         assert!(BodyReader::admit().is_some());
     }
-}
-
-#[cfg(test)]
-mod request_tests {
-    use super::*;
 
     #[test]
     fn lines_are_bounded_and_large_checks_fit() {
@@ -713,14 +514,20 @@ mod request_tests {
 
     #[test]
     fn only_host_cid_is_allowed() {
-        let mut peer: libc::sockaddr_vm = unsafe { std::mem::zeroed() };
-        peer.svm_family = libc::AF_VSOCK as _;
-        peer.svm_cid = libc::VMADDR_CID_HOST;
+        let mut peer = vsock_addr(libc::VMADDR_CID_HOST, 0);
         let len = std::mem::size_of_val(&peer) as _;
         assert!(host_peer(&peer, len));
+        assert!(!host_peer(&peer, 0));
         peer.svm_cid = 3;
         assert!(!host_peer(&peer, len));
-        peer.svm_cid = libc::VMADDR_CID_HOST;
-        assert!(!host_peer(&peer, 0));
+    }
+
+    #[test]
+    fn times_parse_strictly() {
+        let t = parse_time("12.000000005").unwrap();
+        assert_eq!((t.tv_sec, t.tv_nsec), (12, 5));
+        for bad in ["12", "12.5", "12.1000000000", "x.000000000", "12.-00000001"] {
+            assert!(parse_time(bad).is_none(), "{bad}");
+        }
     }
 }

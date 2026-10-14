@@ -492,9 +492,7 @@ pub fn exec(host: &Host, name: &str, cmd: &str) -> Result<i32> {
 }
 
 fn exec_session(host: &Host, name: &str, cmd: &str, stdout: &mut impl Write, stderr: &mut impl Write) -> Result<i32> {
-    let mut random = [0u8; 16];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
-    let id: String = random.iter().map(|b| format!("{b:02x}")).collect();
+    let id = guest::session_id()?;
     let (mut offset, mut started) = (0, false);
     let mut deadline = Instant::now() + Duration::from_secs(30);
     let mut error = String::new();

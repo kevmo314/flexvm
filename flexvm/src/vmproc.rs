@@ -586,9 +586,14 @@ impl Proc {
         let mut w = &c;
         let vm = self.vm();
         let cmd = req["cmd"].as_str().unwrap_or("");
+        // Without a session id, a one-shot session answered with plain frames.
+        let mut once = None;
         let started = vm.exec(|s| match req["session"].as_str() {
             Some(id) => guest::session(s, req["action"].as_str().unwrap_or("start"), id, req["offset"].as_u64().unwrap_or(0), cmd, guest::TIMEOUT),
-            None => guest::start_exec(s, cmd, guest::TIMEOUT),
+            None => guest::start_exec(s, cmd, guest::TIMEOUT).map(|(g, id)| {
+                once = Some(id);
+                g
+            }),
         });
         let (mut g, id) = match started {
             Ok(g) => g,
@@ -608,6 +613,11 @@ impl Proc {
                 g.get_ref().set_read_timeout(Some(Duration::from_secs(3)))?;
             }
             send_json(&mut w, &json!({"ok": true}))?;
+            if let Some(id) = &once {
+                let code = guest::exec_output(&mut g, id, |kind, data| Ok(guest::write_frame(&mut w, kind, data)?))?;
+                guest::write_frame(&mut w, guest::FRAME_EXIT, &code.to_le_bytes())?;
+                return guest::close(&vm.vsock(), id, Instant::now() + guest::TIMEOUT);
+            }
             std::io::copy(&mut g, &mut w)?;
             Ok(())
         })();
@@ -922,12 +932,6 @@ pub fn host_available_mib() -> u64 {
     proc_kb("/proc/meminfo", "MemAvailable").unwrap_or(0) >> 20
 }
 
-/// Free memory (MiB) kept plugged for a guest of `total` MiB; the guest asks
-/// for more below it (guest/src/mem.rs uses the same mark).
-pub fn headroom(total: u64) -> u64 {
-    (total / 4).max(1024.min(total / 2))
-}
-
 /// What a resize did, answered to the guest when it asked.
 #[derive(Debug, PartialEq)]
 pub enum Resized {
@@ -968,7 +972,7 @@ fn resize(vm: &Vm, host: &Host, hint: Option<u64>, grow_only: bool) -> Result<Re
         None => stats["available_memory"].as_u64().unwrap_or(0) >> 20,
     }
     .min(total);
-    let (floor, headroom) = (meta.plugged_mib.min(hotplug_total), headroom(total));
+    let (floor, headroom) = (meta.plugged_mib.min(hotplug_total), guest::headroom(total));
     let round = |mib: u64| mib.div_ceil(STEP_MIB) * STEP_MIB;
     // Balloon statistics lag a plug by up to a second.
     let stale = hint.is_none() && last.elapsed() < Duration::from_millis(1500);

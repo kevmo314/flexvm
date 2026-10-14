@@ -1,28 +1,20 @@
-//! Elastic memory, guest side.
+//! Elastic memory, guest side. The host plugs virtio-mem memory ahead of
+//! demand but samples the guest only once a second; this keeps an allocation
+//! burst from reaching the OOM killer in between:
 //!
-//! The host plugs virtio-mem memory ahead of demand, but it only samples the
-//! guest once a second. This keeps a fast allocation burst from reaching the
-//! OOM killer in between:
-//!
-//! - Overcommit is always allowed, so one allocation bigger than the memory
-//!   plugged so far succeeds; the host plugs more as it is touched.
-//! - Everything flexvm-init starts runs under one memory cgroup (`/vm`) whose
-//!   `memory.high` sits `headroom(MemTotal)` below MemTotal, the same mark the
-//!   host keeps free: commands and the app in `/vm/work`, readiness checks in
-//!   their own groups under `/vm`. flexvm-init itself stays outside, so the
-//!   throttle never slows the thread that has to lift it.
-//! - Crossing the mark wakes this thread at once (a `memory.events`
-//!   notification, no polling), which asks the host for memory over vsock.
-//!   Allocations that outrun the plug are throttled by the kernel instead of
-//!   OOM-killed.
-//! - Plugs and unplugs move the mark (memory block uevents, subscribed to
-//!   before the first read of MemTotal). If the host cannot grow the VM, or
-//!   nothing arrives within `GIVE_UP`, the throttle is lifted so the guest
-//!   behaves as it would without it.
+//! - Overcommit is always allowed; the host plugs more as memory is touched.
+//! - Everything flexvm-init starts runs under `/vm`, whose `memory.high` sits
+//!   `headroom(MemTotal)` below MemTotal (the mark the host keeps free).
+//!   flexvm-init itself stays outside, so the throttle never slows the thread
+//!   that has to lift it.
+//! - Crossing the mark wakes the watcher (`memory.events`), which asks the host
+//!   for memory; allocations that outrun the plug are throttled meanwhile.
+//! - Plugs and unplugs (memory block uevents) move the mark. If the host cannot
+//!   grow the VM, or nothing arrives within `GIVE_UP`, the throttle is lifted.
 
 use std::ffi::CString;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::FileExt;
 use std::os::unix::process::CommandExt;
@@ -32,11 +24,11 @@ use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// Host (CID 2) port for memory requests; the host listens on `<vsock uds>_53`.
-const HOST_PORT: u32 = 53;
-const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+use crate::os;
+
+pub const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 /// The throttled parent: its `memory.high` is the mark.
-const CGROUP: &str = "/sys/fs/cgroup/vm";
+pub const CGROUP: &str = "/sys/fs/cgroup/vm";
 const WORK: &str = "/sys/fs/cgroup/vm/work";
 /// Lift the throttle when no memory has arrived this long after asking.
 const GIVE_UP: Duration = Duration::from_secs(3);
@@ -46,14 +38,7 @@ const RETRY: Duration = Duration::from_millis(250);
 /// `<WORK>/cgroup.procs`, once the cgroups are set up.
 static WORK_PROCS: OnceLock<CString> = OnceLock::new();
 
-/// Free memory (MiB) the host keeps plugged for a guest with `total` MiB.
-/// Must match `headroom` in flexvm/src/daemon.rs.
-fn headroom(total: u64) -> u64 {
-    (total / 4).max(1024.min(total / 2))
-}
-
-/// Sets up the cgroups and the watcher. Returns once the watcher is
-/// subscribed to memory changes, so none can be missed after readiness.
+/// Sets up the cgroups and the watcher, subscribed to memory changes before it returns.
 pub fn start() {
     let _ = std::fs::write("/proc/sys/vm/overcommit_memory", "1");
     match setup() {
@@ -65,54 +50,32 @@ pub fn start() {
     }
 }
 
-/// `cgroup.procs` of the throttled group for workloads, for a child to move
-/// itself into before exec (and before dropping privileges).
+/// `cgroup.procs` of the throttled group for workloads.
 pub fn work_procs() -> Option<CString> {
     WORK_PROCS.get().cloned()
 }
 
-/// Where other groups that should share the mark go (readiness checks).
-pub fn parent() -> Option<&'static str> {
-    WORK_PROCS.get().map(|_| CGROUP)
-}
-
-/// Puts `cmd`'s child into the throttled group before exec, unless an
-/// earlier `pre_exec` already moved it out of the root cgroup.
-pub fn contain(cmd: &mut Command) {
-    let Some(procs) = work_procs() else { return };
+/// Moves `cmd`'s child into the group whose `cgroup.procs` is `procs` before
+/// exec (register it before dropping privileges). Fails the spawn only if `required`.
+pub fn enter(cmd: &mut Command, procs: CString, required: bool) {
     unsafe {
         cmd.pre_exec(move || {
-            // Raw syscalls only, after fork. Failing to move must not fail the spawn.
-            let mut buf = [0u8; 16];
-            let fd = libc::open(c"/proc/self/cgroup".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
-            if fd < 0 {
-                return Ok(());
+            // "0" moves the writing process; only raw syscalls after fork.
+            let fd = libc::open(procs.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+            let moved = fd >= 0 && libc::write(fd, b"0".as_ptr().cast(), 1) == 1;
+            if fd >= 0 {
+                libc::close(fd);
             }
-            let n = libc::read(fd, buf.as_mut_ptr().cast(), buf.len());
-            libc::close(fd);
-            if n == 5 && &buf[..5] == b"0::/\n" {
-                let fd = libc::open(procs.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
-                if fd >= 0 {
-                    libc::write(fd, b"0".as_ptr().cast(), 1);
-                    libc::close(fd);
-                }
-            }
-            Ok(())
+            if moved || !required { Ok(()) } else { Err(io::Error::last_os_error()) }
         });
     }
 }
 
-/// Creates the groups and subscribes to memory block uevents, then sets the
-/// mark from MemTotal (in that order: a plug in between still gets an event).
-/// Returns `/vm/memory.events`, which the kernel flags when the mark is crossed.
+/// Subscribes to memory block uevents before reading MemTotal for the mark, so
+/// a plug in between still gets an event. Returns `/vm/memory.events`.
 fn setup() -> io::Result<(File, OwnedFd, High)> {
     std::fs::create_dir_all(CGROUP_ROOT)?;
-    let rc = unsafe {
-        libc::mount(c"cgroup2".as_ptr(), c"/sys/fs/cgroup".as_ptr(), c"cgroup2".as_ptr(), 0, std::ptr::null())
-    };
-    if rc != 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EBUSY) {
-        return Err(io::Error::last_os_error());
-    }
+    crate::mount("cgroup2", CGROUP_ROOT, "cgroup2", 0, "")?;
     std::fs::write(format!("{CGROUP_ROOT}/cgroup.subtree_control"), "+memory")?;
     std::fs::create_dir_all(WORK)?;
     let uev = uevents()?;
@@ -124,24 +87,14 @@ fn setup() -> io::Result<(File, OwnedFd, High)> {
 
 /// (MemTotal, MemAvailable) in KiB.
 fn meminfo() -> (u64, u64) {
-    let (mut total, mut avail) = (0, 0);
-    if let Ok(f) = File::open("/proc/meminfo") {
-        for line in BufReader::new(f).lines().map_while(|l| l.ok()) {
-            let kib = || line.split_whitespace().nth(1).and_then(|v| v.parse().ok()).unwrap_or(0);
-            if line.starts_with("MemTotal:") {
-                total = kib();
-            } else if line.starts_with("MemAvailable:") {
-                avail = kib();
-                break;
-            }
-        }
-    }
-    (total, avail)
+    let text = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+    let kib = |key| text.lines().find_map(|l| l.strip_prefix(key)?.split_whitespace().next()?.parse().ok()).unwrap_or(0);
+    (kib("MemTotal:"), kib("MemAvailable:"))
 }
 
 fn high_limit(total_kib: u64) -> u64 {
     let total = total_kib >> 10;
-    (total - headroom(total)) << 20
+    (total - crate::proto::headroom(total)) << 20
 }
 
 /// Writes `value` (None: max) unless it is installed already or, with
@@ -149,18 +102,16 @@ fn high_limit(total_kib: u64) -> u64 {
 /// independent of a worker blocked in reclaim.
 fn write_high(value: Option<u64>, raise_only: bool) -> io::Result<()> {
     let path = format!("{CGROUP}/memory.high");
-    let installed = std::fs::read_to_string(&path)?.trim().parse().unwrap_or(u64::MAX);
-    let value = value.unwrap_or(u64::MAX);
-    if value != installed && !(raise_only && value < installed) {
-        std::fs::write(path, if value == u64::MAX { "max".to_string() } else { value.to_string() })?;
+    let value = value.map_or_else(|| "max".to_string(), |n| n.to_string());
+    // A concurrent lift may have installed it already.
+    if std::fs::read_to_string(&path)?.trim() != value {
+        std::fs::write(path, value)?;
     }
     Ok(())
 }
 
-type WriteHigh = dyn Fn(Option<u64>, bool) -> io::Result<()> + Send + Sync;
-
-/// Lowering the mark can reclaim synchronously on Linux 6.1. Keep that off the
-/// watcher, coalesce pending changes, and let raises and lifts bypass the worker.
+/// Numeric writes can reclaim synchronously (Linux 6.1), so a worker makes
+/// them, coalesced; lifts bypass it.
 struct High {
     total_kib: u64,
     desired: Arc<Mutex<Option<u64>>>,
@@ -170,17 +121,12 @@ struct High {
 }
 
 impl High {
-    fn new(total_kib: u64, write: impl Fn(Option<u64>, bool) -> io::Result<()> + Send + Sync + 'static) -> Self {
-        let desired = Arc::new(Mutex::new(Some(high_limit(total_kib))));
-        let write = Arc::new(write);
+    fn new(total_kib: u64, write: impl Fn(Option<u64>) -> io::Result<()> + Send + Sync + 'static) -> Self {
+        let (desired, pending, write) = (Arc::new(Mutex::new(Some(high_limit(total_kib)))), Arc::new(AtomicUsize::new(0)), Arc::new(write));
+        let (latest, outstanding, writer) = (desired.clone(), pending.clone(), write.clone());
         let (changed, changes) = mpsc::channel();
-        let latest = Arc::clone(&desired);
-        let pending = Arc::new(AtomicUsize::new(0));
-        let outstanding = Arc::clone(&pending);
-        let writer = Arc::clone(&write);
         thread::spawn(move || {
             while changes.recv().is_ok() {
-                // Notifications carry no stale limits: always use the newest.
                 let count = 1 + changes.try_iter().count();
                 let value = *latest.lock().unwrap();
                 if let Err(e) = writer(value, false) {
@@ -193,12 +139,8 @@ impl High {
     }
 
     fn set_total(&mut self, total_kib: u64) {
-        if self.total_kib == total_kib {
-            return;
-        }
-        let old = high_limit(self.total_kib);
+        let (old, value) = (high_limit(self.total_kib), high_limit(total_kib));
         self.total_kib = total_kib;
-        let value = high_limit(total_kib);
         if old != value {
             *self.desired.lock().unwrap() = Some(value);
             self.relieve();
@@ -230,7 +172,7 @@ impl High {
         let changed = self.desired.lock().unwrap().take().is_some();
         self.relieve();
         if changed {
-            // Supersede queued numeric updates, and reconcile an in-flight write.
+            // Supersedes queued numeric updates and reconciles an in-flight one.
             self.notify();
         }
     }
@@ -240,30 +182,16 @@ impl High {
 fn high_events(f: &File) -> u64 {
     let mut buf = [0u8; 256];
     let n = f.read_at(&mut buf, 0).unwrap_or(0);
-    String::from_utf8_lossy(&buf[..n])
-        .lines()
-        .find_map(|l| l.strip_prefix("high ").and_then(|v| v.trim().parse().ok()))
-        .unwrap_or(0)
+    String::from_utf8_lossy(&buf[..n]).lines().find_map(|l| l.strip_prefix("high ")?.trim().parse().ok()).unwrap_or(0)
 }
 
 /// A socket that receives the kernel's device uevents.
 fn uevents() -> io::Result<OwnedFd> {
-    let fd = unsafe {
-        libc::socket(libc::AF_NETLINK, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK, libc::NETLINK_KOBJECT_UEVENT)
-    };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let flags = libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK;
+    let fd = unsafe { OwnedFd::from_raw_fd(os(libc::socket(libc::AF_NETLINK, flags, libc::NETLINK_KOBJECT_UEVENT))?) };
     let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
-    addr.nl_family = libc::AF_NETLINK as _;
-    addr.nl_groups = 1;
-    let rc = unsafe {
-        libc::bind(fd.as_raw_fd(), (&addr as *const libc::sockaddr_nl).cast(), std::mem::size_of_val(&addr) as _)
-    };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
+    (addr.nl_family, addr.nl_groups) = (libc::AF_NETLINK as _, 1);
+    os(unsafe { libc::bind(fd.as_raw_fd(), (&addr as *const libc::sockaddr_nl).cast(), std::mem::size_of_val(&addr) as _) })?;
     Ok(fd)
 }
 
@@ -294,8 +222,7 @@ fn watch(events: File, uev: OwnedFd, mut limit: High) {
         if unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout) } < 0 {
             continue;
         }
-        // A lowering write can start just after a raise or lift, then reclaim.
-        // Repair that race without waiting for the worker to return.
+        // A numeric write that started just after a lift may be blocked in reclaim.
         if limit.busy() {
             limit.relieve();
         }
@@ -333,33 +260,21 @@ fn watch(events: File, uev: OwnedFd, mut limit: High) {
 enum Reply {
     /// The host is plugging more (or could not be reached; retry).
     Asked,
-    /// The host sees enough free memory; the mark was crossed by reclaimable memory.
+    /// The host sees enough free memory (the mark was crossed by reclaimable memory).
     Enough,
     /// The host cannot grow this VM.
     Full,
 }
 
-/// Tells the host how much memory is left: `MEM <available KiB> <total KiB>`.
-/// It answers `grow`, `busy` (a plug is in flight), `ok` or `full`.
+/// Sends `MEM <available KiB> <total KiB>`; the host answers `grow`, `busy`
+/// (a plug is in flight), `ok` or `full`.
 fn ask() -> Reply {
     let (total, avail) = meminfo();
     let reply = (|| -> io::Result<String> {
-        let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let mut s = unsafe { std::fs::File::from_raw_fd(fd) };
-        let mut addr: libc::sockaddr_vm = unsafe { std::mem::zeroed() };
-        addr.svm_family = libc::AF_VSOCK as _;
-        addr.svm_port = HOST_PORT;
-        addr.svm_cid = libc::VMADDR_CID_HOST;
-        let timeout = libc::timeval { tv_sec: 2, tv_usec: 0 };
-        let opt = (&timeout as *const libc::timeval).cast();
-        unsafe { libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVTIMEO, opt, std::mem::size_of_val(&timeout) as _) };
-        let rc = unsafe { libc::connect(fd, (&addr as *const libc::sockaddr_vm).cast(), std::mem::size_of_val(&addr) as _) };
-        if rc != 0 {
-            return Err(io::Error::last_os_error());
-        }
+        let mut s = File::from(crate::vsock_socket()?);
+        let addr = crate::vsock_addr(libc::VMADDR_CID_HOST, crate::proto::MEM_PORT);
+        crate::sock_timeout(s.as_raw_fd(), libc::SO_RCVTIMEO, Duration::from_secs(2));
+        os(unsafe { libc::connect(s.as_raw_fd(), (&addr as *const libc::sockaddr_vm).cast(), std::mem::size_of_val(&addr) as _) })?;
         s.write_all(format!("MEM {avail} {total}\n").as_bytes())?;
         let mut buf = [0u8; 64];
         let n = s.read(&mut buf)?;
@@ -376,113 +291,67 @@ fn ask() -> Reply {
 mod tests {
     use super::*;
 
-    /// A memory.high that honors `raise_only`; `on_write` installs the value.
-    fn kernel(
-        installed: &Arc<Mutex<Option<u64>>>, on_write: impl Fn(Option<u64>) + Send + Sync + 'static,
-    ) -> impl Fn(Option<u64>, bool) -> io::Result<()> + Send + Sync + 'static {
-        let installed = Arc::clone(installed);
-        move |value, raise_only| {
-            let current = *installed.lock().unwrap();
-            if value != current && !(raise_only && value.unwrap_or(u64::MAX) < current.unwrap_or(u64::MAX)) {
-                on_write(value);
+    type Writes = mpsc::Receiver<(&'static str, Option<u64>)>;
+
+    /// A `High` for 4 GiB whose writes are reported, numeric ones pausing (until
+    /// resumed) before the limit is installed and again "in reclaim".
+    fn high() -> (High, Writes, mpsc::Sender<()>, Arc<Mutex<Option<u64>>>) {
+        let (sent, writes) = mpsc::channel();
+        let (resume, blocked) = mpsc::channel::<()>();
+        let blocked = Mutex::new(blocked);
+        let installed = Arc::new(Mutex::new(Some(high_limit(4096 << 10))));
+        let current = Arc::clone(&installed);
+        let high = High::new(4096 << 10, move |value| {
+            if value.is_some() {
+                let _ = sent.send(("starting", value));
+                let _ = blocked.lock().unwrap().recv();
+                *current.lock().unwrap() = value;
+                let _ = sent.send(("reclaiming", value));
+                let _ = blocked.lock().unwrap().recv();
+            } else {
+                *current.lock().unwrap() = None;
+                let _ = sent.send(("lifted", None));
             }
             Ok(())
-        }
+        });
+        (high, writes, resume, installed)
     }
 
-    fn settle(high: &High) {
-        let end = Instant::now() + Duration::from_secs(1);
-        while high.busy() {
-            assert!(Instant::now() < end);
-            thread::sleep(Duration::from_millis(1));
-        }
+    fn next(writes: &Writes) -> (&'static str, Option<u64>) {
+        writes.recv_timeout(Duration::from_secs(1)).unwrap()
     }
 
     #[test]
     fn unchanged_total_does_not_write_or_rearm_after_lift() {
-        let (sent, received) = mpsc::channel();
-        let installed = Arc::new(Mutex::new(Some(high_limit(4096 << 10))));
-        let current = Arc::clone(&installed);
-        let mut high = High::new(4096 << 10, kernel(&installed, move |value| {
-            *current.lock().unwrap() = value;
-            let _ = sent.send(value);
-        }));
-        high.set_total(4096 << 10);
+        let (mut high, writes, _resume, _) = high();
         // KiB changes within the same MiB leave the limit unchanged too.
+        high.set_total(4096 << 10);
         high.set_total((4096 << 10) + 1);
-        assert!(received.try_recv().is_err());
+        assert!(writes.try_recv().is_err());
         high.lift();
-        assert_eq!(received.recv_timeout(Duration::from_secs(1)).unwrap(), None);
-        high.set_total((4096 << 10) + 1);
+        assert_eq!(next(&writes), ("lifted", None));
+        high.set_total((4096 << 10) + 2);
         assert_eq!(*high.desired.lock().unwrap(), None);
     }
 
-    /// The worker's lowering write of `low` pauses before the kernel installs
-    /// it ("starting") and again in reclaim ("reclaiming"); other writes report "raised".
-    fn blocking(installed: &Arc<Mutex<Option<u64>>>, low: u64) -> (High, mpsc::Receiver<&'static str>, mpsc::Sender<()>) {
-        let (sent, received) = mpsc::channel();
-        let (resume, blocked) = mpsc::channel::<()>();
-        let blocked = Mutex::new(blocked);
-        let current = Arc::clone(installed);
-        let high = High::new(4096 << 10, kernel(installed, move |value| {
-            if value == Some(low) {
-                let _ = sent.send("starting");
-                blocked.lock().unwrap().recv().unwrap();
-                *current.lock().unwrap() = value;
-                let _ = sent.send("reclaiming");
-                blocked.lock().unwrap().recv().unwrap();
-            } else {
-                *current.lock().unwrap() = value;
-                let _ = sent.send("raised");
-            }
-        }));
-        (high, received, resume)
-    }
-
     #[test]
-    fn lift_bypasses_and_repairs_a_blocked_numeric_write() {
-        let installed = Arc::new(Mutex::new(Some(high_limit(4096 << 10))));
-        let (mut high, received, resume) = blocking(&installed, high_limit(2048 << 10));
-        let next = || received.recv_timeout(Duration::from_secs(1)).unwrap();
+    fn lift_overrides_blocked_and_queued_numeric_writes() {
+        let (mut high, writes, resume, installed) = high();
         high.set_total(2048 << 10);
-        assert_eq!(next(), "starting");
-        // GIVE_UP's lift supersedes the queued numeric update.
+        assert_eq!(next(&writes), ("starting", Some(high_limit(2048 << 10))));
+        // Neither the blocked write nor a queued update holds up the lift.
         high.set_total(1024 << 10);
         high.lift();
-        assert_eq!(next(), "raised");
+        assert_eq!(next(&writes), ("lifted", None));
+        // The blocked write lands late; the watcher repairs it while it reclaims.
         resume.send(()).unwrap();
-        assert_eq!(next(), "reclaiming");
+        assert_eq!(next(&writes).0, "reclaiming");
         assert_eq!(*installed.lock().unwrap(), Some(high_limit(2048 << 10)));
         assert!(high.busy());
-        high.relieve();
-        assert_eq!(*installed.lock().unwrap(), None);
+        high.maintain_lift();
+        assert_eq!((*installed.lock().unwrap(), next(&writes)), (None, ("lifted", None)));
+        // The queued update was superseded: the worker writes max again.
         resume.send(()).unwrap();
-        settle(&high);
-        assert_eq!(*installed.lock().unwrap(), None);
-    }
-
-    #[test]
-    fn raises_bypass_a_blocked_lowering_write_but_never_lower_the_mark() {
-        let installed = Arc::new(Mutex::new(Some(high_limit(4096 << 10))));
-        let (mut high, received, resume) = blocking(&installed, high_limit(2048 << 10));
-        let next = || received.recv_timeout(Duration::from_secs(1)).unwrap();
-        high.set_total(2048 << 10);
-        assert_eq!(next(), "starting");
-        // Above the last desired mark but below the installed one: a direct
-        // write would reclaim on the watcher, so the worker gets it.
-        high.set_total(1024 << 10);
-        high.set_total(3072 << 10);
-        assert!(received.try_recv().is_err());
-        assert_eq!(*installed.lock().unwrap(), Some(high_limit(4096 << 10)));
-        high.set_total(8192 << 10);
-        assert_eq!(next(), "raised");
-        resume.send(()).unwrap();
-        assert_eq!(next(), "reclaiming");
-        high.relieve();
-        assert_eq!(*installed.lock().unwrap(), Some(high_limit(8192 << 10)));
-        assert_eq!(next(), "raised");
-        resume.send(()).unwrap();
-        settle(&high);
-        assert_eq!(*installed.lock().unwrap(), Some(high_limit(8192 << 10)));
+        assert_eq!(next(&writes), ("lifted", None));
     }
 }
