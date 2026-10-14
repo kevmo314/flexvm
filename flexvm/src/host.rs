@@ -1229,8 +1229,8 @@ pub fn reap(run: &Path, owner: &Ident) -> Result<()> {
         }
         let Some(fc) = load::<Ident>(&e.path().join("fc"))? else { continue };
         if let Some(fd) = PidFd::open(&fc)? {
-            // It exited and was waited for since it was opened (its parent died with SIGKILL
-            // pending for it): nothing left to wait for.
+            // If it exited and was waited for since it was opened (its parent died with SIGKILL
+            // pending for it), the kill finds nothing and the wait returns at once.
             crate::util::pidfd_kill(&fd.0).map_err(|e| format!("signal {}: {e}", libc::SIGKILL))?;
             if !fd.wait(Duration::from_secs(5)) {
                 bail!("firecracker {} of dead process {} will not exit", fc.pid, owner.pid);

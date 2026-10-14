@@ -140,7 +140,7 @@ impl Firecracker {
         format!("firecracker {} {status}; log: {}", self.pid(), lines[lines.len().saturating_sub(5)..].join(" | "))
     }
 
-    fn join_cgroup(&self) {
+    pub fn join_cgroup(&self) {
         if let Some(j) = self.joining.borrow_mut().take() {
             let _ = j.join();
         }
