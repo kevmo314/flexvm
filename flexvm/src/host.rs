@@ -21,6 +21,28 @@ use crate::bail;
 use crate::net::IpRange;
 use crate::util::Result;
 
+/// A held grant (`Host::grant_held`): counted while this lives, and not a
+/// moment after its process does (the kernel drops the flock). Dropping it
+/// removes the file; if that fails, the free lock tells admission it is gone.
+pub struct Hold {
+    path: PathBuf,
+    _file: File,
+}
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// What a grant must leave available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Floor {
+    Reserve,
+    /// The eviction mark (`Config::evict_at`): an arrival moved here by eviction.
+    EvictMark,
+}
+
 /// `STATE/host.json`, written by `flexvm listen`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -202,18 +224,23 @@ impl Host {
         cfg
     }
 
-    /// What an arrival moved here by eviction must leave available: this
-    /// host's own eviction mark, so it is not moved straight back. Refused
-    /// while this host is evicting itself.
-    pub fn evict_floor(&self) -> Result<u64> {
-        let cfg = self.config_now();
-        // The marker outlives the last VM here that would clear it: believed while a VM runs here,
-        // below where eviction stops.
-        let evicting = self.run.join("evict.active").exists() && crate::vmproc::host_available_mib() < cfg.evict_until();
-        if evicting && self.entries().iter().any(|e| e.state == "running") {
-            bail!("this host is low on memory itself (moving vms away)");
-        }
-        Ok(cfg.evict_at())
+    fn worker_flock(&self) -> Option<File> {
+        let f = File::options().create(true).truncate(false).write(true).open(self.state.join("evict.worker.lock")).ok()?;
+        flock(&f, libc::LOCK_EX | libc::LOCK_NB).ok().map(|()| f)
+    }
+
+    /// `STATE/evict.worker.lock`, held by the thread running an eviction for
+    /// as long as it runs (and let go with its process). Taken under the
+    /// host lock, as `evicting` probes it, so the two never meet.
+    pub fn evict_worker_lock(&self) -> Result<File> {
+        let _l = self.lock()?;
+        self.worker_flock().ok_or_else(|| "another eviction runs here".into())
+    }
+
+    /// Whether an eviction runs here now (not merely that the host was under
+    /// pressure). Under the host lock (see `evict_worker_lock`).
+    fn evicting(&self, _l: &Locked) -> bool {
+        self.worker_flock().is_none() && self.state.join("evict.worker.lock").exists()
     }
 
     /// Reentrant within a thread (so a guard dropped under it cannot
@@ -595,6 +622,24 @@ impl Host {
         Ok(self.held(&a).then_some(a.holder).flatten())
     }
 
+    /// Live holds (`RUN/holds/ID-MIB`, each flocked by its owner for as
+    /// long as it is held), as (id, MiB). One whose lock is free has no
+    /// owner left (the kernel let go of it with the process): removed.
+    fn holds(&self, _l: &Locked) -> Vec<(u64, u64)> {
+        let dir = self.run.join("holds");
+        let mut live = Vec::new();
+        for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let Some((id, mib)) = name.split_once('-').and_then(|(i, m)| Some((i.parse().ok()?, m.parse().ok()?))) else { continue };
+            match File::open(e.path()).map(|f| flock(&f, libc::LOCK_EX | libc::LOCK_NB).is_ok()) {
+                Ok(true) => drop(std::fs::remove_file(e.path())),
+                // Held; or unreadable, which counts as held.
+                _ => live.push((id, mib)),
+            }
+        }
+        live
+    }
+
     /// Gives back grant `id` (from `grant`) that was not used.
     pub fn refund(&self, id: u64) {
         let Ok(_l) = self.lock() else { return };
@@ -613,30 +658,68 @@ impl Host {
 
     /// `grant` against the current reserve.
     pub fn grant(&self, mib: u64) -> Option<u64> {
-        self.grant_above(mib, None)
+        self.grant_above(mib, Floor::Reserve).ok()
+    }
+
+    pub fn grant_above(&self, mib: u64, floor: Floor) -> Result<u64> {
+        self.grant_inner(mib, floor, false).map(|g| g.0)
+    }
+
+    /// A grant held past `GRANT_WINDOW`, until the `Hold` is dropped or its
+    /// process ends, made in the same critical section: an arrival's memory
+    /// comes in only as it pulls, however long that takes.
+    pub fn grant_held(&self, mib: u64, floor: Floor) -> Result<(u64, Hold)> {
+        let (id, hold) = self.grant_inner(mib, floor, true)?;
+        Ok((id, hold.ok_or("no hold")?))
     }
 
     /// MemAvailable lags a grant until the guest touches the memory, so all
-    /// processes' grants of the last `GRANT_WINDOW` count as used. Returns
-    /// the grant's id. Leaves `floor` MiB available (default: the current
-    /// reserve; never less). Test fault `no_admit`: refuses everything.
-    pub fn grant_above(&self, mib: u64, floor: Option<u64>) -> Option<u64> {
+    /// processes' grants of the last `GRANT_WINDOW` count as used, and held
+    /// ones (`grant_held`) however old, each once. Returns the grant's id.
+    /// Leaves `floor` available, read with the reserve under the host lock.
+    /// Test fault `no_admit`: refuses everything.
+    fn grant_inner(&self, mib: u64, floor: Floor, hold: bool) -> Result<(u64, Option<Hold>)> {
         if fault("no_admit") {
-            return None;
+            bail!("not enough memory here for {mib} MiB (injected fault)");
         }
-        let _l = self.lock().ok()?;
+        let l = self.lock()?;
+        let cfg = self.config_now();
+        let (floor, what) = match floor {
+            Floor::Reserve => (cfg.reserve_mib, "reserve"),
+            // An eviction's arrival: never while this host evicts itself, and it
+            // leaves this host's own mark, so it is not moved straight back.
+            Floor::EvictMark if self.evicting(&l) => bail!("this host is moving vms away itself"),
+            Floor::EvictMark => (cfg.evict_at(), "eviction mark"),
+        };
         let path = self.run.join("grants");
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
         let mut grants: Vec<(u64, u64, u64)> = load(&path).ok().flatten().unwrap_or_default();
         grants.retain(|&(t, ..)| now.saturating_sub(t) <= GRANT_WINDOW.as_millis() as u64);
-        let pending: u64 = grants.iter().map(|g| g.1).sum();
-        let floor = floor.unwrap_or(0).max(self.config_now().reserve_mib);
+        let held = self.holds(&l);
+        let pending: u64 = grants.iter().filter(|g| !held.iter().any(|h| h.0 == g.2)).map(|g| g.1).sum::<u64>() + held.iter().map(|h| h.1).sum::<u64>();
         if crate::vmproc::host_available_mib() < floor + pending + mib {
-            return None;
+            bail!("not enough memory here for {mib} MiB above the {floor} MiB {what}");
         }
         let id = crate::migrate::migration_id().max(1);
+        // Locked before it is visible (renamed in): a probe never takes it for an owner's.
+        let hold = match hold {
+            false => None,
+            true => {
+                let dir = self.run.join("holds");
+                std::fs::create_dir_all(&dir)?;
+                let (tmp, path) = (dir.join(format!(".{id}")), dir.join(format!("{id}-{mib}")));
+                let f = File::create(&tmp)?;
+                flock(&f, libc::LOCK_EX | libc::LOCK_NB)?;
+                std::fs::rename(&tmp, &path)?;
+                Some(Hold { path, _file: f })
+            }
+        };
         grants.push((now, mib, id));
-        store(&path, &grants, false).ok().map(|()| id)
+        if let Err(e) = store(&path, &grants, false) {
+            drop(hold);
+            return Err(e);
+        }
+        Ok((id, hold))
     }
 
     // Incoming migrations: `STATE/migs/ID`, durable, under the host lock.
@@ -1649,10 +1732,15 @@ mod tests {
         let running = h.clone();
         assert!(running.admit(100));
         // An eviction's arrival leaves the mark available, not only the reserve.
-        let floor = running.evict_floor().unwrap();
-        assert_eq!(floor, free.saturating_sub(1500));
-        assert!(running.grant_above(2000, Some(floor)).is_none());
-        assert!(running.grant_above(200, Some(floor)).is_some());
+        assert!(running.grant_above(2000, Floor::EvictMark).unwrap_err().to_string().contains("eviction mark"));
+        assert!(running.grant_above(200, Floor::EvictMark).is_ok());
+        // Not while an eviction runs here; a pressure marker alone does not refuse.
+        std::fs::write(running.run.join("evict.active"), b"").unwrap();
+        let worker = running.evict_worker_lock().unwrap();
+        assert!(running.evict_worker_lock().is_err(), "one eviction at a time");
+        assert!(running.grant_above(1, Floor::EvictMark).unwrap_err().to_string().contains("moving vms away"));
+        drop(worker);
+        assert!(running.grant_above(1, Floor::EvictMark).is_ok());
         // `listen` raises the reserve while this process runs: admission sees it.
         std::thread::sleep(Duration::from_millis(20));
         h.configure(|c| {
@@ -1662,8 +1750,25 @@ mod tests {
         .unwrap();
         assert_eq!(running.config_now().reserve_mib, free + 1000);
         assert!(!running.admit(1));
-        // A marker no VM here is left to clear (none runs) does not refuse.
-        std::fs::write(running.run.join("evict.active"), b"").unwrap();
-        assert!(running.evict_floor().is_ok());
+    }
+
+    #[test]
+    fn held_grants_count_past_the_window_until_dropped_or_their_owner_is_gone() {
+        let mut h = host("held");
+        let free = crate::vmproc::host_available_mib();
+        h.cfg.reserve_mib = free.saturating_sub(3000);
+        let (_, hold) = h.grant_held(2000, Floor::Reserve).unwrap();
+        // The window passes (the grant ages out): held, it still counts, once.
+        let path = h.run.join("grants");
+        let aged: Vec<(u64, u64, u64)> = load::<Vec<(u64, u64, u64)>>(&path).unwrap().unwrap().into_iter().map(|g| (0, g.1, g.2)).collect();
+        store(&path, &aged, false).unwrap();
+        assert!(!h.admit(1500), "a held grant counts after the window");
+        drop(hold);
+        assert!(h.admit(1500));
+        // A hold whose lock nobody has (its process died; or its removal failed) goes.
+        store(&path, &Vec::<(u64, u64, u64)>::new(), false).unwrap();
+        std::fs::write(h.run.join("holds").join("99-2000"), b"").unwrap();
+        assert!(h.admit(2500));
+        assert!(!h.run.join("holds").join("99-2000").exists());
     }
 }

@@ -174,8 +174,13 @@ parsed is an error, never a free address.
 **Admission** (`reserve_mib`): every start (run, restore, resume, standby
 claim, arrival: what the VM brings or pages in, and a step), growth and
 incoming migrations are admitted under the host lock against MemAvailable
-minus the reserve and the grants of the last 10 s (`RUN/grants`); a start
-refused fails before it loads anything. Standby refills stop under it.
+minus the reserve and the grants of the last 10 s (`RUN/grants`); an
+arrival's grant is held past that until all its memory is here, or it ends,
+as it comes in only as the pull goes: made with the grant in one critical
+section, it is a file (`RUN/holds/ID-MIB`) its process keeps flocked, so it
+goes with the process whatever becomes of the file (admission removes one
+whose lock is free). A start refused fails before it loads
+anything. Standby refills stop under it.
 
 **Memory marks** (`limit.rs`): each VM's Firecracker cgroup has a
 `memory.high` at the memory admitted for it plus Firecracker's overhead
@@ -310,13 +315,17 @@ not hold that up. The lock's
 holder, at most once per 5 s, reads the registry and ranks running VMs: the
 starved first, then the fastest growing (by power of two, under 8 MiB/s is
 none), then the biggest RSS (without pressure, only starved VMs are
-candidates; a `run -- CMD` VM never is: its process ends with CMD's, and
-`migrate` with `evict` refuses it as busy). It runs the eviction on a thread of its own that keeps the lock,
+candidates; a `run -- CMD` VM never is: its process ends with CMD's, so
+its registry entry says so (`cmd`, set before it is first published, for a
+run, a standby claim or a resume), `migrate` with `evict` refuses it as busy
+and a plain `migrate` refuses it outright). It runs the eviction on a thread of its own that keeps the lock,
 so its controller keeps ticking and its VM's memory requests are answered: it
 sends the first candidate `migrate` with each peer in turn until one accepts
 (`migrate` with `evict`: the target admits such an arrival only if it
-leaves the target's own eviction mark available, and refuses it while it
-is evicting itself, so a VM is not moved straight back), then waits
+leaves the target's own eviction mark available, read with the reserve
+under the host lock, and refuses it while an eviction runs there (its
+thread holds `STATE/evict.worker.lock`, taken under the host lock that
+admission probes it under), so a VM is not moved straight back), then waits
 for that VM's copy here to exit (its target has all its memory), so the next
 decision sees the memory freed; all within 60 s, past which it lets go (an
 unanswered migration is not a refusal: the VM, still migrating, is busy to

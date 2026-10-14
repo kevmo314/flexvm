@@ -281,21 +281,24 @@ impl Proc {
             self.host.claim_incoming(&l, name, ip, gen)?
         };
         self.set_addr(claim);
+        // Before it is published: eviction leaves a CMD VM alone.
+        *self.cmd.lock().unwrap() = cmd.as_ref().map(|(c, _)| c.clone());
         match self.restore_checkpoint(name, ck, ip, true, false, &mut t) {
             Ok(mut v) => {
                 v["from"] = json!("suspended");
                 // Its command runs on in the guest: the process reattaches it and ends with it.
-                if let Some((cmd, session)) = cmd {
-                    *self.cmd.lock().unwrap() = Some(cmd);
+                if let Some((_, session)) = cmd {
                     let _ = self.cmd_session.set(std::sync::Mutex::new(session));
                 }
                 Ok(v)
             }
             Err(Restore::NotRun(e)) => {
+                *self.cmd.lock().unwrap() = None;
                 self.keep_addr();
                 Err(e)
             }
             Err(Restore::Uncertain(e)) => {
+                *self.cmd.lock().unwrap() = None;
                 self.keep_addr();
                 let _ = std::fs::write(dir.join(QUARANTINE), format!("{} {e}", crate::host::boot_id()));
                 bail!("vm {name} is quarantined: {e}; kill it to discard its checkpoint")
@@ -339,7 +342,7 @@ impl Proc {
             let tpl = Template::open_id(&self.paths, &m.template, &m.template_id)?;
             t.mark("verify_template");
             // The template's working set is prefetched too.
-            self.admit_start(tpl.working_set_mib() + to_load, 0, None)?;
+            self.admit_start(tpl.working_set_mib() + to_load, 0, crate::host::Floor::Reserve)?;
             let seed = Some((ck.runs, Origin::File(ck.file)));
             let prepared = Vm::prepare(self.spawner.take(None)?, tpl, t)?;
             prepared.load(&self.spawner, name, Snapshot::Bytes(&ck.vmstate), seed, ip, !(hold && fault("restore_no_hold")), None, || Ok(()), t)

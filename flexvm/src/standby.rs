@@ -238,6 +238,8 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
         if send_json(&mut &c, &json!({"claiming": true})).is_err() {
             continue;
         }
+        // Before it is published: eviction leaves a CMD VM alone.
+        *p.cmd.lock().unwrap() = req["cmd"].as_str().map(String::from);
         match claim(p, &req) {
             Ok(v) => {
                 p.forget_stop();
@@ -249,7 +251,6 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
                     crate::util::output::retarget([out.as_raw_fd(), err.as_raw_fd()]);
                 }
                 *p.claimer.lock().unwrap() = Some(c);
-                *p.cmd.lock().unwrap() = req["cmd"].as_str().map(String::from);
                 for f in p.files.lock().unwrap().drain(..) {
                     let _ = std::fs::remove_file(f);
                 }
@@ -263,6 +264,7 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
                 return Ok(Value::Null);
             }
             Err((e, retry)) => {
+                *p.cmd.lock().unwrap() = None;
                 let _ = send_json(&mut &c, &json!({"ok": false, "error": e.to_string(), "retry": retry}));
                 if p.standby.lock().unwrap().is_none() {
                     p.finish(op, End::NotStarted, crate::vmproc::FAILED, None);
@@ -289,7 +291,7 @@ fn claim(p: &Arc<Proc>, req: &Value) -> std::result::Result<Value, (Error, bool)
     // Its memory is already out of MemAvailable: only the step is charged.
     let held = p.standby.lock().unwrap().as_ref().and_then(|s| crate::util::proc_kb(&format!("/proc/{}/status", s.firecracker().pid()), "VmRSS"));
     let held = held.unwrap_or(0) >> 20;
-    p.admit_start(held, held, None).map_err(|e| (e, true))?;
+    p.admit_start(held, held, crate::host::Floor::Reserve).map_err(|e| (e, true))?;
     let not_run = |e: Error, retry: bool| {
         p.refund_start();
         (e, retry)

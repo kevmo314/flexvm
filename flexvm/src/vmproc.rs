@@ -103,6 +103,8 @@ pub struct Proc {
     granted: AtomicU64,
     /// The grant of this start (refunded if the VM never starts).
     charged: AtomicU64,
+    /// An arrival's grant, held until all its memory is here.
+    held_grant: Mutex<Option<crate::host::Hold>>,
     /// A standby's (MiB held or to page in, guest size), taken while it waits, so a claim need not.
     pub sizes: Mutex<Option<(u64, u64)>>,
     serving: AtomicBool,
@@ -185,6 +187,7 @@ impl Proc {
             files: Mutex::new(Vec::new()),
             granted: AtomicU64::new(0),
             charged: AtomicU64::new(0),
+            held_grant: Mutex::new(None),
             sizes: Mutex::new(None),
             serving: AtomicBool::new(false),
             ticks: Mutex::new(Ticks::default()),
@@ -217,19 +220,29 @@ impl Proc {
     /// to page in) and a step, against the host's reserve, less what it
     /// already holds here (`held`: a standby's memory is out of MemAvailable).
     /// An arrival moved here by eviction leaves this host's eviction mark
-    /// (`floor`) available instead of only the reserve.
-    pub fn admit_start(&self, need: u64, held: u64, floor: Option<u64>) -> Result<()> {
+    /// available instead of only the reserve (`floor`).
+    pub fn admit_start(&self, need: u64, held: u64, floor: crate::host::Floor) -> Result<()> {
         let mib = crate::limit::allowance(need);
         let charge = mib.saturating_sub(held);
-        let Some(id) = self.host.grant_above(charge, floor) else {
-            match floor {
-                Some(f) => bail!("not enough memory here for {charge} MiB above its {f} MiB eviction mark"),
-                None => bail!("not enough memory here for {charge} MiB above the {} MiB reserve", self.host.config_now().reserve_mib),
-            }
-        };
+        let id = self.host.grant_above(charge, floor)?;
         self.granted.store(mib, Ordering::SeqCst);
         self.charged.store(id, Ordering::SeqCst);
         Ok(())
+    }
+
+    /// An arrival's admission: its grant counts until all its memory is here
+    /// (`settle_arrival`) or it ends, however long the pull takes.
+    pub fn admit_arrival(&self, need: u64, floor: crate::host::Floor) -> Result<()> {
+        let mib = crate::limit::allowance(need);
+        let (id, hold) = self.host.grant_held(mib, floor)?;
+        self.granted.store(mib, Ordering::SeqCst);
+        self.charged.store(id, Ordering::SeqCst);
+        *self.held_grant.lock().unwrap() = Some(hold);
+        Ok(())
+    }
+
+    fn release_hold(&self) {
+        drop(self.held_grant.lock().unwrap().take());
     }
 
     /// A start that did not happen gives its admission back.
@@ -320,6 +333,8 @@ impl Proc {
                 .map_err(|e| format!("vm {}: recording that all its memory arrived: {e}; try again", vm.name))?;
         }
         *arrived = None;
+        drop(arrived);
+        self.release_hold();
         Ok(())
     }
 
@@ -413,6 +428,7 @@ impl Proc {
         if matches!(end, End::NotStarted) {
             self.refund_start();
         }
+        self.release_hold();
         self.drop_held_in();
         self.set_leaving(true);
         if let Some(vm) = self.vm.get() {
@@ -548,7 +564,7 @@ impl Proc {
         let ip = self.set_addr(claim);
         t.mark("claim_ip");
         crate::host::stall("start_stall");
-        self.admit_start(tpl.working_set_mib(), 0, None)?;
+        self.admit_start(tpl.working_set_mib(), 0, crate::host::Floor::Reserve)?;
         let prepared = Vm::prepare(self.spawner.take(None)?, tpl.clone(), &mut t)?;
         let learn = crate::standby::load_set(&self.host, &tpl).is_empty();
         if learn {
@@ -1429,6 +1445,14 @@ fn relieve(host: &Host, starved_here: bool) {
     let host = host.clone();
     thread::spawn(move || {
         let _lock = lock;
+        // Arrivals by eviction are refused while it runs (`Floor::EvictMark`).
+        let _worker = match host.evict_worker_lock() {
+            Ok(w) => w,
+            Err(e) => {
+                EVICTING.store(false, Ordering::SeqCst);
+                return eprintln!("eviction: {e}");
+            }
+        };
         evict(&host, &cfg.peers, &vms, avail, Instant::now() + EVICT_DEADLINE);
         EVICTING.store(false, Ordering::SeqCst);
     });

@@ -55,8 +55,11 @@ impl Proc {
             true => self.op_now().ok_or_else(|| format!("vm {}: {}", vm.name, crate::vmproc::BUSY))?,
             false => self.op_within()?,
         };
-        if evict && self.cmd.lock().unwrap().is_some() {
-            bail!("vm {} runs a command here that its process ends with; {}", vm.name, crate::vmproc::BUSY);
+        if self.cmd.lock().unwrap().is_some() {
+            match evict {
+                true => bail!("vm {} runs a command here that its process ends with; {}", vm.name, crate::vmproc::BUSY),
+                false => bail!("vm {} runs `run -- CMD`, which ends with its command here: it cannot migrate", vm.name),
+            }
         }
         if if_idle && self.arrived.lock().unwrap().is_some() {
             bail!("vm {} is still arriving; {}", vm.name, crate::vmproc::BUSY);
@@ -526,8 +529,8 @@ impl Proc {
         let ip: Ipv4Addr = req["ip"].as_str().ok_or("missing ip")?.parse()?;
         *self.arrived.lock().unwrap() = Some(self.host.mig_begin(mig, &source.addr, by, Some(ip))?);
         let need = req["rss_mib"].as_u64().unwrap_or(0);
-        let floor = if req["evict"] == true { Some(self.host.evict_floor()?) } else { None };
-        self.admit_start(need, 0, floor)?;
+        let floor = if req["evict"] == true { crate::host::Floor::EvictMark } else { crate::host::Floor::Reserve };
+        self.admit_arrival(need, floor)?;
         let tpl = Template::open_id(&self.paths, req["template"].as_str().ok_or("missing template")?, req["id"].as_str().ok_or("missing template id")?)?;
         t.mark("template");
         let claim = self.host.claim_incoming(&self.host.lock()?, &name, ip, req["gen"].as_u64().unwrap_or(0))?;
