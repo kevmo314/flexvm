@@ -494,9 +494,12 @@ pub fn exec(host: &Host, name: &str, cmd: &str) -> Result<i32> {
             }
             Ok(Ok(StreamEnd::Disconnected(why))) => error = why,
             Err(e) => {
-                // Paused stays paused: no point retrying.
+                // A new command fails at once; a running one waits for its VM to resume.
                 if e.to_string().contains(" is paused; ") {
-                    return Err(e);
+                    if !started {
+                        return Err(e);
+                    }
+                    deadline = Instant::now() + Duration::from_secs(30);
                 }
                 if !host.alive(name) {
                     if let Ok(to) = std::fs::read_to_string(host.vms(name, "moved")) {
