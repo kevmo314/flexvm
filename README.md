@@ -1,1231 +1,198 @@
 # flexvm
 
-Elastic Firecracker microVMs. A VM never reserves a size: it sees every host
-CPU and a memory ceiling equal to host RAM, but only uses what it touches.
-When a host gets tight, the VM is live-migrated (post-copy) to a roomier host
-in tens of milliseconds.
+Elastic Firecracker microVMs. A VM sees every host CPU and a memory ceiling of
+host RAM, but only uses what it touches. It starts in about 5 ms, pauses,
+checkpoints and suspends to disk, and live-migrates to another host
+(post-copy) in tens of milliseconds, keeping its address and TCP connections.
 
-## How it works
+There is no daemon. `flexvm run` starts a process that *is* the VM: kill the
+process and the VM is gone, send it a signal and the VM pauses or suspends.
 
-| Concern | Mechanism |
-|---|---|
-| CPU | vCPUs = host cores (FC max 32). Idle vCPUs halt and cost nothing. Each VM's Firecracker runs in a cgroup of its own with the `cpu` controller on, all at the default `cpu.weight`, so busy VMs share contended CPU equally however many threads each runs. |
-| Memory growth | Boot memory (256 MiB + 1/32 of the ceiling) + a virtio-mem region up to host RAM, of which **4 GiB is already plugged in the template**. Plugged memory the guest never touched costs the host nothing, so bursts never wait on the host. Past that, the guest asks for more over vsock the moment it runs low, and the daemon keeps a quarter of the guest (at least 1 GiB) free. See [Memory](#memory). |
-| Memory return | virtio-balloon **free page reporting**: pages the guest frees go back to the host within seconds, whether or not they stay plugged. |
-| Root filesystem | One read-only ext4 image on virtio-pmem with DAX, shared by every VM through the host page cache. Writes go to a tmpfs overlay inside the guest, so they migrate with memory. |
-| Start | Every VM is a **UFFD restore of a template snapshot** into a pre-spawned, pre-cgrouped Firecracker. The template's recorded working set is copied in bulk; everything else is faulted in lazily from a shared, sparse template image. A **hot pool** keeps VMs already restored and paused, so `run` is usually just a resume. |
-| Migration | **Post-copy**: the target gets everything ready first (template, address, a Firecracker with the template's VM structure already built); then pause, save vCPU and device state only (~20–200 KiB), load it and resume on the target, then the target's pager fetches pages from the paused source on fault and in the background. The source releases the VM once every page has arrived, and never resumes it once the target may own it. |
-| Pressure | If a VM needs to grow and the host would drop below `--reserve`, or the host is already below it, the daemon migrates that VM to the peer with the most spare memory. |
-| Network | Each VM has its own IPv4 /32 routed to a per-VM tap. The address moves with the VM, so open TCP connections survive migration. See below. |
-| Container images | `flexvm template NAME --image REF` builds the root filesystem from an OCI/Docker image; flexvm-init runs and supervises its entrypoint. See below. |
-
-### Pages
-
-The userfaultfd pager (`flexvm/src/uffd.rs`) tracks every guest page as
-`BASE` (template), `ZERO` (discarded by balloon or virtio-mem), `REMOTE` (on
-the migration source), `INFLIGHT` or `PRESENT`. A migration target needs only
-the run-length list of PRESENT and ZERO pages; the source serves PRESENT pages
-straight out of the paused Firecracker with `process_vm_readv`. No memory file
-is written, so the pause does not grow with VM size.
-
-Every install (fault, prefetch, background pull) first claims its pages
-(`INFLIGHT`). A balloon or virtio-mem REMOVE on a claimed page marks it
-`DISCARDED`, so the installer skips it instead of copying stale bytes in or
-marking it PRESENT; failed fetches and copies give their claims back. Copies
-hold a lock that REMOVE handling takes exclusively, and the kernel fails copies
-while a REMOVE is queued, so no data lands in a page the guest has just given
-back. The kernel's zap itself can still come after a page settled PRESENT, so a
-fault on a PRESENT page zero-fills it if it is missing. A checkpoint stops prefetch and waits for claims to
-settle before exporting page states, so they match the saved vmstate. If the
-migration source stays unreachable for 10 s (fetches reconnect with backoff
-until then), the target kills the VM and reports it `failed`.
-
-One thread reads uffd events, but it never waits for the network or disk:
-a fault on a REMOTE page claims a 64-page run and hands it to one of 8
-fetcher threads (each with its own connection to the source), so faults on
-template and zero pages, and REMOVEs, are served meanwhile. Fetchers and the
-4 background pullers install pages as they arrive (16 at a time), and a
-fetcher asks for the faulting page on its own, pipelined ahead of the rest of
-its run. A fault on a page someone else is installing waits for that copy,
-which wakes the faulting thread; installers signal the event thread (an
-eventfd) when pages settle, and an install that hits EAGAIN (a REMOVE is
-queued) waits until the event thread has read events, instead of polling.
-`migration_status` reports fault service latency per kind (served locally,
-fetched, waited for another installer), measured from reading the fault to
-the copy that woke it, plus fetch, queueing and pull times.
-
-Pausing Firecracker stops only the vCPUs, so before the state-only snapshot the
-source also brings the VM's tap down (no RX into guest memory), closes host
-exec sessions (vsock) and parks the balloon statistics timer; the target and an
-aborted source put the timer back.
-
-### Migration steps
-
-Only what needs the VM's state happens while it is paused. Everything goes
-over one connection, in this order: the target's answer to the prepare
-request; the source's header, vmstate and preloaded pages; the target's
-answer once it committed and resumed the VM; the held packets (`hold`); the
-target's reply to them.
-
-1. Before the pause, over one connection (`migrate_in`): the target checks the
-   template, reserves the name and address, takes a pooled Firecracker and
-   starts its pager. With `firecracker/0002-*.patch` it also has Firecracker
-   prepare the load from the template's snapshot: KVM VM, vCPUs, memory slots,
-   guest memory handed to the pager (which then waits for the page states),
-   the vsock socket and the pmem mapping. A target that cannot take the VM
-   refuses here, before anything happened to it.
-2. The source parks the balloon timer, holds the VM's packets, pauses, saves
-   the state (taking the tap down alongside: Firecracker serves the snapshot
-   from its pause loop, which reads no tap), exports its page states and reads the pages
-   of the template's *load set* that it holds: pages Firecracker touches
-   while loading and resuming a VM of that template (vCPU clock pages,
-   virtqueues), learned from the hot pool's loads (which hold their prefetch
-   back until then). Header, vmstate and those pages go out on the open
-   connection.
-3. The target seeds its pager and loads the state (vCPU, VM and device
-   state only, when prepared) with the vCPUs stopped, installing the
-   preloaded pages while Firecracker parses the state. Only once every check
-   that can still abort has passed (the source's page server answers, the
-   pager is healthy, the name is registered) does it record the migration
-   committed, and only then resume the VM: a VM that ran on the target is
-   never handed back to the source. A source that is gone, or too slow (one
-   30 s deadline for everything it sends after the pause), leaves nothing
-   behind on the target. Once it answered, it takes in the packets the
-   source held and only then announces the VM.
-
-Downtime p50 on an idle host (`flexvm bench`, interleaved runs of 12–15
-trials): 2 vCPU 37 ms before, 26 ms with steps 1–3 on stock Firecracker,
-10 ms with the patch (pause 0.5 ms, snapshot 1.7 ms, transfer 0.1 ms, target
-load 4 ms, resume 1.4 ms); 24 vCPU 50 and 25 ms (its load is still 11 ms and
-its resume 4 ms: vCPU threads, state parsing).
-
-### Lifecycle: pause, checkpoint, restore, suspend
-
-```
-starting -> running <-> paused                     (pause / resume)
-running | paused -> checkpointing -> running | paused | gone   (checkpoint [--stop])
-running | paused -> checkpointing -> suspended -> running      (suspend / resume)
-running | paused -> source (migrating) -> gone, or back if the target aborted
-any -> failed (memory lost) -> gone                (kill)
-```
-
-Every lifecycle operation (and each controller resize) first reserves the
-VM's name, so operations on one VM never interleave; the controller skips a
-VM that is busy, paused or suspended.
-
-- **pause / resume** stop and restart the vCPUs; memory and devices stay.
-  Both take under a millisecond (2 vCPU) to 1.5 ms (24 vCPU).
-- **checkpoint NAME DIR** first waits for any VM still pulling memory (from a
-  migration source or its checkpoint), and for virtio-mem to settle (see
-  below). It then pauses the VM, quiesces its devices and pager like a
-  migration source does, saves the vCPU/device state and writes every page
-  that differs from the template into DIR. With `--keep-running` (the
-  default) the VM resumes as soon as its memory is write-protected and the
-  pages are written copy-on-write while it runs (pause 17–30 ms at any
-  size, see below); with `--stop` it stays paused for the write (2–3 GB/s
-  here) and is killed. `--incremental` writes only what changed since its
-  last checkpoint, as a delta against it.
-- **restore DIR** works on any host whose template has the same content id.
-  It loads the verified state (copied to the VM's own run directory) into a
-  pooled Firecracker, paused. That Firecracker's pager takes pages from the
-  checkpoint's page file: on fault, and in the background (the template's
-  working set first) until all are in. The VM is ready in about the time of
-  a `run`. By default it keeps its name and address; on another host it
-  borrows the address from its home host (see Networking), which refuses
-  one in use or lent out. `--ip auto` picks a new one, which also makes a
-  restore a fork of a running VM. `--paused` holds the restored VM paused
-  until `resume`; its memory is still paged in meanwhile.
-- **suspend** checkpoints into the daemon's `--state-dir` (default
-  `/var/lib/flexvm/<listen>`). The state dir must be on disk, not tmpfs, and
-  it is created durably and locked for the daemon's lifetime like `--run`.
-  Then suspend kills Firecracker, so the VM costs no memory. Memory is
-  released only once the checkpoint is durable. The pager is stopped before
-  Firecracker dies, so no discard event can mark a saved page as zero.
-  A suspended VM's checkpoint stays in `suspended/`.
-  - **Resume** first creates a `STARTED` marker in it and fsyncs it, before
-    any vCPU runs. It then restores lazily like `restore`, and deletes the
-    checkpoint once every page is in. The pager closes the checkpoint's
-    files as soon as the last page has settled (readers still busy finish
-    first), so the deletion gives the disk space back while the VM runs on.
-  - **Kill** creates a `DISCARDED` marker the same way before it answers.
-  - **Daemon restart** deletes marked checkpoints and brings back the rest,
-    so suspended VMs survive a restart, and a resumed or killed one never
-    comes back.
-  - **Failed resume.** If it fails before the resume request reaches
-    Firecracker, the VM stays suspended. If it fails after, the checkpoint
-    is consumed: the VM is gone, as re-arming it would replay what it did.
-    If the `STARTED` marker cannot be made durable, it is removed again and
-    the directory fsynced before the VM goes back to suspended. If that
-    fails too, the marker may or may not survive a crash: the VM (which
-    never ran) is listed `quarantined`, with why. It cannot be resumed; a
-    `kill` discards it as usual, and a daemon restart goes by what the disk
-    holds (marker: deleted; none: suspended again). Test faults
-    `started_fsync` and `started_unmark` cover both.
-- **Device quiescing.** An API pause (`PATCH /vm Paused`) puts Firecracker's
-  VMM thread into a loop that serves only API requests until the resume. It
-  does not return to its event loop meanwhile, so device emulation stops
-  with the vCPUs: no queue, tap, vsock backend or timer is serviced, and the
-  events wait for the resume. flexvm builds on that:
-  - **Loaded paused.** A load with `resume_vm: false` (a paused migration
-    target, `restore --paused`) stops only the vCPUs. The daemon follows it
-    at once with an API pause, so the devices are held too. The
-    `held_restore_frozen` scenario shows the difference: a held restore's
-    memory stays bit-identical while frames arrive on its tap, a host vsock
-    connection waits and the balloon timer is due. Skip the hold and the
-    same activity changes guest memory.
-  - **Every checkpoint or migration pauses through the API,** even for a VM
-    already paused.
-  - **Guest-facing requests happen only before the snapshot.** Requests
-    served inside the pause loop can still write guest memory: changing the
-    balloon statistics interval writes the stats queue, and balloon or
-    virtio-mem size changes send config interrupts. So the only one flexvm
-    sends to a paused VM (parking the balloon timer) goes before the
-    snapshot. None follows until the pages are captured (checkpoint) or the
-    source is released (migration). The controller never touches a VM that
-    is not running.
-  - **Belt and braces.** The earlier measures stay. Before a pause the
-    daemon waits for virtio-mem to carry out the last resize. A checkpoint
-    is not published if memory was discarded, or the plugged size changed,
-    after the snapshot.
-- **Clock.** A restored guest's wall clock resumes from when it was saved.
-  The guest uses the TSC clocksource, whose saved value Firecracker
-  restores, while `clock_realtime` only moves kvmclock. A restore or a
-  suspended VM's resume therefore steps the guest clock under the VM's
-  reservation, within a 5 s deadline, with the agent's `CLOCK` (it sets the
-  host's time and reports how far off it was), up to three tries, stopping
-  at the first whose round trip is under 5 ms; the residual error is a few
-  ms. Agents without `CLOCK` get
-  no step (logged once): an exec could run late, after a snapshot.
-  Across a plain pause the TSC keeps counting, so the clock stays right
-  (measured: 0 ms drift after 20 s). `resume` still checks it in the
-  background, at most one check per VM at a time.
-- **Paused migration.** A paused VM migrates and stays paused on the
-  target, which pulls all its pages from the source. Resuming it there
-  waits (up to 30 s) for that pull, so it never runs split across hosts.
-
-#### Checkpoint format (versions 2 and 3)
-
-A template records the host it was built on: CPU vendor, family and model,
-the CPU feature bits KVM offered its guest, the XSAVE layout, and the
-Firecracker version and build. Checkpoints and migrations pin their template
-by content id and so carry its guest CPU. Every snapshot load (run, restore,
-resume, and a migration target before its source pauses) refuses a host with
-a different CPU model or Firecracker, a missing feature bit or another XSAVE
-layout, naming the mismatch. Extra feature bits are fine. Templates built
-before this record must be rebuilt.
-
-A checkpoint is a directory that is written in full or not at all. The
-destination's directory may belong to an unprivileged user while the daemon
-runs as root, so nothing follows a path that user can change:
-
-- **Staging.** The destination's directory is opened and pinned by fd. Files
-  are created with `O_EXCL|O_NOFOLLOW` inside a root-only (0700)
-  `.flexvm-staging-<pid>-<n>/ck` directory in it, also pinned by fd.
-  Firecracker writes the VM state into the VM's own run directory, from
-  where it is copied in.
-- **Ownership.** Files are fchowned to the destination directory's owner.
-- **Publish.** Everything is fsynced, then renamed fd to fd into place with
-  `RENAME_NOREPLACE` (checkpoints are never overwritten or modified), and
-  the destination directory is fsynced.
-- **Durability failure.** If that last fsync fails, the manifest is
-  durably removed before the VM resumes. If that fails too, the VM stays
-  paused and is marked failed.
-- **Restore.** Every file is opened with `O_NOFOLLOW` and must be a regular
-  file.
-- **Leftovers.** A later checkpoint into the same directory clears staging
-  that a dead daemon left behind.
-
-| file | contents |
-|---|---|
-| `manifest.json` | line 1: checksum of the rest; then JSON with the format version, name, address, template name and content id, machine (vCPUs, base/max/hotplugged MiB), guest page count, page counts and the length and checksum of each file |
-| `vmstate` | Firecracker's state-only snapshot |
-| `pagemap` | `FVPGMAP2`, run and data page counts, then runs `(first page, count, DATA\|ZERO, index in pages)` and the CRC32C of every page in `pages` |
-| `pages` | DATA pages back to back, in roughly guest page order |
-
-The pager's PRESENT pages are a superset of what changed: template pages
-read in by prefetch are PRESENT too. The writer therefore compares each page
-with the template and with zero. A page equal to the template, or zero over
-a template hole, is BASE and is not stored. A zero page over template data
-is a ZERO run. Anything else is DATA.
-
-A restore checks the manifest, `vmstate` and `pagemap` (whose DATA runs
-must tile `pages` exactly) before it loads anything, and checks every page
-of `pages` against its CRC32C as it reads it. A bad page kills the VM
-rather than letting it run on wrong memory. The checksums catch corruption,
-not deliberate tampering.
-
-The writer copies each page once and reads it once more to checksum it and
-check it for zeroes (plus a template compare where the template has data). Up to 12
-threads take 1 MiB units of PRESENT pages in turn. A thread copies its unit
-out of Firecracker with `process_vm_readv`, compares each page with the
-template (only where the template has data) and computes its CRC32C and
-whether it is all zero in the same read (SSE4.2, three interleaved streams).
-It then reserves the unit's place at the end of `pages` and writes its DATA
-pages there with `pwritev` and `O_DIRECT`, straight from its buffer, so the
-page cache is never involved. Units land in the order they finish, which the
-page map records, so no thread waits for another. `pages` is created in the
-staging directory and preallocated (`fallocate`) for every PRESENT page
-before the VM pauses, which is what lets ext4 run the direct writes in
-parallel; it is trimmed to what was written.
-
-An incremental checkpoint (format 3) adds `parent` to the manifest: the
-parent's path (`../NAME` when they share a directory, else absolute) and id
-(its manifest's checksum line). Its page map lists only pages that changed
-since the parent's pause, with a third kind, TEMPLATE (the template's page,
-a run only). A restore follows the chain (at most 64 deep), checks each
-link and that it names the template and size its child does, refuses a
-parent that is missing or whose id changed, and flattens the maps: each page
-is read from the newest checkpoint that has it. Deleting or rewriting a
-parent breaks its children.
-
-#### Copy-on-write and incremental checkpoints
-
-A checkpoint of a VM that runs on (`--keep-running`) pauses it only to save
-its vCPU/device state and to arm userfaultfd write protection (uffd-wp); the
-pages are written while it runs. A guest write to a page not saved yet
-faults, the pager saves that page first and only then lets the write
-through, so the checkpoint is exactly the memory at the pause.
-
-- **Packets are held during the pause.** Taking the tap down for the
-  snapshot deletes the VM's /32, so packets for it would otherwise follow
-  the host's default route for the 15–50 ms pause. As in a migration, just
-  before the pause the address is pointed at the daemon's hold device; before
-  the resume the held packets are injected into the VM's own tap and the
-  route goes back to it, so they arrive ahead of newer traffic. A checkpoint
-  reports them as `held_packets`. A 1 kHz UDP stream through 6 checkpoints
-  lost 59 datagrams (7–11 per pause) before, none now
-  (`scripts/faults.py ckpt_packet_hold`).
-- **No Firecracker change for write tracking.** The pager registers write-protect mode
-  (`UFFDIO_REGISTER` with `MODE_MISSING|MODE_WP`) on Firecracker's existing
-  userfaultfd and its ranges. Nothing has to be requested at `UFFDIO_API`
-  time: write-protect faults are reported with `UFFD_PAGEFAULT_FLAG_WP`
-  regardless, `WP_UNPOPULATED` is not needed (a page not populated at the
-  pause is the template's or zero, which the page map records) and
-  `WP_ASYNC` would let writes through unsaved. Checked on 6.18 against a
-  context created like Firecracker's (`EVENT_REMOVE` only).
-- **Write tracking.** The first keep-running checkpoint registers write
-  protection and protects all guest memory while the VM still runs (in 2 MiB
-  calls: KVM retries guest faults anywhere in a range the kernel is
-  changing, so one call over a region would stall the vCPUs; 70–90 ms
-  per GiB populated here). From then on a write fault unprotects a 64 KiB
-  block and marks it dirty, as do installs and discards. At each
-  checkpoint's pause only the pages dirtied since are protected again, so
-  the pause does not grow with memory size. They are protected range by
-  range (ranges closer than 64 pages merged: a call costs about as much as
-  walking that many populated pages, ~19 µs here); only when the calls
-  would cost more than walking every populated page of the region is the
-  whole region protected at once. A guest that rewrote 600 scattered pages
-  of 1 GiB written: pause 25–35 ms, protect 11–17 ms (was 49–84 and 34–64
-  ms, when more than 256 ranges meant protecting the whole region).
-- **The pause.** Pause through the API, save the state (as for a
-  migration), take the dirty pages, re-protect them, arm copy-on-write for
-  the pages to save, resume: 17–30 ms here at any size (was 125 ms at 256 MiB
-  and 1.5–1.9 s at 4 GiB).
-- **The copy.** The parallel writer reads each unsaved page out of
-  Firecracker and writes it as before. A write fault on an unsaved page
-  copies its block into memory (a "rescue": 120–250 µs here, a heavily
-  loaded host) before unprotecting it; writers take the rescued copy. Past
-  256 MiB of rescued copies a fault waits for the writers to reach its page
-  instead. Writers never unprotect anything, so tracking continues.
-- **KVM and devices.** KVM's own writes to guest memory (kvmclock through
-  its pfn cache, steal time and PV EOI through user accesses) go through
-  the host page tables, so they fault like the guest's: protecting a range
-  invalidates KVM's mappings (MMU notifier), and the cache refills with a
-  write fault. Measured: every checkpoint takes write faults on the
-  kvmclock page (which only KVM writes) and the steal-time pages right after
-  the resume, and its contents equal the memory at the pause. Writes that
-  KVM makes without faulting (the preempted flag) fail on a protected page
-  and are skipped. Firecracker's device emulation writes through its
-  mapping too; a device thread blocked on a fault waits only for the pager,
-  which never waits for Firecracker.
-- **Discards.** The kernel zaps a page right after the pager reads the
-  REMOVE event for it, so a balloon or virtio-mem discard must not be read
-  while pages are unsaved. So none is made during the copy:
-  - **Free page reports are held.** Before the resume the daemon sends
-    `PATCH /balloon/reporting/hold` (`firecracker/0003`): Firecracker leaves
-    the guest's reports in the queue, neither discarding nor acknowledging
-    them, until `.../release` after the copy (also on failure) processes
-    them. A hold whose answer is lost counts as held, and a release that
-    fails for 5 s is retried by the controller, under the VM's
-    reservation, until it lands. The guest's reporting worker just waits for the acknowledgement
-    (it reports asynchronously; nothing else in the guest waits on it).
-    The one batch in flight, 32 blocks of 2 or 4 MiB, stays off the
-    guest's free lists meanwhile: 90 MiB measured, and allocating all of
-    MemAvailable during a held copy works, without OOM or hung tasks.
-  - **Measured** (guest rewriting 1 GiB, two threads allocating, touching
-    and freeing 512 MiB every 1.6 s; disk throttled to 300 MB/s so the copy
-    takes 6 s at 1.7 GiB and 13–15 s at 4 GiB, long enough for reports;
-    3 runs each): without the hold every run with a report during the copy
-    stalled all faulting vCPUs once for 1.2–1.3 s (1.7 GiB) or 2.9–3.6 s
-    (4 GiB); with it no discard reaches the pager, the worst page write is
-    65–96 ms (faults waiting for the slowed writers past the rescue budget,
-    as before) and nothing reaches 134 ms; p99.99 is unchanged (0.1–0.5 ms for
-    the rewriter, 1–4 ms for the allocating threads, including the
-    guest's own page faults). `scripts/faults.py cow_reports_held` checks
-    that reports are held during a copy and carried out after it.
-  - **Balloon inflate and virtio-mem** happen only on the host's request:
-    flexvm's balloon target stays 0 (the guest never inflates on its own,
-    and `deflate_on_oom` is off), and virtio-mem resizes need the VM's
-    reservation, which the checkpoint holds.
-  - **Fallback.** A REMOVE that comes anyway (a Firecracker without the
-    patch, where the hold request fails and is logged) is still safe:
-    before each read the pager probes for a queued REMOVE (re-protecting an
-    unsaved page fails with EAGAIN while one is queued) and first saves
-    everything left, in memory with 8 threads if it fits in a quarter of
-    available memory, else by waiting for the writers. The guest's faults
-    wait meanwhile (the kernel refuses every ioctl until the event is
-    read): 1.2–3.6 s stalls here (see below). A REMOVE that slips in between the probe and the
-    read, or writers that stall, invalidate the checkpoint instead of
-    saving wrong contents.
-- **Other operations** wait for the copy: migration, pause, suspend and
-  resizes need the VM's reservation, which the checkpoint holds. A kill
-  stops the copy (the checkpoint fails). Exec works (the VM is `running`;
-  `ls` shows `checkpoint_copy`).
-- **Failure.** A copy that fails publishes nothing and the VM runs on. A
-  daemon crash leaves only root-only staging, as before.
-- **Incremental** (`--incremental`): writes only the pages dirtied since the
-  VM's last checkpoint here that it ran on after (taken since it last
-  arrived on this host), as a delta that names its parent (format 3). The
-  delta is chosen over writing a merged full image because it costs time
-  and space in proportion to what changed (35 MiB and 90–110 ms for a 4 GiB
-  VM with a small writer, against 4.2 GiB and 1.5–1.9 s); the price is that
-  restores read a chain and parents must be kept. Before writing a delta
-  the whole chain is verified (and must stay under 64 links), and just
-  before publishing it is walked again through the manifests' parent
-  references and must have the same ids. The check covers metadata and page
-  checksum lists; page data is checked when read, except that a `--stop`
-  delta (whose VM is then gone) reads every page it inherits first. Re-arming
-  write tracking (after a failed re-protection) forgets the dirty history,
-  so the next delta needs a full checkpoint first. A failed checkpoint gives back the
-  dirty pages it took, so the last good one stays the base, and every page
-  stays either protected or dirty. `--stop` can be incremental too.
-  Tracking costs a write fault per 64 KiB block written between
-  checkpoints, and the first protect makes KVM refault each page once.
-
-`scripts/faults.py` checks this with `scripts/memwriter.c`, a guest program
-that rewrites its memory all the time in a known order, each page stamped
-with its iteration and a salt from RDRAND, and checks every page against its
-own record before rewriting it, plus all of them on request at an iteration
-boundary. A restored copy finds any page saved with contents from after the
-pause (or before its last write before it). The daemon also hashes guest
-memory during the pause (`ckpt_memhash` test fault), which must equal the
-hash of what the checkpoint restores (`ckhash`).
-
-### Memory
-
-A VM never needs a memory size: it must be able to grow to host RAM without
-the guest OOM killer firing first. Growth by hot-plug is reactive, though,
-and a guest can allocate faster than a 1 s controller notices. So growth does
-not wait on the host:
-
-- **Pre-plugged.** Templates are snapshotted with `PLUG_MIB` (4 GiB) of
-  virtio-mem already plugged, so a VM starts with ~5 GiB of RAM. The memory
-  is free in the snapshot (holes in the template file), and guest pages cost
-  the host only once touched. Only the page structs (1/64) are data: the
-  template's memory file grows from 48 to 131 MiB. The controller never
-  shrinks a VM below this, because unplugging means offlining, which walks
-  the page structs.
-- **Overcommit.** The guest runs with `vm.overcommit_memory=1`, so one
-  allocation larger than the guest's current RAM succeeds and grows as it is
-  touched. Under the default heuristic, `bytearray(1 << 30)` in a 230 MiB
-  guest failed with ENOMEM before touching a page, which no host reaction
-  could fix.
-- **Asking, not polling.** flexvm-init (`guest/src/mem.rs`) runs everything
-  it starts under a memory cgroup, `/vm`, whose `memory.high` sits
-  `headroom(MemTotal)` below MemTotal. That is the same mark the daemon keeps
-  free (a quarter of the guest, at least 1 GiB). Commands and the image app
-  go in `/vm/work` and readiness checks in their own groups under `/vm`;
-  flexvm-init itself stays outside, so the throttle never slows the thread
-  that lifts it. Crossing the mark wakes the agent (a `memory.events`
-  notification, no timer), which sends `MEM <available KiB> <total KiB>` to
-  the host on vsock port 53. The daemon resizes at once instead of waiting
-  for its next tick.
-- **The guest is untrusted.** A request may be at most 128 bytes and must
-  arrive within 500 ms; malformed ones are dropped. Requests are acted on at
-  most every 50 ms per VM; the rest get `busy`. The guest's size comes from
-  Firecracker, not from the guest; what it says is free only steers growth.
-  Each step grows by at most a quarter of the guest. All growth, from guest
-  requests and ticks alike, is admitted against `--reserve` under one host-wide
-  lock, with the last 10 s of grants counted as used (plugged memory shows up
-  in MemAvailable only once touched). A refused guest is told `full` and
-  marked starved. Admission is not enforcement: a guest can still fill memory
-  that is already plugged, the 4 GiB pre-plug included (#54).
-- **Wait, don't die.** Allocations that outrun the plug are throttled by the
-  kernel at `memory.high` rather than OOM-killed. Memory block uevents move
-  the mark as memory arrives. The agent subscribes to them before it first
-  reads MemTotal, and re-reads it on every reply and retry. If the host answers `full` (at the ceiling), or
-  nothing arrives within 3 s, the agent lifts the throttle, and the guest
-  behaves as it would without it.
-- **Kernel memory grows with the plug.** The page structs of plugged memory
-  (1/64 of it), page tables and all other kernel allocations need kernel
-  memory; movable memory cannot hold them. The guest onlines hot-plugged
-  blocks with the kernel's `auto-movable` policy (ratio 20:1): movable while
-  there is at least 1/20 as much kernel memory (boot memory plus hot-plugged
-  kernel blocks), otherwise as kernel memory. When every block went movable,
-  kernel memory was boot memory only: a 256 MiB base ran out at ~13 GiB
-  plugged and the guest panicked ("System is deadlocked on memory", #97).
-  Now a 256 MiB guest grows to the full ceiling. The default base is still
-  256 MiB + 1/32 of the ceiling (1280 MiB on a 32 GiB host; untouched, it
-  costs nothing), so such a guest's first ~24 GiB stay movable. The ratio
-  gives kernel memory about 2.5 times what page structs and page tables
-  need, which is capacity, not a guarantee: a kernel-heavy workload (many
-  processes, large slab caches) can still exhaust it. Unplug
-  takes movable blocks first; kernel blocks may not unplug, but their free
-  pages go back through free page reporting like any other.
-  - **Rebuild templates.** The boot command line is part of the snapshot:
-    templates built before this change, and checkpoints of their VMs, keep
-    onlining everything movable and still panic past ~13 GiB plugged with a
-    256 MiB base. Rebuild them with `flexvm template`.
-- **Shrinking** is free page reporting (freed pages go back within seconds,
-  plugged or not), plus unplugging memory above the template's plug once a
-  guest has had more than three times its headroom free for 10 s. A shrink
-  the guest cannot finish (pinned kernel blocks, memory in use) never blocks
-  growth: a guest that runs short (it asks, or a tick sees it) cancels the
-  shrink and grows from what is plugged, and a resize still unfinished after
-  10 s is settled at what is plugged (`shrink_stall` in `scripts/faults.py`).
-- **Host accounting.** A VM is starved (and migrated by the pressure policy)
-  only when it is actually short of free memory and cannot grow here: at its
-  ceiling, or refused admission. Plugged-but-free memory is not counted as
-  use, and the pressure policy still picks VMs by host RSS.
-- **Resizes stay out of lifecycle operations.** A resize, whether from a
-  controller tick or from the guest asking, holds the VM's reservation, like
-  migrations, checkpoints and pauses do, and only touches a running VM. A
-  guest that asks during one is told `busy`, with one exception: while a
-  copy-on-write checkpoint copies a running VM, it may grow (never shrink).
-  The copy only reads pages the VM had at the pause, and memory plugged
-  later was unplugged then, so the copy never reads it. The checkpoint keeps
-  the plugged size it saved. Growth since the pause is dirty for the next
-  incremental checkpoint. Before, a guest that grew during a long copy was
-  OOM-killed (`cow_grow` in `scripts/faults.py`). A migration also waits for any
-  plug in flight to settle (`Vm::settle_hotplug`). The target refuses a
-  vmstate whose memory regions differ from its own.
-
-Measured with the 2 vCPU template (WSL2, loaded host), a fresh VM per trial,
-with each burst run right after `run`:
-
-| Burst right after `run` | before | now |
-|---|---|---|
-| 1 GiB in one buffer (`python3 -c 'b=bytearray(1<<30)'`, `dd bs=1G`) | ENOMEM 11/11 | ok 40/40 |
-| 1 GiB in 64 MiB chunks, to /dev/shm, or from 4 parallel writers | ok 9/9 (first touch is slow here) | ok 60/60 |
-| 3 GiB in one buffer, in chunks, or to /dev/shm | ENOMEM 2/2 (one buffer) | ok 19/19 |
-| 300 MiB with the controller slowed to 4 s (as if the guest were 4× faster) | OOM-killed 4/8 | - |
-| 2 GiB, 4 s controller, template with nothing pre-plugged | - | ok 14/14 (grown on guest requests) |
-
-Memory still goes back to the host. A VM's host RSS went from 19 MiB idle to
-2630 MiB holding 2.5 GiB in /dev/shm, then back to 96 MiB 15 s after the
-file was deleted. What stays resident is the page structs of the touched
-memory (1/64 of it) and small free fragments that free page reporting skips.
-Two details keep untouched plugged memory free:
-
-- Templates wait for free page reporting to finish before the snapshot.
-  Otherwise every VM reports the 4 GiB again after restore, and the walk over
-  its page structs costs ~64 MiB RSS per VM.
-- The pager copies 16 template pages per fault only when faults are
-  sequential. Strided reads, such as reporting touching one page struct per
-  4 MiB block, used to pull in 16 times what they touched. Recorded working
-  sets are padded to 16-page blocks instead, so restores still prefetch
-  around what they touch.
-
-Cost, measured against main on the same host. Run latency alternated the two
-daemons trial by trial (60 runs each); migration used four alternating rounds
-of `flexvm bench --dirty-mib 200`, 15 trials each:
-
-| | main | now |
-|---|---|---|
-| Idle VM host RSS | 18 MiB | 9–23 MiB |
-| `run` p50 from the hot pool | 4.7 ms | 4.4 ms |
-| `run` p50 with no hot pool (snapshot load) | 38.0 ms (load 26.8) | 39.6 ms (load 26.4) |
-| Migration downtime p50 / p90 | 52.5 / 82.5 ms | 48.5 / 59.3 ms |
-| Background pull p50 (200 MiB dirty) | 330 ms | 303 ms |
-
-### Migration ownership
-
-Each migration has a random id. Once the target may have received the vmstate,
-the source never resumes on its own: it resumes only on an explicit refusal, or
-when the target, asked about that id, says it aborted (asking also fences the
-id off, so it can never start later). If the target committed, the source stays
-paused and serves memory until the target releases it with the same id;
-release is idempotent and ignores any other VM by that name. Meanwhile `kill`
-refuses that paused copy (kill the VM where it runs); `kill --force` kills it
-anyway, without withdrawing the address, and the target loses every page it
-has not pulled. If the target
-cannot be asked, the VM stays paused on the source until it can. A daemon
-locks its run directory (refusing to start if another daemon uses it, or one
-inside or around it) and kills any Firecracker a previous instance left there,
-confirming each is dead, before it answers anything, so "never seen this id" is true of a restarted target too
-(a source resuming then rolls the VM back to the pause point; it never runs
-twice). It also removes the run directories those Firecrackers left. A
-target forgets an aborted migration's id 10 minutes after it aborted, and a
-committed one's 10 minutes after its source answered the release, so the
-record of migrations stays bounded.
-
-The page server (`pages`) answers its request line with one JSON line,
-`{"ok": true}` or why it refuses, before the binary protocol, so a target
-reports the source's reason rather than a hang-up. It serves reads of at most
-1 MiB (the largest a pager asks for) and drops a connection that asks for
-more, that sits idle for 10 minutes, or whose VM is no longer that
-migration's source (released or killed; checked every second). Peer-sized lengths are bounded
-everywhere a daemon reads them: request lines (16 MiB), a migration's header
-(256 MiB, parsed straight into page runs), vmstate (64 MiB), preloaded pages
-(4096).
-
-`FLEXVM_FAULTS=1` lets a daemon accept `{"op": "fault", "fault": F, "ms": N}`
-for any of the faults in `FAULTS` (`flexvm/src/daemon.rs`, described at
-`Daemon::inject`; anything else is refused): migration (`pages`, `route`,
-`lost_ack`, `status`, `prepare_fail`, `short_incoming`, `slow_preload`,
-`kill_prepared`), restores (`restore_no_hold`, `restore_before_run`,
-`restore_after_run`, `resume_kill`, `started_fsync`, `started_unmark`),
-checkpoints (`ckpt_memhash`, `ckpt_fail_protect`, `ckpt_no_hold`,
-`ckpt_abort`, `ckpt_slow`, `ckpt_fail_write`, `ckpt_copy_wait`) and guest
-requests (`guest_drop`, `guest_lose_reply`). `scripts/faults.py` uses it to check
-each failure path, and disarms every fault after each scenario so none leaks
-into the next (`ms: 0` disarms one).
-
-### Hot pool
-
-`run` takes a VM from the template's hot pool when one is ready: it was
-restored in the background exactly like any other VM (same pager, so it
-migrates and checkpoints like any other), then paused. Starting it is: route
-its address to its tap, resume, `START`. When the pool is empty (or the
-paused VM's resume never reached its Firecracker), `run` falls back to
-loading the snapshot then and there. A resume that reached it and failed
-(an error answer, a timeout, a Firecracker that died) fails the `run`
-instead: Firecracker resumes vCPUs one by one, so the guest may have run,
-and a second copy could repeat what it did.
-
-- **Size.** `--hot N` per template (default 2, `0` disables) within
-  `--hot-mib` of host memory for all of them together, the VM being loaded
-  included (default 512; a paused 24-vCPU VM costs ~26 MiB here). One
-  background worker refills, one VM at a time; it gives back the newest
-  paused VMs when the stock outgrows the budget, and loads nothing while the
-  host is below `--reserve` + one VM. What a VM costs starts as an estimate
-  (working set + 8 MiB) and becomes the largest RSS measured; a load that
-  comes out over the budget is dropped, its size learned, and that template
-  backs off (5 s, doubling up to 5 min) instead of loading again at once. A
-  template that fits is loaded before one that does not. Paused VMs that died
-  are dropped on the worker's next round (at most a second), and one that
-  cannot be measured counts as its estimate. The memory controller drops the pool
-  (and any load in progress) when the host goes below `--reserve`.
-- **Refills wait for runs.** A load (snapshot load, the guest's first run)
-  competes with a `run`'s resume and `START`, so none starts while a `run`
-  is in progress: the worker refills once it has answered (or after 2 s of
-  back-to-back runs).
-- **Generations.** `flexvm template` publishes each build as an immutable
-  `templates/.gen/<content id>/` and points `templates/NAME` at it with one
-  atomic symlink swap. It never deletes a generation: VMs, migrations, pooled
-  VMs and checkpoints refer to them by content id. Remove old ones by hand
-  (`rm -r templates/.gen/<id>`) once no daemon has a VM from them (`flexvm ls`
-  shows each VM's template id). The daemon resolves the link on every `run` (one
-  readlink), so new VMs and new pooled VMs use the new generation while
-  running VMs keep theirs; the stock of the old one is dropped. An incoming
-  migration uses the generation with the source's content id if the host has
-  it. A template opened from a plain directory (made before generations) is
-  read through a handle on that directory, so swapping another one over its
-  path cannot mix files either.
-- **Settling.** The first run after a restore is slow (Firecracker's first
-  resume, the guest catching up and handling the new VMGenID: ~10 ms of extra
-  `NET` latency here). Each pooled VM therefore runs once in the background,
-  as long as the reseed below takes plus 50 ms, then is paused. Firecracker
-  calls in a load have deadlines, and shutdown kills a load in progress.
-- **RNG.** Firecracker gives every snapshot load a new VMGenID; on it, the
-  guest kernel reseeds its RNG and then logs `random: crng reseeded due to
-  virtual machine fork` (add_vmfork_randomness). The agent's `FORKS` counts
-  those lines in `/dev/kmsg`, and a pooled VM is only stocked once the count
-  has gone up, so no two handed-out VMs of a template share RNG state; until
-  then only the idle agent runs. That is what is provable here: this kernel's
-  vmgenid sends no uevent, and `/dev/sysgenid` is not ordered against the
-  reseed. With an agent that has no `FORKS`, a pooled VM is only checked to
-  answer (logged once). VMs restored on the fallback path or migrated reseed
-  after resume, as before.
-- **Clock.** The guests use the TSC clocksource, so Firecracker's
-  `clock_realtime` (which adjusts kvmclock) has no effect: a VM's wall clock
-  starts at the template's snapshot time, whether pooled or not (minutes to
-  days behind). The TSC keeps running while a VM is paused, so a pause adds no
-  further error. The agent's `START <ip> <unix time> [dns]` (sent instead of
-  `NET`) sets the address and steps `CLOCK_REALTIME` to the host's time, and
-  answers only then. A pooled VM gets its clock stepped (`CLOCK`) while it
-  settles, so `START` at take finds it right and skips `clock_settime`, which
-  can take tens of ms in a 24-vCPU guest. A migration target, after resuming,
-  and a source that resumes after an aborted migration send `CLOCK` in the
-  background (up to three tries, until a round trip is under 5 ms), so the guest gets back
-  the downtime too: measured within ±2 ms. If a clock request fails it may
-  still be on its way into the guest, so the next migration first waits for
-  the agent to answer a ping (it serves requests in order) rather than let it
-  land, stale, after the snapshot. Agents that predate `START` get `NET` and
-  keep the stale clock.
-  KVM saves the realtime clock that `clock_realtime` needs only while the VM
-  has a master clock, and drops that for good once the vCPUs' TSCs were
-  restored more than a second apart: a migration target whose load waited
-  on its source for guest memory (each vCPU's kvmclock page faults during
-  the load). Firecracker refuses to load such a VM's later snapshots with
-  `clock_realtime`, so a restore that gets that error tries once more on a
-  fresh Firecracker without it; the clock is stepped afterwards as above. A
-  restore also tries once more when its Firecracker died with nothing given
-  up, and the idle and hot pools never hand out a Firecracker that has died.
-  Retries stop at the resume: snapshots are always loaded with the vCPUs
-  stopped and resumed only once loaded, and a failed resume is never
-  retried, as the guest may have run (test fault `resume_kill`). A
-  migration target whose prepared load fails that way retries on a fresh,
-  unprepared Firecracker before it commits (the guest never ran, and the
-  paused source still serves every page, the preloaded ones included); once
-  committed, a failed resume leaves the VM failed there.
-
-### Networking
-
-```
- guest eth0 192.168.100.128/32 ── tap (host) ── route 192.168.100.128/32 dev tap
-   gateway 169.254.1.1, MAC pinned           peers: route 192.168.100.128/32 via <host>
-   (identical in every VM)                   LAN:   host answers ARP for it (proxy ARP)
-```
-
-- Every guest's network setup is the same except for its address. The gateway
-  is a fixed link-local address whose MAC is pinned in the guest, and every
-  tap uses that MAC. So clones of one template need no per-VM changes beyond
-  `NET <ip>`, which the guest agent applies with one rtnetlink message.
-- Taps are created ahead of time with the pooled Firecracker processes. The
-  host route and a permanent neighbour entry are set with rtnetlink while the
-  snapshot loads, so networking adds nothing to start time.
-- udev with `MACAddressPolicy=persistent` can replace a new tap's MAC after
-  the daemon set it to the gateway MAC, which leaves the guest's pinned
-  gateway entry pointing nowhere. The daemon puts the MAC back (one
-  `RTM_SETLINK`) whenever it hands a tap to a VM. To stop udev touching the
-  taps at all, install a link file:
-
-  ```ini
-  # /etc/systemd/network/10-flexvm-taps.link
-  [Match]
-  OriginalName=fv*
-
-  [Link]
-  MACAddressPolicy=none
-  ```
-- Addresses come from the daemon's `--vm-ips` range, which is authoritative:
-  **every host's range must be disjoint** from the others'. That is a
-  precondition for the operator to ensure; the daemon only checks it best
-  effort. It refuses to start when a peer that answers has an overlapping
-  range (one that does not answer is not checked, and a WARNING says so),
-  and hands out no address in an overlap it learns of later (it checks
-  every 10 s).
-  **Only an address's home host hands it to a new VM**: `run --ip` is
-  refused for an address outside the host's range ("start the vm on its
-  home host, or use --ip auto"). A restore of another host's address
-  (its checkpoint's, or `--ip`) borrows it: it asks the home host (op
-  `lend_ip`), which checks the address is free (no VM there, not lent),
-  gives it a new generation, records the loan durably and answers with the
-  generation; the restore then claims the address with it, and gives it
-  back (a withdrawal) if it fails. A home host that does not answer fails
-  the restore ("restore with --ip auto"). An address leaves its home only
-  this way or with a VM that migrates away: it stays reserved there
-  ("lent", recorded in `STATE_DIR/lent-ips.json`, which outlives restarts)
-  until that VM is killed wherever it is (its host tells the peers), or it
-  migrates back. If that message is lost, the address stays taken; `flexvm
-  unlend IP` frees it. Leaks, never collisions.
-- **Generations.** Each VM's address carries a generation that orders the
-  VMs that have had it. Its home host gives a new, higher one every time it
-  hands the address out (run, restore). A VM keeps its generation through
-  migrations and suspends (`GEN` in the suspended checkpoint). Lent records
-  store it (records from before generations count as 0, older than any),
-  and route announcements and withdrawals carry it.
-  - Every host keeps the newest generation it has seen per address, and
-    whether that one was withdrawn, in `STATE_DIR/gens/` (one small file per
-    address, written before the message is acted on or answered, or before
-    a claim of a new generation exists; a failure refuses the message or
-    fails the claim), plus a high-water mark of the generations it hands
-    out (reserved 1024 at a time, so a restart never repeats one). The last
-    check that an address is free (not used, lent or in an overlapping
-    peer range) and the claim happen in one critical section.
-  - A message about an older generation, or an announcement of one already
-    withdrawn, is ignored: a late withdrawal for a VM long gone (say one an
-    operator unlent, whose address then went to a new VM that migrated away
-    too) leaves the newer VM's loan and route alone, and a late
-    announcement brings back no route for a VM that is gone, also after a
-    restart. A withdrawal frees a loan of its generation or an older one.
-  - Route messages are taken only for addresses of this host's range, a
-    peer's, or a VM here, and leave the route of an address a VM here has
-    claimed (running, starting or arriving) with that generation or a
-    newer one alone; a newer one supersedes such a claim. Deciding a route
-    and changing it in the kernel happen under that address's lock, as do
-    migration route switches (which check the VM's generation first) and
-    packet holds. An arriving VM's generation is recorded before it is
-    taken in and checked again when it commits; if it does not commit, the
-    newest route a peer announced for the address is put back. A migration
-    source that aborts does not resume a VM whose generation was withdrawn
-    or superseded meanwhile: that copy is killed, and the newest route a
-    peer announced replaces the hold.
-  - A suspended VM whose generation was withdrawn or superseded meanwhile
-    is not resumed (checked under the address's lock, held until the VM
-    has resumed). Suspend records the generation in the checkpoint before
-    publishing it; one without (or with a stale one) is quarantined at
-    startup (left on disk, logged, not brought back); its checkpoint
-    restores with `--ip auto`.
-  - Hosts of a cluster must be upgraded together: the page server's answer
-    line and the generations are part of the protocol.
-- Reachability:
-  - **Peers** get a route pushed to them: `<vm-ip>/32 via <host underlay ip>`.
-    Routes via an address local to the daemon's network namespace (including
-    loopback) are skipped, so test daemons sharing a host keep each other's
-    tap routes; the first skip is logged.
-  - **The LAN** (`--announce-dev eth0`): the host answers ARP for its VMs
-    (proxy ARP) and sends a gratuitous ARP whenever a VM arrives. Other
-    machines on the LAN therefore follow a migrated VM without any
-    configuration. Give VMs addresses from the LAN's subnet and they can use
-    the LAN's normal gateway for internet access.
-- On migration, the target routes the address to its new tap before the VM
-  resumes. The guest keeps its address and TCP state, so connections
-  continue, and packets that arrive during the downtime are held, not lost
-  (`hold.rs`):
-  - Just before pausing the VM, the source routes its address to a TUN
-    device of its own (`fv<port>h`; the one route this adds). A thread queues
-    what arrives there, up to 4 MiB per VM, beyond that dropping and counting.
-  - Once the target answers (the VM runs there), the source opens a stream
-    on the migration connection and, once the target accepts it, sends the
-    queue (length, sequence number, packet), then whatever reached the TUN
-    device meanwhile. It waits until the target has injected all of it,
-    points its own route at the target, and sends the few packets that were
-    still on their way. The target takes one stream per migration, on that
-    connection, for that VM instance only, and stops it if the VM is killed
-    or moves on. Nothing is resent: a stream that breaks off, or a source
-    whose answer was lost, loses the rest (counted). Sequence numbers count
-    gaps and drop duplicates.
-  - The target injects each packet into the guest as an Ethernet frame sent
-    out of the VM's tap from an AF_PACKET socket (from the gateway's MAC to
-    the guest's): Firecracker reads it like any other frame, byte for byte as
-    it arrived, with no host routing involved; packets that are not whole
-    IPv4 packets for the VM's address are dropped (and counted). Only when the
-    stream ends (or none opens within 250 ms; then none is taken any more)
-    does it announce the address (route pushes to peers, gratuitous ARP,
-    each only while that VM still runs there), so held packets come before
-    traffic sent straight to it.
-  - If the migration aborts, the source injects the held packets into the
-    VM's own tap before resuming it. If it lost track of the outcome, the
-    packets wait for it (even after the paused copy is gone): dropped if the
-    VM went to the target, injected into its tap here if it has come back.
-
-  `migrate` reports `held: {packets, kib, dropped, injected, dropped_target}`.
-  TCP peers stall for about the downtime instead of a retransmit timeout
-  (200 ms, 400+ ms when the retransmit is lost too). Taps carry a host-scope
-  address (`169.254.1.2`, not answered in ARP: `arp_ignore=3`), because the
-  reverse-path filter drops everything an addressless tap sends once the
-  guest's address is routed to the TUN device, even in loose mode (a per-tap
-  `rp_filter=0` would not help where `all` is 2, as distributions set it), and
-  queue up to 4096 frames, so an injected burst fits while the guest catches up.
-
-### Firecracker patches
-
-`firecracker/0001-snapshot-state-only.patch`: an empty `mem_file_path` in
-`PUT /snapshot/create` saves only the microVM state. Stock Firecracker always
-writes all guest memory, which would make migration downtime proportional to
-RAM and double memory use on a host that is already short.
-
-`firecracker/0002-prepare-snapshot-load.patch`: `PUT /snapshot/prepare`, with
-the body of a load, does the part of a snapshot load that does not depend on
-the VM being loaded, from the given snapshot (the template's): it creates the
-KVM VM, its vCPUs and memory slots, hands guest memory to the UFFD handler,
-binds the vsock socket and maps the pmem file into KVM. The next
-`PUT /snapshot/load` of a compatible snapshot (same vCPUs, machine
-configuration and memory layout; hot-plugged slots are replugged to match)
-then only restores vCPU, VM and device state. Under nested virtualization
-those prepared steps are most of a load (creating a KVM memory slot alone
-takes 3–10 ms on a busy host). Without the patch, Firecracker rejects the
-path and flexvm loads the whole snapshot during the pause.
-
-`firecracker/0003-hold-free-page-reporting.patch`: `PATCH
-/balloon/reporting/hold` and `PATCH /balloon/reporting/release`. While held,
-the balloon leaves free page reports in their virtqueue (it consumes the
-queue notification but pops nothing); a release processes whatever is
-queued. Not saved in snapshots: a restored balloon is not held, and reports
-queued at the snapshot are processed at its first resume, which kicks
-every queue.
-
-## Measured (WSL2, Ryzen 9 3900X, nested KVM)
-
-| | |
-|---|---|
-| Template cold boot (one time) | 250 ms (2 vCPU), 420 ms (24 vCPU), then seconds to plug 4 GiB and let free page reporting finish |
-| `run` → guest agent answering with its address set, hot pool | **4–7 ms** p50, 6–14 ms p90 (resume ~2 ms, `START` ~3 ms; host load ~20) |
-| same, hot pool empty (snapshot load) | 45–54 ms p50 under the same load (36–56 ms on a quieter host) |
-| of which Firecracker snapshot load | 22–50 ms (mostly KVM memslot setup, which is slow under nested virt) |
-| Migration downtime, idle VM, idle host | **10 ms** p50, 14 ms p90 (2 vCPU); 25 / 31 ms (24 vCPU) |
-| TCP ping-pong through two migrations (`scripts/nettest.sh`, host load ~20 on 24 threads) | worst stall **69–158 ms**, at most 1.6x that round's downtime (12 rounds); before packets were held: 206–220 ms, one retransmit timeout every round |
-| UDP stream through the same, 5,000 datagrams/s | **0 lost**, 0–17 reordered per round (12 rounds); before: 184–770 lost per round. At 20,000/s: 0 lost, 0–14 reordered |
-| nginx image, `run` → first HTTP response from the host | **205 ms** p50 (run 56 + nginx startup 144); `--warm`: **55 ms** p50 (run 31 + first request 22) |
-| Background memory pull | ~1.1 GB/s over loopback TCP |
-| Post-copy faults, 500 MiB written then read back right after the migration (host load ~15; 4 interleaved rounds of 8) | REMOTE fault p50 **1.0–1.3 ms** (was 4.2–5.2 ms, fetched on the event thread), p99 2.6–4.2 ms (was 12.6–16.8); template/zero faults p50 41–57 µs (was 1.3–1.6 ms, queued behind fetches); all faults blocked 0.77–0.98 s in all (was 1.33–1.6). The read itself barely changes here: most of it is KVM mapping each page again under nested virtualization |
-| Idle VM host RSS | 9–22 MiB (with 4 GiB plugged) |
-| pause / resume (daemon side; RPC round trip ~2.3 ms) | **0.6 / 0.7 ms** (2 vCPU), 1.5 ms resume (24 vCPU) |
-| checkpoint `--keep-running`, 256 / 1024 / 4096 MiB written in the guest: VM paused | **20 / 18 / 24–31 ms** (was 125 / 406–428 / 1456–1923 ms); write protection armed beforehand while it runs (first checkpoint only): 20 / 95–125 / 270–380 ms; whole checkpoint 220–250 / 450–620 / 1900–2200 ms |
-| ... with a guest rewriting 2 × 256 MiB during the copy | pause 17–56 ms; 650–2700 write faults, 340–1970 of them saving 20–120 MiB first (120–250 µs each); writer iterations > 100 µs: 4–9k (idle 0.1–1k), worst single stall 35–50 ms at 1 GiB (one 100–150 ms stall before 2 MiB protect chunks); free page reports are held during the copy (they cost 0.35–3.6 s stalls before) |
-| incremental checkpoint of a 4 GiB VM (small writer running) | **paused 29–50 ms, 92–112 ms in all, 35 MiB written** (full: 4238 MiB, 1.5–1.9 s) |
-| checkpoint `--stop`, by memory touched: 256 / 1024 MiB written in the guest | write_pages 113–249 / 483–521 ms (was 435–480 / 2019–2892 ms); paused 286–430 / 760–816 ms (was 653–703 / 2335–3255), including Firecracker's exit; disk: 4–5 GB/s O_DIRECT, 1 GB/s buffered |
-| restore → guest agent answering | **33 / 27 / 67 ms** (snapshot load 28 / 24 / 63 ms); whole checkpoint paged in after 39 / 153 / 509 ms |
-| suspend (checkpoint + free) / resume of a suspended VM to ready | 127 / 448 / 2012 ms; 27 / 28 / 36 ms |
-| suspended VM host RSS | 0 (Firecracker gone) |
-
-Lifecycle numbers are from `flexvm bench --lifecycle` with the 2-vCPU template,
-5 trials per size, restoring on the second daemon of the same host
-(`bench/*-lifecycle.json`). The guest clock step after a restore adds another
-35–100 ms after ready.
-
-## Quickstart
+## Setup
 
 ```sh
 ./scripts/fetch.sh               # firecracker, guest kernel 6.1, ubuntu 24.04 base
 ./scripts/build-firecracker.sh   # patched firecracker -> artifacts/firecracker (needs musl-tools, libseccomp-dev)
 ./scripts/build-rootfs.sh        # artifacts/rootfs.ext4, and artifacts/flexvm-init for image templates
 cargo build --release
-
-sudo ./target/release/flexvm template default             # all CPUs, ceiling = host RAM
-
-# host A (192.168.1.10) and host B (192.168.1.11) on one LAN; VMs use spare LAN addresses
-sudo flexvm daemon --listen 192.168.1.10:7070 --peer 192.168.1.11:7070 \
-    --announce-dev eth0 --vm-ips 192.168.1.128-192.168.1.191 --dns 192.168.1.1
-sudo flexvm daemon --listen 192.168.1.11:7070 --peer 192.168.1.10:7070 \
-    --announce-dev eth0 --vm-ips 192.168.1.192-192.168.1.250 --dns 192.168.1.1
-
-export FLEXVM_HOST=192.168.1.10:7070
-flexvm run web                                  # -> 192.168.1.128
-flexvm exec web 'free -m'
-flexvm ls
-flexvm migrate web --to 192.168.1.11:7070       # address and connections follow
-export FLEXVM_HOST=192.168.1.11:7070
-flexvm pause web; flexvm resume web             # vCPUs stopped, memory kept
-flexvm suspend web; flexvm resume web           # state to local disk, memory freed; lazy restore
-flexvm checkpoint web /data/web-1 --stop        # complete state to disk; VM stops
-# or, running on: flexvm checkpoint web /data/web-1; flexvm checkpoint web /data/web-2 --incremental
-flexvm --host 192.168.1.10:7070 restore /data/web-1   # same template id needed; same name and address
-flexvm --host 192.168.1.10:7070 kill web
+sudo ./target/release/flexvm template default   # cold-boot and snapshot a template (all CPUs, ceiling = host RAM, 4 GiB plugged)
 ```
 
-`scripts/netlab.sh up && scripts/netlab.sh daemons` builds the same setup on
-one machine out of network namespaces: two hosts and a client on a simulated
-LAN. `scripts/nettest.sh` builds a private copy of it (namespaces `fv5*`,
-`192.168.155.0/24`, touching only its own processes), migrates a VM back and
-forth under a TCP ping-pong and a sequence-numbered UDP stream, and fails on
-any lost datagram or a TCP stall over twice the downtime.
+flexvm runs as root (KVM, userfaultfd, routes, cgroups). Commands below
+assume `flexvm` is on the PATH and `FLEXVM_ARTIFACTS` points at `artifacts/`.
 
-`sudo scripts/e2e.py` is what CI (`.github/workflows/ci.yml`) runs on a
-GitHub-hosted runner with KVM: it builds a template and an image template,
-starts two hosts on loopback (ports 7140/7141, VM addresses 10.140.0.x and
-10.141.0.x, run directories `/run/fvci-*`), checks run, exec, ls, pause and
-resume, migration with an open TCP connection, checkpoint and restore,
-suspend and resume, and that kill and shutdown leave nothing behind, then runs
-a selection of `scripts/faults.py` scenarios against the same hosts.
-
-The daemon must run as root: it uses `/dev/kvm`, privileged userfaultfd,
-`process_vm_readv` on Firecracker and cgroup v2. Its taps, hold device and
-cgroups are named after its port (cgroups also after its listen address and
-network namespace), so one daemon per port and network namespace: a second
-one (on another address) refuses to start, before it cleans up anything
-(abstract socket `flexvm-port-<port>`). On SIGTERM or SIGINT it stops
-taking new VMs and migrations, lets the ones in progress finish, waits until
-every VM paused here as a migration source has been released by its target
-(killing it earlier would lose the pages the target has not pulled), stops its
-VMs and pooled Firecrackers, tells the sources of VMs that migrated in to drop
-their copies, and removes its taps, cgroups and run directory. It logs what it
-is waiting for every 5 s; a second signal stops the waiting and logs what that
-costs.
-
-Firecracker API, vsock and UFFD sockets live in short private directories
-under `/run/flexvm/s` (or `/tmp/flexvm-s-<uid>` if that is unusable), one per
-daemon or template build, named after a hash of its run or build directory,
-with a counter-named slot per Firecracker. They must be real directories owned
-by the process's user with mode 0700. Sockets are removed with their VM or pool
-slot, and a restarted daemon removes what its predecessor left. Deep artifact,
-template and run paths do not affect socket path lengths.
-
-## Container images
+## Run a VM
 
 ```sh
-sudo flexvm template web --image nginx:1.27                    # any registry: Docker Hub, ghcr.io, gcr.io, ...
-sudo flexvm template app --image ./app.tar --env PORT=8080     # `docker save` output or an OCI archive
-sudo flexvm template py  --image ./oci-layout --cmd "python3 -m http.server 8000"
-sudo flexvm template web-warm --image nginx:1.27 --warm        # snapshot nginx running and ready
-flexvm run web1 --template web
-curl http://<ip>/
-flexvm logs web1 -f
+flexvm run web                  # foreground: the VM's output here, Ctrl-Z pauses, Ctrl-C destroys
+flexvm run web -d               # in the background; prints {"name", "ip", "pid", ...} once it answers
+flexvm run job -- make test     # runs one command; exits with its status, the VM goes with it
+flexvm run web --ip 10.200.0.9 --template small
 ```
 
-`REF` is a registry reference (`nginx`, `ghcr.io/org/app@sha256:…`), an
-uncompressed `docker save` / OCI archive, or an OCI image layout directory.
-Overrides follow `docker run`: `--entrypoint` and `--cmd` (words, or a JSON
-array; a new entrypoint drops the image's command), `--env K=V` (repeatable),
-`--workdir`, `--user name|uid[:group|gid]`.
+```sh
+flexvm ls
+NAME             IP              TEMPLATE   STATE             PID VCPU  RSS MiB  MAX MiB
+web              10.200.0.1      default    running        41522   24       27    32000
+```
 
-Images are untrusted input processed as root. Every document and blob is
-checked against its digest (layers while unpacking into private staging,
-and their uncompressed contents against the config's `diff_ids`, all before
-publishing the root filesystem), and builds are bounded: `--max-download-mib`
-(8192, all layers compressed), `--max-unpacked-mib` (16384), `--max-file-mib` (4096),
-`--max-entries` (1,000,000), plus 4 MiB per manifest or config and 1 MiB per
-tar entry's metadata (PAX records and GNU long names together, one of each).
-Readiness commands run as the app does (same user and restrictions) in a
-cgroup of their own that is killed and checked empty when the check ends; a
-failed cleanup fails the check. Non-root checks need cgroup2 with
-`cgroup.kill` and fail closed without it. Root checks are trusted (root in
-the guest can leave any cgroup); without cgroup2 their session is killed.
+```sh
+flexvm exec web 'free -m'       # a shell command in the guest; exits with its status
+```
 
-- **Pull.** Native registry v2 client (no docker or skopeo): anonymous bearer
-  tokens, or basic credentials from `$DOCKER_CONFIG`, `~/.docker/config.json`
-  or, under sudo, the invoking user's. Indexes resolve to linux/amd64. Blobs
-  are streamed to `ARTIFACTS/images/blobs/sha256/` and checked against their
-  digests; gzip, zstd and uncompressed layers are supported. Archives are read
-  in place (layers are located inside the tarball, not extracted). Registry
-  credentials go only over HTTPS to the registry itself or its token service
-  (auth.docker.io for Docker Hub); redirects to blob storage carry none.
-- **Root filesystem.** Layers are applied in order as root, with whiteouts and
-  opaque directories, ownership, modes, xattrs, device nodes, symlinks and
-  hard links. Every path resolves inside the image (`openat2(RESOLVE_IN_ROOT)`),
-  so absolute symlinks behave as in a container and a layer cannot write
-  outside it; whiteouts must name one entry, and removal walks directory fds.
-  Layers are unpacked in `--image-staging` (default `/var/lib/flexvm/staging`),
-  which must be root-owned and 0700 with an ancestry only root can change, and
-  is used through a descriptor, so other users can neither reach the image's
-  setuid files and device nodes nor swap the directory mid-build. The image
-  cache is trusted by whoever can write it (it is reused as is); writes into it
-  never follow symlinks. flexvm adds `/sbin/flexvm-init`, its mount points,
-  `/etc/flexvm/app.conf` (argv, env, workdir, uid/gid/groups resolved against
-  the image's own `/etc/passwd` and `/etc/group`), an `/etc/hosts`, and an
-  empty `/etc/resolv.conf` if the image has none (the daemon's `--dns` fills
-  it at `run`). `mkfs.ext4 -d` writes the read-only image. Built filesystems
-  are cached in `ARTIFACTS/images/rootfs/` by image config digest, flexvm-init
-  and overrides, and templates attach the cached file in place, so templates of
-  one image share one copy in the page cache (it is never rewritten; deleting it
-  breaks those templates). Builds of the same cache key are serialized with
-  a lock; entries are published with fsync and no-replace rename, with their
-  `.ok` marker last. Every reuse also fsyncs the cache directory under the
-  lock; a failed fsync refuses the entry. Templates only ever get durably
-  marked entries, so a build that finds an unmarked one (an interrupted
-  build) removes it and rebuilds; a marked entry with missing files is
-  refused. The template's content ID covers that file as its `rootfs`
-  component plus the image's manifest and config digests and the
-  app config, so it differs whenever the image does.
-- **Process.** flexvm-init stays PID 1. It starts the entrypoint in its own
-  session with the image's env, workdir and credentials, reaps it and records
-  its exit status, and keeps its stdout and stderr (interleaved) in a 1 MiB
-  ring: `flexvm logs NAME` prints it and the status, `-f` follows until the
-  app exits. There is no restart policy. Nothing beyond the entrypoint is
-  assumed: distroless and scratch images work, and `flexvm exec` on an image
-  without `/bin/sh` exits 127 with a message saying so. `/dev/stdout` and
-  friends exist, so images that log to them work. With a non-root `--user`
-  (or image `User`), the app runs with `no_new_privs` and no capabilities in
-  its bounding set, so setuid binaries and file capabilities in the image do
-  not work for it (and cannot make it root again); flexvm-init is not
-  dumpable, so such an app cannot ptrace or read it. That does not stop an
-  app running as root with `CAP_SYS_PTRACE`, which can reach flexvm-init
-  anyway (root in the guest owns the guest).
-- **When the app starts.** By default at `run`: the snapshot is an idle booted
-  guest and `run` sends `APP` after the address is set (`app_start`, ~17 ms
-  for nginx), then the app starts as it would anywhere. With `--warm` the
-  template starts the app, waits until it is ready (`--ready-port N`: something
-  accepts on 127.0.0.1:N in the guest, default the lowest exposed TCP port;
-  `--ready-cmd CMD`: a shell command exits 0, killed when the deadline passes; `--ready-timeout S`, default 120)
-  and snapshots it running.
+A background VM's output (an image app's stdout and stderr, flexvm's own
+messages) goes to `/run/flexvm/vms/web.log`.
 
-> **`--warm` clones share userland state.** Every VM restored from a warm
-> template starts from the same memory: anything the app generated before the
-> snapshot (RNG seeds, session and TLS keys, UUIDs, tokens, caches) is
-> identical in every clone. Firecracker's VMGenID makes the guest kernel
-> reseed its RNG on restore, but nothing tells the app. Only use `--warm` for
-> apps that hold no secrets or per-instance identity at startup, or that
-> regenerate them per connection from the kernel RNG.
+## Pause, suspend, destroy
+
+A VM is its process, so the usual signals work:
+
+```sh
+kill -TSTP 41522                # pause the vCPUs (memory kept); Ctrl-Z in the foreground
+kill -CONT 41522                # resume; `flexvm resume web` does the same
+kill 41522                      # SIGTERM: suspend to disk, free its memory, exit
+flexvm resume web               # bring a suspended VM back (in a new process)
+flexvm kill web                 # destroy it, running or suspended; Ctrl-C in the foreground
+```
+
+A closed terminal (SIGHUP) leaves a foreground VM running; its output then
+goes to `/run/flexvm/vms/NAME.log`.
+
+Exit statuses of `flexvm run`: with `-- CMD`, CMD's own; 128 + the signal
+that ended it (130: destroyed by SIGINT, Ctrl-C or `flexvm kill`; 143:
+suspended by SIGTERM); 0 when it migrated away or `checkpoint --stop`
+stopped it. flexvm's own failures use the range shells and container
+runtimes keep for themselves: 125 when it could not start the VM (or gave it
+up), 124 when the VM died under it (`flexvm ls` then shows it `failed`, and
+why, until `flexvm kill`).
+
+A VM migrating away stays paused on its source until the target has all its
+memory; `flexvm kill` refuses that copy (kill the VM where it runs), and
+`kill -KILL PID` gives it up (the target loses the pages it has not pulled).
+
+A suspended VM keeps its name and address; `ls` shows it `suspended`.
+
+## Checkpoint and restore
+
+```sh
+flexvm checkpoint web /data/web-1                   # the VM runs on (paused ~20 ms)
+flexvm checkpoint web /data/web-2 --incremental     # only what changed since the last one
+flexvm checkpoint web /data/web-3 --stop            # and destroy it
+flexvm restore /data/web-1                          # same name and address
+flexvm restore /data/web-1 --name web2 --ip auto    # a fork, with a new address
+flexvm restore /data/web-1 --paused                 # held until SIGCONT
+```
+
+A checkpoint restores on any host with the same template (by content id).
+Restored on another host with its own address, the VM borrows the address
+from its home host, which refuses one in use or lent out; `--ip auto` picks
+a new one.
+
+## Migrate
+
+Each host that takes migrations runs a listener; its flags are the host's
+configuration (kept in `/var/lib/flexvm/host.json`). It is an optional
+helper, and can be socket-activated:
+
+```sh
+# host A (192.168.1.10) and host B (192.168.1.11) on one LAN; VMs use spare LAN addresses
+flexvm listen 192.168.1.10:7070 --peer 192.168.1.11:7070 --announce-dev eth0 \
+    --vm-ips 192.168.1.128-192.168.1.191 --dns 192.168.1.1
+flexvm listen 192.168.1.11:7070 --peer 192.168.1.10:7070 --announce-dev eth0 \
+    --vm-ips 192.168.1.192-192.168.1.250 --dns 192.168.1.1
+
+flexvm migrate web 192.168.1.11:7070      # on A: web now runs on B, same address, connections intact
+```
+
+Every host's `--vm-ips` must be disjoint, and the hosts must list each other
+with `--peer`: a listener serves its peers' addresses only. `--reserve MIB`
+(default 1024) is the memory a host keeps free: below it, VMs are moved to a
+peer with room.
+
+## Fast starts
+
+```sh
+flexvm standby 2                 # keep 2 VMs of the default template restored and paused
+flexvm standby --template web 1
+flexvm standby 0                 # none
+```
+
+`run` takes one (resume and set the address: ~5 ms) and a replacement starts.
+Without one, `run` loads the snapshot (~50-100 ms).
+
+## Templates from container images
+
+```sh
+flexvm template web --image nginx:1.27                       # any registry
+flexvm template app --image ./app.tar --env PORT=8080        # `docker save` output or an OCI archive
+flexvm template py --image ./oci-layout --cmd "python3 -m http.server 8000"
+flexvm template web-warm --image nginx:1.27 --warm           # snapshot the app running and ready
+flexvm run web1 --template web -d && curl http://<ip>/
+```
+
+Overrides follow `docker run`: `--entrypoint`, `--cmd`, `--env K=V`,
+`--workdir`, `--user`. `--warm` snapshots the app once it is ready
+(`--ready-port N` or `--ready-cmd CMD`); every VM from a warm template starts
+with the same userland state (RNG seeds, keys), so use it only for apps that
+hold no secrets at startup. Details: [docs/images.md](docs/images.md).
 
 ## Benchmarks
 
 ```sh
-flexvm --host 192.168.1.10:7070 bench                                        # run
-flexvm --host 192.168.1.10:7070 bench --to 192.168.1.11:7070 --dirty-mib 500 # run + migrate
-flexvm --host 192.168.1.10:7070 bench --template web --ready-http 80           # run until the app answers
-flexvm --host 192.168.1.10:7070 bench --lifecycle /data/ckpt --to 192.168.1.11:7070 --dirty-mib 0,256,1024
+flexvm bench --template small                                     # run latency
+flexvm bench --to 127.0.0.1:7131 --to-state S --to-run R --dirty-mib 500   # run + migrate to another host on this machine
+flexvm bench --lifecycle /data/ckpt --to-state S --to-run R      # pause, checkpoint, restore, suspend
 ```
 
-`--ready-port N` / `--ready-http N` add a `client` group: `run_rpc` as the
-client sees it, then `app_ready` until the VM accepts a TCP connection on N
-(or answers `GET /`), and their `total`.
+Reports land in `bench/`. With `--dirty-mib`, the guest reads its memory
+back before and right after the migration; `post_copy` has the difference
+(`stall`) and the target's fault service per kind.
 
-With `--dirty-mib`, the guest also reads its file back before the migration
-and right after it, while its pages are still being pulled; the `post_copy`
-group has both read times, their difference (`stall`), and the target's fault
-service: counts and p50/p99/max latency of faults served locally, fetched
-(`remote`) or that waited for another installer (`wait`), their total
-(`fault_blocked`), and fetch, queueing and pull times. (On nested KVM the
-read after a migration is dominated by KVM mapping each page once again,
-not by the pager: compare the fault numbers.)
+## Tests
 
-`--lifecycle DIR` runs, for each memory size, VMs that are paused and resumed
-ten times, checkpointed into DIR with `--stop`, restored on `--to`, then
-suspended and resumed there. The report covers every phase, including the
-background page-in. `--scatter-pages N` adds keep-running checkpoints
-before that: one that arms write tracking, one with nothing written since,
-and one after the guest rewrote N pages spread evenly over its file (the
-`cow` group: pauses, re-protect time, ranges protected, MiB dirty).
+`sudo scripts/e2e.py` is what CI runs on a KVM runner: two hosts on loopback,
+the commands above, then a selection of `scripts/faults.py` scenarios (every
+failure path of migration, checkpoints and suspend, by injected faults).
+`scripts/nettest.sh` migrates a VM back and forth under TCP and UDP traffic
+between network namespaces and fails on a lost datagram or a long stall.
 
-Each trial runs a fresh VM, optionally writes N MiB into its /tmp and migrates
-it (waiting for the full pull), then kills it. Phases are back-to-back daemon
-timings that sum to `total`; the report lands in `bench/<date>-<sha>.json` with
-p50/p90/p99/max per phase, raw samples and host context.
+## How it works
 
-## Layout
+- **A VM is a process.** It spawns its Firecracker (which dies with it), runs
+  the userfaultfd pager that serves guest memory, owns its tap and route,
+  and answers on a control socket (`/run/flexvm/vms/NAME.sock`: exec,
+  checkpoint, migrate). Host-wide state (which names and addresses are in
+  use, address generations, migration records) is in small flock-guarded
+  files under `/var/lib/flexvm` and `/run/flexvm`.
+- **Start** restores a template snapshot; memory is faulted in from a shared
+  sparse image. Standby VMs are restored ahead of time.
+- **Memory**: templates come with 4 GiB plugged (free until touched); past
+  that the guest asks for more over vsock the moment it runs low, admitted
+  against the host's reserve. Freed pages go back through free page reporting.
+- **Migration** is post-copy: the target is prepared first, then the source
+  pauses, sends only vCPU and device state (~20-200 KiB), the target resumes
+  and pulls pages on fault and in the background. Packets that arrive during
+  the downtime are held and delivered. The source resumes only if the target
+  says the migration aborted.
+- **Checkpoints** write only pages that differ from the template, while the
+  VM runs (copy-on-write through userfaultfd write protection).
+- **Networking**: each VM has a /32 routed to its tap; peers get a route,
+  the LAN a gratuitous ARP (proxy ARP), when it moves.
 
-```
-flexvm/src/
-  main.rs      command line
-  daemon.rs    RPC, migration, elastic memory controller, pressure policy, test faults
-  lifecycle.rs pause/resume, checkpoint, restore, suspend; per-VM operation lock
-  checkpoint.rs checkpoint format: crash-consistent writer, verified page-file reader, delta chains
-  cow.rs       copy-on-write state of a running VM's checkpoint (write faults save pages first)
-  crc32c.rs    CRC32C of checkpoint pages (SSE4.2, three interleaved streams)
-  uffd.rs      userfaultfd pager (template / zero / migration source / checkpoint file) + page server
-  template.rs  cold boot, snapshot, sparse image, working-set recording
-  vm.rs        restore into a pooled Firecracker, checkpoint, stats
-  hot.rs       hot pool: restored, settled and paused VMs per template
-  net.rs       taps, rtnetlink routes and neighbours, gratuitous ARP, address ranges
-  hold.rs      holds a migrating VM's packets while it is paused, injects them where it resumes
-  fc.rs        Firecracker process, API client, warm pool
-  socket.rs    short private directories for Firecracker API, vsock and UFFD sockets
-  guest.rs     vsock client for flexvm-init
-  util.rs      errors, JSON framing, connects with deadlines, phase timers, pidfds, /proc helpers
-  bench.rs     `flexvm bench`: run and migration latency per phase
-  bench_lifecycle.rs `flexvm bench --lifecycle`: pause, checkpoint, restore, suspend
-  image/       container images: references, registry client, archives and
-               layouts, layer unpacking, root filesystem build
-guest/src/main.rs     flexvm-init: PID 1, overlay root, vsock exec agent
-guest/src/session.rs  resumable exec sessions: output rings, attach, tombstones
-guest/src/app.rs      image entrypoint: start, supervision, log ring, readiness probe
-guest/src/mem.rs      memory cgroup mark, asks the host for memory over vsock
-guest/src/net.rs      guest network setup with ioctls and rtnetlink (no iproute2 needed)
-firecracker/          patches on top of Firecracker v1.17.0
-scripts/              setup, builds, fault and network tests
-```
+Design and internals: [docs/process-per-vm.md](docs/process-per-vm.md)
+(processes, state, migration protocol, invariants) and
+[docs/internals.md](docs/internals.md) (pager, checkpoint format,
+copy-on-write, packet holds, clocks, Firecracker patches, measurements).
 
-## Limitations / next steps
+## Limits
 
-- **Post-copy risk**: until the background pull finishes (~1 s per GB), the
-  VM's memory is split across two hosts, and losing either one loses the VM.
-- **Networking is IPv4 only.** Peers form a full mesh (every daemon lists
-  every other one). Address allocation is disjoint per-host ranges
-  (configured by hand), not real cluster-wide address management.
-- **Packets held during a migration or checkpoint** are capped at 4 MiB per VM; a faster
-  flood loses the excess (counted). A few packets can be reordered around
-  the moment the source's route switches. IPv4 only; the guest's own packets
-  in the instant before the pause are lost on hosts with strict
-  (`rp_filter=1`) reverse-path filtering.
-- **NAT on a host would break connections on migration**, because the
-  translation state stays behind. Use routable VM addresses (as above) or do
-  NAT at a dedicated gateway.
-- **Restoring through the userfaultfd pager costs ~20 ms more** than a plain
-  file-backed restore here. Fresh VMs could be restored straight from the
-  template file (sharing unmodified pages between VMs too), with the pager
-  kept for migration targets.
-- **vsock connections reset on migration.** `flexvm exec` reconnects for up
-  to 30 seconds, trying the original daemon and its peers. Guest commands keep
-  running; each session retains up to 4 MiB of recent output. Output waits for
-  the attached client, and for 30 seconds after it drops, rather than overwrite
-  anything not yet sent to it; past that the buffer wraps and exec reports output
-  loss explicitly. A finished session keeps its output and exit until the CLI
-  acknowledges it, or until its client has been gone for a minute (see below).
-  The daemon's own
-  guest requests (`START`/`NET`, `PING`, `CLOCK`) go again when their
-  connection is refused or drops before an answer, all I/O within one
-  deadline (5 s; 2 s for a ping; `info` counts the retries): the agent
-  serves them in order, so a retry never lands before an earlier try. A
-  command's body (after its request line) may take up to 30 s in all to
-  reach the agent, which right after a restore or migration can be busy
-  faulting its memory in; at most 16 bodies are read at once (more are
-  refused), each at most 1 MiB, request lines at most 4 KiB.
-- **Templates must be identical on every host.** Creation records a content ID
-  and component hashes in `meta.json`; migration checks the ID before pausing
-  and again on arrival. Copy the template and its artifacts to each host;
-  independently booted snapshots generally have different IDs. Older templates
-  without IDs must be recreated. Keep template files and artifacts immutable
-  while VMs use them. Files are rehashed (before pausing) only when their
-  size, mtime, ctime or inode changed; IDs are a 64-bit non-cryptographic hash
-  that detects accidental differences on trusted hosts, not tampering.
-- The control channel is plain TCP with no authentication; it must not be
-  exposed outside a trusted network.
-- **Container images**: linux/amd64 only; no Docker credential helpers; no
-  restart policy, health checks, volumes or stop signal; stdout and stderr
-  share one ring; `logs -f` stops when the VM migrates away (vsock resets).
-  Building needs root (to keep ownership) and an uncompressed archive.
-- **A copy-on-write checkpoint's copy holds back the VM's memory changes:**
-  free page reports wait until it is done (memory the guest frees then
-  goes back to the host only afterwards), and the guest cannot grow by
-  hotplug meanwhile, so a guest still growing fast can hit its OOM killer
-  during a long copy. A discard that reaches the pager anyway (Firecracker
-  without `0003`) still stalls the guest until the unsaved pages are saved.
-  `--stop` checkpoints and suspends still pause for the whole write. Write tracking stays on once a VM has
-  had a keep-running checkpoint (one fault per 64 KiB block written between
-  checkpoints); a restored VM starts without it, so its first checkpoint is
-  full (installing its pages write-protected would allow a delta against
-  the checkpoint it came from).
-- **The restore working set is the template's** (pages a fresh VM touches to
-  become ready), not the checkpointed VM's own recent working set. This host
-  has no idle page tracking to record that. Everything else is paged in
-  address order in the background.
-- A checkpoint, including a suspended VM, needs the template it was made
-  from, and the template's content id must match. Rebuilding a template
-  strands its checkpoints, so keep old templates while their checkpoints
-  matter.
-- **Guests whose agent predates `START`/`CLOCK` keep the clock they were
-  saved with** (the template's snapshot time, minus each migration's
-  downtime); see "Hot pool" for how the agent's requests fix it.
-- A guest that gets a different address on restore keeps its old one too,
-  unless it has iproute2 to drop it.
-- **Growth past the pre-plugged 4 GiB is still reactive.** The guest asks
-  the moment it crosses its mark and is throttled meanwhile, but plugging
-  takes ~250 ms per GiB here. The throttle is lifted after 3 s (or when the
-  host is full), and a guest that keeps allocating can then OOM. Unplugging
-  also only covers memory above the template's plug.
-- **First touch of guest memory is slow under nested virt** (~10 ms per MiB
-  here: a userfaultfd zero-page fault plus an EPT fault per page). This
-  throttles bursts on its own; on bare metal the guest-side mechanisms above
-  carry more of the load.
-- Snapshot load is dominated by KVM memslot creation in this nested
-  environment; expect much lower numbers on bare metal.
-
-### Resumable exec protocol
-
-Legacy `EXEC <len>`, `SPAWN <len>`, `PING` and `NET` retain their wire format.
-Sessions use `SESSION <id> <len>\n` followed by exactly `len` command bytes,
-`ATTACH <id> <offset>\n`, or `CLOSE <id>\n`. The client chooses a random ID;
-retrying SESSION with the same ID and command attaches to the existing process
-from offset zero. Reusing an ID for another command fails. IDs contain up to
-64 ASCII letters, digits, underscores or hyphens; commands are at most 1 MiB.
-
-Frames retain `[kind u8][payload length u32 LE][payload]`. SESSION and ATTACH
-first return kind 4 with the session ID. A session has at most one attachment
-(connection streaming its output): SESSION or ATTACH replaces it, and the guest
-shuts the previous connection down, so its stream just ends. Session stdout/stderr (kinds 1/2)
-prefix their bytes with an absolute `u64 LE` offset in the combined output
-stream. Kind 3 contains the final `u64 LE` offset and `i32 LE` exit code.
-Kind 5 contains the earliest retained `u64 LE` offset and reports output loss;
-clients must not silently skip it. Kind 4 also carries `waiting` heartbeats,
-`error: ...` failures, or `closed` for CLOSE. Socket writes happen outside the
-output ring mutex. Reading an exit does not discard it: the CLI sends CLOSE
-after receiving it, and the guest retains the ID as a tombstone until expiry
-so a delayed creation retry cannot execute the command again.
-
-At most 64 sessions are live (running, or finished and not yet closed); another
-SESSION fails with `error: too many sessions: ...`. A finished session whose
-client has been gone for a minute is closed by the guest (checked every minute,
-and whenever the limit is reached), its output freed. Closed sessions leave
-tombstones: small records outside that limit that expire five minutes after the
-close, and beyond 4096 the oldest one (if at least 30 s old) is dropped. Each
-live session's output ring keeps 128 KiB and grows towards 4 MiB from a shared
-pool, so all rings together hold at most 64 MiB; when the pool is spent, rings
-stop growing, and a detached client may then see kind 5 sooner.
-
-Backpressure: while a client is attached, and for 30 s after it drops, the
-command's output waits (its pipe fills and the command blocks) once half the
-ring is unsent to the latest attachment's offset, so nothing past that offset
-is overwritten. Consecutive output of one kind is stored in blocks of up to
-16 KiB however small the command's writes; a ring holds at most 4096 blocks,
-and output also waits once 2048 of them are unsent (output alternating between
-stdout and stderr in tiny writes), so that limit never drops unsent output
-either. Only the latest attachment's offset holds output back: a replaced
-client reattaching later gets kind 5 if its offset has meanwhile been
-overwritten.
-
-The daemon JSON exec request adds `session`, `action` (`start`, `attach`, or
-`close`), and `offset`; start also supplies `cmd`. Start/attach return the usual
-JSON success reply followed by session frames; close returns a JSON reply.
-Daemon info includes `peers` for recovery discovery.
+- Until a migrated VM has pulled all its memory (~1 s per GB) it depends on
+  both hosts.
+- IPv4 only; peers form a full mesh; address ranges are per host and set by hand.
+- The peer protocol is plain TCP, served to the peers' addresses only, without
+  authentication: trusted networks only.
+- An address lent to a restore elsewhere stays lent if that restore's host
+  dies before it starts the VM (a leak, never a collision).
+- `exec` reaches VMs on this host; one that migrates away ends its exec
+  saying where it went (the command keeps running there).
+- Templates must be identical on every host (checked by content id).

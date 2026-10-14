@@ -11,7 +11,8 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Runs on main are never cancelled.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -174,13 +175,13 @@ jobs:
         run: sudo python3 -u scripts/e2e.py --log-dir "$RUNNER_TEMP/e2e-logs"
 
       - name: Collect logs
-        if: failure()
+        if: failure() || cancelled()
         run: |
           mkdir -p "$RUNNER_TEMP/e2e-logs"
           sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/e2e-logs" || true
           sudo dmesg | tail -200 > "$RUNNER_TEMP/e2e-logs/dmesg.txt" || true
       - name: Upload logs
-        if: failure()
+        if: failure() || cancelled()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-logs

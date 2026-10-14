@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Measures what a TCP connection and a UDP stream see while a VM migrates
 # A -> B -> A, in a private network-namespace lab that only touches its own
-# namespaces, processes, run directories and cgroups (unlike test.sh, it never
-# kills Firecrackers it did not start). Run as root.
+# namespaces, processes, state directories and cgroups. Run as root.
 #
 #   ${P}A   $NET.1   host A, VM addresses $NET.128-$NET.191
 #   ${P}B   $NET.2   host B, VM addresses $NET.192-$NET.250
@@ -28,22 +27,24 @@ UDP_PPS=${UDP_PPS:-5000}
 MAX_UDP_LOSS=${MAX_UDP_LOSS:-0}
 host_A=$NET.1:7070
 host_B=$NET.2:7070
-run_A=/run/$P-a
-run_B=/run/$P-b
+dir_A=/run/$P-a
+dir_B=/run/$P-b
 name=nettest-$$
 work=$(mktemp -d /tmp/flexvm-nettest.XXXXXX)
-daemon_pids=()
-ns_A= ns_B= ns_C=
+listener_pids=()
 bg_pids=()
 failed=0
 
 say() { printf '%s\n' "$*" >&2; }
 die() { say "FAIL: $*"; exit 1; }
 
+# flexvm on host A or B, in its namespace (with the cgroup2 hierarchy that
+# `ip netns exec`'s fresh sysfs lacks).
 cli() {
-    local ns=$1 host=$2
+    local ns=$1 dir=$2
     shift 2
-    timeout 60s ip netns exec "$ns" "$flexvm" --host "$host" "$@"
+    timeout 60s ip netns exec "$ns" sh -c 'mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null; exec "$@"' sh \
+        "$flexvm" --artifacts "$artifacts" --state "$dir/state" --run "$dir/run" "$@"
 }
 
 wait_for() {
@@ -54,34 +55,33 @@ wait_for() {
     done
 }
 
-# Our Firecrackers: they log (stdout) into VM directories under our run
-# directories; their sockets live elsewhere.
-our_firecrackers() {
-    local p log
+# Our processes: listeners and VM processes, by the state directories on
+# their command lines (their Firecrackers die with them).
+our_processes() {
+    local p
     for p in /proc/[0-9]*; do
-        [[ $(cat "$p/comm" 2>/dev/null) == firecracker ]] || continue
-        log=$(readlink "$p/fd/1" 2>/dev/null) || continue
-        case $log in "$run_A"/*|"$run_B"/*) echo "${p#/proc/}" ;; esac
+        { tr '\0' ' ' < "$p/cmdline"; } 2>/dev/null | grep -qE -- "--state ($dir_A|$dir_B)/state" && echo "${p#/proc/}"
     done
 }
 
 teardown() {
-    local pid cg
+    local pid cg pids
     trap - EXIT INT TERM
     set +e
-    for pid in "${bg_pids[@]}" "${daemon_pids[@]}"; do kill "$pid" 2>/dev/null; done
-    for pid in "${bg_pids[@]}" "${daemon_pids[@]}"; do wait "$pid" 2>/dev/null; done
-    for pid in $(our_firecrackers); do kill -9 "$pid" 2>/dev/null; done
-    sleep 0.5
+    for pid in "${bg_pids[@]}"; do kill "$pid" 2>/dev/null; done
+    for pid in "${bg_pids[@]}"; do wait "$pid" 2>/dev/null; done
+    pids=$(our_processes)
+    for pid in $pids; do kill -9 "$pid" 2>/dev/null; done
+    sleep 1
     for ns in "${P}A" "${P}B" "${P}C" "${P}lan"; do ip netns del "$ns" 2>/dev/null; done
-    # The daemons' cgroups are named after their listen address and netns.
-    for cg in "/sys/fs/cgroup/flexvm/${NET//./_}_1_7070_ns$ns_A" "/sys/fs/cgroup/flexvm/${NET//./_}_2_7070_ns$ns_B"; do
-        [[ -d $cg ]] || continue
-        echo 1 > "$cg/cgroup.kill" 2>/dev/null
-        find "$cg" -mindepth 1 -depth -type d -exec rmdir {} + 2>/dev/null
-        rmdir "$cg" 2>/dev/null
+    # Each VM process's Firecracker had a cgroup named after the process.
+    for pid in $pids; do
+        for cg in /sys/fs/cgroup/flexvm/idle-"$pid"-*; do
+            [[ -d $cg ]] && rmdir "$cg" 2>/dev/null
+        done
     done
-    rm -rf "$run_A" "$run_B"
+    cp "$dir_A"/run/vms/*.log "$dir_B"/run/vms/*.log "$work"/ 2>/dev/null
+    rm -rf "$dir_A" "$dir_B"
     if (( failed )); then say "logs kept in $work"; else rm -rf "$work"; fi
 }
 
@@ -100,26 +100,25 @@ ip -n "${P}lan" link set br0 up
 for spec in A:1 B:2 C:10; do
     h=${spec%%:*}
     ip netns add "$P$h"
-    printf -v "ns_$h" '%s' "$(stat -L -c %i "/run/netns/$P$h")"
     ip link add eth0 netns "$P$h" type veth peer name "p$h" netns "${P}lan"
     ip -n "${P}lan" link set "p$h" master br0 up
     ip -n "$P$h" addr add "$NET.${spec#*:}/24" dev eth0
     ip -n "$P$h" link set eth0 up
     ip -n "$P$h" link set lo up
 done
-start_daemon() {
-    local ns=$1 listen=$2 peer=$3 run=$4 ips=$5
-    # ip netns exec remounts sysfs; restore the host cgroup2 hierarchy there.
-    ip netns exec "$ns" sh -c 'mount -t cgroup2 none /sys/fs/cgroup && exec "$@"' sh "$flexvm" --artifacts "$artifacts" daemon --listen "$listen" --peer "$peer" \
-        --run "$run" --announce-dev eth0 --vm-ips "$ips" > "$work/daemon-$ns.log" 2>&1 &
-    daemon_pids+=($!)
+start_listener() {
+    local ns=$1 dir=$2 listen=$3 peer=$4 ips=$5
+    mkdir -p "$dir/state" "$dir/run"
+    cli "$ns" "$dir" listen "$listen" --peer "$peer" --announce-dev eth0 --vm-ips "$ips" --prefix fvn > "$work/listen-$ns.log" 2>&1 &
+    listener_pids+=($!)
 }
-start_daemon "${P}A" "$host_A" "$host_B" "$run_A" "$NET.128-$NET.191"
-start_daemon "${P}B" "$host_B" "$host_A" "$run_B" "$NET.192-$NET.250"
-wait_for cli "${P}A" "$host_A" ls
-wait_for cli "${P}B" "$host_B" ls
+start_listener "${P}A" "$dir_A" "$host_A" "$host_B" "$NET.128-$NET.191"
+start_listener "${P}B" "$dir_B" "$host_B" "$host_A" "$NET.192-$NET.250"
+wait_for test -f "$dir_A/state/host.json"
+wait_for test -f "$dir_B/state/host.json"
+sleep 0.5
 
-addr=$(cli "${P}A" "$host_A" run "$name" | python3 -c 'import json,sys; print(json.load(sys.stdin)["ip"])')
+addr=$(cli "${P}A" "$dir_A" run "$name" --template "${TEMPLATE:-default}" -d | python3 -c 'import json,sys; print(json.load(sys.stdin)["ip"])')
 say "vm $name at $addr"
 
 cat > "$work/server.py" <<'PY'
@@ -180,11 +179,11 @@ threading.Thread(target=tcp, daemon=True).start()
 open("/tmp/fv-server-ready", "w").write("ready")
 udp()
 PY
-cli "${P}A" "$host_A" exec "$name" "sysctl -qw net.core.rmem_max=33554432 2>/dev/null || echo 33554432 > /proc/sys/net/core/rmem_max; cat > /tmp/fv-server.py <<'PY'
+cli "${P}A" "$dir_A" exec "$name" "sysctl -qw net.core.rmem_max=33554432 2>/dev/null || echo 33554432 > /proc/sys/net/core/rmem_max; cat > /tmp/fv-server.py <<'PY'
 $(cat "$work/server.py")
 PY
 python3 /tmp/fv-server.py </dev/null >/tmp/fv-server.log 2>&1 &"
-wait_for cli "${P}A" "$host_A" exec "$name" 'test -f /tmp/fv-server-ready'
+wait_for cli "${P}A" "$dir_A" exec "$name" 'test -f /tmp/fv-server-ready'
 
 cat > "$work/client.py" <<'PY'
 import pathlib, socket, struct, sys, time
@@ -252,11 +251,11 @@ absent() {
 running() { cli "$1" "$2" ls | awk -v n="$name" 'NR>1 && $1==n && $4=="running" {f=1} END {exit !f}'; }
 migrate() {
     local res
-    res=$(cli "$1" "$2" migrate "$name" --to "$3") || die "migrate to $3 failed"
+    res=$(cli "$1" "$2" migrate "$name" "$3") || die "migrate to $3 failed"
     python3 -c 'import json,sys; r=json.load(sys.stdin); print("  migrate downtime %s ms, rerouted %s ms, held %s" % (r["downtime_ms"], r["rerouted_ms"], r.get("held")))' <<< "$res" >&2
     python3 -c 'import json,sys; print(json.load(sys.stdin)["downtime_ms"])' <<< "$res" >> "$work/downtime-$round"
-    wait_for running "$4" "$3"
-    wait_for absent "$5" "$2"
+    wait_for running "$4" "$5"
+    wait_for absent "$1" "$2"
 }
 
 failures=0
@@ -271,17 +270,17 @@ for round in $(seq 1 "$ROUNDS"); do
     udp_pid=$!
     bg_pids+=("$udp_pid")
     sleep 0.5
-    migrate "${P}A" "$host_A" "$host_B" "${P}B" "${P}A"
+    migrate "${P}A" "$dir_A" "$host_B" "${P}B" "$dir_B"
     before=$(cat "$work/progress"); wait_for progress_after "$before"
     sleep 0.5
-    migrate "${P}B" "$host_B" "$host_A" "${P}A" "${P}B"
+    migrate "${P}B" "$dir_B" "$host_A" "${P}A" "$dir_A"
     before=$(cat "$work/progress"); wait_for progress_after "$before"
     sleep 0.5
     touch "$work/stop"
     wait "$client_pid" || { cat "$work/client-$round.log" >&2; die 'client failed'; }
     wait "$udp_pid" || { cat "$work/udp-$round.log" >&2; die 'udp sender failed'; }
-    wait_for cli "${P}A" "$host_A" exec "$name" "test -f /tmp/udp-$round.json"
-    udp=$(cli "${P}A" "$host_A" exec "$name" "cat /tmp/udp-$round.json")
+    wait_for cli "${P}A" "$dir_A" exec "$name" "test -f /tmp/udp-$round.json"
+    udp=$(cli "${P}A" "$dir_A" exec "$name" "cat /tmp/udp-$round.json")
     sed -n 's/^stalls/  TCP stalls/p' "$work/client-$round.log" >&2
     python3 - "$work/client-$round.log" "$work/downtime-$round" "$udp" "$MAX_UDP_LOSS" "$round" <<'PY' || failures=$((failures + 1))
 import json, re, sys

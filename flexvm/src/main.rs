@@ -1,106 +1,102 @@
 mod bench;
-mod bench_lifecycle;
 mod checkpoint;
 mod compat;
 mod cow;
 mod crc32c;
-mod daemon;
 mod fc;
 mod guest;
 mod hold;
+mod host;
 mod image;
-mod hot;
+mod lifecycle;
+mod listen;
+mod migrate;
 mod net;
 mod socket;
+mod standby;
 mod template;
 mod uffd;
 mod util;
 mod vm;
+mod vmproc;
 
 use std::io::{BufReader, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+use crate::host::Host;
 use crate::template::Paths;
-use crate::util::{proc_kb, recv_json, send_json, Result};
+use crate::util::{proc_kb, recv_json, Result};
+use crate::vmproc::Start;
 
 const USAGE: &str = "\
 flexvm: elastic Firecracker microVMs with post-copy live migration
 
-usage:
-  flexvm template NAME [--vcpus N] [--mem MIB] [--max MIB] [--plug MIB]
-                                                             cold-boot and snapshot a template (root)
-                [--image REF|ARCHIVE|DIR] [--entrypoint ARGV] [--cmd ARGV]
-                [--env K=V]... [--workdir DIR] [--user USER[:GROUP]]
-                [--warm [--ready-port N | --ready-cmd CMD] [--ready-timeout S]]
-                [--max-download-mib N] [--max-unpacked-mib N] [--max-file-mib N] [--max-entries N]
-                [--image-staging DIR]
-                                                             ... from a container image
-  flexvm daemon [--listen ADDR] [--advertise ADDR] [--run DIR]
-                [--peer ADDR]... [--reserve MIB] [--pool N]
-                [--hot N] [--hot-mib MIB]
-                [--vm-ips CIDR|FIRST-LAST] [--underlay IP]
-                [--announce-dev IFACE] [--dns IP] [--state-dir DIR]  run the host daemon (root)
-  flexvm run NAME [--template T] [--ip IP]                   start a VM from a template
-  flexvm ls                                                  list VMs
-  flexvm exec NAME CMD...                                    run a shell command in a VM
-  flexvm logs NAME [-f]                                      an image app's output (-f: follow)
-  flexvm migrate NAME --to ADDR                              live-migrate a VM to another daemon
-  flexvm pause NAME | resume NAME                            stop / restart a VM's vCPUs (memory kept)
-  flexvm suspend NAME                                        checkpoint to the daemon's --state-dir and free
-                                                             the VM's memory; `resume` restores it lazily
-  flexvm checkpoint NAME DIR [--keep-running | --stop]       write the VM's full state to DIR (new directory)
-                [--incremental]                              ... only what changed since its last checkpoint
-  flexvm restore DIR [--name N] [--ip IP|auto] [--paused]    start a VM from a checkpoint (same template id)
-  flexvm bench [--to ADDR] [--iterations N] [--dirty-mib N]  per-phase run/migrate latency into bench/
-               [--template T] [--ready-port N | --ready-http N]  ... and until an image app answers
-  flexvm bench --lifecycle DIR [--to ADDR] [--dirty-mib N,N..] pause/checkpoint/restore/suspend latency into bench/
-  flexvm kill NAME [--force]                                 stop a VM (--force: even a migration's paused source copy)
-  flexvm unlend IP                                           free an address lent to a VM that migrated away
+  flexvm run NAME [--template T] [--ip IP] [-d] [-- CMD...]
+                                     start a VM; the process is the VM (-d: in the background)
+  flexvm ls                          list VMs (with their pids)
+  flexvm exec NAME CMD...            run a shell command in a VM
+  kill -TSTP PID / kill -CONT PID    pause / resume a VM (Ctrl-Z works in the foreground)
+  kill PID                           suspend a VM to disk (SIGTERM); its memory is freed
+  flexvm resume NAME [-d]            bring a suspended VM back
+  flexvm kill NAME                   destroy a VM, running or suspended (Ctrl-C works too)
+  flexvm checkpoint NAME DIR [--stop] [--incremental]
+                                     write the VM's state to DIR (a new directory)
+  flexvm restore DIR [--name N] [--ip IP|auto] [--paused] [-d]
+                                     start a VM from a checkpoint
+  flexvm migrate NAME HOST:PORT      live-migrate a VM to the host listening there
+  flexvm listen [ADDR] [--peer ADDR]... [--vm-ips CIDR|FIRST-LAST] [--underlay IP]
+                [--announce-dev IFACE] [--dns IP] [--reserve MIB] [--prefix P]
+                                     configure this host and take migrations from peers
+  flexvm standby [--template T] N    keep N VMs restored and paused, so run takes ~5 ms
+  flexvm template NAME [--vcpus N] [--mem MIB] [--max MIB] [--plug MIB] [--image REF ...]
+                                     build a template (see README)
+  flexvm bench ...                   latency benchmarks (see README)
 
-options:
-  --host ADDR        daemon to talk to (env FLEXVM_HOST, default 127.0.0.1:7070)
-  --artifacts DIR    firecracker, vmlinux, rootfs.ext4 (env FLEXVM_ARTIFACTS, default ./artifacts)
-  --templates DIR    template store (default ARTIFACTS/templates)
-  --image-cache DIR  image blobs and root filesystems (default ARTIFACTS/images)
+options: --state DIR (FLEXVM_STATE, /var/lib/flexvm), --run DIR (FLEXVM_RUN, /run/flexvm),
+         --artifacts DIR (FLEXVM_ARTIFACTS, ./artifacts), --templates DIR, --image-cache DIR
 ";
 
-/// Flags that take no value.
-const SWITCHES: &[&str] = &["warm", "follow", "stop", "keep-running", "paused", "incremental", "force"];
+const SWITCHES: &[&str] = &["warm", "stop", "paused", "incremental", "standby", "incoming", "json"];
 
-struct Args {
+/// `--flag value`s: last wins. `rest` follows `--` (or `exec NAME`).
+pub struct Args {
     positional: Vec<String>,
     flags: Vec<(String, String)>,
+    rest: Vec<String>,
 }
 
 impl Args {
     fn parse() -> Args {
-        let mut positional = Vec::new();
-        let mut flags = Vec::new();
+        let mut a = Args { positional: Vec::new(), flags: Vec::new(), rest: Vec::new() };
         let mut it = std::env::args().skip(1);
-        while let Some(a) = it.next() {
-            if let Some(flag) = a.strip_prefix("--") {
-                let value = if SWITCHES.contains(&flag) { "1".into() } else { it.next().unwrap_or_default() };
-                flags.push((flag.to_string(), value));
-            } else {
-                positional.push(a);
-                // Everything after `exec NAME` is the guest command.
-                if positional.len() == 2 && positional[0] == "exec" {
-                    positional.extend(it.by_ref());
+        while let Some(arg) = it.next() {
+            match arg.strip_prefix("--") {
+                Some("") => a.rest.extend(it.by_ref()),
+                Some(f) => {
+                    let value = if SWITCHES.contains(&f) { "1".into() } else { it.next().unwrap_or_default() };
+                    a.flags.push((f.into(), value));
+                }
+                None if arg == "-d" => a.flags.push(("detach".into(), "1".into())),
+                None => {
+                    a.positional.push(arg);
+                    if a.positional.len() == 2 && a.positional[0] == "exec" {
+                        a.rest.extend(it.by_ref());
+                    }
                 }
             }
         }
-        Args { positional, flags }
+        a
     }
 
-    fn has(&self, name: &str) -> bool {
-        self.flags.iter().any(|(k, _)| k == name)
+    pub fn has(&self, name: &str) -> bool {
+        self.get(name).is_some()
     }
 
-    fn get(&self, name: &str) -> Option<&str> {
+    pub fn get(&self, name: &str) -> Option<&str> {
         self.flags.iter().rev().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
     }
 
@@ -108,11 +104,16 @@ impl Args {
         self.flags.iter().filter(|(k, _)| k == name).map(|(_, v)| v.clone()).collect()
     }
 
-    fn num(&self, name: &str, default: u64) -> Result<u64> {
-        match self.get(name) {
-            Some(v) => Ok(v.parse().map_err(|_| format!("--{name} wants a number, got {v:?}"))?),
-            None => Ok(default),
-        }
+    pub fn parse_or<T: std::str::FromStr>(&self, name: &str, default: T) -> Result<T> {
+        self.get(name).map_or(Ok(default), |v| v.parse().map_err(|_| format!("bad --{name} {v:?}").into()))
+    }
+
+    pub fn num(&self, name: &str, default: u64) -> Result<u64> {
+        self.parse_or(name, default)
+    }
+
+    fn path(&self, flag: &str, env: &str, default: &str) -> PathBuf {
+        self.get(flag).map(PathBuf::from).or_else(|| std::env::var_os(env).map(PathBuf::from)).unwrap_or_else(|| default.into())
     }
 }
 
@@ -123,122 +124,67 @@ fn main() {
     }
 }
 
+pub fn open_host(args: &Args) -> Result<Host> {
+    Host::open(&args.path("state", "FLEXVM_STATE", "/var/lib/flexvm"), &args.path("run", "FLEXVM_RUN", "/run/flexvm"))
+}
+
+/// Exported for the VM processes this one starts.
+fn paths(args: &Args) -> Result<Paths> {
+    let artifacts = args.path("artifacts", "FLEXVM_ARTIFACTS", "artifacts");
+    let templates = args.get("templates").map(PathBuf::from).or_else(|| std::env::var_os("FLEXVM_TEMPLATES").map(PathBuf::from));
+    std::env::set_var("FLEXVM_ARTIFACTS", std::path::absolute(&artifacts)?);
+    if let Some(t) = &templates {
+        std::env::set_var("FLEXVM_TEMPLATES", std::path::absolute(t)?);
+    }
+    Paths::new(&artifacts, templates)
+}
+
 fn real_main() -> Result<()> {
     let args = Args::parse();
-    let host = args
-        .get("host")
-        .map(String::from)
-        .or_else(|| std::env::var("FLEXVM_HOST").ok())
-        .unwrap_or_else(|| "127.0.0.1:7070".into());
-    let paths = || {
-        let artifacts = args
-            .get("artifacts")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("FLEXVM_ARTIFACTS").map(PathBuf::from))
-            .unwrap_or_else(|| PathBuf::from("artifacts"));
-        Paths::new(&artifacts, args.get("templates").map(PathBuf::from))
-    };
+    let _ = paths(&args);
     let pos: Vec<&str> = args.positional.iter().map(|s| s.as_str()).collect();
-    let name = pos.get(1).copied().unwrap_or("");
+    let (name, arg2) = (pos.get(1).copied().unwrap_or(""), pos.get(2).copied());
+    let template = args.get("template").unwrap_or("default");
+    let call = |req: Value| print(vmproc::call(&open_host(&args)?, name, req)?);
     match pos.first().copied() {
-        Some("template") => {
-            if name.is_empty() {
-                return Err("template needs a NAME".into());
-            }
-            // Default: every host CPU (Firecracker wants 1 or an even count, at most 32)
-            // and a ceiling of all host memory. Neither is reserved up front.
-            let cpus = (util::host_cpus() as u64).min(32);
-            let cpus = if cpus > 1 { cpus & !1 } else { 1 };
-            let host_mib = proc_kb("/proc/meminfo", "MemTotal").unwrap_or(0) >> 20;
-            let max = args.num("max", host_mib)?;
-            let mut paths = paths()?;
-            let image = image_options(&args)?
-                .map(|opts| {
-                    let artifacts = paths.kernel.parent().ok_or("bad artifacts dir")?.to_path_buf();
-                    let cache = args.get("image-cache").map(PathBuf::from).unwrap_or_else(|| artifacts.join("images"));
-                    let init = args.get("init").map(PathBuf::from).unwrap_or_else(|| artifacts.join("flexvm-init"));
-                    let (rootfs, meta) = image::prepare(&cache, &init, &opts)?;
-                    paths.rootfs = rootfs;
-                    Ok::<_, util::Error>(meta)
-                })
-                .transpose()?;
-            template::create(
-                &paths,
-                name,
-                args.num("vcpus", cpus)? as u32,
-                args.num("mem", template::base_mib(max))?,
-                max,
-                args.num("plug", template::PLUG_MIB)?,
-                image,
-            )
+        Some("template") => build_template(&args, name),
+        Some("run") if args.has("standby") => vmproc::main(open_host(&args)?, paths(&args)?, Start::Standby { template: template.into() }, notify_fd()),
+        Some("run") if args.has("incoming") => {
+            let req: Value = serde_json::from_str(&std::env::var("FLEXVM_INCOMING")?)?;
+            unsafe { libc::fcntl(3, libc::F_SETFD, libc::FD_CLOEXEC) };
+            vmproc::main(open_host(&args)?, paths(&args)?, Start::Incoming { req }, None)
         }
-        Some("daemon") => {
-            let listen = args.get("listen").unwrap_or("127.0.0.1:7070").to_string();
-            let advertise = args.get("advertise").map(String::from).unwrap_or_else(|| listen.clone());
-            daemon::run(daemon::Config {
-                paths: paths()?,
-                advertise: advertise.clone(),
-                run_dir: args
-                    .get("run")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from(format!("/run/flexvm/{}", listen.replace(':', "_")))),
-                state_dir: args.get("state-dir").map(PathBuf::from).unwrap_or_else(|| {
-                    PathBuf::from(format!("/var/lib/flexvm/{}", listen.replace([':', '.', '[', ']'], "_")))
-                }),
-                listen,
-                peers: args.all("peer"),
-                reserve_mib: args.num("reserve", 1024)?,
-                pool: args.num("pool", 2)? as usize,
-                hot: args.num("hot", 2)? as usize,
-                hot_mib: args.num("hot-mib", 512)?,
-                vm_ips: net::IpRange::parse(args.get("vm-ips").unwrap_or("10.200.0.0/16"))?,
-                underlay: match args.get("underlay") {
-                    Some(ip) => ip.parse().map_err(|_| format!("bad --underlay {ip:?}"))?,
-                    None => advertise.rsplit_once(':').map(|(h, _)| h).unwrap_or(&advertise).parse().map_err(|_| {
-                        "--underlay is required when --advertise is not an IPv4 address".to_string()
-                    })?,
-                },
-                announce_dev: args.get("announce-dev").map(String::from),
-                dns: args.get("dns").map(String::from),
-            })
-        }
-        Some("bench") => match args.get("lifecycle") {
-            Some(dir) => bench_lifecycle::run(&host, &args, dir),
-            None => bench::run(&host, &args),
-        },
-        Some("run") => print(call(
-            &host,
-            json!({"op": "run", "name": name, "template": args.get("template").unwrap_or("default"), "ip": args.get("ip")}),
-        )?),
-        Some("ls") => list(call(&host, json!({"op": "ls"}))?),
-        Some("unlend") => print(call(&host, json!({"op": "unlend", "ip": name}))?),
-        Some("kill") => print(call(&host, json!({"op": "kill", "name": name, "force": args.has("force")}))?),
-        Some(op @ ("pause" | "resume" | "suspend")) => print(call(&host, json!({"op": op, "name": name}))?),
-        Some("checkpoint") => {
-            let dir = pos.get(2).ok_or("checkpoint needs NAME DIR")?;
-            if args.has("stop") && args.has("keep-running") {
-                return Err("--stop and --keep-running are exclusive".into());
-            }
-            let dir = std::path::absolute(dir)?;
-            let req = json!({"op": "checkpoint", "name": name, "dir": dir, "stop": args.has("stop"), "incremental": args.has("incremental")});
-            print(call(&host, req)?)
-        }
+        Some("run") => run(&args, name, template),
+        // A paused VM gets SIGCONT; a suspended one a new process.
+        Some("resume") if open_host(&args)?.signal(name, libc::SIGCONT).is_ok() => Ok(()),
+        Some("resume") => start(&args, name, Start::Resume { name: name.into() }),
         Some("restore") => {
             let dir = std::path::absolute(pos.get(1).ok_or("restore needs DIR")?)?;
-            print(call(&host, json!({"op": "restore", "dir": dir, "name": args.get("name"), "ip": args.get("ip"), "paused": args.has("paused")}))?)
+            let label = args.get("name").map_or(format!("restore-{}", std::process::id()), String::from);
+            start(&args, &label, Start::Restore { dir, name: args.get("name").map(String::from), ip: args.get("ip").map(String::from), paused: args.has("paused") })
         }
-        Some("migrate") => {
-            let to = args.get("to").ok_or("migrate needs --to ADDR")?;
-            print(call(&host, json!({"op": "migrate", "name": name, "to": to}))?)
+        Some("ls") => list(&open_host(&args)?, args.has("json")),
+        Some("exec") => std::process::exit(exec(&open_host(&args)?, name, &args.rest.join(" "))?),
+        Some("kill") => kill(&open_host(&args)?, name),
+        Some("checkpoint") => {
+            let dir = std::path::absolute(arg2.ok_or("checkpoint needs NAME DIR")?)?;
+            call(json!({"op": "checkpoint", "dir": dir, "stop": args.has("stop"), "incremental": args.has("incremental")}))
         }
-        Some("logs") => {
-            let follow = args.get("follow").is_some() || pos.get(2) == Some(&"-f");
-            logs(&host, name, follow)
+        Some("migrate") => call(json!({"op": "migrate", "to": arg2.ok_or("migrate needs NAME HOST:PORT")?})),
+        Some("listen") => {
+            let mut host = open_host(&args)?;
+            host.configure(|c| configure(c, &args, pos.get(1).copied()))?;
+            listen::main(host)
         }
-        Some("exec") => {
-            let code = exec(&host, name, &pos[2..].join(" "))?;
-            std::process::exit(code);
-        }
+        Some("standby") => print(standby::set(&open_host(&args)?, template, name.parse().map_err(|_| "standby wants a count")?)?),
+        Some("bench") => bench::run(&args),
+        // Test hooks: arm a fault for MS ms (0 disarms), hash a checkpoint, or ask a VM.
+        Some("debug") => match name {
+            "fault" => host::arm(&open_host(&args)?, arg2.ok_or("debug fault NAME MS")?, pos.get(3).and_then(|m| m.parse().ok()).unwrap_or(1000)),
+            "ckhash" => print(lifecycle::ckhash(&paths(&args)?, std::path::Path::new(arg2.ok_or("debug ckhash DIR")?))?),
+            "" => Err("debug fault|ckhash|VM ...".into()),
+            _ => call(json!({"op": "debug", "what": arg2.unwrap_or("status")})),
+        },
         _ => {
             eprint!("{USAGE}");
             std::process::exit(2);
@@ -246,26 +192,191 @@ fn real_main() -> Result<()> {
     }
 }
 
-/// `template --image` and its overrides, or None for a plain template.
+/// Flags not given keep their configured values.
+fn configure(c: &mut host::Config, args: &Args, addr: Option<&str>) -> Result<()> {
+    if let Some(a) = addr {
+        c.listen = Some(a.into());
+    }
+    if args.has("peer") {
+        c.peers = args.all("peer");
+    }
+    if let Some(r) = args.get("vm-ips") {
+        net::IpRange::parse(r)?;
+        c.vm_ips = r.into();
+    }
+    c.underlay = args.get("underlay").map(|u| u.parse()).transpose().map_err(|_| "bad --underlay")?.or(c.underlay);
+    c.announce_dev = args.get("announce-dev").map(String::from).or(c.announce_dev.take());
+    c.dns = args.get("dns").map(String::from).or(c.dns.take());
+    c.reserve_mib = args.num("reserve", c.reserve_mib)?;
+    c.prefix = args.get("prefix").map_or(c.prefix.clone(), String::from);
+    if c.listen.as_deref().is_some_and(|l| l.starts_with("0.0.0.0")) && c.underlay.is_none() {
+        return Err("listening on 0.0.0.0 needs --underlay (the address peers route VMs to)".into());
+    }
+    Ok(())
+}
+
+/// Claims a standby VM if there is one, else becomes the VM.
+fn run(args: &Args, name: &str, template: &str) -> Result<()> {
+    let (host, paths) = (open_host(args)?, paths(args)?);
+    let ip: Option<std::net::Ipv4Addr> = args.get("ip").map(|s| s.parse()).transpose().map_err(|_| "bad --ip")?;
+    let cmd = (!args.rest.is_empty()).then(|| args.rest.join(" "));
+    host::check_name(name)?;
+    let req = json!({"op": "claim", "name": name, "ip": ip.map(|i| i.to_string()), "cmd": cmd});
+    // A claimed standby VM writes where this process would.
+    let log = args.has("detach").then(|| log_file(&host, name)).transpose()?;
+    let fds = log.as_ref().map_or([1, 2], |f| [f.as_raw_fd(); 2]);
+    match standby::take(&host, &paths, template, &req, &fds)? {
+        Some((v, _)) if log.is_some() => print(v),
+        Some((v, conn)) => {
+            eprintln!("{v}");
+            let id = host::Ident { pid: v["pid"].as_u64().unwrap_or(0) as u32, start: v["start"].as_u64().unwrap_or(0), boot: host::boot_id().into() };
+            follow(conn, id)
+        }
+        None if log.is_some() => spawn_detached(&host, name),
+        None => vmproc::main(host, paths, Start::Run { name: name.into(), template: template.into(), ip, cmd }, notify_fd()),
+    }
+}
+
+fn start(args: &Args, name: &str, s: Start) -> Result<()> {
+    if args.has("detach") {
+        return spawn_detached(&open_host(args)?, name);
+    }
+    vmproc::main(open_host(args)?, paths(args)?, s, notify_fd())
+}
+
+fn log_file(host: &Host, name: &str) -> Result<std::fs::File> {
+    host::check_name(name)?;
+    Ok(std::fs::OpenOptions::new().create(true).append(true).open(host.vms(name, "log"))?)
+}
+
+fn spawn_detached(host: &Host, name: &str) -> Result<()> {
+    let argv: Vec<String> = std::env::args().skip(1).filter(|a| a != "-d").collect();
+    let (r, w) = std::os::unix::net::UnixStream::pair()?;
+    util::spawn_self(&argv, &log_file(host, name)?, w.as_raw_fd(), &[("FLEXVM_NOTIFY_FD", "3")])?;
+    drop(w);
+    let reply = recv_json(&mut BufReader::new(r))?.ok_or_else(|| format!("the vm process failed to start (see {})", host.vms(name, "log").display()))?;
+    if reply["ok"] != json!(true) {
+        return Err(reply["error"].as_str().unwrap_or("failed").to_string().into());
+    }
+    print(reply["result"].clone())
+}
+
+fn notify_fd() -> Option<std::fs::File> {
+    let fd: i32 = std::env::var("FLEXVM_NOTIFY_FD").ok()?.parse().ok()?;
+    std::env::remove_var("FLEXVM_NOTIFY_FD");
+    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    Some(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+/// A foreground `run` that claimed a standby VM: forwards signals, exits with its status.
+fn follow(mut conn: BufReader<std::os::unix::net::UnixStream>, id: host::Ident) -> Result<()> {
+    let set = util::block_signals(&[libc::SIGTERM, libc::SIGINT, libc::SIGTSTP, libc::SIGCONT, libc::SIGHUP]);
+    // A fast command's process may be gone already: its exit frame is buffered.
+    if let Ok(Some(vm)) = host::PidFd::open(&id) {
+        std::thread::spawn(move || loop {
+            match util::wait_signal(&set) {
+                libc::SIGHUP => {}
+                sig => drop(vm.signal(sig)),
+            }
+        });
+    }
+    let reply = recv_json(&mut conn).ok().flatten();
+    std::process::exit(reply.and_then(|r| r["exit"].as_i64()).map_or(vmproc::FAILED, |c| c as i32))
+}
+
+fn kill(host: &Host, name: &str) -> Result<()> {
+    if host.entry(name).is_ok_and(|e| e.state == "source") {
+        return Err(format!("vm {name} is the source of a migration in progress; it ends once the target has its memory (kill it where it runs)").into());
+    }
+    if let Ok(vm) = host.signal(name, libc::SIGINT) {
+        if !vm.wait(Duration::from_secs(30)) {
+            return Err(format!("vm {name} is still there; see its log").into());
+        }
+        // A suspend that finished first is undone: the kill wins.
+        if !host.suspended(name).exists() {
+            return Ok(());
+        }
+    }
+    if host.suspended(name).exists() {
+        let _lock = host.take_name(name, true)?;
+        return lifecycle::discard(host, name);
+    }
+    if !host.alive(name) && std::fs::remove_file(host.vms(name, "failed")).is_ok() {
+        return Ok(());
+    }
+    Err(format!("no vm named {name:?}").into())
+}
+
+fn list(host: &Host, as_json: bool) -> Result<()> {
+    let rss = |pid: Option<u32>| pid.and_then(|p| proc_kb(&format!("/proc/{p}/status"), "VmRSS")).unwrap_or(0) >> 20;
+    let mut vms: Vec<Value> = host.entries().into_iter().map(|e| {
+        let mut v = serde_json::to_value(&e).unwrap_or_default();
+        v["rss_mib"] = json!(rss(e.firecracker));
+        v
+    }).collect();
+    let names = |dir: PathBuf| std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.file_name().to_string_lossy().into_owned());
+    vms.extend(names(host.state.join("suspended")).filter(|n| !n.starts_with('.') && !host.alive(n)).filter_map(|n| lifecycle::describe_suspended(host, &n)));
+    for n in names(host.run.join("vms")).filter_map(|n| n.strip_suffix(".failed").map(String::from)).filter(|n| !host.alive(n)) {
+        vms.push(json!({"name": n, "state": "failed", "error": std::fs::read_to_string(host.vms(&n, "failed")).unwrap_or_default()}));
+    }
+    if as_json {
+        return print(json!(vms));
+    }
+    let row = |c: [&str; 8]| println!("{:<16} {:<15} {:<10} {:<12} {:>8} {:>4} {:>8} {:>8}", c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]);
+    row(["NAME", "IP", "TEMPLATE", "STATE", "PID", "VCPU", "RSS MiB", "MAX MiB"]);
+    for v in &vms {
+        let s = |k: &str| v[k].as_str().map(String::from).or_else(|| v[k].as_u64().map(|n| n.to_string())).unwrap_or_default();
+        row(["name", "ip", "template", "state", "pid", "vcpus", "rss_mib", "max_mib"].map(s).each_ref().map(|s| s.as_str()));
+    }
+    Ok(())
+}
+
+pub fn print(v: Value) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(&v)?);
+    Ok(())
+}
+
+fn build_template(args: &Args, name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err("template needs a NAME".into());
+    }
+    // Firecracker wants 1 or an even count of vCPUs, at most 32.
+    let cpus = (util::host_cpus() as u64).min(32);
+    let cpus = if cpus > 1 { cpus & !1 } else { 1 };
+    let mut paths = paths(args)?;
+    let image = image_options(args)?
+        .map(|opts| {
+            let artifacts = paths.kernel.parent().ok_or("bad artifacts dir")?.to_path_buf();
+            let cache = args.get("image-cache").map_or(artifacts.join("images"), PathBuf::from);
+            let init = args.get("init").map_or(artifacts.join("flexvm-init"), PathBuf::from);
+            let (rootfs, meta) = image::prepare(&cache, &init, &opts)?;
+            paths.rootfs = rootfs;
+            Ok::<_, util::Error>(meta)
+        })
+        .transpose()?;
+    let max = args.num("max", proc_kb("/proc/meminfo", "MemTotal").unwrap_or(0) >> 20)?;
+    let (cpus, mem, plug) = (args.num("vcpus", cpus)? as u32, args.num("mem", template::base_mib(max))?, args.num("plug", template::PLUG_MIB)?);
+    template::create(&paths, name, cpus, mem, max, plug, image)
+}
+
 fn image_options(args: &Args) -> Result<Option<image::Options>> {
     let Some(src) = args.get("image") else {
-        for f in ["entrypoint", "cmd", "env", "workdir", "user", "warm", "ready-port", "ready-cmd"] {
-            if args.get(f).is_some() {
-                return Err(format!("--{f} needs --image").into());
-            }
+        if let Some(f) = ["entrypoint", "cmd", "env", "workdir", "user", "warm", "ready-port", "ready-cmd"].iter().find(|f| args.has(f)) {
+            return Err(format!("--{f} needs --image").into());
         }
         return Ok(None);
     };
-    let warm = args.get("warm").is_some();
+    let warm = args.has("warm");
     let ready = match (args.get("ready-port"), args.get("ready-cmd")) {
         (Some(_), Some(_)) => return Err("pass --ready-port or --ready-cmd, not both".into()),
-        (Some(p), None) => Some(image::Ready::Port(p.parse().map_err(|_| format!("bad --ready-port {p:?}"))?)),
+        (Some(_), None) => Some(image::Ready::Port(args.parse_or("ready-port", 0)?)),
         (None, Some(c)) => Some(image::Ready::Cmd(c.into())),
         (None, None) => None,
     };
     if ready.is_some() && !warm {
         return Err("--ready-port and --ready-cmd only apply with --warm".into());
     }
+    let d = image::Limits::default();
     Ok(Some(image::Options {
         image: src.into(),
         entrypoint: args.get("entrypoint").map(image::parse_argv).transpose()?,
@@ -277,197 +388,57 @@ fn image_options(args: &Args) -> Result<Option<image::Options>> {
         ready,
         ready_timeout: Duration::from_secs(args.num("ready-timeout", 120)?),
         staging: args.get("image-staging").unwrap_or(image::STAGING).into(),
-        limits: {
-            let d = image::Limits::default();
-            image::Limits {
-                download: args.num("max-download-mib", d.download >> 20)? << 20,
-                unpacked: args.num("max-unpacked-mib", d.unpacked >> 20)? << 20,
-                file: args.num("max-file-mib", d.file >> 20)? << 20,
-                entries: args.num("max-entries", d.entries)?,
-            }
+        limits: image::Limits {
+            download: args.num("max-download-mib", d.download >> 20)? << 20,
+            unpacked: args.num("max-unpacked-mib", d.unpacked >> 20)? << 20,
+            file: args.num("max-file-mib", d.file >> 20)? << 20,
+            entries: args.num("max-entries", d.entries)?,
         },
     }))
 }
 
-/// Prints an image app's output. With `follow`, keeps printing until the app
-/// exits, reconnecting from the same offset if the connection drops.
-fn logs(host: &str, name: &str, follow: bool) -> Result<()> {
-    let mut offset = 0u64;
-    let mut retries = 0;
-    loop {
-        let mut c = TcpStream::connect(host)?;
-        send_json(&mut c, &json!({"op": "logs", "name": name, "offset": offset, "follow": follow}))?;
-        let mut r = BufReader::new(c);
-        let reply = recv_json(&mut r)?.ok_or("daemon hung up")?;
-        if reply["ok"] != json!(true) {
-            return Err(reply["error"].as_str().unwrap_or("logs failed").to_string().into());
-        }
-        while let Some((kind, data)) = guest::read_frame(&mut r)? {
-            if kind == guest::FRAME_MSG {
-                // `<status> <next offset>`
-                let status = String::from_utf8_lossy(&data);
-                let status = status.rsplit_once(' ').map(|(s, _)| s).unwrap_or(&status);
-                if !status.starts_with("running") {
-                    eprintln!("[app {status}]");
-                }
-                return Ok(());
+/// Reattaches when the connection drops (a checkpoint's pause resets vsock).
+pub fn exec(host: &Host, name: &str, cmd: &str) -> Result<i32> {
+    let (stdout, stderr) = (&mut std::io::stdout().lock(), &mut std::io::stderr().lock());
+    let id = guest::session_id()?;
+    let (mut offset, mut started, mut error) = (0, false, String::new());
+    let mut deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        let req = json!({"op": "exec", "session": id, "action": if started { "attach" } else { "start" }, "offset": offset, "cmd": cmd});
+        let stream = vmproc::connect(host, name, &req, &[]).and_then(|c| {
+            c.set_read_timeout(Some(Duration::from_secs(5)))?;
+            let mut r = BufReader::new(c);
+            let reply = recv_json(&mut r)?.ok_or("vm hung up")?;
+            if reply["ok"] != json!(true) {
+                return Err(reply["error"].as_str().unwrap_or("exec failed").to_string().into());
             }
-            std::io::stdout().write_all(&data)?;
-            std::io::stdout().flush()?;
-            offset += data.len() as u64;
-            retries = 0;
-        }
-        // vsock connections reset when the VM migrates or pauses.
-        retries += 1;
-        if !follow || retries > 25 {
-            return Err("connection to the guest closed".into());
+            // The guest heartbeats every second, even for silent commands.
+            r.get_ref().set_read_timeout(Some(Duration::from_secs(3)))?;
+            Ok(r)
+        });
+        match stream.map(|mut r| exec_frames(&mut r, &id, &mut started, &mut offset, stdout, stderr, &mut deadline)) {
+            Ok(Err(e)) => return Err(e),
+            Ok(Ok(StreamEnd::Exit(code))) => {
+                // Best effort: the guest closes it a minute after its client leaves anyway.
+                let _ = vmproc::connect(host, name, &json!({"op": "exec", "session": id, "action": "close"}), &[]);
+                return Ok(code);
+            }
+            Ok(Ok(StreamEnd::Disconnected(why))) => error = why,
+            Err(e) => {
+                if !host.alive(name) {
+                    if let Ok(to) = std::fs::read_to_string(host.vms(name, "moved")) {
+                        return Err(format!("vm {name} moved to {to}; the command keeps running there (session {id})").into());
+                    }
+                    if !started {
+                        return Err(e);
+                    }
+                }
+                error = e.to_string();
+            }
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-}
-
-fn call(host: &str, req: Value) -> Result<Value> {
-    let c = TcpStream::connect(host).map_err(|e| format!("connect to daemon at {host}: {e}"))?;
-    rpc_reply(c, req)
-}
-
-pub(crate) fn call_with_timeout(host: &str, req: Value, timeout: Duration) -> Result<Value> {
-    let mut error = None;
-    for addr in host.to_socket_addrs()? {
-        match TcpStream::connect_timeout(&addr, timeout) {
-            Ok(c) => {
-                c.set_read_timeout(Some(timeout))?;
-                c.set_write_timeout(Some(timeout))?;
-                return rpc_reply(c, req);
-            }
-            Err(e) => error = Some(e),
-        }
-    }
-    Err(format!("connect to daemon at {host}: {}", error.map(|e| e.to_string()).unwrap_or_else(|| "no addresses".into())).into())
-}
-
-fn rpc_reply(mut c: TcpStream, req: Value) -> Result<Value> {
-    send_json(&mut c, &req)?;
-    let reply = recv_json(&mut BufReader::new(c))?.ok_or("daemon hung up")?;
-    if reply["ok"] != json!(true) {
-        return Err(reply["error"].as_str().unwrap_or("request failed").to_string().into());
-    }
-    Ok(reply["result"].clone())
-}
-
-fn print(v: Value) -> Result<()> {
-    println!("{}", serde_json::to_string_pretty(&v)?);
-    Ok(())
-}
-
-fn list(v: Value) -> Result<()> {
-    println!(
-        "{:<16} {:<15} {:<10} {:<8} {:>4} {:>8} {:>9} {:>8} {:>8} {:>16}",
-        "NAME", "IP", "TEMPLATE", "STATE", "VCPU", "RSS MiB", "GUEST MiB", "MAX MiB", "PULL MiB", "TEMPLATE ID"
-    );
-    let n = |v: &Value| v.as_u64().unwrap_or(0);
-    for vm in v.as_array().into_iter().flatten() {
-        println!(
-            "{:<16} {:<15} {:<10} {:<8} {:>4} {:>8} {:>9} {:>8} {:>8} {:>16}",
-            vm["name"].as_str().unwrap_or(""),
-            vm["ip"].as_str().unwrap_or(""),
-            vm["template"].as_str().unwrap_or(""),
-            vm["state"].as_str().unwrap_or(""),
-            n(&vm["vcpus"]),
-            n(&vm["rss_mib"]),
-            n(&vm["guest_mib"]),
-            n(&vm["max_mib"]),
-            n(&vm["pages_mib"]["remote"]),
-            vm["template_id"].as_str().unwrap_or(""),
-        );
-    }
-    Ok(())
-}
-
-/// Connect with bounded I/O so a dead host cannot stall session recovery.
-fn exec_stream(host: &str, req: Value, timeout: Duration) -> Result<BufReader<TcpStream>> {
-    let mut error = "no addresses".to_string();
-    for addr in host.to_socket_addrs()? {
-        match TcpStream::connect_timeout(&addr, timeout) {
-            Ok(mut c) => {
-                c.set_read_timeout(Some(timeout))?;
-                c.set_write_timeout(Some(timeout))?;
-                send_json(&mut c, &req)?;
-                let mut r = BufReader::new(c);
-                let reply = recv_json(&mut r)?.ok_or("daemon hung up")?;
-                if reply["ok"] != json!(true) {
-                    return Err(reply["error"].as_str().unwrap_or("exec failed").to_string().into());
-                }
-                // The guest emits a heartbeat every second even for silent commands.
-                r.get_ref().set_read_timeout(Some(Duration::from_secs(3)))?;
-                return Ok(r);
-            }
-            Err(e) => error = e.to_string(),
-        }
-    }
-    Err(error.into())
-}
-
-fn exec(host: &str, name: &str, cmd: &str) -> Result<i32> {
-    exec_session(host, name, cmd, &mut std::io::stdout().lock(), &mut std::io::stderr().lock())
-}
-
-fn exec_session(host: &str, name: &str, cmd: &str, stdout: &mut impl Write, stderr: &mut impl Write) -> Result<i32> {
-    let mut random = [0u8; 16];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
-    let id: String = random.iter().map(|b| format!("{b:02x}")).collect();
-    let mut hosts = vec![host.to_string()];
-    let mut offset = 0;
-    let mut started = false;
-    let mut deadline = Instant::now() + Duration::from_secs(30);
-    let mut error = String::new();
-    // How many hosts in a row said they have no such VM.
-    let mut unknown = 0;
-    for i in 0.. {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() { return Err(format!("exec recovery timed out: {error}").into()); }
-        // A VM that no daemon knows was never there; one mid-migration is known
-        // to both. One host failing otherwise (it timed out) says nothing.
-        if i > 0 && error.starts_with("no vm named") {
-            unknown += 1;
-        } else {
-            unknown = 0;
-        }
-        if !started && unknown >= hosts.len() {
-            return Err(error.into());
-        }
-        if i > 0 && i % hosts.len() == 0 {
-            std::thread::sleep(Duration::from_millis(200));
-        }
-        let target = hosts[i % hosts.len()].clone();
-        let req = json!({"op": "exec", "name": name, "session": id,
-            "action": if started { "attach" } else { "start" }, "offset": offset, "cmd": cmd});
-        match exec_stream(&target, req, remaining.min(Duration::from_secs(2))) {
-            Ok(mut r) => match exec_frames(&mut r, &id, &mut started, &mut offset, stdout, stderr, &mut deadline)? {
-                StreamEnd::Exit(code) => {
-                    // Fire and forget: the daemon acts on it after we hang up, and a lost
-                    // acknowledgement is harmless since the guest closes a finished
-                    // session a minute after its client leaves.
-                    if let Some(addr) = target.to_socket_addrs().ok().and_then(|mut a| a.next()) {
-                        if let Ok(mut c) = TcpStream::connect_timeout(&addr, Duration::from_secs(1)) {
-                            let _ = send_json(&mut c, &json!({"op": "exec", "name": name, "session": id, "action": "close"}));
-                        }
-                    }
-                    return Ok(code);
-                }
-                StreamEnd::Disconnected(reason) => error = reason,
-            },
-            Err(e) => error = e.to_string(),
-        }
-        // Peers are only needed once the VM may have moved; the host it was on knows them.
-        for h in [&target, host] {
-            if let Ok(info) = call_with_timeout(h, json!({"op": "info"}), Duration::from_secs(1)) {
-                add_peers(&mut hosts, &info);
-                break;
-            }
-        }
-    }
-    unreachable!()
+    Err(format!("exec recovery timed out: {error}").into())
 }
 
 enum StreamEnd {
@@ -475,37 +446,31 @@ enum StreamEnd {
     Disconnected(String),
 }
 
-fn exec_frames(
-    r: &mut impl Read, id: &str, started: &mut bool, offset: &mut u64,
-    stdout: &mut impl Write, stderr: &mut impl Write, deadline: &mut Instant,
-) -> Result<StreamEnd> {
+/// Tracks `offset` so a reattach resumes without duplicates.
+fn exec_frames(r: &mut impl Read, id: &str, started: &mut bool, offset: &mut u64, stdout: &mut impl Write, stderr: &mut impl Write, deadline: &mut Instant) -> Result<StreamEnd> {
     loop {
         let (kind, data) = match guest::read_frame(r) {
             Ok(Some(frame)) => frame,
-            Ok(None) => return Ok(StreamEnd::Disconnected("daemon closed the stream".into())),
+            Ok(None) => return Ok(StreamEnd::Disconnected("the vm closed the stream".into())),
             Err(e) => return Ok(StreamEnd::Disconnected(e.to_string())),
         };
         match kind {
-            guest::FRAME_STDOUT | guest::FRAME_STDERR => {
-                if !*started { return Err("session output before session id".into()); }
+            guest::FRAME_STDOUT | guest::FRAME_STDERR if *started => {
                 let bytes = guest::session_output(&data, *offset)?;
-                if kind == guest::FRAME_STDOUT {
-                    stdout.write_all(bytes)?;
-                    stdout.flush()?;
-                } else {
-                    stderr.write_all(bytes)?;
-                    stderr.flush()?;
-                }
+                let out: &mut dyn Write = if kind == guest::FRAME_STDOUT { stdout } else { stderr };
+                out.write_all(bytes)?;
+                out.flush()?;
                 *offset += bytes.len() as u64;
             }
+            guest::FRAME_STDOUT | guest::FRAME_STDERR => return Err("session output before session id".into()),
             guest::FRAME_EXIT => return Ok(StreamEnd::Exit(guest::session_exit(&data, *offset)?)),
             guest::FRAME_LOST => {
                 let start = u64::from_le_bytes(data.as_slice().try_into().map_err(|_| "bad output-lost frame")?);
                 return Err(format!("session output lost: needed offset {offset}, retained output starts at {start}").into());
             }
-            guest::FRAME_MSG if data == id.as_bytes() => { *started = true; continue; }
+            guest::FRAME_MSG if data == id.as_bytes() => *started = true,
             guest::FRAME_MSG if data == b"waiting" && *started => {}
-            // Before the ID echo the request itself failed (bad command, old agent): don't retry it.
+            // Before the id echo the request itself failed: not retried.
             guest::FRAME_MSG if !*started => return Err(String::from_utf8_lossy(&data).into_owned().into()),
             guest::FRAME_MSG => return Ok(StreamEnd::Disconnected(String::from_utf8_lossy(&data).into_owned())),
             _ => return Err(format!("unknown session frame {kind}").into()),
@@ -514,52 +479,25 @@ fn exec_frames(
     }
 }
 
-fn add_peers(hosts: &mut Vec<String>, info: &Value) {
-    for peer in info["peers"].as_array().into_iter().flatten().filter_map(Value::as_str) {
-        if !hosts.iter().any(|host| host == peer) {
-            hosts.push(peer.to_string());
-        }
-    }
-}
-
 #[cfg(test)]
 mod exec_tests {
     use super::*;
 
-    fn frame(w: &mut Vec<u8>, kind: u8, data: &[u8]) {
-        w.push(kind);
-        w.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        w.extend_from_slice(data);
+    fn frames(fs: &[(u8, &[u8])]) -> Vec<u8> {
+        fs.iter().flat_map(|(kind, data)| [&[*kind][..], &(data.len() as u32).to_le_bytes(), data].concat()).collect()
     }
 
     #[test]
     fn resumes_partial_frame_without_duplicates() {
-        let mut first = Vec::new();
-        frame(&mut first, guest::FRAME_MSG, b"test-id");
-        frame(&mut first, guest::FRAME_STDOUT, &[0u64.to_le_bytes().as_slice(), b"abc"].concat());
+        let at = |o: u64, d: &[u8]| [&o.to_le_bytes()[..], d].concat();
+        let mut first = frames(&[(guest::FRAME_MSG, b"test-id"), (guest::FRAME_STDOUT, &at(0, b"abc"))]);
         first.extend_from_slice(&[guest::FRAME_STDERR, 11, 0, 0, 0]);
-        first.extend_from_slice(&3u64.to_le_bytes());
-        first.extend_from_slice(b"d");
-        let mut offset = 0;
-        let mut started = false;
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        let mut deadline = Instant::now();
-        assert!(matches!(exec_frames(&mut first.as_slice(), "test-id", &mut started, &mut offset,
-            &mut stdout, &mut stderr, &mut deadline).unwrap(), StreamEnd::Disconnected(_)));
-        assert!(started);
-        assert_eq!(offset, 3);
-        let mut resumed = Vec::new();
-        frame(&mut resumed, guest::FRAME_MSG, b"test-id");
-        frame(&mut resumed, guest::FRAME_STDERR, &[3u64.to_le_bytes().as_slice(), b"def"].concat());
-        frame(&mut resumed, guest::FRAME_EXIT, &[6u64.to_le_bytes().as_slice(), &7i32.to_le_bytes()].concat());
-        assert!(matches!(exec_frames(&mut resumed.as_slice(), "test-id", &mut started, &mut offset,
-            &mut stdout, &mut stderr, &mut deadline).unwrap(), StreamEnd::Exit(7)));
-        assert_eq!(stdout, b"abc");
-        assert_eq!(stderr, b"def");
-        assert_eq!(offset, 6);
-        let mut hosts = vec!["original".to_string()];
-        add_peers(&mut hosts, &json!({"peers": ["original", "target", "target"]}));
-        assert_eq!(hosts, ["original", "target"]);
+        first.extend_from_slice(&at(3, b"d"));
+        let (mut offset, mut started, mut stdout, mut stderr, mut deadline) = (0, false, Vec::new(), Vec::new(), Instant::now());
+        let mut run = |input: Vec<u8>| exec_frames(&mut input.as_slice(), "test-id", &mut started, &mut offset, &mut stdout, &mut stderr, &mut deadline).unwrap();
+        assert!(matches!(run(first), StreamEnd::Disconnected(_)));
+        let resumed = frames(&[(guest::FRAME_MSG, b"test-id"), (guest::FRAME_STDERR, &at(3, b"def")), (guest::FRAME_EXIT, &[&6u64.to_le_bytes()[..], &7i32.to_le_bytes()].concat())]);
+        assert!(matches!(run(resumed), StreamEnd::Exit(7)));
+        assert!(started && offset == 6 && stdout == b"abc" && stderr == b"def");
     }
 }

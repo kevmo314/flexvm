@@ -1,8 +1,6 @@
-//! A minimal OCI distribution (registry v2) client: anonymous or basic
-//! credentials exchanged for a bearer token, manifests, and blobs streamed to
-//! disk with their digests checked.
+//! A minimal OCI distribution (registry v2) client.
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -11,7 +9,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::reference::Reference;
-use super::unpack::MAX_DOCUMENT;
+use super::unpack::{Hashed, MAX_DOCUMENT};
 use crate::bail;
 use crate::util::Result;
 
@@ -23,9 +21,8 @@ pub const MANIFEST_TYPES: &str = "application/vnd.oci.image.index.v1+json, \
 pub struct Registry {
     agent: ureq::Agent,
     pub r: Reference,
-    /// base64 `user:password` from the Docker config, if any.
+    /// base64 `user:password` from the Docker config.
     basic: Option<String>,
-    /// `Authorization` header value once authenticated.
     auth: Option<String>,
 }
 
@@ -43,72 +40,60 @@ impl Registry {
         Registry { agent, r, basic, auth: None }
     }
 
-    /// Whether `url` may receive this registry's credentials: HTTPS, and the
-    /// registry itself or its well-known token service.
+    /// Credentials go only over HTTPS to the registry itself or its well-known token service.
     fn trusted(&self, url: &str) -> bool {
         let Some(rest) = url.strip_prefix("https://") else { return false };
         let host = rest.split(['/', '?', '#']).next().unwrap_or("");
         host == self.r.registry || (self.r.registry == "registry-1.docker.io" && host == "auth.docker.io")
     }
 
-    /// GETs `path` under the repository, authenticating on a 401 and retrying
-    /// once. Redirects (blob storage) are followed without credentials, and
-    /// a challenge from anywhere but the registry is an error.
+    /// Authenticates on a 401 and retries once; redirects (blob storage) are followed without credentials.
     fn get(&mut self, path: &str, accept: &str) -> Result<ureq::Response> {
-        let url = format!("{}/{path}", self.r.base_url());
-        let mut authenticated = false;
+        let base = format!("{}/{path}", self.r.base_url());
+        let (mut url, mut redirects, mut authenticated) = (base.clone(), 0, false);
         loop {
-            let mut req = self.agent.get(&url).set("Accept", accept);
-            if let Some(a) = &self.auth {
-                req = req.set("Authorization", a);
+            let mut req = self.agent.get(&url);
+            if redirects == 0 {
+                req = req.set("Accept", accept);
+                if let Some(a) = &self.auth {
+                    req = req.set("Authorization", a);
+                }
             }
             match req.call() {
-                Ok(resp) if (300..400).contains(&resp.status()) => return self.follow(&url, resp),
+                Ok(resp) if (300..400).contains(&resp.status()) => {
+                    let loc = resp.header("location").ok_or("redirect without a location")?;
+                    url = if loc.starts_with("https://") || loc.starts_with("http://") {
+                        loc.to_string()
+                    } else if loc.starts_with('/') {
+                        format!("{}{loc}", url.splitn(4, '/').take(3).collect::<Vec<_>>().join("/"))
+                    } else {
+                        bail!("unsupported redirect to {loc:?}");
+                    };
+                    if base.starts_with("https://") && !url.starts_with("https://") {
+                        bail!("refusing a redirect from HTTPS to {url}");
+                    }
+                    redirects += 1;
+                    if redirects > 5 {
+                        bail!("too many redirects from {base}");
+                    }
+                }
                 Ok(resp) => return Ok(resp),
-                Err(ureq::Error::Status(401, resp)) if !authenticated => {
+                Err(ureq::Error::Status(401, resp)) if !authenticated && redirects == 0 => {
                     let challenge = resp.header("www-authenticate").unwrap_or("").to_string();
                     self.authenticate(&challenge)?;
                     authenticated = true;
                 }
-                Err(ureq::Error::Status(401, _)) => bail!(
-                    "GET {url}: unauthorized{}",
-                    if self.basic.is_none() { " (no credentials in docker config)" } else { "" }
-                ),
+                Err(ureq::Error::Status(401, _)) if redirects == 0 => {
+                    bail!("GET {url}: unauthorized{}", if self.basic.is_none() { " (no credentials in docker config)" } else { "" })
+                }
                 Err(ureq::Error::Status(code, resp)) => {
                     let mut body = Vec::new();
                     let _ = resp.into_reader().take(300).read_to_end(&mut body);
-                    let body = String::from_utf8_lossy(&body);
-                    bail!("GET {url}: HTTP {code}: {}", body.chars().take(300).collect::<String>().trim())
+                    bail!("GET {url}: HTTP {code}: {}", String::from_utf8_lossy(&body).trim())
                 }
                 Err(e) => bail!("GET {url}: {e}"),
             }
         }
-    }
-
-    /// Follows up to five redirects from `from`, without any credentials.
-    fn follow(&self, from: &str, mut resp: ureq::Response) -> Result<ureq::Response> {
-        let mut url = from.to_string();
-        for _ in 0..5 {
-            let loc = resp.header("location").ok_or("redirect without a location")?.to_string();
-            url = if loc.starts_with("https://") || loc.starts_with("http://") {
-                loc
-            } else if loc.starts_with('/') {
-                let scheme_host: String = url.splitn(4, '/').take(3).collect::<Vec<_>>().join("/");
-                format!("{scheme_host}{loc}")
-            } else {
-                bail!("unsupported redirect to {loc:?}");
-            };
-            if from.starts_with("https://") && !url.starts_with("https://") {
-                bail!("refusing a redirect from HTTPS to {url}");
-            }
-            resp = match self.agent.get(&url).call() {
-                Ok(r) if (300..400).contains(&r.status()) => r,
-                Ok(r) => return Ok(r),
-                Err(ureq::Error::Status(code, _)) => bail!("GET {url} (redirected): HTTP {code}"),
-                Err(e) => bail!("GET {url} (redirected): {e}"),
-            };
-        }
-        bail!("too many redirects from {from}")
     }
 
     fn authenticate(&mut self, challenge: &str) -> Result<()> {
@@ -142,7 +127,6 @@ impl Registry {
         let body: Value = match req.call() {
             Ok(r) if r.status() == 200 => serde_json::from_reader(r.into_reader().take(1 << 20))?,
             Ok(r) => bail!("token from {realm}: HTTP {}", r.status()),
-            Err(ureq::Error::Status(code, _)) => bail!("token from {realm}: HTTP {code}"),
             Err(e) => bail!("token from {realm}: {e}"),
         };
         let token = body["token"].as_str().or(body["access_token"].as_str()).ok_or("token response has no token")?;
@@ -150,7 +134,6 @@ impl Registry {
         Ok(())
     }
 
-    /// Fetches a manifest or index by tag or digest; returns it with its digest.
     pub fn manifest(&mut self, reference: &str) -> Result<(Value, String)> {
         let resp = self.get(&format!("manifests/{reference}"), MANIFEST_TYPES)?;
         let mut body = Vec::new();
@@ -165,82 +148,46 @@ impl Registry {
         Ok((serde_json::from_slice(&body)?, digest))
     }
 
-    /// Downloads blob `digest` of `size` bytes into `blobs/sha256/<hex>`
-    /// unless it is already there, streaming through a temporary file and
-    /// checking size and digest before publishing it (fsynced, then renamed).
-    /// Cached blobs are checked again where they are used.
+    /// Size and digest are checked before the fsynced rename; cached blobs are checked where used.
     pub fn blob(&mut self, digest: &str, size: u64, blobs: &Path) -> Result<PathBuf> {
         let path = blob_path(blobs, digest)?;
         let dir = path.parent().unwrap().to_path_buf();
         std::fs::create_dir_all(&dir)?;
-        // Best effort: leftovers never stand in the way of a pull.
         sweep_parts(&dir);
         if path.exists() {
             return Ok(path);
         }
-        let tmp = path.with_extension(format!("part{}", std::process::id()));
-        let resp = self.get(&format!("blobs/{digest}"), "*/*")?;
-        let res = (|| {
-            let mut f = super::create_new(&tmp)?;
-            let mut r = resp.into_reader().take(size + 1);
-            let mut h = Sha256::new();
-            let mut buf = vec![0u8; 256 << 10];
-            let mut n_total = 0u64;
-            loop {
-                let n = r.read(&mut buf)?;
-                if n == 0 {
-                    break;
-                }
-                n_total += n as u64;
-                if n_total > size {
-                    bail!("blob {digest} is larger than its descriptor's {size} bytes");
-                }
-                h.update(&buf[..n]);
-                f.write_all(&buf[..n])?;
+        let mut r = Hashed::new(self.get(&format!("blobs/{digest}"), "*/*")?.into_reader().take(size + 1));
+        super::publish(&path, |f| {
+            std::io::copy(&mut r, f)?;
+            if r.n != size {
+                bail!("blob {digest} does not have its descriptor's {size} bytes");
             }
-            if n_total != size {
-                bail!("blob {digest} is {n_total} bytes, its descriptor says {size}");
+            if r.digest() != digest {
+                bail!("blob {digest} downloaded with digest {}", r.digest());
             }
-            let got = format!("sha256:{:x}", h.finalize());
-            if got != digest {
-                bail!("blob {digest} downloaded with digest {got}");
-            }
-            f.sync_all()?;
-            std::fs::rename(&tmp, &path)?;
-            sync_dir(&dir)?;
-            Ok(path.clone())
-        })();
-        if res.is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
-        res
+            Ok(())
+        })?;
+        sync_dir(&dir)?;
+        Ok(path)
     }
 }
 
-/// Removes abandoned downloads while preserving files owned by live processes.
 fn sweep_parts(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        let Some((hex, pid)) = name.rsplit_once(".part") else { continue };
-        if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-            continue;
+        let Some((hex, pid)) = name.to_str().and_then(|n| n.rsplit_once(".part")) else { continue };
+        let pid = pid.parse::<libc::pid_t>().unwrap_or(0);
+        let dead = pid > 0 && unsafe { libc::kill(pid, 0) } != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        if dead && hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            let _ = std::fs::remove_file(entry.path());
         }
-        let Ok(pid) = pid.parse::<libc::pid_t>() else { continue };
-        if pid <= 0 || unsafe { libc::kill(pid, 0) } == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
-            continue;
-        }
-        let _ = std::fs::remove_file(entry.path());
     }
 }
 
-/// Makes renames into `dir` durable.
 pub fn sync_dir(dir: &Path) -> Result<()> {
-    std::fs::File::open(dir)
-        .and_then(|d| d.sync_all())
-        .map_err(|e| format!("fsync of directory {}: {e}", dir.display()))?;
-    Ok(())
+    Ok(std::fs::File::open(dir).and_then(|d| d.sync_all()).map_err(|e| format!("fsync of directory {}: {e}", dir.display()))?)
 }
 
 pub fn sha256_hex(data: &[u8]) -> String {
@@ -255,30 +202,21 @@ pub fn blob_path(blobs: &Path, digest: &str) -> Result<PathBuf> {
     }
 }
 
-/// Basic credentials for `registry` from the Docker config (`$DOCKER_CONFIG`,
-/// `~/.docker/config.json`, or the invoking user's under sudo). Credential
-/// helpers are not supported.
+/// From `$DOCKER_CONFIG`, `~/.docker` or the sudo user's; credential helpers are not supported.
 fn docker_credentials(registry: &str) -> Option<String> {
-    let mut homes: Vec<PathBuf> = std::env::var_os("DOCKER_CONFIG").map(PathBuf::from).into_iter().collect();
-    if let Some(h) = std::env::var_os("HOME") {
-        homes.push(PathBuf::from(h).join(".docker"));
-    }
-    if let Ok(user) = std::env::var("SUDO_USER") {
-        if let Some(home) = user_home(&user) {
-            homes.push(home.join(".docker"));
-        }
-    }
-    let wanted: &[&str] = if registry == "registry-1.docker.io" {
-        &["index.docker.io", "docker.io", "registry-1.docker.io"]
-    } else {
-        &[registry]
-    };
-    for dir in homes {
-        let Ok(text) = std::fs::read(dir.join("config.json")) else { continue };
-        let Ok(cfg) = serde_json::from_slice::<Value>(&text) else { continue };
+    let sudo_home = std::env::var("SUDO_USER").ok().and_then(|user| {
+        std::fs::read_to_string("/etc/passwd").ok()?.lines().find_map(|l| {
+            let f: Vec<&str> = l.split(':').collect();
+            (f.len() > 5 && f[0] == user).then(|| PathBuf::from(f[5]))
+        })
+    });
+    let homes = [std::env::var_os("DOCKER_CONFIG").map(PathBuf::from), std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".docker")), sudo_home.map(|h| h.join(".docker"))];
+    let hub = ["index.docker.io", "docker.io", "registry-1.docker.io"];
+    let wanted: &[&str] = if registry == hub[2] { &hub } else { &[registry] };
+    for dir in homes.into_iter().flatten() {
+        let Some(cfg) = std::fs::read(dir.join("config.json")).ok().and_then(|t| serde_json::from_slice::<Value>(&t).ok()) else { continue };
         for (key, entry) in cfg["auths"].as_object().into_iter().flatten() {
-            let host = key.trim_start_matches("https://").trim_start_matches("http://");
-            let host = host.split('/').next().unwrap_or("");
+            let host = key.trim_start_matches("https://").trim_start_matches("http://").split('/').next().unwrap_or("");
             if !wanted.contains(&host) {
                 continue;
             }
@@ -291,14 +229,6 @@ fn docker_credentials(registry: &str) -> Option<String> {
         }
     }
     None
-}
-
-fn user_home(user: &str) -> Option<PathBuf> {
-    let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
-    passwd.lines().find_map(|l| {
-        let f: Vec<&str> = l.split(':').collect();
-        (f.len() > 5 && f[0] == user).then(|| PathBuf::from(f[5]))
-    })
 }
 
 #[cfg(test)]
@@ -334,7 +264,6 @@ mod tests {
         let ghcr = Registry::new(Reference::parse("ghcr.io/o/a").unwrap());
         assert!(ghcr.trusted("https://ghcr.io/token"));
         assert!(!ghcr.trusted("https://auth.docker.io/token"));
-        // A plain-HTTP registry never gets credentials at all.
         assert!(Registry::new(Reference::parse("localhost:5000/a").unwrap()).basic.is_none());
     }
 }

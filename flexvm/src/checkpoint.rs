@@ -1,54 +1,10 @@
-//! Durable checkpoints: a VM's complete state on disk, stored as a delta
-//! against its template, and the page source that restores one lazily.
-//!
-//! A checkpoint is a directory (format 2):
-//!
-//!   manifest.json  line 1: checksum of the rest of the file; then the
-//!                  `Manifest` JSON (template id, address, machine, file sums)
-//!   vmstate        Firecracker's vCPU and device state (a state-only snapshot)
-//!   pagemap        "FVPGMAP2", run count, data page count (u64 LE each), then
-//!                  runs as (first page, page count, kind, index of the first
-//!                  in `pages`) (u64 LE each) and the CRC32C of every page in
-//!                  `pages` (u32 LE each)
-//!   pages          the DATA pages, back to back (in about guest page order)
-//!
-//! Every guest page is one of
-//!
-//!   BASE  the template's page (a template hole is a zero page); not stored
-//!   ZERO  a zero page where the template has data; stored as a run only
-//!   DATA  anything else; stored in `pages`
-//!
-//! The pager's PRESENT pages are a superset of the pages that differ from the
-//! template (prefetched template pages are PRESENT too), so the writer
-//! compares each one with the template and with zero before storing it.
-//!
-//! The writer splits the PRESENT pages into units of `UNIT` pages that
-//! `writer_threads` threads take in turn. A thread copies its unit out of
-//! Firecracker (the one copy), checksums each page in the same pass that
-//! checks it for zeroes (pages where the template has data are compared
-//! with it first), reserves room in `pages` for the unit's DATA pages and
-//! writes them there straight from its buffer with O_DIRECT. Units take
-//! their place in `pages` as they finish, so no thread waits for another;
-//! the page map records where each run went. `pages` is preallocated before
-//! the VM pauses so the writes run in parallel.
-//!
-//! Incremental checkpoints (format 3) add `parent` to the manifest: the
-//! parent checkpoint's path (relative to this one's directory if they share
-//! a parent directory) and its id (the checksum line of its manifest). Their
-//! page map lists only the pages that changed since the parent's pause, with
-//! a third kind, TEMPLATE (the template's page, stored as a run only); every
-//! page it does not list is as in the parent. A restore follows the chain
-//! (at most `MAX_CHAIN` deep), checks every link and flattens the maps, so
-//! pages are read from whichever checkpoint holds their latest version.
-//!
-//! Crash consistency: everything is written into the `ck` directory of a
-//! fresh, root-only `.flexvm-staging-<pid>-<n>` directory next to the
-//! destination (all pinned by fd), fsynced, and then renamed into place
-//! (never over an existing one) and the parent fsynced; a later checkpoint
-//! there clears staging a dead daemon left. A checkpoint directory
-//! therefore either holds a complete checkpoint or does not exist, and is
-//! never modified afterwards. Restores verify the manifest, `vmstate` and
-//! `pagemap` up front, and every page of `pages` as it is read.
+//! Durable checkpoints: a VM's state as a delta against its template, restored lazily.
+//! A directory (format 2): manifest.json (checksum line, then the `Manifest`), vmstate,
+//! pagemap ("FVPGMAP2", run count, data page count, runs of (first page, count, kind, index
+//! in `pages`) as u64 LE, then each stored page's CRC32C as u32 LE) and pages (DATA pages).
+//! A page is BASE (template's, or zero over a hole; not stored), ZERO or DATA; a delta
+//! (format 3) names a `parent` and adds TEMPLATE runs. Directories are staged root-only,
+//! fsynced and renamed into place, never over anything: complete or absent, never changed.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -66,6 +22,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::bail;
+
+macro_rules! ensure {
+    ($ok:expr, $($why:tt)*) => { if !$ok { bail!($($why)*) } };
+}
 use crate::crc32c;
 use crate::template::{Hash, Template};
 use crate::uffd::{Pager, Runs, REMOTE};
@@ -73,27 +33,21 @@ use crate::util::{Error, Phases, Result, PAGE_SIZE};
 use crate::vm::Vm;
 
 pub const FORMAT: u64 = 2;
-/// Incremental checkpoints: format 2 plus `parent` and TEMPLATE runs.
 pub const FORMAT_INCREMENTAL: u64 = 3;
 const MAGIC: &[u8; 8] = b"FVPGMAP2";
 const DATA: u64 = 1;
 const ZERO: u64 = 2;
 const TEMPLATE: u64 = 3;
-/// Most checkpoints in a chain of incremental checkpoints.
 pub const MAX_CHAIN: usize = 64;
-/// Pages per writer work unit: read, classified and written together.
 const UNIT: usize = 256;
 /// Most writer threads; a few saturate the disk.
 const MAX_WRITERS: usize = 12;
-/// Most bytes of VM state a checkpoint may have.
 const MAX_VMSTATE: u64 = 64 << 20;
-/// Least metadata (manifests, VM states, page maps) opening a chain may read;
-/// its pages are read lazily.
 const MAX_CHAIN_META: u64 = 256 << 20;
 
-/// Most metadata opening a chain may read: it scales with the host, never
-/// with what a (possibly forged) manifest claims. A page map costs at most
-/// 36 bytes per guest page, under 1% of the guest.
+/// Most metadata (manifests, VM states, page maps) opening a chain may read:
+/// it scales with the host, never with what a (possibly forged) manifest
+/// claims. A page map costs at most 36 bytes per guest page, under 1% of it.
 pub fn chain_meta_budget() -> u64 {
     MAX_CHAIN_META.max(crate::util::proc_kb("/proc/meminfo", "MemTotal").unwrap_or(0) / 16)
 }
@@ -115,7 +69,6 @@ pub struct Manifest {
     pub vcpus: u32,
     pub mem_mib: u64,
     pub max_mib: u64,
-    /// virtio-mem memory plugged at checkpoint time.
     pub hotplug_mib: u64,
     pub guest_pages: u64,
     pub data_pages: u64,
@@ -130,7 +83,6 @@ pub struct Manifest {
 pub struct Parent {
     /// Relative to this checkpoint's directory, or absolute.
     pub path: String,
-    /// The parent's manifest checksum.
     pub id: String,
 }
 
@@ -140,15 +92,10 @@ fn sum(bytes: &[u8]) -> String {
     h.finish()
 }
 
-/// The checksum of the per-page checksums, for the manifest.
 fn sums_sum(sums: &[u32]) -> String {
     let mut h = Hash::new();
     sums.iter().for_each(|&c| h.word(c as u64));
     h.finish()
-}
-
-fn unix_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
 }
 
 fn cname(name: &str) -> CString {
@@ -164,50 +111,37 @@ fn publish_permissions(files: &[RawFd], dir: RawFd, owner: &libc::stat) -> io::R
 }
 
 fn check(rc: libc::c_int) -> io::Result<()> {
-    if rc < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    (rc >= 0).then_some(()).ok_or_else(io::Error::last_os_error)
 }
 
-/// Opens directory `name` in `dir` without following a symlink.
-fn open_dir_at(dir: RawFd, name: &CStr) -> io::Result<OwnedFd> {
-    let fd = unsafe { libc::openat(dir, name.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+/// Opens `name` in `dir`, never through a symlink (O_NOFOLLOW is added).
+fn openat(dir: RawFd, name: &CStr, flags: libc::c_int) -> io::Result<OwnedFd> {
+    let fd = unsafe { libc::openat(dir, name.as_ptr(), flags | libc::O_NOFOLLOW | libc::O_CLOEXEC, 0o600) };
     check(fd)?;
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-/// Creates file `name` in `dir`; never an existing file, never through a symlink.
+fn open_dir_at(dir: RawFd, name: &CStr) -> io::Result<OwnedFd> {
+    openat(dir, name, libc::O_RDONLY | libc::O_DIRECTORY)
+}
+
 fn create_at(dir: RawFd, name: &str) -> io::Result<File> {
-    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-    let fd = unsafe { libc::openat(dir, cname(name).as_ptr(), flags, 0o600) };
-    check(fd)?;
-    Ok(unsafe { File::from_raw_fd(fd) })
+    openat(dir, &cname(name), libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL).map(File::from)
 }
 
-/// Opens file `name` in `dir` for reading, never through a symlink.
+/// Opens file `name` in `dir` for reading. O_NONBLOCK: a FIFO planted in its
+/// place must not block (callers check for a regular file).
 fn open_at(dir: RawFd, name: &str) -> io::Result<File> {
-    // O_NONBLOCK: opening a FIFO planted in its place must not block; callers
-    // check it is a regular file, where the flag changes nothing.
-    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
-    let fd = unsafe { libc::openat(dir, cname(name).as_ptr(), flags) };
-    check(fd)?;
-    Ok(unsafe { File::from_raw_fd(fd) })
-}
-
-fn fsync_fd(fd: RawFd) -> io::Result<()> {
-    check(unsafe { libc::fsync(fd) })
+    openat(dir, &cname(name), libc::O_RDONLY | libc::O_NONBLOCK).map(File::from)
 }
 
 const STAGING_PREFIX: &str = ".flexvm-staging-";
 
-/// Why a commit failed.
 pub enum CommitError {
     /// Nothing was published (or what was is durably unusable): the VM may resume.
     Failed(Error),
-    /// The checkpoint was published but may not be durable, and could not be
-    /// revoked: resuming the VM could leave a stale checkpoint behind that
-    /// later restores, so it must not resume.
+    /// Published, maybe not durably, and not revocable: the VM must not
+    /// resume, or a stale checkpoint could later restore.
     Uncertain(Error),
 }
 
@@ -217,63 +151,40 @@ impl<E: Into<Error>> From<E> for CommitError {
     }
 }
 
-/// A checkpoint being written, which becomes `dest` only once complete and
-/// durable. Dropped unpublished, it is removed.
-///
-/// The destination's directory may belong to an unprivileged user while the
-/// daemon runs as root, so nothing here follows a path the user can change:
-/// the destination's directory is pinned by fd, files are written inside a
-/// root-only (0700) staging directory in it, also pinned, and are created
-/// with `O_EXCL | O_NOFOLLOW`. Firecracker writes the VM state into the VM's
-/// own run directory, from where it is copied in. Publishing renames the
-/// checkpoint out of the staging directory into the destination's directory,
-/// fd to fd, never over anything.
+/// A checkpoint being written: published as `dest` once complete and durable, else removed.
+/// We run as root under a directory a user may own, so nothing follows a path they can change:
+/// dirs are pinned by fd, files created O_EXCL|O_NOFOLLOW in root-only staging, renamed fd to fd.
 pub struct Staging {
     dest: PathBuf,
     parent: OwnedFd,
     base: CString,
-    /// The root-only staging directory in `parent`, and its name there.
+    /// The root-only staging directory in `parent`, and "ck" in it, published as `dest`.
     outer: OwnedFd,
     outer_name: CString,
-    /// The checkpoint directory inside `outer` (named "ck"), published as `dest`.
     ck: OwnedFd,
     vmstate: PathBuf,
-    /// `pages`, once preallocated.
     pages: Option<PagesFile>,
     published: bool,
-    /// Metadata the chain this checkpoint ends may still read when opened.
     pub meta_left: u64,
 }
 
 impl Staging {
-    /// Claims a staging directory for a checkpoint at `dest`, which must not
-    /// exist yet (checkpoints are immutable); Firecracker is to write the VM
-    /// state to `vmstate`, a path only root controls. Clears out staging
-    /// directories that daemons no longer running left in the same directory.
+    /// Firecracker writes the VM state to `vmstate`, a path only root controls.
     pub fn new(dest: &Path, vmstate: PathBuf) -> Result<Staging> {
-        let parent = match dest.parent() {
-            Some(p) if !p.as_os_str().is_empty() => p,
-            _ => Path::new("."),
-        };
+        let parent = dest.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
         let base = dest.file_name().ok_or_else(|| format!("bad checkpoint path {}", dest.display()))?;
         let parent_path = parent.canonicalize().map_err(|e| format!("checkpoint directory {}: {e}", parent.display()))?;
         let dest = parent_path.join(base);
         let pfd = open_dir_at(libc::AT_FDCWD, &CString::new(parent_path.as_os_str().as_bytes())?)
             .map_err(|e| format!("checkpoint directory {}: {e}", parent_path.display()))?;
         let base = CString::new(base.as_bytes())?;
-        if exists_at(pfd.as_raw_fd(), &base) {
-            bail!("{} already exists; checkpoints are never overwritten", dest.display());
-        }
+        ensure!(!exists_at(pfd.as_raw_fd(), &base), "{} already exists; checkpoints are never overwritten", dest.display());
         clear_stale(&pfd);
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().subsec_nanos();
         let outer_name = cname(&format!("{STAGING_PREFIX}{}-{nanos:x}", std::process::id()));
         check(unsafe { libc::mkdirat(pfd.as_raw_fd(), outer_name.as_ptr(), 0o700) })?;
         let outer = open_dir_at(pfd.as_raw_fd(), &outer_name)?;
-        // Someone could have swapped in a directory of their own meanwhile.
-        let st = fstat(outer.as_raw_fd())?;
-        if st.st_uid != unsafe { libc::geteuid() } || st.st_mode & 0o077 != 0 {
-            bail!("staging directory in {} was replaced", parent_path.display());
-        }
+        ensure!(private_dir(outer.as_raw_fd()), "staging directory in {} was replaced", parent_path.display());
         check(unsafe { libc::mkdirat(outer.as_raw_fd(), c"ck".as_ptr(), 0o700) })?;
         let ck = open_dir_at(outer.as_raw_fd(), c"ck")?;
         let _ = std::fs::remove_file(&vmstate);
@@ -284,13 +195,11 @@ impl Staging {
         &self.dest
     }
 
-    /// A path to the destination's directory as pinned (it is published
-    /// into), whatever happens to its name meanwhile; valid while this lives.
+    /// A path to the destination's directory as pinned; valid while this lives.
     pub fn pinned_dir(&self) -> PathBuf {
         PathBuf::from(format!("/proc/self/fd/{}", self.parent.as_raw_fd()))
     }
 
-    /// Where Firecracker is to write the VM's state.
     pub fn vmstate(&self) -> PathBuf {
         self.vmstate.clone()
     }
@@ -299,16 +208,14 @@ impl Staging {
         create_at(self.ck.as_raw_fd(), name)
     }
 
-    /// Adds a small file of the daemon's own to the checkpoint, durably,
-    /// published with it (a suspended VM's `GEN`).
-    pub fn add_file(&self, name: &str, bytes: &[u8]) -> Result<()> {
+    pub fn add_file(&self, name: &str, bytes: &[u8]) -> io::Result<File> {
         let f = self.create(name)?;
         (&f).write_all(bytes)?;
         f.sync_all()?;
-        Ok(())
+        Ok(f)
     }
 
-    /// Allocates disk space for about `pages` pages, ahead of the pause.
+    /// Allocates disk space ahead of the pause.
     pub fn preallocate(&mut self, pages: usize) -> Result<()> {
         let file = PagesFile::new(self.create("pages")?);
         file.reserve(pages);
@@ -316,12 +223,8 @@ impl Staging {
         Ok(())
     }
 
-    /// Writes the pages and metadata of `vm`, whose state is already in
-    /// `vmstate` and whose pages are in the states `runs` (as exported by the
-    /// pager's checkpoint barrier), then publishes the checkpoint.
-    ///
-    /// Pages come from `src`; with a `parent`, `runs` lists only what changed
-    /// since it (BASE runs being explicit), and the checkpoint is a delta.
+    /// Writes `runs` (read from `src`) and metadata, then publishes. With a `parent`, `runs`
+    /// lists only what changed since it (BASE runs explicit): a delta.
     #[allow(clippy::too_many_arguments)]
     pub fn commit(
         mut self,
@@ -333,32 +236,26 @@ impl Staging {
         t: &mut Phases,
         still_valid: impl FnOnce() -> Result<()>,
     ) -> std::result::Result<(Manifest, String), CommitError> {
-        let pages = match self.pages.take() {
-            Some(p) => p,
-            None => PagesFile::new(self.create("pages")?),
-        };
+        let pages = if let Some(p) = self.pages.take() { p } else { PagesFile::new(self.create("pages")?) };
         let out = write_pages(&vm.template, src, runs, &pages, writer_threads(), parent.is_some())?;
         t.mark("write_pages");
         pages.file.sync_all()?;
-        let (map, data_pages, zero_pages) = (&out.map, out.data, out.zero);
-        let pagemap = self.create("pagemap")?;
-        (&pagemap).write_all(map)?;
-        pagemap.sync_all()?;
+        let map = &out.map;
+        let pagemap = self.add_file("pagemap", map)?;
         let vmstate = std::fs::read(&self.vmstate)?;
         if vmstate.len() as u64 > MAX_VMSTATE {
-            return Err(CommitError::Failed(format!("its vmstate is over {MAX_VMSTATE} bytes").into()));
+            return Err(format!("its vmstate is over {MAX_VMSTATE} bytes").into());
         }
-        let vmstate_file = self.create("vmstate")?;
-        (&vmstate_file).write_all(&vmstate)?;
-        vmstate_file.sync_all()?;
-        let mut files = BTreeMap::new();
-        files.insert("vmstate".into(), FileSum { len: vmstate.len() as u64, hash: sum(&vmstate) });
-        files.insert("pagemap".into(), FileSum { len: map.len() as u64, hash: sum(map) });
-        files.insert("pages".into(), FileSum { len: data_pages * PAGE_SIZE as u64, hash: sums_sum(&out.sums) });
+        let vmstate_file = self.add_file("vmstate", &vmstate)?;
+        let files = BTreeMap::from([
+            ("vmstate".into(), FileSum { len: vmstate.len() as u64, hash: sum(&vmstate) }),
+            ("pagemap".into(), FileSum { len: map.len() as u64, hash: sum(map) }),
+            ("pages".into(), FileSum { len: out.data * PAGE_SIZE as u64, hash: sums_sum(&out.sums) }),
+        ]);
         let meta = &vm.template.meta;
         let manifest = Manifest {
             format: if parent.is_some() { FORMAT_INCREMENTAL } else { FORMAT },
-            created_unix_ms: unix_ms(),
+            created_unix_ms: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
             name: vm.name.clone(),
             ip: vm.ip,
             template: vm.template.name.clone(),
@@ -368,55 +265,45 @@ impl Staging {
             max_mib: meta.max_mib,
             hotplug_mib,
             guest_pages: vm.pager.total_pages() as u64,
-            data_pages,
-            zero_pages,
+            data_pages: out.data,
+            zero_pages: out.zero,
             files,
             parent,
         };
         let body = serde_json::to_vec_pretty(&manifest)?;
         let id = sum(&body);
-        let mut text = format!("{id}\n").into_bytes();
-        text.extend_from_slice(&body);
+        let text = [format!("{id}\n").as_bytes(), &body].concat();
         if (text.len() + vmstate.len() + map.len()) as u64 > self.meta_left {
             let budget = chain_meta_budget();
-            return Err(CommitError::Failed(match manifest.parent {
+            return Err(match manifest.parent {
                 Some(_) => format!("its chain would have more than {budget} bytes of metadata; take a full one"),
                 None => format!("it would have more than {budget} bytes of metadata"),
-            }.into()));
+            }
+            .into());
         }
-        let mf = self.create("manifest.json")?;
-        (&mf).write_all(&text)?;
-        mf.sync_all()?;
-        // The checkpoint belongs to whoever owns the directory it was put in
-        // (the daemon runs as root), so they can move and delete it.
+        let mf = self.add_file("manifest.json", &text)?;
+        // Owned by the directory's owner (we run as root), who may move and delete it.
         let owner = fstat(self.parent.as_raw_fd())?;
         publish_permissions(&[pages.file.as_raw_fd(), pagemap.as_raw_fd(), vmstate_file.as_raw_fd(), mf.as_raw_fd()], self.ck.as_raw_fd(), &owner)?;
-        fsync_fd(self.ck.as_raw_fd())?;
-        // Last check before it becomes visible.
+        check(unsafe { libc::fsync(self.ck.as_raw_fd()) })?;
         still_valid()?;
-        // The rename goes through the pinned directory: it must still be the
-        // one the destination path names, or the checkpoint would appear
-        // somewhere else.
-        let named = std::fs::metadata(self.dest.parent().unwrap_or(Path::new("/")))
-            .map_err(|e| format!("the directory of {} was moved or replaced during the checkpoint: {e}", self.dest.display()))?;
+        // The pinned directory must still be the one `dest` names.
+        use std::os::unix::fs::MetadataExt;
+        let moved = format!("the directory of {} was moved or replaced during the checkpoint", self.dest.display());
+        let named = std::fs::metadata(self.dest.parent().unwrap_or(Path::new("/"))).map_err(|e| format!("{moved}: {e}"))?;
         let pinned = fstat(self.parent.as_raw_fd())?;
-        if std::os::unix::fs::MetadataExt::dev(&named) != pinned.st_dev as u64 || std::os::unix::fs::MetadataExt::ino(&named) != pinned.st_ino as u64 {
-            return Err(CommitError::Failed(format!("the directory of {} was moved or replaced during the checkpoint", self.dest.display()).into()));
+        if named.dev() != pinned.st_dev as u64 || named.ino() != pinned.st_ino as u64 {
+            return Err(moved.into());
         }
         t.mark("fsync");
         let (outer, parent) = (self.outer.as_raw_fd(), self.parent.as_raw_fd());
-        let rc = unsafe { libc::renameat2(outer, c"ck".as_ptr(), parent, self.base.as_ptr(), libc::RENAME_NOREPLACE) };
-        if rc < 0 {
-            let e = io::Error::last_os_error();
-            return Err(CommitError::Failed(format!("publish checkpoint at {}: {e}", self.dest.display()).into()));
-        }
+        check(unsafe { libc::renameat2(outer, c"ck".as_ptr(), parent, self.base.as_ptr(), libc::RENAME_NOREPLACE) })
+            .map_err(|e| format!("publish checkpoint at {}: {e}", self.dest.display()))?;
         self.published = true;
-        if let Err(e) = fsync_fd(parent) {
-            // Published, but maybe not durably: a crash could still bring it
-            // back after the VM has run on. Revoke it, durably, or the VM
-            // must not resume.
+        if let Err(e) = check(unsafe { libc::fsync(parent) }) {
+            // A crash could bring it back after the VM ran on: revoke it, durably.
             let revoked = check(unsafe { libc::unlinkat(self.ck.as_raw_fd(), c"manifest.json".as_ptr(), 0) })
-                .and_then(|()| fsync_fd(self.ck.as_raw_fd()));
+                .and_then(|()| check(unsafe { libc::fsync(self.ck.as_raw_fd()) }));
             let e = format!("making checkpoint {} durable: {e}", self.dest.display());
             return Err(match revoked {
                 Ok(()) => CommitError::Failed(format!("{e} (revoked it)").into()),
@@ -430,14 +317,21 @@ impl Staging {
 
 impl Drop for Staging {
     fn drop(&mut self) {
-        if !self.published {
-            remove_ck(&self.outer, &self.ck);
-        }
-        // Empty now; if someone swapped another directory in under its name,
-        // removing that only works if it is empty too.
-        unsafe { libc::unlinkat(self.parent.as_raw_fd(), self.outer_name.as_ptr(), libc::AT_REMOVEDIR) };
+        let ck = (!self.published).then(|| self.ck.as_raw_fd());
+        remove_staging(self.parent.as_raw_fd(), &self.outer_name, self.outer.as_raw_fd(), ck);
         let _ = std::fs::remove_file(&self.vmstate);
     }
+}
+
+fn remove_staging(parent: RawFd, name: &CStr, outer: RawFd, ck: Option<RawFd>) {
+    // Every file in it (only we write there; `add_file` adds more than the four).
+    if let Some(ck) = ck {
+        for f in std::fs::read_dir(format!("/proc/self/fd/{ck}")).into_iter().flatten().flatten() {
+            unsafe { libc::unlinkat(ck, cname(&f.file_name().to_string_lossy()).as_ptr(), 0) };
+        }
+    }
+    unsafe { libc::unlinkat(outer, c"ck".as_ptr(), libc::AT_REMOVEDIR) };
+    unsafe { libc::unlinkat(parent, name.as_ptr(), libc::AT_REMOVEDIR) };
 }
 
 fn fstat(fd: RawFd) -> io::Result<libc::stat> {
@@ -446,21 +340,16 @@ fn fstat(fd: RawFd) -> io::Result<libc::stat> {
     Ok(st)
 }
 
+/// Whether `fd` is ours and nobody else may enter it, as staging is made.
+fn private_dir(fd: RawFd) -> bool {
+    fstat(fd).is_ok_and(|st| st.st_uid == unsafe { libc::geteuid() } && st.st_mode & 0o077 == 0)
+}
+
 fn exists_at(dir: RawFd, name: &CStr) -> bool {
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     unsafe { libc::fstatat(dir, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) == 0 }
 }
 
-/// Removes `ck` from `outer`, with every file in it (only we write there).
-fn remove_ck(outer: &OwnedFd, ck: &OwnedFd) {
-    for f in std::fs::read_dir(format!("/proc/self/fd/{}", ck.as_raw_fd())).into_iter().flatten().flatten() {
-        unsafe { libc::unlinkat(ck.as_raw_fd(), cname(&f.file_name().to_string_lossy()).as_ptr(), 0) };
-    }
-    unsafe { libc::unlinkat(outer.as_raw_fd(), c"ck".as_ptr(), libc::AT_REMOVEDIR) };
-}
-
-/// Removes staging directories of daemons that are gone: only directories
-/// this user owns and nobody else may enter, as `Staging::new` makes them.
 fn clear_stale(parent: &OwnedFd) {
     let Ok(dir) = std::fs::read_dir(format!("/proc/self/fd/{}", parent.as_raw_fd())) else { return };
     for e in dir.flatten() {
@@ -471,22 +360,16 @@ fn clear_stale(parent: &OwnedFd) {
             continue;
         }
         let Ok(outer) = open_dir_at(parent.as_raw_fd(), &cname(&name)) else { continue };
-        match fstat(outer.as_raw_fd()) {
-            Ok(st) if st.st_uid == unsafe { libc::geteuid() } && st.st_mode & 0o077 == 0 => {}
-            _ => continue,
+        if !private_dir(outer.as_raw_fd()) {
+            continue;
         }
-        if let Ok(ck) = open_dir_at(outer.as_raw_fd(), c"ck") {
-            remove_ck(&outer, &ck);
-        }
-        unsafe { libc::unlinkat(parent.as_raw_fd(), cname(&name).as_ptr(), libc::AT_REMOVEDIR) };
+        let ck = open_dir_at(outer.as_raw_fd(), c"ck").ok();
+        remove_staging(parent.as_raw_fd(), &cname(&name), outer.as_raw_fd(), ck.as_ref().map(|c| c.as_raw_fd()));
     }
 }
 
-/// Where the writer gets guest pages from.
 pub(crate) trait GuestPages: Sync {
-    /// The first page past the memory region holding `page`.
     fn region_end(&self, page: usize) -> Option<usize>;
-    /// Copies the pages from `page` on (all in one region) into `buf`.
     fn read(&self, page: usize, buf: &mut [u8]) -> Result<()>;
     /// A page someone waits on, whose unit to write next.
     fn wanted(&self) -> Option<usize> {
@@ -507,12 +390,9 @@ impl GuestPages for Pager {
 fn writer_threads() -> usize {
     let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
     let n = std::env::var("FLEXVM_CKPT_THREADS").ok().and_then(|v| v.parse().ok());
-    // The override is for benchmarking; keep it bounded either way.
     n.unwrap_or(cpus).clamp(1, MAX_WRITERS)
 }
 
-/// What `write_pages` wrote: the page map, DATA and ZERO page counts and
-/// the checksums of the pages in the file.
 struct Written {
     map: Vec<u8>,
     data: u64,
@@ -520,10 +400,8 @@ struct Written {
     sums: Vec<u32>,
 }
 
-/// Pages not stored (the template's, or zero over a template hole).
 const BASE: u8 = 0;
 
-/// How one page is stored, and its checksum if DATA.
 fn classify(template: &Template, page: usize, bytes: &[u8]) -> (u8, u32) {
     let tpl = template.has_data(page);
     if tpl && bytes == template.pages(page, 1) {
@@ -536,7 +414,6 @@ fn classify(template: &Template, page: usize, bytes: &[u8]) -> (u8, u32) {
     }
 }
 
-/// A unit's pages, classified, and where its DATA pages went in the file.
 struct Unit {
     first: usize,
     kinds: Vec<u8>,
@@ -544,68 +421,53 @@ struct Unit {
     at: u64,
 }
 
-/// The page file, written with O_DIRECT where the filesystem allows it.
 struct PagesFile {
     file: File,
-    /// Pages allocated on disk.
     allocated: AtomicUsize,
 }
 
 impl PagesFile {
-    /// Takes over `file` (created in the staging directory) and switches it
-    /// to O_DIRECT if its filesystem supports that.
     fn new(file: File) -> PagesFile {
-        let fd = file.as_raw_fd();
-        unsafe { libc::fcntl(fd, libc::F_SETFL, libc::fcntl(fd, libc::F_GETFL) | libc::O_DIRECT) };
+        let _ = direct(&file, true);
         PagesFile { file, allocated: AtomicUsize::new(0) }
     }
 
-    /// Allocates room for `pages` pages, so writes up to there need no
-    /// block allocation and (on ext4, with O_DIRECT) run in parallel. Best
-    /// effort; the file is trimmed to what was written in the end.
+    /// Allocates room for `pages` pages so writes run in parallel (ext4 with O_DIRECT).
     fn reserve(&self, pages: usize) {
         let have = self.allocated.load(Ordering::Relaxed);
-        if pages > have {
-            let (off, len) = ((have * PAGE_SIZE) as libc::off_t, ((pages - have) * PAGE_SIZE) as libc::off_t);
-            if unsafe { libc::fallocate(self.file.as_raw_fd(), 0, off, len) } == 0 {
-                self.allocated.store(pages, Ordering::Relaxed);
-            }
+        let (off, len) = ((have * PAGE_SIZE) as libc::off_t, (pages.saturating_sub(have) * PAGE_SIZE) as libc::off_t);
+        if pages > have && unsafe { libc::fallocate(self.file.as_raw_fd(), 0, off, len) } == 0 {
+            self.allocated.store(pages, Ordering::Relaxed);
         }
     }
 
-    /// Writes the buffers in `iov` (page-aligned, initialized whole pages) at
-    /// a page-aligned `off`. The caller keeps their allocations alive and
-    /// unchanged until this returns, including through the buffered retry.
+    /// Safety: `iov` is page-aligned whole pages the caller keeps alive and unchanged until return.
     fn write(&self, iov: &mut [libc::iovec], off: u64) -> io::Result<()> {
         match pwritev_all(&self.file, &mut iov.to_vec(), off) {
-            // O_DIRECT turned out not to work here after all: write through the cache.
-            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
-                let fd = self.file.as_raw_fd();
-                check(unsafe { libc::fcntl(fd, libc::F_SETFL, libc::fcntl(fd, libc::F_GETFL) & !libc::O_DIRECT) })?;
-                pwritev_all(&self.file, iov, off)
-            }
+            // O_DIRECT does not work here after all.
+            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => direct(&self.file, false).and_then(|()| pwritev_all(&self.file, iov, off)),
             r => r,
         }
     }
 }
 
-// Each iovec points into initialized, readable storage owned by the caller,
-// which stays alive and unchanged through every synchronous syscall here.
-// O_DIRECT callers supply aligned addresses, lengths and offsets. Advancing a
-// partially written iovec stays within its allocation; it does not own memory.
+fn direct(file: &File, on: bool) -> io::Result<()> {
+    let (fd, flag) = (file.as_raw_fd(), libc::O_DIRECT);
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    check(unsafe { libc::fcntl(fd, libc::F_SETFL, if on { flags | flag } else { flags & !flag }) })
+}
+
+// Each iovec points into initialized storage the caller keeps alive and
+// unchanged throughout; advancing one stays within its allocation.
 fn pwritev_all(file: &File, mut iov: &mut [libc::iovec], mut off: u64) -> io::Result<()> {
     while !iov.is_empty() {
         let cnt = iov.len().min(libc::UIO_MAXIOV as usize) as libc::c_int;
         let n = unsafe { libc::pwritev(file.as_raw_fd(), iov.as_ptr(), cnt, off as libc::off_t) };
-        if n < 0 {
-            let e = io::Error::last_os_error();
-            if e.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(e);
-        }
-        if n == 0 {
-            return Err(io::ErrorKind::WriteZero.into());
+        let e = (n <= 0).then(|| if n < 0 { io::Error::last_os_error() } else { io::ErrorKind::WriteZero.into() });
+        match e {
+            Some(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Some(e) => return Err(e),
+            None => {}
         }
         off += n as u64;
         let mut n = n as usize;
@@ -622,43 +484,26 @@ fn pwritev_all(file: &File, mut iov: &mut [libc::iovec], mut off: u64) -> io::Re
     Ok(())
 }
 
-/// Owns a nonempty, PAGE_SIZE-aligned allocation of initialized bytes, for
-/// O_DIRECT. `get` lends at most the allocation's length exclusively; raw
-/// iovecs derived from it must be consumed before reuse or drop of the buffer.
-struct Buf(*mut u8, usize);
+/// One page, aligned for O_DIRECT.
+#[derive(Clone)]
+#[repr(C, align(4096))]
+struct Page([u8; PAGE_SIZE]);
 
-impl Buf {
-    fn new(len: usize) -> io::Result<Buf> {
-        let layout = std::alloc::Layout::from_size_align(len, PAGE_SIZE)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        if len == 0 {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty checkpoint buffer"));
-        }
-        // Zeroing makes creating a u8 slice valid even before GuestPages::read.
-        let p = unsafe { std::alloc::alloc_zeroed(layout) };
-        if p.is_null() {
-            return Err(io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate checkpoint buffer"));
-        }
-        Ok(Buf(p, len))
-    }
-
-    fn get(&mut self, len: usize) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.0, len.min(self.1)) }
-    }
+fn aligned(n: usize) -> io::Result<Vec<Page>> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(n).map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate checkpoint buffer"))?;
+    v.resize(n, Page([0; PAGE_SIZE]));
+    Ok(v)
 }
 
-impl Drop for Buf {
-    fn drop(&mut self) {
-        unsafe { std::alloc::dealloc(self.0, std::alloc::Layout::from_size_align(self.1, PAGE_SIZE).unwrap()) };
-    }
+fn as_bytes(pages: &mut [Page]) -> &mut [u8] {
+    // `Page` is PAGE_SIZE initialized bytes with no padding.
+    unsafe { std::slice::from_raw_parts_mut(pages.as_mut_ptr().cast(), std::mem::size_of_val(pages)) }
 }
 
-/// Writes the pages in states `runs` (REMOTE: in the guest, read from
-/// `src`; ZERO: discarded by the guest; BASE: the template's) into `out` with
-/// `threads` threads, and builds the page map. With `explicit` (a delta),
-/// pages listed that are the template's get TEMPLATE runs instead of no run.
+/// Writes the REMOTE pages of `runs` into `out` and builds the page map; with `explicit`
+/// (a delta), listed template pages get TEMPLATE runs.
 fn write_pages(template: &Template, src: &dyn GuestPages, runs: &Runs, out: &PagesFile, threads: usize, explicit: bool) -> Result<Written> {
-    // Units of REMOTE pages, never across a memory region.
     let mut units: Vec<(usize, usize)> = Vec::new();
     for &(first, count, _) in runs.iter().filter(|r| r.2 == REMOTE) {
         let (mut p, end) = (first as usize, (first + count) as usize);
@@ -673,7 +518,6 @@ fn write_pages(template: &Template, src: &dyn GuestPages, runs: &Runs, out: &Pag
     let done: Vec<Mutex<Option<Unit>>> = units.iter().map(|_| Mutex::new(None)).collect();
     let taken: Vec<AtomicBool> = units.iter().map(|_| AtomicBool::new(false)).collect();
     let (next, placed, failed) = (AtomicUsize::new(0), AtomicU64::new(0), AtomicBool::new(false));
-    // The next unit to write: one something waits on, else the next in order.
     let pick = || -> Option<usize> {
         while let Some(p) = src.wanted() {
             let k = units.partition_point(|u| u.0 <= p).checked_sub(1);
@@ -681,18 +525,10 @@ fn write_pages(template: &Template, src: &dyn GuestPages, runs: &Runs, out: &Pag
                 return Some(k);
             }
         }
-        loop {
-            let k = next.fetch_add(1, Ordering::Relaxed);
-            if k >= units.len() {
-                return None;
-            }
-            if !taken[k].swap(true, Ordering::SeqCst) {
-                return Some(k);
-            }
-        }
+        (0..).map(|_| next.fetch_add(1, Ordering::Relaxed)).take_while(|&k| k < units.len()).find(|&k| !taken[k].swap(true, Ordering::SeqCst))
     };
     let work = || -> Result<()> {
-        let mut buf = Buf::new(UNIT * PAGE_SIZE)?;
+        let mut buf = aligned(UNIT)?;
         let mut iov: Vec<libc::iovec> = Vec::with_capacity(UNIT);
         loop {
             if failed.load(Ordering::Relaxed) {
@@ -700,13 +536,11 @@ fn write_pages(template: &Template, src: &dyn GuestPages, runs: &Runs, out: &Pag
             }
             let Some(k) = pick() else { return Ok(()) };
             let (first, n) = units[k];
-            let bytes = buf.get(n * PAGE_SIZE);
+            let bytes = &mut as_bytes(&mut buf)[..n * PAGE_SIZE];
             src.read(first, bytes)?;
             let mut unit = Unit { first, kinds: Vec::with_capacity(n), sums: Vec::new(), at: 0 };
             iov.clear();
-            // Only whole initialized pages enter the iovecs. Coalescing is
-            // within this one allocation, which is not reused until write
-            // (and all its pwritev calls) has returned.
+            // Whole pages of this one allocation, not reused until `write` returns.
             for (i, page) in bytes.chunks(PAGE_SIZE).enumerate() {
                 let (kind, sum) = classify(template, first + i, page);
                 unit.kinds.push(kind);
@@ -728,32 +562,30 @@ fn write_pages(template: &Template, src: &dyn GuestPages, runs: &Runs, out: &Pag
     };
     let threads = threads.min(units.len()).max(1);
     std::thread::scope(|s| {
-        // A failed spawn must not panic (panic = abort with the VM paused):
-        // stop the workers already running and report it.
-        let mut handles = Vec::with_capacity(threads);
-        let mut spawned: crate::util::Result<()> = Ok(());
-        for _ in 0..threads {
-            match std::thread::Builder::new().spawn_scoped(s, || work().inspect_err(|_| failed.store(true, Ordering::Relaxed))) {
-                Ok(h) => handles.push(h),
-                Err(e) => {
-                    failed.store(true, Ordering::Relaxed);
-                    spawned = Err(e.into());
-                    break;
-                }
-            }
-        }
+        // A failed spawn must not panic (that aborts with the VM paused): stop the rest and report it.
+        let mut spawned: Result<()> = Ok(());
+        let handles: Vec<_> = (0..threads)
+            .map_while(|_| {
+                let h = std::thread::Builder::new().spawn_scoped(s, || work().inspect_err(|_| failed.store(true, Ordering::Relaxed)));
+                h.map_err(|e| (failed.store(true, Ordering::Relaxed), spawned = Err(e.into()))).ok()
+            })
+            .collect();
         let joined = handles.into_iter().try_for_each(|h| h.join().unwrap());
         spawned.and(joined)
     })?;
-    // The page map, in page order: discarded runs and units interleave.
     let data = placed.into_inner();
-    let mut w = Written { map: Vec::new(), data, zero: 0, sums: vec![0; data as usize] };
+    let mut w = Written { map: MAGIC.to_vec(), data, zero: 0, sums: vec![0; data as usize] };
     let mut map: Vec<[u64; 4]> = Vec::new();
     let mut push = |page: usize, kind: u64, at: u64| {
-        let page = page as u64;
+        let kind = match kind {
+            ZERO | DATA => kind,
+            _ if explicit => TEMPLATE,
+            _ => return,
+        };
+        w.zero += (kind == ZERO) as u64;
         match map.last_mut() {
-            Some([f, n, k, a]) if *k == kind && *f + *n == page && (kind != DATA || *a + *n == at) => *n += 1,
-            _ => map.push([page, 1, kind, at]),
+            Some([f, n, k, a]) if *k == kind && *f + *n == page as u64 && (kind != DATA || *a + *n == at) => *n += 1,
+            _ => map.push([page as u64, 1, kind, at]),
         }
     };
     let mut done = done.into_iter().map(|u| u.into_inner().unwrap().unwrap()).peekable();
@@ -762,71 +594,41 @@ fn write_pages(template: &Template, src: &dyn GuestPages, runs: &Runs, out: &Pag
             while let Some(u) = done.next_if(|u| u.first < (first + count) as usize) {
                 let mut at = u.at;
                 for (i, &kind) in u.kinds.iter().enumerate() {
-                    match kind as u64 {
-                        DATA => {
-                            push(u.first + i, DATA, at);
-                            at += 1;
-                        }
-                        ZERO => {
-                            push(u.first + i, ZERO, 0);
-                            w.zero += 1;
-                        }
-                        _ if explicit => push(u.first + i, TEMPLATE, 0),
-                        _ => {}
-                    }
+                    push(u.first + i, kind as u64, at);
+                    at += (kind as u64 == DATA) as u64;
                 }
-                let at = u.at as usize;
-                w.sums[at..at + u.sums.len()].copy_from_slice(&u.sums);
+                w.sums[u.at as usize..u.at as usize + u.sums.len()].copy_from_slice(&u.sums);
             }
             continue;
         }
         // Discarded pages read as zero, which a template hole already is.
         for p in (first..first + count).map(|p| p as usize) {
-            if state == crate::uffd::ZERO && template.has_data(p) {
-                push(p, ZERO, 0);
-                w.zero += 1;
-            } else if explicit {
-                push(p, TEMPLATE, 0);
-            }
+            push(p, if state == crate::uffd::ZERO && template.has_data(p) { ZERO } else { BASE as u64 }, 0);
         }
     }
     out.file.set_len(data * PAGE_SIZE as u64)?;
-    w.map.reserve(24 + map.len() * 32 + w.sums.len() * 4);
-    w.map.extend_from_slice(MAGIC);
-    w.map.extend_from_slice(&(map.len() as u64).to_le_bytes());
-    w.map.extend_from_slice(&data.to_le_bytes());
-    for v in map.iter().flatten() {
-        w.map.extend_from_slice(&v.to_le_bytes());
-    }
-    for s in &w.sums {
-        w.map.extend_from_slice(&s.to_le_bytes());
-    }
+    let words = [map.len() as u64, data].into_iter().chain(map.into_iter().flatten());
+    w.map.extend(words.flat_map(u64::to_le_bytes));
+    w.map.extend(w.sums.iter().flat_map(|s| s.to_le_bytes()));
     Ok(w)
 }
 
-/// A checkpoint opened for restore, with its manifest and metadata verified
-/// (those of every checkpoint in its chain, for an incremental one).
 pub struct Checkpoint {
     pub dir: PathBuf,
     pub manifest: Manifest,
-    /// The manifest's checksum, which a child names its parent by.
+    /// The manifest's checksum, by which a child names its parent.
     pub id: String,
-    /// The verified VM state. Load these bytes (from a file only root
-    /// controls), not the checkpoint's file, which may have changed since.
+    /// The verified VM state: load these bytes, not the file, which may have changed.
     pub vmstate: Vec<u8>,
     /// Initial page states for the pager: DATA pages are REMOTE, read from `file`.
     pub runs: Runs,
     pub file: Arc<PageFile>,
-    /// The checkpoints it is built on, nearest first.
+    /// Its ancestors, nearest first.
     pub chain: Vec<PathBuf>,
-    /// The ids of `chain`, in the same order.
     pub chain_ids: Vec<String>,
-    /// Metadata a delta on this checkpoint may still add (see `MAX_CHAIN_META`).
     pub meta_left: u64,
 }
 
-/// Opens regular file `name` in `dir` (never through a symlink) and reads up
-/// to `max` bytes of it.
 fn read_at(dir: RawFd, name: &str, max: u64) -> io::Result<(File, Vec<u8>)> {
     let f = open_at(dir, name)?;
     let st = fstat(f.as_raw_fd())?;
@@ -838,99 +640,78 @@ fn read_at(dir: RawFd, name: &str, max: u64) -> io::Result<(File, Vec<u8>)> {
     Ok((f, bytes))
 }
 
-/// One checkpoint directory, verified on its own.
 struct Link {
     dir: PathBuf,
     manifest: Manifest,
     id: String,
     vmstate: Vec<u8>,
-    map: MapRuns,
-    file: File,
+    map: Vec<Run>,
+    file: Option<File>,
     sums: Vec<u32>,
 }
 
 impl Link {
-    /// Reads at most `meta_left` bytes of metadata, and takes them off it.
-    fn open(dir: &Path, meta_left: &mut u64) -> Result<Link> {
+    /// With `meta_left`, also reads and checks the rest within that budget (debited) and opens `pages`.
+    fn open(dir: &Path, ck: usize, meta_left: Option<&mut u64>) -> Result<Link> {
         let dir = dir.canonicalize().map_err(|e| format!("checkpoint {}: {e}", dir.display()))?;
         let bad = |why: String| format!("checkpoint {} is invalid: {why}", dir.display());
         let dfd = open_dir_at(libc::AT_FDCWD, &CString::new(dir.as_os_str().as_bytes())?).map_err(|e| bad(e.to_string()))?;
         let (_, text) = read_at(dfd.as_raw_fd(), "manifest.json", 1 << 20).map_err(|e| bad(format!("manifest.json: {e}")))?;
         let split = text.iter().position(|&b| b == b'\n').ok_or_else(|| bad("manifest has no checksum".into()))?;
-        let (want, body) = (&text[..split], &text[split + 1..]);
-        if want != sum(body).as_bytes() {
-            bail!("{}", bad("manifest checksum mismatch".into()));
-        }
-        let manifest: Manifest = serde_json::from_slice(body).map_err(|e| bad(format!("manifest: {e}")))?;
+        ensure!(text[..split] == *sum(&text[split + 1..]).as_bytes(), "{}", bad("manifest checksum mismatch".into()));
+        let manifest: Manifest = serde_json::from_slice(&text[split + 1..]).map_err(|e| bad(format!("manifest: {e}")))?;
+        let id = String::from_utf8_lossy(&text[..split]).into_owned();
         match (manifest.format, &manifest.parent) {
             (FORMAT, None) | (FORMAT_INCREMENTAL, Some(_)) => {}
             (f, _) => bail!("{}", bad(format!("format {f}; this flexvm reads formats {FORMAT} and {FORMAT_INCREMENTAL}"))),
         }
-        // Bound what the manifest's lengths make us read: a page map has at
-        // most a run (32 bytes) and a checksum (4) per page.
+        let Some(meta_left) = meta_left else {
+            return Ok(Link { dir, manifest, id, vmstate: Vec::new(), map: Vec::new(), file: None, sums: Vec::new() });
+        };
+        // Bound what we read: a page map has at most a run (32 bytes) and a checksum (4) per page.
         let len = |name: &str| manifest.files.get(name).map_or(0, |f| f.len);
         let map_max = manifest.guest_pages.checked_mul(36).and_then(|n| n.checked_add(24));
-        if len("vmstate") > MAX_VMSTATE || map_max.is_none_or(|m| len("pagemap") > m) {
-            bail!("{}", bad("vmstate or pagemap is too long".into()));
-        }
+        ensure!(len("vmstate") <= MAX_VMSTATE && map_max.is_some_and(|m| len("pagemap") <= m), "{}", bad("vmstate or pagemap is too long".into()));
         let cost = (text.len() as u64 + len("vmstate")).saturating_add(len("pagemap"));
         *meta_left = meta_left.checked_sub(cost).ok_or_else(|| bad(format!("its chain has more than {} bytes of metadata", chain_meta_budget())))?;
         let read_checked = |name: &str| -> Result<Vec<u8>> {
             let want = manifest.files.get(name).ok_or_else(|| bad(format!("manifest lists no {name}")))?;
             let (_, bytes) = read_at(dfd.as_raw_fd(), name, want.len + 1).map_err(|e| bad(format!("{name}: {e}")))?;
-            if bytes.len() as u64 != want.len || sum(&bytes) != want.hash {
-                bail!("{}", bad(format!("{name} does not match its checksum")));
-            }
+            ensure!(bytes.len() as u64 == want.len && sum(&bytes) == want.hash, "{}", bad(format!("{name} does not match its checksum")));
             Ok(bytes)
         };
         let vmstate = read_checked("vmstate")?;
-        let raw = read_checked("pagemap")?;
-        let (map, sums) = parse_pagemap(&raw, manifest.guest_pages, manifest.parent.is_some()).map_err(|e| bad(e.to_string()))?;
+        let (map, sums) = parse_pagemap(&read_checked("pagemap")?, manifest.guest_pages, manifest.parent.is_some(), ck).map_err(|e| bad(e.to_string()))?;
         let data: u64 = map.iter().filter(|r| r.2 == DATA).map(|r| r.1).sum();
-        let pages_len = manifest.files.get("pages").map(|f| f.len);
-        if data != manifest.data_pages || pages_len != Some(data * PAGE_SIZE as u64) {
-            bail!("{}", bad("page counts do not add up".into()));
-        }
-        if manifest.files["pages"].hash != sums_sum(&sums) {
-            bail!("{}", bad("page checksums do not match the manifest".into()));
-        }
+        ensure!(data == manifest.data_pages && manifest.files.get("pages").map(|f| f.len) == Some(data * PAGE_SIZE as u64), "{}", bad("page counts do not add up".into()));
+        ensure!(manifest.files["pages"].hash == sums_sum(&sums), "{}", bad("page checksums do not match the manifest".into()));
         let (file, _) = read_at(dfd.as_raw_fd(), "pages", 0).map_err(|e| bad(format!("pages: {e}")))?;
-        if file.metadata()?.len() != data * PAGE_SIZE as u64 {
-            bail!("{}", bad("pages has the wrong length".into()));
-        }
-        Ok(Link { dir, manifest, id: String::from_utf8_lossy(want).into_owned(), vmstate, map, file, sums })
+        ensure!(file.metadata()?.len() == data * PAGE_SIZE as u64, "{}", bad("pages has the wrong length".into()));
+        Ok(Link { dir, manifest, id, vmstate, map, file: Some(file), sums })
     }
 }
 
-/// The ids of the checkpoint at `dir` and its ancestors, nearest first,
-/// following each manifest's parent reference as a restore does. Reads only
-/// the manifests (each checked against its checksum).
+/// The chain ending at `dir`, nearest first; `full` verifies all metadata within
+/// `chain_meta_budget` (returning what is left), else only manifests.
+fn open_chain(dir: &Path, full: bool) -> Result<(Vec<Link>, u64)> {
+    let mut meta_left = chain_meta_budget();
+    let mut links = vec![Link::open(dir, 0, full.then_some(&mut meta_left))?];
+    while let Some(parent) = links.last().unwrap().manifest.parent.clone() {
+        let child = links.last().unwrap();
+        ensure!(links.len() < MAX_CHAIN, "checkpoint {} is more than {MAX_CHAIN} deltas deep", dir.display());
+        let link = Link::open(&child.dir.join(&parent.path), links.len(), full.then_some(&mut meta_left))
+            .map_err(|e| format!("parent of {}: {e}", child.dir.display()))?;
+        ensure!(link.id == parent.id, "checkpoint {}: its parent {} has changed (id {} is not {})", child.dir.display(), link.dir.display(), link.id, parent.id);
+        ensure!(child.manifest.template_id == link.manifest.template_id && child.manifest.guest_pages == link.manifest.guest_pages, "checkpoint {}: its parent {} is of another template or size", child.dir.display(), link.dir.display());
+        links.push(link);
+    }
+    Ok((links, meta_left))
+}
+
 pub fn chain_ids(dir: &Path) -> Result<Vec<String>> {
-    let mut ids = Vec::new();
-    let mut dir = dir.to_path_buf();
-    loop {
-        if ids.len() >= MAX_CHAIN {
-            bail!("more than {MAX_CHAIN} checkpoints deep");
-        }
-        // Resolved as a restore resolves it (`Link::open`).
-        dir = dir.canonicalize().map_err(|e| format!("{}: {e}", dir.display()))?;
-        let dfd = open_dir_at(libc::AT_FDCWD, &CString::new(dir.as_os_str().as_bytes())?).map_err(|e| format!("{}: {e}", dir.display()))?;
-        let (_, text) = read_at(dfd.as_raw_fd(), "manifest.json", 1 << 20).map_err(|e| format!("{}: {e}", dir.display()))?;
-        let split = text.iter().position(|&b| b == b'\n').ok_or("manifest has no checksum")?;
-        if text[..split] != *sum(&text[split + 1..]).as_bytes() {
-            bail!("{}: manifest checksum mismatch", dir.display());
-        }
-        ids.push(String::from_utf8_lossy(&text[..split]).into_owned());
-        let m: Manifest = serde_json::from_slice(&text[split + 1..])?;
-        match m.parent {
-            Some(p) => dir = dir.join(p.path),
-            None => return Ok(ids),
-        }
-    }
+    Ok(open_chain(dir, false)?.0.into_iter().map(|l| l.id).collect())
 }
 
-/// How `child` (a checkpoint directory) names `parent`: relative to the
-/// child when they share a directory, else absolute.
 pub fn parent_path(child: &Path, parent: &Path) -> String {
     match (child.parent(), parent.parent(), parent.file_name()) {
         (Some(a), Some(b), Some(name)) if a == b => format!("../{}", name.to_string_lossy()),
@@ -939,101 +720,58 @@ pub fn parent_path(child: &Path, parent: &Path) -> String {
 }
 
 impl Checkpoint {
-    /// Opens the checkpoint at `dir`, and the chain of checkpoints it is a
-    /// delta against, and verifies everything but the page data itself,
-    /// which is checked page by page as it is read.
+    /// Opens the chain ending at `dir`, verifying all but page data, which is checked as read.
     pub fn open(dir: &Path) -> Result<Checkpoint> {
-        let mut meta_left = chain_meta_budget();
-        let top = Link::open(dir, &mut meta_left)?;
-        let mut links = vec![top];
-        while let Some(parent) = links.last().unwrap().manifest.parent.clone() {
-            let child = links.last().unwrap();
-            if links.len() >= MAX_CHAIN {
-                bail!("checkpoint {} is more than {MAX_CHAIN} deltas deep", dir.display());
-            }
-            let path = child.dir.join(&parent.path);
-            let link = Link::open(&path, &mut meta_left).map_err(|e| format!("parent of {}: {e}", child.dir.display()))?;
-            let (c, p) = (&child.manifest, &link.manifest);
-            if link.id != parent.id {
-                bail!("checkpoint {}: its parent {} has changed (id {} is not {})", child.dir.display(), link.dir.display(), link.id, parent.id);
-            }
-            if c.template_id != p.template_id || c.guest_pages != p.guest_pages {
-                bail!("checkpoint {}: its parent {} is of another template or size", child.dir.display(), link.dir.display());
-            }
-            links.push(link);
-        }
-        let layers: Vec<Vec<Run>> = links.iter().enumerate().rev().map(|(i, l)| l.map.iter().map(|&(f, c, k, a)| (f, c, k, i, a)).collect()).collect();
-        let mut files = Vec::new();
-        let mut sums = Vec::new();
-        let mut chain = Vec::new();
-        let mut chain_ids = Vec::new();
-        let mut top = None;
-        for (i, l) in links.into_iter().enumerate() {
-            files.push(l.file);
+        let (mut links, meta_left) = open_chain(dir, true)?;
+        let layers: Vec<Vec<Run>> = links.iter_mut().rev().map(|l| std::mem::take(&mut l.map)).collect();
+        let (mut files, mut sums, mut rest) = (Vec::new(), Vec::new(), Vec::new());
+        for l in links {
+            files.push(l.file.unwrap());
             sums.push(l.sums);
-            if i == 0 {
-                top = Some((l.dir, l.manifest, l.id, l.vmstate));
-            } else {
-                chain.push(l.dir);
-                chain_ids.push(l.id);
-            }
+            rest.push((l.dir, l.manifest, l.id, l.vmstate));
         }
-        let (dir, manifest, id, vmstate) = top.unwrap();
+        let mut rest = rest.into_iter();
+        let (dir, manifest, id, vmstate) = rest.next().unwrap();
+        let (chain, chain_ids) = rest.map(|(dir, _, id, _)| (dir, id)).unzip();
         let (runs, file) = flatten(&layers, files, sums);
         Ok(Checkpoint { dir, manifest, id, vmstate, runs, file: Arc::new(file), chain, chain_ids, meta_left })
     }
 
-    /// Reads every page the checkpoint (chain) restores from its files and
-    /// checks it against its checksum.
-    pub fn verify_data(&self) -> Result<()> {
+    fn each_page(&self, drop_cache: bool, mut f: impl FnMut(usize, &[u8])) -> Result<()> {
         let mut buf = vec![0u8; 256 * PAGE_SIZE];
-        for &(first, count, state) in self.runs.iter().filter(|r| r.2 == REMOTE) {
-            let (mut p, end) = (first as usize, (first + count) as usize);
-            while p < end {
-                let n = (end - p).min(256);
-                self.file.read(p, &mut buf[..n * PAGE_SIZE], true)?;
-                p += n;
+        for &(first, count, state) in &self.runs {
+            for p in (first as usize..(first + count) as usize).step_by(256) {
+                let n = ((first + count) as usize - p).min(256);
+                if state != REMOTE {
+                    (p..p + n).for_each(|p| f(p, &[]));
+                    continue;
+                }
+                let b = &mut buf[..n * PAGE_SIZE];
+                self.file.read(p, b, drop_cache)?;
+                b.chunks(PAGE_SIZE).enumerate().for_each(|(i, page)| f(p + i, page));
             }
-            let _ = state;
         }
         Ok(())
     }
 
-    /// Pages the restored VM pulls from the checkpoint files.
+    pub fn verify_data(&self) -> Result<()> {
+        self.each_page(true, |_, _| {})
+    }
+
     pub fn data_pages(&self) -> u64 {
         self.file.runs.iter().map(|r| r.1).sum()
     }
 
-    /// The canonical hash of the memory this checkpoint restores (a test
-    /// hook; see `Canon`).
     pub fn content_hash(&self, template: &Template) -> Result<String> {
         let mut canon = Canon::new(template);
-        let mut buf = vec![0u8; 256 * PAGE_SIZE];
-        for &(first, count, state) in &self.runs {
-            let (mut p, end) = (first as usize, (first + count) as usize);
-            while p < end {
-                if state != REMOTE {
-                    canon.page(p, &[]);
-                    p += 1;
-                    continue;
-                }
-                let n = (end - p).min(256);
-                let b = &mut buf[..n * PAGE_SIZE];
-                self.file.read(p, b, false)?;
-                for (i, page) in b.chunks(PAGE_SIZE).enumerate() {
-                    canon.page(p + i, page);
-                }
-                p += n;
-            }
-        }
+        self.each_page(false, |p, b| canon.page(p, b))?;
         Ok(canon.finish())
     }
 }
 
-/// A hash of guest memory that does not depend on how it is stored: every
-/// page that is neither the template's nor zero over a template hole, with
-/// its number, in page order. Memory read out of a paused VM and the memory
-/// a checkpoint of it restores hash the same.
+/// A hash of guest memory independent of how it is stored: every page that
+/// is neither the template's nor zero over a template hole, with its number,
+/// in page order. A paused VM and a checkpoint of it hash the same.
 pub struct Canon<'a> {
     template: &'a Template,
     hash: Hash,
@@ -1050,12 +788,11 @@ impl<'a> Canon<'a> {
         static ZEROES: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
         let bytes = if bytes.is_empty() { &ZEROES[..] } else { bytes };
         let base: &[u8] = if self.template.has_data(p) { self.template.pages(p, 1) } else { &ZEROES };
-        if bytes == base {
-            return;
+        if bytes != base {
+            self.hash.word(p as u64);
+            self.hash.update(bytes);
+            self.pages += 1;
         }
-        self.hash.word(p as u64);
-        self.hash.update(bytes);
-        self.pages += 1;
     }
 
     pub fn finish(self) -> String {
@@ -1063,15 +800,10 @@ impl<'a> Canon<'a> {
     }
 }
 
-/// One checkpoint's page map runs: (first page, count, kind, index in `pages`).
-type MapRuns = Vec<(u64, u64, u64, u64)>;
-
-/// A page map run of one checkpoint in a chain: (first page, count, kind,
-/// checkpoint index, index of the first in that checkpoint's `pages`).
+/// A page map run: (first page, count, kind, checkpoint's index in its
+/// chain, index of the first in that checkpoint's `pages`).
 type Run = (u64, u64, u64, usize, u64);
 
-/// Lays `top` over `base` (both ascending and disjoint): pages `top` lists
-/// come from it, the rest from `base`.
 fn overlay(base: &[Run], top: &[Run]) -> Vec<Run> {
     let mut out: Vec<Run> = Vec::with_capacity(base.len() + top.len());
     for &(first, count, kind, ck, at) in base {
@@ -1085,13 +817,8 @@ fn overlay(base: &[Run], top: &[Run]) -> Vec<Run> {
                 let skip = pos - first;
                 out.push((pos, gap_end - pos, kind, ck, if kind == DATA { at + skip } else { 0 }));
             }
-            match next {
-                Some(r) => {
-                    pos = (r.0 + r.1).max(pos);
-                    t += 1;
-                }
-                None => pos = end,
-            }
+            pos = next.map_or(end, |r| (r.0 + r.1).max(pos));
+            t += 1;
         }
     }
     out.extend_from_slice(top);
@@ -1099,9 +826,6 @@ fn overlay(base: &[Run], top: &[Run]) -> Vec<Run> {
     out
 }
 
-/// Flattens the page maps of a chain (`layers`, oldest first; layer `i`
-/// names checkpoint `files[i]`... by its own index) into the pager's initial
-/// page states and a reader for the DATA pages.
 fn flatten(layers: &[Vec<Run>], files: Vec<File>, sums: Vec<Vec<u32>>) -> (Runs, PageFile) {
     let mut runs: Vec<Run> = Vec::new();
     for layer in layers {
@@ -1109,33 +833,23 @@ fn flatten(layers: &[Vec<Run>], files: Vec<File>, sums: Vec<Vec<u32>>) -> (Runs,
     }
     let mut states: Runs = Vec::new();
     let mut data = Vec::new();
-    for (first, count, kind, ck, at) in runs {
-        match kind {
-            DATA => {
-                data.push((first, count, ck, at));
-                states.push((first, count, REMOTE));
-            }
-            ZERO => states.push((first, count, crate::uffd::ZERO)),
-            _ => {}
+    for (first, count, kind, ck, at) in runs.into_iter().filter(|r| r.2 != TEMPLATE) {
+        if kind == DATA {
+            data.push((first, count, ck, at));
         }
+        states.push((first, count, if kind == DATA { REMOTE } else { crate::uffd::ZERO }));
     }
     (states, PageFile { files, runs: data, sums })
 }
 
-/// Parses and checks a page map for a guest of `guest_pages` pages (TEMPLATE
-/// runs only in a delta). Returns its runs (first, count, kind, index in
-/// `pages`) and the page checksums.
-fn parse_pagemap(map: &[u8], guest_pages: u64, delta: bool) -> Result<(MapRuns, Vec<u32>)> {
+/// TEMPLATE runs are allowed only in a delta.
+fn parse_pagemap(map: &[u8], guest_pages: u64, delta: bool, ck: usize) -> Result<(Vec<Run>, Vec<u32>)> {
     let word = |i: usize| -> Result<u64> {
         Ok(u64::from_le_bytes(map.get(i * 8..i * 8 + 8).ok_or("pagemap truncated")?.try_into()?))
     };
-    if map.len() < 24 || &map[..8] != MAGIC {
-        bail!("bad pagemap header");
-    }
+    ensure!(map.len() >= 24 && &map[..8] == MAGIC, "bad pagemap header");
     let (nruns, ndata) = (word(1)?, word(2)?);
-    if Some(map.len() as u64) != nruns.checked_mul(32).zip(ndata.checked_mul(4)).and_then(|(r, d)| (24 + r).checked_add(d)) {
-        bail!("bad pagemap length");
-    }
+    ensure!(Some(map.len() as u64) == nruns.checked_mul(32).zip(ndata.checked_mul(4)).and_then(|(r, d)| (24 + r).checked_add(d)), "bad pagemap length");
     let nruns = nruns as usize;
     let (mut runs, mut next) = (Vec::with_capacity(nruns), 0u64);
     for r in 0..nruns {
@@ -1145,29 +859,23 @@ fn parse_pagemap(map: &[u8], guest_pages: u64, delta: bool) -> Result<(MapRuns, 
         let Some(end) = end else { bail!("page run {r} out of order or bounds") };
         next = end;
         match kind {
-            DATA | ZERO => runs.push((first, count, kind, at)),
-            TEMPLATE if delta => runs.push((first, count, kind, 0)),
+            DATA | ZERO => runs.push((first, count, kind, ck, at)),
+            TEMPLATE if delta => runs.push((first, count, kind, ck, 0)),
             k => bail!("page run {r} has kind {k}"),
         }
     }
-    // The DATA runs must tile the page file exactly.
-    let mut tiles: Vec<(u64, u64)> = runs.iter().filter(|r| r.2 == DATA).map(|r| (r.3, r.1)).collect();
+    let mut tiles: Vec<(u64, u64)> = runs.iter().filter(|r| r.2 == DATA).map(|r| (r.4, r.1)).collect();
     tiles.sort_unstable();
     let end = tiles.iter().try_fold(0u64, |pos, &(at, n)| (at == pos).then_some(pos + n));
-    if end != Some(ndata) {
-        bail!("data runs do not cover the {ndata} stored pages exactly once");
-    }
+    ensure!(end == Some(ndata), "data runs do not cover the {ndata} stored pages exactly once");
     let sums = map[24 + 32 * nruns..].chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
     Ok((runs, sums))
 }
 
-/// Reads guest pages out of the page files of a checkpoint (chain),
-/// verifying each one.
 pub struct PageFile {
     files: Vec<File>,
     /// DATA runs: (first guest page, pages, file, index of the first in it).
     runs: Vec<(u64, u64, usize, u64)>,
-    /// The CRC32C of each data page, per file.
     sums: Vec<Vec<u32>>,
 }
 
@@ -1176,9 +884,7 @@ fn corrupt(why: String) -> io::Error {
 }
 
 impl PageFile {
-    /// Fills `buf` with the guest pages from `page` on, which must all be
-    /// DATA. Errors are InvalidData, which the pager treats as fatal.
-    /// `drop_cache` evicts what it read from the page cache.
+    /// Errors are InvalidData, which the pager treats as fatal.
     pub fn read(&self, page: usize, buf: &mut [u8], drop_cache: bool) -> io::Result<()> {
         let n = buf.len() / PAGE_SIZE;
         let mut done = 0;
@@ -1189,31 +895,23 @@ impl PageFile {
                 Some(run) if p < run.0 + run.1 => run,
                 _ => return Err(corrupt(format!("page {p} is not stored"))),
             };
-            let k = ((first + count - p) as usize).min(n - done);
-            self.read_data(f, d + p - first, &mut buf[done * PAGE_SIZE..(done + k) * PAGE_SIZE], drop_cache)?;
+            let (k, d) = (((first + count - p) as usize).min(n - done), d + p - first);
+            let (out, off, file) = (&mut buf[done * PAGE_SIZE..(done + k) * PAGE_SIZE], d * PAGE_SIZE as u64, &self.files[f]);
+            file.read_exact_at(out, off).map_err(|e| corrupt(format!("read at {off}: {e}")))?;
+            if drop_cache {
+                unsafe { libc::posix_fadvise(file.as_raw_fd(), off as i64, out.len() as i64, libc::POSIX_FADV_DONTNEED) };
+            }
+            for (i, page) in out.chunks(PAGE_SIZE).enumerate() {
+                let d = d as usize + i;
+                if crc32c::page(page).0 != self.sums[f][d] {
+                    return Err(corrupt(format!("data page {d} does not match its checksum")));
+                }
+            }
             done += k;
         }
         Ok(())
     }
 
-    /// Reads data pages from index `d` of file `f` on into `out` and checks them.
-    fn read_data(&self, f: usize, d: u64, out: &mut [u8], drop_cache: bool) -> io::Result<()> {
-        let off = d * PAGE_SIZE as u64;
-        let file = &self.files[f];
-        file.read_exact_at(out, off).map_err(|e| corrupt(format!("read at {off}: {e}")))?;
-        if drop_cache {
-            unsafe { libc::posix_fadvise(file.as_raw_fd(), off as i64, out.len() as i64, libc::POSIX_FADV_DONTNEED) };
-        }
-        for (i, page) in out.chunks(PAGE_SIZE).enumerate() {
-            let d = d as usize + i;
-            if crc32c::page(page).0 != self.sums[f][d] {
-                return Err(corrupt(format!("data page {d} does not match its checksum")));
-            }
-        }
-        Ok(())
-    }
-
-    /// Evicts the files from the page cache, once every page is in.
     pub fn drop_cache(&self) {
         for f in &self.files {
             unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
@@ -1225,99 +923,84 @@ impl PageFile {
 mod tests {
     use super::*;
     use crate::template::Paths;
+    use crate::uffd::{BASE as P_BASE, ZERO as P_ZERO};
+    use serde_json::json;
+    use std::fs;
 
-    #[test]
-    fn buffer_is_aligned_initialized_and_allocation_failure_is_an_error() {
-        let mut buf = Buf::new(PAGE_SIZE).unwrap();
-        assert_eq!(buf.0 as usize % PAGE_SIZE, 0);
-        assert!(buf.get(PAGE_SIZE).iter().all(|&b| b == 0));
-        // A valid layout larger than the address space Linux can map must fail
-        // allocation without aborting (even with virtual-memory overcommit).
-        let len = isize::MAX as usize & !(PAGE_SIZE - 1);
-        assert_eq!(Buf::new(len).err().unwrap().kind(), io::ErrorKind::OutOfMemory);
+    fn tmp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("flexvm-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
-    /// Writes a checkpoint of 256 pages, none stored, to `dir`, its manifest
-    /// changed by `edit`; returns its id.
-    fn link(dir: &Path, parent: Option<Parent>, edit: impl FnOnce(&mut Manifest)) -> String {
-        std::fs::create_dir_all(dir).unwrap();
-        let map = [MAGIC.as_slice(), &[0; 16]].concat();
-        std::fs::write(dir.join("vmstate"), b"s").unwrap();
-        std::fs::write(dir.join("pagemap"), &map).unwrap();
-        std::fs::write(dir.join("pages"), []).unwrap();
-        let mut m: Manifest = serde_json::from_value(serde_json::json!({
+    fn manifest(guest_pages: usize, parent: Option<Parent>, files: serde_json::Value) -> Manifest {
+        serde_json::from_value(json!({
             "format": if parent.is_some() { FORMAT_INCREMENTAL } else { FORMAT }, "created_unix_ms": 0, "name": "x",
             "ip": "10.0.0.1", "template": "tpl", "template_id": "id", "vcpus": 1, "mem_mib": 1, "max_mib": 1,
-            "hotplug_mib": 0, "guest_pages": 256, "data_pages": 0, "zero_pages": 0, "parent": parent,
-            "files": {
-                "vmstate": {"len": 1, "hash": sum(b"s")},
-                "pagemap": {"len": map.len(), "hash": sum(&map)},
-                "pages": {"len": 0, "hash": sums_sum(&[])},
-            }
+            "hotplug_mib": 0, "guest_pages": guest_pages, "data_pages": 0, "zero_pages": 0, "parent": parent, "files": files,
         }))
-        .unwrap();
+        .unwrap()
+    }
+
+    /// A 256-page checkpoint with nothing stored, its manifest changed by `edit`; returns its id.
+    fn link(dir: &Path, parent: Option<Parent>, edit: impl FnOnce(&mut Manifest)) -> String {
+        fs::create_dir_all(dir).unwrap();
+        let map = [MAGIC.as_slice(), &[0; 16]].concat();
+        for (name, bytes) in [("vmstate", &b"s"[..]), ("pagemap", &map), ("pages", &[])] {
+            fs::write(dir.join(name), bytes).unwrap();
+        }
+        let files = json!({"vmstate": {"len": 1, "hash": sum(b"s")}, "pagemap": {"len": map.len(), "hash": sum(&map)}, "pages": {"len": 0, "hash": sums_sum(&[])}});
+        let mut m = manifest(256, parent, files);
         edit(&mut m);
         let body = serde_json::to_vec(&m).unwrap();
-        let id = sum(&body);
-        std::fs::write(dir.join("manifest.json"), [format!("{id}\n").as_bytes(), &body].concat()).unwrap();
-        id
+        fs::write(dir.join("manifest.json"), [format!("{}\n", sum(&body)).as_bytes(), &body].concat()).unwrap();
+        sum(&body)
     }
 
     #[test]
-    fn manifest_lengths_are_bounded_before_reading() {
-        let dir = std::env::temp_dir().join(format!("flexvm-lengths-{}", std::process::id()));
+    fn metadata_is_bounded_before_reading() {
+        let dir = tmp("lengths");
         type Edit = fn(&mut Manifest);
         let cases: [(Edit, &str); 5] = [
             (|m| m.files.get_mut("vmstate").unwrap().len = MAX_VMSTATE + 1, "too long"),
             (|m| m.files.get_mut("vmstate").unwrap().len = u64::MAX, "too long"),
             (|m| m.files.get_mut("pagemap").unwrap().len = 24 + 36 * 256 + 1, "too long"),
             (|m| (m.guest_pages, m.files.get_mut("pagemap").unwrap().len) = (u64::MAX, u64::MAX), "too long"),
-            // Within what a guest this size could need, but not what a chain may read.
             (|m| (m.guest_pages, m.files.get_mut("pagemap").unwrap().len) = (1 << 40, 1 << 40), "bytes of metadata"),
         ];
         for (edit, want) in cases {
-            link(&dir, None, edit);
-            let e = Checkpoint::open(&dir).err().unwrap().to_string();
+            link(&dir.join("bad"), None, edit);
+            let e = Checkpoint::open(&dir.join("bad")).err().unwrap().to_string();
             assert!(e.contains(want), "{e}");
         }
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn a_chain_reads_at_most_its_metadata_budget() {
-        let dir = std::env::temp_dir().join(format!("flexvm-budget-{}", std::process::id()));
-        let mut parent = None;
+        // A chain reads at most its budget: the base is refused once it runs out.
+        let (mut parent, mut ids) = (None, Vec::new());
         for i in 0..3 {
             let id = link(&dir.join(format!("ck{i}")), parent, |_| {});
+            ids.insert(0, id.clone());
             parent = Some(Parent { path: format!("../ck{i}"), id });
         }
         let top = dir.join("ck2");
         let ck = Checkpoint::open(&top).unwrap();
-        assert_eq!(ck.chain.len(), 2);
+        assert_eq!((ck.chain.len(), &ck.chain_ids[..], chain_ids(&top).unwrap()), (2, &ids[1..], ids.clone()));
         let cost = chain_meta_budget() - ck.meta_left;
-        let mut left = cost;
-        Link::open(&top, &mut left).unwrap();
-        // The base is refused once the budget runs out.
+        Link::open(&top, 0, Some(&mut { cost })).unwrap();
         let mut left = cost - 1;
-        let e = Link::open(&top, &mut left).and_then(|_| Link::open(&dir.join("ck1"), &mut left)).and_then(|_| Link::open(&dir.join("ck0"), &mut left));
+        let e = (0..3).rev().try_for_each(|i| Link::open(&dir.join(format!("ck{i}")), 0, Some(&mut left)).map(drop));
         assert!(e.err().unwrap().to_string().contains("bytes of metadata"));
-        std::fs::remove_dir_all(&dir).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
     }
-    /// A template whose memory file has `pages` pages; `Some(b)` is a page
-    /// filled with `b`, `None` a hole.
+
     fn template(dir: &Path, pages: &[Option<u8>]) -> Arc<Template> {
         let tdir = dir.join("tpl");
-        std::fs::create_dir_all(&tdir).unwrap();
-        let meta = r#"{"vcpus": 1, "mem_mib": 1, "max_mib": 1, "kernel": "/k", "rootfs": "/r"}"#;
-        std::fs::write(tdir.join("meta.json"), meta).unwrap();
+        fs::create_dir_all(&tdir).unwrap();
+        fs::write(tdir.join("meta.json"), r#"{"vcpus": 1, "mem_mib": 1, "max_mib": 1, "kernel": "/k", "rootfs": "/r"}"#).unwrap();
         let mem = File::create(tdir.join("mem")).unwrap();
         mem.set_len((pages.len() * PAGE_SIZE) as u64).unwrap();
-        for (i, p) in pages.iter().enumerate() {
-            if let Some(b) = p {
-                mem.write_all_at(&[*b; PAGE_SIZE], (i * PAGE_SIZE) as u64).unwrap();
-            }
+        for (i, b) in pages.iter().enumerate().filter_map(|(i, p)| Some((i, (*p)?))) {
+            mem.write_all_at(&[b; PAGE_SIZE], (i * PAGE_SIZE) as u64).unwrap();
         }
-        mem.sync_all().unwrap();
         let paths = Paths { firecracker: "/f".into(), kernel: "/k".into(), rootfs: "/r".into(), templates: dir.into() };
         Template::open(&paths, "tpl").unwrap()
     }
@@ -1326,147 +1009,33 @@ mod tests {
         (0..PAGE_SIZE).map(|i| (i * 31 + seed * 7 + 1) as u8).collect()
     }
 
-    /// A new page file at `path`, created the way `Staging` creates it.
     fn pages_file(path: &Path) -> PagesFile {
-        let dir = open_dir_at(libc::AT_FDCWD, &CString::new(path.parent().unwrap().as_os_str().as_bytes()).unwrap()).unwrap();
+        let dir = File::open(path.parent().unwrap()).unwrap();
         PagesFile::new(create_at(dir.as_raw_fd(), path.file_name().unwrap().to_str().unwrap()).unwrap())
     }
 
-    /// Guest memory for tests: pages in regions of `region` pages; reading
-    /// page `fail` fails.
-    struct Guest {
-        pages: Vec<Vec<u8>>,
-        region: usize,
-        fail: Option<usize>,
-    }
+    /// Guest memory: pages, in regions of `.1` pages; reading page `.2` fails.
+    struct Guest(Vec<Vec<u8>>, usize, Option<usize>);
 
     impl GuestPages for Guest {
         fn region_end(&self, page: usize) -> Option<usize> {
-            (page < self.pages.len()).then(|| ((page / self.region + 1) * self.region).min(self.pages.len()))
+            (page < self.0.len()).then(|| ((page / self.1 + 1) * self.1).min(self.0.len()))
         }
 
         fn read(&self, page: usize, buf: &mut [u8]) -> Result<()> {
             for (i, b) in buf.chunks_mut(PAGE_SIZE).enumerate() {
-                if Some(page + i) == self.fail {
+                if Some(page + i) == self.2 {
                     bail!("cannot read page {}", page + i);
                 }
-                b.copy_from_slice(&self.pages[page + i]);
+                b.copy_from_slice(&self.0[page + i]);
             }
             Ok(())
         }
     }
 
-    #[test]
-    fn pages_roundtrip_against_the_template() {
-        let dir = std::env::temp_dir().join(format!("flexvm-ckpt-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let n = 1000;
-        let tpl_pages: Vec<Option<u8>> = (0..n).map(|i| (i % 2 == 0).then_some(i as u8 | 1)).collect();
-        let tpl = template(&dir, &tpl_pages);
-        // What the guest holds: the template's page, zeroes, or new data.
-        let pages: Vec<Vec<u8>> = (0..n)
-            .map(|i| match i % 5 {
-                0 => tpl_pages[i].map_or(vec![0; PAGE_SIZE], |b| vec![b; PAGE_SIZE]),
-                1 => vec![0; PAGE_SIZE],
-                _ => page(i),
-            })
-            .collect();
-        // Pages 7 and 300..320 were discarded by the guest; 900.. were never touched.
-        let discarded = |i: usize| i == 7 || (300..320).contains(&i);
-        let mut input: Runs = Vec::new();
-        for i in 0..900 {
-            let s = if discarded(i) { crate::uffd::ZERO } else { REMOTE };
-            match input.last_mut() {
-                Some((f, c, st)) if *st == s && *f + *c == i as u64 => *c += 1,
-                _ => input.push((i as u64, 1, s)),
-            }
-        }
-        let want = |i: usize| if discarded(i) { vec![0; PAGE_SIZE] } else if i < 900 { pages[i].clone() } else { tpl.pages(i, 1).to_vec() };
-        let guest = Guest { pages: pages.clone(), region: 333, fail: None };
-        let want_data = (0..900).filter(|&i| i % 5 >= 2 && !discarded(i)).count() as u64;
-        let want_zero = (0..900).filter(|&i| i % 2 == 0 && (i % 5 == 1 || discarded(i))).count() as u64;
-        let mut last = None;
-        for threads in [8, 3, 1] {
-            let path = dir.join(format!("pages-{threads}"));
-            let w = write_pages(&tpl, &guest, &input, &pages_file(&path), threads, false).unwrap();
-            // Zero pages over template holes, and discarded holes, cost nothing.
-            assert_eq!((w.data, w.zero), (want_data, want_zero));
-            assert_eq!(std::fs::metadata(&path).unwrap().len(), w.data * PAGE_SIZE as u64);
-            let (map, sums) = parse_pagemap(&w.map, n as u64, false).unwrap();
-            assert!(parse_pagemap(&w.map, 899, false).is_err(), "runs past the guest's end");
-            assert!(parse_pagemap(&w.map[..w.map.len() - 4], n as u64, false).is_err());
-            // A DATA run pointing anywhere but its own place in the file.
-            let mut bad = w.map.clone();
-            let r = (0..map.len()).find(|&r| bad[24 + 32 * r + 16] == DATA as u8).unwrap();
-            bad[24 + 32 * r + 24] ^= 1;
-            assert!(parse_pagemap(&bad, n as u64, false).is_err(), "overlapping data runs");
-            let layer: Vec<Run> = map.iter().map(|&(f, c, k, a)| (f, c, k, 0, a)).collect();
-            let (runs, file) = flatten(&[layer], vec![File::open(&path).unwrap()], vec![sums]);
-            // Rebuild every page the way the pager would and compare.
-            let mut state = vec![crate::uffd::BASE; n];
-            for &(f, c, s) in &runs {
-                state[f as usize..(f + c) as usize].fill(s);
-            }
-            for (i, &st) in state.iter().enumerate() {
-                let got = match st {
-                    crate::uffd::BASE if tpl.has_data(i) => tpl.pages(i, 1).to_vec(),
-                    crate::uffd::BASE | crate::uffd::ZERO => vec![0; PAGE_SIZE],
-                    _ => {
-                        let mut b = vec![0; PAGE_SIZE];
-                        file.read(i, &mut b, false).unwrap();
-                        b
-                    }
-                };
-                assert!(got == want(i), "page {i} (state {st}, {threads} threads)");
-            }
-            last = Some((runs, state, file, path));
-        }
-        let (runs, state, file, path) = last.unwrap();
-        // Runs of DATA pages read in one go.
-        let (f, c, _) = runs.iter().copied().filter(|r| r.2 == REMOTE).max_by_key(|r| r.1).unwrap();
-        let mut b = vec![0; c as usize * PAGE_SIZE];
-        file.read(f as usize, &mut b, true).unwrap();
-        assert_eq!(&b[(c as usize - 1) * PAGE_SIZE..], &want((f + c) as usize - 1)[..]);
-        // Pages that are not stored, and corrupt pages, are InvalidData.
-        let mut one = vec![0; PAGE_SIZE];
-        assert_eq!(file.read(0, &mut one, false).unwrap_err().kind(), io::ErrorKind::InvalidData);
-        let f2 = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-        f2.write_all_at(&[0xff], (5 * PAGE_SIZE + 5) as u64).unwrap();
-        let bad: Vec<usize> = (0..n).filter(|&i| state[i] == REMOTE && file.read(i, &mut one, false).is_err()).collect();
-        assert_eq!(bad.len(), 1, "exactly the corrupt page fails");
-        assert_eq!(file.read(bad[0], &mut one, false).unwrap_err().kind(), io::ErrorKind::InvalidData);
-        // A failed read fails the whole write instead of hanging the other writers.
-        let guest = Guest { fail: Some(500), ..guest };
-        assert!(write_pages(&tpl, &guest, &input, &pages_file(&dir.join("pages-fail")), 4, false).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-
-    #[test]
-    fn published_files_and_directory_are_private_and_owned_by_destination() {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let dir = std::env::temp_dir().join(format!("flexvm-publish-mode-{}", std::process::id()));
-        std::fs::create_dir(&dir).unwrap();
-        let parent = File::open(&dir).unwrap();
-        let owner = fstat(parent.as_raw_fd()).unwrap();
-        let files: Vec<_> = ["pages", "pagemap", "vmstate", "manifest.json"].iter()
-            .map(|name| File::create(dir.join(name)).unwrap()).collect();
-        let fds: Vec<_> = files.iter().map(AsRawFd::as_raw_fd).collect();
-        publish_permissions(&fds, parent.as_raw_fd(), &owner).unwrap();
-        for file in &files {
-            let meta = file.metadata().unwrap();
-            assert_eq!(meta.permissions().mode() & 0o777, 0o600);
-            assert_eq!((meta.uid(), meta.gid()), (owner.st_uid, owner.st_gid));
-        }
-        assert_eq!(parent.metadata().unwrap().permissions().mode() & 0o777, 0o700);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    /// Builds runs of `state` for the pages `ps` (ascending).
-    fn runs_of(ps: &[(usize, u8)]) -> Runs {
+    fn runs_of(ps: impl IntoIterator<Item = (usize, u8)>) -> Runs {
         let mut out: Runs = Vec::new();
-        for &(p, s) in ps {
+        for (p, s) in ps {
             match out.last_mut() {
                 Some((f, n, st)) if *st == s && *f + *n == p as u64 => *n += 1,
                 _ => out.push((p as u64, 1, s)),
@@ -1475,180 +1044,165 @@ mod tests {
         out
     }
 
+    fn restore(tpl: &Template, n: usize, runs: &Runs, file: &PageFile) -> Vec<(u8, Vec<u8>)> {
+        let mut state = vec![P_BASE; n];
+        runs.iter().for_each(|&(f, c, s)| state[f as usize..(f + c) as usize].fill(s));
+        let mut b = vec![0; PAGE_SIZE];
+        let mut read = |i: usize, st: u8| match st {
+            P_BASE if tpl.has_data(i) => tpl.pages(i, 1).to_vec(),
+            P_BASE | P_ZERO => vec![0; PAGE_SIZE],
+            _ => file.read(i, &mut b, false).map(|()| b.clone()).unwrap(),
+        };
+        state.into_iter().enumerate().map(|(i, st)| (st, read(i, st))).collect()
+    }
+
+    #[test]
+    fn pages_roundtrip_against_the_template() {
+        let dir = tmp("ckpt");
+        let n = 1000;
+        let tpl_pages: Vec<Option<u8>> = (0..n).map(|i| (i % 2 == 0).then_some(i as u8 | 1)).collect();
+        let tpl = template(&dir, &tpl_pages);
+        let zero = || vec![0; PAGE_SIZE];
+        let pages: Vec<Vec<u8>> = (0..n).map(|i| [tpl_pages[i].map_or(zero(), |b| vec![b; PAGE_SIZE]), zero()].get(i % 5).cloned().unwrap_or_else(|| page(i))).collect();
+        // Pages 7 and 300..320 were discarded by the guest; 900.. were never touched.
+        let discarded = |i: usize| i == 7 || (300..320).contains(&i);
+        let input = runs_of((0..900).map(|i| (i, if discarded(i) { P_ZERO } else { REMOTE })));
+        let want = |i: usize| if discarded(i) { zero() } else if i < 900 { pages[i].clone() } else { tpl.pages(i, 1).to_vec() };
+        let guest = Guest(pages.clone(), 333, None);
+        let want_data = (0..900).filter(|&i| i % 5 >= 2 && !discarded(i)).count() as u64;
+        let want_zero = (0..900).filter(|&i| i % 2 == 0 && (i % 5 == 1 || discarded(i))).count() as u64;
+        let mut last = None;
+        for threads in [8, 3, 1] {
+            let path = dir.join(format!("pages-{threads}"));
+            let w = write_pages(&tpl, &guest, &input, &pages_file(&path), threads, false).unwrap();
+            assert_eq!((w.data, w.zero, fs::metadata(&path).unwrap().len()), (want_data, want_zero, w.data * PAGE_SIZE as u64));
+            let (map, sums) = parse_pagemap(&w.map, n as u64, false, 0).unwrap();
+            // Runs past the guest's end, a truncated map, and a DATA run pointing anywhere but its place.
+            let mut bad = w.map.clone();
+            let r = (0..map.len()).find(|&r| bad[24 + 32 * r + 16] == DATA as u8).unwrap();
+            bad[24 + 32 * r + 24] ^= 1;
+            for (map, pages) in [(&w.map[..], 899), (&w.map[..w.map.len() - 4], n as u64), (&bad[..], n as u64)] {
+                assert!(parse_pagemap(map, pages, false, 0).is_err());
+            }
+            let (runs, file) = flatten(&[map], vec![File::open(&path).unwrap()], vec![sums]);
+            let got = restore(&tpl, n, &runs, &file);
+            for (i, (st, page)) in got.iter().enumerate() {
+                assert!(*page == want(i), "page {i} (state {st}, {threads} threads)");
+            }
+            last = Some((runs, got, file, path));
+        }
+        let (runs, got, file, path) = last.unwrap();
+        let (f, c, _) = runs.iter().copied().filter(|r| r.2 == REMOTE).max_by_key(|r| r.1).unwrap();
+        let mut b = vec![0; c as usize * PAGE_SIZE];
+        file.read(f as usize, &mut b, true).unwrap();
+        assert_eq!(&b[(c as usize - 1) * PAGE_SIZE..], &want((f + c) as usize - 1)[..]);
+        // Pages that are not stored, and exactly the corrupt page, are InvalidData.
+        let mut one = zero();
+        assert_eq!(file.read(0, &mut one, false).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        fs::OpenOptions::new().write(true).open(&path).unwrap().write_all_at(&[0xff], (5 * PAGE_SIZE + 5) as u64).unwrap();
+        let bad: Vec<_> = (0..n).filter_map(|i| (got[i].0 == REMOTE).then(|| file.read(i, &mut one, false).err()).flatten()).collect();
+        assert_eq!(bad.iter().map(|e| e.kind()).collect::<Vec<_>>(), [io::ErrorKind::InvalidData]);
+        // A failed read fails the whole write instead of hanging the other writers.
+        assert!(write_pages(&tpl, &Guest(pages, 333, Some(500)), &input, &pages_file(&dir.join("pages-fail")), 4, false).is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn deltas_flatten_over_their_parents() {
-        let dir = std::env::temp_dir().join(format!("flexvm-delta-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tmp("delta");
         let n = 300;
         let tpl_pages: Vec<Option<u8>> = (0..n).map(|i| (i % 3 == 0).then_some(i as u8 | 1)).collect();
         let tpl = template(&dir, &tpl_pages);
         let tpl_page = |i: usize| tpl_pages[i].map_or(vec![0; PAGE_SIZE], |b| vec![b; PAGE_SIZE]);
-        // Generation 1: pages 0..200 populated with data, the rest untouched.
         let v1: Vec<Vec<u8>> = (0..n).map(|i| if i < 200 { page(i) } else { tpl_page(i) }).collect();
-        let full_runs = runs_of(&(0..200).map(|i| (i, REMOTE)).collect::<Vec<_>>());
-        let w1 = write_pages(&tpl, &Guest { pages: v1.clone(), region: 128, fail: None }, &full_runs, &pages_file(&dir.join("p1")), 3, false).unwrap();
-        // Generation 2 changes some pages: new data, back to the template's,
-        // zero, discarded (ZERO), and a page populated since (BASE before).
-        let mut v2 = v1.clone();
-        let mut dirty: Vec<(usize, u8)> = Vec::new();
-        for i in [5usize, 6, 7, 50, 199] {
-            v2[i] = page(i + 1000);
-            dirty.push((i, REMOTE));
-        }
-        for i in [9usize, 10] {
-            v2[i] = tpl_page(i);
-            dirty.push((i, REMOTE));
-        }
-        v2[20] = vec![0; PAGE_SIZE];
-        dirty.push((20, REMOTE));
-        for i in [30usize, 31, 32, 33] {
-            v2[i] = vec![0; PAGE_SIZE];
-            dirty.push((i, crate::uffd::ZERO));
-        }
-        v2[250] = tpl_page(250);
-        dirty.push((250, crate::uffd::BASE));
-        v2[251] = page(251);
-        dirty.push((251, REMOTE));
-        dirty.sort();
-        let delta = runs_of(&dirty);
-        let g2 = Guest { pages: v2.clone(), region: 128, fail: None };
-        let w2 = write_pages(&tpl, &g2, &delta, &pages_file(&dir.join("p2")), 2, true).unwrap();
-        assert_eq!(w2.data, 6, "only the changed data pages are stored");
-        let (m1, s1) = parse_pagemap(&w1.map, n as u64, false).unwrap();
-        let (m2, s2) = parse_pagemap(&w2.map, n as u64, true).unwrap();
-        assert!(parse_pagemap(&w2.map, n as u64, false).is_err(), "TEMPLATE runs only in a delta");
-        assert!(m2.iter().any(|r| r.2 == TEMPLATE));
-        let layers = vec![
-            m1.iter().map(|&(f, c, k, a)| (f, c, k, 1, a)).collect::<Vec<Run>>(),
-            m2.iter().map(|&(f, c, k, a)| (f, c, k, 0, a)).collect::<Vec<Run>>(),
+        let w1 = write_pages(&tpl, &Guest(v1.clone(), 128, None), &runs_of((0..200).map(|i| (i, REMOTE))), &pages_file(&dir.join("p1")), 3, false).unwrap();
+        // Generation 2: new data, back to the template's, zero, discarded, and populated since (BASE before).
+        let (mut v2, mut dirty) = (v1, Vec::new());
+        type Change<'a> = (&'a [usize], u8, &'a dyn Fn(usize) -> Vec<u8>);
+        let changes: [Change; 5] = [
+            (&[5, 6, 7, 50, 199, 251], REMOTE, &|i| page(i + 1000)),
+            (&[9, 10], REMOTE, &tpl_page),
+            (&[20], REMOTE, &|_| vec![0; PAGE_SIZE]),
+            (&[30, 31, 32, 33], P_ZERO, &|_| vec![0; PAGE_SIZE]),
+            (&[250], P_BASE, &tpl_page),
         ];
+        for (pages, state, bytes) in changes {
+            for &i in pages {
+                v2[i] = bytes(i);
+                dirty.push((i, state));
+            }
+        }
+        dirty.sort();
+        let w2 = write_pages(&tpl, &Guest(v2.clone(), 128, None), &runs_of(dirty), &pages_file(&dir.join("p2")), 2, true).unwrap();
+        assert_eq!(w2.data, 6, "only the changed data pages are stored");
+        let (m1, s1) = parse_pagemap(&w1.map, n as u64, false, 1).unwrap();
+        let (m2, s2) = parse_pagemap(&w2.map, n as u64, true, 0).unwrap();
+        assert!(parse_pagemap(&w2.map, n as u64, false, 0).is_err(), "TEMPLATE runs only in a delta");
+        assert!(m2.iter().any(|r| r.2 == TEMPLATE));
         let files = vec![File::open(dir.join("p2")).unwrap(), File::open(dir.join("p1")).unwrap()];
-        let (runs, file) = flatten(&layers, files, vec![s2, s1]);
-        let mut state = vec![crate::uffd::BASE; n];
-        for &(f, c, s) in &runs {
-            state[f as usize..(f + c) as usize].fill(s);
+        let (runs, file) = flatten(&[m1, m2], files, vec![s2, s1]);
+        for (i, (st, page)) in restore(&tpl, n, &runs, &file).into_iter().enumerate() {
+            assert!(page == v2[i], "page {i} (state {st})");
         }
-        for i in 0..n {
-            let got = match state[i] {
-                crate::uffd::BASE => tpl_page(i),
-                crate::uffd::ZERO => vec![0; PAGE_SIZE],
-                _ => {
-                    let mut b = vec![0; PAGE_SIZE];
-                    file.read(i, &mut b, false).unwrap();
-                    b
-                }
-            };
-            assert!(got == v2[i], "page {i} (state {})", state[i]);
-        }
-        // The canonical hash of what the chain restores is that of generation 2.
         let mut want = Canon::new(&tpl);
-        for (i, p) in v2.iter().enumerate() {
-            want.page(i, p);
-        }
-        let ck = Checkpoint { dir: dir.clone(), manifest: serde_json::from_value(serde_json::json!({
-            "format": 2, "created_unix_ms": 0, "name": "x", "ip": "10.0.0.1", "template": "tpl", "template_id": "", "vcpus": 1,
-            "mem_mib": 1, "max_mib": 1, "hotplug_mib": 0, "guest_pages": n, "data_pages": 0, "zero_pages": 0, "files": {}})).unwrap(),
-            id: String::new(), vmstate: Vec::new(), runs, file: Arc::new(file), chain: Vec::new(), chain_ids: Vec::new(), meta_left: 0 };
+        v2.iter().enumerate().for_each(|(i, p)| want.page(i, p));
+        let (manifest, file) = (manifest(n, None, json!({})), Arc::new(file));
+        let ck = Checkpoint { dir: dir.clone(), manifest, id: String::new(), vmstate: Vec::new(), runs, file, chain: Vec::new(), chain_ids: Vec::new(), meta_left: 0 };
         assert_eq!(ck.content_hash(&tpl).unwrap(), want.finish());
-        let _ = std::fs::remove_dir_all(&dir);
+        ck.verify_data().unwrap();
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn overlay_splits_runs() {
+    fn overlays_buffers_and_parent_paths() {
         let base: Vec<Run> = vec![(0, 10, DATA, 1, 100), (20, 5, ZERO, 1, 0)];
         let top: Vec<Run> = vec![(2, 2, ZERO, 0, 0), (5, 1, TEMPLATE, 0, 0), (9, 13, DATA, 0, 7)];
-        assert_eq!(
-            overlay(&base, &top),
-            vec![(0, 2, DATA, 1, 100), (2, 2, ZERO, 0, 0), (4, 1, DATA, 1, 104), (5, 1, TEMPLATE, 0, 0), (6, 3, DATA, 1, 106), (9, 13, DATA, 0, 7), (22, 3, ZERO, 1, 0)]
-        );
+        let want = [(0, 2, DATA, 1, 100), (2, 2, ZERO, 0, 0), (4, 1, DATA, 1, 104), (5, 1, TEMPLATE, 0, 0), (6, 3, DATA, 1, 106), (9, 13, DATA, 0, 7), (22, 3, ZERO, 1, 0)];
+        assert_eq!(overlay(&base, &top), want);
         assert_eq!(parent_path(Path::new("/d/ck2"), Path::new("/d/ck1")), "../ck1");
         assert_eq!(parent_path(Path::new("/e/ck2"), Path::new("/d/ck1")), "/d/ck1");
+        // Writer buffers are aligned and zeroed; one larger than Linux can map fails, even with overcommit.
+        let mut buf = aligned(2).unwrap();
+        assert_eq!(buf.as_ptr() as usize % PAGE_SIZE, 0);
+        assert!(as_bytes(&mut buf).len() == 2 * PAGE_SIZE && as_bytes(&mut buf).iter().all(|&b| b == 0));
+        assert_eq!(aligned(isize::MAX as usize / PAGE_SIZE).err().unwrap().kind(), io::ErrorKind::OutOfMemory);
     }
 
     #[test]
     fn staging_is_private_never_overwrites_and_cleans_up() {
-        use std::os::unix::fs::{symlink, PermissionsExt};
-        let dir = std::env::temp_dir().join(format!("flexvm-stage-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+        let dir = tmp("stage");
         let dest = dir.join("ck");
-        // Staging left by a daemon that is gone is cleared, if it is private
-        // like ours; anything else with that name is left alone.
-        let stale = dir.join(format!("{STAGING_PREFIX}999999999-1"));
-        std::fs::create_dir_all(stale.join("ck")).unwrap();
-        std::fs::write(stale.join("ck/pages"), b"x").unwrap();
-        std::fs::write(stale.join("ck/GEN"), b"generation").unwrap();
-        std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let foreign = dir.join(format!("{STAGING_PREFIX}999999998-1"));
-        std::fs::create_dir_all(&foreign).unwrap();
-        std::fs::set_permissions(&foreign, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        // Staging left by a process that is gone is cleared if it is private like ours; anything else is left alone.
+        let (stale, foreign) = (dir.join(format!("{STAGING_PREFIX}999999999-1")), dir.join(format!("{STAGING_PREFIX}999999998-1")));
+        fs::create_dir_all(stale.join("ck")).unwrap();
+        fs::write(stale.join("ck/pages"), b"x").unwrap();
+        fs::write(stale.join("ck/GEN"), b"generation").unwrap();
+        fs::create_dir_all(&foreign).unwrap();
+        fs::set_permissions(&stale, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&foreign, fs::Permissions::from_mode(0o755)).unwrap();
         let s = Staging::new(&dest, dir.join("vmstate.private")).unwrap();
-        assert!(!stale.exists());
-        assert!(foreign.exists());
-        let ours: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap()
-            .flatten()
-            .filter(|e| e.file_name().to_string_lossy().starts_with(&format!("{STAGING_PREFIX}{}", std::process::id())))
-            .collect();
-        assert_eq!(ours.len(), 1);
-        assert_eq!(ours[0].metadata().unwrap().permissions().mode() & 0o777, 0o700);
-        // Files are never created over, or through, anything already there.
-        let f = s.create("pages").unwrap();
-        drop(f);
+        assert!(!stale.exists() && foreign.exists());
+        let ours = format!("{STAGING_PREFIX}{}", std::process::id());
+        let mine = || fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()).filter(|p| p.file_name().unwrap().to_string_lossy().starts_with(&ours)).collect::<Vec<_>>();
+        assert_eq!(mine().iter().map(|p| mode(p)).collect::<Vec<_>>(), [0o700]);
+        drop(s.create("pages").unwrap());
         assert!(s.create("pages").is_err());
         symlink("/etc/hostname", dir.join("link")).unwrap();
-        let pfd = s.parent.as_raw_fd();
-        assert!(create_at(pfd, "link").is_err());
-        assert!(open_at(pfd, "link").is_err());
-        assert!(s.create("pagemap").is_ok());
+        assert!(create_at(s.parent.as_raw_fd(), "link").is_err() && open_at(s.parent.as_raw_fd(), "link").is_err());
+        let files: Vec<_> = ["vmstate", "pagemap", "manifest.json"].map(|f| s.create(f).unwrap()).into();
         s.add_file("GEN", b"generation").unwrap();
-        drop(s);
-        assert!(!dest.exists());
-        assert!(std::fs::read_dir(&dir).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().contains(&std::process::id().to_string())));
-        std::fs::create_dir_all(&dest).unwrap();
-        assert!(Staging::new(&dest, dir.join("vmstate.private")).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    #[ignore]
-    fn bench_write_pages() {
-        let dir = PathBuf::from(std::env::var("FLEXVM_BENCH_DIR").unwrap());
-        let mib: usize = std::env::var("FLEXVM_BENCH_MIB").map_or(1024, |v| v.parse().unwrap());
-        let n = mib << 8;
-        let tdir = dir.join(format!("bench-tpl-{}", std::process::id()));
-        let tpl = template(&tdir, &vec![None; n]);
-        let mut x = 0x9E37_79B9_7F4A_7C15u64;
-        let pages: Vec<Vec<u8>> = (0..n)
-            .map(|_| {
-                (0..PAGE_SIZE / 8)
-                    .flat_map(|_| {
-                        x ^= x << 13;
-                        x ^= x >> 7;
-                        x ^= x << 17;
-                        x.to_le_bytes()
-                    })
-                    .collect()
-            })
-            .collect();
-        let guest = Guest { pages, region: n, fail: None };
-        let runs: Runs = vec![(0, n as u64, REMOTE)];
-        for _ in 0..3 {
-            let path = dir.join(format!("bench-pages-{}", std::process::id()));
-            let out = pages_file(&path);
-            if std::env::var_os("FLEXVM_BENCH_PREALLOC").is_some() {
-                out.reserve(n);
-            }
-            let start = std::time::Instant::now();
-            let w = write_pages(&tpl, &guest, &runs, &out, writer_threads(), false).unwrap();
-            let took = start.elapsed();
-            let f = File::open(&path).unwrap();
-            f.sync_all().unwrap();
-            let synced = start.elapsed();
-            eprintln!("{mib} MiB, {} threads: write_pages {:.0} ms ({:.2} GB/s), +fsync {:.0} ms", writer_threads(), took.as_secs_f64() * 1e3, (w.data as f64 * PAGE_SIZE as f64) / took.as_secs_f64() / 1e9, (synced - took).as_secs_f64() * 1e3);
-            std::fs::remove_file(&path).unwrap();
+        let owner = fstat(s.parent.as_raw_fd()).unwrap();
+        publish_permissions(&files.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>(), s.ck.as_raw_fd(), &owner).unwrap();
+        for m in files.iter().map(|f| f.metadata().unwrap()) {
+            assert_eq!((m.permissions().mode() & 0o777, m.uid(), m.gid()), (0o600, owner.st_uid, owner.st_gid));
         }
-        let _ = std::fs::remove_dir_all(&tdir);
+        assert_eq!(mode(&mine()[0].join("ck")), 0o700);
+        drop(s);
+        assert!(!dest.exists() && mine().is_empty());
+        fs::create_dir_all(&dest).unwrap();
+        assert!(Staging::new(&dest, dir.join("vmstate.private")).is_err());
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

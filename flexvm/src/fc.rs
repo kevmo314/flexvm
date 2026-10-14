@@ -7,8 +7,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
-use std::thread::JoinHandle;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -17,15 +16,10 @@ use crate::bail;
 use crate::socket::{SocketRoot, Sockets};
 use crate::util::{retry, Result};
 
-/// How long a new Firecracker has to open its API socket.
 pub const SPAWN_READY: Duration = Duration::from_secs(5);
-
-/// Deadline for a Firecracker API call that does not pick its own.
 pub const API_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// A request that never reached Firecracker: its API socket would not take
-/// a connection, or a write failed before sending any bytes. Any other
-/// failure, an error answer included, may come after Firecracker acted on it.
+/// Never reached Firecracker; any other failure (error answers too) may come after it acted.
 #[derive(Debug)]
 pub struct NotSent(String);
 
@@ -37,7 +31,6 @@ impl std::fmt::Display for NotSent {
 
 impl std::error::Error for NotSent {}
 
-/// Whether `e` says the request never reached Firecracker.
 pub fn not_sent(e: &crate::util::Error) -> bool {
     e.downcast_ref::<NotSent>().is_some()
 }
@@ -46,24 +39,40 @@ pub struct Firecracker {
     child: Child,
     pub sockets: Sockets,
     api: Api,
+    /// The cgroup move: joined before the kill, so its pid is never reused meanwhile.
+    joining: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Firecracker {
-    /// Starts Firecracker with private sockets and a log inside `dir`, and
-    /// waits up to `ready` for its API socket.
     pub fn spawn(bin: &Path, dir: &Path, sockets: Sockets, ready: Duration) -> Result<Self> {
         crate::socket::check(&sockets.api)?;
+        use std::os::unix::process::CommandExt;
         let log = File::create(dir.join("firecracker.log"))?;
-        let child = Command::new(bin)
-            .arg("--api-sock")
-            .arg(&sockets.api)
-            .arg("--level")
-            .arg("Warn")
-            .stdin(Stdio::null())
-            .stdout(log.try_clone()?)
-            .stderr(log)
-            .spawn()?;
-        let fc = Firecracker { child, sockets, api: Api::default() };
+        let mut cmd = Command::new(bin);
+        cmd.arg("--api-sock").arg(&sockets.api).arg("--level").arg("Warn").stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log);
+        // Firecracker never outlives its VM process (whose pager serves its memory). The
+        // signal comes when the spawning *thread* exits, so spawn from the main thread.
+        let parent = std::process::id() as i32;
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != parent {
+                    return Err(std::io::Error::other("its parent died"));
+                }
+                // Out of the terminal's process group: Ctrl-Z, Ctrl-C and a hang-up
+                // are for the VM process, which decides what becomes of Firecracker.
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = cmd.spawn()?;
+        let fc = Firecracker { child, sockets, api: Api::default(), joining: None };
+        let id = crate::host::Ident::of(fc.pid()).ok_or("firecracker exited at once")?;
+        crate::host::store(&dir.join("fc"), &id, false)?;
         retry(ready, || Ok(UnixStream::connect(&fc.sockets.api)?))?;
         Ok(fc)
     }
@@ -73,15 +82,29 @@ impl Firecracker {
     }
 
     pub fn put(&self, path: &str, body: Value) -> Result<Value> {
-        self.request("PUT", path, Some(body))
+        self.request_within("PUT", path, Some(body), API_TIMEOUT)
     }
 
     pub fn patch(&self, path: &str, body: Value) -> Result<Value> {
-        self.request("PATCH", path, Some(body))
+        self.request_within("PATCH", path, Some(body), API_TIMEOUT)
     }
 
     pub fn get(&self, path: &str) -> Result<Value> {
-        self.request("GET", path, None)
+        self.request_within("GET", path, None, API_TIMEOUT)
+    }
+
+    /// With no `clock_realtime`, only prepares the load (`firecracker/0002-*.patch`).
+    pub fn load_snapshot(&self, vmstate: &Path, tap: &str, clock_realtime: Option<bool>, timeout: Duration) -> Result<Value> {
+        let mut body = serde_json::json!({
+            "snapshot_path": vmstate,
+            "mem_backend": {"backend_type": "Uffd", "backend_path": self.sockets.uffd},
+            "vsock_override": {"uds_path": self.sockets.vsock},
+            "network_overrides": [{"iface_id": "eth0", "host_dev_name": tap}],
+        });
+        let Some(realtime) = clock_realtime else { return self.request_within("PUT", "/snapshot/prepare", Some(body), timeout) };
+        body["clock_realtime"] = realtime.into();
+        body["resume_vm"] = false.into();
+        self.request_within("PUT", "/snapshot/load", Some(body), timeout)
     }
 
     pub fn pause(&self) -> Result<()> {
@@ -93,22 +116,14 @@ impl Firecracker {
     }
 
     /// Every call has a deadline, so none can hold a VM's API lock forever.
-    fn request(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value> {
-        self.request_within(method, path, body, API_TIMEOUT)
-    }
-
-    /// `request`, all of it (connecting, writing, every read) within `timeout`.
     pub fn request_within(&self, method: &str, path: &str, body: Option<Value>, timeout: Duration) -> Result<Value> {
         self.api.request(&self.sockets.api, method, path, body, timeout)
     }
 
-    /// Whether the process is still running (it has not exited or been killed).
     pub fn alive(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
     }
 
-    /// How Firecracker exited, if it has, and the end of its log: why a
-    /// request to it failed.
     pub fn post_mortem(&mut self, dir: &Path) -> String {
         let status = match self.child.try_wait() {
             Ok(Some(st)) => format!("exited ({st})"),
@@ -116,12 +131,14 @@ impl Firecracker {
             Err(e) => format!("unknown ({e})"),
         };
         let log = File::open(dir.join("firecracker.log")).and_then(|mut f| log_tail(&mut f)).unwrap_or_default();
-        let tail: Vec<&str> = log.lines().rev().take(5).collect();
-        let tail: Vec<&str> = tail.into_iter().rev().collect();
-        format!("firecracker {} {status}; log: {}", self.pid(), tail.join(" | "))
+        let lines: Vec<&str> = log.lines().collect();
+        format!("firecracker {} {status}; log: {}", self.pid(), lines[lines.len().saturating_sub(5)..].join(" | "))
     }
 
     pub fn kill(&mut self) {
+        if let Some(j) = self.joining.take() {
+            let _ = j.join();
+        }
         self.api.connection.get_mut().take();
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -129,8 +146,7 @@ impl Firecracker {
     }
 }
 
-/// Calls on a VM hold its `fc` mutex; standalone/pooled Firecrackers have
-/// one owner. Keep the reader too, so any buffered bytes stay with the socket.
+/// Calls on a VM hold its `fc` mutex; idle Firecrackers have one owner.
 #[derive(Default)]
 struct Api {
     connection: RefCell<Option<BufReader<crate::util::By<UnixStream>>>>,
@@ -145,10 +161,11 @@ impl Api {
              Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         );
-        // At most two tries: a cached connection Firecracker has since closed
-        // fails the write before a byte goes out; then one fresh connection.
+        // A cached connection Firecracker closed fails before a byte goes out: one fresh retry.
         loop {
-            let cached = self.connection.borrow_mut().take();
+            // Anything readable on an idle connection (stray bytes, or the close
+            // of a Firecracker that died) means it is never used again (#109).
+            let cached = self.connection.borrow_mut().take().filter(|r| !readable(&r.get_ref().s));
             let reused = cached.is_some();
             let mut r = match cached {
                 Some(mut r) => {
@@ -175,8 +192,7 @@ impl Api {
                 Err(e) if !sent => return Err(Box::new(NotSent(format!("firecracker {method} {path}: {e}")))),
                 Err(e) => return Err(e),
             };
-            // Bytes past the answer were never asked for: the stream is not
-            // in step any more.
+            // Bytes past the answer mean the stream is out of step.
             if !close && r.buffer().is_empty() {
                 *self.connection.borrow_mut() = Some(r);
             }
@@ -194,8 +210,7 @@ impl Api {
 }
 
 fn exchange(r: &mut BufReader<crate::util::By<UnixStream>>, mut req: &[u8], sent: &mut bool) -> Result<(u16, Vec<u8>, bool)> {
-    // Usually one write. A partial write means the request may have reached
-    // Firecracker, even if a later write or read fails: never replay it.
+    // After a partial write the request may have reached Firecracker: never replay it.
     while !req.is_empty() {
         match r.get_mut().write(req) {
             Ok(0) => return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "firecracker request write returned zero").into()),
@@ -208,7 +223,9 @@ fn exchange(r: &mut BufReader<crate::util::By<UnixStream>>, mut req: &[u8], sent
         }
     }
     let mut status = String::new();
-    r.read_line(&mut status)?;
+    if r.read_line(&mut status)? == 0 {
+        bail!("firecracker closed the connection without answering");
+    }
     let code: u16 = status.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
     if code == 0 || !status.ends_with("\r\n") {
         bail!("firecracker: invalid response status");
@@ -239,8 +256,7 @@ fn exchange(r: &mut BufReader<crate::util::By<UnixStream>>, mut req: &[u8], sent
             bail!("firecracker: unsupported transfer encoding");
         }
     }
-    // micro_http omits Content-Length for 204 responses. Other responses
-    // must declare their length; reading to EOF would lose keep-alive.
+    // micro_http omits Content-Length for 204; reading to EOF would lose keep-alive.
     let len = if code == 204 || code == 304 {
         if code == 204 && len.is_some_and(|n| n != 0) {
             bail!("firecracker: nonzero content length for 204");
@@ -254,8 +270,13 @@ fn exchange(r: &mut BufReader<crate::util::By<UnixStream>>, mut req: &[u8], sent
     Ok((code, buf, close))
 }
 
-/// Reads at most the last 64 KiB, dropping the first partial line when
-/// seeking into a log. Invalid UTF-8 is replaced, not fatal.
+fn readable(s: &UnixStream) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut p = libc::pollfd { fd: s.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+    unsafe { libc::poll(&mut p, 1, 0) != 0 }
+}
+
+/// At most the last 64 KiB, without the first partial line.
 fn log_tail(r: &mut (impl Read + Seek)) -> std::io::Result<String> {
     const MAX: u64 = 64 << 10;
     let len = r.seek(SeekFrom::End(0))?;
@@ -277,8 +298,7 @@ impl Drop for Firecracker {
     }
 }
 
-/// An idle Firecracker with its directory, (already joined) cgroup and tap.
-/// Dropping it kills the Firecracker and removes all three.
+/// Dropping it kills the Firecracker and removes its directory, cgroup and tap.
 pub struct Idle {
     pub fc: Firecracker,
     pub dir: PathBuf,
@@ -287,7 +307,6 @@ pub struct Idle {
 }
 
 impl Idle {
-    /// Takes the parts out; the caller becomes responsible for cleaning them up.
     pub fn into_parts(self) -> (Firecracker, PathBuf, Option<PathBuf>, String) {
         let me = std::mem::ManuallyDrop::new(self);
         // SAFETY: `me` is never used or dropped again, so each field is moved out exactly once.
@@ -302,172 +321,66 @@ impl Drop for Idle {
     }
 }
 
-/// Removes a VM's tap, cgroup and directory. Its Firecracker must be gone.
+/// Its Firecracker must be gone.
 pub fn release(tap: &str, cgroup: Option<&Path>, dir: &Path) {
     crate::net::delete_tap(tap);
     if let Some(cg) = cgroup.filter(|cg| cg.exists()) {
-        // The cgroup stays busy until the kernel has finished tearing the process down.
+        // Busy until the kernel has torn the process down.
         let _ = retry(Duration::from_secs(2), || Ok(std::fs::remove_dir(cg)?));
     }
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// Idle Firecracker processes, spawned ahead of time so starting a VM only
-/// pays for the snapshot load. Each one owns a fresh directory under `root`
-/// and has already been moved into its own cgroup (that move alone costs tens
-/// of milliseconds, as it waits for an RCU grace period).
-///
-/// A single background worker keeps `size` of them ready, so concurrent
-/// takes cannot make the pool overshoot.
-pub struct Pool {
+/// Starts Firecrackers, each with its own directory, tap and cgroup; the cgroup is joined in
+/// the background (an RCU grace period). Spawn from a thread that lives as long as the VM.
+pub struct Spawner {
     bin: PathBuf,
     root: PathBuf,
     sockets: Arc<SocketRoot>,
     cgroups: Option<PathBuf>,
     tap_prefix: String,
-    size: usize,
-    state: Mutex<PoolState>,
-    wake: Condvar,
-    worker: Mutex<Option<JoinHandle<()>>>,
     next: AtomicU64,
 }
 
-#[derive(Default)]
-struct PoolState {
-    idle: Vec<Idle>,
-    closed: bool,
-}
-
-impl Pool {
-    pub fn new(bin: &Path, root: &Path, sockets: Arc<SocketRoot>, cgroups: Option<PathBuf>, tap_prefix: &str, size: usize) -> Arc<Pool> {
-        let pool = Arc::new(Pool {
-            bin: bin.into(),
-            root: root.into(),
-            sockets,
-            cgroups,
-            tap_prefix: tap_prefix.into(),
-            size,
-            state: Mutex::new(PoolState::default()),
-            wake: Condvar::new(),
-            worker: Mutex::new(None),
-            next: AtomicU64::new(0),
-        });
-        let p = pool.clone();
-        *pool.worker.lock().unwrap() = Some(std::thread::spawn(move || p.refill()));
-        pool
+impl Spawner {
+    pub fn new(bin: &Path, root: &Path, sockets: Arc<SocketRoot>, cgroups: Option<PathBuf>, tap_prefix: &str) -> Spawner {
+        Spawner { bin: bin.into(), root: root.into(), sockets, cgroups, tap_prefix: tap_prefix.into(), next: AtomicU64::new(0) }
     }
 
-    fn spawn(&self, ready: Duration) -> Result<Idle> {
+    pub fn take(&self, deadline: Option<std::time::Instant>) -> Result<Idle> {
+        let ready = deadline.map_or(SPAWN_READY, |d| d.saturating_duration_since(std::time::Instant::now()).min(SPAWN_READY));
+        if ready.is_zero() {
+            bail!("out of time to start firecracker");
+        }
         let n = self.next.fetch_add(1, Ordering::SeqCst);
         let id = format!("idle-{}-{n}", std::process::id());
         let tap = format!("{}{n:x}", self.tap_prefix);
         let dir = self.root.join(&id);
         let cgroup = self.cgroups.as_ref().map(|root| root.join(&id));
-        let fc = (|| {
-            crate::net::create_tap(&tap)?;
-            std::fs::create_dir_all(&dir)?;
-            let fc = Firecracker::spawn(&self.bin, &dir, self.sockets.allocate()?, ready)?;
-            if let Some(cg) = &cgroup {
-                std::fs::create_dir_all(cg)?;
-                std::fs::write(cg.join("cgroup.procs"), fc.pid().to_string())?;
-            }
-            Ok(fc)
-        })();
-        match fc {
-            Ok(fc) => Ok(Idle { fc, dir, cgroup, tap }),
+        let made = {
+            let t = tap.clone();
+            std::thread::spawn(move || crate::net::create_tap(&t))
+        };
+        let fc = std::fs::create_dir_all(&dir).map_err(Into::into).and_then(|()| Firecracker::spawn(&self.bin, &dir, self.sockets.allocate()?, ready));
+        let made = made.join().unwrap_or_else(|_| Err("tap thread panicked".into()));
+        // A Firecracker without its tap is dropped (killed) here, before `release`.
+        let mut fc = match fc.and_then(|fc| made.map(|()| fc)) {
+            Ok(fc) => fc,
             Err(e) => {
-                // A Firecracker that was started has already been killed by its drop.
                 release(&tap, cgroup.as_deref(), &dir);
-                Err(e)
-            }
-        }
-    }
-
-    /// Hands out an idle Firecracker, or spawns one right away if none is
-    /// ready. One that has died meanwhile is torn down, never handed out.
-    pub fn take(&self) -> Result<Idle> {
-        self.take_by(None)
-    }
-
-    /// `take`, done by `deadline` if given (a spawned Firecracker must be up by then).
-    pub fn take_by(&self, deadline: Option<std::time::Instant>) -> Result<Idle> {
-        let ready = match deadline {
-            Some(d) => d.saturating_duration_since(std::time::Instant::now()).min(SPAWN_READY),
-            None => SPAWN_READY,
-        };
-        if ready.is_zero() {
-            bail!("out of time for an idle firecracker");
-        }
-        let mut dead = Vec::new();
-        let got = {
-            let mut s = self.state.lock().unwrap();
-            if s.closed {
-                bail!("daemon is shutting down");
-            }
-            loop {
-                match s.idle.pop() {
-                    Some(mut f) => match f.fc.alive() {
-                        true => break Some(f),
-                        false => dead.push(f),
-                    },
-                    None => break None,
-                }
+                return Err(e);
             }
         };
-        self.wake.notify_one();
-        for mut f in dead {
-            eprintln!("pool: dropping a dead idle firecracker: {}", f.fc.post_mortem(&f.dir));
-        }
-        match got {
-            Some(f) => Ok(f),
-            None => self.spawn(ready),
-        }
-    }
-
-    /// The worker: tops the pool up to `size`, one Firecracker at a time.
-    fn refill(&self) {
-        let mut backoff = Duration::from_millis(100);
-        loop {
-            {
-                let s = self.state.lock().unwrap();
-                let s = self.wake.wait_while(s, |s| !s.closed && s.idle.len() >= self.size).unwrap();
-                if s.closed {
-                    return;
+        if let Some(cg) = cgroup.clone() {
+            let pid = fc.pid();
+            fc.joining = Some(std::thread::spawn(move || {
+                let joined = std::fs::create_dir(&cg).and_then(|()| std::fs::write(cg.join("cgroup.procs"), pid.to_string()));
+                if let Err(e) = joined {
+                    eprintln!("firecracker {pid}: no cgroup of its own ({}): {e}", cg.display());
                 }
-            }
-            match self.spawn(SPAWN_READY) {
-                Ok(f) => {
-                    backoff = Duration::from_millis(100);
-                    let mut s = self.state.lock().unwrap();
-                    if s.closed {
-                        drop(s);
-                        drop(f);
-                        return;
-                    }
-                    s.idle.push(f);
-                }
-                Err(e) => {
-                    eprintln!("pool: cannot spawn firecracker: {e}");
-                    let s = self.state.lock().unwrap();
-                    let _ = self.wake.wait_timeout_while(s, backoff, |s| !s.closed);
-                    backoff = (backoff * 2).min(Duration::from_secs(10));
-                }
-            }
+            }));
         }
-    }
-
-    /// Stops the worker and tears down every idle Firecracker. Later takes fail.
-    pub fn close(&self) {
-        let idle = {
-            let mut s = self.state.lock().unwrap();
-            s.closed = true;
-            std::mem::take(&mut s.idle)
-        };
-        self.wake.notify_all();
-        if let Some(w) = self.worker.lock().unwrap().take() {
-            let _ = w.join();
-        }
-        drop(idle);
+        Ok(Idle { fc, dir, cgroup, tap })
     }
 }
 
@@ -476,6 +389,7 @@ mod tests {
     use super::*;
 
     use std::os::unix::net::UnixListener;
+    use std::thread::JoinHandle;
 
     struct Server {
         path: PathBuf,
@@ -525,6 +439,17 @@ mod tests {
         r.read_exact(&mut vec![0; len]).unwrap();
     }
 
+    fn answer(r: &mut BufReader<UnixStream>, response: &[u8]) {
+        read_request(r);
+        r.get_mut().write_all(response).unwrap();
+    }
+
+    fn no_more(listener: &UnixListener) {
+        assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+    }
+
+    const NO_CONTENT: &[u8] = b"HTTP/1.1 204 No Content\r\n\r\n";
+
     fn call(api: &Api, socket: &Path) -> Result<Value> {
         api.request(socket, "PATCH", "/vm", Some(serde_json::json!({"state": "Resumed"})), Duration::from_secs(1))
     }
@@ -533,12 +458,10 @@ mod tests {
     fn api_reuses_connection_and_reads_exact_bodies() {
         let server = Server::new(|listener| {
             let mut r = accept(&listener);
-            read_request(&mut r);
             // A non-success answer also has to be fully consumed and cached.
-            r.get_mut().write_all(b"HTTP/1.1 400 Bad Request\r\ncontent-length: 7\r\n\r\n{\"n\":1}").unwrap();
-            read_request(&mut r);
-            r.get_mut().write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\n{\"n\":2}").unwrap();
-            assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+            answer(&mut r, b"HTTP/1.1 400 Bad Request\r\ncontent-length: 7\r\n\r\n{\"n\":1}");
+            answer(&mut r, b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\n{\"n\":2}");
+            no_more(&listener);
         });
         let api = Api::default();
         assert!(call(&api, &server.path).unwrap_err().to_string().contains("400"));
@@ -549,14 +472,9 @@ mod tests {
     fn api_reconnects_after_unsent_write_on_closed_connection() {
         let (closed, wait) = std::sync::mpsc::channel();
         let server = Server::new(move |listener| {
-            let mut r = accept(&listener);
-            read_request(&mut r);
-            r.get_mut().write_all(b"HTTP/1.1 204 No Content\r\n\r\n").unwrap();
-            drop(r);
+            answer(&mut accept(&listener), NO_CONTENT);
             closed.send(()).unwrap();
-            let mut r = accept(&listener);
-            read_request(&mut r);
-            r.get_mut().write_all(b"HTTP/1.1 204 No Content\r\n\r\n").unwrap();
+            answer(&mut accept(&listener), NO_CONTENT);
         });
         let api = Api::default();
         assert_eq!(call(&api, &server.path).unwrap(), Value::Null);
@@ -565,36 +483,49 @@ mod tests {
     }
 
     #[test]
-    fn api_honors_connection_close() {
-        let server = Server::new(|listener| {
+    fn api_drops_a_connection_it_cannot_reuse() {
+        for (first, second, want) in [
+            // The header alone must force a new connection (the old one stays open).
+            (&b"HTTP/1.1 200 OK\r\ncOnNeCtIoN: keep-alive, Close\r\nContent-Length: 4\r\n\r\nnull"[..], NO_CONTENT, Value::Null),
+            (&b"HTTP/1.1 204 No Content\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n"[..], &b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n2"[..], serde_json::json!(2)),
+        ] {
+            let server = Server::new(move |listener| {
+                let mut r = accept(&listener);
+                answer(&mut r, first);
+                answer(&mut accept(&listener), second);
+            });
+            let api = Api::default();
+            call(&api, &server.path).unwrap();
+            assert!(api.connection.borrow().is_none());
+            assert_eq!(call(&api, &server.path).unwrap(), want);
+        }
+    }
+
+    #[test]
+    fn api_never_reads_bytes_that_arrive_on_an_idle_connection() {
+        let (stray, wait) = std::sync::mpsc::channel();
+        let server = Server::new(move |listener| {
             let mut r = accept(&listener);
-            read_request(&mut r);
-            r.get_mut().write_all(b"HTTP/1.1 200 OK\r\ncOnNeCtIoN: keep-alive, Close\r\nContent-Length: 4\r\n\r\nnull").unwrap();
-            // Keep the old socket open: the header alone must force a new one.
-            let mut fresh = accept(&listener);
-            read_request(&mut fresh);
-            fresh.get_mut().write_all(b"HTTP/1.1 204 No Content\r\n\r\n").unwrap();
+            answer(&mut r, NO_CONTENT);
+            r.get_mut().write_all(b"HTTP/1.1 500 Late\r\n\r\n").unwrap();
+            stray.send(()).unwrap();
+            answer(&mut accept(&listener), b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n3");
         });
         let api = Api::default();
         call(&api, &server.path).unwrap();
-        assert!(api.connection.borrow().is_none());
-        call(&api, &server.path).unwrap();
+        wait.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(call(&api, &server.path).unwrap(), serde_json::json!(3));
     }
 
     #[test]
     fn api_does_not_replay_a_request_with_a_lost_response() {
         let server = Server::new(|listener| {
-            let mut r = accept(&listener);
-            read_request(&mut r);
-            drop(r);
-            let mut r = accept(&listener);
+            read_request(&mut accept(&listener));
             // This is the caller's next request, not a replay of the failed one.
-            read_request(&mut r);
-            r.get_mut().write_all(b"HTTP/1.1 204 No Content\r\n\r\n").unwrap();
+            answer(&mut accept(&listener), NO_CONTENT);
         });
         let api = Api::default();
-        let e = call(&api, &server.path).unwrap_err();
-        assert!(!not_sent(&e));
+        assert!(!not_sent(&call(&api, &server.path).unwrap_err()));
         assert!(api.connection.borrow().is_none());
         call(&api, &server.path).unwrap();
     }
@@ -612,7 +543,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(30));
                 r.get_mut().write_all(response).unwrap();
                 std::thread::sleep(Duration::from_millis(150));
-                assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+                no_more(&listener);
             });
             let api = Api::default();
             let start = std::time::Instant::now();
@@ -633,11 +564,7 @@ mod tests {
             &b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nx"[..],
             &b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nTransfer-Encoding: chunked\r\n\r\n"[..],
         ] {
-            let server = Server::new(move |listener| {
-                let mut r = accept(&listener);
-                read_request(&mut r);
-                r.get_mut().write_all(response).unwrap();
-            });
+            let server = Server::new(move |listener| answer(&mut accept(&listener), response));
             let api = Api::default();
             assert!(!not_sent(&call(&api, &server.path).unwrap_err()));
             assert!(api.connection.borrow().is_none());
@@ -645,32 +572,14 @@ mod tests {
     }
 
     #[test]
-    fn api_drops_a_connection_with_unrequested_bytes() {
-        let server = Server::new(|listener| {
-            let mut r = accept(&listener);
-            read_request(&mut r);
-            r.get_mut().write_all(b"HTTP/1.1 204 No Content\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n").unwrap();
-            let mut fresh = accept(&listener);
-            read_request(&mut fresh);
-            fresh.get_mut().write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n2").unwrap();
-        });
-        let api = Api::default();
-        call(&api, &server.path).unwrap();
-        assert!(api.connection.borrow().is_none());
-        assert_eq!(call(&api, &server.path).unwrap(), serde_json::json!(2));
-    }
-
-    #[test]
     fn api_does_not_retry_a_fresh_connection() {
         let server = Server::new(|listener| {
-            // Closed before reading: the request may or may not have gone out,
-            // but a fresh connection is never tried twice.
+            // Closed before reading: a fresh connection is never tried twice.
             drop(accept(&listener));
             std::thread::sleep(Duration::from_millis(100));
-            assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+            no_more(&listener);
         });
-        let api = Api::default();
-        assert!(call(&api, &server.path).is_err());
+        assert!(call(&Api::default(), &server.path).is_err());
     }
 
     #[test]
@@ -704,8 +613,7 @@ mod tests {
     fn post_mortem_log_reads_only_a_bounded_tail() {
         let path = std::env::temp_dir().join(format!("flexvm-fc-tail-{}", std::process::id()));
         let mut f = File::create(&path).unwrap();
-        // Invalid UTF-8 outside the tail must never be read. The tail starts
-        // halfway through a long line, which must be discarded.
+        // Invalid UTF-8 outside the tail must never be read; the partial line is discarded.
         f.write_all(&vec![0xff; 2 << 20]).unwrap();
         f.write_all(&vec![b'x'; 64 << 10]).unwrap();
         f.write_all(b"\nfirst\nsecond\nthird\nfourth\nfifth\n").unwrap();
@@ -723,18 +631,15 @@ mod tests {
             assert_eq!(log_tail(&mut Cursor::new(log.as_bytes())).unwrap(), log);
         }
         assert_eq!(log_tail(&mut Cursor::new(vec![b'x'; 128 << 10])).unwrap(), "");
-        // Seeking can land inside a UTF-8 character in the discarded line.
         let mut log = "é".repeat(64 << 10).into_bytes();
         log.extend_from_slice(b"\nlast");
         assert_eq!(log_tail(&mut Cursor::new(log)).unwrap(), "last");
-        // A tail that starts exactly on a line keeps that line.
         let mut log = vec![b'x'; 100];
         log.push(b'\n');
         log.extend(std::iter::repeat_n(b'y', (64 << 10) - 4));
         log.extend_from_slice(b"\nend");
         assert_eq!(log_tail(&mut Cursor::new(&log)).unwrap().len(), 64 << 10);
         assert!(log_tail(&mut Cursor::new(&log)).unwrap().starts_with('y'));
-        // Short logs without a trailing newline and with binary junk.
         let log = b"ok\n\xff\xfe junk\nlast line";
         assert_eq!(log_tail(&mut Cursor::new(&log[..])).unwrap(), "ok\n\u{fffd}\u{fffd} junk\nlast line");
     }
