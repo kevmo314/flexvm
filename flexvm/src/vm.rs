@@ -111,6 +111,7 @@ impl Vm {
             }
             res
         })?;
+        self.pager.hold_collapse(false);
         *self.state.lock().unwrap() = State::Running;
         Ok(())
     }
@@ -209,6 +210,8 @@ impl Vm {
     /// stop devices writing memory, so execs close, `unroute` holds packets and the tap goes
     /// down. `resume` undoes this; a target calls `restore_devices`.
     pub fn save_state(&self, vmstate: &Path, sync: bool, park: bool, unroute: impl FnOnce(), t: &mut Phases) -> Result<Runs> {
+        // No huge-page collapse in flight or starting during the pause (`resume` lets it go on).
+        self.pager.hold_collapse(true);
         if park {
             self.park_balloon()?;
             t.mark("park_balloon");
@@ -283,6 +286,9 @@ impl Vm {
             true => Ok(State::Paused),
             false => self.fc(|fc| fc.resume()).map(|()| State::Running),
         };
+        if matches!(resumed, Ok(State::Running)) {
+            self.pager.hold_collapse(false);
+        }
         // Out of the pause, but with the mark still lifted: Firecracker throttled at it could time this out.
         if resumed.is_ok() {
             self.unpark_balloon();
@@ -336,9 +342,37 @@ impl Vm {
             s if s != from => bail!("vm {} is {}, not {}", self.name, s.name(), from.name()),
             _ => {}
         }
-        self.fc(|fc| if to == State::Paused { fc.pause() } else { fc.resume() })?;
-        *self.state.lock().unwrap() = to;
-        Ok(())
+        let pausing = to == State::Paused;
+        if pausing {
+            self.pager.hold_collapse(true);
+        }
+        let mut res = self.fc(|fc| if pausing { fc.pause() } else { fc.resume() }).map(drop);
+        // Test fault `pause_lost`: the pause landed, but its answer is lost.
+        if pausing && res.is_ok() && crate::host::fault("pause_lost") {
+            res = Err("injected fault: the pause's answer was lost".into());
+        }
+        // A timeout or a lost answer may still have switched it: Firecracker says which state it is in. Only if that
+        // cannot be had either is it left as it was (collapsing held, after a pause: until a resume or the pager's end).
+        let now = match &res {
+            Ok(()) => Some(to),
+            Err(e) if rejected(e, "/vm") => Some(from),
+            Err(_) => self.fc(|fc| fc.get("/")).ok().and_then(|info| match info["state"].as_str() {
+                Some("Paused") => Some(State::Paused),
+                Some("Running") => Some(State::Running),
+                _ => None,
+            }),
+        };
+        if now == Some(State::Running) {
+            self.pager.hold_collapse(false);
+        }
+        if now == Some(to) {
+            if let Err(e) = &res {
+                eprintln!("vm {}: {e}, but firecracker is {}", self.name, to.name());
+            }
+            *self.state.lock().unwrap() = to;
+            return Ok(());
+        }
+        res
     }
 
     fn running_here(&self) -> Result<()> {
@@ -765,6 +799,7 @@ impl Prepared {
             }
             let held = loaded.and_then(|_| {
                 if hold {
+                    self.pager.hold_collapse(true);
                     // Only an API pause holds device emulation.
                     fc.request_within("PATCH", "/vm", Some(json!({"state": "Paused"})), left(API_TIMEOUT))?;
                     t.mark("hold_paused");

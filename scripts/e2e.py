@@ -49,7 +49,7 @@ p.add_argument("--image-cache", help="keep the pulled image here, and build from
 # machine's MemAvailable, which lanes running at once move) and the ones that restart the
 # listeners (target_killed, suspend_resume, unit_restart).
 FAULTS = ("basic route lost_ack unknown refused pages_blip pages_dead_restore prepared_retry resume_kill exec_race guest_calls "
-          "checkpoint_restore checkpoint_fork checkpoint_corrupt held_restore_frozen cow_exact cow_abort ckpt_incremental "
+          "checkpoint_restore checkpoint_fork checkpoint_corrupt held_restore_frozen cow_exact cow_collapsed unplug_collapsed cow_abort ckpt_incremental "
           "ckpt_failed_stop ckpt_rearm prepare_fail fc_prepare slow_preload ckpt_packet_hold "
           "abort_superseded gen_zero signals suspend_gen standby restore_ip_peer late_withdrawal "
           "incoming_killed start_killed claim_killed fc_died cow_grow plug_race plug_storm suspend_debris revoked_publication "
@@ -861,7 +861,7 @@ def worker():
 # hosts of its own). Unlisted ones count as 2 s.
 COST = {"image_template": 30, "pause_resume": 6, "migrate": 3, "checkpoint_restore": 3, "suspend_resume": 3,
         "faults/cow_grow": 70, "faults/plug_race": 40, "faults/held_restore_frozen": 19,
-        "faults/pages_blip": 18, "faults/ckpt_incremental": 18,
+        "faults/pages_blip": 18, "faults/ckpt_incremental": 18, "faults/cow_collapsed": 18, "faults/unplug_collapsed": 35,
         "faults/pages_dead_restore": 14, "faults/abort_superseded": 13, "faults/plug_storm": 11, "faults/unknown": 10,
         "faults/checkpoint_corrupt": 10, "faults/guest_calls": 10, "faults/checkpoint_fork": 9,
         "faults/signals": 9, "faults/checkpoint_restore": 7, "faults/suspend_cmd": 7, "faults/fc_died_busy": 5, "faults/pause_cmd_start": 6, "faults/suspend_died": 4,
@@ -890,8 +890,8 @@ def main():
     scenarios = args.faults.split() if "faults" in selected else []
     # (name, templates it needs, cost): the cases, and each scenario on its own.
     work = [(c, set() if c == "image_template" else {args.template}, COST.get(c, 2)) for c in selected if c != "faults"]
-    # Growth (and checkpoint_hotplug, which needs room to plug) runs on GROW; fc_prepare needs a second template to mismatch with.
-    work += [(f"faults/{s}", {args.template, GROW} if s in ("cow_grow", "plug_race", "plug_storm", "checkpoint_hotplug", "fc_prepare") else {args.template},
+    # Growth (and checkpoint_hotplug and unplug_collapsed, which need room to plug) runs on GROW; fc_prepare needs a second template to mismatch with.
+    work += [(f"faults/{s}", {args.template, GROW} if s in ("cow_grow", "plug_race", "plug_storm", "checkpoint_hotplug", "unplug_collapsed", "fc_prepare") else {args.template},
               COST.get(f"faults/{s}", 2)) for s in scenarios]
     work.sort(key=lambda w: -w[2])
     scheduled = list(work)

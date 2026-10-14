@@ -25,7 +25,8 @@
 //! them (see `cow`).
 //!
 //! Page states, claims and bitmaps live in `pages`; `event` handles faults, `fetch` services their remote runs, and
-//! `pull` brings the rest in. `server` reads the paused source, and `wp` handles write tracking and COW.
+//! `pull` brings the rest in, and `collapse` turns what was paged in into huge pages afterwards. `server` reads the
+//! paused source, and `wp` handles write tracking and COW.
 
 use std::io::{self, IoSliceMut};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -44,6 +45,7 @@ use crate::cow::Cow;
 use crate::template::Template;
 use crate::util::{Result, PAGE_SIZE};
 
+mod collapse;
 mod event;
 mod fetch;
 mod pages;
@@ -248,6 +250,12 @@ pub struct Pager {
     /// Pages `[next, end)` past the latest REMOTE fault, which the pullers take before going on with their share
     /// (`steered`).
     steer: Mutex<(usize, usize)>,
+    /// What the pass collapsing paged-in memory into huge pages did, once done (see `collapse`).
+    collapse_report: Mutex<Option<collapse::CollapseReport>>,
+    /// Set while the VM is (about to be) paused: no collapse starts (see `hold_collapse`).
+    collapse_held: AtomicBool,
+    /// Held across each collapse call, so `hold_collapse` can wait one out.
+    collapse_gate: Mutex<()>,
 }
 
 impl Pager {
@@ -297,6 +305,9 @@ impl Pager {
             fault_stats: FaultStats::new(),
             lanes: Default::default(),
             steer: Mutex::new((0, 0)),
+            collapse_report: Mutex::new(None),
+            collapse_held: AtomicBool::new(false),
+            collapse_gate: Mutex::new(()),
         });
         let p = pager.clone();
         let thread = thread::Builder::new().name("uffd".into()).spawn(move || {
@@ -743,6 +754,11 @@ impl Pager {
     /// Guest memory regions as `(offset, size)`, in Firecracker's order.
     pub fn regions(&self) -> Vec<(u64, u64)> {
         regions(self.mappings())
+    }
+
+    /// Guest memory regions as `(offset, size, host address in Firecracker)` (for tests that inspect its mappings).
+    pub fn host_regions(&self) -> Vec<(u64, u64, u64)> {
+        self.mappings().iter().map(|m| (m.offset, m.size as u64, m.base_host_virt_addr)).collect()
     }
 
     fn mappings(&self) -> &[Mapping] {

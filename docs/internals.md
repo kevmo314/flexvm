@@ -190,6 +190,40 @@ queued) waits until the event thread has read events, instead of polling.
 locally, fetched, waited for another installer), measured from reading the
 fault to the copy that woke it, plus fetch, queueing and pull times.
 
+**Huge pages after the pull** (`uffd/collapse.rs`, #141). The pager installs 4 KiB
+pages, so KVM maps guest memory 4 KiB at a time. After a migration or restore
+nothing is mapped in KVM yet, so the guest's first pass over its memory exits once
+per page: reading 500 MiB took 1.1 s even with every page pulled, and 50 ms the
+second time. Once the pull is done, one thread collapses each 2 MiB chunk whose
+pages are all PRESENT into a transparent huge page
+(`process_madvise(MADV_COLLAPSE)` on Firecracker), which KVM then maps with one
+entry. It uses at most half a core (it sleeps as long as each collapse took CPU).
+Before every pause (migration, checkpoint, suspend, `kill -TSTP`, the paused
+start of an arriving VM) the VM process holds the pass and waits out a collapse
+in flight, so no pause waits behind a collapse's mmap write lock or compaction
+(0.05–2.9 ms before the pause, while the guest still runs); a resume lets it go
+on. It ends when the pager stops, at a checkpoint or migration barrier, once
+write tracking is registered, or when the kernel has no huge page to give
+(ENOMEM). Nothing else changes:
+
+- The kernel collapses a chunk of a userfaultfd-registered range only if all 512
+  pages are mapped, none of them the zero page and none write-protected. It checks
+  this again under the mmap write lock before copying. So a collapse never fills a
+  missing page behind the pager's back, and never drops a protection a checkpoint
+  relies on. Contents and page states stay the same, and RSS does not grow.
+- Write-protecting a huge page protects it whole (arming tracking got faster:
+  5–9 ms against 26–37 ms for 500 MiB). A write fault on it is reported for its
+  4 KiB page as before, and unprotecting the 64 KiB block splits the huge page.
+- Free page reporting and virtio-mem discard 2 MiB-aligned blocks, which free the
+  huge page whole. A smaller discard splits it and still raises a REMOVE, and then
+  a missing fault, as before.
+- `scripts/faults.py cow_collapsed` checks checkpoints, deltas, a restore and free
+  page reporting on collapsed memory with the guest rewriting it, and
+  `unplug_collapsed` has the guest offline the hotplugged blocks holding the most
+  huge pages (virtio-mem unplugs offline blocks first) and checks, with free page
+  reports held and from Firecracker's pagemap and kpageflags, that every huge
+  page in them is gone after the unplug and the data moved intact.
+
 Pausing Firecracker stops only the vCPUs, so before the state-only snapshot the
 source also brings the VM's tap down (no RX into guest memory), closes host
 exec sessions (vsock) and parks the balloon statistics timer; the target and an
@@ -831,6 +865,7 @@ losing the interrupt on purpose would need a debug hook in Firecracker.
 | nginx image, `run` → first HTTP response from the host | **205 ms** p50 (run 56 + nginx startup 144); `--warm`: **55 ms** p50 (run 31 + first request 22) |
 | Background memory pull | ~1.1 GB/s over loopback TCP |
 | Post-copy faults, 500 MiB written then read back right after the migration (host load ~15; 4 interleaved rounds of 8) | REMOTE fault p50 **1.0–1.3 ms** (was 4.2–5.2 ms, fetched on the event thread), p99 2.6–4.2 ms (was 12.6–16.8); template/zero faults p50 41–57 µs (was 1.3–1.6 ms, queued behind fetches); all faults blocked 0.77–0.98 s in all (was 1.33–1.6). The read itself barely changes here: most of it is KVM mapping each page again under nested virtualization |
+| First read of 500 MiB once the pull is done (2 vCPU, 2 × 5 interleaved rounds) | migrated: **59 ms** p50 with huge pages (was 1037–1146 ms; 40–50 ms the second time either way); restored from a checkpoint: **54 ms** (was 1047–1124 ms). The collapse pass: 0.4–0.85 s of CPU for 253 chunks (2–3 ms each; up to 9 ms on a loaded host), 0.9–1.8 s in all. Downtime, pull, restore and checkpoint pauses unchanged; RSS the same |
 | Idle VM host RSS | 13–35 MiB |
 | pause / resume (VM side) | **0.6 / 0.7 ms** (2 vCPU), 1.5 ms resume (24 vCPU) |
 | checkpoint (the VM runs on), 256 / 1024 / 4096 MiB written in the guest: VM paused | **20 / 18 / 24–31 ms** (was 125 / 406–428 / 1456–1923 ms); write protection armed beforehand while it runs (first checkpoint only): 20 / 95–125 / 270–380 ms; whole checkpoint 220–250 / 450–620 / 1900–2200 ms |

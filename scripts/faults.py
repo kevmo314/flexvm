@@ -10,7 +10,7 @@ usage: scripts/faults.py [--a ADDR] [--b ADDR] [--a-dir DIR] [--b-dir DIR]
 The script starts both listeners (FLEXVM_FAULTS=1, VMs log to DIR/run/vms)
 and stops them at the end. Checkpoint scenarios write to --ckpt-dir.
 """
-import argparse, base64, json, os, re, signal, socket, subprocess, sys, tempfile, threading, time, traceback
+import argparse, base64, json, struct, os, re, signal, socket, subprocess, sys, tempfile, threading, time, traceback
 
 p = argparse.ArgumentParser(usage=__doc__)
 p.add_argument("--a", default="127.0.0.1:7130")
@@ -209,7 +209,7 @@ FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_be
           "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "resume_kill",
           "prepare_fail", "short_incoming", "slow_preload", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
           "started_fsync", "started_unmark", "start_stall", "incoming_stall", "claim_stall", "handoff_stall", "ckpt_wp_race",
-          "fetch_tail_enomem", "fetch_enomem_stuck", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo", "release_stall", "release_late", "no_plug")
+          "fetch_tail_enomem", "fetch_enomem_stuck", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo", "release_stall", "release_late", "no_plug", "pause_lost")
 
 
 def disarm():
@@ -1745,6 +1745,24 @@ def pause_resume():
     cleanup(n)
 
 
+def pause_lost():
+    """A pause whose answer is lost (it landed all the same): the VM process asks Firecracker which state it is in and
+    records it, so a SIGCONT resumes it, instead of believing it runs while it sits paused for good."""
+    n = "ft-pause-lost"
+    m = setup(n)
+    sock = api_sock(A, n)
+    fault(A, "pause_lost", 30000)
+    try:
+        check("pause lost: SIGTSTP still records the pause", pause(A, n), vms(A)[n])
+        check("pause lost: Firecracker is paused", fc_api(sock, "GET", "/")["state"] == "Paused", fc_api(sock, "GET", "/"))
+    finally:
+        fault(A, "pause_lost", 0)
+    signal_vm(A, n, signal.SIGCONT)
+    check("pause lost: SIGCONT resumes it", wait_for(lambda: vms(A)[n]["state"] == "running", 10), vms(A)[n])
+    check("pause lost: running and intact", fc_api(sock, "GET", "/")["state"] == "Running" and md5(A, n) == m, fc_api(sock, "GET", "/"))
+    cleanup(n)
+
+
 def signals():
     """SIGTERM on a migration source waits for the release (no suspend);
     SIGINT destroys; a suspend is not undone by the SIGCONT systemd sends
@@ -2218,6 +2236,202 @@ def cow_exact():
     cleanup(n)
     cleanup("ft-cow2")
     rm_ckpt(path)
+
+
+def huge_mib(host, name):
+    """MiB of guest memory Firecracker holds in transparent huge pages, and its RSS."""
+    out = {}
+    for l in open(f"/proc/{fc_pid(host, name)}/smaps_rollup"):
+        k, _, v = l.partition(":")
+        if k in ("Rss", "AnonHugePages"):
+            out[k] = int(v.split()[0]) // 1024
+    return out.get("AnonHugePages", 0), out.get("Rss", 0)
+
+
+def collapse_report(host, name):
+    r = control(host, name, {"op": "debug", "what": "status"}, timeout=10)
+    return r.get("result", {}).get("collapse") if r.get("ok") else None
+
+
+def cow_collapsed():
+    """Memory a migration paged in is collapsed into huge pages once the pull is done (#141), and keeps what 4 KiB
+    pages guarantee: with the guest rewriting it, a keep-running checkpoint and a delta each hold exactly the memory at
+    their pause, the restored copy (collapsed in turn) is intact, and free page reporting still returns memory."""
+    if "[never]" in open("/sys/kernel/mm/transparent_hugepage/enabled").read():
+        raise Skip("transparent huge pages are disabled here")
+    n, paths = "ft-huge", [ckpt_path("ft-huge0"), ckpt_path("ft-huge1")]
+    ok(run(A, n))
+    code, out = sh(A, n, "dd if=/dev/urandom of=/tmp/f bs=1M count=200 2>/dev/null; md5sum /tmp/f")
+    m = out.split()[0]
+    start_writer(A, n, mib=64)
+    ok(migrate(A, n, B))
+    st = wait_released(B, n)
+    check("huge: migrated and pulled", st["released"] and st["state"] == "running", st)
+    wait_for(lambda: (collapse_report(B, n) or {}).get("done"), 60)
+    c = collapse_report(B, n)
+    huge, _ = huge_mib(B, n)
+    print(f"huge: collapse {c}, {huge} MiB in huge pages")
+    check("huge: paged-in memory collapsed into huge pages", c and c["collapsed"] >= 100 and huge >= 200, (c, huge))
+    errors, _, out = writer_check(B, n)
+    check("huge: guest memory intact after the collapse", errors == 0 and md5(B, n) == m, out)
+    fault(B, "ckpt_memhash", 120000)
+    res = [ok(checkpoint(B, n, paths[0]))]
+    time.sleep(1)
+    res.append(ok(checkpoint(B, n, paths[1], incremental=True)))
+    fault(B, "ckpt_memhash", 0)
+    print(f"huge: checkpoints paused {[r['paused_ms'] for r in res]} ms, rescues {[r['copy'].get('rescues') for r in res]}")
+    for i, p in enumerate(paths):
+        h = ckhash(B, p)
+        check(f"huge: checkpoint {i} == memory at its pause", h["hash"] == res[i]["pause_memhash"], (h["hash"], res[i]["pause_memhash"]))
+    errors, _, out = writer_check(B, n)
+    check("huge: the original is intact after the checkpoints", errors == 0, out)
+    ok(restore(A, paths[1], name="ft-huge2", ip="auto"))
+    wait_for(lambda: (collapse_report(A, "ft-huge2") or {}).get("done"), 60)
+    c = collapse_report(A, "ft-huge2")
+    errors, _, out = writer_check(A, "ft-huge2")
+    check("huge: the restored copy collapsed and intact", c and c["collapsed"] > 0 and errors == 0 and md5(A, "ft-huge2") == m, (c, out))
+    # Free page reporting discards whole 2 MiB blocks, each a whole huge page: RSS falls as before.
+    huge0, rss0 = huge_mib(A, "ft-huge2")
+    sh(A, "ft-huge2", "rm /tmp/f")
+    returned = wait_for(lambda: huge_mib(A, "ft-huge2")[1] < rss0 - 150, 30)
+    huge1, rss1 = huge_mib(A, "ft-huge2")
+    check("huge: freed memory goes back to the host", returned and huge1 < huge0, (rss0, rss1, huge0, huge1))
+    errors, _, out = writer_check(A, "ft-huge2")
+    check("huge: guest memory intact after the discards", errors == 0, out)
+    cleanup(n)
+    cleanup("ft-huge2")
+    for p in paths:
+        rm_ckpt(p)
+
+
+def guest_chunks(host, name):
+    """Firecracker's guest memory by 2 MiB chunk (of its userfaultfd-registered mappings): those backed by one
+    transparent huge page (512 present pages on contiguous PFNs from a 2 MiB-aligned one, each flagged THP), those with
+    nothing mapped, and those Firecracker made inaccessible (unplugged slots)."""
+    pid = fc_pid(host, name)
+    vmas, cur = [], None
+    for l in open(f"/proc/{pid}/smaps"):
+        head = l.split()
+        if "-" in head[0] and ":" not in head[0]:
+            cur = (*(int(x, 16) for x in head[0].split("-")), head[1].startswith("---"))
+        elif l.startswith("VmFlags:") and " um" in l:
+            vmas.append(cur)
+    huge, empty, unplugged = set(), set(), set()
+    with open(f"/proc/{pid}/pagemap", "rb") as pm, open("/proc/kpageflags", "rb") as kf:
+        for a, b, none in vmas:
+            for c in range((a + (2 << 20) - 1) & ~((2 << 20) - 1), b - (2 << 20) + 1, 2 << 20):
+                if none:
+                    unplugged.add(c)
+                pm.seek(c // 4096 * 8)
+                entries = struct.unpack("512Q", pm.read(512 * 8))
+                if not any(e >> 63 & 1 or e >> 62 & 1 for e in entries):
+                    empty.add(c)
+                    continue
+                pfn = entries[0] & ((1 << 55) - 1)
+                if pfn % 512 or not all(e >> 63 & 1 and e & ((1 << 55) - 1) == pfn + i for i, e in enumerate(entries)):
+                    continue
+                kf.seek(pfn * 8)
+                if all(f >> 22 & 1 for f in struct.unpack("512Q", kf.read(512 * 8))):  # KPF_THP, every page
+                    huge.add(c)
+    return huge, empty, unplugged
+
+
+def settle_rss(host, name, timeout=60):
+    """Waits for Firecracker's RSS to hold still for 3 s (free page reporting done)."""
+    last, since, end = None, time.time(), time.time() + timeout
+    while time.time() < end:
+        rss = huge_mib(host, name)[1]
+        if last is None or abs(rss - last) > 4:
+            last, since = rss, time.time()
+        elif time.time() - since >= 3:
+            return rss
+        time.sleep(0.5)
+    return last
+
+
+def guest_blocks(host, name):
+    """The guest's hotplugged memory blocks: (hotplug region's guest address, block size, online block ids)."""
+    code, out = sh(host, name, "cat /proc/iomem; echo; cat /sys/devices/system/memory/block_size_bytes; "
+                               "for d in /sys/devices/system/memory/memory*; do echo $d $(cat $d/state); done")
+    assert code == 0, out
+    lines = out.splitlines()
+    i = next(i for i, l in enumerate(lines) if "(virtio_mem)" in l)
+    base = int(next(l for l in reversed(lines[:i]) if not l.startswith(" ")).split("-")[0], 16)
+    bs = int(next(l for l in lines if re.fullmatch(r"[0-9a-f]+", l.strip())), 16)
+    online = [int(l.split()[0].rsplit("memory", 1)[1]) for l in lines if l.startswith("/sys/") and l.endswith(" online")]
+    return base, bs, sorted(b for b in online if b * bs >= base)
+
+
+def unplug_collapsed():
+    """virtio-mem unplug of memory collapsed into huge pages after a migration (#141): the guest moves the data out of
+    the blocks it gives back, Firecracker discards them (2 MiB blocks, whole huge pages), every huge page in them is
+    gone, and the guest's memory stays intact. Deterministic: the guest offlines the hotplugged blocks that hold the
+    most huge pages, and virtio-mem unplugs offline blocks first. PLUG_TEMPLATE picks a template with at least
+    1.5 GiB of unplugged hotplug room."""
+    n = "ft-huge-unplug"
+    m = setup(n, template=os.environ.get("PLUG_TEMPLATE"))
+    v = vms(A)[n]
+    plugged = v["plugged_mib"]
+    if v["max_mib"] - v["guest_mib"] < 1536:
+        cleanup(n)
+        raise Skip(f"template too small to plug 1.5 GiB more ({v['guest_mib']} of {v['max_mib']} MiB)")
+    ok(hotplug(A, n, plugged + 1536))
+    grown = wait_for(lambda: (vms(A)[n]["requested_mib"], vms(A)[n]["plugged_mib"]) == (plugged + 1536,) * 2, 60)
+    check("huge unplug: plugged 1.5 GiB more", grown, vms(A)[n])
+    code, out = sh(A, n, "dd if=/dev/urandom of=/tmp/g bs=1M count=500 2>/dev/null && md5sum /tmp/g")
+    check("huge unplug: guest wrote 500 MiB more", code == 0, out)
+    g = out.split()[0] if code == 0 else None
+    start_writer(A, n, mib=64)
+    ok(migrate(A, n, B))
+    st = wait_released(B, n)
+    check("huge unplug: migrated and pulled", st["released"] and st["state"] == "running", st)
+    wait_for(lambda: (collapse_report(B, n) or {}).get("done"), 120)
+    c = collapse_report(B, n)
+    check("huge unplug: memory collapsed", c and c["collapsed"] >= 100, c)
+    rss0 = settle_rss(B, n)
+    # Host address of each hotplugged block (the hotplug region is the last guest memory region).
+    offset, _, host_base = control(B, n, {"op": "debug", "what": "status"})["result"]["host_regions"][-1]
+    hp_gpa, bs, online = guest_blocks(B, n)
+    chunks_of = lambda blk: {host_base + blk * bs - hp_gpa + i for i in range(0, bs, 2 << 20)}
+    # Growth is refused meanwhile (and eviction is off), so the controller never plugs back what the test takes away.
+    fault(B, "no_admit", 120000)
+    sock = api_sock(B, n)
+    # Free page reports are held (firecracker/0003) across the unplug: every chunk that empties then is the unplug's.
+    held = fc_api(sock, "PATCH", "/balloon/reporting/hold")
+    try:
+        check("huge unplug: free page reports held", held is None, held)
+        huge0, empty0, _ = guest_chunks(B, n)
+        ranked = sorted(online, key=lambda blk: -len(chunks_of(blk) & huge0))
+        chosen = []
+        for blk in ranked[:6]:
+            if len(chunks_of(blk) & huge0) >= 16 and len(chosen) < 2:
+                code, out = sh(B, n, f"echo offline > /sys/devices/system/memory/memory{blk}/state")
+                if code == 0:
+                    chosen.append(blk)
+        target = {c for blk in chosen for c in chunks_of(blk)} & huge0
+        print(f"huge unplug: blocks of {bs >> 20} MiB at {hp_gpa:#x}; offlined {chosen}, holding {len(target) * 2} MiB of huge pages "
+              f"(of {len(huge0) * 2} MiB)")
+        check("huge unplug: offlined blocks that hold huge pages", chosen and len(target) * 2 >= 64, (chosen, ranked[:6]))
+        now = vms(B)[n]["plugged_mib"]
+        ok(hotplug(B, n, now - len(chosen) * (bs >> 20)))
+        hp = lambda: (vms(B)[n]["requested_mib"], vms(B)[n]["plugged_mib"])
+        done = wait_for(lambda: hp() == (now - len(chosen) * (bs >> 20),) * 2, 60)
+        gone = all(sh(B, n, f"test -e /sys/devices/system/memory/memory{blk}")[0] != 0 for blk in chosen)
+        st = control(B, n, {"op": "debug", "what": "status"})["result"]
+        huge1, empty1, _ = guest_chunks(B, n)
+    finally:
+        released = fc_api(sock, "PATCH", "/balloon/reporting/release")
+        fault(B, "no_admit", 0)
+    rss1 = settle_rss(B, n)
+    print(f"huge unplug: plugged {now} -> {hp()[1]} MiB (settled: {done}, blocks gone: {gone}); {len(target - empty1) * 2} MiB of the "
+          f"targeted huge pages still mapped; {len(empty1 - empty0) * 2} MiB emptied in all; RSS {rss0} -> {rss1} MiB")
+    check("huge unplug: the offlined blocks were unplugged", done and gone and not st["failed"] and released is None,
+          (hp(), gone, st["failed"], released))
+    check("huge unplug: every huge page in them is gone", target and not target - empty1, (len(target), len(target - empty1)))
+    check("huge unplug: data moved, not copied (RSS did not grow)", rss1 <= rss0 + 64, (rss0, rss1))
+    errors, _, out = writer_check(B, n)
+    check("huge unplug: guest memory intact", errors == 0 and md5(B, n) == m and sh(B, n, "md5sum /tmp/g")[1].split()[0] == g, out)
+    cleanup(n)
 
 
 def cow_abort():
@@ -4714,9 +4928,9 @@ SCENARIOS = dict(
     quiet_source=quiet_source, exec_race=exec_race, guest_calls=guest_calls, guest_hang=guest_hang,
     source_killed=source_killed, target_killed=target_killed, abort_superseded=abort_superseded, gen_zero=gen_zero,
     checkpoint_restore=checkpoint_restore, checkpoint_fork=checkpoint_fork, checkpoint_corrupt=checkpoint_corrupt,
-    checkpoint_crash=checkpoint_crash, pause_resume=pause_resume, signals=signals, suspend_resume=suspend_resume,
+    checkpoint_crash=checkpoint_crash, pause_resume=pause_resume, signals=signals, pause_lost=pause_lost, suspend_resume=suspend_resume,
     suspend_gen=suspend_gen, checkpoint_hotplug=checkpoint_hotplug, checkpoint_untrusted_dir=checkpoint_untrusted_dir,
-    resume_failures=resume_failures, held_restore_frozen=held_restore_frozen, cow_exact=cow_exact, cow_abort=cow_abort,
+    resume_failures=resume_failures, held_restore_frozen=held_restore_frozen, cow_exact=cow_exact, cow_collapsed=skippable(cow_collapsed), unplug_collapsed=no_evict(skippable(unplug_collapsed)), cow_abort=cow_abort,
     cow_crash=cow_crash, cow_reports_held=cow_reports_held, ckpt_incremental=ckpt_incremental,
     ckpt_failed_stop=ckpt_failed_stop, ckpt_rearm=ckpt_rearm, ckpt_dir_moved=ckpt_dir_moved,
     prepare_disconnect=prepare_disconnect, prepare_trickle=prepare_trickle, prepare_fail=prepare_fail,
