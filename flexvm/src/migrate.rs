@@ -791,7 +791,7 @@ pub fn release_into(h: &Holder, ip: Ipv4Addr, mig: u64, vm: &Vm, linger: Duratio
         h.forget(ip, mig);
         eprintln!("vm {}: routing {ip} back to its tap after injecting the held packets: {e}", vm.name);
     }
-    let (tap_dropped, _) = inj.dropped();
+    let tap_dropped = inj.dropped();
     (stats.injected, stats.dropped_target) = (stats.packets, tap_dropped);
     vm.tap_drops_reported(tap_dropped);
     // Closing a packet socket waits for an RCU grace period; the VM need not.

@@ -549,6 +549,7 @@ impl Proc {
         cancelled()?;
         let _lifted = vm.limit.lift(vm.pid());
         vm.leave(State::Checkpointing)?;
+        let _unquiesce = Unquiesce(vm);
         self.publish();
         let paused = Instant::now();
         let mut hold = PacketHold { d: self, vm, id: crate::migrate::migration_id(), stats: None, resumed: None, rearm: None };
@@ -769,6 +770,18 @@ impl Drop for PacketHold<'_> {
     fn drop(&mut self) {
         if let Some(h) = self.d.holder() {
             h.forget(self.vm.ip, self.id);
+        }
+    }
+}
+
+/// Dropped with the VM back in service (a keep-running checkpoint, or any that failed), undoes `quiesce_export` as an
+/// aborted migration does: the working-set prefetch and collapse pass it cut short start again.
+struct Unquiesce<'a>(&'a Vm);
+
+impl Drop for Unquiesce<'_> {
+    fn drop(&mut self) {
+        if matches!(self.0.state(), State::Running | State::Paused) {
+            self.0.pager.unquiesce();
         }
     }
 }

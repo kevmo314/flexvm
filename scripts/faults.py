@@ -1061,6 +1061,33 @@ def ckpt_backlog():
     cleanup(n)
 
 
+def ckpt_paused_backlog():
+    """A paused VM's checkpoint (#207): its Firecracker reads nothing from the tap while paused, so frames sent to it
+    stay queued past the drain; the checkpoint returns it to paused with them still there, and a kill afterwards counts
+    them as dropped rather than forgetting them."""
+    n, path = "ft-ckpt-pbacklog", ckpt_path("ft-ckpt-pbacklog")
+    rm_ckpt(path)
+    clear_log(A, n)
+    ok(run(A, n))
+    ip = vm_ip(A, n)
+    check("paused backlog: paused", pause(A, n), vms(A)[n])
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    for i in range(100):
+        s.sendto(b"%08d\n" % i, (ip, 9000))
+    s.close()
+    time.sleep(0.2)
+    r = checkpoint(A, n, path)
+    check("paused backlog: checkpoint written, still paused", r["ok"] and r["result"]["state"] == "paused" and vms(A)[n]["state"] == "paused", (r, vms(A).get(n)))
+    check("paused backlog: the drain gave up on its tap's queue", "frames still queued on its tap" in log(A, n), log(A, n)[-2000:])
+    ok(kill(A, n))
+    left = re.compile(r"dropped (\d+) frames still queued on its tap when it left")
+    found = wait_for(lambda: left.search(log(A, n)), 10)
+    check("paused backlog: the kill counts what was left on its tap", found and int(left.search(log(A, n)).group(1)) > 0,
+          [l for l in log(A, n).splitlines() if "tap" in l][-6:])
+    rm_ckpt(path)
+    cleanup(n)
+
+
 def udp_receiver(host, n):
     """Starts socat in the guest appending what UDP port 9000 receives to /tmp/udp (its socket
     buffer large enough for any burst of held packets), and waits until the port is bound:
@@ -1866,6 +1893,44 @@ def pause_lost():
     check("pause unknown: pauses again", pause(A, n) and fc_api(sock, "GET", "/")["state"] == "Paused", vms(A)[n])
     ok(cli_json(A, "resume", n))
     check("pause unknown: resumes again", fc_api(sock, "GET", "/")["state"] == "Running" and md5(A, n) == m, vms(A)[n])
+    # A checkpoint or migration after an unknown pause asks Firecracker too (#207): refused while it cannot say, then
+    # the checkpoint leaves the VM paused (not resumed) and the migration's target starts it paused.
+    path = ckpt_path("ft-pause-lost")
+    rm_ckpt(path)
+
+    def unknown_pause(label):
+        for f in ("pause_lost", "pause_unknown"):
+            fault(A, f, 60000)
+        signal_vm(A, n, signal.SIGTSTP)
+        check(f"{label}: Firecracker is paused, recorded as running", wait_for(lambda: fc_api(sock, "GET", "/")["state"] == "Paused", 10)
+              and vms(A)[n]["state"] == "running", (fc_api(sock, "GET", "/"), vms(A)[n]))
+        time.sleep(0.5)
+        fault(A, "pause_lost", 0)
+
+    try:
+        unknown_pause("unknown before a checkpoint")
+        r = checkpoint(A, n, path)
+        check("unknown before a checkpoint: refused while Firecracker cannot say", not r["ok"] and "ended unknown" in r["error"] and not os.path.exists(path), r)
+        r = migrate(A, n, B)
+        check("unknown before a migration: refused too", not r["ok"] and "ended unknown" in r["error"] and where(n) == {A: "running"}, (r, where(n)))
+    finally:
+        fault(A, "pause_unknown", 0)
+    r = checkpoint(A, n, path)
+    check("unknown before a checkpoint: it leaves the VM paused", r["ok"] and r["result"]["state"] == "paused" and vms(A)[n]["state"] == "paused"
+          and fc_api(sock, "GET", "/")["state"] == "Paused", (r, vms(A)[n], fc_api(sock, "GET", "/")))
+    ok(cli_json(A, "resume", n))
+    check("unknown before a checkpoint: resumes after it", fc_api(sock, "GET", "/")["state"] == "Running" and md5(A, n) == m, vms(A)[n])
+    try:
+        unknown_pause("unknown before a migration")
+    finally:
+        fault(A, "pause_unknown", 0)
+    r = migrate(A, n, B)
+    check("unknown before a migration: migrated", r["ok"], r)
+    st = wait_released(B, n)
+    check("unknown before a migration: its target keeps it paused", st["released"] and where(n) == {B: "paused"}, (st, where(n)))
+    ok(cli_json(B, "resume", n))
+    check("unknown before a migration: resumes there, intact", where(n) == {B: "running"} and md5(B, n) == m, where(n))
+    rm_ckpt(path)
     cleanup(n)
 
 
@@ -2387,7 +2452,7 @@ def cow_collapsed():
     ok(migrate(A, n, B))
     st = wait_released(B, n)
     check("huge: migrated and pulled", st["released"] and st["state"] == "running", st)
-    wait_for(lambda: (collapse_report(B, n) or {}).get("done"), 60)
+    wait_for(lambda: collapse_report(B, n) is not None, 60)
     c = collapse_report(B, n)
     huge, _ = huge_mib(B, n)
     print(f"huge: collapse {c}, {huge} MiB in huge pages")
@@ -2406,7 +2471,7 @@ def cow_collapsed():
     errors, _, out = writer_check(B, n)
     check("huge: the original is intact after the checkpoints", errors == 0, out)
     ok(restore(A, paths[1], name="ft-huge2", ip="auto"))
-    wait_for(lambda: (collapse_report(A, "ft-huge2") or {}).get("done"), 60)
+    wait_for(lambda: collapse_report(A, "ft-huge2") is not None, 60)
     c = collapse_report(A, "ft-huge2")
     errors, _, out = writer_check(A, "ft-huge2")
     check("huge: the restored copy collapsed and intact", c and c["collapsed"] > 0 and errors == 0 and md5(A, "ft-huge2") == m, (c, out))
@@ -2441,13 +2506,40 @@ def collapse_abort():
     fault(A, "resume_kill", 0)
     check("collapse abort: migration committed, then the target died", r["ok"], r)
     check("collapse abort: the source runs its copy again", wait_for(lambda: where(n) == {B: "running"}, 60), where(n))
-    wait_for(lambda: (collapse_report(B, n) or {}).get("done"), 120)
+    wait_for(lambda: collapse_report(B, n) is not None, 120)
     c = collapse_report(B, n)
     huge, _ = huge_mib(B, n)
     print(f"collapse abort: before the migration {mid}, after {c}, {huge} MiB in huge pages")
     check("collapse abort: the pass was mid-way when the source paused", mid is None, mid)
     check("collapse abort: the pass went on to the end", c and c["stopped"] is None and c["collapsed"] >= 200 and huge >= 400, (c, huge))
     check("collapse abort: md5 intact", md5(B, n) == m)
+    cleanup(n)
+
+
+def collapse_ckpt_fail():
+    """A `checkpoint --stop` that fails while writing, its quiesce having ended the collapse pass mid-way (#207): the VM
+    runs on and the pass starts again and goes on to the end, as after an aborted migration."""
+    if "[never]" in open("/sys/kernel/mm/transparent_hugepage/enabled").read():
+        raise Skip("transparent huge pages are disabled here")
+    n, path = "ft-collapse-ckpt", ckpt_path("ft-collapse-ckpt")
+    rm_ckpt(path)
+    m = setup(n, mib=600)
+    ok(migrate(A, n, B))
+    st = wait_released(B, n)
+    check("collapse ckpt fail: migrated and pulled", st["released"] and st["state"] == "running", st)
+    mid = collapse_report(B, n)
+    fault(B, "ckpt_fail_write", 60000)
+    r = checkpoint(B, n, path, stop=True)
+    fault(B, "ckpt_fail_write", 0)
+    check("collapse ckpt fail: refused as injected, VM runs on", not r["ok"] and "injected" in r["error"] and where(n) == {B: "running"}, (r, where(n)))
+    wait_for(lambda: collapse_report(B, n) is not None, 120)
+    c = collapse_report(B, n)
+    huge, _ = huge_mib(B, n)
+    print(f"collapse ckpt fail: before the checkpoint {mid}, after {c}, {huge} MiB in huge pages")
+    check("collapse ckpt fail: the pass was mid-way when the checkpoint paused", mid is None, mid)
+    check("collapse ckpt fail: the pass went on to the end", c and c["stopped"] is None and c["collapsed"] >= 200 and huge >= 400, (c, huge))
+    check("collapse ckpt fail: md5 intact", md5(B, n) == m)
+    rm_ckpt(path)
     cleanup(n)
 
 
@@ -2532,7 +2624,7 @@ def unplug_collapsed():
     ok(migrate(A, n, B))
     st = wait_released(B, n)
     check("huge unplug: migrated and pulled", st["released"] and st["state"] == "running", st)
-    wait_for(lambda: (collapse_report(B, n) or {}).get("done"), 120)
+    wait_for(lambda: collapse_report(B, n) is not None, 120)
     c = collapse_report(B, n)
     check("huge unplug: memory collapsed", c and c["collapsed"] >= 100, c)
     rss0 = settle_rss(B, n)
@@ -5186,7 +5278,7 @@ SCENARIOS = dict(
     incoming_killed=incoming_killed, start_killed=start_killed, claim_killed=claim_killed, standby_stalled=standby_stalled, fc_died=fc_died,
     sigkill_restart=sigkill_restart, listen_trickle=listen_trickle,
     cow_wp_race=cow_wp_race, fetch_tail_enomem=fetch_tail_enomem, fetch_enomem_stuck=fetch_enomem_stuck,
-    collapse_abort=collapse_abort, same_host_order=same_host_order, same_host_slow_route=same_host_slow_route, same_host_flood=same_host_flood, same_host_late_handover=same_host_late_handover, same_host_backlog=same_host_backlog, ckpt_backlog=ckpt_backlog, rx_stall=rx_stall, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,
+    collapse_abort=collapse_abort, collapse_ckpt_fail=collapse_ckpt_fail, ckpt_paused_backlog=ckpt_paused_backlog, same_host_order=same_host_order, same_host_slow_route=same_host_slow_route, same_host_flood=same_host_flood, same_host_late_handover=same_host_late_handover, same_host_backlog=same_host_backlog, ckpt_backlog=ckpt_backlog, rx_stall=rx_stall, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,
     handoff_superseded=handoff_superseded, suspend_cmd=suspend_cmd, fc_died_busy=fc_died_busy, pause_cmd_start=pause_cmd_start, suspend_died=suspend_died)
 names = [n for s in args.scenarios for n in (list(SCENARIOS) if s == "all" else [s])]
 if os.geteuid() != 0:

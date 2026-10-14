@@ -42,7 +42,7 @@ const EINVAL_GIVE_UP: usize = 16;
 const ENOMEM_BACKOFF: Duration = Duration::from_millis(100);
 const ENOMEM_BACKOFF_MAX: Duration = Duration::from_secs(2);
 const ENOMEM_GIVE_UP: usize = 8;
-/// Why a pass ends at a checkpoint or migration; one that aborts (`Pager::unquiesce`) starts it again.
+/// Why a pass ends at a checkpoint or migration; one that leaves the VM here (`Pager::unquiesce`) starts it again.
 pub(super) const QUIESCED: &str = "checkpoint or migration";
 
 /// The collapse pass's gate, under `Pager::collapse_gate`'s mutex, which the pass holds across each call.
@@ -80,7 +80,6 @@ impl CollapseReport {
             "busy_ms": crate::util::ms(self.busy),
             "cpu_ms": crate::util::ms(self.cpu),
             "wall_ms": crate::util::ms(self.wall),
-            "done": true,
             "stopped": self.stopped,
         })
     }
