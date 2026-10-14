@@ -513,13 +513,14 @@ fn resolve_user(root: &Root, user: &str) -> Result<(u32, u32, String, Vec<u32>)>
 fn mkfs(dir: &Path, entries: u64, dest: &Path) -> Result<()> {
     let du = Command::new("du").arg("-sk").arg(dir).output()?;
     let kib: u64 = String::from_utf8_lossy(&du.stdout).split_whitespace().next().and_then(|s| s.parse().ok()).ok_or("du failed")?;
-    let mib = (kib * 12 / 10 / 1024 + 64).div_ceil(2) * 2;
     let inodes = entries * 12 / 10 + 4096;
+    // Content and inode tables, with headroom, plus a 32 MiB journal.
+    let mib = (((kib * 1024 + inodes * 256) * 12 / 10).div_ceil(1 << 20) + 64 + 32).div_ceil(2) * 2;
     // mkfs writes through our descriptor, so the name cannot be swapped for a symlink.
     let image = create_new(dest)?;
     image.set_len(mib << 20)?;
     let out = Command::new("mkfs.ext4")
-        .args(["-q", "-F", "-b", "4096", "-L", "flexroot", "-N", &inodes.to_string(), "-d"])
+        .args(["-q", "-F", "-b", "4096", "-I", "256", "-J", "size=32", "-L", "flexroot", "-N", &inodes.to_string(), "-d"])
         .arg(dir)
         .arg(format!("/proc/{}/fd/{}", std::process::id(), image.as_raw_fd()))
         .output()
@@ -534,11 +535,29 @@ fn mkfs(dir: &Path, entries: u64, dest: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::{symlink, MetadataExt};
+    use std::os::unix::fs::{symlink, FileExt, MetadataExt};
     use unpack::tests::{layer, tmpdir};
 
     fn read(p: impl AsRef<Path>) -> String {
         std::fs::read_to_string(p).unwrap()
+    }
+
+    #[test]
+    fn mkfs_has_room_for_inode_heavy_images() {
+        let dir = tmpdir("mkfs-inodes");
+        let root = dir.join("root");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("empty"), b"").unwrap();
+        symlink("empty", root.join("link")).unwrap();
+        let dest = dir.join("root.ext4");
+        // Request the inode budget of a million-entry tree without creating it.
+        mkfs(&root, 1_000_000, &dest).unwrap();
+        let mut superblock = [0u8; 256];
+        File::open(&dest).unwrap().read_exact_at(&mut superblock, 1024).unwrap();
+        assert_eq!(&superblock[56..58], &0xef53u16.to_le_bytes());
+        assert!(u32::from_le_bytes(superblock[..4].try_into().unwrap()) >= 1_204_096);
+        assert_eq!(u16::from_le_bytes(superblock[88..90].try_into().unwrap()), 256);
+        assert_eq!(std::fs::metadata(&dest).unwrap().len() % (2 << 20), 0);
     }
 
     #[test]
