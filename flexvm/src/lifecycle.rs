@@ -339,7 +339,7 @@ impl Proc {
         let tpl = Template::open_id(&self.paths, &ck.manifest.template, &ck.manifest.template_id)?;
         t.mark("verify_template");
         // The template's working set is prefetched too.
-        self.admit_start(tpl.working_set_mib() + ((ck.data_pages() * PAGE_SIZE as u64) >> 20), 0, crate::host::Floor::Reserve)?;
+        self.admit_pull(tpl.working_set_mib() + ((ck.data_pages() * PAGE_SIZE as u64) >> 20), crate::host::Floor::Reserve)?;
         Ok(tpl)
     }
 
@@ -377,6 +377,7 @@ impl Proc {
             self.paused_by_request.store(true, Ordering::SeqCst);
             self.publish();
             self.announce();
+            self.watch_checkpoint_pull(vm.clone(), dir, to_load);
             return Ok(json!({"name": name, "ip": ip.to_string(), "pid": std::process::id(), "state": "paused", "restore_ms": ms(restore), "timings_ms": t.json()}));
         }
         let still = self.still_current(ip).map_err(|e| Restore::NotRun(kill(e)))?;
@@ -420,18 +421,7 @@ impl Proc {
         t.mark("clock");
         self.announce();
         let state = vm.state().name();
-        let p = self.arc();
-        thread::spawn(move || {
-            let pulled = vm.pager.wait_pulled(None);
-            eprintln!("vm {}: {to_load} MiB paged in from {} (complete: {pulled}, {:?} ms)", vm.name, dir.display(), vm.pager.pull_time().map(ms));
-            // Under the op lock: a suspend may be about to write here.
-            if let Some(p) = p {
-                let _op = p.op();
-                if let Some(dir) = p.consumed.lock().unwrap().take() {
-                    delete_consumed(&vm.name, &dir);
-                }
-            }
-        });
+        self.watch_checkpoint_pull(vm.clone(), dir, to_load);
         Ok(json!({
             "name": name,
             "ip": ip.to_string(),
@@ -444,6 +434,26 @@ impl Proc {
             "to_load_mib": to_load,
             "timings_ms": t.json(),
         }))
+    }
+
+    /// Release disk admission and a consumed checkpoint once the pull finishes.
+    fn watch_checkpoint_pull(&self, vm: Arc<Vm>, dir: PathBuf, to_load: u64) {
+        let p = self.arc();
+        thread::spawn(move || {
+            let pulled = vm.pager.wait_pulled(None);
+            eprintln!("vm {}: {to_load} MiB paged in from {} (complete: {pulled}, {:?} ms)", vm.name, dir.display(), vm.pager.pull_time().map(ms));
+            if let Some(p) = p {
+                // Not under `op`: the memory is in, whatever operation runs.
+                if pulled && p.pulled_all() {
+                    p.release_hold();
+                }
+                // Under the op lock: a suspend may be about to write here.
+                let _op = p.op();
+                if let Some(dir) = p.consumed.lock().unwrap().take() {
+                    delete_consumed(&vm.name, &dir);
+                }
+            }
+        });
     }
 
     /// Without `cow` the VM stays paused (`Checkpointing`) for the write, and

@@ -175,8 +175,9 @@ parsed is an error, never a free address.
 claim, arrival: what the VM brings or pages in, and a step), growth and
 incoming migrations are admitted under the host lock against MemAvailable
 minus the reserve and the grants of the last 10 s (`RUN/grants`); an
-arrival's grant is held past that until all its memory is here, or it ends,
-as it comes in only as the pull goes: made with the grant in one critical
+arrival's or checkpoint restore's grant (including a suspended resume) is
+held past that until all its memory is here, or it ends, as it comes in only
+as the pull goes: made with the grant in one critical
 section, it is a file (`RUN/holds/ID-MIB`) its process keeps flocked, so it
 goes with the process whatever becomes of the file (admission removes one
 whose lock is free). A start refused fails before it loads
