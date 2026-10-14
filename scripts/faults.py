@@ -2900,23 +2900,30 @@ def fetch_enomem_stuck():
     fault(B, "fetch_enomem_stuck", 60000)
     ok(migrate(A, n, B))
     t0 = time.time()
-    threading.Thread(target=lambda: sh(B, n, "md5sum /tmp/f"), daemon=True).start()
-    st = {}
+    # Its own process, reaped here: once started, an exec waits 30 s for a VM
+    # that went away, longer than the hosts' teardown waits for leftovers.
+    reader = subprocess.Popen([BIN, "--state", B.state, "--run", B.run, "exec", n, "md5sum /tmp/f"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=ENV)
+    try:
+        st = {}
 
-    def failed():
-        st.update(vms(B).get(n) or {})
-        return st.get("state") == "failed"
+        def failed():
+            st.update(vms(B).get(n) or {})
+            return st.get("state") == "failed"
 
-    gave_up = wait_for(failed, 20)
-    took = time.time() - t0
-    fault(B, "fetch_enomem_stuck", 0)
-    why = (st.get("failed") or st.get("error") or "")
-    check(f"stuck: target gave up ({took:.1f} s) and reports the vm failed", gave_up and "installing pages" in why, (st.get("state"), why[:300]))
-    # Copies fail from 0.5 s after the target took the VM on, and the fault
-    # deadline is 1 s: nothing (a stalled fetch, a requeue) may stretch it.
-    check("stuck: within the fault deadline (< 3 s)", gave_up and took < 3, f"{took:.1f} s")
-    check("stuck: the source runs its copy again", wait_for(lambda: where(n) == {A: "running"}, 60), where(n))
-    check("stuck: md5 intact on A", md5(A, n) == m)
+        gave_up = wait_for(failed, 20)
+        took = time.time() - t0
+        fault(B, "fetch_enomem_stuck", 0)
+        why = (st.get("failed") or st.get("error") or "")
+        check(f"stuck: target gave up ({took:.1f} s) and reports the vm failed", gave_up and "installing pages" in why, (st.get("state"), why[:300]))
+        # Copies fail from 0.5 s after the target took the VM on, and the fault
+        # deadline is 1 s: nothing (a stalled fetch, a requeue) may stretch it.
+        check("stuck: within the fault deadline (< 3 s)", gave_up and took < 3, f"{took:.1f} s")
+        check("stuck: the source runs its copy again", wait_for(lambda: where(n) == {A: "running"}, 60), where(n))
+        check("stuck: md5 intact on A", md5(A, n) == m)
+    finally:
+        reader.kill()
+        reader.wait()
     cleanup(n)
 
 
