@@ -57,6 +57,11 @@ const PREFETCH_RUN: usize = 256;
 const REMOTE_FAULT_RUN: usize = 64;
 const PULL_RUN: usize = 256;
 const PULL_THREADS: usize = 4;
+/// Pages past a REMOTE fault's run that the pullers take next (32 MiB): the
+/// guest tends to read on from where it faulted.
+const STEER_AHEAD: usize = 32 * PULL_RUN;
+/// Steered runs a puller takes, at most, before each run of its own share.
+const STEER_BURST: usize = 4;
 /// Threads fetching pages for faults, each with its own connection.
 const FAULT_FETCHERS: usize = 8;
 /// Fetched pages are installed as they arrive: the first at once, then at
@@ -78,6 +83,10 @@ const SERVE_WRITE: Duration = Duration::from_secs(30);
 const FAULT_TIMEOUT: Duration = Duration::from_secs(1);
 /// How long the migration source may stay unreachable before the pager gives up.
 const SOURCE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long one page request may take, writing it and reading its reply, before
+/// its connection is given up as lost (and the pager reconnects).
+const FETCH_DEADLINE: Duration = if cfg!(test) { Duration::from_millis(300) } else { Duration::from_secs(5) };
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 const BACKOFF_MIN: Duration = Duration::from_millis(10);
 const BACKOFF_MAX: Duration = Duration::from_secs(1);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -540,8 +549,11 @@ impl Pages {
         let mut failed: Option<io::Error> = None;
         loop {
             let base = done;
+            // Pages from `first` in `buf`, installed or not.
+            let mut arrived = base;
             let fetched = fetch(((first + base) * PAGE_SIZE) as u64, &mut buf[base * PAGE_SIZE..n * PAGE_SIZE], stop, &mut |data| {
                 let ready = base + data.len() / PAGE_SIZE;
+                arrived = ready;
                 if failed.is_none() && ready > done && (done == 0 || ready - done >= STREAM_RUN) {
                     let (r, res) = install(done, ready, data, base);
                     resolved += r;
@@ -563,7 +575,18 @@ impl Pages {
                     }
                     break;
                 }
-                Err(e) if done < n && retry(&e) => {}
+                Err(e) if done < n && retry(&e) => {
+                    // What did arrive goes in, so the next try asks only for the rest.
+                    if arrived > done {
+                        let (r, res) = install(done, arrived, &buf[..n * PAGE_SIZE], 0);
+                        resolved += r;
+                        done = arrived;
+                        if let Err(e) = res {
+                            failed = Some(e);
+                            break;
+                        }
+                    }
+                }
                 Err(e) => return (resolved + self.release(first + done, n - done, REMOTE), Err(Failed::Fetch(e))),
             }
         }
@@ -578,7 +601,8 @@ impl Pages {
 /// present page; that had their run fetched from the origin; that waited for
 /// another installer; write-protect faults. Then not faults: fetching and
 /// installing each fault's run, each background pull run, how long a fault's
-/// run waited for a fetcher, and until its first page went in.
+/// run waited for its fetcher to get to it (its request is out meanwhile), and
+/// until its first page went in.
 const KINDS: [&str; 8] = ["local", "remote", "wait", "wp", "fetch", "pull", "queued", "first"];
 const LOCAL: usize = 0;
 const FETCHED: usize = 1;
@@ -759,8 +783,11 @@ pub struct Pager {
     /// The prefetch, held back until `loaded` while learning: (loaded, due).
     prefetch: Mutex<(bool, bool)>,
     pub fault_stats: FaultStats,
-    /// Runs of REMOTE pages faults claimed, for the fetchers (`fetch_faults`).
-    demand: (Mutex<VecDeque<Job>>, Condvar),
+    /// Runs of REMOTE pages faults claimed, per fault fetcher (`fetch_faults`).
+    lanes: [Lane; FAULT_FETCHERS],
+    /// Pages `[next, end)` past the latest REMOTE fault, which the pullers
+    /// take before going on with their share (`steered`).
+    steer: Mutex<(usize, usize)>,
 }
 
 /// What `Pager::freeze` captured for a checkpoint.
@@ -825,7 +852,8 @@ impl Pager {
             learning: AtomicBool::new(false),
             prefetch: Mutex::new((false, false)),
             fault_stats: FaultStats::new(),
-            demand: (Mutex::new(VecDeque::new()), Condvar::new()),
+            lanes: Default::default(),
+            steer: Mutex::new((0, 0)),
         });
         let p = pager.clone();
         let thread = thread::Builder::new().name("uffd".into()).spawn(move || {
@@ -1127,8 +1155,10 @@ impl Pager {
     fn notify(&self) {
         drop(self.done.0.lock().unwrap());
         self.done.1.notify_all();
-        drop(self.demand.0.lock().unwrap());
-        self.demand.1.notify_all();
+        for lane in &self.lanes {
+            drop(lane.q.lock().unwrap());
+            lane.cv.notify_all();
+        }
     }
 
     /// The guest's memory size in pages, once Firecracker has connected.
@@ -1569,8 +1599,9 @@ impl Pager {
                 if n == 0 {
                     return Err(os(libc::EAGAIN));
                 }
-                self.demand.0.lock().unwrap().push_back((page, n, Instant::now()));
-                self.demand.1.notify_one();
+                self.queue_fault((page, n, Instant::now()));
+                // The pullers go on from there.
+                *self.steer.lock().unwrap() = (page + n, (page + n + STEER_AHEAD).min(m.span().1));
                 Ok(Served::Fetching)
             }
             state => {
@@ -2027,44 +2058,62 @@ impl Pager {
             // puller) or over a source connection of its own.
             let mut fetch: Box<Fetch> = match (file.clone(), &source) {
                 (Some(file), _) => Box::new(move |off, buf, _, _| file.read(off as usize / PAGE_SIZE, buf, puller)),
+                (None, Some(source)) if puller => {
+                    let mut link = Link::new(source.clone());
+                    Box::new(move |off, buf, stop, progress| link.fetch(off, buf, stop, progress))
+                }
                 (None, Some(source)) => {
                     let mut link = link.take().unwrap_or_else(|| Link::new(source.clone()));
-                    // A fault waits for the first page of its run: ask for it first.
-                    let head = if puller { 0 } else { PAGE_SIZE };
-                    Box::new(move |off, buf, stop, progress| link.fetch(off, buf, stop, head, progress))
+                    let p = self.clone();
+                    Box::new(move |off, buf, stop, progress| link.fetch_queued(&p.lanes[i], off, buf, stop, progress))
                 }
                 (None, None) => return self.fail("remote pages but nowhere to pull them from".into()),
             };
             let file = file.clone();
             thread::spawn(move || match puller {
-                false => p.fetch_faults(&mut fetch),
+                false => p.fetch_faults(&p.lanes[i], &mut fetch),
                 true => p.pull(i - FAULT_FETCHERS, file, &mut fetch),
             });
         }
     }
 
-    /// Fetches and installs the runs faults claimed (`demand`), so that the
+    /// Queues a run of REMOTE pages a fault claimed for the fault fetcher
+    /// with the fewest runs queued (see `Lane`), passing over one busy
+    /// writing requests.
+    fn queue_fault(&self, job: Job) {
+        let queued = |l: &Lane| l.q.try_lock().map_or(usize::MAX, |q| q.jobs.len());
+        let lane = self.lanes.iter().min_by_key(|l| queued(l)).unwrap();
+        lane.push(job);
+    }
+
+    /// Fetches and installs the runs faults claimed (`lane`), so that the
     /// event thread never waits for the network or disk. The faulting thread
     /// is woken by the copy, the event thread by the pages settling.
-    fn fetch_faults(&self, fetch: &mut Fetch) {
+    fn fetch_faults(&self, lane: &Lane, fetch: &mut Fetch) {
         let mut buf = vec![0u8; REMOTE_FAULT_RUN * PAGE_SIZE];
         let pages = self.pages();
+        // Connects ahead of the first fault (nothing to read).
+        if let Err(e) = fetch(0, &mut [], &self.stop, &mut |_| true) {
+            if !self.stop.load(Ordering::SeqCst) {
+                return self.fail(format!("fetching pages for faults: {e}"));
+            }
+        }
         loop {
             let (page, n, queued) = {
-                let mut jobs = self.demand.0.lock().unwrap();
+                let mut q = lane.q.lock().unwrap();
                 loop {
                     if self.stop.load(Ordering::SeqCst) {
                         return;
                     }
-                    if let Some(job) = jobs.pop_front() {
-                        break job;
+                    if let Some(front) = q.jobs.front() {
+                        break front.job;
                     }
                     // Claimed pages count as left until they settle, so with
                     // none left no fault can queue another run.
                     if self.remote_left() == 0 {
                         return;
                     }
-                    jobs = self.demand.1.wait_timeout(jobs, Duration::from_millis(100)).unwrap().0;
+                    q = lane.cv.wait_timeout(q, Duration::from_millis(100)).unwrap().0;
                 }
             };
             self.fault_stats.record(QUEUED, queued.elapsed());
@@ -2077,6 +2126,10 @@ impl Pager {
             // A link waits out a source outage itself (until it gives up,
             // which is fatal); other errors are retried for a while.
             let mut retry = |e: &io::Error| {
+                if partial(e) {
+                    // The source is slow, not gone: on with the rest.
+                    return !self.stop.load(Ordering::SeqCst);
+                }
                 let again = !fatal(e) && !self.stop.load(Ordering::SeqCst) && started.elapsed() < FAULT_TIMEOUT;
                 if again {
                     eprintln!("uffd: fetching pages {page}+{n} for a fault: {e}; retrying");
@@ -2117,6 +2170,7 @@ impl Pager {
                 r
             });
             self.fault_stats.record(FETCH, started.elapsed());
+            lane.pop();
             match res {
                 Ok(()) => {}
                 Err(Failed::Fetch(_)) if self.stop.load(Ordering::SeqCst) => {}
@@ -2137,18 +2191,16 @@ impl Pager {
                     // pullers may be past it: queue it again, with its failure
                     // history, so it is not stranded.
                     thread::sleep(BACKOFF_MIN);
-                    let mut jobs = self.demand.0.lock().unwrap();
                     let mut i = page;
                     while i < page + n {
                         match pages.claim(i, page + n - i, REMOTE, |_| true) {
                             0 => i += 1,
                             k => {
-                                jobs.push_back((i, k, Instant::now()));
+                                self.queue_fault((i, k, Instant::now()));
                                 i += k;
                             }
                         }
                     }
-                    self.demand.1.notify_one();
                 }
             }
         }
@@ -2175,40 +2227,85 @@ impl Pager {
     }
 
     /// Background puller `t` of `PULL_THREADS`: pulls its share of the REMOTE
-    /// pages, a run at a time. `fetch` holds the file (if any) too: let go as
-    /// the thread ends, as soon as nothing is left to pull.
+    /// pages, a run at a time, and before each run, the pages past the latest
+    /// REMOTE fault (`steered`). `fetch` holds the file (if any) too: let go
+    /// as the thread ends, as soon as nothing is left to pull.
     fn pull(&self, t: usize, file: Option<Arc<PageFile>>, fetch: &mut Fetch) {
         // A checkpoint's pages come off local disk: the ones in the
         // template's working set first, as the guest needs them soonest.
-        let first = self.chunks(self.working_set(t, PULL_THREADS).filter(|_| file.is_some()), usize::MAX);
+        let first = self.chunks(self.working_set(t, PULL_THREADS).filter(|_| file.is_some()), PULL_RUN);
         let all = self.chunks(ALL, PULL_RUN).skip(t).step_by(PULL_THREADS);
         let mut buf = vec![0u8; PULL_RUN * PAGE_SIZE];
-        let pages = self.pages();
-        for (mut i, end) in first.chain(all) {
-            while i < end && !self.stop.load(Ordering::SeqCst) && self.remote_left() > 0 {
-                // Test fault `fetch_enomem_stuck`: only faults fetch pages.
-                while self.stuck_from.lock().unwrap().is_some() && !self.stop.load(Ordering::SeqCst) {
-                    thread::sleep(Duration::from_millis(10));
+        for (i, end) in first.chain(all) {
+            if !self.pulling() {
+                break;
+            }
+            // At most `STEER_BURST` runs before each of its own, so faults
+            // that keep coming never hold the rest of the pull back for long.
+            for (a, b) in std::iter::from_fn(|| self.steered()).take(STEER_BURST) {
+                if !self.pull_range(t, a, b, &mut buf, fetch) {
+                    return;
                 }
-                let n = pages.claim(i, (end - i).min(PULL_RUN), REMOTE, |_| true);
-                if n == 0 {
-                    // On to the next REMOTE page, skipping untouched stretches.
-                    i = pages.next_in(REMOTE, i + 1, end);
-                    continue;
-                }
-                let started = Instant::now();
-                let res = self.install_claimed(i, n, &mut buf, fetch, &mut |_| false, |p, c, src| self.populate(p, c, Some(src)));
-                self.fault_stats.record(PULL, started.elapsed());
-                match res {
-                    Ok(()) => i += n,
-                    Err(Failed::Install(e)) if self.unmapped(&e, i, n) => return self.gone(),
-                    Err(Failed::Fetch(e) | Failed::Install(e)) => return self.fail(format!("background pull {t} failed: {e}")),
-                }
+            }
+            if !self.pull_range(t, i, end, &mut buf, fetch) {
+                return;
             }
         }
         if let Some(file) = file.filter(|_| self.remote_left() == 0) {
             file.drop_cache();
         }
+    }
+
+    fn pulling(&self) -> bool {
+        !self.stop.load(Ordering::SeqCst) && self.remote_left() > 0
+    }
+
+    /// The next run of up to `PULL_RUN` pages past the latest REMOTE fault
+    /// (`steer`), as `[first, end)`, within one of the 2 MiB chunks runs
+    /// keep to (see `fault`): regions start on whole MiB.
+    fn steered(&self) -> Option<(usize, usize)> {
+        let mut steer = self.steer.lock().unwrap();
+        let (a, end) = *steer;
+        if a >= end {
+            return None;
+        }
+        let b = end.min((a / PULL_RUN + 1) * PULL_RUN);
+        steer.0 = b;
+        Some((a, b))
+    }
+
+    /// Pulls the REMOTE pages of `[i, end)`. False if the pager gave up.
+    fn pull_range(&self, t: usize, mut i: usize, end: usize, buf: &mut [u8], fetch: &mut Fetch) -> bool {
+        let pages = self.pages();
+        while i < end && self.pulling() {
+            // Test fault `fetch_enomem_stuck`: only faults fetch pages.
+            while self.stuck_from.lock().unwrap().is_some() && !self.stop.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(10));
+            }
+            let n = pages.claim(i, (end - i).min(PULL_RUN), REMOTE, |_| true);
+            if n == 0 {
+                // On to the next REMOTE page, skipping untouched stretches.
+                i = pages.next_in(REMOTE, i + 1, end);
+                continue;
+            }
+            let started = Instant::now();
+            // A source that is slow, not gone: on with the rest of the run.
+            let mut retry = |e: &io::Error| partial(e) && !self.stop.load(Ordering::SeqCst);
+            let res = self.install_claimed(i, n, buf, fetch, &mut retry, |p, c, src| self.populate(p, c, Some(src)));
+            self.fault_stats.record(PULL, started.elapsed());
+            match res {
+                Ok(()) => i += n,
+                Err(Failed::Install(e)) if self.unmapped(&e, i, n) => {
+                    self.gone();
+                    return false;
+                }
+                Err(Failed::Fetch(e) | Failed::Install(e)) => {
+                    self.fail(format!("background pull {t} failed: {e}"));
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// Every `step`th range of the template's working set from range `skip`, as `[first, end)`.
@@ -2224,6 +2321,114 @@ impl Pager {
                 (from..to).step_by(max).map(move |c| (c, c.saturating_add(max).min(to)))
             })
         })
+    }
+}
+
+/// A fault fetcher's queue: the runs faults claimed (`Job`s), oldest first,
+/// which it fetches in order. From a migration source, each run's request
+/// goes out on the fetcher's connection as it is queued (`push`, by the
+/// event thread), so it is on its way before the fetcher wakes, and behind
+/// replies still arriving: requests are pipelined, and replies come in
+/// their order.
+#[derive(Default)]
+struct Lane {
+    q: Mutex<LaneQueue>,
+    cv: Condvar,
+}
+
+#[derive(Default)]
+struct LaneQueue {
+    jobs: VecDeque<Queued>,
+    /// The fetcher's connection, while it has one, to write requests on.
+    conn: Option<TcpStream>,
+    /// How many jobs, from the front, have their request out on `conn`.
+    sent: usize,
+    /// The fetcher is writing requests on `conn` (see `Lane::flush`).
+    writing: bool,
+}
+
+struct Queued {
+    job: Job,
+    /// What its request asks for, `(offset, len)`: the run, or what is left
+    /// of it to fetch again.
+    req: (u64, usize),
+}
+
+impl Lane {
+    /// Queues `job`, writing its request now if the connection takes it
+    /// without blocking; otherwise the fetcher writes it.
+    fn push(&self, job: Job) {
+        let mut q = self.q.lock().unwrap();
+        let req = ((job.0 * PAGE_SIZE) as u64, job.1 * PAGE_SIZE);
+        q.jobs.push_back(Queued { job, req });
+        if !q.writing && q.sent + 1 == q.jobs.len() {
+            if let Some(conn) = &q.conn {
+                let (buf, len) = request(req.0, req.1, PAGE_SIZE);
+                let n = unsafe { libc::send(conn.as_raw_fd(), buf.as_ptr().cast(), len, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) };
+                match n {
+                    n if n == len as isize => q.sent += 1,
+                    n if n < 0 && io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock => {}
+                    // Part of a request, or the connection failed: the
+                    // fetcher reconnects and asks again.
+                    _ => {
+                        let _ = conn.shutdown(std::net::Shutdown::Both);
+                        q.conn = None;
+                    }
+                }
+            }
+        }
+        self.cv.notify_one();
+    }
+
+    /// The fetcher is done with the front job.
+    fn pop(&self) {
+        let mut q = self.q.lock().unwrap();
+        q.jobs.pop_front();
+        q.sent = q.sent.saturating_sub(1);
+    }
+
+    /// Takes `conn` for requests, and writes those not out yet. Before
+    /// reading the reply to `req`, the front job's: fails if its request was
+    /// out asking for something else (the connection must go). Every write
+    /// ends by `at`, the deadline of the fetcher's attempt.
+    fn flush(&self, conn: &TcpStream, req: Option<(u64, usize)>, at: Instant) -> io::Result<()> {
+        let mut q = self.q.lock().unwrap();
+        if q.conn.is_none() {
+            q.conn = Some(conn.try_clone()?);
+            q.sent = 0;
+        }
+        if let Some((front, req)) = q.jobs.front_mut().zip(req).filter(|(f, req)| f.req != *req) {
+            front.req = req;
+            if q.sent > 0 {
+                return Err(io::Error::other("refetching part of a run"));
+            }
+        }
+        // Written without holding `q`, so that queueing (the event thread)
+        // never waits for a write; it writes nothing meanwhile (`writing`),
+        // which keeps requests in order.
+        while q.sent < q.jobs.len() {
+            let mut out = Vec::new();
+            for j in q.jobs.range(q.sent..) {
+                let (buf, len) = request(j.req.0, j.req.1, PAGE_SIZE);
+                out.extend_from_slice(&buf[..len]);
+            }
+            let upto = q.jobs.len();
+            q.writing = true;
+            drop(q);
+            let res = crate::util::By { s: conn, at }.write_all(&out);
+            q = self.q.lock().unwrap();
+            q.writing = false;
+            res?;
+            q.sent = upto;
+        }
+        Ok(())
+    }
+
+    /// The fetcher's connection is gone: requests go out again on the next.
+    fn detach(&self) {
+        let mut q = self.q.lock().unwrap();
+        q.conn = None;
+        q.sent = 0;
     }
 }
 
@@ -2248,22 +2453,44 @@ impl Link {
     /// as `PageClient::fetch` does (from the start again after a reconnect).
     /// Waiting to reconnect, it sleeps until `stop` is set. Fails with
     /// TimedOut once the outage is too long.
-    fn fetch(&mut self, offset: u64, buf: &mut [u8], stop: &AtomicBool, head: usize, progress: &mut dyn FnMut(&[u8]) -> bool) -> io::Result<()> {
+    fn fetch(&mut self, offset: u64, buf: &mut [u8], stop: &AtomicBool, progress: &mut dyn FnMut(&[u8]) -> bool) -> io::Result<()> {
+        self.fetch_with(None, offset, buf, stop, progress)
+    }
+
+    /// `fetch` for a fault fetcher: reads the reply to the front job of
+    /// `lane`, whose request may be out already, the faulting page first.
+    /// With nothing to read, only connects.
+    fn fetch_queued(&mut self, lane: &Lane, offset: u64, buf: &mut [u8], stop: &AtomicBool, progress: &mut dyn FnMut(&[u8]) -> bool) -> io::Result<()> {
+        self.fetch_with(Some(lane), offset, buf, stop, progress)
+    }
+
+    fn fetch_with(&mut self, lane: Option<&Lane>, offset: u64, buf: &mut [u8], stop: &AtomicBool, progress: &mut dyn FnMut(&[u8]) -> bool) -> io::Result<()> {
+        // A fault waits for the first page of its run: it is asked for first.
+        let head = if lane.is_some() { PAGE_SIZE } else { 0 };
         loop {
-            if self.client.is_none() {
+            let Some(client) = self.client.as_mut() else {
                 if stop.load(Ordering::SeqCst) {
                     return Err(io::Error::other("pager stopped"));
                 }
                 thread::sleep(self.retry_at.saturating_duration_since(Instant::now()));
                 match PageClient::connect(&self.source) {
                     Ok(c) => self.client = Some(c),
-                    Err(e) => {
-                        self.lost(e)?;
-                        continue;
-                    }
+                    Err(e) => self.lost(e)?,
                 }
-            }
-            match self.client.as_mut().unwrap().fetch(offset, buf, head, progress) {
+                continue;
+            };
+            let at = Instant::now() + FETCH_DEADLINE;
+            let mut got = 0;
+            let mut counted = |data: &[u8]| {
+                got = data.len();
+                progress(data)
+            };
+            let res = match lane {
+                Some(lane) if buf.is_empty() => lane.flush(&client.stream.s, None, at),
+                Some(lane) => lane.flush(&client.stream.s, Some((offset, buf.len())), at).and_then(|()| client.recv(buf, head, &mut counted, at)),
+                None => client.fetch(offset, buf, head, &mut counted, at),
+            };
+            match res {
                 Ok(()) => {
                     self.down = None;
                     self.backoff = BACKOFF_MIN;
@@ -2271,9 +2498,20 @@ impl Link {
                 }
                 Err(e) => {
                     self.client = None;
+                    if let Some(lane) = lane {
+                        lane.detach();
+                    }
                     // Stopped by the caller: the source is fine.
                     if e.get_ref().is_some_and(|e| e.is::<Cancelled>()) {
                         return Err(e);
+                    }
+                    // Pages kept arriving, just not all in time: the source
+                    // is alive, and the caller asks for the rest (`partial`).
+                    if got >= PAGE_SIZE {
+                        self.down = None;
+                        self.backoff = BACKOFF_MIN;
+                        self.retry_at = Instant::now();
+                        return Err(io::Error::other(Partial(e.to_string())));
                     }
                     self.lost(e)?;
                 }
@@ -2310,8 +2548,8 @@ pub fn probe(source: &Source, page: u64, deadline: Instant) -> io::Result<()> {
         }
         let s = crate::util::connect(&source.addr, left)?;
         s.set_nodelay(true)?;
-        let mut client = PageClient::new(crate::util::By { s, at: give_up }, source)?;
-        client.fetch(page * PAGE_SIZE as u64, &mut [0u8; PAGE_SIZE], 0, &mut |_| true)
+        let mut client = PageClient::new(s, source, give_up)?;
+        client.fetch(page * PAGE_SIZE as u64, &mut [0u8; PAGE_SIZE], 0, &mut |_| true, give_up)
     };
     loop {
         let e = match once() {
@@ -2326,9 +2564,31 @@ pub fn probe(source: &Source, page: u64, deadline: Instant) -> io::Result<()> {
     }
 }
 
-/// Client for a migration source's page server.
+/// The request for `len` bytes of guest memory at `offset`: with `head`
+/// (bytes, less than `len`), the first `head` bytes are asked for on their
+/// own, ahead of the rest, so the server reads and sends them without
+/// waiting to read the rest out of guest memory. Returns it and its length.
+fn request(offset: u64, len: usize, head: usize) -> ([u8; 24], usize) {
+    let mut req = [0u8; 24];
+    for (i, (a, b)) in parts(len, head).enumerate() {
+        req[i * 12..i * 12 + 8].copy_from_slice(&(offset + a as u64).to_le_bytes());
+        req[i * 12 + 8..i * 12 + 12].copy_from_slice(&((b - a) as u32).to_le_bytes());
+    }
+    (req, 12 * parts(len, head).count())
+}
+
+/// The byte ranges `request` asks for, each answered on its own.
+fn parts(len: usize, head: usize) -> impl Iterator<Item = (usize, usize)> {
+    let split = head > 0 && head < len;
+    let first = if split { head } else { len };
+    std::iter::once((0, first)).chain(split.then_some((head, len)))
+}
+
+/// Client for a migration source's page server. Every write and read of a
+/// request ends by the deadline it is given, however slowly the server
+/// trickles.
 pub struct PageClient<S = TcpStream> {
-    stream: S,
+    stream: crate::util::By<S>,
     /// Whether the server's answer to the `pages` request has been read: it
     /// is read along with the first reply, so connecting costs no round trip.
     acked: bool,
@@ -2336,42 +2596,40 @@ pub struct PageClient<S = TcpStream> {
 
 impl PageClient {
     pub fn connect(source: &Source) -> io::Result<Self> {
-        let stream = crate::util::connect(&source.addr, Duration::from_millis(500))?;
+        let stream = crate::util::connect(&source.addr, CONNECT_TIMEOUT)?;
         stream.set_nodelay(true)?;
-        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-        PageClient::new(stream, source)
+        PageClient::new(stream, source, Instant::now() + CONNECT_TIMEOUT)
     }
 }
 
-impl<S: Read + Write> PageClient<S> {
-    fn new(mut stream: S, source: &Source) -> io::Result<Self> {
+impl<S: crate::util::Timed> PageClient<S> {
+    fn new(stream: S, source: &Source, at: Instant) -> io::Result<Self> {
         let mut hello = serde_json::to_vec(&serde_json::json!({"op": "pages", "name": source.vm, "mig": source.mig}))?;
         hello.push(b'\n');
+        let mut stream = crate::util::By { s: stream, at };
         stream.write_all(&hello)?;
         Ok(PageClient { stream, acked: false })
     }
 
-    /// Reads guest memory at `offset` into `buf`, calling `progress` with
-    /// what has arrived so far as it does. With `head` (bytes, less than
-    /// `buf`), the first `head` bytes are asked for on their own, ahead of
-    /// the rest: the server reads and sends them without waiting to read
-    /// the rest out of guest memory.
-    pub fn fetch(&mut self, offset: u64, buf: &mut [u8], head: usize, progress: &mut dyn FnMut(&[u8]) -> bool) -> io::Result<()> {
-        let parts = match head {
-            h if h > 0 && h < buf.len() => vec![(0, h), (h, buf.len())],
-            _ => vec![(0, buf.len())],
-        };
-        let mut req = Vec::with_capacity(12 * parts.len());
-        for &(a, b) in &parts {
-            req.extend_from_slice(&(offset + a as u64).to_le_bytes());
-            req.extend_from_slice(&((b - a) as u32).to_le_bytes());
-        }
-        self.stream.write_all(&req)?;
+    /// Reads guest memory at `offset` into `buf` by `at`, calling `progress`
+    /// with what has arrived so far as it does, the first `head` bytes asked
+    /// for on their own (see `request`).
+    pub fn fetch(&mut self, offset: u64, buf: &mut [u8], head: usize, progress: &mut dyn FnMut(&[u8]) -> bool, at: Instant) -> io::Result<()> {
+        let (req, len) = request(offset, buf.len(), head);
+        self.stream.at = at;
+        self.stream.write_all(&req[..len])?;
+        self.recv(buf, head, progress, at)
+    }
+
+    /// Reads the reply to a request (`request(_, buf.len(), head)`) into
+    /// `buf` by `at`, as `fetch` does.
+    fn recv(&mut self, buf: &mut [u8], head: usize, progress: &mut dyn FnMut(&[u8]) -> bool, at: Instant) -> io::Result<()> {
+        self.stream.at = at;
         if !self.acked {
             self.read_ack()?;
             self.acked = true;
         }
-        for (a, b) in parts {
+        for (a, b) in parts(buf.len(), head) {
             let mut status = [0u8; 1];
             self.stream.read_exact(&mut status)?;
             if status[0] != 0 {
@@ -2431,6 +2689,24 @@ impl std::fmt::Display for Cancelled {
 }
 
 impl std::error::Error for Cancelled {}
+
+/// A fetch that delivered pages, but not all of them, before its connection
+/// failed (say, past its deadline from a slow source): the caller fetches the
+/// rest (see `Pages::fetch_install`).
+#[derive(Debug)]
+struct Partial(String);
+
+impl std::fmt::Display for Partial {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "fetch cut short after some pages arrived: {}", self.0)
+    }
+}
+
+impl std::error::Error for Partial {}
+
+fn partial(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|e| e.is::<Partial>())
+}
 
 /// Serves page reads for `pager` on an accepted page-server connection
 /// (already answered `ok`), until the client hangs up, sits idle for
@@ -2974,16 +3250,155 @@ mod tests {
         let mut buf = vec![0u8; 4 * PAGE_SIZE];
         let start = Instant::now();
         let mut head_at = None;
-        c.fetch(8192, &mut buf, PAGE_SIZE, &mut |data| {
+        let mut progress = |data: &[u8]| {
             if data.len() >= PAGE_SIZE && head_at.is_none() {
                 head_at = Some(start.elapsed());
             }
             true
-        })
-        .unwrap();
+        };
+        c.fetch(8192, &mut buf, PAGE_SIZE, &mut progress, start + Duration::from_secs(5)).unwrap();
         assert!(head_at.unwrap() < Duration::from_millis(40), "head reported before the rest arrived");
         assert!(buf[..PAGE_SIZE].iter().all(|&b| b == 1) && buf[PAGE_SIZE..].iter().all(|&b| b == 2));
         server.join().unwrap();
+    }
+
+    /// A page server whose page `p` is all `p as u8`. Its first connection
+    /// answers `first` requests only, then hangs up its side; later ones
+    /// answer all. Sends each connection's requests, as `(offset, len)`, down
+    /// `seen` once the client hung up.
+    fn fake_source(first: usize, seen: std::sync::mpsc::Sender<Vec<(u64, u32)>>) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        thread::spawn(move || {
+            for (k, s) in listener.incoming().enumerate() {
+                let s = s.unwrap();
+                let mut r = io::BufReader::new(s.try_clone().unwrap());
+                let mut w = s;
+                let mut hello = String::new();
+                io::BufRead::read_line(&mut r, &mut hello).unwrap();
+                w.write_all(b"{\"ok\": true}\n").unwrap();
+                let mut reqs = Vec::new();
+                let mut req = [0u8; 12];
+                while r.read_exact(&mut req).is_ok() {
+                    let (off, len) = (u64::from_le_bytes(req[..8].try_into().unwrap()), u32::from_le_bytes(req[8..].try_into().unwrap()));
+                    reqs.push((off, len));
+                    if k == 0 && reqs.len() > first {
+                        continue;
+                    }
+                    let mut out = vec![0u8];
+                    out.extend((0..len as u64).map(|i| ((off + i) / PAGE_SIZE as u64) as u8));
+                    w.write_all(&out).unwrap();
+                    if k == 0 && reqs.len() == first {
+                        w.shutdown(std::net::Shutdown::Write).unwrap();
+                    }
+                }
+                let _ = seen.send(reqs);
+            }
+        });
+        addr
+    }
+
+    #[test]
+    fn queued_requests_are_pipelined_and_resent_after_a_reconnect() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        // The first connection answers the head and the rest of the first run only.
+        let source = Source { addr: fake_source(2, tx), vm: "v".into(), mig: 1, regions: Vec::new() };
+        let (lane, stop) = (Lane::default(), AtomicBool::new(false));
+        let mut link = Link::new(source);
+        link.fetch_queued(&lane, 0, &mut [], &stop, &mut |_| true).unwrap();
+        // Written as they are queued, before the fetcher reads any reply.
+        for job in [(3, 2), (7, 1), (10, 3)] {
+            lane.push((job.0, job.1, Instant::now()));
+        }
+        assert_eq!(lane.q.lock().unwrap().sent, 3);
+        for (first, n) in [(3usize, 2usize), (7, 1), (10, 3)] {
+            let mut buf = vec![0u8; n * PAGE_SIZE];
+            link.fetch_queued(&lane, (first * PAGE_SIZE) as u64, &mut buf, &stop, &mut |_| true).unwrap();
+            assert!(buf.chunks(PAGE_SIZE).enumerate().all(|(i, p)| p.iter().all(|&b| b as usize == first + i)), "run {first}+{n}");
+            lane.pop();
+        }
+        let page = |p: u64| p * PAGE_SIZE as u64;
+        let sz = PAGE_SIZE as u32;
+        // All three went out on the first connection, the faulting page of
+        // each on its own; what was not answered went out again on the next.
+        let rest = vec![(page(7), sz), (page(10), sz), (page(11), 2 * sz)];
+        assert_eq!(rx.recv().unwrap(), [vec![(page(3), sz), (page(4), sz)], rest.clone()].concat());
+        drop((link, lane));
+        assert_eq!(rx.recv().unwrap(), rest);
+    }
+
+    #[test]
+    fn a_fetch_ends_by_its_deadline_however_the_server_trickles() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            s.write_all(b"{\"ok\": true}\n\0").unwrap();
+            while s.write_all(&[7]).is_ok() {
+                thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let source = Source { addr, vm: "v".into(), mig: 1, regions: Vec::new() };
+        let mut c = PageClient::connect(&source).unwrap();
+        let start = Instant::now();
+        let e = c.fetch(0, &mut [0u8; PAGE_SIZE], 0, &mut |_| true, start + Duration::from_millis(200)).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut, "{e}");
+        assert!(start.elapsed() < Duration::from_millis(400), "{:?}", start.elapsed());
+    }
+
+    /// A source that delivers steadily but too slowly for any one request to
+    /// finish by its deadline: the pull goes on from what arrived, and
+    /// completes.
+    #[test]
+    fn a_slow_source_that_keeps_delivering_is_not_lost() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let conns = Arc::new(AtomicUsize::new(0));
+        let counted = conns.clone();
+        thread::spawn(move || {
+            for s in listener.incoming() {
+                counted.fetch_add(1, Ordering::SeqCst);
+                let s = s.unwrap();
+                thread::spawn(move || {
+                    let mut r = io::BufReader::new(s.try_clone().unwrap());
+                    let mut w = s;
+                    let mut hello = String::new();
+                    io::BufRead::read_line(&mut r, &mut hello).unwrap();
+                    w.write_all(b"{\"ok\": true}\n").unwrap();
+                    let mut req = [0u8; 12];
+                    while r.read_exact(&mut req).is_ok() {
+                        let (off, len) = (u64::from_le_bytes(req[..8].try_into().unwrap()), u32::from_le_bytes(req[8..].try_into().unwrap()) as u64);
+                        let _ = w.write_all(&[0]);
+                        for p in (off..off + len).step_by(PAGE_SIZE) {
+                            thread::sleep(Duration::from_millis(25));
+                            if w.write_all(&[(p / PAGE_SIZE as u64) as u8; PAGE_SIZE]).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        let n = 32;
+        let p = pages(&[REMOTE; 32]);
+        p.claim(0, n, REMOTE, |_| true);
+        let mut link = Link::new(Source { addr, vm: "v".into(), mig: 1, regions: Vec::new() });
+        let mut fetch = |off: u64, buf: &mut [u8], stop: &AtomicBool, progress: &mut dyn FnMut(&[u8]) -> bool| link.fetch(off, buf, stop, progress);
+        let stop = AtomicBool::new(false);
+        let mut got = vec![0u8; n];
+        let (resolved, res) = p.fetch_install(0, n, &mut vec![0u8; n * PAGE_SIZE], &mut fetch, &stop, &mut |e| partial(e), |pg, c, src| {
+            for i in 0..c {
+                got[pg + i] = src[i * PAGE_SIZE];
+            }
+            Ok(c)
+        });
+        assert!(res.is_ok(), "{:?}", res.err().map(|e| match e {
+            Failed::Fetch(e) | Failed::Install(e) => e.to_string(),
+        }));
+        assert_eq!(resolved, n);
+        assert!(got.iter().enumerate().all(|(i, &b)| b as usize == i), "{got:?}");
+        // 0.8 s of pages over 0.3 s deadlines: it reconnected, for the rest only.
+        assert!(conns.load(Ordering::SeqCst) > 1);
     }
 
     #[test]
