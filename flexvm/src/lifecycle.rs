@@ -26,7 +26,6 @@ use crate::vmproc::{End, Op, Proc, CLOCK_DEADLINE};
 
 pub const DRAIN_WAIT: Duration = Duration::from_secs(60);
 pub const SETTLE_WAIT: Duration = Duration::from_secs(10);
-const CKPT_RELEASE: Duration = Duration::from_millis(20);
 /// Suspended-checkpoint markers: STARTED (may have run: never resume again),
 /// DISCARDED, GEN (address generation), and QUARANTINE `<boot id> <why>` when
 /// STARTED's durability is unknown (held until a reboot shows the disk).
@@ -682,7 +681,7 @@ impl PacketHold<'_> {
     fn end(&mut self) -> Result<State> {
         let Some(h) = self.d.holder() else { return self.vm.end_checkpoint() };
         let (ip, tap) = (self.vm.ip, &self.vm.tap);
-        self.stats = crate::migrate::release_into(h, ip, self.id, self.vm, CKPT_RELEASE, |()| crate::net::attach(ip, tap));
+        self.stats = crate::migrate::release_into(h, ip, self.id, self.vm, Duration::ZERO, |()| crate::net::attach(ip, tap));
         let res = self.vm.end_checkpoint();
         h.forget(ip, self.id);
         res

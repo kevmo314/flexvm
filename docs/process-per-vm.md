@@ -197,7 +197,10 @@ never past the guest's size, raised before a grow's PATCH by what the grow
 was charged, lowered only once a shrink settles and never below what is in
 use. Refused, the VM is throttled at its mark (the kernel slows its vCPUs;
 `memory.high`, never `memory.max`: nothing is OOM-killed) and counts as
-starved, so eviction moves it. The pager's installs are charged to the
+starved, so eviction moves it. Its cgroup never swaps (`memory.swap.max`
+0): on a host with swap, reclaim at the mark would page the guest out
+instead, and a pause would wait for its vCPUs' swap reads, which nothing
+can cut short (#136). The pager's installs are charged to the
 cgroup but throttled by the VM process's own, so pulls and checkpoint copies
 never wait on the mark; a migration (once its target is prepared) or a
 checkpoint lifts it right before it pauses the VM, first waiting out vCPUs
@@ -527,7 +530,7 @@ where it is kept and what tests it.
   becomes `standby` (count, refill, claim fallback). New: `abort_superseded`,
   `gen_zero`, `suspend_gen`, `signals`, `kill_source`, `forged_peer`, `evict_grower`, `evict_latency`, `evict_no_pingpong`, `evict_skips_cmd`,
   `restore_ip_peer`, `late_withdrawal`, `kill_refused_checkpoint`,
-  `wildcard_listen`, `same_host_order`, `arrival_abort_route`, `arrival_killed_route`, `handoff_superseded`,
+  `wildcard_listen`, `same_host_order`, `same_host_slow_route`, `arrival_abort_route`, `arrival_killed_route`, `handoff_superseded`,
   `suspend_cmd` (#134), `pause_cmd_start`, `fc_died_busy` (#122), `suspend_died`, and processes SIGKILLed between
   steps at test stalls (`incoming_killed`, `start_killed`, `claim_killed`).
   Dropped:

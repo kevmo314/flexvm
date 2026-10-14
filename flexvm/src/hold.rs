@@ -25,8 +25,14 @@ const CATCH_UP: Duration = Duration::from_millis(100);
 const MAX_FRAME: usize = 65535;
 const ACCEPT_WAIT: Duration = Duration::from_secs(1);
 const SYNC_WAIT: Duration = Duration::from_millis(250);
+/// For the target to take the address over: a route change, which waits for RTNL. The
+/// address stays held here meanwhile, so waiting loses nothing.
+const SWITCH_WAIT: Duration = Duration::from_secs(2);
 const FLUSH_WAIT: Duration = Duration::from_millis(400);
 const REPLY_WAIT: Duration = Duration::from_secs(1);
+
+/// Where `release_local` hands packets, from more than one thread.
+pub type LocalSink<'a> = &'a mut (dyn FnMut(&[u8]) -> bool + Send);
 
 pub struct Holder {
     dev: String,
@@ -40,6 +46,8 @@ pub struct Holder {
     passes: AtomicU64,
     /// Held while an address's TUN route is added or deleted.
     routes: Mutex<()>,
+    /// Held while a packet is read off the device and queued.
+    rx: Mutex<()>,
 }
 
 struct Entry {
@@ -93,7 +101,7 @@ impl Holder {
         let _ = crate::net::sysctl(&format!("net.ipv6.conf.{dev}.disable_ipv6"), "1");
         crate::net::set_link_up(&dev, true)?;
         let ifindex = crate::net::ifindex(&dev)?;
-        let h = Arc::new(Holder { dev, ifindex, tun, held: Mutex::default(), reading: AtomicBool::new(false), passes: AtomicU64::new(0), routes: Mutex::new(()) });
+        let h = Arc::new(Holder { dev, ifindex, tun, held: Mutex::default(), reading: AtomicBool::new(false), passes: AtomicU64::new(0), routes: Mutex::new(()), rx: Mutex::new(()) });
         let reader = h.clone();
         std::thread::Builder::new().name("hold".into()).spawn(move || reader.read_loop())?;
         Ok(Some(h))
@@ -164,22 +172,63 @@ impl Holder {
         Some((stats, switched))
     }
 
-    /// `release` into a VM here: never waits for the device to go quiet (another VM's packets
-    /// may keep it busy). If `switch` fails the address stays held until `forget`.
+    /// `release` into a VM here. `switch` (a route change) may wait long, for RTNL: a helper
+    /// thread hands over what arrives meanwhile as it comes, and once it is done, all the
+    /// device took before it is read off the device and handed over right away (not waiting
+    /// for the reader thread or the helper, which a busy host may not run for a while), so
+    /// the packets routed to the VM from then on have as little as possible to overtake.
+    /// Nothing held is dropped for taking long. A sender that looked the old route up just
+    /// before the switch may still be putting a packet on the device: with `linger`, the device
+    /// is watched that long more for one. If `switch` fails the address stays held until
+    /// `forget`.
     pub fn release_local(
         &self,
         ip: Ipv4Addr,
         mig: u64,
-        sink: &mut dyn FnMut(&[u8]) -> bool,
+        sink: LocalSink,
         switch: impl FnOnce() -> Result<()>,
-        within: Duration,
+        linger: Duration,
     ) -> Option<(Stats, Result<()>)> {
         let e = self.releasing(ip, mig)?;
-        let end = Instant::now() + within;
-        let mut stats = Stats::default();
-        self.drain(&e, sink, &mut stats, end);
-        let switched = switch();
-        self.drain(&e, sink, &mut stats, end);
+        let out = Mutex::new((sink, Stats::default()));
+        let give = |o: &mut (LocalSink, Stats)| self.give_all(&e, &mut *o.0, &mut o.1);
+        give(&mut out.lock().unwrap());
+        let switching = AtomicBool::new(true);
+        let switched = std::thread::scope(|sc| {
+            sc.spawn(|| {
+                let _rt = Realtime::new();
+                while switching.load(Ordering::SeqCst) {
+                    if !give(&mut out.lock().unwrap()) {
+                        std::thread::sleep(Duration::from_micros(200));
+                    }
+                }
+            });
+            // From the switch to the last packet the device took before it handed over, packets
+            // routed to the VM race those: not preempted by the busy host's other work meanwhile.
+            let rt = Realtime::new();
+            let switched = switch();
+            let mut o = out.lock().unwrap();
+            if switched.is_ok() {
+                // Nothing reaches the device for this address any more: this ends.
+                let mut buf = vec![0u8; MAX_FRAME];
+                while self.read_one(&mut buf) {}
+            }
+            give(&mut o);
+            drop(rt);
+            switching.store(false, Ordering::SeqCst);
+            switched
+        });
+        let end = Instant::now() + linger;
+        while switched.is_ok() && Instant::now() < end {
+            let mut pfd = libc::pollfd { fd: self.tun.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+            let wait = end.saturating_duration_since(Instant::now()).as_millis().max(1) as i32;
+            if unsafe { libc::poll(&mut pfd, 1, wait) } > 0 {
+                let mut buf = vec![0u8; MAX_FRAME];
+                while self.read_one(&mut buf) {}
+            }
+            give(&mut out.lock().unwrap());
+        }
+        let (_, mut stats) = out.into_inner().unwrap();
         if switched.is_ok() {
             self.unhold(ip, &e);
         }
@@ -191,22 +240,17 @@ impl Holder {
         Some((stats, switched))
     }
 
-    fn drain(&self, e: &Entry, sink: &mut dyn FnMut(&[u8]) -> bool, stats: &mut Stats, end: Instant) {
-        let mut give = |stats: &mut Stats| {
-            while Instant::now() < end {
-                let batch = e.q.lock().unwrap().take_batch();
-                if batch.is_empty() {
-                    return;
-                }
-                batch.iter().for_each(|p| stats.give(sink, p));
+    /// Hands over all queued; false if there was none.
+    fn give_all(&self, e: &Entry, sink: &mut dyn FnMut(&[u8]) -> bool, stats: &mut Stats) -> bool {
+        let mut any = false;
+        loop {
+            let batch = e.q.lock().unwrap().take_batch();
+            if batch.is_empty() {
+                return any;
             }
-        };
-        give(stats);
-        let pass = self.passes.load(Ordering::SeqCst);
-        while Instant::now() < end && self.passes.load(Ordering::SeqCst) == pass && (self.reading.load(Ordering::SeqCst) || readable(&self.tun)) {
-            std::thread::yield_now();
+            any = true;
+            batch.iter().for_each(|p| stats.give(sink, p));
         }
-        give(stats);
     }
 
     fn hand_over(&self, e: &Entry, sink: &mut dyn FnMut(&[u8]) -> bool, stats: &mut Stats) {
@@ -256,23 +300,32 @@ impl Holder {
                 return eprintln!("hold device {}: {e}", self.dev);
             }
             self.reading.store(true, Ordering::SeqCst);
-            while let Ok(n) = eintr(|| unsafe { libc::read(self.tun.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) }) {
-                let p = &buf[..n as usize];
-                if p.len() < 20 || p[0] >> 4 != 4 {
-                    continue;
-                }
-                let Some(e) = self.entry(Ipv4Addr::new(p[16], p[17], p[18], p[19])) else { continue };
-                let mut q = e.q.lock().unwrap();
-                if q.bytes + p.len() > CAP {
-                    q.dropped += 1;
-                } else {
-                    q.bytes += p.len();
-                    q.packets.push_back(p.to_vec());
-                }
-            }
+            while self.read_one(&mut buf) {}
             self.passes.fetch_add(1, Ordering::SeqCst);
             self.reading.store(false, Ordering::SeqCst);
         }
+    }
+
+    /// Reads a packet off the device and queues it for its address; false once it is empty.
+    /// Read and queued under `rx`, so packets are queued in the order they were read, by
+    /// whichever thread.
+    fn read_one(&self, buf: &mut [u8]) -> bool {
+        let _rx = self.rx.lock().unwrap();
+        let Ok(n) = eintr(|| unsafe { libc::read(self.tun.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) }) else { return false };
+        let p = &buf[..n as usize];
+        if p.len() < 20 || p[0] >> 4 != 4 {
+            return true;
+        }
+        if let Some(e) = self.entry(Ipv4Addr::new(p[16], p[17], p[18], p[19])) {
+            let mut q = e.q.lock().unwrap();
+            if q.bytes + p.len() > CAP {
+                q.dropped += 1;
+            } else {
+                q.bytes += p.len();
+                q.packets.push_back(p.to_vec());
+            }
+        }
+        true
     }
 }
 
@@ -461,7 +514,7 @@ pub fn send(
         true => {
             let mut o = out.borrow_mut();
             o.buf.extend_from_slice(&SWITCH.to_be_bytes());
-            let (mut ack, deadline) = ([0u8; 1], Instant::now() + SYNC_WAIT);
+            let (mut ack, deadline) = ([0u8; 1], Instant::now() + SWITCH_WAIT);
             if !(o.flush(deadline) && By { s: conn, at: deadline }.read_exact(&mut ack).is_ok() && ack[0] == b'w') {
                 o.broken = true;
                 eprintln!("hold {ip}: the target did not take the address over; dropping the rest");
@@ -512,6 +565,25 @@ impl Out<'_> {
         }
         self.buf.clear();
         !self.broken
+    }
+}
+
+/// The calling thread runs `SCHED_FIFO` (lowest priority) until this goes, if it may.
+struct Realtime(bool);
+
+impl Realtime {
+    fn new() -> Realtime {
+        let p = libc::sched_param { sched_priority: 1 };
+        Realtime(unsafe { libc::sched_setscheduler(0, libc::SCHED_FIFO, &p) } == 0)
+    }
+}
+
+impl Drop for Realtime {
+    fn drop(&mut self) {
+        if self.0 {
+            let p = libc::sched_param { sched_priority: 0 };
+            unsafe { libc::sched_setscheduler(0, libc::SCHED_OTHER, &p) };
+        }
     }
 }
 

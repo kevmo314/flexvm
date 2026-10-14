@@ -23,7 +23,6 @@ use crate::util::{ms, recv_json, send_json, By, Error, Phases, Result};
 use crate::vm::{Snapshot, State, Vm};
 use crate::vmproc::{peer_call, End, Op, Proc};
 
-const RELEASE_LOCAL: Duration = Duration::from_millis(100);
 /// From the target's prepare answer to its commit answer.
 const INCOMING_WAIT: Duration = Duration::from_secs(30);
 const MAX_VMSTATE: u64 = 64 << 20;
@@ -32,6 +31,9 @@ const MAX_HEADER: u64 = 256 << 20;
 const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(10);
 const HOLD_FENCE: Duration = Duration::from_millis(250);
 const HELD_STREAM: Duration = Duration::from_secs(2);
+/// How long a same-host target's hold, let go, watches for a packet sent along the old route
+/// (the VM runs meanwhile: no downtime).
+const STRAGGLERS: Duration = Duration::from_millis(5);
 /// How long migrating on waits for an arrival still pulling.
 const ARRIVAL_WAIT: Duration = Duration::from_secs(10);
 
@@ -234,7 +236,7 @@ impl Proc {
             }
         };
         if let Some(h) = self.holder() {
-            release_into(h, vm.ip, mig, vm, RELEASE_LOCAL, |()| crate::net::attach(vm.ip, &vm.tap));
+            release_into(h, vm.ip, mig, vm, Duration::ZERO, |()| crate::net::attach(vm.ip, &vm.tap));
         }
         let (s, e) = match vm.resume() {
             Ok(s) => (s, e),
@@ -483,7 +485,16 @@ impl Proc {
             }
             let ended = p.if_current(|| match (holder.as_deref(), holding) {
                 (Some(h), true) => {
-                    let _ = release_into(h, vm.ip, mig, &vm, RELEASE_LOCAL, |()| vm.route_here());
+                    // `release_stall`: the route change waits long (for RTNL, say).
+                    let released = release_into(h, vm.ip, mig, &vm, STRAGGLERS, |()| {
+                        if fault("release_stall") {
+                            thread::sleep(Duration::from_millis(300));
+                        }
+                        vm.route_here()
+                    });
+                    if let Some(s) = released.filter(|s| s.dropped + s.dropped_target > 0) {
+                        eprintln!("vm {}: dropped {} of the packets held while taking {} over", vm.name, s.dropped + s.dropped_target, vm.ip);
+                    }
                     Ok(())
                 }
                 _ if !routed => vm.route_here(),
@@ -693,7 +704,7 @@ fn outcome(to: &str, mig: u64, patience: Duration) -> Option<Outcome> {
 
 /// Injects held packets, `switch`es the route, then injects stragglers. A
 /// failed switch leaves the address held until the caller `forget`s it.
-pub fn release_into(h: &Holder, ip: Ipv4Addr, mig: u64, vm: &Vm, within: Duration, switch: impl FnOnce(()) -> Result<()>) -> Option<hold::Stats> {
+pub fn release_into(h: &Holder, ip: Ipv4Addr, mig: u64, vm: &Vm, linger: Duration, switch: impl FnOnce(()) -> Result<()>) -> Option<hold::Stats> {
     if !h.holding_for(ip, mig) {
         return None;
     }
@@ -705,7 +716,7 @@ pub fn release_into(h: &Holder, ip: Ipv4Addr, mig: u64, vm: &Vm, within: Duratio
             return None;
         }
     };
-    let (mut stats, switched) = h.release_local(ip, mig, &mut |p| hold::valid(p, ip) && inj.send(p), || switch(()), within)?;
+    let (mut stats, switched) = h.release_local(ip, mig, &mut |p| hold::valid(p, ip) && inj.send(p), || switch(()), linger)?;
     if let Err(e) = switched {
         eprintln!("vm {}: routing {ip} back to its tap after injecting the held packets: {e}", vm.name);
     }

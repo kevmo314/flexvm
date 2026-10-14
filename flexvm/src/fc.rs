@@ -391,7 +391,18 @@ impl Spawner {
         if let Some(cg) = cgroup.clone() {
             let pid = fc.pid();
             fc.joining = Some(std::thread::spawn(move || {
-                let joined = std::fs::create_dir(&cg).and_then(|()| std::fs::write(cg.join("cgroup.procs"), pid.to_string()));
+                // Never swapped: at its mark the VM is throttled (sleeps a migration's or
+                // checkpoint's lift waits out), not paged out to swap, whose reads would hold
+                // up its pauses. Without swap accounting the file is missing: nothing to do.
+                let joined = std::fs::create_dir(&cg).and_then(|()| {
+                    if let Err(e) = std::fs::write(cg.join("memory.swap.max"), "0").or_else(|e| match e.kind() {
+                        std::io::ErrorKind::NotFound => Ok(()),
+                        _ => Err(e),
+                    }) {
+                        eprintln!("firecracker {pid}: its memory may be swapped ({}): {e}", cg.display());
+                    }
+                    std::fs::write(cg.join("cgroup.procs"), pid.to_string())
+                });
                 if let Err(e) = joined {
                     eprintln!("firecracker {pid}: no cgroup of its own ({}): {e}", cg.display());
                 }
