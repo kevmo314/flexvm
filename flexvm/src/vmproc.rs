@@ -1,6 +1,6 @@
 //! The VM process: one process per VM, owning its Firecracker, pager, tap,
 //! route and holds, exiting with the VM. SIGTERM suspends, SIGTSTP pauses,
-//! SIGCONT resumes, SIGINT destroys; `RUN/vms/NAME.sock` takes control ops.
+//! SIGCONT resumes, SIGINT (and SIGQUIT) destroys; `RUN/vms/NAME.sock` takes control ops.
 //! Every operation, starting included, holds `op`; the process ends only
 //! through `finish`, which holds it too.
 
@@ -35,7 +35,7 @@ const OP_WAIT: Duration = Duration::from_secs(30);
 const RELEASE_WAIT: Duration = Duration::from_secs(10);
 const CLOCK_TOLERANCE: Duration = Duration::from_millis(20);
 pub const CLOCK_DEADLINE: Duration = Duration::from_secs(5);
-const SIGNALS: [i32; 5] = [libc::SIGTERM, libc::SIGINT, libc::SIGTSTP, libc::SIGCONT, libc::SIGHUP];
+const SIGNALS: [i32; 6] = [libc::SIGTERM, libc::SIGINT, libc::SIGQUIT, libc::SIGTSTP, libc::SIGCONT, libc::SIGHUP];
 const MAX_CONTROL: usize = 256;
 static CONTROL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -945,7 +945,11 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
     });
     let s = p.clone();
     thread::spawn(move || loop {
-        s.signal(crate::util::wait_signal(&signals));
+        // Ctrl-\ quits like Ctrl-C: the VM is destroyed, not dumped.
+        s.signal(match crate::util::wait_signal(&signals) {
+            libc::SIGQUIT => libc::SIGINT,
+            sig => sig,
+        });
     });
     let op = p.op();
     let res = match start {
@@ -1276,7 +1280,15 @@ pub fn tell_peers(host: &Host, req: Value) {
 }
 
 pub fn connect(host: &Host, name: &str, req: &Value, fds: &[i32]) -> Result<UnixStream> {
-    let c = UnixStream::connect(host.sock(name)).map_err(|_| format!("no vm named {name:?}"))?;
+    let c = UnixStream::connect(host.sock(name)).map_err(|e| {
+        if host.alive(name) {
+            format!("vm {name:?} is starting or its control socket is unavailable; retry once it is ready, or see {}: {e}", host.vms(name, "log").display())
+        } else if host.is_suspended(name) {
+            format!("vm {name:?} is suspended; use flexvm resume {name} first")
+        } else {
+            format!("no vm named {name:?}")
+        }
+    })?;
     let mut line = serde_json::to_vec(req)?;
     line.push(b'\n');
     crate::util::send_with_fds(&c, &line, fds)?;

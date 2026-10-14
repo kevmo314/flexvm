@@ -20,6 +20,9 @@ sudo ./target/release/flexvm template default   # cold-boot and snapshot a templ
 
 flexvm runs as root (KVM, userfaultfd, routes, cgroups). Commands below
 assume `flexvm` is on the PATH and `FLEXVM_ARTIFACTS` points at `artifacts/`.
+sudo drops `FLEXVM_ARTIFACTS`: keep it with `sudo --preserve-env=FLEXVM_ARTIFACTS`
+(`sudo -E` is refused by some sudo builds, e.g. sudo-rs), or pass `--artifacts DIR`;
+without either, the default is `./artifacts` relative to the working directory.
 
 ## Run a VM
 
@@ -31,7 +34,7 @@ flexvm run web --ip 10.200.0.9 --template small
 ```
 
 ```sh
-flexvm ls
+flexvm ls                      # --json prints the list as JSON
 NAME             IP              TEMPLATE   STATE             PID VCPU  RSS MiB  MAX MiB
 web              10.200.0.1      default    running        41522   24       27    32000
 ```
@@ -39,6 +42,13 @@ web              10.200.0.1      default    running        41522   24       27  
 ```sh
 flexvm exec web 'free -m'       # a shell command in the guest; exits with its status
 ```
+
+As with ssh, the words of `run -- CMD` and `exec NAME CMD` are joined with
+spaces for the guest's shell, so quote a command that has its own quoting:
+`flexvm run job -- "sh -c 'echo -d'"`. Flags after `--` (or after `exec NAME`)
+belong to CMD.
+
+`-d` and `--detach` are equivalent for `run`, `restore`, and `resume`.
 
 A background VM's output (an image app's stdout and stderr, flexvm's own
 messages) goes to `/run/flexvm/vms/web.log`.
@@ -54,6 +64,9 @@ kill 41522                      # SIGTERM: suspend to disk, free its memory, exi
 flexvm resume web               # bring a suspended VM back (in a new process)
 flexvm kill web                 # destroy it, running or suspended; Ctrl-C in the foreground
 ```
+
+Ctrl-\ (SIGQUIT) destroys the VM like Ctrl-C. A VM paused with Ctrl-Z keeps
+its terminal: resume it from another one with `flexvm resume web`.
 
 A closed terminal (SIGHUP) leaves a foreground VM running; its output then
 goes to `/run/flexvm/vms/NAME.log`.
@@ -71,6 +84,9 @@ memory; `flexvm kill` refuses that copy (kill the VM where it runs), and
 `kill -KILL PID` gives it up (the target loses the pages it has not pulled).
 
 A suspended VM keeps its name and address; `ls` shows it `suspended`.
+`resume` restores a suspended VM in the foreground, even if it was originally
+started with `-d`; use `flexvm resume web -d` to detach it again.
+Resuming a paused VM leaves its existing process in place.
 
 ## Checkpoint and restore
 
@@ -103,6 +119,10 @@ flexvm listen 192.168.1.11:7070 --peer 192.168.1.10:7070 --announce-dev eth0 \
 
 flexvm migrate web 192.168.1.11:7070      # on A: web now runs on B, same address, connections intact
 ```
+
+Networking is routed IPv4: flexvm provides no NAT or automatic internet
+egress. Arrange upstream routes or NAT yourself if guests need it. There is
+no default DNS server; configure one with `flexvm listen ... --dns IP`.
 
 Every host's `--vm-ips` must be disjoint, and the hosts must list each other
 with `--peer`: a listener serves its peers' addresses only. `--reserve MIB`
@@ -198,5 +218,5 @@ copy-on-write, packet holds, clocks, Firecracker patches, measurements).
 - An address lent to a restore elsewhere stays lent if that restore's host
   dies before it starts the VM (a leak, never a collision).
 - `exec` reaches VMs on this host; one that migrates away ends its exec
-  saying where it went (the command keeps running there).
+  saying where it went and exits 1 (the command keeps running there).
 - Templates must be identical on every host (checked by content id).

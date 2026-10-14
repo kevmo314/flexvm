@@ -2,7 +2,7 @@
 //! (socket-activatable) that serves only configured peers. Each connection
 //! starts with one JSON line, consumed exactly through its newline so nothing after it is:
 //! `migrate_in`, `pages` (handed to the source VM process), `migration`
-//! (status/done), `route`, `lend`.
+//! (status/done), `route`, `lend`, `source` (source liveness).
 
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
