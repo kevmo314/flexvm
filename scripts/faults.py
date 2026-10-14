@@ -1142,7 +1142,9 @@ def udp_across_migrations(label, n, target_fault=None, burst=1, source_fault=Non
         late = [got[max(0, i - 3):i + 12] for i, (a, b) in enumerate(zip(got, got[1:])) if b <= a]
         check(f"{label}: none reordered", not late, late[:10])
         for h in dropped:
-            check(f"{label}: no held packets dropped on {h}", not dropped[h], dropped[h][-3:])
+            # A tap's own drops are no held packets; one of the stream's would be missing above.
+            held_drops = [l for l in dropped[h] if "its tap dropped" not in l]
+            check(f"{label}: no held packets dropped on {h}", not held_drops, held_drops[-3:])
     else:
         # Overload may drop, but only what is counted: by the holds, the guest's socket or a tap.
         said = sum(int(m) for ls in dropped.values() for l in ls for m in re.findall(r"dropped (\d+)", l))
