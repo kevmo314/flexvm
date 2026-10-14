@@ -28,7 +28,7 @@
 //! checkpoint of a running VM saves pages before the guest overwrites them
 //! (see `cow`).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::io::{self, IoSliceMut, Read, Write};
 use std::net::TcpStream;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -234,6 +234,10 @@ pub struct Pages {
     /// Pages faults wait on, and when a copy into them woke the faulting
     /// threads: what their latency counts to (`FaultStats`).
     parked: Mutex<Vec<(usize, Option<Instant>)>>,
+    /// REMOTE pages whose install failed and that are not in yet, with
+    /// since when: whoever claims them next inherits the deadline.
+    failing: Mutex<Vec<(usize, Instant)>>,
+    failing_len: AtomicUsize,
 }
 
 /// Pages per `touched` bit: one page of `states`.
@@ -261,6 +265,8 @@ impl Pages {
             read_cv: Condvar::new(),
             install_eagain: AtomicU64::new(0),
             parked: Mutex::new(Vec::new()),
+            failing: Mutex::new(Vec::new()),
+            failing_len: AtomicUsize::new(0),
         }
     }
 
@@ -455,7 +461,40 @@ impl Pages {
             })
             .unwrap();
         self.mark_dirty(page);
+        if old != INFLIGHT && old != DISCARDED {
+            self.forget_failure(page);
+        }
         old == REMOTE
+    }
+
+    /// Claimed REMOTE `page` failed to install: notes since when, unless
+    /// it already kept failing. Only while it is claimed, so never after it
+    /// was resolved.
+    fn note_failure(&self, page: usize) {
+        let mut failing = self.failing.lock().unwrap();
+        if !failing.iter().any(|(p, _)| *p == page) {
+            failing.push((page, Instant::now()));
+            self.failing_len.store(failing.len(), Ordering::SeqCst);
+        }
+    }
+
+    /// `page` is in (or gone): it no longer keeps failing.
+    fn forget_failure(&self, page: usize) {
+        if self.failing_len.load(Ordering::SeqCst) == 0 {
+            return;
+        }
+        let mut failing = self.failing.lock().unwrap();
+        failing.retain(|(p, _)| *p != page);
+        self.failing_len.store(failing.len(), Ordering::SeqCst);
+    }
+
+    /// Since when some page of `first..first + n` has kept failing to install.
+    pub fn failing_since(&self, first: usize, n: usize) -> Option<Instant> {
+        if self.failing_len.load(Ordering::SeqCst) == 0 {
+            return None;
+        }
+        let failing = self.failing.lock().unwrap();
+        failing.iter().filter(|(p, _)| (first..first + n).contains(p)).map(|(_, t)| *t).min()
     }
 
     /// Settles claimed `page`, claimed from state `from`.
@@ -473,6 +512,9 @@ impl Pages {
         if populated {
             // Installed writable: it may change without a fault from now on.
             self.mark_dirty(page);
+        }
+        if populated || old == DISCARDED {
+            self.forget_failure(page);
         }
         from == REMOTE && (populated || old == DISCARDED)
     }
@@ -527,7 +569,12 @@ impl Pages {
                     drop(installing);
                     self.wait_events_read(gen)
                 }
-                Err(e) => return (resolved + self.release(i, end - i, from), Err(e)),
+                Err(e) => {
+                    if from == REMOTE {
+                        self.note_failure(i);
+                    }
+                    return (resolved + self.release(i, end - i, from), Err(e));
+                }
             }
         }
         self.settled();
@@ -573,6 +620,9 @@ impl Pages {
                     failed = res.err();
                     done = ready;
                 }
+                // A failed install stops the fetch at once: what is still to
+                // come would only be given back.
+                failed.is_none()
             });
             if failed.is_some() {
                 break;
@@ -778,8 +828,6 @@ pub struct Pager {
     /// Test fault: from then on every copy of a fault-fetched run fails
     /// (ENOMEM), and the pullers wait.
     pub stuck_from: Mutex<Option<Instant>>,
-    /// Pages whose install failed, and since when they have kept failing.
-    install_failing: Mutex<HashMap<usize, Instant>>,
     /// Initial page states and their origin, applied when Firecracker
     /// connects (see `seed`).
     initial: Mutex<Option<(Runs, Origin)>>,
@@ -858,7 +906,6 @@ impl Pager {
             wp_race: AtomicBool::new(false),
             tail_fail: AtomicU32::new(0),
             stuck_from: Mutex::new(None),
-            install_failing: Mutex::new(HashMap::new()),
             initial: Mutex::new(initial),
             seeded: Condvar::new(),
             awaiting_seed: AtomicBool::new(false),
@@ -2195,6 +2242,11 @@ impl Pager {
                 }
             };
             self.fault_stats.record(QUEUED, queued.elapsed());
+            // Pages that have kept failing past the deadline, however they
+            // were queued again: give up now rather than after one more try.
+            if pages.failing_since(page, n).is_some_and(|t| t.elapsed() >= FAULT_TIMEOUT) {
+                return self.fail(format!("installing pages {page}+{n} for a fault kept failing for {FAULT_TIMEOUT:?}"));
+            }
             let started = Instant::now();
             // A link waits out a source outage itself (until it gives up,
             // which is fatal); other errors are retried for a while.
@@ -2210,7 +2262,7 @@ impl Pager {
             // run, a copy of its tail fails as if memory were short.
             let tail_fail = self.tail_fail.load(Ordering::SeqCst) > 0;
             let mut held = false;
-            let mut fetch = |off: u64, buf: &mut [u8], stop: &AtomicBool, progress: &mut dyn FnMut(&[u8])| {
+            let mut fetch = |off: u64, buf: &mut [u8], stop: &AtomicBool, progress: &mut dyn FnMut(&[u8]) -> bool| {
                 fetch(off, buf, stop, &mut |data: &[u8]| {
                     if tail_fail && !held && data.len() > PAGE_SIZE {
                         held = true;
@@ -2241,12 +2293,7 @@ impl Pager {
             self.fault_stats.record(FETCH, started.elapsed());
             self.pulled(resolved);
             match res {
-                Ok(()) => {
-                    let mut failing = self.install_failing.lock().unwrap();
-                    if !failing.is_empty() {
-                        (page..page + n).for_each(|p| _ = failing.remove(&p));
-                    }
-                }
+                Ok(()) => {}
                 // All discarded meanwhile, there was nothing left to fetch.
                 Err(Failed::Fetch(_)) if resolved == n || self.stop.load(Ordering::SeqCst) => {}
                 Err(Failed::Fetch(e)) => return self.fail(format!("fetching pages for a fault: {e}")),
@@ -2259,14 +2306,9 @@ impl Pager {
                 Err(Failed::Install(e)) => {
                     // Since when these pages have kept failing to install,
                     // whoever claimed them (this requeue, or a fault that
-                    // got to them first): kept per page, so that no claim
-                    // starts the deadline over.
-                    let since = {
-                        let mut failing = self.install_failing.lock().unwrap();
-                        let since = (page..page + n).filter_map(|p| failing.get(&p).copied()).min().unwrap_or_else(Instant::now);
-                        (page..page + n).for_each(|p| _ = failing.entry(p).or_insert(since));
-                        since
-                    };
+                    // got to them first): noted per page as it failed, so
+                    // that no claim starts the deadline over.
+                    let since = pages.failing_since(page, n).unwrap_or_else(Instant::now);
                     if since.elapsed() >= FAULT_TIMEOUT {
                         return self.fail(format!("installing pages for a fault: {e}"));
                     }
@@ -2392,7 +2434,7 @@ impl Link {
     /// as `PageClient::fetch` does (from the start again after a reconnect).
     /// Waiting to reconnect, it sleeps until `stop` is set. Fails with
     /// TimedOut once the outage is too long.
-    fn fetch(&mut self, offset: u64, buf: &mut [u8], stop: &AtomicBool, head: usize, progress: &mut dyn FnMut(&[u8])) -> io::Result<()> {
+    fn fetch(&mut self, offset: u64, buf: &mut [u8], stop: &AtomicBool, head: usize, progress: &mut dyn FnMut(&[u8]) -> bool) -> io::Result<()> {
         loop {
             if self.client.is_none() {
                 if stop.load(Ordering::SeqCst) {
@@ -2415,6 +2457,10 @@ impl Link {
                 }
                 Err(e) => {
                     self.client = None;
+                    // Stopped by the caller: the source is fine.
+                    if e.get_ref().is_some_and(|e| e.is::<Cancelled>()) {
+                        return Err(e);
+                    }
                     self.lost(e)?;
                 }
             }
@@ -2527,7 +2573,7 @@ impl PageClient {
     /// `buf`), the first `head` bytes are asked for on their own, ahead of
     /// the rest: the server reads and sends them without waiting to read
     /// the rest out of guest memory.
-    pub fn fetch(&mut self, offset: u64, buf: &mut [u8], head: usize, progress: &mut dyn FnMut(&[u8])) -> io::Result<()> {
+    pub fn fetch(&mut self, offset: u64, buf: &mut [u8], head: usize, progress: &mut dyn FnMut(&[u8]) -> bool) -> io::Result<()> {
         let parts = match head {
             h if h > 0 && h < buf.len() => vec![(0, h), (h, buf.len())],
             _ => vec![(0, buf.len())],
@@ -2554,7 +2600,9 @@ impl PageClient {
                     Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
                     Ok(n) => {
                         filled += n;
-                        progress(&buf[..filled]);
+                        if !progress(&buf[..filled]) {
+                            return Err(io::Error::other(Cancelled));
+                        }
                     }
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                     Err(e) => return Err(e),
@@ -2564,6 +2612,19 @@ impl PageClient {
         Ok(())
     }
 }
+
+/// A fetch its caller stopped part way (`progress` said so); what was left
+/// of the reply is unread, so the connection goes.
+#[derive(Debug)]
+struct Cancelled;
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("fetch cancelled")
+    }
+}
+
+impl std::error::Error for Cancelled {}
 
 /// Serves page reads for `pager` on an accepted page-server connection
 /// (already answered `ok`), until the client hangs up, sits idle for
@@ -2638,9 +2699,9 @@ pub fn remote_among(runs: &Runs, wanted: impl IntoIterator<Item = u64>) -> Vec<u
 /// Reads guest memory at an offset from wherever REMOTE pages come from,
 /// reporting what has arrived as it does (see `PageClient::fetch`; a file
 /// read reports nothing).
-type Fetch = dyn FnMut(u64, &mut [u8], &AtomicBool, &mut dyn FnMut(&[u8])) -> io::Result<()> + Send;
+type Fetch = dyn FnMut(u64, &mut [u8], &AtomicBool, &mut dyn FnMut(&[u8]) -> bool) -> io::Result<()> + Send;
 /// `Fetch`, borrowed and not necessarily `Send`.
-type FetchAny<'a> = dyn FnMut(u64, &mut [u8], &AtomicBool, &mut dyn FnMut(&[u8])) -> io::Result<()> + 'a;
+type FetchAny<'a> = dyn FnMut(u64, &mut [u8], &AtomicBool, &mut dyn FnMut(&[u8]) -> bool) -> io::Result<()> + 'a;
 /// A run of REMOTE pages a fault claimed, `(first, count)`, and when it
 /// was queued.
 type Job = (usize, usize, Instant);
@@ -2772,7 +2833,7 @@ mod tests {
                 }
                 let (fails, retries) = (rand(3), rand(2) == 0);
                 let (mut attempts, mut discarded) = (0, 0);
-                let mut fetch = |off: u64, buf: &mut [u8], _: &AtomicBool, progress: &mut dyn FnMut(&[u8])| -> io::Result<()> {
+                let mut fetch = |off: u64, buf: &mut [u8], _: &AtomicBool, progress: &mut dyn FnMut(&[u8]) -> bool| -> io::Result<()> {
                     attempts += 1;
                     let start = off as usize / PAGE_SIZE;
                     assert!(start >= first && start + buf.len() / PAGE_SIZE == first + n, "refetches what has yet to arrive");
@@ -2789,7 +2850,9 @@ mod tests {
                         if attempts <= fails && rand(4) == 0 {
                             return Err(os(libc::ECONNRESET));
                         }
-                        progress(&buf[..filled]);
+                        if !progress(&buf[..filled]) {
+                            return Err(io::Error::other(Cancelled));
+                        }
                     }
                     Ok(())
                 };
@@ -2818,8 +2881,80 @@ mod tests {
             let s = states(&p);
             assert!(s.iter().all(|&s| s != INFLIGHT && s != DISCARDED), "{s:?}");
             assert_eq!(resolved, 64 - s.iter().filter(|&&s| s == REMOTE).count());
+            // Failure history is kept only for pages still to come.
+            let failing = p.failing.lock().unwrap();
+            assert!(failing.iter().all(|&(pg, _)| s[pg] == REMOTE), "{failing:?} {s:?}");
+            assert_eq!(p.failing_len.load(Ordering::SeqCst), failing.len());
         }
         assert!(fetches > 5000);
+    }
+
+    /// A page that fails to install is remembered (with when it first
+    /// failed) until it goes in or is discarded, however it gets claimed
+    /// again; its neighbours that did go in are not.
+    #[test]
+    fn failure_history_follows_the_pages() {
+        let p = pages(&[REMOTE; 8]);
+        let enomem = |fail: usize| move |pg: usize, c: usize| if (pg..pg + c).contains(&fail) { if pg == fail { Err(os(libc::ENOMEM)) } else { Ok(fail - pg) } } else { Ok(c) };
+        p.claim(0, 4, REMOTE, |_| true);
+        assert!(p.install(0, 4, REMOTE, None, enomem(2)).1.is_err());
+        assert_eq!(states(&p)[..4], [PRESENT, PRESENT, REMOTE, REMOTE]);
+        let first = p.failing_since(0, 8).expect("page 2 noted");
+        assert_eq!(p.failing_since(0, 2), None, "pages that went in are not");
+        assert_eq!(p.failing_since(3, 1), None, "nor ones given back unattempted");
+        // Claimed again (by anyone) and failing again: the first time sticks.
+        thread::sleep(Duration::from_millis(5));
+        p.claim(2, 2, REMOTE, |_| true);
+        assert!(p.install(2, 2, REMOTE, None, enomem(2)).1.is_err());
+        assert_eq!(p.failing_since(2, 1), Some(first));
+        // In at last: forgotten.
+        p.claim(2, 2, REMOTE, |_| true);
+        assert!(p.install(2, 2, REMOTE, None, |_, c| Ok(c)).1.is_ok());
+        assert_eq!(p.failing_since(0, 8), None);
+        assert_eq!(p.failing_len.load(Ordering::SeqCst), 0);
+        // Discarded instead, while given back or while claimed: forgotten too.
+        for claimed in [false, true] {
+            let p = pages(&[REMOTE; 2]);
+            p.claim(0, 2, REMOTE, |_| true);
+            assert!(p.install(0, 2, REMOTE, None, enomem(0)).1.is_err());
+            assert!(p.failing_since(0, 1).is_some());
+            if claimed {
+                p.claim(0, 1, REMOTE, |_| true);
+            }
+            discard(&p, 0);
+            if claimed {
+                assert!(p.install(0, 1, REMOTE, None, |_, _| panic!("discarded")).1.is_ok());
+            }
+            assert_eq!(p.failing_since(0, 2), None, "claimed {claimed}");
+            assert_eq!(p.failing_len.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    /// A streamed install that fails stops the fetch at once.
+    #[test]
+    fn failed_install_cancels_the_fetch() {
+        let p = pages(&[REMOTE; 64]);
+        p.claim(0, 64, REMOTE, |_| true);
+        let mut delivered = 0;
+        let mut fetch = |_: u64, buf: &mut [u8], _: &AtomicBool, progress: &mut dyn FnMut(&[u8]) -> bool| -> io::Result<()> {
+            for k in 1..=buf.len() / PAGE_SIZE {
+                delivered = k;
+                if !progress(&buf[..k * PAGE_SIZE]) {
+                    return Err(io::Error::other(Cancelled));
+                }
+            }
+            Ok(())
+        };
+        let stop = AtomicBool::new(false);
+        let (resolved, res) = p.fetch_install(0, 64, &mut vec![0u8; 64 * PAGE_SIZE], &mut fetch, &stop, &mut |_| true, |pg, _, _| match pg {
+            0 => Ok(1),
+            _ => Err(os(libc::ENOMEM)),
+        });
+        assert!(matches!(res, Err(Failed::Install(_))));
+        assert_eq!(resolved, 1);
+        assert_eq!(delivered, 1 + STREAM_RUN, "stopped as soon as the second install failed");
+        assert!(states(&p)[1..].iter().all(|&s| s == REMOTE));
+        assert!(p.failing_since(1, 1).is_some());
     }
 
     /// Faults waiting on claimed pages are woken when they settle, whether
@@ -2915,6 +3050,7 @@ mod tests {
             if data.len() >= PAGE_SIZE && head_at.is_none() {
                 head_at = Some(start.elapsed());
             }
+            true
         })
         .unwrap();
         assert!(head_at.unwrap() < Duration::from_millis(40), "head reported before the rest arrived");

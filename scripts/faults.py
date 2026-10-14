@@ -1630,6 +1630,9 @@ def fetch_enomem_stuck():
     fault(B, "fetch_enomem_stuck", 0)
     check(f"stuck: target gave up ({took:.1f} s) and reports the vm failed", gave_up and "installing pages" in (st.get("failed") or ""),
           {k: st.get(k) for k in ("state", "failed", "released")})
+    # Copies fail from 0.5 s after the target took the VM on, and the fault
+    # deadline is 1 s: nothing (a stalled fetch, a requeue) may stretch it.
+    check("stuck: within the fault deadline (< 3 s)", gave_up and took < 3, f"{took:.1f} s")
     cleanup(n)
 
 
