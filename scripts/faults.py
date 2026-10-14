@@ -695,7 +695,7 @@ def guest_calls():
     target's own clock step goes through although its first guest
     connections drop."""
     n = "ft-guest-calls"
-    m = setup(n)
+    m = setup(n, mib=64)
     time.sleep(1)
     code, out = sh(A, n, "date -s @$(( $(date +%s) - 100 )) >/dev/null")
     assert code == 0, out
@@ -709,24 +709,31 @@ def guest_calls():
                 code, out = None, "hung"
             if code == 0 and out == "hi":
                 results["ok"] += 1
-            elif "moved to" in out or "no vm named" in out:
+            elif "moved to" in out:
                 results["moved"] += 1
             else:
                 results["failed"].append((h.addr, code, out[-200:]))
 
-    workers = [threading.Thread(target=worker, args=(h,)) for h in (A, B) for _ in range(3)]
+    workers = [threading.Thread(target=worker, args=(A,)) for _ in range(3)]
     for w in workers:
         w.start()
-    time.sleep(0.3)
-    fault(A, "pages", 3000)
-    fault(B, "guest_drop", 1000)
-    ok(migrate(A, n, B))
-    got = md5(B, n)
-    wait_released(B, n)
-    time.sleep(0.3)
-    stop.set()
-    for w in workers:
-        w.join()
+    try:
+        time.sleep(0.3)
+        fault(A, "pages", 3000)
+        fault(B, "guest_drop", 1000)
+        ok(migrate(A, n, B))
+        # B can accept execs only after the VM arrives there.
+        for _ in range(3):
+            w = threading.Thread(target=worker, args=(B,))
+            w.start()
+            workers.append(w)
+        got = md5(B, n)
+        wait_released(B, n)
+        time.sleep(0.3)
+    finally:
+        stop.set()
+        for w in workers:
+            w.join()
     check("guest calls: every exec finished", results["ok"] > 0 and not results["failed"], results)
     check("guest calls: md5 intact while paging in", got == m, got)
     check("guest calls: only on B", where(n) == {B: "running"}, where(n))
