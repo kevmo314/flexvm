@@ -23,7 +23,7 @@ mod vm;
 mod vmproc;
 
 use std::io::{BufReader, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -367,12 +367,13 @@ fn run(args: &Args, name: &str, template: &str) -> Result<()> {
     let cmd = (!args.rest.is_empty()).then(|| args.rest.join(" "));
     host::check_name(name)?;
     let req = json!({"op": "claim", "name": name, "ip": ip.map(|i| i.to_string()), "cmd": cmd});
-    // A claimed standby VM writes where this process would.
+    // A claimed standby VM writes where this process would, to opens made here (`own`).
     let log = args.has("detach").then(|| log_file(&host, name)).transpose()?;
-    let fds = log.as_ref().map_or([1, 2], |f| [f.as_raw_fd(); 2]);
+    let fds = log.as_ref().map_or([1, 2], |f| [f.as_raw_fd(); 2]).map(|fd| unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned());
+    let outs = fds.into_iter().map(|f| Ok(util::output::own(f?.into()))).collect::<std::io::Result<Vec<_>>>()?;
     // A detached run's VM process (it answers on FLEXVM_NOTIFY_FD): its parent tried them.
     let tried = std::env::var_os("FLEXVM_NOTIFY_FD").is_some();
-    match if tried { None } else { standby::take(&host, &paths, template, &req, &fds)? } {
+    match if tried { None } else { standby::take(&host, &paths, template, &req, &outs.iter().map(|f| f.as_raw_fd()).collect::<Vec<_>>())? } {
         Some((v, _)) if log.is_some() => print(v),
         Some((v, conn)) => {
             eprintln!("{v}");

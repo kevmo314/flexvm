@@ -345,8 +345,13 @@ pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]
     let mut line = serde_json::to_vec(req)?;
     line.push(b'\n');
     let name = req["name"].as_str().unwrap_or("");
+    // One budget for all (a stopped standby uses it up), and a moment past it for each live one, up to a few.
+    let budget = Instant::now() + HANDSHAKE_TIMEOUT;
     for sock in socks {
-        let at = Instant::now() + HANDSHAKE_TIMEOUT;
+        if Instant::now() >= budget + 4 * LATE {
+            break;
+        }
+        let at = budget.max(Instant::now() + LATE);
         let c = match crate::util::send_unix(&sock, &line, fds, at) {
             Ok(c) => c,
             // Refused: stale. (A full backlog is a stopped standby's.)
@@ -393,6 +398,7 @@ pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]
 }
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const LATE: Duration = Duration::from_millis(250);
 const CLAIM_TIMEOUT: Duration = Duration::from_secs(60);
 const SETTLE: Duration = Duration::from_millis(50);
 const LOAD_TIMEOUT: Duration = Duration::from_secs(30);
@@ -463,6 +469,35 @@ fn wait_for_reseed(vsock: &std::path::Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stopped_standbys_share_one_handshake_budget_and_a_live_one_after_them_wins() {
+        let root = std::env::temp_dir().join(format!("flexvm-standby-budget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        std::fs::create_dir_all(root.join("templates/default")).unwrap();
+        let paths = Paths::new(&root, None).unwrap();
+        let d = dir(&host, "default");
+        std::fs::create_dir_all(&d).unwrap();
+        let stopped: Vec<_> = (0..2).map(|n| UnixListener::bind(d.join(format!("default.{n}.sock"))).unwrap()).collect();
+        let live = UnixListener::bind(d.join("default.2.sock")).unwrap();
+        let live = std::thread::spawn(move || {
+            let (c, _) = live.accept().unwrap();
+            std::io::BufRead::read_line(&mut BufReader::new(&c), &mut String::new()).unwrap();
+            send_json(&mut &c, &json!({"claiming": true})).unwrap();
+            send_json(&mut &c, &json!({"ok": true, "result": "live"})).unwrap();
+        });
+        let start = Instant::now();
+        let (v, _) = take(&host, &paths, "default", &json!({"name": "test"}), &[]).unwrap().unwrap();
+        assert_eq!(v, json!("live"));
+        assert!(start.elapsed() < HANDSHAKE_TIMEOUT + 3 * LATE, "{:?}", start.elapsed());
+        live.join().unwrap();
+        // The stopped ones' late claims are refused.
+        for s in &stopped {
+            assert!(send_json(&mut s.accept().unwrap().0, &json!({"claiming": true})).is_err());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn recovery_finds_persistent_targets_and_respects_refill_lock_and_reserve() {

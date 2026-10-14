@@ -766,7 +766,7 @@ pub mod output {
             unsafe { libc::close(p[1]) };
             let orig = unsafe { File::from_raw_fd(orig) };
             LOGS.lock().unwrap()[i] = capped(&orig);
-            TARGETS.lock().unwrap()[i] = own(orig).map(Arc::new);
+            TARGETS.lock().unwrap()[i] = Some(Arc::new(own(orig)));
             let mut from = unsafe { File::from_raw_fd(p[0]) };
             RELAYS.lock().unwrap().push(std::thread::spawn(move || {
                 let mut buf = [0u8; 8192];
@@ -798,10 +798,12 @@ pub mod output {
                 targets[i] = log();
                 LOGS.lock().unwrap()[i] = targets[i].as_ref().and_then(|f| capped(f));
             }
-            targets[i].clone()
+            (targets[i].clone(), LOGS.lock().unwrap()[i].clone())
         };
-        if let Some(mut f) = fallback.as_deref() {
-            let _ = f.write_all(&data[sent..]);
+        if let Some(log) = fallback.1 {
+            append_capped(&log, &data[sent..], LOG_CAP);
+        } else if let Some(f) = fallback.0.as_deref() {
+            write_within(f, &data[sent..], Instant::now() + STALL);
         }
     }
 
@@ -831,16 +833,16 @@ pub mod output {
         sent
     }
 
-    /// A target's own open file, non-blocking (flags set on `f` would change
-    /// every process's sharing it); a regular file or socket is kept as is.
-    /// None (output goes to the log) if it cannot be had.
-    fn own(f: File) -> Option<File> {
+    /// A target's own open file, non-blocking (flags set on `f` would change every process's
+    /// sharing it); a regular file, a socket or one that cannot be reopened (a /dev/tty away
+    /// from its terminal: a claimer passes its own) is kept as is.
+    pub fn own(f: File) -> File {
         use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
         if f.metadata().is_ok_and(|m| m.is_file() || m.file_type().is_socket()) {
-            return Some(f);
+            return f;
         }
         let path = format!("/proc/self/fd/{}", f.as_raw_fd());
-        File::options().write(true).custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY).open(path).ok()
+        File::options().write(true).custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY).open(path).unwrap_or(f)
     }
 
     /// Where output goes once the terminal is gone.
@@ -855,7 +857,7 @@ pub mod output {
             if let Ok(dup) = super::eintr(|| unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) }) {
                 let f = unsafe { File::from_raw_fd(dup) };
                 LOGS.lock().unwrap()[i] = capped(&f);
-                targets[i] = own(f).map(Arc::new);
+                targets[i] = Some(Arc::new(own(f)));
             }
         }
     }
@@ -953,11 +955,40 @@ pub mod output {
         let mut p = [0; 2];
         assert_eq!(unsafe { libc::pipe2(p.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
         let (_r, w) = unsafe { (File::from_raw_fd(p[0]), File::from_raw_fd(p[1])) };
-        let t = own(w.try_clone().unwrap()).unwrap();
+        let t = own(w.try_clone().unwrap());
         while (&t).write(&[0; 4096]).is_ok() {}
         let start = Instant::now();
         assert_eq!(write_within(&t, &[0; 100], start + Duration::from_millis(200)), 0);
         assert!(start.elapsed() < Duration::from_millis(600));
         assert_eq!(unsafe { libc::fcntl(w.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK, 0);
+    }
+
+    #[test]
+    fn a_retargeted_full_pipe_keeps_the_fallback_output() {
+        let full = || {
+            let mut p = [0; 2];
+            assert_eq!(unsafe { libc::pipe2(p.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+            let (r, w) = unsafe { (File::from_raw_fd(p[0]), File::from_raw_fd(p[1])) };
+            let w = own(w);
+            let mut filled = 0;
+            while let Ok(n) = (&w).write(&[0; 4096]) {
+                filled += n;
+            }
+            (r, Arc::new(w), filled)
+        };
+        let (_old, target, _) = full();
+        let (mut next, fallback, filled) = full();
+        TARGETS.lock().unwrap()[0] = Some(target);
+        let relay = std::thread::spawn(|| relay(0, b"kept"));
+        std::thread::sleep(Duration::from_millis(100));
+        TARGETS.lock().unwrap()[0] = Some(fallback);
+        std::thread::sleep(STALL);
+        next.read_exact(&mut vec![0; filled]).unwrap();
+        relay.join().unwrap();
+        assert!(super::readable(&next, Duration::from_millis(100)).unwrap());
+        let mut data = [0; 4];
+        next.read_exact(&mut data).unwrap();
+        assert_eq!(&data, b"kept");
+        TARGETS.lock().unwrap()[0] = None;
     }
 }
