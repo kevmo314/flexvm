@@ -465,9 +465,9 @@ mod tests {
     }
 
     fn accept(listener: &UnixListener) -> BufReader<UnixStream> {
-        let s = retry(Duration::from_secs(2), || Ok(listener.accept()?.0)).unwrap();
-        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        s.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+        let s = retry(PATIENCE, || Ok(listener.accept()?.0)).unwrap();
+        s.set_read_timeout(Some(PATIENCE)).unwrap();
+        s.set_write_timeout(Some(PATIENCE)).unwrap();
         BufReader::new(s)
     }
 
@@ -501,8 +501,12 @@ mod tests {
 
     const NO_CONTENT: &[u8] = b"HTTP/1.1 204 No Content\r\n\r\n";
 
+    /// How long a test side waits on the other: a bound for a hung test, never what one checks. A loaded host
+    /// stalls a test process for seconds (#136), which a tighter call deadline took for a failed call.
+    const PATIENCE: Duration = Duration::from_secs(30);
+
     fn call(api: &Api, socket: &Path) -> Result<Value> {
-        api.request(socket, "PATCH", "/vm", Some(serde_json::json!({"state": "Resumed"})), Duration::from_secs(1))
+        api.request(socket, "PATCH", "/vm", Some(serde_json::json!({"state": "Resumed"})), PATIENCE)
     }
 
     #[test]
@@ -529,7 +533,7 @@ mod tests {
         });
         let api = Api::default();
         assert_eq!(call(&api, &server.path).unwrap(), Value::Null);
-        wait.recv_timeout(Duration::from_secs(2)).unwrap();
+        wait.recv_timeout(PATIENCE).unwrap();
         assert_eq!(call(&api, &server.path).unwrap(), Value::Null);
     }
 
@@ -564,7 +568,7 @@ mod tests {
         });
         let api = Api::default();
         call(&api, &server.path).unwrap();
-        wait.recv_timeout(Duration::from_secs(2)).unwrap();
+        wait.recv_timeout(PATIENCE).unwrap();
         assert_eq!(call(&api, &server.path).unwrap(), serde_json::json!(3));
     }
 
