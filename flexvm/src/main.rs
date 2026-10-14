@@ -102,13 +102,13 @@ impl Args {
                         a.child_args.push(value.clone());
                         value
                     } else {
-                        bail!("unknown option --{f}");
+                        bail!("unknown option --{f} (see flexvm --help)");
                     };
                     a.flags.push((f.into(), value));
                 }
                 None if arg == "-d" => a.flags.push(("detach".into(), "1".into())),
                 None if arg == "-h" => a.flags.push(("help".into(), "1".into())),
-                None if arg.starts_with('-') => bail!("unknown option {arg}"),
+                None if arg.starts_with('-') => bail!("unknown option {arg} (see flexvm --help)"),
                 None => {
                     a.positional.push(arg);
                     if a.positional.len() == 2 && a.positional[0] == "exec" {
@@ -595,7 +595,7 @@ mod exec_tests {
     fn unknown_options_and_missing_values_are_errors() {
         for option in ["--typo", "-x", "--detach=yes", "--keep-running"] {
             let error = Args::parse(["run", option, "web"].map(String::from)).err().unwrap();
-            assert_eq!(error.to_string(), format!("unknown option {option}"));
+            assert_eq!(error.to_string(), format!("unknown option {option} (see flexvm --help)"));
         }
         let error = Args::parse(["run", "web", "--ip"].map(String::from)).err().unwrap();
         assert_eq!(error.to_string(), "--ip needs a value");
