@@ -2862,8 +2862,8 @@ def evict_grower():
     check("evict grower: moved under the high-water mark, above the reserve", moved is not None and reserve < moved[1] < high + 200, moved)
     check("evict grower: the host never got to its reserve", min(a for _, a in w.avail) > reserve, min(a for _, a in w.avail))
     check("evict grower: every controller ticked within 2.5 s", all(r["tick_gap_max_ms"] < 2500 for r in rep.values()), rep)
-    check("evict grower: memory requests answered within 0.5 s",
-          all(r["asks"] > 0 and r["ask_max_ms"] < 500 and not any(x.startswith("error") for x in r["replies"]) for r in rep.values()), rep)
+    check("evict grower: memory requests answered within the guest's 2 s",
+          all(r["asks"] > 0 and r["ask_max_ms"] < 2000 and not any(x.startswith("error") for x in r["replies"]) for r in rep.values()), rep)
     check("evict grower: md5s intact", md5(B, g) == sums[g] and all(md5(A, n) == sums[n] for n in big))
     for n in big + [g]:
         cleanup(n)
@@ -2889,8 +2889,8 @@ def evict_latency():
     rep = w.report("evict latency: during the eviction")
     check("evict latency: moved to B", moved, (where(n), log(A, n)[-1500:]))
     check("evict latency: every controller ticked within 2.5 s", all(r["tick_gap_max_ms"] < 2500 for r in rep.values()), rep)
-    check("evict latency: memory requests answered within 0.5 s",
-          all(r["asks"] > 0 and r["ask_max_ms"] < 500 and not any(x.startswith("error") for x in r["replies"]) for r in rep.values()), rep)
+    check("evict latency: memory requests answered within the guest's 2 s",
+          all(r["asks"] > 0 and r["ask_max_ms"] < 2000 and not any(x.startswith("error") for x in r["replies"]) for r in rep.values()), rep)
     check("evict latency: md5s intact", md5(B, n) == sums[n] and all(md5(A, o) == sums[o] for o in others))
     for v in [n] + others:
         cleanup(v)
