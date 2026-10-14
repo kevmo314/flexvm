@@ -2610,8 +2610,10 @@ def throttle(label, host, n, reserve=512):
     more: it stays at its mark (memory.high), the host above its reserve, and
     nothing is killed. Returns how much the guest is filling (MiB)."""
     v = vms(host)[n]
-    used, high, _ = cgroup(host, n)
     admitted = v["admitted_mib"]
+    if not admitted:
+        raise Skip("no per-VM cgroups here")
+    used, high, _ = cgroup(host, n)
     fill = v["guest_mib"] - 384
     check(f"{label}: a mark at the admitted size, below the guest's", high is not None and admitted < high < v["guest_mib"], (admitted, high, v["guest_mib"]))
     check(f"{label}: the fill is far beyond it", fill >= 2 * high, (fill, high))
@@ -2631,6 +2633,21 @@ def throttle(label, host, n, reserve=512):
     check(f"{label}: throttled and starved, so the host would move it",
           wait_for(lambda: vms(host)[n].get("starved") and vms(host)[n].get("throttled"), 5), vms(host)[n])
     return fill
+
+
+class Skip(Exception):
+    pass
+
+
+def skippable(scenario):
+    """A scenario that may find this host lacks what it tests: it then passes, saying why."""
+    def run_it():
+        try:
+            scenario()
+        except Skip as e:
+            print(f"{scenario.__name__}: skipped, {e}", flush=True)
+    run_it.__doc__ = scenario.__doc__
+    return run_it
 
 
 def mem_high():
@@ -2677,6 +2694,8 @@ def mem_high_evict():
     n = "ft-mem-high-evict"
     m = setup(n, mib=1)
     v = vms(A)[n]
+    if not v["admitted_mib"]:
+        raise Skip("no per-VM cgroups here")
     fault(A, "no_admit", 600000)
     hog(A, n, v["guest_mib"] - 384)
     check("mem high evict: moved to B", wait_for(lambda: where(n) == {B: "running"}, 60), (where(n), log(A, n)[-2000:]))
@@ -3503,7 +3522,8 @@ SCENARIOS = dict(
     arrival_overtaken=arrival_overtaken,
     pull_died=pull_died,
     uffd_err=uffd_err,
-    mem_high=no_evict(mem_high), mem_high_migrate=no_evict(mem_high_migrate), mem_high_evict=mem_high_evict,
+    mem_high=no_evict(skippable(mem_high)), mem_high_migrate=no_evict(skippable(mem_high_migrate)),
+    mem_high_evict=skippable(mem_high_evict),
     cow_grow=no_evict(cow_grow), plug_race=no_evict(plug_race), shrink_stall=no_evict(shrink_stall), plug_storm=no_evict(plug_storm),
     basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, refused=refused, pages_blip=pages_blip,
     pages_dead_restore=pages_dead_restore, pages_dead=pages_dead, resume_kill=resume_kill, prepared_retry=prepared_retry,
