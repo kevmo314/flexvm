@@ -141,6 +141,7 @@ impl Proc {
     }
 
     pub fn set_vm(&self, vm: Arc<Vm>) {
+        vm.start_limit();
         let _ = self.vm.set(vm);
     }
 
@@ -293,7 +294,7 @@ impl Proc {
             max_mib: vm.template.meta.max_mib,
             state: vm.state().name().into(),
             firecracker: vm.pid(),
-            starved: vm.starved.load(Ordering::SeqCst),
+            starved: vm.starving(),
         };
         if let Err(e) = self.name.lock().unwrap().as_ref().map_or(Ok(()), |l| l.publish(&e)) {
             eprintln!("vm {n}: registry: {e}");
@@ -519,6 +520,7 @@ impl Proc {
         };
         spawn(Proc::controller);
         spawn(Proc::serve_memory);
+        spawn(Proc::watch_memory);
         if self.vm().template.meta.image.is_some() {
             spawn(Proc::follow_app);
         }
@@ -674,6 +676,7 @@ impl Proc {
                 }
                 *vm.last_resize.lock().unwrap() = Instant::now();
                 let mib = req["mib"].as_u64().ok_or("missing mib")?.min(vm.template.meta.max_mib - vm.template.meta.mem_mib);
+                vm.limit.plug(vm.template.meta.mem_mib + mib, 0);
                 vm.fc(|fc| fc.patch("/hotplug/memory", json!({"requested_size_mib": mib})))?;
                 Ok(json!(mib))
             }
@@ -710,6 +713,7 @@ impl Proc {
     }
 
     fn controller(self: Arc<Self>) {
+        let mut published = false;
         loop {
             thread::sleep(Duration::from_secs(1));
             let vm = self.vm();
@@ -724,14 +728,15 @@ impl Proc {
                     }
                 }
             }
-            let starved = vm.starved.load(Ordering::SeqCst);
             if let Err(e) = self.resize(None) {
                 eprintln!("vm {}: resize: {e}", vm.name);
             }
-            if starved != vm.starved.load(Ordering::SeqCst) {
+            // Throttling (`watch_memory`) changes it between ticks too.
+            if published != vm.starving() {
+                published = !published;
                 self.publish();
             }
-            relieve(&self.host, vm.starved.load(Ordering::SeqCst));
+            relieve(&self.host, vm.starving());
         }
     }
 
@@ -746,6 +751,11 @@ impl Proc {
             true => resize(vm, &self.host, hint, true),
             false => Ok(Resized::Busy),
         }
+    }
+
+    fn watch_memory(self: Arc<Self>) {
+        let vm = self.vm().clone();
+        vm.limit.watch(&self.host, Duration::from_secs(1), || vm.pid().is_some());
     }
 
     /// The guest is untrusted: requests are bounded in size and time and
@@ -1010,8 +1020,13 @@ fn resize(vm: &Vm, host: &Host, hint: Option<u64>, grow_only: bool) -> Result<Re
     if new != requested {
         let why = if plan.settle { "stalled" } else if hint.is_some() { "guest asked" } else { "tick" };
         eprintln!("vm {}: available {avail} MiB, hotplug {requested} (plugged {plugged}) -> {new} MiB ({why})", vm.name);
+        if new > requested {
+            vm.limit.plug(meta.mem_mib + new, plan.charge);
+        }
         vm.fc(|fc| fc.patch("/hotplug/memory", json!({"requested_size_mib": new})))?;
         *last = Instant::now();
+    } else if requested == plugged {
+        vm.limit.settled(meta.mem_mib + plugged);
     }
     Ok(if new > plugged {
         Resized::Grew

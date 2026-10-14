@@ -152,6 +152,22 @@ parsed is an error, never a free address.
 under the host lock against MemAvailable minus the reserve and the grants of
 the last 10 s (`RUN/grants`); standby refills stop under it.
 
+**Memory marks** (`limit.rs`): each VM's Firecracker cgroup has a
+`memory.high` at the memory admitted for it plus Firecracker's overhead
+(64 MiB + 1/64). It starts at what the VM holds or still pages in (an
+arrival's or restore's remote pages too) plus a step, and is raised a step
+(a quarter, 256 MiB to 2 GiB) when the cgroup's usage comes within half a
+step of it (its `high` events, or each second), each step admitted first;
+never past the guest's size, raised before a grow's PATCH by what the grow
+was charged, lowered only once a shrink settles and never below what is in
+use. Refused, the VM is throttled at its mark (the kernel slows its vCPUs;
+`memory.high`, never `memory.max`: nothing is OOM-killed) and counts as
+starved, so eviction moves it. The pager's installs are charged to the
+cgroup but throttled by the VM process's own, so pulls and checkpoint copies
+never wait on the mark; a migration or checkpoint lifts it while it pauses
+the VM, first waiting out vCPUs already asleep in throttling (up to 2 s), so
+the pause is not held up.
+
 ## Migration, runner to runner
 
 Over one TCP connection, as before (prepare, header + vmstate + preload,

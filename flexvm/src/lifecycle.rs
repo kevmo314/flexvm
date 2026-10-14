@@ -441,6 +441,7 @@ impl Proc {
             }
         }
         t.mark("drain");
+        let _lifted = vm.limit.lift(vm.pid());
         // Paused vCPUs do not stop virtio-mem discarding memory after the save.
         vm.settle_hotplug(Instant::now() + SETTLE_WAIT)?;
         t.mark("settle_hotplug");

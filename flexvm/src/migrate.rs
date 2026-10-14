@@ -60,6 +60,8 @@ impl Proc {
         self.settle_arrival(&op, ARRIVAL_WAIT)?;
         vm.template.verify(&self.paths, true)?;
         let settle = Instant::now();
+        // Waits out throttling (counted in settle_hotplug_ms).
+        let _lifted = vm.limit.lift(vm.pid());
         vm.settle_hotplug(settle + crate::lifecycle::SETTLE_WAIT)?;
         let settle = settle.elapsed();
         let (mig, gen, prep) = (migration_id(), self.gen(), Instant::now());

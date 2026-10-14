@@ -452,7 +452,11 @@ impl Host {
 
     /// MemAvailable lags a grant until the guest touches the memory, so all
     /// processes' grants of the last `GRANT_WINDOW` count as used.
+    /// Test fault `no_admit`: refuses everything.
     pub fn admit(&self, mib: u64) -> bool {
+        if fault("no_admit") {
+            return false;
+        }
         let Ok(_l) = self.lock() else { return false };
         let path = self.run.join("grants");
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;

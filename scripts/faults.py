@@ -149,7 +149,8 @@ def vms(host):
                 d = st["result"]
                 v.update(tap=d["describe"]["tap"], pages_mib=d["describe"]["pages_mib"], regions=d["describe"]["regions"],
                          plugged_mib=d["describe"]["plugged_mib"], requested_mib=d["describe"]["requested_mib"],
-                         guest_mib=d["describe"]["guest_mib"],
+                         guest_mib=d["describe"]["guest_mib"], admitted_mib=d["describe"]["admitted_mib"],
+                         throttled=d["describe"]["throttled"],
                          checkpoint_copy=d["describe"]["checkpoint_copy"], checkpoint_copy_stats=d["checkpoint_copy_stats"],
                          background_pull_ms=d["background_pull_ms"], failed=d["failed"], guest_retries=d["guest_retries"])
     return out
@@ -208,7 +209,7 @@ FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_be
           "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "resume_kill",
           "prepare_fail", "short_incoming", "slow_preload", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
           "started_fsync", "started_unmark", "start_stall", "incoming_stall", "claim_stall", "handoff_stall", "ckpt_wp_race",
-          "fetch_tail_enomem", "fetch_enomem_stuck", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup")
+          "fetch_tail_enomem", "fetch_enomem_stuck", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit")
 
 
 def disarm():
@@ -2581,6 +2582,111 @@ def plug_storm():
     cleanup(n)
 
 
+def cgroup(host, name):
+    """`name`'s Firecracker cgroup on `host`: (memory.current MiB, memory.high MiB or None, memory.events)."""
+    path = "/sys/fs/cgroup" + open(f"/proc/{fc_pid(host, name)}/cgroup").read().strip().split(":", 2)[2]
+    high = open(os.path.join(path, "memory.high")).read().strip()
+    events = dict(l.split() for l in open(os.path.join(path, "memory.events")).read().splitlines())
+    return int(open(os.path.join(path, "memory.current")).read()) >> 20, None if high == "max" else int(high) >> 20, events
+
+
+def mem_available():
+    return next(int(l.split()[1]) >> 10 for l in open("/proc/meminfo") if l.startswith("MemAvailable:"))
+
+
+def hog(host, name, mib):
+    """Starts a guest program filling `mib` MiB; it touches /tmp/hog.done once it has."""
+    code, out = sh(host, name, f"rm -f /tmp/hog.done; setsid python3 -c 'b=bytearray({mib}<<20); open(\"/tmp/hog.done\", \"w\").close(); "
+                               "import time; time.sleep(3600)' >/dev/null 2>&1 </dev/null & echo started")
+    assert code == 0, out
+
+
+def hog_done(host, name):
+    return sh(host, name, "test -e /tmp/hog.done")[0] == 0
+
+
+def throttle(label, host, n, reserve=512):
+    """Fills a VM far beyond what its host admitted while the host refuses it
+    more: it stays at its mark (memory.high), the host above its reserve, and
+    nothing is killed. Returns how much the guest is filling (MiB)."""
+    v = vms(host)[n]
+    used, high, _ = cgroup(host, n)
+    admitted = v["admitted_mib"]
+    fill = v["guest_mib"] - 384
+    check(f"{label}: a mark at the admitted size, below the guest's", high is not None and admitted < high < v["guest_mib"], (admitted, high, v["guest_mib"]))
+    check(f"{label}: the fill is far beyond it", fill >= 2 * high, (fill, high))
+    fault(host, "no_admit", 600000)
+    hog(host, n, fill)
+    peak, low_avail, seen = 0, mem_available(), []
+    for _ in range(40):
+        time.sleep(0.25)
+        used, high_now, events = cgroup(host, n)
+        peak, low_avail = max(peak, used), min(low_avail, mem_available())
+        seen.append(used)
+    check(f"{label}: throttled at its mark", high_now == high and peak <= high * 1.15 + 32 and events.get("high", "0") != "0",
+          (high, peak, seen[::8], events))
+    check(f"{label}: the fill did not finish", not hog_done(host, n))
+    check(f"{label}: host stays above its reserve", low_avail > reserve, low_avail)
+    check(f"{label}: nothing OOM-killed", events.get("oom_kill") == "0" and alive(fc_pid(host, n)) and alive(vm_pid(host, n)), events)
+    check(f"{label}: throttled and starved, so the host would move it",
+          wait_for(lambda: vms(host)[n].get("starved") and vms(host)[n].get("throttled"), 5), vms(host)[n])
+    return fill
+
+
+def mem_high():
+    """A guest filling far beyond its admitted memory while the host refuses
+    to admit more is throttled at its mark rather than eating the host's
+    reserve, and nothing is killed; admitted again, it grows to what it needs."""
+    n = "ft-mem-high"
+    m = setup(n, mib=1)
+    t = time.time()
+    fill = throttle("mem high", A, n)
+    fault(A, "no_admit", 0)
+    done = wait_for(lambda: hog_done(A, n), 240)
+    v = vms(A)[n]
+    check("mem high: admitted again, the fill finishes", done, (time.time() - t, v.get("admitted_mib"), cgroup(A, n)))
+    check("mem high: its mark grew with it", v["admitted_mib"] >= fill and cgroup(A, n)[1] >= fill, (fill, v["admitted_mib"], cgroup(A, n)))
+    check("mem high: no longer throttled", wait_for(lambda: not vms(A)[n].get("throttled"), 5), vms(A)[n])
+    check("mem high: md5 intact", md5(A, n) == m)
+    cleanup(n)
+
+
+def mem_high_migrate():
+    """A VM throttled at its mark migrates without a stall: its pause is not
+    held up by throttled vCPUs, the target pulls all its memory, and there
+    (admitted for all of it) it fills what it was refused."""
+    n = "ft-mem-high-mig"
+    m = setup(n, mib=1)
+    throttle("mem high migrate", A, n)
+    used = cgroup(A, n)[0]
+    r = ok(migrate(A, n, B))
+    print(f"mem high migrate: {used} MiB; settle (throttle wait) {r['settle_hotplug_ms']} ms, pause {r['timings_ms']['pause']} ms, "
+          f"downtime {r['downtime_ms']} ms", flush=True)
+    check("mem high migrate: the pause is not held up", r["timings_ms"]["pause"] < 50 and r["downtime_ms"] < 1000, r["timings_ms"])
+    st = wait_released(B, n, timeout=60)
+    check("mem high migrate: pulled and released", st["released"] is True and st["failed"] is None and st["background_pull_ms"] < 20000, st)
+    check("mem high migrate: the target's mark covers what it pulled", vms(B)[n]["admitted_mib"] >= used, (used, vms(B)[n]["admitted_mib"]))
+    check("mem high migrate: the fill finishes there", wait_for(lambda: hog_done(B, n), 240), cgroup(B, n))
+    check("mem high migrate: md5 intact, one copy", md5(B, n) == m and where(n) == {B: "running"}, where(n))
+    cleanup(n)
+
+
+def mem_high_evict():
+    """A VM its host refuses more memory, throttled at its mark, is moved to
+    a peer with room by itself, and grows there."""
+    n = "ft-mem-high-evict"
+    m = setup(n, mib=1)
+    v = vms(A)[n]
+    fault(A, "no_admit", 600000)
+    hog(A, n, v["guest_mib"] - 384)
+    check("mem high evict: moved to B", wait_for(lambda: where(n) == {B: "running"}, 60), (where(n), log(A, n)[-2000:]))
+    st = wait_released(B, n, timeout=60)
+    check("mem high evict: pulled and released", st["released"] is True and st["failed"] is None, st)
+    check("mem high evict: the fill finishes there", wait_for(lambda: hog_done(B, n), 240), cgroup(B, n))
+    check("mem high evict: md5 intact", md5(B, n) == m)
+    cleanup(n)
+
+
 def kill_source():
     """A migration's paused source copy cannot be killed (the target still
     pulls from it and releases it); the VM lives on at the target."""
@@ -3397,6 +3503,7 @@ SCENARIOS = dict(
     arrival_overtaken=arrival_overtaken,
     pull_died=pull_died,
     uffd_err=uffd_err,
+    mem_high=no_evict(mem_high), mem_high_migrate=no_evict(mem_high_migrate), mem_high_evict=mem_high_evict,
     cow_grow=no_evict(cow_grow), plug_race=no_evict(plug_race), shrink_stall=no_evict(shrink_stall), plug_storm=no_evict(plug_storm),
     basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, refused=refused, pages_blip=pages_blip,
     pages_dead_restore=pages_dead_restore, pages_dead=pages_dead, resume_kill=resume_kill, prepared_retry=prepared_retry,
