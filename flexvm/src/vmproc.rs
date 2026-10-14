@@ -212,10 +212,11 @@ impl Proc {
     }
 
     /// Every page is here and the VM can still run (a stopped pager, as when
-    /// its Firecracker died, ends a wait for the pull without a failure).
+    /// its Firecracker died, ends a wait for the pull without a failure). A VM
+    /// whose resume failed cannot, though its Firecracker may not be gone yet.
     pub fn pulled_all(&self) -> bool {
         let vm = self.vm();
-        vm.pager.remote_left() == 0 && vm.pager.failed().is_none() && vm.firecracker_alive()
+        vm.pager.remote_left() == 0 && vm.pager.failed().is_none() && vm.state() != State::Failed && vm.firecracker_alive()
     }
 
     pub fn keep_addr(&self) {
