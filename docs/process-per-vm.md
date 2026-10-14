@@ -365,7 +365,16 @@ where it is kept and what tests it.
    new generation; every VM start rechecks its generation under the host
    lock until it runs. Faults `abort_superseded`, `gen_zero`, `forged_peer`,
    `suspend_gen`, `late_withdrawal`, `checkpoint_restore`, `restore_ip_peer`.
-12. **`scripts/faults.py`** is ported to VM processes and listeners (see
+12. **An arrival settles once, before anything else changes owners.** Until
+   every page is in and its record is durably `released` (then a home host
+   takes its loan back), the arrival is unsettled. Settling happens in one
+   place (`Proc::settle_arrival`), under `op`, so it never races the VM's
+   end. Every operation that changes who owns the VM (suspend, migrating
+   on, `checkpoint --stop`) settles first, waiting a bounded time, and is
+   refused as "still arriving" otherwise; later operations see a settled VM.
+   A migration's rollback removes only a loan that migration made. Faults
+   `arrival_overtaken`, `pull_died`, `target_killed`.
+13. **`scripts/faults.py`** is ported to VM processes and listeners (see
    Test plan).
 
 ## Test plan

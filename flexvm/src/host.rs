@@ -319,13 +319,12 @@ impl Host {
         self.update(l, ip, false, |a| a.holder = a.holder.take().filter(|h| h != holder))
     }
 
-    pub fn lend(&self, l: &Locked, ip: Ipv4Addr, gen: u64) -> Result<()> {
+    /// True if this made the loan (only then may its maker undo it).
+    pub fn lend(&self, l: &Locked, ip: Ipv4Addr, gen: u64) -> Result<bool> {
         if !self.cfg.range()?.contains(ip) {
-            return Ok(());
+            return Ok(false);
         }
-        let mut a = self.addr(l, ip)?;
-        a.lent = Some(gen);
-        self.put_addr(ip, &a, true)
+        self.update(l, ip, true, |a| a.lent.replace(gen) != Some(gen))
     }
 
     pub fn unlend(&self, l: &Locked, ip: Ipv4Addr, gen: u64) -> Result<()> {
@@ -953,7 +952,8 @@ mod tests {
         assert_eq!(h.mig_status(3).unwrap(), "committed", "only a released one is forgotten");
         // A VM back home: its loan stays through the commit, and goes with the release.
         let (home, lent) = (ip("10.9.0.3"), |h: &Host| h.addr(&h.lock().unwrap(), ip("10.9.0.3")).unwrap().lent);
-        h.lend(&h.lock().unwrap(), home, 9).unwrap();
+        assert!(h.lend(&h.lock().unwrap(), home, 9).unwrap(), "made the loan");
+        assert!(!h.lend(&h.lock().unwrap(), home, 9).unwrap(), "a loan it did not make is not its to undo");
         assert_eq!(lent(&h), Some(9));
         r.release(Some((home, 9)));
         assert!(h.mig_status(3).unwrap() == "released" && lent(&h).is_none());

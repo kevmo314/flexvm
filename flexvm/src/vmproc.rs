@@ -72,6 +72,8 @@ pub struct Proc {
     pub app_log: AtomicU64,
     /// Set while a migration away may commit: exit when the VM leaves.
     leaving: AtomicBool,
+    /// This VM's migration away lent its address here (and only then may undo it).
+    pub lent_here: AtomicBool,
     pub standby: Mutex<Option<crate::vm::Prepared>>,
     pub claimer: Mutex<Option<UnixStream>>,
     pub cmd: Mutex<Option<String>>,
@@ -114,6 +116,7 @@ impl Proc {
             held_in: Mutex::new(None),
             app_log: AtomicU64::new(0),
             leaving: AtomicBool::new(false),
+            lent_here: AtomicBool::new(false),
             standby: Mutex::new(None),
             claimer: Mutex::new(None),
             cmd: Mutex::new(None),
@@ -172,6 +175,29 @@ impl Proc {
             };
         }
         bail!("cannot borrow {ip} from its home host ({}); restore with --ip auto", why.join("; "))
+    }
+
+    /// The one place an arrival settles, under `op`: once every page is here
+    /// its record is released durably, then a home loan taken back. Every
+    /// operation that changes who owns the VM (suspend, migrating on,
+    /// checkpoint --stop) settles first, waiting up to `wait`, and is refused
+    /// while the VM is still arriving.
+    pub fn settle_arrival(&self, _op: &Op, wait: Duration) -> Result<()> {
+        if self.arrived.lock().unwrap().is_none() {
+            return Ok(());
+        }
+        let vm = self.vm();
+        // A stopped pager (its Firecracker died) ends the wait without a failure.
+        let pulled = vm.pager.wait_pulled(Some(wait));
+        if !pulled || vm.pager.remote_left() > 0 || vm.pager.failed().is_some() || !vm.firecracker_alive() {
+            bail!("vm {} is still arriving: not all its memory is here yet", vm.name);
+        }
+        let mut arrived = self.arrived.lock().unwrap();
+        if let Some(rec) = arrived.as_ref() {
+            rec.release(Some((vm.ip, self.gen())));
+        }
+        *arrived = None;
+        Ok(())
     }
 
     pub fn keep_addr(&self) {
@@ -503,6 +529,9 @@ impl Proc {
             "pages" => return self.pages(&req, fds),
             "checkpoint" => self.op_within().and_then(|op| {
                 let stop = req["stop"] == true;
+                if stop {
+                    self.settle_arrival(&op, crate::lifecycle::DRAIN_WAIT)?;
+                }
                 let v = self.checkpoint(&op, req["dir"].as_str().unwrap_or(""), stop, req["incremental"] == true)?;
                 if stop {
                     self.finish(&op, End::Gone, 0, Some((&c, json!({"ok": true, "result": v}))));

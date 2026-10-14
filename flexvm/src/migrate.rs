@@ -32,6 +32,8 @@ const MAX_HEADER: u64 = 256 << 20;
 const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(10);
 const HOLD_FENCE: Duration = Duration::from_millis(250);
 const HELD_STREAM: Duration = Duration::from_secs(2);
+/// How long migrating on waits for an arrival still pulling.
+const ARRIVAL_WAIT: Duration = Duration::from_secs(10);
 
 enum Outcome {
     Committed(Value),
@@ -48,6 +50,7 @@ impl Proc {
             bail!("this host runs no peer listener (flexvm listen): the target fetches the vm's memory through it");
         };
         let op = self.op_within()?;
+        self.settle_arrival(&op, ARRIVAL_WAIT)?;
         vm.template.verify(&self.paths, true)?;
         let settle = Instant::now();
         vm.settle_hotplug(settle + crate::lifecycle::SETTLE_WAIT)?;
@@ -57,11 +60,13 @@ impl Proc {
         let prepare = prep.elapsed();
         let holder = self.holder().cloned();
         // Lent durably first: a crash with the outcome unknown must not hand the address out.
-        self.host.lend(&self.host.lock()?, vm.ip, gen)?;
+        self.lent_here.store(self.host.lend(&self.host.lock()?, vm.ip, gen)?, Ordering::SeqCst);
         self.drop_held_in();
         self.set_leaving(true);
         if let Err(e) = vm.leave(State::Source(mig)) {
-            let _ = self.host.unlend(&self.host.lock()?, vm.ip, gen);
+            if self.lent_here.swap(false, Ordering::SeqCst) {
+                let _ = self.host.unlend(&self.host.lock()?, vm.ip, gen);
+            }
             self.set_leaving(false);
             return Err(e);
         }
@@ -214,7 +219,9 @@ impl Proc {
             h.forget(vm.ip, mig);
         }
         *vm.state.lock().unwrap() = s;
-        let _ = self.host.unlend(&l, vm.ip, gen);
+        if self.lent_here.swap(false, Ordering::SeqCst) {
+            let _ = self.host.unlend(&l, vm.ip, gen);
+        }
         drop(l);
         self.set_leaving(false);
         self.publish();
@@ -411,20 +418,11 @@ impl Proc {
             let vm = p.vm().clone();
             vm.restore_devices();
             let start = Instant::now();
-            let pulled = vm.pager.wait_pulled(None);
+            vm.pager.wait_pulled(None);
             eprintln!("vm {}: pull from {source} ended after {} ms", vm.name, ms(start.elapsed()));
-            // Under `op`, as `finish` is: either the VM ends first (the source's
-            // copy runs again), or the record stays here until Released is durable.
-            let _op = p.op();
-            // A stopped pager (its Firecracker died) wakes this without a failure.
-            if !pulled || vm.pager.remote_left() > 0 || vm.pager.failed().is_some() || !vm.firecracker_alive() {
-                return;
-            }
-            let mut arrived = p.arrived.lock().unwrap();
-            if let Some(rec) = arrived.as_ref() {
-                rec.release(Some((vm.ip, p.gen())));
-            }
-            *arrived = None;
+            // Unless an operation settled it first, or the VM ended (its source's copy runs again).
+            let op = p.op();
+            let _ = p.settle_arrival(&op, Duration::ZERO);
         });
         Ok(())
     }

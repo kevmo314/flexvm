@@ -23,7 +23,7 @@ use crate::util::{ms, Error, Phases, Result, PAGE_SIZE};
 use crate::vm::{Snapshot, State, Vm};
 use crate::vmproc::{End, Op, Proc, CLOCK_DEADLINE};
 
-const DRAIN_WAIT: Duration = Duration::from_secs(60);
+pub const DRAIN_WAIT: Duration = Duration::from_secs(60);
 pub const SETTLE_WAIT: Duration = Duration::from_secs(10);
 const CKPT_RELEASE: Duration = Duration::from_millis(20);
 /// Suspended-checkpoint markers: STARTED (may have run: never resume again),
@@ -134,6 +134,7 @@ impl Proc {
             if !matches!(vm.state(), State::Running | State::Paused) {
                 bail!("vm {} is {}; not suspending it", vm.name, vm.state().name());
             }
+            self.settle_arrival(&op, DRAIN_WAIT)?;
             // This one goes where the checkpoint it was resumed from is.
             if let Some(dir) = self.consumed.lock().unwrap().take() {
                 delete_consumed(&vm.name, &dir);
