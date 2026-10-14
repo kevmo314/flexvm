@@ -56,8 +56,10 @@ impl Pager {
                 return Err(os(libc::EAGAIN));
             }
             // Test fault `ckpt_wp_race`: a writer claims the faulting page right here (#88): have the writers take it
-            // next, and wait.
-            if self.wp_race.load(Ordering::Relaxed) && cow.state(page) == PENDING {
+            // next, and wait. Only once they run: before, nothing can claim it, and the faults of the resume (vCPUs,
+            // and Firecracker's device thread with a balloon request waiting behind it) would only stall.
+            let race = self.wp_race.load(Ordering::Relaxed) && cow.writing();
+            if race && cow.state(page) == PENDING {
                 cow.want(page);
                 let t = Instant::now();
                 while cow.state(page) == PENDING && t.elapsed() < Duration::from_millis(50) {
@@ -95,7 +97,7 @@ impl Pager {
             woken |= (p..q).contains(&page);
         }
         // Test fault `ckpt_wp_race`: the writer that claimed the page is done with it before the fault is settled.
-        if self.wp_race.load(Ordering::Relaxed) && !woken {
+        if self.wp_race.load(Ordering::Relaxed) && cow.as_ref().is_some_and(|c| c.writing()) && !woken {
             let t = Instant::now();
             while keep(page) && t.elapsed() < Duration::from_millis(50) {
                 thread::sleep(Duration::from_micros(100));
