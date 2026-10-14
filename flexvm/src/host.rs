@@ -1183,14 +1183,31 @@ pub fn reap(run: &Path, owner: &Ident) -> Result<()> {
     if owner.boot != boot_id() || load::<Ident>(&dir.join("owner"))?.as_ref() != Some(owner) {
         return Ok(());
     }
-    for e in std::fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))? {
-        let e = e.map_err(|e| format!("{}: {e}", dir.display()))?;
-        if !e.file_type()?.is_dir() {
-            continue;
+    // Another process's sweep removes the directory once it reaped them (`collect_garbage`):
+    // gone meanwhile, they are dead.
+    let gone = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
+    let entries = match std::fs::read_dir(&dir) {
+        Err(e) if gone(&e) => return Ok(()),
+        r => r.map_err(|e| format!("{}: {e}", dir.display()))?,
+    };
+    for e in entries {
+        let e = match e {
+            Err(e) if gone(&e) => return Ok(()),
+            r => r.map_err(|e| format!("{}: {e}", dir.display()))?,
+        };
+        match e.file_type() {
+            Ok(t) if t.is_dir() => {}
+            Err(e) if !gone(&e) => return Err(e.into()),
+            _ => continue,
         }
         let Some(fc) = load::<Ident>(&e.path().join("fc"))? else { continue };
         if let Some(fd) = PidFd::open(&fc)? {
-            fd.signal(libc::SIGKILL)?;
+            // It exited and was waited for since it was opened (its parent died with SIGKILL
+            // pending for it): nothing left to wait for.
+            match crate::util::pidfd_signal(&fd.0, libc::SIGKILL) {
+                Err(e) if e.raw_os_error() == Some(libc::ESRCH) => continue,
+                r => r.map_err(|e| format!("signal {}: {e}", libc::SIGKILL))?,
+            }
             if !fd.wait(Duration::from_secs(5)) {
                 bail!("firecracker {} of dead process {} will not exit", fc.pid, owner.pid);
             }
@@ -1346,6 +1363,9 @@ fn liveness_by(id: &Ident, boot: &str, stat: impl Fn(u32) -> std::io::Result<Str
 fn pid_liveness_by(pid: u32, stat: impl Fn(u32) -> std::io::Result<String>) -> (Liveness, Option<u64>) {
     match stat(pid) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Liveness::Gone, None),
+        // Opened while it was exiting, read once it was gone: /proc says its task no longer
+        // exists (a new process with its pid would be another one anyway).
+        Err(e) if e.raw_os_error() == Some(libc::ESRCH) => (Liveness::Gone, None),
         Err(_) => (Liveness::Unknown, None),
         Ok(text) => match parse_stat(&text) {
             None => (Liveness::Unknown, None),
@@ -1904,6 +1924,10 @@ mod tests {
         assert_eq!(liveness_by(&me, boot_id(), |_| Ok(running(me.start))), Liveness::Alive);
         assert_eq!(liveness_by(&me, boot_id(), |_| Ok(running(me.start + 1))), Liveness::Gone, "pid reused");
         assert_eq!(pid_liveness_by(1, emfile).0, Liveness::Unknown, "a tap or cgroup of an unreadable pid is kept");
+        // /proc/PID/stat of a process that finished exiting between open and read.
+        let esrch = |_| Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+        assert_eq!(pid_liveness_by(1, esrch).0, Liveness::Gone);
+        assert_eq!(liveness_by(&me, boot_id(), esrch), Liveness::Gone);
         // A dead owner's goes, as asking would make it go.
         store(&h.mig_path(9), &Mig::Committed { owner: dead_owner(&h, 999_999_909, &[]) }, false).unwrap();
         h.retire_migrations();
