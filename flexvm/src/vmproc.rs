@@ -169,7 +169,7 @@ impl Proc {
             host.tap_prefix()?
         };
         // Unlocked: our work directory holds the prefix, and no sweep frees them while we live.
-        crate::host::clear_pid(&prefix, ident.pid);
+        crate::host::clear_taps(&prefix, ident.pid);
         let tap_prefix = format!("{prefix}{:x}t", ident.pid);
         let spawner = Spawner::new(&paths.firecracker, &work, crate::socket::SocketRoot::new(&work)?, cgroup_root(), &tap_prefix);
         Ok(Arc::new_cyclic(|me| Proc {

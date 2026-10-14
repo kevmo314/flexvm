@@ -95,13 +95,19 @@ pub fn create_tap(name: &str) -> Result<()> {
 
 pub fn delete_tap(name: &str) {
     if let Ok(index) = ifindex(name) {
-        delete_link(index);
+        delete_link(index, name);
     }
 }
 
-/// By index: a tap made since under the same name is another one.
-pub fn delete_link(ifindex: u32) {
-    let _ = netlink(RTM_DELLINK, 0, &ifinfomsg(ifindex));
+/// By index, while it still has `name`: a tap made since under the name has another
+/// index, and one renamed or moved away (its index reused) another name. A rename in
+/// between the check and the delete is not caught.
+pub fn delete_link(ifindex: u32, name: &str) {
+    let mut now = [0 as libc::c_char; libc::IFNAMSIZ];
+    let named = unsafe { libc::if_indextoname(ifindex, now.as_mut_ptr()) };
+    if !named.is_null() && unsafe { std::ffi::CStr::from_ptr(named) }.to_bytes() == name.as_bytes() {
+        let _ = netlink(RTM_DELLINK, 0, &ifinfomsg(ifindex));
+    }
 }
 
 /// A longer name is refused: the kernel would take it truncated.

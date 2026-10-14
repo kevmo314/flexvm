@@ -475,7 +475,7 @@ fn build_template(args: &Args, name: &str) -> Result<()> {
     let tap = {
         let _l = host.lock()?;
         let prefix = host.tap_prefix()?;
-        host::clear_pid(&prefix, std::process::id());
+        host::clear_taps(&prefix, std::process::id());
         let tap = template::tap(&prefix);
         net::create_tap(&tap)?;
         tap

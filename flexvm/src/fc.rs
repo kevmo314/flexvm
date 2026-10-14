@@ -382,7 +382,9 @@ impl Spawner {
             bail!("out of time to start firecracker");
         }
         let n = self.next.fetch_add(1, Ordering::SeqCst);
-        let id = format!("idle-{}-{n}", std::process::id());
+        // Named by this process's identity, not its pid alone: never a dead one's with the same pid.
+        let me = crate::host::Ident::me();
+        let id = format!("idle-{}-{}-{n}", me.pid, me.start);
         let tap = format!("{}{n:x}", self.tap_prefix);
         let dir = self.root.join(&id);
         let cgroup = self.cgroups.as_ref().map(|root| root.join(&id));
@@ -415,13 +417,7 @@ impl Spawner {
                 // Never swapped: at its mark the VM is throttled (sleeps a migration's or
                 // checkpoint's lift waits out), not paged out to swap, whose reads would hold
                 // up its pauses. Without swap accounting the file is missing: nothing to do.
-                // One already there is a dead process's with this pid (`Proc::new` clears
-                // them): never shared, as its limits would not be this VM's.
-                let made = std::fs::create_dir(&cg).or_else(|e| match e.kind() {
-                    std::io::ErrorKind::AlreadyExists => remove_cgroup(&cg).and_then(|()| std::fs::create_dir(&cg)),
-                    _ => Err(e),
-                });
-                let joined = made.and_then(|()| {
+                let joined = std::fs::create_dir(&cg).and_then(|()| {
                     if let Err(e) = std::fs::write(cg.join("memory.swap.max"), "0").or_else(|e| match e.kind() {
                         std::io::ErrorKind::NotFound => Ok(()),
                         _ => Err(e),
