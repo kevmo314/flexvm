@@ -466,12 +466,23 @@ not wait on the host:
   plugged and the guest panicked ("System is deadlocked on memory", #97).
   Now a 256 MiB guest grows to the full ceiling. The default base is still
   256 MiB + 1/32 of the ceiling (1280 MiB on a 32 GiB host; untouched, it
-  costs nothing), so such a guest's first ~24 GiB stay movable. Unplug takes
-  movable blocks first; kernel blocks may not unplug, but their free pages
-  go back through free page reporting like any other.
+  costs nothing), so such a guest's first ~24 GiB stay movable. The ratio
+  gives kernel memory about 2.5 times what page structs and page tables
+  need, which is capacity, not a guarantee: a kernel-heavy workload (many
+  processes, large slab caches) can still exhaust it. Unplug
+  takes movable blocks first; kernel blocks may not unplug, but their free
+  pages go back through free page reporting like any other.
+  - **Rebuild templates.** The boot command line is part of the snapshot:
+    templates built before this change, and checkpoints of their VMs, keep
+    onlining everything movable and still panic past ~13 GiB plugged with a
+    256 MiB base. Rebuild them with `flexvm template`.
 - **Shrinking** is free page reporting (freed pages go back within seconds,
   plugged or not), plus unplugging memory above the template's plug once a
-  guest has had more than three times its headroom free for 10 s.
+  guest has had more than three times its headroom free for 10 s. A shrink
+  the guest cannot finish (pinned kernel blocks, memory in use) never blocks
+  growth: a guest that runs short (it asks, or a tick sees it) cancels the
+  shrink and grows from what is plugged, and a resize still unfinished after
+  10 s is settled at what is plugged (`shrink_stall` in `scripts/faults.py`).
 - **Host accounting.** A VM is starved (and migrated by the pressure policy)
   only when it is actually short of free memory and cannot grow here: at its
   ceiling, or refused admission. Plugged-but-free memory is not counted as

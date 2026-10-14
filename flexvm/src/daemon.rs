@@ -2612,6 +2612,10 @@ enum Resized {
     Full,
 }
 
+/// How long a resize may go unfinished before the controller settles for
+/// what the guest managed (requested = plugged).
+const RESIZE_STALL: Duration = Duration::from_secs(10);
+
 /// How long a grant counts as used: the guest touches what it asked for
 /// gradually, and MemAvailable only shows it once touched.
 const GRANT_WINDOW: Duration = Duration::from_secs(10);
@@ -2675,8 +2679,12 @@ fn resize(vm: &Vm, admission: &Admission, hint: Option<u64>, grow_only: bool) ->
     })?;
     let requested = hp["requested_size_mib"].as_u64().ok_or("no hotplug state")?;
     let plugged = hp["plugged_size_mib"].as_u64().ok_or("no hotplug state")?;
-    if plugged != requested {
-        return Ok(Resized::Busy);
+    // The guest may never finish a resize: kernel-zone blocks (see BOOT_ARGS)
+    // or memory in use can keep it from unplugging. Past RESIZE_STALL the
+    // controller settles for what is plugged instead of waiting forever.
+    let stalled = plugged != requested && last.elapsed() > RESIZE_STALL;
+    if plugged < requested && !stalled {
+        return Ok(Resized::Busy); // growing
     }
     let total = meta.mem_mib + plugged;
     let avail = match hint {
@@ -2691,25 +2699,40 @@ fn resize(vm: &Vm, admission: &Admission, hint: Option<u64>, grow_only: bool) ->
     // Balloon statistics lag a plug by up to a second; don't grow twice on stale numbers.
     let stale = hint.is_none() && last.elapsed() < Duration::from_millis(1500);
     let short = headroom.saturating_sub(avail);
-    let new = if short > 0 && !stale {
-        let step = round(headroom * 2 - avail).min(round(total / 4).max(STEP_MIB));
-        (requested + step).min(hotplug_total)
-    } else if !grow_only && avail > headroom * 3 && requested > floor && last.elapsed() > Duration::from_secs(10) {
-        requested.saturating_sub((avail - headroom * 2) / STEP_MIB * STEP_MIB).max(floor)
-    } else {
-        requested
-    };
-    let refused = new > requested && !admission.admit(new - requested);
-    let full = short > 0 && (requested == hotplug_total || refused);
-    vm.starved.store(full, Ordering::SeqCst);
-    if new == requested || refused {
-        return Ok(if full { Resized::Full } else { Resized::Same });
+    let urgent = short > 0 && !stale;
+    if plugged > requested && !stalled && !urgent {
+        return Ok(Resized::Busy); // shrinking
     }
-    let why = if hint.is_some() { "guest asked" } else { "tick" };
-    eprintln!("vm {}: available {avail}/{total} MiB, hotplug {requested} -> {new} MiB ({why})", vm.name);
-    vm.fc(|fc| fc.patch("/hotplug/memory", json!({"requested_size_mib": new})))?;
-    *last = Instant::now();
-    Ok(if new > requested { Resized::Grew } else { Resized::Same })
+    // A shrink still in progress is cancelled from here on: sizes count from what is plugged.
+    let new = if urgent {
+        let step = round(headroom * 2 - avail).min(round(total / 4).max(STEP_MIB));
+        (plugged + step).min(hotplug_total)
+    } else if !grow_only && avail > headroom * 3 && plugged > floor && last.elapsed() > Duration::from_secs(10) {
+        plugged.saturating_sub((avail - headroom * 2) / STEP_MIB * STEP_MIB).max(floor)
+    } else {
+        plugged
+    };
+    let refused = new > plugged && !admission.admit(new - plugged);
+    let full = short > 0 && (plugged == hotplug_total || refused);
+    vm.starved.store(full, Ordering::SeqCst);
+    let new = if refused { plugged } else { new };
+    if new != requested {
+        let why = match (stalled, hint.is_some()) {
+            (true, _) => "stalled",
+            (_, true) => "guest asked",
+            _ => "tick",
+        };
+        eprintln!("vm {}: available {avail}/{total} MiB, hotplug {requested} (plugged {plugged}) -> {new} MiB ({why})", vm.name);
+        vm.fc(|fc| fc.patch("/hotplug/memory", json!({"requested_size_mib": new})))?;
+        *last = Instant::now();
+    }
+    Ok(if new > plugged {
+        Resized::Grew
+    } else if full {
+        Resized::Full
+    } else {
+        Resized::Same
+    })
 }
 
 /// The longest memory request a guest may send, and how long it has to send it.

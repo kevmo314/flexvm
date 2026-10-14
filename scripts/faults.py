@@ -2181,6 +2181,46 @@ def plug_storm():
     cleanup(n)
 
 
+def shrink_stall():
+    """A shrink the guest does not carry out must not block growth: when the
+    guest then needs memory, the controller cancels the shrink and grows,
+    instead of answering `busy` until the guest OOMs (#97). Kernel-zone
+    blocks pinned by unmovable allocations stall a shrink the same way; here
+    the guest's virtio-mem driver is told not to unplug online memory at all.
+    PLUG_TEMPLATE picks the template."""
+    n = "ft-shrink-stall"
+    setup(n, mib=1, template=os.environ.get("PLUG_TEMPLATE"))
+    v = vms(A)[n]
+    hold = v["guest_mib"] - 1536
+    touch = "b=bytearray({}<<20)\\nfor i in range(0, len(b), 4096): b[i] = 1\\n"
+    holder = "python3 -c \"exec('" + touch.format(hold) + "'); open('/tmp/held', 'w').close(); import time; time.sleep(3600)\""
+    code, pid = sh(A, n, f"setsid {holder} >/dev/null 2>&1 </dev/null & echo $!")
+    check("shrink stall: holder started", code == 0 and pid.isdigit(), pid)
+    held = wait_for(lambda: sh(A, n, "test -e /tmp/held")[0] == 0, 120)
+    check(f"shrink stall: guest holds {hold} of {v['guest_mib']} MiB", held)
+    code, out = sh(A, n, "echo N > /sys/module/virtio_mem/parameters/unplug_online")
+    check("shrink stall: guest stops unplugging online memory", code == 0, out)
+    def hp():
+        v = vms(A)[n]
+        return v["requested_mib"], v["plugged_mib"]
+
+    def grew():
+        requested, now = hp()
+        return requested == now > plugged
+
+    plugged = vms(A)[n]["plugged_mib"]
+    ok(A, {"op": "hotplug", "name": n, "mib": plugged - 1024})
+    time.sleep(2)
+    check("shrink stall: shrink stalled", hp() == (plugged - 1024, plugged), (plugged, hp()))
+    code, out = sh(A, n, "python3 -c \"exec('" + touch.format(2048) + "'); print(len(b)>>20)\"")
+    check("shrink stall: guest can allocate 2 GiB more", code == 0 and out == "2048", (code, out))
+    check("shrink stall: holder not OOM-killed", sh(A, n, f"kill -0 {pid}")[0] == 0,
+          sh(A, n, "dmesg | grep -i 'out of memory' | tail -n 2"))
+    check("shrink stall: resize settled, guest grew", wait_for(grew, 60),
+          (plugged, hp()))
+    cleanup(n)
+
+
 def kill_source():
     """A migration's paused source copy cannot be killed (the target still
     pulls from it and releases it); the VM lives on at the target."""
@@ -2452,7 +2492,7 @@ def suspend_no_gen():
     subprocess.run(["sudo", "rm", "-rf", d], check=True)
 
 
-SCENARIOS = dict(plug_race=plug_race, plug_storm=plug_storm, cow_grow=cow_grow, basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, refused=refused, pages_blip=pages_blip,
+SCENARIOS = dict(plug_race=plug_race, plug_storm=plug_storm, shrink_stall=shrink_stall, cow_grow=cow_grow, basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, refused=refused, pages_blip=pages_blip,
                  pages_dead_restore=pages_dead_restore, pages_dead=pages_dead, resume_kill=resume_kill, prepared_retry=prepared_retry, quiet_source=quiet_source,
                  shared_run_dir=shared_run_dir, exec_race=exec_race, guest_calls=guest_calls, source_killed=source_killed,
                  target_restart=target_restart, target_restart_symlink=target_restart_symlink, guest_hang=guest_hang,
