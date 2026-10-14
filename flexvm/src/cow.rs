@@ -15,7 +15,8 @@
 //!
 //! Writers never unprotect anything: pages stay protected after the copy, so
 //! the next write to each marks it dirty for an incremental checkpoint (see
-//! `Pager::freeze`). A write fault on a page being READ waits for the reader.
+//! `Pager::freeze`). A write fault on a page being READ waits for the reader,
+//! which wakes the event thread once it has saved it (`wait_for`).
 //!
 //! Rescued copies are kept in memory up to a budget; past it, a fault on a
 //! PENDING page asks the writers to take that page's unit next and waits for
@@ -23,14 +24,15 @@
 //!
 //! Discards: the kernel zaps a page right after the pager reads the REMOVE
 //! event, so the pager never reads one while pages are PENDING. It probes
-//! for a queued REMOVE before each read (UFFDIO_WRITEPROTECT fails with EAGAIN
-//! while one is queued) and lets the writers finish first (`drain`); if they
-//! make no progress for a while, or a REMOVE slips in between the probe and
-//! the read, the checkpoint is invalidated instead of saving wrong contents.
+//! for a queued REMOVE before each read (`Pager::remove_queued`) and lets the
+//! writers finish first (`drain`); if they make no progress for a while, or a
+//! REMOVE slips in between the probe and the read, the checkpoint is
+//! invalidated instead of saving wrong contents.
 
 use std::collections::{HashMap, VecDeque};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -78,8 +80,9 @@ pub struct Cow {
     wanted: Mutex<VecDeque<usize>>,
     /// Bumped as pages are saved; drains wait on it.
     progress: (Mutex<u64>, Condvar),
-    /// Where to look for an unsaved page to probe with.
-    hint: AtomicUsize,
+    /// The event thread's eventfd (`set_waker`), and whether a fault waits for a writer to save a page (`wait_for`).
+    waker: OnceLock<OwnedFd>,
+    fault_waits: AtomicBool,
     stopped: AtomicBool,
     /// Whether a writer has started reading pages (`CowPages::read`).
     writing: AtomicBool,
@@ -106,7 +109,8 @@ impl Cow {
             budget,
             wanted: Mutex::new(VecDeque::new()),
             progress: (Mutex::new(0), Condvar::new()),
-            hint: AtomicUsize::new(runs.first().map_or(0, |r| r.0)),
+            waker: OnceLock::new(),
+            fault_waits: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             writing: AtomicBool::new(false),
             error: Mutex::new(None),
@@ -160,6 +164,31 @@ impl Cow {
         self.left.fetch_sub(n, Ordering::SeqCst);
         *self.progress.0.lock().unwrap() += n as u64;
         self.progress.1.notify_all();
+        if self.fault_waits.swap(false, Ordering::SeqCst) {
+            self.wake();
+        }
+    }
+
+    /// Wakes the event thread through `fd` (an eventfd it polls) when a fault waits for a writer.
+    pub fn set_waker(&self, fd: OwnedFd) {
+        let _ = self.waker.set(fd);
+    }
+
+    fn wake(&self) {
+        if let Some(fd) = self.waker.get() {
+            unsafe { libc::write(fd.as_raw_fd(), (&1u64 as *const u64).cast(), 8) };
+        }
+    }
+
+    /// A fault on `page` waits for a writer to save it (it is READING, or wanted while over budget): the event thread
+    /// is woken as soon as a writer saves pages, rather than retrying the fault on a timer; at once if `page` is saved
+    /// already. No wakeup is lost: a writer sets a page's state before it looks at the flag, and this sets the flag
+    /// before it looks at the state.
+    pub fn wait_for(&self, page: usize) {
+        self.fault_waits.store(true, Ordering::SeqCst);
+        if !matches!(self.state(page), PENDING | READING | RESCUING) {
+            self.wake();
+        }
     }
 
     pub fn over_budget(&self) -> bool {
@@ -185,18 +214,6 @@ impl Cow {
         if !wanted.contains(&page) {
             wanted.push_back(page);
         }
-    }
-
-    /// Some page that is still protected because it is not saved yet.
-    pub fn unsaved_page(&self) -> Option<usize> {
-        if self.left() == 0 {
-            return None;
-        }
-        let n = self.states.len();
-        let hint = self.hint.load(Ordering::Relaxed).min(n);
-        let found = (hint..n).chain(0..hint).find(|&p| matches!(self.state(p), PENDING | READING))?;
-        self.hint.store(found, Ordering::Relaxed);
-        Some(found)
     }
 
     /// The checkpoint cannot be trusted any more: say why (the first reason
@@ -385,7 +402,7 @@ mod tests {
         assert_eq!(cow.report()["retries"], 0, "queueing pages does not count fault retries");
         assert_eq!(pages.wanted(), Some(30));
         assert_eq!(pages.wanted(), None);
-        assert_eq!(cow.unsaved_page(), Some(8));
+        assert_eq!(cow.state(8), PENDING);
         // An invalidated copy stops: faults no longer save pages for it, and
         // its writer fails, saying why, instead of writing guesses.
         cow.invalidate("page 8 was discarded before it was saved");
@@ -445,6 +462,32 @@ mod tests {
         }
     }
 
+    /// A fault waiting for a writer (`wait_for`) is woken through the waker once the writer saves pages, or at once
+    /// if the page is done with already; nothing wakes it while the page is still being read.
+    #[test]
+    fn faults_waiting_for_a_writer_are_woken() {
+        use std::os::fd::FromRawFd;
+        let efd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        assert!(efd >= 0);
+        let efd = unsafe { OwnedFd::from_raw_fd(efd) };
+        let woken = || {
+            let mut n = 0u64;
+            unsafe { libc::read(efd.as_raw_fd(), (&mut n as *mut u64).cast(), 8) == 8 }
+        };
+        let cow = Cow::new(8, &vec![(0, 4, REMOTE)]);
+        cow.set_waker(efd.try_clone().unwrap());
+        assert!(cow.claim(1, PENDING, READING));
+        cow.wait_for(1);
+        assert!(!woken(), "page 1 is still being read");
+        cow.set(1, CLEAN);
+        cow.saved(1);
+        assert!(woken(), "saving it wakes the fault");
+        cow.saved(0);
+        assert!(!woken(), "once: nothing waits any more");
+        cow.wait_for(1);
+        assert!(woken(), "page 1 is done with already");
+    }
+
     #[test]
     fn drain_waits_for_the_writers() {
         let cow = Cow::new(4, &vec![(0, 2, REMOTE)]);
@@ -460,6 +503,5 @@ mod tests {
             assert!(cow.drain());
         });
         assert_eq!(cow.left(), 0);
-        assert_eq!(cow.unsaved_page(), None);
     }
 }
