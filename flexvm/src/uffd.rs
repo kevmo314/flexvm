@@ -928,14 +928,9 @@ impl Pager {
                 Ok((stream, _)) => break stream,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     waiting("connected")?;
-                    let mut pfd = libc::pollfd {
-                        fd: listener.as_raw_fd(),
-                        events: libc::POLLIN,
-                        revents: 0,
-                    };
-                    if unsafe { libc::poll(&mut pfd, 1, 100) } < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
-                        return Err(io::Error::last_os_error().into());
-                    }
+                    // Bounded, to notice a stop.
+                    let mut pfd = libc::pollfd { fd: listener.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+                    unsafe { libc::poll(&mut pfd, 1, 10) };
                 }
                 Err(e) => return Err(e.into()),
             }
