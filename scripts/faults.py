@@ -3320,11 +3320,16 @@ def refused_admission():
     n, path = "ft-refused-adm", ckpt_path("ft-refused-adm")
     m = setup(n, mib=1)
     migs = lambda: sorted(os.listdir(os.path.join(B.state, "migs"))) if os.path.isdir(os.path.join(B.state, "migs")) else []
+    # The start announces its generation to B in the background: in before the snapshot.
+    v = vms(A)[n]
+    check("refused admission: b saw the start", wait_for(lambda: addr(B, v["ip"]).get("seen", 0) >= v["gen"], 10), addr(B, v["ip"]))
     before, recorded = addr_records(), migs()
     fault(B, "no_admit", 600000)
     r = migrate(A, n, B)
     check("refused admission: a migration is refused", not r["ok"] and "not enough memory" in r["error"], r)
-    check("refused admission: and records nothing", migs() == recorded and addr_records() == before, (recorded, migs()))
+    after, now = addr_records(), migs()
+    changed = {k: (before.get(k), after.get(k)) for k in before.keys() | after.keys() if before.get(k) != after.get(k)}
+    check("refused admission: and records nothing", now == recorded and not changed, (recorded, now, changed))
     check("refused admission: the vm runs on at A", where(n) == {A: "running"} and md5(A, n) == m, where(n))
     ok(checkpoint(A, n, path, stop=True))
     before = addr_records()
