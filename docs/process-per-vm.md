@@ -165,9 +165,12 @@ answer, held packets). What changed is who is at each end:
    once), claims the address with the source's generation, spawns and
    prepares Firecracker, answers.
 3. The source pauses, sends the state; the target loads it, runs every
-   check that can abort, then under the host lock turns `pending` into
-   `committed` (refused if it was fenced), and resumes before letting go of
-   the lock.
+   check that can abort, then under the host lock routes the address to its
+   tap and turns `pending` into `committed` (refused if it was fenced), and
+   resumes before letting go of the lock. Until then the host's route to the
+   address (a peer's, say the source's) stays; one that a dead arrival's
+   host lost is put back once its record reads as aborted. Hosts sharing a
+   network namespace route it only after the held packets (`hold.rs`).
 4. Pages: the target's pager connects to the *source's* listener (the
    address the source sent: its listen address, or for a wildcard one its
    underlay address with the listen port; `listen` refuses a wildcard
@@ -441,7 +444,7 @@ where it is kept and what tests it.
   becomes `standby` (count, refill, claim fallback). New: `abort_superseded`,
   `gen_zero`, `suspend_gen`, `signals`, `kill_source`, `forged_peer`,
   `restore_ip_peer`, `late_withdrawal`, `kill_refused_checkpoint`,
-  `wildcard_listen`, and processes SIGKILLed between
+  `wildcard_listen`, `same_host_order`, `arrival_abort_route`, `arrival_killed_route`, `handoff_superseded`, and processes SIGKILLed between
   steps at test stalls (`incoming_killed`, `start_killed`, `claim_killed`).
   Dropped:
   `target_restart_symlink`, `shared_run_dir`, `state_dir_lock` (they tested a

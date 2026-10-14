@@ -427,8 +427,15 @@ impl Host {
     }
 
     pub fn reinstall(&self, l: &Locked, ip: Ipv4Addr) -> Result<bool> {
+        self.reinstall_after(l, ip, None)
+    }
+
+    /// `reinstall`, counting a holder whose name `dead` (a dead process) still locks as
+    /// gone: its other threads may hold the lock a moment longer.
+    fn reinstall_after(&self, l: &Locked, ip: Ipv4Addr, dead: Option<&Ident>) -> Result<bool> {
         let a = self.addr(l, ip)?;
-        let Some(via) = a.via.filter(|_| !a.withdrawn && !self.held(&a)) else { return Ok(false) };
+        let dying = || a.holder.as_deref().is_some_and(|h| dead.is_some() && self.holder_of(h).as_ref() == dead);
+        let Some(via) = a.via.filter(|_| !a.withdrawn && (dying() || !self.held(&a))) else { return Ok(false) };
         crate::net::route_via(ip, via)?;
         eprintln!("put back route {ip} via {via} (generation {})", a.seen);
         Ok(true)
@@ -468,31 +475,41 @@ impl Host {
 
     /// `source`: its listener, asked whether the source process `by` is gone
     /// when it never says it is done with a released record.
-    pub fn mig_begin(&self, id: u64, source: &str, by: Option<Ident>) -> Result<MigRecord> {
+    /// `ip`: the VM's address, whose peer route comes back if the arrival dies before it commits.
+    pub fn mig_begin(&self, id: u64, source: &str, by: Option<Ident>, ip: Option<Ipv4Addr>) -> Result<MigRecord> {
         let _l = self.lock()?;
         if load::<Mig>(&self.mig_path(id))?.is_some() {
             bail!("migration {id} was already seen here");
         }
-        store(&self.mig_path(id), &Mig::Pending { owner: Ident::me() }, true)?;
+        store(&self.mig_path(id), &Mig::Pending { owner: Ident::me(), ip }, true)?;
         Ok(MigRecord { host: self.clone(), id, committed: false, source: source.into(), by })
     }
 
     /// A record whose process died becomes aborted once its Firecrackers are
     /// dead: committed or not, the source's paused copy is the only one left.
     pub fn mig_status(&self, id: u64) -> Result<&'static str> {
-        let _l = self.lock()?;
+        let l = self.lock()?;
         let path = self.mig_path(id);
-        Ok(match load(&path)? {
-            None => "aborted",
-            Some(Mig::Released { .. }) => "released",
-            Some(Mig::Pending { owner }) if owner.alive() => "pending",
-            Some(Mig::Committed { owner }) if owner.alive() => "committed",
-            Some(Mig::Pending { owner } | Mig::Committed { owner }) => {
-                reap(&self.run, &owner)?;
-                remove(&path)?;
-                "aborted"
+        let (owner, ip) = match load(&path)? {
+            None => return Ok("aborted"),
+            Some(Mig::Released { .. }) => return Ok("released"),
+            Some(Mig::Pending { owner, .. }) if owner.alive() => return Ok("pending"),
+            Some(Mig::Committed { owner }) if owner.alive() => return Ok("committed"),
+            Some(Mig::Pending { owner, ip }) => (owner, ip),
+            Some(Mig::Committed { owner }) => (owner, None),
+        };
+        reap(&self.run, &owner)?;
+        // Killed before it committed, it never ran here: the newest route a peer
+        // announced for its address (say, back to its source) comes back. Until
+        // it does, the record stays (still aborted), so the next query retries.
+        if let Some(ip) = ip {
+            if let Err(e) = self.reinstall_after(&l, ip, Some(&owner)) {
+                eprintln!("migration {id} died before its commit; putting back the route for {ip}: {e}; retried on the next query");
+                return Ok("aborted");
             }
-        })
+        }
+        remove(&path)?;
+        Ok("aborted")
     }
 
     pub fn mig_done(&self, id: u64) -> Result<()> {
@@ -576,7 +593,11 @@ impl Drop for AddrClaim {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "lowercase")]
 pub enum Mig {
-    Pending { owner: Ident },
+    Pending {
+        owner: Ident,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ip: Option<Ipv4Addr>,
+    },
     /// The source must never run it again.
     Committed { owner: Ident },
     /// All memory is here, or the VM is gone: the source may exit.
@@ -603,7 +624,7 @@ impl MigRecord {
     pub fn commit(&mut self, _: &Locked) -> Result<()> {
         let path = self.host.mig_path(self.id);
         match load(&path)? {
-            Some(Mig::Pending { owner }) if owner == Ident::me() => store(&path, &Mig::Committed { owner }, true)?,
+            Some(Mig::Pending { owner, .. }) if owner == Ident::me() => store(&path, &Mig::Committed { owner }, true)?,
             m => bail!("migration {} was fenced off meanwhile ({m:?})", self.id),
         }
         self.committed = true;
@@ -646,7 +667,7 @@ impl Drop for MigRecord {
     fn drop(&mut self) {
         if let (false, Ok(_l)) = (self.committed, self.host.lock()) {
             let path = self.host.mig_path(self.id);
-            if matches!(load(&path), Ok(Some(Mig::Pending { owner })) if owner == Ident::me()) {
+            if matches!(load(&path), Ok(Some(Mig::Pending { owner, .. })) if owner == Ident::me()) {
                 let _ = remove(&path);
             }
         }
@@ -1140,11 +1161,11 @@ mod tests {
         let h = host("migs");
         let rec = |id: u64| load::<Mig>(&h.mig_path(id)).unwrap();
         assert!(h.mig_status(1).unwrap() == "aborted" && rec(1).is_none());
-        let r = h.mig_begin(2, "", None).unwrap();
-        assert!(h.mig_begin(2, "", None).is_err() && h.mig_status(2).unwrap() == "pending");
+        let r = h.mig_begin(2, "", None, None).unwrap();
+        assert!(h.mig_begin(2, "", None, None).is_err() && h.mig_status(2).unwrap() == "pending");
         drop(r);
         assert_eq!(h.mig_status(2).unwrap(), "aborted");
-        let mut r = h.mig_begin(3, "", None).unwrap();
+        let mut r = h.mig_begin(3, "", None, None).unwrap();
         r.commit(&h.lock().unwrap()).unwrap();
         h.mig_done(3).unwrap();
         assert_eq!(h.mig_status(3).unwrap(), "committed", "only a released one is forgotten");
@@ -1157,13 +1178,20 @@ mod tests {
         assert!(h.mig_status(3).unwrap() == "released" && lent(&h).is_none());
         h.mig_done(3).unwrap();
         assert!(rec(3).is_none());
-        let mut r = h.mig_begin(4, "", None).unwrap();
-        store(&h.mig_path(4), &Mig::Pending { owner: dead_owner(&h, 999_999_904, &[]) }, false).unwrap();
+        let mut r = h.mig_begin(4, "", None, None).unwrap();
+        store(&h.mig_path(4), &Mig::Pending { owner: dead_owner(&h, 999_999_904, &[]), ip: None }, false).unwrap();
         assert!(h.mig_status(4).unwrap() == "aborted" && rec(4).is_none() && r.commit(&h.lock().unwrap()).is_err());
+        // A dead arrival's route that cannot be put back yet keeps its record, for the next query.
+        let back = ip("10.9.0.4");
+        std::fs::write(h.addr_path(back), "{").unwrap();
+        store(&h.mig_path(10), &Mig::Pending { owner: dead_owner(&h, 999_999_910, &[]), ip: Some(back) }, false).unwrap();
+        assert!(h.mig_status(10).unwrap() == "aborted" && rec(10).is_some(), "kept while its route cannot be put back");
+        std::fs::remove_file(h.addr_path(back)).unwrap();
+        assert!(h.mig_status(10).unwrap() == "aborted" && rec(10).is_none());
         let fc = Sleeper::new();
         store(&h.mig_path(5), &Mig::Committed { owner: dead_owner(&h, 999_999_905, &[&fc.1]) }, false).unwrap();
         assert!(h.mig_status(5).unwrap() == "aborted" && fc.done() && rec(5).is_none());
-        let mut r = h.mig_begin(7, "", None).unwrap();
+        let mut r = h.mig_begin(7, "", None, None).unwrap();
         r.commit(&h.lock().unwrap()).unwrap();
         r.settle(true);
         assert_eq!(h.mig_status(7).unwrap(), "released");

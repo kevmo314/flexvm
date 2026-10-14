@@ -155,7 +155,11 @@ impl Holder {
         if !lost {
             self.hand_over(&e, sink, &mut stats);
         }
-        self.unhold(ip, &e);
+        match switched {
+            Ok(()) => self.unhold(ip, &e),
+            // Left to the TUN, the address would be dropped here until the caller's retry.
+            Err(_) => self.unroute(ip, &e),
+        }
         stats.dropped += e.q.lock().unwrap().discard();
         Some((stats, switched))
     }
@@ -228,13 +232,20 @@ impl Holder {
     }
 
     pub fn forget(&self, ip: Ipv4Addr, mig: u64) -> Stats {
-        // Under `routes`: a newer hold of `ip` never loses its route to this one.
-        let _routes = self.routes.lock().unwrap();
         let Some(e) = self.entry(ip).filter(|e| e.mig == mig) else { return Stats::default() };
-        self.unhold(ip, &e);
-        let _ = crate::net::route_dev(false, ip, self.ifindex);
+        self.unroute(ip, &e);
         let dropped = e.q.lock().unwrap().discard();
         Stats { dropped, ..Stats::default() }
+    }
+
+    /// Drops `e` and its TUN route, unless a newer hold replaced it.
+    fn unroute(&self, ip: Ipv4Addr, e: &Arc<Entry>) {
+        // Under `routes`: a newer hold of `ip` never loses its route to this one.
+        let _routes = self.routes.lock().unwrap();
+        if self.entry(ip).is_some_and(|x| Arc::ptr_eq(&x, e)) {
+            self.unhold(ip, e);
+            let _ = crate::net::route_dev(false, ip, self.ifindex);
+        }
     }
 
     fn read_loop(&self) {
@@ -323,10 +334,12 @@ fn tap_tx_dropped(tap: &str) -> u64 {
 }
 
 // Stream: `START`, answered `b'a'` + first expected seq (u64). Frames: u32 BE length, u64
-// seq, packet. `SYNC` gets `b's'` once all before it is injected. Length 0 ends it and gets
-// one JSON line. Nothing is resent.
+// seq, packet. `SYNC` gets `b's'` once all before it is injected. `SWITCH` (hosts sharing
+// routes) gets `b'w'` once all before it is injected and the target took the address over.
+// Length 0 ends it and gets one JSON line. Nothing is resent.
 const SYNC: u32 = u32::MAX;
 const START: u32 = u32::MAX - 1;
+const SWITCH: u32 = u32::MAX - 2;
 const MAX_RECEIVERS: usize = 8;
 static RECEIVERS: AtomicUsize = AtomicUsize::new(0);
 
@@ -344,15 +357,16 @@ pub fn wait_start(r: &mut BufReader<By<TcpStream>>, deadline: Instant) -> bool {
     read_by(r, &mut head, deadline).is_ok() && u32::from_be_bytes(head) == START
 }
 
-/// Injects only while `revoked` is false. Refused if too many streams are being received.
-pub fn receive(r: &mut BufReader<By<TcpStream>>, ip: Ipv4Addr, tap: &str, revoked: &Mutex<bool>, deadline: Instant) {
+/// Injects only while `revoked` is false; on `SWITCH`, `take_over` takes the address. Refused if
+/// too many streams are being received.
+pub fn receive(r: &mut BufReader<By<TcpStream>>, ip: Ipv4Addr, tap: &str, revoked: &Mutex<bool>, deadline: Instant, take_over: &mut dyn FnMut()) {
     if RECEIVERS.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n < MAX_RECEIVERS).then_some(n + 1)).is_ok() {
-        receive_counted(r, ip, tap, revoked, deadline);
+        receive_counted(r, ip, tap, revoked, deadline, take_over);
         RECEIVERS.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
-fn receive_counted(r: &mut BufReader<By<TcpStream>>, ip: Ipv4Addr, tap: &str, revoked: &Mutex<bool>, deadline: Instant) {
+fn receive_counted(r: &mut BufReader<By<TcpStream>>, ip: Ipv4Addr, tap: &str, revoked: &Mutex<bool>, deadline: Instant, take_over: &mut dyn FnMut()) {
     let (Ok(conn), Ok(inj)) = (r.get_ref().s.try_clone(), Injector::new(tap)) else { return };
     if write_by(&conn, &[&b"a"[..], &0u64.to_be_bytes()].concat(), deadline).is_err() {
         return;
@@ -366,6 +380,14 @@ fn receive_counted(r: &mut BufReader<By<TcpStream>>, ip: Ipv4Addr, tap: &str, re
         let len = match u32::from_be_bytes(head) {
             SYNC if write_by(&conn, b"s", deadline).is_ok() => continue,
             SYNC => break false,
+            SWITCH => {
+                // What was injected before is queued on the tap ahead of anything routed.
+                take_over();
+                match write_by(&conn, b"w", deadline) {
+                    Ok(()) => continue,
+                    Err(_) => break false,
+                }
+            }
             0 => break true,
             len => len as usize,
         };
@@ -408,8 +430,17 @@ pub fn start(conn: &TcpStream) -> Result<u64> {
     Ok(u64::from_be_bytes(ack[1..].try_into().unwrap()))
 }
 
-/// Before `switch` moves the route, `SYNC`s until the target injected all sent so far.
-pub fn send(holder: &Holder, ip: Ipv4Addr, mig: u64, conn: &TcpStream, seq: u64, switch: impl FnOnce() -> Result<()>) -> Option<(Stats, Result<()>)> {
+/// Before `switch` moves the route, `SYNC`s until the target injected all sent so far. With
+/// `handoff` (hosts sharing routes) the target routes the address itself, after those.
+pub fn send(
+    holder: &Holder,
+    ip: Ipv4Addr,
+    mig: u64,
+    conn: &TcpStream,
+    seq: u64,
+    handoff: bool,
+    switch: impl FnOnce() -> Result<()>,
+) -> Option<(Stats, Result<()>)> {
     let out = std::cell::RefCell::new(Out { buf: Vec::with_capacity(64 << 10), seq, broken: false, conn });
     let mut sink = |p: &[u8]| out.borrow_mut().frame(p);
     let mut barrier = || {
@@ -423,13 +454,31 @@ pub fn send(holder: &Holder, ip: Ipv4Addr, mig: u64, conn: &TcpStream, seq: u64,
         }
         ok
     };
-    let (mut stats, switched) = holder.release(ip, mig, &mut sink, &mut barrier, switch)?;
+    // A handoff moves the route on the target; `switch` runs after the stragglers went, as
+    // until they are injected, packets routed to the target overtake them.
+    let mut switch = Some(switch);
+    let handover = || match handoff {
+        true => {
+            let mut o = out.borrow_mut();
+            o.buf.extend_from_slice(&SWITCH.to_be_bytes());
+            let (mut ack, deadline) = ([0u8; 1], Instant::now() + SYNC_WAIT);
+            if !(o.flush(deadline) && By { s: conn, at: deadline }.read_exact(&mut ack).is_ok() && ack[0] == b'w') {
+                o.broken = true;
+                eprintln!("hold {ip}: the target did not take the address over; dropping the rest");
+                bail!("the target did not take {ip} over (its held packets after this are lost)");
+            }
+            Ok(())
+        }
+        false => switch.take().map_or(Ok(()), |f| f()),
+    };
+    let (mut stats, switched) = holder.release(ip, mig, &mut sink, &mut barrier, handover)?;
     let mut o = out.into_inner();
     o.buf.extend_from_slice(&0u32.to_be_bytes());
     match o.flush(Instant::now() + FLUSH_WAIT).then(|| read_reply(conn, Instant::now() + REPLY_WAIT)).flatten() {
         Some(r) => (stats.injected, stats.dropped_target) = (r["injected"].as_u64().unwrap_or(0), r["dropped"].as_u64().unwrap_or(0)),
         None => stats.dropped_target = stats.packets,
     }
+    let switched = switched.and_then(|()| switch.take().map_or(Ok(()), |f| f()));
     Some((stats, switched))
 }
 
