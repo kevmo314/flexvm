@@ -602,20 +602,22 @@ def target_killed():
     stall = threading.Timer(0.2, lambda: fault(A, "pages", 6000))
     stall.start()
     r = migrate(A, n, B)
+    # Killed at once, from its lock and work directory alone (no `ls`): the
+    # pull must still be under way.
+    pid = json.load(open(os.path.join(B.run, "vms", f"{n}.lock")))["pid"]
+    work = os.path.join(B.run, "w", str(pid))
+    fcs = [json.load(open(os.path.join(work, d, "fc")))["pid"] for d in os.listdir(work) if os.path.exists(os.path.join(work, d, "fc"))]
+    os.kill(pid, signal.SIGKILL)
     stall.join()
-    check("target killed: outcome unknown, source paused", not r["ok"] and where(n).get(A) == "source", (r, where(n)))
-    v = vms(B).get(n)
-    check("target killed: VM running on target", v is not None and v["state"] == "running", v)
-    if v:
-        fc = v["firecracker"]
-        migs = os.path.join(B.state, "migs")
-        newest = max(os.listdir(migs), key=lambda m: os.path.getmtime(os.path.join(migs, m)))
-        os.kill(v["pid"], signal.SIGKILL)
-        # Asked at once, before the Firecracker can have died of its own accord.
-        fault(B, "status", 0)
-        st = peer(B, {"op": "migration", "mig": int(newest)})
-        check("target killed: aborted, only once its firecracker is dead",
-              st.get("ok") and st["result"]["outcome"] == "aborted" and not alive(fc), (st, alive(fc)))
+    migs = os.path.join(B.state, "migs")
+    newest = max(os.listdir(migs), key=lambda m: os.path.getmtime(os.path.join(migs, m)))
+    # Asked at once, before the Firecracker can have died of its own accord.
+    fault(B, "status", 0)
+    st = peer(B, {"op": "migration", "mig": int(newest)})
+    w = where(n)
+    check("target killed: the source still holds its paused copy", not r["ok"] and w.get(A) == "source", (r, w or "gone everywhere"))
+    check("target killed: aborted, only once its firecracker is dead",
+          st.get("ok") and st["result"]["outcome"] == "aborted" and not any(alive(p) for p in fcs), (st, fcs))
     # The listener restarts too: nothing it knows is in memory.
     stop_listeners()
     start_listeners()
@@ -934,9 +936,9 @@ def fc_prepare():
     """Firecracker's prepared load (firecracker/0002-*.patch): refuses a second
     prepare, a snapshot of another layout, and a load after boot config."""
     art = args.artifacts
-    tpls = os.path.join(art, "templates")
+    tpls = os.environ.get("FLEXVM_TEMPLATES") or os.path.join(art, "templates")
     fc = os.path.join(art, "firecracker")
-    other = "small" if args.template != "small" else "default"
+    other = next((t for t in sorted(os.listdir(tpls)) if t != args.template and not t.startswith(".")), "") if os.path.isdir(tpls) else ""
     vmstate = lambda t: os.path.join(tpls, t, "vmstate")
     if not os.path.exists(vmstate(other)):
         return print(f"fc prepare: skipped, no template {other!r} to mismatch with")

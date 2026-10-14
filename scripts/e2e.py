@@ -516,7 +516,8 @@ def checkpoint_restore():
     r = B.restore(path2, name=fork, ip="auto")
     check("fork: new address", r["ip"] != ip and B.ls()[fork]["ip"] == r["ip"], r)
     check("fork: RAM as at the checkpoint", md5(B, fork) == m)
-    check("fork: later writes not in it", B.exec(fork, "test -e /tmp/after")[0] != 0)
+    code, out, err = B.exec(fork, "test -e /tmp/after && echo present || echo absent")
+    check("fork: later writes not in it", code == 0 and out.strip() == "absent", (code, out, err))
     check("fork: same process", marker_id(B, fork) == proc)
     A.kill(vm)
     B.kill(fork)
@@ -581,7 +582,7 @@ def image_template():
     # Anonymous registry pulls get rate limited (HTTP 429); only that is retried.
     for delay in (5, 15, 30, None):
         try:
-            template(name, "--image", args.image, "--vcpus", "2", "--max", "2048", "--cmd", json.dumps(cmd))
+            template(name, "--image", args.image, "--image-cache", os.path.join(WORK, "images"), "--vcpus", "2", "--max", "2048", "--cmd", json.dumps(cmd))
             break
         except AssertionError as e:
             if delay is None or "HTTP 429" not in str(e):
@@ -638,6 +639,8 @@ def faults():
 # (tmpfs), state and checkpoints under /var/tmp (suspend needs a disk).
 RUN = tempfile.mkdtemp(prefix="fvci-", dir="/run")
 WORK = tempfile.mkdtemp(prefix="fvci-", dir="/var/tmp")
+# Templates of this run's own: never another's `ci` or the shared image cache.
+os.environ["FLEXVM_TEMPLATES"] = ENV["FLEXVM_TEMPLATES"] = os.path.join(WORK, "templates")
 A = Host("a", args.port_a, args.port_a + 1, args.net_a)
 GROW = args.template + "-grow"
 B = Host("b", args.port_a + 1, args.port_a, args.net_b)
@@ -649,7 +652,7 @@ def main():
     for c in selected:
         assert c in CASES, f"unknown case {c}; have {', '.join(CASES)}"
     started = time.time()
-    failed = []
+    failed, clean = [], False
     try:
         t = time.time()
         template(args.template, "--vcpus", "2", "--max", "2048")
@@ -672,12 +675,18 @@ def main():
                 traceback.print_exc()
                 results.append((c, "FAIL", time.time() - t))
                 failed.append(c)
-                for h in (A, B):  # free the VMs this script made, so the next case starts clean
-                    for vm in sorted(h.vms & set(h.ls())):
-                        h.kill(vm, check=False)
+                # Free the VMs this script made, so the next case starts clean; a
+                # failure here must not stop the other cases.
+                try:
+                    for h in (A, B):
+                        for vm in sorted(h.vms & set(h.ls())):
+                            h.kill(vm, check=False)
+                except Exception:
+                    traceback.print_exc()
+        clean = True
     finally:
-        # Teardown happens whatever saving the logs does.
-        if failed:
+        # Logs on any failure or interruption (a cancelled run too); teardown whatever that does.
+        if failed or not clean:
             for h in (A, B):
                 try:
                     h.save_logs()
