@@ -3224,6 +3224,42 @@ def fc_died():
     check("fc died: kill clears it", n not in vms(A), vms(A).get(n))
 
 
+def fc_died_busy():
+    """A Firecracker that dies while an operation holds the VM (a slow
+    checkpoint copying its memory) ends the VM at once all the same: the
+    death interrupts the operation instead of waiting for it. Exit status
+    124, the checkpoint fails and is never published, `ls` shows it failed."""
+    n, path = "ft-fc-died-busy", ckpt_path("ft-fc-died-busy")
+    scenario_vms.add(n)
+    p = subprocess.Popen([BIN, "--state", A.state, "--run", A.run, "run", n, "--template", args.template],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=ENV)
+    check("fc died busy: up", wait_for(lambda: vms(A).get(n, {}).get("state") == "running", 30), vms(A).get(n))
+    code, out = sh(A, n, "dd if=/dev/urandom of=/tmp/f bs=1M count=300 iflag=fullblock 2>/dev/null && echo ok")
+    check("fc died busy: memory written", code == 0, out)
+    fault(A, "ckpt_slow", 120000)
+    res = {}
+    t = threading.Thread(target=lambda: res.update(r=checkpoint(A, n, path)))
+    t.start()
+    busy = wait_for(lambda: staged_mib() > 20 and vms(A).get(n, {}).get("checkpoint_copy"), 60)
+    check("fc died busy: caught the checkpoint copying", busy, vms(A).get(n))
+    v = vms(A)[n]
+    os.kill(v["firecracker"], signal.SIGKILL)
+    started = time.time()
+    try:
+        code = p.wait(timeout=60)
+    except subprocess.TimeoutExpired:
+        code = None
+    took = time.time() - started
+    t.join(60)
+    fault(A, "ckpt_slow", 0)
+    check("fc died busy: noticed at once, exit status 124", code == 124 and took < 2, (code, took))
+    check("fc died busy: the checkpoint failed, nothing published", not res.get("r", {}).get("ok") and not os.path.exists(path), res)
+    failed = vms(A).get(n, {})
+    check("fc died busy: ls shows it failed", failed.get("state") == "failed" and "signal: 9" in failed.get("error", ""), failed)
+    check("fc died busy: address withdrawn", not addr(A, v["ip"]).get("holder") and addr(A, v["ip"]).get("withdrawn"), addr(A, v["ip"]))
+    ok(kill(A, n))
+
+
 def pull_died():
     """An arrival whose Firecracker dies mid-pull never releases its source,
     which runs its copy again. A VM coming home whose arrival dies mid-pull
@@ -3426,6 +3462,31 @@ def suspend_killed():
     os.kill(pid, signal.SIGTERM)
     r = kill(A, n)
     check("suspend killed: kill after a suspend destroys it", r["ok"] and n not in vms(A) and not os.path.exists(d), (r, vms(A).get(n)))
+
+
+def suspend_cmd():
+    """SIGTERM on a `run -d -- CMD` VM suspends it, CMD and all: the command
+    keeps running in the guest's memory, and the process `flexvm resume`
+    starts reattaches to it, prints the rest of its output (nothing twice)
+    and exits with its status."""
+    n = "ft-susp-cmd"
+    scenario_vms.add(n)
+    cmd = "echo before; sleep 6; echo after; exit 7"
+    clear_log(A, n)
+    ok(cli_json(A, "run", n, "--template", args.template, "-d", "--", cmd))
+    pid = vm_pid(A, n)
+    check("suspend cmd: started", wait_for(lambda: "before" in log(A, n), 30), log(A, n)[-300:])
+    t = time.time()
+    os.kill(pid, signal.SIGTERM)
+    gone = wait_for(lambda: not alive(pid), 60)
+    check("suspend cmd: SIGTERM suspends it", gone and vms(A).get(n, {}).get("state") == "suspended" and time.time() - t < 10,
+          (time.time() - t, vms(A).get(n), log(A, n)[-500:]))
+    check("suspend cmd: the command was not given up", "timed out" not in log(A, n) and "being killed" not in log(A, n), log(A, n)[-500:])
+    r = subprocess.run([BIN, "--state", A.state, "--run", A.run, "resume", n], capture_output=True, text=True, timeout=120, env=ENV)
+    check("suspend cmd: resumed, the command's status", r.returncode == 7, (r.returncode, r.stderr[-500:]))
+    out = log(A, n) + r.stdout
+    check("suspend cmd: its output, once", out.count("before") == 1 and out.count("after") == 1, (log(A, n)[-300:], r.stdout))
+    check("suspend cmd: gone after it", n not in vms(A), vms(A).get(n))
 
 
 def suspend_debris():
@@ -3700,7 +3761,7 @@ SCENARIOS = dict(
     sigkill_restart=sigkill_restart, listen_trickle=listen_trickle,
     cow_wp_race=cow_wp_race, fetch_tail_enomem=fetch_tail_enomem, fetch_enomem_stuck=fetch_enomem_stuck,
     same_host_order=same_host_order, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,
-    handoff_superseded=handoff_superseded)
+    handoff_superseded=handoff_superseded, suspend_cmd=suspend_cmd, fc_died_busy=fc_died_busy)
 names = [n for s in args.scenarios for n in (list(SCENARIOS) if s == "all" else [s])]
 if os.geteuid() != 0:
     sys.exit("run as root (sudo)")

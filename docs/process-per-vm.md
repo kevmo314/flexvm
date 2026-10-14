@@ -30,7 +30,10 @@ stopped by `checkpoint --stop`; 128 + the signal when one ended it (130:
 SIGINT destroyed it, 143: SIGTERM suspended it); 125 when flexvm failed (it
 could not start the VM, or gave it up); 124 when it died under the process
 (its Firecracker exited, watched through a pidfd, or its memory was lost):
-cleaned up as a
+noticed at once whatever operation is in progress, which is interrupted
+rather than waited for (`Vm::mark_dead`: guest calls fail without retrying,
+waits on Firecracker give up, the pager stops, a checkpoint is cancelled),
+then cleaned up as a
 kill, with why (Firecracker's exit status and the end of its log, the
 guest's console) in `RUN/vms/NAME.failed`, which `ls` shows as `failed`
 until `flexvm kill NAME`.
@@ -46,7 +49,11 @@ address by how the VM left (`End::Gone` withdraws it, `Suspended` keeps it,
 this VM, withdraws it), deletes a consumed checkpoint, gives up the name, and
 tells a waiting client and a standby claimer before it exits. With `-- CMD`, the VM runs
 CMD in the guest, streams its output, and the process exits with CMD's status
-(the VM is destroyed afterwards).
+(the VM is destroyed afterwards). CMD goes along with a suspend: while one
+runs its stream waits (never giving up, never ending the VM), and the
+suspend holds its session from before the pause, recording in the checkpoint
+(`CMD`) the command, its guest session and how much of its output was
+written out; `flexvm resume` reattaches it from there and exits with its status.
 
 ### Signals
 
@@ -478,7 +485,8 @@ where it is kept and what tests it.
   becomes `standby` (count, refill, claim fallback). New: `abort_superseded`,
   `gen_zero`, `suspend_gen`, `signals`, `kill_source`, `forged_peer`,
   `restore_ip_peer`, `late_withdrawal`, `kill_refused_checkpoint`,
-  `wildcard_listen`, `same_host_order`, `arrival_abort_route`, `arrival_killed_route`, `handoff_superseded`, and processes SIGKILLed between
+  `wildcard_listen`, `same_host_order`, `arrival_abort_route`, `arrival_killed_route`, `handoff_superseded`,
+  `suspend_cmd` (#134), `fc_died_busy` (#122), and processes SIGKILLed between
   steps at test stalls (`incoming_killed`, `start_killed`, `claim_killed`).
   Dropped:
   `target_restart_symlink`, `shared_run_dir`, `state_dir_lock` (they tested a

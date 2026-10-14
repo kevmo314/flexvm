@@ -33,6 +33,8 @@ const STARTED: &str = "STARTED";
 const DISCARDED: &str = "DISCARDED";
 const GEN: &str = "GEN";
 const QUARANTINE: &str = "QUARANTINE";
+/// A suspended `run -- CMD` VM's command and its session (`{"cmd", "session"}`), reattached on resume.
+const CMD: &str = "CMD";
 
 /// Set while a suspend or `checkpoint --stop` saves the VM, and for good once
 /// it did: the app log follower writes nothing past the offset the checkpoint
@@ -165,7 +167,9 @@ impl Proc {
     pub fn suspend(&self) -> Error {
         let vm = self.vm();
         let mut t = Phases::new();
+        self.suspending.store(true, Ordering::SeqCst);
         let op = self.op();
+        let mut cmd_held = None;
         let saved = (|| -> Result<(Manifest, Value)> {
             if !matches!(vm.state(), State::Running | State::Paused) {
                 bail!("vm {} is {}; not suspending it", vm.name, vm.state().name());
@@ -182,6 +186,12 @@ impl Proc {
             }
             let staging = Staging::new(&dir, vm.dir.join("checkpoint.vmstate"))?;
             staging.add_file(GEN, self.gen().to_string().as_bytes())?;
+            // Held from here on: nothing more of its output is written here, the resumed VM goes on from what was.
+            if let Some(cmd) = self.cmd.lock().unwrap().clone() {
+                let session = self.cmd_session()?.lock().unwrap();
+                staging.add_file(CMD, &serde_json::to_vec(&json!({"cmd": cmd, "session": *session}))?)?;
+                cmd_held = Some(session);
+            }
             let saved = self.save(vm, staging, false, false, &mut t);
             self.publish();
             saved
@@ -211,7 +221,11 @@ impl Proc {
                 eprintln!("{}", json!({"name": vm.name, "state": "suspended", "dir": self.host.suspended(&vm.name), "freed_rss_mib": vm.rss() >> 20, "data_mib": data, "suspend_ms": ms(t.total()), "timings_ms": t.json()}));
                 self.finish(&op, End::Suspended, 128 + libc::SIGTERM, None)
             }
-            Err(e) => e,
+            Err(e) => {
+                drop(cmd_held);
+                self.suspending.store(false, Ordering::SeqCst);
+                e
+            }
         }
     }
 
@@ -238,6 +252,7 @@ impl Proc {
             format!("vm {name} is quarantined: its address generation was never recorded, so it cannot be resumed with its address; restore {dir:?} with --name NEW --ip auto (choose an unused name), or flexvm kill {name} to discard it")
         })?;
         let ck = Checkpoint::open(&dir)?;
+        let cmd = read_cmd(&dir).map_err(|e| format!("vm {name}: its command's record {}: {e}", dir.join(CMD).display()))?;
         t.mark("verify_checkpoint");
         let ip = ck.manifest.ip;
         let claim = {
@@ -251,6 +266,11 @@ impl Proc {
         match self.restore_checkpoint(name, ck, ip, true, false, &mut t) {
             Ok(mut v) => {
                 v["from"] = json!("suspended");
+                // Its command runs on in the guest: the process reattaches it and ends with it.
+                if let Some((cmd, session)) = cmd {
+                    *self.cmd.lock().unwrap() = Some(cmd);
+                    let _ = self.cmd_session.set(std::sync::Mutex::new(session));
+                }
                 Ok(v)
             }
             Err(Restore::NotRun(e)) => {
@@ -665,6 +685,17 @@ impl Drop for CopyGrowth<'_> {
     fn drop(&mut self) {
         *self.0.cow_copy.lock().unwrap() = false;
     }
+}
+
+fn read_cmd(dir: &Path) -> Result<Option<(String, crate::Session)>> {
+    let bytes = match std::fs::read(dir.join(CMD)) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let v: Value = serde_json::from_slice(&bytes)?;
+    let cmd = v["cmd"].as_str().ok_or("no command")?.to_string();
+    Ok(Some((cmd, serde_json::from_value(v["session"].clone())?)))
 }
 
 fn read_gen(dir: &Path) -> Option<u64> {

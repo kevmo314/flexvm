@@ -24,6 +24,7 @@ mod vmproc;
 use std::io::{BufReader, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -466,13 +467,45 @@ fn image_options(args: &Args) -> Result<Option<image::Options>> {
     }))
 }
 
+/// A command's session in the guest: its id, whether the guest took it, and
+/// how much of its output was written out (a reattach goes on from there).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Session {
+    pub id: String,
+    pub started: bool,
+    pub offset: u64,
+}
+
+impl Session {
+    pub fn new() -> Result<Session> {
+        Ok(Session { id: guest::session_id()?, started: false, offset: 0 })
+    }
+}
+
 /// Reattaches when the connection drops (a checkpoint's pause resets vsock).
 pub fn exec(host: &Host, name: &str, cmd: &str) -> Result<i32> {
-    let (stdout, stderr) = (&mut std::io::stdout().lock(), &mut std::io::stderr().lock());
-    let id = guest::session_id()?;
-    let (mut offset, mut started, mut error) = (0, false, String::new());
+    let session = Session::new()?;
+    let id = session.id.clone();
+    let code = exec_session(host, name, cmd, &Mutex::new(session))?;
+    // Best effort: the guest closes it a minute after its client leaves anyway.
+    let _ = vmproc::connect(host, name, &json!({"op": "exec", "session": id, "action": "close"}), &[]);
+    Ok(code)
+}
+
+/// `exec` of a session that may have started already. Output is written,
+/// and its offset counted, under the session's lock: whoever holds it knows
+/// exactly what was written (a suspend records it for the resumed VM). The
+/// session is left open: a VM's main command may be reattached after a
+/// suspend, and its VM goes with it anyway.
+pub fn exec_session(host: &Host, name: &str, cmd: &str, session: &Mutex<Session>) -> Result<i32> {
+    let id = session.lock().unwrap().id.clone();
+    let mut error = String::new();
     let mut deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
+        let (started, offset) = {
+            let s = session.lock().unwrap();
+            (s.started, s.offset)
+        };
         let req = json!({"op": "exec", "session": id, "action": if started { "attach" } else { "start" }, "offset": offset, "cmd": cmd});
         let stream = vmproc::connect(host, name, &req, &[]).and_then(|c| {
             c.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -485,17 +518,16 @@ pub fn exec(host: &Host, name: &str, cmd: &str) -> Result<i32> {
             r.get_ref().set_read_timeout(Some(Duration::from_secs(3)))?;
             Ok(r)
         });
-        match stream.map(|mut r| exec_frames(&mut r, &id, &mut started, &mut offset, stdout, stderr, &mut deadline)) {
+        // Locked per write, never across a read: a checkpoint takes stdout's lock too.
+        match stream.map(|mut r| exec_frames(&mut r, session, &mut std::io::stdout(), &mut std::io::stderr(), &mut deadline)) {
             Ok(Err(e)) => return Err(e),
-            Ok(Ok(StreamEnd::Exit(code))) => {
-                // Best effort: the guest closes it a minute after its client leaves anyway.
-                let _ = vmproc::connect(host, name, &json!({"op": "exec", "session": id, "action": "close"}), &[]);
-                return Ok(code);
-            }
+            Ok(Ok(StreamEnd::Exit(code))) => return Ok(code),
             Ok(Ok(StreamEnd::Disconnected(why))) => error = why,
             Err(e) => {
-                // A new command fails at once; a running one waits for its VM to resume.
-                if e.to_string().contains(" is paused; ") {
+                // A new command fails at once; a running one waits for its VM to
+                // resume, or for a checkpoint (a suspend's too) to finish.
+                let msg = e.to_string();
+                if msg.contains(" is paused; ") || msg.contains(vm::CHECKPOINTING) {
                     if !started {
                         return Err(e);
                     }
@@ -509,7 +541,7 @@ pub fn exec(host: &Host, name: &str, cmd: &str) -> Result<i32> {
                         return Err(e);
                     }
                 }
-                error = e.to_string();
+                error = msg;
             }
         }
         std::thread::sleep(Duration::from_millis(200));
@@ -522,32 +554,34 @@ enum StreamEnd {
     Disconnected(String),
 }
 
-/// Tracks `offset` so a reattach resumes without duplicates.
-fn exec_frames(r: &mut impl Read, id: &str, started: &mut bool, offset: &mut u64, stdout: &mut impl Write, stderr: &mut impl Write, deadline: &mut Instant) -> Result<StreamEnd> {
+/// Tracks the session's offset so a reattach resumes without duplicates.
+fn exec_frames(r: &mut impl Read, session: &Mutex<Session>, stdout: &mut impl Write, stderr: &mut impl Write, deadline: &mut Instant) -> Result<StreamEnd> {
+    let id = session.lock().unwrap().id.clone();
     loop {
         let (kind, data) = match guest::read_frame(r) {
             Ok(Some(frame)) => frame,
             Ok(None) => return Ok(StreamEnd::Disconnected("the vm closed the stream".into())),
             Err(e) => return Ok(StreamEnd::Disconnected(e.to_string())),
         };
+        let mut s = session.lock().unwrap();
         match kind {
-            guest::FRAME_STDOUT | guest::FRAME_STDERR if *started => {
-                let bytes = guest::session_output(&data, *offset)?;
+            guest::FRAME_STDOUT | guest::FRAME_STDERR if s.started => {
+                let bytes = guest::session_output(&data, s.offset)?;
                 let out: &mut dyn Write = if kind == guest::FRAME_STDOUT { stdout } else { stderr };
                 out.write_all(bytes)?;
                 out.flush()?;
-                *offset += bytes.len() as u64;
+                s.offset += bytes.len() as u64;
             }
             guest::FRAME_STDOUT | guest::FRAME_STDERR => return Err("session output before session id".into()),
-            guest::FRAME_EXIT => return Ok(StreamEnd::Exit(guest::session_exit(&data, *offset)?)),
+            guest::FRAME_EXIT => return Ok(StreamEnd::Exit(guest::session_exit(&data, s.offset)?)),
             guest::FRAME_LOST => {
                 let start = u64::from_le_bytes(data.as_slice().try_into().map_err(|_| "bad output-lost frame")?);
-                return Err(format!("session output lost: needed offset {offset}, retained output starts at {start}").into());
+                return Err(format!("session output lost: needed offset {}, retained output starts at {start}", s.offset).into());
             }
-            guest::FRAME_MSG if data == id.as_bytes() => *started = true,
-            guest::FRAME_MSG if data == b"waiting" && *started => {}
+            guest::FRAME_MSG if data == id.as_bytes() => s.started = true,
+            guest::FRAME_MSG if data == b"waiting" && s.started => {}
             // Before the id echo the request itself failed: not retried.
-            guest::FRAME_MSG if !*started => return Err(String::from_utf8_lossy(&data).into_owned().into()),
+            guest::FRAME_MSG if !s.started => return Err(String::from_utf8_lossy(&data).into_owned().into()),
             guest::FRAME_MSG => return Ok(StreamEnd::Disconnected(String::from_utf8_lossy(&data).into_owned())),
             _ => return Err(format!("unknown session frame {kind}").into()),
         }
@@ -654,11 +688,13 @@ mod exec_tests {
         let mut first = frames(&[(guest::FRAME_MSG, b"test-id"), (guest::FRAME_STDOUT, &at(0, b"abc"))]);
         first.extend_from_slice(&[guest::FRAME_STDERR, 11, 0, 0, 0]);
         first.extend_from_slice(&at(3, b"d"));
-        let (mut offset, mut started, mut stdout, mut stderr, mut deadline) = (0, false, Vec::new(), Vec::new(), Instant::now());
-        let mut run = |input: Vec<u8>| exec_frames(&mut input.as_slice(), "test-id", &mut started, &mut offset, &mut stdout, &mut stderr, &mut deadline).unwrap();
+        let session = Mutex::new(Session { id: "test-id".into(), started: false, offset: 0 });
+        let (mut stdout, mut stderr, mut deadline) = (Vec::new(), Vec::new(), Instant::now());
+        let mut run = |input: Vec<u8>| exec_frames(&mut input.as_slice(), &session, &mut stdout, &mut stderr, &mut deadline).unwrap();
         assert!(matches!(run(first), StreamEnd::Disconnected(_)));
         let resumed = frames(&[(guest::FRAME_MSG, b"test-id"), (guest::FRAME_STDERR, &at(3, b"def")), (guest::FRAME_EXIT, &[&6u64.to_le_bytes()[..], &7i32.to_le_bytes()].concat())]);
         assert!(matches!(run(resumed), StreamEnd::Exit(7)));
-        assert!(started && offset == 6 && stdout == b"abc" && stderr == b"def");
+        let s = session.lock().unwrap();
+        assert!(s.started && s.offset == 6 && stdout == b"abc" && stderr == b"def");
     }
 }
