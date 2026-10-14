@@ -207,6 +207,8 @@ pub struct Pager {
     /// The page after the last template fault: only sequential template reads copy `FAULT_AROUND` pages, avoiding
     /// sixteenfold amplification for strided reads of guest page structs.
     template_next: AtomicUsize,
+    /// The working-set prefetch is due or running: its pages are still to come.
+    prefetching: AtomicBool,
     failed: OnceLock<PagerFailure>,
     stop: AtomicBool,
     thread: Mutex<Option<thread::JoinHandle<()>>>,
@@ -271,6 +273,7 @@ impl Pager {
             done: (Mutex::new(()), Condvar::new()),
             quiesce: AtomicBool::new(false),
             template_next: AtomicUsize::new(usize::MAX),
+            prefetching: AtomicBool::new(false),
             failed: OnceLock::new(),
             stop: AtomicBool::new(false),
             thread: Mutex::new(None),
@@ -298,7 +301,10 @@ impl Pager {
             match handshake {
                 // Alongside fault handling: Firecracker itself touches guest memory while restoring devices and must
                 // not wait behind it.
-                Ok(prefetch) => p.start_prefetch(false, prefetch),
+                Ok(prefetch) => {
+                    p.prefetching.store(prefetch, Ordering::SeqCst);
+                    p.start_prefetch(false, prefetch)
+                }
                 Err(e) => return p.fail(format!("uffd handshake failed: {e}")),
             }
             p.serve();
@@ -455,6 +461,7 @@ impl Pager {
                 i += n.max(1);
             }
         }
+        self.prefetching.store(false, Ordering::SeqCst);
     }
 
     /// Runs of pages populated so far, as `(first_page, count)`.
@@ -557,13 +564,15 @@ impl Pager {
         self.wait_for(timeout, || self.remote_left() == 0)
     }
 
-    /// `wait_pulled(None)`, telling `tick` what is left every `every` meanwhile.
-    pub fn wait_pulled_every(&self, every: Duration, mut tick: impl FnMut(usize)) -> bool {
+    /// `wait_pulled(None)`, telling `tick` every `every` meanwhile how many MiB are still to come: remote pages, and the
+    /// template's working set while its prefetch may still run.
+    pub fn wait_pulled_every(&self, every: Duration, mut tick: impl FnMut(u64)) -> bool {
         while !self.wait_pulled(Some(every)) {
             if self.stop.load(Ordering::SeqCst) {
                 return false;
             }
-            tick(self.remote_left());
+            let ws = if self.prefetching.load(Ordering::SeqCst) { self.base.working_set_mib() } else { 0 };
+            tick((self.remote_left() as u64 * PAGE_SIZE as u64).div_ceil(1 << 20) + ws);
         }
         true
     }
