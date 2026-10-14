@@ -345,9 +345,12 @@ pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]
     let mut line = serde_json::to_vec(req)?;
     line.push(b'\n');
     let name = req["name"].as_str().unwrap_or("");
-    // One budget for all (a stopped standby uses it up), and a moment past it for each live one.
+    // One budget for all (a stopped standby uses it up), and a moment past it for each live one, up to a few.
     let budget = Instant::now() + HANDSHAKE_TIMEOUT;
     for sock in socks {
+        if Instant::now() >= budget + 4 * LATE {
+            break;
+        }
         let at = budget.max(Instant::now() + LATE);
         let c = match crate::util::send_unix(&sock, &line, fds, at) {
             Ok(c) => c,
