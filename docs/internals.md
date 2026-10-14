@@ -62,14 +62,22 @@ not wait on the host:
   reads MemTotal, and re-reads it on every reply and retry. If the host answers `full` (at the ceiling), or
   nothing arrives within 3 s, the agent lifts the throttle, and the guest
   behaves as it would without it.
-- **Boot memory for page structs.** Hot-plugged memory is movable, so the
-  page structs of every plugged block (1/64 of it) and all other kernel
-  allocations live in boot memory. A 256 MiB base ran out at ~11 GiB plugged
-  and the guest kernel OOMed. The default base is therefore 256 MiB + 1/32 of
-  the ceiling (1280 MiB on a 32 GiB host); untouched, it costs nothing.
+- **Kernel memory.** Page structs of every plugged block (1/64 of it) and
+  other kernel allocations need non-movable memory. Plugged blocks online
+  auto-movable: movable only while kernel memory is at least 1/20 of it, so
+  kernel memory grows with the plug instead of filling boot memory (a 256 MiB
+  base onlining all movable panicked near 13 GiB, #97). The default base is
+  256 MiB + 1/32 of the ceiling (1280 MiB on a 32 GiB host; untouched, it
+  costs nothing). The boot command line is part of the snapshot: templates
+  built before this, and their checkpoints, keep the old onlining; rebuild
+  them. Unplug takes movable blocks first; kernel blocks may not unplug, but
+  their free pages go back through free page reporting.
 - **Shrinking** is free page reporting (freed pages go back within seconds,
   plugged or not), plus unplugging memory above the template's plug once a
-  guest has had more than three times its headroom free for 10 s.
+  guest has had more than three times its headroom free for 10 s. A shrink
+  the guest cannot finish never blocks growth: a guest that runs short
+  cancels it and grows from what is plugged, and a resize still unfinished
+  after 10 s settles at what is plugged (`shrink_stall`).
 - **Host accounting.** A VM is starved (and migrated by the pressure policy)
   only when it is actually short of free memory and cannot grow here: at its
   ceiling, or refused admission. Plugged-but-free memory is not counted as

@@ -593,7 +593,7 @@ impl Proc {
                 *vm.last_resize.lock().unwrap() = Instant::now();
                 let mib = req["mib"].as_u64().ok_or("missing mib")?.min(vm.template.meta.max_mib - vm.template.meta.mem_mib);
                 vm.fc(|fc| fc.patch("/hotplug/memory", json!({"requested_size_mib": mib})))?;
-                Ok(json!({"requested_mib": mib}))
+                Ok(json!(mib))
             }
             "status" => Ok(json!({
                 "state": vm.state().name(),
@@ -870,8 +870,11 @@ fn resize(vm: &Vm, host: &Host, hint: Option<u64>, grow_only: bool) -> Result<Re
     }
     let (stats, hp) = vm.fc(|fc| Ok((if hint.is_none() { fc.get("/balloon/statistics")? } else { Value::Null }, fc.get("/hotplug/memory")?)))?;
     let (requested, plugged) = (hp["requested_size_mib"].as_u64().ok_or("no hotplug state")?, hp["plugged_size_mib"].as_u64().ok_or("no hotplug state")?);
-    if plugged != requested {
-        return Ok(Resized::Busy);
+    // The guest may never finish a resize (kernel-zone blocks, memory in use
+    // keep it from unplugging): past RESIZE_STALL it settles for what is plugged.
+    let stalled = plugged != requested && last.elapsed() > RESIZE_STALL;
+    if plugged < requested && !stalled {
+        return Ok(Resized::Busy); // growing
     }
     let total = meta.mem_mib + plugged;
     let avail = match hint {
@@ -885,25 +888,39 @@ fn resize(vm: &Vm, host: &Host, hint: Option<u64>, grow_only: bool) -> Result<Re
     // Balloon statistics lag a plug by up to a second.
     let stale = hint.is_none() && last.elapsed() < Duration::from_millis(1500);
     let short = headroom.saturating_sub(avail);
-    let new = if short > 0 && !stale {
-        (requested + round(headroom * 2 - avail).min(round(total / 4).max(STEP_MIB))).min(hotplug_total)
-    } else if !grow_only && avail > headroom * 3 && requested > floor && last.elapsed() > Duration::from_secs(10) {
-        requested.saturating_sub((avail - headroom * 2) / STEP_MIB * STEP_MIB).max(floor)
-    } else {
-        requested
-    };
-    let refused = new > requested && !host.admit(new - requested);
-    let full = short > 0 && (requested == hotplug_total || refused);
-    vm.starved.store(full, Ordering::SeqCst);
-    if new == requested || refused {
-        return Ok(if full { Resized::Full } else { Resized::Same });
+    let urgent = short > 0 && !stale;
+    if plugged > requested && !stalled && !urgent {
+        return Ok(Resized::Busy); // shrinking
     }
-    let why = if hint.is_some() { "guest asked" } else { "tick" };
-    eprintln!("vm {}: available {avail}/{total} MiB, hotplug {requested} -> {new} MiB ({why})", vm.name);
-    vm.fc(|fc| fc.patch("/hotplug/memory", json!({"requested_size_mib": new})))?;
-    *last = Instant::now();
-    Ok(if new > requested { Resized::Grew } else { Resized::Same })
+    // Sizes count from what is plugged: urgent growth cancels a pending shrink.
+    let new = if urgent {
+        (plugged + round(headroom * 2 - avail).min(round(total / 4).max(STEP_MIB))).min(hotplug_total)
+    } else if !grow_only && avail > headroom * 3 && plugged > floor && last.elapsed() > Duration::from_secs(10) {
+        plugged.saturating_sub((avail - headroom * 2) / STEP_MIB * STEP_MIB).max(floor)
+    } else {
+        plugged
+    };
+    let refused = new > plugged && !host.admit(new - plugged);
+    let full = short > 0 && (plugged == hotplug_total || refused);
+    vm.starved.store(full, Ordering::SeqCst);
+    let new = if refused { plugged } else { new };
+    if new != requested {
+        let why = if stalled { "stalled" } else if hint.is_some() { "guest asked" } else { "tick" };
+        eprintln!("vm {}: available {avail}/{total} MiB, hotplug {requested} (plugged {plugged}) -> {new} MiB ({why})", vm.name);
+        vm.fc(|fc| fc.patch("/hotplug/memory", json!({"requested_size_mib": new})))?;
+        *last = Instant::now();
+    }
+    Ok(if new > plugged {
+        Resized::Grew
+    } else if full {
+        Resized::Full
+    } else {
+        Resized::Same
+    })
 }
+
+/// How long a resize may go unfinished before it settles at what is plugged.
+const RESIZE_STALL: Duration = Duration::from_secs(10);
 
 const MEM_REQUEST_MAX: usize = 128;
 const MEM_REQUEST_DEADLINE: Duration = Duration::from_millis(500);

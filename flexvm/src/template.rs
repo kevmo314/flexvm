@@ -31,8 +31,9 @@ pub const BOOT_ARGS: &str = "console=ttyS0 quiet reboot=k panic=1 pci=off \
 /// Restores pay per KVM memslot and untouched memory is free, so slots are big.
 pub const SLOT_MIB: u64 = 1024;
 pub const STEP_MIB: u64 = 128;
-/// Hot-plugged memory is movable, so the page structs of all of it (1/64) must fit in boot
-/// memory: a 256 MiB base OOMs near 11 GiB plugged.
+/// Kernel memory (page structs of hot-plugged memory, 1/64 of it, and the rest) grows with
+/// the plug: blocks online auto-movable (BOOT_ARGS), movable only while there is 1/20 as
+/// much kernel memory (#97). This base keeps a guest's first ~20x of it movable.
 pub fn base_mib(max_mib: u64) -> u64 {
     (256 + max_mib / 32).div_ceil(STEP_MIB) * STEP_MIB
 }
