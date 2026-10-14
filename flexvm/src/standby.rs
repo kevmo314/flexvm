@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use crate::bail;
-use crate::fc::Idle;
+use crate::fc::Firecracker;
 use crate::guest;
 use crate::host::{fault, Host, Ident, PidFd};
 use crate::template::{Paths, Template};
@@ -152,7 +152,7 @@ fn refill_by(host: &Host, template: &str, wait: bool) -> Result<usize> {
     let log = std::fs::OpenOptions::new().create(true).append(true).open(d.join("standby.log"))?;
     let args = [host.state.as_os_str(), host.run.as_os_str(), template.as_ref()];
     for _ in 0..want {
-        if !host.admit(256)? {
+        if host.grant(256, None)?.is_none() {
             break;
         }
         let (r, w) = std::os::unix::net::UnixStream::pair()?;
@@ -226,7 +226,7 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
         if unsafe { libc::poll(&mut pfd, 1, 100) } <= 0 {
             let current = key(&p.paths, template).ok();
             let extra = live(host, template).iter().position(|id| *id == me).is_some_and(|i| i >= target(host, template));
-            let dead = p.standby.lock().unwrap().as_mut().is_none_or(|s| s.pager.failed().is_some() || !s.firecracker_alive());
+            let dead = p.standby.lock().unwrap().as_ref().is_none_or(|s| s.pager.failed().is_some() || !s.firecracker_alive());
             if p.stop_requested() || current.as_deref() != Some(&mine) || extra || dead {
                 p.finish(op, End::NotStarted, 0, None);
             }
@@ -407,11 +407,11 @@ const RESEED_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Runs the restored VM once (the slow first resume, off the request path)
 /// until the guest reseeds, then pauses it.
-fn load(idle: Idle, template: Arc<Template>) -> Result<Prepared> {
+fn load(idle: Firecracker, template: Arc<Template>) -> Result<Prepared> {
     let p = Vm::prepare(idle, template, &mut Phases::new())?;
     p.pager.learn_load_set();
     let fc = p.firecracker();
-    fc.load_snapshot(&p.template().vmstate(), p.tap(), Some(true), LOAD_TIMEOUT)?;
+    fc.load_snapshot(&p.template().vmstate(), &p.firecracker().tap, Some(true), LOAD_TIMEOUT)?;
     // Only an API pause stops the devices writing guest memory.
     fc.request_within("PATCH", "/vm", Some(json!({"state": "Paused"})), API_TIMEOUT)?;
     p.pager.wait_ready(Duration::from_secs(5))?;
@@ -429,7 +429,7 @@ fn load(idle: Idle, template: Arc<Template>) -> Result<Prepared> {
 /// On failure the flag says whether the guest may have run for `name` (the
 /// resume may have reached Firecracker).
 fn resume(p: Prepared, name: &str, ip: Ipv4Addr, kill: bool, t: &mut Phases) -> std::result::Result<Arc<Vm>, (Error, bool)> {
-    crate::net::attach(ip, p.tap()).map_err(|e| (e, false))?;
+    crate::net::attach(ip, &p.firecracker().tap).map_err(|e| (e, false))?;
     t.mark("route");
     let res = p.firecracker().request_within("PATCH", "/vm", Some(json!({"state": "Resumed"})), API_TIMEOUT);
     if kill {

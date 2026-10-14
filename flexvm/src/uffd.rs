@@ -742,7 +742,7 @@ impl Pager {
             eprintln!("uffd: firecracker unmapped guest memory; killing it unless it exits within {UNMAPPED_GRACE:?}");
             if let Some(fd) = self.pidfd.get().and_then(|fd| fd.try_clone().ok()) {
                 thread::spawn(move || {
-                    if !crate::util::pidfd_wait(&fd, UNMAPPED_GRACE).unwrap_or(false) {
+                    if !crate::util::readable(&fd, UNMAPPED_GRACE).unwrap_or(false) {
                         let _ = crate::util::pidfd_kill(&fd);
                     }
                 });
@@ -763,7 +763,7 @@ impl Pager {
     pub fn firecracker_gone(&self) {
         self.kill_firecracker();
         if let Some(fd) = self.pidfd.get() {
-            let _ = crate::util::pidfd_wait(fd, Duration::from_secs(5));
+            let _ = crate::util::readable(fd, Duration::from_secs(5));
         }
         self.gone();
     }

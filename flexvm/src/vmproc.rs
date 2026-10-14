@@ -265,18 +265,16 @@ impl Proc {
     /// None holds the grant until a disk restore or arrival finishes pulling.
     pub fn admit_start(&self, need: u64, held: Option<u64>, floor: crate::host::Floor) -> Result<()> {
         let mib = crate::limit::allowance(need);
-        let (id, hold) = match held {
-            Some(held) => (self.host.grant_above(mib.saturating_sub(held), floor)?, None),
+        let id = match held {
+            Some(held) => self.host.grant_start(mib.saturating_sub(held), floor, false)?.0,
             None => {
-                let (id, hold) = self.host.grant_held(mib, floor)?;
-                (id, Some(hold))
+                let (id, hold) = self.host.grant_start(mib, floor, true)?;
+                *self.held_grant.lock().unwrap() = Some(hold.ok_or("no hold")?);
+                id
             }
         };
         self.granted.store(mib, Ordering::SeqCst);
         self.charged.store(id, Ordering::SeqCst);
-        if hold.is_some() {
-            *self.held_grant.lock().unwrap() = hold;
-        }
         Ok(())
     }
 
@@ -504,7 +502,7 @@ impl Proc {
                 let ip = a.ip;
                 if let Ok(l) = self.host.lock() {
                     let _ = a.release(&l);
-                    let _ = self.host.reinstall(&l, ip);
+                    let _ = self.host.reinstall(&l, ip, None);
                 }
             }
             (_, None) => {}
@@ -555,7 +553,7 @@ impl Proc {
             let ours = self.host.holder(&l, ip).is_ok_and(|h| h.is_none_or(|h| h == self.name()));
             let _ = a.release(&l);
             let _ = self.host.observe(&l, ip, gen, None);
-            if ours && !self.host.reinstall(&l, ip).unwrap_or(false) {
+            if ours && !self.host.reinstall(&l, ip, None).unwrap_or(false) {
                 crate::net::unroute(ip);
             }
         }
@@ -1270,7 +1268,7 @@ fn resize(vm: &Vm, host: &Host, hint: Option<u64>, grow_only: bool) -> Result<Re
     let Some(plan) = sizes.plan(requested, plugged, avail, last.elapsed(), hint.is_some(), grow_only) else {
         return Ok(Resized::Busy);
     };
-    let refused = plan.charge > 0 && !host.admit(plan.charge)?;
+    let refused = plan.charge > 0 && host.grant(plan.charge, None)?.is_none();
     let full = plan.short && (plugged == hotplug_total || refused);
     // Starved only when the host refused it: at its own ceiling, moving it cannot help.
     vm.starved.store(plan.short && refused, Ordering::SeqCst);
@@ -1580,7 +1578,7 @@ fn evict(host: &Host, peers: &[String], vms: &[Entry], avail: u64, deadline: Ins
                 return;
             }
             eprintln!("vm {}: {why} ({avail} MiB available); migrating to {peer}", vm.name);
-            match call_within(host, &vm.name, json!({"op": "migrate", "to": peer, "if_idle": true, "evict": true}), deadline) {
+            match call(host, &vm.name, json!({"op": "migrate", "to": peer, "if_idle": true, "evict": true}), Some(deadline)) {
                 Ok(_) => {
                     backoff.remove(&key);
                     let _ = crate::host::store(&backoff_path, &backoff, false);
@@ -1649,15 +1647,14 @@ pub fn connect(host: &Host, name: &str, req: &Value, fds: &[i32], at: Instant) -
     Ok(c)
 }
 
-pub fn call(host: &Host, name: &str, req: Value) -> Result<Value> {
-    let c = connect(host, name, &req, &[], Instant::now() + Duration::from_secs(10))?;
-    answer(crate::util::recv_json(&mut BufReader::new(c))?, &format!("vm {name}"))
-}
-
-/// `call`, connected, sent and answered by `at`.
-fn call_within(host: &Host, name: &str, req: Value, at: Instant) -> Result<Value> {
-    let c = crate::util::By { s: connect(host, name, &req, &[], at)?, at };
-    answer(crate::util::recv_json(&mut BufReader::new(c))?, &format!("vm {name}"))
+/// With `at`, connected, sent and answered by then; otherwise only connecting and sending time out.
+pub fn call(host: &Host, name: &str, req: Value, at: Option<Instant>) -> Result<Value> {
+    let c = connect(host, name, &req, &[], at.unwrap_or_else(|| Instant::now() + Duration::from_secs(10)))?;
+    let reply = match at {
+        Some(at) => crate::util::recv_json(&mut BufReader::new(crate::util::By { s: c, at })),
+        None => crate::util::recv_json(&mut BufReader::new(c)),
+    }?;
+    answer(reply, &format!("vm {name}"))
 }
 
 #[cfg(test)]

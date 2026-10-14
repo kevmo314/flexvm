@@ -49,7 +49,7 @@ impl Hosts {
     fn pulled(&self, host: &Host, name: &str) -> Result<Value> {
         let deadline = Instant::now() + self.timeout;
         loop {
-            let st = crate::vmproc::call(host, name, json!({"op": "debug", "what": "status"}))?;
+            let st = crate::vmproc::call(host, name, json!({"op": "debug", "what": "status"}), None)?;
             if st["background_pull_ms"].is_number() {
                 return Ok(st["background_pull_ms"].clone());
             }
@@ -75,7 +75,7 @@ pub fn run(args: &Args) -> Result<()> {
         (None, None) if to.is_none() => crate::open_host(args)?,
         _ => bail!("--to needs the target host's --to-state and --to-run (on this machine)"),
     };
-    let timeout = Duration::from_secs(args.num("timeout", 120)?.max(1));
+    let timeout = Duration::from_secs(args.parse_or::<u64>("timeout", 120)?.max(1));
     let hosts = Hosts { a, b, to, timeout };
     let template = args.get("template").unwrap_or("default");
     let date = command("date", &["-u", "+%Y-%m-%dT%H-%M-%SZ"])?;
@@ -98,10 +98,10 @@ pub fn run(args: &Args) -> Result<()> {
 }
 
 fn runs(h: &Hosts, args: &Args, template: &str, date: &str) -> Result<Value> {
-    let iterations = args.num("iterations", 50)?;
-    let warmup = args.num("warmup", 3)?;
-    let dirty_mib = args.num("dirty-mib", 0)?;
-    let settle = Duration::from_millis(args.num("settle-ms", 100)?);
+    let iterations = args.parse_or::<u64>("iterations", 50)?;
+    let warmup = args.parse_or::<u64>("warmup", 3)?;
+    let dirty_mib = args.parse_or::<u64>("dirty-mib", 0)?;
+    let settle = Duration::from_millis(args.parse_or::<u64>("settle-ms", 100)?);
     let ready = match (args.get("ready-port"), args.get("ready-http")) {
         (Some(p), None) => Some((p.parse().map_err(|_| "bad --ready-port")?, false)),
         (None, Some(p)) => Some((p.parse().map_err(|_| "bad --ready-http")?, true)),
@@ -174,11 +174,11 @@ fn iteration(h: &Hosts, name: &str, template: &str, dirty_mib: u64, ready: Optio
             Ok((dirty_mib > 0).then(|| ms(t.elapsed())))
         };
         let read_local = read(&h.a)?;
-        let migrated = crate::vmproc::call(&h.a, name, json!({"op": "migrate", "to": to}))?;
+        let migrated = crate::vmproc::call(&h.a, name, json!({"op": "migrate", "to": to}), None)?;
         let read_after = read(&h.b)?;
         h.wait("the source to let go", || !h.a.alive(name))?;
         let pull = h.pulled(&h.b, name)?;
-        let status = crate::vmproc::call(&h.b, name, json!({"op": "debug", "what": "status"}))?;
+        let status = crate::vmproc::call(&h.b, name, json!({"op": "debug", "what": "status"}), None)?;
         sample["migrate"] = migrated["timings_ms"].clone();
         sample["migrate"]["downtime"] = migrated["downtime_ms"].clone();
         sample["migrate"]["background_pull"] = pull;
@@ -207,7 +207,7 @@ fn iteration(h: &Hosts, name: &str, template: &str, dirty_mib: u64, ready: Optio
 }
 
 fn lifecycle(h: &Hosts, args: &Args, template: &str, dir: &str, date: &str) -> Result<Value> {
-    let iterations = args.num("iterations", 5)?.max(1);
+    let iterations = args.parse_or::<u64>("iterations", 5)?.max(1);
     let sizes: Vec<u64> = args
         .get("dirty-mib")
         .unwrap_or("0,256,1024")
@@ -268,7 +268,7 @@ fn trial(h: &Hosts, name: &str, template: &str, mib: u64, ck: &std::path::Path) 
     };
     let pause = json!({"pause": med(&mut p), "resume": med(&mut r)});
 
-    let c = crate::vmproc::call(&h.a, name, json!({"op": "checkpoint", "dir": ck, "stop": true}))?;
+    let c = crate::vmproc::call(&h.a, name, json!({"op": "checkpoint", "dir": ck, "stop": true}), None)?;
     let mut checkpoint = c["timings_ms"].clone();
     checkpoint["paused"] = c["paused_ms"].clone();
     checkpoint["data_mib"] = c["data_mib"].clone();

@@ -183,10 +183,6 @@ impl Args {
         self.get(name).map_or(Ok(default), |v| v.parse().map_err(|_| format!("bad --{name} {v:?}").into()))
     }
 
-    pub fn num(&self, name: &str, default: u64) -> Result<u64> {
-        self.parse_or(name, default)
-    }
-
     fn path(&self, flag: &str, env: &str, default: &str) -> PathBuf {
         self.get(flag).map(PathBuf::from).or_else(|| std::env::var_os(env).map(PathBuf::from)).unwrap_or_else(|| default.into())
     }
@@ -224,7 +220,7 @@ fn real_main() -> Result<()> {
     let pos: Vec<&str> = args.positional.iter().map(|s| s.as_str()).collect();
     let (name, arg2) = (pos.get(1).copied().unwrap_or(""), pos.get(2).copied());
     let template = args.get("template").unwrap_or("default");
-    let call = |req: Value| print(vmproc::call(&open_host(&args)?, name, req)?);
+    let call = |req: Value| print(vmproc::call(&open_host(&args)?, name, req, None)?);
     match pos.first().copied() {
         Some("template") => build_template(&args, name),
         Some("run") if args.has("standby") => vmproc::main(open_host(&args)?, paths(&args)?, Start::Standby { template: template.into() }, notify_fd()),
@@ -346,9 +342,9 @@ fn configure(c: &mut host::Config, args: &Args, addr: Option<&str>) -> Result<()
     if let Some(d) = args.get("dns") {
         c.dns = (!d.is_empty()).then(|| d.parse::<std::net::IpAddr>().map(|_| d.into())).transpose().map_err(|_| format!("bad --dns {d:?}"))?;
     }
-    c.reserve_mib = args.num("reserve", c.reserve_mib)?;
+    c.reserve_mib = args.parse_or::<u64>("reserve", c.reserve_mib)?;
     if args.has("evict-at") {
-        c.evict_mib = Some(args.num("evict-at", 0)?);
+        c.evict_mib = Some(args.parse_or::<u64>("evict-at", 0)?);
     }
     if let Some(p) = args.get("prefix") {
         host::check_prefix(p).map_err(|e| format!("--prefix: {e}"))?;
@@ -518,8 +514,9 @@ fn build_template(args: &Args, name: &str) -> Result<()> {
             Ok::<_, util::Error>(meta)
         })
         .transpose()?;
-    let max = args.num("max", proc_kb("/proc/meminfo", "MemTotal").unwrap_or(0) >> 20)?;
-    let (cpus, mem, plug) = (args.num("vcpus", cpus)? as u32, args.num("mem", template::base_mib(max))?, args.num("plug", template::PLUG_MIB)?);
+    let max = args.parse_or::<u64>("max", proc_kb("/proc/meminfo", "MemTotal").unwrap_or(0) >> 20)?;
+    let (cpus, mem, plug) =
+        (args.parse_or::<u64>("vcpus", cpus)? as u32, args.parse_or::<u64>("mem", template::base_mib(max))?, args.parse_or::<u64>("plug", template::PLUG_MIB)?);
     // Named and made under the host lock, so a prefix change sees it (`Host::prefix_in_use`).
     let host = open_host(args)?;
     let me = host::Ident::me();
@@ -561,13 +558,13 @@ fn image_options(args: &Args) -> Result<Option<image::Options>> {
         user: args.get("user").map(String::from),
         warm,
         ready,
-        ready_timeout: Duration::from_secs(args.num("ready-timeout", 120)?),
+        ready_timeout: Duration::from_secs(args.parse_or::<u64>("ready-timeout", 120)?),
         staging: args.get("image-staging").unwrap_or(image::STAGING).into(),
         limits: image::Limits {
-            download: args.num("max-download-mib", d.download >> 20)? << 20,
-            unpacked: args.num("max-unpacked-mib", d.unpacked >> 20)? << 20,
-            file: args.num("max-file-mib", d.file >> 20)? << 20,
-            entries: args.num("max-entries", d.entries)?,
+            download: args.parse_or::<u64>("max-download-mib", d.download >> 20)? << 20,
+            unpacked: args.parse_or::<u64>("max-unpacked-mib", d.unpacked >> 20)? << 20,
+            file: args.parse_or::<u64>("max-file-mib", d.file >> 20)? << 20,
+            entries: args.parse_or::<u64>("max-entries", d.entries)?,
         },
     }))
 }
@@ -757,7 +754,7 @@ mod exec_tests {
         let args = parse(&["listen", "--peer", "a:1", "--json", "--peer", "b:2", "--reserve", "123", "--reserve", "456"]);
         assert!(args.has("json"));
         assert_eq!(args.all("peer"), ["a:1", "b:2"]);
-        assert_eq!(args.num("reserve", 0).unwrap(), 456);
+        assert_eq!(args.parse_or::<u64>("reserve", 0).unwrap(), 456);
         let args = parse(&["run", "--incoming", "--standby", "--paused"]);
         assert!(args.has("incoming") && args.has("standby") && args.has("paused"));
         assert!(args.rest.is_empty());
