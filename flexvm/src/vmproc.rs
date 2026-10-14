@@ -1725,8 +1725,9 @@ mod tests {
             assert!(!pressure.exists() && !active.exists());
             assert!(child.try_wait().unwrap().is_none(), "a standby was stopped");
         }
-        // Mid-claim (`PID.claim` locked): not counted as stopped, so eviction starts.
-        let claim = std::fs::File::create(d.join(format!("{}.claim", child.id()))).unwrap();
+        // Mid-claim (`PID-START.claim` locked): not counted as stopped, so eviction starts.
+        let id = Ident::of(child.id()).unwrap();
+        let claim = std::fs::File::create(d.join(format!("{}-{}.claim", id.pid, id.start))).unwrap();
         assert_eq!(unsafe { libc::flock(claim.as_raw_fd(), libc::LOCK_EX) }, 0);
         relieve(&host, Some(0), false);
         assert!(!pressure.exists() && active.exists());

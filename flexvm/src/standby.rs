@@ -1,7 +1,7 @@
 //! Standby VMs: `flexvm run --standby` processes holding a restored, settled,
 //! paused VM so `run` is a resume plus `START`. Each listens on
 //! `RUN/standby/TEMPLATE/KEY.PID.sock` (KEY: template generation) and holds
-//! `PID.lock` while alive, and `PID.claim` locked while a claim is under way. Protocol: `run` sends `claim {name, ip, cmd}` with
+//! `PID.lock` while alive, and `PID-START.claim` locked while a claim is under way. Protocol: `run` sends `claim {name, ip, cmd}` with
 //! its stdout/stderr; once the standby replies `claiming`, the claim may have
 //! started the VM and is never retried elsewhere. `{"exit": code}` follows.
 
@@ -65,11 +65,12 @@ pub fn live(host: &Host, template: &str) -> Vec<Ident> {
     ids
 }
 
-/// `live`, less those mid-claim (`PID.claim` locked): a stop would not end them.
+/// `live`, less those mid-claim (`PID-START.claim` locked; START keeps a reused pid's apart): a stop would not end them.
 pub fn stoppable(host: &Host, template: &str) -> Vec<Ident> {
     let d = dir(host, template);
-    let claiming =
-        |id: &Ident| File::open(d.join(format!("{}.claim", id.pid))).is_ok_and(|f| unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0);
+    let claiming = |id: &Ident| {
+        File::open(d.join(format!("{}-{}.claim", id.pid, id.start))).is_ok_and(|f| unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0)
+    };
     live(host, template).into_iter().filter(|id| !claiming(id)).collect()
 }
 
@@ -222,7 +223,7 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
     crate::host::flock(&lock, libc::LOCK_EX)?;
     lock.write_all_at(&serde_json::to_vec(&me)?, 0)?;
     std::fs::rename(&tmp, &lock_path)?;
-    let claim_path = d.join(format!("{}.claim", me.pid));
+    let claim_path = d.join(format!("{}-{}.claim", me.pid, me.start));
     p.files.lock().unwrap().extend([sock.clone(), lock_path, claim_path.clone()]);
     let ready = load(p.spawner.take(None)?, tpl.clone())?;
     // Taken now, so a claim does not scan memory or ask Firecracker.
