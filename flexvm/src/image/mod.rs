@@ -237,6 +237,8 @@ fn cached_rootfs(cached: &Path, build: impl FnOnce(&Path) -> Result<String>, syn
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
         res => res.map(|_| true)?,
     };
+    // Before anything is published: existing directories may have been made by a builder that died before syncing.
+    crate::util::sync_ancestors(dir)?;
     if entry_complete(cached) {
         // A previous publisher may have failed its fsync after renaming .ok.
         sync(dir)?;
@@ -256,8 +258,6 @@ fn cached_rootfs(cached: &Path, build: impl FnOnce(&Path) -> Result<String>, syn
         let _ = std::fs::remove_file(&tmp);
         res?;
     }
-    // Existing directories were not synced above; one may have been made by a builder that died first.
-    crate::util::sync_ancestors(dir)?;
     Ok(std::fs::canonicalize(cached)?)
 }
 
