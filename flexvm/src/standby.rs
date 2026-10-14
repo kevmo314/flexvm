@@ -354,8 +354,10 @@ pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]
             }
         };
         // Not `claiming` by `at`: reads are shut down, so one sent later fails (and
-        // claims nothing), and one sent already is read (and is no reason to retry).
-        if !crate::util::readable(&c, at.saturating_duration_since(Instant::now())).unwrap_or(false) {
+        // claims nothing), and one sent already is read (and is uncertain: no answer
+        // can follow on a shut stream, even one sent before).
+        let shut = !crate::util::readable(&c, at.saturating_duration_since(Instant::now())).unwrap_or(false);
+        if shut {
             let _ = c.shutdown(std::net::Shutdown::Read);
         }
         // Byte by byte: what follows stays unread, for the caller.
@@ -363,7 +365,10 @@ pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]
         if crate::util::recv_json(&mut r).ok().flatten().is_none_or(|t| t["claiming"] != json!(true)) {
             continue;
         }
-        let answer = crate::util::recv_json(&mut r).and_then(|a| a.ok_or_else(|| "it hung up".into()));
+        let answer = match shut {
+            true => Err("its claiming came too late".into()),
+            false => crate::util::recv_json(&mut r).and_then(|a| a.ok_or_else(|| "it hung up".into())),
+        };
         let reply = match answer {
             Ok(r) => r,
             Err(e) => {
