@@ -523,7 +523,7 @@ impl Proc {
             let vm = p.vm().clone();
             vm.restore_devices();
             let start = Instant::now();
-            vm.pager.wait_pulled(None);
+            p.wait_pulled(&vm);
             eprintln!("vm {}: pull from {source} ended after {} ms", vm.name, ms(start.elapsed()));
             // Unless an operation settled it first, or the VM ended (its source's
             // copy runs again). `op` is let go between tries, for a kill.

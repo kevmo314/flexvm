@@ -26,6 +26,8 @@ use crate::util::{Error, Result};
 /// removes the file; if that fails, the free lock tells admission it is gone.
 pub struct Hold {
     path: PathBuf,
+    id: u64,
+    mib: u64,
     _file: File,
 }
 
@@ -704,20 +706,43 @@ impl Host {
 
     /// Live holds (`RUN/holds/ID-MIB`, each flocked by its owner for as
     /// long as it is held), as (id, MiB). One whose lock is free has no
-    /// owner left (the kernel let go of it with the process): removed.
+    /// owner left (the kernel let go of it with the process): removed, as is
+    /// a free `.ID` (a grant's temp file, never in sight while it is made).
     fn holds(&self, _l: &Locked) -> Vec<(u64, u64)> {
         let dir = self.run.join("holds");
         let mut live = Vec::new();
         for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
-            let Some((id, mib)) = name.split_once('-').and_then(|(i, m)| Some((i.parse().ok()?, m.parse().ok()?))) else { continue };
+            let hold = name.split_once('-').and_then(|(i, m)| Some((i.parse().ok()?, m.parse().ok()?)));
+            if hold.is_none() && !name.starts_with('.') {
+                continue;
+            }
             match File::open(e.path()).map(|f| flock(&f, libc::LOCK_EX | libc::LOCK_NB).is_ok()) {
                 Ok(true) => drop(std::fs::remove_file(e.path())),
+                // Being unlinked by its owner.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 // Held; or unreadable, which counts as held.
-                _ => live.push((id, mib)),
+                _ => live.extend(hold),
             }
         }
         live
+    }
+
+    /// Counts `hold` as `mib` from now on, if less: renamed under the host
+    /// lock, its flock going with the file. On failure it counts as before.
+    pub fn shrink_hold(&self, hold: &Mutex<Option<Hold>>, mib: u64) -> Result<()> {
+        let more = |h: &Hold| h.mib > mib;
+        if !hold.lock().unwrap().as_ref().is_some_and(more) {
+            return Ok(());
+        }
+        // The host lock first: whoever has it may be letting the hold go.
+        let _l = self.lock()?;
+        let mut g = hold.lock().unwrap();
+        let Some(h) = g.as_mut().filter(|h| more(h)) else { return Ok(()) };
+        let path = h.path.with_file_name(format!("{}-{mib}", h.id));
+        std::fs::rename(&h.path, &path)?;
+        (h.path, h.mib) = (path, mib);
+        Ok(())
     }
 
     /// Gives back grant `id` (from `grant`) that was not used.
@@ -806,9 +831,11 @@ impl Host {
                 std::fs::create_dir_all(&dir)?;
                 let (tmp, path) = (dir.join(format!(".{id}")), dir.join(format!("{id}-{mib}")));
                 let f = File::create(&tmp)?;
-                flock(&f, libc::LOCK_EX | libc::LOCK_NB)?;
-                std::fs::rename(&tmp, &path)?;
-                Some(Hold { path, _file: f })
+                if let Err(e) = flock(&f, libc::LOCK_EX | libc::LOCK_NB).and_then(|()| std::fs::rename(&tmp, &path)) {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(e.into());
+                }
+                Some(Hold { path, id, mib, _file: f })
             }
         };
         grants.push((now, mib, id));
@@ -1997,9 +2024,22 @@ mod tests {
         let charge = crate::limit::allowance(1600);
         let grant = |mib, held| h.grant_inner(mib, Floor::Reserve, held, None, || Some(h.cfg.reserve_mib + charge)).unwrap();
         let (id, hold) = grant(charge, true).unwrap();
+        let hold = Mutex::new(hold);
         let path = h.run.join("grants");
         store(&path, &vec![(0u64, charge, id)], false).unwrap();
         assert!(grant(1, false).is_err(), "disk pull reservation counts after ten seconds");
+        // Pages come in: it counts only what is still to come, never more again.
+        h.shrink_hold(&hold, 100).unwrap();
+        h.shrink_hold(&hold, 200).unwrap();
+        assert!(h.run.join(format!("holds/{id}-100")).exists());
+        assert!(grant(charge - 99, false).is_err());
+        assert!(grant(charge - 100, false).is_ok());
+        store(&path, &vec![(0u64, charge, id)], false).unwrap();
+        // A grant's temp file left by a dead process goes.
+        let tmp = h.run.join("holds/.7");
+        std::fs::write(&tmp, b"").unwrap();
+        assert!(grant(charge - 100, false).is_ok() && !tmp.exists());
+        store(&path, &vec![(0u64, charge, id)], false).unwrap();
         drop(hold); // Pull completed: its pages now count in MemAvailable.
         assert!(grant(1, false).is_ok());
         store(&path, &Vec::<(u64, u64, u64)>::new(), false).unwrap();

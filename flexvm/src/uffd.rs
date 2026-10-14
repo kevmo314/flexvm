@@ -557,6 +557,17 @@ impl Pager {
         self.wait_for(timeout, || self.remote_left() == 0)
     }
 
+    /// `wait_pulled(None)`, telling `tick` what is left every `every` meanwhile.
+    pub fn wait_pulled_every(&self, every: Duration, mut tick: impl FnMut(usize)) -> bool {
+        while !self.wait_pulled(Some(every)) {
+            if self.stop.load(Ordering::SeqCst) {
+                return false;
+            }
+            tick(self.remote_left());
+        }
+        true
+    }
+
     /// How long an incoming migration took to pull every remote page, once done.
     pub fn pull_time(&self) -> Option<Duration> {
         Some(self.pull_finished.get()?.duration_since(*self.pull_started.get()?))

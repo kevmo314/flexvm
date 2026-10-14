@@ -440,7 +440,7 @@ impl Proc {
     fn watch_checkpoint_pull(&self, vm: Arc<Vm>, dir: PathBuf, to_load: u64) {
         let p = self.arc();
         thread::spawn(move || {
-            let pulled = vm.pager.wait_pulled(None);
+            let pulled = p.as_ref().map_or_else(|| vm.pager.wait_pulled(None), |p| p.wait_pulled(&vm));
             eprintln!("vm {}: {to_load} MiB paged in from {} (complete: {pulled}, {:?} ms)", vm.name, dir.display(), vm.pager.pull_time().map(ms));
             if let Some(p) = p {
                 // Not under `op`: the memory is in, whatever operation runs.

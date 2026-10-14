@@ -265,6 +265,14 @@ impl Proc {
         drop(self.held_grant.lock().unwrap().take());
     }
 
+    /// Waits for `vm`'s pull, its hold counting only what is still to come:
+    /// pages in count in MemAvailable already (#162).
+    pub fn wait_pulled(&self, vm: &Vm) -> bool {
+        vm.pager.wait_pulled_every(Duration::from_secs(1), |left| {
+            let _ = self.host.shrink_hold(&self.held_grant, (left as u64 * crate::util::PAGE_SIZE as u64).div_ceil(1 << 20));
+        })
+    }
+
     /// A start that did not happen gives its admission back.
     /// A hold is left to `finish`, which drops it once the VM is killed.
     pub fn refund_start(&self) {
