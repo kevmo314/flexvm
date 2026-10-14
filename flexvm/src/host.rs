@@ -257,9 +257,33 @@ impl Host {
         load(&self.vms(name, "lock")).ok().flatten()
     }
 
+    /// Whether `name`'s lock is held: None when that cannot be told (the
+    /// file cannot be opened, or the probe fails other than by contention).
+    fn name_locked(&self, name: &str) -> Option<bool> {
+        let f = match File::open(self.vms(name, "lock")) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(false),
+            Err(_) => return None,
+        };
+        match flock(&f, libc::LOCK_SH | libc::LOCK_NB) {
+            Ok(()) => Some(false),
+            Err(e) if e.raw_os_error() == Some(libc::EWOULDBLOCK) => Some(true),
+            Err(_) => None,
+        }
+    }
+
+    /// Whether `id` holds `name` now: None when that cannot be told (the lock
+    /// or its record unreadable, or held but not yet written).
+    fn held_by(&self, name: &str, id: &Ident) -> Option<bool> {
+        if !self.name_locked(name)? {
+            return Some(false);
+        }
+        lock_holder(&self.vms(name, "lock")).ok()?.map(|h| h == *id)
+    }
+
     /// Also requires the last holder's Firecrackers to have exited.
     fn gone(&self, name: &str) -> bool {
-        !self.alive(name) && lock_holder(&self.vms(name, "lock")).is_ok_and(|id| id.is_none_or(|id| reap(&self.run, &id).is_ok()))
+        self.name_locked(name) == Some(false) && lock_holder(&self.vms(name, "lock")).is_ok_and(|id| id.is_none_or(|id| reap(&self.run, &id).is_ok()))
     }
 
     pub fn entries(&self) -> Vec<Entry> {
@@ -322,7 +346,8 @@ impl Host {
             // Written before instances were recorded.
             None => !self.gone(h),
             Some(id) => match id.liveness() {
-                Liveness::Alive => self.alive(h) && self.holder_of(h).as_ref() == Some(id),
+                // What cannot be read about its name keeps it held.
+                Liveness::Alive => self.held_by(h, id).unwrap_or(true),
                 // Until its Firecrackers are reaped.
                 Liveness::Gone => reap(&self.run, id).is_err(),
                 Liveness::Unknown => true,
@@ -396,6 +421,9 @@ impl Host {
             boot: String,
         }
         let path = self.state.join("addrs").join(".gens");
+        if boot_id().is_empty() {
+            bail!("cannot read the boot id: generations would not be ordered across a reboot");
+        }
         let g = load::<Gens>(&path)?.unwrap_or(Gens { next: 1, reserved: 0, boot: String::new() });
         let next = if g.boot == boot_id() { g.next } else { g.next.max(g.reserved) };
         let gen = next.max(seen + 1);
@@ -821,12 +849,19 @@ pub struct Ident {
 }
 
 impl Ident {
+    /// Panics without a boot id or `/proc/self/stat`: a process that cannot
+    /// name itself must not take a name, an address or a migration.
     pub fn me() -> Ident {
-        Ident::of(std::process::id()).expect("no /proc/self/stat")
+        Ident::of(std::process::id()).expect("cannot read this process's identity (/proc/self/stat, boot id)")
     }
 
+    /// None without a boot id: an identity without one would read as another boot's, i.e. gone.
     pub fn of(pid: u32) -> Option<Ident> {
-        Some(Ident { pid, start: starttime(pid)?, boot: boot_id().into() })
+        let boot = boot_id();
+        if boot.is_empty() {
+            return None;
+        }
+        Some(Ident { pid, start: starttime(pid)?, boot: boot.into() })
     }
 
     /// Alive, gone on proof, or unknown (an unreadable `/proc`, say: never proof).
@@ -851,9 +886,16 @@ pub enum Liveness {
     Unknown,
 }
 
+/// "" when it cannot be read; only a successful read is cached, so a later call retries.
 pub fn boot_id() -> &'static str {
     static BOOT: OnceLock<String> = OnceLock::new();
-    BOOT.get_or_init(|| std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap_or_default().trim().into())
+    if let Some(b) = BOOT.get() {
+        return b;
+    }
+    match std::fs::read_to_string("/proc/sys/kernel/random/boot_id").map(|s| s.trim().to_string()) {
+        Ok(b) if !b.is_empty() => BOOT.get_or_init(|| b),
+        _ => "",
+    }
 }
 
 pub struct PidFd(OwnedFd);
@@ -1001,7 +1043,8 @@ pub fn gone(id: &Ident) -> Option<bool> {
 
 /// Every error, and anything unparsable, is unknown.
 fn liveness_by(id: &Ident, boot: &str, stat: impl Fn(u32) -> std::io::Result<String>) -> Liveness {
-    if boot.is_empty() {
+    // Without either boot id, a mismatch proves nothing.
+    if boot.is_empty() || id.boot.is_empty() {
         return Liveness::Unknown;
     }
     if id.boot != boot {
@@ -1354,6 +1397,34 @@ mod tests {
         // An empty lock (created, never written) is no holder.
         std::fs::write(h.vms("e", "lock"), "").unwrap();
         assert!(h.take_name("e", false).is_ok());
+        // A live holder whose lock record cannot be read keeps its address.
+        let _v = h.take_name("v", false).unwrap();
+        let x = h.claim_new(&l, "v", Some(ip("10.9.0.2"))).unwrap();
+        for unreadable in ["{", ""] {
+            std::fs::write(h.vms("v", "lock"), unreadable).unwrap();
+            assert_eq!(h.holder(&l, x.ip).unwrap().as_deref(), Some("v"), "{unreadable:?}");
+            assert!(h.claim_new(&l, "w", Some(x.ip)).is_err() && h.lend_new(&l, x.ip).is_err());
+        }
+        // Read, and naming another instance: not this claim's holder.
+        store(&h.vms("v", "lock"), &Ident { start: 1, ..Ident::me() }, false).unwrap();
+        assert_eq!(h.holder(&l, x.ip).unwrap(), None);
+        x.keep();
+    }
+
+    #[test]
+    fn an_empty_boot_id_is_never_proof_of_death() {
+        let me = Ident::me();
+        let running = format!("1 (x) S {}", "0 ".repeat(18) + &me.start.to_string());
+        let stat = |_| Ok(running.clone());
+        // Recorded without one: not "another boot".
+        assert_eq!(liveness_by(&Ident { boot: String::new(), ..me.clone() }, boot_id(), stat), Liveness::Unknown);
+        // Ours unreadable: nothing can be told.
+        assert_eq!(liveness_by(&me, "", stat), Liveness::Unknown);
+        assert_eq!(liveness_by(&Ident { boot: "other".into(), ..me.clone() }, boot_id(), stat), Liveness::Gone);
+        let h = host("noboot");
+        let dead = Ident { pid: 999_999_931, start: 1, boot: String::new() };
+        assert!(reap(&h.run, &dead).is_err(), "never reaped as another boot's");
+        assert!(!boot_id().is_empty() && Ident::of(std::process::id()).is_some_and(|i| i.boot == boot_id()));
     }
 
     #[test]

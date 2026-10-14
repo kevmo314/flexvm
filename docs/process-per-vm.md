@@ -246,7 +246,7 @@ one of:
 | `source` | whether a VM process of that name is a migration source here (a target retires a released record when not) |
 
 Only connections from the configured peers' addresses are served. Request
-lines must arrive whole within 10 s of the connection (one deadline, however the line trickles in) and are capped at 64 KiB; at most 512
+lines must arrive whole within 10 s of the connection being accepted (one deadline, however the line trickles in; peer names are resolved off the request path, at start and every 30 s) and are capped at 64 KiB; at most 512
 requests at once. Restarting or not running it loses nothing but the ability
 to receive.
 
