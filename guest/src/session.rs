@@ -305,8 +305,10 @@ fn open<'a>(body: &[u8], conn: Option<File>, line: &'a str, sessions: &Sessions,
             let (pumped, statuses_) = (output.clone(), statuses.clone());
             thread::Builder::new()
                 .spawn(move || {
-                    if let Ok(child) = rx.recv() {
-                        run(child, pumped, &statuses_);
+                    if let Ok(mut child) = rx.recv() {
+                        crate::pump(child.stdout.take(), child.stderr.take(), |kind, data| deliver(&pumped, kind, data));
+                        pumped.0.lock().unwrap().exit = wait_pid(&statuses_, child.id() as i32, None);
+                        pumped.1.notify_all();
                     }
                 })
                 .map_err(|e| io::Error::new(e.kind(), format!("cannot start session thread: {e}")))?;
@@ -359,12 +361,6 @@ fn attach(output: &Session, offset: u64, conn: Option<File>) -> Attached {
         unsafe { libc::shutdown(conn.as_raw_fd(), libc::SHUT_RDWR) };
     }
     (output.clone(), id)
-}
-
-fn run(mut child: Child, output: Session, statuses: &Statuses) {
-    crate::pump(child.stdout.take(), child.stderr.take(), |kind, data| deliver(&output, kind, data));
-    output.0.lock().unwrap().exit = wait_pid(statuses, child.id() as i32, None);
-    output.1.notify_all();
 }
 
 fn deliver(output: &Session, kind: u8, data: &[u8]) {
