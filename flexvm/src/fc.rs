@@ -578,7 +578,8 @@ mod tests {
                 let mut r = accept(&listener);
                 read_request(&mut r);
                 std::thread::sleep(Duration::from_millis(30));
-                r.get_mut().write_all(response).unwrap();
+                // A client already past its deadline (a loaded host) has closed: EPIPE.
+                let _ = r.get_mut().write_all(response);
                 std::thread::sleep(Duration::from_millis(150));
                 no_more(&listener);
             });
