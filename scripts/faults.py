@@ -2471,36 +2471,65 @@ def kill_refused_checkpoint():
     cleanup(n)
 
 
+def dual_stack():
+    """Whether a default [::] bind here takes IPv4 connections on loopback."""
+    try:
+        if open("/proc/sys/net/ipv6/bindv6only").read().strip() != "0":
+            return False
+        with socket.socket(socket.AF_INET6) as l:
+            l.bind(("::", 0))
+            l.listen(1)
+            with socket.create_connection(("127.0.0.1", l.getsockname()[1]), timeout=2):
+                return True
+    except OSError:
+        return False
+
+
 def wildcard_listen():
-    """A listener on a wildcard address (0.0.0.0, ::) is refused without
-    --underlay; with one, migrations from it give the target the underlay
-    address to pull pages from, never the wildcard."""
+    """A listener on a wildcard address (0.0.0.0, ::, ::ffff:0:0) or a
+    link-local one is refused without --underlay, as is port 0; with one,
+    migrations from it give the target the underlay address to pull pages
+    from, never the wildcard. On a dual-stack [::] listener, IPv4 peers
+    (arriving as ::ffff:a.b.c.d) are still peers: pages are pulled from it
+    and migrations to it arrive."""
     if args.no_listeners:
         return print("wildcard listen: skipped (--no-listeners)")
-    port = A.addr.rsplit(":", 1)[1]
+    host_ip, port = A.addr.rsplit(":", 1)
     # On a host with no configuration yet (A's keeps the --underlay given below).
     fresh = Host(A.addr, A.dir + "-wildcard", A.ips)
-    for wild in (f"0.0.0.0:{port}", f"[::]:{port}"):
+    for bad in (f"0.0.0.0:{port}", f"[::]:{port}", f"[::ffff:0:0]:{port}", f"[fe80::1%1]:{port}"):
         subprocess.run(["rm", "-rf", fresh.dir])
-        code, out, err = cli(fresh, "listen", wild, timeout=10)
-        check(f"wildcard listen: {wild} without --underlay refused", code != 0 and "--underlay" in err, (code, err))
+        code, out, err = cli(fresh, "listen", bad, timeout=10)
+        check(f"wildcard listen: {bad} without --underlay refused", code != 0 and "--underlay" in err, (code, err))
     subprocess.run(["rm", "-rf", fresh.dir])
-    stop_listener(A)
-    try:
-        start_listener(A, f"0.0.0.0:{port}", ["--underlay", A.addr.rsplit(":", 1)[0]])
-        n = "ft-wildcard"
-        clear_log(B, n)
-        m = setup(n)
-        ok(migrate(A, n, B))
-        st = wait_released(B, n)
-        check("wildcard listen: released", st["released"] is True and where(n) == {B: "running"}, (st, where(n)))
-        pulls = re.findall(r"pull from (\S+) ended", log(B, n))
-        check("wildcard listen: the target pulled from the underlay address", pulls == [A.addr], pulls)
-        check("wildcard listen: md5 intact", md5(B, n) == m)
-        cleanup(n)
-    finally:
+    code, out, err = cli(fresh, "listen", f"{host_ip}:0", timeout=10)
+    check("wildcard listen: port 0 refused", code != 0 and "port" in err, (code, err))
+    subprocess.run(["rm", "-rf", fresh.dir])
+    wilds = ["0.0.0.0"] + (["[::]"] if dual_stack() else [])
+    if len(wilds) == 1:
+        print("wildcard listen: no dual-stack loopback here; [::] not tried")
+    for wild in wilds:
         stop_listener(A)
-        start_listener(A)
+        try:
+            start_listener(A, f"{wild}:{port}", ["--underlay", host_ip])
+            n = "ft-wildcard"
+            clear_log(B, n)
+            m = setup(n)
+            ok(migrate(A, n, B))
+            st = wait_released(B, n)
+            check(f"wildcard listen {wild}: released", st["released"] is True and where(n) == {B: "running"}, (st, where(n)))
+            pulls = re.findall(r"pull from (\S+) ended", log(B, n))
+            check(f"wildcard listen {wild}: the target pulled from the underlay address", pulls == [A.addr], pulls)
+            check(f"wildcard listen {wild}: md5 intact", md5(B, n) == m)
+            # And back: the wildcard listener takes a migration from its IPv4 peer.
+            r = migrate(B, n, A)
+            wait_released(A, n)
+            check(f"wildcard listen {wild}: a migration to it arrives", r["ok"] and where(n) == {A: "running"}, (r, where(n)))
+            check(f"wildcard listen {wild}: md5 intact after the round trip", md5(A, n) == m)
+            cleanup(n)
+        finally:
+            stop_listener(A)
+            start_listener(A)
 
 
 def raw(host, data, timeout=10):
