@@ -2656,7 +2656,7 @@ def claim_killed():
 def fc_died():
     """A VM's Firecracker dies under it (a guest panic, an OOM kill): its
     process notices at once, cleans up as a kill would (address withdrawn,
-    route gone), exits with status 3, and `ls` shows it failed, with
+    route gone), exits with status 124, and `ls` shows it failed, with
     Firecracker's exit status and the end of its log, until `kill`."""
     n = "ft-fc-died"
     scenario_vms.add(n)
@@ -2671,7 +2671,7 @@ def fc_died():
     except subprocess.TimeoutExpired:
         code = None
     took = time.time() - t
-    check("fc died: noticed at once, exit status 3", code == 3 and took < 2, (code, took))
+    check("fc died: noticed at once, exit status 124", code == 124 and took < 2, (code, took))
     failed = vms(A).get(n, {})
     check("fc died: ls shows it failed, saying how", failed.get("state") == "failed" and "signal: 9" in failed.get("error", ""), failed)
     check("fc died: address withdrawn", not addr(A, v["ip"]).get("holder") and addr(A, v["ip"]).get("withdrawn"), addr(A, v["ip"]))
@@ -2783,6 +2783,60 @@ def arrival_overtaken():
     cleanup(n)
 
 
+def terminal():
+    """A foreground run as a shell runs it, signalled through its process
+    group: Ctrl-Z pauses the VM (Firecracker is not in the group, so it never
+    stops), SIGHUP (a closed terminal) is ignored and output to a terminal
+    that is gone goes to the VM's log instead of killing it, and Ctrl-C
+    destroys it with exit status 130 and nothing left failed."""
+    n = "ft-terminal"
+    scenario_vms.add(n)
+    p = subprocess.Popen([BIN, "--state", A.state, "--run", A.run, "run", n, "--template", args.template],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=ENV, start_new_session=True)
+    check("terminal: up", wait_for(lambda: vms(A).get(n, {}).get("state") == "running", 30), vms(A).get(n))
+    fc = vms(A)[n]["firecracker"]
+    check("terminal: firecracker has a process group of its own", os.getpgid(fc) != p.pid, (os.getpgid(fc), p.pid))
+    os.killpg(p.pid, signal.SIGTSTP)
+    check("terminal: Ctrl-Z pauses the vm", wait_for(lambda: vms(A).get(n, {}).get("state") == "paused", 10), vms(A).get(n))
+    state = open(f"/proc/{fc}/stat").read().rsplit(")", 1)[1].split()[0]
+    check("terminal: firecracker itself is not stopped", state != "T", state)
+    os.killpg(p.pid, signal.SIGCONT)
+    check("terminal: resumed", wait_for(lambda: vms(A).get(n, {}).get("state") == "running", 10), vms(A).get(n))
+    os.killpg(p.pid, signal.SIGHUP)
+    # The terminal is gone: the next line the VM process prints has nowhere to go.
+    p.stdout.close()
+    p.stderr.close()
+    fault(A, "publish", 5000)
+    os.killpg(p.pid, signal.SIGTSTP)
+    time.sleep(1)
+    os.killpg(p.pid, signal.SIGCONT)
+    time.sleep(1)
+    fault(A, "publish", 0)
+    check("terminal: a closed terminal leaves it running", p.poll() is None and alive(fc), p.poll())
+    check("terminal: its output then goes to its log", "injected fault: not published" in log(A, n), log(A, n)[-300:])
+    os.killpg(p.pid, signal.SIGINT)
+    try:
+        code = p.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        code = None
+    check("terminal: Ctrl-C destroys it, exit status 130", code == 130, code)
+    check("terminal: nothing left, nothing failed", n not in vms(A) and not alive(fc), vms(A).get(n))
+
+
+def run_status():
+    """`run -- CMD` exits with CMD's status, started cold or claiming a
+    standby VM (whose exit frame may arrive before the claimer reads it)."""
+    n = "ft-run-status"
+    scenario_vms.add(n)
+    argv = [BIN, "--state", A.state, "--run", A.run, "run", n, "--template", args.template, "--"]
+    r = subprocess.run(argv + ["exit 7"], capture_output=True, text=True, env=ENV, timeout=120)
+    check("run status: cold, CMD's own", r.returncode == 7, (r.returncode, r.stderr[-300:]))
+    ok(cli_json(A, "standby", "--template", args.template, "1"))
+    r = subprocess.run(argv + ["exit 5"], capture_output=True, text=True, env=ENV, timeout=120)
+    check("run status: claimed, CMD's own", r.returncode == 5 and '"standby":true' in r.stderr, (r.returncode, r.stderr[-300:]))
+    ok(cli_json(A, "standby", "--template", args.template, "0"))
+
+
 def suspend_killed():
     """SIGINT means destroy, and it wins over a suspend: a kill that comes
     while the suspend is publishing its checkpoint revokes the checkpoint
@@ -2860,6 +2914,8 @@ def source_killed_basic():
 
 
 SCENARIOS = dict(
+    run_status=run_status,
+    terminal=terminal,
     suspend_killed=suspend_killed,
     source_unpublished=source_unpublished,
     source_killed_basic=source_killed_basic,

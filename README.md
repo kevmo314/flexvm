@@ -55,6 +55,17 @@ flexvm resume web               # bring a suspended VM back (in a new process)
 flexvm kill web                 # destroy it, running or suspended; Ctrl-C in the foreground
 ```
 
+A closed terminal (SIGHUP) leaves a foreground VM running; its output then
+goes to `/run/flexvm/vms/NAME.log`.
+
+Exit statuses of `flexvm run`: with `-- CMD`, CMD's own; 128 + the signal
+that ended it (130: destroyed by SIGINT, Ctrl-C or `flexvm kill`; 143:
+suspended by SIGTERM); 0 when it migrated away or `checkpoint --stop`
+stopped it. flexvm's own failures use the range shells and container
+runtimes keep for themselves: 125 when it could not start the VM (or gave it
+up), 124 when the VM died under it (`flexvm ls` then shows it `failed`, and
+why, until `flexvm kill`).
+
 A VM migrating away stays paused on its source until the target has all its
 memory; `flexvm kill` refuses that copy (kill the VM where it runs), and
 `kill -KILL PID` gives it up (the target loses the pages it has not pulled).

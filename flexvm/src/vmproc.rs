@@ -25,7 +25,12 @@ use crate::template::{Paths, Template, STEP_MIB};
 use crate::util::{ms, proc_kb, send_json, Error, Phases, Result};
 use crate::vm::{Snapshot, State, Vm};
 
-pub const DIED: i32 = 3;
+/// A VM process's own exit statuses (`run -- CMD` passes CMD's through):
+/// 128 + the signal that ended it (130 SIGINT, 143 SIGTERM's suspend), and
+/// these two, from the range shells and container runtimes keep for themselves.
+pub const FAILED: i32 = 125;
+/// Its Firecracker died under it.
+pub const DIED: i32 = 124;
 const OP_WAIT: Duration = Duration::from_secs(30);
 const RELEASE_WAIT: Duration = Duration::from_secs(10);
 const CLOCK_TOLERANCE: Duration = Duration::from_millis(20);
@@ -144,6 +149,7 @@ impl Proc {
     }
 
     pub fn set_name(&self, n: NameLock) {
+        crate::util::output::fall_back_to(self.host.vms(&n.name, "log"));
         *self.name.lock().unwrap() = Some(n);
     }
 
@@ -342,7 +348,7 @@ impl Proc {
         let work = self.host.run.join("w").join(self.ident.pid.to_string());
         crate::socket::remove(&work);
         let _ = std::fs::remove_dir_all(&work);
-        let _ = std::io::stdout().flush();
+        crate::util::output::drain();
         std::process::exit(code)
     }
 
@@ -550,7 +556,7 @@ impl Proc {
                 }
                 None => Err(self.suspend()),
             },
-            libc::SIGINT => Err(self.destroy(0)),
+            libc::SIGINT => Err(self.destroy(128 + libc::SIGINT)),
             _ => Ok(()),
         };
         if let Err(e) = res {
@@ -798,7 +804,7 @@ impl Proc {
         let cmd = self.cmd.lock().unwrap().clone().unwrap_or_default();
         let code = crate::exec(&self.host, &self.name(), &cmd).unwrap_or_else(|e| {
             eprintln!("vm {}: {e}", self.name());
-            255
+            FAILED
         });
         eprintln!("vm {}: {}", self.name(), self.destroy(code));
     }
@@ -844,7 +850,9 @@ impl Proc {
 }
 
 pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::File>) -> Result<()> {
+    // Blocked first: every thread from here on (the output relays too) inherits it.
     let signals = crate::util::block_signals(&SIGNALS);
+    crate::util::output::guard()?;
     let _ = crate::net::sysctl("net.ipv4.ip_forward", "1");
     let p = Proc::new(host, paths)?;
     let host = p.host.clone();
@@ -881,7 +889,7 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
     }
     if let Err(e) = res {
         eprintln!("flexvm: {e}");
-        p.finish(&op, End::NotStarted, 1, None);
+        p.finish(&op, End::NotStarted, FAILED, None);
     }
     drop(op);
     p.serve()

@@ -194,8 +194,8 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
                 let _ = std::fs::remove_file(&sock);
                 p.serve_control();
                 let _ = send_json(&mut &c, &json!({"ok": true, "result": v}));
-                for (fd, to) in fds.iter().zip([1, 2]) {
-                    unsafe { libc::dup2(fd.as_raw_fd(), to) };
+                if let [out, err, ..] = &fds[..] {
+                    crate::util::output::retarget([out.as_raw_fd(), err.as_raw_fd()]);
                 }
                 *p.claimer.lock().unwrap() = Some(c);
                 *p.cmd.lock().unwrap() = req["cmd"].as_str().map(String::from);
@@ -214,7 +214,7 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
             Err((e, retry)) => {
                 let _ = send_json(&mut &c, &json!({"ok": false, "error": e.to_string(), "retry": retry}));
                 if p.standby.lock().unwrap().is_none() {
-                    p.finish(op, End::NotStarted, 1, None);
+                    p.finish(op, End::NotStarted, crate::vmproc::FAILED, None);
                 }
             }
         }

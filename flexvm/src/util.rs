@@ -400,3 +400,80 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 }
+
+/// A VM process's stdout and stderr: pipes that relay threads copy to the
+/// terminal (or the claimer's, `retarget_output`). A write that fails there
+/// (a closed terminal, a broken pipe) switches that relay to the VM's log
+/// file, so printing never fails and never aborts the VM.
+pub mod output {
+    use std::fs::File;
+    use std::io::{Read, Write};
+    use std::os::fd::{FromRawFd, RawFd};
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+    use std::thread::JoinHandle;
+
+    static TARGETS: Mutex<[Option<File>; 2]> = Mutex::new([None, None]);
+    static LOG: Mutex<Option<PathBuf>> = Mutex::new(None);
+    static RELAYS: Mutex<Vec<JoinHandle<()>>> = Mutex::new(Vec::new());
+
+    pub fn guard() -> std::io::Result<()> {
+        for (i, fd) in [1, 2].into_iter().enumerate() {
+            let mut p = [0; 2];
+            let orig = super::eintr(|| unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) })?;
+            super::eintr(|| unsafe { libc::pipe2(p.as_mut_ptr(), libc::O_CLOEXEC) })?;
+            super::eintr(|| unsafe { libc::dup2(p[1], fd) })?;
+            unsafe { libc::close(p[1]) };
+            TARGETS.lock().unwrap()[i] = Some(unsafe { File::from_raw_fd(orig) });
+            let mut from = unsafe { File::from_raw_fd(p[0]) };
+            RELAYS.lock().unwrap().push(std::thread::spawn(move || {
+                let mut buf = [0u8; 8192];
+                while let Ok(n @ 1..) = from.read(&mut buf) {
+                    let mut targets = TARGETS.lock().unwrap();
+                    if targets[i].as_mut().is_some_and(|t| t.write_all(&buf[..n]).is_err()) {
+                        targets[i] = LOG.lock().unwrap().as_ref().and_then(|p| File::options().create(true).append(true).open(p).ok());
+                        if let Some(t) = targets[i].as_mut() {
+                            let _ = t.write_all(&buf[..n]);
+                        }
+                    }
+                }
+            }));
+        }
+        Ok(())
+    }
+
+    /// Where output goes once the terminal is gone.
+    pub fn fall_back_to(log: PathBuf) {
+        *LOG.lock().unwrap() = Some(log);
+    }
+
+    /// A claimed standby's output goes to its claimer's terminal.
+    pub fn retarget(fds: [RawFd; 2]) {
+        let mut targets = TARGETS.lock().unwrap();
+        for (i, fd) in fds.into_iter().enumerate() {
+            if let Ok(dup) = super::eintr(|| unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) }) {
+                targets[i] = Some(unsafe { File::from_raw_fd(dup) });
+            }
+        }
+    }
+
+    /// Before exit: everything printed reaches its target (bounded by a second).
+    pub fn drain() {
+        let _ = std::io::stdout().flush();
+        let null = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
+        if null >= 0 {
+            unsafe {
+                libc::dup2(null, 1);
+                libc::dup2(null, 2);
+                libc::close(null);
+            }
+        }
+        let relays: Vec<_> = RELAYS.lock().unwrap().drain(..).collect();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        for r in relays {
+            while !r.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    }
+}

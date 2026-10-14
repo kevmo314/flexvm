@@ -61,6 +61,11 @@ impl Firecracker {
                 if libc::getppid() != parent {
                     return Err(std::io::Error::other("its parent died"));
                 }
+                // Out of the terminal's process group: Ctrl-Z, Ctrl-C and a hang-up
+                // are for the VM process, which decides what becomes of Firecracker.
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
                 Ok(())
             });
         }

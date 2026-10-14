@@ -281,7 +281,7 @@ fn follow(mut conn: BufReader<std::os::unix::net::UnixStream>, id: host::Ident) 
         });
     }
     let reply = recv_json(&mut conn).ok().flatten();
-    std::process::exit(reply.and_then(|r| r["exit"].as_i64()).unwrap_or(1) as i32)
+    std::process::exit(reply.and_then(|r| r["exit"].as_i64()).map_or(vmproc::FAILED, |c| c as i32))
 }
 
 fn kill(host: &Host, name: &str) -> Result<()> {

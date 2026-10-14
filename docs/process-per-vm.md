@@ -25,9 +25,12 @@ A VM process:
    socket `RUN/vms/NAME.sock`,
 5. waits for signals and control requests until the VM is gone.
 
-Exit status: 0 when the VM was suspended, migrated away or killed on request;
-1 when it failed to start; 3 when it died under the process (its Firecracker
-exited, watched through a pidfd, or its memory was lost): cleaned up as a
+Exit status: with `-- CMD`, CMD's; else 0 when it migrated away or was
+stopped by `checkpoint --stop`; 128 + the signal when one ended it (130:
+SIGINT destroyed it, 143: SIGTERM suspended it); 125 when flexvm failed (it
+could not start the VM, or gave it up); 124 when it died under the process
+(its Firecracker exited, watched through a pidfd, or its memory was lost):
+cleaned up as a
 kill, with why (Firecracker's exit status and the end of its log, the
 guest's console) in `RUN/vms/NAME.failed`, which `ls` shows as `failed`
 until `flexvm kill NAME`.

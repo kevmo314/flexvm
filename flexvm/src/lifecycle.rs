@@ -149,17 +149,21 @@ impl Proc {
         if saved.is_ok() {
             crate::host::stall("suspend_stall");
         }
+        // As `flexvm kill` does to a suspended VM; one that cannot be revoked stays suspended.
         if saved.is_ok() && vm.cancel_checkpoint.load(Ordering::SeqCst) > 0 {
-            if let Err(e) = discard(&self.host, &vm.name) {
-                eprintln!("vm {}: killed while suspending; revoking its checkpoint: {e}", vm.name);
+            match discard(&self.host, &vm.name) {
+                Ok(()) => self.finish(&op, End::Gone, 128 + libc::SIGINT, None),
+                Err(e) => {
+                    eprintln!("vm {}: killed while suspending, but its checkpoint stays: {e}", vm.name);
+                    self.finish(&op, End::Suspended, crate::vmproc::FAILED, None)
+                }
             }
-            self.finish(&op, End::Gone, 0, None)
         }
         match saved {
             Ok((m, _)) => {
                 let data = (m.data_pages * PAGE_SIZE as u64) >> 20;
                 eprintln!("{}", json!({"name": vm.name, "state": "suspended", "dir": self.host.suspended(&vm.name), "freed_rss_mib": vm.rss() >> 20, "data_mib": data, "suspend_ms": ms(t.total()), "timings_ms": t.json()}));
-                self.finish(&op, End::Suspended, 0, None)
+                self.finish(&op, End::Suspended, 128 + libc::SIGTERM, None)
             }
             Err(e) => e,
         }

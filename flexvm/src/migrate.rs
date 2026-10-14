@@ -209,7 +209,7 @@ impl Proc {
                     h.forget(vm.ip, mig);
                 }
                 eprintln!("vm {}: {e}; generation {gen} of {} was superseded meanwhile, so it is destroyed instead of resumed", vm.name, vm.ip);
-                self.finish(op, End::Gone, 1, None)
+                self.finish(op, End::Gone, crate::vmproc::FAILED, None)
             }
             Err(r) => {
                 vm.set_failed();
