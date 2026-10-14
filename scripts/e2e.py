@@ -3,17 +3,22 @@
 runs them. Run as root, after building flexvm, the patched Firecracker, the
 guest kernel and the rootfs (see README.md and .github/workflows/ci.yml).
 
-It builds a template, starts two flexvm hosts on loopback (A and B: their
-own listeners, run directories, state directories and VM address ranges), and runs
-each case below against them with fresh VMs. It touches only what it created:
-its own processes, taps, cgroups and directories.
+It builds the templates, then runs the cases below and the selected
+scripts/faults.py scenarios, with fresh VMs, in --jobs lanes at once. Each
+lane has two flexvm hosts on loopback (A and B: their own listeners, run
+directories, state directories and VM address ranges); a lane runs its work
+in batches, each a worker process (this script with --worker) that starts the
+lane's hosts, runs its cases against them, stops them and checks that nothing
+is left. It touches only what it created: its own processes, taps, cgroups
+and directories.
 
 usage: sudo scripts/e2e.py [--bin FLEXVM] [--artifacts DIR] [--log-dir DIR]
                            [--port-a N] [--net-a A.B.C] [--net-b A.B.C]
-                           [--image REF | --no-image] [--faults "SCENARIO ..."]
+                           [--jobs N] [--lanes "PORT:NET-A:NET-B ..."]
+                           [--image REF [--image-cache DIR] | --no-image] [--faults "SCENARIO ..."]
                            [CASE ...]
 """
-import argparse, glob, hashlib, json, os, re, shutil, signal, socket, subprocess, sys, tempfile, time, traceback
+import argparse, glob, hashlib, json, os, re, shutil, signal, socket, subprocess, sys, tempfile, threading, time, traceback
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -21,13 +26,20 @@ p = argparse.ArgumentParser(usage=__doc__)
 p.add_argument("--bin", default=os.path.join(ROOT, "target", "release", "flexvm"))
 p.add_argument("--artifacts", default=os.path.join(ROOT, "artifacts"))
 p.add_argument("--log-dir", default="/tmp/fvci-logs", help="listener, VM and Firecracker logs end up here")
-p.add_argument("--port-a", type=int, default=7140, help="host A listens here, host B on the next port")
-p.add_argument("--net-a", default="10.140.0", help="host A's VM addresses (.2-.60); B uses --net-b")
+p.add_argument("--port-a", type=int, default=7140, help="lane 0's host A listens here, its host B on the next port; "
+               "each further lane takes the next two")
+p.add_argument("--net-a", default="10.140.0", help="lane 0's host A's VM addresses (.2-.60); B uses --net-b; "
+               "each further lane adds 2 to their second octet")
 p.add_argument("--net-b", default="10.141.0")
+p.add_argument("--jobs", type=int, default=4, help="lanes that run at once")
+p.add_argument("--lanes", help="the lanes' ports and address ranges, as PORT:NET-A:NET-B each (overrides --port-a, "
+               "--net-a, --net-b and --jobs)")
+p.add_argument("--tag", default="fvci", help="prefix of this run's own directories under /run and /var/tmp")
 p.add_argument("--template", default="ci", help="name of the template the cases build and use")
 p.add_argument("--image", default="public.ecr.aws/docker/library/busybox:1.36",
                help="container image for the image-template case")
 p.add_argument("--no-image", action="store_true", help="skip the image-template case (needs registry access)")
+p.add_argument("--image-cache", help="keep the pulled image here, and build from it when it is there (no registry)")
 # The scripts/faults.py scenarios that fit CI time: migration failure paths and fencing, address
 # generations and loans, forged peers, processes killed between steps, checkpoint corruption,
 # copy-on-write exactness, growth (on a template with little pre-plugged), held packets and devices,
@@ -41,6 +53,13 @@ FAULTS = ("basic route lost_ack unknown refused pages_blip pages_dead_restore pr
           "abort_superseded gen_zero signals suspend_gen standby restore_ip_peer late_withdrawal "
           "incoming_killed start_killed claim_killed fc_died cow_grow plug_storm")
 p.add_argument("--faults", default=FAULTS, help="scripts/faults.py scenarios to run against the two hosts ('' for none)")
+# A worker runs its cases on one lane, against templates that are already built.
+p.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+p.add_argument("--templates", help=argparse.SUPPRESS)
+p.add_argument("--lane", type=int, default=0, help=argparse.SUPPRESS)
+p.add_argument("--results", help=argparse.SUPPRESS)
+p.add_argument("--selftest", action="store_true",
+               help="check the scheduler without KVM: fake templates and workers, one worker that cannot be spawned")
 p.add_argument("cases", nargs="*", help="cases to run (default: all)")
 args = p.parse_args()
 BIN = os.path.abspath(args.bin)
@@ -106,7 +125,7 @@ class Host:
         # Inside this run's own fresh directories (see main).
         self.run_dir = os.path.join(RUN, label)
         self.state_dir = os.path.join(WORK, f"{label}-state")
-        self.prefix = f"fvci{label}"
+        self.prefix = f"fvci{args.lane}{label}"
         self.log = os.path.join(args.log_dir, f"listen-{label}.log")
         self.proc = None
         self.vms = set()  # names of the VMs this script created here or moved here
@@ -576,6 +595,121 @@ def kill_releases():
     check("kill: second kill of the name fails", A.kill(vm, check=False).returncode != 0)
 
 
+# --- the image case's registry pull and its cache --------------------------------
+# With --image-cache, a pull's blobs stay in that directory and an OCI layout of the
+# image is kept beside them (oci/REF/), which later runs build from without the registry.
+# CI keeps the directory in actions/cache; a cold cache pulls from the registry.
+
+
+def image_ref():
+    """(registry host, repository, tag) of --image, with Docker's defaults."""
+    name, _, tag = args.image.rpartition(":") if ":" in args.image.rsplit("/", 1)[-1] else (args.image, "", "latest")
+    first, _, rest = name.partition("/")
+    if rest and ("." in first or ":" in first or first == "localhost"):
+        host, repo = first, rest
+    else:
+        host, repo = "registry-1.docker.io", name if "/" in name else f"library/{name}"
+    return ("registry-1.docker.io" if host in ("docker.io", "index.docker.io") else host), repo, tag
+
+
+def image_dir():
+    return os.path.join(args.image_cache, "oci", re.sub(r"[^A-Za-z0-9._-]", "_", args.image)) if args.image_cache else None
+
+
+def image_layout():
+    d = image_dir()
+    return d if d and os.path.exists(os.path.join(d, "index.json")) else None
+
+
+def image_digest(layout):
+    return json.load(open(os.path.join(layout, "index.json")))["manifests"][0]["digest"]
+
+
+MANIFEST_TYPES = ("application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json, "
+                  "application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json")
+
+
+def registry_get(path):
+    """(status, headers, body) of GET /v2/REPO/PATH, with an anonymous bearer token if asked for one."""
+    import urllib.error, urllib.parse, urllib.request
+    host, repo, _ = image_ref()
+    scheme = "http" if host.split(":")[0] in ("localhost", "127.0.0.1") else "https"
+    url, auth = f"{scheme}://{host}/v2/{repo}/{path}", None
+    for _ in range(2):
+        req = urllib.request.Request(url, headers={"Accept": MANIFEST_TYPES, **({"Authorization": auth} if auth else {})})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return resp.status, resp.headers, resp.read(4 << 20)
+        except urllib.error.HTTPError as e:
+            if e.code != 401 or auth:
+                return e.code, e.headers, e.read(300)
+            params = dict(re.findall(r'(\w+)="([^"]*)"', e.headers.get("WWW-Authenticate", "")))
+            q = urllib.parse.urlencode({k: v for k, v in params.items() if k in ("service", "scope")})
+            with urllib.request.urlopen(f"{params.get('realm')}?{q}", timeout=30) as t:
+                tok = json.load(t)
+            auth = f"Bearer {tok.get('token') or tok.get('access_token')}"
+    return 401, {}, b""
+
+
+def retry_after():
+    """Seconds the registry asks a client to wait now (Retry-After on a 429), or None."""
+    try:
+        status, headers, _ = registry_get(f"manifests/{image_ref()[2]}")
+        v = headers.get("Retry-After") if status == 429 else None
+        return min(int(v), 300) if v and v.isdigit() else None
+    except Exception:
+        return None
+
+
+def pull_template(name, opts):
+    """Builds the template from the registry. HTTP 429s are retried with longer and longer
+    waits (or what Retry-After asks); a registry that stays rate limited fails as that."""
+    cache = args.image_cache or os.path.join(WORK, "images")
+    waits = (15, 30, 60, 120)
+    for i in range(len(waits) + 1):
+        r = flexvm("template", name, "--image", args.image, "--image-cache", cache, *opts, timeout=600, check=False)
+        if r.returncode == 0:
+            return r
+        if "HTTP 429" not in r.stderr:
+            raise AssertionError(f"flexvm template --image {args.image} exited {r.returncode}: {r.stderr.strip()}")
+        if i == len(waits):
+            break
+        wait = retry_after() or waits[i]
+        print(f"  registry rate limited (HTTP 429); retrying in {wait} s", flush=True)
+        time.sleep(wait)
+    raise AssertionError(f"registry rate-limited: {args.image} still answers HTTP 429 after {len(waits) + 1} tries "
+                         f"(not a flexvm failure): {r.stderr.strip()[-300:]}")
+
+
+def save_layout(stderr):
+    """Keeps the pulled image as an OCI layout: its blobs, and its manifest fetched again by digest."""
+    d = image_dir()
+    m = re.search(r"^image: .* -> (sha256:[0-9a-f]{64})$", stderr, re.M)
+    if not d or not m:
+        return
+    try:
+        status, _, body = registry_get(f"manifests/{m.group(1)}")
+        if status != 200 or "sha256:" + hashlib.sha256(body).hexdigest() != m.group(1):
+            return print(f"  not caching the image: its manifest came back HTTP {status}")
+        manifest = json.loads(body)
+        tmp = d + ".new"
+        shutil.rmtree(tmp, ignore_errors=True)
+        os.makedirs(os.path.join(tmp, "blobs", "sha256"))
+        for desc in [manifest["config"], *manifest["layers"]]:
+            hexd = desc["digest"].split(":", 1)[1]
+            shutil.copy(os.path.join(args.image_cache, "blobs", "sha256", hexd), os.path.join(tmp, "blobs", "sha256", hexd))
+        open(os.path.join(tmp, "blobs", "sha256", m.group(1).split(":", 1)[1]), "wb").write(body)
+        json.dump({"imageLayoutVersion": "1.0.0"}, open(os.path.join(tmp, "oci-layout"), "w"))
+        json.dump({"schemaVersion": 2, "manifests": [{"mediaType": manifest.get("mediaType", "application/vnd.oci.image.manifest.v1+json"),
+                                                      "digest": m.group(1), "size": len(body)}]},
+                  open(os.path.join(tmp, "index.json"), "w"))
+        shutil.rmtree(d, ignore_errors=True)
+        os.rename(tmp, d)
+        print(f"  cached {args.image} ({m.group(1)}) as an OCI layout")
+    except Exception as e:
+        print(f"  not caching the image: {e}")
+
+
 @case
 def image_template():
     """template --image: a container image becomes a template whose VMs run its entrypoint."""
@@ -586,17 +720,17 @@ def image_template():
     t = time.time()
     cmd = ["sh", "-c", "mkdir -p /tmp/www && echo hello-from-image > /tmp/www/index.html && "
                        "echo app-started && exec httpd -f -p 8080 -h /tmp/www"]
-    # Anonymous registry pulls get rate limited (HTTP 429); only that is retried.
-    for delay in (5, 15, 30, None):
-        try:
-            template(name, "--image", args.image, "--image-cache", os.path.join(WORK, "images"), "--vcpus", "2", "--max", "2048", "--cmd", json.dumps(cmd))
-            break
-        except AssertionError as e:
-            if delay is None or "HTTP 429" not in str(e):
-                raise
-            print(f"  registry rate limit; retrying in {delay} s")
-            time.sleep(delay)
-    print(f"  template from {args.image}: {time.time() - t:.1f} s")
+    opts = ["--vcpus", "2", "--max", "2048", "--cmd", json.dumps(cmd)]
+    layout = image_layout()
+    if layout:
+        # Cached (CI): the image as an OCI layout of the blobs an earlier pull fetched. No
+        # registry; flexvm checks every blob against its digest as it would after a pull.
+        flexvm("template", name, "--image", layout, "--image-cache", os.path.join(WORK, "images"), *opts, timeout=600)
+        print(f"  template from the cached {args.image} ({image_digest(layout)}): {time.time() - t:.1f} s")
+    else:
+        r = pull_template(name, opts)
+        print(f"  template from {args.image}, pulled: {time.time() - t:.1f} s")
+        save_layout(r.stderr)
     vm = "e2e-img"
     ip = A.run(vm, template=name)
     check("image vm: app's output in logs", wait_for(lambda: "\napp-started\n" in A.logs(vm), 15), A.logs(vm))
@@ -644,35 +778,25 @@ def faults():
 
 # Directories of this run's own, shared with nothing else: run directories under /run
 # (tmpfs), state and checkpoints under /var/tmp (suspend needs a disk).
-RUN = tempfile.mkdtemp(prefix="fvci-", dir="/run")
-WORK = tempfile.mkdtemp(prefix="fvci-", dir="/var/tmp")
-# Templates of this run's own: never another's `ci` or the shared image cache.
-os.environ["FLEXVM_TEMPLATES"] = ENV["FLEXVM_TEMPLATES"] = os.path.join(WORK, "templates")
+RUN = tempfile.mkdtemp(prefix=args.tag + "-", dir=None if args.selftest else "/run")
+WORK = tempfile.mkdtemp(prefix=args.tag + "-", dir="/var/tmp")
+# Templates of this run's own (a worker's are its run's): never another's `ci` or the shared image
+# cache. On tmpfs: building one writes out all of the guest's memory and reads it back to hash it,
+# which a CI runner's disk makes slow; what stays (sparse) is small.
+TEMPLATES = args.templates or tempfile.mkdtemp(prefix=args.tag + "-", dir="/dev/shm" if os.path.isdir("/dev/shm") else WORK)
+os.environ["FLEXVM_TEMPLATES"] = ENV["FLEXVM_TEMPLATES"] = TEMPLATES
 A = Host("a", args.port_a, args.port_a + 1, args.net_a)
 GROW = args.template + "-grow"
 B = Host("b", args.port_a + 1, args.port_a, args.net_b)
 
 
-def main():
-    assert os.geteuid() == 0, "run as root"
-    selected = args.cases or list(CASES)
-    for c in selected:
-        assert c in CASES, f"unknown case {c}; have {', '.join(CASES)}"
-    started = time.time()
+def worker():
+    """Runs the given cases against this lane's two hosts; writes their results to --results."""
     failed, clean = [], False
-    try:
-        t = time.time()
-        template(args.template, "--vcpus", "2", "--max", "2048")
-        # A larger ceiling with little plugged at the start: VMs must grow.
-        template(GROW, "--vcpus", "2", "--max", "6144", "--plug", "128")
-        print(f"PASS templates ({time.time() - t:.1f} s)", flush=True)
-    except Exception as e:
-        print(f"FAIL template: {e}", flush=True)
-        return 1
     try:
         A.start()
         B.start()
-        for c in selected:
+        for c in args.cases:
             print(f"--- {c}: {CASES[c].__doc__.strip().splitlines()[0]}", flush=True)
             t = time.time()
             try:
@@ -701,6 +825,16 @@ def main():
                     print(f"saving {h.label}'s logs: {e}", flush=True)
         t = time.time()
         problems = []
+        # What a SIGKILLed VM process leaves (its tap, its name) is collected by the next VM
+        # process to start on its host, as later cases' VMs would: after scenarios (which kill
+        # VM processes so), start one on each.
+        for h in (A, B):
+            try:
+                if h.proc and "faults" in args.cases:
+                    h.run("e2e-collect")
+                    h.kill("e2e-collect")
+            except Exception as e:
+                problems.append(f"host {h.label}: a VM to collect garbage: {e}")
         for h in (A, B):
             try:
                 h.stop()
@@ -712,10 +846,186 @@ def main():
         if problems:
             failed.append("teardown")
             print("\n".join(problems))
-        shutil.rmtree(WORK, ignore_errors=True)
-        shutil.rmtree(RUN, ignore_errors=True)
-    print("\n" + "\n".join(f"{s} {c} ({d:.1f} s)" for c, s, d in results))
-    print(f"{len(results) - len(failed)} passed, {len(failed)} failed in {time.time() - started:.0f} s")
+        if args.results:
+            json.dump(results, open(args.results, "w"))
+    return 1 if failed else 0
+
+
+# About how many seconds each case and scenario takes on a CI runner (4 lanes): the long ones
+# start first, and the short ones go in batches of about BATCH_S (each batch is a worker, with
+# hosts of its own). Unlisted ones count as 2 s.
+COST = {"image_template": 30, "pause_resume": 6, "migrate": 3, "checkpoint_restore": 3, "suspend_resume": 3,
+        "faults/cow_grow": 70, "faults/held_restore_frozen": 19, "faults/pages_blip": 18, "faults/ckpt_incremental": 18,
+        "faults/pages_dead_restore": 14, "faults/abort_superseded": 13, "faults/plug_storm": 11, "faults/unknown": 10,
+        "faults/checkpoint_corrupt": 10, "faults/checkpoint_fork": 9, "faults/signals": 9, "faults/checkpoint_restore": 7,
+        "faults/cow_exact": 7, "faults/prepared_retry": 7, "faults/ckpt_failed_stop": 7, "faults/exec_race": 7,
+        "faults/prepare_fail": 6, "faults/route": 6, "faults/basic": 6, "faults/slow_preload": 6, "faults/refused": 6,
+        "faults/resume_kill": 5, "faults/lost_ack": 5, "faults/ckpt_rearm": 5, "faults/cow_abort": 5,
+        "faults/ckpt_packet_hold": 4}
+BATCH_S = 20
+
+
+def lanes():
+    """(port, net A, net B) of each lane."""
+    if args.lanes:
+        return [(int(port), a, b) for port, a, b in (lane.split(":") for lane in args.lanes.split())]
+    bump = lambda net, i: ".".join(str(int(o) + 2 * i) if k == 1 else o for k, o in enumerate(net.split(".")))
+    return [(args.port_a + 2 * i, bump(args.net_a, i), bump(args.net_b, i)) for i in range(max(1, args.jobs))]
+
+
+def main():
+    assert args.selftest or os.geteuid() == 0, "run as root"
+    if args.worker:
+        return worker()
+    selected = args.cases or list(CASES)
+    for c in selected:
+        assert c in CASES, f"unknown case {c}; have {', '.join(CASES)}"
+    scenarios = args.faults.split() if "faults" in selected else []
+    # (name, templates it needs, cost): the cases, and each scenario on its own.
+    work = [(c, set() if c == "image_template" else {args.template}, COST.get(c, 2)) for c in selected if c != "faults"]
+    # Growth runs on GROW; fc_prepare needs a second template to mismatch with.
+    work += [(f"faults/{s}", {args.template, GROW} if s in ("cow_grow", "plug_storm", "fc_prepare") else {args.template},
+              COST.get(f"faults/{s}", 2)) for s in scenarios]
+    work.sort(key=lambda w: -w[2])
+    scheduled = list(work)
+    lock, out_lock = threading.Condition(), threading.Lock()
+    built, broken, procs, summary = set(), set(), [], []
+    started = time.time()
+
+    def say(line):
+        with out_lock:
+            print(line, flush=True)
+
+    def build(name, *extra):
+        t = time.time()
+        try:
+            r = flexvm("template", name, *extra, timeout=600) if not args.selftest else None
+            out, ok = (r.stdout + r.stderr).strip() if r else "(selftest)", True
+        except Exception as e:
+            out, ok = str(e), False
+        with lock:
+            (built if ok else broken).add(name)
+            summary.append((f"template {name}", "PASS" if ok else "FAIL", time.time() - t, "-"))
+            lock.notify_all()
+        say(f"{'PASS' if ok else 'FAIL'} template {name} ({time.time() - t:.1f} s): {out}")
+
+    def take():
+        """The next batch whose templates are built; None once there is no more."""
+        with lock:
+            while True:
+                for w in [w for w in work if w[1] & broken]:
+                    work.remove(w)
+                    summary.append((w[0], "FAIL", 0.0, "-"))
+                    say(f"FAIL {w[0]}: its template failed")
+                ready = [w for w in work if w[1] <= built]
+                if ready or not work:
+                    break
+                lock.wait()
+            if not ready:
+                return None
+            batch = [ready[0]]
+            for w in reversed(ready[1:]):
+                if sum(b[2] for b in batch) + w[2] > BATCH_S:
+                    break
+                batch.append(w)
+            for w in batch:
+                work.remove(w)
+            return [w[0] for w in batch]
+
+    spawned = []
+
+    def spawn(cmd, cases, scens, res):
+        """A worker process; under --selftest a fake one, and the second spawn fails as with EMFILE."""
+        if args.selftest:
+            with lock:
+                spawned.append((cases, scens))
+                if len(spawned) == 2:
+                    raise OSError(24, "Too many open files (selftest)")
+            fake = ("import json, sys; c, s, res = json.loads(sys.argv[1]); [print(f'scenario {x}: ok in 0.0 s') for x in s]; "
+                    "json.dump([[x, 'PASS', 0.0] for x in c] + ([['faults', 'PASS', 0.0]] if s else []), open(res, 'w'))")
+            cmd = [sys.executable, "-c", fake, json.dumps([cases, scens, res])]
+        return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, text=True)
+
+    def run_batch(i, label, batch, port, net_a, net_b):
+        """Runs one batch in a worker; returns its results."""
+        cases = [c for c in batch if not c.startswith("faults/")]
+        scens = [c.split("/", 1)[1] for c in batch if c.startswith("faults/")]
+        res = os.path.join(WORK, f"results-{label}.json")
+        cmd = [sys.executable, "-u", os.path.abspath(__file__), "--worker", "--lane", str(i), "--bin", BIN,
+               "--artifacts", ARTIFACTS, "--log-dir", os.path.join(args.log_dir, f"lane-{label}"),
+               "--port-a", str(port), "--net-a", net_a, "--net-b", net_b, "--tag", args.tag,
+               "--template", args.template, "--templates", TEMPLATES, "--image", args.image, "--results", res,
+               *(["--image-cache", os.path.abspath(args.image_cache)] if args.image_cache else []),
+               "--faults", " ".join(scens), *(["--no-image"] if args.no_image else []),
+               *cases, *(["faults"] if scens else [])]
+        say(f"[{label}] {' '.join(batch)}")
+        t = time.time()
+        p = spawn(cmd, cases, scens, res)
+        with lock:
+            procs.append(p)
+        got = []
+        for line in p.stdout:
+            say(f"[{label}] {line.rstrip()}")
+            m = re.match(r"scenario (\S+): (ok|FAILED) in ([\d.]+) s$", line.strip())
+            if m:
+                got.append((f"faults/{m.group(1)}", "PASS" if m.group(2) == "ok" else "FAIL", float(m.group(3)), label))
+        code = p.wait()
+        try:
+            got += [(c, st, d, label) for c, st, d in json.load(open(res)) if c != "faults" or st == "FAIL"]
+        except (OSError, ValueError):
+            got.append((f"worker {label}", "FAIL", time.time() - t, label))
+        if code != 0 and not any(g[1] == "FAIL" for g in got):
+            got.append((f"worker {label} (exit {code})", "FAIL", time.time() - t, label))
+        return got
+
+    def lane(i, port, net_a, net_b):
+        n = 0
+        while (batch := take()) is not None:
+            n += 1
+            label = f"{i}.{n}"
+            try:
+                got = run_batch(i, label, batch, port, net_a, net_b)
+            except Exception as e:
+                # Whatever went wrong, the batch failed: none of it may pass unrun.
+                say(f"[{label}] FAIL batch: {type(e).__name__}: {e}")
+                got = [(c, "FAIL", 0.0, label) for c in batch]
+            with lock:
+                summary.extend(got)
+
+    builders = [threading.Thread(target=build, args=(args.template, "--vcpus", "2", "--max", "2048")),
+                # A larger ceiling with little plugged at the start: VMs must grow.
+                threading.Thread(target=build, args=(GROW, "--vcpus", "2", "--max", "6144", "--plug", "128"))]
+    runners = [threading.Thread(target=lane, args=(i, *l), daemon=True) for i, l in enumerate(lanes())]
+    try:
+        for t in builders + runners:
+            t.start()
+        for t in builders + runners:
+            t.join()
+    finally:
+        # Interrupted: the workers tear down what they made.
+        with lock:
+            for p in procs:
+                if p.poll() is None:
+                    p.send_signal(signal.SIGINT)
+        for p in procs:
+            try:
+                p.wait(60)
+            except subprocess.TimeoutExpired:
+                p.kill()
+    # Every case and scenario has a result, or it failed (a lane that died, say).
+    done = {r[0] for r in summary}
+    summary.extend((name, "FAIL", 0.0, "not run") for name, _, _ in scheduled if name not in done)
+    summary.sort(key=lambda r: -r[2])
+    failed = [r for r in summary if r[1] != "PASS"]
+    print("\n" + "\n".join(f"{s} {c} ({d:.1f} s, batch {b})" for c, s, d, b in summary))
+    print(f"{len(summary) - len(failed)} passed, {len(failed)} failed in {time.time() - started:.0f} s "
+          f"({sum(r[2] for r in summary):.0f} s of work in {len(lanes())} lanes)")
+    if args.selftest:
+        # The second batch could not be spawned: exactly its cases and scenarios fail, the rest pass.
+        bad = sorted(r[0] for r in failed)
+        want = sorted(spawned[1][0] + [f"faults/{x}" for x in spawned[1][1]]) if len(spawned) > 1 else ["(no second batch)"]
+        print(f"selftest: failed {bad}, expected {want}")
+        return 0 if bad == want and len(summary) == len(scheduled) + 2 else 1
     return 1 if failed else 0
 
 
@@ -725,4 +1035,6 @@ if __name__ == "__main__":
     finally:
         shutil.rmtree(WORK, ignore_errors=True)
         shutil.rmtree(RUN, ignore_errors=True)
+        if not args.templates:
+            shutil.rmtree(TEMPLATES, ignore_errors=True)
     sys.exit(code)
