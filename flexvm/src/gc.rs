@@ -53,7 +53,7 @@ pub fn sweep(host: &Host) {
 }
 
 /// Local sweeps are one at a time (`RUN/.gc.lock`).
-fn local_cleanup(host: &Host) {
+pub fn local_cleanup(host: &Host) {
     let Ok(lock) = File::create(host.run.join(".gc.lock")) else { return };
     if flock(&lock, libc::LOCK_EX | libc::LOCK_NB).is_err() {
         return;
@@ -65,6 +65,25 @@ fn local_cleanup(host: &Host) {
     for e in std::fs::read_dir(host.run.join("standby")).into_iter().flatten().flatten() {
         if e.file_type().is_ok_and(|t| t.is_dir()) {
             standby_sockets(&e.path());
+        }
+    }
+    if let Ok(paths) = crate::template::Paths::from_env() {
+        load_sets(&host.run.join("standby"), &paths);
+    }
+}
+
+/// `.loadset-ID` (`standby::save_load_set`, written once its generation is in place) of
+/// a generation no longer in `paths`' templates: a rebuilt template's old ones, once
+/// removed. None go if that directory is not there (not this host's templates).
+fn load_sets(dir: &Path, paths: &crate::template::Paths) {
+    if !paths.templates.is_dir() {
+        return;
+    }
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let n = e.file_name().to_string_lossy().into_owned();
+        let Some(id) = n.strip_prefix(".loadset-") else { continue };
+        if crate::template::Template::generation(paths, id).is_none() {
+            let _ = std::fs::remove_file(e.path());
         }
     }
 }
@@ -109,12 +128,13 @@ fn vm_files(host: &Host) {
     }
 }
 
-/// `KEY.PID-START.sock` and `PID-START.claim` of standbys whose locks are gone,
+/// `KEY.PID-START.sock`, `PID-START.claim` and `PID-START.take` (a claimer's) of standbys whose locks are gone,
 /// and `.PID-START.lock` (a lock not yet in place, unlocked at first) of standbys gone.
 fn standby_sockets(dir: &Path) {
     for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         let n = e.file_name().to_string_lossy().into_owned();
-        let (claim, tmp) = (n.strip_suffix(".claim"), n.strip_prefix('.').and_then(|n| n.strip_suffix(".lock")));
+        let claim = n.strip_suffix(".claim").or_else(|| n.strip_suffix(".take"));
+        let tmp = n.strip_prefix('.').and_then(|n| n.strip_suffix(".lock"));
         let Some(id) = claim.or(tmp).or_else(|| n.strip_suffix(".sock").and_then(|s| s.rsplit_once('.')).map(|(_, id)| id)) else { continue };
         let Some((pid, start)) = id.split_once('-') else { continue };
         if [pid, start].iter().any(|s| s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit())) {
@@ -154,7 +174,19 @@ mod tests {
         File::create(d.join("2-1.lock")).unwrap();
         let claiming = File::create(d.join("4-1.claim")).unwrap();
         flock(&claiming, libc::LOCK_EX).unwrap();
-        for s in ["key.1-1.sock", "key.1-2.sock", "key.2-1.sock", "key.3-1.sock", "key.x.sock", "1-1.lock", "3-1.claim", "5-6.claim", "5-7.claim"] {
+        for s in [
+            "key.1-1.sock",
+            "key.1-2.sock",
+            "key.2-1.sock",
+            "key.3-1.sock",
+            "key.x.sock",
+            "1-1.lock",
+            "3-1.claim",
+            "5-6.claim",
+            "5-7.claim",
+            "3-1.take",
+            "5-7.take",
+        ] {
             File::create(d.join(s)).unwrap();
         }
         let other = File::create(d.join("5-7.lock")).unwrap();
@@ -169,10 +201,29 @@ mod tests {
         assert!(left("key.1-1.sock"), "its standby holds its lock");
         assert!(left("4-1.claim") && left("5-7.claim"), "a claim marker of a standby still here stays");
         assert!(!left("3-1.claim") && !left("5-6.claim"), "one unlocked goes once its lock is gone or names another process");
+        assert!(!left("3-1.take") && left("5-7.take"), "a claimer's marker goes with its standby");
         assert!(!left("key.1-2.sock"), "a reused pid keeps only its own socket");
         assert!(!left("key.2-1.sock") && !left("key.3-1.sock"), "lock free or gone");
         assert!(left("key.x.sock") && left("2-1.lock"));
         assert!(!left(".999999999-1.lock") && left(&mine));
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn load_sets_of_generations_gone_go() {
+        let d = dir("loadsets");
+        let run = d.join("run");
+        std::fs::create_dir_all(&run).unwrap();
+        for f in [".loadset-ab12", ".loadset-cd34", "default"] {
+            File::create(run.join(f)).unwrap();
+        }
+        let paths = crate::template::Paths::new(&d, Some(d.join("templates"))).unwrap();
+        // No templates directory: not this host's, so nothing is decided.
+        load_sets(&run, &paths);
+        assert!(run.join(".loadset-cd34").exists());
+        std::fs::create_dir_all(d.join("templates/.gen/ab12")).unwrap();
+        load_sets(&run, &paths);
+        assert!(run.join(".loadset-ab12").exists() && !run.join(".loadset-cd34").exists() && run.join("default").exists());
         std::fs::remove_dir_all(d).unwrap();
     }
 

@@ -167,10 +167,11 @@ fn refill_by(host: &Host, template: &str, wait: bool) -> Result<usize> {
     }
     let mut ready = Vec::new();
     let log = std::fs::OpenOptions::new().create(true).append(true).open(d.join("standby.log"))?;
+    let mib = grant_mib(template);
     // A failed start ends the round, but those started before it are still waited for.
     let mut failed = None;
     for _ in 0..want {
-        match start_one(host, template, &log) {
+        match start_one(host, template, &log, mib) {
             Ok(Some(r)) => ready.push(r),
             Ok(None) => break,
             Err(e) => {
@@ -202,9 +203,17 @@ fn wait_ready(r: UnixStream, timeout: Duration) -> Result<()> {
     }
 }
 
+/// What a refill's grant admits for each standby: what its load pages in, as a cold
+/// start admits (`working_set_mib`), and `MIN_GRANT_MIB` at least. The template is
+/// found as the standby's process will find it.
+fn grant_mib(template: &str) -> u64 {
+    let wset = crate::template::Paths::from_env().and_then(|paths| Template::working_set_mib_of(&paths, template));
+    MIN_GRANT_MIB.max(wset.unwrap_or(0))
+}
+
 /// One standby started and listed, its readiness reply to come; None if relief
 /// holds the stop lock, the grant is refused or the host lock is busy.
-fn start_one(host: &Host, template: &str, log: &File) -> Result<Option<UnixStream>> {
+fn start_one(host: &Host, template: &str, log: &File, mib: u64) -> Result<Option<UnixStream>> {
     // Shared from the grant until its lock file exists (`locked`), not through its load:
     // relief either lists it or ran before the grant. None while relief stops them, and
     // held `LOCKED_TIMEOUT` at most (a stuck host lock fails the grant; a child that
@@ -214,18 +223,19 @@ fn start_one(host: &Host, template: &str, log: &File) -> Result<Option<UnixStrea
     if flock(&stop, libc::LOCK_SH | libc::LOCK_NB).is_err() {
         return Ok(None);
     }
-    let grant = match host.grant(256, Some(by)) {
+    let grant = match host.grant(mib, Some(by)) {
         Ok(Some(id)) => id,
         Ok(None) => return Ok(None),
         Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::WouldBlock) => return Ok(None),
         Err(e) => return Err(e),
     };
     // What a child left unlisted is gone (`wait_locked`), so relief may go on; then its
-    // grant and what it made before its lock (its cgroup and work directory) are freed.
+    // grant and what it made before its lock (its cgroup and work directory) are freed:
+    // locally only, never waiting on peers (`gc::sweep`'s network retirement).
     let release = |stop: File| {
         drop(stop);
         host.refund_by(grant, Some(Instant::now() + LOCKED_TIMEOUT));
-        crate::gc::sweep(host);
+        crate::gc::local_cleanup(host);
     };
     let started = (|| {
         let (r, w) = UnixStream::pair()?;
@@ -327,7 +337,7 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
         let _ = send_json(f, &json!({"locked": true}));
     }
     let claim_path = d.join(format!("{id}.claim"));
-    p.files.lock().unwrap().extend([sock.clone(), lock_path, claim_path.clone()]);
+    p.files.lock().unwrap().extend([sock.clone(), lock_path, claim_path.clone(), d.join(format!("{id}.take"))]);
     let ready = load(p.spawner.take(None)?, tpl.clone())?;
     // Taken now, so a claim does not scan memory or ask Firecracker.
     *p.sizes.lock().unwrap() = Some(ready.mem_sizes());
@@ -380,7 +390,13 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
                 crate::host::stall("claim_stall");
                 let _ = std::fs::remove_file(&sock);
                 p.serve_control();
-                let _ = send_json(&mut &c, &json!({"ok": true, "result": v}));
+                // A claimer gone before its answer (a foreground `run` interrupted) would leave
+                // the VM running with no one to stop it: it goes, as a cold foreground run's would.
+                if let Err(e) = send_json(&mut &c, &json!({"ok": true, "result": v})) {
+                    crate::log!("standby {template}: the claimer of {} is gone ({e}): destroying it", req["name"].as_str().unwrap_or(""));
+                    // Not `destroy`: this op (the start) is held already. Nothing else runs on the VM yet.
+                    p.finish(op, End::Gone, crate::vmproc::FAILED, None);
+                }
                 if let [out, err, ..] = &fds[..] {
                     crate::util::output::retarget([out.as_raw_fd(), err.as_raw_fd()]);
                 }
@@ -391,6 +407,10 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
                 drop(lock);
                 let (h, t) = (host.clone(), template.to_string());
                 std::thread::spawn(move || {
+                    // As `maintain`: none for a while after pressure stopped standby VMs.
+                    if recent(&pressure(&h)) {
+                        return;
+                    }
                     if let Err(e) = refill(&h, &t) {
                         crate::log!("standby {t}: {e}");
                     }
@@ -466,10 +486,23 @@ pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]
     let name = req["name"].as_str().unwrap_or("");
     // One budget for all (a stopped standby uses it up), and a moment past it for each live one, up to a few.
     let budget = Instant::now() + HANDSHAKE_TIMEOUT;
-    for sock in socks {
+    // Each tried first by one claimer at a time (`ID.take`, held while it is tried), so
+    // concurrent runs take different standbys; those others are trying come last.
+    let mut queue: std::collections::VecDeque<(PathBuf, bool)> = socks.into_iter().map(|s| (s, false)).collect();
+    while let Some((sock, deferred)) = queue.pop_front() {
         if Instant::now() >= budget + 4 * LATE {
             break;
         }
+        let _taking = match deferred {
+            false => match try_take(&sock) {
+                Some(taking) => taking,
+                None => {
+                    queue.push_back((sock, true));
+                    continue;
+                }
+            },
+            true => None,
+        };
         let at = budget.max(Instant::now() + LATE);
         let c = match crate::util::send_unix(&sock, &line, fds, at) {
             Ok(c) => c,
@@ -516,7 +549,21 @@ pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]
     Ok(None)
 }
 
+/// `KEY.ID.sock`'s `ID.take`, locked: Some(lock), Some(None) if it cannot be had (no
+/// such name, a file it cannot create: tried anyway), None if another claimer holds it.
+fn try_take(sock: &std::path::Path) -> Option<Option<File>> {
+    let Some(id) = sock.file_stem().and_then(|s| s.to_str()).and_then(|s| s.rsplit_once('.')).map(|(_, id)| id) else { return Some(None) };
+    let Ok(f) = File::options().create(true).truncate(false).write(true).open(sock.with_file_name(format!("{id}.take"))) else { return Some(None) };
+    match flock(&f, libc::LOCK_EX | libc::LOCK_NB) {
+        Ok(()) => Some(Some(f)),
+        Err(e) if e.raw_os_error() == Some(libc::EWOULDBLOCK) => None,
+        Err(_) => Some(None),
+    }
+}
+
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// What a refill grants a standby at least (`grant_mib`).
+const MIN_GRANT_MIB: u64 = 256;
 /// How long a refill holds relief off for each standby it starts: its grant, then its lock file.
 const LOCKED_TIMEOUT: Duration = Duration::from_secs(5);
 /// Restore, reseed and settle, bounded independently of publishing the lock.
@@ -676,6 +723,45 @@ mod tests {
         for s in &stopped {
             assert!(send_json(&mut s.accept().unwrap().0, &json!({"claiming": true})).is_err());
         }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn concurrent_claimers_take_different_standbys() {
+        let root = std::env::temp_dir().join(format!("flexvm-standby-take-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        std::fs::create_dir_all(root.join("templates/default")).unwrap();
+        let paths = Paths::new(&root, None).unwrap();
+        let d = dir(&host, "default");
+        std::fs::create_dir_all(&d).unwrap();
+        let serve = |n: u32| {
+            let l = UnixListener::bind(d.join(format!("default.{n}-1.sock"))).unwrap();
+            std::thread::spawn(move || {
+                let (c, _) = l.accept().unwrap();
+                std::io::BufRead::read_line(&mut BufReader::new(&c), &mut String::new()).unwrap();
+                send_json(&mut &c, &json!({"claiming": true})).unwrap();
+                send_json(&mut &c, &json!({"ok": true, "result": n})).unwrap();
+                // Answers no other claimer: one queued here would wait out the handshake budget.
+                std::thread::sleep(Duration::from_secs(2));
+            })
+        };
+        let (first, second) = (serve(1), serve(2));
+        // Another claimer is trying the first: this one takes the second, at once.
+        let other = try_take(&d.join("default.1-1.sock")).unwrap().unwrap();
+        assert!(try_take(&d.join("default.1-1.sock")).is_none());
+        let start = Instant::now();
+        let (v, _) = take(&host, &paths, "default", &json!({"name": "a"}), &[]).unwrap().unwrap();
+        assert_eq!(v, json!(2));
+        assert!(start.elapsed() < Duration::from_secs(1), "{:?}", start.elapsed());
+        // Only those others are trying are left: tried anyway.
+        assert!(try_take(&d.join("default.2-1.sock")).unwrap().is_some());
+        std::fs::remove_file(d.join("default.2-1.sock")).unwrap();
+        let (v, _) = take(&host, &paths, "default", &json!({"name": "b"}), &[]).unwrap().unwrap();
+        assert_eq!(v, json!(1));
+        drop(other);
+        first.join().unwrap();
+        second.join().unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 

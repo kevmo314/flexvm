@@ -504,7 +504,15 @@ fn run(args: &Args, name: &str, template: &str) -> Result<()> {
     let outs = fds.into_iter().map(|f| Ok(util::output::own(f?.into()))).collect::<std::io::Result<Vec<_>>>()?;
     // A detached run's VM process (it answers on FLEXVM_NOTIFY_FD): its parent tried them.
     let tried = std::env::var_os("FLEXVM_NOTIFY_FD").is_some();
-    match if tried { None } else { standby::take(&host, &paths, template, &req, &outs.iter().map(|f| f.as_raw_fd()).collect::<Vec<_>>())? } {
+    // A foreground claim's signals wait from before it is sent: the VM it makes gets them
+    // (`follow`), as a cold start would, never orphaned by this process dying mid-claim.
+    let set = (!tried && log.is_none()).then(|| util::block_signals(&FOLLOW_SIGNALS));
+    let taken = if tried { None } else { standby::take(&host, &paths, template, &req, &outs.iter().map(|f| f.as_raw_fd()).collect::<Vec<_>>())? };
+    if let (None, Some(set)) = (&taken, &set) {
+        // No claim: this process becomes the VM, and one pending kills it as before.
+        unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, set, std::ptr::null_mut()) };
+    }
+    match taken {
         Some((v, _)) if log.is_some() => print(v),
         Some((v, conn)) => {
             crate::log!("{v}");
@@ -515,6 +523,9 @@ fn run(args: &Args, name: &str, template: &str) -> Result<()> {
         None => vmproc::main(host, paths, Start::Run { name: name.into(), template: template.into(), ip, cmd }, notify_fd()),
     }
 }
+
+/// What a foreground `run` that claimed a standby VM forwards to it (SIGHUP is ignored).
+const FOLLOW_SIGNALS: [i32; 6] = [libc::SIGTERM, libc::SIGINT, libc::SIGQUIT, libc::SIGTSTP, libc::SIGCONT, libc::SIGHUP];
 
 fn start(args: &Args, name: &str, s: Start) -> Result<()> {
     if args.has("detach") {
@@ -553,7 +564,8 @@ fn notify_fd() -> Option<std::fs::File> {
 
 /// A foreground `run` that claimed a standby VM: forwards signals, exits with its status.
 fn follow(mut conn: BufReader<std::os::unix::net::UnixStream>, id: host::Ident) -> Result<()> {
-    let set = util::block_signals(&[libc::SIGTERM, libc::SIGINT, libc::SIGQUIT, libc::SIGTSTP, libc::SIGCONT, libc::SIGHUP]);
+    // Blocked since before the claim (`run`): any that came meanwhile are pending, and forwarded.
+    let set = util::block_signals(&FOLLOW_SIGNALS);
     // A fast command's process may be gone already: its exit frame is buffered.
     if let Ok(Some(vm)) = host::PidFd::open(&id) {
         std::thread::spawn(move || loop {
