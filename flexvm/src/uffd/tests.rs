@@ -893,3 +893,27 @@ fn prefetch_ordering_preserves_learning_and_load_completion() {
         }
     }
 }
+
+#[test]
+fn protect_ranges_stay_bounded() {
+    use super::wp::{protect_ranges, PROTECT_MAX};
+    // Merged across gaps of up to 64 pages, and not across a kept page.
+    assert_eq!(protect_ranges([0, 65, 131].into_iter(), |_| false), vec![(0, 66), (131, 132)]);
+    assert_eq!(protect_ranges([0, 10].into_iter(), |p| p == 5), vec![(0, 1), (10, 11)]);
+    // Every 66th page of a 32 GiB region: 127,101 ranges at that gap, merged down to a bounded count, covering every
+    // page and no kept one.
+    let n = 32 << 18;
+    let kept = |p: usize| p % (1 << 20) == 7;
+    let pages: Vec<usize> = (0..n).step_by(66).filter(|&p| !kept(p)).collect();
+    let ranges = protect_ranges(pages.iter().copied(), kept);
+    assert!(ranges.len() <= PROTECT_MAX, "{} ranges", ranges.len());
+    assert!(ranges.windows(2).all(|w| w[0].1 < w[1].0));
+    let mut r = ranges.iter().peekable();
+    for &p in &pages {
+        while r.peek().is_some_and(|&&(_, e)| e <= p) {
+            r.next();
+        }
+        assert!(r.peek().is_some_and(|&&(f, _)| f <= p), "page {p} not protected");
+    }
+    assert!(ranges.iter().all(|&(f, e)| !(f..e).any(kept)));
+}

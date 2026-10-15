@@ -18,6 +18,12 @@ const SAVE_REST_THREADS: usize = 8;
 /// chunk (see `WP_SIZES`), so this keeps a chunk written all over to a call or two (about 6-9 µs a call here).
 const PROTECT_GAP: usize = 64;
 
+/// Past this many protect ranges in a region, they are merged across gaps 4 times as wide until they fit: 4096 calls
+/// cost 25-37 ms of pause, more than protecting a whole populated GiB in one call (3-23 ms here, #281), and a GiB merged
+/// at `PROTECT_GAP` stays below it. So only a larger region written in pages scattered all over pays the refaults that
+/// merging causes, and its pause stays bounded.
+pub(super) const PROTECT_MAX: usize = 4096;
+
 /// Pages a write-protect fault unprotects (and saves first, during a copy), at the least.
 const WP_BLOCK: usize = 16;
 /// Writes cluster: a guest that writes a page of a 2 MiB chunk tends to write much of it soon, and again after the next
@@ -397,17 +403,11 @@ impl Pager {
         // were unprotected.
         for m in self.mappings().iter().filter(|_| cow) {
             let (from, to) = m.span();
-            let mut ranges: Vec<(usize, usize)> = Vec::new();
-            for p in set_bits(&dirty).filter(|&p| p >= from && p < to && pages.get(p) == PRESENT && !keeps(p)) {
-                match ranges.last_mut() {
-                    Some((_, e)) if p <= *e + PROTECT_GAP && !(*e..p).any(keeps) => *e = p + 1,
-                    _ => ranges.push((p, p + 1)),
-                }
-            }
-            // Range by range, never the whole region: a protect makes KVM drop its mappings of everything in the range
+            // Range by range, not the whole region: a protect makes KVM drop its mappings of everything in the range
             // (see `WP_CHUNK`), so the guest would refault every page it uses there, clean ones too, after the resume.
             // That costs far more than the calls it spares (#281).
-            protected += self.protect(ranges, Some(&dirty))?;
+            let dirty_here = set_bits(&dirty).filter(|&p| p >= from && p < to && pages.get(p) == PRESENT && !keeps(p));
+            protected += self.protect(protect_ranges(dirty_here, keeps), Some(&dirty))?;
         }
         let protect = start.elapsed();
         let out = match incremental {
@@ -509,4 +509,27 @@ impl Pager {
     pub(super) fn wake(&self, page: usize) -> io::Result<()> {
         self.ioctl(UFFDIO_WAKE, &mut [self.addr(page)?, PAGE_SIZE as u64])
     }
+}
+
+/// The ranges that protect `pages` (ascending): merged across gaps of up to `PROTECT_GAP` pages, wider ones while there
+/// are more than `PROTECT_MAX`, never across a page `keeps` keeps.
+pub(super) fn protect_ranges(pages: impl Iterator<Item = usize>, keeps: impl Fn(usize) -> bool) -> Vec<(usize, usize)> {
+    let merge = |ranges: &mut dyn Iterator<Item = (usize, usize)>, gap: usize| {
+        let mut out: Vec<(usize, usize)> = Vec::new();
+        for (p, q) in ranges {
+            match out.last_mut() {
+                Some((_, e)) if p <= *e + gap && !(*e..p).any(&keeps) => *e = q,
+                _ => out.push((p, q)),
+            }
+        }
+        out
+    };
+    let mut gap = PROTECT_GAP;
+    let mut ranges = merge(&mut pages.map(|p| (p, p + 1)), gap);
+    let span = ranges.first().zip(ranges.last()).map_or(0, |(f, l)| l.1 - f.0);
+    while ranges.len() > PROTECT_MAX && gap < span {
+        gap *= 4;
+        ranges = merge(&mut ranges.into_iter(), gap);
+    }
+    ranges
 }
