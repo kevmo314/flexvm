@@ -1249,6 +1249,57 @@ def same_host_backlog():
     udp_across_migrations("same host backlog", "ft-backlog", burst=10, source_fault="tap_backlog")
 
 
+def same_host_bulk_tcp():
+    """#411: a bulk TCP download into a VM moving there and back, each source's Firecracker
+    stopped until frames pile up on its tap (`tap_backlog_stuck`), so its guest leaves them
+    there: mostly TSO frames, cut into their segments and handed to the target, none dropped.
+    The download goes on after each move, and no segment is lost (any retransmit is one the
+    guest reports as a duplicate)."""
+    n = "ft-bulk"
+    for h in (A, B):
+        clear_log(h, n)
+    ok(run(A, n))
+    ip = vm_ip(A, n)
+    tcp_server(A, n)
+    conn = socket.create_connection((ip, 7000), timeout=10)
+    stop, sent = threading.Event(), [0]
+
+    def pump():
+        chunk = b"x" * 65536
+        while not stop.is_set():
+            try:
+                sent[0] += conn.send(chunk)
+            except OSError:
+                return
+
+    t = threading.Thread(target=pump, daemon=True)
+    t.start()
+    time.sleep(0.5)
+    held, left, moved = [], [], []
+    for src, dst in ((A, B), (B, A)):
+        fault(src, "tap_backlog_stuck", 60000)
+        r = migrate(src, n, dst)
+        fault(src, "tap_backlog_stuck", 0)
+        held.append((r.get("result") or {}).get("held") or r.get("error"))
+        wait_released(dst, n, src)
+        left.append([l for l in log(src, n).splitlines() if "still queued on its tap" in l])
+        before = sent[0]
+        time.sleep(1)
+        moved.append(sent[0] - before)
+    stop.set()
+    t.join(15)
+    retrans, dsacks = tcp_retrans(conn)
+    conn.close()
+    check("bulk tcp: migrated there and back, running on A", where(n) == {A: "running"}, where(n))
+    check("bulk tcp: each source left frames on its tap", all(left), left)
+    check("bulk tcp: held packets all injected, none dropped",
+          all(isinstance(h, dict) and h.get("packets", 0) > 0 and h.get("injected") == h.get("packets") and h.get("dropped") == 0
+              and h.get("dropped_target") == 0 for h in held), held)
+    check("bulk tcp: the download goes on after each move", all(m > 0 for m in moved), moved)
+    check("bulk tcp: no segment lost (any retransmit a duplicate)", retrans <= dsacks, f"retransmits {retrans}, duplicates {dsacks}")
+    cleanup(n)
+
+
 def ckpt_backlog():
     """#136: a keep-running checkpoint whose VM is paused with frames still queued on its
     tap (`tap_backlog_stuck`: its Firecracker stopped until the wait for the guest to take
@@ -5361,6 +5412,28 @@ def peer_by_name():
         start_listener(B)
 
 
+def peer_unresolvable():
+    """#411: a peer configured by a name that never resolves (a typo, a peer gone from DNS)
+    gives no addresses once its lookup ended: route messages from the other peers are taken,
+    not refused while it does not resolve."""
+    if args.no_listeners:
+        return print("peer unresolvable: skipped (--no-listeners)")
+    ip = A.ips.split("-")[0].rsplit(".", 1)[0] + ".205"
+    withdraw = lambda: peer(B, {"op": "route", "ip": ip, "gen": addr(B, ip).get("seen", 0) + 1})
+    stop_listener(B)
+    try:
+        start_listener(B, extra=("--peer", "gone-peer.invalid:7000"))
+        t = time.time()
+        r = withdraw()
+        check("peer unresolvable: a route message from a peer is taken", r.get("ok"), (r, f"{time.time() - t:.2f}s"))
+        t = time.time()
+        r = withdraw()
+        check("peer unresolvable: and the next at once", r.get("ok") and time.time() - t < 1, (r, f"{time.time() - t:.2f}s"))
+    finally:
+        stop_listener(B)
+        start_listener(B)
+
+
 def peer_moved():
     """#311: a peer configured by name that comes back on a new address
     (DHCP) has its route messages accepted at once, not refused until the
@@ -7415,13 +7488,13 @@ SCENARIOS = dict(
     prepare_disconnect=prepare_disconnect, prepare_trickle=prepare_trickle, prepare_fail=prepare_fail,
     fc_prepare=fc_prepare, slow_preload=slow_preload, bad_preload=bad_preload, ckpt_packet_hold=ckpt_packet_hold, ckpt_stall=ckpt_stall, standby=standby,
     suspend_disk_freed=suspend_disk_freed, resume_mark_fails=resume_mark_fails, kill_source=kill_source,
-    kill_refused_checkpoint=no_evict(kill_refused_checkpoint), wildcard_listen=wildcard_listen, peer_by_name=peer_by_name, peer_moved=peer_moved, page_refusals=page_refusals,
+    kill_refused_checkpoint=no_evict(kill_refused_checkpoint), wildcard_listen=wildcard_listen, peer_by_name=peer_by_name, peer_moved=peer_moved, peer_unresolvable=peer_unresolvable, page_refusals=page_refusals,
     forged_peer=forged_peer, restore_ip_peer=restore_ip_peer, spoof_filter=spoof_filter, late_withdrawal=late_withdrawal, unlend_retry=unlend_retry,
     unit_restart=unit_restart, log_cap=log_cap, gc_debris=gc_debris, prefix_change=prefix_change, arrival_log=arrival_log, template_tap=template_tap,
     incoming_killed=incoming_killed, start_killed=start_killed, claim_killed=claim_killed, standby_stalled=standby_stalled, standby_refill_race=standby_refill_race, standby_lock_timeout=standby_lock_timeout, fc_died=fc_died,
     sigkill_restart=sigkill_restart, listen_trickle=listen_trickle,
     cow_wp_race=cow_wp_race, fetch_tail_enomem=fetch_tail_enomem, fetch_enomem_stuck=fetch_enomem_stuck, pull_enomem=pull_enomem,
-    collapse_abort=collapse_abort, collapse_ckpt_fail=collapse_ckpt_fail, ckpt_paused_backlog=ckpt_paused_backlog, same_host_order=same_host_order, same_host_slow_route=same_host_slow_route, same_host_flood=same_host_flood, same_host_late_handover=same_host_late_handover, same_host_backlog=same_host_backlog, ckpt_backlog=ckpt_backlog, rx_stall=rx_stall, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,
+    collapse_abort=collapse_abort, collapse_ckpt_fail=collapse_ckpt_fail, ckpt_paused_backlog=ckpt_paused_backlog, same_host_order=same_host_order, same_host_slow_route=same_host_slow_route, same_host_flood=same_host_flood, same_host_late_handover=same_host_late_handover, same_host_backlog=same_host_backlog, same_host_bulk_tcp=same_host_bulk_tcp, ckpt_backlog=ckpt_backlog, rx_stall=rx_stall, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,
     handoff_superseded=handoff_superseded, delayed_announce=delayed_announce, announce_arp_timer=announce_arp_timer,
     prepare_fail_announce=prepare_fail_announce, reconcile_announce=reconcile_announce, reconcile_kill=reconcile_kill, resume_pull_lock=resume_pull_lock, page_conns=page_conns, suspend_cmd=suspend_cmd, suspend_overlap=suspend_overlap, fc_died_busy=fc_died_busy, pause_cmd_start=pause_cmd_start, suspend_died=suspend_died,
     ctrl_z_long_op=ctrl_z_long_op, resume_suspending=resume_suspending, quit_status=quit_status)

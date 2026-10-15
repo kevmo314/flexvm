@@ -200,13 +200,14 @@ impl Holder {
     pub fn hold_first(&self, ip: Ipv4Addr, mig: u64, frames: &[Vec<u8>]) {
         let Some(e) = self.entry(ip).filter(|e| e.mig == mig) else { return };
         let mut q = e.q.lock().unwrap();
-        for p in frames.iter().rev().map(|f| from_tap(f)) {
-            match p {
-                Some(p) => {
-                    q.bytes += p.len();
-                    q.packets.push_front(p);
-                }
-                None => q.dropped += 1,
+        for packets in frames.iter().rev().map(|f| from_tap(f)) {
+            let Some(packets) = packets else {
+                q.dropped += 1;
+                continue;
+            };
+            for p in packets.into_iter().rev() {
+                q.bytes += p.len();
+                q.packets.push_front(p);
             }
         }
     }
@@ -566,12 +567,45 @@ fn sum16(b: &[u8]) -> u16 {
     sum as u16
 }
 
-/// The IPv4 packet in a frame read off a tap (a 12-byte virtio-net header, then Ethernet),
-/// `accept`ed; None for anything else.
-fn from_tap(f: &[u8]) -> Option<Vec<u8>> {
+/// The IPv4 packets in a frame read off a tap (a 12-byte virtio-net header, then Ethernet),
+/// each `accept`ed: one, or a TCP GSO frame's segments (Firecracker turns TSO on for a guest
+/// that takes it, as Linux does: a bulk download's frames are mostly these, #411), cut as
+/// `tcp_gso_segment` would. None for anything else (UDP GSO, IPv6).
+fn from_tap(f: &[u8]) -> Option<Vec<Vec<u8>>> {
     let (h, eth) = (f.get(..12)?, f.get(12..)?);
     let mut p = eth.get(14..14 + usize::from(u16::from_be_bytes([*eth.get(16)?, *eth.get(17)?])))?.to_vec();
-    (eth[12..14] == [8, 0] && accept(h, 14, &mut p)).then_some(p)
+    // `h` as for one packet: what each segment must pass, and the whole frame first.
+    let one = [&[h[0], 0][..], &h[2..]].concat();
+    match (eth[12..14] == [8, 0], h[1] & 0x7f) {
+        (true, 0) => return (h[1] == 0 && accept(h, 14, &mut p)).then(|| vec![p]),
+        // TCPv4 (0x80: ECN), its checksum left to the device: only in TCP's own field.
+        (true, 1) if p.get(9) == Some(&6) && h[0] & 1 != 0 && accept(&one, 14, &mut p.clone()) => {}
+        _ => return None,
+    }
+    let (ihl, mss) = (usize::from(p[0] & 0xf) * 4, usize::from(u16::from_le_bytes([h[4], h[5]])));
+    let thl = usize::from(*p.get(ihl + 12)? >> 4) * 4;
+    let (head, body) = p.split_at_checked(ihl + thl)?;
+    if mss == 0 || thl < 20 || body.is_empty() {
+        return None;
+    }
+    let (id, seq, n) = (u16::from_be_bytes([p[4], p[5]]), u32::from_be_bytes(p[ihl + 4..ihl + 8].try_into().ok()?), body.len().div_ceil(mss));
+    let segment = |(i, data): (usize, &[u8])| {
+        let mut s = [head, data].concat();
+        let len = s.len() as u16;
+        s[2..4].copy_from_slice(&len.to_be_bytes());
+        s[4..6].copy_from_slice(&id.wrapping_add(i as u16).to_be_bytes());
+        s[10..12].fill(0);
+        let sum = !sum16(&s[..ihl]);
+        s[10..12].copy_from_slice(&sum.to_be_bytes());
+        s[ihl + 4..ihl + 8].copy_from_slice(&seq.wrapping_add((i * mss) as u32).to_be_bytes());
+        // FIN and PSH on the last segment only, CWR on the first.
+        s[ihl + 13] &= !(if i + 1 < n { 0x09 } else { 0 } | if i > 0 { 0x80 } else { 0 });
+        // The pseudo-header's sum where the checksum goes, for `accept` to complete.
+        let pseudo = sum16(&[&s[12..20], &[0, 6], &(len - ihl as u16).to_be_bytes()].concat());
+        s[ihl + 16..ihl + 18].copy_from_slice(&pseudo.to_be_bytes());
+        accept(&one, 14, &mut s).then_some(s)
+    };
+    body.chunks(mss).enumerate().map(segment).collect()
 }
 
 /// Whether IPv4 packet `p`, behind virtio-net header `h`, may go to a guest or be re-sent,
@@ -961,16 +995,59 @@ mod tests {
         let mut p = udp_to(Ipv4Addr::new(10, 9, 0, 8));
         let pseudo = [&p[12..20], &[0, 17, 0, 9]].concat();
         p[26..28].copy_from_slice(&sum16(&pseudo).to_be_bytes());
-        let got = from_tap(&tap_frame(&p, 1, 0, (14 + 20, 6), 3)).unwrap();
+        let got = from_tap(&tap_frame(&p, 1, 0, (14 + 20, 6), 3)).unwrap().remove(0);
         assert_eq!(got.len(), 29, "Ethernet padding is not the packet's");
         assert_eq!((&got[..26], &got[28..]), (&p[..26], &p[28..]));
         assert_eq!(sum16(&[&pseudo[..], &got[20..]].concat()), 0xffff, "the UDP checksum verifies");
-        assert_eq!(from_tap(&tap_frame(&p, 0, 0, (0, 0), 0)).unwrap(), p, "a complete one is as it was");
-        assert_eq!(from_tap(&tap_frame(&p, 0, 1, (0, 0), 0)), None, "GSO");
+        assert_eq!(from_tap(&tap_frame(&p, 0, 0, (0, 0), 0)).unwrap(), [p.clone()], "a complete one is as it was");
+        assert_eq!(from_tap(&tap_frame(&p, 1, 3, (14 + 20, 6), 0)), None, "UDP GSO");
         let mut arp = tap_frame(&p, 0, 0, (0, 0), 0);
         arp[24..26].copy_from_slice(&[8, 6]);
         assert_eq!(from_tap(&arp), None, "not IPv4");
         assert_eq!(from_tap(&tap_frame(&p[..20], 0, 0, (0, 0), 0)), None, "truncated");
+    }
+
+    #[test]
+    fn a_tso_frame_is_cut_into_its_segments() {
+        // As the host's TCP sends to a tap with TSO: one frame for three segments, its checksum
+        // field holding the pseudo-header's sum without the length, FIN and PSH set.
+        let data: Vec<u8> = (0..3500u32).map(|i| i as u8).collect();
+        let tcp = [&[0x30, 0x39, 0x1f, 0x40][..], &1000u32.to_be_bytes(), &[0, 0, 0, 1], &[0x50, 0x19, 0xff, 0xff, 0, 0, 0, 0]].concat();
+        let mut p = [&[0x45, 0, 0, 0, 0x12, 0x34, 0x40, 0, 64, 6, 0, 0, 10, 9, 0, 2, 10, 9, 0, 8][..], &tcp, &data].concat();
+        let len = p.len() as u16;
+        p[2..4].copy_from_slice(&len.to_be_bytes());
+        let sum = !sum16(&p[..20]);
+        p[10..12].copy_from_slice(&sum.to_be_bytes());
+        let pseudo = sum16(&[&p[12..20], &[0, 6, 0, 0]].concat());
+        p[36..38].copy_from_slice(&pseudo.to_be_bytes());
+        let tso = |csum: (u16, u16)| {
+            let mut f = tap_frame(&p, 1, 1, csum, 0);
+            f[2..4].copy_from_slice(&54u16.to_le_bytes());
+            f[4..6].copy_from_slice(&1448u16.to_le_bytes());
+            f
+        };
+        let segs = from_tap(&tso((14 + 20, 16))).unwrap();
+        assert_eq!(segs.iter().map(Vec::len).collect::<Vec<_>>(), [40 + 1448, 40 + 1448, 40 + 604]);
+        let mut joined = Vec::new();
+        for (i, s) in segs.iter().enumerate() {
+            assert!(ipv4_header_csum_ok(s) && valid(s, Ipv4Addr::new(10, 9, 0, 8)), "segment {i}");
+            assert_eq!((&s[12..16], u16::from_be_bytes([s[4], s[5]])), (&[10, 9, 0, 2][..], 0x1234 + i as u16));
+            assert_eq!(u32::from_be_bytes(s[24..28].try_into().unwrap()), 1000 + 1448 * i as u32);
+            assert_eq!(s[33], if i == 2 { 0x19 } else { 0x10 }, "FIN and PSH on the last only");
+            let pseudo = [&s[12..20], &[0, 6], &(s.len() as u16 - 20).to_be_bytes()].concat();
+            assert_eq!(sum16(&[&pseudo[..], &s[20..]].concat()), 0xffff, "segment {i}'s TCP checksum verifies");
+            joined.extend_from_slice(&s[40..]);
+        }
+        assert_eq!(joined, data);
+        // Held first, in their order, ahead of what was held.
+        let h = holder(std::fs::File::open("/dev/null").unwrap().into());
+        let q = Queue { packets: VecDeque::from([b"held".to_vec()]), bytes: 4, ..Queue::default() };
+        h.held.lock().unwrap().insert(Ipv4Addr::new(10, 9, 0, 8), Arc::new(Entry { mig: 1, q: Mutex::new(q) }));
+        h.hold_first(Ipv4Addr::new(10, 9, 0, 8), 1, &[tso((14 + 20, 16))]);
+        assert_eq!(h.entry(Ipv4Addr::new(10, 9, 0, 8)).unwrap().q.lock().unwrap().packets, [&segs[..], &[b"held".to_vec()]].concat());
+        // Its checksum asked for anywhere but TCP's own field, as for one packet: dropped.
+        assert_eq!(from_tap(&tso((14 + 13, 0))), None, "Codex's offsets");
+        assert_eq!(from_tap(&tso((14 + 20, 6))), None, "UDP's field");
     }
 
     #[test]

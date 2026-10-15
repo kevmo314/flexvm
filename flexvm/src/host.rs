@@ -562,7 +562,7 @@ impl Host {
         let range = self.cfg.range()?;
         let taken = |ip| self.addr(l, ip).map_or(true, |a| a.lent.is_some() || self.held(&a));
         let ip = match want {
-            Some(ip) if !range.contains(ip) => {
+            Some(ip) if !range.allocatable(ip) => {
                 bail!("{ip} is not this host's to hand out (range {range}): start the vm on its home host, or let it pick an address")
             }
             Some(ip) if self.addr(l, ip)?.lent.is_some() => bail!("{ip} is lent out, with a vm that migrated away"),

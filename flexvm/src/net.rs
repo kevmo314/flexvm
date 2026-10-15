@@ -632,18 +632,22 @@ impl IpRange {
         Ok(IpRange { first: base + 1, last: (base | !mask) - 1 })
     }
 
-    /// Never one with a 16-bit half all zeros or all ones: checksum completion can rewrite one
-    /// into the other and still leave the IP header checksum valid (#365), forging a source.
     pub fn contains(&self, ip: Ipv4Addr) -> bool {
+        (self.first..=self.last).contains(&u32::from(ip))
+    }
+
+    /// In it, and never with a 16-bit half all zeros or all ones: checksum completion could
+    /// rewrite one into the other and leave the IP header checksum valid (#365), forging a source.
+    pub fn allocatable(&self, ip: Ipv4Addr) -> bool {
         let n = u32::from(ip);
-        (self.first..=self.last).contains(&n) && [n >> 16, n & 0xffff].iter().all(|h| ![0, 0xffff].contains(h))
+        self.contains(ip) && [n >> 16, n & 0xffff].iter().all(|h| ![0, 0xffff].contains(h))
     }
 
     /// The first address not `taken`, looking from `hint` (if in range) to the
     /// end, then from the start: each address at most once.
     pub fn allocate(&self, hint: Option<Ipv4Addr>, taken: impl Fn(Ipv4Addr) -> bool) -> Option<Ipv4Addr> {
         let start = hint.map(u32::from).filter(|h| (self.first..=self.last).contains(h)).unwrap_or(self.first);
-        (start..=self.last).chain(self.first..start).map(Ipv4Addr::from).find(|ip| self.contains(*ip) && !taken(*ip))
+        (start..=self.last).chain(self.first..start).map(Ipv4Addr::from).find(|ip| self.allocatable(*ip) && !taken(*ip))
     }
 
     /// The address after `ip`, wrapping around.
@@ -681,8 +685,9 @@ mod tests {
     fn no_address_has_a_half_of_all_zeros_or_ones() {
         let r = IpRange::parse("10.9.255.254-10.10.0.2").unwrap();
         let ip = |s: &str| s.parse::<Ipv4Addr>().unwrap();
-        assert!(r.contains(ip("10.9.255.254")) && r.contains(ip("10.10.0.1")));
-        assert!(!r.contains(ip("10.9.255.255")) && !r.contains(ip("10.10.0.0")));
+        assert!(r.allocatable(ip("10.9.255.254")) && r.allocatable(ip("10.10.0.1")));
+        assert!(!r.allocatable(ip("10.9.255.255")) && !r.allocatable(ip("10.10.0.0")));
+        assert!(r.contains(ip("10.9.255.255")) && r.contains(ip("10.10.0.0")), "still in it: a home address");
         let mut got = Vec::new();
         while let Some(a) = r.allocate(None, |a| got.contains(&a)) {
             got.push(a);
