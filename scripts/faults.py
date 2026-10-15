@@ -210,7 +210,7 @@ FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_be
           "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "resume_kill",
           "prepare_fail", "short_incoming", "slow_preload", "bad_preload", "bad_app_log", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
           "started_fsync", "started_unmark", "start_stall", "incoming_stall", "claim_stall", "standby_lock_stall", "standby_lock_hang", "handoff_stall", "ckpt_wp_race", "ckpt_rescue_fail",
-          "fetch_tail_enomem", "fetch_enomem_stuck", "pull_enomem", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo", "release_stall", "release_late", "no_plug", "pause_lost", "tap_backlog", "tap_backlog_stuck", "pause_unknown", "restore_unpause_fail", "resume_link_fail", "resume_partial", "repause_fail", "pause_fail", "restore_ping_slow", "readdress_fail", "no_collapse", "collapse_slow", "pages_slow", "unlend_fail", "route_stall")
+          "fetch_tail_enomem", "fetch_enomem_stuck", "pull_enomem", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo", "release_stall", "release_late", "no_plug", "pause_lost", "tap_backlog", "tap_backlog_stuck", "pause_unknown", "restore_unpause_fail", "resume_link_fail", "resume_partial", "repause_fail", "pause_fail", "restore_ping_slow", "readdress_fail", "no_collapse", "collapse_slow", "pages_slow", "unlend_fail", "route_stall", "suspend_slow", "owe_fail")
 
 
 def disarm():
@@ -1647,6 +1647,161 @@ def reconcile_announce():
     check("reconcile announce: announced past B's revision",
           wait_for(lambda: addr(B, ip).get("rev") == 2 and addr(B, ip).get("via") == "127.0.0.1", 10), addr(B, ip))
     kill(A, n)
+
+
+def owed(host):
+    """Migration ids whose outcome `host` still owes (a source killed before it knew)."""
+    d = os.path.join(host.state, "owed")
+    return sorted(f for f in os.listdir(d) if f.isdigit()) if os.path.isdir(d) else []
+
+
+def reconcile_kill():
+    """#350: SIGINT and SIGQUIT end a source that never heard its target's
+    outcome (ack lost, status unavailable) within seconds, as they do a VM
+    anywhere else. The target may be running the VM, so nothing is withdrawn:
+    the address stays lent, never handed out on the source's host, until the
+    target says. Pulling from the dead source, the target's copy ends; its
+    record reads aborted, and gc on the source's host then withdraws the
+    generation and frees the address. A target that already had every page
+    keeps running with it: told `done`, it keeps the loan until it is killed
+    there, and only then does the address run again on the source's host."""
+    def unknown_then_kill(n, sig, slow, refuse_first=False):
+        what = f"reconcile kill ({n})"
+        m = setup(n, mib=100)
+        ip, pid = vms(A)[n]["ip"], vm_pid(A, n)
+        gen = addr(A, ip)["seen"]
+        if slow:
+            fault(A, "pages_slow", 120000)
+        fault(B, "lost_ack", 30000)
+        fault(B, "status", 30000)
+        r = migrate(A, n, B)
+        fault(B, "lost_ack", 0)
+        check(f"{what}: outcome unknown, the source paused", not r["ok"] and vms(A).get(n, {}).get("state") == "source", (r, where(n)))
+        check(f"{what}: lent while it waits", addr(A, ip).get("lent") == gen, addr(A, ip))
+        if not slow:
+            check(f"{what}: the target has every page", wait_for(lambda: vms(B).get(n, {}).get("background_pull_ms") is not None, 30), vms(B).get(n))
+        if refuse_first:
+            # Its outcome cannot be recorded as owed (`owe_fail`, a full disk, say): the kill is refused.
+            fault(A, "owe_fail", 60000)
+            os.kill(pid, sig)
+            check(f"{what}: unrecorded, the kill is refused and the source goes on",
+                  wait_for(lambda: "is not killed" in log(A, n), 10) and alive(pid) and not owed(A), (alive(pid), owed(A), log(A, n)[-400:]))
+            fault(A, "owe_fail", 0)
+        t = time.time()
+        os.kill(pid, sig)
+        gone = wait_for(lambda: not alive(pid), 5)
+        check(f"{what}: the source exits within 5 s", gone, f"{time.time() - t:.1f} s; " + log(A, n)[-400:])
+        if not gone:
+            os.kill(pid, signal.SIGKILL)
+            return None
+        check(f"{what}: says the target may still run it", "may still be running it" in log(A, n), log(A, n)[-400:])
+        a = addr(A, ip)
+        check(f"{what}: still lent, not withdrawn, no holder here",
+              a.get("seen") == gen and not a.get("withdrawn") and a.get("lent") == gen and not a.get("holder"), a)
+        check(f"{what}: the outcome is owed", len(owed(A)) == 1, owed(A))
+        r2 = run(A, n + "-again", ip=ip)
+        check(f"{what}: the address is not handed out here meanwhile", not r2["ok"] and "lent" in r2["error"], r2)
+        return ip, gen, m
+
+    # The target still pulls when the source is killed: it cannot finish, and the outcome is aborted.
+    for sig in (signal.SIGINT, signal.SIGQUIT):
+        n = f"ft-reconcile-kill-{signal.Signals(sig).name.lower()}"
+        got = unknown_then_kill(n, sig, True, refuse_first=sig == signal.SIGINT)
+        if not got:
+            continue
+        ip, gen, _ = got
+        what = f"reconcile kill ({n})"
+        fault(B, "status", 0)
+        fault(A, "pages_slow", 0)
+        check(f"{what}: the target's copy ends", wait_for(lambda: where(n) == {}, 90), where(n))
+        check(f"{what}: gc settles it: withdrawn, no longer lent",
+              wait_for(lambda: cli(A, "debug", "gc")[0] == 0 and not owed(A), 30), (owed(A), addr(A, ip)))
+        a, b = addr(A, ip), addr(B, ip)
+        check(f"{what}: withdrawn here and at B, free", a.get("withdrawn") and a.get("lent") is None and b.get("seen") == gen and b.get("withdrawn"), (a, b))
+        r2 = run(A, n + "-again", ip=ip)
+        check(f"{what}: the address runs again on A, with a newer generation", r2["ok"] and addr(A, ip).get("seen", 0) > gen, (r2, addr(A, ip)))
+        kill(A, n + "-again")
+        kill(B, n)
+
+    # The target is lost for good (killed, its status never available): nothing settles it, and
+    # the operator reclaims the address, warned first, then with --force.
+    n = "ft-reconcile-kill-lost"
+    what = f"reconcile kill ({n})"
+    got = unknown_then_kill(n, signal.SIGINT, True)
+    if got:
+        ip, gen, _ = got
+        os.kill(json.load(open(os.path.join(B.run, "vms", f"{n}.lock")))["pid"], signal.SIGKILL)
+        cli(A, "debug", "gc")
+        check(f"{what}: unsettled while the target cannot say", len(owed(A)) == 1 and addr(A, ip).get("lent") == gen, (owed(A), addr(A, ip)))
+        code, out, err = cli(A, "reclaim", ip)
+        check(f"{what}: reclaim without --force says what it would do, and does nothing",
+              code != 0 and "make sure no host runs that vm" in err and "--force" in err and len(owed(A)) == 1 and addr(A, ip).get("lent") == gen, (code, err))
+        code, out, err = cli(A, "reclaim", ip, "--force")
+        r = json.loads(out) if code == 0 else {}
+        check(f"{what}: reclaim --force withdraws it and forgets the owed outcome, warning",
+              code == 0 and r.get("withdrawn_gen") == gen and len(r.get("forgot_migrations", [])) == 1 and "WARNING" in err and not owed(A), (code, out, err))
+        a = addr(A, ip)
+        check(f"{what}: withdrawn here and at B, no longer lent",
+              a.get("withdrawn") and a.get("lent") is None and wait_for(lambda: addr(B, ip).get("withdrawn") and addr(B, ip).get("seen") == gen, 10), (a, addr(B, ip)))
+        r2 = run(A, n + "-again", ip=ip)
+        check(f"{what}: the address runs again on A", r2["ok"] and addr(A, ip).get("seen", 0) > gen, (r2, addr(A, ip)))
+        kill(A, n + "-again")
+    fault(B, "status", 0)
+    fault(A, "pages_slow", 0)
+    kill(B, n)
+
+    # A SIGINT taken while the migration still holds the operation lock (the target stalls preparing):
+    # it waits, the outcome turns out unknown, and the wait ends the source all the same.
+    n = "ft-reconcile-kill-waiting"
+    what = f"reconcile kill ({n})"
+    setup(n, mib=100)
+    ip, pid = vms(A)[n]["ip"], vm_pid(A, n)
+    gen = addr(A, ip)["seen"]
+    fault(A, "pages_slow", 120000)
+    fault(B, "incoming_stall", 2000)
+    fault(B, "lost_ack", 30000)
+    fault(B, "status", 30000)
+    r = [None]
+    th = threading.Thread(target=lambda: r.__setitem__(0, migrate(A, n, B)))
+    th.start()
+    lock = os.path.join(B.run, "vms", f"{n}.lock")
+    wait_for(lambda: os.path.exists(lock) and open(lock).read().strip(), 20)
+    os.kill(pid, signal.SIGINT)
+    th.join()
+    fault(B, "lost_ack", 0)
+    gone = wait_for(lambda: not alive(pid), 10)
+    check(f"{what}: the waiting SIGINT ends the source once the outcome is unknown", gone and len(owed(A)) == 1,
+          (r[0], owed(A), log(A, n)[-400:]))
+    if not gone:
+        os.kill(pid, signal.SIGKILL)
+    check(f"{what}: still lent meanwhile", addr(A, ip).get("lent") == gen and not addr(A, ip).get("withdrawn"), addr(A, ip))
+    fault(B, "status", 0)
+    fault(A, "pages_slow", 0)
+    check(f"{what}: settled once the target's copy ends", wait_for(lambda: where(n) == {} and cli(A, "debug", "gc")[0] == 0 and not owed(A), 90),
+          (where(n), owed(A), addr(A, ip)))
+    check(f"{what}: then free", addr(A, ip).get("lent") is None and addr(A, ip).get("withdrawn"), addr(A, ip))
+    kill(B, n)
+
+    # The target already has every page (its ack lost, its status unavailable): it runs on with the address.
+    n = "ft-reconcile-kill-pulled"
+    what = f"reconcile kill ({n})"
+    got = unknown_then_kill(n, signal.SIGINT, False)
+    if not got:
+        return
+    ip, gen, m = got
+    check(f"{what}: the VM runs on at B, md5 intact", where(n) == {B: "running"} and md5(B, n) == m, where(n))
+    fault(B, "status", 0)
+    check(f"{what}: gc settles it as B's", wait_for(lambda: cli(A, "debug", "gc")[0] == 0 and not owed(A), 30), owed(A))
+    migs = os.path.join(B.state, "migs")
+    check(f"{what}: B was told done, no record left", wait_for(lambda: not os.listdir(migs), 10), os.listdir(migs))
+    check(f"{what}: still lent to B", addr(A, ip).get("lent") == gen and not addr(A, ip).get("withdrawn"), addr(A, ip))
+    r2 = run(A, n + "-again", ip=ip)
+    check(f"{what}: still not handed out here", not r2["ok"] and "lent" in r2["error"], r2)
+    ok(kill(B, n))
+    check(f"{what}: once killed at B, the loan is taken back", wait_for(lambda: addr(A, ip).get("lent") is None, 10), addr(A, ip))
+    r2 = run(A, n + "-again", ip=ip)
+    check(f"{what}: then the address runs again on A", r2["ok"] and addr(A, ip).get("seen", 0) > gen, (r2, addr(A, ip)))
+    kill(A, n + "-again")
 
 
 def resume_pull_lock():
@@ -5996,6 +6151,46 @@ def suspend_cmd():
     check("suspend cmd: gone after it", n not in vms(A), vms(A).get(n))
 
 
+def suspend_overlap():
+    """#351: SIGTERMs that overlap make one suspend at a time, the rest taken
+    into it. Each fails (`ckpt_fail_write`, after `suspend_slow` holds the
+    operation lock a while), leaving the VM running with its command; once
+    the command ends, its process ends the VM and exits, never deadlocked
+    between a waiting suspend and the command's kill."""
+    n = "ft-susp-overlap"
+    scenario_vms.add(n)
+    clear_log(A, n)
+    ok(cli_json(A, "run", n, "--template", args.template, "-d", "--", "echo susp-overlap-start; sleep 8; exit 5"))
+    pid = vm_pid(A, n)
+    ip = vms(A)[n]["ip"]
+    check("suspend overlap: started", wait_for(lambda: "susp-overlap-start" in log(A, n).splitlines(), 30), log(A, n)[-300:])
+    fault(A, "ckpt_fail_write", 60000)
+    # Each suspend holds the VM's operation lock a while: the command likely ends with one waiting.
+    fault(A, "suspend_slow", 60000)
+    # Bursts of SIGTERMs, until the process is gone or long after the command's end.
+    end, sent = time.time() + 40, 0
+    while alive(pid) and time.time() < end:
+        for _ in range(3):
+            try:
+                os.kill(pid, signal.SIGTERM)
+                sent += 1
+            except ProcessLookupError:
+                break
+        time.sleep(0.15)
+    gone = wait_for(lambda: not alive(pid), 10)
+    check("suspend overlap: the process exits once the command ends", gone, f"{sent} SIGTERMs; " + log(A, n)[-800:])
+    if not gone:
+        os.kill(pid, signal.SIGKILL)
+        return
+    fault(A, "ckpt_fail_write", 0)
+    fault(A, "suspend_slow", 0)
+    check("suspend overlap: suspends failed meanwhile", "injected fault: writing the checkpoint failed" in log(A, n), log(A, n)[-500:])
+    check("suspend overlap: overlapping SIGTERMs were taken into one suspend", "already under way" in log(A, n), log(A, n)[-500:])
+    check("suspend overlap: not suspended, not listed", n not in vms(A) and not os.path.exists(os.path.join(A.state, "suspended", n)), vms(A).get(n))
+    a = addr(A, ip)
+    check("suspend overlap: its address withdrawn, no holder", a.get("withdrawn") and not a.get("holder"), a)
+
+
 def first_entry(host, name, timeout=60):
     """`name`'s registry entry as first published (polled every 5 ms)."""
     path = os.path.join(host.run, "vms", f"{name}.json")
@@ -6707,7 +6902,7 @@ SCENARIOS = dict(
     cow_wp_race=cow_wp_race, fetch_tail_enomem=fetch_tail_enomem, fetch_enomem_stuck=fetch_enomem_stuck, pull_enomem=pull_enomem,
     collapse_abort=collapse_abort, collapse_ckpt_fail=collapse_ckpt_fail, ckpt_paused_backlog=ckpt_paused_backlog, same_host_order=same_host_order, same_host_slow_route=same_host_slow_route, same_host_flood=same_host_flood, same_host_late_handover=same_host_late_handover, same_host_backlog=same_host_backlog, ckpt_backlog=ckpt_backlog, rx_stall=rx_stall, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,
     handoff_superseded=handoff_superseded, delayed_announce=delayed_announce, announce_arp_timer=announce_arp_timer,
-    prepare_fail_announce=prepare_fail_announce, reconcile_announce=reconcile_announce, resume_pull_lock=resume_pull_lock, page_conns=page_conns, suspend_cmd=suspend_cmd, fc_died_busy=fc_died_busy, pause_cmd_start=pause_cmd_start, suspend_died=suspend_died)
+    prepare_fail_announce=prepare_fail_announce, reconcile_announce=reconcile_announce, reconcile_kill=reconcile_kill, resume_pull_lock=resume_pull_lock, page_conns=page_conns, suspend_cmd=suspend_cmd, suspend_overlap=suspend_overlap, fc_died_busy=fc_died_busy, pause_cmd_start=pause_cmd_start, suspend_died=suspend_died)
 names = [n for s in args.scenarios for n in (list(SCENARIOS) if s == "all" else [s])]
 if os.geteuid() != 0:
     sys.exit("run as root (sudo)")

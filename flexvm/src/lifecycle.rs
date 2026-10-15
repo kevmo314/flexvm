@@ -182,16 +182,20 @@ impl Proc {
         Ok(v)
     }
 
-    /// SIGTERM. Returns only on failure, with the VM running on.
-    pub fn suspend(&self) -> Error {
+    /// SIGTERM, `reserved` first. Returns only on failure, with the VM running
+    /// on, the reservation let go (after the command's session).
+    pub fn suspend(&self, reserved: crate::vmproc::SuspendReserved) -> Error {
         let vm = self.vm();
         let mut t = Phases::new();
-        *self.suspending.lock().unwrap() = true;
         let op = self.op();
         let mut cmd_held = None;
         let saved = (|| -> Result<(Manifest, Value)> {
             if !matches!(vm.state(), State::Running | State::Paused) {
                 bail!("vm {} is {}; not suspending it", vm.name, vm.state().name());
+            }
+            // Test fault `suspend_slow`: each suspend holds `op` a while first.
+            if fault("suspend_slow") {
+                thread::sleep(Duration::from_millis(300));
             }
             self.settle_arrival(&op, DRAIN_WAIT)?;
             // This one goes where the checkpoint it was resumed from is.
@@ -262,7 +266,7 @@ impl Proc {
             }
             Err(e) => {
                 drop(cmd_held);
-                *self.suspending.lock().unwrap() = false;
+                drop(reserved);
                 e
             }
         }

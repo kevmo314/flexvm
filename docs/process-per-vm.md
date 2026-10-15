@@ -93,12 +93,37 @@ checkpoint) holds the VM's operation mutex. Requests give up after 30 s;
 what must not be refused (SIGINT, SIGTERM, a dead VM, the end of a
 migration) waits for it, after cancelling a checkpoint in progress.
 SIGTERM's suspend runs off the signal thread, so a SIGINT after it is still
-taken; SIGINT wins: a suspend that published its checkpoint meanwhile
+taken. It is reserved before its thread starts: SIGTERMs while one runs are
+taken into it, and none starts once a `run -- CMD` command ends the VM
+(`suspend_overlap`). SIGINT wins: a suspend that published its checkpoint meanwhile
 revokes it (discarded, address withdrawn) and the process exits destroyed,
 and `flexvm kill` discards one that finished first (`suspend_killed`).
 
 `kill -KILL` on a migration source is the operator's way to give up its
 copy (the target loses the pages it has not pulled); `flexvm kill` refuses.
+A source still waiting to learn whether its target resumed the VM (ack
+lost, status unavailable) does end on SIGINT or SIGQUIT, but the target may
+be running the VM, so nothing is withdrawn: the address stays lent (never
+handed out on this host), the newest route a peer announced for it comes
+back, and the outcome is owed in `STATE/owed/ID`. Garbage collection asks
+the target until it says: `released`, the VM is the target's (told `done`;
+the loan is taken back by its own withdrawal, as for any VM that moved);
+`aborted`, no copy runs, so the generation is withdrawn then and the address
+is free. Meanwhile the listener counts the killed source as still there, so
+the target keeps the record it is asked about (`reconcile_kill`). The record
+is written (retried a few times) before the process ends: if it cannot be
+(a full disk), the kill is refused and the source goes on asking its target,
+so a lent address always has a record of whom it is owed to.
+
+A target lost for good (its host gone, never to answer) leaves the address
+lent, refused to `run --ip` and automatic allocation alike. `flexvm reclaim
+IP` says what it is lent with (the migrations owed for it) and what
+reclaiming does; `flexvm reclaim IP --force` withdraws that generation here
+and at every peer and forgets the owed records, so the address can be handed
+out again. It is the operator's word that no host still runs the VM: one that
+does would share the address with the next VM given it, so make sure first
+(kill it there, or know its host is gone). It also takes back a loan left by
+a source killed with SIGKILL, which records nothing.
 
 ## On-disk state
 
@@ -120,6 +145,7 @@ STATE (default /var/lib/flexvm, on disk)
   standby/TEMPLATE       how many standby VMs to keep for a template
   standby.stop.lock      held while pressure stops standby VMs (SIGUSR1)
   migs/ID                incoming migration records (fencing), JSON, fsynced
+  owed/ID                migrations away whose source was killed before it knew the outcome: target, address, generation (`Host::settle_owed`)
   evict.lock             one eviction decider at a time (flock)
   evict.worker.lock      held by the thread running an eviction; arrivals by eviction are refused meanwhile
   evict.last             its mtime: when an eviction last started (5 s apart)
@@ -487,7 +513,8 @@ where it is kept and what tests it.
    resumes only a VM paused by SIGTSTP (or held by `restore --paused`), and
    is ignored once a suspend or kill began: the kernel sends it after any
    SIGSTOP, systemd right after SIGTERM. A destroy refused because the VM is
-   migrating away (SIGINT, or `run -- CMD` ending) never ends the process,
+   migrating away (SIGINT, or `run -- CMD` ending), its target having
+committed, never ends the process,
    and takes back the checkpoint cancel it raised (fault
    `kill_refused_checkpoint`).
 6. **Suspend markers and quarantine.** `STARTED` means consumed: `resume`

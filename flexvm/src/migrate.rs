@@ -312,12 +312,19 @@ impl Proc {
         e
     }
 
+    /// Until the outcome is known, a kill ends this copy (`Proc::destroy`); once it
+    /// is, this takes it back first, or (a kill took it) leaves the process to end.
     fn reconcile_later(self: &Arc<Self>, mig: u64, to: String) {
+        self.reconciling(mig, &to);
         let p = self.clone();
         thread::spawn(move || {
             let mut patience = Duration::from_secs(1);
             loop {
-                match outcome(&to, mig, patience) {
+                let o = outcome(&to, mig, patience);
+                if o.is_some() && !p.known(mig) {
+                    return;
+                }
+                match o {
                     Some(Outcome::Committed(target)) => {
                         crate::log!("vm {}: migration {mig} to {to} committed", p.name());
                         let _ = p.reroute(mig, &to, &target, None, false);
