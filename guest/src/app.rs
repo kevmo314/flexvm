@@ -292,8 +292,6 @@ fn start(statuses: &Statuses) -> io::Result<i32> {
     let c = parse_conf(&read_conf()?)?;
     let mut cmd = command(&c, &c.argv);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    // Keep the app from reading or ptracing flexvm-init (a root app with CAP_SYS_PTRACE still can).
-    unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
     if let Some(work) = mem::work_procs() {
         mem::enter(&mut cmd, work, true);
     }

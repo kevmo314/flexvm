@@ -70,16 +70,23 @@ fn setup() -> io::Result<(File, OwnedFd, High)> {
     std::fs::write(format!("{CGROUP_ROOT}/cgroup.subtree_control"), "+memory")?;
     std::fs::create_dir_all(WORK)?;
     let uev = uevents()?;
-    let total = meminfo().0;
-    write_high(Some(high_limit(total)), false)?;
+    let total = meminfo().map(|(total, _)| total);
+    if let Some(total) = total {
+        write_high(Some(high_limit(total)), false)?;
+    }
     let high = High::new(total, write_high);
     Ok((File::open(format!("{CGROUP}/memory.events"))?, uev, high))
 }
 
-fn meminfo() -> (u64, u64) {
-    let text = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
-    let kib = |key| text.lines().find_map(|l| l.strip_prefix(key)?.split_whitespace().next()?.parse().ok()).unwrap_or(0);
-    (kib("MemTotal:"), kib("MemAvailable:"))
+fn meminfo() -> Option<(u64, u64)> {
+    read_meminfo(File::open("/proc/meminfo").ok()?)
+}
+
+fn read_meminfo(reader: impl Read) -> Option<(u64, u64)> {
+    let text = io::read_to_string(reader).ok()?;
+    let kib = |key| text.lines().find_map(|l| l.strip_prefix(key)?.split_whitespace().next()?.parse::<u64>().ok());
+    let total = kib("MemTotal:").filter(|&total| total != 0)?;
+    Some((total, kib("MemAvailable:").unwrap_or(0)))
 }
 
 fn high_limit(total_kib: u64) -> u64 {
@@ -105,7 +112,7 @@ type WriteHigh = dyn Fn(Option<u64>, bool) -> io::Result<()> + Send + Sync;
 /// Lowering the mark can reclaim synchronously (Linux 6.1), so a worker makes
 /// those writes, coalesced; raises and lifts bypass it.
 struct High {
-    total_kib: u64,
+    total_kib: Option<u64>,
     desired: Arc<Mutex<Option<u64>>>,
     changed: mpsc::Sender<()>,
     pending: Arc<AtomicUsize>,
@@ -113,8 +120,8 @@ struct High {
 }
 
 impl High {
-    fn new(total_kib: u64, write: impl Fn(Option<u64>, bool) -> io::Result<()> + Send + Sync + 'static) -> Self {
-        let (desired, pending, write) = (Arc::new(Mutex::new(Some(high_limit(total_kib)))), Arc::new(AtomicUsize::new(0)), Arc::new(write));
+    fn new(total_kib: Option<u64>, write: impl Fn(Option<u64>, bool) -> io::Result<()> + Send + Sync + 'static) -> Self {
+        let (desired, pending, write) = (Arc::new(Mutex::new(total_kib.map(high_limit))), Arc::new(AtomicUsize::new(0)), Arc::new(write));
         let (latest, outstanding, writer) = (desired.clone(), pending.clone(), write.clone());
         let (changed, changes) = mpsc::channel();
         thread::spawn(move || {
@@ -130,10 +137,11 @@ impl High {
         Self { total_kib, desired, changed, pending, write }
     }
 
-    fn set_total(&mut self, total_kib: u64) {
-        let (old, value) = (high_limit(self.total_kib), high_limit(total_kib));
-        self.total_kib = total_kib;
-        if old != value {
+    fn set_total(&mut self, total_kib: Option<u64>) {
+        let Some(total_kib) = total_kib else { return };
+        let (old, value) = (self.total_kib.map(high_limit), high_limit(total_kib));
+        self.total_kib = Some(total_kib);
+        if old != Some(value) {
             *self.desired.lock().unwrap() = Some(value);
             self.relieve();
             self.notify();
@@ -216,7 +224,7 @@ fn watch(events: File, uev: OwnedFd, mut limit: High) {
         }
         if fds[1].revents & libc::POLLIN != 0 && memory_changed(&uev) {
             // Plugged or unplugged: move the mark. Memory arriving ends a wait.
-            limit.set_total(meminfo().0);
+            limit.set_total(meminfo().map(|(total, _)| total));
             waiting = None;
         }
         let now = Instant::now();
@@ -239,7 +247,7 @@ fn watch(events: File, uev: OwnedFd, mut limit: High) {
             waiting = None;
         } else if waiting.is_some() || asked == Some(now) {
             // Reconcile with what is plugged now, in case an event was lost.
-            limit.set_total(meminfo().0);
+            limit.set_total(meminfo().map(|(total, _)| total));
         }
     }
 }
@@ -255,7 +263,7 @@ enum Reply {
 
 /// Sends `MEM <available KiB> <total KiB>`; the host answers `grow`, `busy` (plug in flight), `ok` or `full`.
 fn ask() -> Reply {
-    let (total, avail) = meminfo();
+    let Some((total, avail)) = meminfo() else { return Reply::Asked };
     let reply = (|| -> io::Result<String> {
         let mut s = File::from(crate::vsock_socket()?);
         let addr = crate::vsock_addr(libc::VMADDR_CID_HOST, crate::proto::MEM_PORT);
@@ -288,7 +296,7 @@ mod tests {
         let blocked = Mutex::new(blocked);
         let installed = Arc::new(Mutex::new(Some(high_limit(4096 << 10))));
         let current = Arc::clone(&installed);
-        let high = High::new(4096 << 10, move |value, raise_only| {
+        let high = High::new(Some(4096 << 10), move |value, raise_only| {
             let now = *current.lock().unwrap();
             if value == now || (raise_only && value.unwrap_or(u64::MAX) < now.unwrap_or(u64::MAX)) {
                 return Ok(());
@@ -321,24 +329,71 @@ mod tests {
     }
 
     #[test]
+    fn invalid_meminfo_leaves_high_unchanged() {
+        // A directory opens successfully but cannot be read as meminfo.
+        let unreadable = File::open(std::env::temp_dir()).unwrap();
+        let readings = [
+            read_meminfo(unreadable),
+            read_meminfo(&b"MemTotal: 0 kB\nMemAvailable: 0 kB\n"[..]),
+            read_meminfo(&b"MemAvailable: 1024 kB\n"[..]),
+            read_meminfo(&b"MemTotal: invalid kB\n"[..]),
+        ];
+        let (mut high, writes, _resume, installed) = high(0);
+        let initial = Some(high_limit(4096 << 10));
+        for reading in readings {
+            assert_eq!(reading, None);
+            high.set_total(reading.map(|(total, _)| total));
+            assert!(!high.busy());
+            assert_eq!(high.total_kib, Some(4096 << 10));
+            assert_eq!(*high.desired.lock().unwrap(), initial);
+            assert_eq!(*installed.lock().unwrap(), initial);
+            assert!(writes.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn meminfo_requires_total_but_available_can_be_missing() {
+        assert_eq!(read_meminfo(&b"MemTotal: 4194304 kB\nMemAvailable: 1024 kB\n"[..]), Some((4194304, 1024)));
+        assert_eq!(read_meminfo(&b"MemTotal: 4194304 kB\n"[..]), Some((4194304, 0)));
+    }
+
+    #[test]
+    fn unknown_initial_total_waits_for_a_valid_reading() {
+        let (sent, writes) = mpsc::channel();
+        let mut high = High::new(None, move |value, _| {
+            sent.send(value).unwrap();
+            Ok(())
+        });
+        high.set_total(None);
+        assert!(!high.busy());
+        assert!(writes.try_recv().is_err());
+        high.set_total(Some(4096 << 10));
+        settle(&high);
+        assert_eq!(high.total_kib, Some(4096 << 10));
+        assert_eq!(*high.desired.lock().unwrap(), Some(high_limit(4096 << 10)));
+        assert_eq!(writes.try_recv().unwrap(), Some(high_limit(4096 << 10)));
+        assert!(writes.try_iter().all(|value| value == Some(high_limit(4096 << 10))));
+    }
+
+    #[test]
     fn unchanged_total_does_not_write_or_rearm_after_lift() {
         let (mut high, writes, _resume, installed) = high(0);
-        high.set_total(4096 << 10);
-        high.set_total((4096 << 10) + 1);
+        high.set_total(Some(4096 << 10));
+        high.set_total(Some((4096 << 10) + 1));
         assert!(writes.try_recv().is_err());
         high.lift();
         assert_eq!((next(&writes), *installed.lock().unwrap()), ("raised", None));
-        high.set_total((4096 << 10) + 2);
+        high.set_total(Some((4096 << 10) + 2));
         assert_eq!(*high.desired.lock().unwrap(), None);
     }
 
     #[test]
     fn lift_bypasses_and_repairs_a_blocked_numeric_write() {
         let (mut high, writes, resume, installed) = high(high_limit(2048 << 10));
-        high.set_total(2048 << 10);
+        high.set_total(Some(2048 << 10));
         assert_eq!(next(&writes), "starting");
         // GIVE_UP's lift supersedes the queued numeric update.
-        high.set_total(1024 << 10);
+        high.set_total(Some(1024 << 10));
         high.lift();
         assert_eq!(next(&writes), "raised");
         // The blocked write lands late; the watcher repairs it while it reclaims.
@@ -356,15 +411,15 @@ mod tests {
     #[test]
     fn raises_bypass_a_blocked_lowering_write_but_never_lower_the_mark() {
         let (mut high, writes, resume, installed) = high(high_limit(2048 << 10));
-        high.set_total(2048 << 10);
+        high.set_total(Some(2048 << 10));
         assert_eq!(next(&writes), "starting");
         // Above the last desired mark but below the installed one: a direct
         // write would reclaim on the watcher, so the worker gets it.
-        high.set_total(1024 << 10);
-        high.set_total(3072 << 10);
+        high.set_total(Some(1024 << 10));
+        high.set_total(Some(3072 << 10));
         assert!(writes.try_recv().is_err());
         assert_eq!(*installed.lock().unwrap(), Some(high_limit(4096 << 10)));
-        high.set_total(8192 << 10);
+        high.set_total(Some(8192 << 10));
         assert_eq!(next(&writes), "raised");
         resume.send(()).unwrap();
         assert_eq!(next(&writes), "reclaiming");
