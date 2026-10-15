@@ -63,20 +63,18 @@ pub fn tap_queued(fd: &OwnedFd) -> Result<bool> {
     Ok(n > 0 && pfd.revents & libc::POLLIN != 0)
 }
 
-/// Reads off and counts the frames queued on a tap (`tap_fd_of`, non-blocking as Firecracker
-/// opened it): for a VM leaving with frames its guest would not take, so their loss is counted.
-pub fn discard_tap_queue(fd: &OwnedFd) -> u64 {
+/// Reads off the frames queued on a tap (`tap_fd_of`, non-blocking as Firecracker opened it),
+/// each with its virtio-net header: for a VM leaving them, so they are passed on or counted.
+pub fn read_tap_queue(fd: &OwnedFd) -> Vec<Vec<u8>> {
     // A frame with its virtio-net header, up to the 64 KiB a GSO frame can be.
     let mut buf = vec![0u8; 65562 + 64];
-    let mut n = 0;
+    let mut frames = Vec::new();
     // Bounded by the ring (TAP_QUEUE) and in case the descriptor were blocking after all.
-    while n < u64::from(TAP_QUEUE) && tap_queued(fd).unwrap_or(false) {
-        if unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) } < 0 {
-            break;
-        }
-        n += 1;
+    while frames.len() < TAP_QUEUE as usize && tap_queued(fd).unwrap_or(false) {
+        let Ok(n) = usize::try_from(unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) }) else { break };
+        frames.push(buf[..n].to_vec());
     }
-    n
+    frames
 }
 
 /// Process `pid`'s descriptor attached to `tap` (its fdinfo says `iff: TAP`), duplicated here
@@ -470,6 +468,12 @@ pub fn route_via(ip: Ipv4Addr, via: Ipv4Addr) -> Result<()> {
     netlink(RTM_NEWROUTE, NLM_F_CREATE | NLM_F_REPLACE, &route)
 }
 
+/// The next hops in `table` (`/proc/net/route`: hex, in network byte order).
+pub fn gateways(table: &str) -> Vec<Ipv4Addr> {
+    let hop = |l: &str| u32::from_str_radix(l.split_whitespace().nth(2)?, 16).ok().filter(|&g| g != 0);
+    table.lines().skip(1).filter_map(hop).map(|g| Ipv4Addr::from(g.to_ne_bytes())).collect()
+}
+
 /// A delete names the device, so it removes only that route.
 pub fn route_dev(add: bool, ip: Ipv4Addr, ifindex: u32) -> Result<()> {
     let mut route = rtmsg(RT_SCOPE_LINK);
@@ -628,15 +632,18 @@ impl IpRange {
         Ok(IpRange { first: base + 1, last: (base | !mask) - 1 })
     }
 
+    /// Never one with a 16-bit half all zeros or all ones: checksum completion can rewrite one
+    /// into the other and still leave the IP header checksum valid (#365), forging a source.
     pub fn contains(&self, ip: Ipv4Addr) -> bool {
-        (self.first..=self.last).contains(&u32::from(ip))
+        let n = u32::from(ip);
+        (self.first..=self.last).contains(&n) && [n >> 16, n & 0xffff].iter().all(|h| ![0, 0xffff].contains(h))
     }
 
     /// The first address not `taken`, looking from `hint` (if in range) to the
     /// end, then from the start: each address at most once.
     pub fn allocate(&self, hint: Option<Ipv4Addr>, taken: impl Fn(Ipv4Addr) -> bool) -> Option<Ipv4Addr> {
         let start = hint.map(u32::from).filter(|h| (self.first..=self.last).contains(h)).unwrap_or(self.first);
-        (start..=self.last).chain(self.first..start).map(Ipv4Addr::from).find(|ip| !taken(*ip))
+        (start..=self.last).chain(self.first..start).map(Ipv4Addr::from).find(|ip| self.contains(*ip) && !taken(*ip))
     }
 
     /// The address after `ip`, wrapping around.
@@ -668,6 +675,27 @@ mod tests {
         assert_eq!(probe(Some(2), &[1, 2, 3, 4]), (None, vec![2, 3, 4, 1]), "each address once");
         assert_eq!(probe(Some(9), &[]), (Some(1), vec![1]), "a hint out of range starts at the start");
         assert_eq!((r.after(ip(2)), r.after(ip(4)), r.after(ip(9))), (ip(3), ip(1), ip(1)));
+    }
+
+    #[test]
+    fn no_address_has_a_half_of_all_zeros_or_ones() {
+        let r = IpRange::parse("10.9.255.254-10.10.0.2").unwrap();
+        let ip = |s: &str| s.parse::<Ipv4Addr>().unwrap();
+        assert!(r.contains(ip("10.9.255.254")) && r.contains(ip("10.10.0.1")));
+        assert!(!r.contains(ip("10.9.255.255")) && !r.contains(ip("10.10.0.0")));
+        let mut got = Vec::new();
+        while let Some(a) = r.allocate(None, |a| got.contains(&a)) {
+            got.push(a);
+        }
+        assert_eq!(got, [ip("10.9.255.254"), ip("10.10.0.1"), ip("10.10.0.2")]);
+    }
+
+    #[test]
+    fn gateways_are_read_off_the_route_table() {
+        let table = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n\
+                     eth0\t00000000\t0101A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0\n\
+                     eth0\t0001A8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n";
+        assert_eq!(gateways(table), [Ipv4Addr::new(192, 168, 1, 1)]);
     }
 
     #[test]

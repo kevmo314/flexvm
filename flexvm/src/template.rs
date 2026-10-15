@@ -344,7 +344,7 @@ impl Template {
         // All reads, the vmstate Firecracker loads included, go through one directory handle.
         let handle = File::open(&dir).map_err(|e| format!("template {name:?}: {e}"))?;
         let fixed = PathBuf::from(format!("/proc/{}/fd/{}", std::process::id(), handle.as_raw_fd()));
-        let meta: Meta = serde_json::from_slice(&std::fs::read(fixed.join("meta.json")).map_err(|e| format!("template {name:?}: {e}"))?)?;
+        let meta = Meta::read(&fixed).map_err(|e| format!("template {name:?}: {e}"))?;
         let file = File::open(fixed.join("mem"))?;
         let len = file.metadata()?.len() as usize;
         let data = data_bitmap(&file, len)?;

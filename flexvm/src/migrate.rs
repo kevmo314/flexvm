@@ -390,11 +390,13 @@ impl Proc {
         };
         let (mut held, mut res) = (None, None);
         if let Some(h) = self.holder().filter(|h| h.holding_for(ip, mig)) {
+            // Its paused Firecracker takes nothing off the tap: what is there came before the hold.
+            h.hold_first(ip, mig, &self.vm().take_tap_queue());
             match conn.map(|c| (c, hold::start(c))) {
-                Some((c, Ok(seq))) => {
+                Some((c, Ok(()))) => {
                     // Sharing our routes, the target takes the address over itself, after the held packets.
                     let handoff = switch && crate::net::is_local_addr(via).unwrap_or(false);
-                    (held, res) = hold::send(h, ip, mig, c, seq, handoff, || self.switch_route(mig, via)).map(|(s, r)| (Some(s), Some(r))).unwrap_or_default()
+                    (held, res) = hold::send(h, ip, mig, c, handoff, || self.switch_route(mig, via)).map(|(s, r)| (Some(s), Some(r))).unwrap_or_default()
                 }
                 started => {
                     if let Some((_, Err(e))) = started {

@@ -1246,10 +1246,9 @@ impl Host {
         ids.sort_unstable();
         let start = last.map_or(0, |last| ids.partition_point(|id| *id <= last));
         ids.rotate_left(start);
+        ids.truncate(budget);
         let mut unavailable = HashSet::new();
-        let mut visited = None;
-        for id in ids.into_iter().take(budget) {
-            visited = Some(id);
+        for &id in &ids {
             let Ok(Some(Mig::Released { source, by, .. })) = load(&self.mig_path(id)) else {
                 let _ = self.mig_status(id);
                 continue;
@@ -1269,8 +1268,8 @@ impl Host {
                 }
             }
         }
-        if let Some(id) = visited {
-            if let Err(e) = store(&cursor, &id, false) {
+        if let Some(id) = ids.last() {
+            if let Err(e) = store(&cursor, id, false) {
                 crate::log!("migration retirement cursor: {e}");
             }
         }

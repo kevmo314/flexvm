@@ -362,18 +362,20 @@ pub fn refuse(conn: TcpStream, why: &str, wait: Option<Duration>) {
 pub fn activated() -> Option<TcpListener> {
     let pid: u32 = std::env::var("LISTEN_PID").ok()?.parse().ok()?;
     let n: u32 = std::env::var("LISTEN_FDS").ok()?.parse().ok()?;
-    (pid == std::process::id() && n >= 1).then(|| unsafe { TcpListener::from_raw_fd(3) })
+    // Close-on-exec: no child it starts inherits it (#386).
+    (pid == std::process::id() && n >= 1 && unsafe { libc::fcntl(3, libc::F_SETFD, libc::FD_CLOEXEC) } == 0).then(|| unsafe { TcpListener::from_raw_fd(3) })
 }
 
 /// From a peer: they are authenticated by address only (`main`), the network between them is trusted.
 fn handle(host: &Host, mut conn: TcpStream, deadline: Instant) -> Result<()> {
     let line = read_line_by(&conn, deadline)?;
+    let from = conn.peer_addr().ok().map(|a| a.ip());
     let req: Value = serde_json::from_slice(&line)?;
     let reply = match req["op"].as_str().unwrap_or("") {
         "migrate_in" => return incoming(host, &req, &line, conn),
         "pages" => return pages(host, &req, conn),
         "migration" => migration(host, &req),
-        "route" => route(host, &req),
+        "route" => route(host, &req, from),
         "lend" => lend(host, &req),
         // Whether a migration's source process is proven gone (never from published state).
         "source" => serde_json::from_value(req["ident"].clone())
@@ -504,11 +506,12 @@ fn lend(host: &Host, req: &Value) -> Result<Value> {
 /// Stale generations and revisions (see `host::Addr`) are ignored; an
 /// address a VM here holds keeps its local route.
 /// Test fault `route_refuse`: refused, as by a listener that is down.
-fn route(host: &Host, req: &Value) -> Result<Value> {
+fn route(host: &Host, req: &Value, from: Option<IpAddr>) -> Result<Value> {
     if fault("route_refuse") {
         bail!("injected fault: route messages refused");
     }
     let ip: Ipv4Addr = req["ip"].as_str().ok_or("missing ip")?.parse()?;
+    routable(ip, &host.config_now(), from, &crate::net::gateways(&std::fs::read_to_string("/proc/net/route")?))?;
     let gen = req["gen"].as_u64().filter(|&g| g > 0).ok_or("route messages carry the address's generation")?;
     let via: Option<Ipv4Addr> = req["via"].as_str().map(|v| v.parse()).transpose()?;
     let rev = match via {
@@ -536,9 +539,47 @@ fn route(host: &Host, req: &Value) -> Result<Value> {
     Ok(json!({"ip": ip.to_string(), "local": local}))
 }
 
+/// A peer routes only a VM's address, never one this host reaches its peers or network by (#365).
+fn routable(ip: Ipv4Addr, cfg: &crate::host::Config, from: Option<IpAddr>, gateways: &[Ipv4Addr]) -> Result<()> {
+    let is = |a: IpAddr| a.to_canonical() == IpAddr::V4(ip);
+    let peer = from.is_some_and(is) || cfg.peers.iter().filter_map(|p| p.parse::<SocketAddr>().ok()).any(|a| is(a.ip()));
+    let special = ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() || cfg.underlay() == Some(ip) || gateways.contains(&ip);
+    if peer || special || crate::net::is_local_addr(ip)? {
+        bail!("{ip} is not a vm's address: a local, peer, underlay or gateway address, or not unicast");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// In a child started with a descriptor on fd 3, as systemd would: none of this one's is touched.
+    #[test]
+    fn the_activated_socket_is_close_on_exec() {
+        if std::env::var_os("LISTEN_FDS").is_none() {
+            let script = r#"exec 3</dev/null; LISTEN_PID=$$ LISTEN_FDS=1 exec "$0" --exact listen::tests::the_activated_socket_is_close_on_exec --quiet"#;
+            let st = std::process::Command::new("sh").args(["-c", script]).arg(std::env::current_exe().unwrap()).status().unwrap();
+            return assert!(st.success());
+        }
+        std::mem::forget(activated().expect("fd 3 taken"));
+        assert_eq!(unsafe { libc::fcntl(3, libc::F_GETFD) } & libc::FD_CLOEXEC, libc::FD_CLOEXEC);
+    }
+
+    #[test]
+    fn peers_route_only_vm_addresses() {
+        let cfg = crate::host::Config {
+            peers: vec!["10.98.0.1:7000".into(), "peer.example:7000".into()],
+            underlay: Some("10.97.0.1".parse().unwrap()),
+            ..Default::default()
+        };
+        let gw: Ipv4Addr = "10.96.0.1".parse().unwrap();
+        let check = |ip: &str| routable(ip.parse().unwrap(), &cfg, Some("10.95.0.1".parse().unwrap()), &[gw]);
+        for ip in ["127.0.0.1", "0.0.0.0", "255.255.255.255", "224.0.0.1", "10.98.0.1", "10.97.0.1", "10.96.0.1", "10.95.0.1"] {
+            assert!(check(ip).is_err(), "{ip} is refused");
+        }
+        check("10.200.0.7").unwrap();
+    }
 
     #[test]
     fn refused_arrival_removes_only_its_own_log() {

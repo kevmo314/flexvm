@@ -399,7 +399,11 @@ fn resolve_with(
     let mut l = dns.lookups.lock().unwrap();
     loop {
         l.all.retain(|k| k.done.as_ref().is_none_or(|(t, _)| t.elapsed() < DNS_RECENT));
-        let found = l.all.iter().position(|k| k.name == addr);
+        // A caller keeps to the lookup it joined: a fresh one starts beside it, never taking its answer away.
+        let found = match mine {
+            Some(id) => l.all.iter().position(|k| k.id == id),
+            None => l.all.iter().rposition(|k| k.name == addr),
+        };
         match found.map(|i| (l.all[i].id, &l.all[i].done)) {
             Some((id, None)) => mine = Some(id),
             Some((id, Some((_, res)))) if mine == Some(id) || (!fresh && res.is_ok()) => {
@@ -408,9 +412,6 @@ fn resolve_with(
             // Failed before this caller asked, or a stale address needs a fresh answer: try again.
             _ => match lookup.take() {
                 Some(f) if l.workers < DNS_WORKERS => {
-                    if let Some(i) = found {
-                        l.all.remove(i);
-                    }
                     let id = l.next;
                     l.next += 1;
                     let name = addr.to_owned();
@@ -1244,6 +1245,29 @@ mod tests {
         assert_eq!(resolve_with(name, at(), &DNS, false, |_| panic!("answered recently")).unwrap(), vec![old]);
         assert_eq!(resolve_with(name, at(), &DNS, true, move |_| Ok(vec![new])).unwrap(), vec![new]);
         assert_eq!(resolve_with(name, at(), &DNS, false, |_| panic!("fresh answer is cached")).unwrap(), vec![new]);
+    }
+
+    #[test]
+    fn a_fresh_lookup_leaves_a_waiter_its_answer() {
+        static DNS: Resolver = Resolver::new();
+        let name = "moved.example:80";
+        let (old, new): (std::net::SocketAddr, std::net::SocketAddr) = ("10.0.0.1:80".parse().unwrap(), "10.0.0.2:80".parse().unwrap());
+        let (go, hung) = std::sync::mpsc::channel::<()>();
+        let at = Instant::now() + Duration::from_secs(2);
+        let waiter = std::thread::spawn(move || resolve_with(name, at, &DNS, false, move |_| hung.recv().map(|()| Vec::new()).map_err(io::Error::other)));
+        while DNS.lookups.lock().unwrap().all.is_empty() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Its answer is in, its caller not woken yet, when a fresh lookup of the name starts (and hangs).
+        DNS.lookups.lock().unwrap().all[0].done = Some((Instant::now(), Ok(vec![old])));
+        let fresh = resolve_with(name, Instant::now() + Duration::from_millis(50), &DNS, true, move |_| {
+            std::thread::sleep(Duration::from_secs(3));
+            Ok(vec![new])
+        });
+        assert_eq!(fresh.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        DNS.changed.notify_all();
+        assert_eq!(waiter.join().unwrap().unwrap(), vec![old], "the waiter still gets the answer it waited for");
+        drop(go);
     }
 
     #[test]
