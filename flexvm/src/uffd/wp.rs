@@ -206,7 +206,7 @@ impl Pager {
             return Ok(0);
         }
         let mut pages: Vec<Box<[u8]>> = claimed.iter().map(|_| vec![0u8; PAGE_SIZE].into_boxed_slice()).collect();
-        let read = self.pagemap(first, end - first).and_then(|map| {
+        let read = self.rescue_fail(cow, &claimed).and_then(|()| self.pagemap(first, end - first)).and_then(|map| {
             // Runs of claimed populated pages, each read with one call into the pages' own buffers.
             let mut i = 0;
             while i < claimed.len() {
@@ -224,13 +224,23 @@ impl Pager {
             Ok(())
         });
         if let Err(e) = read {
+            cow.stats.rescue_failures.fetch_add(1, Ordering::Relaxed);
             claimed.iter().for_each(|&p| cow.unclaim(p));
             return Err(e);
         }
-        for (&p, bytes) in claimed.iter().zip(pages) {
-            cow.rescue(p, bytes);
-        }
+        cow.rescue_many(first, end, claimed.iter().copied().zip(pages));
         Ok(claimed.len())
+    }
+
+    /// Test fault `ckpt_rescue_fail`, once the writers run: every other rescue fails after its claim, with a writer
+    /// asked to take its first page meanwhile, so that the writer finds the page RESCUING and then given back.
+    fn rescue_fail(&self, cow: &Cow, claimed: &[usize]) -> io::Result<()> {
+        if !self.rescue_fail.load(Ordering::Relaxed) || !cow.writing() || self.rescue_tries.fetch_add(1, Ordering::Relaxed) % 2 == 1 {
+            return Ok(());
+        }
+        cow.want(claimed[0]);
+        thread::sleep(Duration::from_millis(5));
+        Err(io::Error::other("injected fault: rescue failed"))
     }
 
     /// Reads consecutive guest pages from `page` out of Firecracker, a page into each buffer of `pages`.

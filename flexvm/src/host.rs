@@ -1441,6 +1441,13 @@ fn collect_owned(run: &Path) {
     for e in std::fs::read_dir(run.join("w")).into_iter().flatten().flatten() {
         let owner = load::<Ident>(&e.path().join("owner")).ok().flatten();
         if owner.is_some_and(|o| reap(run, &o).is_ok()) {
+            // Kept for the next sweep while another process holds that directory's lock.
+            if let Ok(path) = std::fs::read(e.path().join("checkpoint-staging")) {
+                use std::os::unix::ffi::OsStrExt;
+                if !crate::checkpoint::clear_stale(Path::new(std::ffi::OsStr::from_bytes(&path))) {
+                    continue;
+                }
+            }
             crate::socket::remove(&e.path());
             let _ = std::fs::remove_dir_all(e.path());
         }
@@ -1682,6 +1689,56 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         store(&dir.join("owner"), &dead, false).unwrap();
         dead
+    }
+
+    #[test]
+    fn dead_owners_staging_is_cleared() {
+        use std::os::unix::{ffi::OsStrExt, fs::PermissionsExt};
+        let h = host("stale-checkpoint");
+        let dead = dead_owner(&h, 999_999_939, &[]);
+        let live = Ident::me().work_dir(&h.run);
+        std::fs::create_dir_all(&live).unwrap();
+        store(&live.join("owner"), &Ident::me(), false).unwrap();
+        let parent = h.state.join("checkpoints");
+        std::fs::create_dir_all(&parent).unwrap();
+        let staging = crate::checkpoint::Staging::new(&parent.join("live"), live.join("vmstate"), &live).unwrap();
+        let stale = parent.join(".flexvm-staging-dead");
+        std::fs::create_dir_all(stale.join("ck")).unwrap();
+        std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(stale.join("ck/pages"), b"pause-time pages").unwrap();
+        std::fs::write(dead.work_dir(&h.run).join("checkpoint-staging"), parent.as_os_str().as_bytes()).unwrap();
+        collect_owned(&h.run);
+        assert!(!stale.exists());
+        assert!(!dead.work_dir(&h.run).exists());
+        assert!(live.exists());
+        assert!(staging.create("pages").is_ok(), "live staging remains locked and usable");
+
+        // A directory another process holds locked is tried again by a later sweep, not waited for.
+        let dead = dead_owner(&h, 999_999_938, &[]);
+        let stale = parent.join(".flexvm-staging-dead2");
+        std::fs::create_dir_all(stale.join("ck")).unwrap();
+        std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(dead.work_dir(&h.run).join("checkpoint-staging"), parent.as_os_str().as_bytes()).unwrap();
+        let held = std::fs::File::open(&parent).unwrap();
+        assert_eq!(unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&held), libc::LOCK_EX) }, 0);
+        collect_owned(&h.run);
+        assert!(stale.exists() && dead.work_dir(&h.run).exists());
+        drop(held);
+        collect_owned(&h.run);
+        assert!(!stale.exists() && !dead.work_dir(&h.run).exists());
+
+        // The recorded path is never followed through a symlink planted since.
+        let dead = dead_owner(&h, 999_999_937, &[]);
+        let elsewhere = h.state.join("elsewhere");
+        let stale = elsewhere.join(".flexvm-staging-dead3");
+        std::fs::create_dir_all(stale.join("ck")).unwrap();
+        std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let link = h.state.join("link");
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+        std::fs::write(dead.work_dir(&h.run).join("checkpoint-staging"), link.as_os_str().as_bytes()).unwrap();
+        collect_owned(&h.run);
+        assert!(stale.exists() && !dead.work_dir(&h.run).exists());
+        drop(staging);
     }
 
     struct Sleeper(std::process::Child, Ident);

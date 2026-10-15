@@ -20,7 +20,7 @@ mod write;
 
 pub use chain::{chain_ids, chain_meta_budget, parent_path, Checkpoint, PageFile, MAX_CHAIN};
 pub use format::{Canon, FileSum, Manifest, Parent, FORMAT, FORMAT_INCREMENTAL};
-pub use staging::{CommitError, Staging};
+pub use staging::{clear_stale, CommitError, Staging};
 pub(crate) use write::GuestPages;
 
 fn create_at(dir: RawFd, name: &str) -> io::Result<File> {
