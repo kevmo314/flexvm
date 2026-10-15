@@ -469,6 +469,8 @@ fn queued_requests_are_pipelined_and_resent_after_a_reconnect() {
     let (lane, stop) = (Lane::default(), AtomicBool::new(false));
     let mut link = Link::new(source);
     link.fetch_with(Some(&lane), 0, &mut [], &stop, &mut |_| true).unwrap();
+    // Reconnects must use the cached addresses, even if the original name can no longer resolve.
+    link.source.addr = "invalid address".into();
     // Written as they are queued, before the fetcher reads any reply.
     for job in [(3, 2), (7, 1), (10, 3)] {
         lane.push((job.0, job.1, Instant::now()));

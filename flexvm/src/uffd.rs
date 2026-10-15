@@ -59,7 +59,7 @@ mod tests;
 mod wp;
 
 pub use event::FaultStats;
-pub use fetch::{probe, PageClient};
+pub use fetch::probe;
 use fetch::{Lane, Link};
 pub use hot::Held;
 pub(crate) use pages::zeroed_atomics;
@@ -463,7 +463,7 @@ impl Pager {
                 Origin::Peer(source) => {
                     // Connect now: the restore itself faults on remote pages.
                     let mut link = Link::new(source);
-                    link.client = PageClient::connect(&link.source).ok();
+                    link.client = link.connect().ok();
                     *self.remote.lock().unwrap() = Some(link);
                 }
                 Origin::File(file) => {
