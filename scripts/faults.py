@@ -845,6 +845,13 @@ def migrate_in_raw(host, name, ip, source, gen=None, template=None):
     return s, (json.loads(buf) if buf else {"ok": False, "error": "hung up"}), mig
 
 
+def spare(h, k):
+    """The k-th address down from the top of h's range, which h hands out,
+    clear of the low ones `run` picks first."""
+    net, last = h.ips.split("-")[1].rsplit(".", 1)
+    return f"{net}.{int(last) - k}"
+
+
 def nothing_left(label, name, ip):
     """B holds neither the name nor the address after an abandoned migration."""
     # The incoming process holds the name (its lock) until it has given up.
@@ -867,7 +874,7 @@ def source_vm():
 
 def prepare_disconnect():
     """A source that goes away after the target prepared leaves nothing behind."""
-    n, ip = "ft-prep-gone", B.ips.split("-")[1].rsplit(".", 1)[0] + ".200"
+    n, ip = "ft-prep-gone", spare(B, 0)
     s, r, mig = migrate_in_raw(B, n, ip, source_vm())
     check("prepare disconnect: target prepared", r.get("ok"), r)
     check("prepare disconnect: address held while prepared", addr(B, ip).get("holder") == n, addr(B, ip))
@@ -880,7 +887,7 @@ def prepare_disconnect():
 def prepare_trickle():
     """A source that trickles its header is cut off by one deadline (here 2 s,
     `short_incoming`), however much it keeps sending."""
-    n, ip = "ft-prep-trickle", B.ips.split("-")[1].rsplit(".", 1)[0] + ".201"
+    n, ip = "ft-prep-trickle", spare(B, 1)
     fault(B, "short_incoming", 30000)
     s, r, _ = migrate_in_raw(B, n, ip, source_vm())
     check("prepare trickle: target prepared", r.get("ok"), r)
@@ -4268,7 +4275,7 @@ def forged_peer():
     recorded, a huge vmstate, too many preloaded pages, an endless request
     line, a huge page request; page-server refusals reach the client."""
     tid = source_vm()
-    n, ip = "ft-forged-gen", B.ips.split("-")[1].rsplit(".", 1)[0] + ".210"
+    n, ip = "ft-forged-gen", spare(B, 2)
     scenario_vms.add(n)
     for label, gen in (("zero", 0),):
         s, r, _ = migrate_in_raw(B, n, ip, tid, gen=gen)
