@@ -63,6 +63,8 @@ pub use pages::{Pages, BASE, DISCARDED, INFLIGHT, PRESENT, REMOTE, ZERO};
 pub use server::serve_pages;
 pub use wp::Frozen;
 
+pub const MAX_PRELOAD: usize = 4096;
+
 /// `Pager::prefetching`.
 const DUE: u8 = 1;
 const RUNNING: u8 = 2;
@@ -533,10 +535,6 @@ impl Pager {
             }
         }
         let pages = self.pages();
-        // Held to guest memory as it is (the source's list was checked against the regions it named: `check_incoming`).
-        if list.windows(2).any(|w| w[0] >= w[1]) || list.last().is_some_and(|&p| p >= pages.len() as u64) {
-            bail!("preload list out of order or past guest memory ({} pages)", pages.len());
-        }
         let mut installed = 0;
         for (index, n) in page_runs(list, self.mappings()) {
             let (mut index, end) = (index, index + n);
@@ -1008,13 +1006,16 @@ fn page_runs<'a>(list: &'a [u64], mappings: &'a [Mapping]) -> impl Iterator<Item
 /// the guest memory regions it named, which the pager later holds to Firecracker's, and its preload list, which must be
 /// ascending, without repeats, and only of pages the runs make REMOTE (as the source picks them, `remote_among`).
 pub fn check_incoming(runs: &Runs, preload: &[u64], regions: &[(u64, u64)]) -> Result<()> {
+    if preload.len() > MAX_PRELOAD {
+        bail!("{} pages to preload, more than {MAX_PRELOAD}", preload.len());
+    }
     let mappings: Vec<Mapping> = regions.iter().map(|&(offset, size)| Mapping { base_host_virt_addr: 0, size: size as usize, offset }).collect();
     remote_pages(runs, &mappings)?;
     if let Some(w) = preload.windows(2).find(|w| w[0] >= w[1]) {
         bail!("preload list out of order: page {} before {}", w[0], w[1]);
     }
     let remote = remote_among(runs, preload.iter().copied());
-    if let Some(p) = preload.iter().find(|p| remote.binary_search(p).is_err()) {
+    if let Some(p) = preload.get(remote.iter().zip(preload).take_while(|(a, b)| a == b).count()) {
         bail!("preload page {p} is not a remote page");
     }
     Ok(())
