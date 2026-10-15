@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -26,7 +27,7 @@ pub struct Image {
 
 impl Image {
     /// Download missing registry layers only when the derived rootfs needs building.
-    pub fn download_layers(&mut self) -> Result<()> {
+    pub fn download_layers(&self) -> Result<()> {
         let descs: Vec<_> = self
             .layers
             .iter()
@@ -39,21 +40,12 @@ impl Image {
             let cached = if blob_path(blobs, d)?.exists() { " (cached)" } else { "" };
             crate::log!("image: layer {}/{} {d} {:.1} MiB{cached}", i + 1, descs.len(), *size as f64 / 1048576.0);
         }
-        let fresh = std::sync::Mutex::new(HashMap::new());
         download_layers(&descs, |d, size, (blobs, registry)| {
             if !blob_path(blobs, d)?.exists() {
-                let path = registry.as_ref().clone().blob(d, size, blobs)?;
-                fresh.lock().unwrap().insert(d.to_string(), path);
+                registry.blob(d, size, blobs)?;
             }
             Ok(())
-        })?;
-        let fresh = fresh.into_inner().unwrap();
-        for layer in &mut self.layers {
-            if let Some(path) = layer.digest.as_ref().and_then(|d| fresh.get(d)) {
-                layer.src = Blob::File(path.clone());
-            }
-        }
-        Ok(())
+        })
     }
 }
 
@@ -67,7 +59,7 @@ pub struct Layer {
 pub enum Blob {
     File(PathBuf),
     Slice { file: PathBuf, offset: u64, len: u64 },
-    Cached { blobs: PathBuf, registry: Box<Registry>, digest: String, size: u64 },
+    Cached { blobs: PathBuf, registry: Arc<Registry>, digest: String, size: u64 },
 }
 
 impl Blob {
@@ -77,7 +69,7 @@ impl Blob {
             Blob::Cached { blobs, registry, digest, size } => {
                 let path = match blob_path(blobs, digest)? {
                     p if p.exists() => p,
-                    _ => registry.as_ref().clone().blob(digest, *size, blobs)?,
+                    _ => registry.blob(digest, *size, blobs)?,
                 };
                 return Blob::File(path).open();
             }
@@ -182,16 +174,27 @@ pub fn resolve(cache: &Path, src: &str, limits: &Limits) -> Result<Image> {
     Ok(img)
 }
 
-fn image(digest: String, config_digest: String, config: Vec<u8>, layers: Vec<Layer>) -> Result<Image> {
-    let v: Value = serde_json::from_slice(&config)?;
+/// Far more than any real image has (Docker's overlay2 stops at 128).
+const MAX_LAYERS: usize = 1024;
+
+fn check_layer_count(n: usize) -> Result<()> {
+    if n > MAX_LAYERS {
+        bail!("image has {n} layers, over the {MAX_LAYERS} layer limit");
+    }
+    Ok(())
+}
+
+/// The config's diff_ids, one per layer: checked before any layer is set up.
+fn diff_ids(config: &[u8], layers: usize) -> Result<Vec<String>> {
+    let v: Value = serde_json::from_slice(config)?;
     let diff_ids = Vec::<String>::deserialize(&v["rootfs"]["diff_ids"]).map_err(|e| format!("image config rootfs.diff_ids: {e}"))?;
-    if diff_ids.len() != layers.len() {
-        bail!("image config lists {} layers, the manifest {}", diff_ids.len(), layers.len());
+    if diff_ids.len() != layers {
+        bail!("image config lists {} layers, the manifest {layers}", diff_ids.len());
     }
     for d in &diff_ids {
         blob_path(Path::new(""), d)?; // a well-formed sha256 digest
     }
-    Ok(Image { digest, config_digest, config, layers, diff_ids })
+    Ok(diff_ids)
 }
 
 /// A cached document: a regular file of exactly `size` bytes (at most `MAX_DOCUMENT`) matching `digest`.
@@ -211,8 +214,10 @@ fn check_download(total: u64, limits: &Limits) -> Result<()> {
 }
 
 fn descriptors(manifest: &Value, limits: &Limits) -> Result<Vec<(String, u64)>> {
-    let mut out = Vec::new();
-    for l in manifest["layers"].as_array().ok_or("manifest has no layers")? {
+    let layers = manifest["layers"].as_array().ok_or("manifest has no layers")?;
+    check_layer_count(layers.len())?;
+    let mut out = Vec::with_capacity(layers.len());
+    for l in layers {
         let d = l["digest"].as_str().ok_or("layer without digest")?.to_string();
         blob_path(Path::new(""), &d)?;
         out.push((d, l["size"].as_u64().ok_or("layer without size")?));
@@ -247,29 +252,31 @@ fn resolve_index(mut v: Value, mut digest: String, mut get: impl FnMut(&str) -> 
     Ok((v, digest))
 }
 
-fn pull(cache: &Path, mut reg: Registry, limits: &Limits) -> Result<Image> {
+fn pull(cache: &Path, reg: Registry, limits: &Limits) -> Result<Image> {
     let blobs = cache.join("blobs");
     crate::util::create_dir_durably(&blobs.join("sha256"), 0o777)?;
     super::registry::sweep_parts(&blobs.join("sha256"));
     let (manifest, digest) = reg.manifest(&reg.r.reference.clone())?;
     let (manifest, digest) = resolve_index(manifest, digest, |d| Ok(reg.manifest(d)?.0))?;
     crate::log!("image: {} -> {digest}", reg.r);
+    let descs = descriptors(&manifest, limits)?;
     let config_digest = manifest["config"]["digest"].as_str().ok_or("manifest has no config")?.to_string();
     let config_size = manifest["config"]["size"].as_u64().ok_or("config without size")?;
     if config_size > MAX_DOCUMENT {
         bail!("image config of {config_size} bytes is over the {MAX_DOCUMENT} byte limit");
     }
     let config = read_verified(&reg.blob(&config_digest, config_size, &blobs)?, config_size, &config_digest)?;
-    let descs = descriptors(&manifest, limits)?;
+    let diff_ids = diff_ids(&config, descs.len())?;
+    let reg = Arc::new(reg);
     let layers = descs
         .into_iter()
         .map(|(d, size)| Layer {
-            src: Blob::Cached { blobs: blobs.clone(), registry: Box::new(reg.clone()), digest: d.clone(), size },
+            src: Blob::Cached { blobs: blobs.clone(), registry: reg.clone(), digest: d.clone(), size },
             digest: Some(d),
             size: Some(size),
         })
         .collect();
-    image(digest, config_digest, config, layers)
+    Ok(Image { digest, config_digest, config, layers, diff_ids })
 }
 
 fn download_layers<T: Sync>(descs: &[(String, u64, T)], download: impl Fn(&str, u64, &T) -> Result<()> + Sync) -> Result<()> {
@@ -367,12 +374,11 @@ fn from_files(blob: &dyn Fn(&str) -> Result<Blob>, limits: &Limits) -> Result<Im
         let index = serde_json::from_slice(&read("index.json")?)?;
         let (v, digest) = resolve_index(index, String::new(), |d| Ok(serde_json::from_slice(&read_blob(d)?)?))?;
         let config_digest = v["config"]["digest"].as_str().ok_or("manifest has no config")?.to_string();
+        let descs = descriptors(&v, limits)?;
         let config = read_blob(&config_digest)?;
-        let layers = descriptors(&v, limits)?
-            .into_iter()
-            .map(|(d, size)| Ok(Layer { src: blob(&by_digest(&d)?)?, digest: Some(d), size: Some(size) }))
-            .collect::<Result<_>>()?;
-        return image(digest, config_digest, config, layers);
+        let diff_ids = diff_ids(&config, descs.len())?;
+        let layers = descs.into_iter().map(|(d, size)| Ok(Layer { src: blob(&by_digest(&d)?)?, digest: Some(d), size: Some(size) })).collect::<Result<_>>()?;
+        return Ok(Image { digest, config_digest, config, layers, diff_ids });
     }
     if blob("manifest.json").is_err() {
         bail!("not an OCI layout or docker save archive: no index.json or manifest.json");
@@ -381,15 +387,18 @@ fn from_files(blob: &dyn Fn(&str) -> Result<Blob>, limits: &Limits) -> Result<Im
     let m: Value = serde_json::from_slice(&read("manifest.json")?)?;
     let m = m.get(0).ok_or("empty manifest.json")?;
     let config = read(m["Config"].as_str().ok_or("manifest.json has no Config")?)?;
+    let paths = m["Layers"].as_array().ok_or("manifest.json has no Layers")?;
+    check_layer_count(paths.len())?;
+    let diff_ids = diff_ids(&config, paths.len())?;
     let (mut layers, mut total) = (Vec::new(), 0u64);
-    for l in m["Layers"].as_array().ok_or("manifest.json has no Layers")? {
+    for l in paths {
         let src = blob(l.as_str().ok_or("bad layer path")?)?;
         total = total.saturating_add(src.open()?.1);
         layers.push(Layer { src, digest: None, size: None });
     }
     check_download(total, limits)?;
     let digest = sha256_hex(&config);
-    image(digest.clone(), digest, config, layers)
+    Ok(Image { digest: digest.clone(), config_digest: digest, config, layers, diff_ids })
 }
 
 #[cfg(test)]
@@ -427,7 +436,7 @@ mod tests {
         let registry = Registry::new(Reference::parse(&format!("{}/test", server.local_addr().unwrap())).unwrap());
         std::thread::spawn(move || server.incoming().for_each(drop));
         let layer = Layer {
-            src: Blob::Cached { blobs: dir.to_path_buf(), registry: Box::new(registry), digest: digest.clone(), size: 4 },
+            src: Blob::Cached { blobs: dir.to_path_buf(), registry: Arc::new(registry), digest: digest.clone(), size: 4 },
             digest: Some(digest),
             size: Some(4),
         };
@@ -449,6 +458,42 @@ mod tests {
         // A blob of the wrong size goes too.
         std::fs::write(&path, b"good!").unwrap();
         assert!(layer.open().is_err() && layer.src.evicted());
+    }
+
+    #[test]
+    fn layer_counts_and_configs_are_checked_before_layers_are_set_up() {
+        let d = sha256_hex(b"layer");
+        let many = serde_json::json!({"layers": vec![serde_json::json!({"digest": d, "size": 0}); 20_000]});
+        let err = descriptors(&many, &Limits::default()).unwrap_err().to_string();
+        assert!(err.contains("20000 layers, over the 1024 layer limit"), "{err}");
+
+        // A registry serving a two-layer manifest whose config lists `diff_ids` layers.
+        let pull_with = |diff_ids: usize| {
+            let config = serde_json::json!({"rootfs": {"type": "layers", "diff_ids": vec![sha256_hex(b"diff"); diff_ids]}}).to_string();
+            let cd = sha256_hex(config.as_bytes());
+            let layers = (0..2).map(|i| serde_json::json!({"digest": sha256_hex(&[i]), "size": 1})).collect::<Vec<_>>();
+            let manifest = serde_json::json!({"schemaVersion": 2, "config": {"digest": cd, "size": config.len()}, "layers": layers}).to_string();
+            let addr = super::super::registry::tests::drip_server(usize::MAX, std::time::Duration::ZERO, move |_, path| {
+                let body = if path.contains("/manifests/") { manifest.clone() } else { config.clone() };
+                format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+            });
+            let cache = super::super::unpack::tests::tmpdir(&format!("pull-layers{diff_ids}"));
+            pull(&cache, Registry::new(Reference::parse(&format!("{addr}/test")).unwrap()), &Limits::default())
+        };
+        let err = pull_with(1).err().unwrap().to_string();
+        assert!(err.contains("config lists 1 layers, the manifest 2"), "{err}");
+        // All layers share one registry, and its token, rather than a copy each.
+        let img = pull_with(2).unwrap();
+        let regs: Vec<_> = img
+            .layers
+            .iter()
+            .map(|l| match &l.src {
+                Blob::Cached { registry, .. } => registry.clone(),
+                _ => panic!("a registry layer is cached"),
+            })
+            .collect();
+        assert!(Arc::ptr_eq(&regs[0], &regs[1]));
+        assert_eq!(Arc::strong_count(&regs[0]), 2 * img.layers.len());
     }
 
     #[test]

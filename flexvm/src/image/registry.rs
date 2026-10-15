@@ -2,7 +2,8 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use serde_json::Value;
@@ -18,27 +19,109 @@ pub const MANIFEST_TYPES: &str = "application/vnd.oci.image.index.v1+json, \
     application/vnd.oci.image.manifest.v1+json, \
     application/vnd.docker.distribution.manifest.v2+json";
 
-#[derive(Clone)]
+/// Every transfer, from its first request through auth and redirects to its last body byte, ends by a
+/// deadline: this long, plus the transfer's size at `MIN_RATE`. A slow registry otherwise holds a pull,
+/// and the rootfs cache's per-key lock, indefinitely.
+const TRANSFER_BASE: Duration = Duration::from_secs(300);
+const MIN_RATE: u64 = 128 << 10;
+
+fn deadline(size: u64) -> Instant {
+    Instant::now() + TRANSFER_BASE + Duration::from_secs(size / MIN_RATE)
+}
+
+/// An agent for one transfer: its TLS runs over a socket that enforces the transfer's deadline,
+/// handshake included (ureq's own deadline starts only once the handshake is done), and its
+/// connections are never pooled into another transfer.
+fn agent(deadline: Instant) -> ureq::Agent {
+    static TLS: std::sync::OnceLock<Arc<ureq::rustls::ClientConfig>> = std::sync::OnceLock::new();
+    // As ureq's default.
+    let tls = TLS.get_or_init(|| {
+        let roots = ureq::rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
+        let config = ureq::rustls::ClientConfig::builder_with_provider(ureq::rustls::crypto::ring::default_provider().into())
+            .with_protocol_versions(&[&ureq::rustls::version::TLS12, &ureq::rustls::version::TLS13])
+            .expect("ring supports TLS 1.2 and 1.3")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        Arc::new(config)
+    });
+    ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(30))
+        .timeout_read(IDLE)
+        .timeout_write(IDLE)
+        .tls_connector(Arc::new(DeadlineTls { tls: tls.clone(), deadline }))
+        .user_agent(concat!("flexvm/", env!("CARGO_PKG_VERSION")))
+        // Redirects are followed by hand, never carrying credentials.
+        .redirects(0)
+        .build()
+}
+
+/// Longest wait for any one read or write.
+const IDLE: Duration = Duration::from_secs(120);
+
+struct DeadlineTls {
+    tls: Arc<ureq::rustls::ClientConfig>,
+    deadline: Instant,
+}
+
+impl ureq::TlsConnector for DeadlineTls {
+    fn connect(&self, dns_name: &str, io: Box<dyn ureq::ReadWrite>) -> std::result::Result<Box<dyn ureq::ReadWrite>, ureq::Error> {
+        self.tls.connect(dns_name, Box::new(Deadlined { io, deadline: self.deadline }))
+    }
+}
+
+/// Every read and write waits at most until the deadline, and none starts after it.
+#[derive(Debug)]
+struct Deadlined {
+    io: Box<dyn ureq::ReadWrite>,
+    deadline: Instant,
+}
+
+impl Deadlined {
+    fn io<T>(&mut self, op: impl FnOnce(&mut Box<dyn ureq::ReadWrite>) -> std::io::Result<T>) -> std::io::Result<T> {
+        let timed_out = || std::io::Error::new(std::io::ErrorKind::TimedOut, "transfer deadline passed");
+        let left = self.deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()).ok_or_else(timed_out)?;
+        let socket = self.io.socket().ok_or_else(|| std::io::Error::other("TLS without a TCP socket"))?;
+        socket.set_read_timeout(Some(left.min(IDLE)))?;
+        socket.set_write_timeout(Some(left.min(IDLE)))?;
+        op(&mut self.io).map_err(|e| if e.kind() == std::io::ErrorKind::WouldBlock { timed_out() } else { e })
+    }
+}
+
+impl Read for Deadlined {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.io(|io| io.read(buf))
+    }
+}
+
+impl std::io::Write for Deadlined {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.io(|io| io.write(buf))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.io(|io| io.flush())
+    }
+}
+
+impl ureq::ReadWrite for Deadlined {
+    fn socket(&self) -> Option<&std::net::TcpStream> {
+        self.io.socket()
+    }
+}
+
+/// Shared by all of an image's layers (`Arc`), its token with them.
 pub struct Registry {
-    agent: ureq::Agent,
     pub r: Reference,
     /// base64 `user:password` from the Docker config.
     basic: Option<String>,
-    auth: Option<String>,
+    auth: Mutex<Option<Arc<str>>>,
 }
 
 impl Registry {
     pub fn new(r: Reference) -> Registry {
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(30))
-            .timeout_read(Duration::from_secs(120))
-            .user_agent(concat!("flexvm/", env!("CARGO_PKG_VERSION")))
-            // Redirects are followed by hand, never carrying credentials.
-            .redirects(0)
-            .build();
         // Credentials only ever travel over TLS.
         let basic = if r.base_url().starts_with("https://") { docker_credentials(&r.registry) } else { None };
-        Registry { agent, r, basic, auth: None }
+        Registry { r, basic, auth: Mutex::new(None) }
     }
 
     /// Credentials go only over HTTPS to the registry itself or its well-known token service.
@@ -48,16 +131,25 @@ impl Registry {
         host == self.r.registry || (self.r.registry == "registry-1.docker.io" && host == "auth.docker.io")
     }
 
+    /// The time left before `deadline`, for the next request; ureq holds connect, writes and the body to it.
+    fn left(deadline: Instant, what: &str) -> Result<Duration> {
+        match deadline.checked_duration_since(Instant::now()) {
+            Some(left) if !left.is_zero() => Ok(left),
+            _ => bail!("{what}: transfer deadline passed"),
+        }
+    }
+
     /// Authenticates on a 401 and retries once; redirects (blob storage) are followed without credentials.
-    fn get(&mut self, path: &str, accept: &str) -> Result<ureq::Response> {
+    fn get(&self, path: &str, accept: &str, deadline: Instant) -> Result<ureq::Response> {
         let base = format!("{}/{path}", self.r.base_url());
         let (mut url, mut redirects, mut authenticated) = (base.clone(), 0, false);
+        let agent = agent(deadline);
         loop {
-            let mut req = self.agent.get(&url);
+            let mut req = agent.get(&url).timeout(Self::left(deadline, &format!("GET {url}"))?);
             if redirects == 0 {
                 req = req.set("Accept", accept);
-                if let Some(a) = &self.auth {
-                    req = req.set("Authorization", a);
+                if let Some(a) = self.auth.lock().unwrap().clone() {
+                    req = req.set("Authorization", &a);
                 }
             }
             match req.call() {
@@ -81,7 +173,7 @@ impl Registry {
                 Ok(resp) => return Ok(resp),
                 Err(ureq::Error::Status(401, resp)) if !authenticated && redirects == 0 => {
                     let challenge = resp.header("www-authenticate").unwrap_or("").to_string();
-                    self.authenticate(&challenge)?;
+                    self.authenticate(&agent, &challenge, deadline)?;
                     authenticated = true;
                 }
                 Err(ureq::Error::Status(401, _)) if redirects == 0 => {
@@ -97,11 +189,11 @@ impl Registry {
         }
     }
 
-    fn authenticate(&mut self, challenge: &str) -> Result<()> {
+    fn authenticate(&self, agent: &ureq::Agent, challenge: &str, deadline: Instant) -> Result<()> {
         let (scheme, params) = challenge.split_once(' ').unwrap_or((challenge, ""));
         if scheme.eq_ignore_ascii_case("basic") {
             let Some(b) = &self.basic else { bail!("{} wants basic credentials; none found", self.r.registry) };
-            self.auth = Some(format!("Basic {b}"));
+            *self.auth.lock().unwrap() = Some(format!("Basic {b}").into());
             return Ok(());
         }
         if !scheme.eq_ignore_ascii_case("bearer") {
@@ -114,7 +206,7 @@ impl Registry {
             })
         };
         let realm = param("realm").ok_or("auth challenge has no realm")?;
-        let mut req = self.agent.get(&realm);
+        let mut req = agent.get(&realm).timeout(Self::left(deadline, &format!("token from {realm}"))?);
         if let Some(service) = param("service") {
             req = req.query("service", &service);
         }
@@ -131,12 +223,12 @@ impl Registry {
             Err(e) => bail!("token from {realm}: {e}"),
         };
         let token = body["token"].as_str().or(body["access_token"].as_str()).ok_or("token response has no token")?;
-        self.auth = Some(format!("Bearer {token}"));
+        *self.auth.lock().unwrap() = Some(format!("Bearer {token}").into());
         Ok(())
     }
 
-    pub fn manifest(&mut self, reference: &str) -> Result<(Value, String)> {
-        let resp = self.get(&format!("manifests/{reference}"), MANIFEST_TYPES)?;
+    pub fn manifest(&self, reference: &str) -> Result<(Value, String)> {
+        let resp = self.get(&format!("manifests/{reference}"), MANIFEST_TYPES, deadline(MAX_DOCUMENT))?;
         let mut body = Vec::new();
         resp.into_reader().take(MAX_DOCUMENT + 1).read_to_end(&mut body)?;
         if body.len() as u64 > MAX_DOCUMENT {
@@ -151,8 +243,8 @@ impl Registry {
 
     /// Checks cached blobs before reuse; a corrupt one gets one fresh download, renamed over it so that
     /// concurrent pulls never see the path missing.
-    pub fn blob(&mut self, digest: &str, size: u64, blobs: &Path) -> Result<PathBuf> {
-        cached_blob(digest, size, blobs, || Ok(self.get(&format!("blobs/{digest}"), "*/*")?.into_reader()))
+    pub fn blob(&self, digest: &str, size: u64, blobs: &Path) -> Result<PathBuf> {
+        cached_blob(digest, size, blobs, || Ok(self.get(&format!("blobs/{digest}"), "*/*", deadline(size))?.into_reader()))
     }
 }
 
@@ -247,7 +339,7 @@ fn docker_credentials(registry: &str) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     #[test]
@@ -299,6 +391,111 @@ mod tests {
         drop(lock);
         sweep_parts(&dir);
         assert!(!live.exists());
+    }
+
+    /// Serves each connection by its request path: `/v2/<image>/<path>` answers `respond(path)`, one byte at a
+    /// time every `drip` once past its first `fast` bytes, until the client hangs up.
+    pub(in super::super) fn drip_server(fast: usize, drip: Duration, respond: impl Fn(&str, &str) -> String + Send + Sync + 'static) -> String {
+        use std::io::{BufRead, BufReader, Write};
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap().to_string();
+        let respond = Arc::new(respond);
+        let base = addr.clone();
+        std::thread::spawn(move || {
+            for mut socket in server.incoming().flatten() {
+                let (respond, base) = (respond.clone(), base.clone());
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(socket.try_clone().unwrap());
+                    let mut request = String::new();
+                    reader.read_line(&mut request).unwrap();
+                    while reader.read_line(&mut String::new()).is_ok_and(|n| n > 2) {}
+                    let path = request.split(' ').nth(1).unwrap_or("").to_string();
+                    let resp = respond(&base, &path).into_bytes();
+                    let _ = socket.write_all(&resp[..fast.min(resp.len())]);
+                    for b in resp.iter().skip(fast) {
+                        std::thread::sleep(drip);
+                        if socket.write_all(&[*b]).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    #[test]
+    fn slow_transfers_hit_the_overall_deadline() {
+        let body = |b: &str| format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len());
+        // Each byte arrives well within the 120 s read timeout; only the deadline ends them.
+        type Respond = fn(&str, &str) -> String;
+        let cases: [(&str, usize, Respond); 3] = [
+            ("headers", 0, |_, _| format!("HTTP/1.1 200 OK\r\n{}Content-Length: 0\r\n\r\n", "X-Pad: y\r\n".repeat(100))),
+            ("body", 64, |_, _| format!("HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n{}", "x".repeat(1000))),
+            ("token", 64, |base, path| {
+                if path.starts_with("/token") {
+                    let t = format!("{{\"token\": \"{}\"}}", "t".repeat(1000));
+                    format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{t}", t.len())
+                } else {
+                    format!(
+                        "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"http://{base}/token\"\r\n\
+                         Content-Length: 0\r\nConnection: close\r\n{}\r\n",
+                        " ".repeat(64)
+                    )
+                }
+            }),
+        ];
+        for (name, fast, respond) in cases {
+            let addr = drip_server(fast, Duration::from_millis(20), respond);
+            let reg = Registry::new(Reference::parse(&format!("{addr}/test")).unwrap());
+            let start = Instant::now();
+            let res = reg.get("blobs/x", "*/*", start + Duration::from_millis(700)).and_then(|r| {
+                let mut data = Vec::new();
+                r.into_reader().read_to_end(&mut data)?;
+                Ok(data)
+            });
+            let err = res.expect_err(name).to_string();
+            assert!(err.contains("timed out") || err.contains("deadline"), "{name}: {err}");
+            assert!(start.elapsed() < Duration::from_secs(5), "{name}: took {:?}", start.elapsed());
+        }
+        // A fast transfer is unaffected.
+        let addr = drip_server(usize::MAX, Duration::ZERO, move |_, _| body("blob"));
+        let reg = Registry::new(Reference::parse(&format!("{addr}/test")).unwrap());
+        let mut data = String::new();
+        reg.get("blobs/x", "*/*", Instant::now() + Duration::from_secs(5)).unwrap().into_reader().read_to_string(&mut data).unwrap();
+        assert_eq!(data, "blob");
+    }
+
+    #[test]
+    fn a_dripped_tls_handshake_hits_the_deadline() {
+        use std::io::Write;
+        // Announces a 16 KiB handshake record, then sends it a byte at a time: each read succeeds
+        // well within the idle timeout, and no certificate is ever needed.
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for mut socket in server.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let _ = socket.read(&mut [0; 4096]);
+                    let _ = socket.write_all(&[0x16, 0x03, 0x03, 0x40, 0x00]);
+                    while socket.write_all(&[0]).is_ok() {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                });
+            }
+        });
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(700);
+        let err = agent(deadline).get(&format!("https://{addr}/v2/")).timeout(deadline - start).call().unwrap_err().to_string();
+        assert!(err.contains("deadline") || err.contains("timed out"), "{err}");
+        assert!(start.elapsed() < Duration::from_secs(5), "took {:?}", start.elapsed());
+    }
+
+    #[test]
+    fn the_deadline_grows_with_the_transfer() {
+        let now = Instant::now();
+        assert!(deadline(0) >= now + TRANSFER_BASE && deadline(0) < now + TRANSFER_BASE + Duration::from_secs(5));
+        assert!(deadline(1 << 30) >= now + TRANSFER_BASE + Duration::from_secs(8192));
     }
 
     #[test]

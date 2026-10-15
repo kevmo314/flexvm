@@ -131,7 +131,7 @@ fn app_config(config: &Value, o: &Options) -> Result<App> {
 }
 
 pub fn prepare(cache: &Path, init: &Path, o: &Options) -> Result<(PathBuf, ImageMeta)> {
-    let mut img = source::resolve(cache, &o.image, &o.limits)?;
+    let img = source::resolve(cache, &o.image, &o.limits)?;
     let config: Value = serde_json::from_slice(&img.config)?;
     let (os, arch) = (config["os"].as_str().unwrap_or("linux"), config["architecture"].as_str().unwrap_or("amd64"));
     if os != "linux" || arch != "amd64" {
@@ -280,19 +280,18 @@ fn remove_leftovers(cached: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Publishes immutable files, the completion marker last. A competing
-/// publisher's entry is only reused once all three files are durable.
+/// Publishes immutable files, the completion marker last, never replacing one: the caller's
+/// per-key lock leaves no competing publisher, so anything already there is a stray.
 fn publish_rootfs(tmp: &Path, cached: &Path, conf: &str, sync: impl Fn(&Path) -> std::io::Result<()>) -> Result<()> {
     File::open(tmp)?.sync_all()?;
     let dir = cached.parent().unwrap();
-    let won = rename_noreplace(tmp, cached)? && publish(&cached.with_extension("conf"), bytes(conf.as_bytes()))? && {
+    let published = rename_noreplace(tmp, cached)? && publish(&cached.with_extension("conf"), bytes(conf.as_bytes()))? && {
         sync(dir)?;
         publish(&cached.with_extension("ok"), bytes(b""))?
     };
-    if !won && !entry_complete(cached) {
-        bail!("incomplete image cache entry {}: refusing to replace it", cached.display());
+    if !published {
+        bail!("image cache entry {} already exists: refusing to replace it", cached.display());
     }
-    // Even a collision winner may still need its marker synced.
     Ok(sync(dir)?)
 }
 
@@ -797,7 +796,7 @@ mod tests {
         publish_rootfs(&tmp, &cached, "first config", sync_dir).unwrap();
         let inode = std::fs::metadata(&cached).unwrap().ino();
         std::fs::write(&tmp, "second image").unwrap();
-        publish_rootfs(&tmp, &cached, "second config", sync_dir).unwrap();
+        assert!(publish_rootfs(&tmp, &cached, "second config", sync_dir).is_err());
         assert_eq!(std::fs::metadata(&cached).unwrap().ino(), inode);
         assert_eq!(read(&cached), "first image");
         assert!(!publish(&cached.with_extension("conf"), bytes(b"second config")).unwrap());
@@ -814,15 +813,6 @@ mod tests {
         assert!(publish_rootfs(&tmp, &cached, "new config", sync_dir).is_err());
         assert_eq!(read(cached.with_extension("conf")), "existing config");
         assert!(!cached.with_extension("ok").exists());
-    }
-
-    fn losing_build(d: &Path, cached: &Path) -> impl FnOnce(&Path) -> Result<String> {
-        let (winner, cached) = (d.join("winner"), cached.to_path_buf());
-        move |tmp| {
-            std::fs::write(&winner, "winner image")?;
-            publish_rootfs(&winner, &cached, "winner config", sync_dir)?;
-            build("loser")(tmp)
-        }
     }
 
     #[test]
@@ -869,27 +859,20 @@ mod tests {
     }
 
     #[test]
-    fn cache_reuses_the_winning_entry_and_canonical_path() {
+    fn cache_reuses_the_entry_by_its_canonical_path() {
         let d = tmpdir("reuse");
         std::fs::create_dir(d.join("real")).unwrap();
         symlink(d.join("real"), d.join("alias")).unwrap();
         let cached = d.join("alias/key.ext4");
-        let path = cached_rootfs(&cached, losing_build(&d, &cached), sync_dir).unwrap();
+        let path = cached_rootfs(&cached, build("first"), sync_dir).unwrap();
         assert_eq!(path, std::fs::canonicalize(d.join("real/key.ext4")).unwrap());
-        assert_eq!(read(&path), "winner image");
-        assert_eq!(read(path.with_extension("conf")), "winner config");
+        assert_eq!(read(&path), "first image");
+        assert_eq!(read(path.with_extension("conf")), "first config");
         assert!(!cached.with_extension(format!("tmp{}", std::process::id())).exists());
         assert_eq!(cached_rootfs(&cached, never, sync_dir).unwrap(), path);
         std::fs::remove_file(path.with_extension("conf")).unwrap();
         assert!(cached_rootfs(&cached, never, sync_dir).is_err());
-        assert_eq!(read(&path), "winner image");
-
-        // Reusing a collision winner needs its directory synced too.
-        let cached = d.join("key2.ext4");
-        let eio = |_: &Path| Err(std::io::Error::from_raw_os_error(libc::EIO));
-        assert!(cached_rootfs(&cached, losing_build(&d, &cached), eio).is_err());
-        assert!(entry_complete(&cached));
-        assert!(cached_rootfs(&cached, never, sync_dir).is_ok());
+        assert_eq!(read(&path), "first image");
     }
 
     #[test]
