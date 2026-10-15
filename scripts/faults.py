@@ -210,7 +210,7 @@ FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_be
           "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "resume_kill",
           "prepare_fail", "short_incoming", "slow_preload", "bad_preload", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
           "started_fsync", "started_unmark", "start_stall", "incoming_stall", "claim_stall", "handoff_stall", "ckpt_wp_race",
-          "fetch_tail_enomem", "fetch_enomem_stuck", "pull_enomem", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo", "release_stall", "release_late", "no_plug", "pause_lost", "tap_backlog", "tap_backlog_stuck", "pause_unknown", "no_collapse", "collapse_slow", "pages_slow")
+          "fetch_tail_enomem", "fetch_enomem_stuck", "pull_enomem", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo", "release_stall", "release_late", "no_plug", "pause_lost", "tap_backlog", "tap_backlog_stuck", "pause_unknown", "no_collapse", "collapse_slow", "pages_slow", "unlend_fail")
 
 
 def disarm():
@@ -1558,6 +1558,7 @@ def bad_preload():
     check("bad preload: refused for the preload list", "preload page" in r.get("error", ""), r.get("error"))
     check("bad preload: refused promptly", took < 20, took)
     check("bad preload: running on A only", where(n) == {A: "running"}, where(n))
+    check("bad preload: its loan is undone", not addr(A, vms(A)[n]["ip"]).get("lent"), addr(A, vms(A)[n]["ip"]))
     check("bad preload: md5 intact on A", md5(A, n) == m)
     r = migrate(A, n, B)
     check("bad preload: a later migration works", r["ok"] and where(n).get(B) == "running", r)
@@ -1960,6 +1961,7 @@ def pause_lost():
         check("unknown before a checkpoint: refused before arming write tracking (#219)", st["write_tracking"] is False, st)
         r = migrate(A, n, B)
         check("unknown before a migration: refused too", not r["ok"] and "ended unknown" in r["error"] and where(n) == {A: "running"}, (r, where(n)))
+        check("unknown before a migration: nothing lent", not addr(A, vms(A)[n]["ip"]).get("lent"), addr(A, vms(A)[n]["ip"]))
     finally:
         fault(A, "pause_unknown", 0)
     r = checkpoint(A, n, path)
@@ -4350,6 +4352,33 @@ def restore_ip_peer():
     rm_ckpt(path)
 
 
+def unlend_retry():
+    """An aborted migration whose unlend fails keeps its loan (#257): the next
+    attempt undoes it, and so does the VM's end."""
+    n = "ft-unlend"
+    m = setup(n)
+    ip, gen = vms(A)[n]["ip"], vms(A)[n]["gen"]
+    lent = lambda: addr(A, ip).get("lent")
+    try:
+        fault(A, "bad_preload", 60000)
+        fault(A, "unlend_fail", 60000)
+        r = migrate(A, n, B)
+        check("unlend retry: aborted, still lent", not r["ok"] and where(n) == {A: "running"} and lent() == gen, (r, where(n), addr(A, ip)))
+        fault(A, "unlend_fail", 0)
+        r = migrate(A, n, B)
+        check("unlend retry: a second abort undoes the loan", not r["ok"] and where(n) == {A: "running"} and not lent(), (r, where(n), addr(A, ip)))
+        fault(A, "unlend_fail", 60000)
+        r = migrate(A, n, B)
+        check("unlend retry: aborted again, still lent", not r["ok"] and lent() == gen, (r, addr(A, ip)))
+    finally:
+        fault(A, "bad_preload", 0)
+        fault(A, "unlend_fail", 0)
+    check("unlend retry: md5 intact on A", md5(A, n) == m)
+    kill(A, n)
+    check("unlend retry: its end undoes the loan", wait_for(lambda: not lent(), 10), addr(A, ip))
+    cleanup(n)
+
+
 def late_withdrawal():
     """Address generations order the VMs that had an address: a late
     withdrawal for a VM long gone cannot free a newer VM's loan of it or
@@ -5626,7 +5655,7 @@ SCENARIOS = dict(
     fc_prepare=fc_prepare, slow_preload=slow_preload, bad_preload=bad_preload, ckpt_packet_hold=ckpt_packet_hold, ckpt_stall=ckpt_stall, standby=standby,
     suspend_disk_freed=suspend_disk_freed, resume_mark_fails=resume_mark_fails, kill_source=kill_source,
     kill_refused_checkpoint=no_evict(kill_refused_checkpoint), wildcard_listen=wildcard_listen,
-    forged_peer=forged_peer, restore_ip_peer=restore_ip_peer, late_withdrawal=late_withdrawal,
+    forged_peer=forged_peer, restore_ip_peer=restore_ip_peer, late_withdrawal=late_withdrawal, unlend_retry=unlend_retry,
     unit_restart=unit_restart, log_cap=log_cap, gc_debris=gc_debris, prefix_change=prefix_change, arrival_log=arrival_log, template_tap=template_tap,
     incoming_killed=incoming_killed, start_killed=start_killed, claim_killed=claim_killed, standby_stalled=standby_stalled, fc_died=fc_died,
     sigkill_restart=sigkill_restart, listen_trickle=listen_trickle,
