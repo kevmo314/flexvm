@@ -4989,6 +4989,16 @@ def forged_peer():
     s, r, _ = migrate_in_raw(B, n, ip, tid, gen=newest - 1)
     s.close()
     check("forged gen: an older one than recorded is refused", not r.get("ok") and "newer generation" in r.get("error", ""), r)
+    # A template name and id are file names in the templates directory, never paths.
+    n, (good_id, regions) = "ft-forged-tpl", tid
+    scenario_vms.add(n)
+    for label, tpl, tpl_id in (("absolute name", "/tmp", good_id), ("parent name", "../" + args.template, good_id),
+                               ("name with a slash", f"{args.template}/x", good_id),
+                               ("parent id", args.template, ".."), ("path id", args.template, "../../tmp")):
+        s, r, _ = migrate_in_raw(B, n, ip, (tpl_id, regions), template=tpl)
+        s.close()
+        check(f"forged template {label}: refused", not r.get("ok") and "bad template" in r.get("error", ""), r)
+        nothing_left(f"forged template {label}", n, ip)
     for label, hdr in (("vmstate", {"runs": [], "vmstate_len": 1 << 40, "preload": []}),
                        ("preload", {"runs": [], "vmstate_len": 0, "preload": list(range(5000))})):
         n = f"ft-forged-{label}"

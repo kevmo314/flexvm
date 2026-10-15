@@ -348,4 +348,9 @@ copy-on-write, packet holds, clocks, Firecracker patches, measurements).
   saying where it went and exits 1 (the command keeps running there).
 - Templates must be identical on every host (checked by content id), as
   must the CPU model and the Firecracker binary (see Setup).
+- The templates directory is trusted like the binaries: whoever can write in
+  it decides what VMs boot, by pointing `templates/NAME` elsewhere or editing a
+  generation's `meta.json` (whose recorded hashes and file stamps decide what
+  is re-hashed). Keep it, and its parents, root-owned and not group- or
+  world-writable.
 - `net.ipv4.ip_forward` is turned on host-wide and left on.
