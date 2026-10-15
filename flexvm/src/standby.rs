@@ -682,7 +682,7 @@ mod tests {
 
     #[test]
     fn long_template_has_a_short_socket_path() {
-        let root = std::env::temp_dir().join(format!("fv-long-{}", std::process::id()));
+        let root = crate::test_util::TempDir::new("fv-long");
         let run = root.join("r".repeat(60usize.saturating_sub(root.as_os_str().len() + 1).max(1)));
         let host = Host::open(&root.join("state"), &run).unwrap();
         let template = "t".repeat(64);
@@ -707,7 +707,7 @@ mod tests {
     fn unacknowledged_children_are_killed_and_reaped_before_relief() {
         use std::os::unix::process::ExitStatusExt;
 
-        let root = std::env::temp_dir().join(format!("flexvm-standby-locked-{}", std::process::id()));
+        let root = crate::test_util::TempDir::new("standby-locked");
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
         for reply in ["", "{\"locked\":", "{\"locked\":false}\n", "{\"ok\":false,\"error\":\"no template\"}\n"] {
             let stop = Flock::new(stop_lock(&host).unwrap(), libc::LOCK_SH).unwrap();
@@ -769,8 +769,7 @@ mod tests {
 
     #[test]
     fn stopped_standbys_share_one_handshake_budget_and_a_live_one_after_them_wins() {
-        let root = std::env::temp_dir().join(format!("flexvm-standby-budget-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::test_util::TempDir::new("standby-budget");
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
         std::fs::create_dir_all(root.join("templates/.gen/a")).unwrap();
         std::os::unix::fs::symlink(".gen/a", root.join("templates/default")).unwrap();
@@ -800,8 +799,7 @@ mod tests {
 
     #[test]
     fn concurrent_claimers_take_different_standbys() {
-        let root = std::env::temp_dir().join(format!("flexvm-standby-take-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::test_util::TempDir::new("standby-take");
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
         std::fs::create_dir_all(root.join("templates/.gen/a")).unwrap();
         std::os::unix::fs::symlink(".gen/a", root.join("templates/default")).unwrap();
@@ -840,7 +838,7 @@ mod tests {
 
     #[test]
     fn a_reused_pid_keeps_its_own_lock() {
-        let root = std::env::temp_dir().join(format!("flexvm-standby-identity-{}", std::process::id()));
+        let root = crate::test_util::TempDir::new("standby-identity");
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
         let d = dir(&host, "default");
         std::fs::create_dir_all(&d).unwrap();
@@ -858,8 +856,7 @@ mod tests {
 
     #[test]
     fn recovery_finds_persistent_targets_and_respects_refill_lock_and_reserve() {
-        let root = std::env::temp_dir().join(format!("flexvm-refill-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::test_util::TempDir::new("refill");
         let mut host = Host::open(&root.join("state"), &root.join("run")).unwrap();
         crate::util::write_file(&host.state.join("standby"), "default", b"1", true).unwrap();
         // No runtime pool after a reboot; the persistent target is discovered.

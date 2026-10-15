@@ -2239,12 +2239,11 @@ pub fn arm(host: &Host, name: &str, ms: u64) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn host(tag: &str) -> Host {
-        let base = std::env::temp_dir().join(format!("flexvm-host-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+    fn host(tag: &str) -> (crate::test_util::TempDir, Host) {
+        let base = crate::test_util::TempDir::new(&format!("host-{tag}"));
         let mut h = Host::open(&base.join("state"), &base.join("run")).unwrap();
         h.cfg.vm_ips = "10.9.0.1-10.9.0.3".into();
-        h
+        (base, h)
     }
 
     fn ip(s: &str) -> Ipv4Addr {
@@ -2255,7 +2254,7 @@ mod tests {
     fn run_directory_creation_errors_name_the_path() {
         use std::os::unix::fs::PermissionsExt;
 
-        let h = host("run-error");
+        let (_h_dir, h) = host("run-error");
         let base = h.state.parent().unwrap();
         std::fs::remove_dir_all(&h.run).unwrap();
         std::fs::write(&h.run, "").unwrap();
@@ -2281,7 +2280,7 @@ mod tests {
 
     #[test]
     fn state_directories_are_synced_once_and_remade() {
-        let h = host("synced");
+        let (_h_dir, h) = host("synced");
         let marker = std::fs::read_to_string(h.state.join(".synced")).unwrap();
         std::fs::remove_dir(h.state.join("standby")).unwrap();
         // Copied from another root: synced again.
@@ -2352,7 +2351,7 @@ mod tests {
 
     #[test]
     fn names_are_locked_for_life() {
-        let h = host("names");
+        let (_h_dir, h) = host("names");
         let a = h.take_name("a", false).unwrap();
         assert!(h.take_name("a", false).is_err());
         a.publish(&Entry { name: "a".into(), ident: Ident::me(), ..Entry::default() }).unwrap();
@@ -2372,7 +2371,7 @@ mod tests {
 
     #[test]
     fn suspend_debris_is_removed_by_the_names_next_holder() {
-        let h = host("debris");
+        let (_h_dir, h) = host("debris");
         let dir = |n: &str, files: &[&str]| {
             std::fs::create_dir_all(h.suspended(n)).unwrap();
             files.iter().for_each(|f| std::fs::write(h.suspended(n).join(f), "").unwrap());
@@ -2403,7 +2402,7 @@ mod tests {
 
     #[test]
     fn a_dead_holders_firecrackers_die_before_its_name_or_address_is_free() {
-        let h = host("reap");
+        let (_h_dir, h) = host("reap");
         let fc = Sleeper::new();
         store(&h.vms("d", "lock"), &dead_owner(&h, 999_999_901, &[&fc.1]), false).unwrap();
         let l = h.lock().unwrap();
@@ -2429,7 +2428,7 @@ mod tests {
 
     #[test]
     fn addresses_generations_and_loans() {
-        let h = host("addrs");
+        let (_h_dir, h) = host("addrs");
         let _a = h.take_name("a", false).unwrap();
         let l = h.lock().unwrap();
         let a = h.claim_new(&l, "a", None).unwrap();
@@ -2474,7 +2473,7 @@ mod tests {
 
     #[test]
     fn an_address_is_held_by_the_instance_that_claimed_it() {
-        let h = host("instances");
+        let (_h_dir, h) = host("instances");
         let (x, y) = (ip("10.9.0.1"), ip("10.9.0.2"));
         // `web` SIGKILLed at x (its Firecracker still running), and an earlier crash's claim at y.
         let fc = Sleeper::new();
@@ -2526,7 +2525,7 @@ mod tests {
 
     #[test]
     fn a_dead_holders_address_is_withdrawn_unless_its_vm_may_live_on() {
-        let h = host("withdraw-dead");
+        let (_h_dir, h) = host("withdraw-dead");
         let l = h.lock().unwrap();
         let dead = |pid| dead_owner(&h, pid, &[]);
         let claim = |ip: Ipv4Addr, name: &str, id: Option<Ident>, gen: u64, change: &dyn Fn(&mut Addr)| {
@@ -2618,7 +2617,7 @@ mod tests {
 
     #[test]
     fn a_claim_is_moving_while_its_vm_migrates() {
-        let h = host("moving");
+        let (_h_dir, h) = host("moving");
         let (home, away) = (ip("10.9.0.1"), ip("10.9.2.1"));
         let l = h.lock().unwrap();
         let moving = |ip| h.addr(&h.lock().unwrap(), ip).unwrap().leaving.is_some();
@@ -2669,7 +2668,7 @@ mod tests {
 
     #[test]
     fn a_source_decides_its_hand_off_before_its_target_may_forget_it() {
-        let h = host("hand-off");
+        let (_h_dir, h) = host("hand-off");
         let x = ip("10.9.0.1");
         let l = h.lock().unwrap();
         let c = h.claim_new(&l, "vm", Some(x)).unwrap();
@@ -2712,7 +2711,7 @@ mod tests {
 
     #[test]
     fn a_settled_outcome_retires_the_leaving_claim_before_its_record_goes() {
-        let h = host("owed-retire");
+        let (_h_dir, h) = host("owed-retire");
         let x = ip("10.9.0.1");
         let gone = dead_owner(&h, 999_999_963, &[]);
         let a = Addr {
@@ -2770,7 +2769,7 @@ mod tests {
 
     #[test]
     fn an_abort_undoes_leaving_and_its_loan_in_one_write() {
-        let h = host("stay");
+        let (_h_dir, h) = host("stay");
         let x = ip("10.9.0.1");
         let l = h.lock().unwrap();
         let c = h.claim_new(&l, "vm", Some(x)).unwrap();
@@ -2797,7 +2796,7 @@ mod tests {
 
     #[test]
     fn a_withdrawal_is_recorded_before_its_claim_goes() {
-        let mut h = host("enqueue-first");
+        let (_h_dir, mut h) = host("enqueue-first");
         h.cfg.peers = vec!["a".into()];
         let x = ip("10.9.1.1");
         let l = h.lock().unwrap();
@@ -2825,7 +2824,7 @@ mod tests {
 
     #[test]
     fn unreadable_migration_records_withdraw_nothing() {
-        let h = host("withdraw-unreadable");
+        let (_h_dir, h) = host("withdraw-unreadable");
         let x = ip("10.9.1.1");
         let gone = dead_owner(&h, 999_999_951, &[]);
         h.put_addr(x, &Addr { seen: 4, holder: Some("vm".into()), holder_id: Some(gone), held: 4, ..Addr::default() }, false).unwrap();
@@ -2854,7 +2853,7 @@ mod tests {
 
     #[test]
     fn a_release_cut_short_is_finished_by_retirement() {
-        let h = host("release-cut");
+        let (_h_dir, h) = host("release-cut");
         let x = ip("10.9.0.1");
         let gone = dead_owner(&h, 999_999_952, &[]);
         let a = Addr { seen: 4, lent: Some(4), holder: Some("vm".into()), holder_id: Some(gone), held: 4, arriving: Some(30), ..Addr::default() };
@@ -2895,7 +2894,7 @@ mod tests {
 
     #[test]
     fn withdrawals_are_redelivered_until_each_peer_has_them() {
-        let mut h = host("notices");
+        let (_h_dir, mut h) = host("notices");
         h.cfg.peers = vec!["p1".into(), "p2".into()];
         let x = ip("10.9.1.1");
         let gone = dead_owner(&h, 999_999_953, &[]);
@@ -2932,7 +2931,7 @@ mod tests {
 
     #[test]
     fn peers_that_are_down_never_crowd_out_one_that_is_up() {
-        let mut h = host("notice-fair");
+        let (_h_dir, mut h) = host("notice-fair");
         let peers: Vec<String> = (1..=9).map(|i| format!("p{i}")).collect();
         h.cfg.peers = peers.clone();
         let x = ip("10.9.1.1");
@@ -2957,7 +2956,7 @@ mod tests {
 
     #[test]
     fn an_undelivered_withdrawal_is_never_given_up() {
-        let mut h = host("notice-kept");
+        let (_h_dir, mut h) = host("notice-kept");
         h.cfg.peers = vec!["home".into()];
         let x = ip("10.9.1.1");
         h.withdraw_noted(&h.lock().unwrap(), x, 4).unwrap();
@@ -2979,7 +2978,7 @@ mod tests {
 
     #[test]
     fn a_source_killed_after_its_abort_resumed_is_settled_by_its_target() {
-        let mut h = host("abort-killed");
+        let (_h_dir, mut h) = host("abort-killed");
         h.cfg.peers = vec!["a".into()];
         let x = ip("10.9.1.1");
         let gone = dead_owner(&h, 999_999_954, &[]);
@@ -3017,7 +3016,7 @@ mod tests {
 
     #[test]
     fn what_cannot_be_read_is_never_proof_of_death() {
-        let h = host("unreadable");
+        let (_h_dir, h) = host("unreadable");
         // A dead owner whose work directory's owner record cannot be read: not reaped.
         let dead = dead_owner(&h, 999_999_921, &[]);
         let owner = dead.work_dir(&h.run).join("owner");
@@ -3090,7 +3089,7 @@ mod tests {
                 Ok(())
             }
         }
-        let mut h = host("prefix");
+        let (_h_dir, mut h) = host("prefix");
         // Not from the default (`fv`), whose taps this machine may have.
         store(&h.state.join("host.json"), &Config { prefix: "zq1".into(), ..Config::default() }, false).unwrap();
         let w = h.run.join("w").join("4242");
@@ -3124,7 +3123,7 @@ mod tests {
     /// whose prefixes overlap (`fq`, `fq2`) never take each other's.
     #[test]
     fn taps_are_this_hosts_by_their_alias() {
-        let h = host("alias");
+        let (_h_dir, h) = host("alias");
         let me = Ident::me();
         let alias = tap_alias(&h.run, &me);
         assert_eq!(parse_tap_alias(&alias), Some((me.clone(), &*h.run.to_string_lossy())));
@@ -3162,7 +3161,7 @@ mod tests {
     /// One saved under the earlier 8-character limit is refused where it is read.
     #[test]
     fn a_stored_prefix_is_checked_where_read() {
-        let h = host("oldprefix");
+        let (_h_dir, h) = host("oldprefix");
         for (p, ok) in [("fv", true), ("fvci0a", true), ("fvci10a", false), ("fvci0.1a", false), ("", false), ("f/v", false)] {
             store(&h.state.join("host.json"), &Config { prefix: p.into(), ..Config::default() }, false).unwrap();
             let got = h.tap_prefix();
@@ -3177,8 +3176,7 @@ mod tests {
     /// (a reused one may have joined it): never killed.
     #[test]
     fn a_scope_goes_only_once_empty() {
-        let d = std::env::temp_dir().join(format!("flexvm-scope-sweep-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
+        let d = crate::test_util::TempDir::new("scope-sweep");
         let (busy, unread) = (d.join("vm-1-1"), d.join("vm-2-2"));
         for cg in [&busy, &unread] {
             std::fs::create_dir_all(cg).unwrap();
@@ -3201,7 +3199,7 @@ mod tests {
         // Ours unreadable: nothing can be told.
         assert_eq!(liveness_by(&me, "", stat), Liveness::Unknown);
         assert_eq!(liveness_by(&Ident { boot: "other".into(), ..me.clone() }, boot_id(), stat), Liveness::Gone);
-        let h = host("noboot");
+        let (_h_dir, h) = host("noboot");
         let dead = Ident { pid: 999_999_931, start: 1, boot: String::new() };
         assert!(reap(&h.run, &dead).is_err(), "never reaped as another boot's");
         assert!(!boot_id().is_empty() && Ident::of(std::process::id()).is_some_and(|i| i.boot == boot_id()));
@@ -3209,7 +3207,7 @@ mod tests {
 
     #[test]
     fn automatic_allocation_goes_on_from_the_last_one() {
-        let h = host("hint");
+        let (_h_dir, h) = host("hint");
         let l = h.lock().unwrap();
         let a = h.claim_new(&l, "a", None).unwrap();
         assert_eq!(a.ip, ip("10.9.0.1"));
@@ -3237,7 +3235,7 @@ mod tests {
 
     #[test]
     fn revisions_order_locations_within_a_generation() {
-        let h = host("revs");
+        let (_h_dir, h) = host("revs");
         let l = h.lock().unwrap();
         let (x, a, b) = (ip("10.9.0.1"), Some(ip("192.0.2.1")), Some(ip("192.0.2.2")));
         assert!(h.observe(&l, x, 7, 3, b).unwrap());
@@ -3255,7 +3253,7 @@ mod tests {
 
     #[test]
     fn addresses_are_lent_to_restoring_peers_only_when_free() {
-        let h = host("lend");
+        let (_h_dir, h) = host("lend");
         let l = h.lock().unwrap();
         let x = ip("10.9.0.2");
         assert!(h.lend_new(&l, ip("10.9.9.9")).is_err(), "not ours");
@@ -3271,7 +3269,7 @@ mod tests {
 
     #[test]
     fn an_owed_outcome_keeps_the_loan_until_the_target_says() {
-        let h = host("owed");
+        let (_h_dir, h) = host("owed");
         let x = ip("10.9.0.2");
         let gen = {
             let l = h.lock().unwrap();
@@ -3325,7 +3323,7 @@ mod tests {
 
     #[test]
     fn an_interrupted_owed_write_is_not_a_record_and_is_swept_once_its_writer_is_gone() {
-        let h = host("owed-tmp");
+        let (_h_dir, h) = host("owed-tmp");
         let dir = h.state.join("owed");
         // An interrupted write: garbage under a temporary name, by a dead process and by this one.
         let dead = dir.join(".7.4294967.tmp");
@@ -3344,7 +3342,7 @@ mod tests {
 
     #[test]
     fn reclaim_withdraws_a_lent_address_and_forgets_its_owed_outcome() {
-        let h = host("reclaim");
+        let (_h_dir, h) = host("reclaim");
         let x = ip("10.9.0.2");
         assert!(h.reclaim(x).unwrap_err().to_string().contains("not lent"));
         let gen = {
@@ -3369,7 +3367,7 @@ mod tests {
 
     #[test]
     fn owed_outcomes_respect_the_budget_and_ask_an_unreachable_target_once() {
-        let h = host("owed-budget");
+        let (_h_dir, h) = host("owed-budget");
         let x = ip("10.9.0.3");
         for id in 1..=6 {
             h.owe(id, &Owed { to: if id <= 3 { "down".into() } else { "up".into() }, ip: x, gen: 1, by: Ident { start: id, ..Ident::me() } }).unwrap();
@@ -3408,7 +3406,7 @@ mod tests {
 
     #[test]
     fn migration_retirement_sweeps_dead_writers_under_the_host_lock() {
-        let h = host("migs-tmp");
+        let (_h_dir, h) = host("migs-tmp");
         let dir = h.state.join("migs");
         let dead = dir.join(".7.999999971.tmp");
         let live = dir.join(format!(".8.{}.tmp", std::process::id()));
@@ -3435,7 +3433,7 @@ mod tests {
     #[test]
     fn aborted_arrivals_release_only_the_matching_dead_claim_and_keep_the_loan() {
         for committed in [false, true] {
-            let h = host(if committed { "aborted-committed" } else { "aborted-pending" });
+            let (_h_dir, h) = host(if committed { "aborted-committed" } else { "aborted-pending" });
             let x = ip("10.9.0.1");
             let owner = dead_owner(&h, 999_999_972, &[]);
             let l = h.lock().unwrap();
@@ -3464,7 +3462,7 @@ mod tests {
 
     #[test]
     fn retirement_respects_record_budget() {
-        let h = host("retire-budget");
+        let (_h_dir, h) = host("retire-budget");
         for id in 1..=8 {
             released_migration(&h, id, "reachable");
         }
@@ -3482,7 +3480,7 @@ mod tests {
 
     #[test]
     fn retirement_continues_across_passes_and_wraps() {
-        let h = host("retire-continue");
+        let (_h_dir, h) = host("retire-continue");
         for id in 1..=6 {
             released_migration(&h, id, "reachable");
         }
@@ -3505,7 +3503,7 @@ mod tests {
 
     #[test]
     fn retirement_skips_unavailable_endpoints_only_for_this_pass() {
-        let h = host("retire-endpoints");
+        let (_h_dir, h) = host("retire-endpoints");
         for (id, source) in [(1, "unreachable"), (2, "reachable"), (3, "unreachable"), (4, "reachable"), (5, "unknown"), (6, "unreachable")] {
             released_migration(&h, id, source);
         }
@@ -3533,7 +3531,7 @@ mod tests {
 
     #[test]
     fn retirement_uses_its_own_nonblocking_lock() {
-        let h = host("retire-lock");
+        let (_h_dir, h) = host("retire-lock");
         released_migration(&h, 1, "reachable");
         let gc = File::create(h.run.join(".gc.lock")).unwrap();
         flock(&gc, libc::LOCK_EX | libc::LOCK_NB).unwrap();
@@ -3552,7 +3550,7 @@ mod tests {
 
     #[test]
     fn a_pass_lets_go_of_its_lock_though_a_forked_child_shares_it() {
-        let h = host("retire-fork");
+        let (_h_dir, h) = host("retire-fork");
         released_migration(&h, 1, "reachable");
         let (forked, mut told) = std::os::unix::net::UnixStream::pair().unwrap();
         let mut spawner = None;
@@ -3582,7 +3580,7 @@ mod tests {
 
     #[test]
     fn migrations_are_fenced() {
-        let h = host("migs");
+        let (_h_dir, h) = host("migs");
         let rec = |id: u64| load::<Mig>(&h.mig_path(id)).unwrap();
         assert!(h.mig_status(1).unwrap() == "aborted" && rec(1).is_none());
         let r = h.mig_begin(2, "", None, None).unwrap();
@@ -3691,14 +3689,14 @@ mod tests {
 
     #[test]
     fn last_good_config_is_shared_by_clones_and_isolated_from_other_hosts() {
-        let mut h = host("config-isolated");
+        let (_h_dir, mut h) = host("config-isolated");
         h.configure(|c| {
             c.peers = vec!["10.1.0.8:7070".into()];
             Ok(())
         })
         .unwrap();
         let clone = h.clone();
-        let other = host("config-unrelated");
+        let (_other_dir, other) = host("config-unrelated");
         let path = h.state.join("host.json");
         let mut cfg = h.cfg.clone();
         for peers in [vec!["10.1.0.9:7070".to_string()], Vec::new()] {
@@ -3720,7 +3718,7 @@ mod tests {
 
     #[test]
     fn config_replacements_with_the_same_mtime_are_seen() {
-        let mut h = host("config-stamp");
+        let (_h_dir, mut h) = host("config-stamp");
         h.configure(|_| Ok(())).unwrap();
         let running = h.clone();
         let path = h.state.join("host.json");
@@ -3743,7 +3741,7 @@ mod tests {
 
     #[test]
     fn peer_generations_are_bounded_before_storing() {
-        let h = host("gen-bound");
+        let (_h_dir, h) = host("gen-bound");
         let l = h.lock().unwrap();
         let addr = ip("10.9.0.1");
         for gen in [0, RECV_MAX + 1, GEN_MAX - 1025, GEN_MAX - 1024, GEN_MAX - 1, GEN_MAX, GEN_MAX + 1, u64::MAX] {
@@ -3757,7 +3755,7 @@ mod tests {
     #[test]
     fn near_bound_peer_generations_do_not_poison_allocation() {
         for (tag, incoming) in [("gen-observe", false), ("gen-incoming", true)] {
-            let h = host(tag);
+            let (_h_dir, h) = host(tag);
             let l = h.lock().unwrap();
             let addr = ip("10.9.0.1");
             let mut gen = RECV_MAX - 1025;
@@ -3783,7 +3781,7 @@ mod tests {
 
     #[test]
     fn admission_uses_this_boots_clock_and_drops_future_grants() {
-        let mut h = host("grant-clock");
+        let (_h_dir, mut h) = host("grant-clock");
         h.cfg.reserve_mib = AVAIL - 1000;
         let before = boottime_ms();
         grant_at(&h, 1000, Floor::Reserve, false).unwrap();
@@ -3815,7 +3813,7 @@ mod tests {
 
     #[test]
     fn admission_counts_recent_grants() {
-        let mut h = host("admit");
+        let (_h_dir, mut h) = host("admit");
         let admit = |h: &Host, mib| grant_at(h, mib, Floor::Reserve, false).is_ok();
         h.cfg.reserve_mib = AVAIL - 3000;
         pin_clock(boottime_ms());
@@ -3836,7 +3834,7 @@ mod tests {
     /// available; nothing is granted.
     #[test]
     fn admission_fails_closed_when_holds_cannot_be_read() {
-        let mut h = host("holds-unreadable");
+        let (_h_dir, mut h) = host("holds-unreadable");
         h.cfg.reserve_mib = 0;
         let grants = || load::<Vec<(u64, u64, u64)>>(&h.grants()).unwrap().unwrap_or_default();
         let grant = || h.grant_inner(1, Floor::Reserve, false, None, || Some(AVAIL)).map(|r| r.ok().map(|g| g.0));
@@ -3854,7 +3852,7 @@ mod tests {
 
     #[test]
     fn admission_errors_are_not_refusals() {
-        let mut h = host("admit-err");
+        let (_h_dir, mut h) = host("admit-err");
         h.cfg.reserve_mib = 0;
         let grants = || load::<Vec<(u64, u64, u64)>>(&h.grants()).unwrap().unwrap_or_default();
         let grant = |avail: Option<u64>| h.grant_inner(1, Floor::Reserve, false, None, || avail).map(|r| r.ok().map(|g| g.0));
@@ -3879,7 +3877,7 @@ mod tests {
 
     #[test]
     fn admission_and_eviction_read_the_marks_as_they_change() {
-        let mut h = host("marks");
+        let (_h_dir, mut h) = host("marks");
         h.configure(|c| {
             c.reserve_mib = AVAIL - 3000;
             c.evict_mib = Some(AVAIL - 1500);
@@ -3914,7 +3912,7 @@ mod tests {
 
     #[test]
     fn disk_restore_reservation_survives_expiry_and_can_be_completed_or_refunded() {
-        let h = host("disk-restore-hold");
+        let (_h_dir, h) = host("disk-restore-hold");
         let charge = crate::limit::allowance(1600);
         let grant = |mib, held| h.grant_inner(mib, Floor::Reserve, held, None, || Some(h.cfg.reserve_mib + charge)).unwrap();
         let (id, hold) = grant(charge, true).unwrap();
@@ -3945,7 +3943,7 @@ mod tests {
 
     #[test]
     fn held_grants_count_past_the_window_until_dropped_or_their_owner_is_gone() {
-        let mut h = host("held");
+        let (_h_dir, mut h) = host("held");
         let admit = |h: &Host, mib| grant_at(h, mib, Floor::Reserve, false).is_ok();
         h.cfg.reserve_mib = AVAIL - 3000;
         let hold = grant_at(&h, 2000, Floor::Reserve, true).unwrap().1.unwrap();

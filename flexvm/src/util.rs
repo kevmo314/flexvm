@@ -1170,9 +1170,7 @@ mod tests {
     #[test]
     fn only_a_trusted_file_is_read() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("flexvm-trusted-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_util::TempDir::new("trusted");
         let (file, link) = (dir.join("hosts.json"), dir.join("link.json"));
         std::fs::write(&file, b"{}").unwrap();
         let mode = |m| std::fs::set_permissions(&file, std::fs::Permissions::from_mode(m)).unwrap();
@@ -1321,7 +1319,7 @@ mod tests {
 
     #[test]
     fn failed_write_file_removes_its_temp_file() {
-        let dir = std::env::temp_dir().join(format!("flexvm-write-file-{}", std::process::id()));
+        let dir = crate::test_util::TempDir::new("write-file");
         std::fs::create_dir_all(dir.join("dest")).unwrap();
         assert!(write_file(&dir, "dest", b"data", true).is_err());
         assert!(!dir.join(format!(".dest.{}.tmp", std::process::id())).exists());
@@ -1389,9 +1387,7 @@ mod tests {
         assert_eq!(stat_start(b"9 (a) b) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 777 1"), Some(777), "a ')' in the name");
         assert_eq!(stat_start(b"9 (a) S 1"), None);
         // In a plain directory standing in for the cgroup tree.
-        let root = std::env::temp_dir().join(format!("flexvm-scope-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        let root = crate::test_util::TempDir::new("scope");
         let prefix = root.join("vm-");
         let prefix = prefix.as_os_str().as_encoded_bytes();
         assert!(!scope(prefix, 7, 9), "made, but no cgroup.procs to join");
@@ -1555,9 +1551,7 @@ mod tests {
     /// one: nothing written is cut or lost, and a second writer follows.
     #[test]
     fn a_full_log_is_rotated_by_its_writers() {
-        let d = std::env::temp_dir().join(format!("flexvm-rotate-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
+        let d = crate::test_util::TempDir::new("rotate");
         let log = d.join("vm.log");
         let open = || std::fs::File::options().create(true).append(true).open(&log).unwrap();
         let read = |n: &str| String::from_utf8(std::fs::read(d.join(n)).unwrap()).unwrap();
@@ -1602,8 +1596,7 @@ mod tests {
 
     #[test]
     fn a_send_to_a_full_backlog_ends_by_its_deadline() {
-        let dir = std::env::temp_dir().join(format!("flexvm-backlog-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_util::TempDir::new("backlog");
         let path = dir.join("s");
         let _ = std::fs::remove_file(&path);
         let l = std::os::unix::net::UnixListener::bind(&path).unwrap();
@@ -1668,20 +1661,21 @@ mod tests {
 
     #[test]
     fn state_and_suspended_directories_are_private() {
-        let root = std::env::temp_dir().join(format!("flexvm-private-{}", std::process::id()));
+        let tmp = crate::test_util::TempDir::new("private");
+        // Made here, not by the guard, so its mode is create_dir_durably's.
+        let root = tmp.join("root");
         let dir = root.join("state/suspended");
         create_dir_durably(&dir, 0o700).unwrap();
         for path in [&root, &root.join("state"), &dir] {
             assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o700);
         }
         create_dir_durably(&dir, 0o700).unwrap();
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn ancestors_are_synced_physically_and_through_symlinks() {
         use std::os::unix::fs::MetadataExt;
-        let root = std::env::temp_dir().join(format!("flexvm-ancestors-{}", std::process::id()));
+        let root = crate::test_util::TempDir::new("ancestors");
         std::fs::create_dir_all(root.join("real/a/b")).unwrap();
         std::fs::create_dir_all(root.join("l")).unwrap();
         std::os::unix::fs::symlink("../real/a", root.join("l/link")).unwrap();

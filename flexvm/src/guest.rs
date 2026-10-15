@@ -314,7 +314,8 @@ mod tests {
 
     #[test]
     fn message_deadline_bounds_a_trickled_frame() {
-        let path = std::env::temp_dir().join(format!("flexvm-message-{}.sock", std::process::id()));
+        let _dir = crate::test_util::TempDir::new("message");
+        let path = _dir.join("fixture");
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         let uds = path.clone();
         let client = std::thread::spawn(move || {
@@ -339,7 +340,8 @@ mod tests {
 
     #[test]
     fn exec_deadline_bounds_a_guest_that_keeps_answering() {
-        let path = std::env::temp_dir().join(format!("flexvm-exec-{}.sock", std::process::id()));
+        let _dir = crate::test_util::TempDir::new("exec");
+        let path = _dir.join("fixture");
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         let uds = path.clone();
         let client = std::thread::spawn(move || {
@@ -378,7 +380,8 @@ mod tests {
 
     #[test]
     fn ping_waits_for_pong_without_a_session() {
-        let path = std::env::temp_dir().join(format!("flexvm-ping-{}.sock", std::process::id()));
+        let _dir = crate::test_util::TempDir::new("ping");
+        let path = _dir.join("fixture");
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         for reply in [b"pong".as_slice(), b"error: no shell"] {
             let (tx, rx) = std::sync::mpsc::channel();
@@ -405,7 +408,8 @@ mod tests {
 
     #[test]
     fn current_agent_protocol_is_required() {
-        let path = std::env::temp_dir().join(format!("flexvm-current-agent-{}.sock", std::process::id()));
+        let _dir = crate::test_util::TempDir::new("current-agent");
+        let path = _dir.join("fixture");
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         let replies: &[(&str, &[u8])] = &[
             ("START", b"ok"),
@@ -540,8 +544,7 @@ mod tests {
     #[test]
     fn a_dead_firecrackers_guest_is_not_retried() {
         // A listener that refuses everything, as a dead Firecracker's leftover socket does.
-        let dir = std::env::temp_dir().join(format!("flexvm-abandon-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_util::TempDir::new("abandon");
         let uds = dir.join("v.sock");
         drop(std::os::unix::net::UnixListener::bind(&uds).unwrap());
         let start = Instant::now();

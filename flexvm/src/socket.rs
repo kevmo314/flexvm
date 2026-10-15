@@ -142,11 +142,8 @@ mod tests {
     use super::*;
     use std::os::unix::fs::{symlink, PermissionsExt};
 
-    fn fixture() -> PathBuf {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let base = std::env::temp_dir().join(format!("fvs-test-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
-        DirBuilder::new().mode(0o700).create(&base).unwrap();
-        base
+    fn fixture() -> crate::test_util::TempDir {
+        crate::test_util::TempDir::new("socket")
     }
 
     #[test]

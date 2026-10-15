@@ -11,20 +11,10 @@ use crate::{
     util::{stat_at, Result, PAGE_SIZE},
 };
 use serde_json::json;
-use std::{
-    fs,
-    io::Write,
-    os::fd::AsRawFd,
-    os::unix::fs::FileExt,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{fs, io::Write, os::fd::AsRawFd, os::unix::fs::FileExt, path::Path, sync::Arc};
 
-fn tmp(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("flexvm-{name}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
+fn tmp(name: &str) -> crate::test_util::TempDir {
+    crate::test_util::TempDir::new(name)
 }
 
 fn manifest(guest_pages: usize, parent: Option<Parent>, files: serde_json::Value) -> Manifest {

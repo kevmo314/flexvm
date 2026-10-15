@@ -987,7 +987,8 @@ mod tests {
     #[test]
     fn background_output_after_the_drain_is_dropped_not_refused() {
         let (sessions, statuses) = (Sessions::default(), statuses());
-        let marker = std::env::temp_dir().join(format!("flexvm-discard-{}", std::process::id()));
+        let _dir = crate::test_util::TempDir::new("discard");
+        let marker = _dir.join("fixture");
         let _ = std::fs::remove_file(&marker);
         let command = format!("(sleep 3; echo late; echo late >&2; echo survived > {}) & exit 0", marker.display());
         let (output, group) = start(&sessions, &statuses, "drop", command.as_bytes());

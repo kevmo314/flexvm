@@ -678,26 +678,10 @@ pub(super) mod tests {
         v
     }
 
-    pub struct Tmp(PathBuf);
-
-    impl std::ops::Deref for Tmp {
-        type Target = Path;
-        fn deref(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for Tmp {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    pub use crate::test_util::TempDir as Tmp;
 
     pub fn tmpdir(tag: &str) -> Tmp {
-        let d = std::env::temp_dir().join(format!("flexvm-img-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        Tmp(d)
+        Tmp::new(&format!("img-{tag}"))
     }
 
     struct Sandbox {
