@@ -220,14 +220,7 @@ fn kill_running(statuses: &Statuses, pid: i32, token: u64, group: bool, sig: lib
     unsafe { libc::kill(if group { -pid } else { pid }, sig) == 0 }
 }
 
-fn pump(stdout: Option<ChildStdout>, stderr: Option<ChildStderr>, mut deliver: impl FnMut(u8, &[u8])) {
-    drop(pump_until(stdout, stderr, None, Duration::ZERO, |kind, data| {
-        deliver(kind, data);
-        Duration::ZERO
-    }));
-}
-
-/// As `pump`, but once `exited` (a pidfd) is readable, returns after `drain` of pumping:
+/// Pumps output until EOF or, once `exited` (a pidfd) is readable, `drain` more:
 /// background processes may hold the pipes open for good. `deliver` returns how long it waited
 /// for its reader, which is not counted. Returns the pipes still open.
 fn pump_until(
