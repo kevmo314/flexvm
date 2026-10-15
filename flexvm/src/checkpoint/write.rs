@@ -41,9 +41,8 @@ impl GuestPages for Pager {
 }
 
 pub(super) fn writer_threads() -> usize {
-    let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
     let n = std::env::var("FLEXVM_CKPT_THREADS").ok().and_then(|v| v.parse().ok());
-    n.unwrap_or(cpus).clamp(1, MAX_WRITERS)
+    n.unwrap_or_else(crate::util::host_cpus).clamp(1, MAX_WRITERS)
 }
 
 pub(super) struct Written {
@@ -95,8 +94,10 @@ impl PagesFile {
     }
 
     /// Safety: `iov` is page-aligned whole pages the caller keeps alive and unchanged until return.
-    fn write(&self, iov: &mut [libc::iovec], off: u64) -> io::Result<()> {
-        match pwritev_all(&self.file, &mut iov.to_vec(), off) {
+    fn write(&self, iov: &mut [libc::iovec], scratch: &mut Vec<libc::iovec>, off: u64) -> io::Result<()> {
+        scratch.clear();
+        scratch.extend_from_slice(iov);
+        match pwritev_all(&self.file, scratch, off) {
             // O_DIRECT does not work here after all.
             Err(e) if e.raw_os_error() == Some(libc::EINVAL) => direct(&self.file, false).and_then(|()| pwritev_all(&self.file, iov, off)),
             r => r,
@@ -183,6 +184,7 @@ pub(super) fn write_pages(template: &Template, src: &dyn GuestPages, runs: &Runs
     let work = || -> Result<()> {
         let mut buf = aligned(UNIT)?;
         let mut iov: Vec<libc::iovec> = Vec::with_capacity(UNIT);
+        let mut scratch = Vec::with_capacity(UNIT);
         loop {
             if failed.load(Ordering::Relaxed) {
                 return Ok(());
@@ -208,7 +210,7 @@ pub(super) fn write_pages(template: &Template, src: &dyn GuestPages, runs: &Runs
             }
             unit.at = placed.fetch_add(unit.sums.len() as u64, Ordering::Relaxed);
             if !iov.is_empty() {
-                out.write(&mut iov, unit.at * PAGE_SIZE as u64)?;
+                out.write(&mut iov, &mut scratch, unit.at * PAGE_SIZE as u64)?;
             }
             *done[k].lock().unwrap() = Some(unit);
         }

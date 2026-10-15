@@ -20,10 +20,11 @@ use serde_json::{json, Value};
 use crate::bail;
 use crate::guest;
 use crate::host::flock;
+use crate::util::{cpath, stat_at};
 use crate::util::{ms, rename_noreplace, sync_dir, Result};
 use registry::sha256_hex;
 pub use unpack::Limits;
-use unpack::{check, cpath, open_at, stat_at, Root};
+use unpack::{check, open_at, Root};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageMeta {

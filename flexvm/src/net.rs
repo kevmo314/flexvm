@@ -53,14 +53,9 @@ pub fn set_link_up(name: &str, up: bool) -> Result<()> {
 /// with frames there loses them when the tap goes (a migration, `checkpoint --stop`, a
 /// suspend), and no counter shows it: a guest slow to refill under load leaves hundreds (#136).
 pub fn tap_queued(fd: &OwnedFd) -> Result<bool> {
-    loop {
-        let mut pfd = libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-        match unsafe { libc::poll(&mut pfd, 1, 0) } {
-            n if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => continue,
-            n if n < 0 => bail!("poll: {}", std::io::Error::last_os_error()),
-            n => return Ok(n > 0 && pfd.revents & libc::POLLIN != 0),
-        }
-    }
+    let mut pfd = libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+    let n = crate::util::eintr(|| unsafe { libc::poll(&mut pfd, 1, 0) }).map_err(|e| format!("poll: {e}"))?;
+    Ok(n > 0 && pfd.revents & libc::POLLIN != 0)
 }
 
 /// Reads off and counts the frames queued on a tap (`tap_fd_of`, non-blocking as Firecracker

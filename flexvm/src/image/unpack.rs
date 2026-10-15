@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 
 use crate::bail;
 use crate::util::Result;
+use crate::util::{cpath, stat_at};
 
 /// Budgets for one image build: bytes compressed, uncompressed and per file, and tar entries.
 #[derive(Debug, Clone, Copy)]
@@ -35,15 +36,8 @@ const MAX_META: u64 = 1 << 20;
 const MAX_PAX_RECORDS: usize = 256;
 const MAX_DEPTH: u32 = 4096;
 
-pub fn cpath(p: &Path) -> Result<CString> {
-    Ok(CString::new(p.as_os_str().as_bytes()).map_err(|_| format!("NUL in path {p:?}"))?)
-}
-
 pub fn check(rc: libc::c_int, what: &str, path: &Path) -> Result<()> {
-    match rc < 0 {
-        true => bail!("{what} {path:?}: {}", io::Error::last_os_error()),
-        false => Ok(()),
-    }
+    crate::util::check(rc).map_err(|e| format!("{what} {path:?}: {e}").into())
 }
 
 /// `p` with `..` applied lexically, clamped at the root as inside a root.
@@ -69,25 +63,15 @@ fn split(p: &Path) -> Result<Option<(PathBuf, CString)>> {
 }
 
 pub fn open_at(dir: RawFd, name: &CStr, flags: i32) -> Result<OwnedFd> {
-    let fd = unsafe { libc::openat(dir, name.as_ptr(), flags | libc::O_CLOEXEC, 0o600) };
-    if fd < 0 {
-        bail!("open {name:?}: {}", io::Error::last_os_error());
-    }
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    crate::util::openat(dir, name, flags).map_err(|e| format!("open {name:?}: {e}").into())
 }
 
 pub fn open_dir_at(dir: RawFd, name: &CStr) -> Result<OwnedFd> {
-    open_at(dir, name, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+    crate::util::open_dir_at(dir, name).map_err(|e| format!("open {name:?}: {e}").into())
 }
 
 fn proc_path(fd: &OwnedFd) -> CString {
     CString::new(format!("/proc/self/fd/{}", fd.as_raw_fd())).unwrap()
-}
-
-pub fn stat_at(dir: RawFd, name: &CStr) -> Option<libc::stat> {
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::fstatat(dir, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW | libc::AT_EMPTY_PATH) };
-    (rc == 0).then_some(st)
 }
 
 pub fn is_type(dir: RawFd, name: &CStr, fmt: libc::mode_t) -> bool {

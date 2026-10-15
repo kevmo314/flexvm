@@ -77,7 +77,7 @@ impl Firecracker {
         let fc = Firecracker { child, sockets, dir: dir.into(), cgroup: None, tap: String::new(), api: Api::default(), joining: RefCell::new(None) };
         let id = crate::host::Ident::of(fc.pid()).ok_or_else(|| fc.post_mortem())?;
         crate::host::store(&dir.join("fc"), &id, false)?;
-        retry(ready, || -> Result<Result<UnixStream>> {
+        retry(ready, Duration::from_micros(200), || -> Result<Result<UnixStream>> {
             if !fc.alive() {
                 return Ok(Err(fc.post_mortem().into()));
             }
@@ -187,7 +187,7 @@ impl Api {
         loop {
             // Anything readable on an idle connection (stray bytes, or the close
             // of a Firecracker that died) means it is never used again (#109).
-            let cached = self.connection.borrow_mut().take().filter(|r| !readable(&r.get_ref().s));
+            let cached = self.connection.borrow_mut().take().filter(|r| !crate::util::readable(&r.get_ref().s, Duration::ZERO).unwrap_or(true));
             let reused = cached.is_some();
             let mut r = match cached {
                 Some(mut r) => {
@@ -286,12 +286,6 @@ fn exchange(r: &mut BufReader<crate::util::By<UnixStream>>, mut req: &[u8], sent
     let mut buf = vec![0; len];
     r.read_exact(&mut buf)?;
     Ok((code, buf, close))
-}
-
-fn readable(s: &UnixStream) -> bool {
-    use std::os::fd::AsRawFd;
-    let mut p = libc::pollfd { fd: s.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-    unsafe { libc::poll(&mut p, 1, 0) != 0 }
 }
 
 /// At most the last 64 KiB, without the first partial line.
@@ -454,7 +448,7 @@ mod tests {
     }
 
     fn accept(listener: &UnixListener) -> BufReader<UnixStream> {
-        let s = retry(PATIENCE, || Ok(listener.accept()?.0)).unwrap();
+        let s = retry(PATIENCE, Duration::from_millis(1), || Ok(listener.accept()?.0)).unwrap();
         s.set_read_timeout(Some(PATIENCE)).unwrap();
         s.set_write_timeout(Some(PATIENCE)).unwrap();
         BufReader::new(s)
@@ -664,7 +658,7 @@ mod tests {
     fn exit_status_leaves_the_child_unreaped() {
         for (script, want) in [("exit 3", "exit status: 3"), ("kill -9 $$", "signal: 9")] {
             let mut child = Command::new("sh").args(["-c", script]).spawn().unwrap();
-            let st = retry(Duration::from_secs(5), || Ok(exited(&child)?.ok_or("running")?)).unwrap();
+            let st = retry(Duration::from_secs(5), Duration::from_millis(10), || Ok(exited(&child)?.ok_or("running")?)).unwrap();
             assert!(st.to_string().contains(want), "{st}");
             assert!(exited(&child).unwrap().is_some(), "still there to ask again");
             assert!(Path::new(&format!("/proc/{}", child.id())).exists(), "a zombie, its pid not free");

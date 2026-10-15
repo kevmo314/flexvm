@@ -20,8 +20,7 @@
 //!
 //! Rescued copies are kept in memory up to a budget; past it (once the writers
 //! have started), a fault on a PENDING page asks the writers to take that
-//! page's unit next and waits for
-//! them instead.
+//! page's unit next and waits for them instead.
 //!
 //! Discards: the kernel zaps a page right after the pager reads the REMOVE
 //! event, so the pager never reads one while pages are PENDING. It probes
