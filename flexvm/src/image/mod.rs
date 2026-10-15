@@ -22,7 +22,7 @@ use crate::guest;
 use crate::host::flock;
 use crate::template::interrupted;
 use crate::util::{cpath, is_nonce, nonce, stat_at};
-use crate::util::{ms, rename_noreplace, sync_dir, Result};
+use crate::util::{ms, rename_noreplace, run_until, sync_dir, Result};
 use registry::sha256_hex;
 pub use unpack::Limits;
 use unpack::{check, open_at, Root};
@@ -220,6 +220,17 @@ fn read_logs(vsock: &Path) -> Result<Vec<u8>> {
     bail!("guest closed the connection while sending logs")
 }
 
+/// Takes `lock` once its holder lets go, unless `stop` fails first (an interrupted build).
+fn wait_lock(lock: &File, stop: impl Fn() -> Result<()>) -> Result<()> {
+    loop {
+        stop()?;
+        match flock(lock, libc::LOCK_EX | libc::LOCK_NB) {
+            Err(e) if e.raw_os_error() == Some(libc::EWOULDBLOCK) => std::thread::sleep(Duration::from_millis(100)),
+            res => return Ok(res?),
+        }
+    }
+}
+
 fn entry_complete(cached: &Path) -> bool {
     ["ext4", "conf", "ok"].iter().all(|ext| cached.with_extension(ext).is_file())
 }
@@ -238,7 +249,7 @@ fn cached_rootfs(cached: &Path, build: impl FnOnce(&Path) -> Result<String>, syn
             return Err(e.into());
         }
         crate::log!("image: waiting for another build of {}", cached.display());
-        flock(&lock, libc::LOCK_EX)?;
+        wait_lock(&lock, interrupted)?;
     }
     let marked = match std::fs::symlink_metadata(cached.with_extension("ok")) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
@@ -452,8 +463,7 @@ impl Drop for Work<'_> {
     }
 }
 
-/// Removes the trees (and locks) of builds that are gone: their lock free or missing, or,
-/// named by pid before builds took locks, their process gone.
+/// Removes the trees (and locks) of builds that are gone: their lock free or missing.
 fn sweep_staging(staging: &OwnedFd) -> Result<()> {
     let _l = staging_lock(staging, libc::LOCK_EX)?;
     let fd = staging.as_raw_fd();
@@ -461,13 +471,11 @@ fn sweep_staging(staging: &OwnedFd) -> Result<()> {
         let name = entry?.file_name();
         let Some(id) = name.to_str().and_then(|n| n.strip_prefix("rootfs-")) else { continue };
         let id = id.strip_suffix(".lock").unwrap_or(id);
-        let dead = if is_nonce(id) {
-            let lock = cpath(Path::new(&format!("rootfs-{id}.lock")))?;
-            !open_at(fd, &lock, libc::O_RDONLY | libc::O_NOFOLLOW).is_ok_and(|f| flock(&File::from(f), libc::LOCK_EX | libc::LOCK_NB).is_err())
-        } else {
-            id.parse::<u32>().is_ok_and(|pid| !Path::new(&format!("/proc/{pid}")).exists())
-        };
-        if dead {
+        if !is_nonce(id) {
+            continue;
+        }
+        let lock = cpath(Path::new(&format!("rootfs-{id}.lock")))?;
+        if !open_at(fd, &lock, libc::O_RDONLY | libc::O_NOFOLLOW).is_ok_and(|f| flock(&File::from(f), libc::LOCK_EX | libc::LOCK_NB).is_err()) {
             crate::log!("image: removing staging {}, left by a build that did not finish", name.to_string_lossy());
             if let Err(e) = unpack::remove_at(fd, &cpath(Path::new(&name))?) {
                 crate::log!("image: removing staging {}: {e}", name.to_string_lossy());
@@ -497,8 +505,11 @@ fn build_rootfs(staging: &Path, img: &source::Image, app: &App, init: &[u8], des
             mkfs(&path, root.entries, dest)?;
             Ok(conf)
         })();
-        if let Err(e) = unpack::remove_at(staging.as_raw_fd(), &cname) {
-            crate::log!("image: removing staging {name}: {e}");
+        // Before a retry; otherwise `work` removes it.
+        if res.is_err() {
+            if let Err(e) = unpack::remove_at(staging.as_raw_fd(), &cname) {
+                crate::log!("image: removing staging {name}: {e}");
+            }
         }
         res
     };
@@ -612,19 +623,17 @@ fn resolve_user(root: &Root, user: &str) -> Result<(u32, u32, String, Vec<u32>)>
 
 /// Sized to content and 256-byte inodes plus headroom, rounded up to 2 MiB as virtio-pmem requires.
 fn mkfs(dir: &Path, entries: u64, dest: &Path) -> Result<()> {
-    let du = Command::new("du").arg("-sk").arg(dir).output()?;
+    let du = run_until(Command::new("du").arg("-sk").arg(dir), interrupted)?;
     let kib: u64 = String::from_utf8_lossy(&du.stdout).split_whitespace().next().and_then(|s| s.parse().ok()).ok_or("du failed")?;
     let inodes = entries * 12 / 10 + 4096;
     let mib = ((kib + inodes / 4) * 12 / 10 / 1024 + 64).div_ceil(2) * 2;
     // mkfs writes through our descriptor, so the name cannot be swapped for a symlink.
     let image = create_new(dest)?;
     image.set_len(mib << 20)?;
-    let out = Command::new("mkfs.ext4")
-        .args(["-q", "-F", "-b", "4096", "-I", "256", "-L", "flexroot", "-N", &inodes.to_string(), "-d"])
-        .arg(dir)
-        .arg(format!("/proc/{}/fd/{}", std::process::id(), image.as_raw_fd()))
-        .output()
-        .map_err(|e| format!("mkfs.ext4: {e}"))?;
+    let mut cmd = Command::new("mkfs.ext4");
+    cmd.args(["-q", "-F", "-b", "4096", "-I", "256", "-L", "flexroot", "-N", &inodes.to_string(), "-d"]);
+    cmd.arg(dir).arg(format!("/proc/{}/fd/{}", std::process::id(), image.as_raw_fd()));
+    let out = run_until(&mut cmd, interrupted).map_err(|e| format!("mkfs.ext4: {e}"))?;
     if !out.status.success() {
         bail!("mkfs.ext4 failed: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
@@ -686,6 +695,26 @@ mod tests {
     }
 
     #[test]
+    fn lock_waits_end_when_interrupted() {
+        let d = tmpdir("lock-wait");
+        let open = || File::options().write(true).create(true).truncate(false).open(d.join("key.lock")).unwrap();
+        let (held, waiting) = (open(), open());
+        flock(&held, libc::LOCK_EX).unwrap();
+        let calls = std::cell::Cell::new(0);
+        let start = Instant::now();
+        let stop = || match calls.replace(calls.get() + 1) {
+            3 => Err("interrupted".into()),
+            _ => Ok(()),
+        };
+        assert_eq!(wait_lock(&waiting, stop).unwrap_err().to_string(), "interrupted");
+        assert!(start.elapsed() < Duration::from_secs(5));
+        // Unlocked, not only closed: a child another test forks meanwhile shares the lock until it execs.
+        flock(&held, libc::LOCK_UN).unwrap();
+        wait_lock(&waiting, || Ok(())).unwrap();
+        flock(&waiting, libc::LOCK_UN).unwrap();
+    }
+
+    #[test]
     fn killed_builds_staging_is_swept() {
         let d = tmpdir("staging-sweep");
         let staging = open_at(libc::AT_FDCWD, &cpath(&d).unwrap(), libc::O_RDONLY | libc::O_DIRECTORY).unwrap();
@@ -700,7 +729,7 @@ mod tests {
         }
         let held = File::open(d.join(format!("rootfs-{live}.lock"))).unwrap();
         flock(&held, libc::LOCK_EX).unwrap();
-        // Named by pid by earlier builds: one gone (above any pid_max), one running (this one).
+        // Named by pid by older builds: no lock says whose (pids are per namespace, and reused), so kept.
         let (gone, running) = ("rootfs-2147483647".to_string(), format!("rootfs-{}", std::process::id()));
         for name in [&gone, &running, &"other".to_string()] {
             std::fs::create_dir(d.join(name)).unwrap();
@@ -710,7 +739,7 @@ mod tests {
             v.sort();
             v
         };
-        let mut want = vec![".lock".to_string(), "other".into(), format!("rootfs-{live}"), format!("rootfs-{live}.lock"), running.clone()];
+        let mut want = vec![".lock".to_string(), "other".into(), format!("rootfs-{live}"), format!("rootfs-{live}.lock"), running.clone(), gone.clone()];
         want.sort();
         {
             let work = Work::new(&staging).unwrap();

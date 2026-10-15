@@ -285,8 +285,7 @@ pub(super) fn sweep_parts(dir: &Path) {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some((hex, id)) = name.to_str().and_then(|n| n.rsplit_once(".part")) else { continue };
-        // A nonce, or a pid from before parts were named by nonce.
-        if (crate::util::is_nonce(id) || id.parse::<u32>().is_ok_and(|p| p > 0)) && hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if crate::util::is_nonce(id) && hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
             let Ok(f) = std::fs::File::open(entry.path()) else { continue };
             if crate::host::flock(&f, libc::LOCK_EX | libc::LOCK_NB).is_ok() {
                 let _ = std::fs::remove_file(entry.path());
@@ -397,8 +396,9 @@ pub(super) mod tests {
         let lock = std::fs::File::open(&live).unwrap();
         crate::host::flock(&lock, libc::LOCK_EX).unwrap();
         sweep_parts(&dir);
-        assert!(!stale.exists() && !dead.exists());
-        assert!(live.exists() && other.exists() && blob.exists());
+        assert!(!dead.exists());
+        // Named by pid by older builds: no lock says whose, so never removed.
+        assert!(stale.exists() && live.exists() && other.exists() && blob.exists());
         // Unlocked, not only closed: a child another test forks meanwhile shares the lock until it execs.
         crate::host::flock(&lock, libc::LOCK_UN).unwrap();
         drop(lock);
