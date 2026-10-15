@@ -36,7 +36,7 @@ pub fn main(host: Host, listener: TcpListener) -> Result<()> {
     eprintln!("flexvm listening on {}", listener.local_addr()?);
     crate::standby::maintain(host.clone());
     crate::gc::periodic(host.clone());
-    let peers = Peers::watch(host.cfg.peers.clone());
+    let peers = Peers::watch(host.clone());
     let host = std::sync::Arc::new(host);
     for conn in listener.incoming() {
         // Everything a request does before it is read, checking its peer
@@ -89,8 +89,9 @@ fn is_peer(peers: &[IpAddr], from: IpAddr) -> bool {
 }
 
 /// The configured peers' addresses, resolved off the request path: at start,
-/// then every `PEER_REFRESH` in the background. A name that fails to resolve
-/// keeps the addresses it last had.
+/// then every `PEER_REFRESH` in the background, from host.json as it is then
+/// (`flexvm config --peer` reaches a running listener). A name that fails to
+/// resolve keeps the addresses it last had.
 #[derive(Clone)]
 struct Peers(Arc<RwLock<Vec<Peer>>>);
 
@@ -100,26 +101,36 @@ type Peer = (String, Vec<IpAddr>);
 const PEER_REFRESH: Duration = Duration::from_secs(30);
 
 impl Peers {
-    fn watch(names: Vec<String>) -> Peers {
-        let peers = Peers(Arc::new(RwLock::new(names.into_iter().map(|n| (n, Vec::new())).collect())));
-        peers.refresh();
+    fn new(names: &[String]) -> Peers {
+        let peers = Peers(Arc::new(RwLock::new(Vec::new())));
+        peers.refresh(names);
+        peers
+    }
+
+    fn watch(host: Host) -> Peers {
+        let peers = Peers::new(&host.config_now().peers);
         let p = peers.clone();
         std::thread::spawn(move || loop {
             std::thread::sleep(PEER_REFRESH);
-            p.refresh();
+            p.refresh(&host.config_now().peers);
         });
         peers
     }
 
-    fn refresh(&self) {
-        let names: Vec<String> = self.0.read().unwrap().iter().map(|(n, _)| n.clone()).collect();
+    fn refresh(&self, names: &[String]) {
         let resolved: Vec<_> = names.iter().map(|n| n.to_socket_addrs().ok().map(|a| a.map(|a| a.ip()).collect::<Vec<_>>())).collect();
         let mut w = self.0.write().unwrap();
-        for ((_, addrs), new) in w.iter_mut().zip(resolved) {
-            if let Some(new) = new {
-                *addrs = new;
-            }
+        let last = |n: &String| w.iter().find(|(o, _)| o == n).map(|(_, a)| a.clone()).unwrap_or_default();
+        *w = names.iter().zip(resolved).map(|(n, new)| (n.clone(), new.unwrap_or_else(|| last(n)))).collect();
+    }
+
+    /// Whether `from` is a peer by the configuration as it is now: changed peers are resolved at once.
+    fn admit(&self, host: &Host, from: IpAddr) -> bool {
+        let names = host.config_now().peers;
+        if !self.0.read().unwrap().iter().map(|(n, _)| n).eq(names.iter()) {
+            self.refresh(&names);
         }
+        is_peer(&self.addrs(), from)
     }
 
     fn addrs(&self) -> Vec<IpAddr> {
@@ -136,8 +147,12 @@ pub fn activated() -> Option<TcpListener> {
 fn handle(host: &Host, peers: &Peers, mut conn: TcpStream, deadline: Instant) -> Result<()> {
     // Peers are authenticated by address only: the network between them is trusted.
     let from = conn.peer_addr()?.ip();
-    if !is_peer(&peers.addrs(), from) {
-        bail!("{from} is not a peer of this host (flexvm listen --peer)");
+    if !peers.admit(host, from) {
+        // Told why, not just hung up on; its request is read first (briefly), so closing does not reset the reply.
+        let e = format!("{from} is not a peer of {} (add it there: flexvm config --peer)", conn.local_addr()?);
+        let _ = read_line_by(&conn, deadline.min(Instant::now() + Duration::from_secs(1)));
+        let _ = send_json(&mut conn, &json!({"ok": false, "error": e}));
+        bail!("{e}");
     }
     let line = read_line_by(&conn, deadline)?;
     let req: Value = serde_json::from_slice(&line)?;
@@ -384,19 +399,42 @@ mod tests {
     #[test]
     fn an_ipv4_peer_on_a_dual_stack_socket_is_a_peer() {
         let peers = vec!["10.1.0.2:7070".to_string(), "[2001:db8::2]:7070".to_string()];
-        let peers = Peers::watch(peers).addrs();
+        let peers = Peers::new(&peers).addrs();
         for from in ["10.1.0.2", "::ffff:10.1.0.2", "2001:db8::2"] {
             assert!(is_peer(&peers, from.parse().unwrap()), "{from}");
         }
         for from in ["10.1.0.3", "::ffff:10.1.0.3", "::1", "2001:db8::3"] {
             assert!(!is_peer(&peers, from.parse().unwrap()), "{from}");
         }
-        assert!(is_peer(&Peers::watch(vec!["[::ffff:10.1.0.2]:7070".to_string()]).addrs(), "10.1.0.2".parse().unwrap()));
+        assert!(is_peer(&Peers::new(&["[::ffff:10.1.0.2]:7070".to_string()]).addrs(), "10.1.0.2".parse().unwrap()));
         // Unresolvable now: kept as last resolved.
-        let p = Peers::watch(vec!["10.1.0.2:7070".to_string()]);
+        let p = Peers::new(&["10.1.0.2:7070".to_string()]);
         p.0.write().unwrap()[0].0 = "no-such-host.invalid:7070".into();
-        p.refresh();
+        p.refresh(&["no-such-host.invalid:7070".to_string()]);
         assert!(is_peer(&p.addrs(), "10.1.0.2".parse().unwrap()));
+        // A peer no longer configured is not one.
+        p.refresh(&[]);
+        assert!(!is_peer(&p.addrs(), "10.1.0.2".parse().unwrap()));
+    }
+
+    #[test]
+    fn a_running_listener_takes_peers_configured_since() {
+        let root = std::env::temp_dir().join(format!("flexvm-listen-peers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let running = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let peers = Peers::new(&running.config_now().peers);
+        let from = "10.1.0.9".parse().unwrap();
+        assert!(!peers.admit(&running, from));
+        let mut other = running.clone();
+        let set = |c: &mut crate::host::Config, p: &[&str]| {
+            c.peers = p.iter().map(|p| p.to_string()).collect();
+            Ok(())
+        };
+        other.configure(|c| set(c, &["10.1.0.9:7070"])).unwrap();
+        assert!(peers.admit(&running, from));
+        other.configure(|c| set(c, &[])).unwrap();
+        assert!(!peers.admit(&running, from));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
