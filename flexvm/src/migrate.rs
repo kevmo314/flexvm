@@ -111,16 +111,16 @@ impl Proc {
         // Made now, not in the hold right before the pause.
         self.holder();
         // Lent durably first: a crash with the outcome unknown must not hand the address out.
-        self.lent_here.fetch_or(self.host.lend(&self.host.lock()?, vm.ip, gen)?, Ordering::SeqCst);
+        self.lent_here.fetch_or(self.host.lend(&self.host.lock()?, vm.ip, gen, mig, to)?, Ordering::SeqCst);
         self.drop_held_in();
         self.set_leaving(true);
         if let Err(e) = vm.leave(State::Source(mig)) {
             self.set_leaving(false);
-            if self.lent_here.load(Ordering::SeqCst) {
-                match self.host.lock().and_then(|l| self.host.unlend(&l, vm.ip, gen)) {
-                    Ok(()) => self.lent_here.store(false, Ordering::SeqCst),
-                    Err(r) => crate::log!("vm {}: undoing its loan after a refused migration: {r}", vm.name),
-                }
+            // Leaving and its own loan undone in one write.
+            let unlend = self.lent_here.load(Ordering::SeqCst).then_some(gen);
+            match self.host.lock().and_then(|l| self.host.stay(&l, vm.ip, unlend)) {
+                Ok(()) => self.lent_here.store(false, Ordering::SeqCst),
+                Err(r) => crate::log!("vm {}: marking it here again and undoing its loan after a refused migration: {r}", vm.name),
             }
             return Err(e);
         }
@@ -290,11 +290,12 @@ impl Proc {
         // Running here again, so do the collapse pass and prefetch the save cut short.
         vm.back_here();
         self.release_app_log();
-        if self.lent_here.load(Ordering::SeqCst) {
-            match self.host.unlend(&l, vm.ip, gen) {
-                Ok(()) => self.lent_here.store(false, Ordering::SeqCst),
-                Err(r) => crate::log!("vm {}: undoing its loan after an aborted migration: {r}", vm.name),
-            }
+        // Leaving and its own loan undone in one write: a crash leaves both (settled
+        // through its target, `withdraw_dead`) or neither.
+        let unlend = self.lent_here.load(Ordering::SeqCst).then_some(gen);
+        match self.host.stay(&l, vm.ip, unlend) {
+            Ok(()) => self.lent_here.store(false, Ordering::SeqCst),
+            Err(r) => crate::log!("vm {}: marking it here again and undoing its loan after an aborted migration: {r}", vm.name),
         }
         // Past the revision its target took (and may have announced, if it committed).
         if let Err(r) = self.advance(&l, 2) {
@@ -365,7 +366,15 @@ impl Proc {
                 }
             }
             let op = p.op();
-            let _ = peer_call(&to, json!({"op": "migration", "mig": mig, "done": true}));
+            // Decided here durably first: once the target forgets its record, the
+            // migration would read as aborted there (`Host::hand_off`).
+            match p.host.lock().and_then(|l| p.host.hand_off(&l, p.vm().ip)) {
+                Ok(()) => drop(peer_call(&to, json!({"op": "migration", "mig": mig, "done": true}))),
+                Err(e) => crate::log!(
+                    "vm {}: recording that {to} has it: {e}; {to} is not told it is done, so it keeps its record for this host to ask about",
+                    p.vm().name
+                ),
+            }
             p.finish(&op, End::Moved(to), 0, None)
         });
     }
@@ -664,7 +673,7 @@ impl Proc {
         t.mark("template");
         // The source's next revision: past it, its resume after an abort outranks this location.
         let rev = req["rev"].as_u64().ok_or("missing rev")?.saturating_add(1);
-        let claim = self.host.claim_incoming(&self.host.lock()?, &name, ip, req["gen"].as_u64().unwrap_or(0), Some(rev))?;
+        let claim = self.host.claim_arrival(&self.host.lock()?, &name, ip, req["gen"].as_u64().unwrap_or(0), rev, mig)?;
         self.set_addr(claim);
         t.mark("claim_ip");
         let idle = self.spawner.take(None)?;
@@ -752,7 +761,7 @@ impl Proc {
                     t.mark("route");
                 }
                 self.arrived.lock().unwrap().as_mut().ok_or("no migration record")?.commit(&l)?;
-                // Only now its revision outranks the source's (`claim_incoming`).
+                // Only now its revision outranks the source's (`claim_arrival`).
                 if let Err(e) = self.advance(&l, 0) {
                     crate::log!("vm {name}: recording its revision: {e}");
                 }

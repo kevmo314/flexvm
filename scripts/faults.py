@@ -5506,6 +5506,78 @@ def late_withdrawal():
     check("late withdrawal: an older one leaves the newer VM alone", r["stale"] and where(n3) == {A: "running"}, (r, where(n3)))
 
 
+def killed_migrated():
+    """#361: a VM process SIGKILLed after its VM migrated (as a panic would end
+    it) never withdraws the address: a sweep on its host does, so its home host
+    takes back the loan and the peers drop their route. One suspended after
+    migrating keeps its address through the sweep and resumes with it."""
+    lent = lambda ip: addr(A, ip).get("lent")
+    route = lambda ip: subprocess.run(["ip", "route", "show", ip], capture_output=True, text=True).stdout.strip()
+    n = "ft-killed-migrated"
+    m = setup(n, mib=1)
+    ip = vms(A)[n]["ip"]
+    ok(migrate(A, n, B))
+    wait_released(B, n)
+    check("killed migrated: lent while away", lent(ip) is not None, addr(A, ip))
+    check("killed migrated: A routes it via B", wait_for(lambda: addr(A, ip).get("via") is not None, 10), addr(A, ip))
+    check("killed migrated: md5 intact on B", md5(B, n) == m)
+    pid, fc = vm_pid(B, n), fc_pid(B, n)
+    os.kill(pid, signal.SIGKILL)
+    check("killed migrated: its process and firecracker die", wait_for(lambda: not alive(pid) and not alive(fc), 10), (pid, fc))
+    ok(cli_json(B, "debug", "gc"))
+    check("killed migrated: B withdrew it", addr(B, ip).get("withdrawn") is True and addr(B, ip).get("holder") is None, addr(B, ip))
+    check("killed migrated: A takes back its loan and drops the route",
+          wait_for(lambda: not lent(ip) and addr(A, ip).get("withdrawn") is True and addr(A, ip).get("via") is None, 15), addr(A, ip))
+    check("killed migrated: no route left", wait_for(lambda: route(ip) == "", 10), route(ip))
+    n2 = "ft-killed-migrated-2"
+    ok(run(A, n2, ip=ip))
+    check("killed migrated: the address runs a new vm on A", where(n2) == {A: "running"} and sh(A, n2, "echo hi") == (0, "hi"), where(n2))
+    ok(cli_json(A, "debug", "gc"))
+    check("killed migrated: a sweep leaves a live vm's address alone", addr(A, ip).get("holder") == n2 and not addr(A, ip).get("withdrawn"), addr(A, ip))
+    cleanup(n2)
+    # Suspended after migrating: its process is gone, but its checkpoint keeps the address.
+    n3 = "ft-suspended-migrated"
+    m3 = setup(n3, mib=1)
+    ip3 = vms(A)[n3]["ip"]
+    ok(migrate(A, n3, B))
+    wait_released(B, n3)
+    suspend(B, n3)
+    ok(cli_json(B, "debug", "gc"))
+    check("suspended migrated: still lent, still B's", lent(ip3) is not None and addr(B, ip3).get("holder") == n3 and not addr(B, ip3).get("withdrawn"),
+          (addr(A, ip3), addr(B, ip3)))
+    ok(resume_suspended(B, n3))
+    check("suspended migrated: resumes on B with its data", where(n3) == {B: "running"} and md5(B, n3) == m3, where(n3))
+    cleanup(n3)
+    check("suspended migrated: its kill frees the address", wait_for(lambda: not lent(ip3), 15), addr(A, ip3))
+    # A home host that cannot be told at the time (down) hears on a later sweep: the withdrawal is recorded first.
+    n4 = "ft-killed-migrated-4"
+    setup(n4, mib=1)
+    ip4 = vms(A)[n4]["ip"]
+    ok(migrate(A, n4, B))
+    wait_released(B, n4)
+    pid, fc = vm_pid(B, n4), fc_pid(B, n4)
+    fault(A, "route_refuse", 60000)
+    os.kill(pid, signal.SIGKILL)
+    wait_for(lambda: not alive(pid) and not alive(fc), 10)
+    ok(cli_json(B, "debug", "gc"))
+    notice = os.path.join(B.state, "withdrawals", ip4)
+    check("killed migrated, home down: withdrawn on B, still lent on A, the notice kept",
+          addr(B, ip4).get("withdrawn") is True and lent(ip4) is not None and os.path.exists(notice), (addr(A, ip4), addr(B, ip4)))
+    fault(A, "route_refuse", 0)
+    # As a sweep would once its backoff passed.
+    n = json.load(open(notice))
+    for u in n["peers"]:
+        u["next_ms"] = 0
+    json.dump(n, open(notice, "w"))
+    ok(cli_json(B, "debug", "gc"))
+    check("killed migrated, home back: a later sweep tells it, and it takes back its loan",
+          wait_for(lambda: not lent(ip4) and addr(A, ip4).get("withdrawn") is True, 15) and not os.path.exists(notice), (addr(A, ip4), os.path.exists(notice)))
+    n5 = "ft-killed-migrated-5"
+    ok(run(A, n5, ip=ip4))
+    check("killed migrated, home back: the address runs a new vm on A", where(n5) == {A: "running"}, where(n5))
+    cleanup(n5)
+
+
 def incoming_killed():
     """An incoming VM process SIGKILLed after it took the name and address
     (no cleanup runs): both are free again for the next taker once its
@@ -7026,6 +7098,7 @@ def uffd_err():
 
 
 SCENARIOS = dict(
+    killed_migrated=killed_migrated,
     unread_output=unread_output,
     run_status=run_status,
     terminal=terminal,
