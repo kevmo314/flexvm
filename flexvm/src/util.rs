@@ -378,9 +378,16 @@ fn sync_ancestors_with(dir: &Path, seen: &mut Seen, sync: &mut impl FnMut(&std::
     walk_up(open_dir(&dir).map_err(named)?.as_raw_fd(), seen, sync).map_err(named)
 }
 
-/// The directory holding each symlink `path` resolves through, then the links in its target.
+/// Every directory prefix and its physical ancestors, then the links in each link's target.
 fn sync_links(path: &Path, seen: &mut Seen, sync: &mut impl FnMut(&std::fs::File) -> io::Result<()>) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
+    for prefix in path.ancestors().skip(1) {
+        let dir = open_dir(prefix)?;
+        if seen.insert((dir_id(dir.as_raw_fd())?, None)) {
+            sync(&dir)?;
+            walk_up(dir.as_raw_fd(), seen, sync)?;
+        }
+    }
     for (link, m) in path.ancestors().filter_map(|p| Some((p, std::fs::symlink_metadata(p).ok().filter(|m| m.is_symlink())?))) {
         let at = link.parent().unwrap_or(Path::new("/"));
         let holder = open_dir(at)?;
@@ -909,6 +916,15 @@ mod tests {
             assert!(synced.contains(&id(&root.join(d))), "{d}: {synced:?}");
         }
         assert_eq!(walk(&root.join("p/l1/b"), &mut seen).unwrap(), []);
+
+        // A link target walks through directories that ".." then leaves behind.
+        std::fs::create_dir_all(root.join("q/inner")).unwrap();
+        std::os::unix::fs::symlink("../q/inner/../../real/a", root.join("p/link")).unwrap();
+        let synced = walk(&root.join("p/link/b"), &mut Default::default()).unwrap();
+        for d in ["p", "q", "q/inner", "real/a", "real"] {
+            assert!(synced.contains(&id(&root.join(d))), "{d}: {synced:?}");
+        }
+        assert_eq!(synced.len(), synced.iter().collect::<std::collections::HashSet<_>>().len());
 
         // From a pinned directory, a swapped-in path is never followed.
         let pinned = std::fs::File::open(root.join("real/a/b")).unwrap();
