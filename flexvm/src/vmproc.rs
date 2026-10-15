@@ -886,8 +886,9 @@ impl Proc {
         let _ = (|| -> Result<()> {
             if req["action"] == "close" {
                 g.get_ref().set_read_timeout(Some(Duration::from_secs(2)))?;
-                let closed = matches!(guest::read_frame(&mut g)?, Some((guest::FRAME_MSG, data)) if data == b"closed");
-                return Ok(send_json(&mut w, &json!({"ok": closed, "error": "session close failed"}))?);
+                let reply = guest::read_frame(&mut g)?.map(|(_, m)| String::from_utf8_lossy(&m).into_owned());
+                let closed = reply.as_deref() == Some("closed");
+                return Ok(send_json(&mut w, &json!({"ok": closed, "error": format!("session close failed: {}", reply.unwrap_or_default())}))?);
             }
             if req["session"].is_string() {
                 // The guest heartbeats every second; silence means the VM moved.
@@ -895,7 +896,23 @@ impl Proc {
             }
             send_json(&mut w, &json!({"ok": true}))?;
             if let Some(id) = &once {
-                let code = guest::exec_output(&mut g, id, |kind, data| Ok(guest::write_frame(&mut w, kind, data)?))?;
+                // Without the id no one can reattach: a command whose client hung up is stopped
+                // (a silent command's heartbeats never reach the client, so writes cannot tell).
+                let done = Arc::new(AtomicBool::new(false));
+                let watch = (c.try_clone()?, done.clone(), vm.vsock.clone(), id.clone());
+                thread::spawn(move || {
+                    let (c, done, vsock, id) = watch;
+                    while !done.load(Ordering::Acquire) {
+                        let mut p = libc::pollfd { fd: std::os::fd::AsRawFd::as_raw_fd(&c), events: 0, revents: 0 };
+                        if unsafe { libc::poll(&mut p, 1, 1000) } > 0 && p.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+                            let _ = guest::close(&vsock, &id, Instant::now() + guest::TIMEOUT);
+                            return;
+                        }
+                    }
+                });
+                let code = guest::exec_output(&mut g, id, |kind, data| Ok(guest::write_frame(&mut w, kind, data)?));
+                done.store(true, Ordering::Release);
+                let code = code?;
                 guest::write_frame(&mut w, guest::FRAME_EXIT, &code.to_le_bytes())?;
                 return guest::close(&vm.vsock, id, Instant::now() + guest::TIMEOUT);
             }

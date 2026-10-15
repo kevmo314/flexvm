@@ -788,6 +788,67 @@ def guest_calls():
     cleanup(n)
 
 
+def exec_background():
+    """An exec whose command leaves a background process holding its output returns once the
+    shell exits (the process keeps running), and such execs never use up the guest agent's 64
+    session slots; nor do interrupted ones (SIGINT stops the command) or session-less ones whose
+    client went away."""
+    n = "ft-exec-bg"
+    ok(run(A, n))
+    # Processes whose command line starts with `cmd` (the ^ keeps grep from counting itself).
+    count = lambda cmd: sh(A, n, f"for f in /proc/[0-9]*/cmdline; do tr '\\0' ' ' <$f; echo; done | grep -c '^{cmd} ' || :")
+    t = time.time()
+    r = sh(A, n, "echo started; sleep 1000 &")
+    took = time.time() - t
+    check("exec bg: returns once the shell exits", r == (0, "started") and took < 15, (r, took))
+    check("exec bg: the background process keeps running", count("sleep 1000") == (0, "1"), count("sleep 1000"))
+    results = []
+
+    def worker():
+        for _ in range(7):
+            results.append(sh(A, n, "sleep 1000 &"))
+
+    workers = [threading.Thread(target=worker) for _ in range(10)]
+    for w in workers:
+        w.start()
+    for w in workers:
+        w.join()
+    bad = [r for r in results if r != (0, "")]
+    check("exec bg: 70 more such execs all return", len(results) == 70 and not bad, bad[:3])
+    check("exec bg: execs still start after them", sh(A, n, "echo hi") == (0, "hi"))
+    interrupted = []
+    for _ in range(70):
+        p = subprocess.Popen([BIN, "--state", A.state, "--run", A.run, "exec", n, "echo ready; sleep 1001; echo after"],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=ENV)
+        line = p.stdout.readline().strip()
+        p.send_signal(signal.SIGINT)
+        try:
+            _, err = p.communicate(timeout=15)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            _, err = p.communicate()
+        interrupted.append((line, p.returncode, err.strip()[-200:]))
+    bad = [r for r in interrupted if r[:2] != ("ready", 130) or r[2]]
+    check("exec bg: 70 interrupted execs end at once with 130", not bad, bad[:3])
+    stopped = wait_for(lambda: count("sleep 1001") == (0, "0"), 10)
+    check("exec bg: an interrupted exec's command is stopped", stopped, count("sleep 1001"))
+    check("exec bg: execs still start after the interrupted ones", sh(A, n, "echo hi") == (0, "hi"))
+    with socket.socket(socket.AF_UNIX) as s:
+        s.settimeout(30)
+        s.connect(os.path.join(A.run, "vms", f"{n}.sock"))
+        s.sendall((json.dumps({"op": "exec", "cmd": "echo ready; sleep 1002"}) + "\n").encode())
+        buf = b""
+        while b"ready" not in buf:
+            d = s.recv(65536)
+            if not d:
+                break
+            buf += d
+    check("exec bg: a session-less exec started", b"ready" in buf, buf[-200:])
+    stopped = wait_for(lambda: count("sleep 1002") == (0, "0"), 10)
+    check("exec bg: a session-less exec's command stops when its client goes", stopped, count("sleep 1002"))
+    cleanup(n)
+
+
 def guest_hang():
     """A guest that never answers its agent (Firecracker stopped) must not
     hold anything forever: execs fail within their deadline, and once it is
@@ -6049,7 +6110,7 @@ SCENARIOS = dict(
     cow_grow=no_evict(cow_grow), plug_race=no_evict(plug_race), shrink_stall=no_evict(shrink_stall), plug_storm=no_evict(plug_storm),
     basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, refused=refused, pages_blip=pages_blip,
     pages_dead_restore=pages_dead_restore, pages_dead=pages_dead, resume_kill=resume_kill, prepared_retry=prepared_retry,
-    quiet_source=quiet_source, exec_race=exec_race, guest_calls=guest_calls, guest_hang=guest_hang,
+    quiet_source=quiet_source, exec_race=exec_race, guest_calls=guest_calls, exec_background=exec_background, guest_hang=guest_hang,
     source_killed=source_killed, target_killed=target_killed, abort_superseded=abort_superseded, gen_zero=gen_zero,
     checkpoint_restore=checkpoint_restore, checkpoint_fork=checkpoint_fork, checkpoint_corrupt=checkpoint_corrupt,
     checkpoint_crash=checkpoint_crash, pause_resume=pause_resume, signals=signals, pause_lost=pause_lost, suspend_resume=suspend_resume,

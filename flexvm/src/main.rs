@@ -705,11 +705,48 @@ impl Session {
 
 /// Reattaches when the connection drops (a checkpoint's pause resets vsock).
 pub fn exec(host: &Host, name: &str, cmd: &str) -> Result<i32> {
-    let session = Session::new()?;
-    let id = session.id.clone();
-    let code = exec_session(host, name, cmd, &Mutex::new(session), false)?;
+    let session: &'static Mutex<Session> = Box::leak(Box::new(Mutex::new(Session::new()?)));
+    let id = session.lock().unwrap().id.clone();
+    let close = {
+        let (host, name, id) = (host.clone(), name.to_string(), id.clone());
+        move || -> Result<()> {
+            let c = vmproc::connect(&host, &name, &json!({"op": "exec", "session": id, "action": "close"}), &[], Instant::now() + Duration::from_secs(5))?;
+            c.set_read_timeout(Some(Duration::from_secs(5)))?;
+            match recv_json(&mut BufReader::new(c))? {
+                Some(r) if r["ok"] == json!(true) => Ok(()),
+                Some(r) => Err(r["error"].as_str().unwrap_or("session close failed").into()),
+                None => Err("vm hung up".into()),
+            }
+        }
+    };
+    // Interrupted, the command is stopped: left running, it would hold one of the guest's session slots.
+    let set = util::block_signals(&[libc::SIGINT, libc::SIGTERM, libc::SIGHUP]);
+    let (stop, vm) = (close.clone(), name.to_string());
+    std::thread::spawn(move || {
+        let sig = util::wait_signal(&set);
+        // A second one ends flexvm at once.
+        unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut()) };
+        // Held until exit, so the stopped command's status is not reported; not waited for long, as
+        // a write to a stalled stdout holds it.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let _s = loop {
+            match session.try_lock() {
+                Ok(s) => break Some(s),
+                Err(std::sync::TryLockError::Poisoned(e)) => break Some(e.into_inner()),
+                Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+                Err(_) => break None,
+            }
+        };
+        if let Err(e) = stop() {
+            let e = e.to_string();
+            let why = if e.contains("session still running") { "its guest agent is too old to stop it; rebuild the rootfs" } else { &e };
+            log!("flexvm: the command may still be running in vm {vm}: {why}");
+        }
+        std::process::exit(128 + sig);
+    });
+    let code = exec_session(host, name, cmd, session, false)?;
     // Best effort: the guest closes it a minute after its client leaves anyway.
-    let _ = vmproc::connect(host, name, &json!({"op": "exec", "session": id, "action": "close"}), &[], Instant::now() + Duration::from_secs(5));
+    let _ = close();
     Ok(code)
 }
 

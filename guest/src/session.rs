@@ -1,5 +1,8 @@
 //! Resumable commands: `SESSION <id> <len>` (then `len` bytes of shell command), `ATTACH <id> <offset>`,
 //! `CLOSE <id>`. Output frames start with their stream offset (u64 LE); the exit frame is offset plus code.
+//! The command runs in a process group of its own; its exit is the shell's, recorded once output stops or
+//! `DRAIN` after the shell exits (background processes may keep its pipes open). Closing a running
+//! session kills its process group; closing an unknown one leaves a tombstone, so a start in flight never runs.
 //! At most `MAX_LIVE` sessions are live; closed ones leave a tombstone so a delayed `SESSION` retry cannot
 //! rerun the command. Rings keep `BASE` bytes and grow towards `CAPACITY` from a shared pool: at most
 //! `MAX_LIVE * BASE + POOL` (plus a partial `BLOCK` each). One attachment per session; a new one shuts the
@@ -8,7 +11,8 @@ use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::hash::{BuildHasher, BuildHasherDefault};
 use std::io::{self, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
@@ -16,7 +20,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::proto::{valid_session_id, FRAME_EXIT, FRAME_LOST, FRAME_MSG, FRAME_STDERR, FRAME_STDOUT, MAX_BODY};
-use crate::{fail, msg, spawn, wait_pid, write_frame, Statuses};
+use crate::{fail, msg, spawn_watched, wait_pid, write_frame, Statuses};
 
 const CAPACITY: usize = 4 * 1024 * 1024;
 const MAX_CHUNKS: usize = 4096;
@@ -32,6 +36,8 @@ const RETENTION: Duration = Duration::from_secs(300);
 const GRACE: Duration = Duration::from_secs(30);
 /// A finished session whose client has been gone this long (the CLI gives up after 30 s) becomes a tombstone.
 const ABANDONED: Duration = Duration::from_secs(60);
+/// Output still read after the shell exits, as for the app.
+const DRAIN: Duration = Duration::from_secs(2);
 
 type Session = Arc<(Mutex<Output>, Condvar)>;
 pub type Sessions = Arc<Mutex<Table>>;
@@ -56,6 +62,8 @@ struct Entry {
     /// Recognises a retried SESSION without keeping the command; ids are random, so this is only a check.
     command: (usize, u64),
     output: Session,
+    /// The command's process group (its shell's pid).
+    group: i32,
 }
 
 fn fingerprint(command: &[u8]) -> (usize, u64) {
@@ -301,28 +309,29 @@ fn open<'a>(body: &[u8], conn: Option<File>, line: &'a str, sessions: &Sessions,
             let command = std::str::from_utf8(command).map_err(io::Error::other)?;
             let output = session(table.new_output());
             // Start the pump first: if no thread can be had, nothing has run yet.
-            let (tx, rx) = mpsc::sync_channel::<Child>(1);
+            let (tx, rx) = mpsc::sync_channel::<(Child, Option<OwnedFd>)>(1);
             let (pumped, statuses_) = (output.clone(), statuses.clone());
             thread::Builder::new()
                 .spawn(move || {
-                    if let Ok(mut child) = rx.recv() {
-                        crate::pump(child.stdout.take(), child.stderr.take(), |kind, data| deliver(&pumped, kind, data));
+                    if let Ok((mut child, exited)) = rx.recv() {
+                        crate::pump_until(child.stdout.take(), child.stderr.take(), exited, DRAIN, |kind, data| deliver(&pumped, kind, data));
                         pumped.0.lock().unwrap().exit = wait_pid(&statuses_, child.id() as i32, None);
                         pumped.1.notify_all();
                     }
                 })
                 .map_err(|e| io::Error::new(e.kind(), format!("cannot start session thread: {e}")))?;
             let mut cmd = Command::new("/bin/sh");
-            cmd.args(["-c", command]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+            cmd.args(["-c", command]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
             if let Some(work) = crate::mem::work_procs() {
                 crate::mem::enter(&mut cmd, work, false);
             }
             // Minimal images (distroless, scratch) have no shell.
-            let child = spawn(&mut cmd, statuses).map_err(|e| io::Error::new(e.kind(), format!("cannot run /bin/sh: {e} (does the image have a shell?)")))?;
-            table.live.insert(id.to_string(), Entry { command: fingerprint, output: output.clone() });
+            let (child, exited) = spawn_watched(&mut cmd, statuses, true)
+                .map_err(|e| io::Error::new(e.kind(), format!("cannot run /bin/sh: {e} (does the image have a shell?)")))?;
+            table.live.insert(id.to_string(), Entry { command: fingerprint, output: output.clone(), group: child.id() as i32 });
             // Attached before any output, so none is overwritten before it is sent.
             let attached = attach(&output, 0, conn);
-            let _ = tx.send(child);
+            let _ = tx.send((child, exited));
             (id, 0, attached)
         }
         Request::Attach { id, offset } => {
@@ -335,12 +344,16 @@ fn open<'a>(body: &[u8], conn: Option<File>, line: &'a str, sessions: &Sessions,
         Request::Close { id } => {
             let mut table = sessions.lock().unwrap();
             // Closing again (a retried acknowledgement) is fine.
-            if !table.closed.contains_key(id) {
-                if table.live.get(id).ok_or_else(unknown)?.output.0.lock().unwrap().exit.is_none() {
-                    return Err(io::Error::other("session still running"));
-                }
-                table.close(id);
+            match table.live.get(id) {
+                // Its exit is recorded only once output stops, so the group is still there to kill.
+                Some(entry) if entry.group > 0 && entry.output.0.lock().unwrap().exit.is_none() => unsafe {
+                    libc::kill(-entry.group, libc::SIGKILL);
+                },
+                // A start still in flight (a client interrupted at once) must not run.
+                None if !table.closed.contains_key(id) => drop(table.closed.insert(id.to_string(), Instant::now())),
+                _ => {}
             }
+            table.close(id);
             return Ok(None);
         }
     }))
@@ -362,17 +375,26 @@ fn attach(output: &Session, offset: u64, conn: Option<File>) -> Attached {
     (output.clone(), id)
 }
 
-fn deliver(output: &Session, kind: u8, data: &[u8]) {
+/// Returns how long it waited for the client.
+fn deliver(output: &Session, kind: u8, data: &[u8]) -> Duration {
     let mut ring = output.0.lock().unwrap();
+    if ring.closed {
+        return Duration::ZERO;
+    }
     let need = (ring.end - ring.start) as usize + data.len();
     ring.reservation.grow(need);
-    while ring.must_wait() {
+    let start = Instant::now();
+    while ring.must_wait() && !ring.closed {
         ring = output.1.wait_timeout(ring, Duration::from_secs(1)).unwrap().0;
     }
-    let capacity = ring.capacity();
-    ring.push(kind, data, capacity);
+    let waited = start.elapsed();
+    if !ring.closed {
+        let capacity = ring.capacity();
+        ring.push(kind, data, capacity);
+    }
     drop(ring);
     output.1.notify_all();
+    waited
 }
 
 fn drain(w: &mut impl Write, output: &Session, mut offset: u64, me: u64) -> io::Result<()> {
@@ -426,7 +448,7 @@ mod tests {
 
     fn live(table: &mut Table, id: &str, output: Output) -> Session {
         let output = session(Output { reservation: table.new_output().reservation, ..output });
-        table.live.insert(id.to_string(), Entry { command: fingerprint(b"true"), output: output.clone() });
+        table.live.insert(id.to_string(), Entry { command: fingerprint(b"true"), output: output.clone(), group: 0 });
         output
     }
 
@@ -506,7 +528,9 @@ mod tests {
             ("ATTACH 0 0", b"", b"error: session closed"),
             ("CLOSE 0", b"", b"closed"),
             ("ATTACH nope 0", b"", b"error: unknown session"),
-            ("CLOSE nope", b"", b"error: unknown session"),
+            // An interrupted client's start may still be in flight: it must never run.
+            ("CLOSE nope", b"", b"closed"),
+            ("SESSION nope 4", b"true", b"error: session closed"),
         ] {
             assert!(request(&sessions, &statuses, line, body).ends_with(reply), "{line}");
         }
@@ -621,6 +645,59 @@ mod tests {
             detach_and_join(&output, t);
             assert!(output.0.lock().unwrap().chunks.len() <= MAX_CHUNKS);
         }
+    }
+
+    /// Reaps `pid` as PID 1's reaper would, without leaving a reaper thread in the test process.
+    fn reap(statuses: &Statuses, pid: i32) -> i32 {
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        let code = if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { 128 + libc::WTERMSIG(status) };
+        statuses.0.lock().unwrap().insert(pid, Some(code));
+        statuses.1.notify_all();
+        status
+    }
+
+    fn start(sessions: &Sessions, statuses: &Statuses, id: &str, command: &[u8]) -> (Session, i32) {
+        let disconnected = UnixStream::pair().unwrap().0;
+        let _ = handle(disconnected, command, None, &format!("SESSION {id} {}", command.len()), sessions, statuses);
+        let table = sessions.lock().unwrap();
+        (table.live[id].output.clone(), table.live[id].group)
+    }
+
+    #[test]
+    fn exit_is_recorded_while_a_background_process_holds_the_output() {
+        let (sessions, statuses) = (Sessions::default(), statuses());
+        let (output, group) = start(&sessions, &statuses, "bg", b"echo hi; sleep 100 & exit 3");
+        let status = reap(&statuses, group);
+        let ring = output.0.lock().unwrap();
+        let (ring, timeout) = output.1.wait_timeout_while(ring, DRAIN * 3, |r| r.exit.is_none()).unwrap();
+        assert!(!timeout.timed_out(), "exit never recorded");
+        assert_eq!((ring.end, ring.exit, libc::WEXITSTATUS(status)), (3, Some(3), 3));
+        drop(ring);
+        // Finished: closing leaves the background process alone.
+        assert!(request(&sessions, &statuses, "CLOSE bg", b"").ends_with(b"closed"));
+        assert_eq!(unsafe { libc::kill(-group, 0) }, 0, "the background process was killed");
+        unsafe { libc::kill(-group, libc::SIGKILL) };
+    }
+
+    #[test]
+    fn closing_a_running_session_kills_its_process_group() {
+        let (sessions, statuses) = (Sessions::default(), statuses());
+        let (output, group) = start(&sessions, &statuses, "run", b"sleep 100 & sleep 100");
+        assert!(request(&sessions, &statuses, "CLOSE run", b"").ends_with(b"closed"));
+        assert!(sessions.lock().unwrap().closed.contains_key("run"));
+        let status = reap(&statuses, group);
+        assert!(libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL);
+        // The background sleep went with it: the group empties.
+        let gone = Instant::now() + Duration::from_secs(5);
+        while unsafe { libc::kill(-group, 0) } == 0 {
+            assert!(Instant::now() < gone, "the background process survived");
+            let mut status = 0;
+            unsafe { libc::waitpid(-group, &mut status, libc::WNOHANG) };
+            thread::sleep(Duration::from_millis(10));
+        }
+        let ring = output.0.lock().unwrap();
+        assert!(output.1.wait_timeout_while(ring, DRAIN * 3, |r| r.exit.is_none()).unwrap().0.exit.is_some());
     }
 
     #[test]

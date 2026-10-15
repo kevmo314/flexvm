@@ -157,13 +157,21 @@ fn reap(statuses: Statuses) {
 }
 
 fn spawn(command: &mut Command, statuses: &Statuses) -> io::Result<Child> {
+    spawn_watched(command, statuses, false).map(|(child, _)| child)
+}
+
+/// With `pidfd`, also a pidfd for the child (None if the kernel has none), opened before the
+/// reaper can reap it, so it never names a reused pid.
+fn spawn_watched(command: &mut Command, statuses: &Statuses, pidfd: bool) -> io::Result<(Child, Option<OwnedFd>)> {
     let (lock, cv) = &**statuses;
     // Held through spawn and registration, even if the child exits at once.
     let mut map = lock.lock().unwrap();
     let child = command.spawn()?;
+    let fd = pidfd.then(|| unsafe { libc::syscall(libc::SYS_pidfd_open, child.id() as libc::pid_t, 0) as RawFd });
+    let fd = fd.filter(|&fd| fd >= 0).map(|fd| unsafe { OwnedFd::from_raw_fd(fd) });
     map.insert(child.id() as i32, None);
     cv.notify_all();
-    Ok(child)
+    Ok((child, fd))
 }
 
 fn wait_pid(statuses: &Statuses, pid: i32, deadline: Option<Instant>) -> Option<i32> {
@@ -183,22 +191,56 @@ fn wait_pid(statuses: &Statuses, pid: i32, deadline: Option<Instant>) -> Option<
 }
 
 fn pump(stdout: Option<ChildStdout>, stderr: Option<ChildStderr>, mut deliver: impl FnMut(u8, &[u8])) {
+    pump_until(stdout, stderr, None, Duration::ZERO, |kind, data| {
+        deliver(kind, data);
+        Duration::ZERO
+    })
+}
+
+/// As `pump`, but once `exited` (a pidfd) is readable, returns after `drain` of pumping:
+/// background processes may hold the pipes open for good. `deliver` returns how long it waited
+/// for its reader, which is not counted.
+fn pump_until(
+    stdout: Option<ChildStdout>,
+    stderr: Option<ChildStderr>,
+    mut exited: Option<OwnedFd>,
+    drain: Duration,
+    mut deliver: impl FnMut(u8, &[u8]) -> Duration,
+) {
     let out = stdout.map(|s| (File::from(OwnedFd::from(s)), FRAME_STDOUT));
     let mut streams: Vec<(File, u8)> = out.into_iter().chain(stderr.map(|s| (File::from(OwnedFd::from(s)), FRAME_STDERR))).collect();
     let mut buf = [0; 16 * 1024];
+    let mut left: Option<Duration> = None;
     while !streams.is_empty() {
         let mut fds: Vec<_> = streams.iter().map(|(f, _)| libc::pollfd { fd: f.as_raw_fd(), events: libc::POLLIN, revents: 0 }).collect();
-        match os(unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) }) {
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(_) => return,
-            Ok(_) => {}
+        if let Some(fd) = &exited {
+            fds.push(libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLIN, revents: 0 });
         }
-        for i in (0..fds.len()).rev().filter(|&i| fds[i].revents != 0) {
-            match streams[i].0.read(&mut buf) {
-                Ok(0) => drop(streams.remove(i)),
-                Ok(n) => deliver(streams[i].1, &buf[..n]),
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(_) => drop(streams.remove(i)),
+        let timeout = left.map_or(-1, |l| l.as_millis().clamp(1, i32::MAX as u128) as i32);
+        let start = Instant::now();
+        let (mut waited, mut fired) = (Duration::ZERO, false);
+        let polled = os(unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) });
+        match polled {
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return,
+            Ok(_) => {
+                if exited.is_some() && fds.pop().is_some_and(|p| p.revents != 0) {
+                    (exited, left, fired) = (None, Some(drain), true);
+                }
+                for i in (0..fds.len()).rev().filter(|&i| fds[i].revents != 0) {
+                    match streams[i].0.read(&mut buf) {
+                        Ok(0) => drop(streams.remove(i)),
+                        Ok(n) => waited += deliver(streams[i].1, &buf[..n]),
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                        Err(_) => drop(streams.remove(i)),
+                    }
+                }
+            }
+        }
+        if let Some(l) = left.as_mut().filter(|_| !fired) {
+            *l = l.saturating_sub(start.elapsed().saturating_sub(waited));
+            if l.is_zero() {
+                return;
             }
         }
     }
