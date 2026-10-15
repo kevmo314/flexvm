@@ -204,7 +204,7 @@ mod tests {
         check(Path::new(&"x".repeat(107))).unwrap();
         for name in ["x".repeat(108), "é".repeat(54), "bad\0path".into()] {
             let error = check(Path::new(&name)).unwrap_err().to_string();
-            assert!(error.contains(&name) && error.contains("108"));
+            assert!(error.contains(&name) && error.contains(&format!("{} bytes", name.len())) && error.contains("108"));
         }
         let t = fixture();
         let deep = t.join("x".repeat(80));

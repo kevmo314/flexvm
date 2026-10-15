@@ -5962,7 +5962,7 @@ def standby_claim_signal():
 
 
 def standby_dir(run, t):
-    """RUN/standby/HASH: HASH as `standby::dir` hashes the template's name (`template::Hash`)."""
+    """RUN/standby/HASH: HASH is 16 hex characters; `standby::dir` hashes the template's name (`template::Hash`)."""
     m, h = (1 << 64) - 1, 0xcbf29ce484222325
 
     def word(w):
@@ -7205,7 +7205,7 @@ def gc_debris():
     orphan, fresh = made(os.path.join(vd, "ft-gc-orphan.log"), old), made(os.path.join(vd, "ft-gc-fresh.log"))
     sbd = standby_dir(A.run, args.template)
     os.makedirs(sbd, exist_ok=True)
-    sock = made(os.path.join(sbd, "deadbeef.999999990-1.sock"))
+    sock = made(os.path.join(sbd, "999999990.sock"))
     ok(cli_json(A, "debug", "gc"))
     gone = lambda p: not os.path.exists(p)
     check("gc: an old .moved marker goes, a recent one stays", gone(moved) and not gone(moved_new))
