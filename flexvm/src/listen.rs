@@ -22,23 +22,38 @@ use crate::util::{send_json, Result, Slot};
 /// Requests handled at once; more connections are closed unanswered.
 const MAX_ACTIVE: usize = 512;
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
-/// Unknown addresses held while a peer's name is looked up, in all and from
-/// any one address (a peer's restart backlog can hold a few of its requests);
-/// more are refused at once. One source cannot take them all; many at once
-/// still can, each for `ADMIT_WAIT`.
+/// Unknown addresses held while a peer's name with no addresses yet is
+/// looked up, in all and from any one address (a peer's restart backlog can
+/// hold a few of its requests); more are refused at once. One source cannot
+/// take them all; many at once still can, each for `ADMIT_WAIT`.
 const MAX_WAITING: usize = 64;
 const MAX_WAITING_FROM: usize = 4;
+/// Unknown addresses held while a name that has addresses is looked up again
+/// (a peer by name may be back on a new one, #311): a budget of its own, so
+/// non-peers, which always find such a lookup to wait for, never take the
+/// one above. A peer they keep out is still looked up at once, and gets in
+/// on its sender's retry (`vmproc::tell`).
+const MAX_MOVED: usize = 4;
+const MAX_MOVED_FROM: usize = 1;
 
-#[derive(Clone, Default)]
-struct Waiting(Arc<Mutex<HashMap<IpAddr, usize>>>);
+#[derive(Clone)]
+struct Waiting {
+    held: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    max: usize,
+    max_from: usize,
+}
 
 struct Wait(Waiting, IpAddr);
 
 impl Waiting {
+    fn new(max: usize, max_from: usize) -> Waiting {
+        Waiting { held: Arc::default(), max, max_from }
+    }
+
     fn take(&self, from: IpAddr) -> Option<Wait> {
         let from = from.to_canonical();
-        let mut w = self.0.lock().unwrap();
-        if w.values().sum::<usize>() >= MAX_WAITING || w.get(&from).is_some_and(|&n| n >= MAX_WAITING_FROM) {
+        let mut w = self.held.lock().unwrap();
+        if w.values().sum::<usize>() >= self.max || w.get(&from).is_some_and(|&n| n >= self.max_from) {
             return None;
         }
         *w.entry(from).or_default() += 1;
@@ -48,7 +63,7 @@ impl Waiting {
 
 impl Drop for Wait {
     fn drop(&mut self) {
-        let mut w = self.0 .0.lock().unwrap();
+        let mut w = self.0.held.lock().unwrap();
         if let Some(n) = w.get_mut(&self.1) {
             *n -= 1;
             if *n == 0 {
@@ -74,7 +89,7 @@ pub fn main(host: Host, listener: TcpListener) -> Result<()> {
     crate::standby::maintain(host.clone());
     crate::gc::periodic(host.clone());
     let peers = Peers::watch(host.clone());
-    let waits = Waiting::default();
+    let (waits, moved) = (Waiting::new(MAX_WAITING, MAX_WAITING_FROM), Waiting::new(MAX_MOVED, MAX_MOVED_FROM));
     // Refusals are logged off the accept loop, never waiting on stderr: past 64 queued, dropped.
     let (refusals, queued) = std::sync::mpsc::sync_channel::<String>(64);
     std::thread::spawn(move || queued.into_iter().for_each(|e| crate::log!("peer request: {e}")));
@@ -96,14 +111,15 @@ pub fn main(host: Host, listener: TcpListener) -> Result<()> {
         // one's, and a bounded few wait for it (a peer's restart backlog, a
         // peer just added, a peer by name back on a new address).
         let waiting = match peers.check(&host.config_now().peers, from) {
-            Some(true) => {
+            Admission::Peer => {
                 let Some(slot) = Slot::take(&ACTIVE, MAX_ACTIVE) else { continue };
                 let host = host.clone();
                 std::thread::spawn(move || serve(&host, conn, slot, deadline));
                 continue;
             }
-            Some(false) => None,
-            None => waits.take(from),
+            Admission::Refused => None,
+            Admission::Unresolved => waits.take(from),
+            Admission::Moved => moved.take(from),
         };
         let Some(waiting) = waiting else {
             not_a_peer(conn, from, &refusals);
@@ -154,6 +170,17 @@ fn unreachable_at(local: SocketAddr, v6only: bool, advertised: Option<&str>) -> 
 /// dual-stack socket (::ffff:a.b.c.d).
 fn is_peer(peers: &[IpAddr], from: IpAddr) -> bool {
     peers.iter().any(|a| a.to_canonical() == from.to_canonical())
+}
+
+/// What `Peers::check` makes of an address.
+#[derive(Debug, PartialEq)]
+enum Admission {
+    Peer,
+    Refused,
+    /// May be a peer whose name has no addresses yet: its lookup is under way.
+    Unresolved,
+    /// May be a peer by name now elsewhere: a name with addresses is being looked up again.
+    Moved,
 }
 
 /// The configured peers' addresses. Names are resolved off the accept loop,
@@ -235,24 +262,30 @@ impl Peers {
         is_peer(&self.addrs(names), from)
     }
 
-    /// Whether a name in `names` has its lookup under way (one that hangs
-    /// keeps every unknown address waiting its `ADMIT_WAIT`, within `Waiting`).
-    fn resolving(&self, names: &[String]) -> bool {
-        let l = self.0.lookups.lock().unwrap();
-        names.iter().any(|n| l.get(n) == Some(&None))
+    /// Whether a name in `names` with no addresses yet has its lookup under
+    /// way, and whether one with addresses has.
+    fn resolving(&self, names: &[String]) -> (bool, bool) {
+        let (r, l) = (self.0.resolved.read().unwrap(), self.0.lookups.lock().unwrap());
+        let under_way = |cached: bool| names.iter().any(|n| r.contains_key(n) == cached && l.get(n) == Some(&None));
+        (under_way(false), under_way(true))
     }
 
-    /// Whether `from` is a peer; None while it may yet be, a name still being
-    /// looked up. One it would refuse looks again for any name not looked up
-    /// within `LOOKUP_EVERY`: a peer by name may be back on a new address
-    /// (DHCP), which would otherwise wait for `PEER_REFRESH` (#311).
-    fn check(&self, names: &[String], from: IpAddr) -> Option<bool> {
+    /// Whether `from` is a peer, or may yet be. One it would refuse looks
+    /// again for any name not looked up within `LOOKUP_EVERY`: a peer by name
+    /// may be back on a new address (DHCP), which would otherwise wait for
+    /// `PEER_REFRESH` (#311).
+    fn check(&self, names: &[String], from: IpAddr) -> Admission {
         if self.admit(names, from) {
-            return Some(true);
+            return Admission::Peer;
         }
         self.refresh(names);
-        // A lookup that ended since may have given its address.
-        (!self.resolving(names)).then(|| self.admit(names, from))
+        match self.resolving(names) {
+            (true, _) => Admission::Unresolved,
+            (_, true) => Admission::Moved,
+            // A lookup that ended since may have given its address.
+            _ if self.admit(names, from) => Admission::Peer,
+            _ => Admission::Refused,
+        }
     }
 
     /// Admits `from` once a lookup under way gives its address, or refuses it
@@ -260,9 +293,10 @@ impl Peers {
     fn admit_by(&self, host: &Host, from: IpAddr, by: Instant) -> bool {
         loop {
             match self.check(&host.config_now().peers, from) {
-                Some(admitted) => return admitted,
-                None if Instant::now() >= by => return false,
-                None => std::thread::sleep(Duration::from_millis(20)),
+                Admission::Peer => return true,
+                Admission::Refused => return false,
+                _ if Instant::now() >= by => return false,
+                _ => std::thread::sleep(Duration::from_millis(20)),
             }
         }
     }
@@ -589,7 +623,7 @@ mod tests {
         let p = Peers::default();
         let local: [IpAddr; 2] = ["127.0.0.1".parse().unwrap(), "::1".parse().unwrap()];
         p.0.lookups.lock().unwrap().insert(names[0].clone(), None);
-        assert!(!p.admit(&names, local[0]) && p.resolving(&names) && p.check(&names, local[0]).is_none());
+        assert!(!p.admit(&names, local[0]) && p.resolving(&names) == (true, false) && p.check(&names, local[0]) == Admission::Unresolved);
         // A request that finds the name unresolved starts its lookup, and is admitted once it ends.
         p.0.lookups.lock().unwrap().clear();
         assert!(!p.admit(&names, local[0]) && p.0.lookups.lock().unwrap().contains_key(&names[0]));
@@ -608,18 +642,18 @@ mod tests {
         // localhost resolved, the other failed: nothing under way to wait for. Each ended "now" for as long as this
         // takes, so the failed one is not looked up again (`LOOKUP_EVERY`) however slowly it runs (#294).
         p.0.lookups.lock().unwrap().values_mut().for_each(|l| *l = Some(Instant::now() + Duration::from_secs(3600)));
-        assert!(!p.resolving(&names));
+        assert_eq!(p.resolving(&names), (false, false));
         // Refused at once: `check` has its answer, so `admit_by` never waits (not timed, as a loaded machine can take
         // any time over it, #294).
         let from = "10.9.9.9".parse().unwrap();
-        assert_eq!(p.check(&names, from), Some(false));
+        assert_eq!(p.check(&names, from), Admission::Refused);
         assert!(!p.admit_by(&host, from, Instant::now() + Duration::from_secs(60)));
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn one_source_cannot_take_every_wait() {
-        let w = Waiting::default();
+        let w = Waiting::new(MAX_WAITING, MAX_WAITING_FROM);
         let (one, other): (IpAddr, IpAddr) = ("10.9.9.9".parse().unwrap(), "10.1.0.2".parse().unwrap());
         let held: Vec<_> = (0..MAX_WAITING_FROM).map(|_| w.take(one).unwrap()).collect();
         assert!(w.take(one).is_none() && w.take("::ffff:10.9.9.9".parse().unwrap()).is_none());
@@ -630,6 +664,26 @@ mod tests {
         // Many sources still share MAX_WAITING in all.
         let many: Vec<_> = (0..).map_while(|i: u32| w.take(IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + i)))).collect();
         assert_eq!(many.len(), MAX_WAITING);
+    }
+
+    #[test]
+    fn non_peers_waiting_on_a_refresh_take_only_its_small_budget() {
+        let names = vec!["peer.test:7070".to_string(), "new.test:7070".to_string()];
+        let p = Peers::default();
+        // A refresh of a name with addresses under way (slow, or hung): unknown sources may wait, on `MAX_MOVED` only.
+        p.0.resolved.write().unwrap().insert(names[0].clone(), vec!["10.1.0.2".parse().unwrap()]);
+        p.0.lookups.lock().unwrap().insert(names[0].clone(), None);
+        p.0.lookups.lock().unwrap().insert(names[1].clone(), Some(Instant::now() + Duration::from_secs(3600)));
+        assert_eq!(p.check(&names, "10.9.9.9".parse().unwrap()), Admission::Moved);
+        let moved = Waiting::new(MAX_MOVED, MAX_MOVED_FROM);
+        let attackers: Vec<IpAddr> = (0..16).map(|i: u32| IpAddr::V4(Ipv4Addr::from(0x0a09_0000 + i))).collect();
+        let held: Vec<_> = attackers.iter().flat_map(|&a| std::iter::repeat_n(a, 4)).filter_map(|a| moved.take(a)).collect();
+        assert_eq!(held.len(), MAX_MOVED, "one each, four in all");
+        // A name with no addresses yet still has #291's waits, all of them, for its peer.
+        p.0.lookups.lock().unwrap().insert(names[1].clone(), None);
+        assert_eq!(p.check(&names, "10.1.0.3".parse().unwrap()), Admission::Unresolved);
+        let waits = Waiting::new(MAX_WAITING, MAX_WAITING_FROM);
+        assert!(waits.take("10.1.0.3".parse().unwrap()).is_some());
     }
 
     #[test]
@@ -645,9 +699,9 @@ mod tests {
                 q.0.resolved.write().unwrap().insert("peer.test:7070".into(), vec!["10.1.0.2".parse().unwrap()]);
                 q.0.lookups.lock().unwrap().insert("peer.test:7070".into(), Some(Instant::now()));
             });
-            assert_ne!(p.check(&names, from), Some(false));
+            assert_ne!(p.check(&names, from), Admission::Refused);
             lookup.join().unwrap();
-            assert_eq!(p.check(&names, from), Some(true));
+            assert_eq!(p.check(&names, from), Admission::Peer);
         }
     }
 
@@ -661,8 +715,8 @@ mod tests {
         let Some(long_ago) = Instant::now().checked_sub(LOOKUP_EVERY) else { return };
         p.0.lookups.lock().unwrap().insert(names[0].clone(), Some(long_ago));
         let local: [IpAddr; 2] = ["127.0.0.1".parse().unwrap(), "::1".parse().unwrap()];
-        // Not refused: looked up again, and waited for.
-        assert_ne!(p.check(&names, local[0]), Some(false));
+        // Not refused: looked up again, and waited for (on the moved budget, not #291's).
+        assert!(matches!(p.check(&names, local[0]), Admission::Moved | Admission::Peer));
         assert_ne!(p.0.lookups.lock().unwrap()[&names[0]], Some(long_ago), "a lookup started");
         // Only a bound on a hung lookup: on a loaded machine one of localhost can take seconds.
         let by = Instant::now() + Duration::from_secs(60);

@@ -329,13 +329,30 @@ pub fn resolve_fresh(addr: &str, at: Instant) -> io::Result<Addrs> {
 /// faults on (`host::fault`), `RUN/hosts.json` ({"HOST:PORT": ["IP:PORT", ...]}) answers for the names it lists.
 pub fn lookup(addr: &str) -> io::Result<Addrs> {
     use std::net::ToSocketAddrs;
-    if crate::host::faults_on() {
-        let hosts = crate::host::run_dir().map(|r| crate::host::load::<std::collections::HashMap<String, Addrs>>(&r.join("hosts.json")));
-        if let Some(addrs) = hosts.and_then(|h| h.ok().flatten()).and_then(|mut h| h.remove(addr)) {
-            return Ok(addrs);
-        }
+    if let Some(addrs) = crate::host::faults_on().then(test_hosts).flatten().and_then(|mut h| h.remove(addr)) {
+        return Ok(addrs);
     }
     addr.to_socket_addrs().map(Iterator::collect)
+}
+
+/// `RUN/hosts.json`, only as a regular file (no symlink) owned by root or this process's user and writable by no
+/// one else: it decides which addresses are peers.
+fn test_hosts() -> Option<std::collections::HashMap<String, Addrs>> {
+    let f = trusted_file(&crate::host::run_dir()?.join("hosts.json"))?;
+    serde_json::from_reader(io::BufReader::new(f).take(1 << 20)).ok()
+}
+
+/// `path` opened, if it is a regular file (not through a symlink) owned by root or this process's user and writable
+/// by no one else.
+fn trusted_file(path: &Path) -> Option<std::fs::File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let f = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path).ok()?;
+    let m = f.metadata().ok()?;
+    if !m.is_file() || (m.uid() != 0 && m.uid() != unsafe { libc::geteuid() }) || m.mode() & 0o022 != 0 {
+        crate::log!("{}: ignored: not a regular file owned by root or this user, writable by no one else", path.display());
+        return None;
+    }
+    Some(f)
 }
 
 fn resolve_with(
@@ -1013,6 +1030,28 @@ fn scope(prefix: &[u8], pid: u32, start: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_trusted_file_is_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("flexvm-trusted-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (file, link) = (dir.join("hosts.json"), dir.join("link.json"));
+        std::fs::write(&file, b"{}").unwrap();
+        let mode = |m| std::fs::set_permissions(&file, std::fs::Permissions::from_mode(m)).unwrap();
+        mode(0o644);
+        assert!(trusted_file(&file).is_some());
+        mode(0o664);
+        assert!(trusted_file(&file).is_none(), "group-writable");
+        mode(0o646);
+        assert!(trusted_file(&file).is_none(), "world-writable");
+        mode(0o600);
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert!(trusted_file(&link).is_none(), "through a symlink");
+        assert!(trusted_file(&dir).is_none(), "not a regular file");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     use std::os::unix::fs::PermissionsExt;
 
     fn workers(dns: &Resolver) -> usize {
