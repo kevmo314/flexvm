@@ -240,12 +240,19 @@ impl Cow {
         self.rescued_bytes.load(Ordering::SeqCst) >= budget
     }
 
-    /// Keeps `bytes`, the pause-time contents of `page` (claimed RESCUING).
-    pub fn rescue(&self, page: usize, bytes: Box<[u8]>) {
-        self.rescued_bytes.fetch_add(bytes.len(), Ordering::SeqCst);
-        self.rescued.lock().unwrap().insert(page, bytes);
-        self.set(page, RESCUED);
-        self.saved(page, page + 1, 1);
+    /// Keeps the pause-time copies of pages claimed RESCUING in `first..end`.
+    pub fn rescue_many(&self, first: usize, end: usize, pages: impl IntoIterator<Item = (usize, Box<[u8]>)>) {
+        let mut rescued = self.rescued.lock().unwrap();
+        let (mut n, mut bytes) = (0, 0);
+        for (page, copy) in pages {
+            bytes += copy.len();
+            rescued.insert(page, copy);
+            self.set(page, RESCUED);
+            n += 1;
+        }
+        self.rescued_bytes.fetch_add(bytes, Ordering::SeqCst);
+        drop(rescued);
+        self.saved(first, end, n);
     }
 
     /// The pause-time contents of pages to save, copied during the pause: the writers take them from there. (Once.)
@@ -374,7 +381,7 @@ impl GuestPages for CowPages<'_> {
         (0..n).filter(|&k| mine[k]).for_each(|k| cow.set(page + k, CLEAN));
         cow.saved(page, page + n, mine.iter().filter(|&&m| m).count());
         // The rest were copied during the pause, or a fault saved them first (or is saving them right now).
-        for k in (0..n).filter(|&k| !mine[k]) {
+        'copies: for k in (0..n).filter(|&k| !mine[k]) {
             let p = page + k;
             if cow.state(p) == HELD {
                 let Some(bytes) = cow.held.get().and_then(|h| h.get(p)) else { crate::bail!("page {p}: held copy missing") };
@@ -383,12 +390,23 @@ impl GuestPages for CowPages<'_> {
                 continue;
             }
             loop {
+                cow.check_active()?;
                 match cow.state(p) {
                     RESCUED => break,
                     RESCUING => std::thread::yield_now(),
+                    PENDING => {
+                        if cow.claim(p, PENDING, READING) {
+                            if let Err(e) = self.guest.read(p, &mut buf[k * PAGE_SIZE..(k + 1) * PAGE_SIZE]) {
+                                cow.unclaim(p);
+                                return Err(e);
+                            }
+                            cow.set(p, CLEAN);
+                            cow.saved(p, p + 1, 1);
+                            continue 'copies;
+                        }
+                    }
                     s => crate::bail!("page {p} is in copy state {s}, not saved"),
                 }
-                cow.check_active()?;
             }
             // A copy that stops (abort, kill) drops the rescued copies under
             // the writers: that is the stop, not a lost page.
@@ -438,7 +456,7 @@ mod tests {
         assert_eq!(cow.left(), 40);
         // A fault on page 3 saves it before the guest overwrites it.
         assert!(cow.claim(3, PENDING, RESCUING));
-        cow.rescue(3, vec![3u8; PAGE_SIZE].into());
+        cow.rescue_many(3, 4, [(3, vec![3u8; PAGE_SIZE].into())]);
         live.pages.lock().unwrap()[3 * PAGE_SIZE..4 * PAGE_SIZE].fill(0xee);
         // Page 5 is being saved by a fault while the writer gets there.
         assert!(cow.claim(5, PENDING, RESCUING));
@@ -448,7 +466,7 @@ mod tests {
         std::thread::scope(|s| {
             s.spawn(|| {
                 std::thread::sleep(Duration::from_millis(50));
-                cow.rescue(5, vec![5u8; PAGE_SIZE].into());
+                cow.rescue_many(5, 6, [(5, vec![5u8; PAGE_SIZE].into())]);
             });
             pages.read(0, &mut buf).unwrap();
         });
@@ -469,6 +487,100 @@ mod tests {
         cow.invalidate("page 8 was discarded before it was saved");
         assert!(!cow.active());
         assert!(pages.read(8, &mut buf[..PAGE_SIZE]).unwrap_err().to_string().contains("page 8 was discarded"));
+    }
+
+    #[test]
+    fn failed_rescue_is_read_by_the_writer() {
+        struct Retry<'a> {
+            gate: &'a Gate,
+            cow: &'a Cow,
+            fail: bool,
+        }
+        impl GuestPages for Retry<'_> {
+            fn region_end(&self, _page: usize) -> Option<usize> {
+                Some(2)
+            }
+            fn read(&self, page: usize, buf: &mut [u8]) -> Result<()> {
+                if page == 0 {
+                    return self.gate.read(page, buf);
+                }
+                assert_eq!(self.cow.state(page), READING);
+                if self.fail {
+                    crate::bail!("retry unreadable");
+                }
+                buf.fill(7);
+                Ok(())
+            }
+        }
+        for fail in [false, true] {
+            let cow = Cow::new(2, &vec![(0, 2, REMOTE)]);
+            assert!(cow.claim(1, PENDING, RESCUING));
+            let gate = Gate { entered: std::sync::Barrier::new(2), go: std::sync::Barrier::new(2) };
+            let guest = Retry { gate: &gate, cow: &cow, fail };
+            let pages = CowPages { guest: &guest, cow: &cow, slow: || Duration::ZERO };
+            let mut buf = vec![0; 2 * PAGE_SIZE];
+            let result = std::thread::scope(|s| {
+                let writer = s.spawn(|| pages.read(0, &mut buf));
+                gate.entered.wait();
+                // The writer already lost its initial claim to the rescue. A failed rescue
+                // gives it back without unprotecting it, so the pause-time bytes remain.
+                cow.unclaim(1);
+                gate.go.wait();
+                writer.join().unwrap()
+            });
+            if fail {
+                assert!(result.unwrap_err().to_string().contains("retry unreadable"));
+                assert_eq!(cow.state(1), PENDING);
+                assert_eq!(cow.left(), 1);
+            } else {
+                result.unwrap();
+                assert!(buf[PAGE_SIZE..].iter().all(|&b| b == 7));
+                assert_eq!(cow.state(1), CLEAN);
+                assert_eq!(cow.left(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn batched_rescue_keeps_each_pause_time_copy() {
+        let cow = Cow::new(6, &vec![(0, 6, REMOTE)]);
+        let live = Live { pages: StdMutex::new((0..6 * PAGE_SIZE).map(|i| (i / PAGE_SIZE) as u8).collect()) };
+        use std::os::fd::FromRawFd;
+        let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        assert!(fd >= 0);
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        cow.set_waker(fd.try_clone().unwrap());
+        let claimed = [1, 3, 4];
+        for p in claimed {
+            assert!(cow.claim(p, PENDING, RESCUING));
+        }
+        cow.wait_for(1, RESCUING);
+        cow.wait_for(4, RESCUING);
+        cow.rescue_many(1, 5, claimed.map(|p| (p, vec![p as u8; PAGE_SIZE].into())));
+        let mut wakes = 0u64;
+        assert_eq!(unsafe { libc::read(fd.as_raw_fd(), (&mut wakes as *mut u64).cast(), 8) }, 8);
+        assert_eq!(wakes, 1, "one wake for the whole batch");
+        assert!(cow.waits.lock().unwrap().is_empty());
+        assert_eq!(cow.left(), 3);
+        assert_eq!(*cow.progress.0.lock().unwrap(), 3);
+        assert_eq!(cow.rescued_bytes.load(Ordering::SeqCst), 3 * PAGE_SIZE);
+        for p in 0..6 {
+            assert_eq!(cow.state(p), if claimed.contains(&p) { RESCUED } else { PENDING });
+        }
+        for p in claimed {
+            live.pages.lock().unwrap()[p * PAGE_SIZE..(p + 1) * PAGE_SIZE].fill(0xee);
+        }
+        let pages = CowPages { guest: &live, cow: &cow, slow: || Duration::ZERO };
+        let mut buf = vec![0; 6 * PAGE_SIZE];
+        pages.read(0, &mut buf).unwrap();
+        for (p, bytes) in buf.chunks(PAGE_SIZE).enumerate() {
+            assert!(bytes.iter().all(|&b| b == p as u8));
+            assert_eq!(cow.state(p), CLEAN);
+        }
+        assert_eq!(cow.left(), 0);
+        assert_eq!(*cow.progress.0.lock().unwrap(), 6);
+        assert_eq!(cow.rescued_bytes.load(Ordering::SeqCst), 0);
+        assert!(cow.rescued.lock().unwrap().is_empty());
     }
 
     /// Guest memory whose reads stop half way until the test lets them go.
@@ -499,7 +611,7 @@ mod tests {
             let cow = Cow::new(64, &vec![(0, 2, REMOTE)]);
             // Page 1 was rescued by a fault; the writer reads page 0 itself.
             assert!(cow.claim(1, PENDING, RESCUING));
-            cow.rescue(1, vec![1u8; PAGE_SIZE].into());
+            cow.rescue_many(1, 2, [(1, vec![1u8; PAGE_SIZE].into())]);
             let gate = Gate { entered: std::sync::Barrier::new(2), go: std::sync::Barrier::new(2) };
             let pages = CowPages { guest: &gate, cow: &cow, slow: || Duration::ZERO };
             let mut buf = vec![0u8; 2 * PAGE_SIZE];

@@ -227,9 +227,7 @@ impl Pager {
             claimed.iter().for_each(|&p| cow.unclaim(p));
             return Err(e);
         }
-        for (&p, bytes) in claimed.iter().zip(pages) {
-            cow.rescue(p, bytes);
-        }
+        cow.rescue_many(first, end, claimed.iter().copied().zip(pages));
         Ok(claimed.len())
     }
 

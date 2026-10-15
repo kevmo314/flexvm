@@ -133,7 +133,7 @@ impl Proc {
     pub fn checkpoint(&self, _op: &Op, dir: &str, stop: bool, incremental: bool) -> Result<Value> {
         let vm = self.vm();
         let mut t = Phases::new();
-        let staging = Staging::new(Path::new(dir), vm.dir.join("checkpoint.vmstate"))?;
+        let staging = Staging::new(Path::new(dir), vm.dir.join("checkpoint.vmstate"), &crate::host::Ident::me().work_dir(&self.host.run))?;
         let dest = staging.dest().to_path_buf();
         t.mark("prepare");
         let saved = self.save(vm, staging, !stop, incremental, &mut t, || Ok(()));
@@ -184,7 +184,7 @@ impl Proc {
             if dir.exists() && !self.host.is_suspended(&vm.name) {
                 remove_durably(&dir).map_err(|e| format!("removing what is left of {}: {e}", dir.display()))?;
             }
-            let staging = Staging::new(&dir, vm.dir.join("checkpoint.vmstate"))?;
+            let staging = Staging::new(&dir, vm.dir.join("checkpoint.vmstate"), &crate::host::Ident::me().work_dir(&self.host.run))?;
             staging.add_file(GEN, self.gen().to_string().as_bytes())?;
             let cmd = match self.cmd.lock().unwrap().clone() {
                 Some(cmd) => Some((cmd, self.cmd_session()?, staging.create(CMD)?)),

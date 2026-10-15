@@ -67,7 +67,7 @@ pub struct Staging {
 
 impl Staging {
     /// Firecracker writes the VM state to `vmstate`, a path only root controls.
-    pub fn new(dest: &Path, vmstate: PathBuf) -> Result<Staging> {
+    pub fn new(dest: &Path, vmstate: PathBuf, work: &Path) -> Result<Staging> {
         let parent = dest.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
         let base = dest.file_name().ok_or_else(|| format!("bad checkpoint path {}", dest.display()))?;
         let parent_path = parent.canonicalize().map_err(|e| format!("checkpoint directory {}: {e}", parent.display()))?;
@@ -78,8 +78,10 @@ impl Staging {
         ensure!(crate::util::stat_at(pfd.as_raw_fd(), &base).is_none(), "{} already exists; checkpoints are never overwritten", dest.display());
         // Its directory's own entry, up to the root, ahead of the pause; `commit` walks again, as then.
         crate::util::sync_ancestors_fd(pfd.as_raw_fd()).map_err(|e| format!("checkpoint directory {}: {e}", parent_path.display()))?;
+        // Record before creating anything: gc can find debris even if we die during setup.
+        std::fs::write(work.join("checkpoint-staging"), parent_path.as_os_str().as_bytes())?;
         check(unsafe { libc::flock(pfd.as_raw_fd(), libc::LOCK_EX) })?;
-        clear_stale(&pfd);
+        clear_stale_fd(&pfd);
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().subsec_nanos();
         let outer_name = cname(&format!("{STAGING_PREFIX}{}-{nanos:x}", std::process::id()));
         check(unsafe { libc::mkdirat(pfd.as_raw_fd(), outer_name.as_ptr(), 0o700) })?;
@@ -110,7 +112,10 @@ impl Staging {
     }
 
     pub fn create(&self, name: &str) -> io::Result<File> {
-        create_at(self.ck.as_raw_fd(), name)
+        let f = create_at(self.ck.as_raw_fd(), name)?;
+        // Set ownership before any data sync, so the inode's permissions are durable too.
+        publish_permissions(&[f.as_raw_fd()], self.ck.as_raw_fd(), &fstat(self.parent.as_raw_fd())?)?;
+        Ok(f)
     }
 
     pub fn add_file(&self, name: &str, bytes: &[u8]) -> io::Result<File> {
@@ -153,23 +158,21 @@ impl Staging {
     ) -> std::result::Result<(Manifest, String), CommitError> {
         let pages = if let Some(p) = self.pages.take() { p } else { PagesFile::new(self.create("pages")?) };
         // The scope joins every writer before the manifest, including on failure.
-        let (out, pagemap, vmstate, vmstate_file) = std::thread::scope(|s| -> Result<_> {
+        let (out, vmstate) = std::thread::scope(|s| -> Result<_> {
             let state = std::thread::Builder::new().spawn_scoped(s, || -> Result<_> {
                 let vmstate = std::fs::read(&self.vmstate)?;
                 ensure!(vmstate.len() as u64 <= MAX_VMSTATE, "its vmstate is over {MAX_VMSTATE} bytes");
-                let file = self.add_file("vmstate", &vmstate)?;
-                Ok((vmstate, file))
+                self.add_file("vmstate", &vmstate)?;
+                Ok(vmstate)
             })?;
             let copied = write_pages(&vm.template, src, runs, &pages, writer_threads(), parent.is_some()).and_then(|out| {
                 t.mark("write_pages");
-                let pagemap = self.sync_pages_and_pagemap(&pages.file, &out.map)?;
-                Ok((out, pagemap))
+                self.sync_pages_and_pagemap(&pages.file, &out.map)?;
+                Ok(out)
             });
             let state = state.join().map_err(|_| "vmstate writer thread panicked")?;
             // The copy's error says more than the VM state's.
-            let (out, pagemap) = copied?;
-            let (vmstate, vmstate_file) = state?;
-            Ok((out, pagemap, vmstate, vmstate_file))
+            Ok((copied?, state?))
         })?;
         let map = &out.map;
         let files = BTreeMap::from([
@@ -207,10 +210,7 @@ impl Staging {
             }
             .into());
         }
-        let mf = self.add_file("manifest.json", &text)?;
-        // Owned by the directory's owner (we run as root), who may move and delete it.
-        let owner = fstat(self.parent.as_raw_fd())?;
-        publish_permissions(&[pages.file.as_raw_fd(), pagemap.as_raw_fd(), vmstate_file.as_raw_fd(), mf.as_raw_fd()], self.ck.as_raw_fd(), &owner)?;
+        self.add_file("manifest.json", &text)?;
         check(unsafe { libc::fsync(self.ck.as_raw_fd()) })?;
         still_valid()?;
         // The pinned directory must still be the one `dest` names.
@@ -300,7 +300,15 @@ fn private_dir(fd: RawFd) -> bool {
     fstat(fd).is_ok_and(|st| st.st_uid == unsafe { libc::geteuid() } && st.st_mode & 0o077 == 0)
 }
 
-fn clear_stale(parent: &OwnedFd) {
+pub fn clear_stale(path: &Path) {
+    let Ok(path) = CString::new(path.as_os_str().as_bytes()) else { return };
+    let Ok(parent) = open_dir_at(libc::AT_FDCWD, &path) else { return };
+    if unsafe { libc::flock(parent.as_raw_fd(), libc::LOCK_EX) } == 0 {
+        clear_stale_fd(&parent);
+    }
+}
+
+fn clear_stale_fd(parent: &OwnedFd) {
     let Ok(dir) = std::fs::read_dir(format!("/proc/self/fd/{}", parent.as_raw_fd())) else { return };
     for e in dir.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
