@@ -35,6 +35,8 @@ pub const MAX_DOCUMENT: u64 = 4 << 20;
 const MAX_META: u64 = 1 << 20;
 const MAX_PAX_RECORDS: usize = 256;
 const MAX_DEPTH: u32 = 4096;
+/// Largest zstd window a layer may declare (libzstd's default), since decoding holds that much.
+const MAX_ZSTD_WINDOW: u64 = 128 << 20;
 
 pub fn check(rc: libc::c_int, what: &str, path: &Path) -> Result<()> {
     crate::util::check(rc).map_err(|e| format!("{what} {path:?}: {e}").into())
@@ -489,7 +491,12 @@ pub fn decompress<'a>(r: impl Read + 'a) -> Result<Box<dyn Read + 'a>> {
     let magic = r.fill_buf()?.get(..4).map(|m| m.to_vec()).unwrap_or_default();
     Ok(match magic.as_slice() {
         [0x1f, 0x8b, ..] => Box::new(flate2::read::MultiGzDecoder::new(r)),
-        [0x28, 0xb5, 0x2f, 0xfd] => Box::new(ZstdFrames { src: r, dec: ruzstd::decoding::FrameDecoder::new(), active: false }),
+        [0x28, 0xb5, 0x2f, 0xfd] => {
+            // Checked on every frame since ruzstd 0.9; 0.8 skipped a decoder's first.
+            let mut dec = ruzstd::decoding::FrameDecoder::new();
+            dec.set_max_window_size(MAX_ZSTD_WINDOW);
+            Box::new(ZstdFrames { src: r, dec, active: false })
+        }
         _ => Box::new(r),
     })
 }
@@ -813,6 +820,28 @@ pub(super) mod tests {
         let mut bad = compress_to_vec(&tar[..], CompressionLevel::Fastest);
         bad.extend_from_slice(b"trailing junk");
         assert!(decompress(io::Cursor::new(bad)).unwrap().read_to_end(&mut Vec::new()).is_err());
+    }
+
+    #[test]
+    fn zstd_windows_are_capped_on_every_frame() {
+        use ruzstd::encoding::{compress_to_vec, CompressionLevel};
+        // 8 MiB of 128 KiB RLE blocks, which a 4 GiB window would hold back instead of returning.
+        let blocks: Vec<u8> = (0..64u32).flat_map(|i| [&((128 << 13) | 1 << 1 | (i == 63) as u32).to_le_bytes()[..3], b"x"].concat()).collect();
+        let magic = [0x28, 0xb5, 0x2f, 0xfd];
+        // Window descriptor 2^32, and a single-segment frame whose content size (the window) is 2^32.
+        let headers = [[&magic[..], &[0x00, 22 << 3]].concat(), [&magic[..], &[0xe0], &(1u64 << 32).to_le_bytes()].concat()];
+        let mut first = compress_to_vec(&b"ok"[..], CompressionLevel::Fastest);
+        first.extend_from_slice(&0x184D2A50u32.to_le_bytes());
+        first.extend_from_slice(&0u32.to_le_bytes());
+        for prefix in [vec![], first] {
+            for h in &headers {
+                let mut out = Vec::new();
+                let z = [&prefix[..], h, &blocks].concat();
+                let e = decompress(io::Cursor::new(z)).unwrap().read_to_end(&mut out).unwrap_err();
+                assert!(e.to_string().contains("window_size is too big"), "{e}");
+                assert!(out.len() <= 2);
+            }
+        }
     }
 
     #[test]
