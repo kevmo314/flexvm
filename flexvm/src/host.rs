@@ -1581,11 +1581,16 @@ pub fn starttime(pid: u32) -> Option<u64> {
     parse_stat(&stat).filter(|(state, _)| *state != "Z").map(|(_, start)| start)
 }
 
+/// Whether test hooks are on: FLEXVM_FAULTS=1.
+pub fn faults_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FLEXVM_FAULTS").is_ok_and(|v| v == "1"))
+}
+
 /// Test faults (`RUN/faults.json`); only with FLEXVM_FAULTS=1.
 pub fn fault(name: &str) -> bool {
     static CACHE: Mutex<Option<(SystemTime, HashMap<String, u64>)>> = Mutex::new(None);
-    static ON: OnceLock<bool> = OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var("FLEXVM_FAULTS").is_ok_and(|v| v == "1")) {
+    if !faults_on() {
         return false;
     }
     let Some(path) = RUN_DIR.get().map(|r| r.join("faults.json")) else { return false };

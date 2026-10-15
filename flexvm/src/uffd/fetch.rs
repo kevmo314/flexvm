@@ -454,7 +454,7 @@ impl Link {
 /// `SOURCE_TIMEOUT`, and not past `deadline`).
 pub fn probe(source: &Source, page: u64, deadline: Instant) -> io::Result<()> {
     let mut addrs = SourceAddrs::default();
-    probe_with_connect(source, page, deadline, |addr, timeout| addrs.connect(addr, Instant::now() + timeout))
+    probe_with_connect(source, page, deadline, |addr, timeout, retry| addrs.retry(addr, Instant::now() + timeout, retry))
 }
 
 /// The source's addresses, looked up once: reconnects need no lookup, which a stalled resolver could hold past
@@ -480,32 +480,42 @@ impl SourceAddrs {
         s.set_nodelay(true)?;
         Ok(s)
     }
+
+    /// `connect`, after a failed attempt (`retry`) as after `Link::lost`: an old address that still takes TCP but
+    /// refuses the handshake or the fetch is looked up afresh too (#352).
+    fn retry(&mut self, name: &str, at: Instant, retry: bool) -> io::Result<TcpStream> {
+        self.stale |= retry;
+        self.connect(name, at)
+    }
 }
 
 fn probe_with_connect<S: crate::util::Timed>(
     source: &Source,
     page: u64,
     deadline: Instant,
-    mut connect: impl FnMut(&str, Duration) -> io::Result<S>,
+    mut connect: impl FnMut(&str, Duration, bool) -> io::Result<S>,
 ) -> io::Result<()> {
     let give_up = deadline.min(Instant::now() + SOURCE_TIMEOUT);
     let mut backoff = BACKOFF_MIN;
     // Bound connects separately so SYN retries cannot consume the whole outage
     // budget. The request and every read still share the overall deadline.
-    let mut once = || {
+    // `retry`: after an attempt that failed, whether at connecting, the handshake or the fetch.
+    let mut once = |retry| {
         let left = give_up.saturating_duration_since(Instant::now());
         if left.is_zero() {
             return Err(io::Error::new(io::ErrorKind::TimedOut, "deadline passed"));
         }
-        let s = connect(&source.addr, left.min(CONNECT_TIMEOUT))?;
+        let s = connect(&source.addr, left.min(CONNECT_TIMEOUT), retry)?;
         let mut client = PageClient::new(s, source, give_up)?;
         client.fetch(page * PAGE_SIZE as u64, &mut [0u8; PAGE_SIZE], 0, &mut |_| true, give_up)
     };
+    let mut retry = false;
     loop {
-        let e = match once() {
+        let e = match once(retry) {
             Ok(()) => return Ok(()),
             Err(e) => e,
         };
+        retry = true;
         if Instant::now() + backoff >= give_up {
             return Err(io::Error::new(io::ErrorKind::TimedOut, format!("no page from {} in time: {e}", source.addr)));
         }
@@ -747,11 +757,44 @@ mod probe_tests {
     }
 
     #[test]
+    fn a_probe_refused_by_an_old_address_looks_the_source_up_afresh() {
+        use std::io::BufRead;
+        // The old address still takes TCP but no longer serves this migration; the name now resolves to the new one.
+        let (old, new) = (std::net::TcpListener::bind("127.0.0.1:0").unwrap(), std::net::TcpListener::bind("127.0.0.1:0").unwrap());
+        let (old_addr, new_addr) = (old.local_addr().unwrap(), new.local_addr().unwrap());
+        let serve = |l: std::net::TcpListener, reply: Vec<u8>| {
+            thread::spawn(move || {
+                for c in l.incoming() {
+                    let Ok(mut c) = c else { return };
+                    let _ = io::BufReader::new(&c).read_line(&mut String::new());
+                    let _ = c.write_all(&reply);
+                }
+            })
+        };
+        serve(old, b"{\"ok\": false, \"error\": \"unknown migration\"}\n".to_vec());
+        let mut page = b"{\"ok\": true}\n".to_vec();
+        page.extend_from_slice(&[0u8; PAGE_SIZE + 1]);
+        serve(new, page);
+        let source = Source { addr: "moved.test:80".into(), vm: "v".into(), mig: 1, regions: Vec::new() };
+        let mut addrs = SourceAddrs::default();
+        let mut tried = Vec::new();
+        probe_with_connect(&source, 0, Instant::now() + Duration::from_secs(10), |_, timeout, retry| {
+            // What the name resolves to: the old address at first, the new one since.
+            let name = if addrs.addrs.is_empty() { old_addr } else { new_addr };
+            let s = addrs.retry(&name.to_string(), Instant::now() + timeout, retry);
+            tried.push(addrs.addrs.clone());
+            s
+        })
+        .unwrap();
+        assert_eq!(tried, vec![vec![old_addr], vec![new_addr]], "the refused address is not tried again");
+    }
+
+    #[test]
     fn short_connect_attempts_survive_a_three_second_outage() {
         let source = Source { addr: "source".into(), vm: "v".into(), mig: 1, regions: Vec::new() };
         let start = Instant::now();
         let mut attempts = 0;
-        probe_with_connect(&source, 2, start + SOURCE_TIMEOUT, |_, timeout| {
+        probe_with_connect(&source, 2, start + SOURCE_TIMEOUT, |_, timeout, _| {
             assert!(timeout <= CONNECT_TIMEOUT, "a connect must not consume the outage budget");
             attempts += 1;
             if start.elapsed() < Duration::from_secs(3) {
@@ -775,7 +818,7 @@ mod probe_tests {
         let budget = Duration::from_millis(70);
         let start = Instant::now();
         let mut attempts = 0;
-        let err = probe_with_connect::<Reply>(&source, 0, start + budget, |_, timeout| {
+        let err = probe_with_connect::<Reply>(&source, 0, start + budget, |_, timeout, _| {
             attempts += 1;
             assert!(timeout <= budget);
             thread::sleep(timeout);
@@ -786,7 +829,7 @@ mod probe_tests {
         assert_eq!(attempts, 1);
         assert!(start.elapsed() < CONNECT_TIMEOUT);
 
-        let err = probe_with_connect::<Reply>(&source, 0, Instant::now(), |_, _| panic!("connecting after the deadline")).unwrap_err();
+        let err = probe_with_connect::<Reply>(&source, 0, Instant::now(), |_, _, _| panic!("connecting after the deadline")).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
     }
 }
