@@ -26,13 +26,20 @@ macro_rules! log {
     }};
 }
 
-/// Lines queued for the log writer, written by it, and dropped (`log_line`).
-static LOG_QUEUED: AtomicUsize = AtomicUsize::new(0);
-static LOG_WRITTEN: AtomicUsize = AtomicUsize::new(0);
+/// Lines dropped since the log writer last got through (`log_line`), and
+/// lines it has written.
 static LOG_DROPPED: AtomicUsize = AtomicUsize::new(0);
+static LOG_WRITTEN: AtomicUsize = AtomicUsize::new(0);
 
-/// A longer log line (a peer's error, say) is cut to this.
+/// A longer log line (a peer's error, say) is cut to this, its note of the cut included.
 const LOG_LINE_MAX: usize = 16 << 10;
+
+/// What the log writer is handed: a line, or a flush that it acknowledges
+/// once every line handed to it before is written.
+enum LogMsg {
+    Line(String),
+    Flush(std::sync::mpsc::Sender<()>),
+}
 
 /// Hands `line` to this process's log writer, a thread that writes each line
 /// to stderr in one write (so lines from other processes sharing the pipe
@@ -42,28 +49,30 @@ const LOG_LINE_MAX: usize = 16 << 10;
 /// it next gets through. Lines from one thread keep their order.
 pub fn log_line(mut line: String) {
     cap_line(&mut line, LOG_LINE_MAX);
-    match log_writer().map(|tx| tx.try_send(line)) {
-        Some(Ok(())) => drop(LOG_QUEUED.fetch_add(1, Ordering::SeqCst)),
-        _ => drop(LOG_DROPPED.fetch_add(1, Ordering::SeqCst)),
+    if log_writer().is_none_or(|tx| tx.try_send(LogMsg::Line(line)).is_err()) {
+        LOG_DROPPED.fetch_add(1, Ordering::SeqCst);
     }
 }
 
-/// Cuts `line` to at most `max` bytes (and a note of the cut), on a character boundary.
+/// Cuts `line` to at most `max` bytes, a note of the cut included, on a character boundary.
 fn cap_line(line: &mut String, max: usize) {
     if line.len() > max {
-        let cut = (0..=max).rev().find(|&i| line.is_char_boundary(i)).unwrap_or(0);
+        let note = |gone: usize| format!("... ({gone} bytes cut)\n");
+        // What is cut is at most the whole line: its note is no longer than that one's.
+        let room = max.saturating_sub(note(line.len()).len());
+        let cut = (0..=room).rev().find(|&i| line.is_char_boundary(i)).unwrap_or(0);
         let gone = line.len() - cut;
         line.truncate(cut);
-        line.push_str(&format!("... ({gone} bytes cut)\n"));
+        line.push_str(&note(gone));
     }
 }
 
 /// The log writer, started on first use. A thread that cannot be started
 /// is tried again at most once a second: until then lines are dropped, as for
 /// a full queue. Only a start is waited for, never stderr.
-fn log_writer() -> Option<&'static std::sync::mpsc::SyncSender<String>> {
+fn log_writer() -> Option<&'static std::sync::mpsc::SyncSender<LogMsg>> {
     use std::sync::mpsc::{sync_channel, SyncSender};
-    static WRITER: std::sync::OnceLock<SyncSender<String>> = std::sync::OnceLock::new();
+    static WRITER: std::sync::OnceLock<SyncSender<LogMsg>> = std::sync::OnceLock::new();
     static TRIED: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
     if let Some(tx) = WRITER.get() {
         return Some(tx);
@@ -71,9 +80,16 @@ fn log_writer() -> Option<&'static std::sync::mpsc::SyncSender<String>> {
     let mut tried = TRIED.lock().unwrap_or_else(|e| e.into_inner());
     if WRITER.get().is_none() && !tried.is_some_and(|t| t.elapsed() < Duration::from_secs(1)) {
         *tried = Some(Instant::now());
-        let (tx, rx) = sync_channel::<String>(1024);
+        let (tx, rx) = sync_channel::<LogMsg>(1024);
         let writer = move || {
-            for line in rx {
+            for msg in rx {
+                let line = match msg {
+                    LogMsg::Line(line) => line,
+                    LogMsg::Flush(done) => {
+                        let _ = done.send(());
+                        continue;
+                    }
+                };
                 let mut err = io::stderr().lock();
                 let dropped = LOG_DROPPED.swap(0, Ordering::SeqCst);
                 if dropped > 0 {
@@ -99,13 +115,27 @@ fn log_writer() -> Option<&'static std::sync::mpsc::SyncSender<String>> {
     WRITER.get()
 }
 
-/// Waits up to `timeout` for the lines queued so far to be written, before
-/// the process exits: a stalled stderr does not hold the exit up past it.
+/// Waits up to `timeout` for every line handed to the log writer before this
+/// call to be written, before the process exits: a flush goes through the
+/// queue behind them, and a stalled stderr does not hold the exit up past it.
 pub fn flush_log(timeout: Duration) {
-    let (queued, deadline) = (LOG_QUEUED.load(Ordering::SeqCst), Instant::now() + timeout);
-    while LOG_WRITTEN.load(Ordering::SeqCst) < queued && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(1));
+    use std::sync::mpsc::TrySendError;
+    let deadline = Instant::now() + timeout;
+    // No writer: every line so far was dropped.
+    let Some(tx) = log_writer() else { return };
+    let (done, acked) = std::sync::mpsc::channel();
+    let mut msg = LogMsg::Flush(done);
+    loop {
+        match tx.try_send(msg) {
+            Ok(()) => break,
+            Err(TrySendError::Full(m)) if Instant::now() < deadline => {
+                msg = m;
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(_) => return,
+        }
     }
+    let _ = acked.recv_timeout(deadline.saturating_duration_since(Instant::now()));
 }
 
 /// Makes `sigs` end the process as their default action does (a supervisor
@@ -1165,13 +1195,45 @@ mod tests {
     }
 
     #[test]
-    fn a_long_log_line_is_cut_on_a_character_boundary() {
-        let mut l = "é".repeat(10);
-        super::cap_line(&mut l, 5);
-        assert_eq!(l, "éé... (16 bytes cut)\n");
+    fn a_long_log_line_is_cut_on_a_character_boundary_within_its_cap() {
+        let mut l = "é".repeat(20);
+        super::cap_line(&mut l, 30);
+        assert_eq!(l, "ééééé... (30 bytes cut)\n");
+        // Caps that fit a note: the real one is 16 KiB.
+        for max in 30..200 {
+            for len in [max - 1, max, max + 1, 2 * max, 1000] {
+                let mut l = "é".repeat(len / 2) + &"x".repeat(len % 2);
+                super::cap_line(&mut l, max);
+                assert!(l.len() <= max, "{len} bytes capped at {max}: {}", l.len());
+            }
+        }
         let mut short = "short\n".to_string();
         super::cap_line(&mut short, 16);
         assert_eq!(short, "short\n");
+    }
+
+    /// A flush returns once every line handed over before it is written,
+    /// whatever other threads log meanwhile.
+    #[test]
+    fn a_flush_follows_every_line_logged_before_it() {
+        use std::sync::atomic::Ordering::SeqCst;
+        static SENT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let base = super::LOG_WRITTEN.load(SeqCst);
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                std::thread::spawn(move || {
+                    for i in 0..25 {
+                        crate::log!("a_flush_follows_every_line_logged_before_it {t}.{i}");
+                        let sent = SENT.fetch_add(1, SeqCst) + 1;
+                        super::flush_log(Duration::from_secs(30));
+                        // Other tests' lines count too: at least ours are there.
+                        let written = super::LOG_WRITTEN.load(SeqCst) - base;
+                        assert!(written >= sent, "flushed with {written} of {sent} lines written");
+                    }
+                })
+            })
+            .collect();
+        threads.into_iter().for_each(|t| t.join().unwrap());
     }
 
     /// Past the cap a log moves to `.1` whole and its writers go on in a new
