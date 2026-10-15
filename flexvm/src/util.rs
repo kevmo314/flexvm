@@ -52,7 +52,16 @@ pub fn log_line(line: String) {
                 LOG_DONE.fetch_add(1, Ordering::SeqCst);
             }
         };
-        std::thread::Builder::new().name("log".into()).spawn(writer).ok().map(|_| tx)
+        // Started with every signal blocked, so that a signal for the process
+        // (that `block_signals`' callers wait for) is never handed to it.
+        unsafe {
+            let (mut all, mut old): (libc::sigset_t, libc::sigset_t) = (std::mem::zeroed(), std::mem::zeroed());
+            libc::sigfillset(&mut all);
+            libc::pthread_sigmask(libc::SIG_SETMASK, &all, &mut old);
+            let started = std::thread::Builder::new().name("log".into()).spawn(writer);
+            libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
+            started.ok().map(|_| tx)
+        }
     });
     LOG_QUEUED.fetch_add(1, Ordering::SeqCst);
     match queue {
