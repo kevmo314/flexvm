@@ -254,6 +254,17 @@ impl Peers {
         addrs
     }
 
+    /// `addrs`, or an error while a name has none yet (its lookup started): it could be any
+    /// address, so nothing is decided by them meanwhile; asked again, it may have one.
+    fn all_addrs(&self, names: &[String]) -> Result<Vec<IpAddr>> {
+        let addrs = self.addrs(names);
+        let r = self.0.resolved.read().unwrap();
+        match names.iter().find(|n| n.parse::<SocketAddr>().is_err() && !r.contains_key(*n)) {
+            Some(n) => bail!("peer {n} is not resolved yet; try again"),
+            None => Ok(addrs),
+        }
+    }
+
     fn admit(&self, names: &[String], from: IpAddr) -> bool {
         is_peer(&self.addrs(names), from)
     }
@@ -375,7 +386,9 @@ fn handle(host: &Host, peers: &Peers, mut conn: TcpStream, deadline: Instant) ->
         "pages" => return pages(host, &req, conn),
         "migration" => migration(host, &req),
         // Its peers by address, those configured by name too, and the one asking.
-        "route" => route(host, &req, &[peers.addrs(&host.config_now().peers), conn.peer_addr().map(|a| a.ip()).into_iter().collect()].concat()),
+        "route" => {
+            peers.all_addrs(&host.config_now().peers).and_then(|p| route(host, &req, &[p, conn.peer_addr().into_iter().map(|a| a.ip()).collect()].concat()))
+        }
         "lend" => lend(host, &req),
         // Whether a migration's source process is proven gone (never from published state).
         "source" => serde_json::from_value(req["ident"].clone())
@@ -575,8 +588,10 @@ mod tests {
         let gw: Ipv4Addr = "10.96.0.1".parse().unwrap();
         // The peer configured by name, as resolved; and the one asking.
         let p = Peers::default();
+        let e = p.all_addrs(&cfg.peers).unwrap_err().to_string();
+        assert!(e.contains("peer.example:7000 is not resolved yet"), "refused until the name has addresses: {e}");
         p.0.resolved.write().unwrap().insert("peer.example:7000".into(), vec!["10.94.0.1".parse().unwrap()]);
-        let peers = [p.addrs(&cfg.peers), vec!["10.95.0.1".parse().unwrap()]].concat();
+        let peers = [p.all_addrs(&cfg.peers).unwrap(), vec!["10.95.0.1".parse().unwrap()]].concat();
         let check = |ip: &str| routable(ip.parse().unwrap(), &cfg, &peers, &[gw]);
         for ip in ["127.0.0.1", "0.0.0.0", "255.255.255.255", "224.0.0.1", "10.98.0.1", "10.94.0.1", "10.97.0.1", "10.96.0.1", "10.95.0.1"] {
             assert!(check(ip).is_err(), "{ip} is refused");
