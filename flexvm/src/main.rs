@@ -379,7 +379,7 @@ fn real_main(args: &Args) -> Result<()> {
         Some("migrate") => call(json!({"op": "migrate", "to": arg2.ok_or("migrate needs NAME HOST:PORT")?})),
         Some("listen") => {
             // Before any thread that would take these signals is started.
-            util::flush_log_on(&[libc::SIGTERM, libc::SIGINT, libc::SIGHUP]);
+            util::on_signal(&[libc::SIGTERM, libc::SIGINT, libc::SIGHUP], |sig| util::raise_signal(sig));
             let mut host = open_host(args)?;
             let listener = configure_listener(&mut host, args, pos.get(1).copied(), listen::activated())?;
             listen::main(host, listener)
@@ -515,15 +515,15 @@ fn run(args: &Args, name: &str, template: &str) -> Result<()> {
         // No claim: this process becomes the VM, and one pending kills it as before.
         unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, set, std::ptr::null_mut()) };
     }
-    match taken {
-        Some((v, _)) if log.is_some() => print(v),
-        Some((v, conn)) => {
+    match (taken, log) {
+        (Some((v, _)), Some(_)) => print(v),
+        (Some((v, conn)), None) => {
             crate::log!("{v}");
             let id = host::Ident { pid: v["pid"].as_u64().unwrap_or(0) as u32, start: v["start"].as_u64().unwrap_or(0), boot: host::boot_id().into() };
             follow(conn, id)
         }
-        None if log.is_some() => spawn_detached_to(&host, name, args, log.as_ref().unwrap()),
-        None => vmproc::main(host, paths, Start::Run { name: name.into(), template: template.into(), ip, cmd }, notify_fd()),
+        (None, Some(log)) => spawn_detached(&host, name, args, &log),
+        (None, None) => vmproc::main(host, paths, Start::Run { name: name.into(), template: template.into(), ip, cmd }, notify_fd()),
     }
 }
 
@@ -532,7 +532,8 @@ const FOLLOW_SIGNALS: [i32; 6] = [libc::SIGTERM, libc::SIGINT, libc::SIGQUIT, li
 
 fn start(args: &Args, name: &str, s: Start) -> Result<()> {
     if args.has("detach") {
-        return spawn_detached(&open_host(args)?, name, args);
+        let host = open_host(args)?;
+        return spawn_detached(&host, name, args, &log_file(&host, name)?);
     }
     vmproc::main(open_host(args)?, paths(args)?, s, notify_fd())
 }
@@ -547,11 +548,7 @@ fn log_file(host: &Host, name: &str) -> Result<std::fs::File> {
     Ok(f)
 }
 
-fn spawn_detached(host: &Host, name: &str, args: &Args) -> Result<()> {
-    spawn_detached_to(host, name, args, &log_file(host, name)?)
-}
-
-fn spawn_detached_to(host: &Host, name: &str, args: &Args, log: &std::fs::File) -> Result<()> {
+fn spawn_detached(host: &Host, name: &str, args: &Args, log: &std::fs::File) -> Result<()> {
     let (r, w) = std::os::unix::net::UnixStream::pair()?;
     util::spawn_self(&args.child_args, log, w.as_raw_fd(), &[("FLEXVM_NOTIFY_FD", "3")])?;
     drop(w);

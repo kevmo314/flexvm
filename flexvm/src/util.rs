@@ -156,11 +156,12 @@ fn send_log_by(tx: &std::sync::mpsc::SyncSender<LogMsg>, mut msg: LogMsg, deadli
     }
 }
 
-/// Makes `sigs` end the process as their default action does (a supervisor
-/// sees the same signal), once the queued log lines are written (`flush_log`).
-/// Inherited ignored signals keep their disposition and are never blocked here.
+/// Takes the first of `sigs` on a thread of its own, with them unblocked there so a second ends
+/// the process at once; `raise_signal` there ends it as the default action would (a
+/// supervisor sees the same signal), once the queued log lines are written. Inherited ignored
+/// signals keep their disposition and are never blocked here (a blocked one would be queued).
 /// Called before any other thread that does not block them is started.
-pub fn flush_log_on(sigs: &[i32]) {
+pub fn on_signal(sigs: &[i32], action: impl FnOnce(i32) + Send + 'static) {
     let sigs: Vec<_> = sigs
         .iter()
         .copied()
@@ -172,13 +173,7 @@ pub fn flush_log_on(sigs: &[i32]) {
     if sigs.is_empty() {
         return;
     }
-    on_signal(&sigs, |sig| raise_signal(sig));
-}
-
-/// Blocks before spawning, then handles the first signal with the set unblocked so a second
-/// can end cleanup immediately. Call before starting other threads that could take the signals.
-pub fn on_signal(sigs: &[i32], action: impl FnOnce(i32) + Send + 'static) {
-    let set = block_signals(sigs);
+    let set = block_signals(&sigs);
     std::thread::spawn(move || {
         let sig = wait_signal(&set);
         unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut()) };
@@ -1463,7 +1458,7 @@ mod tests {
             libc::sigemptyset(&mut hup);
             libc::sigaddset(&mut hup, libc::SIGHUP);
             assert_eq!(libc::pthread_sigmask(libc::SIG_UNBLOCK, &hup, std::ptr::null_mut()), 0);
-            flush_log_on(&[libc::SIGHUP, libc::SIGTERM]);
+            on_signal(&[libc::SIGHUP, libc::SIGTERM], |sig| raise_signal(sig));
             let mut mask: libc::sigset_t = std::mem::zeroed();
             assert_eq!(libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut mask), 0);
             assert_eq!(libc::sigismember(&mask, libc::SIGHUP), 0, "ignored signals must not be blocked");
