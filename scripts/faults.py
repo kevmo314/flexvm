@@ -1867,20 +1867,27 @@ def reconcile_kill():
         return
     ip, gen, m, mig = got
     check(f"{what}: the VM runs on at B, md5 intact", where(n) == {B: "running"} and md5(B, n) == m, where(n))
-    b_log = B.listen_log
-    since = os.path.getsize(b_log) if os.path.exists(b_log) else 0
-    fault(B, "status", 0)
-    check(f"{what}: gc settles it as B's", wait_for(lambda: cli(A, "debug", "gc")[0] == 0 and not owed(A), 30), owed(A))
-    migs = os.path.join(B.state, "migs")
-    # Its own record: B's others (an earlier case's) go by their own retirement.
-    check(f"{what}: B's record gone", mig is not None and wait_for(lambda: mig not in os.listdir(migs), 10), (mig, os.listdir(migs)))
-    # B's gc could retire the released record by itself, its source gone (#380): only B's log of
-    # the `done` it took shows A told it.
-    def b_since():
-        with open(b_log, errors="replace") as f:
-            f.seek(since)
-            return f.read()
-    check(f"{what}: B was told done", wait_for(lambda: f"migration {mig}: its source says done" in b_since(), 10), b_since()[-800:])
+    # A forgets the outcome before it tells B `done`, so B's own retirement (its source gone)
+    # could take the released record first, and `done` would find nothing (#380). Held off
+    # (its `.retire.lock`, which a pass skips while taken), only `done` can take it.
+    import fcntl
+    retire = open(os.path.join(B.run, ".retire.lock"), "a")
+    fcntl.flock(retire, fcntl.LOCK_EX)
+    try:
+        b_log = B.listen_log
+        since = os.path.getsize(b_log) if os.path.exists(b_log) else 0
+        fault(B, "status", 0)
+        check(f"{what}: gc settles it as B's", wait_for(lambda: cli(A, "debug", "gc")[0] == 0 and not owed(A), 30), owed(A))
+        migs = os.path.join(B.state, "migs")
+        check(f"{what}: B's record gone", mig is not None and wait_for(lambda: mig not in os.listdir(migs), 10), (mig, os.listdir(migs)))
+
+        def b_since():
+            with open(b_log, errors="replace") as f:
+                f.seek(since)
+                return f.read()
+        check(f"{what}: B was told done", wait_for(lambda: f"migration {mig}: its source says done" in b_since(), 10), b_since()[-800:])
+    finally:
+        retire.close()
     check(f"{what}: still lent to B", addr(A, ip).get("lent") == gen and not addr(A, ip).get("withdrawn"), addr(A, ip))
     r2 = run(A, n + "-again", ip=ip)
     check(f"{what}: still not handed out here", not r2["ok"] and "lent" in r2["error"], r2)
