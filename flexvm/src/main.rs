@@ -218,14 +218,14 @@ fn main() {
     std::panic::set_hook(Box::new(|p| {
         let bt = std::backtrace::Backtrace::capture();
         let bt = if bt.status() == std::backtrace::BacktraceStatus::Captured { format!("\nstack backtrace:\n{bt}") } else { String::new() };
-        crate::log!("thread '{}' {p}{bt}", std::thread::current().name().unwrap_or("<unnamed>"));
-        util::flush_log(util::LOG_FLUSH);
+        util::log_final(format!("thread '{}' {p}{bt}\n", std::thread::current().name().unwrap_or("<unnamed>")));
+        util::output::drain();
     }));
     let (args, error) = Args::parse_partly(std::env::args().skip(1));
     let vm = matches!(args.positional.first().map(String::as_str), Some("run" | "resume" | "restore"));
     if let Err(e) = error.map_or_else(|| real_main(&args), Err) {
-        crate::log!("flexvm: {e}");
-        util::exit(if vm { vmproc::FAILED } else { 1 });
+        util::log_final(format!("flexvm: {e}\n"));
+        std::process::exit(if vm { vmproc::FAILED } else { 1 });
     }
     util::exit(0)
 }

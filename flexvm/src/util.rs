@@ -30,6 +30,7 @@ macro_rules! log {
 /// lines it has written.
 static LOG_DROPPED: AtomicUsize = AtomicUsize::new(0);
 static LOG_WRITTEN: AtomicUsize = AtomicUsize::new(0);
+static WRITER: OnceLock<std::sync::mpsc::SyncSender<LogMsg>> = OnceLock::new();
 
 /// A longer log line (a peer's error, say) is cut to this, its note of the cut included.
 const LOG_LINE_MAX: usize = 16 << 10;
@@ -71,8 +72,7 @@ fn cap_line(line: &mut String, max: usize) {
 /// is tried again at most once a second: until then lines are dropped, as for
 /// a full queue. Only a start is waited for, never stderr.
 fn log_writer() -> Option<&'static std::sync::mpsc::SyncSender<LogMsg>> {
-    use std::sync::mpsc::{sync_channel, SyncSender};
-    static WRITER: std::sync::OnceLock<SyncSender<LogMsg>> = std::sync::OnceLock::new();
+    use std::sync::mpsc::sync_channel;
     static TRIED: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
     if let Some(tx) = WRITER.get() {
         return Some(tx);
@@ -83,20 +83,17 @@ fn log_writer() -> Option<&'static std::sync::mpsc::SyncSender<LogMsg>> {
         let (tx, rx) = sync_channel::<LogMsg>(1024);
         let writer = move || {
             for msg in rx {
-                let line = match msg {
-                    LogMsg::Line(line) => line,
-                    LogMsg::Flush(done) => {
-                        let _ = done.send(());
-                        continue;
+                if let LogMsg::Line(line) = msg {
+                    let mut err = io::stderr().lock();
+                    let dropped = LOG_DROPPED.swap(0, Ordering::SeqCst);
+                    if dropped > 0 {
+                        let _ = err.write_all(format!("flexvm: {dropped} log lines dropped: stderr was blocked\n").as_bytes());
                     }
-                };
-                let mut err = io::stderr().lock();
-                let dropped = LOG_DROPPED.swap(0, Ordering::SeqCst);
-                if dropped > 0 {
-                    let _ = err.write_all(format!("flexvm: {dropped} log lines dropped: stderr was blocked\n").as_bytes());
+                    let _ = err.write_all(line.as_bytes());
+                    LOG_WRITTEN.fetch_add(1, Ordering::SeqCst);
+                } else if let LogMsg::Flush(done) = msg {
+                    let _ = done.send(());
                 }
-                let _ = err.write_all(line.as_bytes());
-                LOG_WRITTEN.fetch_add(1, Ordering::SeqCst);
             }
         };
         // Started with every signal blocked, so that a signal for the process
@@ -119,39 +116,65 @@ fn log_writer() -> Option<&'static std::sync::mpsc::SyncSender<LogMsg>> {
 /// call to be written, before the process exits: a flush goes through the
 /// queue behind them, and a stalled stderr does not hold the exit up past it.
 pub fn flush_log(timeout: Duration) {
-    use std::sync::mpsc::TrySendError;
-    let deadline = Instant::now() + timeout;
-    // No writer: every line so far was dropped.
-    let Some(tx) = log_writer() else { return };
+    flush_log_by(Instant::now() + timeout);
+}
+
+/// Queues an uncapped final diagnostic and flushes it within one exit deadline.
+/// Unlike ordinary `log!` calls, this may wait for room in the queue.
+pub fn log_final(line: String) {
+    let deadline = Instant::now() + LOG_FLUSH;
+    if !log_writer().is_some_and(|tx| send_log_by(tx, LogMsg::Line(line), deadline)) {
+        LOG_DROPPED.fetch_add(1, Ordering::SeqCst);
+    }
+    flush_log_by(deadline);
+}
+
+fn flush_log_by(deadline: Instant) {
+    // No writer: every line so far was dropped. Do not start one just to flush.
+    let Some(tx) = WRITER.get() else { return };
     let (done, acked) = std::sync::mpsc::channel();
-    let mut msg = LogMsg::Flush(done);
+    if send_log_by(tx, LogMsg::Flush(done), deadline) {
+        let _ = acked.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+    }
+}
+
+fn send_log_by(tx: &std::sync::mpsc::SyncSender<LogMsg>, mut msg: LogMsg, deadline: Instant) -> bool {
+    use std::sync::mpsc::TrySendError;
     loop {
         match tx.try_send(msg) {
-            Ok(()) => break,
+            Ok(()) => return true,
             Err(TrySendError::Full(m)) if Instant::now() < deadline => {
                 msg = m;
-                std::thread::sleep(Duration::from_millis(1));
+                std::thread::sleep(Duration::from_millis(1).min(deadline.saturating_duration_since(Instant::now())));
             }
-            Err(_) => return,
+            Err(_) => return false,
         }
     }
-    let _ = acked.recv_timeout(deadline.saturating_duration_since(Instant::now()));
 }
 
 /// Makes `sigs` end the process as their default action does (a supervisor
 /// sees the same signal), once the queued log lines are written (`flush_log`).
+/// Inherited ignored signals keep their disposition and are never blocked here.
 /// Called before any other thread that does not block them is started.
 pub fn flush_log_on(sigs: &[i32]) {
-    let set = block_signals(sigs);
+    let sigs: Vec<_> = sigs
+        .iter()
+        .copied()
+        .filter(|&sig| unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            libc::sigaction(sig, std::ptr::null(), &mut action) == 0 && action.sa_sigaction != libc::SIG_IGN
+        })
+        .collect();
+    if sigs.is_empty() {
+        return;
+    }
+    let set = block_signals(&sigs);
     std::thread::spawn(move || {
         let sig = wait_signal(&set);
         flush_log(LOG_FLUSH);
         unsafe {
             libc::signal(sig, libc::SIG_DFL);
-            let mut one: libc::sigset_t = std::mem::zeroed();
-            libc::sigemptyset(&mut one);
-            libc::sigaddset(&mut one, sig);
-            libc::pthread_sigmask(libc::SIG_UNBLOCK, &one, std::ptr::null_mut());
+            libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
             libc::raise(sig);
         }
         std::process::exit(128 + sig)
@@ -1245,6 +1268,51 @@ mod tests {
     }
 
     #[test]
+    fn signal_flush_preserves_ignored_sighup() {
+        const CHILD: &str = "FLEXVM_TEST_IGNORED_SIGHUP";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "util::tests::signal_flush_preserves_ignored_sighup"])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "ignored SIGHUP child: {status}");
+            return;
+        }
+        unsafe {
+            assert_ne!(libc::signal(libc::SIGHUP, libc::SIG_IGN), libc::SIG_ERR);
+            let mut hup: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut hup);
+            libc::sigaddset(&mut hup, libc::SIGHUP);
+            assert_eq!(libc::pthread_sigmask(libc::SIG_UNBLOCK, &hup, std::ptr::null_mut()), 0);
+            flush_log_on(&[libc::SIGHUP, libc::SIGTERM]);
+            let mut mask: libc::sigset_t = std::mem::zeroed();
+            assert_eq!(libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut mask), 0);
+            assert_eq!(libc::sigismember(&mask, libc::SIGHUP), 0, "ignored signals must not be blocked");
+            assert_eq!(libc::kill(libc::getpid(), libc::SIGHUP), 0);
+            let mut action: libc::sigaction = std::mem::zeroed();
+            assert_eq!(libc::sigaction(libc::SIGHUP, std::ptr::null(), &mut action), 0);
+            assert_eq!(action.sa_sigaction, libc::SIG_IGN);
+        }
+    }
+
+    #[test]
+    fn a_final_log_waits_for_queue_space_but_only_until_its_deadline() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        tx.send(LogMsg::Line("first".into())).unwrap();
+        let start = Instant::now();
+        assert!(!send_log_by(&tx, LogMsg::Line("full".into()), start + Duration::from_millis(20)));
+        assert!(start.elapsed() < Duration::from_millis(300));
+        let reader = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            assert!(matches!(rx.recv().unwrap(), LogMsg::Line(line) if line == "first"));
+            assert!(matches!(rx.recv().unwrap(), LogMsg::Line(line) if line.len() > LOG_LINE_MAX));
+        });
+        assert!(send_log_by(&tx, LogMsg::Line("x".repeat(LOG_LINE_MAX + 1)), Instant::now() + LOG_FLUSH));
+        reader.join().unwrap();
+    }
+
+    #[test]
     fn a_long_log_line_is_cut_on_a_character_boundary_within_its_cap() {
         let mut l = "é".repeat(20);
         super::cap_line(&mut l, 30);
@@ -1671,11 +1739,11 @@ pub mod output {
         written
     }
 
-    /// Before exit, bounded by a second from the start: what was printed
-    /// reaches its target if it can. No output lock is taken (a thread may
-    /// hold stdout's for good); what std still buffers, exit flushes if free.
+    /// Drains the relays before exit, after queued diagnostics have been flushed.
+    /// Bounded by a second from the start: what was printed reaches its target
+    /// if it can. No output lock is taken (a thread may hold stdout's for good);
+    /// what std still buffers, exit flushes if free.
     pub fn drain() {
-        super::flush_log(super::LOG_FLUSH);
         let deadline = Instant::now() + STALL;
         let null = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
         if null >= 0 {

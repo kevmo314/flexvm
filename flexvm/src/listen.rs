@@ -9,7 +9,6 @@ use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -90,9 +89,6 @@ pub fn main(host: Host, listener: TcpListener) -> Result<()> {
     crate::gc::periodic(host.clone());
     let peers = Peers::watch(host.clone());
     let (waits, moved) = (Waiting::new(MAX_WAITING, MAX_WAITING_FROM), Waiting::new(MAX_MOVED, MAX_MOVED_FROM));
-    // Refusals are logged off the accept loop, never waiting on stderr: past 64 queued, dropped.
-    let (refusals, queued) = std::sync::mpsc::sync_channel::<String>(64);
-    std::thread::spawn(move || queued.into_iter().for_each(|e| crate::log!("peer request: {e}")));
     let host = std::sync::Arc::new(host);
     for conn in listener.incoming() {
         // Everything a request does before it is read, checking its peer
@@ -122,16 +118,16 @@ pub fn main(host: Host, listener: TcpListener) -> Result<()> {
             Admission::Moved => moved.take(from),
         };
         let Some(waiting) = waiting else {
-            not_a_peer(conn, from, &refusals);
+            not_a_peer(conn, from);
             continue;
         };
-        let (host, peers, refusals) = (host.clone(), peers.clone(), refusals.clone());
+        let (host, peers) = (host.clone(), peers.clone());
         std::thread::spawn(move || {
             let admitted = peers.admit_by(&host, from, Instant::now() + ADMIT_WAIT);
             drop(waiting);
             match admitted.then(|| Slot::take(&ACTIVE, MAX_ACTIVE)).flatten() {
                 Some(slot) => serve(&host, conn, slot, deadline),
-                None if !admitted => not_a_peer(conn, from, &refusals),
+                None if !admitted => not_a_peer(conn, from),
                 None => {}
             }
         });
@@ -302,10 +298,10 @@ impl Peers {
     }
 }
 
-fn not_a_peer(conn: TcpStream, from: IpAddr, log: &SyncSender<String>) {
+fn not_a_peer(conn: TcpStream, from: IpAddr) {
     let local = conn.local_addr().map(|a| a.to_string()).unwrap_or_default();
     let e = format!("{from} is not a peer of {local} (add it there: flexvm config --peer)");
-    let _ = log.try_send(e.clone());
+    crate::log!("peer request: {e}");
     refuse(conn, &e, None);
 }
 
