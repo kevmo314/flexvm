@@ -36,6 +36,38 @@ impl Drop for Hold {
     }
 }
 
+/// Recent admission: boottime, MiB, id, and optionally the VM's usage baseline.
+/// Older records have only the first three elements.
+#[derive(Debug, Serialize, Deserialize)]
+struct Grant(u64, u64, u64, #[serde(default)] Option<GrantOwner>);
+
+#[derive(Debug, Serialize, Deserialize)]
+struct GrantOwner {
+    ident: Ident,
+    cgroup: PathBuf,
+    used_mib: Option<u64>,
+}
+
+/// Charge only memory not yet reflected in MemAvailable. Work backwards so
+/// growth since a newer grant is credited once, before older grants can use it.
+fn pending_grants(grants: &[Grant], held_ids: &HashSet<u64>, mut memory: impl FnMut(&Path) -> Option<u64>) -> u64 {
+    let mut usage = HashMap::new();
+    grants
+        .iter()
+        .rev()
+        .filter(|g| !held_ids.contains(&g.2))
+        .map(|g| {
+            let Some(owner) = &g.3 else { return g.1 };
+            let Some(baseline) = owner.used_mib else { return g.1 };
+            let (current, credited) = usage.entry(&owner.ident).or_insert_with(|| (memory(&owner.cgroup), 0u64));
+            let Some(current) = *current else { return g.1 };
+            let used = g.1.min(current.saturating_sub(baseline).saturating_sub(*credited));
+            *credited += used;
+            g.1 - used
+        })
+        .sum()
+}
+
 /// What a grant must leave available.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Floor {
@@ -807,7 +839,7 @@ impl Host {
     pub fn refund_by(&self, id: u64, deadline: Option<std::time::Instant>) {
         let Ok(_l) = self.lock_by(deadline) else { return };
         let path = self.grants();
-        let mut grants: Vec<(u64, u64, u64)> = load(&path).ok().flatten().unwrap_or_default();
+        let mut grants: Vec<Grant> = load(&path).ok().flatten().unwrap_or_default();
         let n = grants.len();
         grants.retain(|g| g.2 != id);
         if grants.len() != n {
@@ -816,18 +848,18 @@ impl Host {
     }
 
     /// Against the reserve: None if refused; errors grant nothing (`WouldBlock` if the lock is busy).
-    pub fn grant(&self, mib: u64, deadline: Option<std::time::Instant>) -> Result<Option<u64>> {
-        Ok(self.grant_inner(mib, Floor::Reserve, false, deadline, crate::vmproc::host_available_mib)?.ok().map(|g| g.0))
+    pub fn grant(&self, mib: u64, deadline: Option<std::time::Instant>, cgroup: Option<&Path>) -> Result<Option<u64>> {
+        Ok(self.grant_inner(mib, Floor::Reserve, false, deadline, cgroup, crate::vmproc::host_available_mib)?.ok().map(|g| g.0))
     }
 
     /// A refusal is an error too; `hold` keeps the grant past `GRANT_WINDOW`.
-    pub fn grant_start(&self, mib: u64, floor: Floor, hold: bool) -> Result<(u64, Option<Hold>)> {
-        self.grant_inner(mib, floor, hold, None, crate::vmproc::host_available_mib)?
+    pub fn grant_start(&self, mib: u64, floor: Floor, hold: bool, cgroup: Option<&Path>) -> Result<(u64, Option<Hold>)> {
+        self.grant_inner(mib, floor, hold, None, cgroup, crate::vmproc::host_available_mib)?
     }
 
-    /// MemAvailable lags a grant until the guest touches the memory, so all
-    /// processes' grants of the last `GRANT_WINDOW` count as used, and held
-    /// ones (`grant_start`) however old, each once. Returns the grant's id.
+    /// MemAvailable lags a grant until the guest touches the memory: recent
+    /// grants count only their unused portion, or in full without a readable
+    /// owner baseline. Held grants count however old, each once. Returns its id.
     /// Leaves `floor` available, read with the reserve under the host lock.
     /// Ok(Err(why)) if refused. Test fault `no_admit`: refuses everything.
     fn grant_inner(
@@ -836,6 +868,7 @@ impl Host {
         floor: Floor,
         hold: bool,
         deadline: Option<std::time::Instant>,
+        cgroup: Option<&Path>,
         available: impl FnOnce() -> Option<u64>,
     ) -> Result<std::result::Result<(u64, Option<Hold>), Error>> {
         if fault("no_admit") {
@@ -852,12 +885,12 @@ impl Host {
         };
         let path = self.grants();
         let now = boottime_ms();
-        let mut grants: Vec<(u64, u64, u64)> = load(&path)?.unwrap_or_default();
+        let mut grants: Vec<Grant> = load(&path)?.unwrap_or_default();
         // A stamp in the future is an older build's wall clock.
-        grants.retain(|&(t, ..)| t <= now && now - t <= GRANT_WINDOW.as_millis() as u64);
+        grants.retain(|g| g.0 <= now && now - g.0 <= GRANT_WINDOW.as_millis() as u64);
         let held = self.holds(&l);
         let held_ids: HashSet<_> = held.iter().map(|h| h.0).collect();
-        let pending: u64 = grants.iter().filter(|g| !held_ids.contains(&g.2)).map(|g| g.1).sum::<u64>() + held.iter().map(|h| h.1).sum::<u64>();
+        let pending: u64 = pending_grants(&grants, &held_ids, crate::limit::used_mib) + held.iter().map(|h| h.1).sum::<u64>();
         let avail = available().ok_or("cannot read MemAvailable from /proc/meminfo")?;
         if avail < floor + pending + mib {
             return Ok(Err(format!("not enough memory here for {mib} MiB above the {floor} MiB {what}").into()));
@@ -878,7 +911,8 @@ impl Host {
                 Some(Hold { path, id, mib, _file: f })
             }
         };
-        grants.push((now, mib, id));
+        let owner = cgroup.map(|cg| GrantOwner { ident: Ident::me(), cgroup: cg.into(), used_mib: crate::limit::used_mib(cg) });
+        grants.push(Grant(now, mib, id, owner));
         if let Err(e) = store(&path, &grants, false) {
             drop(hold);
             return Err(e);
@@ -1227,7 +1261,7 @@ pub struct Entry {
 }
 
 /// Unique however pids are reused.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Ident {
     pub pid: u32,
     pub start: u64,
@@ -2362,7 +2396,7 @@ mod tests {
 
     /// `grant_inner` against `AVAIL`.
     fn grant_at(h: &Host, mib: u64, floor: Floor, hold: bool) -> std::result::Result<(u64, Option<Hold>), Error> {
-        h.grant_inner(mib, floor, hold, None, || Some(AVAIL)).unwrap()
+        h.grant_inner(mib, floor, hold, None, None, || Some(AVAIL)).unwrap()
     }
 
     #[test]
@@ -2464,7 +2498,7 @@ mod tests {
         let before = boottime_ms();
         grant_at(&h, 1000, Floor::Reserve, false).unwrap();
         let path = h.grants();
-        let grants: Vec<(u64, u64, u64)> = load(&path).unwrap().unwrap();
+        let grants: Vec<Grant> = load(&path).unwrap().unwrap();
         assert!(grants[0].0 >= before && grants[0].0 <= boottime_ms());
         // From here what counts depends on stamps' ages alone, not on how long the test takes.
         pin_clock(grants[0].0);
@@ -2487,6 +2521,72 @@ mod tests {
         assert!(grant_at(&h, 1, Floor::Reserve, false).is_err());
         store(&path, &vec![(now - GRANT_WINDOW.as_millis() as u64 - 1000, 1000u64, 1u64)], false).unwrap();
         grant_at(&h, 1000, Floor::Reserve, false).unwrap();
+    }
+
+    fn owned_grant(id: u64, baseline: Option<u64>) -> Grant {
+        Grant(0, 100, id, Some(GrantOwner { ident: Ident::me(), cgroup: "/fake/vm".into(), used_mib: baseline }))
+    }
+
+    #[test]
+    fn pending_grants_discount_memory_already_used() {
+        let grants = [owned_grant(1, Some(200))];
+        for (current, pending) in [(Some(300), 0), (Some(350), 0), (Some(240), 60), (Some(150), 100), (None, 100)] {
+            assert_eq!(
+                pending_grants(&grants, &HashSet::new(), |cg| {
+                    assert_eq!(cg, Path::new("/fake/vm"));
+                    current
+                }),
+                pending,
+                "current {current:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pending_grants_keep_unknown_baselines_and_legacy_records_in_full() {
+        let legacy: Grant = serde_json::from_str("[0,100,1]").unwrap();
+        let grants = [legacy, owned_grant(2, None)];
+        assert_eq!(pending_grants(&grants, &HashSet::new(), |_| panic!("no readable baseline")), 200);
+        let decoded: Vec<Grant> = serde_json::from_slice(&serde_json::to_vec(&grants).unwrap()).unwrap();
+        assert_eq!(pending_grants(&decoded, &HashSet::new(), |_| Some(1000)), 200);
+    }
+
+    #[test]
+    fn pending_grants_credit_each_owners_growth_once() {
+        let mut grants = [owned_grant(1, Some(200)), owned_grant(2, Some(240)), owned_grant(3, Some(200))];
+        // Another VM (including reuse of a pid) has its own growth budget.
+        grants[2].3.as_mut().unwrap().ident.start += 1;
+        let mut reads = 0;
+        assert_eq!(
+            pending_grants(&grants, &HashSet::new(), |_| {
+                reads += 1;
+                Some(300)
+            }),
+            100
+        );
+        assert_eq!(reads, 2, "one reading per owner");
+        assert_eq!(pending_grants(&grants, &HashSet::from([2]), |_| Some(300)), 0);
+    }
+
+    #[test]
+    fn admission_records_the_vms_cgroup_baseline() {
+        let mut h = host("grant-owner");
+        h.cfg.reserve_mib = 0;
+        let cg = h.run.join("cg");
+        std::fs::create_dir(&cg).unwrap();
+        std::fs::write(cg.join("memory.current"), (200u64 << 20).to_string()).unwrap();
+        let id = h.grant_inner(100, Floor::Reserve, false, None, Some(&cg), || Some(100)).unwrap().unwrap().0;
+        let grants: Vec<Grant> = load(&h.grants()).unwrap().unwrap();
+        let owner = grants[0].3.as_ref().unwrap();
+        assert_eq!(owner.ident, Ident::me());
+        assert_eq!(owner.cgroup, cg);
+        assert_eq!(owner.used_mib, Some(200));
+        std::fs::write(cg.join("memory.current"), (300u64 << 20).to_string()).unwrap();
+        assert!(h.grant_inner(100, Floor::Reserve, false, None, None, || Some(100)).unwrap().is_ok());
+        h.refund(id);
+        let grants: Vec<Grant> = load(&h.grants()).unwrap().unwrap();
+        assert_eq!(grants.len(), 1);
+        assert!(grants[0].3.is_none());
     }
 
     #[test]
@@ -2514,8 +2614,8 @@ mod tests {
     fn admission_errors_are_not_refusals() {
         let mut h = host("admit-err");
         h.cfg.reserve_mib = 0;
-        let grants = || load::<Vec<(u64, u64, u64)>>(&h.grants()).unwrap().unwrap_or_default();
-        let grant = |avail: Option<u64>| h.grant_inner(1, Floor::Reserve, false, None, || avail).map(|r| r.ok().map(|g| g.0));
+        let grants = || load::<Vec<Grant>>(&h.grants()).unwrap().unwrap_or_default();
+        let grant = |avail: Option<u64>| h.grant_inner(1, Floor::Reserve, false, None, None, || avail).map(|r| r.ok().map(|g| g.0));
         assert!(grant(None).unwrap_err().to_string().contains("MemAvailable"));
         assert!(grants().is_empty());
         assert_eq!(grant(Some(0)).unwrap(), None);
@@ -2528,7 +2628,7 @@ mod tests {
             let _ = release.1.recv();
         });
         held.1.recv().unwrap();
-        let err = h.grant(1, Some(std::time::Instant::now() + Duration::from_millis(50))).unwrap_err();
+        let err = h.grant(1, Some(std::time::Instant::now() + Duration::from_millis(50)), None).unwrap_err();
         assert_eq!(err.downcast_ref::<std::io::Error>().unwrap().kind(), std::io::ErrorKind::WouldBlock);
         release.0.send(()).unwrap();
         t.join().unwrap();
@@ -2574,7 +2674,7 @@ mod tests {
     fn disk_restore_reservation_survives_expiry_and_can_be_completed_or_refunded() {
         let h = host("disk-restore-hold");
         let charge = crate::limit::allowance(1600);
-        let grant = |mib, held| h.grant_inner(mib, Floor::Reserve, held, None, || Some(h.cfg.reserve_mib + charge)).unwrap();
+        let grant = |mib, held| h.grant_inner(mib, Floor::Reserve, held, None, None, || Some(h.cfg.reserve_mib + charge)).unwrap();
         let (id, hold) = grant(charge, true).unwrap();
         let hold = Mutex::new(hold);
         let path = h.grants();
@@ -2609,7 +2709,7 @@ mod tests {
         let hold = grant_at(&h, 2000, Floor::Reserve, true).unwrap().1.unwrap();
         // The window passes (the grant ages out): held, it still counts, once.
         let path = h.grants();
-        let aged: Vec<(u64, u64, u64)> = load::<Vec<(u64, u64, u64)>>(&path).unwrap().unwrap().into_iter().map(|g| (0, g.1, g.2)).collect();
+        let aged: Vec<(u64, u64, u64)> = load::<Vec<Grant>>(&path).unwrap().unwrap().into_iter().map(|g| (0, g.1, g.2)).collect();
         store(&path, &aged, false).unwrap();
         assert!(!admit(&h, 1001) && admit(&h, 1000), "a held grant counts after the window, once");
         drop(hold);

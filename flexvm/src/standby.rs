@@ -214,7 +214,7 @@ fn start_one(host: &Host, template: &str, log: &File) -> Result<Option<UnixStrea
     if flock(&stop, libc::LOCK_SH | libc::LOCK_NB).is_err() {
         return Ok(None);
     }
-    let grant = match host.grant(256, Some(by)) {
+    let grant = match host.grant(256, Some(by), None) {
         Ok(Some(id)) => id,
         Ok(None) => return Ok(None),
         Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::WouldBlock) => return Ok(None),

@@ -275,10 +275,11 @@ impl Proc {
     /// None holds the grant until a disk restore or arrival finishes pulling.
     pub fn admit_start(&self, need: u64, held: Option<u64>, floor: crate::host::Floor) -> Result<()> {
         let mib = crate::limit::allowance(need);
+        let cgroup = self.vm.get().and_then(|vm| vm.limit.cgroup());
         let id = match held {
-            Some(held) => self.host.grant_start(mib.saturating_sub(held), floor, false)?.0,
+            Some(held) => self.host.grant_start(mib.saturating_sub(held), floor, false, cgroup)?.0,
             None => {
-                let (id, hold) = self.host.grant_start(mib, floor, true)?;
+                let (id, hold) = self.host.grant_start(mib, floor, true, cgroup)?;
                 *self.held_grant.lock().unwrap() = Some(hold.ok_or("no hold")?);
                 id
             }
@@ -1381,7 +1382,7 @@ fn resize(vm: &Vm, host: &Host, hint: Option<u64>, grow_only: bool) -> Result<Re
     let Some(plan) = sizes.plan(requested, plugged, avail, last.elapsed(), hint.is_some(), grow_only) else {
         return Ok(Resized::Busy);
     };
-    let refused = plan.charge > 0 && host.grant(plan.charge, None)?.is_none();
+    let refused = plan.charge > 0 && host.grant(plan.charge, None, vm.limit.cgroup())?.is_none();
     let full = plan.short && (plugged == hotplug_total || refused);
     // Starved only when the host refused it: at its own ceiling, moving it cannot help.
     vm.starved.store(plan.short && refused, Ordering::SeqCst);

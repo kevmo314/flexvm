@@ -168,7 +168,7 @@ impl Vm {
         if more == 0 {
             return;
         }
-        match host.grant(more, Some(Instant::now() + ADMIT_WAIT)) {
+        match host.grant(more, Some(Instant::now() + ADMIT_WAIT), self.limit.cgroup()) {
             Ok(Some(_)) => self.limit.plug(cap, more),
             Ok(None) => {}
             Err(e) => crate::log!("vm {}: admitting {more} MiB: {e}", self.name),

@@ -18,7 +18,7 @@
 
 use std::io::{Read, Seek};
 use std::os::fd::AsRawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -77,6 +77,11 @@ pub struct Limit {
     pub throttled: AtomicBool,
 }
 
+/// MiB charged to a Firecracker's cgroup; unreadable or malformed is unknown.
+pub(crate) fn used_mib(cgroup: &Path) -> Option<u64> {
+    Some(std::fs::read_to_string(cgroup.join("memory.current")).ok()?.trim().parse::<u64>().ok()? >> 20)
+}
+
 impl Limit {
     pub fn new(cgroup: Option<PathBuf>) -> Limit {
         Limit { cgroup, mark: Mutex::new(Mark::default()), throttled: AtomicBool::new(false) }
@@ -84,8 +89,11 @@ impl Limit {
 
     /// MiB charged to the VM's cgroup.
     pub fn used(&self) -> Option<u64> {
-        let cg = self.cgroup.as_ref()?;
-        Some(std::fs::read_to_string(cg.join("memory.current")).ok()?.trim().parse::<u64>().ok()? >> 20)
+        used_mib(self.cgroup()?)
+    }
+
+    pub fn cgroup(&self) -> Option<&Path> {
+        self.cgroup.as_deref()
     }
 
     pub fn admitted(&self) -> u64 {
@@ -123,7 +131,7 @@ impl Limit {
 
     /// Usage within half a step of the mark: admit a step and raise it.
     fn grow(&self, host: &Host) -> Growth {
-        self.grow_with(host, |more| host.grant(more, None))
+        self.grow_with(host, |more| host.grant(more, None, self.cgroup()))
     }
 
     fn grow_with(&self, host: &Host, grant: impl Fn(u64) -> crate::util::Result<Option<u64>>) -> Growth {
