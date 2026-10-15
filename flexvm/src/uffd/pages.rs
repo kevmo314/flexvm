@@ -311,6 +311,10 @@ impl Pages {
     /// Settles claimed `page`, claimed from state `from`. Returns whether a REMOTE page got resolved, for the pager's
     /// count of pages to pull.
     fn settle(&self, page: usize, populated: bool, from: u8) -> bool {
+        if populated {
+            // Installed writable: publish dirty before PRESENT, which lets quiesce_export finish and freeze take it.
+            self.mark_dirty(page);
+        }
         let old = self.states[page]
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |s| {
                 Some(match (s, populated) {
@@ -321,10 +325,6 @@ impl Pages {
             })
             .unwrap();
         debug_assert!(old == INFLIGHT || (old == DISCARDED && !populated), "settling page {page} in state {old}");
-        if populated {
-            // Installed writable: it may change without a fault from now on.
-            self.mark_dirty(page);
-        }
         if populated || old == DISCARDED {
             self.forget_failure(page);
         }
@@ -386,5 +386,35 @@ impl Pages {
         }
         self.settled();
         (resolved, Ok(()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn present_publishes_dirty() {
+        for from in [BASE, ZERO, REMOTE] {
+            let mut pages = Pages::new(8192);
+            pages.fill(0, pages.len(), from);
+            assert_eq!(pages.claim(0, pages.len(), from, |_| true), pages.len());
+            thread::scope(|s| {
+                s.spawn(|| {
+                    for p in 0..pages.len() {
+                        while pages.get(p) != PRESENT {
+                            std::hint::spin_loop();
+                        }
+                        assert!(pages.touched(p));
+                        assert_ne!(pages.dirty[p / 64].load(Ordering::SeqCst) & (1 << (p % 64)), 0);
+                    }
+                });
+                let (resolved, result) =
+                    pages.install(0, pages.len(), from, None, |p, _| if p % 2 == 0 { Ok(1) } else { Err(io::Error::from_raw_os_error(libc::EEXIST)) });
+                result.unwrap();
+                assert_eq!(resolved, if from == REMOTE { pages.len() } else { 0 });
+            });
+            assert!(pages.dirty_bits(true).iter().all(|&bits| bits == u64::MAX));
+        }
     }
 }
