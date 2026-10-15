@@ -799,7 +799,12 @@ impl Host {
 
     /// Gives back grant `id` (from `grant`) that was not used.
     pub fn refund(&self, id: u64) {
-        let Ok(_l) = self.lock() else { return };
+        self.refund_by(id, None)
+    }
+
+    /// `refund`, giving up at `deadline` (the grant then expires on its own).
+    pub fn refund_by(&self, id: u64, deadline: Option<std::time::Instant>) {
+        let Ok(_l) = self.lock_by(deadline) else { return };
         let path = self.grants();
         let mut grants: Vec<(u64, u64, u64)> = load(&path).ok().flatten().unwrap_or_default();
         let n = grants.len();

@@ -209,7 +209,7 @@ def fault(host, f, ms):
 FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_before_run", "restore_after_run",
           "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "resume_kill",
           "prepare_fail", "short_incoming", "slow_preload", "bad_preload", "bad_app_log", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
-          "started_fsync", "started_unmark", "start_stall", "incoming_stall", "claim_stall", "standby_lock_stall", "handoff_stall", "ckpt_wp_race",
+          "started_fsync", "started_unmark", "start_stall", "incoming_stall", "claim_stall", "standby_lock_stall", "standby_lock_hang", "handoff_stall", "ckpt_wp_race",
           "fetch_tail_enomem", "fetch_enomem_stuck", "pull_enomem", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo", "release_stall", "release_late", "no_plug", "pause_lost", "tap_backlog", "tap_backlog_stuck", "pause_unknown", "no_collapse", "collapse_slow", "pages_slow", "unlend_fail", "route_stall")
 
 
@@ -4874,6 +4874,81 @@ def standby_refill_race():
     cleanup(n)
 
 
+def standby_starting(host):
+    """(pid, start) of each `run --standby` process of `host` alive now, listed or not."""
+    out = []
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        try:
+            argv = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")
+            stat = open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()
+        except OSError:
+            continue
+        if host.state.encode() in argv and b"--standby" in argv and stat[0] != "Z":
+            out.append((int(pid), int(stat[19])))
+    return out
+
+
+def standby_lock_timeout():
+    """A refill's standby that does not create its lock file within
+    LOCKED_TIMEOUT (`standby_lock_hang`, held past it) while the host is under
+    its reserve: the refill kills and reaps it before letting relief in, so it
+    never gets listed or loads; relief, finding no standby to stop, starts
+    eviction only once it is gone; the refill fails, and the child leaves
+    nothing behind (its cgroup, work directory, standby files)."""
+    t, n = args.template, "ft-sb-lock-timeout"
+    ok(run(A, n))
+    d = os.path.join(A.run, "standby", t)
+    pressure, active = os.path.join(A.run, "standby", ".pressure"), os.path.join(A.run, "evict.active")
+    for f in (pressure, active):
+        if os.path.exists(f):
+            os.remove(f)
+    fault(A, "no_evict", 600000)
+    fault(A, "standby_lock_hang", 30000)
+    res, seen, began = {}, {}, time.time()
+    th = threading.Thread(target=lambda: res.update(r=cli_json(A, "standby", "--template", t, "1"), took=time.time() - began))
+    th.start()
+    child = None
+    try:
+        wait_for(lambda: standby_starting(A), 5)
+        child = (standby_starting(A) or [None])[0]
+        avail = mem_available()
+        with marks(avail + 4096, avail + 4608):
+            start = time.time()
+            while time.time() - start < 20 and "active" not in seen:
+                gone = child is not None and not alive(child[0])
+                if gone and "gone" not in seen:
+                    seen["gone"] = time.time() - start
+                if os.path.exists(active):
+                    seen["active"] = time.time() - start
+                    seen["gone at active"] = gone
+                time.sleep(0.05)
+            th.join(30)
+            listed = standby_pids(A, t)
+            marked = os.path.exists(pressure)
+    finally:
+        fault(A, "standby_lock_hang", 0)
+        fault(A, "no_evict", 0)
+    check("standby lock timeout: the hung standby was seen starting", child is not None)
+    r = res.get("r", {})
+    check("standby lock timeout: the refill fails, its lock unacknowledged, within the timeout",
+          not r.get("ok", True) and "acknowledge its lock" in r.get("error", "") and res.get("took", 99) < 12, res)
+    check("standby lock timeout: killed and reaped by the refill", child is not None and not alive(child[0]), (child, seen))
+    check("standby lock timeout: it was never listed, so relief marked no pressure", not listed and not marked, (listed, marked))
+    check("standby lock timeout: eviction starts, only once it is gone", seen.get("gone at active") is True, seen)
+    if child:
+        key = f"{child[0]}-{child[1]}"
+        left = lambda: [p for p in [f"/sys/fs/cgroup/flexvm/vm-{key}", os.path.join(A.run, "w", key)] if os.path.exists(p)] + \
+            [f for f in (os.listdir(d) if os.path.isdir(d) else []) if key in f]
+        check("standby lock timeout: nothing left behind (the refill sweeps)", wait_for(lambda: not left(), 5), left())
+    cli(A, "standby", "--template", t, "0")
+    check("standby lock timeout: no standby left", wait_for(lambda: not standby_starting(A), 30), standby_starting(A))
+    try:
+        os.remove(pressure)
+    except FileNotFoundError:
+        pass
+    cleanup(n)
+
+
 def fc_died():
     """A VM's Firecracker dies under it (a guest panic, an OOM kill): its
     process notices at once, cleans up as a kill would (address withdrawn,
@@ -5928,7 +6003,7 @@ SCENARIOS = dict(
     kill_refused_checkpoint=no_evict(kill_refused_checkpoint), wildcard_listen=wildcard_listen, peer_by_name=peer_by_name,
     forged_peer=forged_peer, restore_ip_peer=restore_ip_peer, late_withdrawal=late_withdrawal, unlend_retry=unlend_retry,
     unit_restart=unit_restart, log_cap=log_cap, gc_debris=gc_debris, prefix_change=prefix_change, arrival_log=arrival_log, template_tap=template_tap,
-    incoming_killed=incoming_killed, start_killed=start_killed, claim_killed=claim_killed, standby_stalled=standby_stalled, standby_refill_race=standby_refill_race, fc_died=fc_died,
+    incoming_killed=incoming_killed, start_killed=start_killed, claim_killed=claim_killed, standby_stalled=standby_stalled, standby_refill_race=standby_refill_race, standby_lock_timeout=standby_lock_timeout, fc_died=fc_died,
     sigkill_restart=sigkill_restart, listen_trickle=listen_trickle,
     cow_wp_race=cow_wp_race, fetch_tail_enomem=fetch_tail_enomem, fetch_enomem_stuck=fetch_enomem_stuck, pull_enomem=pull_enomem,
     collapse_abort=collapse_abort, collapse_ckpt_fail=collapse_ckpt_fail, ckpt_paused_backlog=ckpt_paused_backlog, same_host_order=same_host_order, same_host_slow_route=same_host_slow_route, same_host_flood=same_host_flood, same_host_late_handover=same_host_late_handover, same_host_backlog=same_host_backlog, ckpt_backlog=ckpt_backlog, rx_stall=rx_stall, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,

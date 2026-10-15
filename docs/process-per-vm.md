@@ -375,7 +375,7 @@ one forwards its signals to it and exits with the status the VM process sends
 back on the claim connection. Under memory pressure standby VMs are stopped
 (SIGUSR1) first. The count is explicit, and refills stop under the reserve; one refill
 of a template runs at a time (`.refill` lock), and waits until the standby
-VMs it starts are ready, so concurrent claims never overfill. A claim sent
+VMs it starts are ready (a minute at most each), so concurrent claims never overfill. A claim sent
 but not answered (the standby died, or hung up) is an uncertain outcome: the
 guest may have run, so `run` reports it (with the standby's socket, and
 whether the registry shows the VM) and starts nothing else.
@@ -402,7 +402,7 @@ standby VMs are stopped first, under a lock of their own
 (`STATE/standby.stop.lock`), so a slow migration holding `evict.lock` does
 not hold that up. A refill holds it shared from each standby's grant until
 that standby has created its lock file (it says so on its notify fd), 5 s
-at most (its grant gives up on a busy host lock by then), never through its load, and starts none while relief holds it: relief either lists
+at most (its grant gives up on a busy host lock by then; a standby that has not said so by then, or said something else, is killed and reaped before the lock is let go, then its grant is refunded and what it left swept, and the refill fails), never through its load, and starts none while relief holds it: relief either lists
 a standby being started or ran before its grant, and meanwhile holds eviction
 off as it does for another process stopping them. Signalling any marks the pressure (`RUN/standby/.pressure`,
 no refill for a minute); the controller then checks their pidfds on its
