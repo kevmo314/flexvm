@@ -95,6 +95,8 @@ impl Proc {
         self.publish();
         if let Err(e) = self.take_address(vm) {
             drop(op);
+            // An existing finish worker may only be retrying the address.
+            self.sync_clock_later();
             self.finish_later(vm.clone(), true, true);
             return Err(e);
         }

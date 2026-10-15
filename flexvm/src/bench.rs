@@ -91,20 +91,20 @@ pub fn run(args: &Args) -> Result<()> {
     let template = args.get("template").unwrap_or("default");
     let date = command("date", &["-u", "+%Y-%m-%dT%H-%M-%SZ"])?;
     let id = format!("{}-{}", std::process::id(), crate::migrate::migration_id());
-    let parent = match args.get("lifecycle") {
-        Some(dir) => std::path::absolute(dir)?,
-        None => std::env::temp_dir(),
-    };
-    std::fs::create_dir_all(&parent)?;
-    let scratch = parent.join(format!("bench-{id}"));
-    std::fs::create_dir(&scratch)?;
     let (report, suffix) = match args.get("lifecycle") {
-        Some(_) => (lifecycle(&hosts, args, template, &scratch, &date, &id), "-lifecycle"),
+        Some(dir) => {
+            let parent = std::path::absolute(dir)?;
+            std::fs::create_dir_all(&parent)?;
+            let scratch = parent.join(format!("bench-{id}"));
+            std::fs::create_dir(&scratch)?;
+            let report = lifecycle(&hosts, args, template, &scratch, &date, &id);
+            if let Err(e) = std::fs::remove_dir_all(&scratch) {
+                crate::log!("bench: cleanup {}: {e}", scratch.display());
+            }
+            (report, "-lifecycle")
+        }
         None => (runs(&hosts, args, template, &date, &id), ""),
     };
-    if let Err(e) = std::fs::remove_dir_all(&scratch) {
-        crate::log!("bench: cleanup {}: {e}", scratch.display());
-    }
     let mut report = report?;
     let sha = command("git", &["rev-parse", "HEAD"])?;
     report["date_utc"] = json!(date);
