@@ -246,6 +246,7 @@ impl Proc {
                 "id": vm.template.meta.id,
                 "ip": vm.ip.to_string(),
                 "gen": gen,
+                "rev": self.rev(),
                 "source": source,
                 "source_ident": crate::host::Ident::me(),
                 "rss_mib": vm.rss() >> 20,
@@ -311,6 +312,10 @@ impl Proc {
                 Ok(()) => self.lent_here.store(false, Ordering::SeqCst),
                 Err(r) => eprintln!("vm {}: undoing its loan after an aborted migration: {r}", vm.name),
             }
+        }
+        // Past the revision its target took (and may have announced, if it committed).
+        if let Err(r) = self.advance(&l, 2) {
+            eprintln!("vm {}: recording its revision: {r}", vm.name);
         }
         drop(l);
         self.set_leaving(false);
@@ -668,7 +673,9 @@ impl Proc {
         *self.arrived.lock().unwrap() = Some(self.host.mig_begin(mig, &source.addr, by, Some(ip))?);
         let tpl = Template::open_id(&self.paths, req["template"].as_str().ok_or("missing template")?, req["id"].as_str().ok_or("missing template id")?)?;
         t.mark("template");
-        let claim = self.host.claim_incoming(&self.host.lock()?, &name, ip, req["gen"].as_u64().unwrap_or(0))?;
+        // The source's next revision: past it, its resume after an abort outranks this location.
+        let rev = req["rev"].as_u64().ok_or("missing rev")?.saturating_add(1);
+        let claim = self.host.claim_incoming(&self.host.lock()?, &name, ip, req["gen"].as_u64().unwrap_or(0), Some(rev))?;
         self.set_addr(claim);
         t.mark("claim_ip");
         let idle = self.spawner.take(None)?;

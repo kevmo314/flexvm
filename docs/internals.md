@@ -721,7 +721,8 @@ a second copy could repeat what it did.
   address stays taken; removing `lent` from that file frees it. Leaks, never
   collisions. A restore elsewhere that keeps the address borrows it the same
   way (op `lend`). Every address carries a generation that orders the VMs
-  that had it; messages about older ones are ignored, and the route a peer
+  that had it, and a revision that orders the places it ran within one;
+  messages about older ones are ignored, and the route a peer
   announced for the newest one is put back when a claim here goes without
   its VM running (see process-per-vm.md).
 - Reachability:

@@ -281,7 +281,7 @@ impl Proc {
             if !self.host.current(&l, ip, gen)? {
                 bail!("vm {name}: {ip} generation {gen} was withdrawn or given out again meanwhile; restore {dir:?} with --name NEW --ip auto (choose an unused name), or flexvm kill {name} to discard it");
             }
-            self.host.claim_incoming(&l, name, ip, gen)?
+            self.host.claim_incoming(&l, name, ip, gen, None)?
         };
         self.set_addr(claim);
         // Before it is published: eviction leaves a CMD VM alone.
@@ -882,7 +882,7 @@ fn free_address(host: &Host, name: &str, ip: Option<Ipv4Addr>, gen: Option<u64>)
         let l = host.lock()?;
         host.release(&l, ip, name, None)?;
         if let Some(gen) = gen {
-            host.observe(&l, ip, gen, None)?;
+            host.observe(&l, ip, gen, 0, None)?;
             drop(l);
             crate::vmproc::tell_peers(host, json!({"op": "route", "ip": ip.to_string(), "gen": gen}));
         }

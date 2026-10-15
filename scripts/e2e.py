@@ -53,7 +53,7 @@ FAULTS = ("basic route route_abort lost_ack unknown refused pages_blip pages_dea
           "ckpt_failed_stop ckpt_rearm prepare_fail fc_prepare slow_preload bad_preload pull_enomem ckpt_packet_hold "
           "abort_superseded gen_zero signals suspend_gen standby restore_ip_peer late_withdrawal "
           "incoming_killed start_killed claim_killed standby_stalled standby_stop_claim fc_died cow_grow plug_race plug_storm suspend_debris revoked_publication "
-          "same_host_order same_host_slow_route same_host_flood same_host_late_handover same_host_backlog ckpt_backlog ckpt_paused_backlog rx_stall arrival_abort_route arrival_killed_route handoff_superseded mem_high mem_high_migrate mem_high_evict "
+          "same_host_order same_host_slow_route same_host_flood same_host_late_handover same_host_backlog ckpt_backlog ckpt_paused_backlog rx_stall arrival_abort_route arrival_killed_route handoff_superseded delayed_announce mem_high mem_high_migrate mem_high_evict "
           "sigkill_restart listen_trickle suspend_cmd fc_died_busy pause_cmd_start suspend_died evict_latency evict_skips_cmd cmd_flag "
           "refused_admission meminfo_unreadable checkpoint_hotplug log_cap gc_debris arrival_log template_tap prefix_change arrival_overtaken "
           "prepare_disconnect prepare_trickle unlend_retry bad_app_log")

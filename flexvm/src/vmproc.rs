@@ -341,7 +341,7 @@ impl Proc {
             let _ = peer_call(&peer, json!({"op": "route", "ip": ip.to_string(), "gen": gen}));
         }
         if let Some((peer, gen)) = first {
-            return match self.host.lock().and_then(|l| self.host.claim_incoming(&l, name, ip, gen)) {
+            return match self.host.lock().and_then(|l| self.host.claim_incoming(&l, name, ip, gen, None)) {
                 Ok(mut c) => {
                     c.fresh = true;
                     Ok(c)
@@ -416,6 +416,21 @@ impl Proc {
 
     pub fn gen(&self) -> u64 {
         self.addr.lock().unwrap().as_ref().map_or(0, |a| a.gen)
+    }
+
+    pub fn rev(&self) -> u64 {
+        self.addr.lock().unwrap().as_ref().map_or(0, |a| a.rev)
+    }
+
+    /// Moves the VM's revision `by` on, recorded here too.
+    pub fn advance(&self, l: &crate::host::Locked, by: u64) -> Result<()> {
+        let Some((ip, gen, rev)) = self.addr.lock().unwrap().as_mut().map(|a| {
+            a.rev = a.rev.saturating_add(by);
+            (a.ip, a.gen, a.rev)
+        }) else {
+            return Ok(());
+        };
+        self.host.advance(l, ip, gen, rev)
     }
 
     pub fn op(&self) -> Op<'_> {
@@ -563,7 +578,7 @@ impl Proc {
         if let Ok(l) = self.host.lock() {
             let ours = self.host.holder(&l, ip).is_ok_and(|h| h.is_none_or(|h| h == self.name()));
             let _ = a.release(&l);
-            let _ = self.host.observe(&l, ip, gen, None);
+            let _ = self.host.observe(&l, ip, gen, 0, None);
             if ours && !self.host.reinstall(&l, ip, None).unwrap_or(false) {
                 crate::net::unroute(ip);
             }
@@ -573,7 +588,7 @@ impl Proc {
 
     pub fn announce(&self) {
         let vm = self.vm().clone();
-        let (ip, gen, peers, dev) = (vm.ip, self.gen(), self.host.cfg.peers.clone(), self.host.cfg.announce_dev.clone());
+        let (ip, gen, rev, peers, dev) = (vm.ip, self.gen(), self.rev(), self.host.cfg.peers.clone(), self.host.cfg.announce_dev.clone());
         let Some(via) = self.host.cfg.underlay() else {
             if !peers.is_empty() {
                 eprintln!("announce {ip}: no underlay address (give flexvm listen an ADDR peers can reach, or --underlay IP); peers not told");
@@ -589,7 +604,7 @@ impl Proc {
             };
             arp();
             // All peers at once: one slow or down peer does not hold up the others.
-            let req = json!({"op": "route", "ip": ip.to_string(), "via": via.to_string(), "gen": gen});
+            let req = json!({"op": "route", "ip": ip.to_string(), "via": via.to_string(), "gen": gen, "rev": rev});
             let sends: Vec<_> = peers
                 .into_iter()
                 .filter(|_| here())
