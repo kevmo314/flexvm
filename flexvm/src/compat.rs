@@ -157,8 +157,7 @@ mod tests {
     fn firecracker_cache_hits_and_invalidates_on_stamp_changes() {
         use std::os::unix::fs::PermissionsExt;
 
-        let root = std::env::temp_dir().join(format!("flexvm-compat-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
+        let root = crate::test_util::TempDir::new("compat");
         let binary = root.join("firecracker");
         let calls = root.join("firecracker.calls");
         let write = |version| {

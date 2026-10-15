@@ -969,8 +969,7 @@ mod exec_tests {
 
     #[test]
     fn standby_zero_needs_no_artifacts() {
-        let root = std::env::temp_dir().join(format!("flexvm-standby-zero-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::test_util::TempDir::new("standby-zero");
         let args = parse(&[
             "--state",
             root.join("state").to_str().unwrap(),
@@ -1086,8 +1085,7 @@ mod exec_tests {
     #[test]
     fn listener_configuration_is_published_only_after_binding_and_validation() {
         use std::net::TcpListener;
-        let root = std::env::temp_dir().join(format!("flexvm-listen-config-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::test_util::TempDir::new("listen-config");
         let mut host = Host::open(&root.join("state"), &root.join("run")).unwrap();
         host.configure(|c| {
             c.reserve_mib = 321;
@@ -1122,7 +1120,7 @@ mod exec_tests {
     #[test]
     fn kill_refuses_a_committed_source_but_signals_a_reconciling_one() {
         use std::os::unix::process::ExitStatusExt;
-        let root = std::env::temp_dir().join(format!("flexvm-kill-source-{}", std::process::id()));
+        let root = crate::test_util::TempDir::new("kill-source");
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
         let name = host.take_name("moving", false).unwrap();
         let mut child = std::process::Command::new("sleep");
@@ -1216,7 +1214,7 @@ mod exec_tests {
 
     #[test]
     fn started_session_fails_promptly_when_vm_is_gone() {
-        let root = std::env::temp_dir().join(format!("flexvm-exec-dead-{}", std::process::id()));
+        let root = crate::test_util::TempDir::new("exec-dead");
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
         let session = Mutex::new(Session { id: "test-id".into(), started: true, offset: 0, exit: None });
         let start = Instant::now();
@@ -1254,3 +1252,6 @@ mod exec_tests {
         assert_eq!(e.to_string(), "unknown request \"SESSION\"; rebuild the rootfs and its templates");
     }
 }
+
+#[cfg(test)]
+mod test_util;

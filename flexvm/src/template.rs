@@ -826,12 +826,10 @@ fn build(paths: &Paths, dir: &Path, name: &str, vcpus: u32, mem_mib: u64, max_mi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
     fn working_set_mib_is_read_without_opening_the_template() {
-        let root = std::env::temp_dir().join(format!("flexvm-wset-mib-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::test_util::TempDir::new("wset-mib");
         std::fs::create_dir_all(root.join("templates/.gen/a")).unwrap();
         std::os::unix::fs::symlink(".gen/a", root.join("templates/t")).unwrap();
         let paths = Paths::new(&root, None).unwrap();
@@ -860,15 +858,13 @@ mod tests {
 
     struct Fixture {
         paths: Paths,
-        dir: PathBuf,
+        dir: crate::test_util::TempDir,
         meta: Meta,
     }
 
     impl Fixture {
         fn new() -> Self {
-            static NEXT: AtomicU64 = AtomicU64::new(0);
-            let dir = std::env::temp_dir().join(format!("flexvm-identity-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
-            std::fs::create_dir_all(&dir).unwrap();
+            let dir = crate::test_util::TempDir::new("template");
             let paths = Paths { firecracker: dir.join("firecracker"), kernel: dir.join("kernel"), rootfs: dir.join("rootfs"), templates: dir.clone() };
             let mut meta = Meta {
                 compatibility: None,
@@ -911,12 +907,6 @@ mod tests {
 
         fn write_meta(&self, meta: &Meta, dir: &Path) {
             std::fs::write(dir.join("meta.json"), serde_json::to_vec(meta).unwrap()).unwrap();
-        }
-    }
-
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
 
@@ -1214,6 +1204,8 @@ mod tests {
         let dir = mine.dir.clone();
         drop(mine);
         assert!(!dir.exists() && second.dir.exists());
+        // A concurrent fork can inherit the open file description until exec.
+        crate::host::flock(&running, libc::LOCK_UN).unwrap();
         drop(running);
         sweep(&f.paths).unwrap();
         assert!(!exists(".t.new-0000000000000002") && second.dir.exists());

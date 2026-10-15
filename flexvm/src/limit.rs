@@ -300,9 +300,8 @@ mod tests {
     use std::path::Path;
 
     /// A cgroup's memory files in a plain directory.
-    fn cgroup(tag: &str) -> (Limit, PathBuf, Host) {
-        let base = std::env::temp_dir().join(format!("flexvm-limit-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+    fn cgroup(tag: &str) -> (crate::test_util::TempDir, Limit, PathBuf, Host) {
+        let base = crate::test_util::TempDir::new(&format!("limit-{tag}"));
         let cg = base.join("cg");
         std::fs::create_dir_all(&cg).unwrap();
         for f in ["memory.high", "memory.events"] {
@@ -310,7 +309,7 @@ mod tests {
         }
         let mut host = Host::open(&base.join("state"), &base.join("run")).unwrap();
         host.cfg.reserve_mib = 0;
-        (Limit::new(Some(cg.clone())), cg, host)
+        (base, Limit::new(Some(cg.clone())), cg, host)
     }
 
     fn set(cg: &Path, used_mib: u64) {
@@ -323,7 +322,7 @@ mod tests {
 
     #[test]
     fn the_mark_follows_admitted_memory() {
-        let (l, cg, mut host) = cgroup("follow");
+        let (_dir, l, cg, mut host) = cgroup("follow");
         set(&cg, 20);
         // What it holds and still pages in, and a step.
         l.start(allowance(100), 1000);
@@ -366,7 +365,7 @@ mod tests {
     /// (`restore`); the watcher admitting meanwhile must not hold `mark`.
     #[test]
     fn admission_never_holds_the_mark() {
-        let (l, cg, host) = cgroup("order");
+        let (_dir, l, cg, host) = cgroup("order");
         l.start(512, 5000);
         set(&cg, 512 + overhead(512));
         let held = host.lock().unwrap();
@@ -390,7 +389,7 @@ mod tests {
     /// Lifted while the watcher's admission waits: nothing is raised, and the grant goes back.
     #[test]
     fn a_mark_lifted_during_admission_is_not_raised() {
-        let (l, cg, host) = cgroup("lifted");
+        let (_dir, l, cg, host) = cgroup("lifted");
         l.start(512, 5000);
         set(&cg, 512 + overhead(512));
         let held = host.lock().unwrap();
@@ -411,7 +410,7 @@ mod tests {
 
     #[test]
     fn refusal_only_throttles_near_the_mark() {
-        let (l, cg, mut host) = cgroup("refused");
+        let (_dir, l, cg, mut host) = cgroup("refused");
         host.cfg.reserve_mib = u64::MAX / 4;
         l.start(4096, 8192);
         let mark = 4096 + overhead(4096);
@@ -433,7 +432,7 @@ mod tests {
 
     #[test]
     fn a_refused_step_is_retried_once_at_a_smaller_size() {
-        let (l, cg, host) = cgroup("retry");
+        let (_dir, l, cg, host) = cgroup("retry");
         l.start(4096, 8192);
         set(&cg, 4096 + overhead(4096));
         let asks = std::cell::RefCell::new(Vec::new());
@@ -488,7 +487,7 @@ mod tests {
 
     #[test]
     fn refused_steps_back_off_until_a_grant() {
-        let (l, cg, host) = cgroup("backoff");
+        let (_dir, l, cg, host) = cgroup("backoff");
         l.start(4096, 8192);
         set(&cg, 8192);
         let (mut backoff, mut now) = (GrantBackoff::default(), Instant::now());
@@ -530,7 +529,7 @@ mod tests {
 
     #[test]
     fn full_size_asks_nothing_even_above_the_mark() {
-        let (l, cg, host) = cgroup("full");
+        let (_dir, l, cg, host) = cgroup("full");
         l.start(4096, 4096);
         set(&cg, 5000);
         l.throttled.store(true, Ordering::SeqCst);

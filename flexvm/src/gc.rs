@@ -157,13 +157,9 @@ fn standby_sockets(dir: &Path) {
 mod tests {
     use super::*;
     use crate::host::flock;
-    use std::path::PathBuf;
 
-    fn dir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("flexvm-gc-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    fn dir(tag: &str) -> crate::test_util::TempDir {
+        crate::test_util::TempDir::new(&format!("gc-{tag}"))
     }
 
     #[test]

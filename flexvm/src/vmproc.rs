@@ -2257,8 +2257,8 @@ mod tests {
         assert_eq!(l.wanted.load(Ordering::SeqCst), 0);
     }
 
-    fn test_proc(tag: &str) -> (Arc<Proc>, PathBuf) {
-        let root = std::env::temp_dir().join(format!("fv-proc-{tag}-{}", std::process::id()));
+    fn test_proc(tag: &str) -> (Arc<Proc>, crate::test_util::TempDir) {
+        let root = crate::test_util::TempDir::new(&format!("fv-proc-{tag}"));
         std::fs::create_dir_all(root.join("templates/.gen/a")).unwrap();
         std::os::unix::fs::symlink(".gen/a", root.join("templates/default")).unwrap();
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
@@ -2346,8 +2346,7 @@ mod tests {
     /// and no eviction is tried; read as under the reserve, both are.
     #[test]
     fn unreadable_meminfo_relieves_nothing() {
-        let base = std::env::temp_dir().join(format!("flexvm-relieve-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        let base = crate::test_util::TempDir::new("relieve");
         let mut host = Host::open(&base.join("state"), &base.join("run")).unwrap();
         host.cfg.reserve_mib = 1024;
         host.cfg.peers = vec!["127.0.0.1:1".into()];
@@ -2404,7 +2403,7 @@ mod tests {
 
     #[test]
     fn a_standby_that_has_not_exited_marks_the_pressure_and_holds_eviction_off_a_second_without_waiting() {
-        let base = std::env::temp_dir().join(format!("flexvm-relieve-pending-{}", std::process::id()));
+        let base = crate::test_util::TempDir::new("relieve-pending");
         let host = Host::open(&base.join("state"), &base.join("run")).unwrap();
         let mut child = std::process::Command::new("sleep");
         unsafe {

@@ -433,15 +433,16 @@ mod tests {
     struct Server {
         path: PathBuf,
         thread: Option<JoinHandle<()>>,
+        _dir: crate::test_util::TempDir,
     }
 
     impl Server {
         fn new(f: impl FnOnce(UnixListener) + Send + 'static) -> Self {
-            static NEXT: AtomicU64 = AtomicU64::new(0);
-            let path = std::env::temp_dir().join(format!("flexvm-api-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+            let dir = crate::test_util::TempDir::new("http");
+            let path = dir.join("api");
             let listener = UnixListener::bind(&path).unwrap();
             listener.set_nonblocking(true).unwrap();
-            Self { path, thread: Some(std::thread::spawn(move || f(listener))) }
+            Self { path, thread: Some(std::thread::spawn(move || f(listener))), _dir: dir }
         }
     }
 
@@ -678,7 +679,8 @@ mod tests {
 
     #[test]
     fn post_mortem_log_reads_only_a_bounded_tail() {
-        let path = std::env::temp_dir().join(format!("flexvm-fc-tail-{}", std::process::id()));
+        let _dir = crate::test_util::TempDir::new("fc-tail");
+        let path = _dir.join("fixture");
         let mut f = File::create(&path).unwrap();
         // Invalid UTF-8 outside the tail must never be read; the partial line is discarded.
         f.write_all(&vec![0xff; 2 << 20]).unwrap();

@@ -380,8 +380,7 @@ mod tests {
 
     #[test]
     fn unsupported_check_group_is_removed() {
-        let dir = std::env::temp_dir().join(format!("flexvm-check-group-{}", std::process::id()));
-        std::fs::create_dir(&dir).unwrap();
+        let dir = crate::test_util::TempDir::new("check-group");
         assert!(CheckGroup::from_dir(dir.to_str().unwrap().into()).err().unwrap().to_string().contains("cgroup.kill"));
         assert!(!dir.exists());
     }

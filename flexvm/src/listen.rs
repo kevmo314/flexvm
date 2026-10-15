@@ -601,8 +601,7 @@ mod tests {
 
     #[test]
     fn refused_arrival_removes_only_its_own_log() {
-        let root = std::env::temp_dir().join(format!("flexvm-arrival-log-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::test_util::TempDir::new("arrival-log");
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
         let arrival = host.run.join("vms/.incoming.log");
         let existing = host.vms("web", "log");
@@ -707,9 +706,8 @@ mod tests {
         (0..6000).any(|_| ended() || (std::thread::sleep(Duration::from_millis(10)), false).1)
     }
 
-    fn host_with_peers(label: &str, peers: &[&str]) -> (std::path::PathBuf, Host) {
-        let root = std::env::temp_dir().join(format!("flexvm-listen-{label}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+    fn host_with_peers(label: &str, peers: &[&str]) -> (crate::test_util::TempDir, Host) {
+        let root = crate::test_util::TempDir::new(&format!("listen-{label}"));
         let mut host = Host::open(&root.join("state"), &root.join("run")).unwrap();
         host.configure(|c| {
             c.peers = peers.iter().map(|p| p.to_string()).collect();
@@ -885,8 +883,7 @@ mod tests {
 
     #[test]
     fn a_running_listener_takes_peers_configured_since() {
-        let root = std::env::temp_dir().join(format!("flexvm-listen-peers-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::test_util::TempDir::new("listen-peers");
         let running = Host::open(&root.join("state"), &root.join("run")).unwrap();
         let p = Peers::default();
         let admit = |h: &Host, from| p.admit(&h.config_now().peers, from);

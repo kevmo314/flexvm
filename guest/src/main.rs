@@ -693,3 +693,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../flexvm/src/test_util.rs"]
+mod test_util;
