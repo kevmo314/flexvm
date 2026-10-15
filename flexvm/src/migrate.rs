@@ -154,10 +154,15 @@ impl Proc {
             t.mark("read_preload");
             Ok((runs, paused, state, pages, data))
         })();
-        let (runs, paused, state, pages, data) = match captured {
+        let (runs, paused, state, mut pages, mut data) = match captured {
             Ok(c) => c,
             Err(e) => return Err(self.abort(&op, &vm, mig, e)),
         };
+        // Test fault `bad_preload`: a preload page past any guest memory, which the target refuses.
+        if fault("bad_preload") {
+            pages.push(u64::MAX);
+            data.resize(data.len() + crate::util::PAGE_SIZE, 0);
+        }
         let remote_pages: u64 = runs.iter().filter(|r| r.2 == crate::uffd::REMOTE).map(|r| r.1).sum();
         let sent = (|| -> Result<Value> {
             send_json(
@@ -454,13 +459,15 @@ impl Proc {
             let hdr = Header::recv(&mut r)?.ok_or("source hung up before sending the vmstate")?;
             let mut t = Phases::new();
             let runs: Runs = hdr.runs.into_owned();
-            *self.sizes.lock().unwrap() = Some(arrival_sizes(&runs, &prepared.0.template(), req["plugged_mib"].as_u64()));
-            let state = read_vec(&mut r, hdr.vmstate_len, MAX_VMSTATE)?;
-            t.mark("recv_state");
             let pages: Vec<u64> = hdr.preload.into_owned();
             if pages.len() > MAX_PRELOAD {
                 bail!("{} pages to preload, more than {MAX_PRELOAD}", pages.len());
             }
+            // Before anything counts or walks them: a bad page index would otherwise overflow, or hang the preload.
+            crate::uffd::check_incoming(&runs, &pages, &prepared.2.regions).map_err(|e| format!("bad migration header: {e}"))?;
+            *self.sizes.lock().unwrap() = Some(arrival_sizes(&runs, &prepared.0.template(), req["plugged_mib"].as_u64()));
+            let state = read_vec(&mut r, hdr.vmstate_len, MAX_VMSTATE)?;
+            t.mark("recv_state");
             self.app_log.store(hdr.app_log, Ordering::SeqCst);
             // Preload installed while Firecracker parses the state; all in, or no commit.
             let r = &mut r;

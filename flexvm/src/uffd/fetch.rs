@@ -66,8 +66,10 @@ impl Pages {
                     failed = res.err();
                     done = ready;
                 }
-                // A failed install stops the fetch at once: what is still to come would only be given back.
-                failed.is_none()
+                // After a failed install, the rest of the reply is read and dropped rather than cut short: the
+                // connection then serves the retry (cutting it would reconnect on every retry, as memory is short).
+                // Only a stop cuts it.
+                failed.is_none() || !stop.load(Ordering::SeqCst)
             });
             match fetched {
                 _ if failed.is_some() => break,
@@ -599,8 +601,8 @@ impl<S: crate::util::Timed> PageClient<S> {
 /// Fetch outcomes carried through the public client's `io::Result` API.
 #[derive(Debug)]
 pub(super) enum FetchFailure {
-    /// A fetch its caller stopped part way (`progress` said so); what was left of the reply is unread, so the
-    /// connection goes.
+    /// A fetch its caller stopped part way (`progress` said so, as the pager stops); what was left of the reply is
+    /// unread, so the connection goes.
     Cancelled,
     /// A fetch that delivered pages, but not all of them, before its connection failed (say, past its deadline from a
     /// slow source): the caller fetches the rest (see `Pages::fetch_install`).

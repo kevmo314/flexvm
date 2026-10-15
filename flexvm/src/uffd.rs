@@ -105,7 +105,7 @@ pub struct Mapping {
 impl Mapping {
     /// Its pages, as `[first, end)`.
     fn span(&self) -> (usize, usize) {
-        (self.offset as usize / PAGE_SIZE, (self.offset as usize + self.size) / PAGE_SIZE)
+        (self.offset as usize / PAGE_SIZE, (self.offset as usize).saturating_add(self.size) / PAGE_SIZE)
     }
 }
 
@@ -533,6 +533,10 @@ impl Pager {
             }
         }
         let pages = self.pages();
+        // Held to guest memory as it is (the source's list was checked against the regions it named: `check_incoming`).
+        if list.windows(2).any(|w| w[0] >= w[1]) || list.last().is_some_and(|&p| p >= pages.len() as u64) {
+            bail!("preload list out of order or past guest memory ({} pages)", pages.len());
+        }
         let mut installed = 0;
         for (index, n) in page_runs(list, self.mappings()) {
             let (mut index, end) = (index, index + n);
@@ -976,26 +980,44 @@ impl Pager {
 
 /// The pages of `wanted` (sorted) that `runs` make REMOTE on a target.
 pub fn remote_among(runs: &Runs, wanted: impl IntoIterator<Item = u64>) -> Vec<u64> {
-    let mut remote: Vec<(u64, u64)> = runs.iter().filter(|r| r.2 == REMOTE).map(|r| (r.0, r.0 + r.1)).collect();
+    let mut remote: Vec<(u64, u64)> = runs.iter().filter(|r| r.2 == REMOTE).map(|r| (r.0, r.0.saturating_add(r.1))).collect();
     remote.sort_unstable();
     let is_remote = |&p: &u64| remote.get(remote.partition_point(|r| r.1 <= p)).is_some_and(|r| r.0 <= p);
     wanted.into_iter().filter(is_remote).collect()
 }
 
 /// Runs of consecutive pages in `list`, as `(index, count)`, each within one region's 2 MiB chunk: a uffd copy (or a
-/// read) never crosses a VMA end (see `Pager::fault`). A page outside every region is a run of its own.
+/// read) never crosses a VMA end (see `Pager::fault`). A page outside every region is a run of its own. Every run has
+/// at least one page, whatever `list` holds, so this always ends.
 fn page_runs<'a>(list: &'a [u64], mappings: &'a [Mapping]) -> impl Iterator<Item = (usize, usize)> + 'a {
     let mut i = 0;
     std::iter::from_fn(move || {
         let first = *list.get(i)?;
-        let end = match mappings.iter().map(Mapping::span).find(|&(a, b)| (a..b).contains(&(first as usize))) {
-            Some((a, b)) => b.min(first as usize + ARM_CHUNK - (first as usize - a) % ARM_CHUNK) as u64,
-            None => first + 1,
+        let region = usize::try_from(first).ok().and_then(|f| mappings.iter().map(Mapping::span).find(|&(a, b)| (a..b).contains(&f)).map(|s| (f, s)));
+        let end = match region {
+            Some((f, (a, b))) => b.min(f.saturating_add(ARM_CHUNK - (f - a) % ARM_CHUNK)) as u64,
+            None => first.saturating_add(1),
         };
-        let n = list[i..].iter().zip(first..end).take_while(|(&p, q)| p == *q).count();
+        let n = list[i..].iter().zip(first..end).take_while(|(&p, q)| p == *q).count().max(1);
         i += n;
         Some((i - n, n))
     })
+}
+
+/// Checks what a migration source sent before the target uses any of it: its page runs (as `remote_pages` does) against
+/// the guest memory regions it named, which the pager later holds to Firecracker's, and its preload list, which must be
+/// ascending, without repeats, and only of pages the runs make REMOTE (as the source picks them, `remote_among`).
+pub fn check_incoming(runs: &Runs, preload: &[u64], regions: &[(u64, u64)]) -> Result<()> {
+    let mappings: Vec<Mapping> = regions.iter().map(|&(offset, size)| Mapping { base_host_virt_addr: 0, size: size as usize, offset }).collect();
+    remote_pages(runs, &mappings)?;
+    if let Some(w) = preload.windows(2).find(|w| w[0] >= w[1]) {
+        bail!("preload list out of order: page {} before {}", w[0], w[1]);
+    }
+    let remote = remote_among(runs, preload.iter().copied());
+    if let Some(p) = preload.iter().find(|p| remote.binary_search(p).is_err()) {
+        bail!("preload page {p} is not a remote page");
+    }
+    Ok(())
 }
 
 const ALL: [(usize, usize); 1] = [(0, usize::MAX)];
