@@ -10,7 +10,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::de::DeserializeOwned;
@@ -175,6 +175,8 @@ pub struct Host {
     pub cfg: Config,
     /// host.json's mtime and inode when `cfg` was loaded.
     cfg_stamp: Option<Stamp>,
+    /// Last good reload, shared by this Host's clones, never by unrelated Hosts.
+    cfg_seen: Arc<Mutex<Option<(Stamp, Config)>>>,
 }
 
 /// mtime and inode: `store` renames, so a rewrite in the same mtime tick differs too.
@@ -220,7 +222,7 @@ impl Host {
         let _ = RUN_DIR.set(run.clone());
         let cfg_stamp = stamp(&state.join("host.json"));
         let cfg = load(&state.join("host.json"))?.unwrap_or_default();
-        Ok(Host { state, run, cfg, cfg_stamp })
+        Ok(Host { state, run, cfg, cfg_stamp, cfg_seen: Arc::new(Mutex::new(None)) })
     }
 
     pub fn configure(&mut self, change: impl FnOnce(&mut Config) -> Result<()>) -> Result<()> {
@@ -289,19 +291,18 @@ impl Host {
     /// While it cannot be read whole (mid-write, missing), the newest one that was read
     /// stands, never an older one: a peer revoked since is not let back in.
     pub fn config_now(&self) -> Config {
-        static SEEN: Mutex<Option<(PathBuf, Stamp, Config)>> = Mutex::new(None);
         let path = self.state.join("host.json");
         let now = stamp(&path);
         if now.is_some() && now == self.cfg_stamp {
             return self.cfg.clone();
         }
-        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-        let last = seen.as_ref().filter(|(p, ..)| *p == path).map(|(_, t, c)| (*t, c.clone()));
+        let mut seen = self.cfg_seen.lock().unwrap_or_else(|e| e.into_inner());
+        let last = seen.clone();
         if let Some((_, cfg)) = last.as_ref().filter(|(t, _)| Some(*t) == now) {
             return cfg.clone();
         }
         if let Some(cfg) = now.and_then(|_| load::<Config>(&path).ok().flatten()) {
-            *seen = Some((path, now.unwrap(), cfg.clone()));
+            *seen = Some((now.unwrap(), cfg.clone()));
             return cfg;
         }
         match last {
@@ -2292,6 +2293,35 @@ mod tests {
     /// `grant_inner` against `AVAIL`.
     fn grant_at(h: &Host, mib: u64, floor: Floor, hold: bool) -> std::result::Result<(u64, Option<Hold>), Error> {
         h.grant_inner(mib, floor, hold, None, || Some(AVAIL)).unwrap()
+    }
+
+    #[test]
+    fn last_good_config_is_shared_by_clones_and_isolated_from_other_hosts() {
+        let mut h = host("config-isolated");
+        h.configure(|c| {
+            c.peers = vec!["10.1.0.8:7070".into()];
+            Ok(())
+        })
+        .unwrap();
+        let clone = h.clone();
+        let other = host("config-unrelated");
+        let path = h.state.join("host.json");
+        let mut cfg = h.cfg.clone();
+        for peers in [vec!["10.1.0.9:7070".to_string()], Vec::new()] {
+            cfg.peers = peers.clone();
+            store(&path, &cfg, false).unwrap();
+            assert_eq!(h.config_now().peers, peers);
+
+            // Another Host's reload must not evict this Host's last good config.
+            store(&other.state.join("host.json"), &other.cfg, false).unwrap();
+            assert!(other.config_now().peers.is_empty());
+            std::fs::write(&path, b"{\"peers\": [").unwrap();
+            assert_eq!(clone.config_now().peers, peers);
+            std::fs::remove_file(&path).unwrap();
+            assert_eq!(h.config_now().peers, peers);
+        }
+        std::fs::remove_dir_all(h.state.parent().unwrap()).unwrap();
+        std::fs::remove_dir_all(other.state.parent().unwrap()).unwrap();
     }
 
     #[test]
