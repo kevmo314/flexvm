@@ -120,7 +120,7 @@ pub fn maintain(host: Host) {
             if recent(&failed) {
                 continue;
             }
-            if let Err(e) = refill_by(&host, &template, false) {
+            if let Err(e) = refill_by(&host, &template, false, true) {
                 let _ = std::fs::write(&failed, b"");
                 // As its standby VMs write it: capped, to whichever file is current.
                 let path = dir(&host, &template).join("standby.log");
@@ -149,10 +149,13 @@ fn recent(path: &std::path::Path) -> bool {
 /// Starts standby VMs up to the target and waits for them. Serialised per
 /// template so the ones starting are counted.
 pub fn refill(host: &Host, template: &str) -> Result<usize> {
-    refill_by(host, template, true)
+    refill_by(host, template, true, false)
 }
 
-fn refill_by(host: &Host, template: &str, wait: bool) -> Result<usize> {
+/// `cooldown`: none while `.pressure` is recent, checked for each standby under the stop
+/// lock, so a refill that waited behind another while relief stopped standbys starts none.
+/// Only a count set by hand (`set`) starts them regardless.
+fn refill_by(host: &Host, template: &str, wait: bool, cooldown: bool) -> Result<usize> {
     let d = dir(host, template);
     std::fs::create_dir_all(&d)?;
     let lock = File::create(d.join(".refill"))?;
@@ -171,7 +174,7 @@ fn refill_by(host: &Host, template: &str, wait: bool) -> Result<usize> {
     // A failed start ends the round, but those started before it are still waited for.
     let mut failed = None;
     for _ in 0..want {
-        match start_one(host, template, &log, mib) {
+        match start_one(host, template, &log, mib, cooldown) {
             Ok(Some(r)) => ready.push(r),
             Ok(None) => break,
             Err(e) => {
@@ -212,8 +215,8 @@ fn grant_mib(template: &str) -> u64 {
 }
 
 /// One standby started and listed, its readiness reply to come; None if relief
-/// holds the stop lock, the grant is refused or the host lock is busy.
-fn start_one(host: &Host, template: &str, log: &File, mib: u64) -> Result<Option<UnixStream>> {
+/// holds the stop lock, pressure is recent (`cooldown`), the grant is refused or the host lock is busy.
+fn start_one(host: &Host, template: &str, log: &File, mib: u64, cooldown: bool) -> Result<Option<UnixStream>> {
     // Shared from the grant until its lock file exists (`locked`), not through its load:
     // relief either lists it or ran before the grant. None while relief stops them, and
     // held `LOCKED_TIMEOUT` at most (a stuck host lock fails the grant; a child that
@@ -221,6 +224,10 @@ fn start_one(host: &Host, template: &str, log: &File, mib: u64) -> Result<Option
     let stop = stop_lock(host)?;
     let by = Instant::now() + LOCKED_TIMEOUT;
     if flock(&stop, libc::LOCK_SH | libc::LOCK_NB).is_err() {
+        return Ok(None);
+    }
+    // Relief marks `.pressure` holding the stop lock exclusively: seen now if it came at all.
+    if cooldown && recent(&pressure(host)) {
         return Ok(None);
     }
     let grant = match host.grant(mib, Some(by)) {
@@ -301,7 +308,10 @@ pub fn save_load_set(host: &Host, tpl: &Template) {
 
 pub fn load_set(host: &Host, tpl: &Template) -> Vec<u64> {
     let mut set = tpl.load_set();
-    if let Some(saved) = std::fs::read(host.run.join("standby").join(load_set_name(tpl))).ok().and_then(|b| serde_json::from_slice::<Vec<u64>>(&b).ok()) {
+    let path = host.run.join("standby").join(load_set_name(tpl));
+    // Marked used: gc removes one neither read nor written for a while (`gc::LOADSET_TTL`).
+    let _ = File::options().write(true).open(&path).and_then(|f| f.set_modified(std::time::SystemTime::now()));
+    if let Some(saved) = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice::<Vec<u64>>(&b).ok()) {
         set.extend(saved);
         set.sort_unstable();
         set.dedup();
@@ -408,10 +418,7 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
                 let (h, t) = (host.clone(), template.to_string());
                 std::thread::spawn(move || {
                     // As `maintain`: none for a while after pressure stopped standby VMs.
-                    if recent(&pressure(&h)) {
-                        return;
-                    }
-                    if let Err(e) = refill(&h, &t) {
+                    if let Err(e) = refill_by(&h, &t, true, true) {
                         crate::log!("standby {t}: {e}");
                     }
                 });
@@ -795,18 +802,18 @@ mod tests {
         std::fs::create_dir_all(&d).unwrap();
         let lock = File::create(d.join(".refill")).unwrap();
         let lock = Flock::new(lock, libc::LOCK_EX).unwrap();
-        assert_eq!(refill_by(&host, "default", false).unwrap(), 0);
+        assert_eq!(refill_by(&host, "default", false, true).unwrap(), 0);
         drop(lock);
         // Nor while relief stops standby VMs.
         let stop = stop_lock(&host).unwrap();
         let stop = Flock::new(stop, libc::LOCK_EX).unwrap();
-        assert_eq!(refill_by(&host, "default", false).unwrap(), 0);
+        assert_eq!(refill_by(&host, "default", false, true).unwrap(), 0);
         drop(stop);
         // A busy host lock ends this round without a refill failure or backoff, and lets relief in.
         let held = File::create(host.state.join("lock")).unwrap();
         let held = Flock::new(held, libc::LOCK_EX).unwrap();
         let start = Instant::now();
-        assert_eq!(refill_by(&host, "default", false).unwrap(), 0);
+        assert_eq!(refill_by(&host, "default", false, true).unwrap(), 0);
         assert!(!d.join(".failed").exists());
         assert!(start.elapsed() < LOCKED_TIMEOUT + Duration::from_secs(1), "{:?}", start.elapsed());
         Flock::new(stop_lock(&host).unwrap(), libc::LOCK_EX | libc::LOCK_NB).unwrap();
@@ -817,13 +824,21 @@ mod tests {
         host.cfg.reserve_mib = u64::MAX / 2;
         // Hold the reentrant host lock so another test cannot time out this grant before it checks the reserve.
         let l = host.lock().unwrap();
-        let started = refill_by(&host, "default", false).unwrap();
+        let started = refill_by(&host, "default", false, true).unwrap();
         drop(l);
         assert_eq!(started, 0);
         assert!(live(&host, "default").is_empty());
         assert!(!recent(&pressure(&host)));
         std::fs::write(pressure(&host), b"").unwrap();
         assert!(recent(&pressure(&host)));
+        // Under the stop lock, before the grant: recent pressure ends the round at once, with
+        // no grant (one would wait out the busy host lock), even for a refill that got its locks late.
+        host.cfg.reserve_mib = 0;
+        let held = Flock::new(File::create(host.state.join("lock")).unwrap(), libc::LOCK_EX).unwrap();
+        let start = Instant::now();
+        assert_eq!(refill_by(&host, "default", true, true).unwrap(), 0);
+        assert!(start.elapsed() < Duration::from_secs(1), "{:?}", start.elapsed());
+        drop(held);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

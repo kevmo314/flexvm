@@ -169,7 +169,7 @@ RUN (default /run/flexvm, tmpfs)
   standby/T/standby.log  the standby VMs' output and refill errors
   standby/.pressure      its mtime: when pressure last stopped standby VMs (no refill for a minute)
   standby/.loadset-ID    pages loads of template ID touch, learned by standby VMs, for migrations to preload
-                         (one per generation; swept once ID is gone from the templates directory)
+                         (one per generation; swept once neither read nor written for a day)
   faults.json            armed test faults (FLEXVM_FAULTS=1 only)
   w/PID-START/           a VM process's work directory, named by its whole identity (a later
                          process with its pid never shares it): `owner` (pid, start time), and per
@@ -428,7 +428,7 @@ admission uses) are read from `host.json` as it changes. Under the reserve,
 standby VMs are stopped first, under a lock of their own
 (`STATE/standby.stop.lock`), so a slow migration holding `evict.lock` does
 not hold that up. A refill's grant for each standby is the template's working set (what a cold start
-admits), 256 MiB at least; a refill a claim starts waits out `.pressure` like any other. A refill holds it shared from each standby's grant until
+admits), 256 MiB at least. Recovery and a claim's refill start none while `.pressure` is recent, checked under the stop lock before each grant (relief marks it holding the lock), so one that waited behind another refill during relief starts none. A refill holds it shared from each standby's grant until
 that standby has created its lock file (it says so on its notify fd), 5 s
 at most (its grant gives up on a busy host lock by then; a standby that has not said so by then, or said something else, is killed and reaped before the lock is let go, then its grant is refunded and what it left swept locally, never waiting on peers, and the refill fails), never through its load, and starts none while relief holds it: relief either lists
 a standby being started or ran before its grant, and meanwhile holds eviction

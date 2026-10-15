@@ -22,6 +22,9 @@ const MOVED_TTL: Duration = Duration::from_secs(3600);
 /// moved record) goes once unwritten this long.
 const ORPHAN_LOG_TTL: Duration = Duration::from_secs(3600);
 
+/// A load set unused this long goes; one still wanted is learned again at its next load.
+pub const LOADSET_TTL: Duration = Duration::from_secs(24 * 3600);
+
 /// Prefix of an arrival's log until it is accepted (`listen::incoming`).
 pub const ARRIVAL_LOG: &str = ".incoming-";
 
@@ -67,22 +70,15 @@ pub fn local_cleanup(host: &Host) {
             standby_sockets(&e.path());
         }
     }
-    if let Ok(paths) = crate::template::Paths::from_env() {
-        load_sets(&host.run.join("standby"), &paths);
-    }
+    load_sets(&host.run.join("standby"));
 }
 
-/// `.loadset-ID` (`standby::save_load_set`, written once its generation is in place) of
-/// a generation no longer in `paths`' templates: a rebuilt template's old ones, once
-/// removed. None go if that directory is not there (not this host's templates).
-fn load_sets(dir: &Path, paths: &crate::template::Paths) {
-    if !paths.templates.is_dir() {
-        return;
-    }
+/// `.loadset-ID` (`standby::save_load_set`) neither read nor written for `LOADSET_TTL`:
+/// a rebuilt template's old ones, say. By age, not by whether generation ID exists: a
+/// run directory may serve several templates directories, and this sweep knows none.
+fn load_sets(dir: &Path) {
     for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        let n = e.file_name().to_string_lossy().into_owned();
-        let Some(id) = n.strip_prefix(".loadset-") else { continue };
-        if crate::template::Template::generation(paths, id).is_none() {
+        if e.file_name().to_string_lossy().starts_with(".loadset-") && age(&e.path()).is_some_and(|a| a > LOADSET_TTL) {
             let _ = std::fs::remove_file(e.path());
         }
     }
@@ -210,20 +206,14 @@ mod tests {
     }
 
     #[test]
-    fn load_sets_of_generations_gone_go() {
+    fn load_sets_unused_for_a_day_go() {
         let d = dir("loadsets");
-        let run = d.join("run");
-        std::fs::create_dir_all(&run).unwrap();
-        for f in [".loadset-ab12", ".loadset-cd34", "default"] {
-            File::create(run.join(f)).unwrap();
+        let old = SystemTime::now() - LOADSET_TTL - Duration::from_secs(60);
+        for (f, t) in [(".loadset-ab12", SystemTime::now()), (".loadset-cd34", old), ("default", old)] {
+            File::create(d.join(f)).unwrap().set_modified(t).unwrap();
         }
-        let paths = crate::template::Paths::new(&d, Some(d.join("templates"))).unwrap();
-        // No templates directory: not this host's, so nothing is decided.
-        load_sets(&run, &paths);
-        assert!(run.join(".loadset-cd34").exists());
-        std::fs::create_dir_all(d.join("templates/.gen/ab12")).unwrap();
-        load_sets(&run, &paths);
-        assert!(run.join(".loadset-ab12").exists() && !run.join(".loadset-cd34").exists() && run.join("default").exists());
+        load_sets(&d);
+        assert!(d.join(".loadset-ab12").exists() && !d.join(".loadset-cd34").exists() && d.join("default").exists());
         std::fs::remove_dir_all(d).unwrap();
     }
 
