@@ -307,10 +307,18 @@ impl Vm {
     fn drain_tap(&self, fd: &OwnedFd) -> bool {
         // Paused, its guest takes nothing: no use waiting.
         if self.was_paused() {
-            return crate::net::tap_queued(fd).map(|queued| !queued).unwrap_or_else(|e| {
-                eprintln!("vm {}: not waiting for its tap's queue before the pause: {e}", self.name);
-                true
-            });
+            return match crate::net::tap_queued(fd) {
+                Ok(queued) => {
+                    if queued {
+                        eprintln!("vm {}: frames still queued on its tap, which its paused guest does not take", self.name);
+                    }
+                    !queued
+                }
+                Err(e) => {
+                    eprintln!("vm {}: not waiting for its tap's queue before the pause: {e}", self.name);
+                    true
+                }
+            };
         }
         let start = Instant::now();
         let mut queued = false;
