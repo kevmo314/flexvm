@@ -43,6 +43,10 @@ static CONTROL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize:
 /// never shut out local control requests (#335). Those served are bounded further by the page server.
 const MAX_PAGES: usize = 64;
 static PAGES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Page-server refusals waiting out their `PAGE_REFUSAL` drain, on neither budget above, so a peer's refused requests
+/// never keep its page connections out (#352); past this many, a refusal does not wait on the client at all.
+static PAGE_REFUSALS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+const PAGE_REFUSAL: Duration = Duration::from_secs(1);
 
 pub enum Start {
     Run {
@@ -843,19 +847,23 @@ impl Proc {
     fn pages(&self, req: &Value, fds: Vec<OwnedFd>, slot: Slot) {
         let Some(fd) = fds.into_iter().next() else { return };
         let s = std::net::TcpStream::from(fd);
-        let Some(_pages) = Slot::take(&PAGES, MAX_PAGES) else { return };
-        drop(slot);
+        // Checked before taking a page slot: a refusal never holds one.
         let (vm, source) = (self.vm(), req["mig"].as_u64().map(State::Source));
         if source != Some(vm.state()) {
-            return crate::listen::refuse(s, &format!("vm {} is not the source of migration {}", vm.name, req["mig"]), Some(Duration::from_secs(1)));
+            drop(slot);
+            return refuse_pages(s, &format!("vm {} is not the source of migration {}", vm.name, req["mig"]));
         }
         if fault("pages") {
-            return crate::listen::refuse(s, "injected fault: page server down", Some(Duration::from_secs(1)));
+            drop(slot);
+            return refuse_pages(s, "injected fault: page server down");
         }
+        let Some(pages) = Slot::take(&PAGES, MAX_PAGES) else { return };
+        drop(slot);
         let admitted = match crate::uffd::admit(&s) {
             Ok(Some(a)) => a,
             Ok(None) => {
-                return crate::listen::refuse(s, "page server busy: every connection is answering a request or still ending", Some(Duration::from_secs(1)))
+                drop(pages);
+                return refuse_pages(s, "page server busy: every connection is answering a request or still ending");
             }
             Err(e) => return crate::log!("vm {}: page server: {e}", vm.name),
         };
@@ -1790,6 +1798,13 @@ fn tell(peer: &str, req: Value) -> Result<Value> {
         thread::sleep(Duration::from_secs(1));
         peer_call(peer, req)
     })
+}
+
+/// Refuses a page-server request on no page slot: draining for at most `PAGE_REFUSAL` in all while fewer than
+/// `MAX_PAGES` refusals do, otherwise without waiting on the client.
+fn refuse_pages(s: std::net::TcpStream, why: &str) {
+    let draining = Slot::take(&PAGE_REFUSALS, MAX_PAGES);
+    crate::listen::refuse(s, why, draining.as_ref().map(|_| PAGE_REFUSAL));
 }
 
 /// Connects and sends `req` by `at`; the stream's reads and writes then block.

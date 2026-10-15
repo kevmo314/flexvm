@@ -1739,6 +1739,78 @@ def page_conns():
     cleanup(n)
 
 
+def page_refusals():
+    """#352: 64 page requests for a migration that is not this VM's, each
+    then trickling a byte just under a second apart (a per-read timeout
+    never ends their drain): each refusal ends by one deadline and holds no
+    page slot, so a valid page connection still gets in and is served, and
+    the migration completes."""
+    n = "ft-page-refusals"
+    m = setup(n)
+    fault(A, "pages_slow", 120000)
+    r = ok(migrate(A, n, B))
+    h, port = A.addr.rsplit(":", 1)
+    hello = lambda mig: json.dumps({"op": "pages", "name": n, "mig": mig}).encode() + b"\n"
+
+    def page_conn(mig):
+        s = socket.create_connection((h, int(port)), timeout=10)
+        s.sendall(hello(mig))
+        got = b""
+        try:
+            while not got.endswith(b"\n") and (d := s.recv(1)):
+                got += d
+        except OSError:
+            pass
+        return s, got
+
+    refused, lasted, stop = [], [], threading.Event()
+
+    def trickle():
+        try:
+            s, got = page_conn(r["mig"] + 1000)
+        except OSError:
+            return refused.append(False)
+        refused.append(b"is not the source of migration" in got)
+        t = time.time()
+        try:
+            while not stop.is_set() and time.time() - t < 20:
+                s.sendall(b"x")
+                time.sleep(0.9)
+        except OSError:
+            pass
+        lasted.append(time.time() - t)
+        s.close()
+
+    threads = [threading.Thread(target=trickle) for _ in range(64)]
+    for t in threads:
+        t.start()
+    wait_for(lambda: len(refused) == 64, 20)
+    check("page refusals: all 64 told why", refused.count(True) == 64, f"{refused.count(True)} of {len(refused)}")
+    s, got = page_conn(r["mig"])
+    reply = b""
+    try:
+        if got == b'{"ok":true}\n':
+            s.settimeout(10)
+            s.sendall((0).to_bytes(8, "little") + (4096).to_bytes(4, "little"))
+            try:
+                while len(reply) < 4097 and (d := s.recv(65536)):
+                    reply += d
+            except OSError:
+                pass
+    finally:
+        s.close()
+    check("page refusals: a valid page connection is admitted and served", len(reply) == 4097 and reply[0] == 0, (got, reply[:20]))
+    for t in threads:
+        t.join(30)
+    stop.set()
+    # Closed by the 1 s deadline; the client learns it at its next send or two.
+    check("page refusals: each trickling refusal ends by its deadline", len(lasted) == 64 and max(lasted) < 6, (len(lasted), max(lasted, default=None)))
+    fault(A, "pages_slow", 0)
+    st = wait_released(B, n)
+    check("page refusals: migration completed, md5 intact", st["released"] is True and where(n) == {B: "running"} and md5(B, n) == m, (st, where(n)))
+    cleanup(n)
+
+
 def conns(host):
     """Connections `host`'s listener has yet to answer (established, or closed by the peer)."""
     port = int(host.addr.rsplit(":", 1)[1])
@@ -4951,6 +5023,48 @@ def peer_by_name():
         start_listener(B)
 
 
+def peer_moved():
+    """#311: a peer configured by name that comes back on a new address
+    (DHCP) has its route messages accepted at once, not refused until the
+    listener's 30 s refresh: a source it would refuse starts a lookup of a
+    name not looked up lately, and waits for it. Names resolve through the
+    test hook RUN/hosts.json."""
+    if args.no_listeners:
+        return print("peer moved: skipped (--no-listeners)")
+    name = "pr352-peer.test:" + A.addr.rsplit(":", 1)[1]
+    hosts = os.path.join(B.run, "hosts.json")
+    resolve = lambda ip: json.dump({name: [f"{ip}:{A.addr.rsplit(':', 1)[1]}"]}, open(hosts + ".tmp", "w")) or os.replace(hosts + ".tmp", hosts)
+    ip = A.ips.split("-")[0].rsplit(".", 1)[0] + ".204"
+    withdraw = lambda source: peer(B, {"op": "route", "ip": ip, "gen": addr(B, ip).get("seen", 0) + 1}, source=source)
+    if not A.addr.startswith("127."):
+        return print("peer moved: skipped (not on loopback)")
+    stop_listener(B)
+    try:
+        resolve("127.0.0.3")
+        start_listener(B, peer=name)
+        r, deadline = None, time.time() + 10
+        while not (r and r.get("ok")) and time.time() < deadline:
+            r = withdraw("127.0.0.3")
+        check("peer moved: admitted at its first address", r is not None and r.get("ok"), r)
+        # Past LOOKUP_EVERY since that lookup, as when a peer comes back on a new lease.
+        time.sleep(2.5)
+        resolve("127.0.0.4")
+        t = time.time()
+        r = withdraw("127.0.0.4")
+        check("peer moved: a route message from its new address is accepted at once", r.get("ok") and time.time() - t < 2, (r, f"{time.time() - t:.2f}s"))
+        r = withdraw("127.0.0.3")
+        check("peer moved: its old address is no longer a peer", not r["ok"] and "is not a peer of" in r.get("error", ""), r)
+        r = peer(B, {"op": "migration", "mig": 1}, source="127.0.0.5")
+        check("peer moved: a non-peer is still refused", not r["ok"] and "is not a peer of" in r.get("error", ""), r)
+    finally:
+        stop_listener(B)
+        try:
+            os.unlink(hosts)
+        except OSError:
+            pass
+        start_listener(B)
+
+
 def raw(host, data, timeout=10):
     """Sends `data` on a new connection to `host`'s listener; returns everything until EOF."""
     h, port = host.addr.rsplit(":", 1)
@@ -6585,7 +6699,7 @@ SCENARIOS = dict(
     prepare_disconnect=prepare_disconnect, prepare_trickle=prepare_trickle, prepare_fail=prepare_fail,
     fc_prepare=fc_prepare, slow_preload=slow_preload, bad_preload=bad_preload, ckpt_packet_hold=ckpt_packet_hold, ckpt_stall=ckpt_stall, standby=standby,
     suspend_disk_freed=suspend_disk_freed, resume_mark_fails=resume_mark_fails, kill_source=kill_source,
-    kill_refused_checkpoint=no_evict(kill_refused_checkpoint), wildcard_listen=wildcard_listen, peer_by_name=peer_by_name,
+    kill_refused_checkpoint=no_evict(kill_refused_checkpoint), wildcard_listen=wildcard_listen, peer_by_name=peer_by_name, peer_moved=peer_moved, page_refusals=page_refusals,
     forged_peer=forged_peer, restore_ip_peer=restore_ip_peer, late_withdrawal=late_withdrawal, unlend_retry=unlend_retry,
     unit_restart=unit_restart, log_cap=log_cap, gc_debris=gc_debris, prefix_change=prefix_change, arrival_log=arrival_log, template_tap=template_tap,
     incoming_killed=incoming_killed, start_killed=start_killed, claim_killed=claim_killed, standby_stalled=standby_stalled, standby_refill_race=standby_refill_race, standby_lock_timeout=standby_lock_timeout, fc_died=fc_died,

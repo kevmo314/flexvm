@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::io::Read;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::SyncSender;
@@ -92,8 +92,9 @@ pub fn main(host: Host, listener: TcpListener) -> Result<()> {
         };
         let Ok(from) = conn.peer_addr().map(|a| a.ip()) else { continue };
         // Refused here, at once, unless a configured name is still being
-        // looked up: then it may be this one's, and a bounded few wait for it
-        // (a peer's restart backlog, a peer just added).
+        // looked up, or not looked up lately (it is then): it may be this
+        // one's, and a bounded few wait for it (a peer's restart backlog, a
+        // peer just added, a peer by name back on a new address).
         let waiting = match peers.check(&host.config_now().peers, from) {
             Some(true) => {
                 let Some(slot) = Slot::take(&ACTIVE, MAX_ACTIVE) else { continue };
@@ -204,8 +205,8 @@ impl Peers {
             }
             let (p, name) = (self.clone(), n.clone());
             let lookup = std::thread::Builder::new().spawn(move || {
-                if let Ok(a) = name.to_socket_addrs() {
-                    p.0.resolved.write().unwrap().insert(name.clone(), a.map(|a| a.ip()).collect());
+                if let Ok(a) = crate::util::lookup(&name) {
+                    p.0.resolved.write().unwrap().insert(name.clone(), a.iter().map(|a| a.ip()).collect());
                 }
                 p.0.lookups.lock().unwrap().insert(name, Some(Instant::now()));
             });
@@ -234,18 +235,22 @@ impl Peers {
         is_peer(&self.addrs(names), from)
     }
 
-    /// Whether a name in `names` with no addresses yet has its lookup under way.
+    /// Whether a name in `names` has its lookup under way (one that hangs
+    /// keeps every unknown address waiting its `ADMIT_WAIT`, within `Waiting`).
     fn resolving(&self, names: &[String]) -> bool {
-        let (r, l) = (self.0.resolved.read().unwrap(), self.0.lookups.lock().unwrap());
-        names.iter().any(|n| !r.contains_key(n) && l.get(n) == Some(&None))
+        let l = self.0.lookups.lock().unwrap();
+        names.iter().any(|n| l.get(n) == Some(&None))
     }
 
-    /// Whether `from` is a peer; None while it may yet be, a name with no
-    /// addresses still being looked up.
+    /// Whether `from` is a peer; None while it may yet be, a name still being
+    /// looked up. One it would refuse looks again for any name not looked up
+    /// within `LOOKUP_EVERY`: a peer by name may be back on a new address
+    /// (DHCP), which would otherwise wait for `PEER_REFRESH` (#311).
     fn check(&self, names: &[String], from: IpAddr) -> Option<bool> {
         if self.admit(names, from) {
             return Some(true);
         }
+        self.refresh(names);
         // A lookup that ended since may have given its address.
         (!self.resolving(names)).then(|| self.admit(names, from))
     }
@@ -271,18 +276,24 @@ fn not_a_peer(conn: TcpStream, from: IpAddr, log: &SyncSender<String>) {
 }
 
 /// Tells the client why, then reads off what it already sent so the close
-/// does not reset the reply away: for up to `wait`, or with none only what
-/// has arrived, never waiting on the client.
-pub fn refuse(mut conn: TcpStream, why: &str, wait: Option<Duration>) {
-    let set = match wait {
-        Some(w) => conn.set_read_timeout(Some(w)),
-        None => conn.set_nonblocking(true),
-    };
-    if set.is_ok() {
-        let _ = send_json(&mut conn, &json!({"ok": false, "error": why}));
-        let _ = conn.shutdown(std::net::Shutdown::Write);
-        let _ = std::io::copy(&mut (&mut conn).take(1 << 20), &mut std::io::sink());
+/// does not reset the reply away: until `wait` from now in all, however the
+/// client trickles (#352), or with none only what has arrived, never waiting
+/// on the client.
+pub fn refuse(conn: TcpStream, why: &str, wait: Option<Duration>) {
+    let mut c = crate::util::By { s: &conn, at: Instant::now() + wait.unwrap_or_default() };
+    if wait.is_none() && conn.set_nonblocking(true).is_err() {
+        return;
     }
+    let reply = json!({"ok": false, "error": why});
+    let _ = match wait {
+        Some(_) => send_json(&mut c, &reply),
+        None => send_json(&mut &conn, &reply),
+    };
+    let _ = conn.shutdown(std::net::Shutdown::Write);
+    let _ = match wait {
+        Some(_) => std::io::copy(&mut c.take(1 << 20), &mut std::io::sink()),
+        None => std::io::copy(&mut (&conn).take(1 << 20), &mut std::io::sink()),
+    };
 }
 
 pub fn activated() -> Option<TcpListener> {
@@ -638,6 +649,44 @@ mod tests {
             lookup.join().unwrap();
             assert_eq!(p.check(&names, from), Some(true));
         }
+    }
+
+    #[test]
+    fn a_peer_by_name_on_a_new_address_is_admitted_before_the_refresh() {
+        let (root, host) = host_with_peers("moved", &["localhost:7070"]);
+        let names = host.config_now().peers;
+        let p = Peers::default();
+        // Resolved before it moved (DHCP), and not looked up since `LOOKUP_EVERY`.
+        p.0.resolved.write().unwrap().insert(names[0].clone(), vec!["10.1.0.2".parse().unwrap()]);
+        let Some(long_ago) = Instant::now().checked_sub(LOOKUP_EVERY) else { return };
+        p.0.lookups.lock().unwrap().insert(names[0].clone(), Some(long_ago));
+        let local: [IpAddr; 2] = ["127.0.0.1".parse().unwrap(), "::1".parse().unwrap()];
+        // Not refused: looked up again, and waited for.
+        assert_ne!(p.check(&names, local[0]), Some(false));
+        assert_ne!(p.0.lookups.lock().unwrap()[&names[0]], Some(long_ago), "a lookup started");
+        // Only a bound on a hung lookup: on a loaded machine one of localhost can take seconds.
+        let by = Instant::now() + Duration::from_secs(60);
+        assert!(local.iter().any(|&a| p.admit_by(&host, a, by)), "admitted once localhost resolved");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_trickling_client_is_refused_by_one_deadline() {
+        use std::io::Write;
+        let (mut c, s) = pair();
+        let sender = std::thread::spawn(move || {
+            // Each byte well within a per-read timeout of the whole wait.
+            for _ in 0..50 {
+                if c.write_all(b"x").is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+        let start = Instant::now();
+        refuse(s, "no", Some(Duration::from_millis(400)));
+        assert!(start.elapsed() < Duration::from_millis(2000), "{:?}", start.elapsed());
+        sender.join().unwrap();
     }
 
     #[test]

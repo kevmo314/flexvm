@@ -317,14 +317,25 @@ static DNS: Resolver = Resolver::new();
 
 /// HOST:PORT's addresses by `at`; an IP literal resolves at once.
 pub fn resolve(addr: &str, at: Instant) -> io::Result<Addrs> {
-    use std::net::ToSocketAddrs;
-    resolve_with(addr, at, &DNS, false, |addr| addr.to_socket_addrs().map(Iterator::collect))
+    resolve_with(addr, at, &DNS, false, |addr| lookup(&addr))
 }
 
 /// Resolves a stale address without reusing a finished answer; still joins a lookup under way.
 pub fn resolve_fresh(addr: &str, at: Instant) -> io::Result<Addrs> {
+    resolve_with(addr, at, &DNS, true, |addr| lookup(&addr))
+}
+
+/// HOST:PORT's addresses, as the system resolver gives them now (it may block indefinitely). Test hook: with test
+/// faults on (`host::fault`), `RUN/hosts.json` ({"HOST:PORT": ["IP:PORT", ...]}) answers for the names it lists.
+pub fn lookup(addr: &str) -> io::Result<Addrs> {
     use std::net::ToSocketAddrs;
-    resolve_with(addr, at, &DNS, true, |addr| addr.to_socket_addrs().map(Iterator::collect))
+    if crate::host::faults_on() {
+        let hosts = crate::host::run_dir().map(|r| crate::host::load::<std::collections::HashMap<String, Addrs>>(&r.join("hosts.json")));
+        if let Some(addrs) = hosts.and_then(|h| h.ok().flatten()).and_then(|mut h| h.remove(addr)) {
+            return Ok(addrs);
+        }
+    }
+    addr.to_socket_addrs().map(Iterator::collect)
 }
 
 fn resolve_with(
