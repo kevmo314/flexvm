@@ -73,8 +73,10 @@ impl Pager {
     /// copy has not saved yet; then unprotects the pages of its block (`wp_block`) around it that need not stay
     /// protected for the copy, and marks them dirty. Unless it must wait for a writer to save the page first
     /// (`Served::Writer`).
-    pub(super) fn wp_fault(&self, page: usize, m: &Mapping, parked: bool) -> io::Result<Served> {
+    pub(super) fn wp_fault(&self, page: usize, m: &Mapping, first: bool) -> io::Result<Served> {
         let cow = self.cow();
+        // On its `first` try only: a fault is retried after errors, and on every pass of the event loop while it waits.
+        cow.iter().for_each(|c| _ = c.stats.faults.fetch_add(first as u64, Ordering::Relaxed));
         // Already unprotected: by the fault of another thread (each one that writes it queues one, and the first
         // unprotect wakes them all), or one on a page of the same block. Its thread may still wait, if it faulted after
         // that unprotect woke the others but before the page table changed: wake it, which costs nothing like an
@@ -83,13 +85,9 @@ impl Pager {
         if self.pagemap(page, 1).is_ok_and(|e| e[0] & PM_PRESENT != 0 && e[0] & PM_UFFD_WP == 0) {
             return self.wake(page).map(|()| Served::Done(WP));
         }
-        if let Some(cow) = &cow {
-            // Once: a fault waiting for a writer (`parked`) is retried on every pass of the event loop.
-            cow.stats.faults.fetch_add(!parked as u64, Ordering::Relaxed);
-            if cow.state(page) == READING {
-                cow.wait_for(page, READING);
-                return Ok(Served::Writer);
-            }
+        if let Some(cow) = cow.as_ref().filter(|c| c.state(page) == READING) {
+            cow.wait_for(page, READING);
+            return Ok(Served::Writer(cow.clone()));
         }
         // Over budget, nothing more is copied here, and only the least block is unprotected.
         let over = cow.as_ref().is_some_and(|c| c.over_budget());
@@ -104,7 +102,7 @@ impl Pager {
                 unsaved.iter().for_each(|&p| cow.want(p));
                 if unsaved.contains(&page) {
                     cow.wait_for(page, PENDING);
-                    return Ok(Served::Writer);
+                    return Ok(Served::Writer(cow.clone()));
                 }
             }
             let start = Instant::now();
@@ -124,7 +122,7 @@ impl Pager {
         // pause (a range costs by its size as well as by the call). One call: more would cost more than the faults
         // they spare.
         let keep = |p: usize| cow.as_ref().is_some_and(|c| matches!(c.state(p), PENDING | READING | RESCUING));
-        if !keep(page) {
+        let Some(cow) = cow.as_ref().filter(|_| keep(page)) else {
             let (mut p, mut q) = (page, page + 1);
             while p > first && !keep(p - 1) {
                 p -= 1;
@@ -141,16 +139,14 @@ impl Pager {
             (p..q).for_each(|d| self.pages().mark_dirty(d));
             self.writeprotect(p, q - p, false)?;
             return Ok(Served::Done(WP));
-        }
+        };
         // A writer claimed the faulting page itself (PENDING -> READING) after the check above, so it stayed protected,
         // and nothing else wakes the fault (writers never unprotect, even once they are done with it): retry it once the
         // writer is done, and unprotect it then. (Only with a copy: nothing is kept protected without one.)
-        if let Some(cow) = &cow {
-            // Test fault `ckpt_wp_race`: the writer that claimed the page is done with it before the fault is settled.
-            self.wp_race(cow, page, &[PENDING, READING, RESCUING]);
-            cow.wait_for(page, cow.state(page));
-        }
-        Ok(Served::Writer)
+        // Test fault `ckpt_wp_race`: the writer that claimed the page is done with it before the fault is settled.
+        self.wp_race(cow, page, &[PENDING, READING, RESCUING]);
+        cow.wait_for(page, cow.state(page));
+        Ok(Served::Writer(cow.clone()))
     }
 
     /// Test fault `ckpt_wp_race`, once the writers run (before, nothing can claim a page, and the faults of the resume
