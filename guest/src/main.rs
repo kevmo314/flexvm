@@ -30,15 +30,28 @@ const MAX_LINE: u64 = 2 * MAX_BODY as u64 + 128;
 const MAX_BODY_READERS: usize = 16;
 static BODY_READERS: AtomicUsize = AtomicUsize::new(0);
 
-/// Children someone waits for, by pid.
-type Statuses = Arc<(Mutex<HashMap<i32, Watched>>, Condvar)>;
+/// Children someone waits for.
+type Statuses = Arc<(Mutex<Children>, Condvar)>;
 
-/// A spawned child in `Statuses`. Its pid can be reused once it is reaped; its token never is.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Watched {
-    token: u64,
-    /// The exit code, once reaped.
-    exit: Option<i32>,
+/// Spawned children by pid until reaped, then their exit codes by token. A pid can be reused once
+/// its child is reaped; a token never is, so a newer child (or an orphan reaped under the same pid)
+/// cannot touch an older one's status.
+#[derive(Default)]
+struct Children {
+    running: HashMap<i32, u64>,
+    finished: HashMap<u64, i32>,
+}
+
+impl Children {
+    /// Records a reaped child's exit, if it is one of ours (orphans are not).
+    fn reaped(&mut self, pid: i32, code: i32) -> bool {
+        self.running.remove(&pid).map(|token| self.finished.insert(token, code)).is_some()
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.running.is_empty() && self.finished.is_empty()
+    }
 }
 
 static TOKENS: AtomicU64 = AtomicU64::new(1);
@@ -53,7 +66,7 @@ fn main() {
         }
         mem::start();
     }
-    let statuses: Statuses = Arc::new((Mutex::new(HashMap::new()), Condvar::new()));
+    let statuses = Statuses::default();
     let reaped = statuses.clone();
     thread::spawn(move || reap(reaped));
     log("ready");
@@ -157,17 +170,12 @@ fn reap(statuses: Statuses) {
             Err(_) => return,
             Ok(pid) => {
                 let code = if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { 128 + libc::WTERMSIG(status) };
-                if let Some(watched) = map.get_mut(&pid) {
-                    watched.exit = Some(code);
+                if map.reaped(pid, code) {
                     cv.notify_all();
                 }
             }
         }
     }
-}
-
-fn spawn(command: &mut Command, statuses: &Statuses) -> io::Result<Child> {
-    spawn_watched(command, statuses, false).map(|(child, _, _)| child)
 }
 
 /// Also returns the child's token in `Statuses` and, with `pidfd`, a pidfd for it (None if the
@@ -180,17 +188,17 @@ fn spawn_watched(command: &mut Command, statuses: &Statuses, pidfd: bool) -> io:
     let fd = pidfd.then(|| unsafe { libc::syscall(libc::SYS_pidfd_open, child.id() as libc::pid_t, 0) as RawFd });
     let fd = fd.filter(|&fd| fd >= 0).map(|fd| unsafe { OwnedFd::from_raw_fd(fd) });
     let token = TOKENS.fetch_add(1, Ordering::Relaxed);
-    map.insert(child.id() as i32, Watched { token, exit: None });
+    map.running.insert(child.id() as i32, token);
     cv.notify_all();
     Ok((child, fd, token))
 }
 
-fn wait_pid(statuses: &Statuses, pid: i32, deadline: Option<Instant>) -> Option<i32> {
+/// Waits for the exit of the child `spawn_watched` gave `token`.
+fn wait_exit(statuses: &Statuses, token: u64, deadline: Option<Instant>) -> Option<i32> {
     let (lock, cv) = &**statuses;
     let mut map = lock.lock().unwrap();
     loop {
-        if let Some(Watched { exit: Some(code), .. }) = map.get(&pid).copied() {
-            map.remove(&pid);
+        if let Some(code) = map.finished.remove(&token) {
             return Some(code);
         }
         map = match deadline.map(|d| d.saturating_duration_since(Instant::now())) {
@@ -199,6 +207,17 @@ fn wait_pid(statuses: &Statuses, pid: i32, deadline: Option<Instant>) -> Option<
             Some(left) => cv.wait_timeout(map, left).unwrap().0,
         };
     }
+}
+
+/// Sends `sig` to `pid` (its process group with `group`) only while it is still `token`'s unreaped
+/// child, checked under the reaper's lock: once reaped, its pid (and an emptied group's id) may be
+/// another process's. Returns whether it was sent.
+fn kill_running(statuses: &Statuses, pid: i32, token: u64, group: bool, sig: libc::c_int) -> bool {
+    let map = statuses.0.lock().unwrap();
+    if pid <= 0 || map.running.get(&pid) != Some(&token) {
+        return false;
+    }
+    unsafe { libc::kill(if group { -pid } else { pid }, sig) == 0 }
 }
 
 fn pump(stdout: Option<ChildStdout>, stderr: Option<ChildStderr>, mut deliver: impl FnMut(u8, &[u8])) {
@@ -359,10 +378,10 @@ fn serve(statuses: Statuses) -> io::Result<()> {
     os(unsafe { libc::bind(fd.as_raw_fd(), (&addr as *const libc::sockaddr_vm).cast(), std::mem::size_of_val(&addr) as _) })?;
     os(unsafe { libc::listen(fd.as_raw_fd(), 64) })?;
     let sessions = session::Sessions::default();
-    let swept = sessions.clone();
+    let (swept, statuses_) = (sessions.clone(), statuses.clone());
     thread::spawn(move || loop {
         thread::sleep(Duration::from_secs(60));
-        session::cleanup(&swept);
+        session::cleanup(&swept, &statuses_);
     });
     let mut backoff = Duration::ZERO;
     loop {
@@ -594,7 +613,7 @@ mod tests {
     use super::*;
 
     #[test]
-    #[allow(clippy::zombie_processes)] // reap() consumes children; wait_pid receives their statuses.
+    #[allow(clippy::zombie_processes)] // reap() consumes children; wait_exit receives their statuses.
     fn failed_exec_does_not_race_the_reaper() {
         // Isolate waitpid(P_ALL) from children of the other tests.
         const CHILD: &str = "FLEXVM_REAPER_TEST";
@@ -607,21 +626,22 @@ mod tests {
                 .success());
             return;
         }
-        let statuses: Statuses = Arc::new((Mutex::new(HashMap::new()), Condvar::new()));
+        let statuses = Statuses::default();
         let reaper = statuses.clone();
         thread::spawn(move || reap(reaper));
-        let child = spawn(Command::new("/bin/sleep").arg("0.2"), &statuses).unwrap();
+        let (_child, _, token) = spawn_watched(Command::new("/bin/sleep").arg("0.2"), &statuses, false).unwrap();
         // Let the reaper reach its blocking wait before failed execs exit.
         thread::sleep(Duration::from_millis(10));
         for _ in 0..200 {
             // A pre_exec makes std fork and reap a failed exec itself, as with the throttle cgroup.
             let mut missing = Command::new("/flexvm/nonexistent-executable");
             unsafe { std::os::unix::process::CommandExt::pre_exec(&mut missing, || Ok(())) };
-            assert!(spawn(&mut missing, &statuses).is_err());
+            assert!(spawn_watched(&mut missing, &statuses, false).is_err());
         }
-        assert_eq!(wait_pid(&statuses, child.id() as i32, None), Some(0));
-        let child = spawn(Command::new("/bin/sh").args(["-c", "exit 7"]), &statuses).unwrap();
-        assert_eq!(wait_pid(&statuses, child.id() as i32, None), Some(7));
+        assert_eq!(wait_exit(&statuses, token, None), Some(0));
+        let (_child, _, token) = spawn_watched(Command::new("/bin/sh").args(["-c", "exit 7"]), &statuses, false).unwrap();
+        assert_eq!(wait_exit(&statuses, token, None), Some(7));
+        assert!(statuses.0.lock().unwrap().is_empty());
     }
 
     #[test]

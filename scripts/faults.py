@@ -791,8 +791,8 @@ def guest_calls():
 def exec_background():
     """An exec whose command leaves a background process holding its output returns once the
     shell exits (the process keeps running), and such execs never use up the guest agent's 64
-    session slots; nor do interrupted ones (SIGINT stops the command) or session-less ones whose
-    client went away."""
+    session slots; nor do interrupted ones (SIGINT stops the command), session-less ones whose
+    client went away, or ones whose client was killed outright."""
     n = "ft-exec-bg"
     ok(run(A, n))
     # Processes whose command line starts with `cmd` (the ^ keeps grep from counting itself).
@@ -870,6 +870,31 @@ def exec_background():
     check("exec bg: a session-less exec started", b"ready" in buf, buf[-200:])
     stopped = wait_for(lambda: count("sleep 1002") == (0, "0"), 10)
     check("exec bg: a session-less exec's command stops when its client goes", stopped, count("sleep 1002"))
+    # A client killed outright (SIGKILL: no close) leaves its command running. Once the client has been
+    # gone long enough (ten minutes; 3 s through the agent's test knob), the guest stops the command and
+    # frees its slot, so 70 of these never use up the 64.
+    knob = "/run/flexvm-test-abandoned-running-secs"
+    check("exec bg: the abandoned-session wait is shortened", sh(A, n, f"echo 3 > {knob}") == (0, ""))
+    killed = []
+
+    def killer():
+        for _ in range(7):
+            p = subprocess.run(["timeout", "-s", "KILL", "2", BIN, "--state", A.state, "--run", A.run, "exec", n, "sleep infinity"],
+                               capture_output=True, text=True, env=ENV, timeout=60)
+            killed.append((p.returncode, p.stderr.strip()[-200:]))
+
+    killers = [threading.Thread(target=killer) for _ in range(10)]
+    for k in killers:
+        k.start()
+    for k in killers:
+        k.join()
+    # 124: `timeout` had to kill it, so it ran until then; "too many sessions" would end it at once.
+    bad = [k for k in killed if k != (124, "")]
+    check("exec bg: 70 execs killed outright all ran until killed", len(killed) == 70 and not bad, bad[:3])
+    check("exec bg: execs still start after them", sh(A, n, "echo hi") == (0, "hi"))
+    stopped = wait_for(lambda: count("sleep infinity") == (0, "0"), 90)
+    check("exec bg: an abandoned exec's command is stopped", stopped, count("sleep infinity"))
+    sh(A, n, f"rm -f {knob}")
     cleanup(n)
 
 

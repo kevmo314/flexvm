@@ -871,14 +871,18 @@ impl Proc {
         let mut once = None;
         let started = vm.exec(|s| match req["session"].as_str() {
             Some(id) => guest::session(s, req["action"].as_str().unwrap_or("start"), id, req["offset"].as_u64().unwrap_or(0), cmd, guest::TIMEOUT),
-            None => guest::start_exec(s, cmd, guest::TIMEOUT).map(|(g, id)| {
-                once = Some(id);
-                g
-            }),
+            // Closed once it has exited, however that went (a start cut short too).
+            None => {
+                let id = once.insert(guest::session_id()?);
+                guest::session(s, "start", id, 0, cmd, guest::TIMEOUT)
+            }
         });
         let (mut g, id) = match started {
             Ok(g) => g,
             Err(e) => {
+                if let Some(id) = &once {
+                    let _ = guest::close(&vm.vsock, id, Instant::now() + guest::TIMEOUT);
+                }
                 let _ = send_json(&mut w, &json!({"ok": false, "error": e.to_string()}));
                 return;
             }
@@ -890,10 +894,8 @@ impl Proc {
                 let closed = reply.as_deref() == Some("closed");
                 return Ok(send_json(&mut w, &json!({"ok": closed, "error": format!("session close failed: {}", reply.unwrap_or_default())}))?);
             }
-            if req["session"].is_string() {
-                // The guest heartbeats every second; silence means the VM moved.
-                g.get_ref().set_read_timeout(Some(Duration::from_secs(3)))?;
-            }
+            // The guest heartbeats every second; silence means the VM moved, or its agent stalled.
+            g.get_ref().set_read_timeout(Some(Duration::from_secs(3)))?;
             send_json(&mut w, &json!({"ok": true}))?;
             if let Some(id) = &once {
                 // A silent command's heartbeats never reach the client, so writes cannot tell it hung up.

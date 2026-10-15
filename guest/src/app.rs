@@ -16,7 +16,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::proto::FRAME_LOST;
-use crate::{fail, mem, msg, session::Output, spawn, wait_pid, write_frame, Statuses, FRAME_STDOUT};
+use crate::{fail, kill_running, mem, msg, session::Output, spawn_watched, wait_exit, write_frame, Statuses, FRAME_STDOUT};
 
 const CONF: &str = "/etc/flexvm/app.conf";
 const RING_BYTES: usize = 1 << 20;
@@ -163,19 +163,21 @@ fn check(arg: &str, statuses: &Statuses) -> io::Result<String> {
         None => mem::work_procs().into_iter().for_each(|work| mem::enter(&mut cmd, work, false)),
     }
     restrict(&mut cmd, &c);
-    let pid = spawn(&mut cmd, statuses).map_err(|e| io::Error::new(e.kind(), format!("cannot run /bin/sh: {e}")))?.id() as i32;
-    let code = wait_pid(statuses, pid, Some(Instant::now() + Duration::from_millis(ms)));
-    // Kill whatever is left, the leader included if it timed out.
+    let (child, _, token) = spawn_watched(&mut cmd, statuses, false).map_err(|e| io::Error::new(e.kind(), format!("cannot run /bin/sh: {e}")))?;
+    let pid = child.id() as i32;
+    let code = wait_exit(statuses, token, Some(Instant::now() + Duration::from_millis(ms)));
+    // Kill whatever is left, the leader included if it timed out. Without a cgroup only its session
+    // (group) can be, and only while the leader is unreaped: a reaped leader's pid may be anyone's.
     let cleaned = match &mut cg {
         Some(g) => g.cleanup(),
         None => {
-            unsafe { libc::kill(-pid, libc::SIGKILL) };
+            kill_running(statuses, pid, token, true, libc::SIGKILL);
             Ok(())
         }
     };
     if code.is_none() {
-        unsafe { libc::kill(pid, libc::SIGKILL) };
-        if wait_pid(statuses, pid, Some(Instant::now() + Duration::from_secs(2))).is_none() {
+        kill_running(statuses, pid, token, false, libc::SIGKILL);
+        if wait_exit(statuses, token, Some(Instant::now() + Duration::from_secs(2))).is_none() {
             return Err(io::Error::other(format!("readiness command {pid} would not die")));
         }
     }
@@ -296,7 +298,7 @@ fn start(statuses: &Statuses) -> io::Result<i32> {
         mem::enter(&mut cmd, work, true);
     }
     restrict(&mut cmd, &c);
-    let mut child = spawn(&mut cmd, statuses).map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", c.argv[0])))?;
+    let (mut child, _, token) = spawn_watched(&mut cmd, statuses, false).map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", c.argv[0])))?;
     let pid = child.id() as i32;
     app.state = State::Running(pid);
     app.push(format!("flexvm-init: started {:?} as pid {pid}\n", c.argv).as_bytes());
@@ -309,7 +311,7 @@ fn start(statuses: &Statuses) -> io::Result<i32> {
     });
     let statuses = statuses.clone();
     thread::spawn(move || {
-        let code = wait_pid(&statuses, pid, None).unwrap_or(-1);
+        let code = wait_exit(&statuses, token, None).unwrap_or(-1);
         // Descendants may hold the app's pipes after it exits; never wait indefinitely.
         let (mut app, _) = CHANGED.wait_timeout_while(APP.lock().unwrap(), Duration::from_secs(2), |a| a.pumped != pid).unwrap();
         app.state = State::Exited(code);
