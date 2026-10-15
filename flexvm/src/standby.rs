@@ -747,12 +747,13 @@ mod tests {
         let root = std::env::temp_dir().join(format!("flexvm-standby-budget-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
-        std::fs::create_dir_all(root.join("templates/default")).unwrap();
+        std::fs::create_dir_all(root.join("templates/.gen/a")).unwrap();
+        std::os::unix::fs::symlink(".gen/a", root.join("templates/default")).unwrap();
         let paths = Paths::new(&root, None).unwrap();
         let d = dir(&host, "default");
         std::fs::create_dir_all(&d).unwrap();
-        let stopped: Vec<_> = (0..2).map(|n| UnixListener::bind(d.join(format!("default.{n}.sock"))).unwrap()).collect();
-        let live = UnixListener::bind(d.join("default.2.sock")).unwrap();
+        let stopped: Vec<_> = (0..2).map(|n| UnixListener::bind(d.join(format!("a.{n}.sock"))).unwrap()).collect();
+        let live = UnixListener::bind(d.join("a.2.sock")).unwrap();
         let live = std::thread::spawn(move || {
             let (c, _) = live.accept().unwrap();
             std::io::BufRead::read_line(&mut BufReader::new(&c), &mut String::new()).unwrap();
@@ -776,12 +777,13 @@ mod tests {
         let root = std::env::temp_dir().join(format!("flexvm-standby-take-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
-        std::fs::create_dir_all(root.join("templates/default")).unwrap();
+        std::fs::create_dir_all(root.join("templates/.gen/a")).unwrap();
+        std::os::unix::fs::symlink(".gen/a", root.join("templates/default")).unwrap();
         let paths = Paths::new(&root, None).unwrap();
         let d = dir(&host, "default");
         std::fs::create_dir_all(&d).unwrap();
         let serve = |n: u32| {
-            let l = UnixListener::bind(d.join(format!("default.{n}-1.sock"))).unwrap();
+            let l = UnixListener::bind(d.join(format!("a.{n}-1.sock"))).unwrap();
             std::thread::spawn(move || {
                 let (c, _) = l.accept().unwrap();
                 std::io::BufRead::read_line(&mut BufReader::new(&c), &mut String::new()).unwrap();
@@ -793,15 +795,15 @@ mod tests {
         };
         let (first, second) = (serve(1), serve(2));
         // Another claimer is trying the first: this one takes the second, at once.
-        let other = try_take(&d.join("default.1-1.sock")).unwrap().unwrap();
-        assert!(try_take(&d.join("default.1-1.sock")).is_none());
+        let other = try_take(&d.join("a.1-1.sock")).unwrap().unwrap();
+        assert!(try_take(&d.join("a.1-1.sock")).is_none());
         let start = Instant::now();
         let (v, _) = take(&host, &paths, "default", &json!({"name": "a"}), &[]).unwrap().unwrap();
         assert_eq!(v, json!(2));
         assert!(start.elapsed() < Duration::from_secs(1), "{:?}", start.elapsed());
         // Only those others are trying are left: tried anyway.
-        assert!(try_take(&d.join("default.2-1.sock")).unwrap().is_some());
-        std::fs::remove_file(d.join("default.2-1.sock")).unwrap();
+        assert!(try_take(&d.join("a.2-1.sock")).unwrap().is_some());
+        std::fs::remove_file(d.join("a.2-1.sock")).unwrap();
         let (v, _) = take(&host, &paths, "default", &json!({"name": "b"}), &[]).unwrap().unwrap();
         assert_eq!(v, json!(1));
         drop(other);

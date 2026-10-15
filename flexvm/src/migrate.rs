@@ -368,8 +368,8 @@ impl Proc {
             }
             let op = p.op();
             // Decided here durably first: once the target forgets its record, the
-            // migration would read as aborted there (`Host::hand_off`).
-            match p.host.lock().and_then(|l| p.host.hand_off(&l, p.vm().ip)) {
+            // migration would read as aborted there.
+            match p.host.lock().and_then(|l| p.host.release(&l, p.vm().ip, &p.vm().name, Some(&crate::host::Ident::me()))) {
                 Ok(()) => drop(peer_call(&to, json!({"op": "migration", "mig": mig, "done": true}))),
                 Err(e) => crate::log!(
                     "vm {}: recording that {to} has it: {e}; {to} is not told it is done, so it keeps its record for this host to ask about",
