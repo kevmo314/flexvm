@@ -1744,11 +1744,13 @@ pub mod output {
     }
 
     /// Drains the relays before exit, after queued diagnostics have been flushed.
-    /// Bounded by a second from the start: what was printed reaches its target
-    /// if it can. No output lock is taken (a thread may hold stdout's for good);
-    /// what std still buffers, exit flushes if free.
+    /// Bounded by a little over `STALL` from the start, so a relay's write that
+    /// began just before and waits out its own `STALL` (a log's stopped lock
+    /// holder) still lands: what was printed reaches its target if it can. No
+    /// output lock is taken (a thread may hold stdout's for good); what std
+    /// still buffers, exit flushes if free.
     pub fn drain() {
-        let deadline = Instant::now() + STALL;
+        let deadline = Instant::now() + STALL + STALL / 4;
         let null = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
         if null >= 0 {
             unsafe {
