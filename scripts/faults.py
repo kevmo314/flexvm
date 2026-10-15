@@ -5613,31 +5613,43 @@ def standby_claim_signal():
         for sig, n in ((signal.SIGINT, "ft-sb-sigint"), (signal.SIGKILL, "ft-sb-sigkill")):
             scenario_vms.add(n)
             what = signal.Signals(sig).name
-            check(f"standby claim {what}: a standby ready", wait_for(lambda: len(standby_pids(A, t)) == 1, 60), standby_pids(A, t))
+            check(f"standby claim {what}: a standby ready", wait_for(lambda: len(standby_socks(A, t)) == 1, 60), standby_pids(A, t))
             # The claim stalls 3 s once the VM runs, before the standby answers.
             fault(A, "claim_stall", 10000)
+            # Output to a file: an orphaned VM would hold a pipe open, and reading it would never end.
+            out = tempfile.TemporaryFile("w+")
             p = subprocess.Popen([BIN, "--state", A.state, "--run", A.run, "run", n, "--template", t, "--", "sleep 600"],
-                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=ENV)
+                                 stdin=subprocess.DEVNULL, stdout=out, stderr=out, text=True, env=ENV)
             # Inside the stall: the claim has started the VM, its answer is yet to come.
             time.sleep(1.5)
             p.send_signal(sig)
             try:
-                _, err = p.communicate(timeout=60)
+                p.wait(timeout=60)
             except subprocess.TimeoutExpired:
                 p.kill()
-                _, err = p.communicate()
+                p.wait()
+            out.seek(0)
+            err = out.read()
             fault(A, "claim_stall", 0)
             if sig == signal.SIGINT:
                 check("standby claim SIGINT: the claim finishes, then the VM gets the signal", '"standby":true' in err.replace(" ", ""), err[-800:])
             else:
-                sblog = open(os.path.join(A.run, "standby", t, "standby.log"), errors="replace").read()
-                check("standby claim SIGKILL: the standby finds its claimer gone", f"the claimer of {n} is gone" in sblog, sblog[-800:])
+                # Once its stall is over, the standby answers, finds the claimer gone and ends the VM.
+                sblog = lambda: open(os.path.join(A.run, "standby", t, "standby.log"), errors="replace").read()
+                check("standby claim SIGKILL: the standby finds its claimer gone", wait_for(lambda: f"the claimer of {n} is gone" in sblog(), 30),
+                      (err[-800:], sblog()[-1500:]))
             check(f"standby claim {what}: the claimed vm is gone, not orphaned", wait_for(lambda: n not in vms(A), 30),
                   (vms(A).get(n), log(A, n)[-1500:]))
             cleanup(n)
     finally:
         fault(A, "claim_stall", 0)
         cli(A, "standby", "--template", t, "0")
+
+
+def standby_socks(host, t):
+    """The listening sockets of `host`'s standby VMs of `t`: those loaded, claimable."""
+    d = os.path.join(host.run, "standby", t)
+    return [f for f in os.listdir(d) if f.endswith(".sock")] if os.path.isdir(d) else []
 
 
 def standby_concurrent_claims():
@@ -5647,7 +5659,7 @@ def standby_concurrent_claims():
     ok(cli_json(A, "standby", "--template", t, "2"))
     res = {}
     try:
-        check("standby concurrent: two ready", wait_for(lambda: len(standby_pids(A, t)) == 2, 90), standby_pids(A, t))
+        check("standby concurrent: two ready", wait_for(lambda: len(standby_socks(A, t)) == 2, 90), standby_pids(A, t))
         ready = set(standby_pids(A, t))
         fault(A, "claim_stall", 15000)
 
