@@ -93,11 +93,7 @@ pub fn templates(host: &Host) -> Vec<String> {
     t
 }
 
-/// The template is checked first: a count saved for one that cannot be opened would be retried forever.
-pub fn set(host: &Host, paths: &Paths, template: &str, n: usize) -> Result<Value> {
-    if n > 0 {
-        Template::open(paths, template)?;
-    }
+pub fn set(host: &Host, template: &str, n: usize) -> Result<Value> {
     crate::util::write_file(&host.state.join("standby"), template, n.to_string().as_bytes(), true)?;
     for id in live(host, template).iter().skip(n) {
         stop(id);
@@ -180,8 +176,14 @@ fn refill_by(host: &Host, template: &str, wait: bool) -> Result<usize> {
         // and held `LOCKED_TIMEOUT` at most (a stuck host lock fails the grant).
         let stop = stop_lock(host)?;
         let by = Instant::now() + LOCKED_TIMEOUT;
-        if flock(&stop, libc::LOCK_SH | libc::LOCK_NB).is_err() || host.grant(256, Some(by))?.is_none() {
+        if flock(&stop, libc::LOCK_SH | libc::LOCK_NB).is_err() {
             break;
+        }
+        match host.grant(256, Some(by)) {
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(e) if e.to_string() == "the host lock is busy" => break,
+            Err(e) => return Err(e),
         }
         let (r, w) = std::os::unix::net::UnixStream::pair()?;
         let args = ["--state".as_ref(), args[0], "--run".as_ref(), args[1], "run".as_ref(), "--standby".as_ref(), "--template".as_ref(), args[2]];
@@ -583,24 +585,23 @@ mod tests {
         let stop = Flock::new(stop, libc::LOCK_EX).unwrap();
         assert_eq!(refill_by(&host, "default", false).unwrap(), 0);
         drop(stop);
-        // A host lock held by a stuck process fails the grant within the budget, and lets relief in.
+        // A busy host lock ends this round without a refill failure or backoff, and lets relief in.
         let held = File::create(host.state.join("lock")).unwrap();
         let held = Flock::new(held, libc::LOCK_EX).unwrap();
         let start = Instant::now();
-        assert!(refill_by(&host, "default", false).is_err());
+        assert_eq!(refill_by(&host, "default", false).unwrap(), 0);
+        assert!(!d.join(".failed").exists());
         assert!(start.elapsed() < LOCKED_TIMEOUT + Duration::from_secs(1), "{:?}", start.elapsed());
         Flock::new(stop_lock(&host).unwrap(), libc::LOCK_EX | libc::LOCK_NB).unwrap();
+        // Saving a count also succeeds if its first refill hits the same timeout.
+        assert_eq!(set(&host, "default", 1).unwrap()["started"], json!(0));
+        assert_eq!(target(&host, "default"), 1);
         drop(held);
         host.cfg.reserve_mib = u64::MAX / 2;
-        // Other tests' host locks share THREADS, even with different state directories.
-        // Retry only lock contention; the reserve must still refuse a grant without error.
-        let deadline = Instant::now() + Duration::from_secs(60);
-        let started = loop {
-            match refill_by(&host, "default", false) {
-                Err(e) if e.to_string() == "the host lock is busy" && Instant::now() < deadline => continue,
-                result => break result.unwrap(),
-            }
-        };
+        // Hold the reentrant host lock so another test cannot time out this grant before it checks the reserve.
+        let l = host.lock().unwrap();
+        let started = refill_by(&host, "default", false).unwrap();
+        drop(l);
         assert_eq!(started, 0);
         assert!(live(&host, "default").is_empty());
         assert!(!recent(&pressure(&host)));

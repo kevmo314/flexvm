@@ -365,7 +365,15 @@ fn real_main(args: &Args) -> Result<()> {
             print(serde_json::to_value(&host.cfg)?)
         }
         Some("standby") if name.is_empty() => print(standby::show(&open_host(args)?)),
-        Some("standby") => print(standby::set(&open_host(args)?, &paths(args)?, template, name.parse().map_err(|_| "standby wants a count")?)?),
+        Some("standby") => {
+            let host = open_host(args)?;
+            let n = name.parse().map_err(|_| "standby wants a count")?;
+            // Check before saving a positive count, or an unreadable template would be retried forever.
+            if n > 0 {
+                template::Template::open(&paths(args)?, template)?;
+            }
+            print(standby::set(&host, template, n)?)
+        }
         Some("bench") => bench::run(args),
         // Test hooks: arm a fault for MS ms (0 disarms), hash a checkpoint, or ask a VM.
         Some("debug") => match name {
@@ -813,6 +821,26 @@ mod exec_tests {
 
     fn parse(args: &[&str]) -> Args {
         Args::parse(args.iter().map(|a| a.to_string())).unwrap()
+    }
+
+    #[test]
+    fn standby_zero_needs_no_artifacts() {
+        let root = std::env::temp_dir().join(format!("flexvm-standby-zero-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let args = parse(&[
+            "--state",
+            root.join("state").to_str().unwrap(),
+            "--run",
+            root.join("run").to_str().unwrap(),
+            "--artifacts",
+            root.join("missing").to_str().unwrap(),
+            "standby",
+            "0",
+        ]);
+        real_main(&args).unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("state/standby/default")).unwrap(), "0");
+        assert!(!root.join("missing").exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
