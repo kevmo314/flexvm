@@ -243,9 +243,7 @@ fn start_one(host: &Host, template: &str, log: &File, mib: u64, cooldown: bool) 
     // has not acknowledged its lock by then is killed and reaped).
     let stop = stop_lock(host)?;
     let by = Instant::now() + LOCKED_TIMEOUT;
-    if flock(&stop, libc::LOCK_SH | libc::LOCK_NB).is_err() {
-        return Ok(None);
-    }
+    let Ok(stop) = Flock::new(stop, libc::LOCK_SH | libc::LOCK_NB) else { return Ok(None) };
     // Relief marks `.pressure` holding the stop lock exclusively: seen now if it came at all.
     if cooldown && recent(&pressure(host)) {
         return Ok(None);
@@ -259,7 +257,7 @@ fn start_one(host: &Host, template: &str, log: &File, mib: u64, cooldown: bool) 
     // What a child left unlisted is gone (`wait_locked`), so relief may go on; then its
     // grant and what it made before its lock (its cgroup and work directory) are freed:
     // locally only, never waiting on peers (`gc::sweep`'s network retirement).
-    let release = |stop: File| {
+    let release = |stop: Flock| {
         drop(stop);
         host.refund_by(grant, Some(Instant::now() + LOCKED_TIMEOUT));
         crate::gc::local_cleanup(host);

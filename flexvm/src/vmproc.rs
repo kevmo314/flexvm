@@ -1796,9 +1796,7 @@ fn relieve(host: &Host, avail: Option<u64>, starved_here: bool, stopping: &mut O
         return;
     }
     let Ok(lock) = std::fs::File::options().create(true).truncate(false).write(true).open(host.state.join("evict.lock")) else { return };
-    if crate::host::flock(&lock, libc::LOCK_EX | libc::LOCK_NB).is_err() {
-        return;
-    }
+    let Ok(lock) = crate::host::Flock::new(lock, libc::LOCK_EX | libc::LOCK_NB) else { return };
     let pressure = avail < until && (evicting || avail < at);
     if pressure && !evicting {
         let _ = std::fs::write(&active, b"");
@@ -1847,7 +1845,7 @@ fn relieve(host: &Host, avail: Option<u64>, starved_here: bool, stopping: &mut O
 /// Standby VMs a controller signalled, settled on its later ticks, never
 /// waited for. `STATE/standby.stop.lock` is held only until its next tick starts.
 struct Stopping {
-    lock: Option<std::fs::File>,
+    lock: Option<crate::host::Flock>,
     fds: Vec<crate::host::PidFd>,
     by: Instant,
 }
@@ -1871,9 +1869,7 @@ fn stop_standby(host: &Host, avail: u64, reserve: u64, stopping: &mut Option<Sto
         return stopped > 0;
     }
     let Ok(lock) = crate::standby::stop_lock(host) else { return false };
-    if crate::host::flock(&lock, libc::LOCK_EX | libc::LOCK_NB).is_err() {
-        return true;
-    }
+    let Ok(lock) = crate::host::Flock::new(lock, libc::LOCK_EX | libc::LOCK_NB) else { return true };
     let fds: Vec<_> =
         crate::standby::templates(host).iter().flat_map(|t| crate::standby::stoppable(host, t)).filter_map(|id| crate::standby::stop(&id)).collect();
     if fds.is_empty() {

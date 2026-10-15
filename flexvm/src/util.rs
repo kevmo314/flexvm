@@ -288,7 +288,7 @@ pub fn eintr<T: Copy + Default + PartialOrd>(mut f: impl FnMut() -> T) -> io::Re
 
 /// Whether a nonblocking flock fails; `None` if the file cannot be opened.
 pub fn locked(path: &Path, how: i32) -> Option<bool> {
-    std::fs::File::open(path).ok().map(|f| crate::host::flock(&f, how | libc::LOCK_NB).is_err())
+    std::fs::File::open(path).ok().map(|f| crate::host::probe(&f, how).is_err())
 }
 
 /// Calls `f` every `every` until it succeeds or `timeout` has passed.
@@ -1733,12 +1733,19 @@ pub mod output {
             if same_file(&f, log) || !locked && Instant::now() >= deadline {
                 break (f, locked);
             }
+            if locked {
+                // Unlocked, not only closed: see `host::Flock`.
+                let _ = crate::host::flock(&f, libc::LOCK_UN);
+            }
         };
         let written = (&f).write_all(data).is_ok();
         if locked && f.metadata().is_ok_and(|m| m.len() > cap) {
             let mut old = log.as_os_str().to_owned();
             old.push(".1");
             let _ = std::fs::rename(log, old);
+        }
+        if locked {
+            let _ = crate::host::flock(&f, libc::LOCK_UN);
         }
         written
     }
