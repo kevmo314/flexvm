@@ -29,7 +29,7 @@ fn deadline(size: u64) -> Instant {
     Instant::now() + TRANSFER_BASE + Duration::from_secs(size / MIN_RATE)
 }
 
-/// An agent for one transfer: its TLS runs over a socket that enforces the transfer's deadline,
+/// An agent for one transfer: DNS and TLS obey the transfer's deadline. TLS runs over a socket that enforces it,
 /// handshake included (ureq's own deadline starts only once the handshake is done), and its
 /// connections are never pooled into another transfer.
 fn agent(deadline: Instant) -> ureq::Agent {
@@ -45,6 +45,7 @@ fn agent(deadline: Instant) -> ureq::Agent {
         Arc::new(config)
     });
     ureq::AgentBuilder::new()
+        .resolver(move |addr: &str| crate::util::resolve(addr, deadline))
         .timeout_connect(Duration::from_secs(30))
         .timeout_read(IDLE)
         .timeout_write(IDLE)
@@ -341,6 +342,15 @@ fn docker_credentials(registry: &str) -> Option<String> {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+
+    #[test]
+    fn agent_dns_obeys_the_transfer_deadline() {
+        let err = agent(Instant::now()).get("http://unused.example:80/").call().unwrap_err();
+        let ureq::Error::Transport(err) = err else { panic!("expected DNS failure") };
+        assert_eq!(err.kind(), ureq::ErrorKind::Dns);
+        let cause = std::error::Error::source(&err).unwrap().downcast_ref::<std::io::Error>().unwrap();
+        assert_eq!(cause.kind(), std::io::ErrorKind::TimedOut);
+    }
 
     #[test]
     fn corrupt_cached_blobs_are_downloaded_once() {

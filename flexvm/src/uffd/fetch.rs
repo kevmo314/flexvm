@@ -352,6 +352,7 @@ impl Lane {
 pub(super) struct Link {
     pub(super) source: Source,
     pub(super) client: Option<PageClient>,
+    addrs: SourceAddrs,
     /// When the current outage began.
     down: Option<Instant>,
     retry_at: Instant,
@@ -360,7 +361,13 @@ pub(super) struct Link {
 
 impl Link {
     pub(super) fn new(source: Source) -> Link {
-        Link { source, client: None, down: None, retry_at: Instant::now(), backoff: BACKOFF_MIN }
+        Link { source, client: None, addrs: SourceAddrs::default(), down: None, retry_at: Instant::now(), backoff: BACKOFF_MIN }
+    }
+
+    pub(super) fn connect(&mut self) -> io::Result<PageClient> {
+        let at = Instant::now() + CONNECT_TIMEOUT;
+        let stream = self.addrs.connect(&self.source.addr, at)?;
+        PageClient::new(stream, &self.source, at)
     }
 
     /// Reads guest memory, optionally from `lane`'s queued request. Reconnects until stopped or the outage is too long.
@@ -380,7 +387,7 @@ impl Link {
                     return Err(io::Error::other("pager stopped"));
                 }
                 thread::sleep(self.retry_at.saturating_duration_since(Instant::now()));
-                match PageClient::connect(&self.source) {
+                match self.connect() {
                     Ok(c) => self.client = Some(c),
                     Err(e) => self.lost(e)?,
                 }
@@ -445,11 +452,33 @@ impl Link {
 /// Whether a migration source serves pages at all: fetches `page`, retrying as a pager would (for up to
 /// `SOURCE_TIMEOUT`, and not past `deadline`).
 pub fn probe(source: &Source, page: u64, deadline: Instant) -> io::Result<()> {
-    probe_with_connect(source, page, deadline, |addr, timeout| {
-        let s = crate::util::connect(addr, timeout)?;
+    let mut addrs = SourceAddrs::default();
+    probe_with_connect(source, page, deadline, |addr, timeout| addrs.connect(addr, Instant::now() + timeout))
+}
+
+/// The source's addresses, looked up once: reconnects need no lookup, which a stalled resolver could hold past
+/// `SOURCE_TIMEOUT`. After a connect to them fails, the next one looks them up again (a source whose name now
+/// resolves elsewhere), with half its time, and keeps the old ones if that lookup fails.
+#[derive(Default)]
+struct SourceAddrs {
+    addrs: Vec<std::net::SocketAddr>,
+    stale: bool,
+}
+
+impl SourceAddrs {
+    fn connect(&mut self, name: &str, at: Instant) -> io::Result<TcpStream> {
+        if self.addrs.is_empty() {
+            self.addrs = crate::util::resolve(name, at)?;
+        } else if std::mem::take(&mut self.stale) {
+            let now = Instant::now();
+            if let Ok(addrs) = crate::util::resolve(name, now + at.saturating_duration_since(now) / 2) {
+                self.addrs = addrs;
+            }
+        }
+        let s = crate::util::connect_addrs(&self.addrs, at).inspect_err(|_| self.stale = true)?;
         s.set_nodelay(true)?;
         Ok(s)
-    })
+    }
 }
 
 fn probe_with_connect<S: crate::util::Timed>(
@@ -513,10 +542,9 @@ pub struct PageClient<S = TcpStream> {
 }
 
 impl PageClient {
+    #[cfg(test)]
     pub fn connect(source: &Source) -> io::Result<Self> {
-        let stream = crate::util::connect(&source.addr, CONNECT_TIMEOUT)?;
-        stream.set_nodelay(true)?;
-        PageClient::new(stream, source, Instant::now() + CONNECT_TIMEOUT)
+        Link::new(source.clone()).connect()
     }
 }
 
@@ -655,6 +683,25 @@ pub(super) fn fatal(e: &io::Error) -> bool {
 #[cfg(test)]
 mod probe_tests {
     use super::*;
+
+    #[test]
+    fn source_addresses_are_kept_and_looked_up_again_only_after_a_failed_connect() {
+        let at = || Instant::now() + Duration::from_secs(2);
+        let (one, two) = (std::net::TcpListener::bind("127.0.0.1:0").unwrap(), std::net::TcpListener::bind("127.0.0.1:0").unwrap());
+        let (one_addr, two_addr) = (one.local_addr().unwrap(), two.local_addr().unwrap());
+        let mut addrs = SourceAddrs::default();
+        addrs.connect(&one_addr.to_string(), at()).unwrap();
+        // Connected: a reconnect looks nothing up (this name would fail).
+        addrs.connect("invalid address", at()).unwrap();
+        drop(one);
+        assert!(addrs.connect("invalid address", at()).is_err());
+        // Its lookup fails: the old addresses are tried again.
+        assert!(addrs.connect("invalid address", at()).is_err());
+        assert_eq!(addrs.addrs, vec![one_addr]);
+        // The name now resolves elsewhere.
+        addrs.connect(&two_addr.to_string(), at()).unwrap();
+        assert_eq!(addrs.addrs, vec![two_addr]);
+    }
 
     struct Reply(io::Cursor<Vec<u8>>);
 
