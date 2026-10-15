@@ -35,6 +35,9 @@ pub const MAX_DOCUMENT: u64 = 4 << 20;
 const MAX_META: u64 = 1 << 20;
 const MAX_PAX_RECORDS: usize = 256;
 const MAX_DEPTH: u32 = 4096;
+/// Largest zstd window a layer may declare (libzstd's default). Decoding holds the window and one block
+/// (up to 1 MiB of literals) in a ring buffer that grows by doubling: about twice this at worst.
+const MAX_ZSTD_WINDOW: u64 = 128 << 20;
 
 pub fn check(rc: libc::c_int, what: &str, path: &Path) -> Result<()> {
     crate::util::check(rc).map_err(|e| format!("{what} {path:?}: {e}").into())
@@ -102,25 +105,54 @@ pub fn remove_at(dir: RawFd, name: &CStr, depth: u32) -> Result<()> {
     }
 }
 
-/// Hides lower layers' entries under `fd`, keeping `layer` (this layer's paths and ancestors).
-fn opaque(fd: RawFd, dir: &Path, layer: &HashSet<PathBuf>, depth: u32) -> Result<()> {
+/// An entry as resolved, not as spelled: a directory by its (dev, ino), anything else by its directory's and its name.
+type Key = (libc::dev_t, libc::ino_t, CString);
+
+fn key(dir: RawFd, name: &CStr) -> Option<Key> {
+    let st = stat_at(dir, name)?;
+    if st.st_mode & libc::S_IFMT == libc::S_IFDIR {
+        return Some((st.st_dev, st.st_ino, CString::default()));
+    }
+    let d = stat_at(dir, c"")?;
+    Some((d.st_dev, d.st_ino, name.to_owned()))
+}
+
+/// Forgets the directories of `layer` at and under `name`, which is about to be replaced, so that one
+/// created later on a reused inode is not taken for a directory whose ancestors are already recorded.
+fn forget(fd: RawFd, name: &CStr, layer: &mut HashSet<Key>, depth: u32) -> Result<()> {
+    let Some(st) = stat_at(fd, name).filter(|st| st.st_mode & libc::S_IFMT == libc::S_IFDIR) else { return Ok(()) };
+    // Directories of this layer's are only ever under others of its own.
+    if !layer.remove(&(st.st_dev, st.st_ino, CString::default())) {
+        return Ok(());
+    }
+    if depth > MAX_DEPTH {
+        bail!("directory tree too deep");
+    }
+    let sub = open_dir_at(fd, name)?;
+    for child in list_dir(sub.as_raw_fd())? {
+        forget(sub.as_raw_fd(), &child, layer, depth + 1)?;
+    }
+    Ok(())
+}
+
+/// Hides lower layers' entries under `fd`, keeping `layer` (this layer's entries and their directories).
+fn opaque(fd: RawFd, layer: &HashSet<Key>, depth: u32) -> Result<()> {
     for name in list_dir(fd)? {
-        hide(fd, dir, &name, layer, depth)?;
+        hide(fd, &name, layer, depth)?;
     }
     Ok(())
 }
 
 /// Whiteout of `name` in `fd`: removed if from a lower layer, else made opaque.
-fn hide(fd: RawFd, dir: &Path, name: &CStr, layer: &HashSet<PathBuf>, depth: u32) -> Result<()> {
-    let rel = dir.join(OsStr::from_bytes(name.to_bytes()));
-    if !layer.contains(&rel) {
+fn hide(fd: RawFd, name: &CStr, layer: &HashSet<Key>, depth: u32) -> Result<()> {
+    if !key(fd, name).is_some_and(|k| layer.contains(&k)) {
         return remove_at(fd, name, 0);
     }
     if depth > MAX_DEPTH {
         bail!("directory tree too deep");
     }
     match is_type(fd, name, libc::S_IFDIR) {
-        true => opaque(open_dir_at(fd, name)?.as_raw_fd(), &rel, layer, depth + 1),
+        true => opaque(open_dir_at(fd, name)?.as_raw_fd(), layer, depth + 1),
         false => Ok(()),
     }
 }
@@ -333,7 +365,7 @@ impl Root {
         let limit = self.limits.unpacked.saturating_sub(self.unpacked);
         let mut r = Hashed::new(layer.take(limit.saturating_add(1)));
         let mut seen = self.seen;
-        // This layer's paths and their ancestors, which its whiteouts keep.
+        // This layer's entries and the directories holding them, which its whiteouts keep.
         let mut mine = HashSet::new();
         let res = each_entry(&mut r, &mut seen, self.limits.entries, |e, m| self.apply(e, m, &mut mine))
             .and_then(|_| Ok(io::copy(&mut r, &mut io::sink()).map(|_| ())?));
@@ -346,7 +378,7 @@ impl Root {
         Ok(r.digest())
     }
 
-    fn apply<R: Read>(&mut self, e: &mut tar::Entry<R>, m: Meta, mine: &mut HashSet<PathBuf>) -> Result<()> {
+    fn apply<R: Read>(&mut self, e: &mut tar::Entry<R>, m: Meta, mine: &mut HashSet<Key>) -> Result<()> {
         let Some((parent, name)) = split(&m.path)? else { return Ok(()) };
         let name = name.as_bytes();
         if let Some(rest) = name.strip_prefix(b".wh.") {
@@ -360,27 +392,34 @@ impl Root {
             }
             if let Ok(dir) = self.resolve(&parent) {
                 match opq {
-                    true => opaque(dir.as_raw_fd(), &parent, mine, 0)?,
-                    false => hide(dir.as_raw_fd(), &parent, &CString::new(rest).unwrap(), mine, 0)?,
+                    true => opaque(dir.as_raw_fd(), mine, 0)?,
+                    false => hide(dir.as_raw_fd(), &CString::new(rest).unwrap(), mine, 0)?,
                 }
             }
             return Ok(());
         }
-        let rel = parent.join(OsStr::from_bytes(name));
-        self.entry(e, &rel, m)?;
-        for a in rel.ancestors().filter(|a| !a.as_os_str().is_empty()) {
-            if !mine.insert(a.to_path_buf()) {
+        let at = self.entry(e, &parent.join(OsStr::from_bytes(name)), m, mine)?;
+        mine.extend(key(at.dir.as_raw_fd(), &at.name));
+        // Up from where the entry landed, which a symlinked parent may have moved.
+        let (root, mut dir) = (key(self.fd.as_raw_fd(), c""), at.dir);
+        while let Some(k) = key(dir.as_raw_fd(), c"").filter(|k| Some(k) != root.as_ref()) {
+            if !mine.insert(k) {
                 break;
             }
+            dir = open_dir_at(dir.as_raw_fd(), c"..")?;
         }
         Ok(())
     }
 
-    fn entry<R: Read>(&mut self, e: &mut tar::Entry<R>, rel: &Path, m: Meta) -> Result<()> {
+    fn entry<R: Read>(&mut self, e: &mut tar::Entry<R>, rel: &Path, m: Meta, mine: &mut HashSet<Key>) -> Result<At> {
         use tar::EntryType as T;
         let h = e.header().clone();
         let kind = h.entry_type();
         let at = self.at(rel)?;
+        // Anything else replaces what is there (a hard link, unless it is that already).
+        if !matches!(kind, T::Directory | T::Link) {
+            forget(at.dir.as_raw_fd(), &at.name, mine, 0)?;
+        }
         let (dfd, name) = (at.dir.as_raw_fd(), at.name.as_ptr());
         match kind {
             T::Directory => {
@@ -409,13 +448,14 @@ impl Root {
                 let src = self.at(m.link.as_ref().ok_or("hard link without target")?)?;
                 let ino = |a: &At| stat_at(a.dir.as_raw_fd(), &a.name).map(|st| (st.st_dev, st.st_ino));
                 if ino(&src).is_some_and(|i| Some(i) == ino(&at)) {
-                    return Ok(());
+                    return Ok(at);
                 }
+                forget(dfd, &at.name, mine, 0)?;
                 at.remove()?;
                 check(unsafe { libc::linkat(src.dir.as_raw_fd(), src.name.as_ptr(), dfd, name, 0) }, "link", rel)?;
                 // A hard link shares its target's inode and metadata.
                 self.entries += 1;
-                return Ok(());
+                return Ok(at);
             }
             T::Char | T::Block | T::Fifo => {
                 at.remove()?;
@@ -443,7 +483,7 @@ impl Root {
         }
         let ts = [libc::timespec { tv_sec: h.mtime().unwrap_or(0) as i64, tv_nsec: 0 }; 2];
         unsafe { libc::utimensat(dfd, name, ts.as_ptr(), nofollow) };
-        Ok(())
+        Ok(at)
     }
 
     pub fn ensure_dir(&mut self, rel: &str, mode: u32) -> Result<()> {
@@ -489,7 +529,12 @@ pub fn decompress<'a>(r: impl Read + 'a) -> Result<Box<dyn Read + 'a>> {
     let magic = r.fill_buf()?.get(..4).map(|m| m.to_vec()).unwrap_or_default();
     Ok(match magic.as_slice() {
         [0x1f, 0x8b, ..] => Box::new(flate2::read::MultiGzDecoder::new(r)),
-        [0x28, 0xb5, 0x2f, 0xfd] => Box::new(ZstdFrames { src: r, dec: ruzstd::decoding::FrameDecoder::new(), active: false }),
+        [0x28, 0xb5, 0x2f, 0xfd] => {
+            // Checked on every frame since ruzstd 0.9 (0.8 skipped the first); 0.9.1 also bounds each block (RUSTSEC-2026-0344).
+            let mut dec = ruzstd::decoding::FrameDecoder::new();
+            dec.set_max_window_size(MAX_ZSTD_WINDOW);
+            Box::new(ZstdFrames { src: r, dec, active: false })
+        }
         _ => Box::new(r),
     })
 }
@@ -510,9 +555,10 @@ impl<R: BufRead> Read for ZstdFrames<R> {
         }
         loop {
             if self.active {
-                while self.dec.can_collect() < buf.len() && !self.dec.is_finished() {
-                    let want = buf.len() - self.dec.can_collect();
-                    self.dec.decode_blocks(&mut self.src, BlockDecodingStrategy::UptoBytes(want)).map_err(io::Error::other)?;
+                // A block at a time: what is decoded past the window stays buffered until read, and
+                // ruzstd 0.9.1 lets one block of literals alone regenerate 1 MiB.
+                while self.dec.can_collect() == 0 && !self.dec.is_finished() {
+                    self.dec.decode_blocks(&mut self.src, BlockDecodingStrategy::UptoBlocks(1)).map_err(io::Error::other)?;
                 }
                 let n = self.dec.read(buf)?;
                 if n > 0 {
@@ -720,6 +766,23 @@ pub(super) mod tests {
                 &[("a/b/new", 'f', "n"), ("a/sub/z", 'f', "z"), ("keep/me", 'f', "m"), ("a/.wh..wh..opq", 'f', ""), (".wh..wh..opq", 'f', "")],
                 &[("a/b/new", Some("n")), ("a/sub/z", Some("z")), ("keep/me", Some("m")), ("a/sub/y", None), ("a/x", None), ("old", None), ("low", None)],
             ),
+            // Written through a symlinked parent, in either order.
+            (
+                &[("real/old", 'f', "o"), ("alias", 'l', "real")],
+                &[("alias/new", 'f', "n"), ("real/.wh..wh..opq", 'f', "")],
+                &[("real/new", Some("n")), ("real/old", None)],
+            ),
+            (
+                &[("real/old", 'f', "o"), ("alias", 'l', "real")],
+                &[("real/.wh..wh..opq", 'f', ""), ("alias/new", 'f', "n")],
+                &[("real/new", Some("n")), ("real/old", None)],
+            ),
+            // A directory replaced in the same layer, whose inode a later one may reuse.
+            (
+                &[("B/", 'd', ""), ("seed", 'f', "s")],
+                &[("tmp/", 'd', ""), ("tmp", 'h', "seed"), ("B/c/new", 'f', "n"), (".wh..wh..opq", 'f', "")],
+                &[("B/c/new", Some("n")), ("tmp", Some("s")), ("seed", None)],
+            ),
         ];
         for (i, (lower, upper, want)) in cases.iter().enumerate() {
             let s = Sandbox::new(&format!("wh{i}"));
@@ -731,6 +794,18 @@ pub(super) mod tests {
                 assert_eq!(s.root.join(p).exists(), content.is_some(), "case {i}: {p}");
             }
         }
+    }
+
+    #[test]
+    fn replaced_directories_are_forgotten() {
+        let s = Sandbox::new("forget");
+        std::fs::create_dir_all(s.root.join("tmp/a/b")).unwrap();
+        std::fs::create_dir(s.root.join("keep")).unwrap();
+        let root = open_at(libc::AT_FDCWD, &cpath(&s.root).unwrap(), libc::O_PATH | libc::O_DIRECTORY).unwrap();
+        let key = |p: &str| key(root.as_raw_fd(), &cpath(Path::new(p)).unwrap()).unwrap();
+        let mut mine: HashSet<Key> = ["tmp", "tmp/a", "tmp/a/b", "keep"].map(key).into();
+        forget(root.as_raw_fd(), c"tmp", &mut mine, 0).unwrap();
+        assert_eq!(mine, HashSet::from([key("keep")]));
     }
 
     #[test]
@@ -813,6 +888,49 @@ pub(super) mod tests {
         let mut bad = compress_to_vec(&tar[..], CompressionLevel::Fastest);
         bad.extend_from_slice(b"trailing junk");
         assert!(decompress(io::Cursor::new(bad)).unwrap().read_to_end(&mut Vec::new()).is_err());
+    }
+
+    #[test]
+    fn zstd_windows_are_capped_on_every_frame() {
+        use ruzstd::encoding::{compress_to_vec, CompressionLevel};
+        // 8 MiB of 128 KiB RLE blocks, which a 4 GiB window would hold back instead of returning.
+        let blocks: Vec<u8> = (0..64u32).flat_map(|i| [&((128 << 13) | 1 << 1 | (i == 63) as u32).to_le_bytes()[..3], b"x"].concat()).collect();
+        let magic = [0x28, 0xb5, 0x2f, 0xfd];
+        // Window descriptor 2^32, and a single-segment frame whose content size (the window) is 2^32.
+        let headers = [[&magic[..], &[0x00, 22 << 3]].concat(), [&magic[..], &[0xe0], &(1u64 << 32).to_le_bytes()].concat()];
+        let mut first = compress_to_vec(&b"ok"[..], CompressionLevel::Fastest);
+        first.extend_from_slice(&0x184D2A50u32.to_le_bytes());
+        first.extend_from_slice(&0u32.to_le_bytes());
+        for prefix in [vec![], first] {
+            for h in &headers {
+                let mut out = Vec::new();
+                let z = [&prefix[..], h, &blocks].concat();
+                let e = decompress(io::Cursor::new(z)).unwrap().read_to_end(&mut out).unwrap_err();
+                assert!(e.to_string().contains("window_size is too big"), "{e}");
+                assert!(out.len() <= 2);
+            }
+        }
+    }
+
+    #[test]
+    fn zstd_reads_hold_one_block_past_the_window() {
+        // A 1 MiB window, then blocks of RLE literals alone: 1 MiB - 1 each, which ruzstd 0.9.1 lets past
+        // its 128 KiB block bound.
+        let block = [0x2c, 0, 0, 0xfd, 0xff, 0xff, b'x', 0];
+        let z = [&[0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x50][..], &block.repeat(32), &[1, 0, 0]].concat();
+        let mut r = ZstdFrames { src: io::Cursor::new(z), dec: ruzstd::decoding::FrameDecoder::new(), active: false };
+        let (mut buf, mut total) = (vec![0u8; 16 << 20], 0);
+        loop {
+            let n = r.read(&mut buf).unwrap();
+            // Past the window, only what one block decoded, however much the caller asks for.
+            assert!(r.dec.is_finished() || n + r.dec.can_collect() < 1 << 20, "{n} + {}", r.dec.can_collect());
+            assert!(buf[..n].iter().all(|&b| b == b'x'));
+            total += n;
+            if n == 0 {
+                break;
+            }
+        }
+        assert_eq!(total, 32 * ((1 << 20) - 1));
     }
 
     #[test]
