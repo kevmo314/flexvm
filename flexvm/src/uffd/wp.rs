@@ -14,11 +14,8 @@ use std::time::{Duration, Instant};
 /// Threads copying unsaved pages into memory while a discard is held back.
 const SAVE_REST_THREADS: usize = 8;
 
-/// Up to this many ranges in a region are protected one by one without looking further; past it, see `Pager::freeze`.
-const PROTECT_RUNS: usize = 256;
-
-/// Merge protect ranges across gaps up to this many pages: one more protect call costs about as much as the kernel
-/// walking this many populated pages (about 19 µs a call, 70-90 ms per GiB populated, here).
+/// Merge protect ranges across gaps up to this many pages: a write-protect fault unprotects aligned blocks of up to a
+/// chunk (see `WP_SIZES`), so this keeps a chunk written all over to a call or two (about 6-9 µs a call here).
 const PROTECT_GAP: usize = 64;
 
 /// Pages a write-protect fault unprotects (and saves first, during a copy), at the least.
@@ -407,13 +404,9 @@ impl Pager {
                     _ => ranges.push((p, p + 1)),
                 }
             }
-            // Range by range, so that the pause grows with what was written rather than with what is populated; unless
-            // the calls would cost more than walking every populated page of the region once (the writes covered most
-            // of it).
-            let kept = hot.as_ref().is_some_and(|h| h.held.pages().iter().any(|&p| p >= from && p < to && h.keeps(p)));
-            if ranges.len() > PROTECT_RUNS && ranges.len() * PROTECT_GAP > pages.count(PRESENT, from, to) && !kept {
-                ranges = vec![(from, to)];
-            }
+            // Range by range, never the whole region: a protect makes KVM drop its mappings of everything in the range
+            // (see `WP_CHUNK`), so the guest would refault every page it uses there, clean ones too, after the resume.
+            // That costs far more than the calls it spares (#281).
             protected += self.protect(ranges, Some(&dirty))?;
         }
         let protect = start.elapsed();

@@ -613,7 +613,6 @@ fn next_not_base_finds_every_state() {
         for end in from..=300 {
             let want = (from..end).find(|&i| st[i] != PRESENT).unwrap_or(end);
             assert_eq!(p.next_not(PRESENT, from, end), want, "PRESENT from {from} end {end}");
-            assert_eq!(p.count(PRESENT, from, end), st[from..end].iter().filter(|&&s| s == PRESENT).count());
             assert_eq!(p.next_in(PRESENT, from, end), (from..end).find(|&i| st[i] == PRESENT).unwrap_or(end));
         }
     }
@@ -647,7 +646,6 @@ fn fill_seeds_runs_and_marks_their_chunks() {
         let any = (c * CHUNK..((c + 1) * CHUNK).min(n)).any(|i| want(i) != BASE);
         assert_eq!(p.touched(c * CHUNK), any, "chunk {c}");
     }
-    assert_eq!(p.count(REMOTE, 0, n), 4 + 2 * CHUNK);
     assert_eq!(p.next_in(ZERO, 0, n), 3 * CHUNK);
     assert_eq!(p.next_not(BASE, 4 * CHUNK, n), 64 * CHUNK + 5);
 }

@@ -491,12 +491,13 @@ through, so the checkpoint is exactly the memory at the pause.
   block and marks it dirty, as do installs and discards. At each
   checkpoint's pause only the pages dirtied since are protected again, so
   the pause does not grow with memory size. They are protected range by
-  range (ranges closer than 64 pages merged: a call costs about as much as
-  walking that many populated pages, ~19 µs here); only when the calls
-  would cost more than walking every populated page of the region is the
-  whole region protected at once. A guest that rewrote 600 scattered pages
-  of 1 GiB written: pause 25–35 ms, protect 11–17 ms (was 49–84 and 34–64
-  ms, when more than 256 ranges meant protecting the whole region).
+  range (ranges closer than 64 pages merged; ~6–9 µs a call here), never
+  the whole region at once: KVM drops its mappings of everything in a
+  protected range, so the guest would refault all it uses there, clean
+  pages too. With a guest reading 256 MiB of a 1 GiB region, protecting
+  the whole region cost 66k refaults a checkpoint against 3–17k range by
+  range, and no shorter a pause; with nothing of it mapped, at most ~3 ms
+  of pause saved per 1,000 ranges.
 - **The pause.** Pause through the API, save the state (as for a
   migration), take the dirty pages, re-protect them, arm copy-on-write for
   the pages to save, resume: 17–30 ms here at any size (was 125 ms at 256 MiB
