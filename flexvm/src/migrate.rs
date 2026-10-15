@@ -190,8 +190,9 @@ impl Proc {
         };
         t.mark("target");
         let downtime = t.total();
-        // A target that takes `SWITCH` says so (`hold_switch`); with any other, the hold switches as before.
-        let (held, rerouted) = self.reroute(mig, to, &target, answered.then_some(&conn), prepared["hold_switch"] == true);
+        // A target that takes this held stream (no sequence numbers) and `SWITCH` says so; to any
+        // other, nothing held is sent (it is counted as dropped).
+        let (held, rerouted) = self.reroute(mig, to, &target, answered.then_some(&conn), prepared["hold_switch2"] == true);
         t.mark("reroute");
         self.wait_release(mig, to.to_string());
         Ok(json!({
@@ -392,7 +393,10 @@ impl Proc {
         if let Some(h) = self.holder().filter(|h| h.holding_for(ip, mig)) {
             // Its paused Firecracker takes nothing off the tap: what is there came before the hold.
             h.hold_first(ip, mig, &self.vm().take_tap_queue());
-            match conn.map(|c| (c, hold::start(c))) {
+            if conn.is_some() && !switch {
+                crate::log!("vm {}: {to} takes no held stream of this version; dropping the held packets", self.name());
+            }
+            match conn.filter(|_| switch).map(|c| (c, hold::start(c))) {
                 Some((c, Ok(()))) => {
                     // Sharing our routes, the target takes the address over itself, after the held packets.
                     let handoff = switch && crate::net::is_local_addr(via).unwrap_or(false);
@@ -471,7 +475,7 @@ impl Proc {
                 return Err(e);
             }
         };
-        send_json(&mut w, &json!({"ok": true, "result": {"timings_ms": prep.json(), "load_set": prepared.4, "hold_switch": true}}))?;
+        send_json(&mut w, &json!({"ok": true, "result": {"timings_ms": prep.json(), "load_set": prepared.4, "hold_switch2": true}}))?;
         let deadline = Instant::now() + if fault("short_incoming") { Duration::from_secs(2) } else { INCOMING_WAIT };
         let mut r = BufReader::new(By { s: w.try_clone()?, at: deadline });
         let pager = prepared.0.pager.clone();

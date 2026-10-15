@@ -109,8 +109,8 @@ pub fn main(host: Host, listener: TcpListener) -> Result<()> {
         let waiting = match peers.check(&host.config_now().peers, from) {
             Admission::Peer => {
                 let Some(slot) = Slot::take(&ACTIVE, MAX_ACTIVE) else { continue };
-                let host = host.clone();
-                std::thread::spawn(move || serve(&host, conn, slot, deadline));
+                let (host, peers) = (host.clone(), peers.clone());
+                std::thread::spawn(move || serve(&host, &peers, conn, slot, deadline));
                 continue;
             }
             Admission::Refused => None,
@@ -126,7 +126,7 @@ pub fn main(host: Host, listener: TcpListener) -> Result<()> {
             let admitted = peers.admit_by(&host, from, Instant::now() + ADMIT_WAIT);
             drop(waiting);
             match admitted.then(|| Slot::take(&ACTIVE, MAX_ACTIVE)).flatten() {
-                Some(slot) => serve(&host, conn, slot, deadline),
+                Some(slot) => serve(&host, &peers, conn, slot, deadline),
                 None if !admitted => not_a_peer(conn, from),
                 None => {}
             }
@@ -135,9 +135,9 @@ pub fn main(host: Host, listener: TcpListener) -> Result<()> {
     Ok(())
 }
 
-fn serve(host: &Host, conn: TcpStream, _slot: Slot, deadline: Instant) {
+fn serve(host: &Host, peers: &Peers, conn: TcpStream, _slot: Slot, deadline: Instant) {
     let _ = conn.set_nodelay(true);
-    if let Err(e) = handle(host, conn, deadline) {
+    if let Err(e) = handle(host, peers, conn, deadline) {
         crate::log!("peer request: {e}");
     }
 }
@@ -367,15 +367,15 @@ pub fn activated() -> Option<TcpListener> {
 }
 
 /// From a peer: they are authenticated by address only (`main`), the network between them is trusted.
-fn handle(host: &Host, mut conn: TcpStream, deadline: Instant) -> Result<()> {
+fn handle(host: &Host, peers: &Peers, mut conn: TcpStream, deadline: Instant) -> Result<()> {
     let line = read_line_by(&conn, deadline)?;
-    let from = conn.peer_addr().ok().map(|a| a.ip());
     let req: Value = serde_json::from_slice(&line)?;
     let reply = match req["op"].as_str().unwrap_or("") {
         "migrate_in" => return incoming(host, &req, &line, conn),
         "pages" => return pages(host, &req, conn),
         "migration" => migration(host, &req),
-        "route" => route(host, &req, from),
+        // Its peers by address, those configured by name too, and the one asking.
+        "route" => route(host, &req, &[peers.addrs(&host.config_now().peers), conn.peer_addr().map(|a| a.ip()).into_iter().collect()].concat()),
         "lend" => lend(host, &req),
         // Whether a migration's source process is proven gone (never from published state).
         "source" => serde_json::from_value(req["ident"].clone())
@@ -506,12 +506,12 @@ fn lend(host: &Host, req: &Value) -> Result<Value> {
 /// Stale generations and revisions (see `host::Addr`) are ignored; an
 /// address a VM here holds keeps its local route.
 /// Test fault `route_refuse`: refused, as by a listener that is down.
-fn route(host: &Host, req: &Value, from: Option<IpAddr>) -> Result<Value> {
+fn route(host: &Host, req: &Value, peers: &[IpAddr]) -> Result<Value> {
     if fault("route_refuse") {
         bail!("injected fault: route messages refused");
     }
     let ip: Ipv4Addr = req["ip"].as_str().ok_or("missing ip")?.parse()?;
-    routable(ip, &host.config_now(), from, &crate::net::gateways(&std::fs::read_to_string("/proc/net/route")?))?;
+    routable(ip, &host.config_now(), peers, &crate::net::gateways(&std::fs::read_to_string("/proc/net/route")?))?;
     let gen = req["gen"].as_u64().filter(|&g| g > 0).ok_or("route messages carry the address's generation")?;
     let via: Option<Ipv4Addr> = req["via"].as_str().map(|v| v.parse()).transpose()?;
     let rev = match via {
@@ -540,9 +540,8 @@ fn route(host: &Host, req: &Value, from: Option<IpAddr>) -> Result<Value> {
 }
 
 /// A peer routes only a VM's address, never one this host reaches its peers or network by (#365).
-fn routable(ip: Ipv4Addr, cfg: &crate::host::Config, from: Option<IpAddr>, gateways: &[Ipv4Addr]) -> Result<()> {
-    let is = |a: IpAddr| a.to_canonical() == IpAddr::V4(ip);
-    let peer = from.is_some_and(is) || cfg.peers.iter().filter_map(|p| p.parse::<SocketAddr>().ok()).any(|a| is(a.ip()));
+fn routable(ip: Ipv4Addr, cfg: &crate::host::Config, peers: &[IpAddr], gateways: &[Ipv4Addr]) -> Result<()> {
+    let peer = is_peer(peers, IpAddr::V4(ip));
     let special = ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() || cfg.underlay() == Some(ip) || gateways.contains(&ip);
     if peer || special || crate::net::is_local_addr(ip)? {
         bail!("{ip} is not a vm's address: a local, peer, underlay or gateway address, or not unicast");
@@ -574,8 +573,12 @@ mod tests {
             ..Default::default()
         };
         let gw: Ipv4Addr = "10.96.0.1".parse().unwrap();
-        let check = |ip: &str| routable(ip.parse().unwrap(), &cfg, Some("10.95.0.1".parse().unwrap()), &[gw]);
-        for ip in ["127.0.0.1", "0.0.0.0", "255.255.255.255", "224.0.0.1", "10.98.0.1", "10.97.0.1", "10.96.0.1", "10.95.0.1"] {
+        // The peer configured by name, as resolved; and the one asking.
+        let p = Peers::default();
+        p.0.resolved.write().unwrap().insert("peer.example:7000".into(), vec!["10.94.0.1".parse().unwrap()]);
+        let peers = [p.addrs(&cfg.peers), vec!["10.95.0.1".parse().unwrap()]].concat();
+        let check = |ip: &str| routable(ip.parse().unwrap(), &cfg, &peers, &[gw]);
+        for ip in ["127.0.0.1", "0.0.0.0", "255.255.255.255", "224.0.0.1", "10.98.0.1", "10.94.0.1", "10.97.0.1", "10.96.0.1", "10.95.0.1"] {
             assert!(check(ip).is_err(), "{ip} is refused");
         }
         check("10.200.0.7").unwrap();
