@@ -175,6 +175,39 @@ fn resolve_location(base: &str, loc: &str) -> Result<String> {
     Ok(format!("{scheme}://{host}{path}{}", query.map(|q| format!("?{q}")).unwrap_or_default()))
 }
 
+/// Retries of a 429 or 503 (a registry's rate limit, or one briefly unavailable) per request, within its transfer's
+/// deadline.
+const MAX_RETRIES: u32 = 5;
+
+/// The wait before retry `n` (from 0) without a `Retry-After`: 1 s, doubling, at most 30 s.
+fn backoff(n: u32) -> Duration {
+    Duration::from_secs(1u64 << n.min(5)).min(Duration::from_secs(30))
+}
+
+/// A `Retry-After` value as a wait from `now`: seconds, or an HTTP date (IMF-fixdate, as RFC 9110 has servers send).
+fn retry_after(v: &str, now: std::time::SystemTime) -> Option<Duration> {
+    let v = v.trim();
+    if let Ok(secs) = v.parse::<u64>() {
+        return Some(Duration::from_secs(secs));
+    }
+    // `Sun, 06 Nov 1994 08:49:37 GMT`
+    let f: Vec<&str> = v.split_ascii_whitespace().collect();
+    let [_, day, mon, year, time, "GMT"] = f[..] else { return None };
+    let months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let m = months.iter().position(|&x| x == mon)? as i64 + 1;
+    let (d, y): (i64, i64) = (day.parse().ok()?, year.parse().ok()?);
+    let hms: Vec<i64> = time.split(':').map(|x| x.parse().ok()).collect::<Option<_>>()?;
+    let [h, mi, sec] = hms[..] else { return None };
+    // Days since 1970-01-01 of a proleptic Gregorian date (Howard Hinnant's days_from_civil).
+    let (y, m) = if m <= 2 { (y - 1, m + 9) } else { (y, m - 3) };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * m + 2) / 5 + d - 1;
+    let days = era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468;
+    let at = std::time::UNIX_EPOCH + Duration::from_secs(u64::try_from(days * 86400 + h * 3600 + mi * 60 + sec).ok()?);
+    Some(at.duration_since(now).unwrap_or(Duration::ZERO))
+}
+
 /// Shared by all of an image's layers (`Arc`), its token with them.
 pub struct Registry {
     pub r: Reference,
@@ -208,7 +241,7 @@ impl Registry {
     /// Authenticates on a 401 and retries once; redirects (blob storage) are followed without credentials.
     fn get(&self, path: &str, accept: &str, deadline: Instant) -> Result<ureq::Body> {
         let base = format!("{}/{path}", self.r.base_url());
-        let (mut url, mut redirects, mut authenticated) = (base.clone(), 0, false);
+        let (mut url, mut redirects, mut authenticated, mut retries) = (base.clone(), 0, false, 0);
         let agent = agent(deadline);
         loop {
             let mut req = agent.get(&url).config().timeout_global(Some(Self::left(deadline, &format!("GET {url}"))?)).build();
@@ -236,6 +269,16 @@ impl Registry {
                     }
                 }
                 ..=299 => return Ok(resp.into_body()),
+                code @ (429 | 503) if retries < MAX_RETRIES => {
+                    let now = std::time::SystemTime::now();
+                    let wait = header("retry-after").and_then(|v| retry_after(v, now)).unwrap_or(backoff(retries));
+                    if Instant::now() + wait >= deadline {
+                        bail!("GET {url}: HTTP {code}, and a retry in {} s would pass the transfer deadline", wait.as_secs());
+                    }
+                    crate::log!("image: GET {url}: HTTP {code}; retrying in {} s", wait.as_secs_f32().ceil());
+                    std::thread::sleep(wait);
+                    retries += 1;
+                }
                 401 if !authenticated && redirects == 0 => {
                     let challenge = header("www-authenticate").unwrap_or("").to_string();
                     self.authenticate(&agent, &challenge, deadline)?;
@@ -709,6 +752,62 @@ pub(super) mod tests {
         reg.get("blobs/x", "*/*", Instant::now() + Duration::from_secs(5)).unwrap().into_reader().read_to_string(&mut data).unwrap();
         assert_eq!(data, "moved");
         assert_eq!(hops.load(Ordering::SeqCst), 2, "/v2/test/blobs/x, then /v2/test/elsewhere");
+    }
+
+    /// A 429 (or 503) is retried after its `Retry-After`, or a backoff, unless that would pass the deadline.
+    #[test]
+    fn rate_limits_are_retried_within_the_deadline() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls2 = calls.clone();
+        let addr = drip_server(usize::MAX, Duration::ZERO, move |_, _| {
+            if calls2.fetch_add(1, Ordering::SeqCst) == 0 {
+                "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
+            } else {
+                "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nblob".into()
+            }
+        });
+        let reg = Registry::new(Reference::parse(&format!("{addr}/test")).unwrap());
+        let (start, mut data) = (Instant::now(), String::new());
+        reg.get("blobs/x", "*/*", start + Duration::from_secs(10)).unwrap().into_reader().read_to_string(&mut data).unwrap();
+        assert_eq!((data.as_str(), calls.load(Ordering::SeqCst)), ("blob", 2));
+        assert!(start.elapsed() >= Duration::from_secs(1), "waited {:?}", start.elapsed());
+
+        // A wait past the deadline fails at once; one always busy stops after MAX_RETRIES.
+        let addr = drip_server(usize::MAX, Duration::ZERO, |_, _| {
+            "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 3600\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
+        });
+        let reg = Registry::new(Reference::parse(&format!("{addr}/test")).unwrap());
+        let start = Instant::now();
+        let err = reg.get("blobs/x", "*/*", start + Duration::from_secs(60)).err().unwrap().to_string();
+        assert!(err.contains("HTTP 503") && err.contains("deadline"), "{err}");
+        assert!(start.elapsed() < Duration::from_secs(5));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls2 = calls.clone();
+        let addr = drip_server(usize::MAX, Duration::ZERO, move |_, _| {
+            calls2.fetch_add(1, Ordering::SeqCst);
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
+        });
+        let reg = Registry::new(Reference::parse(&format!("{addr}/test")).unwrap());
+        let err = reg.get("blobs/x", "*/*", Instant::now() + Duration::from_secs(10)).err().unwrap().to_string();
+        assert!(err.contains("HTTP 429"), "{err}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1 + MAX_RETRIES as usize);
+    }
+
+    #[test]
+    fn retry_after_is_seconds_or_an_http_date() {
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(784111777); // Sun, 06 Nov 1994 08:49:37 GMT
+        assert_eq!(retry_after(" 120 ", now), Some(Duration::from_secs(120)));
+        assert_eq!(retry_after("Sun, 06 Nov 1994 08:50:07 GMT", now), Some(Duration::from_secs(30)));
+        assert_eq!(retry_after("Tue, 01 Mar 2000 00:00:00 GMT", std::time::UNIX_EPOCH), Some(Duration::from_secs(951868800)));
+        assert_eq!(retry_after("Sun, 06 Nov 1994 08:49:00 GMT", now), Some(Duration::ZERO), "past dates mean now");
+        for bad in ["-1", "soon", "Sunday, 06-Nov-94 08:49:37 GMT", "Sun, 06 Foo 1994 08:49:37 GMT", "Sun, 06 Nov 1994 08:49 GMT"] {
+            assert_eq!(retry_after(bad, now), None, "{bad}");
+        }
+        assert_eq!(
+            (backoff(0), backoff(1), backoff(4), backoff(5), backoff(50)),
+            (Duration::from_secs(1), Duration::from_secs(2), Duration::from_secs(16), Duration::from_secs(30), Duration::from_secs(30))
+        );
     }
 
     #[test]
