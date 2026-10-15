@@ -34,6 +34,8 @@ const SYNC_WAIT: Duration = Duration::from_millis(250);
 const SWITCH_WAIT: Duration = Duration::from_secs(2);
 const FLUSH_WAIT: Duration = Duration::from_millis(400);
 const REPLY_WAIT: Duration = Duration::from_secs(1);
+/// How long a let-go address's stragglers (`Holder::gone`) are re-sent or counted.
+const GONE_FOR: Duration = Duration::from_secs(30);
 
 /// Where `release_local` hands packets, from more than one thread.
 pub type LocalSink<'a> = &'a mut (dyn FnMut(&[u8]) -> bool + Send);
@@ -50,6 +52,14 @@ pub struct Holder {
     routes: Mutex<()>,
     /// Held while a packet is read off the device and queued.
     rx: Mutex<()>,
+    /// Addresses let go of (when, and whether the route moved on: not when it was dropped).
+    /// A sender that looked the route up before the switch can still hand a packet to this
+    /// device after the release took the last one off it (a stalled vCPU, preemption between
+    /// the lookup and the transmit): with no entry it would be lost, uncounted (#254). It is
+    /// re-sent (`resend`), routed to where the address is now, or counted as dropped.
+    gone: Mutex<HashMap<Ipv4Addr, (Instant, bool)>>,
+    /// A raw socket (IPPROTO_RAW: the packet's own header) the kernel routes re-sent packets by.
+    resend: Option<OwnedFd>,
 }
 
 struct Entry {
@@ -106,7 +116,24 @@ impl Holder {
         let _ = crate::net::sysctl(&format!("net.ipv6.conf.{dev}.disable_ipv6"), "1");
         crate::net::set_link_up(&dev, true)?;
         let ifindex = crate::net::ifindex(&dev)?;
-        let h = Arc::new(Holder { dev, ifindex, tun, held: Mutex::default(), reading: AtomicBool::new(false), routes: Mutex::new(()), rx: Mutex::new(()) });
+        let resend = match unsafe { libc::socket(libc::AF_INET, libc::SOCK_RAW | libc::SOCK_CLOEXEC, libc::IPPROTO_RAW) } {
+            fd if fd >= 0 => Some(unsafe { OwnedFd::from_raw_fd(fd) }),
+            _ => {
+                eprintln!("hold device {dev}: no raw socket ({}); packets reaching it after a release are dropped", std::io::Error::last_os_error());
+                None
+            }
+        };
+        let h = Arc::new(Holder {
+            dev,
+            ifindex,
+            tun,
+            held: Mutex::default(),
+            reading: AtomicBool::new(false),
+            routes: Mutex::new(()),
+            rx: Mutex::new(()),
+            gone: Mutex::default(),
+            resend,
+        });
         let reader = h.clone();
         std::thread::Builder::new().name("hold".into()).spawn(move || reader.read_loop())?;
         Ok(Some(h))
@@ -114,6 +141,7 @@ impl Holder {
 
     pub fn hold(&self, ip: Ipv4Addr, mig: u64) -> Result<()> {
         let _routes = self.routes.lock().unwrap();
+        self.gone.lock().unwrap().remove(&ip);
         self.held.lock().unwrap().insert(ip, Arc::new(Entry { mig, q: Mutex::default() }));
         crate::net::route_dev(true, ip, self.ifindex).inspect_err(|_| drop(self.held.lock().unwrap().remove(&ip)))
     }
@@ -133,14 +161,18 @@ impl Holder {
         first.then_some(e)
     }
 
-    /// Unless a newer hold replaced it.
-    fn unhold(&self, ip: Ipv4Addr, e: &Arc<Entry>) {
+    /// Unless a newer hold replaced it. `moved`: the address is routed elsewhere now, where
+    /// stragglers that still reach the device are re-sent.
+    fn unhold(&self, ip: Ipv4Addr, e: &Arc<Entry>, moved: bool) {
         // Under `rx`: no read is between finding `e` and queuing on it, so nothing reaches its
         // queue once it is gone from `held` (what is there is then counted or handed over).
         let _rx = self.rx.lock().unwrap();
         let mut held = self.held.lock().unwrap();
         if held.get(&ip).is_some_and(|x| Arc::ptr_eq(x, e)) {
             held.remove(&ip);
+            let mut gone = self.gone.lock().unwrap();
+            gone.retain(|_, (at, _)| at.elapsed() < GONE_FOR);
+            gone.insert(ip, (Instant::now(), moved));
         }
     }
 
@@ -185,7 +217,7 @@ impl Holder {
             (false, Err(_)) => self.hand_over(&e, sink, &mut stats),
         }
         match switched {
-            Ok(()) => self.unhold(ip, &e),
+            Ok(()) => self.unhold(ip, &e, true),
             // Left to the TUN, the address would be dropped here until the caller's retry.
             Err(_) => self.unroute(ip, &e),
         }
@@ -264,7 +296,7 @@ impl Holder {
         give(&mut o);
         let mut stats = o.1;
         if switched.is_ok() {
-            self.unhold(ip, &e);
+            self.unhold(ip, &e, true);
         }
         let mut q = e.q.lock().unwrap();
         stats.dropped += match switched {
@@ -323,7 +355,7 @@ impl Holder {
         // Under `routes`: a newer hold of `ip` never loses its route to this one.
         let _routes = self.routes.lock().unwrap();
         if self.entry(ip).is_some_and(|x| Arc::ptr_eq(&x, e)) {
-            self.unhold(ip, e);
+            self.unhold(ip, e, false);
             let _ = crate::net::route_dev(false, ip, self.ifindex);
         }
     }
@@ -351,16 +383,42 @@ impl Holder {
         if p.len() < 20 || p[0] >> 4 != 4 {
             return true;
         }
-        if let Some(e) = self.entry(Ipv4Addr::new(p[16], p[17], p[18], p[19])) {
-            let mut q = e.q.lock().unwrap();
-            if q.bytes + p.len() > CAP && !q.switched {
-                q.dropped += 1;
-            } else {
-                q.bytes += p.len();
-                q.packets.push_back(p.to_vec());
+        let ip = Ipv4Addr::new(p[16], p[17], p[18], p[19]);
+        match self.entry(ip) {
+            Some(e) => {
+                let mut q = e.q.lock().unwrap();
+                if q.bytes + p.len() > CAP && !q.switched {
+                    q.dropped += 1;
+                } else {
+                    q.bytes += p.len();
+                    q.packets.push_back(p.to_vec());
+                }
             }
+            None => self.straggler(ip, &mut buf[..n as usize]),
         }
         true
+    }
+
+    /// A packet for `ip` read after it was let go of: re-sent if the address moved on, else
+    /// counted. Its TTL goes down by one, so a route that still leads here cannot loop it.
+    fn straggler(&self, ip: Ipv4Addr, p: &mut [u8]) {
+        let Some((at, moved)) = self.gone.lock().unwrap().get(&ip).copied().filter(|(at, _)| at.elapsed() < GONE_FOR) else { return };
+        let after = at.elapsed().as_secs_f64() * 1e3;
+        let sent = moved
+            && p[8] > 1
+            && self.resend.as_ref().is_some_and(|fd| {
+                p[8] -= 1;
+                // The kernel fills the header checksum in.
+                let mut to: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+                to.sin_family = libc::AF_INET as u16;
+                to.sin_addr.s_addr = u32::from_ne_bytes(ip.octets());
+                let size = std::mem::size_of::<libc::sockaddr_in>() as u32;
+                unsafe { libc::sendto(fd.as_raw_fd(), p.as_ptr().cast(), p.len(), libc::MSG_DONTWAIT, (&to as *const libc::sockaddr_in).cast(), size) >= 0 }
+            });
+        match sent {
+            true => eprintln!("hold {ip}: re-sent a packet that reached {} {after:.1} ms after it let go of the address", self.dev),
+            false => eprintln!("hold {ip}: dropped 1 packet that reached {} {after:.1} ms after it let go of the address", self.dev),
+        }
     }
 }
 
@@ -638,4 +696,39 @@ fn open_tun(dev: &str) -> std::result::Result<OwnedFd, (bool, crate::util::Error
         unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCSIFTXQLEN as _, &req) };
     }
     Ok(fd)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Needs root: `sudo cargo test -- --ignored`. A sender that looked the route up before a
+    /// release hands its packet to the device after it (#254), here by binding to the device:
+    /// it is re-sent to where the address went, never lost uncounted.
+    #[test]
+    #[ignore]
+    fn stragglers_follow_the_address() {
+        let (a, b) =
+            (Holder::new(&format!("tsa{:x}h", std::process::id())).unwrap().unwrap(), Holder::new(&format!("tsb{:x}h", std::process::id())).unwrap().unwrap());
+        let ip = Ipv4Addr::new(10, 100, 254, 9);
+        a.hold(ip, 1).unwrap();
+        let mut none = |_: &[u8]| true;
+        let (_, switched) = a.release_local(ip, 1, &mut none, || b.hold(ip, 2), Duration::ZERO).unwrap();
+        switched.unwrap();
+        let s = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let dev = a.dev.as_bytes();
+        assert_eq!(unsafe { libc::setsockopt(s.as_raw_fd(), libc::SOL_SOCKET, libc::SO_BINDTODEVICE, dev.as_ptr().cast(), dev.len() as u32) }, 0);
+        s.send_to(b"late", (ip, 9)).unwrap();
+        let mut got = Vec::new();
+        let mut sink = |p: &[u8]| {
+            got.push(p.to_vec());
+            true
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        let (stats, _) = b.release_local(ip, 2, &mut sink, || Ok(()), Duration::ZERO).unwrap();
+        b.forget(ip, 2);
+        let _ = crate::net::route_dev(false, ip, b.ifindex);
+        assert_eq!((stats.packets, stats.dropped), (1, 0));
+        assert!(got[0].ends_with(b"late") && got[0][8] == 63, "{got:?}");
+    }
 }
