@@ -146,7 +146,7 @@ pub fn exec_output(r: &mut impl Read, id: &str, mut out: impl FnMut(u8, &[u8]) -
             Some((FRAME_EXIT, d)) => return session_exit(&d, offset),
             Some((FRAME_MSG, m)) if m == id.as_bytes() || m == b"waiting" => {}
             Some((FRAME_LOST, _)) => bail!("guest command output lost"),
-            Some((_, m)) => bail!("guest command: {}", String::from_utf8_lossy(&m)),
+            Some((_, m)) => bail!("guest command: {}", refusal(&m)),
             None => bail!("guest closed the connection before the command exited"),
         }
     }
@@ -230,9 +230,14 @@ fn now() -> Result<String> {
     Ok(format!("{}.{:09}", now.as_secs(), now.subsec_nanos()))
 }
 
-fn refused(verb: &'static str, m: &[u8]) -> Error {
+/// The agent's answer to a request it refused; one too old to know the request is told apart.
+pub fn refusal(m: &[u8]) -> String {
     let hint = if m.starts_with(b"unknown request") { "; rebuild the rootfs and its templates" } else { "" };
-    format!("guest {}: {}{hint}", verb.to_lowercase(), String::from_utf8_lossy(m)).into()
+    format!("{}{hint}", String::from_utf8_lossy(m))
+}
+
+fn refused(verb: &'static str, m: &[u8]) -> Error {
+    format!("guest {}: {}", verb.to_lowercase(), refusal(m)).into()
 }
 
 /// Address, nameserver and wall clock; doubles as the readiness check.
@@ -483,6 +488,8 @@ mod tests {
             assert!(exec_output(&mut wire(&[bad]).as_slice(), "id", |_, _| Ok(())).is_err());
         }
         assert!(exec_output(&mut &b""[..], "id", |_, _| Ok(())).is_err());
+        let old = exec_output(&mut wire(&[(FRAME_MSG, b"unknown request \"SESSION\"".to_vec())]).as_slice(), "id", |_, _| Ok(()));
+        assert!(old.unwrap_err().to_string().ends_with("unknown request \"SESSION\"; rebuild the rootfs and its templates"));
     }
 
     #[test]

@@ -930,7 +930,7 @@ fn exec_frames(r: &mut impl Read, session: &Mutex<Session>, stdout: &mut impl Wr
             guest::FRAME_MSG if data == id.as_bytes() => s.started = true,
             guest::FRAME_MSG if data == b"waiting" && s.started => {}
             // Before the id echo the request itself failed: not retried.
-            guest::FRAME_MSG if !s.started => return Err(String::from_utf8_lossy(&data).into_owned().into()),
+            guest::FRAME_MSG if !s.started => return Err(guest::refusal(&data).into()),
             guest::FRAME_MSG => return Ok(StreamEnd::Disconnected(String::from_utf8_lossy(&data).into_owned())),
             _ => return Err(format!("unknown session frame {kind}").into()),
         }
@@ -1153,5 +1153,13 @@ mod exec_tests {
         assert!(matches!(run(resumed), StreamEnd::Exit(7)));
         let s = session.lock().unwrap();
         assert!(s.started && s.offset == 6 && s.exit == Some(7) && stdout == b"abc" && stderr == b"def");
+    }
+
+    #[test]
+    fn an_agent_without_sessions_says_to_rebuild() {
+        let session = Mutex::new(Session { id: "test-id".into(), started: false, offset: 0, exit: None });
+        let input = frames(&[(guest::FRAME_MSG, b"unknown request \"SESSION\"")]);
+        let e = exec_frames(&mut input.as_slice(), &session, &mut Vec::new(), &mut Vec::new(), &mut Instant::now()).err().unwrap();
+        assert_eq!(e.to_string(), "unknown request \"SESSION\"; rebuild the rootfs and its templates");
     }
 }

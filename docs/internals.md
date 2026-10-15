@@ -700,8 +700,8 @@ a second copy could repeat what it did.
   still be on its way into the guest, so the next migration first waits for
   the agent to answer a ping (it serves requests in order) rather than let it
   land, stale, after the snapshot. An agent that answers `unknown request` to
-  `START`, `CLOCK` or `FORKS` is too old: the call fails saying so, and the
-  rootfs and its templates need rebuilding.
+  any request (`START`, `CLOCK`, `FORKS`, an exec's `SESSION`) is too old: the
+  call fails with that answer and a hint to rebuild the rootfs and its templates.
   KVM saves the realtime clock that `clock_realtime` needs only while the VM
   has a master clock, and drops that for good once the vCPUs' TSCs were
   restored more than a second apart: a migration target whose load waited
@@ -999,6 +999,9 @@ either. Only the latest attachment's offset holds output back: a replaced
 client reattaching later gets kind 5 if its offset has meanwhile been
 overwritten.
 
-The control socket's exec request adds `session`, `action` (`start`, `attach`, or
-`close`), and `offset`; start also supplies `cmd`. Start/attach return the usual
+The control socket's exec request carries `session` (required: every exec is a
+session the client names), `action` (`start`, `attach`, or `close`), and
+`offset`; start also supplies `cmd`. A client closes its session when done, or
+when interrupted; one that vanishes without closing leaves the command to the
+guest's reclaim above. Start/attach return the usual
 JSON success reply followed by session frames; close returns a JSON reply.
