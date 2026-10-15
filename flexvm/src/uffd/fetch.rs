@@ -489,7 +489,7 @@ impl SourceAddrs {
     }
 }
 
-fn probe_with_connect<S: crate::util::Timed>(
+fn probe_with_connect<S: crate::util::Timed + Write>(
     source: &Source,
     page: u64,
     deadline: Instant,
@@ -559,7 +559,7 @@ impl PageClient {
     }
 }
 
-impl<S: crate::util::Timed> PageClient<S> {
+impl<S: crate::util::Timed + Write> PageClient<S> {
     pub(super) fn new(stream: S, source: &Source, at: Instant) -> io::Result<Self> {
         let mut hello = serde_json::to_vec(&serde_json::json!({"op": "pages", "name": source.vm, "mig": source.mig}))?;
         hello.push(b'\n');

@@ -229,7 +229,11 @@ fn main() {
     }));
     let (args, error) = Args::parse_partly(std::env::args().skip(1));
     let vm = matches!(args.positional.first().map(String::as_str), Some("run" | "resume" | "restore"));
-    if let Err(e) = error.map_or_else(|| real_main(&args), Err) {
+    let result = error.map_or_else(|| real_main(&args), Err);
+    if let Some(sig) = template::interrupted_signal() {
+        util::raise_signal(sig);
+    }
+    if let Err(e) = result {
         util::log_final(format!("flexvm: {e}\n"), true);
         if vm {
             // A VM process's output may still be in its relays (`output::guard`).
@@ -518,7 +522,7 @@ fn run(args: &Args, name: &str, template: &str) -> Result<()> {
             let id = host::Ident { pid: v["pid"].as_u64().unwrap_or(0) as u32, start: v["start"].as_u64().unwrap_or(0), boot: host::boot_id().into() };
             follow(conn, id)
         }
-        None if log.is_some() => spawn_detached(&host, name, args),
+        None if log.is_some() => spawn_detached_to(&host, name, args, log.as_ref().unwrap()),
         None => vmproc::main(host, paths, Start::Run { name: name.into(), template: template.into(), ip, cmd }, notify_fd()),
     }
 }
@@ -544,8 +548,12 @@ fn log_file(host: &Host, name: &str) -> Result<std::fs::File> {
 }
 
 fn spawn_detached(host: &Host, name: &str, args: &Args) -> Result<()> {
+    spawn_detached_to(host, name, args, &log_file(host, name)?)
+}
+
+fn spawn_detached_to(host: &Host, name: &str, args: &Args, log: &std::fs::File) -> Result<()> {
     let (r, w) = std::os::unix::net::UnixStream::pair()?;
-    util::spawn_self(&args.child_args, &log_file(host, name)?, w.as_raw_fd(), &[("FLEXVM_NOTIFY_FD", "3")])?;
+    util::spawn_self(&args.child_args, log, w.as_raw_fd(), &[("FLEXVM_NOTIFY_FD", "3")])?;
     drop(w);
     let reply = recv_json(&mut BufReader::new(r))?.ok_or_else(|| format!("the vm process failed to start (see {})", host.vms(name, "log").display()))?;
     if reply["ok"] != json!(true) {
@@ -704,13 +712,9 @@ fn build_template(args: &Args, name: &str) -> Result<()> {
     // Interrupted, the build stops at its next step and removes its tap and staging (gigabytes:
     // an image's unpacked tree and rootfs too); a second signal ends flexvm at once, and the next
     // build removes the staging. Blocked before the image's download threads start.
-    let set = util::block_signals(&[libc::SIGINT, libc::SIGTERM, libc::SIGHUP]);
-    std::thread::spawn(move || {
-        let sig = util::wait_signal(&set);
+    util::on_signal(&[libc::SIGINT, libc::SIGTERM, libc::SIGHUP], |sig| {
         log!("flexvm: stopping the template build; it cleans up first");
         template::interrupt(sig);
-        // Kept alive to take the next one, now with its default action.
-        unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut()) };
         loop {
             std::thread::park();
         }
@@ -824,12 +828,8 @@ pub fn exec(host: &Host, name: &str, cmd: &str) -> Result<i32> {
         }
     };
     // Interrupted, the command is stopped: left running, it would hold one of the guest's session slots.
-    let set = util::block_signals(&[libc::SIGINT, libc::SIGTERM, libc::SIGHUP]);
     let (stop, vm) = (close.clone(), name.to_string());
-    std::thread::spawn(move || {
-        let sig = util::wait_signal(&set);
-        // A second one ends flexvm at once.
-        unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut()) };
+    util::on_signal(&[libc::SIGINT, libc::SIGTERM, libc::SIGHUP], move |sig| {
         // Held until exit, so the stopped command's status is not reported; not waited for long, as
         // a write to a stalled stdout holds it.
         let deadline = Instant::now() + Duration::from_secs(1);
@@ -844,7 +844,7 @@ pub fn exec(host: &Host, name: &str, cmd: &str) -> Result<i32> {
         if let Err(e) = stop() {
             crate::log!("flexvm: the command may still be running in vm {vm}: {e}");
         }
-        util::exit(128 + sig);
+        util::raise_signal(sig);
     });
     let result = exec_session(host, name, cmd, session, false);
     // On an error too (a closed stdout, as with `| head`): the command would run on, holding its slot.
@@ -874,16 +874,7 @@ pub fn exec_session(host: &Host, name: &str, cmd: &str, session: &Mutex<Session>
         };
         let req = json!({"op": "exec", "session": id, "action": if started { "attach" } else { "start" }, "offset": offset, "cmd": cmd});
         let at = Instant::now() + Duration::from_secs(5);
-        let stream = vmproc::connect(host, name, &req, &[], at).and_then(|c| {
-            // Byte by byte: the frames after it stay unread.
-            let reply = recv_json(&mut BufReader::with_capacity(1, util::By { s: &c, at }))?.ok_or("vm hung up")?;
-            if reply["ok"] != json!(true) {
-                return Err(reply["error"].as_str().unwrap_or("exec failed").to_string().into());
-            }
-            // The guest heartbeats every second, even for silent commands.
-            c.set_read_timeout(Some(Duration::from_secs(3)))?;
-            Ok(BufReader::new(c))
-        });
+        let stream = vmproc::connect(host, name, &req, &[], at).and_then(|c| exec_stream(c, at));
         // Locked per write, never across a read: a checkpoint takes stdout's lock too.
         match stream.map(|mut r| exec_frames(&mut r, session, &mut std::io::stdout(), &mut std::io::stderr(), &mut deadline)) {
             Ok(Err(e)) => return Err(e),
@@ -904,7 +895,7 @@ pub fn exec_session(host: &Host, name: &str, cmd: &str, session: &Mutex<Session>
                     if let Ok(to) = std::fs::read_to_string(host.vms(name, "moved")) {
                         return Err(format!("vm {name} moved to {to}; the command keeps running there (session {id})").into());
                     }
-                    if !started {
+                    if !started || !host.suspended(name).is_dir() {
                         return Err(e);
                     }
                 }
@@ -914,6 +905,17 @@ pub fn exec_session(host: &Host, name: &str, cmd: &str, session: &Mutex<Session>
         std::thread::sleep(Duration::from_millis(200));
     }
     Err(format!("exec recovery timed out: {error}").into())
+}
+
+/// Keeps frames read ahead with the reply, then switches from its deadline to heartbeat timeouts.
+fn exec_stream<S: util::Timed>(c: S, at: Instant) -> Result<BufReader<S>> {
+    let mut r = util::By { s: BufReader::new(c), at };
+    let reply = recv_json(&mut r)?.ok_or("vm hung up")?;
+    if reply["ok"] != json!(true) {
+        return Err(reply["error"].as_str().unwrap_or("exec failed").to_string().into());
+    }
+    r.s.get_ref().read_timeout(Duration::from_secs(3))?;
+    Ok(r.s)
 }
 
 enum StreamEnd {
@@ -1155,6 +1157,76 @@ mod exec_tests {
 
     fn frames(fs: &[(u8, &[u8])]) -> Vec<u8> {
         fs.iter().flat_map(|(kind, data)| [&[*kind][..], &(data.len() as u32).to_le_bytes(), data].concat()).collect()
+    }
+
+    #[derive(Debug)]
+    struct ExecInput {
+        bytes: std::io::Cursor<Vec<u8>>,
+        reads: usize,
+        timeouts: std::cell::RefCell<Vec<Duration>>,
+    }
+
+    impl ExecInput {
+        fn new(bytes: Vec<u8>) -> Self {
+            Self { bytes: std::io::Cursor::new(bytes), reads: 0, timeouts: Default::default() }
+        }
+    }
+
+    impl Read for ExecInput {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.reads += 1;
+            self.bytes.read(buf)
+        }
+    }
+
+    impl util::Timed for ExecInput {
+        fn read_timeout(&self, t: Duration) -> std::io::Result<()> {
+            self.timeouts.borrow_mut().push(t);
+            Ok(())
+        }
+        fn write_timeout(&self, _: Duration) -> std::io::Result<()> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn exec_reply_keeps_buffered_frames_and_switches_timeouts() {
+        let session = Mutex::new(Session { id: "test-id".into(), started: false, offset: 0, exit: None });
+        let data = frames(&[
+            (guest::FRAME_MSG, b"test-id"),
+            (guest::FRAME_STDOUT, &[&0u64.to_le_bytes()[..], b"hello"].concat()),
+            (guest::FRAME_EXIT, &[&5u64.to_le_bytes()[..], &7i32.to_le_bytes()].concat()),
+        ]);
+        let input = ExecInput::new([b"{\"ok\":true}\n", data.as_slice()].concat());
+        let mut r = exec_stream(input, Instant::now() + Duration::from_secs(1)).unwrap();
+        assert_eq!(r.buffer(), data, "the reply and frames should be read together");
+        assert_eq!(r.get_ref().timeouts.borrow().as_slice().len(), 2);
+        assert_eq!(r.get_ref().timeouts.borrow().last(), Some(&Duration::from_secs(3)));
+        let mut stdout = Vec::new();
+        let result = exec_frames(&mut r, &session, &mut stdout, &mut Vec::new(), &mut Instant::now()).unwrap();
+        assert!(matches!(result, StreamEnd::Exit(7)));
+        assert_eq!(stdout, b"hello");
+        assert_eq!(r.get_ref().reads, 1, "reply and frames need just one underlying read");
+    }
+
+    #[test]
+    fn exec_reply_obeys_deadline_and_reports_refusals() {
+        let err = exec_stream(ExecInput::new(Vec::new()), Instant::now()).unwrap_err();
+        assert!(err.to_string().contains("deadline passed"));
+        let input = ExecInput::new(b"{\"ok\":false,\"error\":\"refused\"}\n".to_vec());
+        assert_eq!(exec_stream(input, Instant::now() + Duration::from_secs(1)).unwrap_err().to_string(), "refused");
+    }
+
+    #[test]
+    fn started_session_fails_promptly_when_vm_is_gone() {
+        let root = std::env::temp_dir().join(format!("flexvm-exec-dead-{}", std::process::id()));
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let session = Mutex::new(Session { id: "test-id".into(), started: true, offset: 0, exit: None });
+        let start = Instant::now();
+        let error = exec_session(&host, "gone", "true", &session, false).unwrap_err();
+        assert!(!error.to_string().contains("recovery timed out"), "{error}");
+        assert!(start.elapsed() < Duration::from_secs(5));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
