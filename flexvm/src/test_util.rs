@@ -12,9 +12,13 @@ pub struct TempDir(PathBuf);
 impl TempDir {
     pub fn new(name: &str) -> Self {
         static SWEEP: Once = Once::new();
-        static NEXT: AtomicU64 = AtomicU64::new(0);
         let root = std::env::temp_dir();
         SWEEP.call_once(|| sweep(&root));
+        Self::new_in(&root, name)
+    }
+
+    pub fn new_in(root: &Path, name: &str) -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         loop {
             let dir = root.join(format!("flexvm-test-{name}-{}-{}", NEXT.fetch_add(1, Ordering::Relaxed), std::process::id()));
             match fs::DirBuilder::new().mode(0o700).create(&dir) {
