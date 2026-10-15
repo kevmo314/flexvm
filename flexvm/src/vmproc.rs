@@ -1152,7 +1152,7 @@ impl Proc {
         let vm = self.vm().clone();
         // Only while it runs here: a paused or migrating VM touches nothing, and a
         // source sitting at its mark through the pull is not starved.
-        vm.limit.watch(&self.host, &vm.grant_backoff, Duration::from_secs(1), || !vm.dead(), || vm.state() == State::Running);
+        vm.limit.watch(&self.host, Duration::from_secs(1), || !vm.dead(), || vm.state() == State::Running);
     }
 
     /// The guest is untrusted: requests are bounded in size and time and
