@@ -1386,7 +1386,8 @@ def arrival_with_peer_route(n, ip):
     s, r, mig = migrate_in_raw(B, n, ip, source_vm(), gen=gen)
     assert r.get("ok"), r
     bad = os.urandom(4096)
-    s.sendall((json.dumps({"runs": [], "vmstate_len": len(bad), "preload": [0], "paused": False}) + "\n").encode() + bad)
+    # A valid header (the preloaded page is a REMOTE one, as a source sends): only the vmstate is bad.
+    s.sendall((json.dumps({"runs": [[0, 1, 3]], "vmstate_len": len(bad), "preload": [0], "paused": False}) + "\n").encode() + bad)
     return s, mig, gw, gen
 
 
