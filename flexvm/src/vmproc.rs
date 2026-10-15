@@ -1057,7 +1057,7 @@ impl Proc {
         let vm = self.vm().clone();
         // Only while it runs here: a paused or migrating VM touches nothing, and a
         // source sitting at its mark through the pull is not starved.
-        vm.limit.watch(&self.host, Duration::from_secs(1), || vm.pid().is_some(), || vm.state() == State::Running);
+        vm.limit.watch(&self.host, Duration::from_secs(1), || !vm.dead(), || vm.state() == State::Running);
     }
 
     /// The guest is untrusted: requests are bounded in size and time and
@@ -1304,6 +1304,10 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
     p.serve()
 }
 
+fn has_controller(controllers: &str, name: &str) -> bool {
+    controllers.split_whitespace().any(|controller| controller == name)
+}
+
 pub fn cgroup_root() -> Option<PathBuf> {
     let root = PathBuf::from("/sys/fs/cgroup/flexvm");
     let setup = || -> Result<()> {
@@ -1312,8 +1316,16 @@ pub fn cgroup_root() -> Option<PathBuf> {
         }
         std::fs::create_dir_all(&root)?;
         let ctl = std::fs::read_to_string(root.join("cgroup.subtree_control")).unwrap_or_default();
-        if !(ctl.contains("cpu") && ctl.contains("memory")) {
-            std::fs::write(root.join("cgroup.subtree_control"), "+cpu +memory")?;
+        if !has_controller(&ctl, "memory") {
+            std::fs::write(root.join("cgroup.subtree_control"), "+memory")?;
+        }
+        static NO_CPU: AtomicBool = AtomicBool::new(false);
+        if !has_controller(&ctl, "cpu") {
+            if let Err(e) = std::fs::write(root.join("cgroup.subtree_control"), "+cpu") {
+                if !NO_CPU.swap(true, Ordering::Relaxed) {
+                    crate::log!("cgroup cpu controller unavailable (memory limits still apply): {e}");
+                }
+            }
         }
         Ok(())
     };
@@ -1811,6 +1823,22 @@ pub fn call(host: &Host, name: &str, req: Value, at: Option<Instant>) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cgroup_controllers_are_whole_words() {
+        for (controllers, memory, cpu) in [
+            ("", false, false),
+            ("cpuset", false, false),
+            ("cpuset memory", true, false),
+            ("cpu", false, true),
+            ("cpu memory", true, true),
+            ("\tio\ncpuset cpu  memory\n", true, true),
+            ("memory_extra cpuacct", false, false),
+        ] {
+            assert_eq!(has_controller(controllers, "memory"), memory, "{controllers:?}");
+            assert_eq!(has_controller(controllers, "cpu"), cpu, "{controllers:?}");
+        }
+    }
 
     /// The wait ends with the last peer done, or at its deadline while one still runs.
     #[test]
