@@ -567,7 +567,7 @@ impl Proc {
         // Failure must `unfreeze` so the last checkpoint stays the delta base.
         let mut memhash = None;
         let frozen = (|| -> Result<Frozen> {
-            let runs = vm.save_state(&staging.vmstate(), false, true, || hold.hold(), &mut Phases::new())?;
+            let runs = vm.save_state(&staging.vmstate(), false, true, || self.hold_addr(vm, hold.id, "the checkpoint"), &mut Phases::new())?;
             t.mark("snapshot");
             if fault("ckpt_memhash") {
                 memhash = Some(vm.pager.content_hash()?);
@@ -749,18 +749,6 @@ struct PacketHold<'a> {
 }
 
 impl PacketHold<'_> {
-    /// Whether the address is held.
-    fn hold(&self) -> bool {
-        match self.d.holder().map(|h| h.hold(self.vm.ip, self.id)) {
-            Some(Ok(())) => true,
-            Some(Err(e)) => {
-                eprintln!("vm {}: not holding packets during the checkpoint: {e}", self.vm.name);
-                false
-            }
-            None => false,
-        }
-    }
-
     fn end(&mut self) -> Result<State> {
         let res = match self.d.holder() {
             None => self.vm.end_checkpoint(false),
@@ -768,9 +756,7 @@ impl PacketHold<'_> {
                 let (ip, tap) = (self.vm.ip, &self.vm.tap);
                 let (stats, attached) = crate::migrate::release_into(h, ip, self.id, self.vm, Duration::ZERO, |()| crate::net::attach(ip, tap));
                 self.stats = stats;
-                let res = self.vm.end_checkpoint(stats.is_some() && attached.is_ok());
-                h.forget(ip, self.id);
-                res
+                self.vm.end_checkpoint(stats.is_some() && attached.is_ok())
             }
         };
         let resumed = Instant::now();

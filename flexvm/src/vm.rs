@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{BufReader, Write};
+use std::io::BufReader;
 use std::net::{Ipv4Addr, Shutdown};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
@@ -305,6 +305,13 @@ impl Vm {
     /// With its address held nothing new reaches the tap, so the running guest empties its
     /// queue unless it stops taking frames; false if it has not by `TAP_DRAIN_WAIT`.
     fn drain_tap(&self, fd: &OwnedFd) -> bool {
+        // Paused, its guest takes nothing: no use waiting.
+        if self.was_paused() {
+            return crate::net::tap_queued(fd).map(|queued| !queued).unwrap_or_else(|e| {
+                eprintln!("vm {}: not waiting for its tap's queue before the pause: {e}", self.name);
+                true
+            });
+        }
         let start = Instant::now();
         let mut queued = false;
         loop {
@@ -316,8 +323,7 @@ impl Vm {
                     return true;
                 }
             }
-            // Paused, its guest takes nothing: no use waiting.
-            if self.was_paused() || start.elapsed() >= TAP_DRAIN_WAIT {
+            if start.elapsed() >= TAP_DRAIN_WAIT {
                 eprintln!("vm {}: frames still queued on its tap {} ms after its address was held; pausing it anyway", self.name, start.elapsed().as_millis());
                 return false;
             }
@@ -630,19 +636,10 @@ impl Vm {
         let left = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
         let raw = crate::util::connect_unix(&self.vsock, left)?;
         let id = self.track(&raw)?;
-        let sid = crate::guest::session_id()?;
         let res = (|| -> Result<(i32, String)> {
-            let s = crate::util::By { s: raw.try_clone()?, at: deadline };
-            let mut g = crate::guest::handshake(s, &format!("SESSION {sid} {}", cmd.len()))?;
-            g.get_mut().write_all(cmd.as_bytes())?;
-            let mut out = Vec::new();
-            let code = crate::guest::exec_output(&mut g, &sid, |_, d| {
-                out.extend_from_slice(&d[..d.len().min(MAX_OUTPUT.saturating_sub(out.len()))]);
-                Ok(())
-            })
-            .map_err(|e| format!("guest command {cmd:?}: {e}"))?;
-            let _ = crate::guest::close(&self.vsock, &sid, deadline);
-            Ok((code, String::from_utf8_lossy(&out).into_owned()))
+            let (code, out, _) =
+                crate::guest::run(raw.try_clone()?, &self.vsock, cmd, deadline, MAX_OUTPUT).map_err(|e| format!("guest command {cmd:?}: {e}"))?;
+            Ok((code, out))
         })();
         let _ = raw.shutdown(Shutdown::Both);
         self.untrack_exec(id);

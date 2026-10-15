@@ -115,6 +115,10 @@ pub fn session_id() -> Result<String> {
 }
 
 pub fn session(s: UnixStream, action: &str, id: &str, offset: u64, cmd: &str, timeout: Duration) -> Result<BufReader<UnixStream>> {
+    session_on(action, id, offset, cmd, |line| request_on(s, line, timeout))
+}
+
+fn session_on<S: Read + Write>(action: &str, id: &str, offset: u64, cmd: &str, open: impl FnOnce(&str) -> Result<BufReader<S>>) -> Result<BufReader<S>> {
     if !valid_session_id(id) {
         bail!("bad session id");
     }
@@ -124,7 +128,7 @@ pub fn session(s: UnixStream, action: &str, id: &str, offset: u64, cmd: &str, ti
         "close" => format!("CLOSE {id}"),
         _ => bail!("bad session action"),
     };
-    let mut r = request_on(s, &line, timeout)?;
+    let mut r = open(&line)?;
     if action == "start" {
         r.get_mut().write_all(cmd.as_bytes())?;
     }
@@ -204,12 +208,21 @@ pub fn ping(uds: &Path) -> Result<()> {
 pub fn exec(uds: &Path, cmd: &str, timeout: Duration) -> Result<i32> {
     let at = Instant::now() + timeout;
     let s = crate::util::connect_unix(uds, timeout)?;
-    let id = session_id()?;
-    let mut r = handshake(By { s, at }, &format!("SESSION {id} {}", cmd.len()))?;
-    r.get_mut().write_all(cmd.as_bytes())?;
-    let code = exec_output(&mut r, &id, |_, _| Ok(()))?;
-    close(uds, &id, at)?;
+    let (code, _, closed) = run(s, uds, cmd, at, 0)?;
+    closed?;
     Ok(code)
+}
+
+/// Drains all output, keeping at most `max_out` bytes; returns the close result separately.
+pub fn run(s: UnixStream, uds: &Path, cmd: &str, deadline: Instant, max_out: usize) -> Result<(i32, String, Result<()>)> {
+    let id = session_id()?;
+    let mut r = session_on("start", &id, 0, cmd, |line| handshake(By { s, at: deadline }, line))?;
+    let mut out = Vec::new();
+    let code = exec_output(&mut r, &id, |_, d| {
+        out.extend_from_slice(&d[..d.len().min(max_out.saturating_sub(out.len()))]);
+        Ok(())
+    })?;
+    Ok((code, String::from_utf8_lossy(&out).into_owned(), close(uds, &id, deadline)))
 }
 
 fn now() -> Result<String> {
