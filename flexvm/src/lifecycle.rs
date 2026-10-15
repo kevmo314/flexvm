@@ -750,15 +750,9 @@ struct PacketHold<'a> {
 
 impl PacketHold<'_> {
     fn end(&mut self) -> Result<State> {
-        let res = match self.d.holder() {
-            None => self.vm.end_checkpoint(false),
-            Some(h) => {
-                let (ip, tap) = (self.vm.ip, &self.vm.tap);
-                let (stats, attached) = crate::migrate::release_into(h, ip, self.id, self.vm, Duration::ZERO, |()| crate::net::attach(ip, tap));
-                self.stats = stats;
-                self.vm.end_checkpoint(stats.is_some() && attached.is_ok())
-            }
-        };
+        let (stats, attached) = self.d.release_to_tap(self.vm, self.id);
+        self.stats = stats;
+        let res = self.vm.end_checkpoint(attached);
         let resumed = Instant::now();
         self.resumed = Some(resumed);
         self.vm.after_resume(res.is_ok());

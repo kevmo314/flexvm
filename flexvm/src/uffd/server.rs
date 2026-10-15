@@ -78,11 +78,11 @@ impl Pager {
     /// within one region.
     pub(super) fn read_at(&self, offset: u64, local: &[libc::iovec]) -> io::Result<()> {
         let len: usize = local.iter().map(|v| v.iov_len).sum();
-        let Some(m) = self.locate(offset) else { return Err(io::Error::other(format!("offset {offset:#x} outside guest memory"))) };
+        let Some((addr, m)) = self.host_addr(offset) else { return Err(io::Error::other(format!("offset {offset:#x} outside guest memory"))) };
         if offset + len as u64 > m.offset + m.size as u64 {
             return Err(io::Error::other("read crosses a region boundary"));
         }
-        let remote = libc::iovec { iov_base: (m.base_host_virt_addr + (offset - m.offset)) as *mut _, iov_len: len };
+        let remote = libc::iovec { iov_base: addr as *mut _, iov_len: len };
         let pid = self.pid.load(Ordering::SeqCst) as libc::pid_t;
         if unsafe { libc::process_vm_readv(pid, local.as_ptr(), local.len() as _, &remote, 1, 0) } != len as isize {
             return Err(io::Error::other(format!("process_vm_readv: {}", io::Error::last_os_error())));

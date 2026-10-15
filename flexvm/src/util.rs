@@ -5,6 +5,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -398,7 +399,8 @@ pub fn proc_kb(path: &str, key: &str) -> Option<u64> {
 }
 
 pub fn host_cpus() -> usize {
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+    static CPUS: OnceLock<usize> = OnceLock::new();
+    *CPUS.get_or_init(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
 }
 
 pub fn sync_dir(dir: &Path) -> io::Result<()> {

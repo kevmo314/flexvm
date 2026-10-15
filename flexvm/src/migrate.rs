@@ -59,6 +59,13 @@ enum Outcome {
 }
 
 impl Proc {
+    /// Releases held packets back to the VM's tap, returning stats and whether the route was attached.
+    pub(crate) fn release_to_tap(&self, vm: &Vm, id: u64) -> (Option<hold::Stats>, bool) {
+        let Some(h) = self.holder() else { return (None, false) };
+        let (stats, res) = release_into(h, vm.ip, id, vm, Duration::ZERO, |()| crate::net::attach(vm.ip, &vm.tap));
+        (stats, stats.is_some() && res.is_ok())
+    }
+
     /// Everything not needing vmstate is prepared on the target before the
     /// pause. Once the target may have the state, this copy resumes only if
     /// the target says it aborted.
@@ -266,10 +273,7 @@ impl Proc {
                 return format!("{e}; and whether its address went to another vm cannot be told ({r}), so it stays paused, failed").into();
             }
         };
-        let attached = self.holder().is_some_and(|h| {
-            let (stats, res) = release_into(h, vm.ip, mig, vm, Duration::ZERO, |()| crate::net::attach(vm.ip, &vm.tap));
-            stats.is_some() && res.is_ok()
-        });
+        let (_, attached) = self.release_to_tap(vm, mig);
         let (s, e) = match vm.resume(attached) {
             Ok(s) => (s, e),
             Err(r) => (State::Failed, format!("{e}; resuming it here failed too: {r}").into()),
