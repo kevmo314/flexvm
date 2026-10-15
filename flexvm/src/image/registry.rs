@@ -407,6 +407,37 @@ fn docker_credentials(registry: &str) -> Option<String> {
 pub(super) mod tests {
     use super::*;
 
+    /// flexvm's test binary's allocator: the system's, counting the bytes each thread allocates (`allocated`).
+    struct Counting;
+
+    thread_local! {
+        static ALLOCATED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    unsafe impl std::alloc::GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+            let _ = ALLOCATED.try_with(|n| n.set(n.get() + layout.size() as u64));
+            unsafe { std::alloc::System.alloc(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+            unsafe { std::alloc::System.dealloc(ptr, layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+            let _ = ALLOCATED.try_with(|n| n.set(n.get() + new_size as u64));
+            unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
+        }
+    }
+
+    #[global_allocator]
+    static COUNTING: Counting = Counting;
+
+    /// Bytes this thread has allocated so far (each reallocation counted at its new size).
+    pub fn allocated() -> u64 {
+        ALLOCATED.with(|n| n.get())
+    }
+
     #[test]
     fn agent_dns_obeys_the_transfer_deadline() {
         let err = agent(Instant::now()).get("http://unused.example:80/").call().unwrap_err();
@@ -613,13 +644,13 @@ pub(super) mod tests {
         for (name, head, fill) in cases {
             let addr = endless_server(head, fill);
             let reg = Registry::new(Reference::parse(&format!("{addr}/test")).unwrap());
-            let (start, before) = (Instant::now(), crate::test_util::allocated());
+            let (start, before) = (Instant::now(), allocated());
             let res = reg.get("manifests/x", "*/*", start + Duration::from_secs(30)).and_then(|r| {
                 let mut data = Vec::new();
                 r.into_reader().read_to_end(&mut data)?;
                 Ok(data)
             });
-            let allocated = crate::test_util::allocated() - before;
+            let allocated = allocated() - before;
             let err = res.expect_err(name).to_string();
             assert!(allocated < 2 << 20, "{name}: allocated {allocated} bytes ({err})");
             assert!(start.elapsed() < Duration::from_secs(10), "{name}: took {:?} ({err})", start.elapsed());

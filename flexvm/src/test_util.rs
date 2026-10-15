@@ -155,34 +155,3 @@ fn sweep_removes_dead_fixtures_and_preserves_live_and_unrelated_directories() {
     assert!(kept.iter().all(|name| root.join(name).exists()));
     assert!(link.is_symlink());
 }
-
-/// The test binary's allocator: the system's, counting the bytes each thread allocates (`allocated`).
-struct Counting;
-
-thread_local! {
-    static ALLOCATED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
-unsafe impl std::alloc::GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
-        let _ = ALLOCATED.try_with(|n| n.set(n.get() + layout.size() as u64));
-        unsafe { std::alloc::System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
-        unsafe { std::alloc::System.dealloc(ptr, layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
-        let _ = ALLOCATED.try_with(|n| n.set(n.get() + new_size as u64));
-        unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
-    }
-}
-
-#[global_allocator]
-static COUNTING: Counting = Counting;
-
-/// Bytes this thread has allocated so far (each reallocation counted at its new size).
-pub fn allocated() -> u64 {
-    ALLOCATED.with(|n| n.get())
-}
