@@ -783,7 +783,7 @@ impl Proc {
             }),
             // Also through while a new address is pending (a resume that failed to set it): this one retries it.
             libc::SIGCONT
-                if self.leaving.load(Ordering::SeqCst) || !(self.paused_by_request.load(Ordering::SeqCst) || vm.pending_net.lock().unwrap().is_some()) =>
+                if self.leaving.load(Ordering::SeqCst) || !(self.paused_by_request.load(Ordering::SeqCst) || vm.pending_net.load(Ordering::SeqCst)) =>
             {
                 Ok(())
             }

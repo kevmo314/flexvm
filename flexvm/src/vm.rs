@@ -98,8 +98,8 @@ pub struct Vm {
     pub vsock: PathBuf,
     was_paused: AtomicBool,
     pub clock_pending: AtomicBool,
-    /// Restored held paused at a new address: the guest still has this old one.
-    pub pending_net: Mutex<Option<Ipv4Addr>>,
+    /// Restored at a new address the guest has not taken yet.
+    pub pending_net: AtomicBool,
     /// Discards after this count mean the saved state and memory may disagree.
     pub snapshot_discards: AtomicU64,
     /// (dir, id) of the last write-tracked checkpoint: a delta's base.
@@ -414,7 +414,7 @@ impl Vm {
         if self.pager.remote_left() > 0 {
             bail!("vm {} is still pulling its memory from its previous host or checkpoint", self.name);
         }
-        if self.pending_net.lock().unwrap().is_some() {
+        if self.pending_net.load(Ordering::SeqCst) {
             bail!("vm {} has not taken its new address yet; resume it first", self.name);
         }
         Ok(())
@@ -948,7 +948,7 @@ impl Prepared {
             tap_drops_reported: AtomicU64::new(0),
             was_paused: AtomicBool::new(false),
             clock_pending: AtomicBool::new(false),
-            pending_net: Mutex::new(None),
+            pending_net: AtomicBool::new(false),
             snapshot_discards: AtomicU64::new(0),
             last_checkpoint: Mutex::new(None),
             cancel_checkpoint: AtomicUsize::new(0),

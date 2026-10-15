@@ -128,7 +128,7 @@ impl Proc {
     /// Sets a pending new address (`pending_net`) in the guest; failing, it stays
     /// pending, and the next `flexvm resume` (SIGCONT) tries again. Under `op`.
     fn take_address(&self, vm: &Vm) -> Result<()> {
-        if vm.pending_net.lock().unwrap().is_none() {
+        if !vm.pending_net.load(Ordering::SeqCst) {
             return Ok(());
         }
         let res = match fault("readdress_fail") {
@@ -137,7 +137,7 @@ impl Proc {
         };
         match res {
             Ok(()) => {
-                *vm.pending_net.lock().unwrap() = None;
+                vm.pending_net.store(false, Ordering::SeqCst);
                 Ok(())
             }
             Err(e) => bail!("vm {} runs, but setting its address {} failed: {e}; flexvm resume {} tries again", vm.name, vm.ip, vm.name),
@@ -399,7 +399,7 @@ impl Proc {
         // Published paused, until SIGCONT (`flexvm resume`); `why`: a resume that failed.
         let keep_paused = |t: &mut Phases, why: Option<String>| {
             if ip != m.ip {
-                *vm.pending_net.lock().unwrap() = Some(m.ip);
+                vm.pending_net.store(true, Ordering::SeqCst);
             }
             self.set_vm(vm.clone());
             self.paused_by_request.store(true, Ordering::SeqCst);
@@ -453,7 +453,7 @@ impl Proc {
         // It runs: from here a slow or failed guest step is reported, never fatal (its checkpoint,
         // still where its memory comes from, is deleted once all of it is in). Pending until the guest has it.
         if ip != m.ip {
-            *vm.pending_net.lock().unwrap() = Some(m.ip);
+            vm.pending_net.store(true, Ordering::SeqCst);
         }
         self.set_vm(vm.clone());
         self.publish();
@@ -529,7 +529,7 @@ impl Proc {
                         answered = true;
                         crate::log!("vm {}: its guest agent answered {} ms after it resumed", vm.name, ms(start.elapsed()));
                     }
-                    if vm.pending_net.lock().unwrap().is_some() {
+                    if vm.pending_net.load(Ordering::SeqCst) {
                         let _op = p.op_within()?;
                         p.take_address(&vm)?;
                         crate::log!("vm {}: took its address {}", vm.name, vm.ip);
