@@ -9,7 +9,6 @@ use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -90,9 +89,6 @@ pub fn main(host: Host, listener: TcpListener) -> Result<()> {
     crate::gc::periodic(host.clone());
     let peers = Peers::watch(host.clone());
     let (waits, moved) = (Waiting::new(MAX_WAITING, MAX_WAITING_FROM), Waiting::new(MAX_MOVED, MAX_MOVED_FROM));
-    // Refusals are logged off the accept loop, never waiting on stderr: past 64 queued, dropped.
-    let (refusals, queued) = std::sync::mpsc::sync_channel::<String>(64);
-    std::thread::spawn(move || queued.into_iter().for_each(|e| crate::log!("peer request: {e}")));
     let host = std::sync::Arc::new(host);
     for conn in listener.incoming() {
         // Everything a request does before it is read, checking its peer
@@ -122,16 +118,16 @@ pub fn main(host: Host, listener: TcpListener) -> Result<()> {
             Admission::Moved => moved.take(from),
         };
         let Some(waiting) = waiting else {
-            not_a_peer(conn, from, &refusals);
+            not_a_peer(conn, from);
             continue;
         };
-        let (host, peers, refusals) = (host.clone(), peers.clone(), refusals.clone());
+        let (host, peers) = (host.clone(), peers.clone());
         std::thread::spawn(move || {
             let admitted = peers.admit_by(&host, from, Instant::now() + ADMIT_WAIT);
             drop(waiting);
             match admitted.then(|| Slot::take(&ACTIVE, MAX_ACTIVE)).flatten() {
                 Some(slot) => serve(&host, conn, slot, deadline),
-                None if !admitted => not_a_peer(conn, from, &refusals),
+                None if !admitted => not_a_peer(conn, from),
                 None => {}
             }
         });
@@ -302,11 +298,44 @@ impl Peers {
     }
 }
 
-fn not_a_peer(conn: TcpStream, from: IpAddr, log: &SyncSender<String>) {
+fn not_a_peer(conn: TcpStream, from: IpAddr) {
     let local = conn.local_addr().map(|a| a.to_string()).unwrap_or_default();
     let e = format!("{from} is not a peer of {local} (add it there: flexvm config --peer)");
-    let _ = log.try_send(e.clone());
+    // A flood of non-peers is counted, not logged line by line.
+    static WINDOW: Mutex<RefusalLog> = Mutex::new(RefusalLog { second: 0, logged: 0, unlogged: 0 });
+    let second = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let logged = WINDOW.lock().unwrap_or_else(|p| p.into_inner()).take(second);
+    match logged {
+        Some(0) => crate::log!("peer request: {e}"),
+        Some(n) => crate::log!("peer request: {e} ({n} refusals before it not logged)"),
+        None => {}
+    }
     refuse(conn, &e, None);
+}
+
+/// Refusals logged at most in any one second.
+const REFUSALS_LOGGED: u32 = 10;
+
+/// This second's refusal lines, and the refusals not logged since the last line.
+struct RefusalLog {
+    second: u64,
+    logged: u32,
+    unlogged: u64,
+}
+
+impl RefusalLog {
+    /// Whether a refusal in `second` is logged, with how many were not since the last that was.
+    fn take(&mut self, second: u64) -> Option<u64> {
+        if self.second != second {
+            (self.second, self.logged) = (second, 0);
+        }
+        if self.logged >= REFUSALS_LOGGED {
+            self.unlogged += 1;
+            return None;
+        }
+        self.logged += 1;
+        Some(std::mem::take(&mut self.unlogged))
+    }
 }
 
 /// Tells the client why, then reads off what it already sent so the close
@@ -522,6 +551,16 @@ mod tests {
         assert!(!arrival.exists());
         assert_eq!(std::fs::read(&existing).unwrap(), b"accepted");
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_refusal_flood_is_logged_a_few_lines_a_second_and_counted() {
+        let mut w = RefusalLog { second: 0, logged: 0, unlogged: 0 };
+        let first: Vec<_> = (0..1000).map(|_| w.take(5)).collect();
+        assert_eq!(first.iter().filter(|l| l.is_some()).count(), REFUSALS_LOGGED as usize);
+        assert!(first.iter().flatten().all(|&n| n == 0));
+        assert_eq!(w.take(6), Some(1000 - REFUSALS_LOGGED as u64));
+        assert_eq!(w.take(6), Some(0));
     }
 
     fn pair() -> (TcpStream, TcpStream) {
