@@ -605,11 +605,19 @@ pub fn interrupt(sig: i32) {
     INTERRUPT.store(sig, Ordering::Relaxed);
 }
 
+/// Read after the build has unwound and removed its staging and tap.
+pub fn interrupted_signal() -> Option<i32> {
+    match INTERRUPT.load(Ordering::Relaxed) {
+        0 => None,
+        sig => Some(sig),
+    }
+}
+
 /// Also checked by image builds (`image::prepare`), which run under the same signal thread.
 pub fn interrupted() -> Result<()> {
-    match INTERRUPT.load(Ordering::Relaxed) {
-        0 => Ok(()),
-        sig => bail!("template build interrupted (signal {sig})"),
+    match interrupted_signal() {
+        None => Ok(()),
+        Some(sig) => bail!("template build interrupted (signal {sig})"),
     }
 }
 

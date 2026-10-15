@@ -156,11 +156,12 @@ fn send_log_by(tx: &std::sync::mpsc::SyncSender<LogMsg>, mut msg: LogMsg, deadli
     }
 }
 
-/// Makes `sigs` end the process as their default action does (a supervisor
-/// sees the same signal), once the queued log lines are written (`flush_log`).
-/// Inherited ignored signals keep their disposition and are never blocked here.
+/// Takes the first of `sigs` on a thread of its own, with them unblocked there so a second ends
+/// the process at once; `raise_signal` there ends it as the default action would (a
+/// supervisor sees the same signal), once the queued log lines are written. Inherited ignored
+/// signals keep their disposition and are never blocked here (a blocked one would be queued).
 /// Called before any other thread that does not block them is started.
-pub fn flush_log_on(sigs: &[i32]) {
+pub fn on_signal(sigs: &[i32], action: impl FnOnce(i32) + Send + 'static) {
     let sigs: Vec<_> = sigs
         .iter()
         .copied()
@@ -175,14 +176,21 @@ pub fn flush_log_on(sigs: &[i32]) {
     let set = block_signals(&sigs);
     std::thread::spawn(move || {
         let sig = wait_signal(&set);
-        flush_log(LOG_FLUSH);
-        unsafe {
-            libc::signal(sig, libc::SIG_DFL);
-            libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
-            libc::raise(sig);
-        }
-        std::process::exit(128 + sig)
+        unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut()) };
+        action(sig);
     });
+}
+
+/// Ends by the signal's default action, after flushing queued diagnostics.
+pub fn raise_signal(sig: i32) -> ! {
+    flush_log(LOG_FLUSH);
+    unsafe {
+        libc::signal(sig, libc::SIG_DFL);
+        let set = block_signals(&[sig]);
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+        libc::raise(sig);
+    }
+    std::process::exit(128 + sig)
 }
 
 /// How long an exiting process waits for its queued log lines (`flush_log`).
@@ -475,7 +483,7 @@ pub fn answer(reply: Option<serde_json::Value>, who: &str) -> Result<serde_json:
     Ok(reply["result"].clone())
 }
 
-pub trait Timed: Read + Write {
+pub trait Timed: Read {
     fn read_timeout(&self, t: Duration) -> io::Result<()>;
     fn write_timeout(&self, t: Duration) -> io::Result<()>;
 }
@@ -493,6 +501,15 @@ macro_rules! timed {
     )*};
 }
 timed!(std::net::TcpStream, &std::net::TcpStream, UnixStream, &UnixStream);
+
+impl<S: Timed> Timed for io::BufReader<S> {
+    fn read_timeout(&self, t: Duration) -> io::Result<()> {
+        self.get_ref().read_timeout(t)
+    }
+    fn write_timeout(&self, t: Duration) -> io::Result<()> {
+        self.get_ref().write_timeout(t)
+    }
+}
 
 /// A socket for `By` that sets its read timeout a sixteenth short of `By`'s deadline and again only once it would end a
 /// read past the deadline or more than an eighth before it: a page client's many small reads skip nearly every
@@ -576,7 +593,17 @@ impl<S: Timed> Read for By<S> {
     }
 }
 
-impl<S: Timed> Write for By<S> {
+impl<S: Timed + BufRead> BufRead for By<S> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        self.s.read_timeout(self.left()?)?;
+        self.s.fill_buf().map_err(timed_out)
+    }
+    fn consume(&mut self, n: usize) {
+        self.s.consume(n);
+    }
+}
+
+impl<S: Timed + Write> Write for By<S> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.s.write_timeout(self.left()?)?;
         self.s.write(buf).map_err(timed_out)
@@ -896,7 +923,7 @@ pub fn create_dir_durably(dir: &Path, mode: u32) -> io::Result<()> {
 pub fn send_with_fds(s: &UnixStream, line: &[u8], fds: &[RawFd], at: Instant) -> io::Result<()> {
     let mut iov = libc::iovec { iov_base: line.as_ptr() as *mut libc::c_void, iov_len: line.len() };
     let space = unsafe { libc::CMSG_SPACE(std::mem::size_of_val(fds) as u32) } as usize;
-    let mut cbuf = vec![0u8; space];
+    let mut cbuf = vec![0u64; space.div_ceil(std::mem::size_of::<u64>())];
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
@@ -927,12 +954,12 @@ pub fn recv_with_fds(s: &UnixStream, max: usize, mut ready: impl FnMut() -> io::
             return Err(io::Error::new(io::ErrorKind::InvalidData, "request line too long"));
         }
         let mut iov = libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() };
-        let mut cbuf = [0u8; 256];
+        let mut cbuf = [0u64; 32];
         let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
         msg.msg_iov = &mut iov;
         msg.msg_iovlen = 1;
         msg.msg_control = cbuf.as_mut_ptr().cast();
-        msg.msg_controllen = cbuf.len() as _;
+        msg.msg_controllen = std::mem::size_of_val(&cbuf) as _;
         ready()?;
         let n = eintr(|| unsafe { libc::recvmsg(s.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) })?;
         unsafe {
@@ -1382,6 +1409,38 @@ mod tests {
     }
 
     #[test]
+    fn signal_cleanup_ends_by_the_original_signal() {
+        use std::os::unix::process::ExitStatusExt;
+        const CHILD: &str = "FLEXVM_TEST_SIGNAL_CLEANUP";
+        if let Ok(sig) = std::env::var(CHILD) {
+            let sig = sig.parse::<i32>().unwrap();
+            unsafe { libc::signal(sig, libc::SIG_DFL) };
+            on_signal(&[sig], |sig| {
+                let mut mask = unsafe { std::mem::zeroed() };
+                unsafe {
+                    libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut mask);
+                    assert_eq!(libc::sigismember(&mask, sig), 0);
+                    // Re-raising must restore the default action even after a disposition changed.
+                    libc::signal(sig, libc::SIG_IGN);
+                }
+                raise_signal(sig);
+            });
+            unsafe { libc::kill(libc::getpid(), sig) };
+            loop {
+                std::thread::park();
+            }
+        }
+        for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "util::tests::signal_cleanup_ends_by_the_original_signal"])
+                .env(CHILD, sig.to_string())
+                .status()
+                .unwrap();
+            assert_eq!(status.signal(), Some(sig), "{status}");
+        }
+    }
+
+    #[test]
     fn signal_flush_preserves_ignored_sighup() {
         const CHILD: &str = "FLEXVM_TEST_IGNORED_SIGHUP";
         if std::env::var_os(CHILD).is_none() {
@@ -1399,7 +1458,7 @@ mod tests {
             libc::sigemptyset(&mut hup);
             libc::sigaddset(&mut hup, libc::SIGHUP);
             assert_eq!(libc::pthread_sigmask(libc::SIG_UNBLOCK, &hup, std::ptr::null_mut()), 0);
-            flush_log_on(&[libc::SIGHUP, libc::SIGTERM]);
+            on_signal(&[libc::SIGHUP, libc::SIGTERM], |sig| raise_signal(sig));
             let mut mask: libc::sigset_t = std::mem::zeroed();
             assert_eq!(libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut mask), 0);
             assert_eq!(libc::sigismember(&mask, libc::SIGHUP), 0, "ignored signals must not be blocked");
@@ -1550,6 +1609,14 @@ mod tests {
         let null = std::fs::File::open("/dev/null").unwrap();
         send_with_fds(&a, b"{}\n", &[null.as_raw_fd(); 2], Instant::now() + Duration::from_secs(5)).unwrap();
         assert_eq!(recv_with_fds(&b, 64, || Ok(())).unwrap().1.len(), 2);
+        // The aligned receive buffer still holds 256 bytes, including the header.
+        assert!(std::mem::align_of::<u64>() >= std::mem::align_of::<libc::cmsghdr>());
+        send_with_fds(&a, b"{}\n", &[null.as_raw_fd(); 60], Instant::now() + Duration::from_secs(5)).unwrap();
+        let (_, fds) = recv_with_fds(&b, 64, || Ok(())).unwrap();
+        assert_eq!(fds.len(), 60);
+        for fd in fds {
+            assert_ne!(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC, 0);
+        }
         // More than the receive buffer holds: an error, not a request missing some.
         send_with_fds(&a, b"{}\n", &[null.as_raw_fd(); 100], Instant::now() + Duration::from_secs(5)).unwrap();
         let e = recv_with_fds(&b, 64, || Ok(())).unwrap_err();
@@ -1693,7 +1760,7 @@ pub mod output {
             TARGETS.lock().unwrap()[i] = Some(Arc::new(own(orig)));
             let mut from = unsafe { File::from_raw_fd(p[0]) };
             RELAYS.lock().unwrap().push(std::thread::spawn(move || {
-                let mut buf = [0u8; 8192];
+                let mut buf = [0u8; 64 << 10];
                 while let Ok(n @ 1..) = from.read(&mut buf) {
                     relay(i, &buf[..n]);
                 }

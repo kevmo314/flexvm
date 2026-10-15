@@ -834,8 +834,9 @@ def exec_background():
             p.kill()
             _, err = p.communicate()
         interrupted.append((line, p.returncode, err.strip()[-200:]))
-    bad = [r for r in interrupted if r[:2] != ("ready", 130) or r[2]]
-    check("exec bg: 70 interrupted execs end at once with 130", not bad, bad[:3])
+    # Ended by the signal itself, so a shell loop running them stops too.
+    bad = [r for r in interrupted if r[:2] != ("ready", -signal.SIGINT) or r[2]]
+    check("exec bg: 70 interrupted execs end at once by SIGINT", not bad, bad[:3])
     stopped = wait_for(lambda: count("sleep 1001") == (0, "0"), 10)
     check("exec bg: an interrupted exec's command is stopped", stopped, count("sleep 1001"))
     check("exec bg: execs still start after the interrupted ones", sh(A, n, "echo hi") == (0, "hi"))
