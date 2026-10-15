@@ -36,6 +36,8 @@ const FLUSH_WAIT: Duration = Duration::from_millis(400);
 const REPLY_WAIT: Duration = Duration::from_secs(1);
 /// How long a let-go address's stragglers (`Holder::gone`) are re-sent or counted.
 const GONE_FOR: Duration = Duration::from_secs(30);
+/// Stragglers are logged at most this often per address after the first report.
+const STRAGGLER_LOG: Duration = Duration::from_secs(1);
 
 /// Where `release_local` hands packets, from more than one thread.
 pub type LocalSink<'a> = &'a mut (dyn FnMut(&[u8]) -> bool + Send);
@@ -52,14 +54,24 @@ pub struct Holder {
     routes: Mutex<()>,
     /// Held while a packet is read off the device and queued.
     rx: Mutex<()>,
-    /// Addresses let go of (when, and whether the route moved on: not when it was dropped).
-    /// A sender that looked the route up before the switch can still hand a packet to this
-    /// device after the release took the last one off it (a stalled vCPU, preemption between
-    /// the lookup and the transmit): with no entry it would be lost, uncounted (#254). It is
-    /// re-sent (`resend`), routed to where the address is now, or counted as dropped.
-    gone: Mutex<HashMap<Ipv4Addr, (Instant, bool)>>,
+    /// Addresses let go of. A sender that looked the route up before the switch can still
+    /// hand a packet to this device after the release took the last one off it (a stalled
+    /// vCPU, preemption between the lookup and the transmit): with no entry it would be lost,
+    /// uncounted (#254). It is re-sent (`resend`), routed to where the address is now, or
+    /// counted as dropped (`Holder::straggler`).
+    gone: Mutex<HashMap<Ipv4Addr, Gone>>,
     /// A raw socket (IPPROTO_RAW: the packet's own header) the kernel routes re-sent packets by.
     resend: Option<OwnedFd>,
+}
+
+struct Gone {
+    at: Instant,
+    /// The route moved on (a switched release), not dropped: stragglers are re-sent.
+    moved: bool,
+    /// Not reported yet (`report_stragglers`): re-sent, dropped.
+    resent: u64,
+    dropped: u64,
+    reported: Option<Instant>,
 }
 
 struct Entry {
@@ -119,7 +131,7 @@ impl Holder {
         let resend = match unsafe { libc::socket(libc::AF_INET, libc::SOCK_RAW | libc::SOCK_CLOEXEC, libc::IPPROTO_RAW) } {
             fd if fd >= 0 => Some(unsafe { OwnedFd::from_raw_fd(fd) }),
             _ => {
-                eprintln!("hold device {dev}: no raw socket ({}); packets reaching it after a release are dropped", std::io::Error::last_os_error());
+                crate::log!("hold device {dev}: no raw socket ({}); packets reaching it after a release are dropped", std::io::Error::last_os_error());
                 None
             }
         };
@@ -141,7 +153,9 @@ impl Holder {
 
     pub fn hold(&self, ip: Ipv4Addr, mig: u64) -> Result<()> {
         let _routes = self.routes.lock().unwrap();
-        self.gone.lock().unwrap().remove(&ip);
+        if let Some(g) = self.gone.lock().unwrap().remove(&ip) {
+            report(ip, &self.dev, &g);
+        }
         self.held.lock().unwrap().insert(ip, Arc::new(Entry { mig, q: Mutex::default() }));
         crate::net::route_dev(true, ip, self.ifindex).inspect_err(|_| drop(self.held.lock().unwrap().remove(&ip)))
     }
@@ -171,8 +185,8 @@ impl Holder {
         if held.get(&ip).is_some_and(|x| Arc::ptr_eq(x, e)) {
             held.remove(&ip);
             let mut gone = self.gone.lock().unwrap();
-            gone.retain(|_, (at, _)| at.elapsed() < GONE_FOR);
-            gone.insert(ip, (Instant::now(), moved));
+            gone.retain(|_, g| g.at.elapsed() < GONE_FOR || g.resent + g.dropped > 0);
+            gone.insert(ip, Gone { at: Instant::now(), moved, resent: 0, dropped: 0, reported: None });
         }
     }
 
@@ -222,6 +236,7 @@ impl Holder {
             Err(_) => self.unroute(ip, &e),
         }
         stats.dropped += e.q.lock().unwrap().discard();
+        self.report_stragglers();
         Some((stats, switched))
     }
 
@@ -303,6 +318,8 @@ impl Holder {
             Ok(()) => q.discard(),
             Err(_) => std::mem::take(&mut q.dropped),
         };
+        drop(q);
+        self.report_stragglers();
         Some((stats, switched))
     }
 
@@ -363,14 +380,44 @@ impl Holder {
     fn read_loop(&self) {
         let mut pfd = libc::pollfd { fd: self.tun.as_raw_fd(), events: libc::POLLIN, revents: 0 };
         let mut buf = vec![0u8; 65536];
+        let mut wait = -1;
         loop {
-            if let Err(e) = eintr(|| unsafe { libc::poll(&mut pfd, 1, -1) }) {
+            if let Err(e) = eintr(|| unsafe { libc::poll(&mut pfd, 1, wait) }) {
                 return crate::log!("hold device {}: {e}", self.dev);
             }
             self.reading.store(true, Ordering::SeqCst);
             while self.read_one(&mut buf) {}
             self.reading.store(false, Ordering::SeqCst);
+            wait = self.report_stragglers();
         }
+    }
+
+    /// Logs the stragglers counted since an address's last report: the first report at once,
+    /// later ones at most every `STRAGGLER_LOG`. Here, off `rx`: a blocked stderr never holds
+    /// up reading the device or a release. Returns how long until the next one is due (ms),
+    /// -1 if none is pending.
+    fn report_stragglers(&self) -> i32 {
+        let mut due: Option<Duration> = None;
+        let mut gone = self.gone.lock().unwrap();
+        let ready: Vec<_> = gone
+            .iter_mut()
+            .filter(|(_, g)| g.resent + g.dropped > 0)
+            .filter_map(|(ip, g)| match g.reported.map(|r| STRAGGLER_LOG.saturating_sub(r.elapsed())).filter(|d| !d.is_zero()) {
+                Some(d) => {
+                    due = Some(due.map_or(d, |x| x.min(d)));
+                    None
+                }
+                None => {
+                    let out = (*ip, Gone { at: g.at, moved: g.moved, resent: g.resent, dropped: g.dropped, reported: None });
+                    (g.resent, g.dropped, g.reported) = (0, 0, Some(Instant::now()));
+                    Some(out)
+                }
+            })
+            .collect();
+        gone.retain(|_, g| g.at.elapsed() < GONE_FOR || g.resent + g.dropped > 0);
+        drop(gone);
+        ready.iter().for_each(|(ip, g)| report(*ip, &self.dev, g));
+        due.map_or(-1, |d| d.as_millis().max(1) as i32)
     }
 
     /// Reads a packet off the device and queues it for its address; false once it is empty.
@@ -400,11 +447,19 @@ impl Holder {
     }
 
     /// A packet for `ip` read after it was let go of: re-sent if the address moved on, else
-    /// counted. Its TTL goes down by one, so a route that still leads here cannot loop it.
+    /// counted (and logged by `report_stragglers`, not here: this runs under `rx`). Its TTL
+    /// goes down by one, so a route that still leads here cannot loop it. Limits, each counted
+    /// as dropped: a fragment with IP ID 0 (the kernel would give it a new ID, so it would no
+    /// longer reassemble with its siblings), and a packet larger than the new route's MTU
+    /// (EMSGSIZE). A re-sent packet can arrive after newer ones that took the new route (and
+    /// behind what a plugged tap holds): late rather than lost.
     fn straggler(&self, ip: Ipv4Addr, p: &mut [u8]) {
-        let Some((at, moved)) = self.gone.lock().unwrap().get(&ip).copied().filter(|(at, _)| at.elapsed() < GONE_FOR) else { return };
-        let after = at.elapsed().as_secs_f64() * 1e3;
-        let sent = moved
+        let mut gone = self.gone.lock().unwrap();
+        let Some(g) = gone.get_mut(&ip).filter(|g| g.at.elapsed() < GONE_FOR) else { return };
+        let fragment = u16::from_be_bytes([p[6], p[7]]) & 0x3fff != 0;
+        let zero_id = p[4] == 0 && p[5] == 0;
+        let sent = g.moved
+            && !(fragment && zero_id)
             && p[8] > 1
             && self.resend.as_ref().is_some_and(|fd| {
                 p[8] -= 1;
@@ -416,9 +471,19 @@ impl Holder {
                 unsafe { libc::sendto(fd.as_raw_fd(), p.as_ptr().cast(), p.len(), libc::MSG_DONTWAIT, (&to as *const libc::sockaddr_in).cast(), size) >= 0 }
             });
         match sent {
-            true => eprintln!("hold {ip}: re-sent a packet that reached {} {after:.1} ms after it let go of the address", self.dev),
-            false => eprintln!("hold {ip}: dropped 1 packet that reached {} {after:.1} ms after it let go of the address", self.dev),
+            true => g.resent += 1,
+            false => g.dropped += 1,
         }
+    }
+}
+
+/// Logs `g`'s straggler counts, if any ("dropped N" is what loss accounting reads).
+fn report(ip: Ipv4Addr, dev: &str, g: &Gone) {
+    let after = format!("{dev} after it let go of the address ({} ms ago)", g.at.elapsed().as_millis());
+    match (g.resent, g.dropped) {
+        (0, 0) => {}
+        (r, 0) => crate::log!("hold {ip}: re-sent {r} packets that reached {after}"),
+        (r, d) => crate::log!("hold {ip}: dropped {d} packets that reached {after}, re-sent {r}"),
     }
 }
 
