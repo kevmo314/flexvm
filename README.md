@@ -20,6 +20,14 @@ sudo ./target/release/flexvm template default   # cold-boot and snapshot a templ
 
 The host needs Linux 5.16+: Firecracker patch `0004` uses `KVM_VCPU_TSC_OFFSET`.
 
+Hosts that migrate or restore each other's VMs need the same CPU model and
+a byte-identical Firecracker: a snapshot records both (the binary by its
+content hash), and any difference refuses it ("Firecracker differs"). Build
+Firecracker once and copy `artifacts/firecracker` to every host rather than
+building it on each. Replacing the binary also invalidates every template
+built with the old one: rebuild them. Templates themselves must be identical
+too (build once and copy `artifacts/templates`, or build from the same inputs).
+
 flexvm runs as root (KVM, userfaultfd, routes, cgroups). Commands below
 assume `flexvm` is on the PATH and `FLEXVM_ARTIFACTS` points at `artifacts/`.
 sudo drops `FLEXVM_ARTIFACTS`: keep it with `sudo --preserve-env=FLEXVM_ARTIFACTS`
@@ -40,6 +48,18 @@ flexvm ls                      # --json prints the list as JSON
 NAME             IP              TEMPLATE   STATE             PID VCPU  RSS MiB  MAX MiB
 web              10.200.0.1      default    running        41522   24       27    32000
 ```
+
+| state | meaning |
+|---|---|
+| `running` | its vCPUs run |
+| `paused` | stopped by SIGTSTP or Ctrl-Z (or held by `restore --paused`); SIGCONT resumes it |
+| `checkpointing` | paused for a checkpoint's or a suspend's copy |
+| `source` | migrating away: paused here until the target has its memory |
+| `suspended` | on disk, no process (SIGTERM); `flexvm resume` brings it back |
+| `quarantined` | a suspended VM that cannot be resumed (its address generation is unknown); `restore` its directory with a new name and `--ip auto`, or `flexvm kill` it |
+| `failed` | died under its process (exit 124); `ls --json` (or `/run/flexvm/vms/NAME.failed`) says why, until `flexvm kill` |
+
+Standby VMs are not listed: `flexvm standby` shows them.
 
 ```sh
 flexvm exec web 'free -m'       # a shell command in the guest; exits with its status
@@ -84,7 +104,8 @@ suspended by SIGTERM); 0 when it migrated away or `checkpoint --stop`
 stopped it. flexvm's own failures use the range shells and container
 runtimes keep for themselves: 125 when it could not start the VM (or gave it
 up), 124 when the VM died under it (`flexvm ls` then shows it `failed`, and
-why, until `flexvm kill`).
+`flexvm ls --json` why, until `flexvm kill`). Without `-- CMD` they are
+the same, so a script can tell a VM that never ran (125) from one that did.
 
 A VM migrating away stays paused on its source until the target has all its
 memory; `flexvm kill` refuses that copy (kill the VM where it runs), and
@@ -134,14 +155,27 @@ egress. Arrange upstream routes or NAT yourself if guests need it. There is
 no default DNS server; configure one with `--dns IP`.
 
 Every host's `--vm-ips` must be disjoint, and the hosts must list each other
-with `--peer`: a listener serves its peers' addresses only. `--reserve MIB`
+with `--peer HOST:PORT` (each peer's listen address): a listener serves its
+peers' addresses only, and tells any other it is not a peer. The default
+range, `10.200.0.0/16`, is the same on every host, so give each host its own
+once it has peers (`listen` and `config` warn until then). `--peer` replaces
+the whole list: give every peer each time, or `--peer ''` for none. `--reserve MIB`
 (default 1024) is the memory a host keeps free: starts and growth that would
 take it below are refused. VMs start moving to peers with room earlier, once
 the host has less than `--evict-at MIB` available (default: the reserve
 plus the reserve or 512, whichever is more), the fastest growing first,
 until it is back above the mark by half the mark's height over the reserve.
-A peer takes such a VM only if it stays above its own mark. Running VMs pick
-up both from `host.json` as it changes.
+A peer takes such a VM only if it stays above its own mark. `--evict-at ''`
+goes back to the default; a mark under the reserve counts as the reserve.
+
+Running VM processes and listeners pick up `--peer`, `--reserve` and
+`--evict-at` from `host.json` as it changes. The other settings (`--vm-ips`,
+`--dns`, `--underlay`, `--announce-dev`, the listen address) reach VMs
+started afterwards; restart the listener for its own.
+
+Every VM process and listener sets `net.ipv4.ip_forward=1`, and
+`proxy_arp` on `--announce-dev`, and never reverts them: the host routes
+between all its interfaces from then on, so check its `FORWARD` policy.
 
 A host that only runs VMs needs no listener. `flexvm config` sets the same
 flags (all but the listen address), and prints the configuration:
@@ -208,7 +242,10 @@ flexvm standby 0                 # none
 ```
 
 `run` takes one (resume and set the address: ~5 ms) and a replacement starts.
-Without one, `run` loads the snapshot (~50-100 ms).
+Without one, `run` loads the snapshot (~50-100 ms). `flexvm standby` with no
+count shows each template's count and how many standby VMs it has now. The
+template must exist: a count is kept and refilled by every listener and VM
+process, retried each minute (errors in `/run/flexvm/standby/T/standby.log`).
 
 ## Templates from container images
 
@@ -225,6 +262,26 @@ Overrides follow `docker run`: `--entrypoint`, `--cmd`, `--env K=V`,
 (`--ready-port N` or `--ready-cmd CMD`); every VM from a warm template starts
 with the same userland state (RNG seeds, keys), so use it only for apps that
 hold no secrets at startup. Details: [docs/images.md](docs/images.md).
+
+## Paths and knobs
+
+| flag | environment | default | what |
+|---|---|---|---|
+| `--state DIR` | `FLEXVM_STATE` | `/var/lib/flexvm` | host configuration, addresses, suspended VMs (on disk) |
+| `--run DIR` | `FLEXVM_RUN` | `/run/flexvm` | registry, sockets, logs (tmpfs) |
+| `--artifacts DIR` | `FLEXVM_ARTIFACTS` | `./artifacts` | `firecracker`, `vmlinux`, `rootfs.ext4`, `flexvm-init` |
+| `--templates DIR` | `FLEXVM_TEMPLATES` | `ARTIFACTS/templates` | built templates |
+| `--image-cache DIR` | | `ARTIFACTS/images` | pulled container images |
+| `--image-staging DIR` | | `STATE/staging` | where image layers unpack (root-owned, see [docs/images.md](docs/images.md)) |
+| `--init PATH` | | `ARTIFACTS/flexvm-init` | the init image templates run as PID 1 |
+| | `FLEXVM_CKPT_THREADS` | the CPU count, 1-12 | threads writing a checkpoint |
+| | `FLEXVM_COW_BUDGET_MIB` | 256 | copies of pages a running checkpoint keeps in memory (the guest wrote them before they were saved) before write faults wait for the writers |
+
+`FLEXVM_CKPT_THREADS` and `FLEXVM_COW_BUDGET_MIB` are read by the VM
+process, so set them where it starts (`flexvm run`, `resume`, `restore`,
+the listener for arrivals); on a `flexvm checkpoint` client they do nothing.
+`FLEXVM_FAULTS=1` enables test fault injection only. The state layout is in
+[docs/process-per-vm.md](docs/process-per-vm.md#on-disk-state).
 
 ## Benchmarks
 
@@ -289,4 +346,6 @@ copy-on-write, packet holds, clocks, Firecracker patches, measurements).
   dies before it starts the VM (a leak, never a collision).
 - `exec` reaches VMs on this host; one that migrates away ends its exec
   saying where it went and exits 1 (the command keeps running there).
-- Templates must be identical on every host (checked by content id).
+- Templates must be identical on every host (checked by content id), as
+  must the CPU model and the Firecracker binary (see Setup).
+- `net.ipv4.ip_forward` is turned on host-wide and left on.
