@@ -177,7 +177,11 @@ impl Proc {
                     vmstate_len: state.len() as u64,
                     preload: Cow::Borrowed(&pages),
                     paused: vm.was_paused(),
-                    app_log: self.hold_app_log(),
+                    app_log: match self.hold_app_log() {
+                        // Test fault `bad_app_log`: an offset past all of the guest's output.
+                        _ if fault("bad_app_log") => u64::MAX,
+                        at => at,
+                    },
                 },
             )?;
             conn.write_all(&state)?;
