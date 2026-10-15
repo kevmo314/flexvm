@@ -23,6 +23,7 @@ p.add_argument("--prefix", default="fvp", help="names of taps and hold devices s
 for h in "ab":
     p.add_argument(f"--{h}-state", help=f"host {h.upper()}'s state directory (default: --{h}-dir/state)")
     p.add_argument(f"--{h}-run", help=f"host {h.upper()}'s run directory (default: --{h}-dir/run)")
+    p.add_argument(f"--{h}-listen-log", help=f"host {h.upper()}'s listener log (default: its run directory's listen.log)")
 p.add_argument("--no-listeners", action="store_true", help="use the listeners already running on --a and --b")
 p.add_argument("--bin", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "target", "release", "flexvm"))
 p.add_argument("--artifacts", default=os.environ.get("FLEXVM_ARTIFACTS", "artifacts"))
@@ -40,16 +41,17 @@ scenario_vms, scenario_checkpoints = set(), set()
 
 
 class Host:
-    def __init__(self, addr, d, ips, state=None, run=None):
+    def __init__(self, addr, d, ips, state=None, run=None, listen_log=None):
         self.addr, self.dir, self.ips = addr, d, ips
         self.state, self.run = state or os.path.join(d, "state"), run or os.path.join(d, "run")
+        self.listen_log = listen_log or os.path.join(self.run, "listen.log")
 
     def __repr__(self):
         return self.addr
 
 
-A = Host(args.a, args.a_dir, args.a_ips, args.a_state, args.a_run)
-B = Host(args.b, args.b_dir, args.b_ips, args.b_state, args.b_run)
+A = Host(args.a, args.a_dir, args.a_ips, args.a_state, args.a_run, args.a_listen_log)
+B = Host(args.b, args.b_dir, args.b_ips, args.b_state, args.b_run, args.b_listen_log)
 ENV = dict(os.environ, FLEXVM_FAULTS="1", FLEXVM_ARTIFACTS=os.path.abspath(args.artifacts))
 listeners = {}
 
@@ -288,7 +290,7 @@ def start_listener(h, listen=None, extra=(), peer=None, wait=True):
     other = B if h is A else A
     for d in (h.state, h.run):
         os.makedirs(d, exist_ok=True)
-    lg = open(os.path.join(h.run, "listen.log"), "a")
+    lg = open(h.listen_log, "a")
     listeners[h.addr] = subprocess.Popen(
         [BIN, "--state", h.state, "--run", h.run, "listen", listen or h.addr, "--peer", peer or other.addr, "--vm-ips", h.ips,
          "--reserve", "512", "--prefix", args.prefix, *extra], stdout=lg, stderr=lg, env=ENV)
@@ -1865,7 +1867,7 @@ def reconcile_kill():
         return
     ip, gen, m, mig = got
     check(f"{what}: the VM runs on at B, md5 intact", where(n) == {B: "running"} and md5(B, n) == m, where(n))
-    b_log = os.path.join(B.run, "listen.log")
+    b_log = B.listen_log
     since = os.path.getsize(b_log) if os.path.exists(b_log) else 0
     fault(B, "status", 0)
     check(f"{what}: gc settles it as B's", wait_for(lambda: cli(A, "debug", "gc")[0] == 0 and not owed(A), 30), owed(A))

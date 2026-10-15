@@ -780,6 +780,7 @@ def faults():
         env["IMAGE_CACHE"] = os.path.join(WORK, "images")
     r = subprocess.run([sys.executable, os.path.join(ROOT, "scripts", "faults.py"), "--a", A.addr, "--b", B.addr,
                         "--a-state", A.state_dir, "--a-run", A.run_dir, "--b-state", B.state_dir, "--b-run", B.run_dir,
+                        "--a-listen-log", A.log, "--b-listen-log", B.log,
                         "--a-ips", f"{A.net}.2-{A.net}.60", "--b-ips", f"{B.net}.2-{B.net}.60",
                         "--no-listeners", "--bin", BIN, "--artifacts", ARTIFACTS, "--template", args.template,
                         "--ckpt-dir", os.path.join(WORK, "faults-ckpt"), *image, *args.faults.split()], timeout=1800, env=env)
