@@ -158,6 +158,7 @@ pub struct Proc {
     /// Held by `publish` from reading the VM's state to writing it.
     publishing: Mutex<()>,
     me: std::sync::Weak<Proc>,
+    announcer: Arc<Announcer>,
 }
 
 /// How regularly the controller ticks (every second when nothing holds it up).
@@ -214,6 +215,8 @@ impl Proc {
         let tap_prefix = format!("{prefix}{:x}t", ident.pid);
         let tap_owner = crate::host::tap_alias(&host.run, &ident);
         let spawner = Spawner::new(&paths.firecracker, &work, crate::socket::SocketRoot::new(&work)?, cgroup_root(), &tap_prefix, &tap_owner);
+        // Before any guest runs: without it no route reaches the peers.
+        let announcer = Announcer::start(|f| thread::Builder::new().spawn(f).map(drop), |peer, req| peer_call(peer, req.clone()).map(drop))?;
         Ok(Arc::new_cyclic(|me| Proc {
             host,
             paths,
@@ -254,6 +257,7 @@ impl Proc {
             growth: AtomicU64::new(0),
             publishing: Mutex::new(()),
             me: me.clone(),
+            announcer,
         }))
     }
 
@@ -766,27 +770,23 @@ impl Proc {
             }
             return;
         };
-        spawn_or_run(&format!("announce {ip}"), move || {
-            let here = || vm.state().local();
+        if vm.state().local() {
+            self.announcer.tell(peers, json!({"op": "route", "ip": ip.to_string(), "via": via.to_string(), "gen": gen, "rev": rev}));
+        }
+        let Some(dev) = dev else { return };
+        if let Err(e) = thread::Builder::new().spawn(move || {
             let arp = || {
-                if let Some(dev) = dev.as_deref().filter(|_| here()) {
-                    crate::net::gratuitous_arp(dev, ip).unwrap_or_else(|e| crate::log!("announce {ip}: {e}"));
+                if vm.state().local() {
+                    crate::net::gratuitous_arp(&dev, ip).unwrap_or_else(|e| crate::log!("announce {ip}: {e}"));
                 }
             };
             arp();
-            // The second ARP goes 200 ms after the first, however long a down or hung peer takes.
-            let second = Instant::now() + Duration::from_millis(200);
-            if here() {
-                let req = json!({"op": "route", "ip": ip.to_string(), "via": via.to_string(), "gen": gen, "rev": rev});
-                each_peer(peers, second, move |peer| {
-                    if let Err(e) = tell(peer, req.clone()) {
-                        crate::log!("announce {ip} to {peer}: {e}");
-                    }
-                });
-            }
-            thread::sleep(second.saturating_duration_since(Instant::now()));
+            // The second ARP 200 ms after the first.
+            thread::sleep(Duration::from_millis(200));
             arp();
-        });
+        }) {
+            crate::log!("announce {ip}: no thread for its ARPs: {e}");
+        }
     }
 
     pub fn drop_held_in(&self) {
@@ -2132,42 +2132,101 @@ fn each_peer(peers: Vec<String>, by: Instant, f: impl Fn(&str) + Send + Sync + '
     let (done, finished) = std::sync::mpsc::channel::<()>();
     for p in peers {
         let (f, done) = (f.clone(), done.clone());
-        spawn_or_run("a peer call", move || {
+        if let Err(e) = thread::Builder::new().spawn(move || {
             f(&p);
             drop(done);
-        });
+        }) {
+            crate::log!("cannot start a peer call: {e}");
+        }
     }
     drop(done);
     let _ = finished.recv_timeout(by.saturating_duration_since(Instant::now()));
 }
 
-#[cfg(test)]
-thread_local! {
-    /// Test hook: `spawn_or_run` on this thread finds no thread to start.
-    static REFUSE_SPAWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+/// The route announcements the peers have yet to take, the newest per peer: one thread of the process's own hands each
+/// to a thread of its own, retrying with backoff (a thread not had, a lookup or a call failed) until it is delivered or
+/// a newer one replaces it. Callers never wait on a peer.
+pub struct Announcer {
+    pending: Mutex<std::collections::HashMap<String, Pending>>,
+    wake: std::sync::Condvar,
+    spawn: fn(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+    call: fn(&str, &Value) -> Result<()>,
 }
 
-/// Runs `f` on a thread of its own or, when none can start (EAGAIN), here: a route message is never dropped.
-fn spawn_or_run(what: &str, f: impl FnOnce() + Send + 'static) {
-    let f = Arc::new(Mutex::new(Some(f)));
-    let g = f.clone();
-    #[cfg(test)]
-    let refused = REFUSE_SPAWN.get();
-    #[cfg(not(test))]
-    let refused = false;
-    let spawned = match refused {
-        true => Err(std::io::ErrorKind::WouldBlock.into()),
-        false => thread::Builder::new()
-            .spawn(move || {
-                let f = g.lock().unwrap().take();
-                f.into_iter().for_each(|f| f())
-            })
-            .map(drop),
-    };
-    if let Err(e) = spawned {
-        crate::log!("{what}: cannot start a thread ({e}); running it here");
-        let f = f.lock().unwrap().take();
-        f.into_iter().for_each(|f| f());
+struct Pending {
+    req: Value,
+    at: Instant,
+    backoff: Duration,
+    busy: bool,
+}
+
+const ANNOUNCE_RETRY: (Duration, Duration) = (Duration::from_millis(250), Duration::from_secs(10));
+
+impl Announcer {
+    fn start(spawn: fn(Box<dyn FnOnce() + Send>) -> std::io::Result<()>, call: fn(&str, &Value) -> Result<()>) -> std::io::Result<Arc<Announcer>> {
+        let a = Arc::new(Announcer { pending: Mutex::default(), wake: Default::default(), spawn, call });
+        let me = a.clone();
+        thread::Builder::new().name("announce".into()).spawn(move || me.run())?;
+        Ok(a)
+    }
+
+    /// `req` for each of `peers` (and none for any other), unless one of its address with a newer generation or
+    /// revision is pending.
+    fn tell(&self, peers: Vec<String>, req: Value) {
+        let newer = |old: &Value| old["ip"] == req["ip"] && (old["gen"].as_u64(), old["rev"].as_u64()) > (req["gen"].as_u64(), req["rev"].as_u64());
+        let mut p = self.pending.lock().unwrap();
+        p.retain(|peer, _| peers.contains(peer));
+        for peer in peers {
+            let fresh = Pending { req: req.clone(), at: Instant::now(), backoff: ANNOUNCE_RETRY.0, busy: false };
+            match p.get_mut(&peer) {
+                Some(e) if newer(&e.req) => {}
+                Some(e) => *e = Pending { busy: e.busy, ..fresh },
+                None => drop(p.insert(peer, fresh)),
+            }
+        }
+        self.wake.notify_all();
+    }
+
+    fn run(self: Arc<Self>) {
+        let mut p = self.pending.lock().unwrap();
+        loop {
+            let now = Instant::now();
+            for (peer, e) in p.iter_mut().filter(|(_, e)| !e.busy && e.at <= now) {
+                e.busy = true;
+                let (me, peer, req) = (self.clone(), peer.clone(), e.req.clone());
+                if let Err(err) = (self.spawn)(Box::new(move || {
+                    let r = (me.call)(&peer, &req);
+                    me.done(&peer, &req, r);
+                })) {
+                    Self::retry(e, &format!("no thread: {err}"));
+                }
+            }
+            let next = p.values().filter(|e| !e.busy).map(|e| e.at).min();
+            p = match next {
+                Some(at) => self.wake.wait_timeout(p, at.saturating_duration_since(Instant::now())).unwrap().0,
+                None => self.wake.wait(p).unwrap(),
+            };
+        }
+    }
+
+    /// A call of `req` to `peer` ended: delivered, it is no longer pending, unless a newer one replaced it meanwhile.
+    fn done(&self, peer: &str, req: &Value, r: Result<()>) {
+        let mut p = self.pending.lock().unwrap();
+        let Some(e) = p.get_mut(peer) else { return };
+        e.busy = false;
+        match r {
+            _ if e.req != *req => {}
+            Ok(()) => drop(p.remove(peer)),
+            Err(err) => Self::retry(e, &format!("{peer}: {err}")),
+        }
+        self.wake.notify_all();
+    }
+
+    fn retry(e: &mut Pending, why: &str) {
+        e.busy = false;
+        crate::log!("announce {} gen {}: {why}; trying again in {:?}", e.req["ip"].as_str().unwrap_or("?"), e.req["gen"], e.backoff);
+        e.at = Instant::now() + e.backoff;
+        e.backoff = (e.backoff * 2).min(ANNOUNCE_RETRY.1);
     }
 }
 
@@ -2277,33 +2336,40 @@ mod tests {
         assert!(took >= Duration::from_millis(200) && took < Duration::from_secs(2), "{took:?}");
     }
 
-    /// With no thread to be had, a route message is still sent: on the calling thread, to every peer.
+    /// An announcement waits out refused threads and failed lookups, and is delivered (the newest one) once both can be had.
     #[test]
-    fn a_refused_spawn_still_tells_the_peers() {
-        let (p, _root) = test_proc("refused-spawn");
-        let peers: Vec<_> = (0..2).map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap()).collect();
-        let cfg = crate::host::Config { peers: peers.iter().map(|l| l.local_addr().unwrap().to_string()).collect(), ..Default::default() };
-        std::fs::write(p.host.state.join("host.json"), serde_json::to_vec(&cfg).unwrap()).unwrap();
-        let heard = thread::spawn(move || {
-            peers
-                .iter()
-                .map(|l| {
-                    let (mut c, _) = l.accept().unwrap();
-                    let req = crate::util::recv_json(&mut BufReader::new(c.try_clone().unwrap())).unwrap().unwrap();
-                    writeln!(c, "{}", json!({"ok": true, "result": null})).unwrap();
-                    req
-                })
-                .collect::<Vec<_>>()
-        });
-        REFUSE_SPAWN.set(true);
-        let ran = Arc::new(AtomicBool::new(false));
-        let r = ran.clone();
-        spawn_or_run("test", move || r.store(true, Ordering::SeqCst));
-        assert!(ran.load(Ordering::SeqCst), "run here, at once");
-        tell_peers(&p.host, json!({"op": "route", "ip": "10.0.0.9", "gen": 3}));
-        REFUSE_SPAWN.set(false);
-        for req in heard.join().unwrap() {
-            assert_eq!(req["ip"], "10.0.0.9");
+    fn an_announcement_is_delivered_once_threads_and_its_lookup_can_be_had() {
+        use std::sync::atomic::AtomicUsize;
+        static SPAWNS: AtomicUsize = AtomicUsize::new(0);
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = format!("localhost:{}", l.local_addr().unwrap().port());
+        let a = Announcer::start(
+            |f| match SPAWNS.fetch_add(1, Ordering::SeqCst) {
+                0 | 1 => Err(std::io::ErrorKind::WouldBlock.into()),
+                _ => thread::Builder::new().spawn(f).map(drop),
+            },
+            |peer, req| match CALLS.fetch_add(1, Ordering::SeqCst) {
+                0 | 1 => Err(format!("DNS lookup of {peer}: cannot start a thread").into()),
+                _ => peer_call(peer, req.clone()).map(drop),
+            },
+        )
+        .unwrap();
+        let route = |gen: u64| json!({"op": "route", "ip": "10.0.0.9", "via": "10.1.0.1", "gen": gen, "rev": 0});
+        let t = Instant::now();
+        a.tell(vec![peer.clone()], route(3));
+        a.tell(vec![peer.clone()], route(4));
+        a.tell(vec![peer.clone()], route(2));
+        assert!(t.elapsed() < Duration::from_millis(100), "the caller does not wait");
+        let (mut c, _) = l.accept().unwrap();
+        let req = crate::util::recv_json(&mut BufReader::new(c.try_clone().unwrap())).unwrap().unwrap();
+        writeln!(c, "{}", json!({"ok": true, "result": null})).unwrap();
+        assert_eq!(req, route(4), "the newest generation");
+        assert!(SPAWNS.load(Ordering::SeqCst) >= 4 && CALLS.load(Ordering::SeqCst) >= 3);
+        let end = Instant::now() + Duration::from_secs(5);
+        while !a.pending.lock().unwrap().is_empty() {
+            assert!(Instant::now() < end, "delivered, no longer pending");
+            thread::sleep(Duration::from_millis(10));
         }
     }
 
