@@ -14,12 +14,17 @@ use std::time::{Duration, Instant};
 /// Threads copying unsaved pages into memory while a discard is held back.
 const SAVE_REST_THREADS: usize = 8;
 
-/// Up to this many ranges in a region are protected one by one without looking further; past it, see `Pager::freeze`.
-const PROTECT_RUNS: usize = 256;
-
-/// Merge protect ranges across gaps up to this many pages: one more protect call costs about as much as the kernel
-/// walking this many populated pages (about 19 µs a call, 70-90 ms per GiB populated, here).
+/// Merge protect ranges across gaps up to this many pages: a write-protect fault unprotects aligned blocks of up to a
+/// chunk (see `WP_SIZES`), so this keeps a chunk written all over to a call or two (about 6-9 µs a call here).
 const PROTECT_GAP: usize = 64;
+
+/// Past this many protect ranges in a region, they are merged across gaps 4 times as wide until they fit: 4096 calls
+/// cost 25-37 ms of pause, more than protecting a whole populated GiB in one call (3-23 ms here, #281), and a GiB merged
+/// at `PROTECT_GAP` stays below it. So only a larger region written in pages scattered all over pays the refaults that
+/// merging causes, and its pause stays bounded. Not across kept hot pages, though: a region ends with up to one more
+/// range than it has runs of kept pages, if that is more (hot pages need not be consecutive, so up to one more than
+/// `FLEXVM_HOT_MIB` holds pages: 16,385 at its default).
+pub(super) const PROTECT_MAX: usize = 4096;
 
 /// Pages a write-protect fault unprotects (and saves first, during a copy), at the least.
 const WP_BLOCK: usize = 16;
@@ -391,7 +396,8 @@ impl Pager {
         // Hot pages stay unprotected unless their block did not change since the last checkpoint.
         let prev = hot.as_mut().and_then(|h| h.prev.take());
         let hot_unchanged = hot.as_ref().map_or(0, |h| h.unchanged.len());
-        let keeps = |p: usize| hot.as_ref().is_some_and(|h| h.keeps(p));
+        // Ascending.
+        let kept: Vec<usize> = hot.iter().flat_map(|h| h.held.pages().iter().copied().filter(|&p| h.keeps(p))).collect();
         // Only populated ones: a page discarded since must be in a delta, as zero.
         let unchanged = |p: usize| hot.as_ref().is_some_and(|h| h.unchanged(p)) && pages.get(p) == PRESENT;
         let start = Instant::now();
@@ -400,21 +406,11 @@ impl Pager {
         // were unprotected.
         for m in self.mappings().iter().filter(|_| cow) {
             let (from, to) = m.span();
-            let mut ranges: Vec<(usize, usize)> = Vec::new();
-            for p in set_bits(&dirty).filter(|&p| p >= from && p < to && pages.get(p) == PRESENT && !keeps(p)) {
-                match ranges.last_mut() {
-                    Some((_, e)) if p <= *e + PROTECT_GAP && !(*e..p).any(keeps) => *e = p + 1,
-                    _ => ranges.push((p, p + 1)),
-                }
-            }
-            // Range by range, so that the pause grows with what was written rather than with what is populated; unless
-            // the calls would cost more than walking every populated page of the region once (the writes covered most
-            // of it).
-            let kept = hot.as_ref().is_some_and(|h| h.held.pages().iter().any(|&p| p >= from && p < to && h.keeps(p)));
-            if ranges.len() > PROTECT_RUNS && ranges.len() * PROTECT_GAP > pages.count(PRESENT, from, to) && !kept {
-                ranges = vec![(from, to)];
-            }
-            protected += self.protect(ranges, Some(&dirty))?;
+            // Range by range, not the whole region: a protect makes KVM drop its mappings of everything in the range
+            // (see `WP_CHUNK`), so the guest would refault every page it uses there, clean ones too, after the resume.
+            // That costs far more than the calls it spares (#281).
+            let dirty_here = set_bits(&dirty).filter(|&p| p >= from && p < to && pages.get(p) == PRESENT && kept.binary_search(&p).is_err());
+            protected += self.protect(protect_ranges(dirty_here, &kept), Some(&dirty))?;
         }
         let protect = start.elapsed();
         let out = match incremental {
@@ -437,9 +433,9 @@ impl Pager {
             }
         };
         if cow {
-            let mut kept = vec![0u64; dirty.len()];
-            hot.iter().flat_map(|h| h.held.pages().iter().filter(|&&p| h.keeps(p))).for_each(|&p| kept[p / 64] |= 1 << (p % 64));
-            *self.hot_kept.lock().unwrap() = kept;
+            let mut bits = vec![0u64; dirty.len()];
+            kept.iter().for_each(|&p| bits[p / 64] |= 1 << (p % 64));
+            *self.hot_kept.lock().unwrap() = bits;
             *self.hot_dirty.lock().unwrap() = dirty.clone();
         }
         let cow = cow.then(|| {
@@ -449,7 +445,6 @@ impl Pager {
         });
         // Unprotected, so dirty from the pause on.
         let held = hot.as_ref().map(|h| {
-            let kept: Vec<usize> = h.held.pages().iter().copied().filter(|&p| h.keeps(p)).collect();
             kept.iter().for_each(|&p| pages.mark_dirty(p));
             (kept.len(), h.held.clone())
         });
@@ -516,4 +511,43 @@ impl Pager {
     pub(super) fn wake(&self, page: usize) -> io::Result<()> {
         self.ioctl(UFFDIO_WAKE, &mut [self.addr(page)?, PAGE_SIZE as u64])
     }
+}
+
+/// The ranges that protect `pages` (ascending): merged across gaps of up to `PROTECT_GAP` pages, wider ones while there
+/// are more than `PROTECT_MAX`, never across a page of `kept` (ascending).
+pub(super) fn protect_ranges(pages: impl Iterator<Item = usize>, kept: &[usize]) -> Vec<(usize, usize)> {
+    // Whether `(p, q)` joins `last`, extending it: within `gap` pages of it, no kept page between. `k` walks `kept`
+    // along with the ranges, so a pass costs as many steps as there are ranges and kept pages.
+    let joins = |last: &mut (usize, usize), (p, q): (usize, usize), gap: usize, k: &mut usize| {
+        while kept.get(*k).is_some_and(|&x| x < last.1) {
+            *k += 1;
+        }
+        let joins = p <= last.1 + gap && kept.get(*k).is_none_or(|&x| x >= p);
+        if joins {
+            last.1 = q;
+        }
+        joins
+    };
+    let (mut gap, mut k) = (PROTECT_GAP, 0);
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for p in pages {
+        if !ranges.last_mut().is_some_and(|l| joins(l, (p, p + 1), gap, &mut k)) {
+            ranges.push((p, p + 1));
+        }
+    }
+    let span = ranges.first().zip(ranges.last()).map_or(0, |(f, l)| l.1 - f.0);
+    while ranges.len() > PROTECT_MAX && gap < span {
+        // In place: ranges only shrink in number.
+        (gap, k) = (gap * 4, 0);
+        let mut n = 0;
+        for i in 0..ranges.len() {
+            let r = ranges[i];
+            if n == 0 || !joins(&mut ranges[n - 1], r, gap, &mut k) {
+                ranges[n] = r;
+                n += 1;
+            }
+        }
+        ranges.truncate(n);
+    }
+    ranges
 }

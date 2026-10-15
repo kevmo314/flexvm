@@ -253,11 +253,6 @@ impl Pages {
         self.not_base(from, end).find(|&i| self.states[i].load(Ordering::Relaxed) == state).unwrap_or(end.min(self.len()))
     }
 
-    /// How many pages in `[from, end)` are in `state` (not BASE).
-    pub fn count(&self, state: u8, from: usize, end: usize) -> usize {
-        self.not_base(from, end).filter(|&i| self.states[i].load(Ordering::Relaxed) == state).count()
-    }
-
     /// Held while reading and applying uffd events; required by `discard`.
     pub fn removing(&self) -> RwLockWriteGuard<'_, ()> {
         self.events.write().unwrap()
