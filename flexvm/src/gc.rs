@@ -51,6 +51,8 @@ pub fn sweep_due(host: &Host) {
 /// slow sources cannot keep other processes from cleaning up local files.
 pub fn sweep(host: &Host) {
     local_cleanup(host);
+    // Its own nonblocking lock: a peer that is down holds up no local cleanup.
+    host.deliver_withdrawals();
     host.retire_migrations();
     host.settle_owed();
 }

@@ -5549,6 +5549,32 @@ def killed_migrated():
     check("suspended migrated: resumes on B with its data", where(n3) == {B: "running"} and md5(B, n3) == m3, where(n3))
     cleanup(n3)
     check("suspended migrated: its kill frees the address", wait_for(lambda: not lent(ip3), 15), addr(A, ip3))
+    # A home host that cannot be told at the time (down) hears on a later sweep: the withdrawal is recorded first.
+    n4 = "ft-killed-migrated-4"
+    setup(n4, mib=1)
+    ip4 = vms(A)[n4]["ip"]
+    ok(migrate(A, n4, B))
+    wait_released(B, n4)
+    pid, fc = vm_pid(B, n4), fc_pid(B, n4)
+    fault(A, "route_refuse", 60000)
+    os.kill(pid, signal.SIGKILL)
+    wait_for(lambda: not alive(pid) and not alive(fc), 10)
+    ok(cli_json(B, "debug", "gc"))
+    notice = os.path.join(B.state, "withdrawals", ip4)
+    check("killed migrated, home down: withdrawn on B, still lent on A, the notice kept",
+          addr(B, ip4).get("withdrawn") is True and lent(ip4) is not None and os.path.exists(notice), (addr(A, ip4), addr(B, ip4)))
+    fault(A, "route_refuse", 0)
+    # As a sweep would once its backoff passed.
+    n = json.load(open(notice))
+    n["next_ms"] = 0
+    json.dump(n, open(notice, "w"))
+    ok(cli_json(B, "debug", "gc"))
+    check("killed migrated, home back: a later sweep tells it, and it takes back its loan",
+          wait_for(lambda: not lent(ip4) and addr(A, ip4).get("withdrawn") is True, 15) and not os.path.exists(notice), (addr(A, ip4), os.path.exists(notice)))
+    n5 = "ft-killed-migrated-5"
+    ok(run(A, n5, ip=ip4))
+    check("killed migrated, home back: the address runs a new vm on A", where(n5) == {A: "running"}, where(n5))
+    cleanup(n5)
 
 
 def incoming_killed():

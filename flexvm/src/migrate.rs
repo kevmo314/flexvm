@@ -670,7 +670,7 @@ impl Proc {
         t.mark("template");
         // The source's next revision: past it, its resume after an abort outranks this location.
         let rev = req["rev"].as_u64().ok_or("missing rev")?.saturating_add(1);
-        let claim = self.host.claim_incoming(&self.host.lock()?, &name, ip, req["gen"].as_u64().unwrap_or(0), Some(rev))?;
+        let claim = self.host.claim_arrival(&self.host.lock()?, &name, ip, req["gen"].as_u64().unwrap_or(0), rev, mig)?;
         self.set_addr(claim);
         t.mark("claim_ip");
         let idle = self.spawner.take(None)?;
@@ -758,7 +758,7 @@ impl Proc {
                     t.mark("route");
                 }
                 self.arrived.lock().unwrap().as_mut().ok_or("no migration record")?.commit(&l)?;
-                // Only now its revision outranks the source's (`claim_incoming`).
+                // Only now its revision outranks the source's (`claim_arrival`).
                 if let Err(e) = self.advance(&l, 0) {
                     crate::log!("vm {name}: recording its revision: {e}");
                 }

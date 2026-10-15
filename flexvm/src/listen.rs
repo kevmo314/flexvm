@@ -501,7 +501,11 @@ fn lend(host: &Host, req: &Value) -> Result<Value> {
 
 /// Stale generations and revisions (see `host::Addr`) are ignored; an
 /// address a VM here holds keeps its local route.
+/// Test fault `route_refuse`: refused, as by a listener that is down.
 fn route(host: &Host, req: &Value) -> Result<Value> {
+    if fault("route_refuse") {
+        bail!("injected fault: route messages refused");
+    }
     let ip: Ipv4Addr = req["ip"].as_str().ok_or("missing ip")?.parse()?;
     let gen = req["gen"].as_u64().filter(|&g| g > 0).ok_or("route messages carry the address's generation")?;
     let via: Option<Ipv4Addr> = req["via"].as_str().map(|v| v.parse()).transpose()?;
