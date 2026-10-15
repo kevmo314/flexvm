@@ -52,17 +52,16 @@ fn incoming_header_is_checked() {
     check_incoming(&runs, &[], &regions).unwrap();
     check_incoming(&runs, &[0, 3, 16, 19], &regions).unwrap();
     for (preload, why) in [
-        (vec![u64::MAX], "not a remote page"),
-        (vec![0, u64::MAX], "not a remote page"),
-        (vec![20], "not a remote page"),
-        (vec![4], "not a remote page"),
-        (vec![7], "not a remote page"),
+        (vec![u64::MAX], "preload page 18446744073709551615 is not a remote page"),
+        (vec![0, u64::MAX], "preload page 18446744073709551615 is not a remote page"),
+        (vec![20], "preload page 20 is not a remote page"),
+        (vec![4], "preload page 4 is not a remote page"),
+        (vec![7], "preload page 7 is not a remote page"),
         (vec![3, 0], "out of order"),
         (vec![3, 3], "out of order"),
     ] {
         let e = check_incoming(&runs, &preload, &regions).unwrap_err().to_string();
         assert!(e.contains(why), "{preload:?}: {e}");
-        assert!(e.contains("preload page") || e.contains("out of order"), "{e}");
     }
     // Runs past guest memory, or that wrap, are refused whatever the preload list.
     for bad in [vec![(u64::MAX, 1, REMOTE)], vec![(u64::MAX - 1, 4, REMOTE)], vec![(6, 4, REMOTE)], vec![(0, u64::MAX, ZERO)]] {

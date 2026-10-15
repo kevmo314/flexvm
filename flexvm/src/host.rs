@@ -200,9 +200,10 @@ impl Host {
                 .and_then(|()| std::fs::write(&marker, id()?))
                 .map_err(root)?;
         }
+        // Only the run directory itself must be made here: a non-root user still reads one root made.
+        std::fs::create_dir_all(run).map_err(|e| named(run, e))?;
         for d in ["vms", "standby", "w"] {
-            let d = run.join(d);
-            std::fs::create_dir_all(&d).map_err(|e| named(&d, e))?;
+            let _ = std::fs::create_dir_all(run.join(d));
         }
         let canon = |d: &Path| d.canonicalize().map_err(|e| named(d, e));
         let (state, run) = (canon(state)?, canon(run)?);
@@ -1572,20 +1573,27 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let h = host("run-error");
-        let path = h.run.join("vms");
-        std::fs::remove_dir(&path).unwrap();
-        std::fs::write(&path, "").unwrap();
+        let base = h.state.parent().unwrap();
+        std::fs::remove_dir_all(&h.run).unwrap();
+        std::fs::write(&h.run, "").unwrap();
         let e = Host::open(&h.state, &h.run).err().unwrap().to_string();
-        assert!(e.contains(path.to_str().unwrap()), "{e}");
-        std::fs::remove_file(&path).unwrap();
+        assert!(e.contains(h.run.to_str().unwrap()), "{e}");
+        std::fs::remove_file(&h.run).unwrap();
         if unsafe { libc::geteuid() } != 0 {
-            std::fs::set_permissions(&h.run, std::fs::Permissions::from_mode(0o555)).unwrap();
+            let mode = |d: &Path, m| std::fs::set_permissions(d, std::fs::Permissions::from_mode(m)).unwrap();
+            mode(base, 0o555);
             let result = Host::open(&h.state, &h.run);
-            std::fs::set_permissions(&h.run, std::fs::Permissions::from_mode(0o755)).unwrap();
+            mode(base, 0o755);
             let e = result.err().unwrap().to_string();
-            assert!(e.contains(path.to_str().unwrap()) && e.contains("run flexvm as root to create it"), "{e}");
+            assert!(e.contains(h.run.to_str().unwrap()) && e.contains("run flexvm as root to create it"), "{e}");
+            // A run directory someone else made, without all its subdirectories, still opens.
+            std::fs::create_dir(&h.run).unwrap();
+            mode(&h.run, 0o555);
+            let result = Host::open(&h.state, &h.run);
+            mode(&h.run, 0o755);
+            result.unwrap();
         }
-        std::fs::remove_dir_all(h.state.parent().unwrap()).unwrap();
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

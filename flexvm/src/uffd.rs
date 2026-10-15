@@ -1014,8 +1014,9 @@ pub fn check_incoming(runs: &Runs, preload: &[u64], regions: &[(u64, u64)]) -> R
     if let Some(w) = preload.windows(2).find(|w| w[0] >= w[1]) {
         bail!("preload list out of order: page {} before {}", w[0], w[1]);
     }
-    if remote_among(runs, preload.iter().copied()).len() != preload.len() {
-        bail!("preload page is not a remote page");
+    let remote = remote_among(runs, preload.iter().copied());
+    if let Some(p) = preload.get(remote.iter().zip(preload).take_while(|(a, b)| a == b).count()) {
+        bail!("preload page {p} is not a remote page");
     }
     Ok(())
 }
