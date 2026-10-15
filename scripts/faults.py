@@ -871,7 +871,8 @@ def exec_background():
                 break
             buf += d
     check("exec bg: a resumable exec started", b"ready" in buf, buf[-200:])
-    stopped = wait_for(lambda: count("sleep 1002") == (0, "0"), 10)
+    # The guest's sweeper reads the knob only between its sweeps, which come a minute apart without it.
+    stopped = wait_for(lambda: count("sleep 1002") == (0, "0"), 90)
     check("exec bg: a disconnected exec's command is reclaimed", stopped, count("sleep 1002"))
     # A client killed outright (SIGKILL: no close) leaves its command running. Once the client has been
     # gone long enough (ten minutes; 3 s through the agent's test knob), the guest stops the command and
