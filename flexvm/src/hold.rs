@@ -161,7 +161,7 @@ impl Holder {
                 Ok(()) => self.gone.lock().unwrap().remove(&ip),
                 // Not held after all: its stragglers are still counted.
                 Err(_) => {
-                    self.held.lock().unwrap().remove(&ip);
+                    self.discard_hold(ip);
                     None
                 }
             };
@@ -172,6 +172,19 @@ impl Holder {
             report(ip, &self.dev, &g);
         }
         routed
+    }
+
+    /// Under `routes`; `rx` keeps the reader from queuing after removal.
+    fn discard_hold(&self, ip: Ipv4Addr) {
+        let _rx = self.rx.lock().unwrap();
+        if let Some(e) = self.held.lock().unwrap().remove(&ip) {
+            let dropped = e.q.lock().unwrap().discard();
+            if dropped > 0 {
+                let mut gone = self.gone.lock().unwrap();
+                let g = gone.entry(ip).or_insert(Gone { at: Instant::now(), moved: false, resent: 0, dropped: 0, reported: None });
+                g.dropped += dropped;
+            }
+        }
     }
 
     pub fn holding_for(&self, ip: Ipv4Addr, mig: u64) -> bool {
@@ -793,6 +806,44 @@ fn open_tun(dev: &str) -> std::result::Result<OwnedFd, (bool, crate::util::Error
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_hold_counts_queued_and_overflow_packets() {
+        let h = Holder {
+            dev: "test".into(),
+            ifindex: 0,
+            tun: std::fs::File::open("/dev/null").unwrap().into(),
+            held: Mutex::default(),
+            reading: AtomicBool::new(false),
+            routes: Mutex::new(()),
+            rx: Mutex::new(()),
+            gone: Mutex::default(),
+            resend: None,
+        };
+        let ip = Ipv4Addr::new(10, 100, 254, 9);
+        for existing in [false, true] {
+            if existing {
+                h.gone.lock().unwrap().insert(ip, Gone { at: Instant::now(), moved: true, resent: 2, dropped: 3, reported: None });
+            }
+            let e = Arc::new(Entry {
+                mig: 1,
+                q: Mutex::new(Queue { packets: VecDeque::from([vec![0; 20], vec![0; 20]]), bytes: 40, dropped: 4, ..Queue::default() }),
+            });
+            h.held.lock().unwrap().insert(ip, e.clone());
+            let _routes = h.routes.lock().unwrap();
+            h.discard_hold(ip);
+            assert!(h.entry(ip).is_none());
+            let g = h.gone.lock().unwrap()[&ip];
+            assert_eq!((g.resent, g.dropped), if existing { (2, 9) } else { (0, 6) });
+            assert_eq!(g.moved, existing);
+            let mut q = e.q.lock().unwrap();
+            assert!(q.packets.is_empty());
+            assert_eq!(q.bytes, 0);
+            assert_eq!(q.discard(), 0);
+            h.discard_hold(ip);
+            assert_eq!(h.gone.lock().unwrap()[&ip].dropped, g.dropped);
+        }
+    }
 
     /// Needs root: `sudo cargo test -- --ignored`. A sender that looked the route up before a
     /// release hands its packet to the device after it (#254), here by binding to the device:
