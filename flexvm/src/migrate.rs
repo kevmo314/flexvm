@@ -98,6 +98,11 @@ impl Proc {
             bail!("vm {} is still arriving; {}", vm.name, crate::vmproc::BUSY);
         }
         self.settle_arrival(&op, ARRIVAL_WAIT)?;
+        vm.can_leave()?;
+        if self.lent_here.load(Ordering::SeqCst) {
+            self.host.unlend(&self.host.lock()?, vm.ip, self.gen())?;
+            self.lent_here.store(false, Ordering::SeqCst);
+        }
         vm.template.verify(&self.paths, true)?;
         let settle = Instant::now();
         vm.settle_hotplug(settle + crate::lifecycle::SETTLE_WAIT)?;
@@ -116,7 +121,7 @@ impl Proc {
         let unthrottle = unthrottle.elapsed();
         let holder = self.holder().cloned();
         // Lent durably first: a crash with the outcome unknown must not hand the address out.
-        self.lent_here.store(self.host.lend(&self.host.lock()?, vm.ip, gen)?, Ordering::SeqCst);
+        self.lent_here.fetch_or(self.host.lend(&self.host.lock()?, vm.ip, gen)?, Ordering::SeqCst);
         self.drop_held_in();
         self.set_leaving(true);
         if let Err(e) = vm.leave(State::Source(mig)) {
@@ -297,8 +302,11 @@ impl Proc {
         // Running here again, so do the collapse pass and prefetch the save cut short.
         vm.back_here();
         self.release_app_log();
-        if self.lent_here.swap(false, Ordering::SeqCst) {
-            let _ = self.host.unlend(&l, vm.ip, gen);
+        if self.lent_here.load(Ordering::SeqCst) {
+            match self.host.unlend(&l, vm.ip, gen) {
+                Ok(()) => self.lent_here.store(false, Ordering::SeqCst),
+                Err(r) => eprintln!("vm {}: undoing its loan after an aborted migration: {r}", vm.name),
+            }
         }
         drop(l);
         self.set_leaving(false);
