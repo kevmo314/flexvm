@@ -87,7 +87,7 @@ pub fn sweep_every() -> Duration {
     knob().map_or(Duration::from_secs(60), |_| Duration::from_secs(1))
 }
 /// Output still read after the shell exits, as for the app.
-const DRAIN: Duration = Duration::from_secs(2);
+pub(crate) const DRAIN: Duration = Duration::from_secs(2);
 
 type Session = Arc<(Mutex<Output>, Condvar)>;
 pub type Sessions = Arc<Mutex<Table>>;

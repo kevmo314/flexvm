@@ -16,7 +16,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::proto::FRAME_LOST;
-use crate::{fail, kill_running, mem, msg, session::Output, spawn_watched, wait_exit, write_frame, Statuses, FRAME_STDOUT};
+use crate::session::{Output, DRAIN};
+use crate::{fail, kill_running, mem, msg, spawn_watched, wait_exit, write_frame, Statuses, FRAME_STDOUT};
 
 const CONF: &str = "/etc/flexvm/app.conf";
 const RING_BYTES: usize = 1 << 20;
@@ -33,11 +34,9 @@ enum State {
 struct App {
     state: State,
     output: Output,
-    /// The pid whose output pump last finished.
-    pumped: i32,
 }
 
-static APP: LazyLock<Mutex<App>> = LazyLock::new(|| Mutex::new(App { state: State::Idle, output: Output::default(), pumped: 0 }));
+static APP: LazyLock<Mutex<App>> = LazyLock::new(|| Mutex::new(App { state: State::Idle, output: Output::default() }));
 static CHANGED: Condvar = Condvar::new();
 
 impl App {
@@ -291,31 +290,49 @@ fn start(statuses: &Statuses) -> io::Result<i32> {
     }
     let c = parse_conf(&read_conf()?)?;
     let mut cmd = command(&c, &c.argv);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     if let Some(work) = mem::work_procs() {
         mem::enter(&mut cmd, work, true);
     }
     restrict(&mut cmd, &c);
-    let (mut child, _, token) = spawn_watched(&mut cmd, statuses, false).map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", c.argv[0])))?;
-    let pid = child.id() as i32;
-    app.state = State::Running(pid);
+    let (pid, _) = launch(&mut app, &mut cmd, statuses).map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", c.argv[0])))?;
     app.push(format!("flexvm-init: started {:?} as pid {pid}\n", c.argv).as_bytes());
-    drop(app);
-    let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
-    thread::spawn(move || {
-        crate::pump(stdout, stderr, |_, data| APP.lock().unwrap().push(data));
-        APP.lock().unwrap().pumped = pid;
-        CHANGED.notify_all();
-    });
+    Ok(pid)
+}
+
+/// Its supervisor (returned) logs output as an exec session's: until its exit and `DRAIN` more, then
+/// discarded, so descendants that hold the pipes never write into the log once it is marked exited.
+fn launch(app: &mut App, cmd: &mut Command, statuses: &Statuses) -> io::Result<(i32, thread::JoinHandle<()>)> {
+    let (mut child, exited, token) = spawn_watched(cmd.stdout(Stdio::piped()).stderr(Stdio::piped()), statuses, true)?;
+    let pid = child.id() as i32;
+    let Some(exited) = exited else { return Err(unwatched(statuses, pid, token)) };
+    app.state = State::Running(pid);
     let statuses = statuses.clone();
-    thread::spawn(move || {
-        let code = wait_exit(&statuses, token, None).unwrap_or(-1);
-        // Descendants may hold the app's pipes after it exits; never wait indefinitely.
-        let (mut app, _) = CHANGED.wait_timeout_while(APP.lock().unwrap(), Duration::from_secs(2), |a| a.pumped != pid).unwrap();
+    let supervisor = thread::spawn(move || {
+        crate::discard(crate::pump_until(child.stdout.take(), child.stderr.take(), Some(exited), DRAIN, |_, data| {
+            APP.lock().unwrap().push(data);
+            Duration::ZERO
+        }));
+        let code = wait_exit(&statuses, token, None).expect("no deadline");
+        let mut app = APP.lock().unwrap();
         app.state = State::Exited(code);
         app.push(format!("flexvm-init: pid {pid} exited with status {code}\n").as_bytes());
     });
-    Ok(pid)
+    Ok((pid, supervisor))
+}
+
+/// Without a pidfd (only out of fds or memory: guest kernels have had them since 5.3) its exit could go
+/// unnoticed while descendants hold the pipes, so the app is refused: its session is killed and reaped.
+fn unwatched(statuses: &Statuses, pid: i32, token: u64) -> io::Error {
+    // By group even if the leader exited at once and was reaped: no new process gets the group's id while
+    // a member lives, and once none does the pid comes back only after the pid space wraps, not since the spawn.
+    unsafe { libc::kill(-pid, libc::SIGKILL) };
+    if wait_exit(statuses, token, Some(Instant::now() + Duration::from_secs(2))).is_none() {
+        // Forgotten: reaped later, it is an orphan whose status is not kept.
+        let mut map = statuses.0.lock().unwrap();
+        map.running.retain(|_, t| *t != token);
+        map.finished.remove(&token);
+    }
+    io::Error::other("cannot open a pidfd to watch it")
 }
 
 /// Output from `offset` (clamped to the ring), then `<status> <next offset>`; with `follow`, until exit.
@@ -377,9 +394,77 @@ mod tests {
             .spawn()
             .unwrap();
         let mut out = [Vec::new(), Vec::new()];
-        crate::pump(child.stdout.take(), child.stderr.take(), |kind, data| out[usize::from(kind != FRAME_STDOUT)].extend_from_slice(data));
+        crate::pump_until(child.stdout.take(), child.stderr.take(), None, Duration::ZERO, |kind, data| {
+            out[usize::from(kind != FRAME_STDOUT)].extend_from_slice(data);
+            Duration::ZERO
+        });
         assert!(!child.wait().unwrap().success());
         assert_eq!(out, [vec![0; 131072], b"crash-tail\n".to_vec()]);
+    }
+
+    #[test]
+    fn descendants_holding_the_pipes_leave_nothing_behind() {
+        // Alone in a process: the reaper waits on every child, and this test owns APP.
+        const CHILD: &str = "FLEXVM_APP_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let name = "app::tests::descendants_holding_the_pipes_leave_nothing_behind";
+            assert!(Command::new(std::env::current_exe().unwrap()).args(["--exact", name]).env(CHILD, "1").status().unwrap().success());
+            return;
+        }
+        let statuses = Statuses::default();
+        let reaper = statuses.clone();
+        thread::spawn(move || crate::reap(reaper));
+        let count = |dir: &str| std::fs::read_dir(format!("/proc/self/{dir}")).unwrap().count();
+        let (tasks, fds) = (count("task"), count("fd"));
+        for _ in 0..3 {
+            let mut cmd = Command::new("/bin/sh");
+            cmd.args(["-c", "echo early; (sleep 3; echo late) & exit 0"]);
+            let begun = Instant::now();
+            let (_, supervisor) = launch(&mut APP.lock().unwrap(), &mut cmd, &statuses).unwrap();
+            supervisor.join().unwrap();
+            assert!(begun.elapsed() < DRAIN + Duration::from_millis(900), "{:?}", begun.elapsed());
+            assert!(matches!(APP.lock().unwrap().state, State::Exited(0)));
+            // Only the discarder's thread is added, however many starts.
+            assert_eq!(count("task"), tasks + 1);
+        }
+        // Once the descendants exit, their pipes are closed: only the discarder's wake pipe is left.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while count("fd") > fds + 2 {
+            assert!(Instant::now() < deadline, "{} fds, {fds} before", count("fd"));
+            thread::sleep(Duration::from_millis(50));
+        }
+        // Without a pidfd the app's whole group is killed, even once the leader was reaped, and its token cleared.
+        let refuse = |script: &str, reaped: bool| {
+            let mut cmd = Command::new("/bin/sh");
+            cmd.args(["-c", script]).process_group(0);
+            let (child, _, token) = spawn_watched(&mut cmd, &statuses, false).unwrap();
+            let pid = child.id() as i32;
+            thread::sleep(Duration::from_millis(100));
+            assert_eq!(statuses.0.lock().unwrap().finished.contains_key(&token), reaped);
+            assert!(unwatched(&statuses, pid, token).to_string().contains("pidfd"));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while unsafe { libc::kill(-pid, 0) } == 0 {
+                assert!(Instant::now() < deadline, "the app's group outlived it");
+                thread::sleep(Duration::from_millis(20));
+            }
+        };
+        refuse("sleep 100 & sleep 100", false);
+        refuse("sleep 100 & exit 7", true);
+        assert!(statuses.0.lock().unwrap().is_empty());
+        // Reaping that outlasts the wait (a pid past pid_max, never reaped): the token is forgotten.
+        let (pid, token) = (i32::MAX, crate::TOKENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        statuses.0.lock().unwrap().running.insert(pid, token);
+        assert!(unwatched(&statuses, pid, token).to_string().contains("pidfd"));
+        assert!(!statuses.0.lock().unwrap().reaped(pid, 137));
+        assert!(statuses.0.lock().unwrap().is_empty());
+        let app = APP.lock().unwrap();
+        let mut log = Vec::new();
+        while let Some((_, data)) = app.output.read_chunk(log.len() as u64) {
+            log.extend_from_slice(data);
+        }
+        let log = String::from_utf8(log).unwrap();
+        assert_eq!((log.matches("early").count(), log.matches("exited with status 0").count()), (3, 3), "{log}");
+        assert!(!log.contains("late"), "{log}");
     }
 
     #[test]
