@@ -792,8 +792,8 @@ def guest_calls():
 def exec_background():
     """An exec whose command leaves a background process holding its output returns once the
     shell exits (the process keeps running), and such execs never use up the guest agent's 64
-    session slots; nor do interrupted ones (SIGINT stops the command), session-less ones whose
-    client went away, or ones whose client was killed outright."""
+    session slots; nor do interrupted ones (SIGINT stops the command), or abandoned sessions
+    whose client disconnected or was killed outright."""
     n = "ft-exec-bg"
     ok(run(A, n))
     # Processes whose command line starts with `cmd` (the ^ keeps grep from counting itself).
@@ -858,24 +858,24 @@ def exec_background():
     stopped = wait_for(lambda: count("yes") == (0, "0"), 10)
     check("exec bg: a piped exec's command is stopped once its stdout breaks", stopped, count("yes"))
     check("exec bg: execs still start after the piped ones", sh(A, n, "echo hi") == (0, "hi"))
+    knob = "/run/flexvm-test-abandoned-running-secs"
+    check("exec bg: the abandoned-session wait is shortened", sh(A, n, f"echo 3 > {knob}") == (0, ""))
     with socket.socket(socket.AF_UNIX) as s:
         s.settimeout(30)
         s.connect(os.path.join(A.run, "vms", f"{n}.sock"))
-        s.sendall((json.dumps({"op": "exec", "cmd": "echo ready; sleep 1002"}) + "\n").encode())
+        s.sendall((json.dumps({"op": "exec", "session": os.urandom(16).hex(), "action": "start", "cmd": "echo ready; sleep 1002"}) + "\n").encode())
         buf = b""
         while b"ready" not in buf:
             d = s.recv(65536)
             if not d:
                 break
             buf += d
-    check("exec bg: a session-less exec started", b"ready" in buf, buf[-200:])
+    check("exec bg: a resumable exec started", b"ready" in buf, buf[-200:])
     stopped = wait_for(lambda: count("sleep 1002") == (0, "0"), 10)
-    check("exec bg: a session-less exec's command stops when its client goes", stopped, count("sleep 1002"))
+    check("exec bg: a disconnected exec's command is reclaimed", stopped, count("sleep 1002"))
     # A client killed outright (SIGKILL: no close) leaves its command running. Once the client has been
     # gone long enough (ten minutes; 3 s through the agent's test knob), the guest stops the command and
     # frees its slot, so 70 of these never use up the 64.
-    knob = "/run/flexvm-test-abandoned-running-secs"
-    check("exec bg: the abandoned-session wait is shortened", sh(A, n, f"echo 3 > {knob}") == (0, ""))
     killed = []
 
     # As `timeout -s KILL 2 flexvm exec ...`, whose own exit status differs between coreutils versions.
@@ -2484,7 +2484,7 @@ def pause_resume():
     m = setup(n)
     sh(A, n, "date -s @$(date +%s)")  # fresh VMs keep the template's clock; start from a right one
     check("pause: SIGTSTP pauses (the process keeps running)", pause(A, n) and alive(vm_pid(A, n)), vms(A)[n])
-    r = control(A, n, {"op": "exec", "cmd": "echo hi"})
+    r = control(A, n, {"op": "exec", "session": os.urandom(16).hex(), "action": "start", "cmd": "echo hi"})
     check("pause: exec refused while paused", not r["ok"] and "is paused" in r["error"], r)
     time.sleep(0.2)
     controller_quiet = vms(A)[n]["state"] == "paused"

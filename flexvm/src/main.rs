@@ -820,9 +820,7 @@ pub fn exec(host: &Host, name: &str, cmd: &str) -> Result<i32> {
             }
         };
         if let Err(e) = stop() {
-            let e = e.to_string();
-            let why = if e.contains("session still running") { "its guest agent is too old to stop it; rebuild the rootfs" } else { &e };
-            log!("flexvm: the command may still be running in vm {vm}: {why}");
+            crate::log!("flexvm: the command may still be running in vm {vm}: {e}");
         }
         util::exit(128 + sig);
     });

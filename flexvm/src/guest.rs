@@ -230,27 +230,9 @@ fn now() -> Result<String> {
     Ok(format!("{}.{:09}", now.as_secs(), now.subsec_nanos()))
 }
 
-/// The agent answered `unknown request` to part of the protocol flexvm requires.
-#[derive(Debug)]
-pub struct AgentTooOld(&'static str);
-
-impl std::fmt::Display for AgentTooOld {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "guest agent too old (no {}): rebuild the rootfs and its templates", self.0)
-    }
-}
-
-impl std::error::Error for AgentTooOld {}
-
-pub fn too_old(e: &Error) -> bool {
-    e.downcast_ref::<AgentTooOld>().is_some()
-}
-
 fn refused(verb: &'static str, m: &[u8]) -> Error {
-    if m.starts_with(b"unknown request") {
-        return AgentTooOld(verb).into();
-    }
-    format!("guest {}: {}", verb.to_lowercase(), String::from_utf8_lossy(m)).into()
+    let hint = if m.starts_with(b"unknown request") { "; rebuild the rootfs and its templates" } else { "" };
+    format!("guest {}: {}{hint}", verb.to_lowercase(), String::from_utf8_lossy(m)).into()
 }
 
 /// Address, nameserver and wall clock; doubles as the readiness check.
@@ -271,12 +253,9 @@ pub fn clock(uds: &Path, timeout: Duration) -> Result<f64> {
 }
 
 fn message(uds: &Path, line: &str, timeout: Duration) -> Result<String> {
-    let at = Instant::now() + timeout;
-    let s = crate::util::connect_unix(uds, timeout)?;
-    match read_frame(&mut handshake(By { s, at }, line)?)? {
-        Some((FRAME_MSG, m)) => Ok(String::from_utf8_lossy(&m).into_owned()),
-        Some((_, m)) => bail!("unexpected reply to {line}: {}", String::from_utf8_lossy(&m)),
-        None => bail!("guest closed the connection during {line}"),
+    match ask(uds, line, Instant::now() + timeout)? {
+        (FRAME_MSG, m) => Ok(String::from_utf8_lossy(&m).into_owned()),
+        (_, m) => bail!("unexpected reply to {line}: {}", String::from_utf8_lossy(&m)),
     }
 }
 
@@ -461,15 +440,15 @@ mod tests {
         let ip = "10.0.0.2".parse().unwrap();
         start(&path, ip, Some("1.1.1.1")).unwrap();
         let e = start(&path, ip, Some("1.1.1.1")).unwrap_err();
-        assert!(too_old(&e) && e.to_string().contains("too old (no START)"), "{e}");
+        assert!(e.to_string().contains("guest start: unknown request START; rebuild the rootfs and its templates"), "{e}");
         assert_eq!(clock(&path, TIMEOUT).unwrap(), -2.5);
-        assert!(too_old(&clock(&path, TIMEOUT).unwrap_err()));
+        assert!(clock(&path, TIMEOUT).unwrap_err().to_string().contains("guest clock: unknown request CLOCK; rebuild the rootfs and its templates"));
         for _ in 0..2 {
             let e = clock(&path, TIMEOUT).unwrap_err();
-            assert!(!too_old(&e), "{e}");
+            assert!(!e.to_string().contains("rebuild"), "{e}");
         }
         assert_eq!(forks(&path).unwrap(), 1);
-        assert!(too_old(&forks(&path).unwrap_err()));
+        assert!(forks(&path).unwrap_err().to_string().contains("guest forks: unknown request FORKS; rebuild the rootfs and its templates"));
         server.join().unwrap();
         std::fs::remove_file(path).unwrap();
     }
