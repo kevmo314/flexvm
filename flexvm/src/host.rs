@@ -706,12 +706,33 @@ impl Host {
     }
 
     /// A source whose migration did not happen runs its VM here again: its
-    /// death is the VM's once more.
-    pub fn stay(&self, l: &Locked, ip: Ipv4Addr) -> Result<()> {
+    /// death is the VM's once more. With `unlend`, the loan of that generation
+    /// (its own) goes in the same write, so no crash leaves one without the other.
+    /// Test fault `unlend_fail`: an unlend fails, leaving both.
+    pub fn stay(&self, l: &Locked, ip: Ipv4Addr, unlend: Option<u64>) -> Result<()> {
+        if unlend.is_some() && fault("unlend_fail") {
+            bail!("injected fault");
+        }
         let me = Ident::me();
         self.update(l, ip, true, |a| {
             if a.holder_id.as_ref() == Some(&me) {
                 a.leaving = None;
+            }
+            if let Some(gen) = unlend {
+                a.lent = a.lent.filter(|&lent| lent != gen);
+            }
+        })
+    }
+
+    /// A source's decision that its VM is its target's, durable before the
+    /// target may forget the migration (`done`), after which an unknown id
+    /// reads as aborted there: its claim here goes, `leaving` with it, and a
+    /// loan stays the target's (its own withdrawal takes it back).
+    pub fn hand_off(&self, l: &Locked, ip: Ipv4Addr) -> Result<()> {
+        let me = Ident::me();
+        self.update(l, ip, true, |a| {
+            if a.holder_id.as_ref() == Some(&me) {
+                (a.holder, a.holder_id, a.arriving, a.leaving) = (None, None, None, None);
             }
         })
     }
@@ -1029,11 +1050,28 @@ impl Host {
     /// Whether an outcome is still owed for the source process `by`: its target
     /// must keep its record (the source host asks about it), as if `by` lived.
     /// What cannot be read counts as owed.
+    /// So is one whose claim here is still `leaving`: dead, its outcome is yet
+    /// to be recorded as owed (`withdraw_dead`); alive, it has not decided.
     pub fn owes(&self, by: &Ident) -> bool {
-        match self.owed_ids() {
+        let recorded = match self.owed_ids() {
             Ok(ids) => ids.iter().any(|(_, path)| load::<Owed>(path).map_or(true, |o| o.is_some_and(|o| o.by == *by))),
             Err(e) => e.kind() != std::io::ErrorKind::NotFound,
-        }
+        };
+        recorded || self.leaving_by(by)
+    }
+
+    /// Whether `by` holds an address here as a migration source (`leaving`);
+    /// what cannot be read counts as such.
+    fn leaving_by(&self, by: &Ident) -> bool {
+        let entries = match std::fs::read_dir(self.state.join("addrs")) {
+            Ok(entries) => entries,
+            Err(e) => return e.kind() != std::io::ErrorKind::NotFound,
+        };
+        entries.into_iter().any(|e| {
+            let Ok(e) = e else { return true };
+            let Some(ip) = e.file_name().to_str().and_then(|n| n.parse::<Ipv4Addr>().ok()) else { return false };
+            load::<Addr>(&self.addr_path(ip)).map_or(true, |a| a.is_some_and(|a| a.leaving.is_some() && a.holder_id.as_ref() == Some(by)))
+        })
     }
 
     /// Asks each owed migration's target (five a pass, an unreachable one once): once
@@ -1125,7 +1163,12 @@ impl Host {
     /// doubt keeps the record: a source that still waits must find it.
     /// An interrupted `owe`'s `.ID.PID.tmp`, once its writer is gone.
     fn owed_debris(&self) {
-        for e in std::fs::read_dir(self.state.join("owed")).into_iter().flatten().flatten() {
+        self.write_debris("owed")
+    }
+
+    /// In `STATE/DIR`, an interrupted write's `.NAME.PID.tmp` (`util::write_file`), once its writer is gone.
+    fn write_debris(&self, dir: &str) {
+        for e in std::fs::read_dir(self.state.join(dir)).into_iter().flatten().flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
             let Some(pid) =
                 name.strip_prefix('.').and_then(|n| n.strip_suffix(".tmp")).and_then(|n| n.rsplit_once('.')).and_then(|(_, p)| p.parse::<u32>().ok())
@@ -1877,6 +1920,7 @@ impl Host {
         if flock(&lock, libc::LOCK_EX | libc::LOCK_NB).is_err() {
             return false;
         }
+        self.write_debris("withdrawals");
         let peers = self.config_now().peers;
         let notices: Vec<(Ipv4Addr, Notice)> = std::fs::read_dir(self.state.join("withdrawals"))
             .into_iter()
@@ -2564,7 +2608,7 @@ mod tests {
         // A source, at home and elsewhere: moving from its loan until it stays.
         let c = h.claim_new(&l, "vm", Some(home)).unwrap();
         assert!(!moving(home) && h.lend(&l, home, c.gen, 1, "t").unwrap() && moving(home));
-        h.stay(&l, home).unwrap();
+        h.stay(&l, home, None).unwrap();
         assert!(!moving(home) && h.addr(&l, home).unwrap().lent == Some(c.gen), "the loan is its maker's to undo");
         h.unlend(&l, home, c.gen).unwrap();
         let d = h.claim_incoming(&l, "vm2", away, 7, None).unwrap();
@@ -2573,7 +2617,7 @@ mod tests {
         let mut a = h.addr(&l, away).unwrap();
         a.holder_id = Some(Ident { start: 1, ..Ident::me() });
         h.put_addr(away, &a, false).unwrap();
-        h.stay(&l, away).unwrap();
+        h.stay(&l, away, None).unwrap();
         assert!(moving(away));
         h.release(&l, away, "vm2", None).unwrap();
         assert!(!moving(away), "released, it holds nothing");
@@ -2604,6 +2648,104 @@ mod tests {
         r.release(None, None).unwrap();
         let a = h.addr(&h.lock().unwrap(), x).unwrap();
         assert!(a.arriving.is_none() && a.lent.is_none(), "{a:?}");
+    }
+
+    #[test]
+    fn a_source_decides_its_hand_off_before_its_target_may_forget_it() {
+        let h = host("hand-off");
+        let x = ip("10.9.0.1");
+        let l = h.lock().unwrap();
+        let c = h.claim_new(&l, "vm", Some(x)).unwrap();
+        assert!(!h.owes(&Ident::me()));
+        assert!(h.lend(&l, x, c.gen, 7, "b").unwrap());
+        // Leaving, it has not decided: its target keeps the record it would ask about.
+        assert!(h.owes(&Ident::me()), "leaving counts as owed");
+        h.hand_off(&l, x).unwrap();
+        let a = h.addr(&l, x).unwrap();
+        assert!(a.holder.is_none() && a.leaving.is_none() && a.lent == Some(c.gen) && a.current(c.gen), "the loan stays the target's: {a:?}");
+        assert!(!h.owes(&Ident::me()), "decided: the target may forget it");
+        let gen = c.gen;
+        c.keep();
+        drop(l);
+        // Killed after the target forgot it: nothing is owed, nothing withdrawn.
+        h.withdraw_dead().unwrap();
+        let a = h.addr(&h.lock().unwrap(), x).unwrap();
+        assert!(a.current(gen) && a.lent == Some(gen) && !h.owed_path(7).exists());
+        // Killed before it decided: its target is asked (it kept its record, as `owes` says).
+        let y = ip("10.9.0.2");
+        let gone = dead_owner(&h, 999_999_961, &[]);
+        let a = Addr {
+            seen: 3,
+            lent: Some(3),
+            holder: Some("vm2".into()),
+            holder_id: Some(gone.clone()),
+            held: 3,
+            leaving: Some(Leaving { mig: 8, to: "b".into() }),
+            ..Addr::default()
+        };
+        h.put_addr(y, &a, false).unwrap();
+        assert!(h.owes(&gone));
+        h.withdraw_dead().unwrap();
+        assert!(h.owes(&gone) && h.owed_path(8).exists(), "owed until the target says");
+        // What cannot be read counts as leaving.
+        let other = dead_owner(&h, 999_999_962, &[]);
+        std::fs::write(h.state.join("addrs").join("10.9.0.3"), b"{").unwrap();
+        assert!(h.owes(&other));
+    }
+
+    #[test]
+    fn an_abort_undoes_leaving_and_its_loan_in_one_write() {
+        let h = host("stay");
+        let x = ip("10.9.0.1");
+        let l = h.lock().unwrap();
+        let c = h.claim_new(&l, "vm", Some(x)).unwrap();
+        assert!(h.lend(&l, x, c.gen, 7, "b").unwrap());
+        let before = std::fs::metadata(h.addr_path(x)).unwrap().ino();
+        h.stay(&l, x, Some(c.gen)).unwrap();
+        let a = h.addr(&l, x).unwrap();
+        assert!(a.leaving.is_none() && a.lent.is_none() && a.holder_id == Some(Ident::me()), "{a:?}");
+        assert_ne!(std::fs::metadata(h.addr_path(x)).unwrap().ino(), before, "replaced whole (one rename)");
+        // A failed write leaves both, never one: settled through the target should it die.
+        assert!(h.lend(&l, x, c.gen, 8, "b").unwrap());
+        let path = h.addr_path(x);
+        let dir = path.parent().unwrap();
+        let ro = |mode| std::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(mode)).unwrap();
+        if unsafe { libc::geteuid() } != 0 {
+            ro(0o555);
+            assert!(h.stay(&l, x, Some(c.gen)).is_err());
+            ro(0o777);
+            let a = h.addr(&l, x).unwrap();
+            assert!(a.leaving.is_some() && a.lent == Some(c.gen), "{a:?}");
+        }
+        c.keep();
+    }
+
+    #[test]
+    fn a_withdrawal_is_recorded_before_its_claim_goes() {
+        let mut h = host("enqueue-first");
+        h.cfg.peers = vec!["a".into()];
+        let x = ip("10.9.1.1");
+        let l = h.lock().unwrap();
+        h.put_addr(x, &Addr { seen: 4, holder: Some("vm".into()), holder_id: Some(Ident::me()), held: 4, ..Addr::default() }, false).unwrap();
+        // The notice cannot be written: nothing changes, so the claim (kept) still leads a sweep to it.
+        let notices = h.state.join("withdrawals");
+        std::fs::remove_dir(&notices).unwrap();
+        std::fs::write(&notices, b"").unwrap();
+        assert!(h.withdraw_noted(&l, x, 4).is_err());
+        let a = h.addr(&l, x).unwrap();
+        assert!(a.current(4) && a.holder_id == Some(Ident::me()), "{a:?}");
+        std::fs::remove_file(&notices).unwrap();
+        std::fs::create_dir(&notices).unwrap();
+        assert!(h.withdraw_noted(&l, x, 4).unwrap() && notices.join("10.9.1.1").exists());
+        // An interrupted notice write's temp file goes once its writer is gone, not before.
+        let (dead, live) = (notices.join(".10.9.1.2.999999971.tmp"), notices.join(format!(".10.9.1.3.{}.tmp", std::process::id())));
+        std::fs::write(&dead, b"{").unwrap();
+        std::fs::write(&live, b"{").unwrap();
+        drop(l);
+        while !h.deliver_withdrawals_with(8, 0, |_, _| Ok(())) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!dead.exists() && live.exists());
     }
 
     #[test]

@@ -116,14 +116,11 @@ impl Proc {
         self.set_leaving(true);
         if let Err(e) = vm.leave(State::Source(mig)) {
             self.set_leaving(false);
-            if let Err(r) = self.host.lock().and_then(|l| self.host.stay(&l, vm.ip)) {
-                crate::log!("vm {}: marking it here again after a refused migration: {r}", vm.name);
-            }
-            if self.lent_here.load(Ordering::SeqCst) {
-                match self.host.lock().and_then(|l| self.host.unlend(&l, vm.ip, gen)) {
-                    Ok(()) => self.lent_here.store(false, Ordering::SeqCst),
-                    Err(r) => crate::log!("vm {}: undoing its loan after a refused migration: {r}", vm.name),
-                }
+            // Leaving and its own loan undone in one write.
+            let unlend = self.lent_here.load(Ordering::SeqCst).then_some(gen);
+            match self.host.lock().and_then(|l| self.host.stay(&l, vm.ip, unlend)) {
+                Ok(()) => self.lent_here.store(false, Ordering::SeqCst),
+                Err(r) => crate::log!("vm {}: marking it here again and undoing its loan after a refused migration: {r}", vm.name),
             }
             return Err(e);
         }
@@ -293,14 +290,12 @@ impl Proc {
         // Running here again, so do the collapse pass and prefetch the save cut short.
         vm.back_here();
         self.release_app_log();
-        if let Err(r) = self.host.stay(&l, vm.ip) {
-            crate::log!("vm {}: marking it here again after an aborted migration: {r}", vm.name);
-        }
-        if self.lent_here.load(Ordering::SeqCst) {
-            match self.host.unlend(&l, vm.ip, gen) {
-                Ok(()) => self.lent_here.store(false, Ordering::SeqCst),
-                Err(r) => crate::log!("vm {}: undoing its loan after an aborted migration: {r}", vm.name),
-            }
+        // Leaving and its own loan undone in one write: a crash leaves both (settled
+        // through its target, `withdraw_dead`) or neither.
+        let unlend = self.lent_here.load(Ordering::SeqCst).then_some(gen);
+        match self.host.stay(&l, vm.ip, unlend) {
+            Ok(()) => self.lent_here.store(false, Ordering::SeqCst),
+            Err(r) => crate::log!("vm {}: marking it here again and undoing its loan after an aborted migration: {r}", vm.name),
         }
         // Past the revision its target took (and may have announced, if it committed).
         if let Err(r) = self.advance(&l, 2) {
@@ -371,7 +366,15 @@ impl Proc {
                 }
             }
             let op = p.op();
-            let _ = peer_call(&to, json!({"op": "migration", "mig": mig, "done": true}));
+            // Decided here durably first: once the target forgets its record, the
+            // migration would read as aborted there (`Host::hand_off`).
+            match p.host.lock().and_then(|l| p.host.hand_off(&l, p.vm().ip)) {
+                Ok(()) => drop(peer_call(&to, json!({"op": "migration", "mig": mig, "done": true}))),
+                Err(e) => crate::log!(
+                    "vm {}: recording that {to} has it: {e}; {to} is not told it is done, so it keeps its record for this host to ask about",
+                    p.vm().name
+                ),
+            }
             p.finish(&op, End::Moved(to), 0, None)
         });
     }

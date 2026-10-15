@@ -987,10 +987,13 @@ pub fn revoke(host: &Host, name: &str) -> Result<Result<()>> {
 fn free_address(host: &Host, name: &str, ip: Option<Ipv4Addr>, gen: Option<u64>) -> Result<()> {
     if let Some(ip) = ip {
         let l = host.lock()?;
-        host.release(&l, ip, name, None)?;
+        // Recorded before the claim goes; failing, the claim stays (a later kill finishes it).
         if let Some(gen) = gen {
             host.withdraw_noted(&l, ip, gen)?;
-            drop(l);
+        }
+        host.release(&l, ip, name, None)?;
+        drop(l);
+        if gen.is_some() {
             host.deliver_withdrawals();
         }
     }
