@@ -15,8 +15,13 @@ use libc::{
 use crate::bail;
 use crate::util::Result;
 
-pub const GATEWAY_MAC: &str = "06:00:a9:fe:01:01";
-pub const GUEST_MAC: &str = "06:00:ac:10:00:02";
+pub const GATEWAY_MAC: [u8; 6] = [0x06, 0x00, 0xa9, 0xfe, 0x01, 0x01];
+pub const GUEST_MAC: [u8; 6] = [0x06, 0x00, 0xac, 0x10, 0x00, 0x02];
+
+/// `aa:bb:...`, as Firecracker takes it.
+pub fn mac_string(mac: &[u8; 6]) -> String {
+    mac.map(|b| format!("{b:02x}")).join(":")
+}
 
 fn socket(domain: c_int, kind: c_int, protocol: c_int, what: &str) -> Result<OwnedFd> {
     let fd = unsafe { libc::socket(domain, kind | libc::SOCK_CLOEXEC, protocol) };
@@ -97,7 +102,7 @@ pub fn tap_fd_of(pid: u32, tap: &str) -> Result<OwnedFd> {
 
 /// Without an address on the tap, rp_filter (even loose) drops what the guest sends while
 /// its address is routed elsewhere (`hold`); a per-tap `rp_filter=0` loses to `all`=2.
-pub const TAP_ADDR: &str = "169.254.1.2/32";
+pub const TAP_ADDR: Ipv4Addr = Ipv4Addr::new(169, 254, 1, 2);
 
 /// Room for the packets a migration held, injected all at once (default 1000).
 pub const TAP_QUEUE: u32 = 4096;
@@ -131,22 +136,23 @@ pub fn create_tap(name: &str, owner: &str) -> Result<()> {
     let made = (|| -> Result<()> {
         let index = ifindex(name)?;
         let mut addr = [&[libc::AF_INET as u8, 32, 0, RT_SCOPE_HOST][..], &index.to_ne_bytes()].concat();
-        let local: Ipv4Addr = TAP_ADDR.split('/').next().unwrap_or_default().parse()?;
-        attr(&mut addr, IFA_LOCAL, &local.octets());
-        attr(&mut addr, IFA_ADDRESS, &local.octets());
+        attr(&mut addr, IFA_LOCAL, &TAP_ADDR.octets());
+        attr(&mut addr, IFA_ADDRESS, &TAP_ADDR.octets());
         netlink(RTM_NEWADDR, NLM_F_CREATE | NLM_F_REPLACE, &addr)?;
-        set_mac(index, &parse_mac(GATEWAY_MAC)?)?;
+        set_mac(index, &GATEWAY_MAC)?;
         let mut q = ifreq(name)?;
         q.ifr_ifru.ifru_metric = TAP_QUEUE as i32;
         let sock = socket(libc::AF_INET, libc::SOCK_DGRAM, 0, "socket")?;
         if unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCSIFTXQLEN as _, &q) } < 0 {
             bail!("txqueuelen of {name}: {}", std::io::Error::last_os_error());
         }
-        sysctl(&format!("net.ipv4.conf.{name}.arp_ignore"), "3")?;
+        conf("ipv4", name, "arp_ignore", "3")?;
         // The guest is IPv4 only. With IPv6, the host sends an MLD report out of the tap as
         // it comes up: dropped (tx_dropped) when no Firecracker reads it yet (an arrival's),
         // which reads as a frame lost on its way to the guest. As for the hold device.
-        let _ = sysctl(&format!("net.ipv6.conf.{name}.disable_ipv6"), "1");
+        let _ = conf("ipv6", name, "disable_ipv6", "1");
+        // Shut until `neighbour` names the VM's address: nothing the guest sends gets out.
+        guard(index, None).map_err(|e| format!("tap {name}: {e}"))?;
         set_link_up(name, true)
     })();
     if made.is_err() {
@@ -194,14 +200,15 @@ pub fn attach(ip: Ipv4Addr, tap: &str) -> Result<()> {
 /// tap's index.
 pub fn neighbour(ip: Ipv4Addr, tap: &str) -> Result<u32> {
     let ifindex = ifindex(tap)?;
-    let mac = parse_mac(GATEWAY_MAC)?;
-    if std::fs::read_to_string(format!("/sys/class/net/{tap}/address")).ok().and_then(|s| parse_mac(&s).ok()) != Some(mac) {
-        set_mac(ifindex, &mac)?;
+    if std::fs::read_to_string(format!("/sys/class/net/{tap}/address")).ok().and_then(|s| parse_mac(&s).ok()) != Some(GATEWAY_MAC) {
+        set_mac(ifindex, &GATEWAY_MAC)?;
     }
+    // Before the neighbour entry and the route: the tap passes only `ip`'s packets once it is `ip`'s.
+    guard(ifindex, Some(ip)).map_err(|e| format!("tap {tap}: {e}"))?;
     // struct ndmsg: family, pad, index, state, flags, type.
     let mut neigh = [&[libc::AF_INET as u8, 0, 0, 0][..], &ifindex.to_ne_bytes(), &NUD_PERMANENT.to_ne_bytes(), &[0, 0]].concat();
     attr(&mut neigh, NDA_DST, &ip.octets());
-    attr(&mut neigh, NDA_LLADDR, &parse_mac(GUEST_MAC)?);
+    attr(&mut neigh, NDA_LLADDR, &GUEST_MAC);
     netlink(RTM_NEWNEIGH, NLM_F_CREATE | NLM_F_REPLACE, &neigh)?;
     Ok(ifindex)
 }
@@ -226,6 +233,74 @@ fn plug_msg(ifindex: u32, action: i32) -> Vec<u8> {
     attr(&mut m, TCA_KIND, b"plug\0");
     attr(&mut m, TCA_OPTIONS, &[&action.to_ne_bytes()[..], &PLUG_LIMIT.to_ne_bytes()].concat());
     m
+}
+
+/// clsact's handle and parent, and its ingress hook's (`TC_H_MAKE(TC_H_CLSACT, TC_H_MIN_INGRESS)`).
+const CLSACT_HANDLE: u32 = 0xffff_0000;
+const TC_H_CLSACT: u32 = 0xffff_fff1;
+const CLSACT_INGRESS: u32 = 0xffff_fff2;
+const TCA_BPF_OPS_LEN: u16 = 4;
+const TCA_BPF_OPS: u16 = 5;
+const TCA_BPF_FLAGS: u16 = 8;
+const TCA_BPF_FLAG_ACT_DIRECT: u32 = 1;
+const TC_ACT_OK: u32 = 0;
+const TC_ACT_SHOT: u32 = 2;
+
+/// The guest is untrusted, and the host forwards what it sends (with a loose rp_filter, which
+/// the hold needs: `TAP_ADDR`), so the tap's ingress lets through only IPv4 from `ip` and ARP
+/// naming `ip` as its sender, nothing else (no other source, IPv6, VLAN or other ethertype);
+/// with no `ip`, nothing. ARP is held to the address too: the guest never needs another (its
+/// gateway's entry is pinned, and the host's for it is permanent), and a spoofed sender could
+/// only leave stale neighbour entries. A clsact qdisc (made once, kept by a create of one
+/// already there) holds a classic BPF filter in direct-action mode, which a replace swaps at
+/// once, with no gap; both go with the tap.
+fn guard(ifindex: u32, ip: Option<Ipv4Addr>) -> Result<()> {
+    let tc = |handle: u32, parent: u32, info: u32| {
+        [&[libc::AF_UNSPEC as u8, 0, 0, 0][..], &ifindex.to_ne_bytes(), &handle.to_ne_bytes(), &parent.to_ne_bytes(), &info.to_ne_bytes()].concat()
+    };
+    let mut qdisc = tc(CLSACT_HANDLE, TC_H_CLSACT, 0);
+    attr(&mut qdisc, TCA_KIND, b"clsact\0");
+    netlink(libc::RTM_NEWQDISC, NLM_F_CREATE, &qdisc).map_err(|e| format!("its clsact qdisc (sch_ingress): {e}"))?;
+    // Handle 1, priority 1, every protocol (in network order).
+    let mut filter = tc(1, CLSACT_INGRESS, 1 << 16 | u32::from((libc::ETH_P_ALL as u16).to_be()));
+    attr(&mut filter, TCA_KIND, b"bpf\0");
+    let ops = source_filter(ip);
+    let mut opts = Vec::new();
+    attr(&mut opts, TCA_BPF_OPS_LEN, &(ops.len() as u16).to_ne_bytes());
+    attr(&mut opts, TCA_BPF_OPS, &ops.iter().flat_map(|op| [&op.code.to_ne_bytes()[..], &[op.jt, op.jf], &op.k.to_ne_bytes()].concat()).collect::<Vec<u8>>());
+    attr(&mut opts, TCA_BPF_FLAGS, &TCA_BPF_FLAG_ACT_DIRECT.to_ne_bytes());
+    attr(&mut filter, TCA_OPTIONS, &opts);
+    netlink(libc::RTM_NEWTFILTER, NLM_F_CREATE | NLM_F_REPLACE, &filter).map_err(|e| format!("its source filter (cls_bpf): {e}"))?;
+    Ok(())
+}
+
+/// The classic BPF program of `guard`, run on frames from their Ethernet header on; a load
+/// past a frame's end would end it with 0 (pass), so lengths are checked first.
+fn source_filter(ip: Option<Ipv4Addr>) -> Vec<libc::sock_filter> {
+    let op = |code: u16, jt: u8, jf: u8, k: u32| libc::sock_filter { code, jt, jf, k };
+    let (ld_w, ld_h, ld_len, jeq, jge, ret) = (0x20, 0x28, 0x80, 0x15, 0x35, 0x06);
+    let Some(ip) = ip else { return vec![op(ret, 0, 0, TC_ACT_SHOT)] };
+    let ip = u32::from(ip);
+    // SKF_AD_OFF + SKF_AD_VLAN_TAG_PRESENT: the kernel strips a VLAN tag before ingress.
+    let vlan = 0xffff_f000 + 48;
+    // Jumps are relative to the next instruction; 13 drops, 14 passes.
+    vec![
+        op(ld_w, 0, 0, vlan),       // 0
+        op(jeq, 0, 11, 0),          // 1: tagged: drop
+        op(ld_h, 0, 0, 12),         // 2: ethertype
+        op(jeq, 0, 4, 0x0800),      // 3: not IPv4: 8
+        op(ld_len, 0, 0, 0),        // 4
+        op(jge, 0, 7, 14 + 20),     // 5: Ethernet and an IPv4 header
+        op(ld_w, 0, 0, 14 + 12),    // 6: source
+        op(jeq, 6, 5, ip),          // 7
+        op(jeq, 0, 4, 0x0806),      // 8: not ARP: drop
+        op(ld_len, 0, 0, 0),        // 9
+        op(jge, 0, 2, 14 + 28),     // 10: Ethernet and an Ethernet/IPv4 ARP body
+        op(ld_w, 0, 0, 14 + 14),    // 11: sender protocol address
+        op(jeq, 1, 0, ip),          // 12
+        op(ret, 0, 0, TC_ACT_SHOT), // 13
+        op(ret, 0, 0, TC_ACT_OK),   // 14
+    ]
 }
 
 /// Packets the host routes out of `tap` wait in its qdisc, in their order, until
@@ -485,9 +560,15 @@ pub fn parse_mac(s: &str) -> Result<[u8; 6]> {
     Ok(mac)
 }
 
-pub fn sysctl(key: &str, value: &str) -> Result<()> {
-    let path = format!("/proc/sys/{}", key.replace('.', "/"));
-    std::fs::write(&path, value).map_err(|e| format!("sysctl {key}: {e}"))?;
+/// `/proc/sys/net/{family}/conf/{dev}/{key}`, by its path: a sysctl key's dots would split a
+/// device name with one (`eth0.100`, a `--prefix` with a dot).
+pub fn conf(family: &str, dev: &str, key: &str, value: &str) -> Result<()> {
+    std::fs::write(format!("/proc/sys/net/{family}/conf/{dev}/{key}"), value).map_err(|e| format!("{family} {key} of {dev}: {e}"))?;
+    Ok(())
+}
+
+pub fn ip_forward() -> Result<()> {
+    std::fs::write("/proc/sys/net/ipv4/ip_forward", "1").map_err(|e| format!("ip_forward: {e}"))?;
     Ok(())
 }
 
@@ -621,7 +702,68 @@ mod tests {
         assert!(drops == 0 && res.is_ok(), "{res:?}");
         remove_plug(ifindex(&tap).unwrap()).unwrap();
         assert!(!root().contains("plug"), "{}", root());
+        // Shut from the start; an address, then another, replaces its one filter.
+        let filters = || String::from_utf8_lossy(&tc(&format!("filter show dev {tap} ingress")).stdout).into_owned();
+        assert!(filters().matches("direct-action").count() == 1 && filters().contains("bytecode '1,6 0 0 2'"), "{}", filters());
+        for ip in [Ipv4Addr::new(192, 0, 2, 7), Ipv4Addr::new(192, 0, 2, 8)] {
+            neighbour(ip, &tap).unwrap();
+            let f = filters();
+            assert!(f.matches("direct-action").count() == 1 && f.contains(&format!(" {},", u32::from(ip))), "{f}");
+        }
         delete_tap(&tap);
+    }
+
+    /// `source_filter`'s verdict on `frame` (with a VLAN tag stripped or not), by a classic BPF
+    /// interpreter of the instructions it uses, a load past the end returning 0 as the kernel's.
+    fn verdict(ip: Option<Ipv4Addr>, frame: &[u8], tagged: bool) -> u32 {
+        let prog = source_filter(ip);
+        let (mut a, mut pc) = (0u32, 0usize);
+        loop {
+            let op = &prog[pc];
+            pc += 1;
+            let jump = |taken: bool| if taken { op.jt as usize } else { op.jf as usize };
+            match op.code {
+                0x20 if op.k == 0xffff_f030 => a = tagged as u32,
+                0x20 | 0x28 => {
+                    let n = if op.code == 0x20 { 4 } else { 2 };
+                    let Some(b) = frame.get(op.k as usize..op.k as usize + n) else { return 0 };
+                    a = b.iter().fold(0, |a, &b| a << 8 | u32::from(b));
+                }
+                0x80 => a = frame.len() as u32,
+                0x15 => pc += jump(a == op.k),
+                0x35 => pc += jump(a >= op.k),
+                0x06 => return op.k,
+                c => panic!("unexpected op {c:#x}"),
+            }
+        }
+    }
+
+    #[test]
+    fn taps_pass_only_their_own_address() {
+        let (me, other) = (Ipv4Addr::new(10, 9, 0, 2), Ipv4Addr::new(10, 9, 0, 3));
+        let eth = |ty: u16| [&GATEWAY_MAC[..], &GUEST_MAC, &ty.to_be_bytes()].concat();
+        let ipv4 = |src: Ipv4Addr| [&eth(0x0800)[..], &[0x45, 0, 0, 28, 0, 0, 0, 0, 64, 17, 0, 0], &src.octets(), &[10, 9, 0, 9], &[0; 8]].concat();
+        let arp = |sender: Ipv4Addr| [&eth(0x0806)[..], &[0, 1, 8, 0, 6, 4, 0, 1], &GUEST_MAC, &sender.octets(), &[0; 6], &[169, 254, 1, 1]].concat();
+        let pass = |ip, frame: &[u8]| verdict(ip, frame, false) == TC_ACT_OK;
+        assert!(pass(Some(me), &ipv4(me)));
+        assert!(!pass(Some(me), &ipv4(other)), "another's source");
+        assert!(!pass(Some(other), &ipv4(me)), "an old address, once readdressed");
+        assert!(!pass(Some(me), &ipv4(Ipv4Addr::UNSPECIFIED)), "a DHCP client's");
+        assert!(pass(Some(me), &arp(me)));
+        assert!(!pass(Some(me), &arp(other)), "ARP with another's sender");
+        assert!(!pass(Some(me), &ipv4(me)[..33]), "short of an IPv4 header");
+        assert!(!pass(Some(me), &arp(me)[..41]), "short of an ARP body");
+        assert!(!pass(Some(me), &eth(0x0800)), "an Ethernet header alone");
+        assert!(!pass(Some(me), &[&eth(0x86dd)[..], &[0; 40]].concat()), "IPv6");
+        assert!(!pass(Some(me), &[&eth(0x88cc)[..], &[0; 40]].concat()), "another ethertype");
+        assert!(verdict(Some(me), &ipv4(me), true) == TC_ACT_SHOT, "VLAN tagged");
+        assert!(!pass(None, &ipv4(me)) && !pass(None, &arp(me)), "a tap with no address yet");
+    }
+
+    #[test]
+    fn macs_print_as_firecracker_takes_them() {
+        assert_eq!(mac_string(&GUEST_MAC), "06:00:ac:10:00:02");
+        assert_eq!(parse_mac(&mac_string(&GATEWAY_MAC)).unwrap(), GATEWAY_MAC);
     }
 
     #[test]

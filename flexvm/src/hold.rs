@@ -126,7 +126,7 @@ impl Holder {
                 return Ok(None);
             }
         };
-        let _ = crate::net::sysctl(&format!("net.ipv6.conf.{dev}.disable_ipv6"), "1");
+        let _ = crate::net::conf("ipv6", &dev, "disable_ipv6", "1");
         crate::net::set_link_up(&dev, true)?;
         let ifindex = crate::net::ifindex(&dev)?;
         let resend = match unsafe { libc::socket(libc::AF_INET, libc::SOCK_RAW | libc::SOCK_CLOEXEC, libc::IPPROTO_RAW) } {
@@ -470,6 +470,17 @@ impl Holder {
         if p.len() < 20 || p[0] >> 4 != 4 {
             return true;
         }
+        // #362: the kernel checks a packet's header checksum before it forwards it here, so a
+        // stale one means the header was rewritten in flight. A guest frame with
+        // VIRTIO_NET_HDR_F_NEEDS_CSUM whose csum range covers its own IP source makes checksum
+        // completion on egress overwrite the source after the tap's ingress filter passed the
+        // original; the source is forged but the header checksum no longer matches (one
+        // completion write touches one field, and the checksum covers the source, so the two
+        // cannot agree). Dropped before it is queued or re-sent, so `straggler`'s IPPROTO_RAW
+        // resend never recomputes a valid checksum over the forged source.
+        if !ipv4_header_csum_ok(p) {
+            return true;
+        }
         let ip = Ipv4Addr::new(p[16], p[17], p[18], p[19]);
         match self.entry(ip) {
             Some(e) => {
@@ -515,6 +526,24 @@ impl Holder {
             false => g.dropped += 1,
         }
     }
+}
+
+/// Whether `p`'s IPv4 header checksum is valid (the one's-complement sum over the header,
+/// including its own checksum field, is 0xffff). The header length is `p[0] & 0xf` 32-bit
+/// words; a truncated or under-length header is treated as invalid.
+fn ipv4_header_csum_ok(p: &[u8]) -> bool {
+    let ihl = (p[0] & 0xf) as usize * 4;
+    if ihl < 20 || p.len() < ihl {
+        return false;
+    }
+    let mut sum = 0u32;
+    for pair in p[..ihl].chunks_exact(2) {
+        sum += u32::from(u16::from_be_bytes([pair[0], pair[1]]));
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    sum == 0xffff
 }
 
 /// Logs `g`'s straggler counts, if any ("dropped N" is what loss accounting reads).
@@ -565,8 +594,8 @@ impl Injector {
             libc::setsockopt(fd.as_raw_fd(), SOL_PACKET, PACKET_QDISC_BYPASS, (&one as *const libc::c_int).cast(), std::mem::size_of::<libc::c_int>() as u32)
         };
         let mut header = [0u8; 14];
-        header[..6].copy_from_slice(&crate::net::parse_mac(crate::net::GUEST_MAC)?);
-        header[6..12].copy_from_slice(&crate::net::parse_mac(crate::net::GATEWAY_MAC)?);
+        header[..6].copy_from_slice(&crate::net::GUEST_MAC);
+        header[6..12].copy_from_slice(&crate::net::GATEWAY_MAC);
         header[12..].copy_from_slice(&[0x08, 0x00]);
         Ok(Injector { fd, tap: tap.into(), ifindex: crate::net::ifindex(tap)?, header, tx_dropped: tap_tx_dropped(tap) })
     }
@@ -843,6 +872,75 @@ mod tests {
             h.discard_hold(ip);
             assert_eq!(h.gone.lock().unwrap()[&ip].dropped, g.dropped);
         }
+    }
+
+    #[test]
+    fn a_rewritten_header_fails_its_checksum() {
+        // A UDP datagram 10.9.0.2 -> 10.9.0.8 (ports 12345 -> 54321), its header checksum filled in.
+        let mut p = vec![0x45, 0, 0, 29, 0, 1, 0, 0, 64, 17, 0, 0, 10, 9, 0, 2, 10, 9, 0, 8, 0x30, 0x39, 0xd4, 0x31, 0, 9, 0, 0, 0];
+        let csum = |p: &[u8]| -> u16 {
+            let mut s = 0u32;
+            for pair in p[..20].chunks_exact(2) {
+                s += u32::from(u16::from_be_bytes([pair[0], pair[1]]));
+            }
+            while s >> 16 != 0 {
+                s = (s & 0xffff) + (s >> 16);
+            }
+            !(s as u16)
+        };
+        let c = csum(&p).to_be_bytes();
+        p[10..12].copy_from_slice(&c);
+        assert!(ipv4_header_csum_ok(&p), "a well-formed header passes");
+        // Checksum completion overwrote the low two bytes of the source (#362): the header
+        // checksum is now stale, so it no longer verifies.
+        let mut forged = p.clone();
+        forged[14] = 0x00;
+        forged[15] = 0x63;
+        assert!(!ipv4_header_csum_ok(&forged), "a rewritten source no longer matches the checksum");
+        assert!(!ipv4_header_csum_ok(&p[..19]), "a truncated header is rejected");
+    }
+
+    #[test]
+    fn read_one_drops_a_rewritten_header() {
+        // A held entry for the destination, and the reader fed from a pipe standing in for the tun.
+        let mut fds = [0 as libc::c_int; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (r, w) = (fds[0], fds[1]);
+        let h = Holder {
+            dev: "test".into(),
+            ifindex: 0,
+            tun: unsafe { OwnedFd::from_raw_fd(r) },
+            held: Mutex::default(),
+            reading: AtomicBool::new(false),
+            routes: Mutex::new(()),
+            rx: Mutex::new(()),
+            gone: Mutex::default(),
+            resend: None,
+        };
+        let dst = Ipv4Addr::new(10, 9, 0, 8);
+        h.held.lock().unwrap().insert(dst, Arc::new(Entry { mig: 1, q: Mutex::default() }));
+        let mut p = vec![0x45u8, 0, 0, 29, 0, 1, 0, 0, 64, 17, 0, 0, 10, 9, 0, 2, 10, 9, 0, 8, 0x30, 0x39, 0xd4, 0x31, 0, 9, 0, 0, 0];
+        let mut sum = 0u32;
+        for pair in p[..20].chunks_exact(2) {
+            sum += u32::from(u16::from_be_bytes([pair[0], pair[1]]));
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        p[10..12].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+        let queued = || h.entry(dst).unwrap().q.lock().unwrap().packets.len();
+        let write = |p: &[u8]| assert_eq!(unsafe { libc::write(w, p.as_ptr().cast(), p.len()) }, p.len() as isize);
+        let mut buf = vec![0u8; 2048];
+        write(&p);
+        h.read_one(&mut buf);
+        assert_eq!(queued(), 1, "a valid packet is queued");
+        // Checksum completion overwrote the source low byte (#362): now dropped, not queued or straggled.
+        let mut forged = p.clone();
+        forged[15] ^= 0xff;
+        write(&forged);
+        h.read_one(&mut buf);
+        assert_eq!(queued(), 1, "a rewritten-header packet is dropped");
+        unsafe { libc::close(w) };
     }
 
     /// Needs root: `sudo cargo test -- --ignored`. A sender that looked the route up before a

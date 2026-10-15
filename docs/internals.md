@@ -14,7 +14,7 @@ migration protocol are in [process-per-vm.md](process-per-vm.md).
 | Start | Every VM is a **UFFD restore of a template snapshot** into a pre-spawned, pre-cgrouped Firecracker. The template's recorded working set is copied in bulk; everything else is faulted in lazily from a shared, sparse template image. **Standby VMs** are already restored and paused, so `run` is usually just a resume. |
 | Migration | **Post-copy**: the target gets everything ready first (template, address, a Firecracker with the template's VM structure already built); then pause, save vCPU and device state only (~20–200 KiB), load it and resume on the target, then the target's pager fetches pages from the paused source on fault and in the background. The source releases the VM once every page has arrived, and never resumes it once the target may own it. |
 | Pressure | If a VM needs to grow and the host would drop below `--reserve`, or the host is already below it, that VM is migrated to a peer with room. |
-| Network | Each VM has its own IPv4 /32 routed to a per-VM tap. The address moves with the VM, so open TCP connections survive migration. See below. |
+| Network | Each VM has its own IPv4 /32 routed to a per-VM tap. The address moves with the VM, so open TCP connections survive migration. The tap's ingress (a clsact classic BPF filter) passes only IPv4 from that /32 and ARP naming it, so a guest cannot spoof another's address; it follows the address on a readdress, restore or migration. See below. |
 | Container images | `flexvm template NAME --image REF` builds the root filesystem from an OCI/Docker image; flexvm-init runs and supervises its entrypoint. See below. |
 
 ## Memory

@@ -1371,9 +1371,9 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
     // Blocked first: every thread from here on (the output relays too) inherits it.
     let signals = crate::util::block_signals(&SIGNALS);
     crate::util::output::guard()?;
-    let _ = crate::net::sysctl("net.ipv4.ip_forward", "1");
+    let _ = crate::net::ip_forward();
     if let Some(dev) = &host.cfg.announce_dev {
-        if let Err(e) = crate::net::sysctl(&format!("net.ipv4.conf.{dev}.proxy_arp"), "1") {
+        if let Err(e) = crate::net::conf("ipv4", dev, "proxy_arp", "1") {
             crate::log!("WARNING: proxy ARP on {dev}: {e}");
         }
     }
