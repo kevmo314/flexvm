@@ -782,7 +782,7 @@ mod tests {
         let live = std::thread::spawn(move || {
             let (c, _) = live.accept().unwrap();
             let req = crate::util::recv_json(&mut BufReader::new(&c)).unwrap().unwrap();
-            assert_eq!(req["generation"], "default");
+            assert_eq!(req["generation"], "a");
             send_json(&mut &c, &json!({"claiming": true})).unwrap();
             send_json(&mut &c, &json!({"ok": true, "result": "live"})).unwrap();
         });
