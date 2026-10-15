@@ -49,7 +49,6 @@ pub(super) struct Written {
     pub(super) map: Vec<u8>,
     pub(super) data: u64,
     pub(super) zero: u64,
-    pub(super) sums: Vec<u32>,
 }
 
 const BASE: u8 = 0;
@@ -215,21 +214,18 @@ pub(super) fn write_pages(template: &Template, src: &dyn GuestPages, runs: &Runs
             *done[k].lock().unwrap() = Some(unit);
         }
     };
+    let work = || work().inspect_err(|_| failed.store(true, Ordering::Relaxed));
     let threads = threads.min(units.len()).max(1);
     std::thread::scope(|s| {
-        // A failed spawn must not panic (that aborts with the VM paused): stop the rest and report it.
-        let mut spawned: Result<()> = Ok(());
-        let handles: Vec<_> = (0..threads)
-            .map_while(|_| {
-                let h = std::thread::Builder::new().spawn_scoped(s, || work().inspect_err(|_| failed.store(true, Ordering::Relaxed)));
-                h.map_err(|e| (failed.store(true, Ordering::Relaxed), spawned = Err(e.into()))).ok()
-            })
-            .collect();
-        let joined = handles.into_iter().try_for_each(|h| h.join().unwrap());
-        spawned.and(joined)
+        // Helpers as many as can be had (a failed spawn must not panic, which aborts with
+        // the VM paused): this thread works too, so the copy goes on with fewer.
+        let helpers: Vec<_> = (1..threads).map_while(|_| std::thread::Builder::new().spawn_scoped(s, work).ok()).collect();
+        let here = work();
+        helpers.into_iter().map(|h| h.join().unwrap()).fold(here, Result::and)
     })?;
     let data = placed.into_inner();
-    let mut w = Written { map: MAGIC.to_vec(), data, zero: 0, sums: vec![0; data as usize] };
+    let mut sums = vec![0u32; data as usize];
+    let mut w = Written { map: MAGIC.to_vec(), data, zero: 0 };
     let mut map: Vec<[u64; 4]> = Vec::new();
     let mut push = |page: u64, count: u64, kind: u64, at: u64| {
         if count == 0 {
@@ -255,7 +251,7 @@ pub(super) fn write_pages(template: &Template, src: &dyn GuestPages, runs: &Runs
                     push((u.first + i) as u64, 1, kind as u64, at);
                     at += (kind as u64 == DATA) as u64;
                 }
-                w.sums[u.at as usize..u.at as usize + u.sums.len()].copy_from_slice(&u.sums);
+                sums[u.at as usize..u.at as usize + u.sums.len()].copy_from_slice(&u.sums);
             }
             continue;
         }
@@ -271,6 +267,6 @@ pub(super) fn write_pages(template: &Template, src: &dyn GuestPages, runs: &Runs
     out.file.set_len(data * PAGE_SIZE as u64)?;
     let words = [map.len() as u64, data].into_iter().chain(map.into_iter().flatten());
     w.map.extend(words.flat_map(u64::to_le_bytes));
-    w.map.extend(w.sums.iter().flat_map(|s| s.to_le_bytes()));
+    w.map.extend(sums.iter().flat_map(|s| s.to_le_bytes()));
     Ok(w)
 }

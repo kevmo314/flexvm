@@ -164,6 +164,7 @@ impl Vm {
     /// admitted (`granted`), then what it holds and still pages in beyond
     /// that (`sizes`), if admitted within `ADMIT_WAIT` (refused, or not
     /// answered by then, it stays at its mark until the watcher admits a step).
+    /// An arrival's was admitted before its commit (`Proc::admit_arrival`).
     pub fn start_limit(&self, granted: u64, (need, cap): (u64, u64), host: &crate::host::Host) {
         self.limit.start(granted, cap);
         let more = need.saturating_sub(granted);

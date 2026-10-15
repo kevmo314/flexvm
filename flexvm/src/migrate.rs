@@ -486,7 +486,12 @@ impl Proc {
             let pages: Vec<u64> = hdr.preload.into_owned();
             // Before anything counts or walks them: a bad page index would otherwise overflow, or hang the preload.
             crate::uffd::check_incoming(&runs, &pages, &prepared.2.regions).map_err(|e| format!("bad migration header: {e}"))?;
-            *self.sizes.lock().unwrap() = Some(arrival_sizes(&runs, &prepared.0.template(), req["plugged_mib"].as_u64()));
+            let sizes = arrival_sizes(&runs, &prepared.0.template(), req["plugged_mib"].as_u64());
+            // The guest ran on while this side prepared: what it pulls now is admitted
+            // before anything is seeded or loaded, else refused while the source can resume.
+            self.admit_arrival(sizes, arrival_floor(req), deadline)?;
+            crate::host::stall("admitted_stall");
+            *self.sizes.lock().unwrap() = Some(sizes);
             let state = read_vec(&mut r, hdr.vmstate_len, MAX_VMSTATE)?;
             t.mark("recv_state");
             self.app_log.store(hdr.app_log, Ordering::SeqCst);
@@ -672,8 +677,7 @@ impl Proc {
         let by = serde_json::from_value(req["source_ident"].clone()).ok();
         let ip: Ipv4Addr = req["ip"].as_str().ok_or("missing ip")?.parse()?;
         // Before the record (fsynced) and the claim: a refusal leaves nothing to undo.
-        let floor = if req["evict"] == true { crate::host::Floor::EvictMark } else { crate::host::Floor::Reserve };
-        self.admit_start(req["rss_mib"].as_u64().unwrap_or(0), None, floor)?;
+        self.admit_start(req["rss_mib"].as_u64().unwrap_or(0), None, arrival_floor(req))?;
         *self.arrived.lock().unwrap() = Some(self.host.mig_begin(mig, &source.addr, by, Some(ip))?);
         let tpl = Template::open_id(&self.paths, req["template"].as_str().ok_or("missing template")?, req["id"].as_str().ok_or("missing template id")?)?;
         t.mark("template");
@@ -804,6 +808,14 @@ fn arrival_sizes(runs: &Runs, tpl: &Template, plugged: Option<u64>) -> (u64, u64
     let remote: u64 = runs.iter().filter(|r| r.2 == crate::uffd::REMOTE).map(|r| r.1).sum();
     let meta = &tpl.meta;
     ((remote * crate::util::PAGE_SIZE as u64) >> 20, meta.mem_mib + plugged.unwrap_or(meta.max_mib - meta.mem_mib).min(meta.max_mib - meta.mem_mib))
+}
+
+/// What an arrival's admission leaves available: the eviction mark for one moved by eviction.
+fn arrival_floor(req: &Value) -> crate::host::Floor {
+    match req["evict"] == true {
+        true => crate::host::Floor::EvictMark,
+        false => crate::host::Floor::Reserve,
+    }
 }
 
 /// Whether the host at `addr` (a listener's) is this one, routes and all.

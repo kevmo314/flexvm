@@ -309,6 +309,25 @@ impl Proc {
         Ok(())
     }
 
+    /// An arrival's final footprint, from the runs its source sent once
+    /// paused (`sizes`: MiB to page in, the guest's size), admitted on top
+    /// of what its start was (from the source's earlier RSS): the held grant
+    /// grows by the difference, so the top-up `start_limit` makes once it
+    /// runs has nothing left to ask. Refused, nothing changes.
+    pub fn admit_arrival(&self, sizes: (u64, u64), floor: crate::host::Floor, deadline: Instant) -> Result<()> {
+        let granted = self.granted.load(Ordering::SeqCst);
+        let more = arrival_more(granted, sizes);
+        if more == 0 {
+            return Ok(());
+        }
+        self.host
+            .grow_hold(&self.held_grant, more, floor, Some(deadline))
+            .map_err(|e| format!("its memory grew to {} MiB since it was admitted here for {granted} MiB: {e}", sizes.0))?;
+        self.granted.fetch_add(more, Ordering::SeqCst);
+        crate::log!("vm {}: admitted {more} MiB more: it grew to {} MiB since its preflight", self.name(), sizes.0);
+        Ok(())
+    }
+
     pub(crate) fn release_hold(&self) {
         drop(self.held_grant.lock().unwrap().take());
     }
@@ -1610,6 +1629,13 @@ pub fn cgroup_root() -> Option<PathBuf> {
     }
 }
 
+/// What an arrival admitted `granted` MiB still needs for (`need` MiB to
+/// page in, of a guest of `cap`): its allowance, short of what the guest
+/// can hold (its memory mark stops there), less what it has.
+fn arrival_more(granted: u64, (need, cap): (u64, u64)) -> u64 {
+    crate::limit::allowance(need).min(cap.max(need)).saturating_sub(granted)
+}
+
 /// None if it cannot be read: never taken for 0 (pressure). Test fault `no_meminfo`.
 pub fn host_available_mib() -> Option<u64> {
     if fault("no_meminfo") {
@@ -2167,6 +2193,28 @@ mod tests {
         ] {
             assert_eq!(has_controller(controllers, "memory"), memory, "{controllers:?}");
             assert_eq!(has_controller(controllers, "cpu"), cpu, "{controllers:?}");
+        }
+    }
+
+    /// An arrival admitted for its source's RSS at preflight is admitted the
+    /// rest of what it pulls, short of the guest's size: then what it is
+    /// admitted covers what it pages in, and nothing is asked twice.
+    #[test]
+    fn an_arrival_is_admitted_what_it_grew_by() {
+        use crate::limit::allowance;
+        // Grew from 256 MiB to 2 GiB of a 4 GiB guest: its allowance, less what it had.
+        let granted = allowance(256);
+        assert_eq!(arrival_more(granted, (2048, 4096)), allowance(2048) - granted);
+        // Shrank, or the same: nothing more.
+        assert_eq!(arrival_more(granted, (100, 4096)), 0);
+        assert_eq!(arrival_more(allowance(2048), (2048, 4096)), 0);
+        // Never past the guest's size, yet at least what it pulls.
+        assert_eq!(arrival_more(granted, (4000, 4096)), 4096 - granted);
+        assert_eq!(arrival_more(0, (4096, 4096)), 4096);
+        // What `start_limit` then tops up (need less granted) is nothing.
+        for need in [0, 1, 256, 1000, 2048, 4096] {
+            let more = arrival_more(granted, (need, 4096));
+            assert!(granted + more >= need, "{need}");
         }
     }
 

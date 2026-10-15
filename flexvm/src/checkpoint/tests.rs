@@ -364,8 +364,8 @@ fn staging_is_private_never_overwrites_and_cleans_up() {
 }
 
 /// The page map as built before BASE runs were pushed whole: a page at a time.
-fn per_page_map(tpl: &Template, guest: &Guest, runs: &Runs, explicit: bool) -> (Vec<[u64; 4]>, u64) {
-    let (mut map, mut zero, mut at): (Vec<[u64; 4]>, u64, u64) = (Vec::new(), 0, 0);
+fn per_page_map(tpl: &Template, guest: &Guest, runs: &Runs, explicit: bool) -> (Vec<[u64; 4]>, u64, Vec<u32>) {
+    let (mut map, mut zero, mut at, mut sums): (Vec<[u64; 4]>, u64, u64, Vec<u32>) = (Vec::new(), 0, 0, Vec::new());
     let mut push = |page: usize, kind: u64, at: u64| {
         let kind = match kind {
             ZERO | DATA => kind,
@@ -380,16 +380,20 @@ fn per_page_map(tpl: &Template, guest: &Guest, runs: &Runs, explicit: bool) -> (
     };
     for &(first, count, state) in runs {
         for p in (first..first + count).map(|p| p as usize) {
-            let kind = match state {
-                REMOTE => classify(tpl, p, &guest.0[p]).0 as u64,
-                P_ZERO if tpl.has_data(p) => ZERO,
-                _ => P_BASE as u64,
+            let (kind, sum) = match state {
+                REMOTE => classify(tpl, p, &guest.0[p]),
+                P_ZERO if tpl.has_data(p) => (ZERO as u8, 0),
+                _ => (P_BASE, 0),
             };
+            let kind = kind as u64;
             push(p, kind, if state == REMOTE { at } else { 0 });
-            at += (kind == DATA) as u64;
+            if kind == DATA {
+                sums.push(sum);
+                at += 1;
+            }
         }
     }
-    (map, zero)
+    (map, zero, sums)
 }
 
 #[test]
@@ -426,11 +430,11 @@ fn whole_base_runs_build_the_per_page_map() {
         }
         let explicit = round % 2 == 1;
         let w = write_pages(&tpl, &guest, &runs, &pages_file(&dir.join(format!("p{round}"))), 1, explicit).unwrap();
-        let (map, zero) = per_page_map(&tpl, &guest, &runs, explicit);
+        let (map, zero, sums) = per_page_map(&tpl, &guest, &runs, explicit);
         let mut want = MAGIC.to_vec();
         let words = [map.len() as u64, w.data].into_iter().chain(map.into_iter().flatten());
         want.extend(words.flat_map(u64::to_le_bytes));
-        want.extend(w.sums.iter().flat_map(|s| s.to_le_bytes()));
+        want.extend(sums.iter().flat_map(|s| s.to_le_bytes()));
         assert!(w.map == want && w.zero == zero, "round {round}: runs {runs:?}");
         fs::remove_file(dir.join(format!("p{round}"))).unwrap();
     }
