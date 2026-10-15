@@ -629,6 +629,13 @@ pub fn wait_signal(set: &libc::sigset_t) -> i32 {
 /// reach of whatever stops the caller's: a systemd unit's restart or stop
 /// (`KillMode=control-group`), logind's `KillUserProcesses`.
 pub fn spawn_self<S: AsRef<std::ffi::OsStr>>(args: &[S], log: &std::fs::File, fd3: RawFd, env: &[(&str, &str)]) -> io::Result<()> {
+    let mut child = spawn_self_child(args, log, fd3, env)?;
+    std::thread::spawn(move || child.wait());
+    Ok(())
+}
+
+/// Like `spawn_self`, but the caller owns termination and reaping.
+pub fn spawn_self_child<S: AsRef<std::ffi::OsStr>>(args: &[S], log: &std::fs::File, fd3: RawFd, env: &[(&str, &str)]) -> io::Result<std::process::Child> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::process::CommandExt;
     let cgroups = crate::vmproc::cgroup_root().map(|r| r.join("vm-").as_os_str().as_bytes().to_vec());
@@ -651,9 +658,7 @@ pub fn spawn_self<S: AsRef<std::ffi::OsStr>>(args: &[S], log: &std::fs::File, fd
             Ok(())
         });
     }
-    let mut child = cmd.spawn()?;
-    std::thread::spawn(move || child.wait());
-    Ok(())
+    cmd.spawn()
 }
 
 /// `PREFIX` `PID` `-` `START` `SUFFIX` NUL in `buf`, without allocating

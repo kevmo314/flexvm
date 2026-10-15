@@ -185,24 +185,40 @@ fn refill_by(host: &Host, template: &str, wait: bool) -> Result<usize> {
         }
         let (r, w) = std::os::unix::net::UnixStream::pair()?;
         let args = ["--state".as_ref(), args[0], "--run".as_ref(), args[1], "run".as_ref(), "--standby".as_ref(), "--template".as_ref(), args[2]];
-        crate::util::spawn_self(&args, &log, w.as_raw_fd(), &[("FLEXVM_NOTIFY_FD", "3")])?;
+        let mut child = crate::util::spawn_self_child(&args, &log, w.as_raw_fd(), &[("FLEXVM_NOTIFY_FD", "3")])?;
         drop(w);
-        let _ = crate::util::readable(&r, by.saturating_duration_since(Instant::now()));
+        wait_locked(&r, &mut child, by)?;
         drop(stop);
-        ready.push(BufReader::new(r));
+        std::thread::spawn(move || child.wait());
+        ready.push(BufReader::new(crate::util::By { s: r, at: Instant::now() + READY_TIMEOUT }));
     }
     let started = ready.len();
     for mut r in ready {
-        let mut reply = crate::util::recv_json(&mut r)?;
-        if reply.as_ref().is_some_and(|v| v["locked"] == json!(true)) {
-            reply = crate::util::recv_json(&mut r)?;
-        }
-        let reply = reply.ok_or("a standby vm failed to start (see its log)")?;
+        let reply = crate::util::recv_json(&mut r)?.ok_or("a standby vm failed to start (see its log)")?;
         if reply["ok"] != json!(true) {
             bail!("a standby vm failed to start: {}", reply["error"]);
         }
     }
     Ok(started)
+}
+
+/// Never let relief pass an unlisted live child, including on a partial or invalid reply.
+fn wait_locked(r: &UnixStream, child: &mut std::process::Child, by: Instant) -> Result<()> {
+    // Do not read ahead into the readiness reply: it has a separate deadline.
+    let mut r = BufReader::with_capacity(1, crate::util::By { s: r, at: by });
+    let result = crate::util::recv_json(&mut r).and_then(|reply| {
+        if reply.as_ref().is_some_and(|v| v["locked"] == json!(true)) {
+            Ok(())
+        } else {
+            Err("a standby vm failed to acknowledge its lock (see its log)".into())
+        }
+    });
+    if result.is_err() {
+        // The unreaped child's pid cannot be reused. Even EOF can precede its exit.
+        let _ = child.kill();
+        child.wait()?;
+    }
+    result
 }
 
 /// Where what standby loads of a template touch is saved, for migrations to preload: in `host.run`/standby.
@@ -445,6 +461,8 @@ pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a refill holds relief off for each standby it starts: its grant, then its lock file.
 const LOCKED_TIMEOUT: Duration = Duration::from_secs(5);
+/// Restore, reseed and settle, bounded independently of publishing the lock.
+const READY_TIMEOUT: Duration = Duration::from_secs(60);
 const LATE: Duration = Duration::from_millis(250);
 const CLAIM_TIMEOUT: Duration = Duration::from_secs(60);
 const SETTLE: Duration = Duration::from_millis(50);
@@ -509,6 +527,54 @@ fn wait_for_reseed(vsock: &std::path::Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unacknowledged_children_are_killed_and_reaped_before_relief() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let root = std::env::temp_dir().join(format!("flexvm-standby-locked-{}", std::process::id()));
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        for reply in ["", "{\"locked\":", "{\"locked\":false}\n"] {
+            let stop = Flock::new(stop_lock(&host).unwrap(), libc::LOCK_SH).unwrap();
+            let (r, mut w) = UnixStream::pair().unwrap();
+            std::io::Write::write_all(&mut w, reply.as_bytes()).unwrap();
+            let mut child = std::process::Command::new("sleep").arg("60").spawn().unwrap();
+            let pid = child.id();
+            let relief_host = host.clone();
+            let relief = std::thread::spawn(move || {
+                let _stop = Flock::new(stop_lock(&relief_host).unwrap(), libc::LOCK_EX).unwrap();
+                assert!(live(&relief_host, "default").is_empty());
+                assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists(), "relief missed a live child");
+            });
+            let start = Instant::now();
+            let error = wait_locked(&r, &mut child, start + Duration::from_millis(100)).unwrap_err();
+            assert_eq!(child.try_wait().unwrap().unwrap().signal(), Some(libc::SIGKILL));
+            assert!(start.elapsed() < Duration::from_secs(1));
+            drop(stop);
+            relief.join().unwrap();
+            if !reply.ends_with('\n') {
+                assert_eq!(error.downcast_ref::<std::io::Error>().unwrap().kind(), std::io::ErrorKind::TimedOut);
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn readiness_has_a_deadline_after_a_valid_lock_acknowledgement() {
+        let (r, mut w) = UnixStream::pair().unwrap();
+        send_json(&mut w, &json!({"locked": true})).unwrap();
+        // A partial readiness reply must not extend its deadline either.
+        std::io::Write::write_all(&mut w, b"{\"ok\":").unwrap();
+        let mut child = std::process::Command::new("sleep").arg("60").spawn().unwrap();
+        wait_locked(&r, &mut child, Instant::now() + Duration::from_secs(1)).unwrap();
+        assert!(child.try_wait().unwrap().is_none());
+        let start = Instant::now();
+        let mut r = BufReader::new(crate::util::By { s: r, at: start + Duration::from_millis(100) });
+        assert!(crate::util::recv_json(&mut r).is_err());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
 
     #[test]
     fn stopped_standbys_share_one_handshake_budget_and_a_live_one_after_them_wins() {
