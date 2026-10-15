@@ -213,12 +213,19 @@ impl Args {
 
 /// A VM's command's statuses are its own: flexvm's failures there exit 125.
 fn main() {
+    // Queued log lines go out before a panic's message and its abort.
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |p| {
+        util::flush_log(util::LOG_FLUSH);
+        default(p)
+    }));
     let (args, error) = Args::parse_partly(std::env::args().skip(1));
     let vm = matches!(args.positional.first().map(String::as_str), Some("run" | "resume" | "restore"));
     if let Err(e) = error.map_or_else(|| real_main(&args), Err) {
         crate::log!("flexvm: {e}");
-        std::process::exit(if vm { vmproc::FAILED } else { 1 });
+        util::exit(if vm { vmproc::FAILED } else { 1 });
     }
+    util::exit(0)
 }
 
 /// Flags every command takes.
@@ -346,7 +353,7 @@ fn real_main(args: &Args) -> Result<()> {
             )
         }
         Some("ls") => list(&open_host(args)?, args.has("json")),
-        Some("exec") => std::process::exit(exec(&open_host(args)?, name, &args.rest.join(" "))?),
+        Some("exec") => util::exit(exec(&open_host(args)?, name, &args.rest.join(" "))?),
         Some("kill") => kill(&open_host(args)?, name),
         Some("checkpoint") => {
             let dir = std::path::absolute(arg2.ok_or("checkpoint needs NAME DIR")?)?;
@@ -543,7 +550,7 @@ fn follow(mut conn: BufReader<std::os::unix::net::UnixStream>, id: host::Ident) 
         });
     }
     let reply = recv_json(&mut conn).ok().flatten();
-    std::process::exit(reply.and_then(|r| r["exit"].as_i64()).map_or(vmproc::FAILED, |c| c as i32))
+    util::exit(reply.and_then(|r| r["exit"].as_i64()).map_or(vmproc::FAILED, |c| c as i32))
 }
 
 fn kill(host: &Host, name: &str) -> Result<()> {

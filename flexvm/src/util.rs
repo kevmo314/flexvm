@@ -15,17 +15,73 @@ macro_rules! bail {
     ($($arg:tt)*) => { return Err(format!($($arg)*).into()) };
 }
 
-/// Writes a diagnostic line to stderr, ignoring write errors (a closed or full log pipe)
-/// that make `eprintln!` panic. The line goes out in one write, so lines from other
-/// threads or processes sharing the pipe don't interleave with it.
+/// Queues a diagnostic line for stderr without blocking (`log_line`).
 #[macro_export]
 macro_rules! log {
     ($($arg:tt)*) => {{
-        use std::io::Write as _;
         let mut line = format!($($arg)*);
         line.push('\n');
-        let _ = std::io::stderr().lock().write_all(line.as_bytes());
+        $crate::util::log_line(line);
     }};
+}
+
+/// Lines queued for the log writer, written and dropped (`log_line`).
+static LOG_QUEUED: AtomicUsize = AtomicUsize::new(0);
+static LOG_DONE: AtomicUsize = AtomicUsize::new(0);
+static LOG_DROPPED: AtomicUsize = AtomicUsize::new(0);
+
+/// Hands `line` to this process's log writer, a thread started on first use
+/// that writes each line to stderr in one write (so lines from other processes
+/// sharing the pipe don't interleave with it), ignoring write errors. A stalled
+/// stderr never blocks the caller, who may hold the host lock or a pager's
+/// state: past 1024 queued lines a line is dropped, and the writer reports how
+/// many when it next gets through. Lines from one thread keep their order.
+pub fn log_line(line: String) {
+    use std::sync::mpsc::{sync_channel, SyncSender};
+    static QUEUE: std::sync::OnceLock<Option<SyncSender<String>>> = std::sync::OnceLock::new();
+    let queue = QUEUE.get_or_init(|| {
+        let (tx, rx) = sync_channel::<String>(1024);
+        let writer = move || {
+            for line in rx {
+                let mut err = io::stderr().lock();
+                let dropped = LOG_DROPPED.swap(0, Ordering::SeqCst);
+                if dropped > 0 {
+                    let _ = err.write_all(format!("flexvm: {dropped} log lines dropped: stderr was blocked\n").as_bytes());
+                }
+                let _ = err.write_all(line.as_bytes());
+                LOG_DONE.fetch_add(1, Ordering::SeqCst);
+            }
+        };
+        std::thread::Builder::new().name("log".into()).spawn(writer).ok().map(|_| tx)
+    });
+    LOG_QUEUED.fetch_add(1, Ordering::SeqCst);
+    match queue {
+        Some(tx) => match tx.try_send(line) {
+            Ok(()) => return,
+            Err(_) => drop(LOG_DROPPED.fetch_add(1, Ordering::SeqCst)),
+        },
+        // No thread to spare: written here.
+        None => drop(io::stderr().lock().write_all(line.as_bytes())),
+    }
+    LOG_DONE.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Waits up to `timeout` for the lines queued so far to be written, before
+/// the process exits: a stalled stderr does not hold the exit up past it.
+pub fn flush_log(timeout: Duration) {
+    let (queued, deadline) = (LOG_QUEUED.load(Ordering::SeqCst), Instant::now() + timeout);
+    while LOG_DONE.load(Ordering::SeqCst) < queued && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// How long an exiting process waits for its queued log lines (`flush_log`).
+pub const LOG_FLUSH: Duration = Duration::from_millis(300);
+
+/// Exits with `code` once the queued log lines are written (`flush_log`).
+pub fn exit(code: i32) -> ! {
+    flush_log(LOG_FLUSH);
+    std::process::exit(code)
 }
 
 /// One bounded counter slot, released on drop.
@@ -1227,6 +1283,7 @@ pub mod output {
     /// reaches its target if it can. No output lock is taken (a thread may
     /// hold stdout's for good); what std still buffers, exit flushes if free.
     pub fn drain() {
+        super::flush_log(super::LOG_FLUSH);
         let deadline = Instant::now() + STALL;
         let null = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
         if null >= 0 {
