@@ -1183,6 +1183,76 @@ mod tests {
         assert_eq!(&got, b"\0\0\0\x03one\0\0\0\x05three");
     }
 
+    /// Needs root: `sudo cargo test -- --ignored`. A TSO frame the kernel's TCP puts on a tap
+    /// opened as Firecracker opens one (a 12-byte virtio-net header, checksum and TSO4 offload)
+    /// is cut into segments that carry the stream as sent, each valid (#411). The test answers
+    /// the host's SYN itself, as a guest would.
+    #[test]
+    #[ignore]
+    fn a_kernel_tso_frame_is_cut_into_valid_segments() {
+        let (tap, ip) = (format!("tso{:x}t0", std::process::id()), Ipv4Addr::new(10, 100, 254, 11));
+        crate::net::create_tap(&tap, "test").unwrap();
+        let fd = unsafe { OwnedFd::from_raw_fd(libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC)) };
+        let mut req = crate::net::ifreq(&tap).unwrap();
+        req.ifr_ifru.ifru_flags = (libc::IFF_TAP | libc::IFF_NO_PI | libc::IFF_VNET_HDR) as libc::c_short;
+        let hdr: libc::c_int = 12;
+        unsafe {
+            assert_eq!(libc::ioctl(fd.as_raw_fd(), libc::TUNSETIFF, &req), 0);
+            assert_eq!(libc::ioctl(fd.as_raw_fd(), 0x4004_54d8 /* TUNSETVNETHDRSZ */, &hdr), 0);
+            assert_eq!(libc::ioctl(fd.as_raw_fd(), 0x4004_54d0 /* TUNSETOFFLOAD */, 0x3 as libc::c_ulong /* CSUM, TSO4 */), 0);
+        }
+        crate::net::set_link_up(&tap, true).unwrap();
+        crate::net::attach(ip, &tap).unwrap();
+        let mut buf = vec![0u8; 70000];
+        let mut next = |what: &dyn Fn(&[u8]) -> bool| loop {
+            assert!(crate::util::readable(&fd, Duration::from_secs(5)).unwrap(), "no frame came");
+            let n = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+            if n > 0 && what(&buf[..n as usize]) {
+                break buf[..n as usize].to_vec();
+            }
+        };
+        let tcp = |f: &[u8]| f.len() > 12 + 14 + 40 && f[12 + 12..12 + 14] == [8, 0] && f[12 + 14 + 9] == 6;
+        let data: Vec<u8> = (0..60000u32).map(|i| (i % 251) as u8).collect();
+        let sent = data.clone();
+        let sender = std::thread::spawn(move || {
+            let mut c = TcpStream::connect((ip, 7000)).unwrap();
+            c.write_all(&sent).unwrap();
+            c
+        });
+        // Its SYN, answered: a SYN-ACK with an MSS of 1460 and a 64 KiB window.
+        let syn = next(&|f| tcp(f) && f[12 + 14 + 33] == 0x02);
+        let p = &syn[26..];
+        let mut synack = [&p[16..20], &p[12..16]].concat();
+        synack.splice(0..0, [0x45, 0, 0, 44, 0, 0, 0x40, 0, 64, 6, 0, 0]);
+        let isn = u32::from_be_bytes(p[24..28].try_into().unwrap());
+        synack.extend_from_slice(&[0x1b, 0x58]);
+        synack.extend_from_slice(&p[20..22]);
+        synack.extend_from_slice(&5000u32.to_be_bytes());
+        synack.extend_from_slice(&(isn + 1).to_be_bytes());
+        synack.extend_from_slice(&[0x60, 0x12, 0xff, 0xff, 0, 0, 0, 0, 2, 4, 0x05, 0xb4]);
+        let sum = !sum16(&synack[..20]);
+        synack[10..12].copy_from_slice(&sum.to_be_bytes());
+        let sum = !sum16(&[&synack[12..20], &[0, 6, 0, 24], &synack[20..]].concat());
+        synack[36..38].copy_from_slice(&sum.to_be_bytes());
+        let frame = [&[0u8; 12][..], &crate::net::GATEWAY_MAC, &crate::net::GUEST_MAC, &[8, 0], &synack].concat();
+        assert_eq!(unsafe { libc::write(fd.as_raw_fd(), frame.as_ptr().cast(), frame.len()) }, frame.len() as isize);
+        let tso = next(&|f| tcp(f) && f[1] & 0x7f == 1);
+        let segs = from_tap(&tso).unwrap();
+        let (first, mut joined) = (u32::from_be_bytes(segs[0][24..28].try_into().unwrap()), Vec::new());
+        assert!(segs.len() >= 2, "{} segments", segs.len());
+        for s in &segs {
+            let pseudo = [&s[12..20], &[0, 6], &(s.len() as u16 - 20).to_be_bytes()].concat();
+            assert!(ipv4_header_csum_ok(s) && sum16(&[&pseudo[..], &s[20..]].concat()) == 0xffff && s.len() - 40 <= 1460);
+            assert_eq!(u32::from_be_bytes(s[24..28].try_into().unwrap()), first + joined.len() as u32, "in sequence");
+            joined.extend_from_slice(&s[40..]);
+        }
+        let at = (first - isn - 1) as usize;
+        assert_eq!(joined, data[at..at + joined.len()], "the stream as sent");
+        drop(fd);
+        crate::net::delete_tap(&tap);
+        drop(sender);
+    }
+
     /// Needs root: `sudo cargo test -- --ignored`. A sender that looked the route up before a
     /// release hands its packet to the device after it (#254), here by binding to the device:
     /// it is re-sent to where the address went, never lost uncounted.
