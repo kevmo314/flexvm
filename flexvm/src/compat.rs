@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::os::fd::AsRawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
@@ -91,13 +91,31 @@ pub fn local(pid: u32) -> Result<Compat> {
     if let Some((_, c)) = cache.as_ref().filter(|(s, _)| *s == stamp) {
         return Ok(c.clone());
     }
-    let version = std::process::Command::new(&firecracker).arg("--version").output()?;
+    let (stamp, binary) = firecracker_id(&firecracker, crate::host::run_dir())?;
+    let compat = Compat::of_cpuid(&supported_cpuid()?, binary)?;
+    *cache = Some((stamp, compat.clone()));
+    Ok(compat)
+}
+
+/// Shared across VM processes; an unreadable cache is only a miss.
+fn firecracker_id(path: &Path, run: Option<&Path>) -> Result<(Stamp, String)> {
+    let stamp = Stamp::of(&std::fs::metadata(path)?);
+    if let Some(cached) = run
+        .and_then(|d| std::fs::read(d.join("firecracker.json")).ok())
+        .and_then(|b| serde_json::from_slice::<(Stamp, String)>(&b).ok())
+        .filter(|(s, _)| *s == stamp)
+    {
+        return Ok(cached);
+    }
+    let version = std::process::Command::new(path).arg("--version").output()?;
     let version = String::from_utf8_lossy(&version.stdout);
     let version = version.lines().next().filter(|v| !v.is_empty()).ok_or("firecracker --version printed nothing")?;
-    let binary = hash_file(&firecracker)?;
-    let compat = Compat::of_cpuid(&supported_cpuid()?, format!("{version} (content {})", binary.hash))?;
-    *cache = Some((binary.metadata, compat.clone()));
-    Ok(compat)
+    let binary = hash_file(path)?;
+    let cached = (binary.metadata, format!("{version} (content {})", binary.hash));
+    if let Some(run) = run {
+        let _ = crate::util::write_file(run, "firecracker.json", &serde_json::to_vec(&cached)?, false);
+    }
+    Ok(cached)
 }
 
 pub fn check(template: &Template, pid: u32) -> Result<()> {
@@ -133,6 +151,44 @@ mod tests {
             [0xd, 2, 0x100, 0x240, 0, 0],
         ];
         Compat::of_cpuid(&entries, "Firecracker v1.17.0 (content a)".into()).unwrap()
+    }
+
+    #[test]
+    fn firecracker_cache_hits_and_invalidates_on_stamp_changes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("flexvm-compat-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let binary = root.join("firecracker");
+        let calls = root.join("firecracker.calls");
+        let write = |version| {
+            std::fs::write(&binary, format!("#!/bin/sh\necho {version}\necho called >> \"$0.calls\"\n")).unwrap();
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        };
+        write("v1");
+        let first = firecracker_id(&binary, Some(&root)).unwrap();
+        assert!(first.1.starts_with("v1 (content "));
+        assert_eq!(firecracker_id(&binary, Some(&root)).unwrap(), first);
+        assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 1);
+        // A replacement inode invalidates the cache even with identical bytes.
+        std::fs::rename(&binary, root.join("old")).unwrap();
+        write("v1");
+        let replaced = firecracker_id(&binary, Some(&root)).unwrap();
+        assert_ne!(replaced.0, first.0);
+        assert_eq!(replaced.1, first.1);
+        write("v2-longer");
+        let changed = firecracker_id(&binary, Some(&root)).unwrap();
+        assert_ne!(changed.0, replaced.0);
+        assert!(changed.1.starts_with("v2-longer (content "));
+        assert_eq!(firecracker_id(&binary, Some(&root)).unwrap(), changed);
+        assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 3);
+        std::fs::write(root.join("firecracker.json"), b"broken").unwrap();
+        assert_eq!(firecracker_id(&binary, Some(&root)).unwrap(), changed);
+        std::fs::remove_file(root.join("firecracker.json")).unwrap();
+        std::fs::create_dir(root.join("firecracker.json")).unwrap();
+        assert_eq!(firecracker_id(&binary, Some(&root)).unwrap(), changed);
+        assert_eq!(std::fs::read_to_string(calls).unwrap().lines().count(), 5);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

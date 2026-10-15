@@ -1,6 +1,6 @@
 //! Standby VMs: `flexvm run --standby` processes holding a restored, settled,
 //! paused VM so `run` is a resume plus `START`. Each listens on
-//! `RUN/standby/TEMPLATE/KEY.PID-START.sock` (KEY: template generation) and holds
+//! `RUN/standby/HASH/KEY.PID-START.sock` (KEY: template generation) and holds
 //! `PID-START.lock` while alive, and `PID-START.claim` locked while a claim is under way. Protocol: `run` sends `claim {name, ip, cmd}` with
 //! its stdout/stderr; once the standby replies `claiming`, the claim may have
 //! started the VM and is never retried elsewhere. `{"exit": code}` follows.
@@ -26,8 +26,17 @@ use crate::util::{locked, send_json, Error, Phases, Result};
 use crate::vm::{Prepared, Vm};
 use crate::vmproc::{End, Op, Proc};
 
-fn dir(host: &Host, template: &str) -> PathBuf {
-    host.run.join("standby").join(template)
+pub(crate) fn dir(host: &Host, template: &str) -> PathBuf {
+    let mut hash = crate::template::Hash::new();
+    hash.update(template.as_bytes());
+    host.run.join("standby").join(hash.finish())
+}
+
+fn create_dir(host: &Host, template: &str) -> Result<PathBuf> {
+    let d = dir(host, template);
+    std::fs::create_dir_all(&d)?;
+    crate::util::write_file(&d, ".template", template.as_bytes(), false)?;
+    Ok(d)
 }
 
 fn key(paths: &Paths, template: &str) -> Result<String> {
@@ -83,7 +92,13 @@ pub fn templates(host: &Host) -> Vec<String> {
     let mut t: Vec<String> = [host.state.join("standby"), host.run.join("standby")]
         .iter()
         .flat_map(|d| std::fs::read_dir(d).into_iter().flatten().flatten())
-        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter_map(|e| {
+            if e.file_type().ok()?.is_dir() {
+                std::fs::read_to_string(e.path().join(".template")).ok()
+            } else {
+                Some(e.file_name().to_string_lossy().into_owned())
+            }
+        })
         .filter(|n| !n.starts_with('.'))
         .collect();
     t.sort();
@@ -156,8 +171,7 @@ pub fn refill(host: &Host, template: &str) -> Result<usize> {
 /// lock, so a refill that waited behind another while relief stopped standbys starts none.
 /// Only a count set by hand (`set`) starts them regardless.
 fn refill_by(host: &Host, template: &str, wait: bool, cooldown: bool) -> Result<usize> {
-    let d = dir(host, template);
-    std::fs::create_dir_all(&d)?;
+    let d = create_dir(host, template)?;
     let lock = File::create(d.join(".refill"))?;
     let _lock = match Flock::new(lock, libc::LOCK_EX | if wait { 0 } else { libc::LOCK_NB }) {
         Ok(lock) => lock,
@@ -327,11 +341,11 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
     // The key of the generation opened, not of whatever the name resolves to now: a
     // rebuild in between would publish this snapshot under the new generation's key.
     let mine = dir_key(&tpl.dir);
-    let d = dir(host, template);
-    std::fs::create_dir_all(&d)?;
+    let d = create_dir(host, template)?;
     let me = Ident::me();
     let id = me.key();
     let (lock_path, sock) = (d.join(format!("{id}.lock")), d.join(format!("{mine}.{id}.sock")));
+    crate::socket::check(&sock)?;
     crate::host::stall("standby_lock_stall");
     // Test hook: held before its lock for as long as armed (past `LOCKED_TIMEOUT`, say).
     while crate::host::fault("standby_lock_hang") {
@@ -357,13 +371,21 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
     if let Some(mut f) = notify.take() {
         let _ = send_json(&mut f, &json!({"ok": true, "result": {"pid": me.pid, "template": template}}));
     }
+    let mut checked = Instant::now();
     loop {
         let mut pfd = libc::pollfd { fd: listener.as_raw_fd(), events: libc::POLLIN, revents: 0 };
         if unsafe { libc::poll(&mut pfd, 1, 100) } <= 0 {
+            if p.stop_requested() {
+                p.finish(op, End::NotStarted, 0, None);
+            }
+            if checked.elapsed() < Duration::from_secs(1) {
+                continue;
+            }
+            checked = Instant::now();
             let current = key(&p.paths, template).ok();
             let extra = live(host, template).iter().position(|id| *id == me).is_none_or(|i| i >= target(host, template));
             let dead = p.standby.lock().unwrap().as_ref().is_none_or(|s| s.pager.failed().is_some() || !s.firecracker().alive());
-            if p.stop_requested() || current.as_deref() != Some(&mine) || extra || dead {
+            if current.as_deref() != Some(&mine) || extra || dead {
                 p.finish(op, End::NotStarted, 0, None);
             }
             continue;
@@ -638,6 +660,19 @@ fn wait_for_reseed(vsock: &std::path::Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_template_has_a_short_socket_path() {
+        let root = std::env::temp_dir().join(format!("fv-long-{}", std::process::id()));
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let template = "t".repeat(64);
+        let d = create_dir(&host, &template).unwrap();
+        let sock = d.join(format!("0123456789abcdef.{}.sock", Ident::me().key()));
+        crate::socket::check(&sock).unwrap();
+        assert_eq!(templates(&host), [template]);
+        assert_ne!(d, dir(&host, &"u".repeat(64)));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn unacknowledged_children_are_killed_and_reaped_before_relief() {

@@ -2111,8 +2111,9 @@ mod tests {
             });
         }
         let mut child = child.arg("30").spawn().unwrap();
-        let d = host.run.join("standby").join("t");
+        let d = crate::standby::dir(&host, "t");
         std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(".template"), "t").unwrap();
         let id = Ident::of(child.id()).unwrap();
         let path = d.join(format!("{}.lock", id.key()));
         let lock = std::fs::File::create(&path).unwrap();
@@ -2164,8 +2165,9 @@ mod tests {
         }
         let mut child = child.arg("30").spawn().unwrap();
         let id = Ident::of(child.id()).unwrap();
-        let d = host.run.join("standby/t");
+        let d = crate::standby::dir(&host, "t");
         std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(".template"), "t").unwrap();
         let path = d.join(format!("{}.lock", id.key()));
         let lock = std::fs::File::create(&path).unwrap();
         let _lock = crate::host::Flock::new(lock, libc::LOCK_EX).unwrap();

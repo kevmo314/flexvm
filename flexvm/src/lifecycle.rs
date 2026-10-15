@@ -99,7 +99,7 @@ impl Proc {
             drop(op);
             // An existing finish worker may only be retrying the address.
             self.sync_clock_later();
-            self.finish_later(vm.clone(), true, true);
+            self.finish_later(vm.clone(), true, false);
             return Err(e);
         }
         drop(op);
@@ -279,10 +279,6 @@ impl Proc {
         let dir = self.host.suspended(name);
         if !dir.exists() {
             bail!("no vm named {name:?}");
-        }
-        if dir.join(DISCARDED).exists() || dir.join(STARTED).exists() {
-            revoke(&self.host, name)??;
-            bail!("no vm named {name:?} (its checkpoint was consumed)");
         }
         if let Ok(q) = std::fs::read_to_string(dir.join(QUARANTINE)) {
             let (boot, why) = q.split_once(' ').unwrap_or((&q, ""));
