@@ -210,7 +210,7 @@ impl Api {
                     };
                     match s {
                         Ok(s) => BufReader::new(crate::util::By { s, at }),
-                        Err(e) => return Err(Box::new(NotSent(format!("firecracker {method} {path}: cannot connect: {e}")))),
+                        Err(e) => return Err(Box::new(NotSent(format!("firecracker {method} {path} (timeout {timeout:?}): cannot connect: {e}")))),
                     }
                 }
             };
@@ -218,8 +218,11 @@ impl Api {
             let (code, buf, close) = match exchange(&mut r, req.as_bytes(), &mut sent) {
                 Ok(response) => response,
                 Err(_) if !sent && reused => continue,
-                Err(e) if !sent => return Err(Box::new(NotSent(format!("firecracker {method} {path}: {e}")))),
-                Err(e) => return Err(e),
+                Err(e) if !sent => return Err(Box::new(NotSent(format!("firecracker {method} {path} (timeout {timeout:?}): {e}")))),
+                Err(e) => {
+                    let kind = e.downcast_ref::<std::io::Error>().map_or(std::io::ErrorKind::Other, |e| e.kind());
+                    return Err(std::io::Error::new(kind, format!("firecracker {method} {path} (timeout {timeout:?}): {e}")).into());
+                }
             };
             // Bytes past the answer mean the stream is out of step.
             if !close && r.buffer().is_empty() {
@@ -238,7 +241,7 @@ fn exchange(r: &mut BufReader<crate::util::By<UnixStream>>, mut req: &[u8], sent
     // After a partial write the request may have reached Firecracker: never replay it.
     while !req.is_empty() {
         match r.get_mut().write(req) {
-            Ok(0) => return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "firecracker request write returned zero").into()),
+            Ok(0) => return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "request write returned zero").into()),
             Ok(n) => {
                 *sent = true;
                 req = &req[n..];
@@ -249,11 +252,11 @@ fn exchange(r: &mut BufReader<crate::util::By<UnixStream>>, mut req: &[u8], sent
     }
     let mut status = String::new();
     if r.read_line(&mut status)? == 0 {
-        bail!("firecracker closed the connection without answering");
+        bail!("closed the connection without answering");
     }
     let code: u16 = status.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
     if code == 0 || !status.ends_with("\r\n") {
-        bail!("firecracker: invalid response status");
+        bail!("invalid response status");
     }
     let mut len = None;
     let mut close = false;
@@ -261,34 +264,34 @@ fn exchange(r: &mut BufReader<crate::util::By<UnixStream>>, mut req: &[u8], sent
         let mut h = String::new();
         r.read_line(&mut h)?;
         if !h.ends_with("\r\n") {
-            bail!("firecracker: incomplete response headers");
+            bail!("incomplete response headers");
         }
         if h == "\r\n" {
             break;
         }
         let Some((k, v)) = h.trim_end().split_once(':') else {
-            bail!("firecracker: invalid response header");
+            bail!("invalid response header");
         };
         if k.eq_ignore_ascii_case("content-length") {
             let n: usize = v.trim().parse()?;
             if len.is_some_and(|previous| previous != n) {
-                bail!("firecracker: conflicting content lengths");
+                bail!("conflicting content lengths");
             }
             len = Some(n);
         } else if k.eq_ignore_ascii_case("connection") {
             close |= v.split(',').any(|v| v.trim().eq_ignore_ascii_case("close"));
         } else if k.eq_ignore_ascii_case("transfer-encoding") {
-            bail!("firecracker: unsupported transfer encoding");
+            bail!("unsupported transfer encoding");
         }
     }
     // micro_http omits Content-Length for 204; reading to EOF would lose keep-alive.
     let len = if code == 204 || code == 304 {
         if code == 204 && len.is_some_and(|n| n != 0) {
-            bail!("firecracker: nonzero content length for 204");
+            bail!("nonzero content length for 204");
         }
         0
     } else {
-        len.ok_or("firecracker: missing content length")?
+        len.ok_or("missing content length")?
     };
     let mut buf = vec![0; len];
     r.read_exact(&mut buf)?;
@@ -602,6 +605,7 @@ mod tests {
             let e = api.request(&server.path, "GET", "/vm", None, TIMEOUT).unwrap_err();
             assert!(!not_sent(&e));
             assert_eq!(e.downcast_ref::<std::io::Error>().unwrap().kind(), std::io::ErrorKind::TimedOut);
+            assert_eq!(e.to_string(), "firecracker GET /vm (timeout 500ms): deadline passed");
             // Scheduler slack under parallel load, but short of a restarted deadline.
             assert!(start.elapsed() < Duration::from_millis(900), "{:?}", start.elapsed());
             assert!(api.connection.borrow().is_none());
@@ -641,7 +645,9 @@ mod tests {
         let api = Api::default();
         let missing = Path::new("/no-flexvm-api/socket");
         assert!(not_sent(&call(&api, missing).unwrap_err()));
-        assert!(not_sent(&api.request(missing, "GET", "/vm", None, Duration::ZERO).unwrap_err()));
+        let e = api.request(missing, "GET", "/vm", None, Duration::ZERO).unwrap_err();
+        assert!(not_sent(&e));
+        assert_eq!(e.to_string(), "firecracker GET /vm (timeout 0ns): cannot connect: deadline passed");
     }
 
     struct Counted<R> {

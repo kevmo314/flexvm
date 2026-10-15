@@ -98,8 +98,8 @@ fn session(output: Output) -> Session {
 
 pub struct Table {
     live: HashMap<String, Entry>,
-    closed: HashMap<String, Instant>,
-    cancelled: HashMap<String, Instant>,
+    closed: HashMap<String, Duration>,
+    cancelled: HashMap<String, Duration>,
     pool: Arc<AtomicUsize>,
 }
 
@@ -148,7 +148,7 @@ impl Table {
             if let Some(conn) = attached {
                 unsafe { libc::shutdown(conn.as_raw_fd(), libc::SHUT_RDWR) };
             }
-            self.closed.insert(id.to_string(), Instant::now());
+            self.closed.insert(id.to_string(), awake());
         }
     }
 
@@ -162,7 +162,7 @@ impl Table {
                 self.cancelled.remove(&oldest);
             }
         }
-        self.cancelled.insert(id.to_string(), Instant::now());
+        self.cancelled.insert(id.to_string(), awake());
     }
 
     /// Closes sessions whose client is gone: finished ones after `ABANDONED`, running ones (killing
@@ -197,7 +197,7 @@ impl Table {
         if self.closed.len() >= MAX_TOMBSTONES {
             // Only a badly delayed retry of the oldest one's creation could still arrive.
             match self.closed.iter().min_by_key(|(_, at)| **at).map(|(id, at)| (id.clone(), *at)) {
-                Some((id, at)) if at.elapsed() >= GRACE => drop(self.closed.remove(&id)),
+                Some((id, at)) if awake().saturating_sub(at) >= GRACE => drop(self.closed.remove(&id)),
                 _ => return Err(io::Error::other("too many sessions finished in the last 30 s")),
             }
         }
@@ -347,8 +347,9 @@ pub fn parse(line: &str) -> io::Result<Request<'_>> {
 pub fn cleanup(sessions: &Sessions, statuses: &Statuses) {
     let mut table = sessions.lock().unwrap();
     table.reclaim(statuses);
-    table.closed.retain(|_, at| at.elapsed() < RETENTION);
-    table.cancelled.retain(|_, at| at.elapsed() < RETENTION);
+    let now = awake();
+    table.closed.retain(|_, at| now.saturating_sub(*at) < RETENTION);
+    table.cancelled.retain(|_, at| now.saturating_sub(*at) < RETENTION);
 }
 
 /// Request errors become a message frame; write errors just end the stream (a frame may be cut short).
@@ -775,24 +776,59 @@ mod tests {
     }
 
     #[test]
-    fn tombstones_are_bounded_and_expire() {
+    fn tombstone_expiry_uses_the_awake_clock() {
+        // Isolated so advancing the clock cannot expire other tests' sessions.
+        const CHILD: &str = "FLEXVM_TOMBSTONE_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let name = "session::tests::tombstone_expiry_uses_the_awake_clock";
+            assert!(Command::new(std::env::current_exe().unwrap()).args(["--exact", name]).env(CHILD, "1").status().unwrap().success());
+            return;
+        }
+        let set_clock = |at: Duration| AWAKE_MS.store(at.as_millis() as u64, Ordering::Relaxed);
         let mut table = Table::default();
         let statuses = statuses();
-        let old = Instant::now() - GRACE;
+        let old = RETENTION * 2;
+        set_clock(old);
+        live(&mut table, "closed", Output::default());
+        table.close("closed", None);
+        assert_eq!(table.closed.remove("closed"), Some(old));
         for i in 0..MAX_TOMBSTONES {
             table.closed.insert(i.to_string(), if i == 7 { old - Duration::from_secs(1) } else { old });
         }
+        // A 20-minute pause adds only one short tick, leaving the tombstones their grace.
+        set_clock(old + tick(Duration::from_secs(1200)));
+        assert!(table.admit(&statuses).is_err());
+        set_clock(old + GRACE - Duration::from_secs(1) - Duration::from_millis(1));
+        assert!(table.admit(&statuses).is_err());
+        set_clock(old + GRACE - Duration::from_secs(1));
         table.admit(&statuses).unwrap();
         assert_eq!(table.closed.len(), MAX_TOMBSTONES - 1);
         assert!(!table.closed.contains_key("7"), "the oldest tombstone goes first");
-        table.closed.insert("new".into(), Instant::now());
-        table.closed.values_mut().for_each(|at| *at = Instant::now());
+        table.closed.insert("new".into(), awake());
+        table.closed.values_mut().for_each(|at| *at = awake());
         assert!(table.admit(&statuses).unwrap_err().to_string().contains("finished in the last"));
-        table.closed.values_mut().for_each(|at| *at = Instant::now() - RETENTION);
-        table.closed.insert("recent".into(), Instant::now());
+        table.closed.values_mut().for_each(|at| *at = old);
         let sessions = Arc::new(Mutex::new(table));
+        set_clock(old + GRACE + tick(Duration::from_secs(1200)));
+        cleanup(&sessions, &statuses);
+        assert_eq!(sessions.lock().unwrap().closed.len(), MAX_TOMBSTONES);
+        assert!(request(&sessions, &statuses, "ATTACH 0 0", b"").ends_with(b"error: session closed"));
+        set_clock(old + RETENTION - Duration::from_millis(1));
+        cleanup(&sessions, &statuses);
+        assert_eq!(sessions.lock().unwrap().closed.len(), MAX_TOMBSTONES);
+        sessions.lock().unwrap().closed.insert("recent".into(), awake());
+        set_clock(old + RETENTION);
         cleanup(&sessions, &statuses);
         assert_eq!(sessions.lock().unwrap().closed.keys().collect::<Vec<_>>(), ["recent"]);
+        // Cancelled IDs keep their retention across a pause too.
+        let cancelled = old + RETENTION;
+        sessions.lock().unwrap().cancel("cancelled");
+        set_clock(cancelled + tick(Duration::from_secs(1200)));
+        cleanup(&sessions, &statuses);
+        assert!(request(&sessions, &statuses, "SESSION cancelled 4", b"true").ends_with(b"session closed"));
+        set_clock(cancelled + RETENTION);
+        cleanup(&sessions, &statuses);
+        assert!(sessions.lock().unwrap().cancelled.is_empty());
     }
 
     #[test]
@@ -1013,9 +1049,6 @@ mod tests {
         assert!(statuses.0.lock().unwrap().is_empty());
         cleanup(&sessions, &statuses);
         assert!(sessions.lock().unwrap().closed.contains_key("retry"), "closed ID must remain a tombstone");
-        sessions.lock().unwrap().closed.insert("retry".into(), Instant::now() - RETENTION);
-        cleanup(&sessions, &statuses);
-        assert!(sessions.lock().unwrap().closed.is_empty());
     }
 
     #[test]
