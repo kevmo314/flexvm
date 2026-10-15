@@ -115,12 +115,9 @@ fn direct(file: &File, on: bool) -> io::Result<()> {
 fn pwritev_all(file: &File, mut iov: &mut [libc::iovec], mut off: u64) -> io::Result<()> {
     while !iov.is_empty() {
         let cnt = iov.len().min(libc::UIO_MAXIOV as usize) as libc::c_int;
-        let n = unsafe { libc::pwritev(file.as_raw_fd(), iov.as_ptr(), cnt, off as libc::off_t) };
-        let e = (n <= 0).then(|| if n < 0 { io::Error::last_os_error() } else { io::ErrorKind::WriteZero.into() });
-        match e {
-            Some(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Some(e) => return Err(e),
-            None => {}
+        let n = crate::util::eintr(|| unsafe { libc::pwritev(file.as_raw_fd(), iov.as_ptr(), cnt, off as libc::off_t) })?;
+        if n == 0 {
+            return Err(io::ErrorKind::WriteZero.into());
         }
         off += n as u64;
         let mut n = n as usize;

@@ -65,28 +65,17 @@ impl Firecracker {
         let parent = std::process::id() as i32;
         unsafe {
             cmd.pre_exec(move || {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
+                crate::util::check(libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL))?;
                 if libc::getppid() != parent {
                     return Err(std::io::Error::other("its parent died"));
                 }
                 // Out of the terminal's process group: Ctrl-Z, Ctrl-C and a hang-up
                 // are for the VM process, which decides what becomes of Firecracker.
-                if libc::setpgid(0, 0) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                // Not the signals its spawner blocks to take them itself (a VM process, a
-                // template build): the mask is inherited across exec.
-                let mut none: libc::sigset_t = std::mem::zeroed();
-                libc::sigemptyset(&mut none);
-                if libc::sigprocmask(libc::SIG_SETMASK, &none, std::ptr::null_mut()) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
+                crate::util::check(libc::setpgid(0, 0))?;
                 Ok(())
             });
         }
-        let child = cmd.spawn().map_err(|e| format!("{}: {e} (see README: Setup)", bin.display()))?;
+        let child = crate::util::unblock_signals_in(&mut cmd).spawn().map_err(|e| format!("{}: {e} (see README: Setup)", bin.display()))?;
         let fc = Firecracker { child, sockets, dir: dir.into(), cgroup: None, tap: String::new(), api: Api::default(), joining: RefCell::new(None) };
         let id = crate::host::Ident::of(fc.pid()).ok_or_else(|| fc.post_mortem())?;
         crate::host::store(&dir.join("fc"), &id, false)?;
@@ -170,9 +159,7 @@ impl Firecracker {
 fn exited(child: &Child) -> std::io::Result<Option<ExitStatus>> {
     use std::os::unix::process::ExitStatusExt;
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    if unsafe { libc::waitid(libc::P_PID, child.id(), &mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT) } < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
+    crate::util::check(unsafe { libc::waitid(libc::P_PID, child.id(), &mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT) })?;
     let (pid, st) = unsafe { (info.si_pid(), info.si_status()) };
     Ok((pid != 0).then(|| match info.si_code {
         libc::CLD_EXITED => ExitStatus::from_raw((st & 0xff) << 8),

@@ -29,6 +29,7 @@ macro_rules! log {
 /// Lines dropped since the log writer last got through (`log_line`), and
 /// lines it has written.
 static LOG_DROPPED: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
 static LOG_WRITTEN: AtomicUsize = AtomicUsize::new(0);
 static WRITER: OnceLock<std::sync::mpsc::SyncSender<LogMsg>> = OnceLock::new();
 
@@ -90,6 +91,7 @@ fn log_writer() -> Option<&'static std::sync::mpsc::SyncSender<LogMsg>> {
                         let _ = err.write_all(format!("flexvm: {dropped} log lines dropped: stderr was blocked\n").as_bytes());
                     }
                     let _ = err.write_all(line.as_bytes());
+                    #[cfg(test)]
                     LOG_WRITTEN.fetch_add(1, Ordering::SeqCst);
                 } else if let LogMsg::Flush(done) = msg {
                     let _ = done.send(());
@@ -227,7 +229,7 @@ pub fn send_json(w: &mut impl Write, v: &impl serde::Serialize) -> io::Result<()
 }
 
 /// Room for an exec command of the guest's 1 MiB limit even when escaping inflates it.
-const MAX_LINE: u64 = 8 << 20;
+pub const MAX_LINE: u64 = 8 << 20;
 
 /// None on EOF.
 pub fn recv_json(r: &mut impl BufRead) -> Result<Option<serde_json::Value>> {
@@ -471,15 +473,15 @@ pub fn rpc(addr: &str, wait: Duration, at: Instant, req: &serde_json::Value) -> 
         let s = connect_addrs(&addrs, at.min(Instant::now() + wait))?;
         send_json(&mut By { s: &s, at }, req)?;
         let reply = recv_json(&mut io::BufReader::new(By { s: &s, at }))?;
-        Ok((s, answer(reply, "it")?))
+        Ok((s, answer(reply, "it", "refused")?))
     })()
     .map_err(|e| format!("{addr}: {e}").into())
 }
 
-pub fn answer(reply: Option<serde_json::Value>, who: &str) -> Result<serde_json::Value> {
+pub fn answer(reply: Option<serde_json::Value>, who: &str, fallback: &str) -> Result<serde_json::Value> {
     let reply = reply.ok_or_else(|| format!("{who} hung up"))?;
     if reply["ok"] != true {
-        bail!("{}", reply["error"].as_str().unwrap_or("refused"));
+        bail!("{}", reply["error"].as_str().unwrap_or(fallback));
     }
     Ok(reply["result"].clone())
 }
@@ -795,9 +797,7 @@ fn walk_up(dir: RawFd, seen: &mut Seen, sync: &mut impl FnMut(&std::fs::File) ->
     loop {
         let fd = cur.as_ref().map_or(dir, |f| f.as_raw_fd());
         let up = unsafe { libc::openat(fd, c"..".as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
-        if up < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        check(up)?;
         let up = unsafe { std::fs::File::from_raw_fd(up) };
         let up_id = dir_id(up.as_raw_fd())?;
         if up_id == id || !seen.insert((up_id, None)) {
@@ -1011,9 +1011,7 @@ pub fn signal_pending(sig: i32) -> bool {
 /// Readable while one of `set` (blocked) is pending; `take_signal` takes it.
 pub fn signal_fd(set: &libc::sigset_t) -> io::Result<OwnedFd> {
     let fd = unsafe { libc::signalfd(-1, set, libc::SFD_CLOEXEC) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
+    check(fd)?;
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
@@ -1059,10 +1057,7 @@ pub fn spawn_self_child<S: AsRef<std::ffi::OsStr>>(args: &[S], log: &std::fs::Fi
             }
             // dup2 onto itself would leave it close-on-exec.
             let moved = if fd3 == 3 { libc::fcntl(3, libc::F_SETFD, 0) } else { libc::dup2(fd3, 3) };
-            if moved < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
+            check(moved)
         });
     }
     cmd.spawn()

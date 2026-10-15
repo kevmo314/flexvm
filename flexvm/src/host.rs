@@ -1995,12 +1995,15 @@ impl Host {
         let answers: Vec<(Ipv4Addr, u64, String, Result<()>)> = std::thread::scope(|scope| {
             let calls: Vec<_> = due
                 .into_iter()
-                .map(|(_, _, ip, gen, peer)| {
+                .filter_map(|(_, _, ip, gen, peer)| {
                     let tell = &tell;
-                    scope.spawn(move || {
-                        let r = tell(&peer, &serde_json::json!({"op": "route", "ip": ip.to_string(), "gen": gen}));
-                        (ip, gen, peer, r)
-                    })
+                    std::thread::Builder::new()
+                        .spawn_scoped(scope, move || {
+                            let r = tell(&peer, &serde_json::json!({"op": "route", "ip": ip.to_string(), "gen": gen}));
+                            (ip, gen, peer, r)
+                        })
+                        .inspect_err(|e| crate::log!("withdraw {ip}: cannot start peer call: {e}"))
+                        .ok()
                 })
                 .collect();
             calls.into_iter().filter_map(|c| c.join().ok()).collect()

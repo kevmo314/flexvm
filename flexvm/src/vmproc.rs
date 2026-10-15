@@ -364,11 +364,14 @@ impl Proc {
             .peers
             .iter()
             .cloned()
-            .map(|peer| {
-                thread::spawn(move || {
-                    let r = peer_call(&peer, json!({"op": "lend", "ip": ip.to_string()}));
-                    (peer, r)
-                })
+            .filter_map(|peer| {
+                thread::Builder::new()
+                    .spawn(move || {
+                        let r = peer_call(&peer, json!({"op": "lend", "ip": ip.to_string()}));
+                        (peer, r)
+                    })
+                    .inspect_err(|e| crate::log!("borrow {ip}: cannot start peer call: {e}"))
+                    .ok()
             })
             .collect();
         let (mut lent, mut why) = (Vec::new(), Vec::new());
@@ -493,14 +496,13 @@ impl Proc {
     pub fn op_within(&self) -> Result<Op<'_>> {
         let (deadline, mut nap) = (Instant::now() + OP_WAIT, Duration::from_millis(1));
         loop {
-            match self.op.try_lock() {
-                Ok(g) => return Ok(g),
-                Err(std::sync::TryLockError::Poisoned(e)) => return Ok(e.into_inner()),
-                Err(_) if Instant::now() < deadline => {
+            match self.op_now() {
+                Some(g) => return Ok(g),
+                None if Instant::now() < deadline => {
                     thread::sleep(nap);
                     nap = (nap * 2).min(Duration::from_millis(50));
                 }
-                Err(_) => bail!("vm {} is busy", self.name()),
+                None => bail!("vm {} is busy", self.name()),
             }
         }
     }
@@ -764,7 +766,7 @@ impl Proc {
             }
             return;
         };
-        thread::spawn(move || {
+        if let Err(e) = thread::Builder::new().spawn(move || {
             let here = || vm.state().local();
             let arp = || {
                 if let Some(dev) = dev.as_deref().filter(|_| here()) {
@@ -784,7 +786,9 @@ impl Proc {
             }
             thread::sleep(second.saturating_duration_since(Instant::now()));
             arp();
-        });
+        }) {
+            crate::log!("announce {ip}: cannot start: {e}");
+        }
     }
 
     pub fn drop_held_in(&self) {
@@ -876,9 +880,16 @@ impl Proc {
                         continue;
                     }
                 };
-                let Some(slot) = Slot::take(&CONTROL, MAX_CONTROL) else { continue };
+                let Some(slot) = Slot::take(&CONTROL, MAX_CONTROL) else {
+                    // Not to wait on the client: the reply fits the socket's buffer.
+                    let _ = c.set_nonblocking(true);
+                    let _ = send_json(&mut &c, &json!({"ok": false, "error": "busy"}));
+                    continue;
+                };
                 let p = p.clone();
-                thread::spawn(move || p.control(c, slot));
+                if let Err(e) = thread::Builder::new().spawn(move || p.control(c, slot)) {
+                    crate::log!("control: cannot start a connection's thread: {e}");
+                }
             }
         });
     }
@@ -1017,12 +1028,13 @@ impl Proc {
     /// `slot`: its place among `MAX_CONTROL`, which a page-server request trades for one among `MAX_PAGES`.
     fn control(self: &Arc<Self>, c: UnixStream, slot: Slot) {
         let _ = c.set_read_timeout(Some(Duration::from_secs(10)));
-        let (line, fds) = match crate::util::recv_with_fds(&c, 1 << 20, || Ok(())) {
+        let got = crate::util::recv_with_fds(&c, crate::util::MAX_LINE as usize, || Ok(()))
+            .and_then(|(line, fds)| Ok((serde_json::from_slice::<Value>(&line)?, fds)));
+        let (req, fds) = match got {
             Ok(got) => got,
             Err(e) => return drop(send_json(&mut &c, &json!({"ok": false, "error": format!("bad request: {e}")}))),
         };
         let _ = c.set_read_timeout(None);
-        let Ok(req) = serde_json::from_slice::<Value>(&line) else { return };
         let reply = match req["op"].as_str().unwrap_or("") {
             "exec" => return self.exec(&req, c),
             "pages" => return self.pages(&req, fds, slot),
@@ -2122,10 +2134,12 @@ fn each_peer(peers: Vec<String>, by: Instant, f: impl Fn(&str) + Send + Sync + '
     let (done, finished) = std::sync::mpsc::channel::<()>();
     for p in peers {
         let (f, done) = (f.clone(), done.clone());
-        thread::spawn(move || {
+        if let Err(e) = thread::Builder::new().spawn(move || {
             f(&p);
             drop(done);
-        });
+        }) {
+            crate::log!("cannot start a peer call: {e}");
+        }
     }
     drop(done);
     let _ = finished.recv_timeout(by.saturating_duration_since(Instant::now()));
@@ -2173,7 +2187,7 @@ pub fn call(host: &Host, name: &str, req: Value, at: Option<Instant>) -> Result<
         Some(at) => crate::util::recv_json(&mut BufReader::new(crate::util::By { s: c, at })),
         None => crate::util::recv_json(&mut BufReader::new(c)),
     }?;
-    answer(reply, &format!("vm {name}"))
+    answer(reply, &format!("vm {name}"), "refused")
 }
 
 #[cfg(test)]
@@ -2311,6 +2325,29 @@ mod tests {
         std::os::unix::fs::symlink(".gen/a", root.join("templates/default")).unwrap();
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
         (Proc::new(host, Paths::new(&root, None).unwrap()).unwrap(), root)
+    }
+
+    #[test]
+    fn control_replies_to_invalid_json_and_accepts_a_large_escaped_command() {
+        static COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let (p, _root) = test_proc("control-requests");
+        let large = json!({"op": "unknown", "cmd": "\u{1}".repeat(1 << 20)}).to_string();
+        assert!(large.len() > 1 << 20 && large.len() < crate::util::MAX_LINE as usize);
+        for (request, error) in [("{invalid".to_string(), "bad request:"), (large, "unknown op")] {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            client.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+            let q = p.clone();
+            let slot = Slot::take(&COUNT, MAX_CONTROL).unwrap();
+            let worker = thread::spawn(move || q.control(server, slot));
+            use std::io::Write;
+            writeln!(client, "{request}").unwrap();
+            let reply = crate::util::recv_json(&mut BufReader::new(client)).unwrap().unwrap();
+            assert_eq!(reply["ok"], false);
+            assert!(reply["error"].as_str().unwrap().starts_with(error), "{reply}");
+            worker.join().unwrap();
+            assert_eq!(COUNT.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[test]
