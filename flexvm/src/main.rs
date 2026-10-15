@@ -565,7 +565,7 @@ fn kill(host: &Host, name: &str) -> Result<()> {
         if !host.suspended(name).exists() {
             return Ok(());
         }
-        return lifecycle::discard(host, name);
+        return lifecycle::revoke(host, name)?;
     }
     if !host.alive(name) && std::fs::remove_file(host.vms(name, "failed")).is_ok() {
         return Ok(());

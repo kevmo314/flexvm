@@ -713,24 +713,6 @@ impl Vm {
         Ok(id)
     }
 
-    pub fn sh(&self, cmd: &str, deadline: Instant) -> Result<(i32, String)> {
-        const MAX_OUTPUT: usize = 64 << 10;
-        if self.state() != State::Running || Instant::now() >= deadline {
-            bail!("vm {} is not running here, or no time is left", self.name);
-        }
-        let left = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
-        let raw = crate::util::connect_unix(&self.vsock, left)?;
-        let id = self.track(&raw)?;
-        let res = (|| -> Result<(i32, String)> {
-            let (code, out, _) =
-                crate::guest::run(raw.try_clone()?, &self.vsock, cmd, deadline, MAX_OUTPUT).map_err(|e| format!("guest command {cmd:?}: {e}"))?;
-            Ok((code, out))
-        })();
-        let _ = raw.shutdown(Shutdown::Both);
-        self.untrack_exec(id);
-        res
-    }
-
     /// Returns the offset (ms); the guest ends up behind by a request's transit, so slow
     /// round trips are repeated.
     pub fn sync_clock(&self, deadline: Instant) -> Result<f64> {
