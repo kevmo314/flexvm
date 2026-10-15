@@ -579,16 +579,15 @@ fn follow(mut conn: BufReader<std::os::unix::net::UnixStream>, id: host::Ident) 
 }
 
 /// A paused VM gets SIGCONT (true); a suspended one a new process. SIGCONT does
-/// nothing during a suspend: that is waited out, the VM then running here (a
+/// nothing during a suspend: its process says whether one is coming, in order
+/// with SIGTERMs sent before, and it is waited out, the VM then running here (a
 /// failed suspend) or suspended.
 fn resume(host: &Host, name: &str) -> bool {
     loop {
-        match host.entry(name) {
-            Ok(e) if e.state == "suspending" => match host::PidFd::open(&e.ident) {
-                Ok(Some(vm)) => drop(vm.wait(Duration::from_millis(100))),
-                _ => std::thread::sleep(Duration::from_millis(100)),
-            },
-            _ => return host.signal(name, libc::SIGCONT).is_ok(),
+        match vmproc::call(host, name, json!({"op": "resume"}), None) {
+            Ok(v) if v["suspending"] == true => std::thread::sleep(Duration::from_millis(100)),
+            Ok(_) => return true,
+            Err(_) => return host.signal(name, libc::SIGCONT).is_ok(),
         }
     }
 }

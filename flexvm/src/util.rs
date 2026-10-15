@@ -972,6 +972,14 @@ pub fn block_signals(sigs: &[i32]) -> libc::sigset_t {
     }
 }
 
+/// Pending for the process (or this thread), blocked and not yet taken.
+pub fn signal_pending(sig: i32) -> bool {
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigpending(&mut set) == 0 && libc::sigismember(&set, sig) == 1
+    }
+}
+
 pub fn wait_signal(set: &libc::sigset_t) -> i32 {
     let mut sig = 0;
     while unsafe { libc::sigwait(set, &mut sig) } != 0 {}

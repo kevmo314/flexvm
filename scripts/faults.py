@@ -6719,6 +6719,34 @@ def resume_suspending():
           code == 0 and alive(pid) and wait_for(lambda: vms(A).get(n, {}).get("state") == "running", 10), (code, err, vms(A).get(n)))
     check("resume suspending: the suspend did fail", "injected fault: writing the checkpoint failed" in log(A, n), log(A, n)[-500:])
     ok(kill(A, n))
+    # Resume right behind the SIGTERM, before anything is published: still waited out, the VM resumed.
+    ok(run(A, n))
+    pid = vm_pid(A, n)
+    fault(A, "suspend_stall", 10000)
+    os.kill(pid, signal.SIGTERM)
+    code, out, err = cli(A, "resume", n, "-d")
+    fault(A, "suspend_stall", 0)
+    v = vms(A).get(n, {})
+    check("resume suspending: a resume right behind the SIGTERM resumes the suspended vm",
+          code == 0 and not alive(pid) and v.get("state") == "running" and v.get("pid") != pid, (code, err[-300:], v))
+    ok(kill(A, n))
+
+
+def quit_status():
+    """Ctrl-\\ (SIGQUIT) destroys the VM as Ctrl-C does, but the exit status is 131 (128 + SIGQUIT)."""
+    n = "ft-quit"
+    scenario_vms.add(n)
+    p = subprocess.Popen([BIN, "--state", A.state, "--run", A.run, "run", n, "--template", args.template],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=ENV, start_new_session=True)
+    check("quit: up", wait_for(lambda: vms(A).get(n, {}).get("state") == "running", 30), vms(A).get(n))
+    fc = vms(A)[n]["firecracker"]
+    os.kill(p.pid, signal.SIGQUIT)
+    try:
+        code = p.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        code = None
+    check("quit: destroyed, exit status 131", code == 131, code)
+    check("quit: nothing left", n not in vms(A) and not alive(fc), vms(A).get(n))
 
 
 def suspend_died():
@@ -7357,7 +7385,7 @@ SCENARIOS = dict(
     collapse_abort=collapse_abort, collapse_ckpt_fail=collapse_ckpt_fail, ckpt_paused_backlog=ckpt_paused_backlog, same_host_order=same_host_order, same_host_slow_route=same_host_slow_route, same_host_flood=same_host_flood, same_host_late_handover=same_host_late_handover, same_host_backlog=same_host_backlog, ckpt_backlog=ckpt_backlog, rx_stall=rx_stall, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,
     handoff_superseded=handoff_superseded, delayed_announce=delayed_announce, announce_arp_timer=announce_arp_timer,
     prepare_fail_announce=prepare_fail_announce, reconcile_announce=reconcile_announce, reconcile_kill=reconcile_kill, resume_pull_lock=resume_pull_lock, page_conns=page_conns, suspend_cmd=suspend_cmd, suspend_overlap=suspend_overlap, fc_died_busy=fc_died_busy, pause_cmd_start=pause_cmd_start, suspend_died=suspend_died,
-    ctrl_z_long_op=ctrl_z_long_op, resume_suspending=resume_suspending)
+    ctrl_z_long_op=ctrl_z_long_op, resume_suspending=resume_suspending, quit_status=quit_status)
 names = [n for s in args.scenarios for n in (list(SCENARIOS) if s == "all" else [s])]
 if os.geteuid() != 0:
     sys.exit("run as root (sudo)")
