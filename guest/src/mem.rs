@@ -55,11 +55,7 @@ pub fn enter(cmd: &mut Command, procs: CString, required: bool) {
             if fd >= 0 {
                 libc::close(fd);
             }
-            if moved || !required {
-                Ok(())
-            } else {
-                Err(io::Error::last_os_error())
-            }
+            (moved || !required).then_some(()).ok_or_else(io::Error::last_os_error)
         });
     }
 }
@@ -138,8 +134,9 @@ impl High {
         Self { total_kib, desired, changed, pending, write }
     }
 
-    fn set_total(&mut self, total_kib: Option<u64>) {
-        let Some(total_kib) = total_kib else { return };
+    fn set_total(&mut self, total_kib: Option<u64>) -> bool {
+        let Some(total_kib) = total_kib else { return false };
+        let rose = self.total_kib.is_some_and(|old| total_kib > old);
         let (old, value) = (self.total_kib.map(high_limit), high_limit(total_kib));
         self.total_kib = Some(total_kib);
         if old != Some(value) {
@@ -147,6 +144,7 @@ impl High {
             self.relieve();
             self.notify();
         }
+        rose
     }
 
     fn notify(&self) {
@@ -243,13 +241,19 @@ fn watch(events: File, uev: OwnedFd, mut limit: High) {
                 Reply::Enough => waiting = None,
             }
         }
-        if waiting.is_some_and(|t| now - t >= GIVE_UP) {
-            limit.lift();
-            waiting = None;
-        } else if waiting.is_some() || asked == Some(now) {
-            // Reconcile with what is plugged now, in case an event was lost.
-            limit.set_total(meminfo().map(|(total, _)| total));
+        if waiting.is_some() || asked == Some(now) {
+            // A plug into an already-online block need not send a uevent.
+            check_wait(&mut limit, &mut waiting, meminfo().map(|(total, _)| total), now);
         }
+    }
+}
+
+fn check_wait(limit: &mut High, waiting: &mut Option<Instant>, total: Option<u64>, now: Instant) {
+    if limit.set_total(total) {
+        *waiting = None;
+    } else if waiting.is_some_and(|t| now - t >= GIVE_UP) {
+        limit.lift();
+        *waiting = None;
     }
 }
 
@@ -330,6 +334,26 @@ mod tests {
             assert!(Instant::now() < end);
             thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    #[test]
+    fn memtotal_rise_without_a_uevent_ends_wait_even_at_give_up() {
+        let (mut high, _writes, _resume, installed) = high(0);
+        let now = Instant::now();
+        let mut waiting = Some(now - GIVE_UP);
+        // Even a rise too small to change the MiB-rounded mark ends the wait.
+        check_wait(&mut high, &mut waiting, Some((4096 << 10) + 1), now);
+        assert!(waiting.is_none());
+        assert_eq!(*installed.lock().unwrap(), Some(high_limit(4096 << 10)));
+        for total in [None, Some((4096 << 10) + 1), Some(4096 << 10)] {
+            waiting = Some(now);
+            check_wait(&mut high, &mut waiting, total, now);
+            assert_eq!(waiting, Some(now));
+        }
+        waiting = Some(now - GIVE_UP);
+        check_wait(&mut high, &mut waiting, Some(4096 << 10), now);
+        assert!(waiting.is_none());
+        assert_eq!(*installed.lock().unwrap(), None);
     }
 
     #[test]

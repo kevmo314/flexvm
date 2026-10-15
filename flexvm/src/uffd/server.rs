@@ -122,12 +122,13 @@ pub fn serve_pages(
     pager: &Pager,
     conn: &TcpStream,
     admitted: &Admitted,
-    mut stream: impl Read + Write,
+    stream: impl Read + Write,
     stop: impl Fn() -> bool,
     pace: impl Fn(),
 ) -> io::Result<()> {
     conn.set_read_timeout(Some(Duration::from_secs(1)))?;
     conn.set_write_timeout(Some(SERVE_WRITE))?;
+    let mut stream = io::BufReader::with_capacity(12 * 16, stream);
     let mut req = [0u8; 12];
     let mut buf = Vec::new();
     while read_request(&mut stream, &mut req, &stop) && !stop() {
@@ -138,7 +139,7 @@ pub fn serve_pages(
         let len = u32::from_le_bytes(req[8..].try_into().unwrap()) as usize;
         if len > MAX_FETCH {
             crate::log!("page server: refusing a {len}-byte read (at most {MAX_FETCH}); dropping the connection");
-            return stream.write_all(&[1]);
+            return stream.get_mut().write_all(&[1]);
         }
         // The status byte, then the pages: sent with one write. The buffer only grows (zeroed once): `read_guest`
         // overwrites what is sent.
@@ -149,10 +150,10 @@ pub fn serve_pages(
         let reply = &mut buf[..1 + len];
         reply[0] = 0;
         match pager.read_guest(offset, &mut reply[1..]) {
-            Ok(()) => stream.write_all(reply)?,
+            Ok(()) => stream.get_mut().write_all(reply)?,
             Err(e) => {
                 crate::log!("page server: {e}");
-                stream.write_all(&[1])?;
+                stream.get_mut().write_all(&[1])?;
             }
         }
         admitted.0.idle();
@@ -274,6 +275,53 @@ mod tests {
 
     fn conn(idle_for: Duration) -> Arc<Conn> {
         Arc::new(Conn { sock: sock(), state: Mutex::new(Serving::Idle(Instant::now() - idle_for)) })
+    }
+
+    #[test]
+    fn buffered_requests_share_a_read_and_survive_partial_reads() {
+        let requests: Vec<u8> = (0..24).collect();
+        let mut reads = 0;
+        let mut input = requests.as_slice();
+        let source = |buf: &mut [u8]| {
+            reads += 1;
+            input.read(buf)
+        };
+        struct Reader<F>(F);
+        impl<F: FnMut(&mut [u8]) -> io::Result<usize>> Read for Reader<F> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                (self.0)(buf)
+            }
+        }
+        let mut stream = io::BufReader::with_capacity(12 * 16, Reader(source));
+        let mut req = [0; 12];
+        assert!(read_request(&mut stream, &mut req, &|| false));
+        assert_eq!(req, requests[..12]);
+        assert!(read_request(&mut stream, &mut req, &|| false));
+        assert_eq!(req, requests[12..]);
+        drop(stream);
+        assert_eq!(reads, 1);
+
+        // Interrupted and timed-out partial requests retain their framing.
+        let mut offset = 0;
+        let mut calls = 0;
+        let mut partial = Reader(|buf: &mut [u8]| {
+            calls += 1;
+            match calls {
+                2 => Err(io::ErrorKind::Interrupted.into()),
+                4 => Err(io::ErrorKind::TimedOut.into()),
+                _ => {
+                    let n = 5.min(buf.len()).min(requests.len() - offset);
+                    buf[..n].copy_from_slice(&requests[offset..offset + n]);
+                    offset += n;
+                    Ok(n)
+                }
+            }
+        });
+        for expected in requests.chunks_exact(12) {
+            assert!(read_request(&mut partial, &mut req, &|| false));
+            assert_eq!(req, expected);
+        }
+        assert!(!read_request(&mut partial, &mut req, &|| false));
     }
 
     #[test]

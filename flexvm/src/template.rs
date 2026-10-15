@@ -674,6 +674,7 @@ fn sweep(paths: &Paths) -> Result<()> {
             let live = File::open(entry.path().join("lock")).is_ok_and(|f| crate::host::flock(&f, libc::LOCK_EX | libc::LOCK_NB).is_err());
             if !live {
                 crate::log!("template: removing {}, left by a build that did not finish", entry.path().display());
+                crate::socket::remove(&entry.path());
                 let _ = std::fs::remove_dir_all(entry.path());
             }
         }
@@ -1196,7 +1197,21 @@ mod tests {
             staging(name, true);
         }
         std::fs::create_dir(f.dir.join(foreign[3])).unwrap();
+        // Recreate a killed build's socket directory, without a live SocketRoot to clean it up.
+        use sha2::{Digest, Sha256};
+        use std::os::unix::{ffi::OsStrExt, fs::DirBuilderExt};
+        let base = PathBuf::from(format!("/tmp/flexvm-s-{}", unsafe { libc::geteuid() }));
+        match std::fs::DirBuilder::new().mode(0o700).create(&base) {
+            Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => panic!("{e}"),
+            _ => {}
+        }
+        let key = f.dir.join(".t.new-0000000000000001");
+        let hash = Sha256::digest(key.as_os_str().as_bytes());
+        let sockets = base.join(hash[..8].iter().map(|b| format!("{b:02x}")).collect::<String>());
+        std::fs::create_dir(&sockets).unwrap();
+        std::fs::write(sockets.join("api.sock"), b"leftover socket").unwrap();
         let mine = Staging::new(&f.paths, "t").unwrap();
+        assert!(!sockets.exists());
         for gone in [".t.new-0000000000000001", ".u.new-0000000000000003", ".foo.link-bar.new-0000000000000004", ".t.link-0000000000000005"] {
             assert!(!exists(gone), "{gone}");
         }
