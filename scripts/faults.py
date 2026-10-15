@@ -212,7 +212,7 @@ FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_be
           "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "resume_kill",
           "prepare_fail", "short_incoming", "slow_preload", "bad_preload", "bad_app_log", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
           "started_fsync", "started_unmark", "start_stall", "incoming_stall", "claim_stall", "standby_lock_stall", "standby_lock_hang", "handoff_stall", "ckpt_wp_race", "ckpt_rescue_fail",
-          "fetch_tail_enomem", "fetch_enomem_stuck", "pull_enomem", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo", "release_stall", "release_late", "no_plug", "pause_lost", "tap_backlog", "tap_backlog_stuck", "pause_unknown", "restore_unpause_fail", "resume_link_fail", "resume_partial", "repause_fail", "pause_fail", "restore_ping_slow", "readdress_fail", "no_collapse", "collapse_slow", "pages_slow", "unlend_fail", "route_stall", "suspend_slow", "owe_fail")
+          "fetch_tail_enomem", "fetch_enomem_stuck", "pull_enomem", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo", "release_stall", "release_late", "no_plug", "pause_lost", "tap_backlog", "tap_backlog_stuck", "pause_unknown", "restore_unpause_fail", "resume_link_fail", "resume_partial", "repause_fail", "pause_fail", "restore_ping_slow", "readdress_fail", "no_collapse", "collapse_slow", "pages_slow", "unlend_fail", "route_stall", "suspend_slow", "owe_fail", "settle_unpause")
 
 
 def disarm():
@@ -2888,7 +2888,9 @@ def fc_api(sock, method, path, body=None):
 def checkpoint_hotplug():
     """A virtio-mem resize still in flight when a checkpoint starts: the
     checkpoint waits for the guest to carry it out (no device request can
-    land behind the saved state), and the result restores intact. The
+    land behind the saved state), and the result restores intact. Paused
+    vCPUs hold the resize until the checkpoint waits for it (settle_unpause),
+    so the guest cannot finish it first. The
     template needs unplugged room in its hotplug region: PLUG_TEMPLATE picks
     it (one fully plugged has nothing to resize, issue #145)."""
     n, path = "ft-hotplug", ckpt_path("ft-hotplug")
@@ -2898,12 +2900,20 @@ def checkpoint_hotplug():
     room = hp["total_size_mib"] - hp["plugged_size_mib"]
     assert room >= 256, f"template {os.environ.get('PLUG_TEMPLATE') or args.template} has {room} MiB of hotplug room, too little to resize: {hp}"
     want = hp["plugged_size_mib"] + min(1024, room)
+    # Paused vCPUs hold the resize (the guest carries it out) until the
+    # checkpoint is waiting for it: settle_unpause resumes them from there.
+    r = fc_api(sock, "PATCH", "/vm", {"state": "Paused"})
+    assert r is None, f"pausing the vCPUs refused: {r}"
     r = fc_api(sock, "PATCH", "/hotplug/memory", {"requested_size_mib": want})
     assert r is None, f"resize to {want} MiB refused: {r}"
+    time.sleep(0.5)
     hp = fc_api(sock, "GET", "/hotplug/memory")
     check("hotplug: resize in flight when the checkpoint starts", hp["plugged_size_mib"] < want, hp)
+    fault(A, "settle_unpause", 60000)
     r = ok(checkpoint(A, n, path, stop=True))
+    fault(A, "settle_unpause", 0)
     print(f"hotplug: settled in {r['timings_ms']['settle_hotplug']} ms")
+    check("hotplug: the checkpoint released the held resize", "injected fault: resuming its vCPUs" in log(A, n), log(A, n)[-2000:])
     check("hotplug: checkpoint waited for the resize", r["timings_ms"]["settle_hotplug"] > 1, r["timings_ms"])
     text = open(f"{path}/manifest.json", "rb").read()
     plugged = json.loads(text.split(b"\n", 1)[1])["hotplug_mib"]
