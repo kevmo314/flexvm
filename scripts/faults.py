@@ -5248,13 +5248,23 @@ class mem_available_as:
         self.path, self.mib = os.path.join(host.run, "mem_available_mib"), mib
 
     def __enter__(self):
-        with open(self.path + ".tmp", "w") as f:
-            f.write(str(self.mib))
-        os.rename(self.path + ".tmp", self.path)
+        try:
+            self.was = open(self.path).read()
+        except FileNotFoundError:
+            self.was = None
+        self.write(str(self.mib))
         return self
 
+    def write(self, text):
+        with open(self.path + ".tmp", "w") as f:
+            f.write(text)
+        os.rename(self.path + ".tmp", self.path)
+
     def __exit__(self, *_):
-        os.unlink(self.path)
+        if self.was is None:
+            os.unlink(self.path)
+        else:
+            self.write(self.was)
 
 
 def reserve_of(host):
@@ -5328,6 +5338,8 @@ def refused_admission():
 # arrival_grew's room on B above the grant B recorded at the preflight. Before B goes on, the
 # guest has grown so that B is asked at least twice this more (hotplug paces it: 128 MiB is quick).
 ARRIVAL_MARGIN = 64
+# B's room in the arrival scenarios outside that narrowed window: ample for all the guest grows by.
+ARRIVAL_ROOM = 8192
 
 
 def park_arrival(n):
@@ -5365,36 +5377,38 @@ def arrival_grew():
     grow = 1024
     if v["guest_mib"] < grow + 256:
         raise Skip(f"its guest has {v['guest_mib']} MiB, too little to grow by {grow} MiB")
-    hold_dir = os.path.join(B.run, "holds")
-    holds = lambda: [f for f in os.listdir(hold_dir) if not f.startswith(".")] if os.path.isdir(hold_dir) else []
-    migs = lambda: sorted(os.listdir(os.path.join(B.state, "migs"))) if os.path.isdir(os.path.join(B.state, "migs")) else []
-    check("arrival grew: b holds nothing before", not holds(), holds())
-    recorded = migs()
-    time.sleep(11)  # Earlier grants on B age out: its preflight's hold is all it counts.
-    t, res = park_arrival(n)
-    try:
-        admitted = wait_for(lambda: holds(), 30) and holds()
-        check("arrival grew: b admitted its preflight", admitted, admitted)
-        # Room on B for exactly the grant it recorded at the preflight and a margin, whatever this
-        # machine has: less than B is asked for once the guest has grown.
-        grant = sum(int(f.split("-")[1]) for f in admitted or [])
-        with marks(1024, 1024, host=B), mem_available_as(B, 1024 + grant + ARRIVAL_MARGIN):
-            grow_parked(n, grow, grant, "arrival grew")
-            t.join()
-    finally:
-        fault(B, "incoming_gate", 0)
-    r = res["r"]
-    check("arrival grew: refused for what it grew by", not r["ok"] and "grew to" in r["error"] and "not enough memory" in r["error"], r)
-    check("arrival grew: the vm runs on at A", where(n) == {A: "running"} and md5(A, n) == m, where(n))
-    check("arrival grew: b keeps no record", wait_for(lambda: migs() == recorded, 10), (recorded, migs()))
-    check("arrival grew: and no held grant", wait_for(lambda: not holds(), 10), holds())
-    check("arrival grew: the guest grew on A", wait_for(lambda: hog_done(A, n), 120), cgroup(A, n))
-    r = migrate(A, n, B)
-    check("arrival grew: with room it moves", r["ok"], r)
-    st = wait_released(B, n, timeout=60)
-    check("arrival grew: pulled and released", st["released"] is True and st["failed"] is None, st)
-    check("arrival grew: admitted for all it pulled", vms(B)[n]["admitted_mib"] >= grow, vms(B)[n].get("admitted_mib"))
-    check("arrival grew: md5 intact, one copy", md5(B, n) == m and where(n) == {B: "running"}, where(n))
+    # B's room, whatever this machine has: ample for its preflight and for the move given room.
+    with marks(1024, 1024, host=B), mem_available_as(B, 1024 + ARRIVAL_ROOM):
+        hold_dir = os.path.join(B.run, "holds")
+        holds = lambda: [f for f in os.listdir(hold_dir) if not f.startswith(".")] if os.path.isdir(hold_dir) else []
+        migs = lambda: sorted(os.listdir(os.path.join(B.state, "migs"))) if os.path.isdir(os.path.join(B.state, "migs")) else []
+        check("arrival grew: b holds nothing before", not holds(), holds())
+        recorded = migs()
+        time.sleep(11)  # Earlier grants on B age out: its preflight's hold is all it counts.
+        t, res = park_arrival(n)
+        try:
+            admitted = wait_for(lambda: holds(), 30) and holds()
+            check("arrival grew: b admitted its preflight", admitted, admitted)
+            # Narrowed to exactly the grant it recorded at the preflight and a margin: less than
+            # B is asked for once the guest has grown.
+            grant = sum(int(f.split("-")[1]) for f in admitted or [])
+            with mem_available_as(B, 1024 + grant + ARRIVAL_MARGIN):
+                grow_parked(n, grow, grant, "arrival grew")
+                t.join()
+        finally:
+            fault(B, "incoming_gate", 0)
+        r = res["r"]
+        check("arrival grew: refused for what it grew by", not r["ok"] and "grew to" in r["error"] and "not enough memory" in r["error"], r)
+        check("arrival grew: the vm runs on at A", where(n) == {A: "running"} and md5(A, n) == m, where(n))
+        check("arrival grew: b keeps no record", wait_for(lambda: migs() == recorded, 10), (recorded, migs()))
+        check("arrival grew: and no held grant", wait_for(lambda: not holds(), 10), holds())
+        check("arrival grew: the guest grew on A", wait_for(lambda: hog_done(A, n), 120), cgroup(A, n))
+        r = migrate(A, n, B)
+        check("arrival grew: with room it moves", r["ok"], r)
+        st = wait_released(B, n, timeout=60)
+        check("arrival grew: pulled and released", st["released"] is True and st["failed"] is None, st)
+        check("arrival grew: admitted for all it pulled", vms(B)[n]["admitted_mib"] >= grow, vms(B)[n].get("admitted_mib"))
+        check("arrival grew: md5 intact, one copy", md5(B, n) == m and where(n) == {B: "running"}, where(n))
     cleanup(n)
 
 
@@ -5405,7 +5419,7 @@ def arrival_grew_admitted():
     runs on; let be, the migration commits, admitted for all it pulls, and
     the hold goes once the pull is done."""
     # B's room, whatever this machine has: ample for all it grows by, there and before.
-    with marks(1024, 1024, host=B), mem_available_as(B, 1024 + 8192):
+    with marks(1024, 1024, host=B), mem_available_as(B, 1024 + ARRIVAL_ROOM):
         grew_admitted()
 
 
