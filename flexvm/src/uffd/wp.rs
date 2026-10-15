@@ -381,7 +381,7 @@ impl Pager {
 
     /// Pages dirtied since the last checkpoint's pause.
     pub fn dirty_count(&self) -> usize {
-        self.pages().dirty.iter().map(|w| w.load(Ordering::Relaxed).count_ones() as usize).sum()
+        self.pages().dirty_count()
     }
 
     /// Captures memory for a checkpoint of the paused VM, after `quiesce_export` gave `runs`: takes the pages dirtied
