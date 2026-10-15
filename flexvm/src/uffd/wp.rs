@@ -1,5 +1,6 @@
 use super::event::{Served, WP};
 use super::hot::Held;
+use super::pages::set_bits;
 use super::{Mapping, Pager, Runs, ALL, ARM_CHUNK, BASE, PREFETCH_RUN, PRESENT};
 use crate::bail;
 use crate::cow::{Cow, PENDING, READING, RESCUING};
@@ -230,22 +231,7 @@ impl Pager {
     /// Reads consecutive guest pages from `page` out of Firecracker, a page into each buffer of `pages`.
     fn read_pages(&self, page: usize, pages: &mut [Box<[u8]>]) -> io::Result<()> {
         let local: Vec<libc::iovec> = pages.iter_mut().map(|b| libc::iovec { iov_base: b.as_mut_ptr().cast(), iov_len: PAGE_SIZE }).collect();
-        self.read_into(page, &local)
-    }
-
-    /// Reads consecutive guest pages from `page` out of Firecracker into the buffers `local`, as many as they hold.
-    pub(super) fn read_into(&self, page: usize, local: &[libc::iovec]) -> io::Result<()> {
-        let len: usize = local.iter().map(|v| v.iov_len).sum();
-        let remote = libc::iovec { iov_base: self.addr(page)? as *mut _, iov_len: len };
-        let pid = self.pid.load(Ordering::SeqCst) as libc::pid_t;
-        if unsafe { libc::process_vm_readv(pid, local.as_ptr(), local.len() as _, &remote, 1, 0) } != len as isize {
-            return Err(io::Error::other(format!("process_vm_readv: {}", io::Error::last_os_error())));
-        }
-        // The pid was Firecracker's all along.
-        if self.exited() {
-            return Err(io::Error::other("firecracker exited"));
-        }
-        Ok(())
+        self.read_at((page * PAGE_SIZE) as u64, &local)
     }
 
     /// The pagemap entries of `n` pages from `page` in Firecracker (`PM_*` bits).
@@ -402,12 +388,6 @@ impl Pager {
         // it runs on, they still tell what is unprotected. One that runs on starts a new interval.
         let dirty = pages.dirty_bits(cow);
         let ndirty = dirty.iter().map(|w| w.count_ones() as usize).sum();
-        // Set bits in ascending page order.
-        let dirty_pages = || {
-            dirty.iter().enumerate().flat_map(|(w, &bits)| {
-                std::iter::successors((bits != 0).then_some(bits), |b| Some(b & (b - 1)).filter(|&b| b != 0)).map(move |b| w * 64 + b.trailing_zeros() as usize)
-            })
-        };
         // Hot pages stay unprotected unless their block did not change since the last checkpoint.
         let prev = hot.as_mut().and_then(|h| h.prev.take());
         let hot_unchanged = hot.as_ref().map_or(0, |h| h.unchanged.len());
@@ -421,7 +401,7 @@ impl Pager {
         for m in self.mappings().iter().filter(|_| cow) {
             let (from, to) = m.span();
             let mut ranges: Vec<(usize, usize)> = Vec::new();
-            for p in dirty_pages().filter(|&p| p >= from && p < to && pages.get(p) == PRESENT && !keeps(p)) {
+            for p in set_bits(&dirty).filter(|&p| p >= from && p < to && pages.get(p) == PRESENT && !keeps(p)) {
                 match ranges.last_mut() {
                     Some((_, e)) if p <= *e + PROTECT_GAP && !(*e..p).any(keeps) => *e = p + 1,
                     _ => ranges.push((p, p + 1)),
@@ -442,7 +422,7 @@ impl Pager {
             true => {
                 // Pages not dirty keep what the previous checkpoint has, and so do hot pages unchanged since.
                 let mut out: Runs = Vec::new();
-                for p in dirty_pages().take_while(|&p| p < pages.len()).filter(|&p| !unchanged(p)) {
+                for p in set_bits(&dirty).take_while(|&p| p < pages.len()).filter(|&p| !unchanged(p)) {
                     let r = runs.partition_point(|r| r.0 <= p as u64);
                     let st = match r.checked_sub(1).map(|r| runs[r]) {
                         Some((f, n, s)) if (p as u64) < f + n => s,

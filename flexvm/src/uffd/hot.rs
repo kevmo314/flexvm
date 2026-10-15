@@ -15,6 +15,7 @@
 //! keep-running checkpoints holds up to twice `HOT_MIB` for this: the last checkpoint's copies and the memory for the
 //! next one's.
 
+use super::pages::set_bits;
 use super::{Pager, PRESENT};
 use crate::bail;
 use crate::util::{Result, PAGE_SIZE};
@@ -159,13 +160,11 @@ impl Pager {
         // Written in two intervals in a row: one written once (a file being written, say) is better left to the writers.
         let before = self.hot_dirty.lock().unwrap().clone();
         let dirty: Vec<u64> = self.pages().dirty_bits(false).iter().zip(before.iter().chain(std::iter::repeat(&0))).map(|(a, b)| a & b).collect();
-        let set = dirty.iter().enumerate().flat_map(|(w, &bits)| {
-            std::iter::successors((bits != 0).then_some(bits), |b| Some(b & (b - 1)).filter(|&b| b != 0)).map(move |b| w * 64 + b.trailing_zeros() as usize)
-        });
         let pages = self.pages();
         let spans: Vec<(usize, usize)> = self.mappings().iter().map(|m| m.span()).collect();
         let eligible = |p: usize| pages.get(p) == PRESENT && spans.iter().any(|&(a, b)| (a..b).contains(&p));
-        let hot: Vec<usize> = set.filter(|&p| eligible(p)).collect();
+        // One past what fits is enough to know they do not.
+        let hot: Vec<usize> = set_bits(&dirty).filter(|&p| eligible(p)).take(buf.pages() + 1).collect();
         if hot.len() > buf.pages() {
             self.recycle_buf(buf);
             return None;
@@ -173,7 +172,7 @@ impl Pager {
         // Taken: unless this checkpoint is taken, the next one has nothing to compare with.
         let prev = self.hot_prev.lock().unwrap().take();
         let next_to = |p: usize| self.addr(p).ok().zip(self.addr(p - 1).ok()).is_some_and(|(a, b)| a == b + PAGE_SIZE as u64);
-        let read = |p: usize, dst: &mut [u8]| self.read_into(p, &[libc::iovec { iov_base: dst.as_mut_ptr().cast(), iov_len: dst.len() }]);
+        let read = |p: usize, dst: &mut [u8]| self.read_at((p * PAGE_SIZE) as u64, &[libc::iovec { iov_base: dst.as_mut_ptr().cast(), iov_len: dst.len() }]);
         copy(buf, prev, hot, next_to, read).inspect_err(|e| eprintln!("uffd: hot pages not copied, protecting them: {e}")).ok()
     }
 
@@ -236,7 +235,7 @@ fn copy(
         }
         unchanged.lock().unwrap().extend(same);
     };
-    let threads = HOT_THREADS.min(thread::available_parallelism().map_or(1, |n| n.get())).min(runs.len().div_ceil(8));
+    let threads = HOT_THREADS.min(crate::util::host_cpus()).min(runs.len().div_ceil(8));
     thread::scope(|s| {
         for _ in 1..threads {
             // Fewer threads if they cannot be had: this one copies too.

@@ -71,18 +71,25 @@ fn read_request(stream: &mut impl Read, req: &mut [u8; 12], stop: &impl Fn() -> 
 
 impl Pager {
     pub fn read_guest(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
-        let Some(m) = self.locate(offset) else { bail!("offset {offset:#x} outside guest memory") };
-        if offset + buf.len() as u64 > m.offset + m.size as u64 {
-            bail!("read crosses a region boundary");
+        Ok(self.read_at(offset, &[libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() }])?)
+    }
+
+    /// Reads guest memory from `offset` out of Firecracker into the buffers `local`, as many bytes as they hold, all
+    /// within one region.
+    pub(super) fn read_at(&self, offset: u64, local: &[libc::iovec]) -> io::Result<()> {
+        let len: usize = local.iter().map(|v| v.iov_len).sum();
+        let Some(m) = self.locate(offset) else { return Err(io::Error::other(format!("offset {offset:#x} outside guest memory"))) };
+        if offset + len as u64 > m.offset + m.size as u64 {
+            return Err(io::Error::other("read crosses a region boundary"));
         }
-        let local = libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() };
-        let remote = libc::iovec { iov_base: (m.base_host_virt_addr + (offset - m.offset)) as *mut _, iov_len: buf.len() };
+        let remote = libc::iovec { iov_base: (m.base_host_virt_addr + (offset - m.offset)) as *mut _, iov_len: len };
         let pid = self.pid.load(Ordering::SeqCst) as libc::pid_t;
-        if unsafe { libc::process_vm_readv(pid, &local, 1, &remote, 1, 0) } != buf.len() as isize {
-            bail!("process_vm_readv: {}", io::Error::last_os_error());
+        if unsafe { libc::process_vm_readv(pid, local.as_ptr(), local.len() as _, &remote, 1, 0) } != len as isize {
+            return Err(io::Error::other(format!("process_vm_readv: {}", io::Error::last_os_error())));
         }
+        // The pid was Firecracker's all along.
         if self.exited() {
-            bail!("firecracker exited");
+            return Err(io::Error::other("firecracker exited"));
         }
         Ok(())
     }

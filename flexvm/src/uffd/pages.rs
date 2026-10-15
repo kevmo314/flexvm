@@ -11,6 +11,13 @@ mod sealed {
     impl ZeroAtomic for super::AtomicU64 {}
 }
 
+/// The set bits of `words` (a bit a page), in ascending page order.
+pub(super) fn set_bits(words: &[u64]) -> impl Iterator<Item = usize> + '_ {
+    words.iter().enumerate().flat_map(|(w, &bits)| {
+        std::iter::successors((bits != 0).then_some(bits), |b| Some(b & (b - 1)).filter(|&b| b != 0)).map(move |b| w * 64 + b.trailing_zeros() as usize)
+    })
+}
+
 /// Zeroed atomic storage, lazily backed by the kernel, with each type's alignment.
 pub(crate) fn zeroed_atomics<T: sealed::ZeroAtomic>(n: usize) -> Vec<T> {
     if n == 0 {
