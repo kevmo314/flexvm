@@ -16,7 +16,7 @@
 //! next one's.
 
 use super::pages::set_bits;
-use super::{Pager, PRESENT};
+use super::{Mapping, Pager, PRESENT};
 use crate::bail;
 use crate::util::{Result, PAGE_SIZE};
 use std::io;
@@ -171,9 +171,8 @@ impl Pager {
         }
         // Taken: unless this checkpoint is taken, the next one has nothing to compare with.
         let prev = self.hot_prev.lock().unwrap().take();
-        let next_to = |p: usize| self.addr(p).ok().zip(self.addr(p - 1).ok()).is_some_and(|(a, b)| a == b + PAGE_SIZE as u64);
         let read = |p: usize, dst: &mut [u8]| self.read_at((p * PAGE_SIZE) as u64, &[libc::iovec { iov_base: dst.as_mut_ptr().cast(), iov_len: dst.len() }]);
-        copy(buf, prev, hot, next_to, read).inspect_err(|e| eprintln!("uffd: hot pages not copied, protecting them: {e}")).ok()
+        copy(buf, prev, hot, |p| next_to(self.mappings(), p), read).inspect_err(|e| eprintln!("uffd: hot pages not copied, protecting them: {e}")).ok()
     }
 
     /// The memory of hot pages no checkpoint needs any more is the next one's (`prepare_hot`), unless it has larger.
@@ -189,6 +188,12 @@ impl Pager {
             *spare = Some(buf);
         }
     }
+}
+
+/// Whether page `p`'s memory follows that of page `p - 1` in the same region (a read stays within one).
+fn next_to(mappings: &[Mapping], p: usize) -> bool {
+    let off = (p * PAGE_SIZE) as u64;
+    mappings.iter().any(|m| off > m.offset && off < m.offset + m.size as u64)
 }
 
 /// Copies the pages `hot` (ascending, at most as many as `buf` holds) into `buf` with several threads, with `read` (a
@@ -318,6 +323,26 @@ mod tests {
         let last = copy_of(&mem, Some(next.held.clone()), vec![3, 5, 200], &Mutex::new(Vec::new()));
         assert_eq!(last.unchanged, [3, 5, 200]);
         assert!(!last.keeps(3) && !last.keeps(5) && !last.keeps(200));
+    }
+
+    #[test]
+    fn hot_runs_stop_at_region_ends() {
+        // Two regions next to each other in guest and host memory alike.
+        let regions = [
+            Mapping { base_host_virt_addr: 0, offset: 0, size: 512 * PAGE_SIZE },
+            Mapping { base_host_virt_addr: (512 * PAGE_SIZE) as u64, offset: (512 * PAGE_SIZE) as u64, size: 512 * PAGE_SIZE },
+        ];
+        assert!(next_to(&regions, 511) && next_to(&regions, 513));
+        assert!(!next_to(&regions, 0) && !next_to(&regions, 512) && !next_to(&regions, 1024));
+        let reads = Mutex::new(Vec::new());
+        let read = |p: usize, dst: &mut [u8]| {
+            reads.lock().unwrap().push((p, dst.len() / PAGE_SIZE));
+            Ok(())
+        };
+        copy(Buf::new(4).unwrap(), None, vec![510, 511, 512, 513], |p| next_to(&regions, p), read).unwrap();
+        let mut runs = reads.into_inner().unwrap();
+        runs.sort();
+        assert_eq!(runs, [(510, 2), (512, 2)]);
     }
 
     #[test]
