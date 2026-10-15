@@ -241,7 +241,7 @@ fn exchange(r: &mut BufReader<crate::util::By<UnixStream>>, mut req: &[u8], sent
     // After a partial write the request may have reached Firecracker: never replay it.
     while !req.is_empty() {
         match r.get_mut().write(req) {
-            Ok(0) => return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "firecracker request write returned zero").into()),
+            Ok(0) => return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "request write returned zero").into()),
             Ok(n) => {
                 *sent = true;
                 req = &req[n..];
@@ -252,11 +252,11 @@ fn exchange(r: &mut BufReader<crate::util::By<UnixStream>>, mut req: &[u8], sent
     }
     let mut status = String::new();
     if r.read_line(&mut status)? == 0 {
-        bail!("firecracker closed the connection without answering");
+        bail!("closed the connection without answering");
     }
     let code: u16 = status.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
     if code == 0 || !status.ends_with("\r\n") {
-        bail!("firecracker: invalid response status");
+        bail!("invalid response status");
     }
     let mut len = None;
     let mut close = false;
@@ -264,34 +264,34 @@ fn exchange(r: &mut BufReader<crate::util::By<UnixStream>>, mut req: &[u8], sent
         let mut h = String::new();
         r.read_line(&mut h)?;
         if !h.ends_with("\r\n") {
-            bail!("firecracker: incomplete response headers");
+            bail!("incomplete response headers");
         }
         if h == "\r\n" {
             break;
         }
         let Some((k, v)) = h.trim_end().split_once(':') else {
-            bail!("firecracker: invalid response header");
+            bail!("invalid response header");
         };
         if k.eq_ignore_ascii_case("content-length") {
             let n: usize = v.trim().parse()?;
             if len.is_some_and(|previous| previous != n) {
-                bail!("firecracker: conflicting content lengths");
+                bail!("conflicting content lengths");
             }
             len = Some(n);
         } else if k.eq_ignore_ascii_case("connection") {
             close |= v.split(',').any(|v| v.trim().eq_ignore_ascii_case("close"));
         } else if k.eq_ignore_ascii_case("transfer-encoding") {
-            bail!("firecracker: unsupported transfer encoding");
+            bail!("unsupported transfer encoding");
         }
     }
     // micro_http omits Content-Length for 204; reading to EOF would lose keep-alive.
     let len = if code == 204 || code == 304 {
         if code == 204 && len.is_some_and(|n| n != 0) {
-            bail!("firecracker: nonzero content length for 204");
+            bail!("nonzero content length for 204");
         }
         0
     } else {
-        len.ok_or("firecracker: missing content length")?
+        len.ok_or("missing content length")?
     };
     let mut buf = vec![0; len];
     r.read_exact(&mut buf)?;
