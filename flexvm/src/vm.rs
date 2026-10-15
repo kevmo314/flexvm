@@ -703,10 +703,16 @@ impl Vm {
         }
         let half = Instant::now() + deadline.saturating_duration_since(Instant::now()) / 2;
         let mut gave_up = false;
+        // Test fault `settle_unpause`: the test paused the vCPUs to hold a resize until now.
+        let mut unpause = crate::host::fault("settle_unpause");
         loop {
             let left = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
             let hp = self.hotplug(left)?;
             let (requested, plugged) = (hp["requested_size_mib"].as_u64(), hp["plugged_size_mib"].as_u64());
+            if std::mem::take(&mut unpause) {
+                crate::log!("vm {}: injected fault: resuming its vCPUs at {plugged:?} of {requested:?} MiB plugged", self.name);
+                self.fc(|fc| fc.resume())?;
+            }
             if requested.is_some() && requested == plugged {
                 return Ok(());
             }
