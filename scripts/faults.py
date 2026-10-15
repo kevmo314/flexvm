@@ -6179,8 +6179,8 @@ def gc_debris():
         if os.path.exists(p):
             os.unlink(p)
     cleanup(n)
-    # A VM process killed during a checkpoint leaves its root-only staging in the checkpoint's directory: the sweep that
-    # reaps it removes that (#310).
+    # A VM process killed during a checkpoint leaves its root-only staging in the checkpoint's directory: gc leaves it
+    # (#329), and the next checkpoint into that directory clears it.
     n, d = "ft-gc-ck", ckpt_path("ft-gc-ckdir")
     os.makedirs(d)
     ok(run(A, n))
@@ -6193,9 +6193,13 @@ def gc_debris():
     signal_vm(A, n, signal.SIGKILL)
     t.join()
     fault(A, "ckpt_slow", 0)
-    check("gc: the killed checkpoint's staging stays until a sweep", staged(), os.listdir(d))
     ok(cli_json(A, "debug", "gc"))
-    check("gc: a dead process's checkpoint staging goes", not staged() and not os.path.exists(os.path.join(d, "ck")), os.listdir(d))
+    check("gc: the killed checkpoint's staging stays through a sweep", staged(), os.listdir(d))
+    n2 = "ft-gc-ck2"
+    ok(run(A, n2))
+    ok(checkpoint(A, n2, os.path.join(d, "ck2")))
+    check("gc: the next checkpoint into the directory clears the dead one's staging", not staged() and not os.path.exists(os.path.join(d, "ck")), os.listdir(d))
+    cleanup(n2)
     cleanup(n)
     rm_ckpt(d)
 

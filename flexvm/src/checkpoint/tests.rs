@@ -310,7 +310,7 @@ fn page_sync_and_pagemap_errors_leave_staging_unpublished() {
     let dir = tmp("parallel-sync");
     let dest = dir.join("ck");
     {
-        let s = Staging::new(&dest, dir.join("vmstate.private"), &dir).unwrap();
+        let s = Staging::new(&dest, dir.join("vmstate.private")).unwrap();
         let pages = s.create("pages").unwrap();
         (&pages).write_all(b"pages").unwrap();
         let map = s.sync_pages_and_pagemap(&pages, b"map").unwrap();
@@ -322,7 +322,7 @@ fn page_sync_and_pagemap_errors_leave_staging_unpublished() {
         assert!(!dest.exists());
     }
     {
-        let s = Staging::new(&dest, dir.join("vmstate.private"), &dir).unwrap();
+        let s = Staging::new(&dest, dir.join("vmstate.private")).unwrap();
         // /dev/null accepts writes but cannot be fsynced: propagate the worker's error.
         let pages = File::options().write(true).open("/dev/null").unwrap();
         assert!(s.sync_pages_and_pagemap(&pages, b"map").is_err());
@@ -346,9 +346,9 @@ fn staging_is_private_never_overwrites_and_cleans_up() {
     fs::create_dir_all(&foreign).unwrap();
     fs::set_permissions(&stale, fs::Permissions::from_mode(0o700)).unwrap();
     fs::set_permissions(&foreign, fs::Permissions::from_mode(0o755)).unwrap();
-    let s = Staging::new(&dest, dir.join("vmstate.private"), &dir).unwrap();
+    let s = Staging::new(&dest, dir.join("vmstate.private")).unwrap();
     assert!(!stale.exists() && foreign.exists());
-    let other = Staging::new(&dir.join("other"), dir.join("other.vmstate"), &dir).unwrap();
+    let other = Staging::new(&dir.join("other"), dir.join("other.vmstate")).unwrap();
     drop(other);
     let ours = format!("{STAGING_PREFIX}{}", std::process::id());
     let mine =
@@ -368,7 +368,7 @@ fn staging_is_private_never_overwrites_and_cleans_up() {
     drop(s);
     assert!(!dest.exists() && mine().is_empty());
     fs::create_dir_all(&dest).unwrap();
-    assert!(Staging::new(&dest, dir.join("vmstate.private"), &dir).is_err());
+    assert!(Staging::new(&dest, dir.join("vmstate.private")).is_err());
     fs::remove_dir_all(&dir).unwrap();
 }
 
