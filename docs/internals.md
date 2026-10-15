@@ -452,7 +452,17 @@ through, so the checkpoint is exactly the memory at the pause.
   route goes back to it, so they arrive ahead of newer traffic. A checkpoint
   reports them as `held_packets`. A 1 kHz UDP stream through 6 checkpoints
   lost 59 datagrams (7–11 per pause) before, none now
-  (`scripts/faults.py ckpt_packet_hold`).
+  (`scripts/faults.py ckpt_packet_hold`). Packets already routed to the hold
+  device can still reach it after release (#292). For 30 seconds after the
+  route moves on, these stragglers are re-sent through a raw IP socket to
+  the address's current route, with TTL reduced by one to prevent loops.
+  They can arrive behind newer traffic. An expired TTL, no raw socket, a
+  send failure (including exceeding the new route's MTU), or a fragment
+  with IP ID zero counts as a drop; packets after a release that did not
+  move the route are dropped too. Reports are rate-limited per address:
+  `hold IP: re-sent N packets that reached ...`, or
+  `hold IP: dropped N packets that reached ..., re-sent M` when any were
+  lost. The `dropped N` form is what loss accounting reads.
 - **The tap's queue is taken before the pause.** Frames already routed to
   the tap wait in tun's ring until the guest posts rx buffers, and paused
   vCPUs post none, so whatever is queued there at the pause dies with the
@@ -491,9 +501,14 @@ through, so the checkpoint is exactly the memory at the pause.
   block and marks it dirty, as do installs and discards. At each
   checkpoint's pause only the pages dirtied since are protected again, so
   the pause does not grow with memory size. They are protected range by
-  range (ranges closer than 64 pages merged; ~6–9 µs a call here), never
-  the whole region at once: KVM drops its mappings of everything in a
-  protected range, so the guest would refault all it uses there, clean
+  range (`protect_ranges` merges gaps of up to 64 pages; ~6–9 µs a call
+  here). Above `PROTECT_MAX` (4,096 ranges per region), it widens the merge
+  gap fourfold per pass until the count fits or the gap spans the region
+  (#293). It never merges across kept hot pages: the real bound is
+  `max(PROTECT_MAX, kept_runs + 1)`, up to 16,385 with the default 64 MiB
+  hot-page budget if each kept page is isolated. Wider merging trades
+  extra refaults for fewer protection calls: KVM drops its mappings of
+  everything in a protected range, so the guest would refault all it uses there, clean
   pages too. With a guest reading 256 MiB of a 1 GiB region, protecting
   the whole region cost 66k refaults a checkpoint against 3–17k range by
   range, and no shorter a pause; with nothing of it mapped, at most ~3 ms

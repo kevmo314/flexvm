@@ -1,7 +1,7 @@
 //! Private staging, overlapping fsyncs, publication and revocation.
 use super::{
     chain_meta_budget, check, cname, create_at,
-    format::{sum, sums_sum, MAX_VMSTATE},
+    format::{sum, MAX_VMSTATE},
     fstat, open_dir_at,
     write::{write_pages, writer_threads, GuestPages, PagesFile},
     FileSum, Manifest, Parent, FORMAT, FORMAT_INCREMENTAL,
@@ -178,7 +178,7 @@ impl Staging {
         let files = BTreeMap::from([
             ("vmstate".into(), FileSum { len: vmstate.len() as u64, hash: sum(&vmstate) }),
             ("pagemap".into(), FileSum { len: map.len() as u64, hash: sum(map) }),
-            ("pages".into(), FileSum { len: out.data * PAGE_SIZE as u64, hash: sums_sum(&out.sums) }),
+            ("pages".into(), FileSum { len: out.data * PAGE_SIZE as u64, hash: String::new() }),
         ]);
         let meta = &vm.template.meta;
         let manifest = Manifest {

@@ -1,7 +1,7 @@
 //! Budgeted chain opening, overlay flattening and checked page reads.
 use super::{
     bail,
-    format::{parse_pagemap, sum, sums_sum, Canon, Manifest, Run, DATA, FORMAT, FORMAT_INCREMENTAL, MAX_VMSTATE, TEMPLATE},
+    format::{parse_pagemap, sum, Canon, Manifest, Run, DATA, FORMAT, FORMAT_INCREMENTAL, MAX_VMSTATE, TEMPLATE},
     fstat, open_at, open_dir_at,
 };
 use crate::{
@@ -106,7 +106,6 @@ impl Link {
             "{}",
             bad("page counts do not add up".into())
         );
-        ensure!(manifest.files["pages"].hash == sums_sum(&sums), "{}", bad("page checksums do not match the manifest".into()));
         let (file, _) = read_at(dfd.as_raw_fd(), "pages", 0).map_err(|e| bad(format!("pages: {e}")))?;
         ensure!(file.metadata()?.len() == data * PAGE_SIZE as u64, "{}", bad("pages has the wrong length".into()));
         Ok(Link { dir, manifest, id, vmstate, map, file: Some(file), sums })

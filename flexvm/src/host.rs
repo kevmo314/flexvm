@@ -335,7 +335,7 @@ impl Host {
         self.lock_by(None)
     }
 
-    /// Gives up at `deadline`, if any.
+    /// Gives up at `deadline`, if any, with an I/O `WouldBlock` error.
     pub fn lock_by(&self, deadline: Option<std::time::Instant>) -> Result<Locked> {
         if DEPTH.with(|d| d.get()) > 0 {
             DEPTH.with(|d| d.set(d.get() + 1));
@@ -348,7 +348,7 @@ impl Host {
                 match THREADS.try_lock() {
                     Ok(g) => break g,
                     Err(std::sync::TryLockError::Poisoned(e)) => break e.into_inner(),
-                    Err(_) if past() => bail!("the host lock is busy"),
+                    Err(_) if past() => return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "the host lock is busy").into()),
                     Err(_) => std::thread::sleep(Duration::from_millis(2)),
                 }
             },
@@ -362,7 +362,7 @@ impl Host {
                         return Err(e.into());
                     }
                     if past() {
-                        bail!("the host lock is busy");
+                        return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "the host lock is busy").into());
                     }
                     std::thread::sleep(Duration::from_millis(2));
                 }
@@ -814,7 +814,7 @@ impl Host {
         }
     }
 
-    /// Against the reserve: None if refused; errors grant nothing.
+    /// Against the reserve: None if refused; errors grant nothing (`WouldBlock` if the lock is busy).
     pub fn grant(&self, mib: u64, deadline: Option<std::time::Instant>) -> Result<Option<u64>> {
         Ok(self.grant_inner(mib, Floor::Reserve, false, deadline, crate::vmproc::host_available_mib)?.ok().map(|g| g.0))
     }
@@ -2242,7 +2242,9 @@ mod tests {
         });
         held.1.recv().unwrap();
         let start = std::time::Instant::now();
-        assert!(h.lock_by(Some(start + Duration::from_millis(50))).is_err() && start.elapsed() < Duration::from_secs(1));
+        let err = h.lock_by(Some(start + Duration::from_millis(50))).err().unwrap();
+        assert_eq!(err.downcast_ref::<std::io::Error>().unwrap().kind(), std::io::ErrorKind::WouldBlock);
+        assert!(start.elapsed() < Duration::from_secs(1));
         release.0.send(()).unwrap();
         t.join().unwrap();
         // Had once let go of; not within 1 s, as other tests' host locks take the same
@@ -2426,7 +2428,8 @@ mod tests {
             let _ = release.1.recv();
         });
         held.1.recv().unwrap();
-        assert!(h.grant(1, Some(std::time::Instant::now() + Duration::from_millis(50))).is_err());
+        let err = h.grant(1, Some(std::time::Instant::now() + Duration::from_millis(50))).unwrap_err();
+        assert_eq!(err.downcast_ref::<std::io::Error>().unwrap().kind(), std::io::ErrorKind::WouldBlock);
         release.0.send(()).unwrap();
         t.join().unwrap();
         assert_eq!(grants().len(), 1);
