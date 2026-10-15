@@ -110,9 +110,12 @@ pub struct Proc {
     /// what was written out, and the resumed VM reattaches from there.
     pub cmd_session: OnceLock<Mutex<crate::Session>>,
     /// While a suspend runs: the main command neither gives up nor ends the VM.
-    /// A lock, not a flag: the command ending the VM and a suspend starting
-    /// exclude each other (the command holds it through its `destroy`).
-    pub suspending: Mutex<bool>,
+    /// Reserved (`reserve_suspend`) before its worker starts, so SIGTERMs that
+    /// overlap make one suspend; `Ending` once the command ends the VM.
+    pub suspending: Mutex<Suspend>,
+    /// The migration away whose outcome this source has yet to learn (its
+    /// target never said, nor can be asked): a kill meanwhile ends it.
+    reconciling: Mutex<Option<u64>>,
     /// While an operation waits in `settle_arrival` for the arrival's last pages (`debug status` shows it).
     settling: AtomicBool,
     early: Mutex<Vec<i32>>,
@@ -217,7 +220,8 @@ impl Proc {
             claimer: Mutex::new(None),
             cmd: Mutex::new(None),
             cmd_session: OnceLock::new(),
-            suspending: Mutex::new(false),
+            suspending: Mutex::new(Suspend::Idle),
+            reconciling: Mutex::new(None),
             settling: AtomicBool::new(false),
             early: Mutex::new(Vec::new()),
             paused_by_request: AtomicBool::new(false),
@@ -569,12 +573,16 @@ impl Proc {
         std::process::exit(code)
     }
 
-    /// Returns only if refused: a migration source is never killed, as its
-    /// target may still be pulling its memory.
+    /// Returns only if refused: a migration source whose target committed is
+    /// never killed, as the target may still be pulling its memory. One whose
+    /// outcome is still unknown is (`end_reconciling`).
     pub fn destroy(&self, code: i32) -> Error {
         let vm = self.vm();
         let source = || format!("vm {} is the source of a migration in progress; it ends once the target has its memory", vm.name).into();
-        if matches!(vm.state(), State::Source(_)) {
+        if let State::Source(mig) = vm.state() {
+            if self.reconciling.lock().unwrap().take_if(|m| *m == mig).is_some() {
+                self.end_reconciling(mig, code)
+            }
             return source();
         }
         vm.cancel_checkpoint.fetch_add(1, Ordering::SeqCst);
@@ -587,6 +595,49 @@ impl Proc {
             return source();
         }
         self.finish(&op, End::Gone, code, None)
+    }
+
+    /// Marks migration `mig` as one whose outcome is unknown, until `known` takes it back.
+    pub(crate) fn reconciling(&self, mig: u64) {
+        *self.reconciling.lock().unwrap() = Some(mig);
+    }
+
+    /// False if a kill took the reconciliation first (and is ending the process).
+    pub(crate) fn known(&self, mig: u64) -> bool {
+        self.reconciling.lock().unwrap().take_if(|m| *m == mig).is_some()
+    }
+
+    /// A kill while migration `mig`'s outcome is unknown (taken from `reconciling`,
+    /// so its reconciliation never resumes nor reroutes this copy). This copy is
+    /// destroyed as any other: its generation is withdrawn here and at every peer,
+    /// which takes back its loan and frees the address here, and fences the
+    /// target's copy off: uncommitted, it can no longer commit; committed, it
+    /// cannot finish its pull without this copy's memory, and ends without
+    /// putting a route back (its record then reads aborted).
+    fn end_reconciling(&self, mig: u64, code: i32) -> ! {
+        let vm = self.vm();
+        let op = self.op();
+        crate::log!(
+            "vm {}: killed while the outcome of migration {mig} is unknown; generation {} of {} is withdrawn, so a copy its target may have resumed ends too",
+            vm.name,
+            self.gen(),
+            vm.ip
+        );
+        if let Some(h) = self.holder() {
+            h.forget(vm.ip, mig);
+        }
+        self.finish(&op, End::Gone, code, None)
+    }
+
+    /// Reserves the one suspend that may run: None if one already is (it
+    /// takes this request too) or the VM is ending.
+    pub fn reserve_suspend(&self) -> Option<SuspendReserved> {
+        let p = self.arc()?;
+        let mut s = self.suspending.lock().unwrap();
+        (*s == Suspend::Idle).then(|| {
+            *s = Suspend::Suspending;
+            SuspendReserved(p.clone())
+        })
     }
 
     fn withdraw(&self, a: AddrClaim) {
@@ -793,13 +844,19 @@ impl Proc {
                 crate::log!("vm {}: migrating away; it ends once the target has its memory", vm.name);
                 Ok(())
             }
-            libc::SIGTERM => match self.arc() {
-                // Off the signal thread, which a later SIGINT needs.
-                Some(p) => {
-                    thread::spawn(move || crate::log!("vm {}: signal {sig}: {}", p.name(), p.suspend()));
+            libc::SIGTERM => match self.reserve_suspend() {
+                None => {
+                    crate::log!("vm {}: a suspend is already under way, or the vm is ending", vm.name);
                     Ok(())
                 }
-                None => Err(self.suspend()),
+                // Off the signal thread, which a later SIGINT needs. Unspawned, the closure and its reservation are dropped.
+                Some(r) => thread::Builder::new()
+                    .spawn(move || {
+                        let p = r.proc().clone();
+                        crate::log!("vm {}: signal {sig}: {}", p.name(), p.suspend(r))
+                    })
+                    .map(drop)
+                    .map_err(|e| format!("suspending: {e}").into()),
             },
             libc::SIGINT => Err(self.destroy(128 + libc::SIGINT)),
             _ => Ok(()),
@@ -1155,21 +1212,26 @@ impl Proc {
         let cmd = self.cmd.lock().unwrap().clone().unwrap_or_default();
         loop {
             let res = self.cmd_session().and_then(|s| crate::exec_session(&self.host, &self.name(), &cmd, s, true));
-            let suspending = self.suspending.lock().unwrap();
-            if *suspending {
-                // Afterwards an exit status already received is in the session: the next try returns it.
-                drop(suspending);
-                while *self.suspending.lock().unwrap() {
-                    thread::sleep(Duration::from_millis(20));
+            {
+                let mut s = self.suspending.lock().unwrap();
+                if *s == Suspend::Suspending {
+                    // Afterwards an exit status already received is in the session: the next try returns it.
+                    drop(s);
+                    while *self.suspending.lock().unwrap() == Suspend::Suspending {
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    continue;
                 }
-                continue;
+                // No suspend starts from here (the lock is not held through `destroy`, which waits for `op`).
+                *s = Suspend::Ending;
             }
             let code = res.unwrap_or_else(|e| {
                 crate::log!("vm {}: {e}", self.name());
                 FAILED
             });
-            // Holding `suspending`: no suspend starts until the VM is gone (or the kill refused).
-            return crate::log!("vm {}: {}", self.name(), self.destroy(code));
+            let refused = self.destroy(code);
+            *self.suspending.lock().unwrap() = Suspend::Idle;
+            return crate::log!("vm {}: {refused}", self.name());
         }
     }
 
@@ -1219,6 +1281,33 @@ impl Proc {
                 Err(e) => crate::log!("vm {}: checking the guest clock: {e}", vm.name),
             }
         });
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Suspend {
+    Idle,
+    /// Reserved, or running.
+    Suspending,
+    /// The main command is ending the VM.
+    Ending,
+}
+
+/// The reserved suspend: dropped (it failed, or never started), the next may run.
+pub struct SuspendReserved(Arc<Proc>);
+
+impl SuspendReserved {
+    fn proc(&self) -> &Arc<Proc> {
+        &self.0
+    }
+}
+
+impl Drop for SuspendReserved {
+    fn drop(&mut self) {
+        let mut s = self.0.suspending.lock().unwrap();
+        if *s == Suspend::Suspending {
+            *s = Suspend::Idle;
+        }
     }
 }
 

@@ -93,12 +93,20 @@ checkpoint) holds the VM's operation mutex. Requests give up after 30 s;
 what must not be refused (SIGINT, SIGTERM, a dead VM, the end of a
 migration) waits for it, after cancelling a checkpoint in progress.
 SIGTERM's suspend runs off the signal thread, so a SIGINT after it is still
-taken; SIGINT wins: a suspend that published its checkpoint meanwhile
+taken. It is reserved before its thread starts: SIGTERMs while one runs are
+taken into it, and none starts once a `run -- CMD` command ends the VM
+(`suspend_overlap`). SIGINT wins: a suspend that published its checkpoint meanwhile
 revokes it (discarded, address withdrawn) and the process exits destroyed,
 and `flexvm kill` discards one that finished first (`suspend_killed`).
 
 `kill -KILL` on a migration source is the operator's way to give up its
 copy (the target loses the pages it has not pulled); `flexvm kill` refuses.
+A source still waiting to learn whether its target resumed the VM (ack
+lost, status unavailable) is killed by SIGINT or SIGQUIT as any VM: its
+generation is withdrawn here and at every peer, which takes back its loan,
+fences off an uncommitted target and leaves a committed one (which cannot
+finish its pull) to end without a route; its record then reads aborted
+(`reconcile_kill`).
 
 ## On-disk state
 
@@ -487,7 +495,8 @@ where it is kept and what tests it.
    resumes only a VM paused by SIGTSTP (or held by `restore --paused`), and
    is ignored once a suspend or kill began: the kernel sends it after any
    SIGSTOP, systemd right after SIGTERM. A destroy refused because the VM is
-   migrating away (SIGINT, or `run -- CMD` ending) never ends the process,
+   migrating away (SIGINT, or `run -- CMD` ending), its target having
+committed, never ends the process,
    and takes back the checkpoint cancel it raised (fault
    `kill_refused_checkpoint`).
 6. **Suspend markers and quarantine.** `STARTED` means consumed: `resume`
