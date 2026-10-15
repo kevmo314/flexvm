@@ -10,7 +10,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::process::{Child, ChildStderr, ChildStdout, Command};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -30,8 +30,18 @@ const MAX_LINE: u64 = 2 * MAX_BODY as u64 + 128;
 const MAX_BODY_READERS: usize = 16;
 static BODY_READERS: AtomicUsize = AtomicUsize::new(0);
 
-/// Exit codes of children someone waits for, by pid (None while running).
-type Statuses = Arc<(Mutex<HashMap<i32, Option<i32>>>, Condvar)>;
+/// Children someone waits for, by pid.
+type Statuses = Arc<(Mutex<HashMap<i32, Watched>>, Condvar)>;
+
+/// A spawned child in `Statuses`. Its pid can be reused once it is reaped; its token never is.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Watched {
+    token: u64,
+    /// The exit code, once reaped.
+    exit: Option<i32>,
+}
+
+static TOKENS: AtomicU64 = AtomicU64::new(1);
 
 fn main() {
     if unsafe { libc::getpid() } == 1 {
@@ -147,8 +157,8 @@ fn reap(statuses: Statuses) {
             Err(_) => return,
             Ok(pid) => {
                 let code = if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { 128 + libc::WTERMSIG(status) };
-                if let Some(exit) = map.get_mut(&pid) {
-                    *exit = Some(code);
+                if let Some(watched) = map.get_mut(&pid) {
+                    watched.exit = Some(code);
                     cv.notify_all();
                 }
             }
@@ -157,28 +167,29 @@ fn reap(statuses: Statuses) {
 }
 
 fn spawn(command: &mut Command, statuses: &Statuses) -> io::Result<Child> {
-    spawn_watched(command, statuses, false).map(|(child, _)| child)
+    spawn_watched(command, statuses, false).map(|(child, _, _)| child)
 }
 
-/// With `pidfd`, also a pidfd for the child (None if the kernel has none), opened before the
-/// reaper can reap it, so it never names a reused pid.
-fn spawn_watched(command: &mut Command, statuses: &Statuses, pidfd: bool) -> io::Result<(Child, Option<OwnedFd>)> {
+/// Also returns the child's token in `Statuses` and, with `pidfd`, a pidfd for it (None if the
+/// kernel has none), opened before the reaper can reap it, so it never names a reused pid.
+fn spawn_watched(command: &mut Command, statuses: &Statuses, pidfd: bool) -> io::Result<(Child, Option<OwnedFd>, u64)> {
     let (lock, cv) = &**statuses;
     // Held through spawn and registration, even if the child exits at once.
     let mut map = lock.lock().unwrap();
     let child = command.spawn()?;
     let fd = pidfd.then(|| unsafe { libc::syscall(libc::SYS_pidfd_open, child.id() as libc::pid_t, 0) as RawFd });
     let fd = fd.filter(|&fd| fd >= 0).map(|fd| unsafe { OwnedFd::from_raw_fd(fd) });
-    map.insert(child.id() as i32, None);
+    let token = TOKENS.fetch_add(1, Ordering::Relaxed);
+    map.insert(child.id() as i32, Watched { token, exit: None });
     cv.notify_all();
-    Ok((child, fd))
+    Ok((child, fd, token))
 }
 
 fn wait_pid(statuses: &Statuses, pid: i32, deadline: Option<Instant>) -> Option<i32> {
     let (lock, cv) = &**statuses;
     let mut map = lock.lock().unwrap();
     loop {
-        if let Some(Some(code)) = map.get(&pid).copied() {
+        if let Some(Watched { exit: Some(code), .. }) = map.get(&pid).copied() {
             map.remove(&pid);
             return Some(code);
         }
