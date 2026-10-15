@@ -372,9 +372,11 @@ impl Vm {
 
     /// What is queued on its tap, read off it. Its Firecracker paused, that reached the tap after
     /// `drain_tap` last looked, from a sender that looked the route up before the hold (#379).
-    pub fn take_tap_queue(&self) -> Vec<Vec<u8>> {
+    pub fn take_tap_queue(&self, each: &mut dyn FnMut(&[u8])) {
         self.tap_stuck.store(false, Ordering::SeqCst);
-        self.tap_watch.lock().unwrap().as_ref().map_or_else(Vec::new, |(_, fd)| crate::net::read_tap_queue(fd))
+        if let Some((_, fd)) = self.tap_watch.lock().unwrap().as_ref() {
+            crate::net::read_tap_queue(fd, each);
+        }
     }
 
     /// `n` of the tap's drops were reported (with packets a hold injected); `tap_dropped` leaves them out.
@@ -863,7 +865,7 @@ impl Vm {
                     if !matches!(gone, Ok(true)) {
                         crate::log!("vm {}: firecracker not seen gone ({gone:?}); counting what is left on its tap anyway", self.name);
                     }
-                    let n = crate::net::read_tap_queue(&fd).len();
+                    let n = crate::net::read_tap_queue(&fd, &mut |_| {});
                     crate::log!("vm {}: dropped {n} frames still queued on its tap when it left (its guest was not taking them)", self.name);
                 }
             }

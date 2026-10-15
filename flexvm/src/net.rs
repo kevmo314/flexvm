@@ -64,17 +64,19 @@ pub fn tap_queued(fd: &OwnedFd) -> Result<bool> {
 }
 
 /// Reads off the frames queued on a tap (`tap_fd_of`, non-blocking as Firecracker opened it),
-/// each with its virtio-net header: for a VM leaving them, so they are passed on or counted.
-pub fn read_tap_queue(fd: &OwnedFd) -> Vec<Vec<u8>> {
+/// each with its virtio-net header, handing each to `each` as it is read: for a VM leaving
+/// them, so they are passed on or counted. Returns how many.
+pub fn read_tap_queue(fd: &OwnedFd, each: &mut dyn FnMut(&[u8])) -> u64 {
     // A frame with its virtio-net header, up to the 64 KiB a GSO frame can be.
     let mut buf = vec![0u8; 65562 + 64];
-    let mut frames = Vec::new();
+    let mut n = 0;
     // Bounded by the ring (TAP_QUEUE) and in case the descriptor were blocking after all.
-    while frames.len() < TAP_QUEUE as usize && tap_queued(fd).unwrap_or(false) {
-        let Ok(n) = usize::try_from(unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) }) else { break };
-        frames.push(buf[..n].to_vec());
+    while n < u64::from(TAP_QUEUE) && tap_queued(fd).unwrap_or(false) {
+        let Ok(len) = usize::try_from(unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) }) else { break };
+        each(&buf[..len]);
+        n += 1;
     }
-    frames
+    n
 }
 
 /// Process `pid`'s descriptor attached to `tap` (its fdinfo says `iff: TAP`), duplicated here
@@ -632,18 +634,22 @@ impl IpRange {
         Ok(IpRange { first: base + 1, last: (base | !mask) - 1 })
     }
 
-    /// Never one with a 16-bit half all zeros or all ones: checksum completion can rewrite one
-    /// into the other and still leave the IP header checksum valid (#365), forging a source.
     pub fn contains(&self, ip: Ipv4Addr) -> bool {
+        (self.first..=self.last).contains(&u32::from(ip))
+    }
+
+    /// In it, and never with a 16-bit half all zeros or all ones: checksum completion could
+    /// rewrite one into the other and leave the IP header checksum valid (#365), forging a source.
+    pub fn allocatable(&self, ip: Ipv4Addr) -> bool {
         let n = u32::from(ip);
-        (self.first..=self.last).contains(&n) && [n >> 16, n & 0xffff].iter().all(|h| ![0, 0xffff].contains(h))
+        self.contains(ip) && [n >> 16, n & 0xffff].iter().all(|h| ![0, 0xffff].contains(h))
     }
 
     /// The first address not `taken`, looking from `hint` (if in range) to the
     /// end, then from the start: each address at most once.
     pub fn allocate(&self, hint: Option<Ipv4Addr>, taken: impl Fn(Ipv4Addr) -> bool) -> Option<Ipv4Addr> {
         let start = hint.map(u32::from).filter(|h| (self.first..=self.last).contains(h)).unwrap_or(self.first);
-        (start..=self.last).chain(self.first..start).map(Ipv4Addr::from).find(|ip| self.contains(*ip) && !taken(*ip))
+        (start..=self.last).chain(self.first..start).map(Ipv4Addr::from).find(|ip| self.allocatable(*ip) && !taken(*ip))
     }
 
     /// The address after `ip`, wrapping around.
@@ -681,8 +687,9 @@ mod tests {
     fn no_address_has_a_half_of_all_zeros_or_ones() {
         let r = IpRange::parse("10.9.255.254-10.10.0.2").unwrap();
         let ip = |s: &str| s.parse::<Ipv4Addr>().unwrap();
-        assert!(r.contains(ip("10.9.255.254")) && r.contains(ip("10.10.0.1")));
-        assert!(!r.contains(ip("10.9.255.255")) && !r.contains(ip("10.10.0.0")));
+        assert!(r.allocatable(ip("10.9.255.254")) && r.allocatable(ip("10.10.0.1")));
+        assert!(!r.allocatable(ip("10.9.255.255")) && !r.allocatable(ip("10.10.0.0")));
+        assert!(r.contains(ip("10.9.255.255")) && r.contains(ip("10.10.0.0")), "still in it: a home address");
         let mut got = Vec::new();
         while let Some(a) = r.allocate(None, |a| got.contains(&a)) {
             got.push(a);

@@ -254,14 +254,19 @@ impl Peers {
         addrs
     }
 
-    /// `addrs`, or an error while a name has none yet (its lookup started): it could be any
-    /// address, so nothing is decided by them meanwhile; asked again, it may have one.
-    fn all_addrs(&self, names: &[String]) -> Result<Vec<IpAddr>> {
-        let addrs = self.addrs(names);
-        let r = self.0.resolved.read().unwrap();
-        match names.iter().find(|n| n.parse::<SocketAddr>().is_err() && !r.contains_key(*n)) {
-            Some(n) => bail!("peer {n} is not resolved yet; try again"),
-            None => Ok(addrs),
+    /// `addrs` once no name without addresses has its lookup under way (it could give any
+    /// address), waiting for one until `by`, then an error: asked again, it may have ended. A
+    /// lookup that ended with none (a name that does not resolve) gives none (#411).
+    fn all_addrs(&self, names: &[String], by: Instant) -> Result<Vec<IpAddr>> {
+        loop {
+            let addrs = self.addrs(names);
+            if !self.resolving(names).0 {
+                return Ok(addrs);
+            }
+            if Instant::now() >= by {
+                bail!("a peer's name is still being looked up; try again");
+            }
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 
@@ -386,9 +391,9 @@ fn handle(host: &Host, peers: &Peers, mut conn: TcpStream, deadline: Instant) ->
         "pages" => return pages(host, &req, conn),
         "migration" => migration(host, &req),
         // Its peers by address, those configured by name too, and the one asking.
-        "route" => {
-            peers.all_addrs(&host.config_now().peers).and_then(|p| route(host, &req, &[p, conn.peer_addr().into_iter().map(|a| a.ip()).collect()].concat()))
-        }
+        "route" => peers
+            .all_addrs(&host.config_now().peers, Instant::now() + ADMIT_WAIT)
+            .and_then(|p| route(host, &req, &[p, conn.peer_addr().into_iter().map(|a| a.ip()).collect()].concat())),
         "lend" => lend(host, &req),
         // Whether a migration's source process is proven gone (never from published state).
         "source" => serde_json::from_value(req["ident"].clone())
@@ -588,10 +593,16 @@ mod tests {
         let gw: Ipv4Addr = "10.96.0.1".parse().unwrap();
         // The peer configured by name, as resolved; and the one asking.
         let p = Peers::default();
-        let e = p.all_addrs(&cfg.peers).unwrap_err().to_string();
-        assert!(e.contains("peer.example:7000 is not resolved yet"), "refused until the name has addresses: {e}");
+        let soon = || Instant::now() + Duration::from_millis(50);
+        // Its lookup under way: refused, after a wait.
+        p.0.lookups.lock().unwrap().insert("peer.example:7000".into(), None);
+        let e = p.all_addrs(&cfg.peers, soon()).unwrap_err().to_string();
+        assert!(e.contains("still being looked up"), "{e}");
+        // Ended with no address (it does not resolve): no addresses, not a refusal forever.
+        p.0.lookups.lock().unwrap().insert("peer.example:7000".into(), Some(Instant::now()));
+        assert_eq!(p.all_addrs(&cfg.peers, soon()).unwrap(), ["10.98.0.1".parse::<IpAddr>().unwrap()]);
         p.0.resolved.write().unwrap().insert("peer.example:7000".into(), vec!["10.94.0.1".parse().unwrap()]);
-        let peers = [p.all_addrs(&cfg.peers).unwrap(), vec!["10.95.0.1".parse().unwrap()]].concat();
+        let peers = [p.all_addrs(&cfg.peers, soon()).unwrap(), vec!["10.95.0.1".parse().unwrap()]].concat();
         let check = |ip: &str| routable(ip.parse().unwrap(), &cfg, &peers, &[gw]);
         for ip in ["127.0.0.1", "0.0.0.0", "255.255.255.255", "224.0.0.1", "10.98.0.1", "10.94.0.1", "10.97.0.1", "10.96.0.1", "10.95.0.1"] {
             assert!(check(ip).is_err(), "{ip} is refused");

@@ -562,7 +562,7 @@ impl Host {
         let range = self.cfg.range()?;
         let taken = |ip| self.addr(l, ip).map_or(true, |a| a.lent.is_some() || self.held(&a));
         let ip = match want {
-            Some(ip) if !range.contains(ip) => {
+            Some(ip) if !range.allocatable(ip) => {
                 bail!("{ip} is not this host's to hand out (range {range}): start the vm on its home host, or let it pick an address")
             }
             Some(ip) if self.addr(l, ip)?.lent.is_some() => bail!("{ip} is lent out, with a vm that migrated away"),
@@ -590,7 +590,8 @@ impl Host {
     }
 
     pub fn lend_new(&self, l: &Locked, ip: Ipv4Addr) -> Result<u64> {
-        if !self.cfg.range()?.contains(ip) {
+        // A fresh loan: only an address this host would hand out itself.
+        if !self.cfg.range()?.allocatable(ip) {
             bail!("{ip} is not from this host's range {}", self.cfg.vm_ips);
         }
         let a = self.addr(l, ip)?;
@@ -3249,6 +3250,18 @@ mod tests {
         assert!(!h.observe(&l, x, 7, 5, b).unwrap());
         assert!(h.observe(&l, x, 8, 0, a).unwrap(), "a newer generation starts over");
         assert!(h.observe(&l, x, 8, 0, None).unwrap() && !h.observe(&l, x, 8, 9, b).unwrap(), "a withdrawal takes every revision");
+    }
+
+    /// A peer borrows no address this host would not hand out itself (#415).
+    #[test]
+    fn no_fresh_loan_or_claim_of_a_zero_half_address() {
+        let (_dir, mut h) = host("zero-half");
+        h.cfg.vm_ips = "10.9.255.254-10.10.0.2".into();
+        let l = h.lock().unwrap();
+        for x in [ip("10.10.0.0"), ip("10.9.255.255")] {
+            assert!(h.lend_new(&l, x).is_err() && h.claim_new(&l, "w", Some(x)).is_err(), "{x}");
+        }
+        h.lend_new(&l, ip("10.10.0.1")).unwrap();
     }
 
     #[test]
