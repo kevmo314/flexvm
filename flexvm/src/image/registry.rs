@@ -287,7 +287,8 @@ pub(super) fn sweep_parts(dir: &Path) {
         let Some((hex, id)) = name.to_str().and_then(|n| n.rsplit_once(".part")) else { continue };
         if crate::util::is_nonce(id) && hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
             let Ok(f) = std::fs::File::open(entry.path()) else { continue };
-            if crate::host::flock(&f, libc::LOCK_EX | libc::LOCK_NB).is_ok() {
+            // Let go explicitly, not by close: a child another thread forks shares the descriptor.
+            if let Ok(_held) = crate::host::Flock::new(f, libc::LOCK_EX | libc::LOCK_NB) {
                 let _ = std::fs::remove_file(entry.path());
             }
         }

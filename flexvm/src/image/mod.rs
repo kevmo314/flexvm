@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 
 use crate::bail;
 use crate::guest;
-use crate::host::flock;
+use crate::host::{flock, Flock};
 use crate::template::interrupted;
 use crate::util::{cpath, is_nonce, nonce, stat_at};
 use crate::util::{ms, rename_noreplace, run_until, sync_dir, Result};
@@ -251,6 +251,8 @@ fn cached_rootfs(cached: &Path, build: impl FnOnce(&Path) -> Result<String>, syn
         crate::log!("image: waiting for another build of {}", cached.display());
         wait_lock(&lock, interrupted)?;
     }
+    // Held already: from here let go explicitly, not by close (see `install`).
+    let _lock = Flock::new(lock, libc::LOCK_EX | libc::LOCK_NB)?;
     let marked = match std::fs::symlink_metadata(cached.with_extension("ok")) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
         res => res.map(|_| true)?,
@@ -300,8 +302,8 @@ fn sweep_temporaries(dir: &Path) -> Result<()> {
         let held = match File::open(&lock) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(e.into()),
-            Ok(f) => match flock(&f, libc::LOCK_EX | libc::LOCK_NB) {
-                Ok(()) => Some(f),
+            Ok(f) => match Flock::new(f, libc::LOCK_EX | libc::LOCK_NB) {
+                Ok(held) => Some(held),
                 Err(_) => continue,
             },
         };
@@ -361,18 +363,29 @@ fn install<T>(path: &Path, write: impl FnOnce(&mut File) -> Result<()>, rename: 
     use std::os::unix::fs::OpenOptionsExt;
     let tmp = path.with_extension(format!("part{}", nonce()?));
     let dir = File::open(path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")))?;
+    // Every lock is let go explicitly (`Flock`), not by close: a child another thread forks
+    // shares the descriptor until it execs, and would hold the lock on after we return.
     // A part is created and locked under the directory's lock, so `registry::sweep_parts` takes one it can lock for dead.
-    flock(&dir, libc::LOCK_EX)?;
-    let mut f = File::options().write(true).create_new(true).custom_flags(libc::O_NOFOLLOW).open(&tmp)?;
+    let (mut f, part) = {
+        let _dir = Flock::new(dir, libc::LOCK_EX)?;
+        let f = File::options().write(true).create_new(true).custom_flags(libc::O_NOFOLLOW).open(&tmp)?;
+        // A clone shares the open file, and so the lock.
+        match f.try_clone().and_then(|c| Flock::new(c, libc::LOCK_EX)) {
+            Ok(part) => (f, part),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e.into());
+            }
+        }
+    };
     let res = (|| {
-        flock(&f, libc::LOCK_EX)?;
-        flock(&dir, libc::LOCK_UN)?;
         write(&mut f)?;
         f.sync_all()?;
         Ok(rename(&tmp, path)?)
     })();
     // The name is ours alone: gone if renamed, else a failed write's.
     let _ = std::fs::remove_file(&tmp);
+    drop(part);
     res
 }
 
@@ -424,10 +437,9 @@ fn staging_dir(path: &Path) -> Result<OwnedFd> {
 
 /// The staging directory's `.lock`: held shared while a build makes its tree and lock,
 /// exclusive while one sweeps, so a tree seen then without a held lock is dead.
-fn staging_lock(staging: &OwnedFd, how: i32) -> Result<File> {
+fn staging_lock(staging: &OwnedFd, how: i32) -> Result<Flock> {
     let f: File = open_at(staging.as_raw_fd(), c".lock", libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW)?.into();
-    flock(&f, how)?;
-    Ok(f)
+    Ok(Flock::new(f, how)?)
 }
 
 /// A build's unpacked tree, `rootfs-{nonce}` in the staging directory, flocked through
@@ -475,7 +487,7 @@ fn sweep_staging(staging: &OwnedFd) -> Result<()> {
             continue;
         }
         let lock = cpath(Path::new(&format!("rootfs-{id}.lock")))?;
-        if !open_at(fd, &lock, libc::O_RDONLY | libc::O_NOFOLLOW).is_ok_and(|f| flock(&File::from(f), libc::LOCK_EX | libc::LOCK_NB).is_err()) {
+        if !open_at(fd, &lock, libc::O_RDONLY | libc::O_NOFOLLOW).is_ok_and(|f| Flock::new(File::from(f), libc::LOCK_EX | libc::LOCK_NB).is_err()) {
             crate::log!("image: removing staging {}, left by a build that did not finish", name.to_string_lossy());
             if let Err(e) = unpack::remove_at(fd, &cpath(Path::new(&name))?) {
                 crate::log!("image: removing staging {}: {e}", name.to_string_lossy());
@@ -688,6 +700,23 @@ mod tests {
         assert_eq!(read(&theirs), "theirs");
         std::fs::remove_file(&theirs).unwrap();
         assert!(temporaries(&dir).is_empty());
+    }
+
+    #[test]
+    fn install_lets_go_of_its_locks_though_a_child_shares_them() {
+        let dir = tmpdir("install-unlock");
+        let path = dir.join("blob");
+        let mut shared = Vec::new();
+        replace(&path, |f| {
+            // As a child forked meanwhile by another thread would, until it execs.
+            shared.push(f.try_clone()?);
+            Ok(f.write_all(b"ours")?)
+        })
+        .unwrap();
+        // The renamed part is the blob's inode, and the directory is the directory.
+        flock(&File::open(&path).unwrap(), libc::LOCK_EX | libc::LOCK_NB).expect("the part's lock is let go");
+        flock(&File::open(&*dir).unwrap(), libc::LOCK_EX | libc::LOCK_NB).expect("the directory's lock is let go");
+        drop(shared);
     }
 
     fn nonces(n: usize) -> Vec<String> {
