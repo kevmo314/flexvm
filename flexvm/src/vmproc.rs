@@ -600,9 +600,9 @@ impl Proc {
 
     pub fn announce(&self) {
         let vm = self.vm().clone();
-        let cfg = self.host.config_now();
-        let (ip, gen, rev, peers, dev) = (vm.ip, self.gen(), self.rev(), cfg.peers.clone(), cfg.announce_dev.clone());
-        let Some(via) = cfg.underlay() else {
+        let peers = self.host.config_now().peers;
+        let (ip, gen, rev, dev) = (vm.ip, self.gen(), self.rev(), self.host.cfg.announce_dev.clone());
+        let Some(via) = self.host.cfg.underlay() else {
             if !peers.is_empty() {
                 eprintln!("announce {ip}: no underlay address (give flexvm listen an ADDR peers can reach, or --underlay IP); peers not told");
             }
