@@ -628,7 +628,6 @@ fn wait_for_reseed(vsock: &std::path::Path) -> Result<()> {
         let res = guest::forks(vsock);
         match res {
             Ok(n) if n > 0 => return Ok(()),
-            Err(e) if guest::too_old(&e) => return Err(e),
             _ if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
             Ok(_) => bail!("guest did not reseed its RNG for the new VMGenID within {RESEED_TIMEOUT:?}"),
             Err(e) => bail!("guest agent not answering after restore: {e}"),

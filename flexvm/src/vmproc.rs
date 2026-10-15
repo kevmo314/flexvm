@@ -974,21 +974,13 @@ impl Proc {
         let mut w = &c;
         let vm = self.vm();
         let cmd = req["cmd"].as_str().unwrap_or("");
-        let mut once = None;
-        let started = vm.exec(|s| match req["session"].as_str() {
-            Some(id) => guest::session(s, req["action"].as_str().unwrap_or("start"), id, req["offset"].as_u64().unwrap_or(0), cmd, guest::TIMEOUT),
-            // Closed once it has exited, however that went (a start cut short too).
-            None => {
-                let id = once.insert(guest::session_id()?);
-                guest::session(s, "start", id, 0, cmd, guest::TIMEOUT)
-            }
+        let started = vm.exec(|s| {
+            let id = req["session"].as_str().ok_or("missing session id")?;
+            guest::session(s, req["action"].as_str().unwrap_or("start"), id, req["offset"].as_u64().unwrap_or(0), cmd, guest::TIMEOUT)
         });
         let (mut g, id) = match started {
             Ok(g) => g,
             Err(e) => {
-                if let Some(id) = &once {
-                    let _ = guest::close(&vm.vsock, id, Instant::now() + guest::TIMEOUT);
-                }
                 let _ = send_json(&mut w, &json!({"ok": false, "error": e.to_string()}));
                 return;
             }
@@ -1003,32 +995,9 @@ impl Proc {
             // The guest heartbeats every second; silence means the VM moved, or its agent stalled.
             g.get_ref().set_read_timeout(Some(Duration::from_secs(3)))?;
             send_json(&mut w, &json!({"ok": true}))?;
-            if let Some(id) = &once {
-                // A silent command's heartbeats never reach the client, so writes cannot tell it hung up.
-                let done = Arc::new(AtomicBool::new(false));
-                let watch = (c.try_clone()?, done.clone(), vm.vsock.clone(), id.clone());
-                thread::spawn(move || {
-                    let (c, done, vsock, id) = watch;
-                    while !done.load(Ordering::Acquire) {
-                        let mut p = libc::pollfd { fd: std::os::fd::AsRawFd::as_raw_fd(&c), events: 0, revents: 0 };
-                        if unsafe { libc::poll(&mut p, 1, 1000) } > 0 && p.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
-                            let _ = guest::close(&vsock, &id, Instant::now() + guest::TIMEOUT);
-                            return;
-                        }
-                    }
-                });
-                let code = guest::exec_output(&mut g, id, |kind, data| Ok(guest::write_frame(&mut w, kind, data)?));
-                done.store(true, Ordering::Release);
-                return Ok(guest::write_frame(&mut w, guest::FRAME_EXIT, &code?.to_le_bytes())?);
-            }
             std::io::copy(&mut g, &mut w)?;
             Ok(())
         })();
-        // Without the id no one can reattach: however it ended, the session goes (a running
-        // command with it).
-        if let Some(id) = &once {
-            let _ = guest::close(&vm.vsock, id, Instant::now() + guest::TIMEOUT);
-        }
         vm.untrack_exec(id);
     }
 

@@ -22,6 +22,7 @@ pub fn valid_session_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
+#[allow(dead_code)] // The host only writes frames in tests.
 pub fn write_frame(mut w: impl std::io::Write, kind: u8, payload: &[u8]) -> std::io::Result<()> {
     w.write_all(&[&[kind][..], &(payload.len() as u32).to_le_bytes()].concat())?;
     w.write_all(payload)
