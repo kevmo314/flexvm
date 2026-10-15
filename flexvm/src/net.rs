@@ -283,19 +283,21 @@ pub fn unplug_tap(tap: &str) -> (u64, Result<()>) {
     }
     let tap = tap.to_string();
     std::thread::spawn(move || {
+        let mut latest = (drops, queued);
         for _ in 0..60 {
             std::thread::sleep(std::time::Duration::from_secs(1));
             // Only while the index is still this tap's.
             if crate::net::ifindex(&tap).ok() != Some(ifindex) {
                 return;
             }
+            latest = qdisc_stats(ifindex).unwrap_or(latest);
             if remove().is_ok() {
-                return eprintln!("tap {tap}: plug removed");
+                return eprintln!("tap {tap}: plug removed, {} extra drops, {} queued packets discarded", latest.0.saturating_sub(drops), latest.1);
             }
         }
-        eprintln!("tap {tap}: could not remove its plug");
+        eprintln!("tap {tap}: could not remove its plug, {} extra drops; backlog stays queued", latest.0.saturating_sub(drops));
     });
-    (drops + queued, Err(format!("{e}; removing the plug failed too, retrying").into()))
+    (drops, Err(format!("{e}; removing the plug failed too, retrying").into()))
 }
 
 fn retry3(mut f: impl FnMut() -> Result<()>) -> Result<()> {
