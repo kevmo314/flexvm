@@ -1319,9 +1319,12 @@ pub fn cgroup_root() -> Option<PathBuf> {
         if !has_controller(&ctl, "memory") {
             std::fs::write(root.join("cgroup.subtree_control"), "+memory")?;
         }
+        static NO_CPU: AtomicBool = AtomicBool::new(false);
         if !has_controller(&ctl, "cpu") {
             if let Err(e) = std::fs::write(root.join("cgroup.subtree_control"), "+cpu") {
-                crate::log!("cgroup cpu controller unavailable: {e}");
+                if !NO_CPU.swap(true, Ordering::Relaxed) {
+                    crate::log!("cgroup cpu controller unavailable (memory limits still apply): {e}");
+                }
             }
         }
         Ok(())

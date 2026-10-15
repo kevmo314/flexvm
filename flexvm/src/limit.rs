@@ -46,10 +46,17 @@ fn step(mib: u64) -> u64 {
     (mib / 4).clamp(256, 2048).div_ceil(STEP_MIB) * STEP_MIB
 }
 
+/// Within this of its mark (MiB), a refused VM counts as throttled: `memory.current`
+/// hovers about `memory.high` (reclaimed page cache, MiB rounding), yet far less
+/// than the smallest half step (128 MiB), so a refusal with headroom never counts.
+const MARK_SLACK: u64 = 16;
+
 #[derive(Debug, PartialEq)]
 enum Growth {
     Raised,
     Idle,
+    /// At the guest's size: nothing to raise however often its cgroup's events change.
+    Full,
     Refused,
 }
 
@@ -124,7 +131,10 @@ impl Limit {
         let mut more = {
             let m = self.mark.lock().unwrap();
             let s = step(m.admitted);
-            match m.lifted || m.admitted == 0 || m.admitted >= m.cap || used + s / 2 < m.admitted + overhead(m.admitted) {
+            if !m.lifted && m.admitted > 0 && m.admitted >= m.cap {
+                return self.clear_throttled(Growth::Full);
+            }
+            match m.lifted || m.admitted == 0 || used + s / 2 < m.admitted + overhead(m.admitted) {
                 true => 0,
                 false => (m.admitted + s).min(m.cap) - m.admitted,
             }
@@ -146,8 +156,10 @@ impl Limit {
             Ok(None) => {
                 let used = self.used();
                 let m = self.mark.lock().unwrap();
-                self.throttled
-                    .store(!m.lifted && m.admitted > 0 && m.admitted < m.cap && used.is_some_and(|u| u >= m.admitted + overhead(m.admitted)), Ordering::SeqCst);
+                self.throttled.store(
+                    !m.lifted && m.admitted > 0 && m.admitted < m.cap && used.is_some_and(|u| u + MARK_SLACK >= m.admitted + overhead(m.admitted)),
+                    Ordering::SeqCst,
+                );
                 return Growth::Refused;
             }
             Err(e) => {
@@ -232,8 +244,11 @@ impl Limit {
                 std::thread::sleep(tick);
                 continue;
             }
-            // Only a raised mark needs a quick recheck; idle (including full size) or refused, wait a tick.
-            std::thread::sleep(if self.grow(host) == Growth::Raised { Duration::from_millis(20) } else { tick });
+            // Throttling raises an event every 10 ms: at full size or refused, no use asking again at each.
+            std::thread::sleep(match self.grow(host) {
+                Growth::Full | Growth::Refused => tick,
+                Growth::Raised | Growth::Idle => Duration::from_millis(20),
+            });
         }
     }
 }
@@ -372,12 +387,13 @@ mod tests {
     }
 
     #[test]
-    fn refusal_only_throttles_at_or_above_the_mark() {
+    fn refusal_only_throttles_near_the_mark() {
         let (l, cg, mut host) = cgroup("refused");
         host.cfg.reserve_mib = u64::MAX / 4;
         l.start(4096, 8192);
         let mark = 4096 + overhead(4096);
-        for (used, throttled) in [(mark - 1, false), (mark, true), (mark + 1, true), (mark - 1, false)] {
+        let at = mark - MARK_SLACK;
+        for (used, throttled) in [(at - 1, false), (at, true), (mark, true), (mark + 1, true), (at - 1, false), (mark - step(4096) / 2, false)] {
             set(&cg, used);
             assert_eq!(l.grow(&host), Growth::Refused);
             assert_eq!(l.admitted(), 4096);
@@ -448,12 +464,12 @@ mod tests {
     }
 
     #[test]
-    fn full_size_is_idle_even_above_the_mark() {
+    fn full_size_asks_nothing_even_above_the_mark() {
         let (l, cg, host) = cgroup("full");
         l.start(4096, 4096);
         set(&cg, 5000);
         l.throttled.store(true, Ordering::SeqCst);
-        assert_eq!(l.grow_with(&host, |_| panic!("full VM requested a grant")), Growth::Idle);
+        assert_eq!(l.grow_with(&host, |_| panic!("full VM requested a grant")), Growth::Full);
         assert!(!l.throttled.load(Ordering::SeqCst));
         std::fs::remove_dir_all(cg.parent().unwrap()).unwrap();
     }
