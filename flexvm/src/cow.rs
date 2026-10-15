@@ -117,14 +117,13 @@ impl Cow {
         let states: Vec<AtomicU8> = zeroed_atomics(total);
         let runs: Vec<(usize, usize)> = runs.iter().filter(|r| r.2 == REMOTE).map(|r| (r.0 as usize, (r.0 + r.1) as usize)).collect();
         runs.iter().flat_map(|&(a, b)| &states[a..b]).for_each(|s| s.store(PENDING, Ordering::Relaxed));
-        let budget = std::env::var("FLEXVM_COW_BUDGET_MIB").ok().and_then(|v| v.parse().ok()).unwrap_or(BUDGET_MIB) << 20;
         Cow {
             states,
             left: AtomicUsize::new(runs.iter().map(|(a, b)| b - a).sum()),
             rescued: Mutex::new(HashMap::new()),
             rescued_bytes: AtomicUsize::new(0),
             held: OnceLock::new(),
-            budget,
+            budget: BUDGET_MIB << 20,
             wanted: Mutex::new(VecDeque::new()),
             progress: (Mutex::new(0), Condvar::new()),
             #[cfg(test)]

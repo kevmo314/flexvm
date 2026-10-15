@@ -26,7 +26,7 @@ mod vmproc;
 
 use std::io::{BufReader, Read, Write};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -67,9 +67,8 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
                                      build a template (see README)
   flexvm bench ...                   latency benchmarks (see README)
 
-options: --state DIR (FLEXVM_STATE, /var/lib/flexvm), --run DIR (FLEXVM_RUN, /run/flexvm),
-         --artifacts DIR (FLEXVM_ARTIFACTS, ./artifacts), --templates DIR (FLEXVM_TEMPLATES),
-         --image-cache DIR, --version
+options: --state DIR (/var/lib/flexvm: artifacts, templates, images, VMs), --run DIR (/run/flexvm),
+         --version
 run, resume and restore exit with the VM's command's status, 128+signal, 125 when flexvm
 fails, 124 when the VM dies
 ";
@@ -79,9 +78,6 @@ const SWITCHES: &[&str] = &["warm", "stop", "paused", "incremental", "standby", 
 const VALUE_FLAGS: &[&str] = &[
     "state",
     "run",
-    "artifacts",
-    "templates",
-    "image-cache",
     "template",
     "ip",
     "name",
@@ -107,7 +103,6 @@ const VALUE_FLAGS: &[&str] = &[
     "ready-port",
     "ready-cmd",
     "ready-timeout",
-    "image-staging",
     "max-download-mib",
     "max-unpacked-mib",
     "max-file-mib",
@@ -207,10 +202,6 @@ impl Args {
     pub fn parse_or<T: std::str::FromStr>(&self, name: &str, default: T) -> Result<T> {
         self.get(name).map_or(Ok(default), |v| v.parse().map_err(|_| format!("bad --{name} {v:?}").into()))
     }
-
-    fn path(&self, flag: &str, env: &str, default: &str) -> PathBuf {
-        self.get(flag).map(PathBuf::from).or_else(|| std::env::var_os(env).map(PathBuf::from)).unwrap_or_else(|| default.into())
-    }
 }
 
 /// A VM's command's statuses are its own: flexvm's failures there exit 125.
@@ -245,7 +236,7 @@ fn main() {
 }
 
 /// Flags every command takes.
-const GLOBAL: &[&str] = &["state", "run", "artifacts", "templates", "image-cache", "help", "version"];
+const GLOBAL: &[&str] = &["state", "run", "help", "version"];
 
 /// What `template --image` takes.
 const IMAGE_FLAGS: &[&str] = &[
@@ -258,7 +249,6 @@ const IMAGE_FLAGS: &[&str] = &[
     "ready-port",
     "ready-cmd",
     "ready-timeout",
-    "image-staging",
     "max-download-mib",
     "max-unpacked-mib",
     "max-file-mib",
@@ -313,19 +303,16 @@ fn check_applies(args: &Args) -> Result<()> {
     Ok(())
 }
 
-pub fn open_host(args: &Args) -> Result<Host> {
-    Host::open(&args.path("state", "FLEXVM_STATE", "/var/lib/flexvm"), &args.path("run", "FLEXVM_RUN", "/run/flexvm"))
+fn state(args: &Args) -> Result<PathBuf> {
+    Ok(std::path::absolute(args.get("state").unwrap_or("/var/lib/flexvm"))?)
 }
 
-/// Exported for the VM processes this one starts.
+pub fn open_host(args: &Args) -> Result<Host> {
+    Host::open(&state(args)?, Path::new(args.get("run").unwrap_or("/run/flexvm")))
+}
+
 fn paths(args: &Args) -> Result<Paths> {
-    let artifacts = args.path("artifacts", "FLEXVM_ARTIFACTS", "artifacts");
-    let templates = args.get("templates").map(PathBuf::from).or_else(|| std::env::var_os("FLEXVM_TEMPLATES").map(PathBuf::from));
-    std::env::set_var("FLEXVM_ARTIFACTS", std::path::absolute(&artifacts)?);
-    if let Some(t) = &templates {
-        std::env::set_var("FLEXVM_TEMPLATES", std::path::absolute(t)?);
-    }
-    Paths::new(&artifacts, templates)
+    Ok(Paths::new(&state(args)?))
 }
 
 fn real_main(args: &Args) -> Result<()> {
@@ -336,7 +323,6 @@ fn real_main(args: &Args) -> Result<()> {
         return output(format_args!("flexvm {}\n", env!("CARGO_PKG_VERSION")));
     }
     check_applies(args)?;
-    let _ = paths(args);
     let pos: Vec<&str> = args.positional.iter().map(|s| s.as_str()).collect();
     let (name, arg2) = (pos.get(1).copied().unwrap_or(""), pos.get(2).copied());
     let template = args.get("template").unwrap_or("default");
@@ -738,10 +724,8 @@ fn build_template(args: &Args, name: &str) -> Result<()> {
     let mut paths = paths(args)?;
     let image = image_options(args)?
         .map(|opts| {
-            let artifacts = paths.kernel.parent().ok_or("bad artifacts dir")?.to_path_buf();
-            let cache = args.get("image-cache").map_or(artifacts.join("images"), PathBuf::from);
-            let init = args.get("init").map_or(artifacts.join("flexvm-init"), PathBuf::from);
-            let (rootfs, meta) = image::prepare(&cache, &init, &opts)?;
+            let init = args.get("init").map_or(paths.kernel.with_file_name("flexvm-init"), PathBuf::from);
+            let (rootfs, meta) = image::prepare(&state(args)?.join("images"), &init, &opts)?;
             paths.rootfs = rootfs;
             Ok::<_, util::Error>(meta)
         })
@@ -791,7 +775,7 @@ fn image_options(args: &Args) -> Result<Option<image::Options>> {
         warm,
         ready,
         ready_timeout: Duration::from_secs(args.parse_or::<u32>("ready-timeout", 120)?.into()),
-        staging: args.get("image-staging").unwrap_or(image::STAGING).into(),
+        staging: state(args)?.join("staging"),
         limits: image::Limits {
             download: bytes("max-download-mib", d.download >> 20)?,
             unpacked: bytes("max-unpacked-mib", d.unpacked >> 20)?,
@@ -1045,19 +1029,10 @@ mod exec_tests {
     #[test]
     fn standby_zero_needs_no_artifacts() {
         let root = crate::test_util::TempDir::new("standby-zero");
-        let args = parse(&[
-            "--state",
-            root.join("state").to_str().unwrap(),
-            "--run",
-            root.join("run").to_str().unwrap(),
-            "--artifacts",
-            root.join("missing").to_str().unwrap(),
-            "standby",
-            "0",
-        ]);
+        let args = parse(&["--state", root.join("state").to_str().unwrap(), "--run", root.join("run").to_str().unwrap(), "standby", "0"]);
         real_main(&args).unwrap();
         assert_eq!(std::fs::read_to_string(root.join("state/standby/default")).unwrap(), "0");
-        assert!(!root.join("missing").exists());
+        assert!(!root.join("state/artifacts").exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1132,7 +1107,7 @@ mod exec_tests {
         for ok in [
             &["--state", "/s", "run", "web", "--template", "t", "-d", "--", "make", "test"][..],
             &["exec", "web", "ls", "-l"],
-            &["template", "t", "--image", "busybox", "--warm", "--ready-port", "80", "--image-cache", "/c"],
+            &["template", "t", "--image", "busybox", "--warm", "--ready-port", "80"],
             &["listen", "1.2.3.4:7070", "--peer", "a:1", "--evict-at", ""],
             &["config"],
             &["restore", "/d", "--ip", "auto", "--paused"],

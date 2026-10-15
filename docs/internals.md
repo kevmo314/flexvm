@@ -538,7 +538,7 @@ through, so the checkpoint is exactly the memory at the pause.
   are left out of a delta (byte for byte what its parent has; only while
   that parent is the last checkpoint taken, which a failure or re-arming
   forgets), and a 64-page block with none changed is protected again. All
-  or none, up to 64 MiB (`FLEXVM_HOT_MIB`, 0 to turn it off): copying part
+  or none, up to 64 MiB: copying part
   of a larger set costs the pause as much but leaves the vCPUs writing the
   rest stalling as before. Keeps up to twice that in memory per VM. Saving
   device state writes guest memory (a vsock transport reset), so the copy

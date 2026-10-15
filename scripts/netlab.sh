@@ -6,10 +6,12 @@
 #   fvC  192.168.100.10  a plain client machine
 #
 # usage: netlab.sh up | down | listeners | stop | fv A|B ARGS...
+# The hosts use the artifacts and templates of STATE (default /var/lib/flexvm).
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 flexvm=$root/target/release/flexvm
+state=$(realpath -m "${STATE:-/var/lib/flexvm}")
 
 up() {
   ip netns add fvlan
@@ -41,7 +43,11 @@ fv() {
 }
 
 listeners() {
-  mkdir -p /run/flexvm-lab-A /run/flexvm-lab-B
+  for h in A B; do
+    mkdir -p "/run/flexvm-lab-$h/state"
+    ln -sfn "$state/artifacts" "/run/flexvm-lab-$h/state/artifacts"
+    ln -sfn "$state/templates" "/run/flexvm-lab-$h/state/templates"
+  done
   fv A listen 192.168.100.1:7070 --peer 192.168.100.2:7070 \
     --announce-dev eth0 --vm-ips 192.168.100.128-192.168.100.191 > "$root/listen-A.log" 2>&1 &
   fv B listen 192.168.100.2:7070 --peer 192.168.100.1:7070 \

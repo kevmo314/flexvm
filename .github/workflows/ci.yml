@@ -20,6 +20,8 @@ env:
   RUST_TOOLCHAIN: "1.88.0"
   # The e2e image-template case's image (pulled, then cached: see "Restore image").
   E2E_IMAGE: public.ecr.aws/docker/library/busybox:1.36
+  # Where the scripts install firecracker, the kernel and the rootfs (flexvm's default state).
+  STATE: /var/lib/flexvm
   # No FC_VERSION / CI_VERSION / KERNEL overrides are set here. fetch.sh --urls resolves
   # them, and the cache keys below are built from its output, so setting one changes the keys.
 
@@ -82,6 +84,10 @@ jobs:
         run: |
           nohup sh -c 'cargo build --release -p flexvm; echo $? > "$RUNNER_TEMP/build.status"' > "$RUNNER_TEMP/build.log" 2>&1 &
 
+      # The caches below restore into it as the runner's user.
+      - name: State directory
+        run: sudo install -d -o "$(id -u)" -g "$(id -g)" "$STATE/artifacts"
+
       # Cache keys: the build inputs in the repo, what fetch.sh resolves (versions and
       # URLs, plus the ETags of the unversioned S3 objects), and the build environment
       # (runner image; flexvm's toolchain for the rootfs; Firecracker's toolchain is
@@ -108,7 +114,7 @@ jobs:
         id: fc-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: artifacts/firecracker
+          path: ${{ env.STATE }}/artifacts/firecracker
           key: firecracker-${{ steps.keys.outputs.env }}-${{ steps.keys.outputs.fc }}-${{ hashFiles('firecracker/*.patch', 'scripts/build-firecracker.sh', 'scripts/versions.sh') }}
       - name: Build Firecracker
         if: steps.fc-cache.outputs.cache-hit != 'true'
@@ -120,7 +126,7 @@ jobs:
         if: steps.fc-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: artifacts/firecracker
+          path: ${{ env.STATE }}/artifacts/firecracker
           key: ${{ steps.fc-cache.outputs.cache-primary-key }}
 
       # Guest kernel and base root filesystem (fetch.sh skips the stock Firecracker: the patched one is there).
@@ -129,21 +135,21 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
-            artifacts/vmlinux
-            artifacts/base.squashfs
+            ${{ env.STATE }}/artifacts/vmlinux
+            ${{ env.STATE }}/artifacts/base.squashfs
           key: downloads-${{ steps.keys.outputs.downloads }}-${{ hashFiles('scripts/fetch.sh', 'scripts/versions.sh', 'scripts/checksums.sha256') }}
       - name: Fetch kernel and base rootfs
         run: |
           ./scripts/fetch.sh
-          echo "base=$(sha256sum artifacts/base.squashfs | cut -c1-16)" >> "$GITHUB_OUTPUT"
+          echo "base=$(sha256sum "$STATE/artifacts/base.squashfs" | cut -c1-16)" >> "$GITHUB_OUTPUT"
         id: fetch
       - name: Save downloads
         if: steps.dl-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
-            artifacts/vmlinux
-            artifacts/base.squashfs
+            ${{ env.STATE }}/artifacts/vmlinux
+            ${{ env.STATE }}/artifacts/base.squashfs
           key: ${{ steps.dl-cache.outputs.cache-primary-key }}
 
       # Root filesystem with flexvm-init: rebuilt when the guest agent, the image recipe,
@@ -153,9 +159,9 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
-            artifacts/rootfs-*.ext4
-            artifacts/rootfs.ext4
-            artifacts/flexvm-init
+            ${{ env.STATE }}/artifacts/rootfs-*.ext4
+            ${{ env.STATE }}/artifacts/rootfs.ext4
+            ${{ env.STATE }}/artifacts/flexvm-init
           key: rootfs-${{ steps.keys.outputs.env }}-rust${{ env.RUST_TOOLCHAIN }}-base${{ steps.fetch.outputs.base }}-${{ hashFiles('guest/**', 'scripts/build-rootfs.sh', 'Cargo.lock', 'Cargo.toml') }}
       - name: Build rootfs
         if: steps.rootfs-cache.outputs.cache-hit != 'true'
@@ -170,9 +176,9 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
-            artifacts/rootfs-*.ext4
-            artifacts/rootfs.ext4
-            artifacts/flexvm-init
+            ${{ env.STATE }}/artifacts/rootfs-*.ext4
+            ${{ env.STATE }}/artifacts/rootfs.ext4
+            ${{ env.STATE }}/artifacts/flexvm-init
           key: ${{ steps.rootfs-cache.outputs.cache-primary-key }}
 
       - name: Build flexvm
@@ -192,19 +198,19 @@ jobs:
         id: img-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: artifacts/image-cache/oci
+          path: ${{ runner.temp }}/image-cache/oci
           key: ${{ steps.img.outputs.prefix }}
           restore-keys: ${{ steps.img.outputs.prefix }}
 
       - name: End-to-end tests
-        run: sudo python3 -u scripts/e2e.py --jobs 4 --image "$E2E_IMAGE" --image-cache artifacts/image-cache --log-dir "$RUNNER_TEMP/e2e-logs"
+        run: sudo python3 -u scripts/e2e.py --jobs 4 --image "$E2E_IMAGE" --image-cache "$RUNNER_TEMP/image-cache" --log-dir "$RUNNER_TEMP/e2e-logs"
 
       - name: Image digest
         id: img-digest
         if: always()
         run: |
-          sudo chown -R "$(id -u):$(id -g)" artifacts/image-cache 2>/dev/null || true
-          for f in artifacts/image-cache/oci/*/index.json; do
+          sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/image-cache" 2>/dev/null || true
+          for f in "$RUNNER_TEMP"/image-cache/oci/*/index.json; do
             [ -e "$f" ] && python3 -c 'import json, sys; print("digest=" + json.load(open(sys.argv[1]))["manifests"][0]["digest"].replace(":", "-"))' "$f" >> "$GITHUB_OUTPUT"
           done
           true
@@ -212,7 +218,7 @@ jobs:
         if: always() && steps.img-digest.outputs.digest != '' && steps.img-cache.outputs.cache-matched-key != format('{0}{1}', steps.img.outputs.prefix, steps.img-digest.outputs.digest)
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: artifacts/image-cache/oci
+          path: ${{ runner.temp }}/image-cache/oci
           key: ${{ steps.img.outputs.prefix }}${{ steps.img-digest.outputs.digest }}
 
       - name: Collect logs

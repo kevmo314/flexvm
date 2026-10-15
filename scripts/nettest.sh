@@ -12,7 +12,7 @@
 # or the UDP stream loses more than MAX_UDP_LOSS datagrams in a round.
 # Reordered datagrams are reported, not checked.
 #
-# env: FLEXVM (binary), ARTIFACTS, P (namespace prefix, default fv5), NET
+# env: FLEXVM (binary), STATE (whose artifacts and templates to use), P (namespace prefix, default fv5), NET
 #      (default 192.168.155), ROUNDS (default 3), UDP_PPS (default 5000),
 #      MAX_UDP_LOSS (default 0), PORT (listeners, default 7070), PREFIX (taps, default
 #      fvn), WORK (keep logs under this directory, default /tmp), TEMPLATE (default default)
@@ -20,7 +20,7 @@ set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 flexvm=${FLEXVM:-$root/target/release/flexvm}
-artifacts=${ARTIFACTS:-$root/artifacts}
+state=$(realpath -m "${STATE:-/var/lib/flexvm}")
 P=${P:-fv5}
 NET=${NET:-192.168.155}
 ROUNDS=${ROUNDS:-3}
@@ -47,7 +47,7 @@ cli() {
     local ns=$1 dir=$2
     shift 2
     timeout 60s ip netns exec "$ns" sh -c 'mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null; exec "$@"' sh \
-        "$flexvm" --artifacts "$artifacts" --state "$dir/state" --run "$dir/run" "$@"
+        "$flexvm" --state "$dir/state" --run "$dir/run" "$@"
 }
 
 wait_for() {
@@ -114,6 +114,8 @@ done
 start_listener() {
     local ns=$1 dir=$2 listen=$3 peer=$4 ips=$5
     mkdir -p "$dir/state" "$dir/run"
+    ln -sfn "$state/artifacts" "$dir/state/artifacts"
+    ln -sfn "$state/templates" "$dir/state/templates"
     cli "$ns" "$dir" listen "$listen" --peer "$peer" --announce-dev eth0 --vm-ips "$ips" --prefix "${PREFIX:-fvn}" > "$work/listen-$ns.log" 2>&1 &
     listener_pids+=($!)
 }

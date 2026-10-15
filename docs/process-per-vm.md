@@ -127,10 +127,14 @@ a source killed with SIGKILL, which records nothing.
 
 ## On-disk state
 
-Two directories, both overridable (`--state`/`FLEXVM_STATE`, `--run`/`FLEXVM_RUN`):
+Two directories, both overridable (`--state`, `--run`):
 
 ```
 STATE (default /var/lib/flexvm, on disk)
+  artifacts/             firecracker, vmlinux, base.squashfs, rootfs-HASH.ext4, rootfs.ext4 (a symlink to
+                         the newest) and flexvm-init, as scripts/fetch.sh and build-*.sh install them
+  templates/             built templates: NAME -> .gen/ID (see internals.md)
+  images/                pulled container images: blobs/sha256/, rootfs/KEY.ext4 (see images.md)
   host.json              host config: listen, peers, vm_ips, underlay, announce_dev, dns, reserve_mib, evict_mib, prefix
   lock                   the host lock (flock), held for short critical sections only
   .synced                the root's (dev, inode) once its directories were made durable (`Host::open`)
@@ -149,8 +153,7 @@ STATE (default /var/lib/flexvm, on disk)
   evict.lock             one eviction decider at a time (flock)
   evict.worker.lock      held by the thread running an eviction; arrivals by eviction are refused meanwhile
   evict.last             its mtime: when an eviction last started (5 s apart)
-  staging/               where image layers unpack (`template --image`): `/var/lib/flexvm/staging`
-                         whatever STATE is, as it must be root-owned (`--image-staging` elsewhere)
+  staging/               where image layers unpack (`template --image`); its ancestry must be root-owned
 RUN (default /run/flexvm, tmpfs)
   vms/NAME.{lock,json,sock,log}   registry entry, liveness lock, control socket, log of -d/standby VMs
   vms/NAME.{failed,moved}         why a VM died (until `flexvm kill`); where it migrated to (an hour)

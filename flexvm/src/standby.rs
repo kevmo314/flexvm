@@ -190,7 +190,7 @@ fn refill_by(host: &Host, template: &str, wait: bool, cooldown: bool) -> Result<
     }
     let mut ready = Vec::new();
     let log = std::fs::OpenOptions::new().create(true).append(true).open(d.join("standby.log"))?;
-    let mib = grant_mib(template);
+    let mib = grant_mib(host, template);
     // A failed start ends the round, but those started before it are still waited for.
     let mut failed = None;
     for _ in 0..want {
@@ -229,8 +229,8 @@ fn wait_ready(r: UnixStream, timeout: Duration) -> Result<()> {
 /// What a refill's grant admits for each standby: what its load pages in, as a cold
 /// start admits (`working_set_mib`), and `MIN_GRANT_MIB` at least. The template is
 /// found as the standby's process will find it.
-fn grant_mib(template: &str) -> u64 {
-    let wset = crate::template::Paths::from_env().and_then(|paths| Template::working_set_mib_of(&paths, template));
+fn grant_mib(host: &Host, template: &str) -> u64 {
+    let wset = Template::working_set_mib_of(&crate::template::Paths::new(&host.state), template);
     MIN_GRANT_MIB.max(wset.unwrap_or(0))
 }
 
@@ -781,7 +781,7 @@ mod tests {
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
         std::fs::create_dir_all(root.join("templates/.gen/a")).unwrap();
         std::os::unix::fs::symlink(".gen/a", root.join("templates/default")).unwrap();
-        let paths = Paths::new(&root, None).unwrap();
+        let paths = Paths::new(&root);
         let d = dir(&host, "default");
         std::fs::create_dir_all(&d).unwrap();
         let stopped: Vec<_> = (0..2).map(|n| UnixListener::bind(d.join(format!("a.{n}.sock"))).unwrap()).collect();
@@ -811,7 +811,7 @@ mod tests {
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
         std::fs::create_dir_all(root.join("templates/.gen/a")).unwrap();
         std::os::unix::fs::symlink(".gen/a", root.join("templates/default")).unwrap();
-        let paths = Paths::new(&root, None).unwrap();
+        let paths = Paths::new(&root);
         let d = dir(&host, "default");
         std::fs::create_dir_all(&d).unwrap();
         let serve = |n: u32| {

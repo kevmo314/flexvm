@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
-# Builds artifacts/rootfs-<hash>.ext4: the base image plus flexvm-init as /sbin/flexvm-init,
-# and points the artifacts/rootfs.ext4 symlink at it. Images are never rewritten:
+# Builds STATE/artifacts/rootfs-<hash>.ext4: the base image (scripts/fetch.sh) plus flexvm-init
+# as /sbin/flexvm-init, and points the rootfs.ext4 symlink beside it at it. Images are never rewritten:
 # templates pin the file they were built from, so rebuilding is safe while VMs run.
 # The image is attached read-only over virtio-pmem and mounted with DAX, so every VM
 # on a host shares one copy of the root filesystem in the host page cache.
+# usage: build-rootfs.sh [--state DIR (/var/lib/flexvm)]
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
+state=/var/lib/flexvm
+if [ "${1:-}" = --state ]; then state=$(realpath -m "$2"); fi
+out=$state/artifacts
 cd "$root"
 # A fixed default: a commit that leaves the image inputs alone keeps the same rootfs hash.
 SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-1700000000}
@@ -14,18 +18,18 @@ SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-1700000000}
 target=${CARGO_TARGET_DIR:-$root/target}
 RUSTFLAGS="-C target-feature=+crt-static" cargo build --release -p flexvm-init --target x86_64-unknown-linux-gnu
 # Also injected into templates built from container images (flexvm template --image).
-install -m 755 "$target"/x86_64-unknown-linux-gnu/release/flexvm-init artifacts/flexvm-init
+sudo install -D -m 755 "$target"/x86_64-unknown-linux-gnu/release/flexvm-init "$out/flexvm-init"
 
 work=$root/build/rootfs
 sudo rm -rf "$work"
 mkdir -p "$(dirname "$work")"
-sudo unsquashfs -q -d "$work" artifacts/base.squashfs
+sudo unsquashfs -q -d "$work" "$out/base.squashfs"
 sudo install -m 755 "$target"/x86_64-unknown-linux-gnu/release/flexvm-init "$work/sbin/flexvm-init"
 
 # Size to the content plus headroom, rounded up to 2 MiB as virtio-pmem requires.
 kib=$(sudo du -sk "$work" | cut -f1)
 mib=$(( (kib * 12 / 10 / 1024 + 64 + 1) / 2 * 2 ))
-tmp=artifacts/.rootfs.$$.ext4
+tmp=$root/build/rootfs.$$.ext4
 trap 'rm -f "$tmp"' EXIT
 truncate -s "${mib}M" "$tmp"
 # mkfs copies source timestamps, including the freshly installed init and directories.
@@ -47,7 +51,7 @@ sudo find "$work" -printf '%P\0' | while IFS= read -r -d '' path; do
 done | sudo E2FSPROGS_FAKE_TIME=1 debugfs -w -f - "$tmp" > /dev/null
 sudo chown "$(id -u):$(id -g)" "$tmp"
 sudo rm -rf "$work"
-out=artifacts/rootfs-$(sha256sum "$tmp" | cut -c1-12).ext4
-mv "$tmp" "$out"
-ln -sfn "$(basename "$out")" artifacts/.rootfs.link && mv -T artifacts/.rootfs.link artifacts/rootfs.ext4
-ls -lh "$out"
+img=rootfs-$(sha256sum "$tmp" | cut -c1-12).ext4
+[ -e "$out/$img" ] || { sudo install -m 644 "$tmp" "$out/.$img" && sudo mv -T "$out/.$img" "$out/$img"; }
+sudo ln -sfn "$img" "$out/.rootfs.link" && sudo mv -T "$out/.rootfs.link" "$out/rootfs.ext4"
+ls -lh "$out/$img"

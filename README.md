@@ -10,12 +10,18 @@ process and the VM is gone, send it a signal and the VM pauses or suspends.
 
 ## Setup
 
+Everything flexvm keeps lives in its state directory, `/var/lib/flexvm`: the
+artifacts (`artifacts/`), templates (`templates/`), pulled images
+(`images/`) and VMs. The scripts install into it (with sudo); give them
+`--state DIR` for another.
+
 ```sh
-./scripts/fetch.sh               # firecracker, guest kernel 6.1, ubuntu 24.04 base
-./scripts/build-firecracker.sh   # patched firecracker -> artifacts/firecracker (needs musl-tools, libseccomp-dev)
-./scripts/build-rootfs.sh        # artifacts/rootfs.ext4, and artifacts/flexvm-init for image templates
-cargo build --release
-sudo ./target/release/flexvm template default   # cold-boot and snapshot a template (all CPUs, ceiling = host RAM, 4 GiB plugged)
+./scripts/build-firecracker.sh   # patched firecracker (needs musl-tools, libseccomp-dev)
+./scripts/fetch.sh               # guest kernel 6.1, ubuntu 24.04 base (and stock firecracker, if none is built)
+./scripts/build-rootfs.sh        # rootfs.ext4, and flexvm-init for image templates
+cargo build --release && sudo install target/release/flexvm /usr/local/bin/
+sudo flexvm template default     # cold-boot and snapshot a template (all CPUs, ceiling = host RAM, 4 GiB plugged)
+sudo flexvm run web
 ```
 
 The host needs Linux 5.16+: Firecracker patch `0004` uses `KVM_VCPU_TSC_OFFSET`.
@@ -23,16 +29,15 @@ The host needs Linux 5.16+: Firecracker patch `0004` uses `KVM_VCPU_TSC_OFFSET`.
 Hosts that migrate or restore each other's VMs need the same CPU model and
 a byte-identical Firecracker: a snapshot records both (the binary by its
 content hash), and any difference refuses it ("Firecracker differs"). Build
-Firecracker once and copy `artifacts/firecracker` to every host rather than
+Firecracker once and copy `/var/lib/flexvm/artifacts` to every host rather than
 building it on each. Replacing the binary also invalidates every template
 built with the old one: rebuild them. Templates themselves must be identical
-too (build once and copy `artifacts/templates`, or build from the same inputs).
+too (build once and copy `/var/lib/flexvm/templates`, or build from the same
+inputs). A template pins its rootfs by path, so one built before the state
+directory held the artifacts must be rebuilt.
 
-flexvm runs as root (KVM, userfaultfd, routes, cgroups). Commands below
-assume `flexvm` is on the PATH and `FLEXVM_ARTIFACTS` points at `artifacts/`.
-sudo drops `FLEXVM_ARTIFACTS`: keep it with `sudo --preserve-env=FLEXVM_ARTIFACTS`
-(`sudo -E` is refused by some sudo builds, e.g. sudo-rs), or pass `--artifacts DIR`;
-without either, the default is `./artifacts` relative to the working directory.
+flexvm runs as root (KVM, userfaultfd, routes, cgroups); commands below
+assume that.
 
 ## Run a VM
 
@@ -214,7 +219,6 @@ Requires=flexvm-listen.socket
 After=flexvm-listen.socket
 
 [Service]
-Environment=FLEXVM_ARTIFACTS=/opt/flexvm/artifacts
 ExecStart=/usr/local/bin/flexvm listen --peer 192.168.1.11:7070 --announce-dev eth0 \
     --vm-ips 192.168.1.128-192.168.1.191 --dns 192.168.1.1
 Restart=on-failure
@@ -268,22 +272,15 @@ hold no secrets at startup. Details: [docs/images.md](docs/images.md).
 
 ## Paths and knobs
 
-| flag | environment | default | what |
-|---|---|---|---|
-| `--state DIR` | `FLEXVM_STATE` | `/var/lib/flexvm` | host configuration, addresses, suspended VMs (on disk) |
-| `--run DIR` | `FLEXVM_RUN` | `/run/flexvm` | registry, sockets, logs (tmpfs) |
-| `--artifacts DIR` | `FLEXVM_ARTIFACTS` | `./artifacts` | `firecracker`, `vmlinux`, `rootfs.ext4`, `flexvm-init` |
-| `--templates DIR` | `FLEXVM_TEMPLATES` | `ARTIFACTS/templates` | built templates |
-| `--image-cache DIR` | | `ARTIFACTS/images` | pulled container images |
-| `--image-staging DIR` | | `/var/lib/flexvm/staging` | where image layers unpack (root-owned, see [docs/images.md](docs/images.md)) |
-| `--init PATH` | | `ARTIFACTS/flexvm-init` | the init image templates run as PID 1 |
-| | `FLEXVM_CKPT_THREADS` | the CPU count, 1-12 | threads writing a checkpoint |
-| | `FLEXVM_COW_BUDGET_MIB` | 256 | copies of pages a running checkpoint keeps in memory (the guest wrote them before they were saved) before write faults wait for the writers |
+| flag | default | what |
+|---|---|---|
+| `--state DIR` | `/var/lib/flexvm` | everything on disk: `artifacts/` (`firecracker`, `vmlinux`, `rootfs.ext4`, `flexvm-init`), `templates/`, `images/` (pulled container images), `staging/` (where image layers unpack: root-owned, see [docs/images.md](docs/images.md)), host configuration, addresses, suspended VMs |
+| `--run DIR` | `/run/flexvm` | registry, sockets, logs (tmpfs) |
 
-`FLEXVM_CKPT_THREADS` and `FLEXVM_COW_BUDGET_MIB` are read by the VM
-process, so set them where it starts (`flexvm run`, `resume`, `restore`,
-the listener for arrivals); on a `flexvm checkpoint` client they do nothing.
-`FLEXVM_FAULTS=1` enables test fault injection only. The state layout is in
+`template --image` runs `STATE/artifacts/flexvm-init` as PID 1 (`--init PATH`
+for another). Several hosts on one machine (tests, benchmarks) each take a `--state` and
+`--run` of their own; their `artifacts` and `templates` can be symlinks to one
+host's. `FLEXVM_FAULTS=1` enables test fault injection only. The state layout is in
 [docs/process-per-vm.md](docs/process-per-vm.md#on-disk-state).
 
 ## Benchmarks
@@ -294,7 +291,8 @@ flexvm bench --to 127.0.0.1:7131 --to-state S --to-run R --dirty-mib 500   # run
 flexvm bench --lifecycle /data/ckpt --to-state S --to-run R      # pause, checkpoint, restore, suspend
 ```
 
-Reports land in `bench/`. With `--dirty-mib`, the guest reads its memory
+The other host's state (S) holds the same artifacts and templates (symlinks
+to this host's do). Reports land in `bench/`. With `--dirty-mib`, the guest reads its memory
 back before and right after the migration; `post_copy` has the difference
 (`stall`) and the target's fault service per kind.
 

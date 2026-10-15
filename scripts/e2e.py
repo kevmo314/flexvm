@@ -12,7 +12,7 @@ lane's hosts, runs its cases against them, stops them and checks that nothing
 is left. It touches only what it created: its own processes, taps, cgroups
 and directories.
 
-usage: sudo scripts/e2e.py [--bin FLEXVM] [--artifacts DIR] [--log-dir DIR]
+usage: sudo scripts/e2e.py [--bin FLEXVM] [--state DIR] [--log-dir DIR]
                            [--port-a N] [--net-a A.B.C] [--net-b A.B.C]
                            [--jobs N] [--lanes "PORT:NET-A:NET-B ..."]
                            [--image REF [--image-cache DIR] | --no-image] [--faults "SCENARIO ..."]
@@ -24,7 +24,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 p = argparse.ArgumentParser(usage=__doc__)
 p.add_argument("--bin", default=os.path.join(ROOT, "target", "release", "flexvm"))
-p.add_argument("--artifacts", default=os.path.join(ROOT, "artifacts"))
+p.add_argument("--state", default="/var/lib/flexvm", help="the state directory whose artifacts/ the scripts installed")
 p.add_argument("--log-dir", default="/tmp/fvci-logs", help="listener, VM and Firecracker logs end up here")
 p.add_argument("--port-a", type=int, default=7140, help="lane 0's host A listens here, its host B on the next port; "
                "each further lane takes the next two")
@@ -39,7 +39,7 @@ p.add_argument("--template", default="ci", help="name of the template the cases 
 p.add_argument("--image", default="public.ecr.aws/docker/library/busybox:1.36",
                help="container image for the image-template case")
 p.add_argument("--no-image", action="store_true", help="skip the image-template case (needs registry access)")
-p.add_argument("--image-cache", help="keep the pulled image here, and build from it when it is there (no registry)")
+p.add_argument("--image-cache", help="keep the pulled image here as an OCI layout, and build from it when it is there (no registry)")
 # The scripts/faults.py scenarios that fit CI time: migration failure paths and fencing, address
 # generations and loans, forged peers, processes killed between steps, checkpoint corruption,
 # copy-on-write exactness, growth and a checkpoint during a resize (on a template with little
@@ -68,7 +68,7 @@ p.add_argument("--selftest", action="store_true",
 p.add_argument("cases", nargs="*", help="cases to run (default: all)")
 args = p.parse_args()
 BIN = os.path.abspath(args.bin)
-ARTIFACTS = os.path.abspath(args.artifacts)
+ARTIFACTS = os.path.join(os.path.abspath(args.state), "artifacts")
 os.makedirs(args.log_dir, exist_ok=True)
 
 
@@ -82,7 +82,7 @@ os.makedirs(args.log_dir, exist_ok=True)
 
 def flexvm(*argv, timeout=180, check=True, env=None):
     """Runs the flexvm CLI; returns the CompletedProcess."""
-    r = subprocess.run([BIN, "--artifacts", ARTIFACTS, *argv], capture_output=True, text=True, timeout=timeout,
+    r = subprocess.run([BIN, "--state", BUILD, *argv], capture_output=True, text=True, timeout=timeout,
                        env=env)
     if check and r.returncode != 0:
         raise AssertionError(f"flexvm {' '.join(argv)} exited {r.returncode}: {r.stderr.strip()}")
@@ -143,8 +143,8 @@ class Host:
         if listener_inode(self.port) is not None:
             raise AssertionError(f"port {self.port} is in use; pick other ports with --port-a")
         os.makedirs(self.run_dir, exist_ok=True)
-        os.makedirs(self.state_dir, exist_ok=True)
-        cmd = [BIN, "--artifacts", ARTIFACTS, "--state", self.state_dir, "--run", self.run_dir, "listen", self.addr,
+        shared_state(self.state_dir)
+        cmd = [BIN, "--state", self.state_dir, "--run", self.run_dir, "listen", self.addr,
                "--peer", self.peer, "--vm-ips", f"{self.net}.2-{self.net}.60", "--reserve", "256", "--prefix", self.prefix]
         self.proc = subprocess.Popen(cmd, stdout=open(self.log, "a"), stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                      env=ENV, start_new_session=True)
@@ -604,8 +604,8 @@ def kill_releases():
 
 
 # --- the image case's registry pull and its cache --------------------------------
-# With --image-cache, a pull's blobs stay in that directory and an OCI layout of the
-# image is kept beside them (oci/REF/), which later runs build from without the registry.
+# With --image-cache, the pulled blobs are kept there as an OCI layout of the image
+# (oci/REF/), which later runs build from without the registry.
 # CI keeps the directory in actions/cache; a cold cache pulls from the registry.
 
 
@@ -672,10 +672,9 @@ def retry_after():
 def pull_template(name, opts):
     """Builds the template from the registry. HTTP 429s are retried with longer and longer
     waits (or what Retry-After asks); a registry that stays rate limited fails as that."""
-    cache = args.image_cache or os.path.join(WORK, "images")
     waits = (15, 30, 60, 120)
     for i in range(len(waits) + 1):
-        r = flexvm("template", name, "--image", args.image, "--image-cache", cache, *opts, timeout=600, check=False)
+        r = flexvm("template", name, "--image", args.image, *opts, timeout=600, check=False)
         if r.returncode == 0:
             return r
         if "HTTP 429" not in r.stderr:
@@ -705,7 +704,7 @@ def save_layout(stderr):
         os.makedirs(os.path.join(tmp, "blobs", "sha256"))
         for desc in [manifest["config"], *manifest["layers"]]:
             hexd = desc["digest"].split(":", 1)[1]
-            shutil.copy(os.path.join(args.image_cache, "blobs", "sha256", hexd), os.path.join(tmp, "blobs", "sha256", hexd))
+            shutil.copy(os.path.join(BUILD, "images", "blobs", "sha256", hexd), os.path.join(tmp, "blobs", "sha256", hexd))
         open(os.path.join(tmp, "blobs", "sha256", m.group(1).split(":", 1)[1]), "wb").write(body)
         json.dump({"imageLayoutVersion": "1.0.0"}, open(os.path.join(tmp, "oci-layout"), "w"))
         json.dump({"schemaVersion": 2, "manifests": [{"mediaType": manifest.get("mediaType", "application/vnd.oci.image.manifest.v1+json"),
@@ -733,7 +732,7 @@ def image_template():
     if layout:
         # Cached (CI): the image as an OCI layout of the blobs an earlier pull fetched. No
         # registry; flexvm checks every blob against its digest as it would after a pull.
-        flexvm("template", name, "--image", layout, "--image-cache", os.path.join(WORK, "images"), *opts, timeout=600)
+        flexvm("template", name, "--image", layout, *opts, timeout=600)
         print(f"  template from the cached {args.image} ({image_digest(layout)}): {time.time() - t:.1f} s")
     else:
         r = pull_template(name, opts)
@@ -777,13 +776,11 @@ def faults():
     # The app-log template is built from the cached image when there is one (CI), not pulled.
     layout = image_layout()
     image = ["--image", layout] if layout else ["--image", args.image]
-    if layout:
-        env["IMAGE_CACHE"] = os.path.join(WORK, "images")
     r = subprocess.run([sys.executable, os.path.join(ROOT, "scripts", "faults.py"), "--a", A.addr, "--b", B.addr,
                         "--a-state", A.state_dir, "--a-run", A.run_dir, "--b-state", B.state_dir, "--b-run", B.run_dir,
                         "--a-listen-log", A.log, "--b-listen-log", B.log,
                         "--a-ips", f"{A.net}.2-{A.net}.60", "--b-ips", f"{B.net}.2-{B.net}.60",
-                        "--no-listeners", "--bin", BIN, "--artifacts", ARTIFACTS, "--template", args.template,
+                        "--no-listeners", "--bin", BIN, "--template", args.template,
                         "--ckpt-dir", os.path.join(WORK, "faults-ckpt"), *image, *args.faults.split()], timeout=1800, env=env)
     check("faults.py: no failures", r.returncode == 0, f"exit {r.returncode}")
 
@@ -799,7 +796,19 @@ WORK = tempfile.mkdtemp(prefix=args.tag + "-", dir=None if args.selftest else "/
 # which a CI runner's disk makes slow; what stays (sparse) is small.
 TEMPLATES = args.templates or tempfile.mkdtemp(prefix=args.tag + "-",
                                             dir="/dev/shm" if not args.selftest and os.path.isdir("/dev/shm") else WORK)
-os.environ["FLEXVM_TEMPLATES"] = ENV["FLEXVM_TEMPLATES"] = TEMPLATES
+
+
+def shared_state(state):
+    """A state directory whose artifacts and templates are this run's."""
+    os.makedirs(state, exist_ok=True)
+    for name, target in (("artifacts", ARTIFACTS), ("templates", TEMPLATES)):
+        if not os.path.lexists(os.path.join(state, name)):
+            os.symlink(target, os.path.join(state, name))
+
+
+# Where templates are built (and images pulled, unpacked in its staging/).
+BUILD = os.path.join(WORK, "build")
+shared_state(BUILD)
 A = Host("a", args.port_a, args.port_a + 1, args.net_a)
 GROW = args.template + "-grow"
 B = Host("b", args.port_a + 1, args.port_a, args.net_b)
@@ -968,7 +977,7 @@ def main():
         scens = [c.split("/", 1)[1] for c in batch if c.startswith("faults/")]
         res = os.path.join(WORK, f"results-{label}.json")
         cmd = [sys.executable, "-u", os.path.abspath(__file__), "--worker", "--lane", str(i), "--bin", BIN,
-               "--artifacts", ARTIFACTS, "--log-dir", os.path.join(args.log_dir, f"lane-{label}"),
+               "--state", args.state, "--log-dir", os.path.join(args.log_dir, f"lane-{label}"),
                "--port-a", str(port), "--net-a", net_a, "--net-b", net_b, "--tag", args.tag,
                "--template", args.template, "--templates", TEMPLATES, "--image", args.image, "--results", res,
                *(["--image-cache", os.path.abspath(args.image_cache)] if args.image_cache else []),

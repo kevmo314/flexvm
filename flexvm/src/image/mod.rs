@@ -398,8 +398,6 @@ fn create_new(path: &Path) -> Result<File> {
     Ok(std::fs::OpenOptions::new().write(true).create_new(true).custom_flags(libc::O_NOFOLLOW).open(path)?)
 }
 
-pub const STAGING: &str = "/var/lib/flexvm/staging";
-
 /// Only root may change what `path` names (sticky directories excepted).
 fn check_ancestry(path: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
@@ -409,7 +407,7 @@ fn check_ancestry(path: &Path) -> Result<()> {
         if m.uid() != 0 || writable || m.file_type().is_symlink() {
             bail!(
                 "image staging directory {}: {} must be root-owned and not writable by others \
-                 (choose another with --image-staging)",
+                 (choose another --state)",
                 path.display(),
                 dir.display()
             );
