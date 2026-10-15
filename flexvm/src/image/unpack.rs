@@ -343,11 +343,18 @@ impl Root {
         let mut how: libc::open_how = unsafe { std::mem::zeroed() };
         how.flags = (flags | libc::O_CLOEXEC) as u64;
         how.resolve = libc::RESOLVE_IN_ROOT | libc::RESOLVE_NO_MAGICLINKS;
-        let fd = unsafe { libc::syscall(libc::SYS_openat2, self.fd.as_raw_fd(), path.as_ptr(), &how, std::mem::size_of::<libc::open_how>()) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
+        for attempt in 0..100 {
+            let fd = unsafe { libc::syscall(libc::SYS_openat2, self.fd.as_raw_fd(), path.as_ptr(), &how, std::mem::size_of::<libc::open_how>()) };
+            if fd >= 0 {
+                return Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) });
+            }
+            let err = io::Error::last_os_error();
+            // RESOLVE_IN_ROOT can race even with unrelated renames elsewhere on the system.
+            if attempt == 99 || !matches!(err.raw_os_error(), Some(libc::EAGAIN | libc::EINTR)) {
+                return Err(err);
+            }
         }
-        Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
+        unreachable!()
     }
 
     fn resolve(&self, rel: &Path) -> io::Result<OwnedFd> {
@@ -715,6 +722,36 @@ pub(super) mod tests {
         fn drop(&mut self) {
             assert_eq!(std::fs::read_to_string(self.dir.join("outside")).ok().as_deref(), Some("keep"), "escaped the root");
         }
+    }
+
+    #[test]
+    fn resolve_during_unrelated_renames() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Barrier;
+
+        let s = Sandbox::new("resolve-renames");
+        std::fs::create_dir_all(s.root.join("a/b")).unwrap();
+        let root = s.open();
+        let unrelated = tmpdir("unrelated-renames");
+        let a = unrelated.join("a");
+        let b = unrelated.join("b");
+        std::fs::write(&a, "").unwrap();
+        let running = AtomicBool::new(true);
+        let ready = Barrier::new(2);
+        std::thread::scope(|scope| {
+            let renamer = scope.spawn(|| {
+                ready.wait();
+                while running.load(Ordering::Relaxed) {
+                    std::fs::rename(&a, &b).unwrap();
+                    std::fs::rename(&b, &a).unwrap();
+                }
+            });
+            ready.wait();
+            let result = (0..20_000).try_for_each(|_| root.resolve(Path::new("a/b/../../a/b")).map(drop));
+            running.store(false, Ordering::Relaxed);
+            renamer.join().unwrap();
+            result.expect("path resolution failed during unrelated renames");
+        });
     }
 
     #[test]
