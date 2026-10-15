@@ -1004,16 +1004,18 @@ impl Host {
 
     /// A released record goes, its address's arrival settled first: it is the
     /// evidence `withdraw_dead` reads should the release have been cut short.
-    pub fn mig_done(&self, id: u64) -> Result<()> {
+    /// Whether it went (there was one).
+    pub fn mig_done(&self, id: u64) -> Result<bool> {
         let l = self.lock()?;
         match load(&self.mig_path(id))? {
             Some(Mig::Released { ip, .. }) => {
                 if let Some(ip) = ip {
                     self.settle_arrived(&l, ip, id)?;
                 }
-                Ok(crate::util::unlink_durably(&self.mig_path(id))?)
+                crate::util::unlink_durably(&self.mig_path(id))?;
+                Ok(true)
             }
-            _ => Ok(()),
+            _ => Ok(false),
         }
     }
 
