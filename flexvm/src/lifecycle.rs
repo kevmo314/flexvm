@@ -87,6 +87,8 @@ impl Proc {
         let vm = self.vm();
         let op = self.op_within()?;
         let start = Instant::now();
+        // An arriving VM's pages first, so the host lock is held only through the resume itself (#334).
+        vm.await_peer_pages()?;
         let still = self.still_current(vm.ip)?;
         vm.unpause()?;
         drop(still);

@@ -108,13 +108,20 @@ pub struct Vm {
     pub cancel_checkpoint: AtomicUsize,
     /// Its Firecracker died (`mark_dead`): waits on it end at once.
     dead: AtomicBool,
-    /// A pause or resume whose outcome Firecracker could not tell: `state` may be wrong, so the next `switch` asks.
-    switch_unsure: AtomicBool,
+    /// Whether `state` is known after the last pause or resume (see `Unsure`).
+    unsure: Mutex<Unsure>,
     /// Its tap could not be raised or routed when it resumed: the next `unpause` does that first.
     link_down: AtomicBool,
-    /// With `switch_unsure`: a resume failed and the VM could not be paused again, so Firecracker saying Paused
-    /// proves nothing (see `after_failed_resume`).
-    resume_failed: AtomicBool,
+}
+
+/// After a pause or resume: `Pause`, its outcome Firecracker could not tell (`state` may be wrong, so the next `switch`
+/// asks); `Resume`, a resume failed and the VM could not be paused again, so Firecracker saying Paused proves nothing
+/// (see `after_failed_resume`).
+#[derive(Clone, Copy, PartialEq)]
+enum Unsure {
+    Settled,
+    Pause,
+    Resume,
 }
 
 impl Vm {
@@ -528,8 +535,7 @@ impl Vm {
     /// Never Failed: it can still be resumed.
     fn settle_failed_resume(&self) -> State {
         let now = self.after_failed_resume();
-        self.switch_unsure.store(now.is_none(), Ordering::SeqCst);
-        self.resume_failed.store(now.is_none(), Ordering::SeqCst);
+        *self.unsure.lock().unwrap() = if now.is_none() { Unsure::Resume } else { Unsure::Settled };
         let now = now.unwrap_or(State::Paused);
         self.record(now);
         now
@@ -539,11 +545,17 @@ impl Vm {
         self.switch(State::Running, State::Paused)
     }
 
-    /// A migration target first pulls all its memory, so it never runs split across two hosts.
-    pub fn unpause(&self) -> Result<()> {
+    /// A migration target first pulls all its memory, so it never runs split across two hosts. Waits up to
+    /// `PULL_WAIT`: callers do it before taking the host lock (#334), which `unpause` then finds done.
+    pub fn await_peer_pages(&self) -> Result<()> {
         if self.pager.pulling_from_peer() && !self.pager.wait_pulled(Some(PULL_WAIT)) {
             bail!("vm {} is still pulling its memory from its previous host; resume it once that is done", self.name);
         }
+        Ok(())
+    }
+
+    pub fn unpause(&self) -> Result<()> {
+        self.await_peer_pages()?;
         if self.link_down.load(Ordering::SeqCst) {
             self.link_up().map_err(|e| format!("vm {}: raising its network: {e}", self.name))?;
         }
@@ -578,7 +590,7 @@ impl Vm {
         // A timeout or a lost answer may still have switched it: Firecracker says which state it is in. If that cannot
         // be had either, it is recorded as it was but unsure (collapsing held, after a pause), so the next pause or
         // resume asks again or sends its request whatever the record says.
-        let resume_failed = self.resume_failed.load(Ordering::SeqCst);
+        let resume_failed = *self.unsure.lock().unwrap() == Unsure::Resume;
         let now = match &res {
             Ok(()) => Some(to),
             // Not `rejected`: a resume that failed part way is answered 400 too.
@@ -589,13 +601,16 @@ impl Vm {
             Err(e) if rejected(e, "/vm") => Some(from),
             Err(_) => self.fc_state(),
         };
-        // Kept until an explicit pause succeeds or Running is confirmed.
-        self.resume_failed.store(now.is_none() && (resume_failed || !pausing), Ordering::SeqCst);
         // Recorded whichever it is (a failed resume may find it still paused).
         if let Some(s) = now {
             self.record(s);
         }
-        self.switch_unsure.store(now.is_none(), Ordering::SeqCst);
+        // A failed resume's is kept until an explicit pause succeeds or Running is confirmed.
+        *self.unsure.lock().unwrap() = match now {
+            Some(_) => Unsure::Settled,
+            None if resume_failed || !pausing => Unsure::Resume,
+            None => Unsure::Pause,
+        };
         if now == Some(to) {
             if let Err(e) = &res {
                 crate::log!("vm {}: {e}, but firecracker is {}", self.name, to.name());
@@ -607,17 +622,17 @@ impl Vm {
 
     /// Whether a pause or resume ended unknown (see `switch`).
     pub fn switch_unsure(&self) -> bool {
-        self.switch_unsure.load(Ordering::SeqCst)
+        *self.unsure.lock().unwrap() != Unsure::Settled
     }
 
     /// Its state, after a pause or resume that ended unknown first recorded as Firecracker has it, or after a failed
-    /// resume as `after_failed_resume` makes it (clearing `switch_unsure`); None if that cannot be had.
+    /// resume as `after_failed_resume` makes it (settling `unsure`); None if that cannot be had.
     fn reconcile(&self) -> Option<State> {
-        if self.switch_unsure.load(Ordering::SeqCst) {
+        let unsure = *self.unsure.lock().unwrap();
+        if unsure != Unsure::Settled {
             // After a resume that failed, Firecracker saying Paused proves nothing: it is paused again instead.
-            self.record(if self.resume_failed.load(Ordering::SeqCst) { self.after_failed_resume() } else { self.fc_state() }?);
-            self.switch_unsure.store(false, Ordering::SeqCst);
-            self.resume_failed.store(false, Ordering::SeqCst);
+            self.record(if unsure == Unsure::Resume { self.after_failed_resume() } else { self.fc_state() }?);
+            *self.unsure.lock().unwrap() = Unsure::Settled;
         }
         Some(self.state())
     }
@@ -953,9 +968,8 @@ impl Prepared {
             last_checkpoint: Mutex::new(None),
             cancel_checkpoint: AtomicUsize::new(0),
             dead: AtomicBool::new(false),
-            switch_unsure: AtomicBool::new(false),
+            unsure: Mutex::new(Unsure::Settled),
             link_down: AtomicBool::new(false),
-            resume_failed: AtomicBool::new(false),
         })
     }
 

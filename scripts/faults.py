@@ -1585,6 +1585,96 @@ def reconcile_announce():
     kill(A, n)
 
 
+def resume_pull_lock():
+    """#334: resuming an arriving VM waits for its pages (`pages_slow` keeps
+    them coming) before it takes the host lock, so other operations on that
+    host that need the lock (a run claiming an address) do not stall for it."""
+    n, other = "ft-resume-pull-lock", "ft-resume-pull-lock-2"
+    m = setup(n, mib=400)
+    fault(A, "pages_slow", 120000)
+    ok(migrate(A, n, B))
+    arriving = lambda: (lambda v: v.get("remote_left", 0) > 0 and not v.get("failed"))(vms(B).get(n, {}))
+    check("resume pull lock: caught arriving on B", arriving(), vms(B).get(n))
+    check("resume pull lock: paused mid-arrival", pause(B, n), vms(B).get(n))
+    signal_vm(B, n, signal.SIGCONT)
+    time.sleep(1)
+    t = time.time()
+    r = run(B, other)
+    took = time.time() - t
+    check("resume pull lock: a run on B is not held up by the resume's wait", r["ok"] and took < 15, (r, f"{took:.1f}s"))
+    check("resume pull lock: the resume was still waiting meanwhile", vms(B)[n]["state"] == "paused" and arriving(), vms(B).get(n))
+    fault(A, "pages_slow", 0)
+    wait_released(B, n)
+    if not wait_for(lambda: vms(B)[n]["state"] == "running", 35):
+        resume(B, n)
+    check("resume pull lock: runs on B only, md5 intact", where(n) == {B: "running"} and md5(B, n) == m, where(n))
+    cleanup(n)
+    cleanup(other)
+
+
+def page_conns():
+    """#335: a peer that knows the migration holds many page connections open
+    (more than the 256 control connections a VM process takes): page
+    connections have a budget of their own, the one idle longest making room,
+    so a local control request is still answered, a new page connection (as
+    a target's pager reconnects) is still served, and the target still
+    faults pages in and finishes its pull."""
+    n = "ft-page-conns"
+    m = setup(n, mib=400)
+    _, head = sh(A, n, "head -c 4194304 /tmp/f | md5sum")
+    fault(A, "pages_slow", 120000)
+    r = ok(migrate(A, n, B))
+    hello = json.dumps({"op": "pages", "name": n, "mig": r["mig"]}).encode() + b"\n"
+    h, port = A.addr.rsplit(":", 1)
+
+    def page_conn():
+        s = socket.create_connection((h, int(port)), timeout=10)
+        s.sendall(hello)
+        got = b""
+        try:
+            while not got.endswith(b"\n") and (d := s.recv(1)):
+                got += d
+        except OSError:
+            pass
+        return s, got
+
+    held, answered = [], 0
+    try:
+        for _ in range(300):
+            s, got = page_conn()
+            held.append(s)
+            answered += got == b'{"ok":true}\n'
+        check("page conns: idle page connections opened", answered >= 200, f"{answered} of 300 answered")
+        t = time.time()
+        try:
+            st = control(A, n, {"op": "debug", "what": "status"}, timeout=10)
+        except OSError as e:
+            st = {"ok": False, "error": str(e)}
+        check("page conns: a local control request is answered", st.get("ok") and time.time() - t < 5, st.get("error"))
+        s, got = page_conn()
+        held.append(s)
+        reply = b""
+        if got == b'{"ok":true}\n':
+            s.settimeout(10)
+            s.sendall((0).to_bytes(8, "little") + (4096).to_bytes(4, "little"))
+            try:
+                while len(reply) < 4097 and (d := s.recv(65536)):
+                    reply += d
+            except OSError:
+                pass
+        check("page conns: a new page connection is admitted and served", len(reply) == 4097 and reply[0] == 0, (got, reply[:20]))
+        # At full speed (an exec at a second per reply times out), the connections still held.
+        fault(A, "pages_slow", 0)
+        code, out = sh(B, n, "head -c 4194304 /tmp/f | md5sum")
+        check("page conns: the target still faults pages in", code == 0 and out == head, (code, out, head))
+    finally:
+        for s in held:
+            s.close()
+    st = wait_released(B, n)
+    check("page conns: migration completed, md5 intact", st["released"] is True and where(n) == {B: "running"} and md5(B, n) == m, (st, where(n)))
+    cleanup(n)
+
+
 def conns(host):
     """Connections `host`'s listener has yet to answer (established, or closed by the peer)."""
     port = int(host.addr.rsplit(":", 1)[1])
@@ -6381,7 +6471,7 @@ SCENARIOS = dict(
     cow_wp_race=cow_wp_race, fetch_tail_enomem=fetch_tail_enomem, fetch_enomem_stuck=fetch_enomem_stuck, pull_enomem=pull_enomem,
     collapse_abort=collapse_abort, collapse_ckpt_fail=collapse_ckpt_fail, ckpt_paused_backlog=ckpt_paused_backlog, same_host_order=same_host_order, same_host_slow_route=same_host_slow_route, same_host_flood=same_host_flood, same_host_late_handover=same_host_late_handover, same_host_backlog=same_host_backlog, ckpt_backlog=ckpt_backlog, rx_stall=rx_stall, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,
     handoff_superseded=handoff_superseded, delayed_announce=delayed_announce, announce_arp_timer=announce_arp_timer,
-    prepare_fail_announce=prepare_fail_announce, reconcile_announce=reconcile_announce, suspend_cmd=suspend_cmd, fc_died_busy=fc_died_busy, pause_cmd_start=pause_cmd_start, suspend_died=suspend_died)
+    prepare_fail_announce=prepare_fail_announce, reconcile_announce=reconcile_announce, resume_pull_lock=resume_pull_lock, page_conns=page_conns, suspend_cmd=suspend_cmd, fc_died_busy=fc_died_busy, pause_cmd_start=pause_cmd_start, suspend_died=suspend_died)
 names = [n for s in args.scenarios for n in (list(SCENARIOS) if s == "all" else [s])]
 if os.geteuid() != 0:
     sys.exit("run as root (sudo)")

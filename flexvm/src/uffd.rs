@@ -64,7 +64,7 @@ use fetch::{Lane, Link};
 pub use hot::Held;
 pub(crate) use pages::zeroed_atomics;
 pub use pages::{Pages, BASE, DISCARDED, INFLIGHT, PRESENT, REMOTE, ZERO};
-pub use server::serve_pages;
+pub use server::{admit, serve_pages};
 pub use wp::Frozen;
 
 pub const MAX_PRELOAD: usize = 4096;

@@ -2,8 +2,9 @@ use super::{page_runs, Mapping, Pager, MAX_FETCH};
 use crate::bail;
 use crate::util::{Result, PAGE_SIZE};
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const SERVE_WRITE: Duration = Duration::from_secs(30);
@@ -12,17 +13,66 @@ const SERVE_WRITE: Duration = Duration::from_secs(30);
 /// just reconnects.
 const SERVE_IDLE: Duration = Duration::from_secs(600);
 
+/// Page-server connections this process serves at once, apart from its control connections (#335). A target uses 12
+/// (`FAULT_FETCHERS` + `PULL_THREADS`), and more for a while after it reconnects; one past this takes the place of the
+/// one idle longest, so connections a peer leaves open never shut out a target's reconnect. Each one's buffer is at
+/// most `1 + MAX_FETCH`, so this bounds their buffers too.
+const MAX_CONNS: usize = 32;
+const _: () = assert!(MAX_CONNS * (1 + MAX_FETCH) <= 40 << 20);
+static CONNS: Mutex<Vec<Arc<Conn>>> = Mutex::new(Vec::new());
+
+struct Conn {
+    sock: TcpStream,
+    /// Since when it has waited for a request; None while it answers one.
+    idle: Mutex<Option<Instant>>,
+}
+
+/// A page-server connection's place among `MAX_CONNS`, given up when dropped.
+pub struct Admitted(Arc<Conn>);
+
+impl Drop for Admitted {
+    fn drop(&mut self) {
+        CONNS.lock().unwrap().retain(|c| !Arc::ptr_eq(c, &self.0));
+    }
+}
+
+/// A place for `conn` among the page-server connections; when they are all taken, the one idle longest is shut down
+/// for it (its client reconnects when it needs it), or None if every one is answering a request.
+pub fn admit(conn: &TcpStream) -> io::Result<Option<Admitted>> {
+    let c = Arc::new(Conn { sock: conn.try_clone()?, idle: Mutex::new(Some(Instant::now())) });
+    let mut all = CONNS.lock().unwrap();
+    if all.len() >= MAX_CONNS {
+        let longest = all.iter().enumerate().filter_map(|(i, c)| c.idle.lock().unwrap().map(|t| (t, i))).min();
+        let Some((since, i)) = longest else { return Ok(None) };
+        let old = all.swap_remove(i);
+        crate::log!("page server: {MAX_CONNS} connections; dropping one idle for {} s", since.elapsed().as_secs());
+        let _ = old.sock.shutdown(Shutdown::Both);
+    }
+    all.push(c.clone());
+    Ok(Some(Admitted(c)))
+}
+
 /// Serves page reads for `pager` on an accepted page-server connection (already answered `ok`), until the client hangs
-/// up, sits idle for `SERVE_IDLE`, asks for more than `MAX_FETCH`, or `stop()` says to drop it. `stop` is asked before
+/// up, sits idle for `SERVE_IDLE` (or longest, as another one is admitted), asks for more than `MAX_FETCH`, or `stop()`
+/// says to drop it. `stop` is asked before
 /// every request and every second meanwhile, so a connection ends soon after its VM stops being a migration source.
 /// `pace()` is called before each reply (a test fault slows the server with it). `conn` is the socket under `stream`, for
-/// its timeouts.
-pub fn serve_pages(pager: &Pager, conn: &TcpStream, mut stream: impl Read + Write, stop: impl Fn() -> bool, pace: impl Fn()) -> io::Result<()> {
+/// its timeouts; `admitted` its place (`admit`).
+pub fn serve_pages(
+    pager: &Pager,
+    conn: &TcpStream,
+    admitted: &Admitted,
+    mut stream: impl Read + Write,
+    stop: impl Fn() -> bool,
+    pace: impl Fn(),
+) -> io::Result<()> {
     conn.set_read_timeout(Some(Duration::from_secs(1)))?;
     conn.set_write_timeout(Some(SERVE_WRITE))?;
     let mut req = [0u8; 12];
     let mut buf = Vec::new();
+    let idle = |yes: bool| *admitted.0.idle.lock().unwrap() = yes.then(Instant::now);
     while read_request(&mut stream, &mut req, &stop) && !stop() {
+        idle(false);
         let offset = u64::from_le_bytes(req[..8].try_into().unwrap());
         let len = u32::from_le_bytes(req[8..].try_into().unwrap()) as usize;
         if len > MAX_FETCH {
@@ -44,6 +94,7 @@ pub fn serve_pages(pager: &Pager, conn: &TcpStream, mut stream: impl Read + Writ
                 stream.write_all(&[1])?;
             }
         }
+        idle(true);
     }
     Ok(())
 }
