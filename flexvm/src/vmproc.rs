@@ -959,9 +959,13 @@ impl Proc {
     }
 
     fn controller(self: Arc<Self>) {
-        let (mut published, mut growth, mut stopping) = (false, Growth::default(), None);
+        let (mut published, mut growth, mut stopping) = (false, Growth::default(), None::<Stopping>);
         loop {
             thread::sleep(Duration::from_secs(1));
+            // Standby VMs signalled last tick had that sleep: other processes may stop them now, however long this tick blocks.
+            if let Some(s) = &mut stopping {
+                s.lock = None;
+            }
             self.ticks.lock().unwrap().tick();
             let vm = self.vm();
             if !vm.firecracker_alive() || vm.pager.failed().is_some() {
@@ -1592,10 +1596,10 @@ fn relieve(host: &Host, avail: Option<u64>, starved_here: bool, stopping: &mut O
     });
 }
 
-/// Standby VMs a controller signalled, with `STATE/standby.stop.lock` held
-/// until they are settled: carried across its ticks, never waited for.
+/// Standby VMs a controller signalled, settled on its later ticks, never
+/// waited for. `STATE/standby.stop.lock` is held only until its next tick starts.
 struct Stopping {
-    _lock: std::fs::File,
+    lock: Option<std::fs::File>,
     fds: Vec<crate::host::PidFd>,
     by: Instant,
 }
@@ -1621,13 +1625,13 @@ fn stop_standby(host: &Host, avail: u64, reserve: u64, stopping: &mut Option<Sto
     if crate::host::flock(&lock, libc::LOCK_EX | libc::LOCK_NB).is_err() {
         return true;
     }
-    let standby: Vec<_> = crate::standby::templates(host).iter().flat_map(|t| crate::standby::stoppable(host, t)).collect();
-    let fds: Vec<_> = standby.iter().filter_map(crate::standby::stop).collect();
+    let fds: Vec<_> =
+        crate::standby::templates(host).iter().flat_map(|t| crate::standby::stoppable(host, t)).filter_map(|id| crate::standby::stop(&id)).collect();
     if fds.is_empty() {
         return false;
     }
     let _ = std::fs::write(crate::standby::pressure(host), b"");
-    *stopping = Some(Stopping { _lock: lock, fds, by: Instant::now() + Duration::from_secs(1) });
+    *stopping = Some(Stopping { lock: Some(lock), fds, by: Instant::now() + Duration::from_secs(1) });
     true
 }
 
