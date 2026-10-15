@@ -3255,7 +3255,7 @@ mod tests {
     /// A peer borrows no address this host would not hand out itself (#415).
     #[test]
     fn no_fresh_loan_or_claim_of_a_zero_half_address() {
-        let mut h = host("zero-half");
+        let (_dir, mut h) = host("zero-half");
         h.cfg.vm_ips = "10.9.255.254-10.10.0.2".into();
         let l = h.lock().unwrap();
         for x in [ip("10.10.0.0"), ip("10.9.255.255")] {
