@@ -23,6 +23,8 @@ pub const CAP: usize = 4 << 20;
 /// Per round of `release`; past it (a flood faster than the sink) packets are dropped.
 const CATCH_UP: Duration = Duration::from_millis(100);
 const MAX_FRAME: usize = 65535;
+/// The hold device's virtio-net header (`open_tun`): struct virtio_net_hdr.
+const VNET_HDR: usize = 10;
 /// Packets read off the device at a time before what was read is handed over.
 const PASS: usize = 256;
 /// The hold device's queue length (`open_tun`).
@@ -73,6 +75,12 @@ struct Gone {
     resent: u64,
     dropped: u64,
     reported: Option<Instant>,
+}
+
+impl Gone {
+    fn new(moved: bool) -> Gone {
+        Gone { at: Instant::now(), moved, resent: 0, dropped: 0, reported: None }
+    }
 }
 
 struct Entry {
@@ -181,8 +189,24 @@ impl Holder {
             let dropped = e.q.lock().unwrap().discard();
             if dropped > 0 {
                 let mut gone = self.gone.lock().unwrap();
-                let g = gone.entry(ip).or_insert(Gone { at: Instant::now(), moved: false, resent: 0, dropped: 0, reported: None });
-                g.dropped += dropped;
+                gone.entry(ip).or_insert(Gone::new(false)).dropped += dropped;
+            }
+        }
+    }
+
+    /// The IPv4 packets in `frames` (`from_tap`; the rest counted as dropped) go ahead of what is
+    /// held for `ip`: routed to the VM's tap before the hold, they reached it too late for its
+    /// guest to take before the pause (#379).
+    pub fn hold_first(&self, ip: Ipv4Addr, mig: u64, frames: &[Vec<u8>]) {
+        let Some(e) = self.entry(ip).filter(|e| e.mig == mig) else { return };
+        let mut q = e.q.lock().unwrap();
+        for p in frames.iter().rev().map(|f| from_tap(f)) {
+            match p {
+                Some(p) => {
+                    q.bytes += p.len();
+                    q.packets.push_front(p);
+                }
+                None => q.dropped += 1,
             }
         }
     }
@@ -213,7 +237,7 @@ impl Holder {
             held.remove(&ip);
             let mut gone = self.gone.lock().unwrap();
             gone.retain(|_, g| g.at.elapsed() < GONE_FOR || g.resent + g.dropped > 0);
-            gone.insert(ip, Gone { at: Instant::now(), moved, resent: 0, dropped: 0, reported: None });
+            gone.insert(ip, Gone::new(moved));
         }
     }
 
@@ -243,24 +267,19 @@ impl Holder {
         let switched = switch();
         match (lost, &switched) {
             (true, _) => {}
-            // Nothing reaches the device for this address any more: what it took is read off it
-            // here (the reader thread may not run for a while on a busy host) and all of it goes,
-            // however long that takes, since no flood can make it more.
-            (false, Ok(())) => {
-                e.q.lock().unwrap().switched = true;
-                let mut buf = vec![0u8; MAX_FRAME];
-                let mut read = 0;
-                while read < TXQ && self.read_one(&mut buf) {
-                    read += 1;
-                }
-                while self.give_queued(&e, sink, &mut stats) {}
-            }
+            (false, Ok(())) => self.drain_switched(&e, &mut || {
+                self.give_queued(&e, sink, &mut stats);
+            }),
             (false, Err(_)) => self.hand_over(&e, sink, &mut stats),
         }
         match switched {
             Ok(()) => self.unhold(ip, &e, true),
             // Left to the TUN, the address would be dropped here until the caller's retry.
             Err(_) => self.unroute(ip, &e),
+        }
+        // After `unhold`: a packet read since is a straggler, re-sent, not discarded here.
+        if !lost && switched.is_ok() {
+            self.give_queued(&e, sink, &mut stats);
         }
         stats.dropped += e.q.lock().unwrap().discard();
         self.report_stragglers();
@@ -291,7 +310,7 @@ impl Holder {
             std::thread::sleep(Duration::from_millis(20));
         }
         let switching = AtomicBool::new(!late);
-        let mut buf = vec![0u8; MAX_FRAME];
+        let mut buf = vec![0u8; VNET_HDR + MAX_FRAME];
         let switched = std::thread::scope(|sc| {
             sc.spawn(|| {
                 while switching.load(Ordering::SeqCst) {
@@ -307,18 +326,9 @@ impl Holder {
             // Right away, here: the helper may be asleep, or not running at all.
             let mut o = out.lock().unwrap();
             if switched.is_ok() {
-                // Nothing reaches the device for this address any more.
-                e.q.lock().unwrap().switched = true;
-                let mut read = 0;
-                while read < TXQ {
-                    let pass = PASS.min(TXQ - read);
-                    let n = (0..pass).take_while(|_| self.read_one(&mut buf)).count();
+                self.drain_switched(&e, &mut || {
                     give(&mut o);
-                    read += n;
-                    if n < pass {
-                        break;
-                    }
-                }
+                });
             }
             switching.store(false, Ordering::SeqCst);
             switched
@@ -335,11 +345,12 @@ impl Holder {
                 give(&mut o);
             }
         }
-        give(&mut o);
-        let mut stats = o.1;
         if switched.is_ok() {
             self.unhold(ip, &e, true);
         }
+        // After `unhold`: a packet read since is a straggler, re-sent, not discarded below.
+        give(&mut o);
+        let mut stats = o.1;
         let mut q = e.q.lock().unwrap();
         stats.dropped += match switched {
             Ok(()) => q.discard(),
@@ -348,6 +359,22 @@ impl Holder {
         drop(q);
         self.report_stragglers();
         Some((stats, switched))
+    }
+
+    /// Routed away, nothing new reaches the device for the address: what it took is read off it
+    /// here (the reader thread may not run for a while on a busy host), a pass at a time, each
+    /// `give`n before the next, up to its queue length, so no flood can make it more.
+    fn drain_switched(&self, e: &Entry, give: &mut dyn FnMut()) {
+        e.q.lock().unwrap().switched = true;
+        let mut buf = vec![0u8; VNET_HDR + MAX_FRAME];
+        for read in (0..TXQ).step_by(PASS) {
+            let pass = PASS.min(TXQ - read);
+            let n = (0..pass).take_while(|_| self.read_one(&mut buf)).count();
+            give();
+            if n < pass {
+                break;
+            }
+        }
     }
 
     /// Hands over what is queued now, not what arrives meanwhile; false if there was none.
@@ -406,7 +433,7 @@ impl Holder {
 
     fn read_loop(&self) {
         let mut pfd = libc::pollfd { fd: self.tun.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-        let mut buf = vec![0u8; 65536];
+        let mut buf = vec![0u8; VNET_HDR + MAX_FRAME];
         let mut wait = -1;
         loop {
             if let Err(e) = eintr(|| unsafe { libc::poll(&mut pfd, 1, wait) }) {
@@ -466,19 +493,13 @@ impl Holder {
     fn read_one(&self, buf: &mut [u8]) -> bool {
         let _rx = self.rx.lock().unwrap();
         let Ok(n) = eintr(|| unsafe { libc::read(self.tun.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) }) else { return false };
-        let p = &buf[..n as usize];
-        if p.len() < 20 || p[0] >> 4 != 4 {
-            return true;
-        }
-        // #362: the kernel checks a packet's header checksum before it forwards it here, so a
-        // stale one means the header was rewritten in flight. A guest frame with
-        // VIRTIO_NET_HDR_F_NEEDS_CSUM whose csum range covers its own IP source makes checksum
-        // completion on egress overwrite the source after the tap's ingress filter passed the
-        // original; the source is forged but the header checksum no longer matches (one
-        // completion write touches one field, and the checksum covers the source, so the two
-        // cannot agree). Dropped before it is queued or re-sent, so `straggler`'s IPPROTO_RAW
-        // resend never recomputes a valid checksum over the forged source.
-        if !ipv4_header_csum_ok(p) {
+        // #362: a guest frame with VIRTIO_NET_HDR_F_NEEDS_CSUM can aim checksum completion at
+        // its own IP source, after the tap's ingress filter passed the original. The device
+        // leaves completion to us (`open_tun`): `accept` does it only at a TCP or UDP checksum
+        // field, so no forged source is queued, nor re-sent by `straggler` (whose IPPROTO_RAW
+        // resend recomputes the header checksum).
+        let Some((h, p)) = buf[..n as usize].split_at_mut_checked(VNET_HDR) else { return true };
+        if !accept(h, 0, p) {
             return true;
         }
         let ip = Ipv4Addr::new(p[16], p[17], p[18], p[19]);
@@ -492,7 +513,7 @@ impl Holder {
                     q.packets.push_back(p.to_vec());
                 }
             }
-            None => self.straggler(ip, &mut buf[..n as usize]),
+            None => self.straggler(ip, p),
         }
         true
     }
@@ -533,17 +554,54 @@ impl Holder {
 /// words; a truncated or under-length header is treated as invalid.
 fn ipv4_header_csum_ok(p: &[u8]) -> bool {
     let ihl = (p[0] & 0xf) as usize * 4;
-    if ihl < 20 || p.len() < ihl {
-        return false;
-    }
-    let mut sum = 0u32;
-    for pair in p[..ihl].chunks_exact(2) {
-        sum += u32::from(u16::from_be_bytes([pair[0], pair[1]]));
-    }
+    ihl >= 20 && p.len() >= ihl && sum16(&p[..ihl]) == 0xffff
+}
+
+/// The one's-complement sum of `b` as big-endian 16-bit words (an odd last byte padded), folded.
+fn sum16(b: &[u8]) -> u16 {
+    let mut sum: u32 = b.chunks(2).map(|w| u32::from(u16::from_be_bytes([w[0], w.get(1).copied().unwrap_or(0)]))).sum();
     while sum >> 16 != 0 {
         sum = (sum & 0xffff) + (sum >> 16);
     }
-    sum == 0xffff
+    sum as u16
+}
+
+/// The IPv4 packet in a frame read off a tap (a 12-byte virtio-net header, then Ethernet),
+/// `accept`ed; None for anything else.
+fn from_tap(f: &[u8]) -> Option<Vec<u8>> {
+    let (h, eth) = (f.get(..12)?, f.get(12..)?);
+    let mut p = eth.get(14..14 + usize::from(u16::from_be_bytes([*eth.get(16)?, *eth.get(17)?])))?.to_vec();
+    (eth[12..14] == [8, 0] && accept(h, 14, &mut p)).then_some(p)
+}
+
+/// Whether IPv4 packet `p`, behind virtio-net header `h`, may go to a guest or be re-sent,
+/// its L4 checksum completed if `h` leaves that to the device (as `skb_checksum_help` would).
+/// Completed only in a TCP or UDP packet's own checksum field, its `csum_start` right after
+/// the IP header (`eth`: the bytes before that header it counts): anywhere else a guest could
+/// aim the write at the header and forge a source the header checksum still passes (#406:
+/// 0x0000 to 0xffff across the middle bytes of 10.0.0.2). Then the header checksum must
+/// verify (`ipv4_header_csum_ok`). Not GSO (many packets in one).
+fn accept(h: &[u8], eth: usize, p: &mut [u8]) -> bool {
+    if p.len() < 20 || p[0] >> 4 != 4 || h[1] != 0 {
+        return false;
+    }
+    if h[0] & 1 != 0 {
+        let ihl = usize::from(p[0] & 0xf) * 4;
+        let Some(field) = (match p[9] {
+            6 => Some(16),
+            17 => Some(6),
+            _ => None,
+        }) else {
+            return false;
+        };
+        let (start, off) = (usize::from(u16::from_le_bytes([h[6], h[7]])), usize::from(u16::from_le_bytes([h[8], h[9]])));
+        if start != eth + ihl || off != field || ihl < 20 || p.len() < ihl + field + 2 {
+            return false;
+        }
+        let sum = !sum16(&p[ihl..]);
+        p[ihl + field..ihl + field + 2].copy_from_slice(&(if sum == 0 { 0xffff } else { sum }).to_be_bytes());
+    }
+    ipv4_header_csum_ok(p)
 }
 
 /// Logs `g`'s straggler counts, if any ("dropped N" is what loss accounting reads).
@@ -624,12 +682,14 @@ fn tap_tx_dropped(tap: &str) -> u64 {
     std::fs::read_to_string(format!("/sys/class/net/{tap}/statistics/tx_dropped")).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0)
 }
 
-// Stream: `START`, answered `b'a'` + first expected seq (u64). Frames: u32 BE length, u64
-// seq, packet. `SYNC` gets `b's'` once all before it is injected. `SWITCH` (hosts sharing
+// Stream (over TCP: nothing lost or reordered): `START`, answered `b'a'`. Frames: u32 BE
+// length, packet. `SYNC` gets `b's'` once all before it is injected. `SWITCH` (hosts sharing
 // routes) gets `b'w'` once all before it is injected and the target took the address over.
 // Length 0 ends it and gets one JSON line. Nothing is resent.
 const SYNC: u32 = u32::MAX;
-const START: u32 = u32::MAX - 1;
+/// Not `u32::MAX - 1`, which started the stream with sequence numbers: a target here refuses
+/// such a source's stream (which counts its packets dropped), never misreads it.
+const START: u32 = u32::MAX - 3;
 const SWITCH: u32 = u32::MAX - 2;
 const MAX_RECEIVERS: usize = 8;
 static RECEIVERS: AtomicUsize = AtomicUsize::new(0);
@@ -661,10 +721,10 @@ pub fn receive(
 ) -> Option<u64> {
     let _slot = Slot::take(&RECEIVERS, MAX_RECEIVERS)?;
     let (Ok(conn), Ok(inj)) = (r.get_ref().s.try_clone(), Injector::new(tap)) else { return None };
-    if write_by(&conn, &[&b"a"[..], &0u64.to_be_bytes()].concat(), deadline).is_err() {
+    if write_by(&conn, b"a", deadline).is_err() {
         return None;
     }
-    let (mut buf, mut next, mut injected, mut dropped) = (vec![0u8; MAX_FRAME], 0, 0, 0);
+    let (mut buf, mut injected, mut dropped) = (vec![0u8; MAX_FRAME], 0, 0);
     let ended = loop {
         let mut head = [0u8; 4];
         if read_by(r, &mut head, deadline).is_err() {
@@ -684,17 +744,9 @@ pub fn receive(
             0 => break true,
             len => len as usize,
         };
-        let mut seq = [0u8; 8];
-        if len > MAX_FRAME || read_by(r, &mut seq, deadline).is_err() || read_by(r, &mut buf[..len], deadline).is_err() {
+        if len > MAX_FRAME || read_by(r, &mut buf[..len], deadline).is_err() {
             break false;
         }
-        let seq = u64::from_be_bytes(seq);
-        if seq < next {
-            dropped += 1;
-            continue;
-        }
-        dropped += seq - next;
-        next = seq + 1;
         match !*revoked.lock().unwrap() && valid(&buf[..len], ip) && inj.send(&buf[..len]) {
             true => injected += 1,
             false => dropped += 1,
@@ -714,29 +766,21 @@ pub fn valid(p: &[u8], ip: Ipv4Addr) -> bool {
     p.len() >= 20 && p[0] >> 4 == 4 && ihl >= 20 && ihl <= p.len() && u16::from_be_bytes([p[2], p[3]]) as usize == p.len() && p[16..20] == ip.octets()
 }
 
-pub fn start(conn: &TcpStream) -> Result<u64> {
+pub fn start(conn: &TcpStream) -> Result<()> {
     let deadline = Instant::now() + ACCEPT_WAIT;
     write_by(conn, &START.to_be_bytes(), deadline)?;
-    let mut ack = [0u8; 9];
+    let mut ack = [0u8; 1];
     By { s: conn, at: deadline }.read_exact(&mut ack)?;
     if ack[0] != b'a' {
         bail!("the target refused the held packets");
     }
-    Ok(u64::from_be_bytes(ack[1..].try_into().unwrap()))
+    Ok(())
 }
 
 /// Before `switch` moves the route, `SYNC`s until the target injected all sent so far. With
 /// `handoff` (hosts sharing routes) the target routes the address itself, after those.
-pub fn send(
-    holder: &Holder,
-    ip: Ipv4Addr,
-    mig: u64,
-    conn: &TcpStream,
-    seq: u64,
-    handoff: bool,
-    switch: impl FnOnce() -> Result<()>,
-) -> Option<(Stats, Result<()>)> {
-    let out = std::cell::RefCell::new(Out { buf: Vec::with_capacity(64 << 10), seq, broken: false, conn });
+pub fn send(holder: &Holder, ip: Ipv4Addr, mig: u64, conn: &TcpStream, handoff: bool, switch: impl FnOnce() -> Result<()>) -> Option<(Stats, Result<()>)> {
+    let out = std::cell::RefCell::new(Out { buf: Vec::with_capacity(64 << 10), broken: false, conn });
     let mut sink = |p: &[u8]| out.borrow_mut().frame(p);
     let mut barrier = || {
         let mut o = out.borrow_mut();
@@ -784,7 +828,6 @@ fn read_reply(conn: &TcpStream, deadline: Instant) -> Option<Value> {
 
 struct Out<'a> {
     buf: Vec<u8>,
-    seq: u64,
     broken: bool,
     conn: &'a TcpStream,
 }
@@ -795,9 +838,7 @@ impl Out<'_> {
             return false;
         }
         self.buf.extend_from_slice(&(p.len() as u32).to_be_bytes());
-        self.buf.extend_from_slice(&self.seq.to_be_bytes());
         self.buf.extend_from_slice(p);
-        self.seq += 1;
         self.buf.len() < 48 << 10 || self.flush(Instant::now() + FLUSH_WAIT)
     }
 
@@ -817,10 +858,16 @@ fn open_tun(dev: &str) -> std::result::Result<OwnedFd, (bool, crate::util::Error
         .map_err(|e| (false, format!("/dev/net/tun: {e}").into()))?;
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
     let mut req = crate::net::ifreq(dev).map_err(|e| (true, e))?;
-    req.ifr_ifru.ifru_flags = (libc::IFF_TUN | libc::IFF_NO_PI) as libc::c_short;
+    req.ifr_ifru.ifru_flags = (libc::IFF_TUN | libc::IFF_NO_PI | libc::IFF_VNET_HDR) as libc::c_short;
     if let Err(e) = eintr(|| unsafe { libc::ioctl(fd.as_raw_fd(), TUNSETIFF as _, &req) }) {
         let busy = matches!(e.raw_os_error(), Some(libc::EBUSY | libc::EEXIST | libc::EPERM));
         return Err((busy, format!("{dev}: {e}{}", if busy { " (another process has it)" } else { "" }).into()));
+    }
+    // TUN_F_CSUM: checksums reach us left to the device (`accept`), never completed by the
+    // kernel at whatever offset a guest gave.
+    const TUNSETOFFLOAD: libc::c_ulong = 0x4004_54d0;
+    if let Err(e) = eintr(|| unsafe { libc::ioctl(fd.as_raw_fd(), TUNSETOFFLOAD as _, 1 as libc::c_ulong) }) {
+        return Err((true, format!("{dev}: checksum offload: {e}").into()));
     }
     // Room for what arrives while a release catches up (default 500).
     req.ifr_ifru.ifru_metric = TXQ as i32;
@@ -836,23 +883,120 @@ fn open_tun(dev: &str) -> std::result::Result<OwnedFd, (bool, crate::util::Error
 mod tests {
     use super::*;
 
+    /// Reading `tun`, with no routes or raw socket: nothing here needs root.
+    fn holder(tun: OwnedFd) -> Holder {
+        let (held, gone) = (Mutex::default(), Mutex::default());
+        Holder { dev: "test".into(), ifindex: 0, tun, held, reading: AtomicBool::new(false), routes: Mutex::new(()), rx: Mutex::new(()), gone, resend: None }
+    }
+
+    /// A UDP datagram 10.9.0.2 -> `dst` (ports 12345 -> 54321), its header checksum filled in.
+    fn udp_to(dst: Ipv4Addr) -> Vec<u8> {
+        let mut p = vec![0x45, 0, 0, 29, 0, 1, 0, 0, 64, 17, 0, 0, 10, 9, 0, 2, 0, 0, 0, 0, 0x30, 0x39, 0xd4, 0x31, 0, 9, 0, 0, 0];
+        p[16..20].copy_from_slice(&dst.octets());
+        let sum = !sum16(&p[..20]);
+        p[10..12].copy_from_slice(&sum.to_be_bytes());
+        p
+    }
+
+    /// `p` as a tap frame: virtio-net header (`flags`, `gso_type`, csum start and offset from
+    /// the Ethernet header), Ethernet header, and `pad` bytes after it.
+    fn tap_frame(p: &[u8], flags: u8, gso: u8, csum: (u16, u16), pad: usize) -> Vec<u8> {
+        [&vnet_hdr(flags, gso, csum)[..], &[0, 0], &[2; 12], &[8, 0], p, &vec![0; pad]].concat()
+    }
+
+    /// A struct virtio_net_hdr: `flags`, `gso_type`, csum start and offset.
+    fn vnet_hdr(flags: u8, gso: u8, csum: (u16, u16)) -> Vec<u8> {
+        [&[flags, gso, 0, 0, 0, 0][..], &csum.0.to_le_bytes(), &csum.1.to_le_bytes()].concat()
+    }
+
+    /// Codex's #406 frame: a UDP datagram from 10.0.0.2 whose payload makes a completion over
+    /// bytes 13 on write 0xffff at bytes 13-14, its source then 10.255.255.2.
+    fn forgery() -> Vec<u8> {
+        let mut p = [&udp_to(Ipv4Addr::new(10, 9, 0, 8))[..], &[0, 0]].concat();
+        (p[3], p[25]) = (31, 11);
+        p[12..16].copy_from_slice(&[10, 0, 0, 2]);
+        p[10..12].fill(0);
+        let sum = !sum16(&p[..20]);
+        p[10..12].copy_from_slice(&sum.to_be_bytes());
+        let x = (0..=u16::MAX).find(|&x| {
+            p[29..31].copy_from_slice(&x.to_be_bytes());
+            sum16(&p[13..]) == 0xffff
+        });
+        assert!(x.is_some());
+        p
+    }
+
+    #[test]
+    fn completion_never_writes_into_the_ip_header() {
+        let p = forgery();
+        // Completed as asked, the source is forged and the header checksum still passes.
+        let mut naive = p.clone();
+        let sum = !sum16(&p[13..]);
+        naive[13..15].copy_from_slice(&(if sum == 0 { 0xffff } else { sum }).to_be_bytes());
+        assert_eq!((&naive[12..16], ipv4_header_csum_ok(&naive)), (&[10, 255, 255, 2][..], true));
+        assert_eq!(from_tap(&tap_frame(&p, 1, 0, (14 + 13, 0), 0)), None, "Codex's frame");
+        assert_eq!(from_tap(&tap_frame(&p, 1, 0, (14 + 21, 6), 0)), None, "a misaligned start");
+        assert_eq!(from_tap(&tap_frame(&p, 1, 0, (14 + 20, 16), 0)), None, "TCP's field in a UDP packet");
+        assert!(from_tap(&tap_frame(&p, 1, 0, (14 + 20, 6), 0)).is_some(), "UDP's own field");
+        // The hold device's reads too: the kernel leaves completion to it.
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK, 0, fds.as_mut_ptr()) }, 0);
+        let (h, w) = unsafe { (holder(OwnedFd::from_raw_fd(fds[0])), OwnedFd::from_raw_fd(fds[1])) };
+        let dst = Ipv4Addr::new(10, 9, 0, 8);
+        h.held.lock().unwrap().insert(dst, Arc::new(Entry { mig: 1, q: Mutex::default() }));
+        let mut buf = vec![0u8; VNET_HDR + MAX_FRAME];
+        for (csum, queued) in [((13, 0), 0), ((21, 6), 0), ((20, 16), 0), ((20, 6), 1)] {
+            let f = [&vnet_hdr(1, 0, csum)[..], &p].concat();
+            assert_eq!(unsafe { libc::write(w.as_raw_fd(), f.as_ptr().cast(), f.len()) }, f.len() as isize);
+            h.read_one(&mut buf);
+            assert_eq!(h.entry(dst).unwrap().q.lock().unwrap().packets.len(), queued, "{csum:?}");
+        }
+        let q = h.entry(dst).unwrap().q.lock().unwrap().packets[0].clone();
+        assert_eq!((&q[12..16], ipv4_header_csum_ok(&q)), (&[10, 0, 0, 2][..], true));
+    }
+
+    #[test]
+    fn tap_frames_become_packets_with_their_checksums_completed() {
+        // As the host sends to a tap with checksum offload: the UDP checksum holds the pseudo-header's sum.
+        let mut p = udp_to(Ipv4Addr::new(10, 9, 0, 8));
+        let pseudo = [&p[12..20], &[0, 17, 0, 9]].concat();
+        p[26..28].copy_from_slice(&sum16(&pseudo).to_be_bytes());
+        let got = from_tap(&tap_frame(&p, 1, 0, (14 + 20, 6), 3)).unwrap();
+        assert_eq!(got.len(), 29, "Ethernet padding is not the packet's");
+        assert_eq!((&got[..26], &got[28..]), (&p[..26], &p[28..]));
+        assert_eq!(sum16(&[&pseudo[..], &got[20..]].concat()), 0xffff, "the UDP checksum verifies");
+        assert_eq!(from_tap(&tap_frame(&p, 0, 0, (0, 0), 0)).unwrap(), p, "a complete one is as it was");
+        assert_eq!(from_tap(&tap_frame(&p, 0, 1, (0, 0), 0)), None, "GSO");
+        let mut arp = tap_frame(&p, 0, 0, (0, 0), 0);
+        arp[24..26].copy_from_slice(&[8, 6]);
+        assert_eq!(from_tap(&arp), None, "not IPv4");
+        assert_eq!(from_tap(&tap_frame(&p[..20], 0, 0, (0, 0), 0)), None, "truncated");
+    }
+
+    #[test]
+    fn frames_left_on_the_tap_go_ahead_of_the_held_packets() {
+        let h = holder(std::fs::File::open("/dev/null").unwrap().into());
+        let ip = Ipv4Addr::new(10, 9, 0, 8);
+        let (first, second, held) = (udp_to(ip), [&udp_to(ip)[..28], b"!"].concat(), b"held".to_vec());
+        let q = Queue { packets: VecDeque::from([held.clone()]), bytes: 4, ..Queue::default() };
+        h.held.lock().unwrap().insert(ip, Arc::new(Entry { mig: 1, q: Mutex::new(q) }));
+        let frames = [tap_frame(&first, 0, 0, (0, 0), 0), tap_frame(&second, 0, 1, (0, 0), 0), tap_frame(&second, 0, 0, (0, 0), 0)];
+        h.hold_first(ip, 2, &frames);
+        assert_eq!(h.entry(ip).unwrap().q.lock().unwrap().packets.len(), 1, "another migration's hold");
+        h.hold_first(ip, 1, &frames);
+        let e = h.entry(ip).unwrap();
+        let q = e.q.lock().unwrap();
+        assert_eq!(q.packets, [first, second, held]);
+        assert_eq!((q.bytes, q.dropped), (29 + 29 + 4, 1), "the GSO frame is counted as dropped");
+    }
+
     #[test]
     fn failed_hold_counts_queued_and_overflow_packets() {
-        let h = Holder {
-            dev: "test".into(),
-            ifindex: 0,
-            tun: std::fs::File::open("/dev/null").unwrap().into(),
-            held: Mutex::default(),
-            reading: AtomicBool::new(false),
-            routes: Mutex::new(()),
-            rx: Mutex::new(()),
-            gone: Mutex::default(),
-            resend: None,
-        };
+        let h = holder(std::fs::File::open("/dev/null").unwrap().into());
         let ip = Ipv4Addr::new(10, 100, 254, 9);
         for existing in [false, true] {
             if existing {
-                h.gone.lock().unwrap().insert(ip, Gone { at: Instant::now(), moved: true, resent: 2, dropped: 3, reported: None });
+                h.gone.lock().unwrap().insert(ip, Gone { resent: 2, dropped: 3, ..Gone::new(true) });
             }
             let e = Arc::new(Entry {
                 mig: 1,
@@ -876,20 +1020,7 @@ mod tests {
 
     #[test]
     fn a_rewritten_header_fails_its_checksum() {
-        // A UDP datagram 10.9.0.2 -> 10.9.0.8 (ports 12345 -> 54321), its header checksum filled in.
-        let mut p = vec![0x45, 0, 0, 29, 0, 1, 0, 0, 64, 17, 0, 0, 10, 9, 0, 2, 10, 9, 0, 8, 0x30, 0x39, 0xd4, 0x31, 0, 9, 0, 0, 0];
-        let csum = |p: &[u8]| -> u16 {
-            let mut s = 0u32;
-            for pair in p[..20].chunks_exact(2) {
-                s += u32::from(u16::from_be_bytes([pair[0], pair[1]]));
-            }
-            while s >> 16 != 0 {
-                s = (s & 0xffff) + (s >> 16);
-            }
-            !(s as u16)
-        };
-        let c = csum(&p).to_be_bytes();
-        p[10..12].copy_from_slice(&c);
+        let p = udp_to(Ipv4Addr::new(10, 9, 0, 8));
         assert!(ipv4_header_csum_ok(&p), "a well-formed header passes");
         // Checksum completion overwrote the low two bytes of the source (#362): the header
         // checksum is now stale, so it no longer verifies.
@@ -906,30 +1037,15 @@ mod tests {
         let mut fds = [0 as libc::c_int; 2];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
         let (r, w) = (fds[0], fds[1]);
-        let h = Holder {
-            dev: "test".into(),
-            ifindex: 0,
-            tun: unsafe { OwnedFd::from_raw_fd(r) },
-            held: Mutex::default(),
-            reading: AtomicBool::new(false),
-            routes: Mutex::new(()),
-            rx: Mutex::new(()),
-            gone: Mutex::default(),
-            resend: None,
-        };
+        let h = holder(unsafe { OwnedFd::from_raw_fd(r) });
         let dst = Ipv4Addr::new(10, 9, 0, 8);
         h.held.lock().unwrap().insert(dst, Arc::new(Entry { mig: 1, q: Mutex::default() }));
-        let mut p = vec![0x45u8, 0, 0, 29, 0, 1, 0, 0, 64, 17, 0, 0, 10, 9, 0, 2, 10, 9, 0, 8, 0x30, 0x39, 0xd4, 0x31, 0, 9, 0, 0, 0];
-        let mut sum = 0u32;
-        for pair in p[..20].chunks_exact(2) {
-            sum += u32::from(u16::from_be_bytes([pair[0], pair[1]]));
-        }
-        while sum >> 16 != 0 {
-            sum = (sum & 0xffff) + (sum >> 16);
-        }
-        p[10..12].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+        let p = udp_to(dst);
         let queued = || h.entry(dst).unwrap().q.lock().unwrap().packets.len();
-        let write = |p: &[u8]| assert_eq!(unsafe { libc::write(w, p.as_ptr().cast(), p.len()) }, p.len() as isize);
+        let write = |p: &[u8]| {
+            let f = [&vnet_hdr(0, 0, (0, 0))[..], p].concat();
+            assert_eq!(unsafe { libc::write(w, f.as_ptr().cast(), f.len()) }, f.len() as isize)
+        };
         let mut buf = vec![0u8; 2048];
         write(&p);
         h.read_one(&mut buf);
@@ -941,6 +1057,53 @@ mod tests {
         h.read_one(&mut buf);
         assert_eq!(queued(), 1, "a rewritten-header packet is dropped");
         unsafe { libc::close(w) };
+    }
+
+    /// The reader thread queues packets all through a release: those it queues after the last
+    /// hand-over must not be discarded with the queue (#365). Read after `unhold`, they are
+    /// stragglers (counted there, with no raw socket to re-send them by).
+    #[test]
+    fn a_release_discards_nothing_the_reader_queues() {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK, 0, fds.as_mut_ptr()) }, 0);
+        let (h, w) = unsafe { (holder(OwnedFd::from_raw_fd(fds[0])), OwnedFd::from_raw_fd(fds[1])) };
+        let ip = Ipv4Addr::new(10, 9, 0, 8);
+        let (p, stop) = ([&vnet_hdr(0, 0, (0, 0))[..], &udp_to(ip)].concat(), AtomicBool::new(false));
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                while !stop.load(Ordering::SeqCst) {
+                    unsafe { libc::write(w.as_raw_fd(), p.as_ptr().cast(), p.len()) };
+                }
+            });
+            s.spawn(|| {
+                let mut buf = vec![0u8; MAX_FRAME];
+                while !stop.load(Ordering::SeqCst) {
+                    h.read_one(&mut buf);
+                }
+            });
+            let dropped: Vec<u64> = (0..10)
+                .map(|mig| {
+                    h.held.lock().unwrap().insert(ip, Arc::new(Entry { mig, q: Mutex::default() }));
+                    let (stats, switched) = h.release_local(ip, mig, &mut |_| true, || Ok(()), Duration::ZERO).unwrap();
+                    switched.unwrap();
+                    stats.dropped
+                })
+                .collect();
+            stop.store(true, Ordering::SeqCst);
+            assert!(dropped.iter().all(|&d| d == 0), "{dropped:?}");
+        });
+    }
+
+    #[test]
+    fn held_frames_are_a_length_and_the_packet() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let c = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (mut s, _) = l.accept().unwrap();
+        let mut out = Out { buf: Vec::new(), broken: false, conn: &c };
+        assert!(out.frame(b"one") && out.frame(b"three") && out.flush(Instant::now() + FLUSH_WAIT));
+        let mut got = [0u8; 16];
+        s.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"\0\0\0\x03one\0\0\0\x05three");
     }
 
     /// Needs root: `sudo cargo test -- --ignored`. A sender that looked the route up before a

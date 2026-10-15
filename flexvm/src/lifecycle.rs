@@ -679,6 +679,8 @@ impl Proc {
         let plugged = vm.hotplug_plugged();
         cancelled()?;
         let _lifted = vm.limit.lift(vm.pid());
+        // Made now, not in the hold inside the pause.
+        self.holder();
         vm.leave(State::Checkpointing)?;
         self.publish();
         let paused = Instant::now();

@@ -370,6 +370,13 @@ impl Vm {
         true
     }
 
+    /// What is queued on its tap, read off it. Its Firecracker paused, that reached the tap after
+    /// `drain_tap` last looked, from a sender that looked the route up before the hold (#379).
+    pub fn take_tap_queue(&self) -> Vec<Vec<u8>> {
+        self.tap_stuck.store(false, Ordering::SeqCst);
+        self.tap_watch.lock().unwrap().as_ref().map_or_else(Vec::new, |(_, fd)| crate::net::read_tap_queue(fd))
+    }
+
     /// `n` of the tap's drops were reported (with packets a hold injected); `tap_dropped` leaves them out.
     pub fn tap_drops_reported(&self, n: u64) {
         self.tap_drops_reported.fetch_add(n, Ordering::SeqCst);
@@ -856,7 +863,7 @@ impl Vm {
                     if !matches!(gone, Ok(true)) {
                         crate::log!("vm {}: firecracker not seen gone ({gone:?}); counting what is left on its tap anyway", self.name);
                     }
-                    let n = crate::net::discard_tap_queue(&fd);
+                    let n = crate::net::read_tap_queue(&fd).len();
                     crate::log!("vm {}: dropped {n} frames still queued on its tap when it left (its guest was not taking them)", self.name);
                 }
             }
@@ -1061,6 +1068,8 @@ impl Prepared {
             let fc = self.firecracker();
             let tap = fc.tap.clone();
             let route = self.route.then(|| std::thread::spawn(move || crate::net::attach(ip, &tap)));
+            // Before `left` is read: the deadline covers it too.
+            fc.join_cgroup();
             let loaded = fc.load_snapshot(&path, &fc.tap, Some(clock_realtime), left(API_TIMEOUT));
             if matches!(vmstate, Snapshot::Bytes(_)) {
                 let _ = std::fs::remove_file(&path);

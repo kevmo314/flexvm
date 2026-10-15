@@ -110,10 +110,9 @@ impl Blob {
 impl Layer {
     pub fn name(&self) -> String {
         match (&self.digest, &self.src) {
-            (Some(d), _) => d.chars().take(19).collect(),
+            (Some(d), _) | (None, Blob::Cached { digest: d, .. }) => d.chars().take(19).collect(),
             (None, Blob::File(p)) => p.to_string_lossy().chars().rev().take(24).collect::<Vec<_>>().into_iter().rev().collect(),
             (None, Blob::Slice { offset, .. }) => format!("@{offset}"),
-            (None, Blob::Cached { digest, .. }) => digest.chars().take(19).collect(),
         }
     }
 
