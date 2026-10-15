@@ -2132,8 +2132,7 @@ pub fn flock(f: &File, how: i32) -> std::io::Result<()> {
 /// when it can: not left to the close, which a child forked meanwhile delays (see `Flock`).
 pub fn probe(f: &File, how: i32) -> std::io::Result<()> {
     flock(f, how | libc::LOCK_NB)?;
-    let _ = flock(f, libc::LOCK_UN);
-    Ok(())
+    flock(f, libc::LOCK_UN)
 }
 
 /// A holder may unlink the file just before we lock: retry until it is the path's.

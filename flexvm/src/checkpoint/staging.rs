@@ -30,6 +30,16 @@ pub(super) fn publish_permissions(files: &[RawFd], dir: RawFd, owner: &libc::sta
     Ok(())
 }
 
+/// Lets go of an fd's flock when dropped, explicitly: not only by its close,
+/// which a child another thread forked meanwhile delays (see `host::Flock`).
+struct Unlock(RawFd);
+
+impl Drop for Unlock {
+    fn drop(&mut self) {
+        unsafe { libc::flock(self.0, libc::LOCK_UN) };
+    }
+}
+
 pub(super) const STAGING_PREFIX: &str = ".flexvm-staging-";
 
 pub enum CommitError {
@@ -79,6 +89,8 @@ impl Staging {
         // Its directory's own entry, up to the root, ahead of the pause; `commit` walks again, as then.
         crate::util::sync_ancestors_fd(pfd.as_raw_fd()).map_err(|e| format!("checkpoint directory {}: {e}", parent_path.display()))?;
         check(unsafe { libc::flock(pfd.as_raw_fd(), libc::LOCK_EX) })?;
+        // Let go of on the error paths too, before `pfd` closes; on success, handed to the staging lock below.
+        let _parent_lock = Unlock(pfd.as_raw_fd());
         clear_stale_fd(&pfd);
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().subsec_nanos();
         let outer_name = cname(&format!("{STAGING_PREFIX}{}-{nanos:x}", std::process::id()));
