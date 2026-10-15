@@ -624,7 +624,7 @@ impl Proc {
                 .map(|peer| {
                     let req = req.clone();
                     thread::spawn(move || {
-                        if let Err(e) = peer_call(&peer, req) {
+                        if let Err(e) = tell(&peer, req) {
                             crate::log!("announce {ip} to {peer}: {e}");
                         }
                     })
@@ -843,10 +843,10 @@ impl Proc {
         let s = std::net::TcpStream::from(fd);
         let (vm, source) = (self.vm(), req["mig"].as_u64().map(State::Source));
         if source != Some(vm.state()) {
-            return crate::listen::refuse_pages(s, &format!("vm {} is not the source of migration {}", vm.name, req["mig"]));
+            return crate::listen::refuse(s, &format!("vm {} is not the source of migration {}", vm.name, req["mig"]), Some(Duration::from_secs(1)));
         }
         if fault("pages") {
-            return crate::listen::refuse_pages(s, "injected fault: page server down");
+            return crate::listen::refuse(s, "injected fault: page server down", Some(Duration::from_secs(1)));
         }
         let _ = s.set_nodelay(true);
         let served = send_json(&mut &s, &json!({"ok": true})).and_then(|()| {
@@ -1719,10 +1719,20 @@ pub fn tell_peers(host: &Host, req: Value) {
         .cloned()
         .map(|p| {
             let req = req.clone();
-            thread::spawn(move || peer_call(&p, req))
+            thread::spawn(move || tell(&p, req))
         })
         .collect();
     sends.into_iter().for_each(|s| drop(s.join()));
+}
+
+/// A route message, sent once more a second after it fails: nothing else
+/// sends it again, and a peer may be refusing it only for the moment (its
+/// listener restarting, or still looking up this host's name).
+fn tell(peer: &str, req: Value) -> Result<Value> {
+    peer_call(peer, req.clone()).or_else(|_| {
+        thread::sleep(Duration::from_secs(1));
+        peer_call(peer, req)
+    })
 }
 
 /// Connects and sends `req` by `at`; the stream's reads and writes then block.
