@@ -90,18 +90,6 @@ def ok(r):
     return r["result"]
 
 
-def set_config(host, **kv):
-    """Changes `host`'s settings in place, as a listener restarted with other
-    flags would write them (renamed in: running processes read it again)."""
-    path = os.path.join(host.state, "host.json")
-    cfg = json.load(open(path))
-    cfg.update(kv)
-    with open(path + ".tmp", "w") as f:
-        json.dump(cfg, f)
-    os.rename(path + ".tmp", path)
-    return cfg
-
-
 def peer(host, req, timeout=30, source=None):
     """One request to `host`'s peer listener (from address `source`, if given)."""
     h, port = host.addr.rsplit(":", 1)
@@ -316,9 +304,8 @@ def start_listener(h, listen=None, extra=(), peer=None, wait=True):
     for d in (h.state, h.run):
         os.makedirs(d, exist_ok=True)
     lg = open(h.listen_log, "a")
-    listeners[h.addr] = subprocess.Popen(
-        [BIN, "--state", h.state, "--run", h.run, "listen", listen or h.addr, "--peer", peer or other.addr, "--vm-ips", h.ips,
-         "--reserve", "512", *extra], stdout=lg, stderr=lg, env=ENV)
+    ok(cli_json(h, "config", "--peer", peer or other.addr, "--vm-ips", h.ips, "--reserve", "512", *extra))
+    listeners[h.addr] = subprocess.Popen([BIN, "--state", h.state, "--run", h.run, "listen", listen or h.addr], stdout=lg, stderr=lg, env=ENV)
     if not wait:
         return
     hp = h.addr.rsplit(":", 1)
@@ -1717,7 +1704,7 @@ def announce_arp_timer():
     and the gap is between the kernel's timestamps, not between the reads (the
     first ARP goes out before `run` returns, its read later)."""
     n, dev = "ft-arp-timer", f"garp{A.addr.rsplit(':', 1)[1]}"
-    was = ok(cli_json(A, "config")).get("announce_dev")
+    was = ok(cli_json(A, "config"))["set"].get("announce_dev") or ""
     arps, drops, cap = [], None, socket.socket(socket.AF_PACKET, socket.SOCK_RAW, 0)
     subprocess.run(["ip", "link", "del", dev], capture_output=True)
     subprocess.run(["ip", "link", "add", dev, "up", "type", "dummy"], check=True)
@@ -1727,7 +1714,8 @@ def announce_arp_timer():
         # Stamped by the kernel as each frame went out: read late, a frame's time is still its own.
         cap.setsockopt(socket.SOL_SOCKET, SO_TIMESTAMPNS, 1)
         cap.settimeout(0.2)
-        set_config(A, announce_dev=dev)
+        code, out, err = cli(A, "config", "--announce-dev", dev)
+        assert code == 0, err
         fault(B, "route_stall", 60000)
         ok(run(A, n))
         ip = socket.inet_aton(vms(A)[n]["ip"])
@@ -1750,7 +1738,7 @@ def announce_arp_timer():
             fault(B, "route_stall", 0)
         finally:
             try:
-                set_config(A, announce_dev=was)
+                cli(A, "config", "--announce-dev", was)
             finally:
                 cap.close()
                 subprocess.run(["ip", "link", "del", dev], capture_output=True)
@@ -5290,7 +5278,7 @@ class mem_available_as:
 
 
 def reserve_of(host):
-    return json.load(open(os.path.join(host.state, "host.json"))).get("reserve_mib", 1024)
+    return ok(cli_json(host, "config"))["derived"]["reserve_mib"]
 
 
 class tight_reserve(mem_available_as):
@@ -5630,9 +5618,9 @@ def dual_stack():
 
 
 def wildcard_listen():
-    """A listener on a wildcard address (0.0.0.0, ::, ::ffff:0:0) detects
-    its underlay address from the route toward its peer (here, on loopback),
-    and a port 0 is refused; migrations from it give the target the underlay
+    """A listener on a wildcard address (0.0.0.0, ::, ::ffff:0:0) derives
+    its underlay address toward its peers (loopback, as they are all on this
+    machine), and a port 0 is refused; migrations from it give the target the underlay
     address to pull pages from, never the wildcard. On a dual-stack [::]
     listener, IPv4 peers (arriving as ::ffff:a.b.c.d) are still peers: pages
     are pulled from it and migrations to it arrive."""
@@ -5651,7 +5639,7 @@ def wildcard_listen():
         stop_listener(A)
         try:
             start_listener(A, f"{wild}:{port}")
-            underlay = ok(cli_json(A, "config")).get("underlay")
+            underlay = ok(cli_json(A, "config"))["derived"]["underlay"]
             check(f"wildcard listen {wild}: the underlay detected", underlay == host_ip, underlay)
             n = "ft-wildcard"
             clear_log(B, n)
@@ -6668,8 +6656,8 @@ def route_abort():
     n = "ft-route-abort"
     scenario_vms.add(n)
     gw = subprocess.run(["ip", "route", "show", "default"], capture_output=True, text=True).stdout.split()[2]
-    was = ok(cli_json(B, "config")).get("underlay")
-    set_config(B, underlay=gw)
+    code, out, err = cli(B, "config", "--underlay", gw)
+    assert code == 0, err
     ip = None
     try:
         m = setup(n, mib=1000)
@@ -6701,7 +6689,7 @@ def route_abort():
         check("route abort: the retry stopped with the abort", "dropped, migration" in log(A, n), log(A, n)[-1500:])
         check("route abort: md5 intact on A", md5(A, n) == m)
     finally:
-        set_config(B, underlay=was)
+        cli(B, "config", "--underlay", "")
         if ip and f"via {gw}" in peer_route(ip):
             subprocess.run(["ip", "route", "del", f"{ip}/32"], capture_output=True)
 
@@ -7453,8 +7441,7 @@ def unit_restart():
         stop_listener(B)
         lg = open(os.path.join(B.run, "listen.log"), "a")
         listeners[B.addr] = subprocess.Popen(
-            [BIN, "--state", B.state, "--run", B.run, "listen", B.addr, "--peer", A.addr, "--vm-ips", B.ips,
-             "--reserve", "512"], stdout=lg, stderr=lg, env=ENV, preexec_fn=in_cgroup(unit))
+            [BIN, "--state", B.state, "--run", B.run, "listen", B.addr], stdout=lg, stderr=lg, env=ENV, preexec_fn=in_cgroup(unit))
         hp = B.addr.rsplit(":", 1)
         up = lambda: subprocess.run(["bash", "-c", f"exec 3<>/dev/tcp/{hp[0]}/{hp[1]}"], capture_output=True).returncode == 0
         check("unit restart: listener up in the unit", wait_for(up, 10) and cgroup_of(listeners[B.addr].pid) == unit[len("/sys/fs/cgroup"):])
@@ -7640,7 +7627,7 @@ def template_tap():
     whatever their names read as."""
     name = f"ft-tpltap-{os.getpid()}"
     tdir = os.path.join(A.state, "templates")
-    prefix = ok(cli_json(A, "config"))["prefix"]
+    prefix = ok(cli_json(A, "config"))["derived"]["prefix"]
     p = subprocess.Popen([BIN, "--state", A.state, "--run", A.run, "template", name, "--vcpus", "1", "--max", "512"],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=ENV)
     tap = f"{prefix}x{p.pid:x}"

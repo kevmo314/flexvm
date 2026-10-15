@@ -141,14 +141,17 @@ a new one.
 
 ## Migrate
 
-Each host that takes migrations runs a listener. Its flags are the host's
-whole configuration: each `flexvm listen` replaces the one before (kept in
-`STATE/host.json`, which `flexvm config` prints). It can be socket-activated:
+A host's settings are `flexvm config`'s, kept in `STATE/host.json` and
+applied live: running VM processes and listeners pick up changes. Each host
+that takes migrations then runs a listener, which takes only its address
+and can be socket-activated:
 
 ```sh
 # host A (192.168.1.10) and host B (192.168.1.11) on one LAN; VMs use spare LAN addresses
-flexvm listen 192.168.1.10:7070 --peer 192.168.1.11:7070 --vm-ips 192.168.1.128-192.168.1.191 --dns 192.168.1.1
-flexvm listen 192.168.1.11:7070 --peer 192.168.1.10:7070 --vm-ips 192.168.1.192-192.168.1.250 --dns 192.168.1.1
+flexvm config --peer 192.168.1.11:7070 --vm-ips 192.168.1.128-192.168.1.191 --dns 192.168.1.1   # on A
+flexvm config --peer 192.168.1.10:7070 --vm-ips 192.168.1.192-192.168.1.250 --dns 192.168.1.1   # on B
+flexvm listen 192.168.1.10:7070          # on A
+flexvm listen 192.168.1.11:7070          # on B
 
 flexvm migrate web 192.168.1.11:7070      # on A: web now runs on B, same address, connections intact
 ```
@@ -161,46 +164,46 @@ Every host's `--vm-ips` must be disjoint, and the hosts must list each other
 with `--peer HOST:PORT` (each peer's listen address): a listener serves its
 peers' addresses only, and tells any other it is not a peer. The default
 range, `10.200.0.0/16`, is the same on every host, so give each host its own
-once it has peers (`listen` warns until then).
-
-The rest is detected or derived; the flags override it:
+once it has peers (`config` warns until then). `--peer` replaces the whole
+list; an empty value (`--peer ''`, `--reserve ''`, ...) unsets a setting.
+`flexvm config` alone prints what is set and what is derived for the rest:
 
 - `--underlay IP`, the address peers route this host's VMs through: the listen
-  address, or for a wildcard one the source address of the route toward the
-  first peer with an IPv4 address (the default route without one).
-- `--announce-dev IFACE`, where the host answers ARP for its VMs (`proxy_arp`)
-  and announces a VM that arrives: the device of that same route. Peers on
-  this machine (loopback, or a local address) need none; without peers there
-  is none. `listen` fails, naming these flags, when there is no route to
-  detect them from.
+  address, or for a wildcard one the source address of the kernel's route
+  toward the first peer not on this machine (`ip route get`, policy routing
+  included). With every peer on this machine (loopback, or one of its
+  addresses) it is loopback; with peers elsewhere, never.
+- `--announce-dev IFACE`, where the host answers ARP for its VMs
+  (`proxy_arp`) and announces a VM that arrives: that route's device, none
+  for peers on this machine. `--announce-dev none` turns this off, for
+  routed or WireGuard links.
 - `--reserve MIB`, the memory a host keeps free (starts and growth that would
   take it below are refused): a sixteenth of the host's RAM, from 256 MiB to 4 GiB.
 - `--evict-at MIB`: VMs start moving to peers with room once the host has less
   than this available, the fastest growing first, until it is back above the
   mark by half the mark's height over the reserve. Default: the reserve plus
-  the reserve or 512, whichever is more (twice the reserve on hosts with 8 GiB
-  or more). A peer takes such a VM only if it stays above its own mark; a mark
-  under the reserve counts as the reserve.
+  the reserve or 512, whichever is more. A peer takes such a VM only if it
+  stays above its own mark; a mark under the reserve counts as the reserve.
 
-Running VM processes and listeners pick up the peers, the reserve and the
-eviction mark from `host.json` as it changes. The other settings reach VMs
-started afterwards.
+Derived values are never saved: they follow the routes, the peers and the
+host's RAM. A wildcard listener with peers elsewhere and no route toward them
+fails, asking for `--underlay`.
 
 Every VM process and listener sets `net.ipv4.ip_forward=1`, and
 `proxy_arp` on the announce device, and never reverts them: the host routes
 between all its interfaces from then on, so check its `FORWARD` policy.
 
-A host that only runs VMs needs no listener; it uses the defaults above.
+A host that only runs VMs needs no listener.
 
-Taps are named after the state directory (`fv` and four characters of its
+Taps are named after the state directory (`f` and five characters of its
 hash, then the owning process's pid), so hosts on separate state directories
 read apart. Each tap's alias (`ip link show`) names its owner, `flexvm PID
 START RUN-DIR`: hosts sharing a network namespace only ever sweep their own taps.
 
 ### Under systemd
 
-Run the listener as a socket-activated service; without ADDR it takes its
-address from the socket:
+Run the listener as a socket-activated service (after `flexvm config`); without
+ADDR it takes its address from the socket:
 
 ```ini
 # /etc/systemd/system/flexvm-listen.socket
@@ -218,8 +221,7 @@ Requires=flexvm-listen.socket
 After=flexvm-listen.socket
 
 [Service]
-ExecStart=/usr/local/bin/flexvm listen --peer 192.168.1.11:7070 \
-    --vm-ips 192.168.1.128-192.168.1.191 --dns 192.168.1.1
+ExecStart=/usr/local/bin/flexvm listen
 Restart=on-failure
 # The default KillMode=control-group is right: see below.
 ```

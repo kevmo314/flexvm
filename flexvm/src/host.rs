@@ -54,7 +54,8 @@ pub enum Floor {
     EvictMark,
 }
 
-/// `STATE/host.json`, written by `flexvm listen` from its flags and what it detects.
+/// `STATE/host.json`: `flexvm config` sets it (and the listen address,
+/// `flexvm listen`). What is left unset is derived where it is used, never saved.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -62,13 +63,13 @@ pub struct Config {
     pub peers: Vec<String>,
     /// Disjoint across hosts.
     pub vm_ips: String,
-    /// Default: the listen address's, else the source address toward the peers (`net::toward`).
+    /// None: derived (`underlay`).
     pub underlay: Option<Ipv4Addr>,
-    /// Default: the device toward the peers, none for peers on this machine.
+    /// None: derived (`announce_dev`); `none`: no announcements.
     pub announce_dev: Option<String>,
     pub dns: Option<String>,
-    /// Default: `default_reserve` of the host's RAM.
-    pub reserve_mib: u64,
+    /// None: `default_reserve`.
+    pub reserve_mib: Option<u64>,
     /// Eviction's high-water mark (MiB available): below it VMs start moving
     /// to peers (`evict_at`). None: the reserve plus the reserve or 512 MiB, whichever is more.
     pub evict_mib: Option<u64>,
@@ -83,41 +84,118 @@ impl Default for Config {
             underlay: None,
             announce_dev: None,
             dns: None,
-            reserve_mib: default_reserve(crate::util::proc_kb("/proc/meminfo", "MemTotal").unwrap_or(0) >> 10),
+            reserve_mib: None,
             evict_mib: None,
         }
     }
 }
 
-/// The reserve for a host with `total` MiB of RAM: a sixteenth, from 256 MiB to 4 GiB.
-pub fn default_reserve(total: u64) -> u64 {
-    (total / 16).clamp(256, 4096)
+/// The reserve of a host that sets none: a sixteenth of its RAM, from 256 MiB to 4 GiB.
+pub fn default_reserve() -> u64 {
+    reserve_for(crate::util::proc_kb("/proc/meminfo", "MemTotal").unwrap_or(0) >> 20)
+}
+
+fn reserve_for(total_mib: u64) -> u64 {
+    (total_mib / 16).clamp(256, 4096)
+}
+
+/// The underlay address and announce device derived toward the peers.
+type Derived = (Option<Ipv4Addr>, Option<String>);
+
+/// Which peer the underlay and announce device are derived toward.
+#[derive(Debug, PartialEq)]
+pub enum Toward {
+    /// Every peer is on this machine (loopback, or one of its addresses), or there is none.
+    Local,
+    /// The first peer elsewhere with an IPv4 address.
+    Remote(Ipv4Addr),
+    /// Peers elsewhere, none with an IPv4 address (or a name that did not resolve).
+    Unknown,
+}
+
+/// `peers`: each peer's addresses, none for a name that did not resolve.
+pub fn toward(peers: &[Vec<IpAddr>], local: impl Fn(Ipv4Addr) -> bool) -> Toward {
+    let mut out = Toward::Local;
+    for addrs in peers {
+        let v4: Vec<Ipv4Addr> = addrs.iter().filter_map(|a| if let IpAddr::V4(v) = a.to_canonical() { Some(v) } else { None }).collect();
+        if addrs.iter().any(|a| a.to_canonical().is_loopback()) || v4.iter().any(|&a| local(a)) {
+            continue;
+        }
+        match v4.first() {
+            Some(&a) => return Toward::Remote(a),
+            None => out = Toward::Unknown,
+        }
+    }
+    out
 }
 
 impl Config {
+    pub fn reserve(&self) -> u64 {
+        self.reserve_mib.unwrap_or_else(default_reserve)
+    }
+
     /// MemAvailable (MiB) under which eviction starts: never below the reserve.
     pub fn evict_at(&self) -> u64 {
-        self.evict_mib.unwrap_or(self.reserve_mib + self.reserve_mib.max(512)).max(self.reserve_mib)
+        let reserve = self.reserve();
+        self.evict_mib.unwrap_or(reserve + reserve.max(512)).max(reserve)
     }
 
     /// Once started, eviction goes on until MemAvailable is back this high:
     /// the mark plus half its height above the reserve (at least 128 MiB).
     pub fn evict_until(&self) -> u64 {
         let at = self.evict_at();
-        at + ((at - self.reserve_mib) / 2).max(128)
+        at + ((at - self.reserve()) / 2).max(128)
     }
 
     pub fn range(&self) -> Result<IpRange> {
         IpRange::parse(&self.vm_ips)
     }
 
-    /// Never a wildcard address.
+    /// Never a wildcard address. Unset: the listen address, else the source
+    /// address of the kernel's route toward the first peer elsewhere, or
+    /// loopback when every peer is on this machine; never loopback with peers elsewhere.
     pub fn underlay(&self) -> Option<Ipv4Addr> {
         let from_listen = || match self.listen.as_deref()?.parse::<SocketAddr>().ok()?.ip().to_canonical() {
             IpAddr::V4(v4) => Some(v4),
             IpAddr::V6(_) => None,
         };
-        self.underlay.or_else(from_listen).filter(|u| !u.is_unspecified())
+        let listen = self.underlay.or_else(from_listen).filter(|u| !u.is_unspecified());
+        listen.or_else(|| self.derived().0)
+    }
+
+    /// Unset: that route's device, none for peers on this machine; `none`: no announcements.
+    pub fn announce_dev(&self) -> Option<String> {
+        match self.announce_dev.as_deref() {
+            Some("none") => None,
+            Some(dev) => Some(dev.into()),
+            None => self.derived().1,
+        }
+    }
+
+    /// Looked up again once the peers change or 30 s on.
+    fn derived(&self) -> Derived {
+        static SEEN: Mutex<Option<(std::time::Instant, Vec<String>, Derived)>> = Mutex::new(None);
+        let mut seen = SEEN.lock().unwrap();
+        if let Some((at, peers, d)) = &*seen {
+            if *peers == self.peers && at.elapsed() < Duration::from_secs(30) {
+                return d.clone();
+            }
+        }
+        use std::net::ToSocketAddrs;
+        let addrs: Vec<Vec<IpAddr>> = self.peers.iter().map(|p| p.to_socket_addrs().map(|a| a.map(|a| a.ip()).collect()).unwrap_or_default()).collect();
+        let d = match toward(&addrs, |a| crate::net::is_local_addr(a).unwrap_or(false)) {
+            Toward::Local => (Some(Ipv4Addr::LOCALHOST), None),
+            Toward::Remote(to) => crate::net::route_get(to).map_or_else(
+                |e| {
+                    crate::log!("flexvm: {e}: no underlay address or announce device derived (set them with flexvm config)");
+                    (None, None)
+                },
+                |(dev, src)| (Some(src), Some(dev)),
+            ),
+            Toward::Unknown => (None, None),
+        };
+        *seen = Some((std::time::Instant::now(), self.peers.clone(), d.clone()));
+        d
     }
 
     /// Where peers reach this host's listener (a migration target pulls
@@ -142,7 +220,7 @@ impl Config {
         match self.underlay() {
             Some(u) => Ok(Some(SocketAddr::from((u, addr.port())).to_string())),
             None => bail!(
-                "listening on {listen} needs an underlay address (none detected: give --underlay IP): peers cannot reach a wildcard or link-local address"
+                "listening on {listen} needs an underlay address (none derived toward the peers: flexvm config --underlay IP): peers cannot reach a wildcard or link-local address"
             ),
         }
     }
@@ -905,7 +983,7 @@ impl Host {
         }
         let cfg = self.config_now();
         let (floor, what) = match floor {
-            Floor::Reserve => (cfg.reserve_mib, "reserve"),
+            Floor::Reserve => (cfg.reserve(), "reserve"),
             // An eviction's arrival: never while this host evicts itself, and it
             // leaves this host's own mark, so it is not moved straight back.
             Floor::EvictMark if self.evicting(l) => return Ok(Err("this host is moving vms away itself".into())),
@@ -2316,7 +2394,14 @@ mod tests {
 
     #[test]
     fn a_wildcard_listener_advertises_its_underlay() {
-        let cfg = |listen: Option<&str>, underlay: Option<&str>| Config { listen: listen.map(String::from), underlay: underlay.map(ip), ..Config::default() };
+        // A peer elsewhere whose address is unknown: nothing derived.
+        let peers = vec!["flexvm-no-such-host.invalid:7070".into()];
+        let cfg = |listen: Option<&str>, underlay: Option<&str>| Config {
+            listen: listen.map(String::from),
+            underlay: underlay.map(ip),
+            peers: peers.clone(),
+            ..Config::default()
+        };
         assert_eq!(cfg(None, None).advertise().unwrap(), None);
         assert_eq!(cfg(Some("10.1.0.1:7070"), None).advertise().unwrap().as_deref(), Some("10.1.0.1:7070"));
         assert_eq!(cfg(Some("10.1.0.1:7070"), Some("10.1.0.2")).advertise().unwrap().as_deref(), Some("10.1.0.1:7070"));
@@ -3098,11 +3183,48 @@ mod tests {
 
     #[test]
     fn the_default_reserve_is_a_sixteenth_of_ram() {
-        assert_eq!(default_reserve(0), 256);
-        assert_eq!(default_reserve(4096), 256);
-        assert_eq!(default_reserve(16384), 1024);
-        assert_eq!(default_reserve(65536), 4096);
-        assert_eq!(default_reserve(1 << 20), 4096);
+        for (total_mib, reserve) in [(0, 256), (2048, 256), (4096, 256), (16384, 1024), (65536, 4096), (1 << 20, 4096)] {
+            assert_eq!(reserve_for(total_mib), reserve, "{total_mib}");
+        }
+        // This host's, read in kB from /proc/meminfo here, MiB there.
+        let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap();
+        let kb: u64 = meminfo.lines().find_map(|l| l.strip_prefix("MemTotal:")).unwrap().trim().trim_end_matches(" kB").parse().unwrap();
+        assert_eq!(default_reserve(), (kb / 1024 / 16).clamp(256, 4096));
+        assert_eq!(Config::default().reserve(), default_reserve());
+        assert_eq!(Config { reserve_mib: Some(300), ..Config::default() }.reserve(), 300);
+    }
+
+    #[test]
+    fn the_underlay_is_derived_toward_a_peer_elsewhere() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let mine = |a: Ipv4Addr| a == Ipv4Addr::new(10, 0, 0, 5);
+        let peers = |p: &[&[&str]]| p.iter().map(|a| a.iter().map(|s| ip(s)).collect()).collect::<Vec<Vec<_>>>();
+        assert_eq!(toward(&[], mine), Toward::Local);
+        // Loopback (either family) or one of this host's addresses: on this machine, skipped.
+        assert_eq!(toward(&peers(&[&["127.0.0.1"], &["::1", "127.0.0.1"], &["10.0.0.5"]]), mine), Toward::Local);
+        assert_eq!(toward(&peers(&[&["127.0.0.1"], &["::1"], &["192.168.1.11"]]), mine), Toward::Remote("192.168.1.11".parse().unwrap()));
+        assert_eq!(toward(&peers(&[&["::ffff:192.168.1.11"]]), mine), Toward::Remote("192.168.1.11".parse().unwrap()));
+        // A name that did not resolve, or an IPv6-only peer: elsewhere, address unknown.
+        assert_eq!(toward(&peers(&[&["127.0.0.1"], &[]]), mine), Toward::Unknown);
+        assert_eq!(toward(&peers(&[&["2001:db8::2"], &["192.168.1.12"]]), mine), Toward::Remote("192.168.1.12".parse().unwrap()));
+        assert_eq!(toward(&peers(&[&["2001:db8::2"]]), mine), Toward::Unknown);
+        // Loopback only without peers elsewhere; the listen address, or one set, comes first.
+        let cfg =
+            |listen: &str, peers: &[&str]| Config { listen: Some(listen.into()), peers: peers.iter().map(|p| p.to_string()).collect(), ..Config::default() };
+        assert_eq!(cfg("0.0.0.0:7070", &["127.0.0.1:7071"]).underlay(), Some(Ipv4Addr::LOCALHOST));
+        assert_eq!(cfg("0.0.0.0:7070", &["127.0.0.1:7071", "flexvm-no-such-host.invalid:7070"]).underlay(), None);
+        assert_eq!(cfg("10.1.0.1:7070", &["flexvm-no-such-host.invalid:7070"]).underlay(), Some("10.1.0.1".parse().unwrap()));
+        let set = Config { underlay: Some("10.2.0.1".parse().unwrap()), ..cfg("0.0.0.0:7070", &["flexvm-no-such-host.invalid:7070"]) };
+        assert_eq!(set.underlay(), Some("10.2.0.1".parse().unwrap()));
+        // An IPv6 listener is told as it is, with or without an IPv4 underlay.
+        assert_eq!(cfg("[2001:db8::1]:7070", &["flexvm-no-such-host.invalid:7070"]).advertise().unwrap().as_deref(), Some("[2001:db8::1]:7070"));
+        // The kernel's route toward a peer elsewhere: its device and source, as set ones override.
+        let any = cfg("0.0.0.0:7070", &["192.0.2.1:7070"]);
+        if let Ok((dev, src)) = crate::net::route_get("192.0.2.1".parse().unwrap()) {
+            assert_eq!((any.underlay(), any.announce_dev()), (Some(src), Some(dev)));
+        }
+        let off = Config { announce_dev: Some("none".into()), ..any };
+        assert_eq!(off.announce_dev(), None);
     }
 
     /// A tap is this host's by its alias alone, whatever its name: hosts
@@ -3712,14 +3834,14 @@ mod tests {
         for reserve in [2048, 4096] {
             let previous = File::open(&path).unwrap();
             h.configure(|c| {
-                c.reserve_mib = reserve;
+                c.reserve_mib = Some(reserve);
                 Ok(())
             })
             .unwrap();
             File::open(&path).unwrap().set_times(times).unwrap();
             assert_eq!(stamp(&path).unwrap().0, time);
             assert_ne!(stamp(&path).unwrap().1, previous.metadata().unwrap().ino());
-            assert_eq!(running.config_now().reserve_mib, reserve);
+            assert_eq!(running.config_now().reserve(), reserve);
         }
     }
 
@@ -3766,7 +3888,7 @@ mod tests {
     #[test]
     fn admission_uses_this_boots_clock_and_drops_future_grants() {
         let (_h_dir, mut h) = host("grant-clock");
-        h.cfg.reserve_mib = AVAIL - 1000;
+        h.cfg.reserve_mib = Some(AVAIL - 1000);
         let before = boottime_ms();
         grant_at(&h, 1000, Floor::Reserve, false).unwrap();
         let path = h.grants();
@@ -3799,7 +3921,7 @@ mod tests {
     fn admission_counts_recent_grants() {
         let (_h_dir, mut h) = host("admit");
         let admit = |h: &Host, mib| grant_at(h, mib, Floor::Reserve, false).is_ok();
-        h.cfg.reserve_mib = AVAIL - 3000;
+        h.cfg.reserve_mib = Some(AVAIL - 3000);
         pin_clock(boottime_ms());
         assert!(admit(&h, 1000) && admit(&h, 1000));
         assert!(!admit(&h, 1001), "recent grants count as used");
@@ -3809,7 +3931,7 @@ mod tests {
         h.refund(id);
         h.refund(u64::MAX);
         assert!(admit(&h, 500) && !admit(&h, 501));
-        h.cfg.reserve_mib = AVAIL + 1;
+        h.cfg.reserve_mib = Some(AVAIL + 1);
         assert!(!admit(&h, 1));
     }
 
@@ -3819,7 +3941,7 @@ mod tests {
     #[test]
     fn admission_fails_closed_when_holds_cannot_be_read() {
         let (_h_dir, mut h) = host("holds-unreadable");
-        h.cfg.reserve_mib = 0;
+        h.cfg.reserve_mib = Some(0);
         // Its grants must all count to the end, however long a loaded machine takes over it.
         pin_clock(boottime_ms());
         let grants = || load::<Vec<(u64, u64, u64)>>(&h.grants()).unwrap().unwrap_or_default();
@@ -3839,7 +3961,7 @@ mod tests {
     #[test]
     fn admission_errors_are_not_refusals() {
         let (_h_dir, mut h) = host("admit-err");
-        h.cfg.reserve_mib = 0;
+        h.cfg.reserve_mib = Some(0);
         let grants = || load::<Vec<(u64, u64, u64)>>(&h.grants()).unwrap().unwrap_or_default();
         let grant = |avail: Option<u64>| h.grant_inner(1, Floor::Reserve, false, None, || avail).map(|r| r.ok().map(|g| g.0));
         assert!(grant(None).unwrap_err().to_string().contains("MemAvailable"));
@@ -3865,7 +3987,7 @@ mod tests {
     fn admission_and_eviction_read_the_marks_as_they_change() {
         let (_h_dir, mut h) = host("marks");
         h.configure(|c| {
-            c.reserve_mib = AVAIL - 3000;
+            c.reserve_mib = Some(AVAIL - 3000);
             c.evict_mib = Some(AVAIL - 1500);
             Ok(())
         })
@@ -3888,11 +4010,11 @@ mod tests {
         // `listen` raises the reserve while this process runs: admission sees it.
         std::thread::sleep(Duration::from_millis(20));
         h.configure(|c| {
-            c.reserve_mib = AVAIL - 1000;
+            c.reserve_mib = Some(AVAIL - 1000);
             Ok(())
         })
         .unwrap();
-        assert_eq!(running.config_now().reserve_mib, AVAIL - 1000);
+        assert_eq!(running.config_now().reserve(), AVAIL - 1000);
         assert!(grant_at(&running, 700, Floor::Reserve, false).is_err() && grant_at(&running, 699, Floor::Reserve, false).is_ok());
     }
 
@@ -3900,7 +4022,7 @@ mod tests {
     fn disk_restore_reservation_survives_expiry_and_can_be_completed_or_refunded() {
         let (_h_dir, h) = host("disk-restore-hold");
         let charge = crate::limit::allowance(1600);
-        let grant = |mib, held| h.grant_inner(mib, Floor::Reserve, held, None, || Some(h.cfg.reserve_mib + charge)).unwrap();
+        let grant = |mib, held| h.grant_inner(mib, Floor::Reserve, held, None, || Some(h.cfg.reserve() + charge)).unwrap();
         let (id, hold) = grant(charge, true).unwrap();
         let hold = Mutex::new(hold);
         let path = h.grants();
@@ -3932,7 +4054,7 @@ mod tests {
     #[test]
     fn a_held_grant_grows_only_when_admitted() {
         let (_h_dir, mut h) = host("grow-hold");
-        (h.cfg.reserve_mib, h.cfg.evict_mib) = (AVAIL - 3000, Some(AVAIL - 1500));
+        (h.cfg.reserve_mib, h.cfg.evict_mib) = (Some(AVAIL - 3000), Some(AVAIL - 1500));
         pin_clock(boottime_ms());
         let admit = |h: &Host, mib| grant_at(h, mib, Floor::Reserve, false).is_ok();
         let (id, hold) = grant_at(&h, 1000, Floor::Reserve, true).unwrap();
@@ -3959,7 +4081,7 @@ mod tests {
     #[test]
     fn admission_saturates() {
         let (_h_dir, mut h) = host("saturate");
-        h.cfg.reserve_mib = AVAIL - 3000;
+        h.cfg.reserve_mib = Some(AVAIL - 3000);
         pin_clock(boottime_ms());
         assert_eq!(crate::limit::allowance(u64::MAX), u64::MAX);
         assert!(grant_at(&h, u64::MAX, Floor::Reserve, false).is_err());
@@ -3976,7 +4098,7 @@ mod tests {
     fn held_grants_count_past_the_window_until_dropped_or_their_owner_is_gone() {
         let (_h_dir, mut h) = host("held");
         let admit = |h: &Host, mib| grant_at(h, mib, Floor::Reserve, false).is_ok();
-        h.cfg.reserve_mib = AVAIL - 3000;
+        h.cfg.reserve_mib = Some(AVAIL - 3000);
         let hold = grant_at(&h, 2000, Floor::Reserve, true).unwrap().1.unwrap();
         // The window passes (the grant ages out): held, it still counts, once.
         let path = h.grants();

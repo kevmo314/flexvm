@@ -81,10 +81,12 @@ pub fn validate(listener: &TcpListener, cfg: &crate::host::Config) -> Result<()>
 
 pub fn main(host: Host, listener: TcpListener) -> Result<()> {
     crate::net::ip_forward()?;
-    if let Some(dev) = &host.cfg.announce_dev {
+    let dev = host.cfg.announce_dev();
+    if let Some(dev) = &dev {
         crate::net::conf("ipv4", dev, "proxy_arp", "1")?;
     }
-    crate::log!("flexvm listening on {}", listener.local_addr()?);
+    let underlay = host.cfg.underlay().map_or("none".into(), |u| u.to_string());
+    crate::log!("flexvm listening on {} (underlay {underlay}, announce device {})", listener.local_addr()?, dev.as_deref().unwrap_or("none"));
     crate::standby::maintain(host.clone());
     crate::gc::periodic(host.clone());
     let peers = Peers::watch(host.clone());
@@ -315,7 +317,7 @@ impl Peers {
 
 fn not_a_peer(conn: TcpStream, from: IpAddr) {
     let local = conn.local_addr().map(|a| a.to_string()).unwrap_or_default();
-    let e = format!("{from} is not a peer of {local} (add it there: flexvm listen --peer)");
+    let e = format!("{from} is not a peer of {local} (add it there: flexvm config --peer)");
     // A flood of non-peers is counted, not logged line by line.
     static WINDOW: Mutex<RefusalLog> = Mutex::new(RefusalLog { second: 0, logged: 0, unlogged: 0 });
     let second = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());

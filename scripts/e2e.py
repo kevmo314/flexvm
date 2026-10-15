@@ -142,9 +142,9 @@ class Host:
             raise AssertionError(f"port {self.port} is in use; pick other ports with --port-a")
         os.makedirs(self.run_dir, exist_ok=True)
         shared_state(self.state_dir)
-        self.prefix = json.loads(self.cli("config").stdout)["prefix"]
-        cmd = [BIN, "--state", self.state_dir, "--run", self.run_dir, "listen", self.addr,
-               "--peer", self.peer, "--vm-ips", f"{self.net}.2-{self.net}.60", "--reserve", "256"]
+        cfg = self.cli("config", "--peer", self.peer, "--vm-ips", f"{self.net}.2-{self.net}.60", "--reserve", "256")
+        self.prefix = json.loads(cfg.stdout)["derived"]["prefix"]
+        cmd = [BIN, "--state", self.state_dir, "--run", self.run_dir, "listen", self.addr]
         self.proc = subprocess.Popen(cmd, stdout=open(self.log, "a"), stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                      env=ENV, start_new_session=True)
         # Up once our own child holds the listening socket.

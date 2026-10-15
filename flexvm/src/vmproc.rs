@@ -759,7 +759,7 @@ impl Proc {
     pub fn announce(&self) {
         let vm = self.vm().clone();
         let peers = self.host.config_now().peers;
-        let (ip, gen, rev, dev) = (vm.ip, self.gen(), self.rev(), self.host.cfg.announce_dev.clone());
+        let (ip, gen, rev, dev) = (vm.ip, self.gen(), self.rev(), self.host.cfg.announce_dev());
         let Some(via) = self.host.cfg.underlay() else {
             if !peers.is_empty() {
                 crate::log!("announce {ip}: no underlay address (give flexvm listen an ADDR peers can reach, or --underlay IP); peers not told");
@@ -1528,7 +1528,7 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
     let signals = crate::util::block_signals(&SIGNALS);
     crate::util::output::guard()?;
     let _ = crate::net::ip_forward();
-    if let Some(dev) = &host.cfg.announce_dev {
+    if let Some(dev) = &host.cfg.announce_dev() {
         if let Err(e) = crate::net::conf("ipv4", dev, "proxy_arp", "1") {
             crate::log!("WARNING: proxy ARP on {dev}: {e}");
         }
@@ -1955,7 +1955,7 @@ fn relieve(host: &Host, avail: Option<u64>, starved_here: bool, stopping: &mut O
         return;
     };
     let cfg = host.config_now();
-    let (reserve, at, until) = (cfg.reserve_mib, cfg.evict_at(), cfg.evict_until());
+    let (reserve, at, until) = (cfg.reserve(), cfg.evict_at(), cfg.evict_until());
     // Standby VMs go under the reserve whatever eviction is doing (a slow migration holds its lock).
     if avail >= reserve {
         *stopping = None;
@@ -2668,7 +2668,7 @@ mod tests {
     fn unreadable_meminfo_relieves_nothing() {
         let base = crate::test_util::TempDir::new("relieve");
         let mut host = Host::open(&base.join("state"), &base.join("run")).unwrap();
-        host.cfg.reserve_mib = 1024;
+        host.cfg.reserve_mib = Some(1024);
         host.cfg.peers = vec!["127.0.0.1:1".into()];
         // A standby of template t: its lock held, naming a live process.
         // Stopped by SIGUSR1's default action, which an ignored or blocked SIGUSR1 inherited from here would defeat.
@@ -2821,9 +2821,9 @@ mod tests {
 
     #[test]
     fn eviction_starts_at_its_high_water_mark_and_stops_above_it() {
-        let mut c = crate::host::Config { reserve_mib: crate::host::default_reserve(16384), ..Default::default() };
-        assert_eq!((c.reserve_mib, c.evict_at(), c.evict_until()), (1024, 2048, 2560));
-        c.reserve_mib = 256;
+        let mut c = crate::host::Config { reserve_mib: Some(1024), ..Default::default() };
+        assert_eq!((c.evict_at(), c.evict_until()), (2048, 2560));
+        c.reserve_mib = Some(256);
         assert_eq!((c.evict_at(), c.evict_until()), (768, 1024));
         c.evict_mib = Some(5000);
         assert_eq!((c.evict_at(), c.evict_until()), (5000, 7372));

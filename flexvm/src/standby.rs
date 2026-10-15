@@ -892,7 +892,7 @@ mod tests {
         assert_eq!(set(&host, "default", 1).unwrap()["started"], json!(0));
         assert_eq!(target(&host, "default"), 1);
         drop(held);
-        host.cfg.reserve_mib = u64::MAX / 2;
+        host.cfg.reserve_mib = Some(u64::MAX / 2);
         // Hold the reentrant host lock so another test cannot time out this grant before it checks the reserve.
         let l = host.lock().unwrap();
         let started = refill_by(&host, "default", false, true).unwrap();
@@ -904,7 +904,7 @@ mod tests {
         assert!(recent(&pressure(&host)));
         // Under the stop lock, before the grant: recent pressure ends the round at once, with
         // no grant (one would wait out the busy host lock), even for a refill that got its locks late.
-        host.cfg.reserve_mib = 0;
+        host.cfg.reserve_mib = Some(0);
         let held = Flock::new(File::create(host.state.join("lock")).unwrap(), libc::LOCK_EX).unwrap();
         let start = Instant::now();
         assert_eq!(refill_by(&host, "default", true, true).unwrap(), 0);

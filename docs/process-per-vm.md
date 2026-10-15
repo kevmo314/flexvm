@@ -135,7 +135,7 @@ STATE (default /var/lib/flexvm, on disk)
                          the newest) and flexvm-init, as scripts/fetch.sh and build-*.sh install them
   templates/             built templates: NAME -> .gen/ID (see internals.md)
   images/                pulled container images: blobs/sha256/, rootfs/KEY.ext4 (see images.md)
-  host.json              host config (`flexvm listen`'s): listen, peers, vm_ips, underlay, announce_dev, dns, reserve_mib, evict_mib
+  host.json              host config (`flexvm config`'s; listen is `flexvm listen`'s): listen, peers, vm_ips, underlay, announce_dev, dns, reserve_mib, evict_mib; unset ones are derived where used
   lock                   the host lock (flock), held for short critical sections only
   .synced                the root's (dev, inode) once its directories were made durable (`Host::open`)
   addrs/IP               per address: newest generation seen, withdrawn?, lent generation, holder name, instance
@@ -339,7 +339,7 @@ answer, held packets). What changed is who is at each end:
    network namespace route it only after the held packets (`hold.rs`).
 4. Pages: the target's pager connects to the *source's* listener (the
    address the source sent: its listen address, or for a wildcard one its
-   underlay address with the listen port, detected from the route toward
+   underlay address with the listen port, derived from the kernel's route toward
    the peers without `--underlay`) with `pages {name, mig}`; the listener passes the socket (SCM_RIGHTS) to the
    source VM process, which serves it if it is the source of that migration.
 5. Release: the source polls `migration {mig}` on the target's listener.
@@ -363,10 +363,11 @@ answer, held packets). What changed is who is at each end:
 `flexvm listen [ADDR]` is an optional helper, needed only to receive
 migrations (and page requests for VMs migrating away). It is stateless and
 socket-activatable (`LISTEN_FDS`, taking its address from the socket when
-no ADDR is given, or binds ADDR). Its flags replace host.json, written only
-once the socket is bound and valid; what they leave out is detected (the
-underlay address and announce device, from the route toward the first peer)
-or derived (the reserve, from the host's RAM). Proxy ARP on the announce device is enabled
+no ADDR is given, or binds ADDR or `host.json`'s `listen`); it saves only its
+address, once the socket is bound and valid. Settings are `flexvm config`'s;
+those unset are derived where used, never saved (`Config::underlay`,
+`announce_dev`, `reserve`: the kernel's route toward the first peer elsewhere,
+cached for 30 s, and the host's RAM). Proxy ARP on the announce device is enabled
 by every VM process too, so it needs no listener. Each
 connection's first line (peeked, then consumed exactly through its newline, so nothing after it is consumed) is
 one of:
@@ -467,8 +468,8 @@ an operation. A refused VM and peer pair is not tried again for 5 s, doubling
 to 60 s while refusals continue (`RUN/evict.backoff`). A refused arrival's
 log is removed; an accepted one becomes `NAME.log`.
 Announcements and `lend` requests go to all peers at once, by the peers
-configured now (`Host::config_now`); the listener re-reads them too, so a
-listener restarted with other `--peer`s reaches running processes.
+configured now (`Host::config_now`); the listener re-reads them too, so
+`flexvm config --peer` reaches running processes.
 
 ## Exec across hosts
 
