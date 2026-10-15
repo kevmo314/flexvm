@@ -258,15 +258,12 @@ fn restrict(cmd: &mut Command, c: &Conf) {
     let (uid, gid, groups) = (c.uid, c.gid, c.groups.clone());
     unsafe {
         cmd.pre_exec(move || {
-            let fail = || Err(io::Error::last_os_error());
-            if libc::setsid() < 0 {
-                return fail();
-            }
+            crate::os(libc::setsid())?;
             if uid != 0 {
                 // No way back to root: drop the bounding set (EINVAL: past the kernel's last capability).
                 for cap in 0..64 {
                     if libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0) != 0 && *libc::__errno_location() != libc::EINVAL {
-                        return fail();
+                        return Err(io::Error::last_os_error());
                     }
                 }
             }
@@ -274,11 +271,7 @@ fn restrict(cmd: &mut Command, c: &Conf) {
                 && libc::setgid(gid) == 0
                 && libc::setuid(uid) == 0
                 && (uid == 0 || libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0);
-            if ok {
-                Ok(())
-            } else {
-                fail()
-            }
+            ok.then_some(()).ok_or_else(io::Error::last_os_error)
         });
     }
 }

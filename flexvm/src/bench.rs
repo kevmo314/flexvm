@@ -79,6 +79,10 @@ impl Hosts {
 }
 
 pub fn run(args: &Args) -> Result<()> {
+    let sha = command("git", &["rev-parse", "HEAD"])?;
+    let dirty = !command("git", &["status", "--porcelain"])?.is_empty();
+    let dir = format!("{}/bench", command("git", &["rev-parse", "--show-toplevel"])?);
+    std::fs::create_dir_all(&dir)?;
     let a = crate::open_host(args)?;
     let to = args.get("to").map(String::from);
     let b = match (args.get("to-state"), args.get("to-run")) {
@@ -106,13 +110,10 @@ pub fn run(args: &Args) -> Result<()> {
         None => (runs(&hosts, args, template, &date, &id), ""),
     };
     let mut report = report?;
-    let sha = command("git", &["rev-parse", "HEAD"])?;
     report["date_utc"] = json!(date);
     report["git_sha"] = json!(sha);
-    report["git_dirty"] = json!(!command("git", &["status", "--porcelain"])?.is_empty());
+    report["git_dirty"] = json!(dirty);
     report["host_context"] = host_context(template);
-    let dir = format!("{}/bench", command("git", &["rev-parse", "--show-toplevel"])?);
-    std::fs::create_dir_all(&dir)?;
     let path = format!("{dir}/{date}-{}{suffix}.json", &sha[..7]);
     let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path)?;
     serde_json::to_writer_pretty(file, &report)?;
@@ -175,7 +176,8 @@ fn iteration(h: &Hosts, name: &str, template: &str, dirty_mib: u64, ready: Optio
     if let Some((port, http)) = ready {
         let ip: std::net::Ipv4Addr = run["ip"].as_str().ok_or("run reply has no ip")?.parse()?;
         wait_ready((ip, port).into(), http, start + h.timeout)?;
-        sample["client"] = json!({"run_cli": ms(run_cli), "app_ready": ms(start.elapsed() - run_cli), "total": ms(start.elapsed())});
+        let total = start.elapsed();
+        sample["client"] = json!({"run_cli": ms(run_cli), "app_ready": ms(total - run_cli), "total": ms(total)});
     }
     if let Some(to) = &h.to {
         if dirty_mib > 0 {
@@ -305,7 +307,7 @@ fn trial(h: &Hosts, name: &str, template: &str, mib: u64, ck: &std::path::Path) 
     };
     let ck = ck.to_string_lossy();
     let mut argv = vec!["restore", &ck, "--name", name, "-d"];
-    if h.to.is_some() {
+    if h.to.is_some() || h.a.state != h.b.state || h.a.run != h.b.run {
         // Another host gives it an address of its own (its own is the first host's to give).
         argv.extend(["--ip", "auto"]);
     }
@@ -396,6 +398,29 @@ fn command(bin: &str, args: &[&str]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sha_is_resolved_before_opening_hosts_or_running_iterations() {
+        const CHILD: &str = "FLEXVM_TEST_BENCH_NO_GIT";
+        if std::env::var_os(CHILD).is_some() {
+            let args = Args::parse(["--state", "state", "--run", "run"].map(String::from)).unwrap();
+            let error = run(&args).unwrap_err().to_string();
+            assert!(error.starts_with("git failed:"), "{error}");
+            assert!(!std::path::Path::new("state").exists());
+            assert!(!std::path::Path::new("run").exists());
+            return;
+        }
+        let dir = crate::test_util::TempDir::new("bench-no-git");
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "bench::tests::sha_is_resolved_before_opening_hosts_or_running_iterations", "--nocapture"])
+            .current_dir(&dir)
+            .env(CHILD, "1")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    }
 
     #[test]
     fn nearest_rank_percentiles() {

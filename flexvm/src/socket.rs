@@ -40,7 +40,6 @@ fn private(path: &Path) -> io::Result<()> {
 /// nobody can swap it later.
 fn base_dir(base: &Path) -> io::Result<()> {
     let parent = base.parent().unwrap();
-    let _ = DirBuilder::new().mode(0o700).create(parent);
     let m = fs::symlink_metadata(parent)?;
     let euid = unsafe { libc::geteuid() };
     if !m.is_dir() || (m.uid() != 0 && m.uid() != euid) || (m.mode() & 0o022 != 0 && m.mode() & libc::S_ISVTX == 0) {
@@ -125,15 +124,9 @@ pub struct Sockets {
     _root: Arc<SocketRoot>,
 }
 
-impl Sockets {
-    pub fn cleanup(&self) {
-        let _ = fs::remove_dir_all(&self.dir);
-    }
-}
-
 impl Drop for Sockets {
     fn drop(&mut self) {
-        self.cleanup();
+        let _ = fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -175,6 +168,16 @@ mod tests {
         drop(b);
         assert_eq!(fs::read_dir(&bases[0]).unwrap().count(), 0);
         fs::remove_dir_all(t).unwrap();
+    }
+
+    #[test]
+    fn missing_parent_is_not_created_and_uses_fallback() {
+        let t = fixture();
+        let missing = t.join("missing");
+        let fallback = t.join("fallback");
+        let root = SocketRoot::from_bases(&[missing.join("s"), fallback.clone()], &t).unwrap();
+        assert!(!missing.exists());
+        assert_eq!(root.dir.parent().unwrap(), fallback);
     }
 
     #[test]

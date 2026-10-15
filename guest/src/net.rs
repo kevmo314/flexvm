@@ -97,9 +97,19 @@ pub fn configure(ip: Ipv4Addr, dns: Option<&str>) -> io::Result<()> {
     let (fd, ifindex) = *NETLINK.get().ok_or_else(|| io::Error::other("no netlink socket"))?;
     update_address(&mut address, ip, |kind, ip| address_request(fd, ifindex, kind, ip))?;
     if let Some(dns) = dns {
-        std::fs::write("/etc/resolv.conf", format!("nameserver {dns}\n"))?;
+        resolv_conf(std::path::Path::new("/etc/resolv.conf"), dns)?;
     }
     Ok(())
+}
+
+fn resolv_conf(path: &std::path::Path, dns: &str) -> io::Result<()> {
+    let content = format!("nameserver {dns}\n");
+    if std::fs::read(path).is_ok_and(|old| old == content.as_bytes()) {
+        return Ok(());
+    }
+    let tmp = path.with_extension("conf.tmp");
+    std::fs::write(&tmp, content)?;
+    std::fs::rename(tmp, path)
 }
 
 fn update_address(address: &mut Option<Ipv4Addr>, ip: Ipv4Addr, mut request: impl FnMut(u16, Ipv4Addr) -> io::Result<()>) -> io::Result<()> {
@@ -173,6 +183,28 @@ fn matching_ack(mut data: &[u8], seq: u32) -> Option<io::Result<()>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolv_conf_is_replaced_atomically_and_unchanged_content_is_skipped() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = crate::test_util::TempDir::new("resolv");
+        let path = dir.join("resolv.conf");
+        resolv_conf(&path, "1.1.1.1").unwrap();
+        let old = std::fs::File::open(&path).unwrap();
+        let ino = old.metadata().unwrap().ino();
+        resolv_conf(&path, "1.1.1.1").unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), ino);
+        resolv_conf(&path, "8.8.8.8").unwrap();
+        assert_ne!(std::fs::metadata(&path).unwrap().ino(), ino);
+        assert_eq!(std::io::read_to_string(old).unwrap(), "nameserver 1.1.1.1\n");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "nameserver 8.8.8.8\n");
+        assert!(!path.with_extension("conf.tmp").exists());
+        // A failed replacement leaves the published file intact.
+        std::fs::create_dir(path.with_extension("conf.tmp")).unwrap();
+        resolv_conf(&path, "8.8.8.8").unwrap();
+        assert!(resolv_conf(&path, "9.9.9.9").is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "nameserver 8.8.8.8\n");
+    }
 
     #[test]
     fn a_new_address_is_added_before_the_previous_one_is_deleted() {
