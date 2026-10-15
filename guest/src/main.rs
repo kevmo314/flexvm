@@ -157,13 +157,21 @@ fn reap(statuses: Statuses) {
 }
 
 fn spawn(command: &mut Command, statuses: &Statuses) -> io::Result<Child> {
+    spawn_watched(command, statuses, false).map(|(child, _)| child)
+}
+
+/// With `pidfd`, also a pidfd for the child (None if the kernel has none), opened before the
+/// reaper can reap it, so it never names a reused pid.
+fn spawn_watched(command: &mut Command, statuses: &Statuses, pidfd: bool) -> io::Result<(Child, Option<OwnedFd>)> {
     let (lock, cv) = &**statuses;
     // Held through spawn and registration, even if the child exits at once.
     let mut map = lock.lock().unwrap();
     let child = command.spawn()?;
+    let fd = pidfd.then(|| unsafe { libc::syscall(libc::SYS_pidfd_open, child.id() as libc::pid_t, 0) as RawFd });
+    let fd = fd.filter(|&fd| fd >= 0).map(|fd| unsafe { OwnedFd::from_raw_fd(fd) });
     map.insert(child.id() as i32, None);
     cv.notify_all();
-    Ok(child)
+    Ok((child, fd))
 }
 
 fn wait_pid(statuses: &Statuses, pid: i32, deadline: Option<Instant>) -> Option<i32> {
@@ -183,24 +191,139 @@ fn wait_pid(statuses: &Statuses, pid: i32, deadline: Option<Instant>) -> Option<
 }
 
 fn pump(stdout: Option<ChildStdout>, stderr: Option<ChildStderr>, mut deliver: impl FnMut(u8, &[u8])) {
+    drop(pump_until(stdout, stderr, None, Duration::ZERO, |kind, data| {
+        deliver(kind, data);
+        Duration::ZERO
+    }));
+}
+
+/// As `pump`, but once `exited` (a pidfd) is readable, returns after `drain` of pumping:
+/// background processes may hold the pipes open for good. `deliver` returns how long it waited
+/// for its reader, which is not counted. Returns the pipes still open.
+fn pump_until(
+    stdout: Option<ChildStdout>,
+    stderr: Option<ChildStderr>,
+    mut exited: Option<OwnedFd>,
+    drain: Duration,
+    mut deliver: impl FnMut(u8, &[u8]) -> Duration,
+) -> Vec<File> {
     let out = stdout.map(|s| (File::from(OwnedFd::from(s)), FRAME_STDOUT));
     let mut streams: Vec<(File, u8)> = out.into_iter().chain(stderr.map(|s| (File::from(OwnedFd::from(s)), FRAME_STDERR))).collect();
     let mut buf = [0; 16 * 1024];
+    let mut left: Option<Duration> = None;
     while !streams.is_empty() {
         let mut fds: Vec<_> = streams.iter().map(|(f, _)| libc::pollfd { fd: f.as_raw_fd(), events: libc::POLLIN, revents: 0 }).collect();
-        match os(unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) }) {
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(_) => return,
-            Ok(_) => {}
+        if let Some(fd) = &exited {
+            fds.push(libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLIN, revents: 0 });
         }
-        for i in (0..fds.len()).rev().filter(|&i| fds[i].revents != 0) {
-            match streams[i].0.read(&mut buf) {
-                Ok(0) => drop(streams.remove(i)),
-                Ok(n) => deliver(streams[i].1, &buf[..n]),
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(_) => drop(streams.remove(i)),
+        let timeout = left.map_or(-1, |l| l.as_millis().clamp(1, i32::MAX as u128) as i32);
+        let start = Instant::now();
+        let (mut waited, mut fired) = (Duration::ZERO, false);
+        let polled = os(unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) });
+        match polled {
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+            Ok(_) => {
+                if exited.is_some() && fds.pop().is_some_and(|p| p.revents != 0) {
+                    (exited, left, fired) = (None, Some(drain), true);
+                }
+                for i in (0..fds.len()).rev().filter(|&i| fds[i].revents != 0) {
+                    match streams[i].0.read(&mut buf) {
+                        Ok(0) => drop(streams.remove(i)),
+                        Ok(n) => waited += deliver(streams[i].1, &buf[..n]),
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                        Err(_) => drop(streams.remove(i)),
+                    }
+                }
             }
         }
+        if let Some(l) = left.as_mut().filter(|_| !fired) {
+            *l = l.saturating_sub(start.elapsed().saturating_sub(waited));
+            if l.is_zero() {
+                break;
+            }
+        }
+    }
+    streams.into_iter().map(|(f, _)| f).collect()
+}
+
+/// Pipes the discarder keeps at most: 2 fds each, so a flood of finished execs whose background
+/// processes hold their output cannot use up flexvm-init's fds. Past it a newly finished exec's pipes
+/// are closed instead (their writers then get SIGPIPE): the jobs started earlier keep working.
+const MAX_DISCARDED: usize = 256;
+
+/// Reads and drops whatever comes down its pipes until each one's EOF, on one thread for all.
+struct Discarder {
+    cap: usize,
+    /// Pipes kept: being read, or queued for the thread.
+    held: AtomicUsize,
+    queue: Mutex<Vec<File>>,
+    wake: File,
+}
+
+impl Discarder {
+    fn start(cap: usize) -> io::Result<Arc<Discarder>> {
+        let mut fds = [0; 2];
+        os(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) })?;
+        let (woken, wake) = unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) };
+        let d = Arc::new(Discarder { cap, held: AtomicUsize::new(0), queue: Mutex::new(Vec::new()), wake });
+        let run = d.clone();
+        thread::Builder::new().spawn(move || run.run(woken))?;
+        Ok(d)
+    }
+
+    /// Takes as many of `pipes` as fit under the cap; returns how many it closed instead.
+    fn add(&self, mut pipes: Vec<File>) -> usize {
+        let want = pipes.len();
+        let room = self.held.fetch_update(Ordering::AcqRel, Ordering::Acquire, |h| Some(h + want.min(self.cap.saturating_sub(h)))).unwrap();
+        let took = want.min(self.cap.saturating_sub(room));
+        let refused = pipes.split_off(took).len();
+        if took > 0 {
+            self.queue.lock().unwrap().extend(pipes);
+            let _ = (&self.wake).write(&[1]);
+        }
+        refused
+    }
+
+    fn run(&self, mut woken: File) {
+        let mut pipes: Vec<File> = Vec::new();
+        let mut buf = [0; 16 * 1024];
+        loop {
+            let mut fds: Vec<_> = std::iter::once(&woken).chain(&pipes).map(|f| libc::pollfd { fd: f.as_raw_fd(), events: libc::POLLIN, revents: 0 }).collect();
+            if os(unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) }).is_err() {
+                continue;
+            }
+            for i in (1..fds.len()).rev().filter(|&i| fds[i].revents != 0) {
+                match pipes[i - 1].read(&mut buf) {
+                    Ok(n) if n > 0 => continue,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted || e.kind() == io::ErrorKind::WouldBlock => continue,
+                    _ => {}
+                }
+                drop(pipes.swap_remove(i - 1));
+                self.held.fetch_sub(1, Ordering::AcqRel);
+            }
+            if fds[0].revents != 0 {
+                while woken.read(&mut buf).is_ok_and(|n| n > 0) {}
+                pipes.append(&mut self.queue.lock().unwrap());
+            }
+        }
+    }
+}
+
+static DISCARDER: std::sync::OnceLock<Option<Arc<Discarder>>> = std::sync::OnceLock::new();
+
+/// Hands a finished exec's still-open pipes to the discarder (closed if it is full or cannot start).
+fn discard(pipes: Vec<File>) {
+    if pipes.is_empty() {
+        return;
+    }
+    let n = pipes.len();
+    let refused = match DISCARDER.get_or_init(|| Discarder::start(MAX_DISCARDED).ok()) {
+        Some(d) => d.add(pipes),
+        None => n,
+    };
+    if refused > 0 {
+        eprintln!("flexvm-init: closed {refused} output pipe(s) still held by a finished exec's background processes: {MAX_DISCARDED} are kept at most");
     }
 }
 
@@ -418,6 +541,45 @@ fn request_line(r: &mut impl BufRead) -> io::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn discarder_keeps_at_most_its_cap() {
+        let d = Discarder::start(4).unwrap();
+        let pipe = || {
+            let mut fds = [0; 2];
+            assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+            unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) }
+        };
+        let (mut writers, mut refused) = (Vec::new(), 0);
+        // Three finished execs' stdout and stderr: one more than fits.
+        for _ in 0..3 {
+            let ((out, out_w), (err, err_w)) = (pipe(), pipe());
+            refused += d.add(vec![out, err]);
+            writers.extend([out_w, err_w]);
+        }
+        assert_eq!((refused, d.held.load(Ordering::Acquire)), (2, 4));
+        // Kept pipes are drained: far more than a pipe holds goes through.
+        let chunk = vec![0u8; 64 * 1024];
+        for w in &mut writers[..4] {
+            for _ in 0..16 {
+                w.write_all(&chunk).unwrap();
+            }
+        }
+        // Refused ones were closed (the test harness ignores SIGPIPE).
+        for w in &mut writers[4..] {
+            assert_eq!(w.write(b"x").unwrap_err().raw_os_error(), Some(libc::EPIPE));
+        }
+        // A writer's exit (EOF) makes room again.
+        writers.drain(..2);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while d.held.load(Ordering::Acquire) > 2 {
+            assert!(Instant::now() < deadline, "EOF did not free the pipes");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let ((out, _out_w), (err, _err_w)) = (pipe(), pipe());
+        assert_eq!(d.add(vec![out, err]), 0);
+        assert_eq!(d.held.load(Ordering::Acquire), 4);
+    }
+
     use super::*;
 
     #[test]
