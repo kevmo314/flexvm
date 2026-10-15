@@ -120,7 +120,7 @@ RUN (default /run/flexvm, tmpfs)
   vms/NAME.{failed,moved}         why a VM died (until `flexvm kill`); where it migrated to (an hour)
   vms/.incoming-LPID-N.log        an arrival's log until it is accepted (as NAME.log) or refused; locked by the arrival
   .gc, .gc.lock          when garbage was last swept periodically; one sweep at a time
-  standby/T/KEY.PID.sock a standby VM of template T, generation KEY (PID.lock while it lives)
+  standby/T/KEY.PID-START.sock a standby VM of template T, generation KEY (PID-START.lock while it lives)
   standby/T/standby.log  the standby VMs' output and refill errors
   standby/.loadset-ID    pages loads of template ID touch, learned by standby VMs, for migrations to preload
                          (one per generation, never swept: whether one is in use cannot be told)
@@ -164,7 +164,7 @@ devices whose alias names its run directory and an owner proven gone
 taps with no such alias, an earlier version's say, are never touched); a
 process with a reused pid removes its dead namesake's as it starts, as their
 names would be its own (`host::clear_taps`), Firecrackers' cgroups (`idle-<pid>-<start>-<n>`, by the process's identity), work directories, names, a standby
-VM's socket (its `PID.lock` free), an arrival's log (no lock on it, 5 s
+VM's socket (its `PID-START.lock` free), an arrival's log (no lock on it, 5 s
 old). A VM process's own cgroup (`vm-PID-START`) goes once empty, never
 killed (`rmdir` refuses a populated cgroup). An earlier version's
 Firecracker cgroups (`idle-PID-N`, no start time) are left alone. The logs of a name with no
@@ -333,7 +333,7 @@ to receive.
 `flexvm standby [--template T] N` records N in `STATE/standby/T` and starts
 standby VMs until there are N: each is `flexvm run --standby`, a VM process
 that restores the template, lets the guest reseed and settle, pauses, and
-listens on `RUN/standby/TEMPLATE/KEY.PID.sock`. `flexvm run` claims one (`claim
+listens on `RUN/standby/TEMPLATE/KEY.PID-START.sock`. `flexvm run` claims one (`claim
 {name, ip, cmd}` with its stdout/stderr passed over SCM_RIGHTS): the standby
 takes the name and address, routes, resumes, sends `START`, and becomes that
 VM. A claimed standby starts its replacement, and every 5 s the listener and
