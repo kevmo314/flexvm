@@ -945,17 +945,52 @@ impl Host {
     /// proven gone (killed before its `done`) by its own host's listener. Any
     /// doubt keeps the record: a source that still waits must find it.
     pub fn retire_migrations(&self) {
-        for e in std::fs::read_dir(self.state.join("migs")).into_iter().flatten().flatten() {
-            let Some(id) = e.file_name().to_str().and_then(|n| n.parse().ok()) else { continue };
+        // At most five records (and thus five two-second peer calls) per pass.
+        self.retire_migrations_with(5, |source, by| {
+            crate::vmproc::peer_call(source, serde_json::json!({"op": "source", "ident": by})).map(|r| r["gone"] == true)
+        });
+    }
+
+    fn retire_migrations_with(&self, budget: usize, mut query: impl FnMut(&str, &Ident) -> Result<bool>) {
+        let Ok(lock) = File::create(self.run.join(".retire.lock")) else { return };
+        if flock(&lock, libc::LOCK_EX | libc::LOCK_NB).is_err() {
+            return;
+        }
+        // A sorted ID cursor survives deletions and lets different processes
+        // continue the same rotation. Only retirement holds this lock.
+        let cursor = self.run.join(".retire.next");
+        let last = load::<u64>(&cursor).ok().flatten();
+        let mut ids: Vec<u64> =
+            std::fs::read_dir(self.state.join("migs")).into_iter().flatten().flatten().filter_map(|e| e.file_name().to_str()?.parse().ok()).collect();
+        ids.sort_unstable();
+        let start = last.map_or(0, |last| ids.partition_point(|id| *id <= last));
+        ids.rotate_left(start);
+        let mut unavailable = HashSet::new();
+        let mut visited = None;
+        for id in ids.into_iter().take(budget) {
+            visited = Some(id);
             let Ok(Some(Mig::Released { source, by })) = load(&self.mig_path(id)) else {
                 let _ = self.mig_status(id);
                 continue;
             };
             let Some(by) = by.filter(|_| !source.is_empty()) else { continue };
-            let gone = crate::vmproc::peer_call(&source, serde_json::json!({"op": "source", "ident": by}));
-            if gone.is_ok_and(|r| r["gone"] == true) {
-                crate::log!("migration {id}: its source at {source} is gone; forgetting it");
-                let _ = self.mig_done(id);
+            if unavailable.contains(&source) {
+                continue;
+            }
+            match query(&source, &by) {
+                Ok(true) => {
+                    crate::log!("migration {id}: its source at {source} is gone; forgetting it");
+                    let _ = self.mig_done(id);
+                }
+                Ok(false) => (),
+                Err(_) => {
+                    unavailable.insert(source);
+                }
+            }
+        }
+        if let Some(id) = visited {
+            if let Err(e) = store(&cursor, &id, false) {
+                crate::log!("migration retirement cursor: {e}");
             }
         }
     }
@@ -2127,6 +2162,98 @@ mod tests {
         let c = h.claim_new(&l, "x", Some(x)).unwrap();
         assert!(c.gen > g && c.fresh);
         assert!(h.lend_new(&l, x).unwrap_err().to_string().contains("in use"));
+    }
+
+    fn released_migration(h: &Host, id: u64, source: &str) {
+        store(&h.mig_path(id), &Mig::Released { source: source.into(), by: Some(Ident { start: id, ..Ident::me() }) }, false).unwrap();
+    }
+
+    #[test]
+    fn retirement_respects_record_budget() {
+        let h = host("retire-budget");
+        for id in 1..=8 {
+            released_migration(&h, id, "reachable");
+        }
+        h.retire_migrations_with(0, |_, _| panic!("zero budget must not query"));
+        assert!(!h.run.join(".retire.next").exists());
+        let mut queried = Vec::new();
+        h.retire_migrations_with(3, |_, by| {
+            queried.push(by.start);
+            Ok(false)
+        });
+        assert_eq!(queried, [1, 2, 3]);
+        assert_eq!(load::<u64>(&h.run.join(".retire.next")).unwrap(), Some(3));
+        assert!((1..=8).all(|id| h.mig_path(id).exists()), "a source still present keeps every record");
+    }
+
+    #[test]
+    fn retirement_continues_across_passes_and_wraps() {
+        let h = host("retire-continue");
+        for id in 1..=6 {
+            released_migration(&h, id, "reachable");
+        }
+        let pass = |h: &Host| {
+            let mut queried = Vec::new();
+            h.retire_migrations_with(2, |_, by| {
+                queried.push(by.start);
+                Ok(false)
+            });
+            queried
+        };
+        assert_eq!(pass(&h), [1, 2]);
+        // Removing an earlier record must not shift the continuation past ID 3.
+        h.mig_done(1).unwrap();
+        let reopened = Host::open(&h.state, &h.run).unwrap();
+        assert_eq!(pass(&reopened), [3, 4]);
+        assert_eq!(pass(&reopened), [5, 6]);
+        assert_eq!(pass(&reopened), [2, 3]);
+    }
+
+    #[test]
+    fn retirement_skips_unavailable_endpoints_only_for_this_pass() {
+        let h = host("retire-endpoints");
+        for (id, source) in [(1, "unreachable"), (2, "reachable"), (3, "unreachable"), (4, "reachable"), (5, "unknown"), (6, "unreachable")] {
+            released_migration(&h, id, source);
+        }
+        store(&h.mig_path(7), &Mig::Released { source: "reachable".into(), by: None }, false).unwrap();
+        released_migration(&h, 8, "");
+        let mut queried = Vec::new();
+        h.retire_migrations_with(8, |source, by| {
+            queried.push(by.start);
+            match source {
+                "unreachable" | "unknown" => Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into()),
+                "reachable" => Ok(by.start == 4),
+                _ => panic!("invalid source must not be queried"),
+            }
+        });
+        assert_eq!(queried, [1, 2, 4, 5]);
+        assert!(!h.mig_path(4).exists(), "only an explicit gone response retires a record");
+        assert!([1, 2, 3, 5, 6, 7, 8].iter().all(|id| h.mig_path(*id).exists()));
+        queried.clear();
+        h.retire_migrations_with(3, |_, by| {
+            queried.push(by.start);
+            Ok(false)
+        });
+        assert_eq!(queried, [1, 2, 3], "a later pass retries the endpoint");
+    }
+
+    #[test]
+    fn retirement_uses_its_own_nonblocking_lock() {
+        let h = host("retire-lock");
+        released_migration(&h, 1, "reachable");
+        let gc = File::create(h.run.join(".gc.lock")).unwrap();
+        flock(&gc, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+        let mut queried = false;
+        h.retire_migrations_with(1, |_, _| {
+            let retirement = File::open(h.run.join(".retire.lock")).unwrap();
+            assert!(flock(&retirement, libc::LOCK_EX | libc::LOCK_NB).is_err());
+            queried = true;
+            Ok(false)
+        });
+        assert!(queried, "the local cleanup lock does not block retirement");
+        let retirement = File::open(h.run.join(".retire.lock")).unwrap();
+        flock(&retirement, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+        h.retire_migrations_with(1, |_, _| panic!("busy retirement must be skipped"));
     }
 
     #[test]
