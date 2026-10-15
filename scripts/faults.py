@@ -6643,6 +6643,84 @@ def pause_cmd_start():
     check("pause cmd: the command ran, its status", code == 9 and out.count("started") == 1, (code, out))
 
 
+def ctrl_z_long_op():
+    """#387: a Ctrl-Z waiting for the VM while a long operation holds it (a
+    crawling keep-running checkpoint) never holds up the Ctrl-C after it:
+    the VM is destroyed at once, exit status 130, the checkpoint cancelled."""
+    n, path = "ft-ctrlz-op", ckpt_path("ft-ctrlz-op")
+    scenario_vms.add(n)
+    p = subprocess.Popen([BIN, "--state", A.state, "--run", A.run, "run", n, "--template", args.template],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=ENV, start_new_session=True)
+    check("ctrl-z long op: up", wait_for(lambda: vms(A).get(n, {}).get("state") == "running", 30), vms(A).get(n))
+    code, out = sh(A, n, "dd if=/dev/urandom of=/tmp/f bs=1M count=100 iflag=fullblock 2>/dev/null && echo written")
+    check("ctrl-z long op: memory written", code == 0, out)
+    fault(A, "ckpt_crawl", 120000)
+    res = {}
+    t = threading.Thread(target=lambda: res.update(r=checkpoint(A, n, path)))
+    t.start()
+    check("ctrl-z long op: checkpoint copying", wait_for(lambda: vms(A).get(n, {}).get("checkpoint_copy"), 30), vms(A).get(n))
+    os.kill(p.pid, signal.SIGTSTP)
+    time.sleep(1)
+    started = time.time()
+    os.kill(p.pid, signal.SIGINT)
+    try:
+        code = p.wait(timeout=60)
+    except subprocess.TimeoutExpired:
+        code = None
+    took = time.time() - started
+    fault(A, "ckpt_crawl", 0)
+    t.join(120)
+    check("ctrl-z long op: Ctrl-C destroys it at once, exit status 130", code == 130 and took < 5, (code, took))
+    check("ctrl-z long op: the checkpoint cancelled, none published", not res.get("r", {}).get("ok") and not os.path.exists(path), res)
+    check("ctrl-z long op: nothing left", n not in vms(A), vms(A).get(n))
+
+
+def resume_suspending():
+    """#387: `flexvm resume` during a suspend (when SIGCONT does nothing)
+    waits it out: a suspend that finishes is resumed, its command reattached,
+    exiting with the command's status; one that fails leaves the VM running,
+    and resume exits 0."""
+    n = "ft-resume-susp"
+    scenario_vms.add(n)
+    entry = os.path.join(A.run, "vms", f"{n}.json")
+
+    def state():
+        try:
+            return json.load(open(entry)).get("state")
+        except (OSError, ValueError):
+            return None
+
+    clear_log(A, n)
+    ok(cli_json(A, "run", n, "--template", args.template, "-d", "--", "echo resume-susp-start; sleep 8; exit 7"))
+    pid = vm_pid(A, n)
+    check("resume suspending: started", wait_for(lambda: "resume-susp-start" in log(A, n).splitlines(), 30), log(A, n)[-300:])
+    # The suspend stalls 3 s once its checkpoint is published, still under way.
+    fault(A, "suspend_stall", 10000)
+    os.kill(pid, signal.SIGTERM)
+    check("resume suspending: published as suspending", wait_for(lambda: state() == "suspending", 30), state())
+    r = subprocess.run([BIN, "--state", A.state, "--run", A.run, "resume", n], capture_output=True, text=True, timeout=120, env=ENV)
+    fault(A, "suspend_stall", 0)
+    check("resume suspending: the suspended vm resumed, the command's status", r.returncode == 7, (r.returncode, r.stderr[-500:]))
+    check("resume suspending: gone after it, not left suspended",
+          not alive(pid) and n not in vms(A) and not os.path.exists(os.path.join(A.state, "suspended", n)), vms(A).get(n))
+    # A suspend that fails, raced by the resume: the VM runs on.
+    ok(run(A, n))
+    pid = vm_pid(A, n)
+    fault(A, "ckpt_fail_write", 60000)
+    fault(A, "suspend_slow", 60000)
+    os.kill(pid, signal.SIGTERM)
+    end = time.time() + 10
+    while state() != "suspending" and time.time() < end:
+        time.sleep(0.005)
+    code, out, err = cli(A, "resume", n)
+    fault(A, "ckpt_fail_write", 0)
+    fault(A, "suspend_slow", 0)
+    check("resume suspending: a failed suspend's vm runs on, resume exits 0",
+          code == 0 and alive(pid) and wait_for(lambda: vms(A).get(n, {}).get("state") == "running", 10), (code, err, vms(A).get(n)))
+    check("resume suspending: the suspend did fail", "injected fault: writing the checkpoint failed" in log(A, n), log(A, n)[-500:])
+    ok(kill(A, n))
+
+
 def suspend_died():
     """A Firecracker that dies after a suspend published its checkpoint (but
     before the suspend ended) is a death, not a kill: the checkpoint is
@@ -7278,7 +7356,8 @@ SCENARIOS = dict(
     cow_wp_race=cow_wp_race, fetch_tail_enomem=fetch_tail_enomem, fetch_enomem_stuck=fetch_enomem_stuck, pull_enomem=pull_enomem,
     collapse_abort=collapse_abort, collapse_ckpt_fail=collapse_ckpt_fail, ckpt_paused_backlog=ckpt_paused_backlog, same_host_order=same_host_order, same_host_slow_route=same_host_slow_route, same_host_flood=same_host_flood, same_host_late_handover=same_host_late_handover, same_host_backlog=same_host_backlog, ckpt_backlog=ckpt_backlog, rx_stall=rx_stall, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,
     handoff_superseded=handoff_superseded, delayed_announce=delayed_announce, announce_arp_timer=announce_arp_timer,
-    prepare_fail_announce=prepare_fail_announce, reconcile_announce=reconcile_announce, reconcile_kill=reconcile_kill, resume_pull_lock=resume_pull_lock, page_conns=page_conns, suspend_cmd=suspend_cmd, suspend_overlap=suspend_overlap, fc_died_busy=fc_died_busy, pause_cmd_start=pause_cmd_start, suspend_died=suspend_died)
+    prepare_fail_announce=prepare_fail_announce, reconcile_announce=reconcile_announce, reconcile_kill=reconcile_kill, resume_pull_lock=resume_pull_lock, page_conns=page_conns, suspend_cmd=suspend_cmd, suspend_overlap=suspend_overlap, fc_died_busy=fc_died_busy, pause_cmd_start=pause_cmd_start, suspend_died=suspend_died,
+    ctrl_z_long_op=ctrl_z_long_op, resume_suspending=resume_suspending)
 names = [n for s in args.scenarios for n in (list(SCENARIOS) if s == "all" else [s])]
 if os.geteuid() != 0:
     sys.exit("run as root (sudo)")

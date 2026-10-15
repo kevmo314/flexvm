@@ -348,8 +348,7 @@ fn real_main(args: &Args) -> Result<()> {
             vmproc::main(open_host(args)?, paths(args)?, Start::Incoming { req }, None)
         }
         Some("run") => run(args, name, template),
-        // A paused VM gets SIGCONT; a suspended one a new process.
-        Some("resume") if open_host(args)?.signal(name, libc::SIGCONT).is_ok() => Ok(()),
+        Some("resume") if resume(&open_host(args)?, name) => Ok(()),
         Some("resume") => start(args, name, Start::Resume { name: name.into() }),
         Some("restore") => {
             let dir = std::path::absolute(pos.get(1).ok_or("restore needs DIR")?)?;
@@ -577,6 +576,21 @@ fn follow(mut conn: BufReader<std::os::unix::net::UnixStream>, id: host::Ident) 
     }
     let reply = recv_json(&mut conn).ok().flatten();
     util::exit(reply.and_then(|r| r["exit"].as_i64()).map_or(vmproc::FAILED, |c| c as i32))
+}
+
+/// A paused VM gets SIGCONT (true); a suspended one a new process. SIGCONT does
+/// nothing during a suspend: that is waited out, the VM then running here (a
+/// failed suspend) or suspended.
+fn resume(host: &Host, name: &str) -> bool {
+    loop {
+        match host.entry(name) {
+            Ok(e) if e.state == "suspending" => match host::PidFd::open(&e.ident) {
+                Ok(Some(vm)) => drop(vm.wait(Duration::from_millis(100))),
+                _ => std::thread::sleep(Duration::from_millis(100)),
+            },
+            _ => return host.signal(name, libc::SIGCONT).is_ok(),
+        }
+    }
 }
 
 fn kill(host: &Host, name: &str) -> Result<()> {

@@ -9,7 +9,7 @@ use std::net::Ipv4Addr;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -142,7 +142,10 @@ pub struct Proc {
     held_grant: Mutex<Option<crate::host::Hold>>,
     /// A standby's (MiB held or to page in, guest size), taken while it waits, so a claim need not.
     pub sizes: Mutex<Option<(u64, u64)>>,
-    serving: AtomicBool,
+    /// Set once the control socket is bound (a failed bind is tried again).
+    serving: Mutex<bool>,
+    /// SIGTSTP and SIGCONT, off the signal thread (which a later SIGINT needs).
+    pauses: Latest,
     /// The controller's tick gaps, for `debug status`.
     ticks: Mutex<Ticks>,
     /// How fast the VM's memory grew lately (MiB/s), for eviction's ranking.
@@ -238,7 +241,8 @@ impl Proc {
             charged: AtomicU64::new(0),
             held_grant: Mutex::new(None),
             sizes: Mutex::new(None),
-            serving: AtomicBool::new(false),
+            serving: Mutex::new(false),
+            pauses: Latest::default(),
             ticks: Mutex::new(Ticks::default()),
             growth: AtomicU64::new(0),
             publishing: Mutex::new(()),
@@ -461,12 +465,15 @@ impl Proc {
     }
 
     pub fn op_within(&self) -> Result<Op<'_>> {
-        let deadline = Instant::now() + OP_WAIT;
+        let (deadline, mut nap) = (Instant::now() + OP_WAIT, Duration::from_millis(1));
         loop {
             match self.op.try_lock() {
                 Ok(g) => return Ok(g),
                 Err(std::sync::TryLockError::Poisoned(e)) => return Ok(e.into_inner()),
-                Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(1)),
+                Err(_) if Instant::now() < deadline => {
+                    thread::sleep(nap);
+                    nap = (nap * 2).min(Duration::from_millis(50));
+                }
                 Err(_) => bail!("vm {} is busy", self.name()),
             }
         }
@@ -514,6 +521,8 @@ impl Proc {
             max_mib: vm.template.meta.max_mib,
             state: match vm.state() {
                 State::Source(mig) if self.reconciling.lock().unwrap().as_ref().is_some_and(|(m, _)| *m == mig) => "reconciling",
+                // SIGCONT does nothing then: `flexvm resume` waits for the suspend instead.
+                _ if *self.suspending.lock().unwrap() == Suspend::Suspending => "suspending",
                 state => state.name(),
             }
             .into(),
@@ -668,10 +677,15 @@ impl Proc {
     pub fn reserve_suspend(&self) -> Option<SuspendReserved> {
         let p = self.arc()?;
         let mut s = self.suspending.lock().unwrap();
-        (*s == Suspend::Idle).then(|| {
+        let r = (*s == Suspend::Idle).then(|| {
             *s = Suspend::Suspending;
             SuspendReserved(p.clone())
-        })
+        });
+        drop(s);
+        if r.is_some() {
+            self.publish();
+        }
+        r
     }
 
     /// Recorded for the peers first (`Host::withdraw_noted`): told now, and on a
@@ -797,7 +811,8 @@ impl Proc {
     }
 
     pub fn serve_control(self: &Arc<Self>) {
-        if self.serving.swap(true, Ordering::SeqCst) {
+        let mut serving = self.serving.lock().unwrap();
+        if *serving {
             return;
         }
         let sock = self.host.sock(&self.name());
@@ -808,6 +823,7 @@ impl Proc {
         };
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600));
+        *serving = true;
         let p = self.clone();
         thread::spawn(move || {
             for c in l.incoming() {
@@ -845,10 +861,16 @@ impl Proc {
                 p.died();
             });
         }
-        // Before the main command starts: a Ctrl-Z taken during startup pauses the VM first.
-        let early = std::mem::take(&mut *self.early.lock().unwrap());
-        for sig in early {
-            self.signal(sig);
+        // In order, what comes meanwhile queued behind; and before the main
+        // command starts: a Ctrl-Z taken during startup pauses the VM first.
+        loop {
+            let next = self.early.lock().unwrap().first().copied();
+            let Some(sig) = next else { break };
+            self.dispatch(sig);
+            self.early.lock().unwrap().remove(0);
+        }
+        while self.pauses.busy.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(10));
         }
         if self.cmd.lock().unwrap().is_some() {
             spawn(Proc::main_command);
@@ -858,15 +880,38 @@ impl Proc {
         }
     }
 
-    fn signal(&self, sig: i32) {
+    fn signal(self: &Arc<Self>, sig: i32) {
         let mut early = self.early.lock().unwrap();
-        let Some(vm) = self.vm.get() else {
+        // Until those before it are replayed (`serve`), as it would overtake them.
+        if self.vm.get().is_none() || !early.is_empty() {
             if sig != libc::SIGHUP {
                 early.push(sig);
             }
             return;
-        };
+        }
         drop(early);
+        self.dispatch(sig);
+    }
+
+    fn dispatch(self: &Arc<Self>, sig: i32) {
+        if !matches!(sig, libc::SIGTSTP | libc::SIGCONT) {
+            return self.handle(sig);
+        }
+        if self.pauses.offer(sig) {
+            let p = self.clone();
+            if let Err(e) = thread::Builder::new().spawn(move || {
+                while let Some(sig) = p.pauses.next() {
+                    p.handle(sig);
+                }
+            }) {
+                self.pauses.busy.store(false, Ordering::SeqCst);
+                crate::log!("vm {}: signal {sig}: {e}", self.name());
+            }
+        }
+    }
+
+    fn handle(&self, sig: i32) {
+        let vm = self.vm();
         let res = match sig {
             libc::SIGTSTP => self.op_within().and_then(|_op| {
                 let res = vm.pause();
@@ -955,7 +1000,10 @@ impl Proc {
             drop(slot);
             return refuse_pages(s, "injected fault: page server down");
         }
-        let Some(pages) = Slot::take(&PAGES, MAX_PAGES) else { return };
+        let Some(pages) = Slot::take(&PAGES, MAX_PAGES) else {
+            drop(slot);
+            return refuse_pages(s, "page server busy");
+        };
         drop(slot);
         let admitted = match crate::uffd::admit(&s) {
             Ok(Some(a)) => a,
@@ -1000,8 +1048,13 @@ impl Proc {
             if req["action"] == "close" {
                 g.get_ref().set_read_timeout(Some(Duration::from_secs(2)))?;
                 let reply = guest::read_frame(&mut g)?.map(|(_, m)| String::from_utf8_lossy(&m).into_owned());
-                let closed = reply.as_deref() == Some("closed");
-                return Ok(send_json(&mut w, &json!({"ok": closed, "error": format!("session close failed: {}", reply.unwrap_or_default())}))?);
+                return Ok(send_json(
+                    &mut w,
+                    &match reply.as_deref() {
+                        Some("closed") => json!({"ok": true}),
+                        r => json!({"ok": false, "error": format!("session close failed: {}", r.unwrap_or_default())}),
+                    },
+                )?);
             }
             // The guest heartbeats every second; silence means the VM moved, or its agent stalled.
             g.get_ref().set_read_timeout(Some(Duration::from_secs(3)))?;
@@ -1014,7 +1067,7 @@ impl Proc {
 
     fn debug(&self, req: &Value) -> Result<Value> {
         if req["what"] != "status" && std::env::var("FLEXVM_FAULTS").ok().as_deref() != Some("1") {
-            bail!("memhash needs FLEXVM_FAULTS=1");
+            bail!("debug {} needs FLEXVM_FAULTS=1", req["what"]);
         }
         let vm = self.vm();
         match req["what"].as_str().unwrap_or("") {
@@ -1186,7 +1239,8 @@ impl Proc {
                 let _ = g.get_ref().set_read_timeout(None);
                 while let Ok(Some((kind, data))) = guest::read_frame(&mut g) {
                     // The guest's ring moved past us (or we asked past its end): it goes on from there.
-                    if let (guest::FRAME_LOST, Ok(at)) = (kind, <[u8; 8]>::try_from(&data[..data.len().min(8)])) {
+                    if kind == guest::FRAME_LOST {
+                        let Ok(at) = <[u8; 8]>::try_from(&data[..data.len().min(8)]) else { continue };
                         let (at, was) = (u64::from_le_bytes(at), self.app_log.load(Ordering::SeqCst));
                         if at > was {
                             crate::log!("vm {}: {} bytes of app output lost (the guest keeps its last 1 MiB)", vm.name, at - was);
@@ -1326,6 +1380,40 @@ impl Drop for SuspendReserved {
         let mut s = self.0.suspending.lock().unwrap();
         if *s == Suspend::Suspending {
             *s = Suspend::Idle;
+            drop(s);
+            self.0.publish();
+        }
+    }
+}
+
+/// The newest request offered, taken one at a time by a single worker: a
+/// SIGCONT after a SIGTSTP still waiting for the VM leaves it running.
+#[derive(Default)]
+struct Latest {
+    wanted: AtomicI32,
+    busy: AtomicBool,
+}
+
+impl Latest {
+    /// True if the caller is to start the worker.
+    fn offer(&self, sig: i32) -> bool {
+        self.wanted.store(sig, Ordering::SeqCst);
+        !self.busy.swap(true, Ordering::SeqCst)
+    }
+
+    /// The worker's next request; None once there is none (and it is to stop).
+    fn next(&self) -> Option<i32> {
+        loop {
+            match self.wanted.swap(0, Ordering::SeqCst) {
+                0 => {
+                    self.busy.store(false, Ordering::SeqCst);
+                    // An offer between the two found it busy: this worker takes it, unless a new one started.
+                    if self.wanted.load(Ordering::SeqCst) == 0 || self.busy.swap(true, Ordering::SeqCst) {
+                        return None;
+                    }
+                }
+                sig => return Some(sig),
+            }
         }
     }
 }
@@ -2079,6 +2167,46 @@ mod tests {
         });
         assert_eq!(got.unwrap().as_deref(), Some("b:1"));
         assert!(r.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn pauses_run_one_at_a_time_the_newest_winning() {
+        let l = Latest::default();
+        assert!(l.offer(libc::SIGTSTP), "the first starts the worker");
+        assert!(!l.offer(libc::SIGCONT), "one worker at a time");
+        assert_eq!(l.next(), Some(libc::SIGCONT), "a SIGCONT after a waiting SIGTSTP wins");
+        assert!(!l.offer(libc::SIGTSTP));
+        assert_eq!(l.next(), Some(libc::SIGTSTP), "taken by the running worker, in order");
+        assert_eq!(l.next(), None);
+        assert!(l.offer(libc::SIGCONT), "stopped: the next offer starts another");
+    }
+
+    #[test]
+    fn no_pause_offer_is_lost_to_a_stopping_worker() {
+        let l = Arc::new(Latest::default());
+        let (handled, workers) = (Arc::new(AtomicI32::new(0)), Arc::new(AtomicI32::new(0)));
+        for i in 1..=2000 {
+            let sig = if i % 2 == 0 { libc::SIGCONT } else { libc::SIGTSTP };
+            if l.offer(sig) {
+                let (l, handled, workers) = (l.clone(), handled.clone(), workers.clone());
+                workers.fetch_add(1, Ordering::SeqCst);
+                thread::spawn(move || {
+                    while let Some(sig) = l.next() {
+                        handled.store(sig, Ordering::SeqCst);
+                    }
+                    workers.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
+            while workers.load(Ordering::SeqCst) > 0 && i % 100 == 0 {
+                thread::yield_now();
+            }
+        }
+        let end = Instant::now() + Duration::from_secs(5);
+        while (workers.load(Ordering::SeqCst) > 0 || l.busy.load(Ordering::SeqCst)) && Instant::now() < end {
+            thread::yield_now();
+        }
+        assert_eq!(handled.load(Ordering::SeqCst), libc::SIGCONT, "the last offer was handled");
+        assert_eq!(l.wanted.load(Ordering::SeqCst), 0);
     }
 
     #[test]
