@@ -660,7 +660,11 @@ impl Host {
         self.update(l, ip, true, |a| a.lent.replace(gen) != Some(gen))
     }
 
+    /// Test fault `unlend_fail`: it fails, leaving the loan.
     pub fn unlend(&self, l: &Locked, ip: Ipv4Addr, gen: u64) -> Result<()> {
+        if fault("unlend_fail") {
+            bail!("injected fault");
+        }
         self.update(l, ip, true, |a| a.lent = a.lent.filter(|&lent| lent != gen))
     }
 

@@ -200,19 +200,16 @@ pub fn ping(uds: &Path) -> Result<()> {
     })
 }
 
-pub fn exec(uds: &Path, cmd: &str, timeout: Duration) -> Result<(i32, Vec<u8>)> {
+/// Runs a command, draining its output without retaining it.
+pub fn exec(uds: &Path, cmd: &str, timeout: Duration) -> Result<i32> {
     let at = Instant::now() + timeout;
     let s = crate::util::connect_unix(uds, timeout)?;
     let id = session_id()?;
     let mut r = handshake(By { s, at }, &format!("SESSION {id} {}", cmd.len()))?;
     r.get_mut().write_all(cmd.as_bytes())?;
-    let mut out = Vec::new();
-    let code = exec_output(&mut r, &id, |_, data| {
-        out.extend_from_slice(data);
-        Ok(())
-    })?;
+    let code = exec_output(&mut r, &id, |_, _| Ok(()))?;
     close(uds, &id, at)?;
-    Ok((code, out))
+    Ok(code)
 }
 
 fn now() -> Result<String> {
@@ -325,8 +322,9 @@ mod tests {
         });
         let (mut stream, _) = listener.accept().unwrap();
         stream.write_all(b"OK 1\n").unwrap();
-        for _ in 0..100 {
-            if write_frame(&mut stream, FRAME_MSG, b"waiting").is_err() {
+        let data = vec![b'x'; 64 << 10];
+        for i in 0..100 {
+            if write_frame(&mut stream, FRAME_STDOUT, &at(i * data.len() as u64, &data)).is_err() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
