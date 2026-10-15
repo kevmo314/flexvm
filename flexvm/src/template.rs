@@ -18,7 +18,7 @@ use crate::fc::Firecracker;
 use crate::guest;
 use crate::image::ImageMeta;
 use crate::socket::SocketRoot;
-use crate::util::{ms, retry, retry_every, Result, PAGE_SIZE};
+use crate::util::{ms, retry, Result, PAGE_SIZE};
 
 pub const BALLOON_STATS_S: u16 = 1;
 
@@ -457,7 +457,7 @@ fn record_working_set(paths: &Paths, name: &str, tap: &str, sockets: &Arc<Socket
     // Like VM restores: stepping the clock touches pages of its own.
     fc.load_snapshot(&tpl.vmstate(), tap, Some(true), crate::fc::API_TIMEOUT)?;
     fc.resume()?;
-    retry(Duration::from_secs(10), || guest::ping(&fc.sockets.vsock))?;
+    retry(Duration::from_secs(10), Duration::from_millis(10), || guest::ping(&fc.sockets.vsock))?;
     guest::start(&fc.sockets.vsock, "10.255.255.254".parse()?, None, &tpl.legacy_agent)?;
     if tpl.meta.image.as_ref().is_some_and(|i| !i.warm) {
         guest::start_app(&fc.sockets.vsock)?;
@@ -493,7 +493,7 @@ fn plug(fc: &Firecracker, mib: u64) -> Result<u64> {
         return Ok(0);
     }
     fc.patch("/hotplug/memory", json!({"requested_size_mib": mib}))?;
-    retry_every(Duration::from_secs(60), Duration::from_millis(10), || match fc.get("/hotplug/memory")?["plugged_size_mib"].as_u64() {
+    retry(Duration::from_secs(60), Duration::from_millis(10), || match fc.get("/hotplug/memory")?["plugged_size_mib"].as_u64() {
         Some(p) if p == mib => Ok(()),
         p => bail!("plugged {p:?} of {mib} MiB"),
     })?;
@@ -614,7 +614,7 @@ fn build(paths: &Paths, staging: &str, name: &str, vcpus: u32, mem_mib: u64, max
     fc.put("/network-interfaces/eth0", json!({"iface_id": "eth0", "host_dev_name": tap, "guest_mac": crate::net::GUEST_MAC}))?;
     fc.put("/entropy", json!({}))?;
     fc.put("/actions", json!({"action_type": "InstanceStart"}))?;
-    retry_every(Duration::from_secs(30), Duration::from_millis(10), || guest::ping(&vsock))?;
+    retry(Duration::from_secs(30), Duration::from_millis(10), || guest::ping(&vsock))?;
     let booted = start.elapsed();
     let plugged = plug(&fc, plug_mib.min(hotplug) / STEP_MIB * STEP_MIB)?;
 

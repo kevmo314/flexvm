@@ -135,8 +135,7 @@ impl Pager {
                     return false;
                 }
                 Err(Failed::Install(e)) => {
-                    let what = format!("background pull {t}: installing pages {i}+{n}");
-                    if !self.install_retry(i, n, &e, &what, &what) {
+                    if !self.install_retry(i, n, &e, &format!("background pull {t}: installing pages {i}+{n}")) {
                         return false;
                     }
                 }

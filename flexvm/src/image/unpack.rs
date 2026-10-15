@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 
 use crate::bail;
 use crate::util::Result;
-pub use crate::util::{cpath, stat_at};
+use crate::util::{cpath, stat_at};
 
 /// Budgets for one image build: bytes compressed, uncompressed and per file, and tar entries.
 #[derive(Debug, Clone, Copy)]

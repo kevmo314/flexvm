@@ -1770,7 +1770,7 @@ mod tests {
         drop(claim);
         relieve(&host, Some(0), false);
         use std::os::unix::process::ExitStatusExt;
-        let stopped = crate::util::retry(Duration::from_secs(10), || Ok(child.try_wait()?.ok_or("running")?));
+        let stopped = crate::util::retry(Duration::from_secs(10), Duration::from_millis(10), || Ok(child.try_wait()?.ok_or("running")?));
         let _ = child.kill();
         let _ = child.wait();
         assert!(pressure.exists() && stopped.unwrap().signal() == Some(libc::SIGUSR1));

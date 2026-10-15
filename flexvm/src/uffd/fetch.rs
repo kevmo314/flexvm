@@ -111,10 +111,10 @@ impl Pager {
     }
 
     /// Failure history stays with the pages, whoever claimed them, so no retry starts the deadline over.
-    pub(super) fn install_retry(&self, page: usize, n: usize, e: &io::Error, what: &str, failed: &str) -> bool {
+    pub(super) fn install_retry(&self, page: usize, n: usize, e: &io::Error, what: &str) -> bool {
         let since = self.pages().failing_since(page, n).unwrap_or_else(Instant::now);
         if since.elapsed() >= FAULT_TIMEOUT {
-            self.fail(format!("{failed}: {e}"));
+            self.fail(format!("{what}: {e}"));
             return false;
         }
         eprintln!("uffd: {what}: {e}; retrying");
@@ -205,7 +205,7 @@ impl Pager {
                 Err(Failed::Fetch(e)) => return self.fail(format!("fetching pages for a fault: {e}")),
                 Err(Failed::Install(e)) if self.unmapped(&e, page, n) => return self.gone(),
                 Err(Failed::Install(e)) => {
-                    if !self.install_retry(page, n, &e, &format!("installing pages {page}+{n} for a fault"), "installing pages for a fault") {
+                    if !self.install_retry(page, n, &e, &format!("installing pages {page}+{n} for a fault")) {
                         return;
                     }
                     // What went back to REMOTE may have no fault waiting on it any more (the faulting page went in

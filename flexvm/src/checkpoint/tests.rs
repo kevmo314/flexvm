@@ -1,14 +1,14 @@
 use super::{
     chain::{flatten, overlay, read_at, Link},
     format::{parse_pagemap, sum, sums_sum, Run, DATA, MAGIC, MAX_VMSTATE, TEMPLATE, ZERO},
-    staging::{exists_at, publish_permissions, STAGING_PREFIX},
+    staging::{publish_permissions, STAGING_PREFIX},
     write::{aligned, as_bytes, classify, write_pages, PagesFile},
     *,
 };
 use crate::{
     template::{Paths, Template},
     uffd::{Runs, BASE as P_BASE, REMOTE, ZERO as P_ZERO},
-    util::{Result, PAGE_SIZE},
+    util::{stat_at, Result, PAGE_SIZE},
 };
 use serde_json::json;
 use std::{
@@ -303,7 +303,7 @@ fn page_sync_and_pagemap_errors_leave_staging_unpublished() {
         assert_eq!(read_at(s.ck.as_raw_fd(), "pagemap", 10).unwrap().1, b"map");
         // O_EXCL failure must still join the pages' fsync.
         assert!(s.sync_pages_and_pagemap(&pages, b"replacement").is_err());
-        assert!(!exists_at(s.ck.as_raw_fd(), c"manifest.json"));
+        assert!(stat_at(s.ck.as_raw_fd(), c"manifest.json").is_none());
         assert!(!dest.exists());
     }
     {
@@ -311,7 +311,7 @@ fn page_sync_and_pagemap_errors_leave_staging_unpublished() {
         // /dev/null accepts writes but cannot be fsynced: propagate the worker's error.
         let pages = File::options().write(true).open("/dev/null").unwrap();
         assert!(s.sync_pages_and_pagemap(&pages, b"map").is_err());
-        assert!(!exists_at(s.ck.as_raw_fd(), c"manifest.json"));
+        assert!(stat_at(s.ck.as_raw_fd(), c"manifest.json").is_none());
         assert!(!dest.exists());
     }
     fs::remove_dir_all(&dir).unwrap();

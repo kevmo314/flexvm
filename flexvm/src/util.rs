@@ -112,17 +112,14 @@ pub fn locked(path: &Path, how: i32) -> Option<bool> {
     std::fs::File::open(path).ok().map(|f| crate::host::flock(&f, how | libc::LOCK_NB).is_err())
 }
 
-pub fn retry<T>(timeout: Duration, f: impl FnMut() -> Result<T>) -> Result<T> {
-    retry_every(timeout, Duration::from_micros(200), f)
-}
-
-pub fn retry_every<T>(timeout: Duration, sleep: Duration, mut f: impl FnMut() -> Result<T>) -> Result<T> {
+/// Calls `f` every `every` until it succeeds or `timeout` has passed.
+pub fn retry<T>(timeout: Duration, every: Duration, mut f: impl FnMut() -> Result<T>) -> Result<T> {
     let start = Instant::now();
     loop {
         match f() {
             Ok(v) => return Ok(v),
             Err(e) if start.elapsed() >= timeout => return Err(e),
-            Err(_) => std::thread::sleep(sleep),
+            Err(_) => std::thread::sleep(every),
         }
     }
 }

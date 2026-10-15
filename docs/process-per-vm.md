@@ -70,6 +70,8 @@ the suspend holds its session, recording in the checkpoint (`CMD`) the
 command, its guest session, how much of its output was written out and its
 exit status if it had one; `flexvm resume` reattaches it from there (or
 takes that status) and exits with its status.
+Its control socket serves `exec`, `checkpoint` and `migrate`, plus `claim` (a
+standby), `pages` (passed on by the listener) and `debug` (tests).
 
 ### Signals
 

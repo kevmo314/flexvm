@@ -75,7 +75,7 @@ impl Staging {
         let pfd = open_dir_at(libc::AT_FDCWD, &CString::new(parent_path.as_os_str().as_bytes())?)
             .map_err(|e| format!("checkpoint directory {}: {e}", parent_path.display()))?;
         let base = CString::new(base.as_bytes())?;
-        ensure!(!exists_at(pfd.as_raw_fd(), &base), "{} already exists; checkpoints are never overwritten", dest.display());
+        ensure!(crate::util::stat_at(pfd.as_raw_fd(), &base).is_none(), "{} already exists; checkpoints are never overwritten", dest.display());
         // Its directory's own entry, up to the root, ahead of the pause; `commit` walks again, as then.
         crate::util::sync_ancestors_fd(pfd.as_raw_fd()).map_err(|e| format!("checkpoint directory {}: {e}", parent_path.display()))?;
         check(unsafe { libc::flock(pfd.as_raw_fd(), libc::LOCK_EX) })?;
@@ -298,10 +298,6 @@ fn empty_dir(dir: RawFd) -> io::Result<()> {
 /// Whether `fd` is ours and nobody else may enter it, as staging is made.
 fn private_dir(fd: RawFd) -> bool {
     fstat(fd).is_ok_and(|st| st.st_uid == unsafe { libc::geteuid() } && st.st_mode & 0o077 == 0)
-}
-
-pub(super) fn exists_at(dir: RawFd, name: &CStr) -> bool {
-    crate::util::stat_at(dir, name).is_some()
 }
 
 fn clear_stale(parent: &OwnedFd) {
