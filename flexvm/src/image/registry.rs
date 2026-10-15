@@ -122,7 +122,7 @@ impl Registry {
         // Anywhere else gets an anonymous token request.
         match &self.basic {
             Some(b) if self.trusted(&realm) => req = req.set("Authorization", &format!("Basic {b}")),
-            Some(_) => eprintln!("image: not sending credentials to untrusted token realm {realm}"),
+            Some(_) => crate::log!("image: not sending credentials to untrusted token realm {realm}"),
             None => {}
         }
         let body: Value = match req.call() {
@@ -168,7 +168,7 @@ fn cached_blob<R: Read>(digest: &str, size: u64, blobs: &Path, download: impl Fn
             sync_dir(&dir)?;
             return Ok(path);
         }
-        eprintln!("image: cached blob {digest} is corrupt; downloading it again");
+        crate::log!("image: cached blob {digest} is corrupt; downloading it again");
     }
     let mut r = Hashed::new(download()?.take(size.saturating_add(1)));
     super::replace(&path, |f| {

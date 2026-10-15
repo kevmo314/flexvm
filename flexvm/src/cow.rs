@@ -275,7 +275,7 @@ impl Cow {
     pub fn invalidate(&self, why: &str) {
         let mut e = self.error.lock().unwrap();
         if e.is_none() {
-            eprintln!("uffd: checkpoint copy invalidated: {why}");
+            crate::log!("uffd: checkpoint copy invalidated: {why}");
             *e = Some(why.into());
         }
         drop(e);

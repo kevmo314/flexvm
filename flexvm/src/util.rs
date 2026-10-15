@@ -15,6 +15,15 @@ macro_rules! bail {
     ($($arg:tt)*) => { return Err(format!($($arg)*).into()) };
 }
 
+/// Writes a diagnostic line without panicking if stderr is closed or unavailable.
+#[macro_export]
+macro_rules! log {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
+
 /// One bounded counter slot, released on drop.
 pub struct Slot(&'static AtomicUsize);
 
@@ -333,7 +342,7 @@ pub fn readable(fd: &impl AsRawFd, timeout: Duration) -> io::Result<bool> {
 /// peer gone) returns; anything else (out of fds) waits rather than spins.
 pub fn accept_failed(what: &str, e: &io::Error) {
     if !matches!(e.kind(), io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted) {
-        eprintln!("{what}: accept: {e}");
+        crate::log!("{what}: accept: {e}");
         std::thread::sleep(Duration::from_millis(100));
     }
 }

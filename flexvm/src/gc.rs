@@ -52,7 +52,7 @@ pub fn sweep(host: &Host) {
         return;
     }
     if let Err(e) = host.collect_garbage() {
-        eprintln!("garbage collection: {e}");
+        crate::log!("garbage collection: {e}");
     }
     vm_files(host);
     for e in std::fs::read_dir(host.run.join("standby")).into_iter().flatten().flatten() {

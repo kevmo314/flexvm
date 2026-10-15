@@ -463,7 +463,7 @@ impl Proc {
         match self.holder().map(|h| h.hold(vm.ip, id)) {
             Some(Ok(())) => true,
             Some(Err(e)) => {
-                eprintln!("vm {}: not holding packets during {what}: {e}", vm.name);
+                crate::log!("vm {}: not holding packets during {what}: {e}", vm.name);
                 false
             }
             None => false,
@@ -474,7 +474,7 @@ impl Proc {
         self.holder
             .get_or_init(|| {
                 Holder::new(&format!("{}{:x}h", self.prefix, self.ident.pid)).unwrap_or_else(|e| {
-                    eprintln!("packets in flight while the vm is paused will be dropped: {e}");
+                    crate::log!("packets in flight while the vm is paused will be dropped: {e}");
                     None
                 })
             })
@@ -487,7 +487,7 @@ impl Proc {
         let _publishing = self.publishing.lock().unwrap();
         let (Some(vm), Some(n)) = (self.vm.get(), self.name.lock().unwrap().as_ref().map(|n| n.name.clone())) else { return };
         if fault("publish") {
-            return eprintln!("vm {n}: registry: injected fault: not published");
+            return crate::log!("vm {n}: registry: injected fault: not published");
         }
         let e = Entry {
             name: n.clone(),
@@ -505,7 +505,7 @@ impl Proc {
             cmd: self.cmd.lock().unwrap().is_some(),
         };
         if let Err(e) = self.name.lock().unwrap().as_ref().map_or(Ok(()), |l| l.publish(&e)) {
-            eprintln!("vm {n}: registry: {e}");
+            crate::log!("vm {n}: registry: {e}");
         }
     }
 
@@ -533,7 +533,7 @@ impl Proc {
             (End::NotStarted, Some(a)) if a.fresh => self.withdraw(a),
             (End::Moved(to), _) => {
                 let _ = std::fs::write(self.host.vms(&self.name(), "moved"), &to);
-                eprintln!("vm {}: moved to {to}", self.name());
+                crate::log!("vm {}: moved to {to}", self.name());
             }
             // Never ran here: a peer's route for it (say its source's) comes back.
             (_, Some(a)) => {
@@ -604,7 +604,7 @@ impl Proc {
         let (ip, gen, rev, peers, dev) = (vm.ip, self.gen(), self.rev(), cfg.peers.clone(), cfg.announce_dev.clone());
         let Some(via) = cfg.underlay() else {
             if !peers.is_empty() {
-                eprintln!("announce {ip}: no underlay address (give flexvm listen an ADDR peers can reach, or --underlay IP); peers not told");
+                crate::log!("announce {ip}: no underlay address (give flexvm listen an ADDR peers can reach, or --underlay IP); peers not told");
             }
             return;
         };
@@ -612,7 +612,7 @@ impl Proc {
             let here = || vm.state().local();
             let arp = || {
                 if let Some(dev) = dev.as_deref().filter(|_| here()) {
-                    crate::net::gratuitous_arp(dev, ip).unwrap_or_else(|e| eprintln!("announce {ip}: {e}"));
+                    crate::net::gratuitous_arp(dev, ip).unwrap_or_else(|e| crate::log!("announce {ip}: {e}"));
                 }
             };
             arp();
@@ -625,7 +625,7 @@ impl Proc {
                     let req = req.clone();
                     thread::spawn(move || {
                         if let Err(e) = peer_call(&peer, req) {
-                            eprintln!("announce {ip} to {peer}: {e}");
+                            crate::log!("announce {ip} to {peer}: {e}");
                         }
                     })
                 })
@@ -709,7 +709,7 @@ impl Proc {
         let _ = std::fs::remove_file(&sock);
         let l = match UnixListener::bind(&sock) {
             Ok(l) => l,
-            Err(e) => return eprintln!("vm {}: no control socket at {}: {e}", self.name(), sock.display()),
+            Err(e) => return crate::log!("vm {}: no control socket at {}: {e}", self.name(), sock.display()),
         };
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600));
@@ -789,13 +789,13 @@ impl Proc {
             libc::SIGCONT if self.leaving.load(Ordering::SeqCst) || !self.paused_by_request.load(Ordering::SeqCst) => Ok(()),
             libc::SIGCONT => self.resume().map(drop),
             libc::SIGTERM if matches!(vm.state(), State::Source(_)) => {
-                eprintln!("vm {}: migrating away; it ends once the target has its memory", vm.name);
+                crate::log!("vm {}: migrating away; it ends once the target has its memory", vm.name);
                 Ok(())
             }
             libc::SIGTERM => match self.arc() {
                 // Off the signal thread, which a later SIGINT needs.
                 Some(p) => {
-                    thread::spawn(move || eprintln!("vm {}: signal {sig}: {}", p.name(), p.suspend()));
+                    thread::spawn(move || crate::log!("vm {}: signal {sig}: {}", p.name(), p.suspend()));
                     Ok(())
                 }
                 None => Err(self.suspend()),
@@ -804,7 +804,7 @@ impl Proc {
             _ => Ok(()),
         };
         if let Err(e) = res {
-            eprintln!("vm {}: signal {sig}: {e}", vm.name);
+            crate::log!("vm {}: signal {sig}: {e}", vm.name);
         }
     }
 
@@ -860,7 +860,7 @@ impl Proc {
             crate::uffd::serve_pages(&vm.pager, &s, &s, || fault("pages") || Some(vm.state()) != source, pace)
         });
         if let Err(e) = served {
-            eprintln!("vm {}: page server: {e}", vm.name);
+            crate::log!("vm {}: page server: {e}", vm.name);
         }
     }
 
@@ -966,7 +966,7 @@ impl Proc {
     pub fn end_died(&self, op: &Op) -> ! {
         let vm = self.vm();
         let why = format!("{}; {}", vm.pager.failed().unwrap_or("its firecracker exited"), vm.post_mortem());
-        eprintln!("vm {}: died: {why}", vm.name);
+        crate::log!("vm {}: died: {why}", vm.name);
         let _ = std::fs::write(self.host.vms(&vm.name, "failed"), &why);
         self.finish(op, End::Died, DIED, None)
     }
@@ -987,13 +987,13 @@ impl Proc {
             if let Ok(_op) = self.op.try_lock() {
                 if vm.release_pending() && matches!(vm.state(), State::Running | State::Paused) {
                     match vm.release_reports(Duration::from_millis(500)) {
-                        Ok(()) => eprintln!("vm {}: released free page reports", vm.name),
-                        Err(e) => eprintln!("vm {}: releasing free page reports: {e}", vm.name),
+                        Ok(()) => crate::log!("vm {}: released free page reports", vm.name),
+                        Err(e) => crate::log!("vm {}: releasing free page reports: {e}", vm.name),
                     }
                 }
             }
             if let Err(e) = self.resize(None) {
-                eprintln!("vm {}: resize: {e}", vm.name);
+                crate::log!("vm {}: resize: {e}", vm.name);
             }
             // An arrival's pull is not growth.
             let used = vm.limit.used().unwrap_or_else(|| vm.rss() >> 20);
@@ -1035,7 +1035,7 @@ impl Proc {
         let _ = std::fs::remove_file(vm.mem_sock());
         let listener = match UnixListener::bind(vm.mem_sock()) {
             Ok(l) => l,
-            Err(e) => return eprintln!("vm {}: memory requests: {e}", vm.name),
+            Err(e) => return crate::log!("vm {}: memory requests: {e}", vm.name),
         };
         let mut acted: Option<Instant> = None;
         for conn in listener.incoming() {
@@ -1061,7 +1061,7 @@ impl Proc {
                     Ok(Resized::Same) => "ok",
                     Ok(Resized::Busy) => "busy",
                     Err(e) => {
-                        eprintln!("vm {}: resize on request: {e}", vm.name);
+                        crate::log!("vm {}: resize on request: {e}", vm.name);
                         "busy"
                     }
                 }
@@ -1081,10 +1081,10 @@ impl Proc {
                     if let (guest::FRAME_LOST, Ok(at)) = (kind, <[u8; 8]>::try_from(&data[..data.len().min(8)])) {
                         let (at, was) = (u64::from_le_bytes(at), self.app_log.load(Ordering::SeqCst));
                         if at > was {
-                            eprintln!("vm {}: {} bytes of app output lost (the guest keeps its last 1 MiB)", vm.name, at - was);
+                            crate::log!("vm {}: {} bytes of app output lost (the guest keeps its last 1 MiB)", vm.name, at - was);
                         } else if at < was {
                             // Only an offset past the guest's output (a bad migration header or manifest) moves back.
-                            eprintln!(
+                            crate::log!(
                                 "vm {}: app output offset {was} is past the guest's end {at}; going on from there (output before it may be missing)",
                                 vm.name
                             );
@@ -1095,7 +1095,7 @@ impl Proc {
                     if kind == guest::FRAME_MSG {
                         let status = String::from_utf8_lossy(&data);
                         if !status.starts_with("running") {
-                            eprintln!("vm {}: app {}", vm.name, status.rsplit_once(' ').map(|(s, _)| s).unwrap_or(&status));
+                            crate::log!("vm {}: app {}", vm.name, status.rsplit_once(' ').map(|(s, _)| s).unwrap_or(&status));
                             vm.untrack_exec(id);
                             return;
                         }
@@ -1133,11 +1133,11 @@ impl Proc {
                 continue;
             }
             let code = res.unwrap_or_else(|e| {
-                eprintln!("vm {}: {e}", self.name());
+                crate::log!("vm {}: {e}", self.name());
                 FAILED
             });
             // Holding `suspending`: no suspend starts until the VM is gone (or the kill refused).
-            return eprintln!("vm {}: {}", self.name(), self.destroy(code));
+            return crate::log!("vm {}: {}", self.name(), self.destroy(code));
         }
     }
 
@@ -1181,10 +1181,10 @@ impl Proc {
             vm.clock_pending.store(false, Ordering::SeqCst);
             match res {
                 Ok(Some(off)) if off.abs() > CLOCK_TOLERANCE.as_secs_f64() * 1e3 => {
-                    eprintln!("vm {}: guest clock was {off:.1} ms off after resuming; stepped it", vm.name)
+                    crate::log!("vm {}: guest clock was {off:.1} ms off after resuming; stepped it", vm.name)
                 }
                 Ok(_) => {}
-                Err(e) => eprintln!("vm {}: checking the guest clock: {e}", vm.name),
+                Err(e) => crate::log!("vm {}: checking the guest clock: {e}", vm.name),
             }
         });
     }
@@ -1208,7 +1208,7 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
     let _ = crate::net::sysctl("net.ipv4.ip_forward", "1");
     if let Some(dev) = &host.cfg.announce_dev {
         if let Err(e) = crate::net::sysctl(&format!("net.ipv4.conf.{dev}.proxy_arp"), "1") {
-            eprintln!("WARNING: proxy ARP on {dev}: {e}");
+            crate::log!("WARNING: proxy ARP on {dev}: {e}");
         }
     }
     let p = Proc::new(host, paths)?;
@@ -1243,7 +1243,7 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
                 match crate::listen::finish_incoming_log(&p.host, &p.name(), &log, res.is_ok()) {
                     Ok(()) if res.is_ok() => crate::util::output::published(&p.host.vms(&p.name(), "log")),
                     Ok(()) => {}
-                    Err(e) => eprintln!("arrival log {}: {e}", log.display()),
+                    Err(e) => crate::log!("arrival log {}: {e}", log.display()),
                 }
             }
             res.map(|()| Value::Null)
@@ -1261,11 +1261,11 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
     };
     match notify.take() {
         Some(mut f) => drop(send_json(&mut f, &reply)),
-        None if res.is_ok() && !reply["result"].is_null() => eprintln!("{}", reply["result"]),
+        None if res.is_ok() && !reply["result"].is_null() => crate::log!("{}", reply["result"]),
         None => {}
     }
     if let Err(e) = res {
-        eprintln!("flexvm: {e}");
+        crate::log!("flexvm: {e}");
         p.finish(&op, End::NotStarted, FAILED, None);
     }
     drop(op);
@@ -1289,7 +1289,7 @@ pub fn cgroup_root() -> Option<PathBuf> {
     match setup() {
         Ok(()) => Some(root),
         Err(e) if !WARNED.swap(true, Ordering::Relaxed) => {
-            eprintln!("WARNING: per-VM cgroups unavailable: {e}");
+            crate::log!("WARNING: per-VM cgroups unavailable: {e}");
             None
         }
         Err(_) => None,
@@ -1350,7 +1350,7 @@ fn resize(vm: &Vm, host: &Host, hint: Option<u64>, grow_only: bool) -> Result<Re
         } else {
             "tick"
         };
-        eprintln!("vm {}: available {avail} MiB, hotplug {requested} (plugged {plugged}) -> {new} MiB ({why})", vm.name);
+        crate::log!("vm {}: available {avail} MiB, hotplug {requested} (plugged {plugged}) -> {new} MiB ({why})", vm.name);
         if new > requested {
             vm.limit.plug(meta.mem_mib + new, if refused { 0 } else { plan.charge });
         }
@@ -1567,10 +1567,10 @@ fn relieve(host: &Host, avail: Option<u64>, starved_here: bool, stopping: &mut O
     let pressure = avail < until && (evicting || avail < at);
     if pressure && !evicting {
         let _ = std::fs::write(&active, b"");
-        eprintln!("host has {avail} MiB available, under its {at} MiB high-water mark ({reserve} MiB reserve): moving vms to peers until it has {until} MiB");
+        crate::log!("host has {avail} MiB available, under its {at} MiB high-water mark ({reserve} MiB reserve): moving vms to peers until it has {until} MiB");
     } else if !pressure && evicting {
         let _ = std::fs::remove_file(&active);
-        eprintln!("host has {avail} MiB available, {until} MiB or more: eviction stops");
+        crate::log!("host has {avail} MiB available, {until} MiB or more: eviction stops");
     }
     if !pressure && !starved_here {
         return;
@@ -1601,7 +1601,7 @@ fn relieve(host: &Host, avail: Option<u64>, starved_here: bool, stopping: &mut O
             Ok(w) => w,
             Err(e) => {
                 EVICTING.store(false, Ordering::SeqCst);
-                return eprintln!("eviction: {e}");
+                return crate::log!("eviction: {e}");
             }
         };
         evict(&host, &cfg.peers, &vms, avail, Instant::now() + EVICT_DEADLINE);
@@ -1631,7 +1631,7 @@ fn stop_standby(host: &Host, avail: u64, reserve: u64, stopping: &mut Option<Sto
         }
         *stopping = None;
         if stopped > 0 {
-            eprintln!("host has {avail} MiB available, under its {reserve} MiB reserve: stopped {stopped} standby vms");
+            crate::log!("host has {avail} MiB available, under its {reserve} MiB reserve: stopped {stopped} standby vms");
         }
         return stopped > 0;
     }
@@ -1673,15 +1673,15 @@ fn evict(host: &Host, peers: &[String], vms: &[Entry], avail: u64, deadline: Ins
             if Instant::now() >= deadline {
                 return;
             }
-            eprintln!("vm {}: {why} ({avail} MiB available); migrating to {peer}", vm.name);
+            crate::log!("vm {}: {why} ({avail} MiB available); migrating to {peer}", vm.name);
             match call(host, &vm.name, json!({"op": "migrate", "to": peer, "if_idle": true, "evict": true}), Some(deadline)) {
                 Ok(_) => {
                     backoff.remove(&key);
                     let _ = crate::host::store(&backoff_path, &backoff, false);
-                    eprintln!("vm {}: migrated to {peer}", vm.name);
+                    crate::log!("vm {}: migrated to {peer}", vm.name);
                     while host.entry(&vm.name).is_ok_and(|e| e.ident == vm.ident) {
                         if Instant::now() >= deadline {
-                            return eprintln!("vm {}: its copy here still serves pages to {peer} at the eviction's deadline", vm.name);
+                            return crate::log!("vm {}: its copy here still serves pages to {peer} at the eviction's deadline", vm.name);
                         }
                         thread::sleep(Duration::from_millis(100));
                     }
@@ -1690,10 +1690,10 @@ fn evict(host: &Host, peers: &[String], vms: &[Entry], avail: u64, deadline: Ins
                 Err(e) if e.to_string().contains(BUSY) => break,
                 // No answer is no refusal: the VM may still be migrating (busy to the next decider).
                 Err(e) if Instant::now() >= deadline => {
-                    return eprintln!("vm {}: migrating to {peer}: no answer by the eviction's deadline: {e}", vm.name);
+                    return crate::log!("vm {}: migrating to {peer}: no answer by the eviction's deadline: {e}", vm.name);
                 }
                 Err(e) => {
-                    eprintln!("vm {}: migrating to {peer}: {e}", vm.name);
+                    crate::log!("vm {}: migrating to {peer}: {e}", vm.name);
                     backoff.entry(key).or_default().refuse(eviction_time());
                     if crate::host::store(&backoff_path, &backoff, false).is_err() {
                         return;

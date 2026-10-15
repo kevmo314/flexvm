@@ -147,7 +147,7 @@ impl Pager {
         *spare = None;
         match Buf::new(want) {
             Ok(b) => *spare = Some(b),
-            Err(e) => eprintln!("uffd: no memory for hot pages ({want} pages): {e}"),
+            Err(e) => crate::log!("uffd: no memory for hot pages ({want} pages): {e}"),
         }
     }
 
@@ -172,7 +172,7 @@ impl Pager {
         // Taken: unless this checkpoint is taken, the next one has nothing to compare with.
         let prev = self.hot_prev.lock().unwrap().take();
         let read = |p: usize, dst: &mut [u8]| self.read_at((p * PAGE_SIZE) as u64, &[libc::iovec { iov_base: dst.as_mut_ptr().cast(), iov_len: dst.len() }]);
-        copy(buf, prev, hot, |p| next_to(self.mappings(), p), read).inspect_err(|e| eprintln!("uffd: hot pages not copied, protecting them: {e}")).ok()
+        copy(buf, prev, hot, |p| next_to(self.mappings(), p), read).inspect_err(|e| crate::log!("uffd: hot pages not copied, protecting them: {e}")).ok()
     }
 
     /// The memory of hot pages no checkpoint needs any more is the next one's (`prepare_hot`), unless it has larger.

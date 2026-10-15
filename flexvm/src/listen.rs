@@ -34,13 +34,13 @@ pub fn main(host: Host, listener: TcpListener) -> Result<()> {
     if let Some(dev) = &host.cfg.announce_dev {
         crate::net::sysctl(&format!("net.ipv4.conf.{dev}.proxy_arp"), "1")?;
     }
-    eprintln!("flexvm listening on {}", listener.local_addr()?);
+    crate::log!("flexvm listening on {}", listener.local_addr()?);
     crate::standby::maintain(host.clone());
     crate::gc::periodic(host.clone());
     let peers = Peers::watch(host.clone());
     // Refusals are logged off the accept loop, never waiting on stderr: past 64 queued, dropped.
     let (refusals, queued) = std::sync::mpsc::sync_channel::<String>(64);
-    std::thread::spawn(move || queued.into_iter().for_each(|e| eprintln!("peer request: {e}")));
+    std::thread::spawn(move || queued.into_iter().for_each(|e| crate::log!("peer request: {e}")));
     let host = std::sync::Arc::new(host);
     for conn in listener.incoming() {
         // Everything a request does before it is read, checking its peer
@@ -68,7 +68,7 @@ pub fn main(host: Host, listener: TcpListener) -> Result<()> {
             let _slot = slot;
             let _ = conn.set_nodelay(true);
             if let Err(e) = handle(&host, conn, deadline) {
-                eprintln!("peer request: {e}");
+                crate::log!("peer request: {e}");
             }
         });
     }
@@ -356,7 +356,7 @@ fn route(host: &Host, req: &Value) -> Result<Value> {
     };
     if let Some(via) = via.filter(|_| fault("route_stall")) {
         // Test hook: an announcement held up (as by a slow network) while armed.
-        eprintln!("route {ip} via {via}: held up (injected fault)");
+        crate::log!("route {ip} via {via}: held up (injected fault)");
         while fault("route_stall") {
             std::thread::sleep(Duration::from_millis(10));
         }

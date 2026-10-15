@@ -54,6 +54,8 @@ mod pull;
 mod server;
 #[cfg(test)]
 mod tests;
+// TODO(#284): convert this module to log! before removing the allowance.
+#[allow(clippy::print_stderr)]
 mod wp;
 
 pub use event::FaultStats;
@@ -718,12 +720,12 @@ impl Pager {
     /// (or snapshot load) may be blocked on pages that will never come.
     fn fail(&self, why: String) {
         if !self.stop.load(Ordering::SeqCst) {
-            eprintln!("uffd: {why}; killing the vm");
+            crate::log!("uffd: {why}; killing the vm");
             let _ = self.failed.set(PagerFailure::Lost(why));
             match self.pidfd.get().map(crate::util::pidfd_kill) {
                 Some(Ok(())) => {}
-                Some(Err(e)) => eprintln!("uffd: cannot kill firecracker: {e}"),
-                None => eprintln!("uffd: no firecracker to kill"),
+                Some(Err(e)) => crate::log!("uffd: cannot kill firecracker: {e}"),
+                None => crate::log!("uffd: no firecracker to kill"),
             }
         }
         self.stop();
@@ -757,7 +759,7 @@ impl Pager {
     fn gone(&self) {
         // Once, though every puller runs into it.
         if !self.stop.load(Ordering::SeqCst) && self.failed.set(PagerFailure::Gone).is_ok() {
-            eprintln!("uffd: firecracker unmapped guest memory; killing it unless it exits within {UNMAPPED_GRACE:?}");
+            crate::log!("uffd: firecracker unmapped guest memory; killing it unless it exits within {UNMAPPED_GRACE:?}");
             if let Some(fd) = self.pidfd.get().and_then(|fd| fd.try_clone().ok()) {
                 thread::spawn(move || {
                     if !crate::util::readable(&fd, UNMAPPED_GRACE).unwrap_or(false) {

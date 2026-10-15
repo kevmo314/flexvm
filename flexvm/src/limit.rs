@@ -85,7 +85,7 @@ impl Limit {
             false => ((m.admitted + overhead(m.admitted)) << 20).to_string(),
         };
         if let Err(e) = std::fs::write(cg.join("memory.high"), high) {
-            eprintln!("{}: setting memory.high: {e}", cg.display());
+            crate::log!("{}: setting memory.high: {e}", cg.display());
         }
     }
 
@@ -129,7 +129,7 @@ impl Limit {
                 return false;
             }
             Err(e) => {
-                eprintln!("admitting {more} MiB: {e}");
+                crate::log!("admitting {more} MiB: {e}");
                 return false;
             }
         };

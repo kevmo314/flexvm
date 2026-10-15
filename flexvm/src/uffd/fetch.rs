@@ -117,7 +117,7 @@ impl Pager {
             self.fail(format!("{what}: {e}"));
             return false;
         }
-        eprintln!("uffd: {what}: {e}; retrying");
+        crate::log!("uffd: {what}: {e}; retrying");
         thread::sleep(BACKOFF_MIN);
         true
     }
@@ -434,7 +434,7 @@ impl Link {
             return Err(io::Error::new(io::ErrorKind::TimedOut, FetchFailure::SourceLost(why)));
         }
         if self.backoff == BACKOFF_MIN {
-            eprintln!("uffd: page fetch from {} failed, reconnecting: {e}", self.source.addr);
+            crate::log!("uffd: page fetch from {} failed, reconnecting: {e}", self.source.addr);
         }
         self.retry_at = Instant::now() + self.backoff;
         self.backoff = (self.backoff * 2).min(BACKOFF_MAX);

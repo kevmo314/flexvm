@@ -244,7 +244,7 @@ impl Pager {
                         p.parked = false;
                         match p.since {
                             None => {
-                                eprintln!("uffd: fault at {:#x}: {e}; retrying", p.addr);
+                                crate::log!("uffd: fault at {:#x}: {e}; retrying", p.addr);
                                 p.since = Some(Instant::now());
                             }
                             Some(t) if t.elapsed() < FAULT_TIMEOUT => {}

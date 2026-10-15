@@ -124,7 +124,7 @@ fn runs(h: &Hosts, args: &Args, template: &str, date: &str) -> Result<Value> {
         if i >= warmup {
             samples.push(sample);
         }
-        eprintln!("bench: {}/{}{}", i + 1, warmup + iterations, if i < warmup { " (warmup)" } else { "" });
+        crate::log!("bench: {}/{}{}", i + 1, warmup + iterations, if i < warmup { " (warmup)" } else { "" });
         // Let standby VMs refill between trials; misses show up as cold runs.
         thread::sleep(settle);
     }
@@ -227,7 +227,7 @@ fn lifecycle(h: &Hosts, args: &Args, template: &str, dir: &str, date: &str) -> R
             h.kill(&name);
             let _ = std::fs::remove_dir_all(&ck);
             samples.push(res.map_err(|e| format!("{mib} MiB, trial {}: {e}", i + 1))?);
-            eprintln!("bench: {mib} MiB {}/{iterations}", i + 1);
+            crate::log!("bench: {mib} MiB {}/{iterations}", i + 1);
         }
         let mut s = Map::new();
         for group in ["pause", "checkpoint", "restore", "suspend", "resume_suspended"] {

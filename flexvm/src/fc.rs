@@ -388,7 +388,7 @@ impl Spawner {
         if std::env::var("FLEXVM_FAULTS").is_ok_and(|v| v == "1") {
             let path = dir.join("metrics.json");
             if let Err(e) = File::create(&path).map_err(Into::into).and_then(|_| fc.put("/metrics", serde_json::json!({"metrics_path": path}))) {
-                eprintln!("firecracker {}: no metrics: {e}", fc.pid());
+                crate::log!("firecracker {}: no metrics: {e}", fc.pid());
             }
         }
         if let Some(cg) = cgroup.clone() {
@@ -402,12 +402,12 @@ impl Spawner {
                         std::io::ErrorKind::NotFound => Ok(()),
                         _ => Err(e),
                     }) {
-                        eprintln!("firecracker {pid}: its memory may be swapped ({}): {e}", cg.display());
+                        crate::log!("firecracker {pid}: its memory may be swapped ({}): {e}", cg.display());
                     }
                     std::fs::write(cg.join("cgroup.procs"), pid.to_string())
                 });
                 if let Err(e) = joined {
-                    eprintln!("firecracker {pid}: no cgroup of its own ({}): {e}", cg.display());
+                    crate::log!("firecracker {pid}: no cgroup of its own ({}): {e}", cg.display());
                 }
             }));
         }
