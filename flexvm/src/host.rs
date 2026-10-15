@@ -949,19 +949,34 @@ impl Host {
 
     /// Recorded durably before the source process ends: its address stays lent
     /// until `settle_owed` learns the outcome.
+    /// Test fault `owe_fail`: it fails, as on a full disk.
     pub fn owe(&self, id: u64, o: &Owed) -> Result<()> {
+        if fault("owe_fail") {
+            bail!("injected fault: recording the owed outcome failed");
+        }
         store(&self.owed_path(id), o, true)
+    }
+
+    /// Owed records by id; anything else there (a write's `.ID.PID.tmp`) is not one.
+    fn owed_ids(&self) -> std::io::Result<Vec<(u64, PathBuf)>> {
+        let ids = std::fs::read_dir(self.state.join("owed"))?
+            .filter_map(|e| {
+                let e = e.ok()?;
+                let name = e.file_name().into_string().ok()?;
+                (!name.is_empty() && name.bytes().all(|b| b.is_ascii_digit())).then(|| Some((name.parse().ok()?, e.path())))?
+            })
+            .collect();
+        Ok(ids)
     }
 
     /// Whether an outcome is still owed for the source process `by`: its target
     /// must keep its record (the source host asks about it), as if `by` lived.
     /// What cannot be read counts as owed.
     pub fn owes(&self, by: &Ident) -> bool {
-        let dir = match std::fs::read_dir(self.state.join("owed")) {
-            Ok(d) => d,
-            Err(e) => return e.kind() != std::io::ErrorKind::NotFound,
-        };
-        dir.into_iter().any(|e| e.map_or(true, |e| load::<Owed>(&e.path()).map_or(true, |o| o.is_some_and(|o| o.by == *by))))
+        match self.owed_ids() {
+            Ok(ids) => ids.iter().any(|(_, path)| load::<Owed>(path).map_or(true, |o| o.is_some_and(|o| o.by == *by))),
+            Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+        }
     }
 
     /// Asks each owed migration's target (five a pass, an unreachable one once): once
@@ -993,10 +1008,10 @@ impl Host {
         if flock(&lock, libc::LOCK_EX | libc::LOCK_NB).is_err() {
             return;
         }
+        self.owed_debris();
         let cursor = self.run.join(".owed.next");
         let last = load::<u64>(&cursor).ok().flatten();
-        let mut ids: Vec<u64> =
-            std::fs::read_dir(self.state.join("owed")).into_iter().flatten().flatten().filter_map(|e| e.file_name().to_str()?.parse().ok()).collect();
+        let mut ids: Vec<u64> = self.owed_ids().unwrap_or_default().into_iter().map(|(id, _)| id).collect();
         ids.sort_unstable();
         let start = last.map_or(0, |last| ids.partition_point(|id| *id <= last));
         ids.rotate_left(start);
@@ -1051,6 +1066,61 @@ impl Host {
     /// `mig_status` would answer), and released ones whose source process is
     /// proven gone (killed before its `done`) by its own host's listener. Any
     /// doubt keeps the record: a source that still waits must find it.
+    /// An interrupted `owe`'s `.ID.PID.tmp`, once its writer is gone.
+    fn owed_debris(&self) {
+        for e in std::fs::read_dir(self.state.join("owed")).into_iter().flatten().flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let Some(pid) =
+                name.strip_prefix('.').and_then(|n| n.strip_suffix(".tmp")).and_then(|n| n.rsplit_once('.')).and_then(|(_, p)| p.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            if !Path::new("/proc").join(pid.to_string()).exists() {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+
+    /// `flexvm reclaim IP --force`: an address lent out with a VM that migrated away, taken
+    /// back: its generation withdrawn here (the peers are told by the caller) and any
+    /// outcome owed for it forgotten. Only for a target known to be gone for good (the VM
+    /// is not running there): a VM still running with the address would share it.
+    /// Returns the generation withdrawn and the migrations forgotten.
+    pub fn reclaim(&self, ip: Ipv4Addr) -> Result<Lent> {
+        let l = self.lock()?;
+        let a = self.addr(&l, ip)?;
+        let Some(gen) = a.lent else { bail!("{ip} is not lent out") };
+        if let Some(h) = self.holder(&l, ip)? {
+            bail!("{ip} is held by vm {h} here");
+        }
+        let owed: Vec<(u64, PathBuf, Owed)> =
+            self.owed_ids()?.into_iter().filter_map(|(id, path)| Some((id, path.clone(), load::<Owed>(&path).ok()??))).filter(|(_, _, o)| o.ip == ip).collect();
+        // Withdrawn first: a crash before the records go leaves them to settle as aborted (a withdrawal again).
+        let current = self.observe(&l, ip, gen, 0, None)?;
+        self.unlend(&l, ip, gen)?;
+        if current && !self.reinstall(&l, ip, None)? {
+            crate::net::unroute(ip);
+        }
+        for (_, path, _) in &owed {
+            crate::util::unlink_durably(path)?;
+        }
+        Ok((gen, owed.into_iter().map(|(id, _, o)| (id, o.to)).collect()))
+    }
+
+    /// What `reclaim` would take back: the generation lent and the migrations owed for `ip`.
+    pub fn lent_to(&self, ip: Ipv4Addr) -> Result<Option<Lent>> {
+        let l = self.lock()?;
+        let Some(gen) = self.addr(&l, ip)?.lent else { return Ok(None) };
+        let owed = self
+            .owed_ids()?
+            .into_iter()
+            .filter_map(|(id, path)| Some((id, load::<Owed>(&path).ok()??)))
+            .filter(|(_, o)| o.ip == ip)
+            .map(|(id, o)| (id, o.to))
+            .collect();
+        Ok(Some((gen, owed)))
+    }
+
     pub fn retire_migrations(&self) {
         // At most five records (and thus five two-second peer calls) per pass.
         self.retire_migrations_with(5, |source, by| {
@@ -1193,6 +1263,9 @@ pub enum Mig {
         by: Option<Ident>,
     },
 }
+
+/// A loan: its generation, and the migrations (id, target) whose outcome is owed for it.
+pub type Lent = (u64, Vec<(u64, String)>);
 
 /// An outcome owed (`Host::owe`): migration away to `to` of `ip` at generation `gen`, by source process `by`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2330,6 +2403,50 @@ mod tests {
         assert!(!h.owed_path(8).exists() && lent(&h).is_none());
         let a = h.addr(&h.lock().unwrap(), x).unwrap();
         assert!(a.withdrawn && a.seen == gen);
+        let _w = h.take_name("w", false).unwrap();
+        assert!(h.claim_new(&h.lock().unwrap(), "w", Some(x)).unwrap().gen > gen);
+    }
+
+    #[test]
+    fn an_interrupted_owed_write_is_not_a_record_and_is_swept_once_its_writer_is_gone() {
+        let h = host("owed-tmp");
+        let dir = h.state.join("owed");
+        // An interrupted write: garbage under a temporary name, by a dead process and by this one.
+        let dead = dir.join(".7.4294967.tmp");
+        let live = dir.join(format!(".8.{}.tmp", std::process::id()));
+        std::fs::write(&dead, b"{\"to\": trunc").unwrap();
+        std::fs::write(&live, b"").unwrap();
+        let by = Ident { start: 1, ..Ident::me() };
+        assert!(!h.owes(&by), "a temporary file owes nothing: target retirement goes on");
+        h.settle_owed_with(5, |_, _| panic!("no records"), |_, _| {}, |_, _| {});
+        assert!(!dead.exists(), "swept: its writer is gone");
+        assert!(live.exists(), "kept: its writer may still rename it into place");
+        // A record under its own name that cannot be read still counts (fail closed).
+        std::fs::write(dir.join("9"), b"{corrupt").unwrap();
+        assert!(h.owes(&by));
+    }
+
+    #[test]
+    fn reclaim_withdraws_a_lent_address_and_forgets_its_owed_outcome() {
+        let h = host("reclaim");
+        let x = ip("10.9.0.2");
+        assert!(h.reclaim(x).unwrap_err().to_string().contains("not lent"));
+        let gen = {
+            let l = h.lock().unwrap();
+            let _v = h.take_name("v", false).unwrap();
+            let c = h.claim_new(&l, "v", Some(x)).unwrap();
+            h.lend(&l, x, c.gen).unwrap();
+            let gen = c.gen;
+            c.release(&l).unwrap();
+            gen
+        };
+        h.owe(4, &Owed { to: "lost:1".into(), ip: x, gen, by: Ident { start: 4, ..Ident::me() } }).unwrap();
+        h.owe(5, &Owed { to: "other:1".into(), ip: ip("10.9.0.3"), gen: 1, by: Ident { start: 5, ..Ident::me() } }).unwrap();
+        assert_eq!(h.lent_to(x).unwrap(), Some((gen, vec![(4, "lost:1".to_string())])));
+        assert_eq!(h.reclaim(x).unwrap(), (gen, vec![(4, "lost:1".to_string())]));
+        let a = h.addr(&h.lock().unwrap(), x).unwrap();
+        assert!(a.withdrawn && a.lent.is_none());
+        assert!(!h.owed_path(4).exists() && h.owed_path(5).exists(), "only that address's");
         let _w = h.take_name("w", false).unwrap();
         assert!(h.claim_new(&h.lock().unwrap(), "w", Some(x)).unwrap().gen > gen);
     }

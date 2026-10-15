@@ -53,6 +53,8 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
   flexvm restore DIR [--name N] [--ip IP|auto] [--paused] [-d]
                                      start a VM from a checkpoint
   flexvm migrate NAME HOST:PORT      live-migrate a VM to the host listening there
+  flexvm reclaim IP [--force]        take back an address lent out with a VM that migrated away,
+                                     once its target is gone for good (without --force: say what)
   flexvm listen [ADDR] [--peer HOST:PORT]... [--vm-ips CIDR|FIRST-LAST] [--underlay IP]
                 [--announce-dev IFACE] [--dns IP] [--reserve MIB] [--evict-at MIB] [--prefix P]
                                      configure this host and take migrations from peers
@@ -72,7 +74,7 @@ run, resume and restore exit with the VM's command's status, 128+signal, 125 whe
 fails, 124 when the VM dies
 ";
 
-const SWITCHES: &[&str] = &["warm", "stop", "paused", "incremental", "standby", "incoming", "json", "detach", "help", "version"];
+const SWITCHES: &[&str] = &["warm", "stop", "paused", "incremental", "standby", "incoming", "json", "detach", "force", "help", "version"];
 
 const VALUE_FLAGS: &[&str] = &[
     "state",
@@ -261,6 +263,7 @@ const COMMANDS: &[(&str, usize, &[&str])] = &[
     ("checkpoint", 3, &["stop", "incremental"]),
     ("restore", 2, &["name", "ip", "paused", "detach"]),
     ("migrate", 3, &[]),
+    ("reclaim", 2, &["force"]),
     ("listen", 2, CONFIG_FLAGS),
     ("config", 1, CONFIG_FLAGS),
     ("standby", 2, &["template"]),
@@ -357,6 +360,7 @@ fn real_main(args: &Args) -> Result<()> {
         Some("ls") => list(&open_host(args)?, args.has("json")),
         Some("exec") => util::exit(exec(&open_host(args)?, name, &args.rest.join(" "))?),
         Some("kill") => kill(&open_host(args)?, name),
+        Some("reclaim") => reclaim(&open_host(args)?, name, args.has("force")),
         Some("checkpoint") => {
             let dir = std::path::absolute(arg2.ok_or("checkpoint needs NAME DIR")?)?;
             call(json!({"op": "checkpoint", "dir": dir, "stop": args.has("stop"), "incremental": args.has("incremental")}))
@@ -590,6 +594,31 @@ fn kill(host: &Host, name: &str) -> Result<()> {
         Ok(to) => Err(format!("vm {name} moved to {to}; kill it there").into()),
         Err(_) => Err(format!("no vm named {name:?}").into()),
     }
+}
+
+/// Withdraws the generation an address was lent out with, everywhere, and forgets what
+/// outcome was owed for it: only for a target gone for good, so `--force` it is.
+fn reclaim(host: &Host, ip: &str, force: bool) -> Result<()> {
+    let ip: std::net::Ipv4Addr = ip.parse().map_err(|_| format!("reclaim takes the address (an IPv4 address), not {ip:?}"))?;
+    let Some((gen, owed)) = host.lent_to(ip)? else { return Err(format!("{ip} is not lent out").into()) };
+    let whom = match owed.as_slice() {
+        [] => "a vm that migrated away".to_string(),
+        o => o.iter().map(|(id, to)| format!("migration {id} to {to}, whose outcome is unknown")).collect::<Vec<_>>().join(", "),
+    };
+    if !force {
+        return Err(format!(
+            "{ip} is lent out (generation {gen}) with {whom}. Reclaiming withdraws that generation everywhere and lets {ip} be handed out here again: \
+             first make sure no host runs that vm any more (kill it there, or know the host is gone for good), or two vms will share {ip}. \
+             Then: flexvm reclaim {ip} --force"
+        )
+        .into());
+    }
+    let (gen, forgot) = host.reclaim(ip)?;
+    vmproc::tell_peers(host, json!({"op": "route", "ip": ip.to_string(), "gen": gen}));
+    util::log_line(format!(
+        "WARNING: {ip} reclaimed (generation {gen} withdrawn, lent with {whom}); if that vm still runs anywhere, it shares {ip} with the next vm given it"
+    ));
+    print(json!({"ip": ip.to_string(), "withdrawn_gen": gen, "forgot_migrations": forgot.iter().map(|(id, _)| id).collect::<Vec<_>>()}))
 }
 
 fn list(host: &Host, as_json: bool) -> Result<()> {

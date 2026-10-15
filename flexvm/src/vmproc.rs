@@ -582,9 +582,9 @@ impl Proc {
         let vm = self.vm();
         let source = || format!("vm {} is the source of a migration in progress; it ends once the target has its memory", vm.name).into();
         if let State::Source(mig) = vm.state() {
-            if let Some(to) = self.take_reconciling(mig) {
+            if self.reconciling.lock().unwrap().as_ref().is_some_and(|(m, _)| *m == mig) {
                 let op = self.op();
-                self.end_reconciling(&op, mig, &to, code)
+                return self.end_reconciling(&op, mig, code).unwrap_or_else(source);
             }
             return source();
         }
@@ -593,13 +593,11 @@ impl Proc {
         let op = self.op();
         if let State::Source(mig) = vm.state() {
             // It became one while this waited (a migration that holds `op` until its outcome is unknown).
-            if let Some(to) = self.take_reconciling(mig) {
-                self.end_reconciling(&op, mig, &to, code)
-            }
+            let refused = self.end_reconciling(&op, mig, code).unwrap_or_else(source);
             // Refused: the next checkpoint must not take this kill for its own
             // (one it already cancelled consumed it).
             let _ = vm.cancel_checkpoint.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
-            return source();
+            return refused;
         }
         self.finish(&op, End::Gone, code, None)
     }
@@ -618,29 +616,37 @@ impl Proc {
         self.reconciling.lock().unwrap().take_if(|(m, _)| *m == mig).map(|(_, to)| to)
     }
 
-    /// A kill while migration `mig`'s outcome is unknown (taken from `reconciling`,
-    /// so its reconciliation never resumes nor reroutes this copy). The target
-    /// may be running the VM, so nothing is withdrawn: the process ends as a
-    /// killed source does, its address left lent (never handed out here) and the
-    /// newest route a peer announced for it put back. The outcome is owed
-    /// (`Host::owe`) and settled by garbage collection once the target says
-    /// (`Host::settle_owed`): released, the loan stays the target's; aborted, the
-    /// generation is withdrawn then.
-    fn end_reconciling(&self, op: &Op, mig: u64, to: &str, code: i32) -> ! {
+    /// A kill while migration `mig`'s outcome is unknown: None if it is not (or no
+    /// longer: the reconciliation learned it), Some (refused) if the outcome could
+    /// not be recorded as owed. The target may be running the VM, so nothing is
+    /// withdrawn: the process ends as a killed source does, its address left lent
+    /// (never handed out here) and the newest route a peer announced for it put
+    /// back. The outcome is owed (`Host::owe`), settled by garbage collection once
+    /// the target says (`Host::settle_owed`): released, the loan stays the target's;
+    /// aborted, the generation is withdrawn then. Never left lent with no record of
+    /// whom: unrecorded, the kill is refused and this process goes on reconciling.
+    fn end_reconciling(&self, op: &Op, mig: u64, code: i32) -> Option<Error> {
         let vm = self.vm();
-        let owed = crate::host::Owed { to: to.into(), ip: vm.ip, gen: self.gen(), by: self.ident.clone() };
-        match self.host.owe(mig, &owed) {
-            Ok(()) => crate::log!(
-                "vm {}: killed while the outcome of migration {mig} to {to} is unknown; {to} may still be running it, so {} stays lent (not handed out here) until {to} says",
-                vm.name,
-                vm.ip
-            ),
-            Err(e) => crate::log!(
-                "vm {}: killed while the outcome of migration {mig} to {to} is unknown; {to} may still be running it, so {} stays lent; recording that to settle it later failed ({e}): it stays lent until {to} withdraws it",
-                vm.name,
-                vm.ip
-            ),
-        }
+        let (ip, gen, by) = (vm.ip, self.gen(), self.ident.clone());
+        let to = match owe_or_refuse(&self.reconciling, mig, OWE_TRIES, |to| {
+            self.host.owe(mig, &crate::host::Owed { to: to.into(), ip, gen, by: by.clone() })
+        }) {
+            Ok(Some(to)) => to,
+            Ok(None) => return None,
+            Err(e) => {
+                return Some(
+                    format!(
+                        "vm {}: the outcome of migration {mig} is unknown, and recording it as owed failed ({e}), so it is not killed: it goes on asking its target, and {ip} stays lent",
+                        vm.name
+                    )
+                    .into(),
+                )
+            }
+        };
+        crate::log!(
+            "vm {}: killed while the outcome of migration {mig} to {to} is unknown; {to} may still be running it, so {ip} stays lent (not handed out here) until {to} says",
+            vm.name
+        );
         if let Some(h) = self.holder() {
             h.forget(vm.ip, mig);
         }
@@ -1329,6 +1335,32 @@ impl Drop for SuspendReserved {
     }
 }
 
+/// Tries at recording an owed outcome before a kill is refused (`owe_or_refuse`).
+const OWE_TRIES: u32 = 5;
+
+/// Records migration `mig`'s outcome as owed (`owe`, given its target), up to `tries`
+/// times, holding `reconciling` throughout so the reconciliation can neither learn
+/// the outcome meanwhile nor lose its mark: recorded, the mark is taken (Some(target));
+/// not reconciling `mig`, None; never recorded, an error with the mark left in place.
+fn owe_or_refuse(reconciling: &Mutex<Option<(u64, String)>>, mig: u64, tries: u32, mut owe: impl FnMut(&str) -> Result<()>) -> Result<Option<String>> {
+    let mut r = reconciling.lock().unwrap();
+    let Some(to) = r.as_ref().filter(|(m, _)| *m == mig).map(|(_, to)| to.clone()) else { return Ok(None) };
+    let mut last = None;
+    for i in 0..tries.max(1) {
+        if i > 0 {
+            thread::sleep(Duration::from_millis(100 << i.min(4)));
+        }
+        match owe(&to) {
+            Ok(()) => {
+                *r = None;
+                return Ok(Some(to));
+            }
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| "not recorded".into()))
+}
+
 /// What stops a standby VM before its claim: SIGUSR1 (`standby::stop`'s, which
 /// the claimed VM ignores), or SIGINT or SIGTERM sent to it.
 fn is_stop(sig: i32) -> bool {
@@ -1964,6 +1996,34 @@ mod tests {
         });
         let took = t.elapsed();
         assert!(took >= Duration::from_millis(200) && took < Duration::from_secs(2), "{took:?}");
+    }
+
+    #[test]
+    fn an_unrecorded_owed_outcome_refuses_the_kill_and_keeps_reconciling() {
+        let r = Mutex::new(Some((7, "b:1".to_string())));
+        let mut calls = 0;
+        let e = owe_or_refuse(&r, 7, 3, |to| {
+            assert_eq!(to, "b:1");
+            calls += 1;
+            Err("disk full".into())
+        });
+        assert!(e.unwrap_err().to_string().contains("disk full"));
+        assert_eq!(calls, 3, "retried, bounded");
+        assert_eq!(*r.lock().unwrap(), Some((7, "b:1".to_string())), "still reconciling: its thread goes on asking");
+        // Another migration's kill is not this one's.
+        assert!(owe_or_refuse(&r, 8, 3, |_| panic!("not reconciling 8")).unwrap().is_none());
+        // Recorded on a later try: the mark is taken, so the reconciliation stands down.
+        let mut calls = 0;
+        let got = owe_or_refuse(&r, 7, 3, |_| {
+            calls += 1;
+            if calls < 2 {
+                Err("transient".into())
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(got.unwrap().as_deref(), Some("b:1"));
+        assert!(r.lock().unwrap().is_none());
     }
 
     #[test]

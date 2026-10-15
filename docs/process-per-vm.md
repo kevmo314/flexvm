@@ -110,7 +110,20 @@ the target until it says: `released`, the VM is the target's (told `done`;
 the loan is taken back by its own withdrawal, as for any VM that moved);
 `aborted`, no copy runs, so the generation is withdrawn then and the address
 is free. Meanwhile the listener counts the killed source as still there, so
-the target keeps the record it is asked about (`reconcile_kill`).
+the target keeps the record it is asked about (`reconcile_kill`). The record
+is written (retried a few times) before the process ends: if it cannot be
+(a full disk), the kill is refused and the source goes on asking its target,
+so a lent address always has a record of whom it is owed to.
+
+A target lost for good (its host gone, never to answer) leaves the address
+lent, refused to `run --ip` and automatic allocation alike. `flexvm reclaim
+IP` says what it is lent with (the migrations owed for it) and what
+reclaiming does; `flexvm reclaim IP --force` withdraws that generation here
+and at every peer and forgets the owed records, so the address can be handed
+out again. It is the operator's word that no host still runs the VM: one that
+does would share the address with the next VM given it, so make sure first
+(kill it there, or know its host is gone). It also takes back a loan left by
+a source killed with SIGKILL, which records nothing.
 
 ## On-disk state
 
