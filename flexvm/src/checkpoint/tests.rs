@@ -77,7 +77,7 @@ fn metadata_is_bounded_before_reading() {
     for i in 0..3 {
         let id = link(&dir.join(format!("ck{i}")), parent, |_| {});
         ids.insert(0, id.clone());
-        parent = Some(Parent { path: format!("../ck{i}"), id });
+        parent = Some(Parent { path: format!("../ck{i}").into(), id });
     }
     let top = dir.join("ck2");
     let ck = Checkpoint::open(&top).unwrap();
@@ -287,8 +287,8 @@ fn overlays_buffers_and_parent_paths() {
         (22, 3, ZERO, 1, 0),
     ];
     assert_eq!(overlay(&base, &top), want);
-    assert_eq!(parent_path(Path::new("/d/ck2"), Path::new("/d/ck1")), "../ck1");
-    assert_eq!(parent_path(Path::new("/e/ck2"), Path::new("/d/ck1")), "/d/ck1");
+    assert_eq!(parent_path(Path::new("/d/ck2"), Path::new("/d/ck1")), Path::new("../ck1"));
+    assert_eq!(parent_path(Path::new("/e/ck2"), Path::new("/d/ck1")), Path::new("/d/ck1"));
     // Writer buffers are aligned and zeroed; one larger than Linux can map fails, even with overcommit.
     let mut buf = aligned(2).unwrap();
     assert_eq!(buf.as_ptr() as usize % PAGE_SIZE, 0);
@@ -439,4 +439,62 @@ fn whole_base_runs_build_the_per_page_map() {
         fs::remove_file(dir.join(format!("p{round}"))).unwrap();
     }
     fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn ancestor_vmstate_is_unused_but_metadata_and_pages_remain_checked() {
+    let dir = tmp("ancestor-vmstate");
+    let base = dir.join("base");
+    let head = dir.join("head");
+    let page = vec![7; PAGE_SIZE];
+    let mut map = MAGIC.to_vec();
+    for word in [1u64, 1, 0, 1, DATA, 0] {
+        map.extend_from_slice(&word.to_le_bytes());
+    }
+    map.extend_from_slice(&crate::crc32c::page(&page).0.to_le_bytes());
+    let id = link(&base, None, |m| {
+        fs::write(base.join("pages"), &page).unwrap();
+        fs::write(base.join("pagemap"), &map).unwrap();
+        m.data_pages = 1;
+        m.files.get_mut("pages").unwrap().len = PAGE_SIZE as u64;
+        let info = m.files.get_mut("pagemap").unwrap();
+        info.len = map.len() as u64;
+        info.hash = sum(&map);
+    });
+    link(&head, Some(Parent { path: parent_path(&head, &base), id }), |_| {});
+    let budget = Checkpoint::open(&head).unwrap().meta_left;
+    // Not even opening an ancestor's VM state: only its memory participates in restore.
+    fs::remove_file(base.join("vmstate")).unwrap();
+    let ck = Checkpoint::open(&head).unwrap();
+    assert_eq!(ck.vmstate, b"s");
+    assert_eq!(ck.meta_left, budget);
+    let mut restored = vec![0; PAGE_SIZE];
+    ck.file.read(0, &mut restored, false).unwrap();
+    assert_eq!(restored, page);
+    fs::write(base.join("pages"), vec![8; PAGE_SIZE]).unwrap();
+    assert_eq!(ck.file.read(0, &mut restored, false).unwrap_err().kind(), io::ErrorKind::InvalidData);
+    assert!(Checkpoint::open(&base).is_err(), "the head's VM state is still required");
+    fs::write(head.join("vmstate"), b"x").unwrap();
+    assert!(Checkpoint::open(&head).err().unwrap().to_string().contains("vmstate does not match"));
+    fs::write(head.join("vmstate"), b"s").unwrap();
+    fs::write(base.join("pagemap"), b"bad").unwrap();
+    assert!(Checkpoint::open(&head).err().unwrap().to_string().contains("pagemap does not match"));
+}
+
+#[test]
+fn non_utf8_parent_paths_roundtrip_and_open() {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+    let dir = tmp("parent-bytes");
+    let base = dir.join(OsStr::from_bytes(b"base-\xff"));
+    let id = link(&base, None, |_| {});
+    for head in [dir.join("head"), dir.join("nested/head")] {
+        let parent = Parent { path: parent_path(&head, &base), id: id.clone() };
+        let encoded = serde_json::to_vec(&parent).unwrap();
+        let decoded: Parent = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.path, parent.path);
+        link(&head, Some(decoded), |_| {});
+        assert_eq!(Checkpoint::open(&head).unwrap().chain, [base.canonicalize().unwrap()]);
+    }
+    let old: Parent = serde_json::from_str(r#"{"path":"../base","id":"id"}"#).unwrap();
+    assert_eq!(serde_json::to_value(old).unwrap()["path"], "../base");
 }

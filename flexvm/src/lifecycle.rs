@@ -176,7 +176,7 @@ impl Proc {
             "zero_mib": (m.zero_pages * PAGE_SIZE as u64) >> 20,
             "vmstate_kib": m.files["vmstate"].len >> 10,
             "incremental": m.parent.is_some(),
-            "parent": m.parent.as_ref().map(|p| &p.path),
+            "parent": m.parent.as_ref().map(|p| p.path.to_string_lossy()),
             "timings_ms": t.json(),
         });
         v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
@@ -800,7 +800,7 @@ impl Proc {
             }
             // The parent chain must be unchanged, walked as a restore will.
             if let (Some(p), Some(ids)) = (&parent_ref, &links) {
-                let first = p.path.strip_prefix("../").map_or_else(|| PathBuf::from(&p.path), |name| pinned.join(name));
+                let first = p.path.strip_prefix("..").map_or_else(|_| p.path.clone(), |name| pinned.join(name));
                 let now = crate::checkpoint::chain_ids(&first);
                 if now.as_ref().ok() != Some(ids) {
                     bail!(

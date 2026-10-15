@@ -690,7 +690,7 @@ pub fn create(paths: &Paths, name: &str, vcpus: u32, mem_mib: u64, max_mib: u64,
         let staging = Staging::new(paths, name)?;
         build(paths, &staging.dir, name, vcpus, mem_mib, max_mib, plug_mib, tap, image).map_err(|e| format!("template {name:?}: {e}"))?;
         interrupted()?;
-        publish(paths, name, &staging.dir)
+        publish(paths, name, &staging.dir, interrupted)
     })();
     crate::net::delete_tap(tap);
     res
@@ -698,7 +698,7 @@ pub fn create(paths: &Paths, name: &str, vcpus: u32, mem_mib: u64, max_mib: u64,
 
 /// Nothing is deleted: VMs and checkpoints refer to generations by content id, so old ones
 /// stay until an operator removes them.
-fn publish(paths: &Paths, name: &str, staged: &Path) -> Result<()> {
+fn publish(paths: &Paths, name: &str, staged: &Path, check_interrupt: impl FnOnce() -> Result<()>) -> Result<()> {
     let meta = Meta::read(staged)?;
     let gens = paths.templates.join(GENERATIONS);
     crate::util::create_dir_durably(&gens, 0o777)?;
@@ -717,6 +717,7 @@ fn publish(paths: &Paths, name: &str, staged: &Path) -> Result<()> {
         r => r?,
     }
     crate::util::sync_dir(staged)?;
+    check_interrupt()?;
     match std::fs::rename(staged, &gen) {
         // An identical build published it already.
         Err(e) if matches!(e.raw_os_error(), Some(libc::ENOTEMPTY | libc::EEXIST)) => {}
@@ -937,6 +938,29 @@ mod tests {
     }
 
     #[test]
+    fn publish_checks_interrupt_after_sync_before_rename() {
+        let f = Fixture::new();
+        let staged = f.dir.join(".t.new-interrupted");
+        std::fs::create_dir(&staged).unwrap();
+        let meta = Meta { id: "interrupted".into(), ..f.meta.clone() };
+        f.write_meta(&meta, &staged);
+        std::fs::write(staged.join("lock"), b"").unwrap();
+        std::fs::write(staged.join("vmstate"), b"state").unwrap();
+        let error = publish(&f.paths, "t", &staged, || {
+            // This checkpoint follows the file fsyncs, lock removal and directory fsync.
+            assert!(!staged.join("lock").exists());
+            assert!(staged.join("vmstate").exists());
+            assert!(!f.dir.join(GENERATIONS).join(&meta.id).exists());
+            Err("template build interrupted (signal 2)".into())
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("interrupted"));
+        assert!(staged.exists());
+        assert!(!f.dir.join(GENERATIONS).join(&meta.id).exists());
+        assert!(!f.paths.templates.join("t").exists());
+    }
+
+    #[test]
     fn publish_swaps_generations_and_keeps_them_all() {
         let f = Fixture::new();
         let stage = |id: &str| {
@@ -952,15 +976,15 @@ mod tests {
             g.sort();
             g
         };
-        publish(&f.paths, "t", &stage("a")).unwrap();
+        publish(&f.paths, "t", &stage("a"), || Ok(())).unwrap();
         assert_eq!(current(), "a");
         let a = Template::resolve(&f.paths, "t").unwrap();
-        publish(&f.paths, "t", &stage("b")).unwrap();
+        publish(&f.paths, "t", &stage("b"), || Ok(())).unwrap();
         assert_eq!(current(), "b");
         // Whoever resolved `a` before the swap still reads a's files.
         assert_eq!(std::fs::read_to_string(a.join("vmstate")).unwrap(), "a");
         assert_eq!(gens(), ["a", "b"]);
-        publish(&f.paths, "t", &stage("c")).unwrap();
+        publish(&f.paths, "t", &stage("c"), || Ok(())).unwrap();
         assert_eq!(current(), "c");
         assert_eq!(gens(), ["a", "b", "c"]);
         assert_eq!(Template::generation(&f.paths, "a"), Some(f.dir.join(GENERATIONS).join("a")));

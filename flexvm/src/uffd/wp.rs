@@ -225,7 +225,7 @@ impl Pager {
         });
         if let Err(e) = read {
             cow.stats.rescue_failures.fetch_add(1, Ordering::Relaxed);
-            claimed.iter().for_each(|&p| cow.unclaim(p));
+            cow.unclaim_many(&claimed);
             return Err(e);
         }
         cow.rescue_many(first, end, claimed.iter().copied().zip(pages));
