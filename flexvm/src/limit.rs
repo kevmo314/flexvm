@@ -85,11 +85,21 @@ fn used_mib(cgroup: &Path) -> Option<u64> {
 /// A cgroup's inode and anon bytes (the guest's memory: UFFD installs into an
 /// anonymous mapping), which MemAvailable never counts, unlike page cache.
 pub(crate) fn anon(cgroup: &Path) -> Option<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt;
-    let ino = std::fs::metadata(cgroup).ok()?.ino();
     let stat = std::fs::read_to_string(cgroup.join("memory.stat")).ok()?;
     let anon = stat.lines().find_map(|l| l.strip_prefix("anon "))?.trim().parse().ok()?;
-    Some((ino, anon))
+    Some((inode(cgroup)?, anon))
+}
+
+/// A cgroup's inode and mark (`memory.high`, bytes); None at "max" (lifted,
+/// or not started), where nothing bounds what any grant's memory is.
+pub(crate) fn mark(cgroup: &Path) -> Option<(u64, u64)> {
+    let high = std::fs::read_to_string(cgroup.join("memory.high")).ok()?.trim().parse().ok()?;
+    Some((inode(cgroup)?, high))
+}
+
+fn inode(cgroup: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Some(std::fs::metadata(cgroup).ok()?.ino())
 }
 
 impl Limit {
