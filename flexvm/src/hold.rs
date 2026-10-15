@@ -155,9 +155,17 @@ impl Holder {
     pub fn hold(&self, ip: Ipv4Addr, mig: u64) -> Result<()> {
         let (pending, routed) = {
             let _routes = self.routes.lock().unwrap();
-            let pending = self.gone.lock().unwrap().remove(&ip);
             self.held.lock().unwrap().insert(ip, Arc::new(Entry { mig, q: Mutex::default() }));
-            (pending, crate::net::route_dev(true, ip, self.ifindex).inspect_err(|_| drop(self.held.lock().unwrap().remove(&ip))))
+            let routed = crate::net::route_dev(true, ip, self.ifindex);
+            let pending = match &routed {
+                Ok(()) => self.gone.lock().unwrap().remove(&ip),
+                // Not held after all: its stragglers are still counted.
+                Err(_) => {
+                    self.held.lock().unwrap().remove(&ip);
+                    None
+                }
+            };
+            (pending, routed)
         };
         // Off the locks: a blocked stderr holds up no route change or reader.
         if let Some(g) = pending {

@@ -1474,6 +1474,45 @@ def delayed_announce():
     kill(B, n)
 
 
+def announce_arp_timer():
+    """#311: a VM's second gratuitous ARP goes out about 200 ms after its first,
+    on a timer of its own: a peer that holds up the announcement (B, with
+    `route_stall`; `tell`'s retry would keep it about 5 s) does not delay it.
+    A's announce device is a dummy link, the ARPs captured on it."""
+    n, dev = "ft-arp-timer", f"garp{A.addr.rsplit(':', 1)[1]}"
+    subprocess.run(["ip", "link", "del", dev], capture_output=True)
+    subprocess.run(["ip", "link", "add", dev, "up", "type", "dummy"], check=True)
+    arps = []
+    try:
+        cap = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003))
+        cap.bind((dev, 0))
+        cap.settimeout(0.2)
+        code, out, err = cli(A, "config", "--announce-dev", dev)
+        assert code == 0, err
+        fault(B, "route_stall", 60000)
+        ok(run(A, n))
+        ip = socket.inet_aton(vms(A)[n]["ip"])
+        end = time.time() + 10
+        while len(arps) < 2 and time.time() < end:
+            try:
+                f = cap.recv(64)
+            except socket.timeout:
+                continue
+            if f[12:14] == b"\x08\x06" and f[38:42] == ip:
+                arps.append(time.monotonic())
+        check("announce arp timer: B holds up A's announcement", conns(B) >= 1, conns(B))
+    finally:
+        fault(B, "route_stall", 0)
+        cli(A, "config", "--announce-dev", "")
+        subprocess.run(["ip", "link", "del", dev], capture_output=True)
+    check("announce arp timer: both ARPs went out", len(arps) == 2, arps)
+    if len(arps) == 2:
+        gap = arps[1] - arps[0]
+        check("announce arp timer: the second within 1 s of the first", 0.15 < gap < 1, f"{gap:.2f} s")
+    check("announce arp timer: B handled it", wait_for(lambda: conns(B) == 0, 10), conns(B))
+    kill(A, n)
+
+
 def prepare_fail_announce():
     """#256: a target that claims the next revision and then fails to prepare
     never outranks its running source: the source's announcement, held up in
@@ -6131,7 +6170,7 @@ SCENARIOS = dict(
     sigkill_restart=sigkill_restart, listen_trickle=listen_trickle,
     cow_wp_race=cow_wp_race, fetch_tail_enomem=fetch_tail_enomem, fetch_enomem_stuck=fetch_enomem_stuck, pull_enomem=pull_enomem,
     collapse_abort=collapse_abort, collapse_ckpt_fail=collapse_ckpt_fail, ckpt_paused_backlog=ckpt_paused_backlog, same_host_order=same_host_order, same_host_slow_route=same_host_slow_route, same_host_flood=same_host_flood, same_host_late_handover=same_host_late_handover, same_host_backlog=same_host_backlog, ckpt_backlog=ckpt_backlog, rx_stall=rx_stall, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,
-    handoff_superseded=handoff_superseded, delayed_announce=delayed_announce,
+    handoff_superseded=handoff_superseded, delayed_announce=delayed_announce, announce_arp_timer=announce_arp_timer,
     prepare_fail_announce=prepare_fail_announce, reconcile_announce=reconcile_announce, suspend_cmd=suspend_cmd, fc_died_busy=fc_died_busy, pause_cmd_start=pause_cmd_start, suspend_died=suspend_died)
 names = [n for s in args.scenarios for n in (list(SCENARIOS) if s == "all" else [s])]
 if os.geteuid() != 0:
