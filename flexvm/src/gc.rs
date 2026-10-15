@@ -44,9 +44,15 @@ pub fn sweep_due(host: &Host) {
     }
 }
 
-/// Everything collectable now. Sweeps are one at a time (`RUN/.gc.lock`);
-/// one already under way is not repeated.
+/// Local cleanup and network retirement have separate nonblocking locks, so
+/// slow sources cannot keep other processes from cleaning up local files.
 pub fn sweep(host: &Host) {
+    local_cleanup(host);
+    host.retire_migrations();
+}
+
+/// Local sweeps are one at a time (`RUN/.gc.lock`).
+fn local_cleanup(host: &Host) {
     let Ok(lock) = File::create(host.run.join(".gc.lock")) else { return };
     if flock(&lock, libc::LOCK_EX | libc::LOCK_NB).is_err() {
         return;
@@ -60,7 +66,6 @@ pub fn sweep(host: &Host) {
             standby_sockets(&e.path());
         }
     }
-    host.retire_migrations();
 }
 
 fn age(path: &Path) -> Option<Duration> {
@@ -172,6 +177,21 @@ mod tests {
 
     fn store_holder(host: &Host, name: &str, id: &crate::host::Ident) {
         crate::host::store(&host.vms(name, "lock"), id, false).unwrap();
+    }
+
+    #[test]
+    fn busy_retirement_does_not_block_local_cleanup() {
+        let d = dir("retire-lock");
+        let host = Host::open(&d.join("state"), &d.join("run")).unwrap();
+        let retirement = File::create(host.run.join(".retire.lock")).unwrap();
+        flock(&retirement, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+        let marker = host.vms("gone", "moved");
+        File::create(&marker).unwrap().set_modified(SystemTime::now() - MOVED_TTL - Duration::from_secs(1)).unwrap();
+        sweep(&host);
+        assert!(!marker.exists());
+        let gc = File::open(host.run.join(".gc.lock")).unwrap();
+        flock(&gc, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
