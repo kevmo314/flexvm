@@ -304,19 +304,28 @@ fn start(statuses: &Statuses) -> io::Result<i32> {
 fn launch(app: &mut App, cmd: &mut Command, statuses: &Statuses) -> io::Result<(i32, thread::JoinHandle<()>)> {
     let (mut child, exited, token) = spawn_watched(cmd.stdout(Stdio::piped()).stderr(Stdio::piped()), statuses, true)?;
     let pid = child.id() as i32;
+    let Some(exited) = exited else { return Err(unwatched(statuses, pid, token)) };
     app.state = State::Running(pid);
     let statuses = statuses.clone();
     let supervisor = thread::spawn(move || {
-        crate::discard(crate::pump_until(child.stdout.take(), child.stderr.take(), exited, DRAIN, |_, data| {
+        crate::discard(crate::pump_until(child.stdout.take(), child.stderr.take(), Some(exited), DRAIN, |_, data| {
             APP.lock().unwrap().push(data);
             Duration::ZERO
         }));
-        let code = wait_exit(&statuses, token, None).unwrap_or(-1);
+        let code = wait_exit(&statuses, token, None).expect("no deadline");
         let mut app = APP.lock().unwrap();
         app.state = State::Exited(code);
         app.push(format!("flexvm-init: pid {pid} exited with status {code}\n").as_bytes());
     });
     Ok((pid, supervisor))
+}
+
+/// Without a pidfd (only out of fds or memory: guest kernels have had them since 5.3) its exit could go
+/// unnoticed while descendants hold the pipes, so the app is refused: its session is killed and reaped.
+fn unwatched(statuses: &Statuses, pid: i32, token: u64) -> io::Error {
+    kill_running(statuses, pid, token, true, libc::SIGKILL);
+    wait_exit(statuses, token, Some(Instant::now() + Duration::from_secs(2)));
+    io::Error::other("cannot open a pidfd to watch it")
 }
 
 /// Output from `offset` (clamped to the ring), then `<status> <next offset>`; with `follow`, until exit.
@@ -416,6 +425,19 @@ mod tests {
         while count("fd") > fds + 2 {
             assert!(Instant::now() < deadline, "{} fds, {fds} before", count("fd"));
             thread::sleep(Duration::from_millis(50));
+        }
+        // Without a pidfd the app's whole session is killed and reaped.
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "sleep 100 & sleep 100"]).process_group(0);
+        let (child, _, token) = spawn_watched(&mut cmd, &statuses, false).unwrap();
+        let pid = child.id() as i32;
+        thread::sleep(Duration::from_millis(100));
+        assert!(unwatched(&statuses, pid, token).to_string().contains("pidfd"));
+        assert!(statuses.0.lock().unwrap().is_empty());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while unsafe { libc::kill(-pid, 0) } == 0 {
+            assert!(Instant::now() < deadline, "the app's session outlived it");
+            thread::sleep(Duration::from_millis(20));
         }
         let app = APP.lock().unwrap();
         let mut log = Vec::new();
