@@ -32,10 +32,13 @@ pub(crate) fn dir(host: &Host, template: &str) -> PathBuf {
     host.run.join("standby").join(hash.finish())
 }
 
+/// Its `.template` (the name, for `templates`) is written once: a rewrite per refill could race another thread's.
 fn create_dir(host: &Host, template: &str) -> Result<PathBuf> {
     let d = dir(host, template);
     std::fs::create_dir_all(&d)?;
-    crate::util::write_file(&d, ".template", template.as_bytes(), false)?;
+    if std::fs::read(d.join(".template")).ok().as_deref() != Some(template.as_bytes()) {
+        crate::util::write_file(&d, ".template", template.as_bytes(), false)?;
+    }
     Ok(d)
 }
 
@@ -117,7 +120,10 @@ pub fn set(host: &Host, template: &str, n: usize) -> Result<Value> {
 
 /// Each template's count and its standby VMs now.
 pub fn show(host: &Host) -> Value {
-    json!(templates(host).iter().map(|t| json!({"template": t, "standby": target(host, t), "live": live(host, t).len()})).collect::<Vec<_>>())
+    json!(templates(host)
+        .iter()
+        .map(|t| json!({"template": t, "standby": target(host, t), "live": live(host, t).len(), "dir": dir(host, t)}))
+        .collect::<Vec<_>>())
 }
 
 /// Periodic recovery, run by listeners and running VM processes. A

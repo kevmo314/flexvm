@@ -97,9 +97,10 @@ impl Proc {
         self.publish();
         if let Err(e) = self.take_address(vm) {
             drop(op);
-            // An existing finish worker may only be retrying the address.
-            self.sync_clock_later();
-            self.finish_later(vm.clone(), true, false);
+            // Retried with the address; an existing worker may be retrying the address alone.
+            if !self.finish_later(vm.clone(), true, true) {
+                self.sync_clock_later();
+            }
             return Err(e);
         }
         drop(op);
@@ -508,10 +509,11 @@ impl Proc {
 
     /// For a VM whose resume left guest steps undone: until `GUEST_WAIT`, waits for its guest agent (unless
     /// `answered`), then retries setting a pending address and (`clock`) syncing its clock, each until it succeeds.
-    fn finish_later(&self, vm: Arc<Vm>, mut answered: bool, mut clock: bool) {
-        let Some(p) = self.arc() else { return };
+    /// False if a worker was already at it (or the process is ending): this one's `clock` is not taken up.
+    fn finish_later(&self, vm: Arc<Vm>, mut answered: bool, mut clock: bool) -> bool {
+        let Some(p) = self.arc() else { return false };
         if FINISHING.swap(true, Ordering::SeqCst) {
-            return;
+            return false;
         }
         thread::spawn(move || {
             struct Done;
@@ -533,11 +535,11 @@ impl Proc {
                         answered = true;
                         crate::log!("vm {}: its guest agent answered {} ms after it resumed", vm.name, ms(start.elapsed()));
                     }
-                    if vm.pending_net.load(Ordering::SeqCst) {
-                        let _op = p.op_within()?;
-                        p.take_address(&vm)?;
-                        crate::log!("vm {}: took its address {}", vm.name, vm.ip);
-                    }
+                    // The clock is not held up by an address that keeps failing.
+                    let address = match vm.pending_net.load(Ordering::SeqCst) {
+                        true => p.op_within().and_then(|_op| p.take_address(&vm)).map(|()| crate::log!("vm {}: took its address {}", vm.name, vm.ip)),
+                        false => Ok(()),
+                    };
                     if clock {
                         let _op = p.op_within()?;
                         if vm.state() == State::Running {
@@ -546,7 +548,7 @@ impl Proc {
                             clock = false;
                         }
                     }
-                    Ok(!clock)
+                    address.map(|()| !clock)
                 })();
                 match step {
                     Ok(true) => return,
@@ -564,6 +566,7 @@ impl Proc {
                 crate::log!("vm {}: gave up finishing its resume after {} s: {}", vm.name, GUEST_WAIT.as_secs(), failed.as_deref().unwrap_or("not running"));
             }
         });
+        true
     }
 
     /// Release disk admission and a consumed checkpoint once the pull finishes.

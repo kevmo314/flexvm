@@ -3145,7 +3145,7 @@ def standby():
     comes up, `standby 0` stops them all; without one, run loads cold."""
     t = args.template
     ok(cli_json(A, "standby", "--template", t, "2"))
-    live = lambda: len([f for f in os.listdir(os.path.join(A.run, "standby", t)) if f.endswith(".lock") and alive(f[:-5].split("-")[0])])
+    live = lambda: len([f for f in os.listdir(standby_dir(A.run, t)) if f.endswith(".lock") and alive(f[:-5].split("-")[0])])
     check("standby: two ready", live() == 2, live())
     r = ok(run(A, "ft-sb1"))
     check("standby: run claims one", r["standby"] is True and r["ready_ms"] < 50, r)
@@ -5087,7 +5087,7 @@ def meminfo_unreadable():
     mtime = lambda p: os.stat(p).st_mtime if os.path.exists(p) else None
     try:
         ok(cli_json(A, "standby", "--template", t, "1"))
-        locks = lambda: [f for f in os.listdir(os.path.join(A.run, "standby", t)) if f.endswith(".lock") and alive(f[:-5].split("-")[0])]
+        locks = lambda: [f for f in os.listdir(standby_dir(A.run, t)) if f.endswith(".lock") and alive(f[:-5].split("-")[0])]
         check("meminfo: a standby ready", wait_for(lambda: len(locks()) == 1, 60), locks())
         ready, pressed = locks(), mtime(pressure)
         fault(A, "no_meminfo", 600000)
@@ -5112,7 +5112,7 @@ def standby_admission():
     ok(run(A, "ft-sbadm-dup"))
     try:
         ok(cli_json(A, "standby", "--template", t, "1"))
-        live = lambda: len([f for f in os.listdir(os.path.join(A.run, "standby", t)) if f.endswith(".lock") and alive(f[:-5].split("-")[0])])
+        live = lambda: len([f for f in os.listdir(standby_dir(A.run, t)) if f.endswith(".lock") and alive(f[:-5].split("-")[0])])
         check("standby admission: one ready", wait_for(lambda: live() == 1, 60), live())
         with tight_reserve(256 + 48):
             r = run(A, "ft-sbadm-dup")
@@ -5704,7 +5704,7 @@ def claim_killed():
     code, out, err = cli(A, "standby", "--template", args.template, "1")
     check("claim killed: a standby vm", code == 0, err)
     fault(A, "claim_stall", 10000)
-    lockdir = os.path.join(A.run, "standby", args.template)
+    lockdir = standby_dir(A.run, args.template)
     pids = [json.load(open(os.path.join(lockdir, f)))["pid"] for f in os.listdir(lockdir) if f.endswith(".lock")]
     res = {}
     t = threading.Thread(target=lambda: res.update(r=cli_json(A, "run", n, "--template", args.template, "-d")))
@@ -5788,7 +5788,7 @@ def standby_claim_signal():
                 check("standby claim SIGINT: the claim finishes, then the VM gets the signal", '"standby":true' in err.replace(" ", ""), err[-800:])
             else:
                 # Once its stall is over, the standby answers, finds the claimer gone and ends the VM.
-                sblog = lambda: open(os.path.join(A.run, "standby", t, "standby.log"), errors="replace").read()
+                sblog = lambda: open(os.path.join(standby_dir(A.run, t), "standby.log"), errors="replace").read()
                 check("standby claim SIGKILL: the standby finds its claimer gone", wait_for(lambda: f"the claimer of {n} is gone" in sblog(), 30),
                       (err[-800:], sblog()[-1500:]))
             check(f"standby claim {what}: the claimed vm is gone, not orphaned", wait_for(lambda: n not in vms(A), 30),
@@ -5799,9 +5799,26 @@ def standby_claim_signal():
         cli(A, "standby", "--template", t, "0")
 
 
+def standby_dir(run, t):
+    """RUN/standby/HASH: HASH as `standby::dir` hashes the template's name (`template::Hash`)."""
+    m, h = (1 << 64) - 1, 0xcbf29ce484222325
+
+    def word(w):
+        nonlocal h
+        x = ((h ^ w) * 0x9e3779b97f4a7c15) & m
+        h = x ^ (x >> 29)
+    b = t.encode()
+    word(len(b))
+    full = len(b) - len(b) % 8
+    for i in range(0, full, 8):
+        word(int.from_bytes(b[i:i + 8], "little"))
+    word(int.from_bytes(b[full:].ljust(8, b"\0"), "little"))
+    return os.path.join(run, "standby", f"{h:016x}")
+
+
 def standby_socks(host, t):
     """The listening sockets of `host`'s standby VMs of `t`: those loaded, claimable."""
-    d = os.path.join(host.run, "standby", t)
+    d = standby_dir(host.run, t)
     return [f for f in os.listdir(d) if f.endswith(".sock")] if os.path.isdir(d) else []
 
 
@@ -5849,7 +5866,7 @@ def standby_stalled():
     ok(cli_json(A, "standby", "--template", t, "1"))
     check("standby stalled: one ready", wait_for(lambda: len(standby_pids(A, t)) == 1, 60))
     pid = standby_pids(A, t)[0]
-    d = os.path.join(A.run, "standby", t)
+    d = standby_dir(A.run, t)
     c = socket.socket(socket.AF_UNIX)
     c.connect(os.path.join(d, next(f for f in os.listdir(d) if f.endswith(".sock") and f.split(".")[-2].split("-")[0] == str(pid))))
     c.send(b'{"name"')
@@ -5962,7 +5979,7 @@ def standby_lock_timeout():
     nothing behind (its cgroup, work directory, standby files)."""
     t, n = args.template, "ft-sb-lock-timeout"
     ok(run(A, n))
-    d = os.path.join(A.run, "standby", t)
+    d = standby_dir(A.run, t)
     pressure, active = os.path.join(A.run, "standby", ".pressure"), os.path.join(A.run, "evict.active")
     for f in (pressure, active):
         if os.path.exists(f):
@@ -6447,7 +6464,7 @@ def cmd_flag():
     scenario_vms.update({n, r})
     ok(cli_json(A, "standby", "--template", t, "1"))
     try:
-        live = lambda: len([f for f in os.listdir(os.path.join(A.run, "standby", t)) if f.endswith(".lock") and alive(f[:-5].split("-")[0])])
+        live = lambda: len([f for f in os.listdir(standby_dir(A.run, t)) if f.endswith(".lock") and alive(f[:-5].split("-")[0])])
         check("cmd flag: a standby ready", wait_for(lambda: live() == 1, 60), live())
         p = subprocess.Popen([BIN, "--state", A.state, "--run", A.run, "run", n, "--template", t, "--", "sleep 600"],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=ENV, start_new_session=True)
@@ -6464,7 +6481,7 @@ def cmd_flag():
     started = ok(cli_json(A, "run", r, "--template", t, "-d", "--", "sleep 600"))
     pid = vm_pid(A, r)
     os.kill(pid, signal.SIGTERM)
-    standby_log = os.path.join(A.run, "standby", t, "standby.log")
+    standby_log = os.path.join(standby_dir(A.run, t), "standby.log")
     check("cmd flag: suspended", wait_for(lambda: not alive(pid), 60) and vms(A).get(r, {}).get("state") == "suspended",
           (vms(A).get(r), started, log(A, r)[-1500:], open(standby_log).read()[-1500:] if os.path.exists(standby_log) else ""))
     p = subprocess.Popen([BIN, "--state", A.state, "--run", A.run, "resume", r], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -6782,7 +6799,7 @@ def in_cgroup(cg):
 
 
 def standby_pids(host, t):
-    d = os.path.join(host.run, "standby", t)
+    d = standby_dir(host.run, t)
     pids = []
     for f in os.listdir(d) if os.path.isdir(d) else []:
         if f.endswith(".lock"):
@@ -6918,7 +6935,7 @@ def gc_debris():
     os.utime(os.path.join(vd, f"{n}.log"), (old, old))
     moved, moved_new = made(os.path.join(vd, "ft-gc-moved.moved"), old), made(os.path.join(vd, "ft-gc-moved2.moved"))
     orphan, fresh = made(os.path.join(vd, "ft-gc-orphan.log"), old), made(os.path.join(vd, "ft-gc-fresh.log"))
-    sbd = os.path.join(A.run, "standby", args.template)
+    sbd = standby_dir(A.run, args.template)
     os.makedirs(sbd, exist_ok=True)
     sock = made(os.path.join(sbd, "deadbeef.999999990-1.sock"))
     ok(cli_json(A, "debug", "gc"))
