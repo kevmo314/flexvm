@@ -211,7 +211,7 @@ def fault(host, f, ms):
 FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_before_run", "restore_after_run",
           "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "resume_kill",
           "prepare_fail", "short_incoming", "slow_preload", "bad_preload", "bad_app_log", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
-          "started_fsync", "started_unmark", "start_stall", "incoming_stall", "admitted_stall", "claim_stall", "standby_lock_stall", "standby_lock_hang", "handoff_stall", "ckpt_wp_race", "ckpt_rescue_fail",
+          "started_fsync", "started_unmark", "start_stall", "incoming_stall", "incoming_gate", "admitted_stall", "claim_stall", "standby_lock_stall", "standby_lock_hang", "handoff_stall", "ckpt_wp_race", "ckpt_rescue_fail",
           "fetch_tail_enomem", "fetch_enomem_stuck", "pull_enomem", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo", "release_stall", "release_late", "no_plug", "pause_lost", "tap_backlog", "tap_backlog_stuck", "pause_unknown", "restore_unpause_fail", "resume_link_fail", "resume_partial", "repause_fail", "pause_fail", "restore_ping_slow", "readdress_fail", "no_collapse", "collapse_slow", "pages_slow", "unlend_fail", "route_stall", "suspend_slow", "owe_fail", "settle_unpause", "prealloc_fail", "resume_fence_fail")
 
 
@@ -5312,6 +5312,32 @@ def refused_admission():
     rm_ckpt(path)
 
 
+# arrival_grew's room on B above the grant B recorded at the preflight. Before B goes on, its
+# guest has grown past that grant by twice this, however fast it grows (hotplug paces it).
+ARRIVAL_MARGIN = 256
+
+
+def park_arrival(n):
+    """Migrates `n` to B in a thread (its answer in the returned dict's "r"), B parked once it
+    has admitted the preflight, before it answers it: the source runs on until `grow_parked`."""
+    res = {}
+    # Under the source's 30 s for B's answer, should the test never let it go.
+    fault(B, "incoming_gate", 25000)
+    t = threading.Thread(target=lambda: res.update(r=migrate(A, n, B)))
+    t.start()
+    return t, res
+
+
+def grow_parked(n, grow, grant, label):
+    """Grows parked `n` by `grow` MiB and lets B go on once A has at least `grant` and twice
+    ARRIVAL_MARGIN MiB of it present, so the source pauses with no less than that."""
+    hog(A, n, grow)
+    want = grant + 2 * ARRIVAL_MARGIN
+    present = lambda: vms(A)[n]["pages_mib"]["present"]
+    check(f"{label}: the guest grew before b went on", wait_for(lambda: present() >= want, 20), (grant, want, present()))
+    fault(B, "incoming_gate", 0)
+
+
 def arrival_grew():
     """A guest that grows between its migration's preflight and its pause, to
     a target with room for only what it had at the preflight, is refused
@@ -5330,24 +5356,21 @@ def arrival_grew():
     migs = lambda: sorted(os.listdir(os.path.join(B.state, "migs"))) if os.path.isdir(os.path.join(B.state, "migs")) else []
     check("arrival grew: b holds nothing before", not holds(), holds())
     recorded = migs()
-    # Room on B for the preflight's allowance (its RSS and a step, limit.rs) and a margin for the
-    # machine's own drift: far less than the guest grows by, which A and B share besides.
-    rss = v["rss_mib"]
-    room = rss + (-(-min(max(rss // 4, 256), 2048) // 128) * 128) + 256
-    time.sleep(11)  # Earlier grants on B age out.
-    reserve = mem_available() - room
-    res = {}
-    with marks(reserve, reserve, host=B):
-        # B prepares for 3 s after its admission; the guest grows meanwhile.
-        fault(B, "incoming_stall", 600000)
-        t = threading.Thread(target=lambda: res.update(r=migrate(A, n, B)))
-        t.start()
-        admitted = wait_for(lambda: holds(), 30)
-        hog(A, n, grow)
-        t.join()
-        fault(B, "incoming_stall", 0)
+    time.sleep(11)  # Earlier grants on B age out: its preflight's hold is all it counts.
+    t, res = park_arrival(n)
+    try:
+        admitted = wait_for(lambda: holds(), 30) and holds()
+        check("arrival grew: b admitted its preflight", admitted, admitted)
+        # Room on B for the grant it recorded at the preflight and a margin for the machine's own
+        # drift: far less than what the guest has grown by when B goes on, which A and B share besides.
+        grant = sum(int(f.split("-")[1]) for f in admitted or [])
+        reserve = mem_available() - grant - ARRIVAL_MARGIN
+        with marks(reserve, reserve, host=B):
+            grow_parked(n, grow, grant, "arrival grew")
+            t.join()
+    finally:
+        fault(B, "incoming_gate", 0)
     r = res["r"]
-    check("arrival grew: b admitted its preflight", admitted, (rss, room))
     check("arrival grew: refused for what it grew by", not r["ok"] and "grew to" in r["error"] and "not enough memory" in r["error"], r)
     check("arrival grew: the vm runs on at A", where(n) == {A: "running"} and md5(A, n) == m, where(n))
     check("arrival grew: b keeps no record", wait_for(lambda: migs() == recorded, 10), (recorded, migs()))
@@ -5393,13 +5416,13 @@ def arrival_grew_admitted():
         if v["guest_mib"] < grow + 256:
             raise Skip(f"its guest has {v['guest_mib']} MiB, too little to grow by {grow} MiB")
         check(f"{label}: b holds nothing before", not holds(), holds())
-        res = {}
-        fault(B, "incoming_stall", 600000)
         fault(B, "admitted_stall", 600000)
-        t = threading.Thread(target=lambda: res.update(r=migrate(A, n, B)))
-        t.start()
-        first = wait_for(lambda: holds(), 30)
-        hog(A, n, grow)
+        t, res = park_arrival(n)
+        first = wait_for(lambda: holds(), 30) and holds()
+        try:
+            grow_parked(n, grow, sum((first or {}).values()), label)
+        finally:
+            fault(B, "incoming_gate", 0)
         # Admitted at the header: a hold larger than the preflight's, for the 3 s B then stalls.
         more = first and wait_for(lambda: any(holds().get(i, 0) > m for i, m in first.items()), 20) and holds()
         return t, res, first, more
@@ -5412,8 +5435,7 @@ def arrival_grew_admitted():
     lock = json.load(open(os.path.join(B.run, "vms", f"{n}.lock")))
     os.kill(lock["pid"], signal.SIGKILL)
     t.join()
-    for f in ("incoming_stall", "admitted_stall"):
-        fault(B, f, 0)
+    fault(B, "admitted_stall", 0)
     r = res["r"]
     check("grew killed: the migration fails", not r["ok"], r)
     check("grew killed: the vm runs on at A", where(n) == {A: "running"} and md5(A, n) == m, where(n))
@@ -5426,8 +5448,7 @@ def arrival_grew_admitted():
     m = setup(n, mib=1)
     t, res, first, more = grown(n, "grew admitted")
     t.join()
-    for f in ("incoming_stall", "admitted_stall"):
-        fault(B, f, 0)
+    fault(B, "admitted_stall", 0)
     r = res["r"]
     check("grew admitted: b's hold grew by what the guest grew by", more, (first, holds()))
     check("grew admitted: the migration commits", r["ok"], r)

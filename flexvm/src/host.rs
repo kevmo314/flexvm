@@ -2278,6 +2278,13 @@ pub fn stall(name: &str) {
     }
 }
 
+/// Test hook: parks here while `name` is armed (its arming bounds the wait), until a test disarms it.
+pub fn gate(name: &str) {
+    while fault(name) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 pub fn arm(host: &Host, name: &str, ms: u64) -> Result<()> {
     let _l = host.lock()?;
     let path = host.run.join("faults.json");
