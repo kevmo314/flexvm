@@ -246,6 +246,9 @@ Without one, `run` loads the snapshot (~50-100 ms). `flexvm standby` with no
 count shows each template's count and how many standby VMs it has now. The
 template must exist: a count is kept and refilled by every listener and VM
 process, retried each minute (errors in `standby.log` in the `dir` that `flexvm standby` shows).
+Standby sockets are `RUN/standby/HASH/PID.sock`, where HASH is the 16-hex hash
+of the template's name. Claims carry the generation key; `PID-START.lock`
+identifies the process while it lives. Socket paths must be under 108 bytes.
 
 ## Templates from container images
 

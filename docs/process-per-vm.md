@@ -161,10 +161,10 @@ RUN (default /run/flexvm, tmpfs)
   grants-BOOTID          recent grants not yet held, counted against the reserve
   evict.active           present while the host is under its eviction mark
   evict.backoff          refused VM and peer pairs and when to try them again
-  standby/H/             template T's standby files, H the hash of T's name (any T fits sun_path;
+  standby/H/             template T's standby files, H the 16-hex hash of T's name (independent of T's length;
                          `flexvm standby` shows each one's `dir`)
   standby/H/.template    T, the template's name
-  standby/H/KEY.PID-START.sock a standby VM of template T, generation KEY (PID-START.lock while it lives)
+  standby/H/PID.sock     a standby VM of template T (PID-START.lock while it lives)
   standby/H/PID-START.claim  locked by a standby VM while a claim of it is under way
   standby/H/PID-START.take   locked by a `run` while it tries that standby (others try another first)
   standby/H/.refill      one refill of T at a time (flock)
@@ -393,8 +393,9 @@ to receive.
 `flexvm standby [--template T] N` records N in `STATE/standby/T` and starts
 standby VMs until there are N: each is `flexvm run --standby`, a VM process
 that restores the template, lets the guest reseed and settle, pauses, and
-listens on `RUN/standby/HASH/KEY.PID-START.sock` (HASH: of the template's name). `flexvm run` claims one (`claim
-{name, ip, cmd}` with its stdout/stderr passed over SCM_RIGHTS): the standby
+listens on `RUN/standby/HASH/PID.sock` (HASH: 16 hex characters of the template's name;
+the claim request carries the generation key). `flexvm run` claims one (`claim
+{name, ip, cmd, generation}` with its stdout/stderr passed over SCM_RIGHTS): the standby
 takes the name and address, routes, resumes, sends `START`, and becomes that
 VM. A claimed standby starts its replacement, and every 5 s the listener and
 each running VM process refill any pool below its target (skipped while

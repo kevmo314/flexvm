@@ -124,14 +124,17 @@ fn vm_files(host: &Host) {
     }
 }
 
-/// `KEY.PID-START.sock`, `PID-START.claim` and `PID-START.take` (a claimer's) of standbys whose locks are gone,
+/// `PID.sock` (and legacy `KEY.PID-START.sock`), `PID-START.claim` and `PID-START.take` (a claimer's) of standbys whose locks are gone,
 /// and `.PID-START.lock` (a lock not yet in place, unlocked at first) of standbys gone.
 fn standby_sockets(dir: &Path) {
     for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         let n = e.file_name().to_string_lossy().into_owned();
         let claim = n.strip_suffix(".claim").or_else(|| n.strip_suffix(".take"));
         let tmp = n.strip_prefix('.').and_then(|n| n.strip_suffix(".lock"));
-        let Some(id) = claim.or(tmp).or_else(|| n.strip_suffix(".sock").and_then(|s| s.rsplit_once('.')).map(|(_, id)| id)) else { continue };
+        let socket_id = n.strip_suffix(".sock").and_then(|s| s.parse().ok()).map(|pid| Ident::of(pid).map(|id| id.key()).unwrap_or_else(|| format!("{pid}-0")));
+        let Some(id) = claim.or(tmp).or(socket_id.as_deref()).or_else(|| n.strip_suffix(".sock").and_then(|s| s.rsplit_once('.')).map(|(_, id)| id)) else {
+            continue;
+        };
         let Some((pid, start)) = id.split_once('-') else { continue };
         if [pid, start].iter().any(|s| s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit())) {
             continue;
@@ -193,8 +196,16 @@ mod tests {
         for s in [".999999999-1.lock", &mine] {
             File::create(d.join(s)).unwrap();
         }
+        let me = Ident::me();
+        let live_lock = File::create(d.join(format!("{}.lock", me.key()))).unwrap();
+        flock(&live_lock, libc::LOCK_EX).unwrap();
+        let live_sock = format!("{}.sock", me.pid);
+        File::create(d.join(&live_sock)).unwrap();
+        File::create(d.join("999999990.sock")).unwrap();
         standby_sockets(&d);
         let left = |n: &str| d.join(n).exists();
+        assert!(left(&live_sock));
+        assert!(!left("999999990.sock"));
         assert!(left("key.1-1.sock"), "its standby holds its lock");
         assert!(left("4-1.claim") && left("5-7.claim"), "a claim marker of a standby still here stays");
         assert!(!left("3-1.claim") && !left("5-6.claim"), "one unlocked goes once its lock is gone or names another process");

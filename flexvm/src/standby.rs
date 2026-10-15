@@ -1,7 +1,7 @@
 //! Standby VMs: `flexvm run --standby` processes holding a restored, settled,
 //! paused VM so `run` is a resume plus `START`. Each listens on
-//! `RUN/standby/HASH/KEY.PID-START.sock` (KEY: template generation) and holds
-//! `PID-START.lock` while alive, and `PID-START.claim` locked while a claim is under way. Protocol: `run` sends `claim {name, ip, cmd}` with
+//! `RUN/standby/HASH/PID.sock` (HASH: 16 hex characters) and holds
+//! `PID-START.lock` while alive, and `PID-START.claim` locked while a claim is under way. Protocol: `run` sends `claim {name, ip, cmd, generation}` with
 //! its stdout/stderr; once the standby replies `claiming`, the claim may have
 //! started the VM and is never retried elsewhere. `{"exit": code}` follows.
 
@@ -348,7 +348,7 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
     let d = create_dir(host, template)?;
     let me = Ident::me();
     let id = me.key();
-    let (lock_path, sock) = (d.join(format!("{id}.lock")), d.join(format!("{mine}.{id}.sock")));
+    let (lock_path, sock) = (d.join(format!("{id}.lock")), d.join(format!("{}.sock", me.pid)));
     crate::socket::check(&sock)?;
     crate::host::stall("standby_lock_stall");
     // Test hook: held before its lock for as long as armed (past `LOCKED_TIMEOUT`, say).
@@ -371,6 +371,7 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
     *p.sizes.lock().unwrap() = Some(ready.mem_sizes());
     *p.standby.lock().unwrap() = Some(ready);
     save_load_set(host, &tpl);
+    let _ = std::fs::remove_file(&sock); // A previous process with this pid may have left it.
     let listener = UnixListener::bind(&sock)?;
     if let Some(mut f) = notify.take() {
         let _ = send_json(&mut f, &json!({"ok": true, "result": {"pid": me.pid, "template": template}}));
@@ -407,6 +408,9 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
         };
         let Ok((line, fds)) = crate::util::recv_with_fds(&c, 1 << 20, ready) else { continue };
         let Ok(req) = serde_json::from_slice::<Value>(&line) else { continue };
+        if req["generation"] != mine {
+            continue;
+        }
         // Locked until the claim succeeds or rolls back (dropped): relief does not count it stopped.
         let claiming = File::options().create(true).truncate(false).write(true).open(&claim_path)?;
         crate::host::flock(&claiming, libc::LOCK_EX)?;
@@ -511,10 +515,15 @@ pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]
         .flatten()
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with(&format!("{key}."))) && p.extension().is_some_and(|e| e == "sock"))
+        .filter(|p| {
+            p.extension().is_some_and(|e| e == "sock")
+                && p.file_stem().and_then(|s| s.to_str()).is_some_and(|s| s.parse::<u32>().is_ok() || s.starts_with(&format!("{key}.")))
+        })
         .collect();
     socks.sort();
-    let mut line = serde_json::to_vec(req)?;
+    let mut req = req.clone();
+    req["generation"] = json!(key);
+    let mut line = serde_json::to_vec(&req)?;
     line.push(b'\n');
     let name = req["name"].as_str().unwrap_or("");
     // One budget for all (a stopped standby uses it up), and a moment past it for each live one, up to a few.
@@ -582,10 +591,13 @@ pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]
     Ok(None)
 }
 
-/// `KEY.ID.sock`'s `ID.take`, locked: Some(lock), Some(None) if it cannot be had (no
+/// `PID.sock`'s `PID-START.take`, locked: Some(lock), Some(None) if it cannot be had (no
 /// such name, a file it cannot create: tried anyway), None if another claimer holds it.
 fn try_take(sock: &std::path::Path) -> Option<Option<File>> {
-    let Some(id) = sock.file_stem().and_then(|s| s.to_str()).and_then(|s| s.rsplit_once('.')).map(|(_, id)| id) else { return Some(None) };
+    let Some(stem) = sock.file_stem().and_then(|s| s.to_str()) else { return Some(None) };
+    let Some(id) = stem.parse().ok().and_then(Ident::of).map(|id| id.key()).or_else(|| stem.rsplit_once('.').map(|(_, id)| id.to_owned())) else {
+        return Some(None);
+    };
     let Ok(f) = File::options().create(true).truncate(false).write(true).open(sock.with_file_name(format!("{id}.take"))) else { return Some(None) };
     match flock(&f, libc::LOCK_EX | libc::LOCK_NB) {
         Ok(()) => Some(Some(f)),
@@ -667,12 +679,22 @@ mod tests {
 
     #[test]
     fn long_template_has_a_short_socket_path() {
-        let root = std::env::temp_dir().join(format!("fv-long-{}", std::process::id()));
-        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let root = PathBuf::from(format!("/tmp/fv-long-{}", std::process::id()));
+        let run = root.join("r".repeat(60 - root.as_os_str().len() - 1));
+        let host = Host::open(&root.join("state"), &run).unwrap();
         let template = "t".repeat(64);
         let d = create_dir(&host, &template).unwrap();
-        let sock = d.join(format!("0123456789abcdef.{}.sock", Ident::me().key()));
-        crate::socket::check(&sock).unwrap();
+        assert!(host.run.as_os_str().len() >= 60);
+        assert_eq!(d.file_name().unwrap().len(), 16);
+        for pid in [Ident::me().pid, u32::MAX] {
+            let sock = d.join(format!("{pid}.sock"));
+            crate::socket::check(&sock).unwrap();
+        }
+        let sock = d.join(format!("{}.sock", Ident::me().pid));
+        let taking = try_take(&sock).unwrap().unwrap();
+        assert!(try_take(&sock).is_none());
+        assert!(d.join(format!("{}.take", Ident::me().key())).exists());
+        drop(taking);
         assert_eq!(templates(&host), [template]);
         assert_ne!(d, dir(&host, &"u".repeat(64)));
         std::fs::remove_dir_all(root).unwrap();
@@ -756,7 +778,8 @@ mod tests {
         let live = UnixListener::bind(d.join("a.2.sock")).unwrap();
         let live = std::thread::spawn(move || {
             let (c, _) = live.accept().unwrap();
-            std::io::BufRead::read_line(&mut BufReader::new(&c), &mut String::new()).unwrap();
+            let req = crate::util::recv_json(&mut BufReader::new(&c)).unwrap().unwrap();
+            assert_eq!(req["generation"], "default");
             send_json(&mut &c, &json!({"claiming": true})).unwrap();
             send_json(&mut &c, &json!({"ok": true, "result": "live"})).unwrap();
         });
