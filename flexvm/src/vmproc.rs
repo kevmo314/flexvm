@@ -1711,18 +1711,28 @@ pub fn peer_call(peer: &str, req: Value) -> Result<Value> {
     Ok(crate::util::rpc(peer, Duration::from_millis(500), Instant::now() + Duration::from_secs(2), &req)?.1)
 }
 
+/// Two calls and the pause between them (`tell`).
+const TELL_WAIT: Duration = Duration::from_secs(5);
+
+/// Tells every peer at once, waiting `TELL_WAIT` at most, a hung lookup of a
+/// peer's name included: a peer not told by then is told on alone.
 pub fn tell_peers(host: &Host, req: Value) {
-    let sends: Vec<_> = host
-        .config_now()
-        .peers
-        .iter()
-        .cloned()
-        .map(|p| {
-            let req = req.clone();
-            thread::spawn(move || tell(&p, req))
-        })
-        .collect();
-    sends.into_iter().for_each(|s| drop(s.join()));
+    let (done, told) = std::sync::mpsc::channel();
+    let peers = host.config_now().peers;
+    let n = peers.len();
+    for p in peers {
+        let (req, done) = (req.clone(), done.clone());
+        thread::spawn(move || {
+            let _ = tell(&p, req);
+            let _ = done.send(());
+        });
+    }
+    let by = Instant::now() + TELL_WAIT;
+    for _ in 0..n {
+        if told.recv_timeout(by.saturating_duration_since(Instant::now())).is_err() {
+            break;
+        }
+    }
 }
 
 /// A route message, sent once more a second after it fails: nothing else

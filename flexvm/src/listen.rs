@@ -22,9 +22,41 @@ use crate::util::{send_json, Result, Slot};
 /// Requests handled at once; more connections are closed unanswered.
 const MAX_ACTIVE: usize = 512;
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
-/// Unknown addresses held while a peer's name is looked up; more are refused at once.
+/// Unknown addresses held while a peer's name is looked up, in all and from
+/// any one address (a peer's restart backlog can hold a few of its requests);
+/// more are refused at once. One source cannot take them all; many at once
+/// still can, each for `ADMIT_WAIT`.
 const MAX_WAITING: usize = 64;
-static WAITING: AtomicUsize = AtomicUsize::new(0);
+const MAX_WAITING_FROM: usize = 4;
+
+#[derive(Clone, Default)]
+struct Waiting(Arc<Mutex<HashMap<IpAddr, usize>>>);
+
+struct Wait(Waiting, IpAddr);
+
+impl Waiting {
+    fn take(&self, from: IpAddr) -> Option<Wait> {
+        let from = from.to_canonical();
+        let mut w = self.0.lock().unwrap();
+        if w.values().sum::<usize>() >= MAX_WAITING || w.get(&from).is_some_and(|&n| n >= MAX_WAITING_FROM) {
+            return None;
+        }
+        *w.entry(from).or_default() += 1;
+        Some(Wait(self.clone(), from))
+    }
+}
+
+impl Drop for Wait {
+    fn drop(&mut self) {
+        let mut w = self.0 .0.lock().unwrap();
+        if let Some(n) = w.get_mut(&self.1) {
+            *n -= 1;
+            if *n == 0 {
+                w.remove(&self.1);
+            }
+        }
+    }
+}
 
 pub fn validate(listener: &TcpListener, cfg: &crate::host::Config) -> Result<()> {
     if let Some(e) = unreachable_at(listener.local_addr()?, v6only(listener), cfg.advertise()?.as_deref()) {
@@ -42,6 +74,7 @@ pub fn main(host: Host, listener: TcpListener) -> Result<()> {
     crate::standby::maintain(host.clone());
     crate::gc::periodic(host.clone());
     let peers = Peers::watch(host.clone());
+    let waits = Waiting::default();
     // Refusals are logged off the accept loop, never waiting on stderr: past 64 queued, dropped.
     let (refusals, queued) = std::sync::mpsc::sync_channel::<String>(64);
     std::thread::spawn(move || queued.into_iter().for_each(|e| crate::log!("peer request: {e}")));
@@ -58,17 +91,20 @@ pub fn main(host: Host, listener: TcpListener) -> Result<()> {
             }
         };
         let Ok(from) = conn.peer_addr().map(|a| a.ip()) else { continue };
-        let names = host.config_now().peers;
-        if peers.admit(&names, from) {
-            let Some(slot) = Slot::take(&ACTIVE, MAX_ACTIVE) else { continue };
-            let host = host.clone();
-            std::thread::spawn(move || serve(&host, conn, slot, deadline));
-            continue;
-        }
         // Refused here, at once, unless a configured name is still being
         // looked up: then it may be this one's, and a bounded few wait for it
         // (a peer's restart backlog, a peer just added).
-        let Some(waiting) = peers.resolving(&names).then(|| Slot::take(&WAITING, MAX_WAITING)).flatten() else {
+        let waiting = match peers.check(&host.config_now().peers, from) {
+            Some(true) => {
+                let Some(slot) = Slot::take(&ACTIVE, MAX_ACTIVE) else { continue };
+                let host = host.clone();
+                std::thread::spawn(move || serve(&host, conn, slot, deadline));
+                continue;
+            }
+            Some(false) => None,
+            None => waits.take(from),
+        };
+        let Some(waiting) = waiting else {
             not_a_peer(conn, from, &refusals);
             continue;
         };
@@ -204,18 +240,25 @@ impl Peers {
         names.iter().any(|n| !r.contains_key(n) && l.get(n) == Some(&None))
     }
 
+    /// Whether `from` is a peer; None while it may yet be, a name with no
+    /// addresses still being looked up.
+    fn check(&self, names: &[String], from: IpAddr) -> Option<bool> {
+        if self.admit(names, from) {
+            return Some(true);
+        }
+        // A lookup that ended since may have given its address.
+        (!self.resolving(names)).then(|| self.admit(names, from))
+    }
+
     /// Admits `from` once a lookup under way gives its address, or refuses it
     /// when none is left under way, or at `by`.
     fn admit_by(&self, host: &Host, from: IpAddr, by: Instant) -> bool {
         loop {
-            let names = host.config_now().peers;
-            if self.admit(&names, from) {
-                return true;
+            match self.check(&host.config_now().peers, from) {
+                Some(admitted) => return admitted,
+                None if Instant::now() >= by => return false,
+                None => std::thread::sleep(Duration::from_millis(20)),
             }
-            if !self.resolving(&names) || Instant::now() >= by {
-                return false;
-            }
-            std::thread::sleep(Duration::from_millis(20));
         }
     }
 }
@@ -550,6 +593,40 @@ mod tests {
         assert!(!p.admit_by(&host, "10.9.9.9".parse().unwrap(), start + Duration::from_secs(5)));
         assert!(start.elapsed() < Duration::from_millis(100), "{:?}", start.elapsed());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn one_source_cannot_take_every_wait() {
+        let w = Waiting::default();
+        let (one, other): (IpAddr, IpAddr) = ("10.9.9.9".parse().unwrap(), "10.1.0.2".parse().unwrap());
+        let held: Vec<_> = (0..MAX_WAITING_FROM).map(|_| w.take(one).unwrap()).collect();
+        assert!(w.take(one).is_none() && w.take("::ffff:10.9.9.9".parse().unwrap()).is_none());
+        let peer = w.take(other).expect("another source still waits");
+        drop(held);
+        assert!(w.take(one).is_some(), "freed as each wait ends");
+        drop(peer);
+        // Many sources still share MAX_WAITING in all.
+        let many: Vec<_> = (0..).map_while(|i: u32| w.take(IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + i)))).collect();
+        assert_eq!(many.len(), MAX_WAITING);
+    }
+
+    #[test]
+    fn a_lookup_ending_while_admitting_is_not_a_refusal() {
+        let names = vec!["peer.test:7070".to_string()];
+        let from: IpAddr = "10.1.0.2".parse().unwrap();
+        for _ in 0..2000 {
+            let p = Peers::default();
+            p.0.lookups.lock().unwrap().insert(names[0].clone(), None);
+            // As the lookup thread ends: published, then no longer under way.
+            let q = p.clone();
+            let lookup = std::thread::spawn(move || {
+                q.0.resolved.write().unwrap().insert("peer.test:7070".into(), vec!["10.1.0.2".parse().unwrap()]);
+                q.0.lookups.lock().unwrap().insert("peer.test:7070".into(), Some(Instant::now()));
+            });
+            assert_ne!(p.check(&names, from), Some(false));
+            lookup.join().unwrap();
+            assert_eq!(p.check(&names, from), Some(true));
+        }
     }
 
     #[test]
