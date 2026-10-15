@@ -270,7 +270,9 @@ pub fn clock(uds: &Path, timeout: Duration) -> Result<f64> {
 }
 
 fn message(uds: &Path, line: &str, timeout: Duration) -> Result<String> {
-    match read_frame(&mut request_on(crate::util::connect_unix(uds, timeout)?, line, timeout)?)? {
+    let at = Instant::now() + timeout;
+    let s = crate::util::connect_unix(uds, timeout)?;
+    match read_frame(&mut handshake(By { s, at }, line)?)? {
         Some((FRAME_MSG, m)) => Ok(String::from_utf8_lossy(&m).into_owned()),
         Some((_, m)) => bail!("unexpected reply to {line}: {}", String::from_utf8_lossy(&m)),
         None => bail!("guest closed the connection during {line}"),
@@ -324,6 +326,31 @@ pub fn start_logs(s: UnixStream, offset: u64, follow: bool, timeout: Duration) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_deadline_bounds_a_trickled_frame() {
+        let path = std::env::temp_dir().join(format!("flexvm-message-{}.sock", std::process::id()));
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let uds = path.clone();
+        let client = std::thread::spawn(move || {
+            let start = Instant::now();
+            let e = message(&uds, "FORKS", Duration::from_millis(100)).unwrap_err();
+            assert_eq!(e.downcast_ref::<std::io::Error>().unwrap().kind(), ErrorKind::TimedOut);
+            assert!(start.elapsed() < Duration::from_secs(1));
+        });
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.write_all(b"OK 1\n").unwrap();
+        let mut frame = Vec::new();
+        write_frame(&mut frame, FRAME_MSG, b"ok 123456789").unwrap();
+        for byte in frame {
+            if stream.write_all(&[byte]).is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        client.join().unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn exec_deadline_bounds_a_guest_that_keeps_answering() {

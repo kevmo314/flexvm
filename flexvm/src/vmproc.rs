@@ -1314,8 +1314,8 @@ pub enum Resized {
 }
 
 /// Keeps `headroom` free via hotplug, never below the template's size. The
-/// guest is untrusted: its free memory (`hint` or balloon stats) only steers
-/// bounded, reserve-admitted growth. Callers hold the op lock (or copy-growth).
+/// guest's hint only steers bounded, reserve-admitted growth; only balloon
+/// statistics may trigger shrinking. Callers hold the op lock (or copy-growth).
 fn resize(vm: &Vm, host: &Host, hint: Option<u64>, grow_only: bool) -> Result<Resized> {
     let meta = &vm.template.meta;
     let hotplug_total = meta.max_mib - meta.mem_mib;
@@ -1416,7 +1416,7 @@ impl Sizes {
         // Sizes count from what is plugged: urgent growth cancels a pending shrink.
         let new = if urgent {
             (plugged + round(headroom * 2 - avail).min(round(total / 4).max(STEP_MIB))).min(self.hotplug_total)
-        } else if !grow_only && avail > headroom * 3 && plugged > self.floor && since > Duration::from_secs(10) {
+        } else if !asked && !grow_only && avail > headroom * 3 && plugged > self.floor && since > Duration::from_secs(10) {
             plugged.saturating_sub((avail - headroom * 2) / STEP_MIB * STEP_MIB).max(self.floor)
         } else {
             plugged
@@ -1957,6 +1957,19 @@ mod tests {
 
     fn secs(s: u64) -> Duration {
         Duration::from_secs(s)
+    }
+
+    #[test]
+    fn memory_hints_only_grow() {
+        for avail in [7800, 99999999 >> 10, u64::MAX] {
+            assert_eq!(SIZES.plan(8192, 8192, avail, secs(11), true, false), Some(Plan { settle: false, new: 8192, charge: 0, short: false }));
+        }
+        // Balloon statistics still reclaim surplus memory.
+        assert_eq!(SIZES.plan(8192, 8192, 7800, secs(11), false, false), Some(Plan { settle: false, new: 4736, charge: 0, short: false }));
+        // A fresh hint bypasses the statistics delay and grows promptly.
+        let p = SIZES.plan(8192, 8192, 0, Duration::ZERO, true, false).unwrap();
+        assert!(p.new > 8192 && p.charge == p.new - 8192 && p.short, "{p:?}");
+        assert_eq!(SIZES.plan(8192, 8192, 0, Duration::ZERO, false, false).unwrap().new, 8192);
     }
 
     #[test]
