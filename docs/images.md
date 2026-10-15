@@ -31,7 +31,7 @@ the guest can leave any cgroup); without cgroup2 their session is killed.
 - **Pull.** Native registry v2 client (no docker or skopeo): anonymous bearer
   tokens, or basic credentials from `$DOCKER_CONFIG`, `~/.docker/config.json`
   or, under sudo, the invoking user's. Indexes resolve to linux/amd64. Blobs
-  are streamed to `ARTIFACTS/images/blobs/sha256/` and checked against their
+  are streamed to `STATE/images/blobs/sha256/` and checked against their
   digests; gzip, zstd and uncompressed layers are supported. Archives are read
   in place (layers are located inside the tarball, not extracted). Registry
   credentials go only over HTTPS to the registry itself or its token service
@@ -41,7 +41,7 @@ the guest can leave any cgroup); without cgroup2 their session is killed.
   hard links. Every path resolves inside the image (`openat2(RESOLVE_IN_ROOT)`),
   so absolute symlinks behave as in a container and a layer cannot write
   outside it; whiteouts must name one entry, and removal walks directory fds.
-  Layers are unpacked in `--image-staging` (default `/var/lib/flexvm/staging`),
+  Layers are unpacked in `STATE/staging` (default `/var/lib/flexvm/staging`),
   which must be root-owned and 0700 with an ancestry only root can change, and
   is used through a descriptor, so other users can neither reach the image's
   setuid files and device nodes nor swap the directory mid-build. A build
@@ -55,7 +55,7 @@ the guest can leave any cgroup); without cgroup2 their session is killed.
   the image's own `/etc/passwd` and `/etc/group`), an `/etc/hosts`, and an
   empty `/etc/resolv.conf` if the image has none (the host's `--dns` fills
   it at `run`). `mkfs.ext4 -d` writes the read-only image. Built filesystems
-  are cached in `ARTIFACTS/images/rootfs/` by image config digest, flexvm-init
+  are cached in `STATE/images/rootfs/` by image config digest, flexvm-init
   and overrides, and templates attach the cached file in place, so templates of
   one image share one copy in the page cache (it is never rewritten; deleting it
   breaks those templates). Builds of the same cache key are serialized with

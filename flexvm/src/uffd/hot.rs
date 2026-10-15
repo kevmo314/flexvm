@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-/// Hot pages copied during a pause, at most (`FLEXVM_HOT_MIB`; 0 protects every dirty page instead): about 0.5 µs a
+/// Hot pages copied during a pause, at most: about 0.5 µs a
 /// page here, so up to 8 ms more pause, against 1.5 µs or more a page of guest time through faults. All or none: with
 /// more, copying some would cost the pause as much but spare the guest little (a vCPU writing pages not copied
 /// stalls as before).
@@ -40,10 +40,6 @@ const HOT_RUN: usize = 256;
 /// fewer pages unprotected, and faulted three times as often.
 const HOT_BLOCK: usize = 64;
 const MADV_POPULATE_WRITE: libc::c_int = 23;
-
-fn cap() -> usize {
-    std::env::var("FLEXVM_HOT_MIB").ok().and_then(|v| v.parse().ok()).unwrap_or(HOT_MIB) << 20 >> 12
-}
 
 /// Anonymous memory, populated when allocated, so that filling it during a pause takes no page faults (several
 /// microseconds each here).
@@ -129,8 +125,8 @@ impl Pager {
     /// Before a keep-running checkpoint pauses the VM: allocates the memory its hot pages are copied into, a little
     /// more than is dirty now, within `HOT_MIB` (none past it). Without it, the pause protects every dirty page.
     pub fn prepare_hot(&self) {
-        let cap = cap();
-        if cap == 0 || !self.tracking() {
+        let cap = HOT_MIB << 20 >> 12;
+        if !self.tracking() {
             return;
         }
         let dirty = self.dirty_count();

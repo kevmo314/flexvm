@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
-# Builds Firecracker with the flexvm patches into ./artifacts/firecracker.
+# Builds Firecracker with the flexvm patches into STATE/artifacts/firecracker.
+# usage: build-firecracker.sh [--state DIR (/var/lib/flexvm)]
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
+state=/var/lib/flexvm
+if [ "${1:-}" = --state ]; then state=$2; fi
 # shellcheck source=versions.sh
 source "$root/scripts/versions.sh"
 src=${FC_SRC:-$root/build/firecracker-src}
@@ -34,6 +37,5 @@ export CFLAGS_x86_64_unknown_linux_musl="-idirafter $kh"
 
 cd "$src"
 cargo build --release --target x86_64-unknown-linux-musl -p firecracker
-mkdir -p "$root/artifacts"
-install -m 755 build/cargo_target/x86_64-unknown-linux-musl/release/firecracker "$root/artifacts/firecracker"
-"$root/artifacts/firecracker" --version
+sudo install -D -m 755 build/cargo_target/x86_64-unknown-linux-musl/release/firecracker "$state/artifacts/firecracker"
+"$state/artifacts/firecracker" --version

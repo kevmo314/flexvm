@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
-# Downloads Firecracker, a guest kernel and a base rootfs into ./artifacts.
+# Downloads Firecracker, a guest kernel and a base rootfs into STATE/artifacts.
+# usage: fetch.sh [--state DIR (/var/lib/flexvm)] [--urls]
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
+state=/var/lib/flexvm
+if [ "${1:-}" = --state ]; then state=$2; shift 2; fi
 # shellcheck source=versions.sh
 source "$root/scripts/versions.sh"
 CI_VERSION=${CI_VERSION:-v1.15}
@@ -18,49 +21,46 @@ if [ "${1:-}" = --urls ]; then
   exit 0
 fi
 
-out=$root/artifacts
-mkdir -p "$out"
+out=$state/artifacts
+sudo mkdir -p "$out"
 cd "$out"
-
-temps=()
-trap 'rm -rf -- "${temps[@]}"' EXIT
+work=$(mktemp -d)
+trap 'rm -rf -- "$work"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+# A download into $work, checked against its pinned SHA256.
 download() {
-  local target=$1 url=$2 tmp checksum
+  local target=$work/$1 url=$2 checksum
   checksum=$(awk -v url="$url" '$2 == url {print $1}' "$root/scripts/checksums.sha256")
   if [[ ! $checksum =~ ^[[:xdigit:]]{64}$ ]]; then
     echo "No pinned SHA256 for $url; update scripts/checksums.sha256" >&2
     return 1
   fi
-  tmp=$(mktemp "$target.XXXXXX")
-  temps+=("$tmp")
-  curl -fsSL -o "$tmp" "$url"
-  if ! printf '%s  %s\n' "$checksum" "$tmp" | sha256sum --check --status; then
+  curl -fsSL -o "$target" "$url"
+  if ! printf '%s  %s\n' "$checksum" "$target" | sha256sum --check --status; then
     echo "SHA256 mismatch for $url" >&2
     return 1
   fi
-  mv -f "$tmp" "$target"
 }
 
 if [ ! -x firecracker ]; then
   echo "fetching firecracker $FC_VERSION"
-  tmp=$(mktemp -d ./firecracker.XXXXXX)
-  temps+=("$tmp")
-  download "$tmp/firecracker.tgz" "$FC_URL"
-  tar xzf "$tmp/firecracker.tgz" -C "$tmp"
-  mv "$tmp/release-$FC_VERSION-$ARCH/firecracker-$FC_VERSION-$ARCH" firecracker
+  download firecracker.tgz "$FC_URL"
+  tar xzf "$work/firecracker.tgz" -C "$work"
+  sudo install -m 755 "$work/release-$FC_VERSION-$ARCH/firecracker-$FC_VERSION-$ARCH" firecracker
 fi
 
 if [ ! -f vmlinux ]; then
   echo "fetching $KERNEL"
   download vmlinux "$CI/$KERNEL"
+  sudo install -m 644 "$work/vmlinux" vmlinux
 fi
 
 if [ ! -f base.squashfs ]; then
   echo "fetching ubuntu-24.04 rootfs"
   download base.squashfs "$CI/ubuntu-24.04.squashfs"
+  sudo install -m 644 "$work/base.squashfs" base.squashfs
 fi
 
 ls -lh "$out"

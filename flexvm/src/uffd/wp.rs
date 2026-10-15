@@ -23,7 +23,7 @@ const PROTECT_GAP: usize = 64;
 /// at `PROTECT_GAP` stays below it. So only a larger region written in pages scattered all over pays the refaults that
 /// merging causes, and its pause stays bounded. Not across kept hot pages, though: a region ends with up to one more
 /// range than it has runs of kept pages, if that is more (hot pages need not be consecutive, so up to one more than
-/// `FLEXVM_HOT_MIB` holds pages: 16,385 at its default).
+/// `HOT_MIB` holds pages: 16,385).
 pub(super) const PROTECT_MAX: usize = 4096;
 
 /// Pages a write-protect fault unprotects (and saves first, during a copy), at the least.

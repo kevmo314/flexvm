@@ -5,10 +5,11 @@ scenario checks that the VM ends up running on exactly one host (md5 of a
 guest file intact) or cleanly gone. Run as root.
 
 usage: scripts/faults.py [--a ADDR] [--b ADDR] [--a-dir DIR] [--b-dir DIR]
-                         [--bin FLEXVM] [--artifacts DIR] [--ckpt-dir DIR] SCENARIO... | all
+                         [--bin FLEXVM] [--state DIR] [--ckpt-dir DIR] SCENARIO... | all
 
 The script starts both listeners (FLEXVM_FAULTS=1, VMs log to DIR/run/vms)
-and stops them at the end. Checkpoint scenarios write to --ckpt-dir.
+and stops them at the end. Each host's state links artifacts/ and templates/
+to --state's. Checkpoint scenarios write to --ckpt-dir.
 """
 import argparse, base64, fcntl, json, struct, os, re, signal, socket, subprocess, sys, tempfile, threading, time, traceback
 
@@ -26,7 +27,7 @@ for h in "ab":
     p.add_argument(f"--{h}-listen-log", help=f"host {h.upper()}'s listener log (default: its run directory's listen.log)")
 p.add_argument("--no-listeners", action="store_true", help="use the listeners already running on --a and --b")
 p.add_argument("--bin", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "target", "release", "flexvm"))
-p.add_argument("--artifacts", default=os.environ.get("FLEXVM_ARTIFACTS", "artifacts"))
+p.add_argument("--state", default="/var/lib/flexvm", help="the state directory whose artifacts and templates the hosts use")
 p.add_argument("--ckpt-dir", default=os.path.join(tempfile.gettempdir(), "flexvm-checkpoints"),
                help="where checkpoint scenarios write checkpoints (removed afterwards)")
 p.add_argument("--template", default="small")
@@ -52,7 +53,12 @@ class Host:
 
 A = Host(args.a, args.a_dir, args.a_ips, args.a_state, args.a_run, args.a_listen_log)
 B = Host(args.b, args.b_dir, args.b_ips, args.b_state, args.b_run, args.b_listen_log)
-ENV = dict(os.environ, FLEXVM_FAULTS="1", FLEXVM_ARTIFACTS=os.path.abspath(args.artifacts))
+ENV = dict(os.environ, FLEXVM_FAULTS="1")
+for h in (A, B):
+    os.makedirs(h.state, exist_ok=True)
+    for d in ("artifacts", "templates"):
+        if not os.path.lexists(os.path.join(h.state, d)):
+            os.symlink(os.path.join(os.path.abspath(args.state), d), os.path.join(h.state, d))
 listeners = {}
 
 
@@ -2213,9 +2219,8 @@ def arrival_killed_route():
 def fc_prepare():
     """Firecracker's prepared load (firecracker/0002-*.patch): refuses a second
     prepare, a snapshot of another layout, and a load after boot config."""
-    art = args.artifacts
-    tpls = os.environ.get("FLEXVM_TEMPLATES") or os.path.join(art, "templates")
-    fc = os.path.join(art, "firecracker")
+    tpls = os.path.join(A.state, "templates")
+    fc = os.path.join(A.state, "artifacts", "firecracker")
     other = next((t for t in sorted(os.listdir(tpls)) if t != args.template and not t.startswith(".")), "") if os.path.isdir(tpls) else ""
     vmstate = lambda t: os.path.join(tpls, t, "vmstate")
     if not os.path.exists(vmstate(other)):
@@ -7247,16 +7252,14 @@ def revoked_publication():
 
 def app_template():
     """A template whose app floods its log past the guest's 1 MiB ring, then
-    prints numbered lines (built from --image, cached in IMAGE_CACHE if set)."""
+    prints numbered lines (built from --image)."""
     name = os.environ.get("APP_TEMPLATE")
     if name:
         return name
     name = args.template + "-applog"
-    templates = os.environ.get("FLEXVM_TEMPLATES") or os.path.join(os.path.abspath(args.artifacts), "templates")
-    if not os.path.isdir(os.path.join(templates, name)):
+    if not os.path.isdir(os.path.join(A.state, "templates", name)):
         cmd = ["sh", "-c", "head -c 8000000 /dev/zero | tr '\\0' x; echo; i=0; while :; do echo applog-$i; i=$((i+1)); sleep 0.05; done"]
-        cache = ["--image-cache", os.environ["IMAGE_CACHE"]] if os.environ.get("IMAGE_CACHE") else []
-        code, out, err = cli(A, "template", name, "--image", args.image, *cache, "--vcpus", "2", "--max", "2048", "--cmd", json.dumps(cmd), timeout=600)
+        code, out, err = cli(A, "template", name, "--image", args.image, "--vcpus", "2", "--max", "2048", "--cmd", json.dumps(cmd), timeout=600)
         assert code == 0, err or out
     return name
 
@@ -7647,7 +7650,7 @@ def template_tap():
     lives is kept, as are another host's (a prefix extending this one's,
     #193) and a tap with no owner, whatever their names read as."""
     name = f"ft-tpltap-{os.getpid()}"
-    tdir = os.environ.get("FLEXVM_TEMPLATES") or os.path.join(os.path.abspath(args.artifacts), "templates")
+    tdir = os.path.join(A.state, "templates")
     try:
         prefix = json.load(open(os.path.join(A.state, "host.json")))["prefix"]
     except (OSError, ValueError, KeyError):

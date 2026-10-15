@@ -41,8 +41,7 @@ impl GuestPages for Pager {
 }
 
 pub(super) fn writer_threads() -> usize {
-    let n = std::env::var("FLEXVM_CKPT_THREADS").ok().and_then(|v| v.parse().ok());
-    n.unwrap_or_else(crate::util::host_cpus).clamp(1, MAX_WRITERS)
+    crate::util::host_cpus().clamp(1, MAX_WRITERS)
 }
 
 pub(super) struct Written {

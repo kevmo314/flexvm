@@ -238,23 +238,12 @@ pub struct Paths {
 }
 
 impl Paths {
-    pub fn new(artifacts: &Path, templates: Option<PathBuf>) -> Result<Self> {
-        let a = artifacts.canonicalize().map_err(|e| {
-            format!("artifacts dir {}: {e} (give the one with firecracker, vmlinux and rootfs.ext4: --artifacts DIR or FLEXVM_ARTIFACTS)", artifacts.display())
-        })?;
-        Ok(Paths {
-            firecracker: a.join("firecracker"),
-            kernel: a.join("vmlinux"),
-            rootfs: a.join("rootfs.ext4"),
-            templates: templates.unwrap_or_else(|| a.join("templates")),
-        })
-    }
-
-    /// As a VM process this one spawns without `--artifacts` finds them: `FLEXVM_ARTIFACTS`
-    /// (else `./artifacts`) and `FLEXVM_TEMPLATES`, which `main` sets from its flags.
-    pub fn from_env() -> Result<Self> {
-        let artifacts = std::env::var_os("FLEXVM_ARTIFACTS").map_or_else(|| PathBuf::from("artifacts"), PathBuf::from);
-        Paths::new(&artifacts, std::env::var_os("FLEXVM_TEMPLATES").map(PathBuf::from))
+    /// `STATE/artifacts` (as scripts/fetch.sh and build-*.sh install it; resolved, so templates
+    /// record the files themselves) and `STATE/templates`.
+    pub fn new(state: &Path) -> Self {
+        let a = state.join("artifacts");
+        let a = a.canonicalize().unwrap_or(a);
+        Paths { firecracker: a.join("firecracker"), kernel: a.join("vmlinux"), rootfs: a.join("rootfs.ext4"), templates: state.join("templates") }
     }
 }
 
@@ -311,7 +300,7 @@ impl Template {
                 bail!("template {name:?} is not a symlink; remove {} and rebuild it: flexvm template {name}", link.display())
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                bail!("no template {name:?} in {} (build it: flexvm template {name}; or give --templates DIR)", paths.templates.display())
+                bail!("no template {name:?} in {} (build it: flexvm template {name})", paths.templates.display())
             }
             Err(e) => bail!("template {name:?}: {e}"),
         }
@@ -839,7 +828,7 @@ mod tests {
         let root = crate::test_util::TempDir::new("wset-mib");
         std::fs::create_dir_all(root.join("templates/.gen/a")).unwrap();
         std::os::unix::fs::symlink(".gen/a", root.join("templates/t")).unwrap();
-        let paths = Paths::new(&root, None).unwrap();
+        let paths = Paths::new(&root);
         // 1 GiB and 2 MiB of 4 KiB pages; no memory file, which opening it would need.
         std::fs::write(root.join("templates/t/wset"), b"[[0, 262144], [300000, 512]]").unwrap();
         assert_eq!(Template::working_set_mib_of(&paths, "t").unwrap(), 1026);
