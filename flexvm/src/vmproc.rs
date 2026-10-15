@@ -1185,7 +1185,8 @@ impl Proc {
                 match self.resize(Some(avail)) {
                     Ok(Resized::Grew) => "grow",
                     Ok(Resized::Full) => "full",
-                    Ok(Resized::Same) => "ok",
+                    // Any guest agent keeps its throttle on `ok`; `full` lifts it (#368).
+                    Ok(Resized::Same) | Ok(Resized::Refused) => "ok",
                     Ok(Resized::Busy) => "busy",
                     Err(e) => {
                         crate::log!("vm {}: resize on request: {e}", vm.name);
@@ -1506,8 +1507,12 @@ pub enum Resized {
     Grew,
     Same,
     Busy,
-    /// Short, and at its ceiling or refused by the host's reserve.
+    /// Short, and at its ceiling: the guest may use all it has.
     Full,
+    /// Short, and refused by the host's reserve: the guest stays throttled
+    /// at its mark (killing for memory a plug may still bring is worse) and
+    /// the VM starved, so relief moves it; it asks again as it is throttled.
+    Refused,
 }
 
 /// Keeps `headroom` free via hotplug, never below the template's size. The
@@ -1535,7 +1540,6 @@ fn resize(vm: &Vm, host: &Host, hint: Option<u64>, grow_only: bool) -> Result<Re
         return Ok(Resized::Busy);
     };
     let refused = plan.charge > 0 && host.grant(plan.charge, None)?.is_none();
-    let full = plan.short && (plugged == hotplug_total || refused);
     // Starved only when the host refused it: at its own ceiling, moving it cannot help.
     vm.starved.store(plan.short && refused, Ordering::SeqCst);
     let new = if refused { plugged } else { plan.new };
@@ -1556,13 +1560,18 @@ fn resize(vm: &Vm, host: &Host, hint: Option<u64>, grow_only: bool) -> Result<Re
     } else if requested == plugged {
         vm.limit.settled(meta.mem_mib + plugged);
     }
-    Ok(if new > plugged {
-        Resized::Grew
-    } else if full {
-        Resized::Full
-    } else {
-        Resized::Same
-    })
+    Ok(Resized::of(new > plugged, plan.short, plugged == hotplug_total, refused))
+}
+
+impl Resized {
+    fn of(grew: bool, short: bool, at_ceiling: bool, refused: bool) -> Resized {
+        match (grew, short) {
+            (true, _) => Resized::Grew,
+            (false, true) if at_ceiling => Resized::Full,
+            (false, true) if refused => Resized::Refused,
+            _ => Resized::Same,
+        }
+    }
 }
 
 /// How long a resize may go unfinished before it settles at what is plugged.
@@ -2272,6 +2281,16 @@ mod tests {
         // Shrink 4096 -> 3072 outstanding, guest short: grow from what is plugged.
         let p = SIZES.plan(3072, 4096, 512, secs(2), true, false).unwrap();
         assert!(!p.settle && p.new > 4096 && p.charge == p.new - 4096, "{p:?}");
+    }
+
+    #[test]
+    fn a_refused_plug_is_not_the_ceiling() {
+        // Only at its ceiling is the guest told `full` (it lifts its throttle);
+        // refused by the reserve it stays throttled (#368).
+        assert_eq!(Resized::of(false, true, true, false), Resized::Full);
+        assert_eq!(Resized::of(false, true, false, true), Resized::Refused);
+        assert_eq!(Resized::of(false, false, false, true), Resized::Same);
+        assert_eq!(Resized::of(true, true, false, false), Resized::Grew);
     }
 
     #[test]

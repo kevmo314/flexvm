@@ -4614,6 +4614,70 @@ def mem_refused_headroom():
     cleanup(n)
 
 
+def guest_mem(host, name):
+    """The guest's view: (MemTotal MiB, /vm memory.high MiB or None, the fill's pid alive, OOM kills in its kernel log)."""
+    code, out = sh(host, name, "awk '/MemTotal/{print $2}' /proc/meminfo; cat /sys/fs/cgroup/vm/memory.high; "
+                               "kill -0 $(cat /tmp/hog.pid) 2>/dev/null && echo alive || echo dead; dmesg | grep -c -i 'killed process'; true")
+    if code != 0 or len(out.split()) != 4:
+        return None
+    total, high, live, kills = out.split()
+    return int(total) >> 10, None if high == "max" else int(high) >> 20, live == "alive", int(kills)
+
+
+def fill(host, name, mib):
+    """`hog`, its pid in the guest's /tmp/hog.pid."""
+    prog = f"b=bytearray({mib}<<20); [b.__setitem__(slice(i, i + 8), i.to_bytes(8, \"little\")) for i in range(0, len(b), 4096)]"
+    code, out = sh(host, name, f"rm -f /tmp/hog.done; setsid python3 -c '{prog}; open(\"/tmp/hog.done\", \"w\").close(); "
+                               "import time; time.sleep(3600)' >/dev/null 2>&1 </dev/null & echo $! >/tmp/hog.pid; echo started")
+    assert code == 0, out
+
+
+def mem_refused_fill():
+    """A guest filling past its plugged memory whose host refuses it more
+    partway (no plug, no step) is not OOM-killed: it stays throttled at its
+    own mark in the guest, never lifted, and counts as starved; relief then
+    moves it to a peer, where the fill finishes. PLUG_TEMPLATE: a template
+    with little plugged and room to grow."""
+    n = "ft-refused-fill"
+    m = setup(n, mib=1, template=os.environ.get("PLUG_TEMPLATE"))
+    v = vms(A)[n]
+    if not v["admitted_mib"]:
+        raise Skip("no per-VM cgroups here")
+    mib = 2560
+    if v["max_mib"] < mib + 1536:
+        raise Skip(f"its template grows to {v['max_mib']} MiB, too little to fill {mib} MiB")
+    plugged0 = v["plugged_mib"]
+    fault(A, "no_evict", 600000)
+    fill(A, n, mib)
+    # Refused partway: once the guest has grown by 768 MiB.
+    grew = wait_for(lambda: vms(A)[n]["plugged_mib"] >= plugged0 + 768, 60)
+    fault(A, "no_admit", 600000)
+    check("refused fill: it grew before it was refused", grew, vms(A)[n])
+    seen = []
+    for _ in range(15):
+        time.sleep(1)
+        x = vms(A).get(n, {})
+        seen.append((x.get("plugged_mib"), x.get("requested_mib"), x.get("starved"), guest_mem(A, n)))
+    print(f"refused fill: (plugged, requested, starved, (MemTotal, /vm high, alive, kills)) each second: {seen}", flush=True)
+    g = seen[-1][3]
+    check("refused fill: the fill is alive, nothing OOM-killed", g is not None and g[2] and g[3] == 0,
+          (g, sh(A, n, "dmesg | grep -i -A2 oom | tail -20")[1], log(A, n)[-1500:]))
+    check("refused fill: throttled in the guest at its mark, never lifted", all(s[3] and s[3][1] is not None for s in seen), seen)
+    check("refused fill: not finished", not hog_done(A, n))
+    check("refused fill: starved, so the host would move it", any(s[2] for s in seen[-5:]), seen[-5:])
+    check("refused fill: the host's cgroup saw no OOM", cgroup(A, n)[2].get("oom_kill") == "0", cgroup(A, n)[2])
+    # Relief: moved to B, where it grows.
+    fault(A, "no_evict", 0)
+    check("refused fill: moved to B", wait_for(lambda: where(n) == {B: "running"}, 60), (where(n), log(A, n)[-1500:]))
+    st = wait_released(B, n, timeout=60)
+    check("refused fill: pulled and released", st["released"] is True and st["failed"] is None, st)
+    check("refused fill: the fill finishes there", wait_for(lambda: hog_done(B, n), 240), (guest_mem(B, n), vms(B).get(n)))
+    g = guest_mem(B, n)
+    check("refused fill: the same fill, nothing OOM-killed", g is not None and g[2] and g[3] == 0, g)
+    check("refused fill: md5 intact", md5(B, n) == m)
+    cleanup(n)
+
+
 class Watch:
     """While eviction runs on `host`: each of `names`' controller ticks (from
     `debug status`) and its memory requests, asked as its guest does (`MEM`,
@@ -6964,7 +7028,7 @@ SCENARIOS = dict(
     route_abort=route_abort,
     uffd_err=uffd_err,
     mem_high=no_evict(skippable(mem_high)), mem_high_migrate=no_evict(skippable(mem_high_migrate)),
-    mem_high_evict=skippable(mem_high_evict), mem_refused_headroom=skippable(mem_refused_headroom), evict_grower=skippable(evict_grower), evict_no_pingpong=evict_no_pingpong, evict_skips_cmd=evict_skips_cmd, cmd_flag=cmd_flag, standby_stop_claim=standby_stop_claim, standby_claim_signal=standby_claim_signal, standby_concurrent_claims=standby_concurrent_claims, evict_latency=skippable(evict_latency),
+    mem_high_evict=skippable(mem_high_evict), mem_refused_headroom=skippable(mem_refused_headroom), mem_refused_fill=skippable(mem_refused_fill), evict_grower=skippable(evict_grower), evict_no_pingpong=evict_no_pingpong, evict_skips_cmd=evict_skips_cmd, cmd_flag=cmd_flag, standby_stop_claim=standby_stop_claim, standby_claim_signal=standby_claim_signal, standby_concurrent_claims=standby_concurrent_claims, evict_latency=skippable(evict_latency),
     start_admission=start_admission, standby_admission=standby_admission,
     refused_admission=refused_admission, meminfo_unreadable=meminfo_unreadable,
     cow_grow=no_evict(cow_grow), plug_race=no_evict(plug_race), shrink_stall=no_evict(shrink_stall), plug_storm=no_evict(plug_storm),
