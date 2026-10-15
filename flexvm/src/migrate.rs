@@ -490,6 +490,7 @@ impl Proc {
             // The guest ran on while this side prepared: what it pulls now is admitted
             // before anything is seeded or loaded, else refused while the source can resume.
             self.admit_arrival(sizes, arrival_floor(req), deadline)?;
+            crate::host::stall("admitted_stall");
             *self.sizes.lock().unwrap() = Some(sizes);
             let state = read_vec(&mut r, hdr.vmstate_len, MAX_VMSTATE)?;
             t.mark("recv_state");

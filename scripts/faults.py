@@ -10,7 +10,7 @@ usage: scripts/faults.py [--a ADDR] [--b ADDR] [--a-dir DIR] [--b-dir DIR]
 The script starts both listeners (FLEXVM_FAULTS=1, VMs log to DIR/run/vms)
 and stops them at the end. Checkpoint scenarios write to --ckpt-dir.
 """
-import argparse, base64, json, struct, os, re, signal, socket, subprocess, sys, tempfile, threading, time, traceback
+import argparse, base64, fcntl, json, struct, os, re, signal, socket, subprocess, sys, tempfile, threading, time, traceback
 
 p = argparse.ArgumentParser(usage=__doc__)
 p.add_argument("--a", default="127.0.0.1:7130")
@@ -211,7 +211,7 @@ def fault(host, f, ms):
 FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_before_run", "restore_after_run",
           "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "resume_kill",
           "prepare_fail", "short_incoming", "slow_preload", "bad_preload", "bad_app_log", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
-          "started_fsync", "started_unmark", "start_stall", "incoming_stall", "claim_stall", "standby_lock_stall", "standby_lock_hang", "handoff_stall", "ckpt_wp_race", "ckpt_rescue_fail",
+          "started_fsync", "started_unmark", "start_stall", "incoming_stall", "admitted_stall", "claim_stall", "standby_lock_stall", "standby_lock_hang", "handoff_stall", "ckpt_wp_race", "ckpt_rescue_fail",
           "fetch_tail_enomem", "fetch_enomem_stuck", "pull_enomem", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo", "release_stall", "release_late", "no_plug", "pause_lost", "tap_backlog", "tap_backlog_stuck", "pause_unknown", "restore_unpause_fail", "resume_link_fail", "resume_partial", "repause_fail", "pause_fail", "restore_ping_slow", "readdress_fail", "no_collapse", "collapse_slow", "pages_slow", "unlend_fail", "route_stall", "suspend_slow", "owe_fail", "settle_unpause")
 
 
@@ -5287,6 +5287,86 @@ def arrival_grew():
     cleanup(n)
 
 
+def arrival_grew_admitted():
+    """A guest that grows between its migration's preflight and its pause, to
+    a target with room, has its held grant grown by what it grew by before
+    the commit: killed then, the target's hold goes with it and the source
+    runs on; let be, the migration commits, admitted for all it pulls, and
+    the hold goes once the pull is done."""
+    grow = 1024
+    hold_dir = os.path.join(B.run, "holds")
+    # Live ones: a dead owner's file stays, its lock free, until an admission next looks.
+    holds = lambda: {int(f.split("-")[0]): int(f.split("-")[1]) for f in (os.listdir(hold_dir) if os.path.isdir(hold_dir) else [])
+                     if not f.startswith(".") and not released(f)}
+
+    def released(name):
+        try:
+            with open(os.path.join(hold_dir, name)) as f:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+
+    def grown(n, label):
+        """Migrates `n` to B, growing it by `grow` MiB once B has admitted its preflight; returns
+        (B's hold as admitted at the preflight, as grown, the migration's answer, the kill's)."""
+        v = vms(A)[n]
+        if not v["admitted_mib"]:
+            raise Skip("no per-VM cgroups here")
+        if v["guest_mib"] < grow + 256:
+            raise Skip(f"its guest has {v['guest_mib']} MiB, too little to grow by {grow} MiB")
+        check(f"{label}: b holds nothing before", not holds(), holds())
+        res = {}
+        fault(B, "incoming_stall", 600000)
+        fault(B, "admitted_stall", 600000)
+        t = threading.Thread(target=lambda: res.update(r=migrate(A, n, B)))
+        t.start()
+        first = wait_for(lambda: holds(), 30)
+        hog(A, n, grow)
+        # Admitted at the header: a hold larger than the preflight's, for the 3 s B then stalls.
+        more = first and wait_for(lambda: any(holds().get(i, 0) > m for i, m in first.items()), 20) and holds()
+        return t, res, first, more
+
+    # Killed after its hold grew, before the commit.
+    n = "ft-grew-killed"
+    m = setup(n, mib=1)
+    t, res, first, more = grown(n, "grew killed")
+    check("grew killed: b's hold grew by what the guest grew by", more, (first, holds()))
+    lock = json.load(open(os.path.join(B.run, "vms", f"{n}.lock")))
+    os.kill(lock["pid"], signal.SIGKILL)
+    t.join()
+    for f in ("incoming_stall", "admitted_stall"):
+        fault(B, f, 0)
+    r = res["r"]
+    check("grew killed: the migration fails", not r["ok"], r)
+    check("grew killed: the vm runs on at A", where(n) == {A: "running"} and md5(A, n) == m, where(n))
+    names = [f"{i}-{mib}" for i, mib in (more or {}).items()]
+    check("grew killed: its hold goes with it", wait_for(lambda: all(released(x) for x in names), 10), names)
+    cleanup(n)
+
+    # Let be: it commits and pulls all of it.
+    n = "ft-grew-admitted"
+    m = setup(n, mib=1)
+    t, res, first, more = grown(n, "grew admitted")
+    t.join()
+    for f in ("incoming_stall", "admitted_stall"):
+        fault(B, f, 0)
+    r = res["r"]
+    check("grew admitted: b's hold grew by what the guest grew by", more, (first, holds()))
+    check("grew admitted: the migration commits", r["ok"], r)
+    check("grew admitted: b says so", "MiB more: it grew to" in log(B, n), log(B, n)[-1500:])
+    st = wait_released(B, n, timeout=60)
+    check("grew admitted: pulled and released", st["released"] is True and st["failed"] is None, st)
+    grew_to = max((more or {0: 0}).values())
+    check("grew admitted: its mark starts at what was admitted", vms(B)[n]["admitted_mib"] >= grew_to, (grew_to, vms(B)[n].get("admitted_mib")))
+    check("grew admitted: the hold goes once the pull is done", wait_for(lambda: not holds(), 15), holds())
+    check("grew admitted: the guest finishes growing there", wait_for(lambda: hog_done(B, n), 120), cgroup(B, n))
+    check("grew admitted: md5 intact, one copy", md5(B, n) == m and where(n) == {B: "running"}, where(n))
+    cleanup(n)
+
+
 def meminfo_unreadable():
     """/proc/meminfo unreadable (injected) is not 0 MiB available: no standby
     is stopped and nothing is evicted, and a start is refused saying why."""
@@ -7531,7 +7611,7 @@ SCENARIOS = dict(
     mem_high=no_evict(skippable(mem_high)), mem_high_migrate=no_evict(skippable(mem_high_migrate)),
     mem_high_evict=skippable(mem_high_evict), mem_refused_headroom=skippable(mem_refused_headroom), mem_refused_fill=skippable(mem_refused_fill), evict_grower=skippable(evict_grower), evict_no_pingpong=evict_no_pingpong, evict_skips_cmd=evict_skips_cmd, cmd_flag=cmd_flag, standby_stop_claim=standby_stop_claim, standby_claim_signal=standby_claim_signal, standby_concurrent_claims=standby_concurrent_claims, evict_latency=skippable(evict_latency),
     start_admission=start_admission, standby_admission=standby_admission,
-    refused_admission=refused_admission, arrival_grew=no_evict(skippable(arrival_grew)), meminfo_unreadable=meminfo_unreadable,
+    refused_admission=refused_admission, arrival_grew=no_evict(skippable(arrival_grew)), arrival_grew_admitted=no_evict(skippable(arrival_grew_admitted)), meminfo_unreadable=meminfo_unreadable,
     cow_grow=no_evict(cow_grow), plug_race=no_evict(plug_race), shrink_stall=no_evict(shrink_stall), plug_storm=no_evict(plug_storm),
     basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, refused=refused, pages_blip=pages_blip,
     pages_dead_restore=pages_dead_restore, pages_dead=pages_dead, resume_kill=resume_kill, prepared_retry=prepared_retry,

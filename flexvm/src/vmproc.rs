@@ -324,6 +324,7 @@ impl Proc {
             .grow_hold(&self.held_grant, more, floor, Some(deadline))
             .map_err(|e| format!("its memory grew to {} MiB since it was admitted here for {granted} MiB: {e}", sizes.0))?;
         self.granted.fetch_add(more, Ordering::SeqCst);
+        crate::log!("vm {}: admitted {more} MiB more: it grew to {} MiB since its preflight", self.name(), sizes.0);
         Ok(())
     }
 
