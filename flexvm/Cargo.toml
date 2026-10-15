@@ -8,9 +8,9 @@ libc.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Container image templates: registry pulls over HTTPS, digests, layer formats.
-ureq = { version = "2", default-features = false, features = ["tls"] }
-# ureq's own roots, for its rustls config under a deadline-enforcing stream.
-webpki-roots = "0.26"
+# 3.x: its chunked decoder and header parser read into a fixed buffer (2.x grows a chunk-size line without bound).
+# `unversioned` (resolver, connector) is used, so minor versions are taken by hand.
+ureq = { version = "~3.4.2", default-features = false, features = ["rustls"] }
 base64 = "0.22"
 sha2 = "0.10"
 flate2 = "1"
