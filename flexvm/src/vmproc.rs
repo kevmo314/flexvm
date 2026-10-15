@@ -39,6 +39,10 @@ pub const CLOCK_DEADLINE: Duration = Duration::from_secs(5);
 const SIGNALS: [i32; 7] = [libc::SIGTERM, libc::SIGINT, libc::SIGQUIT, libc::SIGTSTP, libc::SIGCONT, libc::SIGHUP, libc::SIGUSR1];
 const MAX_CONTROL: usize = 256;
 static CONTROL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Page-server requests (peers', forwarded by the listener) refused or served at once: not on `MAX_CONTROL`, so they
+/// never shut out local control requests (#335). Those served are bounded further by the page server.
+const MAX_PAGES: usize = 64;
+static PAGES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 pub enum Start {
     Run {
@@ -720,10 +724,7 @@ impl Proc {
                 };
                 let Some(slot) = Slot::take(&CONTROL, MAX_CONTROL) else { continue };
                 let p = p.clone();
-                thread::spawn(move || {
-                    let _slot = slot;
-                    p.control(c);
-                });
+                thread::spawn(move || p.control(c, slot));
             }
         });
     }
@@ -808,7 +809,8 @@ impl Proc {
         }
     }
 
-    fn control(self: &Arc<Self>, c: UnixStream) {
+    /// `slot`: its place among `MAX_CONTROL`, which a page-server request trades for one among `MAX_PAGES`.
+    fn control(self: &Arc<Self>, c: UnixStream, slot: Slot) {
         let _ = c.set_read_timeout(Some(Duration::from_secs(10)));
         let (line, fds) = match crate::util::recv_with_fds(&c, 1 << 20, || Ok(())) {
             Ok(got) => got,
@@ -818,7 +820,7 @@ impl Proc {
         let Ok(req) = serde_json::from_slice::<Value>(&line) else { return };
         let reply = match req["op"].as_str().unwrap_or("") {
             "exec" => return self.exec(&req, c),
-            "pages" => return self.pages(&req, fds),
+            "pages" => return self.pages(&req, fds, slot),
             "checkpoint" => self.op_within().and_then(|op| {
                 let stop = req["stop"] == true;
                 if stop {
@@ -838,9 +840,11 @@ impl Proc {
         let _ = send_json(&mut &c, &reply.map_or_else(|e| json!({"ok": false, "error": e.to_string()}), |v| json!({"ok": true, "result": v})));
     }
 
-    fn pages(&self, req: &Value, fds: Vec<OwnedFd>) {
+    fn pages(&self, req: &Value, fds: Vec<OwnedFd>, slot: Slot) {
         let Some(fd) = fds.into_iter().next() else { return };
         let s = std::net::TcpStream::from(fd);
+        let Some(_pages) = Slot::take(&PAGES, MAX_PAGES) else { return };
+        drop(slot);
         let (vm, source) = (self.vm(), req["mig"].as_u64().map(State::Source));
         if source != Some(vm.state()) {
             return crate::listen::refuse(s, &format!("vm {} is not the source of migration {}", vm.name, req["mig"]), Some(Duration::from_secs(1)));
@@ -848,6 +852,13 @@ impl Proc {
         if fault("pages") {
             return crate::listen::refuse(s, "injected fault: page server down", Some(Duration::from_secs(1)));
         }
+        let admitted = match crate::uffd::admit(&s) {
+            Ok(Some(a)) => a,
+            Ok(None) => {
+                return crate::listen::refuse(s, "page server busy: every connection is answering a request or still ending", Some(Duration::from_secs(1)))
+            }
+            Err(e) => return crate::log!("vm {}: page server: {e}", vm.name),
+        };
         let _ = s.set_nodelay(true);
         let served = send_json(&mut &s, &json!({"ok": true})).and_then(|()| {
             // A slow source, not a lost one: every reply comes, a second late (well within the target's
@@ -857,7 +868,7 @@ impl Proc {
                     std::thread::sleep(Duration::from_secs(1));
                 }
             };
-            crate::uffd::serve_pages(&vm.pager, &s, &s, || fault("pages") || Some(vm.state()) != source, pace)
+            crate::uffd::serve_pages(&vm.pager, &s, &admitted, &s, || fault("pages") || Some(vm.state()) != source, pace)
         });
         if let Err(e) = served {
             crate::log!("vm {}: page server: {e}", vm.name);
