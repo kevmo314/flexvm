@@ -698,7 +698,8 @@ mod probe_tests {
     #[test]
     fn source_addresses_are_kept_and_looked_up_again_only_after_a_failed_connect() {
         let at = || Instant::now() + Duration::from_secs(2);
-        let (one, two) = (std::net::TcpListener::bind("127.0.0.1:0").unwrap(), std::net::TcpListener::bind("127.0.0.1:0").unwrap());
+        // `one` on a loopback address of its own: once dropped, no other test's 127.0.0.1 listener can answer there.
+        let (one, two) = (std::net::TcpListener::bind("127.94.20.1:0").unwrap(), std::net::TcpListener::bind("127.0.0.1:0").unwrap());
         let (one_addr, two_addr) = (one.local_addr().unwrap(), two.local_addr().unwrap());
         let mut addrs = SourceAddrs::default();
         addrs.connect(&one_addr.to_string(), at()).unwrap();
