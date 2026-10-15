@@ -795,5 +795,15 @@ mod tests {
         let _ = crate::net::route_dev(false, ip, b.ifindex);
         assert_eq!((stats.packets, stats.dropped), (1, 0));
         assert!(got[0].ends_with(b"late") && got[0][8] == 63, "{got:?}");
+        // A fragment with IP ID 0 would get a new ID if re-sent (no longer reassembling with its
+        // siblings): counted as dropped instead. One with an ID is re-sent.
+        let counts = |a: &Holder| a.gone.lock().unwrap().get(&ip).map(|g| (g.resent, g.dropped)).unwrap();
+        let mut frag = [0x45u8, 0, 0, 28, 0, 0, 0x20, 0, 64, 17, 0, 0, 10, 100, 254, 1, 10, 100, 254, 9, 0, 1, 0, 9, 0, 8, 0, 0];
+        let before = counts(&a);
+        a.straggler(ip, &mut frag);
+        assert_eq!(counts(&a), (before.0, before.1 + 1));
+        frag[4..6].copy_from_slice(&[0x12, 0x34]);
+        a.straggler(ip, &mut frag);
+        assert_eq!(counts(&a), (before.0 + 1, before.1 + 1));
     }
 }
