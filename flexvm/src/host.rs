@@ -729,7 +729,7 @@ impl Host {
     /// A paused migration source keeps its route too: its release moves it.
     pub fn keeps_route(&self, l: &Locked, ip: Ipv4Addr, gen: u64) -> Result<bool> {
         let a = self.addr(l, ip)?;
-        let source = || a.holder.as_deref().and_then(|h| self.entry(h).ok()).is_some_and(|e| e.state == "source");
+        let source = || a.holder.as_deref().and_then(|h| self.entry(h).ok()).is_some_and(|e| matches!(e.state.as_str(), "source" | "reconciling"));
         Ok(self.held(&a) && (a.held >= gen || source()))
     }
 

@@ -421,7 +421,8 @@ def unknown():
     r = migrate(A, n, B)
     check("unknown: migrate reports unknown outcome", not r["ok"] and "paused" in r["error"], r)
     w = where(n)
-    check("unknown: source never resumed", w.get(A) in (None, "source") and w.get(B) == "running", w)
+    # Paused, waiting to learn the outcome: reconciling (#358), or gone once it has.
+    check("unknown: source never resumed", w.get(A) in (None, "reconciling") and w.get(B) == "running", w)
     st = wait_released(B, n)
     check("unknown: reconciled and released", st["released"] is True and where(n) == {B: "running"}, (st, where(n)))
     check("unknown: md5 intact", md5(B, n) == m)
@@ -646,7 +647,7 @@ def target_killed():
     stall.join()
     # The status fault still keeps the source from hearing anything.
     w = where(n)
-    check("target killed: the source still holds its paused copy", not r["ok"] and w.get(A) == "source", (r, w or "gone everywhere"))
+    check("target killed: the source still holds its paused copy", not r["ok"] and w.get(A) == "reconciling", (r, w or "gone everywhere"))
     migs = os.path.join(B.state, "migs")
     newest = max(os.listdir(migs), key=lambda m: os.path.getmtime(os.path.join(migs, m)))
     # Asked at once, before the Firecracker can have died of its own accord.
@@ -1638,7 +1639,7 @@ def reconcile_announce():
     fault(B, "status", 30000)
     r = migrate(A, n, B)
     fault(B, "lost_ack", 0)
-    check("reconcile announce: outcome unknown, the source paused", not r["ok"] and vms(A).get(n, {}).get("state") == "source", (r, where(n)))
+    check("reconcile announce: outcome unknown, the source paused", not r["ok"] and vms(A).get(n, {}).get("state") == "reconciling", (r, where(n)))
     check("reconcile announce: B committed the next revision", addr(B, ip).get("rev") == 1, addr(B, ip))
     os.kill(json.load(open(os.path.join(B.run, "vms", f"{n}.lock")))["pid"], signal.SIGKILL)
     fault(B, "status", 0)
@@ -1656,7 +1657,7 @@ def owed(host):
 
 
 def reconcile_kill():
-    """#350: SIGINT and SIGQUIT end a source that never heard its target's
+    """#350, #358: SIGINT, SIGQUIT and flexvm kill end a source that never heard its target's
     outcome (ack lost, status unavailable) within seconds, as they do a VM
     anywhere else. The target may be running the VM, so nothing is withdrawn:
     the address stays lent, never handed out on the source's host, until the
@@ -1665,7 +1666,7 @@ def reconcile_kill():
     generation and frees the address. A target that already had every page
     keeps running with it: told `done`, it keeps the loan until it is killed
     there, and only then does the address run again on the source's host."""
-    def unknown_then_kill(n, sig, slow, refuse_first=False):
+    def unknown_then_kill(n, sig, slow, refuse_first=False, use_cli=False):
         what = f"reconcile kill ({n})"
         m = setup(n, mib=100)
         ip, pid = vms(A)[n]["ip"], vm_pid(A, n)
@@ -1676,7 +1677,7 @@ def reconcile_kill():
         fault(B, "status", 30000)
         r = migrate(A, n, B)
         fault(B, "lost_ack", 0)
-        check(f"{what}: outcome unknown, the source paused", not r["ok"] and vms(A).get(n, {}).get("state") == "source", (r, where(n)))
+        check(f"{what}: outcome unknown, the source paused", not r["ok"] and vms(A).get(n, {}).get("state") == "reconciling", (r, where(n)))
         check(f"{what}: lent while it waits", addr(A, ip).get("lent") == gen, addr(A, ip))
         if not slow:
             check(f"{what}: the target has every page", wait_for(lambda: vms(B).get(n, {}).get("background_pull_ms") is not None, 30), vms(B).get(n))
@@ -1688,7 +1689,11 @@ def reconcile_kill():
                   wait_for(lambda: "is not killed" in log(A, n), 10) and alive(pid) and not owed(A), (alive(pid), owed(A), log(A, n)[-400:]))
             fault(A, "owe_fail", 0)
         t = time.time()
-        os.kill(pid, sig)
+        if use_cli:
+            code, out, err = cli(A, "kill", n, timeout=10)
+            check(f"{what}: flexvm kill succeeds", code == 0, (code, out, err))
+        else:
+            os.kill(pid, sig)
         gone = wait_for(lambda: not alive(pid), 5)
         check(f"{what}: the source exits within 5 s", gone, f"{time.time() - t:.1f} s; " + log(A, n)[-400:])
         if not gone:
@@ -1727,7 +1732,7 @@ def reconcile_kill():
     # the operator reclaims the address, warned first, then with --force.
     n = "ft-reconcile-kill-lost"
     what = f"reconcile kill ({n})"
-    got = unknown_then_kill(n, signal.SIGINT, True)
+    got = unknown_then_kill(n, signal.SIGINT, True, use_cli=True)
     if got:
         ip, gen, _ = got
         os.kill(json.load(open(os.path.join(B.run, "vms", f"{n}.lock")))["pid"], signal.SIGKILL)

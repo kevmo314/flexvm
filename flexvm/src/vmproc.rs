@@ -512,7 +512,11 @@ impl Proc {
             template_id: vm.template.meta.id.clone(),
             vcpus: vm.template.meta.vcpus,
             max_mib: vm.template.meta.max_mib,
-            state: vm.state().name().into(),
+            state: match vm.state() {
+                State::Source(mig) if self.reconciling.lock().unwrap().as_ref().is_some_and(|(m, _)| *m == mig) => "reconciling",
+                state => state.name(),
+            }
+            .into(),
             firecracker: vm.pid(),
             starved: vm.starving(),
             growth_mib_s: self.growth.load(Ordering::SeqCst),
@@ -610,15 +614,16 @@ impl Proc {
     /// Marks migration `mig` to `to` as one whose outcome is unknown, until `known` takes it back.
     pub(crate) fn reconciling(&self, mig: u64, to: &str) {
         *self.reconciling.lock().unwrap() = Some((mig, to.into()));
+        self.publish();
     }
 
     /// False if a kill took the reconciliation first (and is ending the process).
     pub(crate) fn known(&self, mig: u64) -> bool {
-        self.take_reconciling(mig).is_some()
-    }
-
-    fn take_reconciling(&self, mig: u64) -> Option<String> {
-        self.reconciling.lock().unwrap().take_if(|(m, _)| *m == mig).map(|(_, to)| to)
+        let taken = self.reconciling.lock().unwrap().take_if(|(m, _)| *m == mig).is_some();
+        if taken {
+            self.publish();
+        }
+        taken
     }
 
     /// A kill while migration `mig`'s outcome is unknown: None if it is not (or no

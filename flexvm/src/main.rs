@@ -580,6 +580,7 @@ fn follow(mut conn: BufReader<std::os::unix::net::UnixStream>, id: host::Ident) 
 }
 
 fn kill(host: &Host, name: &str) -> Result<()> {
+    // Reconciling sources accept SIGINT too; the process records the owed outcome before ending.
     if host.entry(name).is_ok_and(|e| e.state == "source") {
         return Err(format!("vm {name} is the source of a migration in progress; it ends once the target has its memory (kill it where it runs)").into());
     }
@@ -1096,6 +1097,39 @@ mod exec_tests {
         // Port 0 binds, but peers could not be told the port.
         assert!(configure_listener(&mut host, &args, Some("127.0.0.1:0"), None).is_err());
         assert_eq!(std::fs::read(host.state.join("host.json")).unwrap(), before);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn kill_refuses_a_committed_source_but_signals_a_reconciling_one() {
+        use std::os::unix::process::ExitStatusExt;
+        let root = std::env::temp_dir().join(format!("flexvm-kill-source-{}", std::process::id()));
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let name = host.take_name("moving", false).unwrap();
+        let mut child = std::process::Command::new("sleep");
+        unsafe {
+            std::os::unix::process::CommandExt::pre_exec(&mut child, || {
+                libc::signal(libc::SIGINT, libc::SIG_DFL);
+                Ok(())
+            });
+        }
+        let mut child = child.arg("60").spawn().unwrap();
+        let mut entry = host::Entry { name: "moving".into(), ident: host::Ident::of(child.id()).unwrap(), state: "source".into(), ..host::Entry::default() };
+        // Hold the name on the child's behalf, with its identity in both records.
+        std::fs::write(host.vms("moving", "lock"), serde_json::to_vec(&entry.ident).unwrap()).unwrap();
+        name.publish(&entry).unwrap();
+        let refused = kill(&host, "moving").unwrap_err().to_string();
+        assert_eq!(refused, "vm moving is the source of a migration in progress; it ends once the target has its memory (kill it where it runs)");
+        assert!(child.try_wait().unwrap().is_none());
+        entry.state = "reconciling".into();
+        name.publish(&entry).unwrap();
+        let result = kill(&host, "moving");
+        // Reap even on failure, so a failed assertion does not leave the child behind.
+        let _ = child.kill();
+        let status = child.wait().unwrap();
+        result.unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGINT));
+        drop(name);
         std::fs::remove_dir_all(root).unwrap();
     }
 
