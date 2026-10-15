@@ -2,7 +2,8 @@
 //! `CLOSE <id>`. Output frames start with their stream offset (u64 LE); the exit frame is offset plus code.
 //! The command runs in a process group of its own; its exit is the shell's, recorded once output stops or
 //! `DRAIN` after the shell exits; background processes that keep its pipes open run on, their later output
-//! read and dropped. Closing a session whose shell has not exited kills its process group (not processes that
+//! read and dropped (by one thread, for at most `MAX_DISCARDED` pipes: past that, a job's next write gets
+//! SIGPIPE). Closing a session whose shell has not exited kills its process group (not processes that
 //! left it with setsid or setpgid: that would take a cgroup per session); closing an unknown one cancels it, so
 //! a start still in flight never runs.
 //! At most `MAX_LIVE` sessions are live; closed ones leave a tombstone so a delayed `SESSION` retry cannot
