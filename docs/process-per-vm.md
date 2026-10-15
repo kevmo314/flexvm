@@ -201,8 +201,9 @@ withdrawals carry it; each host keeps the newest (generation, withdrawn) seen
 per address and ignores older messages and announcements of withdrawn
 generations; a withdrawal frees a loan of its generation or older. Within a
 generation, each place the VM runs has a revision: a migration's target takes
-the source's next one, a source that runs again after an abort the one after
-that, a restore one past the newest recorded here; announcements carry it, and
+the source's next one (recorded at its commit), a source that runs again after
+an abort the one after that (and announces it), a restore one past the newest
+recorded here; announcements carry it, and
 one with an older revision of the newest generation is stale, so a source's
 delayed announcement never takes a route back from its target (#256). An address
 is *taken* if its record names a holder instance that is alive (holding the
@@ -594,7 +595,7 @@ where it is kept and what tests it.
   `gen_zero`, `suspend_gen`, `signals`, `kill_source`, `forged_peer`, `evict_grower`, `evict_latency`, `evict_no_pingpong`, `evict_skips_cmd`,
   `restore_ip_peer`, `late_withdrawal`, `kill_refused_checkpoint`,
   `wildcard_listen`, `same_host_order`, `same_host_slow_route`, `same_host_flood`, `same_host_late_handover`, `same_host_backlog`, `arrival_abort_route`, `arrival_killed_route`, `handoff_superseded`,
-  `delayed_announce` (#256), `suspend_cmd` (#134), `pause_cmd_start`, `fc_died_busy` (#122), `suspend_died`, and processes SIGKILLed between
+  `delayed_announce`, `prepare_fail_announce`, `reconcile_announce` (#256), `suspend_cmd` (#134), `pause_cmd_start`, `fc_died_busy` (#122), `suspend_died`, and processes SIGKILLed between
   steps at test stalls (`incoming_killed`, `start_killed`, `claim_killed`).
   Garbage and cgroups (#115): `unit_restart` (a listener, `run -d` and
   `standby` started in a cgroup standing in for a systemd unit, which is

@@ -320,6 +320,9 @@ impl Proc {
         drop(l);
         self.set_leaving(false);
         self.publish();
+        if s != State::Failed {
+            self.announce();
+        }
         if s == State::Running {
             self.sync_clock_later();
         }
@@ -360,8 +363,7 @@ impl Proc {
                 match peer_call(&to, json!({"op": "migration", "mig": mig})).map(|r| r["outcome"].clone()) {
                     Ok(o) if o == "released" => break,
                     Ok(o) if o == "aborted" => {
-                        p.abort_later(mig, &format!("{to} lost the vm before it had all its memory; it runs here again, from the pause"));
-                        return p.announce();
+                        return p.abort_later(mig, &format!("{to} lost the vm before it had all its memory; it runs here again, from the pause"));
                     }
                     _ => thread::sleep(delay),
                 }
@@ -763,6 +765,10 @@ impl Proc {
                     t.mark("route");
                 }
                 self.arrived.lock().unwrap().as_mut().ok_or("no migration record")?.commit(&l)?;
+                // Only now its revision outranks the source's (`claim_incoming`).
+                if let Err(e) = self.advance(&l, 0) {
+                    eprintln!("vm {name}: recording its revision: {e}");
+                }
                 Ok(l)
             }),
         };

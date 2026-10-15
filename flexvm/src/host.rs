@@ -609,7 +609,9 @@ impl Host {
         Ok(gen)
     }
 
-    /// At revision `rev` (a migration's target), else one past the newest recorded here.
+    /// At revision `rev` (a migration's target, recorded only once it commits:
+    /// one that never does must not outrank its source), else one past the
+    /// newest recorded here.
     pub fn claim_incoming(&self, l: &Locked, holder: &str, ip: Ipv4Addr, gen: u64, rev: Option<u64>) -> Result<AddrClaim> {
         let mut a = self.addr(l, ip)?;
         if gen == 0 || gen > RECV_MAX {
@@ -624,12 +626,15 @@ impl Host {
         if let Some(lent) = a.lent.filter(|&lent| gen < lent) {
             bail!("{ip} is lent out with a newer vm (generation {lent}, not {gen})");
         }
-        let rev = rev.unwrap_or(if gen > a.seen { 0 } else { a.rev.saturating_add(1) });
+        let (arriving, rev) = (rev.is_some(), rev.unwrap_or(if gen > a.seen { 0 } else { a.rev.saturating_add(1) }));
         if gen > a.seen {
             (a.seen, a.withdrawn, a.via, a.rev) = (gen, false, None, 0);
         }
+        if !arriving {
+            a.rev = a.rev.max(rev);
+        }
         let me = Ident::me();
-        (a.holder, a.holder_id, a.held, a.rev) = (Some(holder.into()), Some(me.clone()), gen, a.rev.max(rev));
+        (a.holder, a.holder_id, a.held) = (Some(holder.into()), Some(me.clone()), gen);
         self.put_addr(ip, &a, true)?;
         Ok(AddrClaim { host: self.clone(), ip, gen, rev, holder: holder.into(), id: me, kept: false, fresh: false })
     }
@@ -2036,7 +2041,8 @@ mod tests {
         assert!(h.observe(&l, x, 7, 3, b).unwrap(), "repeated");
         let _y = h.take_name("y", false).unwrap();
         assert_eq!(h.claim_incoming(&l, "y", x, 7, None).unwrap().rev, 4, "past the newest recorded");
-        assert_eq!(h.claim_incoming(&l, "y", x, 7, Some(2)).unwrap().rev, 2);
+        assert_eq!(h.claim_incoming(&l, "y", x, 7, Some(9)).unwrap().rev, 9);
+        assert!(h.observe(&l, x, 7, 4, b).unwrap(), "an arrival's revision counts only once it commits");
         h.advance(&l, x, 7, 6).unwrap();
         assert!(!h.observe(&l, x, 7, 5, b).unwrap());
         assert!(h.observe(&l, x, 8, 0, a).unwrap(), "a newer generation starts over");

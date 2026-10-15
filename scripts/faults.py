@@ -1401,6 +1401,51 @@ def delayed_announce():
     kill(B, n)
 
 
+def prepare_fail_announce():
+    """#256: a target that claims the next revision and then fails to prepare
+    never outranks its running source: the source's announcement, held up in
+    B's listener until after, is still taken."""
+    n = "ft-prep-announce"
+    fault(B, "route_stall", 60000)
+    ok(run(A, n))
+    ip = vms(A)[n]["ip"]
+    check("prepare fail announce: B holds up A's announcement", wait_for(lambda: conns(B) == 1, 10), conns(B))
+    fault(B, "prepare_fail", 10000)
+    r = migrate(A, n, B)
+    fault(B, "prepare_fail", 0)
+    check("prepare fail announce: migrate refused", not r["ok"] and "injected fault" in r["error"], r)
+    fault(B, "route_stall", 0)
+    check("prepare fail announce: B handled it", wait_for(lambda: conns(B) == 0, 10), conns(B))
+    a = addr(B, ip)
+    check("prepare fail announce: taken, routed to A", a.get("via") == "127.0.0.1" and a.get("rev") == 0 and not a.get("holder"), a)
+    check("prepare fail announce: running on A", where(n) == {A: "running"}, where(n))
+    kill(A, n)
+
+
+def reconcile_announce():
+    """#256: a source that never heard its target commit (ack lost, status
+    unavailable) runs again once the target dies mid-pull (`pages_slow` keeps
+    it pulling), and announces itself past the revision the target took."""
+    n = "ft-reconcile-announce"
+    setup(n, mib=100)
+    ip = vms(A)[n]["ip"]
+    fault(A, "pages_slow", 120000)
+    # Long enough for the slow pages the commit waits on.
+    fault(B, "lost_ack", 30000)
+    fault(B, "status", 30000)
+    r = migrate(A, n, B)
+    fault(B, "lost_ack", 0)
+    check("reconcile announce: outcome unknown, the source paused", not r["ok"] and vms(A).get(n, {}).get("state") == "source", (r, where(n)))
+    check("reconcile announce: B committed the next revision", addr(B, ip).get("rev") == 1, addr(B, ip))
+    os.kill(json.load(open(os.path.join(B.run, "vms", f"{n}.lock")))["pid"], signal.SIGKILL)
+    fault(B, "status", 0)
+    check("reconcile announce: runs on A again", wait_for(lambda: where(n) == {A: "running"}, 60), where(n))
+    fault(A, "pages_slow", 0)
+    check("reconcile announce: announced past B's revision",
+          wait_for(lambda: addr(B, ip).get("rev") == 2 and addr(B, ip).get("via") == "127.0.0.1", 10), addr(B, ip))
+    kill(A, n)
+
+
 def conns(host):
     """Connections `host`'s listener has yet to answer (established, or closed by the peer)."""
     port = int(host.addr.rsplit(":", 1)[1])
@@ -5725,7 +5770,8 @@ SCENARIOS = dict(
     sigkill_restart=sigkill_restart, listen_trickle=listen_trickle,
     cow_wp_race=cow_wp_race, fetch_tail_enomem=fetch_tail_enomem, fetch_enomem_stuck=fetch_enomem_stuck, pull_enomem=pull_enomem,
     collapse_abort=collapse_abort, collapse_ckpt_fail=collapse_ckpt_fail, ckpt_paused_backlog=ckpt_paused_backlog, same_host_order=same_host_order, same_host_slow_route=same_host_slow_route, same_host_flood=same_host_flood, same_host_late_handover=same_host_late_handover, same_host_backlog=same_host_backlog, ckpt_backlog=ckpt_backlog, rx_stall=rx_stall, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,
-    handoff_superseded=handoff_superseded, delayed_announce=delayed_announce, suspend_cmd=suspend_cmd, fc_died_busy=fc_died_busy, pause_cmd_start=pause_cmd_start, suspend_died=suspend_died)
+    handoff_superseded=handoff_superseded, delayed_announce=delayed_announce,
+    prepare_fail_announce=prepare_fail_announce, reconcile_announce=reconcile_announce, suspend_cmd=suspend_cmd, fc_died_busy=fc_died_busy, pause_cmd_start=pause_cmd_start, suspend_died=suspend_died)
 names = [n for s in args.scenarios for n in (list(SCENARIOS) if s == "all" else [s])]
 if os.geteuid() != 0:
     sys.exit("run as root (sudo)")
