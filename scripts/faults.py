@@ -281,15 +281,19 @@ def addr(host, ip):
         return {}
 
 
-def start_listener(h, listen=None, extra=()):
-    """`h`'s listener, on `listen` (default: its address) with `extra` flags."""
+def start_listener(h, listen=None, extra=(), peer=None, wait=True):
+    """`h`'s listener, on `listen` (default: its address) with `extra` flags,
+    peered with `peer` (default: the other host's address); `wait`: until it
+    takes connections."""
     other = B if h is A else A
     for d in (h.state, h.run):
         os.makedirs(d, exist_ok=True)
     lg = open(os.path.join(h.run, "listen.log"), "a")
     listeners[h.addr] = subprocess.Popen(
-        [BIN, "--state", h.state, "--run", h.run, "listen", listen or h.addr, "--peer", other.addr, "--vm-ips", h.ips,
+        [BIN, "--state", h.state, "--run", h.run, "listen", listen or h.addr, "--peer", peer or other.addr, "--vm-ips", h.ips,
          "--reserve", "512", "--prefix", args.prefix, *extra], stdout=lg, stderr=lg, env=ENV)
+    if not wait:
+        return
     hp = h.addr.rsplit(":", 1)
     up = lambda: subprocess.run(["bash", "-c", f"exec 3<>/dev/tcp/{hp[0]}/{hp[1]}"], capture_output=True).returncode == 0
     assert wait_for(up, 10), f"listener {h} did not come up"
@@ -4393,6 +4397,29 @@ def wildcard_listen():
             start_listener(A)
 
 
+def peer_by_name():
+    """A peer configured by name (localhost:PORT) is admitted by a listener
+    just restarted, its lookup of the name not finished yet: the first
+    request, queued while the listener starts, is served, not refused."""
+    if args.no_listeners:
+        return print("peer by name: skipped (--no-listeners)")
+    stop_listener(B)
+    try:
+        start_listener(B, peer="localhost:" + A.addr.rsplit(":", 1)[1], wait=False)
+        r, deadline = None, time.time() + 10
+        while r is None and time.time() < deadline:
+            try:
+                r = peer(B, {"op": "migration", "mig": 1})
+            except ConnectionRefusedError:
+                time.sleep(0.005)
+        check("peer by name: the first request after a restart is admitted", r is not None and r.get("ok"), r)
+        r = peer(B, {"op": "migration", "mig": 1}, source="127.0.0.2")
+        check("peer by name: a non-peer is still refused", not r["ok"] and "is not a peer of" in r.get("error", ""), r)
+    finally:
+        stop_listener(B)
+        start_listener(B)
+
+
 def raw(host, data, timeout=10):
     """Sends `data` on a new connection to `host`'s listener; returns everything until EOF."""
     h, port = host.addr.rsplit(":", 1)
@@ -5898,7 +5925,7 @@ SCENARIOS = dict(
     prepare_disconnect=prepare_disconnect, prepare_trickle=prepare_trickle, prepare_fail=prepare_fail,
     fc_prepare=fc_prepare, slow_preload=slow_preload, bad_preload=bad_preload, ckpt_packet_hold=ckpt_packet_hold, ckpt_stall=ckpt_stall, standby=standby,
     suspend_disk_freed=suspend_disk_freed, resume_mark_fails=resume_mark_fails, kill_source=kill_source,
-    kill_refused_checkpoint=no_evict(kill_refused_checkpoint), wildcard_listen=wildcard_listen,
+    kill_refused_checkpoint=no_evict(kill_refused_checkpoint), wildcard_listen=wildcard_listen, peer_by_name=peer_by_name,
     forged_peer=forged_peer, restore_ip_peer=restore_ip_peer, late_withdrawal=late_withdrawal, unlend_retry=unlend_retry,
     unit_restart=unit_restart, log_cap=log_cap, gc_debris=gc_debris, prefix_change=prefix_change, arrival_log=arrival_log, template_tap=template_tap,
     incoming_killed=incoming_killed, start_killed=start_killed, claim_killed=claim_killed, standby_stalled=standby_stalled, standby_refill_race=standby_refill_race, fc_died=fc_died,
