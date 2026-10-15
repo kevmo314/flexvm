@@ -939,6 +939,69 @@ def exec_background():
     cleanup(n)
 
 
+def exec_pause_grace():
+    """#388: output waits 30 s for a dropped client, counting only time the guest ran. A command whose
+    output overflows its session's ring, whose client left just before a pause longer than that, loses
+    nothing: once resumed, it still waits, and the client that reattaches gets every byte."""
+    n = "ft-exec-grace"
+    ok(run(A, n))
+    sid, lines = os.urandom(16).hex(), 3_000_000
+    sock = os.path.join(A.run, "vms", f"{n}.sock")
+
+    def attach(req, until_ready=False):
+        """The frames of one attachment, as [(kind, payload)]: to its end, or to the "ready" output."""
+        frames = []
+        with socket.socket(socket.AF_UNIX) as s:
+            s.settimeout(30)
+            s.connect(sock)
+            s.sendall((json.dumps({"op": "exec", "session": sid, **req}) + "\n").encode())
+            f = s.makefile("rb")
+            reply = json.loads(f.readline() or b"{}")
+            assert reply.get("ok"), reply
+            while (head := f.read(5)) and len(head) == 5:
+                kind, size = struct.unpack("<BI", head)
+                frames.append((kind, f.read(size)))
+                if kind in (3, 5) or until_ready and kind == 1 and b"ready" in frames[-1][1]:
+                    break
+        return frames
+
+    def output(frames):
+        """(offset after the contiguous stdout, its bytes, exit code or None, offsets that did not follow on)."""
+        at, data, code, gaps = None, [], None, []
+        for kind, p in frames:
+            if kind in (1, 2):
+                off = struct.unpack("<Q", p[:8])[0]
+                if at is not None and off != at:
+                    gaps.append((at, off))
+                at = off + len(p) - 8
+                data.append(p[8:])
+            elif kind == 3:
+                code = struct.unpack("<i", p[8:12])[0]
+            elif kind == 5:
+                gaps.append(("lost", struct.unpack("<Q", p)[0]))
+        return at, b"".join(data), code, gaps
+
+    first = attach({"action": "start", "cmd": f"echo ready; sleep 5; seq 1 {lines}"}, until_ready=True)
+    offset, head, _, _ = output(first)
+    check("exec grace: a session started, then its client left", head == b"ready\n" and offset == 6, first[-3:])
+    # The guest finds the client gone within about 2 s; then seq fills half the ring and waits.
+    time.sleep(8)
+    seqs = lambda: sh(A, n, "for f in /proc/[0-9]*/comm; do cat $f; done 2>/dev/null | grep -cx seq || :")
+    check("exec grace: the output waits for the client", seqs() == (0, "1"), seqs())
+    check("exec grace: paused", pause(A, n))
+    time.sleep(40)
+    resume(A, n)
+    # Past the grace on the wall clock, well within it on the guest's own: it must still be waiting.
+    time.sleep(5)
+    check("exec grace: still waiting after a 40 s pause", seqs() == (0, "1"), seqs())
+    end, data, code, gaps = output(attach({"action": "attach", "offset": offset}))
+    expected = b"".join(b"%d\n" % i for i in range(1, lines + 1))
+    check("exec grace: the reattached client gets all of it, nothing lost", not gaps and data == expected,
+          (gaps[:3], len(data), len(expected)))
+    check("exec grace: then the exit", code == 0 and end == 6 + len(expected), (code, end))
+    cleanup(n)
+
+
 def guest_hang():
     """A guest that never answers its agent (Firecracker stopped) must not
     hold anything forever: execs fail within their deadline, and once it is
@@ -7046,7 +7109,7 @@ SCENARIOS = dict(
     cow_grow=no_evict(cow_grow), plug_race=no_evict(plug_race), shrink_stall=no_evict(shrink_stall), plug_storm=no_evict(plug_storm),
     basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, refused=refused, pages_blip=pages_blip,
     pages_dead_restore=pages_dead_restore, pages_dead=pages_dead, resume_kill=resume_kill, prepared_retry=prepared_retry,
-    quiet_source=quiet_source, exec_race=exec_race, guest_calls=guest_calls, exec_background=exec_background, guest_hang=guest_hang,
+    quiet_source=quiet_source, exec_race=exec_race, guest_calls=guest_calls, exec_background=exec_background, exec_pause_grace=exec_pause_grace, guest_hang=guest_hang,
     source_killed=source_killed, target_killed=target_killed, abort_superseded=abort_superseded, gen_zero=gen_zero,
     checkpoint_restore=checkpoint_restore, checkpoint_fork=checkpoint_fork, checkpoint_corrupt=checkpoint_corrupt,
     checkpoint_crash=checkpoint_crash, pause_resume=pause_resume, signals=signals, pause_lost=pause_lost, suspend_resume=suspend_resume,
