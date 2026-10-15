@@ -30,7 +30,7 @@ p.add_argument("--ckpt-dir", default=os.path.join(tempfile.gettempdir(), "flexvm
                help="where checkpoint scenarios write checkpoints (removed afterwards)")
 p.add_argument("--template", default="small")
 p.add_argument("--image", default="public.ecr.aws/docker/library/busybox:1.36",
-               help="container image of the app_log scenario's template (APP_TEMPLATE names a built one instead)")
+               help="container image of the app_log and bad_app_log scenarios' template (APP_TEMPLATE names a built one instead)")
 p.add_argument("scenarios", nargs="+")
 args = p.parse_args()
 BIN = os.path.abspath(args.bin)
@@ -208,7 +208,7 @@ def fault(host, f, ms):
 
 FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_before_run", "restore_after_run",
           "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "resume_kill",
-          "prepare_fail", "short_incoming", "slow_preload", "bad_preload", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
+          "prepare_fail", "short_incoming", "slow_preload", "bad_preload", "bad_app_log", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
           "started_fsync", "started_unmark", "start_stall", "incoming_stall", "claim_stall", "handoff_stall", "ckpt_wp_race",
           "fetch_tail_enomem", "fetch_enomem_stuck", "pull_enomem", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo", "release_stall", "release_late", "no_plug", "pause_lost", "tap_backlog", "tap_backlog_stuck", "pause_unknown", "no_collapse", "collapse_slow", "pages_slow")
 
@@ -5243,6 +5243,30 @@ def app_log():
     cleanup(n)
 
 
+def bad_app_log():
+    """A source whose header claims more app output than the guest has
+    (u64::MAX, `bad_app_log`): the target goes on from the end of the
+    guest's output, saying the offset was past it, rather than silently."""
+    n = "ft-bad-applog"
+    tpl = app_template()
+    clear_log(A, n)
+    clear_log(B, n)
+    ok(run(A, n, template=tpl))
+    check("bad app log: printing", wait_for(lambda: max(app_lines(log(A, n)), default=-1) >= 5, 60), log(A, n)[-500:])
+    fault(A, "bad_app_log", 10000)
+    r = migrate(A, n, B)
+    fault(A, "bad_app_log", 0)
+    check("bad app log: migrated", r["ok"], r)
+    wait_released(B, n)
+    last = max(app_lines(log(A, n)))
+    check("bad app log: printing after the migration", wait_for(lambda: max(app_lines(log(B, n)), default=-1) >= last + 20, 60), log(B, n)[-500:])
+    check("bad app log: the skip is logged", "is past the guest's end" in log(B, n), log(B, n)[-500:])
+    lines = app_lines(log(A, n)) + app_lines(log(B, n))
+    dups = sorted({x for x in lines if lines.count(x) > 1})
+    check("bad app log: no line printed twice", not dups, dups[:20])
+    cleanup(n)
+
+
 def no_evict(scenario):
     """Runs a scenario that grows guests on purpose with pressure eviction
     off on both hosts: how much the host has free must not move its VMs."""
@@ -5607,7 +5631,7 @@ SCENARIOS = dict(
     suspend_killed=suspend_killed,
     suspend_debris=suspend_debris,
     revoked_publication=revoked_publication,
-    app_log=app_log,
+    app_log=app_log, bad_app_log=bad_app_log,
     source_unpublished=source_unpublished,
     source_killed_basic=source_killed_basic,
     arrival_overtaken=arrival_overtaken,

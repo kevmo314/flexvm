@@ -1050,6 +1050,12 @@ impl Proc {
                         let (at, was) = (u64::from_le_bytes(at), self.app_log.load(Ordering::SeqCst));
                         if at > was {
                             eprintln!("vm {}: {} bytes of app output lost (the guest keeps its last 1 MiB)", vm.name, at - was);
+                        } else if at < was {
+                            // Only an offset past the guest's output (a bad migration header or manifest) moves back.
+                            eprintln!(
+                                "vm {}: app output offset {was} is past the guest's end {at}; going on from there (output before it may be missing)",
+                                vm.name
+                            );
                         }
                         self.app_log.store(at, Ordering::SeqCst);
                         continue;
