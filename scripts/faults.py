@@ -210,7 +210,7 @@ FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_be
           "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "resume_kill",
           "prepare_fail", "short_incoming", "slow_preload", "bad_preload", "bad_app_log", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
           "started_fsync", "started_unmark", "start_stall", "incoming_stall", "claim_stall", "standby_lock_stall", "standby_lock_hang", "handoff_stall", "ckpt_wp_race", "ckpt_rescue_fail",
-          "fetch_tail_enomem", "fetch_enomem_stuck", "pull_enomem", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo", "release_stall", "release_late", "no_plug", "pause_lost", "tap_backlog", "tap_backlog_stuck", "pause_unknown", "restore_unpause_fail", "resume_link_fail", "restore_ping_slow", "readdress_fail", "no_collapse", "collapse_slow", "pages_slow", "unlend_fail", "route_stall")
+          "fetch_tail_enomem", "fetch_enomem_stuck", "pull_enomem", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo", "release_stall", "release_late", "no_plug", "pause_lost", "tap_backlog", "tap_backlog_stuck", "pause_unknown", "restore_unpause_fail", "resume_link_fail", "resume_partial", "repause_fail", "pause_fail", "restore_ping_slow", "readdress_fail", "no_collapse", "collapse_slow", "pages_slow", "unlend_fail", "route_stall")
 
 
 def disarm():
@@ -2451,6 +2451,41 @@ def resume_unpause_fail():
     check("unpause fails: flexvm resume runs it", vms(A).get(n, {}).get("state") == "running", vms(A).get(n))
     check("unpause fails: md5 intact, same processes", md5(A, n) == m and marker_id(A, n) == proc, (proc, marker_id(A, n)))
     cleanup(n)
+
+
+def resume_unsettled():
+    """A resume that failed part way (some vCPUs may run, Firecracker still
+    says Paused) and whose pause after it failed too stays unsure: a later
+    pause that fails is not taken for paused because Firecracker says Paused,
+    and nothing leaves the VM meanwhile. Once a pause succeeds it is known
+    again, and resumes."""
+    n = "ft-unsettled"
+    m = setup(n, mib=20)
+    sock = api_sock(A, n)
+    unsure = lambda: control(A, n, {"op": "debug", "what": "status"})["result"]["describe"]["state_unsure"]
+    check("unsettled: paused", pause(A, n))
+    for f in ("resume_partial", "repause_fail"):
+        fault(A, f, 60000)
+    signal_vm(A, n, signal.SIGCONT)
+    check("unsettled: the resume fails part way", wait_for(lambda: "resume failed part way" in log(A, n), 10), log(A, n)[-1000:])
+    check("unsettled: unsure", unsure())
+    fault(A, "resume_partial", 0)
+    fault(A, "pause_fail", 60000)
+    signal_vm(A, n, signal.SIGTSTP)
+    check("unsettled: a later pause fails too", wait_for(lambda: "pause failed part way" in log(A, n), 10), log(A, n)[-1000:])
+    check("unsettled: Firecracker says Paused, yet still unsure", fc_api(sock, "GET", "/")["state"] == "Paused" and unsure(), fc_api(sock, "GET", "/"))
+    path = ckpt_path("ft-unsettled")
+    r = checkpoint(A, n, path)
+    check("unsettled: no checkpoint while unsure", not r["ok"] and "ended unknown" in r.get("error", "") and not os.path.exists(path), r)
+    for f in ("pause_fail", "repause_fail"):
+        fault(A, f, 0)
+    resume(A, n)
+    check("unsettled: paused explicitly, then resumed", vms(A)[n]["state"] == "running" and not unsure() and fc_api(sock, "GET", "/")["state"] == "Running", vms(A)[n])
+    check("unsettled: md5 intact", md5(A, n) == m)
+    r = checkpoint(A, n, path)
+    check("unsettled: checkpoints again", r["ok"], r)
+    cleanup(n)
+    rm_ckpt(path)
 
 
 def abort_link_fail():
@@ -6246,7 +6281,7 @@ SCENARIOS = dict(
     checkpoint_restore=checkpoint_restore, checkpoint_fork=checkpoint_fork, checkpoint_corrupt=checkpoint_corrupt,
     checkpoint_crash=checkpoint_crash, pause_resume=pause_resume, signals=signals, pause_lost=pause_lost, suspend_resume=suspend_resume,
     suspend_gen=suspend_gen, checkpoint_hotplug=checkpoint_hotplug, checkpoint_untrusted_dir=checkpoint_untrusted_dir,
-    resume_failures=resume_failures, resume_unpause_fail=resume_unpause_fail, abort_link_fail=abort_link_fail, resume_slow_guest=resume_slow_guest, resume_readdress_fail=resume_readdress_fail, held_restore_frozen=held_restore_frozen, cow_exact=cow_exact, cow_rescue_fail=cow_rescue_fail, cow_collapsed=skippable(cow_collapsed), unplug_collapsed=no_evict(skippable(unplug_collapsed)), cow_abort=cow_abort,
+    resume_failures=resume_failures, resume_unpause_fail=resume_unpause_fail, abort_link_fail=abort_link_fail, resume_unsettled=resume_unsettled, resume_slow_guest=resume_slow_guest, resume_readdress_fail=resume_readdress_fail, held_restore_frozen=held_restore_frozen, cow_exact=cow_exact, cow_rescue_fail=cow_rescue_fail, cow_collapsed=skippable(cow_collapsed), unplug_collapsed=no_evict(skippable(unplug_collapsed)), cow_abort=cow_abort,
     cow_crash=cow_crash, cow_reports_held=cow_reports_held, ckpt_incremental=ckpt_incremental, ckpt_hot=ckpt_hot,
     ckpt_failed_stop=ckpt_failed_stop, ckpt_rearm=ckpt_rearm, ckpt_dir_moved=ckpt_dir_moved,
     prepare_disconnect=prepare_disconnect, prepare_trickle=prepare_trickle, prepare_fail=prepare_fail,

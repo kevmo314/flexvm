@@ -519,7 +519,9 @@ impl Vm {
             return Some(State::Running);
         }
         self.pager.hold_collapse(true);
-        (0..2).any(|_| self.fc(|fc| fc.pause()).is_ok()).then_some(State::Paused)
+        // Test fault `repause_fail`: the pause after it fails too.
+        let pause = || if crate::host::fault("repause_fail") { Err("injected fault: pausing it again failed".into()) } else { self.fc(|fc| fc.pause()) };
+        (0..2).any(|_| pause().is_ok()).then_some(State::Paused)
     }
 
     /// `after_failed_resume`, recorded; Paused but unsure if it cannot be had (the next pause or resume tries again).
@@ -564,7 +566,11 @@ impl Vm {
         if pausing {
             self.pager.hold_collapse(true);
         }
-        let mut res = self.fc(|fc| if pausing { fc.pause() } else { fc.resume() }).map(drop);
+        // Test faults `pause_fail` and `resume_partial` (a resume some vCPUs missed: Firecracker still says Paused).
+        let mut res = match crate::host::fault(if pausing { "pause_fail" } else { "resume_partial" }) {
+            true => Err(format!("injected fault: firecracker PATCH /vm: 400 the {} failed part way", if pausing { "pause" } else { "resume" }).into()),
+            false => self.fc(|fc| if pausing { fc.pause() } else { fc.resume() }).map(drop),
+        };
         // Test fault `pause_lost`: the pause landed, but its answer is lost.
         if pausing && res.is_ok() && crate::host::fault("pause_lost") {
             res = Err("injected fault: the pause's answer was lost".into());
@@ -572,14 +578,19 @@ impl Vm {
         // A timeout or a lost answer may still have switched it: Firecracker says which state it is in. If that cannot
         // be had either, it is recorded as it was but unsure (collapsing held, after a pause), so the next pause or
         // resume asks again or sends its request whatever the record says.
+        let resume_failed = self.resume_failed.load(Ordering::SeqCst);
         let now = match &res {
             Ok(()) => Some(to),
             // Not `rejected`: a resume that failed part way is answered 400 too.
             Err(_) if !pausing => self.after_failed_resume(),
+            // Still unsettled after a failed resume: only Firecracker saying Running (every vCPU acknowledged) settles
+            // it here, never its saying Paused (some vCPUs may run) nor a refusal.
+            Err(_) if resume_failed => self.fc_state().filter(|&s| s == State::Running),
             Err(e) if rejected(e, "/vm") => Some(from),
             Err(_) => self.fc_state(),
         };
-        self.resume_failed.store(now.is_none() && !pausing, Ordering::SeqCst);
+        // Kept until an explicit pause succeeds or Running is confirmed.
+        self.resume_failed.store(now.is_none() && (resume_failed || !pausing), Ordering::SeqCst);
         // Recorded whichever it is (a failed resume may find it still paused).
         if let Some(s) = now {
             self.record(s);
@@ -868,6 +879,7 @@ impl Vm {
             "template_id": self.template.meta.id,
             "regions": self.pager.regions(),
             "state": self.state().name(),
+            "state_unsure": self.switch_unsure(),
             "vcpus": self.template.meta.vcpus,
             "rss_mib": self.rss() >> 20,
             "guest_mib": self.template.meta.mem_mib + hotplug["plugged_size_mib"].as_u64().unwrap_or(0),
