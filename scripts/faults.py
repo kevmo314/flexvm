@@ -5603,6 +5603,88 @@ def standby_stop_claim():
     cleanup(n)
 
 
+def standby_claim_signal():
+    """A foreground `run` interrupted (SIGINT), or killed, while its claim of a
+    standby VM is under way: the VM the claim made goes, as a cold foreground
+    run's would, and is not left running with no one to stop it."""
+    t = args.template
+    ok(cli_json(A, "standby", "--template", t, "1"))
+    try:
+        for sig, n in ((signal.SIGINT, "ft-sb-sigint"), (signal.SIGKILL, "ft-sb-sigkill")):
+            scenario_vms.add(n)
+            what = signal.Signals(sig).name
+            check(f"standby claim {what}: a standby ready", wait_for(lambda: len(standby_socks(A, t)) == 1, 60), standby_pids(A, t))
+            # The claim stalls 3 s once the VM runs, before the standby answers.
+            fault(A, "claim_stall", 10000)
+            # Output to a file: an orphaned VM would hold a pipe open, and reading it would never end.
+            out = tempfile.TemporaryFile("w+")
+            p = subprocess.Popen([BIN, "--state", A.state, "--run", A.run, "run", n, "--template", t, "--", "sleep 600"],
+                                 stdin=subprocess.DEVNULL, stdout=out, stderr=out, text=True, env=ENV)
+            # Inside the stall: the claim has started the VM, its answer is yet to come.
+            time.sleep(1.5)
+            p.send_signal(sig)
+            try:
+                p.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait()
+            out.seek(0)
+            err = out.read()
+            fault(A, "claim_stall", 0)
+            if sig == signal.SIGINT:
+                check("standby claim SIGINT: the claim finishes, then the VM gets the signal", '"standby":true' in err.replace(" ", ""), err[-800:])
+            else:
+                # Once its stall is over, the standby answers, finds the claimer gone and ends the VM.
+                sblog = lambda: open(os.path.join(A.run, "standby", t, "standby.log"), errors="replace").read()
+                check("standby claim SIGKILL: the standby finds its claimer gone", wait_for(lambda: f"the claimer of {n} is gone" in sblog(), 30),
+                      (err[-800:], sblog()[-1500:]))
+            check(f"standby claim {what}: the claimed vm is gone, not orphaned", wait_for(lambda: n not in vms(A), 30),
+                  (vms(A).get(n), log(A, n)[-1500:]))
+            cleanup(n)
+    finally:
+        fault(A, "claim_stall", 0)
+        cli(A, "standby", "--template", t, "0")
+
+
+def standby_socks(host, t):
+    """The listening sockets of `host`'s standby VMs of `t`: those loaded, claimable."""
+    d = os.path.join(host.run, "standby", t)
+    return [f for f in os.listdir(d) if f.endswith(".sock")] if os.path.isdir(d) else []
+
+
+def standby_concurrent_claims():
+    """Concurrent runs claim different standby VMs at once: none queues on
+    another's claim (each claim stalls 3 s)."""
+    t, names = args.template, ("ft-sb-cc1", "ft-sb-cc2")
+    ok(cli_json(A, "standby", "--template", t, "2"))
+    res = {}
+    try:
+        check("standby concurrent: two ready", wait_for(lambda: len(standby_socks(A, t)) == 2, 90), standby_pids(A, t))
+        ready = set(standby_pids(A, t))
+        fault(A, "claim_stall", 15000)
+
+        def claim(n):
+            start = time.time()
+            res[n] = (run(A, n), time.time() - start)
+
+        ths = [threading.Thread(target=claim, args=(n,)) for n in names]
+        for th in ths:
+            th.start()
+        for th in ths:
+            th.join()
+    finally:
+        fault(A, "claim_stall", 0)
+        cli(A, "standby", "--template", t, "0")
+    rs = [res.get(n, ({}, 0)) for n in names]
+    check("standby concurrent: both claimed standbys", all(r.get("ok") and r["result"].get("standby") is True for r, _ in rs), rs)
+    pids = {r.get("result", {}).get("pid") for r, _ in rs}
+    check("standby concurrent: different ones, both ready before", len(pids) == 2 and pids <= ready, (pids, ready))
+    # In one stall each, side by side; queued, the second would take two.
+    check("standby concurrent: neither waited for the other", max(d for _, d in rs) < 5.5, [round(d, 2) for _, d in rs])
+    for n in names:
+        cleanup(n)
+
+
 def standby_stalled():
     """A claimer that connects and stops before sending its request keeps no
     standby VM from stopping; a stopped standby VM keeps no `run` waiting
@@ -6877,7 +6959,7 @@ SCENARIOS = dict(
     route_abort=route_abort,
     uffd_err=uffd_err,
     mem_high=no_evict(skippable(mem_high)), mem_high_migrate=no_evict(skippable(mem_high_migrate)),
-    mem_high_evict=skippable(mem_high_evict), mem_refused_headroom=skippable(mem_refused_headroom), evict_grower=skippable(evict_grower), evict_no_pingpong=evict_no_pingpong, evict_skips_cmd=evict_skips_cmd, cmd_flag=cmd_flag, standby_stop_claim=standby_stop_claim, evict_latency=skippable(evict_latency),
+    mem_high_evict=skippable(mem_high_evict), mem_refused_headroom=skippable(mem_refused_headroom), evict_grower=skippable(evict_grower), evict_no_pingpong=evict_no_pingpong, evict_skips_cmd=evict_skips_cmd, cmd_flag=cmd_flag, standby_stop_claim=standby_stop_claim, standby_claim_signal=standby_claim_signal, standby_concurrent_claims=standby_concurrent_claims, evict_latency=skippable(evict_latency),
     start_admission=start_admission, standby_admission=standby_admission,
     refused_admission=refused_admission, meminfo_unreadable=meminfo_unreadable,
     cow_grow=no_evict(cow_grow), plug_race=no_evict(plug_race), shrink_stall=no_evict(shrink_stall), plug_storm=no_evict(plug_storm),

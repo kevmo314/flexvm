@@ -249,6 +249,17 @@ impl Paths {
             templates: templates.unwrap_or_else(|| a.join("templates")),
         })
     }
+
+    /// As a VM process this one spawns without `--artifacts` finds them: `FLEXVM_ARTIFACTS`
+    /// (else `./artifacts`) and `FLEXVM_TEMPLATES`, which `main` sets from its flags.
+    pub fn from_env() -> Result<Self> {
+        let artifacts = std::env::var_os("FLEXVM_ARTIFACTS").map_or_else(|| PathBuf::from("artifacts"), PathBuf::from);
+        Paths::new(&artifacts, std::env::var_os("FLEXVM_TEMPLATES").map(PathBuf::from))
+    }
+}
+
+fn runs_mib(runs: &[(u64, u64)]) -> u64 {
+    (runs.iter().map(|r| r.1).sum::<u64>() * crate::util::PAGE_SIZE as u64) >> 20
 }
 
 pub struct Template {
@@ -366,7 +377,13 @@ impl Template {
 
     /// What a cold start pages in up front (`Pager::prefetch`), MiB.
     pub fn working_set_mib(&self) -> u64 {
-        (self.working_set.iter().map(|r| r.1).sum::<u64>() * crate::util::PAGE_SIZE as u64) >> 20
+        runs_mib(&self.working_set)
+    }
+
+    /// `working_set_mib` of what `name` resolves to now, without opening it (its memory).
+    pub fn working_set_mib_of(paths: &Paths, name: &str) -> Result<u64> {
+        let runs: Vec<(u64, u64)> = serde_json::from_slice(&std::fs::read(Template::resolve(paths, name)?.join("wset"))?)?;
+        Ok(runs_mib(&runs))
     }
 
     pub fn load_set(&self) -> Vec<u64> {
@@ -811,6 +828,19 @@ fn build(paths: &Paths, dir: &Path, name: &str, vcpus: u32, mem_mib: u64, max_mi
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn working_set_mib_is_read_without_opening_the_template() {
+        let root = std::env::temp_dir().join(format!("flexvm-wset-mib-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("templates/t")).unwrap();
+        let paths = Paths::new(&root, None).unwrap();
+        // 1 GiB and 2 MiB of 4 KiB pages; no memory file, which opening it would need.
+        std::fs::write(root.join("templates/t/wset"), b"[[0, 262144], [300000, 512]]").unwrap();
+        assert_eq!(Template::working_set_mib_of(&paths, "t").unwrap(), 1026);
+        assert!(Template::working_set_mib_of(&paths, "none").is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn working_set_runs_are_padded_and_merged() {

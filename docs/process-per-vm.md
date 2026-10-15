@@ -163,12 +163,13 @@ RUN (default /run/flexvm, tmpfs)
   evict.backoff          refused VM and peer pairs and when to try them again
   standby/T/KEY.PID-START.sock a standby VM of template T, generation KEY (PID-START.lock while it lives)
   standby/T/PID-START.claim  locked by a standby VM while a claim of it is under way
+  standby/T/PID-START.take   locked by a `run` while it tries that standby (others try another first)
   standby/T/.refill      one refill of T at a time (flock)
   standby/T/.failed      its mtime: T's last failed refill (none for a minute after)
   standby/T/standby.log  the standby VMs' output and refill errors
   standby/.pressure      its mtime: when pressure last stopped standby VMs (no refill for a minute)
   standby/.loadset-ID    pages loads of template ID touch, learned by standby VMs, for migrations to preload
-                         (one per generation, never swept: whether one is in use cannot be told)
+                         (one per generation; swept once neither read nor written for a day)
   faults.json            armed test faults (FLEXVM_FAULTS=1 only)
   w/PID-START/           a VM process's work directory, named by its whole identity (a later
                          process with its pid never shares it): `owner` (pid, start time), and per
@@ -426,9 +427,10 @@ back above the mark by half the mark's height over the reserve (at least
 admission uses) are read from `host.json` as it changes. Under the reserve,
 standby VMs are stopped first, under a lock of their own
 (`STATE/standby.stop.lock`), so a slow migration holding `evict.lock` does
-not hold that up. A refill holds it shared from each standby's grant until
+not hold that up. A refill's grant for each standby is the template's working set (what a cold start
+admits), 256 MiB at least. Recovery and a claim's refill start none while `.pressure` is recent, checked under the stop lock before each grant (relief marks it holding the lock), so one that waited behind another refill during relief starts none. A refill holds it shared from each standby's grant until
 that standby has created its lock file (it says so on its notify fd), 5 s
-at most (its grant gives up on a busy host lock by then; a standby that has not said so by then, or said something else, is killed and reaped before the lock is let go, then its grant is refunded and what it left swept, and the refill fails), never through its load, and starts none while relief holds it: relief either lists
+at most (its grant gives up on a busy host lock by then; a standby that has not said so by then, or said something else, is killed and reaped before the lock is let go, then its grant is refunded and what it left swept locally, never waiting on peers, and the refill fails), never through its load, and starts none while relief holds it: relief either lists
 a standby being started or ran before its grant, and meanwhile holds eviction
 off as it does for another process stopping them. Signalling any marks the pressure (`RUN/standby/.pressure`,
 no refill for a minute); the controller then checks their pidfds on its
