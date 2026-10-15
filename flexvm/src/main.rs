@@ -497,9 +497,7 @@ pub fn print(v: Value) -> Result<()> {
 }
 
 fn build_template(args: &Args, name: &str) -> Result<()> {
-    if name.is_empty() {
-        return Err("template needs a NAME".into());
-    }
+    host::check_name(name)?;
     // Firecracker wants 1 or an even count of vCPUs, at most 32.
     let cpus = (util::host_cpus() as u64).min(32);
     let cpus = if cpus > 1 { cpus & !1 } else { 1 };
