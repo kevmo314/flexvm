@@ -566,24 +566,33 @@ mod tests {
         let d = dir(&host, "default");
         std::fs::create_dir_all(&d).unwrap();
         let lock = File::create(d.join(".refill")).unwrap();
-        crate::host::flock(&lock, libc::LOCK_EX).unwrap();
+        let lock = Flock::new(lock, libc::LOCK_EX).unwrap();
         assert_eq!(refill_by(&host, "default", false).unwrap(), 0);
         drop(lock);
         // Nor while relief stops standby VMs.
         let stop = stop_lock(&host).unwrap();
-        crate::host::flock(&stop, libc::LOCK_EX).unwrap();
+        let stop = Flock::new(stop, libc::LOCK_EX).unwrap();
         assert_eq!(refill_by(&host, "default", false).unwrap(), 0);
         drop(stop);
         // A host lock held by a stuck process fails the grant within the budget, and lets relief in.
         let held = File::create(host.state.join("lock")).unwrap();
-        crate::host::flock(&held, libc::LOCK_EX).unwrap();
+        let held = Flock::new(held, libc::LOCK_EX).unwrap();
         let start = Instant::now();
         assert!(refill_by(&host, "default", false).is_err());
         assert!(start.elapsed() < LOCKED_TIMEOUT + Duration::from_secs(1), "{:?}", start.elapsed());
-        crate::host::flock(&stop_lock(&host).unwrap(), libc::LOCK_EX | libc::LOCK_NB).unwrap();
+        Flock::new(stop_lock(&host).unwrap(), libc::LOCK_EX | libc::LOCK_NB).unwrap();
         drop(held);
         host.cfg.reserve_mib = u64::MAX / 2;
-        assert_eq!(refill_by(&host, "default", false).unwrap(), 0);
+        // Other tests' host locks share THREADS, even with different state directories.
+        // Retry only lock contention; the reserve must still refuse a grant without error.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let started = loop {
+            match refill_by(&host, "default", false) {
+                Err(e) if e.to_string() == "the host lock is busy" && Instant::now() < deadline => continue,
+                result => break result.unwrap(),
+            }
+        };
+        assert_eq!(started, 0);
         assert!(live(&host, "default").is_empty());
         assert!(!recent(&pressure(&host)));
         std::fs::write(pressure(&host), b"").unwrap();
