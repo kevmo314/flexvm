@@ -9,7 +9,7 @@ use std::fs::File;
 use std::io::BufReader;
 use std::net::Ipv4Addr;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -373,6 +373,8 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
     save_load_set(host, &tpl);
     let _ = std::fs::remove_file(&sock); // A previous process with this pid may have left it.
     let listener = UnixListener::bind(&sock)?;
+    // A claimer refused by a dead standby of this pid may unlink the path after this bind.
+    let bound = std::fs::metadata(&sock)?.ino();
     if let Some(mut f) = notify.take() {
         let _ = send_json(&mut f, &json!({"ok": true, "result": {"pid": me.pid, "template": template}}));
     }
@@ -390,7 +392,8 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
             let current = key(&p.paths, template).ok();
             let extra = live(host, template).iter().position(|id| *id == me).is_none_or(|i| i >= target(host, template));
             let dead = p.standby.lock().unwrap().as_ref().is_none_or(|s| s.pager.failed().is_some() || !s.firecracker().alive());
-            if current.as_deref() != Some(&mine) || extra || dead {
+            let unreachable = std::fs::symlink_metadata(&sock).map(|m| m.ino()).ok() != Some(bound);
+            if current.as_deref() != Some(&mine) || extra || dead || unreachable {
                 p.finish(op, End::NotStarted, 0, None);
             }
             continue;
@@ -679,8 +682,8 @@ mod tests {
 
     #[test]
     fn long_template_has_a_short_socket_path() {
-        let root = PathBuf::from(format!("/tmp/fv-long-{}", std::process::id()));
-        let run = root.join("r".repeat(60 - root.as_os_str().len() - 1));
+        let root = std::env::temp_dir().join(format!("fv-long-{}", std::process::id()));
+        let run = root.join("r".repeat(60usize.saturating_sub(root.as_os_str().len() + 1).max(1)));
         let host = Host::open(&root.join("state"), &run).unwrap();
         let template = "t".repeat(64);
         let d = create_dir(&host, &template).unwrap();
