@@ -444,14 +444,12 @@ impl Host {
     /// `RUN/.logs.lock`: held shared while a log is opened for a start,
     /// exclusively while garbage collection decides on one and removes it.
     /// Never a name's lock, which a start takes without waiting.
-    pub fn logs_lock(&self, how: i32) -> Result<File> {
-        let f = File::create(self.run.join(".logs.lock"))?;
-        flock(&f, how)?;
-        Ok(f)
+    pub fn logs_lock(&self, how: i32) -> Result<Flock> {
+        Ok(Flock::new(File::create(self.run.join(".logs.lock"))?, how)?)
     }
 
     pub fn alive(&self, name: &str) -> bool {
-        File::open(self.vms(name, "lock")).is_ok_and(|f| flock(&f, libc::LOCK_SH | libc::LOCK_NB).is_err())
+        File::open(self.vms(name, "lock")).is_ok_and(|f| probe(&f, libc::LOCK_SH).is_err())
     }
 
     /// Whether `name`'s lock is held: None when that cannot be told (the
@@ -462,7 +460,7 @@ impl Host {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(false),
             Err(_) => return None,
         };
-        match flock(&f, libc::LOCK_SH | libc::LOCK_NB) {
+        match probe(&f, libc::LOCK_SH) {
             Ok(()) => Some(false),
             Err(e) if e.raw_os_error() == Some(libc::EWOULDBLOCK) => Some(true),
             Err(_) => None,
@@ -1101,9 +1099,7 @@ impl Host {
         mut withdrawn: impl FnMut(Ipv4Addr, u64),
     ) {
         let Ok(lock) = File::create(self.run.join(".owed.lock")) else { return };
-        if flock(&lock, libc::LOCK_EX | libc::LOCK_NB).is_err() {
-            return;
-        }
+        let Ok(_lock) = Flock::new(lock, libc::LOCK_EX | libc::LOCK_NB) else { return };
         self.owed_debris();
         let cursor = self.run.join(".owed.next");
         let last = load::<u64>(&cursor).ok().flatten();
@@ -1238,9 +1234,7 @@ impl Host {
 
     fn retire_migrations_with(&self, budget: usize, mut query: impl FnMut(&str, &Ident) -> Result<bool>) {
         let Ok(lock) = File::create(self.run.join(".retire.lock")) else { return };
-        if flock(&lock, libc::LOCK_EX | libc::LOCK_NB).is_err() {
-            return;
-        }
+        let Ok(_lock) = Flock::new(lock, libc::LOCK_EX | libc::LOCK_NB) else { return };
         // A sorted ID cursor survives deletions and lets different processes
         // continue the same rotation. Only retirement holds this lock.
         let cursor = self.run.join(".retire.next");
@@ -1936,9 +1930,7 @@ impl Host {
     /// False if another process was delivering (it, or the next sweep, delivers these too).
     fn deliver_withdrawals_with(&self, budget: usize, now: u64, tell: impl Fn(&str, &serde_json::Value) -> Result<()> + Sync) -> bool {
         let Ok(lock) = File::create(self.run.join(".withdrawals.lock")) else { return false };
-        if flock(&lock, libc::LOCK_EX | libc::LOCK_NB).is_err() {
-            return false;
-        }
+        let Ok(_lock) = Flock::new(lock, libc::LOCK_EX | libc::LOCK_NB) else { return false };
         self.write_debris("withdrawals");
         let peers = self.config_now().peers;
         let notices: Vec<(Ipv4Addr, Notice)> = std::fs::read_dir(self.state.join("withdrawals"))
@@ -2134,6 +2126,14 @@ pub fn check_name(name: &str) -> Result<()> {
 
 pub fn flock(f: &File, how: i32) -> std::io::Result<()> {
     crate::util::eintr(|| unsafe { libc::flock(f.as_raw_fd(), how) }).map(drop)
+}
+
+/// Whether `f`'s lock can be had now (`how`, nonblocking), let go of at once
+/// when it can: not left to the close, which a child forked meanwhile delays (see `Flock`).
+pub fn probe(f: &File, how: i32) -> std::io::Result<()> {
+    flock(f, how | libc::LOCK_NB)?;
+    let _ = flock(f, libc::LOCK_UN);
+    Ok(())
 }
 
 /// A holder may unlink the file just before we lock: retry until it is the path's.
@@ -3494,6 +3494,36 @@ mod tests {
         let retirement = File::open(h.run.join(".retire.lock")).unwrap();
         flock(&retirement, libc::LOCK_EX | libc::LOCK_NB).unwrap();
         h.retire_migrations_with(1, |_, _| panic!("busy retirement must be skipped"));
+    }
+
+    #[test]
+    fn a_pass_lets_go_of_its_lock_though_a_forked_child_shares_it() {
+        let h = host("retire-fork");
+        released_migration(&h, 1, "reachable");
+        let (forked, mut told) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut spawner = None;
+        h.retire_migrations_with(1, |_, _| {
+            // Another thread forks while the pass holds its lock, and its child is slow to
+            // exec, as one making a cgroup scope in `pre_exec` is.
+            let fd = forked.as_raw_fd();
+            spawner = Some(std::thread::spawn(move || {
+                let mut cmd = std::process::Command::new("true");
+                unsafe {
+                    std::os::unix::process::CommandExt::pre_exec(&mut cmd, move || {
+                        libc::write(fd, b"f".as_ptr().cast(), 1);
+                        std::thread::sleep(Duration::from_secs(1));
+                        Ok(())
+                    })
+                };
+                cmd.status().unwrap();
+            }));
+            std::io::Read::read_exact(&mut told, &mut [0]).unwrap();
+            Ok(false)
+        });
+        let retirement = File::open(h.run.join(".retire.lock")).unwrap();
+        let free = flock(&retirement, libc::LOCK_EX | libc::LOCK_NB).is_ok();
+        spawner.unwrap().join().unwrap();
+        assert!(free, "the pass let go of its lock, not only closed it");
     }
 
     #[test]

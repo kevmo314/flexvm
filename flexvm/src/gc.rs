@@ -8,7 +8,7 @@ use std::fs::File;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
-use crate::host::{boot_id, flock, Host, Ident, Liveness};
+use crate::host::{boot_id, probe, Flock, Host, Ident, Liveness};
 use crate::util::locked;
 
 /// How often `periodic` sweeps (some process on the host does).
@@ -60,9 +60,7 @@ pub fn sweep(host: &Host) {
 /// Local sweeps are one at a time (`RUN/.gc.lock`).
 pub fn local_cleanup(host: &Host) {
     let Ok(lock) = File::create(host.run.join(".gc.lock")) else { return };
-    if flock(&lock, libc::LOCK_EX | libc::LOCK_NB).is_err() {
-        return;
-    }
+    let Ok(_lock) = Flock::new(lock, libc::LOCK_EX | libc::LOCK_NB) else { return };
     if let Err(e) = host.collect_garbage() {
         crate::log!("garbage collection: {e}");
     }
@@ -142,7 +140,7 @@ fn standby_sockets(dir: &Path) {
             (Some(_), Ok(pid), Ok(start)) => Ident { pid, start, boot: boot_id().into() }.liveness() == Liveness::Gone,
             (Some(_), ..) => false,
             _ => match File::open(dir.join(format!("{id}.lock"))) {
-                Ok(f) => flock(&f, libc::LOCK_SH | libc::LOCK_NB).is_ok(),
+                Ok(f) => probe(&f, libc::LOCK_SH).is_ok(),
                 Err(e) => e.kind() == std::io::ErrorKind::NotFound,
             },
         };
@@ -155,6 +153,7 @@ fn standby_sockets(dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host::flock;
     use std::path::PathBuf;
 
     fn dir(tag: &str) -> PathBuf {
@@ -233,17 +232,9 @@ mod tests {
         File::create(&marker).unwrap().set_modified(SystemTime::now() - MOVED_TTL - Duration::from_secs(1)).unwrap();
         sweep(&host);
         assert!(!marker.exists());
-        // Let go: free once no other test's child, forked but not yet exec'd, has it open
-        // (its fd inherited for that moment, as in `dead_arrivals_logs_and_old_markers_go`).
+        // Let go explicitly: another test's child, forked but not yet exec'd, may share it.
         let gc = File::open(host.run.join(".gc.lock")).unwrap();
-        let free = (0..200).any(|_| {
-            let free = flock(&gc, libc::LOCK_EX | libc::LOCK_NB).is_ok();
-            if !free {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            free
-        });
-        assert!(free, "the sweep let go of its lock");
+        assert!(flock(&gc, libc::LOCK_EX | libc::LOCK_NB).is_ok(), "the sweep let go of its lock");
         std::fs::remove_dir_all(d).unwrap();
     }
 
@@ -280,16 +271,9 @@ mod tests {
         store_holder(&host, "held", &crate::host::Ident::me());
         let dead_name = at("dead.log", old);
         store_holder(&host, "dead", &crate::host::Ident { pid: 999_999_940, start: 1, boot: crate::host::boot_id().into() });
-        // The logs lock is busy while another test's child, forked but not yet exec'd, still has
-        // it open (its fd inherited for that moment): busy is left for the next sweep, so sweep
-        // until it was free once.
-        for _ in 0..200 {
-            vm_files(&host);
-            if !dead_name.exists() && !orphan.exists() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        // Free at once though another test's child, forked but not yet exec'd, shares the
+        // logs lock's open file: dropping it let go explicitly.
+        vm_files(&host);
         assert!(live_name.exists() && !dead_name.exists(), "by the name's holder");
         assert!(!dead.exists() && fresh.exists() && live.exists(), "arrivals");
         assert!(!moved.exists() && recent_moved.exists(), "markers");

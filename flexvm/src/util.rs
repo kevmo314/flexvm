@@ -288,7 +288,7 @@ pub fn eintr<T: Copy + Default + PartialOrd>(mut f: impl FnMut() -> T) -> io::Re
 
 /// Whether a nonblocking flock fails; `None` if the file cannot be opened.
 pub fn locked(path: &Path, how: i32) -> Option<bool> {
-    std::fs::File::open(path).ok().map(|f| crate::host::flock(&f, how | libc::LOCK_NB).is_err())
+    std::fs::File::open(path).ok().map(|f| crate::host::probe(&f, how).is_err())
 }
 
 /// Calls `f` every `every` until it succeeds or `timeout` has passed.

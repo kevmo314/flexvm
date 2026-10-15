@@ -397,8 +397,7 @@ impl Template {
         if self.meta.verify(paths, &self.fixed, cache)? {
             // Into what is there now, so stamps other processes wrote back are kept; locked, so
             // none is lost to a concurrent write-back.
-            let dir = File::open(&self.fixed)?;
-            crate::host::flock(&dir, libc::LOCK_EX)?;
+            let _dir = crate::host::Flock::new(File::open(&self.fixed)?, libc::LOCK_EX)?;
             let mut meta = Meta::read(&self.fixed).ok().filter(|m| m.id == self.meta.id).unwrap_or_else(|| self.meta.clone());
             for (name, stamp) in cache.iter() {
                 if let Some(c) = meta.components.get_mut(name).filter(|c| c.hash == self.meta.components[name].hash) {
@@ -615,10 +614,9 @@ fn interrupted() -> Result<()> {
 
 /// Held shared while a build makes its staging directory and while it publishes, exclusive
 /// while one sweeps: a staging directory without a lock, or a link, seen under it is dead.
-fn templates_lock(paths: &Paths, how: i32) -> Result<File> {
+fn templates_lock(paths: &Paths, how: i32) -> Result<crate::host::Flock> {
     let f = File::options().create(true).truncate(false).read(true).write(true).open(paths.templates.join(".lock"))?;
-    crate::host::flock(&f, how)?;
-    Ok(f)
+    Ok(crate::host::Flock::new(f, how)?)
 }
 
 /// 16 hex digits, so concurrent builds on hosts sharing a templates directory never pick the
