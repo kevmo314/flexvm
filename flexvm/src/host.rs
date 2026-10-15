@@ -657,7 +657,7 @@ impl Host {
             a.rev = a.rev.max(rev);
         }
         let me = Ident::me();
-        (a.holder, a.holder_id, a.held) = (Some(holder.into()), Some(me.clone()), gen);
+        (a.holder, a.holder_id, a.held, a.moving) = (Some(holder.into()), Some(me.clone()), gen, arriving);
         self.put_addr(ip, &a, true)?;
         Ok(AddrClaim { host: self.clone(), ip, gen, rev, holder: holder.into(), id: me, kept: false, fresh: false })
     }
@@ -677,17 +677,28 @@ impl Host {
         self.update(l, ip, false, |a| {
             let by = |h: &Ident| id.is_none_or(|id| id == h);
             if a.holder.as_deref() == Some(holder) && a.holder_id.as_ref().is_none_or(by) {
-                (a.holder, a.holder_id) = (None, None);
+                (a.holder, a.holder_id, a.moving) = (None, None, false);
             }
         })
     }
 
-    /// True if this made the loan (only then may its maker undo it).
+    /// True if this made the loan (only then may its maker undo it). On any
+    /// host, the source's own claim is marked `moving` until it `stay`s.
     pub fn lend(&self, l: &Locked, ip: Ipv4Addr, gen: u64) -> Result<bool> {
-        if !self.cfg.range()?.contains(ip) {
-            return Ok(false);
-        }
-        self.update(l, ip, true, |a| a.lent.replace(gen) != Some(gen))
+        let (home, me) = (self.cfg.range()?.contains(ip), Ident::me());
+        self.update(l, ip, true, |a| {
+            if a.holder_id.as_ref() == Some(&me) {
+                a.moving = true;
+            }
+            home && a.lent.replace(gen) != Some(gen)
+        })
+    }
+
+    /// A source whose migration did not happen runs its VM here again: its
+    /// death is the VM's once more.
+    pub fn stay(&self, l: &Locked, ip: Ipv4Addr) -> Result<()> {
+        let me = Ident::me();
+        self.update(l, ip, true, |a| a.moving &= a.holder_id.as_ref() != Some(&me))
     }
 
     /// Test fault `unlend_fail`: it fails, leaving the loan.
@@ -756,10 +767,18 @@ impl Host {
     /// long as it is held), as (id, MiB). One whose lock is free has no
     /// owner left (the kernel let go of it with the process): removed, as is
     /// a free `.ID` (a grant's temp file, never in sight while it is made).
-    fn holds(&self, _l: &Locked) -> Vec<(u64, u64)> {
+    /// An error if the directory (made by the first hold) or an entry of it
+    /// cannot be read: holds would be missed.
+    fn holds(&self, _l: &Locked) -> Result<Vec<(u64, u64)>> {
         let dir = self.run.join("holds");
         let mut live = Vec::new();
-        for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(live),
+            Err(e) => bail!("cannot read {}: {e}", dir.display()),
+        };
+        for e in entries {
+            let e = e.map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
             let name = e.file_name().to_string_lossy().into_owned();
             let hold = name.split_once('-').and_then(|(i, m)| Some((i.parse().ok()?, m.parse().ok()?)));
             if hold.is_none() && !name.starts_with('.') {
@@ -773,7 +792,7 @@ impl Host {
                 _ => live.extend(hold),
             }
         }
-        live
+        Ok(live)
     }
 
     /// Counts `hold` as `mib` from now on, if less: renamed under the host
@@ -855,7 +874,11 @@ impl Host {
         let mut grants: Vec<(u64, u64, u64)> = load(&path)?.unwrap_or_default();
         // A stamp in the future is an older build's wall clock.
         grants.retain(|&(t, ..)| t <= now && now - t <= GRANT_WINDOW.as_millis() as u64);
-        let held = self.holds(&l);
+        // Fails closed: unread holds would leave out memory still to arrive.
+        let held = self.holds(&l).map_err(|e| {
+            crate::log!("admission: {e}; granting nothing until it can be read");
+            format!("{e}: memory held for migrations and restores still arriving cannot be counted")
+        })?;
         let held_ids: HashSet<_> = held.iter().map(|h| h.0).collect();
         let pending: u64 = grants.iter().filter(|g| !held_ids.contains(&g.2)).map(|g| g.1).sum::<u64>() + held.iter().map(|h| h.1).sum::<u64>();
         let avail = available().ok_or("cannot read MemAvailable from /proc/meminfo")?;
@@ -902,7 +925,7 @@ impl Host {
             bail!("migration {id} was already seen here");
         }
         store(&self.mig_path(id), &Mig::Pending { owner: Ident::me(), ip }, true)?;
-        Ok(MigRecord { host: self.clone(), id, committed: false, source: source.into(), by })
+        Ok(MigRecord { host: self.clone(), id, committed: false, source: source.into(), by, ip })
     }
 
     /// A record whose process died becomes aborted once its Firecrackers are
@@ -1203,6 +1226,11 @@ pub struct Addr {
     pub via: Option<Ipv4Addr>,
     /// Of `seen`, the newest location's revision: a migration's target takes the next.
     pub rev: u64,
+    /// Its holder's VM is mid-migration (an arrival not yet settled, or a
+    /// source that may have handed it on), so the holder's death is not the
+    /// VM's: garbage collection never withdraws it (`withdraw_dead`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub moving: bool,
 }
 
 impl Addr {
@@ -1283,6 +1311,8 @@ pub struct MigRecord {
     committed: bool,
     source: String,
     by: Option<Ident>,
+    /// The VM's address: once released, its claim here is no longer `moving`.
+    ip: Option<Ipv4Addr>,
 }
 
 impl MigRecord {
@@ -1314,6 +1344,11 @@ impl MigRecord {
         loop {
             let done = self.host.lock_by(within.map(|w| start + w)).and_then(|l| {
                 store(&self.host.mig_path(self.id), &Mig::Released { source: self.source.clone(), by: self.by.clone() }, true)?;
+                // Released first: a crash in between leaves it moving (never withdrawn by gc), not settled early.
+                if let Some(ip) = self.ip {
+                    let me = Ident::me();
+                    self.host.update(&l, ip, true, |a| a.moving &= a.holder_id.as_ref() != Some(&me))?;
+                }
                 match home {
                     Some((ip, gen)) => self.host.update(&l, ip, true, |a| a.lent = a.lent.filter(|&lent| lent > gen)),
                     None => Ok(()),
@@ -1636,7 +1671,54 @@ impl Host {
             }
         }
         collect_owned(&self.run);
+        self.withdraw_dead()
+    }
+
+    /// Addresses whose holder died without withdrawing them (SIGKILLed, or a
+    /// panic): withdrawn as its `finish` would have, here and at the peers, so
+    /// a home host's loan ends and no peer keeps a route to this host.
+    fn withdraw_dead(&self) -> Result<()> {
+        let mut dead = Vec::new();
+        let l = self.lock()?;
+        for e in std::fs::read_dir(self.state.join("addrs")).into_iter().flatten().flatten() {
+            let Some(ip) = e.file_name().to_str().and_then(|n| n.parse::<Ipv4Addr>().ok()) else { continue };
+            let a = match self.addr(&l, ip) {
+                Ok(a) if self.died_holding(&a) => a,
+                _ => continue,
+            };
+            let (name, gen) = (a.holder.as_deref().unwrap_or_default(), a.held);
+            if let Err(e) = self.observe(&l, ip, gen, 0, None) {
+                crate::log!("withdrawing {ip} (generation {gen}) of dead vm {name}: {e}; retried on the next sweep");
+                continue;
+            }
+            crate::log!("withdrew {ip} (generation {gen}): vm {name}'s process died without withdrawing it");
+            let _ = self.release(&l, ip, name, a.holder_id.as_ref());
+            crate::net::unroute(ip);
+            dead.push((ip, gen));
+        }
+        drop(l);
+        for (ip, gen) in dead {
+            crate::vmproc::tell_peers(self, serde_json::json!({"op": "route", "ip": ip.to_string(), "gen": gen}));
+        }
         Ok(())
+    }
+
+    /// Whether `a`'s holder is proven dead with its Firecrackers reaped and
+    /// its VM with it, its generation still current: not if a checkpoint here
+    /// keeps the generation (suspended, or quarantined until a reboot shows
+    /// whether it may resume), nor if the VM may live on elsewhere (`moving`:
+    /// an arrival still pulling, whose source runs again, or a source that
+    /// may have handed it on; or lent with its generation, which only the
+    /// VM's next holder or a settled outcome gives back). A record without the
+    /// instance (from before they were recorded) is never proof.
+    fn died_holding(&self, a: &Addr) -> bool {
+        let (Some(name), Some(id)) = (a.holder.as_deref(), a.holder_id.as_ref()) else { return false };
+        !a.moving
+            && a.current(a.held)
+            && a.lent.is_none_or(|lent| lent < a.held)
+            && id.liveness() == Liveness::Gone
+            && !self.held(a)
+            && !self.suspended(name).join("QUARANTINE").exists()
     }
 }
 
@@ -2102,6 +2184,100 @@ mod tests {
         // Records from before instances were recorded go by the name.
         h.put_addr(x, &Addr { seen: 7, holder: Some("web".into()), held: 7, ..Addr::default() }, false).unwrap();
         assert_eq!(h.holder(&l, x).unwrap().as_deref(), Some("web"));
+    }
+
+    #[test]
+    fn a_dead_holders_address_is_withdrawn_unless_its_vm_may_live_on() {
+        let h = host("withdraw-dead");
+        let l = h.lock().unwrap();
+        let dead = |pid| dead_owner(&h, pid, &[]);
+        let claim = |ip: Ipv4Addr, name: &str, id: Option<Ident>, gen: u64, change: &dyn Fn(&mut Addr)| {
+            let mut a = Addr { seen: gen, holder: Some(name.into()), holder_id: id, held: gen, ..Addr::default() };
+            change(&mut a);
+            h.put_addr(ip, &a, false).unwrap();
+        };
+        let ips: Vec<Ipv4Addr> = (1..=10).map(|i| ip(&format!("10.9.1.{i}"))).collect();
+        // SIGKILLed or panicked after a migration here: withdrawn.
+        claim(ips[0], "killed", Some(dead(999_999_931)), 4, &|_| ());
+        // Mid-migration: an arrival still pulling (its source runs again) or a source that may have handed it on.
+        claim(ips[1], "arriving", Some(dead(999_999_932)), 4, &|a| a.moving = true);
+        // Lent with its generation (a source at home whose outcome is not settled).
+        claim(ips[2], "lent", Some(dead(999_999_933)), 4, &|a| a.lent = Some(4));
+        // Given out again, or already withdrawn.
+        claim(ips[3], "superseded", Some(dead(999_999_934)), 4, &|a| a.seen = 5);
+        claim(ips[4], "withdrawn", Some(dead(999_999_935)), 4, &|a| a.withdrawn = true);
+        // Suspended here with its generation; quarantined after a resume that may have run.
+        claim(ips[5], "suspended", Some(dead(999_999_936)), 4, &|_| ());
+        std::fs::create_dir_all(h.suspended("suspended")).unwrap();
+        std::fs::write(h.suspended("suspended").join("manifest.json"), "").unwrap();
+        std::fs::write(h.suspended("suspended").join("GEN"), "4").unwrap();
+        claim(ips[6], "quarantined", Some(dead(999_999_937)), 4, &|_| ());
+        std::fs::create_dir_all(h.suspended("quarantined")).unwrap();
+        for f in ["manifest.json", "GEN", "STARTED", "QUARANTINE"] {
+            std::fs::write(h.suspended("quarantined").join(f), "4").unwrap();
+        }
+        // Alive (this process, though it does not hold the name), and a record without its instance.
+        claim(ips[7], "alive", Some(Ident::me()), 4, &|_| ());
+        claim(ips[8], "old", None, 4, &|_| ());
+        // An older loan of this address, superseded by the dead VM's generation: freed with it.
+        claim(ips[9], "older-loan", Some(dead(999_999_938)), 6, &|a| a.lent = Some(5));
+        let before: Vec<Addr> = ips.iter().map(|&i| h.addr(&l, i).unwrap()).collect();
+        drop(l);
+        h.withdraw_dead().unwrap();
+        let l = h.lock().unwrap();
+        for (k, &i) in ips.iter().enumerate() {
+            let a = h.addr(&l, i).unwrap();
+            match k {
+                0 | 9 => {
+                    assert!(a.withdrawn && a.holder.is_none() && a.holder_id.is_none() && a.lent.is_none(), "{k}: {a:?}");
+                    assert!(!a.current(before[k].held), "{k}");
+                }
+                _ => assert_eq!(a, before[k], "{k}: kept"),
+            }
+        }
+        // Once the suspended VM is resumed and dies, its claim goes too.
+        std::fs::write(h.suspended("suspended").join("STARTED"), "").unwrap();
+        drop(l);
+        h.withdraw_dead().unwrap();
+        assert!(h.addr(&h.lock().unwrap(), ips[5]).unwrap().withdrawn);
+    }
+
+    #[test]
+    fn a_claim_is_moving_while_its_vm_migrates() {
+        let h = host("moving");
+        let (home, away) = (ip("10.9.0.1"), ip("10.9.2.1"));
+        let l = h.lock().unwrap();
+        let moving = |ip| h.addr(&h.lock().unwrap(), ip).unwrap().moving;
+        // A source, at home and elsewhere: moving from its loan until it stays.
+        let c = h.claim_new(&l, "vm", Some(home)).unwrap();
+        assert!(!moving(home) && h.lend(&l, home, c.gen).unwrap() && moving(home));
+        h.stay(&l, home).unwrap();
+        assert!(!moving(home) && h.addr(&l, home).unwrap().lent == Some(c.gen), "the loan is its maker's to undo");
+        h.unlend(&l, home, c.gen).unwrap();
+        let d = h.claim_incoming(&l, "vm2", away, 7, None).unwrap();
+        assert!(!moving(away) && !h.lend(&l, away, 7).unwrap() && moving(away), "not lent elsewhere, yet moving");
+        // Another instance's claim is not this source's.
+        let mut a = h.addr(&l, away).unwrap();
+        a.holder_id = Some(Ident { start: 1, ..Ident::me() });
+        h.put_addr(away, &a, false).unwrap();
+        h.stay(&l, away).unwrap();
+        assert!(moving(away));
+        h.release(&l, away, "vm2", None).unwrap();
+        assert!(!moving(away), "released, it holds nothing");
+        d.keep();
+        c.release(&l).unwrap();
+        drop(l);
+        // An arrival: moving until its record is released.
+        let mut r = h.mig_begin(11, "", None, Some(away)).unwrap();
+        let l = h.lock().unwrap();
+        let claim = h.claim_incoming(&l, "vm3", away, 8, Some(1)).unwrap();
+        assert!(moving(away));
+        r.commit(&l).unwrap();
+        drop(l);
+        assert!(moving(away), "committed, it may still be pulling");
+        r.release(None, None).unwrap();
+        assert!(!moving(away));
+        claim.keep();
     }
 
     #[test]
@@ -2837,6 +3013,24 @@ mod tests {
     /// An unreadable MemAvailable, or a host lock not had in time, is an
     /// error, never a refusal (which marks a VM throttled) nor 0 MiB
     /// available; nothing is granted.
+    #[test]
+    fn admission_fails_closed_when_holds_cannot_be_read() {
+        let mut h = host("holds-unreadable");
+        h.cfg.reserve_mib = 0;
+        let grants = || load::<Vec<(u64, u64, u64)>>(&h.grants()).unwrap().unwrap_or_default();
+        let grant = || h.grant_inner(1, Floor::Reserve, false, None, || Some(AVAIL)).map(|r| r.ok().map(|g| g.0));
+        // No holds directory yet: nothing held, a complete scan.
+        assert!(grant().unwrap().is_some());
+        // Unreadable (here not a directory): an error that grants nothing, never "no holds".
+        let dir = h.run.join("holds");
+        std::fs::write(&dir, b"").unwrap();
+        assert!(grant().unwrap_err().to_string().contains("cannot be counted"));
+        assert_eq!(grants().len(), 1);
+        assert!(h.grant_inner(1, Floor::Reserve, true, None, || Some(AVAIL)).is_err(), "nor a held grant");
+        std::fs::remove_file(&dir).unwrap();
+        assert!(grant().unwrap().is_some() && grants().len() == 2);
+    }
+
     #[test]
     fn admission_errors_are_not_refusals() {
         let mut h = host("admit-err");

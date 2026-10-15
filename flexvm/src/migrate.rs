@@ -116,6 +116,9 @@ impl Proc {
         self.set_leaving(true);
         if let Err(e) = vm.leave(State::Source(mig)) {
             self.set_leaving(false);
+            if let Err(r) = self.host.lock().and_then(|l| self.host.stay(&l, vm.ip)) {
+                crate::log!("vm {}: marking it here again after a refused migration: {r}", vm.name);
+            }
             if self.lent_here.load(Ordering::SeqCst) {
                 match self.host.lock().and_then(|l| self.host.unlend(&l, vm.ip, gen)) {
                     Ok(()) => self.lent_here.store(false, Ordering::SeqCst),
@@ -290,6 +293,9 @@ impl Proc {
         // Running here again, so do the collapse pass and prefetch the save cut short.
         vm.back_here();
         self.release_app_log();
+        if let Err(r) = self.host.stay(&l, vm.ip) {
+            crate::log!("vm {}: marking it here again after an aborted migration: {r}", vm.name);
+        }
         if self.lent_here.load(Ordering::SeqCst) {
             match self.host.unlend(&l, vm.ip, gen) {
                 Ok(()) => self.lent_here.store(false, Ordering::SeqCst),
