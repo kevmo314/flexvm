@@ -807,11 +807,7 @@ pub fn exec(host: &Host, name: &str, cmd: &str) -> Result<i32> {
         let once = move || -> Result<()> {
             let c = vmproc::connect(&host, &name, &json!({"op": "exec", "session": id, "action": "close"}), &[], Instant::now() + Duration::from_secs(5))?;
             c.set_read_timeout(Some(Duration::from_secs(5)))?;
-            match recv_json(&mut BufReader::new(c))? {
-                Some(r) if r["ok"] == json!(true) => Ok(()),
-                Some(r) => Err(r["error"].as_str().unwrap_or("session close failed").into()),
-                None => Err("vm hung up".into()),
-            }
+            util::answer(recv_json(&mut BufReader::new(c))?, "vm", "session close failed").map(drop)
         };
         // A checkpoint turns it away for a few seconds: it is tried again meanwhile.
         move || -> Result<()> {
@@ -907,10 +903,7 @@ pub fn exec_session(host: &Host, name: &str, cmd: &str, session: &Mutex<Session>
 /// Keeps frames read ahead with the reply, then switches from its deadline to heartbeat timeouts.
 fn exec_stream<S: util::Timed>(c: S, at: Instant) -> Result<BufReader<S>> {
     let mut r = util::By { s: BufReader::new(c), at };
-    let reply = recv_json(&mut r)?.ok_or("vm hung up")?;
-    if reply["ok"] != json!(true) {
-        return Err(reply["error"].as_str().unwrap_or("exec failed").to_string().into());
-    }
+    util::answer(recv_json(&mut r)?, "vm", "exec failed")?;
     r.s.get_ref().read_timeout(Duration::from_secs(3))?;
     Ok(r.s)
 }

@@ -371,13 +371,10 @@ fn install<T>(path: &Path, write: impl FnOnce(&mut File) -> Result<()>, rename: 
         let _dir = Flock::new(dir, libc::LOCK_EX)?;
         let f = File::options().write(true).create_new(true).custom_flags(libc::O_NOFOLLOW).open(&tmp)?;
         // A clone shares the open file, and so the lock.
-        match f.try_clone().and_then(|c| Flock::new(c, libc::LOCK_EX)) {
-            Ok(part) => (f, part),
-            Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
-                return Err(e.into());
-            }
-        }
+        let part = f.try_clone().and_then(|c| Flock::new(c, libc::LOCK_EX)).inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })?;
+        (f, part)
     };
     let res = (|| {
         write(&mut f)?;
