@@ -175,14 +175,27 @@ impl Resolver {
     }
 }
 
+static DNS: Resolver = Resolver::new();
+
 /// HOST:PORT's addresses by `at`; an IP literal resolves at once.
 pub fn resolve(addr: &str, at: Instant) -> io::Result<Addrs> {
     use std::net::ToSocketAddrs;
-    static DNS: Resolver = Resolver::new();
-    resolve_with(addr, at, &DNS, |addr| addr.to_socket_addrs().map(Iterator::collect))
+    resolve_with(addr, at, &DNS, false, |addr| addr.to_socket_addrs().map(Iterator::collect))
 }
 
-fn resolve_with(addr: &str, at: Instant, dns: &'static Resolver, lookup: impl FnOnce(String) -> io::Result<Addrs> + Send + 'static) -> io::Result<Addrs> {
+/// Resolves a stale address without reusing a finished answer; still joins a lookup under way.
+pub fn resolve_fresh(addr: &str, at: Instant) -> io::Result<Addrs> {
+    use std::net::ToSocketAddrs;
+    resolve_with(addr, at, &DNS, true, |addr| addr.to_socket_addrs().map(Iterator::collect))
+}
+
+fn resolve_with(
+    addr: &str,
+    at: Instant,
+    dns: &'static Resolver,
+    fresh: bool,
+    lookup: impl FnOnce(String) -> io::Result<Addrs> + Send + 'static,
+) -> io::Result<Addrs> {
     let fail = |kind, why: &str| io::Error::new(kind, format!("DNS lookup of {addr}: {why}"));
     By { s: (), at }.left().map_err(|_| fail(io::ErrorKind::TimedOut, "deadline passed"))?;
     if let Ok(addr) = addr.parse() {
@@ -196,10 +209,10 @@ fn resolve_with(addr: &str, at: Instant, dns: &'static Resolver, lookup: impl Fn
         let found = l.all.iter().position(|k| k.name == addr);
         match found.map(|i| (l.all[i].id, &l.all[i].done)) {
             Some((id, None)) => mine = Some(id),
-            Some((id, Some((_, res)))) if mine == Some(id) || res.is_ok() => {
+            Some((id, Some((_, res)))) if mine == Some(id) || (!fresh && res.is_ok()) => {
                 return res.clone().map_err(|(kind, why)| fail(kind, &why));
             }
-            // Failed, before this caller asked: try again.
+            // Failed before this caller asked, or a stale address needs a fresh answer: try again.
             _ => match lookup.take() {
                 Some(f) if l.workers < DNS_WORKERS => {
                     if let Some(i) = found {
@@ -868,11 +881,11 @@ mod tests {
         static DNS: Resolver = Resolver::new();
         let (release, lookup) = held();
         let start = Instant::now();
-        let err = resolve_with("hung.example:80", start + Duration::from_millis(30), &DNS, lookup).unwrap_err();
+        let err = resolve_with("hung.example:80", start + Duration::from_millis(30), &DNS, false, lookup).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
         assert!(err.to_string().contains("hung.example:80"), "{err}");
-        for _ in 0..8 {
-            let err = resolve_with("hung.example:80", Instant::now() + Duration::from_millis(10), &DNS, |_| panic!("joins the lookup under way"));
+        for fresh in [false, true].into_iter().cycle().take(8) {
+            let err = resolve_with("hung.example:80", Instant::now() + Duration::from_millis(10), &DNS, fresh, |_| panic!("joins the lookup under way"));
             assert_eq!(err.unwrap_err().kind(), io::ErrorKind::TimedOut);
         }
         assert!(start.elapsed() < Duration::from_secs(1));
@@ -880,7 +893,7 @@ mod tests {
         // It ends after every caller gave up: the next one gets its answer, with no new lookup.
         let addr: std::net::SocketAddr = "10.0.0.1:80".parse().unwrap();
         release.send(vec![addr]).unwrap();
-        let got = resolve_with("hung.example:80", Instant::now() + Duration::from_secs(5), &DNS, |_| panic!("answered recently"));
+        let got = resolve_with("hung.example:80", Instant::now() + Duration::from_secs(5), &DNS, false, |_| panic!("answered recently"));
         assert_eq!(got.unwrap(), vec![addr]);
         assert_eq!(workers(&DNS), 0);
     }
@@ -893,16 +906,18 @@ mod tests {
             let (release, lookup) = held();
             releases.push(release);
             let at = Instant::now() + Duration::from_millis(10);
-            assert!(resolve_with(&format!("hung{i}.example:80"), at, &DNS, lookup).is_err());
+            assert!(resolve_with(&format!("hung{i}.example:80"), at, &DNS, false, lookup).is_err());
         }
         assert_eq!(workers(&DNS), DNS_WORKERS);
-        let err = resolve_with("next.example:80", Instant::now() + Duration::from_millis(30), &DNS, |_| panic!("no free worker"));
-        let err = err.unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
-        assert!(err.to_string().contains("busy"), "{err}");
+        for fresh in [false, true] {
+            let err = resolve_with("next.example:80", Instant::now() + Duration::from_millis(30), &DNS, fresh, |_| panic!("no free worker"));
+            let err = err.unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+            assert!(err.to_string().contains("busy"), "{err}");
+        }
         // IP literals need no worker.
         for addr in ["127.0.0.1:80", "[::1]:443"] {
-            let got = resolve_with(addr, Instant::now() + Duration::from_secs(5), &DNS, |_| panic!("an IP literal is not looked up"));
+            let got = resolve_with(addr, Instant::now() + Duration::from_secs(5), &DNS, false, |_| panic!("an IP literal is not looked up"));
             assert_eq!(got.unwrap(), vec![addr.parse::<std::net::SocketAddr>().unwrap()]);
         }
         // A caller waits for a worker, rather than failing while every one is busy.
@@ -912,7 +927,7 @@ mod tests {
             first.send(Vec::new()).unwrap();
         });
         let addr: std::net::SocketAddr = "10.0.0.2:80".parse().unwrap();
-        let got = resolve_with("next.example:80", Instant::now() + Duration::from_secs(5), &DNS, move |_| Ok(vec![addr]));
+        let got = resolve_with("next.example:80", Instant::now() + Duration::from_secs(5), &DNS, false, move |_| Ok(vec![addr]));
         assert_eq!(got.unwrap(), vec![addr]);
         drop(releases);
         let at = Instant::now() + Duration::from_secs(1);
@@ -923,23 +938,36 @@ mod tests {
     }
 
     #[test]
+    fn a_fresh_lookup_skips_the_recent_answer() {
+        static DNS: Resolver = Resolver::new();
+        let at = || Instant::now() + Duration::from_secs(5);
+        let old = "10.0.0.1:80".parse::<std::net::SocketAddr>().unwrap();
+        let new = "10.0.0.2:80".parse::<std::net::SocketAddr>().unwrap();
+        let name = "moved.example:80";
+        assert_eq!(resolve_with(name, at(), &DNS, false, move |_| Ok(vec![old])).unwrap(), vec![old]);
+        assert_eq!(resolve_with(name, at(), &DNS, false, |_| panic!("answered recently")).unwrap(), vec![old]);
+        assert_eq!(resolve_with(name, at(), &DNS, true, move |_| Ok(vec![new])).unwrap(), vec![new]);
+        assert_eq!(resolve_with(name, at(), &DNS, false, |_| panic!("fresh answer is cached")).unwrap(), vec![new]);
+    }
+
+    #[test]
     fn a_failed_lookup_reaches_its_callers_and_is_not_kept() {
         static DNS: Resolver = Resolver::new();
         let at = || Instant::now() + Duration::from_secs(5);
-        let err = resolve_with("gone.example:80", at(), &DNS, |_| Err(io::Error::new(io::ErrorKind::NotFound, "no such name")));
+        let err = resolve_with("gone.example:80", at(), &DNS, false, |_| Err(io::Error::new(io::ErrorKind::NotFound, "no such name")));
         let err = err.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
         assert!(err.to_string().contains("gone.example:80") && err.to_string().contains("no such name"), "{err}");
-        let err = resolve_with("gone.example:80", at(), &DNS, |_| Ok(Vec::new())).unwrap_err();
+        let err = resolve_with("gone.example:80", at(), &DNS, false, |_| Ok(Vec::new())).unwrap_err();
         assert!(err.to_string().contains("no address"), "{err}");
         let addr: std::net::SocketAddr = "10.0.0.3:80".parse().unwrap();
-        assert_eq!(resolve_with("gone.example:80", at(), &DNS, move |_| Ok(vec![addr])).unwrap(), vec![addr]);
+        assert_eq!(resolve_with("gone.example:80", at(), &DNS, false, move |_| Ok(vec![addr])).unwrap(), vec![addr]);
     }
 
     #[test]
     fn expired_dns_deadline_does_not_start_a_lookup() {
         static DNS: Resolver = Resolver::new();
-        let err = resolve_with("unused.example:80", Instant::now(), &DNS, |_| panic!("deadline passed")).unwrap_err();
+        let err = resolve_with("unused.example:80", Instant::now(), &DNS, false, |_| panic!("deadline passed")).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
         assert_eq!(workers(&DNS), 0);
     }
