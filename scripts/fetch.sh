@@ -5,7 +5,7 @@ set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 state=/var/lib/flexvm
-if [ "${1:-}" = --state ]; then state=$2; shift 2; fi
+if [ "${1:-}" = --state ]; then state=$(realpath -m "$2"); shift 2; fi
 # shellcheck source=versions.sh
 source "$root/scripts/versions.sh"
 CI_VERSION=${CI_VERSION:-v1.15}

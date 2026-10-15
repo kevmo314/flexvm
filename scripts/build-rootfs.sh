@@ -9,7 +9,7 @@ set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 state=/var/lib/flexvm
-if [ "${1:-}" = --state ]; then state=$2; fi
+if [ "${1:-}" = --state ]; then state=$(realpath -m "$2"); fi
 out=$state/artifacts
 cd "$root"
 # A fixed default: a commit that leaves the image inputs alone keeps the same rootfs hash.

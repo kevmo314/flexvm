@@ -20,7 +20,7 @@ set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 flexvm=${FLEXVM:-$root/target/release/flexvm}
-state=${STATE:-/var/lib/flexvm}
+state=$(realpath -m "${STATE:-/var/lib/flexvm}")
 P=${P:-fv5}
 NET=${NET:-192.168.155}
 ROUNDS=${ROUNDS:-3}

@@ -54,11 +54,18 @@ class Host:
 A = Host(args.a, args.a_dir, args.a_ips, args.a_state, args.a_run, args.a_listen_log)
 B = Host(args.b, args.b_dir, args.b_ips, args.b_state, args.b_run, args.b_listen_log)
 ENV = dict(os.environ, FLEXVM_FAULTS="1")
-for h in (A, B):
+# The listeners this script starts use --state's artifacts and templates; hosts given
+# with --no-listeners are left as they were set up.
+for h in () if args.no_listeners else (A, B):
     os.makedirs(h.state, exist_ok=True)
     for d in ("artifacts", "templates"):
-        if not os.path.lexists(os.path.join(h.state, d)):
-            os.symlink(os.path.join(os.path.abspath(args.state), d), os.path.join(h.state, d))
+        link, target = os.path.join(h.state, d), os.path.join(os.path.abspath(args.state), d)
+        if os.path.islink(link) and os.readlink(link) != target:
+            os.remove(link)
+        if not os.path.lexists(link):
+            os.symlink(target, link)
+        elif not os.path.islink(link):
+            sys.exit(f"{link} is not a link to {target}: remove it, or give the host another state directory")
 listeners = {}
 
 

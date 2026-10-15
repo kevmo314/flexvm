@@ -5,7 +5,7 @@ set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 state=/var/lib/flexvm
-if [ "${1:-}" = --state ]; then state=$2; fi
+if [ "${1:-}" = --state ]; then state=$(realpath -m "$2"); fi
 # shellcheck source=versions.sh
 source "$root/scripts/versions.sh"
 src=${FC_SRC:-$root/build/firecracker-src}
