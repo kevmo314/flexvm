@@ -199,7 +199,7 @@ impl Pager {
             for _ in 0..pending.len() {
                 let mut p = pending.pop_front().unwrap();
                 let page = self.page_of(p.addr).map(|(page, _)| page);
-                match self.fault(p.addr, p.flags, p.kind.is_some()) {
+                match self.fault(p.addr, p.flags, p.kind.is_some(), p.parked) {
                     Ok(Served::Done(kind)) => {
                         // A fault that waited was resolved by the copy that woke its thread.
                         let woke = page.filter(|_| p.kind.is_some()).and_then(|page| pages.unpark(page, p.read));
@@ -207,8 +207,11 @@ impl Pager {
                         self.fault_stats.record(kind, woke.unwrap_or_else(Instant::now) - p.read);
                         continue;
                     }
-                    // Woken through the copy's waker (`Cow::wait_for`).
-                    Ok(Served::Writer) => p.parked = true,
+                    // Woken through the copy's waker (`Cow::wait_for`), and retried until a writer saves its page: one wait.
+                    Ok(Served::Writer) => {
+                        self.cow().filter(|_| !p.parked).inspect(|c| _ = c.stats.retries.fetch_add(1, Ordering::Relaxed));
+                        p.parked = true;
+                    }
                     Ok(served) => {
                         p.parked = true;
                         match served {
@@ -266,13 +269,13 @@ impl Pager {
 
     /// Serves a fault, without waiting for the network or disk: a REMOTE page's run goes to a fetcher (`fetch_faults`),
     /// and the fault waits.
-    fn fault(&self, addr: u64, flags: u64, waiting: bool) -> io::Result<Served> {
+    fn fault(&self, addr: u64, flags: u64, waiting: bool, parked: bool) -> io::Result<Served> {
         let Some((page, m)) = self.page_of(addr) else {
             return Err(io::Error::other("fault outside guest memory"));
         };
         let _wp = self.wp.lock().unwrap();
         if flags & UFFD_PAGEFAULT_FLAG_WP != 0 {
-            return self.wp_fault(page, m);
+            return self.wp_fault(page, m, parked);
         }
         // Runs stay within a 2 MiB chunk: Firecracker keeps unplugged virtio-mem slots PROT_NONE, which splits the
         // region into VMAs at slot boundaries, and a uffd copy across a VMA end fails (ENOENT).

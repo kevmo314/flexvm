@@ -69,7 +69,7 @@ pub struct Stats {
     pub rescued_pages: AtomicU64,
     pub rescue_ns: AtomicU64,
     pub rescue_max_ns: AtomicU64,
-    /// Retries waiting for a writer (over budget, or the page was being read).
+    /// Faults that waited for a writer (over budget, or the page was being read), once each however often retried.
     pub retries: AtomicU64,
     /// Discards held back until the copy was done, and for how long in all.
     pub drains: AtomicU64,
@@ -214,7 +214,6 @@ impl Cow {
     /// retried then. No wakeup is lost: a writer (or `stop`) changes the state before it looks at the flag, and this
     /// sets the flag (with the page listed) before it looks at the state.
     pub fn wait_for(&self, page: usize, seen: u8) {
-        self.stats.retries.fetch_add(1, Ordering::Relaxed);
         {
             let mut waits = self.waits.lock().unwrap();
             if !waits.contains(&page) {
@@ -462,7 +461,6 @@ mod tests {
         // Faults wait on pages; writers take those units first.
         cow.want(30);
         cow.want(30);
-        assert_eq!(cow.report()["retries"], 0, "queueing pages does not count fault retries");
         assert_eq!(pages.wanted(), Some(30));
         assert_eq!(pages.wanted(), None);
         assert_eq!(cow.state(8), PENDING);
@@ -527,7 +525,7 @@ mod tests {
 
     /// A fault waiting for a writer (`wait_for`) is woken through the waker once a writer saves its page or gives it
     /// back, or the copy stops, or at once if any of that happened before it waited; nothing wakes it while the page is
-    /// still being read, or for other pages saved meanwhile. Each wait counts as a retry.
+    /// still being read, or for other pages saved meanwhile.
     #[test]
     fn faults_waiting_for_a_writer_are_woken() {
         use std::os::fd::FromRawFd;
@@ -555,7 +553,6 @@ mod tests {
         assert!(!woken(), "once: nothing waits any more");
         cow.wait_for(1, READING);
         assert!(woken(), "page 1 is done with already");
-        assert_eq!(cow.report()["retries"], 2, "each wait is a retry");
         // Before the writers start, the budget is at least `PRE_WRITER_MIB`: a fault on a pending page saves it itself.
         assert!(!cow.over_budget());
         cow.wait_for(4, PENDING);

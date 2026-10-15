@@ -153,6 +153,10 @@ impl Pages {
         }
     }
 
+    pub fn is_dirty(&self, page: usize) -> bool {
+        self.dirty.get(page / 64).is_some_and(|w| w.load(Ordering::Relaxed) >> (page % 64) & 1 != 0)
+    }
+
     /// The dirty bits, cleared with `take`.
     pub(super) fn dirty_bits(&self, take: bool) -> Vec<u64> {
         // Only chunks marked touched (see `mark_dirty`) can have any set.

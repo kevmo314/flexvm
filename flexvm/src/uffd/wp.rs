@@ -73,7 +73,7 @@ impl Pager {
     /// copy has not saved yet; then unprotects the pages of its block (`wp_block`) around it that need not stay
     /// protected for the copy, and marks them dirty. Unless it must wait for a writer to save the page first
     /// (`Served::Writer`).
-    pub(super) fn wp_fault(&self, page: usize, m: &Mapping) -> io::Result<Served> {
+    pub(super) fn wp_fault(&self, page: usize, m: &Mapping, parked: bool) -> io::Result<Served> {
         let cow = self.cow();
         // Already unprotected: by the fault of another thread (each one that writes it queues one, and the first
         // unprotect wakes them all), or one on a page of the same block. Its thread may still wait, if it faulted after
@@ -83,26 +83,20 @@ impl Pager {
         if self.pagemap(page, 1).is_ok_and(|e| e[0] & PM_PRESENT != 0 && e[0] & PM_UFFD_WP == 0) {
             return self.wake(page).map(|()| Served::Done(WP));
         }
-        // Over budget, nothing more is copied here, and only the least block is unprotected.
-        let over = cow.as_ref().is_some_and(|c| c.over_budget());
-        let (first, end) = self.wp_block(page, m, !over);
         if let Some(cow) = &cow {
-            cow.stats.faults.fetch_add(1, Ordering::Relaxed);
+            // Once: a fault waiting for a writer (`parked`) is retried on every pass of the event loop.
+            cow.stats.faults.fetch_add(!parked as u64, Ordering::Relaxed);
             if cow.state(page) == READING {
                 cow.wait_for(page, READING);
                 return Ok(Served::Writer);
             }
-            // Test fault `ckpt_wp_race`: a writer claims the faulting page right here (#88): have the writers take it
-            // next, and wait. Only once they run: before, nothing can claim it, and the faults of the resume (vCPUs,
-            // and Firecracker's device thread with a balloon request waiting behind it) would only stall.
-            let race = self.wp_race.load(Ordering::Relaxed) && cow.writing();
-            if race && cow.state(page) == PENDING {
-                cow.want(page);
-                let t = Instant::now();
-                while cow.state(page) == PENDING && t.elapsed() < Duration::from_millis(50) {
-                    thread::sleep(Duration::from_micros(100));
-                }
-            }
+        }
+        // Over budget, nothing more is copied here, and only the least block is unprotected.
+        let over = cow.as_ref().is_some_and(|c| c.over_budget());
+        let (first, end) = self.wp_block(page, m, !over);
+        if let Some(cow) = &cow {
+            // Test fault `ckpt_wp_race`: a writer claims the faulting page right here (#88).
+            self.wp_race(cow, page, &[PENDING]);
             // Over budget, nothing more is copied here: unsaved pages of the block stay protected, and the writers take
             // them first.
             if over {
@@ -130,9 +124,6 @@ impl Pager {
         // pause (a range costs by its size as well as by the call). One call: more would cost more than the faults
         // they spare.
         let keep = |p: usize| cow.as_ref().is_some_and(|c| matches!(c.state(p), PENDING | READING | RESCUING));
-        let dirty = |p: usize| self.pages().dirty.get(p / 64).is_some_and(|w| w.load(Ordering::Relaxed) >> (p % 64) & 1 != 0);
-        // Whether this call unprotected the faulting page, which wakes it.
-        let mut woken = false;
         if !keep(page) {
             let (mut p, mut q) = (page, page + 1);
             while p > first && !keep(p - 1) {
@@ -141,31 +132,40 @@ impl Pager {
             while q < end && !keep(q) {
                 q += 1;
             }
-            while p < page && dirty(p) {
+            while p < page && self.pages().is_dirty(p) {
                 p += 1;
             }
-            while q - 1 > page && dirty(q - 1) {
+            while q - 1 > page && self.pages().is_dirty(q - 1) {
                 q -= 1;
             }
             (p..q).for_each(|d| self.pages().mark_dirty(d));
             self.writeprotect(p, q - p, false)?;
-            woken = true;
-        }
-        // Test fault `ckpt_wp_race`: the writer that claimed the page is done with it before the fault is settled.
-        if self.wp_race.load(Ordering::Relaxed) && cow.as_ref().is_some_and(|c| c.writing()) && !woken {
-            let t = Instant::now();
-            while keep(page) && t.elapsed() < Duration::from_millis(50) {
-                thread::sleep(Duration::from_micros(100));
-            }
+            return Ok(Served::Done(WP));
         }
         // A writer claimed the faulting page itself (PENDING -> READING) after the check above, so it stayed protected,
         // and nothing else wakes the fault (writers never unprotect, even once they are done with it): retry it once the
         // writer is done, and unprotect it then. (Only with a copy: nothing is kept protected without one.)
-        if woken {
-            return Ok(Served::Done(WP));
+        if let Some(cow) = &cow {
+            // Test fault `ckpt_wp_race`: the writer that claimed the page is done with it before the fault is settled.
+            self.wp_race(cow, page, &[PENDING, READING, RESCUING]);
+            cow.wait_for(page, cow.state(page));
         }
-        cow.iter().for_each(|c| c.wait_for(page, c.state(page)));
         Ok(Served::Writer)
+    }
+
+    /// Test fault `ckpt_wp_race`, once the writers run (before, nothing can claim a page, and the faults of the resume
+    /// would only stall): has them take `page` next if pending, and waits up to 50 ms while it is in one of `states`.
+    fn wp_race(&self, cow: &Cow, page: usize, states: &[u8]) {
+        if !self.wp_race.load(Ordering::Relaxed) || !cow.writing() {
+            return;
+        }
+        if cow.state(page) == PENDING {
+            cow.want(page);
+        }
+        let t = Instant::now();
+        while states.contains(&cow.state(page)) && t.elapsed() < Duration::from_millis(50) {
+            thread::sleep(Duration::from_micros(100));
+        }
     }
 
     /// The pages a write fault on `page` unprotects: an aligned block of its 2 MiB chunk within its region, the larger
@@ -176,15 +176,17 @@ impl Pager {
         let size = match grow {
             true => {
                 let chunk = from + at - at % WP_CHUNK;
-                let dirty = &self.pages().dirty;
+                let (dirty, before) = (&self.pages().dirty, self.hot_dirty.lock().unwrap());
                 // Hot pages kept unprotected are dirty from the pause on whether written or not.
                 let kept = self.hot_kept.lock().unwrap();
-                let n = (chunk..(chunk + WP_CHUNK).min(to))
-                    .filter(|&p| dirty.get(p / 64).is_some_and(|w| w.load(Ordering::Relaxed) >> (p % 64) & 1 != 0))
-                    .filter(|&p| kept.get(p / 64).is_none_or(|w| w >> (p % 64) & 1 == 0))
-                    .count();
-                let before = self.wp_hot.lock().unwrap().get(chunk / WP_CHUNK).map_or(0, |&n| n as usize);
-                let start = WP_SIZES.into_iter().rev().find(|&s| s <= before / 2).unwrap_or(WP_BLOCK);
+                // Its pages dirty now and in the interval before the last pause. Regions are whole MiB: whole words.
+                let (mut n, mut was) = (0, 0);
+                for w in chunk / 64..(chunk + WP_CHUNK).min(to) / 64 {
+                    let k = kept.get(w).copied().unwrap_or(0);
+                    n += (dirty.get(w).map_or(0, |d| d.load(Ordering::Relaxed)) & !k).count_ones() as usize;
+                    was += (before.get(w).copied().unwrap_or(0) & !k).count_ones() as usize;
+                }
+                let start = WP_SIZES.into_iter().rev().find(|&s| s <= was / 2).unwrap_or(WP_BLOCK);
                 WP_SIZES.into_iter().find(|&s| s > 2 * n).unwrap_or(WP_CHUNK).max(start)
             }
             false => WP_BLOCK,
@@ -277,7 +279,7 @@ impl Pager {
         if cow.left() * PAGE_SIZE > avail / 4 {
             return;
         }
-        let threads = thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, SAVE_REST_THREADS);
+        let threads = crate::util::host_cpus().min(SAVE_REST_THREADS);
         // Only the runs to save (not every page of guest memory: a VM's unplugged virtio-mem region alone is millions),
         // within a region.
         let chunks: Vec<(usize, usize)> = self.chunks(cow.runs().iter().copied(), PREFETCH_RUN).collect();
@@ -459,9 +461,6 @@ impl Pager {
             }
         };
         if cow {
-            let mut chunks = vec![0u16; pages.len().div_ceil(WP_CHUNK)];
-            dirty_pages().filter(|&p| !keeps(p)).for_each(|p| chunks.get_mut(p / WP_CHUNK).into_iter().for_each(|h| *h += 1));
-            *self.wp_hot.lock().unwrap() = chunks;
             let mut kept = vec![0u64; dirty.len()];
             hot.iter().flat_map(|h| h.held.pages().iter().filter(|&&p| h.keeps(p))).for_each(|&p| kept[p / 64] |= 1 << (p % 64));
             *self.hot_kept.lock().unwrap() = kept;
