@@ -210,7 +210,7 @@ impl Api {
                     };
                     match s {
                         Ok(s) => BufReader::new(crate::util::By { s, at }),
-                        Err(e) => return Err(Box::new(NotSent(format!("firecracker {method} {path}: cannot connect: {e}")))),
+                        Err(e) => return Err(Box::new(NotSent(format!("firecracker {method} {path} (timeout {timeout:?}): cannot connect: {e}")))),
                     }
                 }
             };
@@ -218,8 +218,11 @@ impl Api {
             let (code, buf, close) = match exchange(&mut r, req.as_bytes(), &mut sent) {
                 Ok(response) => response,
                 Err(_) if !sent && reused => continue,
-                Err(e) if !sent => return Err(Box::new(NotSent(format!("firecracker {method} {path}: {e}")))),
-                Err(e) => return Err(e),
+                Err(e) if !sent => return Err(Box::new(NotSent(format!("firecracker {method} {path} (timeout {timeout:?}): {e}")))),
+                Err(e) => {
+                    let kind = e.downcast_ref::<std::io::Error>().map_or(std::io::ErrorKind::Other, |e| e.kind());
+                    return Err(std::io::Error::new(kind, format!("firecracker {method} {path} (timeout {timeout:?}): {e}")).into());
+                }
             };
             // Bytes past the answer mean the stream is out of step.
             if !close && r.buffer().is_empty() {
@@ -602,6 +605,7 @@ mod tests {
             let e = api.request(&server.path, "GET", "/vm", None, TIMEOUT).unwrap_err();
             assert!(!not_sent(&e));
             assert_eq!(e.downcast_ref::<std::io::Error>().unwrap().kind(), std::io::ErrorKind::TimedOut);
+            assert_eq!(e.to_string(), "firecracker GET /vm (timeout 500ms): deadline passed");
             // Scheduler slack under parallel load, but short of a restarted deadline.
             assert!(start.elapsed() < Duration::from_millis(900), "{:?}", start.elapsed());
             assert!(api.connection.borrow().is_none());
@@ -641,7 +645,9 @@ mod tests {
         let api = Api::default();
         let missing = Path::new("/no-flexvm-api/socket");
         assert!(not_sent(&call(&api, missing).unwrap_err()));
-        assert!(not_sent(&api.request(missing, "GET", "/vm", None, Duration::ZERO).unwrap_err()));
+        let e = api.request(missing, "GET", "/vm", None, Duration::ZERO).unwrap_err();
+        assert!(not_sent(&e));
+        assert_eq!(e.to_string(), "firecracker GET /vm (timeout 0ns): cannot connect: deadline passed");
     }
 
     struct Counted<R> {

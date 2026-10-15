@@ -687,7 +687,7 @@ pub fn create(paths: &Paths, name: &str, vcpus: u32, mem_mib: u64, max_mib: u64,
     let res = (|| {
         // Running VMs map the old files, which must not be rewritten under them.
         let staging = Staging::new(paths, name)?;
-        build(paths, &staging.dir, name, vcpus, mem_mib, max_mib, plug_mib, tap, image)?;
+        build(paths, &staging.dir, name, vcpus, mem_mib, max_mib, plug_mib, tap, image).map_err(|e| format!("template {name:?}: {e}"))?;
         interrupted()?;
         publish(paths, name, &staging.dir)
     })();
