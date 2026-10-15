@@ -791,8 +791,8 @@ def guest_calls():
 def exec_background():
     """An exec whose command leaves a background process holding its output returns once the
     shell exits (the process keeps running), and such execs never use up the guest agent's 64
-    session slots; nor do interrupted ones (SIGINT stops the command) or session-less ones whose
-    client went away."""
+    session slots; nor do interrupted ones (SIGINT stops the command), session-less ones whose
+    client went away, or ones whose client was killed outright."""
     n = "ft-exec-bg"
     ok(run(A, n))
     # Processes whose command line starts with `cmd` (the ^ keeps grep from counting itself).
@@ -870,6 +870,70 @@ def exec_background():
     check("exec bg: a session-less exec started", b"ready" in buf, buf[-200:])
     stopped = wait_for(lambda: count("sleep 1002") == (0, "0"), 10)
     check("exec bg: a session-less exec's command stops when its client goes", stopped, count("sleep 1002"))
+    # A client killed outright (SIGKILL: no close) leaves its command running. Once the client has been
+    # gone long enough (ten minutes; 3 s through the agent's test knob), the guest stops the command and
+    # frees its slot, so 70 of these never use up the 64.
+    knob = "/run/flexvm-test-abandoned-running-secs"
+    check("exec bg: the abandoned-session wait is shortened", sh(A, n, f"echo 3 > {knob}") == (0, ""))
+    killed = []
+
+    # As `timeout -s KILL 2 flexvm exec ...`, whose own exit status differs between coreutils versions.
+    def killer():
+        for _ in range(7):
+            p = subprocess.Popen([BIN, "--state", A.state, "--run", A.run, "exec", n, "sleep infinity"],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, env=ENV)
+            try:
+                p.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                p.kill()
+            killed.append((p.wait(), p.stderr.read().strip()[-200:]))
+
+    killers = [threading.Thread(target=killer) for _ in range(10)]
+    for k in killers:
+        k.start()
+    for k in killers:
+        k.join()
+    # Killed (-9), so it ran until then; "too many sessions" would end it at once.
+    bad = [k for k in killed if k != (-signal.SIGKILL, "")]
+    check("exec bg: 70 execs killed outright all ran until killed", len(killed) == 70 and not bad, bad[:3])
+    check("exec bg: execs still start after them", sh(A, n, "echo hi") == (0, "hi"))
+    stopped = wait_for(lambda: count("sleep infinity") == (0, "0"), 90)
+    check("exec bg: an abandoned exec's command is stopped", stopped, count("sleep infinity"))
+    # Only time the guest ran counts towards that wait: across a plain pause the TSC, and so the
+    # guest's monotonic clock, runs on, but a CLI keeps retrying through a pause of any length. A
+    # client gone just before a pause longer than the wait still reattaches after the resume (with
+    # the knob set, a sweep comes every second, so right after the resume too).
+    check("exec bg: the abandoned-session wait is set to 8 s", sh(A, n, f"echo 8 > {knob}") == (0, ""))
+    sid = os.urandom(16).hex()
+    sock = os.path.join(A.run, "vms", f"{n}.sock")
+
+    def session(req, until):
+        with socket.socket(socket.AF_UNIX) as s:
+            s.settimeout(30)
+            s.connect(sock)
+            s.sendall((json.dumps({"op": "exec", "session": sid, **req}) + "\n").encode())
+            buf = b""
+            while until not in buf:
+                d = s.recv(65536)
+                if not d:
+                    break
+                buf += d
+            return buf
+
+    started = session({"action": "start", "cmd": "echo ready; sleep 8; echo done"}, b"ready")
+    check("exec bg: a session started, then its client left", b"ready" in started, started[-200:])
+    # Heartbeats find the client gone within about 2 s.
+    time.sleep(4)
+    uptime = lambda: float(sh(A, n, "cut -d' ' -f1 /proc/uptime")[1])
+    before = uptime()
+    check("exec bg: paused", pause(A, n))
+    time.sleep(20)
+    resume(A, n)
+    counted = uptime() - before
+    check("exec bg: the guest's clock counted the pause", counted >= 20, counted)
+    out = session({"action": "attach", "offset": 0}, b"done")
+    check("exec bg: a session whose client left just before a long pause reattaches after it", b"done" in out, out[-200:])
+    sh(A, n, f"rm -f {knob}")
     cleanup(n)
 
 

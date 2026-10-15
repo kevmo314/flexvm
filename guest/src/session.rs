@@ -5,7 +5,7 @@
 //! read and dropped (by one thread, for at most `MAX_DISCARDED` pipes: past that, a job's next write gets
 //! SIGPIPE). Closing a session whose shell has not exited kills its process group (not processes that
 //! left it with setsid or setpgid: that would take a cgroup per session); closing an unknown one cancels it, so
-//! a start still in flight never runs.
+//! a start still in flight never runs. Sessions whose client is gone are closed in time, running ones too.
 //! At most `MAX_LIVE` sessions are live; closed ones leave a tombstone so a delayed `SESSION` retry cannot
 //! rerun the command. Rings keep `BASE` bytes and grow towards `CAPACITY` from a shared pool: at most
 //! `MAX_LIVE * BASE + POOL` (plus a partial `BLOCK` each). One attachment per session; a new one shuts the
@@ -17,13 +17,13 @@ use std::io::{self, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::proto::{valid_session_id, FRAME_EXIT, FRAME_LOST, FRAME_MSG, FRAME_STDERR, FRAME_STDOUT, MAX_BODY};
-use crate::{fail, msg, spawn_watched, wait_pid, write_frame, Statuses, Watched};
+use crate::{fail, kill_running, msg, spawn_watched, wait_exit, write_frame, Statuses};
 
 const CAPACITY: usize = 4 * 1024 * 1024;
 const MAX_CHUNKS: usize = 4096;
@@ -41,6 +41,51 @@ const RETENTION: Duration = Duration::from_secs(300);
 const GRACE: Duration = Duration::from_secs(30);
 /// A finished session whose client has been gone this long (the CLI gives up after 30 s) becomes a tombstone.
 const ABANDONED: Duration = Duration::from_secs(60);
+/// A running one's is closed (its command killed) after this long: its client was killed, say, or
+/// gave up reattaching. Both count only time the guest ran (`awake`): a CLI keeps retrying through
+/// a pause of any length.
+const ABANDONED_RUNNING: Duration = Duration::from_secs(600);
+/// Test-only: overrides `ABANDONED_RUNNING` (seconds), and sweeps every second, so that e2e tests
+/// need not wait 10 minutes and a sweep always comes right after a resume.
+const ABANDONED_RUNNING_KNOB: &str = "/run/flexvm-test-abandoned-running-secs";
+/// How often the awake clock ticks, and the most one tick adds.
+const TICK: Duration = Duration::from_secs(1);
+const MAX_TICK: Duration = Duration::from_secs(2);
+
+/// Milliseconds the guest has run since `start_clock`. A plain pause stops the vCPUs but not the
+/// TSC, so CLOCK_MONOTONIC (and `Instant`) jump by the paused time on resume; this counts it as one
+/// tick of at most `MAX_TICK`. A starved ticker only makes it slow, never fast.
+static AWAKE_MS: AtomicU64 = AtomicU64::new(0);
+
+pub fn start_clock() {
+    thread::spawn(|| {
+        let mut last = Instant::now();
+        loop {
+            thread::sleep(TICK);
+            let now = Instant::now();
+            AWAKE_MS.fetch_add(tick(now - last).as_millis() as u64, Ordering::Relaxed);
+            last = now;
+        }
+    });
+}
+
+/// What one tick that took `elapsed` adds to the awake clock.
+fn tick(elapsed: Duration) -> Duration {
+    elapsed.min(MAX_TICK)
+}
+
+fn awake() -> Duration {
+    Duration::from_millis(AWAKE_MS.load(Ordering::Relaxed))
+}
+
+fn knob() -> Option<Duration> {
+    std::fs::read_to_string(ABANDONED_RUNNING_KNOB).ok().and_then(|s| s.trim().parse().ok()).map(Duration::from_secs)
+}
+
+/// How long the sweeper sleeps between `cleanup`s.
+pub fn sweep_every() -> Duration {
+    knob().map_or(Duration::from_secs(60), |_| Duration::from_secs(1))
+}
 /// Output still read after the shell exits, as for the app.
 const DRAIN: Duration = Duration::from_secs(2);
 
@@ -83,15 +128,26 @@ impl Table {
         Output { reservation: Reservation { pool: Some(self.pool.clone()), bytes: 0 }, ..Default::default() }
     }
 
-    fn close(&mut self, id: &str) {
+    /// Kills the command's process group first if its shell is still running (`kill`).
+    fn close(&mut self, id: &str, kill: Option<&Statuses>) {
         if let Some(entry) = self.live.remove(id) {
+            // Only while its own shell is unreaped (the token, under the reaper's lock) is the group
+            // surely the command's. An exited shell's jobs run on.
+            if let Some(statuses) = kill {
+                kill_running(statuses, entry.group, entry.token, true, libc::SIGKILL);
+            }
             let mut output = entry.output.0.lock().unwrap();
             output.closed = true;
             output.chunks = VecDeque::new();
             output.start = output.end;
             output.reservation.release();
+            let attached = output.attached.as_mut().and_then(|a| a.conn.take());
             drop(output);
             entry.output.1.notify_all();
+            // Unblocks its handler even mid-write to a stalled client, as a new attachment would.
+            if let Some(conn) = attached {
+                unsafe { libc::shutdown(conn.as_raw_fd(), libc::SHUT_RDWR) };
+            }
             self.closed.insert(id.to_string(), Instant::now());
         }
     }
@@ -109,23 +165,31 @@ impl Table {
         self.cancelled.insert(id.to_string(), Instant::now());
     }
 
-    fn reclaim(&mut self) {
+    /// Closes sessions whose client is gone: finished ones after `ABANDONED`, running ones (killing
+    /// their command) after `ABANDONED_RUNNING`.
+    fn reclaim(&mut self, statuses: &Statuses) {
+        self.reclaim_after(statuses, knob().unwrap_or(ABANDONED_RUNNING), awake());
+    }
+
+    /// `now` is on the awake clock.
+    fn reclaim_after(&mut self, statuses: &Statuses, running_after: Duration, now: Duration) {
         let abandoned: Vec<String> = self
             .live
             .iter()
             .filter_map(|(id, entry)| {
                 let o = entry.output.0.lock().unwrap();
-                (o.exit.is_some() && o.attached.is_none() && o.detached.is_some_and(|t| t.elapsed() >= ABANDONED)).then(|| id.clone())
+                let after = if o.exit.is_some() { ABANDONED } else { running_after };
+                (o.attached.is_none() && o.gone.is_some_and(|t| now.saturating_sub(t) >= after)).then(|| id.clone())
             })
             .collect();
         for id in abandoned {
-            self.close(&id);
+            self.close(&id, Some(statuses));
         }
     }
 
-    fn admit(&mut self) -> io::Result<()> {
+    fn admit(&mut self, statuses: &Statuses) -> io::Result<()> {
         if self.live.len() >= MAX_LIVE {
-            self.reclaim();
+            self.reclaim(statuses);
         }
         if self.live.len() >= MAX_LIVE {
             return Err(io::Error::other(format!("too many sessions: {MAX_LIVE} commands are running or awaiting their client")));
@@ -198,6 +262,8 @@ pub(crate) struct Output {
     /// The attachment's cursor: everything before it has been sent.
     sent: u64,
     detached: Option<Instant>,
+    /// When it was detached, on the awake clock.
+    gone: Option<Duration>,
     reservation: Reservation,
 }
 
@@ -279,9 +345,9 @@ pub fn parse(line: &str) -> io::Result<Request<'_>> {
     }
 }
 
-pub fn cleanup(sessions: &Sessions) {
+pub fn cleanup(sessions: &Sessions, statuses: &Statuses) {
     let mut table = sessions.lock().unwrap();
-    table.reclaim();
+    table.reclaim(statuses);
     table.closed.retain(|_, at| at.elapsed() < RETENTION);
     table.cancelled.retain(|_, at| at.elapsed() < RETENTION);
 }
@@ -296,7 +362,7 @@ pub fn handle(mut w: impl Write, body: &[u8], conn: Option<File>, line: &str, se
             // A replaced attachment leaves the session to its successor.
             if ring.attached.as_ref().is_some_and(|a| a.id == me) {
                 ring.attached = None;
-                ring.detached = Some(Instant::now());
+                (ring.detached, ring.gone) = (Some(Instant::now()), Some(awake()));
             }
             drop(ring);
             output.1.notify_all();
@@ -327,19 +393,20 @@ fn open<'a>(body: &[u8], conn: Option<File>, line: &'a str, sessions: &Sessions,
                 }
                 return Ok(Some((id, 0, attach(&entry.output, 0, conn))));
             }
-            table.admit()?;
+            table.admit(statuses)?;
             let command = std::str::from_utf8(command).map_err(io::Error::other)?;
             let output = session(table.new_output());
             // Start the pump first: if no thread can be had, nothing has run yet.
-            let (tx, rx) = mpsc::sync_channel::<(Child, Option<OwnedFd>)>(1);
+            let (tx, rx) = mpsc::sync_channel::<(Child, Option<OwnedFd>, u64)>(1);
             let (pumped, statuses_) = (output.clone(), statuses.clone());
             thread::Builder::new()
                 .spawn(move || {
-                    if let Ok((mut child, exited)) = rx.recv() {
+                    if let Ok((mut child, exited, token)) = rx.recv() {
                         let rest = crate::pump_until(child.stdout.take(), child.stderr.take(), exited, DRAIN, |kind, data| deliver(&pumped, kind, data));
                         // Closed, they would kill a background process's next write with SIGPIPE.
                         crate::discard(rest);
-                        pumped.0.lock().unwrap().exit = wait_pid(&statuses_, child.id() as i32, None);
+                        // By token: the pid may be another child's by now, however long the client took.
+                        pumped.0.lock().unwrap().exit = wait_exit(&statuses_, token, None);
                         pumped.1.notify_all();
                     }
                 })
@@ -355,7 +422,7 @@ fn open<'a>(body: &[u8], conn: Option<File>, line: &'a str, sessions: &Sessions,
             table.live.insert(id.to_string(), Entry { command: fingerprint, output: output.clone(), group: child.id() as i32, token });
             // Attached before any output, so none is overwritten before it is sent.
             let attached = attach(&output, 0, conn);
-            let _ = tx.send((child, exited));
+            let _ = tx.send((child, exited, token));
             (id, 0, attached)
         }
         Request::Attach { id, offset } => {
@@ -367,22 +434,12 @@ fn open<'a>(body: &[u8], conn: Option<File>, line: &'a str, sessions: &Sessions,
         }
         Request::Close { id } => {
             let mut table = sessions.lock().unwrap();
-            // Closing again (a retried acknowledgement) is fine.
-            match table.live.get(id) {
-                // Only while its own shell is unreaped (same token, no exit, under the reaper's lock) is
-                // the group surely the command's: a reaped shell's pid, and an emptied group's id, may
-                // belong to a newer child. An exited shell's jobs run on.
-                Some(entry) => {
-                    let reaped = statuses.0.lock().unwrap();
-                    if entry.group > 0 && reaped.get(&entry.group) == Some(&Watched { token: entry.token, exit: None }) {
-                        unsafe { libc::kill(-entry.group, libc::SIGKILL) };
-                    }
-                }
-                // A start still in flight (a client interrupted at once) must not run.
-                None if !table.ended(id) => table.cancel(id),
-                None => {}
+            // A start still in flight (a client interrupted at once) must not run. Closing again
+            // (a retried acknowledgement) is fine.
+            if !table.live.contains_key(id) && !table.ended(id) {
+                table.cancel(id);
             }
-            table.close(id);
+            table.close(id, Some(statuses));
             return Ok(None);
         }
     }))
@@ -481,8 +538,9 @@ mod tests {
         output
     }
 
-    fn finished(table: &mut Table, id: &str, detached: Option<Instant>) -> Session {
-        live(table, id, Output { exit: Some(0), detached, ..Default::default() })
+    /// `gone`: when its client left, on the awake clock.
+    fn finished(table: &mut Table, id: &str, gone: Option<Duration>) -> Session {
+        live(table, id, Output { exit: Some(0), detached: gone.map(|_| Instant::now()), gone, ..Default::default() })
     }
 
     fn attached(ring: Output) -> Session {
@@ -490,7 +548,7 @@ mod tests {
     }
 
     fn statuses() -> Statuses {
-        Arc::new((Mutex::new(HashMap::new()), Condvar::new()))
+        Statuses::default()
     }
 
     fn request(sessions: &Sessions, statuses: &Statuses, line: &str, body: &[u8]) -> Vec<u8> {
@@ -543,7 +601,7 @@ mod tests {
         let (sessions, statuses) = (Sessions::default(), statuses());
         for i in 0..MAX_LIVE * 3 {
             let mut table = sessions.lock().unwrap();
-            table.admit().unwrap();
+            table.admit(&statuses).unwrap();
             finished(&mut table, &i.to_string(), None);
             drop(table);
             assert!(request(&sessions, &statuses, &format!("CLOSE {i}"), b"").ends_with(b"closed"));
@@ -568,48 +626,148 @@ mod tests {
 
     #[test]
     fn live_limit_is_explicit_and_abandoned_sessions_are_reclaimed() {
-        let mut table = Table::default();
+        let (mut table, st) = (Table::default(), statuses());
+        // Clients left at awake time ABANDONED, but 3's and 4's at 0; it is now ABANDONED.
         let outputs: Vec<_> = (0..MAX_LIVE)
             .map(|i| {
-                table.admit().unwrap();
-                finished(&mut table, &i.to_string(), Some(Instant::now()))
+                table.admit(&st).unwrap();
+                finished(&mut table, &i.to_string(), Some(if i == 3 || i == 4 { Duration::ZERO } else { ABANDONED }))
             })
             .collect();
-        assert!(table.admit().unwrap_err().to_string().contains("too many sessions"));
-        let old = Some(Instant::now() - ABANDONED);
-        outputs[3].0.lock().unwrap().detached = old;
-        let mut o4 = outputs[4].0.lock().unwrap();
-        (o4.attached, o4.detached) = (Some(Attachment { id: 1, conn: None }), old);
-        drop(o4);
-        table.admit().unwrap();
+        assert!(table.admit(&st).unwrap_err().to_string().contains("too many sessions"));
+        outputs[4].0.lock().unwrap().attached = Some(Attachment { id: 1, conn: None });
+        table.reclaim_after(&st, ABANDONED_RUNNING, ABANDONED);
+        table.admit(&st).unwrap();
         assert!(!table.live.contains_key("3") && table.closed.contains_key("3"));
         assert!(outputs[3].0.lock().unwrap().closed);
         assert!(table.live.contains_key("4"), "an attached reader keeps its session");
-        // A running session is never reclaimed.
+        assert_eq!(table.live.len(), MAX_LIVE - 1);
+        // A running session's client gets longer.
         let mut o5 = outputs[5].0.lock().unwrap();
-        (o5.exit, o5.detached) = (None, old);
+        (o5.exit, o5.gone) = (None, Some(Duration::ZERO));
         drop(o5);
-        table.reclaim();
+        table.reclaim_after(&st, ABANDONED * 2, ABANDONED * 2 - Duration::from_millis(1));
         assert!(table.live.contains_key("5"));
+        table.reclaim_after(&st, ABANDONED * 2, ABANDONED * 2);
+        assert!(!table.live.contains_key("5") && table.closed.contains_key("5"));
+    }
+
+    #[test]
+    fn a_pause_counts_as_one_short_tick() {
+        assert_eq!(tick(Duration::from_millis(1003)), Duration::from_millis(1003));
+        // Resumed after 20 minutes paused: the TSC (and so Instant) counted them all.
+        assert_eq!(tick(Duration::from_secs(1200)), MAX_TICK);
+        let (mut table, st) = (Table::default(), statuses());
+        let o = live(&mut table, "s", Output { gone: Some(Duration::ZERO), ..Default::default() });
+        // Detached a second before the pause, reattaching a second after it.
+        let now = TICK + tick(Duration::from_secs(1200)) + TICK;
+        table.reclaim_after(&st, Duration::from_secs(8), now);
+        assert!(table.live.contains_key("s") && !o.0.lock().unwrap().closed, "a pause expired a running session");
+    }
+
+    #[test]
+    fn abandoned_running_sessions_are_killed_and_reclaimed() {
+        let (sessions, statuses) = (Sessions::default(), statuses());
+        let after = Duration::from_millis(300);
+        // Their clients are gone at once (`start`'s connection is closed).
+        let (gone, group) = start(&sessions, &statuses, "gone", b"sleep 100 & sleep 100");
+        let (kept, kept_group) = start(&sessions, &statuses, "kept", b"sleep 100");
+        // Detached at awake time 0 (the clock does not run in tests).
+        assert_eq!(gone.0.lock().unwrap().gone, Some(Duration::ZERO));
+        sessions.lock().unwrap().reclaim_after(&statuses, after, after - Duration::from_millis(1));
+        assert!(sessions.lock().unwrap().live.contains_key("gone"), "reclaimed before its client had long to come back");
+        // A client came back to this one.
+        attach(&kept, 0, None);
+        sessions.lock().unwrap().reclaim_after(&statuses, after, after);
+        let table = sessions.lock().unwrap();
+        assert!(!table.live.contains_key("gone") && table.closed.contains_key("gone"));
+        assert!(table.live.contains_key("kept"), "an attached session was reclaimed");
+        drop(table);
+        assert!(gone.0.lock().unwrap().closed);
+        let status = reap(&statuses, group);
+        assert!(libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while unsafe { libc::kill(-group, 0) } == 0 {
+            assert!(Instant::now() < deadline, "the abandoned command's background process survived");
+            unsafe { libc::waitpid(-group, std::ptr::null_mut(), libc::WNOHANG) };
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(request(&sessions, &statuses, "CLOSE kept", b"").ends_with(b"closed"));
+        reap(&statuses, kept_group);
+        let ring = kept.0.lock().unwrap();
+        assert!(kept.1.wait_timeout_while(ring, DRAIN * 3, |r| r.exit.is_none()).unwrap().0.exit.is_some());
+    }
+
+    #[test]
+    fn exit_is_kept_by_token_when_the_pid_is_reused_while_the_pump_waits() {
+        let (sessions, statuses) = (Sessions::default(), statuses());
+        // Half the ring, then more: with its client away but within GRACE, the pump waits for it
+        // before taking the rest, and the shell exits meanwhile (the rest fits the pipe).
+        let (output, group) = start(&sessions, &statuses, "slow", b"head -c 65536 /dev/zero; sleep 0.5; echo more; exit 3");
+        let status = reap(&statuses, group);
+        assert_eq!(libc::WEXITSTATUS(status), 3);
+        thread::sleep(Duration::from_millis(100));
+        let ring = output.0.lock().unwrap();
+        assert!(ring.exit.is_none() && ring.end == 65536, "the pump did not wait: {} bytes", ring.end);
+        drop(ring);
+        let newer = u64::MAX;
+        let mut children = statuses.0.lock().unwrap();
+        // An orphan reaped under the old pid is not ours; a newer child that got the pid has its own token.
+        assert!(!children.reaped(group, 77));
+        children.running.insert(group, newer);
+        assert!(children.reaped(group, 9));
+        drop(children);
+        statuses.1.notify_all();
+        // The client gave up: output goes on.
+        output.0.lock().unwrap().detached = Some(Instant::now() - GRACE);
+        output.1.notify_all();
+        let ring = output.0.lock().unwrap();
+        let (ring, timeout) = output.1.wait_timeout_while(ring, DRAIN * 5, |r| r.exit.is_none()).unwrap();
+        assert!(!timeout.timed_out(), "the pump never got its exit");
+        assert_eq!((ring.exit, ring.end), (Some(3), 65536 + 5));
+        drop(ring);
+        assert_eq!(wait_exit(&statuses, newer, Some(Instant::now())), Some(9), "the newer child's status was taken");
+        assert!(statuses.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn closing_shuts_down_a_stalled_attachment() {
+        let (sessions, statuses) = (Sessions::default(), statuses());
+        let output = live(&mut sessions.lock().unwrap(), "s", Output::default());
+        output.0.lock().unwrap().push(FRAME_STDOUT, &vec![b'x'; 64 * BLOCK], CAPACITY);
+        let (conn, _peer) = UnixStream::pair().unwrap();
+        let dup = File::from(OwnedFd::from(conn.try_clone().unwrap()));
+        let (sessions_, statuses_) = (sessions.clone(), statuses.clone());
+        let handler = thread::spawn(move || handle(conn, b"", Some(dup), "ATTACH s 0", &sessions_, &statuses_));
+        // The client reads nothing, so its handler blocks writing to it.
+        thread::sleep(Duration::from_millis(200));
+        assert!(!handler.is_finished());
+        assert!(request(&sessions, &statuses, "CLOSE s", b"").ends_with(b"closed"));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !handler.is_finished() {
+            assert!(Instant::now() < deadline, "a writer blocked on a stalled client outlived its session");
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
     fn tombstones_are_bounded_and_expire() {
         let mut table = Table::default();
+        let statuses = statuses();
         let old = Instant::now() - GRACE;
         for i in 0..MAX_TOMBSTONES {
             table.closed.insert(i.to_string(), if i == 7 { old - Duration::from_secs(1) } else { old });
         }
-        table.admit().unwrap();
+        table.admit(&statuses).unwrap();
         assert_eq!(table.closed.len(), MAX_TOMBSTONES - 1);
         assert!(!table.closed.contains_key("7"), "the oldest tombstone goes first");
         table.closed.insert("new".into(), Instant::now());
         table.closed.values_mut().for_each(|at| *at = Instant::now());
-        assert!(table.admit().unwrap_err().to_string().contains("finished in the last"));
+        assert!(table.admit(&statuses).unwrap_err().to_string().contains("finished in the last"));
         table.closed.values_mut().for_each(|at| *at = Instant::now() - RETENTION);
         table.closed.insert("recent".into(), Instant::now());
         let sessions = Arc::new(Mutex::new(table));
-        cleanup(&sessions);
+        cleanup(&sessions, &statuses);
         assert_eq!(sessions.lock().unwrap().closed.keys().collect::<Vec<_>>(), ["recent"]);
     }
 
@@ -618,7 +776,7 @@ mod tests {
         let mut table = Table::default();
         let outputs: Vec<_> = (0..MAX_LIVE)
             .map(|i| {
-                table.admit().unwrap();
+                table.admit(&statuses()).unwrap();
                 let output = live(&mut table, &i.to_string(), Output::default());
                 for _ in 0..2 * CAPACITY / BLOCK {
                     deliver(&output, FRAME_STDOUT, &[b'x'; BLOCK]);
@@ -643,8 +801,8 @@ mod tests {
         assert!(full > 0 && full < MAX_LIVE);
         assert!(outputs.iter().all(|o| o.0.lock().unwrap().capacity() >= BASE));
         // Closing and dropping both return what was taken, exactly once.
-        table.close("0");
-        table.close("0");
+        table.close("0", None);
+        table.close("0", None);
         assert_eq!(table.pool.load(Ordering::Acquire), CAPACITY - BASE);
         table.live.clear();
         drop(outputs);
@@ -681,7 +839,7 @@ mod tests {
         let mut status = 0;
         assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
         let code = if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { 128 + libc::WTERMSIG(status) };
-        statuses.0.lock().unwrap().get_mut(&pid).unwrap().exit = Some(code);
+        assert!(statuses.0.lock().unwrap().reaped(pid, code));
         statuses.1.notify_all();
         status
     }
@@ -757,7 +915,7 @@ mod tests {
         let old = sessions.lock().unwrap().live["old"].token;
         assert_ne!(old, token);
         sessions.lock().unwrap().live.get_mut("old").unwrap().group = pid;
-        assert_eq!(statuses.0.lock().unwrap()[&pid], Watched { token, exit: None });
+        assert_eq!(statuses.0.lock().unwrap().running[&pid], token);
         assert!(request(&sessions, &statuses, "CLOSE old", b"").ends_with(b"closed"));
         thread::sleep(Duration::from_millis(100));
         let mut status = 0;
@@ -797,7 +955,7 @@ mod tests {
         }
         let mut table = sessions.lock().unwrap();
         assert_eq!((table.cancelled.len(), table.closed.len()), (MAX_CANCELLED, 0));
-        table.admit().unwrap();
+        table.admit(&statuses).unwrap();
         drop(table);
         let last = format!("c{}", MAX_CANCELLED * 2 - 1);
         assert!(request(&sessions, &statuses, &format!("SESSION {last} 4"), b"true").ends_with(b"session closed"));
@@ -813,11 +971,8 @@ mod tests {
         let disconnected = UnixStream::pair().unwrap().0;
         assert!(handle(disconnected, command, None, &line, &sessions, &statuses).is_err());
         // Simulate PID 1's reaper, without leaving a reaper thread in the test process.
-        let pid = *statuses.0.lock().unwrap().keys().next().unwrap();
-        let mut status = 0;
-        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
-        statuses.0.lock().unwrap().get_mut(&pid).unwrap().exit = Some(libc::WEXITSTATUS(status));
-        statuses.1.notify_all();
+        let pid = *statuses.0.lock().unwrap().running.keys().next().unwrap();
+        reap(&statuses, pid);
         let output = sessions.lock().unwrap().live["retry"].output.clone();
         let ring = output.0.lock().unwrap();
         let (ring, timeout) = output.1.wait_timeout_while(ring, Duration::from_secs(2), |r| r.exit.is_none()).unwrap();
@@ -832,10 +987,10 @@ mod tests {
         assert!(output.0.lock().unwrap().chunks.is_empty());
         assert!(request(&sessions, &statuses, &line, command).ends_with(b"error: session closed"));
         assert!(statuses.0.lock().unwrap().is_empty());
-        cleanup(&sessions);
+        cleanup(&sessions, &statuses);
         assert!(sessions.lock().unwrap().closed.contains_key("retry"), "closed ID must remain a tombstone");
         sessions.lock().unwrap().closed.insert("retry".into(), Instant::now() - RETENTION);
-        cleanup(&sessions);
+        cleanup(&sessions, &statuses);
         assert!(sessions.lock().unwrap().closed.is_empty());
     }
 

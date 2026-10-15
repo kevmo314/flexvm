@@ -974,7 +974,14 @@ so a delayed creation retry cannot execute the command again.
 At most 64 sessions are live (running, or finished and not yet closed); another
 SESSION fails with `error: too many sessions: ...`. A finished session whose
 client has been gone for a minute is closed by the guest (checked every minute,
-and whenever the limit is reached), its output freed. Closed sessions leave
+and whenever the limit is reached), its output freed; a running one is closed
+after ten minutes, its process group killed as CLOSE would (a client killed
+outright never sends CLOSE). Both waits count only time the guest ran: across
+a plain pause the TSC, and so the guest's monotonic clock, runs on, while a
+CLI keeps retrying through it. The agent keeps its own clock, which a thread
+advances every second by at most 2 s, so a pause of any length counts as about
+2 s. Closing a session also shuts down its attached
+connection, so a write to a stalled client cannot hold it. Closed sessions leave
 tombstones: small records outside that limit that expire five minutes after the
 close, and beyond 4096 the oldest one (if at least 30 s old) is dropped. Each
 live session's output ring keeps 128 KiB and grows towards 4 MiB from a shared

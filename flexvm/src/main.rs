@@ -709,13 +709,23 @@ pub fn exec(host: &Host, name: &str, cmd: &str) -> Result<i32> {
     let id = session.lock().unwrap().id.clone();
     let close = {
         let (host, name, id) = (host.clone(), name.to_string(), id.clone());
-        move || -> Result<()> {
+        let once = move || -> Result<()> {
             let c = vmproc::connect(&host, &name, &json!({"op": "exec", "session": id, "action": "close"}), &[], Instant::now() + Duration::from_secs(5))?;
             c.set_read_timeout(Some(Duration::from_secs(5)))?;
             match recv_json(&mut BufReader::new(c))? {
                 Some(r) if r["ok"] == json!(true) => Ok(()),
                 Some(r) => Err(r["error"].as_str().unwrap_or("session close failed").into()),
                 None => Err("vm hung up".into()),
+            }
+        };
+        // A checkpoint turns it away for a few seconds: it is tried again meanwhile.
+        move || -> Result<()> {
+            let until = Instant::now() + Duration::from_secs(10);
+            loop {
+                match once() {
+                    Err(e) if e.to_string().contains(vm::CHECKPOINTING) && Instant::now() < until => std::thread::sleep(Duration::from_millis(200)),
+                    res => return res,
+                }
             }
         }
     };
@@ -746,7 +756,8 @@ pub fn exec(host: &Host, name: &str, cmd: &str) -> Result<i32> {
     });
     let result = exec_session(host, name, cmd, session, false);
     // On an error too (a closed stdout, as with `| head`): the command would run on, holding its slot.
-    // Best effort: the guest closes a finished session a minute after its client leaves anyway.
+    // Best effort: the guest closes a session whose client left anyway, a minute after it finished
+    // (ten, if it still runs).
     let _ = close();
     result
 }

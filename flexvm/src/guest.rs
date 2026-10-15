@@ -134,12 +134,6 @@ fn session_on<S: Read + Write>(action: &str, id: &str, offset: u64, cmd: &str, o
     Ok(r)
 }
 
-/// `close` the session once it has exited.
-pub fn start_exec(s: UnixStream, cmd: &str, timeout: Duration) -> Result<(BufReader<UnixStream>, String)> {
-    let id = session_id()?;
-    Ok((session(s, "start", &id, 0, cmd, timeout)?, id))
-}
-
 pub fn exec_output(r: &mut impl Read, id: &str, mut out: impl FnMut(u8, &[u8]) -> Result<()>) -> Result<i32> {
     let mut offset = 0;
     loop {
@@ -212,16 +206,23 @@ pub fn exec(uds: &Path, cmd: &str, timeout: Duration) -> Result<i32> {
     Ok(code)
 }
 
-/// Drains all output, keeping at most `max_out` bytes; returns the close result separately.
+/// How long past its deadline `run` may take to close a command it gave up on.
+const CLOSE_GRACE: Duration = Duration::from_secs(1);
+
+/// Drains all output, keeping at most `max_out` bytes; returns the close result separately. The
+/// session is closed however it ended (past the deadline, the command is stopped).
 pub fn run(s: UnixStream, uds: &Path, cmd: &str, deadline: Instant, max_out: usize) -> Result<(i32, String, Result<()>)> {
     let id = session_id()?;
-    let mut r = session_on("start", &id, 0, cmd, |line| handshake(By { s, at: deadline }, line))?;
     let mut out = Vec::new();
-    let code = exec_output(&mut r, &id, |_, d| {
-        out.extend_from_slice(&d[..d.len().min(max_out.saturating_sub(out.len()))]);
-        Ok(())
-    })?;
-    Ok((code, String::from_utf8_lossy(&out).into_owned(), close(uds, &id, deadline)))
+    let code = session_on("start", &id, 0, cmd, |line| handshake(By { s, at: deadline }, line)).and_then(|mut r| {
+        exec_output(&mut r, &id, |_, d| {
+            out.extend_from_slice(&d[..d.len().min(max_out.saturating_sub(out.len()))]);
+            Ok(())
+        })
+    });
+    // A command cut off by the deadline still gets a moment to be closed.
+    let closed = close(uds, &id, deadline.max(Instant::now() + CLOSE_GRACE));
+    Ok((code?, String::from_utf8_lossy(&out).into_owned(), closed))
 }
 
 fn now() -> Result<String> {
@@ -361,9 +362,19 @@ mod tests {
             let start = Instant::now();
             let e = exec(&uds, "true", Duration::from_millis(100)).unwrap_err();
             assert_eq!(e.downcast_ref::<std::io::Error>().unwrap().kind(), ErrorKind::TimedOut);
-            assert!(start.elapsed() < Duration::from_secs(1));
+            assert!(start.elapsed() < Duration::from_secs(1) + CLOSE_GRACE);
         });
+        // The request after CONNECT.
+        let request = |stream: &std::os::unix::net::UnixStream| {
+            let mut r = BufReader::new(stream);
+            let mut line = String::new();
+            r.read_line(&mut line).unwrap();
+            line.clear();
+            r.read_line(&mut line).unwrap();
+            line
+        };
         let (mut stream, _) = listener.accept().unwrap();
+        let id = request(&stream).split_whitespace().nth(1).unwrap().to_string();
         stream.write_all(b"OK 1\n").unwrap();
         let data = vec![b'x'; 64 << 10];
         for i in 0..100 {
@@ -372,6 +383,11 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+        // Given up on, the command is still closed.
+        let (mut stream, _) = listener.accept().unwrap();
+        assert_eq!(request(&stream), format!("CLOSE {id}\n"));
+        stream.write_all(b"OK 1\n").unwrap();
+        write_frame(&mut stream, FRAME_MSG, b"closed").unwrap();
         client.join().unwrap();
         std::fs::remove_file(path).unwrap();
     }
