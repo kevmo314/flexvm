@@ -236,10 +236,15 @@ impl Vm {
         let stopped = (stuck || crate::host::fault("tap_backlog")).then(|| self.pid()).flatten();
         if let Some(pid) = stopped {
             // Frames pile up on the tap while Firecracker is stopped, more than the guest has
-            // buffers for, and the address is held before it goes on: a queue to take.
-            crate::log!("vm {}: injected fault: stopping firecracker for 200 ms, holding its address meanwhile", self.name);
+            // buffers for, and the address is held before it goes on: a queue to take. Stopped
+            // until one is there, however late a loaded sender's first frames come (#294).
+            crate::log!("vm {}: injected fault: stopping firecracker for 200 ms or until frames queue on its tap, holding its address meanwhile", self.name);
             unsafe { libc::kill(pid as libc::pid_t, libc::SIGSTOP) };
             std::thread::sleep(Duration::from_millis(200));
+            let until = Instant::now() + Duration::from_secs(5);
+            while watch.as_ref().is_some_and(|fd| !crate::net::tap_queued(fd).unwrap_or(true)) && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(1));
+            }
         }
         let go_on = || {
             if let Some(pid) = stopped {
@@ -247,6 +252,9 @@ impl Vm {
             }
         };
         let held = unroute();
+        // Read while its Firecracker is still stopped, so a guest that empties the queue before
+        // `drain_tap` first looks is still seen to have had one (#294).
+        let backlog = stopped.is_some() && watch.as_ref().is_some_and(|fd| crate::net::tap_queued(fd).unwrap_or(false));
         if !stuck {
             go_on();
         }
@@ -254,7 +262,7 @@ impl Vm {
         if let (true, Some(fd)) = (held, watch) {
             // Not read off here: resumed (a checkpoint, an aborted migration), its Firecracker
             // delivers them once the guest posts buffers. `kill` counts what is left.
-            let emptied = self.drain_tap(&fd);
+            let emptied = self.drain_tap(&fd, backlog);
             self.tap_stuck.store(!emptied, Ordering::SeqCst);
             t.mark("drain_tap");
         }
@@ -303,8 +311,9 @@ impl Vm {
     }
 
     /// With its address held nothing new reaches the tap, so the running guest empties its
-    /// queue unless it stops taking frames; false if it has not by `TAP_DRAIN_WAIT`.
-    fn drain_tap(&self, fd: &OwnedFd) -> bool {
+    /// queue unless it stops taking frames; false if it has not by `TAP_DRAIN_WAIT`. `queued`:
+    /// a queue was already seen there since the hold.
+    fn drain_tap(&self, fd: &OwnedFd, queued: bool) -> bool {
         // Paused, its guest takes nothing: no use waiting.
         if self.was_paused() {
             return match crate::net::tap_queued(fd) {
@@ -321,7 +330,7 @@ impl Vm {
             };
         }
         let start = Instant::now();
-        let mut queued = false;
+        let mut queued = queued;
         loop {
             match crate::net::tap_queued(fd) {
                 Ok(false) => break,

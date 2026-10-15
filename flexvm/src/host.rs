@@ -964,6 +964,10 @@ const GRANT_WINDOW: Duration = Duration::from_secs(10);
 
 /// Shared by all processes (RUN is per boot) and unaffected by wall-clock steps.
 fn boottime_ms() -> u64 {
+    #[cfg(test)]
+    if let Some(t) = tests::PINNED_MS.with(|p| p.get()) {
+        return t;
+    }
     let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut t) };
     t.tv_sec as u64 * 1000 + t.tv_nsec as u64 / 1_000_000
@@ -2214,6 +2218,18 @@ mod tests {
     /// every other process, so no margin is ever safe.
     const AVAIL: u64 = 10_000;
 
+    thread_local! {
+        /// What `boottime_ms` reads on this test's thread, once pinned (`pin_clock`).
+        pub(super) static PINNED_MS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// Stops the clock grants are stamped and aged by, on this test's thread: other tests share
+    /// the host lock's thread mutex, so on a loaded machine a grant can wait on it past
+    /// `GRANT_WINDOW` (#294).
+    fn pin_clock(ms: u64) {
+        PINNED_MS.with(|p| p.set(Some(ms)));
+    }
+
     /// `grant_inner` against `AVAIL`.
     fn grant_at(h: &Host, mib: u64, floor: Floor, hold: bool) -> std::result::Result<(u64, Option<Hold>), Error> {
         h.grant_inner(mib, floor, hold, None, || Some(AVAIL)).unwrap()
@@ -2291,6 +2307,8 @@ mod tests {
         let path = h.grants();
         let grants: Vec<(u64, u64, u64)> = load(&path).unwrap().unwrap();
         assert!(grants[0].0 >= before && grants[0].0 <= boottime_ms());
+        // From here what counts depends on stamps' ages alone, not on how long the test takes.
+        pin_clock(grants[0].0);
         let mut other = Host::open(&h.state, &h.run).unwrap();
         other.cfg.reserve_mib = h.cfg.reserve_mib;
         assert!(grant_at(&other, 1, Floor::Reserve, false).is_err(), "another host handle sees the pending grant");
@@ -2317,6 +2335,7 @@ mod tests {
         let mut h = host("admit");
         let admit = |h: &Host, mib| grant_at(h, mib, Floor::Reserve, false).is_ok();
         h.cfg.reserve_mib = AVAIL - 3000;
+        pin_clock(boottime_ms());
         assert!(admit(&h, 1000) && admit(&h, 1000));
         assert!(!admit(&h, 1001), "recent grants count as used");
         // A start that did not happen gives its grant back, by id: only its own.
@@ -2367,6 +2386,8 @@ mod tests {
         .unwrap();
         let running = h.clone();
         let above = |mib| grant_at(&running, mib, Floor::EvictMark, false).map(|g| g.0);
+        // Its grants must all count to the end, however long a loaded machine takes over it.
+        pin_clock(boottime_ms());
         assert!(grant_at(&running, 100, Floor::Reserve, false).is_ok());
         // An eviction's arrival leaves the mark available, not only the reserve.
         assert!(above(1401).unwrap_err().to_string().contains("eviction mark"));
