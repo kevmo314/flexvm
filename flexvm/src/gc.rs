@@ -231,8 +231,17 @@ mod tests {
         File::create(&marker).unwrap().set_modified(SystemTime::now() - MOVED_TTL - Duration::from_secs(1)).unwrap();
         sweep(&host);
         assert!(!marker.exists());
+        // Let go: free once no other test's child, forked but not yet exec'd, has it open
+        // (its fd inherited for that moment, as in `dead_arrivals_logs_and_old_markers_go`).
         let gc = File::open(host.run.join(".gc.lock")).unwrap();
-        flock(&gc, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+        let free = (0..200).any(|_| {
+            let free = flock(&gc, libc::LOCK_EX | libc::LOCK_NB).is_ok();
+            if !free {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            free
+        });
+        assert!(free, "the sweep let go of its lock");
         std::fs::remove_dir_all(d).unwrap();
     }
 

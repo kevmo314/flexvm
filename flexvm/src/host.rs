@@ -1678,12 +1678,30 @@ impl Host {
     /// panic): withdrawn as its `finish` would have, here and at the peers, so
     /// a home host's loan ends and no peer keeps a route to this host.
     fn withdraw_dead(&self) -> Result<()> {
+        // Candidates first, without the host lock (records are replaced whole): a sweep takes it
+        // only when a holder is proven dead, and each is decided again under it.
+        let candidates: Vec<Ipv4Addr> = std::fs::read_dir(self.state.join("addrs"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| e.file_name().to_str()?.parse::<Ipv4Addr>().ok())
+            .filter(|&ip| load::<Addr>(&self.addr_path(ip)).ok().flatten().and_then(|a| a.holder_id).is_some_and(|id| id.liveness() == Liveness::Gone))
+            .collect();
+        if candidates.is_empty() {
+            return Ok(());
+        }
         let mut dead = Vec::new();
         let l = self.lock()?;
-        for e in std::fs::read_dir(self.state.join("addrs")).into_iter().flatten().flatten() {
-            let Some(ip) = e.file_name().to_str().and_then(|n| n.parse::<Ipv4Addr>().ok()) else { continue };
+        // An outcome owed for an address (`owe`) keeps its loan until `settle_owed` learns it;
+        // what cannot be read counts as owed, for every address.
+        let owed: HashSet<Ipv4Addr> = match self.owed_ids() {
+            Ok(ids) => ids.iter().filter_map(|(_, path)| load::<Owed>(path).ok().flatten().map(|o| o.ip)).collect(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashSet::new(),
+            Err(e) => bail!("reading outcomes owed: {e}; dead vms' addresses are withdrawn on a later sweep"),
+        };
+        for ip in candidates {
             let a = match self.addr(&l, ip) {
-                Ok(a) if self.died_holding(&a) => a,
+                Ok(a) if !owed.contains(&ip) && self.died_holding(&a) => a,
                 _ => continue,
             };
             let (name, gen) = (a.holder.as_deref().unwrap_or_default(), a.held);
@@ -2221,6 +2239,11 @@ mod tests {
         claim(ips[8], "old", None, 4, &|_| ());
         // An older loan of this address, superseded by the dead VM's generation: freed with it.
         claim(ips[9], "older-loan", Some(dead(999_999_938)), 6, &|a| a.lent = Some(5));
+        // A source killed while its outcome is owed (#357), even if not marked moving.
+        let ips: Vec<Ipv4Addr> = ips.into_iter().chain([ip("10.9.1.11")]).collect();
+        let owing = dead(999_999_939);
+        claim(ips[10], "owing", Some(owing.clone()), 4, &|_| ());
+        h.owe(3, &Owed { to: "t".into(), ip: ips[10], gen: 4, by: owing.clone() }).unwrap();
         let before: Vec<Addr> = ips.iter().map(|&i| h.addr(&l, i).unwrap()).collect();
         drop(l);
         h.withdraw_dead().unwrap();
@@ -2235,6 +2258,12 @@ mod tests {
                 _ => assert_eq!(a, before[k], "{k}: kept"),
             }
         }
+        // Settled, the owed record goes: then it is withdrawn.
+        std::fs::remove_file(h.owed_path(3)).unwrap();
+        drop(l);
+        h.withdraw_dead().unwrap();
+        let l = h.lock().unwrap();
+        assert!(h.addr(&l, ips[10]).unwrap().withdrawn);
         // Once the suspended VM is resumed and dies, its claim goes too.
         std::fs::write(h.suspended("suspended").join("STARTED"), "").unwrap();
         drop(l);
