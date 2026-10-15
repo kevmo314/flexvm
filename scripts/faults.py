@@ -1627,18 +1627,33 @@ def delayed_announce():
     kill(B, n)
 
 
+# Linux's (and its SCM_TIMESTAMPNS cmsg type), which Python's socket module leaves out.
+SO_TIMESTAMPNS = getattr(socket, "SO_TIMESTAMPNS", 35)
+
+
 def announce_arp_timer():
     """#311: a VM's second gratuitous ARP goes out about 200 ms after its first,
     on a timer of its own: a peer that holds up the announcement (B, with
     `route_stall`; `tell`'s retry would keep it about 5 s) does not delay it.
-    A's announce device is a dummy link, the ARPs captured on it."""
+    A's announce device is a dummy link, the ARPs captured on it.
+
+    #392: the capture socket is opened with protocol 0, which hooks nothing, and
+    starts hearing frames only once bound to the dummy link. Opened for
+    ETH_P_ALL, it queued every interface's frames until bound (loopback's 64 KiB
+    segments from a busy host's other tests among them), and a full buffer
+    dropped an ARP. Drops are counted, so a lost capture never reads as a lost ARP,
+    and the gap is between the kernel's timestamps, not between the reads (the
+    first ARP goes out before `run` returns, its read later)."""
     n, dev = "ft-arp-timer", f"garp{A.addr.rsplit(':', 1)[1]}"
     was = ok(cli_json(A, "config")).get("announce_dev") or ""
-    arps, cap = [], socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003))
+    arps, drops, cap = [], None, socket.socket(socket.AF_PACKET, socket.SOCK_RAW, 0)
     subprocess.run(["ip", "link", "del", dev], capture_output=True)
     subprocess.run(["ip", "link", "add", dev, "up", "type", "dummy"], check=True)
     try:
-        cap.bind((dev, 0))
+        # ETH_P_ALL (host order: Python swaps it): only an all-protocols hook sees frames sent.
+        cap.bind((dev, 0x0003))
+        # Stamped by the kernel as each frame went out: read late, a frame's time is still its own.
+        cap.setsockopt(socket.SOL_SOCKET, SO_TIMESTAMPNS, 1)
         cap.settimeout(0.2)
         code, out, err = cli(A, "config", "--announce-dev", dev)
         assert code == 0, err
@@ -1648,11 +1663,15 @@ def announce_arp_timer():
         end = time.time() + 10
         while len(arps) < 2 and time.time() < end:
             try:
-                f = cap.recv(64)
+                f, anc, _, _ = cap.recvmsg(64, socket.CMSG_SPACE(16))
             except socket.timeout:
                 continue
             if f[12:14] == b"\x08\x06" and f[38:42] == ip:
-                arps.append(time.monotonic())
+                sec, nsec = next(struct.unpack("qq", d[:16]) for lvl, t, d in anc
+                                 if (lvl, t) == (socket.SOL_SOCKET, SO_TIMESTAMPNS))
+                arps.append(sec + nsec / 1e9)
+        # PACKET_STATISTICS: (frames, drops) since the socket opened.
+        drops = struct.unpack("II", cap.getsockopt(263, 6, 8))[1]
         check("announce arp timer: B holds up A's announcement", conns(B) >= 1, conns(B))
     finally:
         # Each step whatever the one before did (B gone, a CLI failing): the host as found.
@@ -1664,6 +1683,7 @@ def announce_arp_timer():
             finally:
                 cap.close()
                 subprocess.run(["ip", "link", "del", dev], capture_output=True)
+    check("announce arp timer: the capture dropped nothing", drops == 0, drops)
     check("announce arp timer: both ARPs went out", len(arps) == 2, arps)
     if len(arps) == 2:
         gap = arps[1] - arps[0]
