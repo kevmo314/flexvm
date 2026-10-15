@@ -304,25 +304,26 @@ fn start(statuses: &Statuses) -> io::Result<i32> {
 fn launch(app: &mut App, cmd: &mut Command, statuses: &Statuses) -> io::Result<(i32, thread::JoinHandle<()>)> {
     let (mut child, exited, token) = spawn_watched(cmd.stdout(Stdio::piped()).stderr(Stdio::piped()), statuses, true)?;
     let pid = child.id() as i32;
-    let Some(exited) = exited else { return Err(unwatched(statuses, pid, token)) };
+    let Some(exited) = exited else { return Err(unwatched(statuses, pid, token, io::Error::other("cannot open a pidfd to watch it"))) };
+    let watched = statuses.clone();
+    let supervisor = thread::Builder::new()
+        .spawn(move || {
+            crate::discard(crate::pump_until(child.stdout.take(), child.stderr.take(), Some(exited), DRAIN, |_, data| {
+                APP.lock().unwrap().push(data);
+                Duration::ZERO
+            }));
+            let code = wait_exit(&watched, token, None).expect("no deadline");
+            let mut app = APP.lock().unwrap();
+            app.state = State::Exited(code);
+            app.push(format!("flexvm-init: pid {pid} exited with status {code}\n").as_bytes());
+        })
+        .map_err(|e| unwatched(statuses, pid, token, e))?;
     app.state = State::Running(pid);
-    let statuses = statuses.clone();
-    let supervisor = thread::spawn(move || {
-        crate::discard(crate::pump_until(child.stdout.take(), child.stderr.take(), Some(exited), DRAIN, |_, data| {
-            APP.lock().unwrap().push(data);
-            Duration::ZERO
-        }));
-        let code = wait_exit(&statuses, token, None).expect("no deadline");
-        let mut app = APP.lock().unwrap();
-        app.state = State::Exited(code);
-        app.push(format!("flexvm-init: pid {pid} exited with status {code}\n").as_bytes());
-    });
     Ok((pid, supervisor))
 }
 
-/// Without a pidfd (only out of fds or memory: guest kernels have had them since 5.3) its exit could go
-/// unnoticed while descendants hold the pipes, so the app is refused: its session is killed and reaped.
-fn unwatched(statuses: &Statuses, pid: i32, token: u64) -> io::Error {
+/// Without a pidfd or supervisor thread the app cannot be watched: its session is killed and reaped.
+fn unwatched(statuses: &Statuses, pid: i32, token: u64, error: io::Error) -> io::Error {
     // By group even if the leader exited at once and was reaped: no new process gets the group's id while
     // a member lives, and once none does the pid comes back only after the pid space wraps, not since the spawn.
     unsafe { libc::kill(-pid, libc::SIGKILL) };
@@ -332,7 +333,7 @@ fn unwatched(statuses: &Statuses, pid: i32, token: u64) -> io::Error {
         map.running.retain(|_, t| *t != token);
         map.finished.remove(&token);
     }
-    io::Error::other("cannot open a pidfd to watch it")
+    error
 }
 
 /// Output from `offset` (clamped to the ring), then `<status> <next offset>`; with `follow`, until exit.
@@ -383,6 +384,30 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
         assert!(CheckGroup::from_dir(dir.to_str().unwrap().into()).err().unwrap().to_string().contains("cgroup.kill"));
         assert!(!dir.exists());
+    }
+
+    #[test]
+    fn supervisor_spawn_error_kills_and_reaps_the_child() {
+        let statuses = Statuses::default();
+        let mut cmd = Command::new("/bin/sleep");
+        cmd.arg("100").process_group(0);
+        let (child, _, token) = spawn_watched(&mut cmd, &statuses, false).unwrap();
+        let pid = child.id() as i32;
+        let watched = statuses.clone();
+        let reaper = thread::spawn(move || {
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+            assert!(libc::WIFSIGNALED(status));
+            assert_eq!(libc::WTERMSIG(status), libc::SIGKILL);
+            assert!(watched.0.lock().unwrap().reaped(pid, 128 + libc::SIGKILL));
+            watched.1.notify_all();
+        });
+        let error = unwatched(&statuses, pid, token, io::Error::from_raw_os_error(libc::EAGAIN));
+        assert_eq!(error.raw_os_error(), Some(libc::EAGAIN));
+        reaper.join().unwrap();
+        assert!(statuses.0.lock().unwrap().is_empty());
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
     }
 
     #[test]
@@ -441,7 +466,7 @@ mod tests {
             let pid = child.id() as i32;
             thread::sleep(Duration::from_millis(100));
             assert_eq!(statuses.0.lock().unwrap().finished.contains_key(&token), reaped);
-            assert!(unwatched(&statuses, pid, token).to_string().contains("pidfd"));
+            assert!(unwatched(&statuses, pid, token, io::Error::other("pidfd")).to_string().contains("pidfd"));
             let deadline = Instant::now() + Duration::from_secs(5);
             while unsafe { libc::kill(-pid, 0) } == 0 {
                 assert!(Instant::now() < deadline, "the app's group outlived it");
@@ -454,7 +479,7 @@ mod tests {
         // Reaping that outlasts the wait (a pid past pid_max, never reaped): the token is forgotten.
         let (pid, token) = (i32::MAX, crate::TOKENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
         statuses.0.lock().unwrap().running.insert(pid, token);
-        assert!(unwatched(&statuses, pid, token).to_string().contains("pidfd"));
+        assert!(unwatched(&statuses, pid, token, io::Error::other("pidfd")).to_string().contains("pidfd"));
         assert!(!statuses.0.lock().unwrap().reaped(pid, 137));
         assert!(statuses.0.lock().unwrap().is_empty());
         let app = APP.lock().unwrap();

@@ -24,6 +24,15 @@ pub fn valid_session_id(id: &str) -> bool {
 
 #[allow(dead_code)] // The host only writes frames in tests.
 pub fn write_frame(mut w: impl std::io::Write, kind: u8, payload: &[u8]) -> std::io::Result<()> {
-    w.write_all(&[&[kind][..], &(payload.len() as u32).to_le_bytes()].concat())?;
-    w.write_all(payload)
+    w.write_all(&frame(kind, &[payload]))
+}
+
+/// Builds a frame directly from its payload parts, without an intermediate payload buffer.
+pub fn frame(kind: u8, parts: &[&[u8]]) -> Vec<u8> {
+    let len = parts.iter().map(|p| p.len()).sum::<usize>();
+    let mut frame = Vec::with_capacity(5 + len);
+    frame.push(kind);
+    frame.extend_from_slice(&(len as u32).to_le_bytes());
+    parts.iter().for_each(|p| frame.extend_from_slice(p));
+    frame
 }

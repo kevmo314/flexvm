@@ -48,7 +48,7 @@ p.add_argument("--image-cache", help="keep the pulled image here, and build from
 # 1.5 GB guests outgrow the CI template, and the host moves them), evict_grower (it steers by the
 # machine's MemAvailable, which lanes running at once move) and the ones that restart the
 # listeners (target_killed, suspend_resume, unit_restart).
-FAULTS = ("basic route route_abort lost_ack unknown refused pages_blip pages_dead_restore prepared_retry resume_kill exec_race guest_calls exec_background "
+FAULTS = ("basic route route_abort lost_ack unknown refused pages_blip pages_dead_restore prepared_retry resume_kill exec_race guest_calls exec_background exec_pause_grace "
           "checkpoint_restore checkpoint_fork checkpoint_corrupt held_restore_frozen cow_exact cow_rescue_fail cow_collapsed unplug_collapsed cow_abort ckpt_incremental ckpt_hot "
           "ckpt_failed_stop ckpt_rearm prepare_fail fc_prepare slow_preload bad_preload pull_enomem ckpt_packet_hold "
           "abort_superseded gen_zero signals suspend_gen standby restore_ip_peer late_withdrawal killed_migrated "

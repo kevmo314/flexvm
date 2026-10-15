@@ -22,8 +22,8 @@ use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::proto::{valid_session_id, FRAME_EXIT, FRAME_LOST, FRAME_MSG, FRAME_STDERR, FRAME_STDOUT, MAX_BODY};
-use crate::{fail, kill_running, msg, spawn_watched, wait_exit, write_frame, Statuses};
+use crate::proto::{frame, valid_session_id, FRAME_EXIT, FRAME_LOST, FRAME_MSG, FRAME_STDERR, FRAME_STDOUT, MAX_BODY};
+use crate::{fail, kill_running, msg, spawn_watched, wait_exit, Statuses};
 
 const CAPACITY: usize = 4 * 1024 * 1024;
 const MAX_CHUNKS: usize = 4096;
@@ -261,7 +261,6 @@ pub(crate) struct Output {
     attachments: u64,
     /// The attachment's cursor: everything before it has been sent.
     sent: u64,
-    detached: Option<Instant>,
     /// When it was detached, on the awake clock.
     gone: Option<Duration>,
     reservation: Reservation,
@@ -279,7 +278,7 @@ impl Output {
     /// Whether output must wait for the (just) attached client; half the ring is slack for bytes in flight.
     fn must_wait(&self) -> bool {
         let unsent = self.end.saturating_sub(self.sent) >= self.capacity() as u64 / 2 || self.chunks_from(self.sent) >= MAX_CHUNKS / 2;
-        unsent && (self.attached.is_some() || self.detached.is_some_and(|t| t.elapsed() < GRACE))
+        unsent && (self.attached.is_some() || self.gone.is_some_and(|t| awake().saturating_sub(t) < GRACE))
     }
 
     /// Appends, then drops the oldest to fit `capacity` and `MAX_CHUNKS`. Same-kind output joins the
@@ -362,7 +361,7 @@ pub fn handle(mut w: impl Write, body: &[u8], conn: Option<File>, line: &str, se
             // A replaced attachment leaves the session to its successor.
             if ring.attached.as_ref().is_some_and(|a| a.id == me) {
                 ring.attached = None;
-                (ring.detached, ring.gone) = (Some(Instant::now()), Some(awake()));
+                ring.gone = Some(awake());
             }
             drop(ring);
             output.1.notify_all();
@@ -485,7 +484,7 @@ fn deliver(output: &Session, kind: u8, data: &[u8]) -> Duration {
 
 fn drain(w: &mut impl Write, output: &Session, mut offset: u64, me: u64) -> io::Result<()> {
     loop {
-        let (kind, data) = {
+        let data = {
             let ring = output.0.lock().unwrap();
             if ring.attached.as_ref().is_none_or(|a| a.id != me) {
                 // Replaced; the newer attachment owns the cursor now.
@@ -497,23 +496,23 @@ fn drain(w: &mut impl Write, output: &Session, mut offset: u64, me: u64) -> io::
                 return fail(w, e);
             }
             if offset < ring.start {
-                (FRAME_LOST, ring.start.to_le_bytes().to_vec())
+                frame(FRAME_LOST, &[&ring.start.to_le_bytes()])
             } else if let Some((kind, data)) = ring.read_chunk(offset) {
-                (kind, [&offset.to_le_bytes()[..], data].concat())
+                frame(kind, &[&offset.to_le_bytes(), data])
             } else if let Some(code) = ring.exit {
-                (FRAME_EXIT, [offset.to_le_bytes().as_slice(), &code.to_le_bytes()].concat())
+                frame(FRAME_EXIT, &[&offset.to_le_bytes(), &code.to_le_bytes()])
             } else {
                 let timeout = output.1.wait_timeout(ring, Duration::from_secs(1)).unwrap().1;
                 if !timeout.timed_out() {
                     continue;
                 }
-                (FRAME_MSG, b"waiting".to_vec())
+                frame(FRAME_MSG, &[b"waiting"])
             }
         };
-        write_frame(&mut *w, kind, &data)?;
-        match kind {
+        w.write_all(&data)?;
+        match data[0] {
             FRAME_STDOUT | FRAME_STDERR => {
-                offset += (data.len() - 8) as u64;
+                offset += (data.len() - 5 - 8) as u64;
                 let mut ring = output.0.lock().unwrap();
                 if ring.attached.as_ref().is_some_and(|a| a.id == me) {
                     ring.sent = offset.clamp(ring.start, ring.end);
@@ -540,7 +539,7 @@ mod tests {
 
     /// `gone`: when its client left, on the awake clock.
     fn finished(table: &mut Table, id: &str, gone: Option<Duration>) -> Session {
-        live(table, id, Output { exit: Some(0), detached: gone.map(|_| Instant::now()), gone, ..Default::default() })
+        live(table, id, Output { exit: Some(0), gone, ..Default::default() })
     }
 
     fn attached(ring: Output) -> Session {
@@ -666,6 +665,31 @@ mod tests {
     }
 
     #[test]
+    fn output_grace_uses_the_awake_clock() {
+        // Isolated so advancing the clock cannot expire other tests' sessions.
+        const CHILD: &str = "FLEXVM_GRACE_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let name = "session::tests::output_grace_uses_the_awake_clock";
+            assert!(Command::new(std::env::current_exe().unwrap()).args(["--exact", name]).env(CHILD, "1").status().unwrap().success());
+            return;
+        }
+        let set_clock = |at: Duration| AWAKE_MS.store(at.as_millis() as u64, Ordering::Relaxed);
+        let gone = GRACE * 2;
+        set_clock(gone);
+        let mut ring = Output { end: BASE as u64 / 2, gone: Some(gone), ..Default::default() };
+        assert!(ring.must_wait());
+        // A 20-minute pause adds only one short tick, leaving the client its grace.
+        set_clock(gone + tick(Duration::from_secs(1200)));
+        assert!(ring.must_wait());
+        set_clock(gone + GRACE - Duration::from_millis(1));
+        assert!(ring.must_wait());
+        set_clock(gone + GRACE);
+        assert!(!ring.must_wait());
+        ring.attached = Some(Attachment { id: 1, conn: None });
+        assert!(ring.must_wait());
+    }
+
+    #[test]
     fn abandoned_running_sessions_are_killed_and_reclaimed() {
         let (sessions, statuses) = (Sessions::default(), statuses());
         let after = Duration::from_millis(300);
@@ -719,7 +743,7 @@ mod tests {
         drop(children);
         statuses.1.notify_all();
         // The client gave up: output goes on.
-        output.0.lock().unwrap().detached = Some(Instant::now() - GRACE);
+        output.0.lock().unwrap().gone = None;
         output.1.notify_all();
         let ring = output.0.lock().unwrap();
         let (ring, timeout) = output.1.wait_timeout_while(ring, DRAIN * 5, |r| r.exit.is_none()).unwrap();
@@ -1076,15 +1100,17 @@ mod tests {
             let _ = h.join().unwrap();
         }
         let ring = output.0.lock().unwrap();
-        assert!(ring.attached.is_none() && ring.detached.is_some());
+        assert!(ring.attached.is_none() && ring.gone.is_some());
     }
 
     #[test]
-    fn writer_does_not_hold_ring_lock() {
-        struct Writer(Session);
+    fn writer_sends_whole_frames_without_holding_ring_lock() {
+        struct Writer(Session, usize);
         impl Write for Writer {
             fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
                 assert!(self.0 .0.try_lock().is_ok());
+                assert_eq!(bytes.len(), 5 + u32::from_le_bytes(bytes[1..5].try_into().unwrap()) as usize);
+                self.1 += 1;
                 Ok(bytes.len())
             }
             fn flush(&mut self) -> io::Result<()> {
@@ -1094,7 +1120,9 @@ mod tests {
         let mut ring = Output { exit: Some(0), ..Default::default() };
         ring.push(FRAME_STDOUT, b"hello", CAPACITY);
         let output = attached(ring);
-        drain(&mut Writer(output.clone()), &output, 0, 1).unwrap();
+        let mut writer = Writer(output.clone(), 0);
+        drain(&mut writer, &output, 0, 1).unwrap();
+        assert_eq!(writer.1, 2);
     }
 
     #[test]
