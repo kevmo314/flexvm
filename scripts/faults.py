@@ -421,7 +421,8 @@ def unknown():
     r = migrate(A, n, B)
     check("unknown: migrate reports unknown outcome", not r["ok"] and "paused" in r["error"], r)
     w = where(n)
-    check("unknown: source never resumed", w.get(A) in (None, "source") and w.get(B) == "running", w)
+    # Paused, waiting to learn the outcome: reconciling (#358), or gone once it has.
+    check("unknown: source never resumed", w.get(A) in (None, "reconciling") and w.get(B) == "running", w)
     st = wait_released(B, n)
     check("unknown: reconciled and released", st["released"] is True and where(n) == {B: "running"}, (st, where(n)))
     check("unknown: md5 intact", md5(B, n) == m)
@@ -646,7 +647,7 @@ def target_killed():
     stall.join()
     # The status fault still keeps the source from hearing anything.
     w = where(n)
-    check("target killed: the source still holds its paused copy", not r["ok"] and w.get(A) == "source", (r, w or "gone everywhere"))
+    check("target killed: the source still holds its paused copy", not r["ok"] and w.get(A) == "reconciling", (r, w or "gone everywhere"))
     migs = os.path.join(B.state, "migs")
     newest = max(os.listdir(migs), key=lambda m: os.path.getmtime(os.path.join(migs, m)))
     # Asked at once, before the Firecracker can have died of its own accord.
