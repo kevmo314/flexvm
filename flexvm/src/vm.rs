@@ -110,6 +110,8 @@ pub struct Vm {
     dead: AtomicBool,
     /// A pause or resume whose outcome Firecracker could not tell: `state` may be wrong, so the next `switch` asks.
     switch_unsure: AtomicBool,
+    /// Its tap could not be raised or routed when it resumed: the next `unpause` does that first.
+    link_down: AtomicBool,
 }
 
 impl Vm {
@@ -436,8 +438,7 @@ impl Vm {
     fn resume_vcpus(&self, attached: bool) -> Result<State> {
         // A successful held-packet release already raised the link and attached it.
         if !attached {
-            crate::net::set_link_up(&self.tap, true)?;
-            crate::net::attach(self.ip, &self.tap)?;
+            self.link_up()?;
         }
         // Kept paused, its frames stay queued on the tap (`tap_stuck`) until it runs again.
         let resumed = match self.was_paused.swap(false, Ordering::SeqCst) {
@@ -483,9 +484,28 @@ impl Vm {
         if *self.state.lock().unwrap() != State::Checkpointing {
             bail!("vm {} is not being checkpointed", self.name);
         }
-        let res: Result<State> = self.resume_vcpus(attached).map_err(|e| format!("resuming vm {} after its checkpoint failed: {e}", self.name).into());
-        *self.state.lock().unwrap() = *res.as_ref().unwrap_or(&State::Failed);
+        let res = self.resume_vcpus(attached);
+        let now = match &res {
+            Ok(s) => *s,
+            Err(_) => self.after_failed_resume(),
+        };
+        self.record(now);
+        res.map_err(|e| format!("resuming vm {} after its checkpoint failed: {e}; it is {}", self.name, now.name()).into())
+    }
+
+    /// Raises its tap and routes its address there; failing, it is left for the next `unpause`.
+    fn link_up(&self) -> Result<()> {
+        let res = crate::net::set_link_up(&self.tap, true).and_then(|()| crate::net::attach(self.ip, &self.tap));
+        self.link_down.store(res.is_err(), Ordering::SeqCst);
         res
+    }
+
+    /// After a failed `resume_vcpus`: Running or Paused, as Firecracker has it, or Paused but unsure
+    /// (`switch_unsure`: the next pause or resume asks again) if it cannot say. Never Failed: it can still be resumed.
+    fn after_failed_resume(&self) -> State {
+        let now = self.fc_state();
+        self.switch_unsure.store(now.is_none(), Ordering::SeqCst);
+        now.unwrap_or(State::Paused)
     }
 
     pub fn pause(&self) -> Result<()> {
@@ -496,6 +516,9 @@ impl Vm {
     pub fn unpause(&self) -> Result<()> {
         if self.pager.pulling_from_peer() && !self.pager.wait_pulled(Some(PULL_WAIT)) {
             bail!("vm {} is still pulling its memory from its previous host; resume it once that is done", self.name);
+        }
+        if self.link_down.load(Ordering::SeqCst) {
+            self.link_up().map_err(|e| format!("vm {}: raising its network: {e}", self.name))?;
         }
         self.switch(State::Paused, State::Running)
     }
@@ -907,6 +930,7 @@ impl Prepared {
             cancel_checkpoint: AtomicUsize::new(0),
             dead: AtomicBool::new(false),
             switch_unsure: AtomicBool::new(false),
+            link_down: AtomicBool::new(false),
         })
     }
 

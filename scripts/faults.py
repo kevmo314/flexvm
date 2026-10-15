@@ -210,7 +210,7 @@ FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_be
           "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "resume_kill",
           "prepare_fail", "short_incoming", "slow_preload", "bad_preload", "bad_app_log", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
           "started_fsync", "started_unmark", "start_stall", "incoming_stall", "claim_stall", "standby_lock_stall", "standby_lock_hang", "handoff_stall", "ckpt_wp_race", "ckpt_rescue_fail",
-          "fetch_tail_enomem", "fetch_enomem_stuck", "pull_enomem", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo", "release_stall", "release_late", "no_plug", "pause_lost", "tap_backlog", "tap_backlog_stuck", "pause_unknown", "no_collapse", "collapse_slow", "pages_slow", "unlend_fail", "route_stall")
+          "fetch_tail_enomem", "fetch_enomem_stuck", "pull_enomem", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo", "release_stall", "release_late", "no_plug", "pause_lost", "tap_backlog", "tap_backlog_stuck", "pause_unknown", "restore_ping_slow", "readdress_fail", "no_collapse", "collapse_slow", "pages_slow", "unlend_fail", "route_stall")
 
 
 def disarm():
@@ -2355,6 +2355,74 @@ def resume_failures():
     r = resume_suspended(A, n)
     check("resume fails after running: no second resume", not r["ok"], r)
     cleanup(n)
+
+
+def resume_slow_guest():
+    """A resumed suspended VM whose guest agent answers its first ping late
+    (past the 2 s deadline) runs on, the delay reported; its checkpoint stays
+    until all its memory is in, and is deleted then."""
+    n = "ft-resume-slow"
+    m = setup(n)
+    suspend(A, n)
+    d = os.path.join(A.state, "suspended", n)
+    fault(A, "restore_ping_slow", 60000)
+    r = resume_suspended(A, n)
+    fault(A, "restore_ping_slow", 0)
+    check("slow guest: resume succeeds", r.get("ok"), r)
+    res = r.get("result", {})
+    check("slow guest: the late agent is reported", res.get("guest_error") and res.get("ready_ms") is None, res)
+    check("slow guest: still running", vms(A).get(n, {}).get("state") == "running", vms(A).get(n))
+    check("slow guest: md5 intact", md5(A, n, tries=5) == m)
+    check("slow guest: the late answer is logged", wait_for(lambda: "guest agent answered" in log(A, n), 30), log(A, n)[-2000:])
+    check("slow guest: paged in", wait_for(lambda: vms(A)[n].get("pages_mib", {}).get("remote") == 0, 60), vms(A)[n])
+    check("slow guest: checkpoint deleted once all is in", wait_for(lambda: not os.path.exists(d), 30), d)
+    check("slow guest: deleted only once completely paged in", "paged in from" in log(A, n) and "(complete: true" in log(A, n), log(A, n)[-2000:])
+    check("slow guest: still running after", vms(A).get(n, {}).get("state") == "running", vms(A).get(n))
+    cleanup(n)
+
+
+def resume_readdress_fail():
+    """A restore at a new address whose readdress fails runs on with the
+    address pending (no checkpoint meanwhile); `flexvm resume` retries it,
+    held (--paused) or not."""
+    n = "ft-readdr"
+    m = setup(n, mib=20)
+    old_ip = vms(A)[n]["ip"]
+    path = ckpt_path("readdr")
+    ok(checkpoint(A, n, path, stop=True))
+
+    def has(ip):
+        code, out = sh(B, n, "ip -4 -o addr show eth0")
+        return code == 0 and ip in out and old_ip not in out
+
+    for paused in (True, False):
+        what = "held" if paused else "running"
+        clear_log(B, n)
+        if paused:
+            r = ok(restore(B, path, paused=True, ip="auto"))
+            fault(B, "readdress_fail", 60000)
+            code, out, err = cli(B, "resume", n)
+            check(f"readdress fails ({what}): resume sent", code == 0, err)
+            check(f"readdress fails ({what}): logged", wait_for(lambda: "setting its address" in log(B, n), 30), log(B, n)[-2000:])
+        else:
+            fault(B, "readdress_fail", 60000)
+            r = ok(restore(B, path, ip="auto"))
+            check(f"readdress fails ({what}): reported", "setting its address" in (r.get("address_error") or ""), r)
+        fault(B, "readdress_fail", 0)
+        check(f"readdress fails ({what}): running", vms(B).get(n, {}).get("state") == "running", vms(B).get(n))
+        check(f"readdress fails ({what}): guest lacks the new address", not has(r["ip"]))
+        refused = checkpoint(B, n, path + "-x")
+        check(f"readdress fails ({what}): no checkpoint while pending", not refused["ok"] and "address" in refused.get("error", ""), refused)
+        rm_ckpt(path + "-x")
+        code, out, err = cli(B, "resume", n)
+        check(f"readdress fails ({what}): second resume sent", code == 0, err)
+        check(f"readdress fails ({what}): second resume sets it", wait_for(lambda: has(r["ip"]), 30), sh(B, n, "ip -4 -o addr show eth0"))
+        check(f"readdress fails ({what}): md5 intact", md5(B, n) == m)
+        r2 = checkpoint(B, n, path + "-x")
+        check(f"readdress fails ({what}): checkpoints again", r2["ok"], r2)
+        rm_ckpt(path + "-x")
+        kill(B, n)
+    rm_ckpt(path)
 
 
 def suspend_resume():
@@ -6118,7 +6186,7 @@ SCENARIOS = dict(
     checkpoint_restore=checkpoint_restore, checkpoint_fork=checkpoint_fork, checkpoint_corrupt=checkpoint_corrupt,
     checkpoint_crash=checkpoint_crash, pause_resume=pause_resume, signals=signals, pause_lost=pause_lost, suspend_resume=suspend_resume,
     suspend_gen=suspend_gen, checkpoint_hotplug=checkpoint_hotplug, checkpoint_untrusted_dir=checkpoint_untrusted_dir,
-    resume_failures=resume_failures, held_restore_frozen=held_restore_frozen, cow_exact=cow_exact, cow_rescue_fail=cow_rescue_fail, cow_collapsed=skippable(cow_collapsed), unplug_collapsed=no_evict(skippable(unplug_collapsed)), cow_abort=cow_abort,
+    resume_failures=resume_failures, resume_slow_guest=resume_slow_guest, resume_readdress_fail=resume_readdress_fail, held_restore_frozen=held_restore_frozen, cow_exact=cow_exact, cow_rescue_fail=cow_rescue_fail, cow_collapsed=skippable(cow_collapsed), unplug_collapsed=no_evict(skippable(unplug_collapsed)), cow_abort=cow_abort,
     cow_crash=cow_crash, cow_reports_held=cow_reports_held, ckpt_incremental=ckpt_incremental, ckpt_hot=ckpt_hot,
     ckpt_failed_stop=ckpt_failed_stop, ckpt_rearm=ckpt_rearm, ckpt_dir_moved=ckpt_dir_moved,
     prepare_disconnect=prepare_disconnect, prepare_trickle=prepare_trickle, prepare_fail=prepare_fail,

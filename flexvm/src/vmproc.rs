@@ -786,7 +786,12 @@ impl Proc {
                 self.publish();
                 Ok(())
             }),
-            libc::SIGCONT if self.leaving.load(Ordering::SeqCst) || !self.paused_by_request.load(Ordering::SeqCst) => Ok(()),
+            // Also through while a new address is pending (a resume that failed to set it): this one retries it.
+            libc::SIGCONT
+                if self.leaving.load(Ordering::SeqCst) || !(self.paused_by_request.load(Ordering::SeqCst) || vm.pending_net.lock().unwrap().is_some()) =>
+            {
+                Ok(())
+            }
             libc::SIGCONT => self.resume().map(drop),
             libc::SIGTERM if matches!(vm.state(), State::Source(_)) => {
                 crate::log!("vm {}: migrating away; it ends once the target has its memory", vm.name);
