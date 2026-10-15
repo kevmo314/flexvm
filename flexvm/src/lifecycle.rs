@@ -530,6 +530,14 @@ impl Proc {
                 bail!("vm {} is still pulling its memory; try again once it has", vm.name);
             }
         }
+        // Let the arrival inject its queue before a new hold replaces it or the tap pauses.
+        while self.held_in.lock().unwrap().is_some() {
+            cancelled()?;
+            if Instant::now() >= drained {
+                bail!("vm {} is still receiving its held packets; try again once it has", vm.name);
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
         t.mark("drain");
         // Paused vCPUs do not stop virtio-mem discarding memory after the save.
         vm.settle_hotplug(Instant::now() + SETTLE_WAIT)?;

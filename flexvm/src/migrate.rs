@@ -120,10 +120,13 @@ impl Proc {
         self.drop_held_in();
         self.set_leaving(true);
         if let Err(e) = vm.leave(State::Source(mig)) {
-            if self.lent_here.swap(false, Ordering::SeqCst) {
-                let _ = self.host.unlend(&self.host.lock()?, vm.ip, gen);
-            }
             self.set_leaving(false);
+            if self.lent_here.load(Ordering::SeqCst) {
+                match self.host.lock().and_then(|l| self.host.unlend(&l, vm.ip, gen)) {
+                    Ok(()) => self.lent_here.store(false, Ordering::SeqCst),
+                    Err(r) => eprintln!("vm {}: undoing its loan after a refused migration: {r}", vm.name),
+                }
+            }
             return Err(e);
         }
         self.publish();
@@ -479,6 +482,8 @@ impl Proc {
                 return Err(e);
             }
         };
+        let revoked = Arc::new(Mutex::new(false));
+        *self.held_in.lock().unwrap() = Some(revoked.clone());
         self.serve_control();
         if fault("lost_ack") {
             let _ = w.shutdown(std::net::Shutdown::Both);
@@ -494,8 +499,6 @@ impl Proc {
         if vm.state() == State::Running {
             self.sync_clock_later();
         }
-        let revoked = Arc::new(Mutex::new(false));
-        *self.held_in.lock().unwrap() = Some(revoked.clone());
         let p = self.clone();
         let shared = shares_routes(req["source"].as_str().unwrap_or(""));
         let holder = self.holder().cloned().filter(|_| shared);
