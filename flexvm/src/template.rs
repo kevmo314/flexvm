@@ -378,7 +378,10 @@ impl Template {
         let cache = &mut self.verified.lock().unwrap();
         // Through the handle: `dir` may name another template by now.
         if self.meta.verify(paths, &self.fixed, cache)? {
-            // Into what is there now, so stamps other processes wrote back are kept.
+            // Into what is there now, so stamps other processes wrote back are kept; locked, so
+            // none is lost to a concurrent write-back.
+            let dir = File::open(&self.fixed)?;
+            crate::host::flock(&dir, libc::LOCK_EX)?;
             let mut meta = Meta::read(&self.fixed).ok().filter(|m| m.id == self.meta.id).unwrap_or_else(|| self.meta.clone());
             for (name, stamp) in cache.iter() {
                 if let Some(c) = meta.components.get_mut(name).filter(|c| c.hash == self.meta.components[name].hash) {
@@ -601,7 +604,22 @@ fn templates_lock(paths: &Paths, how: i32) -> Result<File> {
     Ok(f)
 }
 
-/// A build's `.{name}.new-{pid}`, flocked through `lock` inside it while the build runs, and
+/// 16 hex digits, so concurrent builds on hosts sharing a templates directory never pick the
+/// same staging directory or link.
+fn nonce() -> Result<String> {
+    let mut random = [0u8; 8];
+    std::io::Read::read_exact(&mut File::open("/dev/urandom")?, &mut random)?;
+    Ok(random.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Whether `file` is `.{name}.{kind}-{nonce}`, as `Staging::new` and `publish` name theirs.
+fn leftover(file: &str, kind: &str) -> bool {
+    file.strip_prefix('.')
+        .and_then(|f| f.rsplit_once(&format!(".{kind}-")))
+        .is_some_and(|(name, n)| check_name(name).is_ok() && n.len() == 16 && n.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// A build's `.{name}.new-{nonce}`, flocked through `lock` inside it while the build runs, and
 /// removed when dropped. A killed build's is removed by the next build (`sweep`).
 struct Staging {
     dir: PathBuf,
@@ -613,8 +631,7 @@ impl Staging {
         std::fs::create_dir_all(&paths.templates)?;
         sweep(paths)?;
         let _l = templates_lock(paths, libc::LOCK_SH)?;
-        let dir = paths.templates.join(format!(".{name}.new-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = paths.templates.join(format!(".{name}.new-{}", nonce()?));
         std::fs::create_dir(&dir)?;
         let lock = File::create(dir.join("lock"))?;
         crate::host::flock(&lock, libc::LOCK_EX)?;
@@ -634,13 +651,10 @@ fn sweep(paths: &Paths) -> Result<()> {
     let _l = templates_lock(paths, libc::LOCK_EX)?;
     for entry in std::fs::read_dir(&paths.templates)? {
         let entry = entry?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !name.starts_with('.') {
-            continue;
-        }
-        if name.contains(".link-") {
+        let (name, kind) = (entry.file_name().to_string_lossy().into_owned(), entry.file_type()?);
+        if kind.is_symlink() && leftover(&name, "link") {
             let _ = std::fs::remove_file(entry.path());
-        } else if name.contains(".new-") && entry.file_type()?.is_dir() {
+        } else if kind.is_dir() && leftover(&name, "new") {
             let live = File::open(entry.path().join("lock")).is_ok_and(|f| crate::host::flock(&f, libc::LOCK_EX | libc::LOCK_NB).is_err());
             if !live {
                 crate::log!("template: removing {}, left by a build that did not finish", entry.path().display());
@@ -692,8 +706,7 @@ fn publish(paths: &Paths, name: &str, staged: &Path) -> Result<()> {
         r => r?,
     }
     let live = paths.templates.join(name);
-    let tmp = paths.templates.join(format!(".{name}.link-{}", std::process::id()));
-    let _ = std::fs::remove_file(&tmp);
+    let tmp = paths.templates.join(format!(".{name}.link-{}", nonce()?));
     std::os::unix::fs::symlink(Path::new(GENERATIONS).join(&meta.id), &tmp)?;
     crate::util::sync_dir(&gens)?;
     std::fs::rename(&tmp, &live)?;
@@ -1126,29 +1139,39 @@ mod tests {
             std::fs::write(dir.join("mem"), b"gigabytes").unwrap();
             lock.then(|| File::create(dir.join("lock")).unwrap())
         };
-        // A killed build's: its lock free.
-        drop(staging(".t.new-1", true));
-        // A running build's.
-        let running = staging(".t.new-2", true).unwrap();
-        crate::host::flock(&running, libc::LOCK_EX).unwrap();
-        // From before staging locks.
-        staging(".u.new-3", false);
-        std::os::unix::fs::symlink(".gen/x", f.dir.join(".t.link-4")).unwrap();
-        let mine = Staging::new(&f.paths, "t").unwrap();
         let exists = |name: &str| f.dir.join(name).exists() || f.dir.join(name).is_symlink();
-        assert!(!exists(".t.new-1") && !exists(".u.new-3") && !exists(".t.link-4"));
-        assert!(exists(".t.new-2") && mine.dir.join("lock").exists());
-        // A concurrent build leaves both running ones alone.
-        let other = Staging { dir: f.dir.join(".v.new-5"), _lock: File::open(f.dir.join("kernel")).unwrap() };
-        sweep(&f.paths).unwrap();
-        assert!(exists(".t.new-2") && mine.dir.exists());
-        drop(other);
+        // A killed build's: its lock free; one killed before it made its lock; one of a
+        // template whose name has `.link-` in it.
+        drop(staging(".t.new-0000000000000001", true));
+        staging(".u.new-0000000000000003", false);
+        drop(staging(".foo.link-bar.new-0000000000000004", true));
+        // A running build's, perhaps on another host sharing the directory.
+        let running = staging(".t.new-0000000000000002", true).unwrap();
+        crate::host::flock(&running, libc::LOCK_EX).unwrap();
+        // A killed publish's link.
+        std::os::unix::fs::symlink(".gen/x", f.dir.join(".t.link-0000000000000005")).unwrap();
+        // Not named as flexvm names its own: left alone.
+        let foreign = [".t.new-6", ".t.new-000000000000000g", "..new-0000000000000007", ".t.link-0000000000000008"];
+        for name in &foreign[..3] {
+            staging(name, true);
+        }
+        std::fs::create_dir(f.dir.join(foreign[3])).unwrap();
+        let mine = Staging::new(&f.paths, "t").unwrap();
+        for gone in [".t.new-0000000000000001", ".u.new-0000000000000003", ".foo.link-bar.new-0000000000000004", ".t.link-0000000000000005"] {
+            assert!(!exists(gone), "{gone}");
+        }
+        assert!(exists(".t.new-0000000000000002") && mine.dir.join("lock").exists());
+        assert!(foreign.iter().all(|name| exists(name)));
+        // A concurrent build of the same name gets a directory of its own, and each leaves
+        // the other's alone.
+        let second = Staging::new(&f.paths, "t").unwrap();
+        assert!(second.dir != mine.dir && second.dir.exists() && mine.dir.exists());
         let dir = mine.dir.clone();
         drop(mine);
-        assert!(!dir.exists());
+        assert!(!dir.exists() && second.dir.exists());
         drop(running);
         sweep(&f.paths).unwrap();
-        assert!(!exists(".t.new-2"));
+        assert!(!exists(".t.new-0000000000000002") && second.dir.exists());
         // Templates and generations are never touched.
         assert!(exists("kernel") && exists("mem"));
     }
