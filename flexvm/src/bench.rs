@@ -415,6 +415,8 @@ mod tests {
             .args(["--exact", "bench::tests::sha_is_resolved_before_opening_hosts_or_running_iterations", "--nocapture"])
             .current_dir(&dir)
             .env(CHILD, "1")
+            // Even when the temporary directory is inside a checkout.
+            .env("GIT_CEILING_DIRECTORIES", dir.parent().unwrap())
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
             .output()
