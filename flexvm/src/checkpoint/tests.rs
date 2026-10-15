@@ -1,6 +1,6 @@
 use super::{
     chain::{flatten, overlay, read_at, Link},
-    format::{parse_pagemap, sum, sums_sum, Run, DATA, MAGIC, MAX_VMSTATE, TEMPLATE, ZERO},
+    format::{parse_pagemap, sum, Run, DATA, MAGIC, MAX_VMSTATE, TEMPLATE, ZERO},
     staging::STAGING_PREFIX,
     write::{aligned, as_bytes, classify, write_pages, PagesFile},
     *,
@@ -43,12 +43,27 @@ fn link(dir: &Path, parent: Option<Parent>, edit: impl FnOnce(&mut Manifest)) ->
     for (name, bytes) in [("vmstate", &b"s"[..]), ("pagemap", &map), ("pages", &[])] {
         fs::write(dir.join(name), bytes).unwrap();
     }
-    let files = json!({"vmstate": {"len": 1, "hash": sum(b"s")}, "pagemap": {"len": map.len(), "hash": sum(&map)}, "pages": {"len": 0, "hash": sums_sum(&[])}});
+    let files = json!({"vmstate": {"len": 1, "hash": sum(b"s")}, "pagemap": {"len": map.len(), "hash": sum(&map)}, "pages": {"len": 0}});
     let mut m = manifest(256, parent, files);
     edit(&mut m);
     let body = serde_json::to_vec(&m).unwrap();
     fs::write(dir.join("manifest.json"), [format!("{}\n", sum(&body)).as_bytes(), &body].concat()).unwrap();
     sum(&body)
+}
+
+#[test]
+fn manifest_covers_pagemap_without_a_pages_hash() {
+    let dir = tmp("map-integrity");
+    link(&dir, None, |_| {});
+    let ck = Checkpoint::open(&dir).unwrap();
+    let manifest = serde_json::to_value(&ck.manifest).unwrap();
+    assert!(manifest["files"]["pages"].get("hash").is_none());
+    assert_eq!(manifest["files"]["pagemap"]["hash"], sum(&fs::read(dir.join("pagemap")).unwrap()));
+    let mut map = fs::read(dir.join("pagemap")).unwrap();
+    *map.last_mut().unwrap() ^= 1;
+    fs::write(dir.join("pagemap"), map).unwrap();
+    assert!(Checkpoint::open(&dir).err().unwrap().to_string().contains("pagemap does not match its checksum"));
+    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]

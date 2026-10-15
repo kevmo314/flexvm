@@ -217,7 +217,7 @@ fn start_one(host: &Host, template: &str, log: &File) -> Result<Option<UnixStrea
     let grant = match host.grant(256, Some(by)) {
         Ok(Some(id)) => id,
         Ok(None) => return Ok(None),
-        Err(e) if e.to_string() == "the host lock is busy" => return Ok(None),
+        Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::WouldBlock) => return Ok(None),
         Err(e) => return Err(e),
     };
     // What a child left unlisted is gone (`wait_locked`), so relief may go on; then its

@@ -18,6 +18,7 @@ pub(super) const MAX_VMSTATE: u64 = 64 << 20;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileSum {
     pub len: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub hash: String,
 }
 
@@ -60,12 +61,6 @@ pub struct Parent {
 pub(super) fn sum(bytes: &[u8]) -> String {
     let mut h = Hash::new();
     h.update(bytes);
-    h.finish()
-}
-
-pub(super) fn sums_sum(sums: &[u32]) -> String {
-    let mut h = Hash::new();
-    sums.iter().for_each(|&c| h.word(c as u64));
     h.finish()
 }
 

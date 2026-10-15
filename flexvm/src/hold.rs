@@ -64,6 +64,7 @@ pub struct Holder {
     resend: Option<OwnedFd>,
 }
 
+#[derive(Clone, Copy)]
 struct Gone {
     at: Instant,
     /// The route moved on (a switched release), not dropped: stragglers are re-sent.
@@ -421,7 +422,7 @@ impl Holder {
                     None
                 }
                 None => {
-                    let out = (*ip, Gone { at: g.at, moved: g.moved, resent: g.resent, dropped: g.dropped, reported: None });
+                    let out = (*ip, *g);
                     (g.resent, g.dropped, g.reported) = (0, 0, Some(Instant::now()));
                     Some(out)
                 }
