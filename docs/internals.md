@@ -684,8 +684,9 @@ a second copy could repeat what it did.
   the downtime too: measured within ±2 ms. If a clock request fails it may
   still be on its way into the guest, so the next migration first waits for
   the agent to answer a ping (it serves requests in order) rather than let it
-  land, stale, after the snapshot. Agents that predate `START` get `NET` and
-  keep the stale clock.
+  land, stale, after the snapshot. An agent that answers `unknown request` to
+  `START`, `CLOCK` or `FORKS` is too old: the call fails saying so, and the
+  rootfs and its templates need rebuilding.
   KVM saves the realtime clock that `clock_realtime` needs only while the VM
   has a master clock, and drops that for good once the vCPUs' TSCs were
   restored more than a second apart: a migration target whose load waited
@@ -714,7 +715,7 @@ a second copy could repeat what it did.
 - Every guest's network setup is the same except for its address. The gateway
   is a fixed link-local address whose MAC is pinned in the guest, and every
   tap uses that MAC. So clones of one template need no per-VM changes beyond
-  `NET <ip>`, which the guest agent applies with one rtnetlink message.
+  the address in `START`, which the guest agent applies with one rtnetlink message.
 - Taps are created with each VM's Firecracker (ahead of time for standby VMs). The
   host route and a permanent neighbour entry are set with rtnetlink while the
   snapshot loads, so networking adds nothing to start time.

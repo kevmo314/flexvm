@@ -229,12 +229,35 @@ fn now() -> Result<String> {
     Ok(format!("{}.{:09}", now.as_secs(), now.subsec_nanos()))
 }
 
+/// The agent answered `unknown request` to part of the protocol flexvm requires.
+#[derive(Debug)]
+pub struct AgentTooOld(&'static str);
+
+impl std::fmt::Display for AgentTooOld {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "guest agent too old (no {}): rebuild the rootfs and its templates", self.0)
+    }
+}
+
+impl std::error::Error for AgentTooOld {}
+
+pub fn too_old(e: &Error) -> bool {
+    e.downcast_ref::<AgentTooOld>().is_some()
+}
+
+fn refused(verb: &'static str, m: &[u8]) -> Error {
+    if m.starts_with(b"unknown request") {
+        return AgentTooOld(verb).into();
+    }
+    format!("guest {}: {}", verb.to_lowercase(), String::from_utf8_lossy(m)).into()
+}
+
 /// Address, nameserver and wall clock; doubles as the readiness check.
 pub fn start(uds: &Path, ip: std::net::Ipv4Addr, dns: Option<&str>) -> Result<()> {
     let dns = dns.unwrap_or("");
     answered("START", Instant::now() + TIMEOUT, |by| match ask(uds, &format!("START {ip} {} {dns}", now()?), by)? {
         (FRAME_MSG, m) if m == b"ok" => Ok(()),
-        (_, m) => bail!("guest start: {}", String::from_utf8_lossy(&m)),
+        (_, m) => Err(refused("START", &m)),
     })
 }
 
@@ -242,7 +265,7 @@ pub fn start(uds: &Path, ip: std::net::Ipv4Addr, dns: Option<&str>) -> Result<()
 pub fn clock(uds: &Path, timeout: Duration) -> Result<f64> {
     answered("CLOCK", Instant::now() + timeout, |by| match ask(uds, &format!("CLOCK {}", now()?), by)? {
         (FRAME_MSG, m) if m.starts_with(b"ok ") => Ok(String::from_utf8_lossy(&m[3..]).trim().parse::<f64>()? / 1e6),
-        (_, m) => bail!("guest clock: {}", String::from_utf8_lossy(&m)),
+        (_, m) => Err(refused("CLOCK", &m)),
     })
 }
 
@@ -257,7 +280,7 @@ fn message(uds: &Path, line: &str, timeout: Duration) -> Result<String> {
 /// Times the guest reseeded its RNG for a new VMGenID.
 pub fn forks(uds: &Path) -> Result<usize> {
     let m = message(uds, "FORKS", TIMEOUT)?;
-    Ok(m.strip_prefix("ok ").ok_or_else(|| format!("guest forks: {m}"))?.trim().parse()?)
+    Ok(m.strip_prefix("ok ").ok_or_else(|| refused("FORKS", m.as_bytes()))?.trim().parse()?)
 }
 
 pub fn start_app(uds: &Path) -> Result<u32> {
@@ -394,13 +417,16 @@ mod tests {
         });
         let ip = "10.0.0.2".parse().unwrap();
         start(&path, ip, Some("1.1.1.1")).unwrap();
-        assert!(start(&path, ip, Some("1.1.1.1")).unwrap_err().to_string().contains("unknown request"));
+        let e = start(&path, ip, Some("1.1.1.1")).unwrap_err();
+        assert!(too_old(&e) && e.to_string().contains("too old (no START)"), "{e}");
         assert_eq!(clock(&path, TIMEOUT).unwrap(), -2.5);
-        for _ in 0..3 {
-            assert!(clock(&path, TIMEOUT).is_err());
+        assert!(too_old(&clock(&path, TIMEOUT).unwrap_err()));
+        for _ in 0..2 {
+            let e = clock(&path, TIMEOUT).unwrap_err();
+            assert!(!too_old(&e), "{e}");
         }
         assert_eq!(forks(&path).unwrap(), 1);
-        assert!(forks(&path).is_err());
+        assert!(too_old(&forks(&path).unwrap_err()));
         server.join().unwrap();
         std::fs::remove_file(path).unwrap();
     }
