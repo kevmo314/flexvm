@@ -54,8 +54,39 @@ fn is_zero(n: &u64) -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Parent {
     /// Relative to this checkpoint's directory, or absolute.
-    pub path: String,
+    #[serde(with = "parent_path")]
+    pub path: std::path::PathBuf,
     pub id: String,
+}
+
+// Keep existing UTF-8 manifests readable, while preserving arbitrary Unix path bytes.
+mod parent_path {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::{
+        ffi::OsString,
+        os::unix::ffi::{OsStrExt, OsStringExt},
+        path::{Path, PathBuf},
+    };
+
+    pub fn serialize<S: Serializer>(path: &Path, serializer: S) -> Result<S::Ok, S::Error> {
+        match path.to_str() {
+            Some(path) => path.serialize(serializer),
+            None => path.as_os_str().as_bytes().serialize(serializer),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<PathBuf, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Text(String),
+            Bytes(Vec<u8>),
+        }
+        Ok(match Repr::deserialize(deserializer)? {
+            Repr::Text(path) => path.into(),
+            Repr::Bytes(path) => OsString::from_vec(path).into(),
+        })
+    }
 }
 
 pub(super) fn sum(bytes: &[u8]) -> String {

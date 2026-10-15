@@ -93,6 +93,8 @@ pub struct Cow {
     wanted: Mutex<VecDeque<usize>>,
     /// Bumped as pages are saved; drains wait on it.
     progress: (Mutex<u64>, Condvar),
+    #[cfg(test)]
+    notifications: AtomicUsize,
     /// The event thread's eventfd (`set_waker`); the pages faults wait for a writer to save (`wait_for`), and whether
     /// there are any (read without the lock).
     waker: OnceLock<OwnedFd>,
@@ -125,6 +127,8 @@ impl Cow {
             budget,
             wanted: Mutex::new(VecDeque::new()),
             progress: (Mutex::new(0), Condvar::new()),
+            #[cfg(test)]
+            notifications: AtomicUsize::new(0),
             waker: OnceLock::new(),
             waits: Mutex::new(Vec::new()),
             fault_waits: AtomicBool::new(false),
@@ -187,6 +191,8 @@ impl Cow {
 
     /// Wakes the drain and writers parked on a rescue (`wait_rescued`), under the lock they check under.
     fn notify(&self) {
+        #[cfg(test)]
+        self.notifications.fetch_add(1, Ordering::SeqCst);
         drop(self.progress.0.lock().unwrap());
         self.progress.1.notify_all();
     }
@@ -200,12 +206,16 @@ impl Cow {
 
     /// The states of pages `first..end` changed (set already): wakes the event thread if a fault waits on one of them.
     fn settled(&self, first: usize, end: usize) {
+        self.settled_where(|p| (first..end).contains(&p));
+    }
+
+    fn settled_where(&self, changed: impl Fn(usize) -> bool) {
         if !self.fault_waits.load(Ordering::SeqCst) {
             return;
         }
         let mut waits = self.waits.lock().unwrap();
         let before = waits.len();
-        waits.retain(|p| !(first..end).contains(p));
+        waits.retain(|&p| !changed(p));
         self.fault_waits.store(!waits.is_empty(), Ordering::SeqCst);
         if waits.len() < before {
             drop(waits);
@@ -280,9 +290,14 @@ impl Cow {
 
     /// Gives back a claim the fault handler could not complete.
     pub fn unclaim(&self, page: usize) {
-        self.set(page, PENDING);
+        self.unclaim_many(&[page]);
+    }
+
+    /// Gives back failed rescue claims, waking writers and the event thread once.
+    pub fn unclaim_many(&self, pages: &[usize]) {
+        pages.iter().for_each(|&p| self.set(p, PENDING));
         self.notify();
-        self.settled(page, page + 1);
+        self.settled_where(|p| pages.contains(&p));
     }
 
     /// A fault waits on `page`: writers take its unit next.
@@ -448,6 +463,37 @@ impl GuestPages for CowPages<'_> {
 mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
+
+    #[test]
+    fn unclaim_many_wakes_once() {
+        use std::os::fd::FromRawFd;
+        let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        assert!(fd >= 0);
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let cow = Arc::new(Cow::new(8, &vec![(0, 8, REMOTE)]));
+        cow.set_waker(fd.try_clone().unwrap());
+        for p in [1, 3, 5] {
+            assert!(cow.claim(p, PENDING, RESCUING));
+            cow.wait_for(p, RESCUING);
+        }
+        let writers: Vec<_> = [1, 5]
+            .into_iter()
+            .map(|p| {
+                let cow = cow.clone();
+                std::thread::spawn(move || cow.wait_rescued(p))
+            })
+            .collect();
+        cow.unclaim_many(&[1, 5]);
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        assert_eq!(cow.notifications.load(Ordering::SeqCst), 1);
+        assert_eq!((cow.state(1), cow.state(3), cow.state(5)), (PENDING, RESCUING, PENDING));
+        assert_eq!(*cow.waits.lock().unwrap(), [3]);
+        let mut wakes = 0u64;
+        assert_eq!(unsafe { libc::read(fd.as_raw_fd(), (&mut wakes as *mut u64).cast(), 8) }, 8);
+        assert_eq!(wakes, 1, "one event-thread wake for the whole batch");
+    }
 
     /// Guest memory whose pages change under the writer, as a running VM's do.
     struct Live {

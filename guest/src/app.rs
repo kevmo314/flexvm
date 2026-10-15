@@ -177,6 +177,7 @@ fn check(arg: &str, statuses: &Statuses) -> io::Result<String> {
     if code.is_none() {
         kill_running(statuses, pid, token, false, libc::SIGKILL);
         if wait_exit(statuses, token, Some(Instant::now() + Duration::from_secs(2))).is_none() {
+            forget(statuses, token);
             return Err(io::Error::other(format!("readiness command {pid} would not die")));
         }
     }
@@ -322,11 +323,16 @@ fn unwatched(statuses: &Statuses, pid: i32, token: u64, error: io::Error) -> io:
     unsafe { libc::kill(-pid, libc::SIGKILL) };
     if wait_exit(statuses, token, Some(Instant::now() + Duration::from_secs(2))).is_none() {
         // Forgotten: reaped later, it is an orphan whose status is not kept.
-        let mut map = statuses.0.lock().unwrap();
-        map.running.retain(|_, t| *t != token);
-        map.finished.remove(&token);
+        forget(statuses, token);
     }
     error
+}
+
+/// A late reap must not retain a status after its watcher has given up.
+fn forget(statuses: &Statuses, token: u64) {
+    let mut map = statuses.0.lock().unwrap();
+    map.running.retain(|_, t| *t != token);
+    map.finished.remove(&token);
 }
 
 /// Output from `offset` (clamped to the ring), then `<status> <next offset>`; with `follow`, until exit.
@@ -370,6 +376,22 @@ fn logs(mut out: impl Write, mut offset: u64, follow: bool) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readiness_token_is_forgotten_even_if_reaped_during_timeout() {
+        for reaped in [false, true] {
+            let statuses = Statuses::default();
+            let (pid, token) = (123, 7);
+            statuses.0.lock().unwrap().running.insert(pid, token);
+            if reaped {
+                assert!(statuses.0.lock().unwrap().reaped(pid, 0));
+            }
+            forget(&statuses, token);
+            assert!(statuses.0.lock().unwrap().is_empty());
+            assert!(!statuses.0.lock().unwrap().reaped(pid, 0), "a late reap is an orphan");
+            assert!(statuses.0.lock().unwrap().is_empty());
+        }
+    }
 
     #[test]
     fn unsupported_check_group_is_removed() {

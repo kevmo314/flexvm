@@ -98,7 +98,9 @@ impl Link {
             ensure!(bytes.len() as u64 == want.len && sum(&bytes) == want.hash, "{}", bad(format!("{name} does not match its checksum")));
             Ok(bytes)
         };
-        let vmstate = read_checked("vmstate")?;
+        // Ancestors supply memory pages only: their manifests authenticate the pagemap
+        // and its page checksums. Only the head supplies VM state to restore.
+        let vmstate = if ck == 0 { read_checked("vmstate")? } else { Vec::new() };
         let (map, sums) = parse_pagemap(&read_checked("pagemap")?, manifest.guest_pages, manifest.parent.is_some(), ck).map_err(|e| bad(e.to_string()))?;
         let data: u64 = map.iter().filter(|r| r.2 == DATA).map(|r| r.1).sum();
         ensure!(
@@ -113,7 +115,8 @@ impl Link {
 }
 
 /// The chain ending at `dir`, nearest first; `full` verifies all metadata within
-/// `chain_meta_budget` (returning what is left), else only manifests.
+/// `chain_meta_budget` (returning what is left), except unused ancestor VM states;
+/// else only manifests.
 fn open_chain(dir: &Path, full: bool) -> Result<(Vec<Link>, u64)> {
     let mut meta_left = chain_meta_budget();
     let mut links = vec![Link::open(dir, 0, full.then_some(&mut meta_left))?];
@@ -145,15 +148,15 @@ pub fn chain_ids(dir: &Path) -> Result<Vec<String>> {
     Ok(open_chain(dir, false)?.0.into_iter().map(|l| l.id).collect())
 }
 
-pub fn parent_path(child: &Path, parent: &Path) -> String {
+pub fn parent_path(child: &Path, parent: &Path) -> PathBuf {
     match (child.parent(), parent.parent(), parent.file_name()) {
-        (Some(a), Some(b), Some(name)) if a == b => format!("../{}", name.to_string_lossy()),
-        _ => parent.to_string_lossy().into_owned(),
+        (Some(a), Some(b), Some(name)) if a == b => Path::new("..").join(name),
+        _ => parent.to_path_buf(),
     }
 }
 
 impl Checkpoint {
-    /// Opens the chain ending at `dir`, verifying all but page data, which is checked as read.
+    /// Opens the chain ending at `dir`, verifying restore metadata; page data is checked as read.
     pub fn open(dir: &Path) -> Result<Checkpoint> {
         let (mut links, meta_left) = open_chain(dir, true)?;
         let layers: Vec<Vec<Run>> = links.iter_mut().rev().map(|l| std::mem::take(&mut l.map)).collect();
