@@ -104,25 +104,36 @@ pub fn remove_at(dir: RawFd, name: &CStr, depth: u32) -> Result<()> {
     }
 }
 
-/// Hides lower layers' entries under `fd`, keeping `layer` (this layer's paths and ancestors).
-fn opaque(fd: RawFd, dir: &Path, layer: &HashSet<PathBuf>, depth: u32) -> Result<()> {
+/// An entry as resolved, not as spelled: a directory by its (dev, ino), anything else by its directory's and its name.
+type Key = (libc::dev_t, libc::ino_t, CString);
+
+fn key(dir: RawFd, name: &CStr) -> Option<Key> {
+    let st = stat_at(dir, name)?;
+    if st.st_mode & libc::S_IFMT == libc::S_IFDIR {
+        return Some((st.st_dev, st.st_ino, CString::default()));
+    }
+    let d = stat_at(dir, c"")?;
+    Some((d.st_dev, d.st_ino, name.to_owned()))
+}
+
+/// Hides lower layers' entries under `fd`, keeping `layer` (this layer's entries and their directories).
+fn opaque(fd: RawFd, layer: &HashSet<Key>, depth: u32) -> Result<()> {
     for name in list_dir(fd)? {
-        hide(fd, dir, &name, layer, depth)?;
+        hide(fd, &name, layer, depth)?;
     }
     Ok(())
 }
 
 /// Whiteout of `name` in `fd`: removed if from a lower layer, else made opaque.
-fn hide(fd: RawFd, dir: &Path, name: &CStr, layer: &HashSet<PathBuf>, depth: u32) -> Result<()> {
-    let rel = dir.join(OsStr::from_bytes(name.to_bytes()));
-    if !layer.contains(&rel) {
+fn hide(fd: RawFd, name: &CStr, layer: &HashSet<Key>, depth: u32) -> Result<()> {
+    if !key(fd, name).is_some_and(|k| layer.contains(&k)) {
         return remove_at(fd, name, 0);
     }
     if depth > MAX_DEPTH {
         bail!("directory tree too deep");
     }
     match is_type(fd, name, libc::S_IFDIR) {
-        true => opaque(open_dir_at(fd, name)?.as_raw_fd(), &rel, layer, depth + 1),
+        true => opaque(open_dir_at(fd, name)?.as_raw_fd(), layer, depth + 1),
         false => Ok(()),
     }
 }
@@ -335,7 +346,7 @@ impl Root {
         let limit = self.limits.unpacked.saturating_sub(self.unpacked);
         let mut r = Hashed::new(layer.take(limit.saturating_add(1)));
         let mut seen = self.seen;
-        // This layer's paths and their ancestors, which its whiteouts keep.
+        // This layer's entries and the directories holding them, which its whiteouts keep.
         let mut mine = HashSet::new();
         let res = each_entry(&mut r, &mut seen, self.limits.entries, |e, m| self.apply(e, m, &mut mine))
             .and_then(|_| Ok(io::copy(&mut r, &mut io::sink()).map(|_| ())?));
@@ -348,7 +359,7 @@ impl Root {
         Ok(r.digest())
     }
 
-    fn apply<R: Read>(&mut self, e: &mut tar::Entry<R>, m: Meta, mine: &mut HashSet<PathBuf>) -> Result<()> {
+    fn apply<R: Read>(&mut self, e: &mut tar::Entry<R>, m: Meta, mine: &mut HashSet<Key>) -> Result<()> {
         let Some((parent, name)) = split(&m.path)? else { return Ok(()) };
         let name = name.as_bytes();
         if let Some(rest) = name.strip_prefix(b".wh.") {
@@ -362,23 +373,26 @@ impl Root {
             }
             if let Ok(dir) = self.resolve(&parent) {
                 match opq {
-                    true => opaque(dir.as_raw_fd(), &parent, mine, 0)?,
-                    false => hide(dir.as_raw_fd(), &parent, &CString::new(rest).unwrap(), mine, 0)?,
+                    true => opaque(dir.as_raw_fd(), mine, 0)?,
+                    false => hide(dir.as_raw_fd(), &CString::new(rest).unwrap(), mine, 0)?,
                 }
             }
             return Ok(());
         }
-        let rel = parent.join(OsStr::from_bytes(name));
-        self.entry(e, &rel, m)?;
-        for a in rel.ancestors().filter(|a| !a.as_os_str().is_empty()) {
-            if !mine.insert(a.to_path_buf()) {
+        let at = self.entry(e, &parent.join(OsStr::from_bytes(name)), m)?;
+        mine.extend(key(at.dir.as_raw_fd(), &at.name));
+        // Up from where the entry landed, which a symlinked parent may have moved.
+        let (root, mut dir) = (key(self.fd.as_raw_fd(), c""), at.dir);
+        while let Some(k) = key(dir.as_raw_fd(), c"").filter(|k| Some(k) != root.as_ref()) {
+            if !mine.insert(k) {
                 break;
             }
+            dir = open_dir_at(dir.as_raw_fd(), c"..")?;
         }
         Ok(())
     }
 
-    fn entry<R: Read>(&mut self, e: &mut tar::Entry<R>, rel: &Path, m: Meta) -> Result<()> {
+    fn entry<R: Read>(&mut self, e: &mut tar::Entry<R>, rel: &Path, m: Meta) -> Result<At> {
         use tar::EntryType as T;
         let h = e.header().clone();
         let kind = h.entry_type();
@@ -411,13 +425,13 @@ impl Root {
                 let src = self.at(m.link.as_ref().ok_or("hard link without target")?)?;
                 let ino = |a: &At| stat_at(a.dir.as_raw_fd(), &a.name).map(|st| (st.st_dev, st.st_ino));
                 if ino(&src).is_some_and(|i| Some(i) == ino(&at)) {
-                    return Ok(());
+                    return Ok(at);
                 }
                 at.remove()?;
                 check(unsafe { libc::linkat(src.dir.as_raw_fd(), src.name.as_ptr(), dfd, name, 0) }, "link", rel)?;
                 // A hard link shares its target's inode and metadata.
                 self.entries += 1;
-                return Ok(());
+                return Ok(at);
             }
             T::Char | T::Block | T::Fifo => {
                 at.remove()?;
@@ -445,7 +459,7 @@ impl Root {
         }
         let ts = [libc::timespec { tv_sec: h.mtime().unwrap_or(0) as i64, tv_nsec: 0 }; 2];
         unsafe { libc::utimensat(dfd, name, ts.as_ptr(), nofollow) };
-        Ok(())
+        Ok(at)
     }
 
     pub fn ensure_dir(&mut self, rel: &str, mode: u32) -> Result<()> {
@@ -726,6 +740,17 @@ pub(super) mod tests {
                 &[("a/x", 'f', "x"), ("a/sub/y", 'f', "y"), ("old", 'f', "o"), ("low/f", 'f', "f")],
                 &[("a/b/new", 'f', "n"), ("a/sub/z", 'f', "z"), ("keep/me", 'f', "m"), ("a/.wh..wh..opq", 'f', ""), (".wh..wh..opq", 'f', "")],
                 &[("a/b/new", Some("n")), ("a/sub/z", Some("z")), ("keep/me", Some("m")), ("a/sub/y", None), ("a/x", None), ("old", None), ("low", None)],
+            ),
+            // Written through a symlinked parent, in either order.
+            (
+                &[("real/old", 'f', "o"), ("alias", 'l', "real")],
+                &[("alias/new", 'f', "n"), ("real/.wh..wh..opq", 'f', "")],
+                &[("real/new", Some("n")), ("real/old", None)],
+            ),
+            (
+                &[("real/old", 'f', "o"), ("alias", 'l', "real")],
+                &[("real/.wh..wh..opq", 'f', ""), ("alias/new", 'f', "n")],
+                &[("real/new", Some("n")), ("real/old", None)],
             ),
         ];
         for (i, (lower, upper, want)) in cases.iter().enumerate() {
