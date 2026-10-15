@@ -15,12 +15,16 @@ macro_rules! bail {
     ($($arg:tt)*) => { return Err(format!($($arg)*).into()) };
 }
 
-/// Writes a diagnostic line without panicking if stderr is closed or unavailable.
+/// Writes a diagnostic line to stderr, ignoring write errors (a closed or full log pipe)
+/// that make `eprintln!` panic. The line goes out in one write, so lines from other
+/// threads or processes sharing the pipe don't interleave with it.
 #[macro_export]
 macro_rules! log {
     ($($arg:tt)*) => {{
         use std::io::Write as _;
-        let _ = writeln!(std::io::stderr(), $($arg)*);
+        let mut line = format!($($arg)*);
+        line.push('\n');
+        let _ = std::io::stderr().lock().write_all(line.as_bytes());
     }};
 }
 

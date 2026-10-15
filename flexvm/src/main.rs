@@ -8,16 +8,12 @@ mod crc32c;
 mod fc;
 mod gc;
 mod guest;
-// TODO(#284): convert this module to log! before removing the allowance.
-#[allow(clippy::print_stderr)]
 mod hold;
 mod host;
 mod image;
 mod lifecycle;
 mod limit;
 mod listen;
-// TODO(#284): convert this module to log! before removing the allowance.
-#[allow(clippy::print_stderr)]
 mod migrate;
 mod net;
 mod socket;

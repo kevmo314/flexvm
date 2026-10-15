@@ -99,7 +99,7 @@ impl Holder {
             Ok(tun) => tun,
             Err((true, e)) => return Err(e),
             Err((false, e)) => {
-                eprintln!("packets in flight during migrations will be dropped: {e}");
+                crate::log!("packets in flight during migrations will be dropped: {e}");
                 return Ok(None);
             }
         };
@@ -333,7 +333,7 @@ impl Holder {
         let mut buf = vec![0u8; 65536];
         loop {
             if let Err(e) = eintr(|| unsafe { libc::poll(&mut pfd, 1, -1) }) {
-                return eprintln!("hold device {}: {e}", self.dev);
+                return crate::log!("hold device {}: {e}", self.dev);
             }
             self.reading.store(true, Ordering::SeqCst);
             while self.read_one(&mut buf) {}
@@ -553,7 +553,7 @@ pub fn send(
         let ok = o.flush(deadline) && By { s: conn, at: deadline }.read_exact(&mut ack).is_ok() && ack[0] == b's';
         if !ok {
             o.broken = true;
-            eprintln!("hold {ip}: the target did not confirm the held packets; dropping the rest");
+            crate::log!("hold {ip}: the target did not confirm the held packets; dropping the rest");
         }
         ok
     };
@@ -567,7 +567,7 @@ pub fn send(
             let (mut ack, deadline) = ([0u8; 1], Instant::now() + SWITCH_WAIT);
             if !(o.flush(deadline) && By { s: conn, at: deadline }.read_exact(&mut ack).is_ok() && ack[0] == b'w') {
                 o.broken = true;
-                eprintln!("hold {ip}: the target did not take the address over; dropping the rest");
+                crate::log!("hold {ip}: the target did not take the address over; dropping the rest");
                 bail!("the target did not take {ip} over (its held packets after this are lost)");
             }
             Ok(())

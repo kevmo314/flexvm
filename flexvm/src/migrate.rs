@@ -112,7 +112,7 @@ impl Proc {
             if self.lent_here.load(Ordering::SeqCst) {
                 match self.host.lock().and_then(|l| self.host.unlend(&l, vm.ip, gen)) {
                     Ok(()) => self.lent_here.store(false, Ordering::SeqCst),
-                    Err(r) => eprintln!("vm {}: undoing its loan after a refused migration: {r}", vm.name),
+                    Err(r) => crate::log!("vm {}: undoing its loan after a refused migration: {r}", vm.name),
                 }
             }
             return Err(e);
@@ -257,7 +257,7 @@ impl Proc {
                 if let Some(h) = self.holder() {
                     h.forget(vm.ip, mig);
                 }
-                eprintln!("vm {}: {e}; generation {gen} of {} was superseded meanwhile, so it is destroyed instead of resumed", vm.name, vm.ip);
+                crate::log!("vm {}: {e}; generation {gen} of {} was superseded meanwhile, so it is destroyed instead of resumed", vm.name, vm.ip);
                 self.finish(op, End::Gone, crate::vmproc::FAILED, None)
             }
             Err(r) => {
@@ -283,12 +283,12 @@ impl Proc {
         if self.lent_here.load(Ordering::SeqCst) {
             match self.host.unlend(&l, vm.ip, gen) {
                 Ok(()) => self.lent_here.store(false, Ordering::SeqCst),
-                Err(r) => eprintln!("vm {}: undoing its loan after an aborted migration: {r}", vm.name),
+                Err(r) => crate::log!("vm {}: undoing its loan after an aborted migration: {r}", vm.name),
             }
         }
         // Past the revision its target took (and may have announced, if it committed).
         if let Err(r) = self.advance(&l, 2) {
-            eprintln!("vm {}: recording its revision: {r}", vm.name);
+            crate::log!("vm {}: recording its revision: {r}", vm.name);
         }
         drop(l);
         self.set_leaving(false);
@@ -309,7 +309,7 @@ impl Proc {
             loop {
                 match outcome(&to, mig, patience) {
                     Some(Outcome::Committed(target)) => {
-                        eprintln!("vm {}: migration {mig} to {to} committed", p.name());
+                        crate::log!("vm {}: migration {mig} to {to} committed", p.name());
                         let _ = p.reroute(mig, &to, &target, None, false);
                         return p.wait_release(mig, to);
                     }
@@ -323,7 +323,7 @@ impl Proc {
     fn abort_later(&self, mig: u64, why: &str) {
         let (vm, op) = (self.vm().clone(), self.op());
         let e = self.abort(&op, &vm, mig, why.into());
-        eprintln!("vm {}: {e}; now {}", vm.name, vm.state().name());
+        crate::log!("vm {}: {e}; now {}", vm.name, vm.state().name());
     }
 
     /// Ends the process once the target is `released`; on `aborted` this copy,
@@ -344,7 +344,7 @@ impl Proc {
             }
             if let Some(via) = p.take_pending_route(mig) {
                 if let Err(e) = p.switch_route(mig, via) {
-                    eprintln!("route {} via {via}: {e}; giving up", p.vm().ip);
+                    crate::log!("route {} via {via}: {e}; giving up", p.vm().ip);
                 }
             }
             let op = p.op();
@@ -372,7 +372,7 @@ impl Proc {
                 }
                 started => {
                     if let Some((_, Err(e))) = started {
-                        eprintln!("vm {}: {to} did not take the held packets: {e}", self.name());
+                        crate::log!("vm {}: {to} did not take the held packets: {e}", self.name());
                     }
                     held = Some(h.forget(ip, mig));
                 }
@@ -380,15 +380,15 @@ impl Proc {
         }
         let res = res.unwrap_or_else(|| self.switch_route(mig, via));
         if let (Err(e), Some(p)) = (&res, self.arc()) {
-            eprintln!("route {ip} via {via}: {e}; retrying");
+            crate::log!("route {ip} via {via}: {e}; retrying");
             *self.pending_route.lock().unwrap() = Some((mig, via));
             thread::spawn(move || {
                 if !retry(&format!("route {ip} via {via}"), || p.switch_route(mig, via)) {
                     return;
                 }
                 match p.take_pending_route(mig) {
-                    Some(_) => eprintln!("route {ip} via {via}: done"),
-                    None => eprintln!("route {ip} via {via}: dropped, migration {mig} no longer owes it"),
+                    Some(_) => crate::log!("route {ip} via {via}: done"),
+                    None => crate::log!("route {ip} via {via}: dropped, migration {mig} no longer owes it"),
                 }
             });
         }
@@ -516,9 +516,9 @@ impl Proc {
                 });
                 match took {
                     Ok(Some(held)) => holding = held,
-                    Ok(None) => eprintln!("vm {}: {} went to a newer vm; not taking it over", vm.name, vm.ip),
+                    Ok(None) => crate::log!("vm {}: {} went to a newer vm; not taking it over", vm.name, vm.ip),
                     Err(e) => {
-                        eprintln!("vm {}: taking over {}: {e}", vm.name, vm.ip);
+                        crate::log!("vm {}: taking over {}: {e}", vm.name, vm.ip);
                         routed = false;
                     }
                 }
@@ -530,7 +530,7 @@ impl Proc {
                     vm.tap_drops_reported(reported);
                 }
             } else {
-                eprintln!("vm {}: no held packets from the source after {} ms", vm.name, ms(fence.elapsed()));
+                crate::log!("vm {}: no held packets from the source after {} ms", vm.name, ms(fence.elapsed()));
             }
             // Only the route switch is under the host lock: the tap's plug, not the lock,
             // keeps what the new route sends behind the held packets (#164).
@@ -544,12 +544,12 @@ impl Proc {
                     // Whether our plug may be on the tap (also when the kernel's answer was
                     // lost): only then is it unplugged, never after a refusal.
                     let plugged = if fault("no_plug") {
-                        eprintln!("vm {}: injected fault: not plugging its tap", vm.name);
+                        crate::log!("vm {}: injected fault: not plugging its tap", vm.name);
                         false
                     } else {
                         let (plugged, res) = crate::net::plug_tap(&vm.tap);
                         if let Err(e) = res {
-                            eprintln!("vm {}: plugging its tap: {e}", vm.name);
+                            crate::log!("vm {}: plugging its tap: {e}", vm.name);
                         }
                         plugged
                     };
@@ -569,13 +569,13 @@ impl Proc {
                         false => (0, Ok(())),
                     };
                     if let Err(e) = unplugged {
-                        eprintln!("vm {}: letting {}'s packets through its tap: {e}", vm.name, vm.ip);
+                        crate::log!("vm {}: letting {}'s packets through its tap: {e}", vm.name, vm.ip);
                     }
                     if let Some(mut s) = released.filter(|_| current) {
                         s.dropped_target += plug_drops;
-                        eprintln!("vm {}: let go of {} after {} ms, {} packets injected", vm.name, vm.ip, ms(start.elapsed()), s.injected);
+                        crate::log!("vm {}: let go of {} after {} ms, {} packets injected", vm.name, vm.ip, ms(start.elapsed()), s.injected);
                         if s.dropped + s.dropped_target > 0 {
-                            eprintln!("vm {}: dropped {} of the packets held while taking {} over", vm.name, s.dropped + s.dropped_target, vm.ip);
+                            crate::log!("vm {}: dropped {} of the packets held while taking {} over", vm.name, s.dropped + s.dropped_target, vm.ip);
                         }
                     }
                     if current {
@@ -593,10 +593,10 @@ impl Proc {
                     if let Some(h) = holder.as_deref().filter(|_| holding) {
                         h.forget(vm.ip, mig);
                     }
-                    eprintln!("vm {}: {} went to a newer vm; not routing it here", vm.name, vm.ip);
+                    crate::log!("vm {}: {} went to a newer vm; not routing it here", vm.name, vm.ip);
                 }
                 Err(e) => {
-                    eprintln!("vm {}: routing {} to its tap: {e}; retrying", vm.name, vm.ip);
+                    crate::log!("vm {}: routing {} to its tap: {e}; retrying", vm.name, vm.ip);
                     if let Some(h) = holder.as_deref() {
                         h.forget(vm.ip, mig);
                     }
@@ -613,13 +613,13 @@ impl Proc {
             vm.restore_devices();
             let start = Instant::now();
             p.wait_pulled(&vm);
-            eprintln!("vm {}: pull from {source} ended after {} ms", vm.name, ms(start.elapsed()));
+            crate::log!("vm {}: pull from {source} ended after {} ms", vm.name, ms(start.elapsed()));
             // Unless an operation settled it first, or the VM ended (its source's
             // copy runs again). `op` is let go between tries, for a kill.
             loop {
                 let op = p.op();
                 match p.settle_arrival(&op, Duration::ZERO) {
-                    Err(e) if p.pulled_all() => eprintln!("{e}"),
+                    Err(e) if p.pulled_all() => crate::log!("{e}"),
                     _ => return,
                 }
                 drop(op);
@@ -737,7 +737,7 @@ impl Proc {
                 self.arrived.lock().unwrap().as_mut().ok_or("no migration record")?.commit(&l)?;
                 // Only now its revision outranks the source's (`claim_incoming`).
                 if let Err(e) = self.advance(&l, 0) {
-                    eprintln!("vm {name}: recording its revision: {e}");
+                    crate::log!("vm {name}: recording its revision: {e}");
                 }
                 Ok(l)
             }),
@@ -754,7 +754,7 @@ impl Proc {
         self.adopt(vm.clone());
         if !paused {
             if let Err(e) = vm.start(fault("resume_kill")) {
-                eprintln!("vm {name}: resuming after migration {} failed: {e}", source.mig);
+                crate::log!("vm {name}: resuming after migration {} failed: {e}", source.mig);
                 vm.set_failed();
             }
             t.mark("resume");
@@ -795,7 +795,7 @@ fn retry(what: &str, mut f: impl FnMut() -> Result<()>) -> bool {
         thread::sleep(delay);
         match f() {
             Ok(()) => return true,
-            Err(e) => eprintln!("{what}: {e}"),
+            Err(e) => crate::log!("{what}: {e}"),
         }
         delay = (delay * 2).min(Duration::from_secs(5));
     }
@@ -828,7 +828,7 @@ pub fn release_into(h: &Holder, ip: Ipv4Addr, mig: u64, vm: &Vm, linger: Duratio
     let inj = match crate::net::set_link_up(&vm.tap, true).and_then(|()| hold::Injector::new(&vm.tap)) {
         Ok(inj) => inj,
         Err(e) => {
-            eprintln!("vm {}: dropping held packets: {e}", vm.name);
+            crate::log!("vm {}: dropping held packets: {e}", vm.name);
             h.forget(ip, mig);
             return (None, Err(e));
         }
@@ -838,7 +838,7 @@ pub fn release_into(h: &Holder, ip: Ipv4Addr, mig: u64, vm: &Vm, linger: Duratio
     };
     if let Err(e) = &switched {
         h.forget(ip, mig);
-        eprintln!("vm {}: routing {ip} back to its tap after injecting the held packets: {e}", vm.name);
+        crate::log!("vm {}: routing {ip} back to its tap after injecting the held packets: {e}", vm.name);
     }
     let tap_dropped = inj.dropped();
     (stats.injected, stats.dropped_target) = (stats.packets, tap_dropped);
