@@ -584,21 +584,26 @@ mod tests {
 
     #[test]
     fn api_stalled_response_keeps_one_deadline_and_drops_connection() {
+        // Response bytes arrive just before the deadline: one restarted by them, not
+        // kept for the whole call, would return at 950 ms at the earliest.
+        const TIMEOUT: Duration = Duration::from_millis(500);
         for response in [&b""[..], &b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n"[..], &b"HTTP/1.1 200 OK\r\nContent-Length:"[..]] {
             let server = Server::new(move |listener| {
                 let mut r = accept(&listener);
                 read_request(&mut r);
-                std::thread::sleep(Duration::from_millis(30));
+                std::thread::sleep(Duration::from_millis(450));
                 // A client already past its deadline (a loaded host) has closed: EPIPE.
                 let _ = r.get_mut().write_all(response);
-                std::thread::sleep(Duration::from_millis(150));
+                std::thread::sleep(Duration::from_millis(1500));
                 no_more(&listener);
             });
             let api = Api::default();
             let start = std::time::Instant::now();
-            let e = api.request(&server.path, "GET", "/vm", None, Duration::from_millis(60)).unwrap_err();
+            let e = api.request(&server.path, "GET", "/vm", None, TIMEOUT).unwrap_err();
             assert!(!not_sent(&e));
-            assert!(start.elapsed() < Duration::from_millis(150));
+            assert_eq!(e.downcast_ref::<std::io::Error>().unwrap().kind(), std::io::ErrorKind::TimedOut);
+            // Scheduler slack under parallel load, but short of a restarted deadline.
+            assert!(start.elapsed() < Duration::from_millis(900), "{:?}", start.elapsed());
             assert!(api.connection.borrow().is_none());
         }
     }
