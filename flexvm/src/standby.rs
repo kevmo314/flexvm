@@ -180,13 +180,8 @@ fn refill_by(host: &Host, template: &str, wait: bool) -> Result<usize> {
         }
     }
     let started = ready.len();
-    for mut r in ready {
-        let res = crate::util::recv_json(&mut r).and_then(|reply| match reply {
-            None => Err("a standby vm failed to start (see its log)".into()),
-            Some(reply) if reply["ok"] != json!(true) => Err(format!("a standby vm failed to start: {}", reply["error"]).into()),
-            Some(_) => Ok(()),
-        });
-        if let Err(e) = res {
+    for r in ready {
+        if let Err(e) = wait_ready(r, READY_TIMEOUT) {
             failed.get_or_insert(e);
         }
     }
@@ -196,9 +191,20 @@ fn refill_by(host: &Host, template: &str, wait: bool) -> Result<usize> {
     }
 }
 
+/// A started standby's readiness reply, within `timeout` of now: counted from when it is
+/// read, not from its start, as replies are read only once every start in the round is done.
+fn wait_ready(r: UnixStream, timeout: Duration) -> Result<()> {
+    let mut r = BufReader::new(crate::util::By { s: r, at: Instant::now() + timeout });
+    match crate::util::recv_json(&mut r)? {
+        None => Err("a standby vm failed to start (see its log)".into()),
+        Some(reply) if reply["ok"] != json!(true) => Err(format!("a standby vm failed to start: {}", reply["error"]).into()),
+        Some(_) => Ok(()),
+    }
+}
+
 /// One standby started and listed, its readiness reply to come; None if relief
 /// holds the stop lock, the grant is refused or the host lock is busy.
-fn start_one(host: &Host, template: &str, log: &File) -> Result<Option<BufReader<crate::util::By<UnixStream>>>> {
+fn start_one(host: &Host, template: &str, log: &File) -> Result<Option<UnixStream>> {
     // Shared from the grant until its lock file exists (`locked`), not through its load:
     // relief either lists it or ran before the grant. None while relief stops them, and
     // held `LOCKED_TIMEOUT` at most (a stuck host lock fails the grant; a child that
@@ -247,7 +253,7 @@ fn start_one(host: &Host, template: &str, log: &File) -> Result<Option<BufReader
     };
     drop(stop);
     std::thread::spawn(move || child.wait());
-    Ok(Some(BufReader::new(crate::util::By { s: r, at: Instant::now() + READY_TIMEOUT })))
+    Ok(Some(r))
 }
 
 /// Never let relief pass an unlisted live child, including on a partial or invalid reply.
@@ -611,6 +617,20 @@ mod tests {
             }
         }
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_readiness_reply_queued_long_before_it_is_read_still_counts() {
+        // As for the first of many standbys, whose reply waits while the others start.
+        let (r, mut w) = UnixStream::pair().unwrap();
+        send_json(&mut w, &json!({"ok": true, "result": {}})).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        wait_ready(r, Duration::from_millis(100)).unwrap();
+        // A child that never replies still fails within its timeout, from when it is read.
+        let (r, _w) = UnixStream::pair().unwrap();
+        let start = Instant::now();
+        assert!(wait_ready(r, Duration::from_millis(100)).unwrap_err().to_string().contains("deadline passed"));
+        assert!(start.elapsed() >= Duration::from_millis(100) && start.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
