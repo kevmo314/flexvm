@@ -392,7 +392,7 @@ impl Proc {
         let (mut held, mut res) = (None, None);
         if let Some(h) = self.holder().filter(|h| h.holding_for(ip, mig)) {
             // Its paused Firecracker takes nothing off the tap: what is there came before the hold.
-            h.hold_first(ip, mig, &self.vm().take_tap_queue());
+            h.hold_first(ip, mig, |each| self.vm().take_tap_queue(each));
             if conn.is_some() && !switch {
                 crate::log!("vm {}: {to} takes no held stream of this version; dropping the held packets", self.name());
             }

@@ -64,17 +64,19 @@ pub fn tap_queued(fd: &OwnedFd) -> Result<bool> {
 }
 
 /// Reads off the frames queued on a tap (`tap_fd_of`, non-blocking as Firecracker opened it),
-/// each with its virtio-net header: for a VM leaving them, so they are passed on or counted.
-pub fn read_tap_queue(fd: &OwnedFd) -> Vec<Vec<u8>> {
+/// each with its virtio-net header, handing each to `each` as it is read: for a VM leaving
+/// them, so they are passed on or counted. Returns how many.
+pub fn read_tap_queue(fd: &OwnedFd, each: &mut dyn FnMut(&[u8])) -> u64 {
     // A frame with its virtio-net header, up to the 64 KiB a GSO frame can be.
     let mut buf = vec![0u8; 65562 + 64];
-    let mut frames = Vec::new();
+    let mut n = 0;
     // Bounded by the ring (TAP_QUEUE) and in case the descriptor were blocking after all.
-    while frames.len() < TAP_QUEUE as usize && tap_queued(fd).unwrap_or(false) {
-        let Ok(n) = usize::try_from(unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) }) else { break };
-        frames.push(buf[..n].to_vec());
+    while n < u64::from(TAP_QUEUE) && tap_queued(fd).unwrap_or(false) {
+        let Ok(len) = usize::try_from(unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) }) else { break };
+        each(&buf[..len]);
+        n += 1;
     }
-    frames
+    n
 }
 
 /// Process `pid`'s descriptor attached to `tap` (its fdinfo says `iff: TAP`), duplicated here
