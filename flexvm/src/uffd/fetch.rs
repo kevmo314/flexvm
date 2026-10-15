@@ -435,6 +435,7 @@ impl Link {
 
     /// Schedules a reconnect after `e`, or gives up.
     pub(super) fn lost(&mut self, e: io::Error) -> io::Result<()> {
+        self.addrs.stale = true;
         let since = *self.down.get_or_insert_with(Instant::now);
         if since.elapsed() >= SOURCE_TIMEOUT {
             let why = format!("migration source {} unreachable for {:?}: {e}", self.source.addr, since.elapsed());
@@ -457,8 +458,8 @@ pub fn probe(source: &Source, page: u64, deadline: Instant) -> io::Result<()> {
 }
 
 /// The source's addresses, looked up once: reconnects need no lookup, which a stalled resolver could hold past
-/// `SOURCE_TIMEOUT`. After a connect to them fails, the next one looks them up again (a source whose name now
-/// resolves elsewhere), with half its time, and keeps the old ones if that lookup fails.
+/// `SOURCE_TIMEOUT`. After a connect or fetch fails without a complete page, the next connect looks them up afresh
+/// (a source whose name now resolves elsewhere), with half its time, and keeps the old ones if that lookup fails.
 #[derive(Default)]
 struct SourceAddrs {
     addrs: Vec<std::net::SocketAddr>,
@@ -471,7 +472,7 @@ impl SourceAddrs {
             self.addrs = crate::util::resolve(name, at)?;
         } else if std::mem::take(&mut self.stale) {
             let now = Instant::now();
-            if let Ok(addrs) = crate::util::resolve(name, now + at.saturating_duration_since(now) / 2) {
+            if let Ok(addrs) = crate::util::resolve_fresh(name, now + at.saturating_duration_since(now) / 2) {
                 self.addrs = addrs;
             }
         }
@@ -727,6 +728,22 @@ mod probe_tests {
         fn write_timeout(&self, _: Duration) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn a_fetch_refused_without_pages_marks_the_source_address_stale() {
+        let source = Source { addr: "moved.example:80".into(), vm: "v".into(), mig: 1, regions: Vec::new() };
+        let at = Instant::now() + CONNECT_TIMEOUT;
+        // TCP and the hello write succeeded, but this host no longer serves this VM.
+        let reply = Reply(io::Cursor::new(b"{\"error\":\"unknown migration\"}\n".to_vec()));
+        let mut client = PageClient::new(reply, &source, at).unwrap();
+        let e = client.fetch(0, &mut [0u8; PAGE_SIZE], 0, &mut |_| panic!("a refused request must deliver no data"), at).unwrap_err();
+        assert!(e.to_string().contains("page server refused"));
+        let mut link = Link::new(source);
+        link.addrs.addrs = vec!["10.0.0.1:80".parse().unwrap()];
+        assert!(!link.addrs.stale);
+        link.lost(e).unwrap();
+        assert!(link.addrs.stale, "the next connect must look the name up afresh");
     }
 
     #[test]
