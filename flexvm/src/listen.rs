@@ -550,10 +550,11 @@ mod tests {
         assert!(p.addrs(&other).is_empty() && p.0.lookups.lock().unwrap().contains_key(&other[0]));
     }
 
-    /// Whether `names`' lookups have all ended, within 5 s.
+    /// Whether `names`' lookups have all ended, within 60 s (a bound on a hung lookup only: on a loaded machine
+    /// one can take seconds).
     fn settled(p: &Peers, names: &[String]) -> bool {
         let ended = || names.iter().all(|n| p.0.lookups.lock().unwrap().get(n).is_some_and(|l| l.is_some()));
-        (0..500).any(|_| ended() || (std::thread::sleep(Duration::from_millis(10)), false).1)
+        (0..6000).any(|_| ended() || (std::thread::sleep(Duration::from_millis(10)), false).1)
     }
 
     fn host_with_peers(label: &str, peers: &[&str]) -> (std::path::PathBuf, Host) {
@@ -573,10 +574,16 @@ mod tests {
         let (root, host) = host_with_peers("by-name", &["localhost:7070"]);
         let names = host.config_now().peers;
         // As at start, or for a peer just added: nothing resolved, so the accept loop hands it to a waiting slot.
+        // The lookup under way is marked here, not run: a real one of localhost can end before `resolving` is asked (#294).
         let p = Peers::default();
         let local: [IpAddr; 2] = ["127.0.0.1".parse().unwrap(), "::1".parse().unwrap()];
-        assert!(!p.admit(&names, local[0]) && p.resolving(&names));
-        let by = Instant::now() + Duration::from_secs(5);
+        p.0.lookups.lock().unwrap().insert(names[0].clone(), None);
+        assert!(!p.admit(&names, local[0]) && p.resolving(&names) && p.check(&names, local[0]).is_none());
+        // A request that finds the name unresolved starts its lookup, and is admitted once it ends.
+        p.0.lookups.lock().unwrap().clear();
+        assert!(!p.admit(&names, local[0]) && p.0.lookups.lock().unwrap().contains_key(&names[0]));
+        // Only a bound on a hung lookup: on a loaded machine one of localhost can take seconds.
+        let by = Instant::now() + Duration::from_secs(60);
         assert!(local.iter().any(|&a| p.admit_by(&host, a, by)), "admitted once localhost resolved");
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -587,11 +594,15 @@ mod tests {
         let (p, names) = (Peers::default(), host.config_now().peers);
         p.addrs(&names);
         assert!(settled(&p, &names[..2]));
-        // localhost resolved, the other failed: nothing under way to wait for.
+        // localhost resolved, the other failed: nothing under way to wait for. Each ended "now" for as long as this
+        // takes, so the failed one is not looked up again (`LOOKUP_EVERY`) however slowly it runs (#294).
+        p.0.lookups.lock().unwrap().values_mut().for_each(|l| *l = Some(Instant::now() + Duration::from_secs(3600)));
         assert!(!p.resolving(&names));
-        let start = Instant::now();
-        assert!(!p.admit_by(&host, "10.9.9.9".parse().unwrap(), start + Duration::from_secs(5)));
-        assert!(start.elapsed() < Duration::from_millis(100), "{:?}", start.elapsed());
+        // Refused at once: `check` has its answer, so `admit_by` never waits (not timed, as a loaded machine can take
+        // any time over it, #294).
+        let from = "10.9.9.9".parse().unwrap();
+        assert_eq!(p.check(&names, from), Some(false));
+        assert!(!p.admit_by(&host, from, Instant::now() + Duration::from_secs(60)));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -634,7 +645,9 @@ mod tests {
         let (p, name) = (Peers::default(), vec!["no-such-host.invalid:7070".to_string()]);
         p.addrs(&name);
         assert!(settled(&p, &name));
-        let ended = p.0.lookups.lock().unwrap()[&name[0]];
+        // Ended "now" for as long as the requests below take, however slowly they run (#294).
+        let ended = Some(Instant::now() + Duration::from_secs(3600));
+        p.0.lookups.lock().unwrap().insert(name[0].clone(), ended);
         // Every request asks for it, none starts a lookup.
         for _ in 0..1000 {
             assert!(p.addrs(&name).is_empty());
@@ -658,7 +671,7 @@ mod tests {
         assert!(start.elapsed() < Duration::from_millis(100));
         assert!(is_peer(&p.addrs(&names), "10.1.0.2".parse().unwrap()), "an address needs no lookup");
         let local = || is_peer(&p.addrs(&names), "127.0.0.1".parse().unwrap()) || is_peer(&p.addrs(&names), "::1".parse().unwrap());
-        assert!((0..500).any(|_| local() || (std::thread::sleep(Duration::from_millis(10)), false).1), "localhost resolved meanwhile");
+        assert!((0..6000).any(|_| local() || (std::thread::sleep(Duration::from_millis(10)), false).1), "localhost resolved meanwhile");
         assert_eq!(p.0.lookups.lock().unwrap()["hung.invalid:7070"], None);
     }
 

@@ -1024,9 +1024,11 @@ def same_host_flood():
 def same_host_backlog():
     """#136: frames queued on the source's tap when its VM pauses went with the tap,
     uncounted. `tap_backlog` stops the source's Firecracker for 200 ms at 10k datagrams/s
-    (more than the guest has buffers for) and holds the address before it goes on, so
-    each migration starts its pause with a queue: the guest takes it first, and nothing is
-    lost that was not counted (a loaded guest can still fill a tap, which counts that)."""
+    (more than the guest has buffers for), and on until frames are queued on its tap, and
+    holds the address before it goes on, so each migration starts its pause with a queue
+    (seen while Firecracker is still stopped, so a guest quick to take it is not missed):
+    the guest takes it first, and nothing is lost that was not counted (a loaded guest can
+    still fill a tap, which counts that)."""
     udp_across_migrations("same host backlog", "ft-backlog", burst=10, source_fault="tap_backlog")
 
 
@@ -5058,7 +5060,10 @@ def route_abort():
     then dies mid-pull, so the source aborts and runs its copy again; the retry, which the
     abort left with the same holder and generation, must not route the address to the dead
     target afterwards. B advertises an underlay that is not a local address (the default
-    gateway), so the source's switch is a real route the kernel keeps."""
+    gateway), so the source's switch is a real route the kernel keeps. The source's page
+    server is slowed from the start (`pages_slow`: every reply comes, a second late), not
+    stopped on a timer: the target's probe of it still succeeds, and its 1000 MiB take
+    minutes to pull, so it is killed mid-pull however loaded the host (#294)."""
     n = "ft-route-abort"
     scenario_vms.add(n)
     gw = subprocess.run(["ip", "route", "show", "default"], capture_output=True, text=True).stdout.split()[2]
@@ -5070,14 +5075,12 @@ def route_abort():
         ip = vm_ip(A, n)
         tcp_server(A, n)
         fault(A, "route", 120000)
-        stall = threading.Timer(0.2, lambda: fault(A, "pages", 120000))
-        stall.start()
+        fault(A, "pages_slow", 120000)
         r = ok(migrate(A, n, B))
-        stall.join()
         check("route abort: the route switch failed, so it is retried", r["reroute_error"] is not None, r["reroute_error"])
         os.kill(vms(B)[n]["firecracker"], signal.SIGKILL)
         check("route abort: the target fails", wait_for(lambda: vms(B).get(n, {}).get("state") == "failed", 10), vms(B).get(n))
-        fault(A, "pages", 0)
+        fault(A, "pages_slow", 0)
         check("route abort: the source runs its copy again", wait_for(lambda: vms(A).get(n, {}).get("state") == "running", 60), where(n))
         # The retry's next try (at most 5 s away) goes through now; watch past it.
         fault(A, "route", 0)
