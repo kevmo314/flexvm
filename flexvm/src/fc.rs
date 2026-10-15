@@ -367,6 +367,21 @@ pub struct Spawner {
     next: AtomicU64,
 }
 
+/// Reuse vanished taps; the lifetime counter is only for directories and cgroups.
+fn free_tap(prefix: &str, interfaces: &Path) -> Result<String> {
+    let mut n = 0u64;
+    loop {
+        let tap = format!("{prefix}{n:x}");
+        if tap.len() >= libc::IFNAMSIZ {
+            bail!("tap {tap:?} is over {} bytes (no free tap names)", libc::IFNAMSIZ - 1);
+        }
+        if !interfaces.join(&tap).try_exists()? {
+            return Ok(tap);
+        }
+        n += 1;
+    }
+}
+
 impl Spawner {
     pub fn new(bin: &Path, root: &Path, sockets: Arc<SocketRoot>, cgroups: Option<PathBuf>, tap_prefix: &str, tap_owner: &str) -> Spawner {
         Spawner { bin: bin.into(), root: root.into(), sockets, cgroups, tap_prefix: tap_prefix.into(), tap_owner: tap_owner.into(), next: AtomicU64::new(0) }
@@ -377,10 +392,10 @@ impl Spawner {
         if ready.is_zero() {
             bail!("out of time to start firecracker");
         }
+        let tap = free_tap(&self.tap_prefix, Path::new("/sys/class/net"))?;
         let n = self.next.fetch_add(1, Ordering::SeqCst);
         // Named by this process's identity, not its pid alone: never a dead one's with the same pid.
         let id = format!("idle-{}-{n}", crate::host::Ident::me().key());
-        let tap = format!("{}{n:x}", self.tap_prefix);
         let dir = self.root.join(&id);
         let cgroup = self.cgroups.as_ref().map(|root| root.join(&id));
         let made = {
@@ -437,6 +452,43 @@ mod tests {
 
     use std::os::unix::net::UnixListener;
     use std::thread::JoinHandle;
+
+    #[test]
+    fn spawner_reuses_tap_names_past_256_and_4096_takes() {
+        // Six prefix bytes and six pid digits leave two suffix digits; five leave three.
+        for prefix in ["abcdef3ffffft", "abcde3ffffft"] {
+            let interfaces = crate::test_util::TempDir::new("tap-names");
+            let mut live = std::collections::VecDeque::new();
+            for take in 0..5000 {
+                // The allocation step of take(), with sysfs replaced by fake live interfaces.
+                let tap = free_tap(prefix, &interfaces).unwrap();
+                assert!(tap.len() <= 15, "take {take}: {tap}");
+                assert!(!live.contains(&tap), "take {take}: duplicate live tap {tap}");
+                assert_eq!(tap, format!("{prefix}{:x}", take % 8), "lowest free suffix");
+                std::fs::create_dir(interfaces.join(&tap)).unwrap();
+                live.push_back(tap);
+                if live.len() == 8 {
+                    std::fs::remove_dir(interfaces.join(live.pop_front().unwrap())).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn spawner_refuses_overlong_tap_before_probing_or_spawning() {
+        let interfaces = crate::test_util::TempDir::new("tap-full");
+        let prefix = "abcdef3ffffft";
+        for n in 0..256 {
+            std::fs::create_dir(interfaces.join(format!("{prefix}{n:x}"))).unwrap();
+        }
+        let error = free_tap(prefix, &interfaces).unwrap_err().to_string();
+        assert!(error.contains("abcdef3ffffft100") && error.contains("15 bytes"), "{error}");
+        // Even an invalid prefix is checked before looking at the interface directory.
+        let error = free_tap("abcdefgh3ffffft", &interfaces.join("absent")).unwrap_err().to_string();
+        assert!(error.contains("abcdefgh3ffffft0") && error.contains("15 bytes"), "{error}");
+        std::fs::remove_dir(interfaces.join(format!("{prefix}80"))).unwrap();
+        assert_eq!(free_tap(prefix, &interfaces).unwrap(), format!("{prefix}80"));
+    }
 
     struct Server {
         path: PathBuf,
