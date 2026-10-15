@@ -6,7 +6,6 @@ use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -189,8 +188,8 @@ impl Meta {
     }
 
     /// Files whose stat matches `cache` (or the creation stamp) are trusted; others are
-    /// rehashed if `rehash`, else rejected. Returns whether anything was rehashed.
-    fn verify(&self, paths: &Paths, dir: &Path, cache: &mut BTreeMap<String, Stamp>, rehash: bool) -> Result<bool> {
+    /// rehashed. Returns whether anything was rehashed.
+    fn verify(&self, paths: &Paths, dir: &Path, cache: &mut BTreeMap<String, Stamp>) -> Result<bool> {
         if self.id.is_empty() || self.components.len() != 5 || content_id(&self.components, self.image.as_ref()) != self.id {
             bail!("template at {} has no valid content id; recreate it with `flexvm template`", dir.display());
         }
@@ -200,9 +199,6 @@ impl Meta {
             let stamp = Stamp::of(&std::fs::metadata(&path).map_err(|e| format!("template component {}: {e}", path.display()))?);
             if cache.get(name).unwrap_or(&component.metadata) == &stamp {
                 continue;
-            }
-            if !rehash {
-                bail!("template component {} changed since preflight", path.display());
             }
             let now = hash_file(&path)?;
             if now.hash != component.hash {
@@ -243,8 +239,6 @@ pub struct Template {
     pub meta: Meta,
     /// `(first_page, count)` runs a fresh VM touches on its way to ready.
     pub working_set: Vec<(u64, u64)>,
-    /// Its guest agent predates `START`, so starts use `NET` and leave the clock alone.
-    pub legacy_agent: AtomicBool,
     /// Pages Firecracker touches loading the snapshot, the same in every VM: a migration
     /// source sends them with the vmstate so the target need not fault them one by one.
     load_set: Mutex<BTreeSet<u64>>,
@@ -297,13 +291,12 @@ impl Template {
             None => Template::open(paths, name)?,
         };
         tpl.check_id(id)?;
-        tpl.verify(paths, true)?;
+        tpl.verify(paths)?;
         Ok(tpl)
     }
 
     pub fn open_dir(name: &str, dir: PathBuf) -> Result<Arc<Template>> {
-        // All reads, the vmstate Firecracker loads included, go through one directory handle:
-        // a pre-generations template is replaced by renaming over its path.
+        // All reads, the vmstate Firecracker loads included, go through one directory handle.
         let handle = File::open(&dir).map_err(|e| format!("template {name:?}: {e}"))?;
         let fixed = PathBuf::from(format!("/proc/{}/fd/{}", std::process::id(), handle.as_raw_fd()));
         let meta: Meta = serde_json::from_slice(&std::fs::read(fixed.join("meta.json")).map_err(|e| format!("template {name:?}: {e}"))?)?;
@@ -320,7 +313,6 @@ impl Template {
             dir,
             meta,
             working_set,
-            legacy_agent: AtomicBool::new(false),
             load_set: Mutex::default(),
             map: map as *const u8,
             len,
@@ -347,11 +339,11 @@ impl Template {
         self.load_set.lock().unwrap().iter().copied().collect()
     }
 
-    /// Stat only unless `rehash` and a file changed. Never call on the run path.
-    pub fn verify(&self, paths: &Paths, rehash: bool) -> Result<()> {
+    /// Rehash files whose stat changed. Never call on the run path.
+    pub fn verify(&self, paths: &Paths) -> Result<()> {
         let cache = &mut self.verified.lock().unwrap();
         // Through the handle: `dir` may name another template by now.
-        if self.meta.verify(paths, &self.fixed, cache, rehash)? {
+        if self.meta.verify(paths, &self.fixed, cache)? {
             let mut meta = self.meta.clone();
             for (name, stamp) in cache.iter() {
                 meta.components.get_mut(name).unwrap().metadata = stamp.clone();
@@ -463,7 +455,7 @@ fn record_working_set(paths: &Paths, name: &str, tap: &str, sockets: &Arc<Socket
     fc.load_snapshot(&tpl.vmstate(), tap, Some(true), crate::fc::API_TIMEOUT)?;
     fc.resume()?;
     retry(Duration::from_secs(10), Duration::from_millis(10), || guest::ping(&fc.sockets.vsock))?;
-    guest::start(&fc.sockets.vsock, "10.255.255.254".parse()?, None, &tpl.legacy_agent)?;
+    guest::start(&fc.sockets.vsock, "10.255.255.254".parse()?, None)?;
     if tpl.meta.image.as_ref().is_some_and(|i| !i.warm) {
         guest::start_app(&fc.sockets.vsock)?;
     }
@@ -573,19 +565,6 @@ fn publish(paths: &Paths, name: &str, staged: &Path) -> Result<()> {
     let tmp = paths.templates.join(format!(".{name}.link-{}", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
     std::os::unix::fs::symlink(Path::new(GENERATIONS).join(&meta.id), &tmp)?;
-    // A pre-generations directory becomes a generation itself, or is kept aside without an id.
-    if std::fs::symlink_metadata(&live).is_ok_and(|m| m.is_dir()) {
-        let id = std::fs::read(live.join("meta.json"))
-            .ok()
-            .and_then(|b| serde_json::from_slice::<Meta>(&b).ok())
-            .map(|m| m.id)
-            .filter(|id| !id.is_empty() && !id.contains('/') && !gens.join(id).exists());
-        let aside = match id {
-            Some(id) => gens.join(id),
-            None => gens.join(format!("legacy-{name}-{}", std::process::id())),
-        };
-        std::fs::rename(&live, &aside)?;
-    }
     crate::util::sync_dir(&gens)?;
     std::fs::rename(&tmp, &live)?;
     Ok(crate::util::sync_dir(&paths.templates)?)
@@ -739,12 +718,12 @@ mod tests {
             std::fs::rename(tmp, path).unwrap();
         }
 
-        fn verify(&self, meta: &Meta, cache: &mut BTreeMap<String, Stamp>, rehash: bool) -> Result<bool> {
-            meta.verify(&self.paths, &self.dir, cache, rehash)
+        fn verify(&self, meta: &Meta, cache: &mut BTreeMap<String, Stamp>) -> Result<bool> {
+            meta.verify(&self.paths, &self.dir, cache)
         }
 
-        fn fresh(&self, rehash: bool) -> Result<bool> {
-            self.verify(&self.meta, &mut BTreeMap::new(), rehash)
+        fn fresh(&self) -> Result<bool> {
+            self.verify(&self.meta, &mut BTreeMap::new())
         }
 
         fn write_meta(&self, meta: &Meta, dir: &Path) {
@@ -779,24 +758,17 @@ mod tests {
             g.sort();
             g
         };
-        // A template from before generations: a plain directory, with an id.
-        std::fs::create_dir_all(f.dir.join("t")).unwrap();
-        std::fs::write(f.dir.join("t/vmstate"), "legacy").unwrap();
-        f.write_meta(&Meta { id: "l".into(), ..f.meta.clone() }, &f.dir.join("t"));
-        assert_eq!(current(), "legacy");
         publish(&f.paths, "t", &stage("a")).unwrap();
         assert_eq!(current(), "a");
-        // Kept, as the generation of its own content id.
-        assert_eq!(std::fs::read_to_string(f.dir.join(GENERATIONS).join("l/vmstate")).unwrap(), "legacy");
         let a = Template::resolve(&f.paths, "t").unwrap();
         publish(&f.paths, "t", &stage("b")).unwrap();
         assert_eq!(current(), "b");
         // Whoever resolved `a` before the swap still reads a's files.
         assert_eq!(std::fs::read_to_string(a.join("vmstate")).unwrap(), "a");
-        assert_eq!(gens(), ["a", "b", "l"]);
+        assert_eq!(gens(), ["a", "b"]);
         publish(&f.paths, "t", &stage("c")).unwrap();
         assert_eq!(current(), "c");
-        assert_eq!(gens(), ["a", "b", "c", "l"]);
+        assert_eq!(gens(), ["a", "b", "c"]);
         assert_eq!(Template::generation(&f.paths, "a"), Some(f.dir.join(GENERATIONS).join("a")));
         assert_eq!(Template::generation(&f.paths, "x"), None);
     }
@@ -810,13 +782,13 @@ mod tests {
             component.metadata.mtime += 1;
         }
         assert_eq!(content_id(&meta.components, None), f.meta.id);
-        f.verify(&meta, &mut BTreeMap::new(), true).unwrap();
+        f.verify(&meta, &mut BTreeMap::new()).unwrap();
         meta.id = "wrong".into();
-        assert!(f.verify(&meta, &mut BTreeMap::new(), true).is_err());
+        assert!(f.verify(&meta, &mut BTreeMap::new()).is_err());
         // Templates from before content ids must be recreated.
         meta.id.clear();
         meta.components.clear();
-        assert!(f.verify(&meta, &mut BTreeMap::new(), true).is_err());
+        assert!(f.verify(&meta, &mut BTreeMap::new()).is_err());
     }
 
     #[test]
@@ -840,9 +812,9 @@ mod tests {
         let mut meta = f.meta.clone();
         meta.image = Some(image("sha256:a", "arg /x\n"));
         meta.identify(&f.paths, &f.dir).unwrap();
-        f.verify(&meta, &mut BTreeMap::new(), false).unwrap();
+        f.verify(&meta, &mut BTreeMap::new()).unwrap();
         meta.image.as_mut().unwrap().digest = "sha256:b".into();
-        assert!(f.verify(&meta, &mut BTreeMap::new(), false).is_err());
+        assert!(f.verify(&meta, &mut BTreeMap::new()).is_err());
     }
 
     #[test]
@@ -850,26 +822,24 @@ mod tests {
         for name in ["vmstate", "mem", "rootfs", "kernel", "firecracker"] {
             let f = Fixture::new();
             let mut cache = BTreeMap::new();
-            f.verify(&f.meta, &mut cache, true).unwrap();
+            f.verify(&f.meta, &mut cache).unwrap();
             // Replacement changes inode even for equal-size content.
             f.replace(name, &vec![b'x'; name.len()]);
-            let error = f.verify(&f.meta, &mut cache, true).unwrap_err().to_string();
+            let error = f.verify(&f.meta, &mut cache).unwrap_err().to_string();
             assert!(error.contains("does not match"), "{error}");
         }
     }
 
     #[test]
-    fn cache_refresh_requires_preflight() {
+    fn cache_refresh_rehashes_changed_files() {
         let f = Fixture::new();
         let mut cache = BTreeMap::new();
-        f.verify(&f.meta, &mut cache, false).unwrap();
+        f.verify(&f.meta, &mut cache).unwrap();
         f.replace("rootfs", b"rootfs");
-        assert!(f.verify(&f.meta, &mut cache, false).is_err());
-        f.verify(&f.meta, &mut cache, true).unwrap();
-        f.verify(&f.meta, &mut cache, false).unwrap();
+        assert!(f.verify(&f.meta, &mut cache).unwrap());
+        assert!(!f.verify(&f.meta, &mut cache).unwrap());
         f.replace("rootfs", b"broken");
-        assert!(f.verify(&f.meta, &mut cache, true).is_err());
-        assert!(f.verify(&f.meta, &mut cache, false).is_err());
+        assert!(f.verify(&f.meta, &mut cache).is_err());
     }
 
     #[test]
@@ -908,8 +878,7 @@ mod tests {
         assert!(error.contains(&f.meta.id));
         f.replace("kernel", b"changed");
         Template::open(&f.paths, "").unwrap();
-        assert!(tpl.verify(&f.paths, false).is_err());
-        assert!(tpl.verify(&f.paths, true).is_err());
+        assert!(tpl.verify(&f.paths).is_err());
     }
 
     #[test]
@@ -919,12 +888,11 @@ mod tests {
         let original = Stamp::of(&file.metadata().unwrap());
         file.set_len(original.size + 1).unwrap();
         assert_ne!(Stamp::of(&file.metadata().unwrap()).size, original.size);
-        assert!(f.fresh(false).is_err());
+        assert!(f.fresh().is_err());
         file.set_len(original.size).unwrap();
         set_mtime(&file, original.mtime + 1, original.mtime_nsec);
         assert_ne!(Stamp::of(&file.metadata().unwrap()).mtime, original.mtime);
-        assert!(f.fresh(false).is_err());
-        f.fresh(true).unwrap();
+        assert!(f.fresh().unwrap());
     }
 
     #[test]
@@ -932,9 +900,10 @@ mod tests {
         let f = Fixture::new();
         f.write_meta(&f.meta, &f.dir);
         f.replace("rootfs", b"rootfs");
-        assert!(Template::open(&f.paths, "").unwrap().verify(&f.paths, false).is_err());
-        Template::open(&f.paths, "").unwrap().verify(&f.paths, true).unwrap();
-        Template::open(&f.paths, "").unwrap().verify(&f.paths, false).unwrap();
+        Template::open(&f.paths, "").unwrap().verify(&f.paths).unwrap();
+        let meta: Meta = serde_json::from_slice(&std::fs::read(f.dir.join("meta.json")).unwrap()).unwrap();
+        assert!(!f.verify(&meta, &mut BTreeMap::new()).unwrap());
+        Template::open(&f.paths, "").unwrap().verify(&f.paths).unwrap();
     }
 
     #[test]
@@ -945,24 +914,23 @@ mod tests {
         f.replace("rootfs", b"rootfs");
         std::fs::remove_file(f.dir.join("meta.json")).unwrap();
         std::fs::create_dir(f.dir.join("meta.json")).unwrap();
-        assert!(tpl.verify(&f.paths, true).is_err() && tpl.verify(&f.paths, true).is_err());
+        assert!(tpl.verify(&f.paths).is_err() && tpl.verify(&f.paths).is_err());
         std::fs::remove_dir(f.dir.join("meta.json")).unwrap();
-        tpl.verify(&f.paths, true).unwrap();
-        Template::open(&f.paths, "").unwrap().verify(&f.paths, false).unwrap();
+        tpl.verify(&f.paths).unwrap();
+        Template::open(&f.paths, "").unwrap().verify(&f.paths).unwrap();
     }
 
     #[test]
     fn same_size_rewrite_with_restored_mtime_is_caught() {
         let f = Fixture::new();
         let mut cache = BTreeMap::new();
-        f.verify(&f.meta, &mut cache, true).unwrap();
+        f.verify(&f.meta, &mut cache).unwrap();
         let file = File::options().write(true).open(f.dir.join("kernel")).unwrap();
         let before = Stamp::of(&file.metadata().unwrap());
         std::thread::sleep(Duration::from_millis(10));
         file.write_all_at(b"KERNEL", 0).unwrap();
         set_mtime(&file, before.mtime, before.mtime_nsec);
-        assert!(f.verify(&f.meta, &mut cache, false).is_err());
-        let error = f.verify(&f.meta, &mut cache, true).unwrap_err().to_string();
+        let error = f.verify(&f.meta, &mut cache).unwrap_err().to_string();
         assert!(error.contains("does not match"), "{error}");
     }
 }

@@ -661,12 +661,11 @@ impl Vm {
     /// Returns the offset (ms); the guest ends up behind by a request's transit, so slow
     /// round trips are repeated.
     pub fn sync_clock(&self, deadline: Instant) -> Result<f64> {
-        static WARNED: AtomicBool = AtomicBool::new(false);
         let mut first = None;
         for tries in 1.. {
             let start = Instant::now();
-            match crate::guest::clock(&self.vsock, &self.template.legacy_agent, deadline.saturating_duration_since(start)) {
-                Ok(Some(off)) => {
+            match crate::guest::clock(&self.vsock, deadline.saturating_duration_since(start)) {
+                Ok(off) => {
                     let off = *first.get_or_insert(off);
                     if start.elapsed() < CLOCK_RTT || Instant::now() + Duration::from_millis(200) >= deadline {
                         return Ok(off);
@@ -675,12 +674,6 @@ impl Vm {
                     if tries >= 3 {
                         std::thread::sleep(Duration::from_millis(100));
                     }
-                }
-                Ok(None) => {
-                    if first.is_none() && !WARNED.swap(true, Ordering::Relaxed) {
-                        crate::log!("vm {}: its guest agent cannot set the clock (no CLOCK); clocks of such VMs are left alone", self.name);
-                    }
-                    return Ok(first.unwrap_or(0.0));
                 }
                 Err(e) => {
                     self.clock_unsure.store(true, Ordering::SeqCst);
@@ -759,7 +752,7 @@ impl Vm {
     /// A failure leaves the clock unsure (see `leave`).
     pub fn guest_net(&self, ip: Ipv4Addr, dns: Option<&str>) -> Result<()> {
         self.running_here()?;
-        let res = crate::guest::start(&self.vsock, ip, dns, &self.template.legacy_agent);
+        let res = crate::guest::start(&self.vsock, ip, dns);
         if res.is_err() {
             self.clock_unsure.store(true, Ordering::SeqCst);
         }
