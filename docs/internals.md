@@ -507,6 +507,26 @@ through, so the checkpoint is exactly the memory at the pause.
   loaded host) before unprotecting it; writers take the rescued copy. Past
   256 MiB of rescued copies a fault waits for the writers to reach its page
   instead. Writers never unprotect anything, so tracking continues.
+- **Hot pages** (#235). Every `UFFDIO_WRITEPROTECT`, protect or unprotect,
+  makes KVM zap its mappings of the whole range (6.18 ignores the notifier's
+  event type) and flush every vCPU's TLB: after the resume the guest
+  refaulted each page it touched (about 2,500 here), and each write fault
+  waited for a rescue and an unprotect, one at a time. So the pause first
+  copies the pages dirtied both since the last pause and in the interval
+  before it (4 threads, about 0.5 µs a page), into memory allocated before
+  it, and leaves them unprotected and dirty: the writer takes the copy.
+  The next checkpoint copies them again and compares: pages unchanged since
+  are left out of a delta (byte for byte what its parent has; only while
+  that parent is the last checkpoint taken, which a failure or re-arming
+  forgets), and a 64-page block with none changed is protected again. All
+  or none, up to 64 MiB (`FLEXVM_HOT_MIB`, 0 to turn it off): copying part
+  of a larger set costs the pause as much but leaves the vCPUs writing the
+  rest stalling as before. Keeps up to twice that in memory per VM. Saving
+  device state writes guest memory (a vsock transport reset), so the copy
+  starts after it. `ckpt_stall`, 2 vCPUs × 4 MiB, 3 runs × 10 checkpoints:
+  quiet, stall p50 23.8 → 14.5 ms (p90 30.6 → 22.3), pause 7.1 → 9.4 ms, the
+  guest's gap 0.5 ms over it (was 7.5), 64 → 10 write faults, 2,533 → 58 KVM
+  page faults; 24 host spinners, 54.3 → 35.3 ms (p90 144.9 → 85.6).
 - **KVM and devices.** KVM's own writes to guest memory (kvmclock through
   its pfn cache, steal time and PV EOI through user accesses) go through
   the host page tables, so they fault like the guest's: protecting a range
