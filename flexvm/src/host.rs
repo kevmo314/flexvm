@@ -2271,10 +2271,25 @@ pub fn fault(name: &str) -> bool {
     c.as_ref().is_some_and(|(_, armed)| armed.get(name).is_some_and(|&until| now < until))
 }
 
+/// Test hook: MemAvailable (MiB) as a test wrote it to `RUN/mem_available_mib`, in place of the host's.
+pub fn mem_available_override() -> Option<u64> {
+    if !faults_on() {
+        return None;
+    }
+    std::fs::read_to_string(RUN_DIR.get()?.join("mem_available_mib")).ok()?.trim().parse().ok()
+}
+
 /// Test hook: a window for a test to kill the process here.
 pub fn stall(name: &str) {
     if fault(name) {
         std::thread::sleep(Duration::from_secs(3));
+    }
+}
+
+/// Test hook: parks here while `name` is armed (its arming bounds the wait), until a test disarms it.
+pub fn gate(name: &str) {
+    while fault(name) {
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 

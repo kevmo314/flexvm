@@ -1652,10 +1652,14 @@ fn arrival_more(granted: u64, (need, cap): (u64, u64)) -> u64 {
     crate::limit::allowance(need).min(cap.max(need)).saturating_sub(granted)
 }
 
-/// None if it cannot be read: never taken for 0 (pressure). Test fault `no_meminfo`.
+/// None if it cannot be read: never taken for 0 (pressure). Test fault `no_meminfo`;
+/// a test's `mem_available_override` stands in for it.
 pub fn host_available_mib() -> Option<u64> {
     if fault("no_meminfo") {
         return None;
+    }
+    if let Some(mib) = crate::host::mem_available_override() {
+        return Some(mib);
     }
     Some(proc_kb("/proc/meminfo", "MemAvailable")? >> 20)
 }

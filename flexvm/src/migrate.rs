@@ -695,6 +695,7 @@ impl Proc {
         t.mark("claim_ip");
         let idle = self.spawner.take(None)?;
         crate::host::stall("incoming_stall");
+        crate::host::gate("incoming_gate");
         t.mark("spawn");
         let load_set = crate::standby::load_set(&self.host, &tpl);
         let vm = Vm::prepare(idle, tpl, t)?;
