@@ -667,7 +667,7 @@ impl Host {
             a.rev = a.rev.max(rev);
         }
         let me = Ident::me();
-        (a.holder, a.holder_id, a.held, a.arriving, a.leaving) = (Some(holder.into()), Some(me.clone()), gen, mig, false);
+        (a.holder, a.holder_id, a.held, a.arriving, a.leaving) = (Some(holder.into()), Some(me.clone()), gen, mig, None);
         self.put_addr(ip, &a, true)?;
         Ok(AddrClaim { host: self.clone(), ip, gen, rev, holder: holder.into(), id: me, kept: false, fresh: false })
     }
@@ -687,18 +687,19 @@ impl Host {
         self.update(l, ip, false, |a| {
             let by = |h: &Ident| id.is_none_or(|id| id == h);
             if a.holder.as_deref() == Some(holder) && a.holder_id.as_ref().is_none_or(by) {
-                (a.holder, a.holder_id, a.arriving, a.leaving) = (None, None, None, false);
+                (a.holder, a.holder_id, a.arriving, a.leaving) = (None, None, None, None);
             }
         })
     }
 
     /// True if this made the loan (only then may its maker undo it). On any
     /// host, the source's own claim is marked `leaving` until it `stay`s.
-    pub fn lend(&self, l: &Locked, ip: Ipv4Addr, gen: u64) -> Result<bool> {
+    /// `mig` to `to`: what a sweep asks should the source die meanwhile.
+    pub fn lend(&self, l: &Locked, ip: Ipv4Addr, gen: u64, mig: u64, to: &str) -> Result<bool> {
         let (home, me) = (self.cfg.range()?.contains(ip), Ident::me());
         self.update(l, ip, true, |a| {
             if a.holder_id.as_ref() == Some(&me) {
-                a.leaving = true;
+                a.leaving = Some(Leaving { mig, to: to.into() });
             }
             home && a.lent.replace(gen) != Some(gen)
         })
@@ -708,7 +709,11 @@ impl Host {
     /// death is the VM's once more.
     pub fn stay(&self, l: &Locked, ip: Ipv4Addr) -> Result<()> {
         let me = Ident::me();
-        self.update(l, ip, true, |a| a.leaving &= a.holder_id.as_ref() != Some(&me))
+        self.update(l, ip, true, |a| {
+            if a.holder_id.as_ref() == Some(&me) {
+                a.leaving = None;
+            }
+        })
     }
 
     /// Migration `mig`'s record is released: the VM it brought to `ip` is this
@@ -1045,7 +1050,7 @@ impl Host {
                 Ok(r["outcome"].as_str().unwrap_or_default().to_string())
             },
             |to, id| drop(crate::vmproc::peer_call(to, serde_json::json!({"op": "migration", "mig": id, "done": true}))),
-            |ip, gen| crate::vmproc::tell_peers(&host, serde_json::json!({"op": "route", "ip": ip.to_string(), "gen": gen})),
+            |_, _| host.deliver_withdrawals(),
         );
     }
 
@@ -1089,7 +1094,7 @@ impl Host {
                 }
                 Ok("aborted") => {
                     let freed = self.lock().and_then(|l| {
-                        let current = self.observe(&l, o.ip, o.gen, 0, None)?;
+                        let current = self.withdraw_noted(&l, o.ip, o.gen)?;
                         self.unlend(&l, o.ip, o.gen)?;
                         // A newer generation here keeps its route.
                         if current && self.holder(&l, o.ip)?.is_none() && !self.reinstall(&l, o.ip, None)? {
@@ -1260,10 +1265,13 @@ pub struct Addr {
     /// runs it again), after it is (`withdraw_dead` reads the record).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arriving: Option<u64>,
-    /// Its holder is a migration source that may have handed the VM on (from
-    /// its loan until it `stay`s): its death is not the VM's.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub leaving: bool,
+    /// Its holder is the source of this migration, which may have handed the
+    /// VM on (from its loan until it `stay`s): should it die meanwhile, the
+    /// outcome is owed (`withdraw_dead`), settled once the target says.
+    /// (Records written before this field read as not leaving: no
+    /// compatibility is kept with them.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leaving: Option<Leaving>,
 }
 
 impl Addr {
@@ -1326,6 +1334,13 @@ pub enum Mig {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ip: Option<Ipv4Addr>,
     },
+}
+
+/// A migration away under way (`Addr::leaving`): its id and target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Leaving {
+    pub mig: u64,
+    pub to: String,
 }
 
 /// A loan: its generation, and the migrations (id, target) whose outcome is owed for it.
@@ -1729,9 +1744,8 @@ impl Host {
         let l = self.lock()?;
         // What the migrations say, read whole or not at all: a record that cannot be read may be the one that
         // keeps an address (an outcome owed, `owe`; an arrival still pulling; a release cut short).
-        let why = |e: Error| format!("{e}; dead vms' addresses are withdrawn on a later sweep");
-        let owed: HashSet<Ipv4Addr> = self.records::<Owed>("owed").map_err(why)?.into_iter().map(|(_, o)| o.ip).collect();
-        let migs = self.records::<Mig>("migs").map_err(why)?;
+        let owed: HashSet<Ipv4Addr> = self.records::<Owed>("owed")?.into_iter().map(|(_, o)| o.ip).collect();
+        let migs = self.records::<Mig>("migs")?;
         let pulling: Vec<Ident> = migs
             .iter()
             .filter_map(|(_, m)| match m {
@@ -1740,21 +1754,36 @@ impl Host {
             })
             .collect();
         let released: HashSet<(u64, Ipv4Addr)> = migs.iter().filter_map(|(id, m)| Some((*id, released_ip(m)?))).collect();
-        let peers = self.config_now().peers;
         for ip in candidates {
             let a = match self.addr(&l, ip) {
-                Ok(a) if !owed.contains(&ip) && self.died_holding(&a, ip, &pulling, &released) => a,
+                Ok(a) if !owed.contains(&ip) => a,
                 _ => continue,
             };
             let (name, gen) = (a.holder.as_deref().unwrap_or_default(), a.held);
-            // The notice first: recorded, a withdrawal always reaches the peers.
-            let noted = || {
-                if !peers.is_empty() {
-                    store(&self.notice_path(ip), &Notice { gen, peers: peers.clone(), tries: 0, next_ms: 0 }, true)?;
+            // A source that died mid-migration (its abort's resume included): what became of
+            // the VM is its target's to say, as for a source killed while reconciling.
+            if let (Some(left), Some(by)) = (a.leaving.as_ref(), a.holder_id.as_ref()) {
+                if a.current(gen) && self.dead_and_reaped(&a) {
+                    let owe = || {
+                        self.owe(left.mig, &Owed { to: left.to.clone(), ip, gen, by: by.clone() })?;
+                        self.release(&l, ip, name, Some(by))
+                    };
+                    match owe() {
+                        Ok(()) => crate::log!(
+                            "vm {name} died as the source of migration {} to {}: {ip} (generation {gen}) is owed until {} says what became of it",
+                            left.mig,
+                            left.to,
+                            left.to
+                        ),
+                        Err(e) => crate::log!("vm {name} died as the source of migration {}: recording it as owed: {e}; retried on the next sweep", left.mig),
+                    }
                 }
-                self.observe(&l, ip, gen, 0, None)
-            };
-            if let Err(e) = noted() {
+                continue;
+            }
+            if !self.died_holding(&a, ip, &pulling, &released) {
+                continue;
+            }
+            if let Err(e) = self.withdraw_noted(&l, ip, gen) {
                 crate::log!("withdrawing {ip} (generation {gen}) of dead vm {name}: {e}; retried on the next sweep");
                 continue;
             }
@@ -1765,6 +1794,25 @@ impl Host {
         Ok(())
     }
 
+    /// Withdraws `gen` of `ip` here (`observe`), a notice for the peers
+    /// recorded first: the one way a withdrawal is made, so each reaches the
+    /// peers (`deliver_withdrawals`) whatever dies or is down meanwhile.
+    /// A notice of an older generation is replaced; a newer one is kept.
+    pub fn withdraw_noted(&self, l: &Locked, ip: Ipv4Addr, gen: u64) -> Result<bool> {
+        let peers = self.config_now().peers;
+        let path = self.notice_path(ip);
+        if !peers.is_empty() && load::<Notice>(&path).ok().flatten().is_none_or(|n| n.gen < gen) {
+            let peers = peers.into_iter().map(|peer| Unheard { peer, tries: 0, next_ms: 0 }).collect();
+            store(&path, &Notice { gen, peers }, true)?;
+        }
+        self.observe(l, ip, gen, 0, None)
+    }
+
+    /// Proven dead, with its Firecrackers reaped.
+    fn dead_and_reaped(&self, a: &Addr) -> bool {
+        a.holder_id.as_ref().is_some_and(|id| id.liveness() == Liveness::Gone) && !self.held(a)
+    }
+
     /// Records in `STATE/DIR` by id (`ID`; anything else there, a write's
     /// temp file, is not one). An error if the directory, an entry or a
     /// record cannot be read: never a partial list.
@@ -1773,16 +1821,16 @@ impl Host {
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => bail!("cannot read {}: {e}", dir.display()),
+            Err(e) => bail!("cannot read {}: {e}{REPAIR}", dir.display()),
         };
         let mut out = Vec::new();
         for e in entries {
-            let e = e.map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
+            let e = e.map_err(|e| format!("cannot read {}: {e}{REPAIR}", dir.display()))?;
             let Some(id) = e.file_name().to_str().filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).and_then(|n| n.parse().ok()) else {
                 continue;
             };
             // Gone meanwhile (settled or retired): nothing to keep.
-            if let Some(r) = load::<T>(&e.path()).map_err(|e| format!("cannot read a record in {}: {e}", dir.display()))? {
+            if let Some(r) = load::<T>(&e.path()).map_err(|err| format!("cannot read {}: {err}{REPAIR}", e.path().display()))? {
                 out.push((id, r));
             }
         }
@@ -1793,7 +1841,7 @@ impl Host {
     /// its VM with it, its generation still current. Not if a checkpoint here
     /// keeps the generation (suspended, or quarantined until a reboot shows
     /// whether it may resume), nor if the VM may live on elsewhere: a source
-    /// that may have handed it on (`leaving`), an arrival whose source may run
+    /// that may have handed it on (`leaving`: owed instead), an arrival whose source may run
     /// it again (`arriving`, or the holder owns a pending or committed
     /// record), or a loan of its generation here. An arrival whose record is
     /// released (its release cut short) is the holder's own VM, any loan of it
@@ -1801,13 +1849,12 @@ impl Host {
     fn died_holding(&self, a: &Addr, ip: Ipv4Addr, pulling: &[Ident], released: &HashSet<(u64, Ipv4Addr)>) -> bool {
         let (Some(name), Some(id)) = (a.holder.as_deref(), a.holder_id.as_ref()) else { return false };
         let settled = a.arriving.is_some_and(|mig| released.contains(&(mig, ip)));
-        !a.leaving
+        a.leaving.is_none()
             && (a.arriving.is_none() || settled)
             && !pulling.contains(id)
             && a.current(a.held)
             && (settled || a.lent.is_none_or(|lent| lent < a.held))
-            && id.liveness() == Liveness::Gone
-            && !self.held(a)
+            && self.dead_and_reaped(a)
             && !self.suspended(name).join("QUARANTINE").exists()
     }
 
@@ -1815,64 +1862,93 @@ impl Host {
         self.state.join("withdrawals").join(ip.to_string())
     }
 
-    /// Tells the peers of the withdrawals `withdraw_dead` recorded, each until
-    /// it answers: a peer that cannot be reached is asked again on a later
-    /// sweep, after a backoff, `WITHDRAWAL_TRIES` times at most.
+    /// Tells the peers of the withdrawals recorded (`withdraw_noted`), each
+    /// peer until it answers. One that cannot be reached is asked again after
+    /// its own backoff (doubling, up to `WITHDRAWAL_MAX_BACKOFF`, then that
+    /// often for good): what was never asked goes first, so peers that are
+    /// down never crowd out one that is up. A peer no longer configured is not asked.
     pub fn deliver_withdrawals(&self) {
         self.deliver_withdrawals_with(WITHDRAWAL_CALLS, wall_ms(), |peer, req| crate::vmproc::peer_call(peer, req.clone()).map(drop));
     }
 
-    fn deliver_withdrawals_with(&self, budget: usize, now: u64, mut tell: impl FnMut(&str, &serde_json::Value) -> Result<()>) {
+    fn deliver_withdrawals_with(&self, budget: usize, now: u64, tell: impl Fn(&str, &serde_json::Value) -> Result<()> + Sync) {
         let Ok(lock) = File::create(self.run.join(".withdrawals.lock")) else { return };
         if flock(&lock, libc::LOCK_EX | libc::LOCK_NB).is_err() {
             return;
         }
-        let ips =
-            std::fs::read_dir(self.state.join("withdrawals")).into_iter().flatten().flatten().filter_map(|e| e.file_name().to_str()?.parse::<Ipv4Addr>().ok());
-        let (mut calls, mut unavailable) = (0, HashSet::new());
-        for ip in ips {
-            let Ok(Some(mut n)) = load::<Notice>(&self.notice_path(ip)) else { continue };
-            if n.next_ms > now || calls >= budget {
-                continue;
-            }
-            let req = serde_json::json!({"op": "route", "ip": ip.to_string(), "gen": n.gen});
-            let mut told = Vec::new();
-            for peer in &n.peers {
-                if unavailable.contains(peer) {
-                    continue;
+        let peers = self.config_now().peers;
+        let notices: Vec<(Ipv4Addr, Notice)> = std::fs::read_dir(self.state.join("withdrawals"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| e.file_name().to_str()?.parse::<Ipv4Addr>().ok())
+            .filter_map(|ip| Some((ip, load::<Notice>(&self.notice_path(ip)).ok()??)))
+            .collect();
+        // Due calls, the longest waiting (never asked: 0) first.
+        let mut due: Vec<(u64, u32, Ipv4Addr, u64, String)> = notices
+            .iter()
+            .flat_map(|(ip, n)| {
+                n.peers.iter().filter(|u| u.next_ms <= now && peers.contains(&u.peer)).map(|u| (u.next_ms, u.tries, *ip, n.gen, u.peer.clone()))
+            })
+            .collect();
+        due.sort();
+        due.truncate(budget);
+        // At once: one slow or down peer holds up no other.
+        let answers: Vec<(Ipv4Addr, u64, String, Result<()>)> = std::thread::scope(|scope| {
+            let calls: Vec<_> = due
+                .into_iter()
+                .map(|(_, _, ip, gen, peer)| {
+                    let tell = &tell;
+                    scope.spawn(move || {
+                        let r = tell(&peer, &serde_json::json!({"op": "route", "ip": ip.to_string(), "gen": gen}));
+                        (ip, gen, peer, r)
+                    })
+                })
+                .collect();
+            calls.into_iter().filter_map(|c| c.join().ok()).collect()
+        });
+        // Under the host lock, from the notice as it is now: a newer withdrawal recorded meanwhile is kept whole.
+        let Ok(_l) = self.lock() else { return };
+        for (ip, _) in notices {
+            let path = self.notice_path(ip);
+            let Ok(Some(mut n)) = load::<Notice>(&path) else { continue };
+            let before = n.clone();
+            n.peers.retain(|u| {
+                let kept = peers.contains(&u.peer);
+                if !kept {
+                    crate::log!("{ip} generation {} is withdrawn; {} is no longer a peer, so it is not told", n.gen, u.peer);
                 }
-                if calls >= budget {
-                    break;
-                }
-                calls += 1;
-                match tell(peer, &req) {
-                    Ok(()) => told.push(peer.clone()),
+                kept
+            });
+            for (_, _, peer, r) in answers.iter().filter(|a| a.0 == ip && a.1 == n.gen) {
+                let Some(i) = n.peers.iter().position(|u| &u.peer == peer) else { continue };
+                match r {
+                    Ok(()) => drop(n.peers.remove(i)),
                     Err(e) => {
-                        crate::log!("telling {peer} that {ip} generation {} is withdrawn: {e}; asked again later", n.gen);
-                        unavailable.insert(peer.clone());
+                        let u = &mut n.peers[i];
+                        u.tries += 1;
+                        let backoff = withdrawal_backoff(u.tries);
+                        u.next_ms = now + backoff;
+                        // Once, as it reaches the cap.
+                        if backoff == withdrawal_backoff(u32::MAX) && withdrawal_backoff(u.tries - 1) < backoff {
+                            crate::log!(
+                                "{ip} generation {} is withdrawn, but {peer} has not heard after {} tries ({e}): asked again every {} s; if {peer} lent {ip}, `flexvm reclaim {ip}` there frees it",
+                                n.gen,
+                                u.tries,
+                                backoff / 1000
+                            );
+                        } else {
+                            crate::log!("telling {peer} that {ip} generation {} is withdrawn: {e}; asked again in {} s", n.gen, backoff / 1000);
+                        }
                     }
                 }
             }
-            n.peers.retain(|p| !told.contains(p));
-            // Under the host lock: a newer withdrawal of the address recorded meanwhile is kept.
-            let Ok(_l) = self.lock() else { continue };
-            if load::<Notice>(&self.notice_path(ip)).ok().flatten().is_none_or(|now| now.gen != n.gen) {
-                continue;
-            }
-            let path = self.notice_path(ip);
             if n.peers.is_empty() {
                 let _ = crate::util::unlink_durably(&path);
-                continue;
-            }
-            n.tries += 1;
-            if n.tries >= WITHDRAWAL_TRIES {
-                crate::log!("{ip} generation {} is withdrawn, but {} never heard: given up after {} tries", n.gen, n.peers.join(", "), n.tries);
-                let _ = crate::util::unlink_durably(&path);
-                continue;
-            }
-            n.next_ms = now + (WITHDRAWAL_BACKOFF.as_millis() as u64 * (1 << (n.tries - 1).min(7))).min(WITHDRAWAL_MAX_BACKOFF.as_millis() as u64);
-            if let Err(e) = store(&path, &n, true) {
-                crate::log!("withdrawal notice for {ip}: {e}");
+            } else if n != before {
+                if let Err(e) = store(&path, &n, true) {
+                    crate::log!("withdrawal notice for {ip}: {e}");
+                }
             }
         }
     }
@@ -1886,21 +1962,35 @@ fn released_ip(m: &Mig) -> Option<Ipv4Addr> {
     }
 }
 
-/// A withdrawal not yet heard by `peers` (`STATE/withdrawals/IP`).
+/// A withdrawal of generation `gen` that `peers` have not heard yet (`STATE/withdrawals/IP`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Notice {
     gen: u64,
-    peers: Vec<String>,
+    peers: Vec<Unheard>,
+}
+
+/// A peer yet to hear a withdrawal: its failed tries, and the wall-clock ms before which it is not asked again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Unheard {
+    peer: String,
     tries: u32,
-    /// Wall-clock ms before which it is not tried again.
     next_ms: u64,
 }
 
-/// Peer calls per delivery pass, tries per notice, and the backoff between tries (doubling, capped).
+/// Peer calls per delivery pass, and the backoff between a peer's tries (doubling, capped, never given up).
 const WITHDRAWAL_CALLS: usize = 8;
-const WITHDRAWAL_TRIES: u32 = 16;
 const WITHDRAWAL_BACKOFF: Duration = Duration::from_secs(30);
 const WITHDRAWAL_MAX_BACKOFF: Duration = Duration::from_secs(3600);
+
+/// Before a peer's next try, after `tries` failed: none before the first.
+fn withdrawal_backoff(tries: u32) -> u64 {
+    match tries {
+        0 => 0,
+        t => (WITHDRAWAL_BACKOFF.as_millis() as u64).saturating_mul(1 << (t - 1).min(16)).min(WITHDRAWAL_MAX_BACKOFF.as_millis() as u64),
+    }
+}
+
+const REPAIR: &str = "; no dead vm's address is withdrawn here until it is repaired or removed by hand (or the address taken back with `flexvm reclaim`)";
 
 /// Notices outlive boots: wall-clock time.
 fn wall_ms() -> u64 {
@@ -2289,7 +2379,7 @@ mod tests {
         b.keep();
         c.keep();
         assert!(h.claim_new(&l, "x", Some(a_ip)).is_err() && h.claim_new(&l, "x", Some(ip("10.9.9.9"))).is_err());
-        h.lend(&l, a_ip, g1).unwrap();
+        h.lend(&l, a_ip, g1, 1, "t").unwrap();
         a.release(&l).unwrap();
         assert!(h.claim_new(&l, "x", Some(a_ip)).is_err());
         assert!(!h.observe(&l, a_ip, g1 - 1, 0, None).unwrap(), "older withdrawal is stale");
@@ -2412,7 +2502,8 @@ mod tests {
         claim(ips[10], "owing", Some(owing.clone()), 4, &|_| ());
         h.owe(3, &Owed { to: "t".into(), ip: ips[10], gen: 4, by: owing.clone() }).unwrap();
         // A source that may have handed its VM on.
-        claim(ips[11], "leaving", Some(dead(999_999_940)), 4, &|a| a.leaving = true);
+        let leaving = |mig| Some(Leaving { mig, to: "c".into() });
+        claim(ips[11], "leaving", Some(dead(999_999_940)), 4, &|a| a.leaving = leaving(40));
         // Its migration record says it was still arriving, whatever the address says.
         let mig = |id: u64, m: Mig| store(&h.mig_path(id), &m, false).unwrap();
         let (pending, committed) = (dead(999_999_941), dead(999_999_942));
@@ -2426,7 +2517,7 @@ mod tests {
         claim(ips[15], "homecoming", Some(dead(999_999_944)), 4, &|a| (a.arriving, a.lent) = (Some(23), Some(4)));
         mig(23, Mig::Released { source: String::new(), by: None, ip: Some(ips[15]) });
         // Arrived and settled, then a source again: the old release is no proof.
-        claim(ips[16], "left-again", Some(dead(999_999_945)), 4, &|a| a.leaving = true);
+        claim(ips[16], "left-again", Some(dead(999_999_945)), 4, &|a| a.leaving = leaving(41));
         mig(24, Mig::Released { source: String::new(), by: None, ip: Some(ips[16]) });
         let before: Vec<Addr> = ips.iter().map(|&i| h.addr(&l, i).unwrap()).collect();
         drop(l);
@@ -2438,6 +2529,13 @@ mod tests {
                 0 | 9 | 14 | 15 => {
                     assert!(a.withdrawn && a.holder.is_none() && a.holder_id.is_none() && a.lent.is_none(), "{k}: {a:?}");
                     assert!(!a.current(before[k].held), "{k}");
+                }
+                // A dead source: owed to its target, the claim let go, nothing withdrawn.
+                11 | 16 => {
+                    let mig = if k == 11 { 40 } else { 41 };
+                    let o = load::<Owed>(&h.owed_path(mig)).unwrap().unwrap();
+                    assert!(o.to == "c" && o.ip == i && o.gen == 4 && Some(o.by) == before[k].holder_id, "{k}");
+                    assert!(a.current(4) && a.holder.is_none() && a.leaving.is_none(), "{k}: {a:?}");
                 }
                 _ => assert_eq!(a, before[k], "{k}: kept"),
             }
@@ -2460,15 +2558,15 @@ mod tests {
         let h = host("moving");
         let (home, away) = (ip("10.9.0.1"), ip("10.9.2.1"));
         let l = h.lock().unwrap();
-        let moving = |ip| h.addr(&h.lock().unwrap(), ip).unwrap().leaving;
+        let moving = |ip| h.addr(&h.lock().unwrap(), ip).unwrap().leaving.is_some();
         // A source, at home and elsewhere: moving from its loan until it stays.
         let c = h.claim_new(&l, "vm", Some(home)).unwrap();
-        assert!(!moving(home) && h.lend(&l, home, c.gen).unwrap() && moving(home));
+        assert!(!moving(home) && h.lend(&l, home, c.gen, 1, "t").unwrap() && moving(home));
         h.stay(&l, home).unwrap();
         assert!(!moving(home) && h.addr(&l, home).unwrap().lent == Some(c.gen), "the loan is its maker's to undo");
         h.unlend(&l, home, c.gen).unwrap();
         let d = h.claim_incoming(&l, "vm2", away, 7, None).unwrap();
-        assert!(!moving(away) && !h.lend(&l, away, 7).unwrap() && moving(away), "not lent elsewhere, yet moving");
+        assert!(!moving(away) && !h.lend(&l, away, 7, 2, "t").unwrap() && moving(away), "not lent elsewhere, yet moving");
         // Another instance's claim is not this source's.
         let mut a = h.addr(&l, away).unwrap();
         a.holder_id = Some(Ident { start: 1, ..Ident::me() });
@@ -2517,7 +2615,8 @@ mod tests {
         for dir in ["owed", "migs"] {
             let bad = h.state.join(dir).join("5");
             std::fs::write(&bad, b"{not json").unwrap();
-            assert!(h.withdraw_dead().unwrap_err().to_string().contains("later sweep"), "{dir}");
+            let e = h.withdraw_dead().unwrap_err().to_string();
+            assert!(e.contains(&bad.display().to_string()) && e.contains("repaired or removed by hand"), "{dir}: {e}");
             assert!(kept(&h), "{dir}");
             std::fs::remove_file(&bad).unwrap();
             // The directory itself.
@@ -2550,6 +2649,26 @@ mod tests {
         assert!(h.addr(&h.lock().unwrap(), x).unwrap().withdrawn);
     }
 
+    /// A delivery pass at `now` with `down` failing: who was asked.
+    fn deliver(h: &Host, budget: usize, now: u64, down: &[&str]) -> Vec<String> {
+        let asked = Mutex::new(Vec::new());
+        h.deliver_withdrawals_with(budget, now, |p, req| {
+            assert!(req["via"].is_null() && req["gen"].as_u64().is_some());
+            asked.lock().unwrap().push(p.to_string());
+            if down.contains(&p) {
+                bail!("down")
+            }
+            Ok(())
+        });
+        let mut asked = asked.into_inner().unwrap();
+        asked.sort();
+        asked
+    }
+
+    fn unheard(peers: &[&str]) -> Vec<Unheard> {
+        peers.iter().map(|p| Unheard { peer: p.to_string(), tries: 0, next_ms: 0 }).collect()
+    }
+
     #[test]
     fn withdrawals_are_redelivered_until_each_peer_has_them() {
         let mut h = host("notices");
@@ -2559,59 +2678,115 @@ mod tests {
         h.put_addr(x, &Addr { seen: 4, holder: Some("vm".into()), holder_id: Some(gone), held: 4, ..Addr::default() }, false).unwrap();
         h.withdraw_dead().unwrap();
         let notice = |h: &Host| load::<Notice>(&h.notice_path(x)).unwrap();
-        assert_eq!(notice(&h), Some(Notice { gen: 4, peers: vec!["p1".into(), "p2".into()], tries: 0, next_ms: 0 }), "recorded with the withdrawal");
-        let up = |down: &'static [&'static str]| {
-            let calls = std::cell::RefCell::new(Vec::new());
-            move |p: &str, req: &serde_json::Value| -> Result<()> {
-                assert!(req["via"].is_null() && req["gen"] == 4);
-                calls.borrow_mut().push(p.to_string());
-                if down.contains(&p) {
-                    bail!("down")
-                }
-                Ok(())
-            }
-        };
-        // p2 is down: p1 is told, p2 asked again only after the backoff.
-        h.deliver_withdrawals_with(8, 1000, up(&["p2"]));
+        assert_eq!(notice(&h), Some(Notice { gen: 4, peers: unheard(&["p1", "p2"]) }), "recorded with the withdrawal");
+        // p2 is down: p1 is told, p2 asked again only after its backoff.
+        assert_eq!(deliver(&h, 8, 1000, &["p2"]), ["p1", "p2"]);
         let n = notice(&h).unwrap();
-        assert!(n.peers == ["p2"] && n.tries == 1 && n.next_ms == 1000 + WITHDRAWAL_BACKOFF.as_millis() as u64, "{n:?}");
-        let mut asked = 0;
-        h.deliver_withdrawals_with(8, 2000, |_, _| {
-            asked += 1;
-            Ok(())
-        });
-        assert_eq!(asked, 0, "not before its backoff");
-        h.deliver_withdrawals_with(8, n.next_ms, up(&[]));
+        let next = 1000 + WITHDRAWAL_BACKOFF.as_millis() as u64;
+        assert_eq!(n.peers, [Unheard { peer: "p2".into(), tries: 1, next_ms: next }]);
+        assert!(deliver(&h, 8, next - 1, &[]).is_empty(), "not before its backoff");
+        assert_eq!(deliver(&h, 8, next, &[]), ["p2"]);
         assert_eq!(notice(&h), None, "every peer has it");
-        // A notice left by a sweep that died before telling anyone is delivered by the next.
-        store(&h.notice_path(x), &Notice { gen: 4, peers: vec!["p3".into()], tries: 0, next_ms: 0 }, false).unwrap();
-        h.deliver_withdrawals_with(8, 0, up(&[]));
+        // A notice left by a process that died before telling anyone is delivered by the next pass.
+        store(&h.notice_path(x), &Notice { gen: 4, peers: unheard(&["p1"]) }, false).unwrap();
+        assert_eq!(deliver(&h, 8, 0, &[]), ["p1"]);
         assert_eq!(notice(&h), None);
-        // A peer down for good: given up after a bounded number of tries, backing off up to its cap.
-        store(&h.notice_path(x), &Notice { gen: 4, peers: vec!["p3".into()], tries: 0, next_ms: 0 }, false).unwrap();
-        let (mut now, mut tries) = (0, 0);
-        while let Some(n) = notice(&h) {
-            assert!(n.next_ms <= now + WITHDRAWAL_MAX_BACKOFF.as_millis() as u64);
-            now = n.next_ms;
-            h.deliver_withdrawals_with(8, now, up(&["p3"]));
-            tries += 1;
-        }
-        assert_eq!(tries, WITHDRAWAL_TRIES);
-        // A newer withdrawal recorded during a delivery is kept whole.
-        store(&h.notice_path(x), &Notice { gen: 4, peers: vec!["p1".into()], tries: 0, next_ms: 0 }, false).unwrap();
-        let newer = Notice { gen: 9, peers: vec!["p1".into(), "p2".into()], tries: 0, next_ms: 0 };
-        h.deliver_withdrawals_with(8, 0, |_, _| {
-            store(&h.notice_path(x), &newer, false).unwrap();
-            Ok(())
-        });
+        // A newer withdrawal recorded during a delivery is kept whole; an older one does not replace it.
+        store(&h.notice_path(x), &Notice { gen: 4, peers: unheard(&["p1"]) }, false).unwrap();
+        let newer = Notice { gen: 9, peers: unheard(&["p1", "p2"]) };
+        h.deliver_withdrawals_with(8, 0, |_, _| store(&h.notice_path(x), &newer, false));
+        assert_eq!(notice(&h), Some(newer.clone()));
+        h.withdraw_noted(&h.lock().unwrap(), x, 5).unwrap();
         assert_eq!(notice(&h), Some(newer));
-        // Bounded calls per pass.
-        let mut asked = 0;
-        h.deliver_withdrawals_with(1, 0, |_, _| {
-            asked += 1;
-            bail!("down")
-        });
-        assert_eq!(asked, 1);
+        // A peer no longer configured is not asked.
+        h.cfg.peers = vec!["p1".into()];
+        assert_eq!(deliver(&h, 8, 0, &[]), ["p1"]);
+        assert_eq!(notice(&h), None);
+    }
+
+    #[test]
+    fn peers_that_are_down_never_crowd_out_one_that_is_up() {
+        let mut h = host("notice-fair");
+        let peers: Vec<String> = (1..=9).map(|i| format!("p{i}")).collect();
+        h.cfg.peers = peers.clone();
+        let x = ip("10.9.1.1");
+        h.withdraw_noted(&h.lock().unwrap(), x, 4).unwrap();
+        // The first eight are down, the ninth (say, the home host) up; eight calls a pass.
+        let down: Vec<&str> = peers[..8].iter().map(|p| p.as_str()).collect();
+        let first = deliver(&h, 8, 1000, &down);
+        assert_eq!(first.len(), 8);
+        let second = deliver(&h, 8, 1000, &down);
+        assert!(second.contains(&"p9".to_string()), "never asked goes before asked again: {second:?}");
+        let n = load::<Notice>(&h.notice_path(x)).unwrap().unwrap();
+        assert!(!n.peers.iter().any(|u| u.peer == "p9"), "p9 heard it");
+        // Each failure counts against its own peer only.
+        assert!(n.peers.iter().all(|u| u.tries >= 1 && u.tries <= 2), "{n:?}");
+        // Across notices too: a new withdrawal's peers are asked before old ones' retries.
+        let y = ip("10.9.1.2");
+        h.withdraw_noted(&h.lock().unwrap(), y, 6).unwrap();
+        let asked = deliver(&h, 9, 1_000_000_000, &down);
+        assert!(asked.contains(&"p9".to_string()));
+        assert_eq!(load::<Notice>(&h.notice_path(y)).unwrap().unwrap().peers.iter().filter(|u| u.peer == "p9").count(), 0);
+    }
+
+    #[test]
+    fn an_undelivered_withdrawal_is_never_given_up() {
+        let mut h = host("notice-kept");
+        h.cfg.peers = vec!["home".into()];
+        let x = ip("10.9.1.1");
+        h.withdraw_noted(&h.lock().unwrap(), x, 4).unwrap();
+        let cap = WITHDRAWAL_MAX_BACKOFF.as_millis() as u64;
+        let mut now = 0;
+        // Down for days: asked again at most every cap, never forgotten.
+        for _ in 0..100 {
+            assert_eq!(deliver(&h, 8, now, &["home"]), ["home"]);
+            let n = load::<Notice>(&h.notice_path(x)).unwrap().expect("kept");
+            let u = &n.peers[0];
+            assert!(u.next_ms > now && u.next_ms <= now + cap);
+            now = u.next_ms;
+        }
+        assert!(now >= 90 * cap);
+        // Back: it hears, and only then the notice goes.
+        assert_eq!(deliver(&h, 8, now, &[]), ["home"]);
+        assert!(load::<Notice>(&h.notice_path(x)).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_source_killed_after_its_abort_resumed_is_settled_by_its_target() {
+        let mut h = host("abort-killed");
+        h.cfg.peers = vec!["a".into()];
+        let x = ip("10.9.1.1");
+        let gone = dead_owner(&h, 999_999_954, &[]);
+        // Its migration to c aborted and it resumed here, then was killed before it stayed.
+        let a = Addr {
+            seen: 4,
+            holder: Some("vm".into()),
+            holder_id: Some(gone.clone()),
+            held: 4,
+            leaving: Some(Leaving { mig: 50, to: "c".into() }),
+            ..Addr::default()
+        };
+        h.put_addr(x, &a, false).unwrap();
+        h.withdraw_dead().unwrap();
+        assert_eq!(load::<Owed>(&h.owed_path(50)).unwrap(), Some(Owed { to: "c".into(), ip: x, gen: 4, by: gone }));
+        let rec = h.addr(&h.lock().unwrap(), x).unwrap();
+        assert!(rec.holder.is_none() && rec.leaving.is_none() && !rec.withdrawn, "{rec:?}");
+        // Asked again on a later sweep: already owed, nothing more.
+        h.withdraw_dead().unwrap();
+        // c says aborted: no copy runs anywhere, so it is withdrawn and the peers are to hear it.
+        h.settle_owed_with(5, |_, _| Ok("aborted".into()), |_, _| (), |_, _| ());
+        assert!(h.addr(&h.lock().unwrap(), x).unwrap().withdrawn && !h.owed_path(50).exists());
+        assert_eq!(load::<Notice>(&h.notice_path(x)).unwrap().map(|n| n.gen), Some(4));
+        // Had c resumed it, the VM would be c's: released, nothing withdrawn.
+        let y = ip("10.9.1.2");
+        let gone = dead_owner(&h, 999_999_955, &[]);
+        let a =
+            Addr { seen: 4, holder: Some("vm2".into()), holder_id: Some(gone), held: 4, leaving: Some(Leaving { mig: 51, to: "c".into() }), ..Addr::default() };
+        h.put_addr(y, &a, false).unwrap();
+        h.withdraw_dead().unwrap();
+        h.settle_owed_with(5, |_, id| Ok(if id == 51 { "released" } else { "pending" }.into()), |_, _| (), |_, _| ());
+        let rec = h.addr(&h.lock().unwrap(), y).unwrap();
+        assert!(!rec.withdrawn && rec.current(4) && !h.owed_path(51).exists(), "{rec:?}");
     }
 
     #[test]
@@ -2876,7 +3051,7 @@ mod tests {
             let l = h.lock().unwrap();
             let _v = h.take_name("v", false).unwrap();
             let c = h.claim_new(&l, "v", Some(x)).unwrap();
-            assert!(h.lend(&l, x, c.gen).unwrap());
+            assert!(h.lend(&l, x, c.gen, 1, "t").unwrap());
             let gen = c.gen;
             c.release(&l).unwrap();
             gen
@@ -2950,7 +3125,7 @@ mod tests {
             let l = h.lock().unwrap();
             let _v = h.take_name("v", false).unwrap();
             let c = h.claim_new(&l, "v", Some(x)).unwrap();
-            h.lend(&l, x, c.gen).unwrap();
+            h.lend(&l, x, c.gen, 1, "t").unwrap();
             let gen = c.gen;
             c.release(&l).unwrap();
             gen
@@ -3108,8 +3283,8 @@ mod tests {
         assert_eq!(h.mig_status(3).unwrap(), "committed", "only a released one is forgotten");
         // A VM back home: its loan stays through the commit, and goes with the release.
         let (home, lent) = (ip("10.9.0.3"), |h: &Host| h.addr(&h.lock().unwrap(), ip("10.9.0.3")).unwrap().lent);
-        assert!(h.lend(&h.lock().unwrap(), home, 9).unwrap(), "made the loan");
-        assert!(!h.lend(&h.lock().unwrap(), home, 9).unwrap(), "a loan it did not make is not its to undo");
+        assert!(h.lend(&h.lock().unwrap(), home, 9, 3, "t").unwrap(), "made the loan");
+        assert!(!h.lend(&h.lock().unwrap(), home, 9, 3, "t").unwrap(), "a loan it did not make is not its to undo");
         assert_eq!(lent(&h), Some(9));
         r.release(Some((home, 9)), None).unwrap();
         assert!(h.mig_status(3).unwrap() == "released" && lent(&h).is_none());

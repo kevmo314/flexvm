@@ -111,7 +111,7 @@ impl Proc {
         // Made now, not in the hold right before the pause.
         self.holder();
         // Lent durably first: a crash with the outcome unknown must not hand the address out.
-        self.lent_here.fetch_or(self.host.lend(&self.host.lock()?, vm.ip, gen)?, Ordering::SeqCst);
+        self.lent_here.fetch_or(self.host.lend(&self.host.lock()?, vm.ip, gen, mig, to)?, Ordering::SeqCst);
         self.drop_held_in();
         self.set_leaving(true);
         if let Err(e) = vm.leave(State::Source(mig)) {

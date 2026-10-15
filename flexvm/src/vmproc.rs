@@ -674,17 +674,24 @@ impl Proc {
         })
     }
 
+    /// Recorded for the peers first (`Host::withdraw_noted`): told now, and on a
+    /// later sweep any peer that could not be.
     fn withdraw(&self, a: AddrClaim) {
         let (ip, gen) = (a.ip, a.gen);
-        if let Ok(l) = self.host.lock() {
-            let ours = self.host.holder(&l, ip).is_ok_and(|h| h.is_none_or(|h| h == self.name()));
-            let _ = a.release(&l);
-            let _ = self.host.observe(&l, ip, gen, 0, None);
-            if ours && !self.host.reinstall(&l, ip, None).unwrap_or(false) {
-                crate::net::unroute(ip);
-            }
+        let Ok(l) = self.host.lock() else {
+            // Nothing recorded: told at least once, as before.
+            return tell_peers(&self.host, json!({"op": "route", "ip": ip.to_string(), "gen": gen}));
+        };
+        let ours = self.host.holder(&l, ip).is_ok_and(|h| h.is_none_or(|h| h == self.name()));
+        let _ = a.release(&l);
+        if let Err(e) = self.host.withdraw_noted(&l, ip, gen) {
+            crate::log!("vm {}: withdrawing {ip}: {e}", self.name());
         }
-        tell_peers(&self.host, json!({"op": "route", "ip": ip.to_string(), "gen": gen}));
+        if ours && !self.host.reinstall(&l, ip, None).unwrap_or(false) {
+            crate::net::unroute(ip);
+        }
+        drop(l);
+        self.host.deliver_withdrawals();
     }
 
     pub fn announce(&self) {

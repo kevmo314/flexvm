@@ -5566,7 +5566,8 @@ def killed_migrated():
     fault(A, "route_refuse", 0)
     # As a sweep would once its backoff passed.
     n = json.load(open(notice))
-    n["next_ms"] = 0
+    for u in n["peers"]:
+        u["next_ms"] = 0
     json.dump(n, open(notice, "w"))
     ok(cli_json(B, "debug", "gc"))
     check("killed migrated, home back: a later sweep tells it, and it takes back its loan",

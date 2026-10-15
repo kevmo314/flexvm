@@ -989,9 +989,9 @@ fn free_address(host: &Host, name: &str, ip: Option<Ipv4Addr>, gen: Option<u64>)
         let l = host.lock()?;
         host.release(&l, ip, name, None)?;
         if let Some(gen) = gen {
-            host.observe(&l, ip, gen, 0, None)?;
+            host.withdraw_noted(&l, ip, gen)?;
             drop(l);
-            crate::vmproc::tell_peers(host, json!({"op": "route", "ip": ip.to_string(), "gen": gen}));
+            host.deliver_withdrawals();
         }
     }
     Ok(())
