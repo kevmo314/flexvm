@@ -235,8 +235,6 @@ pub struct Pager {
     wp: Mutex<()>,
     /// Firecracker's /proc/PID/pagemap, to tell populated pages apart.
     pagemap: OnceLock<std::fs::File>,
-    /// Pages dirtied per 2 MiB chunk in the interval before the last checkpoint's pause (`Pager::wp_block`).
-    wp_hot: Mutex<Vec<u16>>,
     /// Memory for the next checkpoint's hot pages, and the hot pages of the last one, while it is the delta base (see
     /// `hot`).
     hot_spare: Mutex<Option<hot::Buf>>,
@@ -312,7 +310,6 @@ impl Pager {
             cow: Mutex::new(None),
             wp: Mutex::new(()),
             pagemap: OnceLock::new(),
-            wp_hot: Mutex::new(Vec::new()),
             hot_spare: Mutex::new(None),
             hot_prev: Mutex::new(None),
             hot_dirty: Mutex::new(Vec::new()),

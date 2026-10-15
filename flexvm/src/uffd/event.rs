@@ -3,7 +3,7 @@ use super::{
     os, Mapping, Pager, BASE, DISCARDED, FAULT_AROUND, FAULT_TIMEOUT, INFLIGHT, PAGE_SIZE, PRESENT, PULL_RUN, REMOTE, REMOTE_FAULT_RUN, UFFDIO_COPY_MODE_WP,
     ZERO, ZEROES,
 };
-use crate::cow::{PENDING, READING, RESCUING};
+use crate::cow::{Cow, PENDING, READING, RESCUING};
 use std::collections::VecDeque;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -111,6 +111,9 @@ struct Pending {
     kind: Option<usize>,
     /// Waiting for claimed pages to settle, which wakes the event thread; otherwise retried every millisecond.
     parked: bool,
+    /// Served before, and waited for a writer: a write fault and its wait each count once, however often retried.
+    tried: bool,
+    waited: bool,
     /// When it first failed other than with EAGAIN.
     since: Option<Instant>,
 }
@@ -123,8 +126,8 @@ pub(super) enum Served {
     Waiting,
     /// Its run was claimed and handed to a fetcher.
     Fetching,
-    /// A write to a page the checkpoint copy has yet to save, which waits for a writer to save it (`Cow::wait_for`).
-    Writer,
+    /// A write to a page this checkpoint copy has yet to save, which waits for a writer to save it (`Cow::wait_for`).
+    Writer(Arc<Cow>),
 }
 
 impl Pager {
@@ -181,7 +184,16 @@ impl Pager {
                             if let Some((page, _)) = self.page_of(b).filter(|_| learning) {
                                 self.base.note_load_fault(page as u64);
                             }
-                            pending.push_back(Pending { addr: b, flags: a, read: Instant::now(), kind: None, parked: false, since: None })
+                            pending.push_back(Pending {
+                                addr: b,
+                                flags: a,
+                                read: Instant::now(),
+                                kind: None,
+                                parked: false,
+                                tried: false,
+                                waited: false,
+                                since: None,
+                            })
                         }
                         UFFD_EVENT_REMOVE => resolved += self.discard(&removing, a, b),
                         _ => {}
@@ -199,7 +211,9 @@ impl Pager {
             for _ in 0..pending.len() {
                 let mut p = pending.pop_front().unwrap();
                 let page = self.page_of(p.addr).map(|(page, _)| page);
-                match self.fault(p.addr, p.flags, p.kind.is_some()) {
+                let served = self.fault(p.addr, p.flags, p.kind.is_some(), !p.tried);
+                p.tried = true;
+                match served {
                     Ok(Served::Done(kind)) => {
                         // A fault that waited was resolved by the copy that woke its thread.
                         let woke = page.filter(|_| p.kind.is_some()).and_then(|page| pages.unpark(page, p.read));
@@ -207,8 +221,11 @@ impl Pager {
                         self.fault_stats.record(kind, woke.unwrap_or_else(Instant::now) - p.read);
                         continue;
                     }
-                    // Woken through the copy's waker (`Cow::wait_for`).
-                    Ok(Served::Writer) => p.parked = true,
+                    // Woken through the copy's waker (`Cow::wait_for`), and retried until a writer saves its page: one wait.
+                    Ok(Served::Writer(cow)) => {
+                        cow.stats.retries.fetch_add(!p.waited as u64, Ordering::Relaxed);
+                        (p.waited, p.parked) = (true, true);
+                    }
                     Ok(served) => {
                         p.parked = true;
                         match served {
@@ -266,13 +283,13 @@ impl Pager {
 
     /// Serves a fault, without waiting for the network or disk: a REMOTE page's run goes to a fetcher (`fetch_faults`),
     /// and the fault waits.
-    fn fault(&self, addr: u64, flags: u64, waiting: bool) -> io::Result<Served> {
+    fn fault(&self, addr: u64, flags: u64, waiting: bool, first: bool) -> io::Result<Served> {
         let Some((page, m)) = self.page_of(addr) else {
             return Err(io::Error::other("fault outside guest memory"));
         };
         let _wp = self.wp.lock().unwrap();
         if flags & UFFD_PAGEFAULT_FLAG_WP != 0 {
-            return self.wp_fault(page, m);
+            return self.wp_fault(page, m, first);
         }
         // Runs stay within a 2 MiB chunk: Firecracker keeps unplugged virtio-mem slots PROT_NONE, which splits the
         // region into VMAs at slot boundaries, and a uffd copy across a VMA end fails (ENOENT).
