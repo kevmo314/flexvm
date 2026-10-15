@@ -110,6 +110,11 @@ pub struct Vm {
     dead: AtomicBool,
     /// A pause or resume whose outcome Firecracker could not tell: `state` may be wrong, so the next `switch` asks.
     switch_unsure: AtomicBool,
+    /// Its tap could not be raised or routed when it resumed: the next `unpause` does that first.
+    link_down: AtomicBool,
+    /// With `switch_unsure`: a resume failed and the VM could not be paused again, so Firecracker saying Paused
+    /// proves nothing (see `after_failed_resume`).
+    resume_failed: AtomicBool,
 }
 
 impl Vm {
@@ -426,18 +431,22 @@ impl Vm {
         self.was_paused.load(Ordering::SeqCst)
     }
 
-    pub fn resume(&self, attached: bool) -> Result<State> {
+    /// On failure its state is settled (`settle_failed_resume`) and returned with the error.
+    pub fn resume(&self, attached: bool) -> std::result::Result<State, (State, crate::util::Error)> {
         let resumed = self.resume_vcpus(attached);
         self.after_resume(resumed.is_ok());
-        resumed
+        resumed.map_err(|e| (self.settle_failed_resume(), e))
     }
 
     /// The part of `resume` the guest waits for: its devices back and its vCPUs running (unless it was paused before).
     fn resume_vcpus(&self, attached: bool) -> Result<State> {
         // A successful held-packet release already raised the link and attached it.
+        if crate::host::fault("resume_link_fail") {
+            self.link_down.store(true, Ordering::SeqCst);
+            bail!("injected fault: raising its tap failed");
+        }
         if !attached {
-            crate::net::set_link_up(&self.tap, true)?;
-            crate::net::attach(self.ip, &self.tap)?;
+            self.link_up()?;
         }
         // Kept paused, its frames stay queued on the tap (`tap_stuck`) until it runs again.
         let resumed = match self.was_paused.swap(false, Ordering::SeqCst) {
@@ -483,9 +492,47 @@ impl Vm {
         if *self.state.lock().unwrap() != State::Checkpointing {
             bail!("vm {} is not being checkpointed", self.name);
         }
-        let res: Result<State> = self.resume_vcpus(attached).map_err(|e| format!("resuming vm {} after its checkpoint failed: {e}", self.name).into());
-        *self.state.lock().unwrap() = *res.as_ref().unwrap_or(&State::Failed);
+        let res = self.resume_vcpus(attached);
+        let now = match &res {
+            Ok(s) => {
+                self.record(*s);
+                *s
+            }
+            Err(_) => self.settle_failed_resume(),
+        };
+        res.map_err(|e| format!("resuming vm {} after its checkpoint failed: {e}; it is {}", self.name, now.name()).into())
+    }
+
+    /// Raises its tap and routes its address there; failing, it is left for the next `unpause`.
+    fn link_up(&self) -> Result<()> {
+        let res = crate::net::set_link_up(&self.tap, true).and_then(|()| crate::net::attach(self.ip, &self.tap));
+        self.link_down.store(res.is_err(), Ordering::SeqCst);
         res
+    }
+
+    /// After a resume that failed: Running if Firecracker says so (only once every vCPU acknowledged), else paused
+    /// again explicitly (twice at most: a vCPU's late answer to the resume may be read first); None if neither.
+    /// Firecracker saying Paused proves nothing: it resumes vCPUs one by one and says Paused until all acknowledge
+    /// (and answers a failed resume 400), so some may have run.
+    fn after_failed_resume(&self) -> Option<State> {
+        if self.fc_state() == Some(State::Running) {
+            return Some(State::Running);
+        }
+        self.pager.hold_collapse(true);
+        // Test fault `repause_fail`: the pause after it fails too.
+        let pause = || if crate::host::fault("repause_fail") { Err("injected fault: pausing it again failed".into()) } else { self.fc(|fc| fc.pause()) };
+        (0..2).any(|_| pause().is_ok()).then_some(State::Paused)
+    }
+
+    /// `after_failed_resume`, recorded; Paused but unsure if it cannot be had (the next pause or resume tries again).
+    /// Never Failed: it can still be resumed.
+    fn settle_failed_resume(&self) -> State {
+        let now = self.after_failed_resume();
+        self.switch_unsure.store(now.is_none(), Ordering::SeqCst);
+        self.resume_failed.store(now.is_none(), Ordering::SeqCst);
+        let now = now.unwrap_or(State::Paused);
+        self.record(now);
+        now
     }
 
     pub fn pause(&self) -> Result<()> {
@@ -496,6 +543,9 @@ impl Vm {
     pub fn unpause(&self) -> Result<()> {
         if self.pager.pulling_from_peer() && !self.pager.wait_pulled(Some(PULL_WAIT)) {
             bail!("vm {} is still pulling its memory from its previous host; resume it once that is done", self.name);
+        }
+        if self.link_down.load(Ordering::SeqCst) {
+            self.link_up().map_err(|e| format!("vm {}: raising its network: {e}", self.name))?;
         }
         self.switch(State::Paused, State::Running)
     }
@@ -516,7 +566,11 @@ impl Vm {
         if pausing {
             self.pager.hold_collapse(true);
         }
-        let mut res = self.fc(|fc| if pausing { fc.pause() } else { fc.resume() }).map(drop);
+        // Test faults `pause_fail` and `resume_partial` (a resume some vCPUs missed: Firecracker still says Paused).
+        let mut res = match crate::host::fault(if pausing { "pause_fail" } else { "resume_partial" }) {
+            true => Err(format!("injected fault: firecracker PATCH /vm: 400 the {} failed part way", if pausing { "pause" } else { "resume" }).into()),
+            false => self.fc(|fc| if pausing { fc.pause() } else { fc.resume() }).map(drop),
+        };
         // Test fault `pause_lost`: the pause landed, but its answer is lost.
         if pausing && res.is_ok() && crate::host::fault("pause_lost") {
             res = Err("injected fault: the pause's answer was lost".into());
@@ -524,11 +578,19 @@ impl Vm {
         // A timeout or a lost answer may still have switched it: Firecracker says which state it is in. If that cannot
         // be had either, it is recorded as it was but unsure (collapsing held, after a pause), so the next pause or
         // resume asks again or sends its request whatever the record says.
+        let resume_failed = self.resume_failed.load(Ordering::SeqCst);
         let now = match &res {
             Ok(()) => Some(to),
+            // Not `rejected`: a resume that failed part way is answered 400 too.
+            Err(_) if !pausing => self.after_failed_resume(),
+            // Still unsettled after a failed resume: only Firecracker saying Running (every vCPU acknowledged) settles
+            // it here, never its saying Paused (some vCPUs may run) nor a refusal.
+            Err(_) if resume_failed => self.fc_state().filter(|&s| s == State::Running),
             Err(e) if rejected(e, "/vm") => Some(from),
             Err(_) => self.fc_state(),
         };
+        // Kept until an explicit pause succeeds or Running is confirmed.
+        self.resume_failed.store(now.is_none() && (resume_failed || !pausing), Ordering::SeqCst);
         // Recorded whichever it is (a failed resume may find it still paused).
         if let Some(s) = now {
             self.record(s);
@@ -548,12 +610,14 @@ impl Vm {
         self.switch_unsure.load(Ordering::SeqCst)
     }
 
-    /// Its state, after a pause or resume that ended unknown first recorded as Firecracker has it (clearing
-    /// `switch_unsure`); None if Firecracker cannot say.
+    /// Its state, after a pause or resume that ended unknown first recorded as Firecracker has it, or after a failed
+    /// resume as `after_failed_resume` makes it (clearing `switch_unsure`); None if that cannot be had.
     fn reconcile(&self) -> Option<State> {
         if self.switch_unsure.load(Ordering::SeqCst) {
-            self.record(self.fc_state()?);
+            // After a resume that failed, Firecracker saying Paused proves nothing: it is paused again instead.
+            self.record(if self.resume_failed.load(Ordering::SeqCst) { self.after_failed_resume() } else { self.fc_state() }?);
             self.switch_unsure.store(false, Ordering::SeqCst);
+            self.resume_failed.store(false, Ordering::SeqCst);
         }
         Some(self.state())
     }
@@ -815,6 +879,7 @@ impl Vm {
             "template_id": self.template.meta.id,
             "regions": self.pager.regions(),
             "state": self.state().name(),
+            "state_unsure": self.switch_unsure(),
             "vcpus": self.template.meta.vcpus,
             "rss_mib": self.rss() >> 20,
             "guest_mib": self.template.meta.mem_mib + hotplug["plugged_size_mib"].as_u64().unwrap_or(0),
@@ -907,6 +972,8 @@ impl Prepared {
             cancel_checkpoint: AtomicUsize::new(0),
             dead: AtomicBool::new(false),
             switch_unsure: AtomicBool::new(false),
+            link_down: AtomicBool::new(false),
+            resume_failed: AtomicBool::new(false),
         })
     }
 

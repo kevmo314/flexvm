@@ -276,7 +276,13 @@ impl Proc {
         let (_, attached) = self.release_to_tap(vm, mig);
         let (s, e) = match vm.resume(attached) {
             Ok(s) => (s, e),
-            Err(r) => (State::Failed, format!("{e}; resuming it here failed too: {r}").into()),
+            // Never Failed: as Firecracker has it (paused again, if it could not say), so a SIGCONT runs it again.
+            Err((s, r)) => {
+                if s != State::Running {
+                    self.paused_by_request.store(true, Ordering::SeqCst);
+                }
+                (s, format!("{e}; resuming it here failed too: {r}; it is {} here (flexvm resume {} runs it)", s.name(), vm.name).into())
+            }
         };
         // Under the host lock: a route retry still running sees it is no longer this migration's source.
         *vm.state.lock().unwrap() = s;

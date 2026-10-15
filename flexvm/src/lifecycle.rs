@@ -26,6 +26,9 @@ use crate::vmproc::{End, Op, Proc, CLOCK_DEADLINE};
 
 pub const DRAIN_WAIT: Duration = Duration::from_secs(60);
 pub const SETTLE_WAIT: Duration = Duration::from_secs(10);
+/// How long `finish_later` retries what a resume left undone; one runs at a time (one VM per process).
+const GUEST_WAIT: Duration = Duration::from_secs(300);
+static FINISHING: AtomicBool = AtomicBool::new(false);
 /// Suspended-checkpoint markers: STARTED (may have run: never resume again),
 /// DISCARDED, GEN (address generation), and QUARANTINE `<boot id> <why>` when
 /// STARTED's durability is unknown (held until a reboot shows the disk).
@@ -90,11 +93,10 @@ impl Proc {
         self.paused_by_request.store(false, Ordering::SeqCst);
         let took = start.elapsed();
         self.publish();
-        if let Some(old) = vm.pending_net.lock().unwrap().take() {
-            if let Err(e) = self.readdress(vm, old) {
-                *vm.pending_net.lock().unwrap() = Some(old);
-                bail!("vm {} resumed, but setting its address {} failed: {e}", vm.name, vm.ip);
-            }
+        if let Err(e) = self.take_address(vm) {
+            drop(op);
+            self.finish_later(vm.clone(), true, true);
+            return Err(e);
         }
         drop(op);
         self.sync_clock_later();
@@ -121,6 +123,23 @@ impl Proc {
 
     pub(crate) fn release_app_log(&self) {
         APP_LOG_HELD.store(false, Ordering::SeqCst);
+    }
+
+    /// Sets a pending new address (`pending_net`) in the guest; failing, it stays
+    /// pending, and the next `flexvm resume` (SIGCONT) tries again. Under `op`.
+    fn take_address(&self, vm: &Vm) -> Result<()> {
+        let Some(old) = *vm.pending_net.lock().unwrap() else { return Ok(()) };
+        let res = match fault("readdress_fail") {
+            true => Err("injected fault: setting the address failed".into()),
+            false => self.readdress(vm, old),
+        };
+        match res {
+            Ok(()) => {
+                *vm.pending_net.lock().unwrap() = None;
+                Ok(())
+            }
+            Err(e) => bail!("vm {} runs, but setting its address {} failed: {e}; flexvm resume {} tries again", vm.name, vm.ip, vm.name),
+        }
     }
 
     fn readdress(&self, vm: &Vm, old: Ipv4Addr) -> Result<()> {
@@ -381,7 +400,8 @@ impl Proc {
             (_, _, s) => Err(format!("vm is {} before resuming", s.name()).into()),
         };
         ready.map_err(|e| Restore::NotRun(kill(e)))?;
-        if hold {
+        // Published paused, until SIGCONT (`flexvm resume`); `why`: a resume that failed.
+        let keep_paused = |t: &mut Phases, why: Option<String>| {
             if ip != m.ip {
                 *vm.pending_net.lock().unwrap() = Some(m.ip);
             }
@@ -389,10 +409,11 @@ impl Proc {
             self.paused_by_request.store(true, Ordering::SeqCst);
             self.publish();
             self.announce();
-            self.watch_checkpoint_pull(vm.clone(), dir, to_load);
-            return Ok(
-                json!({"name": name, "ip": ip.to_string(), "pid": std::process::id(), "state": "paused", "restore_ms": ms(restore), "timings_ms": t.json()}),
-            );
+            self.watch_checkpoint_pull(vm.clone(), dir.clone(), to_load);
+            json!({"name": name, "ip": ip.to_string(), "pid": std::process::id(), "state": "paused", "resume_error": why, "restore_ms": ms(restore), "timings_ms": t.json()})
+        };
+        if hold {
+            return Ok(keep_paused(t, None));
         }
         let still = self.still_current(ip).map_err(|e| Restore::NotRun(kill(e)))?;
         if owned {
@@ -412,27 +433,60 @@ impl Proc {
             }
             *self.consumed.lock().unwrap() = Some(dir.clone());
         }
-        vm.unpause().map_err(|e| Restore::Ran(kill(e)))?;
+        let unpaused = match fault("restore_unpause_fail") {
+            true => Err("injected fault: resuming its vCPUs failed".into()),
+            false => vm.unpause(),
+        };
+        // Some of its vCPUs may have run all the same (STARTED stays): paused again, it is kept, for a
+        // `flexvm resume`; destroyed only if not even that is known.
+        if let Err(e) = unpaused {
+            drop(still);
+            return match vm.state() == State::Paused && !vm.switch_unsure() {
+                true => {
+                    crate::log!("vm {name}: resuming it failed: {e}; it stays paused (flexvm resume {name} runs it)");
+                    Ok(keep_paused(t, Some(e.to_string())))
+                }
+                false => Err(Restore::Ran(kill(e))),
+            };
+        }
         drop(still);
         t.mark("resume");
+        if fault("restore_after_run") {
+            return Err(Restore::Ran(kill("injected fault: restore failed after the vm ran".into())));
+        }
+        // It runs: from here a slow or failed guest step is reported, never fatal (its checkpoint,
+        // still where its memory comes from, is deleted once all of it is in). Pending until the guest has it.
+        if ip != m.ip {
+            *vm.pending_net.lock().unwrap() = Some(m.ip);
+        }
         self.set_vm(vm.clone());
         self.publish();
         t.mark("register");
-        let ready = (|| -> Result<Duration> {
-            if fault("restore_after_run") {
-                bail!("injected fault: restore failed after the vm ran");
+        let address_error = self.take_address(&vm).err().map(|e| e.to_string());
+        let pinged = match fault("restore_ping_slow") {
+            true => {
+                thread::sleep(Duration::from_millis(2500));
+                Err("injected fault: the guest agent did not answer within 2 s".into())
             }
-            if ip != m.ip {
-                self.readdress(&vm, m.ip)?;
-            }
-            crate::guest::ping(&vm.vsock)?;
-            let ready = t.total();
-            t.mark("guest_ready");
-            Ok(ready)
-        })()
-        .map_err(|e| Restore::Ran(kill(e)))?;
-        let clock = vm.sync_clock(Instant::now() + CLOCK_DEADLINE);
+            false => crate::guest::ping(&vm.vsock),
+        };
+        let guest_error = pinged.err().map(|e| e.to_string());
+        let ready = guest_error.is_none().then(|| t.total());
+        t.mark("guest_ready");
+        let clock = match &guest_error {
+            None => vm.sync_clock(Instant::now() + CLOCK_DEADLINE),
+            Some(e) => Err(format!("guest agent not answering: {e}").into()),
+        };
         t.mark("clock");
+        if let Some(e) = &address_error {
+            crate::log!("vm {name}: {e}");
+        }
+        if let Some(e) = &guest_error {
+            crate::log!("vm {name}: runs, but its guest agent did not answer: {e}; waiting for it");
+        }
+        if guest_error.is_some() || address_error.is_some() || clock.is_err() {
+            self.finish_later(vm.clone(), guest_error.is_none(), clock.is_err());
+        }
         self.announce();
         let state = vm.state().name();
         self.watch_checkpoint_pull(vm.clone(), dir, to_load);
@@ -442,12 +496,74 @@ impl Proc {
             "pid": std::process::id(),
             "state": state,
             "restore_ms": ms(restore),
-            "ready_ms": ms(ready),
+            "ready_ms": ready.map(ms),
+            "guest_error": guest_error,
+            "address_error": address_error,
             "clock_offset_ms": clock.as_ref().ok(),
             "clock_error": clock.as_ref().err().map(|e| e.to_string()),
             "to_load_mib": to_load,
             "timings_ms": t.json(),
         }))
+    }
+
+    /// For a VM whose resume left guest steps undone: until `GUEST_WAIT`, waits for its guest agent (unless
+    /// `answered`), then retries setting a pending address and (`clock`) syncing its clock, each until it succeeds.
+    fn finish_later(&self, vm: Arc<Vm>, mut answered: bool, mut clock: bool) {
+        let Some(p) = self.arc() else { return };
+        if FINISHING.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        thread::spawn(move || {
+            struct Done;
+            impl Drop for Done {
+                fn drop(&mut self) {
+                    FINISHING.store(false, Ordering::SeqCst);
+                }
+            }
+            let _done = Done;
+            let start = Instant::now();
+            let mut failed: Option<String> = None;
+            while !vm.dead() && start.elapsed() < GUEST_WAIT {
+                let step = (|| -> Result<bool> {
+                    if vm.state() != State::Running {
+                        return Ok(false);
+                    }
+                    if !answered {
+                        crate::guest::ping(&vm.vsock)?;
+                        answered = true;
+                        crate::log!("vm {}: its guest agent answered {} ms after it resumed", vm.name, ms(start.elapsed()));
+                    }
+                    if vm.pending_net.lock().unwrap().is_some() {
+                        let _op = p.op_within()?;
+                        p.take_address(&vm)?;
+                        crate::log!("vm {}: took its address {}", vm.name, vm.ip);
+                    }
+                    if clock {
+                        let _op = p.op_within()?;
+                        if vm.state() == State::Running {
+                            let off = vm.sync_clock(Instant::now() + CLOCK_DEADLINE)?;
+                            crate::log!("vm {}: guest clock synced ({off:.1} ms off)", vm.name);
+                            clock = false;
+                        }
+                    }
+                    Ok(!clock)
+                })();
+                match step {
+                    Ok(true) => return,
+                    Ok(false) => {}
+                    // Logged as it changes, once the agent answers (until then each ping fails much alike).
+                    Err(e) if answered && failed.as_deref() != Some(&e.to_string()) => {
+                        crate::log!("vm {}: {e}; trying again", vm.name);
+                        failed = Some(e.to_string());
+                    }
+                    Err(e) => failed = Some(e.to_string()),
+                }
+                thread::sleep(Duration::from_secs(1));
+            }
+            if !vm.dead() {
+                crate::log!("vm {}: gave up finishing its resume after {} s: {}", vm.name, GUEST_WAIT.as_secs(), failed.as_deref().unwrap_or("not running"));
+            }
+        });
     }
 
     /// Release disk admission and a consumed checkpoint once the pull finishes.
@@ -754,6 +870,10 @@ impl PacketHold<'_> {
         let (stats, attached) = self.d.release_to_tap(self.vm, self.id);
         self.stats = stats;
         let res = self.vm.end_checkpoint(attached);
+        // Left paused by the failure: `flexvm resume` (SIGCONT) runs it again.
+        if res.is_err() && self.vm.state() == State::Paused {
+            self.d.paused_by_request.store(true, Ordering::SeqCst);
+        }
         let resumed = Instant::now();
         self.resumed = Some(resumed);
         self.vm.after_resume(res.is_ok());
