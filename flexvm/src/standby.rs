@@ -556,29 +556,6 @@ mod tests {
     }
 
     #[test]
-    fn a_refill_stuck_on_the_host_lock_lets_relief_in_within_its_budget() {
-        let root = std::env::temp_dir().join(format!("flexvm-refill-stuck-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
-        crate::util::write_file(&host.state.join("standby"), "default", b"1", true).unwrap();
-        let (held, release) = (std::sync::mpsc::channel(), std::sync::mpsc::channel::<()>());
-        let h = host.clone();
-        let holder = std::thread::spawn(move || {
-            let _l = h.lock().unwrap();
-            held.0.send(()).unwrap();
-            let _ = release.1.recv();
-        });
-        held.1.recv().unwrap();
-        let start = Instant::now();
-        assert!(refill_by(&host, "default", false).is_err());
-        assert!(start.elapsed() < LOCKED_TIMEOUT + Duration::from_secs(1), "{:?}", start.elapsed());
-        crate::host::flock(&stop_lock(&host).unwrap(), libc::LOCK_EX | libc::LOCK_NB).unwrap();
-        release.0.send(()).unwrap();
-        holder.join().unwrap();
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
     fn recovery_finds_persistent_targets_and_respects_refill_lock_and_reserve() {
         let root = std::env::temp_dir().join(format!("flexvm-refill-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -597,6 +574,14 @@ mod tests {
         crate::host::flock(&stop, libc::LOCK_EX).unwrap();
         assert_eq!(refill_by(&host, "default", false).unwrap(), 0);
         drop(stop);
+        // A host lock held by a stuck process fails the grant within the budget, and lets relief in.
+        let held = File::create(host.state.join("lock")).unwrap();
+        crate::host::flock(&held, libc::LOCK_EX).unwrap();
+        let start = Instant::now();
+        assert!(refill_by(&host, "default", false).is_err());
+        assert!(start.elapsed() < LOCKED_TIMEOUT + Duration::from_secs(1), "{:?}", start.elapsed());
+        crate::host::flock(&stop_lock(&host).unwrap(), libc::LOCK_EX | libc::LOCK_NB).unwrap();
+        drop(held);
         host.cfg.reserve_mib = u64::MAX / 2;
         assert_eq!(refill_by(&host, "default", false).unwrap(), 0);
         assert!(live(&host, "default").is_empty());
