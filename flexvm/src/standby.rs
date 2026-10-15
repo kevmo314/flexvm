@@ -57,7 +57,7 @@ pub fn live(host: &Host, template: &str) -> Vec<Ident> {
         let Ok(f) = File::open(e.path()) else { continue };
         if flock(&f, libc::LOCK_SH | libc::LOCK_NB).is_ok() {
             let _ = std::fs::remove_file(e.path());
-        } else if let Ok(id) = serde_json::from_reader::<_, Ident>(&f) {
+        } else if let Some(id) = std::io::read_to_string(&f).ok().and_then(|s| serde_json::from_str::<Ident>(&s).ok()) {
             ids.push(id);
         }
     }
@@ -68,17 +68,17 @@ pub fn live(host: &Host, template: &str) -> Vec<Ident> {
 /// `live`, less those mid-claim (`PID-START.claim` locked; START keeps a reused pid's apart): a stop would not end them.
 pub fn stoppable(host: &Host, template: &str) -> Vec<Ident> {
     let d = dir(host, template);
-    let claiming = |id: &Ident| locked(&d.join(format!("{}-{}.claim", id.pid, id.start)), libc::LOCK_SH) == Some(true);
+    let claiming = |id: &Ident| locked(&d.join(format!("{}.claim", id.key())), libc::LOCK_SH) == Some(true);
     live(host, template).into_iter().filter(|id| !claiming(id)).collect()
 }
 
 /// SIGUSR1, not SIGINT: a stop can reach the process after a claim started
 /// (it lists it until the claim is done, and its signal thread may take it
-/// late), and the VM it became must not take it for a kill.
-pub fn stop(id: &Ident) {
-    if let Ok(Some(fd)) = PidFd::open(id) {
-        let _ = fd.signal(libc::SIGUSR1);
-    }
+/// late), and the VM it became must not take it for a kill. The pidfd of the one signalled.
+pub fn stop(id: &Ident) -> Option<PidFd> {
+    let fd = PidFd::open(id).ok().flatten()?;
+    fd.signal(libc::SIGUSR1).ok()?;
+    Some(fd)
 }
 
 pub fn templates(host: &Host) -> Vec<String> {
@@ -213,7 +213,7 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
     let d = dir(host, template);
     std::fs::create_dir_all(&d)?;
     let me = Ident::me();
-    let id = format!("{}-{}", me.pid, me.start);
+    let id = me.key();
     let (lock_path, sock) = (d.join(format!("{id}.lock")), d.join(format!("{mine}.{id}.sock")));
     let tmp = d.join(format!(".{id}.lock"));
     let lock = File::create(&tmp)?;
@@ -519,7 +519,7 @@ mod tests {
         let d = dir(&host, "default");
         std::fs::create_dir_all(&d).unwrap();
         let me = Ident::me();
-        let path = d.join(format!("{}-{}.lock", me.pid, me.start));
+        let path = d.join(format!("{}.lock", me.key()));
         let lock = File::create(&path).unwrap();
         crate::host::flock(&lock, libc::LOCK_EX).unwrap();
         lock.write_all_at(&serde_json::to_vec(&me).unwrap(), 0).unwrap();

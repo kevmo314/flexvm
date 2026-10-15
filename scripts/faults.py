@@ -4687,7 +4687,10 @@ def standby_stop_claim():
 def standby_stalled():
     """A claimer that connects and stops before sending its request keeps no
     standby VM from stopping; a stopped standby VM keeps no `run` waiting
-    (it starts cold once the handshake times out)."""
+    (it starts cold once the handshake times out). Under the reserve, one that
+    cannot exit yet (as a loading one acts on the stop only once loaded) still
+    marks the pressure, so it is not refilled once it exits, and holds off
+    neither eviction nor a controller's ticks."""
     t, n = args.template, "ft-sb-stalled"
     ok(cli_json(A, "standby", "--template", t, "1"))
     check("standby stalled: one ready", wait_for(lambda: len(standby_pids(A, t)) == 1, 60))
@@ -4709,8 +4712,32 @@ def standby_stalled():
         r = run(A, n)
         check("standby stalled: run starts cold past a stopped one", r.get("ok") and r["result"]["standby"] is False, r)
         check("standby stalled: within the handshake's bound", time.time() - start < 15, time.time() - start)
+        pressure, active = os.path.join(A.run, "standby", ".pressure"), os.path.join(A.run, "evict.active")
+        mtime = lambda p: os.stat(p).st_mtime if os.path.exists(p) else None
+        before = mtime(pressure)
+        fault(A, "no_evict", 600000)
+        try:
+            avail = mem_available()
+            with Watch(A, [n]) as w, marks(avail + 4096, avail + 4608):
+                marked = wait_for(lambda: mtime(pressure) != before, 10)
+                evicting = wait_for(lambda: os.path.exists(active), 10)
+                time.sleep(4)
+        finally:
+            fault(A, "no_evict", 0)
+        rep = w.report("standby stalled: under the reserve")
+        check("standby stalled: under the reserve, one that cannot exit still marks the pressure", marked and alive(pid), (before, mtime(pressure)))
+        check("standby stalled: and holds eviction off no longer", evicting)
+        check("standby stalled: the controller ticks on meanwhile", all(r["tick_gap_max_ms"] < 1600 for r in rep.values()), rep)
     finally:
         os.kill(pid, signal.SIGCONT)
+    check("standby stalled: it exits once it can", wait_for(lambda: not alive(pid), 10))
+    time.sleep(7)
+    live = [p for p in standby_pids(A, t) if alive(p)]
+    check("standby stalled: and is not refilled under the pressure mark", not live, live)
+    try:
+        os.remove(os.path.join(A.run, "standby", ".pressure"))
+    except FileNotFoundError:
+        pass
     cli(A, "standby", "--template", t, "0")
     check("standby stalled: stopped", wait_for(lambda: not standby_pids(A, t), 30))
     cleanup(n)

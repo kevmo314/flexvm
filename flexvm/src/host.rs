@@ -1186,13 +1186,17 @@ impl Ident {
         Some(Ident { pid, start: starttime(pid)?, boot: boot.into() })
     }
 
-    /// Alive, gone on proof, or unknown (an unreadable `/proc`, say: never proof).
-    /// Its work directory (`RUN/w/PID-START`): the instance's own, never another process's
-    /// that got its pid, so removing it once this one is reaped removes nothing alive.
-    pub fn work_dir(&self, run: &Path) -> PathBuf {
-        run.join("w").join(format!("{}-{}", self.pid, self.start))
+    /// `PID-START`: names what is this instance's own, never another process's that got its pid.
+    pub fn key(&self) -> String {
+        format!("{}-{}", self.pid, self.start)
     }
 
+    /// Its work directory (`RUN/w/PID-START`): removing it once this one is reaped removes nothing alive.
+    pub fn work_dir(&self, run: &Path) -> PathBuf {
+        run.join("w").join(self.key())
+    }
+
+    /// Alive, gone on proof, or unknown (an unreadable `/proc`, say: never proof).
     pub fn liveness(&self) -> Liveness {
         liveness_by(self, boot_id(), |pid| std::fs::read_to_string(format!("/proc/{pid}/stat")))
     }
