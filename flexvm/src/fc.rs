@@ -1,13 +1,14 @@
 //! A Firecracker process and a minimal client for its HTTP-over-UDS API.
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -365,11 +366,40 @@ pub struct Spawner {
     /// Each tap's alias (`host::tap_alias`).
     tap_owner: String,
     next: AtomicU64,
+    /// Taps handed out but not made yet: a concurrent `take` sees none of them in sysfs.
+    making: Mutex<HashSet<String>>,
+}
+
+/// Reuse vanished taps; the lifetime counter is only for directories and cgroups.
+/// The name is added to `making`, for its taker to remove once its tap is made or not.
+fn free_tap(prefix: &str, interfaces: &Path, making: &Mutex<HashSet<String>>) -> Result<String> {
+    let mut making = making.lock().unwrap();
+    let mut n = 0u64;
+    loop {
+        let tap = format!("{prefix}{n:x}");
+        if tap.len() >= libc::IFNAMSIZ {
+            bail!("tap {tap:?} is over {} bytes (no free tap names)", libc::IFNAMSIZ - 1);
+        }
+        if !making.contains(&tap) && !interfaces.join(&tap).try_exists()? {
+            making.insert(tap.clone());
+            return Ok(tap);
+        }
+        n += 1;
+    }
 }
 
 impl Spawner {
     pub fn new(bin: &Path, root: &Path, sockets: Arc<SocketRoot>, cgroups: Option<PathBuf>, tap_prefix: &str, tap_owner: &str) -> Spawner {
-        Spawner { bin: bin.into(), root: root.into(), sockets, cgroups, tap_prefix: tap_prefix.into(), tap_owner: tap_owner.into(), next: AtomicU64::new(0) }
+        Spawner {
+            bin: bin.into(),
+            root: root.into(),
+            sockets,
+            cgroups,
+            tap_prefix: tap_prefix.into(),
+            tap_owner: tap_owner.into(),
+            next: AtomicU64::new(0),
+            making: Mutex::default(),
+        }
     }
 
     pub fn take(&self, deadline: Option<std::time::Instant>) -> Result<Firecracker> {
@@ -377,10 +407,10 @@ impl Spawner {
         if ready.is_zero() {
             bail!("out of time to start firecracker");
         }
+        let tap = free_tap(&self.tap_prefix, Path::new("/sys/class/net"), &self.making)?;
         let n = self.next.fetch_add(1, Ordering::SeqCst);
         // Named by this process's identity, not its pid alone: never a dead one's with the same pid.
         let id = format!("idle-{}-{n}", crate::host::Ident::me().key());
-        let tap = format!("{}{n:x}", self.tap_prefix);
         let dir = self.root.join(&id);
         let cgroup = self.cgroups.as_ref().map(|root| root.join(&id));
         let made = {
@@ -390,13 +420,10 @@ impl Spawner {
         let fc = std::fs::create_dir_all(&dir).map_err(Into::into).and_then(|()| Firecracker::spawn(&self.bin, &dir, self.sockets.allocate()?, ready));
         let made = made.join().unwrap_or_else(|_| Err("tap thread panicked".into()));
         // A Firecracker without its tap is dropped (killed) here, before `release`.
-        let mut fc = match fc.and_then(|fc| made.map(|()| fc)) {
-            Ok(fc) => fc,
-            Err(e) => {
-                release(&tap, cgroup.as_deref(), &dir);
-                return Err(e);
-            }
-        };
+        let fc = fc.and_then(|fc| made.map(|()| fc)).inspect_err(|_| release(&tap, cgroup.as_deref(), &dir));
+        // Made (sysfs has it now) or released: no longer kept from other takes.
+        self.making.lock().unwrap().remove(&tap);
+        let mut fc = fc?;
         // Under test, each VM's Firecracker keeps its device metrics (`metrics.json` in its
         // directory, appended every 60 s and on `FlushMetrics`), so a test can see what a
         // device did (#149). Metrics can only be configured before a load.
@@ -437,6 +464,61 @@ mod tests {
 
     use std::os::unix::net::UnixListener;
     use std::thread::JoinHandle;
+
+    #[test]
+    fn spawner_reuses_tap_names_past_256_and_4096_takes() {
+        // Six prefix bytes and six pid digits leave two suffix digits; five leave three.
+        for prefix in ["abcdef3ffffft", "abcde3ffffft"] {
+            let interfaces = crate::test_util::TempDir::new("tap-names");
+            let making = Mutex::default();
+            let mut live = std::collections::VecDeque::new();
+            for take in 0..5000 {
+                // The allocation step of take(), with sysfs replaced by fake live interfaces.
+                let tap = free_tap(prefix, &interfaces, &making).unwrap();
+                assert!(tap.len() <= 15, "take {take}: {tap}");
+                assert!(!live.contains(&tap), "take {take}: duplicate live tap {tap}");
+                assert_eq!(tap, format!("{prefix}{:x}", take % 8), "lowest free suffix");
+                std::fs::create_dir(interfaces.join(&tap)).unwrap();
+                making.lock().unwrap().remove(&tap);
+                live.push_back(tap);
+                if live.len() == 8 {
+                    std::fs::remove_dir(interfaces.join(live.pop_front().unwrap())).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn spawner_refuses_overlong_tap_before_probing_or_spawning() {
+        let interfaces = crate::test_util::TempDir::new("tap-full");
+        let prefix = "abcdef3ffffft";
+        for n in 0..256 {
+            std::fs::create_dir(interfaces.join(format!("{prefix}{n:x}"))).unwrap();
+        }
+        let error = free_tap(prefix, &interfaces, &Mutex::default()).unwrap_err().to_string();
+        assert!(error.contains("abcdef3ffffft100") && error.contains("15 bytes"), "{error}");
+        // Even an invalid prefix is checked before looking at the interface directory.
+        let error = free_tap("abcdefgh3ffffft", &interfaces.join("absent"), &Mutex::default()).unwrap_err().to_string();
+        assert!(error.contains("abcdefgh3ffffft0") && error.contains("15 bytes"), "{error}");
+        std::fs::remove_dir(interfaces.join(format!("{prefix}80"))).unwrap();
+        assert_eq!(free_tap(prefix, &interfaces, &Mutex::default()).unwrap(), format!("{prefix}80"));
+    }
+
+    #[test]
+    fn spawner_never_hands_out_a_tap_still_being_made() {
+        // Two takes with neither tap made yet (`create_tap` runs on its own thread).
+        let interfaces = crate::test_util::TempDir::new("tap-making");
+        let making = Mutex::default();
+        let (a, b) = (free_tap("fvt", &interfaces, &making).unwrap(), free_tap("fvt", &interfaces, &making).unwrap());
+        assert_eq!((a.as_str(), b.as_str()), ("fvt0", "fvt1"));
+        // A failed make lets its name go: the next take reuses it.
+        making.lock().unwrap().remove(&a);
+        assert_eq!(free_tap("fvt", &interfaces, &making).unwrap(), "fvt0");
+        // A made one is kept out by sysfs once its reservation is gone.
+        std::fs::create_dir(interfaces.join(&b)).unwrap();
+        making.lock().unwrap().remove(&b);
+        assert_eq!(free_tap("fvt", &interfaces, &making).unwrap(), "fvt2");
+    }
 
     struct Server {
         path: PathBuf,
