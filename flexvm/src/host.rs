@@ -683,8 +683,9 @@ impl Host {
     }
 
     /// Lets go of `holder`'s claim; with `id`, only that instance's.
+    /// Durable: a claim let go after an outcome was settled must stay gone across a crash.
     pub fn release(&self, l: &Locked, ip: Ipv4Addr, holder: &str, id: Option<&Ident>) -> Result<()> {
-        self.update(l, ip, false, |a| {
+        self.update(l, ip, true, |a| {
             let by = |h: &Ident| id.is_none_or(|id| id == h);
             if a.holder.as_deref() == Some(holder) && a.holder_id.as_ref().is_none_or(by) {
                 (a.holder, a.holder_id, a.arriving, a.leaving) = (None, None, None, None);
@@ -1124,7 +1125,13 @@ impl Host {
             }
             match outcome.as_deref() {
                 Ok("released") => {
-                    // Forgotten first: a target that then forgets its record must never read as aborted here.
+                    // The decision on the address first (its `leaving` claim retired, durably),
+                    // then the record: neither left for a later sweep to owe again once the
+                    // target, told `done`, forgets it and would answer aborted.
+                    if let Err(e) = self.lock().and_then(|l| self.retire_leaving(&l, &o, id)) {
+                        crate::log!("migration {id}: {} has the vm; recording it for {}: {e}; asked again on the next pass", o.to, o.ip);
+                        continue;
+                    }
                     if crate::util::unlink_durably(&path).is_ok() {
                         crate::log!("migration {id}: {} has the vm; {} stays lent to it", o.to, o.ip);
                         done(&o.to, id);
@@ -1134,6 +1141,7 @@ impl Host {
                     let freed = self.lock().and_then(|l| {
                         let current = self.withdraw_noted(&l, o.ip, o.gen)?;
                         self.unlend(&l, o.ip, o.gen)?;
+                        self.retire_leaving(&l, &o, id)?;
                         // A newer generation here keeps its route.
                         if current && self.holder(&l, o.ip)?.is_none() && !self.reinstall(&l, o.ip, None)? {
                             crate::net::unroute(o.ip);
@@ -1849,6 +1857,17 @@ impl Host {
             store(&path, &Notice { gen, peers }, true)?;
         }
         self.observe(l, ip, gen, 0, None)
+    }
+
+    /// Migration `mig`'s outcome settled (`o`): a `leaving` claim of it by its
+    /// source process goes, durably, before the evidence (the owed record, the
+    /// target's) may.
+    fn retire_leaving(&self, l: &Locked, o: &Owed, mig: u64) -> Result<()> {
+        self.update(l, o.ip, true, |a| {
+            if a.leaving.as_ref().is_some_and(|left| left.mig == mig) && a.holder_id.as_ref() == Some(&o.by) {
+                (a.holder, a.holder_id, a.arriving, a.leaving) = (None, None, None, None);
+            }
+        })
     }
 
     /// Proven dead, with its Firecrackers reaped.
@@ -2691,6 +2710,64 @@ mod tests {
         let other = dead_owner(&h, 999_999_962, &[]);
         std::fs::write(h.state.join("addrs").join("10.9.0.3"), b"{").unwrap();
         assert!(h.owes(&other));
+    }
+
+    #[test]
+    fn a_settled_outcome_retires_the_leaving_claim_before_its_record_goes() {
+        let h = host("owed-retire");
+        let x = ip("10.9.0.1");
+        let gone = dead_owner(&h, 999_999_963, &[]);
+        let a = Addr {
+            seen: 3,
+            lent: Some(3),
+            holder: Some("vm".into()),
+            holder_id: Some(gone.clone()),
+            held: 3,
+            leaving: Some(Leaving { mig: 9, to: "b".into() }),
+            ..Addr::default()
+        };
+        h.put_addr(x, &a, false).unwrap();
+        // A sweep owes it, then dies before the claim goes: the owed record and the claim both remain.
+        h.owe(9, &Owed { to: "b".into(), ip: x, gen: 3, by: gone.clone() }).unwrap();
+        // b has it: the claim is retired before the record goes and before b is told done.
+        let order = std::cell::RefCell::new(Vec::new());
+        // Again while its lock was busy for a moment (another test's forked child: #374).
+        while order.borrow().is_empty() {
+            h.settle_owed_with(
+                5,
+                |_, _| Ok("released".into()),
+                |_, id| {
+                    let a = h.addr(&h.lock().unwrap(), x).unwrap();
+                    order.borrow_mut().push((id, a.leaving.is_none() && a.holder.is_none(), h.owed_path(9).exists()));
+                },
+                |_, _| (),
+            );
+        }
+        assert_eq!(order.into_inner(), [(9, true, false)], "decided on the address, then the record gone, then done");
+        // b has forgotten it (an unknown id reads aborted there): later sweeps owe nothing, withdraw nothing.
+        h.withdraw_dead().unwrap();
+        h.settle_owed_with(5, |_, _| Ok("aborted".into()), |_, _| (), |_, _| ());
+        let a = h.addr(&h.lock().unwrap(), x).unwrap();
+        assert!(!h.owed_path(9).exists() && a.current(3) && a.lent == Some(3) && !a.withdrawn, "{a:?}");
+        // Aborted, the claim goes with the record too.
+        let y = ip("10.9.0.2");
+        let gone = dead_owner(&h, 999_999_964, &[]);
+        let a = Addr {
+            seen: 5,
+            lent: Some(5),
+            holder: Some("vm2".into()),
+            holder_id: Some(gone.clone()),
+            held: 5,
+            leaving: Some(Leaving { mig: 10, to: "b".into() }),
+            ..Addr::default()
+        };
+        h.put_addr(y, &a, false).unwrap();
+        h.owe(10, &Owed { to: "b".into(), ip: y, gen: 5, by: gone }).unwrap();
+        while h.owed_path(10).exists() {
+            h.settle_owed_with(5, |_, _| Ok("aborted".into()), |_, _| (), |_, _| ());
+        }
+        let a = h.addr(&h.lock().unwrap(), y).unwrap();
+        assert!(a.withdrawn && a.lent.is_none() && a.leaving.is_none() && a.holder.is_none() && !h.owed_path(10).exists(), "{a:?}");
     }
 
     #[test]
