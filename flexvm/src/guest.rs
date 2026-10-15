@@ -199,7 +199,7 @@ pub fn ping(uds: &Path) -> Result<()> {
 
 /// Runs a command, draining its output without retaining it.
 pub fn exec(uds: &Path, cmd: &str, timeout: Duration) -> Result<i32> {
-    let at = Instant::now() + timeout;
+    let at = Instant::now().checked_add(timeout).ok_or("guest timeout is too large")?;
     let s = crate::util::connect_unix(uds, timeout)?;
     let (code, _, closed) = run(s, uds, cmd, at, 0)?;
     closed?;
@@ -251,14 +251,14 @@ pub fn start(uds: &Path, ip: std::net::Ipv4Addr, dns: Option<&str>) -> Result<()
 
 /// Returns the offset (ms, guest minus host).
 pub fn clock(uds: &Path, timeout: Duration) -> Result<f64> {
-    answered("CLOCK", Instant::now() + timeout, |by| match ask(uds, &format!("CLOCK {}", now()?), by)? {
+    answered("CLOCK", Instant::now().checked_add(timeout).ok_or("guest timeout is too large")?, |by| match ask(uds, &format!("CLOCK {}", now()?), by)? {
         (FRAME_MSG, m) if m.starts_with(b"ok ") => Ok(String::from_utf8_lossy(&m[3..]).trim().parse::<f64>()? / 1e6),
         (_, m) => Err(refused("CLOCK", &m)),
     })
 }
 
 fn message(uds: &Path, line: &str, timeout: Duration) -> Result<String> {
-    match ask(uds, line, Instant::now() + timeout)? {
+    match ask(uds, line, Instant::now().checked_add(timeout).ok_or("guest timeout is too large")?)? {
         (FRAME_MSG, m) => Ok(String::from_utf8_lossy(&m).into_owned()),
         (_, m) => bail!("unexpected reply to {line}: {}", String::from_utf8_lossy(&m)),
     }
@@ -289,7 +289,7 @@ pub fn probe(uds: &Path, port: u16) -> Result<bool> {
 
 pub fn check(uds: &Path, cmd: &str, timeout: Duration) -> Result<bool> {
     let hex: String = cmd.bytes().map(|b| format!("{b:02x}")).collect();
-    match message(uds, &format!("CHECK {} {hex}", timeout.as_millis()), timeout + TIMEOUT)? {
+    match message(uds, &format!("CHECK {} {hex}", timeout.as_millis()), timeout.checked_add(TIMEOUT).ok_or("guest timeout is too large")?)? {
         m if m == "ok" => Ok(true),
         m if m.starts_with("exit ") || m == "timeout" => Ok(false),
         m => bail!("readiness command: {m}"),
@@ -311,6 +311,14 @@ pub fn start_logs(s: UnixStream, offset: u64, follow: bool, timeout: Duration) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overflowing_timeouts_fail_before_contacting_the_guest() {
+        let path = Path::new("/nonexistent-flexvm-timeout-test");
+        for error in [clock(path, Duration::MAX).unwrap_err(), check(path, "true", Duration::MAX).unwrap_err()] {
+            assert_eq!(error.to_string(), "guest timeout is too large");
+        }
+    }
 
     #[test]
     fn message_deadline_bounds_a_trickled_frame() {

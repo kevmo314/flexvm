@@ -817,16 +817,16 @@ fn build(paths: &Paths, dir: &Path, name: &str, vcpus: u32, mem_mib: u64, max_mi
     interrupted()?;
     let wset = record_working_set(paths, dir, tap, &sockets)?;
     let size = std::fs::metadata(dir.join("mem"))?.len();
-    println!(
+    crate::output(format_args!(
         "template {name} (id {}): {vcpus} vCPUs, {mem_mib} MiB base + {hotplug} MiB hotplug ({plugged} MiB plugged, \
-         {reported} MiB reported free), booted in {} ms, memory file {} MiB ({} MiB of zeroes punched out in {} ms), working set {} MiB",
+         {reported} MiB reported free), booted in {} ms, memory file {} MiB ({} MiB of zeroes punched out in {} ms), working set {} MiB\n",
         meta.id,
         ms(booted),
         size >> 20,
         punched >> 20,
         ms(sparsified),
         wset >> 20
-    );
+    ))?;
     Ok(())
 }
 

@@ -68,6 +68,11 @@ pub(super) struct Link {
     sums: Vec<u32>,
 }
 
+/// Read only the bounded, checksummed manifest, without opening its ancestors or page data.
+pub fn read_manifest(dir: &Path) -> Result<Manifest> {
+    Ok(Link::open(dir, 0, None)?.manifest)
+}
+
 impl Link {
     /// With `meta_left`, also reads and checks the rest within that budget (debited) and opens `pages`.
     pub(super) fn open(dir: &Path, ck: usize, meta_left: Option<&mut u64>) -> Result<Link> {
