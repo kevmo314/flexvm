@@ -9,7 +9,7 @@ use std::net::Ipv4Addr;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -142,7 +142,15 @@ pub struct Proc {
     held_grant: Mutex<Option<crate::host::Hold>>,
     /// A standby's (MiB held or to page in, guest size), taken while it waits, so a claim need not.
     pub sizes: Mutex<Option<(u64, u64)>>,
-    serving: AtomicBool,
+    /// Set once the control socket is bound (a failed bind is tried again).
+    serving: Mutex<bool>,
+    /// SIGTSTP and SIGCONT, off the signal thread (which a later SIGINT needs).
+    pauses: Latest,
+    /// The code of a destroy waiting for `op` (0: none): a pause or resume that gets it first does nothing.
+    destroying: AtomicI32,
+    /// Held by the signal thread from taking a signal to reserving a SIGTERM's suspend,
+    /// and by `flexvm resume` asking: one sent earlier is still pending, queued or reserved.
+    taking: Mutex<()>,
     /// The controller's tick gaps, for `debug status`.
     ticks: Mutex<Ticks>,
     /// How fast the VM's memory grew lately (MiB/s), for eviction's ranking.
@@ -238,7 +246,10 @@ impl Proc {
             charged: AtomicU64::new(0),
             held_grant: Mutex::new(None),
             sizes: Mutex::new(None),
-            serving: AtomicBool::new(false),
+            serving: Mutex::new(false),
+            pauses: Latest::default(),
+            destroying: AtomicI32::new(0),
+            taking: Mutex::new(()),
             ticks: Mutex::new(Ticks::default()),
             growth: AtomicU64::new(0),
             publishing: Mutex::new(()),
@@ -461,12 +472,15 @@ impl Proc {
     }
 
     pub fn op_within(&self) -> Result<Op<'_>> {
-        let deadline = Instant::now() + OP_WAIT;
+        let (deadline, mut nap) = (Instant::now() + OP_WAIT, Duration::from_millis(1));
         loop {
             match self.op.try_lock() {
                 Ok(g) => return Ok(g),
                 Err(std::sync::TryLockError::Poisoned(e)) => return Ok(e.into_inner()),
-                Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(1)),
+                Err(_) if Instant::now() < deadline => {
+                    thread::sleep(nap);
+                    nap = (nap * 2).min(Duration::from_millis(50));
+                }
                 Err(_) => bail!("vm {} is busy", self.name()),
             }
         }
@@ -514,6 +528,8 @@ impl Proc {
             max_mib: vm.template.meta.max_mib,
             state: match vm.state() {
                 State::Source(mig) if self.reconciling.lock().unwrap().as_ref().is_some_and(|(m, _)| *m == mig) => "reconciling",
+                // SIGCONT does nothing then: `flexvm resume` waits for the suspend instead.
+                _ if *self.suspending.lock().unwrap() == Suspend::Suspending => "suspending",
                 state => state.name(),
             }
             .into(),
@@ -588,6 +604,27 @@ impl Proc {
     /// never killed, as the target may still be pulling its memory. One whose
     /// outcome is still unknown is (`end_reconciling`).
     pub fn destroy(&self, code: i32) -> Error {
+        self.destroying.store(code, Ordering::SeqCst);
+        let refused = self.try_destroy(code);
+        let _ = self.destroying.compare_exchange(code, 0, Ordering::SeqCst, Ordering::SeqCst);
+        refused
+    }
+
+    /// The code a destroy asked for, if one is waiting (a kill that cancelled a suspend).
+    pub fn destroy_code(&self) -> Option<i32> {
+        Some(self.destroying.load(Ordering::SeqCst)).filter(|&c| c != 0)
+    }
+
+    /// For a pause or resume: refused once a destroy waits for `op` too.
+    pub fn op_unless_destroyed(&self) -> Result<Op<'_>> {
+        let op = self.op_within()?;
+        if self.destroy_code().is_some() {
+            bail!("vm {} is being destroyed", self.name());
+        }
+        Ok(op)
+    }
+
+    fn try_destroy(&self, code: i32) -> Error {
         let vm = self.vm();
         let source = || format!("vm {} is the source of a migration in progress; it ends once the target has its memory", vm.name).into();
         if let State::Source(mig) = vm.state() {
@@ -670,7 +707,7 @@ impl Proc {
         let mut s = self.suspending.lock().unwrap();
         (*s == Suspend::Idle).then(|| {
             *s = Suspend::Suspending;
-            SuspendReserved(p.clone())
+            SuspendReserved(p.clone(), false)
         })
     }
 
@@ -797,7 +834,8 @@ impl Proc {
     }
 
     pub fn serve_control(self: &Arc<Self>) {
-        if self.serving.swap(true, Ordering::SeqCst) {
+        let mut serving = self.serving.lock().unwrap();
+        if *serving {
             return;
         }
         let sock = self.host.sock(&self.name());
@@ -808,6 +846,7 @@ impl Proc {
         };
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600));
+        *serving = true;
         let p = self.clone();
         thread::spawn(move || {
             for c in l.incoming() {
@@ -845,10 +884,16 @@ impl Proc {
                 p.died();
             });
         }
-        // Before the main command starts: a Ctrl-Z taken during startup pauses the VM first.
-        let early = std::mem::take(&mut *self.early.lock().unwrap());
-        for sig in early {
-            self.signal(sig);
+        // In order, what comes meanwhile queued behind; and before the main
+        // command starts: a Ctrl-Z taken during startup pauses the VM first.
+        loop {
+            let next = self.early.lock().unwrap().first().copied();
+            let Some(sig) = next else { break };
+            self.dispatch(sig);
+            self.early.lock().unwrap().remove(0);
+        }
+        while self.pauses.busy.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(10));
         }
         if self.cmd.lock().unwrap().is_some() {
             spawn(Proc::main_command);
@@ -858,17 +903,54 @@ impl Proc {
         }
     }
 
-    fn signal(&self, sig: i32) {
+    fn signal(self: &Arc<Self>, sig: i32) {
         let mut early = self.early.lock().unwrap();
-        let Some(vm) = self.vm.get() else {
+        // Until those before it are replayed (`serve`), as it would overtake them.
+        if self.vm.get().is_none() || !early.is_empty() {
             if sig != libc::SIGHUP {
                 early.push(sig);
             }
             return;
-        };
+        }
         drop(early);
+        self.dispatch(sig);
+    }
+
+    /// `flexvm resume`: whether a SIGTERM sent before it suspends the VM; if none,
+    /// its SIGCONT (which, as a raw one did, discards a Ctrl-Z still pending).
+    fn resume_request(&self) -> Value {
+        let _taking = self.taking.lock().unwrap();
+        // Queued first: a replay reserves, then takes it off.
+        let coming = self.early.lock().unwrap().contains(&libc::SIGTERM)
+            || *self.suspending.lock().unwrap() == Suspend::Suspending
+            || crate::util::signal_pending(libc::SIGTERM);
+        if !coming {
+            unsafe { libc::kill(libc::getpid(), libc::SIGCONT) };
+        }
+        json!({"suspending": coming})
+    }
+
+    fn dispatch(self: &Arc<Self>, sig: i32) {
+        if !matches!(sig, libc::SIGTSTP | libc::SIGCONT) {
+            return self.handle(sig);
+        }
+        if self.pauses.offer(sig) {
+            let p = self.clone();
+            if let Err(e) = thread::Builder::new().spawn(move || {
+                while let Some(sig) = p.pauses.next() {
+                    p.handle(sig);
+                }
+            }) {
+                self.pauses.busy.store(false, Ordering::SeqCst);
+                crate::log!("vm {}: signal {sig}: {e}", self.name());
+            }
+        }
+    }
+
+    fn handle(&self, sig: i32) {
+        let vm = self.vm();
         let res = match sig {
-            libc::SIGTSTP => self.op_within().and_then(|_op| {
+            libc::SIGTSTP => self.op_unless_destroyed().and_then(|_op| {
                 let res = vm.pause();
                 // A pause that may have landed counts as requested, so SIGCONT resumes it.
                 if res.is_ok() || vm.switch_unsure() {
@@ -895,15 +977,17 @@ impl Proc {
                     Ok(())
                 }
                 // Off the signal thread, which a later SIGINT needs. Unspawned, the closure and its reservation are dropped.
-                Some(r) => thread::Builder::new()
+                Some(mut r) => thread::Builder::new()
                     .spawn(move || {
                         let p = r.proc().clone();
+                        r.1 = true;
+                        p.publish();
                         crate::log!("vm {}: signal {sig}: {}", p.name(), p.suspend(r))
                     })
                     .map(drop)
                     .map_err(|e| format!("suspending: {e}").into()),
             },
-            libc::SIGINT => Err(self.destroy(128 + libc::SIGINT)),
+            libc::SIGINT | libc::SIGQUIT => Err(self.destroy(128 + sig)),
             _ => Ok(()),
         };
         if let Err(e) = res {
@@ -936,6 +1020,7 @@ impl Proc {
             }),
             "migrate" => self.migrate(req["to"].as_str().unwrap_or(""), req["if_idle"] == true, req["evict"] == true),
             "debug" => self.debug(&req),
+            "resume" => Ok(self.resume_request()),
             "claim" => Err("this vm is not a standby vm".into()),
             op => Err(format!("unknown op {op:?}").into()),
         };
@@ -955,7 +1040,10 @@ impl Proc {
             drop(slot);
             return refuse_pages(s, "injected fault: page server down");
         }
-        let Some(pages) = Slot::take(&PAGES, MAX_PAGES) else { return };
+        let Some(pages) = Slot::take(&PAGES, MAX_PAGES) else {
+            drop(slot);
+            return refuse_pages(s, "page server busy");
+        };
         drop(slot);
         let admitted = match crate::uffd::admit(&s) {
             Ok(Some(a)) => a,
@@ -1000,8 +1088,13 @@ impl Proc {
             if req["action"] == "close" {
                 g.get_ref().set_read_timeout(Some(Duration::from_secs(2)))?;
                 let reply = guest::read_frame(&mut g)?.map(|(_, m)| String::from_utf8_lossy(&m).into_owned());
-                let closed = reply.as_deref() == Some("closed");
-                return Ok(send_json(&mut w, &json!({"ok": closed, "error": format!("session close failed: {}", reply.unwrap_or_default())}))?);
+                return Ok(send_json(
+                    &mut w,
+                    &match reply.as_deref() {
+                        Some("closed") => json!({"ok": true}),
+                        r => json!({"ok": false, "error": format!("session close failed: {}", r.unwrap_or_default())}),
+                    },
+                )?);
             }
             // The guest heartbeats every second; silence means the VM moved, or its agent stalled.
             g.get_ref().set_read_timeout(Some(Duration::from_secs(3)))?;
@@ -1014,7 +1107,7 @@ impl Proc {
 
     fn debug(&self, req: &Value) -> Result<Value> {
         if req["what"] != "status" && std::env::var("FLEXVM_FAULTS").ok().as_deref() != Some("1") {
-            bail!("memhash needs FLEXVM_FAULTS=1");
+            bail!("debug {} needs FLEXVM_FAULTS=1", req["what"]);
         }
         let vm = self.vm();
         match req["what"].as_str().unwrap_or("") {
@@ -1186,7 +1279,8 @@ impl Proc {
                 let _ = g.get_ref().set_read_timeout(None);
                 while let Ok(Some((kind, data))) = guest::read_frame(&mut g) {
                     // The guest's ring moved past us (or we asked past its end): it goes on from there.
-                    if let (guest::FRAME_LOST, Ok(at)) = (kind, <[u8; 8]>::try_from(&data[..data.len().min(8)])) {
+                    if kind == guest::FRAME_LOST {
+                        let Ok(at) = <[u8; 8]>::try_from(&data[..data.len().min(8)]) else { continue };
                         let (at, was) = (u64::from_le_bytes(at), self.app_log.load(Ordering::SeqCst));
                         if at > was {
                             crate::log!("vm {}: {} bytes of app output lost (the guest keeps its last 1 MiB)", vm.name, at - was);
@@ -1313,7 +1407,8 @@ pub enum Suspend {
 }
 
 /// The reserved suspend: dropped (it failed, or never started), the next may run.
-pub struct SuspendReserved(Arc<Proc>);
+/// Published (as `suspending`) by its worker, never on the signal thread.
+pub struct SuspendReserved(Arc<Proc>, bool);
 
 impl SuspendReserved {
     fn proc(&self) -> &Arc<Proc> {
@@ -1326,6 +1421,42 @@ impl Drop for SuspendReserved {
         let mut s = self.0.suspending.lock().unwrap();
         if *s == Suspend::Suspending {
             *s = Suspend::Idle;
+            drop(s);
+            if self.1 {
+                self.0.publish();
+            }
+        }
+    }
+}
+
+/// The newest request offered, taken one at a time by a single worker: a
+/// SIGCONT after a SIGTSTP still waiting for the VM leaves it running.
+#[derive(Default)]
+struct Latest {
+    wanted: AtomicI32,
+    busy: AtomicBool,
+}
+
+impl Latest {
+    /// True if the caller is to start the worker.
+    fn offer(&self, sig: i32) -> bool {
+        self.wanted.store(sig, Ordering::SeqCst);
+        !self.busy.swap(true, Ordering::SeqCst)
+    }
+
+    /// The worker's next request; None once there is none (and it is to stop).
+    fn next(&self) -> Option<i32> {
+        loop {
+            match self.wanted.swap(0, Ordering::SeqCst) {
+                0 => {
+                    self.busy.store(false, Ordering::SeqCst);
+                    // An offer between the two found it busy: this worker takes it, unless a new one started.
+                    if self.wanted.load(Ordering::SeqCst) == 0 || self.busy.swap(true, Ordering::SeqCst) {
+                        return None;
+                    }
+                }
+                sig => return Some(sig),
+            }
         }
     }
 }
@@ -1359,7 +1490,7 @@ fn owe_or_refuse(reconciling: &Mutex<Option<(u64, String)>>, mig: u64, tries: u3
 /// What stops a standby VM before its claim: SIGUSR1 (`standby::stop`'s, which
 /// the claimed VM ignores), or SIGINT or SIGTERM sent to it.
 fn is_stop(sig: i32) -> bool {
-    matches!(sig, libc::SIGINT | libc::SIGTERM | libc::SIGUSR1)
+    matches!(sig, libc::SIGINT | libc::SIGQUIT | libc::SIGTERM | libc::SIGUSR1)
 }
 
 /// A claim discards only the pool's stop; termination requests still replay.
@@ -1384,12 +1515,17 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
         crate::gc::periodic(host);
     });
     let s = p.clone();
+    let fd = crate::util::signal_fd(&signals)?;
+    // Ctrl-\ quits like Ctrl-C: the VM is destroyed, not dumped.
     thread::spawn(move || loop {
-        // Ctrl-\ quits like Ctrl-C: the VM is destroyed, not dumped.
-        s.signal(match crate::util::wait_signal(&signals) {
-            libc::SIGQUIT => libc::SIGINT,
-            sig => sig,
-        });
+        let _ = crate::util::readable(&fd, Duration::from_secs(3600));
+        // Taken, and a SIGTERM's suspend reserved, under `taking` (`resume_request`).
+        let taking = s.taking.lock().unwrap();
+        let Some(sig) = crate::util::take_signal(&signals) else { continue };
+        if sig != libc::SIGTERM {
+            drop(taking);
+        }
+        s.signal(sig);
     });
     let op = p.op();
     let res = match start {
@@ -2079,6 +2215,123 @@ mod tests {
         });
         assert_eq!(got.unwrap().as_deref(), Some("b:1"));
         assert!(r.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn pauses_run_one_at_a_time_the_newest_winning() {
+        let l = Latest::default();
+        assert!(l.offer(libc::SIGTSTP), "the first starts the worker");
+        assert!(!l.offer(libc::SIGCONT), "one worker at a time");
+        assert_eq!(l.next(), Some(libc::SIGCONT), "a SIGCONT after a waiting SIGTSTP wins");
+        assert!(!l.offer(libc::SIGTSTP));
+        assert_eq!(l.next(), Some(libc::SIGTSTP), "taken by the running worker, in order");
+        assert_eq!(l.next(), None);
+        assert!(l.offer(libc::SIGCONT), "stopped: the next offer starts another");
+    }
+
+    #[test]
+    fn no_pause_offer_is_lost_to_a_stopping_worker() {
+        let l = Arc::new(Latest::default());
+        let (handled, workers) = (Arc::new(AtomicI32::new(0)), Arc::new(AtomicI32::new(0)));
+        for i in 1..=2000 {
+            let sig = if i % 2 == 0 { libc::SIGCONT } else { libc::SIGTSTP };
+            if l.offer(sig) {
+                let (l, handled, workers) = (l.clone(), handled.clone(), workers.clone());
+                workers.fetch_add(1, Ordering::SeqCst);
+                thread::spawn(move || {
+                    while let Some(sig) = l.next() {
+                        handled.store(sig, Ordering::SeqCst);
+                    }
+                    workers.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
+            while workers.load(Ordering::SeqCst) > 0 && i % 100 == 0 {
+                thread::yield_now();
+            }
+        }
+        let end = Instant::now() + Duration::from_secs(5);
+        while (workers.load(Ordering::SeqCst) > 0 || l.busy.load(Ordering::SeqCst)) && Instant::now() < end {
+            thread::yield_now();
+        }
+        assert_eq!(handled.load(Ordering::SeqCst), libc::SIGCONT, "the last offer was handled");
+        assert_eq!(l.wanted.load(Ordering::SeqCst), 0);
+    }
+
+    fn test_proc(tag: &str) -> (Arc<Proc>, PathBuf) {
+        let root = std::env::temp_dir().join(format!("fv-proc-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("templates/default")).unwrap();
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        (Proc::new(host, Paths::new(&root, None).unwrap()).unwrap(), root)
+    }
+
+    #[test]
+    fn a_pause_waiting_for_the_vm_yields_to_a_destroy() {
+        let (p, root) = test_proc("destroy");
+        let held = p.op();
+        let q = p.clone();
+        let pause = thread::spawn(move || q.op_unless_destroyed().map(drop).map_err(|e| e.to_string()));
+        thread::sleep(Duration::from_millis(50));
+        // As `destroy` does before it waits for `op`; the pause gets it first.
+        p.destroying.store(128 + libc::SIGQUIT, Ordering::SeqCst);
+        drop(held);
+        assert!(pause.join().unwrap().unwrap_err().contains("being destroyed"));
+        assert_eq!(p.destroy_code(), Some(131), "a kill that cancels a suspend reports it");
+        // Refused (`destroy` takes its code back): the next pause goes ahead.
+        let _ = p.destroying.compare_exchange(131, 0, Ordering::SeqCst, Ordering::SeqCst);
+        assert!(p.op_unless_destroyed().is_ok());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_resume_asked_while_a_sigterm_is_taken_waits_for_its_reservation() {
+        let (p, root) = test_proc("resume-taking");
+        assert_eq!(p.resume_request()["suspending"], false);
+        // The signal thread has taken a SIGTERM (no longer pending) and not yet reserved.
+        let taking = p.taking.lock().unwrap();
+        let q = p.clone();
+        let asked = thread::spawn(move || q.resume_request());
+        thread::sleep(Duration::from_millis(50));
+        assert!(!asked.is_finished(), "waits for the signal thread");
+        *p.suspending.lock().unwrap() = Suspend::Suspending;
+        drop(taking);
+        assert_eq!(asked.join().unwrap()["suspending"], true);
+        *p.suspending.lock().unwrap() = Suspend::Idle;
+        p.early.lock().unwrap().push(libc::SIGTERM);
+        assert_eq!(p.resume_request()["suspending"], true, "queued at startup, still to be replayed");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_resume_answers_without_any_signal_taken() {
+        // No signal thread (nor a SIGCONT a Ctrl-Z could erase): answered at once, from what is pending.
+        let (p, root) = test_proc("resume-pending");
+        thread::spawn(move || {
+            let set = crate::util::block_signals(&[libc::SIGTERM, libc::SIGTSTP]);
+            unsafe { libc::pthread_kill(libc::pthread_self(), libc::SIGTSTP) };
+            let t = Instant::now();
+            assert_eq!(p.resume_request()["suspending"], false, "a pending Ctrl-Z is no suspend");
+            unsafe { libc::pthread_kill(libc::pthread_self(), libc::SIGTERM) };
+            assert_eq!(p.resume_request()["suspending"], true, "a SIGTERM not yet taken");
+            assert!(t.elapsed() < Duration::from_secs(1));
+            while crate::util::take_signal(&set).is_some() {}
+        })
+        .join()
+        .unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_blocked_signal_not_yet_taken_is_pending() {
+        thread::spawn(|| {
+            let set = crate::util::block_signals(&[libc::SIGUSR2]);
+            assert!(!crate::util::signal_pending(libc::SIGUSR2));
+            unsafe { libc::pthread_kill(libc::pthread_self(), libc::SIGUSR2) };
+            assert!(crate::util::signal_pending(libc::SIGUSR2));
+            assert_eq!(crate::util::wait_signal(&set), libc::SIGUSR2);
+            assert!(!crate::util::signal_pending(libc::SIGUSR2));
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]

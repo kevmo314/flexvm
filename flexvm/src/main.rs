@@ -348,8 +348,7 @@ fn real_main(args: &Args) -> Result<()> {
             vmproc::main(open_host(args)?, paths(args)?, Start::Incoming { req }, None)
         }
         Some("run") => run(args, name, template),
-        // A paused VM gets SIGCONT; a suspended one a new process.
-        Some("resume") if open_host(args)?.signal(name, libc::SIGCONT).is_ok() => Ok(()),
+        Some("resume") if resume(&open_host(args)?, name)? => Ok(()),
         Some("resume") => start(args, name, Start::Resume { name: name.into() }),
         Some("restore") => {
             let dir = std::path::absolute(pos.get(1).ok_or("restore needs DIR")?)?;
@@ -577,6 +576,25 @@ fn follow(mut conn: BufReader<std::os::unix::net::UnixStream>, id: host::Ident) 
     }
     let reply = recv_json(&mut conn).ok().flatten();
     util::exit(reply.and_then(|r| r["exit"].as_i64()).map_or(vmproc::FAILED, |c| c as i32))
+}
+
+/// A running VM's process resumes it (true); a suspended one a new process. A
+/// suspend coming (a SIGTERM sent before) is waited out: the VM then runs here
+/// (it failed) or is suspended. Never true unless its process said so.
+fn resume(host: &Host, name: &str) -> Result<bool> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match vmproc::call(host, name, json!({"op": "resume"}), None) {
+            Ok(v) if v["suspending"] == true => {}
+            Ok(_) => return Ok(true),
+            // A process from before the op: SIGCONT, as then.
+            Err(e) if e.to_string().contains("unknown op") => return Ok(host.signal(name, libc::SIGCONT).is_ok()),
+            Err(_) if host.entry(name).is_err() => return Ok(false),
+            Err(e) if std::time::Instant::now() >= deadline => return Err(e),
+            Err(_) => {}
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn kill(host: &Host, name: &str) -> Result<()> {

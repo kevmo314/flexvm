@@ -85,7 +85,7 @@ impl Proc {
     /// SIGCONT; a held restore at a new address gets it now.
     pub fn resume(&self) -> Result<Value> {
         let vm = self.vm();
-        let op = self.op_within()?;
+        let op = self.op_unless_destroyed()?;
         let start = Instant::now();
         // An arriving VM's pages first, so the host lock is held only through the resume itself (#334).
         vm.await_peer_pages()?;
@@ -248,7 +248,7 @@ impl Proc {
                     if let Err(e) = freed {
                         crate::log!("vm {}: killed while suspending, its checkpoint revoked; freeing its address: {e}", vm.name);
                     }
-                    self.finish(&op, End::Gone, 128 + libc::SIGINT, None)
+                    self.finish(&op, End::Gone, self.destroy_code().unwrap_or(128 + libc::SIGINT), None)
                 }
                 Err(e) => {
                     crate::log!("vm {}: {how} while suspending, but its checkpoint stays: {e}", vm.name);

@@ -972,6 +972,30 @@ pub fn block_signals(sigs: &[i32]) -> libc::sigset_t {
     }
 }
 
+/// Pending for the process (or this thread), blocked and not yet taken.
+pub fn signal_pending(sig: i32) -> bool {
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigpending(&mut set) == 0 && libc::sigismember(&set, sig) == 1
+    }
+}
+
+/// Readable while one of `set` (blocked) is pending; `take_signal` takes it.
+pub fn signal_fd(set: &libc::sigset_t) -> io::Result<OwnedFd> {
+    let fd = unsafe { libc::signalfd(-1, set, libc::SFD_CLOEXEC) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// One of `set` if pending, without waiting.
+pub fn take_signal(set: &libc::sigset_t) -> Option<i32> {
+    let now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    let sig = unsafe { libc::sigtimedwait(set, std::ptr::null_mut(), &now) };
+    (sig > 0).then_some(sig)
+}
+
 pub fn wait_signal(set: &libc::sigset_t) -> i32 {
     let mut sig = 0;
     while unsafe { libc::sigwait(set, &mut sig) } != 0 {}
