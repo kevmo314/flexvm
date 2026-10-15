@@ -1,0 +1,6 @@
+# SHA256 URL (the URL must match exactly, including version and architecture).
+# fetch.sh refuses to download a URL until it has a pinned checksum here. A version override needs its own entry.
+# Firecracker's matches its release's .sha256.txt; the CI kernel and rootfs were checked against copies fetched days earlier.
+06094a1108ae9e82aa4c23a775aa92758f53f1175d422270d9d6162cb9ade558 https://github.com/firecracker-microvm/firecracker/releases/download/v1.17.0/firecracker-v1.17.0-x86_64.tgz
+e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017aeff53af3d4f2 https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.15/x86_64/vmlinux-6.1.155
+68321e0482baeb3844dafe8a6b08a6902401a7afc41fbfd8c3d9ea08aadd244f https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.15/x86_64/ubuntu-24.04.squashfs

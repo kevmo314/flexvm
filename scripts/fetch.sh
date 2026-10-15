@@ -2,7 +2,9 @@
 # Downloads Firecracker, a guest kernel and a base rootfs into ./artifacts.
 set -euo pipefail
 
-FC_VERSION=${FC_VERSION:-v1.17.0}
+root=$(cd "$(dirname "$0")/.." && pwd)
+# shellcheck source=versions.sh
+source "$root/scripts/versions.sh"
 CI_VERSION=${CI_VERSION:-v1.15}
 KERNEL=${KERNEL:-vmlinux-6.1.155}
 ARCH=x86_64
@@ -16,7 +18,6 @@ if [ "${1:-}" = --urls ]; then
   exit 0
 fi
 
-root=$(cd "$(dirname "$0")/.." && pwd)
 out=$root/artifacts
 mkdir -p "$out"
 cd "$out"
@@ -27,10 +28,19 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 download() {
-  local target=$1 url=$2 tmp
-  tmp=$(mktemp "./$target.XXXXXX")
+  local target=$1 url=$2 tmp checksum
+  checksum=$(awk -v url="$url" '$2 == url {print $1}' "$root/scripts/checksums.sha256")
+  if [[ ! $checksum =~ ^[[:xdigit:]]{64}$ ]]; then
+    echo "No pinned SHA256 for $url; update scripts/checksums.sha256" >&2
+    return 1
+  fi
+  tmp=$(mktemp "$target.XXXXXX")
   temps+=("$tmp")
   curl -fsSL -o "$tmp" "$url"
+  if ! printf '%s  %s\n' "$checksum" "$tmp" | sha256sum --check --status; then
+    echo "SHA256 mismatch for $url" >&2
+    return 1
+  fi
   mv -f "$tmp" "$target"
 }
 
@@ -38,7 +48,8 @@ if [ ! -x firecracker ]; then
   echo "fetching firecracker $FC_VERSION"
   tmp=$(mktemp -d ./firecracker.XXXXXX)
   temps+=("$tmp")
-  curl -fsSL "$FC_URL" | tar xz -C "$tmp"
+  download "$tmp/firecracker.tgz" "$FC_URL"
+  tar xzf "$tmp/firecracker.tgz" -C "$tmp"
   mv "$tmp/release-$FC_VERSION-$ARCH/firecracker-$FC_VERSION-$ARCH" firecracker
 fi
 
