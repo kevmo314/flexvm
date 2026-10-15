@@ -39,7 +39,7 @@ fn overhead(mib: u64) -> u64 {
 
 /// What a VM starting with `need` MiB in it, or still to page in, is admitted.
 pub fn allowance(need: u64) -> u64 {
-    need + step(need)
+    need.saturating_add(step(need))
 }
 
 /// How much more is admitted at a time: a quarter of what the VM has, 256 MiB to 2 GiB.

@@ -30,6 +30,16 @@ pub struct Hold {
     _file: File,
 }
 
+impl Hold {
+    /// Renamed to count `mib`, under the host lock.
+    fn resize(&mut self, mib: u64) -> std::io::Result<()> {
+        let path = self.path.with_file_name(format!("{}-{mib}", self.id));
+        std::fs::rename(&self.path, &path)?;
+        (self.path, self.mib) = (path, mib);
+        Ok(())
+    }
+}
+
 impl Drop for Hold {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
@@ -841,10 +851,7 @@ impl Host {
         let _l = self.lock()?;
         let mut g = hold.lock().unwrap();
         let Some(h) = g.as_mut().filter(|h| more(h)) else { return Ok(()) };
-        let path = h.path.with_file_name(format!("{}-{mib}", h.id));
-        std::fs::rename(&h.path, &path)?;
-        (h.path, h.mib) = (path, mib);
-        Ok(())
+        Ok(h.resize(mib)?)
     }
 
     /// Per boot by name: RUN need not be a tmpfs. An unreadable boot id still counts grants.
@@ -948,19 +955,26 @@ impl Host {
             format!("{e}: memory held for migrations and restores still arriving cannot be counted")
         })?;
         let held_ids: HashSet<_> = held.iter().map(|h| h.0).collect();
-        let pending: u64 = grants.iter().filter(|g| !held_ids.contains(&g.2)).map(|g| g.1).sum::<u64>() + held.iter().map(|h| h.1).sum::<u64>();
+        // Saturating: a peer's sizes are not trusted to fit.
+        let pending = grants.iter().filter(|g| !held_ids.contains(&g.2)).map(|g| g.1).chain(held.iter().map(|h| h.1)).fold(0, u64::saturating_add);
         let avail = available().ok_or("cannot read MemAvailable from /proc/meminfo")?;
-        if avail < floor + pending + mib {
+        if avail < floor.saturating_add(pending).saturating_add(mib) {
             return Ok(Err(format!("not enough memory here for {mib} MiB above the {floor} MiB {what}").into()));
         }
         Ok(Ok(grants))
     }
 
-    /// Counts `hold` as `mib` more, admitted above `floor` like a grant (a
-    /// refusal is an error): renamed under the host lock, as `shrink_hold`
+    /// Counts `hold` as `mib` more, admitted above `floor` like a grant
+    /// (Ok(Err(why)) if refused): renamed under the host lock, as `shrink_hold`
     /// does. Its grant's id stays, so a refund still finds it, and it is
     /// counted once (as a hold). Refused, it counts as before.
-    pub fn grow_hold(&self, hold: &Mutex<Option<Hold>>, mib: u64, floor: Floor, deadline: Option<std::time::Instant>) -> Result<()> {
+    pub fn grow_hold(
+        &self,
+        hold: &Mutex<Option<Hold>>,
+        mib: u64,
+        floor: Floor,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<std::result::Result<(), Error>> {
         self.grow_hold_inner(hold, mib, floor, deadline, crate::vmproc::host_available_mib)
     }
 
@@ -971,16 +985,15 @@ impl Host {
         floor: Floor,
         deadline: Option<std::time::Instant>,
         available: impl FnOnce() -> Option<u64>,
-    ) -> Result<()> {
+    ) -> Result<std::result::Result<(), Error>> {
         let l = self.lock_by(deadline)?;
         let mut g = hold.lock().unwrap();
         let h = g.as_mut().ok_or("no held grant to grow")?;
-        self.room(&l, mib, floor, available)??;
-        let total = h.mib + mib;
-        let path = h.path.with_file_name(format!("{}-{total}", h.id));
-        std::fs::rename(&h.path, &path)?;
-        (h.path, h.mib) = (path, total);
-        Ok(())
+        if let Err(why) = self.room(&l, mib, floor, available)? {
+            return Ok(Err(why));
+        }
+        h.resize(h.mib.saturating_add(mib))?;
+        Ok(Ok(()))
     }
 
     // Incoming migrations: `STATE/migs/ID`, durable, under the host lock.
@@ -4013,12 +4026,12 @@ mod tests {
         let hold = Mutex::new(hold);
         let grow = |mib, floor| h.grow_hold_inner(&hold, mib, floor, None, || Some(AVAIL));
         // 2000 MiB left: not 2001 more, and refused it still counts 1000.
-        assert!(grow(2001, Floor::Reserve).unwrap_err().to_string().contains("not enough memory"));
+        assert!(grow(2001, Floor::Reserve).unwrap().unwrap_err().to_string().contains("not enough memory"));
         assert!(h.run.join(format!("holds/{id}-1000")).exists());
         // Above the eviction mark there is less room.
-        assert!(grow(501, Floor::EvictMark).unwrap_err().to_string().contains("eviction mark"));
-        grow(500, Floor::EvictMark).unwrap();
-        grow(1000, Floor::Reserve).unwrap();
+        assert!(grow(501, Floor::EvictMark).unwrap().unwrap_err().to_string().contains("eviction mark"));
+        grow(500, Floor::EvictMark).unwrap().unwrap();
+        grow(1000, Floor::Reserve).unwrap().unwrap();
         assert!(h.run.join(format!("holds/{id}-2500")).exists());
         // Counted once, grown (its own grant in the window is the hold, not more).
         assert!(!admit(&h, 501) && admit(&h, 500));
@@ -4027,6 +4040,23 @@ mod tests {
         assert!(h.run.join(format!("holds/{id}-100")).exists());
         drop(hold.lock().unwrap().take());
         assert!(grow(1, Floor::Reserve).unwrap_err().to_string().contains("no held grant"));
+    }
+
+    /// Sizes past any host's (a peer's, unchecked) saturate: refused, and never wrapped round so later ones fit.
+    #[test]
+    fn admission_saturates() {
+        let (_h_dir, mut h) = host("saturate");
+        h.cfg.reserve_mib = AVAIL - 3000;
+        pin_clock(boottime_ms());
+        assert_eq!(crate::limit::allowance(u64::MAX), u64::MAX);
+        assert!(grant_at(&h, u64::MAX, Floor::Reserve, false).is_err());
+        let hold = Mutex::new(grant_at(&h, 1000, Floor::Reserve, true).unwrap().1);
+        assert!(h.grow_hold_inner(&hold, u64::MAX, Floor::Reserve, None, || Some(AVAIL)).unwrap().is_err());
+        // A grant of nearly everything, with the hold, sums past u64::MAX: all else is refused.
+        let mut grants: Vec<(u64, u64, u64)> = load(&h.grants()).unwrap().unwrap();
+        grants.push((boottime_ms(), u64::MAX - 10, 5));
+        store(&h.grants(), &grants, false).unwrap();
+        assert!(grant_at(&h, 1, Floor::Reserve, false).is_err());
     }
 
     #[test]
