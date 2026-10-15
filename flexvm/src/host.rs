@@ -201,7 +201,8 @@ impl Host {
                 .map_err(root)?;
         }
         for d in ["vms", "standby", "w"] {
-            let _ = std::fs::create_dir_all(run.join(d));
+            let d = run.join(d);
+            std::fs::create_dir_all(&d).map_err(|e| named(&d, e))?;
         }
         let canon = |d: &Path| d.canonicalize().map_err(|e| named(d, e));
         let (state, run) = (canon(state)?, canon(run)?);
@@ -1564,6 +1565,27 @@ mod tests {
 
     fn ip(s: &str) -> Ipv4Addr {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn run_directory_creation_errors_name_the_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let h = host("run-error");
+        let path = h.run.join("vms");
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, "").unwrap();
+        let e = Host::open(&h.state, &h.run).err().unwrap().to_string();
+        assert!(e.contains(path.to_str().unwrap()), "{e}");
+        std::fs::remove_file(&path).unwrap();
+        if unsafe { libc::geteuid() } != 0 {
+            std::fs::set_permissions(&h.run, std::fs::Permissions::from_mode(0o555)).unwrap();
+            let result = Host::open(&h.state, &h.run);
+            std::fs::set_permissions(&h.run, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let e = result.err().unwrap().to_string();
+            assert!(e.contains(path.to_str().unwrap()) && e.contains("run flexvm as root to create it"), "{e}");
+        }
+        std::fs::remove_dir_all(h.state.parent().unwrap()).unwrap();
     }
 
     #[test]

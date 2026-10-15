@@ -62,6 +62,7 @@ fn incoming_header_is_checked() {
     ] {
         let e = check_incoming(&runs, &preload, &regions).unwrap_err().to_string();
         assert!(e.contains(why), "{preload:?}: {e}");
+        assert!(e.contains("preload page") || e.contains("out of order"), "{e}");
     }
     // Runs past guest memory, or that wrap, are refused whatever the preload list.
     for bad in [vec![(u64::MAX, 1, REMOTE)], vec![(u64::MAX - 1, 4, REMOTE)], vec![(6, 4, REMOTE)], vec![(0, u64::MAX, ZERO)]] {
@@ -71,6 +72,17 @@ fn incoming_header_is_checked() {
     assert!(check_incoming(&vec![(u64::MAX, 1, REMOTE)], &[u64::MAX], &[(u64::MAX, u64::MAX)]).is_err());
     let r = remote_among(&vec![(u64::MAX - 1, 4, REMOTE)], [u64::MAX - 1, u64::MAX]);
     assert_eq!(r, vec![u64::MAX - 1]);
+}
+
+#[test]
+fn incoming_preload_is_bounded() {
+    let regions = [(0, ((MAX_PRELOAD + 1) * PAGE_SIZE) as u64)];
+    let runs = vec![(0, (MAX_PRELOAD + 1) as u64, REMOTE)];
+    let mut preload: Vec<u64> = (0..MAX_PRELOAD as u64).collect();
+    check_incoming(&runs, &preload, &regions).unwrap();
+    preload.push(MAX_PRELOAD as u64);
+    let e = check_incoming(&runs, &preload, &regions).unwrap_err().to_string();
+    assert!(e.contains(&format!("{} pages to preload, more than {MAX_PRELOAD}", MAX_PRELOAD + 1)), "{e}");
 }
 
 #[test]

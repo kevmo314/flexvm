@@ -20,7 +20,7 @@ use crate::bail;
 use crate::hold::{self, Holder};
 use crate::host::fault;
 use crate::template::Template;
-use crate::uffd::{Origin, Runs, Source};
+use crate::uffd::{Origin, Runs, Source, MAX_PRELOAD};
 use crate::util::{ms, recv_json, send_json, By, Error, Phases, Result};
 use crate::vm::{Snapshot, State, Vm};
 use crate::vmproc::{peer_call, End, Op, Proc};
@@ -28,7 +28,6 @@ use crate::vmproc::{peer_call, End, Op, Proc};
 /// From the target's prepare answer to its commit answer.
 const INCOMING_WAIT: Duration = Duration::from_secs(30);
 const MAX_VMSTATE: u64 = 64 << 20;
-const MAX_PRELOAD: usize = 4096;
 const MAX_HEADER: u64 = 256 << 20;
 const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(10);
 const HOLD_FENCE: Duration = Duration::from_millis(250);
@@ -99,10 +98,6 @@ impl Proc {
         }
         self.settle_arrival(&op, ARRIVAL_WAIT)?;
         vm.can_leave()?;
-        if self.lent_here.load(Ordering::SeqCst) {
-            self.host.unlend(&self.host.lock()?, vm.ip, self.gen())?;
-            self.lent_here.store(false, Ordering::SeqCst);
-        }
         vm.template.verify(&self.paths, true)?;
         let settle = Instant::now();
         vm.settle_hotplug(settle + crate::lifecycle::SETTLE_WAIT)?;
@@ -115,6 +110,7 @@ impl Proc {
         wanted.extend(serde_json::from_value::<Vec<u64>>(prepared["load_set"].clone()).unwrap_or_default());
         wanted.sort_unstable();
         wanted.dedup();
+        wanted.truncate(MAX_PRELOAD);
         // Only now, right before the pause: the guest runs on at its mark meanwhile.
         let unthrottle = Instant::now();
         let _lifted = vm.limit.lift(vm.pid());
@@ -479,9 +475,6 @@ impl Proc {
             let mut t = Phases::new();
             let runs: Runs = hdr.runs.into_owned();
             let pages: Vec<u64> = hdr.preload.into_owned();
-            if pages.len() > MAX_PRELOAD {
-                bail!("{} pages to preload, more than {MAX_PRELOAD}", pages.len());
-            }
             // Before anything counts or walks them: a bad page index would otherwise overflow, or hang the preload.
             crate::uffd::check_incoming(&runs, &pages, &prepared.2.regions).map_err(|e| format!("bad migration header: {e}"))?;
             *self.sizes.lock().unwrap() = Some(arrival_sizes(&runs, &prepared.0.template(), req["plugged_mib"].as_u64()));
