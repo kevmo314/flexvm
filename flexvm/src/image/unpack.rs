@@ -506,7 +506,7 @@ pub fn decompress<'a>(r: impl Read + 'a) -> Result<Box<dyn Read + 'a>> {
     Ok(match magic.as_slice() {
         [0x1f, 0x8b, ..] => Box::new(flate2::read::MultiGzDecoder::new(r)),
         [0x28, 0xb5, 0x2f, 0xfd] => {
-            // Checked on every frame since ruzstd 0.9; 0.8 skipped a decoder's first.
+            // Checked on every frame since ruzstd 0.9 (0.8 skipped the first); 0.9.1 also bounds each block (RUSTSEC-2026-0344).
             let mut dec = ruzstd::decoding::FrameDecoder::new();
             dec.set_max_window_size(MAX_ZSTD_WINDOW);
             Box::new(ZstdFrames { src: r, dec, active: false })

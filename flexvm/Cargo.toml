@@ -12,5 +12,5 @@ ureq = { version = "2", default-features = false, features = ["tls"] }
 base64 = "0.22"
 sha2 = "0.10"
 flate2 = "1"
-ruzstd = "0.9"
+ruzstd = "0.9.1"
 tar = { version = "0.4", default-features = false }
