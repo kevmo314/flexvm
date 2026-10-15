@@ -371,10 +371,13 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
     *p.sizes.lock().unwrap() = Some(ready.mem_sizes());
     *p.standby.lock().unwrap() = Some(ready);
     save_load_set(host, &tpl);
+    // Under the dir's `.gc.lock`, which a sweep holds: none finds this pid's socket stale and unlinks it after the bind.
+    let publish = crate::host::Flock::new(File::create(d.join(".gc.lock"))?, libc::LOCK_EX)?;
     let _ = std::fs::remove_file(&sock); // A previous process with this pid may have left it.
     let listener = UnixListener::bind(&sock)?;
     // A claimer refused by a dead standby of this pid may unlink the path after this bind.
     let bound = std::fs::metadata(&sock)?.ino();
+    drop(publish);
     if let Some(mut f) = notify.take() {
         let _ = send_json(&mut f, &json!({"ok": true, "result": {"pid": me.pid, "template": template}}));
     }

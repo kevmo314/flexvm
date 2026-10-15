@@ -185,6 +185,19 @@ impl Cow {
         self.settled(first, end);
     }
 
+    /// Wakes the drain and writers parked on a rescue (`wait_rescued`), under the lock they check under.
+    fn notify(&self) {
+        drop(self.progress.0.lock().unwrap());
+        self.progress.1.notify_all();
+    }
+
+    /// Parks a writer while `page` is RESCUING, until the rescue keeps its copy, gives it back, or the copy stops. No
+    /// wakeup is lost: each of those changes the state (or stops) before it notifies under `progress`'s lock.
+    fn wait_rescued(&self, page: usize) {
+        let g = self.progress.0.lock().unwrap();
+        drop(self.progress.1.wait_while(g, |_| self.active() && self.state(page) == RESCUING).unwrap());
+    }
+
     /// The states of pages `first..end` changed (set already): wakes the event thread if a fault waits on one of them.
     fn settled(&self, first: usize, end: usize) {
         if !self.fault_waits.load(Ordering::SeqCst) {
@@ -268,6 +281,7 @@ impl Cow {
     /// Gives back a claim the fault handler could not complete.
     pub fn unclaim(&self, page: usize) {
         self.set(page, PENDING);
+        self.notify();
         self.settled(page, page + 1);
     }
 
@@ -301,7 +315,7 @@ impl Cow {
     pub fn stop(&self) {
         self.stopped.store(true, Ordering::SeqCst);
         self.rescued.lock().unwrap().clear();
-        self.progress.1.notify_all();
+        self.notify();
         self.settled(0, usize::MAX);
     }
 
@@ -396,7 +410,7 @@ impl GuestPages for CowPages<'_> {
                 cow.check_active()?;
                 match cow.state(p) {
                     RESCUED => break,
-                    RESCUING => std::thread::yield_now(),
+                    RESCUING => cow.wait_rescued(p),
                     PENDING => {
                         if cow.claim(p, PENDING, READING) {
                             if let Err(e) = self.guest.read(p, &mut buf[k * PAGE_SIZE..(k + 1) * PAGE_SIZE]) {
@@ -542,6 +556,37 @@ mod tests {
                 assert_eq!(cow.state(1), CLEAN);
                 assert_eq!(cow.left(), 0);
             }
+        }
+    }
+
+    /// A writer that meets a page RESCUING parks until the rescue keeps its copy, gives it back, or the copy stops.
+    #[test]
+    fn writer_parked_on_a_rescue_wakes() {
+        for end in ["rescued", "unclaimed", "stopped"] {
+            let cow = Cow::new(1, &vec![(0, 1, REMOTE)]);
+            let live = Live { pages: StdMutex::new(vec![9u8; PAGE_SIZE]) };
+            assert!(cow.claim(0, PENDING, RESCUING));
+            let pages = CowPages { guest: &live, cow: &cow, slow: || Duration::ZERO };
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    let mut buf = vec![0u8; PAGE_SIZE];
+                    let r = pages.read(0, &mut buf).map(|()| buf[0]);
+                    tx.send(r.map_err(|e| e.to_string())).unwrap();
+                });
+                assert!(rx.recv_timeout(Duration::from_millis(100)).is_err(), "{end}: the writer waits for the rescue");
+                match end {
+                    "rescued" => cow.rescue_many(0, 1, [(0, vec![1u8; PAGE_SIZE].into())]),
+                    "unclaimed" => cow.unclaim(0),
+                    _ => cow.stop(),
+                }
+                let r = rx.recv_timeout(Duration::from_secs(5)).expect("the writer is woken");
+                match end {
+                    "rescued" => assert_eq!(r, Ok(1), "the rescued copy"),
+                    "unclaimed" => assert_eq!(r, Ok(9), "read by the writer itself"),
+                    _ => assert!(r.unwrap_err().contains("stopped")),
+                }
+            });
         }
     }
 

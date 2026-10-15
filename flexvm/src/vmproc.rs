@@ -766,7 +766,7 @@ impl Proc {
             }
             return;
         };
-        if let Err(e) = thread::Builder::new().spawn(move || {
+        spawn_or_run(&format!("announce {ip}"), move || {
             let here = || vm.state().local();
             let arp = || {
                 if let Some(dev) = dev.as_deref().filter(|_| here()) {
@@ -786,9 +786,7 @@ impl Proc {
             }
             thread::sleep(second.saturating_duration_since(Instant::now()));
             arp();
-        }) {
-            crate::log!("announce {ip}: cannot start: {e}");
-        }
+        });
     }
 
     pub fn drop_held_in(&self) {
@@ -2134,15 +2132,43 @@ fn each_peer(peers: Vec<String>, by: Instant, f: impl Fn(&str) + Send + Sync + '
     let (done, finished) = std::sync::mpsc::channel::<()>();
     for p in peers {
         let (f, done) = (f.clone(), done.clone());
-        if let Err(e) = thread::Builder::new().spawn(move || {
+        spawn_or_run("a peer call", move || {
             f(&p);
             drop(done);
-        }) {
-            crate::log!("cannot start a peer call: {e}");
-        }
+        });
     }
     drop(done);
     let _ = finished.recv_timeout(by.saturating_duration_since(Instant::now()));
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: `spawn_or_run` on this thread finds no thread to start.
+    static REFUSE_SPAWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` on a thread of its own or, when none can start (EAGAIN), here: a route message is never dropped.
+fn spawn_or_run(what: &str, f: impl FnOnce() + Send + 'static) {
+    let f = Arc::new(Mutex::new(Some(f)));
+    let g = f.clone();
+    #[cfg(test)]
+    let refused = REFUSE_SPAWN.get();
+    #[cfg(not(test))]
+    let refused = false;
+    let spawned = match refused {
+        true => Err(std::io::ErrorKind::WouldBlock.into()),
+        false => thread::Builder::new()
+            .spawn(move || {
+                let f = g.lock().unwrap().take();
+                f.into_iter().for_each(|f| f())
+            })
+            .map(drop),
+    };
+    if let Err(e) = spawned {
+        crate::log!("{what}: cannot start a thread ({e}); running it here");
+        let f = f.lock().unwrap().take();
+        f.into_iter().for_each(|f| f());
+    }
 }
 
 /// A route message, sent once more a second after it fails: nothing else
@@ -2249,6 +2275,36 @@ mod tests {
         });
         let took = t.elapsed();
         assert!(took >= Duration::from_millis(200) && took < Duration::from_secs(2), "{took:?}");
+    }
+
+    /// With no thread to be had, a route message is still sent: on the calling thread, to every peer.
+    #[test]
+    fn a_refused_spawn_still_tells_the_peers() {
+        let (p, _root) = test_proc("refused-spawn");
+        let peers: Vec<_> = (0..2).map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap()).collect();
+        let cfg = crate::host::Config { peers: peers.iter().map(|l| l.local_addr().unwrap().to_string()).collect(), ..Default::default() };
+        std::fs::write(p.host.state.join("host.json"), serde_json::to_vec(&cfg).unwrap()).unwrap();
+        let heard = thread::spawn(move || {
+            peers
+                .iter()
+                .map(|l| {
+                    let (mut c, _) = l.accept().unwrap();
+                    let req = crate::util::recv_json(&mut BufReader::new(c.try_clone().unwrap())).unwrap().unwrap();
+                    writeln!(c, "{}", json!({"ok": true, "result": null})).unwrap();
+                    req
+                })
+                .collect::<Vec<_>>()
+        });
+        REFUSE_SPAWN.set(true);
+        let ran = Arc::new(AtomicBool::new(false));
+        let r = ran.clone();
+        spawn_or_run("test", move || r.store(true, Ordering::SeqCst));
+        assert!(ran.load(Ordering::SeqCst), "run here, at once");
+        tell_peers(&p.host, json!({"op": "route", "ip": "10.0.0.9", "gen": 3}));
+        REFUSE_SPAWN.set(false);
+        for req in heard.join().unwrap() {
+            assert_eq!(req["ip"], "10.0.0.9");
+        }
     }
 
     #[test]
