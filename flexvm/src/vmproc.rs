@@ -1152,7 +1152,7 @@ impl Proc {
         let vm = self.vm().clone();
         // Only while it runs here: a paused or migrating VM touches nothing, and a
         // source sitting at its mark through the pull is not starved.
-        vm.limit.watch(&self.host, Duration::from_secs(1), || !vm.dead(), || vm.state() == State::Running);
+        vm.limit.watch(&self.host, &vm.grant_backoff, Duration::from_secs(1), || !vm.dead(), || vm.state() == State::Running);
     }
 
     /// The guest is untrusted: requests are bounded in size and time and
@@ -1609,16 +1609,16 @@ pub struct GrantBackoff {
 }
 
 impl GrantBackoff {
-    fn ready(&self, now: Instant) -> bool {
+    pub(crate) fn ready(&self, now: Instant) -> bool {
         self.until.is_none_or(|until| now >= until)
     }
 
-    fn refused(&mut self, now: Instant) {
+    pub(crate) fn refused(&mut self, now: Instant) {
         self.delay = (self.delay * 2).clamp(GRANT_RETRY_MIN, GRANT_RETRY_MAX);
         self.until = Some(now + self.delay);
     }
 
-    fn granted(&mut self) {
+    pub(crate) fn granted(&mut self) {
         *self = GrantBackoff::default();
     }
 }
