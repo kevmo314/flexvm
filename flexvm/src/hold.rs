@@ -152,12 +152,17 @@ impl Holder {
     }
 
     pub fn hold(&self, ip: Ipv4Addr, mig: u64) -> Result<()> {
-        let _routes = self.routes.lock().unwrap();
-        if let Some(g) = self.gone.lock().unwrap().remove(&ip) {
+        let (pending, routed) = {
+            let _routes = self.routes.lock().unwrap();
+            let pending = self.gone.lock().unwrap().remove(&ip);
+            self.held.lock().unwrap().insert(ip, Arc::new(Entry { mig, q: Mutex::default() }));
+            (pending, crate::net::route_dev(true, ip, self.ifindex).inspect_err(|_| drop(self.held.lock().unwrap().remove(&ip))))
+        };
+        // Off the locks: a blocked stderr holds up no route change or reader.
+        if let Some(g) = pending {
             report(ip, &self.dev, &g);
         }
-        self.held.lock().unwrap().insert(ip, Arc::new(Entry { mig, q: Mutex::default() }));
-        crate::net::route_dev(true, ip, self.ifindex).inspect_err(|_| drop(self.held.lock().unwrap().remove(&ip)))
+        routed
     }
 
     pub fn holding_for(&self, ip: Ipv4Addr, mig: u64) -> bool {
@@ -386,7 +391,14 @@ impl Holder {
                 return crate::log!("hold device {}: {e}", self.dev);
             }
             self.reading.store(true, Ordering::SeqCst);
-            while self.read_one(&mut buf) {}
+            // Due reports also go out under sustained traffic, not only once the device is empty.
+            let mut n = 0usize;
+            while self.read_one(&mut buf) {
+                n += 1;
+                if n % PASS == 0 {
+                    self.report_stragglers();
+                }
+            }
             self.reading.store(false, Ordering::SeqCst);
             wait = self.report_stragglers();
         }
@@ -394,8 +406,9 @@ impl Holder {
 
     /// Logs the stragglers counted since an address's last report: the first report at once,
     /// later ones at most every `STRAGGLER_LOG`. Here, off `rx`: a blocked stderr never holds
-    /// up reading the device or a release. Returns how long until the next one is due (ms),
-    /// -1 if none is pending.
+    /// up reading the device or a release. Returns the reader's poll timeout (ms): until the
+    /// next report is due, or at most `STRAGGLER_LOG` while any let-go address is remembered
+    /// (a release's own reads may count stragglers meanwhile), else -1.
     fn report_stragglers(&self) -> i32 {
         let mut due: Option<Duration> = None;
         let mut gone = self.gone.lock().unwrap();
@@ -415,9 +428,14 @@ impl Holder {
             })
             .collect();
         gone.retain(|_, g| g.at.elapsed() < GONE_FOR || g.resent + g.dropped > 0);
+        let watching = !gone.is_empty();
         drop(gone);
         ready.iter().for_each(|(ip, g)| report(*ip, &self.dev, g));
-        due.map_or(-1, |d| d.as_millis().max(1) as i32)
+        match (due, watching) {
+            (Some(d), _) => d.min(STRAGGLER_LOG).as_millis().max(1) as i32,
+            (None, true) => STRAGGLER_LOG.as_millis() as i32,
+            (None, false) => -1,
+        }
     }
 
     /// Reads a packet off the device and queues it for its address; false once it is empty.
