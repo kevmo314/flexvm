@@ -213,12 +213,21 @@ impl Args {
 
 /// A VM's command's statuses are its own: flexvm's failures there exit 125.
 fn main() {
+    // A panic's message is queued after the lines before it, and written
+    // (bounded: a stalled stderr does not keep the process from aborting).
+    std::panic::set_hook(Box::new(|p| {
+        let bt = std::backtrace::Backtrace::capture();
+        let bt = if bt.status() == std::backtrace::BacktraceStatus::Captured { format!("\nstack backtrace:\n{bt}") } else { String::new() };
+        crate::log!("thread '{}' {p}{bt}", std::thread::current().name().unwrap_or("<unnamed>"));
+        util::flush_log(util::LOG_FLUSH);
+    }));
     let (args, error) = Args::parse_partly(std::env::args().skip(1));
     let vm = matches!(args.positional.first().map(String::as_str), Some("run" | "resume" | "restore"));
     if let Err(e) = error.map_or_else(|| real_main(&args), Err) {
         crate::log!("flexvm: {e}");
-        std::process::exit(if vm { vmproc::FAILED } else { 1 });
+        util::exit(if vm { vmproc::FAILED } else { 1 });
     }
+    util::exit(0)
 }
 
 /// Flags every command takes.
@@ -346,7 +355,7 @@ fn real_main(args: &Args) -> Result<()> {
             )
         }
         Some("ls") => list(&open_host(args)?, args.has("json")),
-        Some("exec") => std::process::exit(exec(&open_host(args)?, name, &args.rest.join(" "))?),
+        Some("exec") => util::exit(exec(&open_host(args)?, name, &args.rest.join(" "))?),
         Some("kill") => kill(&open_host(args)?, name),
         Some("checkpoint") => {
             let dir = std::path::absolute(arg2.ok_or("checkpoint needs NAME DIR")?)?;
@@ -354,6 +363,8 @@ fn real_main(args: &Args) -> Result<()> {
         }
         Some("migrate") => call(json!({"op": "migrate", "to": arg2.ok_or("migrate needs NAME HOST:PORT")?})),
         Some("listen") => {
+            // Before any thread that would take these signals is started.
+            util::flush_log_on(&[libc::SIGTERM, libc::SIGINT, libc::SIGHUP]);
             let mut host = open_host(args)?;
             let listener = configure_listener(&mut host, args, pos.get(1).copied(), listen::activated())?;
             listen::main(host, listener)
@@ -389,11 +400,9 @@ fn real_main(args: &Args) -> Result<()> {
             "" => Err("debug fault|ckhash|gc|VM ...".into()),
             _ => call(json!({"op": "debug", "what": arg2.unwrap_or("status")})),
         },
-        // One-shot CLI usage output, outside the VM and listener paths.
-        #[allow(clippy::print_stderr)]
         _ => {
-            eprint!("{USAGE}");
-            std::process::exit(2);
+            util::log_line(USAGE.to_string());
+            util::exit(2)
         }
     }
 }
@@ -543,7 +552,7 @@ fn follow(mut conn: BufReader<std::os::unix::net::UnixStream>, id: host::Ident) 
         });
     }
     let reply = recv_json(&mut conn).ok().flatten();
-    std::process::exit(reply.and_then(|r| r["exit"].as_i64()).map_or(vmproc::FAILED, |c| c as i32))
+    util::exit(reply.and_then(|r| r["exit"].as_i64()).map_or(vmproc::FAILED, |c| c as i32))
 }
 
 fn kill(host: &Host, name: &str) -> Result<()> {
@@ -765,7 +774,7 @@ pub fn exec(host: &Host, name: &str, cmd: &str) -> Result<i32> {
             let why = if e.contains("session still running") { "its guest agent is too old to stop it; rebuild the rootfs" } else { &e };
             log!("flexvm: the command may still be running in vm {vm}: {why}");
         }
-        std::process::exit(128 + sig);
+        util::exit(128 + sig);
     });
     let result = exec_session(host, name, cmd, session, false);
     // On an error too (a closed stdout, as with `| head`): the command would run on, holding its slot.
