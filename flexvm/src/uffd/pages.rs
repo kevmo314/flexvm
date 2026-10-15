@@ -164,14 +164,24 @@ impl Pages {
         self.dirty.get(page / 64).is_some_and(|w| w.load(Ordering::Relaxed) >> (page % 64) & 1 != 0)
     }
 
+    fn dirty_words(&self) -> impl Iterator<Item = (usize, &AtomicU64)> {
+        // Only chunks marked touched (see `mark_dirty`) can have any set.
+        self.dirty
+            .chunks(CHUNK / 64)
+            .enumerate()
+            .filter(|&(c, _)| self.touched(c * CHUNK))
+            .flat_map(|(c, words)| words.iter().enumerate().map(move |(i, w)| (c * (CHUNK / 64) + i, w)))
+    }
+
+    pub(super) fn dirty_count(&self) -> usize {
+        self.dirty_words().map(|(_, w)| w.load(Ordering::Relaxed).count_ones() as usize).sum()
+    }
+
     /// The dirty bits, cleared with `take`.
     pub(super) fn dirty_bits(&self, take: bool) -> Vec<u64> {
-        // Only chunks marked touched (see `mark_dirty`) can have any set.
         let mut bits = vec![0; self.dirty.len()];
-        for (chunk, dst) in bits.chunks_mut(CHUNK / 64).enumerate().filter(|&(c, _)| self.touched(c * CHUNK)) {
-            for (b, w) in dst.iter_mut().zip(&self.dirty[chunk * (CHUNK / 64)..]) {
-                *b = if take { w.swap(0, Ordering::SeqCst) } else { w.load(Ordering::SeqCst) };
-            }
+        for (i, w) in self.dirty_words() {
+            bits[i] = if take { w.swap(0, Ordering::SeqCst) } else { w.load(Ordering::SeqCst) };
         }
         bits
     }

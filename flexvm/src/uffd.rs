@@ -1091,7 +1091,7 @@ fn recv_with_fd(sock: RawFd) -> Result<(Vec<u8>, OwnedFd)> {
     msg.msg_iovlen = 1;
     msg.msg_control = cmsg.as_mut_ptr().cast();
     msg.msg_controllen = cmsg.len();
-    let n = unsafe { libc::recvmsg(sock, &mut msg, 0) };
+    let n = unsafe { libc::recvmsg(sock, &mut msg, libc::MSG_CMSG_CLOEXEC) };
     if n <= 0 {
         bail!("recvmsg: {}", io::Error::last_os_error());
     }

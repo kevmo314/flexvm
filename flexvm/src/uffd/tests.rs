@@ -4,6 +4,7 @@ use super::pages::CHUNK;
 use super::server::capture_preload;
 use super::*;
 use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
 
 fn pages(states: &[u8]) -> Pages {
     let mut p = Pages::new(states.len());
@@ -19,6 +20,21 @@ fn states(p: &Pages) -> Vec<u8> {
 
 fn discard(p: &Pages, page: usize) -> bool {
     p.discard(&p.removing(), page)
+}
+
+#[test]
+fn received_fd_is_cloexec() {
+    let (a, b) = UnixStream::pair().unwrap();
+    let mut pipe = [-1; 2];
+    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+    let [read, _write] = pipe.map(|fd| unsafe { OwnedFd::from_raw_fd(fd) });
+    assert_eq!(unsafe { libc::fcntl(read.as_raw_fd(), libc::F_GETFD) }, 0);
+    crate::util::send_with_fds(&a, b"{}", &[read.as_raw_fd()], Instant::now() + Duration::from_secs(1)).unwrap();
+    let (body, fd) = recv_with_fd(b.as_raw_fd()).unwrap();
+    assert_eq!(body, b"{}");
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+    assert_ne!(flags, -1);
+    assert_ne!(flags & libc::FD_CLOEXEC, 0);
 }
 
 #[test]
@@ -136,6 +152,33 @@ fn preload_capture_reads_sparse_runs_across_regions_and_iovec_batches() {
     assert!(capture_preload(&mappings, &[0], &mut [], |_, _| panic!("invalid size")).is_err());
     assert!(capture_preload(&mappings, &[0], &mut data[..PAGE_SIZE], |_, _| Ok(PAGE_SIZE - 1)).is_err());
     assert!(capture_preload(&mappings, &[0], &mut data[..PAGE_SIZE], |_, _| Err(os(libc::ESRCH))).is_err());
+}
+
+#[test]
+fn dirty_count_skips_untouched_chunks() {
+    for n in [0, 1, CHUNK, CHUNK * 3 + 1, CHUNK * 65 + 1] {
+        let p = Pages::new(n);
+        assert_eq!(p.dirty_count(), 0);
+        for page in [CHUNK, CHUNK + 63, CHUNK * 2 - 1, n.saturating_sub(1)] {
+            if page < n {
+                p.mark_dirty(page);
+            }
+        }
+        let full = || p.dirty.iter().map(|w| w.load(Ordering::Relaxed).count_ones() as usize).sum::<usize>();
+        let count = full();
+        assert_eq!(p.dirty_count(), count);
+        assert_eq!(full(), count);
+        // Poison untouched chunks without marking them touched: neither scan should read their words.
+        for (_, w) in p.dirty.iter().enumerate().filter(|&(i, _)| !p.touched(i * 64)) {
+            w.store(u64::MAX, Ordering::Relaxed);
+        }
+        assert_eq!(p.dirty_count(), count);
+        assert_eq!(p.dirty_bits(true).iter().map(|w| w.count_ones() as usize).sum::<usize>(), count);
+        assert_eq!(p.dirty_count(), 0);
+        if n > CHUNK {
+            assert!(full() > 0);
+        }
+    }
 }
 
 #[test]
