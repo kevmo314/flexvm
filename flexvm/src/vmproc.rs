@@ -1568,7 +1568,7 @@ fn relieve(host: &Host, avail: Option<u64>, starved_here: bool) {
 
 /// Under the reserve: SIGUSR1s the standby VMs, under `STATE/standby.stop.lock`
 /// (not eviction's lock, which a migration may hold for a while). True if
-/// any exited. Loading or claimed VMs must not hold eviction off.
+/// any exited within a second (an idle one takes ~200 ms). Loading or claimed VMs must not hold eviction off.
 fn stop_standby(host: &Host, avail: u64, reserve: u64) -> bool {
     let Ok(lock) = std::fs::File::options().create(true).truncate(false).write(true).open(host.state.join("standby.stop.lock")) else { return false };
     if crate::host::flock(&lock, libc::LOCK_EX | libc::LOCK_NB).is_err() {
@@ -1576,7 +1576,7 @@ fn stop_standby(host: &Host, avail: u64, reserve: u64) -> bool {
     }
     let standby: Vec<_> = crate::standby::templates(host).iter().flat_map(|t| crate::standby::stoppable(host, t)).collect();
     let signalled: Vec<_> = standby.iter().filter_map(|id| crate::host::PidFd::open(id).ok().flatten()).filter(|fd| fd.signal(libc::SIGUSR1).is_ok()).collect();
-    let until = Instant::now() + Duration::from_millis(100);
+    let until = Instant::now() + Duration::from_secs(1);
     let stopped = signalled.iter().filter(|fd| fd.wait(until.saturating_duration_since(Instant::now()))).count();
     if stopped == 0 {
         return false;
