@@ -498,3 +498,25 @@ fn non_utf8_parent_paths_roundtrip_and_open() {
     let old: Parent = serde_json::from_str(r#"{"path":"../base","id":"id"}"#).unwrap();
     assert_eq!(serde_json::to_value(old).unwrap()["path"], "../base");
 }
+
+#[test]
+fn suspended_description_checks_manifest_and_saturates_sizes() {
+    let root = tmp("suspended-description");
+    let host = crate::host::Host::open(&root.join("state"), &root.join("run")).unwrap();
+    let dir = host.suspended("x");
+    link(&dir, Some(Parent { path: "missing-parent".into(), id: "missing".into() }), |m| {
+        m.mem_mib = u64::MAX;
+        m.hotplug_mib = 1;
+        m.data_pages = u64::MAX;
+    });
+    // Listing reads only this manifest, even if ancestors and page data are unavailable.
+    fs::remove_file(dir.join("pages")).unwrap();
+    let description = crate::lifecycle::describe_suspended(&host, "x").unwrap();
+    assert_eq!(description["guest_mib"], u64::MAX);
+    assert_eq!(description["checkpoint_mib"], u64::MAX >> 20);
+    assert_eq!(read_manifest(&dir).unwrap().name, "x");
+    fs::write(dir.join("manifest.json"), b"bad checksum\n{}").unwrap();
+    assert!(crate::lifecycle::describe_suspended(&host, "x").is_none());
+    fs::write(dir.join("manifest.json"), vec![b' '; (1 << 20) + 1]).unwrap();
+    assert!(crate::lifecycle::describe_suspended(&host, "x").is_none());
+}

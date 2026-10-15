@@ -330,12 +330,10 @@ fn paths(args: &Args) -> Result<Paths> {
 
 fn real_main(args: &Args) -> Result<()> {
     if args.has("help") {
-        print!("{USAGE}");
-        return Ok(());
+        return output(format_args!("{USAGE}"));
     }
     if args.has("version") {
-        println!("flexvm {}", env!("CARGO_PKG_VERSION"));
-        return Ok(());
+        return output(format_args!("flexvm {}\n", env!("CARGO_PKG_VERSION")));
     }
     check_applies(args)?;
     let _ = paths(args);
@@ -359,7 +357,7 @@ fn real_main(args: &Args) -> Result<()> {
             // A detached restore logs to the VM's name, which the checkpoint has without --name.
             let label = match args.get("name") {
                 Some(name) => name.to_string(),
-                None if args.has("detach") => checkpoint::Checkpoint::open(&dir)?.manifest.name,
+                None if args.has("detach") => checkpoint::read_manifest(&dir)?.name,
                 None => String::new(),
             };
             start(
@@ -395,6 +393,7 @@ fn real_main(args: &Args) -> Result<()> {
         Some("standby") if name.is_empty() => print(standby::show(&open_host(args)?)),
         Some("standby") => {
             let host = open_host(args)?;
+            template::check_name(template)?;
             let n = name.parse().map_err(|_| "standby wants a count")?;
             // Check before saving a positive count, or an unreadable template would be retried forever.
             if n > 0 {
@@ -471,6 +470,9 @@ fn configure(c: &mut host::Config, args: &Args, addr: Option<&str>) -> Result<()
         c.underlay = (!u.is_empty()).then(|| u.parse()).transpose().map_err(|_| format!("bad --underlay {u:?}"))?;
     }
     if let Some(d) = args.get("announce-dev") {
+        if !d.is_empty() {
+            net::ifindex(d)?;
+        }
         c.announce_dev = (!d.is_empty()).then(|| d.into());
     }
     if let Some(d) = args.get("dns") {
@@ -603,6 +605,7 @@ fn resume(host: &Host, name: &str) -> Result<bool> {
 }
 
 fn kill(host: &Host, name: &str) -> Result<()> {
+    host::check_name(name)?;
     // Reconciling sources accept SIGINT too; the process records the owed outcome before ending.
     if host.entry(name).is_ok_and(|e| e.state == "source") {
         return Err(format!("vm {name} is the source of a migration in progress; it ends once the target has its memory (kill it where it runs)").into());
@@ -684,28 +687,44 @@ fn list(host: &Host, as_json: bool) -> Result<()> {
     if as_json {
         return print(json!(vms));
     }
-    let row = |c: [&str; 9]| println!("{:<16} {:<15} {:<10} {:<12} {:>8} {:>4} {:>8} {:>8} {}", c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8]);
+    let row =
+        |c: [&str; 9]| output(format_args!("{:<16} {:<15} {:<10} {:<12} {:>8} {:>4} {:>8} {:>8} {}\n", c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8]));
     // STARVED: refused memory here and throttled (moved to a peer if there is one).
-    row(["NAME", "IP", "TEMPLATE", "STATE", "PID", "VCPU", "RSS MiB", "MAX MiB", "STARVED"]);
+    row(["NAME", "IP", "TEMPLATE", "STATE", "PID", "VCPU", "RSS MiB", "MAX MiB", "STARVED"])?;
     for v in &vms {
         let s = |k: &str| v[k].as_str().map(String::from).or_else(|| v[k].as_u64().map(|n| n.to_string())).unwrap_or_default();
         let [a, b, c, d, e, f, g, h] = ["name", "ip", "template", "state", "pid", "vcpus", "rss_mib", "max_mib"].map(s);
         let starved = if v["starved"].as_bool() == Some(true) { "yes" } else { "" };
-        row([&a, &b, &c, &d, &e, &f, &g, &h, starved]);
+        row([&a, &b, &c, &d, &e, &f, &g, &h, starved])?;
     }
     Ok(())
 }
 
 pub fn print(v: Value) -> Result<()> {
-    println!("{}", serde_json::to_string_pretty(&v)?);
-    Ok(())
+    output(format_args!("{}\n", serde_json::to_string_pretty(&v)?))
+}
+
+/// CLI output may be piped to a reader that exits early.
+fn output(text: std::fmt::Arguments<'_>) -> Result<()> {
+    match std::io::stdout().lock().write_fmt(text) {
+        Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => Err(e.into()),
+        _ => Ok(()),
+    }
+}
+
+// Firecracker wants 1 or an even count of vCPUs, at most 32.
+fn template_vcpus(args: &Args) -> Result<u32> {
+    let cpus = util::host_cpus().min(32) as u32;
+    let cpus = args.parse_or("vcpus", if cpus > 1 { cpus & !1 } else { 1 })?;
+    if cpus != 1 && (cpus == 0 || cpus > 32 || cpus % 2 != 0) {
+        bail!("--vcpus must be 1 or an even count up to 32");
+    }
+    Ok(cpus)
 }
 
 fn build_template(args: &Args, name: &str) -> Result<()> {
     host::check_name(name)?;
-    // Firecracker wants 1 or an even count of vCPUs, at most 32.
-    let cpus = (util::host_cpus() as u64).min(32);
-    let cpus = if cpus > 1 { cpus & !1 } else { 1 };
+    let cpus = template_vcpus(args)?;
     // Interrupted, the build stops at its next step and removes its tap and staging (gigabytes:
     // an image's unpacked tree and rootfs too); a second signal ends flexvm at once, and the next
     // build removes the staging. Blocked before the image's download threads start.
@@ -728,7 +747,7 @@ fn build_template(args: &Args, name: &str) -> Result<()> {
         })
         .transpose()?;
     let max = args.parse_or("max", proc_kb("/proc/meminfo", "MemTotal").unwrap_or(0) >> 20)?;
-    let (cpus, mem, plug) = (args.parse_or("vcpus", cpus)? as u32, args.parse_or("mem", template::base_mib(max))?, args.parse_or("plug", template::PLUG_MIB)?);
+    let (mem, plug) = (args.parse_or("mem", template::base_mib(max))?, args.parse_or("plug", template::PLUG_MIB)?);
     // Named and made under the host lock, so a prefix change sees it (`Host::prefix_in_use`).
     let host = open_host(args)?;
     let me = host::Ident::me();
@@ -760,6 +779,8 @@ fn image_options(args: &Args) -> Result<Option<image::Options>> {
         return Err("--ready-port and --ready-cmd only apply with --warm".into());
     }
     let d = image::Limits::default();
+    let bytes =
+        |flag, default| -> Result<u64> { args.parse_or::<u64>(flag, default)?.checked_mul(1 << 20).ok_or_else(|| format!("--{flag} is too large").into()) };
     Ok(Some(image::Options {
         image: src.into(),
         entrypoint: args.get("entrypoint").map(image::parse_argv).transpose()?,
@@ -769,12 +790,12 @@ fn image_options(args: &Args) -> Result<Option<image::Options>> {
         user: args.get("user").map(String::from),
         warm,
         ready,
-        ready_timeout: Duration::from_secs(args.parse_or("ready-timeout", 120)?),
+        ready_timeout: Duration::from_secs(args.parse_or::<u32>("ready-timeout", 120)?.into()),
         staging: args.get("image-staging").unwrap_or(image::STAGING).into(),
         limits: image::Limits {
-            download: args.parse_or("max-download-mib", d.download >> 20)? << 20,
-            unpacked: args.parse_or("max-unpacked-mib", d.unpacked >> 20)? << 20,
-            file: args.parse_or("max-file-mib", d.file >> 20)? << 20,
+            download: bytes("max-download-mib", d.download >> 20)?,
+            unpacked: bytes("max-unpacked-mib", d.unpacked >> 20)?,
+            file: bytes("max-file-mib", d.file >> 20)?,
             entries: args.parse_or("max-entries", d.entries)?,
         },
     }))
@@ -844,7 +865,10 @@ pub fn exec(host: &Host, name: &str, cmd: &str) -> Result<i32> {
     // Best effort: the guest closes a session whose client left anyway, a minute after it finished
     // (ten, if it still runs).
     let _ = close();
-    result
+    match result {
+        Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::BrokenPipe) => Ok(0),
+        result => result,
+    }
 }
 
 /// `exec` of a session that may have started already. Output is written,
@@ -958,6 +982,64 @@ mod exec_tests {
 
     fn parse(args: &[&str]) -> Args {
         Args::parse(args.iter().map(|a| a.to_string())).unwrap()
+    }
+
+    #[test]
+    fn numeric_flags_reject_overflow_and_invalid_cpu_counts() {
+        for flag in ["max-download-mib", "max-unpacked-mib", "max-file-mib"] {
+            for value in ["17592186044416", "18446744073709551615"] {
+                assert!(image_options(&parse(&["--image", "busybox", &format!("--{flag}"), value])).is_err(), "{flag}={value}");
+            }
+            let opts = image_options(&parse(&["--image", "busybox", &format!("--{flag}"), "17592186044415"])).unwrap().unwrap();
+            let bytes = match flag {
+                "max-download-mib" => opts.limits.download,
+                "max-unpacked-mib" => opts.limits.unpacked,
+                _ => opts.limits.file,
+            };
+            assert_eq!(bytes, (u64::MAX >> 20) << 20);
+        }
+        assert!(image_options(&parse(&["--image", "busybox", "--ready-timeout", "18446744073709551615"])).is_err());
+        let opts = image_options(&parse(&["--image", "busybox", "--ready-timeout", "4294967295"])).unwrap().unwrap();
+        assert_eq!(opts.ready_timeout.as_secs(), u32::MAX as u64);
+        for value in ["0", "3", "33", "4294967296", "4294967297", "18446744073709551615"] {
+            assert!(template_vcpus(&parse(&["--vcpus", value])).is_err(), "{value}");
+        }
+        for value in ["1", "2", "32"] {
+            assert_eq!(template_vcpus(&parse(&["--vcpus", value])).unwrap().to_string(), value);
+        }
+    }
+
+    #[test]
+    fn kill_validates_names_before_touching_files() {
+        let root = crate::test_util::TempDir::new("kill-name");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let failed = root.join("victim.failed");
+        std::fs::write(&failed, "keep").unwrap();
+        for name in ["../../victim", "", ".hidden", "/tmp/x"] {
+            assert_eq!(kill(&host, name).unwrap_err().to_string(), host::check_name(name).unwrap_err().to_string());
+        }
+        assert_eq!(std::fs::read_to_string(failed).unwrap(), "keep");
+    }
+
+    #[test]
+    fn invalid_announce_device_is_not_saved() {
+        let root = crate::test_util::TempDir::new("announce-device");
+        let mut host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        host.configure(|_| Ok(())).unwrap();
+        let before = std::fs::read(host.state.join("host.json")).unwrap();
+        let args = parse(&["--announce-dev", "flexvm-no-such-interface"]);
+        assert!(host.configure(|c| configure(c, &args, None)).is_err());
+        assert_eq!(std::fs::read(host.state.join("host.json")).unwrap(), before);
+        assert!(host.cfg.announce_dev.is_none());
+    }
+
+    #[test]
+    fn standby_zero_validates_template_name_before_saving() {
+        let root = crate::test_util::TempDir::new("standby-name");
+        let args =
+            parse(&["--state", root.join("state").to_str().unwrap(), "--run", root.join("run").to_str().unwrap(), "standby", "--template", ".typo", "0"]);
+        assert!(real_main(&args).unwrap_err().to_string().contains("bad template name"));
+        assert!(!root.join("state/standby/.typo").exists());
     }
 
     #[test]
@@ -1092,6 +1174,10 @@ mod exec_tests {
         assert!(configure_listener(&mut host, &args, Some(&addr), None).is_err());
         assert_eq!(std::fs::read(host.state.join("host.json")).unwrap(), before);
         assert_eq!(host.cfg.reserve_mib, 321);
+        let bad_dev = parse(&["--announce-dev", "flexvm-no-such-interface"]);
+        assert!(configure_listener(&mut host, &bad_dev, None, Some(TcpListener::bind("127.0.0.1:0").unwrap())).is_err());
+        assert_eq!(std::fs::read(host.state.join("host.json")).unwrap(), before);
+        assert!(host.cfg.announce_dev.is_none());
         // An activated socket supplies the endpoint even without ADDR.
         let listener = configure_listener(&mut host, &args, None, Some(occupied)).unwrap();
         let saved = Host::open(&host.state, &host.run).unwrap();

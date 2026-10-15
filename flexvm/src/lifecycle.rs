@@ -1025,8 +1025,7 @@ fn quarantined<'a>(q: &'a str, boot: &str) -> Option<&'a str> {
 }
 
 fn manifest(dir: &Path) -> Option<Manifest> {
-    let text = std::fs::read(dir.join("manifest.json")).ok()?;
-    serde_json::from_slice(text.splitn(2, |&b| b == b'\n').nth(1)?).ok()
+    crate::checkpoint::read_manifest(dir).ok()
 }
 
 pub fn describe_suspended(host: &Host, name: &str) -> Option<Value> {
@@ -1040,8 +1039,8 @@ pub fn describe_suspended(host: &Host, name: &str) -> Option<Value> {
     let state = if read_gen(&dir).is_none() || held { "quarantined" } else { "suspended" };
     Some(json!({
         "name": name, "ip": m.ip.to_string(), "template": m.template, "template_id": m.template_id,
-        "state": state, "vcpus": m.vcpus, "guest_mib": m.mem_mib + m.hotplug_mib, "max_mib": m.max_mib,
-        "checkpoint_mib": (m.data_pages * PAGE_SIZE as u64) >> 20,
+        "state": state, "vcpus": m.vcpus, "guest_mib": m.mem_mib.saturating_add(m.hotplug_mib), "max_mib": m.max_mib,
+        "checkpoint_mib": (m.data_pages.saturating_mul(PAGE_SIZE as u64)) >> 20,
     }))
 }
 

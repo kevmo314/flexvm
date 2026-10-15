@@ -117,7 +117,7 @@ pub fn run(args: &Args) -> Result<()> {
     let path = format!("{dir}/{date}-{}{suffix}.json", &sha[..7]);
     let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path)?;
     serde_json::to_writer_pretty(file, &report)?;
-    println!("{path}");
+    crate::output(format_args!("{path}\n"))?;
     Ok(())
 }
 
