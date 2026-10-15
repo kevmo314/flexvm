@@ -77,6 +77,8 @@ pub struct Vm {
     pub state: Mutex<State>,
     pub last_resize: Mutex<Instant>,
     pub starved: AtomicBool,
+    /// Growth the reserve refused is not asked for again until this expires.
+    pub grant_backoff: Mutex<crate::vmproc::GrantBackoff>,
     pub limit: crate::limit::Limit,
     reports_held: AtomicBool,
     /// During a copy-on-write checkpoint the VM may grow, not shrink: resizes hold this.
@@ -949,6 +951,7 @@ impl Prepared {
             state: Mutex::new(state),
             last_resize: Mutex::new(Instant::now()),
             starved: AtomicBool::new(false),
+            grant_backoff: Mutex::default(),
             limit: crate::limit::Limit::new(idle.cgroup.clone()),
             reports_held: AtomicBool::new(false),
             cow_copy: Mutex::new(false),

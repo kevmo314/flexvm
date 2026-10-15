@@ -1185,7 +1185,8 @@ impl Proc {
                 match self.resize(Some(avail)) {
                     Ok(Resized::Grew) => "grow",
                     Ok(Resized::Full) => "full",
-                    Ok(Resized::Same) => "ok",
+                    // Any guest agent keeps its throttle on `ok`; `full` lifts it (#368).
+                    Ok(Resized::Same) | Ok(Resized::Refused) => "ok",
                     Ok(Resized::Busy) => "busy",
                     Err(e) => {
                         crate::log!("vm {}: resize on request: {e}", vm.name);
@@ -1506,8 +1507,12 @@ pub enum Resized {
     Grew,
     Same,
     Busy,
-    /// Short, and at its ceiling or refused by the host's reserve.
+    /// Short, and at its ceiling: the guest may use all it has.
     Full,
+    /// Short, and refused by the host's reserve: the guest stays throttled
+    /// at its mark (killing for memory a plug may still bring is worse) and
+    /// the VM starved, so relief moves it; it asks again as it is throttled.
+    Refused,
 }
 
 /// Keeps `headroom` free via hotplug, never below the template's size. The
@@ -1534,10 +1539,32 @@ fn resize(vm: &Vm, host: &Host, hint: Option<u64>, grow_only: bool) -> Result<Re
     let Some(plan) = sizes.plan(requested, plugged, avail, last.elapsed(), hint.is_some(), grow_only) else {
         return Ok(Resized::Busy);
     };
-    let refused = plan.charge > 0 && host.grant(plan.charge, None)?.is_none();
-    let full = plan.short && (plugged == hotplug_total || refused);
+    // Refused, it is not asked again (host lock, grants file, MemAvailable) until its backoff
+    // expires: a guest throttled at its mark asks about every 250 ms.
+    let refused = plan.charge > 0 && {
+        let mut backoff = vm.grant_backoff.lock().unwrap();
+        let now = Instant::now();
+        if !backoff.ready(now) {
+            true
+        } else if host.grant(plan.charge, None)?.is_some() {
+            backoff.granted();
+            false
+        } else {
+            backoff.refused(now);
+            true
+        }
+    };
     // Starved only when the host refused it: at its own ceiling, moving it cannot help.
-    vm.starved.store(plan.short && refused, Ordering::SeqCst);
+    let starved = plan.short && refused;
+    if vm.starved.swap(starved, Ordering::SeqCst) != starved {
+        match starved {
+            true if host.config_now().peers.is_empty() => {
+                crate::log!("vm {}: starved: the host's reserve refused it {} MiB; it stays throttled (no peers to move it to)", vm.name, plan.charge)
+            }
+            true => crate::log!("vm {}: starved: the host's reserve refused it {} MiB; it stays throttled until it grows or moves", vm.name, plan.charge),
+            false => crate::log!("vm {}: no longer starved", vm.name),
+        }
+    }
     let new = if refused { plugged } else { plan.new };
     if new != requested {
         let why = if plan.settle {
@@ -1556,13 +1583,44 @@ fn resize(vm: &Vm, host: &Host, hint: Option<u64>, grow_only: bool) -> Result<Re
     } else if requested == plugged {
         vm.limit.settled(meta.mem_mib + plugged);
     }
-    Ok(if new > plugged {
-        Resized::Grew
-    } else if full {
-        Resized::Full
-    } else {
-        Resized::Same
-    })
+    Ok(Resized::of(new > plugged, plan.short, plugged == hotplug_total, refused))
+}
+
+impl Resized {
+    fn of(grew: bool, short: bool, at_ceiling: bool, refused: bool) -> Resized {
+        match (grew, short) {
+            (true, _) => Resized::Grew,
+            (false, true) if at_ceiling => Resized::Full,
+            (false, true) if refused => Resized::Refused,
+            _ => Resized::Same,
+        }
+    }
+}
+
+const GRANT_RETRY_MIN: Duration = Duration::from_millis(250);
+const GRANT_RETRY_MAX: Duration = Duration::from_secs(5);
+
+/// After the reserve refuses a VM's growth: 250 ms, doubling to 5 s, before it
+/// is asked again; a grant resets it.
+#[derive(Default)]
+pub struct GrantBackoff {
+    delay: Duration,
+    until: Option<Instant>,
+}
+
+impl GrantBackoff {
+    fn ready(&self, now: Instant) -> bool {
+        self.until.is_none_or(|until| now >= until)
+    }
+
+    fn refused(&mut self, now: Instant) {
+        self.delay = (self.delay * 2).clamp(GRANT_RETRY_MIN, GRANT_RETRY_MAX);
+        self.until = Some(now + self.delay);
+    }
+
+    fn granted(&mut self) {
+        *self = GrantBackoff::default();
+    }
 }
 
 /// How long a resize may go unfinished before it settles at what is plugged.
@@ -2272,6 +2330,34 @@ mod tests {
         // Shrink 4096 -> 3072 outstanding, guest short: grow from what is plugged.
         let p = SIZES.plan(3072, 4096, 512, secs(2), true, false).unwrap();
         assert!(!p.settle && p.new > 4096 && p.charge == p.new - 4096, "{p:?}");
+    }
+
+    #[test]
+    fn a_refused_plug_is_not_the_ceiling() {
+        // Only at its ceiling is the guest told `full` (it lifts its throttle);
+        // refused by the reserve it stays throttled (#368).
+        assert_eq!(Resized::of(false, true, true, false), Resized::Full);
+        assert_eq!(Resized::of(false, true, false, true), Resized::Refused);
+        assert_eq!(Resized::of(false, false, false, true), Resized::Same);
+        assert_eq!(Resized::of(true, true, false, false), Resized::Grew);
+    }
+
+    #[test]
+    fn refused_growth_backs_off_until_a_grant() {
+        let (mut b, t) = (GrantBackoff::default(), Instant::now());
+        assert!(b.ready(t));
+        let mut waits = vec![];
+        for _ in 0..7 {
+            b.refused(t);
+            waits.push(b.until.unwrap() - t);
+        }
+        let ms = |n| Duration::from_millis(n);
+        assert_eq!(waits, [ms(250), ms(500), ms(1000), ms(2000), ms(4000), ms(5000), ms(5000)]);
+        assert!(!b.ready(t + ms(4999)) && b.ready(t + ms(5000)));
+        b.granted();
+        assert!(b.ready(t));
+        b.refused(t);
+        assert_eq!(b.until, Some(t + ms(250)));
     }
 
     #[test]

@@ -117,8 +117,19 @@ impl Limit {
     }
 
     fn clear_throttled(&self, growth: Growth) -> Growth {
-        self.throttled.store(false, Ordering::SeqCst);
+        self.set_throttled(false);
         growth
+    }
+
+    /// Logged as it changes, not at each refusal.
+    fn set_throttled(&self, throttled: bool) {
+        if self.throttled.swap(throttled, Ordering::SeqCst) != throttled {
+            let cg = self.cgroup.as_deref().unwrap_or(std::path::Path::new("")).display();
+            match throttled {
+                true => crate::log!("{cg}: throttled at its mark: the host's reserve refused it more"),
+                false => crate::log!("{cg}: no longer throttled"),
+            }
+        }
     }
 
     /// Usage within half a step of the mark: admit a step and raise it.
@@ -156,9 +167,8 @@ impl Limit {
             Ok(None) => {
                 let used = self.used();
                 let m = self.mark.lock().unwrap();
-                self.throttled.store(
+                self.set_throttled(
                     !m.lifted && m.admitted > 0 && m.admitted < m.cap && used.is_some_and(|u| u + MARK_SLACK >= m.admitted + overhead(m.admitted)),
-                    Ordering::SeqCst,
                 );
                 return Growth::Refused;
             }
@@ -240,7 +250,7 @@ impl Limit {
         while live() {
             wait_event(events.as_mut(), tick);
             if !running() {
-                self.throttled.store(false, Ordering::SeqCst);
+                self.set_throttled(false);
                 std::thread::sleep(tick);
                 continue;
             }

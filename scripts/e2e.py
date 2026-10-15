@@ -53,7 +53,7 @@ FAULTS = ("basic route route_abort lost_ack unknown refused pages_blip pages_dea
           "ckpt_failed_stop ckpt_rearm prepare_fail fc_prepare slow_preload bad_preload pull_enomem ckpt_packet_hold "
           "abort_superseded gen_zero signals suspend_gen standby restore_ip_peer late_withdrawal "
           "incoming_killed start_killed claim_killed standby_stalled standby_refill_race standby_lock_timeout standby_stop_claim standby_claim_signal standby_concurrent_claims fc_died cow_grow plug_race plug_storm suspend_debris revoked_publication "
-          "same_host_order same_host_slow_route same_host_flood same_host_late_handover same_host_backlog ckpt_backlog ckpt_paused_backlog rx_stall arrival_abort_route arrival_killed_route handoff_superseded delayed_announce announce_arp_timer prepare_fail_announce reconcile_announce reconcile_kill mem_high mem_high_migrate mem_high_evict mem_refused_headroom "
+          "same_host_order same_host_slow_route same_host_flood same_host_late_handover same_host_backlog ckpt_backlog ckpt_paused_backlog rx_stall arrival_abort_route arrival_killed_route handoff_superseded delayed_announce announce_arp_timer prepare_fail_announce reconcile_announce reconcile_kill mem_high mem_high_migrate mem_high_evict mem_refused_headroom mem_refused_fill "
           "sigkill_restart listen_trickle suspend_cmd suspend_overlap fc_died_busy pause_cmd_start suspend_died evict_latency evict_skips_cmd cmd_flag "
           "refused_admission meminfo_unreadable checkpoint_hotplug log_cap gc_debris arrival_log template_tap prefix_change arrival_overtaken "
           "prepare_disconnect prepare_trickle unlend_retry bad_app_log resume_slow_guest resume_readdress_fail resume_unpause_fail abort_link_fail resume_unsettled resume_pull_lock page_conns page_refusals")
@@ -867,7 +867,7 @@ def worker():
 # start first, and the short ones go in batches of about BATCH_S (each batch is a worker, with
 # hosts of its own). Unlisted ones count as 2 s.
 COST = {"image_template": 30, "pause_resume": 6, "migrate": 3, "checkpoint_restore": 3, "suspend_resume": 3,
-        "faults/cow_grow": 70, "faults/plug_race": 40, "faults/held_restore_frozen": 19,
+        "faults/cow_grow": 70, "faults/mem_refused_fill": 45, "faults/plug_race": 40, "faults/held_restore_frozen": 19,
         "faults/pages_blip": 18, "faults/standby_stop_claim": 5, "faults/standby_claim_signal": 15, "faults/standby_concurrent_claims": 10, "faults/standby_lock_timeout": 10, "faults/ckpt_incremental": 18, "faults/ckpt_hot": 25, "faults/cow_collapsed": 18, "faults/unplug_collapsed": 35,
         "faults/pages_dead_restore": 14, "faults/abort_superseded": 13, "faults/plug_storm": 11, "faults/unknown": 10,
         "faults/checkpoint_corrupt": 10, "faults/guest_calls": 10, "faults/checkpoint_fork": 9,
@@ -897,8 +897,8 @@ def main():
     scenarios = args.faults.split() if "faults" in selected else []
     # (name, templates it needs, cost): the cases, and each scenario on its own.
     work = [(c, set() if c == "image_template" else {args.template}, COST.get(c, 2)) for c in selected if c != "faults"]
-    # Growth (and checkpoint_hotplug and unplug_collapsed, which need room to plug) runs on GROW; fc_prepare needs a second template to mismatch with.
-    work += [(f"faults/{s}", {args.template, GROW} if s in ("cow_grow", "plug_race", "plug_storm", "checkpoint_hotplug", "unplug_collapsed", "fc_prepare") else {args.template},
+    # Growth (and checkpoint_hotplug, unplug_collapsed and mem_refused_fill, which need room to plug) runs on GROW; fc_prepare needs a second template to mismatch with.
+    work += [(f"faults/{s}", {args.template, GROW} if s in ("cow_grow", "plug_race", "plug_storm", "checkpoint_hotplug", "unplug_collapsed", "fc_prepare", "mem_refused_fill") else {args.template},
               COST.get(f"faults/{s}", 2)) for s in scenarios]
     work.sort(key=lambda w: -w[2])
     scheduled = list(work)

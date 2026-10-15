@@ -661,11 +661,14 @@ fn list(host: &Host, as_json: bool) -> Result<()> {
     if as_json {
         return print(json!(vms));
     }
-    let row = |c: [&str; 8]| println!("{:<16} {:<15} {:<10} {:<12} {:>8} {:>4} {:>8} {:>8}", c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]);
-    row(["NAME", "IP", "TEMPLATE", "STATE", "PID", "VCPU", "RSS MiB", "MAX MiB"]);
+    let row = |c: [&str; 9]| println!("{:<16} {:<15} {:<10} {:<12} {:>8} {:>4} {:>8} {:>8} {}", c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8]);
+    // STARVED: refused memory here and throttled (moved to a peer if there is one).
+    row(["NAME", "IP", "TEMPLATE", "STATE", "PID", "VCPU", "RSS MiB", "MAX MiB", "STARVED"]);
     for v in &vms {
         let s = |k: &str| v[k].as_str().map(String::from).or_else(|| v[k].as_u64().map(|n| n.to_string())).unwrap_or_default();
-        row(["name", "ip", "template", "state", "pid", "vcpus", "rss_mib", "max_mib"].map(s).each_ref().map(|s| s.as_str()));
+        let [a, b, c, d, e, f, g, h] = ["name", "ip", "template", "state", "pid", "vcpus", "rss_mib", "max_mib"].map(s);
+        let starved = if v["starved"].as_bool() == Some(true) { "yes" } else { "" };
+        row([&a, &b, &c, &d, &e, &f, &g, &h, starved]);
     }
     Ok(())
 }

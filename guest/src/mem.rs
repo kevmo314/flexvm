@@ -2,8 +2,9 @@
 //! second, so this keeps a burst from the OOM killer: overcommit is on; everything flexvm-init starts runs
 //! under `/vm`, whose `memory.high` sits `headroom(MemTotal)` below MemTotal (flexvm-init stays outside,
 //! so the throttle never slows the thread that lifts it); crossing it wakes the watcher, which asks the
-//! host for memory while allocations are throttled. Memory block uevents move the mark; if the host
-//! cannot grow the VM or nothing arrives within `GIVE_UP`, the throttle is lifted.
+//! host for memory while allocations are throttled. Memory block uevents move the mark; if the VM is
+//! at its ceiling or nothing arrives within `GIVE_UP`, the throttle is lifted. A plug the host's
+//! reserve refuses keeps it (`ok`): slow, not OOM-killed, until a plug or relief comes.
 
 use std::ffi::CString;
 use std::fs::File;
@@ -256,12 +257,15 @@ fn watch(events: File, uev: OwnedFd, mut limit: High) {
 enum Reply {
     /// The host is plugging more (or could not be reached; retry).
     Asked,
-    /// The host sees enough free memory (the mark was crossed by reclaimable memory).
+    /// The host sees enough free memory (the mark was crossed by reclaimable memory), or its
+    /// reserve refused a plug: either way the throttle stays, asked again as it is crossed.
     Enough,
+    /// At the VM's ceiling: nothing more will come.
     Full,
 }
 
-/// Sends `MEM <available KiB> <total KiB>`; the host answers `grow`, `busy` (plug in flight), `ok` or `full`.
+/// Sends `MEM <available KiB> <total KiB>`; the host answers `grow`, `busy` (plug in flight), `ok`
+/// (also when refused) or `full` (at the ceiling).
 fn ask() -> Reply {
     let Some((total, avail)) = meminfo() else { return Reply::Asked };
     let reply = (|| -> io::Result<String> {
