@@ -148,8 +148,9 @@ pub struct Proc {
     pauses: Latest,
     /// The code of a destroy waiting for `op` (0: none): a pause or resume that gets it first does nothing.
     destroying: AtomicI32,
-    /// `flexvm resume`s waiting for the signal thread to say whether a suspend is coming.
-    resumers: Mutex<Vec<std::sync::mpsc::Sender<bool>>>,
+    /// Held by the signal thread from taking a signal to reserving a SIGTERM's suspend,
+    /// and by `flexvm resume` asking: one sent earlier is still pending, queued or reserved.
+    taking: Mutex<()>,
     /// The controller's tick gaps, for `debug status`.
     ticks: Mutex<Ticks>,
     /// How fast the VM's memory grew lately (MiB/s), for eviction's ranking.
@@ -248,7 +249,7 @@ impl Proc {
             serving: Mutex::new(false),
             pauses: Latest::default(),
             destroying: AtomicI32::new(0),
-            resumers: Mutex::new(Vec::new()),
+            taking: Mutex::new(()),
             ticks: Mutex::new(Ticks::default()),
             growth: AtomicU64::new(0),
             publishing: Mutex::new(()),
@@ -903,9 +904,6 @@ impl Proc {
     }
 
     fn signal(self: &Arc<Self>, sig: i32) {
-        if sig == libc::SIGCONT {
-            self.answer_resumers();
-        }
         let mut early = self.early.lock().unwrap();
         // Until those before it are replayed (`serve`), as it would overtake them.
         if self.vm.get().is_none() || !early.is_empty() {
@@ -918,24 +916,18 @@ impl Proc {
         self.dispatch(sig);
     }
 
-    /// On the signal thread, the only one taking signals, which reserves a SIGTERM's
-    /// suspend before it takes the next: one sent earlier is reserved or still pending.
-    fn answer_resumers(&self) {
-        let coming = *self.suspending.lock().unwrap() == Suspend::Suspending
-            || self.early.lock().unwrap().contains(&libc::SIGTERM)
+    /// `flexvm resume`: whether a SIGTERM sent before it suspends the VM; if none,
+    /// its SIGCONT (which, as a raw one did, discards a Ctrl-Z still pending).
+    fn resume_request(&self) -> Value {
+        let _taking = self.taking.lock().unwrap();
+        // Queued first: a replay reserves, then takes it off.
+        let coming = self.early.lock().unwrap().contains(&libc::SIGTERM)
+            || *self.suspending.lock().unwrap() == Suspend::Suspending
             || crate::util::signal_pending(libc::SIGTERM);
-        for r in self.resumers.lock().unwrap().drain(..) {
-            let _ = r.send(coming);
+        if !coming {
+            unsafe { libc::kill(libc::getpid(), libc::SIGCONT) };
         }
-    }
-
-    /// `flexvm resume`'s SIGCONT, answered once the signal thread takes it: whether a suspend is coming.
-    fn resume_request(&self) -> Result<Value> {
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.resumers.lock().unwrap().push(tx);
-        unsafe { libc::kill(libc::getpid(), libc::SIGCONT) };
-        let coming = rx.recv_timeout(Duration::from_secs(10)).map_err(|_| "the signal thread did not answer")?;
-        Ok(json!({"suspending": coming}))
+        json!({"suspending": coming})
     }
 
     fn dispatch(self: &Arc<Self>, sig: i32) {
@@ -1028,7 +1020,7 @@ impl Proc {
             }),
             "migrate" => self.migrate(req["to"].as_str().unwrap_or(""), req["if_idle"] == true, req["evict"] == true),
             "debug" => self.debug(&req),
-            "resume" => self.resume_request(),
+            "resume" => Ok(self.resume_request()),
             "claim" => Err("this vm is not a standby vm".into()),
             op => Err(format!("unknown op {op:?}").into()),
         };
@@ -1523,9 +1515,17 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
         crate::gc::periodic(host);
     });
     let s = p.clone();
+    let fd = crate::util::signal_fd(&signals)?;
     // Ctrl-\ quits like Ctrl-C: the VM is destroyed, not dumped.
     thread::spawn(move || loop {
-        s.signal(crate::util::wait_signal(&signals));
+        let _ = crate::util::readable(&fd, Duration::from_secs(3600));
+        // Taken, and a SIGTERM's suspend reserved, under `taking` (`resume_request`).
+        let taking = s.taking.lock().unwrap();
+        let Some(sig) = crate::util::take_signal(&signals) else { continue };
+        if sig != libc::SIGTERM {
+            drop(taking);
+        }
+        s.signal(sig);
     });
     let op = p.op();
     let res = match start {
@@ -2283,22 +2283,40 @@ mod tests {
     }
 
     #[test]
-    fn resumers_learn_whether_a_suspend_is_coming() {
-        let (p, root) = test_proc("resumers");
-        let ask = |p: &Arc<Proc>| {
-            let (tx, rx) = std::sync::mpsc::channel();
-            p.resumers.lock().unwrap().push(tx);
-            p.answer_resumers();
-            rx.try_recv().unwrap()
-        };
-        assert!(!ask(&p));
+    fn a_resume_asked_while_a_sigterm_is_taken_waits_for_its_reservation() {
+        let (p, root) = test_proc("resume-taking");
+        assert_eq!(p.resume_request()["suspending"], false);
+        // The signal thread has taken a SIGTERM (no longer pending) and not yet reserved.
+        let taking = p.taking.lock().unwrap();
+        let q = p.clone();
+        let asked = thread::spawn(move || q.resume_request());
+        thread::sleep(Duration::from_millis(50));
+        assert!(!asked.is_finished(), "waits for the signal thread");
         *p.suspending.lock().unwrap() = Suspend::Suspending;
-        assert!(ask(&p), "reserved");
+        drop(taking);
+        assert_eq!(asked.join().unwrap()["suspending"], true);
         *p.suspending.lock().unwrap() = Suspend::Idle;
         p.early.lock().unwrap().push(libc::SIGTERM);
-        assert!(ask(&p), "queued at startup, still to be replayed");
-        p.early.lock().unwrap().clear();
-        assert!(p.resumers.lock().unwrap().is_empty(), "each answered once");
+        assert_eq!(p.resume_request()["suspending"], true, "queued at startup, still to be replayed");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_resume_answers_without_any_signal_taken() {
+        // No signal thread (nor a SIGCONT a Ctrl-Z could erase): answered at once, from what is pending.
+        let (p, root) = test_proc("resume-pending");
+        thread::spawn(move || {
+            let set = crate::util::block_signals(&[libc::SIGTERM, libc::SIGTSTP]);
+            unsafe { libc::pthread_kill(libc::pthread_self(), libc::SIGTSTP) };
+            let t = Instant::now();
+            assert_eq!(p.resume_request()["suspending"], false, "a pending Ctrl-Z is no suspend");
+            unsafe { libc::pthread_kill(libc::pthread_self(), libc::SIGTERM) };
+            assert_eq!(p.resume_request()["suspending"], true, "a SIGTERM not yet taken");
+            assert!(t.elapsed() < Duration::from_secs(1));
+            while crate::util::take_signal(&set).is_some() {}
+        })
+        .join()
+        .unwrap();
         let _ = std::fs::remove_dir_all(root);
     }
 
