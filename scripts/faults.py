@@ -1480,11 +1480,11 @@ def announce_arp_timer():
     `route_stall`; `tell`'s retry would keep it about 5 s) does not delay it.
     A's announce device is a dummy link, the ARPs captured on it."""
     n, dev = "ft-arp-timer", f"garp{A.addr.rsplit(':', 1)[1]}"
+    was = ok(cli_json(A, "config")).get("announce_dev") or ""
+    arps, cap = [], socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003))
     subprocess.run(["ip", "link", "del", dev], capture_output=True)
     subprocess.run(["ip", "link", "add", dev, "up", "type", "dummy"], check=True)
-    arps = []
     try:
-        cap = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003))
         cap.bind((dev, 0))
         cap.settimeout(0.2)
         code, out, err = cli(A, "config", "--announce-dev", dev)
@@ -1502,9 +1502,15 @@ def announce_arp_timer():
                 arps.append(time.monotonic())
         check("announce arp timer: B holds up A's announcement", conns(B) >= 1, conns(B))
     finally:
-        fault(B, "route_stall", 0)
-        cli(A, "config", "--announce-dev", "")
-        subprocess.run(["ip", "link", "del", dev], capture_output=True)
+        # Each step whatever the one before did (B gone, a CLI failing): the host as found.
+        try:
+            fault(B, "route_stall", 0)
+        finally:
+            try:
+                cli(A, "config", "--announce-dev", was)
+            finally:
+                cap.close()
+                subprocess.run(["ip", "link", "del", dev], capture_output=True)
     check("announce arp timer: both ARPs went out", len(arps) == 2, arps)
     if len(arps) == 2:
         gap = arps[1] - arps[0]
