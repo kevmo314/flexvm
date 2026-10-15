@@ -167,16 +167,18 @@ fn refill_by(host: &Host, template: &str, wait: bool) -> Result<usize> {
     let args = [host.state.as_os_str(), host.run.as_os_str(), template.as_ref()];
     for _ in 0..want {
         // Shared from the grant until its lock file exists (`locked`, or it died), not through
-        // its load: relief either lists it or ran before the grant. None while relief stops them.
+        // its load: relief either lists it or ran before the grant. None while relief stops them,
+        // and held `LOCKED_TIMEOUT` at most (a stuck host lock fails the grant).
         let stop = stop_lock(host)?;
-        if flock(&stop, libc::LOCK_SH | libc::LOCK_NB).is_err() || host.grant(256, None)?.is_none() {
+        let by = Instant::now() + LOCKED_TIMEOUT;
+        if flock(&stop, libc::LOCK_SH | libc::LOCK_NB).is_err() || host.grant(256, Some(by))?.is_none() {
             break;
         }
         let (r, w) = std::os::unix::net::UnixStream::pair()?;
         let args = ["--state".as_ref(), args[0], "--run".as_ref(), args[1], "run".as_ref(), "--standby".as_ref(), "--template".as_ref(), args[2]];
         crate::util::spawn_self(&args, &log, w.as_raw_fd(), &[("FLEXVM_NOTIFY_FD", "3")])?;
         drop(w);
-        let _ = crate::util::readable(&r, LOCKED_TIMEOUT);
+        let _ = crate::util::readable(&r, by.saturating_duration_since(Instant::now()));
         drop(stop);
         ready.push(BufReader::new(r));
     }
@@ -432,7 +434,7 @@ pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]
 }
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
-/// How long a refill holds relief off for a standby that has not created its lock file.
+/// How long a refill holds relief off for each standby it starts: its grant, then its lock file.
 const LOCKED_TIMEOUT: Duration = Duration::from_secs(5);
 const LATE: Duration = Duration::from_millis(250);
 const CLAIM_TIMEOUT: Duration = Duration::from_secs(60);
@@ -550,6 +552,29 @@ mod tests {
         File::create(&stale).unwrap();
         assert_eq!(live(&host, "default"), [me]);
         assert!(!stale.exists() && path.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_refill_stuck_on_the_host_lock_lets_relief_in_within_its_budget() {
+        let root = std::env::temp_dir().join(format!("flexvm-refill-stuck-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        crate::util::write_file(&host.state.join("standby"), "default", b"1", true).unwrap();
+        let (held, release) = (std::sync::mpsc::channel(), std::sync::mpsc::channel::<()>());
+        let h = host.clone();
+        let holder = std::thread::spawn(move || {
+            let _l = h.lock().unwrap();
+            held.0.send(()).unwrap();
+            let _ = release.1.recv();
+        });
+        held.1.recv().unwrap();
+        let start = Instant::now();
+        assert!(refill_by(&host, "default", false).is_err());
+        assert!(start.elapsed() < LOCKED_TIMEOUT + Duration::from_secs(1), "{:?}", start.elapsed());
+        crate::host::flock(&stop_lock(&host).unwrap(), libc::LOCK_EX | libc::LOCK_NB).unwrap();
+        release.0.send(()).unwrap();
+        holder.join().unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 

@@ -4834,7 +4834,7 @@ def standby_refill_race():
         fault(A, "standby_lock_stall", 0)
         fault(A, "no_evict", 0)
     check("standby refill race: the standby being started is stopped, and marks the pressure", "pressure" in seen, seen)
-    check("standby refill race: eviction waits for it", seen.get("active", 99) > seen.get("pressure", 99), seen)
+    check("standby refill race: eviction waits for it", "active" in seen and "pressure" in seen and seen["active"] > seen["pressure"], seen)
     check("standby refill race: it exits", wait_for(lambda: not [p for p in pids + standby_pids(A, t) if alive(p)], 30), (pids, res))
     try:
         os.remove(pressure)
