@@ -75,9 +75,14 @@ impl Firecracker {
         }
         let child = cmd.spawn()?;
         let fc = Firecracker { child, sockets, dir: dir.into(), cgroup: None, tap: String::new(), api: Api::default(), joining: RefCell::new(None) };
-        let id = crate::host::Ident::of(fc.pid()).ok_or("firecracker exited at once")?;
+        let id = crate::host::Ident::of(fc.pid()).ok_or_else(|| fc.post_mortem())?;
         crate::host::store(&dir.join("fc"), &id, false)?;
-        retry(ready, || Ok(UnixStream::connect(&fc.sockets.api)?))?;
+        retry(ready, || -> Result<Result<UnixStream>> {
+            if !fc.alive() {
+                return Ok(Err(fc.post_mortem().into()));
+            }
+            Ok(Ok(UnixStream::connect(&fc.sockets.api)?))
+        })??;
         Ok(fc)
     }
 

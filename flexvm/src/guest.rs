@@ -200,15 +200,18 @@ pub fn ping(uds: &Path) -> Result<()> {
     })
 }
 
-pub fn exec(uds: &Path, cmd: &str) -> Result<(i32, Vec<u8>)> {
-    let (mut r, id) = start_exec(crate::util::connect_unix(uds, TIMEOUT)?, cmd, TIMEOUT)?;
-    untimed(&r)?;
+pub fn exec(uds: &Path, cmd: &str, timeout: Duration) -> Result<(i32, Vec<u8>)> {
+    let at = Instant::now() + timeout;
+    let s = crate::util::connect_unix(uds, timeout)?;
+    let id = session_id()?;
+    let mut r = handshake(By { s, at }, &format!("SESSION {id} {}", cmd.len()))?;
+    r.get_mut().write_all(cmd.as_bytes())?;
     let mut out = Vec::new();
     let code = exec_output(&mut r, &id, |_, data| {
         out.extend_from_slice(data);
         Ok(())
     })?;
-    close(uds, &id, Instant::now() + TIMEOUT)?;
+    close(uds, &id, at)?;
     Ok((code, out))
 }
 
@@ -308,6 +311,29 @@ pub fn start_logs(s: UnixStream, offset: u64, follow: bool, timeout: Duration) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exec_deadline_bounds_a_guest_that_keeps_answering() {
+        let path = std::env::temp_dir().join(format!("flexvm-exec-{}.sock", std::process::id()));
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let uds = path.clone();
+        let client = std::thread::spawn(move || {
+            let start = Instant::now();
+            let e = exec(&uds, "true", Duration::from_millis(100)).unwrap_err();
+            assert_eq!(e.downcast_ref::<std::io::Error>().unwrap().kind(), ErrorKind::TimedOut);
+            assert!(start.elapsed() < Duration::from_secs(1));
+        });
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.write_all(b"OK 1\n").unwrap();
+        for _ in 0..100 {
+            if write_frame(&mut stream, FRAME_MSG, b"waiting").is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        client.join().unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn ping_waits_for_pong_without_a_session() {

@@ -159,8 +159,7 @@ impl Registry {
 fn cached_blob<R: Read>(digest: &str, size: u64, blobs: &Path, download: impl FnOnce() -> Result<R>) -> Result<PathBuf> {
     let path = blob_path(blobs, digest)?;
     let dir = path.parent().unwrap().to_path_buf();
-    // The path handed out must survive a crash, whoever made its directories (synced once per process).
-    crate::util::create_dir_durably(&dir, 0o777)?;
+    // `pull` synced the directory chain; each blob syncs only its own entry.
     if path.exists() {
         let (reader, len) = super::source::Blob::File(path.clone()).open()?;
         let mut cached = Hashed::new(reader.take(size.saturating_add(1)));
