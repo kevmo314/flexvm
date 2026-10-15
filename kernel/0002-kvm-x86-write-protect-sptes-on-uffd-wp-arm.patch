@@ -1,0 +1,212 @@
+diff -u a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -1674,6 +1674,24 @@
+ 	return flush;
+ }
+ 
++/*
++ * The primary MMU only removed write access from [start, end): write-protect
++ * the TDP MMU's SPTEs instead of zapping them. The shadow MMU, private roots
++ * and the APIC access page still zap.
++ */
++bool kvm_arch_wrprot_gfn_range(struct kvm *kvm, struct kvm_gfn_range *range)
++{
++	lockdep_assert_once(kvm->mmu_invalidate_in_progress);
++
++	if (!tdp_mmu_enabled || kvm_memslots_have_rmaps(kvm) ||
++	    range->attr_filter != KVM_FILTER_SHARED ||
++	    (kvm_x86_ops.set_apic_access_page_addr &&
++	     range->slot->id == APIC_ACCESS_PAGE_PRIVATE_MEMSLOT))
++		return kvm_unmap_gfn_range(kvm, range);
++
++	return kvm_tdp_mmu_wrprot_gfn_range(kvm, range);
++}
++
+ #define RMAP_RECYCLE_THRESHOLD 1000
+ 
+ static void __rmap_add(struct kvm *kvm,
+diff -u a/arch/x86/kvm/mmu/tdp_mmu.c b/arch/x86/kvm/mmu/tdp_mmu.c
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@ -1369,6 +1369,74 @@
+ }
+ 
+ /*
++ * Removes write access from the leaf SPTEs of [start, end) in @root, and the
++ * MMU-writable and host-writable bits too (as write_protect_gfn() does), so
++ * that fast_page_fault() can't make them writable again: the next write takes
++ * the slow path and asks the primary MMU.
++ */
++static bool tdp_mmu_wrprot_leafs(struct kvm *kvm, struct kvm_mmu_page *root,
++				 gfn_t start, gfn_t end, bool can_yield, bool flush)
++{
++	struct tdp_iter iter;
++	u64 new_spte;
++
++	end = min(end, tdp_mmu_max_gfn_exclusive());
++
++	lockdep_assert_held_write(&kvm->mmu_lock);
++
++	rcu_read_lock();
++
++	for_each_tdp_pte_min_level(iter, kvm, root, PG_LEVEL_4K, start, end) {
++		if (can_yield &&
++		    tdp_mmu_iter_cond_resched(kvm, &iter, flush, false)) {
++			flush = false;
++			continue;
++		}
++
++		if (!is_shadow_present_pte(iter.old_spte) ||
++		    !is_last_spte(iter.old_spte, iter.level))
++			continue;
++
++		new_spte = iter.old_spte & ~(PT_WRITABLE_MASK |
++					     shadow_mmu_writable_mask |
++					     shadow_host_writable_mask);
++		if (new_spte == iter.old_spte)
++			continue;
++
++		tdp_mmu_iter_set_spte(kvm, &iter, new_spte);
++		flush = true;
++	}
++
++	rcu_read_unlock();
++	return flush;
++}
++
++/*
++ * The primary MMU removed write access from the range: write-protect valid
++ * roots' SPTEs, and zap those of invalid roots as kvm_tdp_mmu_unmap_gfn_range()
++ * does (they are only waiting to be freed).
++ */
++bool kvm_tdp_mmu_wrprot_gfn_range(struct kvm *kvm, struct kvm_gfn_range *range)
++{
++	enum kvm_tdp_mmu_root_types types;
++	struct kvm_mmu_page *root;
++	bool flush = false;
++
++	types = kvm_gfn_range_filter_to_root_types(kvm, range->attr_filter) | KVM_INVALID_ROOTS;
++
++	__for_each_tdp_mmu_root_yield_safe(kvm, root, range->slot->as_id, types) {
++		if (root->role.invalid)
++			flush = tdp_mmu_zap_leafs(kvm, root, range->start, range->end,
++						  range->may_block, flush);
++		else
++			flush = tdp_mmu_wrprot_leafs(kvm, root, range->start, range->end,
++						     range->may_block, flush);
++	}
++
++	return flush;
++}
++
++/*
+  * Mark the SPTEs range of GFNs [start, end) unaccessed and return non-zero
+  * if any of the GFNs in the range have been accessed.
+  *
+diff -u a/arch/x86/kvm/mmu/tdp_mmu.h b/arch/x86/kvm/mmu/tdp_mmu.h
+--- a/arch/x86/kvm/mmu/tdp_mmu.h
++++ b/arch/x86/kvm/mmu/tdp_mmu.h
+@@ -76,6 +76,7 @@
+ bool kvm_tdp_mmu_unmap_gfn_range(struct kvm *kvm, struct kvm_gfn_range *range,
+ 				 bool flush);
+ bool kvm_tdp_mmu_age_gfn_range(struct kvm *kvm, struct kvm_gfn_range *range);
++bool kvm_tdp_mmu_wrprot_gfn_range(struct kvm *kvm, struct kvm_gfn_range *range);
+ bool kvm_tdp_mmu_test_age_gfn(struct kvm *kvm, struct kvm_gfn_range *range);
+ 
+ bool kvm_tdp_mmu_wrprot_slot(struct kvm *kvm,
+diff -u a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -273,6 +273,7 @@
+ 	bool lockless;
+ };
+ bool kvm_unmap_gfn_range(struct kvm *kvm, struct kvm_gfn_range *range);
++bool kvm_arch_wrprot_gfn_range(struct kvm *kvm, struct kvm_gfn_range *range);
+ bool kvm_age_gfn(struct kvm *kvm, struct kvm_gfn_range *range);
+ bool kvm_test_age_gfn(struct kvm *kvm, struct kvm_gfn_range *range);
+ #endif
+diff -u a/include/linux/mmu_notifier.h b/include/linux/mmu_notifier.h
+--- a/include/linux/mmu_notifier.h
++++ b/include/linux/mmu_notifier.h
+@@ -60,6 +60,13 @@
+ };
+ 
+ #define MMU_NOTIFIER_RANGE_BLOCKABLE (1 << 0)
++/*
++ * Only write permission is removed: present PTEs in the range keep their PFN,
++ * and nothing gains permission. Anything that frees or moves a page in the
++ * range sends its own invalidation. Secondary MMUs may write-protect their
++ * mappings instead of dropping them.
++ */
++#define MMU_NOTIFIER_RANGE_WRPROTECT (1 << 1)
+ 
+ struct mmu_notifier_ops {
+ 	/*
+diff -u a/mm/mprotect.c b/mm/mprotect.c
+--- a/mm/mprotect.c
++++ b/mm/mprotect.c
+@@ -624,8 +624,14 @@
+ 			continue;
+ 
+ 		if (notify && !range.start) {
++			/*
++			 * Arming uffd-wp keeps every PFN and only drops write
++			 * (splits notify on their own).
++			 */
+ 			mmu_notifier_range_init(&range,
+-						MMU_NOTIFY_PROTECTION_VMA, 0,
++						MMU_NOTIFY_PROTECTION_VMA,
++						(cp_flags & MM_CP_UFFD_WP) ?
++						MMU_NOTIFIER_RANGE_WRPROTECT : 0,
+ 						vma->vm_mm, addr, end);
+ 			mmu_notifier_invalidate_range_start(&range);
+ 		}
+diff -u a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -723,14 +723,34 @@
+ 	return kvm_unmap_gfn_range(kvm, range);
+ }
+ 
++/* Architectures that can't write-protect in place unmap instead. */
++bool __weak kvm_arch_wrprot_gfn_range(struct kvm *kvm, struct kvm_gfn_range *range)
++{
++	return kvm_unmap_gfn_range(kvm, range);
++}
++
++static bool kvm_mmu_wrprot_gfn_range(struct kvm *kvm, struct kvm_gfn_range *range)
++{
++	kvm_mmu_invalidate_range_add(kvm, range->start, range->end);
++	return kvm_arch_wrprot_gfn_range(kvm, range);
++}
++
+ static int kvm_mmu_notifier_invalidate_range_start(struct mmu_notifier *mn,
+ 					const struct mmu_notifier_range *range)
+ {
+ 	struct kvm *kvm = mmu_notifier_to_kvm(mn);
++	/*
++	 * Only write permission goes away: keep the mappings, read-only. Faults
++	 * racing with this still retry until range_end(), and pfn caches, which
++	 * write, are still invalidated. Nothing is freed, so there is no memory
++	 * reclaimed to tell the arch about (frees send their own invalidation).
++	 */
++	bool wrprot = range->flags & MMU_NOTIFIER_RANGE_WRPROTECT;
+ 	const struct kvm_mmu_notifier_range hva_range = {
+ 		.start		= range->start,
+ 		.end		= range->end,
+-		.handler	= kvm_mmu_unmap_gfn_range,
++		.handler	= wrprot ? kvm_mmu_wrprot_gfn_range :
++					   kvm_mmu_unmap_gfn_range,
+ 		.on_lock	= kvm_mmu_invalidate_begin,
+ 		.flush_on_ret	= true,
+ 		.may_block	= mmu_notifier_range_blockable(range),
+@@ -767,7 +787,7 @@
+ 	 * that guest memory has been reclaimed.  This needs to be done *after*
+ 	 * dropping mmu_lock, as x86's reclaim path is slooooow.
+ 	 */
+-	if (kvm_handle_hva_range(kvm, &hva_range).found_memslot)
++	if (kvm_handle_hva_range(kvm, &hva_range).found_memslot && !wrprot)
+ 		kvm_arch_guest_memory_reclaimed(kvm);
+ 
+ 	return 0;

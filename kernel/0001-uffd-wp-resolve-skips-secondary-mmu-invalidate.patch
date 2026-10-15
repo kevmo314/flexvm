@@ -1,0 +1,77 @@
+diff -u a/mm/huge_memory.c b/mm/huge_memory.c
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -2369,6 +2369,9 @@
+ 		pmd_t newpmd;
+ 
+ 		VM_BUG_ON(!is_pmd_migration_entry(*pmd));
++		/* See change_pte_range(): resolving touches only uffd-wp entries. */
++		if (uffd_wp_resolve && !pmd_swp_uffd_wp(*pmd))
++			goto unlock;
+ 		if (is_writable_migration_entry(entry)) {
+ 			/*
+ 			 * A protection check is difficult so
+@@ -2395,6 +2398,10 @@
+ 	}
+ #endif
+ 
++	/* See change_pte_range(): resolving touches only uffd-wp entries. */
++	if (uffd_wp_resolve && !pmd_uffd_wp(*pmd))
++		goto unlock;
++
+ 	if (prot_numa) {
+ 		struct folio *folio;
+ 		bool toptier;
+diff -u a/mm/mprotect.c b/mm/mprotect.c
+--- a/mm/mprotect.c
++++ b/mm/mprotect.c
+@@ -304,6 +304,15 @@
+ 			struct page *page;
+ 			pte_t ptent;
+ 
++			/*
++			 * Resolving uffd-wp only touches PTEs that carry the
++			 * bit. Those are never writable, so resolving them can
++			 * only upgrade permissions, which secondary MMUs need
++			 * not hear about (see change_pud_range()).
++			 */
++			if (uffd_wp_resolve && !pte_uffd_wp(oldpte))
++				continue;
++
+ 			page = vm_normal_page(vma, addr, oldpte);
+ 			if (page)
+ 				folio = page_folio(page);
+@@ -358,6 +367,10 @@
+ 			swp_entry_t entry = pte_to_swp_entry(oldpte);
+ 			pte_t newpte;
+ 
++			/* As above: leave entries without uffd-wp alone. */
++			if (uffd_wp_resolve && !pte_swp_uffd_wp_any(oldpte))
++				continue;
++
+ 			if (is_writable_migration_entry(entry)) {
+ 				struct folio *folio = pfn_swap_entry_folio(entry);
+ 
+@@ -586,6 +599,13 @@
+ 	pud_t *pudp, pud;
+ 	unsigned long next;
+ 	long pages = 0, ret;
++	/*
++	 * Resolving uffd-wp only upgrades permissions (change_pte_range() and
++	 * change_huge_pmd() skip entries without the bit), so secondary MMUs
++	 * may keep their mappings and fault for write later, as after any
++	 * write-fault upgrade. Splits notify on their own.
++	 */
++	const bool notify = !(cp_flags & MM_CP_UFFD_WP_RESOLVE);
+ 
+ 	range.start = 0;
+ 
+@@ -603,7 +623,7 @@
+ 		if (pud_none(pud))
+ 			continue;
+ 
+-		if (!range.start) {
++		if (notify && !range.start) {
+ 			mmu_notifier_range_init(&range,
+ 						MMU_NOTIFY_PROTECTION_VMA, 0,
+ 						vma->vm_mm, addr, end);
