@@ -280,7 +280,7 @@ fn pull(cache: &Path, reg: Registry, limits: &Limits) -> Result<Image> {
 }
 
 fn download_layers<T: Sync>(descs: &[(String, u64, T)], download: impl Fn(&str, u64, &T) -> Result<()> + Sync) -> Result<()> {
-    // One download per digest: concurrent writes share a PID-based .part name.
+    // One download per digest, not one per layer that names it.
     let mut unique = HashMap::new();
     for (d, size, src) in descs {
         if unique.insert(d, (*size, src)).is_some_and(|(previous, _)| previous != *size) {

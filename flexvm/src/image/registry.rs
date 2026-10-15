@@ -284,10 +284,11 @@ pub(super) fn sweep_parts(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         let name = entry.file_name();
-        let Some((hex, pid)) = name.to_str().and_then(|n| n.rsplit_once(".part")) else { continue };
-        if pid.parse::<u32>().is_ok_and(|p| p > 0) && hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let Some((hex, id)) = name.to_str().and_then(|n| n.rsplit_once(".part")) else { continue };
+        if crate::util::is_nonce(id) && hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
             let Ok(f) = std::fs::File::open(entry.path()) else { continue };
-            if crate::host::flock(&f, libc::LOCK_EX | libc::LOCK_NB).is_ok() {
+            // Let go explicitly, not by close: a child another thread forks shares the descriptor.
+            if let Ok(_held) = crate::host::Flock::new(f, libc::LOCK_EX | libc::LOCK_NB) {
                 let _ = std::fs::remove_file(entry.path());
             }
         }
@@ -376,7 +377,8 @@ pub(super) mod tests {
                 assert!(err.contains(if downloaded.len() == 4 { "downloaded with digest" } else { "descriptor's 4 bytes" }), "{err}");
                 assert_eq!(std::fs::read(&path).unwrap(), cached, "a failed download keeps what was there");
             }
-            assert!(!path.with_extension(format!("part{}", std::process::id())).exists());
+            let parts = std::fs::read_dir(path.parent().unwrap()).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().contains(".part"));
+            assert_eq!(parts.count(), 0);
         }
     }
 
@@ -385,17 +387,19 @@ pub(super) mod tests {
         let dir = super::super::unpack::tests::tmpdir("parts");
         let hex = "a".repeat(64);
         let stale = dir.join(format!("{hex}.part2147483647"));
-        let live = dir.join(format!("{hex}.part{}", std::process::id()));
+        let live = dir.join(format!("{hex}.part{}", crate::util::nonce().unwrap()));
+        let dead = dir.join(format!("{hex}.part{}", crate::util::nonce().unwrap()));
         let other = dir.join("unrelated.part2147483647");
         let blob = dir.join(&hex);
-        for path in [&stale, &live, &other, &blob] {
+        for path in [&stale, &live, &dead, &other, &blob] {
             std::fs::write(path, "data").unwrap();
         }
         let lock = std::fs::File::open(&live).unwrap();
         crate::host::flock(&lock, libc::LOCK_EX).unwrap();
         sweep_parts(&dir);
-        assert!(!stale.exists());
-        assert!(live.exists() && other.exists() && blob.exists());
+        assert!(!dead.exists());
+        // Named by pid by older builds: no lock says whose, so never removed.
+        assert!(stale.exists() && live.exists() && other.exists() && blob.exists());
         // Unlocked, not only closed: a child another test forks meanwhile shares the lock until it execs.
         crate::host::flock(&lock, libc::LOCK_UN).unwrap();
         drop(lock);

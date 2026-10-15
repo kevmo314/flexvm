@@ -795,6 +795,63 @@ pub fn unlink_durably(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Clears the signal mask of `cmd`'s child, which exec keeps: a spawner that blocks signals to
+/// wait for them itself (`block_signals`) would otherwise pass them on blocked.
+pub fn unblock_signals_in(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        cmd.pre_exec(|| {
+            let mut none: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut none);
+            check(libc::sigprocmask(libc::SIG_SETMASK, &none, std::ptr::null_mut()))
+        })
+    }
+}
+
+/// Runs `cmd` with its output captured, its signals unblocked, polling `stop`: once that fails,
+/// the child is killed and reaped and its error returned (also when the child exited failing
+/// meanwhile, as a Ctrl-C to the process group does).
+pub fn run_until(cmd: &mut std::process::Command, stop: impl Fn() -> Result<()>) -> Result<std::process::Output> {
+    use std::process::Stdio;
+    let mut child = unblock_signals_in(cmd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    let drain = |r: Option<Box<dyn io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            r.map(|mut r| r.read_to_end(&mut buf));
+            buf
+        })
+    };
+    let (out, err) = (drain(child.stdout.take().map(|r| Box::new(r) as _)), drain(child.stderr.take().map(|r| Box::new(r) as _)));
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if let Err(e) = stop() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    if !status.success() {
+        stop()?;
+    }
+    Ok(std::process::Output { status, stdout: out.join().unwrap_or_default(), stderr: err.join().unwrap_or_default() })
+}
+
+/// 16 random hex digits for a temporary name, so that no two writers (other processes, other
+/// pid namespaces, other hosts sharing the directory) ever pick the same one.
+pub fn nonce() -> io::Result<String> {
+    let mut random = [0u8; 8];
+    io::Read::read_exact(&mut std::fs::File::open("/dev/urandom")?, &mut random)?;
+    Ok(random.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Whether `s` is a `nonce()`.
+pub fn is_nonce(s: &str) -> bool {
+    s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// False if `path` exists.
 pub fn rename_noreplace(tmp: &Path, path: &Path) -> io::Result<bool> {
     use std::os::unix::ffi::OsStrExt;
@@ -1269,6 +1326,35 @@ mod tests {
         assert!(!scope(prefix, 7, 9));
         assert_eq!(std::fs::read(root.join("vm-7-9/cgroup.procs")).unwrap(), b"");
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn children_run_with_signals_unblocked_and_stop_when_asked() {
+        // Blocked in this thread only, which the child's mask is copied from.
+        let set = unsafe {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            for s in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+                libc::sigaddset(&mut set, s);
+            }
+            assert_eq!(libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()), 0);
+            set
+        };
+        let out = run_until(std::process::Command::new("grep").args(["SigBlk", "/proc/self/status"]), || Ok(()));
+        unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut()) };
+        assert_eq!(String::from_utf8(out.unwrap().stdout).unwrap().trim(), "SigBlk:\t0000000000000000");
+
+        let start = std::time::Instant::now();
+        let stop = || match start.elapsed() > std::time::Duration::from_millis(200) {
+            true => Err("interrupted".into()),
+            false => Ok(()),
+        };
+        let err = run_until(std::process::Command::new("sleep").arg("30"), stop).unwrap_err();
+        assert_eq!(err.to_string(), "interrupted");
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        // A child that fails once stopped reports the stop, not its own failure.
+        assert_eq!(run_until(&mut std::process::Command::new("false"), || Err("interrupted".into())).unwrap_err().to_string(), "interrupted");
+        assert!(!run_until(&mut std::process::Command::new("false"), || Ok(())).unwrap().status.success());
     }
 
     #[test]

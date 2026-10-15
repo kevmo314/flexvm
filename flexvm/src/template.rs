@@ -605,7 +605,8 @@ pub fn interrupt(sig: i32) {
     INTERRUPT.store(sig, Ordering::Relaxed);
 }
 
-fn interrupted() -> Result<()> {
+/// Also checked by image builds (`image::prepare`), which run under the same signal thread.
+pub fn interrupted() -> Result<()> {
     match INTERRUPT.load(Ordering::Relaxed) {
         0 => Ok(()),
         sig => bail!("template build interrupted (signal {sig})"),
@@ -619,19 +620,9 @@ fn templates_lock(paths: &Paths, how: i32) -> Result<crate::host::Flock> {
     Ok(crate::host::Flock::new(f, how)?)
 }
 
-/// 16 hex digits, so concurrent builds on hosts sharing a templates directory never pick the
-/// same staging directory or link.
-fn nonce() -> Result<String> {
-    let mut random = [0u8; 8];
-    std::io::Read::read_exact(&mut File::open("/dev/urandom")?, &mut random)?;
-    Ok(random.iter().map(|b| format!("{b:02x}")).collect())
-}
-
 /// Whether `file` is `.{name}.{kind}-{nonce}`, as `Staging::new` and `publish` name theirs.
 fn leftover(file: &str, kind: &str) -> bool {
-    file.strip_prefix('.')
-        .and_then(|f| f.rsplit_once(&format!(".{kind}-")))
-        .is_some_and(|(name, n)| check_name(name).is_ok() && n.len() == 16 && n.bytes().all(|b| b.is_ascii_hexdigit()))
+    file.strip_prefix('.').and_then(|f| f.rsplit_once(&format!(".{kind}-"))).is_some_and(|(name, n)| check_name(name).is_ok() && crate::util::is_nonce(n))
 }
 
 /// A build's `.{name}.new-{nonce}`, flocked through `lock` inside it while the build runs, and
@@ -646,7 +637,7 @@ impl Staging {
         std::fs::create_dir_all(&paths.templates)?;
         sweep(paths)?;
         let _l = templates_lock(paths, libc::LOCK_SH)?;
-        let dir = paths.templates.join(format!(".{name}.new-{}", nonce()?));
+        let dir = paths.templates.join(format!(".{name}.new-{}", crate::util::nonce()?));
         std::fs::create_dir(&dir)?;
         let lock = File::create(dir.join("lock"))?;
         crate::host::flock(&lock, libc::LOCK_EX)?;
@@ -721,7 +712,7 @@ fn publish(paths: &Paths, name: &str, staged: &Path) -> Result<()> {
         r => r?,
     }
     let live = paths.templates.join(name);
-    let tmp = paths.templates.join(format!(".{name}.link-{}", nonce()?));
+    let tmp = paths.templates.join(format!(".{name}.link-{}", crate::util::nonce()?));
     std::os::unix::fs::symlink(Path::new(GENERATIONS).join(&meta.id), &tmp)?;
     crate::util::sync_dir(&gens)?;
     std::fs::rename(&tmp, &live)?;

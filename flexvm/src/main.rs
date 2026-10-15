@@ -683,6 +683,20 @@ fn build_template(args: &Args, name: &str) -> Result<()> {
     // Firecracker wants 1 or an even count of vCPUs, at most 32.
     let cpus = (util::host_cpus() as u64).min(32);
     let cpus = if cpus > 1 { cpus & !1 } else { 1 };
+    // Interrupted, the build stops at its next step and removes its tap and staging (gigabytes:
+    // an image's unpacked tree and rootfs too); a second signal ends flexvm at once, and the next
+    // build removes the staging. Blocked before the image's download threads start.
+    let set = util::block_signals(&[libc::SIGINT, libc::SIGTERM, libc::SIGHUP]);
+    std::thread::spawn(move || {
+        let sig = util::wait_signal(&set);
+        log!("flexvm: stopping the template build; it cleans up first");
+        template::interrupt(sig);
+        // Kept alive to take the next one, now with its default action.
+        unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut()) };
+        loop {
+            std::thread::park();
+        }
+    });
     let mut paths = paths(args)?;
     let image = image_options(args)?
         .map(|opts| {
@@ -701,19 +715,6 @@ fn build_template(args: &Args, name: &str) -> Result<()> {
     let me = host::Ident::me();
     // Unlocked, as these are this host's taps of dead processes (by their alias).
     host::clear_taps(&host.run, &me);
-    // Interrupted, the build stops at its next step and removes its tap and staging (gigabytes);
-    // a second signal ends flexvm at once, and the next build removes the staging.
-    let set = util::block_signals(&[libc::SIGINT, libc::SIGTERM, libc::SIGHUP]);
-    std::thread::spawn(move || {
-        let sig = util::wait_signal(&set);
-        log!("flexvm: stopping the template build; it cleans up first");
-        template::interrupt(sig);
-        // Kept alive to take the next one, now with its default action.
-        unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut()) };
-        loop {
-            std::thread::park();
-        }
-    });
     let tap = {
         let _l = host.lock()?;
         let tap = template::tap(&host.tap_prefix()?);
