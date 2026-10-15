@@ -12,10 +12,14 @@
 //!                                      it first: the fault handler copies it
 //!                                      out and only then unprotects it
 //!   RESCUED  -> CLEAN                 a writer takes the copy
+//!   HELD     -> CLEAN                 a hot page, copied during the pause
+//!                                      and left unprotected (`Cow::hold`,
+//!                                      see `uffd::hot`): a writer takes the
+//!                                      copy
 //!
 //! Writers never unprotect anything: pages stay protected after the copy, so
 //! the next write to each marks it dirty for an incremental checkpoint (see
-//! `Pager::freeze`). A write fault on a page being READ parks until the
+//! `Pager::freeze`). HELD pages are unprotected, and dirty from the pause on. A write fault on a page being READ parks until the
 //! reader has saved it, which wakes the event thread (`wait_for`).
 //!
 //! Rescued copies are kept in memory up to a budget; past it (once the writers
@@ -32,13 +36,13 @@
 use std::collections::{HashMap, VecDeque};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
 use crate::checkpoint::GuestPages;
-use crate::uffd::{zeroed_atomics, Runs, REMOTE};
+use crate::uffd::{zeroed_atomics, Held, Runs, REMOTE};
 use crate::util::{Result, PAGE_SIZE};
 
 pub const CLEAN: u8 = 0;
@@ -46,6 +50,7 @@ pub const PENDING: u8 = 1;
 pub const READING: u8 = 2;
 pub const RESCUING: u8 = 3;
 pub const RESCUED: u8 = 4;
+pub const HELD: u8 = 5;
 
 /// Rescued copies kept in memory before faults wait for the writers.
 const BUDGET_MIB: usize = 256;
@@ -78,6 +83,8 @@ pub struct Cow {
     left: AtomicUsize,
     rescued: Mutex<HashMap<usize, Box<[u8]>>>,
     rescued_bytes: AtomicUsize,
+    /// Pages copied during the pause (HELD).
+    held: OnceLock<Arc<Held>>,
     budget: usize,
     /// Pages faults are waiting on, for the writers to take first.
     wanted: Mutex<VecDeque<usize>>,
@@ -111,6 +118,7 @@ impl Cow {
             left: AtomicUsize::new(runs.iter().map(|(a, b)| b - a).sum()),
             rescued: Mutex::new(HashMap::new()),
             rescued_bytes: AtomicUsize::new(0),
+            held: OnceLock::new(),
             budget,
             wanted: Mutex::new(VecDeque::new()),
             progress: (Mutex::new(0), Condvar::new()),
@@ -241,6 +249,13 @@ impl Cow {
         self.saved(page, page + 1, 1);
     }
 
+    /// The pause-time contents of pages to save, copied during the pause: the writers take them from there. (Once.)
+    pub fn hold(&self, held: Arc<Held>) {
+        let n = held.pages().iter().filter(|&&p| self.claim(p, PENDING, HELD)).count();
+        self.left.fetch_sub(n, Ordering::SeqCst);
+        let _ = self.held.set(held);
+    }
+
     /// Gives back a claim the fault handler could not complete.
     pub fn unclaim(&self, page: usize) {
         self.set(page, PENDING);
@@ -359,9 +374,15 @@ impl GuestPages for CowPages<'_> {
         }
         (0..n).filter(|&k| mine[k]).for_each(|k| cow.set(page + k, CLEAN));
         cow.saved(page, page + n, mine.iter().filter(|&&m| m).count());
-        // The rest a fault saved first (or is saving right now).
+        // The rest were copied during the pause, or a fault saved them first (or is saving them right now).
         for k in (0..n).filter(|&k| !mine[k]) {
             let p = page + k;
+            if cow.state(p) == HELD {
+                let Some(bytes) = cow.held.get().and_then(|h| h.get(p)) else { crate::bail!("page {p}: held copy missing") };
+                buf[k * PAGE_SIZE..(k + 1) * PAGE_SIZE].copy_from_slice(bytes);
+                cow.set(p, CLEAN);
+                continue;
+            }
             loop {
                 match cow.state(p) {
                     RESCUED => break,
@@ -578,6 +599,29 @@ mod tests {
         fn read(&self, _page: usize, _buf: &mut [u8]) -> Result<()> {
             crate::bail!("unreadable")
         }
+    }
+
+    /// Pages copied during the pause (HELD) are written from that copy, whatever the guest writes since; no fault or
+    /// writer claims them, and the copy has that many fewer left.
+    #[test]
+    fn held_pages_are_written_from_their_copy() {
+        let n = 16;
+        let live = Live { pages: StdMutex::new(vec![0xee; n * PAGE_SIZE]) };
+        let cow = Cow::new(n, &vec![(0, 8, REMOTE)]);
+        // Page 9 is held but not to save (left out of a delta): it stays as it was.
+        cow.hold(Arc::new(Held::of(&[(2, 2), (3, 3), (9, 9)])));
+        assert_eq!(cow.left(), 6);
+        assert_eq!((cow.state(2), cow.state(9)), (HELD, CLEAN));
+        assert!(!cow.claim(2, PENDING, RESCUING) && !cow.claim(3, PENDING, READING));
+        let pages = CowPages { guest: &live, cow: &cow, slow: || Duration::ZERO };
+        let mut buf = vec![0u8; 8 * PAGE_SIZE];
+        pages.read(0, &mut buf).unwrap();
+        for (i, p) in buf.chunks(PAGE_SIZE).enumerate() {
+            let want = if i == 2 || i == 3 { i as u8 } else { 0xee };
+            assert!(p.iter().all(|&b| b == want), "page {i}");
+        }
+        assert_eq!(cow.left(), 0);
+        assert_eq!(cow.state(2), CLEAN);
     }
 
     #[test]

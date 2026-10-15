@@ -2551,10 +2551,23 @@ def cow_exact():
     ok(restore(B, path, name="ft-cow2", ip="auto"))
     errors, _, out = writer_check(B, "ft-cow2")
     check("cow: the restored copy has exactly the pause-time memory", errors == 0, out)
+    cleanup("ft-cow2")
+    # Again, with write tracking on since the first: the writer rewrites more than a pause copies (#235), so its pages
+    # are all protected and copied on write, as before (`ckpt_hot` checks hot pages).
+    path2 = ckpt_path("ft-cow-again")
+    r = ok(checkpoint(A, n, path2))
+    print(f"cow again: paused {r['paused_ms']} ms, hot {r['hot']}, copy {r['copy']}")
+    check("cow again: too many hot pages to copy during the pause", r["hot"]["copied_mib"] == 0 and r["copy"]["rescues"] > 0, r)
+    h = ckhash(A, path2)
+    check("cow again: checkpoint == memory at the pause", h["hash"] == r["pause_memhash"], (h["hash"], r["pause_memhash"]))
+    ok(restore(B, path2, name="ft-cow3", ip="auto"))
+    errors, _, out = writer_check(B, "ft-cow3")
+    check("cow again: the restored copy has exactly the pause-time memory", errors == 0, out)
     fault(A, "ckpt_memhash", 0)
     cleanup(n)
-    cleanup("ft-cow2")
+    cleanup("ft-cow3")
     rm_ckpt(path)
+    rm_ckpt(path2)
 
 
 def huge_mib(host, name):
@@ -2886,6 +2899,52 @@ def cow_crash():
     cleanup(n)
     cleanup(n + "2")
     rm_ckpt(path)
+
+
+def ckpt_hot():
+    """#235: a keep-running checkpoint copies the pages the guest keeps writing
+    (hot pages) during the pause and leaves them unprotected; the next one
+    leaves out of its delta those whose contents did not change since. A chain
+    of deltas of a guest that rewrites memory, some of it back to what it had
+    at the last checkpoint: each link restores exactly its pause-time memory,
+    across a failed checkpoint (which drops what the next compares with)."""
+    n = "ft-hot"
+    paths = [ckpt_path(f"ft-hot{i}") for i in range(6)]
+    ok(run(A, n))
+    start_writer(A, n, mib=8)
+    # 1024 pages rewritten all the time, alternately all with one byte and the other.
+    flip = "import time\nb = bytearray(4 << 20)\nk = 0\nwhile True:\n    b[:] = bytes([k % 2]) * len(b)\n    k += 1\n    time.sleep(0.05)\n"
+    code, out = sh(A, n, f"printf '{flip.replace('%', '%%')}' > /tmp/flip.py && (setsid python3 /tmp/flip.py >/dev/null 2>&1 </dev/null &) && sleep 0.5 && pgrep -f flip.py")
+    check("hot: flipper started", code == 0 and out.strip(), out)
+    fault(A, "ckpt_memhash", 120000)
+    res = []
+    for i, p in enumerate(paths):
+        if i == 3:
+            failed = ckpt_path("ft-hot-failed")
+            fault(A, "ckpt_fail_write", 60000)
+            r = checkpoint(A, n, failed, incremental=True)
+            fault(A, "ckpt_fail_write", 0)
+            check("hot: the injected failure fails a checkpoint", not r["ok"], r)
+            time.sleep(0.3)
+        r = ok(checkpoint(A, n, p, incremental=i > 0))
+        res.append(r)
+        print(f"hot {i}: paused {r['paused_ms']} ms, {r['data_mib']} MiB data, dirty {r['dirty_mib']} MiB, hot {r['hot']}, "
+              f"{r['copy']['faults']} faults", flush=True)
+        time.sleep(0.3)
+    fault(A, "ckpt_memhash", 0)
+    hot = [r["hot"] for r in res]
+    check("hot: checkpoints after the first two copy hot pages during the pause", all(h["mib"] > 0 for h in hot[2:]), hot)
+    check("hot: unchanged hot pages are left out of deltas", any(h["unchanged_mib"] > 0 for h in hot[2:]), hot)
+    for i, p in enumerate(paths):
+        h = ckhash(A, p)
+        check(f"hot: link {i} == memory at its pause", h["hash"] == res[i]["pause_memhash"] and len(h["chain"]) == i, h)
+    ok(restore(B, paths[-1], name="ft-hot2", ip="auto"))
+    errors, _, out = writer_check(B, "ft-hot2")
+    check("hot: the restored last link is intact", errors == 0, out)
+    errors, _, out = writer_check(A, n)
+    check("hot: the original is intact", errors == 0, out)
+    cleanup(n)
+    cleanup("ft-hot2")
 
 
 def ckpt_incremental():
@@ -5758,7 +5817,7 @@ SCENARIOS = dict(
     checkpoint_crash=checkpoint_crash, pause_resume=pause_resume, signals=signals, pause_lost=pause_lost, suspend_resume=suspend_resume,
     suspend_gen=suspend_gen, checkpoint_hotplug=checkpoint_hotplug, checkpoint_untrusted_dir=checkpoint_untrusted_dir,
     resume_failures=resume_failures, held_restore_frozen=held_restore_frozen, cow_exact=cow_exact, cow_collapsed=skippable(cow_collapsed), unplug_collapsed=no_evict(skippable(unplug_collapsed)), cow_abort=cow_abort,
-    cow_crash=cow_crash, cow_reports_held=cow_reports_held, ckpt_incremental=ckpt_incremental,
+    cow_crash=cow_crash, cow_reports_held=cow_reports_held, ckpt_incremental=ckpt_incremental, ckpt_hot=ckpt_hot,
     ckpt_failed_stop=ckpt_failed_stop, ckpt_rearm=ckpt_rearm, ckpt_dir_moved=ckpt_dir_moved,
     prepare_disconnect=prepare_disconnect, prepare_trickle=prepare_trickle, prepare_fail=prepare_fail,
     fc_prepare=fc_prepare, slow_preload=slow_preload, bad_preload=bad_preload, ckpt_packet_hold=ckpt_packet_hold, ckpt_stall=ckpt_stall, standby=standby,

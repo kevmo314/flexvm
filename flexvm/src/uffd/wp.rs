@@ -1,11 +1,12 @@
 use super::event::{Served, WP};
+use super::hot::Held;
 use super::{Mapping, Pager, Runs, ALL, ARM_CHUNK, BASE, PREFETCH_RUN, PRESENT};
 use crate::bail;
 use crate::cow::{Cow, PENDING, READING, RESCUING};
 use crate::util::{Result, PAGE_SIZE};
 use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -57,6 +58,14 @@ pub struct Frozen {
     taken: Vec<u64>,
     pub protected: usize,
     pub protect: Duration,
+    /// The hot pages copied during the pause (see `hot`), how many of them stay unprotected, how many were unchanged
+    /// since the last checkpoint, and how long that took.
+    pub held: Option<Arc<Held>>,
+    pub hot: usize,
+    pub hot_time: Duration,
+    pub hot_unchanged: usize,
+    /// The last checkpoint's hot pages, whose memory the next one takes once this one ends (`Pager::recycle`).
+    prev: Mutex<Option<Arc<Held>>>,
 }
 
 impl Pager {
@@ -168,8 +177,12 @@ impl Pager {
             true => {
                 let chunk = from + at - at % WP_CHUNK;
                 let dirty = &self.pages().dirty;
-                let n =
-                    (chunk..(chunk + WP_CHUNK).min(to)).filter(|&p| dirty.get(p / 64).is_some_and(|w| w.load(Ordering::Relaxed) >> (p % 64) & 1 != 0)).count();
+                // Hot pages kept unprotected are dirty from the pause on whether written or not.
+                let kept = self.hot_kept.lock().unwrap();
+                let n = (chunk..(chunk + WP_CHUNK).min(to))
+                    .filter(|&p| dirty.get(p / 64).is_some_and(|w| w.load(Ordering::Relaxed) >> (p % 64) & 1 != 0))
+                    .filter(|&p| kept.get(p / 64).is_none_or(|w| w >> (p % 64) & 1 == 0))
+                    .count();
                 let before = self.wp_hot.lock().unwrap().get(chunk / WP_CHUNK).map_or(0, |&n| n as usize);
                 let start = WP_SIZES.into_iter().rev().find(|&s| s <= before / 2).unwrap_or(WP_BLOCK);
                 WP_SIZES.into_iter().find(|&s| s > 2 * n).unwrap_or(WP_CHUNK).max(start)
@@ -219,7 +232,12 @@ impl Pager {
     /// Reads consecutive guest pages from `page` out of Firecracker, a page into each buffer of `pages`.
     fn read_pages(&self, page: usize, pages: &mut [Box<[u8]>]) -> io::Result<()> {
         let local: Vec<libc::iovec> = pages.iter_mut().map(|b| libc::iovec { iov_base: b.as_mut_ptr().cast(), iov_len: PAGE_SIZE }).collect();
-        let len = pages.len() * PAGE_SIZE;
+        self.read_into(page, &local)
+    }
+
+    /// Reads consecutive guest pages from `page` out of Firecracker into the buffers `local`, as many as they hold.
+    pub(super) fn read_into(&self, page: usize, local: &[libc::iovec]) -> io::Result<()> {
+        let len: usize = local.iter().map(|v| v.iov_len).sum();
         let remote = libc::iovec { iov_base: self.addr(page)? as *mut _, iov_len: len };
         let pid = self.pid.load(Ordering::SeqCst) as libc::pid_t;
         if unsafe { libc::process_vm_readv(pid, local.as_ptr(), local.len() as _, &remote, 1, 0) } != len as isize {
@@ -321,6 +339,10 @@ impl Pager {
             self.pages().dirty_bits(true);
             self.tracking.store(true, Ordering::SeqCst);
         }
+        // No delta base now, nor hot pages.
+        *self.hot_prev.lock().unwrap() = None;
+        self.hot_dirty.lock().unwrap().clear();
+        self.hot_kept.lock().unwrap().clear();
         // In chunks: while the kernel changes a range, KVM retries guest faults anywhere in it, so one call over a
         // whole region would stall the vCPUs for as long as it takes.
         self.protect(self.chunks(ALL, ARM_CHUNK), None)?;
@@ -369,6 +391,10 @@ impl Pager {
     /// with `cow` arms copy-on-write for them so the VM can run on: whatever was unprotected since the last pause is
     /// write-protected again first.
     pub fn freeze(&self, runs: &Runs, incremental: bool, cow: bool) -> Result<Frozen> {
+        // Hot pages (see `hot`), copied first, outside the fault lock.
+        let start = Instant::now();
+        let mut hot = if cow && self.tracking() { self.copy_hot() } else { None };
+        let hot_time = start.elapsed();
         let _wp = self.wp.lock().unwrap();
         if (cow || incremental) && !self.tracking() {
             bail!("write tracking is off");
@@ -384,6 +410,12 @@ impl Pager {
                 std::iter::successors((bits != 0).then_some(bits), |b| Some(b & (b - 1)).filter(|&b| b != 0)).map(move |b| w * 64 + b.trailing_zeros() as usize)
             })
         };
+        // Hot pages stay unprotected unless their block did not change since the last checkpoint.
+        let prev = hot.as_mut().and_then(|h| h.prev.take());
+        let hot_unchanged = hot.as_ref().map_or(0, |h| h.unchanged.len());
+        let keeps = |p: usize| hot.as_ref().is_some_and(|h| h.keeps(p));
+        // Only populated ones: a page discarded since must be in a delta, as zero.
+        let unchanged = |p: usize| hot.as_ref().is_some_and(|h| h.unchanged(p)) && pages.get(p) == PRESENT;
         let start = Instant::now();
         let mut protected = 0;
         // Everything populated was protected at the last pause (or when tracking began); since then only dirty pages
@@ -391,16 +423,17 @@ impl Pager {
         for m in self.mappings().iter().filter(|_| cow) {
             let (from, to) = m.span();
             let mut ranges: Vec<(usize, usize)> = Vec::new();
-            for p in dirty_pages().filter(|&p| p >= from && p < to && pages.get(p) == PRESENT) {
+            for p in dirty_pages().filter(|&p| p >= from && p < to && pages.get(p) == PRESENT && !keeps(p)) {
                 match ranges.last_mut() {
-                    Some((_, e)) if p <= *e + PROTECT_GAP => *e = p + 1,
+                    Some((_, e)) if p <= *e + PROTECT_GAP && !(*e..p).any(keeps) => *e = p + 1,
                     _ => ranges.push((p, p + 1)),
                 }
             }
             // Range by range, so that the pause grows with what was written rather than with what is populated; unless
             // the calls would cost more than walking every populated page of the region once (the writes covered most
             // of it).
-            if ranges.len() > PROTECT_RUNS && ranges.len() * PROTECT_GAP > pages.count(PRESENT, from, to) {
+            let kept = hot.as_ref().is_some_and(|h| h.held.pages().iter().any(|&p| p >= from && p < to && h.keeps(p)));
+            if ranges.len() > PROTECT_RUNS && ranges.len() * PROTECT_GAP > pages.count(PRESENT, from, to) && !kept {
                 ranges = vec![(from, to)];
             }
             protected += self.protect(ranges, Some(&dirty))?;
@@ -409,9 +442,9 @@ impl Pager {
         let out = match incremental {
             false => runs.clone(),
             true => {
-                // Pages not dirty keep what the previous checkpoint has.
+                // Pages not dirty keep what the previous checkpoint has, and so do hot pages unchanged since.
                 let mut out: Runs = Vec::new();
-                for p in dirty_pages().take_while(|&p| p < pages.len()) {
+                for p in dirty_pages().take_while(|&p| p < pages.len()).filter(|&p| !unchanged(p)) {
                     let r = runs.partition_point(|r| r.0 <= p as u64);
                     let st = match r.checked_sub(1).map(|r| runs[r]) {
                         Some((f, n, s)) if (p as u64) < f + n => s,
@@ -426,18 +459,33 @@ impl Pager {
             }
         };
         if cow {
-            let mut hot = vec![0u16; pages.len().div_ceil(WP_CHUNK)];
-            dirty_pages().for_each(|p| hot.get_mut(p / WP_CHUNK).into_iter().for_each(|h| *h += 1));
-            *self.wp_hot.lock().unwrap() = hot;
+            let mut chunks = vec![0u16; pages.len().div_ceil(WP_CHUNK)];
+            dirty_pages().filter(|&p| !keeps(p)).for_each(|p| chunks.get_mut(p / WP_CHUNK).into_iter().for_each(|h| *h += 1));
+            *self.wp_hot.lock().unwrap() = chunks;
+            let mut kept = vec![0u64; dirty.len()];
+            hot.iter().flat_map(|h| h.held.pages().iter().filter(|&&p| h.keeps(p))).for_each(|&p| kept[p / 64] |= 1 << (p % 64));
+            *self.hot_kept.lock().unwrap() = kept;
+            *self.hot_dirty.lock().unwrap() = dirty.clone();
         }
-        let cow = cow.then(|| Arc::new(Cow::new(pages.len(), &out)));
+        let cow = cow.then(|| {
+            let c = Cow::new(pages.len(), &out);
+            hot.iter().for_each(|h| c.hold(h.held.clone()));
+            Arc::new(c)
+        });
+        // Unprotected, so dirty from the pause on.
+        let held = hot.as_ref().map(|h| {
+            let kept: Vec<usize> = h.held.pages().iter().copied().filter(|&p| h.keeps(p)).collect();
+            kept.iter().for_each(|&p| pages.mark_dirty(p));
+            (kept.len(), h.held.clone())
+        });
         // Faults that wait for the writers are retried as soon as they save pages.
         if let (Some(c), Some(fd)) = (&cow, pages.wake.get().and_then(|fd| fd.try_clone().ok())) {
             c.set_waker(fd);
         }
         *self.cow.lock().unwrap() = cow.clone();
         let taken = if cow.is_some() { dirty } else { Vec::new() };
-        Ok(Frozen { runs: out, cow, dirty: ndirty, taken, protected, protect })
+        let (hot, held) = held.map_or((0, None), |(n, h)| (n, Some(h)));
+        Ok(Frozen { runs: out, cow, dirty: ndirty, taken, protected, protect, held, hot, hot_time, hot_unchanged, prev: Mutex::new(prev) })
     }
 
     /// Undoes `freeze` for a checkpoint that failed: stops its copy and marks dirty again what it took, so the previous
@@ -445,8 +493,17 @@ impl Pager {
     /// marks them dirty, so nothing is lost either way.
     pub fn unfreeze(&self, frozen: &Frozen) {
         self.end_copy();
+        self.recycle(frozen.prev.lock().unwrap().take());
         let _wp = self.wp.lock().unwrap();
         self.pages().restore_dirty(&frozen.taken);
+    }
+
+    /// Ends the copy of a checkpoint that was taken: it is the delta base now, so its hot pages are what the next one
+    /// compares its own with.
+    pub fn commit_copy(&self, frozen: &Frozen) {
+        self.end_copy();
+        *self.hot_prev.lock().unwrap() = frozen.held.clone();
+        self.recycle(frozen.prev.lock().unwrap().take());
     }
 
     /// Ends a checkpoint copy, finished or not. Pages stay protected for tracking.

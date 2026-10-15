@@ -48,6 +48,7 @@ use crate::util::{Result, PAGE_SIZE};
 mod collapse;
 mod event;
 mod fetch;
+mod hot;
 mod pages;
 mod pull;
 mod server;
@@ -58,6 +59,7 @@ mod wp;
 pub use event::FaultStats;
 pub use fetch::{probe, PageClient};
 use fetch::{Lane, Link};
+pub use hot::Held;
 pub(crate) use pages::zeroed_atomics;
 pub use pages::{Pages, BASE, DISCARDED, INFLIGHT, PRESENT, REMOTE, ZERO};
 pub use server::serve_pages;
@@ -233,6 +235,13 @@ pub struct Pager {
     pagemap: OnceLock<std::fs::File>,
     /// Pages dirtied per 2 MiB chunk in the interval before the last checkpoint's pause (`Pager::wp_block`).
     wp_hot: Mutex<Vec<u16>>,
+    /// Memory for the next checkpoint's hot pages, and the hot pages of the last one, while it is the delta base (see
+    /// `hot`).
+    hot_spare: Mutex<Option<hot::Buf>>,
+    hot_prev: Mutex<Option<Arc<Held>>>,
+    /// The dirty bits of the interval before the last pause, and the hot pages it left unprotected (bitmaps).
+    hot_dirty: Mutex<Vec<u64>>,
+    hot_kept: Mutex<Vec<u64>>,
     /// Test fault: the next freeze fails to re-protect pages.
     pub fail_protect: AtomicBool,
     /// Test fault: write faults during a copy dawdle before claiming pages.
@@ -302,6 +311,10 @@ impl Pager {
             wp: Mutex::new(()),
             pagemap: OnceLock::new(),
             wp_hot: Mutex::new(Vec::new()),
+            hot_spare: Mutex::new(None),
+            hot_prev: Mutex::new(None),
+            hot_dirty: Mutex::new(Vec::new()),
+            hot_kept: Mutex::new(Vec::new()),
             fail_protect: AtomicBool::new(false),
             wp_race: AtomicBool::new(false),
             tail_fail: AtomicU32::new(0),

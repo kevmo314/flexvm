@@ -554,6 +554,8 @@ impl Proc {
             }
             vm.pager.arm_tracking()?;
             t.mark("arm_tracking");
+            vm.pager.prepare_hot();
+            t.mark("prepare_hot");
         }
         let plugged = vm.hotplug_plugged();
         cancelled()?;
@@ -693,7 +695,7 @@ impl Proc {
         }
         let copy = frozen.cow.as_ref().map(|c| c.report());
         match &committed {
-            Ok(_) => vm.pager.end_copy(),
+            Ok(_) => vm.pager.commit_copy(&frozen),
             Err(_) => vm.pager.unfreeze(&frozen),
         }
         self.publish();
@@ -709,6 +711,10 @@ impl Proc {
                         "balloon_rearm_ms": hold.rearm.map(ms),
                         "dirty_mib": (frozen.dirty * PAGE_SIZE) >> 20,
                         "protect": {"ranges": frozen.protected, "ms": ms(frozen.protect)},
+                        "hot": {"mib": (frozen.hot * PAGE_SIZE) as f64 / (1 << 20) as f64,
+                                "copied_mib": (frozen.held.as_ref().map_or(0, |h| h.pages().len()) * PAGE_SIZE) as f64 / (1 << 20) as f64,
+                                "unchanged_mib": (frozen.hot_unchanged * PAGE_SIZE) as f64 / (1 << 20) as f64,
+                                "ms": ms(frozen.hot_time)},
                         "copy": copy,
                         "pause_memhash": memhash,
                         "held_packets": hold.stats.map(|s| s.json()),
