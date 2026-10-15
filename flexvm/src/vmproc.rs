@@ -959,9 +959,13 @@ impl Proc {
     }
 
     fn controller(self: Arc<Self>) {
-        let (mut published, mut growth) = (false, Growth::default());
+        let (mut published, mut growth, mut stopping) = (false, Growth::default(), None::<Stopping>);
         loop {
             thread::sleep(Duration::from_secs(1));
+            // Standby VMs signalled last tick had that sleep: other processes may stop them now, however long this tick blocks.
+            if let Some(s) = &mut stopping {
+                s.lock = None;
+            }
             self.ticks.lock().unwrap().tick();
             let vm = self.vm();
             if !vm.firecracker_alive() || vm.pager.failed().is_some() {
@@ -987,7 +991,7 @@ impl Proc {
                 published = vm.starving();
                 self.publish();
             }
-            relieve(&self.host, host_available_mib(), vm.starving());
+            relieve(&self.host, host_available_mib(), vm.starving(), &mut stopping);
         }
     }
 
@@ -1525,12 +1529,17 @@ static EVICTING: AtomicBool = AtomicBool::new(false);
 /// `evict_until` (`RUN/evict.active` while it lasts). A starved VM is moved
 /// whenever it asks, pressure or not. Nothing is done when MemAvailable
 /// cannot be read (`avail` None): that is no pressure.
-fn relieve(host: &Host, avail: Option<u64>, starved_here: bool) {
-    let Some(avail) = avail else { return };
+fn relieve(host: &Host, avail: Option<u64>, starved_here: bool, stopping: &mut Option<Stopping>) {
+    let Some(avail) = avail else {
+        *stopping = None;
+        return;
+    };
     let cfg = host.config_now();
     let (reserve, at, until) = (cfg.reserve_mib, cfg.evict_at(), cfg.evict_until());
     // Standby VMs go under the reserve whatever eviction is doing (a slow migration holds its lock).
-    if avail < reserve && stop_standby(host, avail, reserve) {
+    if avail >= reserve {
+        *stopping = None;
+    } else if stop_standby(host, avail, reserve, stopping) {
         return;
     }
     let active = host.run.join("evict.active");
@@ -1587,24 +1596,42 @@ fn relieve(host: &Host, avail: Option<u64>, starved_here: bool) {
     });
 }
 
+/// Standby VMs a controller signalled, settled on its later ticks, never
+/// waited for. `STATE/standby.stop.lock` is held only until its next tick starts.
+struct Stopping {
+    lock: Option<std::fs::File>,
+    fds: Vec<crate::host::PidFd>,
+    by: Instant,
+}
+
 /// Under the reserve: SIGUSR1s the standby VMs, under `STATE/standby.stop.lock`
-/// (not eviction's lock, which a migration may hold for a while). True if
-/// any exited within a second (an idle one takes ~200 ms), or another process
-/// is stopping them (it evicts if none exits). Loading or claimed VMs must not hold eviction off.
-fn stop_standby(host: &Host, avail: u64, reserve: u64) -> bool {
+/// (not eviction's lock, which a migration may hold for a while), and marks
+/// the pressure so they are not refilled. True until any exits (an idle one
+/// takes ~200 ms) or a second passes, and while another process is stopping
+/// them (it evicts if none exits). Loading or claimed VMs must not hold eviction off.
+fn stop_standby(host: &Host, avail: u64, reserve: u64, stopping: &mut Option<Stopping>) -> bool {
+    if let Some(s) = stopping {
+        let stopped = s.fds.iter().filter(|fd| fd.wait(Duration::ZERO)).count();
+        if stopped == 0 && Instant::now() < s.by {
+            return true;
+        }
+        *stopping = None;
+        if stopped > 0 {
+            eprintln!("host has {avail} MiB available, under its {reserve} MiB reserve: stopped {stopped} standby vms");
+        }
+        return stopped > 0;
+    }
     let Ok(lock) = std::fs::File::options().create(true).truncate(false).write(true).open(host.state.join("standby.stop.lock")) else { return false };
     if crate::host::flock(&lock, libc::LOCK_EX | libc::LOCK_NB).is_err() {
         return true;
     }
-    let standby: Vec<_> = crate::standby::templates(host).iter().flat_map(|t| crate::standby::stoppable(host, t)).collect();
-    let signalled: Vec<_> = standby.iter().filter_map(|id| crate::host::PidFd::open(id).ok().flatten()).filter(|fd| fd.signal(libc::SIGUSR1).is_ok()).collect();
-    let until = Instant::now() + Duration::from_secs(1);
-    let stopped = signalled.iter().filter(|fd| fd.wait(until.saturating_duration_since(Instant::now()))).count();
-    if stopped == 0 {
+    let fds: Vec<_> =
+        crate::standby::templates(host).iter().flat_map(|t| crate::standby::stoppable(host, t)).filter_map(|id| crate::standby::stop(&id)).collect();
+    if fds.is_empty() {
         return false;
     }
     let _ = std::fs::write(crate::standby::pressure(host), b"");
-    eprintln!("host has {avail} MiB available, under its {reserve} MiB reserve: stopped {stopped} standby vms");
+    *stopping = Some(Stopping { lock: Some(lock), fds, by: Instant::now() + Duration::from_secs(1) });
     true
 }
 
@@ -1746,29 +1773,30 @@ mod tests {
         let d = host.run.join("standby").join("t");
         std::fs::create_dir_all(&d).unwrap();
         let id = Ident::of(child.id()).unwrap();
-        let path = d.join(format!("{}-{}.lock", id.pid, id.start));
+        let path = d.join(format!("{}.lock", id.key()));
         let lock = std::fs::File::create(&path).unwrap();
         assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
         std::fs::write(&path, serde_json::to_vec(&id).unwrap()).unwrap();
         assert_eq!(crate::standby::live(&host, "t").len(), 1);
         let (pressure, active) = (crate::standby::pressure(&host), host.run.join("evict.active"));
+        let mut stopping = None;
         for starved in [false, true] {
-            relieve(&host, None, starved);
+            relieve(&host, None, starved, &mut stopping);
             assert!(!pressure.exists() && !active.exists());
             assert!(child.try_wait().unwrap().is_none(), "a standby was stopped");
         }
         // Mid-claim (`PID-START.claim` locked): not counted as stopped, so eviction starts.
         let id = Ident::of(child.id()).unwrap();
-        let claim = std::fs::File::create(d.join(format!("{}-{}.claim", id.pid, id.start))).unwrap();
+        let claim = std::fs::File::create(d.join(format!("{}.claim", id.key()))).unwrap();
         assert_eq!(unsafe { libc::flock(claim.as_raw_fd(), libc::LOCK_EX) }, 0);
-        relieve(&host, Some(0), false);
+        relieve(&host, Some(0), false, &mut stopping);
         assert!(!pressure.exists() && active.exists());
         assert!(child.try_wait().unwrap().is_none(), "a claiming standby was stopped");
         std::fs::remove_file(&active).unwrap();
         // A claim rolled back makes the standby stoppable again.
         assert_eq!(unsafe { libc::flock(claim.as_raw_fd(), libc::LOCK_UN) }, 0);
         drop(claim);
-        relieve(&host, Some(0), false);
+        relieve(&host, Some(0), false, &mut stopping);
         use std::os::unix::process::ExitStatusExt;
         let stopped = crate::util::retry(Duration::from_secs(10), Duration::from_millis(10), || Ok(child.try_wait()?.ok_or("running")?));
         let _ = child.kill();
@@ -1777,13 +1805,16 @@ mod tests {
         // Unlocked, not only closed: a child another test forks meanwhile shares the lock until it execs.
         assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
         drop(lock);
-        relieve(&host, Some(0), false);
+        // Its exit is counted at the next tick, which leaves eviction to the one after.
+        relieve(&host, Some(0), false, &mut stopping);
+        assert!(!active.exists() && stopping.is_none());
+        relieve(&host, Some(0), false, &mut stopping);
         assert!(active.exists(), "with no standby left, eviction starts");
         let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
-    fn a_standby_that_has_not_exited_does_not_delay_eviction() {
+    fn a_standby_that_has_not_exited_marks_the_pressure_and_holds_eviction_off_a_second_without_waiting() {
         use std::os::fd::AsRawFd;
         let base = std::env::temp_dir().join(format!("flexvm-relieve-pending-{}", std::process::id()));
         let host = Host::open(&base.join("state"), &base.join("run")).unwrap();
@@ -1798,19 +1829,26 @@ mod tests {
         let id = Ident::of(child.id()).unwrap();
         let d = host.run.join("standby/t");
         std::fs::create_dir_all(&d).unwrap();
-        let path = d.join(format!("{}-{}.lock", id.pid, id.start));
+        let path = d.join(format!("{}.lock", id.key()));
         let lock = std::fs::File::create(&path).unwrap();
         assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
         std::fs::write(&path, serde_json::to_vec(&id).unwrap()).unwrap();
-        // Loading, or claimed since enumeration: a delivered signal proves neither stopped.
-        relieve(&host, Some(0), false);
-        let pressure = crate::standby::pressure(&host).exists();
-        let evicting = host.run.join("evict.active").exists();
+        // Loading, or claimed since enumeration: a delivered signal proves neither stopped,
+        // but it will stop, so it is not refilled meanwhile.
+        let (mut stopping, active) = (None, host.run.join("evict.active"));
+        let start = Instant::now();
+        relieve(&host, Some(0), false, &mut stopping);
+        relieve(&host, Some(0), false, &mut stopping);
+        let (took, pressure, held) = (start.elapsed(), crate::standby::pressure(&host).exists(), active.exists());
+        thread::sleep(Duration::from_secs(1));
+        relieve(&host, Some(0), false, &mut stopping);
+        let evicting = active.exists();
         let running = child.try_wait().unwrap().is_none();
         let _ = child.kill();
         let _ = child.wait();
         std::fs::remove_dir_all(base).unwrap();
-        assert!(!pressure && evicting && running);
+        assert!(took < Duration::from_millis(500), "{took:?}");
+        assert!(pressure && !held && evicting && running && stopping.is_none());
     }
 
     #[test]

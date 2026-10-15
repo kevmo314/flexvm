@@ -8,7 +8,7 @@ use std::fs::File;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
-use crate::host::{flock, Host};
+use crate::host::{boot_id, flock, Host, Ident, Liveness};
 use crate::util::locked;
 
 /// How often `periodic` sweeps (some process on the host does).
@@ -103,19 +103,24 @@ fn vm_files(host: &Host) {
     }
 }
 
-/// `KEY.PID-START.sock` and `PID-START.claim` of standbys whose locks are gone.
+/// `KEY.PID-START.sock` and `PID-START.claim` of standbys whose locks are gone,
+/// and `.PID-START.lock` (a lock not yet in place, unlocked at first) of standbys gone.
 fn standby_sockets(dir: &Path) {
     for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         let n = e.file_name().to_string_lossy().into_owned();
-        let claim = n.strip_suffix(".claim");
-        let Some(id) = claim.or_else(|| n.strip_suffix(".sock").and_then(|s| s.rsplit_once('.')).map(|(_, id)| id)) else { continue };
+        let (claim, tmp) = (n.strip_suffix(".claim"), n.strip_prefix('.').and_then(|n| n.strip_suffix(".lock")));
+        let Some(id) = claim.or(tmp).or_else(|| n.strip_suffix(".sock").and_then(|s| s.rsplit_once('.')).map(|(_, id)| id)) else { continue };
         let Some((pid, start)) = id.split_once('-') else { continue };
         if [pid, start].iter().any(|s| s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit())) {
             continue;
         }
-        let free = match File::open(dir.join(format!("{id}.lock"))) {
-            Ok(f) => flock(&f, libc::LOCK_SH | libc::LOCK_NB).is_ok(),
-            Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+        let free = match (tmp, pid.parse(), start.parse()) {
+            (Some(_), Ok(pid), Ok(start)) => Ident { pid, start, boot: boot_id().into() }.liveness() == Liveness::Gone,
+            (Some(_), ..) => false,
+            _ => match File::open(dir.join(format!("{id}.lock"))) {
+                Ok(f) => flock(&f, libc::LOCK_SH | libc::LOCK_NB).is_ok(),
+                Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+            },
         };
         if free && (claim.is_none() || locked(&e.path(), libc::LOCK_EX) == Some(false)) {
             let _ = std::fs::remove_file(e.path());
@@ -148,6 +153,11 @@ mod tests {
         }
         let other = File::create(d.join("5-7.lock")).unwrap();
         flock(&other, libc::LOCK_EX).unwrap();
+        // Lock files not yet renamed in place: a dead process's goes, a live one's stays, locked or not.
+        let mine = format!(".{}.lock", Ident::me().key());
+        for s in [".999999999-1.lock", &mine] {
+            File::create(d.join(s)).unwrap();
+        }
         standby_sockets(&d);
         let left = |n: &str| d.join(n).exists();
         assert!(left("key.1-1.sock"), "its standby holds its lock");
@@ -156,6 +166,7 @@ mod tests {
         assert!(!left("key.1-2.sock"), "a reused pid keeps only its own socket");
         assert!(!left("key.2-1.sock") && !left("key.3-1.sock"), "lock free or gone");
         assert!(left("key.x.sock") && left("2-1.lock"));
+        assert!(!left(".999999999-1.lock") && left(&mine));
         std::fs::remove_dir_all(d).unwrap();
     }
 

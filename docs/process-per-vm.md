@@ -167,7 +167,7 @@ devices whose alias names its run directory and an owner proven gone
 taps with no such alias, an earlier version's say, are never touched); a
 process with a reused pid removes its dead namesake's as it starts, as their
 names would be its own (`host::clear_taps`), Firecrackers' cgroups (`idle-<pid>-<start>-<n>`, by the process's identity), work directories, names, a standby
-VM's socket (its `PID-START.lock` free), an arrival's log (no lock on it, 5 s
+VM's socket (its `PID-START.lock` free) and a lock it died before renaming in place (`.PID-START.lock`), an arrival's log (no lock on it, 5 s
 old). A VM process's own cgroup (`vm-PID-START`) goes once empty, never
 killed (`rmdir` refuses a populated cgroup). An earlier version's
 Firecracker cgroups (`idle-PID-N`, no start time) are left alone. The logs of a name with no
@@ -379,7 +379,10 @@ back above the mark by half the mark's height over the reserve (at least
 admission uses) are read from `host.json` as it changes. Under the reserve,
 standby VMs are stopped first, under a lock of their own
 (`STATE/standby.stop.lock`), so a slow migration holding `evict.lock` does
-not hold that up. The lock's
+not hold that up. Signalling any marks the pressure (`RUN/standby/.pressure`,
+no refill for a minute); the controller then checks their pidfds on its
+next ticks, never waiting on one, and holds eviction off until one exits
+or for a second (a loading or just claimed standby must not hold it longer). The lock's
 holder, at most once per 5 s, reads the registry and ranks running VMs: the
 starved first, then the fastest growing (by power of two, under 8 MiB/s is
 none), then the biggest RSS (without pressure, only starved VMs are

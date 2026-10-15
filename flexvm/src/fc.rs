@@ -364,8 +364,7 @@ impl Spawner {
         }
         let n = self.next.fetch_add(1, Ordering::SeqCst);
         // Named by this process's identity, not its pid alone: never a dead one's with the same pid.
-        let me = crate::host::Ident::me();
-        let id = format!("idle-{}-{}-{n}", me.pid, me.start);
+        let id = format!("idle-{}-{n}", crate::host::Ident::me().key());
         let tap = format!("{}{n:x}", self.tap_prefix);
         let dir = self.root.join(&id);
         let cgroup = self.cgroups.as_ref().map(|root| root.join(&id));
