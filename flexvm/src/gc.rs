@@ -128,7 +128,8 @@ fn vm_files(host: &Host) {
 /// and `.PID-START.lock` (a lock not yet in place, unlocked at first) of standbys gone.
 fn standby_sockets(dir: &Path) {
     // Held while a standby replaces its socket (`standby::serve`): a reused pid's new socket is seen with its lock held.
-    let Ok(_publish) = File::create(dir.join(".publish")).and_then(|f| Flock::new(f, libc::LOCK_EX)) else { return };
+    // Not waited for: a standby stopped holding it would stall every sweep.
+    let Ok(_publish) = File::create(dir.join(".publish")).and_then(|f| Flock::new(f, libc::LOCK_EX | libc::LOCK_NB)) else { return };
     for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         let n = e.file_name().to_string_lossy().into_owned();
         let claim = n.strip_suffix(".claim").or_else(|| n.strip_suffix(".take"));
@@ -215,19 +216,18 @@ mod tests {
         std::fs::remove_dir_all(d).unwrap();
     }
 
-    /// A sweep waits while a standby replaces its socket under the dir's `.publish`, and keeps that lock file.
+    /// A sweep skips the dir while a standby replaces its socket under its `.publish` (one stopped there stalls no
+    /// sweep), sweeps it once free, and keeps that lock file.
     #[test]
-    fn socket_sweep_waits_for_a_standby_publishing() {
+    fn socket_sweep_skips_a_standby_publishing() {
         let d = dir("publish");
         File::create(d.join("999999990.sock")).unwrap();
         let publishing = File::create(d.join(".publish")).unwrap();
         flock(&publishing, libc::LOCK_EX).unwrap();
-        std::thread::scope(|s| {
-            let sweep = s.spawn(|| standby_sockets(&d));
-            std::thread::sleep(Duration::from_millis(100));
-            assert!(d.join("999999990.sock").exists() && !sweep.is_finished(), "the sweep waits");
-            flock(&publishing, libc::LOCK_UN).unwrap();
-        });
+        standby_sockets(&d);
+        assert!(d.join("999999990.sock").exists(), "skipped, not waited for");
+        flock(&publishing, libc::LOCK_UN).unwrap();
+        standby_sockets(&d);
         assert!(!d.join("999999990.sock").exists() && d.join(".publish").exists());
         std::fs::remove_dir_all(d).unwrap();
     }

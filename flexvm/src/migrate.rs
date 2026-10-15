@@ -479,8 +479,12 @@ impl Proc {
         let deadline = Instant::now() + if fault("short_incoming") { Duration::from_secs(2) } else { INCOMING_WAIT };
         let mut r = BufReader::new(By { s: w.try_clone()?, at: deadline });
         let pager = prepared.0.pager.clone();
+        // Bytes the source has declared and this side not yet read: a refusal drains them.
+        let owed = &std::sync::atomic::AtomicU64::new(0);
         let res = thread::scope(|scope| -> Result<(Arc<Vm>, Value)> {
             let hdr: Header<'static> = crate::util::recv_json_max(&mut r, MAX_HEADER)?.ok_or("source hung up before sending the vmstate")?;
+            let preload_len = (hdr.preload.len() * crate::util::PAGE_SIZE) as u64;
+            owed.store(hdr.vmstate_len.min(MAX_VMSTATE) + preload_len, Ordering::SeqCst);
             let mut t = Phases::new();
             let runs: Runs = hdr.runs.into_owned();
             let pages: Vec<u64> = hdr.preload.into_owned();
@@ -493,12 +497,15 @@ impl Proc {
             crate::host::stall("admitted_stall");
             *self.sizes.lock().unwrap() = Some(sizes);
             let state = read_vec(&mut r, hdr.vmstate_len, MAX_VMSTATE)?;
+            owed.store(preload_len, Ordering::SeqCst);
             t.mark("recv_state");
             self.app_log.store(hdr.app_log, Ordering::SeqCst);
             // Preload installed while Firecracker parses the state; all in, or no commit.
             let r = &mut r;
             let preload = scope.spawn(move || -> Result<Result<()>> {
-                let data = read_vec(r, (pages.len() * crate::util::PAGE_SIZE) as u64, u64::MAX).map_err(|e| format!("receiving the preloaded pages: {e}"))?;
+                let data = read_vec(r, preload_len, u64::MAX);
+                owed.store(0, Ordering::SeqCst);
+                let data = data.map_err(|e| format!("receiving the preloaded pages: {e}"))?;
                 Ok(pager.preload(&pages, &data, deadline).map(drop).map_err(|e| format!("preloading pages: {e}").into()))
             });
             let preloaded = move || preload.join().unwrap_or_else(|_| Err("preloading panicked".into()));
@@ -511,7 +518,7 @@ impl Proc {
         let (vm, t) = match res {
             Ok(r) => r,
             Err(e) => {
-                let _ = answer(json!({"ok": false, "error": e.to_string()}));
+                refuse_arrival(&w, &mut r, &json!({"ok": false, "error": e.to_string()}), owed.load(Ordering::SeqCst), deadline);
                 return Err(e);
             }
         };
@@ -676,11 +683,11 @@ impl Proc {
         self.set_name(self.host.take_name(&name, false)?);
         let by = serde_json::from_value(req["source_ident"].clone()).ok();
         let ip: Ipv4Addr = req["ip"].as_str().ok_or("missing ip")?.parse()?;
-        // Before the record (fsynced) and the claim: a refusal leaves nothing to undo.
-        self.admit_start(req["rss_mib"].as_u64().unwrap_or(0), None, arrival_floor(req))?;
-        *self.arrived.lock().unwrap() = Some(self.host.mig_begin(mig, &source.addr, by, Some(ip))?);
         let tpl = Template::open_id(&self.paths, req["template"].as_str().ok_or("missing template")?, req["id"].as_str().ok_or("missing template id")?)?;
         t.mark("template");
+        // Before the record (fsynced) and the claim: a refusal leaves nothing to undo. Never past the guest's size.
+        self.admit_start(req["rss_mib"].as_u64().unwrap_or(0).min(tpl.meta.max_mib), None, arrival_floor(req))?;
+        *self.arrived.lock().unwrap() = Some(self.host.mig_begin(mig, &source.addr, by, Some(ip))?);
         // The source's next revision: past it, its resume after an abort outranks this location.
         let rev = req["rev"].as_u64().ok_or("missing rev")?.saturating_add(1);
         let claim = self.host.claim_arrival(&self.host.lock()?, &name, ip, req["gen"].as_u64().unwrap_or(0), rev, mig)?;
@@ -901,6 +908,14 @@ pub fn migration_id() -> u64 {
     h.finish() >> 11
 }
 
+/// Answers a refusal, then reads what the source still sends (`owed` bytes, by `at`): closed with that unread, the
+/// connection would be reset, and the source, still writing, would never read the reason.
+fn refuse_arrival(w: &TcpStream, r: &mut impl Read, reply: &Value, owed: u64, at: Instant) {
+    let _ = send_json(&mut By { s: w, at }, reply);
+    let _ = w.shutdown(std::net::Shutdown::Write);
+    let _ = std::io::copy(&mut r.take(owed), &mut std::io::sink());
+}
+
 fn read_vec(r: &mut impl Read, len: u64, max: u64) -> Result<Vec<u8>> {
     if len > max {
         bail!("{len} bytes, more than {max}");
@@ -908,4 +923,30 @@ fn read_vec(r: &mut impl Read, len: u64, max: u64) -> Result<Vec<u8>> {
     let mut v = vec![0u8; len as usize];
     r.read_exact(&mut v)?;
     Ok(v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A refused arrival reads what its source still sends, so the source, still writing, gets the reason, not a reset.
+    #[test]
+    fn a_refusal_drains_what_the_source_still_sends() {
+        const LEN: usize = 64 << 20;
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let source = thread::spawn(move || -> Result<Value> {
+            let mut c = TcpStream::connect(addr)?;
+            c.write_all(&vec![7u8; LEN])?;
+            Ok(recv_json(&mut BufReader::new(&c))?.ok_or("hung up")?)
+        });
+        let (w, _) = l.accept().unwrap();
+        let at = Instant::now() + Duration::from_secs(20);
+        let mut r = BufReader::new(By { s: w.try_clone().unwrap(), at });
+        // Its header read, it is refused.
+        r.read_exact(&mut [0u8; 100]).unwrap();
+        refuse_arrival(&w, &mut r, &json!({"ok": false, "error": "no room"}), (LEN - 100) as u64, at);
+        drop((w, r));
+        assert_eq!(source.join().unwrap().unwrap()["error"], "no room");
+    }
 }

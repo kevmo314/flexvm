@@ -552,12 +552,17 @@ pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]
             true => None,
         };
         let at = budget.max(Instant::now() + LATE);
+        let ino = std::fs::metadata(&sock).map(|m| m.ino()).ok();
         let c = match crate::util::send_unix(&sock, &line, fds, at) {
             Ok(c) => c,
-            // Refused: stale. (A full backlog is a stopped standby's.)
+            // Refused: stale. (A full backlog is a stopped standby's.) Unlinked under `.publish`, as gc does,
+            // and only the socket refused, not one a standby of a reused pid has bound since.
             Err(e) => {
                 if e.raw_os_error() == Some(libc::ECONNREFUSED) {
-                    let _ = std::fs::remove_file(&sock);
+                    let publish = File::create(sock.with_file_name(".publish")).and_then(|f| Flock::new(f, libc::LOCK_EX | libc::LOCK_NB));
+                    if publish.is_ok() && ino.is_some() && std::fs::metadata(&sock).map(|m| m.ino()).ok() == ino {
+                        let _ = std::fs::remove_file(&sock);
+                    }
                 }
                 continue;
             }

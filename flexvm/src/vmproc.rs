@@ -216,7 +216,13 @@ impl Proc {
         let tap_owner = crate::host::tap_alias(&host.run, &ident);
         let spawner = Spawner::new(&paths.firecracker, &work, crate::socket::SocketRoot::new(&work)?, cgroup_root(), &tap_prefix, &tap_owner);
         // Before any guest runs: without it no route reaches the peers.
-        let announcer = Announcer::start(|f| thread::Builder::new().spawn(f).map(drop), |peer, req| peer_call(peer, req.clone()).map(drop))?;
+        let h = host.clone();
+        let announcer = Announcer::start(
+            |f| thread::Builder::new().spawn(f).map(drop),
+            |peer, req| peer_call(peer, req.clone()).map(drop),
+            Box::new(move || h.config_now().peers),
+            ANNOUNCE_RETRY,
+        )?;
         Ok(Arc::new_cyclic(|me| Proc {
             host,
             paths,
@@ -324,9 +330,9 @@ impl Proc {
         if more == 0 {
             return Ok(());
         }
-        self.host
-            .grow_hold(&self.held_grant, more, floor, Some(deadline))
-            .map_err(|e| format!("its memory grew to {} MiB since it was admitted here for {granted} MiB: {e}", sizes.0))?;
+        if let Err(e) = self.host.grow_hold(&self.held_grant, more, floor, Some(deadline))? {
+            bail!("its memory grew to {} MiB since it was admitted here for {granted} MiB: {e}", sizes.0);
+        }
         self.granted.fetch_add(more, Ordering::SeqCst);
         crate::log!("vm {}: admitted {more} MiB more: it grew to {} MiB since its preflight", self.name(), sizes.0);
         Ok(())
@@ -2144,27 +2150,39 @@ fn each_peer(peers: Vec<String>, by: Instant, f: impl Fn(&str) + Send + Sync + '
 }
 
 /// The route announcements the peers have yet to take, the newest per peer: one thread of the process's own hands each
-/// to a thread of its own, retrying with backoff (a thread not had, a lookup or a call failed) until it is delivered or
-/// a newer one replaces it. Callers never wait on a peer.
+/// to a thread of its own, retrying with backoff (a thread not had, a lookup or a call failed) until it is delivered, a
+/// newer one replaces it, its peer is no longer configured, or it has been tried `retry.2` times. Callers never wait on a
+/// peer.
 pub struct Announcer {
     pending: Mutex<std::collections::HashMap<String, Pending>>,
     wake: std::sync::Condvar,
     spawn: fn(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
     call: fn(&str, &Value) -> Result<()>,
+    /// The peers configured now.
+    peers: Box<dyn Fn() -> Vec<String> + Send + Sync>,
+    retry: (Duration, Duration, u32),
 }
 
 struct Pending {
     req: Value,
     at: Instant,
     backoff: Duration,
-    busy: bool,
+    tries: u32,
+    /// The call in flight: its dispatch's number, which only its own `done` matches.
+    busy: Option<u64>,
 }
 
-const ANNOUNCE_RETRY: (Duration, Duration) = (Duration::from_millis(250), Duration::from_secs(10));
+/// The first and longest pause between tries, and how many tries (about 5 minutes).
+const ANNOUNCE_RETRY: (Duration, Duration, u32) = (Duration::from_millis(250), Duration::from_secs(10), 36);
 
 impl Announcer {
-    fn start(spawn: fn(Box<dyn FnOnce() + Send>) -> std::io::Result<()>, call: fn(&str, &Value) -> Result<()>) -> std::io::Result<Arc<Announcer>> {
-        let a = Arc::new(Announcer { pending: Mutex::default(), wake: Default::default(), spawn, call });
+    fn start(
+        spawn: fn(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+        call: fn(&str, &Value) -> Result<()>,
+        peers: Box<dyn Fn() -> Vec<String> + Send + Sync>,
+        retry: (Duration, Duration, u32),
+    ) -> std::io::Result<Arc<Announcer>> {
+        let a = Arc::new(Announcer { pending: Mutex::default(), wake: Default::default(), spawn, call, peers, retry });
         let me = a.clone();
         thread::Builder::new().name("announce".into()).spawn(move || me.run())?;
         Ok(a)
@@ -2177,7 +2195,7 @@ impl Announcer {
         let mut p = self.pending.lock().unwrap();
         p.retain(|peer, _| peers.contains(peer));
         for peer in peers {
-            let fresh = Pending { req: req.clone(), at: Instant::now(), backoff: ANNOUNCE_RETRY.0, busy: false };
+            let fresh = Pending { req: req.clone(), at: Instant::now(), backoff: self.retry.0, tries: 0, busy: None };
             match p.get_mut(&peer) {
                 Some(e) if newer(&e.req) => {}
                 Some(e) => *e = Pending { busy: e.busy, ..fresh },
@@ -2188,45 +2206,70 @@ impl Announcer {
     }
 
     fn run(self: Arc<Self>) {
-        let mut p = self.pending.lock().unwrap();
+        let mut seq = 0;
         loop {
-            let now = Instant::now();
-            for (peer, e) in p.iter_mut().filter(|(_, e)| !e.busy && e.at <= now) {
-                e.busy = true;
-                let (me, peer, req) = (self.clone(), peer.clone(), e.req.clone());
-                if let Err(err) = (self.spawn)(Box::new(move || {
-                    let r = (me.call)(&peer, &req);
-                    me.done(&peer, &req, r);
-                })) {
-                    Self::retry(e, &format!("no thread: {err}"));
+            let peers = (self.peers)();
+            let due: Vec<_> = {
+                let mut p = self.pending.lock().unwrap();
+                p.retain(|peer, _| peers.contains(peer));
+                let now = Instant::now();
+                p.iter_mut()
+                    .filter(|(_, e)| e.busy.is_none() && e.at <= now)
+                    .map(|(peer, e)| {
+                        seq += 1;
+                        e.busy = Some(seq);
+                        (peer.clone(), e.req.clone(), seq)
+                    })
+                    .collect()
+            };
+            // Unlocked: `tell` never waits on a thread being had.
+            for (peer, req, seq) in due {
+                let (me, to, sent) = (self.clone(), peer.clone(), req.clone());
+                if let Err(err) = (self.spawn)(Box::new(move || me.done(&to, seq, &sent, (me.call)(&to, &sent)))) {
+                    self.done(&peer, seq, &req, Err(format!("no thread: {err}").into()));
                 }
             }
-            let next = p.values().filter(|e| !e.busy).map(|e| e.at).min();
-            p = match next {
+            let p = self.pending.lock().unwrap();
+            let next = p.values().filter(|e| e.busy.is_none()).map(|e| e.at).min();
+            drop(match next {
                 Some(at) => self.wake.wait_timeout(p, at.saturating_duration_since(Instant::now())).unwrap().0,
                 None => self.wake.wait(p).unwrap(),
-            };
+            });
         }
     }
 
-    /// A call of `req` to `peer` ended: delivered, it is no longer pending, unless a newer one replaced it meanwhile.
-    fn done(&self, peer: &str, req: &Value, r: Result<()>) {
+    /// Call `seq` of `req` to `peer` ended: delivered, it is no longer pending, unless a newer one replaced it meanwhile.
+    fn done(&self, peer: &str, seq: u64, req: &Value, r: Result<()>) {
         let mut p = self.pending.lock().unwrap();
-        let Some(e) = p.get_mut(peer) else { return };
-        e.busy = false;
-        match r {
-            _ if e.req != *req => {}
-            Ok(()) => drop(p.remove(peer)),
-            Err(err) => Self::retry(e, &format!("{peer}: {err}")),
+        // Not this call's entry: pruned meanwhile, and maybe added afresh.
+        let Some(e) = p.get_mut(peer).filter(|e| e.busy == Some(seq)) else { return };
+        e.busy = None;
+        let what = format!("announce {} gen {} to {peer}", req["ip"].as_str().unwrap_or("?"), req["gen"]);
+        let keep = match r {
+            _ if e.req != *req => true,
+            Ok(()) => {
+                if e.tries > 0 {
+                    crate::log!("{what}: delivered after {} failed tries", e.tries);
+                }
+                false
+            }
+            Err(err) => {
+                e.tries += 1;
+                // Only the first failure and the outcome are logged.
+                if e.tries >= self.retry.2 {
+                    crate::log!("{what}: {err}; giving up after {} tries", e.tries);
+                } else if e.tries == 1 {
+                    crate::log!("{what}: {err}; trying again, up to {} times", self.retry.2 - 1);
+                }
+                e.at = Instant::now() + e.backoff;
+                e.backoff = (e.backoff * 2).min(self.retry.1);
+                e.tries < self.retry.2
+            }
+        };
+        if !keep {
+            p.remove(peer);
         }
         self.wake.notify_all();
-    }
-
-    fn retry(e: &mut Pending, why: &str) {
-        e.busy = false;
-        crate::log!("announce {} gen {}: {why}; trying again in {:?}", e.req["ip"].as_str().unwrap_or("?"), e.req["gen"], e.backoff);
-        e.at = Instant::now() + e.backoff;
-        e.backoff = (e.backoff * 2).min(ANNOUNCE_RETRY.1);
     }
 }
 
@@ -2344,6 +2387,7 @@ mod tests {
         static CALLS: AtomicUsize = AtomicUsize::new(0);
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let peer = format!("localhost:{}", l.local_addr().unwrap().port());
+        let configured = peer.clone();
         let a = Announcer::start(
             |f| match SPAWNS.fetch_add(1, Ordering::SeqCst) {
                 0 | 1 => Err(std::io::ErrorKind::WouldBlock.into()),
@@ -2353,6 +2397,8 @@ mod tests {
                 0 | 1 => Err(format!("DNS lookup of {peer}: cannot start a thread").into()),
                 _ => peer_call(peer, req.clone()).map(drop),
             },
+            Box::new(move || vec![configured.clone()]),
+            ANNOUNCE_RETRY,
         )
         .unwrap();
         let route = |gen: u64| json!({"op": "route", "ip": "10.0.0.9", "via": "10.1.0.1", "gen": gen, "rev": 0});
@@ -2371,6 +2417,41 @@ mod tests {
             assert!(Instant::now() < end, "delivered, no longer pending");
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// A peer no longer configured is not told on; one that never takes it is given up on after its tries.
+    #[test]
+    fn announcements_stop_for_removed_peers_and_after_their_tries() {
+        static CALLS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let configured = Arc::new(Mutex::new(vec!["gone".to_string(), "down".to_string()]));
+        let c = configured.clone();
+        let a = Announcer::start(
+            |f| thread::Builder::new().spawn(f).map(drop),
+            |peer, _| {
+                CALLS.lock().unwrap().push(peer.into());
+                Err("refused".into())
+            },
+            Box::new(move || c.lock().unwrap().clone()),
+            (Duration::from_millis(20), Duration::from_millis(100), 5),
+        )
+        .unwrap();
+        let calls = |p: &str| CALLS.lock().unwrap().iter().filter(|c| *c == p).count();
+        let until = |done: &dyn Fn() -> bool| {
+            let end = Instant::now() + Duration::from_secs(5);
+            while !done() {
+                assert!(Instant::now() < end);
+                thread::sleep(Duration::from_millis(1));
+            }
+        };
+        a.tell(configured.lock().unwrap().clone(), json!({"op": "route", "ip": "10.0.0.9", "gen": 1, "rev": 0}));
+        until(&|| calls("gone") > 0);
+        configured.lock().unwrap().retain(|p| p != "gone");
+        until(&|| a.pending.lock().unwrap().is_empty());
+        let gone = calls("gone");
+        assert!(gone < 3, "pruned once no longer configured: {gone}");
+        assert_eq!(calls("down"), 5, "given up after its tries");
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!((calls("gone"), calls("down")), (gone, 5), "and never called again");
     }
 
     #[test]
