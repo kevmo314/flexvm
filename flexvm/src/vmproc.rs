@@ -1607,8 +1607,9 @@ struct Stopping {
 /// Under the reserve: SIGUSR1s the standby VMs, under `STATE/standby.stop.lock`
 /// (not eviction's lock, which a migration may hold for a while), and marks
 /// the pressure so they are not refilled. True until any exits (an idle one
-/// takes ~200 ms) or a second passes, and while another process is stopping
-/// them (it evicts if none exits). Loading or claimed VMs must not hold eviction off.
+/// takes ~200 ms) or a second passes, while another process is stopping
+/// them (it evicts if none exits), and while a refill's standby is not listed
+/// yet (`standby::refill`, seconds at most). Loading or claimed VMs must not hold eviction off.
 fn stop_standby(host: &Host, avail: u64, reserve: u64, stopping: &mut Option<Stopping>) -> bool {
     if let Some(s) = stopping {
         let stopped = s.fds.iter().filter(|fd| fd.wait(Duration::ZERO)).count();
@@ -1621,7 +1622,7 @@ fn stop_standby(host: &Host, avail: u64, reserve: u64, stopping: &mut Option<Sto
         }
         return stopped > 0;
     }
-    let Ok(lock) = std::fs::File::options().create(true).truncate(false).write(true).open(host.state.join("standby.stop.lock")) else { return false };
+    let Ok(lock) = crate::standby::stop_lock(host) else { return false };
     if crate::host::flock(&lock, libc::LOCK_EX | libc::LOCK_NB).is_err() {
         return true;
     }

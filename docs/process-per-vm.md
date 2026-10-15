@@ -379,7 +379,11 @@ back above the mark by half the mark's height over the reserve (at least
 admission uses) are read from `host.json` as it changes. Under the reserve,
 standby VMs are stopped first, under a lock of their own
 (`STATE/standby.stop.lock`), so a slow migration holding `evict.lock` does
-not hold that up. Signalling any marks the pressure (`RUN/standby/.pressure`,
+not hold that up. A refill holds it shared from each standby's grant until
+that standby has created its lock file (it says so on its notify fd), never
+through its load, and starts none while relief holds it: relief either lists
+a standby being started or ran before its grant, and meanwhile holds eviction
+off as it does for another process stopping them. Signalling any marks the pressure (`RUN/standby/.pressure`,
 no refill for a minute); the controller then checks their pidfds on its
 next ticks, never waiting on one, and holds eviction off until one exits
 or for a second (a loading or just claimed standby must not hold it longer). The lock's
