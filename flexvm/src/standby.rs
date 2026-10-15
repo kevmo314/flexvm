@@ -12,8 +12,6 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -469,7 +467,7 @@ fn load(idle: Firecracker, template: Arc<Template>) -> Result<Prepared> {
     resumed?;
     wait_for_reseed(&fc.sockets.vsock)?;
     // Set the clock now so START at the claim can skip clock_settime (slow in big guests).
-    let _ = guest::clock(&fc.sockets.vsock, &p.template().legacy_agent, guest::TIMEOUT);
+    let _ = guest::clock(&fc.sockets.vsock, guest::TIMEOUT);
     std::thread::sleep(SETTLE);
     fc.request_within("PATCH", "/vm", Some(json!({"state": "Paused"})), API_TIMEOUT)?;
     Ok(p)
@@ -493,23 +491,16 @@ fn resume(p: Prepared, name: &str, ip: Ipv4Addr, kill: bool, t: &mut Phases) -> 
     Ok(p.into_vm(name, ip, crate::vm::State::Running))
 }
 
-/// Waits for the guest RNG reseed for the new VMGenID; an agent without
-/// `FORKS` need only answer.
+/// Waits for the guest RNG reseed for the new VMGenID.
 fn wait_for_reseed(vsock: &std::path::Path) -> Result<()> {
-    static WARNED: AtomicBool = AtomicBool::new(false);
     let deadline = Instant::now() + RESEED_TIMEOUT;
     loop {
         let res = guest::forks(vsock);
         match res {
-            Ok(Some(n)) if n > 0 => return Ok(()),
-            Ok(None) => {
-                if !WARNED.swap(true, Ordering::Relaxed) {
-                    crate::log!("standby: guest agent cannot report RNG reseeds (no FORKS); standby vms are only checked to answer");
-                }
-                return Ok(());
-            }
+            Ok(n) if n > 0 => return Ok(()),
+            Err(e) if guest::too_old(&e) => return Err(e),
             _ if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
-            Ok(Some(_)) => bail!("guest did not reseed its RNG for the new VMGenID within {RESEED_TIMEOUT:?}"),
+            Ok(_) => bail!("guest did not reseed its RNG for the new VMGenID within {RESEED_TIMEOUT:?}"),
             Err(e) => bail!("guest agent not answering after restore: {e}"),
         }
     }

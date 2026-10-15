@@ -4,7 +4,6 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -230,37 +229,43 @@ fn now() -> Result<String> {
     Ok(format!("{}.{:09}", now.as_secs(), now.subsec_nanos()))
 }
 
-/// Address, nameserver and wall clock; doubles as the readiness check. Agents that predate
-/// `START` get `NET`, remembered in `legacy`.
-pub fn start(uds: &Path, ip: std::net::Ipv4Addr, dns: Option<&str>, legacy: &AtomicBool) -> Result<()> {
+/// The agent answered `unknown request` to part of the protocol flexvm requires.
+#[derive(Debug)]
+pub struct AgentTooOld(&'static str);
+
+impl std::fmt::Display for AgentTooOld {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "guest agent too old (no {}): rebuild the rootfs and its templates", self.0)
+    }
+}
+
+impl std::error::Error for AgentTooOld {}
+
+pub fn too_old(e: &Error) -> bool {
+    e.downcast_ref::<AgentTooOld>().is_some()
+}
+
+fn refused(verb: &'static str, m: &[u8]) -> Error {
+    if m.starts_with(b"unknown request") {
+        return AgentTooOld(verb).into();
+    }
+    format!("guest {}: {}", verb.to_lowercase(), String::from_utf8_lossy(m)).into()
+}
+
+/// Address, nameserver and wall clock; doubles as the readiness check.
+pub fn start(uds: &Path, ip: std::net::Ipv4Addr, dns: Option<&str>) -> Result<()> {
     let dns = dns.unwrap_or("");
-    answered("START", Instant::now() + TIMEOUT, |by| {
-        if !legacy.load(Ordering::Relaxed) {
-            match ask(uds, &format!("START {ip} {} {dns}", now()?), by)? {
-                (FRAME_MSG, m) if m == b"ok" => return Ok(()),
-                (FRAME_MSG, m) if m.starts_with(b"unknown request") => legacy.store(true, Ordering::Relaxed),
-                (_, m) => bail!("guest start: {}", String::from_utf8_lossy(&m)),
-            }
-        }
-        match ask(uds, &format!("NET {ip} {dns}"), by)? {
-            (FRAME_MSG, m) if m == b"ok" => Ok(()),
-            (_, m) => bail!("guest network setup: {}", String::from_utf8_lossy(&m)),
-        }
+    answered("START", Instant::now() + TIMEOUT, |by| match ask(uds, &format!("START {ip} {} {dns}", now()?), by)? {
+        (FRAME_MSG, m) if m == b"ok" => Ok(()),
+        (_, m) => Err(refused("START", &m)),
     })
 }
 
-/// Returns the offset (ms, guest minus host), or None for agents that predate it.
-pub fn clock(uds: &Path, legacy: &AtomicBool, timeout: Duration) -> Result<Option<f64>> {
-    if legacy.load(Ordering::Relaxed) {
-        return Ok(None);
-    }
+/// Returns the offset (ms, guest minus host).
+pub fn clock(uds: &Path, timeout: Duration) -> Result<f64> {
     answered("CLOCK", Instant::now() + timeout, |by| match ask(uds, &format!("CLOCK {}", now()?), by)? {
-        (FRAME_MSG, m) if m.starts_with(b"ok") => Ok(Some(String::from_utf8_lossy(&m[2..]).trim().parse().unwrap_or(0.0) / 1e6)),
-        (FRAME_MSG, m) if m.starts_with(b"unknown request") => {
-            legacy.store(true, Ordering::Relaxed);
-            Ok(None)
-        }
-        (_, m) => bail!("guest clock: {}", String::from_utf8_lossy(&m)),
+        (FRAME_MSG, m) if m.starts_with(b"ok ") => Ok(String::from_utf8_lossy(&m[3..]).trim().parse::<f64>()? / 1e6),
+        (_, m) => Err(refused("CLOCK", &m)),
     })
 }
 
@@ -272,12 +277,10 @@ fn message(uds: &Path, line: &str, timeout: Duration) -> Result<String> {
     }
 }
 
-/// Times the guest reseeded its RNG for a new VMGenID; None if the agent predates it.
-pub fn forks(uds: &Path) -> Result<Option<usize>> {
-    match message(uds, "FORKS", TIMEOUT)? {
-        m if m.starts_with("unknown request") => Ok(None),
-        m => Ok(Some(m.strip_prefix("ok ").ok_or_else(|| format!("guest forks: {m}"))?.trim().parse()?)),
-    }
+/// Times the guest reseeded its RNG for a new VMGenID.
+pub fn forks(uds: &Path) -> Result<usize> {
+    let m = message(uds, "FORKS", TIMEOUT)?;
+    Ok(m.strip_prefix("ok ").ok_or_else(|| refused("FORKS", m.as_bytes()))?.trim().parse()?)
 }
 
 pub fn start_app(uds: &Path) -> Result<u32> {
@@ -370,6 +373,61 @@ mod tests {
             client.join().unwrap();
         }
         drop(listener);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn current_agent_protocol_is_required() {
+        let path = std::env::temp_dir().join(format!("flexvm-current-agent-{}.sock", std::process::id()));
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let replies: &[(&str, &[u8])] = &[
+            ("START", b"ok"),
+            ("START", b"unknown request START"),
+            ("CLOCK", b"ok -2500000"),
+            ("CLOCK", b"unknown request CLOCK"),
+            ("CLOCK", b"ok"),
+            ("CLOCK", b"ok invalid"),
+            ("FORKS", b"ok 1"),
+            ("FORKS", b"unknown request FORKS"),
+        ];
+        let server = std::thread::spawn(move || {
+            for (verb, reply) in replies {
+                let (stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+                let mut stream = BufReader::new(stream);
+                let mut line = String::new();
+                stream.read_line(&mut line).unwrap();
+                assert_eq!(line, format!("CONNECT {PORT}\n"));
+                line.clear();
+                stream.read_line(&mut line).unwrap();
+                let parts: Vec<_> = line.split_whitespace().collect();
+                assert_eq!(parts[0], *verb);
+                match *verb {
+                    "START" => {
+                        assert_eq!(parts[1], "10.0.0.2");
+                        assert!(parts[2].parse::<f64>().is_ok());
+                        assert_eq!(parts[3], "1.1.1.1");
+                    }
+                    "CLOCK" => assert!(parts[1].parse::<f64>().is_ok()),
+                    _ => assert_eq!(parts.len(), 1),
+                }
+                stream.get_mut().write_all(b"OK 1\n").unwrap();
+                write_frame(stream.get_mut(), FRAME_MSG, reply).unwrap();
+            }
+        });
+        let ip = "10.0.0.2".parse().unwrap();
+        start(&path, ip, Some("1.1.1.1")).unwrap();
+        let e = start(&path, ip, Some("1.1.1.1")).unwrap_err();
+        assert!(too_old(&e) && e.to_string().contains("too old (no START)"), "{e}");
+        assert_eq!(clock(&path, TIMEOUT).unwrap(), -2.5);
+        assert!(too_old(&clock(&path, TIMEOUT).unwrap_err()));
+        for _ in 0..2 {
+            let e = clock(&path, TIMEOUT).unwrap_err();
+            assert!(!too_old(&e), "{e}");
+        }
+        assert_eq!(forks(&path).unwrap(), 1);
+        assert!(too_old(&forks(&path).unwrap_err()));
+        server.join().unwrap();
         std::fs::remove_file(path).unwrap();
     }
 

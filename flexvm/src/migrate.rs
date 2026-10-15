@@ -91,7 +91,7 @@ impl Proc {
         }
         self.settle_arrival(&op, ARRIVAL_WAIT)?;
         vm.can_leave()?;
-        vm.template.verify(&self.paths, true)?;
+        vm.template.verify(&self.paths)?;
         let settle = Instant::now();
         vm.settle_hotplug(settle + crate::lifecycle::SETTLE_WAIT)?;
         let settle = settle.elapsed();
