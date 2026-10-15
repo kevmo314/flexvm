@@ -138,41 +138,101 @@ pub fn retry<T>(timeout: Duration, every: Duration, mut f: impl FnMut() -> Resul
     }
 }
 
-/// DNS/NSS may block indefinitely. Keep at most four such workers alive process-wide;
-/// a timed-out caller leaves its slot with the worker until the lookup actually ends.
-pub fn resolve(addr: &str, at: Instant) -> io::Result<Vec<std::net::SocketAddr>> {
-    use std::net::ToSocketAddrs;
-    static RESOLVING: AtomicUsize = AtomicUsize::new(0);
-    resolve_with(addr, at, &RESOLVING, |addr| addr.to_socket_addrs().map(Iterator::collect))
+type Addrs = Vec<std::net::SocketAddr>;
+
+/// Lookups under way at once, process-wide: each is a thread that DNS/NSS may hold indefinitely.
+const DNS_WORKERS: usize = 4;
+/// How long a finished lookup's addresses answer again: one that ended after its callers
+/// gave up (a slow resolver) still serves the next.
+const DNS_RECENT: Duration = Duration::from_secs(5);
+
+/// One lookup per name at a time, joined by every caller that wants that name, so a name that
+/// hangs holds one worker however often it is asked for. A worker stuck in getaddrinfo keeps
+/// its slot until it returns; callers wait for one, or the name's lookup, until their deadline.
+pub struct Resolver {
+    lookups: std::sync::Mutex<Lookups>,
+    changed: std::sync::Condvar,
 }
 
-fn resolve_with(
-    addr: &str,
-    at: Instant,
-    count: &'static AtomicUsize,
-    lookup: impl FnOnce(String) -> io::Result<Vec<std::net::SocketAddr>> + Send + 'static,
-) -> io::Result<Vec<std::net::SocketAddr>> {
-    By { s: (), at }.left()?;
+struct Lookups {
+    all: Vec<Lookup>,
+    workers: usize,
+    next: u64,
+}
+
+struct Lookup {
+    name: String,
+    id: u64,
+    /// When it ended, and how.
+    done: Option<(Instant, Answer)>,
+}
+
+type Answer = std::result::Result<Addrs, (io::ErrorKind, String)>;
+
+impl Resolver {
+    const fn new() -> Self {
+        Resolver { lookups: std::sync::Mutex::new(Lookups { all: Vec::new(), workers: 0, next: 0 }), changed: std::sync::Condvar::new() }
+    }
+}
+
+/// HOST:PORT's addresses by `at`; an IP literal resolves at once.
+pub fn resolve(addr: &str, at: Instant) -> io::Result<Addrs> {
+    use std::net::ToSocketAddrs;
+    static DNS: Resolver = Resolver::new();
+    resolve_with(addr, at, &DNS, |addr| addr.to_socket_addrs().map(Iterator::collect))
+}
+
+fn resolve_with(addr: &str, at: Instant, dns: &'static Resolver, lookup: impl FnOnce(String) -> io::Result<Addrs> + Send + 'static) -> io::Result<Addrs> {
+    let fail = |kind, why: &str| io::Error::new(kind, format!("DNS lookup of {addr}: {why}"));
+    By { s: (), at }.left().map_err(|_| fail(io::ErrorKind::TimedOut, "deadline passed"))?;
     if let Ok(addr) = addr.parse() {
         return Ok(vec![addr]);
     }
-    let slot = Slot::take(count, 4).ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "DNS resolver workers exhausted"))?;
-    let addr = addr.to_owned();
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    std::thread::Builder::new().name("dns".into()).spawn(move || {
-        let _slot = slot;
-        let _ = tx.send(lookup(addr));
-    })?;
-    rx.recv_timeout(By { s: (), at }.left()?).map_err(|e| match e {
-        std::sync::mpsc::RecvTimeoutError::Timeout => io::Error::new(io::ErrorKind::TimedOut, "DNS lookup deadline passed"),
-        std::sync::mpsc::RecvTimeoutError::Disconnected => io::Error::other("DNS resolver worker stopped"),
-    })?
-}
-
-/// DNS and all connect attempts share the caller's timeout.
-pub fn connect(addr: &str, timeout: Duration) -> io::Result<std::net::TcpStream> {
-    let at = Instant::now() + timeout;
-    connect_addrs(&resolve(addr, at)?, at)
+    let mut lookup = Some(lookup);
+    let mut mine = None;
+    let mut l = dns.lookups.lock().unwrap();
+    loop {
+        l.all.retain(|k| k.done.as_ref().is_none_or(|(t, _)| t.elapsed() < DNS_RECENT));
+        let found = l.all.iter().position(|k| k.name == addr);
+        match found.map(|i| (l.all[i].id, &l.all[i].done)) {
+            Some((id, None)) => mine = Some(id),
+            Some((id, Some((_, res)))) if mine == Some(id) || res.is_ok() => {
+                return res.clone().map_err(|(kind, why)| fail(kind, &why));
+            }
+            // Failed, before this caller asked: try again.
+            _ => match lookup.take() {
+                Some(f) if l.workers < DNS_WORKERS => {
+                    if let Some(i) = found {
+                        l.all.remove(i);
+                    }
+                    let id = l.next;
+                    l.next += 1;
+                    let name = addr.to_owned();
+                    std::thread::Builder::new().name("dns".into()).spawn(move || {
+                        let res = f(name.clone())
+                            .and_then(|a| if a.is_empty() { Err(io::Error::other("no address")) } else { Ok(a) })
+                            .map_err(|e| (e.kind(), e.to_string()));
+                        let mut l = dns.lookups.lock().unwrap();
+                        l.workers -= 1;
+                        if let Some(k) = l.all.iter_mut().find(|k| k.id == id) {
+                            k.done = Some((Instant::now(), res));
+                        }
+                        dns.changed.notify_all();
+                    })?;
+                    l.workers += 1;
+                    l.all.push(Lookup { name: addr.to_owned(), id, done: None });
+                    mine = Some(id);
+                }
+                Some(f) => lookup = Some(f),
+                None => return Err(fail(io::ErrorKind::Other, "its lookup was replaced")),
+            },
+        }
+        let left = By { s: (), at }.left().map_err(|_| match mine {
+            Some(_) => fail(io::ErrorKind::TimedOut, "not answered by the deadline"),
+            None => fail(io::ErrorKind::TimedOut, &format!("all {DNS_WORKERS} DNS workers stayed busy until the deadline")),
+        })?;
+        l = dns.changed.wait_timeout(l, left).unwrap().0;
+    }
 }
 
 /// Splits the remaining time across addresses so a blackholed one cannot use it all.
@@ -188,11 +248,12 @@ pub fn connect_addrs(addrs: &[std::net::SocketAddr], at: Instant) -> io::Result<
     Err(last)
 }
 
-/// Connects within `wait`, sends `req` and reads its answer, all by `at`, including DNS;
+/// Looks `addr` up and sends `req` and reads its answer, all by `at`, connecting within `wait` of that;
 /// any failure names `addr`. The stream stays open for whatever follows.
 pub fn rpc(addr: &str, wait: Duration, at: Instant, req: &serde_json::Value) -> Result<(std::net::TcpStream, serde_json::Value)> {
     (|| -> Result<_> {
-        let s = connect(addr, wait.min(By { s: (), at }.left()?))?;
+        let addrs = resolve(addr, at)?;
+        let s = connect_addrs(&addrs, at.min(Instant::now() + wait))?;
         send_json(&mut By { s: &s, at }, req)?;
         let reply = recv_json(&mut io::BufReader::new(By { s: &s, at }))?;
         Ok((s, answer(reply, "it")?))
@@ -792,48 +853,95 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    fn workers(dns: &Resolver) -> usize {
+        dns.lookups.lock().unwrap().workers
+    }
+
+    /// A lookup that blocks until released.
+    fn held() -> (std::sync::mpsc::Sender<Addrs>, impl FnOnce(String) -> io::Result<Addrs> + Send + 'static) {
+        let (release, wait) = std::sync::mpsc::channel::<Addrs>();
+        (release, move |_| Ok(wait.recv().unwrap_or_default()))
+    }
+
     #[test]
-    fn blocked_dns_obeys_deadlines_and_keeps_worker_slots_until_finished() {
-        static COUNT: AtomicUsize = AtomicUsize::new(0);
-        let mut releases = Vec::new();
-        for _ in 0..4 {
-            let (release, wait) = std::sync::mpsc::channel();
-            releases.push(release);
-            let start = Instant::now();
-            let err = resolve_with("blocked.example:80", start + Duration::from_millis(30), &COUNT, move |_| {
-                wait.recv().unwrap();
-                Ok(vec![])
-            })
-            .unwrap_err();
-            assert_eq!(err.kind(), io::ErrorKind::TimedOut);
-            assert!(start.elapsed() < Duration::from_secs(1));
-        }
-        assert_eq!(COUNT.load(Ordering::SeqCst), 4, "timing out must not release a stuck worker's slot");
+    fn a_hung_name_holds_one_worker_however_often_it_is_asked_for() {
+        static DNS: Resolver = Resolver::new();
+        let (release, lookup) = held();
         let start = Instant::now();
-        let err = resolve_with("refused.example:80", start + Duration::from_secs(5), &COUNT, |_| panic!("no free worker")).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
-        assert!(start.elapsed() < Duration::from_secs(1), "exhausted workers must not queue callers");
+        let err = resolve_with("hung.example:80", start + Duration::from_millis(30), &DNS, lookup).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(err.to_string().contains("hung.example:80"), "{err}");
+        for _ in 0..8 {
+            let err = resolve_with("hung.example:80", Instant::now() + Duration::from_millis(10), &DNS, |_| panic!("joins the lookup under way"));
+            assert_eq!(err.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        }
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert_eq!(workers(&DNS), 1, "timing out must not release a stuck worker's slot");
+        // It ends after every caller gave up: the next one gets its answer, with no new lookup.
+        let addr: std::net::SocketAddr = "10.0.0.1:80".parse().unwrap();
+        release.send(vec![addr]).unwrap();
+        let got = resolve_with("hung.example:80", Instant::now() + Duration::from_secs(5), &DNS, |_| panic!("answered recently"));
+        assert_eq!(got.unwrap(), vec![addr]);
+        assert_eq!(workers(&DNS), 0);
+    }
+
+    #[test]
+    fn busy_workers_hold_other_names_until_one_frees_or_the_deadline() {
+        static DNS: Resolver = Resolver::new();
+        let mut releases = Vec::new();
+        for i in 0..DNS_WORKERS {
+            let (release, lookup) = held();
+            releases.push(release);
+            let at = Instant::now() + Duration::from_millis(10);
+            assert!(resolve_with(&format!("hung{i}.example:80"), at, &DNS, lookup).is_err());
+        }
+        assert_eq!(workers(&DNS), DNS_WORKERS);
+        let err = resolve_with("next.example:80", Instant::now() + Duration::from_millis(30), &DNS, |_| panic!("no free worker"));
+        let err = err.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(err.to_string().contains("busy"), "{err}");
+        // IP literals need no worker.
         for addr in ["127.0.0.1:80", "[::1]:443"] {
-            let got = resolve_with(addr, start + Duration::from_secs(5), &COUNT, |_| panic!("IP literal must not resolve")).unwrap();
-            assert_eq!(got, vec![addr.parse::<std::net::SocketAddr>().unwrap()]);
+            let got = resolve_with(addr, Instant::now() + Duration::from_secs(5), &DNS, |_| panic!("an IP literal is not looked up"));
+            assert_eq!(got.unwrap(), vec![addr.parse::<std::net::SocketAddr>().unwrap()]);
         }
-        for release in releases {
-            release.send(()).unwrap();
-        }
+        // A caller waits for a worker, rather than failing while every one is busy.
+        let first = releases.remove(0);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            first.send(Vec::new()).unwrap();
+        });
+        let addr: std::net::SocketAddr = "10.0.0.2:80".parse().unwrap();
+        let got = resolve_with("next.example:80", Instant::now() + Duration::from_secs(5), &DNS, move |_| Ok(vec![addr]));
+        assert_eq!(got.unwrap(), vec![addr]);
+        drop(releases);
         let at = Instant::now() + Duration::from_secs(1);
-        while COUNT.load(Ordering::SeqCst) != 0 {
+        while workers(&DNS) != 0 {
             assert!(Instant::now() < at, "finished workers must release their slots");
             std::thread::yield_now();
         }
-        assert!(resolve_with("done.example:80", at, &COUNT, |_| Ok(vec![])).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_failed_lookup_reaches_its_callers_and_is_not_kept() {
+        static DNS: Resolver = Resolver::new();
+        let at = || Instant::now() + Duration::from_secs(5);
+        let err = resolve_with("gone.example:80", at(), &DNS, |_| Err(io::Error::new(io::ErrorKind::NotFound, "no such name")));
+        let err = err.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(err.to_string().contains("gone.example:80") && err.to_string().contains("no such name"), "{err}");
+        let err = resolve_with("gone.example:80", at(), &DNS, |_| Ok(Vec::new())).unwrap_err();
+        assert!(err.to_string().contains("no address"), "{err}");
+        let addr: std::net::SocketAddr = "10.0.0.3:80".parse().unwrap();
+        assert_eq!(resolve_with("gone.example:80", at(), &DNS, move |_| Ok(vec![addr])).unwrap(), vec![addr]);
     }
 
     #[test]
     fn expired_dns_deadline_does_not_start_a_lookup() {
-        static COUNT: AtomicUsize = AtomicUsize::new(0);
-        let err = resolve_with("unused.example:80", Instant::now(), &COUNT, |_| panic!("deadline passed")).unwrap_err();
+        static DNS: Resolver = Resolver::new();
+        let err = resolve_with("unused.example:80", Instant::now(), &DNS, |_| panic!("deadline passed")).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
-        assert_eq!(COUNT.load(Ordering::SeqCst), 0);
+        assert_eq!(workers(&DNS), 0);
     }
 
     #[test]
