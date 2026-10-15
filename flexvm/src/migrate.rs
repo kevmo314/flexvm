@@ -479,12 +479,12 @@ impl Proc {
         let deadline = Instant::now() + if fault("short_incoming") { Duration::from_secs(2) } else { INCOMING_WAIT };
         let mut r = BufReader::new(By { s: w.try_clone()?, at: deadline });
         let pager = prepared.0.pager.clone();
-        // Bytes the source has declared and this side not yet read: a refusal drains them.
-        let owed = &std::sync::atomic::AtomicU64::new(0);
+        // Bytes the source has declared and this side not yet read, at most what it may send: a refusal drains them.
+        let owed = &std::sync::atomic::AtomicU64::new(arrival_owed(u64::MAX, usize::MAX));
         let res = thread::scope(|scope| -> Result<(Arc<Vm>, Value)> {
             let hdr: Header<'static> = crate::util::recv_json_max(&mut r, MAX_HEADER)?.ok_or("source hung up before sending the vmstate")?;
+            owed.store(arrival_owed(hdr.vmstate_len, hdr.preload.len()), Ordering::SeqCst);
             let preload_len = (hdr.preload.len() * crate::util::PAGE_SIZE) as u64;
-            owed.store(hdr.vmstate_len.min(MAX_VMSTATE) + preload_len, Ordering::SeqCst);
             let mut t = Phases::new();
             let runs: Runs = hdr.runs.into_owned();
             let pages: Vec<u64> = hdr.preload.into_owned();
@@ -497,7 +497,7 @@ impl Proc {
             crate::host::stall("admitted_stall");
             *self.sizes.lock().unwrap() = Some(sizes);
             let state = read_vec(&mut r, hdr.vmstate_len, MAX_VMSTATE)?;
-            owed.store(preload_len, Ordering::SeqCst);
+            owed.store(arrival_owed(0, pages.len()), Ordering::SeqCst);
             t.mark("recv_state");
             self.app_log.store(hdr.app_log, Ordering::SeqCst);
             // Preload installed while Firecracker parses the state; all in, or no commit.
@@ -908,6 +908,12 @@ pub fn migration_id() -> u64 {
     h.finish() >> 11
 }
 
+/// What an arrival still to read `vmstate_len` bytes of state and `preload` pages is drained of if refused: never
+/// more than a source may send.
+fn arrival_owed(vmstate_len: u64, preload: usize) -> u64 {
+    vmstate_len.min(MAX_VMSTATE) + (preload.min(MAX_PRELOAD) * crate::util::PAGE_SIZE) as u64
+}
+
 /// Answers a refusal, then reads what the source still sends (`owed` bytes, by `at`): closed with that unread, the
 /// connection would be reset, and the source, still writing, would never read the reason.
 fn refuse_arrival(w: &TcpStream, r: &mut impl Read, reply: &Value, owed: u64, at: Instant) {
@@ -948,5 +954,14 @@ mod tests {
         refuse_arrival(&w, &mut r, &json!({"ok": false, "error": "no room"}), (LEN - 100) as u64, at);
         drop((w, r));
         assert_eq!(source.join().unwrap().unwrap()["error"], "no room");
+    }
+
+    /// A header declaring more than a source may send (a million preload pages) drains no more than that.
+    #[test]
+    fn a_refusal_drains_at_most_what_a_source_may_send() {
+        let most = MAX_VMSTATE + (MAX_PRELOAD * crate::util::PAGE_SIZE) as u64;
+        assert_eq!(arrival_owed(u64::MAX, 1_000_000), most);
+        assert_eq!(arrival_owed(100, 2), 100 + 2 * crate::util::PAGE_SIZE as u64);
+        assert_eq!(arrival_owed(0, 0), 0);
     }
 }

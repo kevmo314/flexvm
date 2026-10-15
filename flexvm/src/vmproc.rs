@@ -2151,8 +2151,7 @@ fn each_peer(peers: Vec<String>, by: Instant, f: impl Fn(&str) + Send + Sync + '
 
 /// The route announcements the peers have yet to take, the newest per peer: one thread of the process's own hands each
 /// to a thread of its own, retrying with backoff (a thread not had, a lookup or a call failed) until it is delivered, a
-/// newer one replaces it, its peer is no longer configured, or it has been tried `retry.2` times. Callers never wait on a
-/// peer.
+/// newer one replaces it, or its peer is no longer configured. Callers never wait on a peer.
 pub struct Announcer {
     pending: Mutex<std::collections::HashMap<String, Pending>>,
     wake: std::sync::Condvar,
@@ -2160,7 +2159,7 @@ pub struct Announcer {
     call: fn(&str, &Value) -> Result<()>,
     /// The peers configured now.
     peers: Box<dyn Fn() -> Vec<String> + Send + Sync>,
-    retry: (Duration, Duration, u32),
+    retry: (Duration, Duration),
 }
 
 struct Pending {
@@ -2172,15 +2171,15 @@ struct Pending {
     busy: Option<u64>,
 }
 
-/// The first and longest pause between tries, and how many tries (about 5 minutes).
-const ANNOUNCE_RETRY: (Duration, Duration, u32) = (Duration::from_millis(250), Duration::from_secs(10), 36);
+/// The first and longest pause between tries: a peer down for long is tried quietly, and told once it is back.
+const ANNOUNCE_RETRY: (Duration, Duration) = (Duration::from_millis(250), Duration::from_secs(60));
 
 impl Announcer {
     fn start(
         spawn: fn(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
         call: fn(&str, &Value) -> Result<()>,
         peers: Box<dyn Fn() -> Vec<String> + Send + Sync>,
-        retry: (Duration, Duration, u32),
+        retry: (Duration, Duration),
     ) -> std::io::Result<Arc<Announcer>> {
         let a = Arc::new(Announcer { pending: Mutex::default(), wake: Default::default(), spawn, call, peers, retry });
         let me = a.clone();
@@ -2208,9 +2207,10 @@ impl Announcer {
     fn run(self: Arc<Self>) {
         let mut seq = 0;
         loop {
-            let peers = (self.peers)();
             let due: Vec<_> = {
                 let mut p = self.pending.lock().unwrap();
+                // Read under the lock: a peer configured and told since is not pruned by an older list.
+                let peers = (self.peers)();
                 p.retain(|peer, _| peers.contains(peer));
                 let now = Instant::now();
                 p.iter_mut()
@@ -2245,29 +2245,23 @@ impl Announcer {
         let Some(e) = p.get_mut(peer).filter(|e| e.busy == Some(seq)) else { return };
         e.busy = None;
         let what = format!("announce {} gen {} to {peer}", req["ip"].as_str().unwrap_or("?"), req["gen"]);
-        let keep = match r {
-            _ if e.req != *req => true,
+        match r {
+            _ if e.req != *req => {}
             Ok(()) => {
                 if e.tries > 0 {
                     crate::log!("{what}: delivered after {} failed tries", e.tries);
                 }
-                false
+                p.remove(peer);
             }
             Err(err) => {
                 e.tries += 1;
-                // Only the first failure and the outcome are logged.
-                if e.tries >= self.retry.2 {
-                    crate::log!("{what}: {err}; giving up after {} tries", e.tries);
-                } else if e.tries == 1 {
-                    crate::log!("{what}: {err}; trying again, up to {} times", self.retry.2 - 1);
+                // Only the first failure and the delivery are logged.
+                if e.tries == 1 {
+                    crate::log!("{what}: {err}; trying again until it is delivered or {peer} is no longer a peer");
                 }
                 e.at = Instant::now() + e.backoff;
                 e.backoff = (e.backoff * 2).min(self.retry.1);
-                e.tries < self.retry.2
             }
-        };
-        if !keep {
-            p.remove(peer);
         }
         self.wake.notify_all();
     }
@@ -2419,25 +2413,29 @@ mod tests {
         }
     }
 
-    /// A peer no longer configured is not told on; one that never takes it is given up on after its tries.
+    /// A peer no longer configured is not told on; one down for long (past 36 tries) is told once it is back.
     #[test]
-    fn announcements_stop_for_removed_peers_and_after_their_tries() {
+    fn announcements_stop_for_removed_peers_and_reach_one_back_up() {
         static CALLS: Mutex<Vec<String>> = Mutex::new(Vec::new());
         let configured = Arc::new(Mutex::new(vec!["gone".to_string(), "down".to_string()]));
         let c = configured.clone();
         let a = Announcer::start(
             |f| thread::Builder::new().spawn(f).map(drop),
             |peer, _| {
-                CALLS.lock().unwrap().push(peer.into());
-                Err("refused".into())
+                let mut calls = CALLS.lock().unwrap();
+                calls.push(peer.into());
+                match calls.iter().filter(|c| *c == "down").count() {
+                    41.. if peer == "down" => Ok(()),
+                    _ => Err("refused".into()),
+                }
             },
             Box::new(move || c.lock().unwrap().clone()),
-            (Duration::from_millis(20), Duration::from_millis(100), 5),
+            (Duration::from_millis(1), Duration::from_millis(5)),
         )
         .unwrap();
         let calls = |p: &str| CALLS.lock().unwrap().iter().filter(|c| *c == p).count();
         let until = |done: &dyn Fn() -> bool| {
-            let end = Instant::now() + Duration::from_secs(5);
+            let end = Instant::now() + Duration::from_secs(10);
             while !done() {
                 assert!(Instant::now() < end);
                 thread::sleep(Duration::from_millis(1));
@@ -2448,10 +2446,50 @@ mod tests {
         configured.lock().unwrap().retain(|p| p != "gone");
         until(&|| a.pending.lock().unwrap().is_empty());
         let gone = calls("gone");
-        assert!(gone < 3, "pruned once no longer configured: {gone}");
-        assert_eq!(calls("down"), 5, "given up after its tries");
-        thread::sleep(Duration::from_millis(300));
-        assert_eq!((calls("gone"), calls("down")), (gone, 5), "and never called again");
+        assert!(gone < 10, "pruned once no longer configured: {gone}");
+        assert_eq!(calls("down"), 41, "tried until delivered, then no more");
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!((calls("gone"), calls("down")), (gone, 41), "and never called again");
+    }
+
+    /// A peer configured and told while the announcer reads the peers is not pruned by the list it read.
+    #[test]
+    fn a_peer_added_meanwhile_is_not_pruned_by_an_older_list() {
+        static CALLS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let configured = Arc::new(Mutex::new(Vec::<String>::new()));
+        let me: Arc<std::sync::OnceLock<std::sync::Weak<Announcer>>> = Default::default();
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (c, m, armed2) = (configured.clone(), me.clone(), armed.clone());
+        let a = Announcer::start(
+            |f| thread::Builder::new().spawn(f).map(drop),
+            |peer, _| {
+                CALLS.lock().unwrap().push(peer.into());
+                Ok(())
+            },
+            Box::new(move || {
+                let old = c.lock().unwrap().clone();
+                if armed2.swap(false, Ordering::SeqCst) {
+                    // The peer is configured and told after this list is read, before it is used.
+                    let (c, a) = (c.clone(), m.get().unwrap().upgrade().unwrap());
+                    thread::spawn(move || {
+                        c.lock().unwrap().push("b".into());
+                        a.tell(vec!["b".into()], json!({"op": "route", "ip": "10.0.0.9", "gen": 1, "rev": 0}));
+                    });
+                    thread::sleep(Duration::from_millis(100));
+                }
+                old
+            }),
+            ANNOUNCE_RETRY,
+        )
+        .unwrap();
+        me.set(Arc::downgrade(&a)).unwrap();
+        armed.store(true, Ordering::SeqCst);
+        a.tell(Vec::new(), json!({}));
+        let end = Instant::now() + Duration::from_secs(5);
+        while !CALLS.lock().unwrap().contains(&"b".to_string()) {
+            assert!(Instant::now() < end, "b was told");
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[test]
