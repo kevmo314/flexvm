@@ -9,6 +9,10 @@ use base64::Engine;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver};
+use ureq::unversioned::transport::{Buffers, ConnectionDetails, Connector, NextTimeout, RustlsConnector, TcpConnector, Transport};
+use ureq::Timeout;
+
 use super::reference::Reference;
 use super::unpack::{Hashed, MAX_DOCUMENT};
 use crate::bail;
@@ -29,85 +33,146 @@ fn deadline(size: u64) -> Instant {
     Instant::now() + TRANSFER_BASE + Duration::from_secs(size / MIN_RATE)
 }
 
-/// An agent for one transfer: DNS and TLS obey the transfer's deadline. TLS runs over a socket that enforces it,
-/// handshake included (ureq's own deadline starts only once the handshake is done), and its
-/// connections are never pooled into another transfer.
+/// An agent for one transfer: DNS, connect, the TLS handshake and every read and write obey the transfer's deadline
+/// (ureq holds each handshake read, not the handshake, to its connect timeout), and its connections are never pooled
+/// into another transfer.
 fn agent(deadline: Instant) -> ureq::Agent {
-    static TLS: std::sync::OnceLock<Arc<ureq::rustls::ClientConfig>> = std::sync::OnceLock::new();
-    // As ureq's default.
-    let tls = TLS.get_or_init(|| {
-        let roots = ureq::rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
-        let config = ureq::rustls::ClientConfig::builder_with_provider(ureq::rustls::crypto::ring::default_provider().into())
-            .with_protocol_versions(&[&ureq::rustls::version::TLS12, &ureq::rustls::version::TLS13])
-            .expect("ring supports TLS 1.2 and 1.3")
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        Arc::new(config)
-    });
-    ureq::AgentBuilder::new()
-        .resolver(move |addr: &str| crate::util::resolve(addr, deadline))
-        .timeout_connect(Duration::from_secs(30))
-        .timeout_read(IDLE)
-        .timeout_write(IDLE)
-        .tls_connector(Arc::new(DeadlineTls { tls: tls.clone(), deadline }))
+    let config = ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(30)))
         .user_agent(concat!("flexvm/", env!("CARGO_PKG_VERSION")))
-        // Redirects are followed by hand, never carrying credentials.
-        .redirects(0)
-        .build()
+        // Redirects are followed by hand, never carrying credentials; statuses are handled by hand.
+        .max_redirects(0)
+        .max_redirects_will_error(false)
+        .http_status_as_error(false)
+        .proxy(None)
+        .build();
+    let connector = TcpConnector::default().chain(DeadlineConnector(deadline)).chain(RustlsConnector::default());
+    ureq::Agent::with_parts(config, connector, DeadlineResolver(deadline))
 }
 
 /// Longest wait for any one read or write.
 const IDLE: Duration = Duration::from_secs(120);
 
-struct DeadlineTls {
-    tls: Arc<ureq::rustls::ClientConfig>,
-    deadline: Instant,
-}
-
-impl ureq::TlsConnector for DeadlineTls {
-    fn connect(&self, dns_name: &str, io: Box<dyn ureq::ReadWrite>) -> std::result::Result<Box<dyn ureq::ReadWrite>, ureq::Error> {
-        self.tls.connect(dns_name, Box::new(Deadlined { io, deadline: self.deadline }))
-    }
-}
-
-/// Every read and write waits at most until the deadline, and none starts after it.
 #[derive(Debug)]
-struct Deadlined {
-    io: Box<dyn ureq::ReadWrite>,
+struct DeadlineResolver(Instant);
+
+impl Resolver for DeadlineResolver {
+    fn resolve(&self, uri: &ureq::http::Uri, _: &ureq::config::Config, _: NextTimeout) -> std::result::Result<ResolvedSocketAddrs, ureq::Error> {
+        let (Some(scheme), Some(authority)) = (uri.scheme(), uri.authority()) else { return Err(ureq::Error::HostNotFound) };
+        let addr = DefaultResolver::host_and_port(scheme, authority).ok_or(ureq::Error::HostNotFound)?;
+        let mut addrs = self.empty();
+        for a in crate::util::resolve(&addr, self.0)?.into_iter().take(16) {
+            addrs.push(a);
+        }
+        if addrs.is_empty() {
+            return Err(ureq::Error::HostNotFound);
+        }
+        Ok(addrs)
+    }
+}
+
+/// Puts `Deadlined` under TLS, so the handshake obeys the deadline too.
+#[derive(Debug)]
+struct DeadlineConnector(Instant);
+
+impl<In: Transport> Connector<In> for DeadlineConnector {
+    type Out = Deadlined<In>;
+
+    fn connect(&self, _: &ConnectionDetails, chained: Option<In>) -> std::result::Result<Option<Self::Out>, ureq::Error> {
+        Ok(chained.map(|io| Deadlined { io, deadline: self.0 }))
+    }
+}
+
+/// Every read and write waits at most `IDLE`, and until the deadline; none starts after it.
+#[derive(Debug)]
+struct Deadlined<T> {
+    io: T,
     deadline: Instant,
 }
 
-impl Deadlined {
-    fn io<T>(&mut self, op: impl FnOnce(&mut Box<dyn ureq::ReadWrite>) -> std::io::Result<T>) -> std::io::Result<T> {
-        let timed_out = || std::io::Error::new(std::io::ErrorKind::TimedOut, "transfer deadline passed");
-        let left = self.deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()).ok_or_else(timed_out)?;
-        let socket = self.io.socket().ok_or_else(|| std::io::Error::other("TLS without a TCP socket"))?;
-        socket.set_read_timeout(Some(left.min(IDLE)))?;
-        socket.set_write_timeout(Some(left.min(IDLE)))?;
-        op(&mut self.io).map_err(|e| if e.kind() == std::io::ErrorKind::WouldBlock { timed_out() } else { e })
+impl<T> Deadlined<T> {
+    fn timeout(&self, next: NextTimeout) -> std::result::Result<NextTimeout, ureq::Error> {
+        let left = self.deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()).ok_or(ureq::Error::Timeout(Timeout::Global))?;
+        let idle = NextTimeout { after: next.after.min(IDLE.into()), reason: next.reason };
+        Ok(if idle.after > left.into() { NextTimeout { after: left.into(), reason: Timeout::Global } } else { idle })
     }
 }
 
-impl Read for Deadlined {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.io(|io| io.read(buf))
+impl<T: Transport> Transport for Deadlined<T> {
+    fn buffers(&mut self) -> &mut dyn Buffers {
+        self.io.buffers()
+    }
+
+    fn transmit_output(&mut self, amount: usize, timeout: NextTimeout) -> std::result::Result<(), ureq::Error> {
+        let timeout = self.timeout(timeout)?;
+        self.io.transmit_output(amount, timeout)
+    }
+
+    fn await_input(&mut self, timeout: NextTimeout) -> std::result::Result<bool, ureq::Error> {
+        let timeout = self.timeout(timeout)?;
+        self.io.await_input(timeout)
+    }
+
+    fn is_open(&mut self) -> bool {
+        self.io.is_open()
+    }
+
+    fn is_tls(&self) -> bool {
+        self.io.is_tls()
     }
 }
 
-impl std::io::Write for Deadlined {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.io(|io| io.write(buf))
+/// `loc` resolved against `base` (an absolute http(s) URL) as RFC 3986 section 5.2 does, without its fragment or any
+/// userinfo; only http(s) URLs with a host are accepted.
+fn resolve_location(base: &str, loc: &str) -> Result<String> {
+    // Scheme, authority, path and query (RFC 3986 appendix B).
+    fn split(r: &str) -> (Option<&str>, Option<&str>, &str, Option<&str>) {
+        let r = r.split('#').next().unwrap_or("");
+        let (r, query) = r.split_once('?').map_or((r, None), |(r, q)| (r, Some(q)));
+        let (scheme, r) = match r.split_once(':') {
+            Some((s, rest)) if !s.is_empty() && !s.contains('/') => (Some(s), rest),
+            _ => (None, r),
+        };
+        let (auth, path) = match r.strip_prefix("//") {
+            Some(r) => r.find('/').map_or((Some(r), ""), |i| (Some(&r[..i]), &r[i..])),
+            None => (None, r),
+        };
+        (scheme, auth, path, query)
     }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.io(|io| io.flush())
+    // Section 5.2.4, for a path from the root.
+    fn remove_dots(path: &str) -> String {
+        let segs: Vec<&str> = path.strip_prefix('/').unwrap_or(path).split('/').collect();
+        let mut out = Vec::new();
+        for (i, seg) in segs.iter().enumerate() {
+            match *seg {
+                "." | ".." => {
+                    if *seg == ".." {
+                        out.pop();
+                    }
+                    if i + 1 == segs.len() {
+                        out.push("");
+                    }
+                }
+                s => out.push(s),
+            }
+        }
+        format!("/{}", out.join("/"))
     }
-}
-
-impl ureq::ReadWrite for Deadlined {
-    fn socket(&self) -> Option<&std::net::TcpStream> {
-        self.io.socket()
+    let (Some(scheme), Some(auth), path, query) = split(base) else { bail!("redirect from a relative URL {base:?}") };
+    let (s, a, p, q) = split(loc);
+    let (scheme, auth, path, query) = match (s, a) {
+        (Some(s), _) => (s, a.unwrap_or(""), remove_dots(p), q),
+        (None, Some(a)) => (scheme, a, remove_dots(p), q),
+        (None, None) if p.is_empty() => (scheme, auth, if path.is_empty() { "/".into() } else { path.to_string() }, q.or(query)),
+        (None, None) if p.starts_with('/') => (scheme, auth, remove_dots(p), q),
+        (None, None) => (scheme, auth, remove_dots(&format!("{}{p}", &path[..path.rfind('/').map_or(0, |i| i + 1)])), q),
+    };
+    let scheme = scheme.to_ascii_lowercase();
+    let host = auth.rsplit_once('@').map_or(auth, |(_, host)| host);
+    if !matches!(scheme.as_str(), "http" | "https") || host.is_empty() {
+        bail!("unsupported redirect to {loc:?}");
     }
+    Ok(format!("{scheme}://{host}{path}{}", query.map(|q| format!("?{q}")).unwrap_or_default()))
 }
 
 /// Shared by all of an image's layers (`Arc`), its token with them.
@@ -132,7 +197,7 @@ impl Registry {
         host == self.r.registry || (self.r.registry == "registry-1.docker.io" && host == "auth.docker.io")
     }
 
-    /// The time left before `deadline`, for the next request; ureq holds connect, writes and the body to it.
+    /// The time left before `deadline`, for the next request: ureq's own limit for it, under `Deadlined`'s.
     fn left(deadline: Instant, what: &str) -> Result<Duration> {
         match deadline.checked_duration_since(Instant::now()) {
             Some(left) if !left.is_zero() => Ok(left),
@@ -141,28 +206,27 @@ impl Registry {
     }
 
     /// Authenticates on a 401 and retries once; redirects (blob storage) are followed without credentials.
-    fn get(&self, path: &str, accept: &str, deadline: Instant) -> Result<ureq::Response> {
+    fn get(&self, path: &str, accept: &str, deadline: Instant) -> Result<ureq::Body> {
         let base = format!("{}/{path}", self.r.base_url());
         let (mut url, mut redirects, mut authenticated) = (base.clone(), 0, false);
         let agent = agent(deadline);
         loop {
-            let mut req = agent.get(&url).timeout(Self::left(deadline, &format!("GET {url}"))?);
+            let mut req = agent.get(&url).config().timeout_global(Some(Self::left(deadline, &format!("GET {url}"))?)).build();
             if redirects == 0 {
-                req = req.set("Accept", accept);
+                req = req.header("Accept", accept);
                 if let Some(a) = self.auth.lock().unwrap().clone() {
-                    req = req.set("Authorization", &a);
+                    req = req.header("Authorization", &*a);
                 }
             }
-            match req.call() {
-                Ok(resp) if (300..400).contains(&resp.status()) => {
-                    let loc = resp.header("location").ok_or("redirect without a location")?;
-                    url = if loc.starts_with("https://") || loc.starts_with("http://") {
-                        loc.to_string()
-                    } else if loc.starts_with('/') {
-                        format!("{}{loc}", url.splitn(4, '/').take(3).collect::<Vec<_>>().join("/"))
-                    } else {
-                        bail!("unsupported redirect to {loc:?}");
-                    };
+            let resp = match req.call() {
+                Ok(resp) => resp,
+                Err(e) => bail!("GET {url}: {e}"),
+            };
+            let header = |name: &str| resp.headers().get(name).and_then(|v| v.to_str().ok());
+            match resp.status().as_u16() {
+                300..=399 => {
+                    let loc = header("location").ok_or("redirect without a location")?;
+                    url = resolve_location(&url, loc)?;
                     if base.starts_with("https://") && !url.starts_with("https://") {
                         bail!("refusing a redirect from HTTPS to {url}");
                     }
@@ -171,21 +235,20 @@ impl Registry {
                         bail!("too many redirects from {base}");
                     }
                 }
-                Ok(resp) => return Ok(resp),
-                Err(ureq::Error::Status(401, resp)) if !authenticated && redirects == 0 => {
-                    let challenge = resp.header("www-authenticate").unwrap_or("").to_string();
+                ..=299 => return Ok(resp.into_body()),
+                401 if !authenticated && redirects == 0 => {
+                    let challenge = header("www-authenticate").unwrap_or("").to_string();
                     self.authenticate(&agent, &challenge, deadline)?;
                     authenticated = true;
                 }
-                Err(ureq::Error::Status(401, _)) if redirects == 0 => {
+                401 if redirects == 0 => {
                     bail!("GET {url}: unauthorized{}", if self.basic.is_none() { " (no credentials in docker config)" } else { "" })
                 }
-                Err(ureq::Error::Status(code, resp)) => {
+                code => {
                     let mut body = Vec::new();
-                    let _ = resp.into_reader().take(300).read_to_end(&mut body);
+                    let _ = resp.into_body().into_reader().take(300).read_to_end(&mut body);
                     bail!("GET {url}: HTTP {code}: {}", String::from_utf8_lossy(&body).trim())
                 }
-                Err(e) => bail!("GET {url}: {e}"),
             }
         }
     }
@@ -207,20 +270,20 @@ impl Registry {
             })
         };
         let realm = param("realm").ok_or("auth challenge has no realm")?;
-        let mut req = agent.get(&realm).timeout(Self::left(deadline, &format!("token from {realm}"))?);
+        let mut req = agent.get(&realm).config().timeout_global(Some(Self::left(deadline, &format!("token from {realm}"))?)).build();
         if let Some(service) = param("service") {
             req = req.query("service", &service);
         }
-        req = req.query("scope", &param("scope").unwrap_or(format!("repository:{}:pull", self.r.repository)));
+        req = req.query("scope", param("scope").unwrap_or(format!("repository:{}:pull", self.r.repository)));
         // Anywhere else gets an anonymous token request.
         match &self.basic {
-            Some(b) if self.trusted(&realm) => req = req.set("Authorization", &format!("Basic {b}")),
+            Some(b) if self.trusted(&realm) => req = req.header("Authorization", &format!("Basic {b}")),
             Some(_) => crate::log!("image: not sending credentials to untrusted token realm {realm}"),
             None => {}
         }
         let body: Value = match req.call() {
-            Ok(r) if r.status() == 200 => serde_json::from_reader(r.into_reader().take(1 << 20))?,
-            Ok(r) => bail!("token from {realm}: HTTP {}", r.status()),
+            Ok(r) if r.status() == 200 => serde_json::from_reader(r.into_body().into_reader().take(1 << 20))?,
+            Ok(r) => bail!("token from {realm}: HTTP {}", r.status().as_u16()),
             Err(e) => bail!("token from {realm}: {e}"),
         };
         let token = body["token"].as_str().or(body["access_token"].as_str()).ok_or("token response has no token")?;
@@ -347,10 +410,8 @@ pub(super) mod tests {
     #[test]
     fn agent_dns_obeys_the_transfer_deadline() {
         let err = agent(Instant::now()).get("http://unused.example:80/").call().unwrap_err();
-        let ureq::Error::Transport(err) = err else { panic!("expected DNS failure") };
-        assert_eq!(err.kind(), ureq::ErrorKind::Dns);
-        let cause = std::error::Error::source(&err).unwrap().downcast_ref::<std::io::Error>().unwrap();
-        assert_eq!(cause.kind(), std::io::ErrorKind::TimedOut);
+        let ureq::Error::Io(err) = err else { panic!("expected a timed-out lookup: {err}") };
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
     }
 
     #[test]
@@ -410,28 +471,38 @@ pub(super) mod tests {
     /// Serves each connection by its request path: `/v2/<image>/<path>` answers `respond(path)`, one byte at a
     /// time every `drip` once past its first `fast` bytes, until the client hangs up.
     pub(in super::super) fn drip_server(fast: usize, drip: Duration, respond: impl Fn(&str, &str) -> String + Send + Sync + 'static) -> String {
-        use std::io::{BufRead, BufReader, Write};
+        http_server(respond, move |socket, resp| {
+            use std::io::Write;
+            let _ = socket.write_all(&resp[..fast.min(resp.len())]);
+            for b in resp.iter().skip(fast) {
+                std::thread::sleep(drip);
+                if socket.write_all(&[*b]).is_err() {
+                    return;
+                }
+            }
+        })
+    }
+
+    /// Serves each connection by its request path: `/v2/<image>/<path>` gets `send(socket, respond(base, path))`.
+    fn http_server(
+        respond: impl Fn(&str, &str) -> String + Send + Sync + 'static,
+        send: impl Fn(&mut std::net::TcpStream, Vec<u8>) + Send + Sync + 'static,
+    ) -> String {
+        use std::io::{BufRead, BufReader};
         let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = server.local_addr().unwrap().to_string();
-        let respond = Arc::new(respond);
+        let (respond, send) = (Arc::new(respond), Arc::new(send));
         let base = addr.clone();
         std::thread::spawn(move || {
             for mut socket in server.incoming().flatten() {
-                let (respond, base) = (respond.clone(), base.clone());
+                let (respond, send, base) = (respond.clone(), send.clone(), base.clone());
                 std::thread::spawn(move || {
                     let mut reader = BufReader::new(socket.try_clone().unwrap());
                     let mut request = String::new();
                     reader.read_line(&mut request).unwrap();
                     while reader.read_line(&mut String::new()).is_ok_and(|n| n > 2) {}
                     let path = request.split(' ').nth(1).unwrap_or("").to_string();
-                    let resp = respond(&base, &path).into_bytes();
-                    let _ = socket.write_all(&resp[..fast.min(resp.len())]);
-                    for b in resp.iter().skip(fast) {
-                        std::thread::sleep(drip);
-                        if socket.write_all(&[*b]).is_err() {
-                            return;
-                        }
-                    }
+                    send(&mut socket, respond(&base, &path).into_bytes());
                 });
             }
         });
@@ -469,7 +540,7 @@ pub(super) mod tests {
                 Ok(data)
             });
             let err = res.expect_err(name).to_string();
-            assert!(err.contains("timed out") || err.contains("deadline"), "{name}: {err}");
+            assert!(err.contains("timed out") || err.contains("timeout") || err.contains("deadline"), "{name}: {err}");
             assert!(start.elapsed() < Duration::from_secs(5), "{name}: took {:?}", start.elapsed());
         }
         // A fast transfer is unaffected.
@@ -500,9 +571,109 @@ pub(super) mod tests {
         });
         let start = Instant::now();
         let deadline = start + Duration::from_millis(700);
-        let err = agent(deadline).get(&format!("https://{addr}/v2/")).timeout(deadline - start).call().unwrap_err().to_string();
-        assert!(err.contains("deadline") || err.contains("timed out"), "{err}");
+        // No timeout of ureq's own: it would hold each handshake read to it, not the handshake.
+        let err = agent(deadline).get(&format!("https://{addr}/v2/")).call().unwrap_err().to_string();
+        assert!(err.contains("timeout") || err.contains("timed out"), "{err}");
         assert!(start.elapsed() < Duration::from_secs(5), "took {:?}", start.elapsed());
+    }
+
+    /// Answers every request with `head(base, path)`, then `fill` without end, until the client hangs up.
+    fn endless_server(head: impl Fn(&str, &str) -> String + Send + Sync + 'static, fill: u8) -> String {
+        http_server(head, move |socket, head| {
+            use std::io::Write;
+            let chunk = [fill; 64 << 10];
+            if socket.write_all(&head).is_ok() {
+                while socket.write_all(&chunk).is_ok() {}
+            }
+        })
+    }
+
+    /// A chunk-size line, a header or a trailer without end is refused once ureq's fixed input buffer is full; ureq 2
+    /// grew it until the deadline.
+    #[test]
+    fn endless_lines_allocate_a_bounded_amount() {
+        const CHUNKED: &str = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        type Head = fn(&str, &str) -> String;
+        let cases: [(&str, Head, u8); 4] = [
+            ("chunk size", |_, _| CHUNKED.into(), b'1'),
+            ("trailer", |_, _| format!("{CHUNKED}0\r\nX-Trailer: "), b'x'),
+            ("header", |_, _| "HTTP/1.1 200 OK\r\nX-Pad: ".into(), b'x'),
+            ("token", |base, path| {
+                if path.starts_with("/token") {
+                    CHUNKED.into()
+                } else {
+                    format!("HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"http://{base}/token\"\r\nContent-Length: 0\r\n\r\n")
+                }
+            }, b'f'),
+        ];
+        for (name, head, fill) in cases {
+            let addr = endless_server(head, fill);
+            let reg = Registry::new(Reference::parse(&format!("{addr}/test")).unwrap());
+            let (start, before) = (Instant::now(), crate::test_util::allocated());
+            let res = reg.get("manifests/x", "*/*", start + Duration::from_secs(30)).and_then(|r| {
+                let mut data = Vec::new();
+                r.into_reader().read_to_end(&mut data)?;
+                Ok(data)
+            });
+            let allocated = crate::test_util::allocated() - before;
+            let err = res.expect_err(name).to_string();
+            assert!(allocated < 2 << 20, "{name}: allocated {allocated} bytes ({err})");
+            assert!(start.elapsed() < Duration::from_secs(10), "{name}: took {:?} ({err})", start.elapsed());
+        }
+    }
+
+    #[test]
+    fn redirects_resolve_as_urls_do() {
+        let base = "https://reg.example/v2/a/b/blobs/sha256:x?q=1";
+        let cases = [
+            ("https://cdn.example/blob?sig=2", "https://cdn.example/blob?sig=2"),
+            ("HTTPS://cdn.example/a/./b/../c", "https://cdn.example/a/c"),
+            ("//cdn.example/blob", "https://cdn.example/blob"),
+            ("//cdn.example", "https://cdn.example/"),
+            ("/other/path?x=y#frag", "https://reg.example/other/path?x=y"),
+            ("../blob", "https://reg.example/v2/a/blob"),
+            ("../../../../../../blob", "https://reg.example/blob"),
+            ("blob2", "https://reg.example/v2/a/b/blobs/blob2"),
+            ("./", "https://reg.example/v2/a/b/blobs/"),
+            ("..", "https://reg.example/v2/a/b/"),
+            ("?z", "https://reg.example/v2/a/b/blobs/sha256:x?z"),
+            ("", "https://reg.example/v2/a/b/blobs/sha256:x?q=1"),
+            ("#f", "https://reg.example/v2/a/b/blobs/sha256:x?q=1"),
+            ("https://user:pw@cdn.example/blob", "https://cdn.example/blob"),
+            ("//user@cdn.example/blob", "https://cdn.example/blob"),
+            ("http://cdn.example/blob", "http://cdn.example/blob"),
+        ];
+        for (loc, want) in cases {
+            assert_eq!(resolve_location(base, loc).unwrap(), want, "{loc:?}");
+        }
+        assert_eq!(resolve_location("http://127.0.0.1:5000/v2/x", "//cdn/y").unwrap(), "http://cdn/y");
+        for loc in ["ftp://cdn.example/blob", "https:///blob", "https:blob", "file:/etc/passwd", "javascript:x"] {
+            assert!(resolve_location(base, loc).is_err(), "{loc:?}");
+        }
+    }
+
+    /// `get` follows a protocol-relative redirect to its host, not the registry's, without credentials; one to
+    /// plain HTTP from HTTPS is refused after resolution (here, the registry is HTTP, so it is followed).
+    #[test]
+    fn redirects_go_where_they_point() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let blob = drip_server(usize::MAX, Duration::ZERO, |_, path| {
+            let body = if path == "/v2/test/blob" { "moved" } else { "wrong" };
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+        });
+        let hops = Arc::new(AtomicUsize::new(0));
+        let (blob2, hops2) = (blob.clone(), hops.clone());
+        let addr = drip_server(usize::MAX, Duration::ZERO, move |_, path| {
+            hops2.fetch_add(1, Ordering::SeqCst);
+            let loc = if path.ends_with("/blobs/x") { "../elsewhere".to_string() } else { format!("//{blob2}/v2/test/blob") };
+            format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: {loc}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        });
+        let reg = Registry::new(Reference::parse(&format!("{addr}/test")).unwrap());
+        *reg.auth.lock().unwrap() = Some("Bearer secret".into());
+        let mut data = String::new();
+        reg.get("blobs/x", "*/*", Instant::now() + Duration::from_secs(5)).unwrap().into_reader().read_to_string(&mut data).unwrap();
+        assert_eq!(data, "moved");
+        assert_eq!(hops.load(Ordering::SeqCst), 2, "/v2/test/blobs/x, then /v2/test/elsewhere");
     }
 
     #[test]
