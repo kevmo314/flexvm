@@ -36,34 +36,53 @@ impl Drop for Hold {
     }
 }
 
-/// Recent admission: boottime, MiB, id, and optionally the VM's usage baseline.
-/// Older records have only the first three elements.
-#[derive(Debug, Serialize, Deserialize)]
-struct Grant(u64, u64, u64, #[serde(default)] Option<GrantOwner>);
+/// Recent admission: (boottime ms, MiB, id). Owners are kept apart
+/// (`grant_owners`), so a build that predates them still reads this file.
+type Grant = (u64, u64, u64);
 
+/// The cgroup a recent grant raised and its anon memory then (#349).
 #[derive(Debug, Serialize, Deserialize)]
 struct GrantOwner {
-    ident: Ident,
     cgroup: PathBuf,
-    used_mib: Option<u64>,
+    /// A cgroup made again at the same path is another one: its grant counts in full.
+    ino: u64,
+    /// Bytes.
+    anon: u64,
 }
 
-/// Charge only memory not yet reflected in MemAvailable. Work backwards so
-/// growth since a newer grant is credited once, before older grants can use it.
-fn pending_grants(grants: &[Grant], held_ids: &HashSet<u64>, mut memory: impl FnMut(&Path) -> Option<u64>) -> u64 {
-    let mut usage = HashMap::new();
+/// Recent grants count only what their cgroup has not used yet: MemAvailable
+/// has seen anon memory (the guest's, UFFD-backed) and none of what is still
+/// to come, but counts page cache as available, so `memory.current` would
+/// credit a grant still to be used. Newest first, so a cgroup's growth since a
+/// newer grant is credited once, before older grants can use it; never more
+/// in all than its growth since its oldest grant. No credit while anything is
+/// held (`credit` false): a pull's pages both shrink its hold and grow its
+/// cgroup. Without an owner, or with its cgroup unreadable or made again, a
+/// grant counts in full. `now` is (inode, anon bytes) of a cgroup.
+fn pending_grants(
+    grants: &[Grant],
+    owners: &HashMap<u64, GrantOwner>,
+    held_ids: &HashSet<u64>,
+    credit: bool,
+    mut now: impl FnMut(&Path) -> Option<(u64, u64)>,
+) -> u64 {
+    // Per cgroup: its reading, and the MiB credited so far.
+    type Seen = (Option<(u64, u64)>, u64);
+    let mut seen: HashMap<&Path, Seen> = HashMap::new();
     grants
         .iter()
         .rev()
         .filter(|g| !held_ids.contains(&g.2))
-        .map(|g| {
-            let Some(owner) = &g.3 else { return g.1 };
-            let Some(baseline) = owner.used_mib else { return g.1 };
-            let (current, credited) = usage.entry(&owner.ident).or_insert_with(|| (memory(&owner.cgroup), 0u64));
-            let Some(current) = *current else { return g.1 };
-            let used = g.1.min(current.saturating_sub(baseline).saturating_sub(*credited));
+        .map(|&(_, mib, id)| {
+            let Some(o) = owners.get(&id).filter(|_| credit) else { return mib };
+            let (cur, credited) = seen.entry(&o.cgroup).or_insert_with(|| (now(&o.cgroup), 0));
+            let Some((ino, anon)) = *cur else { return mib };
+            if ino != o.ino {
+                return mib;
+            }
+            let used = mib.min((anon.saturating_sub(o.anon) >> 20).saturating_sub(*credited));
             *credited += used;
-            g.1 - used
+            mib - used
         })
         .sum()
 }
@@ -830,6 +849,11 @@ impl Host {
         self.run.join(format!("grants-{}", boot_id()))
     }
 
+    /// Each recent grant's `GrantOwner`, by id; pruned with the grants.
+    fn grant_owners(&self) -> PathBuf {
+        self.run.join(format!("grant-owners-{}", boot_id()))
+    }
+
     /// Gives back grant `id` (from `grant`) that was not used.
     pub fn refund(&self, id: u64) {
         self.refund_by(id, None)
@@ -840,6 +864,7 @@ impl Host {
         let Ok(_l) = self.lock_by(deadline) else { return };
         let path = self.grants();
         let mut grants: Vec<Grant> = load(&path).ok().flatten().unwrap_or_default();
+        // Its owner goes with the next grant's pruning.
         let n = grants.len();
         grants.retain(|g| g.2 != id);
         if grants.len() != n {
@@ -857,9 +882,10 @@ impl Host {
         self.grant_inner(mib, floor, hold, None, cgroup, crate::vmproc::host_available_mib)?
     }
 
-    /// MemAvailable lags a grant until the guest touches the memory: recent
-    /// grants count only their unused portion, or in full without a readable
-    /// owner baseline. Held grants count however old, each once. Returns its id.
+    /// MemAvailable lags a grant until the guest touches the memory, so the
+    /// grants of the last `GRANT_WINDOW` count, less what their VM's cgroup
+    /// (`cgroup`, if any) has used since (`pending_grants`), and held ones
+    /// (`grant_start`) however old, each once. Returns the grant's id.
     /// Leaves `floor` available, read with the reserve under the host lock.
     /// Ok(Err(why)) if refused. Test fault `no_admit`: refuses everything.
     fn grant_inner(
@@ -890,7 +916,12 @@ impl Host {
         grants.retain(|g| g.0 <= now && now - g.0 <= GRANT_WINDOW.as_millis() as u64);
         let held = self.holds(&l);
         let held_ids: HashSet<_> = held.iter().map(|h| h.0).collect();
-        let pending: u64 = pending_grants(&grants, &held_ids, crate::limit::used_mib) + held.iter().map(|h| h.1).sum::<u64>();
+        // Unreadable, owners cost only credit: their grants count in full.
+        let owners_path = self.grant_owners();
+        let mut owners: HashMap<u64, GrantOwner> = load(&owners_path).ok().flatten().unwrap_or_default();
+        let known = owners.len();
+        owners.retain(|id, _| grants.iter().any(|g| g.2 == *id));
+        let pending = pending_grants(&grants, &owners, &held_ids, held.is_empty(), crate::limit::anon) + held.iter().map(|h| h.1).sum::<u64>();
         let avail = available().ok_or("cannot read MemAvailable from /proc/meminfo")?;
         if avail < floor + pending + mib {
             return Ok(Err(format!("not enough memory here for {mib} MiB above the {floor} MiB {what}").into()));
@@ -911,11 +942,17 @@ impl Host {
                 Some(Hold { path, id, mib, _file: f })
             }
         };
-        let owner = cgroup.map(|cg| GrantOwner { ident: Ident::me(), cgroup: cg.into(), used_mib: crate::limit::used_mib(cg) });
-        grants.push(Grant(now, mib, id, owner));
+        // Read before its mark is raised: nothing the grant is for counts yet.
+        let owner = cgroup.and_then(|cg| crate::limit::anon(cg).map(|(ino, anon)| GrantOwner { cgroup: cg.into(), ino, anon }));
+        grants.push((now, mib, id));
         if let Err(e) = store(&path, &grants, false) {
             drop(hold);
             return Err(e);
+        }
+        // After the grant: should this fail, the grant counts in full.
+        let owned = owner.map(|o| owners.insert(id, o)).is_some();
+        if owned || owners.len() != known {
+            let _ = store(&owners_path, &owners, false);
         }
         Ok(Ok((id, hold)))
     }
@@ -1261,7 +1298,7 @@ pub struct Entry {
 }
 
 /// Unique however pids are reused.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ident {
     pub pid: u32,
     pub start: u64,
@@ -2523,70 +2560,81 @@ mod tests {
         grant_at(&h, 1000, Floor::Reserve, false).unwrap();
     }
 
-    fn owned_grant(id: u64, baseline: Option<u64>) -> Grant {
-        Grant(0, 100, id, Some(GrantOwner { ident: Ident::me(), cgroup: "/fake/vm".into(), used_mib: baseline }))
+    /// (grants of 100 MiB with these ids, their owners in cgroup `/vm` (inode 1) at these anon MiB).
+    fn owned(baselines: &[(u64, u64)]) -> (Vec<Grant>, HashMap<u64, GrantOwner>) {
+        let grants = baselines.iter().map(|&(id, _)| (0, 100, id)).collect();
+        let owners = baselines.iter().map(|&(id, mib)| (id, GrantOwner { cgroup: "/vm".into(), ino: 1, anon: mib << 20 })).collect();
+        (grants, owners)
     }
 
     #[test]
-    fn pending_grants_discount_memory_already_used() {
-        let grants = [owned_grant(1, Some(200))];
-        for (current, pending) in [(Some(300), 0), (Some(350), 0), (Some(240), 60), (Some(150), 100), (None, 100)] {
-            assert_eq!(
-                pending_grants(&grants, &HashSet::new(), |cg| {
-                    assert_eq!(cg, Path::new("/fake/vm"));
-                    current
-                }),
-                pending,
-                "current {current:?}"
-            );
+    fn pending_grants_discount_anon_memory_already_used() {
+        let (grants, owners) = owned(&[(1, 200)]);
+        let none = HashSet::new();
+        for (now, pending) in [(Some((1, 300)), 0), (Some((1, 350)), 0), (Some((1, 240)), 60), (Some((1, 150)), 100), (None, 100), (Some((2, 300)), 100)] {
+            let at = |cg: &Path| {
+                assert_eq!(cg, Path::new("/vm"));
+                now.map(|(ino, mib)| (ino, mib << 20))
+            };
+            assert_eq!(pending_grants(&grants, &owners, &none, true, at), pending, "now {now:?}");
         }
+        // Anything held: no credit at all (a pull's pages also shrink its hold).
+        assert_eq!(pending_grants(&grants, &owners, &none, false, |_| panic!("no credit, no reading")), 100);
+        // Without an owner (an older build's grant, or no cgroup): in full.
+        assert_eq!(pending_grants(&grants, &HashMap::new(), &none, true, |_| panic!("no owner")), 100);
     }
 
     #[test]
-    fn pending_grants_keep_unknown_baselines_and_legacy_records_in_full() {
-        let legacy: Grant = serde_json::from_str("[0,100,1]").unwrap();
-        let grants = [legacy, owned_grant(2, None)];
-        assert_eq!(pending_grants(&grants, &HashSet::new(), |_| panic!("no readable baseline")), 200);
-        let decoded: Vec<Grant> = serde_json::from_slice(&serde_json::to_vec(&grants).unwrap()).unwrap();
-        assert_eq!(pending_grants(&decoded, &HashSet::new(), |_| Some(1000)), 200);
-    }
-
-    #[test]
-    fn pending_grants_credit_each_owners_growth_once() {
-        let mut grants = [owned_grant(1, Some(200)), owned_grant(2, Some(240)), owned_grant(3, Some(200))];
-        // Another VM (including reuse of a pid) has its own growth budget.
-        grants[2].3.as_mut().unwrap().ident.start += 1;
+    fn pending_grants_credit_each_cgroups_growth_once() {
+        let (mut grants, mut owners) = owned(&[(1, 200), (2, 240), (3, 200)]);
         let mut reads = 0;
-        assert_eq!(
-            pending_grants(&grants, &HashSet::new(), |_| {
-                reads += 1;
-                Some(300)
-            }),
-            100
-        );
-        assert_eq!(reads, 2, "one reading per owner");
-        assert_eq!(pending_grants(&grants, &HashSet::from([2]), |_| Some(300)), 0);
+        let mut at = |_: &Path| {
+            reads += 1;
+            Some((1, 300 << 20))
+        };
+        // Grown 60 since grant 2 and 100 since grant 1: 100 credited in all, whoever asked for them.
+        assert_eq!(pending_grants(&grants, &owners, &HashSet::new(), true, &mut at), 200);
+        assert_eq!(reads, 1, "one reading per cgroup");
+        assert_eq!(pending_grants(&grants, &owners, &HashSet::from([2]), true, |_| Some((1, 300 << 20))), 100);
+        // Another cgroup has growth of its own.
+        owners.get_mut(&3).unwrap().cgroup = "/other".into();
+        assert_eq!(pending_grants(&grants, &owners, &HashSet::new(), true, |_| Some((1, 300 << 20))), 100);
+        // Shrunk below a newer grant's baseline, grown past an older one's: credited only past the older.
+        grants.truncate(2);
+        assert_eq!(pending_grants(&grants, &owners, &HashSet::new(), true, |_| Some((1, 230 << 20))), 170);
     }
 
     #[test]
-    fn admission_records_the_vms_cgroup_baseline() {
+    fn admission_credits_the_vms_anon_growth_and_keeps_the_grants_file_readable_by_older_builds() {
         let mut h = host("grant-owner");
         h.cfg.reserve_mib = 0;
+        pin_clock(boottime_ms());
         let cg = h.run.join("cg");
         std::fs::create_dir(&cg).unwrap();
-        std::fs::write(cg.join("memory.current"), (200u64 << 20).to_string()).unwrap();
-        let id = h.grant_inner(100, Floor::Reserve, false, None, Some(&cg), || Some(100)).unwrap().unwrap().0;
-        let grants: Vec<Grant> = load(&h.grants()).unwrap().unwrap();
-        let owner = grants[0].3.as_ref().unwrap();
-        assert_eq!(owner.ident, Ident::me());
-        assert_eq!(owner.cgroup, cg);
-        assert_eq!(owner.used_mib, Some(200));
-        std::fs::write(cg.join("memory.current"), (300u64 << 20).to_string()).unwrap();
-        assert!(h.grant_inner(100, Floor::Reserve, false, None, None, || Some(100)).unwrap().is_ok());
+        let stat = |anon: u64, file: u64| std::fs::write(cg.join("memory.stat"), format!("anon {}\nfile {}\n", anon << 20, file << 20)).unwrap();
+        stat(200, 0);
+        let grant = |mib, cg: Option<&Path>, avail| h.grant_inner(mib, Floor::Reserve, false, None, cg, || Some(avail)).unwrap();
+        let id = grant(100, Some(&cg), 100).unwrap().0;
+        let owners: HashMap<u64, GrantOwner> = load(&h.grant_owners()).unwrap().unwrap();
+        assert_eq!((owners[&id].cgroup.as_path(), owners[&id].anon), (cg.as_path(), 200 << 20));
+        load::<Vec<(u64, u64, u64)>>(&h.grants()).unwrap().unwrap();
+        // Page cache is no use of the grant; anon is: 60 of its 100 MiB used.
+        stat(200, 500);
+        assert!(grant(1, None, 100).is_err());
+        stat(260, 0);
+        assert!(grant(61, None, 100).is_err() && grant(60, None, 100).is_ok());
+        // Gone with its grant (60 MiB unowned still counts from here on).
         h.refund(id);
-        let grants: Vec<Grant> = load(&h.grants()).unwrap().unwrap();
-        assert_eq!(grants.len(), 1);
-        assert!(grants[0].3.is_none());
+        let other = grant(1, None, 100).unwrap().0;
+        assert!(load::<HashMap<u64, GrantOwner>>(&h.grant_owners()).unwrap().unwrap().is_empty());
+        h.refund(other);
+        let id = grant(100, Some(&cg), 160).unwrap().0;
+        stat(400, 0);
+        assert!(grant(2, None, 61).is_err() && grant(1, None, 61).is_ok(), "used in full");
+        // Unreadable owners count their grants in full, and admit as before.
+        std::fs::write(h.grant_owners(), b"junk").unwrap();
+        assert!(grant(1, None, 161).is_err() && grant(1, None, 162).is_ok());
+        h.refund(id);
     }
 
     #[test]

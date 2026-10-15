@@ -78,8 +78,18 @@ pub struct Limit {
 }
 
 /// MiB charged to a Firecracker's cgroup; unreadable or malformed is unknown.
-pub(crate) fn used_mib(cgroup: &Path) -> Option<u64> {
+fn used_mib(cgroup: &Path) -> Option<u64> {
     Some(std::fs::read_to_string(cgroup.join("memory.current")).ok()?.trim().parse::<u64>().ok()? >> 20)
+}
+
+/// A cgroup's inode and anon bytes (the guest's memory: UFFD installs into an
+/// anonymous mapping), which MemAvailable never counts, unlike page cache.
+pub(crate) fn anon(cgroup: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let ino = std::fs::metadata(cgroup).ok()?.ino();
+    let stat = std::fs::read_to_string(cgroup.join("memory.stat")).ok()?;
+    let anon = stat.lines().find_map(|l| l.strip_prefix("anon "))?.trim().parse().ok()?;
+    Some((ino, anon))
 }
 
 impl Limit {
