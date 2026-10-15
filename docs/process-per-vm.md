@@ -161,12 +161,15 @@ RUN (default /run/flexvm, tmpfs)
   grants-BOOTID          recent grants not yet held, counted against the reserve
   evict.active           present while the host is under its eviction mark
   evict.backoff          refused VM and peer pairs and when to try them again
-  standby/T/KEY.PID-START.sock a standby VM of template T, generation KEY (PID-START.lock while it lives)
-  standby/T/PID-START.claim  locked by a standby VM while a claim of it is under way
-  standby/T/PID-START.take   locked by a `run` while it tries that standby (others try another first)
-  standby/T/.refill      one refill of T at a time (flock)
-  standby/T/.failed      its mtime: T's last failed refill (none for a minute after)
-  standby/T/standby.log  the standby VMs' output and refill errors
+  standby/H/             template T's standby files, H the hash of T's name (any T fits sun_path;
+                         `flexvm standby` shows each one's `dir`)
+  standby/H/.template    T, the template's name
+  standby/H/KEY.PID-START.sock a standby VM of template T, generation KEY (PID-START.lock while it lives)
+  standby/H/PID-START.claim  locked by a standby VM while a claim of it is under way
+  standby/H/PID-START.take   locked by a `run` while it tries that standby (others try another first)
+  standby/H/.refill      one refill of T at a time (flock)
+  standby/H/.failed      its mtime: T's last failed refill (none for a minute after)
+  standby/H/standby.log  the standby VMs' output and refill errors
   standby/.pressure      its mtime: when pressure last stopped standby VMs (no refill for a minute)
   standby/.loadset-ID    pages loads of template ID touch, learned by standby VMs, for migrations to preload
                          (one per generation; swept once neither read nor written for a day)
@@ -390,7 +393,7 @@ to receive.
 `flexvm standby [--template T] N` records N in `STATE/standby/T` and starts
 standby VMs until there are N: each is `flexvm run --standby`, a VM process
 that restores the template, lets the guest reseed and settle, pauses, and
-listens on `RUN/standby/TEMPLATE/KEY.PID-START.sock`. `flexvm run` claims one (`claim
+listens on `RUN/standby/HASH/KEY.PID-START.sock` (HASH: of the template's name). `flexvm run` claims one (`claim
 {name, ip, cmd}` with its stdout/stderr passed over SCM_RIGHTS): the standby
 takes the name and address, routes, resumes, sends `START`, and becomes that
 VM. A claimed standby starts its replacement, and every 5 s the listener and
