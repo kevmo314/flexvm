@@ -773,11 +773,16 @@ def faults():
         return
     # Growth needs a template that starts with little plugged.
     env = {**os.environ, "COW_GROW_TEMPLATE": GROW, "PLUG_TEMPLATE": GROW}
+    # The app-log template is built from the cached image when there is one (CI), not pulled.
+    layout = image_layout()
+    image = ["--image", layout] if layout else ["--image", args.image]
+    if layout:
+        env["IMAGE_CACHE"] = os.path.join(WORK, "images")
     r = subprocess.run([sys.executable, os.path.join(ROOT, "scripts", "faults.py"), "--a", A.addr, "--b", B.addr,
                         "--a-state", A.state_dir, "--a-run", A.run_dir, "--b-state", B.state_dir, "--b-run", B.run_dir,
                         "--a-ips", f"{A.net}.2-{A.net}.60", "--b-ips", f"{B.net}.2-{B.net}.60",
                         "--no-listeners", "--bin", BIN, "--artifacts", ARTIFACTS, "--template", args.template,
-                        "--ckpt-dir", os.path.join(WORK, "faults-ckpt"), *args.faults.split()], timeout=1800, env=env)
+                        "--ckpt-dir", os.path.join(WORK, "faults-ckpt"), *image, *args.faults.split()], timeout=1800, env=env)
     check("faults.py: no failures", r.returncode == 0, f"exit {r.returncode}")
 
 
