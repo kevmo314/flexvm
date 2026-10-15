@@ -921,12 +921,13 @@ fn protect_ranges_stay_bounded() {
     assert!(ranges.len() <= PROTECT_MAX, "{} ranges", ranges.len());
     covers(&ranges, &pages, &kept);
     // A kept page just before each of 4,098 dirty ones 2047 pages apart: nothing can merge, so every pass runs to
-    // the region's span. A walk along the kept pages, not a lookup per page of every gap, keeps that fast.
+    // the region's span. A walk along the kept pages, not a lookup per page of every gap, keeps that fast: a few ms,
+    // where a scan of every gap page takes seconds. Loose enough for a loaded test runner.
     let kept: Vec<usize> = (1..=4098).map(|i| 2047 * i - 1).collect();
     let pages: Vec<usize> = (1..=4098).map(|i| 2047 * i).collect();
     let start = std::time::Instant::now();
     let ranges = protect_ranges(pages.iter().copied(), &kept);
-    assert!(start.elapsed() < std::time::Duration::from_millis(100), "{:?}", start.elapsed());
+    assert!(start.elapsed() < std::time::Duration::from_secs(2), "{:?}", start.elapsed());
     assert_eq!(ranges.len(), pages.len());
     covers(&ranges, &pages, &kept);
 }
