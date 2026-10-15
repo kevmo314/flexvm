@@ -17,7 +17,7 @@ use std::io::{self, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -42,11 +42,50 @@ const GRACE: Duration = Duration::from_secs(30);
 /// A finished session whose client has been gone this long (the CLI gives up after 30 s) becomes a tombstone.
 const ABANDONED: Duration = Duration::from_secs(60);
 /// A running one's is closed (its command killed) after this long: its client was killed, say, or
-/// gave up reattaching. Long enough for any reattach (a CLI waiting out a checkpoint or a pause
-/// notices its old connection is gone only once the guest runs again, so its clock starts then).
+/// gave up reattaching. Both count only time the guest ran (`awake`): a CLI keeps retrying through
+/// a pause of any length.
 const ABANDONED_RUNNING: Duration = Duration::from_secs(600);
-/// Test-only: overrides `ABANDONED_RUNNING` (seconds), so that e2e tests need not wait 10 minutes.
+/// Test-only: overrides `ABANDONED_RUNNING` (seconds), and sweeps every second, so that e2e tests
+/// need not wait 10 minutes and a sweep always comes right after a resume.
 const ABANDONED_RUNNING_KNOB: &str = "/run/flexvm-test-abandoned-running-secs";
+/// How often the awake clock ticks, and the most one tick adds.
+const TICK: Duration = Duration::from_secs(1);
+const MAX_TICK: Duration = Duration::from_secs(2);
+
+/// Milliseconds the guest has run since `start_clock`. A plain pause stops the vCPUs but not the
+/// TSC, so CLOCK_MONOTONIC (and `Instant`) jump by the paused time on resume; this counts it as one
+/// tick of at most `MAX_TICK`. A starved ticker only makes it slow, never fast.
+static AWAKE_MS: AtomicU64 = AtomicU64::new(0);
+
+pub fn start_clock() {
+    thread::spawn(|| {
+        let mut last = Instant::now();
+        loop {
+            thread::sleep(TICK);
+            let now = Instant::now();
+            AWAKE_MS.fetch_add(tick(now - last).as_millis() as u64, Ordering::Relaxed);
+            last = now;
+        }
+    });
+}
+
+/// What one tick that took `elapsed` adds to the awake clock.
+fn tick(elapsed: Duration) -> Duration {
+    elapsed.min(MAX_TICK)
+}
+
+fn awake() -> Duration {
+    Duration::from_millis(AWAKE_MS.load(Ordering::Relaxed))
+}
+
+fn knob() -> Option<Duration> {
+    std::fs::read_to_string(ABANDONED_RUNNING_KNOB).ok().and_then(|s| s.trim().parse().ok()).map(Duration::from_secs)
+}
+
+/// How long the sweeper sleeps between `cleanup`s.
+pub fn sweep_every() -> Duration {
+    knob().map_or(Duration::from_secs(60), |_| Duration::from_secs(1))
+}
 /// Output still read after the shell exits, as for the app.
 const DRAIN: Duration = Duration::from_secs(2);
 
@@ -129,19 +168,18 @@ impl Table {
     /// Closes sessions whose client is gone: finished ones after `ABANDONED`, running ones (killing
     /// their command) after `ABANDONED_RUNNING`.
     fn reclaim(&mut self, statuses: &Statuses) {
-        let running_after =
-            std::fs::read_to_string(ABANDONED_RUNNING_KNOB).ok().and_then(|s| s.trim().parse().ok()).map_or(ABANDONED_RUNNING, Duration::from_secs);
-        self.reclaim_after(statuses, running_after);
+        self.reclaim_after(statuses, knob().unwrap_or(ABANDONED_RUNNING), awake());
     }
 
-    fn reclaim_after(&mut self, statuses: &Statuses, running_after: Duration) {
+    /// `now` is on the awake clock.
+    fn reclaim_after(&mut self, statuses: &Statuses, running_after: Duration, now: Duration) {
         let abandoned: Vec<String> = self
             .live
             .iter()
             .filter_map(|(id, entry)| {
                 let o = entry.output.0.lock().unwrap();
                 let after = if o.exit.is_some() { ABANDONED } else { running_after };
-                (o.attached.is_none() && o.detached.is_some_and(|t| t.elapsed() >= after)).then(|| id.clone())
+                (o.attached.is_none() && o.gone.is_some_and(|t| now.saturating_sub(t) >= after)).then(|| id.clone())
             })
             .collect();
         for id in abandoned {
@@ -224,6 +262,8 @@ pub(crate) struct Output {
     /// The attachment's cursor: everything before it has been sent.
     sent: u64,
     detached: Option<Instant>,
+    /// When it was detached, on the awake clock.
+    gone: Option<Duration>,
     reservation: Reservation,
 }
 
@@ -322,7 +362,7 @@ pub fn handle(mut w: impl Write, body: &[u8], conn: Option<File>, line: &str, se
             // A replaced attachment leaves the session to its successor.
             if ring.attached.as_ref().is_some_and(|a| a.id == me) {
                 ring.attached = None;
-                ring.detached = Some(Instant::now());
+                (ring.detached, ring.gone) = (Some(Instant::now()), Some(awake()));
             }
             drop(ring);
             output.1.notify_all();
@@ -498,8 +538,9 @@ mod tests {
         output
     }
 
-    fn finished(table: &mut Table, id: &str, detached: Option<Instant>) -> Session {
-        live(table, id, Output { exit: Some(0), detached, ..Default::default() })
+    /// `gone`: when its client left, on the awake clock.
+    fn finished(table: &mut Table, id: &str, gone: Option<Duration>) -> Session {
+        live(table, id, Output { exit: Some(0), detached: gone.map(|_| Instant::now()), gone, ..Default::default() })
     }
 
     fn attached(ring: Output) -> Session {
@@ -585,32 +626,43 @@ mod tests {
 
     #[test]
     fn live_limit_is_explicit_and_abandoned_sessions_are_reclaimed() {
-        let mut table = Table::default();
+        let (mut table, st) = (Table::default(), statuses());
+        // Clients left at awake time ABANDONED, but 3's and 4's at 0; it is now ABANDONED.
         let outputs: Vec<_> = (0..MAX_LIVE)
             .map(|i| {
-                table.admit(&statuses()).unwrap();
-                finished(&mut table, &i.to_string(), Some(Instant::now()))
+                table.admit(&st).unwrap();
+                finished(&mut table, &i.to_string(), Some(if i == 3 || i == 4 { Duration::ZERO } else { ABANDONED }))
             })
             .collect();
-        assert!(table.admit(&statuses()).unwrap_err().to_string().contains("too many sessions"));
-        let old = Some(Instant::now() - ABANDONED);
-        outputs[3].0.lock().unwrap().detached = old;
-        let mut o4 = outputs[4].0.lock().unwrap();
-        (o4.attached, o4.detached) = (Some(Attachment { id: 1, conn: None }), old);
-        drop(o4);
-        table.admit(&statuses()).unwrap();
+        assert!(table.admit(&st).unwrap_err().to_string().contains("too many sessions"));
+        outputs[4].0.lock().unwrap().attached = Some(Attachment { id: 1, conn: None });
+        table.reclaim_after(&st, ABANDONED_RUNNING, ABANDONED);
+        table.admit(&st).unwrap();
         assert!(!table.live.contains_key("3") && table.closed.contains_key("3"));
         assert!(outputs[3].0.lock().unwrap().closed);
         assert!(table.live.contains_key("4"), "an attached reader keeps its session");
+        assert_eq!(table.live.len(), MAX_LIVE - 1);
         // A running session's client gets longer.
         let mut o5 = outputs[5].0.lock().unwrap();
-        (o5.exit, o5.detached) = (None, old);
+        (o5.exit, o5.gone) = (None, Some(Duration::ZERO));
         drop(o5);
-        table.reclaim_after(&statuses(), ABANDONED * 2);
+        table.reclaim_after(&st, ABANDONED * 2, ABANDONED * 2 - Duration::from_millis(1));
         assert!(table.live.contains_key("5"));
-        outputs[5].0.lock().unwrap().detached = Some(Instant::now() - ABANDONED * 2);
-        table.reclaim_after(&statuses(), ABANDONED * 2);
+        table.reclaim_after(&st, ABANDONED * 2, ABANDONED * 2);
         assert!(!table.live.contains_key("5") && table.closed.contains_key("5"));
+    }
+
+    #[test]
+    fn a_pause_counts_as_one_short_tick() {
+        assert_eq!(tick(Duration::from_millis(1003)), Duration::from_millis(1003));
+        // Resumed after 20 minutes paused: the TSC (and so Instant) counted them all.
+        assert_eq!(tick(Duration::from_secs(1200)), MAX_TICK);
+        let (mut table, st) = (Table::default(), statuses());
+        let o = live(&mut table, "s", Output { gone: Some(Duration::ZERO), ..Default::default() });
+        // Detached a second before the pause, reattaching a second after it.
+        let now = TICK + tick(Duration::from_secs(1200)) + TICK;
+        table.reclaim_after(&st, Duration::from_secs(8), now);
+        assert!(table.live.contains_key("s") && !o.0.lock().unwrap().closed, "a pause expired a running session");
     }
 
     #[test]
@@ -620,12 +672,13 @@ mod tests {
         // Their clients are gone at once (`start`'s connection is closed).
         let (gone, group) = start(&sessions, &statuses, "gone", b"sleep 100 & sleep 100");
         let (kept, kept_group) = start(&sessions, &statuses, "kept", b"sleep 100");
-        sessions.lock().unwrap().reclaim_after(&statuses, after);
+        // Detached at awake time 0 (the clock does not run in tests).
+        assert_eq!(gone.0.lock().unwrap().gone, Some(Duration::ZERO));
+        sessions.lock().unwrap().reclaim_after(&statuses, after, after - Duration::from_millis(1));
         assert!(sessions.lock().unwrap().live.contains_key("gone"), "reclaimed before its client had long to come back");
-        thread::sleep(after);
         // A client came back to this one.
         attach(&kept, 0, None);
-        sessions.lock().unwrap().reclaim_after(&statuses, after);
+        sessions.lock().unwrap().reclaim_after(&statuses, after, after);
         let table = sessions.lock().unwrap();
         assert!(!table.live.contains_key("gone") && table.closed.contains_key("gone"));
         assert!(table.live.contains_key("kept"), "an attached session was reclaimed");

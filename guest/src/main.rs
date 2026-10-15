@@ -379,8 +379,9 @@ fn serve(statuses: Statuses) -> io::Result<()> {
     os(unsafe { libc::listen(fd.as_raw_fd(), 64) })?;
     let sessions = session::Sessions::default();
     let (swept, statuses_) = (sessions.clone(), statuses.clone());
+    session::start_clock();
     thread::spawn(move || loop {
-        thread::sleep(Duration::from_secs(60));
+        thread::sleep(session::sweep_every());
         session::cleanup(&swept, &statuses_);
     });
     let mut backoff = Duration::ZERO;
