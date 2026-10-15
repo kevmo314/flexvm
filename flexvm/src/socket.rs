@@ -3,7 +3,7 @@
 use std::fs::{self, DirBuilder};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -37,9 +37,14 @@ fn private(path: &Path) -> io::Result<()> {
 }
 
 /// Its parent must be one only root or we can rename it out of (sticky /tmp included), so
-/// nobody can swap it later.
+/// nobody can swap it later. It is made 0755 whatever the umask, when this user can (root, for
+/// /run/flexvm): it is also the default run directory, which non-root users read, and root then
+/// never needs the /tmp base, whose name anyone can take first.
 fn base_dir(base: &Path) -> io::Result<()> {
     let parent = base.parent().unwrap();
+    if DirBuilder::new().mode(0o755).create(parent).is_ok() {
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o755))?;
+    }
     let m = fs::symlink_metadata(parent)?;
     let euid = unsafe { libc::geteuid() };
     if !m.is_dir() || (m.uid() != 0 && m.uid() != euid) || (m.mode() & 0o022 != 0 && m.mode() & libc::S_ISVTX == 0) {
@@ -133,7 +138,7 @@ impl Drop for Sockets {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::os::unix::fs::symlink;
 
     fn fixture() -> crate::test_util::TempDir {
         crate::test_util::TempDir::new("socket")
@@ -171,13 +176,23 @@ mod tests {
     }
 
     #[test]
-    fn missing_parent_is_not_created_and_uses_fallback() {
+    fn a_missing_parent_is_made_0755_or_the_fallback_is_used() {
         let t = fixture();
-        let missing = t.join("missing");
-        let fallback = t.join("fallback");
-        let root = SocketRoot::from_bases(&[missing.join("s"), fallback.clone()], &t).unwrap();
-        assert!(!missing.exists());
-        assert_eq!(root.dir.parent().unwrap(), fallback);
+        let parent = t.join("run");
+        let root = SocketRoot::from_bases(&[parent.join("s"), t.join("fallback")], &t).unwrap();
+        assert_eq!(fs::metadata(&parent).unwrap().mode() & 0o7777, 0o755);
+        assert_eq!(root.dir.parent().unwrap(), parent.join("s"));
+        drop(root);
+        // A parent this user cannot make (root can make anything).
+        let closed = t.join("closed");
+        DirBuilder::new().mode(0o555).create(&closed).unwrap();
+        if unsafe { libc::geteuid() } != 0 {
+            let root = SocketRoot::from_bases(&[closed.join("run/s"), t.join("fallback")], &t).unwrap();
+            assert!(!closed.join("run").exists());
+            assert_eq!(root.dir.parent().unwrap(), t.join("fallback"));
+        }
+        fs::set_permissions(&closed, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::remove_dir_all(t).unwrap();
     }
 
     #[test]
