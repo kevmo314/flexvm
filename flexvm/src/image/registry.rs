@@ -66,8 +66,8 @@ impl Resolver for DeadlineResolver {
         let addr = DefaultResolver::host_and_port(scheme, authority).ok_or(ureq::Error::HostNotFound)?;
         let mut addrs = self.empty();
         let found = crate::util::resolve(&addr, self.deadline)?;
-        for a in found.iter().filter(|a| !self.public_only || is_public(a.ip())).take(16) {
-            addrs.push(*a);
+        for a in reachable(&found, self.public_only).take(16) {
+            addrs.push(a);
         }
         if addrs.is_empty() && !found.is_empty() {
             return Err(ureq::Error::Io(std::io::Error::new(std::io::ErrorKind::PermissionDenied, format!("{addr} is not on a public address"))));
@@ -77,6 +77,11 @@ impl Resolver for DeadlineResolver {
         }
         Ok(addrs)
     }
+}
+
+/// The addresses of `found` to connect to: with `public_only`, its public ones.
+fn reachable(found: &[std::net::SocketAddr], public_only: bool) -> impl Iterator<Item = std::net::SocketAddr> + '_ {
+    found.iter().copied().filter(move |a| !public_only || is_public(a.ip()))
 }
 
 /// Not loopback, link-local, private (RFC 1918, unique local, shared CGNAT space), unspecified, broadcast or multicast.
@@ -320,12 +325,13 @@ impl Registry {
         }
     }
 
-    /// Whether the registry is on a loopback, link-local or private address: a local registry, whose token service may
-    /// be local too.
-    fn local(&self, deadline: Instant) -> bool {
-        let uri: Option<ureq::http::Uri> = self.r.base_url().parse().ok();
-        let addr = uri.as_ref().and_then(|u| DefaultResolver::host_and_port(u.scheme()?, u.authority()?));
-        addr.and_then(|a| crate::util::resolve(&a, deadline).ok()).is_some_and(|found| found.iter().any(|a| !is_public(a.ip())))
+    /// Whether the image reference names a local registry: `localhost`, or a loopback, link-local or private address
+    /// as written (never as resolved: DNS could answer otherwise for the registry than for its token realm). Its token
+    /// service may be local too.
+    fn local(&self) -> bool {
+        let host = self.r.registry.strip_prefix('[').and_then(|h| h.split(']').next());
+        let host = host.unwrap_or_else(|| self.r.registry.split(':').next().unwrap_or(""));
+        host.eq_ignore_ascii_case("localhost") || host.parse().is_ok_and(|ip| !is_public(ip))
     }
 
     fn authenticate(&self, challenge: &str, deadline: Instant) -> Result<()> {
@@ -350,7 +356,7 @@ impl Registry {
         if self.r.base_url().starts_with("https://") && !realm.starts_with("https://") {
             bail!("{}: refusing token realm {realm}: not HTTPS", self.r.registry);
         }
-        let agent = agent(deadline, !self.local(deadline));
+        let agent = agent(deadline, !self.local());
         let creds = match &self.basic {
             Some(b) if self.trusted(&realm) => Some(format!("Basic {b}")),
             // Anywhere else gets an anonymous token request.
@@ -895,6 +901,14 @@ pub(super) mod tests {
         let reg = Registry::new(Reference::parse(&format!("{local}/test")).unwrap());
         reg.authenticate(&format!("Bearer realm=\"http://{local}/t\""), deadline).unwrap();
         assert!(served.load(std::sync::atomic::Ordering::SeqCst));
+
+        // Only a registry local as written is exempt; a name is filtered whatever it resolves to.
+        let local = |r: &str| Registry::new(Reference::parse(&format!("{r}/test")).unwrap()).local();
+        assert!(local("127.0.0.1:5000") && local("localhost:5000") && local("10.0.0.5") && local("[::1]:5000"));
+        assert!(!local("registry.example") && !local("localhost.evil.example") && !local("8.8.8.8:5000"));
+        let mixed: Vec<std::net::SocketAddr> = vec!["8.8.8.8:443".parse().unwrap(), "10.0.0.1:443".parse().unwrap(), "[fe80::1]:443".parse().unwrap()];
+        assert_eq!(reachable(&mixed, true).collect::<Vec<_>>(), &mixed[..1]);
+        assert_eq!(reachable(&mixed, false).count(), 3);
 
         use std::net::IpAddr;
         for ip in [
