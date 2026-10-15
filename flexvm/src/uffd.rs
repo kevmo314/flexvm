@@ -735,7 +735,7 @@ impl Pager {
     /// any more (or it is gone): ENOENT outside a registered VMA, ESRCH once its memory is gone. ENOENT also comes
     /// across a VMA boundary, e.g. into an unplugged virtio-mem slot, where memory is still mapped: that is not this.
     fn unmapped(&self, e: &io::Error, page: usize, n: usize) -> bool {
-        let Some((addr, _)) = self.host_addr(page).filter(|_| matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ESRCH))) else {
+        let Some((addr, _)) = self.host_addr((page * PAGE_SIZE) as u64).filter(|_| matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ESRCH))) else {
             return false;
         };
         let pid = self.pid.load(Ordering::SeqCst);
@@ -905,10 +905,9 @@ impl Pager {
         self.mappings().iter().find(|m| offset >= m.offset && offset < m.offset + m.size as u64)
     }
 
-    fn host_addr(&self, page: usize) -> Option<(u64, &Mapping)> {
-        let off = (page * PAGE_SIZE) as u64;
-        let m = self.locate(off)?;
-        Some((m.base_host_virt_addr + (off - m.offset), m))
+    fn host_addr(&self, offset: u64) -> Option<(u64, &Mapping)> {
+        let m = self.locate(offset)?;
+        Some((m.base_host_virt_addr + (offset - m.offset), m))
     }
 
     /// The canonical hash of guest memory as it is now (for a paused VM; a test hook): see `checkpoint::Canon`.
@@ -942,7 +941,7 @@ impl Pager {
 
     /// Where `page` is mapped in Firecracker.
     fn addr(&self, page: usize) -> io::Result<u64> {
-        self.host_addr(page).map(|(a, _)| a).ok_or_else(|| io::Error::other("bad page"))
+        self.host_addr((page * PAGE_SIZE) as u64).map(|(a, _)| a).ok_or_else(|| io::Error::other("bad page"))
     }
 
     /// Populates up to `n` pages starting at `page`, from `src` or with zeroes, and wakes their waiters. Returns how
