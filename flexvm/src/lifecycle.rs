@@ -128,24 +128,20 @@ impl Proc {
     /// Sets a pending new address (`pending_net`) in the guest; failing, it stays
     /// pending, and the next `flexvm resume` (SIGCONT) tries again. Under `op`.
     fn take_address(&self, vm: &Vm) -> Result<()> {
-        let Some(old) = *vm.pending_net.lock().unwrap() else { return Ok(()) };
+        if !vm.pending_net.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         let res = match fault("readdress_fail") {
             true => Err("injected fault: setting the address failed".into()),
-            false => self.readdress(vm, old),
+            false => vm.guest_net(vm.ip, self.host.cfg.dns.as_deref()),
         };
         match res {
             Ok(()) => {
-                *vm.pending_net.lock().unwrap() = None;
+                vm.pending_net.store(false, Ordering::SeqCst);
                 Ok(())
             }
             Err(e) => bail!("vm {} runs, but setting its address {} failed: {e}; flexvm resume {} tries again", vm.name, vm.ip, vm.name),
         }
-    }
-
-    fn readdress(&self, vm: &Vm, old: Ipv4Addr) -> Result<()> {
-        vm.guest_net(vm.ip, self.host.cfg.dns.as_deref())?;
-        let _ = vm.sh(&format!("ip -4 addr del {old}/32 dev eth0 2>/dev/null"), Instant::now() + crate::guest::TIMEOUT);
-        Ok(())
     }
 
     /// With `stop` the VM stays paused for the caller to destroy.
@@ -277,7 +273,7 @@ impl Proc {
             bail!("no vm named {name:?}");
         }
         if dir.join(DISCARDED).exists() || dir.join(STARTED).exists() {
-            discard(&self.host, name)?;
+            revoke(&self.host, name)??;
             bail!("no vm named {name:?} (its checkpoint was consumed)");
         }
         if let Ok(q) = std::fs::read_to_string(dir.join(QUARANTINE)) {
@@ -327,7 +323,7 @@ impl Proc {
             }
             // Re-arming the checkpoint would replay what it did since.
             Err(Restore::Ran(e)) => {
-                let _ = discard(&self.host, name);
+                let _ = revoke(&self.host, name);
                 bail!("vm {name} failed after it resumed: {e}; it is gone, its checkpoint is consumed")
             }
         }
@@ -403,7 +399,7 @@ impl Proc {
         // Published paused, until SIGCONT (`flexvm resume`); `why`: a resume that failed.
         let keep_paused = |t: &mut Phases, why: Option<String>| {
             if ip != m.ip {
-                *vm.pending_net.lock().unwrap() = Some(m.ip);
+                vm.pending_net.store(true, Ordering::SeqCst);
             }
             self.set_vm(vm.clone());
             self.paused_by_request.store(true, Ordering::SeqCst);
@@ -457,7 +453,7 @@ impl Proc {
         // It runs: from here a slow or failed guest step is reported, never fatal (its checkpoint,
         // still where its memory comes from, is deleted once all of it is in). Pending until the guest has it.
         if ip != m.ip {
-            *vm.pending_net.lock().unwrap() = Some(m.ip);
+            vm.pending_net.store(true, Ordering::SeqCst);
         }
         self.set_vm(vm.clone());
         self.publish();
@@ -533,7 +529,7 @@ impl Proc {
                         answered = true;
                         crate::log!("vm {}: its guest agent answered {} ms after it resumed", vm.name, ms(start.elapsed()));
                     }
-                    if vm.pending_net.lock().unwrap().is_some() {
+                    if vm.pending_net.load(Ordering::SeqCst) {
                         let _op = p.op_within()?;
                         p.take_address(&vm)?;
                         crate::log!("vm {}: took its address {}", vm.name, vm.ip);
@@ -969,14 +965,10 @@ pub fn remove_debris(host: &Host, name: &str) -> Result<()> {
 }
 
 /// Marked DISCARDED durably before the address is freed and withdrawn.
-pub fn discard(host: &Host, name: &str) -> Result<()> {
-    revoke(host, name)?
-}
-
 /// The outer error: not revoked (still resumable). The inner one: revoked,
 /// but freeing its address failed (a later `kill` or the address's next
 /// claim finishes that).
-fn revoke(host: &Host, name: &str) -> Result<Result<()>> {
+pub fn revoke(host: &Host, name: &str) -> Result<Result<()>> {
     let dir = host.suspended(name);
     let (ip, gen) = (manifest(&dir).map(|m| m.ip), read_gen(&dir));
     mark_durably(&dir, DISCARDED).map_err(|e| format!("discarding the checkpoint of {name}: {e}"))?;

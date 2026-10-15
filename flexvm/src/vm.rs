@@ -98,8 +98,8 @@ pub struct Vm {
     pub vsock: PathBuf,
     was_paused: AtomicBool,
     pub clock_pending: AtomicBool,
-    /// Restored held paused at a new address: the guest still has this old one.
-    pub pending_net: Mutex<Option<Ipv4Addr>>,
+    /// Restored at a new address the guest has not taken yet.
+    pub pending_net: AtomicBool,
     /// Discards after this count mean the saved state and memory may disagree.
     pub snapshot_discards: AtomicU64,
     /// (dir, id) of the last write-tracked checkpoint: a delta's base.
@@ -414,7 +414,7 @@ impl Vm {
         if self.pager.remote_left() > 0 {
             bail!("vm {} is still pulling its memory from its previous host or checkpoint", self.name);
         }
-        if self.pending_net.lock().unwrap().is_some() {
+        if self.pending_net.load(Ordering::SeqCst) {
             bail!("vm {} has not taken its new address yet; resume it first", self.name);
         }
         Ok(())
@@ -713,24 +713,6 @@ impl Vm {
         Ok(id)
     }
 
-    pub fn sh(&self, cmd: &str, deadline: Instant) -> Result<(i32, String)> {
-        const MAX_OUTPUT: usize = 64 << 10;
-        if self.state() != State::Running || Instant::now() >= deadline {
-            bail!("vm {} is not running here, or no time is left", self.name);
-        }
-        let left = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
-        let raw = crate::util::connect_unix(&self.vsock, left)?;
-        let id = self.track(&raw)?;
-        let res = (|| -> Result<(i32, String)> {
-            let (code, out, _) =
-                crate::guest::run(raw.try_clone()?, &self.vsock, cmd, deadline, MAX_OUTPUT).map_err(|e| format!("guest command {cmd:?}: {e}"))?;
-            Ok((code, out))
-        })();
-        let _ = raw.shutdown(Shutdown::Both);
-        self.untrack_exec(id);
-        res
-    }
-
     /// Returns the offset (ms); the guest ends up behind by a request's transit, so slow
     /// round trips are repeated.
     pub fn sync_clock(&self, deadline: Instant) -> Result<f64> {
@@ -966,7 +948,7 @@ impl Prepared {
             tap_drops_reported: AtomicU64::new(0),
             was_paused: AtomicBool::new(false),
             clock_pending: AtomicBool::new(false),
-            pending_net: Mutex::new(None),
+            pending_net: AtomicBool::new(false),
             snapshot_discards: AtomicU64::new(0),
             last_checkpoint: Mutex::new(None),
             cancel_checkpoint: AtomicUsize::new(0),

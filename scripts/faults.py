@@ -4840,7 +4840,8 @@ def forged_peer():
 def restore_ip_peer():
     """run --ip refuses an address that is not the host's to hand out (a
     peer's, or one from no host's range); restore --ip borrows a peer's from
-    its home host, which refuses one in use there."""
+    its home host, which refuses one in use there. A guest restored at a new
+    address (also from a checkpoint of a restored VM) has only that one."""
     n, path = "ft-rip", ckpt_path("ft-rip")
     ok(run(A, n))
     ok(checkpoint(A, n, path))
@@ -4856,7 +4857,26 @@ def restore_ip_peer():
     check("run --ip: an address from no host's range is refused", not r["ok"] and "not this host's" in r.get("error", ""), r)
     r = restore(A, path, name="ft-rip2", ip="auto")
     check("restore --ip auto still works", r["ok"], r)
+    r = r["result"]
+    old = vms(A)[n]["ip"]
+    has = lambda out, ip: f"inet {ip}/" in out
+    only = lambda h, vm, ip, *gone: (lambda out: has(out, ip) and not any(has(out, g) for g in gone))(sh(h, vm, "ip -4 -o addr show eth0")[1])
+    check("restore --ip auto: the guest has only its new address", only(A, "ft-rip2", r["ip"], old), sh(A, "ft-rip2", "ip -4 -o addr show eth0"))
+    # A checkpoint of the restored VM (its agent set the address in an earlier session) restored at a third address.
+    path2 = ckpt_path("ft-rip2")
+    ok(checkpoint(A, "ft-rip2", path2))
+    r3 = ok(restore(B, path2, name="ft-rip5", ip="auto"))
+    check("restore of a restored VM's checkpoint: only the newest address", only(B, "ft-rip5", r3["ip"], old, r["ip"]), sh(B, "ft-rip5", "ip -4 -o addr show eth0"))
+    # A peer's address, once free there, is borrowed, and the guest has only it.
+    kill(B, "ft-rip-b")
+    check("restore --ip: the peer's address is free once its VM is gone", wait_for(lambda: not addr(B, theirs).get("holder"), 10), addr(B, theirs))
+    r4 = restore(A, path, name="ft-rip4", ip=theirs)
+    check("restore --ip: a peer's free address is borrowed", r4["ok"] and r4["result"]["ip"] == theirs and addr(B, theirs).get("lent"), (r4, addr(B, theirs)))
+    check("restore --ip: the guest has only the borrowed address", r4["ok"] and only(A, "ft-rip4", theirs, old), sh(A, "ft-rip4", "ip -4 -o addr show eth0"))
+    for vm in (n, "ft-rip2", "ft-rip4", "ft-rip5"):
+        cleanup(vm)
     rm_ckpt(path)
+    rm_ckpt(path2)
 
 
 def unlend_retry():
