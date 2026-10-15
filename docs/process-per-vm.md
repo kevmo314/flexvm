@@ -535,7 +535,8 @@ committed, never ends the process,
    revoked checkpoint is removed whole. Unit test
    `host::suspend_debris_is_removed_by_the_names_next_holder`; faults
    `suspend_debris`, `revoked_publication`. Quarantine is a file
-   (`QUARANTINE`, with the boot id). Suspended VMs keep name and address with
+   (`QUARANTINE`, with the boot id), held only in that boot by both `resume`
+   and `ls` (fault `quarantine_reboot_ls`). Suspended VMs keep name and address with
    no pid, and `ls` lists them.
 7. **Address state** is read fresh and changed per change under the host
    lock, durable where it orders anything. The listener's skip-local check

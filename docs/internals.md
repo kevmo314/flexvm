@@ -310,7 +310,9 @@ VM that is busy, paused or suspended.
   Firecracker dies, so no discard event can mark a saved page as zero.
   A suspended VM's checkpoint stays in `suspended/`.
   - **Resume** first creates a `STARTED` marker in it and fsyncs it, before
-    any vCPU runs. It then restores lazily like `restore`, and deletes the
+    any vCPU runs, under the host lock of its final address check (the fence):
+    marked before it, a crash while waiting for the lock would lose a VM that
+    never ran. A failed fence leaves no marker (test fault `resume_fence_fail`). It then restores lazily like `restore`, and deletes the
     checkpoint once every page is in. The pager closes the checkpoint's
     files as soon as the last page has settled (readers still busy finish
     first), so the deletion gives the disk space back while the VM runs on.
@@ -325,7 +327,8 @@ VM that is busy, paused or suspended.
     fails too, the marker may or may not survive a crash: the VM (which
     never ran) is listed `quarantined` (a `QUARANTINE` file with the boot id
     and why). It cannot be resumed; a `kill` discards it as usual, and after
-    a reboot the disk decides (marker: deleted; none: suspended again). Test faults
+    a reboot the disk decides (marker: deleted; none: suspended again, and `ls`
+    lists it so: a `QUARANTINE` of an earlier boot does not hold). Test faults
     `started_fsync` and `started_unmark` cover both.
 - **Device quiescing.** An API pause (`PATCH /vm Paused`) puts Firecracker's
   VMM thread into a loop that serves only API requests until the resume. It
@@ -645,7 +648,7 @@ processes' environment) cover each failure path: migration (`pages`,
 `route`, `lost_ack`, `status`, `prepare_fail`, `short_incoming`,
 `slow_preload`, `kill_prepared`), restores (`restore_no_hold`,
 `restore_before_run`, `restore_after_run`, `resume_kill`, `started_fsync`,
-`started_unmark`), checkpoints (`ckpt_memhash`, `ckpt_fail_protect`,
+`started_unmark`, `resume_fence_fail`), checkpoints (`prealloc_fail`, `ckpt_memhash`, `ckpt_fail_protect`,
 `ckpt_no_hold`, `ckpt_abort`, `ckpt_slow`, `ckpt_fail_write`,
 `ckpt_copy_wait`) and guest requests (`guest_drop`, `guest_lose_reply`);
 `scripts/faults.py` uses them.
