@@ -209,7 +209,7 @@ def fault(host, f, ms):
 FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_before_run", "restore_after_run",
           "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "resume_kill",
           "prepare_fail", "short_incoming", "slow_preload", "bad_preload", "bad_app_log", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
-          "started_fsync", "started_unmark", "start_stall", "incoming_stall", "claim_stall", "handoff_stall", "ckpt_wp_race",
+          "started_fsync", "started_unmark", "start_stall", "incoming_stall", "claim_stall", "standby_lock_stall", "handoff_stall", "ckpt_wp_race",
           "fetch_tail_enomem", "fetch_enomem_stuck", "pull_enomem", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo", "release_stall", "release_late", "no_plug", "pause_lost", "tap_backlog", "tap_backlog_stuck", "pause_unknown", "no_collapse", "collapse_slow", "pages_slow", "unlend_fail", "route_stall")
 
 
@@ -4802,6 +4802,48 @@ def standby_stalled():
     cleanup(n)
 
 
+def standby_refill_race():
+    """A refill granted just before pressure starts, whose standby has not
+    created its lock file yet (`standby_lock_stall`, 3 s): relief does not
+    pass it by, but holds eviction off until the standby is listed, then
+    signals it and marks the pressure, before any eviction starts."""
+    t, n = args.template, "ft-sb-refill-race"
+    ok(run(A, n))
+    pressure, active = os.path.join(A.run, "standby", ".pressure"), os.path.join(A.run, "evict.active")
+    for f in (pressure, active):
+        if os.path.exists(f):
+            os.remove(f)
+    fault(A, "no_evict", 600000)
+    fault(A, "standby_lock_stall", 2000)
+    res, seen = {}, {}
+    th = threading.Thread(target=lambda: res.update(r=cli_json(A, "standby", "--template", t, "1")))
+    th.start()
+    try:
+        time.sleep(1)
+        avail = mem_available()
+        with marks(avail + 4096, avail + 4608):
+            start = time.time()
+            while time.time() - start < 15 and len(seen) < 2:
+                for k, f in (("pressure", pressure), ("active", active)):
+                    if k not in seen and os.path.exists(f):
+                        seen[k] = time.time() - start
+                time.sleep(0.05)
+            pids = standby_pids(A, t)
+            th.join()
+    finally:
+        fault(A, "standby_lock_stall", 0)
+        fault(A, "no_evict", 0)
+    check("standby refill race: the standby being started is stopped, and marks the pressure", "pressure" in seen, seen)
+    check("standby refill race: eviction waits for it", "active" in seen and "pressure" in seen and seen["active"] > seen["pressure"], seen)
+    check("standby refill race: it exits", wait_for(lambda: not [p for p in pids + standby_pids(A, t) if alive(p)], 30), (pids, res))
+    try:
+        os.remove(pressure)
+    except FileNotFoundError:
+        pass
+    cli(A, "standby", "--template", t, "0")
+    cleanup(n)
+
+
 def fc_died():
     """A VM's Firecracker dies under it (a guest panic, an OOM kill): its
     process notices at once, cleans up as a kill would (address withdrawn,
@@ -5852,7 +5894,7 @@ SCENARIOS = dict(
     kill_refused_checkpoint=no_evict(kill_refused_checkpoint), wildcard_listen=wildcard_listen,
     forged_peer=forged_peer, restore_ip_peer=restore_ip_peer, late_withdrawal=late_withdrawal, unlend_retry=unlend_retry,
     unit_restart=unit_restart, log_cap=log_cap, gc_debris=gc_debris, prefix_change=prefix_change, arrival_log=arrival_log, template_tap=template_tap,
-    incoming_killed=incoming_killed, start_killed=start_killed, claim_killed=claim_killed, standby_stalled=standby_stalled, fc_died=fc_died,
+    incoming_killed=incoming_killed, start_killed=start_killed, claim_killed=claim_killed, standby_stalled=standby_stalled, standby_refill_race=standby_refill_race, fc_died=fc_died,
     sigkill_restart=sigkill_restart, listen_trickle=listen_trickle,
     cow_wp_race=cow_wp_race, fetch_tail_enomem=fetch_tail_enomem, fetch_enomem_stuck=fetch_enomem_stuck, pull_enomem=pull_enomem,
     collapse_abort=collapse_abort, collapse_ckpt_fail=collapse_ckpt_fail, ckpt_paused_backlog=ckpt_paused_backlog, same_host_order=same_host_order, same_host_slow_route=same_host_slow_route, same_host_flood=same_host_flood, same_host_late_handover=same_host_late_handover, same_host_backlog=same_host_backlog, ckpt_backlog=ckpt_backlog, rx_stall=rx_stall, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,

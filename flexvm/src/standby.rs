@@ -128,6 +128,12 @@ pub fn maintain(host: Host) {
     });
 }
 
+/// `STATE/standby.stop.lock`: relief holds it exclusively while it lists and
+/// signals standby VMs, a refill shared from a grant until its standby is listed.
+pub fn stop_lock(host: &Host) -> std::io::Result<File> {
+    File::options().create(true).truncate(false).write(true).open(host.state.join("standby.stop.lock"))
+}
+
 /// Touched when memory pressure stops standby VMs.
 pub fn pressure(host: &Host) -> PathBuf {
     host.run.join("standby").join(".pressure")
@@ -160,17 +166,29 @@ fn refill_by(host: &Host, template: &str, wait: bool) -> Result<usize> {
     let log = std::fs::OpenOptions::new().create(true).append(true).open(d.join("standby.log"))?;
     let args = [host.state.as_os_str(), host.run.as_os_str(), template.as_ref()];
     for _ in 0..want {
-        if host.grant(256, None)?.is_none() {
+        // Shared from the grant until its lock file exists (`locked`, or it died), not through
+        // its load: relief either lists it or ran before the grant. None while relief stops them,
+        // and held `LOCKED_TIMEOUT` at most (a stuck host lock fails the grant).
+        let stop = stop_lock(host)?;
+        let by = Instant::now() + LOCKED_TIMEOUT;
+        if flock(&stop, libc::LOCK_SH | libc::LOCK_NB).is_err() || host.grant(256, Some(by))?.is_none() {
             break;
         }
         let (r, w) = std::os::unix::net::UnixStream::pair()?;
         let args = ["--state".as_ref(), args[0], "--run".as_ref(), args[1], "run".as_ref(), "--standby".as_ref(), "--template".as_ref(), args[2]];
         crate::util::spawn_self(&args, &log, w.as_raw_fd(), &[("FLEXVM_NOTIFY_FD", "3")])?;
-        ready.push(r);
+        drop(w);
+        let _ = crate::util::readable(&r, by.saturating_duration_since(Instant::now()));
+        drop(stop);
+        ready.push(BufReader::new(r));
     }
     let started = ready.len();
-    for r in ready {
-        let reply = crate::util::recv_json(&mut BufReader::new(r))?.ok_or("a standby vm failed to start (see its log)")?;
+    for mut r in ready {
+        let mut reply = crate::util::recv_json(&mut r)?;
+        if reply.as_ref().is_some_and(|v| v["locked"] == json!(true)) {
+            reply = crate::util::recv_json(&mut r)?;
+        }
+        let reply = reply.ok_or("a standby vm failed to start (see its log)")?;
         if reply["ok"] != json!(true) {
             bail!("a standby vm failed to start: {}", reply["error"]);
         }
@@ -215,11 +233,16 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
     let me = Ident::me();
     let id = me.key();
     let (lock_path, sock) = (d.join(format!("{id}.lock")), d.join(format!("{mine}.{id}.sock")));
+    crate::host::stall("standby_lock_stall");
     let tmp = d.join(format!(".{id}.lock"));
     let lock = File::create(&tmp)?;
     crate::host::flock(&lock, libc::LOCK_EX)?;
     lock.write_all_at(&serde_json::to_vec(&me)?, 0)?;
     std::fs::rename(&tmp, &lock_path)?;
+    // Listed now: the refill lets relief in.
+    if let Some(f) = notify {
+        let _ = send_json(f, &json!({"locked": true}));
+    }
     let claim_path = d.join(format!("{id}.claim"));
     p.files.lock().unwrap().extend([sock.clone(), lock_path, claim_path.clone()]);
     let ready = load(p.spawner.take(None)?, tpl.clone())?;
@@ -411,6 +434,8 @@ pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]
 }
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a refill holds relief off for each standby it starts: its grant, then its lock file.
+const LOCKED_TIMEOUT: Duration = Duration::from_secs(5);
 const LATE: Duration = Duration::from_millis(250);
 const CLAIM_TIMEOUT: Duration = Duration::from_secs(60);
 const SETTLE: Duration = Duration::from_millis(50);
@@ -544,6 +569,19 @@ mod tests {
         crate::host::flock(&lock, libc::LOCK_EX).unwrap();
         assert_eq!(refill_by(&host, "default", false).unwrap(), 0);
         drop(lock);
+        // Nor while relief stops standby VMs.
+        let stop = stop_lock(&host).unwrap();
+        crate::host::flock(&stop, libc::LOCK_EX).unwrap();
+        assert_eq!(refill_by(&host, "default", false).unwrap(), 0);
+        drop(stop);
+        // A host lock held by a stuck process fails the grant within the budget, and lets relief in.
+        let held = File::create(host.state.join("lock")).unwrap();
+        crate::host::flock(&held, libc::LOCK_EX).unwrap();
+        let start = Instant::now();
+        assert!(refill_by(&host, "default", false).is_err());
+        assert!(start.elapsed() < LOCKED_TIMEOUT + Duration::from_secs(1), "{:?}", start.elapsed());
+        crate::host::flock(&stop_lock(&host).unwrap(), libc::LOCK_EX | libc::LOCK_NB).unwrap();
+        drop(held);
         host.cfg.reserve_mib = u64::MAX / 2;
         assert_eq!(refill_by(&host, "default", false).unwrap(), 0);
         assert!(live(&host, "default").is_empty());
