@@ -282,8 +282,7 @@ impl Proc {
             bail!("no vm named {name:?}");
         }
         if let Ok(q) = std::fs::read_to_string(dir.join(QUARANTINE)) {
-            let (boot, why) = q.split_once(' ').unwrap_or((&q, ""));
-            if boot == crate::host::boot_id() {
+            if let Some(why) = quarantined(&q, crate::host::boot_id()) {
                 bail!("vm {name} is quarantined: {why}; kill it to discard its checkpoint");
             }
             crate::util::unlink_durably(&dir.join(QUARANTINE))?;
@@ -328,7 +327,14 @@ impl Proc {
             }
             // Re-arming the checkpoint would replay what it did since.
             Err(Restore::Ran(e)) => {
-                let _ = revoke(&self.host, name);
+                // Revoking deletes it: not again when the process ends. Unrevoked, it is still
+                // marked STARTED, so deleting it here is as safe.
+                let consumed = self.consumed.lock().unwrap().take();
+                if revoke(&self.host, name).is_err() {
+                    if let Some(dir) = consumed {
+                        delete_consumed(name, &dir);
+                    }
+                }
                 bail!("vm {name} failed after it resumed: {e}; it is gone, its checkpoint is consumed")
             }
         }
@@ -416,9 +422,15 @@ impl Proc {
         if hold {
             return Ok(keep_paused(t, None));
         }
-        let still = self.still_current(ip).map_err(|e| Restore::NotRun(kill(e)))?;
+        // Test fault `resume_fence_fail`: the generation is found withdrawn at the fence.
+        let still = match fault("resume_fence_fail") {
+            true => Err("injected fault: the address's generation was withdrawn meanwhile".into()),
+            false => self.still_current(ip),
+        };
+        let still = still.map_err(|e| Restore::NotRun(kill(e)))?;
         if owned {
-            // A crash must not bring it back once it may have run.
+            // A crash must not bring it back once it may have run. Marked under the fence, not before:
+            // a crash while waiting for the host lock would otherwise lose a VM that never ran.
             let failing = |e: &str| std::fs::remove_file(dir.join(STARTED)).and(Err(std::io::Error::other(format!("injected fault: {e}"))));
             let marked = match fault("started_fsync") {
                 true => std::fs::File::create(dir.join(STARTED)).and(Err(std::io::Error::other("injected fault: fsync failed"))),
@@ -658,15 +670,19 @@ impl Proc {
             thread::sleep(Duration::from_millis(10));
         }
         t.mark("drain");
+        // Refused before the disk is reserved or write tracking armed (a VM that has not taken its new address cannot leave).
+        vm.can_leave()?;
         // Paused vCPUs do not stop virtio-mem discarding memory after the save.
         vm.settle_hotplug(Instant::now() + SETTLE_WAIT)?;
         t.mark("settle_hotplug");
         let present = vm.pager.census()[crate::uffd::PRESENT as usize];
+        // Test fault `prealloc_fail`: shows a refusal came before any of the disk was reserved.
+        if fault("prealloc_fail") {
+            bail!("injected fault: preallocating the checkpoint failed");
+        }
         staging.preallocate(if incremental { present.min(vm.pager.dirty_count()) } else { present })?;
         t.mark("preallocate");
         if cow {
-            // Refused before arming, so a refusal leaves no write tracking (and collapse not halted for it).
-            vm.can_leave()?;
             // Arm while running so the pause only re-protects what it writes from now.
             if !vm.pager.tracking() {
                 *vm.last_checkpoint.lock().unwrap() = None;
@@ -1001,6 +1017,13 @@ fn free_address(host: &Host, name: &str, ip: Option<Ipv4Addr>, gen: Option<u64>)
     Ok(())
 }
 
+/// Why a QUARANTINE file (`<boot id> <why>`) holds, if it was written in boot `boot`: a reboot
+/// shows whether STARTED reached the disk, so an earlier boot's no longer does.
+fn quarantined<'a>(q: &'a str, boot: &str) -> Option<&'a str> {
+    let (written, why) = q.split_once(' ').unwrap_or((q, ""));
+    (written == boot).then_some(why)
+}
+
 fn manifest(dir: &Path) -> Option<Manifest> {
     let text = std::fs::read(dir.join("manifest.json")).ok()?;
     serde_json::from_slice(text.splitn(2, |&b| b == b'\n').nth(1)?).ok()
@@ -1012,7 +1035,9 @@ pub fn describe_suspended(host: &Host, name: &str) -> Option<Value> {
     }
     let dir = host.suspended(name);
     let m = manifest(&dir)?;
-    let state = if read_gen(&dir).is_none() || dir.join(QUARANTINE).exists() { "quarantined" } else { "suspended" };
+    // A quarantine from an earlier boot no longer holds (`resume_suspended` drops it).
+    let held = std::fs::read_to_string(dir.join(QUARANTINE)).is_ok_and(|q| quarantined(&q, crate::host::boot_id()).is_some());
+    let state = if read_gen(&dir).is_none() || held { "quarantined" } else { "suspended" };
     Some(json!({
         "name": name, "ip": m.ip.to_string(), "template": m.template, "template_id": m.template_id,
         "state": state, "vcpus": m.vcpus, "guest_mib": m.mem_mib + m.hotplug_mib, "max_mib": m.max_mib,
@@ -1026,4 +1051,18 @@ pub fn ckhash(paths: &crate::template::Paths, dir: &Path) -> Result<Value> {
     let tpl = Template::open(paths, &ck.manifest.template)?;
     tpl.check_id(&ck.manifest.template_id)?;
     Ok(json!({"hash": ck.content_hash(&tpl)?, "id": ck.id, "chain": ck.chain, "data_pages": ck.data_pages()}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::quarantined;
+
+    #[test]
+    fn quarantine_holds_only_in_its_boot() {
+        assert_eq!(quarantined("b1 the mark may be on disk", "b1"), Some("the mark may be on disk"));
+        assert_eq!(quarantined("b1 the mark may be on disk", "b2"), None, "a reboot lets the disk decide");
+        assert_eq!(quarantined("b1", "b1"), Some(""));
+        assert_eq!(quarantined("", "b1"), None);
+        assert_eq!(quarantined("b1x why", "b1"), None, "the whole first word is the boot id");
+    }
 }

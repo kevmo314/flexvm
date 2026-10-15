@@ -212,7 +212,7 @@ FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_be
           "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "resume_kill",
           "prepare_fail", "short_incoming", "slow_preload", "bad_preload", "bad_app_log", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
           "started_fsync", "started_unmark", "start_stall", "incoming_stall", "admitted_stall", "claim_stall", "standby_lock_stall", "standby_lock_hang", "handoff_stall", "ckpt_wp_race", "ckpt_rescue_fail",
-          "fetch_tail_enomem", "fetch_enomem_stuck", "pull_enomem", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo", "release_stall", "release_late", "no_plug", "pause_lost", "tap_backlog", "tap_backlog_stuck", "pause_unknown", "restore_unpause_fail", "resume_link_fail", "resume_partial", "repause_fail", "pause_fail", "restore_ping_slow", "readdress_fail", "no_collapse", "collapse_slow", "pages_slow", "unlend_fail", "route_stall", "suspend_slow", "owe_fail", "settle_unpause")
+          "fetch_tail_enomem", "fetch_enomem_stuck", "pull_enomem", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo", "release_stall", "release_late", "no_plug", "pause_lost", "tap_backlog", "tap_backlog_stuck", "pause_unknown", "restore_unpause_fail", "resume_link_fail", "resume_partial", "repause_fail", "pause_fail", "restore_ping_slow", "readdress_fail", "no_collapse", "collapse_slow", "pages_slow", "unlend_fail", "route_stall", "suspend_slow", "owe_fail", "settle_unpause", "prealloc_fail", "resume_fence_fail")
 
 
 def disarm():
@@ -3192,6 +3192,81 @@ def suspend_gen():
     r = restore(A, os.path.join(A.state, "suspended", n), name=n + "2", ip="auto")
     check("suspend gen: without it, its checkpoint restores at a new address", r["ok"] and md5(A, n + "2") == m, r)
     cleanup(n + "2")
+    cleanup(n)
+
+
+def suspend_unaddressed():
+    """A VM restored --paused at a new address (--ip auto), not taken yet,
+    refuses suspend (SIGTERM) and checkpoint --stop before any of the
+    checkpoint's disk is reserved: with test fault prealloc_fail armed, the
+    refusal is the address, never the injected fault. Resumed, it takes its
+    address, and suspends and resumes."""
+    n, n2, path = "ft-unaddr", "ft-unaddr2", ckpt_path("ft-unaddr")
+    m = setup(n, mib=20)
+    ok(checkpoint(A, n, path))
+    r = ok(restore(A, path, name=n2, ip="auto", paused=True))
+    check("unaddressed: restored paused at another address", r["state"] == "paused" and r["ip"] != vms(A)[n]["ip"], r)
+    fault(A, "prealloc_fail", 600000)
+    r = checkpoint(A, n2, ckpt_path("ft-unaddr-stop"), stop=True)
+    check("unaddressed: checkpoint --stop refused before preallocating", not r["ok"] and "new address" in r["error"] and "injected" not in r["error"], r)
+    pid, seen = vm_pid(A, n2), len(log(A, n2))
+    os.kill(pid, signal.SIGTERM)
+    lines = lambda: [l for l in log(A, n2)[seen:].splitlines() if "signal 15" in l]
+    refused = wait_for(lines, 60)
+    check("unaddressed: suspend refused before preallocating", refused and "new address" in lines()[0] and "injected" not in lines()[0], lines())
+    wait_for(lambda: vms(A).get(n2, {}).get("state") == "paused", 10)
+    v = vms(A).get(n2, {})
+    check("unaddressed: runs on paused, not suspended", alive(pid) and v.get("state") == "paused" and not os.path.exists(os.path.join(A.state, "suspended", n2)), v)
+    disarm()
+    resume(A, n2)
+    suspend(A, n2)
+    check("unaddressed: once addressed, suspends", vms(A).get(n2, {}).get("state") == "suspended", vms(A).get(n2))
+    ok(resume_suspended(A, n2))
+    check("unaddressed: resumes, md5 intact", md5(A, n2) == m)
+    cleanup(n2)
+    cleanup(n)
+
+
+def resume_fence_fails():
+    """A resume whose address generation is found withdrawn at the fence
+    (test fault resume_fence_fail) never marks STARTED, which is made durable
+    only under the fence: the VM never ran and stays suspended, never
+    quarantined even with the unmark failing too (started_unmark), and
+    resumes later."""
+    n = "ft-fence"
+    m = setup(n, mib=20)
+    d = suspend(A, n)["dir"]
+    exists = lambda f: os.path.exists(os.path.join(d, f))
+    fault(A, "resume_fence_fail", 60000)
+    fault(A, "started_unmark", 60000)
+    r = resume_suspended(A, n)
+    disarm()
+    check("fence fails: resume refused, not quarantined", not r["ok"] and "withdrawn" in r["error"] and "quarantined" not in r["error"], r)
+    check("fence fails: still suspended, never marked", vms(A).get(n, {}).get("state") == "suspended" and not exists("STARTED") and not exists("QUARANTINE") and exists("manifest.json"), vms(A).get(n))
+    ok(resume_suspended(A, n))
+    check("fence fails: resumes later, md5 intact", md5(A, n) == m)
+    cleanup(n)
+
+
+def quarantine_reboot_ls():
+    """ls agrees with resume about a quarantine: one written in this boot is
+    listed quarantined; after a (faked) reboot, its QUARANTINE no longer
+    holds, so the VM is listed suspended, and resumes."""
+    n = "ft-q-boot"
+    m = setup(n, mib=20)
+    d = suspend(A, n)["dir"]
+    fault(A, "started_fsync", 60000)
+    fault(A, "started_unmark", 60000)
+    r = resume_suspended(A, n)
+    disarm()
+    check("quarantine: resume refused, quarantined", not r["ok"] and "quarantined" in r["error"], r)
+    check("quarantine: listed quarantined in its boot", vms(A).get(n, {}).get("state") == "quarantined", vms(A).get(n))
+    q = os.path.join(d, "QUARANTINE")
+    why = open(q).read().split(" ", 1)[1]
+    open(q, "w").write("another-boot " + why)
+    check("quarantine: after a reboot, listed suspended", vms(A).get(n, {}).get("state") == "suspended" and os.path.exists(q), vms(A).get(n))
+    ok(resume_suspended(A, n))
+    check("quarantine: after a reboot, resumes, md5 intact", md5(A, n) == m)
     cleanup(n)
 
 
@@ -7625,7 +7700,7 @@ SCENARIOS = dict(
     ckpt_failed_stop=ckpt_failed_stop, ckpt_rearm=ckpt_rearm, ckpt_dir_moved=ckpt_dir_moved,
     prepare_disconnect=prepare_disconnect, prepare_trickle=prepare_trickle, prepare_fail=prepare_fail,
     fc_prepare=fc_prepare, slow_preload=slow_preload, bad_preload=bad_preload, ckpt_packet_hold=ckpt_packet_hold, ckpt_stall=ckpt_stall, standby=standby,
-    suspend_disk_freed=suspend_disk_freed, resume_mark_fails=resume_mark_fails, kill_source=kill_source,
+    suspend_disk_freed=suspend_disk_freed, resume_mark_fails=resume_mark_fails, suspend_unaddressed=suspend_unaddressed, resume_fence_fails=resume_fence_fails, quarantine_reboot_ls=quarantine_reboot_ls, kill_source=kill_source,
     kill_refused_checkpoint=no_evict(kill_refused_checkpoint), wildcard_listen=wildcard_listen, peer_by_name=peer_by_name, peer_moved=peer_moved, peer_unresolvable=peer_unresolvable, page_refusals=page_refusals,
     forged_peer=forged_peer, restore_ip_peer=restore_ip_peer, spoof_filter=spoof_filter, late_withdrawal=late_withdrawal, unlend_retry=unlend_retry,
     unit_restart=unit_restart, log_cap=log_cap, gc_debris=gc_debris, prefix_change=prefix_change, arrival_log=arrival_log, template_tap=template_tap,

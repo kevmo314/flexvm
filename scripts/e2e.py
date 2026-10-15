@@ -56,7 +56,7 @@ FAULTS = ("basic route route_abort lost_ack unknown refused pages_blip pages_dea
           "same_host_order same_host_slow_route same_host_flood same_host_late_handover same_host_backlog same_host_bulk_tcp ckpt_backlog ckpt_paused_backlog rx_stall arrival_abort_route arrival_killed_route handoff_superseded delayed_announce announce_arp_timer prepare_fail_announce reconcile_announce reconcile_kill mem_high mem_high_migrate mem_high_evict mem_refused_headroom mem_refused_fill "
           "sigkill_restart listen_trickle suspend_cmd suspend_overlap fc_died_busy pause_cmd_start suspend_died evict_latency evict_skips_cmd cmd_flag "
           "refused_admission arrival_grew arrival_grew_admitted meminfo_unreadable checkpoint_hotplug log_cap gc_debris arrival_log template_tap prefix_change arrival_overtaken "
-          "prepare_disconnect prepare_trickle unlend_retry bad_app_log resume_slow_guest resume_readdress_fail resume_unpause_fail abort_link_fail resume_unsettled resume_pull_lock page_conns page_refusals")
+          "prepare_disconnect prepare_trickle unlend_retry bad_app_log resume_slow_guest resume_readdress_fail resume_unpause_fail abort_link_fail resume_unsettled resume_pull_lock page_conns page_refusals suspend_unaddressed resume_fence_fails quarantine_reboot_ls")
 p.add_argument("--faults", default=FAULTS, help="scripts/faults.py scenarios to run against the two hosts ('' for none)")
 # A worker runs its cases on one lane, against templates that are already built.
 p.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
