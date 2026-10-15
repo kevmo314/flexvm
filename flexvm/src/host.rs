@@ -3891,6 +3891,8 @@ mod tests {
     fn admission_fails_closed_when_holds_cannot_be_read() {
         let (_h_dir, mut h) = host("holds-unreadable");
         h.cfg.reserve_mib = 0;
+        // Its grants must all count to the end, however long a loaded machine takes over it.
+        pin_clock(boottime_ms());
         let grants = || load::<Vec<(u64, u64, u64)>>(&h.grants()).unwrap().unwrap_or_default();
         let grant = || h.grant_inner(1, Floor::Reserve, false, None, || Some(AVAIL)).map(|r| r.ok().map(|g| g.0));
         // No holds directory yet: nothing held, a complete scan.
