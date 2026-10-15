@@ -343,11 +343,18 @@ impl Root {
         let mut how: libc::open_how = unsafe { std::mem::zeroed() };
         how.flags = (flags | libc::O_CLOEXEC) as u64;
         how.resolve = libc::RESOLVE_IN_ROOT | libc::RESOLVE_NO_MAGICLINKS;
-        let fd = unsafe { libc::syscall(libc::SYS_openat2, self.fd.as_raw_fd(), path.as_ptr(), &how, std::mem::size_of::<libc::open_how>()) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
+        for attempt in 0..100 {
+            let fd = unsafe { libc::syscall(libc::SYS_openat2, self.fd.as_raw_fd(), path.as_ptr(), &how, std::mem::size_of::<libc::open_how>()) };
+            if fd >= 0 {
+                return Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) });
+            }
+            let err = io::Error::last_os_error();
+            // RESOLVE_IN_ROOT can race even with unrelated renames elsewhere on the system.
+            if attempt == 99 || !matches!(err.raw_os_error(), Some(libc::EAGAIN | libc::EINTR)) {
+                return Err(err);
+            }
         }
-        Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
+        unreachable!()
     }
 
     fn resolve(&self, rel: &Path) -> io::Result<OwnedFd> {
