@@ -695,17 +695,17 @@ fn scope(prefix: &[u8], pid: u32, start: u64) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
     #[test]
     fn failed_write_file_removes_its_temp_file() {
         let dir = std::env::temp_dir().join(format!("flexvm-write-file-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("dest")).unwrap();
-        assert!(super::write_file(&dir, "dest", b"data", true).is_err());
+        assert!(write_file(&dir, "dest", b"data", true).is_err());
         assert!(!dir.join(format!(".dest.{}.tmp", std::process::id())).exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
-
-    use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn read_timeout_is_set_again_only_when_it_drifts() {
