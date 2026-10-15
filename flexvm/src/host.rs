@@ -1868,13 +1868,14 @@ impl Host {
     /// often for good): what was never asked goes first, so peers that are
     /// down never crowd out one that is up. A peer no longer configured is not asked.
     pub fn deliver_withdrawals(&self) {
-        self.deliver_withdrawals_with(WITHDRAWAL_CALLS, wall_ms(), |peer, req| crate::vmproc::peer_call(peer, req.clone()).map(drop));
+        let _ = self.deliver_withdrawals_with(WITHDRAWAL_CALLS, wall_ms(), |peer, req| crate::vmproc::peer_call(peer, req.clone()).map(drop));
     }
 
-    fn deliver_withdrawals_with(&self, budget: usize, now: u64, tell: impl Fn(&str, &serde_json::Value) -> Result<()> + Sync) {
-        let Ok(lock) = File::create(self.run.join(".withdrawals.lock")) else { return };
+    /// False if another process was delivering (it, or the next sweep, delivers these too).
+    fn deliver_withdrawals_with(&self, budget: usize, now: u64, tell: impl Fn(&str, &serde_json::Value) -> Result<()> + Sync) -> bool {
+        let Ok(lock) = File::create(self.run.join(".withdrawals.lock")) else { return false };
         if flock(&lock, libc::LOCK_EX | libc::LOCK_NB).is_err() {
-            return;
+            return false;
         }
         let peers = self.config_now().peers;
         let notices: Vec<(Ipv4Addr, Notice)> = std::fs::read_dir(self.state.join("withdrawals"))
@@ -1908,7 +1909,7 @@ impl Host {
             calls.into_iter().filter_map(|c| c.join().ok()).collect()
         });
         // Under the host lock, from the notice as it is now: a newer withdrawal recorded meanwhile is kept whole.
-        let Ok(_l) = self.lock() else { return };
+        let Ok(_l) = self.lock() else { return true };
         for (ip, _) in notices {
             let path = self.notice_path(ip);
             let Ok(Some(mut n)) = load::<Notice>(&path) else { continue };
@@ -1951,6 +1952,7 @@ impl Host {
                 }
             }
         }
+        true
     }
 }
 
@@ -2649,17 +2651,22 @@ mod tests {
         assert!(h.addr(&h.lock().unwrap(), x).unwrap().withdrawn);
     }
 
-    /// A delivery pass at `now` with `down` failing: who was asked.
+    /// A delivery pass at `now` with `down` failing: who was asked. A pass
+    /// that found its lock busy (another test's child, forked but not yet
+    /// exec'd, may hold it for a moment: #374) is run again.
     fn deliver(h: &Host, budget: usize, now: u64, down: &[&str]) -> Vec<String> {
         let asked = Mutex::new(Vec::new());
-        h.deliver_withdrawals_with(budget, now, |p, req| {
+        let tell = |p: &str, req: &serde_json::Value| {
             assert!(req["via"].is_null() && req["gen"].as_u64().is_some());
             asked.lock().unwrap().push(p.to_string());
             if down.contains(&p) {
                 bail!("down")
             }
             Ok(())
-        });
+        };
+        while !h.deliver_withdrawals_with(budget, now, tell) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let mut asked = asked.into_inner().unwrap();
         asked.sort();
         asked
@@ -2694,7 +2701,9 @@ mod tests {
         // A newer withdrawal recorded during a delivery is kept whole; an older one does not replace it.
         store(&h.notice_path(x), &Notice { gen: 4, peers: unheard(&["p1"]) }, false).unwrap();
         let newer = Notice { gen: 9, peers: unheard(&["p1", "p2"]) };
-        h.deliver_withdrawals_with(8, 0, |_, _| store(&h.notice_path(x), &newer, false));
+        while !h.deliver_withdrawals_with(8, 0, |_, _| store(&h.notice_path(x), &newer, false)) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert_eq!(notice(&h), Some(newer.clone()));
         h.withdraw_noted(&h.lock().unwrap(), x, 5).unwrap();
         assert_eq!(notice(&h), Some(newer));
