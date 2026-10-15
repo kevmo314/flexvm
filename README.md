@@ -272,7 +272,7 @@ hold no secrets at startup. Details: [docs/images.md](docs/images.md).
 | `--artifacts DIR` | `FLEXVM_ARTIFACTS` | `./artifacts` | `firecracker`, `vmlinux`, `rootfs.ext4`, `flexvm-init` |
 | `--templates DIR` | `FLEXVM_TEMPLATES` | `ARTIFACTS/templates` | built templates |
 | `--image-cache DIR` | | `ARTIFACTS/images` | pulled container images |
-| `--image-staging DIR` | | `STATE/staging` | where image layers unpack (root-owned, see [docs/images.md](docs/images.md)) |
+| `--image-staging DIR` | | `/var/lib/flexvm/staging` | where image layers unpack (root-owned, see [docs/images.md](docs/images.md)) |
 | `--init PATH` | | `ARTIFACTS/flexvm-init` | the init image templates run as PID 1 |
 | | `FLEXVM_CKPT_THREADS` | the CPU count, 1-12 | threads writing a checkpoint |
 | | `FLEXVM_COW_BUDGET_MIB` | 256 | copies of pages a running checkpoint keeps in memory (the guest wrote them before they were saved) before write faults wait for the writers |

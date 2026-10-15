@@ -41,7 +41,7 @@ the guest can leave any cgroup); without cgroup2 their session is killed.
   hard links. Every path resolves inside the image (`openat2(RESOLVE_IN_ROOT)`),
   so absolute symlinks behave as in a container and a layer cannot write
   outside it; whiteouts must name one entry, and removal walks directory fds.
-  Layers are unpacked in `--image-staging` (default `STATE/staging`, `/var/lib/flexvm/staging`),
+  Layers are unpacked in `--image-staging` (default `/var/lib/flexvm/staging`),
   which must be root-owned and 0700 with an ancestry only root can change, and
   is used through a descriptor, so other users can neither reach the image's
   setuid files and device nodes nor swap the directory mid-build. The image

@@ -123,7 +123,8 @@ STATE (default /var/lib/flexvm, on disk)
   evict.lock             one eviction decider at a time (flock)
   evict.worker.lock      held by the thread running an eviction; arrivals by eviction are refused meanwhile
   evict.last             its mtime: when an eviction last started (5 s apart)
-  staging/               where image layers unpack (`template --image`, `--image-staging`)
+  staging/               where image layers unpack (`template --image`): `/var/lib/flexvm/staging`
+                         whatever STATE is, as it must be root-owned (`--image-staging` elsewhere)
 RUN (default /run/flexvm, tmpfs)
   vms/NAME.{lock,json,sock,log}   registry entry, liveness lock, control socket, log of -d/standby VMs
   vms/NAME.{failed,moved}         why a VM died (until `flexvm kill`); where it migrated to (an hour)

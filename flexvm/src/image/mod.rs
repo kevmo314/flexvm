@@ -346,6 +346,8 @@ fn create_new(path: &Path) -> Result<File> {
     Ok(std::fs::OpenOptions::new().write(true).create_new(true).custom_flags(libc::O_NOFOLLOW).open(path)?)
 }
 
+pub const STAGING: &str = "/var/lib/flexvm/staging";
+
 /// Only root may change what `path` names (sticky directories excepted).
 fn check_ancestry(path: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;

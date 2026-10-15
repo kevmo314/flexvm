@@ -135,14 +135,19 @@ impl Args {
         e.map_or(Ok(a), Err)
     }
 
-    /// What parsed before an error too: its command decides the exit status.
+    /// The first error, and everything parsed around it: the command decides the exit status, wherever it is.
     fn parse_partly(it: impl IntoIterator<Item = String>) -> (Args, Option<util::Error>) {
         let mut a = Args { positional: Vec::new(), flags: Vec::new(), rest: Vec::new(), child_args: Vec::new() };
-        let e = a.parse_into(it.into_iter()).err();
-        (a, e)
+        let mut first = None;
+        let mut it = it.into_iter();
+        while let Err(e) = a.parse_into(&mut it) {
+            first.get_or_insert(e);
+        }
+        (a, first)
     }
 
-    fn parse_into(&mut self, mut it: impl Iterator<Item = String>) -> Result<()> {
+    /// Up to an error; called again, it goes on after it.
+    fn parse_into(&mut self, it: &mut impl Iterator<Item = String>) -> Result<()> {
         let a = self;
         while let Some(arg) = it.next() {
             if arg != "-d" && arg != "--detach" {
@@ -658,7 +663,7 @@ fn image_options(args: &Args) -> Result<Option<image::Options>> {
         warm,
         ready,
         ready_timeout: Duration::from_secs(args.parse_or("ready-timeout", 120)?),
-        staging: args.get("image-staging").map_or_else(|| args.path("state", "FLEXVM_STATE", "/var/lib/flexvm").join("staging"), PathBuf::from),
+        staging: args.get("image-staging").unwrap_or(image::STAGING).into(),
         limits: image::Limits {
             download: args.parse_or("max-download-mib", d.download >> 20)? << 20,
             unpacked: args.parse_or("max-unpacked-mib", d.unpacked >> 20)? << 20,
@@ -857,6 +862,16 @@ mod exec_tests {
         let args = parse(&["run", "--incoming", "--standby", "--paused"]);
         assert!(args.has("incoming") && args.has("standby") && args.has("paused"));
         assert!(args.rest.is_empty());
+    }
+
+    #[test]
+    fn a_parse_error_still_finds_its_command() {
+        for argv in [&["--bogus", "run", "job"][..], &["run", "job", "--bogus"], &["-x", "resume", "job"], &["--bogus", "restore", "/x", "--ip"]] {
+            let (args, e) = Args::parse_partly(argv.iter().map(|a| a.to_string()));
+            assert!(e.is_some() && ["run", "resume", "restore"].contains(&args.positional[0].as_str()), "{argv:?}");
+        }
+        let (args, e) = Args::parse_partly(["--state", "run", "ls"].map(String::from));
+        assert!(e.is_none() && args.positional == ["ls"]);
     }
 
     #[test]
