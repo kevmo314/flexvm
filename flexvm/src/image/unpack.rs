@@ -725,6 +725,36 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn resolve_during_unrelated_renames() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Barrier;
+
+        let s = Sandbox::new("resolve-renames");
+        std::fs::create_dir_all(s.root.join("a/b")).unwrap();
+        let root = s.open();
+        let unrelated = tmpdir("unrelated-renames");
+        let a = unrelated.join("a");
+        let b = unrelated.join("b");
+        std::fs::write(&a, "").unwrap();
+        let running = AtomicBool::new(true);
+        let ready = Barrier::new(2);
+        std::thread::scope(|scope| {
+            let renamer = scope.spawn(|| {
+                ready.wait();
+                while running.load(Ordering::Relaxed) {
+                    std::fs::rename(&a, &b).unwrap();
+                    std::fs::rename(&b, &a).unwrap();
+                }
+            });
+            ready.wait();
+            let result = (0..20_000).try_for_each(|_| root.resolve(Path::new("a/b/../../a/b")).map(drop));
+            running.store(false, Ordering::Relaxed);
+            renamer.join().unwrap();
+            result.expect("path resolution failed during unrelated renames");
+        });
+    }
+
+    #[test]
     fn dangling_symlinks_resolve_where_they_really_are() {
         let s = Sandbox::new("dangling-under-symlink");
         // `a/link` is really `x/y/link`, so `../run` is `x/run`, not `run` as spelled.
