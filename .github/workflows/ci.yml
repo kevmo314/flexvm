@@ -109,7 +109,7 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: artifacts/firecracker
-          key: firecracker-${{ steps.keys.outputs.env }}-${{ steps.keys.outputs.fc }}-${{ hashFiles('firecracker/*.patch', 'scripts/build-firecracker.sh') }}
+          key: firecracker-${{ steps.keys.outputs.env }}-${{ steps.keys.outputs.fc }}-${{ hashFiles('firecracker/*.patch', 'scripts/build-firecracker.sh', 'scripts/versions.sh') }}
       - name: Build Firecracker
         if: steps.fc-cache.outputs.cache-hit != 'true'
         run: |
@@ -131,7 +131,7 @@ jobs:
           path: |
             artifacts/vmlinux
             artifacts/base.squashfs
-          key: downloads-${{ steps.keys.outputs.downloads }}-${{ hashFiles('scripts/fetch.sh') }}
+          key: downloads-${{ steps.keys.outputs.downloads }}-${{ hashFiles('scripts/fetch.sh', 'scripts/versions.sh', 'scripts/checksums.sha256') }}
       - name: Fetch kernel and base rootfs
         run: |
           ./scripts/fetch.sh
