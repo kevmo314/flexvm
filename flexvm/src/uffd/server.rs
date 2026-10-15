@@ -7,6 +7,8 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+/// The longest a reply may take to send, all of it: a client draining it slowly holds its connection busy (never
+/// evicted) only this long.
 const SERVE_WRITE: Duration = Duration::from_secs(30);
 
 /// How long a page-server connection may idle while its VM is still a migration source; a client that comes back later
@@ -126,8 +128,20 @@ pub fn serve_pages(
     stop: impl Fn() -> bool,
     pace: impl Fn(),
 ) -> io::Result<()> {
+    serve(conn, admitted, stream, stop, pace, SERVE_WRITE, |offset, buf| pager.read_guest(offset, buf))
+}
+
+/// `serve_pages`, reading pages with `read`, each reply sent within `within`.
+fn serve(
+    conn: &TcpStream,
+    admitted: &Admitted,
+    stream: impl Read + Write,
+    stop: impl Fn() -> bool,
+    pace: impl Fn(),
+    within: Duration,
+    read: impl Fn(u64, &mut [u8]) -> Result<()>,
+) -> io::Result<()> {
     conn.set_read_timeout(Some(Duration::from_secs(1)))?;
-    conn.set_write_timeout(Some(SERVE_WRITE))?;
     let mut stream = io::BufReader::with_capacity(12 * 16, stream);
     let mut req = [0u8; 12];
     let mut buf = Vec::new();
@@ -139,9 +153,9 @@ pub fn serve_pages(
         let len = u32::from_le_bytes(req[8..].try_into().unwrap()) as usize;
         if len > MAX_FETCH {
             crate::log!("page server: refusing a {len}-byte read (at most {MAX_FETCH}); dropping the connection");
-            return stream.get_mut().write_all(&[1]);
+            return send(conn, stream.get_mut(), &[1], within, &stop);
         }
-        // The status byte, then the pages: sent with one write. The buffer only grows (zeroed once): `read_guest`
+        // The status byte, then the pages: sent with one write. The buffer only grows (zeroed once): `read`
         // overwrites what is sent.
         pace();
         if buf.len() < 1 + len {
@@ -149,14 +163,36 @@ pub fn serve_pages(
         }
         let reply = &mut buf[..1 + len];
         reply[0] = 0;
-        match pager.read_guest(offset, &mut reply[1..]) {
-            Ok(()) => stream.get_mut().write_all(reply)?,
+        match read(offset, &mut reply[1..]) {
+            Ok(()) => send(conn, stream.get_mut(), reply, within, &stop)?,
             Err(e) => {
                 crate::log!("page server: {e}");
-                stream.get_mut().write_all(&[1])?;
+                send(conn, stream.get_mut(), &[1], within, &stop)?;
             }
         }
         admitted.0.idle();
+    }
+    Ok(())
+}
+
+/// Writes all of `reply` within `within`, however slowly the client drains it, asking `stop` between writes and at
+/// least every second.
+fn send(conn: &TcpStream, w: &mut impl Write, reply: &[u8], within: Duration, stop: &impl Fn() -> bool) -> io::Result<()> {
+    let deadline = Instant::now() + within;
+    let mut sent = 0;
+    while sent < reply.len() {
+        if stop() {
+            return Err(io::Error::other("stopped while sending a reply"));
+        }
+        let left = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero());
+        let Some(left) = left else { return Err(io::Error::new(io::ErrorKind::TimedOut, format!("reply not sent within {within:?}"))) };
+        conn.set_write_timeout(Some(left.min(Duration::from_secs(1))))?;
+        match w.write(&reply[sent..]) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => sent += n,
+            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted) => {}
+            Err(e) => return Err(e),
+        }
     }
     Ok(())
 }
@@ -382,5 +418,63 @@ mod tests {
         }
         assert!(conns.admit(sock(), Duration::from_millis(50)).is_none());
         assert!(conns.all.lock().unwrap().iter().all(|c| *c.state.lock().unwrap() == Serving::Busy));
+    }
+
+    /// A client that drains its reply slowly holds its connection, busy and so never evicted, only until the
+    /// reply's deadline (not a write timeout restarted by every partial write), or until `stop`.
+    #[test]
+    fn a_slow_reader_holds_its_slot_only_until_the_deadline() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for (within, stop_after) in [(Duration::from_millis(500), None), (Duration::from_secs(60), Some(Duration::from_millis(300)))] {
+            let conns: &'static Conns = Box::leak(Box::new(Conns { all: Mutex::new(Vec::new()), gone: Condvar::new() }));
+            // TCP, as served: a Unix socket's send timeout bounds each wait for room, not each write.
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let server = listener.accept().unwrap().0;
+            // Small buffers, each soon drained: every write makes progress well within a write timeout.
+            for (sock, opt) in [(&server, libc::SO_SNDBUF), (&client, libc::SO_RCVBUF)] {
+                let size: libc::c_int = 4096;
+                let fd = std::os::fd::AsRawFd::as_raw_fd(sock);
+                assert_eq!(unsafe { libc::setsockopt(fd, libc::SOL_SOCKET, opt, (&size as *const libc::c_int).cast(), 4) }, 0);
+            }
+            let admitted = conns.admit(server.try_clone().unwrap(), Duration::ZERO).unwrap();
+            let stopped = Arc::new(AtomicBool::new(false));
+            let stopped2 = stopped.clone();
+            let start = Instant::now();
+            let serving = std::thread::spawn(move || {
+                let stop = || stopped2.load(Ordering::SeqCst);
+                let res = serve(
+                    &server,
+                    &admitted,
+                    &server,
+                    stop,
+                    || {},
+                    within,
+                    |_, buf: &mut [u8]| {
+                        buf.fill(7);
+                        Ok(())
+                    },
+                );
+                drop(admitted);
+                res
+            });
+            let mut req = [0u8; 12];
+            req[8..].copy_from_slice(&(MAX_FETCH as u32).to_le_bytes());
+            client.write_all(&req).unwrap();
+            client.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+            let mut got = 0;
+            while !serving.is_finished() && start.elapsed() < Duration::from_secs(10) {
+                if stop_after.is_some_and(|d| start.elapsed() >= d) {
+                    stopped.store(true, Ordering::SeqCst);
+                }
+                got += client.read(&mut [0; 1024]).unwrap_or(0);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let err = serving.join().unwrap().expect_err("a reply not drained in time fails");
+            let elapsed = start.elapsed();
+            assert!(elapsed < within.min(Duration::from_secs(3)) + Duration::from_secs(2), "{within:?}: held {elapsed:?} ({err})");
+            assert!(got < MAX_FETCH, "{within:?}: the reply was not all read");
+            assert!(conns.all.lock().unwrap().is_empty(), "{within:?}: its slot is free");
+        }
     }
 }

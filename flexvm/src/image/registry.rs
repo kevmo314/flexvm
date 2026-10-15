@@ -598,13 +598,17 @@ pub(super) mod tests {
             ("chunk size", |_, _| CHUNKED.into(), b'1'),
             ("trailer", |_, _| format!("{CHUNKED}0\r\nX-Trailer: "), b'x'),
             ("header", |_, _| "HTTP/1.1 200 OK\r\nX-Pad: ".into(), b'x'),
-            ("token", |base, path| {
-                if path.starts_with("/token") {
-                    CHUNKED.into()
-                } else {
-                    format!("HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"http://{base}/token\"\r\nContent-Length: 0\r\n\r\n")
-                }
-            }, b'f'),
+            (
+                "token",
+                |base, path| {
+                    if path.starts_with("/token") {
+                        CHUNKED.into()
+                    } else {
+                        format!("HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"http://{base}/token\"\r\nContent-Length: 0\r\n\r\n")
+                    }
+                },
+                b'f',
+            ),
         ];
         for (name, head, fill) in cases {
             let addr = endless_server(head, fill);
@@ -631,7 +635,7 @@ pub(super) mod tests {
             ("//cdn.example/blob", "https://cdn.example/blob"),
             ("//cdn.example", "https://cdn.example/"),
             ("/other/path?x=y#frag", "https://reg.example/other/path?x=y"),
-            ("../blob", "https://reg.example/v2/a/blob"),
+            ("../blob", "https://reg.example/v2/a/b/blob"),
             ("../../../../../../blob", "https://reg.example/blob"),
             ("blob2", "https://reg.example/v2/a/b/blobs/blob2"),
             ("./", "https://reg.example/v2/a/b/blobs/"),
