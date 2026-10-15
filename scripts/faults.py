@@ -218,10 +218,11 @@ FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_be
 def disarm():
     """Disarms every test fault on both hosts, so none outlives its scenario."""
     for h in (A, B):
-        try:
-            os.unlink(os.path.join(h.run, "faults.json"))
-        except OSError:
-            pass
+        for f in ("faults.json", "mem_available_mib"):
+            try:
+                os.unlink(os.path.join(h.run, f))
+            except OSError:
+                pass
 
 
 def setup(name, host=None, mib=200, template=None):
@@ -5240,22 +5241,34 @@ def start_admission():
     rm_ckpt(path)
 
 
-class tight_reserve:
-    """Host A's reserve set to leave `room` MiB above it, once earlier grants aged out."""
-    def __init__(self, room):
-        self.room, self.cfg = room, os.path.join(A.state, "host.json")
+class mem_available_as:
+    """`host`'s admissions and eviction see `mib` MiB available (RUN/mem_available_mib,
+    read with FLEXVM_FAULTS) in place of this machine's MemAvailable."""
+    def __init__(self, host, mib):
+        self.path, self.mib = os.path.join(host.run, "mem_available_mib"), mib
 
     def __enter__(self):
-        self.saved = open(self.cfg).read()
-        time.sleep(11)
-        c = json.loads(self.saved)
-        c["reserve_mib"] = mem_available() - self.room
-        with open(self.cfg, "w") as f:
-            json.dump(c, f)
+        with open(self.path + ".tmp", "w") as f:
+            f.write(str(self.mib))
+        os.rename(self.path + ".tmp", self.path)
+        return self
 
     def __exit__(self, *_):
-        with open(self.cfg, "w") as f:
-            f.write(self.saved)
+        os.unlink(self.path)
+
+
+def reserve_of(host):
+    return json.load(open(os.path.join(host.state, "host.json"))).get("reserve_mib", 1024)
+
+
+class tight_reserve(mem_available_as):
+    """Host A with `room` MiB above its reserve, once earlier grants aged out."""
+    def __init__(self, room):
+        super().__init__(A, reserve_of(A) + room)
+
+    def __enter__(self):
+        time.sleep(11)
+        return super().__enter__()
 
 
 def grants(host):
@@ -5312,29 +5325,30 @@ def refused_admission():
     rm_ckpt(path)
 
 
-# arrival_grew's room on B above the grant B recorded at the preflight. Before B goes on, its
-# guest has grown past that grant by twice this, however fast it grows (hotplug paces it).
-ARRIVAL_MARGIN = 256
+# arrival_grew's room on B above the grant B recorded at the preflight. Before B goes on, the
+# guest has grown so that B is asked at least twice this more (hotplug paces it: 128 MiB is quick).
+ARRIVAL_MARGIN = 64
 
 
 def park_arrival(n):
     """Migrates `n` to B in a thread (its answer in the returned dict's "r"), B parked once it
     has admitted the preflight, before it answers it: the source runs on until `grow_parked`."""
     res = {}
-    # Under the source's 30 s for B's answer, should the test never let it go.
-    fault(B, "incoming_gate", 25000)
+    # Under the source's 10 s for B's answer (PREFLIGHT_TIMEOUT), should the test never let it go.
+    fault(B, "incoming_gate", 8000)
     t = threading.Thread(target=lambda: res.update(r=migrate(A, n, B)))
     t.start()
     return t, res
 
 
 def grow_parked(n, grow, grant, label):
-    """Grows parked `n` by `grow` MiB and lets B go on once A has at least `grant` and twice
-    ARRIVAL_MARGIN MiB of it present, so the source pauses with no less than that."""
+    """Starts parked `n` growing by `grow` MiB and lets B go on once it has grown enough that B,
+    having granted `grant` (its RSS and a step of at least 256 MiB, limit.rs), is asked at
+    least twice ARRIVAL_MARGIN more for it (its size then and another such step)."""
     hog(A, n, grow)
-    want = grant + 2 * ARRIVAL_MARGIN
+    want = grant - 256 + 2 * ARRIVAL_MARGIN
     present = lambda: vms(A)[n]["pages_mib"]["present"]
-    check(f"{label}: the guest grew before b went on", wait_for(lambda: present() >= want, 20), (grant, want, present()))
+    check(f"{label}: the guest grew before b went on", wait_for(lambda: present() >= want, 7), (grant, want, present()))
     fault(B, "incoming_gate", 0)
 
 
@@ -5361,11 +5375,10 @@ def arrival_grew():
     try:
         admitted = wait_for(lambda: holds(), 30) and holds()
         check("arrival grew: b admitted its preflight", admitted, admitted)
-        # Room on B for the grant it recorded at the preflight and a margin for the machine's own
-        # drift: far less than what the guest has grown by when B goes on, which A and B share besides.
+        # Room on B for exactly the grant it recorded at the preflight and a margin, whatever this
+        # machine has: less than B is asked for once the guest has grown.
         grant = sum(int(f.split("-")[1]) for f in admitted or [])
-        reserve = mem_available() - grant - ARRIVAL_MARGIN
-        with marks(reserve, reserve, host=B):
+        with marks(1024, 1024, host=B), mem_available_as(B, 1024 + grant + ARRIVAL_MARGIN):
             grow_parked(n, grow, grant, "arrival grew")
             t.join()
     finally:
@@ -5391,6 +5404,12 @@ def arrival_grew_admitted():
     the commit: killed then, the target's hold goes with it and the source
     runs on; let be, the migration commits, admitted for all it pulls, and
     the hold goes once the pull is done."""
+    # B's room, whatever this machine has: ample for all it grows by, there and before.
+    with marks(1024, 1024, host=B), mem_available_as(B, 1024 + 8192):
+        grew_admitted()
+
+
+def grew_admitted():
     grow = 1024
     hold_dir = os.path.join(B.run, "holds")
     # Live ones: a dead owner's file stays, its lock free, until an admission next looks.
