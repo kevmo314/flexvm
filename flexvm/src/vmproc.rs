@@ -896,8 +896,7 @@ impl Proc {
             }
             send_json(&mut w, &json!({"ok": true}))?;
             if let Some(id) = &once {
-                // Without the id no one can reattach: a command whose client hung up is stopped
-                // (a silent command's heartbeats never reach the client, so writes cannot tell).
+                // A silent command's heartbeats never reach the client, so writes cannot tell it hung up.
                 let done = Arc::new(AtomicBool::new(false));
                 let watch = (c.try_clone()?, done.clone(), vm.vsock.clone(), id.clone());
                 thread::spawn(move || {
@@ -912,13 +911,16 @@ impl Proc {
                 });
                 let code = guest::exec_output(&mut g, id, |kind, data| Ok(guest::write_frame(&mut w, kind, data)?));
                 done.store(true, Ordering::Release);
-                let code = code?;
-                guest::write_frame(&mut w, guest::FRAME_EXIT, &code.to_le_bytes())?;
-                return guest::close(&vm.vsock, id, Instant::now() + guest::TIMEOUT);
+                return Ok(guest::write_frame(&mut w, guest::FRAME_EXIT, &code?.to_le_bytes())?);
             }
             std::io::copy(&mut g, &mut w)?;
             Ok(())
         })();
+        // Without the id no one can reattach: however it ended, the session goes (a running
+        // command with it).
+        if let Some(id) = &once {
+            let _ = guest::close(&vm.vsock, id, Instant::now() + guest::TIMEOUT);
+        }
         vm.untrack_exec(id);
     }
 

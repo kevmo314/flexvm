@@ -802,6 +802,9 @@ def exec_background():
     took = time.time() - t
     check("exec bg: returns once the shell exits", r == (0, "started") and took < 15, (r, took))
     check("exec bg: the background process keeps running", count("sleep 1000") == (0, "1"), count("sleep 1000"))
+    r = sh(A, n, "(sleep 4; echo late; echo late >&2; touch /tmp/bg-wrote) &")
+    wrote = wait_for(lambda: sh(A, n, "test -e /tmp/bg-wrote") == (0, ""), 15)
+    check("exec bg: a background process writing after the exec ended lives on", r == (0, "") and wrote, r)
     results = []
 
     def worker():

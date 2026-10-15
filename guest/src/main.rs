@@ -191,22 +191,22 @@ fn wait_pid(statuses: &Statuses, pid: i32, deadline: Option<Instant>) -> Option<
 }
 
 fn pump(stdout: Option<ChildStdout>, stderr: Option<ChildStderr>, mut deliver: impl FnMut(u8, &[u8])) {
-    pump_until(stdout, stderr, None, Duration::ZERO, |kind, data| {
+    drop(pump_until(stdout, stderr, None, Duration::ZERO, |kind, data| {
         deliver(kind, data);
         Duration::ZERO
-    })
+    }));
 }
 
 /// As `pump`, but once `exited` (a pidfd) is readable, returns after `drain` of pumping:
 /// background processes may hold the pipes open for good. `deliver` returns how long it waited
-/// for its reader, which is not counted.
+/// for its reader, which is not counted. Returns the pipes still open.
 fn pump_until(
     stdout: Option<ChildStdout>,
     stderr: Option<ChildStderr>,
     mut exited: Option<OwnedFd>,
     drain: Duration,
     mut deliver: impl FnMut(u8, &[u8]) -> Duration,
-) {
+) -> Vec<File> {
     let out = stdout.map(|s| (File::from(OwnedFd::from(s)), FRAME_STDOUT));
     let mut streams: Vec<(File, u8)> = out.into_iter().chain(stderr.map(|s| (File::from(OwnedFd::from(s)), FRAME_STDERR))).collect();
     let mut buf = [0; 16 * 1024];
@@ -222,7 +222,7 @@ fn pump_until(
         let polled = os(unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) });
         match polled {
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(_) => return,
+            Err(_) => break,
             Ok(_) => {
                 if exited.is_some() && fds.pop().is_some_and(|p| p.revents != 0) {
                     (exited, left, fired) = (None, Some(drain), true);
@@ -240,7 +240,59 @@ fn pump_until(
         if let Some(l) = left.as_mut().filter(|_| !fired) {
             *l = l.saturating_sub(start.elapsed().saturating_sub(waited));
             if l.is_zero() {
-                return;
+                break;
+            }
+        }
+    }
+    streams.into_iter().map(|(f, _)| f).collect()
+}
+
+struct Discarder {
+    pipes: Mutex<Vec<File>>,
+    wake: File,
+}
+
+static DISCARDER: std::sync::OnceLock<Option<Discarder>> = std::sync::OnceLock::new();
+
+/// Reads and drops whatever comes down `pipes` until each one's EOF, all on one thread.
+fn discard(pipes: Vec<File>) {
+    if pipes.is_empty() {
+        return;
+    }
+    let discarder = DISCARDER.get_or_init(|| {
+        let mut fds = [0; 2];
+        os(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) }).ok()?;
+        let (woken, wake) = unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) };
+        thread::Builder::new().spawn(move || discarding(woken)).ok()?;
+        Some(Discarder { pipes: Mutex::new(Vec::new()), wake })
+    });
+    // Without the thread they are closed after all.
+    if let Some(d) = discarder {
+        d.pipes.lock().unwrap().extend(pipes);
+        let _ = (&d.wake).write(&[1]);
+    }
+}
+
+fn discarding(mut woken: File) {
+    let mut pipes: Vec<File> = Vec::new();
+    let mut buf = [0; 16 * 1024];
+    loop {
+        let mut fds: Vec<_> = std::iter::once(&woken).chain(&pipes).map(|f| libc::pollfd { fd: f.as_raw_fd(), events: libc::POLLIN, revents: 0 }).collect();
+        if os(unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) }).is_err() {
+            continue;
+        }
+        for i in (1..fds.len()).rev().filter(|&i| fds[i].revents != 0) {
+            match pipes[i - 1].read(&mut buf) {
+                Ok(0) => drop(pipes.swap_remove(i - 1)),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted || e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(_) => drop(pipes.swap_remove(i - 1)),
+                Ok(_) => {}
+            }
+        }
+        if fds[0].revents != 0 {
+            while woken.read(&mut buf).is_ok_and(|n| n > 0) {}
+            if let Some(Some(d)) = DISCARDER.get() {
+                pipes.append(&mut d.pipes.lock().unwrap());
             }
         }
     }
