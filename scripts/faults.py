@@ -4338,6 +4338,50 @@ def mem_high_evict():
     cleanup(n)
 
 
+def mem_refused_headroom():
+    """A VM refused a step while it still has headroom below its mark is not
+    throttled or starved, so its host does not move it; only at its mark is it."""
+    n = "ft-mem-headroom"
+    m = setup(n, mib=1)
+    v = vms(A)[n]
+    admitted = v["admitted_mib"]
+    if not admitted:
+        raise Skip("no per-VM cgroups here")
+    _, high, _ = cgroup(A, n)
+    # flexvm asks for a step (limit.rs `step`) within half of one of its mark, and
+    # counts a refusal as throttling only within 16 MiB of it.
+    half = (-(-min(max(admitted // 4, 256), 2048) // 128) * 128) // 2
+    lo, hi = high - half + 8, high - 40
+    check("mem headroom: room between asking and the mark", hi - lo >= 48, (admitted, high, half))
+    fault(A, "no_admit", 600000)
+    # Filled in pieces up to just past where it asks, never to the mark.
+    for _ in range(4):
+        used = cgroup(A, n)[0]
+        if used >= lo:
+            break
+        hog(A, n, max(8, (lo + hi) // 2 - used - 16))
+        check("mem headroom: the fill finishes", wait_for(lambda: hog_done(A, n), 60), cgroup(A, n))
+        time.sleep(1)
+    used, high_now, _ = cgroup(A, n)
+    check("mem headroom: within half a step of its mark, short of it", lo <= used <= hi and high_now == high, (lo, used, hi, high_now))
+    # Asked and refused each tick; the host's eviction pass (every 5 s) leaves it be.
+    seen = []
+    for _ in range(12):
+        time.sleep(1)
+        x = vms(A).get(n, {})
+        seen.append((x.get("throttled"), x.get("starved"), x.get("admitted_mib"), cgroup(A, n)[0] if x.get("pid") else None))
+    check("mem headroom: refused, not raised", all(s[2] == admitted for s in seen), seen)
+    check("mem headroom: never throttled or starved", not any(s[0] or s[1] for s in seen), seen)
+    check("mem headroom: not moved", where(n) == {A: "running"}, (where(n), log(A, n)[-1500:]))
+    # At its mark, the same refusal is starvation, and the host moves it.
+    hog(A, n, v["guest_mib"] - 384)
+    check("mem headroom: at its mark it is moved", wait_for(lambda: where(n) == {B: "running"}, 60), (where(n), log(A, n)[-1500:]))
+    fault(A, "no_admit", 0)
+    wait_released(B, n, timeout=60)
+    check("mem headroom: md5 intact", md5(B, n) == m)
+    cleanup(n)
+
+
 class Watch:
     """While eviction runs on `host`: each of `names`' controller ticks (from
     `debug status`) and its memory requests, asked as its guest does (`MEM`,
@@ -6514,7 +6558,7 @@ SCENARIOS = dict(
     route_abort=route_abort,
     uffd_err=uffd_err,
     mem_high=no_evict(skippable(mem_high)), mem_high_migrate=no_evict(skippable(mem_high_migrate)),
-    mem_high_evict=skippable(mem_high_evict), evict_grower=skippable(evict_grower), evict_no_pingpong=evict_no_pingpong, evict_skips_cmd=evict_skips_cmd, cmd_flag=cmd_flag, standby_stop_claim=standby_stop_claim, evict_latency=skippable(evict_latency),
+    mem_high_evict=skippable(mem_high_evict), mem_refused_headroom=skippable(mem_refused_headroom), evict_grower=skippable(evict_grower), evict_no_pingpong=evict_no_pingpong, evict_skips_cmd=evict_skips_cmd, cmd_flag=cmd_flag, standby_stop_claim=standby_stop_claim, evict_latency=skippable(evict_latency),
     start_admission=start_admission, standby_admission=standby_admission,
     refused_admission=refused_admission, meminfo_unreadable=meminfo_unreadable,
     cow_grow=no_evict(cow_grow), plug_race=no_evict(plug_race), shrink_stall=no_evict(shrink_stall), plug_storm=no_evict(plug_storm),
