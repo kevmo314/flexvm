@@ -744,10 +744,11 @@ pub fn exec(host: &Host, name: &str, cmd: &str) -> Result<i32> {
         }
         std::process::exit(128 + sig);
     });
-    let code = exec_session(host, name, cmd, session, false)?;
-    // Best effort: the guest closes it a minute after its client leaves anyway.
+    let result = exec_session(host, name, cmd, session, false);
+    // On an error too (a closed stdout, as with `| head`): the command would run on, holding its slot.
+    // Best effort: the guest closes a finished session a minute after its client leaves anyway.
     let _ = close();
-    Ok(code)
+    result
 }
 
 /// `exec` of a session that may have started already. Output is written,

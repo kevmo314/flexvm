@@ -23,7 +23,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::proto::{valid_session_id, FRAME_EXIT, FRAME_LOST, FRAME_MSG, FRAME_STDERR, FRAME_STDOUT, MAX_BODY};
-use crate::{fail, msg, spawn_watched, wait_pid, write_frame, Statuses};
+use crate::{fail, msg, spawn_watched, wait_pid, write_frame, Statuses, Watched};
 
 const CAPACITY: usize = 4 * 1024 * 1024;
 const MAX_CHUNKS: usize = 4096;
@@ -70,6 +70,8 @@ struct Entry {
     output: Session,
     /// The command's process group (its shell's pid).
     group: i32,
+    /// The shell's token in `Statuses`: after the shell is reaped its pid may be another child's.
+    token: u64,
 }
 
 fn fingerprint(command: &[u8]) -> (usize, u64) {
@@ -348,9 +350,9 @@ fn open<'a>(body: &[u8], conn: Option<File>, line: &'a str, sessions: &Sessions,
                 crate::mem::enter(&mut cmd, work, false);
             }
             // Minimal images (distroless, scratch) have no shell.
-            let (child, exited) = spawn_watched(&mut cmd, statuses, true)
+            let (child, exited, token) = spawn_watched(&mut cmd, statuses, true)
                 .map_err(|e| io::Error::new(e.kind(), format!("cannot run /bin/sh: {e} (does the image have a shell?)")))?;
-            table.live.insert(id.to_string(), Entry { command: fingerprint, output: output.clone(), group: child.id() as i32 });
+            table.live.insert(id.to_string(), Entry { command: fingerprint, output: output.clone(), group: child.id() as i32, token });
             // Attached before any output, so none is overwritten before it is sent.
             let attached = attach(&output, 0, conn);
             let _ = tx.send((child, exited));
@@ -367,11 +369,12 @@ fn open<'a>(body: &[u8], conn: Option<File>, line: &'a str, sessions: &Sessions,
             let mut table = sessions.lock().unwrap();
             // Closing again (a retried acknowledgement) is fine.
             match table.live.get(id) {
-                // Only while its shell is unreaped (under the reaper's lock) is the group surely the
-                // command's: an emptied group's id may be reused. An exited shell's jobs run on.
+                // Only while its own shell is unreaped (same token, no exit, under the reaper's lock) is
+                // the group surely the command's: a reaped shell's pid, and an emptied group's id, may
+                // belong to a newer child. An exited shell's jobs run on.
                 Some(entry) => {
                     let reaped = statuses.0.lock().unwrap();
-                    if entry.group > 0 && matches!(reaped.get(&entry.group), Some(None)) {
+                    if entry.group > 0 && reaped.get(&entry.group) == Some(&Watched { token: entry.token, exit: None }) {
                         unsafe { libc::kill(-entry.group, libc::SIGKILL) };
                     }
                 }
@@ -474,7 +477,7 @@ mod tests {
 
     fn live(table: &mut Table, id: &str, output: Output) -> Session {
         let output = session(Output { reservation: table.new_output().reservation, ..output });
-        table.live.insert(id.to_string(), Entry { command: fingerprint(b"true"), output: output.clone(), group: 0 });
+        table.live.insert(id.to_string(), Entry { command: fingerprint(b"true"), output: output.clone(), group: 0, token: 0 });
         output
     }
 
@@ -678,7 +681,7 @@ mod tests {
         let mut status = 0;
         assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
         let code = if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { 128 + libc::WTERMSIG(status) };
-        statuses.0.lock().unwrap().insert(pid, Some(code));
+        statuses.0.lock().unwrap().get_mut(&pid).unwrap().exit = Some(code);
         statuses.1.notify_all();
         status
     }
@@ -740,6 +743,30 @@ mod tests {
     }
 
     #[test]
+    fn closing_after_pid_reuse_spares_the_new_process() {
+        let (sessions, statuses) = (Sessions::default(), statuses());
+        let (output, group) = start(&sessions, &statuses, "old", b"exit 0");
+        reap(&statuses, group);
+        let ring = output.0.lock().unwrap();
+        assert!(output.1.wait_timeout_while(ring, DRAIN * 3, |r| r.exit.is_none()).unwrap().0.exit.is_some());
+        // A new command, unreaped, in a group of its own, takes the finished shell's pid.
+        let mut cmd = Command::new("/bin/sleep");
+        cmd.arg("100").process_group(0);
+        let (victim, _, token) = spawn_watched(&mut cmd, &statuses, false).unwrap();
+        let pid = victim.id() as i32;
+        let old = sessions.lock().unwrap().live["old"].token;
+        assert_ne!(old, token);
+        sessions.lock().unwrap().live.get_mut("old").unwrap().group = pid;
+        assert_eq!(statuses.0.lock().unwrap()[&pid], Watched { token, exit: None });
+        assert!(request(&sessions, &statuses, "CLOSE old", b"").ends_with(b"closed"));
+        thread::sleep(Duration::from_millis(100));
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) }, 0, "the new process was killed");
+        unsafe { libc::kill(-pid, libc::SIGKILL) };
+        reap(&statuses, pid);
+    }
+
+    #[test]
     fn background_output_after_the_drain_is_dropped_not_refused() {
         let (sessions, statuses) = (Sessions::default(), statuses());
         let marker = std::env::temp_dir().join(format!("flexvm-discard-{}", std::process::id()));
@@ -789,7 +816,7 @@ mod tests {
         let pid = *statuses.0.lock().unwrap().keys().next().unwrap();
         let mut status = 0;
         assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
-        statuses.0.lock().unwrap().insert(pid, Some(libc::WEXITSTATUS(status)));
+        statuses.0.lock().unwrap().get_mut(&pid).unwrap().exit = Some(libc::WEXITSTATUS(status));
         statuses.1.notify_all();
         let output = sessions.lock().unwrap().live["retry"].output.clone();
         let ring = output.0.lock().unwrap();

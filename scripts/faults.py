@@ -836,6 +836,27 @@ def exec_background():
     stopped = wait_for(lambda: count("sleep 1001") == (0, "0"), 10)
     check("exec bg: an interrupted exec's command is stopped", stopped, count("sleep 1001"))
     check("exec bg: execs still start after the interrupted ones", sh(A, n, "echo hi") == (0, "hi"))
+    # `flexvm exec VM yes | head -n1`: once head exits, the CLI's stdout is broken; it must still
+    # close the session, or `yes` runs on holding a slot and 64 of these use them all up.
+    piped = []
+    for _ in range(70):
+        p = subprocess.Popen([BIN, "--state", A.state, "--run", A.run, "exec", n, "yes"],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=ENV)
+        head = subprocess.Popen(["head", "-n1"], stdin=p.stdout, stdout=subprocess.PIPE, text=True)
+        p.stdout.close()
+        out = head.communicate(timeout=30)[0].strip()
+        try:
+            p.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.wait()
+            out = "hung"
+        piped.append(out)
+    bad = [o for o in piped if o != "y"]
+    check("exec bg: 70 execs piped into head -n1 end", not bad, bad[:3])
+    stopped = wait_for(lambda: count("yes") == (0, "0"), 10)
+    check("exec bg: a piped exec's command is stopped once its stdout breaks", stopped, count("yes"))
+    check("exec bg: execs still start after the piped ones", sh(A, n, "echo hi") == (0, "hi"))
     with socket.socket(socket.AF_UNIX) as s:
         s.settimeout(30)
         s.connect(os.path.join(A.run, "vms", f"{n}.sock"))
