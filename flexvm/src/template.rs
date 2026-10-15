@@ -225,7 +225,9 @@ pub struct Paths {
 
 impl Paths {
     pub fn new(artifacts: &Path, templates: Option<PathBuf>) -> Result<Self> {
-        let a = artifacts.canonicalize().map_err(|e| format!("artifacts dir {artifacts:?}: {e}"))?;
+        let a = artifacts.canonicalize().map_err(|e| {
+            format!("artifacts dir {}: {e} (give the one with firecracker, vmlinux and rootfs.ext4: --artifacts DIR or FLEXVM_ARTIFACTS)", artifacts.display())
+        })?;
         Ok(Paths {
             firecracker: a.join("firecracker"),
             kernel: a.join("vmlinux"),
@@ -272,6 +274,9 @@ impl Template {
         match std::fs::read_link(&link) {
             Ok(target) => Ok(paths.templates.join(target)),
             Err(e) if e.raw_os_error() == Some(libc::EINVAL) => Ok(link),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                bail!("no template {name:?} in {} (build it: flexvm template {name}; or give --templates DIR)", paths.templates.display())
+            }
             Err(e) => bail!("template {name:?}: {e}"),
         }
     }
@@ -595,7 +600,8 @@ fn build(paths: &Paths, staging: &str, name: &str, vcpus: u32, mem_mib: u64, max
     let sockets = SocketRoot::new(&dir)?;
 
     // rootfs.ext4 is a symlink a rebuild repoints; the snapshot's page cache needs these bytes.
-    let rootfs = std::fs::canonicalize(&paths.rootfs)?;
+    let rootfs = std::fs::canonicalize(&paths.rootfs)
+        .map_err(|e| format!("{}: {e} (build it: scripts/build-rootfs.sh, or give --image REF)", paths.rootfs.display()))?;
     let start = Instant::now();
     let fc = Firecracker::spawn(&paths.firecracker, &run, sockets.allocate()?, crate::fc::SPAWN_READY)?;
     let vsock = fc.sockets.vsock.clone();
@@ -614,7 +620,7 @@ fn build(paths: &Paths, staging: &str, name: &str, vcpus: u32, mem_mib: u64, max
     fc.put("/network-interfaces/eth0", json!({"iface_id": "eth0", "host_dev_name": tap, "guest_mac": crate::net::GUEST_MAC}))?;
     fc.put("/entropy", json!({}))?;
     fc.put("/actions", json!({"action_type": "InstanceStart"}))?;
-    retry(Duration::from_secs(30), Duration::from_millis(10), || guest::ping(&vsock))?;
+    retry(Duration::from_secs(30), Duration::from_millis(10), || guest::ping(&vsock)).map_err(|e| format!("the guest did not boot: {e}; {}", fc.post_mortem()))?;
     let booted = start.elapsed();
     let plugged = plug(&fc, plug_mib.min(hotplug) / STEP_MIB * STEP_MIB)?;
 

@@ -42,9 +42,10 @@ const REGS: [&str; 4] = ["eax", "ebx", "ecx", "edx"];
 
 impl Compat {
     pub fn check(&self, host: &Self) -> Result<()> {
-        for (what, snapshot, here) in [("CPU", &self.cpu, &host.cpu), ("Firecracker", &self.firecracker, &host.firecracker)] {
+        let hints = ["every host needs the same CPU model", "copy one Firecracker binary to every host; templates built with another must be rebuilt"];
+        for ((what, snapshot, here), hint) in [("CPU", &self.cpu, &host.cpu), ("Firecracker", &self.firecracker, &host.firecracker)].into_iter().zip(hints) {
             if snapshot != here {
-                bail!("snapshot incompatible with this host: {what} differs (snapshot: {snapshot}; host: {here})");
+                bail!("snapshot incompatible with this host: {what} differs (snapshot: {snapshot}; host: {here}): {hint}");
             }
         }
         for (word, &want) in &self.features {

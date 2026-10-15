@@ -132,6 +132,16 @@ impl Config {
     }
 }
 
+/// HOST:PORT, an IPv6 address in brackets; a name is resolved only when used.
+pub fn is_endpoint(s: &str) -> bool {
+    let Some((h, port)) = s.rsplit_once(':') else { return false };
+    let host = match h.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        Some(v6) => v6.parse::<std::net::Ipv6Addr>().is_ok(),
+        None => !h.is_empty() && !h.contains([':', '[', ']', '/', ' ']),
+    };
+    host && port.parse::<u16>().is_ok_and(|p| p > 0)
+}
+
 /// Unreadable or corrupt is an error, never None.
 pub fn load<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
     match std::fs::read(path) {

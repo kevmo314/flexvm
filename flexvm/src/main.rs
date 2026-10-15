@@ -51,22 +51,26 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
   flexvm restore DIR [--name N] [--ip IP|auto] [--paused] [-d]
                                      start a VM from a checkpoint
   flexvm migrate NAME HOST:PORT      live-migrate a VM to the host listening there
-  flexvm listen [ADDR] [--peer ADDR]... [--vm-ips CIDR|FIRST-LAST] [--underlay IP]
+  flexvm listen [ADDR] [--peer HOST:PORT]... [--vm-ips CIDR|FIRST-LAST] [--underlay IP]
                 [--announce-dev IFACE] [--dns IP] [--reserve MIB] [--evict-at MIB] [--prefix P]
                                      configure this host and take migrations from peers
-  flexvm config [--peer ADDR]... [--vm-ips ...] [--underlay IP] [--announce-dev IFACE] [--dns IP]
+  flexvm config [--peer HOST:PORT]... [--vm-ips ...] [--underlay IP] [--announce-dev IFACE] [--dns IP]
                 [--reserve MIB] [--evict-at MIB] [--prefix P]
-                                     configure this host without a listener (no flags: show it)
-  flexvm standby [--template T] N    keep N VMs restored and paused, so run takes ~5 ms
+                                     configure this host without a listener (no flags: show it);
+                                     --peer replaces the list, an empty value unsets a setting
+  flexvm standby [--template T] [N]  keep N VMs restored and paused, so run takes ~5 ms (no N: show)
   flexvm template NAME [--vcpus N] [--mem MIB] [--max MIB] [--plug MIB] [--image REF ...]
                                      build a template (see README)
   flexvm bench ...                   latency benchmarks (see README)
 
 options: --state DIR (FLEXVM_STATE, /var/lib/flexvm), --run DIR (FLEXVM_RUN, /run/flexvm),
-         --artifacts DIR (FLEXVM_ARTIFACTS, ./artifacts), --templates DIR, --image-cache DIR
+         --artifacts DIR (FLEXVM_ARTIFACTS, ./artifacts), --templates DIR (FLEXVM_TEMPLATES),
+         --image-cache DIR, --version
+run, resume and restore exit with the VM's command's status, 128+signal, 125 when flexvm
+fails, 124 when the VM dies
 ";
 
-const SWITCHES: &[&str] = &["warm", "stop", "paused", "incremental", "standby", "incoming", "json", "detach", "help"];
+const SWITCHES: &[&str] = &["warm", "stop", "paused", "incremental", "standby", "incoming", "json", "detach", "help", "version"];
 
 const VALUE_FLAGS: &[&str] = &[
     "state",
@@ -125,9 +129,21 @@ pub struct Args {
 }
 
 impl Args {
+    #[cfg(test)]
     fn parse(it: impl IntoIterator<Item = String>) -> Result<Args> {
+        let (a, e) = Args::parse_partly(it);
+        e.map_or(Ok(a), Err)
+    }
+
+    /// What parsed before an error too: its command decides the exit status.
+    fn parse_partly(it: impl IntoIterator<Item = String>) -> (Args, Option<util::Error>) {
         let mut a = Args { positional: Vec::new(), flags: Vec::new(), rest: Vec::new(), child_args: Vec::new() };
-        let mut it = it.into_iter();
+        let e = a.parse_into(it.into_iter()).err();
+        (a, e)
+    }
+
+    fn parse_into(&mut self, mut it: impl Iterator<Item = String>) -> Result<()> {
+        let a = self;
         while let Some(arg) = it.next() {
             if arg != "-d" && arg != "--detach" {
                 a.child_args.push(arg.clone());
@@ -164,7 +180,7 @@ impl Args {
                 }
             }
         }
-        Ok(a)
+        Ok(())
     }
 
     pub fn has(&self, name: &str) -> bool {
@@ -188,11 +204,82 @@ impl Args {
     }
 }
 
+/// A VM's command's statuses are its own: flexvm's failures there exit 125.
 fn main() {
-    if let Err(e) = real_main() {
+    let (args, error) = Args::parse_partly(std::env::args().skip(1));
+    let vm = matches!(args.positional.first().map(String::as_str), Some("run" | "resume" | "restore"));
+    if let Err(e) = error.map_or_else(|| real_main(&args), Err) {
         eprintln!("flexvm: {e}");
-        std::process::exit(1);
+        std::process::exit(if vm { vmproc::FAILED } else { 1 });
     }
+}
+
+/// Flags every command takes.
+const GLOBAL: &[&str] = &["state", "run", "artifacts", "templates", "image-cache", "help", "version"];
+
+/// What `template --image` takes.
+const IMAGE_FLAGS: &[&str] = &[
+    "entrypoint",
+    "cmd",
+    "env",
+    "workdir",
+    "user",
+    "warm",
+    "ready-port",
+    "ready-cmd",
+    "ready-timeout",
+    "image-staging",
+    "max-download-mib",
+    "max-unpacked-mib",
+    "max-file-mib",
+    "max-entries",
+];
+
+/// Each command's words (itself included) at most, and its flags besides `GLOBAL`.
+const COMMANDS: &[(&str, usize, &[&str])] = &[
+    ("run", 2, &["template", "ip", "detach", "standby", "incoming"]),
+    ("ls", 1, &["json"]),
+    ("exec", 2, &[]),
+    ("resume", 2, &["detach"]),
+    ("kill", 2, &[]),
+    ("checkpoint", 3, &["stop", "incremental"]),
+    ("restore", 2, &["name", "ip", "paused", "detach"]),
+    ("migrate", 3, &[]),
+    ("listen", 2, CONFIG_FLAGS),
+    ("config", 1, CONFIG_FLAGS),
+    ("standby", 2, &["template"]),
+    ("template", 2, &["vcpus", "mem", "max", "plug", "image", "init"]),
+    (
+        "bench",
+        1,
+        &["template", "to", "to-state", "to-run", "timeout", "lifecycle", "iterations", "warmup", "dirty-mib", "settle-ms", "ready-port", "ready-http"],
+    ),
+    ("debug", 4, &[]),
+];
+
+/// Flags and words a command does not take are errors, never ignored.
+fn check_applies(args: &Args) -> Result<()> {
+    let Some(cmd) = args.positional.first() else { return Ok(()) };
+    let Some(&(_, most, flags)) = COMMANDS.iter().find(|(c, ..)| c == cmd) else { return Ok(()) };
+    let image = cmd == "template" && args.has("image");
+    if let Some((f, _)) = args.flags.iter().find(|(f, _)| ![GLOBAL, flags, if image { IMAGE_FLAGS } else { &[] }].concat().contains(&f.as_str())) {
+        if cmd == "template" && IMAGE_FLAGS.contains(&f.as_str()) {
+            bail!("--{f} needs --image");
+        }
+        bail!("--{f} does not apply to {cmd} (see flexvm --help)");
+    }
+    if let Some(extra) = args.positional.get(most) {
+        let hint = match cmd.as_str() {
+            "run" => format!("; a command goes after --: flexvm run {} -- {extra} ...", args.positional[1]),
+            "config" => "; the listen address is flexvm listen's".into(),
+            _ => " (see flexvm --help)".into(),
+        };
+        bail!("{cmd} does not take {extra:?}{hint}");
+    }
+    if !args.rest.is_empty() && cmd != "run" && cmd != "exec" {
+        bail!("{cmd} takes no -- CMD");
+    }
+    Ok(())
 }
 
 pub fn open_host(args: &Args) -> Result<Host> {
@@ -210,29 +297,33 @@ fn paths(args: &Args) -> Result<Paths> {
     Paths::new(&artifacts, templates)
 }
 
-fn real_main() -> Result<()> {
-    let args = Args::parse(std::env::args().skip(1))?;
+fn real_main(args: &Args) -> Result<()> {
     if args.has("help") {
         print!("{USAGE}");
         return Ok(());
     }
-    let _ = paths(&args);
+    if args.has("version") {
+        println!("flexvm {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    check_applies(args)?;
+    let _ = paths(args);
     let pos: Vec<&str> = args.positional.iter().map(|s| s.as_str()).collect();
     let (name, arg2) = (pos.get(1).copied().unwrap_or(""), pos.get(2).copied());
     let template = args.get("template").unwrap_or("default");
-    let call = |req: Value| print(vmproc::call(&open_host(&args)?, name, req, None)?);
+    let call = |req: Value| print(vmproc::call(&open_host(args)?, name, req, None)?);
     match pos.first().copied() {
-        Some("template") => build_template(&args, name),
-        Some("run") if args.has("standby") => vmproc::main(open_host(&args)?, paths(&args)?, Start::Standby { template: template.into() }, notify_fd()),
+        Some("template") => build_template(args, name),
+        Some("run") if args.has("standby") => vmproc::main(open_host(args)?, paths(args)?, Start::Standby { template: template.into() }, notify_fd()),
         Some("run") if args.has("incoming") => {
-            let req: Value = serde_json::from_str(&std::env::var("FLEXVM_INCOMING")?)?;
+            let req: Value = serde_json::from_str(&std::env::var("FLEXVM_INCOMING").map_err(|_| "run --incoming is the listener's, for migrations")?)?;
             unsafe { libc::fcntl(3, libc::F_SETFD, libc::FD_CLOEXEC) };
-            vmproc::main(open_host(&args)?, paths(&args)?, Start::Incoming { req }, None)
+            vmproc::main(open_host(args)?, paths(args)?, Start::Incoming { req }, None)
         }
-        Some("run") => run(&args, name, template),
+        Some("run") => run(args, name, template),
         // A paused VM gets SIGCONT; a suspended one a new process.
-        Some("resume") if open_host(&args)?.signal(name, libc::SIGCONT).is_ok() => Ok(()),
-        Some("resume") => start(&args, name, Start::Resume { name: name.into() }),
+        Some("resume") if open_host(args)?.signal(name, libc::SIGCONT).is_ok() => Ok(()),
+        Some("resume") => start(args, name, Start::Resume { name: name.into() }),
         Some("restore") => {
             let dir = std::path::absolute(pos.get(1).ok_or("restore needs DIR")?)?;
             // A detached restore logs to the VM's name, which the checkpoint has without --name.
@@ -242,46 +333,44 @@ fn real_main() -> Result<()> {
                 None => String::new(),
             };
             start(
-                &args,
+                args,
                 &label,
                 Start::Restore { dir, name: args.get("name").map(String::from), ip: args.get("ip").map(String::from), paused: args.has("paused") },
             )
         }
-        Some("ls") => list(&open_host(&args)?, args.has("json")),
-        Some("exec") => std::process::exit(exec(&open_host(&args)?, name, &args.rest.join(" "))?),
-        Some("kill") => kill(&open_host(&args)?, name),
+        Some("ls") => list(&open_host(args)?, args.has("json")),
+        Some("exec") => std::process::exit(exec(&open_host(args)?, name, &args.rest.join(" "))?),
+        Some("kill") => kill(&open_host(args)?, name),
         Some("checkpoint") => {
             let dir = std::path::absolute(arg2.ok_or("checkpoint needs NAME DIR")?)?;
             call(json!({"op": "checkpoint", "dir": dir, "stop": args.has("stop"), "incremental": args.has("incremental")}))
         }
         Some("migrate") => call(json!({"op": "migrate", "to": arg2.ok_or("migrate needs NAME HOST:PORT")?})),
         Some("listen") => {
-            let mut host = open_host(&args)?;
-            let listener = configure_listener(&mut host, &args, pos.get(1).copied(), listen::activated())?;
+            let mut host = open_host(args)?;
+            let listener = configure_listener(&mut host, args, pos.get(1).copied(), listen::activated())?;
             listen::main(host, listener)
         }
         Some("config") => {
-            if let Some(extra) = pos.get(1) {
-                return Err(format!("config takes only flags, not {extra:?}; the listen address is flexvm listen's").into());
-            }
-            let mut host = open_host(&args)?;
+            let mut host = open_host(args)?;
             // A prefix change is refused while any VM process or tap may use the old one (`Host::configure`).
             if CONFIG_FLAGS.iter().any(|f| args.has(f)) {
-                host.configure(|c| configure(c, &args, None))?;
+                host.configure(|c| configure(c, args, None))?;
             }
             print(serde_json::to_value(&host.cfg)?)
         }
-        Some("standby") => print(standby::set(&open_host(&args)?, template, name.parse().map_err(|_| "standby wants a count")?)?),
-        Some("bench") => bench::run(&args),
+        Some("standby") if name.is_empty() => print(standby::show(&open_host(args)?)),
+        Some("standby") => print(standby::set(&open_host(args)?, &paths(args)?, template, name.parse().map_err(|_| "standby wants a count")?)?),
+        Some("bench") => bench::run(args),
         // Test hooks: arm a fault for MS ms (0 disarms), hash a checkpoint, or ask a VM.
         Some("debug") => match name {
             "gc" => {
-                let host = open_host(&args)?;
+                let host = open_host(args)?;
                 gc::sweep(&host);
                 Ok(())
             }
-            "fault" => host::arm(&open_host(&args)?, arg2.ok_or("debug fault NAME MS")?, pos.get(3).and_then(|m| m.parse().ok()).unwrap_or(1000)),
-            "ckhash" => print(lifecycle::ckhash(&paths(&args)?, std::path::Path::new(arg2.ok_or("debug ckhash DIR")?))?),
+            "fault" => host::arm(&open_host(args)?, arg2.ok_or("debug fault NAME MS")?, pos.get(3).and_then(|m| m.parse().ok()).unwrap_or(1000)),
+            "ckhash" => print(lifecycle::ckhash(&paths(args)?, std::path::Path::new(arg2.ok_or("debug ckhash DIR")?))?),
             "" => Err("debug fault|ckhash|gc|VM ...".into()),
             _ => call(json!({"op": "debug", "what": arg2.unwrap_or("status")})),
         },
@@ -321,13 +410,17 @@ fn configure_listener(host: &mut Host, args: &Args, addr: Option<&str>, activate
 const CONFIG_FLAGS: &[&str] = &["peer", "vm-ips", "underlay", "announce-dev", "dns", "reserve", "evict-at", "prefix"];
 
 /// Flags not given keep their configured values; an empty --underlay,
-/// --announce-dev or --dns unsets it.
+/// --announce-dev, --dns or --evict-at unsets it. --peers replace the list
+/// (`--peer ''` empties it).
 fn configure(c: &mut host::Config, args: &Args, addr: Option<&str>) -> Result<()> {
     if let Some(a) = addr {
         c.listen = Some(a.into());
     }
     if args.has("peer") {
-        c.peers = args.all("peer");
+        c.peers = args.all("peer").into_iter().filter(|p| !p.is_empty()).collect();
+        if let Some(p) = c.peers.iter().find(|p| !host::is_endpoint(p)) {
+            bail!("bad --peer {p:?}: give HOST:PORT, a peer's flexvm listen address");
+        }
     }
     if let Some(r) = args.get("vm-ips") {
         net::IpRange::parse(r)?;
@@ -344,7 +437,13 @@ fn configure(c: &mut host::Config, args: &Args, addr: Option<&str>) -> Result<()
     }
     c.reserve_mib = args.parse_or("reserve", c.reserve_mib)?;
     if args.has("evict-at") {
-        c.evict_mib = Some(args.parse_or("evict-at", 0)?);
+        c.evict_mib = (args.get("evict-at") != Some("")).then(|| args.parse_or("evict-at", 0)).transpose()?;
+    }
+    if let Some(e) = c.evict_mib.filter(|&e| e < c.reserve_mib) {
+        eprintln!("flexvm: the eviction mark {e} MiB is under the {} MiB reserve: eviction starts at the reserve", c.reserve_mib);
+    }
+    if !c.peers.is_empty() && c.vm_ips == host::Config::default().vm_ips {
+        eprintln!("flexvm: warning: --vm-ips is the default {}; each peer needs a range of its own", c.vm_ips);
     }
     if let Some(p) = args.get("prefix") {
         host::check_prefix(p).map_err(|e| format!("--prefix: {e}"))?;
@@ -356,7 +455,8 @@ fn configure(c: &mut host::Config, args: &Args, addr: Option<&str>) -> Result<()
 /// Claims a standby VM if there is one, else becomes the VM.
 fn run(args: &Args, name: &str, template: &str) -> Result<()> {
     let (host, paths) = (open_host(args)?, paths(args)?);
-    let ip: Option<std::net::Ipv4Addr> = args.get("ip").map(|s| s.parse()).transpose().map_err(|_| "bad --ip")?;
+    let ip = args.get("ip").filter(|&s| s != "auto");
+    let ip: Option<std::net::Ipv4Addr> = ip.map(|s| s.parse().map_err(|_| format!("bad --ip {s:?}"))).transpose()?;
     let cmd = (!args.rest.is_empty()).then(|| args.rest.join(" "));
     host::check_name(name)?;
     let req = json!({"op": "claim", "name": name, "ip": ip.map(|i| i.to_string()), "cmd": cmd});
@@ -435,7 +535,7 @@ fn kill(host: &Host, name: &str) -> Result<()> {
     }
     if let Ok(vm) = host.signal(name, libc::SIGINT) {
         if !vm.wait(Duration::from_secs(30)) {
-            return Err(format!("vm {name} is still there; see its log").into());
+            return Err(format!("vm {name} is still there; see {}", host.vms(name, "log").display()).into());
         }
         // A suspend that finished first is undone: the kill wins.
         if !host.suspended(name).exists() {
@@ -460,7 +560,10 @@ fn kill(host: &Host, name: &str) -> Result<()> {
         )
         .into());
     }
-    Err(format!("no vm named {name:?}").into())
+    match std::fs::read_to_string(host.vms(name, "moved")) {
+        Ok(to) => Err(format!("vm {name} moved to {to}; kill it there").into()),
+        Err(_) => Err(format!("no vm named {name:?}").into()),
+    }
 }
 
 fn list(host: &Host, as_json: bool) -> Result<()> {
@@ -522,7 +625,8 @@ fn build_template(args: &Args, name: &str) -> Result<()> {
     let tap = {
         let _l = host.lock()?;
         let tap = template::tap(&host.tap_prefix()?);
-        net::create_tap(&tap, &host::tap_alias(&host.run, &me))?;
+        let root = if unsafe { libc::geteuid() } == 0 { "" } else { " (run flexvm as root)" };
+        net::create_tap(&tap, &host::tap_alias(&host.run, &me)).map_err(|e| format!("{e}{root}"))?;
         tap
     };
     template::create(&paths, name, cpus, mem, max, plug, image, &tap)
@@ -530,9 +634,7 @@ fn build_template(args: &Args, name: &str) -> Result<()> {
 
 fn image_options(args: &Args) -> Result<Option<image::Options>> {
     let Some(src) = args.get("image") else {
-        if let Some(f) = ["entrypoint", "cmd", "env", "workdir", "user", "warm", "ready-port", "ready-cmd"].iter().find(|f| args.has(f)) {
-            return Err(format!("--{f} needs --image").into());
-        }
+        // `check_applies` refused the image's flags.
         return Ok(None);
     };
     let warm = args.has("warm");
@@ -556,7 +658,7 @@ fn image_options(args: &Args) -> Result<Option<image::Options>> {
         warm,
         ready,
         ready_timeout: Duration::from_secs(args.parse_or("ready-timeout", 120)?),
-        staging: args.get("image-staging").unwrap_or(image::STAGING).into(),
+        staging: args.get("image-staging").map_or_else(|| args.path("state", "FLEXVM_STATE", "/var/lib/flexvm").join("staging"), PathBuf::from),
         limits: image::Limits {
             download: args.parse_or("max-download-mib", d.download >> 20)? << 20,
             unpacked: args.parse_or("max-unpacked-mib", d.unpacked >> 20)? << 20,
@@ -755,6 +857,43 @@ mod exec_tests {
         let args = parse(&["run", "--incoming", "--standby", "--paused"]);
         assert!(args.has("incoming") && args.has("standby") && args.has("paused"));
         assert!(args.rest.is_empty());
+    }
+
+    #[test]
+    fn flags_and_words_a_command_does_not_take_are_errors() {
+        let err = |a: &[&str]| check_applies(&parse(a)).err().map(|e| e.to_string());
+        assert_eq!(err(&["run", "web", "--mem", "512"]).unwrap(), "--mem does not apply to run (see flexvm --help)");
+        assert!(err(&["run", "job", "make", "test"]).unwrap().contains("flexvm run job -- make ..."));
+        assert!(err(&["resume", "web", "--ip", "10.0.0.1"]).is_some());
+        assert!(err(&["restore", "/d", "--template", "t"]).is_some());
+        assert!(err(&["kill", "web", "--", "x"]).is_some());
+        assert_eq!(err(&["template", "t", "--warm"]).unwrap(), "--warm needs --image");
+        for ok in [
+            &["--state", "/s", "run", "web", "--template", "t", "-d", "--", "make", "test"][..],
+            &["exec", "web", "ls", "-l"],
+            &["template", "t", "--image", "busybox", "--warm", "--ready-port", "80", "--image-cache", "/c"],
+            &["listen", "1.2.3.4:7070", "--peer", "a:1", "--evict-at", ""],
+            &["config"],
+            &["restore", "/d", "--ip", "auto", "--paused"],
+        ] {
+            assert_eq!(err(ok), None, "{ok:?}");
+        }
+    }
+
+    #[test]
+    fn peers_are_validated_and_an_empty_one_clears_them() {
+        for good in ["10.0.0.2:7070", "host-b:7070", "[2001:db8::2]:7070"] {
+            assert!(host::is_endpoint(good), "{good}");
+        }
+        for bad in ["10.0.0.2", "notahost", "10.0.0.2:0", "2001:db8::2", "[foo]:1", ":7070", "a:b"] {
+            assert!(!host::is_endpoint(bad), "{bad}");
+        }
+        let mut c = host::Config::default();
+        assert!(configure(&mut c, &parse(&["--peer", "192.168.1.11"]), None).is_err());
+        configure(&mut c, &parse(&["--peer", "a:1", "--peer", "b:2", "--evict-at", "5000"]), None).unwrap();
+        assert_eq!((c.peers.len(), c.evict_mib), (2, Some(5000)));
+        configure(&mut c, &parse(&["--peer", "", "--evict-at", ""]), None).unwrap();
+        assert!(c.peers.is_empty() && c.evict_mib.is_none());
     }
 
     #[test]

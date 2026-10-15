@@ -76,10 +76,10 @@ def ok(r):
     return r["result"]
 
 
-def peer(host, req, timeout=30):
-    """One request to `host`'s peer listener."""
+def peer(host, req, timeout=30, source=None):
+    """One request to `host`'s peer listener (from address `source`, if given)."""
     h, port = host.addr.rsplit(":", 1)
-    with socket.create_connection((h, int(port)), timeout=timeout) as s:
+    with socket.create_connection((h, int(port)), timeout=timeout, source_address=source and (source, 0)) as s:
         s.sendall((json.dumps(req) + "\n").encode())
         buf = b""
         while not buf.endswith(b"\n"):
@@ -433,6 +433,10 @@ def refused():
     check("refused: source resumed", where(n) == {A: "running", B: "running"}, where(n))
     check("refused: md5 intact on A", md5(A, n) == m)
     cleanup(n)
+    # A connection from an address that is not a peer is told why.
+    if A.addr.startswith("127."):
+        r = peer(A, {"op": "migration", "id": 1}, source="127.0.0.2")
+        check("refused: a non-peer is told it is not one", not r["ok"] and "is not a peer of" in r.get("error", ""), r)
 
 
 def pages_blip():
@@ -5125,6 +5129,10 @@ def run_status():
     argv = [BIN, "--state", A.state, "--run", A.run, "run", n, "--template", args.template, "--"]
     r = subprocess.run(argv + ["exit 7"], capture_output=True, text=True, env=ENV, timeout=120)
     check("run status: cold, CMD's own", r.returncode == 7, (r.returncode, r.stderr[-300:]))
+    # flexvm's own failures are 125, never a status CMD could have.
+    for bad in (["--template", "ft-no-such-template"], ["--ip", "bad"], ["--mem", "512"]):
+        r = subprocess.run(argv[:-1] + bad + ["--", "exit 0"], capture_output=True, text=True, env=ENV, timeout=120)
+        check(f"run status: {bad[0]} {bad[1]} fails with 125", r.returncode == 125, (r.returncode, r.stderr[-300:]))
     ok(cli_json(A, "standby", "--template", args.template, "1"))
     r = subprocess.run(argv + ["exit 5"], capture_output=True, text=True, env=ENV, timeout=120)
     check("run status: claimed, CMD's own", r.returncode == 5 and '"standby":true' in r.stderr, (r.returncode, r.stderr[-300:]))
