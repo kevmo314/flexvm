@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::bail;
-use crate::fc::Firecracker;
+use crate::fc::{memory_timeout, Firecracker};
 use crate::guest;
 use crate::image::ImageMeta;
 use crate::socket::SocketRoot;
@@ -783,7 +783,12 @@ fn build(paths: &Paths, dir: &Path, name: &str, vcpus: u32, mem_mib: u64, max_mi
         );
     }
     fc.pause()?;
-    fc.put("/snapshot/create", json!({"snapshot_type": "Full", "snapshot_path": dir.join("vmstate"), "mem_file_path": dir.join("mem")}))?;
+    fc.request_within(
+        "PUT",
+        "/snapshot/create",
+        Some(json!({"snapshot_type": "Full", "snapshot_path": dir.join("vmstate"), "mem_file_path": dir.join("mem")})),
+        memory_timeout(mem_mib + hotplug),
+    )?;
     let compatibility = crate::compat::local(fc.pid())?;
     drop(fc);
     interrupted()?;

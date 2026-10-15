@@ -19,6 +19,11 @@ use crate::util::{retry, Result};
 pub const SPAWN_READY: Duration = Duration::from_secs(5);
 pub const API_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// A full snapshot writes all of guest memory: more time for large guests on a busy disk.
+pub fn memory_timeout(mem_mib: u64) -> Duration {
+    API_TIMEOUT + Duration::from_secs(mem_mib.div_ceil(1024))
+}
+
 /// Never reached Firecracker; any other failure (error answers too) may come after it acted.
 #[derive(Debug)]
 pub struct NotSent(String);
@@ -489,6 +494,13 @@ mod tests {
 
     fn no_more(listener: &UnixListener) {
         assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+    }
+
+    #[test]
+    fn memory_deadline_scales_with_gib_rounded_up() {
+        for (mib, seconds) in [(0, 30), (1, 31), (1024, 31), (1025, 32), (47_872, 77), (u64::MAX, 30 + u64::MAX.div_ceil(1024))] {
+            assert_eq!(memory_timeout(mib), Duration::from_secs(seconds));
+        }
     }
 
     const NO_CONTENT: &[u8] = b"HTTP/1.1 204 No Content\r\n\r\n";
