@@ -5237,6 +5237,56 @@ def refused_admission():
     rm_ckpt(path)
 
 
+def arrival_grew():
+    """A guest that grows between its migration's preflight and its pause, to
+    a target with room for only what it had at the preflight, is refused
+    before the commit for what it grew by: the source resumes and runs on,
+    and the target keeps no record and no held grant. Given room, it moves."""
+    n = "ft-arrival-grew"
+    m = setup(n, mib=1)
+    v = vms(A)[n]
+    if not v["admitted_mib"]:
+        raise Skip("no per-VM cgroups here")
+    grow = 1024
+    if v["guest_mib"] < grow + 256:
+        raise Skip(f"its guest has {v['guest_mib']} MiB, too little to grow by {grow} MiB")
+    hold_dir = os.path.join(B.run, "holds")
+    holds = lambda: [f for f in os.listdir(hold_dir) if not f.startswith(".")] if os.path.isdir(hold_dir) else []
+    migs = lambda: sorted(os.listdir(os.path.join(B.state, "migs"))) if os.path.isdir(os.path.join(B.state, "migs")) else []
+    check("arrival grew: b holds nothing before", not holds(), holds())
+    recorded = migs()
+    # Room on B for the preflight's allowance (its RSS and a step, limit.rs) and a margin for the
+    # machine's own drift: far less than the guest grows by, which A and B share besides.
+    rss = v["rss_mib"]
+    room = rss + (-(-min(max(rss // 4, 256), 2048) // 128) * 128) + 256
+    time.sleep(11)  # Earlier grants on B age out.
+    reserve = mem_available() - room
+    res = {}
+    with marks(reserve, reserve, host=B):
+        # B prepares for 3 s after its admission; the guest grows meanwhile.
+        fault(B, "incoming_stall", 600000)
+        t = threading.Thread(target=lambda: res.update(r=migrate(A, n, B)))
+        t.start()
+        admitted = wait_for(lambda: holds(), 30)
+        hog(A, n, grow)
+        t.join()
+        fault(B, "incoming_stall", 0)
+    r = res["r"]
+    check("arrival grew: b admitted its preflight", admitted, (rss, room))
+    check("arrival grew: refused for what it grew by", not r["ok"] and "grew to" in r["error"] and "not enough memory" in r["error"], r)
+    check("arrival grew: the vm runs on at A", where(n) == {A: "running"} and md5(A, n) == m, where(n))
+    check("arrival grew: b keeps no record", wait_for(lambda: migs() == recorded, 10), (recorded, migs()))
+    check("arrival grew: and no held grant", wait_for(lambda: not holds(), 10), holds())
+    check("arrival grew: the guest grew on A", wait_for(lambda: hog_done(A, n), 120), cgroup(A, n))
+    r = migrate(A, n, B)
+    check("arrival grew: with room it moves", r["ok"], r)
+    st = wait_released(B, n, timeout=60)
+    check("arrival grew: pulled and released", st["released"] is True and st["failed"] is None, st)
+    check("arrival grew: admitted for all it pulled", vms(B)[n]["admitted_mib"] >= grow, vms(B)[n].get("admitted_mib"))
+    check("arrival grew: md5 intact, one copy", md5(B, n) == m and where(n) == {B: "running"}, where(n))
+    cleanup(n)
+
+
 def meminfo_unreadable():
     """/proc/meminfo unreadable (injected) is not 0 MiB available: no standby
     is stopped and nothing is evicted, and a start is refused saying why."""
@@ -7481,7 +7531,7 @@ SCENARIOS = dict(
     mem_high=no_evict(skippable(mem_high)), mem_high_migrate=no_evict(skippable(mem_high_migrate)),
     mem_high_evict=skippable(mem_high_evict), mem_refused_headroom=skippable(mem_refused_headroom), mem_refused_fill=skippable(mem_refused_fill), evict_grower=skippable(evict_grower), evict_no_pingpong=evict_no_pingpong, evict_skips_cmd=evict_skips_cmd, cmd_flag=cmd_flag, standby_stop_claim=standby_stop_claim, standby_claim_signal=standby_claim_signal, standby_concurrent_claims=standby_concurrent_claims, evict_latency=skippable(evict_latency),
     start_admission=start_admission, standby_admission=standby_admission,
-    refused_admission=refused_admission, meminfo_unreadable=meminfo_unreadable,
+    refused_admission=refused_admission, arrival_grew=no_evict(skippable(arrival_grew)), meminfo_unreadable=meminfo_unreadable,
     cow_grow=no_evict(cow_grow), plug_race=no_evict(plug_race), shrink_stall=no_evict(shrink_stall), plug_storm=no_evict(plug_storm),
     basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, refused=refused, pages_blip=pages_blip,
     pages_dead_restore=pages_dead_restore, pages_dead=pages_dead, resume_kill=resume_kill, prepared_retry=prepared_retry,

@@ -883,7 +883,7 @@ impl Host {
     /// processes' grants of the last `GRANT_WINDOW` count as used, and held
     /// ones (`grant_start`) however old, each once. Returns the grant's id.
     /// Leaves `floor` available, read with the reserve under the host lock.
-    /// Ok(Err(why)) if refused. Test fault `no_admit`: refuses everything.
+    /// Ok(Err(why)) if refused.
     fn grant_inner(
         &self,
         mib: u64,
@@ -892,34 +892,13 @@ impl Host {
         deadline: Option<std::time::Instant>,
         available: impl FnOnce() -> Option<u64>,
     ) -> Result<std::result::Result<(u64, Option<Hold>), Error>> {
-        if fault("no_admit") {
-            return Ok(Err(format!("not enough memory here for {mib} MiB (injected fault)").into()));
-        }
         let l = self.lock_by(deadline)?;
-        let cfg = self.config_now();
-        let (floor, what) = match floor {
-            Floor::Reserve => (cfg.reserve_mib, "reserve"),
-            // An eviction's arrival: never while this host evicts itself, and it
-            // leaves this host's own mark, so it is not moved straight back.
-            Floor::EvictMark if self.evicting(&l) => return Ok(Err("this host is moving vms away itself".into())),
-            Floor::EvictMark => (cfg.evict_at(), "eviction mark"),
+        let mut grants = match self.room(&l, mib, floor, available)? {
+            Ok(grants) => grants,
+            Err(why) => return Ok(Err(why)),
         };
         let path = self.grants();
         let now = boottime_ms();
-        let mut grants: Vec<(u64, u64, u64)> = load(&path)?.unwrap_or_default();
-        // A stamp in the future is an older build's wall clock.
-        grants.retain(|&(t, ..)| t <= now && now - t <= GRANT_WINDOW.as_millis() as u64);
-        // Fails closed: unread holds would leave out memory still to arrive.
-        let held = self.holds(&l).map_err(|e| {
-            crate::log!("admission: {e}; granting nothing until it can be read");
-            format!("{e}: memory held for migrations and restores still arriving cannot be counted")
-        })?;
-        let held_ids: HashSet<_> = held.iter().map(|h| h.0).collect();
-        let pending: u64 = grants.iter().filter(|g| !held_ids.contains(&g.2)).map(|g| g.1).sum::<u64>() + held.iter().map(|h| h.1).sum::<u64>();
-        let avail = available().ok_or("cannot read MemAvailable from /proc/meminfo")?;
-        if avail < floor + pending + mib {
-            return Ok(Err(format!("not enough memory here for {mib} MiB above the {floor} MiB {what}").into()));
-        }
         let id = crate::migrate::migration_id().max(1);
         // Locked before it is visible (renamed in): a probe never takes it for an owner's.
         let hold = match hold {
@@ -942,6 +921,66 @@ impl Host {
             return Err(e);
         }
         Ok(Ok((id, hold)))
+    }
+
+    /// Whether `mib` more fits above `floor` (see `grant_inner`): Ok(Ok(the
+    /// grants of the window, to add to)), or Ok(Err(why)) if refused. Test
+    /// fault `no_admit`: refuses everything.
+    fn room(&self, l: &Locked, mib: u64, floor: Floor, available: impl FnOnce() -> Option<u64>) -> Result<std::result::Result<Grants, Error>> {
+        if fault("no_admit") {
+            return Ok(Err(format!("not enough memory here for {mib} MiB (injected fault)").into()));
+        }
+        let cfg = self.config_now();
+        let (floor, what) = match floor {
+            Floor::Reserve => (cfg.reserve_mib, "reserve"),
+            // An eviction's arrival: never while this host evicts itself, and it
+            // leaves this host's own mark, so it is not moved straight back.
+            Floor::EvictMark if self.evicting(l) => return Ok(Err("this host is moving vms away itself".into())),
+            Floor::EvictMark => (cfg.evict_at(), "eviction mark"),
+        };
+        let now = boottime_ms();
+        let mut grants: Grants = load(&self.grants())?.unwrap_or_default();
+        // A stamp in the future is an older build's wall clock.
+        grants.retain(|&(t, ..)| t <= now && now - t <= GRANT_WINDOW.as_millis() as u64);
+        // Fails closed: unread holds would leave out memory still to arrive.
+        let held = self.holds(l).map_err(|e| {
+            crate::log!("admission: {e}; granting nothing until it can be read");
+            format!("{e}: memory held for migrations and restores still arriving cannot be counted")
+        })?;
+        let held_ids: HashSet<_> = held.iter().map(|h| h.0).collect();
+        let pending: u64 = grants.iter().filter(|g| !held_ids.contains(&g.2)).map(|g| g.1).sum::<u64>() + held.iter().map(|h| h.1).sum::<u64>();
+        let avail = available().ok_or("cannot read MemAvailable from /proc/meminfo")?;
+        if avail < floor + pending + mib {
+            return Ok(Err(format!("not enough memory here for {mib} MiB above the {floor} MiB {what}").into()));
+        }
+        Ok(Ok(grants))
+    }
+
+    /// Counts `hold` as `mib` more, admitted above `floor` like a grant (a
+    /// refusal is an error): renamed under the host lock, as `shrink_hold`
+    /// does. Its grant's id stays, so a refund still finds it, and it is
+    /// counted once (as a hold). Refused, it counts as before.
+    pub fn grow_hold(&self, hold: &Mutex<Option<Hold>>, mib: u64, floor: Floor, deadline: Option<std::time::Instant>) -> Result<()> {
+        self.grow_hold_inner(hold, mib, floor, deadline, crate::vmproc::host_available_mib)
+    }
+
+    fn grow_hold_inner(
+        &self,
+        hold: &Mutex<Option<Hold>>,
+        mib: u64,
+        floor: Floor,
+        deadline: Option<std::time::Instant>,
+        available: impl FnOnce() -> Option<u64>,
+    ) -> Result<()> {
+        let l = self.lock_by(deadline)?;
+        let mut g = hold.lock().unwrap();
+        let h = g.as_mut().ok_or("no held grant to grow")?;
+        self.room(&l, mib, floor, available)??;
+        let total = h.mib + mib;
+        let path = h.path.with_file_name(format!("{}-{total}", h.id));
+        std::fs::rename(&h.path, &path)?;
+        (h.path, h.mib) = (path, total);
+        Ok(())
     }
 
     // Incoming migrations: `STATE/migs/ID`, durable, under the host lock.
@@ -1274,6 +1313,9 @@ impl Host {
         }
     }
 }
+
+/// Recent grants, as (boot-clock ms, MiB, id).
+type Grants = Vec<(u64, u64, u64)>;
 
 const GRANT_WINDOW: Duration = Duration::from_secs(10);
 
@@ -3952,6 +3994,34 @@ mod tests {
         drop(hold);
         h.refund(id); // Start failed: refund the recent grant as well as its hold.
         assert!(grant(charge, false).is_ok());
+    }
+
+    /// A held grant grows only if the extra is admitted, then counts once,
+    /// grown; refused, it counts as before. Its id stays for a refund.
+    #[test]
+    fn a_held_grant_grows_only_when_admitted() {
+        let (_h_dir, mut h) = host("grow-hold");
+        (h.cfg.reserve_mib, h.cfg.evict_mib) = (AVAIL - 3000, Some(AVAIL - 1500));
+        pin_clock(boottime_ms());
+        let admit = |h: &Host, mib| grant_at(h, mib, Floor::Reserve, false).is_ok();
+        let (id, hold) = grant_at(&h, 1000, Floor::Reserve, true).unwrap();
+        let hold = Mutex::new(hold);
+        let grow = |mib, floor| h.grow_hold_inner(&hold, mib, floor, None, || Some(AVAIL));
+        // 2000 MiB left: not 2001 more, and refused it still counts 1000.
+        assert!(grow(2001, Floor::Reserve).unwrap_err().to_string().contains("not enough memory"));
+        assert!(h.run.join(format!("holds/{id}-1000")).exists());
+        // Above the eviction mark there is less room.
+        assert!(grow(501, Floor::EvictMark).unwrap_err().to_string().contains("eviction mark"));
+        grow(500, Floor::EvictMark).unwrap();
+        grow(1000, Floor::Reserve).unwrap();
+        assert!(h.run.join(format!("holds/{id}-2500")).exists());
+        // Counted once, grown (its own grant in the window is the hold, not more).
+        assert!(!admit(&h, 501) && admit(&h, 500));
+        // Pages in: it shrinks as before; dropped, it no longer counts.
+        h.shrink_hold(&hold, 100).unwrap();
+        assert!(h.run.join(format!("holds/{id}-100")).exists());
+        drop(hold.lock().unwrap().take());
+        assert!(grow(1, Floor::Reserve).unwrap_err().to_string().contains("no held grant"));
     }
 
     #[test]
