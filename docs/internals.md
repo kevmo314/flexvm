@@ -922,6 +922,30 @@ acknowledges the status, finds nothing new and returns. The patch has a
 unit test of the re-raise; there is no deterministic end-to-end case, as
 losing the interrupt on purpose would need a debug hook in Firecracker.
 
+### Kernel patches (optional, host kernel)
+
+`kernel/` carries two patches against Linux v6.18 for the host kernel, applied
+in order. They only matter for keep-running checkpoints. flexvm runs unchanged
+on stock kernels, where every `UFFDIO_WRITEPROTECT` makes KVM drop its mappings
+of the whole range, so the guest refaults even pages it only reads (#274).
+
+`kernel/0001-uffd-wp-resolve-skips-secondary-mmu-invalidate.patch`: removing
+uffd write protection only grants access, so it no longer fires an mmu-notifier
+invalidate. That removes the TLB-flush IPIs to running vCPUs after each
+unprotect. Devices that share the page tables without page-fault support (SVA
+without PRI) aren't considered; flexvm doesn't use them.
+
+`kernel/0002-kvm-x86-write-protect-sptes-on-uffd-wp-arm.patch`: arming uffd
+write protection marks the invalidate as write-protect-only, and x86 KVM's TDP
+MMU then clears W on its SPTEs instead of zapping them. The shadow MMU,
+hugetlb and PAGEMAP_SCAN arming still zap as before.
+
+Measured on nested KVM (GCE n2, v6.18), per keep-running checkpoint of a
+guest reading 512 MiB while one thread rewrites part of it: KVM page faults
+144k → 10.4k, TLB-flush IPIs ~1,000 → 0, and guest read time lost in the
+second after a checkpoint 856 → 85 ms. The checkpoint and COW fault scenarios
+pass on both. The details are in #274.
+
 ## Measured (WSL2, Ryzen 9 3900X, nested KVM; before process-per-VM unless noted)
 
 | | |
