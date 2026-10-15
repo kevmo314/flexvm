@@ -307,7 +307,9 @@ impl Template {
         let link = paths.templates.join(name);
         match std::fs::read_link(&link) {
             Ok(target) => Ok(paths.templates.join(target)),
-            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => Ok(link),
+            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+                bail!("template {name:?} is not a symlink; remove {} and rebuild it: flexvm template {name}", link.display())
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 bail!("no template {name:?} in {} (build it: flexvm template {name}; or give --templates DIR)", paths.templates.display())
             }
@@ -830,7 +832,8 @@ mod tests {
     fn working_set_mib_is_read_without_opening_the_template() {
         let root = std::env::temp_dir().join(format!("flexvm-wset-mib-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("templates/t")).unwrap();
+        std::fs::create_dir_all(root.join("templates/.gen/a")).unwrap();
+        std::os::unix::fs::symlink(".gen/a", root.join("templates/t")).unwrap();
         let paths = Paths::new(&root, None).unwrap();
         // 1 GiB and 2 MiB of 4 KiB pages; no memory file, which opening it would need.
         std::fs::write(root.join("templates/t/wset"), b"[[0, 262144], [300000, 512]]").unwrap();
@@ -915,6 +918,21 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
+    }
+
+    #[test]
+    fn resolve_requires_a_symlink() {
+        let f = Fixture::new();
+        let entry = f.paths.templates.join("t");
+        std::fs::create_dir(&entry).unwrap();
+        let error = Template::resolve(&f.paths, "t").unwrap_err().to_string();
+        assert!(error.contains("not a symlink") && error.contains("rebuild"), "{error}");
+        std::fs::remove_dir(&entry).unwrap();
+        std::fs::write(&entry, b"").unwrap();
+        assert!(Template::resolve(&f.paths, "t").is_err());
+        std::fs::remove_file(&entry).unwrap();
+        std::os::unix::fs::symlink(".gen/a", &entry).unwrap();
+        assert_eq!(Template::resolve(&f.paths, "t").unwrap(), f.paths.templates.join(".gen/a"));
     }
 
     fn set_mtime(file: &File, sec: i64, nsec: i64) {

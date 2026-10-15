@@ -101,8 +101,9 @@ fn metadata_is_bounded_before_reading() {
 }
 
 fn template(dir: &Path, pages: &[Option<u8>]) -> Arc<Template> {
-    let tdir = dir.join("tpl");
+    let tdir = dir.join(".gen/a");
     fs::create_dir_all(&tdir).unwrap();
+    std::os::unix::fs::symlink(".gen/a", dir.join("tpl")).unwrap();
     fs::write(tdir.join("meta.json"), r#"{"vcpus": 1, "mem_mib": 1, "max_mib": 1, "kernel": "/k", "rootfs": "/r"}"#).unwrap();
     let mem = File::create(tdir.join("mem")).unwrap();
     mem.set_len((pages.len() * PAGE_SIZE) as u64).unwrap();

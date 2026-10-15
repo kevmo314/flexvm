@@ -747,7 +747,8 @@ mod tests {
         let root = std::env::temp_dir().join(format!("flexvm-standby-budget-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
-        std::fs::create_dir_all(root.join("templates/default")).unwrap();
+        std::fs::create_dir_all(root.join("templates/.gen/a")).unwrap();
+        std::os::unix::fs::symlink(".gen/a", root.join("templates/default")).unwrap();
         let paths = Paths::new(&root, None).unwrap();
         let d = dir(&host, "default");
         std::fs::create_dir_all(&d).unwrap();
@@ -776,7 +777,8 @@ mod tests {
         let root = std::env::temp_dir().join(format!("flexvm-standby-take-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
-        std::fs::create_dir_all(root.join("templates/default")).unwrap();
+        std::fs::create_dir_all(root.join("templates/.gen/a")).unwrap();
+        std::os::unix::fs::symlink(".gen/a", root.join("templates/default")).unwrap();
         let paths = Paths::new(&root, None).unwrap();
         let d = dir(&host, "default");
         std::fs::create_dir_all(&d).unwrap();

@@ -2259,7 +2259,8 @@ mod tests {
 
     fn test_proc(tag: &str) -> (Arc<Proc>, PathBuf) {
         let root = std::env::temp_dir().join(format!("fv-proc-{tag}-{}", std::process::id()));
-        std::fs::create_dir_all(root.join("templates/default")).unwrap();
+        std::fs::create_dir_all(root.join("templates/.gen/a")).unwrap();
+        std::os::unix::fs::symlink(".gen/a", root.join("templates/default")).unwrap();
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
         (Proc::new(host, Paths::new(&root, None).unwrap()).unwrap(), root)
     }

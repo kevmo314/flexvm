@@ -723,19 +723,6 @@ impl Host {
         })
     }
 
-    /// A source's decision that its VM is its target's, durable before the
-    /// target may forget the migration (`done`), after which an unknown id
-    /// reads as aborted there: its claim here goes, `leaving` with it, and a
-    /// loan stays the target's (its own withdrawal takes it back).
-    pub fn hand_off(&self, l: &Locked, ip: Ipv4Addr) -> Result<()> {
-        let me = Ident::me();
-        self.update(l, ip, true, |a| {
-            if a.holder_id.as_ref() == Some(&me) {
-                (a.holder, a.holder_id, a.arriving, a.leaving) = (None, None, None, None);
-            }
-        })
-    }
-
     /// Migration `mig`'s record is released: the VM it brought to `ip` is this
     /// host's own, and a loan of its generation here (it came home) ends.
     /// Idempotent: a release cut short is finished by `mig_done` or `withdraw_dead`.
@@ -998,6 +985,15 @@ impl Host {
                 return Ok("aborted");
             }
         }
+        // Clear only this dead arrival, durably before its evidence goes. Committed
+        // records carry no address, so find the claim by migration and owner.
+        for e in std::fs::read_dir(self.state.join("addrs"))? {
+            let Some(ip) = e?.file_name().to_str().and_then(|n| n.parse::<Ipv4Addr>().ok()) else { continue };
+            let a = self.addr(&l, ip)?;
+            if a.arriving == Some(id) && a.holder_id.as_ref() == Some(&owner) {
+                self.release(&l, ip, a.holder.as_deref().unwrap_or_default(), Some(&owner))?;
+            }
+        }
         crate::util::unlink_durably(&path)?;
         Ok("aborted")
     }
@@ -1163,10 +1159,6 @@ impl Host {
         }
     }
 
-    /// Records no source will ask about again: a dead owner's (aborted, as
-    /// `mig_status` would answer), and released ones whose source process is
-    /// proven gone (killed before its `done`) by its own host's listener. Any
-    /// doubt keeps the record: a source that still waits must find it.
     /// An interrupted `owe`'s `.ID.PID.tmp`, once its writer is gone.
     fn owed_debris(&self) {
         self.write_debris("owed")
@@ -1227,6 +1219,8 @@ impl Host {
         Ok(Some((gen, owed)))
     }
 
+    /// Retires aborted arrivals and released records whose source is proven gone.
+    /// Any doubt keeps the record: a source that still waits must find it.
     pub fn retire_migrations(&self) {
         // At most five records (and thus five two-second peer calls) per pass.
         self.retire_migrations_with(5, |source, by| {
@@ -1237,6 +1231,10 @@ impl Host {
     fn retire_migrations_with(&self, budget: usize, mut query: impl FnMut(&str, &Ident) -> Result<bool>) {
         let Ok(lock) = File::create(self.run.join(".retire.lock")) else { return };
         let Ok(_lock) = Flock::new(lock, libc::LOCK_EX | libc::LOCK_NB) else { return };
+        // Migration writers hold the host lock; never sweep an in-progress write.
+        if let Ok(_l) = self.lock() {
+            self.write_debris("migs");
+        }
         // A sorted ID cursor survives deletions and lets different processes
         // continue the same rotation. Only retirement holds this lock.
         let cursor = self.run.join(".retire.next");
@@ -2679,7 +2677,7 @@ mod tests {
         assert!(h.lend(&l, x, c.gen, 7, "b").unwrap());
         // Leaving, it has not decided: its target keeps the record it would ask about.
         assert!(h.owes(&Ident::me()), "leaving counts as owed");
-        h.hand_off(&l, x).unwrap();
+        h.release(&l, x, "vm", Some(&Ident::me())).unwrap();
         let a = h.addr(&l, x).unwrap();
         assert!(a.holder.is_none() && a.leaving.is_none() && a.lent == Some(c.gen) && a.current(c.gen), "the loan stays the target's: {a:?}");
         assert!(!h.owes(&Ident::me()), "decided: the target may forget it");
@@ -3406,6 +3404,62 @@ mod tests {
 
     fn released_migration(h: &Host, id: u64, source: &str) {
         store(&h.mig_path(id), &Mig::Released { source: source.into(), by: Some(Ident { start: id, ..Ident::me() }), ip: None }, false).unwrap();
+    }
+
+    #[test]
+    fn migration_retirement_sweeps_dead_writers_under_the_host_lock() {
+        let h = host("migs-tmp");
+        let dir = h.state.join("migs");
+        let dead = dir.join(".7.999999971.tmp");
+        let live = dir.join(format!(".8.{}.tmp", std::process::id()));
+        let unrelated = dir.join(".not-a-write");
+        for path in [&dead, &live, &unrelated] {
+            std::fs::write(path, b"{").unwrap();
+        }
+        let l = h.lock().unwrap();
+        let other = h.clone();
+        let (done, finished) = std::sync::mpsc::channel();
+        let sweep = std::thread::spawn(move || {
+            other.retire_migrations_with(0, |_, _| panic!("no records"));
+            done.send(()).unwrap();
+        });
+        assert!(finished.recv_timeout(Duration::from_millis(50)).is_err(), "sweep must wait for writers' host lock");
+        assert!(dead.exists());
+        drop(l);
+        sweep.join().unwrap();
+        assert!(!dead.exists(), "interrupted write swept");
+        assert!(live.exists(), "a live writer may still publish its file");
+        assert!(unrelated.exists());
+    }
+
+    #[test]
+    fn aborted_arrivals_release_only_the_matching_dead_claim_and_keep_the_loan() {
+        for committed in [false, true] {
+            let h = host(if committed { "aborted-committed" } else { "aborted-pending" });
+            let x = ip("10.9.0.1");
+            let owner = dead_owner(&h, 999_999_972, &[]);
+            let l = h.lock().unwrap();
+            h.lend(&l, x, 8, 1, "source").unwrap();
+            h.claim_arrival(&l, "target", x, 8, 2, 7).unwrap().keep();
+            h.update(&l, x, false, |a| a.holder_id = Some(owner.clone())).unwrap();
+            let mut expected = h.addr(&l, x).unwrap();
+            (expected.holder, expected.holder_id, expected.arriving) = (None, None, None);
+            // Neither another migration's claim nor another owner's is this arrival's.
+            let y = ip("10.9.0.2");
+            let z = ip("10.9.0.3");
+            h.claim_arrival(&l, "other-migration", y, 8, 2, 9).unwrap().keep();
+            h.update(&l, y, false, |a| a.holder_id = Some(owner.clone())).unwrap();
+            h.claim_arrival(&l, "other-owner", z, 8, 2, 7).unwrap().keep();
+            let unchanged = [h.addr(&l, y).unwrap(), h.addr(&l, z).unwrap()];
+            let record = if committed { Mig::Committed { owner } } else { Mig::Pending { owner, ip: Some(x) } };
+            store(&h.mig_path(7), &record, false).unwrap();
+            drop(l);
+            assert_eq!(h.mig_status(7).unwrap(), "aborted");
+            assert!(!h.mig_path(7).exists());
+            let l = h.lock().unwrap();
+            assert_eq!(h.addr(&l, x).unwrap(), expected);
+            assert_eq!([h.addr(&l, y).unwrap(), h.addr(&l, z).unwrap()], unchanged);
+        }
     }
 
     #[test]
