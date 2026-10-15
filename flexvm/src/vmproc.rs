@@ -616,22 +616,17 @@ impl Proc {
                 }
             };
             arp();
-            // All peers at once: one slow or down peer does not hold up the others.
-            let req = json!({"op": "route", "ip": ip.to_string(), "via": via.to_string(), "gen": gen, "rev": rev});
-            let sends: Vec<_> = peers
-                .into_iter()
-                .filter(|_| here())
-                .map(|peer| {
-                    let req = req.clone();
-                    thread::spawn(move || {
-                        if let Err(e) = tell(&peer, req) {
-                            crate::log!("announce {ip} to {peer}: {e}");
-                        }
-                    })
-                })
-                .collect();
-            sends.into_iter().for_each(|s| drop(s.join()));
-            thread::sleep(Duration::from_millis(200));
+            // The second ARP goes 200 ms after the first, however long a down or hung peer takes.
+            let second = Instant::now() + Duration::from_millis(200);
+            if here() {
+                let req = json!({"op": "route", "ip": ip.to_string(), "via": via.to_string(), "gen": gen, "rev": rev});
+                each_peer(peers, second, move |peer| {
+                    if let Err(e) = tell(peer, req.clone()) {
+                        crate::log!("announce {ip} to {peer}: {e}");
+                    }
+                });
+            }
+            thread::sleep(second.saturating_duration_since(Instant::now()));
             arp();
         });
     }
@@ -1736,22 +1731,25 @@ const TELL_WAIT: Duration = Duration::from_secs(5);
 /// Tells every peer at once, waiting `TELL_WAIT` at most, a hung lookup of a
 /// peer's name included: a peer not told by then is told on alone.
 pub fn tell_peers(host: &Host, req: Value) {
-    let (done, told) = std::sync::mpsc::channel();
-    let peers = host.config_now().peers;
-    let n = peers.len();
+    each_peer(host.config_now().peers, Instant::now() + TELL_WAIT, move |p| drop(tell(p, req.clone())));
+}
+
+/// Runs `f` for every peer at once, each on a thread of its own, and waits until all are
+/// done or `by`: one slow or down peer holds up no other, and a peer not done by then
+/// finishes alone.
+fn each_peer(peers: Vec<String>, by: Instant, f: impl Fn(&str) + Send + Sync + 'static) {
+    let f = Arc::new(f);
+    // Nothing is sent: the wait ends once every thread has dropped its sender, or at `by`.
+    let (done, finished) = std::sync::mpsc::channel::<()>();
     for p in peers {
-        let (req, done) = (req.clone(), done.clone());
+        let (f, done) = (f.clone(), done.clone());
         thread::spawn(move || {
-            let _ = tell(&p, req);
-            let _ = done.send(());
+            f(&p);
+            drop(done);
         });
     }
-    let by = Instant::now() + TELL_WAIT;
-    for _ in 0..n {
-        if told.recv_timeout(by.saturating_duration_since(Instant::now())).is_err() {
-            break;
-        }
-    }
+    drop(done);
+    let _ = finished.recv_timeout(by.saturating_duration_since(Instant::now()));
 }
 
 /// A route message, sent once more a second after it fails: nothing else
@@ -1795,6 +1793,25 @@ pub fn call(host: &Host, name: &str, req: Value, at: Option<Instant>) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The wait ends with the last peer done, or at its deadline while one still runs.
+    #[test]
+    fn each_peer_waits_until_done_or_by() {
+        let done = Arc::new(Mutex::new(Vec::new()));
+        let d = done.clone();
+        let t = Instant::now();
+        each_peer(vec!["a".into(), "b".into()], t + Duration::from_secs(10), move |p| d.lock().unwrap().push(p.to_string()));
+        assert!(t.elapsed() < Duration::from_secs(5));
+        assert_eq!(done.lock().unwrap().len(), 2);
+        let t = Instant::now();
+        each_peer(vec!["hung".into(), "fast".into()], t + Duration::from_millis(200), |p| {
+            if p == "hung" {
+                thread::sleep(Duration::from_secs(3));
+            }
+        });
+        let took = t.elapsed();
+        assert!(took >= Duration::from_millis(200) && took < Duration::from_secs(2), "{took:?}");
+    }
 
     #[test]
     fn claim_keeps_termination_requests() {
