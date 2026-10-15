@@ -80,9 +80,9 @@ pub fn validate(listener: &TcpListener, cfg: &crate::host::Config) -> Result<()>
 }
 
 pub fn main(host: Host, listener: TcpListener) -> Result<()> {
-    crate::net::sysctl("net.ipv4.ip_forward", "1")?;
+    crate::net::ip_forward()?;
     if let Some(dev) = &host.cfg.announce_dev {
-        crate::net::sysctl(&format!("net.ipv4.conf.{dev}.proxy_arp"), "1")?;
+        crate::net::conf("ipv4", dev, "proxy_arp", "1")?;
     }
     crate::log!("flexvm listening on {}", listener.local_addr()?);
     crate::standby::maintain(host.clone());

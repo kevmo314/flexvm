@@ -126,7 +126,7 @@ impl Holder {
                 return Ok(None);
             }
         };
-        let _ = crate::net::sysctl(&format!("net.ipv6.conf.{dev}.disable_ipv6"), "1");
+        let _ = crate::net::conf("ipv6", &dev, "disable_ipv6", "1");
         crate::net::set_link_up(&dev, true)?;
         let ifindex = crate::net::ifindex(&dev)?;
         let resend = match unsafe { libc::socket(libc::AF_INET, libc::SOCK_RAW | libc::SOCK_CLOEXEC, libc::IPPROTO_RAW) } {
@@ -565,8 +565,8 @@ impl Injector {
             libc::setsockopt(fd.as_raw_fd(), SOL_PACKET, PACKET_QDISC_BYPASS, (&one as *const libc::c_int).cast(), std::mem::size_of::<libc::c_int>() as u32)
         };
         let mut header = [0u8; 14];
-        header[..6].copy_from_slice(&crate::net::parse_mac(crate::net::GUEST_MAC)?);
-        header[6..12].copy_from_slice(&crate::net::parse_mac(crate::net::GATEWAY_MAC)?);
+        header[..6].copy_from_slice(&crate::net::GUEST_MAC);
+        header[6..12].copy_from_slice(&crate::net::GATEWAY_MAC);
         header[12..].copy_from_slice(&[0x08, 0x00]);
         Ok(Injector { fd, tap: tap.into(), ifindex: crate::net::ifindex(tap)?, header, tx_dropped: tap_tx_dropped(tap) })
     }

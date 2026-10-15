@@ -5500,6 +5500,66 @@ def restore_ip_peer():
     rm_ckpt(path2)
 
 
+def spoof_filter():
+    """#362: what a guest sends leaves its tap only from its own address. A datagram from
+    another VM's address (or from one no VM has) is dropped at the tap, while the guest's own
+    gets through; a VM restored at a new address (readdressed at its resume) passes only that
+    one, the old one filtered, and so does its tap after a migration."""
+    n, n2, other = "ft-spoof", "ft-spoof2", "ft-spoof-b"
+    path = ckpt_path(n)
+    ok(run(A, n))
+    ok(run(B, other))
+    mine, theirs = vm_ip(A, n), vm_ip(B, other)
+    rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    rx.bind(("0.0.0.0", 0))
+    rx.settimeout(0.2)
+    port = rx.getsockname()[1]
+
+    def send(h, vm, sources):
+        """From each source (added to eth0 for the send if the guest lacks it), three datagrams
+        to the host's tap address; returns {source: what the host got from where}."""
+        cmd = "; ".join(f"ip addr add {src}/32 dev eth0 2>/dev/null && added=1 || added=0; "
+                        f"for i in 1 2 3; do echo {src} | socat -u - UDP-SENDTO:169.254.1.2:{port},bind={src}; done; "
+                        f"[ $added = 1 ] && ip addr del {src}/32 dev eth0" for src in sources) + "; true"
+        code, out = sh(h, vm, cmd)
+        assert code == 0, out
+        got, end = {}, time.time() + 1.5
+        while time.time() < end:
+            try:
+                data, frm = rx.recvfrom(100)
+            except socket.timeout:
+                continue
+            got.setdefault(data.decode().strip(), set()).add(frm[0])
+        return got
+
+    nowhere = "10.250.0.5"
+    got = send(A, n, [mine, theirs, nowhere])
+    check("spoof: the guest's own address gets through", got.get(mine) == {mine}, got)
+    check("spoof: another VM's address is dropped at the tap", theirs not in got, got)
+    check("spoof: an address no VM has is dropped", nowhere not in got, got)
+    # Restored at a new address, held, and readdressed at its resume.
+    ok(checkpoint(A, n, path))
+    r = ok(restore(A, path, name=n2, ip="auto", paused=True))
+    new = r["ip"]
+    code, out, err = cli(A, "resume", n2)
+    check("spoof: restored at a new address and resumed", code == 0 and new != mine, (r, err))
+    check("spoof: readdressed", wait_for(lambda: f"inet {new}/" in sh(A, n2, "ip -4 -o addr show eth0")[1], 30), sh(A, n2, "ip -4 -o addr show eth0"))
+    got = send(A, n2, [new, mine, theirs])
+    check("spoof: after a readdress the new address gets through", got.get(new) == {new}, got)
+    check("spoof: after a readdress the old address is dropped", mine not in got and theirs not in got, got)
+    got = send(A, n, [mine])
+    check("spoof: the original VM still sends from its own", got.get(mine) == {mine}, got)
+    ok(migrate(A, n2, B))
+    wait_released(B, n2)
+    got = send(B, n2, [new, mine, theirs])
+    check("spoof: after a migration its address gets through", got.get(new) == {new}, got)
+    check("spoof: after a migration others are dropped", mine not in got and theirs not in got, got)
+    rx.close()
+    for vm in (n, n2, other):
+        cleanup(vm)
+    rm_ckpt(path)
+
+
 def unlend_retry():
     """An aborted migration whose unlend fails keeps its loan (#257): the next
     attempt undoes it, and so does the VM's end."""
@@ -7194,7 +7254,7 @@ SCENARIOS = dict(
     fc_prepare=fc_prepare, slow_preload=slow_preload, bad_preload=bad_preload, ckpt_packet_hold=ckpt_packet_hold, ckpt_stall=ckpt_stall, standby=standby,
     suspend_disk_freed=suspend_disk_freed, resume_mark_fails=resume_mark_fails, kill_source=kill_source,
     kill_refused_checkpoint=no_evict(kill_refused_checkpoint), wildcard_listen=wildcard_listen, peer_by_name=peer_by_name, peer_moved=peer_moved, page_refusals=page_refusals,
-    forged_peer=forged_peer, restore_ip_peer=restore_ip_peer, late_withdrawal=late_withdrawal, unlend_retry=unlend_retry,
+    forged_peer=forged_peer, restore_ip_peer=restore_ip_peer, spoof_filter=spoof_filter, spoof_csum=spoof_csum, late_withdrawal=late_withdrawal, unlend_retry=unlend_retry,
     unit_restart=unit_restart, log_cap=log_cap, gc_debris=gc_debris, prefix_change=prefix_change, arrival_log=arrival_log, template_tap=template_tap,
     incoming_killed=incoming_killed, start_killed=start_killed, claim_killed=claim_killed, standby_stalled=standby_stalled, standby_refill_race=standby_refill_race, standby_lock_timeout=standby_lock_timeout, fc_died=fc_died,
     sigkill_restart=sigkill_restart, listen_trickle=listen_trickle,

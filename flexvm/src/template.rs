@@ -754,7 +754,7 @@ fn build(paths: &Paths, dir: &Path, name: &str, vcpus: u32, mem_mib: u64, max_mi
         fc.put("/hotplug/memory", json!({"total_size_mib": hotplug, "slot_size_mib": SLOT_MIB}))?;
     }
     fc.put("/vsock", json!({"guest_cid": 3, "uds_path": vsock}))?;
-    fc.put("/network-interfaces/eth0", json!({"iface_id": "eth0", "host_dev_name": tap, "guest_mac": crate::net::GUEST_MAC}))?;
+    fc.put("/network-interfaces/eth0", json!({"iface_id": "eth0", "host_dev_name": tap, "guest_mac": crate::net::mac_string(&crate::net::GUEST_MAC)}))?;
     fc.put("/entropy", json!({}))?;
     fc.put("/actions", json!({"action_type": "InstanceStart"}))?;
     retry(Duration::from_secs(30), Duration::from_millis(10), || guest::ping(&vsock))
