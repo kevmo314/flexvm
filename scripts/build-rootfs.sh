@@ -52,6 +52,6 @@ done | sudo E2FSPROGS_FAKE_TIME=1 debugfs -w -f - "$tmp" > /dev/null
 sudo chown "$(id -u):$(id -g)" "$tmp"
 sudo rm -rf "$work"
 img=rootfs-$(sha256sum "$tmp" | cut -c1-12).ext4
-[ -e "$out/$img" ] || { sudo install -m 644 "$tmp" "$out/.$img" && sudo mv -T "$out/.$img" "$out/$img"; }
+sudo test -e "$out/$img" || { sudo install -m 644 "$tmp" "$out/.$img" && sudo mv -T "$out/.$img" "$out/$img"; }
 sudo ln -sfn "$img" "$out/.rootfs.link" && sudo mv -T "$out/.rootfs.link" "$out/rootfs.ext4"
-ls -lh "$out/$img"
+sudo ls -lh "$out/$img"
