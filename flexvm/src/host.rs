@@ -3194,6 +3194,31 @@ mod tests {
         assert_eq!(Config { reserve_mib: Some(300), ..Config::default() }.reserve(), 300);
     }
 
+    /// A running process reads one snapshot of the settings as they are now,
+    /// what is derived for those unset included.
+    #[test]
+    fn running_processes_read_the_settings_as_they_change() {
+        let (_h_dir, mut h) = host("derived");
+        let running = h.clone();
+        let set = |h: &mut Host, f: fn(&mut Config)| {
+            h.configure(|c| {
+                f(c);
+                Ok(())
+            })
+            .unwrap()
+        };
+        set(&mut h, |c| (c.listen, c.peers) = (Some("0.0.0.0:7070".into()), vec!["127.0.0.1:7071".into()]));
+        let now = |r: &Host| (r.config_now().underlay(), r.config_now().announce_dev());
+        assert_eq!(now(&running), (Some(Ipv4Addr::LOCALHOST), None));
+        set(&mut h, |c| (c.underlay, c.announce_dev) = (Some(Ipv4Addr::new(10, 3, 0, 1)), Some("lo".into())));
+        assert_eq!(now(&running), (Some(Ipv4Addr::new(10, 3, 0, 1)), Some("lo".into())));
+        assert_eq!(running.config_now().advertise().unwrap().as_deref(), Some("10.3.0.1:7070"));
+        set(&mut h, |c| c.announce_dev = Some("none".into()));
+        assert_eq!(now(&running).1, None);
+        set(&mut h, |c| (c.underlay, c.peers) = (None, vec!["flexvm-no-such-host.invalid:7070".into()]));
+        assert_eq!(now(&running).0, None, "never loopback with a peer elsewhere");
+    }
+
     #[test]
     fn the_underlay_is_derived_toward_a_peer_elsewhere() {
         let ip = |s: &str| s.parse::<IpAddr>().unwrap();

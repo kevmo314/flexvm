@@ -758,11 +758,15 @@ impl Proc {
 
     pub fn announce(&self) {
         let vm = self.vm().clone();
-        let peers = self.host.config_now().peers;
-        let (ip, gen, rev, dev) = (vm.ip, self.gen(), self.rev(), self.host.cfg.announce_dev());
-        let Some(via) = self.host.cfg.underlay() else {
+        // One snapshot of the settings as they are now, derived ones included.
+        let cfg = self.host.config_now();
+        let (ip, gen, rev, dev, peers) = (vm.ip, self.gen(), self.rev(), cfg.announce_dev(), cfg.peers.clone());
+        if let Some(dev) = &dev {
+            crate::net::proxy_arp(dev);
+        }
+        let Some(via) = cfg.underlay() else {
             if !peers.is_empty() {
-                crate::log!("announce {ip}: no underlay address (give flexvm listen an ADDR peers can reach, or --underlay IP); peers not told");
+                crate::log!("announce {ip}: no underlay address (give flexvm listen an ADDR peers can reach, or flexvm config --underlay IP); peers not told");
             }
             return;
         };
@@ -1230,6 +1234,10 @@ impl Proc {
                 self.publish();
             }
             relieve(&self.host, host_available_mib(), vm.starving(), &mut stopping);
+            // A derived announce device follows the routes (one that changed gets proxy ARP).
+            if let Some(dev) = self.host.config_now().announce_dev() {
+                crate::net::proxy_arp(&dev);
+            }
         }
     }
 
@@ -1529,9 +1537,7 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
     crate::util::output::guard()?;
     let _ = crate::net::ip_forward();
     if let Some(dev) = &host.cfg.announce_dev() {
-        if let Err(e) = crate::net::conf("ipv4", dev, "proxy_arp", "1") {
-            crate::log!("WARNING: proxy ARP on {dev}: {e}");
-        }
+        crate::net::proxy_arp(dev);
     }
     let p = Proc::new(host, paths)?;
     let host = p.host.clone();

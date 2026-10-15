@@ -614,6 +614,17 @@ pub fn conf(family: &str, dev: &str, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Proxy ARP on an announce device, once per device this process adopts (a
+/// derived one follows the routes); a failure is logged once.
+pub fn proxy_arp(dev: &str) {
+    static ON: std::sync::Mutex<std::collections::BTreeSet<String>> = std::sync::Mutex::new(std::collections::BTreeSet::new());
+    if ON.lock().unwrap().insert(dev.into()) {
+        if let Err(e) = conf("ipv4", dev, "proxy_arp", "1") {
+            crate::log!("WARNING: proxy ARP on {dev}: {e}");
+        }
+    }
+}
+
 pub fn ip_forward() -> Result<()> {
     std::fs::write("/proc/sys/net/ipv4/ip_forward", "1").map_err(|e| format!("ip_forward: {e}"))?;
     Ok(())

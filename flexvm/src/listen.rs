@@ -513,7 +513,7 @@ fn migration(host: &Host, req: &Value) -> Result<Value> {
         return Ok(json!({"done": true}));
     }
     let outcome = host.mig_status(mig)?;
-    Ok(json!({"outcome": outcome, "underlay": host.cfg.underlay().map(|u| u.to_string())}))
+    Ok(json!({"outcome": outcome, "underlay": host.config_now().underlay().map(|u| u.to_string())}))
 }
 
 fn lend(host: &Host, req: &Value) -> Result<Value> {

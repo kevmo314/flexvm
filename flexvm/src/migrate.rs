@@ -73,7 +73,7 @@ impl Proc {
     /// `evict`: the host moves it for memory; the target admits it only above its own eviction mark.
     pub fn migrate(self: &Arc<Self>, to: &str, if_idle: bool, evict: bool) -> Result<Value> {
         let vm = self.vm().clone();
-        let Some(source) = self.host.cfg.advertise()? else {
+        let Some(source) = self.host.config_now().advertise()? else {
             bail!("this host runs no peer listener (flexvm listen): the target fetches the vm's memory through it");
         };
         let op = match if_idle {
@@ -529,7 +529,7 @@ impl Proc {
             let _ = w.shutdown(std::net::Shutdown::Both);
         } else {
             let _ = answer(json!({"ok": true, "result": {
-                "underlay": self.host.cfg.underlay().map(|u| u.to_string()),
+                "underlay": self.host.config_now().underlay().map(|u| u.to_string()),
                 "timings_ms": t,
                 "resume_error": (vm.state() == State::Failed).then_some("resuming failed"),
             }}));
