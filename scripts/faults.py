@@ -1649,52 +1649,125 @@ def reconcile_announce():
     kill(A, n)
 
 
+def owed(host):
+    """Migration ids whose outcome `host` still owes (a source killed before it knew)."""
+    d = os.path.join(host.state, "owed")
+    return sorted(f for f in os.listdir(d) if f.isdigit()) if os.path.isdir(d) else []
+
+
 def reconcile_kill():
     """#350: SIGINT and SIGQUIT end a source that never heard its target's
     outcome (ack lost, status unavailable) within seconds, as they do a VM
-    anywhere else. It withdraws its generation: the loan is taken back and the
-    address is free here again, the target's copy (it cannot finish its pull
-    without its source) ends and puts no route back, and its migration record
-    reads aborted. A newer generation of the address then runs."""
-    for sig in (signal.SIGINT, signal.SIGQUIT):
-        n = f"ft-reconcile-kill-{signal.Signals(sig).name.lower()}"
-        what = f"reconcile kill ({signal.Signals(sig).name})"
-        setup(n, mib=100)
+    anywhere else. The target may be running the VM, so nothing is withdrawn:
+    the address stays lent, never handed out on the source's host, until the
+    target says. Pulling from the dead source, the target's copy ends; its
+    record reads aborted, and gc on the source's host then withdraws the
+    generation and frees the address. A target that already had every page
+    keeps running with it: told `done`, it keeps the loan until it is killed
+    there, and only then does the address run again on the source's host."""
+    def unknown_then_kill(n, sig, slow):
+        what = f"reconcile kill ({n})"
+        m = setup(n, mib=100)
         ip, pid = vms(A)[n]["ip"], vm_pid(A, n)
         gen = addr(A, ip)["seen"]
-        fault(A, "pages_slow", 120000)
+        if slow:
+            fault(A, "pages_slow", 120000)
         fault(B, "lost_ack", 30000)
         fault(B, "status", 30000)
         r = migrate(A, n, B)
         fault(B, "lost_ack", 0)
         check(f"{what}: outcome unknown, the source paused", not r["ok"] and vms(A).get(n, {}).get("state") == "source", (r, where(n)))
         check(f"{what}: lent while it waits", addr(A, ip).get("lent") == gen, addr(A, ip))
+        if not slow:
+            check(f"{what}: the target has every page", wait_for(lambda: vms(B).get(n, {}).get("background_pull_ms") is not None, 30), vms(B).get(n))
         t = time.time()
         os.kill(pid, sig)
         gone = wait_for(lambda: not alive(pid), 5)
         check(f"{what}: the source exits within 5 s", gone, f"{time.time() - t:.1f} s; " + log(A, n)[-400:])
         if not gone:
             os.kill(pid, signal.SIGKILL)
-            continue
+            return None
+        check(f"{what}: says the target may still run it", "may still be running it" in log(A, n), log(A, n)[-400:])
         a = addr(A, ip)
-        check(f"{what}: generation withdrawn here, its loan taken back, no holder",
-              a.get("seen") == gen and a.get("withdrawn") and a.get("lent") is None and not a.get("holder"), a)
-        check(f"{what}: not listed on A", n not in vms(A), vms(A).get(n))
+        check(f"{what}: still lent, not withdrawn, no holder here",
+              a.get("seen") == gen and not a.get("withdrawn") and a.get("lent") == gen and not a.get("holder"), a)
+        check(f"{what}: the outcome is owed", len(owed(A)) == 1, owed(A))
+        r2 = run(A, n + "-again", ip=ip)
+        check(f"{what}: the address is not handed out here meanwhile", not r2["ok"] and "lent" in r2["error"], r2)
+        return ip, gen, m
+
+    # The target still pulls when the source is killed: it cannot finish, and the outcome is aborted.
+    for sig in (signal.SIGINT, signal.SIGQUIT):
+        n = f"ft-reconcile-kill-{signal.Signals(sig).name.lower()}"
+        got = unknown_then_kill(n, sig, True)
+        if not got:
+            continue
+        ip, gen, _ = got
+        what = f"reconcile kill ({n})"
         fault(B, "status", 0)
         fault(A, "pages_slow", 0)
-        check(f"{what}: the target's copy ends too", wait_for(lambda: where(n) == {}, 90), where(n))
-        b = addr(B, ip)
-        check(f"{what}: B saw the generation withdrawn, holds nothing", b.get("seen") == gen and b.get("withdrawn") and not b.get("holder"), b)
-        migs = os.path.join(B.state, "migs")
-        ids = [int(f) for f in os.listdir(migs) if f.isdigit()] if os.path.isdir(migs) else []
-        outcomes = [peer(B, {"op": "migration", "mig": i}).get("result", {}).get("outcome") for i in ids]
-        check(f"{what}: B's migration records read aborted", all(o == "aborted" for o in outcomes), outcomes)
-        n2 = n + "-again"
-        r2 = run(A, n2, ip=ip)
-        check(f"{what}: the address runs again on A, with a newer generation",
-              r2["ok"] and addr(A, ip).get("seen", 0) > gen and wait_for(lambda: addr(B, ip).get("seen", 0) > gen, 10), (r2, addr(A, ip), addr(B, ip)))
-        kill(A, n2)
+        check(f"{what}: the target's copy ends", wait_for(lambda: where(n) == {}, 90), where(n))
+        check(f"{what}: gc settles it: withdrawn, no longer lent",
+              wait_for(lambda: cli(A, "debug", "gc")[0] == 0 and not owed(A), 30), (owed(A), addr(A, ip)))
+        a, b = addr(A, ip), addr(B, ip)
+        check(f"{what}: withdrawn here and at B, free", a.get("withdrawn") and a.get("lent") is None and b.get("seen") == gen and b.get("withdrawn"), (a, b))
+        r2 = run(A, n + "-again", ip=ip)
+        check(f"{what}: the address runs again on A, with a newer generation", r2["ok"] and addr(A, ip).get("seen", 0) > gen, (r2, addr(A, ip)))
+        kill(A, n + "-again")
         kill(B, n)
+
+    # A SIGINT taken while the migration still holds the operation lock (the target stalls preparing):
+    # it waits, the outcome turns out unknown, and the wait ends the source all the same.
+    n = "ft-reconcile-kill-waiting"
+    what = f"reconcile kill ({n})"
+    setup(n, mib=100)
+    ip, pid = vms(A)[n]["ip"], vm_pid(A, n)
+    gen = addr(A, ip)["seen"]
+    fault(A, "pages_slow", 120000)
+    fault(B, "incoming_stall", 2000)
+    fault(B, "lost_ack", 30000)
+    fault(B, "status", 30000)
+    r = [None]
+    th = threading.Thread(target=lambda: r.__setitem__(0, migrate(A, n, B)))
+    th.start()
+    lock = os.path.join(B.run, "vms", f"{n}.lock")
+    wait_for(lambda: os.path.exists(lock) and open(lock).read().strip(), 20)
+    os.kill(pid, signal.SIGINT)
+    th.join()
+    fault(B, "lost_ack", 0)
+    gone = wait_for(lambda: not alive(pid), 10)
+    check(f"{what}: the waiting SIGINT ends the source once the outcome is unknown", gone and len(owed(A)) == 1,
+          (r[0], owed(A), log(A, n)[-400:]))
+    if not gone:
+        os.kill(pid, signal.SIGKILL)
+    check(f"{what}: still lent meanwhile", addr(A, ip).get("lent") == gen and not addr(A, ip).get("withdrawn"), addr(A, ip))
+    fault(B, "status", 0)
+    fault(A, "pages_slow", 0)
+    check(f"{what}: settled once the target's copy ends", wait_for(lambda: where(n) == {} and cli(A, "debug", "gc")[0] == 0 and not owed(A), 90),
+          (where(n), owed(A), addr(A, ip)))
+    check(f"{what}: then free", addr(A, ip).get("lent") is None and addr(A, ip).get("withdrawn"), addr(A, ip))
+    kill(B, n)
+
+    # The target already has every page (its ack lost, its status unavailable): it runs on with the address.
+    n = "ft-reconcile-kill-pulled"
+    what = f"reconcile kill ({n})"
+    got = unknown_then_kill(n, signal.SIGINT, False)
+    if not got:
+        return
+    ip, gen, m = got
+    check(f"{what}: the VM runs on at B, md5 intact", where(n) == {B: "running"} and md5(B, n) == m, where(n))
+    fault(B, "status", 0)
+    check(f"{what}: gc settles it as B's", wait_for(lambda: cli(A, "debug", "gc")[0] == 0 and not owed(A), 30), owed(A))
+    migs = os.path.join(B.state, "migs")
+    check(f"{what}: B was told done, no record left", wait_for(lambda: not os.listdir(migs), 10), os.listdir(migs))
+    check(f"{what}: still lent to B", addr(A, ip).get("lent") == gen and not addr(A, ip).get("withdrawn"), addr(A, ip))
+    r2 = run(A, n + "-again", ip=ip)
+    check(f"{what}: still not handed out here", not r2["ok"] and "lent" in r2["error"], r2)
+    ok(kill(B, n))
+    check(f"{what}: once killed at B, the loan is taken back", wait_for(lambda: addr(A, ip).get("lent") is None, 10), addr(A, ip))
+    r2 = run(A, n + "-again", ip=ip)
+    check(f"{what}: then the address runs again on A", r2["ok"] and addr(A, ip).get("seen", 0) > gen, (r2, addr(A, ip)))
+    kill(A, n + "-again")
 
 
 def resume_pull_lock():

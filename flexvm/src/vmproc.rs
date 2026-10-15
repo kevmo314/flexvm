@@ -80,6 +80,8 @@ pub enum End {
     Suspended,
     Moved(String),
     NotStarted,
+    /// A migration source killed before it learned the outcome: its address stays lent.
+    Owed,
 }
 
 pub struct Proc {
@@ -113,9 +115,9 @@ pub struct Proc {
     /// Reserved (`reserve_suspend`) before its worker starts, so SIGTERMs that
     /// overlap make one suspend; `Ending` once the command ends the VM.
     pub suspending: Mutex<Suspend>,
-    /// The migration away whose outcome this source has yet to learn (its
-    /// target never said, nor can be asked): a kill meanwhile ends it.
-    reconciling: Mutex<Option<u64>>,
+    /// The migration away (and its target) whose outcome this source has yet
+    /// to learn (its target never said, nor can be asked): a kill meanwhile ends it.
+    reconciling: Mutex<Option<(u64, String)>>,
     /// While an operation waits in `settle_arrival` for the arrival's last pages (`debug status` shows it).
     settling: AtomicBool,
     early: Mutex<Vec<i32>>,
@@ -543,7 +545,7 @@ impl Proc {
                 let _ = std::fs::write(self.host.vms(&self.name(), "moved"), &to);
                 crate::log!("vm {}: moved to {to}", self.name());
             }
-            // Never ran here: a peer's route for it (say its source's) comes back.
+            // Never ran here, or (`Owed`) may run at its target: a peer's route for it comes back, any loan stays.
             (_, Some(a)) => {
                 let ip = a.ip;
                 if let Ok(l) = self.host.lock() {
@@ -580,15 +582,20 @@ impl Proc {
         let vm = self.vm();
         let source = || format!("vm {} is the source of a migration in progress; it ends once the target has its memory", vm.name).into();
         if let State::Source(mig) = vm.state() {
-            if self.reconciling.lock().unwrap().take_if(|m| *m == mig).is_some() {
-                self.end_reconciling(mig, code)
+            if let Some(to) = self.take_reconciling(mig) {
+                let op = self.op();
+                self.end_reconciling(&op, mig, &to, code)
             }
             return source();
         }
         vm.cancel_checkpoint.fetch_add(1, Ordering::SeqCst);
         vm.pager.abort_copy();
         let op = self.op();
-        if matches!(vm.state(), State::Source(_)) {
+        if let State::Source(mig) = vm.state() {
+            // It became one while this waited (a migration that holds `op` until its outcome is unknown).
+            if let Some(to) = self.take_reconciling(mig) {
+                self.end_reconciling(&op, mig, &to, code)
+            }
             // Refused: the next checkpoint must not take this kill for its own
             // (one it already cancelled consumed it).
             let _ = vm.cancel_checkpoint.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
@@ -597,36 +604,47 @@ impl Proc {
         self.finish(&op, End::Gone, code, None)
     }
 
-    /// Marks migration `mig` as one whose outcome is unknown, until `known` takes it back.
-    pub(crate) fn reconciling(&self, mig: u64) {
-        *self.reconciling.lock().unwrap() = Some(mig);
+    /// Marks migration `mig` to `to` as one whose outcome is unknown, until `known` takes it back.
+    pub(crate) fn reconciling(&self, mig: u64, to: &str) {
+        *self.reconciling.lock().unwrap() = Some((mig, to.into()));
     }
 
     /// False if a kill took the reconciliation first (and is ending the process).
     pub(crate) fn known(&self, mig: u64) -> bool {
-        self.reconciling.lock().unwrap().take_if(|m| *m == mig).is_some()
+        self.take_reconciling(mig).is_some()
+    }
+
+    fn take_reconciling(&self, mig: u64) -> Option<String> {
+        self.reconciling.lock().unwrap().take_if(|(m, _)| *m == mig).map(|(_, to)| to)
     }
 
     /// A kill while migration `mig`'s outcome is unknown (taken from `reconciling`,
-    /// so its reconciliation never resumes nor reroutes this copy). This copy is
-    /// destroyed as any other: its generation is withdrawn here and at every peer,
-    /// which takes back its loan and frees the address here, and fences the
-    /// target's copy off: uncommitted, it can no longer commit; committed, it
-    /// cannot finish its pull without this copy's memory, and ends without
-    /// putting a route back (its record then reads aborted).
-    fn end_reconciling(&self, mig: u64, code: i32) -> ! {
+    /// so its reconciliation never resumes nor reroutes this copy). The target
+    /// may be running the VM, so nothing is withdrawn: the process ends as a
+    /// killed source does, its address left lent (never handed out here) and the
+    /// newest route a peer announced for it put back. The outcome is owed
+    /// (`Host::owe`) and settled by garbage collection once the target says
+    /// (`Host::settle_owed`): released, the loan stays the target's; aborted, the
+    /// generation is withdrawn then.
+    fn end_reconciling(&self, op: &Op, mig: u64, to: &str, code: i32) -> ! {
         let vm = self.vm();
-        let op = self.op();
-        crate::log!(
-            "vm {}: killed while the outcome of migration {mig} is unknown; generation {} of {} is withdrawn, so a copy its target may have resumed ends too",
-            vm.name,
-            self.gen(),
-            vm.ip
-        );
+        let owed = crate::host::Owed { to: to.into(), ip: vm.ip, gen: self.gen(), by: self.ident.clone() };
+        match self.host.owe(mig, &owed) {
+            Ok(()) => crate::log!(
+                "vm {}: killed while the outcome of migration {mig} to {to} is unknown; {to} may still be running it, so {} stays lent (not handed out here) until {to} says",
+                vm.name,
+                vm.ip
+            ),
+            Err(e) => crate::log!(
+                "vm {}: killed while the outcome of migration {mig} to {to} is unknown; {to} may still be running it, so {} stays lent; recording that to settle it later failed ({e}): it stays lent until {to} withdraws it",
+                vm.name,
+                vm.ip
+            ),
+        }
         if let Some(h) = self.holder() {
             h.forget(vm.ip, mig);
         }
-        self.finish(&op, End::Gone, code, None)
+        self.finish(op, End::Owed, code, None)
     }
 
     /// Reserves the one suspend that may run: None if one already is (it

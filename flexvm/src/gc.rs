@@ -49,6 +49,7 @@ pub fn sweep_due(host: &Host) {
 pub fn sweep(host: &Host) {
     local_cleanup(host);
     host.retire_migrations();
+    host.settle_owed();
 }
 
 /// Local sweeps are one at a time (`RUN/.gc.lock`).

@@ -102,11 +102,15 @@ and `flexvm kill` discards one that finished first (`suspend_killed`).
 `kill -KILL` on a migration source is the operator's way to give up its
 copy (the target loses the pages it has not pulled); `flexvm kill` refuses.
 A source still waiting to learn whether its target resumed the VM (ack
-lost, status unavailable) is killed by SIGINT or SIGQUIT as any VM: its
-generation is withdrawn here and at every peer, which takes back its loan,
-fences off an uncommitted target and leaves a committed one (which cannot
-finish its pull) to end without a route; its record then reads aborted
-(`reconcile_kill`).
+lost, status unavailable) does end on SIGINT or SIGQUIT, but the target may
+be running the VM, so nothing is withdrawn: the address stays lent (never
+handed out on this host), the newest route a peer announced for it comes
+back, and the outcome is owed in `STATE/owed/ID`. Garbage collection asks
+the target until it says: `released`, the VM is the target's (told `done`;
+the loan is taken back by its own withdrawal, as for any VM that moved);
+`aborted`, no copy runs, so the generation is withdrawn then and the address
+is free. Meanwhile the listener counts the killed source as still there, so
+the target keeps the record it is asked about (`reconcile_kill`).
 
 ## On-disk state
 
@@ -128,6 +132,7 @@ STATE (default /var/lib/flexvm, on disk)
   standby/TEMPLATE       how many standby VMs to keep for a template
   standby.stop.lock      held while pressure stops standby VMs (SIGUSR1)
   migs/ID                incoming migration records (fencing), JSON, fsynced
+  owed/ID                migrations away whose source was killed before it knew the outcome: target, address, generation (`Host::settle_owed`)
   evict.lock             one eviction decider at a time (flock)
   evict.worker.lock      held by the thread running an eviction; arrivals by eviction are refused meanwhile
   evict.last             its mtime: when an eviction last started (5 s apart)

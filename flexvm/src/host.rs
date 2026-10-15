@@ -196,7 +196,7 @@ impl Host {
     /// Synced up to `/` once per state root, not per command: under the root's flock, `.synced` names the
     /// root (dev, inode), so a copy syncs again; it goes before a repair and comes back after the syncs.
     pub fn open(state: &Path, run: &Path) -> Result<Host> {
-        let dirs = [("addrs", 0o777), ("standby", 0o777), ("migs", 0o777), ("suspended", 0o700)];
+        let dirs = [("addrs", 0o777), ("standby", 0o777), ("migs", 0o777), ("owed", 0o700), ("suspended", 0o700)];
         let (marker, id) = (state.join(".synced"), || std::fs::metadata(state).map(|m| format!("{} {}", m.dev(), m.ino())));
         let named = |d: &Path, e: std::io::Error| {
             let hint = if e.kind() == std::io::ErrorKind::PermissionDenied { " (run flexvm as root to create it)" } else { "" };
@@ -940,6 +940,113 @@ impl Host {
         }
     }
 
+    // Outcomes owed: `STATE/owed/ID`, a migration away whose source process
+    // ended before it learned whether its target resumed the VM.
+
+    fn owed_path(&self, id: u64) -> PathBuf {
+        self.state.join("owed").join(id.to_string())
+    }
+
+    /// Recorded durably before the source process ends: its address stays lent
+    /// until `settle_owed` learns the outcome.
+    pub fn owe(&self, id: u64, o: &Owed) -> Result<()> {
+        store(&self.owed_path(id), o, true)
+    }
+
+    /// Whether an outcome is still owed for the source process `by`: its target
+    /// must keep its record (the source host asks about it), as if `by` lived.
+    /// What cannot be read counts as owed.
+    pub fn owes(&self, by: &Ident) -> bool {
+        let dir = match std::fs::read_dir(self.state.join("owed")) {
+            Ok(d) => d,
+            Err(e) => return e.kind() != std::io::ErrorKind::NotFound,
+        };
+        dir.into_iter().any(|e| e.map_or(true, |e| load::<Owed>(&e.path()).map_or(true, |o| o.is_some_and(|o| o.by == *by))))
+    }
+
+    /// Asks each owed migration's target (five a pass, an unreachable one once): once
+    /// it `released`, the VM is the target's, so the loan stays (its own
+    /// withdrawal takes it back) and the target is told `done`; once
+    /// `aborted`, no copy runs anywhere, so the generation is withdrawn here
+    /// and at the peers, which frees the address. Otherwise it is asked again.
+    pub fn settle_owed(&self) {
+        let host = self.clone();
+        self.settle_owed_with(
+            5,
+            |to, id| {
+                let r = crate::vmproc::peer_call(to, serde_json::json!({"op": "migration", "mig": id}))?;
+                Ok(r["outcome"].as_str().unwrap_or_default().to_string())
+            },
+            |to, id| drop(crate::vmproc::peer_call(to, serde_json::json!({"op": "migration", "mig": id, "done": true}))),
+            |ip, gen| crate::vmproc::tell_peers(&host, serde_json::json!({"op": "route", "ip": ip.to_string(), "gen": gen})),
+        );
+    }
+
+    fn settle_owed_with(
+        &self,
+        budget: usize,
+        mut query: impl FnMut(&str, u64) -> Result<String>,
+        mut done: impl FnMut(&str, u64),
+        mut withdrawn: impl FnMut(Ipv4Addr, u64),
+    ) {
+        let Ok(lock) = File::create(self.run.join(".owed.lock")) else { return };
+        if flock(&lock, libc::LOCK_EX | libc::LOCK_NB).is_err() {
+            return;
+        }
+        let cursor = self.run.join(".owed.next");
+        let last = load::<u64>(&cursor).ok().flatten();
+        let mut ids: Vec<u64> =
+            std::fs::read_dir(self.state.join("owed")).into_iter().flatten().flatten().filter_map(|e| e.file_name().to_str()?.parse().ok()).collect();
+        ids.sort_unstable();
+        let start = last.map_or(0, |last| ids.partition_point(|id| *id <= last));
+        ids.rotate_left(start);
+        let (mut unavailable, mut visited) = (HashSet::new(), None);
+        for id in ids.into_iter().take(budget) {
+            visited = Some(id);
+            let path = self.owed_path(id);
+            let Ok(Some(o)) = load::<Owed>(&path) else { continue };
+            if unavailable.contains(&o.to) {
+                continue;
+            }
+            let outcome = query(&o.to, id);
+            if outcome.is_err() {
+                unavailable.insert(o.to.clone());
+            }
+            match outcome.as_deref() {
+                Ok("released") => {
+                    // Forgotten first: a target that then forgets its record must never read as aborted here.
+                    if crate::util::unlink_durably(&path).is_ok() {
+                        crate::log!("migration {id}: {} has the vm; {} stays lent to it", o.to, o.ip);
+                        done(&o.to, id);
+                    }
+                }
+                Ok("aborted") => {
+                    let freed = self.lock().and_then(|l| {
+                        let current = self.observe(&l, o.ip, o.gen, 0, None)?;
+                        self.unlend(&l, o.ip, o.gen)?;
+                        // A newer generation here keeps its route.
+                        if current && self.holder(&l, o.ip)?.is_none() && !self.reinstall(&l, o.ip, None)? {
+                            crate::net::unroute(o.ip);
+                        }
+                        Ok(())
+                    });
+                    match freed {
+                        Ok(()) => {
+                            crate::log!("migration {id}: {} aborted it, and its source is gone; {} generation {} withdrawn", o.to, o.ip, o.gen);
+                            withdrawn(o.ip, o.gen);
+                            let _ = crate::util::unlink_durably(&path);
+                        }
+                        Err(e) => crate::log!("migration {id}: withdrawing {}: {e}; retried on the next pass", o.ip),
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(id) = visited {
+            let _ = store(&cursor, &id, false);
+        }
+    }
+
     /// Records no source will ask about again: a dead owner's (aborted, as
     /// `mig_status` would answer), and released ones whose source process is
     /// proven gone (killed before its `done`) by its own host's listener. Any
@@ -1085,6 +1192,15 @@ pub enum Mig {
         #[serde(default)]
         by: Option<Ident>,
     },
+}
+
+/// An outcome owed (`Host::owe`): migration away to `to` of `ip` at generation `gen`, by source process `by`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Owed {
+    pub to: String,
+    pub ip: Ipv4Addr,
+    pub gen: u64,
+    pub by: Ident,
 }
 
 /// Dropped before it commits, the record goes (aborted).
@@ -2162,6 +2278,95 @@ mod tests {
         let c = h.claim_new(&l, "x", Some(x)).unwrap();
         assert!(c.gen > g && c.fresh);
         assert!(h.lend_new(&l, x).unwrap_err().to_string().contains("in use"));
+    }
+
+    #[test]
+    fn an_owed_outcome_keeps_the_loan_until_the_target_says() {
+        let h = host("owed");
+        let x = ip("10.9.0.2");
+        let gen = {
+            let l = h.lock().unwrap();
+            let _v = h.take_name("v", false).unwrap();
+            let c = h.claim_new(&l, "v", Some(x)).unwrap();
+            assert!(h.lend(&l, x, c.gen).unwrap());
+            let gen = c.gen;
+            c.release(&l).unwrap();
+            gen
+        };
+        let by = |start| Ident { start, ..Ident::me() };
+        for id in [7, 8] {
+            h.owe(id, &Owed { to: format!("t{id}"), ip: x, gen, by: by(id) }).unwrap();
+        }
+        assert!(h.owes(&by(7)) && !h.owes(&by(9)), "the target keeps its record for an owed source");
+        let lent = |h: &Host| h.addr(&h.lock().unwrap(), x).unwrap().lent;
+        let (mut done, mut withdrawn) = (Vec::new(), Vec::new());
+        // Unknown, unreachable or still committed: nothing changes.
+        for answer in [Err("down".into()), Ok("committed".to_string()), Ok("pending".to_string())] {
+            let a = answer.map_err(|e: String| Error::from(e));
+            h.settle_owed_with(
+                5,
+                |_, _| a.as_ref().map(|s| s.clone()).map_err(|e| e.to_string().into()),
+                |t, id| done.push((t.to_string(), id)),
+                |ip, g| withdrawn.push((ip, g)),
+            );
+            assert_eq!(lent(&h), Some(gen));
+            assert!(h.owed_path(7).exists() && h.owed_path(8).exists());
+            assert!(h.claim_new(&h.lock().unwrap(), "w", Some(x)).is_err(), "never handed out meanwhile");
+        }
+        assert!(done.is_empty() && withdrawn.is_empty());
+        // Released: the VM is the target's; the loan stays, the target is told done.
+        h.settle_owed_with(
+            5,
+            |t, _| Ok(if t == "t7" { "released" } else { "committed" }.into()),
+            |t, id| done.push((t.to_string(), id)),
+            |ip, g| withdrawn.push((ip, g)),
+        );
+        assert_eq!(done, [("t7".to_string(), 7)]);
+        assert!(!h.owed_path(7).exists() && !h.owes(&by(7)) && withdrawn.is_empty());
+        assert_eq!(lent(&h), Some(gen), "lent to the target that has it");
+        // Aborted: nobody runs it; withdrawn, and the address is free again.
+        h.settle_owed_with(5, |_, _| Ok("aborted".into()), |t, id| done.push((t.to_string(), id)), |ip, g| withdrawn.push((ip, g)));
+        assert_eq!(withdrawn, [(x, gen)]);
+        assert!(!h.owed_path(8).exists() && lent(&h).is_none());
+        let a = h.addr(&h.lock().unwrap(), x).unwrap();
+        assert!(a.withdrawn && a.seen == gen);
+        let _w = h.take_name("w", false).unwrap();
+        assert!(h.claim_new(&h.lock().unwrap(), "w", Some(x)).unwrap().gen > gen);
+    }
+
+    #[test]
+    fn owed_outcomes_respect_the_budget_and_ask_an_unreachable_target_once() {
+        let h = host("owed-budget");
+        let x = ip("10.9.0.3");
+        for id in 1..=6 {
+            h.owe(id, &Owed { to: if id <= 3 { "down".into() } else { "up".into() }, ip: x, gen: 1, by: Ident { start: id, ..Ident::me() } }).unwrap();
+        }
+        let mut asked = Vec::new();
+        h.settle_owed_with(
+            4,
+            |t, id| {
+                asked.push(id);
+                if t == "down" {
+                    Err("unreachable".into())
+                } else {
+                    Ok("pending".into())
+                }
+            },
+            |_, _| panic!("nothing released"),
+            |_, _| panic!("nothing aborted"),
+        );
+        assert_eq!(asked, [1, 4], "four records visited, the unreachable target asked once");
+        asked.clear();
+        h.settle_owed_with(
+            4,
+            |_, id| {
+                asked.push(id);
+                Ok("pending".into())
+            },
+            |_, _| {},
+            |_, _| {},
+        );
+        assert_eq!(asked, [5, 6, 1, 2], "the next pass goes on from the cursor");
     }
 
     fn released_migration(h: &Host, id: u64, source: &str) {

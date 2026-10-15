@@ -315,7 +315,7 @@ impl Proc {
     /// Until the outcome is known, a kill ends this copy (`Proc::destroy`); once it
     /// is, this takes it back first, or (a kill took it) leaves the process to end.
     fn reconcile_later(self: &Arc<Self>, mig: u64, to: String) {
-        self.reconciling(mig);
+        self.reconciling(mig, &to);
         let p = self.clone();
         thread::spawn(move || {
             let mut patience = Duration::from_secs(1);
