@@ -1578,16 +1578,16 @@ pub struct GrantBackoff {
 }
 
 impl GrantBackoff {
-    fn ready(&self, now: Instant) -> bool {
+    pub(crate) fn ready(&self, now: Instant) -> bool {
         self.until.is_none_or(|until| now >= until)
     }
 
-    fn refused(&mut self, now: Instant) {
+    pub(crate) fn refused(&mut self, now: Instant) {
         self.delay = (self.delay * 2).clamp(GRANT_RETRY_MIN, GRANT_RETRY_MAX);
         self.until = Some(now + self.delay);
     }
 
-    fn granted(&mut self) {
+    pub(crate) fn granted(&mut self) {
         *self = GrantBackoff::default();
     }
 }

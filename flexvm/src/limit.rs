@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 
 use crate::host::Host;
 use crate::template::STEP_MIB;
+use crate::vmproc::GrantBackoff;
 
 /// How long `lift` waits for throttled threads: the kernel's longest
 /// throttling sleep (2 s) and some.
@@ -133,11 +134,11 @@ impl Limit {
     }
 
     /// Usage within half a step of the mark: admit a step and raise it.
-    fn grow(&self, host: &Host) -> Growth {
-        self.grow_with(host, |more| host.grant(more, None))
+    fn grow(&self, host: &Host, backoff: &mut GrantBackoff) -> Growth {
+        self.grow_with(host, backoff, Instant::now(), |more| host.grant(more, None))
     }
 
-    fn grow_with(&self, host: &Host, grant: impl Fn(u64) -> crate::util::Result<Option<u64>>) -> Growth {
+    fn grow_with(&self, host: &Host, backoff: &mut GrantBackoff, now: Instant, grant: impl Fn(u64) -> crate::util::Result<Option<u64>>) -> Growth {
         let Some(used) = self.used() else { return self.clear_throttled(Growth::Idle) };
         let mut more = {
             let m = self.mark.lock().unwrap();
@@ -155,12 +156,22 @@ impl Limit {
         }
         // Admitted without `mark` held; another raise meanwhile only adds to it.
         // Retry a refusal once with half a step (admission is in MiB, not hotplug units).
-        let admitted = match grant(more) {
-            Ok(None) if more > 1 => {
-                more /= 2;
-                grant(more)
+        let admitted = if !backoff.ready(now) {
+            Ok(None)
+        } else {
+            let result = match grant(more) {
+                Ok(None) if more > 1 => {
+                    more /= 2;
+                    grant(more)
+                }
+                result => result,
+            };
+            match &result {
+                Ok(Some(_)) => backoff.granted(),
+                Ok(None) => backoff.refused(now),
+                Err(_) => {}
             }
-            result => result,
+            result
         };
         let id = match admitted {
             Ok(Some(id)) => id,
@@ -247,6 +258,8 @@ impl Limit {
     pub fn watch(&self, host: &Host, tick: Duration, live: impl Fn() -> bool, running: impl Fn() -> bool) {
         let Some(cg) = &self.cgroup else { return };
         let mut events = std::fs::File::open(cg.join("memory.events")).ok();
+        // Its own, not the plug path's: that one asks more often for more, and would take each retry.
+        let mut backoff = GrantBackoff::default();
         while live() {
             wait_event(events.as_mut(), tick);
             if !running() {
@@ -255,7 +268,7 @@ impl Limit {
                 continue;
             }
             // Throttling raises an event every 10 ms: at full size or refused, no use asking again at each.
-            std::thread::sleep(match self.grow(host) {
+            std::thread::sleep(match self.grow(host, &mut backoff) {
                 Growth::Full | Growth::Refused => tick,
                 Growth::Raised | Growth::Idle => Duration::from_millis(20),
             });
@@ -316,18 +329,18 @@ mod tests {
         l.start(allowance(100), 1000);
         assert_eq!((l.admitted(), high(&cg)), (100 + 256, Some(356 + overhead(356))));
         // Far from the mark: nothing; near it, a step more.
-        assert!(l.grow(&host) == Growth::Idle && l.admitted() == 356);
+        assert!(l.grow(&host, &mut GrantBackoff::default()) == Growth::Idle && l.admitted() == 356);
         set(&cg, 356 + overhead(356) - 100);
-        assert!(l.grow(&host) == Growth::Raised && l.admitted() == 612);
+        assert!(l.grow(&host, &mut GrantBackoff::default()) == Growth::Raised && l.admitted() == 612);
         // Refused: stays, throttled.
         set(&cg, 612 + overhead(612));
         host.cfg.reserve_mib = u64::MAX / 4;
-        assert!(l.grow(&host) == Growth::Refused && l.admitted() == 612 && l.throttled.load(Ordering::SeqCst));
+        assert!(l.grow(&host, &mut GrantBackoff::default()) == Growth::Refused && l.admitted() == 612 && l.throttled.load(Ordering::SeqCst));
         host.cfg.reserve_mib = 0;
-        assert!(l.grow(&host) == Growth::Raised && l.admitted() == 868 && !l.throttled.load(Ordering::SeqCst));
+        assert!(l.grow(&host, &mut GrantBackoff::default()) == Growth::Raised && l.admitted() == 868 && !l.throttled.load(Ordering::SeqCst));
         // Never past the guest's size; a plug raises both by what it was charged.
         set(&cg, 2000);
-        assert!(l.grow(&host) == Growth::Raised && l.admitted() == 1000);
+        assert!(l.grow(&host, &mut GrantBackoff::default()) == Growth::Raised && l.admitted() == 1000);
         l.plug(3000, 512);
         assert_eq!((l.admitted(), high(&cg)), (1512, Some(1512 + overhead(1512))));
         // A settled shrink lowers it, never below what is in use.
@@ -343,7 +356,7 @@ mod tests {
         let was = l.admitted();
         set(&cg, was + overhead(was));
         host.cfg.reserve_mib = u64::MAX / 4;
-        assert!(l.grow(&host) == Growth::Idle && l.admitted() == was && !l.throttled.load(Ordering::SeqCst));
+        assert!(l.grow(&host, &mut GrantBackoff::default()) == Growth::Idle && l.admitted() == was && !l.throttled.load(Ordering::SeqCst));
         host.cfg.reserve_mib = 0;
         drop(lifted);
         assert_eq!(high(&cg), Some(l.admitted() + overhead(l.admitted())));
@@ -359,7 +372,7 @@ mod tests {
         let held = host.lock().unwrap();
         let (l, host) = (&l, &host);
         std::thread::scope(|sc| {
-            let grower = sc.spawn(|| l.grow(host));
+            let grower = sc.spawn(|| l.grow(host, &mut GrantBackoff::default()));
             std::thread::sleep(Duration::from_millis(100));
             let (tx, rx) = std::sync::mpsc::channel();
             sc.spawn(move || {
@@ -383,7 +396,7 @@ mod tests {
         let held = host.lock().unwrap();
         let (l, host) = (&l, &host);
         std::thread::scope(|sc| {
-            let grower = sc.spawn(|| l.grow(host));
+            let grower = sc.spawn(|| l.grow(host, &mut GrantBackoff::default()));
             std::thread::sleep(Duration::from_millis(100));
             let lifted = l.lift(None);
             drop(held);
@@ -405,15 +418,15 @@ mod tests {
         let at = mark - MARK_SLACK;
         for (used, throttled) in [(at - 1, false), (at, true), (mark, true), (mark + 1, true), (at - 1, false), (mark - step(4096) / 2, false)] {
             set(&cg, used);
-            assert_eq!(l.grow(&host), Growth::Refused);
+            assert_eq!(l.grow(&host, &mut GrantBackoff::default()), Growth::Refused);
             assert_eq!(l.admitted(), 4096);
             assert_eq!(l.throttled.load(Ordering::SeqCst), throttled, "usage {used}, mark {mark}");
         }
         // An admission error clears an old refusal rather than reporting starvation.
         set(&cg, mark);
-        assert_eq!(l.grow(&host), Growth::Refused);
+        assert_eq!(l.grow(&host, &mut GrantBackoff::default()), Growth::Refused);
         assert!(l.throttled.load(Ordering::SeqCst));
-        assert_eq!(l.grow_with(&host, |_| Err("admission failed".into())), Growth::Refused);
+        assert_eq!(l.grow_with(&host, &mut GrantBackoff::default(), Instant::now(), |_| Err("admission failed".into())), Growth::Refused);
         assert!(!l.throttled.load(Ordering::SeqCst));
         std::fs::remove_dir_all(cg.parent().unwrap()).unwrap();
     }
@@ -425,7 +438,7 @@ mod tests {
         set(&cg, 4096 + overhead(4096));
         let asks = std::cell::RefCell::new(Vec::new());
         assert_eq!(
-            l.grow_with(&host, |more| {
+            l.grow_with(&host, &mut GrantBackoff::default(), Instant::now(), |more| {
                 asks.borrow_mut().push(more);
                 Ok((more == 512).then_some(1))
             }),
@@ -438,7 +451,7 @@ mod tests {
         set(&cg, 4608 + overhead(4608));
         asks.borrow_mut().clear();
         assert_eq!(
-            l.grow_with(&host, |more| {
+            l.grow_with(&host, &mut GrantBackoff::default(), Instant::now(), |more| {
                 asks.borrow_mut().push(more);
                 Ok(None)
             }),
@@ -451,7 +464,7 @@ mod tests {
         set(&cg, 8192);
         asks.borrow_mut().clear();
         assert_eq!(
-            l.grow_with(&host, |more| {
+            l.grow_with(&host, &mut GrantBackoff::default(), Instant::now(), |more| {
                 asks.borrow_mut().push(more);
                 Ok(None)
             }),
@@ -463,7 +476,7 @@ mod tests {
         set(&cg, 8192);
         asks.borrow_mut().clear();
         assert_eq!(
-            l.grow_with(&host, |more| {
+            l.grow_with(&host, &mut GrantBackoff::default(), Instant::now(), |more| {
                 asks.borrow_mut().push(more);
                 Ok(None)
             }),
@@ -474,12 +487,54 @@ mod tests {
     }
 
     #[test]
+    fn refused_steps_back_off_until_a_grant() {
+        let (l, cg, host) = cgroup("backoff");
+        l.start(4096, 8192);
+        set(&cg, 8192);
+        let (mut backoff, mut now) = (GrantBackoff::default(), Instant::now());
+        let asks = std::cell::Cell::new(0);
+        let allowed = std::cell::Cell::new(false);
+        let grant = |_| {
+            asks.set(asks.get() + 1);
+            Ok(allowed.get().then_some(1))
+        };
+        for delay in [250, 500, 1000, 2000, 4000, 5000, 5000] {
+            let before = asks.get();
+            assert_eq!(l.grow_with(&host, &mut backoff, now, grant), Growth::Refused);
+            assert_eq!(asks.get(), before + 2); // Full and half step.
+            now += Duration::from_millis(delay);
+            assert_eq!(l.grow_with(&host, &mut backoff, now - Duration::from_millis(1), grant), Growth::Refused);
+            assert_eq!(asks.get(), before + 2);
+            assert!(l.throttled.load(Ordering::SeqCst));
+        }
+        // Usage changes still update throttling while admission is backed off.
+        set(&cg, 4096 + overhead(4096) - MARK_SLACK - 1);
+        let before = asks.get();
+        assert_eq!(l.grow_with(&host, &mut backoff, now - Duration::from_millis(1), grant), Growth::Refused);
+        assert_eq!(asks.get(), before);
+        assert!(!l.throttled.load(Ordering::SeqCst));
+        set(&cg, 8192);
+        allowed.set(true);
+        assert_eq!(l.grow_with(&host, &mut backoff, now, grant), Growth::Raised);
+        assert!(!l.throttled.load(Ordering::SeqCst));
+        // A grant allows an immediate request; its refusal starts again at 250 ms.
+        allowed.set(false);
+        assert_eq!(l.grow_with(&host, &mut backoff, now, grant), Growth::Refused);
+        assert_eq!(asks.get(), before + 3);
+        assert_eq!(l.grow_with(&host, &mut backoff, now + Duration::from_millis(249), grant), Growth::Refused);
+        assert_eq!(asks.get(), before + 3);
+        assert_eq!(l.grow_with(&host, &mut backoff, now + Duration::from_millis(250), grant), Growth::Refused);
+        assert_eq!(asks.get(), before + 5);
+        std::fs::remove_dir_all(cg.parent().unwrap()).unwrap();
+    }
+
+    #[test]
     fn full_size_asks_nothing_even_above_the_mark() {
         let (l, cg, host) = cgroup("full");
         l.start(4096, 4096);
         set(&cg, 5000);
         l.throttled.store(true, Ordering::SeqCst);
-        assert_eq!(l.grow_with(&host, |_| panic!("full VM requested a grant")), Growth::Full);
+        assert_eq!(l.grow_with(&host, &mut GrantBackoff::default(), Instant::now(), |_| panic!("full VM requested a grant")), Growth::Full);
         assert!(!l.throttled.load(Ordering::SeqCst));
         std::fs::remove_dir_all(cg.parent().unwrap()).unwrap();
     }
