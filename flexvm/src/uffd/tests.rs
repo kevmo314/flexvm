@@ -31,6 +31,48 @@ fn preload_runs_respect_gaps_regions_and_slots() {
     assert_eq!(page_runs(&list, &mappings).collect::<Vec<_>>(), [(0, 2), (2, 1), (3, 2), (5, 2), (7, 2)]);
 }
 
+/// Page indexes from a migration source, however wild, always make runs of at least one page: the walk ends.
+#[test]
+fn preload_runs_end_for_any_page() {
+    let mappings = [Mapping { base_host_virt_addr: 0, offset: 0, size: 4 * PAGE_SIZE }];
+    let list = [2, 3, u64::MAX - 1, u64::MAX];
+    assert_eq!(page_runs(&list, &mappings).collect::<Vec<_>>(), [(0, 2), (2, 1), (3, 1)]);
+    assert_eq!(page_runs(&[u64::MAX, u64::MAX], &mappings).collect::<Vec<_>>(), [(0, 1), (1, 1)]);
+    assert_eq!(page_runs(&[u64::MAX], &[]).collect::<Vec<_>>(), [(0, 1)]);
+    let huge = [Mapping { base_host_virt_addr: 0, offset: (usize::MAX - PAGE_SIZE + 1) as u64, size: PAGE_SIZE }];
+    let last = (usize::MAX / PAGE_SIZE) as u64;
+    assert_eq!(page_runs(&[last - 1, last, u64::MAX], &huge).collect::<Vec<_>>(), [(0, 1), (1, 1), (2, 1)]);
+}
+
+/// A migration header's runs and preload list are checked against the memory regions the source named before any use.
+#[test]
+fn incoming_header_is_checked() {
+    let regions = [(0, (8 * PAGE_SIZE) as u64), ((16 * PAGE_SIZE) as u64, (4 * PAGE_SIZE) as u64)];
+    let runs: Runs = vec![(0, 4, REMOTE), (4, 2, ZERO), (16, 4, REMOTE)];
+    check_incoming(&runs, &[], &regions).unwrap();
+    check_incoming(&runs, &[0, 3, 16, 19], &regions).unwrap();
+    for (preload, why) in [
+        (vec![u64::MAX], "not a remote page"),
+        (vec![0, u64::MAX], "not a remote page"),
+        (vec![20], "not a remote page"),
+        (vec![4], "not a remote page"),
+        (vec![7], "not a remote page"),
+        (vec![3, 0], "out of order"),
+        (vec![3, 3], "out of order"),
+    ] {
+        let e = check_incoming(&runs, &preload, &regions).unwrap_err().to_string();
+        assert!(e.contains(why), "{preload:?}: {e}");
+    }
+    // Runs past guest memory, or that wrap, are refused whatever the preload list.
+    for bad in [vec![(u64::MAX, 1, REMOTE)], vec![(u64::MAX - 1, 4, REMOTE)], vec![(6, 4, REMOTE)], vec![(0, u64::MAX, ZERO)]] {
+        assert!(check_incoming(&bad, &[], &regions).is_err(), "{bad:?}");
+    }
+    // Regions that overflow the address space do not panic.
+    assert!(check_incoming(&vec![(u64::MAX, 1, REMOTE)], &[u64::MAX], &[(u64::MAX, u64::MAX)]).is_err());
+    let r = remote_among(&vec![(u64::MAX - 1, 4, REMOTE)], [u64::MAX - 1, u64::MAX]);
+    assert_eq!(r, vec![u64::MAX - 1]);
+}
+
 #[test]
 fn install_runs_past_partial_copies_eexist_and_discards() {
     let p = pages(&[REMOTE; 6]);
@@ -238,31 +280,40 @@ fn failure_history_follows_the_pages() {
     }
 }
 
-/// A streamed install that fails stops the fetch at once.
+/// A streamed install that fails installs nothing more, but reads the rest of the reply, so that the connection lives
+/// on for the retry; a stopped pager cuts the fetch at once.
 #[test]
-fn failed_install_cancels_the_fetch() {
-    let p = pages(&[REMOTE; 64]);
-    p.claim(0, 64, REMOTE, |_| true);
-    let mut delivered = 0;
-    let mut fetch = |_: u64, buf: &mut [u8], _: &AtomicBool, progress: &mut dyn FnMut(&[u8]) -> bool| -> io::Result<()> {
-        for k in 1..=buf.len() / PAGE_SIZE {
-            delivered = k;
-            if !progress(&buf[..k * PAGE_SIZE]) {
-                return Err(io::Error::other(FetchFailure::Cancelled));
+fn failed_install_drains_the_fetch() {
+    for stopped in [false, true] {
+        let p = pages(&[REMOTE; 64]);
+        p.claim(0, 64, REMOTE, |_| true);
+        let mut delivered = 0;
+        let mut fetch = |_: u64, buf: &mut [u8], _: &AtomicBool, progress: &mut dyn FnMut(&[u8]) -> bool| -> io::Result<()> {
+            for k in 1..=buf.len() / PAGE_SIZE {
+                delivered = k;
+                if !progress(&buf[..k * PAGE_SIZE]) {
+                    return Err(io::Error::other(FetchFailure::Cancelled));
+                }
             }
-        }
-        Ok(())
-    };
-    let stop = AtomicBool::new(false);
-    let (resolved, res) = p.fetch_install(0, 64, &mut vec![0u8; 64 * PAGE_SIZE], &mut fetch, &stop, &mut |_| true, |pg, _, _| match pg {
-        0 => Ok(1),
-        _ => Err(os(libc::ENOMEM)),
-    });
-    assert!(matches!(res, Err(Failed::Install(_))));
-    assert_eq!(resolved, 1);
-    assert_eq!(delivered, 1 + STREAM_RUN, "stopped as soon as the second install failed");
-    assert!(states(&p)[1..].iter().all(|&s| s == REMOTE));
-    assert!(p.failing_since(1, 1).is_some());
+            Ok(())
+        };
+        let stop = AtomicBool::new(stopped);
+        let mut installs = 0;
+        let (resolved, res) = p.fetch_install(0, 64, &mut vec![0u8; 64 * PAGE_SIZE], &mut fetch, &stop, &mut |_| true, |pg, _, _| {
+            installs += 1;
+            match pg {
+                0 => Ok(1),
+                _ => Err(os(libc::ENOMEM)),
+            }
+        });
+        assert!(matches!(res, Err(Failed::Install(_))));
+        assert_eq!(resolved, 1);
+        assert_eq!(installs, 2, "nothing installed after the failure");
+        let want = if stopped { 1 + STREAM_RUN } else { 64 };
+        assert_eq!(delivered, want, "stopped: {stopped}");
+        assert!(states(&p)[1..].iter().all(|&s| s == REMOTE));
+        assert!(p.failing_since(1, 1).is_some());
+    }
 }
 
 /// Faults waiting on claimed pages are woken when they settle, whether installed, given back or discarded; with none

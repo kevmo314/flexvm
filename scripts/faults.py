@@ -208,7 +208,7 @@ def fault(host, f, ms):
 
 FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_before_run", "restore_after_run",
           "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "resume_kill",
-          "prepare_fail", "short_incoming", "slow_preload", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
+          "prepare_fail", "short_incoming", "slow_preload", "bad_preload", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
           "started_fsync", "started_unmark", "start_stall", "incoming_stall", "claim_stall", "handoff_stall", "ckpt_wp_race",
           "fetch_tail_enomem", "fetch_enomem_stuck", "pull_enomem", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo", "release_stall", "release_late", "no_plug", "pause_lost", "tap_backlog", "tap_backlog_stuck", "pause_unknown", "no_collapse", "collapse_slow", "pages_slow")
 
@@ -1386,7 +1386,8 @@ def arrival_with_peer_route(n, ip):
     s, r, mig = migrate_in_raw(B, n, ip, source_vm(), gen=gen)
     assert r.get("ok"), r
     bad = os.urandom(4096)
-    s.sendall((json.dumps({"runs": [], "vmstate_len": len(bad), "preload": [0], "paused": False}) + "\n").encode() + bad)
+    # A valid header (the preloaded page is a REMOTE one, as a source sends): only the vmstate is bad.
+    s.sendall((json.dumps({"runs": [[0, 1, 3]], "vmstate_len": len(bad), "preload": [0], "paused": False}) + "\n").encode() + bad)
     return s, mig, gw, gen
 
 
@@ -1539,6 +1540,29 @@ def slow_preload():
     st = wait_released(B, n)
     check("slow preload: released, only on B", st["released"] is True and where(n) == {B: "running"}, (st, where(n)))
     check("slow preload: md5 intact", md5(B, n) == m)
+    cleanup(n)
+
+
+def bad_preload():
+    """A source whose header names a preload page past guest memory (page
+    u64::MAX, `bad_preload`): the target refuses the header at once, rather
+    than hanging on it, and the VM runs on at the source."""
+    n = "ft-bad-preload"
+    m = setup(n)
+    fault(A, "bad_preload", 10000)
+    started = time.time()
+    r = migrate(A, n, B)
+    took = time.time() - started
+    fault(A, "bad_preload", 0)
+    check("bad preload: migrate fails", not r["ok"], r)
+    check("bad preload: refused for the preload list", "preload page" in r.get("error", ""), r.get("error"))
+    check("bad preload: refused promptly", took < 20, took)
+    check("bad preload: running on A only", where(n) == {A: "running"}, where(n))
+    check("bad preload: md5 intact on A", md5(A, n) == m)
+    r = migrate(A, n, B)
+    check("bad preload: a later migration works", r["ok"] and where(n).get(B) == "running", r)
+    wait_released(B, n)
+    check("bad preload: md5 intact on B", md5(B, n) == m)
     cleanup(n)
 
 
@@ -5599,7 +5623,7 @@ SCENARIOS = dict(
     cow_crash=cow_crash, cow_reports_held=cow_reports_held, ckpt_incremental=ckpt_incremental,
     ckpt_failed_stop=ckpt_failed_stop, ckpt_rearm=ckpt_rearm, ckpt_dir_moved=ckpt_dir_moved,
     prepare_disconnect=prepare_disconnect, prepare_trickle=prepare_trickle, prepare_fail=prepare_fail,
-    fc_prepare=fc_prepare, slow_preload=slow_preload, ckpt_packet_hold=ckpt_packet_hold, ckpt_stall=ckpt_stall, standby=standby,
+    fc_prepare=fc_prepare, slow_preload=slow_preload, bad_preload=bad_preload, ckpt_packet_hold=ckpt_packet_hold, ckpt_stall=ckpt_stall, standby=standby,
     suspend_disk_freed=suspend_disk_freed, resume_mark_fails=resume_mark_fails, kill_source=kill_source,
     kill_refused_checkpoint=no_evict(kill_refused_checkpoint), wildcard_listen=wildcard_listen,
     forged_peer=forged_peer, restore_ip_peer=restore_ip_peer, late_withdrawal=late_withdrawal,
