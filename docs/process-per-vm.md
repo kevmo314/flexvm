@@ -135,7 +135,7 @@ STATE (default /var/lib/flexvm, on disk)
                          the newest) and flexvm-init, as scripts/fetch.sh and build-*.sh install them
   templates/             built templates: NAME -> .gen/ID (see internals.md)
   images/                pulled container images: blobs/sha256/, rootfs/KEY.ext4 (see images.md)
-  host.json              host config: listen, peers, vm_ips, underlay, announce_dev, dns, reserve_mib, evict_mib, prefix
+  host.json              host config (`flexvm config`'s; listen is `flexvm listen`'s): listen, peers, vm_ips, underlay, announce_dev, dns, reserve_mib, evict_mib; unset ones are derived where used
   lock                   the host lock (flock), held for short critical sections only
   .synced                the root's (dev, inode) once its directories were made durable (`Host::open`)
   addrs/IP               per address: newest generation seen, withdrawn?, lent generation, holder name, instance
@@ -231,14 +231,11 @@ log's path then (reopened if another writer rotated it), and past 8 MiB
 renames it `NAME.log.1` and starts a new one. No write goes to a rotated
 or removed generation, and none is cut.
 
-**The tap prefix** names taps (garbage collection goes by their alias, not
-by it), and changes only while nothing uses the old one: `Host::configure`
-refuses a change, under the host lock, while any work directory's owner is
-not proven gone, or any tap already reads as named under the new prefix (`tap_owner`), whoever made it. A VM process makes
-its work directory and then reads the prefix from host.json under the host
-lock; a template build names and makes its tap under it. The prefix is
-checked (1 to 6 characters) where it is read (`Host::tap_prefix`), as
-host.json may hold one saved under an earlier limit.
+**The tap prefix** names taps and hold devices: `f` and five base-36 digits
+of a hash of the state directory (`Host::tap_prefix`), so it never changes
+and hosts on separate state directories read apart. Names never clash even
+when two prefixes do, as each carries its process's pid; garbage collection
+goes by a tap's alias, never its name.
 
 **The host lock** is a flock taken by one thread of a process at a time and
 reentrant within a thread, so a guard dropped under it (an address claim)
@@ -342,8 +339,8 @@ answer, held packets). What changed is who is at each end:
    network namespace route it only after the held packets (`hold.rs`).
 4. Pages: the target's pager connects to the *source's* listener (the
    address the source sent: its listen address, or for a wildcard one its
-   underlay address with the listen port; `listen` refuses a wildcard
-   address without `--underlay`) with `pages {name, mig}`; the listener passes the socket (SCM_RIGHTS) to the
+   underlay address with the listen port, derived from the kernel's route toward
+   the peers without `--underlay`) with `pages {name, mig}`; the listener passes the socket (SCM_RIGHTS) to the
    source VM process, which serves it if it is the source of that migration.
 5. Release: the source polls `migration {mig}` on the target's listener.
    The listener answers from `STATE/migs/ID`: `pending`, `committed`,
@@ -366,8 +363,11 @@ answer, held packets). What changed is who is at each end:
 `flexvm listen [ADDR]` is an optional helper, needed only to receive
 migrations (and page requests for VMs migrating away). It is stateless and
 socket-activatable (`LISTEN_FDS`, taking its address from the socket when
-no ADDR is given, or binds `host.json`'s `listen`); host.json is written only
-once the socket is bound and valid. Proxy ARP on `--announce-dev` is enabled
+no ADDR is given, or binds ADDR or `host.json`'s `listen`); it saves only its
+address, once the socket is bound and valid. Settings are `flexvm config`'s;
+those unset are derived where used, never saved (`Config::underlay`,
+`announce_dev`, `reserve`: the kernel's route toward the first peer elsewhere,
+cached for 30 s, and the host's RAM). Proxy ARP on the announce device is enabled
 by every VM process too, so it needs no listener. Each
 connection's first line (peeked, then consumed exactly through its newline, so nothing after it is consumed) is
 one of:
@@ -428,7 +428,8 @@ Pressure relief needs one decider per host: every second each VM process
 whose host is under pressure, or whose VM is starved, tries
 `STATE/evict.lock` (non-blocking). Pressure starts when MemAvailable falls
 under the high-water mark (`evict_mib`, `listen --evict-at`; default the
-reserve plus the reserve or 512 MiB, whichever is more) and lasts until it is
+reserve plus the reserve or 512 MiB, whichever is more; the reserve's default
+is a sixteenth of the host's RAM, from 256 MiB to 4 GiB) and lasts until it is
 back above the mark by half the mark's height over the reserve (at least
 128 MiB), marked by `RUN/evict.active`; the marks (and the reserve that
 admission uses) are read from `host.json` as it changes. Under the reserve,

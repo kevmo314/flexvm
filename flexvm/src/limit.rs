@@ -308,7 +308,7 @@ mod tests {
             std::fs::write(cg.join(f), "max\n").unwrap();
         }
         let mut host = Host::open(&base.join("state"), &base.join("run")).unwrap();
-        host.cfg.reserve_mib = 0;
+        host.cfg.reserve_mib = Some(0);
         (base, Limit::new(Some(cg.clone())), cg, host)
     }
 
@@ -333,9 +333,9 @@ mod tests {
         assert!(l.grow(&host, &mut GrantBackoff::default()) == Growth::Raised && l.admitted() == 612);
         // Refused: stays, throttled.
         set(&cg, 612 + overhead(612));
-        host.cfg.reserve_mib = u64::MAX / 4;
+        host.cfg.reserve_mib = Some(u64::MAX / 4);
         assert!(l.grow(&host, &mut GrantBackoff::default()) == Growth::Refused && l.admitted() == 612 && l.throttled.load(Ordering::SeqCst));
-        host.cfg.reserve_mib = 0;
+        host.cfg.reserve_mib = Some(0);
         assert!(l.grow(&host, &mut GrantBackoff::default()) == Growth::Raised && l.admitted() == 868 && !l.throttled.load(Ordering::SeqCst));
         // Never past the guest's size; a plug raises both by what it was charged.
         set(&cg, 2000);
@@ -354,9 +354,9 @@ mod tests {
         // Nothing is admitted for it meanwhile (no phantom grant), nor is it throttled.
         let was = l.admitted();
         set(&cg, was + overhead(was));
-        host.cfg.reserve_mib = u64::MAX / 4;
+        host.cfg.reserve_mib = Some(u64::MAX / 4);
         assert!(l.grow(&host, &mut GrantBackoff::default()) == Growth::Idle && l.admitted() == was && !l.throttled.load(Ordering::SeqCst));
-        host.cfg.reserve_mib = 0;
+        host.cfg.reserve_mib = Some(0);
         drop(lifted);
         assert_eq!(high(&cg), Some(l.admitted() + overhead(l.admitted())));
     }
@@ -411,7 +411,7 @@ mod tests {
     #[test]
     fn refusal_only_throttles_near_the_mark() {
         let (_dir, l, cg, mut host) = cgroup("refused");
-        host.cfg.reserve_mib = u64::MAX / 4;
+        host.cfg.reserve_mib = Some(u64::MAX / 4);
         l.start(4096, 8192);
         let mark = 4096 + overhead(4096);
         let at = mark - MARK_SLACK;

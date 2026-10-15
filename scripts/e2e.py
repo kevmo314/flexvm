@@ -55,7 +55,7 @@ FAULTS = ("basic route route_abort lost_ack unknown refused pages_blip pages_dea
           "incoming_killed start_killed claim_killed standby_stalled standby_refill_race standby_lock_timeout standby_stop_claim standby_claim_signal standby_concurrent_claims fc_died cow_grow plug_race plug_storm suspend_debris revoked_publication "
           "same_host_order same_host_slow_route same_host_flood same_host_late_handover same_host_backlog same_host_bulk_tcp ckpt_backlog ckpt_paused_backlog rx_stall arrival_abort_route arrival_killed_route handoff_superseded delayed_announce announce_arp_timer prepare_fail_announce reconcile_announce reconcile_kill mem_high mem_high_migrate mem_high_evict mem_refused_headroom mem_refused_fill "
           "sigkill_restart listen_trickle suspend_cmd suspend_overlap fc_died_busy pause_cmd_start suspend_died evict_latency evict_skips_cmd cmd_flag "
-          "refused_admission arrival_grew arrival_grew_admitted meminfo_unreadable checkpoint_hotplug log_cap gc_debris arrival_log template_tap prefix_change arrival_overtaken "
+          "refused_admission arrival_grew arrival_grew_admitted meminfo_unreadable checkpoint_hotplug log_cap gc_debris arrival_log template_tap arrival_overtaken "
           "prepare_disconnect prepare_trickle unlend_retry bad_app_log resume_slow_guest resume_readdress_fail resume_unpause_fail abort_link_fail resume_unsettled resume_pull_lock page_conns page_refusals suspend_unaddressed resume_fence_fails quarantine_reboot_ls")
 p.add_argument("--faults", default=FAULTS, help="scripts/faults.py scenarios to run against the two hosts ('' for none)")
 # A worker runs its cases on one lane, against templates that are already built.
@@ -130,9 +130,7 @@ class Host:
         # Inside this run's own fresh directories (see main).
         self.run_dir = os.path.join(RUN, label)
         self.state_dir = os.path.join(WORK, f"{label}-state")
-        # Six characters leave room for the pid and suffix in Linux's 15-byte names.
-        # Each host's listening port keeps concurrent runs and lanes apart.
-        self.prefix = f"fc{port:04x}"
+        self.prefix = None  # of its taps, derived from its state directory (`flexvm config`)
         self.log = os.path.join(args.log_dir, f"listen-{label}.log")
         self.proc = None
         self.vms = set()  # names of the VMs this script created here or moved here
@@ -144,8 +142,9 @@ class Host:
             raise AssertionError(f"port {self.port} is in use; pick other ports with --port-a")
         os.makedirs(self.run_dir, exist_ok=True)
         shared_state(self.state_dir)
-        cmd = [BIN, "--state", self.state_dir, "--run", self.run_dir, "listen", self.addr,
-               "--peer", self.peer, "--vm-ips", f"{self.net}.2-{self.net}.60", "--reserve", "256", "--prefix", self.prefix]
+        cfg = self.cli("config", "--peer", self.peer, "--vm-ips", f"{self.net}.2-{self.net}.60", "--reserve", "256")
+        self.prefix = json.loads(cfg.stdout)["derived"]["prefix"]
+        cmd = [BIN, "--state", self.state_dir, "--run", self.run_dir, "listen", self.addr]
         self.proc = subprocess.Popen(cmd, stdout=open(self.log, "a"), stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                      env=ENV, start_new_session=True)
         # Up once our own child holds the listening socket.
@@ -268,7 +267,7 @@ class Host:
         return out
 
     def taps(self):
-        return [n for n in os.listdir("/sys/class/net") if n.startswith(self.prefix)]
+        return [n for n in os.listdir("/sys/class/net") if self.prefix and n.startswith(self.prefix)]
 
     def cgroups(self):
         # By identity (`idle-PID-START-N`): never a later process's that got a pid.

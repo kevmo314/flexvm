@@ -81,10 +81,12 @@ pub fn validate(listener: &TcpListener, cfg: &crate::host::Config) -> Result<()>
 
 pub fn main(host: Host, listener: TcpListener) -> Result<()> {
     crate::net::ip_forward()?;
-    if let Some(dev) = &host.cfg.announce_dev {
+    let dev = host.cfg.announce_dev();
+    if let Some(dev) = &dev {
         crate::net::conf("ipv4", dev, "proxy_arp", "1")?;
     }
-    crate::log!("flexvm listening on {}", listener.local_addr()?);
+    let underlay = host.cfg.underlay().map_or("none".into(), |u| u.to_string());
+    crate::log!("flexvm listening on {} (underlay {underlay}, announce device {})", listener.local_addr()?, dev.as_deref().unwrap_or("none"));
     crate::standby::maintain(host.clone());
     crate::gc::periodic(host.clone());
     let peers = Peers::watch(host.clone());
@@ -184,8 +186,7 @@ enum Admission {
 /// up no other), published as each finishes: at start, every `PEER_REFRESH`,
 /// and when a request finds a name it has no addresses for, but at most every
 /// `LOOKUP_EVERY` per name; a name that fails to resolve keeps the addresses it
-/// last had. Requests go by host.json as it is now (`flexvm config --peer`
-/// reaches a running listener): an address given as such needs no lookup, and
+/// last had. Requests go by host.json as it is now: an address given as such needs no lookup, and
 /// a name no longer configured counts for nothing, whatever a refresh still
 /// holds for it.
 #[derive(Clone, Default)]
@@ -512,7 +513,7 @@ fn migration(host: &Host, req: &Value) -> Result<Value> {
         return Ok(json!({"done": true}));
     }
     let outcome = host.mig_status(mig)?;
-    Ok(json!({"outcome": outcome, "underlay": host.cfg.underlay().map(|u| u.to_string())}))
+    Ok(json!({"outcome": outcome, "underlay": host.config_now().underlay().map(|u| u.to_string())}))
 }
 
 fn lend(host: &Host, req: &Value) -> Result<Value> {

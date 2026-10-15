@@ -55,13 +55,11 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
   flexvm migrate NAME HOST:PORT      live-migrate a VM to the host listening there
   flexvm reclaim IP [--force]        take back an address lent out with a VM that migrated away,
                                      once its target is gone for good (without --force: say what)
-  flexvm listen [ADDR] [--peer HOST:PORT]... [--vm-ips CIDR|FIRST-LAST] [--underlay IP]
-                [--announce-dev IFACE] [--dns IP] [--reserve MIB] [--evict-at MIB] [--prefix P]
-                                     configure this host and take migrations from peers
-  flexvm config [--peer HOST:PORT]... [--vm-ips ...] [--underlay IP] [--announce-dev IFACE] [--dns IP]
-                [--reserve MIB] [--evict-at MIB] [--prefix P]
-                                     configure this host without a listener (no flags: show it);
-                                     --peer replaces the list, an empty value unsets a setting
+  flexvm config [--peer HOST:PORT]... [--vm-ips CIDR|FIRST-LAST] [--dns IP] [--underlay IP]
+                [--announce-dev IFACE|none] [--reserve MIB] [--evict-at MIB]
+                                     set this host's settings, live (no flags: show them and what is
+                                     derived for those unset); --peer replaces the list, '' unsets
+  flexvm listen [ADDR]               take migrations from peers on ADDR
   flexvm standby [--template T] [N]  keep N VMs restored and paused, so run takes ~5 ms (no N: show)
   flexvm template NAME [--vcpus N] [--mem MIB] [--max MIB] [--plug MIB] [--image REF ...]
                                      build a template (see README)
@@ -88,7 +86,6 @@ const VALUE_FLAGS: &[&str] = &[
     "dns",
     "reserve",
     "evict-at",
-    "prefix",
     "vcpus",
     "mem",
     "max",
@@ -266,7 +263,7 @@ const COMMANDS: &[(&str, usize, &[&str])] = &[
     ("restore", 2, &["name", "ip", "paused", "detach"]),
     ("migrate", 3, &[]),
     ("reclaim", 2, &["force"]),
-    ("listen", 2, CONFIG_FLAGS),
+    ("listen", 2, &[]),
     ("config", 1, CONFIG_FLAGS),
     ("standby", 2, &["template"]),
     ("template", 2, &["vcpus", "mem", "max", "plug", "image", "init"]),
@@ -365,16 +362,17 @@ fn real_main(args: &Args) -> Result<()> {
             // Before any thread that would take these signals is started.
             util::on_signal(&[libc::SIGTERM, libc::SIGINT, libc::SIGHUP], |sig| util::raise_signal(sig));
             let mut host = open_host(args)?;
-            let listener = configure_listener(&mut host, args, pos.get(1).copied(), listen::activated())?;
+            let listener = configure_listener(&mut host, pos.get(1).copied(), listen::activated())?;
             listen::main(host, listener)
         }
         Some("config") => {
             let mut host = open_host(args)?;
-            // A prefix change is refused while any VM process or tap may use the old one (`Host::configure`).
             if CONFIG_FLAGS.iter().any(|f| args.has(f)) {
-                host.configure(|c| configure(c, args, None))?;
+                host.configure(|c| configure(c, args))?;
             }
-            print(serde_json::to_value(&host.cfg)?)
+            let c = &host.cfg;
+            let derived = json!({"prefix": host.tap_prefix(), "underlay": c.underlay(), "announce_dev": c.announce_dev(), "reserve_mib": c.reserve(), "evict_at_mib": c.evict_at()});
+            print(json!({"set": c, "derived": derived}))
         }
         Some("standby") if name.is_empty() => print(standby::show(&open_host(args)?)),
         Some("standby") => {
@@ -408,10 +406,12 @@ fn real_main(args: &Args) -> Result<()> {
 }
 
 /// Bind and validate before publishing any host configuration.
-fn configure_listener(host: &mut Host, args: &Args, addr: Option<&str>, activated: Option<std::net::TcpListener>) -> Result<std::net::TcpListener> {
+fn configure_listener(host: &mut Host, addr: Option<&str>, activated: Option<std::net::TcpListener>) -> Result<std::net::TcpListener> {
     let mut listener = None;
     host.configure(|c| {
-        configure(c, args, addr)?;
+        if let Some(a) = addr {
+            c.listen = Some(a.into());
+        }
         let bound = match activated {
             // Without ADDR, an activated socket says where this host listens.
             Some(l) => {
@@ -432,16 +432,13 @@ fn configure_listener(host: &mut Host, args: &Args, addr: Option<&str>, activate
     Ok(listener.unwrap())
 }
 
-/// What `configure` sets, besides the listen address.
-const CONFIG_FLAGS: &[&str] = &["peer", "vm-ips", "underlay", "announce-dev", "dns", "reserve", "evict-at", "prefix"];
+/// What `configure` sets.
+const CONFIG_FLAGS: &[&str] = &["peer", "vm-ips", "underlay", "announce-dev", "dns", "reserve", "evict-at"];
 
-/// Flags not given keep their configured values; an empty --underlay,
-/// --announce-dev, --dns or --evict-at unsets it. --peers replace the list
-/// (`--peer ''` empties it).
-fn configure(c: &mut host::Config, args: &Args, addr: Option<&str>) -> Result<()> {
-    if let Some(a) = addr {
-        c.listen = Some(a.into());
-    }
+/// Flags not given keep their configured values; an empty one unsets it
+/// (derived again where used). --peers replace the list (`--peer ''` empties
+/// it); `--announce-dev none` turns announcements off.
+fn configure(c: &mut host::Config, args: &Args) -> Result<()> {
     if args.has("peer") {
         c.peers = args.all("peer").into_iter().filter(|p| !p.is_empty()).collect();
         if let Some(p) = c.peers.iter().find(|p| !host::is_endpoint(p)) {
@@ -456,7 +453,7 @@ fn configure(c: &mut host::Config, args: &Args, addr: Option<&str>) -> Result<()
         c.underlay = (!u.is_empty()).then(|| u.parse()).transpose().map_err(|_| format!("bad --underlay {u:?}"))?;
     }
     if let Some(d) = args.get("announce-dev") {
-        if !d.is_empty() {
+        if !d.is_empty() && d != "none" {
             net::ifindex(d)?;
         }
         c.announce_dev = (!d.is_empty()).then(|| d.into());
@@ -464,19 +461,16 @@ fn configure(c: &mut host::Config, args: &Args, addr: Option<&str>) -> Result<()
     if let Some(d) = args.get("dns") {
         c.dns = (!d.is_empty()).then(|| d.parse::<std::net::IpAddr>().map(|_| d.into())).transpose().map_err(|_| format!("bad --dns {d:?}"))?;
     }
-    c.reserve_mib = args.parse_or("reserve", c.reserve_mib)?;
-    if args.has("evict-at") {
-        c.evict_mib = (args.get("evict-at") != Some("")).then(|| args.parse_or("evict-at", 0)).transpose()?;
+    for (flag, v) in [("reserve", &mut c.reserve_mib), ("evict-at", &mut c.evict_mib)] {
+        if args.has(flag) {
+            *v = (args.get(flag) != Some("")).then(|| args.parse_or(flag, 0)).transpose()?;
+        }
     }
-    if let Some(e) = c.evict_mib.filter(|&e| e < c.reserve_mib) {
-        crate::log!("flexvm: the eviction mark {e} MiB is under the {} MiB reserve: eviction starts at the reserve", c.reserve_mib);
+    if let Some(e) = c.evict_mib.filter(|&e| e < c.reserve()) {
+        crate::log!("flexvm: the eviction mark {e} MiB is under the {} MiB reserve: eviction starts at the reserve", c.reserve());
     }
     if !c.peers.is_empty() && c.vm_ips == host::Config::default().vm_ips {
         crate::log!("flexvm: warning: --vm-ips is the default {}; each peer needs a range of its own", c.vm_ips);
-    }
-    if let Some(p) = args.get("prefix") {
-        host::check_prefix(p).map_err(|e| format!("--prefix: {e}"))?;
-        c.prefix = p.into();
     }
     Ok(())
 }
@@ -732,18 +726,12 @@ fn build_template(args: &Args, name: &str) -> Result<()> {
         .transpose()?;
     let max = args.parse_or("max", proc_kb("/proc/meminfo", "MemTotal").unwrap_or(0) >> 20)?;
     let (mem, plug) = (args.parse_or("mem", template::base_mib(max))?, args.parse_or("plug", template::PLUG_MIB)?);
-    // Named and made under the host lock, so a prefix change sees it (`Host::prefix_in_use`).
     let host = open_host(args)?;
     let me = host::Ident::me();
-    // Unlocked, as these are this host's taps of dead processes (by their alias).
     host::clear_taps(&host.run, &me);
-    let tap = {
-        let _l = host.lock()?;
-        let tap = template::tap(&host.tap_prefix()?);
-        let root = if unsafe { libc::geteuid() } == 0 { "" } else { " (run flexvm as root)" };
-        net::create_tap(&tap, &host::tap_alias(&host.run, &me)).map_err(|e| format!("{e}{root}"))?;
-        tap
-    };
+    let tap = template::tap(&host.tap_prefix());
+    let root = if unsafe { libc::geteuid() } == 0 { "" } else { " (run flexvm as root)" };
+    net::create_tap(&tap, &host::tap_alias(&host.run, &me)).map_err(|e| format!("{e}{root}"))?;
     template::create(&paths, name, cpus, mem, max, plug, image, &tap)
 }
 
@@ -1012,7 +1000,7 @@ mod exec_tests {
         host.configure(|_| Ok(())).unwrap();
         let before = std::fs::read(host.state.join("host.json")).unwrap();
         let args = parse(&["--announce-dev", "flexvm-no-such-interface"]);
-        assert!(host.configure(|c| configure(c, &args, None)).is_err());
+        assert!(host.configure(|c| configure(c, &args)).is_err());
         assert_eq!(std::fs::read(host.state.join("host.json")).unwrap(), before);
         assert!(host.cfg.announce_dev.is_none());
     }
@@ -1104,11 +1092,13 @@ mod exec_tests {
         assert!(err(&["restore", "/d", "--template", "t"]).is_some());
         assert!(err(&["kill", "web", "--", "x"]).is_some());
         assert_eq!(err(&["template", "t", "--warm"]).unwrap(), "--warm needs --image");
+        assert_eq!(err(&["listen", "1.2.3.4:7070", "--peer", "a:1"]).unwrap(), "--peer does not apply to listen (see flexvm --help)");
         for ok in [
             &["--state", "/s", "run", "web", "--template", "t", "-d", "--", "make", "test"][..],
             &["exec", "web", "ls", "-l"],
             &["template", "t", "--image", "busybox", "--warm", "--ready-port", "80"],
-            &["listen", "1.2.3.4:7070", "--peer", "a:1", "--evict-at", ""],
+            &["listen", "1.2.3.4:7070"],
+            &["config", "--peer", "a:1", "--evict-at", ""],
             &["config"],
             &["restore", "/d", "--ip", "auto", "--paused"],
         ] {
@@ -1125,11 +1115,16 @@ mod exec_tests {
             assert!(!host::is_endpoint(bad), "{bad}");
         }
         let mut c = host::Config::default();
-        assert!(configure(&mut c, &parse(&["--peer", "192.168.1.11"]), None).is_err());
-        configure(&mut c, &parse(&["--peer", "a:1", "--peer", "b:2", "--evict-at", "5000"]), None).unwrap();
-        assert_eq!((c.peers.len(), c.evict_mib), (2, Some(5000)));
-        configure(&mut c, &parse(&["--peer", "", "--evict-at", ""]), None).unwrap();
-        assert!(c.peers.is_empty() && c.evict_mib.is_none());
+        assert!(configure(&mut c, &parse(&["--peer", "192.168.1.11"])).is_err());
+        configure(&mut c, &parse(&["--peer", "a:1", "--peer", "b:2", "--evict-at", "5000", "--reserve", "300", "--announce-dev", "none"])).unwrap();
+        assert_eq!((c.peers.len(), c.evict_mib, c.reserve_mib), (2, Some(5000), Some(300)));
+        // `none`: no announcements, whatever would be derived.
+        assert_eq!((c.announce_dev.as_deref(), c.announce_dev()), (Some("none"), None));
+        configure(&mut c, &parse(&["--vm-ips", "10.9.0.0/24"])).unwrap();
+        assert_eq!((c.peers.len(), c.reserve_mib), (2, Some(300)), "flags not given are kept");
+        configure(&mut c, &parse(&["--peer", "", "--evict-at", "", "--reserve", "", "--announce-dev", ""])).unwrap();
+        assert!(c.peers.is_empty() && c.evict_mib.is_none() && c.reserve_mib.is_none() && c.announce_dev.is_none());
+        assert_eq!(c.reserve(), host::default_reserve());
     }
 
     #[test]
@@ -1138,36 +1133,40 @@ mod exec_tests {
         let root = crate::test_util::TempDir::new("listen-config");
         let mut host = Host::open(&root.join("state"), &root.join("run")).unwrap();
         host.configure(|c| {
-            c.reserve_mib = 321;
+            c.reserve_mib = Some(321);
             Ok(())
         })
         .unwrap();
         let before = std::fs::read(host.state.join("host.json")).unwrap();
         let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = occupied.local_addr().unwrap().to_string();
-        let args = parse(&["--reserve", "456"]);
-        assert!(configure_listener(&mut host, &args, Some(&addr), None).is_err());
+        assert!(configure_listener(&mut host, Some(&addr), None).is_err());
         assert_eq!(std::fs::read(host.state.join("host.json")).unwrap(), before);
-        assert_eq!(host.cfg.reserve_mib, 321);
-        let bad_dev = parse(&["--announce-dev", "flexvm-no-such-interface"]);
-        assert!(configure_listener(&mut host, &bad_dev, None, Some(TcpListener::bind("127.0.0.1:0").unwrap())).is_err());
-        assert_eq!(std::fs::read(host.state.join("host.json")).unwrap(), before);
-        assert!(host.cfg.announce_dev.is_none());
-        // An activated socket supplies the endpoint even without ADDR.
-        let listener = configure_listener(&mut host, &args, None, Some(occupied)).unwrap();
+        // An activated socket supplies the endpoint even without ADDR; the settings stay.
+        let listener = configure_listener(&mut host, None, Some(occupied)).unwrap();
         let saved = Host::open(&host.state, &host.run).unwrap();
         assert_eq!(saved.cfg.listen.as_deref(), Some(addr.as_str()));
         assert_eq!(saved.cfg.advertise().unwrap().as_deref(), Some(addr.as_str()));
         assert_eq!(saved.cfg.underlay(), Some("127.0.0.1".parse().unwrap()));
-        assert_eq!(saved.cfg.reserve_mib, 456);
+        assert_eq!(saved.cfg.reserve_mib, Some(321));
         drop(listener);
+        // A wildcard one's underlay is derived: loopback with no peers elsewhere, and
+        // none with one whose address is unknown (never loopback): refused.
+        let wildcard = TcpListener::bind("0.0.0.0:0").unwrap();
+        let port = wildcard.local_addr().unwrap().port();
+        drop(configure_listener(&mut host, None, Some(wildcard)).unwrap());
+        assert_eq!(host.cfg.advertise().unwrap(), Some(format!("127.0.0.1:{port}")));
+        host.configure(|c| configure(c, &parse(&["--peer", "flexvm-no-such-host.invalid:7070"]))).unwrap();
         let before = std::fs::read(host.state.join("host.json")).unwrap();
         let wildcard = TcpListener::bind("0.0.0.0:0").unwrap();
-        assert!(configure_listener(&mut host, &args, None, Some(wildcard)).is_err());
+        assert!(configure_listener(&mut host, None, Some(wildcard)).unwrap_err().to_string().contains("--underlay"));
         assert_eq!(std::fs::read(host.state.join("host.json")).unwrap(), before);
+        // An IPv6 listener needs no IPv4 underlay.
+        if let Ok(v6) = TcpListener::bind("[::1]:0") {
+            drop(configure_listener(&mut host, None, Some(v6)).unwrap());
+        }
         // Port 0 binds, but peers could not be told the port.
-        assert!(configure_listener(&mut host, &args, Some("127.0.0.1:0"), None).is_err());
-        assert_eq!(std::fs::read(host.state.join("host.json")).unwrap(), before);
+        assert!(configure_listener(&mut host, Some("127.0.0.1:0"), None).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 

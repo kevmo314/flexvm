@@ -456,6 +456,47 @@ pub fn is_local_addr(ip: Ipv4Addr) -> Result<bool> {
     Ok(local.1.contains(&ip))
 }
 
+/// The kernel's route toward `to`, as `ip route get` reads it (policy routing
+/// included): its output device and the source address it would use.
+pub fn route_get(to: Ipv4Addr) -> Result<(String, Ipv4Addr)> {
+    let sock = socket(libc::AF_NETLINK, libc::SOCK_RAW, libc::NETLINK_ROUTE, "netlink socket")?;
+    // struct rtmsg: family, dst_len 32, the rest 0.
+    let mut msg = vec![libc::AF_INET as u8, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    attr(&mut msg, RTA_DST, &to.octets());
+    let mut buf = [0u8; 4096];
+    let reply = exchange(&sock, libc::RTM_GETROUTE, 0, &msg, &mut buf).map_err(|_| format!("no route toward {to}: netlink failed"))?;
+    let (oif, src) = parse_route(reply).ok_or_else(|| format!("no route toward {to}"))?;
+    let mut name = [0 as libc::c_char; libc::IFNAMSIZ];
+    if unsafe { libc::if_indextoname(oif, name.as_mut_ptr()) }.is_null() {
+        bail!("the route toward {to}: interface {oif}: {}", std::io::Error::last_os_error());
+    }
+    Ok((unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }.to_string_lossy().into_owned(), src))
+}
+
+/// A route reply's (RTM_NEWROUTE) output interface and preferred source; None for an error.
+fn parse_route(reply: &[u8]) -> Option<(u32, Ipv4Addr)> {
+    if reply.len() < 28 || u16::from_ne_bytes([reply[4], reply[5]]) != RTM_NEWROUTE {
+        return None;
+    }
+    let end = (u32::from_ne_bytes(reply[..4].try_into().ok()?) as usize).min(reply.len());
+    // After nlmsghdr (16) and rtmsg (12): attributes (length, type, data, padded to 4).
+    let (mut at, mut oif, mut src) = (28, None, None);
+    while at + 4 <= end {
+        let len = u16::from_ne_bytes([reply[at], reply[at + 1]]) as usize;
+        if len < 4 || at + len > end {
+            return None;
+        }
+        let data: Option<[u8; 4]> = reply[at + 4..at + len].try_into().ok();
+        match u16::from_ne_bytes([reply[at + 2], reply[at + 3]]) {
+            RTA_OIF => oif = data.map(u32::from_ne_bytes),
+            libc::RTA_PREFSRC => src = data.map(Ipv4Addr::from),
+            _ => {}
+        }
+        at += len.next_multiple_of(4);
+    }
+    Some((oif?, src?))
+}
+
 /// Hosts sharing a netns share routes: never replace the target's tap route with one via us.
 pub fn route_via(ip: Ipv4Addr, via: Ipv4Addr) -> Result<()> {
     // Not knowing is no reason to leave a peer's VM unrouted.
@@ -571,6 +612,17 @@ pub fn parse_mac(s: &str) -> Result<[u8; 6]> {
 pub fn conf(family: &str, dev: &str, key: &str, value: &str) -> Result<()> {
     std::fs::write(format!("/proc/sys/net/{family}/conf/{dev}/{key}"), value).map_err(|e| format!("{family} {key} of {dev}: {e}"))?;
     Ok(())
+}
+
+/// Proxy ARP on an announce device, once per device this process adopts (a
+/// derived one follows the routes); a failure is logged once.
+pub fn proxy_arp(dev: &str) {
+    static ON: std::sync::Mutex<std::collections::BTreeSet<String>> = std::sync::Mutex::new(std::collections::BTreeSet::new());
+    if ON.lock().unwrap().insert(dev.into()) {
+        if let Err(e) = conf("ipv4", dev, "proxy_arp", "1") {
+            crate::log!("WARNING: proxy ARP on {dev}: {e}");
+        }
+    }
 }
 
 pub fn ip_forward() -> Result<()> {
@@ -703,6 +755,41 @@ mod tests {
                      eth0\t00000000\t0101A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0\n\
                      eth0\t0001A8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n";
         assert_eq!(gateways(table), [Ipv4Addr::new(192, 168, 1, 1)]);
+    }
+
+    #[test]
+    fn a_route_reply_gives_its_device_and_source() {
+        let reply = |kind: u16, attrs: &[(u16, &[u8])]| {
+            let mut m = vec![0u8; 16];
+            m[4..6].copy_from_slice(&kind.to_ne_bytes());
+            m.extend_from_slice(&[libc::AF_INET as u8, 32, 0, 0, 254, 2, 0, 1, 0, 0, 0, 0]);
+            for (k, d) in attrs {
+                attr(&mut m, *k, d);
+            }
+            let len = m.len() as u32;
+            m[..4].copy_from_slice(&len.to_ne_bytes());
+            m
+        };
+        let (dst, src, gw) = ([100u8, 64, 0, 7], [100u8, 101, 9, 2], [192u8, 168, 1, 1]);
+        let full = reply(
+            RTM_NEWROUTE,
+            &[(RTA_DST, &dst), (libc::RTA_TABLE, &52u32.to_ne_bytes()), (libc::RTA_PREFSRC, &src), (RTA_GATEWAY, &gw), (RTA_OIF, &9u32.to_ne_bytes())],
+        );
+        assert_eq!(parse_route(&full), Some((9, Ipv4Addr::from(src))));
+        // Trailing bytes past the message are not read as attributes.
+        assert_eq!(parse_route(&[&full[..], &[8, 0, 4, 0, 1, 0, 0, 0]].concat()), Some((9, Ipv4Addr::from(src))));
+        assert_eq!(parse_route(&reply(RTM_NEWROUTE, &[(RTA_OIF, &9u32.to_ne_bytes())])), None, "no source");
+        assert_eq!(parse_route(&reply(RTM_NEWROUTE, &[(libc::RTA_PREFSRC, &src)])), None, "no device");
+        assert_eq!(parse_route(&reply(NLMSG_ERROR as u16, &[])), None, "an error");
+        let mut bad = full.clone();
+        bad[28] = 200;
+        assert_eq!(parse_route(&bad), None, "an attribute past the end");
+    }
+
+    #[test]
+    fn the_kernel_names_the_route_toward_loopback() {
+        let (dev, src) = route_get(Ipv4Addr::LOCALHOST).unwrap();
+        assert!(!dev.is_empty() && src == Ipv4Addr::LOCALHOST, "{dev} {src}");
     }
 
     #[test]

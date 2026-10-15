@@ -92,8 +92,6 @@ pub struct Proc {
     pub host: Host,
     pub paths: Paths,
     pub spawner: Spawner,
-    /// The tap prefix, as read once the work directory was there (`Host::tap_prefix`).
-    prefix: String,
     ident: Ident,
     name: Mutex<Option<NameLock>>,
     addr: Mutex<Option<AddrClaim>>,
@@ -202,17 +200,10 @@ impl Proc {
             crate::host::reap(&host.run, &old)?;
         }
         let _ = std::fs::remove_dir_all(&work);
-        // The work directory, then the prefix, under the host lock: a prefix
-        // change either sees this process or is what it reads (`Host::prefix_in_use`).
-        let prefix = {
-            let _l = host.lock()?;
-            std::fs::create_dir_all(&work)?;
-            crate::host::store(&work.join("owner"), &ident, false)?;
-            host.tap_prefix()?
-        };
-        // Unlocked: our work directory holds the prefix, and no sweep frees them while we live.
+        std::fs::create_dir_all(&work)?;
+        crate::host::store(&work.join("owner"), &ident, false)?;
         crate::host::clear_taps(&host.run, &ident);
-        let tap_prefix = format!("{prefix}{:x}t", ident.pid);
+        let tap_prefix = format!("{}{:x}t", host.tap_prefix(), ident.pid);
         let tap_owner = crate::host::tap_alias(&host.run, &ident);
         let spawner = Spawner::new(&paths.firecracker, &work, crate::socket::SocketRoot::new(&work)?, cgroup_root(), &tap_prefix, &tap_owner);
         // Before any guest runs: without it no route reaches the peers.
@@ -227,7 +218,6 @@ impl Proc {
             host,
             paths,
             spawner,
-            prefix,
             ident,
             name: Mutex::new(None),
             addr: Mutex::new(None),
@@ -532,7 +522,7 @@ impl Proc {
     pub fn holder(&self) -> Option<&Arc<Holder>> {
         self.holder
             .get_or_init(|| {
-                Holder::new(&format!("{}{:x}h", self.prefix, self.ident.pid)).unwrap_or_else(|e| {
+                Holder::new(&format!("{}{:x}h", self.host.tap_prefix(), self.ident.pid)).unwrap_or_else(|e| {
                     crate::log!("packets in flight while the vm is paused will be dropped: {e}");
                     None
                 })
@@ -768,11 +758,15 @@ impl Proc {
 
     pub fn announce(&self) {
         let vm = self.vm().clone();
-        let peers = self.host.config_now().peers;
-        let (ip, gen, rev, dev) = (vm.ip, self.gen(), self.rev(), self.host.cfg.announce_dev.clone());
-        let Some(via) = self.host.cfg.underlay() else {
+        // One snapshot of the settings as they are now, derived ones included.
+        let cfg = self.host.config_now();
+        let (ip, gen, rev, dev, peers) = (vm.ip, self.gen(), self.rev(), cfg.announce_dev(), cfg.peers.clone());
+        if let Some(dev) = &dev {
+            crate::net::proxy_arp(dev);
+        }
+        let Some(via) = cfg.underlay() else {
             if !peers.is_empty() {
-                crate::log!("announce {ip}: no underlay address (give flexvm listen an ADDR peers can reach, or --underlay IP); peers not told");
+                crate::log!("announce {ip}: no underlay address (give flexvm listen an ADDR peers can reach, or flexvm config --underlay IP); peers not told");
             }
             return;
         };
@@ -1240,6 +1234,10 @@ impl Proc {
                 self.publish();
             }
             relieve(&self.host, host_available_mib(), vm.starving(), &mut stopping);
+            // A derived announce device follows the routes (one that changed gets proxy ARP).
+            if let Some(dev) = self.host.config_now().announce_dev() {
+                crate::net::proxy_arp(&dev);
+            }
         }
     }
 
@@ -1538,10 +1536,8 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
     let signals = crate::util::block_signals(&SIGNALS);
     crate::util::output::guard()?;
     let _ = crate::net::ip_forward();
-    if let Some(dev) = &host.cfg.announce_dev {
-        if let Err(e) = crate::net::conf("ipv4", dev, "proxy_arp", "1") {
-            crate::log!("WARNING: proxy ARP on {dev}: {e}");
-        }
+    if let Some(dev) = &host.cfg.announce_dev() {
+        crate::net::proxy_arp(dev);
     }
     let p = Proc::new(host, paths)?;
     let host = p.host.clone();
@@ -1965,7 +1961,7 @@ fn relieve(host: &Host, avail: Option<u64>, starved_here: bool, stopping: &mut O
         return;
     };
     let cfg = host.config_now();
-    let (reserve, at, until) = (cfg.reserve_mib, cfg.evict_at(), cfg.evict_until());
+    let (reserve, at, until) = (cfg.reserve(), cfg.evict_at(), cfg.evict_until());
     // Standby VMs go under the reserve whatever eviction is doing (a slow migration holds its lock).
     if avail >= reserve {
         *stopping = None;
@@ -2678,7 +2674,7 @@ mod tests {
     fn unreadable_meminfo_relieves_nothing() {
         let base = crate::test_util::TempDir::new("relieve");
         let mut host = Host::open(&base.join("state"), &base.join("run")).unwrap();
-        host.cfg.reserve_mib = 1024;
+        host.cfg.reserve_mib = Some(1024);
         host.cfg.peers = vec!["127.0.0.1:1".into()];
         // A standby of template t: its lock held, naming a live process.
         // Stopped by SIGUSR1's default action, which an ignored or blocked SIGUSR1 inherited from here would defeat.
@@ -2831,9 +2827,9 @@ mod tests {
 
     #[test]
     fn eviction_starts_at_its_high_water_mark_and_stops_above_it() {
-        let mut c = crate::host::Config::default();
-        assert_eq!((c.reserve_mib, c.evict_at(), c.evict_until()), (1024, 2048, 2560));
-        c.reserve_mib = 256;
+        let mut c = crate::host::Config { reserve_mib: Some(1024), ..Default::default() };
+        assert_eq!((c.evict_at(), c.evict_until()), (2048, 2560));
+        c.reserve_mib = Some(256);
         assert_eq!((c.evict_at(), c.evict_until()), (768, 1024));
         c.evict_mib = Some(5000);
         assert_eq!((c.evict_at(), c.evict_until()), (5000, 7372));
