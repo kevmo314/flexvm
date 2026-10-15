@@ -1706,7 +1706,7 @@ def reconcile_kill():
         check(f"{what}: the outcome is owed", len(owed(A)) == 1, owed(A))
         r2 = run(A, n + "-again", ip=ip)
         check(f"{what}: the address is not handed out here meanwhile", not r2["ok"] and "lent" in r2["error"], r2)
-        return ip, gen, m
+        return ip, gen, m, (owed(A) or [None])[0]
 
     # The target still pulls when the source is killed: it cannot finish, and the outcome is aborted.
     for sig in (signal.SIGINT, signal.SIGQUIT):
@@ -1714,7 +1714,7 @@ def reconcile_kill():
         got = unknown_then_kill(n, sig, True, refuse_first=sig == signal.SIGINT)
         if not got:
             continue
-        ip, gen, _ = got
+        ip, gen, _, mig = got
         what = f"reconcile kill ({n})"
         fault(B, "status", 0)
         fault(A, "pages_slow", 0)
@@ -1734,7 +1734,7 @@ def reconcile_kill():
     what = f"reconcile kill ({n})"
     got = unknown_then_kill(n, signal.SIGINT, True, use_cli=True)
     if got:
-        ip, gen, _ = got
+        ip, gen, _, mig = got
         os.kill(json.load(open(os.path.join(B.run, "vms", f"{n}.lock")))["pid"], signal.SIGKILL)
         cli(A, "debug", "gc")
         check(f"{what}: unsettled while the target cannot say", len(owed(A)) == 1 and addr(A, ip).get("lent") == gen, (owed(A), addr(A, ip)))
@@ -1751,6 +1751,12 @@ def reconcile_kill():
         r2 = run(A, n + "-again", ip=ip)
         check(f"{what}: the address runs again on A", r2["ok"] and addr(A, ip).get("seen", 0) > gen, (r2, addr(A, ip)))
         kill(A, n + "-again")
+        # Nothing asks B about it any more (the owed record went with the reclaim): B's record of its
+        # dead arrival reads aborted when asked (here, or by its own retirement), and goes then.
+        fault(B, "status", 0)
+        st = peer(B, {"op": "migration", "mig": int(mig)}) if mig else {}
+        check(f"{what}: B's record of the lost arrival reads aborted, and goes",
+              st.get("result", {}).get("outcome") == "aborted" and mig not in os.listdir(os.path.join(B.state, "migs")), (st, mig))
     fault(B, "status", 0)
     fault(A, "pages_slow", 0)
     kill(B, n)
@@ -1793,12 +1799,13 @@ def reconcile_kill():
     got = unknown_then_kill(n, signal.SIGINT, False)
     if not got:
         return
-    ip, gen, m = got
+    ip, gen, m, mig = got
     check(f"{what}: the VM runs on at B, md5 intact", where(n) == {B: "running"} and md5(B, n) == m, where(n))
     fault(B, "status", 0)
     check(f"{what}: gc settles it as B's", wait_for(lambda: cli(A, "debug", "gc")[0] == 0 and not owed(A), 30), owed(A))
     migs = os.path.join(B.state, "migs")
-    check(f"{what}: B was told done, no record left", wait_for(lambda: not os.listdir(migs), 10), os.listdir(migs))
+    # Its own record: B's others (an earlier case's) go by their own retirement.
+    check(f"{what}: B was told done, its record gone", mig is not None and wait_for(lambda: mig not in os.listdir(migs), 10), (mig, os.listdir(migs)))
     check(f"{what}: still lent to B", addr(A, ip).get("lent") == gen and not addr(A, ip).get("withdrawn"), addr(A, ip))
     r2 = run(A, n + "-again", ip=ip)
     check(f"{what}: still not handed out here", not r2["ok"] and "lent" in r2["error"], r2)
