@@ -46,6 +46,13 @@ fn step(mib: u64) -> u64 {
     (mib / 4).clamp(256, 2048).div_ceil(STEP_MIB) * STEP_MIB
 }
 
+#[derive(Debug, PartialEq)]
+enum Growth {
+    Raised,
+    Idle,
+    Refused,
+}
+
 #[derive(Default)]
 struct Mark {
     /// MiB; 0 until the VM starts.
@@ -91,12 +98,10 @@ impl Limit {
 
     /// Once the VM runs here: what its start was admitted (MiB), up to the
     /// guest's size. Above it from the start, the VM is throttled until a
-    /// step is admitted. The cgroup may still be being made (`Spawner::take`).
+    /// step is admitted. Start paths have already joined the cgroup.
     pub fn start(&self, admitted: u64, cap: u64) {
-        let Some(cg) = &self.cgroup else { return };
-        let made = Instant::now();
-        while !cg.join("memory.high").exists() && made.elapsed() < Duration::from_secs(2) {
-            std::thread::sleep(Duration::from_millis(5));
+        if self.cgroup.is_none() {
+            return;
         }
         let mut m = self.mark.lock().unwrap();
         m.cap = cap;
@@ -104,11 +109,19 @@ impl Limit {
         self.write(&m);
     }
 
+    fn clear_throttled(&self, growth: Growth) -> Growth {
+        self.throttled.store(false, Ordering::SeqCst);
+        growth
+    }
+
     /// Usage within half a step of the mark: admit a step and raise it.
-    /// False if the host refused (the VM stays throttled).
-    pub fn grow(&self, host: &Host) -> bool {
-        let Some(used) = self.used() else { return true };
-        let more = {
+    fn grow(&self, host: &Host) -> Growth {
+        self.grow_with(host, |more| host.grant(more, None))
+    }
+
+    fn grow_with(&self, host: &Host, grant: impl Fn(u64) -> crate::util::Result<Option<u64>>) -> Growth {
+        let Some(used) = self.used() else { return self.clear_throttled(Growth::Idle) };
+        let mut more = {
             let m = self.mark.lock().unwrap();
             let s = step(m.admitted);
             match m.lifted || m.admitted == 0 || m.admitted >= m.cap || used + s / 2 < m.admitted + overhead(m.admitted) {
@@ -117,20 +130,29 @@ impl Limit {
             }
         };
         if more == 0 {
-            self.throttled.store(false, Ordering::SeqCst);
-            return true;
+            return self.clear_throttled(Growth::Idle);
         }
         // Admitted without `mark` held; another raise meanwhile only adds to it.
-        // An error is no refusal: the mark stays, and the VM is not throttled for it.
-        let id = match host.grant(more, None) {
+        // Retry a refusal once with half a step (admission is in MiB, not hotplug units).
+        let admitted = match grant(more) {
+            Ok(None) if more > 1 => {
+                more /= 2;
+                grant(more)
+            }
+            result => result,
+        };
+        let id = match admitted {
             Ok(Some(id)) => id,
             Ok(None) => {
-                self.throttled.store(true, Ordering::SeqCst);
-                return false;
+                let used = self.used();
+                let m = self.mark.lock().unwrap();
+                self.throttled
+                    .store(!m.lifted && m.admitted > 0 && m.admitted < m.cap && used.is_some_and(|u| u >= m.admitted + overhead(m.admitted)), Ordering::SeqCst);
+                return Growth::Refused;
             }
             Err(e) => {
                 crate::log!("admitting {more} MiB: {e}");
-                return false;
+                return self.clear_throttled(Growth::Refused);
             }
         };
         let mut m = self.mark.lock().unwrap();
@@ -138,13 +160,12 @@ impl Limit {
         if m.lifted {
             drop(m);
             host.refund(id);
-            return true;
+            return self.clear_throttled(Growth::Idle);
         }
         m.admitted = (m.admitted + more).min(m.cap.max(m.admitted));
         self.write(&m);
         drop(m);
-        self.throttled.store(false, Ordering::SeqCst);
-        true
+        self.clear_throttled(Growth::Raised)
     }
 
     /// Before a grow to `cap` MiB, of which `charge` was admitted.
@@ -211,8 +232,8 @@ impl Limit {
                 std::thread::sleep(tick);
                 continue;
             }
-            // Throttling raises an event every 10 ms; refused, no use asking again at each.
-            std::thread::sleep(if self.grow(host) { Duration::from_millis(20) } else { tick });
+            // Only a raised mark needs a quick recheck; idle (including full size) or refused, wait a tick.
+            std::thread::sleep(if self.grow(host) == Growth::Raised { Duration::from_millis(20) } else { tick });
         }
     }
 }
@@ -270,18 +291,18 @@ mod tests {
         l.start(allowance(100), 1000);
         assert_eq!((l.admitted(), high(&cg)), (100 + 256, Some(356 + overhead(356))));
         // Far from the mark: nothing; near it, a step more.
-        assert!(l.grow(&host) && l.admitted() == 356);
+        assert!(l.grow(&host) == Growth::Idle && l.admitted() == 356);
         set(&cg, 356 + overhead(356) - 100);
-        assert!(l.grow(&host) && l.admitted() == 612);
+        assert!(l.grow(&host) == Growth::Raised && l.admitted() == 612);
         // Refused: stays, throttled.
         set(&cg, 612 + overhead(612));
         host.cfg.reserve_mib = u64::MAX / 4;
-        assert!(!l.grow(&host) && l.admitted() == 612 && l.throttled.load(Ordering::SeqCst));
+        assert!(l.grow(&host) == Growth::Refused && l.admitted() == 612 && l.throttled.load(Ordering::SeqCst));
         host.cfg.reserve_mib = 0;
-        assert!(l.grow(&host) && l.admitted() == 868 && !l.throttled.load(Ordering::SeqCst));
+        assert!(l.grow(&host) == Growth::Raised && l.admitted() == 868 && !l.throttled.load(Ordering::SeqCst));
         // Never past the guest's size; a plug raises both by what it was charged.
         set(&cg, 2000);
-        assert!(l.grow(&host) && l.admitted() == 1000);
+        assert!(l.grow(&host) == Growth::Raised && l.admitted() == 1000);
         l.plug(3000, 512);
         assert_eq!((l.admitted(), high(&cg)), (1512, Some(1512 + overhead(1512))));
         // A settled shrink lowers it, never below what is in use.
@@ -297,7 +318,7 @@ mod tests {
         let was = l.admitted();
         set(&cg, was + overhead(was));
         host.cfg.reserve_mib = u64::MAX / 4;
-        assert!(l.grow(&host) && l.admitted() == was && !l.throttled.load(Ordering::SeqCst));
+        assert!(l.grow(&host) == Growth::Idle && l.admitted() == was && !l.throttled.load(Ordering::SeqCst));
         host.cfg.reserve_mib = 0;
         drop(lifted);
         assert_eq!(high(&cg), Some(l.admitted() + overhead(l.admitted())));
@@ -323,7 +344,7 @@ mod tests {
             });
             assert!(rx.recv_timeout(Duration::from_secs(5)).is_ok(), "restore waited for admission");
             drop(held);
-            assert!(grower.join().unwrap());
+            assert_eq!(grower.join().unwrap(), Growth::Raised);
         });
         assert_eq!(l.admitted(), 512 + step(512));
     }
@@ -341,13 +362,100 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
             let lifted = l.lift(None);
             drop(held);
-            assert!(grower.join().unwrap());
+            assert_eq!(grower.join().unwrap(), Growth::Idle);
             assert_eq!(l.admitted(), 512);
             let grants: Vec<(u64, u64, u64)> = crate::host::load(&host.grants()).unwrap().unwrap_or_default();
             assert!(grants.is_empty(), "{grants:?}");
             drop(lifted);
         });
         assert_eq!(high(&cg), Some(512 + overhead(512)));
+    }
+
+    #[test]
+    fn refusal_only_throttles_at_or_above_the_mark() {
+        let (l, cg, mut host) = cgroup("refused");
+        host.cfg.reserve_mib = u64::MAX / 4;
+        l.start(4096, 8192);
+        let mark = 4096 + overhead(4096);
+        for (used, throttled) in [(mark - 1, false), (mark, true), (mark + 1, true), (mark - 1, false)] {
+            set(&cg, used);
+            assert_eq!(l.grow(&host), Growth::Refused);
+            assert_eq!(l.admitted(), 4096);
+            assert_eq!(l.throttled.load(Ordering::SeqCst), throttled, "usage {used}, mark {mark}");
+        }
+        // An admission error clears an old refusal rather than reporting starvation.
+        set(&cg, mark);
+        assert_eq!(l.grow(&host), Growth::Refused);
+        assert!(l.throttled.load(Ordering::SeqCst));
+        assert_eq!(l.grow_with(&host, |_| Err("admission failed".into())), Growth::Refused);
+        assert!(!l.throttled.load(Ordering::SeqCst));
+        std::fs::remove_dir_all(cg.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_refused_step_is_retried_once_at_a_smaller_size() {
+        let (l, cg, host) = cgroup("retry");
+        l.start(4096, 8192);
+        set(&cg, 4096 + overhead(4096));
+        let asks = std::cell::RefCell::new(Vec::new());
+        assert_eq!(
+            l.grow_with(&host, |more| {
+                asks.borrow_mut().push(more);
+                Ok((more == 512).then_some(1))
+            }),
+            Growth::Raised
+        );
+        assert_eq!(*asks.borrow(), [1024, 512]);
+        assert_eq!(l.admitted(), 4608);
+        assert_eq!(high(&cg), Some(4608 + overhead(4608)));
+        assert!(!l.throttled.load(Ordering::SeqCst));
+        set(&cg, 4608 + overhead(4608));
+        asks.borrow_mut().clear();
+        assert_eq!(
+            l.grow_with(&host, |more| {
+                asks.borrow_mut().push(more);
+                Ok(None)
+            }),
+            Growth::Refused
+        );
+        assert_eq!(*asks.borrow(), [1152, 576]);
+        assert!(l.throttled.load(Ordering::SeqCst));
+        // Even the final hotplug unit can be admitted in smaller pieces.
+        l.start(8192 - STEP_MIB, 8192);
+        set(&cg, 8192);
+        asks.borrow_mut().clear();
+        assert_eq!(
+            l.grow_with(&host, |more| {
+                asks.borrow_mut().push(more);
+                Ok(None)
+            }),
+            Growth::Refused
+        );
+        assert_eq!(*asks.borrow(), [STEP_MIB, STEP_MIB / 2]);
+        // A single MiB has no smaller positive admission to retry.
+        l.start(8191, 8192);
+        set(&cg, 8192);
+        asks.borrow_mut().clear();
+        assert_eq!(
+            l.grow_with(&host, |more| {
+                asks.borrow_mut().push(more);
+                Ok(None)
+            }),
+            Growth::Refused
+        );
+        assert_eq!(*asks.borrow(), [1]);
+        std::fs::remove_dir_all(cg.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn full_size_is_idle_even_above_the_mark() {
+        let (l, cg, host) = cgroup("full");
+        l.start(4096, 4096);
+        set(&cg, 5000);
+        l.throttled.store(true, Ordering::SeqCst);
+        assert_eq!(l.grow_with(&host, |_| panic!("full VM requested a grant")), Growth::Idle);
+        assert!(!l.throttled.load(Ordering::SeqCst));
+        std::fs::remove_dir_all(cg.parent().unwrap()).unwrap();
     }
 
     #[test]

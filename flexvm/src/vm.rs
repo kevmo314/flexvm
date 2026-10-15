@@ -1056,8 +1056,6 @@ impl Prepared {
                 }
             };
             let fc = self.firecracker();
-            // Its cgroup move is waited for within the deadline.
-            fc.join_cgroup();
             let tap = fc.tap.clone();
             let route = self.route.then(|| std::thread::spawn(move || crate::net::attach(ip, &tap)));
             let loaded = fc.load_snapshot(&path, &fc.tap, Some(clock_realtime), left(API_TIMEOUT));

@@ -398,11 +398,10 @@ impl Spawner {
                 // checkpoint's lift waits out), not paged out to swap, whose reads would hold
                 // up its pauses. Without swap accounting the file is missing: nothing to do.
                 let joined = std::fs::create_dir(&cg).and_then(|()| {
-                    if let Err(e) = std::fs::write(cg.join("memory.swap.max"), "0").or_else(|e| match e.kind() {
-                        std::io::ErrorKind::NotFound => Ok(()),
-                        _ => Err(e),
-                    }) {
-                        crate::log!("firecracker {pid}: its memory may be swapped ({}): {e}", cg.display());
+                    if let Err(e) = std::fs::write(cg.join("memory.swap.max"), "0") {
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            crate::log!("firecracker {pid}: its memory may be swapped ({}): {e}", cg.display());
+                        }
                     }
                     std::fs::write(cg.join("cgroup.procs"), pid.to_string())
                 });
