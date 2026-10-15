@@ -141,7 +141,8 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     fn fixture() -> crate::test_util::TempDir {
-        crate::test_util::TempDir::new("socket")
+        // Leave room for the longest socket suffix regardless of TMPDIR's length.
+        crate::test_util::TempDir::new_in(Path::new("/tmp"), "socket")
     }
 
     #[test]
