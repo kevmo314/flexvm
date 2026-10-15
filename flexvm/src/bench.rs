@@ -22,6 +22,23 @@ struct Hosts {
     timeout: Duration,
 }
 
+/// Only successful starts confer ownership; a refused name must never be killed.
+struct OwnedVm<'a> {
+    h: &'a Hosts,
+    name: &'a str,
+    hosts: Vec<&'a Host>,
+}
+
+impl Drop for OwnedVm<'_> {
+    fn drop(&mut self) {
+        for host in &self.hosts {
+            if let Err(e) = self.h.cli(host, &["kill", self.name]) {
+                crate::log!("bench: cleanup {}: {e}", self.name);
+            }
+        }
+    }
+}
+
 impl Hosts {
     fn cli(&self, host: &Host, args: &[&str]) -> Result<Value> {
         let out = Command::new("/proc/self/exe").arg("--state").arg(&host.state).arg("--run").arg(&host.run).args(args).output()?;
@@ -59,12 +76,6 @@ impl Hosts {
             thread::sleep(Duration::from_millis(10));
         }
     }
-
-    fn kill(&self, name: &str) {
-        for h in [&self.a, &self.b] {
-            let _ = self.cli(h, &["kill", name]);
-        }
-    }
 }
 
 pub fn run(args: &Args) -> Result<()> {
@@ -79,10 +90,22 @@ pub fn run(args: &Args) -> Result<()> {
     let hosts = Hosts { a, b, to, timeout };
     let template = args.get("template").unwrap_or("default");
     let date = command("date", &["-u", "+%Y-%m-%dT%H-%M-%SZ"])?;
-    let (mut report, suffix) = match args.get("lifecycle") {
-        Some(dir) => (lifecycle(&hosts, args, template, dir, &date)?, "-lifecycle"),
-        None => (runs(&hosts, args, template, &date)?, ""),
+    let id = format!("{}-{}", std::process::id(), crate::migrate::migration_id());
+    let parent = match args.get("lifecycle") {
+        Some(dir) => std::path::absolute(dir)?,
+        None => std::env::temp_dir(),
     };
+    std::fs::create_dir_all(&parent)?;
+    let scratch = parent.join(format!("bench-{id}"));
+    std::fs::create_dir(&scratch)?;
+    let (report, suffix) = match args.get("lifecycle") {
+        Some(_) => (lifecycle(&hosts, args, template, &scratch, &date, &id), "-lifecycle"),
+        None => (runs(&hosts, args, template, &date, &id), ""),
+    };
+    if let Err(e) = std::fs::remove_dir_all(&scratch) {
+        crate::log!("bench: cleanup {}: {e}", scratch.display());
+    }
+    let mut report = report?;
     let sha = command("git", &["rev-parse", "HEAD"])?;
     report["date_utc"] = json!(date);
     report["git_sha"] = json!(sha);
@@ -97,7 +120,7 @@ pub fn run(args: &Args) -> Result<()> {
     Ok(())
 }
 
-fn runs(h: &Hosts, args: &Args, template: &str, date: &str) -> Result<Value> {
+fn runs(h: &Hosts, args: &Args, template: &str, date: &str, id: &str) -> Result<Value> {
     let iterations = args.parse_or::<u64>("iterations", 50)?;
     let warmup = args.parse_or::<u64>("warmup", 3)?;
     let dirty_mib = args.parse_or::<u64>("dirty-mib", 0)?;
@@ -116,11 +139,8 @@ fn runs(h: &Hosts, args: &Args, template: &str, date: &str) -> Result<Value> {
     }
     let mut samples = Vec::new();
     for i in 0..warmup + iterations {
-        let name = format!("bench-{}-{i}", std::process::id());
-        let sample = iteration(h, &name, template, dirty_mib, ready).map_err(|e| {
-            h.kill(&name);
-            format!("iteration {} failed: {e}", i + 1)
-        })?;
+        let name = format!("bench-{id}-{i}");
+        let sample = iteration(h, &name, template, dirty_mib, ready).map_err(|e| format!("iteration {} failed: {e}", i + 1))?;
         if i >= warmup {
             samples.push(sample);
         }
@@ -150,6 +170,7 @@ fn iteration(h: &Hosts, name: &str, template: &str, dirty_mib: u64, ready: Optio
     let start = Instant::now();
     let run = h.cli(&h.a, &["run", name, "--template", template, "-d"])?;
     let run_cli = start.elapsed();
+    let mut owned = OwnedVm { h, name, hosts: vec![&h.a] };
     let mut sample = json!({"run": run["timings_ms"], "standby": run["standby"], "run_client": {"total": ms(run_cli)}});
     if let Some((port, http)) = ready {
         let ip: std::net::Ipv4Addr = run["ip"].as_str().ok_or("run reply has no ip")?.parse()?;
@@ -174,6 +195,8 @@ fn iteration(h: &Hosts, name: &str, template: &str, dirty_mib: u64, ready: Optio
             Ok((dirty_mib > 0).then(|| ms(t.elapsed())))
         };
         let read_local = read(&h.a)?;
+        // The name is this run's alone, so a migration that got as far as b is ours to kill there too.
+        owned.hosts.push(&h.b);
         let migrated = crate::vmproc::call(&h.a, name, json!({"op": "migrate", "to": to}), None)?;
         let read_after = read(&h.b)?;
         h.wait("the source to let go", || !h.a.alive(name))?;
@@ -203,10 +226,11 @@ fn iteration(h: &Hosts, name: &str, template: &str, dirty_mib: u64, ready: Optio
         sample["post_copy"] = post;
     }
     h.cli(if h.to.is_some() { &h.b } else { &h.a }, &["kill", name])?;
+    owned.hosts.clear();
     Ok(sample)
 }
 
-fn lifecycle(h: &Hosts, args: &Args, template: &str, dir: &str, date: &str) -> Result<Value> {
+fn lifecycle(h: &Hosts, args: &Args, template: &str, dir: &std::path::Path, date: &str, id: &str) -> Result<Value> {
     let iterations = args.parse_or::<u64>("iterations", 5)?.max(1);
     let sizes: Vec<u64> = args
         .get("dirty-mib")
@@ -214,17 +238,14 @@ fn lifecycle(h: &Hosts, args: &Args, template: &str, dir: &str, date: &str) -> R
         .split(',')
         .map(|s| s.trim().parse().map_err(|_| format!("bad --dirty-mib {s:?}")))
         .collect::<std::result::Result<_, _>>()?;
-    let dir = std::path::absolute(dir)?;
-    std::fs::create_dir_all(&dir)?;
     let mut summary = Map::new();
     let mut all = Map::new();
     for &mib in &sizes {
         let mut samples = Vec::new();
         for i in 0..iterations {
-            let name = format!("lcbench-{}-{mib}-{i}", std::process::id());
+            let name = format!("lcbench-{id}-{mib}-{i}");
             let ck = dir.join(&name);
             let res = trial(h, &name, template, mib, &ck);
-            h.kill(&name);
             let _ = std::fs::remove_dir_all(&ck);
             samples.push(res.map_err(|e| format!("{mib} MiB, trial {}: {e}", i + 1))?);
             crate::log!("bench: {mib} MiB {}/{iterations}", i + 1);
@@ -246,6 +267,7 @@ fn lifecycle(h: &Hosts, args: &Args, template: &str, dir: &str, date: &str) -> R
 /// Ten pause/resume cycles, checkpoint --stop, restore on `b`, then suspend and resume.
 fn trial(h: &Hosts, name: &str, template: &str, mib: u64, ck: &std::path::Path) -> Result<Value> {
     h.cli(&h.a, &["run", name, "--template", template, "-d"])?;
+    let mut owned = OwnedVm { h, name, hosts: vec![&h.a] };
     if mib > 0 && crate::exec(&h.a, name, &format!("dd if=/dev/urandom of=/tmp/f bs=1M count={mib} 2>/dev/null"))? != 0 {
         bail!("dirtying guest memory failed");
     }
@@ -273,6 +295,7 @@ fn trial(h: &Hosts, name: &str, template: &str, mib: u64, ck: &std::path::Path) 
     checkpoint["paused"] = c["paused_ms"].clone();
     checkpoint["data_mib"] = c["data_mib"].clone();
     h.wait("the checkpointed vm to go", || !h.a.alive(name))?;
+    owned.hosts.clear();
 
     let restored = |reply: Value| -> Result<Value> {
         let mut t = reply["timings_ms"].clone();
@@ -286,7 +309,9 @@ fn trial(h: &Hosts, name: &str, template: &str, mib: u64, ck: &std::path::Path) 
         // Another host gives it an address of its own (its own is the first host's to give).
         argv.extend(["--ip", "auto"]);
     }
-    let restore = restored(h.cli(&h.b, &argv)?)?;
+    let reply = h.cli(&h.b, &argv)?;
+    owned.hosts.push(&h.b);
+    let restore = restored(reply)?;
 
     let t = Instant::now();
     h.b.signal(name, libc::SIGTERM)?;
