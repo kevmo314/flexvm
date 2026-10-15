@@ -220,11 +220,12 @@ fn read_logs(vsock: &Path) -> Result<Vec<u8>> {
     bail!("guest closed the connection while sending logs")
 }
 
-/// Takes `lock` once its holder lets go, unless `stop` fails first (an interrupted build).
-fn wait_lock(lock: &File, stop: impl Fn() -> Result<()>) -> Result<()> {
+/// Takes `lock` (`how`: shared or exclusive) once its holders let go, unless `stop` fails
+/// first (an interrupted build).
+fn wait_lock(lock: &File, how: i32, stop: impl Fn() -> Result<()>) -> Result<()> {
     loop {
         stop()?;
-        match flock(lock, libc::LOCK_EX | libc::LOCK_NB) {
+        match flock(lock, how | libc::LOCK_NB) {
             Err(e) if e.raw_os_error() == Some(libc::EWOULDBLOCK) => std::thread::sleep(Duration::from_millis(100)),
             res => return Ok(res?),
         }
@@ -249,7 +250,7 @@ fn cached_rootfs(cached: &Path, build: impl FnOnce(&Path) -> Result<String>, syn
             return Err(e.into());
         }
         crate::log!("image: waiting for another build of {}", cached.display());
-        wait_lock(&lock, interrupted)?;
+        wait_lock(&lock, libc::LOCK_EX, interrupted)?;
     }
     // Held already: from here let go explicitly, not by close (see `install`).
     let _lock = Flock::new(lock, libc::LOCK_EX | libc::LOCK_NB)?;
@@ -437,9 +438,8 @@ fn staging_dir(path: &Path) -> Result<OwnedFd> {
 
 /// The staging directory's `.lock`: held shared while a build makes its tree and lock,
 /// exclusive while one sweeps, so a tree seen then without a held lock is dead.
-fn staging_lock(staging: &OwnedFd, how: i32) -> Result<Flock> {
-    let f: File = open_at(staging.as_raw_fd(), c".lock", libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW)?.into();
-    Ok(Flock::new(f, how)?)
+fn staging_lock(staging: &OwnedFd) -> Result<File> {
+    Ok(open_at(staging.as_raw_fd(), c".lock", libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW)?.into())
 }
 
 /// A build's unpacked tree, `rootfs-{nonce}` in the staging directory, flocked through
@@ -454,7 +454,10 @@ struct Work<'a> {
 impl<'a> Work<'a> {
     fn new(staging: &'a OwnedFd) -> Result<Work<'a>> {
         sweep_staging(staging)?;
-        let _l = staging_lock(staging, libc::LOCK_SH)?;
+        // Behind a sweep, which may be removing a huge tree: an interrupt still ends the wait.
+        let lock = staging_lock(staging)?;
+        wait_lock(&lock, libc::LOCK_SH, interrupted)?;
+        let _l = Flock::new(lock, libc::LOCK_SH | libc::LOCK_NB)?;
         let name = format!("rootfs-{}", nonce()?);
         let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW;
         let lock: File = open_at(staging.as_raw_fd(), &cpath(Path::new(&format!("{name}.lock")))?, flags)?.into();
@@ -475,11 +478,16 @@ impl Drop for Work<'_> {
     }
 }
 
-/// Removes the trees (and locks) of builds that are gone: their lock free or missing.
+/// Removes the trees (and locks) of builds that are gone: their lock free or missing. Best
+/// effort: skipped while another build sweeps (or makes its tree), never waited for.
 fn sweep_staging(staging: &OwnedFd) -> Result<()> {
-    let _l = staging_lock(staging, libc::LOCK_EX)?;
+    let _l = match Flock::new(staging_lock(staging)?, libc::LOCK_EX | libc::LOCK_NB) {
+        Err(e) if e.raw_os_error() == Some(libc::EWOULDBLOCK) => return Ok(()),
+        res => res?,
+    };
     let fd = staging.as_raw_fd();
     for entry in std::fs::read_dir(format!("/proc/self/fd/{fd}"))? {
+        interrupted()?;
         let name = entry?.file_name();
         let Some(id) = name.to_str().and_then(|n| n.strip_prefix("rootfs-")) else { continue };
         let id = id.strip_suffix(".lock").unwrap_or(id);
@@ -735,12 +743,37 @@ mod tests {
             3 => Err("interrupted".into()),
             _ => Ok(()),
         };
-        assert_eq!(wait_lock(&waiting, stop).unwrap_err().to_string(), "interrupted");
+        assert_eq!(wait_lock(&waiting, libc::LOCK_EX, stop).unwrap_err().to_string(), "interrupted");
         assert!(start.elapsed() < Duration::from_secs(5));
         // Unlocked, not only closed: a child another test forks meanwhile shares the lock until it execs.
         flock(&held, libc::LOCK_UN).unwrap();
-        wait_lock(&waiting, || Ok(())).unwrap();
+        wait_lock(&waiting, libc::LOCK_EX, || Ok(())).unwrap();
         flock(&waiting, libc::LOCK_UN).unwrap();
+    }
+
+    #[test]
+    fn sweeps_never_wait_and_builds_wait_only_until_interrupted() {
+        let d = tmpdir("staging-busy");
+        let staging = open_at(libc::AT_FDCWD, &cpath(&d).unwrap(), libc::O_RDONLY | libc::O_DIRECTORY).unwrap();
+        let dead = format!("rootfs-{}", nonce().unwrap());
+        std::fs::create_dir(d.join(&dead)).unwrap();
+        // Another build sweeping.
+        let sweeping = staging_lock(&staging).unwrap();
+        flock(&sweeping, libc::LOCK_EX).unwrap();
+        let start = Instant::now();
+        sweep_staging(&staging).unwrap();
+        assert!(d.join(&dead).exists(), "skipped, not waited for");
+        let waiting = staging_lock(&staging).unwrap();
+        let stop = || match start.elapsed() > Duration::from_millis(300) {
+            true => Err("interrupted".into()),
+            false => Ok(()),
+        };
+        assert_eq!(wait_lock(&waiting, libc::LOCK_SH, stop).unwrap_err().to_string(), "interrupted");
+        assert!(start.elapsed() < Duration::from_secs(5));
+        // Unlocked, not only closed: a child another test forks meanwhile shares the lock until it execs.
+        flock(&sweeping, libc::LOCK_UN).unwrap();
+        sweep_staging(&staging).unwrap();
+        assert!(!d.join(&dead).exists());
     }
 
     #[test]
