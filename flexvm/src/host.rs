@@ -560,7 +560,7 @@ impl Host {
         let gen = self.next_gen(a.seen)?;
         let me = Ident::me();
         self.put_addr(ip, &Addr { seen: gen, holder: Some(holder.into()), holder_id: Some(me.clone()), held: gen, lent: a.lent, ..Addr::default() }, false)?;
-        Ok(AddrClaim { host: self.clone(), ip, gen, holder: holder.into(), id: me, kept: false, fresh: true })
+        Ok(AddrClaim { host: self.clone(), ip, gen, rev: 0, holder: holder.into(), id: me, kept: false, fresh: true })
     }
 
     /// Where the next automatic allocation starts looking: a hint, never a claim.
@@ -609,7 +609,10 @@ impl Host {
         Ok(gen)
     }
 
-    pub fn claim_incoming(&self, l: &Locked, holder: &str, ip: Ipv4Addr, gen: u64) -> Result<AddrClaim> {
+    /// At revision `rev` (a migration's target, recorded only once it commits:
+    /// one that never does must not outrank its source), else one past the
+    /// newest recorded here.
+    pub fn claim_incoming(&self, l: &Locked, holder: &str, ip: Ipv4Addr, gen: u64, rev: Option<u64>) -> Result<AddrClaim> {
         let mut a = self.addr(l, ip)?;
         if gen == 0 || gen > RECV_MAX {
             bail!("{ip}: an arrival must carry its address's generation (not {gen})");
@@ -623,13 +626,17 @@ impl Host {
         if let Some(lent) = a.lent.filter(|&lent| gen < lent) {
             bail!("{ip} is lent out with a newer vm (generation {lent}, not {gen})");
         }
+        let (arriving, rev) = (rev.is_some(), rev.unwrap_or(if gen > a.seen { 0 } else { a.rev.saturating_add(1) }));
         if gen > a.seen {
-            (a.seen, a.withdrawn, a.via) = (gen, false, None);
+            (a.seen, a.withdrawn, a.via, a.rev) = (gen, false, None, 0);
+        }
+        if !arriving {
+            a.rev = a.rev.max(rev);
         }
         let me = Ident::me();
         (a.holder, a.holder_id, a.held) = (Some(holder.into()), Some(me.clone()), gen);
         self.put_addr(ip, &a, true)?;
-        Ok(AddrClaim { host: self.clone(), ip, gen, holder: holder.into(), id: me, kept: false, fresh: false })
+        Ok(AddrClaim { host: self.clone(), ip, gen, rev, holder: holder.into(), id: me, kept: false, fresh: false })
     }
 
     /// The host lock, if `gen` of `ip` is still current: held from this
@@ -668,18 +675,31 @@ impl Host {
         self.update(l, ip, true, |a| a.lent = a.lent.filter(|&lent| lent != gen))
     }
 
-    /// `via` None is a withdrawal. False if stale (older, or announcing a
-    /// withdrawn generation). A withdrawal frees a loan of that gen or older.
-    pub fn observe(&self, l: &Locked, ip: Ipv4Addr, gen: u64, via: Option<Ipv4Addr>) -> Result<bool> {
+    /// `via` None is a withdrawal (of every revision). False if stale (older,
+    /// announcing a withdrawn generation, or an older revision of the newest
+    /// one). A withdrawal frees a loan of that gen or older.
+    pub fn observe(&self, l: &Locked, ip: Ipv4Addr, gen: u64, rev: u64, via: Option<Ipv4Addr>) -> Result<bool> {
         self.update(l, ip, true, |a| {
-            if gen == 0 || gen > RECV_MAX || gen < a.seen || (gen == a.seen && a.withdrawn && via.is_some()) {
+            if gen == 0 || gen > RECV_MAX || gen < a.seen || (gen == a.seen && via.is_some() && (a.withdrawn || rev < a.rev)) {
                 return false;
+            }
+            if via.is_some() || gen > a.seen {
+                a.rev = rev;
             }
             (a.seen, a.withdrawn, a.via) = (gen, via.is_none(), via);
             if via.is_none() && a.lent.is_some_and(|lent| lent <= gen) {
                 a.lent = None;
             }
             true
+        })
+    }
+
+    /// Records revision `rev` of `gen`, if newer: where this host's VM runs again.
+    pub fn advance(&self, l: &Locked, ip: Ipv4Addr, gen: u64, rev: u64) -> Result<()> {
+        self.update(l, ip, true, |a| {
+            if gen == a.seen {
+                a.rev = a.rev.max(rev);
+            }
         })
     }
 
@@ -937,6 +957,8 @@ pub struct Addr {
     pub holder_id: Option<Ident>,
     pub held: u64,
     pub via: Option<Ipv4Addr>,
+    /// Of `seen`, the newest location's revision: a migration's target takes the next.
+    pub rev: u64,
 }
 
 impl Addr {
@@ -950,6 +972,8 @@ pub struct AddrClaim {
     host: Host,
     pub ip: Ipv4Addr,
     pub gen: u64,
+    /// Where within `gen` the VM is: announced with its route.
+    pub rev: u64,
     holder: String,
     id: Ident,
     kept: bool,
@@ -1708,21 +1732,21 @@ mod tests {
         h.lend(&l, a_ip, g1).unwrap();
         a.release(&l).unwrap();
         assert!(h.claim_new(&l, "x", Some(a_ip)).is_err());
-        assert!(!h.observe(&l, a_ip, g1 - 1, None).unwrap(), "older withdrawal is stale");
+        assert!(!h.observe(&l, a_ip, g1 - 1, 0, None).unwrap(), "older withdrawal is stale");
         assert!(h.addr(&l, a_ip).unwrap().lent.is_some());
-        assert!(h.observe(&l, a_ip, g1, None).unwrap() && h.addr(&l, a_ip).unwrap().lent.is_none());
+        assert!(h.observe(&l, a_ip, g1, 0, None).unwrap() && h.addr(&l, a_ip).unwrap().lent.is_none());
         let via = Some(ip("192.0.2.1"));
-        assert!(!h.observe(&l, a_ip, g1, via).unwrap() && !h.current(&l, a_ip, g1).unwrap());
-        assert!(h.observe(&l, a_ip, g1 + 5, via).unwrap() && h.addr(&l, a_ip).unwrap().via == via);
-        assert!(h.claim_incoming(&l, "y", a_ip, g1).is_err() && h.claim_incoming(&l, "y", a_ip, 0).is_err());
-        h.claim_incoming(&l, "y", a_ip, g1 + 5).unwrap().keep();
+        assert!(!h.observe(&l, a_ip, g1, 0, via).unwrap() && !h.current(&l, a_ip, g1).unwrap());
+        assert!(h.observe(&l, a_ip, g1 + 5, 0, via).unwrap() && h.addr(&l, a_ip).unwrap().via == via);
+        assert!(h.claim_incoming(&l, "y", a_ip, g1, None).is_err() && h.claim_incoming(&l, "y", a_ip, 0, None).is_err());
+        h.claim_incoming(&l, "y", a_ip, g1 + 5, None).unwrap().keep();
         drop(h.fence(a_ip, g1 + 5).unwrap());
-        assert!(h.observe(&l, a_ip, g1 + 5, None).unwrap());
-        h.claim_incoming(&l, "y", a_ip, g1 + 6).unwrap().keep();
+        assert!(h.observe(&l, a_ip, g1 + 5, 0, None).unwrap());
+        h.claim_incoming(&l, "y", a_ip, g1 + 6, None).unwrap().keep();
         assert!(h.current(&l, a_ip, g1 + 6).unwrap());
         let _w = h.take_name("w", false).unwrap();
         let wc = h.claim_new(&l, "w", Some(ip("10.9.0.3"))).unwrap();
-        assert!(h.claim_incoming(&l, "w2", wc.ip, wc.gen).is_err());
+        assert!(h.claim_incoming(&l, "w2", wc.ip, wc.gen, None).is_err());
         assert_eq!(h.holder(&l, wc.ip).unwrap().as_deref(), Some("w"));
         drop(h.claim_new(&l, "v", None));
         assert_eq!(h.holder(&l, wc.ip).unwrap().as_deref(), Some("w"));
@@ -2008,6 +2032,24 @@ mod tests {
     }
 
     #[test]
+    fn revisions_order_locations_within_a_generation() {
+        let h = host("revs");
+        let l = h.lock().unwrap();
+        let (x, a, b) = (ip("10.9.0.1"), Some(ip("192.0.2.1")), Some(ip("192.0.2.2")));
+        assert!(h.observe(&l, x, 7, 3, b).unwrap());
+        assert!(!h.observe(&l, x, 7, 2, a).unwrap() && h.addr(&l, x).unwrap().via == b, "a source's delayed announcement is stale");
+        assert!(h.observe(&l, x, 7, 3, b).unwrap(), "repeated");
+        let _y = h.take_name("y", false).unwrap();
+        assert_eq!(h.claim_incoming(&l, "y", x, 7, None).unwrap().rev, 4, "past the newest recorded");
+        assert_eq!(h.claim_incoming(&l, "y", x, 7, Some(9)).unwrap().rev, 9);
+        assert!(h.observe(&l, x, 7, 4, b).unwrap(), "an arrival's revision counts only once it commits");
+        h.advance(&l, x, 7, 6).unwrap();
+        assert!(!h.observe(&l, x, 7, 5, b).unwrap());
+        assert!(h.observe(&l, x, 8, 0, a).unwrap(), "a newer generation starts over");
+        assert!(h.observe(&l, x, 8, 0, None).unwrap() && !h.observe(&l, x, 8, 9, b).unwrap(), "a withdrawal takes every revision");
+    }
+
+    #[test]
     fn addresses_are_lent_to_restoring_peers_only_when_free() {
         let h = host("lend");
         let l = h.lock().unwrap();
@@ -2016,7 +2058,7 @@ mod tests {
         let g = h.lend_new(&l, x).unwrap();
         assert!(h.lend_new(&l, x).unwrap_err().to_string().contains("lent"));
         assert!(h.claim_new(&l, "x", Some(x)).err().unwrap().to_string().contains("lent"));
-        assert!(h.observe(&l, x, g, None).unwrap());
+        assert!(h.observe(&l, x, g, 0, None).unwrap());
         let _x = h.take_name("x", false).unwrap();
         let c = h.claim_new(&l, "x", Some(x)).unwrap();
         assert!(c.gen > g && c.fresh);
@@ -2147,9 +2189,9 @@ mod tests {
         let l = h.lock().unwrap();
         let addr = ip("10.9.0.1");
         for gen in [0, RECV_MAX + 1, GEN_MAX - 1025, GEN_MAX - 1024, GEN_MAX - 1, GEN_MAX, GEN_MAX + 1, u64::MAX] {
-            assert!(h.claim_incoming(&l, "incoming", addr, gen).is_err());
-            assert!(!h.observe(&l, addr, gen, Some(ip("10.1.0.2"))).unwrap());
-            assert!(!h.observe(&l, addr, gen, None).unwrap());
+            assert!(h.claim_incoming(&l, "incoming", addr, gen, None).is_err());
+            assert!(!h.observe(&l, addr, gen, 0, Some(ip("10.1.0.2"))).unwrap());
+            assert!(!h.observe(&l, addr, gen, 0, None).unwrap());
             assert_eq!(h.addr(&l, addr).unwrap(), Addr::default());
         }
     }
@@ -2162,9 +2204,9 @@ mod tests {
             let addr = ip("10.9.0.1");
             let mut gen = RECV_MAX - 1025;
             if incoming {
-                h.claim_incoming(&l, "incoming", addr, gen).unwrap().release(&l).unwrap();
+                h.claim_incoming(&l, "incoming", addr, gen, None).unwrap().release(&l).unwrap();
             } else {
-                assert!(h.observe(&l, addr, gen, Some(ip("10.1.0.2"))).unwrap());
+                assert!(h.observe(&l, addr, gen, 0, Some(ip("10.1.0.2"))).unwrap());
             }
             drop(l);
             for _ in 0..2048 {

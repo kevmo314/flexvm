@@ -278,14 +278,25 @@ fn lend(host: &Host, req: &Value) -> Result<Value> {
     Ok(json!({"ip": ip.to_string(), "gen": gen}))
 }
 
-/// Stale generations (see `host::Addr`) are ignored; an address a VM here
-/// holds keeps its local route.
+/// Stale generations and revisions (see `host::Addr`) are ignored; an
+/// address a VM here holds keeps its local route.
 fn route(host: &Host, req: &Value) -> Result<Value> {
     let ip: Ipv4Addr = req["ip"].as_str().ok_or("missing ip")?.parse()?;
     let gen = req["gen"].as_u64().filter(|&g| g > 0).ok_or("route messages carry the address's generation")?;
     let via: Option<Ipv4Addr> = req["via"].as_str().map(|v| v.parse()).transpose()?;
+    let rev = match via {
+        Some(_) => req["rev"].as_u64().ok_or("route announcements carry the location's revision")?,
+        None => 0,
+    };
+    if let Some(via) = via.filter(|_| fault("route_stall")) {
+        // Test hook: an announcement held up (as by a slow network) while armed.
+        eprintln!("route {ip} via {via}: held up (injected fault)");
+        while fault("route_stall") {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
     let l = host.lock()?;
-    if !host.observe(&l, ip, gen, via)? {
+    if !host.observe(&l, ip, gen, rev, via)? {
         return Ok(json!({"ip": ip.to_string(), "stale": true}));
     }
     let local = host.keeps_route(&l, ip, gen)?;

@@ -210,7 +210,7 @@ FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_be
           "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "resume_kill",
           "prepare_fail", "short_incoming", "slow_preload", "bad_preload", "bad_app_log", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
           "started_fsync", "started_unmark", "start_stall", "incoming_stall", "claim_stall", "handoff_stall", "ckpt_wp_race",
-          "fetch_tail_enomem", "fetch_enomem_stuck", "pull_enomem", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo", "release_stall", "release_late", "no_plug", "pause_lost", "tap_backlog", "tap_backlog_stuck", "pause_unknown", "no_collapse", "collapse_slow", "pages_slow", "unlend_fail")
+          "fetch_tail_enomem", "fetch_enomem_stuck", "pull_enomem", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo", "release_stall", "release_late", "no_plug", "pause_lost", "tap_backlog", "tap_backlog_stuck", "pause_unknown", "no_collapse", "collapse_slow", "pages_slow", "unlend_fail", "route_stall")
 
 
 def disarm():
@@ -834,7 +834,7 @@ def migrate_in_raw(host, name, ip, source, gen=None, template=None):
     # Newer than any the host has seen for it, as an arriving VM's is.
     gen = addr(host, ip).get("seen", 0) + 1 if gen is None else gen
     req = {"op": "migrate_in", "name": name, "mig": mig, "template": template or args.template, "id": template_id,
-           "ip": ip, "gen": gen, "source": A.addr, "regions": regions}
+           "ip": ip, "gen": gen, "rev": 0, "source": A.addr, "regions": regions}
     s.sendall((json.dumps(req) + "\n").encode())
     buf = b""
     while not buf.endswith(b"\n"):
@@ -960,11 +960,11 @@ def abort_superseded():
     t.start()
     # While the target probes the dead page server, the address moves on.
     wait_for(lambda: vms(A).get(n, {}).get("state") == "source", 20)
-    r = peer(A, {"op": "route", "ip": ip, "via": gw, "gen": gen + 1})
+    r = peer(A, {"op": "route", "ip": ip, "via": gw, "gen": gen + 1, "rev": 0})
     check("abort superseded: the newer generation is taken, the source keeps the route",
           r.get("ok") and not r["result"].get("stale") and r["result"].get("local"), r)
     # The target hears of it too (its arrival does not commit then).
-    peer(B, {"op": "route", "ip": ip, "via": gw, "gen": gen + 1})
+    peer(B, {"op": "route", "ip": ip, "via": gw, "gen": gen + 1, "rev": 0})
     t.join()
     fault(A, "pages", 0)
     r = res.get("r", {})
@@ -1364,7 +1364,7 @@ def handoff_superseded():
     clear_log(B, n)
     r = migrate(A, n, B)
     check("handoff superseded: migrated", r["ok"] and where(n).get(B) == "running", (r, where(n)))
-    r = peer(B, {"op": "route", "ip": ip, "via": gw, "gen": gen + 1})
+    r = peer(B, {"op": "route", "ip": ip, "via": gw, "gen": gen + 1, "rev": 0})
     check("handoff superseded: the newer generation is taken", r.get("ok") and not r["result"].get("stale"), r)
     check("handoff superseded: the late handoff says it left the address alone",
           wait_for(lambda: "went to a newer vm" in log(B, n), 10), log(B, n)[-300:])
@@ -1373,6 +1373,84 @@ def handoff_superseded():
     check("handoff superseded: the address routes to the newer vm's host", f"via {gw}" in peer_route(ip), peer_route(ip))
     kill(B, n)
     forget_peer_route(ip, gen + 1)
+
+
+def delayed_announce():
+    """#256: the source's announcement of a VM that reaches a peer only after
+    its migration committed (held up in B's listener by `route_stall`; B
+    stands in for a third peer, which the two hosts here leave none for) is
+    an older revision of the same generation: stale, it routes nothing back
+    to the source. The destination's announcement is taken by the source's host."""
+    n = "ft-delayed-announce"
+    fault(B, "route_stall", 60000)
+    ok(run(A, n))
+    v = vms(A)[n]
+    ip, gen = v["ip"], v["gen"]
+    check("delayed announce: B holds up A's announcement", wait_for(lambda: conns(B) == 1, 10), conns(B))
+    r = migrate(A, n, B)
+    check("delayed announce: migrated", r["ok"] and where(n).get(B) == "running", (r, where(n)))
+    wait_released(B, n)
+    check("delayed announce: B took the next revision", addr(B, ip).get("rev") == 1, addr(B, ip))
+    check("delayed announce: A heard of it", wait_for(lambda: addr(A, ip).get("rev") == 1, 10), addr(A, ip))
+    fault(B, "route_stall", 0)
+    check("delayed announce: B handled it", wait_for(lambda: conns(B) == 0, 10), conns(B))
+    a = addr(B, ip)
+    check("delayed announce: A's late one is stale, the route stays off A",
+          a.get("seen") == gen and a.get("rev") == 1 and a.get("via") is None, a)
+    check("delayed announce: running on B", where(n) == {B: "running"}, where(n))
+    kill(B, n)
+
+
+def prepare_fail_announce():
+    """#256: a target that claims the next revision and then fails to prepare
+    never outranks its running source: the source's announcement, held up in
+    B's listener until after, is still taken."""
+    n = "ft-prep-announce"
+    fault(B, "route_stall", 60000)
+    ok(run(A, n))
+    ip = vms(A)[n]["ip"]
+    check("prepare fail announce: B holds up A's announcement", wait_for(lambda: conns(B) == 1, 10), conns(B))
+    fault(B, "prepare_fail", 10000)
+    r = migrate(A, n, B)
+    fault(B, "prepare_fail", 0)
+    check("prepare fail announce: migrate refused", not r["ok"] and "injected fault" in r["error"], r)
+    fault(B, "route_stall", 0)
+    check("prepare fail announce: B handled it", wait_for(lambda: conns(B) == 0, 10), conns(B))
+    a = addr(B, ip)
+    check("prepare fail announce: taken, routed to A", a.get("via") == "127.0.0.1" and a.get("rev") == 0 and not a.get("holder"), a)
+    check("prepare fail announce: running on A", where(n) == {A: "running"}, where(n))
+    kill(A, n)
+
+
+def reconcile_announce():
+    """#256: a source that never heard its target commit (ack lost, status
+    unavailable) runs again once the target dies mid-pull (`pages_slow` keeps
+    it pulling), and announces itself past the revision the target took."""
+    n = "ft-reconcile-announce"
+    setup(n, mib=100)
+    ip = vms(A)[n]["ip"]
+    fault(A, "pages_slow", 120000)
+    # Long enough for the slow pages the commit waits on.
+    fault(B, "lost_ack", 30000)
+    fault(B, "status", 30000)
+    r = migrate(A, n, B)
+    fault(B, "lost_ack", 0)
+    check("reconcile announce: outcome unknown, the source paused", not r["ok"] and vms(A).get(n, {}).get("state") == "source", (r, where(n)))
+    check("reconcile announce: B committed the next revision", addr(B, ip).get("rev") == 1, addr(B, ip))
+    os.kill(json.load(open(os.path.join(B.run, "vms", f"{n}.lock")))["pid"], signal.SIGKILL)
+    fault(B, "status", 0)
+    check("reconcile announce: runs on A again", wait_for(lambda: where(n) == {A: "running"}, 60), where(n))
+    fault(A, "pages_slow", 0)
+    check("reconcile announce: announced past B's revision",
+          wait_for(lambda: addr(B, ip).get("rev") == 2 and addr(B, ip).get("via") == "127.0.0.1", 10), addr(B, ip))
+    kill(A, n)
+
+
+def conns(host):
+    """Connections `host`'s listener has yet to answer (established, or closed by the peer)."""
+    port = int(host.addr.rsplit(":", 1)[1])
+    rows = [r.split() for r in open("/proc/net/tcp").read().splitlines()[1:]]
+    return sum(int(r[1].split(":")[1], 16) == port and r[3] in ("01", "08") for r in rows)
 
 
 def peer_route(ip):
@@ -1387,7 +1465,7 @@ def arrival_with_peer_route(n, ip):
     load and preloaded pages it never sends. Returns (socket, mig, gateway)."""
     gw = subprocess.run(["ip", "route", "show", "default"], capture_output=True, text=True).stdout.split()[2]
     gen = addr(B, ip).get("seen", 0) + 1
-    r = peer(B, {"op": "route", "ip": ip, "via": gw, "gen": gen})
+    r = peer(B, {"op": "route", "ip": ip, "via": gw, "gen": gen, "rev": 0})
     assert r.get("ok"), r
     assert f"via {gw}" in peer_route(ip), peer_route(ip)
     s, r, mig = migrate_in_raw(B, n, ip, source_vm(), gen=gen)
@@ -4414,7 +4492,7 @@ def late_withdrawal():
     check("late withdrawal: one without a generation is refused", not r["ok"] and lent(ip) == new, (r, addr(A, ip)))
     kill(B, n2)
     check("late withdrawal: the newer VM's withdrawal frees it", wait_for(lambda: not lent(ip), 10), addr(A, ip))
-    late = lambda g: ok(peer(A, {"op": "route", "ip": ip, "via": "127.0.0.1", "gen": g}))
+    late = lambda g: ok(peer(A, {"op": "route", "ip": ip, "via": "127.0.0.1", "gen": g, "rev": 0}))
     check("late announcement: of a withdrawn generation is stale", late(new)["stale"])
     check("late announcement: of an older generation is stale", late(old)["stale"])
     stop_listeners()
@@ -5692,7 +5770,8 @@ SCENARIOS = dict(
     sigkill_restart=sigkill_restart, listen_trickle=listen_trickle,
     cow_wp_race=cow_wp_race, fetch_tail_enomem=fetch_tail_enomem, fetch_enomem_stuck=fetch_enomem_stuck, pull_enomem=pull_enomem,
     collapse_abort=collapse_abort, collapse_ckpt_fail=collapse_ckpt_fail, ckpt_paused_backlog=ckpt_paused_backlog, same_host_order=same_host_order, same_host_slow_route=same_host_slow_route, same_host_flood=same_host_flood, same_host_late_handover=same_host_late_handover, same_host_backlog=same_host_backlog, ckpt_backlog=ckpt_backlog, rx_stall=rx_stall, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,
-    handoff_superseded=handoff_superseded, suspend_cmd=suspend_cmd, fc_died_busy=fc_died_busy, pause_cmd_start=pause_cmd_start, suspend_died=suspend_died)
+    handoff_superseded=handoff_superseded, delayed_announce=delayed_announce,
+    prepare_fail_announce=prepare_fail_announce, reconcile_announce=reconcile_announce, suspend_cmd=suspend_cmd, fc_died_busy=fc_died_busy, pause_cmd_start=pause_cmd_start, suspend_died=suspend_died)
 names = [n for s in args.scenarios for n in (list(SCENARIOS) if s == "all" else [s])]
 if os.geteuid() != 0:
     sys.exit("run as root (sudo)")

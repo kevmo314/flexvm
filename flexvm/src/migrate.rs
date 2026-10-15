@@ -246,6 +246,7 @@ impl Proc {
                 "id": vm.template.meta.id,
                 "ip": vm.ip.to_string(),
                 "gen": gen,
+                "rev": self.rev(),
                 "source": source,
                 "source_ident": crate::host::Ident::me(),
                 "rss_mib": vm.rss() >> 20,
@@ -312,9 +313,16 @@ impl Proc {
                 Err(r) => eprintln!("vm {}: undoing its loan after an aborted migration: {r}", vm.name),
             }
         }
+        // Past the revision its target took (and may have announced, if it committed).
+        if let Err(r) = self.advance(&l, 2) {
+            eprintln!("vm {}: recording its revision: {r}", vm.name);
+        }
         drop(l);
         self.set_leaving(false);
         self.publish();
+        if s != State::Failed {
+            self.announce();
+        }
         if s == State::Running {
             self.sync_clock_later();
         }
@@ -355,8 +363,7 @@ impl Proc {
                 match peer_call(&to, json!({"op": "migration", "mig": mig})).map(|r| r["outcome"].clone()) {
                     Ok(o) if o == "released" => break,
                     Ok(o) if o == "aborted" => {
-                        p.abort_later(mig, &format!("{to} lost the vm before it had all its memory; it runs here again, from the pause"));
-                        return p.announce();
+                        return p.abort_later(mig, &format!("{to} lost the vm before it had all its memory; it runs here again, from the pause"));
                     }
                     _ => thread::sleep(delay),
                 }
@@ -668,7 +675,9 @@ impl Proc {
         *self.arrived.lock().unwrap() = Some(self.host.mig_begin(mig, &source.addr, by, Some(ip))?);
         let tpl = Template::open_id(&self.paths, req["template"].as_str().ok_or("missing template")?, req["id"].as_str().ok_or("missing template id")?)?;
         t.mark("template");
-        let claim = self.host.claim_incoming(&self.host.lock()?, &name, ip, req["gen"].as_u64().unwrap_or(0))?;
+        // The source's next revision: past it, its resume after an abort outranks this location.
+        let rev = req["rev"].as_u64().ok_or("missing rev")?.saturating_add(1);
+        let claim = self.host.claim_incoming(&self.host.lock()?, &name, ip, req["gen"].as_u64().unwrap_or(0), Some(rev))?;
         self.set_addr(claim);
         t.mark("claim_ip");
         let idle = self.spawner.take(None)?;
@@ -756,6 +765,10 @@ impl Proc {
                     t.mark("route");
                 }
                 self.arrived.lock().unwrap().as_mut().ok_or("no migration record")?.commit(&l)?;
+                // Only now its revision outranks the source's (`claim_incoming`).
+                if let Err(e) = self.advance(&l, 0) {
+                    eprintln!("vm {name}: recording its revision: {e}");
+                }
                 Ok(l)
             }),
         };
