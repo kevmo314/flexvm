@@ -4,7 +4,7 @@
 //! `migrate_in`, `pages` (handed to the source VM process), `migration`
 //! (status/done), `route`, `lend`, `source` (source liveness).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -38,6 +38,9 @@ pub fn main(host: Host, listener: TcpListener) -> Result<()> {
     crate::standby::maintain(host.clone());
     crate::gc::periodic(host.clone());
     let peers = Peers::watch(host.clone());
+    // Refusals are logged off the accept loop, never waiting on stderr: past 64 queued, dropped.
+    let (refusals, queued) = std::sync::mpsc::sync_channel::<String>(64);
+    std::thread::spawn(move || queued.into_iter().for_each(|e| eprintln!("peer request: {e}")));
     let host = std::sync::Arc::new(host);
     for conn in listener.incoming() {
         // Everything a request does before it is read, checking its peer
@@ -54,7 +57,7 @@ pub fn main(host: Host, listener: TcpListener) -> Result<()> {
         match conn.peer_addr() {
             Ok(from) if peers.admit(&host, from.ip()) => {}
             Ok(from) => {
-                refuse(conn, from.ip());
+                refuse(conn, from.ip(), &refusals);
                 continue;
             }
             Err(_) => continue,
@@ -98,10 +101,11 @@ fn is_peer(peers: &[IpAddr], from: IpAddr) -> bool {
     peers.iter().any(|a| a.to_canonical() == from.to_canonical())
 }
 
-/// The configured peers' addresses. Names are resolved only by one background
-/// thread (`watch`): at start, every `PEER_REFRESH`, and soon after a request
-/// finds a name it has no addresses for; a name that fails to resolve keeps
-/// the addresses it last had. Requests go by host.json as it is now
+/// The configured peers' addresses. Names are resolved off the request path,
+/// each by a thread of its own (at most one per name, so one hung lookup holds
+/// up no other), published as each finishes: at start, every `PEER_REFRESH`,
+/// and soon after a request finds a name it has no addresses for; a name that
+/// fails to resolve keeps the addresses it last had. Requests go by host.json as it is now
 /// (`flexvm config --peer` reaches a running listener) and never wait on DNS:
 /// an address given as such needs none, and a name no longer configured
 /// counts for nothing, whatever a refresh still holds for it.
@@ -112,6 +116,7 @@ struct Peers(Arc<PeersInner>);
 struct PeersInner {
     resolved: RwLock<HashMap<String, Vec<IpAddr>>>,
     wanted: (Mutex<bool>, Condvar),
+    resolving: Mutex<HashSet<String>>,
 }
 
 const PEER_REFRESH: Duration = Duration::from_secs(30);
@@ -132,13 +137,22 @@ impl Peers {
         peers
     }
 
+    /// Starts a lookup of each name that has none under way; never waits on one.
     fn refresh(&self, names: &[String]) {
-        let resolved: Vec<_> = names.iter().map(|n| n.to_socket_addrs().ok().map(|a| a.map(|a| a.ip()).collect::<Vec<_>>())).collect();
-        let mut w = self.0.resolved.write().unwrap();
-        w.retain(|n, _| names.contains(n));
-        for (n, new) in names.iter().zip(resolved) {
-            if let Some(new) = new {
-                w.insert(n.clone(), new);
+        self.0.resolved.write().unwrap().retain(|n, _| names.contains(n));
+        for n in names.iter().filter(|n| n.parse::<SocketAddr>().is_err()) {
+            if !self.0.resolving.lock().unwrap().insert(n.clone()) {
+                continue;
+            }
+            let (p, name) = (self.clone(), n.clone());
+            let lookup = std::thread::Builder::new().spawn(move || {
+                if let Ok(a) = name.to_socket_addrs() {
+                    p.0.resolved.write().unwrap().insert(name.clone(), a.map(|a| a.ip()).collect());
+                }
+                p.0.resolving.lock().unwrap().remove(&name);
+            });
+            if lookup.is_err() {
+                self.0.resolving.lock().unwrap().remove(n);
             }
         }
     }
@@ -167,10 +181,10 @@ impl Peers {
 
 /// Tells a non-peer why, without waiting on it: what it already sent is
 /// read off first, so the close does not reset the reply away.
-fn refuse(mut conn: TcpStream, from: IpAddr) {
+fn refuse(mut conn: TcpStream, from: IpAddr, log: &std::sync::mpsc::SyncSender<String>) {
     let local = conn.local_addr().map(|a| a.to_string()).unwrap_or_default();
     let e = format!("{from} is not a peer of {local} (add it there: flexvm config --peer)");
-    eprintln!("peer request: {e}");
+    let _ = log.try_send(e.clone());
     if conn.set_nonblocking(true).is_ok() {
         let _ = send_json(&mut conn, &json!({"ok": false, "error": e}));
         let _ = conn.shutdown(std::net::Shutdown::Write);
@@ -450,11 +464,27 @@ mod tests {
         let (p, name) = (Peers::default(), vec!["no-such-host.invalid:7070".to_string()]);
         p.0.resolved.write().unwrap().insert(name[0].clone(), vec!["10.1.0.2".parse().unwrap()]);
         p.refresh(&name);
-        assert!(is_peer(&p.addrs(&name), "10.1.0.2".parse().unwrap()));
+        let settled = |p: &Peers| (0..500).any(|_| p.0.resolving.lock().unwrap().is_empty() || (std::thread::sleep(Duration::from_millis(10)), false).1);
+        assert!(settled(&p) && is_peer(&p.addrs(&name), "10.1.0.2".parse().unwrap()));
         // A name no longer configured counts for nothing, whatever is cached for it.
         assert!(p.addrs(&[]).is_empty());
         // One not resolved yet asks the refresher, and gets nothing meanwhile.
         assert!(p.addrs(&["other.invalid:7070".to_string()]).is_empty() && *p.0.wanted.0.lock().unwrap());
+    }
+
+    #[test]
+    fn a_hung_lookup_holds_up_no_other_name() {
+        let p = Peers::default();
+        // Its lookup under way (and hung): never started again, never waited for.
+        p.0.resolving.lock().unwrap().insert("hung.invalid:7070".into());
+        let names = ["hung.invalid:7070".to_string(), "localhost:7070".to_string(), "10.1.0.2:7070".to_string()];
+        let start = Instant::now();
+        p.refresh(&names);
+        assert!(start.elapsed() < Duration::from_millis(100));
+        assert!(is_peer(&p.addrs(&names), "10.1.0.2".parse().unwrap()), "an address needs no lookup");
+        let local = || is_peer(&p.addrs(&names), "127.0.0.1".parse().unwrap()) || is_peer(&p.addrs(&names), "::1".parse().unwrap());
+        assert!((0..500).any(|_| local() || (std::thread::sleep(Duration::from_millis(10)), false).1), "localhost resolved meanwhile");
+        assert!(p.0.resolving.lock().unwrap().contains("hung.invalid:7070"));
     }
 
     #[test]
@@ -471,6 +501,11 @@ mod tests {
             Ok(())
         };
         other.configure(|c| set(c, &["10.1.0.9:7070"])).unwrap();
+        assert!(peers.admit(&running, from));
+        // Unreadable (mid-write, or gone): the newest read stands, never the startup one.
+        std::fs::write(running.state.join("host.json"), b"{\"peers\": [").unwrap();
+        assert!(peers.admit(&running, from));
+        std::fs::remove_file(running.state.join("host.json")).unwrap();
         assert!(peers.admit(&running, from));
         other.configure(|c| set(c, &[])).unwrap();
         assert!(!peers.admit(&running, from));
