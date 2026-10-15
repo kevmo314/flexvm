@@ -437,7 +437,7 @@ impl Root {
             check(unsafe { libc::fchmodat(dfd, name, h.mode()? & 0o7777, 0) }, "chmod", rel)?;
             for (key, value) in &m.xattrs {
                 if let Err(e) = at.set_xattr(key, value) {
-                    eprintln!("image: xattr {key} on {rel:?}: {e}");
+                    crate::log!("image: xattr {key} on {rel:?}: {e}");
                 }
             }
         }

@@ -287,10 +287,10 @@ pub fn unplug_tap(tap: &str) -> (u64, Result<()>) {
             }
             latest = qdisc_stats(ifindex).unwrap_or(latest);
             if remove().is_ok() {
-                return eprintln!("tap {tap}: plug removed, {} extra drops, {} queued packets discarded", latest.0.saturating_sub(drops), latest.1);
+                return crate::log!("tap {tap}: plug removed, {} extra drops, {} queued packets discarded", latest.0.saturating_sub(drops), latest.1);
             }
         }
-        eprintln!("tap {tap}: could not remove its plug, {} extra drops; backlog stays queued", latest.0.saturating_sub(drops));
+        crate::log!("tap {tap}: could not remove its plug, {} extra drops; backlog stays queued", latest.0.saturating_sub(drops));
     });
     (drops, Err(format!("{e}; removing the plug failed too, retrying").into()))
 }
@@ -386,7 +386,7 @@ pub fn route_via(ip: Ipv4Addr, via: Ipv4Addr) -> Result<()> {
     // Not knowing is no reason to leave a peer's VM unrouted.
     if is_local_addr(via).unwrap_or(false) {
         static LOGGED: std::sync::Once = std::sync::Once::new();
-        LOGGED.call_once(|| eprintln!("not routing {ip} via {via}: a local address (hosts sharing a network namespace); this is logged once"));
+        LOGGED.call_once(|| crate::log!("not routing {ip} via {via}: a local address (hosts sharing a network namespace); this is logged once"));
         return Ok(());
     }
     let mut route = rtmsg(RT_SCOPE_UNIVERSE);

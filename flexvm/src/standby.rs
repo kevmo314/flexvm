@@ -320,7 +320,7 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
                 let (h, t) = (host.clone(), template.to_string());
                 std::thread::spawn(move || {
                     if let Err(e) = refill(&h, &t) {
-                        eprintln!("standby {t}: {e}");
+                        crate::log!("standby {t}: {e}");
                     }
                 });
                 return Ok(Value::Null);
@@ -439,7 +439,7 @@ pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]
         if reply["retry"] != json!(true) {
             bail!("{}", reply["error"].as_str().unwrap_or("claim failed"));
         }
-        eprintln!("flexvm: {}; trying another", reply["error"].as_str().unwrap_or(""));
+        crate::log!("flexvm: {}; trying another", reply["error"].as_str().unwrap_or(""));
     }
     Ok(None)
 }
@@ -504,7 +504,7 @@ fn wait_for_reseed(vsock: &std::path::Path) -> Result<()> {
             Ok(Some(n)) if n > 0 => return Ok(()),
             Ok(None) => {
                 if !WARNED.swap(true, Ordering::Relaxed) {
-                    eprintln!("standby: guest agent cannot report RNG reseeds (no FORKS); standby vms are only checked to answer");
+                    crate::log!("standby: guest agent cannot report RNG reseeds (no FORKS); standby vms are only checked to answer");
                 }
                 return Ok(());
             }

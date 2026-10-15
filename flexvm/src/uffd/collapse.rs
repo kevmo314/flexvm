@@ -230,7 +230,7 @@ impl Pager {
         report.wall = started.elapsed();
         report.cpu = thread_cpu().saturating_sub(cpu0);
         if report.tried > 0 {
-            eprintln!(
+            crate::log!(
                 "uffd: collapsed {} of {} fully paged-in 2 MiB chunks into huge pages in {} calls, {:.0} ms ({:.0} ms in the kernel, {:.0} ms CPU){}",
                 report.collapsed,
                 report.tried,

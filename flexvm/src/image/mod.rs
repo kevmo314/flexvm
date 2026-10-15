@@ -186,7 +186,7 @@ pub fn warm_up(vsock: &Path, meta: &ImageMeta) -> Result<()> {
             None => true,
         };
         if ready {
-            eprintln!("image: app ready after {} ms", ms(start.elapsed()));
+            crate::log!("image: app ready after {} ms", ms(start.elapsed()));
             return Ok(());
         }
         let status = guest::app_status(vsock)?;
@@ -231,7 +231,7 @@ fn cached_rootfs(cached: &Path, build: impl FnOnce(&Path) -> Result<String>, syn
         if e.raw_os_error() != Some(libc::EWOULDBLOCK) {
             return Err(e.into());
         }
-        eprintln!("image: waiting for another build of {}", cached.display());
+        crate::log!("image: waiting for another build of {}", cached.display());
         flock(&lock, libc::LOCK_EX)?;
     }
     let marked = match std::fs::symlink_metadata(cached.with_extension("ok")) {
@@ -241,7 +241,7 @@ fn cached_rootfs(cached: &Path, build: impl FnOnce(&Path) -> Result<String>, syn
     if entry_complete(cached) {
         // A previous publisher may have failed its fsync after renaming .ok.
         sync(dir)?;
-        eprintln!("image: root filesystem cached at {}", cached.display());
+        crate::log!("image: root filesystem cached at {}", cached.display());
     } else if marked {
         // Once marked, templates may use the entry: never rebuild it in place.
         bail!(
@@ -269,7 +269,7 @@ fn remove_leftovers(cached: &Path) -> Result<()> {
         let name = entry.file_name();
         let Some(ext) = name.as_bytes().strip_prefix(stem).and_then(|r| r.strip_prefix(b".")) else { continue };
         if ext == b"ext4" || ext == b"conf" || ext.starts_with(b"tmp") || ext.starts_with(b"part") {
-            eprintln!("image: removing {} left by an interrupted build", entry.path().display());
+            crate::log!("image: removing {} left by an interrupted build", entry.path().display());
             std::fs::remove_file(entry.path())?;
             removed = true;
         }
@@ -410,7 +410,7 @@ fn build_rootfs(staging: &Path, img: &source::Image, app: &App, init: &[u8], des
     loop {
         match attempt() {
             Err(e) if tries > 0 && img.layers.iter().any(|l| l.src.evicted()) => {
-                eprintln!("image: {e}; downloading it again");
+                crate::log!("image: {e}; downloading it again");
                 tries -= 1;
             }
             res => return res,
@@ -421,7 +421,7 @@ fn build_rootfs(staging: &Path, img: &source::Image, app: &App, init: &[u8], des
 /// Checks each blob against its descriptor and its contents against the config's diff_ids.
 fn unpack_layers(root: &mut Root, img: &source::Image) -> Result<()> {
     for (i, layer) in img.layers.iter().enumerate() {
-        eprintln!("image: applying layer {}/{} {}", i + 1, img.layers.len(), layer.name());
+        crate::log!("image: applying layer {}/{} {}", i + 1, img.layers.len(), layer.name());
         let what = |e| format!("layer {}: {e}", layer.name());
         let mut blob = layer.open().map_err(what)?;
         let applied = unpack::decompress(&mut blob).and_then(|r| root.apply_layer(r));
@@ -528,7 +528,7 @@ fn mkfs(dir: &Path, entries: u64, dest: &Path) -> Result<()> {
     if !out.status.success() {
         bail!("mkfs.ext4 failed: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
-    eprintln!("image: root filesystem built ({mib} MiB, {entries} entries)");
+    crate::log!("image: root filesystem built ({mib} MiB, {entries} entries)");
     Ok(())
 }
 

@@ -216,18 +216,18 @@ impl Proc {
             match revoke(&self.host, &vm.name) {
                 Ok(freed) if vm.dead() => {
                     if let Err(e) = freed {
-                        eprintln!("vm {}: died while suspending, its checkpoint revoked; freeing its address: {e}", vm.name);
+                        crate::log!("vm {}: died while suspending, its checkpoint revoked; freeing its address: {e}", vm.name);
                     }
                     self.end_died(&op)
                 }
                 Ok(freed) => {
                     if let Err(e) = freed {
-                        eprintln!("vm {}: killed while suspending, its checkpoint revoked; freeing its address: {e}", vm.name);
+                        crate::log!("vm {}: killed while suspending, its checkpoint revoked; freeing its address: {e}", vm.name);
                     }
                     self.finish(&op, End::Gone, 128 + libc::SIGINT, None)
                 }
                 Err(e) => {
-                    eprintln!("vm {}: {how} while suspending, but its checkpoint stays: {e}", vm.name);
+                    crate::log!("vm {}: {how} while suspending, but its checkpoint stays: {e}", vm.name);
                     self.finish(&op, End::Suspended, crate::vmproc::FAILED, None)
                 }
             }
@@ -235,7 +235,7 @@ impl Proc {
         match saved {
             Ok((m, _)) => {
                 let data = (m.data_pages * PAGE_SIZE as u64) >> 20;
-                eprintln!(
+                crate::log!(
                     "{}",
                     json!({"name": vm.name, "state": "suspended", "dir": self.host.suspended(&vm.name), "freed_rss_mib": vm.rss() >> 20, "data_mib": data, "suspend_ms": ms(t.total()), "timings_ms": t.json()})
                 );
@@ -455,7 +455,7 @@ impl Proc {
         let p = self.arc();
         thread::spawn(move || {
             let pulled = p.as_ref().map_or_else(|| vm.pager.wait_pulled(None), |p| p.wait_pulled(&vm));
-            eprintln!("vm {}: {to_load} MiB paged in from {} (complete: {pulled}, {:?} ms)", vm.name, dir.display(), vm.pager.pull_time().map(ms));
+            crate::log!("vm {}: {to_load} MiB paged in from {} (complete: {pulled}, {:?} ms)", vm.name, dir.display(), vm.pager.pull_time().map(ms));
             if let Some(p) = p {
                 // Not under `op`: the memory is in, whatever operation runs.
                 if pulled && p.pulled_all() {
@@ -601,7 +601,7 @@ impl Proc {
         let _held = (cow && !fault("ckpt_no_hold")).then(|| {
             let held = HeldReports(vm);
             if let Err(e) = vm.hold_reports() {
-                eprintln!("vm {}: free page reports may not be held during the copy: {e}", vm.name);
+                crate::log!("vm {}: free page reports may not be held during the copy: {e}", vm.name);
             }
             held
         });
@@ -782,7 +782,7 @@ struct HeldReports<'a>(&'a Vm);
 impl Drop for HeldReports<'_> {
     fn drop(&mut self) {
         if let Err(e) = self.0.release_reports(Duration::from_secs(5)) {
-            eprintln!("vm {}: releasing free page reports failed: {e}", self.0.name);
+            crate::log!("vm {}: releasing free page reports failed: {e}", self.0.name);
         }
     }
 }
@@ -828,7 +828,7 @@ fn mark_durably(dir: &Path, name: &str) -> std::io::Result<()> {
 /// name's next holder).
 pub fn delete_consumed(name: &str, dir: &Path) {
     if let Err(e) = remove_durably(dir) {
-        eprintln!("vm {name}: removing {}: {e}", dir.display());
+        crate::log!("vm {name}: removing {}: {e}", dir.display());
     }
 }
 

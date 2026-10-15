@@ -1,3 +1,5 @@
+#![deny(clippy::print_stderr)]
+
 mod bench;
 mod checkpoint;
 mod compat;
@@ -214,7 +216,7 @@ fn main() {
     let (args, error) = Args::parse_partly(std::env::args().skip(1));
     let vm = matches!(args.positional.first().map(String::as_str), Some("run" | "resume" | "restore"));
     if let Err(e) = error.map_or_else(|| real_main(&args), Err) {
-        eprintln!("flexvm: {e}");
+        crate::log!("flexvm: {e}");
         std::process::exit(if vm { vmproc::FAILED } else { 1 });
     }
 }
@@ -387,6 +389,8 @@ fn real_main(args: &Args) -> Result<()> {
             "" => Err("debug fault|ckhash|gc|VM ...".into()),
             _ => call(json!({"op": "debug", "what": arg2.unwrap_or("status")})),
         },
+        // One-shot CLI usage output, outside the VM and listener paths.
+        #[allow(clippy::print_stderr)]
         _ => {
             eprint!("{USAGE}");
             std::process::exit(2);
@@ -453,10 +457,10 @@ fn configure(c: &mut host::Config, args: &Args, addr: Option<&str>) -> Result<()
         c.evict_mib = (args.get("evict-at") != Some("")).then(|| args.parse_or("evict-at", 0)).transpose()?;
     }
     if let Some(e) = c.evict_mib.filter(|&e| e < c.reserve_mib) {
-        eprintln!("flexvm: the eviction mark {e} MiB is under the {} MiB reserve: eviction starts at the reserve", c.reserve_mib);
+        crate::log!("flexvm: the eviction mark {e} MiB is under the {} MiB reserve: eviction starts at the reserve", c.reserve_mib);
     }
     if !c.peers.is_empty() && c.vm_ips == host::Config::default().vm_ips {
-        eprintln!("flexvm: warning: --vm-ips is the default {}; each peer needs a range of its own", c.vm_ips);
+        crate::log!("flexvm: warning: --vm-ips is the default {}; each peer needs a range of its own", c.vm_ips);
     }
     if let Some(p) = args.get("prefix") {
         host::check_prefix(p).map_err(|e| format!("--prefix: {e}"))?;
@@ -482,7 +486,7 @@ fn run(args: &Args, name: &str, template: &str) -> Result<()> {
     match if tried { None } else { standby::take(&host, &paths, template, &req, &outs.iter().map(|f| f.as_raw_fd()).collect::<Vec<_>>())? } {
         Some((v, _)) if log.is_some() => print(v),
         Some((v, conn)) => {
-            eprintln!("{v}");
+            crate::log!("{v}");
             let id = host::Ident { pid: v["pid"].as_u64().unwrap_or(0) as u32, start: v["start"].as_u64().unwrap_or(0), boot: host::boot_id().into() };
             follow(conn, id)
         }

@@ -159,7 +159,7 @@ impl Vm {
         match host.grant(more, Some(Instant::now() + ADMIT_WAIT)) {
             Ok(Some(_)) => self.limit.plug(cap, more),
             Ok(None) => {}
-            Err(e) => eprintln!("vm {}: admitting {more} MiB: {e}", self.name),
+            Err(e) => crate::log!("vm {}: admitting {more} MiB: {e}", self.name),
         }
     }
 
@@ -237,7 +237,7 @@ impl Vm {
         if let Some(pid) = stopped {
             // Frames pile up on the tap while Firecracker is stopped, more than the guest has
             // buffers for, and the address is held before it goes on: a queue to take.
-            eprintln!("vm {}: injected fault: stopping firecracker for 200 ms, holding its address meanwhile", self.name);
+            crate::log!("vm {}: injected fault: stopping firecracker for 200 ms, holding its address meanwhile", self.name);
             unsafe { libc::kill(pid as libc::pid_t, libc::SIGSTOP) };
             std::thread::sleep(Duration::from_millis(200));
         }
@@ -296,7 +296,7 @@ impl Vm {
                 Some(fd)
             }
             Err(e) => {
-                eprintln!("vm {}: not waiting for its tap's queue before the pause: {e}", self.name);
+                crate::log!("vm {}: not waiting for its tap's queue before the pause: {e}", self.name);
                 None
             }
         }
@@ -310,12 +310,12 @@ impl Vm {
             return match crate::net::tap_queued(fd) {
                 Ok(queued) => {
                     if queued {
-                        eprintln!("vm {}: frames still queued on its tap, which its paused guest does not take", self.name);
+                        crate::log!("vm {}: frames still queued on its tap, which its paused guest does not take", self.name);
                     }
                     !queued
                 }
                 Err(e) => {
-                    eprintln!("vm {}: not waiting for its tap's queue before the pause: {e}", self.name);
+                    crate::log!("vm {}: not waiting for its tap's queue before the pause: {e}", self.name);
                     true
                 }
             };
@@ -327,18 +327,22 @@ impl Vm {
                 Ok(false) => break,
                 Ok(true) => queued = true,
                 Err(e) => {
-                    eprintln!("vm {}: not waiting for its tap's queue before the pause: {e}", self.name);
+                    crate::log!("vm {}: not waiting for its tap's queue before the pause: {e}", self.name);
                     return true;
                 }
             }
             if start.elapsed() >= TAP_DRAIN_WAIT {
-                eprintln!("vm {}: frames still queued on its tap {} ms after its address was held; pausing it anyway", self.name, start.elapsed().as_millis());
+                crate::log!(
+                    "vm {}: frames still queued on its tap {} ms after its address was held; pausing it anyway",
+                    self.name,
+                    start.elapsed().as_millis()
+                );
                 return false;
             }
             std::thread::sleep(Duration::from_millis(1));
         }
         if queued {
-            eprintln!("vm {}: its guest took what was queued on its tap in {:.1} ms before the pause", self.name, start.elapsed().as_secs_f64() * 1e3);
+            crate::log!("vm {}: its guest took what was queued on its tap in {:.1} ms before the pause", self.name, start.elapsed().as_secs_f64() * 1e3);
         }
         true
     }
@@ -523,7 +527,7 @@ impl Vm {
         self.switch_unsure.store(now.is_none(), Ordering::SeqCst);
         if now == Some(to) {
             if let Err(e) = &res {
-                eprintln!("vm {}: {e}, but firecracker is {}", self.name, to.name());
+                crate::log!("vm {}: {e}, but firecracker is {}", self.name, to.name());
             }
             return Ok(());
         }
@@ -674,7 +678,7 @@ impl Vm {
                 }
                 Ok(None) => {
                     if first.is_none() && !WARNED.swap(true, Ordering::Relaxed) {
-                        eprintln!("vm {}: its guest agent cannot set the clock (no CLOCK); clocks of such VMs are left alone", self.name);
+                        crate::log!("vm {}: its guest agent cannot set the clock (no CLOCK); clocks of such VMs are left alone", self.name);
                     }
                     return Ok(first.unwrap_or(0.0));
                 }
@@ -712,7 +716,7 @@ impl Vm {
                 }
                 Err(e) if Instant::now() >= deadline => return Err(e),
                 Err(e) => {
-                    eprintln!("vm {}: releasing free page reports: {e}; retrying", self.name);
+                    crate::log!("vm {}: releasing free page reports: {e}; retrying", self.name);
                     std::thread::sleep(Duration::from_millis(50));
                 }
             }
@@ -734,7 +738,7 @@ impl Vm {
             }
         };
         if let Err(e) = res {
-            eprintln!("vm {}: balloon statistics stay off: {e}", self.name);
+            crate::log!("vm {}: balloon statistics stay off: {e}", self.name);
         }
     }
 
@@ -777,7 +781,7 @@ impl Vm {
             // Before the tap goes (`fc::release`) with its counters: a full queue drops frames
             // (a guest not keeping up), counted only there.
             if let Some(n) = self.tap_dropped().filter(|&n| n > 0) {
-                eprintln!("vm {}: its tap dropped {n} frames (its queue full, or no Firecracker reading it)", self.name);
+                crate::log!("vm {}: its tap dropped {n} frames (its queue full, or no Firecracker reading it)", self.name);
             }
             // Before the tap goes too, which purges its queue; not keeping it after.
             if let Some((_, fd)) = self.tap_watch.lock().unwrap().take() {
@@ -785,10 +789,10 @@ impl Vm {
                     // Gone (not reaped, so its pid is not reused), so no read of its races these.
                     let gone = crate::util::pidfd_open(fc.pid()).and_then(|p| crate::util::readable(&p, Duration::from_secs(2)));
                     if !matches!(gone, Ok(true)) {
-                        eprintln!("vm {}: firecracker not seen gone ({gone:?}); counting what is left on its tap anyway", self.name);
+                        crate::log!("vm {}: firecracker not seen gone ({gone:?}); counting what is left on its tap anyway", self.name);
                     }
                     let n = crate::net::discard_tap_queue(&fd);
-                    eprintln!("vm {}: dropped {n} frames still queued on its tap when it left (its guest was not taking them)", self.name);
+                    crate::log!("vm {}: dropped {n} frames still queued on its tap when it left (its guest was not taking them)", self.name);
                 }
             }
             let _ = UnixStream::connect(self.mem_sock());
@@ -918,7 +922,7 @@ impl Prepared {
             Err(e) if e.to_string().contains("Invalid request method and/or path") => {
                 self.pager.expect_seed(false);
                 if !UNSUPPORTED.swap(true, Ordering::Relaxed) {
-                    eprintln!("firecracker cannot prepare snapshot loads ({e}); migrations load the whole snapshot while paused");
+                    crate::log!("firecracker cannot prepare snapshot loads ({e}); migrations load the whole snapshot while paused");
                 }
                 Ok(false)
             }
@@ -947,7 +951,7 @@ impl Prepared {
             Err((e, None)) => return Err(e),
             Err((e, Some(realtime))) => (e, realtime),
         };
-        eprintln!("vm {name}: load failed ({e}); once more on a fresh firecracker{}", if realtime { "" } else { ", without clock_realtime" });
+        crate::log!("vm {name}: load failed ({e}); once more on a fresh firecracker{}", if realtime { "" } else { ", without clock_realtime" });
         before_retry()?;
         let mut fresh = Vm::prepare(spawner.take(deadline)?, tpl, t)?;
         fresh.route = route;
@@ -1025,7 +1029,7 @@ impl Prepared {
                     Some(_) if !self.pager.lost_pages() && !idle.alive() => Some(clock_realtime),
                     _ => None,
                 };
-                eprintln!("vm {name}: restore failed: {e} ({})", idle.post_mortem());
+                crate::log!("vm {name}: restore failed: {e} ({})", idle.post_mortem());
                 Err((e, retry))
             }
         }

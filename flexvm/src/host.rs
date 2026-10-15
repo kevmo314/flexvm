@@ -738,7 +738,7 @@ impl Host {
         let dying = dead.is_some() && a.holder_id.as_ref() == dead;
         let Some(via) = a.via.filter(|_| !a.withdrawn && (dying || !self.held(&a))) else { return Ok(false) };
         crate::net::route_via(ip, via)?;
-        eprintln!("put back route {ip} via {via} (generation {})", a.seen);
+        crate::log!("put back route {ip} via {via} (generation {})", a.seen);
         Ok(true)
     }
 
@@ -918,7 +918,7 @@ impl Host {
         // it does, the record stays (still aborted), so the next query retries.
         if let Some(ip) = ip {
             if let Err(e) = self.reinstall(&l, ip, Some(&owner)) {
-                eprintln!("migration {id} died before its commit; putting back the route for {ip}: {e}; retried on the next query");
+                crate::log!("migration {id} died before its commit; putting back the route for {ip}: {e}; retried on the next query");
                 return Ok("aborted");
             }
         }
@@ -948,7 +948,7 @@ impl Host {
             let Some(by) = by.filter(|_| !source.is_empty()) else { continue };
             let gone = crate::vmproc::peer_call(&source, serde_json::json!({"op": "source", "ident": by}));
             if gone.is_ok_and(|r| r["gone"] == true) {
-                eprintln!("migration {id}: its source at {source} is gone; forgetting it");
+                crate::log!("migration {id}: its source at {source} is gone; forgetting it");
                 let _ = self.mig_done(id);
             }
         }
@@ -1086,7 +1086,7 @@ impl MigRecord {
                 }
             });
             match done {
-                Err(e) if within.is_none_or(|w| start.elapsed() + delay < w) => eprintln!("migration {}: {e}; retrying", self.id),
+                Err(e) if within.is_none_or(|w| start.elapsed() + delay < w) => crate::log!("migration {}: {e}; retrying", self.id),
                 done => return done,
             }
             std::thread::sleep(delay);
@@ -1412,7 +1412,7 @@ impl Host {
 pub fn clear_taps(run: &Path, me: &Ident) {
     for (name, index, owner) in taps_of(run) {
         if owner.pid == me.pid && owner.liveness() == Liveness::Gone {
-            eprintln!("removing tap {name}, a dead process's with this pid");
+            crate::log!("removing tap {name}, a dead process's with this pid");
             crate::net::delete_link(index, &name);
         }
     }

@@ -26,7 +26,7 @@ pub fn serve_pages(pager: &Pager, conn: &TcpStream, mut stream: impl Read + Writ
         let offset = u64::from_le_bytes(req[..8].try_into().unwrap());
         let len = u32::from_le_bytes(req[8..].try_into().unwrap()) as usize;
         if len > MAX_FETCH {
-            eprintln!("page server: refusing a {len}-byte read (at most {MAX_FETCH}); dropping the connection");
+            crate::log!("page server: refusing a {len}-byte read (at most {MAX_FETCH}); dropping the connection");
             return stream.write_all(&[1]);
         }
         // The status byte, then the pages: sent with one write. The buffer only grows (zeroed once): `read_guest`
@@ -40,7 +40,7 @@ pub fn serve_pages(pager: &Pager, conn: &TcpStream, mut stream: impl Read + Writ
         match pager.read_guest(offset, &mut reply[1..]) {
             Ok(()) => stream.write_all(reply)?,
             Err(e) => {
-                eprintln!("page server: {e}");
+                crate::log!("page server: {e}");
                 stream.write_all(&[1])?;
             }
         }

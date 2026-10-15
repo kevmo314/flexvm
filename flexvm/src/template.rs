@@ -639,7 +639,7 @@ fn build(paths: &Paths, staging: &str, name: &str, vcpus: u32, mem_mib: u64, max
     }
     let (reported, done) = wait_reporting_done(&fc, &metrics, plugged * 3 / 4)?;
     if !done {
-        eprintln!(
+        crate::log!(
             "template {name}: free page reporting did not finish ({reported} MiB reported of {plugged} MiB \
              plugged); VMs will report the rest after restore, at some RSS each"
         );
