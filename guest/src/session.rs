@@ -448,7 +448,10 @@ mod tests {
         wire
     }
 
-    /// Pumps `n` reads of `data` (alternating kinds if `kinds`); returns once it stops making progress.
+    /// Pumps `n` reads of `data` (alternating kinds if `kinds`); returns once they are all in, or once the
+    /// ring holds them up: output must wait, with the reservation its next read would grow already grown (so
+    /// it is waiting, or will be). Not once 100 ms pass without progress: on a loaded machine the pump may not
+    /// have started by then (#294).
     fn pump(output: &Session, n: usize, data: &'static [u8], kinds: bool) -> thread::JoinHandle<()> {
         let pumped = output.clone();
         let t = thread::spawn(move || {
@@ -456,12 +459,17 @@ mod tests {
                 deliver(&pumped, if kinds && i % 2 == 1 { FRAME_STDERR } else { FRAME_STDOUT }, data);
             }
         });
-        let mut last = u64::MAX;
-        while output.0.lock().unwrap().end != last {
-            last = output.0.lock().unwrap().end;
-            thread::sleep(Duration::from_millis(100));
+        let give_up = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let mut ring = output.0.lock().unwrap();
+            let need = (ring.end - ring.start) as usize + data.len();
+            ring.reservation.grow(need);
+            if ring.must_wait() || t.is_finished() || std::time::Instant::now() >= give_up {
+                return t;
+            }
+            drop(ring);
+            thread::sleep(Duration::from_millis(1));
         }
-        t
     }
 
     fn detach_and_join(output: &Session, t: thread::JoinHandle<()>) {
