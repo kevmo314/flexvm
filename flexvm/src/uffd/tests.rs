@@ -898,22 +898,35 @@ fn prefetch_ordering_preserves_learning_and_load_completion() {
 fn protect_ranges_stay_bounded() {
     use super::wp::{protect_ranges, PROTECT_MAX};
     // Merged across gaps of up to 64 pages, and not across a kept page.
-    assert_eq!(protect_ranges([0, 65, 131].into_iter(), |_| false), vec![(0, 66), (131, 132)]);
-    assert_eq!(protect_ranges([0, 10].into_iter(), |p| p == 5), vec![(0, 1), (10, 11)]);
+    assert_eq!(protect_ranges([0, 65, 131].into_iter(), &[]), vec![(0, 66), (131, 132)]);
+    assert_eq!(protect_ranges([0, 10].into_iter(), &[5]), vec![(0, 1), (10, 11)]);
+    assert_eq!(protect_ranges([0, 10].into_iter(), &[11]), vec![(0, 11)]);
     // Every 66th page of a 32 GiB region: 127,101 ranges at that gap, merged down to a bounded count, covering every
     // page and no kept one.
     let n = 32 << 18;
-    let kept = |p: usize| p % (1 << 20) == 7;
-    let pages: Vec<usize> = (0..n).step_by(66).filter(|&p| !kept(p)).collect();
-    let ranges = protect_ranges(pages.iter().copied(), kept);
-    assert!(ranges.len() <= PROTECT_MAX, "{} ranges", ranges.len());
-    assert!(ranges.windows(2).all(|w| w[0].1 < w[1].0));
-    let mut r = ranges.iter().peekable();
-    for &p in &pages {
-        while r.peek().is_some_and(|&&(_, e)| e <= p) {
-            r.next();
+    let kept: Vec<usize> = (7..n).step_by(1 << 20).collect();
+    let pages: Vec<usize> = (0..n).step_by(66).filter(|p| kept.binary_search(p).is_err()).collect();
+    let covers = |ranges: &[(usize, usize)], pages: &[usize], kept: &[usize]| {
+        assert!(ranges.windows(2).all(|w| w[0].1 < w[1].0));
+        let mut r = ranges.iter().peekable();
+        for &p in pages {
+            while r.peek().is_some_and(|&&(_, e)| e <= p) {
+                r.next();
+            }
+            assert!(r.peek().is_some_and(|&&(f, _)| f <= p), "page {p} not protected");
         }
-        assert!(r.peek().is_some_and(|&&(f, _)| f <= p), "page {p} not protected");
-    }
-    assert!(ranges.iter().all(|&(f, e)| !(f..e).any(kept)));
+        assert!(ranges.iter().all(|&(f, e)| !kept.iter().any(|k| (f..e).contains(k))));
+    };
+    let ranges = protect_ranges(pages.iter().copied(), &kept);
+    assert!(ranges.len() <= PROTECT_MAX, "{} ranges", ranges.len());
+    covers(&ranges, &pages, &kept);
+    // A kept page just before each of 4,098 dirty ones 2047 pages apart: nothing can merge, so every pass runs to
+    // the region's span. A walk along the kept pages, not a lookup per page of every gap, keeps that fast.
+    let kept: Vec<usize> = (1..=4098).map(|i| 2047 * i - 1).collect();
+    let pages: Vec<usize> = (1..=4098).map(|i| 2047 * i).collect();
+    let start = std::time::Instant::now();
+    let ranges = protect_ranges(pages.iter().copied(), &kept);
+    assert!(start.elapsed() < std::time::Duration::from_millis(100), "{:?}", start.elapsed());
+    assert_eq!(ranges.len(), pages.len());
+    covers(&ranges, &pages, &kept);
 }
