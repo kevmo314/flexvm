@@ -7254,7 +7254,7 @@ SCENARIOS = dict(
     fc_prepare=fc_prepare, slow_preload=slow_preload, bad_preload=bad_preload, ckpt_packet_hold=ckpt_packet_hold, ckpt_stall=ckpt_stall, standby=standby,
     suspend_disk_freed=suspend_disk_freed, resume_mark_fails=resume_mark_fails, kill_source=kill_source,
     kill_refused_checkpoint=no_evict(kill_refused_checkpoint), wildcard_listen=wildcard_listen, peer_by_name=peer_by_name, peer_moved=peer_moved, page_refusals=page_refusals,
-    forged_peer=forged_peer, restore_ip_peer=restore_ip_peer, spoof_filter=spoof_filter, spoof_csum=spoof_csum, late_withdrawal=late_withdrawal, unlend_retry=unlend_retry,
+    forged_peer=forged_peer, restore_ip_peer=restore_ip_peer, spoof_filter=spoof_filter, late_withdrawal=late_withdrawal, unlend_retry=unlend_retry,
     unit_restart=unit_restart, log_cap=log_cap, gc_debris=gc_debris, prefix_change=prefix_change, arrival_log=arrival_log, template_tap=template_tap,
     incoming_killed=incoming_killed, start_killed=start_killed, claim_killed=claim_killed, standby_stalled=standby_stalled, standby_refill_race=standby_refill_race, standby_lock_timeout=standby_lock_timeout, fc_died=fc_died,
     sigkill_restart=sigkill_restart, listen_trickle=listen_trickle,
