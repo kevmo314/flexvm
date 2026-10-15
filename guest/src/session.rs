@@ -99,7 +99,7 @@ fn session(output: Output) -> Session {
 pub struct Table {
     live: HashMap<String, Entry>,
     closed: HashMap<String, Duration>,
-    cancelled: HashMap<String, Instant>,
+    cancelled: HashMap<String, Duration>,
     pool: Arc<AtomicUsize>,
 }
 
@@ -162,7 +162,7 @@ impl Table {
                 self.cancelled.remove(&oldest);
             }
         }
-        self.cancelled.insert(id.to_string(), Instant::now());
+        self.cancelled.insert(id.to_string(), awake());
     }
 
     /// Closes sessions whose client is gone: finished ones after `ABANDONED`, running ones (killing
@@ -349,7 +349,7 @@ pub fn cleanup(sessions: &Sessions, statuses: &Statuses) {
     table.reclaim(statuses);
     let now = awake();
     table.closed.retain(|_, at| now.saturating_sub(*at) < RETENTION);
-    table.cancelled.retain(|_, at| at.elapsed() < RETENTION);
+    table.cancelled.retain(|_, at| now.saturating_sub(*at) < RETENTION);
 }
 
 /// Request errors become a message frame; write errors just end the stream (a frame may be cut short).
@@ -820,6 +820,15 @@ mod tests {
         set_clock(old + RETENTION);
         cleanup(&sessions, &statuses);
         assert_eq!(sessions.lock().unwrap().closed.keys().collect::<Vec<_>>(), ["recent"]);
+        // Cancelled IDs keep their retention across a pause too.
+        let cancelled = old + RETENTION;
+        sessions.lock().unwrap().cancel("cancelled");
+        set_clock(cancelled + tick(Duration::from_secs(1200)));
+        cleanup(&sessions, &statuses);
+        assert!(request(&sessions, &statuses, "SESSION cancelled 4", b"true").ends_with(b"session closed"));
+        set_clock(cancelled + RETENTION);
+        cleanup(&sessions, &statuses);
+        assert!(sessions.lock().unwrap().cancelled.is_empty());
     }
 
     #[test]
