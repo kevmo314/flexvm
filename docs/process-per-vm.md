@@ -1,6 +1,6 @@
 # One process per VM
 
-Issue #85. flexvm has no central daemon. `flexvm run NAME` starts a process
+flexvm has no central daemon. `flexvm run NAME` starts a process
 that *is* the VM: it owns the Firecracker child, the uffd pager, the tap and
 route, packet holds, guest sessions, checkpoints and its side of every
 migration. The process exits when the VM is gone. Everything host-wide lives in
@@ -108,6 +108,7 @@ Two directories, both overridable (`--state`/`FLEXVM_STATE`, `--run`/`FLEXVM_RUN
 STATE (default /var/lib/flexvm, on disk)
   host.json              host config: listen, peers, vm_ips, underlay, announce_dev, dns, reserve_mib, evict_mib, prefix
   lock                   the host lock (flock), held for short critical sections only
+  .synced                the root's (dev, inode) once its directories were made durable (`Host::open`)
   addrs/IP               per address: newest generation seen, withdrawn?, lent generation, holder name, instance
                          (pid, start time) and generation, the route a peer announced for the newest generation
                          and the newest revision of it (where the VM is within the generation)
@@ -117,14 +118,29 @@ STATE (default /var/lib/flexvm, on disk)
                          + STARTED, DISCARDED, QUARANTINE markers; without a manifest, or STARTED or
                          DISCARDED, it is debris: never listed, removed by the name's next holder
   standby/TEMPLATE       how many standby VMs to keep for a template
+  standby.stop.lock      held while pressure stops standby VMs (SIGUSR1)
   migs/ID                incoming migration records (fencing), JSON, fsynced
+  evict.lock             one eviction decider at a time (flock)
+  evict.worker.lock      held by the thread running an eviction; arrivals by eviction are refused meanwhile
+  evict.last             its mtime: when an eviction last started (5 s apart)
+  staging/               where image layers unpack (`template --image`): `/var/lib/flexvm/staging`
+                         whatever STATE is, as it must be root-owned (`--image-staging` elsewhere)
 RUN (default /run/flexvm, tmpfs)
   vms/NAME.{lock,json,sock,log}   registry entry, liveness lock, control socket, log of -d/standby VMs
   vms/NAME.{failed,moved}         why a VM died (until `flexvm kill`); where it migrated to (an hour)
   vms/.incoming-LPID-N.log        an arrival's log until it is accepted (as NAME.log) or refused; locked by the arrival
   .gc, .gc.lock          when garbage was last swept periodically; one sweep at a time
+  .logs.lock             logs are opened holding it shared, swept holding it exclusively
+  holds/ID-MIB           memory admitted to a live process, flocked by it (`.ID` while being made)
+  grants-BOOTID          recent grants not yet held, counted against the reserve
+  evict.active           present while the host is under its eviction mark
+  evict.backoff          refused VM and peer pairs and when to try them again
   standby/T/KEY.PID-START.sock a standby VM of template T, generation KEY (PID-START.lock while it lives)
+  standby/T/PID-START.claim  locked by a standby VM while a claim of it is under way
+  standby/T/.refill      one refill of T at a time (flock)
+  standby/T/.failed      its mtime: T's last failed refill (none for a minute after)
   standby/T/standby.log  the standby VMs' output and refill errors
+  standby/.pressure      its mtime: when pressure last stopped standby VMs (no refill for a minute)
   standby/.loadset-ID    pages loads of template ID touch, learned by standby VMs, for migrations to preload
                          (one per generation, never swept: whether one is in use cannot be told)
   faults.json            armed test faults (FLEXVM_FAULTS=1 only)
@@ -332,8 +348,13 @@ one of:
 | `lend` | lend an address of this host's range to a restoring peer, with a new generation |
 | `source` | whether a VM process of that name is a migration source here (a target retires a released record when not) |
 
-Only connections from the configured peers' addresses are served. Request
-lines must arrive whole within 10 s of the connection being accepted (one deadline, however the line trickles in; peer names are resolved off the request path, at start and every 30 s) and are capped at 64 KiB; at most 512
+Only connections from the configured peers' addresses are served, by
+host.json as it is now: any other gets `{"ok": false, "error": "IP is not
+a peer of ADDR ..."}` from the accept loop, unread and without a slot, and
+is closed. Peer names are resolved only by one background thread (at start,
+every 30 s, and when a request meets a name not yet resolved); an address
+needs no lookup, and a name no longer configured admits nothing. Request
+lines must arrive whole within 10 s of the connection being accepted (one deadline, however the line trickles in) and are capped at 64 KiB; at most 512
 requests at once. Restarting or not running it loses nothing but the ability
 to receive.
 
@@ -410,14 +431,16 @@ refuses at once and the next VM is tried; eviction never waits for or races
 an operation. A refused VM and peer pair is not tried again for 5 s, doubling
 to 60 s while refusals continue (`RUN/evict.backoff`). A refused arrival's
 log is removed; an accepted one becomes `NAME.log`.
-Announcements and `lend` requests go to all peers at once.
-This replaces the `info` op the daemon used to find room.
+Announcements and `lend` requests go to all peers at once, by the peers
+configured now (`Host::config_now`); the listener re-reads them too, so
+`flexvm config --peer` reaches running processes.
 
 ## Exec across hosts
 
-There is no remote control channel any more. An exec whose VM migrates away
-ends with `vm NAME moved to HOST (session ID keeps running there)`, exit 1;
-reconnection within a host (checkpoint pauses, vsock resets) still works.
+There is no remote control channel. An exec whose VM migrates away ends
+with `vm NAME moved to HOST; the command keeps running there (session ID)`,
+exit 1; reconnection within a host (checkpoint pauses, vsock resets) still
+works.
 
 ## Invariants
 

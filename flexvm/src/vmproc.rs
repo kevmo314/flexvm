@@ -316,7 +316,7 @@ impl Proc {
     pub fn borrow(&self, name: &str, ip: Ipv4Addr) -> Result<AddrClaim> {
         let asks: Vec<_> = self
             .host
-            .cfg
+            .config_now()
             .peers
             .iter()
             .cloned()
@@ -600,8 +600,9 @@ impl Proc {
 
     pub fn announce(&self) {
         let vm = self.vm().clone();
-        let (ip, gen, rev, peers, dev) = (vm.ip, self.gen(), self.rev(), self.host.cfg.peers.clone(), self.host.cfg.announce_dev.clone());
-        let Some(via) = self.host.cfg.underlay() else {
+        let cfg = self.host.config_now();
+        let (ip, gen, rev, peers, dev) = (vm.ip, self.gen(), self.rev(), cfg.peers.clone(), cfg.announce_dev.clone());
+        let Some(via) = cfg.underlay() else {
             if !peers.is_empty() {
                 eprintln!("announce {ip}: no underlay address (give flexvm listen an ADDR peers can reach, or --underlay IP); peers not told");
             }
@@ -1712,7 +1713,7 @@ pub fn peer_call(peer: &str, req: Value) -> Result<Value> {
 
 pub fn tell_peers(host: &Host, req: Value) {
     let sends: Vec<_> = host
-        .cfg
+        .config_now()
         .peers
         .iter()
         .cloned()

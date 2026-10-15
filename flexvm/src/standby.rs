@@ -93,13 +93,22 @@ pub fn templates(host: &Host) -> Vec<String> {
     t
 }
 
-pub fn set(host: &Host, template: &str, n: usize) -> Result<Value> {
+/// The template is checked first: a count saved for one that cannot be opened would be retried forever.
+pub fn set(host: &Host, paths: &Paths, template: &str, n: usize) -> Result<Value> {
+    if n > 0 {
+        Template::open(paths, template)?;
+    }
     crate::util::write_file(&host.state.join("standby"), template, n.to_string().as_bytes(), true)?;
     for id in live(host, template).iter().skip(n) {
         stop(id);
     }
     let started = refill(host, template)?;
     Ok(json!({"template": template, "standby": n, "started": started}))
+}
+
+/// Each template's count and its standby VMs now.
+pub fn show(host: &Host) -> Value {
+    json!(templates(host).iter().map(|t| json!({"template": t, "standby": target(host, t), "live": live(host, t).len()})).collect::<Vec<_>>())
 }
 
 /// Periodic recovery, run by listeners and running VM processes. A

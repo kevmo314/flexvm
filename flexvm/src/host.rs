@@ -132,6 +132,16 @@ impl Config {
     }
 }
 
+/// HOST:PORT, an IPv6 address in brackets; a name is resolved only when used.
+pub fn is_endpoint(s: &str) -> bool {
+    let Some((h, port)) = s.rsplit_once(':') else { return false };
+    let host = match h.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        Some(v6) => v6.parse::<std::net::Ipv6Addr>().is_ok(),
+        None => !h.is_empty() && !h.contains([':', '[', ']', '/', ' ']),
+    };
+    host && port.parse::<u16>().is_ok_and(|p| p > 0)
+}
+
 /// Unreadable or corrupt is an error, never None.
 pub fn load<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
     match std::fs::read(path) {
@@ -276,18 +286,28 @@ impl Host {
     /// The configuration as it is now: `flexvm listen` may have changed the
     /// reserve, the eviction mark or the peers since this process started.
     /// host.json is read again once its mtime or inode changed (then cached by both).
+    /// While it cannot be read whole (mid-write, missing), the newest one that was read
+    /// stands, never an older one: a peer revoked since is not let back in.
     pub fn config_now(&self) -> Config {
         static SEEN: Mutex<Option<(PathBuf, Stamp, Config)>> = Mutex::new(None);
         let path = self.state.join("host.json");
-        let Some(now) = stamp(&path).filter(|&t| Some(t) != self.cfg_stamp) else { return self.cfg.clone() };
+        let now = stamp(&path);
+        if now.is_some() && now == self.cfg_stamp {
+            return self.cfg.clone();
+        }
         let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((_, _, cfg)) = seen.as_ref().filter(|(p, t, _)| *p == path && *t == now) {
+        let last = seen.as_ref().filter(|(p, ..)| *p == path).map(|(_, t, c)| (*t, c.clone()));
+        if let Some((_, cfg)) = last.as_ref().filter(|(t, _)| Some(*t) == now) {
             return cfg.clone();
         }
-        // Not cached unless read whole (a writer that is not `listen` may be mid-write).
-        let Some(cfg) = load::<Config>(&path).ok().flatten() else { return self.cfg.clone() };
-        *seen = Some((path, now, cfg.clone()));
-        cfg
+        if let Some(cfg) = now.and_then(|_| load::<Config>(&path).ok().flatten()) {
+            *seen = Some((path, now.unwrap(), cfg.clone()));
+            return cfg;
+        }
+        match last {
+            Some((t, cfg)) if self.cfg_stamp.is_none_or(|own| own.0 <= t.0) => cfg,
+            _ => self.cfg.clone(),
+        }
     }
 
     fn worker_flock(&self) -> Option<Flock> {

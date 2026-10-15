@@ -73,7 +73,7 @@ impl Firecracker {
                 Ok(())
             });
         }
-        let child = cmd.spawn()?;
+        let child = cmd.spawn().map_err(|e| format!("{}: {e} (see README: Setup)", bin.display()))?;
         let fc = Firecracker { child, sockets, dir: dir.into(), cgroup: None, tap: String::new(), api: Api::default(), joining: RefCell::new(None) };
         let id = crate::host::Ident::of(fc.pid()).ok_or_else(|| fc.post_mortem())?;
         crate::host::store(&dir.join("fc"), &id, false)?;
