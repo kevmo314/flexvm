@@ -209,7 +209,7 @@ def fault(host, f, ms):
 FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_before_run", "restore_after_run",
           "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "resume_kill",
           "prepare_fail", "short_incoming", "slow_preload", "bad_preload", "bad_app_log", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
-          "started_fsync", "started_unmark", "start_stall", "incoming_stall", "claim_stall", "standby_lock_stall", "standby_lock_hang", "handoff_stall", "ckpt_wp_race",
+          "started_fsync", "started_unmark", "start_stall", "incoming_stall", "claim_stall", "standby_lock_stall", "standby_lock_hang", "handoff_stall", "ckpt_wp_race", "ckpt_rescue_fail",
           "fetch_tail_enomem", "fetch_enomem_stuck", "pull_enomem", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo", "release_stall", "release_late", "no_plug", "pause_lost", "tap_backlog", "tap_backlog_stuck", "pause_unknown", "no_collapse", "collapse_slow", "pages_slow", "unlend_fail", "route_stall")
 
 
@@ -2575,6 +2575,44 @@ def cow_exact():
     cleanup("ft-cow3")
     rm_ckpt(path)
     rm_ckpt(path2)
+
+
+def cow_rescue_fail():
+    """#310: a rescue that fails gives its pages back, still protected, and a writer that found one of them RESCUING
+    reads it itself rather than failing the checkpoint. With every other rescue failing (ckpt_rescue_fail), keep-running
+    checkpoints of a guest rewriting its memory are written, hold exactly the memory at their pause, and restore."""
+    n = "ft-rescuefail"
+    ok(run(A, n))
+    start_writer(A, n, mib=64)
+    fault(A, "ckpt_memhash", 300000)
+    fault(A, "ckpt_slow", 300000)
+    fault(A, "ckpt_rescue_fail", 300000)
+    given_back, i = 0, 0
+    while i < 6 and (i < 2 or given_back == 0):
+        path = ckpt_path(f"ft-rescuefail{i}")
+        r = checkpoint(A, n, path, timeout=180)
+        check(f"rescue fail {i}: checkpoint written", r.get("ok"), r)
+        if not r.get("ok"):
+            break
+        r = r["result"]
+        print(f"rescue fail {i}: paused {r['paused_ms']} ms, copy {r['copy']}")
+        given_back += r["copy"]["given_back"]
+        check(f"rescue fail {i}: rescues failed", r["copy"]["rescue_failures"] > 0, r["copy"])
+        h = ckhash(A, path)
+        check(f"rescue fail {i}: checkpoint == memory at the pause", h["hash"] == r["pause_memhash"], (h["hash"], r["pause_memhash"]))
+        if r["copy"]["given_back"] > 0:
+            ok(restore(B, path, name="ft-rescuefail2", ip="auto"))
+            errors, _, out = writer_check(B, "ft-rescuefail2")
+            check(f"rescue fail {i}: the restored copy has exactly the pause-time memory", errors == 0, out)
+            cleanup("ft-rescuefail2")
+        rm_ckpt(path)
+        i += 1
+    check("rescue fail: a writer read pages a failed rescue gave back", given_back > 0, given_back)
+    for f in ("ckpt_rescue_fail", "ckpt_slow", "ckpt_memhash"):
+        fault(A, f, 0)
+    errors, _, out = writer_check(A, n)
+    check("rescue fail: the original is intact", errors == 0, out)
+    cleanup(n)
 
 
 def huge_mib(host, name):
@@ -5825,6 +5863,25 @@ def gc_debris():
         if os.path.exists(p):
             os.unlink(p)
     cleanup(n)
+    # A VM process killed during a checkpoint leaves its root-only staging in the checkpoint's directory: the sweep that
+    # reaps it removes that (#310).
+    n, d = "ft-gc-ck", ckpt_path("ft-gc-ckdir")
+    os.makedirs(d)
+    ok(run(A, n))
+    fault(A, "ckpt_slow", 120000)
+    t = threading.Thread(target=lambda: checkpoint(A, n, os.path.join(d, "ck"), timeout=60))
+    t.start()
+    staged = lambda: [e for e in os.listdir(d) if e.startswith(".flexvm-staging-")]
+    copying = wait_for(lambda: vms(A).get(n, {}).get("checkpoint_copy") and staged(), 30)
+    check("gc: a checkpoint is staging", copying, (vms(A).get(n), os.listdir(d)))
+    signal_vm(A, n, signal.SIGKILL)
+    t.join()
+    fault(A, "ckpt_slow", 0)
+    check("gc: the killed checkpoint's staging stays until a sweep", staged(), os.listdir(d))
+    ok(cli_json(A, "debug", "gc"))
+    check("gc: a dead process's checkpoint staging goes", not staged() and not os.path.exists(os.path.join(d, "ck")), os.listdir(d))
+    cleanup(n)
+    rm_ckpt(d)
 
 
 def prefix_change():
@@ -5994,7 +6051,7 @@ SCENARIOS = dict(
     checkpoint_restore=checkpoint_restore, checkpoint_fork=checkpoint_fork, checkpoint_corrupt=checkpoint_corrupt,
     checkpoint_crash=checkpoint_crash, pause_resume=pause_resume, signals=signals, pause_lost=pause_lost, suspend_resume=suspend_resume,
     suspend_gen=suspend_gen, checkpoint_hotplug=checkpoint_hotplug, checkpoint_untrusted_dir=checkpoint_untrusted_dir,
-    resume_failures=resume_failures, held_restore_frozen=held_restore_frozen, cow_exact=cow_exact, cow_collapsed=skippable(cow_collapsed), unplug_collapsed=no_evict(skippable(unplug_collapsed)), cow_abort=cow_abort,
+    resume_failures=resume_failures, held_restore_frozen=held_restore_frozen, cow_exact=cow_exact, cow_rescue_fail=cow_rescue_fail, cow_collapsed=skippable(cow_collapsed), unplug_collapsed=no_evict(skippable(unplug_collapsed)), cow_abort=cow_abort,
     cow_crash=cow_crash, cow_reports_held=cow_reports_held, ckpt_incremental=ckpt_incremental, ckpt_hot=ckpt_hot,
     ckpt_failed_stop=ckpt_failed_stop, ckpt_rearm=ckpt_rearm, ckpt_dir_moved=ckpt_dir_moved,
     prepare_disconnect=prepare_disconnect, prepare_trickle=prepare_trickle, prepare_fail=prepare_fail,

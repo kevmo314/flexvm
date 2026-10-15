@@ -248,6 +248,9 @@ pub struct Pager {
     pub fail_protect: AtomicBool,
     /// Test fault: write faults during a copy dawdle before claiming pages.
     pub wp_race: AtomicBool,
+    /// Test fault: every other rescue during a copy fails after its claim, once a writer may be waiting on the page.
+    pub rescue_fail: AtomicBool,
+    rescue_tries: AtomicU32,
     /// Test fault: copies of fault-fetched runs past their first page fail once more.
     pub tail_fail: AtomicU32,
     /// Test fault: from then on every copy of a fault-fetched run fails (ENOMEM), and the pullers wait.
@@ -318,6 +321,8 @@ impl Pager {
             hot_kept: Mutex::new(Vec::new()),
             fail_protect: AtomicBool::new(false),
             wp_race: AtomicBool::new(false),
+            rescue_fail: AtomicBool::new(false),
+            rescue_tries: AtomicU32::new(0),
             tail_fail: AtomicU32::new(0),
             stuck_from: Mutex::new(None),
             pull_fail: AtomicU32::new(0),

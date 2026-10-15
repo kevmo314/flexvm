@@ -300,12 +300,40 @@ fn private_dir(fd: RawFd) -> bool {
     fstat(fd).is_ok_and(|st| st.st_uid == unsafe { libc::geteuid() } && st.st_mode & 0o077 == 0)
 }
 
-pub fn clear_stale(path: &Path) {
-    let Ok(path) = CString::new(path.as_os_str().as_bytes()) else { return };
-    let Ok(parent) = open_dir_at(libc::AT_FDCWD, &path) else { return };
-    if unsafe { libc::flock(parent.as_raw_fd(), libc::LOCK_EX) } == 0 {
-        clear_stale_fd(&parent);
+/// For gc: clears the stale staging a dead process left in `path`, a directory it recorded. Returns false if that
+/// should be tried again later (another process holds the directory's lock). The directory may be a user's, who may
+/// have changed the path since: it is walked from `/` without following a symlink, and nothing but root-only staging
+/// in it is removed. The lock is only tried, never waited for: a user may hold it for as long as they like.
+pub fn clear_stale(path: &Path) -> bool {
+    use std::path::Component;
+    if !path.is_absolute() {
+        return true;
     }
+    let mut dir = match open_dir_at(libc::AT_FDCWD, c"/") {
+        Ok(d) => d,
+        Err(_) => return true,
+    };
+    for c in path.components() {
+        match c {
+            Component::RootDir => {}
+            Component::Normal(name) => {
+                let Ok(name) = CString::new(name.as_bytes()) else { return true };
+                match open_dir_at(dir.as_raw_fd(), &name) {
+                    Ok(d) => dir = d,
+                    Err(_) => return true,
+                }
+            }
+            _ => return true,
+        }
+    }
+    for _ in 0..50 {
+        if unsafe { libc::flock(dir.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            clear_stale_fd(&dir);
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    false
 }
 
 fn clear_stale_fd(parent: &OwnedFd) {

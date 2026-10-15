@@ -574,6 +574,7 @@ impl Proc {
                 t.mark("memhash");
             }
             vm.pager.wp_race.store(fault("ckpt_wp_race"), Ordering::SeqCst);
+            vm.pager.rescue_fail.store(fault("ckpt_rescue_fail"), Ordering::SeqCst);
             if fault("ckpt_fail_protect") {
                 vm.pager.fail_protect.store(true, Ordering::SeqCst);
             }

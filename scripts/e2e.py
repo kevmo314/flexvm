@@ -49,7 +49,7 @@ p.add_argument("--image-cache", help="keep the pulled image here, and build from
 # machine's MemAvailable, which lanes running at once move) and the ones that restart the
 # listeners (target_killed, suspend_resume, unit_restart).
 FAULTS = ("basic route route_abort lost_ack unknown refused pages_blip pages_dead_restore prepared_retry resume_kill exec_race guest_calls "
-          "checkpoint_restore checkpoint_fork checkpoint_corrupt held_restore_frozen cow_exact cow_collapsed unplug_collapsed cow_abort ckpt_incremental ckpt_hot "
+          "checkpoint_restore checkpoint_fork checkpoint_corrupt held_restore_frozen cow_exact cow_rescue_fail cow_collapsed unplug_collapsed cow_abort ckpt_incremental ckpt_hot "
           "ckpt_failed_stop ckpt_rearm prepare_fail fc_prepare slow_preload bad_preload pull_enomem ckpt_packet_hold "
           "abort_superseded gen_zero signals suspend_gen standby restore_ip_peer late_withdrawal "
           "incoming_killed start_killed claim_killed standby_stalled standby_refill_race standby_lock_timeout standby_stop_claim fc_died cow_grow plug_race plug_storm suspend_debris revoked_publication "
@@ -872,7 +872,7 @@ COST = {"image_template": 30, "pause_resume": 6, "migrate": 3, "checkpoint_resto
         "faults/pages_dead_restore": 14, "faults/abort_superseded": 13, "faults/plug_storm": 11, "faults/unknown": 10,
         "faults/checkpoint_corrupt": 10, "faults/guest_calls": 10, "faults/checkpoint_fork": 9,
         "faults/signals": 9, "faults/checkpoint_restore": 7, "faults/suspend_cmd": 7, "faults/fc_died_busy": 5, "faults/pause_cmd_start": 6, "faults/suspend_died": 4,
-        "faults/cow_exact": 7, "faults/prepared_retry": 7, "faults/ckpt_failed_stop": 7, "faults/exec_race": 7,
+        "faults/cow_exact": 7, "faults/cow_rescue_fail": 20, "faults/prepared_retry": 7, "faults/ckpt_failed_stop": 7, "faults/exec_race": 7,
         "faults/prepare_fail": 6, "faults/route": 6, "faults/route_abort": 30, "faults/basic": 6, "faults/slow_preload": 6, "faults/bad_preload": 6, "faults/refused": 6,
         "faults/resume_kill": 5, "faults/lost_ack": 5, "faults/ckpt_rearm": 5, "faults/cow_abort": 5,
         "faults/ckpt_packet_hold": 4, "faults/checkpoint_hotplug": 4, "faults/log_cap": 8, "faults/arrival_log": 13}

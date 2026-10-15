@@ -69,6 +69,9 @@ pub struct Stats {
     pub rescued_pages: AtomicU64,
     pub rescue_ns: AtomicU64,
     pub rescue_max_ns: AtomicU64,
+    /// Rescues that failed, giving their pages back, and pages a writer then read itself.
+    pub rescue_failures: AtomicU64,
+    pub given_back: AtomicU64,
     /// Faults that waited for a writer (over budget, or the page was being read), once each however often retried.
     pub retries: AtomicU64,
     /// Discards held back until the copy was done, and for how long in all.
@@ -335,6 +338,8 @@ impl Cow {
             "rescued_mib": (get(&s.rescued_pages) * PAGE_SIZE as u64) as f64 / (1 << 20) as f64,
             "rescue_avg_us": if rescues > 0 { get(&s.rescue_ns) as f64 / rescues as f64 / 1e3 } else { 0.0 },
             "rescue_max_us": get(&s.rescue_max_ns) as f64 / 1e3,
+            "rescue_failures": get(&s.rescue_failures),
+            "given_back": get(&s.given_back),
             "retries": get(&s.retries),
             "discards_held": get(&s.drains),
             "discards_held_ms": get(&s.drain_ns) as f64 / 1e6,
@@ -402,6 +407,7 @@ impl GuestPages for CowPages<'_> {
                             }
                             cow.set(p, CLEAN);
                             cow.saved(p, p + 1, 1);
+                            cow.stats.given_back.fetch_add(1, Ordering::Relaxed);
                             continue 'copies;
                         }
                     }
