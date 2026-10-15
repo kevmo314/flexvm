@@ -4666,6 +4666,10 @@ def mem_refused_fill():
     check("refused fill: not finished", not hog_done(A, n))
     check("refused fill: starved, so the host would move it", any(s[2] for s in seen[-5:]), seen[-5:])
     check("refused fill: the host's cgroup saw no OOM", cgroup(A, n)[2].get("oom_kill") == "0", cgroup(A, n)[2])
+    said = log(A, n).count("starved: the host's reserve refused")
+    check("refused fill: its starving is logged once, not at each retry", said == 1, log(A, n)[-1500:])
+    rows = [l.split() for l in cli(A, "ls")[1].splitlines()]
+    check("refused fill: plain ls shows it starved", rows[0][-1] == "STARVED" and any(r[0] == n and r[-1] == "yes" for r in rows[1:]), rows)
     # Relief: moved to B, where it grows.
     fault(A, "no_evict", 0)
     check("refused fill: moved to B", wait_for(lambda: where(n) == {B: "running"}, 60), (where(n), log(A, n)[-1500:]))

@@ -1539,9 +1539,32 @@ fn resize(vm: &Vm, host: &Host, hint: Option<u64>, grow_only: bool) -> Result<Re
     let Some(plan) = sizes.plan(requested, plugged, avail, last.elapsed(), hint.is_some(), grow_only) else {
         return Ok(Resized::Busy);
     };
-    let refused = plan.charge > 0 && host.grant(plan.charge, None)?.is_none();
+    // Refused, it is not asked again (host lock, grants file, MemAvailable) until its backoff
+    // expires: a guest throttled at its mark asks about every 250 ms.
+    let refused = plan.charge > 0 && {
+        let mut backoff = vm.grant_backoff.lock().unwrap();
+        let now = Instant::now();
+        if !backoff.ready(now) {
+            true
+        } else if host.grant(plan.charge, None)?.is_some() {
+            backoff.granted();
+            false
+        } else {
+            backoff.refused(now);
+            true
+        }
+    };
     // Starved only when the host refused it: at its own ceiling, moving it cannot help.
-    vm.starved.store(plan.short && refused, Ordering::SeqCst);
+    let starved = plan.short && refused;
+    if vm.starved.swap(starved, Ordering::SeqCst) != starved {
+        match starved {
+            true if host.config_now().peers.is_empty() => {
+                crate::log!("vm {}: starved: the host's reserve refused it {} MiB; it stays throttled (no peers to move it to)", vm.name, plan.charge)
+            }
+            true => crate::log!("vm {}: starved: the host's reserve refused it {} MiB; it stays throttled until it grows or moves", vm.name, plan.charge),
+            false => crate::log!("vm {}: no longer starved", vm.name),
+        }
+    }
     let new = if refused { plugged } else { plan.new };
     if new != requested {
         let why = if plan.settle {
@@ -1571,6 +1594,32 @@ impl Resized {
             (false, true) if refused => Resized::Refused,
             _ => Resized::Same,
         }
+    }
+}
+
+const GRANT_RETRY_MIN: Duration = Duration::from_millis(250);
+const GRANT_RETRY_MAX: Duration = Duration::from_secs(5);
+
+/// After the reserve refuses a VM's growth: 250 ms, doubling to 5 s, before it
+/// is asked again; a grant resets it.
+#[derive(Default)]
+pub struct GrantBackoff {
+    delay: Duration,
+    until: Option<Instant>,
+}
+
+impl GrantBackoff {
+    fn ready(&self, now: Instant) -> bool {
+        self.until.is_none_or(|until| now >= until)
+    }
+
+    fn refused(&mut self, now: Instant) {
+        self.delay = (self.delay * 2).clamp(GRANT_RETRY_MIN, GRANT_RETRY_MAX);
+        self.until = Some(now + self.delay);
+    }
+
+    fn granted(&mut self) {
+        *self = GrantBackoff::default();
     }
 }
 
@@ -2291,6 +2340,24 @@ mod tests {
         assert_eq!(Resized::of(false, true, false, true), Resized::Refused);
         assert_eq!(Resized::of(false, false, false, true), Resized::Same);
         assert_eq!(Resized::of(true, true, false, false), Resized::Grew);
+    }
+
+    #[test]
+    fn refused_growth_backs_off_until_a_grant() {
+        let (mut b, t) = (GrantBackoff::default(), Instant::now());
+        assert!(b.ready(t));
+        let mut waits = vec![];
+        for _ in 0..7 {
+            b.refused(t);
+            waits.push(b.until.unwrap() - t);
+        }
+        let ms = |n| Duration::from_millis(n);
+        assert_eq!(waits, [ms(250), ms(500), ms(1000), ms(2000), ms(4000), ms(5000), ms(5000)]);
+        assert!(!b.ready(t + ms(4999)) && b.ready(t + ms(5000)));
+        b.granted();
+        assert!(b.ready(t));
+        b.refused(t);
+        assert_eq!(b.until, Some(t + ms(250)));
     }
 
     #[test]
