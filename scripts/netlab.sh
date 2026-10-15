@@ -49,9 +49,9 @@ listeners() {
     ln -sfn "$state/templates" "/run/flexvm-lab-$h/state/templates"
   done
   fv A listen 192.168.100.1:7070 --peer 192.168.100.2:7070 \
-    --announce-dev eth0 --vm-ips 192.168.100.128-192.168.100.191 > "$root/listen-A.log" 2>&1 &
+    --vm-ips 192.168.100.128-192.168.100.191 > "$root/listen-A.log" 2>&1 &
   fv B listen 192.168.100.2:7070 --peer 192.168.100.1:7070 \
-    --announce-dev eth0 --vm-ips 192.168.100.192-192.168.100.250 > "$root/listen-B.log" 2>&1 &
+    --vm-ips 192.168.100.192-192.168.100.250 > "$root/listen-B.log" 2>&1 &
   sleep 1
 }
 

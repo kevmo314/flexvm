@@ -436,24 +436,48 @@ pub fn is_local_addr(ip: Ipv4Addr) -> Result<bool> {
     static LOCAL: std::sync::Mutex<(Option<std::time::Instant>, Vec<Ipv4Addr>)> = std::sync::Mutex::new((None, Vec::new()));
     let mut local = LOCAL.lock().unwrap();
     if local.0.is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(1)) {
-        let mut addrs = std::ptr::null_mut();
-        if unsafe { libc::getifaddrs(&mut addrs) } != 0 {
-            bail!("getifaddrs: {}", std::io::Error::last_os_error());
-        }
-        local.1.clear();
-        let mut current = addrs;
-        while !current.is_null() {
-            let addr = unsafe { &*current };
-            if !addr.ifa_addr.is_null() && unsafe { (*addr.ifa_addr).sa_family } == libc::AF_INET as u16 {
-                let v4 = unsafe { &*addr.ifa_addr.cast::<libc::sockaddr_in>() };
-                local.1.push(Ipv4Addr::from(v4.sin_addr.s_addr.to_ne_bytes()));
-            }
-            current = addr.ifa_next;
-        }
-        unsafe { libc::freeifaddrs(addrs) };
-        local.0 = Some(std::time::Instant::now());
+        *local = (Some(std::time::Instant::now()), addrs()?.into_iter().map(|a| a.1).collect());
     }
     Ok(local.1.contains(&ip))
+}
+
+/// This host's IPv4 addresses, with their devices.
+pub fn addrs() -> Result<Vec<(String, Ipv4Addr)>> {
+    let mut addrs = std::ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut addrs) } != 0 {
+        bail!("getifaddrs: {}", std::io::Error::last_os_error());
+    }
+    let (mut out, mut current) = (Vec::new(), addrs);
+    while !current.is_null() {
+        let addr = unsafe { &*current };
+        if !addr.ifa_addr.is_null() && unsafe { (*addr.ifa_addr).sa_family } == libc::AF_INET as u16 {
+            let v4 = unsafe { &*addr.ifa_addr.cast::<libc::sockaddr_in>() };
+            let dev = unsafe { std::ffi::CStr::from_ptr(addr.ifa_name) }.to_string_lossy().into_owned();
+            out.push((dev, Ipv4Addr::from(v4.sin_addr.s_addr.to_ne_bytes())));
+        }
+        current = addr.ifa_next;
+    }
+    unsafe { libc::freeifaddrs(addrs) };
+    Ok(out)
+}
+
+/// The device and source address toward `to`, from the routing table
+/// (`/proc/net/route`) and this host's addresses (`addrs`): the most specific
+/// route that is up, the lowest metric first, and its device's first address.
+/// One of this host's own addresses (a peer on this machine) is reached on no device.
+pub fn toward(table: &str, addrs: &[(String, Ipv4Addr)], to: Ipv4Addr) -> Option<(Option<String>, Ipv4Addr)> {
+    if to.is_loopback() || addrs.iter().any(|(_, a)| *a == to) {
+        return Some((None, to));
+    }
+    let hex = |s: Option<&str>| u32::from_str_radix(s?, 16).ok();
+    let ip = |s: Option<&str>| hex(s).map(|v| u32::from_be_bytes(v.to_ne_bytes()));
+    let routes = table.lines().skip(1).filter_map(|l| {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        let (dest, flags, metric, mask) = (ip(f.get(1).copied())?, hex(f.get(3).copied())?, f.get(6)?.parse::<u32>().ok()?, ip(f.get(7).copied())?);
+        (flags & 1 == 1 && u32::from(to) & mask == dest).then(|| (f[0], mask.count_ones(), std::cmp::Reverse(metric)))
+    });
+    let dev = routes.max_by_key(|&(_, bits, metric)| (bits, metric))?.0;
+    Some((Some(dev.into()), addrs.iter().find(|(d, _)| d == dev)?.1))
 }
 
 /// Hosts sharing a netns share routes: never replace the target's tap route with one via us.
@@ -703,6 +727,35 @@ mod tests {
                      eth0\t00000000\t0101A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0\n\
                      eth0\t0001A8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n";
         assert_eq!(gateways(table), [Ipv4Addr::new(192, 168, 1, 1)]);
+    }
+
+    #[test]
+    fn the_device_toward_an_address_is_its_most_specific_route() {
+        // Default via eth0 (metric 100) and wlan0 (600); 192.168.1.0/24 on eth0; 10.8.0.0/16 on
+        // wg0 and, at a worse metric, eth1; 10.8.5.0/24 on a route that is down.
+        let table = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n\
+                     wlan0\t00000000\t0101A8C0\t0003\t0\t0\t600\t00000000\t0\t0\t0\n\
+                     eth0\t00000000\t0101A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n\
+                     eth0\t0001A8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n\
+                     eth1\t0000080A\t00000000\t0001\t0\t0\t50\t0000FFFF\t0\t0\t0\n\
+                     wg0\t0000080A\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0\n\
+                     eth2\t0005080A\t00000000\t0000\t0\t0\t0\t00FFFFFF\t0\t0\t0\n";
+        let addrs: Vec<(String, Ipv4Addr)> =
+            [("lo", "127.0.0.1"), ("eth0", "192.168.1.10"), ("eth0", "192.168.1.11"), ("wg0", "10.8.0.2"), ("eth1", "10.8.0.3"), ("eth2", "10.8.5.1")]
+                .map(|(d, a)| (d.to_string(), a.parse().unwrap()))
+                .into();
+        let dev = |to: &str| toward(table, &addrs, to.parse().unwrap()).map(|(d, a)| (d, a.to_string()));
+        let on = |d: &str, a: &str| Some((Some(d.to_string()), a.to_string()));
+        assert_eq!(dev("0.0.0.0"), on("eth0", "192.168.1.10"), "the default route, by metric");
+        assert_eq!(dev("8.8.8.8"), on("eth0", "192.168.1.10"));
+        assert_eq!(dev("192.168.1.20"), on("eth0", "192.168.1.10"));
+        assert_eq!(dev("10.8.5.9"), on("wg0", "10.8.0.2"), "the most specific route that is up");
+        // Peers on this machine: on no device.
+        assert_eq!(dev("127.0.0.1"), Some((None, "127.0.0.1".into())));
+        assert_eq!(dev("10.8.0.3"), Some((None, "10.8.0.3".into())));
+        // No route, or none with an address.
+        assert_eq!(toward(&table.lines().take(1).collect::<String>(), &addrs, "8.8.8.8".parse().unwrap()), None);
+        assert_eq!(toward(table, &addrs[..1], "8.8.8.8".parse().unwrap()), None);
     }
 
     #[test]

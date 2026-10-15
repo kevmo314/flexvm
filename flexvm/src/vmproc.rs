@@ -92,8 +92,6 @@ pub struct Proc {
     pub host: Host,
     pub paths: Paths,
     pub spawner: Spawner,
-    /// The tap prefix, as read once the work directory was there (`Host::tap_prefix`).
-    prefix: String,
     ident: Ident,
     name: Mutex<Option<NameLock>>,
     addr: Mutex<Option<AddrClaim>>,
@@ -202,17 +200,10 @@ impl Proc {
             crate::host::reap(&host.run, &old)?;
         }
         let _ = std::fs::remove_dir_all(&work);
-        // The work directory, then the prefix, under the host lock: a prefix
-        // change either sees this process or is what it reads (`Host::prefix_in_use`).
-        let prefix = {
-            let _l = host.lock()?;
-            std::fs::create_dir_all(&work)?;
-            crate::host::store(&work.join("owner"), &ident, false)?;
-            host.tap_prefix()?
-        };
-        // Unlocked: our work directory holds the prefix, and no sweep frees them while we live.
+        std::fs::create_dir_all(&work)?;
+        crate::host::store(&work.join("owner"), &ident, false)?;
         crate::host::clear_taps(&host.run, &ident);
-        let tap_prefix = format!("{prefix}{:x}t", ident.pid);
+        let tap_prefix = format!("{}{:x}t", host.tap_prefix(), ident.pid);
         let tap_owner = crate::host::tap_alias(&host.run, &ident);
         let spawner = Spawner::new(&paths.firecracker, &work, crate::socket::SocketRoot::new(&work)?, cgroup_root(), &tap_prefix, &tap_owner);
         // Before any guest runs: without it no route reaches the peers.
@@ -227,7 +218,6 @@ impl Proc {
             host,
             paths,
             spawner,
-            prefix,
             ident,
             name: Mutex::new(None),
             addr: Mutex::new(None),
@@ -532,7 +522,7 @@ impl Proc {
     pub fn holder(&self) -> Option<&Arc<Holder>> {
         self.holder
             .get_or_init(|| {
-                Holder::new(&format!("{}{:x}h", self.prefix, self.ident.pid)).unwrap_or_else(|e| {
+                Holder::new(&format!("{}{:x}h", self.host.tap_prefix(), self.ident.pid)).unwrap_or_else(|e| {
                     crate::log!("packets in flight while the vm is paused will be dropped: {e}");
                     None
                 })
@@ -2831,7 +2821,7 @@ mod tests {
 
     #[test]
     fn eviction_starts_at_its_high_water_mark_and_stops_above_it() {
-        let mut c = crate::host::Config::default();
+        let mut c = crate::host::Config { reserve_mib: crate::host::default_reserve(16384), ..Default::default() };
         assert_eq!((c.reserve_mib, c.evict_at(), c.evict_until()), (1024, 2048, 2560));
         c.reserve_mib = 256;
         assert_eq!((c.evict_at(), c.evict_until()), (768, 1024));

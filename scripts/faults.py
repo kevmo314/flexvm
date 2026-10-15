@@ -20,7 +20,6 @@ p.add_argument("--a-dir", default="/run/fvp-a")
 p.add_argument("--b-dir", default="/run/fvp-b")
 p.add_argument("--a-ips", default="10.130.0.2-10.130.0.250")
 p.add_argument("--b-ips", default="10.131.0.2-10.131.0.250")
-p.add_argument("--prefix", default="fvp", help="names of taps and hold devices start with this")
 for h in "ab":
     p.add_argument(f"--{h}-state", help=f"host {h.upper()}'s state directory (default: --{h}-dir/state)")
     p.add_argument(f"--{h}-run", help=f"host {h.upper()}'s run directory (default: --{h}-dir/run)")
@@ -89,6 +88,18 @@ def cli_json(host, *a, timeout=120):
 def ok(r):
     assert r["ok"], r
     return r["result"]
+
+
+def set_config(host, **kv):
+    """Changes `host`'s settings in place, as a listener restarted with other
+    flags would write them (renamed in: running processes read it again)."""
+    path = os.path.join(host.state, "host.json")
+    cfg = json.load(open(path))
+    cfg.update(kv)
+    with open(path + ".tmp", "w") as f:
+        json.dump(cfg, f)
+    os.rename(path + ".tmp", path)
+    return cfg
 
 
 def peer(host, req, timeout=30, source=None):
@@ -307,7 +318,7 @@ def start_listener(h, listen=None, extra=(), peer=None, wait=True):
     lg = open(h.listen_log, "a")
     listeners[h.addr] = subprocess.Popen(
         [BIN, "--state", h.state, "--run", h.run, "listen", listen or h.addr, "--peer", peer or other.addr, "--vm-ips", h.ips,
-         "--reserve", "512", "--prefix", args.prefix, *extra], stdout=lg, stderr=lg, env=ENV)
+         "--reserve", "512", *extra], stdout=lg, stderr=lg, env=ENV)
     if not wait:
         return
     hp = h.addr.rsplit(":", 1)
@@ -1706,7 +1717,7 @@ def announce_arp_timer():
     and the gap is between the kernel's timestamps, not between the reads (the
     first ARP goes out before `run` returns, its read later)."""
     n, dev = "ft-arp-timer", f"garp{A.addr.rsplit(':', 1)[1]}"
-    was = ok(cli_json(A, "config")).get("announce_dev") or ""
+    was = ok(cli_json(A, "config")).get("announce_dev")
     arps, drops, cap = [], None, socket.socket(socket.AF_PACKET, socket.SOCK_RAW, 0)
     subprocess.run(["ip", "link", "del", dev], capture_output=True)
     subprocess.run(["ip", "link", "add", dev, "up", "type", "dummy"], check=True)
@@ -1716,8 +1727,7 @@ def announce_arp_timer():
         # Stamped by the kernel as each frame went out: read late, a frame's time is still its own.
         cap.setsockopt(socket.SOL_SOCKET, SO_TIMESTAMPNS, 1)
         cap.settimeout(0.2)
-        code, out, err = cli(A, "config", "--announce-dev", dev)
-        assert code == 0, err
+        set_config(A, announce_dev=dev)
         fault(B, "route_stall", 60000)
         ok(run(A, n))
         ip = socket.inet_aton(vms(A)[n]["ip"])
@@ -1740,7 +1750,7 @@ def announce_arp_timer():
             fault(B, "route_stall", 0)
         finally:
             try:
-                cli(A, "config", "--announce-dev", was)
+                set_config(A, announce_dev=was)
             finally:
                 cap.close()
                 subprocess.run(["ip", "link", "del", dev], capture_output=True)
@@ -5620,21 +5630,16 @@ def dual_stack():
 
 
 def wildcard_listen():
-    """A listener on a wildcard address (0.0.0.0, ::, ::ffff:0:0) or a
-    link-local one is refused without --underlay, as is port 0; with one,
-    migrations from it give the target the underlay address to pull pages
-    from, never the wildcard. On a dual-stack [::] listener, IPv4 peers
-    (arriving as ::ffff:a.b.c.d) are still peers: pages are pulled from it
-    and migrations to it arrive."""
+    """A listener on a wildcard address (0.0.0.0, ::, ::ffff:0:0) detects
+    its underlay address from the route toward its peer (here, on loopback),
+    and a port 0 is refused; migrations from it give the target the underlay
+    address to pull pages from, never the wildcard. On a dual-stack [::]
+    listener, IPv4 peers (arriving as ::ffff:a.b.c.d) are still peers: pages
+    are pulled from it and migrations to it arrive."""
     if args.no_listeners:
         return print("wildcard listen: skipped (--no-listeners)")
     host_ip, port = A.addr.rsplit(":", 1)
-    # On a host with no configuration yet (A's keeps the --underlay given below).
     fresh = Host(A.addr, A.dir + "-wildcard", A.ips)
-    for bad in (f"0.0.0.0:{port}", f"[::]:{port}", f"[::ffff:0:0]:{port}", f"[fe80::1%1]:{port}"):
-        subprocess.run(["rm", "-rf", fresh.dir])
-        code, out, err = cli(fresh, "listen", bad, timeout=10)
-        check(f"wildcard listen: {bad} without --underlay refused", code != 0 and "--underlay" in err, (code, err))
     subprocess.run(["rm", "-rf", fresh.dir])
     code, out, err = cli(fresh, "listen", f"{host_ip}:0", timeout=10)
     check("wildcard listen: port 0 refused", code != 0 and "port" in err, (code, err))
@@ -5645,7 +5650,9 @@ def wildcard_listen():
     for wild in wilds:
         stop_listener(A)
         try:
-            start_listener(A, f"{wild}:{port}", ["--underlay", host_ip])
+            start_listener(A, f"{wild}:{port}")
+            underlay = ok(cli_json(A, "config")).get("underlay")
+            check(f"wildcard listen {wild}: the underlay detected", underlay == host_ip, underlay)
             n = "ft-wildcard"
             clear_log(B, n)
             m = setup(n)
@@ -6661,8 +6668,8 @@ def route_abort():
     n = "ft-route-abort"
     scenario_vms.add(n)
     gw = subprocess.run(["ip", "route", "show", "default"], capture_output=True, text=True).stdout.split()[2]
-    code, out, err = cli(B, "config", "--underlay", gw)
-    assert code == 0, err
+    was = ok(cli_json(B, "config")).get("underlay")
+    set_config(B, underlay=gw)
     ip = None
     try:
         m = setup(n, mib=1000)
@@ -6694,7 +6701,7 @@ def route_abort():
         check("route abort: the retry stopped with the abort", "dropped, migration" in log(A, n), log(A, n)[-1500:])
         check("route abort: md5 intact on A", md5(A, n) == m)
     finally:
-        cli(B, "config", "--underlay", "")
+        set_config(B, underlay=was)
         if ip and f"via {gw}" in peer_route(ip):
             subprocess.run(["ip", "route", "del", f"{ip}/32"], capture_output=True)
 
@@ -7436,7 +7443,7 @@ def unit_restart():
     cgroup of their own (flexvm/vm-PID-START), so they run on; a new listener
     takes them back."""
     t, n, d = args.template, "ft-unit-in", "ft-unit-d"
-    unit = f"/sys/fs/cgroup/{args.prefix}-unit-{os.getpid()}"
+    unit = f"/sys/fs/cgroup/fvp-unit-{os.getpid()}"
     if not os.path.exists("/sys/fs/cgroup/cgroup.controllers"):
         print("SKIP unit restart: no cgroup2 hierarchy")
         return
@@ -7447,7 +7454,7 @@ def unit_restart():
         lg = open(os.path.join(B.run, "listen.log"), "a")
         listeners[B.addr] = subprocess.Popen(
             [BIN, "--state", B.state, "--run", B.run, "listen", B.addr, "--peer", A.addr, "--vm-ips", B.ips,
-             "--reserve", "512", "--prefix", args.prefix], stdout=lg, stderr=lg, env=ENV, preexec_fn=in_cgroup(unit))
+             "--reserve", "512"], stdout=lg, stderr=lg, env=ENV, preexec_fn=in_cgroup(unit))
         hp = B.addr.rsplit(":", 1)
         up = lambda: subprocess.run(["bash", "-c", f"exec 3<>/dev/tcp/{hp[0]}/{hp[1]}"], capture_output=True).returncode == 0
         check("unit restart: listener up in the unit", wait_for(up, 10) and cgroup_of(listeners[B.addr].pid) == unit[len("/sys/fs/cgroup"):])
@@ -7591,31 +7598,6 @@ def gc_debris():
     rm_ckpt(d)
 
 
-def prefix_change():
-    """The tap prefix (which garbage collection reads taps' owners by) does
-    not change while a VM process runs, through `config` or `listen`; once
-    none runs, it does, and back."""
-    n = "ft-prefix"
-    try:
-        prefix = json.load(open(os.path.join(A.state, "host.json")))["prefix"]
-    except (OSError, ValueError, KeyError):
-        prefix = "fv"
-    other = prefix[:-1] + ("y" if prefix.endswith("z") else "z")
-    ok(run(A, n))
-    r = cli_json(A, "config", "--prefix", other)
-    check("prefix change: refused while a vm runs", not r["ok"] and "cannot change the tap prefix" in r["error"], r)
-    r = cli_json(A, "listen", "127.0.0.1:1", "--prefix", other)
-    check("prefix change: through listen too", not r["ok"] and "cannot change the tap prefix" in r["error"], r)
-    cfg = ok(cli_json(A, "config"))
-    check("prefix change: unchanged", cfg["prefix"] == prefix, cfg)
-    ok(kill(A, n))
-    ok(cli_json(A, "debug", "gc"))
-    r = cli_json(A, "config", "--prefix", other)
-    check("prefix change: made once none runs", r["ok"] and r["result"]["prefix"] == other, r)
-    r = cli_json(A, "config", "--prefix", prefix)
-    check("prefix change: and back", r["ok"] and r["result"]["prefix"] == prefix, r)
-
-
 def arrival_log():
     """An arrival's log stays while it runs and goes once it is killed (it
     is never published as NAME.log): the sweep tells them apart by the
@@ -7654,14 +7636,11 @@ def template_tap():
     owner in its alias): a sweep removes the tap once the build is gone (any
     process's periodic sweep may be first, so it is not looked for in
     between). A sweep goes by a tap's alias, never its name: one whose owner
-    lives is kept, as are another host's (a prefix extending this one's,
-    #193) and a tap with no owner, whatever their names read as."""
+    lives is kept, as are another host's (#193) and a tap with no owner,
+    whatever their names read as."""
     name = f"ft-tpltap-{os.getpid()}"
     tdir = os.path.join(A.state, "templates")
-    try:
-        prefix = json.load(open(os.path.join(A.state, "host.json")))["prefix"]
-    except (OSError, ValueError, KeyError):
-        prefix = "fv"
+    prefix = ok(cli_json(A, "config"))["prefix"]
     p = subprocess.Popen([BIN, "--state", A.state, "--run", A.run, "template", name, "--vcpus", "1", "--max", "512"],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=ENV)
     tap = f"{prefix}x{p.pid:x}"
@@ -7767,7 +7746,7 @@ SCENARIOS = dict(
     suspend_disk_freed=suspend_disk_freed, resume_mark_fails=resume_mark_fails, suspend_unaddressed=suspend_unaddressed, resume_fence_fails=resume_fence_fails, quarantine_reboot_ls=quarantine_reboot_ls, kill_source=kill_source,
     kill_refused_checkpoint=no_evict(kill_refused_checkpoint), wildcard_listen=wildcard_listen, peer_by_name=peer_by_name, peer_moved=peer_moved, peer_unresolvable=peer_unresolvable, page_refusals=page_refusals,
     forged_peer=forged_peer, restore_ip_peer=restore_ip_peer, spoof_filter=spoof_filter, late_withdrawal=late_withdrawal, unlend_retry=unlend_retry,
-    unit_restart=unit_restart, log_cap=log_cap, gc_debris=gc_debris, prefix_change=prefix_change, arrival_log=arrival_log, template_tap=template_tap,
+    unit_restart=unit_restart, log_cap=log_cap, gc_debris=gc_debris, arrival_log=arrival_log, template_tap=template_tap,
     incoming_killed=incoming_killed, start_killed=start_killed, claim_killed=claim_killed, standby_stalled=standby_stalled, standby_refill_race=standby_refill_race, standby_lock_timeout=standby_lock_timeout, fc_died=fc_died,
     sigkill_restart=sigkill_restart, listen_trickle=listen_trickle,
     cow_wp_race=cow_wp_race, fetch_tail_enomem=fetch_tail_enomem, fetch_enomem_stuck=fetch_enomem_stuck, pull_enomem=pull_enomem,

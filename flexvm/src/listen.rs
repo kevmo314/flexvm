@@ -184,8 +184,7 @@ enum Admission {
 /// up no other), published as each finishes: at start, every `PEER_REFRESH`,
 /// and when a request finds a name it has no addresses for, but at most every
 /// `LOOKUP_EVERY` per name; a name that fails to resolve keeps the addresses it
-/// last had. Requests go by host.json as it is now (`flexvm config --peer`
-/// reaches a running listener): an address given as such needs no lookup, and
+/// last had. Requests go by host.json as it is now: an address given as such needs no lookup, and
 /// a name no longer configured counts for nothing, whatever a refresh still
 /// holds for it.
 #[derive(Clone, Default)]
@@ -316,7 +315,7 @@ impl Peers {
 
 fn not_a_peer(conn: TcpStream, from: IpAddr) {
     let local = conn.local_addr().map(|a| a.to_string()).unwrap_or_default();
-    let e = format!("{from} is not a peer of {local} (add it there: flexvm config --peer)");
+    let e = format!("{from} is not a peer of {local} (add it there: flexvm listen --peer)");
     // A flood of non-peers is counted, not logged line by line.
     static WINDOW: Mutex<RefusalLog> = Mutex::new(RefusalLog { second: 0, logged: 0, unlogged: 0 });
     let second = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());

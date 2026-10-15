@@ -770,7 +770,8 @@ a second copy could repeat what it did.
     Routes via an address local to the host's network namespace (including
     loopback) are skipped, so test hosts sharing a machine keep each other's
     tap routes; the first skip is logged.
-  - **The LAN** (`--announce-dev eth0`): the host answers ARP for its VMs
+  - **The LAN** (the announce device, detected from the route toward the
+    peers, or `--announce-dev`): the host answers ARP for its VMs
     (proxy ARP) and sends a gratuitous ARP whenever a VM arrives. Other
     machines on the LAN therefore follow a migrated VM without any
     configuration. Give VMs addresses from the LAN's subnet and they can use

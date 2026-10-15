@@ -14,8 +14,8 @@
 #
 # env: FLEXVM (binary), STATE (whose artifacts and templates to use), P (namespace prefix, default fv5), NET
 #      (default 192.168.155), ROUNDS (default 3), UDP_PPS (default 5000),
-#      MAX_UDP_LOSS (default 0), PORT (listeners, default 7070), PREFIX (taps, default
-#      fvn), WORK (keep logs under this directory, default /tmp), TEMPLATE (default default)
+#      MAX_UDP_LOSS (default 0), PORT (listeners, default 7070), WORK (keep logs under this
+#      directory, default /tmp), TEMPLATE (default default)
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -116,7 +116,7 @@ start_listener() {
     mkdir -p "$dir/state" "$dir/run"
     ln -sfn "$state/artifacts" "$dir/state/artifacts"
     ln -sfn "$state/templates" "$dir/state/templates"
-    cli "$ns" "$dir" listen "$listen" --peer "$peer" --announce-dev eth0 --vm-ips "$ips" --prefix "${PREFIX:-fvn}" > "$work/listen-$ns.log" 2>&1 &
+    cli "$ns" "$dir" listen "$listen" --peer "$peer" --vm-ips "$ips" > "$work/listen-$ns.log" 2>&1 &
     listener_pids+=($!)
 }
 start_listener "${P}A" "$dir_A" "$host_A" "$host_B" "$NET.128-$NET.191"

@@ -54,7 +54,7 @@ pub enum Floor {
     EvictMark,
 }
 
-/// `STATE/host.json`, written by `flexvm listen`.
+/// `STATE/host.json`, written by `flexvm listen` from its flags and what it detects.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -62,16 +62,16 @@ pub struct Config {
     pub peers: Vec<String>,
     /// Disjoint across hosts.
     pub vm_ips: String,
-    /// Default: the listen address's.
+    /// Default: the listen address's, else the source address toward the peers (`net::toward`).
     pub underlay: Option<Ipv4Addr>,
+    /// Default: the device toward the peers, none for peers on this machine.
     pub announce_dev: Option<String>,
     pub dns: Option<String>,
+    /// Default: `default_reserve` of the host's RAM.
     pub reserve_mib: u64,
     /// Eviction's high-water mark (MiB available): below it VMs start moving
     /// to peers (`evict_at`). None: the reserve plus the reserve or 512 MiB, whichever is more.
     pub evict_mib: Option<u64>,
-    /// Of taps, hold devices and cgroups.
-    pub prefix: String,
 }
 
 impl Default for Config {
@@ -83,11 +83,15 @@ impl Default for Config {
             underlay: None,
             announce_dev: None,
             dns: None,
-            reserve_mib: 1024,
+            reserve_mib: default_reserve(crate::util::proc_kb("/proc/meminfo", "MemTotal").unwrap_or(0) >> 10),
             evict_mib: None,
-            prefix: "fv".into(),
         }
     }
+}
+
+/// The reserve for a host with `total` MiB of RAM: a sixteenth, from 256 MiB to 4 GiB.
+pub fn default_reserve(total: u64) -> u64 {
+    (total / 16).clamp(256, 4096)
 }
 
 impl Config {
@@ -137,7 +141,9 @@ impl Config {
         }
         match self.underlay() {
             Some(u) => Ok(Some(SocketAddr::from((u, addr.port())).to_string())),
-            None => bail!("listening on {listen} needs --underlay: peers cannot reach a wildcard or link-local address"),
+            None => bail!(
+                "listening on {listen} needs an underlay address (none detected: give --underlay IP): peers cannot reach a wildcard or link-local address"
+            ),
         }
     }
 }
@@ -239,60 +245,20 @@ impl Host {
         let _l = self.lock()?;
         let path = self.state.join("host.json");
         let mut cfg: Config = load(&path)?.unwrap_or_default();
-        let prefix = cfg.prefix.clone();
         change(&mut cfg)?;
-        if cfg.prefix != prefix {
-            if let Some(why) = self.prefix_in_use(&cfg.prefix) {
-                bail!("cannot change the tap prefix from {prefix:?} to {:?}: {why}", cfg.prefix);
-            }
-        }
         store(&path, &cfg, true)?;
         self.cfg = cfg;
         self.cfg_stamp = stamp(&path);
         Ok(())
     }
 
-    /// Why the tap prefix cannot become `new` now, under the host lock: so
-    /// that this host's taps all have one prefix, no VM process of this host
-    /// may be left to make taps under the old one: any whose work directory's
-    /// owner is not proven gone, whatever it is doing (it reads the prefix
-    /// only once its work directory exists, `tap_prefix`). And no tap may
-    /// already read as one of `new`'s, whoever made it, live or leaked: a
-    /// VM process's tap would be refused its name. (Sweeps go by a tap's
-    /// owner, `tap_alias`, never its name or the prefix.) What cannot be
-    /// read is a reason too: never taken for nothing in use.
-    fn prefix_in_use(&self, new: &str) -> Option<String> {
-        self.prefix_in_use_at(new, Path::new("/sys/class/net"))
-    }
-
-    fn prefix_in_use_at(&self, new: &str, net: &Path) -> Option<String> {
-        let names = |dir: &Path| -> std::io::Result<Vec<std::ffi::OsString>> { std::fs::read_dir(dir)?.map(|e| e.map(|e| e.file_name())).collect() };
-        let w = self.run.join("w");
-        let work = match names(&w) {
-            Ok(w) => w,
-            Err(e) => return Some(format!("{}: {e}", w.display())),
-        };
-        for pid in work {
-            let owner = load::<Ident>(&w.join(&pid).join("owner"));
-            if !matches!(owner, Ok(Some(ref o)) if o.liveness() == Liveness::Gone) {
-                return Some(format!("vm process {} runs, or may (stop this host's VMs first)", pid.to_string_lossy()));
-            }
-        }
-        let taps: Vec<String> = match names(net) {
-            Ok(n) => n.iter().map(|n| n.to_string_lossy().into_owned()).filter(|n| tap_owner(n, new).is_some()).collect(),
-            Err(e) => return Some(format!("{}: {e}", net.display())),
-        };
-        (!taps.is_empty()).then(|| format!("taps {} already read as named under it", taps.join(", ")))
-    }
-
-    /// The prefix of the taps of a VM process whose work directory exists:
-    /// read from host.json now, not as it was when the process started, so
-    /// a prefix change either sees the work directory or is seen here.
-    /// Checked here, as host.json may hold one saved under an older limit.
-    pub fn tap_prefix(&self) -> Result<String> {
-        let prefix = load::<Config>(&self.state.join("host.json"))?.unwrap_or_default().prefix;
-        check_prefix(&prefix).map_err(|e| format!("host.json's tap prefix: {e} (set one with `flexvm config --prefix`)"))?;
-        Ok(prefix)
+    /// Of this host's taps and hold devices: `f` and five base-36 digits of a
+    /// hash of the state directory, so hosts on separate ones read apart. Six
+    /// bytes leave a VM process's taps (a pid of up to 6 hex digits, `t`) two
+    /// suffix digits (`fc::free_tap`). Two hosts that collide still never share
+    /// a name, as each carries its process's pid, and sweeps go by a tap's alias.
+    pub fn tap_prefix(&self) -> String {
+        tap_prefix(&self.state)
     }
 
     /// The configuration as it is now: `flexvm listen` may have changed the
@@ -1736,23 +1702,6 @@ pub fn reap(run: &Path, owner: &Ident) -> Result<()> {
     Ok(())
 }
 
-/// The process a tap's name reads as made for: a VM process's (PREFIX, its
-/// pid in hex, `t`, a counter) or a template build's (PREFIX `x` pid in hex,
-/// `template::tap`; earlier builds' PREFIX `tpl` pid in decimal). Only to
-/// keep names apart (`Host::prefix_in_use`): a name proves nothing about
-/// whose a tap is (another host's prefix may extend this one's).
-fn tap_owner(name: &str, prefix: &str) -> Option<u32> {
-    let rest = name.strip_prefix(prefix)?;
-    let number = |s: &str, radix| (!s.is_empty() && s.chars().all(|c| c.is_digit(radix))).then(|| u32::from_str_radix(s, radix).ok()).flatten();
-    if let Some(pid) = rest.strip_prefix("tpl") {
-        return number(pid, 10);
-    }
-    if let Some(pid) = rest.strip_prefix('x') {
-        return number(pid, 16);
-    }
-    rest.split_once('t').and_then(|(p, _)| u32::from_str_radix(p, 16).ok())
-}
-
 /// The VM process a Firecracker's cgroup (`idle-PID-START-N`) was made by.
 /// Earlier builds' (`idle-PID-N`) are left alone, as their owner cannot be
 /// told by identity: emptied when their Firecrackers exit, gone at a reboot.
@@ -2167,12 +2116,12 @@ fn collect_owned(run: &Path) {
     }
 }
 
-/// Tap names are 15 bytes at most: PREFIX, a pid in hex (up to 6), `t` and a counter.
-pub fn check_prefix(p: &str) -> Result<()> {
-    if p.is_empty() || p.len() > 6 || !p.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)) {
-        bail!("bad prefix {p:?}: 1 to 6 letters, digits, '-', '_' or '.'");
-    }
-    Ok(())
+fn tap_prefix(state: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    // FNV-1a: stable across builds.
+    let h = state.as_os_str().as_bytes().iter().fold(0xcbf29ce484222325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100000001b3));
+    let digit = |i: u32| char::from_digit((h / 36u64.pow(i) % 36) as u32, 36).unwrap();
+    std::iter::once('f').chain((0..5).map(digit)).collect()
 }
 
 pub fn check_name(name: &str) -> Result<()> {
@@ -3127,70 +3076,33 @@ mod tests {
     }
 
     #[test]
-    fn taps_and_cgroups_name_their_process() {
-        assert_eq!(tap_owner("fv1a2bt0", "fv"), Some(0x1a2b));
-        assert_eq!(tap_owner("fv1a2bt1f", "fv"), Some(0x1a2b));
-        assert_eq!(tap_owner("fvxf0ac", "fv"), Some(0xf0ac), "a template build's");
-        assert_eq!(tap_owner("fvci0.1ax3fffff", "fvci0.1a"), Some(0x3fffff));
-        assert_eq!(tap_owner("fvtpl61612", "fv"), Some(61612), "an earlier template build's");
-        for (tap, prefix) in [
-            ("fvtpl61612", "fc"),
-            ("fvtpl", "fv"),
-            ("fvtpl12x", "fv"),
-            ("fvtpl+1", "fv"),
-            ("fvx", "fv"),
-            ("fvx+1", "fv"),
-            ("fvxg", "fv"),
-            ("eth0", "fv"),
-            ("fvxyz", "fv"),
-        ] {
-            assert_eq!(tap_owner(tap, prefix), None, "{tap} under {prefix}");
-        }
+    fn cgroups_name_their_process() {
         assert_eq!(cgroup_owner("idle-4242-77-3"), Some(Ident { pid: 4242, start: 77, boot: boot_id().into() }));
         for cg in ["vm-4242", "vm-4242-77", "other-42", "idle-", "idle-4242-3", "idle-4242-x-3", "idle-1-2-3-4", "cgroup.procs", "memory.max"] {
             assert_eq!(cgroup_owner(cg), None, "{cg}");
         }
     }
 
-    /// The tap prefix never changes while a VM process (any work directory
-    /// not proven gone) may have taps under the old one, and a process reads
-    /// it only after its work directory is there.
+    /// Six bytes, `f` and base-36 digits, and apart for separate state directories.
     #[test]
-    fn the_tap_prefix_never_changes_under_a_vm_process() {
-        fn prefix(p: &str) -> impl FnOnce(&mut Config) -> Result<()> + '_ {
-            move |c| {
-                c.prefix = p.into();
-                Ok(())
-            }
+    fn the_tap_prefix_is_the_state_directorys() {
+        let prefixes: HashSet<String> = (0..2000).map(|i| tap_prefix(Path::new(&format!("/var/tmp/fvci-{i}/a-state")))).collect();
+        assert_eq!(prefixes.len(), 2000);
+        for p in &prefixes {
+            assert!(p.len() == 6 && p.starts_with('f') && p.bytes().all(|b| b.is_ascii_digit() || b.is_ascii_lowercase()), "{p}");
         }
-        let (_h_dir, mut h) = host("prefix");
-        // Not from the default (`fv`), whose taps this machine may have.
-        store(&h.state.join("host.json"), &Config { prefix: "zq1".into(), ..Config::default() }, false).unwrap();
-        let w = h.run.join("w").join("4242");
-        std::fs::create_dir_all(&w).unwrap();
-        // Not yet written: a process just starting.
-        let e = h.configure(prefix("zq")).unwrap_err().to_string();
-        assert!(e.contains("vm process 4242"), "{e}");
-        store(&w.join("owner"), &Ident::me(), false).unwrap();
-        assert!(h.configure(prefix("zq")).is_err(), "a live one");
-        assert_eq!(h.tap_prefix().unwrap(), "zq1");
-        h.configure(|c| {
-            c.reserve_mib = 7;
-            Ok(())
-        })
-        .unwrap();
-        store(&w.join("owner"), &Ident { pid: 999_999_930, start: 1, boot: boot_id().into() }, false).unwrap();
-        assert!(h.prefix_in_use_at("zq", &h.run.join("no-such-net")).is_some(), "the taps unreadable");
-        h.configure(prefix("zq")).unwrap();
-        assert_eq!(h.tap_prefix().unwrap(), "zq");
-        // A tap already read as one under the new prefix.
-        let net = h.run.join("net");
-        std::fs::create_dir_all(net.join("zq21t0")).unwrap();
-        assert!(h.prefix_in_use_at("zq2", &net).unwrap().contains("zq21t0"));
-        assert!(h.prefix_in_use_at("zq3", &net).is_none());
-        // The work directories unreadable.
-        std::fs::remove_dir_all(h.run.join("w")).unwrap();
-        assert!(h.prefix_in_use_at("zq3", &net).is_some());
+        assert_eq!(tap_prefix(Path::new("/var/lib/flexvm")), tap_prefix(Path::new("/var/lib/flexvm")));
+        // With a pid of 6 hex digits and `t`, two suffix digits still fit in 15 bytes.
+        assert_eq!(format!("{}3ffffft{:x}", tap_prefix(Path::new("/")), 255).len(), 15);
+    }
+
+    #[test]
+    fn the_default_reserve_is_a_sixteenth_of_ram() {
+        assert_eq!(default_reserve(0), 256);
+        assert_eq!(default_reserve(4096), 256);
+        assert_eq!(default_reserve(16384), 1024);
+        assert_eq!(default_reserve(65536), 4096);
+        assert_eq!(default_reserve(1 << 20), 4096);
     }
 
     /// A tap is this host's by its alias alone, whatever its name: hosts
@@ -3230,20 +3142,6 @@ mod tests {
         let mut theirs = taps_of_at(&other, &net);
         theirs.sort_by_key(|t| t.1);
         assert_eq!(theirs, vec![("fq21a2bt0".into(), 12, me), ("fq21a2ct0".into(), 13, dead)]);
-    }
-
-    /// One saved under the earlier 8-character limit is refused where it is read.
-    #[test]
-    fn a_stored_prefix_is_checked_where_read() {
-        let (_h_dir, h) = host("oldprefix");
-        for (p, ok) in [("fv", true), ("fvci0a", true), ("fvci10a", false), ("fvci0.1a", false), ("", false), ("f/v", false)] {
-            store(&h.state.join("host.json"), &Config { prefix: p.into(), ..Config::default() }, false).unwrap();
-            let got = h.tap_prefix();
-            assert_eq!(got.is_ok(), ok, "{p:?}: {got:?}");
-            if let Err(e) = got {
-                assert!(e.to_string().contains("flexvm config --prefix"), "{e}");
-            }
-        }
     }
 
     /// A VM process's own cgroup goes only once empty, whatever its pid

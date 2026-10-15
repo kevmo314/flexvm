@@ -673,7 +673,7 @@ fn sweep(paths: &Paths) -> Result<()> {
 
 #[allow(clippy::too_many_arguments)]
 pub fn create(paths: &Paths, name: &str, vcpus: u32, mem_mib: u64, max_mib: u64, plug_mib: u64, image: Option<ImageMeta>, tap: &str) -> Result<()> {
-    // `tap` is made (under the host lock, `Host::tap_prefix`) and removed here.
+    // `tap` is made by the caller and removed here.
     let res = (|| {
         // Running VMs map the old files, which must not be rewritten under them.
         let staging = Staging::new(paths, name)?;
