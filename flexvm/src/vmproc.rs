@@ -1568,19 +1568,22 @@ fn relieve(host: &Host, avail: Option<u64>, starved_here: bool) {
 
 /// Under the reserve: SIGUSR1s the standby VMs, under `STATE/standby.stop.lock`
 /// (not eviction's lock, which a migration may hold for a while). True if
-/// it stopped any.
+/// any exited within a second (an idle one takes ~200 ms), or another process
+/// is stopping them (it evicts if none exits). Loading or claimed VMs must not hold eviction off.
 fn stop_standby(host: &Host, avail: u64, reserve: u64) -> bool {
     let Ok(lock) = std::fs::File::options().create(true).truncate(false).write(true).open(host.state.join("standby.stop.lock")) else { return false };
     if crate::host::flock(&lock, libc::LOCK_EX | libc::LOCK_NB).is_err() {
-        return false;
+        return true;
     }
     let standby: Vec<_> = crate::standby::templates(host).iter().flat_map(|t| crate::standby::stoppable(host, t)).collect();
-    standby.iter().for_each(crate::standby::stop);
-    if standby.is_empty() {
+    let signalled: Vec<_> = standby.iter().filter_map(|id| crate::host::PidFd::open(id).ok().flatten()).filter(|fd| fd.signal(libc::SIGUSR1).is_ok()).collect();
+    let until = Instant::now() + Duration::from_secs(1);
+    let stopped = signalled.iter().filter(|fd| fd.wait(until.saturating_duration_since(Instant::now()))).count();
+    if stopped == 0 {
         return false;
     }
     let _ = std::fs::write(crate::standby::pressure(host), b"");
-    eprintln!("host has {avail} MiB available, under its {reserve} MiB reserve: stopped {} standby vms", standby.len());
+    eprintln!("host has {avail} MiB available, under its {reserve} MiB reserve: stopped {stopped} standby vms");
     true
 }
 
@@ -1721,9 +1724,11 @@ mod tests {
         let mut child = child.arg("30").spawn().unwrap();
         let d = host.run.join("standby").join("t");
         std::fs::create_dir_all(&d).unwrap();
-        let lock = std::fs::File::create(d.join(format!("{}.lock", child.id()))).unwrap();
+        let id = Ident::of(child.id()).unwrap();
+        let path = d.join(format!("{}-{}.lock", id.pid, id.start));
+        let lock = std::fs::File::create(&path).unwrap();
         assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
-        std::fs::write(d.join(format!("{}.lock", child.id())), serde_json::to_vec(&Ident::of(child.id()).unwrap()).unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&id).unwrap()).unwrap();
         assert_eq!(crate::standby::live(&host, "t").len(), 1);
         let (pressure, active) = (crate::standby::pressure(&host), host.run.join("evict.active"));
         for starved in [false, true] {
@@ -1754,6 +1759,37 @@ mod tests {
         relieve(&host, Some(0), false);
         assert!(active.exists(), "with no standby left, eviction starts");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_standby_that_has_not_exited_does_not_delay_eviction() {
+        use std::os::fd::AsRawFd;
+        let base = std::env::temp_dir().join(format!("flexvm-relieve-pending-{}", std::process::id()));
+        let host = Host::open(&base.join("state"), &base.join("run")).unwrap();
+        let mut child = std::process::Command::new("sleep");
+        unsafe {
+            std::os::unix::process::CommandExt::pre_exec(&mut child, || {
+                libc::signal(libc::SIGUSR1, libc::SIG_IGN);
+                Ok(())
+            });
+        }
+        let mut child = child.arg("30").spawn().unwrap();
+        let id = Ident::of(child.id()).unwrap();
+        let d = host.run.join("standby/t");
+        std::fs::create_dir_all(&d).unwrap();
+        let path = d.join(format!("{}-{}.lock", id.pid, id.start));
+        let lock = std::fs::File::create(&path).unwrap();
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+        std::fs::write(&path, serde_json::to_vec(&id).unwrap()).unwrap();
+        // Loading, or claimed since enumeration: a delivered signal proves neither stopped.
+        relieve(&host, Some(0), false);
+        let pressure = crate::standby::pressure(&host).exists();
+        let evicting = host.run.join("evict.active").exists();
+        let running = child.try_wait().unwrap().is_none();
+        let _ = child.kill();
+        let _ = child.wait();
+        std::fs::remove_dir_all(base).unwrap();
+        assert!(!pressure && evicting && running);
     }
 
     #[test]

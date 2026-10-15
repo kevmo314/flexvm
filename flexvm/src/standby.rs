@@ -1,7 +1,7 @@
 //! Standby VMs: `flexvm run --standby` processes holding a restored, settled,
 //! paused VM so `run` is a resume plus `START`. Each listens on
-//! `RUN/standby/TEMPLATE/KEY.PID.sock` (KEY: template generation) and holds
-//! `PID.lock` while alive, and `PID-START.claim` locked while a claim is under way. Protocol: `run` sends `claim {name, ip, cmd}` with
+//! `RUN/standby/TEMPLATE/KEY.PID-START.sock` (KEY: template generation) and holds
+//! `PID-START.lock` while alive, and `PID-START.claim` locked while a claim is under way. Protocol: `run` sends `claim {name, ip, cmd}` with
 //! its stdout/stderr; once the standby replies `claiming`, the claim may have
 //! started the VM and is never retried elsewhere. `{"exit": code}` follows.
 
@@ -57,7 +57,7 @@ pub fn live(host: &Host, template: &str) -> Vec<Ident> {
         let Ok(f) = File::open(e.path()) else { continue };
         if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } == 0 {
             let _ = std::fs::remove_file(e.path());
-        } else if let Some(id) = crate::host::load::<Ident>(&e.path()).ok().flatten() {
+        } else if let Ok(id) = serde_json::from_reader::<_, Ident>(&f) {
             ids.push(id);
         }
     }
@@ -217,13 +217,14 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
     let d = dir(host, template);
     std::fs::create_dir_all(&d)?;
     let me = Ident::me();
-    let (lock_path, sock) = (d.join(format!("{}.lock", me.pid)), d.join(format!("{mine}.{}.sock", me.pid)));
-    let tmp = d.join(format!(".{}.lock", me.pid));
+    let id = format!("{}-{}", me.pid, me.start);
+    let (lock_path, sock) = (d.join(format!("{id}.lock")), d.join(format!("{mine}.{id}.sock")));
+    let tmp = d.join(format!(".{id}.lock"));
     let lock = File::create(&tmp)?;
     crate::host::flock(&lock, libc::LOCK_EX)?;
     lock.write_all_at(&serde_json::to_vec(&me)?, 0)?;
     std::fs::rename(&tmp, &lock_path)?;
-    let claim_path = d.join(format!("{}-{}.claim", me.pid, me.start));
+    let claim_path = d.join(format!("{id}.claim"));
     p.files.lock().unwrap().extend([sock.clone(), lock_path, claim_path.clone()]);
     let ready = load(p.spawner.take(None)?, tpl.clone())?;
     // Taken now, so a claim does not scan memory or ask Firecracker.
@@ -238,7 +239,7 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
         let mut pfd = libc::pollfd { fd: listener.as_raw_fd(), events: libc::POLLIN, revents: 0 };
         if unsafe { libc::poll(&mut pfd, 1, 100) } <= 0 {
             let current = key(&p.paths, template).ok();
-            let extra = live(host, template).iter().position(|id| *id == me).is_some_and(|i| i >= target(host, template));
+            let extra = live(host, template).iter().position(|id| *id == me).is_none_or(|i| i >= target(host, template));
             let dead = p.standby.lock().unwrap().as_ref().is_none_or(|s| s.pager.failed().is_some() || !s.firecracker().alive());
             if p.stop_requested() || current.as_deref() != Some(&mine) || extra || dead {
                 p.finish(op, End::NotStarted, 0, None);
@@ -512,6 +513,24 @@ mod tests {
         for s in &stopped {
             assert!(send_json(&mut s.accept().unwrap().0, &json!({"claiming": true})).is_err());
         }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_reused_pid_keeps_its_own_lock() {
+        let root = std::env::temp_dir().join(format!("flexvm-standby-identity-{}", std::process::id()));
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let d = dir(&host, "default");
+        std::fs::create_dir_all(&d).unwrap();
+        let me = Ident::me();
+        let path = d.join(format!("{}-{}.lock", me.pid, me.start));
+        let lock = File::create(&path).unwrap();
+        crate::host::flock(&lock, libc::LOCK_EX).unwrap();
+        lock.write_all_at(&serde_json::to_vec(&me).unwrap(), 0).unwrap();
+        let stale = d.join(format!("{}-0.lock", me.pid));
+        File::create(&stale).unwrap();
+        assert_eq!(live(&host, "default"), [me]);
+        assert!(!stale.exists() && path.exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 

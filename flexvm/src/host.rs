@@ -186,7 +186,11 @@ impl Host {
     pub fn open(state: &Path, run: &Path) -> Result<Host> {
         let dirs = [("addrs", 0o777), ("standby", 0o777), ("migs", 0o777), ("suspended", 0o700)];
         let (marker, id) = (state.join(".synced"), || std::fs::metadata(state).map(|m| format!("{} {}", m.dev(), m.ino())));
-        let root = |e: std::io::Error| format!("{}: {e} (run flexvm as root to create it)", state.display());
+        let named = |d: &Path, e: std::io::Error| {
+            let hint = if e.kind() == std::io::ErrorKind::PermissionDenied { " (run flexvm as root to create it)" } else { "" };
+            format!("{}: {e}{hint}", d.display())
+        };
+        let root = |e| named(state, e);
         let held = std::fs::create_dir_all(state).and_then(|()| std::fs::File::open(state)).map_err(root)?;
         crate::util::eintr(|| unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }).map_err(root)?;
         if id().ok().is_none_or(|id| std::fs::read_to_string(&marker).ok() != Some(id)) || dirs.iter().any(|(d, _)| !state.join(d).is_dir()) {
@@ -199,7 +203,7 @@ impl Host {
         for d in ["vms", "standby", "w"] {
             let _ = std::fs::create_dir_all(run.join(d));
         }
-        let canon = |d: &Path| d.canonicalize().map_err(|e| format!("{}: {e} (run flexvm as root to create it)", d.display()));
+        let canon = |d: &Path| d.canonicalize().map_err(|e| named(d, e));
         let (state, run) = (canon(state)?, canon(run)?);
         let _ = RUN_DIR.set(run.clone());
         let cfg_stamp = stamp(&state.join("host.json"));

@@ -107,29 +107,21 @@ fn unlocked(path: &Path) -> bool {
     File::open(path).is_ok_and(|f| flock(&f, libc::LOCK_EX | libc::LOCK_NB).is_ok())
 }
 
-/// `KEY.PID.sock` of a standby VM whose `PID.lock` nobody holds: it bound
-/// the socket holding the lock, so it is gone (SIGKILLed: it removes both otherwise).
+/// `KEY.PID-START.sock` and `PID-START.claim` of standbys whose locks are gone.
 fn standby_sockets(dir: &Path) {
     for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         let n = e.file_name().to_string_lossy().into_owned();
-        // `PID-START.claim`, unlocked, of a standby gone: its `PID.lock` gone or another process's.
-        if let Some((pid, start)) = n.strip_suffix(".claim").and_then(|s| s.split_once('-')) {
-            let lock = crate::host::load::<crate::host::Ident>(&dir.join(format!("{pid}.lock"))).ok().flatten();
-            if lock.is_none_or(|id| id.start.to_string() != start) && unlocked(&e.path()) {
-                let _ = std::fs::remove_file(e.path());
-            }
+        let claim = n.strip_suffix(".claim");
+        let Some(id) = claim.or_else(|| n.strip_suffix(".sock").and_then(|s| s.rsplit_once('.')).map(|(_, id)| id)) else { continue };
+        let Some((pid, start)) = id.split_once('-') else { continue };
+        if [pid, start].iter().any(|s| s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit())) {
             continue;
         }
-        let Some(pid) = n.strip_suffix(".sock").and_then(|s| s.rsplit_once('.')).map(|(_, pid)| pid.to_string()) else { continue };
-        if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
-            continue;
-        }
-        let lock = dir.join(format!("{pid}.lock"));
-        let free = match File::open(&lock) {
+        let free = match File::open(dir.join(format!("{id}.lock"))) {
             Ok(f) => flock(&f, libc::LOCK_SH | libc::LOCK_NB).is_ok(),
             Err(e) => e.kind() == std::io::ErrorKind::NotFound,
         };
-        if free {
+        if free && (claim.is_none() || unlocked(&e.path())) {
             let _ = std::fs::remove_file(e.path());
         }
     }
@@ -150,22 +142,24 @@ mod tests {
     #[test]
     fn a_dead_standbys_socket_goes_a_live_ones_stays() {
         let d = dir("socks");
-        let held = File::create(d.join("1.lock")).unwrap();
+        let held = File::create(d.join("1-1.lock")).unwrap();
         flock(&held, libc::LOCK_EX).unwrap();
-        File::create(d.join("2.lock")).unwrap();
+        File::create(d.join("2-1.lock")).unwrap();
         let claiming = File::create(d.join("4-1.claim")).unwrap();
         flock(&claiming, libc::LOCK_EX).unwrap();
-        for s in ["key.1.sock", "key.2.sock", "key.3.sock", "key.x.sock", "1.lock", "3-1.claim", "5-6.claim", "5-7.claim"] {
+        for s in ["key.1-1.sock", "key.1-2.sock", "key.2-1.sock", "key.3-1.sock", "key.x.sock", "1-1.lock", "3-1.claim", "5-6.claim", "5-7.claim"] {
             File::create(d.join(s)).unwrap();
         }
-        crate::host::store(&d.join("5.lock"), &crate::host::Ident { pid: 5, start: 7, boot: String::new() }, false).unwrap();
+        let other = File::create(d.join("5-7.lock")).unwrap();
+        flock(&other, libc::LOCK_EX).unwrap();
         standby_sockets(&d);
         let left = |n: &str| d.join(n).exists();
-        assert!(left("key.1.sock"), "its standby holds its lock");
+        assert!(left("key.1-1.sock"), "its standby holds its lock");
         assert!(left("4-1.claim") && left("5-7.claim"), "a claim marker of a standby still here stays");
         assert!(!left("3-1.claim") && !left("5-6.claim"), "one unlocked goes once its lock is gone or names another process");
-        assert!(!left("key.2.sock") && !left("key.3.sock"), "lock free or gone");
-        assert!(left("key.x.sock") && left("2.lock"));
+        assert!(!left("key.1-2.sock"), "a reused pid keeps only its own socket");
+        assert!(!left("key.2-1.sock") && !left("key.3-1.sock"), "lock free or gone");
+        assert!(left("key.x.sock") && left("2-1.lock"));
         std::fs::remove_dir_all(d).unwrap();
     }
 
