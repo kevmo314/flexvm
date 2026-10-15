@@ -23,7 +23,6 @@ fi
 
 out=$state/artifacts
 sudo mkdir -p "$out"
-cd "$out"
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 trap 'exit 130' INT
@@ -44,23 +43,23 @@ download() {
   fi
 }
 
-if [ ! -x firecracker ]; then
+if ! sudo test -x "$out/firecracker"; then
   echo "fetching firecracker $FC_VERSION"
   download firecracker.tgz "$FC_URL"
   tar xzf "$work/firecracker.tgz" -C "$work"
-  sudo install -m 755 "$work/release-$FC_VERSION-$ARCH/firecracker-$FC_VERSION-$ARCH" firecracker
+  sudo install -m 755 "$work/release-$FC_VERSION-$ARCH/firecracker-$FC_VERSION-$ARCH" "$out/firecracker"
 fi
 
-if [ ! -f vmlinux ]; then
+if ! sudo test -f "$out/vmlinux"; then
   echo "fetching $KERNEL"
   download vmlinux "$CI/$KERNEL"
-  sudo install -m 644 "$work/vmlinux" vmlinux
+  sudo install -m 644 "$work/vmlinux" "$out/vmlinux"
 fi
 
-if [ ! -f base.squashfs ]; then
+if ! sudo test -f "$out/base.squashfs"; then
   echo "fetching ubuntu-24.04 rootfs"
   download base.squashfs "$CI/ubuntu-24.04.squashfs"
-  sudo install -m 644 "$work/base.squashfs" base.squashfs
+  sudo install -m 644 "$work/base.squashfs" "$out/base.squashfs"
 fi
 
-ls -lh "$out"
+sudo ls -lh "$out"

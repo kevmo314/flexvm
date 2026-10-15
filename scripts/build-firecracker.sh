@@ -38,4 +38,4 @@ export CFLAGS_x86_64_unknown_linux_musl="-idirafter $kh"
 cd "$src"
 cargo build --release --target x86_64-unknown-linux-musl -p firecracker
 sudo install -D -m 755 build/cargo_target/x86_64-unknown-linux-musl/release/firecracker "$state/artifacts/firecracker"
-"$state/artifacts/firecracker" --version
+build/cargo_target/x86_64-unknown-linux-musl/release/firecracker --version
