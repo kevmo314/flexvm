@@ -453,11 +453,17 @@ pub fn rename_noreplace(tmp: &Path, path: &Path) -> io::Result<bool> {
 pub fn write_file(dir: &Path, name: &str, data: &[u8], durable: bool) -> io::Result<()> {
     let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
     let mut f = std::fs::File::create(&tmp)?;
-    f.write_all(data)?;
-    if durable {
-        f.sync_all()?;
+    let res = (|| {
+        f.write_all(data)?;
+        if durable {
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, dir.join(name))
+    })();
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    std::fs::rename(&tmp, dir.join(name))?;
+    res?;
     if durable {
         sync_dir(dir)
     } else {
@@ -689,6 +695,15 @@ fn scope(prefix: &[u8], pid: u32, start: u64) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn failed_write_file_removes_its_temp_file() {
+        let dir = std::env::temp_dir().join(format!("flexvm-write-file-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("dest")).unwrap();
+        assert!(super::write_file(&dir, "dest", b"data", true).is_err());
+        assert!(!dir.join(format!(".dest.{}.tmp", std::process::id())).exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 

@@ -249,6 +249,7 @@ fn resolve_index(mut v: Value, mut digest: String, mut get: impl FnMut(&str) -> 
 
 fn pull(cache: &Path, mut reg: Registry, limits: &Limits) -> Result<Image> {
     let blobs = cache.join("blobs");
+    crate::util::create_dir_durably(&blobs.join("sha256"), 0o777)?;
     super::registry::sweep_parts(&blobs.join("sha256"));
     let (manifest, digest) = reg.manifest(&reg.r.reference.clone())?;
     let (manifest, digest) = resolve_index(manifest, digest, |d| Ok(reg.manifest(d)?.0))?;

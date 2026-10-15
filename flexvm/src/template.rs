@@ -462,7 +462,7 @@ fn record_working_set(paths: &Paths, name: &str, tap: &str, sockets: &Arc<Socket
     }
     // An exec records the session path's pages, so the first exec after a restore is fast;
     // an image with no shell can't run one, and an agent round trip stands in.
-    if guest::exec(&fc.sockets.vsock, "true").is_err() {
+    if guest::exec(&fc.sockets.vsock, "true", guest::TIMEOUT).is_err() {
         guest::ping(&fc.sockets.vsock)?;
     }
     fc.pause()?;
@@ -529,6 +529,7 @@ pub fn tap(prefix: &str) -> String {
 #[allow(clippy::too_many_arguments)]
 pub fn create(paths: &Paths, name: &str, vcpus: u32, mem_mib: u64, max_mib: u64, plug_mib: u64, image: Option<ImageMeta>, tap: &str) -> Result<()> {
     // `tap` is made (under the host lock, `Host::tap_prefix`) and removed here.
+    crate::host::check_name(name).inspect_err(|_| crate::net::delete_tap(tap))?;
     let tap = tap.to_string();
     // Running VMs map the old files, which must not be rewritten under them.
     let staging = format!(".{name}.new-{}", std::process::id());
@@ -557,7 +558,10 @@ fn publish(paths: &Paths, name: &str, staged: &Path) -> Result<()> {
             }
         }
         crate::util::sync_dir(staged)?;
-        std::fs::rename(staged, &gen)?;
+        match std::fs::rename(staged, &gen) {
+            Err(e) if matches!(e.raw_os_error(), Some(libc::ENOTEMPTY | libc::EEXIST)) => {}
+            r => r?,
+        }
     }
     let live = paths.templates.join(name);
     let tmp = paths.templates.join(format!(".{name}.link-{}", std::process::id()));
@@ -622,7 +626,7 @@ fn build(paths: &Paths, staging: &str, name: &str, vcpus: u32, mem_mib: u64, max
             guest::quiesce(&vsock)?;
         }
         None => {
-            guest::exec(&vsock, "sync; echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory")?;
+            guest::exec(&vsock, "sync; echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory", Duration::from_secs(120))?;
         }
     }
     let (reported, done) = wait_reporting_done(&fc, &metrics, plugged * 3 / 4)?;

@@ -83,12 +83,15 @@ impl Staging {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().subsec_nanos();
         let outer_name = cname(&format!("{STAGING_PREFIX}{}-{nanos:x}", std::process::id()));
         check(unsafe { libc::mkdirat(pfd.as_raw_fd(), outer_name.as_ptr(), 0o700) })?;
-        let outer = open_dir_at(pfd.as_raw_fd(), &outer_name)?;
-        check(unsafe { libc::flock(outer.as_raw_fd(), libc::LOCK_EX) })?;
-        check(unsafe { libc::flock(pfd.as_raw_fd(), libc::LOCK_UN) })?;
-        ensure!(private_dir(outer.as_raw_fd()), "staging directory in {} was replaced", parent_path.display());
-        check(unsafe { libc::mkdirat(outer.as_raw_fd(), c"ck".as_ptr(), 0o700) })?;
-        let ck = open_dir_at(outer.as_raw_fd(), c"ck")?;
+        let outer = open_dir_at(pfd.as_raw_fd(), &outer_name).inspect_err(|_| remove_staging(pfd.as_raw_fd(), &outer_name, -1, None))?;
+        let ck = (|| -> Result<_> {
+            check(unsafe { libc::flock(outer.as_raw_fd(), libc::LOCK_EX) })?;
+            check(unsafe { libc::flock(pfd.as_raw_fd(), libc::LOCK_UN) })?;
+            ensure!(private_dir(outer.as_raw_fd()), "staging directory in {} was replaced", parent_path.display());
+            check(unsafe { libc::mkdirat(outer.as_raw_fd(), c"ck".as_ptr(), 0o700) })?;
+            Ok(open_dir_at(outer.as_raw_fd(), c"ck")?)
+        })()
+        .inspect_err(|_| remove_staging(pfd.as_raw_fd(), &outer_name, outer.as_raw_fd(), None))?;
         let _ = std::fs::remove_file(&vmstate);
         Ok(Staging { dest, parent: pfd, base, outer, outer_name, ck, vmstate, pages: None, published: false, meta_left: chain_meta_budget(), app_log: 0 })
     }
