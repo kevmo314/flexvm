@@ -210,7 +210,7 @@ FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_be
           "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "resume_kill",
           "prepare_fail", "short_incoming", "slow_preload", "bad_preload", "bad_app_log", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
           "started_fsync", "started_unmark", "start_stall", "incoming_stall", "claim_stall", "standby_lock_stall", "standby_lock_hang", "handoff_stall", "ckpt_wp_race", "ckpt_rescue_fail",
-          "fetch_tail_enomem", "fetch_enomem_stuck", "pull_enomem", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo", "release_stall", "release_late", "no_plug", "pause_lost", "tap_backlog", "tap_backlog_stuck", "pause_unknown", "restore_ping_slow", "readdress_fail", "no_collapse", "collapse_slow", "pages_slow", "unlend_fail", "route_stall")
+          "fetch_tail_enomem", "fetch_enomem_stuck", "pull_enomem", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo", "release_stall", "release_late", "no_plug", "pause_lost", "tap_backlog", "tap_backlog_stuck", "pause_unknown", "restore_unpause_fail", "resume_link_fail", "restore_ping_slow", "readdress_fail", "no_collapse", "collapse_slow", "pages_slow", "unlend_fail", "route_stall")
 
 
 def disarm():
@@ -2383,8 +2383,9 @@ def resume_slow_guest():
 
 def resume_readdress_fail():
     """A restore at a new address whose readdress fails runs on with the
-    address pending (no checkpoint meanwhile); `flexvm resume` retries it,
-    held (--paused) or not."""
+    address pending (no checkpoint meanwhile), held (--paused) or not: each
+    `flexvm resume` retries it, and so does the process in the background
+    until it is set."""
     n = "ft-readdr"
     m = setup(n, mib=20)
     old_ip = vms(A)[n]["ip"]
@@ -2395,33 +2396,92 @@ def resume_readdress_fail():
         code, out = sh(B, n, "ip -4 -o addr show eth0")
         return code == 0 and ip in out and old_ip not in out
 
+    sigcont_failed = lambda: log(B, n).count("signal 18: vm ft-readdr runs, but setting its address")
     for paused in (True, False):
         what = "held" if paused else "running"
         clear_log(B, n)
+        fault(B, "readdress_fail", 120000)
         if paused:
             r = ok(restore(B, path, paused=True, ip="auto"))
-            fault(B, "readdress_fail", 60000)
             code, out, err = cli(B, "resume", n)
             check(f"readdress fails ({what}): resume sent", code == 0, err)
-            check(f"readdress fails ({what}): logged", wait_for(lambda: "setting its address" in log(B, n), 30), log(B, n)[-2000:])
+            check(f"readdress fails ({what}): logged", wait_for(lambda: sigcont_failed() == 1, 30), log(B, n)[-2000:])
         else:
-            fault(B, "readdress_fail", 60000)
             r = ok(restore(B, path, ip="auto"))
             check(f"readdress fails ({what}): reported", "setting its address" in (r.get("address_error") or ""), r)
-        fault(B, "readdress_fail", 0)
         check(f"readdress fails ({what}): running", vms(B).get(n, {}).get("state") == "running", vms(B).get(n))
         check(f"readdress fails ({what}): guest lacks the new address", not has(r["ip"]))
         refused = checkpoint(B, n, path + "-x")
         check(f"readdress fails ({what}): no checkpoint while pending", not refused["ok"] and "address" in refused.get("error", ""), refused)
         rm_ckpt(path + "-x")
+        # A SIGCONT is let through while the address is pending: it tries again.
+        before = sigcont_failed()
         code, out, err = cli(B, "resume", n)
-        check(f"readdress fails ({what}): second resume sent", code == 0, err)
-        check(f"readdress fails ({what}): second resume sets it", wait_for(lambda: has(r["ip"]), 30), sh(B, n, "ip -4 -o addr show eth0"))
+        check(f"readdress fails ({what}): another resume tries again", code == 0 and wait_for(lambda: sigcont_failed() > before, 30), log(B, n)[-2000:])
+        check(f"readdress fails ({what}): the background retries too", wait_for(lambda: "trying again" in log(B, n), 30), log(B, n)[-2000:])
+        fault(B, "readdress_fail", 0)
+        check(f"readdress fails ({what}): set once it can be, unasked", wait_for(lambda: has(r["ip"]), 30), sh(B, n, "ip -4 -o addr show eth0"))
+        check(f"readdress fails ({what}): logged as taken", "took its address" in log(B, n), log(B, n)[-2000:])
         check(f"readdress fails ({what}): md5 intact", md5(B, n) == m)
         r2 = checkpoint(B, n, path + "-x")
         check(f"readdress fails ({what}): checkpoints again", r2["ok"], r2)
         rm_ckpt(path + "-x")
         kill(B, n)
+    rm_ckpt(path)
+
+
+def resume_unpause_fail():
+    """A suspended VM whose vCPUs fail to resume may have run some of them:
+    its checkpoint is not resumed again, but the VM, paused again, is kept
+    and `flexvm resume` runs it."""
+    n = "ft-unpause-fail"
+    m = setup(n)
+    proc = marker(A, n)
+    suspend(A, n)
+    fault(A, "restore_unpause_fail", 60000)
+    r = resume_suspended(A, n)
+    fault(A, "restore_unpause_fail", 0)
+    res = r.get("result") or {}
+    check("unpause fails: resume answers, paused", r["ok"] and res.get("state") == "paused" and "resuming its vCPUs failed" in (res.get("resume_error") or ""), r)
+    check("unpause fails: kept, paused", vms(A).get(n, {}).get("state") == "paused", vms(A).get(n))
+    d = os.path.join(A.state, "suspended", n)
+    check("unpause fails: its checkpoint is consumed (STARTED, or deleted once paged in)",
+          not os.path.exists(d) or os.path.exists(os.path.join(d, "STARTED")), os.listdir(d) if os.path.exists(d) else None)
+    resume(A, n)
+    check("unpause fails: flexvm resume runs it", vms(A).get(n, {}).get("state") == "running", vms(A).get(n))
+    check("unpause fails: md5 intact, same processes", md5(A, n) == m and marker_id(A, n) == proc, (proc, marker_id(A, n)))
+    cleanup(n)
+
+
+def abort_link_fail():
+    """Raising a VM's tap fails as it resumes after an aborted migration or a
+    checkpoint: it is left paused (as Firecracker has it), never failed, and
+    `flexvm resume` runs it."""
+    n = "ft-link-fail"
+    m = setup(n, mib=20)
+    for f in ("bad_preload", "resume_link_fail"):
+        fault(A, f, 60000)
+    r = migrate(A, n, B)
+    for f in ("bad_preload", "resume_link_fail"):
+        fault(A, f, 0)
+    check("link fails after an abort: migrate fails, saying so", not r["ok"] and "resuming it here failed too" in r.get("error", ""), r)
+    check("link fails after an abort: paused on A only, not failed", where(n) == {A: "paused"}, where(n))
+    check("link fails after an abort: Firecracker paused", fc_api(api_sock(A, n), "GET", "/")["state"] == "Paused")
+    resume(A, n)
+    check("link fails after an abort: flexvm resume runs it", where(n) == {A: "running"} and md5(A, n) == m, where(n))
+    path = ckpt_path("ft-link-fail")
+    fault(A, "resume_link_fail", 60000)
+    r = checkpoint(A, n, path)
+    fault(A, "resume_link_fail", 0)
+    check("link fails after a checkpoint: it fails, saying so", not r["ok"] and "after its checkpoint failed" in r.get("error", ""), r)
+    check("link fails after a checkpoint: paused, not failed", vms(A)[n]["state"] == "paused", vms(A)[n])
+    resume(A, n)
+    check("link fails after a checkpoint: flexvm resume runs it", vms(A)[n]["state"] == "running" and md5(A, n) == m, vms(A)[n])
+    r = migrate(A, n, B)
+    check("link fails: a later migration works", r["ok"] and where(n).get(B) == "running", r)
+    wait_released(B, n)
+    check("link fails: md5 intact on B", md5(B, n) == m)
+    cleanup(n)
     rm_ckpt(path)
 
 
@@ -6186,7 +6246,7 @@ SCENARIOS = dict(
     checkpoint_restore=checkpoint_restore, checkpoint_fork=checkpoint_fork, checkpoint_corrupt=checkpoint_corrupt,
     checkpoint_crash=checkpoint_crash, pause_resume=pause_resume, signals=signals, pause_lost=pause_lost, suspend_resume=suspend_resume,
     suspend_gen=suspend_gen, checkpoint_hotplug=checkpoint_hotplug, checkpoint_untrusted_dir=checkpoint_untrusted_dir,
-    resume_failures=resume_failures, resume_slow_guest=resume_slow_guest, resume_readdress_fail=resume_readdress_fail, held_restore_frozen=held_restore_frozen, cow_exact=cow_exact, cow_rescue_fail=cow_rescue_fail, cow_collapsed=skippable(cow_collapsed), unplug_collapsed=no_evict(skippable(unplug_collapsed)), cow_abort=cow_abort,
+    resume_failures=resume_failures, resume_unpause_fail=resume_unpause_fail, abort_link_fail=abort_link_fail, resume_slow_guest=resume_slow_guest, resume_readdress_fail=resume_readdress_fail, held_restore_frozen=held_restore_frozen, cow_exact=cow_exact, cow_rescue_fail=cow_rescue_fail, cow_collapsed=skippable(cow_collapsed), unplug_collapsed=no_evict(skippable(unplug_collapsed)), cow_abort=cow_abort,
     cow_crash=cow_crash, cow_reports_held=cow_reports_held, ckpt_incremental=ckpt_incremental, ckpt_hot=ckpt_hot,
     ckpt_failed_stop=ckpt_failed_stop, ckpt_rearm=ckpt_rearm, ckpt_dir_moved=ckpt_dir_moved,
     prepare_disconnect=prepare_disconnect, prepare_trickle=prepare_trickle, prepare_fail=prepare_fail,

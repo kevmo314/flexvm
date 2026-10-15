@@ -112,6 +112,9 @@ pub struct Vm {
     switch_unsure: AtomicBool,
     /// Its tap could not be raised or routed when it resumed: the next `unpause` does that first.
     link_down: AtomicBool,
+    /// With `switch_unsure`: a resume failed and the VM could not be paused again, so Firecracker saying Paused
+    /// proves nothing (see `after_failed_resume`).
+    resume_failed: AtomicBool,
 }
 
 impl Vm {
@@ -428,15 +431,20 @@ impl Vm {
         self.was_paused.load(Ordering::SeqCst)
     }
 
-    pub fn resume(&self, attached: bool) -> Result<State> {
+    /// On failure its state is settled (`settle_failed_resume`) and returned with the error.
+    pub fn resume(&self, attached: bool) -> std::result::Result<State, (State, crate::util::Error)> {
         let resumed = self.resume_vcpus(attached);
         self.after_resume(resumed.is_ok());
-        resumed
+        resumed.map_err(|e| (self.settle_failed_resume(), e))
     }
 
     /// The part of `resume` the guest waits for: its devices back and its vCPUs running (unless it was paused before).
     fn resume_vcpus(&self, attached: bool) -> Result<State> {
         // A successful held-packet release already raised the link and attached it.
+        if crate::host::fault("resume_link_fail") {
+            self.link_down.store(true, Ordering::SeqCst);
+            bail!("injected fault: raising its tap failed");
+        }
         if !attached {
             self.link_up()?;
         }
@@ -486,10 +494,12 @@ impl Vm {
         }
         let res = self.resume_vcpus(attached);
         let now = match &res {
-            Ok(s) => *s,
-            Err(_) => self.after_failed_resume(),
+            Ok(s) => {
+                self.record(*s);
+                *s
+            }
+            Err(_) => self.settle_failed_resume(),
         };
-        self.record(now);
         res.map_err(|e| format!("resuming vm {} after its checkpoint failed: {e}; it is {}", self.name, now.name()).into())
     }
 
@@ -500,12 +510,27 @@ impl Vm {
         res
     }
 
-    /// After a failed `resume_vcpus`: Running or Paused, as Firecracker has it, or Paused but unsure
-    /// (`switch_unsure`: the next pause or resume asks again) if it cannot say. Never Failed: it can still be resumed.
-    fn after_failed_resume(&self) -> State {
-        let now = self.fc_state();
+    /// After a resume that failed: Running if Firecracker says so (only once every vCPU acknowledged), else paused
+    /// again explicitly (twice at most: a vCPU's late answer to the resume may be read first); None if neither.
+    /// Firecracker saying Paused proves nothing: it resumes vCPUs one by one and says Paused until all acknowledge
+    /// (and answers a failed resume 400), so some may have run.
+    fn after_failed_resume(&self) -> Option<State> {
+        if self.fc_state() == Some(State::Running) {
+            return Some(State::Running);
+        }
+        self.pager.hold_collapse(true);
+        (0..2).any(|_| self.fc(|fc| fc.pause()).is_ok()).then_some(State::Paused)
+    }
+
+    /// `after_failed_resume`, recorded; Paused but unsure if it cannot be had (the next pause or resume tries again).
+    /// Never Failed: it can still be resumed.
+    fn settle_failed_resume(&self) -> State {
+        let now = self.after_failed_resume();
         self.switch_unsure.store(now.is_none(), Ordering::SeqCst);
-        now.unwrap_or(State::Paused)
+        self.resume_failed.store(now.is_none(), Ordering::SeqCst);
+        let now = now.unwrap_or(State::Paused);
+        self.record(now);
+        now
     }
 
     pub fn pause(&self) -> Result<()> {
@@ -549,9 +574,12 @@ impl Vm {
         // resume asks again or sends its request whatever the record says.
         let now = match &res {
             Ok(()) => Some(to),
+            // Not `rejected`: a resume that failed part way is answered 400 too.
+            Err(_) if !pausing => self.after_failed_resume(),
             Err(e) if rejected(e, "/vm") => Some(from),
             Err(_) => self.fc_state(),
         };
+        self.resume_failed.store(now.is_none() && !pausing, Ordering::SeqCst);
         // Recorded whichever it is (a failed resume may find it still paused).
         if let Some(s) = now {
             self.record(s);
@@ -571,12 +599,14 @@ impl Vm {
         self.switch_unsure.load(Ordering::SeqCst)
     }
 
-    /// Its state, after a pause or resume that ended unknown first recorded as Firecracker has it (clearing
-    /// `switch_unsure`); None if Firecracker cannot say.
+    /// Its state, after a pause or resume that ended unknown first recorded as Firecracker has it, or after a failed
+    /// resume as `after_failed_resume` makes it (clearing `switch_unsure`); None if that cannot be had.
     fn reconcile(&self) -> Option<State> {
         if self.switch_unsure.load(Ordering::SeqCst) {
-            self.record(self.fc_state()?);
+            // After a resume that failed, Firecracker saying Paused proves nothing: it is paused again instead.
+            self.record(if self.resume_failed.load(Ordering::SeqCst) { self.after_failed_resume() } else { self.fc_state() }?);
             self.switch_unsure.store(false, Ordering::SeqCst);
+            self.resume_failed.store(false, Ordering::SeqCst);
         }
         Some(self.state())
     }
@@ -931,6 +961,7 @@ impl Prepared {
             dead: AtomicBool::new(false),
             switch_unsure: AtomicBool::new(false),
             link_down: AtomicBool::new(false),
+            resume_failed: AtomicBool::new(false),
         })
     }
 
