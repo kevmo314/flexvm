@@ -877,19 +877,24 @@ def exec_background():
     check("exec bg: the abandoned-session wait is shortened", sh(A, n, f"echo 3 > {knob}") == (0, ""))
     killed = []
 
+    # As `timeout -s KILL 2 flexvm exec ...`, whose own exit status differs between coreutils versions.
     def killer():
         for _ in range(7):
-            p = subprocess.run(["timeout", "-s", "KILL", "2", BIN, "--state", A.state, "--run", A.run, "exec", n, "sleep infinity"],
-                               capture_output=True, text=True, env=ENV, timeout=60)
-            killed.append((p.returncode, p.stderr.strip()[-200:]))
+            p = subprocess.Popen([BIN, "--state", A.state, "--run", A.run, "exec", n, "sleep infinity"],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, env=ENV)
+            try:
+                p.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                p.kill()
+            killed.append((p.wait(), p.stderr.read().strip()[-200:]))
 
     killers = [threading.Thread(target=killer) for _ in range(10)]
     for k in killers:
         k.start()
     for k in killers:
         k.join()
-    # 124: `timeout` had to kill it, so it ran until then; "too many sessions" would end it at once.
-    bad = [k for k in killed if k != (124, "")]
+    # Killed (-9), so it ran until then; "too many sessions" would end it at once.
+    bad = [k for k in killed if k != (-signal.SIGKILL, "")]
     check("exec bg: 70 execs killed outright all ran until killed", len(killed) == 70 and not bad, bad[:3])
     check("exec bg: execs still start after them", sh(A, n, "echo hi") == (0, "hi"))
     stopped = wait_for(lambda: count("sleep infinity") == (0, "0"), 90)
