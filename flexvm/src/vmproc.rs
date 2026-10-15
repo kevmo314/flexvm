@@ -854,7 +854,9 @@ impl Proc {
         }
         let admitted = match crate::uffd::admit(&s) {
             Ok(Some(a)) => a,
-            Ok(None) => return crate::listen::refuse(s, "page server busy: every connection is answering a request", Some(Duration::from_secs(1))),
+            Ok(None) => {
+                return crate::listen::refuse(s, "page server busy: every connection is answering a request or still ending", Some(Duration::from_secs(1)))
+            }
             Err(e) => return crate::log!("vm {}: page server: {e}", vm.name),
         };
         let _ = s.set_nodelay(true);

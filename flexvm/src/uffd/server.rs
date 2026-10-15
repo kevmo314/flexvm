@@ -4,7 +4,7 @@ use crate::util::{Result, PAGE_SIZE};
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 const SERVE_WRITE: Duration = Duration::from_secs(30);
@@ -15,47 +15,107 @@ const SERVE_IDLE: Duration = Duration::from_secs(600);
 
 /// Page-server connections this process serves at once, apart from its control connections (#335). A target uses 12
 /// (`FAULT_FETCHERS` + `PULL_THREADS`), and more for a while after it reconnects; one past this takes the place of the
-/// one idle longest, so connections a peer leaves open never shut out a target's reconnect. Each one's buffer is at
-/// most `1 + MAX_FETCH`, so this bounds their buffers too.
+/// one idle longest, so connections a peer leaves open never shut out a target's reconnect. One shut down for another
+/// counts until its thread has ended, its buffer (at most `1 + MAX_FETCH`) freed, so this bounds their buffers too.
 const MAX_CONNS: usize = 32;
 const _: () = assert!(MAX_CONNS * (1 + MAX_FETCH) <= 40 << 20);
-static CONNS: Mutex<Vec<Arc<Conn>>> = Mutex::new(Vec::new());
+/// How long an admission waits for a connection shut down for it to end.
+const EVICT_WAIT: Duration = Duration::from_secs(5);
+static CONNS: Conns = Conns { all: Mutex::new(Vec::new()), gone: Condvar::new() };
+
+struct Conns {
+    all: Mutex<Vec<Arc<Conn>>>,
+    /// Told when one is removed.
+    gone: Condvar,
+}
 
 struct Conn {
     sock: TcpStream,
-    /// Since when it has waited for a request; None while it answers one.
-    idle: Mutex<Option<Instant>>,
+    /// Changed only under its lock, so a connection is never both chosen to make room and answering a request.
+    state: Mutex<Serving>,
 }
 
-/// A page-server connection's place among `MAX_CONNS`, given up when dropped.
-pub struct Admitted(Arc<Conn>);
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Serving {
+    /// Waiting for a request since then.
+    Idle(Instant),
+    Busy,
+    /// Shut down for another: it answers nothing more, but counts until its thread ends.
+    Evicted,
+}
+
+/// A page-server connection's place among `MAX_CONNS`, given up when dropped (by its serving thread, once done with its
+/// buffer).
+pub struct Admitted(Arc<Conn>, &'static Conns);
 
 impl Drop for Admitted {
     fn drop(&mut self) {
-        CONNS.lock().unwrap().retain(|c| !Arc::ptr_eq(c, &self.0));
+        self.1.all.lock().unwrap().retain(|c| !Arc::ptr_eq(c, &self.0));
+        self.1.gone.notify_all();
     }
 }
 
-/// A place for `conn` among the page-server connections; when they are all taken, the one idle longest is shut down
-/// for it (its client reconnects when it needs it), or None if every one is answering a request.
-pub fn admit(conn: &TcpStream) -> io::Result<Option<Admitted>> {
-    let c = Arc::new(Conn { sock: conn.try_clone()?, idle: Mutex::new(Some(Instant::now())) });
-    let mut all = CONNS.lock().unwrap();
-    if all.len() >= MAX_CONNS {
-        let longest = all.iter().enumerate().filter_map(|(i, c)| c.idle.lock().unwrap().map(|t| (t, i))).min();
-        let Some((since, i)) = longest else { return Ok(None) };
-        let old = all.swap_remove(i);
-        crate::log!("page server: {MAX_CONNS} connections; dropping one idle for {} s", since.elapsed().as_secs());
-        let _ = old.sock.shutdown(Shutdown::Both);
+impl Conn {
+    /// Starts answering a request; false if it was evicted.
+    fn busy(&self) -> bool {
+        let mut st = self.state.lock().unwrap();
+        if *st == Serving::Evicted {
+            return false;
+        }
+        *st = Serving::Busy;
+        true
     }
-    all.push(c.clone());
-    Ok(Some(Admitted(c)))
+
+    fn idle(&self) {
+        let mut st = self.state.lock().unwrap();
+        if *st == Serving::Busy {
+            *st = Serving::Idle(Instant::now());
+        }
+    }
+}
+
+impl Conns {
+    fn admit(&'static self, sock: TcpStream, wait: Duration) -> Option<Admitted> {
+        let deadline = Instant::now() + wait;
+        let mut all = self.all.lock().unwrap();
+        loop {
+            if all.len() < MAX_CONNS {
+                let c = Arc::new(Conn { sock, state: Mutex::new(Serving::Idle(Instant::now())) });
+                all.push(c.clone());
+                return Some(Admitted(c, self));
+            }
+            // Room comes once one already shut down ends; only with none ending is another shut down.
+            if !all.iter().any(|c| *c.state.lock().unwrap() == Serving::Evicted) {
+                let (old, since) = evict_longest_idle(&all)?;
+                crate::log!("page server: {MAX_CONNS} connections; dropping one idle for {} s", since.elapsed().as_secs());
+                let _ = old.sock.shutdown(Shutdown::Both);
+            }
+            let left = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero())?;
+            all = self.gone.wait_timeout(all, left).unwrap().0;
+        }
+    }
+}
+
+/// Marks the connection idle longest evicted, with every one's state held meanwhile: one that has started answering a
+/// request is never chosen, and one chosen answers no more. None if every one is busy (or already evicted).
+fn evict_longest_idle(all: &[Arc<Conn>]) -> Option<(Arc<Conn>, Instant)> {
+    let mut states: Vec<_> = all.iter().map(|c| c.state.lock().unwrap()).collect();
+    let (i, since) = states.iter().enumerate().filter_map(|(i, s)| if let Serving::Idle(t) = **s { Some((i, t)) } else { None }).min_by_key(|&(_, t)| t)?;
+    *states[i] = Serving::Evicted;
+    Some((all[i].clone(), since))
+}
+
+/// A place for `conn` among the page-server connections; when they are all taken, the one idle longest is shut down
+/// for it (its client reconnects when it needs it), and this waits up to `EVICT_WAIT` for it to end. None if every one
+/// is answering a request, or the one shut down did not end in time.
+pub fn admit(conn: &TcpStream) -> io::Result<Option<Admitted>> {
+    Ok(CONNS.admit(conn.try_clone()?, EVICT_WAIT))
 }
 
 /// Serves page reads for `pager` on an accepted page-server connection (already answered `ok`), until the client hangs
 /// up, sits idle for `SERVE_IDLE` (or longest, as another one is admitted), asks for more than `MAX_FETCH`, or `stop()`
-/// says to drop it. `stop` is asked before
-/// every request and every second meanwhile, so a connection ends soon after its VM stops being a migration source.
+/// says to drop it. `stop` is asked before every request and every second meanwhile, so a connection ends soon after
+/// its VM stops being a migration source.
 /// `pace()` is called before each reply (a test fault slows the server with it). `conn` is the socket under `stream`, for
 /// its timeouts; `admitted` its place (`admit`).
 pub fn serve_pages(
@@ -70,9 +130,10 @@ pub fn serve_pages(
     conn.set_write_timeout(Some(SERVE_WRITE))?;
     let mut req = [0u8; 12];
     let mut buf = Vec::new();
-    let idle = |yes: bool| *admitted.0.idle.lock().unwrap() = yes.then(Instant::now);
     while read_request(&mut stream, &mut req, &stop) && !stop() {
-        idle(false);
+        if !admitted.0.busy() {
+            return Ok(());
+        }
         let offset = u64::from_le_bytes(req[..8].try_into().unwrap());
         let len = u32::from_le_bytes(req[8..].try_into().unwrap()) as usize;
         if len > MAX_FETCH {
@@ -94,7 +155,7 @@ pub fn serve_pages(
                 stream.write_all(&[1])?;
             }
         }
-        idle(true);
+        admitted.0.idle();
     }
     Ok(())
 }
@@ -198,4 +259,80 @@ pub(super) fn capture_preload(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Barrier;
+
+    /// A socket to shut down (one end of a Unix pair: only `shutdown` is used, and no loopback port is taken).
+    fn sock() -> TcpStream {
+        let (a, _) = std::os::unix::net::UnixStream::pair().unwrap();
+        TcpStream::from(std::os::fd::OwnedFd::from(a))
+    }
+
+    fn conn(idle_for: Duration) -> Arc<Conn> {
+        Arc::new(Conn { sock: sock(), state: Mutex::new(Serving::Idle(Instant::now() - idle_for)) })
+    }
+
+    #[test]
+    fn busy_connections_are_never_evicted() {
+        let (a, b) = (conn(Duration::from_secs(10)), conn(Duration::from_secs(1)));
+        let all = vec![a.clone(), b.clone()];
+        assert!(a.busy());
+        let (gone, _) = evict_longest_idle(&all).unwrap();
+        assert!(Arc::ptr_eq(&gone, &b), "the busy one, though idle longer before, stays");
+        assert!(!b.busy(), "an evicted one answers no more");
+        assert!(evict_longest_idle(&all).is_none(), "nothing left to evict");
+        a.idle();
+        assert!(Arc::ptr_eq(&evict_longest_idle(&all).unwrap().0, &a));
+    }
+
+    #[test]
+    fn eviction_racing_a_connection_turning_busy() {
+        let (a, b) = (conn(Duration::ZERO), conn(Duration::ZERO));
+        let all = vec![a.clone(), b.clone()];
+        for _ in 0..2000 {
+            *a.state.lock().unwrap() = Serving::Idle(Instant::now() - Duration::from_secs(10));
+            *b.state.lock().unwrap() = Serving::Idle(Instant::now() - Duration::from_secs(1));
+            let go = Arc::new(Barrier::new(2));
+            let (a2, go2) = (a.clone(), go.clone());
+            let t = std::thread::spawn(move || {
+                go2.wait();
+                a2.busy()
+            });
+            go.wait();
+            let (gone, _) = evict_longest_idle(&all).unwrap();
+            let busy = t.join().unwrap();
+            // Exactly one of them won: either `a` answers and `b` was evicted, or `a` was evicted and answers nothing.
+            assert_eq!(busy, Arc::ptr_eq(&gone, &b));
+            assert_eq!(*a.state.lock().unwrap(), if busy { Serving::Busy } else { Serving::Evicted });
+        }
+    }
+
+    #[test]
+    fn an_evicted_connection_counts_until_it_ends() {
+        let conns: &'static Conns = Box::leak(Box::new(Conns { all: Mutex::new(Vec::new()), gone: Condvar::new() }));
+        let mut held: Vec<_> = (0..MAX_CONNS).map(|_| conns.admit(sock(), Duration::ZERO).unwrap()).collect();
+        // The first, idle longest, is shut down, but its thread has not ended: no room yet.
+        assert!(conns.admit(sock(), Duration::from_millis(50)).is_none());
+        assert_eq!(conns.all.lock().unwrap().len(), MAX_CONNS);
+        assert_eq!(*held[0].0.state.lock().unwrap(), Serving::Evicted);
+        // Only one is shut down while it ends.
+        assert_eq!(conns.all.lock().unwrap().iter().filter(|c| *c.state.lock().unwrap() == Serving::Evicted).count(), 1);
+        let first = held.remove(0);
+        let ends = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            drop(first);
+        });
+        let last = conns.admit(sock(), Duration::from_secs(5)).expect("room once the evicted one ended");
+        ends.join().unwrap();
+        // Every one busy: nothing to shut down, so the next is refused.
+        for a in held.iter().chain([&last]) {
+            assert!(a.0.busy());
+        }
+        assert!(conns.admit(sock(), Duration::from_millis(50)).is_none());
+        assert!(conns.all.lock().unwrap().iter().all(|c| *c.state.lock().unwrap() == Serving::Busy));
+    }
 }
