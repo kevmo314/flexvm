@@ -1661,14 +1661,15 @@ mod tests {
 
     #[test]
     fn state_and_suspended_directories_are_private() {
-        let root = crate::test_util::TempDir::new("private");
+        let tmp = crate::test_util::TempDir::new("private");
+        // Made here, not by the guard, so its mode is create_dir_durably's.
+        let root = tmp.join("root");
         let dir = root.join("state/suspended");
         create_dir_durably(&dir, 0o700).unwrap();
         for path in [&root, &root.join("state"), &dir] {
             assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o700);
         }
         create_dir_durably(&dir, 0o700).unwrap();
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
