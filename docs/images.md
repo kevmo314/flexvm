@@ -44,7 +44,11 @@ the guest can leave any cgroup); without cgroup2 their session is killed.
   Layers are unpacked in `--image-staging` (default `/var/lib/flexvm/staging`),
   which must be root-owned and 0700 with an ancestry only root can change, and
   is used through a descriptor, so other users can neither reach the image's
-  setuid files and device nodes nor swap the directory mid-build. The image
+  setuid files and device nodes nor swap the directory mid-build. A build
+  unpacks into `rootfs-<random>` there, flocked through `rootfs-<random>.lock`
+  beside it; interrupted (SIGINT, SIGTERM, SIGHUP) it removes that tree and its
+  half-written `<key>.tmp<random>` before exiting, and a killed build's are
+  removed by the next build, once their locks are free. The image
   cache is trusted by whoever can write it (it is reused as is); writes into it
   never follow symlinks. flexvm adds `/sbin/flexvm-init`, its mount points,
   `/etc/flexvm/app.conf` (argv, env, workdir, uid/gid/groups resolved against

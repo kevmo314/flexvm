@@ -795,6 +795,19 @@ pub fn unlink_durably(path: &Path) -> io::Result<()> {
     }
 }
 
+/// 16 random hex digits for a temporary name, so that no two writers (other processes, other
+/// pid namespaces, other hosts sharing the directory) ever pick the same one.
+pub fn nonce() -> io::Result<String> {
+    let mut random = [0u8; 8];
+    io::Read::read_exact(&mut std::fs::File::open("/dev/urandom")?, &mut random)?;
+    Ok(random.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Whether `s` is a `nonce()`.
+pub fn is_nonce(s: &str) -> bool {
+    s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// False if `path` exists.
 pub fn rename_noreplace(tmp: &Path, path: &Path) -> io::Result<bool> {
     use std::os::unix::ffi::OsStrExt;

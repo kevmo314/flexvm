@@ -34,7 +34,9 @@ pub const MAX_DOCUMENT: u64 = 4 << 20;
 /// Most tar metadata (PAX header, GNU long name and link) for one entry, together.
 const MAX_META: u64 = 1 << 20;
 const MAX_PAX_RECORDS: usize = 256;
-const MAX_DEPTH: u32 = 4096;
+/// How deep whiteouts and replacements walk an image's own directories, a descriptor per level:
+/// well under the usual soft limit of 1024 open files.
+const MAX_DEPTH: u32 = 512;
 /// Largest zstd window a layer may declare (libzstd's default). Decoding holds the window and one block
 /// (up to 1 MiB of literals) in a ring buffer that grows by doubling: about twice this at worst.
 const MAX_ZSTD_WINDOW: u64 = 128 << 20;
@@ -86,23 +88,52 @@ fn list_dir(dir: RawFd) -> Result<Vec<CString>> {
     names.map(|e| Ok(CString::new(e?.file_name().into_vec()).unwrap())).collect()
 }
 
-/// Removes `name` in `dir` recursively, never leaving `dir`.
-pub fn remove_at(dir: RawFd, name: &CStr, depth: u32) -> Result<()> {
-    if depth > MAX_DEPTH {
-        bail!("directory tree too deep to remove");
+fn unlink_at(dir: RawFd, name: &CStr) -> Result<()> {
+    match (unsafe { libc::unlinkat(dir, name.as_ptr(), 0) } < 0).then(io::Error::last_os_error) {
+        Some(e) if e.raw_os_error() != Some(libc::ENOENT) => bail!("unlink {name:?}: {e}"),
+        _ => Ok(()),
     }
-    if is_type(dir, name, libc::S_IFDIR) {
-        let sub = open_dir_at(dir, name)?;
-        for child in list_dir(sub.as_raw_fd())? {
-            remove_at(sub.as_raw_fd(), &child, depth + 1)?;
-        }
-        check(unsafe { libc::unlinkat(dir, name.as_ptr(), libc::AT_REMOVEDIR) }, "rmdir", Path::new(OsStr::from_bytes(name.to_bytes())))
-    } else {
-        match (unsafe { libc::unlinkat(dir, name.as_ptr(), 0) } < 0).then(io::Error::last_os_error) {
-            Some(e) if e.raw_os_error() != Some(libc::ENOENT) => bail!("unlink {name:?}: {e}"),
-            _ => Ok(()),
+}
+
+/// Unlinks everything in `dir` but directories, which it returns.
+fn empty_but_dirs(dir: RawFd) -> Result<Vec<CString>> {
+    let mut dirs = Vec::new();
+    for child in list_dir(dir)? {
+        match is_type(dir, &child, libc::S_IFDIR) {
+            true => dirs.push(child),
+            false => unlink_at(dir, &child)?,
         }
     }
+    Ok(dirs)
+}
+
+/// Removes `name` in `dir` recursively, never leaving `dir`. However deep the tree, it holds
+/// one descriptor: it climbs back out through `..`, keeping only names.
+pub fn remove_at(dir: RawFd, name: &CStr) -> Result<()> {
+    if !is_type(dir, name, libc::S_IFDIR) {
+        return unlink_at(dir, name);
+    }
+    let rmdir = |at: RawFd, name: &CStr| {
+        check(unsafe { libc::unlinkat(at, name.as_ptr(), libc::AT_REMOVEDIR) }, "rmdir", Path::new(OsStr::from_bytes(name.to_bytes())))
+    };
+    let mut cur = open_dir_at(dir, name)?;
+    // Each level's name and the subdirectories still to remove in it.
+    let mut stack = vec![(name.to_owned(), empty_but_dirs(cur.as_raw_fd())?)];
+    while let Some((name, pending)) = stack.last_mut() {
+        if let Some(child) = pending.pop() {
+            cur = open_dir_at(cur.as_raw_fd(), &child)?;
+            stack.push((child, empty_but_dirs(cur.as_raw_fd())?));
+            continue;
+        }
+        let name = std::mem::take(name);
+        stack.pop();
+        if stack.is_empty() {
+            return rmdir(dir, &name);
+        }
+        cur = open_dir_at(cur.as_raw_fd(), c"..")?;
+        rmdir(cur.as_raw_fd(), &name)?;
+    }
+    unreachable!()
 }
 
 /// An entry as resolved, not as spelled: a directory by its (dev, ino), anything else by its directory's and its name.
@@ -146,7 +177,7 @@ fn opaque(fd: RawFd, layer: &HashSet<Key>, depth: u32) -> Result<()> {
 /// Whiteout of `name` in `fd`: removed if from a lower layer, else made opaque.
 fn hide(fd: RawFd, name: &CStr, layer: &HashSet<Key>, depth: u32) -> Result<()> {
     if !key(fd, name).is_some_and(|k| layer.contains(&k)) {
-        return remove_at(fd, name, 0);
+        return remove_at(fd, name);
     }
     if depth > MAX_DEPTH {
         bail!("directory tree too deep");
@@ -164,7 +195,7 @@ struct At {
 
 impl At {
     fn remove(&self) -> Result<()> {
-        remove_at(self.dir.as_raw_fd(), &self.name, 0)
+        remove_at(self.dir.as_raw_fd(), &self.name)
     }
 
     fn create(&self) -> Result<File> {
@@ -200,6 +231,9 @@ impl<R> Hashed<R> {
 
 impl<R: Read> Read for Hashed<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // Downloads and unpacking read through here: an interrupted build stops within a read.
+        // Not `ErrorKind::Interrupted`, which readers retry.
+        crate::template::interrupted().map_err(|e| io::Error::other(e.to_string()))?;
         let n = self.inner.read(buf)?;
         self.n += n as u64;
         self.hash.update(&buf[..n]);
@@ -344,7 +378,8 @@ impl Root {
                         let mut buf = vec![0u8; 4096];
                         let n = unsafe { libc::readlinkat(fd.as_raw_fd(), name.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
                         check(n as i32, "mkdir", &cur)?;
-                        let target = cur.parent().unwrap().join(OsStr::from_bytes(&buf[..n as usize]));
+                        // Relative to where the link really is, which a symlinked parent may have moved.
+                        let target = self.real(&fd)?.join(OsStr::from_bytes(&buf[..n as usize]));
                         self.mkdir_p(&lexical(&target), depth + 1)?;
                     }
                     self.resolve(&cur)?
@@ -353,6 +388,12 @@ impl Root {
             };
         }
         Ok(fd)
+    }
+
+    /// Where `dir` is under the root, symlinks resolved.
+    fn real(&self, dir: &OwnedFd) -> Result<PathBuf> {
+        let (root, dir) = (std::fs::read_link(proc_path(&self.fd).to_str().unwrap())?, std::fs::read_link(proc_path(dir).to_str().unwrap())?);
+        Ok(dir.strip_prefix(&root).map_err(|_| format!("{dir:?} is outside the image root {root:?}"))?.to_path_buf())
     }
 
     fn at(&mut self, path: &Path) -> Result<At> {
@@ -690,6 +731,44 @@ pub(super) mod tests {
         fn drop(&mut self) {
             assert_eq!(std::fs::read_to_string(self.dir.join("outside")).ok().as_deref(), Some("keep"), "escaped the root");
         }
+    }
+
+    #[test]
+    fn dangling_symlinks_resolve_where_they_really_are() {
+        let s = Sandbox::new("dangling-under-symlink");
+        // `a/link` is really `x/y/link`, so `../run` is `x/run`, not `run` as spelled.
+        let tar = layer(&[("x/y/", 'd', ""), ("a", 'l', "x/y"), ("a/link", 'l', "../run"), ("a/link/pid", 'f', "1")]);
+        s.open().apply_layer(&tar[..]).unwrap();
+        assert_eq!(s.read("x/run/pid").as_deref(), Some("1"));
+        assert!(!s.root.join("run").exists());
+    }
+
+    #[test]
+    fn deep_trees_are_removed_within_a_few_descriptors() {
+        let s = Sandbox::new("deep");
+        // Deeper than the usual 1024 open files, and than any path can spell.
+        let mut fd = open_dir_at(libc::AT_FDCWD, &cpath(&s.root).unwrap()).unwrap();
+        for i in 0..5000 {
+            std::fs::write(format!("/proc/self/fd/{}/f", fd.as_raw_fd()), "x").unwrap();
+            if i % 1000 == 0 {
+                assert_eq!(unsafe { libc::mkdirat(fd.as_raw_fd(), c"side".as_ptr(), 0o755) }, 0);
+            }
+            assert_eq!(unsafe { libc::mkdirat(fd.as_raw_fd(), c"d".as_ptr(), 0o755) }, 0);
+            fd = open_dir_at(fd.as_raw_fd(), c"d").unwrap();
+        }
+        drop(fd);
+        let root = open_dir_at(libc::AT_FDCWD, &cpath(&s.root).unwrap()).unwrap();
+        // In a child with 32 descriptors at most, so the limit holds whatever this process's is.
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            let limit = libc::rlimit { rlim_cur: 32, rlim_max: 32 };
+            let ok = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } == 0 && remove_at(root.as_raw_fd(), c"d").is_ok();
+            unsafe { libc::_exit(if ok { 0 } else { 1 }) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0, "status {status}");
+        assert!(!s.root.join("d").exists() && s.root.join("f").exists());
     }
 
     #[test]
