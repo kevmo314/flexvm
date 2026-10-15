@@ -35,8 +35,9 @@ fn deadline(size: u64) -> Instant {
 
 /// An agent for one transfer: DNS, connect, the TLS handshake and every read and write obey the transfer's deadline
 /// (ureq holds each handshake read, not the handshake, to its connect timeout), and its connections are never pooled
-/// into another transfer.
-fn agent(deadline: Instant) -> ureq::Agent {
+/// into another transfer. With `public_only`, it connects only to public addresses (as resolved, so DNS cannot
+/// rebind it elsewhere).
+fn agent(deadline: Instant, public_only: bool) -> ureq::Agent {
     let config = ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(30)))
         .user_agent(concat!("flexvm/", env!("CARGO_PKG_VERSION")))
@@ -47,27 +48,54 @@ fn agent(deadline: Instant) -> ureq::Agent {
         .proxy(None)
         .build();
     let connector = TcpConnector::default().chain(DeadlineConnector(deadline)).chain(RustlsConnector::default());
-    ureq::Agent::with_parts(config, connector, DeadlineResolver(deadline))
+    ureq::Agent::with_parts(config, connector, DeadlineResolver { deadline, public_only })
 }
 
 /// Longest wait for any one read or write.
 const IDLE: Duration = Duration::from_secs(120);
 
 #[derive(Debug)]
-struct DeadlineResolver(Instant);
+struct DeadlineResolver {
+    deadline: Instant,
+    public_only: bool,
+}
 
 impl Resolver for DeadlineResolver {
     fn resolve(&self, uri: &ureq::http::Uri, _: &ureq::config::Config, _: NextTimeout) -> std::result::Result<ResolvedSocketAddrs, ureq::Error> {
         let (Some(scheme), Some(authority)) = (uri.scheme(), uri.authority()) else { return Err(ureq::Error::HostNotFound) };
         let addr = DefaultResolver::host_and_port(scheme, authority).ok_or(ureq::Error::HostNotFound)?;
         let mut addrs = self.empty();
-        for a in crate::util::resolve(&addr, self.0)?.into_iter().take(16) {
-            addrs.push(a);
+        let found = crate::util::resolve(&addr, self.deadline)?;
+        for a in found.iter().filter(|a| !self.public_only || is_public(a.ip())).take(16) {
+            addrs.push(*a);
+        }
+        if addrs.is_empty() && !found.is_empty() {
+            return Err(ureq::Error::Io(std::io::Error::new(std::io::ErrorKind::PermissionDenied, format!("{addr} is not on a public address"))));
         }
         if addrs.is_empty() {
             return Err(ureq::Error::HostNotFound);
         }
         Ok(addrs)
+    }
+}
+
+/// Not loopback, link-local, private (RFC 1918, unique local, shared CGNAT space), unspecified, broadcast or multicast.
+fn is_public(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            !(v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified() || v4.is_broadcast() || v4.is_multicast())
+                && a != 0
+                && !(a == 100 && b & 0xc0 == 64)
+        }
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => is_public(IpAddr::V4(v4)),
+            None => {
+                let s0 = v6.segments()[0];
+                !(v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() || s0 & 0xfe00 == 0xfc00 || s0 & 0xffc0 == 0xfe80)
+            }
+        },
     }
 }
 
@@ -184,28 +212,34 @@ fn backoff(n: u32) -> Duration {
     Duration::from_secs(1u64 << n.min(5)).min(Duration::from_secs(30))
 }
 
-/// A `Retry-After` value as a wait from `now`: seconds, or an HTTP date (IMF-fixdate, as RFC 9110 has servers send).
-fn retry_after(v: &str, now: std::time::SystemTime) -> Option<Duration> {
-    let v = v.trim();
-    if let Ok(secs) = v.parse::<u64>() {
-        return Some(Duration::from_secs(secs));
+/// `req` sent, and sent again after a 429 or 503 (a rate limit, or a registry briefly unavailable) up to `MAX_RETRIES`
+/// times: after its `Retry-After` in seconds, or else `backoff`, and only while that wait ends before `deadline`. The
+/// last answer is returned whatever its status.
+fn call(
+    what: &str,
+    deadline: Instant,
+    req: impl Fn(Duration) -> ureq::RequestBuilder<ureq::typestate::WithoutBody>,
+) -> Result<ureq::http::Response<ureq::Body>> {
+    for retries in 0.. {
+        let left = Registry::left(deadline, what)?;
+        let resp = match req(left).call() {
+            Ok(resp) => resp,
+            Err(e) => bail!("{what}: {e}"),
+        };
+        let code = resp.status().as_u16();
+        if !matches!(code, 429 | 503) || retries == MAX_RETRIES {
+            return Ok(resp);
+        }
+        // An HTTP date (rare) gets the backoff.
+        let after = resp.headers().get("retry-after").and_then(|v| v.to_str().ok()?.trim().parse().ok());
+        let wait = after.map_or(backoff(retries), Duration::from_secs);
+        if wait >= deadline.saturating_duration_since(Instant::now()) {
+            bail!("{what}: HTTP {code}, and a retry in {} s would pass the transfer deadline", wait.as_secs());
+        }
+        crate::log!("image: {what}: HTTP {code}; retrying in {} s", wait.as_secs_f32().ceil());
+        std::thread::sleep(wait);
     }
-    // `Sun, 06 Nov 1994 08:49:37 GMT`
-    let f: Vec<&str> = v.split_ascii_whitespace().collect();
-    let [_, day, mon, year, time, "GMT"] = f[..] else { return None };
-    let months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-    let m = months.iter().position(|&x| x == mon)? as i64 + 1;
-    let (d, y): (i64, i64) = (day.parse().ok()?, year.parse().ok()?);
-    let hms: Vec<i64> = time.split(':').map(|x| x.parse().ok()).collect::<Option<_>>()?;
-    let [h, mi, sec] = hms[..] else { return None };
-    // Days since 1970-01-01 of a proleptic Gregorian date (Howard Hinnant's days_from_civil).
-    let (y, m) = if m <= 2 { (y - 1, m + 9) } else { (y, m - 3) };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let doy = (153 * m + 2) / 5 + d - 1;
-    let days = era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468;
-    let at = std::time::UNIX_EPOCH + Duration::from_secs(u64::try_from(days * 86400 + h * 3600 + mi * 60 + sec).ok()?);
-    Some(at.duration_since(now).unwrap_or(Duration::ZERO))
+    unreachable!()
 }
 
 /// Shared by all of an image's layers (`Arc`), its token with them.
@@ -241,20 +275,20 @@ impl Registry {
     /// Authenticates on a 401 and retries once; redirects (blob storage) are followed without credentials.
     fn get(&self, path: &str, accept: &str, deadline: Instant) -> Result<ureq::Body> {
         let base = format!("{}/{path}", self.r.base_url());
-        let (mut url, mut redirects, mut authenticated, mut retries) = (base.clone(), 0, false, 0);
-        let agent = agent(deadline);
+        let (mut url, mut redirects, mut authenticated) = (base.clone(), 0, false);
+        let agent = agent(deadline, false);
         loop {
-            let mut req = agent.get(&url).config().timeout_global(Some(Self::left(deadline, &format!("GET {url}"))?)).build();
-            if redirects == 0 {
-                req = req.header("Accept", accept);
-                if let Some(a) = self.auth.lock().unwrap().clone() {
-                    req = req.header("Authorization", &*a);
+            let auth = if redirects == 0 { self.auth.lock().unwrap().clone() } else { None };
+            let resp = call(&format!("GET {url}"), deadline, |left| {
+                let mut req = agent.get(&url).config().timeout_global(Some(left)).build();
+                if redirects == 0 {
+                    req = req.header("Accept", accept);
                 }
-            }
-            let resp = match req.call() {
-                Ok(resp) => resp,
-                Err(e) => bail!("GET {url}: {e}"),
-            };
+                if let Some(a) = &auth {
+                    req = req.header("Authorization", &**a);
+                }
+                req
+            })?;
             let header = |name: &str| resp.headers().get(name).and_then(|v| v.to_str().ok());
             match resp.status().as_u16() {
                 300..=399 => {
@@ -269,19 +303,9 @@ impl Registry {
                     }
                 }
                 ..=299 => return Ok(resp.into_body()),
-                code @ (429 | 503) if retries < MAX_RETRIES => {
-                    let now = std::time::SystemTime::now();
-                    let wait = header("retry-after").and_then(|v| retry_after(v, now)).unwrap_or(backoff(retries));
-                    if Instant::now() + wait >= deadline {
-                        bail!("GET {url}: HTTP {code}, and a retry in {} s would pass the transfer deadline", wait.as_secs());
-                    }
-                    crate::log!("image: GET {url}: HTTP {code}; retrying in {} s", wait.as_secs_f32().ceil());
-                    std::thread::sleep(wait);
-                    retries += 1;
-                }
                 401 if !authenticated && redirects == 0 => {
                     let challenge = header("www-authenticate").unwrap_or("").to_string();
-                    self.authenticate(&agent, &challenge, deadline)?;
+                    self.authenticate(&challenge, deadline)?;
                     authenticated = true;
                 }
                 401 if redirects == 0 => {
@@ -296,7 +320,15 @@ impl Registry {
         }
     }
 
-    fn authenticate(&self, agent: &ureq::Agent, challenge: &str, deadline: Instant) -> Result<()> {
+    /// Whether the registry is on a loopback, link-local or private address: a local registry, whose token service may
+    /// be local too.
+    fn local(&self, deadline: Instant) -> bool {
+        let uri: Option<ureq::http::Uri> = self.r.base_url().parse().ok();
+        let addr = uri.as_ref().and_then(|u| DefaultResolver::host_and_port(u.scheme()?, u.authority()?));
+        addr.and_then(|a| crate::util::resolve(&a, deadline).ok()).is_some_and(|found| found.iter().any(|a| !is_public(a.ip())))
+    }
+
+    fn authenticate(&self, challenge: &str, deadline: Instant) -> Result<()> {
         let (scheme, params) = challenge.split_once(' ').unwrap_or((challenge, ""));
         if scheme.eq_ignore_ascii_case("basic") {
             let Some(b) = &self.basic else { bail!("{} wants basic credentials; none found", self.r.registry) };
@@ -313,21 +345,35 @@ impl Registry {
             })
         };
         let realm = param("realm").ok_or("auth challenge has no realm")?;
-        let mut req = agent.get(&realm).config().timeout_global(Some(Self::left(deadline, &format!("token from {realm}"))?)).build();
-        if let Some(service) = param("service") {
-            req = req.query("service", &service);
+        // The registry names where to fetch: never down from HTTPS, nor into this host's own networks (its loopback
+        // or metadata services) unless the registry is there itself.
+        if self.r.base_url().starts_with("https://") && !realm.starts_with("https://") {
+            bail!("{}: refusing token realm {realm}: not HTTPS", self.r.registry);
         }
-        req = req.query("scope", param("scope").unwrap_or(format!("repository:{}:pull", self.r.repository)));
-        // Anywhere else gets an anonymous token request.
-        match &self.basic {
-            Some(b) if self.trusted(&realm) => req = req.header("Authorization", &format!("Basic {b}")),
-            Some(_) => crate::log!("image: not sending credentials to untrusted token realm {realm}"),
-            None => {}
-        }
-        let body: Value = match req.call() {
-            Ok(r) if r.status() == 200 => serde_json::from_reader(r.into_body().into_reader().take(1 << 20))?,
-            Ok(r) => bail!("token from {realm}: HTTP {}", r.status().as_u16()),
-            Err(e) => bail!("token from {realm}: {e}"),
+        let agent = agent(deadline, !self.local(deadline));
+        let creds = match &self.basic {
+            Some(b) if self.trusted(&realm) => Some(format!("Basic {b}")),
+            // Anywhere else gets an anonymous token request.
+            Some(_) => {
+                crate::log!("image: not sending credentials to untrusted token realm {realm}");
+                None
+            }
+            None => None,
+        };
+        let resp = call(&format!("token from {realm}"), deadline, |left| {
+            let mut req = agent.get(&realm).config().timeout_global(Some(left)).build();
+            if let Some(service) = param("service") {
+                req = req.query("service", &service);
+            }
+            req = req.query("scope", param("scope").unwrap_or(format!("repository:{}:pull", self.r.repository)));
+            if let Some(c) = &creds {
+                req = req.header("Authorization", c);
+            }
+            req
+        })?;
+        let body: Value = match resp.status().as_u16() {
+            200 => serde_json::from_reader(resp.into_body().into_reader().take(1 << 20))?,
+            code => bail!("token from {realm}: HTTP {code}"),
         };
         let token = body["token"].as_str().or(body["access_token"].as_str()).ok_or("token response has no token")?;
         *self.auth.lock().unwrap() = Some(format!("Bearer {token}").into());
@@ -483,7 +529,7 @@ pub(super) mod tests {
 
     #[test]
     fn agent_dns_obeys_the_transfer_deadline() {
-        let err = agent(Instant::now()).get("http://unused.example:80/").call().unwrap_err();
+        let err = agent(Instant::now(), false).get("http://unused.example:80/").call().unwrap_err();
         let ureq::Error::Io(err) = err else { panic!("expected a timed-out lookup: {err}") };
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
     }
@@ -646,7 +692,7 @@ pub(super) mod tests {
         let start = Instant::now();
         let deadline = start + Duration::from_millis(700);
         // No timeout of ureq's own: it would hold each handshake read to it, not the handshake.
-        let err = agent(deadline).get(&format!("https://{addr}/v2/")).call().unwrap_err().to_string();
+        let err = agent(deadline, false).get(&format!("https://{addr}/v2/")).call().unwrap_err().to_string();
         assert!(err.contains("timeout") || err.contains("timed out"), "{err}");
         assert!(start.elapsed() < Duration::from_secs(5), "took {:?}", start.elapsed());
     }
@@ -794,20 +840,85 @@ pub(super) mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1 + MAX_RETRIES as usize);
     }
 
+    /// Token requests are retried too; a `Retry-After` too large for any deadline, or an HTTP date, is no panic.
     #[test]
-    fn retry_after_is_seconds_or_an_http_date() {
-        let now = std::time::UNIX_EPOCH + Duration::from_secs(784111777); // Sun, 06 Nov 1994 08:49:37 GMT
-        assert_eq!(retry_after(" 120 ", now), Some(Duration::from_secs(120)));
-        assert_eq!(retry_after("Sun, 06 Nov 1994 08:50:07 GMT", now), Some(Duration::from_secs(30)));
-        assert_eq!(retry_after("Tue, 01 Mar 2000 00:00:00 GMT", std::time::UNIX_EPOCH), Some(Duration::from_secs(951868800)));
-        assert_eq!(retry_after("Sun, 06 Nov 1994 08:49:00 GMT", now), Some(Duration::ZERO), "past dates mean now");
-        for bad in ["-1", "soon", "Sunday, 06-Nov-94 08:49:37 GMT", "Sun, 06 Foo 1994 08:49:37 GMT", "Sun, 06 Nov 1994 08:49 GMT"] {
-            assert_eq!(retry_after(bad, now), None, "{bad}");
-        }
+    fn token_rate_limits_and_huge_retry_afters() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls2 = calls.clone();
+        let addr = drip_server(usize::MAX, Duration::ZERO, move |base, path| {
+            if !path.starts_with("/token") {
+                let auth = "WWW-Authenticate: Bearer realm=\"http://".to_string() + base + "/token\"";
+                return format!("HTTP/1.1 401 Unauthorized\r\n{auth}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            }
+            match calls2.fetch_add(1, Ordering::SeqCst) {
+                0 => "HTTP/1.1 429 Too Many Requests\r\nRetry-After: Wed, 21 Oct 2015 07:28:00 GMT\r\nContent-Length: 0\r\n\r\n".into(),
+                1 => "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 18446744073709551615\r\nContent-Length: 0\r\n\r\n".into(),
+                _ => "HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: close\r\n\r\n{\"token\":\"t\"}".into(),
+            }
+        });
+        let reg = Registry::new(Reference::parse(&format!("{addr}/test")).unwrap());
+        let start = Instant::now();
+        let err = reg.authenticate(&format!("Bearer realm=\"http://{addr}/token\""), start + Duration::from_secs(10)).unwrap_err().to_string();
+        assert!(err.contains("HTTP 503") && err.contains("deadline"), "{err}");
+        // The HTTP date got the 1 s backoff.
+        assert!(start.elapsed() >= Duration::from_secs(1) && calls.load(Ordering::SeqCst) == 2);
+        reg.authenticate(&format!("Bearer realm=\"http://{addr}/token\""), Instant::now() + Duration::from_secs(10)).unwrap();
+        assert_eq!(reg.auth.lock().unwrap().as_deref(), Some("Bearer t"));
         assert_eq!(
             (backoff(0), backoff(1), backoff(4), backoff(5), backoff(50)),
             (Duration::from_secs(1), Duration::from_secs(2), Duration::from_secs(16), Duration::from_secs(30), Duration::from_secs(30))
         );
+    }
+
+    /// A registry cannot point the token request at this host's own networks, by address or by name, nor down to HTTP.
+    #[test]
+    fn token_realms_stay_out_of_local_networks() {
+        let served = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let served2 = served.clone();
+        let local = drip_server(usize::MAX, Duration::ZERO, move |_, _| {
+            served2.store(true, std::sync::atomic::Ordering::SeqCst);
+            "HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: close\r\n\r\n{\"token\":\"t\"}".into()
+        });
+        let port = local.rsplit(':').next().unwrap();
+        // A public registry (TEST-NET-3, never contacted here).
+        let public = Registry::new(Reference::parse("203.0.113.7/test").unwrap());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        for realm in [format!("https://127.0.0.1:{port}/t"), format!("https://localhost:{port}/t"), format!("https://[::1]:{port}/t")] {
+            let err = public.authenticate(&format!("Bearer realm=\"{realm}\""), deadline).unwrap_err().to_string();
+            assert!(err.contains("not on a public address"), "{realm}: {err}");
+        }
+        let err = public.authenticate("Bearer realm=\"http://auth.example/t\"", deadline).unwrap_err().to_string();
+        assert!(err.contains("not HTTPS"), "{err}");
+        assert!(!served.load(std::sync::atomic::Ordering::SeqCst));
+        // A local registry may use a local token service.
+        let reg = Registry::new(Reference::parse(&format!("{local}/test")).unwrap());
+        reg.authenticate(&format!("Bearer realm=\"http://{local}/t\""), deadline).unwrap();
+        assert!(served.load(std::sync::atomic::Ordering::SeqCst));
+
+        use std::net::IpAddr;
+        for ip in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "0.0.0.0",
+            "255.255.255.255",
+            "224.0.0.1",
+            "::1",
+            "::",
+            "fe80::1",
+            "fd00::1",
+            "::ffff:127.0.0.1",
+            "::ffff:169.254.169.254",
+        ] {
+            assert!(!is_public(ip.parse::<IpAddr>().unwrap()), "{ip}");
+        }
+        for ip in ["8.8.8.8", "203.0.113.7", "100.128.0.1", "2606:4700::1111", "::ffff:8.8.8.8"] {
+            assert!(is_public(ip.parse::<IpAddr>().unwrap()), "{ip}");
+        }
     }
 
     #[test]
