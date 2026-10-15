@@ -119,9 +119,13 @@ pub fn flush_log(timeout: Duration) {
     flush_log_by(Instant::now() + timeout);
 }
 
-/// Queues an uncapped final diagnostic and flushes it within one exit deadline.
-/// Unlike ordinary `log!` calls, this may wait for room in the queue.
-pub fn log_final(line: String) {
+/// Queues a final diagnostic (cut to the line cap if `capped`: a panic's
+/// backtrace is not) and flushes it within one exit deadline. Unlike ordinary
+/// `log!` calls, this may wait for room in the queue.
+pub fn log_final(mut line: String, capped: bool) {
+    if capped {
+        cap_line(&mut line, LOG_LINE_MAX);
+    }
     let deadline = Instant::now() + LOG_FLUSH;
     if !log_writer().is_some_and(|tx| send_log_by(tx, LogMsg::Line(line), deadline)) {
         LOG_DROPPED.fetch_add(1, Ordering::SeqCst);

@@ -218,13 +218,21 @@ fn main() {
     std::panic::set_hook(Box::new(|p| {
         let bt = std::backtrace::Backtrace::capture();
         let bt = if bt.status() == std::backtrace::BacktraceStatus::Captured { format!("\nstack backtrace:\n{bt}") } else { String::new() };
-        util::log_final(format!("thread '{}' {p}{bt}\n", std::thread::current().name().unwrap_or("<unnamed>")));
-        util::output::drain();
+        util::log_final(format!("thread '{}' {p}{bt}\n", std::thread::current().name().unwrap_or("<unnamed>")), false);
+        // The abort follows: a VM process's relays get the message to its log first. An unwinding
+        // build's process may live on, so its output is left where it is.
+        if cfg!(panic = "abort") {
+            util::output::drain();
+        }
     }));
     let (args, error) = Args::parse_partly(std::env::args().skip(1));
     let vm = matches!(args.positional.first().map(String::as_str), Some("run" | "resume" | "restore"));
     if let Err(e) = error.map_or_else(|| real_main(&args), Err) {
-        util::log_final(format!("flexvm: {e}\n"));
+        util::log_final(format!("flexvm: {e}\n"), true);
+        if vm {
+            // A VM process's output may still be in its relays (`output::guard`).
+            util::output::drain();
+        }
         std::process::exit(if vm { vmproc::FAILED } else { 1 });
     }
     util::exit(0)
