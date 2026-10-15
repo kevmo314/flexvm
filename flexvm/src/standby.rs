@@ -167,52 +167,100 @@ fn refill_by(host: &Host, template: &str, wait: bool) -> Result<usize> {
     }
     let mut ready = Vec::new();
     let log = std::fs::OpenOptions::new().create(true).append(true).open(d.join("standby.log"))?;
-    let args = [host.state.as_os_str(), host.run.as_os_str(), template.as_ref()];
+    // A failed start ends the round, but those started before it are still waited for.
+    let mut failed = None;
     for _ in 0..want {
-        // Shared from the grant until its lock file exists (`locked`, or it died), not through
-        // its load: relief either lists it or ran before the grant. None while relief stops them,
-        // and held `LOCKED_TIMEOUT` at most (a stuck host lock fails the grant).
-        let stop = stop_lock(host)?;
-        let by = Instant::now() + LOCKED_TIMEOUT;
-        if flock(&stop, libc::LOCK_SH | libc::LOCK_NB).is_err() {
-            break;
-        }
-        match host.grant(256, Some(by)) {
-            Ok(Some(_)) => {}
+        match start_one(host, template, &log) {
+            Ok(Some(r)) => ready.push(r),
             Ok(None) => break,
-            Err(e) if e.to_string() == "the host lock is busy" => break,
-            Err(e) => return Err(e),
+            Err(e) => {
+                failed = Some(e);
+                break;
+            }
         }
-        let (r, w) = std::os::unix::net::UnixStream::pair()?;
-        let args = ["--state".as_ref(), args[0], "--run".as_ref(), args[1], "run".as_ref(), "--standby".as_ref(), "--template".as_ref(), args[2]];
-        let mut child = crate::util::spawn_self_child(&args, &log, w.as_raw_fd(), &[("FLEXVM_NOTIFY_FD", "3")])?;
-        drop(w);
-        wait_locked(&r, &mut child, by)?;
-        drop(stop);
-        std::thread::spawn(move || child.wait());
-        ready.push(BufReader::new(crate::util::By { s: r, at: Instant::now() + READY_TIMEOUT }));
     }
     let started = ready.len();
     for mut r in ready {
-        let reply = crate::util::recv_json(&mut r)?.ok_or("a standby vm failed to start (see its log)")?;
-        if reply["ok"] != json!(true) {
-            bail!("a standby vm failed to start: {}", reply["error"]);
+        let res = crate::util::recv_json(&mut r).and_then(|reply| match reply {
+            None => Err("a standby vm failed to start (see its log)".into()),
+            Some(reply) if reply["ok"] != json!(true) => Err(format!("a standby vm failed to start: {}", reply["error"]).into()),
+            Some(_) => Ok(()),
+        });
+        if let Err(e) = res {
+            failed.get_or_insert(e);
         }
     }
-    Ok(started)
+    match failed {
+        Some(e) => Err(e),
+        None => Ok(started),
+    }
+}
+
+/// One standby started and listed, its readiness reply to come; None if relief
+/// holds the stop lock, the grant is refused or the host lock is busy.
+fn start_one(host: &Host, template: &str, log: &File) -> Result<Option<BufReader<crate::util::By<UnixStream>>>> {
+    // Shared from the grant until its lock file exists (`locked`), not through its load:
+    // relief either lists it or ran before the grant. None while relief stops them, and
+    // held `LOCKED_TIMEOUT` at most (a stuck host lock fails the grant; a child that
+    // has not acknowledged its lock by then is killed and reaped).
+    let stop = stop_lock(host)?;
+    let by = Instant::now() + LOCKED_TIMEOUT;
+    if flock(&stop, libc::LOCK_SH | libc::LOCK_NB).is_err() {
+        return Ok(None);
+    }
+    let grant = match host.grant(256, Some(by)) {
+        Ok(Some(id)) => id,
+        Ok(None) => return Ok(None),
+        Err(e) if e.to_string() == "the host lock is busy" => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    // What a child left unlisted is gone (`wait_locked`), so relief may go on; then its
+    // grant and what it made before its lock (its cgroup and work directory) are freed.
+    let release = |stop: File| {
+        drop(stop);
+        host.refund_by(grant, Some(Instant::now() + LOCKED_TIMEOUT));
+        crate::gc::sweep(host);
+    };
+    let started = (|| {
+        let (r, w) = UnixStream::pair()?;
+        let args = [
+            "--state".as_ref(),
+            host.state.as_os_str(),
+            "--run".as_ref(),
+            host.run.as_os_str(),
+            "run".as_ref(),
+            "--standby".as_ref(),
+            "--template".as_ref(),
+            template.as_ref(),
+        ];
+        let mut child = crate::util::spawn_self_child(&args, log, w.as_raw_fd(), &[("FLEXVM_NOTIFY_FD", "3")])?;
+        drop(w);
+        wait_locked(&r, &mut child, by)?;
+        Ok((r, child))
+    })();
+    let (r, mut child) = match started {
+        Ok(started) => started,
+        Err(e) => {
+            release(stop);
+            return Err(e);
+        }
+    };
+    drop(stop);
+    std::thread::spawn(move || child.wait());
+    Ok(Some(BufReader::new(crate::util::By { s: r, at: Instant::now() + READY_TIMEOUT })))
 }
 
 /// Never let relief pass an unlisted live child, including on a partial or invalid reply.
 fn wait_locked(r: &UnixStream, child: &mut std::process::Child, by: Instant) -> Result<()> {
     // Do not read ahead into the readiness reply: it has a separate deadline.
     let mut r = BufReader::with_capacity(1, crate::util::By { s: r, at: by });
-    let result = crate::util::recv_json(&mut r).and_then(|reply| {
-        if reply.as_ref().is_some_and(|v| v["locked"] == json!(true)) {
-            Ok(())
-        } else {
-            Err("a standby vm failed to acknowledge its lock (see its log)".into())
-        }
-    });
+    let result = match crate::util::recv_json(&mut r) {
+        Ok(Some(v)) if v["locked"] == json!(true) => Ok(()),
+        // It failed before its lock (its template, say), and said why.
+        Ok(Some(v)) if v["ok"] == json!(false) => Err(format!("a standby vm failed to start: {}", v["error"]).into()),
+        Ok(_) => Err(Error::from("a standby vm failed to acknowledge its lock (see its log)")),
+        Err(e) => Err(format!("a standby vm failed to acknowledge its lock: {e} (see its log)").into()),
+    };
     if result.is_err() {
         // The unreaped child's pid cannot be reused. Even EOF can precede its exit.
         let _ = child.kill();
@@ -259,6 +307,10 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
     let id = me.key();
     let (lock_path, sock) = (d.join(format!("{id}.lock")), d.join(format!("{mine}.{id}.sock")));
     crate::host::stall("standby_lock_stall");
+    // Test hook: held before its lock for as long as armed (past `LOCKED_TIMEOUT`, say).
+    while crate::host::fault("standby_lock_hang") {
+        std::thread::sleep(Duration::from_millis(50));
+    }
     let tmp = d.join(format!(".{id}.lock"));
     let lock = File::create(&tmp)?;
     crate::host::flock(&lock, libc::LOCK_EX)?;
@@ -534,7 +586,7 @@ mod tests {
 
         let root = std::env::temp_dir().join(format!("flexvm-standby-locked-{}", std::process::id()));
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
-        for reply in ["", "{\"locked\":", "{\"locked\":false}\n"] {
+        for reply in ["", "{\"locked\":", "{\"locked\":false}\n", "{\"ok\":false,\"error\":\"no template\"}\n"] {
             let stop = Flock::new(stop_lock(&host).unwrap(), libc::LOCK_SH).unwrap();
             let (r, mut w) = UnixStream::pair().unwrap();
             std::io::Write::write_all(&mut w, reply.as_bytes()).unwrap();
@@ -552,8 +604,10 @@ mod tests {
             assert!(start.elapsed() < Duration::from_secs(1));
             drop(stop);
             relief.join().unwrap();
+            let why = if reply.contains("no template") { "failed to start: \"no template\"" } else { "failed to acknowledge its lock" };
+            assert!(error.to_string().contains(why), "{error}");
             if !reply.ends_with('\n') {
-                assert_eq!(error.downcast_ref::<std::io::Error>().unwrap().kind(), std::io::ErrorKind::TimedOut);
+                assert!(error.to_string().contains("deadline passed"), "{error}");
             }
         }
         std::fs::remove_dir_all(root).unwrap();
