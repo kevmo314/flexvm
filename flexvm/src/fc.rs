@@ -591,14 +591,16 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(30));
                 // A client already past its deadline (a loaded host) has closed: EPIPE.
                 let _ = r.get_mut().write_all(response);
-                std::thread::sleep(Duration::from_millis(150));
+                std::thread::sleep(Duration::from_secs(1));
                 no_more(&listener);
             });
             let api = Api::default();
             let start = std::time::Instant::now();
             let e = api.request(&server.path, "GET", "/vm", None, Duration::from_millis(60)).unwrap_err();
             assert!(!not_sent(&e));
-            assert!(start.elapsed() < Duration::from_millis(150));
+            assert_eq!(e.downcast_ref::<std::io::Error>().unwrap().kind(), std::io::ErrorKind::TimedOut);
+            // Leave scheduler slack under parallel load, but return before the server closes.
+            assert!(start.elapsed() < Duration::from_millis(500));
             assert!(api.connection.borrow().is_none());
         }
     }

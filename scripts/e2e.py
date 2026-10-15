@@ -130,8 +130,9 @@ class Host:
         # Inside this run's own fresh directories (see main).
         self.run_dir = os.path.join(RUN, label)
         self.state_dir = os.path.join(WORK, f"{label}-state")
-        # Tap prefixes are 6 characters at most: lanes 0-99.
-        self.prefix = f"fvc{args.lane}{label}"
+        # Six characters leave room for the pid and suffix in Linux's 15-byte names.
+        # Each host's listening port keeps concurrent runs and lanes apart.
+        self.prefix = f"fc{port:04x}"
         self.log = os.path.join(args.log_dir, f"listen-{label}.log")
         self.proc = None
         self.vms = set()  # names of the VMs this script created here or moved here
