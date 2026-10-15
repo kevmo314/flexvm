@@ -192,7 +192,7 @@ impl Host {
         };
         let root = |e| named(state, e);
         let held = std::fs::create_dir_all(state).and_then(|()| std::fs::File::open(state)).map_err(root)?;
-        crate::util::eintr(|| unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }).map_err(root)?;
+        let _held = Flock::new(held, libc::LOCK_EX).map_err(root)?;
         if id().ok().is_none_or(|id| std::fs::read_to_string(&marker).ok() != Some(id)) || dirs.iter().any(|(d, _)| !state.join(d).is_dir()) {
             let _ = std::fs::remove_file(&marker);
             dirs.iter()

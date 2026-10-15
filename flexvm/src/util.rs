@@ -47,7 +47,7 @@ pub fn recv_json(r: &mut impl BufRead) -> Result<Option<serde_json::Value>> {
     recv_json_max(r, MAX_LINE)
 }
 
-pub fn recv_json_max(r: &mut impl BufRead, max: u64) -> Result<Option<serde_json::Value>> {
+pub fn recv_json_max<T: serde::de::DeserializeOwned>(r: &mut impl BufRead, max: u64) -> Result<Option<T>> {
     let mut line = String::new();
     if r.take(max).read_line(&mut line)? == 0 {
         return Ok(None);
@@ -926,7 +926,10 @@ mod tests {
         assert!(recv_json(&mut input).unwrap().is_none());
         let mut line = vec![b' '; MAX_LINE as usize + 100];
         line.extend_from_slice(b"2\n");
-        assert_eq!(recv_json_max(&mut io::Cursor::new(line), 2 * MAX_LINE).unwrap(), Some(2.into()));
+        assert_eq!(recv_json_max::<serde_json::Value>(&mut io::Cursor::new(line), 2 * MAX_LINE).unwrap(), Some(2.into()));
+        let mut input = io::Cursor::new(b"[1,2]\n3\n");
+        assert_eq!(recv_json_max::<Vec<u64>>(&mut input, MAX_LINE).unwrap(), Some(vec![1, 2]));
+        assert_eq!(recv_json(&mut input).unwrap(), Some(3.into()));
     }
 
     #[test]

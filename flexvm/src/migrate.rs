@@ -6,7 +6,7 @@
 //! target died without every page), and exits only on `released`.
 
 use std::borrow::Cow;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::net::{Ipv4Addr, TcpStream};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -51,20 +51,6 @@ struct Header<'a> {
     paused: bool,
     #[serde(default)]
     app_log: u64,
-}
-
-impl Header<'_> {
-    /// None if the source hung up first.
-    fn recv(r: &mut impl BufRead) -> Result<Option<Header<'static>>> {
-        let mut line = Vec::new();
-        if r.take(MAX_HEADER).read_until(b'\n', &mut line)? == 0 {
-            return Ok(None);
-        }
-        if line.len() as u64 == MAX_HEADER && line.last() != Some(&b'\n') {
-            bail!("migration header exceeds {MAX_HEADER} bytes");
-        }
-        Ok(Some(serde_json::from_slice(&line)?))
-    }
 }
 
 enum Outcome {
@@ -115,7 +101,8 @@ impl Proc {
         let unthrottle = Instant::now();
         let _lifted = vm.limit.lift(vm.pid());
         let unthrottle = unthrottle.elapsed();
-        let holder = self.holder().cloned();
+        // Made now, not in the hold right before the pause.
+        self.holder();
         // Lent durably first: a crash with the outcome unknown must not hand the address out.
         self.lent_here.fetch_or(self.host.lend(&self.host.lock()?, vm.ip, gen)?, Ordering::SeqCst);
         self.drop_held_in();
@@ -136,14 +123,7 @@ impl Proc {
         }
         let mut t = Phases::new();
         let vmstate = vm.dir.join("vmstate.out");
-        let hold = || match holder.as_ref().map(|h| h.hold(vm.ip, mig)) {
-            Some(Ok(())) => true,
-            Some(Err(e)) => {
-                eprintln!("vm {}: not holding packets during migration: {e}", vm.name);
-                false
-            }
-            None => false,
-        };
+        let hold = || self.hold_addr(&vm, mig, "migration");
         let captured = (|| -> Result<_> {
             let saved = vm.save_state(&vmstate, false, false, hold, &mut t).and_then(|r| Ok((r, t.total(), std::fs::read(&vmstate)?)));
             let _ = std::fs::remove_file(&vmstate);
@@ -294,9 +274,6 @@ impl Proc {
             Ok(s) => (s, e),
             Err(r) => (State::Failed, format!("{e}; resuming it here failed too: {r}").into()),
         };
-        if let Some(h) = self.holder() {
-            h.forget(vm.ip, mig);
-        }
         // Under the host lock: a route retry still running sees it is no longer this migration's source.
         *vm.state.lock().unwrap() = s;
         self.take_pending_route(mig);
@@ -471,7 +448,7 @@ impl Proc {
         let mut r = BufReader::new(By { s: w.try_clone()?, at: deadline });
         let pager = prepared.0.pager.clone();
         let res = thread::scope(|scope| -> Result<(Arc<Vm>, Value)> {
-            let hdr = Header::recv(&mut r)?.ok_or("source hung up before sending the vmstate")?;
+            let hdr: Header<'static> = crate::util::recv_json_max(&mut r, MAX_HEADER)?.ok_or("source hung up before sending the vmstate")?;
             let mut t = Phases::new();
             let runs: Runs = hdr.runs.into_owned();
             let pages: Vec<u64> = hdr.preload.into_owned();

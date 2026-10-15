@@ -458,6 +458,18 @@ impl Proc {
         }
     }
 
+    /// Whether the address is held.
+    pub fn hold_addr(&self, vm: &Vm, id: u64, what: &str) -> bool {
+        match self.holder().map(|h| h.hold(vm.ip, id)) {
+            Some(Ok(())) => true,
+            Some(Err(e)) => {
+                eprintln!("vm {}: not holding packets during {what}: {e}", vm.name);
+                false
+            }
+            None => false,
+        }
+    }
+
     pub fn holder(&self) -> Option<&Arc<Holder>> {
         self.holder
             .get_or_init(|| {
@@ -1755,7 +1767,6 @@ mod tests {
     /// and no eviction is tried; read as under the reserve, both are.
     #[test]
     fn unreadable_meminfo_relieves_nothing() {
-        use std::os::fd::AsRawFd;
         let base = std::env::temp_dir().join(format!("flexvm-relieve-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let mut host = Host::open(&base.join("state"), &base.join("run")).unwrap();
@@ -1776,7 +1787,7 @@ mod tests {
         let id = Ident::of(child.id()).unwrap();
         let path = d.join(format!("{}.lock", id.key()));
         let lock = std::fs::File::create(&path).unwrap();
-        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+        let lock = crate::host::Flock::new(lock, libc::LOCK_EX).unwrap();
         std::fs::write(&path, serde_json::to_vec(&id).unwrap()).unwrap();
         assert_eq!(crate::standby::live(&host, "t").len(), 1);
         let (pressure, active) = (crate::standby::pressure(&host), host.run.join("evict.active"));
@@ -1789,13 +1800,12 @@ mod tests {
         // Mid-claim (`PID-START.claim` locked): not counted as stopped, so eviction starts.
         let id = Ident::of(child.id()).unwrap();
         let claim = std::fs::File::create(d.join(format!("{}.claim", id.key()))).unwrap();
-        assert_eq!(unsafe { libc::flock(claim.as_raw_fd(), libc::LOCK_EX) }, 0);
+        let claim = crate::host::Flock::new(claim, libc::LOCK_EX).unwrap();
         relieve(&host, Some(0), false, &mut stopping);
         assert!(!pressure.exists() && active.exists());
         assert!(child.try_wait().unwrap().is_none(), "a claiming standby was stopped");
         std::fs::remove_file(&active).unwrap();
         // A claim rolled back makes the standby stoppable again.
-        assert_eq!(unsafe { libc::flock(claim.as_raw_fd(), libc::LOCK_UN) }, 0);
         drop(claim);
         relieve(&host, Some(0), false, &mut stopping);
         use std::os::unix::process::ExitStatusExt;
@@ -1803,8 +1813,6 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
         assert!(pressure.exists() && stopped.unwrap().signal() == Some(libc::SIGUSR1));
-        // Unlocked, not only closed: a child another test forks meanwhile shares the lock until it execs.
-        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
         drop(lock);
         // Its exit is counted at the next tick, which leaves eviction to the one after.
         relieve(&host, Some(0), false, &mut stopping);
@@ -1816,7 +1824,6 @@ mod tests {
 
     #[test]
     fn a_standby_that_has_not_exited_marks_the_pressure_and_holds_eviction_off_a_second_without_waiting() {
-        use std::os::fd::AsRawFd;
         let base = std::env::temp_dir().join(format!("flexvm-relieve-pending-{}", std::process::id()));
         let host = Host::open(&base.join("state"), &base.join("run")).unwrap();
         let mut child = std::process::Command::new("sleep");
@@ -1832,7 +1839,7 @@ mod tests {
         std::fs::create_dir_all(&d).unwrap();
         let path = d.join(format!("{}.lock", id.key()));
         let lock = std::fs::File::create(&path).unwrap();
-        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+        let _lock = crate::host::Flock::new(lock, libc::LOCK_EX).unwrap();
         std::fs::write(&path, serde_json::to_vec(&id).unwrap()).unwrap();
         // Loading, or claimed since enumeration: a delivered signal proves neither stopped,
         // but it will stop, so it is not refilled meanwhile.
