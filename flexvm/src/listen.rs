@@ -486,7 +486,9 @@ fn migration(host: &Host, req: &Value) -> Result<Value> {
     }
     let mig = req["mig"].as_u64().ok_or("missing mig")?;
     if req["done"] == json!(true) {
-        host.mig_done(mig)?;
+        if host.mig_done(mig)? {
+            crate::log!("migration {mig}: its source says done; forgetting it");
+        }
         return Ok(json!({"done": true}));
     }
     let outcome = host.mig_status(mig)?;
