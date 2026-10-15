@@ -54,8 +54,6 @@ mod pull;
 mod server;
 #[cfg(test)]
 mod tests;
-// TODO(#284): convert this module to log! before removing the allowance.
-#[allow(clippy::print_stderr)]
 mod wp;
 
 pub use event::FaultStats;

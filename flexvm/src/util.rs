@@ -26,21 +26,51 @@ macro_rules! log {
     }};
 }
 
-/// Lines queued for the log writer, written and dropped (`log_line`).
+/// Lines queued for the log writer, written by it, and dropped (`log_line`).
 static LOG_QUEUED: AtomicUsize = AtomicUsize::new(0);
-static LOG_DONE: AtomicUsize = AtomicUsize::new(0);
+static LOG_WRITTEN: AtomicUsize = AtomicUsize::new(0);
 static LOG_DROPPED: AtomicUsize = AtomicUsize::new(0);
 
-/// Hands `line` to this process's log writer, a thread started on first use
-/// that writes each line to stderr in one write (so lines from other processes
-/// sharing the pipe don't interleave with it), ignoring write errors. A stalled
-/// stderr never blocks the caller, who may hold the host lock or a pager's
-/// state: past 1024 queued lines a line is dropped, and the writer reports how
-/// many when it next gets through. Lines from one thread keep their order.
-pub fn log_line(line: String) {
+/// A longer log line (a peer's error, say) is cut to this.
+const LOG_LINE_MAX: usize = 16 << 10;
+
+/// Hands `line` to this process's log writer, a thread that writes each line
+/// to stderr in one write (so lines from other processes sharing the pipe
+/// don't interleave with it), ignoring write errors. A stalled stderr never
+/// blocks the caller, who may hold the host lock or a pager's state: past
+/// 1024 queued lines a line is dropped, and the writer reports how many when
+/// it next gets through. Lines from one thread keep their order.
+pub fn log_line(mut line: String) {
+    cap_line(&mut line, LOG_LINE_MAX);
+    match log_writer().map(|tx| tx.try_send(line)) {
+        Some(Ok(())) => drop(LOG_QUEUED.fetch_add(1, Ordering::SeqCst)),
+        _ => drop(LOG_DROPPED.fetch_add(1, Ordering::SeqCst)),
+    }
+}
+
+/// Cuts `line` to at most `max` bytes (and a note of the cut), on a character boundary.
+fn cap_line(line: &mut String, max: usize) {
+    if line.len() > max {
+        let cut = (0..=max).rev().find(|&i| line.is_char_boundary(i)).unwrap_or(0);
+        let gone = line.len() - cut;
+        line.truncate(cut);
+        line.push_str(&format!("... ({gone} bytes cut)\n"));
+    }
+}
+
+/// The log writer, started on first use. A thread that cannot be started
+/// is tried again at most once a second: until then lines are dropped, as for
+/// a full queue. Only a start is waited for, never stderr.
+fn log_writer() -> Option<&'static std::sync::mpsc::SyncSender<String>> {
     use std::sync::mpsc::{sync_channel, SyncSender};
-    static QUEUE: std::sync::OnceLock<Option<SyncSender<String>>> = std::sync::OnceLock::new();
-    let queue = QUEUE.get_or_init(|| {
+    static WRITER: std::sync::OnceLock<SyncSender<String>> = std::sync::OnceLock::new();
+    static TRIED: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+    if let Some(tx) = WRITER.get() {
+        return Some(tx);
+    }
+    let mut tried = TRIED.lock().unwrap_or_else(|e| e.into_inner());
+    if WRITER.get().is_none() && !tried.is_some_and(|t| t.elapsed() < Duration::from_secs(1)) {
+        *tried = Some(Instant::now());
         let (tx, rx) = sync_channel::<String>(1024);
         let writer = move || {
             for line in rx {
@@ -50,7 +80,7 @@ pub fn log_line(line: String) {
                     let _ = err.write_all(format!("flexvm: {dropped} log lines dropped: stderr was blocked\n").as_bytes());
                 }
                 let _ = err.write_all(line.as_bytes());
-                LOG_DONE.fetch_add(1, Ordering::SeqCst);
+                LOG_WRITTEN.fetch_add(1, Ordering::SeqCst);
             }
         };
         // Started with every signal blocked, so that a signal for the process
@@ -61,28 +91,41 @@ pub fn log_line(line: String) {
             libc::pthread_sigmask(libc::SIG_SETMASK, &all, &mut old);
             let started = std::thread::Builder::new().name("log".into()).spawn(writer);
             libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
-            started.ok().map(|_| tx)
+            if started.is_ok() {
+                let _ = WRITER.set(tx);
+            }
         }
-    });
-    LOG_QUEUED.fetch_add(1, Ordering::SeqCst);
-    match queue {
-        Some(tx) => match tx.try_send(line) {
-            Ok(()) => return,
-            Err(_) => drop(LOG_DROPPED.fetch_add(1, Ordering::SeqCst)),
-        },
-        // No thread to spare: written here.
-        None => drop(io::stderr().lock().write_all(line.as_bytes())),
     }
-    LOG_DONE.fetch_add(1, Ordering::SeqCst);
+    WRITER.get()
 }
 
 /// Waits up to `timeout` for the lines queued so far to be written, before
 /// the process exits: a stalled stderr does not hold the exit up past it.
 pub fn flush_log(timeout: Duration) {
     let (queued, deadline) = (LOG_QUEUED.load(Ordering::SeqCst), Instant::now() + timeout);
-    while LOG_DONE.load(Ordering::SeqCst) < queued && Instant::now() < deadline {
+    while LOG_WRITTEN.load(Ordering::SeqCst) < queued && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(1));
     }
+}
+
+/// Makes `sigs` end the process as their default action does (a supervisor
+/// sees the same signal), once the queued log lines are written (`flush_log`).
+/// Called before any other thread that does not block them is started.
+pub fn flush_log_on(sigs: &[i32]) {
+    let set = block_signals(sigs);
+    std::thread::spawn(move || {
+        let sig = wait_signal(&set);
+        flush_log(LOG_FLUSH);
+        unsafe {
+            libc::signal(sig, libc::SIG_DFL);
+            let mut one: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut one);
+            libc::sigaddset(&mut one, sig);
+            libc::pthread_sigmask(libc::SIG_UNBLOCK, &one, std::ptr::null_mut());
+            libc::raise(sig);
+        }
+        std::process::exit(128 + sig)
+    });
 }
 
 /// How long an exiting process waits for its queued log lines (`flush_log`).
@@ -1119,6 +1162,16 @@ mod tests {
         assert!(!scope(prefix, 7, 9));
         assert_eq!(std::fs::read(root.join("vm-7-9/cgroup.procs")).unwrap(), b"");
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_long_log_line_is_cut_on_a_character_boundary() {
+        let mut l = "é".repeat(10);
+        super::cap_line(&mut l, 5);
+        assert_eq!(l, "éé... (16 bytes cut)\n");
+        let mut short = "short\n".to_string();
+        super::cap_line(&mut short, 16);
+        assert_eq!(short, "short\n");
     }
 
     /// Past the cap a log moves to `.1` whole and its writers go on in a new
