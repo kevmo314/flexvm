@@ -102,14 +102,24 @@ pub fn configure(ip: Ipv4Addr, dns: Option<&str>) -> io::Result<()> {
     Ok(())
 }
 
+/// Replaced with a rename, so a lookup never reads it empty. An image's symlink (to a file that
+/// exists) is kept and its target replaced; one dangling (systemd-resolved's stub: /run is fresh)
+/// is replaced. A bind-mounted file cannot be renamed over, so it is rewritten in place.
 fn resolv_conf(path: &std::path::Path, dns: &str) -> io::Result<()> {
     let content = format!("nameserver {dns}\n");
     if std::fs::read(path).is_ok_and(|old| old == content.as_bytes()) {
         return Ok(());
     }
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
     let tmp = path.with_extension("conf.tmp");
-    std::fs::write(&tmp, content)?;
-    std::fs::rename(tmp, path)
+    std::fs::write(&tmp, &content)?;
+    match std::fs::rename(&tmp, &path) {
+        Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {
+            let _ = std::fs::remove_file(&tmp);
+            std::fs::write(&path, content)
+        }
+        r => r,
+    }
 }
 
 fn update_address(address: &mut Option<Ipv4Addr>, ip: Ipv4Addr, mut request: impl FnMut(u16, Ipv4Addr) -> io::Result<()>) -> io::Result<()> {
@@ -203,7 +213,20 @@ mod tests {
         std::fs::create_dir(path.with_extension("conf.tmp")).unwrap();
         resolv_conf(&path, "8.8.8.8").unwrap();
         assert!(resolv_conf(&path, "9.9.9.9").is_err());
-        assert_eq!(std::fs::read_to_string(path).unwrap(), "nameserver 8.8.8.8\n");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "nameserver 8.8.8.8\n");
+        std::fs::remove_dir(path.with_extension("conf.tmp")).unwrap();
+
+        // A symlink to a file is kept, and its target replaced; a dangling one is replaced.
+        let (link, target) = (dir.join("link.conf"), dir.join("stub-resolv.conf"));
+        std::fs::write(&target, "nameserver 127.0.0.53\n").unwrap();
+        std::os::unix::fs::symlink("stub-resolv.conf", &link).unwrap();
+        resolv_conf(&link, "1.1.1.1").unwrap();
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "nameserver 1.1.1.1\n");
+        std::fs::remove_file(&target).unwrap();
+        resolv_conf(&link, "1.1.1.1").unwrap();
+        assert!(std::fs::symlink_metadata(&link).unwrap().is_file());
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "nameserver 1.1.1.1\n");
     }
 
     #[test]
