@@ -22,9 +22,9 @@ use serde_json::{json, Value};
 use crate::bail;
 use crate::fc::Firecracker;
 use crate::guest;
-use crate::host::{fault, Host, Ident, PidFd};
+use crate::host::{fault, flock, Flock, Host, Ident, PidFd};
 use crate::template::{Paths, Template};
-use crate::util::{send_json, Error, Phases, Result};
+use crate::util::{locked, send_json, Error, Phases, Result};
 use crate::vm::{Prepared, Vm};
 use crate::vmproc::{End, Op, Proc};
 
@@ -55,7 +55,7 @@ pub fn live(host: &Host, template: &str) -> Vec<Ident> {
             continue;
         }
         let Ok(f) = File::open(e.path()) else { continue };
-        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } == 0 {
+        if flock(&f, libc::LOCK_SH | libc::LOCK_NB).is_ok() {
             let _ = std::fs::remove_file(e.path());
         } else if let Ok(id) = serde_json::from_reader::<_, Ident>(&f) {
             ids.push(id);
@@ -68,9 +68,7 @@ pub fn live(host: &Host, template: &str) -> Vec<Ident> {
 /// `live`, less those mid-claim (`PID-START.claim` locked; START keeps a reused pid's apart): a stop would not end them.
 pub fn stoppable(host: &Host, template: &str) -> Vec<Ident> {
     let d = dir(host, template);
-    let claiming = |id: &Ident| {
-        File::open(d.join(format!("{}-{}.claim", id.pid, id.start))).is_ok_and(|f| unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0)
-    };
+    let claiming = |id: &Ident| locked(&d.join(format!("{}-{}.claim", id.pid, id.start)), libc::LOCK_SH) == Some(true);
     live(host, template).into_iter().filter(|id| !claiming(id)).collect()
 }
 
@@ -149,13 +147,11 @@ fn refill_by(host: &Host, template: &str, wait: bool) -> Result<usize> {
     let d = dir(host, template);
     std::fs::create_dir_all(&d)?;
     let lock = File::create(d.join(".refill"))?;
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | if wait { 0 } else { libc::LOCK_NB }) } != 0 {
-        let e = std::io::Error::last_os_error();
-        if !wait && e.raw_os_error() == Some(libc::EWOULDBLOCK) {
-            return Ok(0);
-        }
-        return Err(e.into());
-    }
+    let _lock = match Flock::new(lock, libc::LOCK_EX | if wait { 0 } else { libc::LOCK_NB }) {
+        Ok(lock) => lock,
+        Err(e) if !wait && e.raw_os_error() == Some(libc::EWOULDBLOCK) => return Ok(0),
+        Err(e) => return Err(e.into()),
+    };
     let want = target(host, template).saturating_sub(live(host, template).len());
     if want == 0 {
         return Ok(0);

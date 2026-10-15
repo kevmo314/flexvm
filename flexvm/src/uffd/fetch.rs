@@ -110,6 +110,18 @@ impl Pager {
         partial(e) && !self.stop.load(Ordering::SeqCst)
     }
 
+    /// Failure history stays with the pages, whoever claimed them, so no retry starts the deadline over.
+    pub(super) fn install_retry(&self, page: usize, n: usize, e: &io::Error, what: &str, failed: &str) -> bool {
+        let since = self.pages().failing_since(page, n).unwrap_or_else(Instant::now);
+        if since.elapsed() >= FAULT_TIMEOUT {
+            self.fail(format!("{failed}: {e}"));
+            return false;
+        }
+        eprintln!("uffd: {what}: {e}; retrying");
+        thread::sleep(BACKOFF_MIN);
+        true
+    }
+
     /// Queues a run of REMOTE pages a fault claimed for the fault fetcher with the fewest runs queued (see `Lane`),
     /// passing over one busy writing requests.
     pub(super) fn queue_fault(&self, job: Job) {
@@ -153,7 +165,6 @@ impl Pager {
                 return self.fail(format!("installing pages {page}+{n} for a fault kept failing for {FAULT_TIMEOUT:?}"));
             }
             let started = Instant::now();
-            let mut retry = |e: &io::Error| self.retry_fetch(e);
             // Test fault `fetch_tail_enomem`: once the pullers are past this run, a copy of its tail fails as if memory
             // were short.
             let tail_fail = self.tail_fail.load(Ordering::SeqCst) > 0;
@@ -172,7 +183,7 @@ impl Pager {
             };
             let mut first = true;
             let stuck = *self.stuck_from.lock().unwrap();
-            let res = self.install_claimed(page, n, &mut buf, &mut fetch, &mut retry, |p, c, src| {
+            let res = self.install_claimed(page, n, &mut buf, &mut fetch, |p, c, src| {
                 if tail_fail && p != page && self.tail_fail.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |k| k.checked_sub(1)).is_ok() {
                     return Err(os(libc::ENOMEM));
                 }
@@ -194,18 +205,12 @@ impl Pager {
                 Err(Failed::Fetch(e)) => return self.fail(format!("fetching pages for a fault: {e}")),
                 Err(Failed::Install(e)) if self.unmapped(&e, page, n) => return self.gone(),
                 Err(Failed::Install(e)) => {
-                    // Since when these pages have kept failing to install, whoever claimed them (this requeue, or a
-                    // fault that got to them first): noted per page as it failed, so that no claim starts the deadline
-                    // over.
-                    let since = pages.failing_since(page, n).unwrap_or_else(Instant::now);
-                    if since.elapsed() >= FAULT_TIMEOUT {
-                        return self.fail(format!("installing pages for a fault: {e}"));
+                    if !self.install_retry(page, n, &e, &format!("installing pages {page}+{n} for a fault"), "installing pages for a fault") {
+                        return;
                     }
-                    eprintln!("uffd: installing pages {page}+{n} for a fault: {e}; retrying");
                     // What went back to REMOTE may have no fault waiting on it any more (the faulting page went in
                     // first) and the pullers may be past it: queue it again, with its failure history, so it is not
                     // stranded.
-                    thread::sleep(BACKOFF_MIN);
                     let mut i = page;
                     while i < page + n {
                         match pages.claim(i, page + n - i, REMOTE, |_| true) {
@@ -229,10 +234,9 @@ impl Pager {
         n: usize,
         buf: &mut [u8],
         fetch: &mut FetchAny<'_>,
-        retry: &mut dyn FnMut(&io::Error) -> bool,
         populate: impl FnMut(usize, usize, &[u8]) -> io::Result<usize>,
     ) -> std::result::Result<(), Failed> {
-        let (resolved, res) = self.pages().fetch_install(first, n, buf, fetch, &self.stop, retry, populate);
+        let (resolved, res) = self.pages().fetch_install(first, n, buf, fetch, &self.stop, &mut |e| self.retry_fetch(e), populate);
         self.pulled(resolved);
         match res {
             Err(Failed::Fetch(_)) if resolved == n => Ok(()),

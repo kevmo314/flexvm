@@ -187,7 +187,7 @@ impl Api {
         loop {
             // Anything readable on an idle connection (stray bytes, or the close
             // of a Firecracker that died) means it is never used again (#109).
-            let cached = self.connection.borrow_mut().take().filter(|r| !readable(&r.get_ref().s));
+            let cached = self.connection.borrow_mut().take().filter(|r| !crate::util::readable(&r.get_ref().s, Duration::ZERO).unwrap_or(true));
             let reused = cached.is_some();
             let mut r = match cached {
                 Some(mut r) => {
@@ -286,12 +286,6 @@ fn exchange(r: &mut BufReader<crate::util::By<UnixStream>>, mut req: &[u8], sent
     let mut buf = vec![0; len];
     r.read_exact(&mut buf)?;
     Ok((code, buf, close))
-}
-
-fn readable(s: &UnixStream) -> bool {
-    use std::os::fd::AsRawFd;
-    let mut p = libc::pollfd { fd: s.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-    unsafe { libc::poll(&mut p, 1, 0) != 0 }
 }
 
 /// At most the last 64 KiB, without the first partial line.

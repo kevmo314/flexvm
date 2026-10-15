@@ -9,6 +9,7 @@ use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use crate::host::{flock, Host};
+use crate::util::locked;
 
 /// How often `periodic` sweeps (some process on the host does).
 const EVERY: Duration = Duration::from_secs(30);
@@ -86,7 +87,7 @@ fn vm_files(host: &Host) {
     let logs = host.logs_lock(libc::LOCK_EX | libc::LOCK_NB).ok();
     for (file, path) in files() {
         if file.starts_with(ARRIVAL_LOG) && file.ends_with(".log") {
-            if age(&path).is_some_and(|a| a > ARRIVAL_GRACE) && unlocked(&path) {
+            if age(&path).is_some_and(|a| a > ARRIVAL_GRACE) && locked(&path, libc::LOCK_EX) == Some(false) {
                 let _ = std::fs::remove_file(&path);
             }
             continue;
@@ -100,11 +101,6 @@ fn vm_files(host: &Host) {
             let _ = std::fs::remove_file(&path);
         }
     }
-}
-
-/// Whether no process holds a lock on `path` (an arrival holds its log's for life).
-fn unlocked(path: &Path) -> bool {
-    File::open(path).is_ok_and(|f| flock(&f, libc::LOCK_EX | libc::LOCK_NB).is_ok())
 }
 
 /// `KEY.PID-START.sock` and `PID-START.claim` of standbys whose locks are gone.
@@ -121,7 +117,7 @@ fn standby_sockets(dir: &Path) {
             Ok(f) => flock(&f, libc::LOCK_SH | libc::LOCK_NB).is_ok(),
             Err(e) => e.kind() == std::io::ErrorKind::NotFound,
         };
-        if free && (claim.is_none() || unlocked(&e.path())) {
+        if free && (claim.is_none() || locked(&e.path(), libc::LOCK_EX) == Some(false)) {
             let _ = std::fs::remove_file(e.path());
         }
     }

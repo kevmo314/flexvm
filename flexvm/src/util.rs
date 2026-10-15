@@ -1,5 +1,7 @@
+use std::ffi::{CStr, CString};
 use std::io::{self, BufRead, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -56,6 +58,41 @@ pub fn recv_json_max(r: &mut impl BufRead, max: u64) -> Result<Option<serde_json
     Ok(Some(serde_json::from_str(&line)?))
 }
 
+pub fn cname(name: &str) -> CString {
+    CString::new(name).expect("no NUL in file names")
+}
+
+pub fn check(rc: libc::c_int) -> io::Result<()> {
+    (rc >= 0).then_some(()).ok_or_else(io::Error::last_os_error)
+}
+
+/// Opens `name` in `dir` with close-on-exec; callers choose whether to follow symlinks.
+pub fn openat(dir: RawFd, name: &CStr, flags: libc::c_int) -> io::Result<OwnedFd> {
+    let fd = unsafe { libc::openat(dir, name.as_ptr(), flags | libc::O_CLOEXEC, 0o600) };
+    check(fd)?;
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+pub fn open_dir_at(dir: RawFd, name: &CStr) -> io::Result<OwnedFd> {
+    openat(dir, name, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+}
+
+pub fn fstat(fd: RawFd) -> io::Result<libc::stat> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    check(unsafe { libc::fstat(fd, &mut st) })?;
+    Ok(st)
+}
+
+pub fn cpath(p: &Path) -> Result<CString> {
+    Ok(CString::new(p.as_os_str().as_bytes()).map_err(|_| format!("NUL in path {p:?}"))?)
+}
+
+pub fn stat_at(dir: RawFd, name: &CStr) -> Option<libc::stat> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::fstatat(dir, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW | libc::AT_EMPTY_PATH) };
+    (rc == 0).then_some(st)
+}
+
 /// Retries on EINTR; a negative return is the OS error.
 pub fn eintr<T: Copy + Default + PartialOrd>(mut f: impl FnMut() -> T) -> io::Result<T> {
     loop {
@@ -70,13 +107,22 @@ pub fn eintr<T: Copy + Default + PartialOrd>(mut f: impl FnMut() -> T) -> io::Re
     }
 }
 
-pub fn retry<T>(timeout: Duration, mut f: impl FnMut() -> Result<T>) -> Result<T> {
+/// Whether a nonblocking flock fails; `None` if the file cannot be opened.
+pub fn locked(path: &Path, how: i32) -> Option<bool> {
+    std::fs::File::open(path).ok().map(|f| crate::host::flock(&f, how | libc::LOCK_NB).is_err())
+}
+
+pub fn retry<T>(timeout: Duration, f: impl FnMut() -> Result<T>) -> Result<T> {
+    retry_every(timeout, Duration::from_micros(200), f)
+}
+
+pub fn retry_every<T>(timeout: Duration, sleep: Duration, mut f: impl FnMut() -> Result<T>) -> Result<T> {
     let start = Instant::now();
     loop {
         match f() {
             Ok(v) => return Ok(v),
             Err(e) if start.elapsed() >= timeout => return Err(e),
-            Err(_) => std::thread::sleep(Duration::from_micros(200)),
+            Err(_) => std::thread::sleep(sleep),
         }
     }
 }

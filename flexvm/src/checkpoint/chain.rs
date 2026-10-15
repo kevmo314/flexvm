@@ -158,15 +158,10 @@ impl Checkpoint {
     pub fn open(dir: &Path) -> Result<Checkpoint> {
         let (mut links, meta_left) = open_chain(dir, true)?;
         let layers: Vec<Vec<Run>> = links.iter_mut().rev().map(|l| std::mem::take(&mut l.map)).collect();
-        let (mut files, mut sums, mut rest) = (Vec::new(), Vec::new(), Vec::new());
-        for l in links {
-            files.push(l.file.unwrap());
-            sums.push(l.sums);
-            rest.push((l.dir, l.manifest, l.id, l.vmstate));
-        }
-        let mut rest = rest.into_iter();
-        let (dir, manifest, id, vmstate) = rest.next().unwrap();
-        let (chain, chain_ids) = rest.map(|(dir, _, id, _)| (dir, id)).unzip();
+        let (files, sums) = links.iter_mut().map(|l| (l.file.take().unwrap(), std::mem::take(&mut l.sums))).unzip();
+        let mut links = links.into_iter();
+        let Link { dir, manifest, id, vmstate, .. } = links.next().unwrap();
+        let (chain, chain_ids) = links.map(|l| (l.dir, l.id)).unzip();
         let (runs, file) = flatten(&layers, files, sums);
         Ok(Checkpoint { dir, manifest, id, vmstate, runs, file: Arc::new(file), chain, chain_ids, meta_left })
     }

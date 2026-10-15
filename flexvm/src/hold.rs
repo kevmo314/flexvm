@@ -163,7 +163,7 @@ impl Holder {
                 lost = true;
                 break;
             }
-            if e.q.lock().unwrap().packets.len() < 16 && !readable(&self.tun) {
+            if e.q.lock().unwrap().packets.len() < 16 && !crate::util::readable(&self.tun, Duration::ZERO).unwrap_or(false) {
                 break;
             }
         }
@@ -294,7 +294,7 @@ impl Holder {
         while Instant::now() < end {
             let batch = e.q.lock().unwrap().take_batch();
             if batch.is_empty() {
-                if !self.reading.load(Ordering::SeqCst) && !readable(&self.tun) {
+                if !self.reading.load(Ordering::SeqCst) && !crate::util::readable(&self.tun, Duration::ZERO).unwrap_or(false) {
                     return;
                 }
                 std::thread::yield_now();
@@ -616,11 +616,6 @@ impl Out<'_> {
         self.buf.clear();
         !self.broken
     }
-}
-
-fn readable(fd: &OwnedFd) -> bool {
-    let mut pfd = libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-    unsafe { libc::poll(&mut pfd, 1, 0) > 0 }
 }
 
 /// The error flag: another process has it, or the name is too long (rather than no TUN support).

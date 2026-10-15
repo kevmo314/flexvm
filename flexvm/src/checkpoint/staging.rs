@@ -301,8 +301,7 @@ fn private_dir(fd: RawFd) -> bool {
 }
 
 pub(super) fn exists_at(dir: RawFd, name: &CStr) -> bool {
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    unsafe { libc::fstatat(dir, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) == 0 }
+    crate::util::stat_at(dir, name).is_some()
 }
 
 fn clear_stale(parent: &OwnedFd) {

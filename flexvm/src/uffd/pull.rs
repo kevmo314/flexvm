@@ -1,6 +1,6 @@
 use super::event::PULL;
-use super::fetch::{Failed, Fetch, FetchFailure, Link, BACKOFF_MIN};
-use super::{os, Pager, ALL, FAULT_FETCHERS, FAULT_TIMEOUT, PAGE_SIZE, PULL_RUN, REMOTE};
+use super::fetch::{Failed, Fetch, FetchFailure, Link};
+use super::{os, Pager, ALL, FAULT_FETCHERS, PAGE_SIZE, PULL_RUN, REMOTE};
 use crate::checkpoint::PageFile;
 use std::io;
 use std::sync::atomic::Ordering;
@@ -120,8 +120,7 @@ impl Pager {
             }
             let started = Instant::now();
             // A source that is slow, not gone: on with the rest of the run.
-            let mut retry = |e: &io::Error| self.retry_fetch(e);
-            let res = self.install_claimed(i, n, buf, fetch, &mut retry, |p, c, src| {
+            let res = self.install_claimed(i, n, buf, fetch, |p, c, src| {
                 // Test fault `pull_enomem`.
                 if self.pull_fail.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |k| k.checked_sub(1)).is_ok() {
                     return Err(os(libc::ENOMEM));
@@ -136,15 +135,10 @@ impl Pager {
                     return false;
                 }
                 Err(Failed::Install(e)) => {
-                    // As for a fault's fetch: an install that fails (memory short, say) gave its pages back, and is
-                    // tried again until some of them have kept failing for `FAULT_TIMEOUT`, whoever claimed them.
-                    let since = pages.failing_since(i, n).unwrap_or_else(Instant::now);
-                    if since.elapsed() >= FAULT_TIMEOUT {
-                        self.fail(format!("background pull {t}: installing pages {i}+{n}: {e}"));
+                    let what = format!("background pull {t}: installing pages {i}+{n}");
+                    if !self.install_retry(i, n, &e, &what, &what) {
                         return false;
                     }
-                    eprintln!("uffd: background pull {t}: installing pages {i}+{n}: {e}; retrying");
-                    thread::sleep(BACKOFF_MIN);
                 }
                 Err(Failed::Fetch(e)) => {
                     self.fail(format!("background pull {t} failed: {e}"));
