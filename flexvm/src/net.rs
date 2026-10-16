@@ -1,7 +1,7 @@
 //! Host networking: every VM gets a /32 routed to its own tap.
 //!
 //! All taps share one MAC, as do all guests, so moving a VM between hosts is just moving
-//! its route (plus, with `--announce-dev`, a gratuitous ARP for proxy-ARP LAN peers).
+//! its route (plus, with `announce_dev`, a gratuitous ARP for proxy-ARP LAN peers).
 
 use std::net::Ipv4Addr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};

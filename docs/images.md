@@ -5,7 +5,7 @@ sudo flexvm pull nginx:1.27                                     # any registry: 
 sudo flexvm pull ./app.tar --tag app --env PORT=8080            # `docker save` output or an OCI archive
 sudo flexvm pull ./oci-layout --tag py --cmd "python3 -m http.server 8000"
 sudo flexvm pull nginx:1.27 --tag web-warm --warm               # snapshot nginx running and ready
-flexvm run web1 --template nginx:1.27
+flexvm run --name web1 nginx:1.27
 curl http://<ip>/
 ```
 
@@ -58,7 +58,7 @@ the guest can leave any cgroup); without cgroup2 their session is killed.
   never follow symlinks. flexvm adds `/sbin/flexvm-init`, its mount points,
   `/etc/flexvm/app.conf` (argv, env, workdir, uid/gid/groups resolved against
   the image's own `/etc/passwd` and `/etc/group`), an `/etc/hosts`, and an
-  empty `/etc/resolv.conf` if the image has none (the host's `--dns` fills
+  empty `/etc/resolv.conf` if the image has none (host.json's `dns` fills
   it at `run`). `mkfs.ext4 -d` writes the read-only image. Built filesystems
   are cached in `STATE/images/rootfs/` by image config digest, flexvm-init
   and overrides, and templates attach the cached file in place, so templates of

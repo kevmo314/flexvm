@@ -187,6 +187,14 @@ impl Vm {
         self.resources.lock().unwrap().hotplug_cap(&self.template.meta)
     }
 
+    pub fn resources(&self) -> Resources {
+        *self.resources.lock().unwrap()
+    }
+
+    pub fn cpus(&self) -> Option<f64> {
+        self.resources().cpus
+    }
+
     /// Its memory ceiling: boot memory and `hotplug_total`.
     pub fn max_mib(&self) -> u64 {
         self.template.meta.mem_mib + self.hotplug_total()
@@ -436,7 +444,7 @@ impl Vm {
         // target starts so): after a pause or resume that ended unknown, Firecracker must say which.
         if self.reconcile().is_none() {
             bail!(
-                "vm {}: an earlier pause or resume ended unknown and firecracker cannot say whether it is paused; pause or resume it, then try again",
+                "vm {}: an earlier pause or resume ended unknown and firecracker cannot say whether it is paused; pause or unpause it, then try again",
                 self.name
             );
         }
@@ -708,7 +716,7 @@ impl Vm {
     fn running_here(&self) -> Result<()> {
         match self.state() {
             State::Running => {}
-            State::Paused => bail!("vm {} is paused; resume it with flexvm resume {}", self.name, self.name),
+            State::Paused => bail!("vm {} is paused; flexvm unpause {} resumes it", self.name, self.name),
             State::Checkpointing => bail!("vm {}{CHECKPOINTING}", self.name),
             _ => bail!("vm {} is not running here", self.name),
         }
@@ -920,7 +928,7 @@ impl Vm {
             "rss_mib": self.rss() >> 20,
             "guest_mib": self.template.meta.mem_mib + hotplug["plugged_size_mib"].as_u64().unwrap_or(0),
             "max_mib": self.max_mib(),
-            "resources": *self.resources.lock().unwrap(),
+            "resources": self.resources(),
             "plugged_mib": hotplug["plugged_size_mib"],
             "admitted_mib": self.limit.admitted(),
             "cgroup_mib": self.limit.used(),

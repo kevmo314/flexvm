@@ -497,7 +497,7 @@ impl Peers {
 
 fn not_a_peer(conn: TcpStream, from: IpAddr) {
     let local = conn.local_addr().map(|a| a.to_string()).unwrap_or_default();
-    let e = format!("{from} is not a peer of {local} (add it there: flexvm config --peer)");
+    let e = format!("{from} is not a peer of {local} (add it to peers in that host's host.json)");
     // A flood of non-peers is counted, not logged line by line.
     static WINDOW: Mutex<RefusalLog> = Mutex::new(RefusalLog { second: 0, logged: 0, unlogged: 0 });
     let second = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
@@ -861,7 +861,7 @@ pub fn check_vm_ip(host: &Host, ip: Ipv4Addr, peers: &[IpAddr]) -> Result<()> {
     routable(ip, &cfg, &known, &crate::net::gateways(&std::fs::read_to_string("/proc/net/route")?))
 }
 
-/// A next hop is the connection's peer or a configured peer (its addresses or `--peer-underlay`),
+/// A next hop is the connection's peer or a configured peer (its addresses or `peer_underlays`),
 /// never a non-unicast address: a cluster VM's route to a peer's own address sends its traffic to
 /// that peer only, which any peer may claim by announcing the VM moved to it.
 /// Callers include the connection address in `peers`; named peers come from strict listener lookup.
@@ -1013,7 +1013,7 @@ mod tests {
         assert!(route(&host, &json!({"ip": "10.201.0.8", "gen": 3}), &[], &[]).is_err());
     }
 
-    /// A peer's configured underlays (`--peer-underlay`) are its next hops, and no VM's address;
+    /// A peer's configured underlays (`peer_underlays`) are its next hops, and no VM's address;
     /// a peer no longer configured has none.
     #[test]
     fn configured_peer_underlays_are_next_hops() {

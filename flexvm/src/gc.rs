@@ -85,7 +85,7 @@ pub fn after_boot(host: &Host, rest: bool) -> Result<bool> {
     Ok(true)
 }
 
-/// `after_boot` with the rest, or `recover` if it did not run: listener startup and `flexvm recover`.
+/// `after_boot` with the rest, or `recover` if it did not run: listener startup.
 pub fn recover_after_boot(host: &Host) -> Result<()> {
     if !after_boot(host, true)? {
         recover(host);
@@ -101,7 +101,7 @@ pub fn first_boot_warning(host: &Host, boot: &str) -> bool {
 }
 
 /// A sweep now (the peers told of withdrawals, interrupted migrations settled and retired) and
-/// each template's standby VMs refilled: `flexvm recover`, a listener as it starts, the first
+/// each template's standby VMs refilled: a listener as it starts, the first
 /// command after a boot.
 pub fn recover(host: &Host) {
     let _ = crate::host::write_record(&host.run.join(".gc"), b"");

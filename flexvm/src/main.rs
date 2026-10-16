@@ -65,7 +65,8 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
   flexvm pull IMAGE[:TAG|@DIGEST] [--tag NAME] [--vcpus N] [--mem MIB] [--max MIB] [--plug MIB]
               [--standby N] ...      pull an image and build its template (an archive or OCI layout
                                      directory needs --tag; see README); again: rebuilt if it changed;
-                                     --standby N keeps N of its VMs restored and paused (run: ~5 ms)
+                                     --standby N keeps N of its VMs restored and paused (run: ~5 ms);
+                                     of an image pulled here, alone it only sets that count
   flexvm images [--json]             list pulled images
   flexvm rmi IMAGE|ID                remove an image no VM here uses
   flexvm listen [ADDR]               take migrations from peers (no ADDR: saved or socket-activated address)
@@ -930,11 +931,9 @@ fn remove(host: &Host, name: &str, running: bool, stopped: bool) -> Result<()> {
         return done();
     }
     if host.alive(name) {
-        return Err(format!(
-            "vm {name:?} is starting or its registry is unavailable; retry flexvm kill {name} once it is ready, or see {}",
-            host.vms(name, "log")?.display()
-        )
-        .into());
+        return Err(
+            format!("vm {name:?} is starting or its registry is unavailable; try again once it is ready, or see {}", host.vms(name, "log")?.display()).into()
+        );
     }
     match std::fs::read_to_string(host.vms(name, "moved")?) {
         Ok(to) => Err(format!("vm {name} moved to {to}; kill it there").into()),
@@ -1068,6 +1067,14 @@ fn pull(args: &Args, src: &str) -> Result<()> {
     let standby = args.get("standby").map(|n| n.parse::<usize>().map_err(|_| format!("bad --standby {n:?}: give a count"))).transpose()?;
     if unsafe { libc::geteuid() } != 0 {
         bail!("run flexvm as root");
+    }
+    // Of an image pulled here, `--standby N` alone (and its --tag) only sets the count: the
+    // pull's other options would have to be given again, or it would be rebuilt without them.
+    let only_standby = args.flags.iter().all(|(f, _)| matches!(f.as_str(), "standby" | "tag" | "state" | "run"));
+    if let (Some(n), true) = (standby, only_standby) {
+        if std::fs::symlink_metadata(paths(args)?.templates.join(&name)).is_ok() {
+            return print(standby::set(&open_host(args)?, &name, n)?);
+        }
     }
     util::check_kvm()?;
     // Interrupted, the build stops at its next step and removes its tap and staging (gigabytes:

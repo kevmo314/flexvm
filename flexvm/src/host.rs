@@ -65,8 +65,8 @@ pub struct Config {
     pub run: Option<PathBuf>,
     pub listen: Option<String>,
     pub peers: Vec<String>,
-    /// A peer's data-plane addresses besides those it is reached by (`--peer-underlay`): next hops
-    /// it may report for its VMs, as its own `--underlay` on another network. Only a configured peer's count.
+    /// A peer's data-plane addresses besides those it is reached by (`peer_underlays`): next hops
+    /// it may report for its VMs, as its own `underlay` on another network. Only a configured peer's count.
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub peer_underlays: std::collections::BTreeMap<String, Vec<Ipv4Addr>>,
     /// Disjoint across hosts.
@@ -243,7 +243,7 @@ impl Config {
         w
     }
 
-    /// `peer`'s configured underlays (`--peer-underlay`), none unless it is a configured peer.
+    /// `peer`'s configured underlays (`peer_underlays`), none unless it is a configured peer.
     pub fn underlays_of(&self, peer: &str) -> &[Ipv4Addr] {
         match self.peers.iter().any(|p| p == peer) {
             true => self.peer_underlays.get(peer).map_or(&[], Vec::as_slice),
@@ -586,7 +586,7 @@ impl Host {
         reserved_run(&state, &run, Path::new(DEFAULT_STATE), Path::new(DEFAULT_RUN))?;
         let bound = verify_binding(&state, "run", &run)?;
         let claimed = claim_run(&state, &run)?;
-        // A user who cannot write the state root (a non-root `flexvm ls` of an unbound one) leaves it unbound,
+        // A user who cannot write the state root (a non-root `flexvm ps` of an unbound one) leaves it unbound,
         // as does one who could not claim the run directory: it is not bound to a directory it may not own.
         if !bound && claimed {
             match crate::util::write_file(&state, "run.json", &serde_json::to_vec(&run)?, true) {
@@ -959,7 +959,7 @@ impl Host {
         self.is_suspended(name) && recorded().is_none_or(|g| g == gen)
     }
 
-    /// From the range as host.json has it now (a standby started before a `--vm-ips`
+    /// From the range as host.json has it now (a standby started before a `vm_ips`
     /// change claims from the new one); addresses handed out before it stay.
     pub fn claim_new(&self, l: &Locked, holder: &str, want: Option<Ipv4Addr>) -> Result<AddrClaim> {
         self.claim_new_in(l, &self.config_now(), holder, want)
@@ -2538,7 +2538,7 @@ impl Host {
 
     /// Until this boot's recovery is complete (`RUN/.boot`), under the host lock, before anything
     /// else here: what the VMs that ran before the boot left. Each is recorded as lost
-    /// (`RUN/vms/NAME.lost`, listed by `ls` until `flexvm kill NAME`) before its address is
+    /// (`RUN/vms/NAME.lost`, listed by `ps -a` until `flexvm rm NAME`) before its address is
     /// withdrawn (`withdraw_dead`: a home host's loan ends once the peers are told, an outcome owed
     /// for an interrupted migration is recorded and settled by sweeps), and the routes to peers'
     /// VMs are put back from `STATE/addrs` (kernel routes do not outlive a boot, and peers never
@@ -2601,7 +2601,7 @@ impl Host {
         if self.alive(name) {
             return Ok(());
         }
-        let why = format!("lost: its process ended without withdrawing {ip} (generation {gen}), as in a reboot; the address is withdrawn, its log is gone with the run directory; flexvm kill {name} clears this");
+        let why = format!("lost: its process ended without withdrawing {ip} (generation {gen}), as in a reboot; the address is withdrawn, its log is gone with the run directory; flexvm rm {name} clears this");
         self.vms(name, "lost")?;
         crate::util::write_file(&self.run.join("vms"), &format!("{name}.lost"), why.as_bytes(), false)
             .map_err(|e| format!("recording vm {name} as lost: {e}").into())
@@ -5517,7 +5517,7 @@ mod tests {
         h.lend_new(&l, ip("10.10.0.1")).unwrap();
     }
 
-    /// A `--vm-ips` change reaches a Host opened before it (a standby, the listener, a
+    /// A `vm_ips` change reaches a Host opened before it (a standby, the listener, a
     /// source): claims, fresh loans and a source's loan go by the range now (#521).
     #[test]
     fn claims_and_loans_go_by_the_range_as_host_json_has_it_now() {

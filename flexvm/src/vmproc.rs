@@ -68,7 +68,7 @@ static CONTROL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize:
 /// Page-server requests (peers', forwarded by the listener) refused or served at once: not on `MAX_CONTROL`, so they
 /// never shut out local control requests (#335). Those served are bounded further by the page server.
 const MAX_PAGES: usize = 64;
-/// How long `flexvm resume` waits for the VM to resume (an arrival's pages come first).
+/// How long `flexvm unpause` (or `start`) waits for the VM to resume (an arrival's pages come first).
 const RESUME_WAIT: Duration = Duration::from_secs(60);
 static PAGES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// Page-server refusals waiting out their `PAGE_REFUSAL` drain, on neither budget above, so a peer's refused requests
@@ -185,12 +185,12 @@ pub struct Runtime {
     serving: Mutex<bool>,
     /// SIGTSTP and SIGCONT, off the signal thread (which a later SIGINT needs).
     pauses: Latest,
-    /// What came of the SIGCONTs `flexvm resume` sent, for its answer.
+    /// What came of the SIGCONTs `flexvm unpause` sent, for its answer.
     resumes: Resumes,
     /// The code of a destroy waiting for `op` (0: none): a pause or resume that gets it first does nothing.
     destroying: AtomicI32,
     /// Held by the signal thread from taking a signal to reserving a SIGTERM's suspend,
-    /// and by `flexvm resume` asking: one sent earlier is still pending, queued or reserved.
+    /// and by `flexvm unpause` asking: one sent earlier is still pending, queued or reserved.
     taking: Mutex<()>,
     /// The controller's tick gaps, for `debug status`.
     ticks: Mutex<Ticks>,
@@ -434,11 +434,11 @@ impl Proc {
                 }
                 Err(e) => {
                     let _ = peer_call(&peer, json!({"op": "route", "ip": ip.to_string(), "gen": gen}));
-                    bail!("cannot take {ip} borrowed from {peer}: {e}; restore with --ip auto")
+                    bail!("cannot take {ip} borrowed from {peer}: {e}; run --checkpoint with --ip auto")
                 }
             };
         }
-        bail!("cannot borrow {ip} from its home host ({}); restore with --ip auto", why.join("; "))
+        bail!("cannot borrow {ip} from its home host ({}); run --checkpoint with --ip auto", why.join("; "))
     }
 
     /// The one place an arrival settles, under `op`: once every page is here
@@ -499,7 +499,7 @@ impl Proc {
 
     /// The host lock, if the generation is still current: hold it until the VM runs.
     pub fn still_current(&self, ip: Ipv4Addr) -> Result<crate::host::Locked> {
-        self.host.fence(ip, self.gen()).map_err(|e| format!("{e}; restore with --ip auto").into())
+        self.host.fence(ip, self.gen()).map_err(|e| format!("{e}; run --checkpoint with --ip auto").into())
     }
 
     /// The address this VM holds, if any.
@@ -675,10 +675,10 @@ impl Proc {
             template_id: vm.template.meta.id.clone(),
             vcpus: vm.template.meta.vcpus,
             max_mib: vm.max_mib(),
-            cpus: vm.resources.lock().unwrap().cpus,
+            cpus: vm.cpus(),
             state: match vm.state() {
                 State::Source(mig) if self.reconciling.lock().unwrap().as_ref().is_some_and(|(m, _)| *m == mig) => "reconciling",
-                // SIGCONT does nothing then: `flexvm resume` waits for the suspend instead.
+                // SIGCONT does nothing then: `flexvm unpause` waits for the suspend instead.
                 _ if *self.suspending.lock().unwrap() == Suspend::Suspending => "suspending",
                 state => state.name(),
             }
@@ -944,7 +944,8 @@ impl Proc {
         let mut t = Phases::new();
         self.set_name(self.host.take_name(name, false)?);
         let tpl = Template::open(&self.paths, template)?;
-        self.set_resources(*self.resources.lock().unwrap(), &tpl.meta)?;
+        let resources = *self.resources.lock().unwrap();
+        self.set_resources(resources, &tpl.meta)?;
         t.mark("template");
         // Before the claim: a refused start mints no generation (nor withdraws one).
         self.admit_start(tpl.working_set_mib(), Some(0), crate::host::Floor::Reserve)?;
@@ -1090,7 +1091,7 @@ impl Proc {
         self.dispatch(sig);
     }
 
-    /// `flexvm resume`: whether a SIGTERM sent before it suspends the VM; if none,
+    /// `flexvm unpause`: whether a SIGTERM sent before it suspends the VM; if none,
     /// its SIGCONT (which, as a raw one did, discards a Ctrl-Z still pending), and
     /// what came of it: the VM runs, its resume failed, or it is being destroyed.
     fn resume_request(&self) -> Result<Value> {
@@ -1150,7 +1151,7 @@ impl Proc {
                 self.publish();
                 Ok(())
             }),
-            // Not run here, whether paused or running when it left: `flexvm resume` is told so, not that it runs (#569).
+            // Not run here, whether paused or running when it left: `flexvm unpause` is told so, not that it runs (#569).
             libc::SIGCONT if self.leaving.load(Ordering::SeqCst) => Err(format!("vm {} is migrating away (or ending)", vm.name).into()),
             // Also through while a new address is pending (a resume that failed to set it): this one retries it.
             libc::SIGCONT if !(self.paused_by_request.load(Ordering::SeqCst) || vm.pending_net.load(Ordering::SeqCst)) => Ok(()),
@@ -2549,7 +2550,7 @@ impl Announcer {
         let peers = cfg.peers.clone();
         let Some(via) = cfg.underlay() else {
             if !peers.is_empty() {
-                crate::log!("announce {ip}: no underlay address (give flexvm listen an ADDR peers can reach, or flexvm config --underlay IP); peers not told");
+                crate::log!("announce {ip}: no underlay address (give flexvm listen an ADDR peers can reach, or set underlay in host.json); peers not told");
             }
             return false;
         };
@@ -2674,7 +2675,7 @@ pub fn connect(host: &Host, name: &str, req: &Value, fds: &[i32], at: Instant, c
         if host.alive(name) {
             format!("vm {name:?} is starting or its control socket is unavailable; retry once it is ready, or see {}: {e}", log.display())
         } else if host.is_suspended(name) {
-            format!("vm {name:?} is suspended; use flexvm resume {name} first")
+            format!("vm {name:?} is stopped; flexvm start {name} first")
         } else {
             format!("no vm named {name:?}")
         }

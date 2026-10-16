@@ -278,7 +278,7 @@ impl Proc {
                 "rss_mib": vm.rss() >> 20,
                 // Settled: the arrival's memory mark is sized by it without asking its Firecracker.
                 "plugged_mib": vm.hotplug_plugged(),
-                "resources": *vm.resources.lock().unwrap(),
+                "resources": vm.resources(),
                 "regions": vm.pager.regions(),
                 // The MSRs its vmstate will hold: this host's, which may be more than the template's.
                 "msrs": msrs,
@@ -341,7 +341,7 @@ impl Proc {
                 if s != State::Running {
                     self.paused_by_request.store(true, Ordering::SeqCst);
                 }
-                (s, format!("{e}; resuming it here failed too: {r}; it is {} here (flexvm resume {} runs it)", s.name(), vm.name).into())
+                (s, format!("{e}; resuming it here failed too: {r}; it is {} here (flexvm unpause {} runs it)", s.name(), vm.name).into())
             }
         };
         // Under the host lock: a route retry still running sees it is no longer this migration's source.

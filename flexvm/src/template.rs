@@ -315,7 +315,7 @@ const MAX_LOAD_SET: usize = 512;
 /// Template builds' guest commands, on a possibly loaded host.
 const EXEC_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// What `run` (without `--template`) uses, pulled when missing.
+/// What `bench` (without `--template`) uses.
 pub const DEFAULT_IMAGE: &str = "ubuntu:24.04";
 
 /// Room for the build's lock and staging names around it in one file name (255 bytes).

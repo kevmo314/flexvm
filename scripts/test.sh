@@ -28,19 +28,19 @@ cli() {
     timeout 60s "$netlab" fv "${ns#fv}" "$@"
 }
 
-# main.rs prints run as JSON, ls as NAME IP TEMPLATE STATE ... (one header row),
+# main.rs prints run -d as JSON, ps as NAME IP IMAGE STATE ... (one header row),
 # and exec streams guest stdout/stderr and returns the guest exit status.
 run_ip() {
     python3 -c 'import ipaddress,json,sys; print(ipaddress.IPv4Address(json.load(sys.stdin)["ip"]))'
 }
 listed() {
     local listing
-    listing=$(cli "$1" "$2" ls) || return 1
+    listing=$(cli "$1" "$2" ps) || return 1
     awk -v name="$name" -v addr="$3" 'NR>1 && $1==name && $2==addr && $4=="running" {found=1} END {exit !found}' <<< "$listing"
 }
 absent() {
     local listing
-    listing=$(cli "$1" "$2" ls) || return 1
+    listing=$(cli "$1" "$2" ps -a) || return 1
     awk -v name="$name" 'NR>1 && $1==name {found=1} END {exit found}' <<< "$listing"
 }
 wait_for() {
@@ -138,14 +138,15 @@ work=$(mktemp -d /tmp/flexvm-test.XXXXXX)
 lab_started=1
 "$netlab" up
 "$netlab" listeners
-wait_for test -f /run/flexvm-lab-A/state/host.json
-wait_for test -f /run/flexvm-lab-B/state/host.json
+# Each listener saves its address in host.json once it listens.
+wait_for grep -q '"listen"' /run/flexvm-lab-A/state/host.json
+wait_for grep -q '"listen"' /run/flexvm-lab-B/state/host.json
 sleep 0.5
 pass
 
 current=1
-addr=$(cli fvA "$host_A" run "$name" --template "${TEMPLATE:-small}" -d | run_ip)
-listed fvA "$host_A" "$addr" || fail 'ls did not report the new VM and address.'
+addr=$(cli fvA "$host_A" run --name "$name" -d "${TEMPLATE:-small}" | run_ip)
+listed fvA "$host_A" "$addr" || fail 'ps did not report the new VM and address.'
 [[ $(cli fvA "$host_A" exec "$name" 'printf flexvm-exec-ok') == flexvm-exec-ok ]] || fail 'Guest exec output mismatch.'
 if cli fvA "$host_A" exec "$name" 'exit 7'; then
     fail 'exec did not propagate a guest failure.'
@@ -153,10 +154,10 @@ else
     code=$?
     [[ $code == 7 ]] || fail "exec returned $code instead of guest exit 7."
 fi
-cli fvA "$host_A" kill "$name"
+[[ $(cli fvA "$host_A" kill "$name") == "$name" ]] || fail 'kill did not print the name.'
 absent fvA "$host_A" || fail 'Killed VM is still listed.'
 # Reclaim the exact address, rather than assuming the allocator reuses its first slot.
-reclaimed=$(cli fvA "$host_A" run "$name" --template "${TEMPLATE:-small}" --ip "$addr" -d | run_ip)
+reclaimed=$(cli fvA "$host_A" run --name "$name" --ip "$addr" -d "${TEMPLATE:-small}" | run_ip)
 [[ $reclaimed == "$addr" ]] || fail 'Killed VM address was not released.'
 pass
 
