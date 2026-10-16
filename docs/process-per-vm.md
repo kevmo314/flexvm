@@ -144,7 +144,8 @@ STATE (default /var/lib/flexvm, on disk)
   addrs/IP               per address: newest generation seen, withdrawn?, lent generation, holder name, instance
                          (pid, start time) and generation, the route a peer announced for the newest generation
                          and the newest revision of it (where the VM is within the generation)
-  addrs/.gens            generation high-water mark, reserved 1024 at a time, with the boot id
+  addrs/.gens            durable generation cursor with the boot id
+  addrs/.gens.reserved   independent durable high-water mark, reserved 1024 at a time
   addrs/.next            where the next automatic allocation starts looking (a hint, wrapping around)
   suspended/NAME/        a suspended VM's checkpoint, GEN (its address's generation) published with it,
                          + STARTED, DISCARDED, QUARANTINE markers; without a manifest, or STARTED or
@@ -276,10 +277,16 @@ with that generation, or it is lent. Another instance of the same name (a
 restart after a SIGKILL) does not hold it, and an instance releases only its
 own claim.
 All of this is decided under the host lock, in one critical section with the
-claim. Records with a new generation, a loan or a withdrawal are fsynced
-before acting; a live holder change is not (a crash loses the VM too, and the
-high-water mark already orders generations). A record that cannot be read or
-parsed is an error, never a free address.
+claim. Every address record replacement, including a live holder change, is
+fsynced before rename, and its directory is fsynced afterward. The generation
+cursor (`addrs/.gens`) uses the same durable replacement; a separate
+`addrs/.gens.reserved` preserves the block reservation and changes only when
+another block is reserved. A missing or corrupt cursor recovers above the
+reservation and surviving address generations. An empty legacy address record
+recovers as a dead holder fenced by that high-water mark; without a surviving
+reservation, it is quarantined. Other malformed address records are also
+quarantined as lent, so they cannot be allocated twice.
+I/O errors still fail closed.
 
 - **Borrowing.** A restore keeping another host's address (its checkpoint's,
   or `--ip`) asks the peers to `lend` it: the home host checks it is free
