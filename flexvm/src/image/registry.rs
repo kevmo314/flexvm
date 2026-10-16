@@ -628,17 +628,28 @@ fn cached_blob<R: Read>(digest: &str, size: u64, blobs: &Path, download: impl Fn
 }
 
 pub(super) fn sweep_parts(dir: &Path) {
+    use std::os::fd::AsRawFd;
     let Ok(dir_lock) = super::publish_lock(dir) else { return };
     let Ok(_lock) = crate::host::Flock::new(dir_lock, libc::LOCK_EX | libc::LOCK_NB) else { return };
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    // Entries are opened and removed relative to the directory as opened here.
+    let Ok(dir_c) = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()) else { return };
+    let Ok(fd) = crate::util::open_dir_at(libc::AT_FDCWD, &dir_c) else { return };
+    let Ok(entries) = std::fs::read_dir(format!("/proc/self/fd/{}", fd.as_raw_fd())) else { return };
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some((hex, id)) = name.to_str().and_then(|n| n.rsplit_once(".part")) else { continue };
         if crate::util::is_nonce(id) && hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-            let Ok(f) = std::fs::File::open(entry.path()) else { continue };
+            let Ok(c) = std::ffi::CString::new(name.as_encoded_bytes()) else { continue };
+            // Never a link, and never waiting on what is not a file (a FIFO would block the open).
+            let Ok(f) = crate::util::openat(fd.as_raw_fd(), &c, libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW).map(std::fs::File::from) else {
+                continue;
+            };
+            if !f.metadata().is_ok_and(|m| m.is_file()) {
+                continue;
+            }
             // Let go explicitly, not by close: a child another thread forks shares the descriptor.
             if let Ok(_held) = crate::host::Flock::new(f, libc::LOCK_EX | libc::LOCK_NB) {
-                let _ = std::fs::remove_file(entry.path());
+                unsafe { libc::unlinkat(fd.as_raw_fd(), c.as_ptr(), 0) };
             }
         }
     }
@@ -968,6 +979,28 @@ pub(super) mod tests {
         drop(lock);
         sweep_parts(&dir);
         assert!(!live.exists());
+    }
+
+    /// A part that is a FIFO or a link is skipped at once, never waited on or followed.
+    #[test]
+    fn sweep_never_waits_on_or_follows_a_part() {
+        let dir = super::super::unpack::tests::tmpdir("parts-fifo");
+        let hex = "b".repeat(64);
+        let fifo = dir.join(format!("{hex}.part{}", crate::util::random_hex(8).unwrap()));
+        let link = dir.join(format!("{hex}.part{}", crate::util::random_hex(8).unwrap()));
+        let target = dir.join("target");
+        std::fs::write(&target, "kept").unwrap();
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let d = dir.to_path_buf();
+        std::thread::spawn(move || {
+            sweep_parts(&d);
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(Duration::from_secs(5)).expect("the sweep did not wait on the FIFO");
+        assert!(fifo.exists() && link.is_symlink() && target.exists());
     }
 
     /// Serves each connection by its request path: `/v2/<image>/<path>` answers `respond(path)`, one byte at a
