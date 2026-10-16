@@ -1559,7 +1559,10 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
         s.signal(sig);
     });
     let op = p.op();
+    // Checked where the failure is answered: to the starter (`notify`), or to the source (`prepare_in`).
+    let kvm = if matches!(start, Start::Incoming { .. }) { Ok(()) } else { crate::util::check_kvm() };
     let res = match start {
+        _ if kvm.is_err() => kvm.map(|()| Value::Null),
         Start::Run { name, template, ip, cmd } => {
             *p.cmd.lock().unwrap() = cmd;
             p.run(&name, &template, ip)

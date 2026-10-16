@@ -466,17 +466,32 @@ pub fn connect_addrs(addrs: &[std::net::SocketAddr], at: Instant) -> io::Result<
     Err(last)
 }
 
+/// Fail before starting Firecracker when KVM is unavailable.
+pub fn check_kvm() -> Result<()> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/kvm")
+        .map_err(|e| format!("/dev/kvm: {e} (enable virtualization or nested virtualization; load kvm_intel/kvm_amd)"))?;
+    Ok(())
+}
+
 /// Looks `addr` up and sends `req` and reads its answer, all by `at`, connecting within `wait` of that;
 /// any failure names `addr`. The stream stays open for whatever follows.
 pub fn rpc(addr: &str, wait: Duration, at: Instant, req: &serde_json::Value) -> Result<(std::net::TcpStream, serde_json::Value)> {
     (|| -> Result<_> {
         let addrs = resolve(addr, at)?;
-        let s = connect_addrs(&addrs, at.min(Instant::now() + wait))?;
+        let s = connect_addrs(&addrs, at.min(Instant::now() + wait)).map_err(peer_connect_error)?;
         send_json(&mut By { s: &s, at }, req)?;
         let reply = recv_json(&mut io::BufReader::new(By { s: &s, at }))?;
         Ok((s, answer(reply, "it", "refused")?))
     })()
     .map_err(|e| format!("{addr}: {e}").into())
+}
+
+fn peer_connect_error(e: io::Error) -> String {
+    let hint = if e.kind() == io::ErrorKind::ConnectionRefused { "; is flexvm listen running there?" } else { "" };
+    format!("{e}{hint}")
 }
 
 pub fn answer(reply: Option<serde_json::Value>, who: &str, fallback: &str) -> Result<serde_json::Value> {
@@ -1351,6 +1366,16 @@ mod tests {
         let (mut x, mut yz) = ([0u8; 1], [0u8; 2]);
         assert_eq!(by.read_vectored(&mut [io::IoSliceMut::new(&mut x), io::IoSliceMut::new(&mut yz)]).unwrap(), 3);
         assert_eq!((&x, &yz), (b"x", b"yz"));
+    }
+
+    #[test]
+    fn refused_peer_connection_suggests_listen_and_peer_settings() {
+        let refused = io::Error::from(io::ErrorKind::ConnectionRefused);
+        let expected = format!("{refused}; is flexvm listen running there?");
+        assert_eq!(peer_connect_error(refused), expected);
+        let timeout = io::Error::from(io::ErrorKind::TimedOut);
+        let expected = timeout.to_string();
+        assert_eq!(peer_connect_error(timeout), expected);
     }
 
     #[test]

@@ -427,7 +427,7 @@ it moves to another power of two; an arrival's pull does not count).
 Pressure relief needs one decider per host: every second each VM process
 whose host is under pressure, or whose VM is starved, tries
 `STATE/evict.lock` (non-blocking). Pressure starts when MemAvailable falls
-under the high-water mark (`evict_mib`, `listen --evict-at`; default the
+under the high-water mark (`evict_mib`, `config --evict-at`; default the
 reserve plus the reserve or 512 MiB, whichever is more; the reserve's default
 is a sixteenth of the host's RAM, from 256 MiB to 4 GiB) and lasts until it is
 back above the mark by half the mark's height over the reserve (at least
