@@ -2539,6 +2539,21 @@ pub fn tripped(name: &str) -> bool {
     armed
 }
 
+/// Test hook: parks here, if `name` is armed when reached, until the test removes this process's
+/// reached-marker (RUN/gates/NAME.PID; `rm -rf RUN/gates` releases every one), or for at most 10 minutes.
+/// Neither the arming's expiry nor the host lock releases it: it parks under the lock too.
+pub fn hold(name: &str) {
+    if !fault(name) {
+        return;
+    }
+    reached(name);
+    let Some(marker) = RUN_DIR.get().map(|r| r.join("gates").join(format!("{name}.{}", std::process::id()))) else { return };
+    let end = std::time::Instant::now() + Duration::from_secs(600);
+    while marker.exists() && std::time::Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// Test hook: tells a test this process got to `name` (RUN/gates/NAME.PID), so it acts there, not after a guessed delay.
 fn reached(name: &str) {
     if let Some(dir) = RUN_DIR.get().map(|r| r.join("gates")) {
