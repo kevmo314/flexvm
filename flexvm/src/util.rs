@@ -490,8 +490,7 @@ pub fn rpc(addr: &str, wait: Duration, at: Instant, req: &serde_json::Value) -> 
 }
 
 fn peer_connect_error(e: io::Error) -> String {
-    let hint =
-        if e.kind() == io::ErrorKind::ConnectionRefused { "; is flexvm listen running there, with this host in its flexvm config --peer list?" } else { "" };
+    let hint = if e.kind() == io::ErrorKind::ConnectionRefused { "; is flexvm listen running there?" } else { "" };
     format!("{e}{hint}")
 }
 
@@ -1372,7 +1371,7 @@ mod tests {
     #[test]
     fn refused_peer_connection_suggests_listen_and_peer_settings() {
         let refused = io::Error::from(io::ErrorKind::ConnectionRefused);
-        let expected = format!("{refused}; is flexvm listen running there, with this host in its flexvm config --peer list?");
+        let expected = format!("{refused}; is flexvm listen running there?");
         assert_eq!(peer_connect_error(refused), expected);
         let timeout = io::Error::from(io::ErrorKind::TimedOut);
         let expected = timeout.to_string();

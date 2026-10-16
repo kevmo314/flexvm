@@ -61,7 +61,7 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
                                      derived for those unset); --peer replaces the list, '' unsets
   flexvm listen [ADDR]               take migrations from peers (no ADDR: saved or socket-activated address)
   flexvm standby [--template T] [N]  keep N VMs restored and paused, so run takes ~5 ms (no N: show)
-  flexvm template NAME [--vcpus N] [--mem MIB] [--max MIB] [--plug MIB] [--init PATH] [--image REF ...]
+  flexvm template NAME [--vcpus N] [--mem MIB] [--max MIB] [--plug MIB] [--image REF [--init PATH] ...]
                                      build a template (see README)
   flexvm bench ...                   latency benchmarks (see README)
 
@@ -238,6 +238,7 @@ const GLOBAL: &[&str] = &["state", "run", "help", "version"];
 
 /// What `template --image` takes.
 const IMAGE_FLAGS: &[&str] = &[
+    "init",
     "entrypoint",
     "cmd",
     "env",
@@ -267,7 +268,7 @@ const COMMANDS: &[(&str, usize, &[&str])] = &[
     ("listen", 2, &[]),
     ("config", 1, CONFIG_FLAGS),
     ("standby", 2, &["template"]),
-    ("template", 2, &["vcpus", "mem", "max", "plug", "image", "init"]),
+    ("template", 2, &["vcpus", "mem", "max", "plug", "image"]),
     (
         "bench",
         1,
@@ -1136,6 +1137,7 @@ mod exec_tests {
         assert!(err(&["restore", "/d", "--template", "t"]).is_some());
         assert!(err(&["kill", "web", "--", "x"]).is_some());
         assert_eq!(err(&["template", "t", "--warm"]).unwrap(), "--warm needs --image");
+        assert_eq!(err(&["template", "t", "--init", "/x"]).unwrap(), "--init needs --image");
         assert_eq!(err(&["listen", "1.2.3.4:7070", "--peer", "a:1"]).unwrap(), "--peer does not apply to listen (see flexvm --help)");
         for ok in [
             &["--state", "/s", "run", "web", "--template", "t", "-d", "--", "make", "test"][..],
