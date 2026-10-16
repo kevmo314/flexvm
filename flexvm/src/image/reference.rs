@@ -35,10 +35,19 @@ impl Reference {
         Ok(Reference { registry, repository, reference })
     }
 
-    /// Base URL of the registry API. Plain HTTP only for local registries.
+    /// The registry's host, without its port (or an IPv6 literal's brackets).
+    pub fn host(&self) -> &str {
+        match self.registry.strip_prefix('[') {
+            Some(v6) => v6.split(']').next().unwrap_or(""),
+            None => self.registry.split(':').next().unwrap_or(""),
+        }
+    }
+
+    /// Base URL of the registry API. Plain HTTP only for this host's own: `localhost` or a loopback address.
     pub fn base_url(&self) -> String {
-        let host = self.registry.split(':').next().unwrap_or("");
-        let scheme = if host == "localhost" || host == "127.0.0.1" { "http" } else { "https" };
+        let host = self.host();
+        let loopback = host == "localhost" || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
+        let scheme = if loopback { "http" } else { "https" };
         format!("{scheme}://{}/v2/{}", self.registry, self.repository)
     }
 }
@@ -71,6 +80,14 @@ mod tests {
         assert_eq!(p("localhost:5000/x:y"), ("localhost:5000".into(), "x".into(), "y".into()));
         assert_eq!(p("gcr.io/distroless/static"), ("gcr.io".into(), "distroless/static".into(), "latest".into()));
         assert!(Reference::parse("Nginx").is_err());
+        let v6 = Reference::parse("[::1]:5000/x:y").unwrap();
+        assert_eq!((v6.registry.as_str(), v6.repository.as_str(), v6.reference.as_str(), v6.host()), ("[::1]:5000", "x", "y", "::1"));
+        assert_eq!(v6.base_url(), "http://[::1]:5000/v2/x");
+        assert_eq!(Reference::parse("[::1]/x").unwrap().base_url(), "http://[::1]/v2/x");
+        assert_eq!(Reference::parse("[2001:db8::1]:5000/x").unwrap().base_url(), "https://[2001:db8::1]:5000/v2/x");
+        assert_eq!(Reference::parse("127.0.0.1:5000/x").unwrap().base_url(), "http://127.0.0.1:5000/v2/x");
+        assert_eq!(Reference::parse("localhost/x").unwrap().base_url(), "http://localhost/v2/x");
+        assert_eq!(Reference::parse("ghcr.io/o/a").unwrap().base_url(), "https://ghcr.io/v2/o/a");
         assert!(Reference::parse("nginx@sha256:abc").is_err());
     }
 }
