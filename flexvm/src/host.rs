@@ -818,8 +818,10 @@ impl Host {
         self.is_suspended(name) && recorded().is_none_or(|g| g == gen)
     }
 
+    /// From the range as host.json has it now (a standby started before a `--vm-ips`
+    /// change claims from the new one); addresses handed out before it stay.
     pub fn claim_new(&self, l: &Locked, holder: &str, want: Option<Ipv4Addr>) -> Result<AddrClaim> {
-        let range = self.cfg.range()?;
+        let range = self.config_now().range()?;
         let taken = |ip| self.addr(l, ip).map_or(true, |a| a.lent.is_some() || self.held(&a));
         let ip = match want {
             Some(ip) if !range.allocatable(ip) => {
@@ -850,9 +852,10 @@ impl Host {
     }
 
     pub fn lend_new(&self, l: &Locked, ip: Ipv4Addr) -> Result<u64> {
-        // A fresh loan: only an address this host would hand out itself.
-        if !self.cfg.range()?.allocatable(ip) {
-            bail!("{ip} is not from this host's range {}", self.cfg.vm_ips);
+        // A fresh loan: only an address this host would hand out itself, by its range now.
+        let cfg = self.config_now();
+        if !cfg.range()?.allocatable(ip) {
+            bail!("{ip} is not from this host's range {}", cfg.vm_ips);
         }
         let a = self.addr(l, ip)?;
         if let Some(gen) = a.lent {
@@ -956,7 +959,7 @@ impl Host {
     /// host, the source's own claim is marked `leaving` until it `stay`s.
     /// `mig` to `to`: what a sweep asks should the source die meanwhile.
     pub fn lend(&self, l: &Locked, ip: Ipv4Addr, gen: u64, mig: u64, to: &str) -> Result<bool> {
-        let (home, me) = (self.cfg.range()?.contains(ip), Ident::me());
+        let (home, me) = (self.config_now().range()?.contains(ip), Ident::me());
         self.update(l, ip, true, |a| {
             if a.holder_id.as_ref() == Some(&me) {
                 a.leaving = Some(Leaving { mig, to: to.into() });
@@ -3884,6 +3887,32 @@ mod tests {
             assert!(h.lend_new(&l, x).is_err() && h.claim_new(&l, "w", Some(x)).is_err(), "{x}");
         }
         h.lend_new(&l, ip("10.10.0.1")).unwrap();
+    }
+
+    /// A `--vm-ips` change reaches a Host opened before it (a standby, the listener, a
+    /// source): claims, fresh loans and a source's loan go by the range now (#521).
+    #[test]
+    fn claims_and_loans_go_by_the_range_as_host_json_has_it_now() {
+        let (_dir, h) = host("live-range");
+        let (old, new) = (ip("10.9.0.1"), ip("10.7.0.5"));
+        let mut writer = h.clone();
+        writer
+            .configure(|c| {
+                (c.vm_ips, c.dns) = ("10.7.0.5-10.7.0.5".into(), Some("10.7.0.53".into()));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(h.cfg.vm_ips, "10.9.0.1-10.9.0.3", "opened before the change");
+        assert_eq!(h.config_now().dns.as_deref(), Some("10.7.0.53"));
+        let l = h.lock().unwrap();
+        let e = h.claim_new(&l, "x", Some(old)).err().unwrap().to_string();
+        assert!(e.contains("range 10.7.0.5-10.7.0.5"), "{e}");
+        let e = h.lend_new(&l, old).unwrap_err().to_string();
+        assert!(e.contains("range 10.7.0.5-10.7.0.5"), "{e}");
+        let c = h.claim_new(&l, "x", None).unwrap();
+        assert_eq!(c.ip, new);
+        assert!(h.lend(&l, new, c.gen, 1, "t").unwrap(), "home by the new range: lent here");
+        assert!(!h.lend(&l, old, 7, 2, "t").unwrap(), "the old range is no longer home");
     }
 
     #[test]

@@ -1413,6 +1413,35 @@ def arrival_flood():
     cleanup(n)
 
 
+
+def arrival_cap_restart():
+    """Arrivals outlive their listener (#521): a restarted one counts the earlier one's still
+    going, from their locked `.incoming-*` logs, and refuses one past the peer's quota (4) at
+    once; once they end, a later arrival is taken."""
+    own_listeners("arrival cap restart")
+    src = source_vm()
+    names = [(f"ft-cap-{i}", spare(B, 20 + i)) for i in range(4)]
+    before = arrivals(B)
+    # Prepared, then silent: they hold the quota until their source hangs up.
+    idle = [migrate_in_raw(B, name, ip, src) for name, ip in names]
+    held = arrivals(B) - before
+    check("arrival cap restart: the peer's quota of arrivals prepared", all(r.get("ok") for _, r, _ in idle) and len(held) == len(names),
+          ([r for _, r, _ in idle], held))
+    restart_listeners("arrival cap restart", [B])
+    check("arrival cap restart: the arrivals outlived the old listener", held <= arrivals(B), (held, arrivals(B)))
+    s, r, _ = migrate_in_raw(B, "ft-cap-x", spare(B, 30), src)
+    s.close()
+    check("arrival cap restart: one past the quota refused", not r.get("ok") and "arriving here already" in r.get("error", ""), r)
+    for s, _, _ in idle:
+        s.close()
+    gone = lambda: not arrivals(B) & held and not any(os.path.exists(os.path.join(B.run, "vms", f"{n}.lock")) for n, _ in names)
+    check("arrival cap restart: the arrivals give up once their source hangs up", wait_for(gone, 10), arrivals(B))
+    s, r, _ = migrate_in_raw(B, "ft-cap-x", spare(B, 30), src)
+    check("arrival cap restart: a later arrival is taken", r.get("ok"), r)
+    s.close()
+    lock = os.path.join(B.run, "vms", "ft-cap-x.lock")
+    check("arrival cap restart: and gives up too", wait_for(lambda: not os.path.exists(lock), 10))
+
 def abort_superseded():
     """A migration that aborts after the source paused does not resume the
     source if a newer generation of its address was recorded meanwhile (the
@@ -4152,6 +4181,38 @@ def standby():
     cleanup("ft-sb1")
     cleanup("ft-sb2")
 
+
+
+def standby_vm_ips():
+    """A `--vm-ips` and `--dns` change reaches a standby VM started before it (#521): its claim
+    takes its address from the new range and gives the guest the new DNS server; a VM already
+    running keeps its address."""
+    t, n, old = args.template, "ft-sbips", "ft-sbips-old"
+    was = ok(cli_json(A, "config"))["set"]
+    ok(run(A, old))
+    old_ip = vms(A)[old]["ip"]
+    ok(cli_json(A, "standby", "--template", t, "1"))
+    ready = lambda: {f[:-5] for f in os.listdir(standby_dir(A.run, t)) if f.endswith(".lock") and alive(f[:-5].split("-")[0])}
+    pool = ready()
+    check("standby vm ips: a standby ready before the change", len(pool) == 1, pool)
+    new, dns = spare(A, 1), "192.0.2.53"
+    try:
+        ok(cli_json(A, "config", "--vm-ips", f"{new}-{new}", "--dns", dns))
+        check("standby vm ips: the same standby waits after the change", ready() == pool, (pool, ready()))
+        r = ok(run(A, n))
+        pid = int(next(iter(pool)).split("-")[0])
+        check("standby vm ips: the standby started before the change is claimed", r["standby"] is True and vms(A)[n].get("pid") == pid,
+              (r, vms(A).get(n), pool))
+        check("standby vm ips: its address is from the new range", r["ip"] == new, r)
+        code, conf = sh(A, n, "cat /etc/resolv.conf")
+        check("standby vm ips: the guest has the new DNS server", code == 0 and f"nameserver {dns}" in conf, conf)
+        check("standby vm ips: the running vm keeps its address", vms(A)[old]["ip"] == old_ip and old_ip != new, vms(A)[old])
+    finally:
+        ok(cli_json(A, "standby", "--template", t, "0"))
+        ok(cli_json(A, "config", "--vm-ips", was["vm_ips"], "--dns", was.get("dns") or ""))
+    check("standby vm ips: standbys stopped", wait_for(lambda: not ready(), 30), ready())
+    cleanup(n)
+    cleanup(old)
 
 # --- copy-on-write and incremental checkpoints --------------------------------
 #
@@ -8858,8 +8919,8 @@ SCENARIOS = dict(
     cow_crash=cow_crash, cow_reports_held=cow_reports_held, ckpt_incremental=ckpt_incremental, ckpt_hot=ckpt_hot,
     ckpt_failed_stop=ckpt_failed_stop, ckpt_rearm=ckpt_rearm, ckpt_dir_moved=ckpt_dir_moved,
     leave_fail=leave_fail, capture_fail=capture_fail, abort_gen_fail=abort_gen_fail, commit_fail=commit_fail, commit_fail_routed=commit_fail_routed, abort_stay_fail=abort_stay_fail,
-    prepare_disconnect=prepare_disconnect, prepare_trickle=prepare_trickle, prepare_fail=prepare_fail, arrival_flood=arrival_flood,
-    fc_prepare=fc_prepare, slow_preload=slow_preload, bad_preload=bad_preload, ckpt_packet_hold=ckpt_packet_hold, ckpt_stall=ckpt_stall, standby=standby,
+    prepare_disconnect=prepare_disconnect, prepare_trickle=prepare_trickle, prepare_fail=prepare_fail, arrival_flood=arrival_flood, arrival_cap_restart=arrival_cap_restart,
+    fc_prepare=fc_prepare, slow_preload=slow_preload, bad_preload=bad_preload, ckpt_packet_hold=ckpt_packet_hold, ckpt_stall=ckpt_stall, standby=standby, standby_vm_ips=standby_vm_ips,
     suspend_disk_freed=suspend_disk_freed, resume_mark_fails=resume_mark_fails, suspend_unaddressed=suspend_unaddressed, resume_fence_fails=resume_fence_fails, quarantine_reboot_ls=quarantine_reboot_ls, kill_source=kill_source,
     kill_refused_checkpoint=no_evict(kill_refused_checkpoint), wildcard_listen=wildcard_listen, peer_by_name=peer_by_name, peer_moved=peer_moved, peer_unresolvable=peer_unresolvable, page_refusals=page_refusals,
     forged_peer=forged_peer, forged_pages=forged_pages, restore_ip_peer=restore_ip_peer, spoof_filter=spoof_filter, late_withdrawal=late_withdrawal, unlend_retry=unlend_retry,

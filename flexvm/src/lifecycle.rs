@@ -138,7 +138,7 @@ impl Proc {
         }
         let res = match fault("readdress_fail") {
             true => Err("injected fault: setting the address failed".into()),
-            false => vm.guest_net(vm.ip, self.host.cfg.dns.as_deref()),
+            false => vm.guest_net(vm.ip, self.host.config_now().dns.as_deref()),
         };
         match res {
             Ok(()) => {
@@ -353,7 +353,7 @@ impl Proc {
             Some(ip) => Some(ip.parse().map_err(|_| format!("bad address {ip:?}"))?),
             None => Some(ck.manifest.ip),
         };
-        let claim = match want.filter(|&ip| !self.host.cfg.range().is_ok_and(|r| r.contains(ip))) {
+        let claim = match want.filter(|&ip| !self.host.config_now().range().is_ok_and(|r| r.contains(ip))) {
             Some(ip) => self.borrow(&name, ip)?,
             None => self.host.claim_new(&self.host.lock()?, &name, want).map_err(|e| format!("{e}; restore with --ip auto (or another address)"))?,
         };

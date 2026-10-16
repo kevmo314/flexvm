@@ -160,7 +160,7 @@ STATE (default /var/lib/flexvm, on disk)
 RUN (default /run/flexvm, tmpfs)
   vms/NAME.{lock,json,sock,log}   registry entry, liveness lock, control socket, log of -d/standby VMs
   vms/NAME.{failed,moved}         why a VM died (until `flexvm kill`); where it migrated to (an hour)
-  vms/.incoming-LPID-N.log        an arrival's log until it is accepted (as NAME.log) or refused; locked by the arrival
+  vms/.incoming-LPID-N-PEER.log   an arrival's log until it is accepted (as NAME.log) or refused; locked by the arrival
   state.json             canonical state path, claimed on first open by a hard link (one state wins a race)
   .gc, .gc.lock          when garbage was last swept periodically; one sweep at a time
   .logs.lock             logs are opened holding it shared, swept holding it exclusively

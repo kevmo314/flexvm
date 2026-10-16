@@ -21,6 +21,16 @@ use crate::util::{send_json, Result, Slot};
 /// Requests handled at once; more connections are closed unanswered.
 const MAX_ACTIVE: usize = 512;
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+/// Of those, requests that take the host lock (`route`, `lend`, `migration`); more are
+/// refused as busy. The rest stay for requests that need none, page handoffs above all,
+/// however long the lock's holder keeps it (a stalled disk, a stopped VM process).
+const MAX_LOCKING: usize = MAX_ACTIVE * 3 / 4;
+static LOCKING: AtomicUsize = AtomicUsize::new(0);
+/// How long such a request waits for the host lock: its peer gives up on the call by then
+/// (`vmproc::peer_call`), and asks again.
+const LOCK_WAIT: Duration = Duration::from_secs(2);
+/// What a request that took the host lock too long, or found no room, is answered.
+const BUSY: &str = "host busy, try again";
 /// Arrival processes from their start until they commit or are refused (or end), in all
 /// and from any one peer address; more arrivals are refused at once, before their source
 /// pauses anything.
@@ -74,9 +84,16 @@ impl Waiting {
     }
 
     fn take(&self, from: IpAddr) -> Option<Wait> {
+        self.take_besides(from, &HashMap::new())
+    }
+
+    /// Counting `others` too: held elsewhere, by address.
+    fn take_besides(&self, from: IpAddr, others: &HashMap<IpAddr, usize>) -> Option<Wait> {
         let from = from.to_canonical();
         let mut w = self.held.lock().unwrap();
-        if w.values().sum::<usize>() >= self.max || w.get(&from).is_some_and(|&n| n >= self.max_from) {
+        let of = |m: &HashMap<IpAddr, usize>| m.get(&from).copied().unwrap_or(0);
+        let total = w.values().sum::<usize>() + others.values().sum::<usize>();
+        if total >= self.max || of(&w) + of(others) >= self.max_from {
             return None;
         }
         *w.entry(from).or_default() += 1;
@@ -428,9 +445,12 @@ pub fn activated() -> Option<TcpListener> {
 fn handle(host: &Host, peers: &Peers, mut conn: TcpStream, deadline: Instant) -> Result<()> {
     let line = read_line_by(&conn, deadline)?;
     let req: Value = serde_json::from_slice(&line)?;
-    let reply = match req["op"].as_str().unwrap_or("") {
+    let op = req["op"].as_str().unwrap_or("");
+    let locking = matches!(op, "migration" | "route" | "lend").then(|| Slot::take(&LOCKING, MAX_LOCKING));
+    let reply = match op {
         "migrate_in" => return incoming(host, &req, &line, conn, deadline - REQUEST_DEADLINE + PREPARE_WAIT),
         "pages" => return pages(host, &req, conn),
+        _ if matches!(locking, Some(None)) => Err(BUSY.into()),
         "migration" => migration(host, &req),
         // Its peers by address, those configured by name too, and the one asking.
         "route" => peers
@@ -504,8 +524,9 @@ fn incoming(host: &Host, req: &Value, line: &[u8], conn: TcpStream, by: Instant)
         return Ok(());
     }
     // Refused before anything is made: the source has paused nothing yet, and its VM runs on.
-    let from = conn.peer_addr()?.ip();
-    let Some(slot) = ARRIVALS.take(from) else {
+    // Arrivals an earlier listener started (they outlive it) count too.
+    let from = conn.peer_addr()?.ip().to_canonical();
+    let Some(slot) = ARRIVALS.take_besides(from, &earlier_arrivals(host)) else {
         let why = format!("too many migrations are arriving here already (at most {MAX_ARRIVALS}, {MAX_ARRIVALS_FROM} from one peer); try again later");
         refuse(&conn, why)?;
         return Ok(());
@@ -518,8 +539,10 @@ fn incoming(host: &Host, req: &Value, line: &[u8], conn: TcpStream, by: Instant)
     // must not remove the running VM's log.
     static ARRIVAL: AtomicUsize = AtomicUsize::new(0);
     // Locked for the arrival's life (its stdout shares the lock), so a dead
-    // arrival's log is told from a live one's and swept (`gc`).
-    let log_path = host.run.join("vms").join(format!("{}{}-{}.log", crate::gc::ARRIVAL_LOG, std::process::id(), ARRIVAL.fetch_add(1, Ordering::Relaxed)));
+    // arrival's log is told from a live one's and swept (`gc`), and a later
+    // listener counts it, by its peer (`earlier_arrivals`).
+    let n = ARRIVAL.fetch_add(1, Ordering::Relaxed);
+    let log_path = host.run.join("vms").join(format!("{}{}-{n}-{from}.log", crate::gc::ARRIVAL_LOG, std::process::id()));
     let log = std::fs::OpenOptions::new().create_new(true).append(true).open(&log_path)?;
     crate::host::flock(&log, libc::LOCK_SH)?;
     let args = ["--state".as_ref(), host.state.as_os_str(), "--run".as_ref(), host.run.as_os_str(), "run".as_ref(), "--incoming".as_ref()];
@@ -548,6 +571,25 @@ fn incoming(host: &Host, req: &Value, line: &[u8], conn: TcpStream, by: Instant)
     Ok(())
 }
 
+/// Live arrivals that other listener processes started (an earlier one, before a
+/// restart), by peer: their `.incoming-LPID-N-PEER.log` files, each locked for its
+/// arrival's life. One with no peer in its name counts toward the total only.
+fn earlier_arrivals(host: &Host) -> HashMap<IpAddr, usize> {
+    let me = std::process::id().to_string();
+    let mut n = HashMap::new();
+    for e in std::fs::read_dir(host.run.join("vms")).into_iter().flatten().flatten() {
+        let name = e.file_name();
+        let Some(rest) = name.to_str().and_then(|f| f.strip_prefix(crate::gc::ARRIVAL_LOG)?.strip_suffix(".log")) else { continue };
+        let mut parts = rest.splitn(3, '-');
+        if parts.next() == Some(me.as_str()) || crate::util::locked(&e.path(), libc::LOCK_EX) != Some(true) {
+            continue;
+        }
+        let peer = parts.nth(1).and_then(|p| p.parse::<IpAddr>().ok()).unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        *n.entry(peer.to_canonical()).or_default() += 1;
+    }
+    n
+}
+
 /// Publish only an accepted arrival's log. A refused arrival owns only its
 /// temporary file, even when the requested name already belongs to a VM.
 pub fn finish_incoming_log(host: &Host, name: &str, log: &std::path::Path, accepted: bool) -> Result<()> {
@@ -571,11 +613,21 @@ fn pages(host: &Host, req: &Value, conn: TcpStream) -> Result<()> {
     Ok(())
 }
 
+/// The host lock, waited for `LOCK_WAIT` at most: then refused as busy.
+fn host_lock(host: &Host) -> Result<crate::host::Locked> {
+    host.lock_by(Some(Instant::now() + LOCK_WAIT)).map_err(|e| match e.downcast_ref::<std::io::Error>().map(|e| e.kind()) {
+        Some(std::io::ErrorKind::WouldBlock) => BUSY.into(),
+        _ => e,
+    })
+}
+
 fn migration(host: &Host, req: &Value) -> Result<Value> {
     if fault("status") {
         bail!("injected fault: migration status unavailable");
     }
     let mig = req["mig"].as_u64().ok_or("missing mig")?;
+    // Held through `mig_done` or `mig_status`, which take it again (reentrant) without waiting.
+    let _l = host_lock(host)?;
     if req["done"] == json!(true) {
         if host.mig_done(mig)? {
             crate::log!("migration {mig}: its source says done; forgetting it");
@@ -588,7 +640,7 @@ fn migration(host: &Host, req: &Value) -> Result<Value> {
 
 fn lend(host: &Host, req: &Value) -> Result<Value> {
     let ip: Ipv4Addr = req["ip"].as_str().ok_or("missing ip")?.parse()?;
-    let gen = host.lend_new(&host.lock()?, ip)?;
+    let gen = host.lend_new(&host_lock(host)?, ip)?;
     Ok(json!({"ip": ip.to_string(), "gen": gen}))
 }
 
@@ -614,7 +666,7 @@ fn route(host: &Host, req: &Value, peers: &[IpAddr]) -> Result<Value> {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
-    let l = host.lock()?;
+    let l = host_lock(host)?;
     if !host.observe(&l, ip, gen, rev, via)? {
         return Ok(json!({"ip": ip.to_string(), "stale": true}));
     }
@@ -766,6 +818,94 @@ mod tests {
         refused("cannot start the vm process");
         crate::util::NO_REAPER.with(|n| n.set(false));
         assert_eq!(held(), 0);
+    }
+
+    /// Arrivals an earlier listener started outlive it: a restarted one counts their
+    /// locked logs, by peer, and admits none past either bound (#521).
+    #[test]
+    fn arrivals_an_earlier_listener_started_count_against_both_bounds() {
+        let root = crate::test_util::TempDir::new("arrivals-earlier");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let vms = host.run.join("vms");
+        let line = br#"{"op":"migrate_in","name":"web"}"#;
+        // Each held as its arrival holds it; `None`: dead, unlocked. An arrival that
+        // ends is taken away by its name (a lock let go may linger a moment in a child
+        // another test forks meanwhile).
+        let log = |name: String, live: bool| {
+            let f = std::fs::File::create(vms.join(&name)).unwrap();
+            live.then(|| (crate::host::flock(&f, libc::LOCK_SH).map(|()| f).unwrap(), vms.join(name)))
+        };
+        let end = |logs: Vec<Option<(std::fs::File, std::path::PathBuf)>>| logs.into_iter().flatten().for_each(|(_, p)| std::fs::remove_file(p).unwrap());
+        let refused = |why: &str| {
+            let (client, server) = pair();
+            incoming(&host, &serde_json::from_slice(line).unwrap(), line, server, Instant::now() + PREPARE_WAIT).unwrap();
+            let reply = crate::util::recv_json(&mut std::io::BufReader::new(&client)).unwrap().unwrap();
+            assert_eq!(reply["ok"], false);
+            assert!(reply["error"].as_str().unwrap().contains(why), "{reply}");
+        };
+        let other = std::process::id() + 1;
+        // This one's own and dead ones do not count: the memory has the former.
+        let mut held: Vec<_> = (0..MAX_ARRIVALS_FROM).map(|i| log(format!(".incoming-{}-{i}-127.0.0.1.log", std::process::id()), true)).collect();
+        held.extend((0..MAX_ARRIVALS).map(|i| log(format!(".incoming-{other}-{}-127.0.0.1.log", 100 + i), false)));
+        assert!(earlier_arrivals(&host).is_empty());
+        let mine: Vec<_> = (0..MAX_ARRIVALS_FROM).map(|i| log(format!(".incoming-{other}-{i}-127.0.0.1.log"), true)).collect();
+        assert_eq!(earlier_arrivals(&host), HashMap::from([("127.0.0.1".parse().unwrap(), MAX_ARRIVALS_FROM)]));
+        refused("arriving here already");
+        // The peer's quota is free again; others' arrivals (one of an older name, with
+        // no peer) fill the total.
+        end(mine);
+        let mut others: Vec<_> = (1..MAX_ARRIVALS).map(|i| log(format!(".incoming-{other}-{i}-10.9.0.{i}.log"), true)).collect();
+        others.push(log(format!(".incoming-{other}-0.log"), true));
+        assert_eq!(earlier_arrivals(&host).values().sum::<usize>(), MAX_ARRIVALS);
+        refused("arriving here already");
+        end(others);
+        assert!(earlier_arrivals(&host).is_empty());
+    }
+
+    /// Requests that take the host lock wait for it a bounded time and then are told the
+    /// host is busy; past their own budget they are told so at once, while page
+    /// handoffs, which need no host lock, are still answered (#521).
+    #[test]
+    fn host_lock_waits_are_bounded_and_leave_page_handoffs_room() {
+        use std::io::Write;
+        let root = crate::test_util::TempDir::new("listen-busy");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let ask = |req: Value| {
+            let (client, server) = pair();
+            let (start, mut line) = (Instant::now(), req.to_string().into_bytes());
+            line.push(b'\n');
+            (&client).write_all(&line).unwrap();
+            handle(&host, &Peers::default(), server, Instant::now() + REQUEST_DEADLINE).unwrap();
+            let reply = crate::util::recv_json(&mut std::io::BufReader::new(&client)).unwrap().unwrap();
+            (reply, start.elapsed())
+        };
+        let requests = [json!({"op": "lend", "ip": "10.200.0.7"}), json!({"op": "migration", "mig": 7}), json!({"op": "route", "ip": "10.200.0.8", "gen": 3})];
+        // Held by another process, as one stopped while holding it would.
+        let held = std::fs::File::create(host.state.join("lock")).unwrap();
+        crate::host::flock(&held, libc::LOCK_EX).unwrap();
+        std::thread::scope(|s| {
+            let waits: Vec<_> = requests.iter().map(|r| s.spawn(|| ask(r.clone()))).collect();
+            for w in waits {
+                let (reply, took) = w.join().unwrap();
+                assert_eq!(reply["error"], BUSY, "{reply}");
+                assert!(took >= LOCK_WAIT && took < LOCK_WAIT + Duration::from_secs(2), "{took:?}");
+            }
+        });
+        // Its budget taken: refused at once, the lock never waited for.
+        let full: Vec<_> = std::iter::from_fn(|| Slot::take(&LOCKING, MAX_LOCKING)).collect();
+        assert!(full.len() <= MAX_LOCKING && Slot::take(&LOCKING, MAX_LOCKING).is_none());
+        for r in &requests {
+            let (reply, took) = ask(r.clone());
+            assert!(reply["error"] == BUSY && took < Duration::from_secs(1), "{reply} {took:?}");
+        }
+        // Answered (its refusal then drains what the client sent, `vmproc::refuse_pages`).
+        let (reply, _) = ask(json!({"op": "pages", "name": "web", "mig": 7}));
+        assert!(reply["error"].as_str().unwrap().contains("not the source"), "{reply}");
+        drop(full);
+        drop(held);
+        // Lent once free (other tests' hosts share this process's lock threads: a few tries).
+        let reply = (0..5).map(|_| ask(requests[0].clone()).0).find(|r| r["error"] != BUSY).expect("lent");
+        assert_eq!(reply["result"]["ip"], "10.200.0.7", "{reply}");
     }
 
     #[test]
