@@ -844,6 +844,9 @@ impl Proc {
     }
 
     pub fn start_guest(&self, t: &mut Phases) -> Result<Value> {
+        // Publication makes the VM discoverable to control callers. Bind first;
+        // requests can queue behind the start operation until guest setup finishes.
+        self.serve_control()?;
         let vm = self.vm().clone();
         self.publish();
         t.mark("register");
@@ -869,25 +872,18 @@ impl Proc {
         }))
     }
 
-    pub fn serve_control(self: &Arc<Self>) {
+    pub fn serve_control(&self) -> Result<()> {
         let mut serving = self.serving.lock().unwrap();
         if *serving {
-            return;
+            return Ok(());
         }
-        let sock = match self.host.sock(&self.name()) {
-            Ok(sock) => sock,
-            Err(e) => return crate::log!("vm {}: no control socket: {e}", self.name()),
-        };
+        let p = self.arc().ok_or("vm process gone")?;
+        let sock = self.host.sock(&self.name())?;
         let _ = std::fs::remove_file(&sock);
-        let l = match UnixListener::bind(&sock) {
-            Ok(l) => l,
-            Err(e) => return crate::log!("vm {}: no control socket at {}: {e}", self.name(), sock.display()),
-        };
+        let l = UnixListener::bind(&sock).map_err(|e| format!("vm {}: no control socket at {}: {e}", self.name(), sock.display()))?;
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600));
-        *serving = true;
-        let p = self.clone();
-        thread::spawn(move || {
+        thread::Builder::new().spawn(move || {
             for c in l.incoming() {
                 let c = match c {
                     Ok(c) => c,
@@ -907,12 +903,13 @@ impl Proc {
                     crate::log!("control: cannot start a connection's thread: {e}");
                 }
             }
-        });
+        })?;
+        *serving = true;
+        Ok(())
     }
 
     /// Never returns: the main thread spawned Firecracker, which dies with it.
     fn serve(self: &Arc<Self>) -> ! {
-        self.serve_control();
         let spawn = |f: fn(Arc<Proc>)| {
             let p = self.clone();
             thread::spawn(move || f(p));
@@ -1619,11 +1616,12 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
         }
         Start::Standby { template } => crate::standby::serve(&p, &template, &mut notify, &op),
     };
-    if res.is_ok() {
-        p.serve_control();
+    let res = res.and_then(|v| {
+        p.serve_control()?;
         // Once running (a standby once claimed), so a start never competes with a refill.
         crate::standby::maintain(p.host.clone());
-    }
+        Ok(v)
+    });
     let reply = match &res {
         Ok(v) => json!({"ok": true, "result": v}),
         Err(e) => json!({"ok": false, "error": e.to_string()}),
@@ -2764,6 +2762,38 @@ mod tests {
         std::os::unix::fs::symlink(".gen/a", root.join("templates/default")).unwrap();
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
         (Proc::new(host, Paths::new(&root)).unwrap(), root)
+    }
+
+    #[test]
+    fn control_is_bound_synchronously_and_repeated_serving_keeps_the_listener() {
+        use std::os::unix::fs::MetadataExt;
+        let (p, _root) = test_proc("control-bind");
+        p.set_name(p.host.take_name("bound", false).unwrap());
+        let sock = p.host.sock("bound").unwrap();
+        p.serve_control().unwrap();
+        let inode = std::fs::metadata(&sock).unwrap().ino();
+        p.serve_control().unwrap();
+        assert_eq!(std::fs::metadata(&sock).unwrap().ino(), inode);
+        let mut c = UnixStream::connect(sock).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        send_json(&mut c, &json!({"op": "unknown"})).unwrap();
+        let reply = crate::util::recv_json(&mut BufReader::new(c)).unwrap().unwrap();
+        assert_eq!(reply["error"], "unknown op \"unknown\"");
+    }
+
+    #[test]
+    fn start_fails_before_publication_when_control_cannot_bind() {
+        let (p, _root) = test_proc("control-bind-fails");
+        p.set_name(p.host.take_name("blocked", false).unwrap());
+        let sock = p.host.sock("blocked").unwrap();
+        std::fs::create_dir(&sock).unwrap();
+        // No VM is needed: binding must fail before start_guest can publish it.
+        let e = p.start_guest(&mut Phases::new()).unwrap_err();
+        assert!(e.to_string().contains("no control socket"), "{e}");
+        assert!(!*p.serving.lock().unwrap());
+        assert!(!p.host.vms("blocked", "json").unwrap().exists());
+        std::fs::remove_dir(sock).unwrap();
+        p.serve_control().unwrap();
     }
 
     #[test]

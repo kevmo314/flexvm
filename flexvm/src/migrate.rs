@@ -532,7 +532,7 @@ impl Proc {
         };
         let revoked = Arc::new(Mutex::new(false));
         *self.held_in.lock().unwrap() = Some(revoked.clone());
-        self.serve_control();
+        self.serve_control()?;
         if fault("lost_ack") {
             let _ = w.shutdown(std::net::Shutdown::Both);
         } else {

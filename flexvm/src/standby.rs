@@ -452,7 +452,6 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
                 p.forget_stop();
                 crate::host::gate("claim_stall");
                 let _ = std::fs::remove_file(&sock);
-                p.serve_control();
                 // A claimer gone before its answer (a foreground `run` interrupted) would leave
                 // the VM running with no one to stop it: it goes, as a cold foreground run's would.
                 if let Err(e) = send_json(&mut &c, &json!({"ok": true, "result": v})) {
@@ -517,6 +516,9 @@ fn claim(p: &Arc<Proc>, req: &Value) -> std::result::Result<Value, (Error, bool)
         p.standby.lock().unwrap().take();
         not_run(format!("resuming a standby vm failed: {e}").into(), true)
     })?;
+    // Separate netlink preparation from the generation fence (which can wait
+    // for the host lock). Neither belongs to the route replacement below.
+    t.mark("neighbour");
     let still = host.fence(claim.ip, claim.gen).map_err(|e| not_run(e, false))?;
     let paused = p.standby.lock().unwrap().take().ok_or_else(|| not_run("standby vm gone".into(), true))?;
     let vm = resume(paused, name, claim.ip, index, fault("resume_kill"), &mut t).map_err(|(e, ran)| {
@@ -676,6 +678,7 @@ fn load(idle: Firecracker, template: Arc<Template>) -> Result<Prepared> {
 /// On failure the flag says whether the guest may have run for `name` (the
 /// resume may have reached Firecracker).
 fn resume(p: Prepared, name: &str, ip: Ipv4Addr, index: u32, kill: bool, t: &mut Phases) -> std::result::Result<Arc<Vm>, (Error, bool)> {
+    t.mark("fence");
     crate::net::route_dev(true, ip, index).map_err(|e| (e, false))?;
     t.mark("route");
     let res = p.firecracker().resume(API_TIMEOUT);
