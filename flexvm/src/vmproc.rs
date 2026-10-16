@@ -248,7 +248,7 @@ impl Proc {
             crate::host::reap(&host.run, &old)?;
         }
         let _ = std::fs::remove_dir_all(&work);
-        std::fs::create_dir_all(&work)?;
+        crate::host::host_dir(&work, 0o700)?;
         crate::host::store(&work.join("owner"), &ident, false)?;
         crate::host::clear_taps(&host.run, &ident);
         let tap_prefix = format!("{}{:x}t", host.tap_prefix(), ident.pid);
@@ -731,7 +731,7 @@ impl Proc {
             (End::NotStarted, Some(a)) if a.fresh => self.withdraw(a),
             (End::Moved(to), _) => {
                 if let Ok(moved) = self.host.vms(&self.name(), "moved") {
-                    let _ = std::fs::write(moved, &to);
+                    let _ = crate::host::write_record(&moved, to.as_bytes());
                 }
                 crate::log!("vm {}: moved to {to}", self.name());
             }
@@ -1352,7 +1352,7 @@ impl Proc {
         let why = format!("{}; {}", vm.pager.failed().unwrap_or("its firecracker exited"), vm.post_mortem());
         crate::log!("vm {}: died: {why}", vm.name);
         if let Ok(failed) = self.host.vms(&vm.name, "failed") {
-            let _ = std::fs::write(failed, &why);
+            let _ = crate::host::write_record(&failed, why.as_bytes());
         }
         self.finish(op, End::Died, DIED, None)
     }
@@ -2261,7 +2261,7 @@ fn relieve(host: &Host, avail: Option<u64>, starved_here: bool, stopping: &mut O
     let Ok(lock) = crate::host::Flock::new(lock, libc::LOCK_EX | libc::LOCK_NB) else { return };
     let pressure = avail < until && (evicting || avail < at);
     if pressure && !evicting {
-        let _ = std::fs::write(&active, b"");
+        let _ = crate::host::write_record(&active, b"");
         crate::log!("host has {avail} MiB available, under its {at} MiB high-water mark ({reserve} MiB reserve): moving vms to peers until it has {until} MiB");
     } else if !pressure && evicting {
         let _ = std::fs::remove_file(&active);
@@ -2286,7 +2286,7 @@ fn relieve(host: &Host, avail: Option<u64>, starved_here: bool, stopping: &mut O
     if vms.is_empty() {
         return;
     }
-    let _ = std::fs::write(&last, b"");
+    let _ = crate::host::write_record(&last, b"");
     EVICTING.store(true, Ordering::SeqCst);
     let host = host.clone();
     thread::spawn(move || {
@@ -2337,7 +2337,7 @@ fn stop_standby(host: &Host, avail: u64, reserve: u64, stopping: &mut Option<Sto
     if fds.is_empty() {
         return false;
     }
-    let _ = std::fs::write(crate::standby::pressure(host), b"");
+    let _ = crate::host::write_record(&crate::standby::pressure(host), b"");
     *stopping = Some(Stopping { lock: Some(lock), fds, by: Instant::now() + Duration::from_secs(1) });
     true
 }

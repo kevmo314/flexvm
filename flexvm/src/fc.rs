@@ -183,10 +183,7 @@ impl Firecracker {
 /// Firecracker gets pipe writers only, so guest output cannot bypass log rotation.
 fn spawn_logged(mut cmd: Command, dir: &Path) -> std::io::Result<(Child, std::thread::JoinHandle<()>)> {
     let log = dir.join("firecracker.log");
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        File::options().write(true).create(true).truncate(true).mode(0o600).open(&log)?;
-    }
+    crate::host::write_record(&log, b"")?;
     let (mut reader, writer) = std::io::pipe()?;
     cmd.stdout(writer.try_clone()?).stderr(writer);
     let child = crate::util::unblock_signals_in(&mut cmd).spawn()?;
@@ -464,7 +461,7 @@ impl Spawner {
             let (t, owner) = (tap.clone(), self.tap_owner.clone());
             std::thread::spawn(move || crate::net::create_tap(&t, &owner))
         };
-        let fc = std::fs::create_dir_all(&dir).map_err(Into::into).and_then(|()| Firecracker::spawn(&self.bin, &dir, self.sockets.allocate()?, ready));
+        let fc = crate::host::host_dir(&dir, 0o700).map_err(Into::into).and_then(|()| Firecracker::spawn(&self.bin, &dir, self.sockets.allocate()?, ready));
         let made = made.join().unwrap_or_else(|_| Err("tap thread panicked".into()));
         // A Firecracker without its tap is dropped (killed) here, before `release`.
         let fc = fc.and_then(|fc| made.map(|()| fc)).inspect_err(|_| release(&tap, cgroup.as_deref(), &dir));
@@ -476,7 +473,9 @@ impl Spawner {
         // device did (#149). Metrics can only be configured before a load.
         if crate::host::faults_on() {
             let path = dir.join("metrics.json");
-            if let Err(e) = File::create(&path).map_err(Into::into).and_then(|_| fc.put("/metrics", serde_json::json!({"metrics_path": path}))) {
+            if let Err(e) =
+                crate::host::write_record(&path, b"").map_err(Into::into).and_then(|_| fc.put("/metrics", serde_json::json!({"metrics_path": path})))
+            {
                 crate::log!("firecracker {}: no metrics: {e}", fc.pid());
             }
         }

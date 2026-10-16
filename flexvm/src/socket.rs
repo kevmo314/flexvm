@@ -46,8 +46,7 @@ fn base_dir(base: &Path) -> io::Result<()> {
         fs::set_permissions(parent, fs::Permissions::from_mode(0o755))?;
     }
     let m = fs::symlink_metadata(parent)?;
-    let euid = unsafe { libc::geteuid() };
-    if !m.is_dir() || (m.uid() != 0 && m.uid() != euid) || (m.mode() & 0o022 != 0 && m.mode() & libc::S_ISVTX == 0) {
+    if !m.is_dir() || !crate::host::guarded(m.uid(), m.mode(), true) {
         return Err(denied(parent, "must be a real directory that only root or this user can change"));
     }
     match DirBuilder::new().mode(0o700).create(base) {

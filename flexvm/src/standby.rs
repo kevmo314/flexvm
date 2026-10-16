@@ -35,7 +35,7 @@ pub(crate) fn dir(host: &Host, template: &str) -> PathBuf {
 /// Its `.template` (the name, for `templates`) is written once: a rewrite per refill could race another thread's.
 fn create_dir(host: &Host, template: &str) -> Result<PathBuf> {
     let d = dir(host, template);
-    std::fs::create_dir_all(&d)?;
+    crate::host::host_dir(&d, 0o755)?;
     if std::fs::read(d.join(".template")).ok().as_deref() != Some(template.as_bytes()) {
         crate::util::write_file(&d, ".template", template.as_bytes(), false)?;
     }
@@ -55,16 +55,28 @@ pub fn target(host: &Host, template: &str) -> usize {
     std::fs::read_to_string(host.state.join("standby").join(template)).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0)
 }
 
+/// `dir` (or its locks, `locks`), if only root or this user may write it: its sockets and locks name the processes signalled.
+fn trusted(host: &Host, template: &str, locks: bool) -> Option<PathBuf> {
+    let d = dir(host, template);
+    let d = if locks { crate::host::locks(&d) } else { d };
+    match crate::host::trusted_dir(d.parent()?).and_then(|()| crate::host::trusted_dir(&d)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => crate::log!("standby {template}: ignored: {e}"),
+        r => return r.ok().map(|()| d),
+    }
+    None
+}
+
 /// The live standby processes of `template`, oldest first.
 pub fn live(host: &Host, template: &str) -> Vec<Ident> {
     let mut ids = Vec::new();
-    for e in std::fs::read_dir(crate::host::locks(&dir(host, template))).into_iter().flatten().flatten() {
+    let Some(d) = trusted(host, template, true) else { return ids };
+    for e in std::fs::read_dir(d).into_iter().flatten().flatten() {
         let name = e.file_name();
         let name = name.to_string_lossy();
         if name.starts_with('.') || !name.ends_with(".lock") {
             continue;
         }
-        let Ok(f) = File::open(e.path()) else { continue };
+        let Ok(f) = crate::host::open_record(&e.path()) else { continue };
         if flock(&f, libc::LOCK_SH | libc::LOCK_NB).is_ok() {
             let _ = std::fs::remove_file(e.path());
         } else if let Some(id) = std::io::read_to_string(&f).ok().and_then(|s| serde_json::from_str::<Ident>(&s).ok()) {
@@ -77,7 +89,7 @@ pub fn live(host: &Host, template: &str) -> Vec<Ident> {
 
 /// `live`, less those mid-claim (`PID-START.claim` locked; START keeps a reused pid's apart): a stop would not end them.
 pub fn stoppable(host: &Host, template: &str) -> Vec<Ident> {
-    let d = crate::host::locks(&dir(host, template));
+    let Some(d) = trusted(host, template, true) else { return Vec::new() };
     let claiming = |id: &Ident| locked(&d.join(format!("{}.claim", id.key())), libc::LOCK_SH) == Some(true);
     live(host, template).into_iter().filter(|id| !claiming(id)).collect()
 }
@@ -152,7 +164,7 @@ pub fn refill_round(host: &Host) {
             continue;
         }
         if let Err(e) = refill_by(host, &template, false, true) {
-            let _ = std::fs::write(&failed, b"");
+            let _ = crate::host::write_record(&failed, b"");
             // As its standby VMs write it: capped, to whichever file is current.
             let path = dir(host, &template).join("standby.log");
             let line = format!("standby {template}: refill: {e}\n");
@@ -200,7 +212,7 @@ fn refill_by(host: &Host, template: &str, wait: bool, cooldown: bool) -> Result<
     let mut ready = Vec::new();
     let log = {
         use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(d.join("standby.log"))?
+        std::fs::OpenOptions::new().create(true).append(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(d.join("standby.log"))?
     };
     let mib = grant_mib(host, template);
     // A failed start ends the round, but those started before it are still waited for.
@@ -573,7 +585,8 @@ fn claim(p: &Arc<Proc>, req: &Value) -> std::result::Result<Value, (Error, bool)
 /// no answer (by `CLAIM_TIMEOUT`) is then an error, never a reason to start it again.
 pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]) -> Result<Option<(Value, BufReader<UnixStream>)>> {
     let Ok(key) = key(paths, template) else { return Ok(None) };
-    let mut socks: Vec<PathBuf> = std::fs::read_dir(dir(host, template))
+    let Some(d) = trusted(host, template, false) else { return Ok(None) };
+    let mut socks: Vec<PathBuf> = std::fs::read_dir(d)
         .into_iter()
         .flatten()
         .flatten()
@@ -983,6 +996,36 @@ mod tests {
         File::create(&stale).unwrap();
         assert_eq!(live(&host, "default"), [me]);
         assert!(!stale.exists() && path.exists());
+    }
+
+    #[test]
+    fn planted_standby_records_name_no_one_to_signal() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::test_util::TempDir::new("standby-planted");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let (d, mut victim) = (dir(&host, "default"), std::process::Command::new("sleep").arg("100").spawn().unwrap());
+        let locks = crate::host::locks(&d);
+        crate::host::private_dir(&locks).unwrap();
+        let id = Ident::of(victim.id()).unwrap();
+        let (record, elsewhere) = (locks.join(format!("{}.lock", id.key())), root.join("elsewhere.lock"));
+        let lock = File::create(&elsewhere).unwrap();
+        crate::host::flock(&lock, libc::LOCK_EX).unwrap();
+        lock.write_all_at(&serde_json::to_vec(&id).unwrap(), 0).unwrap();
+        std::fs::hard_link(&elsewhere, &record).unwrap();
+        let mode = |p: &std::path::Path, m| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+        assert_eq!(live(&host, "default"), [id.clone()], "a safe record is believed");
+        for (path, unsafe_mode, safe) in [(&d, 0o777, 0o755), (&locks, 0o770, 0o700), (&locks, 0o707, 0o700), (&record, 0o666, 0o644), (&record, 0o664, 0o644)]
+        {
+            mode(path, unsafe_mode);
+            assert!(live(&host, "default").is_empty() && stoppable(&host, "default").is_empty(), "{} {unsafe_mode:o}", path.display());
+            mode(path, safe);
+        }
+        std::fs::remove_file(&record).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &record).unwrap();
+        assert!(live(&host, "default").is_empty(), "never through a link");
+        assert!(victim.try_wait().unwrap().is_none());
+        victim.kill().unwrap();
+        victim.wait().unwrap();
     }
 
     #[test]

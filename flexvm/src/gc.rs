@@ -104,7 +104,7 @@ pub fn first_boot_warning(host: &Host, boot: &str) -> bool {
 /// each template's standby VMs refilled: `flexvm recover`, a listener as it starts, the first
 /// command after a boot.
 pub fn recover(host: &Host) {
-    let _ = std::fs::write(host.run.join(".gc"), b"");
+    let _ = crate::host::write_record(&host.run.join(".gc"), b"");
     sweep(host);
     crate::standby::refill_round(host);
 }
@@ -113,7 +113,7 @@ pub fn recover(host: &Host) {
 pub fn sweep_due(host: &Host) {
     let stamp = host.run.join(".gc");
     if age(&stamp).is_none_or(|a| a >= EVERY) {
-        let _ = std::fs::write(&stamp, b"");
+        let _ = crate::host::write_record(&stamp, b"");
         sweep(host);
     }
 }

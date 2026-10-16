@@ -415,7 +415,7 @@ pub fn trusted_file(path: &Path) -> Option<std::fs::File> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let f = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path).ok()?;
     let m = f.metadata().ok()?;
-    if !m.is_file() || (m.uid() != 0 && m.uid() != unsafe { libc::geteuid() }) || m.mode() & 0o022 != 0 {
+    if !m.is_file() || !crate::host::guarded(m.uid(), m.mode(), false) {
         crate::log!("{}: ignored: not a regular file owned by root or this user, writable by no one else", path.display());
         return None;
     }
@@ -1023,7 +1023,8 @@ pub fn write_tag() -> String {
 /// Durably: the file is fsynced before the rename, its directory after.
 pub fn write_file(dir: &Path, name: &str, data: &[u8], durable: bool) -> io::Result<()> {
     let tmp = dir.join(format!(".{name}.{}.tmp", write_tag()));
-    let mut f = std::fs::File::create(&tmp)?;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::File::options().write(true).create(true).truncate(true).mode(0o644).custom_flags(libc::O_NOFOLLOW).open(&tmp)?;
     let res = (|| {
         f.write_all(data)?;
         if durable {
@@ -2181,7 +2182,7 @@ pub mod output {
     use std::fs::File;
     use std::io::{Read, Write};
     use std::os::fd::{AsRawFd, FromRawFd, RawFd};
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
     use std::thread::JoinHandle;
@@ -2230,7 +2231,13 @@ pub mod output {
             return;
         }
         // Given up, unless a retarget replaced it meanwhile.
-        let log = || LOG.lock().unwrap().as_ref().and_then(|p| File::options().create(true).append(true).open(p).ok()).map(Arc::new);
+        let log = || {
+            LOG.lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|p| File::options().create(true).append(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(p).ok())
+                .map(Arc::new)
+        };
         let fallback = {
             let mut targets = TARGETS.lock().unwrap();
             if targets[i].as_ref().map(Arc::as_ptr) == target.as_ref().map(Arc::as_ptr) {
@@ -2276,7 +2283,7 @@ pub mod output {
     /// sharing it); a regular file, a socket or one that cannot be reopened (a /dev/tty away
     /// from its terminal: a claimer passes its own) is kept as is.
     pub fn own(f: File) -> File {
-        use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+        use std::os::unix::fs::FileTypeExt;
         if f.metadata().is_ok_and(|m| m.is_file() || m.file_type().is_socket()) {
             return f;
         }
@@ -2347,8 +2354,7 @@ pub mod output {
             }
         });
         let locked = lock.is_some();
-        use std::os::unix::fs::OpenOptionsExt;
-        let written = File::options().create(true).append(true).mode(0o600).open(log).is_ok_and(|mut f| {
+        let written = File::options().create(true).append(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(log).is_ok_and(|mut f| {
             let written = f.write_all(data).is_ok();
             if locked && f.metadata().is_ok_and(|m| m.len() > cap) {
                 let mut old = log.as_os_str().to_owned();
