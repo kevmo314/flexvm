@@ -254,7 +254,7 @@ FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_be
           "prepare_fail", "short_incoming", "slow_preload", "bad_preload", "bad_app_log", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
           "started_fsync", "started_unmark", "start_stall", "incoming_stall", "incoming_gate", "admitted_stall", "claim_stall", "standby_lock_stall", "standby_lock_hang", "handoff_stall", "ckpt_wp_race", "ckpt_rescue_fail",
           "fetch_tail_enomem", "fetch_enomem_stuck", "pull_enomem", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo", "release_stall", "release_late", "no_plug", "pause_lost", "tap_backlog", "tap_backlog_stuck", "pause_unknown", "restore_unpause_fail", "resume_link_fail", "resume_partial", "repause_fail", "pause_fail", "restore_ping_slow", "readdress_fail", "no_collapse", "collapse_slow", "pages_slow", "unlend_fail", "route_stall", "suspend_slow", "owe_fail", "settle_unpause", "prealloc_fail", "resume_fence_fail",
-          "leave_fail", "park_fail", "capture_fail", "preload_read_fail", "abort_gen_fail", "abort_stay_fail", "advance_fail", "commit_gate", "commit_fail", "snapshot_fail")
+          "leave_fail", "park_fail", "capture_fail", "preload_read_fail", "abort_gen_fail", "abort_stay_fail", "advance_fail", "commit_gate", "commit_fail", "snapshot_fail", "hold_route_fail")
 
 
 def disarm():
@@ -1868,6 +1868,19 @@ def same_host_late_handover():
     the tap): none overtakes them. (With `no_plug` armed as well, the
     scenario reorders.)"""
     udp_across_migrations("same host late handover", "ft-late", "release_late")
+
+
+def same_host_hold_route_fail():
+    """#512: the target's hold fails to take the address over from the source's
+    (`hold_route_fail`: its route change fails). It routes the address to its
+    tap at once instead, plugged behind the source's last held packets, and
+    tells the source only once it has: nothing the source still held or
+    re-sends loops back to it, and nothing is lost or reordered."""
+    for h in (A, B):
+        clear_gate(h, "hold_route_fail")
+    udp_across_migrations("same host hold route fail", "ft-hold-route", "hold_route_fail")
+    hits = {h: reached(h, "hold_route_fail") for h in (A, B)}
+    check("same host hold route fail: reached on each target", len(hits[A]) == 1 and len(hits[B]) == 2, hits)
 
 
 def same_host_flood():
@@ -8514,7 +8527,7 @@ SCENARIOS = dict(
     incoming_killed=incoming_killed, start_killed=start_killed, claim_killed=claim_killed, standby_stalled=standby_stalled, standby_refill_race=standby_refill_race, standby_lock_timeout=standby_lock_timeout, fc_died=fc_died,
     sigkill_restart=sigkill_restart, listen_trickle=listen_trickle,
     cow_wp_race=cow_wp_race, fetch_tail_enomem=fetch_tail_enomem, fetch_enomem_stuck=fetch_enomem_stuck, pull_enomem=pull_enomem,
-    collapse_abort=collapse_abort, collapse_ckpt_fail=collapse_ckpt_fail, ckpt_paused_backlog=ckpt_paused_backlog, same_host_order=same_host_order, same_host_slow_route=same_host_slow_route, same_host_flood=same_host_flood, same_host_late_handover=same_host_late_handover, same_host_backlog=same_host_backlog, same_host_bulk_tcp=same_host_bulk_tcp, ckpt_backlog=ckpt_backlog, rx_stall=rx_stall, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,
+    collapse_abort=collapse_abort, collapse_ckpt_fail=collapse_ckpt_fail, ckpt_paused_backlog=ckpt_paused_backlog, same_host_order=same_host_order, same_host_slow_route=same_host_slow_route, same_host_flood=same_host_flood, same_host_late_handover=same_host_late_handover, same_host_hold_route_fail=same_host_hold_route_fail, same_host_backlog=same_host_backlog, same_host_bulk_tcp=same_host_bulk_tcp, ckpt_backlog=ckpt_backlog, rx_stall=rx_stall, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,
     handoff_superseded=handoff_superseded, delayed_announce=delayed_announce, delayed_announce_handoff=delayed_announce_handoff, announce_arp_timer=announce_arp_timer,
     prepare_fail_announce=prepare_fail_announce, reconcile_announce=reconcile_announce, reconcile_kill=reconcile_kill, resume_pull_lock=resume_pull_lock, page_conns=page_conns, suspend_cmd=suspend_cmd, suspend_slow_cmd=suspend_slow_cmd, suspend_overlap=suspend_overlap, fc_died_busy=fc_died_busy, pause_cmd_start=pause_cmd_start, suspend_died=suspend_died,
     ctrl_z_long_op=ctrl_z_long_op, resume_suspending=resume_suspending, quit_status=quit_status)

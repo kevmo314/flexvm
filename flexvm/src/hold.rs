@@ -504,11 +504,15 @@ impl Holder {
         // leaves completion to us (`open_tun`): `accept` does it only at a TCP or UDP checksum
         // field, so no forged source is queued, nor re-sent by `straggler` (whose IPPROTO_RAW
         // resend recomputes the header checksum).
+        // Refused, it is counted as dropped for the address it was sent to, if it has one.
         let Some((h, p)) = buf[..n as usize].split_at_mut_checked(VNET_HDR) else { return true };
-        if !accept(h, 0, p) {
+        let ip = (p.len() >= 20).then(|| Ipv4Addr::new(p[16], p[17], p[18], p[19]));
+        let Some(ip) = ip.filter(|_| accept(h, 0, p)) else {
+            if let Some(ip) = ip {
+                self.refused(ip);
+            }
             return true;
-        }
-        let ip = Ipv4Addr::new(p[16], p[17], p[18], p[19]);
+        };
         match self.entry(ip) {
             Some(e) => {
                 let mut q = e.q.lock().unwrap();
@@ -522,6 +526,19 @@ impl Holder {
             None => self.straggler(ip, p),
         }
         true
+    }
+
+    /// A packet for `ip` that `accept` refused: dropped where `ip`'s packets are counted, held or
+    /// let go of (then reported as a straggler). Under `rx`.
+    fn refused(&self, ip: Ipv4Addr) {
+        match self.entry(ip) {
+            Some(e) => e.q.lock().unwrap().dropped += 1,
+            None => {
+                if let Some(g) = self.gone.lock().unwrap().get_mut(&ip).filter(|g| g.at.elapsed() < GONE_FOR) {
+                    g.dropped += 1;
+                }
+            }
+        }
     }
 
     /// A packet for `ip` read after it was let go of: re-sent if the address moved on, else
@@ -728,7 +745,8 @@ fn tap_tx_dropped(tap: &str) -> u64 {
 
 // Stream (over TCP: nothing lost or reordered): `START`, answered `b'a'`. Frames: u32 BE
 // length, packet. `SYNC` gets `b's'` once all before it is injected. `SWITCH` (hosts sharing
-// routes) gets `b'w'` once all before it is injected and the target took the address over.
+// routes) gets `b'w'` once all before it is injected and the target took the address over,
+// `b'n'` if it could not (the stream goes on: the target routes the address once it ends).
 // Length 0 ends it and gets one JSON line. Nothing is resent.
 const SYNC: u32 = u32::MAX;
 /// Not `u32::MAX - 1`, which started the stream with sequence numbers: a target here refuses
@@ -752,8 +770,8 @@ pub fn wait_start(r: &mut BufReader<By<TcpStream>>, deadline: Instant) -> bool {
     read_by(r, &mut head, deadline).is_ok() && u32::from_be_bytes(head) == START
 }
 
-/// Injects only while `revoked` is false; on `SWITCH`, `take_over` takes the address. Refused if
-/// too many streams are being received.
+/// Injects only while `revoked` is false; on `SWITCH`, `take_over` takes the address (false if it
+/// could not, which the source is told). Refused if too many streams are being received.
 /// Returns how many tap drops were reported with them (`Injector::dropped`), if they were.
 pub fn receive(
     r: &mut BufReader<By<TcpStream>>,
@@ -761,7 +779,7 @@ pub fn receive(
     tap: &str,
     revoked: &Mutex<bool>,
     deadline: Instant,
-    take_over: &mut dyn FnMut(),
+    take_over: &mut dyn FnMut() -> bool,
 ) -> Option<u64> {
     let _slot = Slot::take(&RECEIVERS, MAX_RECEIVERS)?;
     let (Ok(conn), Ok(inj)) = (r.get_ref().s.try_clone(), Injector::new(tap)) else { return None };
@@ -779,8 +797,8 @@ pub fn receive(
             SYNC => break false,
             SWITCH => {
                 // What was injected before is queued on the tap ahead of anything routed.
-                take_over();
-                match write_by(&conn, b"w", deadline) {
+                let took = take_over();
+                match write_by(&conn, if took { b"w" } else { b"n" }, deadline) {
                     Ok(()) => continue,
                     Err(_) => break false,
                 }
@@ -845,12 +863,21 @@ pub fn send(holder: &Holder, ip: Ipv4Addr, mig: u64, conn: &TcpStream, handoff: 
             let mut o = out.borrow_mut();
             o.buf.extend_from_slice(&SWITCH.to_be_bytes());
             let (mut ack, deadline) = ([0u8; 1], Instant::now() + SWITCH_WAIT);
-            if !(o.flush(deadline) && By { s: conn, at: deadline }.read_exact(&mut ack).is_ok() && ack[0] == b'w') {
-                o.broken = true;
-                crate::log!("hold {ip}: the target did not take the address over; dropping the rest");
-                bail!("the target did not take {ip} over (its held packets after this are lost)");
+            let answered = o.flush(deadline) && By { s: conn, at: deadline }.read_exact(&mut ack).is_ok();
+            match ack[0] {
+                b'w' if answered => Ok(()),
+                // Its route failed: the rest still goes to it, which routes the address once
+                // the stream ends. Not re-sent from here, where the route still leads.
+                b'n' if answered => {
+                    crate::log!("hold {ip}: the target could not take the address over; it routes it after the held packets");
+                    bail!("the target could not take {ip} over")
+                }
+                _ => {
+                    o.broken = true;
+                    crate::log!("hold {ip}: the target did not take the address over; dropping the rest");
+                    bail!("the target did not take {ip} over (its held packets after this are lost)")
+                }
             }
-            Ok(())
         }
         false => switch.take().map_or(Ok(()), |f| f()),
     };
@@ -1180,7 +1207,65 @@ mod tests {
         write(&forged);
         h.read_one(&mut buf);
         assert_eq!(queued(), 1, "a rewritten-header packet is dropped");
+        assert_eq!(h.entry(dst).unwrap().q.lock().unwrap().dropped, 1, "and counted for its address (#512)");
+        // Let go of, the address counts it with its stragglers.
+        h.held.lock().unwrap().clear();
+        h.gone.lock().unwrap().insert(dst, Gone::new(false));
+        write(&forged);
+        h.read_one(&mut buf);
+        assert_eq!(h.gone.lock().unwrap()[&dst].dropped, 1, "a let-go address counts it too");
         unsafe { libc::close(w) };
+    }
+
+    /// A fake handoff target on `l`: confirms each `SYNC`, answers `SWITCH` with `switch_ack`,
+    /// and counts the packets it got in its final reply. Returns those packets.
+    fn fake_target(l: std::net::TcpListener, switch_ack: u8) -> std::thread::JoinHandle<Vec<Vec<u8>>> {
+        std::thread::spawn(move || {
+            let (mut c, _) = l.accept().unwrap();
+            let mut got = Vec::new();
+            loop {
+                let mut head = [0u8; 4];
+                c.read_exact(&mut head).unwrap();
+                match u32::from_be_bytes(head) {
+                    SYNC => c.write_all(b"s").unwrap(),
+                    SWITCH => c.write_all(&[switch_ack]).unwrap(),
+                    0 => break,
+                    len => {
+                        let mut p = vec![0u8; len as usize];
+                        c.read_exact(&mut p).unwrap();
+                        got.push(p);
+                    }
+                }
+            }
+            c.write_all(format!("{}\n", json!({"injected": got.len(), "dropped": 0})).as_bytes()).unwrap();
+            got
+        })
+    }
+
+    /// #512: a target that could not take the address over says so (`b'n'`): the handover fails,
+    /// but the stream goes on, so nothing held is dropped, and the address is not let go of as
+    /// moved (its stragglers would be re-sent into the route that still leads here).
+    #[test]
+    fn a_refused_switch_keeps_the_stream() {
+        for (ack, took) in [(b'w', true), (b'n', false)] {
+            let mut fds = [0; 2];
+            assert_eq!(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK, 0, fds.as_mut_ptr()) }, 0);
+            let (h, _w) = unsafe { (holder(OwnedFd::from_raw_fd(fds[0])), OwnedFd::from_raw_fd(fds[1])) };
+            let ip = Ipv4Addr::new(10, 9, 0, 8);
+            let q = Queue { packets: VecDeque::from(vec![udp_to(ip); 3]), bytes: 3 * 29, ..Queue::default() };
+            h.held.lock().unwrap().insert(ip, Arc::new(Entry { mig: 1, q: Mutex::new(q) }));
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = l.local_addr().unwrap();
+            let target = fake_target(l, ack);
+            let conn = TcpStream::connect(addr).unwrap();
+            let (stats, switched) = send(&h, ip, 1, &conn, true, || Ok(())).unwrap();
+            let got = target.join().unwrap();
+            assert_eq!(switched.is_ok(), took, "{}", ack as char);
+            assert_eq!((got.len(), stats.packets, stats.injected, stats.dropped, stats.dropped_target), (3, 3, 3, 0, 0), "{}", ack as char);
+            assert!(h.entry(ip).is_none(), "{}: no longer held", ack as char);
+            let moved = h.gone.lock().unwrap().get(&ip).map(|g| g.moved);
+            assert_eq!(moved, Some(took), "{}: stragglers re-sent only once it moved", ack as char);
+        }
     }
 
     /// The reader thread queues packets all through a release: those it queues after the last

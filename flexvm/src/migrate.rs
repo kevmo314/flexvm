@@ -588,15 +588,39 @@ impl Proc {
             // and lets go of it once the stream ends; without a handover, the end
             // of the stream routes it. Each step only while the address is still
             // this VM's: a newer one's route, announced meanwhile, stays.
-            let (mut routed, mut holding) = (!shared, false);
+            let (mut routed, mut holding, mut plugged) = (!shared, false, false);
+            // False, which the source is told, if it could not: the source still routes the
+            // address to its own hold, where packets it re-sent would come back to (#512).
             let mut take_over = || {
                 if std::mem::replace(&mut routed, true) {
-                    return;
+                    return true;
                 }
-                let took = p.if_current(|| match holder.as_deref() {
-                    Some(h) => vm.if_here(|| h.hold(vm.ip, mig)),
+                let mut took = p.if_current(|| match holder.as_deref() {
+                    // Test fault `hold_route_fail`: this hold's route fails.
+                    Some(h) => vm.if_here(|| match tripped("hold_route_fail") {
+                        true => Err("injected fault: routing the address to the hold failed".into()),
+                        false => h.hold(vm.ip, mig),
+                    }),
                     None => vm.route_here().map(|()| false),
                 });
+                if let Err(e) = &took {
+                    // Routed to the tap at once instead, a few tries well within the source's
+                    // wait. Plugged first: what the route sends waits there behind the source's
+                    // last held packets, injected past the plug, until the stream ends.
+                    crate::log!("vm {}: taking over {}: {e}; routing it to its tap", vm.name, vm.ip);
+                    let (plug, res) = crate::net::plug_tap(&vm.tap);
+                    plugged = plug;
+                    if let Err(e) = res {
+                        crate::log!("vm {}: plugging its tap: {e}", vm.name);
+                    }
+                    for delay in [0, 20, 80] {
+                        thread::sleep(Duration::from_millis(delay));
+                        took = p.if_current(|| vm.route_here()).map(|r| r.map(|()| false));
+                        if took.is_ok() {
+                            break;
+                        }
+                    }
+                }
                 match took {
                     Ok(Some(held)) => holding = held,
                     Ok(None) => crate::log!("vm {}: {} went to a newer vm; not taking it over", vm.name, vm.ip),
@@ -605,6 +629,7 @@ impl Proc {
                         routed = false;
                     }
                 }
+                routed
             };
             let fence = Instant::now();
             crate::host::stall("handoff_stall");
@@ -614,6 +639,15 @@ impl Proc {
                 }
             } else {
                 crate::log!("vm {}: no held packets from the source after {} ms", vm.name, ms(fence.elapsed()));
+            }
+            if plugged {
+                let (drops, unplugged) = crate::net::unplug_tap(&vm.tap);
+                if let Err(e) = unplugged {
+                    crate::log!("vm {}: letting {}'s packets through its tap: {e}", vm.name, vm.ip);
+                }
+                if drops > 0 {
+                    crate::log!("vm {}: its tap's plug dropped {drops} packets while taking {} over", vm.name, vm.ip);
+                }
             }
             // Only the route switch is under the host lock: the tap's plug, not the lock,
             // keeps what the new route sends behind the held packets (#164).
