@@ -23,7 +23,7 @@ use crate::template::Template;
 use crate::uffd::{Origin, Runs, Source, MAX_PRELOAD};
 use crate::util::{ms, recv_json, send_json, By, Error, Phases, Result};
 use crate::vm::{Snapshot, State, Vm};
-use crate::vmproc::{peer_call, End, Op, Proc};
+use crate::vmproc::{peer_call, Busy, End, Op, Proc, BUSY};
 
 /// From the target's prepare answer to its commit answer.
 const INCOMING_WAIT: Duration = Duration::from_secs(30);
@@ -74,17 +74,17 @@ impl Proc {
             bail!("this host runs no peer listener (flexvm listen): the target fetches the vm's memory through it");
         };
         let op = match if_idle {
-            true => self.op_now().ok_or_else(|| format!("vm {}: {}", vm.name, crate::vmproc::BUSY))?,
+            true => self.op_now().ok_or_else(|| Busy(format!("vm {}: {BUSY}", vm.name)))?,
             false => self.op_within()?,
         };
         if self.cmd.lock().unwrap().is_some() {
             match evict {
-                true => bail!("vm {} runs a command here that its process ends with; {}", vm.name, crate::vmproc::BUSY),
+                true => return Err(Busy(format!("vm {} runs a command here that its process ends with; {BUSY}", vm.name)).into()),
                 false => bail!("vm {} runs `run -- CMD`, which ends with its command here: it cannot migrate", vm.name),
             }
         }
         if if_idle && self.arrived.lock().unwrap().is_some() {
-            bail!("vm {} is still arriving; {}", vm.name, crate::vmproc::BUSY);
+            return Err(Busy(format!("vm {} is still arriving; {BUSY}", vm.name)).into());
         }
         self.settle_arrival(&op, ARRIVAL_WAIT)?;
         vm.can_leave()?;

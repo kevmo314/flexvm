@@ -6046,6 +6046,103 @@ def evict_skips_cmd():
     check("evict cmd: its command's end still ends it here", p.wait(timeout=30) == 130)
 
 
+class busy_peer:
+    """A peer stub on loopback that refuses every request with the text a VM busy
+    here answers eviction with (#599)."""
+    def __enter__(self):
+        self.s = socket.socket()
+        self.s.bind(("127.0.0.1", 0))
+        self.s.listen(16)
+        self.addr, self.asked = f"127.0.0.1:{self.s.getsockname()[1]}", []
+        threading.Thread(target=self.serve, daemon=True).start()
+        return self
+
+    def serve(self):
+        while True:
+            try:
+                c, _ = self.s.accept()
+            except OSError:
+                return
+            with c, suppress(OSError, ValueError):
+                c.settimeout(5)
+                self.asked.append(json.loads(c.makefile().readline()).get("op"))
+                c.sendall(json.dumps({"ok": False, "error": "vm x: busy with another operation"}).encode() + b"\n")
+
+    def __exit__(self, *_):
+        self.s.close()
+
+
+def evict_peer_busy():
+    """#599: a peer that refuses every eviction with the text of a VM busy here
+    is a refusal like any other: backed off, and the VM moves to the next peer."""
+    n = "ft-ev-peer-busy"
+    m = setup(n, mib=1)
+    with busy_peer() as stub:
+        ok(cli_json(A, "config", "--peer", stub.addr, "--peer", B.addr))
+        try:
+            with pressure(512, 1000, A):
+                moved = wait_for(lambda: where(n) == {B: "running"}, 60)
+        finally:
+            ok(cli_json(A, "config", "--peer", B.addr))
+    with open(os.path.join(A.run, "evict.backoff")) as f:
+        backoff = json.load(f)
+    check("evict peer busy: the stub was asked", "migrate_in" in stub.asked, stub.asked)
+    check("evict peer busy: moved to the next peer", moved, (where(n), log(A, n)[-1500:]))
+    check("evict peer busy: the stub is backed off", f"{n} {stub.addr}" in backoff, backoff)
+    check("evict peer busy: md5 intact", md5(B, n) == m)
+    cleanup(n)
+
+
+def standby_relief_no_vm():
+    """#600: a host with a standby VM and no running VM (no controller to stop it)
+    goes under its reserve: the standby leaves by itself, marks the pressure,
+    and is not refilled meanwhile."""
+    t = args.template
+    running = [n for n, v in vms(A).items() if v.get("state") == "running"]
+    if running:
+        raise Skip(f"vms run on A: {running}")
+    marker = os.path.join(A.run, "standby", ".pressure")
+    with suppress(FileNotFoundError):
+        os.remove(marker)
+    ok(cli_json(A, "standby", "--template", t, "1"))
+    try:
+        check("standby relief no vm: one ready", wait_for(lambda: len(standby_pids(A, t)) == 1, 60))
+        pid = standby_pids(A, t)[0]
+        with mem_available_as(A, reserve_of(A) - 64):
+            check("standby relief no vm: it leaves by itself under the reserve", wait_for(lambda: not alive(pid), 10), standby_pids(A, t))
+            check("standby relief no vm: and marks the pressure", os.path.exists(marker))
+            time.sleep(7)  # past a maintain round
+            check("standby relief no vm: not refilled", not standby_pids(A, t), standby_pids(A, t))
+    finally:
+        with suppress(FileNotFoundError):
+            os.remove(marker)
+        cli(A, "standby", "--template", t, "0")
+        wait_for(lambda: not standby_pids(A, t), 30)
+
+
+def standby_refill_mark():
+    """#600: a refill leaves the eviction mark available, not just the reserve:
+    between the two (where eviction moves VMs away) none starts; above it, it does."""
+    t = args.template
+    marker = os.path.join(A.run, "standby", ".pressure")
+    with suppress(FileNotFoundError):
+        os.remove(marker)
+    derived = ok(cli_json(A, "config"))["derived"]
+    reserve, at = derived["reserve_mib"], derived["evict_at_mib"]
+    try:
+        with mem_available_as(A, at - 64) as avail:
+            check("standby refill mark: between the reserve and the mark", reserve < avail.mib < at, (reserve, avail.mib, at))
+            r = ok(cli_json(A, "standby", "--template", t, "1"))
+            check("standby refill mark: none starts under the mark", r["started"] == 0, r)
+            time.sleep(7)  # past a maintain round
+            check("standby refill mark: nor in the background", not standby_pids(A, t), standby_pids(A, t))
+            avail.write(str(at + 8192))
+            check("standby refill mark: refilled above it", wait_for(lambda: len(standby_pids(A, t)) == 1, 60), standby_pids(A, t))
+    finally:
+        cli(A, "standby", "--template", t, "0")
+        wait_for(lambda: not standby_pids(A, t), 30)
+
+
 def evict_latency():
     """Measures each VM's controller ticks and memory requests while a
     starved VM is moved away to a target slow to prepare (3 s): the VM process
@@ -9046,7 +9143,7 @@ SCENARIOS = dict(
     route_abort=route_abort,
     uffd_err=uffd_err,
     mem_high=no_evict(mem_high), mem_high_migrate=no_evict(mem_high_migrate),
-    mem_high_evict=mem_high_evict, mem_refused_headroom=mem_refused_headroom, mem_refused_fill=mem_refused_fill, evict_grower=evict_grower, evict_no_pingpong=evict_no_pingpong, evict_skips_cmd=evict_skips_cmd, cmd_flag=cmd_flag, standby_stop_claim=standby_stop_claim, standby_claim_signal=standby_claim_signal, standby_concurrent_claims=standby_concurrent_claims, evict_latency=evict_latency,
+    mem_high_evict=mem_high_evict, mem_refused_headroom=mem_refused_headroom, mem_refused_fill=mem_refused_fill, evict_grower=evict_grower, evict_no_pingpong=evict_no_pingpong, evict_skips_cmd=evict_skips_cmd, evict_peer_busy=evict_peer_busy, standby_relief_no_vm=standby_relief_no_vm, standby_refill_mark=standby_refill_mark, cmd_flag=cmd_flag, standby_stop_claim=standby_stop_claim, standby_claim_signal=standby_claim_signal, standby_concurrent_claims=standby_concurrent_claims, evict_latency=evict_latency,
     start_admission=start_admission, standby_admission=standby_admission,
     refused_admission=refused_admission, arrival_grew=no_evict(arrival_grew), arrival_grew_admitted=no_evict(arrival_grew_admitted), meminfo_unreadable=meminfo_unreadable,
     cow_grow=no_evict(cow_grow), plug_race=no_evict(plug_race), shrink_stall=no_evict(shrink_stall), plug_storm=no_evict(plug_storm),

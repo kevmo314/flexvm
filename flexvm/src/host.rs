@@ -1254,7 +1254,12 @@ impl Host {
 
     /// Against the reserve: None if refused; errors grant nothing (`WouldBlock` if the lock is busy).
     pub fn grant(&self, mib: u64, deadline: Option<std::time::Instant>) -> Result<Option<u64>> {
-        Ok(self.grant_inner(mib, Floor::Reserve, false, deadline, crate::vmproc::host_available_mib)?.ok().map(|g| g.0))
+        self.grant_above(mib, Floor::Reserve, deadline)
+    }
+
+    /// As `grant`, leaving `floor` available.
+    pub fn grant_above(&self, mib: u64, floor: Floor, deadline: Option<std::time::Instant>) -> Result<Option<u64>> {
+        Ok(self.grant_inner(mib, floor, false, deadline, crate::vmproc::host_available_mib)?.ok().map(|g| g.0))
     }
 
     /// A refusal is an error too; `hold` keeps the grant past `GRANT_WINDOW`.

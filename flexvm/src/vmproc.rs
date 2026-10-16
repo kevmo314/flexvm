@@ -1203,7 +1203,7 @@ impl Proc {
             "claim" => Err("this vm is not a standby vm".into()),
             op => Err(format!("unknown op {op:?}").into()),
         };
-        let _ = send_json(&mut &c, &crate::util::reply(&reply));
+        let _ = send_json(&mut &c, &control_reply(&reply));
     }
 
     fn pages(&self, req: &Value, fds: Vec<OwnedFd>, slot: Slot) {
@@ -2380,7 +2380,8 @@ fn evict(host: &Host, peers: &[String], vms: &[Entry], avail: u64, deadline: Ins
                     }
                     return;
                 }
-                Err(e) if e.to_string().contains(BUSY) => break,
+                // This VM is busy here: the next one is tried. Any peer's refusal, whatever it says, backs off below.
+                Err(e) if e.is::<Busy>() => break,
                 // No answer is no refusal: the VM may still be migrating (busy to the next decider).
                 Err(e) if Instant::now() >= deadline => {
                     return crate::log!("vm {}: migrating to {peer}: no answer by the eviction's deadline: {e}", vm.name);
@@ -2399,6 +2400,29 @@ fn evict(host: &Host, peers: &[String], vms: &[Entry], avail: u64, deadline: Ins
 
 /// What `migrate` with `if_idle` answers for a VM busy with something else.
 pub const BUSY: &str = "busy with another operation";
+
+/// `migrate` with `if_idle` refused on this host's own checks: the VM is busy
+/// with something else. Its reply says so (`busy`), as its text alone does not:
+/// a peer's refusal reaches the same error verbatim and may say anything (#599).
+#[derive(Debug)]
+pub struct Busy(pub String);
+
+impl std::fmt::Display for Busy {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Busy {}
+
+/// A control reply: `busy` set only for a `Busy` error, never for what a peer said.
+fn control_reply(result: &Result<Value>) -> Value {
+    let mut reply = crate::util::reply(result);
+    if result.as_ref().is_err_and(|e| e.is::<Busy>()) {
+        reply["busy"] = json!(true);
+    }
+    reply
+}
 
 pub fn peer_call(peer: &str, req: Value) -> Result<Value> {
     Ok(crate::util::rpc(peer, Duration::from_millis(500), Instant::now() + Duration::from_secs(2), &req)?.1)
@@ -2639,6 +2663,9 @@ pub fn call(host: &Host, name: &str, req: Value, at: Option<Instant>) -> Result<
         Some(at) => crate::util::recv_json(&mut BufReader::new(crate::util::By { s: c, at })),
         None => crate::util::recv_json(&mut BufReader::new(c)),
     }?;
+    if let Some(r) = reply.as_ref().filter(|r| r["ok"] != true && r["busy"] == true) {
+        return Err(Busy(r["error"].as_str().unwrap_or(BUSY).into()).into());
+    }
     answer(reply, &format!("vm {name}"), "refused")
 }
 
@@ -3634,6 +3661,53 @@ mod tests {
         // Growth within the same power of two ranks by size.
         let ranked = rank(vec![vm("a", false, 70, 100).0, vm("b", false, 100, 200).0], |e| e.firecracker.unwrap_or(0) as u64);
         assert_eq!(ranked[0].name, "b");
+    }
+
+    /// #599: a peer answering every eviction with this host's busy text is a refusal
+    /// like any other (backed off, the next peer tried); only the VM's own `busy`
+    /// reply (a `Busy` error here) skips the rest of the peers.
+    #[test]
+    fn eviction_backs_off_a_peer_whatever_its_refusal_says() {
+        let root = crate::test_util::TempDir::new("fv-evict-busy");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let sock = host.sock("ev").unwrap();
+        std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&sock).unwrap();
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        // The VM process's control socket, stubbed: p1's refusal repeats the busy text
+        // (as `prepare_target` passes it on), p2 takes the VM; "busy" answers busy itself.
+        let stub = {
+            let asked = asked.clone();
+            thread::spawn(move || {
+                for c in listener.incoming() {
+                    let c = c.unwrap();
+                    let req = crate::util::recv_json(&mut BufReader::new(&c)).unwrap().unwrap();
+                    let to = req["to"].as_str().unwrap().to_string();
+                    asked.lock().unwrap().push(to.clone());
+                    let reply = match to.as_str() {
+                        "p1" => control_reply(&Err(format!("p1: vm ev: {BUSY}").into())),
+                        "busy" => control_reply(&Err(Busy(format!("vm ev: {BUSY}")).into())),
+                        "stop" => return,
+                        _ => control_reply(&Ok(json!({}))),
+                    };
+                    send_json(&mut &c, &reply).unwrap();
+                }
+            })
+        };
+        let vm = Entry { name: "ev".into(), state: "running".into(), ..Entry::default() };
+        let at = || Instant::now() + Duration::from_secs(10);
+        let backoff = || crate::host::load::<std::collections::HashMap<String, PeerBackoff>>(&host.run.join("evict.backoff")).unwrap().unwrap_or_default();
+        evict(&host, &["p1".into(), "p2".into()], std::slice::from_ref(&vm), 100, at());
+        assert_eq!(*asked.lock().unwrap(), ["p1", "p2"], "the next peer is tried");
+        assert!(backoff().get("ev p1").is_some_and(|b| !b.ready(eviction_time())), "and the refusing one backed off");
+        // The VM busy here: no other peer is asked, and none is backed off for it.
+        asked.lock().unwrap().clear();
+        evict(&host, &["busy".into(), "p3".into()], std::slice::from_ref(&vm), 100, at());
+        assert_eq!(*asked.lock().unwrap(), ["busy"]);
+        assert!(!backoff().contains_key("ev busy"));
+        let e = call(&host, "ev", json!({"op": "migrate", "to": "stop"}), Some(at())).unwrap_err();
+        assert!(!e.is::<Busy>(), "{e}");
+        stub.join().unwrap();
     }
 
     #[test]
