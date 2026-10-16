@@ -256,6 +256,8 @@ struct PeersInner {
     resolved: RwLock<HashMap<String, Vec<IpAddr>>>,
     /// Each name's lookup: None while under way, else when the last one ended.
     lookups: Mutex<HashMap<String, Option<Instant>>>,
+    /// Names whose lookup ended at least once: one with no addresses is not waited for again.
+    tried: Mutex<std::collections::HashSet<String>>,
     /// The listener's: where each looked-up name's addresses are kept for other processes
     /// (`PEER_CACHE` in RUN), with what was last written there.
     cache: Option<(std::path::PathBuf, Mutex<Cached>)>,
@@ -287,6 +289,7 @@ impl Peers {
             let names = host.config_now().peers;
             p.0.resolved.write().unwrap().retain(|n, _| names.contains(n));
             p.0.lookups.lock().unwrap().retain(|n, l| l.is_none() || names.contains(n));
+            p.0.tried.lock().unwrap().retain(|n| names.contains(n));
             p.cache(|c| c.retain(|n, _| names.contains(n)));
             p.refresh(&names);
             std::thread::sleep(PEER_REFRESH);
@@ -315,6 +318,7 @@ impl Peers {
                         c.entry(name.clone()).or_default();
                     }
                 });
+                p.0.tried.lock().unwrap().insert(name.clone());
                 p.0.lookups.lock().unwrap().insert(name, Some(Instant::now()));
             });
             lookups.insert(n.clone(), if lookup.is_ok() { None } else { Some(Instant::now()) });
@@ -351,13 +355,19 @@ impl Peers {
         addrs
     }
 
-    /// `addrs` once no name without addresses has its lookup under way (it could give any
-    /// address), waiting for one until `by`, then an error: asked again, it may have ended. A
-    /// lookup that ended with none (a name that does not resolve) gives none (#411).
+    /// `addrs` once no name without addresses has its first lookup under way (it could give
+    /// any address: a peer just added, or a listener just started), waiting for one until `by`,
+    /// then an error: asked again, it may have ended. A lookup that ended with none (a name
+    /// that does not resolve) gives none (#411), and so does one looked up again meanwhile:
+    /// a DNS outage never holds these up on every refresh.
     fn all_addrs(&self, names: &[String], by: Instant) -> Result<Vec<IpAddr>> {
         loop {
             let addrs = self.addrs(names);
-            if !self.resolving(names).0 {
+            let first = {
+                let (r, l, tried) = (self.0.resolved.read().unwrap(), self.0.lookups.lock().unwrap(), self.0.tried.lock().unwrap());
+                names.iter().any(|n| !r.contains_key(n) && !tried.contains(n) && l.get(n) == Some(&None))
+            };
+            if !first {
                 return Ok(addrs);
             }
             if Instant::now() >= by {
@@ -948,7 +958,13 @@ mod tests {
         assert!(e.contains("still being looked up"), "{e}");
         // Ended with no address (it does not resolve): no addresses, not a refusal forever.
         p.0.lookups.lock().unwrap().insert("peer.example:7000".into(), Some(Instant::now()));
+        p.0.tried.lock().unwrap().insert("peer.example:7000".into());
         assert_eq!(p.all_addrs(&cfg.peers, soon()).unwrap(), ["10.98.0.1".parse::<IpAddr>().unwrap()]);
+        // Nor while it is looked up again (a DNS outage): at once, no wait.
+        p.0.lookups.lock().unwrap().insert("peer.example:7000".into(), None);
+        let start = Instant::now();
+        assert_eq!(p.all_addrs(&cfg.peers, Instant::now() + Duration::from_secs(5)).unwrap(), ["10.98.0.1".parse::<IpAddr>().unwrap()]);
+        assert!(start.elapsed() < Duration::from_secs(1));
         p.0.resolved.write().unwrap().insert("peer.example:7000".into(), vec!["10.94.0.1".parse().unwrap()]);
         let peers = [p.all_addrs(&cfg.peers, soon()).unwrap(), vec!["10.95.0.1".parse().unwrap()]].concat();
         let check = |ip: &str| routable(ip.parse().unwrap(), &cfg, &peers, &[gw]);
