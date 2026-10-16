@@ -59,6 +59,9 @@ pub enum Floor {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    /// The owning host's RUN directory; runtime context, never saved in host.json.
+    #[serde(skip)]
+    pub run: Option<PathBuf>,
     pub listen: Option<String>,
     pub peers: Vec<String>,
     /// Disjoint across hosts.
@@ -78,6 +81,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Config {
         Config {
+            run: None,
             listen: None,
             peers: Vec::new(),
             vm_ips: "10.200.0.0/16".into(),
@@ -129,121 +133,15 @@ pub fn toward(peers: &[Vec<IpAddr>], local: impl Fn(Ipv4Addr) -> bool) -> Toward
     out
 }
 
-const DERIVE_EVERY: Duration = Duration::from_secs(30);
-/// How long the first derivation toward a peer list is waited for: once, never again.
-const DERIVE_WAIT: Duration = Duration::from_secs(2);
-/// Each peer's lookup, by the deadline-bounded resolver (whose workers are shared process-wide).
+/// A peer name's lookup by a process other than the listener, for one the listener has not seen.
 const PEER_WAIT: Duration = Duration::from_secs(2);
 
-/// What a derivation found, and the lookups that failed on the way (logged even when it succeeded).
+/// A peer name's lookup, and what this process's lookups found (none for one that failed).
+type Lookup<'a> = &'a dyn Fn(&str) -> std::io::Result<Vec<IpAddr>>;
+type LookedUp = Mutex<Option<HashMap<String, Vec<IpAddr>>>>;
+
+/// What a derivation found, and the peers whose addresses were unknown.
 type Outcome = (std::result::Result<Derived, String>, Vec<String>);
-
-/// The derivation toward the current peer list: at most one under way, process-wide, each
-/// bounded (its lookups have deadlines), so a name that hangs holds nothing for good.
-struct Deriver {
-    state: Mutex<Derivation>,
-    changed: std::sync::Condvar,
-    wait: Duration,
-}
-
-struct Derivation {
-    peers: Vec<String>,
-    /// Bumped as the peers change: a derivation toward older peers is dropped when it ends.
-    gen: u64,
-    under_way: bool,
-    ended: Option<std::time::Instant>,
-    /// The first derivation toward these peers was waited for, or the wait ran out.
-    waited: bool,
-    /// The last good result toward these peers, else the first.
-    good: Option<Derived>,
-    /// What was last logged: the derivation's failure, and the lookups that failed.
-    failed: Option<String>,
-    unresolved: Vec<String>,
-}
-
-impl Derivation {
-    const fn new(peers: Vec<String>, gen: u64, under_way: bool) -> Self {
-        Derivation { peers, gen, under_way, ended: None, waited: false, good: None, failed: None, unresolved: Vec::new() }
-    }
-}
-
-static DERIVER: Deriver = Deriver::new(DERIVE_WAIT);
-
-fn derive_now(peers: &[String]) -> Outcome {
-    let lookup = |p: &str| crate::util::resolve(p, std::time::Instant::now() + PEER_WAIT).map(|a| a.iter().map(SocketAddr::ip).collect());
-    let route = |to| crate::net::route_get(to).map(|(dev, src)| (dev.clone(), src, crate::net::is_ethernet(&dev)));
-    derive(peers, lookup, |a| crate::net::is_local_addr(a).unwrap_or(false), route)
-}
-
-impl Deriver {
-    const fn new(wait: Duration) -> Self {
-        Deriver { state: Mutex::new(Derivation::new(Vec::new(), 0, false)), changed: std::sync::Condvar::new(), wait }
-    }
-
-    /// Toward `peers`, refreshed every `DERIVE_EVERY` in the background by `run`; only the
-    /// first derivation toward a peer list is waited for, and for at most `wait`.
-    fn get(&'static self, peers: &[String], run: impl FnOnce(Vec<String>) -> Outcome + Send + 'static) -> Derived {
-        let mut run = Some(run);
-        let mut d = self.state.lock().unwrap();
-        if d.peers != peers {
-            *d = Derivation::new(peers.to_vec(), d.gen + 1, d.under_way);
-        }
-        let by = std::time::Instant::now() + self.wait;
-        loop {
-            if d.peers != peers {
-                return (None, None);
-            }
-            if !d.under_way && d.ended.is_none_or(|t| t.elapsed() >= DERIVE_EVERY) {
-                if let Some(run) = run.take() {
-                    let (peers, gen) = (d.peers.clone(), d.gen);
-                    d.under_way = std::thread::Builder::new()
-                        .name("derive".into())
-                        .spawn(move || {
-                            let out = run(peers);
-                            for e in self.record(gen, out) {
-                                crate::log!("flexvm: {e}");
-                            }
-                        })
-                        .is_ok();
-                    // Tried again a while on.
-                    d.ended = (!d.under_way).then(std::time::Instant::now);
-                }
-            }
-            if d.good.is_some() || d.waited {
-                return d.good.clone().unwrap_or_default();
-            }
-            let left = by.saturating_duration_since(std::time::Instant::now());
-            if left.is_zero() {
-                d.waited = true;
-                return (None, None);
-            }
-            d = self.changed.wait_timeout(d, left).unwrap().0;
-        }
-    }
-
-    /// Keeps a good result, or the first, toward the peers derivation `gen` was for; what to
-    /// log, once per change, not by every VM process at every refresh.
-    fn record(&self, gen: u64, (out, unresolved): Outcome) -> Vec<String> {
-        let mut d = self.state.lock().unwrap();
-        d.under_way = false;
-        self.changed.notify_all();
-        if d.gen != gen {
-            return Vec::new();
-        }
-        let mut log: Vec<String> = unresolved.iter().filter(|e| !d.unresolved.contains(e)).cloned().collect();
-        if let Err(e) = &out {
-            if d.failed.as_ref() != Some(e) {
-                let kept = if d.good.is_some() { "; keeping the last derived" } else { "" };
-                log.push(format!("{e}: no underlay address or announce device derived{kept} (set them with flexvm config)"));
-            }
-        }
-        if out.is_ok() || d.good.is_none() {
-            d.good = Some(out.clone().unwrap_or_default());
-        }
-        (d.failed, d.unresolved, d.ended, d.waited) = (out.err(), unresolved, Some(std::time::Instant::now()), true);
-        log
-    }
-}
 
 /// The underlay address and announce device toward `peers`, and the peers that did not
 /// resolve: `lookup` gives a peer's addresses, `route` the device, source and whether the
@@ -291,12 +189,22 @@ impl Config {
     /// address of the kernel's route toward the first peer elsewhere, or
     /// loopback when every peer is on this machine; never loopback with peers elsewhere.
     pub fn underlay(&self) -> Option<Ipv4Addr> {
+        self.underlay_by(true)
+    }
+
+    /// `underlay` starting no lookup (see `derived`): for callers under the host lock or on a
+    /// migration's downtime.
+    pub fn underlay_known(&self) -> Option<Ipv4Addr> {
+        self.underlay_by(false)
+    }
+
+    fn underlay_by(&self, look: bool) -> Option<Ipv4Addr> {
         let from_listen = || match self.listen.as_deref()?.parse::<SocketAddr>().ok()?.ip().to_canonical() {
             IpAddr::V4(v4) => Some(v4),
             IpAddr::V6(_) => None,
         };
         let listen = self.underlay.or_else(from_listen).filter(|u| !u.is_unspecified());
-        listen.or_else(|| self.derived().0)
+        listen.or_else(|| self.derived(look).0)
     }
 
     /// Unset: that route's device, none for peers on this machine; `none`: no announcements.
@@ -304,27 +212,69 @@ impl Config {
         match self.announce_dev.as_deref() {
             Some("none") => None,
             Some(dev) => Some(dev.into()),
-            None => self.derived().1,
+            None => self.derived(true).1,
         }
     }
 
-    /// Derived in the background; only a peer list's first derivation is waited for, and
-    /// for at most `DERIVE_WAIT`.
-    /// Peers given as IP addresses need no lookup: derived at once, every time.
-    fn derived(&self) -> Derived {
-        if !self.peers.iter().all(|p| p.parse::<SocketAddr>().is_ok()) {
-            return DERIVER.get(&self.peers, |peers| derive_now(&peers));
-        }
+    /// Derive from the listener's last-known peer addresses, whatever their age; IP literals
+    /// need none. A name the listener has seen (an empty entry for one it could not look up
+    /// included) is never looked up here; one it has no entry for (no listener has run since
+    /// a boot) is, with `look`, within `PEER_WAIT` and once per process, so a VM started first
+    /// still announces: its result (none, if it failed) stands until the listener's entry does.
+    fn derived(&self, look: bool) -> Derived {
+        static LOOKED_UP: LookedUp = Mutex::new(None);
+        let by = std::time::Instant::now() + PEER_WAIT;
+        let lookup = |p: &str| crate::util::resolve(p, by).map(|a| a.iter().map(SocketAddr::ip).collect());
+        let (out, why) = self.derived_by(&LOOKED_UP, look.then_some(&lookup as Lookup));
         static FAILED: Mutex<Option<String>> = Mutex::new(None);
-        let (out, _) = derive_now(&self.peers);
         let mut failed = FAILED.lock().unwrap();
-        if let Err(e) = &out {
-            if failed.as_ref() != Some(e) {
-                crate::log!("flexvm: {e}: no underlay address or announce device derived (set them with flexvm config)");
+        if let Some(why) = &why {
+            if failed.as_ref() != Some(why) {
+                crate::log!("flexvm: {why}");
             }
         }
-        *failed = out.as_ref().err().cloned();
-        out.unwrap_or_default()
+        *failed = why;
+        out
+    }
+
+    /// What `derived` finds, `lookup` (if any) looking up a name neither the listener nor
+    /// `looked_up` has an entry for, and why nothing was derived. The memo is never held
+    /// across a lookup: a caller without `lookup` never waits on one.
+    fn derived_by(&self, looked_up: &LookedUp, lookup: Option<Lookup>) -> (Derived, Option<String>) {
+        let cache = self.run.as_ref().map(|run| crate::listen::Cached::read(run, &self.peers)).unwrap_or_default();
+        let unseen: Vec<&str> = self.peers.iter().map(String::as_str).filter(|p| cache.addrs(p).is_err()).collect();
+        let find = |p: &str| {
+            cache.addrs(p).or_else(|e| {
+                if let Some(a) = looked_up.lock().unwrap().get_or_insert_default().get(p) {
+                    return Ok(a.clone());
+                }
+                let Some(lookup) = lookup else { return Err(e) };
+                let found = lookup(p);
+                looked_up.lock().unwrap().get_or_insert_default().insert(p.into(), found.as_ref().map_or_else(|_| Vec::new(), Clone::clone));
+                found
+            })
+        };
+        let route = |to| crate::net::route_get(to).map(|(dev, src)| (dev.clone(), src, crate::net::is_ethernet(&dev)));
+        let (out, unresolved) = derive(&self.peers, find, |a| crate::net::is_local_addr(a).unwrap_or(false), route);
+        match out {
+            Ok(d) => (d, None),
+            Err(e) if unseen.is_empty() => {
+                (Derived::default(), Some(format!("{e}: no underlay address or announce device derived (set them with flexvm config)")))
+            }
+            Err(e) => {
+                let why = match unresolved.is_empty() {
+                    true => String::new(),
+                    false => format!(" ({})", unresolved.join("; ")),
+                };
+                let unseen = unseen.join(", ");
+                (
+                    Derived::default(),
+                    Some(format!(
+                        "{e}{why}: no underlay address or announce device derived; this host's listener has not looked up {unseen} yet: start flexvm listen (or set them with flexvm config)"
+                    )),
+                )
+            }
+        }
     }
 
     /// Where peers reach this host's listener (a migration target pulls
@@ -333,6 +283,11 @@ impl Config {
     /// nothing elsewhere) the underlay address with the listen port. None
     /// without a listener.
     pub fn advertise(&self) -> Result<Option<String>> {
+        self.advertise_by(true)
+    }
+
+    /// `advertise`, with `look` false starting no lookup (`underlay_known`).
+    pub fn advertise_by(&self, look: bool) -> Result<Option<String>> {
         let Some(listen) = self.listen.as_deref() else { return Ok(None) };
         let Ok(addr) = listen.parse::<SocketAddr>() else { return Ok(Some(listen.into())) };
         if addr.port() == 0 {
@@ -346,7 +301,7 @@ impl Config {
         if !local_only {
             return Ok(Some(SocketAddr::new(ip, addr.port()).to_string()));
         }
-        match self.underlay() {
+        match self.underlay_by(look) {
             Some(u) => Ok(Some(SocketAddr::from((u, addr.port())).to_string())),
             None => bail!(
                 "listening on {listen} needs an underlay address (none derived toward the peers: flexvm config --underlay IP): peers cannot reach a wildcard or link-local address"
@@ -524,7 +479,8 @@ impl Host {
         }
         let _ = RUN_DIR.set(run.clone());
         let cfg_stamp = stamp(&state.join("host.json"));
-        let cfg = load(&state.join("host.json"))?.unwrap_or_default();
+        let mut cfg: Config = load(&state.join("host.json"))?.unwrap_or_default();
+        cfg.run = Some(run.clone());
         Ok(Host { state, run, cfg, cfg_stamp, cfg_seen: Arc::new(Mutex::new(None)) })
     }
 
@@ -532,6 +488,7 @@ impl Host {
         let _l = self.lock()?;
         let path = self.state.join("host.json");
         let mut cfg: Config = load(&path)?.unwrap_or_default();
+        cfg.run = Some(self.run.clone());
         change(&mut cfg)?;
         store(&path, &cfg, true)?;
         self.cfg = cfg;
@@ -564,7 +521,8 @@ impl Host {
         if let Some((_, cfg)) = last.as_ref().filter(|(t, _)| Some(*t) == now) {
             return cfg.clone();
         }
-        if let Some(cfg) = now.and_then(|_| load::<Config>(&path).ok().flatten()) {
+        if let Some(mut cfg) = now.and_then(|_| load::<Config>(&path).ok().flatten()) {
+            cfg.run = Some(self.run.clone());
             *seen = Some((now.unwrap(), cfg.clone()));
             return cfg;
         }
@@ -4587,6 +4545,108 @@ mod tests {
     }
 
     #[test]
+    fn fresh_process_derivation_uses_last_known_peers_without_dns() {
+        let (_dir, mut h) = host("derive-no-dns");
+        h.configure(|c| {
+            c.peers = vec!["blackholed.example:7070".into()];
+            Ok(())
+        })
+        .unwrap();
+        let reopened = Host::open(&h.state, &h.run).unwrap();
+        let now = || (reopened.config_now().underlay(), reopened.config_now().announce_dev());
+        let cache = h.run.join("peers.json");
+        // Seen by the listener, which could not look it up: never looked up here.
+        std::fs::write(&cache, r#"{"names":{"blackholed.example:7070":[]}}"#).unwrap();
+        let start = std::time::Instant::now();
+        assert_eq!(now(), (None, None), "seen, no addresses: nothing derived, never wait for DNS");
+        assert!(start.elapsed() < Duration::from_millis(500));
+
+        std::fs::write(&cache, r#"{"names":{"blackholed.example:7070":["127.0.0.1"]}}"#).unwrap();
+        let old = SystemTime::now() - Duration::from_secs(3600);
+        File::options().write(true).open(&cache).unwrap().set_modified(old).unwrap();
+        assert_eq!(now(), (Some(Ipv4Addr::LOCALHOST), None), "last-known addresses, whatever their age");
+
+        std::fs::write(&cache, r#"{"names":{"blackholed.example:7070":["192.0.2.9"]}}"#).unwrap();
+        let literal = Config { peers: vec!["192.0.2.9:7070".into()], ..Config::default() };
+        assert_eq!(now(), (literal.underlay(), literal.announce_dev()), "derive the current route from cached addresses");
+
+        h.configure(|c| {
+            c.underlay = Some("192.0.2.10".parse().unwrap());
+            c.announce_dev = Some("lo".into());
+            Ok(())
+        })
+        .unwrap();
+        std::fs::remove_file(cache).unwrap();
+        assert_eq!(now(), (Some("192.0.2.10".parse().unwrap()), Some("lo".into())), "explicit settings override derivation");
+        h.configure(|c| {
+            c.announce_dev = Some("none".into());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(now().1, None);
+    }
+
+    /// Only a name with no entry in `RUN/peers.json` (no listener has run since a boot) is
+    /// looked up by a process other than the listener, once per process; one it has seen
+    /// never is, even with no addresses (#579).
+    #[test]
+    fn only_names_the_listener_has_not_seen_are_looked_up_once() {
+        type Memo = LookedUp;
+        let dir = crate::test_util::TempDir::new("derive-unseen");
+        let cfg =
+            Config { run: Some(dir.to_path_buf()), peers: vec!["seen.example:1".into(), "unseen.example:1".into(), "127.0.0.2:1".into()], ..Config::default() };
+        let asked = std::cell::RefCell::new(Vec::<String>::new());
+        let ok = |p: &str| {
+            asked.borrow_mut().push(p.into());
+            Ok(vec!["127.0.0.1".parse().unwrap()])
+        };
+        let hung = |p: &str| {
+            asked.borrow_mut().push(p.into());
+            Err(std::io::Error::other("DNS lookup timed out"))
+        };
+        let write = |json: &str| std::fs::write(dir.join("peers.json"), json).unwrap();
+        let local = (Some(Ipv4Addr::LOCALHOST), None);
+
+        // No listener yet: both names looked up, and found on this machine; once.
+        let memo = Memo::default();
+        assert_eq!(cfg.derived_by(&memo, Some(&ok)), (local.clone(), None));
+        assert_eq!(asked.take(), ["seen.example:1", "unseen.example:1"]);
+        assert_eq!(cfg.derived_by(&memo, Some(&ok)), (local.clone(), None));
+        assert!(asked.take().is_empty(), "looked up once per process");
+        // A caller under the host lock starts none, but has what this process found.
+        assert_eq!(cfg.derived_by(&memo, None), (local.clone(), None));
+        assert_eq!(cfg.derived_by(&Memo::default(), None).0, (None, None));
+        assert!(asked.take().is_empty());
+
+        // A lookup that hangs is waited for once: then the name counts as seen, with no addresses.
+        let memo = Memo::default();
+        let (d, why) = cfg.derived_by(&memo, Some(&hung));
+        assert_eq!((d, asked.take().len()), ((None, None), 2));
+        let why = why.unwrap();
+        assert!(why.contains("start flexvm listen") && why.contains("seen.example:1, unseen.example:1") && why.contains("timed out"), "{why}");
+        let (d, why) = cfg.derived_by(&memo, Some(&hung));
+        assert_eq!((d, asked.take()), ((None, None), Vec::<String>::new()));
+        assert!(why.unwrap().contains("start flexvm listen"), "the listener has still not looked them up");
+        // Until the listener's entry stands instead.
+        write(r#"{"names":{"seen.example:1":["127.0.0.1"],"unseen.example:1":["127.0.0.1"]}}"#);
+        assert_eq!(cfg.derived_by(&memo, Some(&hung)), (local.clone(), None));
+        assert!(asked.take().is_empty());
+
+        // The listener saw one, with no addresses: only the other is looked up.
+        write(r#"{"names":{"seen.example:1":[]}}"#);
+        let (d, why) = cfg.derived_by(&Memo::default(), Some(&hung));
+        assert_eq!((d, asked.take()), ((None, None), vec!["unseen.example:1".to_string()]));
+        assert!(why.unwrap().contains("not looked up unseen.example:1 yet: start flexvm listen"));
+
+        // It saw both: nothing is looked up, nor is the listener blamed.
+        write(r#"{"names":{"seen.example:1":[],"unseen.example:1":["127.0.0.1"]}}"#);
+        let (d, why) = cfg.derived_by(&Memo::default(), Some(&ok));
+        assert_eq!((d, asked.take()), ((None, None), Vec::<String>::new()));
+        let why = why.unwrap();
+        assert!(why.starts_with("no peer elsewhere has a known IPv4 address") && !why.contains("flexvm listen"), "{why}");
+    }
+
+    #[test]
     fn the_underlay_is_derived_toward_a_peer_elsewhere() {
         let ip = |s: &str| s.parse::<IpAddr>().unwrap();
         let mine = |a: Ipv4Addr| a == Ipv4Addr::new(10, 0, 0, 5);
@@ -4648,104 +4708,6 @@ mod tests {
         assert_eq!(derive(&["gone:1", "far:1"], true), (Ok((Some(src), Some("eth0".into()))), gone()));
         let failed = super::derive(&peers(&["far:1"]), lookup, |_| false, |_| Err("no route toward 192.0.2.9: Network is unreachable".into()));
         assert_eq!(failed.0, Err("no route toward 192.0.2.9: Network is unreachable".into()));
-    }
-
-    #[test]
-    fn derivation_keeps_the_last_good_result_and_logs_changes_only() {
-        static D: Deriver = Deriver::new(Duration::from_secs(5));
-        let peers = vec!["a:1".to_string(), "b:1".to_string()];
-        let good: Derived = (Some("192.0.2.1".parse().unwrap()), Some("eth0".into()));
-        let missing = || vec!["peer a:1: no such name".to_string()];
-        assert_eq!(D.get(&peers, move |_| (Ok(good), missing())), (Some("192.0.2.1".parse().unwrap()), Some("eth0".into())));
-        let gen = D.state.lock().unwrap().gen;
-        let good: Derived = (Some("192.0.2.1".parse().unwrap()), Some("eth0".into()));
-        // The lookup that failed was logged by the run above; the same again is not.
-        assert_eq!(D.record(gen, (Ok(good.clone()), missing())), Vec::<String>::new());
-        let logs = D.record(gen, (Err("no route".into()), missing()));
-        assert_eq!(logs.len(), 1);
-        assert!(logs[0].starts_with("no route: no underlay") && logs[0].contains("keeping the last derived"), "{logs:?}");
-        assert_eq!(D.state.lock().unwrap().good.as_ref(), Some(&good), "a failure keeps the last good result");
-        assert_eq!(D.record(gen, (Err("no route".into()), missing())), Vec::<String>::new());
-        let logs = D.record(gen, (Ok(good.clone()), vec!["peer b:1: timed out".into()]));
-        assert_eq!(logs, vec!["peer b:1: timed out".to_string()]);
-        // A derivation toward peers since replaced is dropped.
-        assert_eq!(D.record(gen - 1, (Ok((None, None)), vec!["peer c:1: gone".into()])), Vec::<String>::new());
-        assert_eq!(D.state.lock().unwrap().good.as_ref(), Some(&good));
-    }
-
-    /// A failed derivation gives nothing (never loopback for a peer elsewhere) and is not tried again until
-    /// `DERIVE_EVERY` has passed; then it is, and its success replaces the failure.
-    #[test]
-    fn a_failed_derivation_recovers_once_refreshed() {
-        static D: Deriver = Deriver::new(Duration::from_secs(60));
-        let peers = vec!["far:1".to_string()];
-        let ok: Derived = (Some("192.0.2.1".parse().unwrap()), Some("eth0".into()));
-        assert_eq!(D.get(&peers, |_| (Err("no route toward 192.0.2.9: Network is unreachable".into()), Vec::new())), (None, None));
-        assert_eq!(D.get(&peers, |_| unreachable!("tried again within DERIVE_EVERY")), (None, None));
-        // As if DERIVE_EVERY had passed (None, early in boot, counts as never derived).
-        D.state.lock().unwrap().ended = std::time::Instant::now().checked_sub(DERIVE_EVERY);
-        let good = ok.clone();
-        assert_eq!(D.get(&peers, move |_| (Ok(good), Vec::new())), (None, None), "answered at once, refreshed in the background");
-        let mut d = D.state.lock().unwrap();
-        while d.under_way {
-            let (next, timeout) = D.changed.wait_timeout(d, Duration::from_secs(60)).unwrap();
-            assert!(!timeout.timed_out(), "the refresh never ended");
-            d = next;
-        }
-        drop(d);
-        assert_eq!(D.get(&peers, |_| unreachable!("refreshed just now")), ok);
-    }
-
-    /// A derivation that hangs holds one thread at most, whatever the peers change to, and
-    /// is waited for once: later calls answer at once.
-    #[test]
-    fn a_hung_derivation_is_waited_for_once_and_peer_changes_start_no_more() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static D: Deriver = Deriver::new(Duration::from_millis(100));
-        static RUNS: AtomicUsize = AtomicUsize::new(0);
-        let peers = |p: &[&str]| p.iter().map(|p| p.to_string()).collect::<Vec<_>>();
-        let (release, hung) = std::sync::mpsc::channel::<()>();
-        let (started, running) = std::sync::mpsc::channel();
-        let start = std::time::Instant::now();
-        let first = D.get(&peers(&["hung:1", "a:1"]), move |_| {
-            RUNS.fetch_add(1, Ordering::SeqCst);
-            started.send(()).unwrap();
-            hung.recv().ok();
-            (Ok((Some("192.0.2.1".parse().unwrap()), None)), Vec::new())
-        });
-        assert_eq!(first, (None, None));
-        assert!(start.elapsed() >= Duration::from_millis(100));
-        running.recv_timeout(Duration::from_secs(30)).expect("the hung derivation never started");
-        assert_eq!(D.get(&peers(&["hung:1", "a:1"]), |_| unreachable!()), (None, None));
-        assert_eq!(RUNS.load(Ordering::SeqCst), 1, "the hung run was not started again");
-        for p in ["b:1", "c:1", "d:1"] {
-            let next = D.get(&peers(&["hung:1", p]), |_| {
-                RUNS.fetch_add(1, Ordering::SeqCst);
-                (Ok((Some("192.0.2.2".parse().unwrap()), None)), Vec::new())
-            });
-            assert_eq!(next, (None, None));
-        }
-        assert_eq!(RUNS.load(Ordering::SeqCst), 1, "one derivation under way at a time");
-        assert_eq!(D.state.lock().unwrap().peers, peers(&["hung:1", "d:1"]), "only the current peers are kept");
-        // It ends: its result, toward peers since replaced, is dropped, and the current peers' derivation runs.
-        release.send(()).unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        let mut state = D.state.lock().unwrap();
-        while state.under_way {
-            let (next, timeout) = D.changed.wait_timeout(state, deadline.saturating_duration_since(std::time::Instant::now())).unwrap();
-            assert!(!timeout.timed_out(), "the released derivation never ended");
-            state = next;
-        }
-        drop(state);
-        let expected = (Some("192.0.2.5".parse().unwrap()), None);
-        loop {
-            let result = expected.clone();
-            if D.get(&peers(&["hung:1", "e:1"]), move |_| (Ok(result), Vec::new())) == expected {
-                break;
-            }
-            assert!(std::time::Instant::now() < deadline, "the new derivation never answered");
-            std::thread::sleep(Duration::from_millis(10));
-        }
     }
 
     /// A tap is this host's by its alias alone, whatever its name: hosts
