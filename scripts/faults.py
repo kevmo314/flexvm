@@ -1802,8 +1802,8 @@ def abort_stay_fail():
     marking it here again (`abort_stay_fail`) and recording its revision (`advance_fail`, after it moved on)
     fail. It is the one owner, its address held by its generation (still lent and marked leaving:
     never free while that is unsure). Its announcement, past the revision its target took, stands
-    on the target's host, where the target's revision is stale; here a stale one leaves the route
-    on its tap. The next migration goes, and the VM's end there frees the loan."""
+    on the target's host, where the target's revision is stale; here too, once the revision write
+    is tried again and goes through (#499), and the route stays on its tap. The next migration goes, and the VM's end there frees the loan."""
     n = "ft-abort-stay"
     m = setup(n, mib=20)
     v = vms(A)[n]
@@ -1829,9 +1829,11 @@ def abort_stay_fail():
               wait_for(lambda: addr(B, ip).get("rev") == rev + 2 and addr(B, ip).get("via") == "127.0.0.1", 10), addr(B, ip))
         late = peer(B, {"op": "route", "ip": ip, "via": gw, "gen": gen, "rev": rev + 1})
         check("abort stay fail: the target's revision is stale on B", late.get("ok") and late["result"].get("stale"), late)
+        check("abort stay fail: A records its revision once the write goes through (#499)",
+              wait_for(lambda: addr(A, ip).get("rev") == rev + 2, 10) and "recorded its revision" in log(A, n)[seen:], addr(A, ip))
         late = peer(A, {"op": "route", "ip": ip, "via": gw, "gen": gen, "rev": rev + 1})
-        check("abort stay fail: on A it leaves the route on its tap",
-              late.get("ok") and (late["result"].get("stale") or late["result"].get("local")) and f"dev {tap}" in peer_route(ip), (late, peer_route(ip)))
+        check("abort stay fail: the target's revision is stale on A, the route on its tap",
+              late.get("ok") and late["result"].get("stale") and f"dev {tap}" in peer_route(ip), (late, peer_route(ip)))
         check("abort stay fail: still the one owner", where(n) == {A: "running"} and addr(A, ip).get("holder") == n, (where(n), addr(A, ip)))
     finally:
         if f"via {gw}" in peer_route(ip):

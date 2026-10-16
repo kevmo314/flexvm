@@ -185,6 +185,8 @@ pub struct Proc {
     growth: AtomicU64,
     /// Held by `publish` from reading the VM's state to writing it.
     publishing: Mutex<()>,
+    /// A failed revision write is being tried again (`advance`); set and cleared under the host lock.
+    recording: AtomicBool,
     me: std::sync::Weak<Proc>,
     announcer: Arc<Announcer>,
 }
@@ -283,6 +285,7 @@ impl Proc {
             ticks: Mutex::new(Ticks::default()),
             growth: AtomicU64::new(0),
             publishing: Mutex::new(()),
+            recording: AtomicBool::new(false),
             me: me.clone(),
             announcer,
         }))
@@ -503,13 +506,48 @@ impl Proc {
         self.addr.lock().unwrap().as_ref().map_or(0, |a| a.rev)
     }
 
-    /// Moves the VM's revision `by` on, recorded here too.
-    /// Test fault `advance_fail`: recording it here fails, the revision moved on.
+    /// Moves the VM's revision `by` on, recorded here too. If recording it
+    /// fails, a thread tries again until it is recorded, so this host's record
+    /// catches up with the revision its VM announces (#499): until then, a late
+    /// announcement of an older revision (an aborted target's) is taken here.
     pub fn advance(&self, l: &crate::host::Locked, by: u64) -> Result<()> {
-        let Some((ip, gen, rev)) = self.addr.lock().unwrap().as_mut().map(|a| {
+        if let Some(a) = self.addr.lock().unwrap().as_mut() {
             a.rev = a.rev.saturating_add(by);
-            (a.ip, a.gen, a.rev)
-        }) else {
+        }
+        let r = self.record_rev(l);
+        if r.is_err() && !self.recording.swap(true, Ordering::SeqCst) {
+            let me = self.me.clone();
+            let spawned = thread::Builder::new().name("record-rev".into()).spawn(move || {
+                retry_record(
+                    || {
+                        let p = me.upgrade()?;
+                        let l = match p.host.lock() {
+                            Ok(l) => l,
+                            Err(e) => return Some(Err(e)),
+                        };
+                        if let Err(e) = p.record_rev(&l) {
+                            return Some(Err(e));
+                        }
+                        crate::log!("vm {}: recorded its revision {} after all", p.name(), p.rev());
+                        // Under the host lock, as `advance` sets it: a failure after this starts another thread.
+                        p.recording.store(false, Ordering::SeqCst);
+                        Some(Ok(()))
+                    },
+                    thread::sleep,
+                );
+            });
+            if let Err(e) = spawned {
+                self.recording.store(false, Ordering::SeqCst);
+                crate::log!("vm {}: no thread to record its revision again: {e}", self.name());
+            }
+        }
+        r.map_err(|e| format!("{e}; trying again").into())
+    }
+
+    /// Records the VM's revision (as it is now, which only changes under the host lock) here.
+    /// Test fault `advance_fail`: it fails.
+    fn record_rev(&self, l: &crate::host::Locked) -> Result<()> {
+        let Some((ip, gen, rev)) = self.addr.lock().unwrap().as_ref().map(|a| (a.ip, a.gen, a.rev)) else {
             return Ok(());
         };
         if crate::host::tripped("advance_fail") {
@@ -2362,6 +2400,16 @@ struct Pending {
 /// The first and longest pause between tries: a peer down for long is tried quietly, and told once it is back.
 const ANNOUNCE_RETRY: (Duration, Duration) = (Duration::from_millis(250), Duration::from_secs(60));
 
+/// Calls `attempt` until it succeeds or has nothing left to do (None), napping
+/// between tries, from 50 ms up to 2 s.
+fn retry_record(mut attempt: impl FnMut() -> Option<Result<()>>, nap: impl Fn(Duration)) {
+    let mut wait = Duration::from_millis(50);
+    while let Some(Err(_)) = attempt() {
+        nap(wait);
+        wait = (wait * 2).min(Duration::from_secs(2));
+    }
+}
+
 impl Announcer {
     fn start(
         spawn: fn(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
@@ -2748,6 +2796,31 @@ mod tests {
         assert_eq!(first.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock, "removed peers receive no new routes");
         drop(commands);
         controller.join().unwrap();
+    }
+
+    /// A failed revision write is tried again, backing off, until it is recorded or there is nothing to record (#499).
+    #[test]
+    fn revision_writes_are_tried_until_recorded() {
+        let (tries, naps) = (std::cell::Cell::new(0), std::cell::RefCell::new(Vec::new()));
+        retry_record(
+            || {
+                tries.set(tries.get() + 1);
+                Some(if tries.get() < 8 { Err("down".into()) } else { Ok(()) })
+            },
+            |d| naps.borrow_mut().push(d.as_millis()),
+        );
+        assert_eq!(tries.get(), 8);
+        assert_eq!(*naps.borrow(), [50, 100, 200, 400, 800, 1600, 2000]);
+        // The VM went: no more tries.
+        let tries = std::cell::Cell::new(0);
+        retry_record(
+            || {
+                tries.set(tries.get() + 1);
+                (tries.get() < 3).then(|| Err("down".into()))
+            },
+            drop,
+        );
+        assert_eq!(tries.get(), 3);
     }
 
     /// A peer no longer configured is not told on; one down for long (past 36 tries) is told once it is back.
