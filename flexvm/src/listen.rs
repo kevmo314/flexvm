@@ -20,7 +20,8 @@ use crate::util::{send_json, Result, Slot};
 
 /// Requests handled at once; more connections are closed unanswered.
 const MAX_ACTIVE: usize = 512;
-static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+const MAX_ACTIVE_FROM: usize = MAX_ACTIVE / 2;
+static ACTIVE: std::sync::LazyLock<Waiting> = std::sync::LazyLock::new(|| Waiting::new(MAX_ACTIVE, MAX_ACTIVE_FROM));
 /// Of those, requests that take the host lock (`route`, `lend`, `migration`); more are
 /// refused as busy. The rest stay for requests that need none, page handoffs above all,
 /// however long the lock's holder keeps it (a stalled disk, a stopped VM process).
@@ -168,7 +169,7 @@ pub fn main(host: Host, listener: TcpListener) -> Result<()> {
         // peer just added, a peer by name back on a new address).
         let waiting = match peers.check(&host.config_now().peers, from) {
             Admission::Peer => {
-                let Some(slot) = Slot::take(&ACTIVE, MAX_ACTIVE) else { continue };
+                let Some(slot) = ACTIVE.take(from) else { continue };
                 let (host, peers) = (host.clone(), peers.clone());
                 std::thread::spawn(move || serve(&host, &peers, conn, slot, deadline));
                 continue;
@@ -185,7 +186,7 @@ pub fn main(host: Host, listener: TcpListener) -> Result<()> {
         std::thread::spawn(move || {
             let admitted = peers.admit_by(&host, from, Instant::now() + ADMIT_WAIT);
             drop(waiting);
-            match admitted.then(|| Slot::take(&ACTIVE, MAX_ACTIVE)).flatten() {
+            match admitted.then(|| ACTIVE.take(from)).flatten() {
                 Some(slot) => serve(&host, &peers, conn, slot, deadline),
                 None if !admitted => not_a_peer(conn, from),
                 None => {}
@@ -195,7 +196,7 @@ pub fn main(host: Host, listener: TcpListener) -> Result<()> {
     Ok(())
 }
 
-fn serve(host: &Host, peers: &Peers, conn: TcpStream, _slot: Slot, deadline: Instant) {
+fn serve(host: &Host, peers: &Peers, conn: TcpStream, _slot: Wait, deadline: Instant) {
     let _ = conn.set_nodelay(true);
     if let Err(e) = handle(host, peers, conn, deadline) {
         crate::log!("peer request: {e}");
@@ -456,7 +457,9 @@ fn handle(host: &Host, peers: &Peers, mut conn: TcpStream, deadline: Instant) ->
         "route" => peers
             .all_addrs(&host.config_now().peers, Instant::now() + ADMIT_WAIT)
             .and_then(|p| route(host, &req, &[p, conn.peer_addr().into_iter().map(|a| a.ip()).collect()].concat())),
-        "lend" => lend(host, &req),
+        "lend" => peers
+            .all_addrs(&host.config_now().peers, Instant::now() + ADMIT_WAIT)
+            .and_then(|p| lend(host, &req, &[p, conn.peer_addr().into_iter().map(|a| a.ip()).collect()].concat())),
         // Whether a migration's source process is proven gone (never from published state).
         "source" => serde_json::from_value(req["ident"].clone())
             .map_err(|e| format!("bad ident: {e}").into())
@@ -538,13 +541,20 @@ fn incoming(host: &Host, req: &Value, line: &[u8], conn: TcpStream, by: Instant)
     // Each arrival owns its log until accepted; refusing a duplicate name
     // must not remove the running VM's log.
     static ARRIVAL: AtomicUsize = AtomicUsize::new(0);
-    // Locked for the arrival's life (its stdout shares the lock), so a dead
-    // arrival's log is told from a live one's and swept (`gc`), and a later
-    // listener counts it, by its peer (`earlier_arrivals`).
+    // Its lock (`RUN/vms/.locks/` and the log's name), made before the log, is held
+    // until the arrival publishes or removes its log (its fd 5 shares it), so a dead
+    // arrival's log is told from a live one's and swept (`gc`), and a later listener
+    // counts it, by its peer (`earlier_arrivals`).
     let n = ARRIVAL.fetch_add(1, Ordering::Relaxed);
-    let log_path = host.run.join("vms").join(format!("{}{}-{n}-{from}.log", crate::gc::ARRIVAL_LOG, std::process::id()));
-    let log = std::fs::OpenOptions::new().create_new(true).append(true).open(&log_path)?;
-    crate::host::flock(&log, libc::LOCK_SH)?;
+    let file = format!("{}{}-{n}-{from}.log", crate::gc::ARRIVAL_LOG, std::process::id());
+    let vms = host.run.join("vms");
+    let (log_path, lock_path) = (vms.join(&file), crate::host::locks(&vms).join(&file));
+    let lock = crate::host::private_file(&lock_path)?;
+    crate::host::flock(&lock, libc::LOCK_SH)?;
+    let log = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new().create_new(true).append(true).mode(0o600).open(&log_path).inspect_err(|_| drop(std::fs::remove_file(&lock_path)))?
+    };
     let args = ["--state".as_ref(), host.state.as_os_str(), "--run".as_ref(), host.run.as_os_str(), "run".as_ref(), "--incoming".as_ref()];
     let (done, told) = std::os::unix::net::UnixStream::pair()?;
     let by = (monotonic_ms() + by.saturating_duration_since(Instant::now()).as_millis() as u64).to_string();
@@ -553,6 +563,7 @@ fn incoming(host: &Host, req: &Value, line: &[u8], conn: TcpStream, by: Instant)
         &log,
         conn.as_raw_fd(),
         Some(told.as_raw_fd()),
+        Some(lock.as_raw_fd()),
         &[
             ("FLEXVM_INCOMING", std::str::from_utf8(line)?),
             ("FLEXVM_INCOMING_LOG", log_path.to_str().ok_or("non-UTF8 log path")?),
@@ -565,6 +576,7 @@ fn incoming(host: &Host, req: &Value, line: &[u8], conn: TcpStream, by: Instant)
         Ok(child) => crate::util::reap_later(child, Some((done.into(), Box::new(slot)))),
         Err(e) => {
             let _ = std::fs::remove_file(log_path);
+            let _ = std::fs::remove_file(lock_path);
             refuse(&conn, format!("cannot start the vm process: {e}"))?;
         }
     }
@@ -577,7 +589,7 @@ fn incoming(host: &Host, req: &Value, line: &[u8], conn: TcpStream, by: Instant)
 fn earlier_arrivals(host: &Host) -> HashMap<IpAddr, usize> {
     let me = std::process::id().to_string();
     let mut n = HashMap::new();
-    for e in std::fs::read_dir(host.run.join("vms")).into_iter().flatten().flatten() {
+    for e in std::fs::read_dir(crate::host::locks(&host.run.join("vms"))).into_iter().flatten().flatten() {
         let name = e.file_name();
         let Some(rest) = name.to_str().and_then(|f| f.strip_prefix(crate::gc::ARRIVAL_LOG)?.strip_suffix(".log")) else { continue };
         let mut parts = rest.splitn(3, '-');
@@ -592,11 +604,15 @@ fn earlier_arrivals(host: &Host) -> HashMap<IpAddr, usize> {
 
 /// Publish only an accepted arrival's log. A refused arrival owns only its
 /// temporary file, even when the requested name already belongs to a VM.
+/// Its lock goes with it: held, it is the caller's to let go of then.
 pub fn finish_incoming_log(host: &Host, name: &str, log: &std::path::Path, accepted: bool) -> Result<()> {
     if accepted {
         std::fs::rename(log, host.vms(name, "log")?)?;
     } else {
         std::fs::remove_file(log)?;
+    }
+    if let Some(file) = log.file_name() {
+        let _ = std::fs::remove_file(crate::host::locks(&host.run.join("vms")).join(file));
     }
     Ok(())
 }
@@ -638,8 +654,9 @@ fn migration(host: &Host, req: &Value) -> Result<Value> {
     Ok(json!({"outcome": outcome, "underlay": host.config_now().underlay().map(|u| u.to_string())}))
 }
 
-fn lend(host: &Host, req: &Value) -> Result<Value> {
+fn lend(host: &Host, req: &Value, peers: &[IpAddr]) -> Result<Value> {
     let ip: Ipv4Addr = req["ip"].as_str().ok_or("missing ip")?.parse()?;
+    routable(ip, &host.config_now(), peers, &crate::net::gateways(&std::fs::read_to_string("/proc/net/route")?))?;
     let gen = host.lend_new(&host_lock(host)?, ip)?;
     Ok(json!({"ip": ip.to_string(), "gen": gen}))
 }
@@ -680,6 +697,16 @@ fn route(host: &Host, req: &Value, peers: &[IpAddr]) -> Result<Value> {
     Ok(json!({"ip": ip.to_string(), "local": local}))
 }
 
+/// Validate addresses from migrations and checkpoints before preparing or claiming them.
+pub fn check_vm_ip(host: &Host, ip: Ipv4Addr, from: Option<IpAddr>, by: Instant) -> Result<()> {
+    static PEERS: std::sync::LazyLock<Peers> = std::sync::LazyLock::new(Peers::default);
+    let cfg = host.config_now();
+    PEERS.refresh(&cfg.peers);
+    let mut peers = PEERS.all_addrs(&cfg.peers, by)?;
+    peers.extend(from);
+    routable(ip, &cfg, &peers, &crate::net::gateways(&std::fs::read_to_string("/proc/net/route")?))
+}
+
 /// A peer routes only a VM's address, never one this host reaches its peers or network by (#365).
 fn routable(ip: Ipv4Addr, cfg: &crate::host::Config, peers: &[IpAddr], gateways: &[Ipv4Addr]) -> Result<()> {
     let peer = is_peer(peers, IpAddr::V4(ip));
@@ -693,6 +720,32 @@ fn routable(ip: Ipv4Addr, cfg: &crate::host::Config, peers: &[IpAddr], gateways:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admitted_connections_leave_half_the_slots_for_other_peers() {
+        let active = Waiting::new(MAX_ACTIVE, MAX_ACTIVE_FROM);
+        let one = "10.9.0.1".parse().unwrap();
+        let two = "10.9.0.2".parse().unwrap();
+        let mut held: Vec<_> = (0..MAX_ACTIVE_FROM).map(|_| active.take(one).unwrap()).collect();
+        assert!(active.take(one).is_none());
+        assert!(active.take("::ffff:10.9.0.1".parse().unwrap()).is_none());
+        let others: Vec<_> = (0..MAX_ACTIVE_FROM).map(|_| active.take(two).unwrap()).collect();
+        assert!(active.take("10.9.0.3".parse().unwrap()).is_none());
+        held.pop();
+        assert!(active.take(one).is_some());
+        drop((held, others));
+        assert!(active.held.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn lend_refuses_peer_addresses_without_creating_a_record() {
+        let root = crate::test_util::TempDir::new("lend-peer");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let ip = "10.9.0.1";
+        let e = lend(&host, &json!({"ip": ip}), &[ip.parse().unwrap()]).unwrap_err();
+        assert!(e.to_string().contains("not a vm's address"));
+        assert!(!host.state.join("addrs").join(ip).exists());
+    }
 
     /// In a child started with a descriptor on fd 3, as systemd would: none of this one's is touched.
     #[test]
@@ -797,7 +850,9 @@ mod tests {
             let reply = crate::util::recv_json(&mut std::io::BufReader::new(&client)).unwrap().unwrap();
             assert_eq!(reply["ok"], false);
             assert!(reply["error"].as_str().unwrap().contains(why), "{reply}");
-            assert_eq!(std::fs::read_dir(host.run.join("vms")).unwrap().count(), 0, "no arrival log made");
+            let vms = host.run.join("vms");
+            let made = |d: &std::path::Path| std::fs::read_dir(d).unwrap().filter(|e| e.as_ref().unwrap().file_name() != crate::host::LOCKS).count();
+            assert_eq!(made(&vms) + made(&crate::host::locks(&vms)), 0, "no arrival log or lock made");
         };
         let held = || ARRIVALS.held.lock().unwrap().values().sum::<usize>();
         let take = |from: &str, n: usize| (0..n).map(|_| ARRIVALS.take(from.parse().unwrap()).unwrap()).collect::<Vec<_>>();
@@ -820,18 +875,18 @@ mod tests {
     }
 
     /// Arrivals an earlier listener started outlive it: a restarted one counts their
-    /// locked logs, by peer, and admits none past either bound (#521).
+    /// locks (`.locks/` and the log's name), by peer, and admits none past either bound (#521).
     #[test]
     fn arrivals_an_earlier_listener_started_count_against_both_bounds() {
         let root = crate::test_util::TempDir::new("arrivals-earlier");
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
-        let vms = host.run.join("vms");
+        let vms = crate::host::locks(&host.run.join("vms"));
         let line = br#"{"op":"migrate_in","name":"web"}"#;
         // Each held as its arrival holds it; `None`: dead, unlocked. An arrival that
         // ends is taken away by its name (a lock let go may linger a moment in a child
         // another test forks meanwhile).
         let log = |name: String, live: bool| {
-            let f = std::fs::File::create(vms.join(&name)).unwrap();
+            let f = crate::host::private_file(&vms.join(&name)).unwrap();
             live.then(|| (crate::host::flock(&f, libc::LOCK_SH).map(|()| f).unwrap(), vms.join(name)))
         };
         let end = |logs: Vec<Option<(std::fs::File, std::path::PathBuf)>>| logs.into_iter().flatten().for_each(|(_, p)| std::fs::remove_file(p).unwrap());
@@ -880,7 +935,7 @@ mod tests {
         };
         let requests = [json!({"op": "lend", "ip": "10.200.0.7"}), json!({"op": "migration", "mig": 7}), json!({"op": "route", "ip": "10.200.0.8", "gen": 3})];
         // Held by another process, as one stopped while holding it would.
-        let held = std::fs::File::create(host.state.join("lock")).unwrap();
+        let held = crate::host::private_file(&host.lock_file()).unwrap();
         crate::host::flock(&held, libc::LOCK_EX).unwrap();
         std::thread::scope(|s| {
             let waits: Vec<_> = requests.iter().map(|r| s.spawn(|| ask(r.clone()))).collect();

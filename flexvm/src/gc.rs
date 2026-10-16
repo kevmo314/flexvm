@@ -59,7 +59,7 @@ pub fn sweep(host: &Host) {
 
 /// Local sweeps are one at a time (`RUN/.gc.lock`).
 pub fn local_cleanup(host: &Host) {
-    let Ok(lock) = File::create(host.run.join(".gc.lock")) else { return };
+    let Ok(lock) = crate::host::private_file(&crate::host::locks(&host.run).join("gc")) else { return };
     let Ok(_lock) = Flock::new(lock, libc::LOCK_EX | libc::LOCK_NB) else { return };
     if let Err(e) = host.collect_garbage() {
         crate::log!("garbage collection: {e}");
@@ -108,8 +108,11 @@ fn vm_files(host: &Host) {
     let logs = host.logs_lock(libc::LOCK_EX | libc::LOCK_NB).ok();
     for (file, path) in files() {
         if file.starts_with(ARRIVAL_LOG) && file.ends_with(".log") {
-            if age(&path).is_some_and(|a| a > ARRIVAL_GRACE) && locked(&path, libc::LOCK_EX) == Some(false) {
+            // Its lock is made first, so one missing is an arrival's that ended.
+            let lock = crate::host::locks(&host.run.join("vms")).join(&file);
+            if age(&path).is_some_and(|a| a > ARRIVAL_GRACE) && locked(&lock, libc::LOCK_EX) != Some(true) {
                 let _ = std::fs::remove_file(&path);
+                let _ = std::fs::remove_file(&lock);
             }
             continue;
         }
@@ -121,18 +124,21 @@ fn vm_files(host: &Host) {
         let Ok(suspended) = host.suspended(name) else { continue };
         let orphan = host.holder_gone(name) && !suspended.exists() && !["failed", "moved"].iter().any(|ext| host.vms(name, ext).is_ok_and(|p| p.exists()));
         if orphan {
+            // Its writers' lock (`output::log_lock`) stays: one may have it open, not yet
+            // locked, and a new one would let two writers rotate at once.
             let _ = std::fs::remove_file(&path);
         }
     }
 }
 
-/// `PID.sock`, `PID-START.claim` and `PID-START.take` (a claimer's) of standbys whose locks are gone,
-/// and `.PID-START.lock` (a lock not yet in place, unlocked at first) of standbys gone.
+/// `PID.sock`, and in `.locks`, `PID-START.claim` and `PID-START.take` (a claimer's) of standbys
+/// whose locks are gone, and `.PID-START.lock` (a lock not yet in place, unlocked at first) of standbys gone.
 fn standby_sockets(dir: &Path) {
+    let locks = crate::host::locks(dir);
     // Held while a standby replaces its socket (`standby::serve`): a reused pid's new socket is seen with its lock held.
     // Not waited for: a standby stopped holding it would stall every sweep.
-    let Ok(_publish) = File::create(dir.join(".publish")).and_then(|f| Flock::new(f, libc::LOCK_EX | libc::LOCK_NB)) else { return };
-    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+    let Ok(_publish) = crate::host::private_file(&locks.join("publish")).and_then(|f| Flock::new(f, libc::LOCK_EX | libc::LOCK_NB)) else { return };
+    for e in [dir, &locks].iter().flat_map(|d| std::fs::read_dir(d).into_iter().flatten().flatten()) {
         let n = e.file_name().to_string_lossy().into_owned();
         let claim = n.strip_suffix(".claim").or_else(|| n.strip_suffix(".take"));
         let tmp = n.strip_prefix('.').and_then(|n| n.strip_suffix(".lock"));
@@ -147,7 +153,7 @@ fn standby_sockets(dir: &Path) {
         let free = match (tmp, pid.parse(), start.parse()) {
             (Some(_), Ok(pid), Ok(start)) => Ident { pid, start, boot: boot_id().into() }.liveness() == Liveness::Gone,
             (Some(_), ..) => false,
-            _ => match File::open(dir.join(format!("{id}.lock"))) {
+            _ => match File::open(locks.join(format!("{id}.lock"))) {
                 Ok(f) => probe(&f, libc::LOCK_SH).is_ok(),
                 Err(e) => e.kind() == std::io::ErrorKind::NotFound,
             },
@@ -170,29 +176,31 @@ mod tests {
     #[test]
     fn a_dead_standbys_socket_goes_a_live_ones_stays() {
         let d = dir("socks");
-        let held = File::create(d.join("1-1.lock")).unwrap();
+        let l = crate::host::locks(&d);
+        crate::host::private_dir(&l).unwrap();
+        let held = File::create(l.join("1-1.lock")).unwrap();
         flock(&held, libc::LOCK_EX).unwrap();
-        File::create(d.join("2-1.lock")).unwrap();
-        let claiming = File::create(d.join("4-1.claim")).unwrap();
+        File::create(l.join("2-1.lock")).unwrap();
+        let claiming = File::create(l.join("4-1.claim")).unwrap();
         flock(&claiming, libc::LOCK_EX).unwrap();
         for s in ["1-1.lock", "3-1.claim", "5-6.claim", "5-7.claim", "3-1.take", "5-7.take"] {
-            File::create(d.join(s)).unwrap();
+            File::create(l.join(s)).unwrap();
         }
-        let other = File::create(d.join("5-7.lock")).unwrap();
+        let other = File::create(l.join("5-7.lock")).unwrap();
         flock(&other, libc::LOCK_EX).unwrap();
         // Lock files not yet renamed in place: a dead process's goes, a live one's stays, locked or not.
         let mine = format!(".{}.lock", Ident::me().key());
         for s in [".999999999-1.lock", &mine] {
-            File::create(d.join(s)).unwrap();
+            File::create(l.join(s)).unwrap();
         }
         let me = Ident::me();
-        let live_lock = File::create(d.join(format!("{}.lock", me.key()))).unwrap();
+        let live_lock = File::create(l.join(format!("{}.lock", me.key()))).unwrap();
         flock(&live_lock, libc::LOCK_EX).unwrap();
         let live_sock = format!("{}.sock", me.pid);
         File::create(d.join(&live_sock)).unwrap();
         File::create(d.join("999999990.sock")).unwrap();
         standby_sockets(&d);
-        let left = |n: &str| d.join(n).exists();
+        let left = |n: &str| d.join(n).exists() || l.join(n).exists();
         assert!(left(&live_sock));
         assert!(!left("999999990.sock"));
         assert!(left("4-1.claim") && left("5-7.claim"), "a claim marker of a standby still here stays");
@@ -202,19 +210,19 @@ mod tests {
         assert!(!left(".999999999-1.lock") && left(&mine));
     }
 
-    /// A sweep skips the dir while a standby replaces its socket under its `.publish` (one stopped there stalls no
+    /// A sweep skips the dir while a standby replaces its socket under its `.locks/publish` (one stopped there stalls no
     /// sweep), sweeps it once free, and keeps that lock file.
     #[test]
     fn socket_sweep_skips_a_standby_publishing() {
         let d = dir("publish");
         File::create(d.join("999999990.sock")).unwrap();
-        let publishing = File::create(d.join(".publish")).unwrap();
+        let publishing = crate::host::private_file(&crate::host::locks(&d).join("publish")).unwrap();
         flock(&publishing, libc::LOCK_EX).unwrap();
         standby_sockets(&d);
         assert!(d.join("999999990.sock").exists(), "skipped, not waited for");
         flock(&publishing, libc::LOCK_UN).unwrap();
         standby_sockets(&d);
-        assert!(!d.join("999999990.sock").exists() && d.join(".publish").exists());
+        assert!(!d.join("999999990.sock").exists() && crate::host::locks(&d).join("publish").exists());
     }
 
     #[test]
@@ -236,14 +244,14 @@ mod tests {
     fn busy_retirement_does_not_block_local_cleanup() {
         let d = dir("retire-lock");
         let host = Host::open(&d.join("state"), &d.join("run")).unwrap();
-        let retirement = File::create(host.run.join(".retire.lock")).unwrap();
+        let retirement = crate::host::private_file(&crate::host::locks(&host.run).join("retire")).unwrap();
         flock(&retirement, libc::LOCK_EX | libc::LOCK_NB).unwrap();
         let marker = host.vms("gone", "moved").unwrap();
         File::create(&marker).unwrap().set_modified(SystemTime::now() - MOVED_TTL - Duration::from_secs(1)).unwrap();
         sweep(&host);
         assert!(!marker.exists());
         // Let go explicitly: another test's child, forked but not yet exec'd, may share it.
-        let gc = File::open(host.run.join(".gc.lock")).unwrap();
+        let gc = File::open(crate::host::locks(&host.run).join("gc")).unwrap();
         assert!(flock(&gc, libc::LOCK_EX | libc::LOCK_NB).is_ok(), "the sweep let go of its lock");
     }
 
@@ -263,6 +271,24 @@ mod tests {
         assert!(logs.iter().all(|p| !p.exists()), "without its snapshot the old logs are orphaned");
     }
 
+    /// An orphaned log goes; its writers' lock stays, since a writer may have it open,
+    /// not yet locked, and a new one would let two writers rotate at once.
+    #[test]
+    fn a_logs_writer_lock_outlives_the_log() {
+        let d = dir("writer-lock");
+        let host = Host::open(&d.join("state"), &d.join("run")).unwrap();
+        let log = host.vms("gone", "log").unwrap();
+        assert!(crate::util::output::append_capped(&log, b"x\n", 1 << 20));
+        File::options().append(true).open(&log).unwrap().set_modified(SystemTime::now() - ORPHAN_LOG_TTL - Duration::from_secs(60)).unwrap();
+        let lock = crate::util::output::log_lock(&log).unwrap();
+        let writer = File::open(&lock).unwrap();
+        vm_files(&host);
+        assert!(!log.exists() && lock.exists(), "the log goes, its lock stays");
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(writer.metadata().unwrap().ino(), std::fs::metadata(&lock).unwrap().ino());
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
     #[test]
     fn dead_arrivals_logs_and_old_markers_go() {
         let d = dir("vmfiles");
@@ -276,7 +302,7 @@ mod tests {
         let dead = at(".incoming-1-0.log", old);
         let fresh = at(".incoming-1-1.log", SystemTime::now());
         let live = at(".incoming-1-2.log", old);
-        let held = File::open(&live).unwrap();
+        let held = crate::host::private_file(&crate::host::locks(&host.run.join("vms")).join(".incoming-1-2.log")).unwrap();
         flock(&held, libc::LOCK_SH).unwrap();
         let moved = at("gone.moved", old);
         let recent_moved = at("web.moved", SystemTime::now());

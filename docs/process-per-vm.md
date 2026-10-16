@@ -15,7 +15,7 @@ flexvm run web -d         # same, detached; prints {"name","ip","pid",...} once 
 
 A VM process:
 
-1. takes its name (an exclusive `flock` on `RUN/vms/NAME.lock`, held for
+1. takes its name (an exclusive `flock` on `RUN/vms/.locks/NAME.lock`, held for
    life, its pid and start time written in it),
 2. claims an address and generation (under the host lock, below),
 3. restores the template snapshot into a Firecracker it spawns itself
@@ -138,8 +138,11 @@ STATE (default /var/lib/flexvm, on disk)
   templates/             built templates: NAME -> .gen/ID (see internals.md)
   images/                pulled container images: blobs/sha256/, rootfs/KEY.ext4 (see images.md)
   host.json              host config (`flexvm config`'s; listen is `flexvm listen`'s): listen, peers, vm_ips, underlay, announce_dev, dns, reserve_mib, evict_mib; unset ones are derived where used
-  run.json               canonical run path, bound on first open under the state root's flock; fsynced
-  lock                   the host lock (flock), held for short critical sections only
+  run.json               canonical run path, bound on first open under `.locks/open`'s flock; fsynced
+  .locks/                root's locks (0700): open (held while a root `Host::open` binds or repairs the root),
+                         host (the host lock, held for short critical sections only), evict (one eviction
+                         decider at a time), evict.worker (held by the thread running an eviction; arrivals
+                         by eviction are refused meanwhile), standby.stop (held while pressure stops standby VMs)
   .synced                the root's (dev, inode) once its directories were made durable (`Host::open`)
   addrs/IP               per address: newest generation seen, withdrawn?, lent generation, holder name, instance
                          (pid, start time) and generation, the route a peer announced for the newest generation
@@ -150,35 +153,34 @@ STATE (default /var/lib/flexvm, on disk)
                          + STARTED, DISCARDED, QUARANTINE markers; without a manifest, or STARTED or
                          DISCARDED, it is debris: never listed, removed by the name's next holder
   standby/TEMPLATE       how many standby VMs to keep for a template
-  standby.stop.lock      held while pressure stops standby VMs (SIGUSR1)
   migs/ID                incoming migration records (fencing), JSON, fsynced
   owed/ID                migrations away whose source was killed before it knew the outcome: target, address, generation (`Host::settle_owed`)
-  evict.lock             one eviction decider at a time (flock)
-  evict.worker.lock      held by the thread running an eviction; arrivals by eviction are refused meanwhile
   evict.last             its mtime: when an eviction last started (5 s apart)
   staging/               where image layers unpack (`template --image`); its ancestry must be root-owned
 RUN (default /run/flexvm, tmpfs)
-  vms/NAME.{lock,json,sock,log}   registry entry, liveness lock, control socket, log of -d/standby VMs
+  vms/NAME.{json,sock,log}        registry entry, control socket, log of -d/standby VMs (0600)
+  vms/.locks/NAME.lock            liveness lock; NAME.log, a log's writers' lock; .incoming-*.log, an arrival's lock
   vms/NAME.{failed,moved}         why a VM died (until `flexvm kill`); where it migrated to (an hour)
   vms/.incoming-LPID-N-PEER.log   an arrival's log until it is accepted (as NAME.log) or refused; locked by the arrival
   state.json             canonical state path, claimed on first open by a hard link (one state wins a race)
-  .gc, .gc.lock          when garbage was last swept periodically; one sweep at a time
+  .gc                   when garbage was last swept periodically
   claims/IP              the boot id, written before an address record is written without fsync (a fresh start's
                          claim), removed once a durable write replaces it
   .gens.next             the next generation, with the boot id and the synced mark it is under; trusted only while
                          addrs/.gens holds that mark, else the next generation reserves and syncs a new one
-  .logs.lock             logs are opened holding it shared, swept holding it exclusively
-  holds/ID-MIB           memory admitted to a live process, flocked by it (`.ID` while being made)
+  .locks/                root's locks (0700): gc (one sweep at a time), logs (logs are opened holding it
+                         shared, swept holding it exclusively), owed, retire, withdrawals
+  .locks/holds/ID-MIB    memory admitted to a live process, flocked by it (`.ID` while being made)
   grants-BOOTID          recent grants not yet held, counted against the reserve
   evict.active           present while the host is under its eviction mark
   evict.backoff          refused VM and peer pairs and when to try them again
   standby/H/             template T's standby files, H the 16-hex hash of T's name (independent of T's length;
                          `flexvm standby` shows each one's `dir`)
   standby/H/.template    T, the template's name
-  standby/H/PID.sock     a standby VM of template T (PID-START.lock while it lives)
-  standby/H/PID-START.claim  locked by a standby VM while a claim of it is under way
-  standby/H/PID-START.take   locked by a `run` while it tries that standby (others try another first)
-  standby/H/.refill      one refill of T at a time (flock)
+  standby/H/PID.sock     a standby VM of template T (.locks/PID-START.lock while it lives)
+  standby/H/.locks/      PID-START.claim (locked by a standby VM while a claim of it is under way),
+                         PID-START.take (locked by a `run` while it tries that standby; others try another
+                         first), refill (one refill of T at a time), publish (held while a socket is replaced)
   standby/H/.failed      its mtime: T's last failed refill (none for a minute after)
   standby/H/standby.log  the standby VMs' output and refill errors
   standby/.pressure      its mtime: when pressure last stopped standby VMs (no refill for a minute)
@@ -189,6 +191,25 @@ RUN (default /run/flexvm, tmpfs)
                          process with its pid never shares it): `owner` (pid, start time), and per
                          Firecracker a directory with `fc` (its pid and start time)
 ```
+
+Every lock flexvm flocks is a 0600 file in a directory only root may enter
+(0700, root's), opened relative to that directory's descriptor once it was
+checked, never through a link: Linux grants an exclusive flock through a
+read-only descriptor, so a lock any user can open is one any user can hold.
+Locks on what is in `STATE` and `RUN` are in a `.locks` directory beside it.
+Locks on what may lie where other users can write are in the host's own lock
+directory, `/run/flexvm-locks`, shared by every instance whatever its `--state`
+and `--run`, each named for its target directory's (dev, inode): a checkpoint
+destination's (`checkpoint-DEV-INO`, held while staging is made there and stale
+staging cleared), an image directory's (`image-DEV-INO-KEY.lock`,
+`publish-DEV-INO`) and the templates directory's (`templates-DEV-INO`,
+`verify-DEV-INO-ID`, `template-new-DEV-INO-STAGING`). Readable files and
+directories (logs, checkpoint directories, the state root) are never flocked; a
+log's writers' lock stays when the log goes. A non-root `flexvm ls` opens the
+state root without its lock and shows entries whose process is alive, without
+the lock's check. Files of the older layout (`STATE/lock` and the like) are
+never used; running older and newer flexvm binaries on one host at once is
+unsupported.
 
 **Liveness** is the name lock: a registry entry whose `.lock` can be locked
 belongs to a dead process and is ignored; an entry is believed only for the
@@ -214,7 +235,7 @@ alive after it), so they die anyway; reaping makes the order certain.
 every listener and VM process about every 30 s, a VM process's first as it
 starts (whichever process finds `RUN/.gc` older than that sweeps, so a start
 right after another sweep does not; one sweep at a time under
-`RUN/.gc.lock`), so a host with no VM starting still sweeps.
+`RUN/.locks/gc`), so a host with no VM starting still sweeps.
 What a process owns goes once that process is proven gone: taps
 (`<prefix><pid hex>t<n>`, and a template build's `<prefix>x<pid hex>`),
 by their alias, never their name: `flexvm PID START RUN`, set before the
@@ -224,18 +245,18 @@ devices whose alias names its run directory and an owner proven gone
 taps with no such alias, an earlier version's say, are never touched); a
 process with a reused pid removes its dead namesake's as it starts, as their
 names would be its own (`host::clear_taps`), Firecrackers' cgroups (`idle-<pid>-<start>-<n>`, by the process's identity), work directories, names, a standby
-VM's socket (its `PID-START.lock` free) and a lock it died before renaming in place (`.PID-START.lock`), an arrival's log (no lock on it, 5 s
+VM's socket (its `PID-START.lock` free) and a lock it died before renaming in place (`.PID-START.lock`), an arrival's log (its lock in `vms/.locks` free or gone, 5 s
 old). A VM process's own cgroup (`vm-PID-START`) goes once empty, never
 killed (`rmdir` refuses a populated cgroup). An earlier version's
 Firecracker cgroups (`idle-PID-N`, no start time) are left alone. The logs of a name with no
 VM, suspended VM, `failed` or `moved` record go once unwritten for an hour,
-decided and removed holding `RUN/.logs.lock`, which a start holds (shared)
+decided and removed holding `RUN/.locks/logs`, which a start holds (shared)
 while it opens and marks its log (whether a VM holds the name is read from its lock's record, never by probing the lock a start takes without waiting); `NAME.moved` goes after an hour.
 Released migration records are retired as below. Logs are capped by their
 writers, not swept (`output::append_capped`): every write a VM process's
 output relay makes to a log in the run directory, whichever process and
-stream, is made under `RUN/.rotate.lock` to the file at the
-log's path then (reopened if another writer rotated it), and past 8 MiB
+stream, is made under the log's lock (`.locks/NAME` in its directory, never the
+log itself) to the file at the log's path then, and past 8 MiB
 renames it `NAME.log.1` and starts a new one. No write goes to a rotated
 or removed generation, and none is cut.
 
@@ -312,7 +333,7 @@ minus the reserve and the grants of the last 10 s (`RUN/grants`); an
 arrival's or checkpoint restore's grant (including a suspended resume) is
 held past that until all its memory is here, or it ends, as it comes in only
 as the pull goes: made with the grant in one critical
-section, it is a file (`RUN/holds/ID-MIB`) its process keeps flocked, so it
+section, it is a file (`RUN/.locks/holds/ID-MIB`) its process keeps flocked, so it
 goes with the process whatever becomes of the file (admission removes one
 whose lock is free). A start refused fails before it loads
 anything. Standby refills stop under it.
@@ -435,7 +456,7 @@ comes back after a reboot, a template rebuild or a standby's death. A foreground
 one forwards its signals to it and exits with the status the VM process sends
 back on the claim connection. Under memory pressure standby VMs are stopped
 (SIGUSR1) first. The count is explicit, and refills stop under the reserve; one refill
-of a template runs at a time (`.refill` lock), and waits until the standby
+of a template runs at a time (`.locks/refill`), and waits until the standby
 VMs it starts are ready (a minute at most each), so concurrent claims never overfill. A claim sent
 but not answered (the standby died, or hung up) is an uncertain outcome: the
 guest may have run, so `run` reports it (with the standby's socket, and
@@ -460,7 +481,7 @@ and publishes how fast its memory
 it moves to another power of two; an arrival's pull does not count).
 Pressure relief needs one decider per host: every second each VM process
 whose host is under pressure, or whose VM is starved, tries
-`STATE/evict.lock` (non-blocking). Pressure starts when MemAvailable falls
+`STATE/.locks/evict` (non-blocking). Pressure starts when MemAvailable falls
 under the high-water mark (`evict_mib`, `config --evict-at`; default the
 reserve plus the reserve or 512 MiB, whichever is more; the reserve's default
 is a sixteenth of the host's RAM, from 256 MiB to 4 GiB) and lasts until it is
@@ -468,7 +489,7 @@ back above the mark by half the mark's height over the reserve (at least
 128 MiB), marked by `RUN/evict.active`; the marks (and the reserve that
 admission uses) are read from `host.json` as it changes. Under the reserve,
 standby VMs are stopped first, under a lock of their own
-(`STATE/standby.stop.lock`), so a slow migration holding `evict.lock` does
+(`STATE/.locks/standby.stop`), so a slow migration holding the eviction lock does
 not hold that up. A refill's grant for each standby is the template's working set (what a cold start
 admits), 256 MiB at least. Recovery and a claim's refill start none while `.pressure` is recent, checked under the stop lock before each grant (relief marks it holding the lock), so one that waited behind another refill during relief starts none. A refill holds it shared from each standby's grant until
 that standby has created its lock file (it says so on its notify fd), 5 s
@@ -490,7 +511,7 @@ sends the first candidate `migrate` with each peer in turn until one accepts
 (`migrate` with `evict`: the target admits such an arrival only if it
 leaves the target's own eviction mark available, read with the reserve
 under the host lock, and refuses it while an eviction runs there (its
-thread holds `STATE/evict.worker.lock`, taken under the host lock that
+thread holds `STATE/.locks/evict.worker`, taken under the host lock that
 admission probes it under), so a VM is not moved straight back), then waits
 for that VM's copy here to exit (its target has all its memory), so the next
 decision sees the memory freed; all within 60 s, past which it lets go (an

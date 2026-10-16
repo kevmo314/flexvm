@@ -238,13 +238,12 @@ fn entry_complete(cached: &Path) -> bool {
 
 /// Holds a per-key lock through the cache check, build and publication.
 fn cached_rootfs(cached: &Path, build: impl FnOnce(&Path) -> Result<String>, sync: impl Fn(&Path) -> std::io::Result<()>) -> Result<PathBuf> {
-    use std::os::unix::fs::OpenOptionsExt;
     let dir = cached.parent().unwrap();
     // Entries handed out must survive a crash right after the first build, whoever made the directories.
     crate::util::create_dir_durably(dir, 0o777)?;
     sweep_temporaries(dir)?;
     // Never unlink the lock: waiters must all lock the same inode.
-    let lock = File::options().write(true).create(true).truncate(false).custom_flags(libc::O_NOFOLLOW).open(cached.with_extension("lock"))?;
+    let lock = crate::host::open_lock(&crate::host::host_locks()?, key_lock(cached)?.as_ref())?;
     if let Err(e) = flock(&lock, libc::LOCK_EX | libc::LOCK_NB) {
         if e.raw_os_error() != Some(libc::EWOULDBLOCK) {
             return Err(e.into());
@@ -283,6 +282,13 @@ fn cached_rootfs(cached: &Path, build: impl FnOnce(&Path) -> Result<String>, syn
     Ok(std::fs::canonicalize(cached)?)
 }
 
+/// A key's lock's name in the host's lock directory (`host::host_locks`): by its
+/// directory's (dev, inode), which other users may be able to write, and `KEY.lock`.
+fn key_lock(cached: &Path) -> std::io::Result<String> {
+    let st = crate::host::stat_dir(cached.parent().unwrap_or(Path::new(".")))?;
+    Ok(crate::host::keyed("image", &st, &format!("-{}", cached.with_extension("lock").file_name().unwrap_or_default().to_string_lossy())))
+}
+
 /// Whether `ext` (after a key's `.`) names a build's temporary: `tmp{nonce}` or `part{nonce}`.
 fn temporary(ext: &[u8]) -> bool {
     ext.starts_with(b"tmp") || ext.starts_with(b"part")
@@ -299,8 +305,8 @@ fn sweep_temporaries(dir: &Path) -> Result<()> {
         if !temporary(ext) {
             continue;
         }
-        let lock = dir.join(std::ffi::OsStr::from_bytes(stem)).with_extension("lock");
-        let held = match File::open(&lock) {
+        let lock = key_lock(&dir.join(std::ffi::OsStr::from_bytes(stem)))?;
+        let held = match crate::host::existing_lock(&crate::host::host_locks()?, lock.as_ref()) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(e.into()),
             Ok(f) => match Flock::new(f, libc::LOCK_EX | libc::LOCK_NB) {
@@ -360,16 +366,22 @@ pub(super) fn replace(path: &Path, write: impl FnOnce(&mut File) -> Result<()>) 
     install(path, write, |tmp, path| std::fs::rename(tmp, path))
 }
 
+/// Parts are made in `dir` under this lock, in the host's lock directory by `dir`'s (dev, inode).
+pub(super) fn publish_lock(dir: &Path) -> std::io::Result<File> {
+    crate::host::open_lock(&crate::host::host_locks()?, crate::host::keyed("publish", &crate::host::stat_dir(dir)?, "").as_ref())
+}
+
 fn install<T>(path: &Path, write: impl FnOnce(&mut File) -> Result<()>, rename: impl FnOnce(&Path, &Path) -> std::io::Result<T>) -> Result<T> {
     use std::os::unix::fs::OpenOptionsExt;
     let tmp = path.with_extension(format!("part{}", random_hex(8)?));
-    let dir = File::open(path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")))?;
+    let dir = publish_lock(path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")))?;
     // Every lock is let go explicitly (`Flock`), not by close: a child another thread forks
     // shares the descriptor until it execs, and would hold the lock on after we return.
-    // A part is created and locked under the directory's lock, so `registry::sweep_parts` takes one it can lock for dead.
+    // A part is created and locked under the private publication lock, so
+    // `registry::sweep_parts` takes one it can lock for dead.
     let (mut f, part) = {
         let _dir = Flock::new(dir, libc::LOCK_EX)?;
-        let f = File::options().write(true).create_new(true).custom_flags(libc::O_NOFOLLOW).open(&tmp)?;
+        let f = File::options().write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(&tmp)?;
         // A clone shares the open file, and so the lock.
         let part = f.try_clone().and_then(|c| Flock::new(c, libc::LOCK_EX)).inspect_err(|_| {
             let _ = std::fs::remove_file(&tmp);
@@ -384,6 +396,11 @@ fn install<T>(path: &Path, write: impl FnOnce(&mut File) -> Result<()>, rename: 
     // The name is ours alone: gone if renamed, else a failed write's.
     let _ = std::fs::remove_file(&tmp);
     drop(part);
+    if res.is_ok() {
+        // Published data remains readable; only temporary parts are ever flocked.
+        use std::os::unix::fs::PermissionsExt;
+        f.set_permissions(std::fs::Permissions::from_mode(0o644))?;
+    }
     res
 }
 
@@ -716,9 +733,9 @@ mod tests {
             Ok(f.write_all(b"ours")?)
         })
         .unwrap();
-        // The renamed part is the blob's inode, and the directory is the directory.
+        // The renamed part and the private publication lock are both released.
         flock(&File::open(&path).unwrap(), libc::LOCK_EX | libc::LOCK_NB).expect("the part's lock is let go");
-        flock(&File::open(&*dir).unwrap(), libc::LOCK_EX | libc::LOCK_NB).expect("the directory's lock is let go");
+        flock(&publish_lock(&dir).unwrap(), libc::LOCK_EX | libc::LOCK_NB).expect("the publication lock is let go");
         drop(shared);
     }
 
@@ -1143,10 +1160,14 @@ mod tests {
         // Under other keys too: one whose build still runs (its lock held), two whose builds are gone.
         let files = [("key.ext4", "half published"), ("key.part123", "partial"), ("key.tmp456", "abandoned"), ("other.tmp789", "other key")];
         let more = [("other.lock", ""), ("gone.lock", ""), ("gone.tmp0123456789abcdef", "dead"), ("nolock.part0123456789abcdef", "dead")];
+        let locks = crate::host::host_locks().unwrap();
         for (name, data) in files.into_iter().chain(more) {
-            std::fs::write(d.join(name), data).unwrap();
+            match name.strip_suffix(".lock") {
+                Some(key) => drop(crate::host::open_lock(&locks, key_lock(&d.join(key)).unwrap().as_ref()).unwrap()),
+                None => std::fs::write(d.join(name), data).unwrap(),
+            }
         }
-        let held = File::open(d.join("other.lock")).unwrap();
+        let held = crate::host::existing_lock(&locks, key_lock(&d.join("other")).unwrap().as_ref()).unwrap();
         flock(&held, libc::LOCK_EX).unwrap();
         let old = File::open(&cached).unwrap();
         let path = cached_rootfs(&cached, build("rebuilt"), sync_dir).unwrap();
@@ -1182,7 +1203,7 @@ mod tests {
             .unwrap()
         });
         started.recv().unwrap();
-        let lock = File::options().write(true).open(cached.with_extension("lock")).unwrap();
+        let lock = crate::host::existing_lock(&crate::host::host_locks().unwrap(), key_lock(&cached).unwrap().as_ref()).unwrap();
         assert_eq!(flock(&lock, libc::LOCK_EX | libc::LOCK_NB).unwrap_err().raw_os_error(), Some(libc::EWOULDBLOCK));
         let second_path = cached.clone();
         let second = std::thread::spawn(move || cached_rootfs(&second_path, never, sync_dir).unwrap());

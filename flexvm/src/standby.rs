@@ -58,7 +58,7 @@ pub fn target(host: &Host, template: &str) -> usize {
 /// The live standby processes of `template`, oldest first.
 pub fn live(host: &Host, template: &str) -> Vec<Ident> {
     let mut ids = Vec::new();
-    for e in std::fs::read_dir(dir(host, template)).into_iter().flatten().flatten() {
+    for e in std::fs::read_dir(crate::host::locks(&dir(host, template))).into_iter().flatten().flatten() {
         let name = e.file_name();
         let name = name.to_string_lossy();
         if name.starts_with('.') || !name.ends_with(".lock") {
@@ -77,7 +77,7 @@ pub fn live(host: &Host, template: &str) -> Vec<Ident> {
 
 /// `live`, less those mid-claim (`PID-START.claim` locked; START keeps a reused pid's apart): a stop would not end them.
 pub fn stoppable(host: &Host, template: &str) -> Vec<Ident> {
-    let d = dir(host, template);
+    let d = crate::host::locks(&dir(host, template));
     let claiming = |id: &Ident| locked(&d.join(format!("{}.claim", id.key())), libc::LOCK_SH) == Some(true);
     live(host, template).into_iter().filter(|id| !claiming(id)).collect()
 }
@@ -152,10 +152,10 @@ pub fn maintain(host: Host) {
     });
 }
 
-/// `STATE/standby.stop.lock`: relief holds it exclusively while it lists and
+/// `STATE/.locks/standby.stop`: relief holds it exclusively while it lists and
 /// signals standby VMs, a refill shared from a grant until its standby is listed.
 pub fn stop_lock(host: &Host) -> std::io::Result<File> {
-    File::options().create(true).truncate(false).write(true).open(host.state.join("standby.stop.lock"))
+    crate::host::private_file(&crate::host::locks(&host.state).join("standby.stop"))
 }
 
 /// Touched when memory pressure stops standby VMs.
@@ -178,7 +178,7 @@ pub fn refill(host: &Host, template: &str) -> Result<usize> {
 /// Only a count set by hand (`set`) starts them regardless.
 fn refill_by(host: &Host, template: &str, wait: bool, cooldown: bool) -> Result<usize> {
     let d = create_dir(host, template)?;
-    let lock = File::create(d.join(".refill"))?;
+    let lock = crate::host::private_file(&crate::host::locks(&d).join("refill"))?;
     let _lock = match Flock::new(lock, libc::LOCK_EX | if wait { 0 } else { libc::LOCK_NB }) {
         Ok(lock) => lock,
         Err(e) if !wait && e.raw_os_error() == Some(libc::EWOULDBLOCK) => return Ok(0),
@@ -189,7 +189,10 @@ fn refill_by(host: &Host, template: &str, wait: bool, cooldown: bool) -> Result<
         return Ok(0);
     }
     let mut ready = Vec::new();
-    let log = std::fs::OpenOptions::new().create(true).append(true).open(d.join("standby.log"))?;
+    let log = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(d.join("standby.log"))?
+    };
     let mib = grant_mib(host, template);
     // A failed start ends the round, but those started before it are still waited for.
     let mut failed = None;
@@ -275,7 +278,7 @@ fn start_one(host: &Host, template: &str, log: &File, mib: u64, cooldown: bool) 
             template.as_ref(),
         ];
         crate::util::start_reaper()?;
-        let mut child = crate::util::spawn_self_child(&args, log, w.as_raw_fd(), None, &[("FLEXVM_NOTIFY_FD", "3")])?;
+        let mut child = crate::util::spawn_self_child(&args, log, w.as_raw_fd(), None, None, &[("FLEXVM_NOTIFY_FD", "3")])?;
         drop(w);
         let mut r = BufReader::new(r);
         wait_locked(&mut r, &mut child, by)?;
@@ -361,15 +364,17 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
     let d = create_dir(host, template)?;
     let me = Ident::me();
     let id = me.key();
-    let (lock_path, sock) = (d.join(format!("{id}.lock")), d.join(format!("{}.sock", me.pid)));
+    // Its locks are in `.locks`, which only root may enter; its socket beside it.
+    let l = crate::host::locks(&d);
+    let (lock_path, sock) = (l.join(format!("{id}.lock")), d.join(format!("{}.sock", me.pid)));
     crate::socket::check(&sock)?;
     crate::host::stall("standby_lock_stall");
     // Test hook: held before its lock for as long as armed (past `LOCKED_TIMEOUT`, say).
     while crate::host::fault("standby_lock_hang") {
         std::thread::sleep(Duration::from_millis(50));
     }
-    let tmp = d.join(format!(".{id}.lock"));
-    let lock = File::create(&tmp)?;
+    let tmp = l.join(format!(".{id}.lock"));
+    let lock = crate::host::private_file(&tmp)?;
     crate::host::flock(&lock, libc::LOCK_EX)?;
     lock.write_all_at(&serde_json::to_vec(&me)?, 0)?;
     std::fs::rename(&tmp, &lock_path)?;
@@ -377,15 +382,15 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
     if let Some(f) = notify {
         let _ = send_json(f, &json!({"locked": true}));
     }
-    let claim_path = d.join(format!("{id}.claim"));
-    p.files.lock().unwrap().extend([sock.clone(), lock_path, claim_path.clone(), d.join(format!("{id}.take"))]);
+    let claim_path = l.join(format!("{id}.claim"));
+    p.files.lock().unwrap().extend([sock.clone(), lock_path, claim_path.clone(), l.join(format!("{id}.take"))]);
     let ready = load(p.spawner.take(None)?, tpl.clone())?;
     // Taken now, so a claim does not scan memory or ask Firecracker.
     *p.sizes.lock().unwrap() = Some(ready.mem_sizes());
     *p.standby.lock().unwrap() = Some(ready);
     save_load_set(host, &tpl);
-    // Under the dir's `.publish`, a lock (not `*.lock`, which names a standby) a sweep holds: none finds this pid's socket stale and unlinks it after the bind.
-    let publish = crate::host::Flock::new(File::create(d.join(".publish"))?, libc::LOCK_EX)?;
+    // Under `.locks/publish`, a lock (not `*.lock`, which names a standby) a sweep holds: none finds this pid's socket stale and unlinks it after the bind.
+    let publish = crate::host::Flock::new(crate::host::private_file(&l.join("publish"))?, libc::LOCK_EX)?;
     let _ = std::fs::remove_file(&sock); // A previous process with this pid may have left it.
     let listener = UnixListener::bind(&sock)?;
     // A claimer refused by a dead standby of this pid may unlink the path after this bind.
@@ -435,7 +440,7 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
             continue;
         }
         // Locked until the claim succeeds or rolls back (dropped): relief does not count it stopped.
-        let claiming = File::options().create(true).truncate(false).write(true).open(&claim_path)?;
+        let claiming = crate::host::private_file(&claim_path)?;
         crate::host::flock(&claiming, libc::LOCK_EX)?;
         // Not yet `claiming`, so the claimer tries another.
         if let Some(code) = p.stop_requested() {
@@ -582,7 +587,7 @@ pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]
             // and only the socket refused, not one a standby of a reused pid has bound since.
             Err(e) => {
                 if e.raw_os_error() == Some(libc::ECONNREFUSED) {
-                    let publish = File::create(sock.with_file_name(".publish")).and_then(|f| Flock::new(f, libc::LOCK_EX | libc::LOCK_NB));
+                    let publish = crate::host::private_file(&publish_lock(&sock)).and_then(|f| Flock::new(f, libc::LOCK_EX | libc::LOCK_NB));
                     if publish.is_ok() && ino.is_some() && std::fs::metadata(&sock).map(|m| m.ino()).ok() == ino {
                         let _ = std::fs::remove_file(&sock);
                     }
@@ -632,12 +637,17 @@ fn try_take(sock: &std::path::Path) -> Option<Option<File>> {
     let Some(id) = stem.parse().ok().and_then(Ident::of).map(|id| id.key()) else {
         return Some(None);
     };
-    let Ok(f) = File::options().create(true).truncate(false).write(true).open(sock.with_file_name(format!("{id}.take"))) else { return Some(None) };
+    let Ok(f) = crate::host::private_file(&publish_lock(sock).with_file_name(format!("{id}.take"))) else { return Some(None) };
     match flock(&f, libc::LOCK_EX | libc::LOCK_NB) {
         Ok(()) => Some(Some(f)),
         Err(e) if e.raw_os_error() == Some(libc::EWOULDBLOCK) => None,
         Err(_) => Some(None),
     }
+}
+
+/// The lock a standby's socket is replaced, and found stale, under: `.locks/publish` beside it.
+pub fn publish_lock(sock: &std::path::Path) -> PathBuf {
+    crate::host::locks(sock.parent().unwrap_or(std::path::Path::new("."))).join("publish")
 }
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -748,7 +758,7 @@ mod tests {
         let sock = d.join(format!("{}.sock", Ident::me().pid));
         let taking = try_take(&sock).unwrap().unwrap();
         assert!(try_take(&sock).is_none());
-        assert!(d.join(format!("{}.take", Ident::me().key())).exists());
+        assert!(crate::host::locks(&d).join(format!("{}.take", Ident::me().key())).exists());
         drop(taking);
         assert_eq!(templates(&host), [template]);
         assert_ne!(d, dir(&host, &"u".repeat(64)));
@@ -936,8 +946,8 @@ mod tests {
     fn a_reused_pid_keeps_its_own_lock() {
         let root = crate::test_util::TempDir::new("standby-identity");
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
-        let d = dir(&host, "default");
-        std::fs::create_dir_all(&d).unwrap();
+        let d = crate::host::locks(&dir(&host, "default"));
+        crate::host::private_dir(&d).unwrap();
         let me = Ident::me();
         let path = d.join(format!("{}.lock", me.key()));
         let lock = File::create(&path).unwrap();
@@ -958,7 +968,7 @@ mod tests {
         assert_eq!(templates(&host), vec!["default"]);
         let d = dir(&host, "default");
         std::fs::create_dir_all(&d).unwrap();
-        let lock = File::create(d.join(".refill")).unwrap();
+        let lock = crate::host::private_file(&crate::host::locks(&d).join("refill")).unwrap();
         let lock = Flock::new(lock, libc::LOCK_EX).unwrap();
         assert_eq!(refill_by(&host, "default", false, true).unwrap(), 0);
         drop(lock);
@@ -968,7 +978,7 @@ mod tests {
         assert_eq!(refill_by(&host, "default", false, true).unwrap(), 0);
         drop(stop);
         // A busy host lock ends this round without a refill failure or backoff, and lets relief in.
-        let held = File::create(host.state.join("lock")).unwrap();
+        let held = crate::host::private_file(&host.lock_file()).unwrap();
         let held = Flock::new(held, libc::LOCK_EX).unwrap();
         let start = Instant::now();
         assert_eq!(refill_by(&host, "default", false, true).unwrap(), 0);
@@ -992,7 +1002,7 @@ mod tests {
         // Under the stop lock, before the grant: recent pressure ends the round at once, with
         // no grant (one would wait out the busy host lock), even for a refill that got its locks late.
         host.cfg.reserve_mib = Some(0);
-        let held = Flock::new(File::create(host.state.join("lock")).unwrap(), libc::LOCK_EX).unwrap();
+        let held = Flock::new(crate::host::private_file(&host.lock_file()).unwrap(), libc::LOCK_EX).unwrap();
         let start = Instant::now();
         assert_eq!(refill_by(&host, "default", true, true).unwrap(), 0);
         assert!(start.elapsed() < Duration::from_secs(5), "{:?}", start.elapsed());
