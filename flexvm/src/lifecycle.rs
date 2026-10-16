@@ -436,6 +436,8 @@ impl Proc {
         if owned {
             crate::host::hold("resume_unmarked_gate");
         }
+        // The netlink socket opened before the fence: the host lock covers only the route request (#541).
+        crate::net::ready();
         // Test fault `resume_fence_fail`: the generation is found withdrawn at the fence.
         let still = crate::fault_result!(fault("resume_fence_fail") => Err("injected fault: the address's generation was withdrawn meanwhile".into());
             self.still_current(ip));
