@@ -679,16 +679,22 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
   standby VMs and checkpoints refer to them by content id. Standby VMs of an
   older generation exit; running VMs keep theirs. An incoming migration uses
   the generation with the source's content id if the host has it.
+- **Component identity.** The content id includes the kernel's hash from build
+  time, but migration, resume and restore don't check the kernel file again: the
+  running kernel is already in guest memory, so replacing `artifacts/vmlinux`
+  leaves existing generations usable. `mem`, `vmstate`, rootfs and Firecracker
+  are still checked.
 - **Settling.** The first run after a restore is slow (Firecracker's first
   resume, the guest catching up and handling the new VMGenID: ~10 ms of extra
-  `NET` latency here). Each standby VM therefore runs once in the background,
+  `START` latency here). Each standby VM therefore runs once in the background,
   as long as the reseed below takes plus 50 ms, then is paused. Firecracker
   calls in a load have deadlines, and shutdown kills a load in progress.
 - **RNG.** Firecracker gives every snapshot load a new VMGenID; on it, the
   guest kernel reseeds its RNG and then logs `random: crng reseeded due to
   virtual machine fork` (add_vmfork_randomness). The agent's `FORKS` counts
   those lines in `/dev/kmsg`, and a standby VM is only stocked once the count
-  has gone up, so no two handed-out VMs of a template share RNG state; until
+  is above zero. This relies on templates being cold boots with no reseed
+  logged before the snapshot, so no two handed-out VMs share RNG state; until
   then only the idle agent runs. That is what is provable here: this kernel's
   vmgenid sends no uevent, and `/dev/sysgenid` is not ordered against the
   reseed. With an agent that has no `FORKS`, a standby VM is only checked to
@@ -698,8 +704,8 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
   `clock_realtime` (which adjusts kvmclock) has no effect: a VM's wall clock
   starts at the template's snapshot time, whether standby or not (minutes to
   days behind). The TSC keeps running while a VM is paused, so a pause adds no
-  further error. The agent's `START <ip> <unix time> [dns]` (sent instead of
-  `NET`) sets the address and steps `CLOCK_REALTIME` to the host's time, and
+  further error. The agent's `START <ip> <unix time> [dns]`
+  sets the address and steps `CLOCK_REALTIME` to the host's time, and
   answers only then. A standby VM gets its clock stepped (`CLOCK`) while it
   settles, so `START` at take finds it right and skips `clock_settime`, which
   can take tens of ms in a 24-vCPU guest. A migration target, after resuming,
@@ -985,7 +991,7 @@ Lifecycle numbers are from `flexvm bench --lifecycle` with the 2-vCPU template,
 
 ### Resumable exec protocol
 
-Legacy `EXEC <len>`, `SPAWN <len>`, `PING` and `NET` retain their wire format.
+Legacy `EXEC <len>`, `SPAWN <len>` and `PING` retain their wire format.
 Sessions use `SESSION <id> <len>\n` followed by exactly `len` command bytes,
 `ATTACH <id> <offset>\n`, or `CLOSE <id>\n`. The client chooses a random ID;
 retrying SESSION with the same ID and command attaches to the existing process
