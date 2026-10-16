@@ -1,6 +1,6 @@
 //! flexvm-init, PID 1 in the guest: sets up a writable overlay on the read-only (DAX) root, then
-//! serves one-line requests on vsock: `PING`, `NET <ip> [dns]`, `START <ip> <secs.nanos> [dns]`
-//! (NET plus the host's clock), `CLOCK <secs.nanos>`, `FORKS`, and those in session.rs and app.rs.
+//! serves one-line requests on vsock: `PING`, `START <ip> <secs.nanos> [dns]` (network and
+//! host clock), `CLOCK <secs.nanos>`, `FORKS`, and those in session.rs and app.rs.
 //! Replies are frames (proto.rs).
 
 use std::collections::HashMap;
@@ -409,7 +409,7 @@ fn serve(statuses: Statuses) -> io::Result<()> {
             }
         };
         // START is on every start's critical path, where a new thread costs ms: quick requests are answered inline.
-        if ["PING", "NET ", "START ", "CLOCK ", "FORKS"].iter().any(|v| line.starts_with(v)) {
+        if ["PING", "START ", "CLOCK ", "FORKS"].iter().any(|v| line.starts_with(v)) {
             let _ = handle(&stream, &line, &statuses);
             continue;
         }
@@ -496,10 +496,6 @@ fn handle(out: &File, line: &str, statuses: &Statuses) -> io::Result<()> {
     let mut parts = arg.split_whitespace();
     let reply = match verb {
         "PING" => Ok("pong".to_string()),
-        "NET" => match parts.next().map(|ip| ip.parse()) {
-            Some(Ok(ip)) => net::configure(ip, parts.next()).map(|()| "ok".into()).map_err(|e| e.to_string()),
-            _ => Err(format!("bad address {arg:?}")),
-        },
         // Acked only once the clock is set, so "ok" means it is.
         "START" => match (parts.next().map(|ip| ip.parse()), parts.next().and_then(parse_time)) {
             (Some(Ok(ip)), Some(now)) => net::configure(ip, parts.next()).map_err(|e| e.to_string()).and_then(|()| set_clock(now)).map(|_| "ok".into()),
@@ -534,8 +530,9 @@ fn set_clock(now: libc::timespec) -> Result<i128, String> {
     Ok(off)
 }
 
-/// Counts "crng reseeded due to virtual machine fork" in the whole kmsg ring: a rise since a snapshot
-/// means fresh RNG state (vmgenid sends no uevent; /dev/sysgenid isn't ordered against the reseed).
+/// Counts "crng reseeded due to virtual machine fork" in the whole kmsg ring. The host checks
+/// for a nonzero count, relying on cold-boot templates having none before their snapshot.
+/// vmgenid sends no uevent; /dev/sysgenid isn't ordered against the reseed.
 fn forks() -> io::Result<usize> {
     const FORK_MSG: &[u8] = b"crng reseeded due to virtual machine fork";
     let mut kmsg = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open("/dev/kmsg")?;

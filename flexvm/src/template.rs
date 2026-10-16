@@ -192,9 +192,9 @@ impl Meta {
         Ok(())
     }
 
-    /// Files whose stat matches `cache`, the creation stamp or one another process wrote
-    /// back to `dir`'s meta.json since are trusted; others are rehashed. Returns whether
-    /// anything was rehashed.
+    /// Except for the build-only kernel, files whose stat matches `cache`, the creation
+    /// stamp or one another process wrote back to `dir`'s meta.json since are trusted;
+    /// others are rehashed. Returns whether anything was rehashed.
     fn verify(&self, paths: &Paths, dir: &Path, cache: &mut BTreeMap<String, Stamp>) -> Result<bool> {
         let files = self.files(paths, dir);
         let named = self.components.len() == files.len() && files.iter().all(|(name, _)| self.components.contains_key(*name));
@@ -204,6 +204,11 @@ impl Meta {
         let mut rehashed = false;
         let mut written: Option<Option<Meta>> = None;
         for (name, path) in files {
+            // The kernel contributes to the build's identity, but restores use the kernel
+            // already in guest memory and never read this file again.
+            if name == "kernel" {
+                continue;
+            }
             let component = &self.components[name];
             let stamp = Stamp::of(&std::fs::metadata(&path).map_err(|e| format!("template component {}: {e}", path.display()))?);
             if cache.get(name).unwrap_or(&component.metadata) == &stamp {
@@ -823,7 +828,7 @@ fn build(paths: &Paths, dir: &Path, name: &str, vcpus: u32, mem_mib: u64, max_mi
         mem_mib,
         max_mib: mem_mib + hotplug,
         plugged_mib: plugged,
-        kernel: paths.kernel.clone(),
+        kernel,
         rootfs,
         id: String::new(),
         components: BTreeMap::new(),
@@ -1078,7 +1083,7 @@ mod tests {
 
     #[test]
     fn changed_components_are_rejected() {
-        for name in ["vmstate", "mem", "rootfs", "kernel", "firecracker"] {
+        for name in ["vmstate", "mem", "rootfs", "firecracker"] {
             let f = Fixture::new();
             let mut cache = BTreeMap::new();
             f.verify(&f.meta, &mut cache).unwrap();
@@ -1086,6 +1091,33 @@ mod tests {
             f.replace(name, &vec![b'x'; name.len()]);
             let error = f.verify(&f.meta, &mut cache).unwrap_err().to_string();
             assert!(error.contains("does not match"), "{error}");
+        }
+    }
+
+    #[test]
+    fn replaced_or_missing_kernel_allows_migration_and_checkpoint_admission() {
+        let f = Fixture::new();
+        f.write_meta(&f.meta, &f.dir);
+        let tpl = f.open().unwrap();
+        let gens = f.dir.join(GENERATIONS);
+        std::fs::create_dir(&gens).unwrap();
+        std::os::unix::fs::symlink(&f.dir, gens.join(&f.meta.id)).unwrap();
+
+        f.replace("kernel", b"new kernel");
+        let mut rebuilt = f.meta.clone();
+        rebuilt.identify(&f.paths, &f.dir).unwrap();
+        assert_ne!(rebuilt.id, f.meta.id);
+        assert_ne!(rebuilt.components["kernel"].hash, f.meta.components["kernel"].hash);
+
+        for missing in [false, true] {
+            if missing {
+                std::fs::remove_file(&f.paths.kernel).unwrap();
+            }
+            // Migration source verification and destination / resume / restore admission.
+            tpl.verify(&f.paths).unwrap();
+            let admitted = Template::open_id(&f.paths, "t", &f.meta.id).unwrap();
+            assert_eq!(admitted.meta.id, f.meta.id);
+            assert_eq!(admitted.meta.components["kernel"].hash, f.meta.components["kernel"].hash);
         }
     }
 
@@ -1135,7 +1167,7 @@ mod tests {
         let error = tpl.check_id("wrong").unwrap_err().to_string();
         assert!(error.contains("id mismatch"));
         assert!(error.contains(&f.meta.id));
-        f.replace("kernel", b"changed");
+        f.replace("rootfs", b"changed");
         f.open().unwrap();
         assert!(tpl.verify(&f.paths).is_err());
     }
@@ -1143,7 +1175,7 @@ mod tests {
     #[test]
     fn size_and_mtime_invalidate_cache() {
         let f = Fixture::new();
-        let file = File::options().read(true).write(true).open(f.dir.join("kernel")).unwrap();
+        let file = File::options().read(true).write(true).open(&f.paths.rootfs).unwrap();
         let original = file.metadata().unwrap();
         file.set_len(original.len() + 1).unwrap();
         assert_ne!(Stamp::of(&file.metadata().unwrap()).size, original.len());
@@ -1183,10 +1215,10 @@ mod tests {
         let f = Fixture::new();
         let mut cache = BTreeMap::new();
         f.verify(&f.meta, &mut cache).unwrap();
-        let file = File::options().write(true).open(f.dir.join("kernel")).unwrap();
+        let file = File::options().write(true).open(&f.paths.rootfs).unwrap();
         let before = file.metadata().unwrap();
         std::thread::sleep(Duration::from_millis(10));
-        file.write_all_at(b"KERNEL", 0).unwrap();
+        file.write_all_at(b"ROOTFS", 0).unwrap();
         set_mtime(&file, before.mtime(), before.mtime_nsec());
         let error = f.verify(&f.meta, &mut cache).unwrap_err().to_string();
         assert!(error.contains("does not match"), "{error}");
@@ -1310,15 +1342,15 @@ mod tests {
         assert!(!f.verify(&b.meta, &mut cache).unwrap());
         assert_eq!(cache.keys().collect::<Vec<_>>(), ["rootfs"]);
         // A rehash of its own is merged into the file, keeping a's stamp.
-        f.replace("kernel", b"kernel");
+        f.replace("firecracker", b"firecracker");
         b.verify(&f.paths).unwrap();
         let written = Meta::read(&f.dir).unwrap();
         assert!(!f.verify(&written, &mut BTreeMap::new()).unwrap());
         // A stamp written back for other content is no reason to trust a file.
-        f.replace("kernel", b"KERNEL");
+        f.replace("firecracker", b"FIRECRACKER");
         let mut forged = Meta::read(&f.dir).unwrap();
-        forged.components.get_mut("kernel").unwrap().metadata = Stamp::of(&std::fs::metadata(&f.paths.kernel).unwrap());
-        forged.components.get_mut("kernel").unwrap().hash = "0".into();
+        forged.components.get_mut("firecracker").unwrap().metadata = Stamp::of(&std::fs::metadata(&f.paths.firecracker).unwrap());
+        forged.components.get_mut("firecracker").unwrap().hash = "0".into();
         f.write_meta(&forged, &f.dir);
         assert!(f.verify(&written, &mut BTreeMap::new()).is_err());
     }
