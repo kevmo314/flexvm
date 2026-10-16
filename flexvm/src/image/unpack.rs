@@ -598,12 +598,23 @@ impl Root {
         Ok(())
     }
 
+    /// An injected config directory must not retain an image user's ownership or write access.
+    pub fn secure_dir(&mut self, rel: &str, mode: u32) -> Result<()> {
+        self.ensure_dir(rel, mode)?;
+        let at = self.at(Path::new(rel))?;
+        let dir = open_dir_at(at.dir.as_raw_fd(), &at.name)?;
+        check(unsafe { libc::fchown(dir.as_raw_fd(), 0, 0) }, "chown", Path::new(rel))?;
+        check(unsafe { libc::fchmod(dir.as_raw_fd(), mode) }, "chmod", Path::new(rel))?;
+        Ok(())
+    }
+
     pub fn write_file(&mut self, rel: &str, data: &[u8], mode: u32) -> Result<()> {
         let at = self.at(Path::new(rel))?;
         self.check_entry_limit()?;
         let mut f = at.create()?;
         self.entries += 1;
         f.write_all(data)?;
+        check(unsafe { libc::fchown(f.as_raw_fd(), 0, 0) }, "chown", Path::new(rel))?;
         check(unsafe { libc::fchmod(f.as_raw_fd(), mode) }, "chmod", Path::new(rel))?;
         Ok(())
     }

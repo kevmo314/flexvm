@@ -148,8 +148,9 @@ pub fn prepare(cache: &Path, init: &Path, o: &Options) -> Result<(PathBuf, Image
         (None, false) => None,
     };
     let init_bytes = std::fs::read(init).map_err(|e| format!("flexvm-init at {init:?}: {e} (run scripts/build-rootfs.sh)"))?;
+    // Rebuild older cached images with Docker's explicit-group semantics and protected app config.
     let key = json!({
-        "v": 2, "config": img.config_digest, "diff_ids": img.diff_ids,
+        "v": 3, "config": img.config_digest, "diff_ids": img.diff_ids,
         "init": sha256_hex(&init_bytes), "options": o,
     });
     let key = sha256_hex(key.to_string().as_bytes());
@@ -581,17 +582,7 @@ fn escape(s: &str) -> String {
 }
 
 fn inject(root: &mut Root, app: &App, init: &[u8]) -> Result<String> {
-    for (dir, mode) in [
-        ("proc", 0o555),
-        ("sys", 0o555),
-        ("dev", 0o755),
-        ("run", 0o755),
-        ("tmp", 0o1777),
-        ("mnt", 0o755),
-        ("root", 0o700),
-        ("etc/flexvm", 0o755),
-        ("sbin", 0o755),
-    ] {
+    for (dir, mode) in [("proc", 0o555), ("sys", 0o555), ("dev", 0o755), ("run", 0o755), ("tmp", 0o1777), ("mnt", 0o755), ("root", 0o700), ("sbin", 0o755)] {
         root.ensure_dir(dir, mode)?;
     }
     root.write_file("sbin/flexvm-init", init, 0o755)?;
@@ -614,6 +605,7 @@ fn inject(root: &mut Root, app: &App, init: &[u8]) -> Result<String> {
     let mut conf: String = app.argv.iter().map(|a| format!("arg {}\n", escape(a))).chain(env.iter().map(|e| format!("env {}\n", escape(e)))).collect();
     conf += &format!("cwd {}\nuid {uid}\ngid {gid}\n", escape(&app.workdir));
     conf += &format!("groups {}\n", groups.iter().map(|g| g.to_string()).collect::<Vec<_>>().join(" "));
+    root.secure_dir("etc/flexvm", 0o755)?;
     root.write_file("etc/flexvm/app.conf", conf.as_bytes(), 0o644)?;
     Ok(conf)
 }
@@ -642,10 +634,12 @@ fn resolve_user(root: &Root, user: &str) -> Result<(u32, u32, String, Vec<u32>)>
         None => entry.and_then(|f| f.get(3)?.parse().ok()).unwrap_or(0),
     };
     let mut groups = vec![gid];
-    let member = |f: &&Vec<String>| entry.is_some_and(|e| f.get(3).is_some_and(|m| m.split(',').any(|m| *m == e[0])));
-    for n in group.iter().filter(member).filter_map(|f| f[2].parse().ok()) {
-        if !groups.contains(&n) {
-            groups.push(n);
+    if g.is_none() {
+        let member = |f: &&Vec<String>| entry.is_some_and(|e| f.get(3).is_some_and(|m| m.split(',').any(|m| *m == e[0])));
+        for n in group.iter().filter(member).filter_map(|f| f[2].parse().ok()) {
+            if !groups.contains(&n) {
+                groups.push(n);
+            }
         }
     }
     Ok((uid, gid, home, groups))
@@ -874,6 +868,50 @@ mod tests {
         sweep_staging(&staging).unwrap();
         want.retain(|n| !n.contains(live.as_str()));
         assert_eq!(names(), want);
+    }
+
+    #[test]
+    fn explicit_user_group_excludes_supplementary_memberships() {
+        let dir = tmpdir("user-groups");
+        std::fs::create_dir(dir.join("etc")).unwrap();
+        std::fs::write(dir.join("etc/passwd"), "app:x:1000:1000::/home/app:/bin/sh\n").unwrap();
+        std::fs::write(dir.join("etc/group"), "app:x:1000:app\nshadow:x:42:app\nrestricted:x:2000:\nshadow-alias:x:42:app\n").unwrap();
+        let root = Root::open(&dir, Limits::default()).unwrap();
+        for user in ["app", "1000"] {
+            assert_eq!(resolve_user(&root, user).unwrap(), (1000, 1000, "/home/app".into(), vec![1000, 42]));
+        }
+        for user in ["app:restricted", "app:2000", "1000:restricted", "1000:2000"] {
+            assert_eq!(resolve_user(&root, user).unwrap(), (1000, 2000, "/home/app".into(), vec![2000]));
+        }
+        assert_eq!(resolve_user(&root, "app:app").unwrap().3, [1000]);
+        assert_eq!(resolve_user(&root, "9999:2000").unwrap(), (9999, 2000, "/".into(), vec![2000]));
+    }
+
+    #[test]
+    fn injection_secures_existing_app_owned_config_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tmpdir("secure-conf");
+        let conf_dir = dir.join("etc/flexvm");
+        std::fs::create_dir_all(&conf_dir).unwrap();
+        let conf_path = conf_dir.join("app.conf");
+        std::fs::write(&conf_path, "attacker config").unwrap();
+        // On an unprivileged test run these already belong to the app uid.
+        if unsafe { libc::geteuid() } == 0 {
+            std::os::unix::fs::chown(&conf_dir, Some(1000), Some(1000)).unwrap();
+            std::os::unix::fs::chown(&conf_path, Some(1000), Some(1000)).unwrap();
+        }
+        std::fs::set_permissions(&conf_dir, std::fs::Permissions::from_mode(0o2777)).unwrap();
+        std::fs::set_permissions(&conf_path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let app = app_config(&json!({"config": {"Cmd": ["/bin/app"], "User": "1000:1000"}}), &Options::default()).unwrap();
+        let mut root = Root::open(&dir, Limits::default()).unwrap();
+        let conf = inject(&mut root, &app, b"init").unwrap();
+        for (path, mode) in [(&conf_dir, 0o755), (&conf_path, 0o644)] {
+            let meta = std::fs::metadata(path).unwrap();
+            assert_eq!((meta.uid(), meta.gid(), meta.mode() & 0o7777), (0, 0, mode));
+        }
+        assert_eq!(read(&conf_path), conf);
+        assert!(conf.contains("\nuid 1000\ngid 1000\ngroups 1000\n"));
     }
 
     #[test]
@@ -1162,7 +1200,7 @@ mod tests {
         std::fs::write(&init, b"init").unwrap();
         let o = Options { image, ..Options::default() };
         let config_value: Value = serde_json::from_str(&config).unwrap();
-        let key = json!({"v": 2, "config": cd, "diff_ids": config_value["rootfs"]["diff_ids"], "init": sha256_hex(b"init"), "options": o});
+        let key = json!({"v": 3, "config": cd, "diff_ids": config_value["rootfs"]["diff_ids"], "init": sha256_hex(b"init"), "options": o});
         let key = sha256_hex(key.to_string().as_bytes());
         let cached = d.join("rootfs").join(format!("{}.ext4", &key[7..]));
         cached_rootfs(&cached, build("cached"), sync_dir).unwrap();

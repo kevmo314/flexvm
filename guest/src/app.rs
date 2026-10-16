@@ -20,7 +20,17 @@ use crate::session::{Output, DRAIN};
 use crate::{fail, kill_running, mem, msg, spawn_watched, wait_exit, write_frame, Statuses, FRAME_STDOUT};
 
 const CONF: &str = "/etc/flexvm/app.conf";
+static CONFIG: LazyLock<io::Result<Conf>> = LazyLock::new(|| read_conf(CONF));
 const RING_BYTES: usize = 1 << 20;
+
+/// Capture the image's configuration before serving requests or starting any app process.
+pub fn init() {
+    LazyLock::force(&CONFIG);
+}
+
+fn config() -> io::Result<&'static Conf> {
+    CONFIG.as_ref().map_err(|e| io::Error::new(e.kind(), e.to_string()))
+}
 
 pub const VERBS: [&str; 6] = ["APP", "APPSTATUS", "LOGS", "PROBE", "CHECK", "QUIESCE"];
 
@@ -147,19 +157,19 @@ fn check(arg: &str, statuses: &Statuses) -> io::Result<String> {
     let ms: u64 = ms.parse().map_err(|_| io::Error::other("bad timeout"))?;
     let bytes: Option<Vec<u8>> = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok()).collect();
     let bytes = bytes.ok_or_else(|| io::Error::other("bad command encoding"))?;
-    let c = parse_conf(&read_conf()?)?;
+    let c = config()?;
     let mut cg = match CheckGroup::new() {
         Ok(g) => Some(g),
         Err(_) if c.uid == 0 => None,
         Err(e) => return Err(io::Error::other(format!("cannot contain a non-root readiness check: {e}"))),
     };
-    let mut cmd = command(&c, &["/bin/sh", "-c", &String::from_utf8_lossy(&bytes)]);
+    let mut cmd = command(c, &["/bin/sh", "-c", &String::from_utf8_lossy(&bytes)]);
     cmd.stdout(Stdio::null()).stderr(Stdio::null());
     match &cg {
         Some(g) => mem::enter(&mut cmd, g.procs.clone(), true),
         None => mem::work_procs().into_iter().for_each(|work| mem::enter(&mut cmd, work, false)),
     }
-    restrict(&mut cmd, &c);
+    restrict(&mut cmd, c);
     let (child, _, token) = spawn_watched(&mut cmd, statuses, false).map_err(|e| io::Error::new(e.kind(), format!("cannot run /bin/sh: {e}")))?;
     let pid = child.id() as i32;
     let code = wait_exit(statuses, token, Some(Instant::now() + Duration::from_millis(ms)));
@@ -187,8 +197,9 @@ fn check(arg: &str, statuses: &Statuses) -> io::Result<String> {
     })
 }
 
-fn read_conf() -> io::Result<String> {
-    std::fs::read_to_string(CONF).map_err(|e| io::Error::new(e.kind(), format!("{CONF}: {e}")))
+fn read_conf(path: impl AsRef<std::path::Path>) -> io::Result<Conf> {
+    let text = std::fs::read_to_string(path).map_err(|e| io::Error::new(e.kind(), format!("{CONF}: {e}")))?;
+    parse_conf(&text)
 }
 
 /// The check groups not yet removed of checks under way: a sweep leaves them be (one just created is empty).
@@ -313,12 +324,12 @@ fn start(statuses: &Statuses) -> io::Result<i32> {
     if let State::Running(pid) = app.state {
         return Ok(pid);
     }
-    let c = parse_conf(&read_conf()?)?;
-    let mut cmd = command(&c, &c.argv);
+    let c = config()?;
+    let mut cmd = command(c, &c.argv);
     if let Some(work) = mem::work_procs() {
         mem::enter(&mut cmd, work, true);
     }
-    restrict(&mut cmd, &c);
+    restrict(&mut cmd, c);
     let (pid, _) = launch(&mut app, &mut cmd, statuses).map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", c.argv[0])))?;
     app.push(format!("flexvm-init: started {:?} as pid {pid}\n", c.argv).as_bytes());
     Ok(pid)
@@ -614,6 +625,40 @@ mod tests {
         assert_eq!(at, end, "the reader ends exactly where the output does");
         let tail = data.len() - b"crash-tail\n".len();
         assert!(data[..tail].iter().all(|&b| b == b'x') && &data[tail..] == b"crash-tail\n");
+    }
+
+    #[test]
+    fn cached_config_survives_replacement_and_removal() {
+        let dir = crate::test_util::TempDir::new("cached-app-conf");
+        let path = dir.join("app.conf");
+        std::fs::write(&path, "arg /bin/app\nenv PATH=/usr/bin\ncwd /srv\nuid 1000\ngid 2000\ngroups 2000 42\n").unwrap();
+        let cached = LazyLock::new(|| read_conf(&path));
+        LazyLock::force(&cached).as_ref().unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, "arg /bin/attacker\nenv PATH=/attacker\ncwd /\nuid 0\ngid 0\ngroups 0\n").unwrap();
+        assert_eq!(read_conf(&path).unwrap().uid, 0);
+        for remove in [false, true] {
+            if remove {
+                std::fs::remove_file(&path).unwrap();
+            }
+            let c = cached.as_ref().unwrap();
+            assert_eq!((c.uid, c.gid, c.groups.as_slice()), (1000, 2000, [2000, 42].as_slice()));
+            let cmd = command(c, &["/bin/sh", "-c", "ready"]);
+            assert_eq!(cmd.get_current_dir().unwrap(), std::path::Path::new("/srv"));
+            assert_eq!(cmd.get_envs().collect::<Vec<_>>(), [(std::ffi::OsStr::new("PATH"), Some(std::ffi::OsStr::new("/usr/bin")))]);
+            assert_eq!(c.argv, ["/bin/app"]);
+        }
+    }
+
+    #[test]
+    fn cached_config_keeps_startup_errors() {
+        let dir = crate::test_util::TempDir::new("cached-app-error");
+        let path = dir.join("app.conf");
+        let cached = LazyLock::new(|| read_conf(&path));
+        assert_eq!(cached.as_ref().err().unwrap().kind(), io::ErrorKind::NotFound);
+        std::fs::write(&path, "arg /bin/app\nuid 0\n").unwrap();
+        assert!(read_conf(&path).is_ok());
+        assert_eq!(cached.as_ref().err().unwrap().kind(), io::ErrorKind::NotFound);
     }
 
     #[test]
