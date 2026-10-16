@@ -1159,8 +1159,7 @@ mod tests {
         let d = tmpdir("reuse");
         std::fs::create_dir(d.join("real")).unwrap();
         symlink(d.join("real"), d.join("alias")).unwrap();
-        let cached = d.join("real/key.ext4");
-        assert!(cached_rootfs(&d.join("alias/key.ext4"), never, sync_dir).is_err());
+        let cached = d.join("alias/key.ext4");
         let path = cached_rootfs(&cached, build("first"), sync_dir).unwrap();
         assert_eq!(path, std::fs::canonicalize(d.join("real/key.ext4")).unwrap());
         assert_eq!(read(&path), "first image");

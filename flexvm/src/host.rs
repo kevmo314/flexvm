@@ -2717,9 +2717,9 @@ pub fn keyed(kind: &str, st: &libc::stat, rest: &str) -> String {
     format!("{kind}-{}-{}{rest}", st.st_dev, st.st_ino)
 }
 
-/// A directory opened once (not through a link at its last component), for a lock keyed
-/// by it (`keyed`) and work in it: `path` reaches it through the descriptor, whatever its
-/// own path names since, for this process and its children.
+/// A directory opened once, for a lock keyed by it (`keyed`) and work in it: `path`
+/// reaches it through the descriptor, whatever its own path names since, for this
+/// process and its children.
 pub struct Directory {
     pub fd: OwnedFd,
     pub path: PathBuf,
@@ -2727,12 +2727,8 @@ pub struct Directory {
 
 impl Directory {
     pub fn open(path: &Path) -> std::io::Result<Self> {
-        let fds = PathBuf::from(format!("/proc/{}/fd", std::process::id()));
-        // Another one's `path` (or a name's parent in it) is a link, but to a directory already opened so.
-        let follow = if path.parent() == Some(&fds) { 0 } else { libc::O_NOFOLLOW };
-        let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())?;
-        let fd = crate::util::openat(libc::AT_FDCWD, &c, libc::O_RDONLY | libc::O_DIRECTORY | follow)?;
-        Ok(Self { path: fds.join(fd.as_raw_fd().to_string()), fd })
+        let fd: OwnedFd = std::os::unix::fs::OpenOptionsExt::custom_flags(File::options().read(true), libc::O_DIRECTORY).open(path)?.into();
+        Ok(Self { path: PathBuf::from(format!("/proc/{}/fd/{}", std::process::id(), fd.as_raw_fd())), fd })
     }
 
     pub fn stat(&self) -> std::io::Result<libc::stat> {
