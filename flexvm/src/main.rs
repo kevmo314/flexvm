@@ -569,7 +569,7 @@ fn resume(host: &Host, name: &str) -> Result<bool> {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let req = json!({"op": "resume"});
-        let reply = vmproc::connect(host, name, &req, &[], Instant::now() + Duration::from_secs(10))
+        let reply = vmproc::connect(host, name, &req, &[], Instant::now() + Duration::from_secs(10), None)
             .map(|c| recv_json(&mut BufReader::new(util::By { s: c, at: Instant::now() + RESUME_ANSWER })));
         match reply {
             Ok(Ok(Some(v))) if v["ok"] == true && v["result"]["suspending"] == true => {}
@@ -820,7 +820,8 @@ pub fn exec(host: &Host, name: &str, cmd: &str) -> Result<i32> {
     let close = {
         let (host, name, id) = (host.clone(), name.to_string(), id.clone());
         let once = move || -> Result<()> {
-            let c = vmproc::connect(&host, &name, &json!({"op": "exec", "session": id, "action": "close"}), &[], Instant::now() + Duration::from_secs(5))?;
+            let c =
+                vmproc::connect(&host, &name, &json!({"op": "exec", "session": id, "action": "close"}), &[], Instant::now() + Duration::from_secs(5), None)?;
             c.set_read_timeout(Some(Duration::from_secs(5)))?;
             util::answer(recv_json(&mut BufReader::new(c))?, "vm", "session close failed").map(drop)
         };
@@ -963,27 +964,16 @@ impl std::error::Error for Replaced {}
 /// since is refused (`Replaced`) before the request reaches it, and one that
 /// cannot be told yet (its registry entry not published) is an error retried.
 fn connect_same(host: &Host, name: &str, req: &Value, at: Instant, vm: &mut Option<Instance>) -> Result<std::os::unix::net::UnixStream> {
-    let c = util::connect_unix(&host.sock(name)?, at.saturating_duration_since(Instant::now())).map_err(|e| {
-        if host.alive(name) {
-            format!("vm {name:?} is starting or its control socket is unavailable; retry once it is ready: {e}")
-        } else if host.is_suspended(name) {
-            format!("vm {name:?} is suspended; use flexvm resume {name} first")
-        } else {
-            format!("no vm named {name:?}")
+    let mut check = |c: &std::os::unix::net::UnixStream| {
+        // The process that listens; a VM's own main command needs no check: no other takes the name while it holds it.
+        let pid = util::peer_pid(c)?;
+        if pid != std::process::id() {
+            let now = host.entry(name).ok().filter(|e| e.ident.pid == pid && e.gen != 0).and_then(|e| Some(Instance { ip: e.ip?, gen: e.gen }));
+            same_instance(name, now.ok_or_else(|| format!("vm {name:?} is starting or its registry entry is unavailable; retry once it is ready"))?, vm)?;
         }
-    })?;
-    // The process that listens; a VM's own main command needs no check: no other takes the name while it holds it.
-    let pid = util::peer_pid(&c)?;
-    if pid != std::process::id() {
-        let now = host.entry(name).ok().filter(|e| e.ident.pid == pid && e.gen != 0).and_then(|e| Some(Instance { ip: e.ip?, gen: e.gen }));
-        same_instance(name, now.ok_or_else(|| format!("vm {name:?} is starting or its registry entry is unavailable; retry once it is ready"))?, vm)?;
-    }
-    let mut line = serde_json::to_vec(req)?;
-    line.push(b'\n');
-    util::send_with_fds(&c, &line, &[], at)?;
-    c.set_read_timeout(None)?;
-    c.set_write_timeout(None)?;
-    Ok(c)
+        Ok(())
+    };
+    vmproc::connect(host, name, req, &[], at, Some(&mut check))
 }
 
 /// Records the first VM reached; any later one must be it.

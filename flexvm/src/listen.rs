@@ -605,7 +605,7 @@ fn pages(host: &Host, req: &Value, conn: TcpStream) -> Result<()> {
     let name = req["name"].as_str().unwrap_or("");
     let fwd = json!({"op": "pages", "mig": req["mig"]});
     // Connected only to a valid name's socket in RUN/vms (`connect` checks it).
-    if let Err(e) = crate::vmproc::connect(host, name, &fwd, &[conn.as_raw_fd()], Instant::now() + Duration::from_secs(5)) {
+    if let Err(e) = crate::vmproc::connect(host, name, &fwd, &[conn.as_raw_fd()], Instant::now() + Duration::from_secs(5), None) {
         // The reason stays here: it tells what exists on this host.
         crate::log!("migration {}: page request for {name:?} refused: {e}", req["mig"]);
         crate::vmproc::refuse_not_source(conn, name, &req["mig"]);

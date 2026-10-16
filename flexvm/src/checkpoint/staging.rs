@@ -244,10 +244,8 @@ impl Staging {
         check(unsafe { libc::renameat2(outer, c"ck".as_ptr(), parent, self.base.as_ptr(), libc::RENAME_NOREPLACE) })
             .map_err(|e| format!("publish checkpoint at {}: {e}", self.dest.display()))?;
         self.published = true;
-        let synced = match crate::host::fault("publish_fsync") {
-            true => Err(io::Error::other("injected fault: fsync failed")),
-            false => check(unsafe { libc::fsync(parent) }),
-        };
+        let synced = crate::fault_result!(crate::host::fault("publish_fsync") => Err(io::Error::other("injected fault: fsync failed"));
+            check(unsafe { libc::fsync(parent) }));
         if let Err(e) = synced {
             // A crash could bring it back after the VM ran on: revoke it, durably.
             let revoked = self.revoke();

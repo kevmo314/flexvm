@@ -13,8 +13,9 @@
 //! `MAX_UNACKNOWLEDGED` of their own, past which the oldest is closed. Closed ones leave a tombstone so a
 //! delayed `SESSION` retry cannot rerun the command. Rings keep `BASE` bytes and grow towards `CAPACITY`
 //! from a shared pool; an unacknowledged session's output is all from the pool (the oldest such are
-//! closed to make room for it): at most `MAX_LIVE * BASE + POOL` (plus a partial `BLOCK` each). One attachment per session; a new one shuts the
-//! old one down. Output waits for it rather than overwrite unsent bytes; writers never hold the ring lock.
+//! closed to make room for it): at most `MAX_LIVE * BASE + POOL` (plus a partial `BLOCK` each).
+//! One attachment per session; a new one shuts the old one down. Output waits for it rather than
+//! overwrite unsent bytes; writers never hold the ring lock.
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::hash::{BuildHasher, BuildHasherDefault};
@@ -204,9 +205,13 @@ impl Table {
         found
     }
 
+    fn unacknowledged_count(&self) -> usize {
+        self.live.values().filter(|e| e.output.0.lock().unwrap().delivered.is_some()).count()
+    }
+
     /// Sessions running or still sending their output.
     fn running(&self) -> usize {
-        self.live.len() - self.unacknowledged().len()
+        self.live.len() - self.unacknowledged_count()
     }
 
     /// The exit went out on attachment `me`: unless a newer attachment has taken over, the session
@@ -242,9 +247,9 @@ impl Table {
     fn admit(&mut self, statuses: &Statuses) -> io::Result<()> {
         if self.running() >= MAX_LIVE {
             self.reclaim(statuses);
-        }
-        if self.running() >= MAX_LIVE {
-            return Err(io::Error::other(format!("too many sessions: {MAX_LIVE} commands are running or awaiting their client")));
+            if self.running() >= MAX_LIVE {
+                return Err(io::Error::other(format!("too many sessions: {MAX_LIVE} commands are running or awaiting their client")));
+            }
         }
         if self.closed.len() >= MAX_TOMBSTONES {
             // Only a badly delayed retry of the oldest one's creation could still arrive.
@@ -418,7 +423,7 @@ pub fn parse(line: &str) -> io::Result<Request<'_>> {
 /// `SESSIONS`' reply: how many sessions are live, and how many of those are exited and unacknowledged.
 pub fn counts(sessions: &Sessions) -> String {
     let table = sessions.lock().unwrap();
-    format!("ok {} {}", table.live.len(), table.unacknowledged().len())
+    format!("ok {} {}", table.live.len(), table.unacknowledged_count())
 }
 
 pub fn cleanup(sessions: &Sessions, statuses: &Statuses) {
@@ -1294,7 +1299,7 @@ mod tests {
             })
             .collect();
         let table = sessions.lock().unwrap();
-        assert_eq!(table.unacknowledged().len(), MAX_UNACKNOWLEDGED);
+        assert_eq!(table.unacknowledged_count(), MAX_UNACKNOWLEDGED);
         assert_eq!(table.running(), 0);
         // The oldest made room.
         assert!((0..5).all(|i| table.closed.contains_key(&i.to_string())));

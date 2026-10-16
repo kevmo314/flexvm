@@ -1,10 +1,8 @@
 //! Snapshot compatibility preflight. A template records its build host's CPU model, the
 //! features KVM offered (passed through: no CPU template), XSAVE layout, TSC rate,
-//! saved MSR set and Firecracker;
-//! checkpoints and migrations pin their template and check the saving host's MSRs and effective TSC rate.
-//! Topology, cache
-//! and leaf-limit words are not compared: Firecracker rewrites the first, the rest do not
-//! change what the guest can run.
+//! saved MSR set and Firecracker. Checkpoints and migrations pin their template and check
+//! the saving host's MSRs and effective TSC rate. Topology, cache and leaf-limit words are
+//! not compared: Firecracker rewrites the first, the rest do not change what the guest can run.
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -13,7 +11,7 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
-use crate::template::{hash_file, Stamp, Template};
+use crate::template::{hash_file, Stamp};
 use crate::{bail, util::Result};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -50,12 +48,14 @@ const FEATURES: [(u32, u32, &[usize]); 11] = [
 const REGS: [&str; 4] = ["eax", "ebx", "ecx", "edx"];
 
 impl Compat {
+    #[cfg(test)]
     pub fn check(&self, host: &Self) -> Result<()> {
-        self.check_saved(host, self.tsc_khz, &self.msrs)
+        self.check_saved(host, self.tsc_khz, &self.msrs).map(drop)
     }
 
-    /// Later snapshots save the effective vCPU rate and the saving host's MSRs.
-    pub fn check_saved(&self, host: &Self, tsc_khz: u32, msrs: &BTreeSet<u32>) -> Result<()> {
+    /// Later snapshots save the effective vCPU rate and the saving host's MSRs. Returns the
+    /// effective restored rate: Firecracker keeps the host default within 250 ppm, else scales.
+    pub fn check_saved(&self, host: &Self, tsc_khz: u32, msrs: &BTreeSet<u32>) -> Result<u32> {
         let hints = ["every host needs the same CPU model", "copy one Firecracker binary to every host; templates built with another must be rebuilt"];
         for ((what, snapshot, here), hint) in [("CPU", &self.cpu, &host.cpu), ("Firecracker", &self.firecracker, &host.firecracker)].into_iter().zip(hints) {
             if snapshot != here {
@@ -75,7 +75,7 @@ impl Compat {
                 bail!("snapshot incompatible with this host: XSAVE component {c} layout differs (snapshot: {want:?}; host: {:?})", host.xsave.get(c));
             }
         }
-        Ok(())
+        Ok(if tsc_scaling_required(tsc_khz, host.tsc_khz) { tsc_khz } else { host.tsc_khz })
     }
 
     fn of_cpuid(entries: &[[u32; 6]], firecracker: String) -> Result<Self> {
@@ -197,10 +197,6 @@ fn firecracker_id(path: &Path, run: Option<&Path>) -> Result<(Stamp, String)> {
     Ok(cached)
 }
 
-pub fn check(template: &Template, pid: u32) -> Result<()> {
-    template.meta.compatibility.check(&local(pid)?)
-}
-
 /// Match Firecracker's is_tsc_scaling_required: tolerance is relative to the saved rate.
 pub fn check_tsc(saved_khz: u32, host: &Compat) -> Result<()> {
     if saved_khz == 0 || host.tsc_khz == 0 {
@@ -214,14 +210,6 @@ pub fn check_tsc(saved_khz: u32, host: &Compat) -> Result<()> {
         );
     }
     Ok(())
-}
-
-/// Firecracker leaves the host default unchanged within 250 ppm; otherwise it scales
-/// to the saved rate. KVM_GET_TSC_KHZ on a duplicated Firecracker fd is not usable:
-/// KVM requires the caller to share the VM's address space.
-pub fn restored_tsc_khz(saved_khz: u32, host: &Compat) -> Result<u32> {
-    check_tsc(saved_khz, host)?;
-    Ok(if tsc_scaling_required(saved_khz, host.tsc_khz) { saved_khz } else { host.tsc_khz })
 }
 
 fn tsc_scaling_required(saved_khz: u32, host_khz: u32) -> bool {
@@ -245,9 +233,7 @@ fn supported_cpuid(kvm: &File) -> Result<Vec<[u32; 6]>> {
     // each entry { function, index, flags, eax, ebx, ecx, edx, padding[3] }.
     let mut buf = vec![0u32; 2 + MAX * 10];
     buf[0] = MAX as u32;
-    if unsafe { libc::ioctl(kvm.as_raw_fd(), 0xc008_ae05, buf.as_mut_ptr()) } < 0 {
-        bail!("KVM_GET_SUPPORTED_CPUID: {}", std::io::Error::last_os_error());
-    }
+    crate::syscall_check!(unsafe { libc::ioctl(kvm.as_raw_fd(), 0xc008_ae05, buf.as_mut_ptr()) } < 0, "KVM_GET_SUPPORTED_CPUID");
     let n = (buf[0] as usize).min(MAX);
     Ok(buf[2..2 + n * 10].chunks(10).map(|e| [e[0], e[1], e[3], e[4], e[5], e[6]]).collect())
 }
@@ -269,9 +255,7 @@ fn tsc_khz(kvm: &File) -> Result<u32> {
 
 fn ioctl(fd: &impl AsRawFd, request: libc::c_ulong, arg: libc::c_ulong, name: &str) -> Result<i32> {
     let value = unsafe { libc::ioctl(fd.as_raw_fd(), request, arg) };
-    if value < 0 {
-        bail!("{name}: {}", std::io::Error::last_os_error());
-    }
+    crate::syscall_check!(value < 0, "{name}");
     Ok(value)
 }
 
@@ -279,13 +263,9 @@ fn saved_msrs(kvm: &File) -> Result<BTreeSet<u32>> {
     // KVM reports the required size with E2BIG. Do not silently truncate a future kernel's list.
     let mut buf = vec![0u32; 1];
     let result = unsafe { libc::ioctl(kvm.as_raw_fd(), 0xc004_ae02, buf.as_mut_ptr()) };
-    if result < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::E2BIG) {
-        bail!("KVM_GET_MSR_INDEX_LIST: {}", std::io::Error::last_os_error());
-    }
+    crate::syscall_check!(result < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::E2BIG), "KVM_GET_MSR_INDEX_LIST");
     buf.resize(1 + buf[0] as usize, 0);
-    if unsafe { libc::ioctl(kvm.as_raw_fd(), 0xc004_ae02, buf.as_mut_ptr()) } < 0 {
-        bail!("KVM_GET_MSR_INDEX_LIST: {}", std::io::Error::last_os_error());
-    }
+    crate::syscall_check!(unsafe { libc::ioctl(kvm.as_raw_fd(), 0xc004_ae02, buf.as_mut_ptr()) } < 0, "KVM_GET_MSR_INDEX_LIST");
     Ok(buf[1..].iter().copied().filter(|&index| msr_should_serialize(index)).collect())
 }
 
@@ -511,7 +491,7 @@ mod tests {
         target.tsc_khz = 2_000_400;
         template.check(&source).unwrap();
         template.check(&target).unwrap();
-        let saved = restored_tsc_khz(template.tsc_khz, &source).unwrap();
+        let saved = template.check_saved(&source, template.tsc_khz, &template.msrs).unwrap();
         assert_eq!(saved, 1_999_600);
         let error = template.check_saved(&target, saved, &source.msrs).unwrap_err().to_string();
         assert!(error.contains("1999600") && error.contains("2000400"), "{error}");
@@ -522,7 +502,7 @@ mod tests {
         target.tsc_khz = 2_000_400;
         target.tsc_control = true;
         template.check_saved(&target, saved, &source.msrs).unwrap();
-        assert_eq!(restored_tsc_khz(saved, &target).unwrap(), saved);
+        assert_eq!(template.check_saved(&target, saved, &source.msrs).unwrap(), saved);
         target.tsc_control = false;
         target.tsc_khz = 1_999_101;
         assert!(template.check(&target).is_err());
@@ -535,14 +515,14 @@ mod tests {
         for delta in [-501, -500, 0, 500, 501] {
             target.tsc_khz = (2_000_000i64 + delta) as u32;
             target.tsc_control = false;
-            assert_eq!(restored_tsc_khz(2_000_000, &target).is_ok(), delta.abs() <= 500);
+            assert_eq!(check_tsc(2_000_000, &target).is_ok(), delta.abs() <= 500);
             target.tsc_control = true;
             let want = if delta.abs() <= 500 { target.tsc_khz } else { 2_000_000 };
-            assert_eq!(restored_tsc_khz(2_000_000, &target).unwrap(), want);
+            assert_eq!(target.check_saved(&target, 2_000_000, &target.msrs).unwrap(), want);
         }
-        assert!(restored_tsc_khz(0, &target).is_err());
+        assert!(check_tsc(0, &target).is_err());
         target.tsc_khz = 0;
-        assert!(restored_tsc_khz(2_000_000, &target).is_err());
+        assert!(check_tsc(2_000_000, &target).is_err());
     }
 
     #[test]

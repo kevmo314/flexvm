@@ -136,10 +136,8 @@ impl Proc {
         if !vm.pending_net.load(Ordering::SeqCst) {
             return Ok(());
         }
-        let res = match fault("readdress_fail") {
-            true => Err("injected fault: setting the address failed".into()),
-            false => vm.guest_net(vm.ip, self.host.config_now().dns.as_deref()),
-        };
+        let res = crate::fault_result!(fault("readdress_fail") => Err("injected fault: setting the address failed".into());
+            vm.guest_net(vm.ip, self.host.config_now().dns.as_deref()));
         match res {
             Ok(()) => {
                 vm.pending_net.store(false, Ordering::SeqCst);
@@ -402,8 +400,7 @@ impl Proc {
         let (vm, restore) = (|| -> Result<_> {
             let seed = Some((ck.runs, Origin::File(ck.file)));
             let fc = self.spawner.take(None)?;
-            let rate = m.check_compatibility(&tpl, &crate::compat::local(fc.pid())?)?;
-            let prepared = crate::vm::Prepared::with_saved_tsc(fc, tpl, rate)?;
+            let prepared = crate::vm::Prepared::with_saved_tsc(fc, tpl, || m.saved_cpu())?;
             t.mark("pager_start");
             // Test gate: its Firecracker is up, nothing loaded or paged in yet.
             crate::host::hold("restore_prepared_gate");
@@ -440,14 +437,12 @@ impl Proc {
             crate::host::hold("resume_unmarked_gate");
         }
         // Test fault `resume_fence_fail`: the generation is found withdrawn at the fence.
-        let still = match fault("resume_fence_fail") {
-            true => Err("injected fault: the address's generation was withdrawn meanwhile".into()),
-            false => self.still_current(ip),
-        };
+        let still = crate::fault_result!(fault("resume_fence_fail") => Err("injected fault: the address's generation was withdrawn meanwhile".into());
+            self.still_current(ip));
         let still = still.map_err(|e| Restore::NotRun(kill(e)))?;
         // Routed only under the fence, paused or not: a newer generation routed elsewhere while this
         // one loaded keeps its route, and this restore fails above without having touched it (#534).
-        let routed = crate::net::ifindex(&vm.tap).and_then(|i| crate::net::route_dev(true, ip, i));
+        let routed = vm.route();
         routed.map_err(|e| Restore::NotRun(kill(format!("routing {ip} to its tap: {e}").into())))?;
         t.mark("route");
         if hold {
@@ -458,10 +453,9 @@ impl Proc {
             // A crash must not bring it back once it may have run. Marked under the fence, not before:
             // a crash while waiting for the host lock would otherwise lose a VM that never ran.
             let failing = |e: &str| std::fs::remove_file(dir.join(STARTED)).and(Err(std::io::Error::other(format!("injected fault: {e}"))));
-            let marked = match fault("started_fsync") {
-                true => std::fs::File::create(dir.join(STARTED)).and(Err(std::io::Error::other("injected fault: fsync failed"))),
-                false => mark_durably(&dir, STARTED),
-            };
+            let marked = crate::fault_result!(fault("started_fsync") =>
+                std::fs::File::create(dir.join(STARTED)).and(Err(std::io::Error::other("injected fault: fsync failed")));
+                mark_durably(&dir, STARTED));
             if let Err(e) = marked {
                 vm.kill();
                 let unmarked = if fault("started_unmark") { failing("fsync failed") } else { crate::util::unlink_durably(&dir.join(STARTED)) };
@@ -474,10 +468,8 @@ impl Proc {
             // Test gate: STARTED is durable, the vCPUs not yet unpaused, the fence's host lock held.
             crate::host::hold("resume_marked_gate");
         }
-        let unpaused = match fault("restore_unpause_fail") {
-            true => Err("injected fault: resuming its vCPUs failed".into()),
-            false => vm.unpause(),
-        };
+        let unpaused = crate::fault_result!(fault("restore_unpause_fail") => Err("injected fault: resuming its vCPUs failed".into());
+            vm.unpause());
         // Some of its vCPUs may have run all the same (STARTED stays): paused again, it is kept, for a
         // `flexvm resume`; destroyed only if not even that is known.
         if let Err(e) = unpaused {
