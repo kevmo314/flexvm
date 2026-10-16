@@ -153,7 +153,7 @@ impl Pager {
     pub(super) fn copy_hot(&self) -> Option<Hot> {
         let buf = self.hot_spare.lock().unwrap().take()?;
         // Written in two intervals in a row: one written once (a file being written, say) is better left to the writers.
-        let before = self.hot_dirty.lock().unwrap();
+        let before = self.hot_dirty.lock().unwrap().clone();
         // This is only a candidate scan: it clears no dirty bits. Freeze later takes the authoritative snapshot
         // under the fault lock and protects every dirty page not copied here, including intervening writes.
         let pages = self.pages();
@@ -161,7 +161,6 @@ impl Pager {
         let eligible = |p: usize| pages.get(p) == PRESENT && spans.iter().any(|&(a, b)| (a..b).contains(&p));
         // One past what fits is enough to know they do not.
         let hot: Vec<usize> = pages.hot_pages(&before).filter(|&p| eligible(p)).take(buf.pages() + 1).collect();
-        drop(before);
         if hot.len() > buf.pages() {
             self.recycle_buf(buf);
             return None;
