@@ -895,7 +895,7 @@ def exec_background():
     """An exec whose command leaves a background process holding its output returns once the
     shell exits (the process keeps running), and such execs never use up the guest agent's 64
     session slots; nor do interrupted ones (SIGINT stops the command), or abandoned sessions
-    whose client disconnected or was killed outright."""
+    whose client disconnected or was killed outright, or exits acknowledged late by a slow reader."""
     n = "ft-exec-bg"
     ok(run(A, n))
     # Processes whose command line starts with `cmd` (the ^ keeps grep from counting itself).
@@ -961,6 +961,29 @@ def exec_background():
     stopped = wait_for(lambda: count("yes") == (0, "0"), 10)
     check("exec bg: a piped exec's command is stopped once its stdout breaks", stopped, count("yes"))
     check("exec bg: execs still start after the piped ones", sh(A, n, "echo hi") == (0, "hi"))
+    # Piped into a slow reader, the CLI acknowledges its exit only after it wrote all output out, seconds
+    # late (#505): 70 of these at once must not use up the slots, keep a new exec out, or lose output.
+    drained = []
+
+    def slow_reader():
+        cmd = f'set -o pipefail; "$0" --state "$1" --run "$2" exec "$3" "head -c 200000 /dev/zero" | (sleep 5; cat) | wc -c'
+        r = subprocess.run(["bash", "-c", cmd, BIN, A.state, A.run, n], capture_output=True, text=True, timeout=120, env=ENV)
+        drained.append((r.returncode, r.stdout.strip(), r.stderr.strip()[-200:]))
+
+    readers = [threading.Thread(target=slow_reader) for _ in range(70)]
+    for r in readers:
+        r.start()
+        time.sleep(0.02)
+    time.sleep(1)
+    t = time.time()
+    r = sh(A, n, "echo hi")
+    took = time.time() - t
+    check("exec bg: an exec starts at once while 70 exited ones wait on slow readers", r == (0, "hi") and took < 4, (r, took))
+    for r in readers:
+        r.join()
+    bad = [d for d in drained if d != (0, "200000", "")]
+    check("exec bg: 70 execs piped into slow readers all end with all their output", len(drained) == 70 and not bad, bad[:3])
+    check("exec bg: execs still start after the slow readers", sh(A, n, "echo hi") == (0, "hi"))
     knob = "/run/flexvm-test-abandoned-running-secs"
     check("exec bg: the abandoned-session wait is shortened", sh(A, n, f"echo 3 > {knob}") == (0, ""))
     with socket.socket(socket.AF_UNIX) as s:

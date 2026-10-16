@@ -1,6 +1,6 @@
 //! Resumable commands: `SESSION <id> <len>` (then `len` bytes of shell command), `ATTACH <id> <offset>`,
 //! `CLOSE <id>`. Output frames start with their stream offset (u64 LE); the exit frame is offset plus code.
-//! After an exit, the client may send SESSION_DONE on the attachment to release the session;
+//! After an exit, the client may send SESSION_DONE on the attachment, however late, to release the session;
 //! without that acknowledgement the exit stays available for reattachment.
 //! The command runs in a process group of its own; its exit is the shell's, recorded once output stops or
 //! `DRAIN` after the shell exits; background processes that keep its pipes open run on, their later output
@@ -8,8 +8,9 @@
 //! SIGPIPE). Closing a session whose shell has not exited kills its process group (not processes that
 //! left it with setsid or setpgid: that would take a cgroup per session); closing an unknown one cancels it, so
 //! a start still in flight never runs. Sessions whose client is gone are closed in time, running ones too.
-//! At most `MAX_LIVE` sessions are live; closed ones leave a tombstone so a delayed `SESSION` retry cannot
-//! rerun the command. Rings keep `BASE` bytes and grow towards `CAPACITY` from a shared pool: at most
+//! At most `MAX_LIVE` sessions are live; when that many are, the one whose exit was sent longest ago makes
+//! room for a new one, so unacknowledged exits never shut out new commands. Closed ones leave a tombstone
+//! so a delayed `SESSION` retry cannot rerun the command. Rings keep `BASE` bytes and grow towards `CAPACITY` from a shared pool: at most
 //! `MAX_LIVE * BASE + POOL` (plus a partial `BLOCK` each). One attachment per session; a new one shuts the
 //! old one down. Output waits for it rather than overwrite unsent bytes; writers never hold the ring lock.
 use std::collections::{HashMap, VecDeque};
@@ -58,6 +59,8 @@ const MAX_TICK: Duration = Duration::from_secs(2);
 /// TSC, so CLOCK_MONOTONIC (and `Instant`) jump by the paused time on resume; this counts it as one
 /// tick of at most `MAX_TICK`. A starved ticker only makes it slow, never fast.
 static AWAKE_MS: AtomicU64 = AtomicU64::new(0);
+/// Orders sent exits, oldest first.
+static DELIVERIES: AtomicU64 = AtomicU64::new(0);
 
 pub fn start_clock() {
     thread::spawn(|| {
@@ -132,26 +135,31 @@ impl Table {
 
     /// Kills the command's process group first if its shell is still running (`kill`).
     fn close(&mut self, id: &str, kill: Option<&Statuses>) {
-        if let Some(entry) = self.live.remove(id) {
-            // Only while its own shell is unreaped (the token, under the reaper's lock) is the group
-            // surely the command's. An exited shell's jobs run on.
-            if let Some(statuses) = kill {
-                kill_running(statuses, entry.group, entry.token, true, libc::SIGKILL);
-            }
-            let mut output = entry.output.0.lock().unwrap();
-            output.closed = true;
-            output.chunks = VecDeque::new();
-            output.start = output.end;
-            output.reservation.release();
-            let attached = output.attached.as_mut().and_then(|a| a.conn.take());
-            drop(output);
-            entry.output.1.notify_all();
-            // Unblocks its handler even mid-write to a stalled client, as a new attachment would.
-            if let Some(conn) = attached {
-                unsafe { libc::shutdown(conn.as_raw_fd(), libc::SHUT_RDWR) };
-            }
-            self.closed.insert(id.to_string(), awake());
+        let Some(output) = self.retire(id, kill) else { return };
+        let attached = output.0.lock().unwrap().attached.as_mut().and_then(|a| a.conn.take());
+        // Unblocks its handler even mid-write to a stalled client, as a new attachment would.
+        if let Some(conn) = attached {
+            unsafe { libc::shutdown(conn.as_raw_fd(), libc::SHUT_RDWR) };
         }
+    }
+
+    /// `close`, leaving the attachment's connection open.
+    fn retire(&mut self, id: &str, kill: Option<&Statuses>) -> Option<Session> {
+        let entry = self.live.remove(id)?;
+        // Only while its own shell is unreaped (the token, under the reaper's lock) is the group
+        // surely the command's. An exited shell's jobs run on.
+        if let Some(statuses) = kill {
+            kill_running(statuses, entry.group, entry.token, true, libc::SIGKILL);
+        }
+        let mut output = entry.output.0.lock().unwrap();
+        output.closed = true;
+        output.chunks = VecDeque::new();
+        output.start = output.end;
+        output.reservation.release();
+        drop(output);
+        entry.output.1.notify_all();
+        self.closed.insert(id.to_string(), awake());
+        Some(entry.output)
     }
 
     fn ended(&self, id: &str) -> bool {
@@ -189,11 +197,19 @@ impl Table {
         }
     }
 
+    /// Closes the session whose exit was sent longest ago: its client most likely has the exit, and is only
+    /// slow to acknowledge it (its stdout drains slowly, say) or lost the acknowledgement. Its connection
+    /// is left open, for the client to read what is still on its way, and ends when the client hangs up.
+    fn evict_delivered(&mut self) -> bool {
+        let oldest = self.live.iter().filter_map(|(id, e)| e.output.0.lock().unwrap().delivered.map(|at| (at, id.clone()))).min();
+        oldest.map(|(_, id)| self.retire(&id, None)).is_some()
+    }
+
     fn admit(&mut self, statuses: &Statuses) -> io::Result<()> {
         if self.live.len() >= MAX_LIVE {
             self.reclaim(statuses);
         }
-        if self.live.len() >= MAX_LIVE {
+        if self.live.len() >= MAX_LIVE && !self.evict_delivered() {
             return Err(io::Error::other(format!("too many sessions: {MAX_LIVE} commands are running or awaiting their client")));
         }
         if self.closed.len() >= MAX_TOMBSTONES {
@@ -265,6 +281,8 @@ pub(crate) struct Output {
     sent: u64,
     /// When it was detached, on the awake clock.
     gone: Option<Duration>,
+    /// When the exit was first sent to an attachment (in `DELIVERIES`' order): from then it may be evicted.
+    delivered: Option<u64>,
     reservation: Reservation,
 }
 
@@ -360,6 +378,9 @@ pub fn handle(mut w: impl Write, body: &[u8], conn: Option<File>, line: &str, se
     match open(body, conn, line, sessions, statuses) {
         Ok(Some((id, offset, (output, me)))) => {
             let result = msg(&mut w, id).and_then(|_| drain(&mut w, &output, offset, me));
+            if matches!(result, Ok(true)) {
+                output.0.lock().unwrap().delivered.get_or_insert_with(|| DELIVERIES.fetch_add(1, Ordering::Relaxed));
+            }
             // Without an acknowledgement (a lost exit, or a client keeping the session), a retry still finds the exit.
             let acknowledged = matches!(result, Ok(true)) && acknowledge(&output, me);
             let mut table = sessions.lock().unwrap();
@@ -493,13 +514,20 @@ fn deliver(output: &Session, kind: u8, data: &[u8]) -> Duration {
     waited
 }
 
-/// SESSION_DONE from the client on attachment `me`, within 2 s of its exit frame (a newer attachment shuts it down).
+/// SESSION_DONE from the client on attachment `me`, whenever it comes: a client writes out all output before it
+/// acknowledges. The wait ends with the connection, which a newer attachment or the session's close shuts down.
 fn acknowledge(output: &Session, me: u64) -> bool {
     let conn = output.0.lock().unwrap().attached.as_ref().filter(|a| a.id == me).and_then(|a| a.conn.as_ref()).and_then(|c| c.try_clone().ok());
     let Some(mut conn) = conn else { return false };
     let mut ready = libc::pollfd { fd: conn.as_raw_fd(), events: libc::POLLIN, revents: 0 };
     let mut ack = [0];
-    (unsafe { libc::poll(&mut ready, 1, 2000) }) > 0 && conn.read(&mut ack).is_ok_and(|n| n == 1) && ack[0] == SESSION_DONE
+    let ready = loop {
+        match unsafe { libc::poll(&mut ready, 1, -1) } {
+            -1 if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => continue,
+            n => break n > 0,
+        }
+    };
+    ready && conn.read(&mut ack).is_ok_and(|n| n == 1) && ack[0] == SESSION_DONE
 }
 
 fn drain(w: &mut impl Write, output: &Session, mut offset: u64, me: u64) -> io::Result<bool> {
@@ -1160,6 +1188,66 @@ mod tests {
         assert!(!output.0.lock().unwrap().closed);
     }
 
+    /// Attaches a client to `id` and reads to its exit, leaving the acknowledgement to the caller.
+    fn attach_to_exit(sessions: &Sessions, statuses: &Statuses, id: &str) -> (thread::JoinHandle<io::Result<()>>, UnixStream) {
+        let (conn, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let duplicate = File::from(OwnedFd::from(conn.try_clone().unwrap()));
+        let (sessions, statuses, line) = (sessions.clone(), statuses.clone(), format!("ATTACH {id} 0"));
+        let handler = thread::spawn(move || handle(conn, b"", Some(duplicate), &line, &sessions, &statuses));
+        read_to_exit(&mut peer);
+        (handler, peer)
+    }
+
+    #[test]
+    fn a_late_acknowledgement_still_releases_the_session() {
+        let (sessions, statuses) = (Sessions::default(), statuses());
+        let output = finished(&mut sessions.lock().unwrap(), "done", None);
+        let (handler, mut peer) = attach_to_exit(&sessions, &statuses, "done");
+        // A client whose stdout drains slowly acknowledges only once it wrote everything out.
+        thread::sleep(Duration::from_secs(4));
+        assert!(!handler.is_finished(), "gave up waiting for the acknowledgement");
+        assert!(output.0.lock().unwrap().delivered.is_some());
+        peer.write_all(&[SESSION_DONE]).unwrap();
+        handler.join().unwrap().unwrap();
+        assert!(sessions.lock().unwrap().closed.contains_key("done"));
+        assert!(output.0.lock().unwrap().closed);
+    }
+
+    #[test]
+    fn unacknowledged_exits_make_room_for_new_sessions() {
+        let (sessions, statuses) = (Sessions::default(), statuses());
+        let mut clients = Vec::new();
+        // Twice the limit of exits whose clients are slow to acknowledge: each new session evicts the oldest.
+        for i in 0..2 * MAX_LIVE {
+            let id = i.to_string();
+            let mut table = sessions.lock().unwrap();
+            table.admit(&statuses).unwrap_or_else(|e| panic!("session {i} refused: {e}"));
+            finished(&mut table, &id, None);
+            drop(table);
+            clients.push(attach_to_exit(&sessions, &statuses, &id));
+            if let Some(evicted) = (i + 1).checked_sub(MAX_LIVE + 1) {
+                let table = sessions.lock().unwrap();
+                assert!(table.closed.contains_key(&evicted.to_string()), "session {evicted} was not the one evicted");
+                assert_eq!(table.live.len(), MAX_LIVE);
+            }
+        }
+        // An evicted session's connection stays open, for what is still on its way to the client.
+        thread::sleep(Duration::from_millis(200));
+        assert!(clients.iter().all(|(handler, _)| !handler.is_finished()));
+        for (handler, mut peer) in clients {
+            peer.write_all(&[SESSION_DONE]).unwrap();
+            handler.join().unwrap().unwrap();
+        }
+        let mut table = sessions.lock().unwrap();
+        assert!(table.live.is_empty());
+        // An exit not yet sent is never evicted.
+        for i in 0..MAX_LIVE {
+            finished(&mut table, &format!("unsent{i}"), None);
+        }
+        assert!(table.admit(&statuses).unwrap_err().to_string().contains("too many sessions"));
+    }
+
     #[test]
     fn a_new_attachment_replaces_the_previous_one() {
         let (sessions, statuses) = (Sessions::default(), statuses());
@@ -1208,6 +1296,8 @@ mod tests {
             }
         }
         assert_eq!(sent, total);
+        // Closed, the survivor's connection ends its wait for an acknowledgement.
+        drop(peers);
         for h in handlers.into_iter().chain([first]) {
             let _ = h.join().unwrap();
         }
