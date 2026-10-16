@@ -150,10 +150,8 @@ fn runs(h: &Hosts, args: &Args, template: &str, date: &str, id: &str) -> Result<
         thread::sleep(settle);
     }
     let standby = samples.iter().filter(|s| s["standby"] == json!(true)).count();
-    let mut summary = json!({"run": summarize(&samples, "run")?, "run_client": summarize(&samples, "run_client")?, "run_standby_hits": standby});
-    if ready.is_some() {
-        summary["client"] = summarize(&samples, "client")?;
-    }
+    let mut summary = run_summary(&samples)?;
+    summary["run_standby_hits"] = json!(standby);
     if h.to.is_some() {
         summary["migrate"] = summarize(&samples, "migrate")?;
         summary["migrate_target"] = summarize(&samples, "migrate_target")?;
@@ -209,17 +207,7 @@ fn iteration(h: &Hosts, name: &str, template: &str, dirty_mib: u64, ready: Optio
         sample["migrate"]["background_pull"] = pull;
         sample["migrate_target"] = migrated["target_timings_ms"].clone();
         // Fault service on the target, by kind (see `uffd::FaultStats`).
-        let f = &status["faults"];
-        let mut post = json!({});
-        for kind in ["local", "remote", "wait", "fetch", "pull", "queued", "first"] {
-            for stat in ["count", "sum_ms", "p50_us", "p99_us", "max_us"] {
-                post[format!("{kind}_{stat}")] = f[kind][stat].clone();
-            }
-        }
-        // How long vCPUs (and Firecracker's own threads) were blocked on
-        // missing pages in all.
-        let blocked: f64 = ["local", "remote", "wait"].iter().filter_map(|k| f[k]["sum_ms"].as_f64()).sum();
-        post["fault_blocked"] = json!(blocked);
+        let mut post = fault_report(&status["faults"])?;
         if let (Some(local), Some(after)) = (read_local, read_after) {
             post["read_local"] = json!(local);
             post["read_after_migrate"] = json!(after);
@@ -253,7 +241,7 @@ fn lifecycle(h: &Hosts, args: &Args, template: &str, dir: &std::path::Path, date
             crate::log!("bench: {mib} MiB {}/{iterations}", i + 1);
         }
         let mut s = Map::new();
-        for group in ["pause", "checkpoint", "restore", "suspend", "resume_suspended"] {
+        for group in ["pause_client", "checkpoint", "restore", "suspend", "resume_suspended"] {
             s.insert(group.into(), summarize(&samples, group)?);
         }
         summary.insert(format!("{mib}_mib"), s.into());
@@ -290,7 +278,8 @@ fn trial(h: &Hosts, name: &str, template: &str, mib: u64, ck: &std::path::Path) 
         v.sort_by(f64::total_cmp);
         v[v.len() / 2]
     };
-    let pause = json!({"pause": med(&mut p), "resume": med(&mut r)});
+    // Signal dispatch, entry/lock reads and the 1 ms state polling interval are included.
+    let pause_client = json!({"pause_client": med(&mut p), "resume_client": med(&mut r)});
 
     let c = crate::vmproc::call(&h.a, name, json!({"op": "checkpoint", "dir": ck, "stop": true}), None)?;
     let mut checkpoint = c["timings_ms"].clone();
@@ -320,7 +309,7 @@ fn trial(h: &Hosts, name: &str, template: &str, mib: u64, ck: &std::path::Path) 
     h.wait("suspend", || !h.b.alive(name))?;
     let suspend = json!({"total": ms(t.elapsed())});
     let resume_suspended = restored(h.cli(&h.b, &["resume", name, "-d"])?)?;
-    Ok(json!({"pause": pause, "checkpoint": checkpoint, "restore": restore, "suspend": suspend, "resume_suspended": resume_suspended}))
+    Ok(json!({"pause_client": pause_client, "checkpoint": checkpoint, "restore": restore, "suspend": suspend, "resume_suspended": resume_suspended}))
 }
 
 fn host_context(template: &str) -> Value {
@@ -360,8 +349,36 @@ fn wait_ready(addr: SocketAddr, http: bool, deadline: Instant) -> Result<()> {
     }
 }
 
-/// Nearest-rank percentiles; a phase only some samples have counts as 0 in the others, so
-/// phases still add up to each sample's total.
+fn fault_report(faults: &Value) -> Result<Value> {
+    let mut post = json!({});
+    for (kind, stats) in faults.as_object().ok_or("status has no fault report")? {
+        for stat in ["count", "sum_ms", "p50_us", "p99_us", "max_us"] {
+            post[format!("{kind}_{stat}")] = stats[stat].clone();
+        }
+    }
+    // These kinds service faults that block vCPUs (or Firecracker threads).
+    let blocked: f64 = ["local", "remote", "wait", "wp"].iter().filter_map(|k| faults[k]["sum_ms"].as_f64()).sum();
+    post["fault_blocked"] = json!(blocked);
+    Ok(post)
+}
+
+fn run_summary(samples: &[Value]) -> Result<Value> {
+    let mut summary = json!({});
+    for (standby, group) in [(true, "run_standby"), (false, "run_cold")] {
+        let population: Vec<_> = samples.iter().filter(|s| s["standby"] == standby).cloned().collect();
+        if !population.is_empty() {
+            summary[group] = summarize(&population, "run")?;
+            summary[format!("{group}_client")] = summarize(&population, "run_client")?;
+            // With --ready-port: until the app answers.
+            if population.iter().all(|s| s.get("client").is_some()) {
+                summary[group.replace("run", "ready")] = summarize(&population, "client")?;
+            }
+        }
+    }
+    Ok(summary)
+}
+
+/// Nearest-rank percentiles over observed values only, with each phase's sample count.
 fn summarize(samples: &[Value], group: &str) -> Result<Value> {
     let mut phases: Vec<&String> = Vec::new();
     for s in samples {
@@ -379,10 +396,13 @@ fn summarize(samples: &[Value], group: &str) -> Result<Value> {
     }
     let mut summary = Map::new();
     for phase in phases {
-        let mut v: Vec<f64> = samples.iter().map(|s| s[group][phase].as_f64().unwrap_or(0.0)).collect();
+        let mut v: Vec<f64> = samples.iter().filter_map(|s| s[group][phase].as_f64()).collect();
+        if v.is_empty() {
+            continue;
+        }
         v.sort_by(f64::total_cmp);
         let rank = |p: usize| v[(v.len() * p).div_ceil(100) - 1];
-        summary.insert(phase.clone(), json!({"p50": rank(50), "p90": rank(90), "p99": rank(99), "max": v[v.len() - 1]}));
+        summary.insert(phase.clone(), json!({"count": v.len(), "p50": rank(50), "p90": rank(90), "p99": rank(99), "max": v[v.len() - 1]}));
     }
     Ok(summary.into())
 }
@@ -425,18 +445,60 @@ mod tests {
     }
 
     #[test]
+    fn run_populations_are_separate() {
+        let samples = [
+            json!({"standby": true, "run": {"total": 2, "fence": 1}, "run_client": {"total": 4}}),
+            json!({"standby": true, "run": {"total": 3, "fence": 2}, "run_client": {"total": 5}}),
+            json!({"standby": false, "run": {"total": 50, "snapshot_load": 40}, "run_client": {"total": 55}}),
+        ];
+        let summary = run_summary(&samples).unwrap();
+        assert_eq!(summary["run_standby"]["total"]["p50"], 2.0);
+        assert_eq!(summary["run_cold"]["snapshot_load"]["p50"], 40.0);
+        assert_eq!(summary["run_cold_client"]["total"]["count"], 1);
+        assert!(summary["run_standby"]["snapshot_load"].is_null());
+        assert!(run_summary(&samples[..2]).unwrap()["run_cold"].is_null());
+        assert!(summary["ready_standby"].is_null());
+        let ready: Vec<_> = samples
+            .iter()
+            .cloned()
+            .map(|mut s| {
+                s["client"] = json!({"total": s["run_client"]["total"].as_f64().unwrap() + 10.0});
+                s
+            })
+            .collect();
+        let summary = run_summary(&ready).unwrap();
+        assert_eq!(summary["ready_standby"]["total"]["max"], 15.0);
+        assert_eq!(summary["ready_cold"]["total"]["count"], 1);
+    }
+
+    #[test]
+    fn fault_report_includes_wp_and_future_kinds() {
+        let faults = json!({
+            "local": {"sum_ms": 1}, "remote": {"sum_ms": 2}, "wait": {"sum_ms": 3},
+            "wp": {"count": 7, "sum_ms": 4, "p99_us": 900},
+            "pull": {"sum_ms": 100}, "future": {"count": 8},
+        });
+        let report = fault_report(&faults).unwrap();
+        assert_eq!(report["fault_blocked"], 10.0);
+        assert_eq!(report["wp_count"], 7);
+        assert_eq!(report["wp_p99_us"], 900);
+        assert_eq!(report["future_count"], 8);
+        assert!(fault_report(&Value::Null).is_err());
+    }
+
+    #[test]
     fn nearest_rank_percentiles() {
         let samples: Vec<_> = (1..=100).rev().map(|n| json!({"run": {"total": n}})).collect();
-        let want = json!({"total": {"p50": 50.0, "p90": 90.0, "p99": 99.0, "max": 100.0}});
+        let want = json!({"total": {"count": 100, "p50": 50.0, "p90": 90.0, "p99": 99.0, "max": 100.0}});
         assert_eq!(summarize(&samples, "run").unwrap(), want);
-        let want = json!({"total": {"p50": 100.0, "p90": 100.0, "p99": 100.0, "max": 100.0}});
+        let want = json!({"total": {"count": 1, "p50": 100.0, "p90": 100.0, "p99": 100.0, "max": 100.0}});
         assert_eq!(summarize(&samples[..1], "run").unwrap(), want);
         assert!(summarize(&[], "run").is_err());
         let mixed = [json!({"run": {"load": 3, "total": 4}}), json!({"run": {"resume": 1, "total": 2}})];
         let want = json!({
-            "load": {"p50": 0.0, "p90": 3.0, "p99": 3.0, "max": 3.0},
-            "total": {"p50": 2.0, "p90": 4.0, "p99": 4.0, "max": 4.0},
-            "resume": {"p50": 0.0, "p90": 1.0, "p99": 1.0, "max": 1.0},
+            "load": {"count": 1, "p50": 3.0, "p90": 3.0, "p99": 3.0, "max": 3.0},
+            "total": {"count": 2, "p50": 2.0, "p90": 4.0, "p99": 4.0, "max": 4.0},
+            "resume": {"count": 1, "p50": 1.0, "p90": 1.0, "p99": 1.0, "max": 1.0},
         });
         assert_eq!(summarize(&mixed, "run").unwrap(), want);
         assert!(summarize(&[json!({"run": {"total": 1}}), json!({})], "run").is_err());

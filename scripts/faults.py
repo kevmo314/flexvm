@@ -1256,7 +1256,7 @@ def migrate_in_raw(host, name, ip, source, gen=None, template=None):
     # Newer than any the host has seen for it, as an arriving VM's is.
     gen = addr(host, ip).get("seen", 0) + 1 if gen is None else gen
     req = {"op": "migrate_in", "name": name, "mig": mig, "template": template or args.template, "id": template_id,
-           "ip": ip, "gen": gen, "rev": 0, "source": A.addr, "regions": regions}
+           "ip": ip, "gen": gen, "rev": 0, "source": A.addr, "regions": regions, "msrs": []}
     s.sendall((json.dumps(req) + "\n").encode())
     buf = b""
     while not buf.endswith(b"\n"):
