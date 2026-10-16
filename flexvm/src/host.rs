@@ -497,7 +497,7 @@ impl Host {
         }
         // Only the run directory itself must be made here: a non-root user still reads one root made.
         std::fs::create_dir_all(run).map_err(|e| named(run, e))?;
-        for d in ["vms", "standby", "w"] {
+        for d in ["vms", "standby", "w", "claims"] {
             let _ = std::fs::create_dir_all(run.join(d));
         }
         let canon = |d: &Path| d.canonicalize().map_err(|e| named(d, e));
@@ -755,17 +755,17 @@ impl Host {
 
     /// Records are replaced whole, so reading one needs no lock. Only `claim_new_in`
     /// writes one without fsync, so only that one can come back empty (a power loss after
-    /// another write synced the directory, #554). Written before this boot, its VM died
-    /// with the host, and its generation is below the durable high-water mark: as
-    /// withdrawn at the mark, the address is free and its generations still only rise.
-    /// One written in this boot may be a live VM's, so it is an error, as is anything
-    /// else that cannot be read or parsed: never a free address.
+    /// another write synced the directory, #554). Written before this boot (no
+    /// `unsynced_marker` of this boot's), its VM died with the host, and its generation is
+    /// below the durable high-water mark: as withdrawn at the mark, the address is free
+    /// and its generations still only rise. One written in this boot may be a live VM's,
+    /// so it is an error, as is anything else that cannot be read or parsed: never a free
+    /// address.
     fn read_addr(&self, ip: Ipv4Addr) -> Result<Addr> {
         let path = self.addr_path(ip);
-        if let Some(m) = std::fs::metadata(&path).ok().filter(|m| m.len() == 0) {
-            let btime = std::fs::read_to_string("/proc/stat").ok().and_then(|s| s.lines().find_map(|l| l.strip_prefix("btime ")?.trim().parse().ok()));
-            if !btime.is_some_and(|b| m.modified().is_ok_and(|t| t < UNIX_EPOCH + Duration::from_secs(b))) {
-                bail!("{}: empty, and not from before this boot: its VM may still run", path.display());
+        if std::fs::metadata(&path).is_ok_and(|m| m.len() == 0) {
+            if std::fs::read_to_string(self.unsynced_marker(ip)).is_ok_and(|b| b == boot_id()) {
+                bail!("{}: empty, and written in this boot: its VM may still run", path.display());
             }
             let g = load::<Gens>(&self.gens_path())?.ok_or_else(|| format!("{}: empty, with no high-water mark to bound it", path.display()))?;
             return Ok(Addr { seen: g.reserved, withdrawn: true, ..Addr::default() });
@@ -773,8 +773,24 @@ impl Host {
         Ok(load(&path)?.unwrap_or_default())
     }
 
+    /// `RUN/claims/IP`, with the boot id: the record was last written without fsync in
+    /// this boot. A clock can be set, so the boot id, not a time, tells (`read_addr`).
+    fn unsynced_marker(&self, ip: Ipv4Addr) -> PathBuf {
+        self.run.join("claims").join(ip.to_string())
+    }
+
+    /// Marked before a write without fsync; the mark goes once a durable write supersedes it.
     fn put_addr(&self, ip: Ipv4Addr, a: &Addr, durable: bool) -> Result<()> {
-        store(&self.addr_path(ip), a, durable)
+        let marker = self.unsynced_marker(ip);
+        if !durable {
+            crate::util::write_file(marker.parent().ok_or("no directory")?, &ip.to_string(), boot_id().as_bytes(), false)
+                .map_err(|e| format!("{}: {e}", marker.display()))?;
+        }
+        store(&self.addr_path(ip), a, durable)?;
+        if durable {
+            let _ = std::fs::remove_file(&marker);
+        }
+        Ok(())
     }
 
     /// Stores the record only if `change` changed it.
@@ -3232,7 +3248,10 @@ mod tests {
         // Emptied in this boot, its VM may still run.
         std::fs::write(h.addr_path(x), "").unwrap();
         assert!(h.addr(&l, x).is_err() && h.claim_new(&l, "b", Some(x)).is_err());
-        File::options().write(true).open(h.addr_path(x)).unwrap().set_modified(UNIX_EPOCH + Duration::from_secs(1)).unwrap();
+        // From an earlier boot: its marker is another boot's, or gone with RUN.
+        std::fs::write(h.unsynced_marker(x), "other").unwrap();
+        assert!(h.addr(&l, x).unwrap().withdrawn);
+        std::fs::remove_file(h.unsynced_marker(x)).unwrap();
         let a = h.addr(&l, x).unwrap();
         assert!(a.seen == mark && a.withdrawn && a.holder.is_none() && a.lent.is_none());
         assert!(!h.observe(&l, x, gen, 0, Some(ip("192.0.2.1"))).unwrap(), "its old generation is stale");
@@ -3242,10 +3261,13 @@ mod tests {
         store(&h.mig_path(3), &Mig::Pending { owner: gone, ip: Some(x) }, false).unwrap();
         assert_eq!(h.mig_status(3).unwrap(), "aborted");
         let l = h.lock().unwrap();
-        assert!(h.claim_new(&l, "b", Some(x)).unwrap().gen > mark);
+        let c = h.claim_new(&l, "b", Some(x)).unwrap();
+        assert!(c.gen > mark && h.unsynced_marker(x).exists());
+        // A durable write (here the release) supersedes the unsynced one, and its marker goes.
+        c.release(&l).unwrap();
+        assert!(!h.unsynced_marker(x).exists());
         // Without a mark nothing bounds it.
         std::fs::write(h.addr_path(ip("10.9.0.2")), "").unwrap();
-        File::options().write(true).open(h.addr_path(ip("10.9.0.2"))).unwrap().set_modified(UNIX_EPOCH).unwrap();
         std::fs::remove_file(h.gens_path()).unwrap();
         assert!(h.addr(&l, ip("10.9.0.2")).is_err());
     }
