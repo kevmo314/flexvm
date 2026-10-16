@@ -148,7 +148,8 @@ enum PagerFailure {
     Lost(String),
 }
 
-/// Learning and load completion gate a pending working-set prefetch under one mutex.
+/// The working-set prefetch and load-set learning (`learn_load_set`): while learning, faults go into the load set, and
+/// a prefetch that comes due before the snapshot is loaded is held back until it is.
 #[derive(Default)]
 struct PrefetchState {
     learning: bool,

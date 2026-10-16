@@ -1629,8 +1629,11 @@ impl Latest {
 }
 
 /// Resume tickets follow signals from `took` (under `taking`, like `ask`) to
-/// the pause worker. Each turn answers all tickets offered so far: SIGCONT
-/// with its outcome, SIGTSTP as paused again. Outcomes stay until collected.
+/// the pause worker. A taken signal covers the tickets asked by then: their
+/// SIGCONT is that one, came before it, or was discarded by it (a SIGTSTP sent
+/// after a SIGCONT still pending discards it). Each turn answers all tickets
+/// offered so far: SIGCONT with its outcome, SIGTSTP (a later Ctrl-Z) as paused
+/// again. Outcomes stay until collected.
 #[derive(Default)]
 struct Resumes {
     state: Mutex<ResumeState>,
