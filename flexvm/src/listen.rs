@@ -875,7 +875,7 @@ fn routable(ip: Ipv4Addr, cfg: &crate::host::Config, peers: &[IpAddr], gateways:
 
 fn routable_by(ip: Ipv4Addr, cfg: &crate::host::Config, peers: &[IpAddr], gateways: &[Ipv4Addr], local: impl FnOnce(Ipv4Addr) -> Result<bool>) -> Result<()> {
     // Only local configuration authorizes a VM address; a peer's range is untrusted.
-    if !crate::net::IpRange::parse(cfg.cluster_ips.as_deref().unwrap_or(&cfg.vm_ips))?.contains(ip) {
+    if !cfg.cluster()?.contains(ip) {
         bail!("{ip} is not a vm's address: outside this host's configured VM ranges");
     }
     let peer = is_peer(peers, IpAddr::V4(ip));
