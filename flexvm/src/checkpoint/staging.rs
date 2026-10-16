@@ -40,6 +40,15 @@ impl Drop for Unlock {
     }
 }
 
+/// Unlinks a lock file when dropped, before its `Unlock` lets go of it.
+struct Unlink(PathBuf);
+
+impl Drop for Unlink {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 pub(super) const STAGING_PREFIX: &str = ".flexvm-staging-";
 
 pub enum CommitError {
@@ -88,11 +97,15 @@ impl Staging {
         ensure!(crate::util::stat_at(pfd.as_raw_fd(), &base).is_none(), "{} already exists; checkpoints are never overwritten", dest.display());
         // Ancestors need durability only at publication. Walk once in commit, using
         // the pinned directory's then-current ancestry (it may move during the write).
-        let parent_lock = crate::host::private_file(&PathBuf::from(format!("/proc/self/fd/{}/.checkpoint.lock", pfd.as_raw_fd())))?;
-        check(unsafe { libc::flock(parent_lock.as_raw_fd(), libc::LOCK_EX) })?;
-        // Let go on error paths too, before the descriptor closes; on success,
-        // the private staging directory takes over exclusion below.
-        let _parent_lock = Unlock(parent_lock.as_raw_fd());
+        // Not in the directory, which its owner may change: in root's, by the directory's (dev, inode).
+        let st = fstat(pfd.as_raw_fd())?;
+        let locks = crate::host::run_dir().map(Path::to_path_buf).or_else(|| vmstate.parent().map(Path::to_path_buf)).ok_or("no run directory")?;
+        let lock_path = crate::host::locks(&locks).join("checkpoints").join(format!("{}-{}", st.st_dev, st.st_ino));
+        let parent_lock = crate::host::lock_path(&lock_path, libc::LOCK_EX)?;
+        // Let go on error paths too, before the descriptor closes, and unlinked while held
+        // (a taker re-checks the path); on success, the private staging directory takes
+        // over exclusion below.
+        let _parent_lock = (Unlink(lock_path), Unlock(parent_lock.as_raw_fd()));
         clear_stale_fd(&pfd);
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().subsec_nanos();
         let outer_name = cname(&format!("{STAGING_PREFIX}{}-{nanos:x}", std::process::id()));
@@ -100,7 +113,6 @@ impl Staging {
         let outer = open_dir_at(pfd.as_raw_fd(), &outer_name).inspect_err(|_| remove_staging(pfd.as_raw_fd(), &outer_name, -1, None))?;
         let ck = (|| -> Result<_> {
             check(unsafe { libc::flock(outer.as_raw_fd(), libc::LOCK_EX) })?;
-            check(unsafe { libc::flock(parent_lock.as_raw_fd(), libc::LOCK_UN) })?;
             ensure!(private_dir(outer.as_raw_fd()), "staging directory in {} was replaced", parent_path.display());
             check(unsafe { libc::mkdirat(outer.as_raw_fd(), c"ck".as_ptr(), 0o700) })?;
             Ok(open_dir_at(outer.as_raw_fd(), c"ck")?)

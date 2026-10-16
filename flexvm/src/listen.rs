@@ -541,16 +541,20 @@ fn incoming(host: &Host, req: &Value, line: &[u8], conn: TcpStream, by: Instant)
     // Each arrival owns its log until accepted; refusing a duplicate name
     // must not remove the running VM's log.
     static ARRIVAL: AtomicUsize = AtomicUsize::new(0);
-    // Locked for the arrival's life (its stdout shares the lock), so a dead
-    // arrival's log is told from a live one's and swept (`gc`), and a later
-    // listener counts it, by its peer (`earlier_arrivals`).
+    // Its lock (`RUN/vms/.locks/` and the log's name), made before the log, is held
+    // until the arrival publishes or removes its log (its fd 5 shares it), so a dead
+    // arrival's log is told from a live one's and swept (`gc`), and a later listener
+    // counts it, by its peer (`earlier_arrivals`).
     let n = ARRIVAL.fetch_add(1, Ordering::Relaxed);
-    let log_path = host.run.join("vms").join(format!("{}{}-{n}-{from}.log", crate::gc::ARRIVAL_LOG, std::process::id()));
+    let file = format!("{}{}-{n}-{from}.log", crate::gc::ARRIVAL_LOG, std::process::id());
+    let vms = host.run.join("vms");
+    let (log_path, lock_path) = (vms.join(&file), crate::host::locks(&vms).join(&file));
+    let lock = crate::host::private_file(&lock_path)?;
+    crate::host::flock(&lock, libc::LOCK_SH)?;
     let log = {
         use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new().create_new(true).append(true).mode(0o600).open(&log_path)?
+        std::fs::OpenOptions::new().create_new(true).append(true).mode(0o600).open(&log_path).inspect_err(|_| drop(std::fs::remove_file(&lock_path)))?
     };
-    crate::host::flock(&log, libc::LOCK_SH)?;
     let args = ["--state".as_ref(), host.state.as_os_str(), "--run".as_ref(), host.run.as_os_str(), "run".as_ref(), "--incoming".as_ref()];
     let (done, told) = std::os::unix::net::UnixStream::pair()?;
     let by = (monotonic_ms() + by.saturating_duration_since(Instant::now()).as_millis() as u64).to_string();
@@ -559,6 +563,7 @@ fn incoming(host: &Host, req: &Value, line: &[u8], conn: TcpStream, by: Instant)
         &log,
         conn.as_raw_fd(),
         Some(told.as_raw_fd()),
+        Some(lock.as_raw_fd()),
         &[
             ("FLEXVM_INCOMING", std::str::from_utf8(line)?),
             ("FLEXVM_INCOMING_LOG", log_path.to_str().ok_or("non-UTF8 log path")?),
@@ -571,6 +576,7 @@ fn incoming(host: &Host, req: &Value, line: &[u8], conn: TcpStream, by: Instant)
         Ok(child) => crate::util::reap_later(child, Some((done.into(), Box::new(slot)))),
         Err(e) => {
             let _ = std::fs::remove_file(log_path);
+            let _ = std::fs::remove_file(lock_path);
             refuse(&conn, format!("cannot start the vm process: {e}"))?;
         }
     }
@@ -583,7 +589,7 @@ fn incoming(host: &Host, req: &Value, line: &[u8], conn: TcpStream, by: Instant)
 fn earlier_arrivals(host: &Host) -> HashMap<IpAddr, usize> {
     let me = std::process::id().to_string();
     let mut n = HashMap::new();
-    for e in std::fs::read_dir(host.run.join("vms")).into_iter().flatten().flatten() {
+    for e in std::fs::read_dir(crate::host::locks(&host.run.join("vms"))).into_iter().flatten().flatten() {
         let name = e.file_name();
         let Some(rest) = name.to_str().and_then(|f| f.strip_prefix(crate::gc::ARRIVAL_LOG)?.strip_suffix(".log")) else { continue };
         let mut parts = rest.splitn(3, '-');
@@ -598,11 +604,15 @@ fn earlier_arrivals(host: &Host) -> HashMap<IpAddr, usize> {
 
 /// Publish only an accepted arrival's log. A refused arrival owns only its
 /// temporary file, even when the requested name already belongs to a VM.
+/// Its lock goes with it: held, it is the caller's to let go of then.
 pub fn finish_incoming_log(host: &Host, name: &str, log: &std::path::Path, accepted: bool) -> Result<()> {
     if accepted {
         std::fs::rename(log, host.vms(name, "log")?)?;
     } else {
         std::fs::remove_file(log)?;
+    }
+    if let Some(file) = log.file_name() {
+        let _ = std::fs::remove_file(crate::host::locks(&host.run.join("vms")).join(file));
     }
     Ok(())
 }
@@ -840,7 +850,9 @@ mod tests {
             let reply = crate::util::recv_json(&mut std::io::BufReader::new(&client)).unwrap().unwrap();
             assert_eq!(reply["ok"], false);
             assert!(reply["error"].as_str().unwrap().contains(why), "{reply}");
-            assert_eq!(std::fs::read_dir(host.run.join("vms")).unwrap().count(), 0, "no arrival log made");
+            let vms = host.run.join("vms");
+            let made = |d: &std::path::Path| std::fs::read_dir(d).unwrap().filter(|e| e.as_ref().unwrap().file_name() != crate::host::LOCKS).count();
+            assert_eq!(made(&vms) + made(&crate::host::locks(&vms)), 0, "no arrival log or lock made");
         };
         let held = || ARRIVALS.held.lock().unwrap().values().sum::<usize>();
         let take = |from: &str, n: usize| (0..n).map(|_| ARRIVALS.take(from.parse().unwrap()).unwrap()).collect::<Vec<_>>();
@@ -863,18 +875,18 @@ mod tests {
     }
 
     /// Arrivals an earlier listener started outlive it: a restarted one counts their
-    /// locked logs, by peer, and admits none past either bound (#521).
+    /// locks (`.locks/` and the log's name), by peer, and admits none past either bound (#521).
     #[test]
     fn arrivals_an_earlier_listener_started_count_against_both_bounds() {
         let root = crate::test_util::TempDir::new("arrivals-earlier");
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
-        let vms = host.run.join("vms");
+        let vms = crate::host::locks(&host.run.join("vms"));
         let line = br#"{"op":"migrate_in","name":"web"}"#;
         // Each held as its arrival holds it; `None`: dead, unlocked. An arrival that
         // ends is taken away by its name (a lock let go may linger a moment in a child
         // another test forks meanwhile).
         let log = |name: String, live: bool| {
-            let f = std::fs::File::create(vms.join(&name)).unwrap();
+            let f = crate::host::private_file(&vms.join(&name)).unwrap();
             live.then(|| (crate::host::flock(&f, libc::LOCK_SH).map(|()| f).unwrap(), vms.join(name)))
         };
         let end = |logs: Vec<Option<(std::fs::File, std::path::PathBuf)>>| logs.into_iter().flatten().for_each(|(_, p)| std::fs::remove_file(p).unwrap());
@@ -923,7 +935,7 @@ mod tests {
         };
         let requests = [json!({"op": "lend", "ip": "10.200.0.7"}), json!({"op": "migration", "mig": 7}), json!({"op": "route", "ip": "10.200.0.8", "gen": 3})];
         // Held by another process, as one stopped while holding it would.
-        let held = crate::host::private_file(&host.state.join("lock")).unwrap();
+        let held = crate::host::private_file(&host.lock_file()).unwrap();
         crate::host::flock(&held, libc::LOCK_EX).unwrap();
         std::thread::scope(|s| {
             let waits: Vec<_> = requests.iter().map(|r| s.spawn(|| ask(r.clone()))).collect();
