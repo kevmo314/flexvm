@@ -1,5 +1,6 @@
 #![deny(clippy::print_stderr)]
 
+mod artifacts;
 mod bench;
 mod checkpoint;
 mod compat;
@@ -842,8 +843,8 @@ fn build_template(args: &Args, name: &str) -> Result<()> {
     let res = (|| {
         let image = opts
             .map(|opts| {
-                let init = args.get("init").map_or(paths.kernel.with_file_name("flexvm-init"), PathBuf::from);
-                let (rootfs, meta) = image::prepare(&state(args)?.join("images"), &init, &opts)?;
+                let init = args.get("init").map(PathBuf::from);
+                let (rootfs, meta) = image::prepare(&state(args)?.join("images"), init.as_deref(), &opts)?;
                 paths.rootfs = rootfs;
                 Ok::<_, util::Error>(meta)
             })

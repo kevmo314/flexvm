@@ -1,0 +1,84 @@
+name: Release artifacts
+
+# Pushing an artifacts-N tag builds the patched Firecracker and re-hosts the pinned guest kernel as the
+# release flexvm downloads from on first use. The tag must be ARTIFACTS_TAG in scripts/versions.sh at the
+# tagged commit. Afterwards, scripts/pin-artifacts.sh pins the assets' sha256 in scripts/checksums.sha256
+# (a follow-up commit): from then on, flexvm builds download them. A release's assets never change.
+
+on:
+  push:
+    tags: ["artifacts-*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: build and publish ${{ github.ref_name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.ref_name }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check the tag
+        run: |
+          want=$(env -u ARTIFACTS_TAG bash -c 'source scripts/versions.sh; echo "$ARTIFACTS_TAG"')
+          if [ "$TAG" != "$want" ]; then
+            echo "::error::scripts/versions.sh at this commit names $want, not $TAG"
+            exit 1
+          fi
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "::error::release $TAG exists already; its assets are never replaced"
+            exit 1
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      # Firecracker builds with the toolchain its own rust-toolchain.toml pins (rustup installs it).
+      - name: Build Firecracker
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends musl-tools libseccomp-dev
+          ./scripts/build-firecracker.sh --state "$RUNNER_TEMP/state"
+
+      - name: Fetch the kernel
+        run: ./scripts/fetch.sh --state "$RUNNER_TEMP/state" --kernel
+
+      - name: Assets
+        run: |
+          out=$RUNNER_TEMP/assets
+          mkdir -p "$out"
+          install -m 755 "$RUNNER_TEMP/state/artifacts/firecracker" "$out/firecracker"
+          install -m 644 "$RUNNER_TEMP/state/artifacts/vmlinux" "$out/vmlinux"
+          ./scripts/pin-artifacts.sh --inputs > "$out/inputs.txt"
+          (cd "$out" && sha256sum firecracker vmlinux inputs.txt > SHA256SUMS)
+          "$out/firecracker" --version
+          cat "$out/inputs.txt" "$out/SHA256SUMS"
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          out=$RUNNER_TEMP/assets
+          {
+            echo "Prebuilt patched Firecracker ($(./scripts/pin-artifacts.sh --inputs | head -1 | cut -d' ' -f2)) and guest kernel for flexvm, built from ${GITHUB_SHA}."
+            echo
+            echo "Pin them with scripts/pin-artifacts.sh at a commit whose scripts/versions.sh names ${TAG}."
+            echo
+            echo '```'
+            cat "$out/SHA256SUMS"
+            echo '```'
+          } > "$RUNNER_TEMP/notes.md"
+          gh release create "$TAG" --verify-tag --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md" \
+            "$out/firecracker" "$out/vmlinux" "$out/inputs.txt" "$out/SHA256SUMS"

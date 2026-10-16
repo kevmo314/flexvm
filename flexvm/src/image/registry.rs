@@ -614,6 +614,27 @@ impl Registry {
     }
 }
 
+/// GET `url` with no credentials, following redirects (`next_hop`) and retrying 429 and 503 as registry requests do,
+/// by the deadline of a `size`-byte transfer: the body, which the caller checks against its pinned digest.
+pub fn download(url: &str, size: u64) -> Result<ureq::Body> {
+    let deadline = deadline(size);
+    let mut next = url.to_string();
+    for redirects in 0.. {
+        let client = agent(deadline, false, Peer::default());
+        let resp = call(&format!("GET {next}"), deadline, |left| client.get(&next).config().timeout_global(Some(left)).build())?;
+        match resp.status().as_u16() {
+            300..=399 => {
+                let loc =
+                    resp.headers().get("location").and_then(|v| v.to_str().ok()).ok_or_else(|| format!("GET {next}: redirect without an ASCII location"))?;
+                next = next_hop(url, &next, loc, redirects)?;
+            }
+            200..=299 => return Ok(resp.into_body()),
+            code => bail!("GET {next}: HTTP {code}"),
+        }
+    }
+    unreachable!()
+}
+
 fn cached_blob<R: Read>(digest: &str, size: u64, blobs: &Path, download: impl FnOnce() -> Result<R>) -> Result<PathBuf> {
     let path = blob_path(blobs, digest)?;
     let dir = path.parent().unwrap().to_path_buf();

@@ -60,6 +60,10 @@ jobs:
         run: |
           sudo modprobe tun
           cargo test -p flexvm --config 'target.x86_64-unknown-linux-gnu.runner="sudo -E"' -- --ignored
+      # The pinned artifacts release (what `cargo build` users download) must be built from this
+      # checkout's Firecracker patches and kernel; a change to them needs a new one (scripts/versions.sh).
+      - name: Pinned artifacts release
+        run: ./scripts/pin-artifacts.sh --check || echo "::warning::the pinned artifacts release is stale; see scripts/versions.sh"
       - name: e2e scheduler self-test
         # Fake templates and workers, one of which cannot be spawned: its cases must fail.
         run: python3 scripts/e2e.py --selftest --log-dir "$RUNNER_TEMP/e2e-selftest"
@@ -119,6 +123,8 @@ jobs:
           ./scripts/fetch.sh --urls > urls.txt
           for f in vmlinux base.squashfs; do
             url=$(awk -v f="$f" '$1 == f {print $2}' urls.txt)
+            # A flexvm release's assets never change (and are pinned): no ETag needed.
+            case $url in https://github.com/*/releases/download/*) continue ;; esac
             etag=$(curl -sfI "$url" | tr -d '\r' | awk 'tolower($1) == "etag:" {print $2}')
             test -n "$etag"
             echo "$f-etag $etag" >> urls.txt
@@ -129,7 +135,8 @@ jobs:
           echo "downloads=$(sha256sum urls.txt | cut -c1-16)" >> "$GITHUB_OUTPUT"
           rm urls.txt
 
-      # Patched Firecracker: rebuilt only when its inputs change. Each artifact is saved
+      # Patched Firecracker, built from this checkout's patches (not the pinned release's, which
+      # a patch under review cannot be in): rebuilt only when its inputs change. Each artifact is saved
       # right after it is built, so a failing test run still fills the cache.
       - name: Restore Firecracker
         id: fc-cache
@@ -173,8 +180,9 @@ jobs:
             ${{ env.STATE }}/artifacts/base.squashfs
           key: ${{ steps.dl-cache.outputs.cache-primary-key }}
 
-      # Root filesystem with flexvm-init: rebuilt when the guest agent, the image recipe,
-      # the base image (by checksum) or the build environment change.
+      # The default template's root filesystem with flexvm-init: rebuilt when the guest agent, the
+      # image recipe, the base image (by checksum) or the build environment change. Image templates
+      # need none of it: flexvm embeds flexvm-init.
       - name: Restore rootfs
         id: rootfs-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -182,7 +190,6 @@ jobs:
           path: |
             ${{ env.STATE }}/artifacts/rootfs-*.ext4
             ${{ env.STATE }}/artifacts/rootfs.ext4
-            ${{ env.STATE }}/artifacts/flexvm-init
           key: rootfs-${{ steps.keys.outputs.env }}-rust${{ env.RUST_TOOLCHAIN }}-base${{ steps.fetch.outputs.base }}-${{ hashFiles('guest/**', 'scripts/build-rootfs.sh', 'Cargo.lock', 'Cargo.toml') }}
       - name: Build rootfs
         if: steps.rootfs-cache.outputs.cache-hit != 'true'
@@ -199,7 +206,6 @@ jobs:
           path: |
             ${{ env.STATE }}/artifacts/rootfs-*.ext4
             ${{ env.STATE }}/artifacts/rootfs.ext4
-            ${{ env.STATE }}/artifacts/flexvm-init
           key: ${{ steps.rootfs-cache.outputs.cache-primary-key }}
 
       - name: Build flexvm

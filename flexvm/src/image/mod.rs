@@ -23,7 +23,9 @@ use crate::host::{flock, Flock};
 use crate::template::interrupted;
 use crate::util::{cpath, is_nonce, random_hex, stat_at};
 use crate::util::{ms, rename_noreplace, run_until, sync_dir, Result};
+pub use registry::download;
 use registry::sha256_hex;
+pub use unpack::Hashed;
 pub use unpack::Limits;
 use unpack::{check, open_at, Root};
 
@@ -131,7 +133,8 @@ fn app_config(config: &Value, o: &Options) -> Result<App> {
     })
 }
 
-pub fn prepare(cache: &Path, init: &Path, o: &Options) -> Result<(PathBuf, ImageMeta)> {
+/// `init` is flexvm-init's path, or the one built into flexvm (`artifacts::INIT`) for `None`.
+pub fn prepare(cache: &Path, init: Option<&Path>, o: &Options) -> Result<(PathBuf, ImageMeta)> {
     let img = source::resolve(cache, &o.image, &o.limits)?;
     let config: Value = serde_json::from_slice(&img.config)?;
     let (os, arch) = (config["os"].as_str().unwrap_or("linux"), config["architecture"].as_str().unwrap_or("amd64"));
@@ -147,7 +150,10 @@ pub fn prepare(cache: &Path, init: &Path, o: &Options) -> Result<(PathBuf, Image
         },
         (None, false) => None,
     };
-    let init_bytes = std::fs::read(init).map_err(|e| format!("flexvm-init at {init:?}: {e} (run scripts/build-rootfs.sh)"))?;
+    let init_bytes = match init {
+        Some(init) => std::fs::read(init).map_err(|e| format!("flexvm-init at {init:?}: {e}"))?,
+        None => crate::artifacts::INIT.to_vec(),
+    };
     // Rebuild older cached images with Docker's explicit-group semantics and protected app config.
     let key = json!({
         "v": 3, "config": img.config_digest, "diff_ids": img.diff_ids,
@@ -1271,7 +1277,7 @@ mod tests {
         let key = sha256_hex(key.to_string().as_bytes());
         let cached = d.join("rootfs").join(format!("{}.ext4", &key[7..]));
         cached_rootfs(&cached, build("cached"), sync_dir).unwrap();
-        let (path, meta) = prepare(&d, &init, &o).unwrap();
+        let (path, meta) = prepare(&d, Some(&init), &o).unwrap();
         serving.join().unwrap();
         assert_eq!(read(path), "cached image");
         assert_eq!(meta.app_conf, "cached config");
