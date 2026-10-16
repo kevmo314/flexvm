@@ -420,10 +420,12 @@ impl Proc {
                 }
                 delay = (delay * 2).min(Duration::from_secs(5));
             }
+            // One last try, never a retry loop: until `finish` the source stays unkillable, keeps its
+            // name, claim and paused Firecracker, and a migration back here waits. `retry_route` already
+            // retried in the background while the target pulled.
             if let Some(mut route) = p.take_pending_route(mig) {
-                let what = format!("route {} to {}", p.vm().ip, route.to);
-                if !retry(&what, || p.switch_route(mig, route.resolve(&p.host)?)) {
-                    crate::log!("{what}: giving up");
+                if let Err(e) = route.resolve(&p.host).and_then(|via| p.switch_route(mig, via)) {
+                    crate::log!("route {} to {}: {e}; giving up", p.vm().ip, route.to);
                 }
             }
             let op = p.op();
