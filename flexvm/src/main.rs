@@ -605,7 +605,7 @@ fn log_file(host: &Host, name: &str) -> Result<std::fs::File> {
     // collection removes only a quiet log, holding it exclusively.
     let _logs = host.logs_lock(libc::LOCK_SH)?;
     use std::os::unix::fs::OpenOptionsExt;
-    let f = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(host.vms(name, "log")?)?;
+    let f = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(host.vms(name, "log")?)?;
     f.set_modified(std::time::SystemTime::now())?;
     Ok(f)
 }
@@ -1214,6 +1214,17 @@ mod exec_tests {
         for value in ["1", "2", "32"] {
             assert_eq!(template_vcpus(&parse(&["--vcpus", value])).unwrap().to_string(), value);
         }
+    }
+
+    #[test]
+    fn detached_log_refuses_symlinks() {
+        let root = crate::test_util::TempDir::new("log-link");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let victim = root.join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        std::os::unix::fs::symlink(&victim, host.vms("vm", "log").unwrap()).unwrap();
+        assert!(log_file(&host, "vm").is_err());
+        assert_eq!(std::fs::read_to_string(victim).unwrap(), "keep");
     }
 
     #[test]

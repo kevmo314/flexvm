@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt};
+use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -362,9 +362,27 @@ pub fn is_endpoint(s: &str) -> bool {
     host && port.parse::<u16>().is_ok_and(|p| p > 0)
 }
 
+/// Never through a link, and only a regular file no other user may write: records name processes to signal.
+pub fn open_record(path: &Path) -> std::io::Result<File> {
+    let f = File::options().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)?;
+    let m = f.metadata()?;
+    if !m.is_file() || !guarded(m.uid(), m.mode(), false) {
+        crate::log!("{}: refused: not a regular file owned by root or this user, writable by no one else", path.display());
+        return Err(untrusted(path, "not a regular file owned by root or this user, writable by no one else"));
+    }
+    Ok(f)
+}
+
+fn read_record(path: &Path) -> std::io::Result<Vec<u8>> {
+    let mut f = open_record(path)?;
+    let mut b = Vec::new();
+    std::io::Read::read_to_end(&mut f, &mut b)?;
+    Ok(b)
+}
+
 /// Unreadable or corrupt is an error, never None.
 pub fn load<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
-    match std::fs::read(path) {
+    match read_record(path) {
         Ok(b) => Ok(Some(serde_json::from_slice(&b).map_err(|e| format!("{}: {e}", path.display()))?)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => bail!("{}: {e}", path.display()),
@@ -374,7 +392,7 @@ pub fn load<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
 /// Who a name lock says holds it: None for an empty lock (created, never
 /// written: no VM started under it); unreadable or corrupt is an error.
 fn lock_holder(path: &Path) -> Result<Option<Ident>> {
-    match std::fs::read(path) {
+    match read_record(path) {
         Ok(b) if b.is_empty() => Ok(None),
         Ok(b) => Ok(Some(serde_json::from_slice(&b).map_err(|e| format!("{}: {e}", path.display()))?)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -446,7 +464,7 @@ fn claim_run(state: &Path, run: &Path) -> Result<bool> {
         return Ok(true);
     }
     let tmp = run.join(format!(".state.json.{}.tmp", crate::util::random_hex(8)?));
-    let made = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp);
+    let made = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o644).open(&tmp);
     let linked = match made {
         // Another state may have claimed it since it was read.
         Err(e) if unwritable(&e) => return verify(),
@@ -485,14 +503,31 @@ impl Host {
     /// `open`, taking `host.json` whatever its ranges: for `flexvm config`, which is how they are
     /// fixed (`configure` validates what it saves).
     pub fn open_unvalidated(state: &Path, run: &Path) -> Result<Host> {
-        let dirs = [("addrs", 0o777), ("standby", 0o777), ("migs", 0o777), ("owed", 0o700), ("withdrawals", 0o700), ("suspended", 0o700)];
-        let (marker, id) = (state.join(".synced"), || std::fs::metadata(state).map(|m| format!("{} {}", m.dev(), m.ino())));
+        let dirs = [("addrs", 0o755), ("standby", 0o755), ("migs", 0o755), ("owed", 0o700), ("withdrawals", 0o700), ("suspended", 0o700)];
         let named = |d: &Path, e: std::io::Error| {
             let hint = if e.kind() == std::io::ErrorKind::PermissionDenied { " (run flexvm as root to create it)" } else { "" };
             format!("{}: {e}{hint}", d.display())
         };
+        // Each root is made 0755 if missing and followed if a link; everything after uses the canonical path.
+        let host_root = |d: &Path| {
+            let made = if d.is_dir() { Ok(()) } else { host_dir(d, 0o755) };
+            made.and_then(|()| d.canonicalize()).and_then(|c| trusted_root(&c).map(|()| c)).map_err(|e| named(d, e))
+        };
+        let (state, run) = (host_root(state)?, host_root(run)?);
+        let (state, run) = (state.as_path(), run.as_path());
         let root = |e| named(state, e);
-        std::fs::create_dir_all(state).map_err(root)?;
+        let (marker, id) = (state.join(".synced"), || std::fs::metadata(state).map(|m| format!("{} {}", m.dev(), m.ino())));
+        // Only the directories flexvm made here; deeper ones are checked where they are used.
+        for d in dirs.iter().map(|(d, _)| state.join(d)).chain([locks(state)]).filter(|d| d.symlink_metadata().is_ok()) {
+            trusted_dir(&d).map_err(|e| named(&d, e))?;
+        }
+        for d in ["vms", "standby", "w", "claims", "live"] {
+            let path = run.join(d);
+            match host_dir(&path, 0o755) {
+                Err(e) if unwritable(&e) && path.symlink_metadata().is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) => {}
+                r => r.map_err(|e| named(&path, e))?,
+            }
+        }
         // Readers of an initialized state need no lock: they cannot change its binding
         // or repair it. Never flock the publicly readable directory itself.
         let _held = match private_file(&locks(state).join("open")) {
@@ -503,19 +538,13 @@ impl Host {
         if id().ok().is_none_or(|id| std::fs::read_to_string(&marker).ok() != Some(id)) || dirs.iter().any(|(d, _)| !state.join(d).is_dir()) {
             let _ = std::fs::remove_file(&marker);
             dirs.iter()
-                .try_for_each(|(d, mode)| crate::util::create_dir_durably(&state.join(d), *mode))
-                .and_then(|()| std::fs::write(&marker, id()?))
+                .try_for_each(|(d, mode)| host_dir(&state.join(d), *mode).and_then(|()| crate::util::create_dir_durably(&state.join(d), *mode)))
+                .and_then(|()| write_record(&marker, id()?.as_bytes()))
                 .map_err(root)?;
-        }
-        // Only the run directory itself must be made here: a non-root user still reads one root made.
-        std::fs::create_dir_all(run).map_err(|e| named(run, e))?;
-        for d in ["vms", "standby", "w", "claims"] {
-            let _ = std::fs::create_dir_all(run.join(d));
         }
         // Name locks (`vms`): made by root, so a non-root reader leaves it be.
         let _ = private_dir(&locks(&run.join("vms")));
-        let canon = |d: &Path| d.canonicalize().map_err(|e| named(d, e));
-        let (state, run) = (canon(state)?, canon(run)?);
+        let (state, run) = (state.to_path_buf(), run.to_path_buf());
         let binding = state.join("run.json");
         reserved_run(&state, &run, Path::new(DEFAULT_STATE), Path::new(DEFAULT_RUN))?;
         let bound = verify_binding(&state, "run", &run)?;
@@ -1136,7 +1165,7 @@ impl Host {
     /// process holds the address; once it is dead the record decides alone.
     pub fn publish_live(&self, _: &Locked, ip: Ipv4Addr, gen: u64, rev: u64) -> Result<()> {
         let path = self.live_path(ip);
-        std::fs::create_dir_all(path.parent().ok_or("no directory")?)?;
+        host_dir(path.parent().ok_or("no directory")?, 0o755)?;
         store(&path, &Live { id: Ident::me(), gen, rev }, false)
     }
 
@@ -2221,7 +2250,13 @@ pub fn reap(run: &Path, owner: &Ident) -> Result<()> {
         Liveness::Alive => bail!("process {} is alive", owner.pid),
         Liveness::Unknown => bail!("cannot tell whether process {} is gone", owner.pid),
     }
+    trusted_root(run)?;
+    trusted_dir(&run.join("w"))?;
     let dir = owner.work_dir(run);
+    match trusted_dir(&dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        r => r?,
+    }
     if owner.boot != boot_id() || load::<Ident>(&dir.join("owner"))?.as_ref() != Some(owner) {
         return Ok(());
     }
@@ -2242,6 +2277,7 @@ pub fn reap(run: &Path, owner: &Ident) -> Result<()> {
             Err(e) if !gone(&e) => return Err(e.into()),
             _ => continue,
         }
+        trusted_dir(&e.path())?;
         let Some(fc) = load::<Ident>(&e.path().join("fc"))? else { continue };
         if let Some(fd) = PidFd::open(&fc)? {
             // If it exited and was waited for since it was opened (its parent died with SIGKILL
@@ -2884,6 +2920,9 @@ pub fn clear_taps(run: &Path, me: &Ident) {
 
 /// Cgroups, work directories and names of dead processes.
 fn collect_owned(run: &Path) {
+    if trusted_root(run).is_err() || trusted_dir(&run.join("w")).is_err() || trusted_dir(&run.join("vms")).is_err() {
+        return;
+    }
     // Firecrackers' by identity: once their process is gone no other makes one under their name.
     for e in std::fs::read_dir("/sys/fs/cgroup/flexvm").into_iter().flatten().flatten() {
         let n = e.file_name().to_string_lossy().into_owned();
@@ -2952,6 +2991,58 @@ pub fn locks(dir: &Path) -> PathBuf {
 }
 
 pub const LOCKS: &str = ".locks";
+
+/// Only root or this user may change it: owned by one of them and not writable by group or others,
+/// unless `sticky` allows a sticky directory (nobody else may rename what is ours out of it).
+pub fn guarded(uid: u32, mode: u32, sticky: bool) -> bool {
+    (uid == 0 || uid == unsafe { libc::geteuid() }) && (mode & 0o022 == 0 || (sticky && mode & libc::S_ISVTX != 0))
+}
+
+fn untrusted(path: &Path, why: &str) -> std::io::Error {
+    std::io::Error::other(format!("{}: {why}", path.display()))
+}
+
+/// Host directories must never let another user plant records or replace subdirectories.
+pub fn trusted_dir(path: &Path) -> std::io::Result<()> {
+    let m = std::fs::symlink_metadata(path)?;
+    if !m.is_dir() || !guarded(m.uid(), m.mode(), false) {
+        return Err(untrusted(path, "must be a real directory that only root or this user may write"));
+    }
+    Ok(())
+}
+
+/// A canonical `--state` or `--run`: trusted, and every directory above it up to `/` only root or this user
+/// may change (sticky /tmp included), so nobody else may move it and put another tree in its place.
+fn trusted_root(path: &Path) -> std::io::Result<()> {
+    trusted_dir(path)?;
+    for a in path.ancestors().skip(1) {
+        let m = std::fs::symlink_metadata(a)?;
+        if !guarded(m.uid(), m.mode(), true) {
+            return Err(untrusted(a, "only root or this user may change the directories above host trees"));
+        }
+    }
+    Ok(())
+}
+
+/// Make host directories with an explicit mode; existing unsafe ones are refused, never repaired.
+pub fn host_dir(path: &Path, mode: u32) -> std::io::Result<()> {
+    match std::fs::DirBuilder::new().mode(mode).create(path) {
+        Ok(()) => std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            host_dir(path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")), mode)?;
+            return host_dir(path, mode);
+        }
+        Err(e) => return Err(e),
+    }
+    trusted_dir(path)
+}
+
+/// Direct host records (including markers), readable as before by non-root `ls`, never truncating a symlink's target.
+pub fn write_record(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    File::options().write(true).create(true).truncate(true).mode(0o644).custom_flags(libc::O_NOFOLLOW).open(path)?.write_all(data)
+}
 
 /// A lock file, made (0600) if missing, in a directory only this user may enter,
 /// made (0700) if missing: one that is not is refused, never repaired. Opened
@@ -3339,8 +3430,8 @@ pub fn hold(name: &str) {
 /// Test hook: tells a test this process got to `name` (RUN/gates/NAME.PID), so it acts there, not after a guessed delay.
 fn reached(name: &str) {
     if let Some(dir) = RUN_DIR.get().map(|r| r.join("gates")) {
-        let _ = std::fs::create_dir_all(&dir);
-        let _ = std::fs::write(dir.join(format!("{name}.{}", std::process::id())), b"");
+        let _ = host_dir(&dir, 0o700);
+        let _ = write_record(&dir.join(format!("{name}.{}", std::process::id())), b"");
     }
 }
 
@@ -3520,6 +3611,168 @@ mod tests {
 
     fn ip(s: &str) -> Ipv4Addr {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn host_refuses_unsafe_directories() {
+        let (_base, h) = host("unsafe-dirs");
+        let dirs = [h.state.clone(), h.run.clone()]
+            .into_iter()
+            .chain(["addrs", "standby", "migs", "owed", "withdrawals", "suspended", LOCKS].map(|d| h.state.join(d)))
+            .chain(["w", "vms", "standby", "claims", "live"].map(|d| h.run.join(d)));
+        for path in dirs {
+            let mode = std::fs::metadata(&path).unwrap().mode() & 0o777;
+            for unsafe_mode in [0o777, 0o775, 0o757] {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(unsafe_mode)).unwrap();
+                assert!(Host::open(&h.state, &h.run).is_err(), "{}", path.display());
+                assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, unsafe_mode, "never repair an unsafe directory");
+            }
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        // Deeper directories are not walked per command: they are checked where used (`reap`).
+        let nested = h.run.join("w/old/0");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o777)).unwrap();
+        std::os::unix::fs::symlink(&h.state, h.run.join("w/link")).unwrap();
+        Host::open(&h.state, &h.run).unwrap();
+        let claims = h.run.join("claims");
+        std::fs::remove_dir(&claims).unwrap();
+        std::os::unix::fs::symlink(h.run.join("missing"), &claims).unwrap();
+        assert!(Host::open(&h.state, &h.run).is_err(), "a dangling trusted directory link is refused");
+        std::fs::remove_file(claims).unwrap();
+        Host::open(&h.state, &h.run).unwrap();
+    }
+
+    #[test]
+    fn only_root_or_this_user_may_change_host_trees() {
+        let me = unsafe { libc::geteuid() };
+        for (uid, mode, sticky, ok) in [
+            (me, 0o755, false, true),
+            (0, 0o755, false, true),
+            (0, 0o1777, true, true),
+            (0, 0o1777, false, false),
+            (0, 0o777, true, false),
+            (me, 0o775, false, false),
+            (me, 0o757, false, false),
+            (u32::MAX - 1, 0o700, true, false),
+        ] {
+            assert_eq!(guarded(uid, mode, sticky), ok, "{uid} {mode:o} {sticky}");
+        }
+        // A linked root is followed, as before: its target is what is checked.
+        let base = crate::test_util::TempDir::new("linked-root");
+        std::fs::create_dir(base.join("real")).unwrap();
+        std::os::unix::fs::symlink(base.join("real"), base.join("state")).unwrap();
+        assert_eq!(Host::open(&base.join("state"), &base.join("run")).unwrap().state, base.join("real").canonicalize().unwrap());
+    }
+
+    #[test]
+    fn every_directory_above_a_root_is_checked() {
+        let base = crate::test_util::TempDir::new("ancestry");
+        let (above, box_) = (base.join("above"), base.join("above/box"));
+        std::fs::create_dir_all(&box_).unwrap();
+        let open = || Host::open(&box_.join("state"), &box_.join("run"));
+        let h = open().unwrap();
+        // Another user who may write above could move `box` away and put a fabricated tree there.
+        std::fs::set_permissions(&above, std::fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(open().err().unwrap().to_string().contains("above host trees"));
+        assert!(reap(&h.run, &Ident { pid: 999999932, start: 1, boot: boot_id().into() }).is_err(), "nor reaped through");
+        // Sticky (like /tmp): nobody else may rename what is ours.
+        std::fs::set_permissions(&above, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        open().unwrap();
+    }
+
+    #[test]
+    fn the_synced_marker_is_the_canonical_roots() {
+        let base = crate::test_util::TempDir::new("synced-link");
+        for d in ["one", "two"] {
+            std::fs::create_dir(base.join(d)).unwrap();
+        }
+        let link = base.join("state");
+        for d in ["one", "two"] {
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink(base.join(d), &link).unwrap();
+            let h = Host::open(&link, &base.join(format!("run-{d}"))).unwrap();
+            let m = std::fs::metadata(base.join(d)).unwrap();
+            assert_eq!(h.state, base.join(d).canonicalize().unwrap());
+            assert_eq!(std::fs::read_to_string(base.join(d).join(".synced")).unwrap(), format!("{} {}", m.dev(), m.ino()));
+        }
+    }
+
+    #[test]
+    fn host_directories_have_explicit_modes() {
+        const MASK: &str = "FLEXVM_TEST_HOST_UMASK";
+        if let Ok(mask) = std::env::var(MASK) {
+            unsafe { libc::umask(mask.parse().unwrap()) };
+        } else {
+            // umask is process-wide: keep other tests out of these changes.
+            for mask in [0, 0o077] {
+                assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "host::tests::host_directories_have_explicit_modes"])
+                    .env(MASK, mask.to_string())
+                    .status()
+                    .unwrap()
+                    .success());
+            }
+            return;
+        }
+        let (_base, h) = host("dir-modes");
+        for path in [h.state.clone(), h.run.clone(), h.state.join("addrs"), h.state.join("migs"), h.run.join("w"), h.run.join("vms")] {
+            assert_eq!(std::fs::metadata(path).unwrap().mode() & 0o777, 0o755);
+        }
+        assert_eq!(std::fs::metadata(h.state.join("suspended")).unwrap().mode() & 0o777, 0o700);
+        let record = h.state.join("addrs/record");
+        store(&record, &Ident::me(), false).unwrap();
+        for path in [record, h.run.join("state.json"), h.state.join("run.json")] {
+            assert_eq!(std::fs::metadata(path).unwrap().mode() & 0o022, 0);
+        }
+    }
+
+    #[test]
+    fn records_do_not_follow_symlinks() {
+        let (base, h) = host("record-links");
+        let victim = base.join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        for name in ["vm.failed", "vm.moved", "vm.log", ".marker"] {
+            let path = h.run.join("vms").join(name);
+            std::os::unix::fs::symlink(&victim, &path).unwrap();
+            assert!(write_record(&path, b"replace").is_err());
+            assert!(load::<Ident>(&path).is_err());
+            assert!(!crate::util::output::append_capped(&path, b"append", 100));
+        }
+        let tmp = h.run.join(format!(".record.{}.tmp", crate::util::write_tag()));
+        std::os::unix::fs::symlink(&victim, tmp).unwrap();
+        assert!(crate::util::write_file(&h.run, "record", b"replace", false).is_err());
+        assert_eq!(std::fs::read_to_string(victim).unwrap(), "keep");
+    }
+
+    #[test]
+    fn reap_refuses_untrusted_work_records() {
+        let (_base, h) = host("reap-unsafe");
+        let child = Sleeper::new();
+        let dead = dead_owner(&h, 999999931, &[&child.1]);
+        let dir = dead.work_dir(&h.run).join("0");
+        for path in [h.run.clone(), h.run.join("w"), dead.work_dir(&h.run), dir.clone()] {
+            let mode = std::fs::metadata(&path).unwrap().mode() & 0o777;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o777)).unwrap();
+            assert!(reap(&h.run, &dead).is_err());
+            collect_owned(&h.run);
+            assert!(child.1.alive());
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let fc = dir.join("fc");
+        // A record another user may write could be rewritten to name any process.
+        for mode in [0o666, 0o664] {
+            std::fs::set_permissions(&fc, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(reap(&h.run, &dead).is_err());
+            collect_owned(&h.run);
+            assert!(child.1.alive());
+        }
+        std::fs::set_permissions(&fc, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let outside = h.run.join("outside");
+        std::fs::rename(&fc, &outside).unwrap();
+        std::os::unix::fs::symlink(outside, &fc).unwrap();
+        assert!(reap(&h.run, &dead).is_err());
+        assert!(!child.done(), "a symlinked identity must never authorize SIGKILL");
     }
 
     #[test]

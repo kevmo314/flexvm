@@ -321,7 +321,7 @@ impl Proc {
             Err(Restore::Uncertain(e)) => {
                 *self.cmd.lock().unwrap() = None;
                 self.keep_addr();
-                let _ = std::fs::write(dir.join(QUARANTINE), format!("{} {e}", crate::host::boot_id()));
+                let _ = crate::host::write_record(&dir.join(QUARANTINE), format!("{} {e}", crate::host::boot_id()).as_bytes());
                 bail!("vm {name} is quarantined: {e}; kill it to discard its checkpoint")
             }
             // Re-arming the checkpoint would replay what it did since.
@@ -462,7 +462,7 @@ impl Proc {
             // a crash while waiting for the host lock would otherwise lose a VM that never ran.
             let failing = |e: &str| std::fs::remove_file(dir.join(STARTED)).and(Err(std::io::Error::other(format!("injected fault: {e}"))));
             let marked = crate::fault_result!(fault("started_fsync") =>
-                std::fs::File::create(dir.join(STARTED)).and(Err(std::io::Error::other("injected fault: fsync failed")));
+                crate::host::write_record(&dir.join(STARTED), b"").and(Err(std::io::Error::other("injected fault: fsync failed")));
                 mark_durably(&dir, STARTED));
             if let Err(e) = marked {
                 vm.kill();
@@ -987,7 +987,8 @@ pub fn read_gen(dir: &Path) -> Option<u64> {
 }
 
 fn mark_durably(dir: &Path, name: &str) -> std::io::Result<()> {
-    std::fs::File::create(dir.join(name))?.sync_all()?;
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::File::options().write(true).create(true).truncate(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(dir.join(name))?.sync_all()?;
     crate::util::sync_dir(dir)
 }
 
