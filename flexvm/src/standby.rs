@@ -133,23 +133,32 @@ pub fn show(host: &Host) -> Value {
 pub fn maintain(host: Host) {
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(5));
-        if recent(&pressure(&host)) {
+        refill_round(&host);
+    });
+}
+
+/// One round of `maintain`: each template short of its count refilled, unless pressure or
+/// its refill failed lately.
+pub fn refill_round(host: &Host) {
+    if recent(&pressure(host)) {
+        return;
+    }
+    for template in templates(host) {
+        if target(host, &template) == 0 {
             continue;
         }
-        for template in templates(&host) {
-            let failed = dir(&host, &template).join(".failed");
-            if recent(&failed) {
-                continue;
-            }
-            if let Err(e) = refill_by(&host, &template, false, true) {
-                let _ = std::fs::write(&failed, b"");
-                // As its standby VMs write it: capped, to whichever file is current.
-                let path = dir(&host, &template).join("standby.log");
-                let line = format!("standby {template}: refill: {e}\n");
-                crate::util::output::append_capped(&path, line.as_bytes(), crate::util::output::LOG_CAP);
-            }
+        let failed = dir(host, &template).join(".failed");
+        if recent(&failed) {
+            continue;
         }
-    });
+        if let Err(e) = refill_by(host, &template, false, true) {
+            let _ = std::fs::write(&failed, b"");
+            // As its standby VMs write it: capped, to whichever file is current.
+            let path = dir(host, &template).join("standby.log");
+            let line = format!("standby {template}: refill: {e}\n");
+            crate::util::output::append_capped(&path, line.as_bytes(), crate::util::output::LOG_CAP);
+        }
+    }
 }
 
 /// `STATE/.locks/standby.stop`: relief holds it exclusively while it lists and

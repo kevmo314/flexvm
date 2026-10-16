@@ -679,7 +679,7 @@ impl Host {
         if !resuming && suspended.exists() {
             bail!("vm {name:?} exists (suspended); resume or kill it");
         }
-        for ext in ["json", "sock", "moved", "failed"] {
+        for ext in ["json", "sock", "moved", "failed", "lost"] {
             let _ = std::fs::remove_file(self.vms(name, ext)?);
         }
         f.set_len(0)?;
@@ -830,6 +830,17 @@ impl Host {
             self.put_addr(ip, &a, durable)?;
         }
         Ok(out)
+    }
+
+    /// Makes `ip`'s record durable if it was last written without fsync (`claim_new_in`): before a
+    /// suspended checkpoint that names its generation is published, which a power loss must not
+    /// outlive while the record comes back empty (read as withdrawn: #563).
+    pub fn sync_addr(&self, l: &Locked, ip: Ipv4Addr) -> Result<()> {
+        if !self.unsynced_marker(ip).exists() {
+            return Ok(());
+        }
+        let a = self.addr(l, ip)?;
+        self.put_addr(ip, &a, true)
     }
 
     /// Held by the VM instance that claimed it: while that process holds the
@@ -1140,10 +1151,7 @@ impl Host {
         for e in entries.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
             let stale = match name.strip_prefix('.') {
-                Some(tmp) => {
-                    let pid = tmp.strip_suffix(".tmp").and_then(|t| t.rsplit_once('.')).and_then(|(_, pid)| pid.parse::<u32>().ok());
-                    pid.is_some_and(|pid| !Path::new(&format!("/proc/{pid}")).exists())
-                }
+                Some(_) => write_debris_of(&e.path()),
                 None => match (name.parse::<Ipv4Addr>(), load::<Live>(&e.path())) {
                     (Ok(ip), Ok(Some(live))) => live.id.liveness() == Liveness::Gone && self.addr(&l, ip)?.holder_id.as_ref() != Some(&live.id),
                     (Ok(_), Ok(None)) => false,
@@ -1604,19 +1612,9 @@ impl Host {
         self.write_debris("owed")
     }
 
-    /// In `STATE/DIR`, an interrupted write's `.NAME.PID.tmp` (`util::write_file`), once its writer is gone.
+    /// In `STATE/DIR`, an interrupted write's temporary file (`util::write_file`), once its writer is gone.
     fn write_debris(&self, dir: &str) {
-        for e in std::fs::read_dir(self.state.join(dir)).into_iter().flatten().flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            let Some(pid) =
-                name.strip_prefix('.').and_then(|n| n.strip_suffix(".tmp")).and_then(|n| n.rsplit_once('.')).and_then(|(_, p)| p.parse::<u32>().ok())
-            else {
-                continue;
-            };
-            if !Path::new("/proc").join(pid.to_string()).exists() {
-                let _ = std::fs::remove_file(e.path());
-            }
-        }
+        remove_write_debris(&self.state.join(dir), |_| true);
     }
 
     /// `flexvm reclaim IP --force`: an address lent out with a VM that migrated away, taken
@@ -2252,6 +2250,79 @@ fn taps_of_at(run: &Path, net: &Path) -> Vec<(String, u32, Ident)> {
 /// A detached VM process's own cgroup (`vm-PID-START`, `util::spawn_self`)
 /// goes once nothing is in it: never killed, so a process that just joined
 /// one is never touched. (`rmdir` refuses a populated cgroup anyway.)
+/// A VM a sweep found dead and withdrew: (name, address, generation).
+pub type Withdrawn = (String, Ipv4Addr, u64);
+
+/// Whether `path` is a temporary file of `util::write_file` (`.NAME.TAG.tmp`) whose writer is
+/// proven gone. TAG `PID-START-BOOT` (`util::write_tag`) names its process: gone once that
+/// process is, or written in another boot. A bare PID (an older flexvm's, or one that could not
+/// name itself) is gone once no process has that pid, or once the file is older than this boot.
+pub(crate) fn write_debris_of(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else { return false };
+    let Some((_, tag)) = name.strip_prefix('.').and_then(|n| n.strip_suffix(".tmp")).and_then(|n| n.rsplit_once('.')) else { return false };
+    let mut parts = tag.split('-');
+    let (Some(Ok(pid)), start, boot, None) = (parts.next().map(str::parse::<u32>), parts.next(), parts.next(), parts.next()) else { return false };
+    match (start.map(str::parse::<u64>), boot) {
+        (Some(Ok(start)), Some(boot)) => {
+            let now = boot_id();
+            if now.is_empty() || boot.len() != crate::util::BOOT_TAG {
+                false
+            } else if !now.starts_with(boot) {
+                true
+            } else {
+                Ident { pid, start, boot: now.into() }.liveness() == Liveness::Gone
+            }
+        }
+        (None, None) => !Path::new(&format!("/proc/{pid}")).exists() || older_than_boot(path),
+        _ => false,
+    }
+}
+
+/// Modified before this boot began (`btime` in /proc/stat); false when either cannot be read.
+fn older_than_boot(path: &Path) -> bool {
+    let btime = std::fs::read_to_string("/proc/stat")
+        .ok()
+        .and_then(|s| s.lines().find_map(|l| l.strip_prefix("btime ")?.trim().parse::<u64>().ok()))
+        .map(|secs| UNIX_EPOCH + Duration::from_secs(secs));
+    let mtime = std::fs::symlink_metadata(path).and_then(|m| m.modified()).ok();
+    matches!((mtime, btime), (Some(m), Some(b)) if m < b)
+}
+
+/// Removes, among `dir`'s entries whose names pass `which`, `write_file` debris (`write_debris_of`):
+/// never a published record (no leading dot) nor a live writer's temporary file.
+fn remove_write_debris(dir: &Path, which: impl Fn(&str) -> bool) {
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        if e.file_name().to_str().is_some_and(&which) && write_debris_of(&e.path()) {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
+/// Whether the suspended directory `dir` holds a QUARANTINE written in this boot (one that cannot be
+/// read counts as such); an earlier boot's no longer holds (`lifecycle::quarantined`).
+fn quarantined_now(dir: &Path) -> bool {
+    match std::fs::read_to_string(dir.join("QUARANTINE")) {
+        Ok(q) => crate::lifecycle::quarantined(&q, boot_id()).is_some(),
+        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
+pub const DEFAULT_STATE: &str = "/var/lib/flexvm";
+pub const DEFAULT_RUN: &str = "/run/flexvm";
+
+/// The run directory of `state` when no `--run` is given: the one its `run.json` names; else
+/// `/run/flexvm` for the default state and `/run/flexvm-PREFIX` (its taps' prefix) for any other.
+/// So after a reboot the default run directory goes to the state that had it, never to whichever
+/// state opens it first (#556).
+pub fn default_run(state: &Path) -> Result<PathBuf> {
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let state = canon(state);
+    if let Some(run) = load::<PathBuf>(&state.join("run.json"))? {
+        return Ok(run);
+    }
+    Ok(if state == canon(Path::new(DEFAULT_STATE)) { DEFAULT_RUN.into() } else { format!("{DEFAULT_RUN}-{}", tap_prefix(&state)).into() })
+}
+
 fn sweep_scope(dir: &Path) {
     let events = std::fs::read_to_string(dir.join("cgroup.events")).unwrap_or_default();
     if events.lines().any(|l| l == "populated 0") {
@@ -2260,10 +2331,65 @@ fn sweep_scope(dir: &Path) {
 }
 
 impl Host {
+    /// `RUN/.boot`: the boot id of the last `after_boot` pass here.
+    fn boot_marker(&self) -> PathBuf {
+        self.run.join(".boot")
+    }
+
+    /// Once per boot of this run directory (`RUN/.boot`, decided under the host lock), before
+    /// anything else here: what the VMs that ran before the boot left. Their addresses are
+    /// withdrawn (`withdraw_dead`: a home host's loan ends once the peers are told, an outcome
+    /// owed for an interrupted migration is recorded and settled by sweeps), each of them is
+    /// recorded as lost (`RUN/vms/NAME.lost`, listed by `ls` until `flexvm kill NAME`), and the
+    /// routes to peers' VMs are put back from `STATE/addrs` (kernel routes do not outlive a boot,
+    /// and peers never announce again what they delivered, #553). True if it ran.
+    pub fn after_boot(&self) -> Result<bool> {
+        self.after_boot_with(boot_id(), crate::net::route_via)
+    }
+
+    fn after_boot_with(&self, boot: &str, mut route: impl FnMut(Ipv4Addr, Ipv4Addr) -> Result<()>) -> Result<bool> {
+        let marker = self.boot_marker();
+        let done = || std::fs::read_to_string(&marker).is_ok_and(|b| b == boot);
+        if boot.is_empty() || done() {
+            return Ok(false);
+        }
+        let l = self.lock()?;
+        if done() {
+            return Ok(false);
+        }
+        let lost = self.collect_garbage().unwrap_or_else(|e| {
+            crate::log!("after boot: {e}");
+            Vec::new()
+        });
+        for (name, ip, gen) in lost {
+            let why = format!("lost: its process ended without withdrawing {ip} (generation {gen}), as in a reboot; the address is withdrawn, its log is gone with the run directory; flexvm kill {name} clears this");
+            if self.vms(&name, "lost").is_ok() && !self.alive(&name) {
+                let _ = crate::util::write_file(&self.run.join("vms"), &format!("{name}.lost"), why.as_bytes(), false);
+            }
+        }
+        let ips = std::fs::read_dir(self.state.join("addrs")).into_iter().flatten().flatten().filter_map(|e| e.file_name().to_str()?.parse::<Ipv4Addr>().ok());
+        for ip in ips {
+            let a = match self.addr(&l, ip) {
+                Ok(a) => a,
+                Err(e) => {
+                    crate::log!("after boot: route for {ip}: {e}");
+                    continue;
+                }
+            };
+            let Some(via) = a.via.filter(|_| !a.withdrawn && !self.held(&a)) else { continue };
+            match route(ip, via) {
+                Ok(()) => crate::log!("after boot: put back route {ip} via {via} (generation {})", a.seen),
+                Err(e) => crate::log!("after boot: route {ip} via {via}: {e}"),
+            }
+        }
+        crate::util::write_file(&self.run, ".boot", boot.as_bytes(), false).map_err(|e| format!("{}: {e}", marker.display()))?;
+        Ok(true)
+    }
+
     /// What dead processes left: taps (a template build's too), cgroups, work
     /// directories and names. Only proof of death (`Liveness::Gone`) frees any.
     /// Taps are this host's by their alias (`taps_of`), whatever their name.
-    pub fn collect_garbage(&self) -> Result<()> {
+    pub fn collect_garbage(&self) -> Result<Vec<Withdrawn>> {
         // Deleted by index and name: a tap made since under a dead one's name is another.
         for (name, index, owner) in taps_of(&self.run) {
             if owner.liveness() == Liveness::Gone {
@@ -2271,6 +2397,10 @@ impl Host {
             }
         }
         collect_owned(&self.run);
+        // What a write killed midway left of the per-boot records: unsynced-claim markers
+        // (`RUN/claims`) and the generation cursor (`RUN/.gens.next`).
+        remove_write_debris(&self.run.join("claims"), |_| true);
+        remove_write_debris(&self.run, |n| n.starts_with("..gens.next."));
         let withdrawn = self.withdraw_dead();
         // After the sweep of dead holders, whose claims took their published revisions with them.
         if let Err(e) = self.sweep_live() {
@@ -2283,7 +2413,8 @@ impl Host {
     /// panic): withdrawn as its `finish` would have, so a home host's loan ends
     /// and no peer keeps a route to this host. The peers are told by
     /// `deliver_withdrawals`, from a notice recorded first.
-    fn withdraw_dead(&self) -> Result<()> {
+    /// Returns what it withdrew, as (VM name, address, generation).
+    fn withdraw_dead(&self) -> Result<Vec<Withdrawn>> {
         // Candidates first, without the host lock (records are replaced whole): a sweep takes it
         // only when a holder is proven dead, and each is decided again under it.
         let candidates: Vec<Ipv4Addr> = std::fs::read_dir(self.state.join("addrs"))
@@ -2293,8 +2424,9 @@ impl Host {
             .filter_map(|e| e.file_name().to_str()?.parse::<Ipv4Addr>().ok())
             .filter(|&ip| self.read_addr(ip).ok().and_then(|a| a.holder_id).is_some_and(|id| id.liveness() == Liveness::Gone))
             .collect();
+        let mut withdrawn = Vec::new();
         if candidates.is_empty() {
-            return Ok(());
+            return Ok(withdrawn);
         }
         let l = self.lock()?;
         // What the migrations say, read whole or not at all: a record that cannot be read may be the one that
@@ -2345,8 +2477,9 @@ impl Host {
             crate::log!("withdrew {ip} (generation {gen}): vm {name}'s process died without withdrawing it");
             let _ = self.release(&l, ip, name, a.holder_id.as_ref());
             crate::net::unroute(ip);
+            withdrawn.push((name.to_string(), ip, gen));
         }
-        Ok(())
+        Ok(withdrawn)
     }
 
     /// Withdraws `gen` of `ip` here (`observe`), a notice for the peers
@@ -2405,8 +2538,8 @@ impl Host {
 
     /// Whether `a`'s holder is proven dead with its Firecrackers reaped and
     /// its VM with it, its generation still current. Not if a checkpoint here
-    /// keeps the generation (suspended, or quarantined until a reboot shows
-    /// whether it may resume), nor if the VM may live on elsewhere: a source
+    /// keeps the generation (suspended, or quarantined in this boot: a reboot shows
+    /// whether it may resume, and an earlier boot's quarantine no longer holds, #556), nor if the VM may live on elsewhere: a source
     /// that may have handed it on (`leaving`: owed instead), an arrival whose source may run
     /// it again (`arriving`, or the holder owns a pending or committed
     /// record), or a loan of its generation here. An arrival whose record is
@@ -2421,7 +2554,7 @@ impl Host {
             && a.current(a.held)
             && (settled || a.lent.is_none_or(|lent| lent < a.held))
             && self.dead_and_reaped(a)
-            && self.suspended(name).is_ok_and(|d| !d.join("QUARANTINE").exists())
+            && self.suspended(name).is_ok_and(|d| !quarantined_now(&d))
     }
 
     fn notice_path(&self, ip: Ipv4Addr) -> PathBuf {
@@ -3640,9 +3773,11 @@ mod tests {
         std::fs::write(h.suspended("suspended").unwrap().join("GEN"), "4").unwrap();
         claim(ips[6], "quarantined", Some(dead(999_999_937)), 4, &|_| ());
         std::fs::create_dir_all(h.suspended("quarantined").unwrap()).unwrap();
-        for f in ["manifest.json", "GEN", "STARTED", "QUARANTINE"] {
+        for f in ["manifest.json", "GEN", "STARTED"] {
             std::fs::write(h.suspended("quarantined").unwrap().join(f), "4").unwrap();
         }
+        let quarantine = h.suspended("quarantined").unwrap().join("QUARANTINE");
+        std::fs::write(&quarantine, format!("{} the mark may be on disk", boot_id())).unwrap();
         // Alive (this process, though it does not hold the name).
         claim(ips[7], "alive", Some(Ident::me()), 4, &|_| ());
         // An older loan of this address, superseded by the dead VM's generation: freed with it.
@@ -3702,6 +3837,12 @@ mod tests {
         drop(l);
         h.withdraw_dead().unwrap();
         assert!(h.addr(&h.lock().unwrap(), ips[5]).unwrap().withdrawn);
+        // #556: an earlier boot's quarantine no longer holds: that resume never ran its VM.
+        assert!(!h.addr(&h.lock().unwrap(), ips[6]).unwrap().withdrawn);
+        std::fs::write(&quarantine, "another-boot the mark may be on disk").unwrap();
+        let withdrawn = h.withdraw_dead().unwrap();
+        assert!(h.addr(&h.lock().unwrap(), ips[6]).unwrap().withdrawn);
+        assert_eq!(withdrawn, vec![("quarantined".to_string(), ips[6], 4)]);
     }
 
     #[test]
@@ -4146,6 +4287,124 @@ mod tests {
         for cg in ["vm-4242", "vm-4242-77", "other-42", "idle-", "idle-4242-3", "idle-4242-x-3", "idle-1-2-3-4", "cgroup.procs", "memory.max"] {
             assert_eq!(cgroup_owner(cg), None, "{cg}");
         }
+    }
+
+    /// #553, #555: once per boot, routes to peers' VMs come back from the records, and the VMs
+    /// that died with the host are withdrawn and listed as lost; not again in the same boot.
+    #[test]
+    fn after_a_boot_routes_come_back_and_lost_vms_are_recorded() {
+        let (_h_dir, h) = host("after-boot");
+        let (peer, gone, mine, withdrawn) = (ip("10.9.5.1"), ip("10.9.5.2"), ip("10.9.5.3"), ip("10.9.5.4"));
+        let via = ip("192.0.2.7");
+        let dead = dead_owner(&h, 999_999_946, &[]);
+        {
+            let l = h.lock().unwrap();
+            h.put_addr(peer, &Addr { seen: 3, via: Some(via), ..Addr::default() }, true).unwrap();
+            h.put_addr(withdrawn, &Addr { seen: 3, via: Some(via), withdrawn: true, ..Addr::default() }, true).unwrap();
+            h.put_addr(gone, &Addr { seen: 5, holder: Some("web".into()), holder_id: Some(dead), held: 5, ..Addr::default() }, true).unwrap();
+            let c = h.claim_new_in(&l, &Config { vm_ips: "10.9.5.3-10.9.5.3".into(), ..Config::default() }, "alive", Some(mine)).unwrap();
+            c.keep();
+        }
+        let routes = std::cell::RefCell::new(Vec::new());
+        let route = |ip, via| {
+            routes.borrow_mut().push((ip, via));
+            Ok(())
+        };
+        assert!(h.after_boot_with("boot-1", route).unwrap());
+        assert_eq!(*routes.borrow(), vec![(peer, via)], "only a peer's live generation, not one withdrawn or held here");
+        let l = h.lock().unwrap();
+        assert!(h.addr(&l, gone).unwrap().withdrawn && h.addr(&l, gone).unwrap().holder.is_none());
+        assert!(!h.addr(&l, mine).unwrap().withdrawn, "a live holder's is kept");
+        drop(l);
+        let lost = std::fs::read_to_string(h.vms("web", "lost").unwrap()).unwrap();
+        assert!(lost.starts_with("lost:") && lost.contains("10.9.5.2") && lost.contains("generation 5"), "{lost}");
+        assert!(!h.vms("alive", "lost").unwrap().exists());
+        assert!(!h.after_boot_with("boot-1", route).unwrap(), "once per boot");
+        assert_eq!(routes.borrow().len(), 1);
+        assert!(h.after_boot_with("boot-2", route).unwrap(), "and again after the next");
+        assert_eq!(routes.borrow().len(), 2);
+        assert!(!h.after_boot_with("", route).unwrap(), "never without a boot id");
+        // A new VM of the name clears the record.
+        drop(h.take_name("web", false).unwrap());
+        assert!(!h.vms("web", "lost").unwrap().exists());
+    }
+
+    /// #563: a suspended VM's record is made durable before its checkpoint is published.
+    #[test]
+    fn a_kept_claim_is_synced_once() {
+        let (_h_dir, h) = host("sync-addr");
+        let l = h.lock().unwrap();
+        let c = h.claim_new(&l, "web", None).unwrap();
+        let ip = c.ip;
+        assert!(h.unsynced_marker(ip).exists());
+        h.sync_addr(&l, ip).unwrap();
+        assert!(!h.unsynced_marker(ip).exists());
+        assert_eq!(h.addr(&l, ip).unwrap().holder.as_deref(), Some("web"));
+        h.sync_addr(&l, ip).unwrap();
+        c.keep();
+    }
+
+    /// #556, #563: a write's temporary file goes once its writer is proven gone (by pid, start time and
+    /// boot), never a live one's nor a published record, in STATE and RUN alike.
+    #[test]
+    fn write_debris_is_told_by_its_writers_identity() {
+        let (_h_dir, h) = host("write-debris");
+        let me = Ident::me();
+        let boot = &boot_id()[..crate::util::BOOT_TAG];
+        let mine = crate::util::write_tag();
+        assert_eq!(mine, format!("{}-{}-{boot}", me.pid, me.start));
+        let claims = h.run.join("claims");
+        let files = [
+            (format!(".10.9.0.1.{mine}.tmp"), true),
+            (format!(".10.9.0.2.{}-{}-{boot}.tmp", me.pid, me.start + 1), false),
+            (format!(".10.9.0.3.{}-{}-0000beef.tmp", me.pid, me.start), false),
+            (".10.9.0.4.999999971.tmp".to_string(), false),
+            (format!(".10.9.0.5.{}.tmp", me.pid), true),
+            ("10.9.0.6".to_string(), true),
+            (".10.9.0.7.x-1-2.tmp".to_string(), true),
+        ];
+        for (f, _) in &files {
+            std::fs::write(claims.join(f), "").unwrap();
+        }
+        // Another boot's, by a pid that runs now: an mtime before this boot.
+        let old = claims.join(format!(".10.9.0.8.{}.tmp", me.pid));
+        File::create(&old).unwrap().set_modified(UNIX_EPOCH + Duration::from_secs(1)).unwrap();
+        let gens = [(format!("..gens.next.{}-1-{boot}.tmp", me.pid), false), (format!("..gens.next.{mine}.tmp"), true), (".gens.next".to_string(), true)];
+        for (f, _) in &gens {
+            std::fs::write(h.run.join(f), "").unwrap();
+        }
+        let other = h.run.join(".state.json.99999999.tmp");
+        std::fs::write(&other, "").unwrap();
+        h.collect_garbage().unwrap();
+        for (f, kept) in &files {
+            assert_eq!(claims.join(f).exists(), *kept, "{f}");
+        }
+        assert!(!old.exists());
+        for (f, kept) in &gens {
+            assert_eq!(h.run.join(f).exists(), *kept, "{f}");
+        }
+        assert!(other.exists(), "only the cursor's temporary files in RUN itself");
+        // STATE's records, by the same rule.
+        let owed = h.state.join("owed");
+        let (dead, live) = (owed.join(format!(".7.{}-1-0000beef.tmp", me.pid)), owed.join(format!(".8.{mine}.tmp")));
+        std::fs::write(&dead, "").unwrap();
+        std::fs::write(&live, "").unwrap();
+        h.write_debris("owed");
+        assert!(!dead.exists() && live.exists());
+    }
+
+    /// #556: without --run, a state's run directory is the one it is bound to, else one of its own.
+    #[test]
+    fn each_state_has_a_run_directory_of_its_own_by_default() {
+        let base = crate::test_util::TempDir::new("default-run");
+        let (a, b) = (base.join("a"), base.join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        let ra = default_run(&a).unwrap();
+        assert_eq!(ra, PathBuf::from(format!("/run/flexvm-{}", tap_prefix(&a.canonicalize().unwrap()))));
+        assert_ne!(ra, default_run(&b).unwrap());
+        let run = base.join("run");
+        Host::open(&a, &run).unwrap();
+        assert_eq!(default_run(&a).unwrap(), run.canonicalize().unwrap(), "bound: its run.json decides");
     }
 
     /// Six bytes, `f` and base-36 digits, and apart for separate state directories.

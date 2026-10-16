@@ -1,6 +1,6 @@
 //! Garbage collection beyond what dead processes hold (`Host::collect_garbage`):
 //! logs on the run directory's tmpfs, `NAME.moved` markers and standby
-//! sockets. `sweep` runs about every `EVERY` on a host with a listener or
+//! sockets. `sweep` runs once a boot as the host is first opened (`after_boot`), and about every `EVERY` on a host with a listener or
 //! any VM process (as one starts, then through `periodic`), whether or not
 //! VMs start. Logs are capped by their writers (`util::output`).
 
@@ -36,6 +36,43 @@ pub fn periodic(host: Host) {
         std::thread::sleep(EVERY + jitter);
         sweep_due(&host);
     });
+}
+
+/// The first opener of the host in a boot (as root): `Host::after_boot`, which withdraws what
+/// the VMs lost in the reboot held, records them for `ls` and puts back the routes to peers' VMs;
+/// then the forwarding settings flexvm needs and, with `rest`, `recover`. VM processes and the
+/// listener pass false: they sweep and refill as they start. Returns whether it ran.
+pub fn after_boot(host: &Host, rest: bool) -> bool {
+    if unsafe { libc::geteuid() } != 0 {
+        return false;
+    }
+    match host.after_boot() {
+        Ok(true) => {}
+        Ok(false) => return false,
+        Err(e) => {
+            crate::log!("flexvm: recovering after boot: {e}");
+            return false;
+        }
+    }
+    if let Err(e) = crate::net::ip_forward() {
+        crate::log!("flexvm: after boot: {e}");
+    }
+    if let Some(dev) = host.config_now().announce_dev() {
+        crate::net::proxy_arp(&dev);
+    }
+    if rest {
+        recover(host);
+    }
+    true
+}
+
+/// A sweep now (the peers told of withdrawals, interrupted migrations settled and retired) and
+/// each template's standby VMs refilled: `flexvm recover`, a listener as it starts, the first
+/// command after a boot.
+pub fn recover(host: &Host) {
+    let _ = std::fs::write(host.run.join(".gc"), b"");
+    sweep(host);
+    crate::standby::refill_round(host);
 }
 
 /// A sweep if no process on the host swept within `EVERY`.
@@ -124,7 +161,8 @@ fn vm_files(host: &Host) {
         }
         // Not a VM's name: never one of its logs.
         let Ok(suspended) = host.suspended(name) else { continue };
-        let orphan = host.holder_gone(name) && !suspended.exists() && !["failed", "moved"].iter().any(|ext| host.vms(name, ext).is_ok_and(|p| p.exists()));
+        let orphan =
+            host.holder_gone(name) && !suspended.exists() && !["failed", "moved", "lost"].iter().any(|ext| host.vms(name, ext).is_ok_and(|p| p.exists()));
         if orphan {
             // Its writers' lock goes after (`orphan_log_locks`).
             let _ = std::fs::remove_file(&path);

@@ -26,7 +26,7 @@ mod vmproc;
 
 use std::io::{BufReader, Read, Write};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -60,14 +60,15 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
                                      set this host's settings, live (no flags: show them and what is
                                      derived for those unset); --peer replaces the list, '' unsets
   flexvm listen [ADDR]               take migrations from peers (no ADDR: saved or socket-activated address)
+  flexvm recover                     sweep and refill standby VMs now (at boot, on a host without a listener)
   flexvm standby [--template T] [N]  keep N VMs restored and paused, so run takes ~5 ms (no N: show)
   flexvm template NAME [--vcpus N] [--mem MIB] [--max MIB] [--plug MIB] [--image REF [--init PATH] ...]
                                      build a template (see README)
   flexvm bench ...                   latency benchmarks (see README)
 
-options: --state DIR (/var/lib/flexvm: artifacts, templates, images, VMs), --run DIR (/run/flexvm),
-         --version
-Each state directory is bound to its first run directory; a different --run is refused.
+options: --state DIR (/var/lib/flexvm: artifacts, templates, images, VMs), --run DIR (/run/flexvm, or
+         /run/flexvm-PREFIX for another --state), --version
+Each state directory is bound to its first run directory, its default from then on; a different --run is refused.
 run, resume and restore exit with the VM's command's status, 128+signal, 125 when flexvm
 fails, 124 when the VM dies
 ";
@@ -223,6 +224,7 @@ const COMMANDS: &[(&str, usize, &[&str])] = &[
     ("migrate", 3, &[]),
     ("reclaim", 2, &["force"]),
     ("listen", 2, &[]),
+    ("recover", 1, &[]),
     ("config", 1, CONFIG_FLAGS),
     ("standby", 2, &["template"]),
     ("template", 2, &["vcpus", "mem", "max", "plug", "image"]),
@@ -267,11 +269,27 @@ fn check_applies(args: &Args) -> Result<()> {
 }
 
 fn state(args: &Args) -> Result<PathBuf> {
-    Ok(std::path::absolute(args.get("state").unwrap_or("/var/lib/flexvm"))?)
+    Ok(std::path::absolute(args.get("state").unwrap_or(host::DEFAULT_STATE))?)
 }
 
+/// The host, recovered first if this is its first open in this boot (`gc::after_boot`): a VM
+/// process or the listener sweeps and refills as it starts, `recover` after, a template build not
+/// at all; any other command does it here.
 pub fn open_host(args: &Args) -> Result<Host> {
-    Host::open(&state(args)?, Path::new(args.get("run").unwrap_or("/run/flexvm")))
+    let host = open_host_only(args)?;
+    let starts = matches!(args.positional.first().map(String::as_str), Some("run" | "resume" | "restore" | "listen" | "recover" | "template"));
+    gc::after_boot(&host, !starts);
+    Ok(host)
+}
+
+/// Without `--run`: the run directory the state is bound to, else its default (`host::default_run`).
+fn open_host_only(args: &Args) -> Result<Host> {
+    let state = state(args)?;
+    let run = match args.get("run") {
+        Some(run) => PathBuf::from(run),
+        None => host::default_run(&state)?,
+    };
+    Host::open(&state, &run)
 }
 
 fn paths(args: &Args) -> Result<Paths> {
@@ -325,6 +343,11 @@ fn real_main(args: &Args) -> Result<()> {
             call(json!({"op": "checkpoint", "dir": dir, "stop": args.has("stop"), "incremental": args.has("incremental")}))
         }
         Some("migrate") => call(json!({"op": "migrate", "to": arg2.ok_or("migrate needs NAME HOST:PORT")?})),
+        Some("recover") => {
+            let host = open_host(args)?;
+            gc::recover(&host);
+            Ok(())
+        }
         Some("listen") => {
             // Before any thread that would take these signals is started.
             util::on_signal(&[libc::SIGTERM, libc::SIGINT, libc::SIGHUP], |sig| util::raise_signal(sig));
@@ -621,7 +644,7 @@ fn kill(host: &Host, name: &str) -> Result<()> {
         }
         return lifecycle::revoke(host, name)?;
     }
-    if !host.alive(name) && std::fs::remove_file(host.vms(name, "failed")?).is_ok() {
+    if !host.alive(name) && [std::fs::remove_file(host.vms(name, "failed")?).is_ok(), std::fs::remove_file(host.vms(name, "lost")?).is_ok()].contains(&true) {
         return Ok(());
     }
     if host.alive(name) {
@@ -678,6 +701,13 @@ fn list(host: &Host, as_json: bool) -> Result<()> {
     for n in names(host.run.join("vms")).filter_map(|n| n.strip_suffix(".failed").map(String::from)).filter(|n| !host.alive(n)) {
         let Ok(failed) = host.vms(&n, "failed") else { continue };
         vms.push(json!({"name": n, "state": "failed", "error": std::fs::read_to_string(failed).unwrap_or_default()}));
+    }
+    // Lost with the host (`Host::after_boot`), unless a record of its failure says more.
+    for n in names(host.run.join("vms")).filter_map(|n| n.strip_suffix(".lost").map(String::from)).filter(|n| !host.alive(n)) {
+        let (Ok(lost), Ok(failed)) = (host.vms(&n, "lost"), host.vms(&n, "failed")) else { continue };
+        if !failed.exists() {
+            vms.push(json!({"name": n, "state": "lost", "error": std::fs::read_to_string(lost).unwrap_or_default()}));
+        }
     }
     if as_json {
         return print(json!(vms));

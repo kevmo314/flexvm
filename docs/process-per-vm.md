@@ -130,6 +130,9 @@ a source killed with SIGKILL, which records nothing.
 Two directories, both overridable (`--state`, `--run`):
 each state directory is bound to one canonical run path on first open.
 A different `--run` for the same state directory is refused, including after a reboot.
+Without `--run`, a state's run directory is the one its `run.json` names, else `/run/flexvm`
+for the default state and `/run/flexvm-PREFIX` (its tap prefix) for any other: after a reboot
+the default run directory goes back to the state that had it, never to whichever opens it first.
 
 ```
 STATE (default /var/lib/flexvm, on disk)
@@ -161,9 +164,13 @@ RUN (default /run/flexvm, tmpfs)
   vms/NAME.{json,sock,log}        registry entry, control socket, log of -d/standby VMs (0600)
   vms/.locks/NAME.lock            liveness lock; NAME.log, a log's writers' lock; .incoming-*.log, an arrival's lock
   vms/NAME.{failed,moved}         why a VM died (until `flexvm kill`); where it migrated to (an hour)
+  vms/NAME.lost                   a VM lost with the host, as the boot's first opener found it (until `flexvm kill`)
+  .boot                  the boot id of the last `Host::after_boot` here
   vms/.incoming-LPID-N-PEER.log   an arrival's log until it is accepted (as NAME.log) or refused; locked by the arrival
   state.json             canonical state path, claimed on first open by a hard link (one state wins a race)
   .gc                   when garbage was last swept periodically
+  .X.PID-START-BOOT.tmp   `util::write_file`'s temporary files here and in STATE: swept once their writer is
+                         gone (or of another boot); a bare PID (older ones) once no such pid runs or older than the boot
   claims/IP              the boot id, written before an address record is written without fsync (a fresh start's
                          claim), removed once a durable write replaces it
   .gens.next             the next generation, with the boot id and the synced mark it is under; trusted only while
@@ -308,7 +315,23 @@ may be empty (#554): written before this boot (no `RUN/claims/IP` with this
 boot's id), it reads as withdrawn at the high-water mark, so the address is free
 and its generations still only rise. One written in this boot may be a live
 VM's; it, and any other record that cannot be read or parsed, is an error,
-never a free address.
+never a free address. A suspend makes its VM's record durable before the
+checkpoint is published (`Host::sync_addr`, #563): a resumable checkpoint never
+outlives a power loss with a record that reads as withdrawn.
+
+**After a reboot.** The first opener of the host in a boot (any command run as
+root, or the listener) runs `Host::after_boot` under the host lock, marked by
+`RUN/.boot` with the boot id: it withdraws what the VMs that died with the host
+held (as any sweep does: notices for the peers, an outcome owed by a source
+that was migrating), writes `RUN/vms/NAME.lost` for each (listed `lost` until
+`flexvm kill NAME`; its log was on RUN and is gone), and puts back the routes
+to peers' VMs from `STATE/addrs` (`via`, not withdrawn, not held here): kernel
+routes do not outlive the boot, and peers never announce again what they
+delivered (#553). A command then sweeps (the peers told, owed outcomes
+settled) and refills the standby VMs (`gc::recover`); a VM process and the
+listener do both as they start. A `QUARANTINE` of an earlier boot no longer
+keeps a dead claim from being withdrawn, and the name's next holder withdraws
+its generation as it removes that debris (that resume never ran its VM).
 
 - **Borrowing.** A restore keeping another host's address (its checkpoint's,
   or `--ip`) asks the peers to `lend` it: the home host checks it is free

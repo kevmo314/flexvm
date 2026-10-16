@@ -202,6 +202,11 @@ impl Proc {
             if dir.exists() && !self.host.is_suspended(&vm.name) {
                 remove_durably(&dir).map_err(|e| format!("removing what is left of {}: {e}", dir.display()))?;
             }
+            // Its address record durable first: a fresh claim's was written without fsync, and a
+            // power loss must not leave a resumable checkpoint whose generation reads as withdrawn (#563).
+            if let Some(ip) = self.ip() {
+                self.host.sync_addr(&self.host.lock()?, ip)?;
+            }
             let staging = Staging::new(&dir, vm.dir.join("checkpoint.vmstate"))?;
             staging.add_file(GEN, self.gen().to_string().as_bytes())?;
             let cmd = match self.cmd.lock().unwrap().clone() {
@@ -1003,16 +1008,16 @@ fn remove_durably(dir: &Path) -> std::io::Result<()> {
 /// A suspended directory that is not a suspended VM (`Host::is_suspended`):
 /// one with no manifest, or consumed, or discarded. Its name's holder
 /// removes it and lets go of its address here, without withdrawing its
-/// generation: a consumed checkpoint's VM may run on elsewhere.
+/// generation: a consumed checkpoint's VM may run on elsewhere. Unless it holds an
+/// earlier boot's QUARANTINE: that resume never ran its VM (the reboot showed STARTED on
+/// disk), so its generation is withdrawn, which also ends a home host's loan of it (#556).
 pub fn remove_debris(host: &Host, name: &str) -> Result<()> {
     let dir = host.suspended(name)?;
     let ip = manifest(&dir).map(|m| m.ip);
+    let stale = std::fs::read_to_string(dir.join(QUARANTINE)).is_ok_and(|q| quarantined(&q, crate::host::boot_id()).is_none());
+    let gen = if stale { read_gen(&dir) } else { None };
     remove_durably(&dir).map_err(|e| format!("vm {name}: removing what is left of its suspended checkpoint {}: {e}", dir.display()))?;
-    if let Some(ip) = ip {
-        let l = host.lock()?;
-        host.release(&l, ip, name, None)?;
-    }
-    Ok(())
+    free_address(host, name, ip, gen)
 }
 
 /// Marked DISCARDED durably before the address is freed and withdrawn.
@@ -1045,7 +1050,7 @@ fn free_address(host: &Host, name: &str, ip: Option<Ipv4Addr>, gen: Option<u64>)
 
 /// Why a QUARANTINE file (`<boot id> <why>`) holds, if it was written in boot `boot`: a reboot
 /// shows whether STARTED reached the disk, so an earlier boot's no longer does.
-fn quarantined<'a>(q: &'a str, boot: &str) -> Option<&'a str> {
+pub(crate) fn quarantined<'a>(q: &'a str, boot: &str) -> Option<&'a str> {
     let (written, why) = q.split_once(' ').unwrap_or((q, ""));
     (written == boot).then_some(why)
 }
