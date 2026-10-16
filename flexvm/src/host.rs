@@ -2639,14 +2639,24 @@ impl Host {
     /// recorded first: the one way a withdrawal is made, so each reaches the
     /// peers (`deliver_withdrawals`) whatever dies or is down meanwhile.
     /// A notice of an older generation is replaced; a newer one is kept.
+    /// A notice of the same generation and an older revision is replaced too.
     pub fn withdraw_noted(&self, l: &Locked, ip: Ipv4Addr, gen: u64) -> Result<bool> {
         let peers = self.config_now().peers;
         let path = self.notice_path(ip);
-        if !peers.is_empty() && load::<Notice>(&path).ok().flatten().is_none_or(|n| n.gen < gen) {
+        let rev = self.withdrawal_rev(l, ip, gen);
+        if !peers.is_empty() && load::<Notice>(&path).ok().flatten().is_none_or(|n| (n.gen, n.rev) < (gen, rev)) {
             let peers = peers.into_iter().map(|peer| Unheard { peer, tries: 0, next_ms: 0 }).collect();
-            store(&path, &Notice { gen, peers }, true)?;
+            store(&path, &Notice { gen, rev, peers }, true)?;
         }
         self.observe(l, ip, gen, 0, None)
+    }
+
+    /// The latest revision of generation `gen` of `ip` here: the record's, or what the VM that
+    /// held it published (`RUN/live/IP`, ahead of a record that trails, #533), dead or not.
+    pub fn withdrawal_rev(&self, l: &Locked, ip: Ipv4Addr, gen: u64) -> u64 {
+        let recorded = self.addr(l, ip).ok().filter(|a| a.seen == gen).map_or(0, |a| a.rev);
+        let live = load::<Live>(&self.live_path(ip)).ok().flatten().filter(|v| v.gen == gen).map_or(0, |v| v.rev);
+        recorded.max(live)
     }
 
     /// Migration `mig`'s outcome settled (`o`): a `leaving` claim of it by its
@@ -2737,24 +2747,24 @@ impl Host {
             .filter_map(|ip| Some((ip, load::<Notice>(&self.notice_path(ip)).ok()??)))
             .collect();
         // Due calls, the longest waiting (never asked: 0) first.
-        let mut due: Vec<(u64, u32, Ipv4Addr, u64, String)> = notices
+        let mut due: Vec<(u64, u32, Ipv4Addr, GenRev, String)> = notices
             .iter()
             .flat_map(|(ip, n)| {
-                n.peers.iter().filter(|u| u.next_ms <= now && peers.contains(&u.peer)).map(|u| (u.next_ms, u.tries, *ip, n.gen, u.peer.clone()))
+                n.peers.iter().filter(|u| u.next_ms <= now && peers.contains(&u.peer)).map(|u| (u.next_ms, u.tries, *ip, (n.gen, n.rev), u.peer.clone()))
             })
             .collect();
         due.sort();
         due.truncate(budget);
         // At once: one slow or down peer holds up no other.
-        let answers: Vec<(Ipv4Addr, u64, String, Result<()>)> = std::thread::scope(|scope| {
+        let answers: Vec<(Ipv4Addr, GenRev, String, Result<()>)> = std::thread::scope(|scope| {
             let calls: Vec<_> = due
                 .into_iter()
-                .filter_map(|(_, _, ip, gen, peer)| {
+                .filter_map(|(_, _, ip, (gen, rev), peer)| {
                     let tell = &tell;
                     std::thread::Builder::new()
                         .spawn_scoped(scope, move || {
-                            let r = tell(&peer, &serde_json::json!({"op": "route", "ip": ip.to_string(), "gen": gen}));
-                            (ip, gen, peer, r)
+                            let r = tell(&peer, &serde_json::json!({"op": "route", "ip": ip.to_string(), "gen": gen, "rev": rev}));
+                            (ip, (gen, rev), peer, r)
                         })
                         .inspect_err(|e| crate::log!("withdraw {ip}: cannot start peer call: {e}"))
                         .ok()
@@ -2775,7 +2785,7 @@ impl Host {
                 }
                 kept
             });
-            for (_, _, peer, r) in answers.iter().filter(|a| a.0 == ip && a.1 == n.gen) {
+            for (_, _, peer, r) in answers.iter().filter(|a| a.0 == ip && a.1 == (n.gen, n.rev)) {
                 let Some(i) = n.peers.iter().position(|u| &u.peer == peer) else { continue };
                 match r {
                     Ok(()) => drop(n.peers.remove(i)),
@@ -2822,8 +2832,15 @@ fn released_ip(m: &Mig) -> Option<Ipv4Addr> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Notice {
     gen: u64,
+    /// The latest revision of `gen` here (the VM's, as it migrated in): a peer that routes `gen`
+    /// via the host it had before takes the withdrawal by it (`listen::route`).
+    #[serde(default)]
+    rev: u64,
     peers: Vec<Unheard>,
 }
+
+/// A withdrawal's generation and revision.
+type GenRev = (u64, u64);
 
 /// A peer yet to hear a withdrawal: its failed tries, and the wall-clock ms before which it is not asked again.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4338,7 +4355,7 @@ mod tests {
         h.put_addr(x, &Addr { seen: 4, holder: Some("vm".into()), holder_id: Some(gone), held: 4, ..Addr::default() }, false).unwrap();
         h.withdraw_dead(false).unwrap();
         let notice = |h: &Host| load::<Notice>(&h.notice_path(x)).unwrap();
-        assert_eq!(notice(&h), Some(Notice { gen: 4, peers: unheard(&["p1", "p2"]) }), "recorded with the withdrawal");
+        assert_eq!(notice(&h), Some(Notice { gen: 4, rev: 0, peers: unheard(&["p1", "p2"]) }), "recorded with the withdrawal");
         // p2 is down: p1 is told, p2 asked again only after its backoff.
         assert_eq!(deliver(&h, 8, 1000, &["p2"]), ["p1", "p2"]);
         let n = notice(&h).unwrap();
@@ -4348,12 +4365,12 @@ mod tests {
         assert_eq!(deliver(&h, 8, next, &[]), ["p2"]);
         assert_eq!(notice(&h), None, "every peer has it");
         // A notice left by a process that died before telling anyone is delivered by the next pass.
-        store(&h.notice_path(x), &Notice { gen: 4, peers: unheard(&["p1"]) }, false).unwrap();
+        store(&h.notice_path(x), &Notice { gen: 4, rev: 0, peers: unheard(&["p1"]) }, false).unwrap();
         assert_eq!(deliver(&h, 8, 0, &[]), ["p1"]);
         assert_eq!(notice(&h), None);
         // A newer withdrawal recorded during a delivery is kept whole; an older one does not replace it.
-        store(&h.notice_path(x), &Notice { gen: 4, peers: unheard(&["p1"]) }, false).unwrap();
-        let newer = Notice { gen: 9, peers: unheard(&["p1", "p2"]) };
+        store(&h.notice_path(x), &Notice { gen: 4, rev: 0, peers: unheard(&["p1"]) }, false).unwrap();
+        let newer = Notice { gen: 9, rev: 0, peers: unheard(&["p1", "p2"]) };
         while !h.deliver_withdrawals_with(8, 0, |_, _| store(&h.notice_path(x), &newer, false)) {
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -4364,6 +4381,37 @@ mod tests {
         h.cfg.peers = vec!["p1".into()];
         assert_eq!(deliver(&h, 8, 0, &[]), ["p1"]);
         assert_eq!(notice(&h), None);
+    }
+
+    /// Review of #594: the VM migrated in (a newer revision than its old host announced) and ended
+    /// here before a peer heard of it: the withdrawal, retries too, carries that revision, as the
+    /// VM published it ahead of its record (#533), so the peer takes it from this host.
+    #[test]
+    fn a_withdrawal_carries_the_latest_revision_of_its_generation() {
+        let (_h_dir, mut h) = host("notice-rev");
+        h.cfg.peers = vec!["p1".into()];
+        let x = ip("10.9.1.1");
+        let gone = dead_owner(&h, 999_999_954, &[]);
+        h.put_addr(x, &Addr { seen: 4, rev: 2, holder: Some("vm".into()), holder_id: Some(gone), held: 4, ..Addr::default() }, false).unwrap();
+        h.publish_live(&h.lock().unwrap(), x, 4, 3).unwrap();
+        h.withdraw_dead(false).unwrap();
+        assert_eq!(load::<Notice>(&h.notice_path(x)).unwrap().map(|n| (n.gen, n.rev)), Some((4, 3)));
+        let sent = Mutex::new(Vec::new());
+        for now in [0, 1 << 40] {
+            while !h.deliver_withdrawals_with(8, now, |_, req| {
+                sent.lock().unwrap().push(req.clone());
+                bail!("down")
+            }) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        let sent = sent.into_inner().unwrap();
+        assert_eq!(sent.len(), 2);
+        assert!(sent.iter().all(|r| r["gen"] == 4 && r["rev"] == 3), "{sent:?}");
+        // One of the same generation and a newer revision replaces it.
+        h.publish_live(&h.lock().unwrap(), x, 4, 5).unwrap();
+        h.withdraw_noted(&h.lock().unwrap(), x, 4).unwrap();
+        assert_eq!(load::<Notice>(&h.notice_path(x)).unwrap().map(|n| (n.gen, n.rev)), Some((4, 5)));
     }
 
     #[test]

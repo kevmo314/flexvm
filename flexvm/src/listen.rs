@@ -815,6 +815,8 @@ fn route(host: &Host, req: &Value, peers: &[IpAddr], sender: &[IpAddr]) -> Resul
         Some(_) => req["rev"].as_u64().ok_or("route announcements carry the location's revision")?,
         None => 0,
     };
+    // A withdrawal's: the latest revision of the generation its sender knows (none: 0).
+    let withdrawn_rev = req["rev"].as_u64().unwrap_or(0);
     if let Some(via) = via.filter(|_| fault("route_stall")) {
         // Test hook: an announcement held up (as by a slow network) while armed.
         crate::log!("route {ip} via {via}: held up (injected fault)");
@@ -829,9 +831,10 @@ fn route(host: &Host, req: &Value, peers: &[IpAddr], sender: &[IpAddr]) -> Resul
         if a.seen == 0 {
             check_vm_ip(host, ip, peers)?;
         }
-        // Not by another peer: a newer generation (a move) only, announced or withdrawn.
-        if let Some(owner) = a.via.filter(|&o| gen == a.seen && !a.withdrawn && !is_peer(sender, IpAddr::V4(o))) {
-            bail!("{ip} generation {gen} is routed via {owner}, not via the asking peer: only that peer withdraws it");
+        // Not by another peer, unless it had the VM later: a newer generation, or a newer revision
+        // (the VM migrated on to it and ended there before its announcement got here).
+        if let Some(owner) = a.via.filter(|&o| gen == a.seen && !a.withdrawn && withdrawn_rev <= a.rev && !is_peer(sender, IpAddr::V4(o))) {
+            bail!("{ip} generation {gen} is routed via {owner} at revision {}, not via the asking peer: only that peer, or one with a newer revision, withdraws it", a.rev);
         }
     }
     if !host.observe(&l, ip, gen, rev, via)? {
@@ -987,8 +990,18 @@ mod tests {
         let req = json!({"ip": ip.to_string(), "gen": 3});
         // Routed via B: another peer (C) does not withdraw that generation.
         let e = route(&host, &req, &[b, c], &[c]).unwrap_err().to_string();
-        assert!(e.contains("only that peer withdraws it"), "{e}");
+        assert!(e.contains("only that peer, or one with a newer revision, withdraws it"), "{e}");
         assert!(!host.addr(&l, ip).unwrap().withdrawn);
+        // C, at B's revision or an older one, neither; at a newer one (the VM migrated on to C and
+        // ended there before C's announcement got here), it does.
+        let moved: Ipv4Addr = "10.201.0.9".parse().unwrap();
+        host.observe(&l, moved, 3, 2, Some("192.0.2.7".parse().unwrap())).unwrap();
+        for rev in [0, 2] {
+            assert!(route(&host, &json!({"ip": moved.to_string(), "gen": 3, "rev": rev}), &[b, c], &[c]).is_err(), "rev {rev}");
+        }
+        assert!(!host.addr(&l, moved).unwrap().withdrawn);
+        route(&host, &json!({"ip": moved.to_string(), "gen": 3, "rev": 3}), &[b, c], &[c]).unwrap();
+        assert!(host.addr(&l, moved).unwrap().withdrawn);
         // B does, retries included.
         route(&host, &req, &[b, c], &[b]).unwrap();
         route(&host, &req, &[b, c], &[b]).unwrap();

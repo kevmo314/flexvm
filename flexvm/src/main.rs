@@ -743,7 +743,8 @@ fn reclaim(host: &Host, ip: &str, force: Option<u64>) -> Result<()> {
         .into());
     };
     let (gen, forgot) = host.reclaim(ip, expected)?;
-    vmproc::tell_peers(host, json!({"op": "route", "ip": ip.to_string(), "gen": gen}));
+    // The operator's word that no host runs it: past whichever peer it is routed via there.
+    vmproc::tell_peers(host, json!({"op": "route", "ip": ip.to_string(), "gen": gen, "rev": u64::MAX}));
     util::log_line(format!(
         "WARNING: {ip} reclaimed (generation {gen} withdrawn, lent with {whom}); if that vm still runs anywhere, it shares {ip} with the next vm given it"
     ));
