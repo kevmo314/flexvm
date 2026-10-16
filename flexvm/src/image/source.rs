@@ -118,7 +118,11 @@ impl Layer {
 
     pub fn open(&self) -> Result<Hashed<Box<dyn Read>>> {
         let (inner, len) = self.src.open()?;
-        self.check_size(len).inspect_err(|_| self.evict())?;
+        if let Err(e) = self.check_size(len) {
+            // Hashed first: a blob whose digest does not match is evicted by `verify` (a truncated one).
+            let _ = self.verify(Hashed::new(inner));
+            return Err(e);
+        }
         Ok(Hashed::new(inner))
     }
 
@@ -129,14 +133,16 @@ impl Layer {
         }
     }
 
-    /// A cached blob that does not match its descriptor is evicted.
+    /// Only a digest mismatch proves a cached blob corrupt; a descriptor's size may be wrong.
     pub fn verify(&self, mut r: Hashed<Box<dyn Read>>) -> Result<()> {
         std::io::copy(&mut r, &mut std::io::sink())?;
-        let res = self.check_size(r.n).and_then(|()| match &self.digest {
-            Some(d) if *d != r.digest() => bail!("layer blob {d} has digest {}", r.digest()),
-            _ => Ok(()),
-        });
-        res.inspect_err(|_| self.evict())
+        if let Some(d) = &self.digest {
+            if *d != r.digest() {
+                self.evict();
+                bail!("layer blob {d} has digest {}", r.digest());
+            }
+        }
+        self.check_size(r.n)
     }
 
     fn evict(&self) {
@@ -454,8 +460,36 @@ mod tests {
         assert!(layer.src.evicted() && !path.exists());
         // Opening it again downloads it (here the registry hangs up).
         assert!(layer.open().is_err());
-        // A blob of the wrong size goes too.
+        // A blob of the wrong size is hashed: one whose digest does not match goes too.
         std::fs::write(&path, b"good!").unwrap();
+        assert!(layer.open().is_err() && layer.src.evicted() && !path.exists());
+    }
+
+    #[test]
+    fn size_only_mismatch_keeps_cached_blob() {
+        let dir = super::super::unpack::tests::tmpdir("blob-size");
+        let digest = sha256_hex(b"good");
+        let path = blob_path(&dir, &digest).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"good").unwrap();
+        let layer = Layer {
+            src: Blob::Cached {
+                blobs: dir.to_path_buf(),
+                registry: Arc::new(Registry::new(Reference::parse("example.com/test").unwrap())),
+                digest: digest.clone(),
+                size: 5,
+            },
+            digest: Some(digest),
+            size: Some(5),
+        };
+        assert!(layer.open().err().unwrap().to_string().contains("descriptor says 5"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"good");
+        let (r, _) = layer.src.open().unwrap();
+        assert!(layer.verify(Hashed::new(r)).unwrap_err().to_string().contains("descriptor says 5"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"good");
+        // A truncated blob fails its size and its digest: evicted.
+        std::fs::write(&path, b"goo").unwrap();
+        let layer = Layer { size: Some(4), ..layer };
         assert!(layer.open().is_err() && layer.src.evicted());
     }
 
