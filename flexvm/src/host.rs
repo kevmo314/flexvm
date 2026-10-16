@@ -1599,8 +1599,11 @@ type Grants = Vec<(u64, u64, u64)>;
 
 const GRANT_WINDOW: Duration = Duration::from_secs(10);
 
+#[cfg(test)]
+pub(crate) use tests::pin_clock;
+
 /// Shared by all processes (RUN is per boot) and unaffected by wall-clock steps.
-fn boottime_ms() -> u64 {
+pub(crate) fn boottime_ms() -> u64 {
     #[cfg(test)]
     if let Some(t) = tests::PINNED_MS.with(|p| p.get()) {
         return t;
@@ -4270,7 +4273,7 @@ mod tests {
     /// Stops the clock grants are stamped and aged by, on this test's thread: other tests share
     /// the host lock's thread mutex, so on a loaded machine a grant can wait on it past
     /// `GRANT_WINDOW` (#294).
-    fn pin_clock(ms: u64) {
+    pub(crate) fn pin_clock(ms: u64) {
         PINNED_MS.with(|p| p.set(Some(ms)));
     }
 
