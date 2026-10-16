@@ -205,18 +205,29 @@ impl Pager {
         if claimed.is_empty() {
             return Ok(0);
         }
+        let mut pages: Vec<Box<[u8]>> = claimed.iter().map(|_| vec![0u8; PAGE_SIZE].into_boxed_slice()).collect();
         let read = self.rescue_fail(cow, &claimed).and_then(|()| self.pagemap(first, end - first)).and_then(|map| {
-            // read_at succeeds only after filling every iovec in full.
-            unsafe { rescue_copies(&claimed, |p| map[p - first] & (PM_PRESENT | PM_SWAP) != 0, |page, local| self.read_at((page * PAGE_SIZE) as u64, local)) }
-        });
-        let pages = match read {
-            Ok(pages) => pages,
-            Err(e) => {
-                cow.stats.rescue_failures.fetch_add(1, Ordering::Relaxed);
-                cow.unclaim_many(&claimed);
-                return Err(e);
+            // Runs of claimed populated pages, each read with one call into the pages' own buffers.
+            let mut i = 0;
+            while i < claimed.len() {
+                if map[claimed[i] - first] & (PM_PRESENT | PM_SWAP) == 0 {
+                    i += 1;
+                    continue;
+                }
+                let mut j = i + 1;
+                while j < claimed.len() && j - i < 1024 && claimed[j] == claimed[j - 1] + 1 && map[claimed[j] - first] & (PM_PRESENT | PM_SWAP) != 0 {
+                    j += 1;
+                }
+                self.read_pages(claimed[i], &mut pages[i..j])?;
+                i = j;
             }
-        };
+            Ok(())
+        });
+        if let Err(e) = read {
+            cow.stats.rescue_failures.fetch_add(1, Ordering::Relaxed);
+            cow.unclaim_many(&claimed);
+            return Err(e);
+        }
         cow.rescue_many(first, end, claimed.iter().copied().zip(pages));
         Ok(claimed.len())
     }
@@ -230,6 +241,12 @@ impl Pager {
         cow.want(claimed[0]);
         thread::sleep(Duration::from_millis(5));
         Err(io::Error::other("injected fault: rescue failed"))
+    }
+
+    /// Reads consecutive guest pages from `page` out of Firecracker, a page into each buffer of `pages`.
+    fn read_pages(&self, page: usize, pages: &mut [Box<[u8]>]) -> io::Result<()> {
+        let local: Vec<libc::iovec> = pages.iter_mut().map(|b| libc::iovec { iov_base: b.as_mut_ptr().cast(), iov_len: PAGE_SIZE }).collect();
+        self.read_at((page * PAGE_SIZE) as u64, &local)
     }
 
     /// The pagemap entries of `n` pages from `page` in Firecracker (`PM_*` bits).
@@ -506,34 +523,6 @@ impl Pager {
     }
 }
 
-/// Missing pages were zero at the pause. Populated pages are fully overwritten by read_at:
-/// allocate those without zero-filling, and never expose a partial or failed read as bytes.
-/// Safety: `read` must initialize all of its iovecs before returning Ok.
-unsafe fn rescue_copies(
-    claimed: &[usize],
-    populated: impl Fn(usize) -> bool,
-    read: impl Fn(usize, &[libc::iovec]) -> io::Result<()>,
-) -> io::Result<Vec<Box<[u8]>>> {
-    let mut pages: Vec<_> = claimed.iter().map(|_| Box::<[u8]>::new_uninit_slice(PAGE_SIZE)).collect();
-    let mut i = 0;
-    while i < claimed.len() {
-        if !populated(claimed[i]) {
-            pages[i].fill(std::mem::MaybeUninit::new(0));
-            i += 1;
-            continue;
-        }
-        let mut j = i + 1;
-        while j < claimed.len() && j - i < 1024 && claimed[j] == claimed[j - 1] + 1 && populated(claimed[j]) {
-            j += 1;
-        }
-        let local: Vec<_> = pages[i..j].iter_mut().map(|p| libc::iovec { iov_base: p.as_mut_ptr().cast(), iov_len: PAGE_SIZE }).collect();
-        read(claimed[i], &local)?;
-        i = j;
-    }
-    // Every page was either explicitly zeroed or fully written by a successful read_at.
-    Ok(pages.into_iter().map(|p| unsafe { p.assume_init() }).collect())
-}
-
 /// The ranges that protect `pages` (ascending): merged across gaps of up to `PROTECT_GAP` pages, wider ones while there
 /// are more than `PROTECT_MAX`, never across a page of `kept` (ascending).
 pub(super) fn protect_ranges(pages: impl Iterator<Item = usize>, kept: &[usize]) -> Vec<(usize, usize)> {
@@ -571,48 +560,4 @@ pub(super) fn protect_ranges(pages: impl Iterator<Item = usize>, kept: &[usize])
         ranges.truncate(n);
     }
     ranges
-}
-
-#[cfg(test)]
-mod rescue_tests {
-    use super::*;
-
-    #[test]
-    fn rescued_pages_initialize_only_missing_pages_and_read_populated_runs() {
-        let calls = std::cell::RefCell::new(Vec::new());
-        // The reader initializes every byte on success, as read_at does.
-        let pages = unsafe {
-            rescue_copies(
-                &[1, 2, 4, 5, 6],
-                |p| p != 5,
-                |page, local| {
-                    calls.borrow_mut().push((page, local.len()));
-                    for (i, v) in local.iter().enumerate() {
-                        std::ptr::write_bytes(v.iov_base.cast::<u8>(), (page + i) as u8, v.iov_len);
-                    }
-                    Ok(())
-                },
-            )
-        }
-        .unwrap();
-        assert_eq!(*calls.borrow(), [(1, 2), (4, 1), (6, 1)]);
-        for (page, value) in pages.iter().zip([1, 2, 4, 0, 6]) {
-            assert_eq!(&**page, &[value; PAGE_SIZE]);
-        }
-    }
-
-    #[test]
-    fn a_partial_failed_rescue_does_not_publish_uninitialized_bytes() {
-        let result = unsafe {
-            rescue_copies(
-                &[0, 1],
-                |_| true,
-                |_, local| {
-                    std::ptr::write_bytes(local[0].iov_base.cast::<u8>(), 1, PAGE_SIZE / 2);
-                    Err(io::Error::other("partial read"))
-                },
-            )
-        };
-        assert_eq!(result.unwrap_err().to_string(), "partial read");
-    }
 }
