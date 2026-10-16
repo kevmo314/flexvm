@@ -175,7 +175,7 @@ impl Pager {
 }
 
 /// Candidates examined per hot page wanted (`select_hot`).
-const SCAN_BUDGET: usize = 4;
+const SCAN_BUDGET: usize = 16;
 
 /// Keeps up to `cap` of the ascending `candidates`, preferring pages copied last time too (dirty in at least three
 /// intervals; `prev`, ascending, checked with `candidate`), then lower page numbers. Bounded by the cap, not by how many
@@ -290,9 +290,11 @@ mod tests {
         let visited = std::cell::Cell::new(0);
         let candidates = (0..1_000_000).inspect(|_| visited.set(visited.get() + 1));
         // Discarded or unmapped pages still count against the scan budget; previous copies get priority.
-        let hot = select_hot(candidates, &[100, 101], |p| p >= 14 && p != 101, 4);
-        assert_eq!(hot, [14, 15, 100]);
-        assert_eq!(visited.get(), 16);
+        let hot = select_hot(candidates, &[100, 101], |p| p >= 62 && p != 101, 4);
+        assert_eq!(hot, [62, 63, 100]);
+        assert_eq!(visited.get(), 64);
+        // A long run of discarded low pages no longer exhausts the old 4x budget.
+        assert_eq!(select_hot(0..100, &[], |p| p >= 20, 4), [20, 21, 22, 23]);
         assert!(select_hot((0..).inspect(|_| panic!("zero budget scanned")), &[], |_| true, 0).is_empty());
     }
 
