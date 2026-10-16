@@ -387,10 +387,13 @@ runs as root, so nothing follows a path that user can change:
 - **Publish.** Everything is fsynced, then renamed fd to fd into place with
   `RENAME_NOREPLACE` (checkpoints are never overwritten or modified), and
   the destination directory is fsynced.
-- **Durability failure.** If that last fsync fails, the checkpoint is
-  revoked before the VM resumes: its manifest durably removed, then the rest
-  of the directory. If that fails too, the VM stays paused and is marked
-  failed.
+- **Durability failure.** If that last fsync fails, flexvm revokes the
+  checkpoint: its manifest is durably removed, then the rest of the directory.
+  For a stopped-copy checkpoint, revocation happens before the VM resumes;
+  if revocation fails too, the VM stays paused and is marked failed. A
+  keep-running copy-on-write checkpoint has already resumed the VM: it keeps
+  running, and if revocation fails the error reports that the checkpoint may
+  reappear after a crash.
 - **Restore.** Every file is opened with `O_NOFOLLOW` and must be a regular
   file.
 - **Leftovers.** A later checkpoint into the same directory clears staging
@@ -802,7 +805,7 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
     what arrives there, up to 4 MiB per VM, beyond that dropping and counting.
   - Once the target answers (the VM runs there), the source opens a stream
     on the migration connection and, once the target accepts it, sends the
-    queue (length, sequence number, packet), then whatever reached the TUN
+    queue (u32 BE length, packet), then whatever reached the TUN
     device meanwhile. It waits until the target has injected all of it,
     points its own route at the target, and sends the few packets that were
     still on their way. If that route cannot be set, the TUN's route goes
@@ -813,7 +816,12 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
     it sends `SWITCH`, and the target, with all before it injected, points
     the route at a hold of its own; the source's last packets follow, and
     once the stream ends the target releases its hold into the VM, so the
-    held packets stay first and in order (#78). Releasing a hold into a VM
+    held packets stay first and in order (#78). If routing to the target's
+    hold fails, it plugs its tap and routes the address there instead; routed
+    packets wait behind the source's last held packets until the stream ends.
+    If plugging or routing to the tap fails too, it answers `n`: the source
+    sends the rest of the held packets, and the target routes the address
+    once the stream ends. Releasing a hold into a VM
     here (that target's, an aborted source's, a checkpoint's) never drops
     what it took because the route change was slow (it waits for RTNL,
     which a busy host's tap and TUN teardowns hold): what arrives while the
@@ -839,14 +847,13 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
     (scenario `same_host_late_handover`). A source likewise reads its hold
     device itself once the route moved, and hands all of it over, not
     bounded by time. A target that takes
-    `SWITCH` says so in its prepare answer (`hold_switch`); a source sends it
+    `SWITCH` says so in its prepare answer (`hold_switch2`); a source sends it
     to no other. Each of these late route changes happens under the host
     lock and only while the address is still this VM's with a current
     generation: a newer VM's route, announced meanwhile, stays. The target takes one stream per migration, on that
     connection, for that VM instance only, and stops it if the VM is killed
     or moves on. Nothing is resent: a stream that breaks off, or a source
-    whose answer was lost, loses the rest (counted). Sequence numbers count
-    gaps and drop duplicates.
+    whose answer was lost, loses the rest (counted).
   - The target injects each packet into the guest as an Ethernet frame sent
     out of the VM's tap from an AF_PACKET socket (from the gateway's MAC to
     the guest's): Firecracker reads it like any other frame, byte for byte as
@@ -991,7 +998,7 @@ Lifecycle numbers are from `flexvm bench --lifecycle` with the 2-vCPU template,
 
 ### Resumable exec protocol
 
-Legacy `EXEC <len>`, `SPAWN <len>` and `PING` retain their wire format.
+The guest answers `PING` with `pong`; it does not handle `EXEC` or `SPAWN`.
 Sessions use `SESSION <id> <len>\n` followed by exactly `len` command bytes,
 `ATTACH <id> <offset>\n`, or `CLOSE <id>\n`. The client chooses a random ID;
 retrying SESSION with the same ID and command attaches to the existing process
@@ -1007,15 +1014,24 @@ stream. Kind 3 contains the final `u64 LE` offset and `i32 LE` exit code.
 Kind 5 contains the earliest retained `u64 LE` offset and reports output loss;
 clients must not silently skip it. Kind 4 also carries `waiting` heartbeats,
 `error: ...` failures, or `closed` for CLOSE. Socket writes happen outside the
-output ring mutex. Reading an exit does not discard it: the CLI sends CLOSE
-after receiving it, and the guest retains the ID as a tombstone until expiry
-so a delayed creation retry cannot execute the command again.
+output ring mutex. Reading an exit does not discard it: after receiving an
+exec's exit, the CLI sends the one-byte `SESSION_DONE` (`d`) on the attachment.
+The guest waits up to 2 s for it after sending the exit and closes the session
+if acknowledged; otherwise the exit stays available for reattachment. A VM's
+main command leaves its session open so it can be reattached after a suspend.
+Closed sessions retain the ID as a tombstone until expiry so a delayed
+creation retry cannot execute the command again.
 
-At most 64 sessions are live (running, or finished and not yet closed); another
-SESSION fails with `error: too many sessions: ...`. A finished session whose
-client has been gone for a minute is closed by the guest (checked every minute,
-and whenever the limit is reached), its output freed; a running one is closed
-after ten minutes, its process group killed as CLOSE would (a client killed
+At most 64 sessions are running or still sending output; another SESSION fails
+with `error: too many sessions: ...`. Once an exit is sent, its session counts
+towards a separate cap of 192 unacknowledged exits, with the oldest closed to
+stay within it. All retained output for these sessions uses the shared pool;
+the oldest unacknowledged sessions are also closed to make room there. If the
+pool still cannot cover a session's output, it keeps counting towards the 64.
+A finished session whose client has been gone for a minute is closed by the
+guest (checked every minute, and whenever the limit is reached), its output
+freed; a running one is closed after ten minutes, its process group killed as
+CLOSE would (a client killed
 outright never sends CLOSE). Both waits count only time the guest ran: across
 a plain pause the TSC, and so the guest's monotonic clock, runs on, while a
 CLI keeps retrying through it. The agent keeps its own clock, which a thread
@@ -1023,10 +1039,11 @@ advances every second by at most 2 s, so a pause of any length counts as about
 2 s. Closing a session also shuts down its attached
 connection, so a write to a stalled client cannot hold it. Closed sessions leave
 tombstones: small records outside that limit that expire five minutes after the
-close, and beyond 4096 the oldest one (if at least 30 s old) is dropped. Each
-live session's output ring keeps 128 KiB and grows towards 4 MiB from a shared
-pool, so all rings together hold at most 64 MiB; when the pool is spent, rings
-stop growing, and a detached client may then see kind 5 sooner.
+close, and beyond 4096 the oldest one (if at least 30 s old) is dropped. For
+sessions running or still sending output, each ring keeps 128 KiB and grows
+towards 4 MiB from a shared 56 MiB pool. The base reservations and pool total
+64 MiB; when the pool is spent, rings stop growing, and a detached client may
+then see kind 5 sooner.
 
 Backpressure: while a client is attached, and for 30 s after it drops, the
 command's output waits (its pipe fills and the command blocks) once half the
@@ -1041,7 +1058,7 @@ overwritten.
 
 The control socket's exec request carries `session` (required: every exec is a
 session the client names), `action` (`start`, `attach`, or `close`), and
-`offset`; start also supplies `cmd`. A client closes its session when done, or
-when interrupted; one that vanishes without closing leaves the command to the
-guest's reclaim above. Start/attach return the usual
+`offset`; start also supplies `cmd`. A client acknowledges the exit when done,
+or closes its session when interrupted; one that vanishes without closing
+leaves the command to the guest's reclaim above. Start/attach return the usual
 JSON success reply followed by session frames; close returns a JSON reply.
