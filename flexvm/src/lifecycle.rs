@@ -202,11 +202,9 @@ impl Proc {
             if dir.exists() && !self.host.is_suspended(&vm.name) {
                 remove_durably(&dir).map_err(|e| format!("removing what is left of {}: {e}", dir.display()))?;
             }
-            // Its address record durable first: a fresh claim's was written without fsync, and a
-            // power loss must not leave a resumable checkpoint whose generation reads as withdrawn (#563).
-            if let Some(ip) = self.ip() {
-                self.host.sync_addr(&self.host.lock()?, ip)?;
-            }
+            // Its address record durable first, at its revision: a fresh claim's was written without fsync, and a
+            // power loss must not leave a resumable checkpoint whose generation reads as withdrawn (#563, #585).
+            self.record_for_suspend()?;
             let staging = Staging::new(&dir, vm.dir.join("checkpoint.vmstate"))?;
             staging.add_file(GEN, self.gen().to_string().as_bytes())?;
             let cmd = match self.cmd.lock().unwrap().clone() {

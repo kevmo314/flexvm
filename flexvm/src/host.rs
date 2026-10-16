@@ -804,7 +804,7 @@ impl Host {
 
     /// `RUN/claims/IP`, with the boot id: the record was last written without fsync in
     /// this boot. A clock can be set, so the boot id, not a time, tells (`read_addr`).
-    fn unsynced_marker(&self, ip: Ipv4Addr) -> PathBuf {
+    pub(crate) fn unsynced_marker(&self, ip: Ipv4Addr) -> PathBuf {
         self.run.join("claims").join(ip.to_string())
     }
 

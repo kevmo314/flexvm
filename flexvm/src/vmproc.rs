@@ -546,6 +546,17 @@ impl Proc {
         Ok(())
     }
 
+    /// Before a suspend keeps the claim (#585): its revision recorded durably, as an `advance` whose
+    /// write failed is still retried to (the retry stops once the claim is kept), and the record
+    /// synced (#563). An error fails the suspend: the resumed VM would announce a revision
+    /// already announced, and a late announcement of it (an aborted target's) would pass.
+    pub fn record_for_suspend(&self) -> Result<()> {
+        let Some(ip) = self.ip() else { return Ok(()) };
+        let l = self.host.lock()?;
+        self.record_rev(&l).map_err(|e| format!("recording its revision: {e}"))?;
+        self.host.sync_addr(&l, ip)
+    }
+
     /// Publishes the VM's revision as it is now (which only changes under the host lock), if it has an address.
     fn publish_rev(&self, l: &crate::host::Locked) -> Result<()> {
         let Some((ip, gen, rev)) = self.addr.lock().unwrap().as_ref().map(|a| (a.ip, a.gen, a.rev)) else {
@@ -3133,6 +3144,25 @@ mod tests {
             assert!(!p.host.observe(&l, ip, gen, 1, Some("10.1.0.1".parse().unwrap())).unwrap(), "the target's late announcement");
         }
         std::fs::remove_dir(&blocker).unwrap();
+    }
+
+    /// #585: a suspend records the revision an `advance` failed to, durably, before its claim is
+    /// kept (which ends the retry); failing that, the suspend fails.
+    #[test]
+    fn a_suspend_records_a_revision_whose_write_failed_or_fails() {
+        let (p, _root) = test_proc("suspend-rev", Some("susp"));
+        let claim = p.host.claim_new(&p.host.lock().unwrap(), "susp", None).unwrap();
+        let ip = p.set_addr(claim);
+        let blocker = block_write(&p.host.state.join("addrs"), &ip.to_string());
+        p.advance(&p.host.lock().unwrap(), 2).unwrap();
+        let e = p.record_for_suspend().unwrap_err();
+        assert!(e.to_string().contains("recording its revision"), "{e}");
+        std::fs::remove_dir(&blocker).unwrap();
+        p.record_for_suspend().unwrap();
+        p.addr.lock().unwrap().take().unwrap().keep();
+        let l = p.host.lock().unwrap();
+        assert_eq!(p.host.addr(&l, ip).unwrap().rev, 2, "recorded before the claim was kept");
+        assert!(!p.host.unsynced_marker(ip).exists(), "and durably");
     }
 
     /// The temporary file `util::write_file` makes for `dir/name`, taken by a directory: writing it fails.
