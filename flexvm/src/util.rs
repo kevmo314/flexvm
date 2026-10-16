@@ -400,10 +400,11 @@ fn resolve_with(
     lookup: impl FnOnce(String) -> io::Result<Addrs> + Send + 'static,
 ) -> io::Result<Addrs> {
     let fail = |kind, why: &str| io::Error::new(kind, format!("DNS lookup of {addr}: {why}"));
-    By { s: (), at }.left().map_err(|_| fail(io::ErrorKind::TimedOut, "deadline passed"))?;
+    // An IP literal needs no lookup, so no time: answered even past the deadline.
     if let Ok(addr) = addr.parse() {
         return Ok(vec![addr]);
     }
+    By { s: (), at }.left().map_err(|_| fail(io::ErrorKind::TimedOut, "deadline passed"))?;
     let mut lookup = Some(lookup);
     let mut mine = None;
     let mut l = dns.lookups.lock().unwrap();
@@ -1310,6 +1311,12 @@ mod tests {
         let err = resolve_with("unused.example:80", Instant::now(), &DNS, false, |_| panic!("deadline passed")).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
         assert_eq!(workers(&DNS), 0);
+        // An IP literal is answered all the same: a slow name before it in a list that shares one
+        // deadline must not make a literal address after it unknown.
+        for addr in ["192.0.2.9:7070", "[2001:db8::1]:7070"] {
+            let got = resolve_with(addr, Instant::now(), &DNS, false, |_| panic!("an IP literal is not looked up")).unwrap();
+            assert_eq!(got, vec![addr.parse::<std::net::SocketAddr>().unwrap()]);
+        }
     }
 
     #[test]
