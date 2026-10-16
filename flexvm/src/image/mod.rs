@@ -617,7 +617,8 @@ fn resolve_user(root: &Root, user: &str) -> Result<(u32, u32, String, Vec<u32>)>
         text.lines().filter(|l| !l.starts_with('#')).map(|l| l.split(':').map(String::from).collect::<Vec<_>>()).filter(|f| f.len() >= 3).collect()
     };
     let (passwd, group) = (rows("etc/passwd"), rows("etc/group"));
-    let (u, g) = user.split_once(':').map_or((user, None), |(u, g)| (u, Some(g)));
+    // As in Docker, `user:` names no group.
+    let (u, g) = user.split_once(':').map_or((user, None), |(u, g)| (u, Some(g).filter(|g| !g.is_empty())));
     let u = if u.is_empty() { "0" } else { u };
     let entry = passwd.iter().find(|f| f[0] == u || (u.parse::<u32>().is_ok() && f[2] == u));
     let uid: u32 = match (u.parse(), entry) {
@@ -877,7 +878,7 @@ mod tests {
         std::fs::write(dir.join("etc/passwd"), "app:x:1000:1000::/home/app:/bin/sh\n").unwrap();
         std::fs::write(dir.join("etc/group"), "app:x:1000:app\nshadow:x:42:app\nrestricted:x:2000:\nshadow-alias:x:42:app\n").unwrap();
         let root = Root::open(&dir, Limits::default()).unwrap();
-        for user in ["app", "1000"] {
+        for user in ["app", "1000", "app:", "1000:"] {
             assert_eq!(resolve_user(&root, user).unwrap(), (1000, 1000, "/home/app".into(), vec![1000, 42]));
         }
         for user in ["app:restricted", "app:2000", "1000:restricted", "1000:2000"] {
@@ -885,10 +886,15 @@ mod tests {
         }
         assert_eq!(resolve_user(&root, "app:app").unwrap().3, [1000]);
         assert_eq!(resolve_user(&root, "9999:2000").unwrap(), (9999, 2000, "/".into(), vec![2000]));
+        std::fs::remove_file(dir.join("etc/group")).unwrap();
+        let root = Root::open(&dir, Limits::default()).unwrap();
+        assert_eq!(resolve_user(&root, "app").unwrap().3, [1000]);
+        assert_eq!(resolve_user(&root, "app:2000").unwrap().3, [2000]);
+        assert!(resolve_user(&root, "app:restricted").is_err());
     }
 
-    #[test]
-    fn injection_secures_existing_app_owned_config_directory() {
+    /// Injection takes /etc/flexvm and app.conf from an image user who owns them, as `owner`.
+    fn secure_config_directory(app_owned: bool, owner: (u32, u32)) {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tmpdir("secure-conf");
@@ -896,8 +902,7 @@ mod tests {
         std::fs::create_dir_all(&conf_dir).unwrap();
         let conf_path = conf_dir.join("app.conf");
         std::fs::write(&conf_path, "attacker config").unwrap();
-        // On an unprivileged test run these already belong to the app uid.
-        if unsafe { libc::geteuid() } == 0 {
+        if app_owned {
             std::os::unix::fs::chown(&conf_dir, Some(1000), Some(1000)).unwrap();
             std::os::unix::fs::chown(&conf_path, Some(1000), Some(1000)).unwrap();
         }
@@ -908,10 +913,22 @@ mod tests {
         let conf = inject(&mut root, &app, b"init").unwrap();
         for (path, mode) in [(&conf_dir, 0o755), (&conf_path, 0o644)] {
             let meta = std::fs::metadata(path).unwrap();
-            assert_eq!((meta.uid(), meta.gid(), meta.mode() & 0o7777), (0, 0, mode));
+            assert_eq!((meta.uid(), meta.gid(), meta.mode() & 0o7777), (owner.0, owner.1, mode));
         }
         assert_eq!(read(&conf_path), conf);
         assert!(conf.contains("\nuid 1000\ngid 1000\ngroups 1000\n"));
+    }
+
+    #[test]
+    fn injection_secures_existing_config_directory() {
+        secure_config_directory(false, unsafe { (libc::geteuid(), libc::getegid()) });
+    }
+
+    /// Needs root: `sudo cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn injection_secures_existing_app_owned_config_directory() {
+        secure_config_directory(true, (0, 0));
     }
 
     #[test]
