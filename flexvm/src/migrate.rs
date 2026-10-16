@@ -424,6 +424,7 @@ impl Proc {
                 if let Some(h) = self.holder() {
                     h.forget(ip, mig);
                 }
+                self.retry_route(mig, to, target, None, &e);
                 return (None, Err(e));
             }
         };
@@ -449,20 +450,42 @@ impl Proc {
             }
         }
         let res = res.unwrap_or_else(|| self.switch_route(mig, via));
-        if let (Err(e), Some(p)) = (&res, self.arc()) {
-            crate::log!("route {ip} via {via}: {e}; retrying");
-            *self.pending_route.lock().unwrap() = Some((mig, via));
-            thread::spawn(move || {
-                if !retry(&format!("route {ip} via {via}"), || p.switch_route(mig, via)) {
-                    return;
-                }
-                match p.take_pending_route(mig) {
-                    Some(_) => crate::log!("route {ip} via {via}: done"),
-                    None => crate::log!("route {ip} via {via}: dropped, migration {mig} no longer owes it"),
-                }
-            });
+        if let Err(e) = &res {
+            self.retry_route(mig, to, target, Some(via), e);
         }
         (held, res)
+    }
+
+    fn retry_route(&self, mig: u64, to: &str, target: &Value, via: Option<Ipv4Addr>, error: &dyn std::fmt::Display) {
+        let Some(p) = self.arc() else { return };
+        let ip = self.vm().ip;
+        let what = format!("route {ip} to {to}");
+        crate::log!("{what}: {error}; retrying");
+        if let Some(via) = via {
+            *self.pending_route.lock().unwrap() = Some((mig, via));
+        }
+        let (to, target) = (to.to_string(), target.clone());
+        thread::spawn(move || {
+            if !retry(&what, || {
+                let resolved = match via {
+                    Some(via) => via,
+                    None => target_via(&p.host, &target, &to, None)?,
+                };
+                if via.is_none() {
+                    let mut pending = p.pending_route.lock().unwrap();
+                    if pending.is_none_or(|(m, _)| m == mig) {
+                        *pending = Some((mig, resolved));
+                    }
+                }
+                p.switch_route(mig, resolved)
+            }) {
+                return;
+            }
+            match p.take_pending_route(mig) {
+                Some(_) => crate::log!("{what}: done"),
+                None => crate::log!("{what}: dropped, migration {mig} no longer owes it"),
+            }
+        });
     }
 
     /// Migration `mig`'s pending route, taken: never a later migration's, which an old retry or
@@ -948,7 +971,11 @@ fn target_via(host: &crate::host::Host, target: &Value, to: &str, conn: Option<&
     }
     match conn {
         Some(conn) => peers.push(conn.peer_addr()?.ip()),
-        None => peers.extend(crate::util::resolve(to, Instant::now() + Duration::from_secs(2))?.iter().map(|a| a.ip())),
+        None => {
+            if let Ok(addrs) = crate::util::resolve(to, Instant::now() + Duration::from_secs(2)) {
+                peers.extend(addrs.iter().map(|a| a.ip()));
+            }
+        }
     }
     crate::listen::check_via(via, &peers)?;
     Ok(via)
@@ -1118,6 +1145,15 @@ mod tests {
         .unwrap();
         crate::util::write_file(&host.run, "peers.json", br#"{"names":{"cached.invalid:7070":["192.0.2.8"]}}"#, false).unwrap();
         assert_eq!(target_via(&host, &json!({"underlay": "192.0.2.8"}), "192.0.2.99:7070", None).unwrap(), "192.0.2.8".parse::<Ipv4Addr>().unwrap());
+        // Failed destination resolution must not discard cached or explicit underlays.
+        assert_eq!(target_via(&host, &json!({"underlay": "192.0.2.8"}), "bad address", None).unwrap(), "192.0.2.8".parse::<Ipv4Addr>().unwrap());
+        host.configure(|c| {
+            c.peer_underlays.insert("cached.invalid:7070".into(), vec!["192.0.2.9".parse().unwrap()]);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(target_via(&host, &json!({"underlay": "192.0.2.9"}), "bad address", None).unwrap(), "192.0.2.9".parse::<Ipv4Addr>().unwrap());
+        assert!(target_via(&host, &json!({"underlay": "192.0.2.10"}), "bad address", None).is_err());
         // The connection authorizes the target even before its name is cached.
         host.configure(|c| {
             c.peers = vec!["unseen.invalid:7070".into()];
@@ -1131,6 +1167,26 @@ mod tests {
         assert_eq!(target_via(&host, &json!({"underlay": "127.0.0.1"}), "localhost:7070", None).unwrap(), Ipv4Addr::LOCALHOST);
         assert!(target_via(&host, &json!({"underlay": "192.0.2.8"}), "127.0.0.1:7070", Some(&conn)).is_err());
         assert!(target_via(&host, &json!({"underlay": "224.0.0.1"}), "224.0.0.1:7070", None).is_err());
+    }
+
+    #[test]
+    fn retry_rechecks_target_underlay_after_validation_failure() {
+        let root = crate::test_util::TempDir::new("target-via-retry");
+        let mut host = crate::host::Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let mut attempts = 0;
+        assert!(retry("target underlay", || {
+            attempts += 1;
+            let via = target_via(&host, &json!({"underlay": "192.0.2.7"}), "bad address", None);
+            if attempts == 1 {
+                assert!(via.is_err());
+                host.configure(|c| {
+                    c.peers.push("192.0.2.7:7070".into());
+                    Ok(())
+                })?;
+            }
+            via.map(|_| ())
+        }));
+        assert_eq!(attempts, 2);
     }
 
     /// A refused arrival reads what its source still sends, so the source, still writing, gets the reason, not a reset.

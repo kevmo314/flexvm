@@ -14,6 +14,11 @@ impl Reference {
     pub fn parse(s: &str) -> Result<Reference> {
         let (name, digest) = s.split_once('@').map_or((s, None), |(n, d)| (n, Some(d)));
         let (name, tag) = name.rsplit_once(':').filter(|(_, t)| !t.contains('/')).map_or((name, None), |(n, t)| (n, Some(t)));
+        if let Some(t) = tag {
+            if t.is_empty() || t.len() > 128 || !t.bytes().enumerate().all(|(i, c)| c.is_ascii_alphanumeric() || c == b'_' || (i > 0 && b".-".contains(&c))) {
+                bail!("bad tag in {s:?}");
+            }
+        }
         let (domain, path) = match name.split_once('/') {
             Some((d, p)) if d.contains('.') || d.contains(':') || d == "localhost" => (d, p.to_string()),
             _ => ("docker.io", name.to_string()),
@@ -29,7 +34,9 @@ impl Reference {
             bail!("bad image reference {s:?}");
         }
         let reference = match (digest, tag) {
-            (Some(d), _) if !d.starts_with("sha256:") || d.len() != 71 => bail!("bad digest in {s:?}: only sha256 digests are supported"),
+            (Some(d), _) if !d.strip_prefix("sha256:").is_some_and(|h| h.len() == 64 && h.bytes().all(|c| c.is_ascii_hexdigit())) => {
+                bail!("bad digest in {s:?}: only sha256 digests are supported")
+            }
             (d, t) => d.or(t).unwrap_or("latest").to_string(),
         };
         Ok(Reference { registry, repository, reference })
@@ -123,6 +130,22 @@ mod tests {
         assert_eq!(Reference::parse("localhost/x").unwrap().base_url(), "http://localhost/v2/x");
         assert_eq!(Reference::parse("ghcr.io/o/a").unwrap().base_url(), "https://ghcr.io/v2/o/a");
         assert!(Reference::parse("nginx@sha256:abc").is_err());
+    }
+
+    #[test]
+    fn tags_and_digests_follow_the_oci_grammar() {
+        for tag in ["1.0+build1", "", ".x", "-x", "é", &"a".repeat(129)] {
+            assert!(Reference::parse(&format!("app:{tag}")).is_err(), "{tag}");
+            assert!(Reference::parse(&format!("app:{tag}@sha256:{}", "a".repeat(64))).is_err(), "{tag}");
+        }
+        for tag in ["_", "V1.0_build-1", &"a".repeat(128)] {
+            let r = Reference::parse(&format!("app:{tag}")).unwrap();
+            assert_eq!(Reference::from_template_name(&r.template_name()).unwrap(), r);
+        }
+        for hex in ["a".repeat(63), "a".repeat(65), format!("{}g", "a".repeat(63)), format!("{}/", "a".repeat(63)), format!("{}.", "a".repeat(63))] {
+            assert!(Reference::parse(&format!("app@sha256:{hex}")).is_err(), "{hex}");
+        }
+        assert!(Reference::parse(&format!("app@sha256:{}", "aB09".repeat(16))).is_ok());
     }
 
     #[test]
