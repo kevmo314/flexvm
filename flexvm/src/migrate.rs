@@ -205,6 +205,9 @@ impl Proc {
         // A target that takes this held stream (no sequence numbers) and `SWITCH` says so; to any
         // other, nothing held is sent (it is counted as dropped).
         let (held, rerouted) = self.reroute(mig, to, &target, answered.then_some(&conn), prepared["hold_switch2"] == true);
+        if let Err(e) = &rerouted {
+            crate::log!("vm {}: migration {mig} to {to}: rerouting failed: {e}", self.name());
+        }
         t.mark("reroute");
         self.wait_release(mig, to.to_string());
         Ok(json!({
@@ -359,7 +362,9 @@ impl Proc {
                 match o {
                     Some(Outcome::Committed(target)) => {
                         crate::log!("vm {}: migration {mig} to {to} committed", p.name());
-                        let _ = p.reroute(mig, &to, &target, None, false);
+                        if let (_, Err(e)) = p.reroute(mig, &to, &target, None, false) {
+                            crate::log!("vm {}: migration {mig} to {to}: rerouting failed: {e}", p.name());
+                        }
                         return p.wait_release(mig, to);
                     }
                     Some(Outcome::Aborted) => return p.abort_later(mig, &format!("migration {mig} to {to} aborted")),
@@ -413,7 +418,7 @@ impl Proc {
     /// A failed route is retried in the background: the target owns the VM either way.
     fn reroute(&self, mig: u64, to: &str, target: &Value, conn: Option<&TcpStream>, switch: bool) -> (Option<hold::Stats>, Result<()>) {
         let ip = self.vm().ip;
-        let via = match target_via(&self.host, target, conn) {
+        let via = match target_via(&self.host, target, to, conn) {
             Ok(via) => via,
             Err(e) => {
                 if let Some(h) = self.holder() {
@@ -931,11 +936,19 @@ impl Proc {
 }
 
 /// Check the target before forwarding held packets or changing any route.
-fn target_via(host: &crate::host::Host, target: &Value, conn: Option<&TcpStream>) -> Result<Ipv4Addr> {
+fn target_via(host: &crate::host::Host, target: &Value, to: &str, conn: Option<&TcpStream>) -> Result<Ipv4Addr> {
     let via = target["underlay"].as_str().ok_or("target sent no underlay")?.parse()?;
-    let mut peers = crate::listen::known_peers(host)?;
-    if let Some(conn) = conn {
-        peers.push(conn.peer_addr()?.ip());
+    let cfg = host.config_now();
+    let cache = crate::listen::Cached::read(&host.run, &cfg.peers);
+    let mut peers = cfg.peer_underlay_addrs();
+    for name in &cfg.peers {
+        if let Ok(addrs) = cache.addrs(name) {
+            peers.extend(addrs);
+        }
+    }
+    match conn {
+        Some(conn) => peers.push(conn.peer_addr()?.ip()),
+        None => peers.extend(crate::util::resolve(to, Instant::now() + Duration::from_secs(2))?.iter().map(|a| a.ip())),
     }
     crate::listen::check_via(via, &peers)?;
     Ok(via)
@@ -1085,18 +1098,39 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        assert_eq!(target_via(&host, &json!({"underlay": "192.0.2.7"}), None).unwrap(), "192.0.2.7".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(target_via(&host, &json!({"underlay": "192.0.2.7"}), "192.0.2.99:7070", None).unwrap(), "192.0.2.7".parse::<Ipv4Addr>().unwrap());
         // A peer sharing this network namespace: the handoff goes by its local underlay.
-        assert_eq!(target_via(&host, &json!({"underlay": "127.0.0.1"}), None).unwrap(), Ipv4Addr::LOCALHOST);
+        assert_eq!(target_via(&host, &json!({"underlay": "127.0.0.1"}), "192.0.2.99:7070", None).unwrap(), Ipv4Addr::LOCALHOST);
         for target in [json!({}), json!({"underlay": "192.0.2.8"}), json!({"underlay": "127.0.0.2"})] {
-            assert!(target_via(&host, &target, None).is_err());
+            assert!(target_via(&host, &target, "192.0.2.99:7070", None).is_err());
         }
         host.configure(|c| {
             c.peers.push("unseen.invalid:7070".into());
             Ok(())
         })
         .unwrap();
-        assert!(target_via(&host, &json!({"underlay": "192.0.2.7"}), None).is_err());
+        assert_eq!(target_via(&host, &json!({"underlay": "192.0.2.7"}), "192.0.2.99:7070", None).unwrap(), "192.0.2.7".parse::<Ipv4Addr>().unwrap());
+        // An available name's cached addresses survive another name's missing entry.
+        host.configure(|c| {
+            c.peers.push("cached.invalid:7070".into());
+            Ok(())
+        })
+        .unwrap();
+        crate::util::write_file(&host.run, "peers.json", br#"{"names":{"cached.invalid:7070":["192.0.2.8"]}}"#, false).unwrap();
+        assert_eq!(target_via(&host, &json!({"underlay": "192.0.2.8"}), "192.0.2.99:7070", None).unwrap(), "192.0.2.8".parse::<Ipv4Addr>().unwrap());
+        // The connection authorizes the target even before its name is cached.
+        host.configure(|c| {
+            c.peers = vec!["unseen.invalid:7070".into()];
+            Ok(())
+        })
+        .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let conn = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        assert_eq!(target_via(&host, &json!({"underlay": "127.0.0.1"}), "unseen.invalid:7070", Some(&conn)).unwrap(), Ipv4Addr::LOCALHOST);
+        // Reconciliation has no connection: resolve the destination instead.
+        assert_eq!(target_via(&host, &json!({"underlay": "127.0.0.1"}), "localhost:7070", None).unwrap(), Ipv4Addr::LOCALHOST);
+        assert!(target_via(&host, &json!({"underlay": "192.0.2.8"}), "127.0.0.1:7070", Some(&conn)).is_err());
+        assert!(target_via(&host, &json!({"underlay": "224.0.0.1"}), "224.0.0.1:7070", None).is_err());
     }
 
     /// A refused arrival reads what its source still sends, so the source, still writing, gets the reason, not a reset.
