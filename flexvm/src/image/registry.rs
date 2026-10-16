@@ -477,8 +477,8 @@ impl Registry {
                 if redirects == 0 {
                     req = req.header("Accept", accept);
                 }
-                if let Some(auth) = auth {
-                    req = req.header("Authorization", auth);
+                if let Some(a) = &auth {
+                    req = req.header("Authorization", &**a);
                 }
                 req
             })?;
