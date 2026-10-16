@@ -2,6 +2,8 @@
 name = "flexvm"
 version = "0.1.0"
 edition = "2021"
+# build.rs reads ../scripts and builds ../guest: only ever built in this workspace.
+publish = false
 
 [dependencies]
 libc.workspace = true

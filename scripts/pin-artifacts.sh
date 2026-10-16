@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
 # The prebuilt artifacts release (ARTIFACTS_TAG in scripts/versions.sh, built by .github/workflows/release.yml).
-# usage: pin-artifacts.sh            downloads the release's assets, checks they were built from this checkout's
-#                                    inputs, and pins them in scripts/checksums.sha256 (commit the result)
+# usage: pin-artifacts.sh            downloads the release's assets, verifies their build provenance (release.yml at
+#                                    the release's tag, attested by GitHub; needs gh), checks they were built from
+#                                    this checkout's inputs, and pins them in scripts/checksums.sha256 (commit it).
+#                                    Nothing downloaded is ever run.
 #        pin-artifacts.sh --inputs   prints what a release is built from (the release's inputs.txt)
-#        pin-artifacts.sh --check    fails if the pinned release was built from other inputs than this checkout's
+#        pin-artifacts.sh --check    fails unless every asset of ARTIFACTS_TAG is pinned and the release was built
+#                                    from this checkout's inputs
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 # shellcheck source=versions.sh
 source "$root/scripts/versions.sh"
 checksums=$root/scripts/checksums.sha256
+REPO=kevmo314/flexvm
+ASSETS=(firecracker vmlinux inputs.txt)
 
 # The pinned SHA256 of a URL, if any.
 pinned() {
@@ -35,11 +40,13 @@ case "${1:-}" in
     exit 0
     ;;
   --check)
+    for asset in "${ASSETS[@]}"; do
+      if [[ ! $(pinned "$ARTIFACTS_URL/$asset") =~ ^[[:xdigit:]]{64}$ ]]; then
+        echo "$ARTIFACTS_URL/$asset is not pinned in scripts/checksums.sha256: flexvm builds from this checkout download nothing (run scripts/pin-artifacts.sh once the release exists)" >&2
+        exit 1
+      fi
+    done
     want=$(pinned "$ARTIFACTS_URL/inputs.txt")
-    if [ -z "$want" ]; then
-      echo "$ARTIFACTS_TAG is not pinned yet: flexvm builds from this checkout download nothing"
-      exit 0
-    fi
     if [ "$(inputs | sha256sum | cut -d' ' -f1)" != "$want" ]; then
       echo "The pinned release $ARTIFACTS_TAG was built from other Firecracker patches, version or kernel than this checkout's: bump ARTIFACTS_TAG in scripts/versions.sh, push the new tag, and run scripts/pin-artifacts.sh" >&2
       exit 1
@@ -54,11 +61,21 @@ case "${1:-}" in
     ;;
 esac
 
+command -v gh > /dev/null || { echo "pinning needs gh (GitHub CLI) to verify the assets' build provenance" >&2; exit 1; }
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
-for asset in firecracker vmlinux inputs.txt; do
+for asset in "${ASSETS[@]}"; do
   echo "downloading $ARTIFACTS_URL/$asset"
+  # Never executable: nothing downloaded here is run.
   curl -fsSL -o "$work/$asset" "$ARTIFACTS_URL/$asset"
+  chmod 644 "$work/$asset"
+done
+# Each asset must have been built by this repository's release workflow, from this tag, on a GitHub-hosted runner.
+for asset in "${ASSETS[@]}"; do
+  echo "verifying the build provenance of $asset"
+  gh attestation verify "$work/$asset" --repo "$REPO" \
+    --signer-workflow "$REPO/.github/workflows/release.yml" \
+    --source-ref "refs/tags/$ARTIFACTS_TAG" --deny-self-hosted-runners > /dev/null
 done
 if ! inputs | cmp -s - "$work/inputs.txt"; then
   echo "$ARTIFACTS_TAG was built from other inputs than this checkout's:" >&2
@@ -70,13 +87,13 @@ if [ "$(sha256sum < "$work/vmlinux" | cut -d' ' -f1)" != "$(pinned "$CI/$KERNEL"
   echo "$ARTIFACTS_URL/vmlinux is not the pinned $CI/$KERNEL" >&2
   exit 1
 fi
-chmod +x "$work/firecracker"
-"$work/firecracker" --version | head -1
+# What Firecracker is, from the attested inputs.txt (never by running it).
+head -1 "$work/inputs.txt"
 
 # This release's lines replace any it had; other lines stay.
 {
   awk -v base="$ARTIFACTS_URL/" 'index($2, base) != 1' "$checksums"
-  for asset in firecracker vmlinux inputs.txt; do
+  for asset in "${ASSETS[@]}"; do
     printf '%s %s\n' "$(sha256sum < "$work/$asset" | cut -d' ' -f1)" "$ARTIFACTS_URL/$asset"
   done
 } > "$work/checksums"

@@ -3,7 +3,8 @@ name: Release artifacts
 # Pushing an artifacts-N tag builds the patched Firecracker and re-hosts the pinned guest kernel as the
 # release flexvm downloads from on first use. The tag must be ARTIFACTS_TAG in scripts/versions.sh at the
 # tagged commit. Afterwards, scripts/pin-artifacts.sh pins the assets' sha256 in scripts/checksums.sha256
-# (a follow-up commit): from then on, flexvm builds download them. A release's assets never change.
+# (a follow-up commit) once their build provenance (attested here) verifies: from then on, flexvm builds
+# download them. A release's assets never change.
 
 on:
   push:
@@ -23,6 +24,9 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: write
+      # Build provenance for the assets: scripts/pin-artifacts.sh verifies it before pinning anything.
+      id-token: write
+      attestations: write
     env:
       TAG: ${{ github.ref_name }}
       GH_REPO: ${{ github.repository }}
@@ -65,6 +69,14 @@ jobs:
           (cd "$out" && sha256sum firecracker vmlinux inputs.txt > SHA256SUMS)
           "$out/firecracker" --version
           cat "$out/inputs.txt" "$out/SHA256SUMS"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            ${{ runner.temp }}/assets/firecracker
+            ${{ runner.temp }}/assets/vmlinux
+            ${{ runner.temp }}/assets/inputs.txt
 
       - name: Publish
         env:

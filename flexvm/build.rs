@@ -43,7 +43,9 @@ fn pins(root: &Path) {
         let url = format!("{base}/{asset}");
         let found: Vec<&str> = checksums.lines().filter_map(|l| l.split_once(' ').filter(|(_, u)| u.trim() == url).map(|(h, _)| h)).collect();
         match found[..] {
-            [] => {}
+            [] => println!(
+                "cargo:warning=scripts/checksums.sha256 pins no {url}: this flexvm cannot download {asset} (scripts/pin-artifacts.sh pins it once the release exists)"
+            ),
             [hash] if hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()) => {
                 println!("cargo:rustc-env={var}={}", hash.to_ascii_lowercase())
             }
