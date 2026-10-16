@@ -446,8 +446,8 @@ fn configure(c: &mut host::Config, args: &Args) -> Result<()> {
         }
     }
     if let Some(r) = args.get("vm-ips") {
-        net::IpRange::parse(r)?;
-        c.vm_ips = r.into();
+        c.vm_ips = if r.is_empty() { host::Config::default().vm_ips } else { r.into() };
+        net::IpRange::parse(&c.vm_ips)?;
     }
     if let Some(u) = args.get("underlay") {
         c.underlay = (!u.is_empty()).then(|| u.parse()).transpose().map_err(|_| format!("bad --underlay {u:?}"))?;
@@ -459,12 +459,16 @@ fn configure(c: &mut host::Config, args: &Args) -> Result<()> {
         c.announce_dev = (!d.is_empty()).then(|| d.into());
     }
     if let Some(d) = args.get("dns") {
-        c.dns = (!d.is_empty()).then(|| d.parse::<std::net::IpAddr>().map(|_| d.into())).transpose().map_err(|_| format!("bad --dns {d:?}"))?;
+        c.dns = (!d.is_empty()).then(|| d.parse::<std::net::Ipv4Addr>().map(|_| d.into())).transpose().map_err(|_| format!("bad --dns {d:?}"))?;
     }
     for (flag, v) in [("reserve", &mut c.reserve_mib), ("evict-at", &mut c.evict_mib)] {
         if args.has(flag) {
             *v = (args.get(flag) != Some("")).then(|| args.parse_or(flag, 0)).transpose()?;
         }
+    }
+    let total = proc_kb("/proc/meminfo", "MemTotal").map_or(u64::MAX, |b| b >> 20);
+    if let Some(r) = c.reserve_mib.filter(|&r| r > total) {
+        bail!("--reserve {r} MiB is more than this host's {total} MiB of RAM");
     }
     if let Some(e) = c.evict_mib.filter(|&e| e < c.reserve()) {
         crate::log!("flexvm: the eviction mark {e} MiB is under the {} MiB reserve: eviction starts at the reserve", c.reserve());
@@ -1125,6 +1129,17 @@ mod exec_tests {
         configure(&mut c, &parse(&["--peer", "", "--evict-at", "", "--reserve", "", "--announce-dev", ""])).unwrap();
         assert!(c.peers.is_empty() && c.evict_mib.is_none() && c.reserve_mib.is_none() && c.announce_dev.is_none());
         assert_eq!(c.reserve(), host::default_reserve());
+        // An empty --vm-ips is the default again; DNS is IPv4 (the guest's resolver is set over IPv4).
+        configure(&mut c, &parse(&["--vm-ips", "", "--dns", "1.1.1.1"])).unwrap();
+        assert_eq!((c.vm_ips.as_str(), c.dns.as_deref()), (host::Config::default().vm_ips.as_str(), Some("1.1.1.1")));
+        assert!(configure(&mut c, &parse(&["--dns", "::1"])).is_err());
+        // Never a reserve above RAM, nor one that would overflow.
+        let total = proc_kb("/proc/meminfo", "MemTotal").unwrap() >> 20;
+        configure(&mut c, &parse(&["--reserve", &total.to_string()])).unwrap();
+        for over in [total + 1, u64::MAX] {
+            let e = configure(&mut c, &parse(&["--reserve", &over.to_string()])).unwrap_err().to_string();
+            assert!(e.contains("more than this host's"), "{e}");
+        }
     }
 
     #[test]

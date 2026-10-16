@@ -465,7 +465,7 @@ pub fn route_get(to: Ipv4Addr) -> Result<(String, Ipv4Addr)> {
     attr(&mut msg, RTA_DST, &to.octets());
     let mut buf = [0u8; 4096];
     let reply = exchange(&sock, libc::RTM_GETROUTE, 0, &msg, &mut buf).map_err(|_| format!("no route toward {to}: netlink failed"))?;
-    let (oif, src) = parse_route(reply).ok_or_else(|| format!("no route toward {to}"))?;
+    let (oif, src) = parse_route(reply).map_err(|e| format!("no route toward {to}{e}"))?;
     let mut name = [0 as libc::c_char; libc::IFNAMSIZ];
     if unsafe { libc::if_indextoname(oif, name.as_mut_ptr()) }.is_null() {
         bail!("the route toward {to}: interface {oif}: {}", std::io::Error::last_os_error());
@@ -473,8 +473,17 @@ pub fn route_get(to: Ipv4Addr) -> Result<(String, Ipv4Addr)> {
     Ok((unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }.to_string_lossy().into_owned(), src))
 }
 
-/// A route reply's (RTM_NEWROUTE) output interface and preferred source; None for an error.
-fn parse_route(reply: &[u8]) -> Option<(u32, Ipv4Addr)> {
+/// A route reply's (RTM_NEWROUTE) output interface and preferred source; else why not
+/// (": " and the kernel's error, or nothing).
+fn parse_route(reply: &[u8]) -> std::result::Result<(u32, Ipv4Addr), String> {
+    if reply.len() >= 20 && u16::from_ne_bytes([reply[4], reply[5]]) == NLMSG_ERROR as u16 {
+        let code = i32::from_ne_bytes(reply[16..20].try_into().unwrap());
+        return Err(format!(": {}", std::io::Error::from_raw_os_error(-code)));
+    }
+    parse_new_route(reply).ok_or_else(String::new)
+}
+
+fn parse_new_route(reply: &[u8]) -> Option<(u32, Ipv4Addr)> {
     if reply.len() < 28 || u16::from_ne_bytes([reply[4], reply[5]]) != RTM_NEWROUTE {
         return None;
     }
@@ -605,6 +614,11 @@ pub fn parse_mac(s: &str) -> Result<[u8; 6]> {
         *m = u8::from_str_radix(part, 16)?;
     }
     Ok(mac)
+}
+
+/// Whether `dev` is an Ethernet link (ARPHRD_ETHER), one that takes ARP announcements.
+pub fn is_ethernet(dev: &str) -> bool {
+    std::fs::read_to_string(format!("/sys/class/net/{dev}/type")).is_ok_and(|t| t.trim() == "1")
 }
 
 /// `/proc/sys/net/{family}/conf/{dev}/{key}`, by its path: a sysctl key's dots would split a
@@ -775,21 +789,28 @@ mod tests {
             RTM_NEWROUTE,
             &[(RTA_DST, &dst), (libc::RTA_TABLE, &52u32.to_ne_bytes()), (libc::RTA_PREFSRC, &src), (RTA_GATEWAY, &gw), (RTA_OIF, &9u32.to_ne_bytes())],
         );
-        assert_eq!(parse_route(&full), Some((9, Ipv4Addr::from(src))));
+        assert_eq!(parse_route(&full), Ok((9, Ipv4Addr::from(src))));
         // Trailing bytes past the message are not read as attributes.
-        assert_eq!(parse_route(&[&full[..], &[8, 0, 4, 0, 1, 0, 0, 0]].concat()), Some((9, Ipv4Addr::from(src))));
-        assert_eq!(parse_route(&reply(RTM_NEWROUTE, &[(RTA_OIF, &9u32.to_ne_bytes())])), None, "no source");
-        assert_eq!(parse_route(&reply(RTM_NEWROUTE, &[(libc::RTA_PREFSRC, &src)])), None, "no device");
-        assert_eq!(parse_route(&reply(NLMSG_ERROR as u16, &[])), None, "an error");
+        assert_eq!(parse_route(&[&full[..], &[8, 0, 4, 0, 1, 0, 0, 0]].concat()), Ok((9, Ipv4Addr::from(src))));
+        assert_eq!(parse_route(&reply(RTM_NEWROUTE, &[(RTA_OIF, &9u32.to_ne_bytes())])), Err("".into()), "no source");
+        assert_eq!(parse_route(&reply(RTM_NEWROUTE, &[(libc::RTA_PREFSRC, &src)])), Err("".into()), "no device");
+        // An error gives the kernel's errno (struct nlmsgerr: a negative errno after the header).
+        let mut err = reply(NLMSG_ERROR as u16, &[]);
+        err[16..20].copy_from_slice(&(-libc::ENETUNREACH).to_ne_bytes());
+        let why = std::io::Error::from_raw_os_error(libc::ENETUNREACH).to_string();
+        assert_eq!(parse_route(&err), Err(format!(": {why}")));
+        assert_eq!(parse_route(&err[..19]), Err("".into()), "a short error");
         let mut bad = full.clone();
         bad[28] = 200;
-        assert_eq!(parse_route(&bad), None, "an attribute past the end");
+        assert_eq!(parse_route(&bad), Err("".into()), "an attribute past the end");
     }
 
     #[test]
     fn the_kernel_names_the_route_toward_loopback() {
         let (dev, src) = route_get(Ipv4Addr::LOCALHOST).unwrap();
         assert!(!dev.is_empty() && src == Ipv4Addr::LOCALHOST, "{dev} {src}");
+        // Loopback (ARPHRD_LOOPBACK) takes no ARP announcements, nor does a device that is not there.
+        assert!(!is_ethernet("lo") && !is_ethernet("flexvm-none0"));
     }
 
     #[test]
