@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """End-to-end checks of flexvm's user-facing commands on one KVM host, as CI
-runs them. Run as root, after building flexvm, the patched Firecracker, the
-guest kernel and the rootfs (see README.md and .github/workflows/ci.yml).
+runs them. Run as root, after building flexvm and the patched Firecracker and
+fetching the guest kernel and the test image's base (scripts/fetch.sh; see
+README.md and .github/workflows/ci.yml).
 
-It builds the templates, then runs the cases below and the selected
+It makes the test image (scripts/test-image.py) and pulls its templates from it
+(the image case's and the app-log scenarios' from --image), then runs the cases below and the selected
 scripts/faults.py scenarios, with fresh VMs, in --jobs lanes at once. Each
 lane has two flexvm hosts on loopback (A and B: their own listeners, run
 directories, state directories and VM address ranges); a lane runs its work
@@ -15,7 +17,7 @@ and directories.
 usage: sudo scripts/e2e.py [--bin FLEXVM] [--state DIR] [--log-dir DIR]
                            [--port-a N] [--net-a A.B.C] [--net-b A.B.C]
                            [--jobs N] [--lanes "PORT:NET-A:NET-B ..."]
-                           [--image REF [--image-cache DIR] | --no-image] [--faults "SCENARIO ..."]
+                           [--image REF [--image-cache DIR] | --no-image] [--test-image DIR] [--faults "SCENARIO ..."]
                            [--shard pr|main|recovery|heavy] [--split I/N] [--no-skips] [CASE ...]
 
 Shards (CI runs pr in four splits side by side, heavy on a schedule):
@@ -46,7 +48,9 @@ p.add_argument("--jobs", type=int, default=4, help="lanes that run at once")
 p.add_argument("--lanes", help="the lanes' ports and address ranges, as PORT:NET-A:NET-B each (overrides --port-a, "
                "--net-a, --net-b and --jobs)")
 p.add_argument("--tag", default="fvci", help="prefix of this run's own directories under /run and /var/tmp")
-p.add_argument("--template", default="ci", help="name of the template the cases build and use")
+p.add_argument("--template", default="ci", help="name of the template the cases pull (from the test image) and use")
+p.add_argument("--test-image", help="the test image's OCI layout: made there (scripts/test-image.py) unless it holds the "
+               "image of the state's base.squashfs already (default: in the run's own directory)")
 p.add_argument("--image", default="public.ecr.aws/docker/library/busybox:1.36",
                help="container image for the image-template case")
 p.add_argument("--no-image", action="store_true", help="skip the image-template case (needs registry access)")
@@ -122,11 +126,6 @@ def flexvm(*argv, timeout=180, check=True, env=None):
     if check and r.returncode != 0:
         raise AssertionError(f"flexvm {' '.join(argv)} exited {r.returncode}: {r.stderr.strip()}")
     return r
-
-
-def template(name, *extra, timeout=600):
-    """Builds a template (`flexvm template`); returns the CLI's output."""
-    return flexvm("template", name, *extra, timeout=timeout).stdout
 
 
 def listener_inode(port):
@@ -710,11 +709,11 @@ def pull_template(name, opts):
     waits (or what Retry-After asks); a registry that stays rate limited fails as that."""
     waits = (15, 30, 60, 120)
     for i in range(len(waits) + 1):
-        r = flexvm("template", name, "--image", args.image, *opts, timeout=600, check=False)
+        r = flexvm("pull", args.image, "--tag", name, *opts, timeout=600, check=False)
         if r.returncode == 0:
             return r
         if "HTTP 429" not in r.stderr:
-            raise AssertionError(f"flexvm template --image {args.image} exited {r.returncode}: {r.stderr.strip()}")
+            raise AssertionError(f"flexvm pull {args.image} exited {r.returncode}: {r.stderr.strip()}")
         if i == len(waits):
             break
         wait = retry_after() or waits[i]
@@ -755,7 +754,7 @@ def save_layout(stderr):
 
 @case
 def image_template():
-    """template --image: a container image becomes a template whose VMs run its entrypoint."""
+    """pull: a container image becomes a template whose VMs run its entrypoint."""
     if args.no_image:
         print("  skipped (--no-image)")
         return
@@ -768,7 +767,7 @@ def image_template():
     if layout:
         # Cached (CI): the image as an OCI layout of the blobs an earlier pull fetched. No
         # registry; flexvm checks every blob against its digest as it would after a pull.
-        flexvm("template", name, "--image", layout, *opts, timeout=600)
+        flexvm("pull", layout, "--tag", name, *opts, timeout=600)
         print(f"  template from the cached {args.image} ({image_digest(layout)}): {time.time() - t:.1f} s")
     else:
         r = pull_template(name, opts)
@@ -848,6 +847,8 @@ def shared_state(state):
 
 # Where templates are built (and images pulled, unpacked in its staging/).
 BUILD = os.path.join(WORK, "build")
+# The OCI layout the cases' templates are pulled from.
+TEST_IMAGE = os.path.abspath(args.test_image) if args.test_image else os.path.join(WORK, "test-image")
 shared_state(BUILD)
 A = Host("a", args.port_a, args.port_a + 1, args.net_a)
 GROW = args.template + "-grow"
@@ -1013,10 +1014,13 @@ def main():
             if args.selftest:
                 r = None
             elif not image:
-                r = flexvm("template", name, *extra, timeout=600)
+                test_image.wait()
+                if not test_image.ok:
+                    raise AssertionError("no test image")
+                r = flexvm("pull", TEST_IMAGE, "--tag", name, *extra, timeout=600)
             else:
                 # From the cached image (CI), else pulled, its HTTP 429s retried.
-                r = flexvm("template", name, "--image", layout, *extra, timeout=600) if layout else pull_template(name, list(extra))
+                r = flexvm("pull", layout, "--tag", name, *extra, timeout=600) if layout else pull_template(name, list(extra))
             out, ok = (r.stdout + r.stderr).strip() if r else "(selftest)", True
         except Exception as e:
             out, ok = str(e), False
@@ -1119,7 +1123,29 @@ def main():
             with lock:
                 summary.extend(got)
 
+    # The test image, made once for the templates pulled from it (`build`).
+    test_image = threading.Event()
+    test_image.ok = False
+
+    def make_test_image():
+        t = time.time()
+        try:
+            if not args.selftest:
+                r = subprocess.run([sys.executable, os.path.join(ROOT, "scripts", "test-image.py"), "--state", args.state, TEST_IMAGE],
+                                   capture_output=True, text=True, timeout=900)
+                if r.returncode != 0:
+                    raise AssertionError(f"scripts/test-image.py exited {r.returncode}: {(r.stdout + r.stderr).strip()[-2000:]}")
+                say(f"test image ({time.time() - t:.1f} s): {r.stdout.strip()}")
+            test_image.ok = True
+        except Exception as e:
+            say(f"FAIL test image ({time.time() - t:.1f} s): {e}")
+        test_image.set()
+
     # The templates this selection uses, built side by side.
+    if args.template in needed or GROW in needed:
+        threading.Thread(target=make_test_image, daemon=True).start()
+    else:
+        test_image.set()
     builders = [threading.Thread(target=build, args=(args.template, "--vcpus", "2", "--max", TEMPLATE_MAX))] if args.template in needed else []
     if GROW in needed:
         # A larger ceiling with little plugged at the start: VMs must grow.

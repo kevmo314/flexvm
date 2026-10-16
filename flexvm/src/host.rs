@@ -3164,6 +3164,28 @@ pub fn lock_at_with(dir: OwnedFd, name: &str, take: impl Fn(&File) -> std::io::R
     }
 }
 
+/// A shared hold on `name` in `dir` that, unlike `HeldLock`, leaves the file for the other
+/// holders when let go. Whoever removes what it guards takes it exclusively with `lock_at` (whose
+/// drop unlinks it), so a holder that locked the file it unlinked tries again on the new one.
+pub fn shared_at(dir: &OwnedFd, name: &str) -> std::io::Result<Flock> {
+    let c = std::ffi::CString::new(name)?;
+    loop {
+        let file = open_lock(dir, std::ffi::OsStr::new(name))?;
+        flock(&file, libc::LOCK_SH)?;
+        let (now, mine) = (crate::util::stat_at(dir.as_raw_fd(), &c), file.metadata()?);
+        if now.is_some_and(|st| st.st_ino == mine.ino() && st.st_dev == mine.dev()) {
+            return Ok(Flock(file));
+        }
+        let _ = flock(&file, libc::LOCK_UN);
+    }
+}
+
+/// The use lock of the file or directory `st` describes (`shared_at` while used, `lock_at`
+/// exclusively to remove it): image root filesystems and template generations.
+pub fn use_lock(st: &libc::stat) -> String {
+    keyed("use", st, "")
+}
+
 #[cfg(test)]
 mod lock_tests {
     use super::*;
@@ -3172,6 +3194,22 @@ mod lock_tests {
         mpsc,
     };
     use std::time::Duration;
+
+    #[test]
+    fn shared_holds_keep_the_file_and_keep_out_an_exclusive_one() {
+        let root = crate::test_util::TempDir::new("shared-at");
+        let dir = lock_dir(&root.join("locks")).unwrap();
+        let (a, b) = (shared_at(&dir, "k").unwrap(), shared_at(&dir, "k").unwrap());
+        drop(a);
+        assert!(root.join("locks/k").exists(), "a holder leaves the file to the others");
+        let excl = |how| lock_at(lock_dir(&root.join("locks")).unwrap(), "k", how);
+        assert_eq!(excl(libc::LOCK_EX | libc::LOCK_NB).err().map(|e| e.kind()), Some(std::io::ErrorKind::WouldBlock));
+        drop(b);
+        let held = excl(libc::LOCK_EX | libc::LOCK_NB).unwrap();
+        drop(held);
+        assert!(!root.join("locks/k").exists(), "the remover's drop unlinks it");
+        drop(shared_at(&dir, "k").unwrap());
+    }
 
     #[test]
     fn waiter_on_unlinked_lock_retries_the_current_inode() {

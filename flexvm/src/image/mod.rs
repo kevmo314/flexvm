@@ -23,6 +23,7 @@ use crate::host::{flock, Flock};
 use crate::template::interrupted;
 use crate::util::{cpath, is_nonce, random_hex, stat_at};
 use crate::util::{ms, rename_noreplace, run_until, sync_dir, Result};
+pub use reference::Reference;
 pub use registry::download;
 use registry::sha256_hex;
 pub use unpack::Hashed;
@@ -43,6 +44,18 @@ pub struct ImageMeta {
     pub ready: Option<Ready>,
     #[serde(skip)]
     pub ready_timeout: Duration,
+}
+
+impl ImageMeta {
+    /// Whether the image has an entrypoint or command to start: one without idles.
+    pub fn has_app(&self) -> bool {
+        !self.argv.is_empty()
+    }
+
+    /// Started at `run` (not before the snapshot, as `--warm` does).
+    pub fn starts_at_run(&self) -> bool {
+        self.has_app() && !self.warm
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,10 +121,8 @@ fn app_config(config: &Value, o: &Options) -> Result<App> {
         (None, Some(_)) => vec![],
         (None, None) => strings(&c["Cmd"]),
     };
+    // None: no app; its VMs idle until told what to run (`exec`, `run -- CMD`).
     let argv: Vec<String> = entrypoint.into_iter().chain(cmd).collect();
-    if argv.is_empty() {
-        bail!("the image has no entrypoint or command; pass --entrypoint or --cmd");
-    }
     let mut env = strings(&c["Env"]);
     for kv in &o.env {
         env.retain(|e| env_key(e) != env_key(kv));
@@ -142,6 +153,9 @@ pub fn prepare(cache: &Path, init: Option<&Path>, o: &Options) -> Result<(PathBu
         bail!("image is {os}/{arch}; only linux/amd64 is supported");
     }
     let app = app_config(&config, o)?;
+    if o.warm && app.argv.is_empty() {
+        bail!("--warm needs an app: the image has no entrypoint or command; pass --entrypoint or --cmd");
+    }
     let ready = match (&o.ready, o.warm) {
         (Some(r), _) => Some(r.clone()),
         (None, true) => match app.ports.first() {
@@ -285,6 +299,53 @@ fn cached_rootfs(cached: &Path, build: impl FnOnce(&Path) -> Result<String>, syn
     }
     // Through the descriptor: the locked directory's path now, wherever it was moved.
     Ok(std::fs::canonicalize(cached)?)
+}
+
+/// Holds the cache entry `rootfs` (as `prepare` returned it) for a build of a template from it, so
+/// `remove_rootfs` leaves it until the template is published. Fails if it was removed meanwhile.
+pub fn reserve_rootfs(rootfs: &Path) -> Result<Flock> {
+    use std::os::unix::fs::MetadataExt;
+    let st = crate::util::fstat(File::open(rootfs)?.as_raw_fd())?;
+    let held = crate::host::shared_at(&crate::host::host_locks()?, &crate::host::use_lock(&st))?;
+    let now = std::fs::metadata(rootfs).ok().map(|m| (m.dev(), m.ino()));
+    if now != Some((st.st_dev, st.st_ino)) || !entry_complete(rootfs) {
+        bail!("image root filesystem {} was removed (flexvm rmi) as the pull went on", rootfs.display());
+    }
+    Ok(held)
+}
+
+/// Removes the cache entry `rootfs` (a `rootfs/KEY.ext4` of `cache`) under its key's lock, its
+/// marker first, so a build that waits for the lock builds it again. The caller knows no template
+/// uses it, and none is being built from it. Returns whether it was removed.
+pub fn remove_rootfs(cache: &Path, rootfs: &Path) -> Result<bool> {
+    let dir = cache.join("rootfs");
+    let (Ok(dir), Some(parent)) = (std::fs::canonicalize(&dir), rootfs.parent()) else { return Ok(false) };
+    if std::fs::canonicalize(parent).ok().as_deref() != Some(dir.as_path()) || rootfs.extension() != Some("ext4".as_ref()) {
+        return Ok(false);
+    }
+    let pinned = crate::host::Directory::open(&dir)?;
+    let cached = pinned.path.join(rootfs.file_name().unwrap());
+    let _lock = crate::host::lock_at(crate::host::host_locks()?, &key_lock(&pinned, &cached)?, libc::LOCK_EX)?;
+    // Kept while a pull builds a template of it (`reserve_rootfs`).
+    let st = match File::open(&cached) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        f => crate::util::fstat(f?.as_raw_fd())?,
+    };
+    let _use = match crate::host::lock_at(crate::host::host_locks()?, &crate::host::use_lock(&st), libc::LOCK_EX | libc::LOCK_NB) {
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+        r => r?,
+    };
+    for ext in ["ok", "ext4", "conf"] {
+        match std::fs::remove_file(cached.with_extension(ext)) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            r => r?,
+        }
+        if ext == "ok" {
+            sync_dir(&pinned.path)?;
+        }
+    }
+    sync_dir(&pinned.path)?;
+    Ok(true)
 }
 
 /// A key's lock's name in the host's lock directory (`host::host_locks`): by its
@@ -1021,7 +1082,8 @@ mod tests {
         assert_eq!(app.env, ["PATH=/bin", "A=2"]);
         let o = Options { entrypoint: Some(vec!["/bin/sh".into()]), ..Default::default() };
         assert_eq!(app_config(&config, &o).unwrap().argv, ["/bin/sh"]);
-        assert!(app_config(&json!({"config": {}}), &Options::default()).is_err());
+        // No app: its VMs idle.
+        assert!(app_config(&json!({"config": {}}), &Options::default()).unwrap().argv.is_empty());
         assert_eq!(parse_argv(r#"["a b", "c"]"#).unwrap(), ["a b", "c"]);
         assert_eq!(parse_argv("python3 -m http.server").unwrap(), ["python3", "-m", "http.server"]);
     }
@@ -1321,6 +1383,30 @@ mod tests {
         std::fs::remove_file(cached.with_extension("conf")).unwrap();
         assert!(cached_rootfs(&cached, never, sync_dir).is_err());
         assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+    }
+
+    #[test]
+    fn removed_rootfs_goes_marker_first_and_only_from_the_cache() {
+        let root = crate::test_util::TempDir::new("rmi-rootfs");
+        let dir = root.join("images/rootfs");
+        std::fs::create_dir_all(&dir).unwrap();
+        for ext in ["ext4", "conf", "ok"] {
+            std::fs::write(dir.join(format!("k.{ext}")), ext).unwrap();
+        }
+        std::fs::write(root.join("k.ext4"), "elsewhere").unwrap();
+        assert!(!remove_rootfs(&root.join("images"), &root.join("k.ext4")).unwrap());
+        assert!(!remove_rootfs(&root.join("images"), &dir.join("k.conf")).unwrap());
+        assert!(root.join("k.ext4").exists() && entry_complete(&dir.join("k.ext4")));
+        // A pull building a template of it holds it until it is published.
+        let building = reserve_rootfs(&dir.join("k.ext4")).unwrap();
+        assert!(!remove_rootfs(&root.join("images"), &dir.join("k.ext4")).unwrap());
+        assert!(entry_complete(&dir.join("k.ext4")));
+        drop(building);
+        assert!(remove_rootfs(&root.join("images"), &dir.join("k.ext4")).unwrap());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        // One removed before the build held it is refused, so the pull builds it again.
+        std::fs::write(dir.join("k.ext4"), "half").unwrap();
+        assert!(reserve_rootfs(&dir.join("k.ext4")).err().unwrap().to_string().contains("was removed"));
     }
 
     #[test]

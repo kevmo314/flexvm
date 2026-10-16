@@ -35,6 +35,40 @@ impl Reference {
         Ok(Reference { registry, repository, reference })
     }
 
+    /// Docker's short form of the repository: `nginx` for Docker Hub's `library/nginx`,
+    /// `traefik/whoami` for its other repositories, `ghcr.io/org/app` elsewhere.
+    pub fn familiar_repository(&self) -> String {
+        match self.registry.as_str() {
+            "registry-1.docker.io" => self.repository.strip_prefix("library/").filter(|r| !r.contains('/')).unwrap_or(&self.repository).to_string(),
+            r => format!("{r}/{}", self.repository),
+        }
+    }
+
+    pub fn is_digest(&self) -> bool {
+        self.reference.starts_with("sha256:")
+    }
+
+    /// `ubuntu:24.04`, `nginx:latest`, `ghcr.io/org/app@sha256:...`.
+    pub fn familiar(&self) -> String {
+        let sep = if self.is_digest() { '@' } else { ':' };
+        format!("{}{sep}{}", self.familiar_repository(), self.reference)
+    }
+
+    /// The name of the template pulled from this reference: its familiar form without a
+    /// `:latest` tag, with `/` written `+` (which no reference has), so it is one file name
+    /// and `from_template_name` gives the reference back.
+    pub fn template_name(&self) -> String {
+        let name = match self.reference.as_str() {
+            "latest" => self.familiar_repository(),
+            _ => self.familiar(),
+        };
+        name.replace('/', "+")
+    }
+
+    pub fn from_template_name(name: &str) -> Result<Reference> {
+        Reference::parse(&name.replace('+', "/"))
+    }
+
     /// The registry's host, without its port (or an IPv6 literal's brackets).
     pub fn host(&self) -> &str {
         match self.registry.strip_prefix('[') {
@@ -54,7 +88,7 @@ impl Reference {
 
 impl std::fmt::Display for Reference {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let sep = if self.reference.starts_with("sha256:") { '@' } else { ':' };
+        let sep = if self.is_digest() { '@' } else { ':' };
         write!(f, "{}/{}{sep}{}", self.registry, self.repository, self.reference)
     }
 }
@@ -89,5 +123,33 @@ mod tests {
         assert_eq!(Reference::parse("localhost/x").unwrap().base_url(), "http://localhost/v2/x");
         assert_eq!(Reference::parse("ghcr.io/o/a").unwrap().base_url(), "https://ghcr.io/v2/o/a");
         assert!(Reference::parse("nginx@sha256:abc").is_err());
+    }
+
+    #[test]
+    fn template_names_are_familiar_file_names_and_reversible() {
+        let d = "sha256:".to_string() + &"b".repeat(64);
+        let digest = format!("ghcr.io+org+app@{d}");
+        for (r, name) in [
+            ("ubuntu:24.04", "ubuntu:24.04"),
+            ("docker.io/library/ubuntu:24.04", "ubuntu:24.04"),
+            ("index.docker.io/ubuntu:24.04", "ubuntu:24.04"),
+            ("nginx", "nginx"),
+            ("nginx:latest", "nginx"),
+            ("ci", "ci"),
+            ("docker.io/traefik/whoami:v1", "traefik+whoami:v1"),
+            ("ghcr.io/org/app:V1.2", "ghcr.io+org+app:V1.2"),
+            (&format!("ghcr.io/org/app:v1@{d}"), &digest),
+            ("localhost:5000/x", "localhost:5000+x"),
+            ("localhost/x/y:z", "localhost+x+y:z"),
+            ("public.ecr.aws/docker/library/busybox:1.36", "public.ecr.aws+docker+library+busybox:1.36"),
+        ] {
+            let parsed = Reference::parse(r).unwrap();
+            assert_eq!(parsed.template_name(), name, "{r}");
+            assert!(!name.contains('/'));
+            assert_eq!(Reference::from_template_name(name).unwrap(), parsed, "{r}");
+            assert_eq!(Reference::parse(&parsed.familiar()).unwrap(), parsed, "{r}");
+        }
+        assert_eq!(Reference::parse("nginx").unwrap().familiar(), "nginx:latest");
+        assert_eq!(Reference::parse("quay.io/a/b").unwrap().familiar(), "quay.io/a/b:latest");
     }
 }

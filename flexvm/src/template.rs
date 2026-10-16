@@ -11,12 +11,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::bail;
 use crate::fc::{memory_timeout, Firecracker};
 use crate::guest;
-use crate::image::ImageMeta;
+use crate::image::{ImageMeta, Reference};
 use crate::socket::SocketRoot;
 use crate::util::{ms, retry, Result, PAGE_SIZE};
 
@@ -54,9 +54,25 @@ pub struct Meta {
     components: BTreeMap<String, Component>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<ImageMeta>,
+    /// `recipe()` of the build: a pull of the same image skips the build only if it matches.
+    #[serde(default)]
+    pub recipe: String,
 }
 
 pub const FORMAT_VERSION: u64 = 2;
+
+/// What a build does that its inputs do not record: the boot command line, the memory and
+/// device layout, flexvm's version. Not part of the content id (generations stay compatible).
+pub fn recipe() -> String {
+    let mut h = Hash::new();
+    h.word(FORMAT_VERSION);
+    for w in [SLOT_MIB, STEP_MIB, BALLOON_STATS_S as u64] {
+        h.word(w);
+    }
+    h.update(BOOT_ARGS.as_bytes());
+    h.update(env!("CARGO_PKG_VERSION").as_bytes());
+    h.finish()
+}
 
 /// ctime changes with every write (and with rewrites that restore mtime); a rename or copy
 /// changes the inode.
@@ -182,7 +198,7 @@ impl Meta {
             } else if pinned {
                 "this checkpoint or suspended VM pins this template generation; rebuilding the named template cannot repair it"
             } else {
-                "rebuild it with `flexvm template`"
+                "pull it again with `flexvm pull`"
             };
             format!("template {}: {error}; {hint}", display.display()).into()
         })
@@ -213,7 +229,7 @@ impl Meta {
         let files = self.files(paths, dir);
         let named = self.components.len() == files.len() && files.iter().all(|(name, _)| self.components.contains_key(*name));
         if !named || !valid_id(&self.id) || content_id(&self.components, self.image.as_ref()) != self.id {
-            bail!("template at {} has no valid content id; recreate it with `flexvm template`", dir.display());
+            bail!("template at {} has no valid content id; pull it again with `flexvm pull`", dir.display());
         }
         let mut rehashed = false;
         let mut written: Option<Option<Meta>> = None;
@@ -249,7 +265,6 @@ impl Meta {
 pub struct Paths {
     pub firecracker: PathBuf,
     pub kernel: PathBuf,
-    pub rootfs: PathBuf,
     pub templates: PathBuf,
 }
 
@@ -259,7 +274,7 @@ impl Paths {
     pub fn new(state: &Path) -> Self {
         let a = state.join("artifacts");
         let a = a.canonicalize().unwrap_or(a);
-        Paths { firecracker: a.join("firecracker"), kernel: a.join("vmlinux"), rootfs: a.join("rootfs.ext4"), templates: state.join("templates") }
+        Paths { firecracker: a.join("firecracker"), kernel: a.join("vmlinux"), templates: state.join("templates") }
     }
 }
 
@@ -283,6 +298,9 @@ pub struct Template {
     /// The directory as opened, through `_handle`, whatever its path refers to now.
     fixed: PathBuf,
     _handle: File,
+    /// Its use lock, held shared while it is open: `rmi` never removes a generation a VM
+    /// process (starting, standing by or running) has open.
+    _use: crate::host::Flock,
 }
 
 unsafe impl Send for Template {}
@@ -296,9 +314,32 @@ const MAX_LOAD_SET: usize = 512;
 /// Template builds' guest commands, on a possibly loaded host.
 const EXEC_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// A template name is a file name in the templates directory, never a path.
+/// What `run` (without `--template`) uses, pulled when missing.
+pub const DEFAULT_IMAGE: &str = "ubuntu:24.04";
+
+/// Room for the build's lock and staging names around it in one file name (255 bytes).
+pub const MAX_NAME: usize = 200;
+
+/// A template name is a file name in the templates directory, never a path: the
+/// `Reference::template_name` of an image reference (`name_of`).
 pub fn check_name(name: &str) -> Result<()> {
-    crate::host::check_name(name).map_err(|_| format!("bad template name {name:?}: up to 64 letters, digits, '-', '_' or '.', not starting with '.'").into())
+    if name.is_empty() || name.len() > MAX_NAME || name.starts_with('.') || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.+:@".contains(&b)) {
+        bail!("bad template name {name:?}: up to {MAX_NAME} letters, digits, '-', '_', '.', '+', ':' or '@', not starting with '.'");
+    }
+    Ok(())
+}
+
+/// The template an image reference names (`ubuntu:24.04`, `docker.io/library/nginx:latest`
+/// is `nginx`, `ghcr.io/org/app:v1` is `ghcr.io+org+app:v1`); a template's own name names itself.
+pub fn name_of(image: &str) -> Result<String> {
+    let name = Reference::from_template_name(image).map_err(|e| format!("{e}: not an image reference or template name"))?.template_name();
+    check_name(&name)?;
+    Ok(name)
+}
+
+/// The image reference a template name stands for (`nginx` is `nginx:latest`), as users write it.
+pub fn image_of(name: &str) -> String {
+    Reference::from_template_name(name).map_or_else(|_| name.to_string(), |r| r.familiar())
 }
 
 /// Content ids are hex (`Hash::finish`), so one is a file name too.
@@ -313,10 +354,10 @@ impl Template {
         match std::fs::read_link(&link) {
             Ok(target) => Ok(paths.templates.join(target)),
             Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
-                bail!("template {name:?} is not a symlink; remove {} and rebuild it: flexvm template {name}", link.display())
+                bail!("template {name:?} is not a symlink; remove {} and pull it again: flexvm pull {}", link.display(), image_of(name))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                bail!("no template {name:?} in {} (build it: flexvm template {name})", paths.templates.display())
+                bail!("no image {} in {} (pull it: flexvm pull {0})", image_of(name), paths.templates.display())
             }
             Err(e) => bail!("template {name:?}: {e}"),
         }
@@ -355,6 +396,12 @@ impl Template {
     fn open_dir_with_context(name: &str, dir: PathBuf, pinned: bool) -> Result<Arc<Template>> {
         // All reads, the vmstate Firecracker loads included, go through one directory handle.
         let handle = File::open(&dir).map_err(|e| format!("template {name:?}: {e}"))?;
+        let st = crate::util::fstat(handle.as_raw_fd())?;
+        let _use = crate::host::shared_at(&crate::host::host_locks()?, &crate::host::use_lock(&st))?;
+        // Removed (`rmi`) before the lock was ours: what the handle reads is gone.
+        if std::fs::metadata(&dir).ok().map(|m| (m.dev(), m.ino())) != Some((st.st_dev, st.st_ino)) {
+            bail!("template {name:?} was removed (flexvm rmi) as it was opened");
+        }
         let fixed = PathBuf::from(format!("/proc/{}/fd/{}", std::process::id(), handle.as_raw_fd()));
         let meta = Meta::read_from(&fixed, &dir, pinned).map_err(|e| format!("template {name:?}: {e}"))?;
         let file = File::open(fixed.join("mem"))?;
@@ -377,6 +424,7 @@ impl Template {
             verified: Mutex::default(),
             fixed,
             _handle: handle,
+            _use,
         }))
     }
 
@@ -573,7 +621,7 @@ fn record_working_set(paths: &Paths, dir: &Path, tap: &str, sockets: &Arc<Socket
     fc.resume(crate::fc::API_TIMEOUT)?;
     retry(Duration::from_secs(10), Duration::from_millis(10), || guest::ping(&fc.sockets.vsock))?;
     guest::start(&fc.sockets.vsock, "10.255.255.254".parse()?, None)?;
-    if tpl.meta.image.as_ref().is_some_and(|i| !i.warm) {
+    if tpl.meta.image.as_ref().is_some_and(|i| i.starts_at_run()) {
         guest::start_app(&fc.sockets.vsock)?;
     }
     // An exec records the session path's pages, so the first exec after a restore is fast;
@@ -761,12 +809,58 @@ fn sweep(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn create(paths: &Paths, name: &str, vcpus: u32, mem_mib: u64, max_mib: u64, plug_mib: u64, image: Option<ImageMeta>, tap: &str) -> Result<()> {
+/// A template's sizes, fixed in its snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Size {
+    pub vcpus: u32,
+    /// Boot memory.
+    pub mem_mib: u64,
+    /// Boot memory plus the hotplug region, which is rounded down to whole slots.
+    pub max_mib: u64,
+    /// Plugged in the snapshot, rounded down to whole steps and to the hotplug region.
+    pub plug_mib: u64,
+}
+
+impl Size {
+    fn hotplug_mib(&self) -> u64 {
+        self.max_mib.saturating_sub(self.mem_mib) / SLOT_MIB * SLOT_MIB
+    }
+
+    fn plugged_mib(&self) -> u64 {
+        self.plug_mib.min(self.hotplug_mib()) / STEP_MIB * STEP_MIB
+    }
+}
+
+/// The content id of `name`'s generation if building it again from `rootfs` and `image` would
+/// make the same template: the same image, app and root filesystem, sizes, recipe, and kernel
+/// and Firecracker (by content), and its files intact. A moved tag, new options or replaced
+/// artifacts make a new generation; this only spares an identical rebuild.
+pub fn up_to_date(paths: &Paths, name: &str, size: Size, rootfs: &Path, image: &ImageMeta) -> Option<String> {
+    let dir = Template::resolve(paths, name).ok()?;
+    let meta = Meta::read(&dir).ok()?;
+    let same_image = meta.image.as_ref().is_some_and(|i| {
+        (&i.digest, &i.config_digest, &i.app_conf, &i.argv, i.warm) == (&image.digest, &image.config_digest, &image.app_conf, &image.argv, image.warm)
+            && serde_json::to_value(&i.ready).ok() == serde_json::to_value(&image.ready).ok()
+    });
+    let sizes = (meta.vcpus, meta.mem_mib, meta.max_mib, meta.plugged_mib) == (size.vcpus, size.mem_mib, size.mem_mib + size.hotplug_mib(), size.plugged_mib());
+    if !same_image || !sizes || meta.recipe != recipe() || std::fs::canonicalize(rootfs).ok()? != meta.rootfs {
+        return None;
+    }
+    let kernel = std::fs::canonicalize(&paths.kernel).ok()?;
+    if meta.components.get("kernel")?.hash != hash_file(&kernel).ok()?.hash {
+        return None;
+    }
+    // Firecracker, the root filesystem and the snapshot files (rehashed if their stat changed).
+    meta.verify(paths, &dir, &mut BTreeMap::new()).ok()?;
+    Some(meta.id)
+}
+
+/// Builds `name` from an image's root filesystem and publishes it as a new generation.
+pub fn create(paths: &Paths, name: &str, size: Size, rootfs: &Path, image: ImageMeta, tap: &str) -> Result<()> {
     // The caller owns `tap` through image preparation and the build.
     // Running VMs map the old files, which must not be rewritten under them.
     let staging = Staging::new(paths, name)?;
-    build(paths, &staging.dir, name, vcpus, mem_mib, max_mib, plug_mib, tap, image).map_err(|e| format!("template {name:?}: {e}"))?;
+    build(paths, &staging.dir, name, size, rootfs, tap, image).map_err(|e| format!("template {name:?}: {e}"))?;
     interrupted()?;
     let paths = &Paths { templates: staging.parent.path.clone(), ..paths.clone() };
     publish(paths, name, &staging.dir, interrupted)
@@ -810,14 +904,13 @@ fn publish(paths: &Paths, name: &str, staged: &Path, check_interrupt: impl FnOnc
     Ok(crate::util::sync_dir(&paths.templates)?)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build(paths: &Paths, dir: &Path, name: &str, vcpus: u32, mem_mib: u64, max_mib: u64, plug_mib: u64, tap: &str, image: Option<ImageMeta>) -> Result<()> {
+fn build(paths: &Paths, dir: &Path, name: &str, size: Size, rootfs: &Path, tap: &str, image: ImageMeta) -> Result<()> {
+    let Size { vcpus, mem_mib, max_mib, plug_mib } = size;
     let run = dir.join("boot");
     std::fs::create_dir_all(&run)?;
 
-    // rootfs.ext4 is a symlink a rebuild repoints; the snapshot's page cache needs these bytes.
-    let rootfs = std::fs::canonicalize(&paths.rootfs)
-        .map_err(|e| format!("{}: {e} (build it: scripts/build-rootfs.sh, or give --image REF)", paths.rootfs.display()))?;
+    // The image cache's file itself: the snapshot's page cache needs these bytes.
+    let rootfs = std::fs::canonicalize(rootfs).map_err(|e| format!("{}: {e}", rootfs.display()))?;
     // Downloaded on first use if missing (`artifacts`): every later VM restores with the Firecracker built with.
     crate::artifacts::ensure(&[(&paths.kernel, &crate::artifacts::KERNEL), (&paths.firecracker, &crate::artifacts::FIRECRACKER)])?;
     let kernel = std::fs::canonicalize(&paths.kernel).map_err(|e| format!("{}: {e} (fetch it: scripts/fetch.sh)", paths.kernel.display()))?;
@@ -846,18 +939,11 @@ fn build(paths: &Paths, dir: &Path, name: &str, vcpus: u32, mem_mib: u64, max_mi
     interrupted()?;
     let plugged = plug(&fc, plug_mib.min(hotplug) / STEP_MIB * STEP_MIB)?;
 
-    match &image {
-        Some(img) => {
-            if img.warm {
-                crate::image::warm_up(&vsock, img)?;
-            }
-            // Images may have no shell.
-            guest::quiesce(&vsock)?;
-        }
-        None => {
-            guest::exec(&vsock, "sync; echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory", EXEC_TIMEOUT)?;
-        }
+    if image.warm {
+        crate::image::warm_up(&vsock, &image)?;
     }
+    // Images may have no shell.
+    guest::quiesce(&vsock)?;
     interrupted()?;
     let (reported, done) = wait_reporting_done(&fc, &metrics, plugged * 3 / 4)?;
     if !done {
@@ -893,7 +979,8 @@ fn build(paths: &Paths, dir: &Path, name: &str, vcpus: u32, mem_mib: u64, max_mi
         rootfs,
         id: String::new(),
         components: BTreeMap::new(),
-        image,
+        image: Some(image),
+        recipe: recipe(),
     };
     meta.identify(paths, dir)?;
     std::fs::write(dir.join("meta.json"), serde_json::to_vec_pretty(&meta)?)?;
@@ -912,6 +999,165 @@ fn build(paths: &Paths, dir: &Path, name: &str, vcpus: u32, mem_mib: u64, max_mi
         wset >> 20
     ))?;
     Ok(())
+}
+
+/// The names in the templates directory (links to generations) and the generations they link to.
+fn names(templates: &Path) -> Result<Vec<(String, String)>> {
+    let entries = match std::fs::read_dir(templates) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        r => r?,
+    };
+    let mut out = vec![];
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if check_name(&name).is_err() || !entry.file_type()?.is_symlink() {
+            continue;
+        }
+        let target = std::fs::read_link(entry.path())?;
+        let id = target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        out.push((name, id));
+    }
+    out.sort();
+    Ok(out)
+}
+
+fn generations(templates: &Path) -> Result<Vec<String>> {
+    let entries = match std::fs::read_dir(templates.join(GENERATIONS)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        r => r?,
+    };
+    let mut ids = vec![];
+    for entry in entries {
+        let entry = entry?;
+        let id = entry.file_name().to_string_lossy().into_owned();
+        if valid_id(&id) && entry.file_type()?.is_dir() {
+            ids.push(id);
+        }
+    }
+    ids.sort();
+    Ok(ids)
+}
+
+fn describe(name: Option<&str>, id: &str, dir: &Path) -> Value {
+    let (repository, tag) = match name.map(Reference::from_template_name) {
+        Some(Ok(r)) => (r.familiar_repository(), r.reference.clone()),
+        Some(Err(_)) => (name.unwrap_or_default().to_string(), String::new()),
+        None => ("<none>".into(), "<none>".into()),
+    };
+    // The snapshot's time: its vmstate is never rewritten (meta.json is, with stamps).
+    let created = std::fs::metadata(dir.join("vmstate"))
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs());
+    let mut v = json!({"name": name, "repository": repository, "tag": tag, "id": id, "created": created});
+    match Meta::read(dir) {
+        Ok(m) => {
+            // What it holds on disk: its memory file's blocks and its image's root filesystem.
+            let blocks = std::fs::metadata(dir.join("mem")).map_or(0, |m| m.blocks() * 512);
+            let rootfs = std::fs::metadata(&m.rootfs).map_or(0, |m| m.len());
+            v["vcpus"] = json!(m.vcpus);
+            v["mem_mib"] = json!(m.mem_mib);
+            v["max_mib"] = json!(m.max_mib);
+            v["plugged_mib"] = json!(m.plugged_mib);
+            v["size_mib"] = json!((blocks + rootfs) >> 20);
+            if let Some(i) = &m.image {
+                v["source"] = json!(i.source);
+                v["digest"] = json!(i.digest);
+                v["app"] = json!(i.argv);
+                v["warm"] = json!(i.warm);
+            }
+        }
+        Err(e) => v["error"] = json!(e.to_string()),
+    }
+    v
+}
+
+/// `flexvm images`: every name, and the generations no name links to (`<none>`, kept for VMs
+/// and checkpoints of earlier pulls until `rmi ID`).
+pub fn images(paths: &Paths) -> Result<Vec<Value>> {
+    let names = names(&paths.templates)?;
+    let gens = paths.templates.join(GENERATIONS);
+    let mut out: Vec<Value> = names.iter().map(|(name, id)| describe(Some(name), id, &gens.join(id))).collect();
+    for id in generations(&paths.templates)? {
+        if !names.iter().any(|(_, i)| *i == id) {
+            out.push(describe(None, &id, &gens.join(&id)));
+        }
+    }
+    Ok(out)
+}
+
+/// The generation `rmi` means by `id`: a whole content id or a prefix of only one.
+pub fn generation_by_prefix(paths: &Paths, id: &str) -> Result<String> {
+    if id.len() < 4 || !valid_id(id) {
+        bail!("no image {id:?}");
+    }
+    let found: Vec<String> = generations(&paths.templates)?.into_iter().filter(|g| g.starts_with(id)).collect();
+    match found.as_slice() {
+        [one] => Ok(one.clone()),
+        [] => bail!("no image {id:?}"),
+        _ => bail!("{id:?} is the start of {} image ids; give more of it", found.len()),
+    }
+}
+
+/// `rmi`: removes the name `name` (if given), then the generation `id` (the one the name linked to)
+/// unless a name still links to it or a VM here uses it (`in_use`, content ids), and the image
+/// root filesystems that no generation left uses. The caller checked that no VM uses the name.
+pub fn remove(paths: &Paths, images: &Path, name: Option<&str>, id: &str, in_use: &BTreeSet<String>) -> Result<Value> {
+    let parent = crate::host::Directory::open(&paths.templates)?;
+    let paths = &Paths { templates: parent.path.clone(), ..paths.clone() };
+    // No build publishes meanwhile (they take it shared).
+    let _l = templates_lock(paths, libc::LOCK_EX)?;
+    if let Some(name) = name {
+        check_name(name)?;
+        let link = paths.templates.join(name);
+        if std::fs::read_link(&link)?.file_name() != Some(id.as_ref()) {
+            bail!("image {} was pulled again meanwhile; try again", image_of(name));
+        }
+        std::fs::remove_file(&link)?;
+        crate::util::sync_dir(&paths.templates)?;
+    }
+    let names = names(&paths.templates)?;
+    if let Some((other, _)) = names.iter().find(|(_, i)| i == id) {
+        if name.is_none() {
+            bail!("image {id} is {}; remove that: flexvm rmi {0}", image_of(other));
+        }
+        return Ok(json!({"untagged": name, "kept": id, "reason": format!("{} is the same image", image_of(other))}));
+    }
+    if in_use.contains(id) {
+        if name.is_none() {
+            bail!("image {id} is used by a VM here");
+        }
+        return Ok(json!({"untagged": name, "kept": id, "reason": "used by a VM here"}));
+    }
+    let gens = paths.templates.join(GENERATIONS);
+    // Kept while a VM process has it open (one starting has no registry entry yet).
+    let st = crate::util::fstat(File::open(gens.join(id))?.as_raw_fd())?;
+    let _use = match crate::host::lock_at(crate::host::host_locks()?, &crate::host::use_lock(&st), libc::LOCK_EX | libc::LOCK_NB) {
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            if name.is_none() {
+                bail!("image {id} is open in a VM process here");
+            }
+            return Ok(json!({"untagged": name, "kept": id, "reason": "open in a VM process here"}));
+        }
+        r => r?,
+    };
+    let rootfs = Meta::read(&gens.join(id)).map(|m| m.rootfs);
+    std::fs::remove_dir_all(gens.join(id))?;
+    crate::util::sync_dir(&gens)?;
+    // Its root filesystem, unless another generation (whose record is readable) uses it.
+    let mut removed_rootfs = None;
+    if let Ok(rootfs) = rootfs {
+        let mut used = false;
+        for g in generations(&paths.templates)? {
+            used |= Meta::read(&gens.join(&g)).map_or(true, |m| m.rootfs == rootfs);
+        }
+        if !used && crate::image::remove_rootfs(images, &rootfs)? {
+            removed_rootfs = Some(rootfs);
+        }
+    }
+    Ok(json!({"untagged": name, "deleted": id, "rootfs": removed_rootfs}))
 }
 
 #[cfg(test)]
@@ -940,9 +1186,9 @@ mod tests {
     fn missing_kernel_names_the_fetch_script_before_spawning() {
         let dir = crate::test_util::TempDir::new("kernel");
         let paths = Paths::new(&dir);
-        std::fs::create_dir_all(paths.rootfs.parent().unwrap()).unwrap();
-        std::fs::write(&paths.rootfs, b"rootfs").unwrap();
-        let error = build(&paths, &dir.join("build"), "test", 1, 256, 256, 256, "unused", None).unwrap_err().to_string();
+        std::fs::write(dir.join("rootfs"), b"rootfs").unwrap();
+        let size = Size { vcpus: 1, mem_mib: 256, max_mib: 256, plug_mib: 256 };
+        let error = build(&paths, &dir.join("build"), "test", size, &dir.join("rootfs"), "unused", image("sha256:a", "")).unwrap_err().to_string();
         assert!(error.starts_with(&format!("{}:", paths.kernel.display())), "{error}");
         assert!(error.contains("scripts/fetch.sh"), "{error}");
     }
@@ -957,6 +1203,19 @@ mod tests {
         }
     }
 
+    fn image(digest: &str, conf: &str) -> ImageMeta {
+        ImageMeta {
+            source: "x".into(),
+            digest: digest.into(),
+            config_digest: "sha256:c".into(),
+            app_conf: conf.into(),
+            argv: vec!["/x".into()],
+            warm: false,
+            ready: None,
+            ready_timeout: Duration::ZERO,
+        }
+    }
+
     struct Fixture {
         paths: Paths,
         dir: crate::test_util::TempDir,
@@ -966,7 +1225,7 @@ mod tests {
     impl Fixture {
         fn new() -> Self {
             let dir = crate::test_util::TempDir::new("template");
-            let paths = Paths { firecracker: dir.join("firecracker"), kernel: dir.join("kernel"), rootfs: dir.join("rootfs"), templates: dir.clone() };
+            let paths = Paths { firecracker: dir.join("firecracker"), kernel: dir.join("kernel"), templates: dir.clone() };
             let mut meta = Meta {
                 compatibility: crate::compat::Compat {
                     cpu: String::new(),
@@ -982,10 +1241,11 @@ mod tests {
                 max_mib: 1024,
                 plugged_mib: 0,
                 kernel: paths.kernel.clone(),
-                rootfs: paths.rootfs.clone(),
+                rootfs: dir.join("rootfs"),
                 id: String::new(),
                 components: BTreeMap::new(),
                 image: None,
+                recipe: String::new(),
             };
             for (name, path) in meta.files(&paths, &dir) {
                 std::fs::write(path, name.as_bytes()).unwrap();
@@ -1027,7 +1287,7 @@ mod tests {
             meta.as_object_mut().unwrap().remove(field);
             std::fs::write(f.dir.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
             let error = Meta::read(&f.dir).unwrap_err().to_string();
-            assert!(error.contains(field) && error.contains("rebuild it with `flexvm template`"), "{error}");
+            assert!(error.contains(field) && error.contains("pull it again with `flexvm pull`"), "{error}");
         }
     }
 
@@ -1054,7 +1314,7 @@ mod tests {
             assert!(!error.contains("/proc/") && !error.contains("rebuild"), "{error}");
             // Fresh template loads retain the useful rebuild hint and a real path too.
             let error = f.open().err().unwrap().to_string();
-            assert!(error.contains(&f.dir.display().to_string()) && error.contains("rebuild it"), "{error}");
+            assert!(error.contains(&f.dir.display().to_string()) && error.contains("pull it again"), "{error}");
             assert!(!error.contains("/proc/"), "{error}");
         }
     }
@@ -1065,7 +1325,7 @@ mod tests {
         let entry = f.paths.templates.join("t");
         std::fs::create_dir(&entry).unwrap();
         let error = Template::resolve(&f.paths, "t").unwrap_err().to_string();
-        assert!(error.contains("not a symlink") && error.contains("rebuild"), "{error}");
+        assert!(error.contains("not a symlink") && error.contains("pull it again"), "{error}");
         std::fs::remove_dir(&entry).unwrap();
         std::fs::write(&entry, b"").unwrap();
         assert!(Template::resolve(&f.paths, "t").is_err());
@@ -1131,6 +1391,130 @@ mod tests {
     }
 
     #[test]
+    fn image_references_name_templates() {
+        let digest = format!("ghcr.io+o+a@sha256:{}", "c".repeat(64));
+        for ok in ["ubuntu:24.04", "nginx", "ci", "ghcr.io+o+a:V1", "localhost:5000+x", &digest] {
+            check_name(ok).unwrap();
+        }
+        for bad in ["", "a/b", ".x", "../x", "a b", "[::1]:5000+x", &"a".repeat(MAX_NAME + 1)] {
+            assert!(check_name(bad).is_err(), "{bad}");
+        }
+        for (arg, name) in [
+            ("ubuntu:24.04", "ubuntu:24.04"),
+            ("docker.io/library/nginx:latest", "nginx"),
+            ("nginx:latest", "nginx"),
+            ("ci", "ci"),
+            ("ghcr.io/o/a:v1", "ghcr.io+o+a:v1"),
+            ("ghcr.io+o+a:v1", "ghcr.io+o+a:v1"),
+        ] {
+            assert_eq!(name_of(arg).unwrap(), name, "{arg}");
+        }
+        assert!(name_of("Upper").is_err());
+        assert!(name_of(".typo").unwrap_err().to_string().contains("bad template name"));
+        assert!(name_of("[::1]:5000/x").is_err());
+        assert_eq!(image_of("nginx"), "nginx:latest");
+        assert_eq!(image_of("ghcr.io+o+a:v1"), "ghcr.io/o/a:v1");
+        assert_eq!(name_of(DEFAULT_IMAGE).unwrap(), DEFAULT_IMAGE);
+    }
+
+    /// Publishes a generation `id` of `name` with the fixture's files and `meta`.
+    fn publish_as(f: &Fixture, name: &str, meta: &Meta) {
+        let dir = f.dir.join(format!(".{name}.new-{}", meta.id));
+        std::fs::create_dir_all(&dir).unwrap();
+        for file in ["vmstate", "mem"] {
+            std::fs::copy(f.dir.join(file), dir.join(file)).unwrap();
+        }
+        f.write_meta(meta, &dir);
+        publish(&f.paths, name, &dir, || Ok(())).unwrap();
+    }
+
+    #[test]
+    fn pulling_again_rebuilds_only_what_changed() {
+        let f = Fixture::new();
+        let rootfs = std::fs::canonicalize(&f.meta.rootfs).unwrap();
+        let size = Size { vcpus: 2, mem_mib: 256, max_mib: 256 + 1024 + 100, plug_mib: 4096 };
+        let mut meta =
+            Meta { rootfs: rootfs.clone(), max_mib: 1280, plugged_mib: 1024, image: Some(image("sha256:a", "arg /x\n")), recipe: recipe(), ..f.meta.clone() };
+        meta.identify(&f.paths, &f.dir).unwrap();
+        publish_as(&f, "t", &meta);
+        let img = image("sha256:a", "arg /x\n");
+        assert_eq!(up_to_date(&f.paths, "t", size, &rootfs, &img), Some(meta.id.clone()));
+        assert_eq!(up_to_date(&f.paths, "other", size, &rootfs, &img), None);
+        // A moved tag (another manifest), another app, other sizes or root filesystem.
+        assert_eq!(up_to_date(&f.paths, "t", size, &rootfs, &image("sha256:b", "arg /x\n")), None);
+        assert_eq!(up_to_date(&f.paths, "t", size, &rootfs, &image("sha256:a", "arg /y\n")), None);
+        assert_eq!(up_to_date(&f.paths, "t", Size { vcpus: 4, ..size }, &rootfs, &img), None);
+        assert_eq!(up_to_date(&f.paths, "t", Size { plug_mib: 512, ..size }, &rootfs, &img), None);
+        assert_eq!(up_to_date(&f.paths, "t", size, &f.paths.kernel, &img), None);
+        // A build by another recipe, or with another kernel or Firecracker.
+        let gen = Template::resolve(&f.paths, "t").unwrap();
+        f.write_meta(&Meta { recipe: String::new(), ..meta.clone() }, &gen);
+        assert_eq!(up_to_date(&f.paths, "t", size, &rootfs, &img), None);
+        f.write_meta(&meta, &gen);
+        assert!(up_to_date(&f.paths, "t", size, &rootfs, &img).is_some());
+        f.replace("kernel", b"another kernel");
+        assert_eq!(up_to_date(&f.paths, "t", size, &rootfs, &img), None);
+        f.replace("kernel", b"kernel");
+        assert!(up_to_date(&f.paths, "t", size, &rootfs, &img).is_some());
+        f.replace("firecracker", b"another firecracker");
+        assert_eq!(up_to_date(&f.paths, "t", size, &rootfs, &img), None);
+    }
+
+    #[test]
+    fn rmi_removes_names_and_unused_generations_only() {
+        let f = Fixture::new();
+        let images_dir = f.dir.join("images");
+        let gen = |id: &str| Meta { id: id.into(), image: Some(image("sha256:a", "")), ..f.meta.clone() };
+        // t was pulled twice (aaaa1111 is an earlier pull's), u once.
+        publish_as(&f, "t", &gen("aaaa1111"));
+        publish_as(&f, "t", &gen("bbbb2222"));
+        publish_as(&f, "u", &gen("cccc3333"));
+        let listed = images(&f.paths).unwrap();
+        let rows: Vec<(String, String)> = listed.iter().map(|v| (v["repository"].as_str().unwrap().into(), v["id"].as_str().unwrap().into())).collect();
+        assert_eq!(rows, [("t".into(), "bbbb2222".into()), ("u".into(), "cccc3333".into()), ("<none>".into(), "aaaa1111".into())]);
+        assert_eq!(listed[0]["tag"], "latest");
+        let none = BTreeSet::new();
+        // Generations by id: only one no name links to and no VM uses.
+        assert_eq!(generation_by_prefix(&f.paths, "aaaa").unwrap(), "aaaa1111");
+        assert!(generation_by_prefix(&f.paths, "aaa").is_err());
+        assert!(generation_by_prefix(&f.paths, "dddd").is_err());
+        assert!(remove(&f.paths, &images_dir, None, "cccc3333", &none).unwrap_err().to_string().contains("flexvm rmi u:latest"));
+        let vm = BTreeSet::from(["aaaa1111".to_string()]);
+        assert!(remove(&f.paths, &images_dir, None, "aaaa1111", &vm).is_err());
+        // A name goes; its generation too, unless a VM here uses it.
+        let r = remove(&f.paths, &images_dir, Some("t"), "bbbb2222", &none).unwrap();
+        assert_eq!(r["deleted"], "bbbb2222");
+        assert!(Template::resolve(&f.paths, "t").is_err() && Template::generation(&f.paths, "bbbb2222").is_none());
+        assert!(Template::generation(&f.paths, "aaaa1111").is_some(), "an earlier pull's stays for its VMs");
+        let used = BTreeSet::from(["cccc3333".to_string()]);
+        assert_eq!(remove(&f.paths, &images_dir, Some("u"), "cccc3333", &used).unwrap()["kept"], "cccc3333");
+        assert!(Template::resolve(&f.paths, "u").is_err() && Template::generation(&f.paths, "cccc3333").is_some());
+        assert_eq!(remove(&f.paths, &images_dir, None, "aaaa1111", &none).unwrap()["deleted"], "aaaa1111");
+        // A name pulled again since it was looked up is left alone.
+        publish_as(&f, "v", &gen("dddd4444"));
+        assert!(remove(&f.paths, &images_dir, Some("v"), "cccc3333", &none).unwrap_err().to_string().contains("pulled again"));
+        assert!(Template::resolve(&f.paths, "v").is_ok());
+    }
+
+    #[test]
+    fn rmi_keeps_a_generation_a_vm_process_has_open() {
+        let f = Fixture::new();
+        let images_dir = f.dir.join("images");
+        publish_as(&f, "t", &Meta { id: "aaaa1111".into(), image: Some(image("sha256:a", "")), ..f.meta.clone() });
+        // A cold run between opening its template and registering its VM: no VM entry names it.
+        let starting = Template::open(&f.paths, "t").unwrap();
+        let none = BTreeSet::new();
+        let r = remove(&f.paths, &images_dir, Some("t"), "aaaa1111", &none).unwrap();
+        assert_eq!((r["kept"].as_str(), r["reason"].as_str()), (Some("aaaa1111"), Some("open in a VM process here")));
+        assert!(remove(&f.paths, &images_dir, None, "aaaa1111", &none).unwrap_err().to_string().contains("open in a VM process"));
+        assert!(Template::generation(&f.paths, "aaaa1111").is_some());
+        assert_eq!(starting.pages(0, 0).len(), 0);
+        drop(starting);
+        assert_eq!(remove(&f.paths, &images_dir, None, "aaaa1111", &none).unwrap()["deleted"], "aaaa1111");
+        assert!(Template::open_dir("t", f.dir.join(GENERATIONS).join("aaaa1111")).is_err());
+    }
+
+    #[test]
     fn publish_swaps_generations_and_keeps_them_all() {
         let f = Fixture::new();
         let stage = |id: &str| {
@@ -1182,16 +1566,6 @@ mod tests {
     #[test]
     fn image_identity_is_part_of_the_id() {
         let f = Fixture::new();
-        let image = |digest: &str, conf: &str| ImageMeta {
-            source: "x".into(),
-            digest: digest.into(),
-            config_digest: "sha256:c".into(),
-            app_conf: conf.into(),
-            argv: vec!["/x".into()],
-            warm: false,
-            ready: None,
-            ready_timeout: Duration::ZERO,
-        };
         let ids: Vec<String> = [image("sha256:a", "arg /x\n"), image("sha256:b", "arg /x\n"), image("sha256:a", "arg /y\n")]
             .iter()
             .map(|i| content_id(&f.meta.components, Some(i)))
@@ -1299,7 +1673,7 @@ mod tests {
     #[test]
     fn size_and_mtime_invalidate_cache() {
         let f = Fixture::new();
-        let file = File::options().read(true).write(true).open(&f.paths.rootfs).unwrap();
+        let file = File::options().read(true).write(true).open(&f.meta.rootfs).unwrap();
         let original = file.metadata().unwrap();
         file.set_len(original.len() + 1).unwrap();
         assert_ne!(Stamp::of(&file.metadata().unwrap()).size, original.len());
@@ -1328,7 +1702,7 @@ mod tests {
         let f = Fixture::new();
         let mut cache = BTreeMap::new();
         f.verify(&f.meta, &mut cache).unwrap();
-        let file = File::options().write(true).open(&f.paths.rootfs).unwrap();
+        let file = File::options().write(true).open(&f.meta.rootfs).unwrap();
         let before = file.metadata().unwrap();
         std::thread::sleep(Duration::from_millis(10));
         file.write_all_at(b"ROOTFS", 0).unwrap();

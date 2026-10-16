@@ -140,9 +140,9 @@ another may own; one bound to another run directory (`run.json`) is refused with
 ```
 STATE (default /var/lib/flexvm, on disk)
   artifacts/             firecracker and vmlinux (downloaded on first use from the pinned release, or as
-                         scripts/fetch.sh and build-firecracker.sh install them); base.squashfs,
-                         rootfs-HASH.ext4 and rootfs.ext4 (a symlink to the newest), as build-rootfs.sh does
-  templates/             built templates: NAME -> .gen/ID (see internals.md)
+                         scripts/fetch.sh and build-firecracker.sh install them); base.squashfs, the tests'
+                         base rootfs (scripts/fetch.sh, for scripts/test-image.py)
+  templates/             pulled images' templates: NAME -> .gen/ID (see internals.md; NAME: README.md#images)
   images/                pulled container images: blobs/sha256/, rootfs/KEY.ext4 (see images.md)
   host.json              host config (`flexvm config`'s; listen is `flexvm listen`'s): listen, peers, vm_ips, cluster_ips, underlay, announce_dev, dns, reserve_mib, evict_mib; unset ones are derived where used
   run.json               canonical run path, bound on first open under `.locks/open`'s flock; fsynced
@@ -163,7 +163,7 @@ STATE (default /var/lib/flexvm, on disk)
   migs/ID                incoming migration records (fencing), JSON, fsynced
   owed/ID                migrations away whose source was killed before it knew the outcome: target, address, generation (`Host::settle_owed`)
   evict.last             its mtime: when an eviction last started (5 s apart)
-  staging/               where image layers unpack (`template --image`); its ancestry must be root-owned
+  staging/               where image layers unpack (`pull`); its ancestry must be root-owned
 RUN (default /run/flexvm, tmpfs)
   vms/NAME.{json,sock,log}        registry entry, control socket, log of -d/standby VMs (0600)
   vms/.locks/NAME.lock            liveness lock; NAME.log, a log's writers' lock; .incoming-*.log, an arrival's lock

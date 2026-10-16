@@ -15,7 +15,7 @@ migration protocol are in [process-per-vm.md](process-per-vm.md).
 | Migration | **Post-copy**: the target gets everything ready first (template, address, a Firecracker with the template's VM structure already built); then pause, save vCPU and device state only (~20–200 KiB), load it and resume on the target, then the target's pager fetches pages from the paused source on fault and in the background. The source releases the VM once every page has arrived, and never resumes it once the target may own it. |
 | Pressure | If a VM needs to grow and the host would drop below `--reserve`, or the host is already below it, that VM is migrated to a peer with room. |
 | Network | Each VM has its own IPv4 /32 routed to a per-VM tap. The address moves with the VM, so open TCP connections survive migration. The tap's ingress (a clsact classic BPF filter) passes only IPv4 from that /32 and ARP naming it, so a guest cannot spoof another's address; it follows the address on a readdress, restore or migration. See below. |
-| Container images | `flexvm template NAME --image REF` builds the root filesystem from an OCI/Docker image; flexvm-init runs and supervises its entrypoint. See below. |
+| Container images | `flexvm pull IMAGE` builds the root filesystem from an OCI/Docker image and snapshots a VM of it as the image's template; flexvm-init runs and supervises its entrypoint. See [images.md](images.md). |
 
 ## Memory
 
@@ -687,18 +687,36 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
 (tap and neighbour setup), `fence` (host lock and generation check) and
 `route` (the route replacement).
 
-- **Count.** `flexvm standby [--template T] N` keeps N; each claimed one starts
+- **Count.** `flexvm standby [--template IMAGE] N` keeps N; each claimed one starts
   its replacement, none start unless they leave the host's eviction mark
   available (so a refill never takes the room eviction moves VMs away to
   make), and the memory controller stops them all when the host goes under
   its reserve. A standby VM also checks every second and leaves by itself
   under the reserve, so a host with no running VM relieves them too.
-- **Generations.** `flexvm template` publishes each build as an immutable
+- **Generations.** `flexvm pull` publishes each build as an immutable
   `templates/.gen/<content id>/` and points `templates/NAME` at it with one
-  atomic symlink swap. It never deletes a generation: VMs, migrations,
-  standby VMs and checkpoints refer to them by content id. Standby VMs of an
-  older generation exit; running VMs keep theirs. An incoming migration uses
-  the generation with the source's content id if the host has it.
+  atomic symlink swap, all through the templates directory as opened and
+  locked (a build's staging and publication stay in it whatever its path
+  names meanwhile). A pull that would build the same template again (same
+  image manifest, app, root filesystem, sizes, build recipe, kernel and
+  Firecracker; `template::up_to_date`) publishes nothing. Pulls never delete
+  a generation: VMs, migrations, standby VMs and checkpoints refer to them
+  by content id. Standby VMs of an older generation exit; running VMs keep
+  theirs. An incoming migration uses the generation with the source's
+  content id if the host has it. `flexvm rmi` removes a name and, under the
+  templates lock (exclusive, so no pull publishes meanwhile), its generation
+  once no other name links to it and no VM here (running, paused or
+  suspended) has its content id, and then the image root filesystem no
+  generation left uses, its `.ok` marker first and under the cache key's
+  lock, so a pull waiting for that lock builds it again. Use locks cover what
+  the registry does not show yet: every process that opens a generation (a
+  VM starting, standing by, restoring or arriving) holds its use lock
+  (`host::use_lock`, by the directory's dev and inode, in the host's lock
+  directory) shared for as long as it has it open, and a pull holds its root
+  filesystem's from `prepare` until the template is published. `rmi` takes
+  each exclusively without waiting and keeps what is held; an opener or a
+  pull that locks only after `rmi` removed it finds it gone and fails (the
+  pull builds the root filesystem again).
 - **Component identity.** The content id includes the kernel's hash from build
   time, but migration, resume and restore don't check the kernel file again: the
   running kernel is already in guest memory, so replacing `artifacts/vmlinux`

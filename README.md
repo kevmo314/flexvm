@@ -17,8 +17,8 @@ artifacts (`artifacts/`), templates (`templates/`), pulled images
 
 ```sh
 cargo build --release && sudo install target/release/flexvm /usr/local/bin/
-sudo flexvm pull ubuntu:24.04
-sudo flexvm run web
+sudo flexvm pull ubuntu:24.04    # pull an image; its template is a cold boot of it, snapshotted (needs e2fsprogs)
+sudo flexvm run web              # a VM of ubuntu:24.04 (without --template; pulled first if missing)
 ```
 
 flexvm-init (the guest's PID 1 and agent) is built by the same `cargo build`
@@ -35,8 +35,7 @@ for another state directory, then copy it over):
 
 ```sh
 ./scripts/build-firecracker.sh   # patched firecracker (needs musl-tools, libseccomp-dev)
-./scripts/fetch.sh               # guest kernel and ubuntu 24.04 base (and the release's firecracker, if none is built)
-./scripts/build-rootfs.sh        # rootfs.ext4 for `flexvm template default` (needs squashfs-tools, e2fsprogs)
+./scripts/fetch.sh               # guest kernel and the release's firecracker (if none is built), and the tests' base rootfs
 ```
 
 `FLEXVM_ARTIFACTS_URL` points the download at a mirror of the release (the
@@ -53,10 +52,11 @@ content hash), and any difference refuses it ("Firecracker differs"). Builds
 pinning the same release download the same binary; a Firecracker of your own
 is built once and copied to every host (`/var/lib/flexvm/artifacts`) rather than
 built on each. Replacing the binary also invalidates every template
-built with the old one: rebuild them. Templates themselves must be identical
-too (build once and copy `/var/lib/flexvm/templates`, or build from the same
-inputs). A template pins its rootfs by path, so one built before the state
-directory held the artifacts must be rebuilt.
+built with the old one: pull them again. Templates themselves must be identical
+too (pull once and copy `/var/lib/flexvm/templates` and `images/rootfs`, or pull
+the same image by digest with the same options). A template pins its image's
+root filesystem by path, so one pulled into another state directory must be
+pulled again.
 
 flexvm runs as root (KVM, userfaultfd, routes, cgroups); commands below
 assume that.
@@ -67,13 +67,13 @@ assume that.
 flexvm run web                  # foreground: the VM's output here, Ctrl-Z pauses, Ctrl-C destroys
 flexvm run web -d               # in the background; prints {"name", "ip", "pid", ...} once it answers
 flexvm run job -- make test     # runs one command; exits with its status, the VM goes with it
-flexvm run web --ip 10.200.0.9 --template small
+flexvm run web --ip 10.200.0.9 --template nginx:1.27   # a VM of another image (see Images)
 ```
 
 ```sh
 flexvm ls                      # --json prints the list as JSON
 NAME             IP              TEMPLATE   STATE             PID VCPU  RSS MiB  MAX MiB STARVED
-web              10.200.0.1      default    running        41522   24       27    32000
+web              10.200.0.1      ubuntu:24.04 running      41522   24       27    32000
 ```
 
 | state | meaning |
@@ -326,8 +326,8 @@ that), and `KillSignal=SIGINT` destroys it instead.
 ## Fast starts
 
 ```sh
-flexvm standby 2                 # keep 2 VMs of the default template restored and paused
-flexvm standby --template web 1
+flexvm standby 2                 # keep 2 VMs of the default image (ubuntu:24.04) restored and paused
+flexvm standby --template nginx:1.27 1
 flexvm standby 0                 # none
 ```
 
@@ -340,15 +340,61 @@ Standby sockets are `RUN/standby/HASH/PID.sock`, where HASH is the 16-hex hash
 of the template's name. Claims carry the generation key; `.locks/PID-START.lock`
 identifies the process while it lives. Socket paths must be under 108 bytes.
 
-## Templates from container images
+## Images
 
 ```sh
-flexvm template web --image nginx:1.27                       # any registry
-flexvm template app --image ./app.tar --env PORT=8080        # `docker save` output or an OCI archive
-flexvm template py --image ./oci-layout --cmd "python3 -m http.server 8000"
-flexvm template web-warm --image nginx:1.27 --warm           # snapshot the app running and ready
-flexvm run web1 --template web -d && curl http://<ip>/
+flexvm pull nginx:1.27                                  # any registry: Docker Hub, ghcr.io, gcr.io, ...
+flexvm pull ghcr.io/org/app@sha256:...                  # by digest
+flexvm pull ./app.tar --tag app --env PORT=8080         # `docker save` output or an OCI archive, named with --tag
+flexvm pull ./oci-layout --tag py --cmd "python3 -m http.server 8000"
+flexvm pull nginx:1.27 --tag web-warm --warm            # snapshot the app running and ready
+flexvm run web1 --template nginx:1.27 -d && curl http://<ip>/
+flexvm images                                           # what is pulled (--json: all of it)
+flexvm rmi nginx:1.27                                   # refused while a VM here uses it
 ```
+
+`pull` fetches an image (a native registry client; no docker needed), builds
+its root filesystem with flexvm-init as PID 1, cold-boots a VM of it and
+snapshots it once its agent answers: that snapshot, the image's *template*,
+is what every `run` restores. The image's entrypoint and command start at
+`run`; an image with neither has no app, and its VMs idle until told what to
+run (`exec`, `run -- CMD`). ubuntu:24.04's command is `bash`, which exits at
+once without a terminal: its VMs log that and idle.
+
+**Names.** A template is named after its image reference, resolved as
+`docker pull` does (`ubuntu` is `docker.io/library/ubuntu:latest`), in
+Docker's short form without a `:latest` tag and with `/` written `+` (which no
+reference has, so the name gives the reference back): `ubuntu:24.04`,
+`nginx`, `ghcr.io+org+app:v1`, `ghcr.io+org+app@sha256:...`. `--template` and
+`rmi` take any spelling of the reference, or the name. `--tag NAME[:TAG]`
+names it otherwise: an archive or layout directory needs one, and so does an
+image built with other options alongside its plain pull.
+
+**Pulling again** asks the registry again. If the image (its manifest), the
+options, the sizes, the kernel, Firecracker and flexvm's build recipe are the
+same, the template is up to date and nothing is built. Otherwise (a tag that
+moved, say) a new template generation is built and the name moves to it:
+running and suspended VMs, checkpoints and migrations of the old one keep
+using it (they name it by content id), and standby VMs of the old one are
+replaced from the new. The old generation stays, listed as `<none>` by
+`images`, until `flexvm rmi ID` removes it.
+
+**Removing.** `rmi IMAGE` removes the name and, unless a VM here still uses
+them, its generation and its root filesystem (`images/rootfs/`); `rmi ID` (or
+a unique prefix of it) removes a `<none>` generation. Both are refused while a
+VM here (running, paused or suspended) uses the image, and `rmi IMAGE` while a
+standby count asks for it. Checkpoints elsewhere that pin a removed
+generation cannot be restored here any more. Layer blobs (`images/blobs/`)
+are a download cache and stay.
+
+**Sizes** are fixed in the snapshot, so they are pull options:
+
+| option | default | what |
+|---|---|---|
+| `--vcpus N` | host CPUs, at most 32, rounded down to even | vCPUs (Firecracker cannot add vCPUs to a running VM) |
+| `--max MIB` | host RAM | memory ceiling: boot memory plus the hot-plug region, in whole 1 GiB slots |
+| `--mem MIB` | 256 + max/32, rounded up to 128 | boot memory, which holds kernel memory for the whole ceiling |
+| `--plug MIB` | 4096 | plugged in the snapshot (free until touched); a VM never shrinks below it |
 
 Overrides follow `docker run`: `--entrypoint`, `--cmd`, `--env K=V`,
 `--workdir`, `--user`. `--warm` snapshots the app once it is ready
@@ -360,10 +406,10 @@ hold no secrets at startup. Details: [docs/images.md](docs/images.md).
 
 | flag | default | what |
 |---|---|---|
-| `--state DIR` | `/var/lib/flexvm` | everything on disk: `artifacts/` (`firecracker`, `vmlinux`, `rootfs.ext4`), `templates/`, `images/` (pulled container images), `staging/` (where image layers unpack: root-owned, see [docs/images.md](docs/images.md)), host configuration, addresses, suspended VMs |
+| `--state DIR` | `/var/lib/flexvm` | everything on disk: `artifacts/` (`firecracker`, `vmlinux`; `base.squashfs`, the tests' base rootfs), `templates/` (a link per image name to its current generation in `templates/.gen/`), `images/` (layer blobs and image root filesystems), `staging/` (where image layers unpack: root-owned, see [docs/images.md](docs/images.md)), host configuration, addresses, suspended VMs |
 | `--run DIR` | `/run/flexvm` (another `--state`'s: `/run/flexvm-PREFIX`) | registry, sockets, logs (tmpfs) |
 
-`template --image` runs the flexvm-init built into flexvm as PID 1 (`--init PATH`
+`pull` writes the flexvm-init built into flexvm into the image as PID 1 (`--init PATH`
 for another). Several hosts on one machine (tests, benchmarks) each take a `--state` and
 `--run` of their own; their `artifacts` and `templates` can be symlinks to one
 host's. On first open, each state directory permanently records its canonical run
@@ -405,7 +451,17 @@ selection: `pr` (`main` and `recovery`: listener restarts, timeouts) runs on
 every change, in four `--split`s side by side, `heavy` (GiB-scale guests)
 nightly. A scenario that
 finds the host lacks what it tests reports SKIP, never PASS; `--no-skips`
-fails on one, as CI does.
+fails on one, as CI does. Its templates are pulled from the test image,
+which `scripts/test-image.py` makes from the base root filesystem `fetch.sh`
+downloads (Firecracker CI's ubuntu 24.04, with the python3, socat and
+iproute2 the guests run) as an OCI layout with no command. `scripts/faults.py`,
+`nettest.sh` and `test.sh` take a template of it, `small` by default (as the
+`bench` example above does):
+
+```sh
+sudo scripts/test-image.py /var/tmp/test-image
+sudo flexvm pull /var/tmp/test-image --tag small --vcpus 2 --max 2048
+```
 `scripts/nettest.sh` migrates a VM back and forth under TCP and UDP traffic
 between network namespaces and fails on a lost datagram or a long stall.
 
