@@ -4097,11 +4097,11 @@ def resume_mark_fails():
     resume_suspended(A, n)
     disarm()
     check("marker kept: quarantined", vms(A).get(n, {}).get("state") == "quarantined", vms(A).get(n))
+    ip = vms(A)[n]["ip"]
     open(os.path.join(d, "STARTED"), "w").close()
     check("marker kept: no longer listed (consumed)", n not in vms(A), vms(A).get(n))
     # A reboot that showed STARTED on disk: that resume never ran its VM, so its earlier boot's
     # quarantine no longer keeps a sweep from withdrawing the generation (#556).
-    ip = json.load(open(os.path.join(d, "manifest.json")))["ip"]
     q = open(os.path.join(d, "QUARANTINE")).read()
     open(os.path.join(d, "QUARANTINE"), "w").write("another-boot " + q.split(" ", 1)[1])
     ok(cli_json(A, "debug", "gc"))
