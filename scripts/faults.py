@@ -1269,7 +1269,7 @@ def prepare_fail():
 def arrival_flood():
     """Arrivals waiting for a held host lock (#486): at most 4 from one peer (8 in all), more
     refused at once (the source's VM runs on), each refused once its preparation time (7 s) is
-    up; one prepared whose source never sends its header gives its place back within 5 s."""
+    up; prepared ones hold their places until their source hangs up."""
     n = "ft-flood"
     m = setup(n)
     src = source_vm()
@@ -1296,14 +1296,15 @@ def arrival_flood():
     check("arrival flood: waiting arrivals refused within their preparation time", len(replies) == len(names) and not late, replies)
     check("arrival flood: running on A only", where(n) == {A: "running"}, where(n))
     check("arrival flood: md5 intact", md5(A, n) == m)
-    # Prepared, then silent: their places come back once the header is overdue.
+    # Prepared, then silent: they hold the quota until they hang up.
     idle = [migrate_in_raw(B, name, ip, src) for name, ip in names]
     check("arrival flood: idle arrivals prepared", all(r.get("ok") for _, r, _ in idle), [r for _, r, _ in idle])
     r = migrate(A, n, B)
     check("arrival flood: refused while idle arrivals hold the quota", not r["ok"] and "arriving here already" in r["error"], r)
-    time.sleep(6)
     for s, _, _ in idle:
         s.close()
+    gone = lambda: not any(os.path.exists(os.path.join(B.run, "vms", f"{name}.lock")) for name, _ in names)
+    check("arrival flood: idle arrivals give up once their source hangs up", wait_for(gone, 10))
     r = migrate(A, n, B)
     check("arrival flood: a later migration works", r["ok"] and where(n).get(B) == "running", r)
     wait_released(B, n)

@@ -27,9 +27,6 @@ use crate::vmproc::{peer_call, End, Op, Proc};
 
 /// From the target's prepare answer to its commit answer.
 const INCOMING_WAIT: Duration = Duration::from_secs(30);
-/// From the target's prepare answer to the start of the source's header: the source only pauses
-/// and saves its VM meanwhile. An arrival never sent one gives its slot back (`listen`).
-const HEADER_WAIT: Duration = Duration::from_secs(5);
 const MAX_VMSTATE: u64 = 64 << 20;
 const MAX_HEADER: u64 = 256 << 20;
 const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -496,11 +493,6 @@ impl Proc {
         // Bytes the source has declared and this side not yet read, at most what it may send: a refusal drains them.
         let owed = &std::sync::atomic::AtomicU64::new(arrival_owed(u64::MAX, usize::MAX));
         let res = thread::scope(|scope| -> Result<(Arc<Vm>, Value)> {
-            if !crate::util::readable(&w, HEADER_WAIT.min(deadline.saturating_duration_since(Instant::now())))? {
-                // Nothing to drain: the refusal waits on it no longer.
-                r.get_mut().at = Instant::now();
-                bail!("the source sent nothing within {} s of its preflight", HEADER_WAIT.as_secs());
-            }
             let hdr: Header<'static> = crate::util::recv_json_max(&mut r, MAX_HEADER)?.ok_or("source hung up before sending the vmstate")?;
             owed.store(arrival_owed(hdr.vmstate_len, hdr.preload.len()), Ordering::SeqCst);
             let preload_len = (hdr.preload.len() * crate::util::PAGE_SIZE) as u64;
@@ -726,6 +718,7 @@ impl Proc {
         t.mark("claim_ip");
         going()?;
         let idle = self.spawner.take(Some(until))?;
+        going()?;
         crate::host::stall("incoming_stall");
         crate::host::gate("incoming_gate");
         t.mark("spawn");
@@ -739,7 +732,7 @@ impl Proc {
             self.holder();
             t.mark("holder");
         }
-        if vm.prepare_load()? {
+        if vm.prepare_load(until)? {
             t.mark("prepare_load");
         }
         if fault("prepare_fail") {

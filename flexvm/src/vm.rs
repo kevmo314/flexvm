@@ -994,14 +994,19 @@ impl Prepared {
 
     /// Does the template-only part of the coming load (`firecracker/0002-*.patch`); false,
     /// changing nothing, if unsupported.
-    pub fn prepare_load(&self) -> Result<bool> {
+    /// Given up at `by` (Firecracker's answer included).
+    pub fn prepare_load(&self, by: Instant) -> Result<bool> {
         static UNSUPPORTED: AtomicBool = AtomicBool::new(false);
         if UNSUPPORTED.load(Ordering::Relaxed) {
             return Ok(false);
         }
+        let wait = API_TIMEOUT.min(by.saturating_duration_since(Instant::now()));
+        if wait.is_zero() {
+            bail!("out of time to prepare the snapshot load");
+        }
         // Before the request: Firecracker connects to the pager during it.
         self.pager.expect_seed(true);
-        match self.firecracker().load_snapshot(&self.template.vmstate(), &self.firecracker().tap, None, API_TIMEOUT) {
+        match self.firecracker().load_snapshot(&self.template.vmstate(), &self.firecracker().tap, None, wait) {
             Ok(_) => Ok(true),
             Err(e) if e.to_string().contains("Invalid request method and/or path") => {
                 self.pager.expect_seed(false);
