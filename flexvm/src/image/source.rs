@@ -118,9 +118,15 @@ impl Layer {
 
     pub fn open(&self) -> Result<Hashed<Box<dyn Read>>> {
         let (inner, len) = self.src.open()?;
+        self.open_with(inner, len)
+    }
+
+    fn open_with(&self, inner: Box<dyn Read>, len: u64) -> Result<Hashed<Box<dyn Read>>> {
         if let Err(e) = self.check_size(len) {
-            // Hashed first: a blob whose digest does not match is evicted by `verify` (a truncated one).
-            let _ = self.verify(Hashed::new(inner));
+            // Only cached blobs need hashing here, to evict one whose digest does not match.
+            if matches!(self.src, Blob::Cached { .. }) {
+                let _ = self.verify(Hashed::new(inner));
+            }
             return Err(e);
         }
         Ok(Hashed::new(inner))
@@ -463,6 +469,20 @@ mod tests {
         // A blob of the wrong size is hashed: one whose digest does not match goes too.
         std::fs::write(&path, b"good!").unwrap();
         assert!(layer.open().is_err() && layer.src.evicted() && !path.exists());
+    }
+
+    #[test]
+    fn local_size_mismatch_does_not_read_the_blob() {
+        struct Unread;
+        impl Read for Unread {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                panic!("local size mismatch must fail without reading");
+            }
+        }
+        for src in [Blob::File("unused".into()), Blob::Slice { file: "unused".into(), offset: 0, len: 4 }] {
+            let layer = Layer { src, digest: Some(sha256_hex(b"good")), size: Some(5) };
+            assert!(layer.open_with(Box::new(Unread), 4).err().unwrap().to_string().contains("descriptor says 5"));
+        }
     }
 
     #[test]

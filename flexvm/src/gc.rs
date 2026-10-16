@@ -70,6 +70,35 @@ pub fn after_boot(host: &Host, rest: bool) -> Result<bool> {
     Ok(true)
 }
 
+/// Listener startup and explicit recovery always sweep and refill, even if boot recovery
+/// failed before reaching that step (for example, opening the host lock).
+pub fn recover_after_boot(host: &Host) -> Result<()> {
+    let result = after_boot(host, true);
+    if !matches!(result, Ok(true)) {
+        recover(host);
+    }
+    result.map(|_| ())
+}
+
+/// One foreground warning per host and boot, without suppressing recovery retries.
+pub fn first_boot_warning(host: &Host, boot: &str) -> Result<bool> {
+    use std::io::{Read, Seek, Write};
+    if boot.is_empty() {
+        return Ok(true);
+    }
+    let mut file = crate::host::private_file(&crate::host::locks(&host.run).join("boot-warning"))?;
+    let _lock = Flock::new(file.try_clone()?, libc::LOCK_EX)?;
+    let mut previous = String::new();
+    file.read_to_string(&mut previous)?;
+    if previous == boot {
+        return Ok(false);
+    }
+    file.rewind()?;
+    file.set_len(0)?;
+    file.write_all(boot.as_bytes())?;
+    Ok(true)
+}
+
 /// A sweep now (the peers told of withdrawals, interrupted migrations settled and retired) and
 /// each template's standby VMs refilled: `flexvm recover`, a listener as it starts, the first
 /// command after a boot.
@@ -229,6 +258,40 @@ mod tests {
 
     fn dir(tag: &str) -> crate::test_util::TempDir {
         crate::test_util::TempDir::new(&format!("gc-{tag}"))
+    }
+
+    #[test]
+    fn foreground_boot_warning_is_once_per_boot() {
+        let d = dir("boot-warning");
+        let host = Host::open(&d.join("state"), &d.join("run")).unwrap();
+        assert!(first_boot_warning(&host, "boot-1").unwrap());
+        assert!(!first_boot_warning(&host, "boot-1").unwrap());
+        let reopened = Host::open(&host.state, &host.run).unwrap();
+        assert!(!first_boot_warning(&reopened, "boot-1").unwrap());
+        assert!(first_boot_warning(&reopened, "b2").unwrap());
+        assert!(!first_boot_warning(&host, "b2").unwrap());
+        std::thread::scope(|scope| {
+            let warnings: Vec<_> = (0..8).map(|_| scope.spawn(|| first_boot_warning(&host, "boot-3").unwrap())).collect();
+            assert_eq!(warnings.into_iter().map(|warning| warning.join().unwrap()).filter(|&first| first).count(), 1);
+        });
+    }
+
+    #[test]
+    fn initial_recovery_sweeps_even_when_the_host_lock_cannot_open() {
+        let d = dir("boot-lock-error");
+        let host = Host::open(&d.join("state"), &d.join("run")).unwrap();
+        let lock = host.lock_file();
+        let _ = std::fs::remove_file(&lock);
+        std::fs::create_dir(&lock).unwrap();
+        assert!(!host.run.join(".gc").exists());
+        let result = recover_after_boot(&host);
+        if unsafe { libc::geteuid() } == 0 {
+            assert!(result.is_err(), "root must report the failed boot recovery");
+        } else {
+            assert!(result.is_ok(), "non-root skips boot recovery");
+        }
+        assert!(host.run.join(".gc").exists(), "the initial sweep still ran");
+        assert!(!host.run.join(".boot").exists(), "failed recovery is retried");
     }
 
     #[test]

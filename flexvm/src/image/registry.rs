@@ -118,6 +118,8 @@ fn is_public(ip: std::net::IpAddr) -> bool {
             Some(v4) => is_public(IpAddr::V4(v4)),
             // NAT64's local-use prefix (RFC 8215) may translate to anything, private addresses included.
             None if is_nat64(v6) => false,
+            // Deprecated IPv4-compatible addresses and Teredo require tunnels and can embed private IPv4.
+            None if v6.segments()[..6] == [0; 6] || v6.segments()[..2] == [0x2001, 0] => false,
             None => {
                 let s0 = v6.segments()[0];
                 !(v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() || s0 & 0xfe00 == 0xfc00 || s0 & 0xffc0 == 0xfe80 || s0 & 0xffc0 == 0xfec0)
@@ -1497,10 +1499,16 @@ pub(super) mod tests {
             "2002:f000:1::",
             "::ffff:198.18.0.1",
             "64:ff9b::c000:1",
+            "::127.0.0.1",
+            "::10.0.0.1",
+            "::8.8.8.8",
+            "2001::",
+            "2001:0:4136:e378:8000:63bf:3fff:fdd2",
+            "2001:0:ffff:ffff:ffff:ffff:ffff:ffff",
         ] {
             assert!(!is_public(ip.parse().unwrap()), "{ip}");
         }
-        for ip in ["192.0.1.0", "198.17.255.255", "198.20.0.0", "fe7f::1", "2002:808:808::1", "2003:a00:1::"] {
+        for ip in ["192.0.1.0", "198.17.255.255", "198.20.0.0", "fe7f::1", "2002:808:808::1", "2003:a00:1::", "2001:1::1", "::1:0:0"] {
             assert!(is_public(ip.parse().unwrap()), "{ip}");
         }
     }

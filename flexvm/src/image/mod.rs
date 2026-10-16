@@ -646,16 +646,18 @@ fn resolve_user(root: &Root, user: &str) -> Result<(u32, u32, String, Vec<u32>)>
     Ok((uid, gid, home, groups))
 }
 
-/// ext4 needs a block per directory and per symlink too long for its inode (60 bytes).
+/// ext4 needs blocks for directory entries and symlinks too long for their inode (60 bytes).
 /// Staging filesystems may report no allocated blocks for these, so `du` alone is insufficient.
 fn ext4_extra_kib(dir: &Path) -> Result<u64> {
     let mut dirs = vec![dir.to_path_buf()];
     let mut kib = 0;
     while let Some(dir) = dirs.pop() {
-        kib += 4;
+        let mut bytes = 24u64; // `.` and `..`, including their entry headers.
         for entry in std::fs::read_dir(dir)? {
             interrupted()?;
             let entry = entry?;
+            // Each entry has an 8-byte header and a name rounded up to 4 bytes.
+            bytes += 8 + (entry.file_name().as_bytes().len() as u64).div_ceil(4) * 4;
             let metadata = entry.metadata()?;
             if metadata.is_dir() {
                 dirs.push(entry.path());
@@ -663,6 +665,8 @@ fn ext4_extra_kib(dir: &Path) -> Result<u64> {
                 kib += 4;
             }
         }
+        // Leave room for directory indexing and block tails as well as the entries.
+        kib += (bytes * 2).div_ceil(4096) * 4;
     }
     Ok(kib)
 }
@@ -710,6 +714,16 @@ mod tests {
         symlink("x".repeat(60), dir.join("block-link")).unwrap();
         symlink("x".repeat(100), dir.join("a/b/long-link")).unwrap();
         assert_eq!(ext4_extra_kib(&dir).unwrap(), 20);
+    }
+
+    #[test]
+    fn ext4_estimate_counts_large_directory_blocks() {
+        let dir = tmpdir("ext4-large-dir");
+        for i in 0..100 {
+            std::fs::write(dir.join(format!("{i:0255}")), b"").unwrap();
+        }
+        // 24 bytes for dot entries, 264 per long name, doubled for headroom.
+        assert_eq!(ext4_extra_kib(&dir).unwrap(), 52);
     }
 
     #[test]
