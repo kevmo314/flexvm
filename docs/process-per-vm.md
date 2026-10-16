@@ -141,7 +141,7 @@ STATE (default /var/lib/flexvm, on disk)
                          the newest) and flexvm-init, as scripts/fetch.sh and build-*.sh install them
   templates/             built templates: NAME -> .gen/ID (see internals.md)
   images/                pulled container images: blobs/sha256/, rootfs/KEY.ext4 (see images.md)
-  host.json              host config (`flexvm config`'s; listen is `flexvm listen`'s): listen, peers, vm_ips, underlay, announce_dev, dns, reserve_mib, evict_mib; unset ones are derived where used
+  host.json              host config (`flexvm config`'s; listen is `flexvm listen`'s): listen, peers, vm_ips, cluster_ips, underlay, announce_dev, dns, reserve_mib, evict_mib; unset ones are derived where used
   run.json               canonical run path, bound on first open under `.locks/open`'s flock; fsynced
   .locks/                root's locks (0700): open (held while a root `Host::open` binds or repairs the root),
                          host (the host lock, held for short critical sections only), evict (one eviction
@@ -277,6 +277,11 @@ goes by a tap's alias, never its name.
 **The host lock** is a flock taken by one thread of a process at a time and
 reentrant within a thread, so a guard dropped under it (an address claim)
 never deadlocks.
+
+Peer VM addresses must be inside the locally configured `cluster_ips`, set
+with `flexvm config --cluster-ips CIDR|FIRST-LAST` to contain every host's
+`vm_ips`. Unset or reset with `--cluster-ips ''`, it allows only this host's
+`vm_ips`. Local, peer, underlay and gateway addresses are still refused.
 
 **Addresses and generations** keep the semantics of the generations work
 (#60): only an address's home host (whose `vm_ips` holds it) hands it out,

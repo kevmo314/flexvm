@@ -152,8 +152,8 @@ and can be socket-activated:
 
 ```sh
 # host A (192.168.1.10) and host B (192.168.1.11) on one LAN; VMs use spare LAN addresses
-flexvm config --peer 192.168.1.11:7070 --vm-ips 192.168.1.128-192.168.1.191 --dns 192.168.1.1   # on A
-flexvm config --peer 192.168.1.10:7070 --vm-ips 192.168.1.192-192.168.1.250 --dns 192.168.1.1   # on B
+flexvm config --peer 192.168.1.11:7070 --vm-ips 192.168.1.128-192.168.1.191 --cluster-ips 192.168.1.128-192.168.1.250 --dns 192.168.1.1   # on A
+flexvm config --peer 192.168.1.10:7070 --vm-ips 192.168.1.192-192.168.1.250 --cluster-ips 192.168.1.128-192.168.1.250 --dns 192.168.1.1   # on B
 flexvm listen 192.168.1.10:7070          # on A
 flexvm listen 192.168.1.11:7070          # on B
 
@@ -164,7 +164,10 @@ Networking is routed IPv4: flexvm provides no NAT or automatic internet
 egress. Arrange upstream routes or NAT yourself if guests need it. There is
 no default DNS server; configure one with `--dns IP`.
 
-Every host's `--vm-ips` must be disjoint, and the hosts must list each other
+Every host's `--vm-ips` must be disjoint and inside `--cluster-ips`, the
+same range on every host covering all of them: a peer's VM may have, route or
+borrow only an address in it (unset, only this host's `--vm-ips`, so
+migrations between hosts are refused). The hosts must list each other
 with `--peer HOST:PORT` (each peer's listen address): a listener serves its
 peers' addresses only, and tells any other it is not a peer. The default
 range, `10.200.0.0/16`, is the same on every host, so give each host its own

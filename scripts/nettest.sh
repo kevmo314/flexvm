@@ -116,7 +116,7 @@ start_listener() {
     mkdir -p "$dir/state" "$dir/run"
     ln -sfn "$state/artifacts" "$dir/state/artifacts"
     ln -sfn "$state/templates" "$dir/state/templates"
-    cli "$ns" "$dir" config --peer "$peer" --vm-ips "$ips" > /dev/null
+    cli "$ns" "$dir" config --peer "$peer" --vm-ips "$ips" --cluster-ips "$NET.128-$NET.250" > /dev/null
     cli "$ns" "$dir" listen "$listen" > "$work/listen-$ns.log" 2>&1 &
     listener_pids+=($!)
 }

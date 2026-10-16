@@ -66,6 +66,8 @@ pub struct Config {
     pub peers: Vec<String>,
     /// Disjoint across hosts.
     pub vm_ips: String,
+    /// Every host's VM addresses. None: only this host's `vm_ips`.
+    pub cluster_ips: Option<String>,
     /// None: derived (`underlay`).
     pub underlay: Option<Ipv4Addr>,
     /// None: derived (`announce_dev`); `none`: no announcements.
@@ -85,6 +87,7 @@ impl Default for Config {
             listen: None,
             peers: Vec::new(),
             vm_ips: "10.200.0.0/16".into(),
+            cluster_ips: None,
             underlay: None,
             announce_dev: None,
             dns: None,
@@ -183,6 +186,11 @@ impl Config {
 
     pub fn range(&self) -> Result<IpRange> {
         IpRange::parse(&self.vm_ips)
+    }
+
+    /// The only addresses a peer's VM may have here (#584): `cluster_ips`, else this host's `vm_ips`.
+    pub fn cluster(&self) -> Result<IpRange> {
+        IpRange::parse(self.cluster_ips.as_deref().unwrap_or(&self.vm_ips))
     }
 
     /// Never a wildcard address. Unset: the listen address, else the source
@@ -1149,9 +1157,22 @@ impl Host {
         let a = self.addr(l, ip)?;
         let dying = dead.is_some() && a.holder_id.as_ref() == dead;
         let Some(via) = a.via.filter(|_| !a.withdrawn && (dying || !self.held(&a))) else { return Ok(false) };
+        if !self.in_cluster(ip, via) {
+            return Ok(false);
+        }
         crate::net::route_via(ip, via)?;
         crate::log!("put back route {ip} via {via} (generation {})", a.seen);
         Ok(true)
+    }
+
+    /// A peer's route comes back from its record only for an address the local allowlist still
+    /// holds: a record from before #584, or from a wider `cluster_ips`, is left out.
+    fn in_cluster(&self, ip: Ipv4Addr, via: Ipv4Addr) -> bool {
+        let ok = self.config_now().cluster().is_ok_and(|c| c.contains(ip));
+        if !ok {
+            crate::log!("route {ip} via {via}: not put back, outside this host's configured VM ranges");
+        }
+        ok
     }
 
     pub fn current(&self, l: &Locked, ip: Ipv4Addr, gen: u64) -> Result<bool> {
@@ -2385,7 +2406,7 @@ impl Host {
                     continue;
                 }
             };
-            let Some(via) = a.via.filter(|_| !a.withdrawn && !self.held(&a)) else { continue };
+            let Some(via) = a.via.filter(|&via| !a.withdrawn && !self.held(&a) && self.in_cluster(ip, via)) else { continue };
             match route(ip, via) {
                 Ok(()) => crate::log!("after boot: put back route {ip} via {via} (generation {})", a.seen),
                 Err(e) => {
@@ -4329,13 +4350,17 @@ mod tests {
     /// the records, and the VMs that died with the host are recorded as lost, then withdrawn.
     #[test]
     fn after_a_boot_routes_come_back_and_lost_vms_are_recorded() {
-        let (_h_dir, h) = host("after-boot");
+        let (_h_dir, mut h) = host("after-boot");
+        h.cfg.cluster_ips = Some("10.9.0.0/16".into());
         let (peer, gone, mine, withdrawn) = (ip("10.9.5.1"), ip("10.9.5.2"), ip("10.9.5.3"), ip("10.9.5.4"));
         let via = ip("192.0.2.7");
         let dead = dead_owner(&h, 999_999_946, &[]);
         {
             let l = h.lock().unwrap();
             h.put_addr(peer, &Addr { seen: 3, via: Some(via), ..Addr::default() }, true).unwrap();
+            // Recorded before #584 (or under a wider cluster range): never put back.
+            h.put_addr(ip("169.254.169.254"), &Addr { seen: 3, via: Some(via), ..Addr::default() }, true).unwrap();
+            assert!(!h.reinstall(&l, ip("169.254.169.254"), None).unwrap(), "outside cluster_ips");
             h.put_addr(withdrawn, &Addr { seen: 3, via: Some(via), withdrawn: true, ..Addr::default() }, true).unwrap();
             h.put_addr(gone, &Addr { seen: 5, holder: Some("web".into()), holder_id: Some(dead), held: 5, ..Addr::default() }, true).unwrap();
             let c = h.claim_new_in(&l, &Config { vm_ips: "10.9.5.3-10.9.5.3".into(), ..Config::default() }, "alive", Some(mine)).unwrap();

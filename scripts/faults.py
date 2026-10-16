@@ -19,7 +19,7 @@ a skip as a failure. BENCHMARKS (ckpt_stall) only run when named.
 """
 from contextlib import contextmanager, suppress
 
-import argparse, base64, fcntl, json, struct, os, re, signal, socket, subprocess, sys, tempfile, termios, threading, time, traceback
+import argparse, base64, fcntl, ipaddress, json, struct, os, re, signal, socket, subprocess, sys, tempfile, termios, threading, time, traceback
 
 p = argparse.ArgumentParser(usage=__doc__)
 p.add_argument("--a", help="host A's listener (default: a free loopback port)")
@@ -407,7 +407,11 @@ def start_listener(h, listen=None, extra=(), peer=None, wait=True):
     for d in (h.state, h.run):
         os.makedirs(d, exist_ok=True)
     lg = open(h.listen_log, "a")
-    ok(cli_json(h, "config", "--peer", peer or other.addr, "--vm-ips", h.ips, "--reserve", "512", *extra))
+    # Include the spare addresses in each subnet used by forged-arrival scenarios too.
+    nets = [ipaddress.IPv4Network(f"{ip}/24", strict=False) for host in (h, other) for ip in host.ips.split("-")]
+    first, last = min(n.network_address for n in nets) + 1, max(n.broadcast_address for n in nets) - 1
+    ok(cli_json(h, "config", "--peer", peer or other.addr, "--vm-ips", h.ips,
+                "--cluster-ips", f"{first}-{last}", "--reserve", "512", *extra))
     listeners[h.addr] = spawn_cli(h, "listen", listen or h.addr, stdout=lg, stderr=lg)
     if not wait:
         return
@@ -1724,7 +1728,8 @@ def commit_fail_routed():
             os.makedirs(x.run)
             for d in ("artifacts", "templates"):
                 os.symlink(os.path.realpath(os.path.join(A.state, d)), os.path.join(x.state, d))
-            nsjson(h, "config", "--peer", hosts[other].addr, "--vm-ips", x.ips, "--reserve", "512")
+            nsjson(h, "config", "--peer", hosts[other].addr, "--vm-ips", x.ips,
+                   "--cluster-ips", f"{net}.128-{net}.250", "--reserve", "512")
             lg = open(os.path.join(root, f"listen-{h}.log"), "a")
             # Its arrivals' Firecrackers get cgroups too: the hierarchy `ip netns exec`'s sysfs lacks.
             procs.append(subprocess.Popen(["ip", "netns", "exec", ns[h], "sh", "-c", 'mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null; exec "$@"', "sh",

@@ -709,6 +709,10 @@ impl IpRange {
         (self.first..=self.last).contains(&u32::from(ip))
     }
 
+    pub fn contains_range(&self, other: &IpRange) -> bool {
+        self.first <= other.first && other.last <= self.last
+    }
+
     /// In it, and never with a 16-bit half all zeros or all ones: checksum completion could
     /// rewrite one into the other and leave the IP header checksum valid (#365), forging a source.
     pub fn allocatable(&self, ip: Ipv4Addr) -> bool {

@@ -56,9 +56,10 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
   flexvm reclaim IP [--force]        take back an address lent out with a VM that migrated away,
                                      once its target is gone for good (without --force: say what)
   flexvm config [--peer HOST:PORT]... [--vm-ips CIDR|FIRST-LAST] [--dns IP] [--underlay IP]
-                [--announce-dev IFACE|none] [--reserve MIB] [--evict-at MIB]
+                [--cluster-ips CIDR|FIRST-LAST] [--announce-dev IFACE|none] [--reserve MIB] [--evict-at MIB]
                                      set this host's settings, live (no flags: show them and what is
                                      derived for those unset); --peer replaces the list, '' unsets
+                                     --cluster-ips holds every host's VM range (unset: only --vm-ips)
   flexvm listen [ADDR]               take migrations from peers (no ADDR: saved or socket-activated address)
   flexvm recover                     sweep and refill standby VMs now (at boot, on a host without a listener)
   flexvm standby [--template T] [N]  keep N VMs restored and paused, so run takes ~5 ms (no N: show)
@@ -450,7 +451,7 @@ fn takes(local: std::net::SocketAddr, v6only: bool, ip: std::net::IpAddr) -> boo
 }
 
 /// What `configure` sets.
-const CONFIG_FLAGS: &[&str] = &["peer", "vm-ips", "underlay", "announce-dev", "dns", "reserve", "evict-at"];
+const CONFIG_FLAGS: &[&str] = &["peer", "vm-ips", "cluster-ips", "underlay", "announce-dev", "dns", "reserve", "evict-at"];
 
 /// Flags not given keep their configured values; an empty one unsets it
 /// (derived again where used). --peers replace the list (`--peer ''` empties
@@ -465,6 +466,14 @@ fn configure(c: &mut host::Config, args: &Args) -> Result<()> {
     if let Some(r) = args.get("vm-ips") {
         c.vm_ips = if r.is_empty() { host::Config::default().vm_ips } else { r.into() };
         net::IpRange::parse(&c.vm_ips)?;
+    }
+    if let Some(r) = args.get("cluster-ips") {
+        c.cluster_ips = (!r.is_empty()).then(|| r.into());
+    }
+    if let Some(r) = &c.cluster_ips {
+        if !net::IpRange::parse(r)?.contains_range(&c.range()?) {
+            bail!("--vm-ips {} is not inside --cluster-ips {r}", c.vm_ips);
+        }
     }
     if let Some(u) = args.get("underlay") {
         c.underlay = (!u.is_empty()).then(|| u.parse()).transpose().map_err(|_| format!("bad --underlay {u:?}"))?;
@@ -492,6 +501,9 @@ fn configure(c: &mut host::Config, args: &Args) -> Result<()> {
     }
     if !c.peers.is_empty() && c.vm_ips == host::Config::default().vm_ips {
         crate::log!("flexvm: warning: --vm-ips is the default {}; each peer needs a range of its own", c.vm_ips);
+    }
+    if !c.peers.is_empty() && c.cluster_ips.is_none() {
+        crate::log!("flexvm: warning: --cluster-ips is unset; peer VM addresses outside --vm-ips {} are refused", c.vm_ips);
     }
     Ok(())
 }
@@ -1254,6 +1266,25 @@ mod exec_tests {
         ] {
             assert_eq!(err(ok), None, "{ok:?}");
         }
+    }
+
+    #[test]
+    fn cluster_range_contains_the_whole_vm_range_and_an_empty_one_resets_it() {
+        let mut c = host::Config::default();
+        configure(&mut c, &parse(&["--vm-ips", "10.9.0.0/24", "--cluster-ips", "10.9.0.0/16"])).unwrap();
+        assert_eq!(c.cluster_ips.as_deref(), Some("10.9.0.0/16"));
+        configure(&mut c, &parse(&["--cluster-ips", "10.9.0.1-10.9.0.254"])).unwrap();
+        for flags in [
+            &["--vm-ips", "10.9.0.1-10.9.1.1"][..],
+            &["--vm-ips", "10.8.255.254-10.9.0.254"],
+            &["--cluster-ips", "10.9.0.2-10.9.0.253"],
+            &["--cluster-ips", "bad"],
+        ] {
+            assert!(configure(&mut c.clone(), &parse(flags)).is_err(), "{flags:?}");
+        }
+        configure(&mut c, &parse(&["--cluster-ips", "", "--vm-ips", ""])).unwrap();
+        assert!(c.cluster_ips.is_none());
+        assert_eq!(c.vm_ips, host::Config::default().vm_ips);
     }
 
     #[test]

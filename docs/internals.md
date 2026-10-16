@@ -788,7 +788,14 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
   messages about older ones are ignored, and the route a peer
   announced for the newest one is put back when a claim here goes without
   its VM running (see process-per-vm.md).
-  No VM gets a local, peer, underlay or gateway address (#549). What a peer
+  Configure `--cluster-ips CIDR|FIRST-LAST` on every host to cover every host's
+  VM range; each host's `--vm-ips` must fit entirely inside it. Only addresses
+  in this locally configured allowlist may arrive, be routed or lent. Unset
+  (or reset with `--cluster-ips ''`), it allows only this host's `--vm-ips`;
+  peers configured without it produce a warning. A peer's report of its own
+  range never authorizes an address here.
+  No VM gets a local, peer, underlay or gateway address (#549), even inside
+  `--cluster-ips`. What a peer
   asks for (arrival, route, lend) is checked against the listener's own peer
   lookups, briefly waiting for one under way; a restore or resume, root's own,
   against the listener's last-known peer addresses (`RUN/peers.json`) whatever
