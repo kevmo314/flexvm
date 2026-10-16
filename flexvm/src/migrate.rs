@@ -756,7 +756,12 @@ impl Proc {
         going: &dyn Fn() -> Result<()>,
     ) -> Result<(crate::vm::Prepared, Ipv4Addr, Source, String, Vec<u64>)> {
         let ip: Ipv4Addr = req["ip"].as_str().ok_or("missing ip")?.parse()?;
-        let mut peers: Vec<std::net::IpAddr> = std::env::var("FLEXVM_INCOMING_PEERS").ok().map(|p| serde_json::from_str(&p)).transpose()?.unwrap_or_default();
+        // The peers' addresses as the listener goes by (it waited for a name just added), else as a
+        // restore's are known; and the source's.
+        let mut peers: Vec<std::net::IpAddr> = match std::env::var("FLEXVM_INCOMING_PEERS") {
+            Ok(p) => serde_json::from_str(&p)?,
+            Err(_) => crate::listen::known_peers(&self.host)?,
+        };
         peers.push(from);
         crate::listen::check_vm_ip(&self.host, ip, &peers)?;
         crate::util::check_kvm()?;

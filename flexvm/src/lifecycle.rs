@@ -288,7 +288,10 @@ impl Proc {
         let cmd = read_cmd(&dir).map_err(|e| format!("vm {name}: its command's record {}: {e}", dir.join(CMD).display()))?;
         t.mark("verify_checkpoint");
         let ip = ck.manifest.ip;
-        // Resume reclaims this host's durable generation, checked under the host lock below.
+        // Not checked as a restore's is (`check_vm_ip`): this address is no peer's input. Only this
+        // host's suspend writes STATE/suspended (root's alone), from a VM of its own whose address
+        // was checked as it was claimed (run, restore or arrival), and the generation it recorded
+        // must still be current here (below).
         let tpl = self.admit_checkpoint(&ck, &mut t)?;
         let claim = {
             let l = self.host.lock()?;
@@ -347,7 +350,7 @@ impl Proc {
             None => Some(ck.manifest.ip),
         };
         if let Some(ip) = want {
-            crate::listen::check_vm_ip(&self.host, ip, &[])?;
+            crate::listen::check_vm_ip(&self.host, ip, &crate::listen::known_peers(&self.host)?)?;
         }
         self.set_name(self.host.take_name(&name, false)?);
         let tpl = self.admit_checkpoint(&ck, &mut t)?;
