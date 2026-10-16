@@ -1830,7 +1830,7 @@ def abort_stay_fail():
         late = peer(B, {"op": "route", "ip": ip, "via": gw, "gen": gen, "rev": rev + 1})
         check("abort stay fail: the target's revision is stale on B", late.get("ok") and late["result"].get("stale"), late)
         check("abort stay fail: A records its revision once the write goes through (#499)",
-              wait_for(lambda: addr(A, ip).get("rev") == rev + 2, 10) and "recorded its revision" in log(A, n)[seen:], addr(A, ip))
+              wait_for(lambda: addr(A, ip).get("rev") == rev + 2 and "recorded its revision" in log(A, n)[seen:], 10), addr(A, ip))
         late = peer(A, {"op": "route", "ip": ip, "via": gw, "gen": gen, "rev": rev + 1})
         check("abort stay fail: the target's revision is stale on A, the route on its tap",
               late.get("ok") and late["result"].get("stale") and f"dev {tap}" in peer_route(ip), (late, peer_route(ip)))
