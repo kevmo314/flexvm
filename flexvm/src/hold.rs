@@ -288,8 +288,9 @@ impl Holder {
                 // (which a busy host may not run for a while): read after `unhold`, it would be a
                 // straggler, counted as dropped (#539).
                 if refused.get() {
-                    let mut buf = vec![0u8; VNET_HDR + MAX_FRAME];
-                    (0..PASS).take_while(|_| self.read_one(&mut buf)).count();
+                    self.drain(&mut || {
+                        self.give_queued(&e, sink, &mut stats);
+                    });
                 }
             }
         }
@@ -388,6 +389,12 @@ impl Holder {
     /// `give`n before the next, up to its queue length, so no flood can make it more.
     fn drain_switched(&self, e: &Entry, give: &mut dyn FnMut()) {
         e.q.lock().unwrap().switched = true;
+        self.drain(give);
+    }
+
+    /// Reads the device a pass at a time, each `give`n before the next, until it is empty or up
+    /// to its queue length (a flood still routed here never holds it up longer).
+    fn drain(&self, give: &mut dyn FnMut()) {
         let mut buf = vec![0u8; VNET_HDR + MAX_FRAME];
         for read in (0..TXQ).step_by(PASS) {
             let pass = PASS.min(TXQ - read);
@@ -1278,10 +1285,11 @@ mod tests {
     /// #512: a target that could not take the address over says so (`b'n'`): the handover fails,
     /// but the stream goes on, so nothing held is dropped, and the address is not let go of as
     /// moved (its stragglers would be re-sent into the route that still leads here). It routes
-    /// the address itself: no route is owed here (#539). A packet on the device that no reader
-    /// took (a busy host's) goes on the stream too, not dropped with the queue (#539).
+    /// the address itself: no route is owed here (#539). Packets on the device that no reader
+    /// took (a busy host's), more than one pass of them, go on the stream too, not dropped (#539).
     #[test]
     fn a_refused_switch_keeps_the_stream() {
+        const LATE: usize = PASS + 100;
         for (ack, took) in [(b'w', true), (b'n', false)] {
             let mut fds = [0; 2];
             assert_eq!(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK, 0, fds.as_mut_ptr()) }, 0);
@@ -1289,8 +1297,13 @@ mod tests {
             let ip = Ipv4Addr::new(10, 9, 0, 8);
             let q = Queue { packets: VecDeque::from(vec![udp_to(ip); 3]), bytes: 3 * 29, ..Queue::default() };
             h.held.lock().unwrap().insert(ip, Arc::new(Entry { mig: 1, q: Mutex::new(q) }));
+            // More than a pass: refused, the device is read until it is empty, not one pass of it.
             let late = [&vnet_hdr(0, 0, (0, 0))[..], &udp_to(ip)].concat();
-            assert_eq!(unsafe { libc::write(w.as_raw_fd(), late.as_ptr().cast(), late.len()) }, late.len() as isize);
+            let buf = 4i32 << 20;
+            unsafe { libc::setsockopt(w.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, (&buf as *const i32).cast(), 4) };
+            for _ in 0..LATE {
+                assert_eq!(unsafe { libc::write(w.as_raw_fd(), late.as_ptr().cast(), late.len()) }, late.len() as isize);
+            }
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = l.local_addr().unwrap();
             let target = fake_target(l, ack);
@@ -1303,7 +1316,12 @@ mod tests {
             .unwrap();
             let got = target.join().unwrap();
             assert!(switched.is_ok() && switch.get() == took, "{}: refused, nothing owed or routed here", ack as char);
-            assert_eq!((got.len(), stats.packets, stats.injected, stats.dropped, stats.dropped_target), (4, 4, 4, 0, 0), "{}", ack as char);
+            assert_eq!(
+                (got.len(), stats.packets, stats.injected, stats.dropped, stats.dropped_target),
+                (3 + LATE, 3 + LATE as u64, 3 + LATE as u64, 0, 0),
+                "{}",
+                ack as char
+            );
             assert!(h.entry(ip).is_none(), "{}: no longer held", ack as char);
             let moved = h.gone.lock().unwrap().get(&ip).map(|g| g.moved);
             assert_eq!(moved, Some(took), "{}: stragglers re-sent only once it moved", ack as char);
