@@ -867,9 +867,9 @@ pub fn send(holder: &Holder, ip: Ipv4Addr, mig: u64, conn: &TcpStream, handoff: 
     Some((stats, switched))
 }
 
-/// A byte at a time: nothing after the line is consumed.
+/// The final reply on the held-packet stream; its caller reads nothing further.
 fn read_reply(conn: &TcpStream, deadline: Instant) -> Option<Value> {
-    crate::util::recv_json_max(&mut BufReader::with_capacity(1, By { s: conn, at: deadline }), 257).ok().flatten()
+    crate::util::recv_json_max(&mut BufReader::new(By { s: conn, at: deadline }), 257).ok().flatten()
 }
 
 struct Out<'a> {

@@ -217,8 +217,8 @@ fn refill_by(host: &Host, template: &str, wait: bool, cooldown: bool) -> Result<
 
 /// A started standby's readiness reply, within `timeout` of now: counted from when it is
 /// read, not from its start, as replies are read only once every start in the round is done.
-fn wait_ready(r: UnixStream, timeout: Duration) -> Result<()> {
-    let mut r = BufReader::new(crate::util::By { s: r, at: Instant::now() + timeout });
+fn wait_ready(r: BufReader<UnixStream>, timeout: Duration) -> Result<()> {
+    let mut r = crate::util::By { s: r, at: Instant::now() + timeout };
     match crate::util::recv_json(&mut r)? {
         None => Err("a standby vm failed to start (see its log)".into()),
         Some(reply) if reply["ok"] != json!(true) => Err(format!("a standby vm failed to start: {}", reply["error"]).into()),
@@ -236,7 +236,7 @@ fn grant_mib(host: &Host, template: &str) -> u64 {
 
 /// One standby started and listed, its readiness reply to come; None if relief
 /// holds the stop lock, pressure is recent (`cooldown`), the grant is refused or the host lock is busy.
-fn start_one(host: &Host, template: &str, log: &File, mib: u64, cooldown: bool) -> Result<Option<UnixStream>> {
+fn start_one(host: &Host, template: &str, log: &File, mib: u64, cooldown: bool) -> Result<Option<BufReader<UnixStream>>> {
     // Shared from the grant until its lock file exists (`locked`), not through its load:
     // relief either lists it or ran before the grant. None while relief stops them, and
     // held `LOCKED_TIMEOUT` at most (a stuck host lock fails the grant; a child that
@@ -276,7 +276,8 @@ fn start_one(host: &Host, template: &str, log: &File, mib: u64, cooldown: bool) 
         ];
         let mut child = crate::util::spawn_self_child(&args, log, w.as_raw_fd(), &[("FLEXVM_NOTIFY_FD", "3")])?;
         drop(w);
-        wait_locked(&r, &mut child, by)?;
+        let mut r = BufReader::new(r);
+        wait_locked(&mut r, &mut child, by)?;
         Ok((r, child))
     })();
     let (r, mut child) = match started {
@@ -292,9 +293,9 @@ fn start_one(host: &Host, template: &str, log: &File, mib: u64, cooldown: bool) 
 }
 
 /// Never let relief pass an unlisted live child, including on a partial or invalid reply.
-fn wait_locked(r: &UnixStream, child: &mut std::process::Child, by: Instant) -> Result<()> {
-    // Do not read ahead into the readiness reply: it has a separate deadline.
-    let mut r = BufReader::with_capacity(1, crate::util::By { s: r, at: by });
+fn wait_locked(r: &mut BufReader<UnixStream>, child: &mut std::process::Child, by: Instant) -> Result<()> {
+    // Keep read-ahead for the readiness reply, which gets its own deadline.
+    let mut r = crate::util::By { s: r, at: by };
     let result = match crate::util::recv_json(&mut r) {
         Ok(Some(v)) if v["locked"] == json!(true) => Ok(()),
         // It failed before its lock (its template, say), and said why.
@@ -509,9 +510,16 @@ fn claim(p: &Arc<Proc>, req: &Value) -> std::result::Result<Value, (Error, bool)
     };
     let claim = host.lock().and_then(|l| host.claim_new(&l, name, want)).map_err(|e| not_run(e, false))?;
     t.mark("claim_ip");
+    // Prepare the paused tap outside the host lock; a withdrawal can still win before fence.
+    let tap = p.standby.lock().unwrap().as_ref().ok_or_else(|| not_run("standby vm gone".into(), true))?.firecracker().tap.clone();
+    let index = crate::net::neighbour(claim.ip, &tap).map_err(|e| {
+        // As a failed attach in resume: discard this prepared VM and let the claimer retry.
+        p.standby.lock().unwrap().take();
+        not_run(format!("resuming a standby vm failed: {e}").into(), true)
+    })?;
     let still = host.fence(claim.ip, claim.gen).map_err(|e| not_run(e, false))?;
     let paused = p.standby.lock().unwrap().take().ok_or_else(|| not_run("standby vm gone".into(), true))?;
-    let vm = resume(paused, name, claim.ip, fault("resume_kill"), &mut t).map_err(|(e, ran)| {
+    let vm = resume(paused, name, claim.ip, index, fault("resume_kill"), &mut t).map_err(|(e, ran)| {
         let e = format!("resuming a standby vm failed{}: {e}", if ran { ", and it may have run" } else { "" }).into();
         if ran {
             (e, false)
@@ -590,8 +598,8 @@ pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]
         if shut {
             let _ = c.shutdown(std::net::Shutdown::Read);
         }
-        // Byte by byte: what follows stays unread, for the caller.
-        let mut r = BufReader::with_capacity(1, crate::util::By { s: &c, at: Instant::now() + CLAIM_TIMEOUT });
+        // Keep read-ahead (including an early exit) when the deadline is removed.
+        let mut r = crate::util::By { s: BufReader::new(c), at: Instant::now() + CLAIM_TIMEOUT };
         if crate::util::recv_json(&mut r).ok().flatten().is_none_or(|t| t["claiming"] != json!(true)) {
             continue;
         }
@@ -607,8 +615,8 @@ pub fn take(host: &Host, paths: &Paths, template: &str, req: &Value, fds: &[i32]
             }
         };
         if reply["ok"] == json!(true) {
-            c.set_read_timeout(None)?;
-            return Ok(Some((reply["result"].clone(), BufReader::new(c))));
+            r.s.get_ref().set_read_timeout(None)?;
+            return Ok(Some((reply["result"].clone(), r.s)));
         }
         if reply["retry"] != json!(true) {
             bail!("{}", reply["error"].as_str().unwrap_or("claim failed"));
@@ -670,8 +678,8 @@ fn load(idle: Firecracker, template: Arc<Template>) -> Result<Prepared> {
 
 /// On failure the flag says whether the guest may have run for `name` (the
 /// resume may have reached Firecracker).
-fn resume(p: Prepared, name: &str, ip: Ipv4Addr, kill: bool, t: &mut Phases) -> std::result::Result<Arc<Vm>, (Error, bool)> {
-    crate::net::attach(ip, &p.firecracker().tap).map_err(|e| (e, false))?;
+fn resume(p: Prepared, name: &str, ip: Ipv4Addr, index: u32, kill: bool, t: &mut Phases) -> std::result::Result<Arc<Vm>, (Error, bool)> {
+    crate::net::route_dev(true, ip, index).map_err(|e| (e, false))?;
     t.mark("route");
     let res = p.firecracker().request_within("PATCH", "/vm", Some(json!({"state": "Resumed"})), API_TIMEOUT);
     if kill {
@@ -754,7 +762,7 @@ mod tests {
                 assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists(), "relief missed a live child");
             });
             let start = Instant::now();
-            let error = wait_locked(&r, &mut child, start + Duration::from_millis(100)).unwrap_err();
+            let error = wait_locked(&mut BufReader::new(r), &mut child, start + Duration::from_millis(100)).unwrap_err();
             assert_eq!(child.try_wait().unwrap().unwrap().signal(), Some(libc::SIGKILL));
             assert!(start.elapsed() < Duration::from_secs(1));
             drop(stop);
@@ -774,11 +782,11 @@ mod tests {
         let (r, mut w) = UnixStream::pair().unwrap();
         send_json(&mut w, &json!({"ok": true, "result": {}})).unwrap();
         std::thread::sleep(Duration::from_millis(300));
-        wait_ready(r, Duration::from_millis(100)).unwrap();
+        wait_ready(BufReader::new(r), Duration::from_millis(100)).unwrap();
         // A child that never replies still fails within its timeout, from when it is read.
         let (r, _w) = UnixStream::pair().unwrap();
         let start = Instant::now();
-        assert!(wait_ready(r, Duration::from_millis(100)).unwrap_err().to_string().contains("deadline passed"));
+        assert!(wait_ready(BufReader::new(r), Duration::from_millis(100)).unwrap_err().to_string().contains("deadline passed"));
         assert!(start.elapsed() >= Duration::from_millis(100) && start.elapsed() < Duration::from_secs(1));
     }
 
@@ -789,10 +797,11 @@ mod tests {
         // A partial readiness reply must not extend its deadline either.
         std::io::Write::write_all(&mut w, b"{\"ok\":").unwrap();
         let mut child = std::process::Command::new("sleep").arg("60").spawn().unwrap();
-        wait_locked(&r, &mut child, Instant::now() + Duration::from_secs(1)).unwrap();
+        let mut r = BufReader::new(r);
+        wait_locked(&mut r, &mut child, Instant::now() + Duration::from_secs(1)).unwrap();
         assert!(child.try_wait().unwrap().is_none());
         let start = Instant::now();
-        let mut r = BufReader::new(crate::util::By { s: r, at: start + Duration::from_millis(100) });
+        let mut r = crate::util::By { s: r, at: start + Duration::from_millis(100) };
         assert!(crate::util::recv_json(&mut r).is_err());
         child.kill().unwrap();
         child.wait().unwrap();
@@ -827,6 +836,43 @@ mod tests {
             assert!(send_json(&mut s.accept().unwrap().0, &json!({"claiming": true})).is_err());
         }
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn claim_keeps_an_exit_read_ahead_with_its_reply() {
+        let root = crate::test_util::TempDir::new("standby-buffer");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        std::fs::create_dir_all(root.join("templates/.gen/a")).unwrap();
+        std::os::unix::fs::symlink(".gen/a", root.join("templates/default")).unwrap();
+        let paths = Paths::new(&root);
+        let d = dir(&host, "default");
+        std::fs::create_dir_all(&d).unwrap();
+        let listener = UnixListener::bind(d.join("a.1.sock")).unwrap();
+        let peer = std::thread::spawn(move || {
+            let (mut c, _) = listener.accept().unwrap();
+            crate::util::recv_json(&mut BufReader::new(&c)).unwrap().unwrap();
+            std::io::Write::write_all(&mut c, b"{\"claiming\":true}\n{\"ok\":true,\"result\":42}\n{\"exit\":7}\n").unwrap();
+        });
+        let (reply, mut r) = take(&host, &paths, "default", &json!({"name":"test"}), &[]).unwrap().unwrap();
+        assert_eq!(reply, json!(42));
+        assert!(!r.buffer().is_empty(), "exit was not read ahead");
+        assert_eq!(r.get_ref().read_timeout().unwrap(), None);
+        assert_eq!(crate::util::recv_json(&mut r).unwrap().unwrap(), json!({"exit":7}));
+        peer.join().unwrap();
+    }
+
+    #[test]
+    fn refill_keeps_readiness_read_ahead_with_the_lock_ack() {
+        let (r, mut w) = UnixStream::pair().unwrap();
+        std::io::Write::write_all(&mut w, b"{\"locked\":true}\n{\"ok\":true}\n").unwrap();
+        let mut r = BufReader::new(r);
+        let mut child = std::process::Command::new("sleep").arg("60").spawn().unwrap();
+        let locked = wait_locked(&mut r, &mut child, Instant::now() + Duration::from_secs(1));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        locked.unwrap();
+        assert!(!r.buffer().is_empty());
+        wait_ready(r, Duration::from_millis(100)).unwrap();
     }
 
     #[test]

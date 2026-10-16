@@ -338,7 +338,7 @@ impl Template {
         let meta = Meta::read(&fixed).map_err(|e| format!("template {name:?}: {e}"))?;
         let file = File::open(fixed.join("mem"))?;
         let len = file.metadata()?.len() as usize;
-        let data = data_bitmap(&file, len)?;
+        let data = memory_bitmap(&file, len, &fixed)?;
         let map = unsafe { libc::mmap(std::ptr::null_mut(), len.max(1), libc::PROT_READ, libc::MAP_SHARED, file.as_raw_fd(), 0) };
         if map == libc::MAP_FAILED {
             bail!("mmap template memory: {}", std::io::Error::last_os_error());
@@ -429,15 +429,48 @@ impl Drop for Template {
     }
 }
 
-fn data_bitmap(file: &File, len: usize) -> Result<Vec<u64>> {
+/// Derived from the immutable memory file. A changed inode/stamp or a damaged cache is a miss,
+/// including after copying a generation to another host. Old generations populate it on first open.
+#[derive(Serialize, Deserialize)]
+struct MemoryExtents {
+    stamp: Stamp,
+    extents: Vec<(u64, u64)>,
+}
+
+fn memory_bitmap(file: &File, len: usize, dir: &Path) -> Result<Vec<u64>> {
+    let stamp = Stamp::of(&file.metadata()?);
+    let cached = std::fs::read(dir.join("extents.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<MemoryExtents>(&b).ok())
+        .filter(|c| c.stamp == stamp && valid_extents(&c.extents, len as u64));
+    let extents = match cached {
+        Some(c) => c.extents,
+        None => {
+            let extents = data_extents(file, len as u64)?;
+            if Stamp::of(&file.metadata()?) == stamp {
+                let cache = MemoryExtents { stamp, extents: extents.clone() };
+                let _ = crate::util::write_file(dir, "extents.json", &serde_json::to_vec(&cache)?, false);
+            }
+            extents
+        }
+    };
     let pages = len.div_ceil(PAGE_SIZE);
     let mut bits = vec![0u64; pages.div_ceil(64)];
-    for (data, end) in data_extents(file, len as u64)? {
+    for (data, end) in extents {
         for p in (data as usize / PAGE_SIZE)..(end as usize).div_ceil(PAGE_SIZE).min(pages) {
             bits[p / 64] |= 1 << (p % 64);
         }
     }
     Ok(bits)
+}
+
+fn valid_extents(extents: &[(u64, u64)], len: u64) -> bool {
+    let mut previous = 0;
+    extents.iter().all(|&(start, end)| {
+        let valid = previous <= start && start < end && end <= len;
+        previous = end;
+        valid
+    })
 }
 
 fn data_extents(file: &File, len: u64) -> Result<Vec<(u64, u64)>> {
@@ -783,6 +816,8 @@ fn build(paths: &Paths, dir: &Path, name: &str, vcpus: u32, mem_mib: u64, max_mi
     let sparsifying = Instant::now();
     let punched = sparsify(&dir.join("mem"))?;
     let sparsified = sparsifying.elapsed();
+    let memory = File::open(dir.join("mem"))?;
+    memory_bitmap(&memory, memory.metadata()?.len() as usize, dir)?;
     let _ = std::fs::remove_dir_all(&run);
 
     let mut meta = Meta {
@@ -1277,6 +1312,39 @@ mod tests {
         forged.components.get_mut("kernel").unwrap().hash = "0".into();
         f.write_meta(&forged, &f.dir);
         assert!(f.verify(&written, &mut BTreeMap::new()).is_err());
+    }
+
+    #[test]
+    fn memory_extent_cache_skips_seeks_and_invalidates_safely() {
+        let f = Fixture::new();
+        let path = f.dir.join("sparse");
+        let file = File::options().read(true).write(true).create_new(true).open(&path).unwrap();
+        let len = 8 * PAGE_SIZE;
+        file.set_len(len as u64).unwrap();
+        file.write_all_at(&[1; PAGE_SIZE], PAGE_SIZE as u64).unwrap();
+        file.sync_all().unwrap();
+        let original = memory_bitmap(&file, len, &f.dir).unwrap();
+        assert_eq!(original, vec![2]);
+        // SEEK_DATA/HOLE change the file offset. A hit must leave it alone.
+        assert_eq!(unsafe { libc::lseek(file.as_raw_fd(), 17, libc::SEEK_SET) }, 17);
+        assert_eq!(memory_bitmap(&file, len, &f.dir).unwrap(), original);
+        assert_eq!(unsafe { libc::lseek(file.as_raw_fd(), 0, libc::SEEK_CUR) }, 17);
+        file.write_all_at(&[2; PAGE_SIZE], (5 * PAGE_SIZE) as u64).unwrap();
+        file.sync_all().unwrap();
+        let changed = memory_bitmap(&file, len, &f.dir).unwrap();
+        assert_eq!(changed, vec![2 | 32]);
+        std::fs::write(f.dir.join("extents.json"), b"broken").unwrap();
+        assert_eq!(memory_bitmap(&file, len, &f.dir).unwrap(), changed);
+        let invalid = MemoryExtents { stamp: Stamp::of(&file.metadata().unwrap()), extents: vec![(0, len as u64 + 1)] };
+        std::fs::write(f.dir.join("extents.json"), serde_json::to_vec(&invalid).unwrap()).unwrap();
+        assert_eq!(memory_bitmap(&file, len, &f.dir).unwrap(), changed);
+        // An unwritable cache is optional; existing templates still open.
+        std::fs::remove_file(f.dir.join("extents.json")).unwrap();
+        std::fs::create_dir(f.dir.join("extents.json")).unwrap();
+        assert_eq!(memory_bitmap(&file, len, &f.dir).unwrap(), changed);
+        assert!(valid_extents(&[], 0));
+        assert!(!valid_extents(&[(2, 4), (3, 5)], 8));
+        assert!(!valid_extents(&[(2, 2)], 8));
     }
 
     #[test]

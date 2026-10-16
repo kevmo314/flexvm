@@ -1,5 +1,7 @@
 //! Resumable commands: `SESSION <id> <len>` (then `len` bytes of shell command), `ATTACH <id> <offset>`,
 //! `CLOSE <id>`. Output frames start with their stream offset (u64 LE); the exit frame is offset plus code.
+//! After an exit, the client may send SESSION_DONE on the attachment to release the session;
+//! without that acknowledgement the exit stays available for reattachment.
 //! The command runs in a process group of its own; its exit is the shell's, recorded once output stops or
 //! `DRAIN` after the shell exits; background processes that keep its pipes open run on, their later output
 //! read and dropped (by one thread, for at most `MAX_DISCARDED` pipes: past that, a job's next write gets
@@ -13,7 +15,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::hash::{BuildHasher, BuildHasherDefault};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
@@ -22,7 +24,7 @@ use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::proto::{frame, valid_session_id, FRAME_EXIT, FRAME_LOST, FRAME_MSG, FRAME_STDERR, FRAME_STDOUT, MAX_BODY};
+use crate::proto::{frame, valid_session_id, FRAME_EXIT, FRAME_LOST, FRAME_MSG, FRAME_STDERR, FRAME_STDOUT, MAX_BODY, SESSION_DONE};
 use crate::{fail, kill_running, msg, spawn_watched, wait_exit, Statuses};
 
 const CAPACITY: usize = 4 * 1024 * 1024;
@@ -358,15 +360,24 @@ pub fn handle(mut w: impl Write, body: &[u8], conn: Option<File>, line: &str, se
     match open(body, conn, line, sessions, statuses) {
         Ok(Some((id, offset, (output, me)))) => {
             let result = msg(&mut w, id).and_then(|_| drain(&mut w, &output, offset, me));
+            // Half-close output so relays finish copying before forwarding the acknowledgement.
+            // Without it (a lost exit, or a client retaining the session), retries still work.
+            let acknowledged = matches!(result, Ok(true)) && acknowledge(&output, me);
+            let mut table = sessions.lock().unwrap();
             let mut ring = output.0.lock().unwrap();
             // A replaced attachment leaves the session to its successor.
             if ring.attached.as_ref().is_some_and(|a| a.id == me) {
                 ring.attached = None;
                 ring.gone = Some(awake());
             }
+            let close = acknowledged && ring.attached.is_none() && ring.attachments == me;
             drop(ring);
+            if close {
+                table.close(id, None);
+            }
+            drop(table);
             output.1.notify_all();
-            result
+            result.map(|_| ())
         }
         Ok(None) => msg(&mut w, "closed"),
         Err(e) => fail(&mut w, e),
@@ -483,18 +494,29 @@ fn deliver(output: &Session, kind: u8, data: &[u8]) -> Duration {
     waited
 }
 
-fn drain(w: &mut impl Write, output: &Session, mut offset: u64, me: u64) -> io::Result<()> {
+fn acknowledge(output: &Session, me: u64) -> bool {
+    let conn = output.0.lock().unwrap().attached.as_ref().filter(|a| a.id == me).and_then(|a| a.conn.as_ref()).and_then(|c| c.try_clone().ok());
+    let Some(mut conn) = conn else { return false };
+    if unsafe { libc::shutdown(conn.as_raw_fd(), libc::SHUT_WR) } < 0 {
+        return false;
+    }
+    let mut ready = libc::pollfd { fd: conn.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+    let mut ack = [0];
+    (unsafe { libc::poll(&mut ready, 1, 2000) }) > 0 && conn.read(&mut ack).is_ok_and(|n| n == 1) && ack[0] == SESSION_DONE
+}
+
+fn drain(w: &mut impl Write, output: &Session, mut offset: u64, me: u64) -> io::Result<bool> {
     loop {
         let data = {
             let ring = output.0.lock().unwrap();
             if ring.attached.as_ref().is_none_or(|a| a.id != me) {
                 // Replaced; the newer attachment owns the cursor now.
-                return Ok(());
+                return Ok(false);
             }
             let error = if ring.closed { Some("session closed") } else { (offset > ring.end).then_some("offset past output end") };
             if let Some(e) = error {
                 drop(ring);
-                return fail(w, e);
+                return fail(w, e).map(|_| false);
             }
             if offset < ring.start {
                 frame(FRAME_LOST, &[&ring.start.to_le_bytes()])
@@ -521,7 +543,7 @@ fn drain(w: &mut impl Write, output: &Session, mut offset: u64, me: u64) -> io::
                 drop(ring);
                 output.1.notify_all();
             }
-            FRAME_EXIT | FRAME_LOST => return Ok(()),
+            FRAME_EXIT | FRAME_LOST => return Ok(data[0] == FRAME_EXIT),
             _ => {}
         }
     }
@@ -1080,6 +1102,57 @@ mod tests {
         assert_eq!((tiny.chunks.len(), tiny.start), (MAX_CHUNKS, 1));
         let n = MAX_CHUNKS as u64;
         assert_eq!([0, n, n + 1].map(|o| tiny.chunks_from(o)), [MAX_CHUNKS, 1, 0]);
+    }
+
+    #[test]
+    fn only_an_acknowledged_exit_releases_the_session() {
+        for acknowledge in [false, true] {
+            let (sessions, statuses) = (Sessions::default(), statuses());
+            let output = finished(&mut sessions.lock().unwrap(), "done", None);
+            let (conn, mut peer) = UnixStream::pair().unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let duplicate = File::from(OwnedFd::from(conn.try_clone().unwrap()));
+            let (sessions_, statuses_) = (sessions.clone(), statuses.clone());
+            let handler = thread::spawn(move || handle(conn, b"", Some(duplicate), "ATTACH done 0", &sessions_, &statuses_));
+            // The exit is followed by a half-close, so a relay can forward the acknowledgement.
+            let mut wire = Vec::new();
+            peer.read_to_end(&mut wire).unwrap();
+            assert!(wire.ends_with(&[&0u64.to_le_bytes()[..], &0i32.to_le_bytes()].concat()));
+            if acknowledge {
+                peer.write_all(&[SESSION_DONE]).unwrap();
+            }
+            drop(peer);
+            handler.join().unwrap().unwrap();
+            let table = sessions.lock().unwrap();
+            assert_eq!(table.closed.contains_key("done"), acknowledge);
+            assert_eq!(table.live.contains_key("done"), !acknowledge);
+            assert_eq!(output.0.lock().unwrap().closed, acknowledge);
+            drop(table);
+            let retry = request(&sessions, &statuses, "ATTACH done 0", b"");
+            if acknowledge {
+                assert!(retry.ends_with(b"session closed"));
+            } else {
+                assert!(retry.ends_with(&[&0u64.to_le_bytes()[..], &0i32.to_le_bytes()].concat()));
+            }
+        }
+    }
+
+    #[test]
+    fn an_exit_acknowledgement_cannot_close_a_newer_attachment() {
+        let (sessions, statuses) = (Sessions::default(), statuses());
+        let output = finished(&mut sessions.lock().unwrap(), "done", None);
+        let (conn, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let duplicate = File::from(OwnedFd::from(conn.try_clone().unwrap()));
+        let (sessions_, statuses_) = (sessions.clone(), statuses.clone());
+        let handler = thread::spawn(move || handle(conn, b"", Some(duplicate), "ATTACH done 0", &sessions_, &statuses_));
+        peer.read_to_end(&mut Vec::new()).unwrap();
+        // Replace the old attachment while its acknowledgement is in flight.
+        attach(&output, 0, None);
+        let _ = peer.write_all(&[SESSION_DONE]);
+        handler.join().unwrap().unwrap();
+        assert!(sessions.lock().unwrap().live.contains_key("done"));
+        assert!(!output.0.lock().unwrap().closed);
     }
 
     #[test]

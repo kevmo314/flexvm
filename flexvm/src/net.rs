@@ -258,9 +258,11 @@ fn guard(ifindex: u32, ip: Option<Ipv4Addr>) -> Result<()> {
     let tc = |handle: u32, parent: u32, info: u32| {
         [&[libc::AF_UNSPEC as u8, 0, 0, 0][..], &ifindex.to_ne_bytes(), &handle.to_ne_bytes(), &parent.to_ne_bytes(), &info.to_ne_bytes()].concat()
     };
-    let mut qdisc = tc(CLSACT_HANDLE, TC_H_CLSACT, 0);
-    attr(&mut qdisc, TCA_KIND, b"clsact\0");
-    netlink(libc::RTM_NEWQDISC, NLM_F_CREATE, &qdisc).map_err(|e| format!("its clsact qdisc (sch_ingress): {e}"))?;
+    if ip.is_none() {
+        let mut qdisc = tc(CLSACT_HANDLE, TC_H_CLSACT, 0);
+        attr(&mut qdisc, TCA_KIND, b"clsact\0");
+        netlink(libc::RTM_NEWQDISC, NLM_F_CREATE, &qdisc).map_err(|e| format!("its clsact qdisc (sch_ingress): {e}"))?;
+    }
     // Handle 1, priority 1, every protocol (in network order).
     let mut filter = tc(1, CLSACT_INGRESS, 1 << 16 | u32::from((libc::ETH_P_ALL as u16).to_be()));
     attr(&mut filter, TCA_KIND, b"bpf\0");

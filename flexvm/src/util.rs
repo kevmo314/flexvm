@@ -521,6 +521,15 @@ macro_rules! timed {
 }
 timed!(std::net::TcpStream, &std::net::TcpStream, UnixStream, &UnixStream);
 
+impl<S: Timed> Timed for &mut S {
+    fn read_timeout(&self, t: Duration) -> io::Result<()> {
+        (**self).read_timeout(t)
+    }
+    fn write_timeout(&self, t: Duration) -> io::Result<()> {
+        (**self).write_timeout(t)
+    }
+}
+
 impl<S: Timed> Timed for io::BufReader<S> {
     fn read_timeout(&self, t: Duration) -> io::Result<()> {
         self.get_ref().read_timeout(t)
