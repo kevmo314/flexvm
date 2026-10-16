@@ -813,8 +813,26 @@ pub(super) mod tests {
         let public = registry(PUBLIC, "https");
         let err = fetch(&named_registry("mixed.test", &[public, registry("127.0.0.1", "https")])).unwrap_err().to_string();
         assert!(err.contains("not on a public address"), "{err}");
-        // Public, unreachable first (a refused port): the private one connected, so local.
-        let refused = std::net::TcpListener::bind((PUBLIC, 0)).unwrap().local_addr().unwrap();
+        // Public, unreachable first: reserve a TCP port without listening, so it refuses
+        // connections and cannot be reused by another test before the fallback is exercised.
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+        assert!(fd >= 0, "socket: {}", std::io::Error::last_os_error());
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let addr = libc::sockaddr_in {
+            sin_family: libc::AF_INET as _,
+            sin_port: 0,
+            sin_addr: libc::in_addr { s_addr: u32::from_ne_bytes(PUBLIC.parse::<std::net::Ipv4Addr>().unwrap().octets()) },
+            sin_zero: [0; 8],
+        };
+        assert_eq!(
+            unsafe { libc::bind(fd.as_raw_fd(), (&addr as *const libc::sockaddr_in).cast(), std::mem::size_of_val(&addr) as _) },
+            0,
+            "bind: {}",
+            std::io::Error::last_os_error()
+        );
+        let reserved = std::net::TcpListener::from(fd);
+        let refused = reserved.local_addr().unwrap();
         assert_eq!(fetch(&named_registry("mixed-down.test", &[refused, registry("127.0.0.1", "http")])).unwrap(), "private");
         assert_eq!((tokens.load(Ordering::SeqCst), blobs.load(Ordering::SeqCst)), (2, 2));
     }

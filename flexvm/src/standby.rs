@@ -840,29 +840,33 @@ mod tests {
         std::fs::create_dir_all(&d).unwrap();
         let serve = |n: u32| {
             let l = UnixListener::bind(d.join(format!("a.{n}-1.sock"))).unwrap();
-            std::thread::spawn(move || {
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            let thread = std::thread::spawn(move || {
                 let (c, _) = l.accept().unwrap();
                 std::io::BufRead::read_line(&mut BufReader::new(&c), &mut String::new()).unwrap();
                 send_json(&mut &c, &json!({"claiming": true})).unwrap();
                 send_json(&mut &c, &json!({"ok": true, "result": n})).unwrap();
                 // Answers no other claimer: one queued here would wait out the handshake budget.
-                std::thread::sleep(Duration::from_secs(2));
-            })
+                // Keep the listener alive through the assertions, regardless of scheduling delays.
+                let _ = held.recv();
+            });
+            (thread, release)
         };
-        let (first, second) = (serve(1), serve(2));
+        let ((first, release_first), (second, release_second)) = (serve(1), serve(2));
         // Another claimer is trying the first: this one takes the second, at once.
         let other = try_take(&d.join("a.1-1.sock")).unwrap().unwrap();
         assert!(try_take(&d.join("a.1-1.sock")).is_none());
         let start = Instant::now();
         let (v, _) = take(&host, &paths, "default", &json!({"name": "a"}), &[]).unwrap().unwrap();
         assert_eq!(v, json!(2));
-        assert!(start.elapsed() < Duration::from_secs(1), "{:?}", start.elapsed());
+        assert!(start.elapsed() < HANDSHAKE_TIMEOUT, "{:?}", start.elapsed());
         // Only those others are trying are left: tried anyway.
         assert!(try_take(&d.join("a.2-1.sock")).unwrap().is_some());
         std::fs::remove_file(d.join("a.2-1.sock")).unwrap();
         let (v, _) = take(&host, &paths, "default", &json!({"name": "b"}), &[]).unwrap().unwrap();
         assert_eq!(v, json!(1));
         drop(other);
+        drop((release_first, release_second));
         first.join().unwrap();
         second.join().unwrap();
         std::fs::remove_dir_all(root).unwrap();
