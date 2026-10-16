@@ -6,9 +6,9 @@
 //! interval, that costs it far more than copying them out while it is paused.
 //!
 //! So the freeze (`copy_hot`) first copies the pages dirtied both since the last pause and in the interval before it,
-//! into memory allocated before the pause (`prepare_hot`), and hands them to the writer as saved (`Cow::hold`). All of
-//! them or none: past `HOT_MIB`, the freeze protects them all as before. They stay unprotected, and count as dirty again from the pause on: the next checkpoint copies them
-//! again. That one compares them with what this one saved: pages that did not change are left out of an incremental
+//! into memory allocated before the pause (`prepare_hot`), and hands them to the writer as saved (`Cow::hold`), up to
+//! `HOT_MIB`, preferring those copied last time too. They stay unprotected, and count as dirty again from the pause on:
+//! the next checkpoint copies them again. That one compares them with what this one saved: pages that did not change are left out of an incremental
 //! checkpoint (their contents at the pause are byte for byte what the last checkpoint has), and protected again where a
 //! whole block of them did not (`HOT_BLOCK`). The copies are kept for that comparison only once their checkpoint is
 //! the delta base (`commit_copy`); any other end drops them, and the next checkpoint leaves none out. A VM taking
@@ -24,9 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 /// Hot pages copied during a pause, at most: about 0.5 µs a
-/// page here, so up to 8 ms more pause, against 1.5 µs or more a page of guest time through faults. All or none: with
-/// more, copying some would cost the pause as much but spare the guest little (a vCPU writing pages not copied
-/// stalls as before).
+/// page here, so up to 8 ms more pause, against 1.5 µs or more a page of guest time through faults.
 const HOT_MIB: usize = 64;
 /// Threads copying hot pages during the pause.
 const HOT_THREADS: usize = 4;
@@ -122,7 +120,7 @@ impl Hot {
 
 impl Pager {
     /// Before a keep-running checkpoint pauses the VM: allocates the memory its hot pages are copied into, a little
-    /// more than is dirty now, within `HOT_MIB` (none past it). Without it, the pause protects every dirty page.
+    /// more than is dirty now, capped at `HOT_MIB`. Without it, the pause protects every dirty page.
     pub fn prepare_hot(&self) {
         let cap = HOT_MIB << 20 >> 12;
         if !self.tracking() {
@@ -130,11 +128,6 @@ impl Pager {
         }
         let dirty = self.dirty_count();
         let mut spare = self.hot_spare.lock().unwrap();
-        // Too many to copy them all (see `HOT_MIB`): none then, and no memory held for them.
-        if dirty > cap {
-            *spare = None;
-            return;
-        }
         let want = (dirty * 3 / 2 + 256).min(cap);
         if spare.as_ref().is_some_and(|b| b.pages() >= want) {
             return;
@@ -159,14 +152,9 @@ impl Pager {
         let pages = self.pages();
         let spans: Vec<(usize, usize)> = self.mappings().iter().map(|m| m.span()).collect();
         let eligible = |p: usize| pages.get(p) == PRESENT && spans.iter().any(|&(a, b)| (a..b).contains(&p));
-        // One past what fits is enough to know they do not.
-        let hot: Vec<usize> = pages.hot_pages(&before.bits).filter(|&p| eligible(p)).take(buf.pages() + 1).collect();
-        if hot.len() > buf.pages() {
-            self.recycle_buf(buf);
-            return None;
-        }
         // Taken: unless this checkpoint is taken, the next one has nothing to compare with.
         let prev = self.hot_prev.lock().unwrap().take();
+        let hot = select_hot(pages.hot_pages(&before.bits).filter(|&p| eligible(p)), prev.as_ref().map_or(&[], |h| h.pages()), buf.pages());
         let read = |p: usize, dst: &mut [u8]| self.read_at((p * PAGE_SIZE) as u64, &[libc::iovec { iov_base: dst.as_mut_ptr().cast(), iov_len: dst.len() }]);
         copy(buf, prev, hot, |p| next_to(self.mappings(), p), read).inspect_err(|e| crate::log!("uffd: hot pages not copied, protecting them: {e}")).ok()
     }
@@ -184,6 +172,18 @@ impl Pager {
             *spare = Some(buf);
         }
     }
+}
+
+/// Keeps up to `cap` ascending candidates, preferring pages copied last time too (dirty in at least three intervals), then
+/// lower page numbers. Returns ascending pages for copying runs and binary searches.
+fn select_hot(candidates: impl Iterator<Item = usize>, prev: &[usize], cap: usize) -> Vec<usize> {
+    let mut hot: Vec<usize> = candidates.collect();
+    if hot.len() > cap {
+        hot.select_nth_unstable_by_key(cap, |p| (prev.binary_search(p).is_err(), *p));
+        hot.truncate(cap);
+        hot.sort_unstable();
+    }
+    hot
 }
 
 /// Whether page `p`'s memory follows that of page `p - 1` in the same region (a read stays within one).
@@ -271,6 +271,22 @@ impl Held {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hot_pages_over_cap_keep_previous_hot_pages_first() {
+        let cap = HOT_MIB << 20 >> 12;
+        let pages = super::super::pages::Pages::new(cap + 3);
+        for p in 0..cap + 3 {
+            pages.mark_dirty(p);
+        }
+        let before = pages.dirty_bits(false);
+        let prev = [cap - 1, cap, cap + 1];
+        let hot = select_hot(pages.hot_pages(&before.bits), &prev, cap);
+        assert_eq!(hot.len(), cap);
+        assert_eq!(&hot[..cap - 3], &(0..cap - 3).collect::<Vec<_>>());
+        assert_eq!(&hot[cap - 3..], &prev);
+        assert_eq!(select_hot(pages.hot_pages(&before.bits), &[], cap), (0..cap).collect::<Vec<_>>());
+    }
 
     /// A guest of `n` pages, each filled with its own byte.
     fn guest(n: usize) -> Vec<u8> {
