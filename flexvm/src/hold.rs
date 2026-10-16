@@ -981,9 +981,8 @@ fn open_tun(dev: &str) -> std::result::Result<OwnedFd, (bool, crate::util::Error
     // TUN_F_CSUM: checksums reach us left to the device (`accept`), never completed by the
     // kernel at whatever offset a guest gave.
     const TUNSETOFFLOAD: libc::c_ulong = 0x4004_54d0;
-    if let Err(e) = eintr(|| unsafe { libc::ioctl(fd.as_raw_fd(), TUNSETOFFLOAD as _, 1 as libc::c_ulong) }) {
-        return Err((true, format!("{dev}: checksum offload: {e}").into()));
-    }
+    eintr(|| unsafe { libc::ioctl(fd.as_raw_fd(), TUNSETOFFLOAD as _, 1 as libc::c_ulong) })
+        .map_err(|e| (true, format!("{dev}: checksum offload: {e}").into()))?;
     // Room for what arrives while a release catches up (default 500).
     req.ifr_ifru.ifru_metric = TXQ as i32;
     let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };

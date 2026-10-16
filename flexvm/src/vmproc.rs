@@ -123,6 +123,14 @@ pub struct Proc {
     ident: Ident,
     name: Mutex<Option<NameLock>>,
     addr: Mutex<Option<AddrClaim>>,
+    runtime: Runtime,
+    me: std::sync::Weak<Proc>,
+    announcer: Arc<Announcer>,
+}
+
+// Kept contiguous so runtime resources retain their field drop order.
+#[derive(Default)]
+pub struct Runtime {
     vm: OnceLock<Arc<Vm>>,
     op: Mutex<()>,
     holder: OnceLock<Option<Arc<Holder>>>,
@@ -190,8 +198,13 @@ pub struct Proc {
     /// Test hook: called by `record_again` holding the host lock.
     #[cfg(test)]
     record_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
-    me: std::sync::Weak<Proc>,
-    announcer: Arc<Announcer>,
+}
+
+impl std::ops::Deref for Proc {
+    type Target = Runtime;
+    fn deref(&self) -> &Runtime {
+        &self.runtime
+    }
 }
 
 /// How regularly the controller ticks (every second when nothing holds it up).
@@ -256,41 +269,7 @@ impl Proc {
             ident,
             name: Mutex::new(None),
             addr: Mutex::new(None),
-            vm: OnceLock::new(),
-            op: Mutex::new(()),
-            holder: OnceLock::new(),
-            arrived: Mutex::new(None),
-            held_in: Mutex::new(None),
-            app_log: AtomicU64::new(0),
-            leaving: AtomicBool::new(false),
-            lent_here: AtomicBool::new(false),
-            standby: Mutex::new(None),
-            claimer: Mutex::new(None),
-            cmd: Mutex::new(None),
-            cmd_session: OnceLock::new(),
-            suspending: Mutex::new(Suspend::Idle),
-            reconciling: Mutex::new(None),
-            settling: AtomicBool::new(false),
-            early: Mutex::new(Vec::new()),
-            paused_by_request: AtomicBool::new(false),
-            consumed: Mutex::new(None),
-            pending_route: Mutex::new(None),
-            files: Mutex::new(Vec::new()),
-            granted: AtomicU64::new(0),
-            charged: AtomicU64::new(0),
-            held_grant: Mutex::new(None),
-            sizes: Mutex::new(None),
-            serving: Mutex::new(false),
-            pauses: Latest::default(),
-            resumes: Resumes::default(),
-            destroying: AtomicI32::new(0),
-            taking: Mutex::new(()),
-            ticks: Mutex::new(Ticks::default()),
-            growth: AtomicU64::new(0),
-            publishing: Mutex::new(()),
-            recording: AtomicBool::new(false),
-            #[cfg(test)]
-            record_hook: Mutex::new(None),
+            runtime: Runtime::default(),
             me: me.clone(),
             announcer,
         }))
@@ -1200,7 +1179,7 @@ impl Proc {
             "claim" => Err("this vm is not a standby vm".into()),
             op => Err(format!("unknown op {op:?}").into()),
         };
-        let _ = send_json(&mut &c, &reply.map_or_else(|e| json!({"ok": false, "error": e.to_string()}), |v| json!({"ok": true, "result": v})));
+        let _ = send_json(&mut &c, &crate::util::reply(&reply));
     }
 
     fn pages(&self, req: &Value, fds: Vec<OwnedFd>, slot: Slot) {
@@ -1584,8 +1563,9 @@ impl Proc {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum Suspend {
+    #[default]
     Idle,
     /// Reserved, or running.
     Suspending,
@@ -1648,14 +1628,9 @@ impl Latest {
     }
 }
 
-/// The SIGCONTs `flexvm resume` sent, and what came of them. Each is asked
-/// with a ticket. A SIGTSTP or SIGCONT the signal thread takes notes the
-/// tickets asked by then (`took`, under `taking`, as `ask` is): their SIGCONT
-/// is that one, came before it, or was discarded by it (a SIGTSTP sent after
-/// a SIGCONT still pending discards it). Offered to the pause worker, it
-/// carries them on, and the worker's turn (`Latest`) takes those offered by
-/// then: its handling answers them, a SIGCONT with its outcome, a SIGTSTP (a
-/// later Ctrl-Z) as paused again. Each ticket's outcome is kept for its asker.
+/// Resume tickets follow signals from `took` (under `taking`, like `ask`) to
+/// the pause worker. Each turn answers all tickets offered so far: SIGCONT
+/// with its outcome, SIGTSTP as paused again. Outcomes stay until collected.
 #[derive(Default)]
 struct Resumes {
     state: Mutex<ResumeState>,
@@ -1844,10 +1819,7 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
         crate::standby::maintain(p.host.clone());
         Ok(v)
     });
-    let reply = match &res {
-        Ok(v) => json!({"ok": true, "result": v}),
-        Err(e) => json!({"ok": false, "error": e.to_string()}),
-    };
+    let reply = crate::util::reply(&res);
     match notify.take() {
         Some(mut f) => drop(send_json(&mut f, &reply)),
         None if res.is_ok() && !reply["result"].is_null() => crate::log!("{}", reply["result"]),

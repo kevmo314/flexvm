@@ -324,9 +324,7 @@ impl Pager {
             for m in self.mappings() {
                 // struct uffdio_register: range, mode, ioctls (out).
                 let mut r = [m.base_host_virt_addr, m.size as u64, UFFDIO_REGISTER_MODE_MISSING | UFFDIO_REGISTER_MODE_WP, 0];
-                if let Err(e) = self.ioctl(UFFDIO_REGISTER, &mut r) {
-                    bail!("registering guest memory for write-protect faults: {e}");
-                }
+                self.ioctl(UFFDIO_REGISTER, &mut r).map_err(|e| format!("registering guest memory for write-protect faults: {e}"))?;
             }
             self.registered_wp.store(true, Ordering::SeqCst);
         }

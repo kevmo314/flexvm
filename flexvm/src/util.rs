@@ -524,6 +524,10 @@ fn peer_connect_error(e: io::Error) -> String {
     format!("{e}{hint}")
 }
 
+pub fn reply(result: &Result<serde_json::Value>) -> serde_json::Value {
+    result.as_ref().map_or_else(|e| serde_json::json!({"ok": false, "error": e.to_string()}), |v| serde_json::json!({"ok": true, "result": v}))
+}
+
 pub fn answer(reply: Option<serde_json::Value>, who: &str, fallback: &str) -> Result<serde_json::Value> {
     let reply = reply.ok_or_else(|| format!("{who} hung up"))?;
     if reply["ok"] != true {

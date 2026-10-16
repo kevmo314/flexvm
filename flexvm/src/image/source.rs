@@ -155,10 +155,10 @@ pub fn resolve(cache: &Path, src: &str, limits: &Limits) -> Result<Image> {
             if !f.starts_with(&path) {
                 bail!("{p:?} escapes image directory {path:?}");
             }
-            match f.is_file() {
-                true => Ok(Blob::File(f)),
-                false => bail!("{path:?} has no {p:?}"),
+            if !f.is_file() {
+                bail!("{path:?} has no {p:?}");
             }
+            Ok(Blob::File(f))
         };
         from_files(&in_dir, limits)?
     } else if path.is_file() {

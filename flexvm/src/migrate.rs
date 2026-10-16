@@ -128,9 +128,7 @@ impl Proc {
         // Test fault `park_fail`: parking the balloon fails, the VM still running as the source.
         let parked = crate::fault_result!(tripped("park_fail") => Err("injected fault: parking the balloon failed".into());
             vm.park_balloon());
-        if let Err(e) = parked {
-            return Err(self.abort(&op, &vm, mig, e));
-        }
+        parked.map_err(|e| self.abort(&op, &vm, mig, e))?;
         let mut t = Phases::new();
         let vmstate = vm.dir.join("vmstate.out");
         let hold = || self.hold_addr(&vm, mig, "migration");
@@ -154,10 +152,7 @@ impl Proc {
             t.mark("read_preload");
             Ok((runs, paused, state, pages, data))
         })();
-        let (runs, paused, state, mut pages, mut data) = match captured {
-            Ok(c) => c,
-            Err(e) => return Err(self.abort(&op, &vm, mig, e)),
-        };
+        let (runs, paused, state, mut pages, mut data) = captured.map_err(|e| self.abort(&op, &vm, mig, e))?;
         // Test fault `bad_preload`: a preload page past any guest memory, which the target refuses.
         if fault("bad_preload") {
             pages.push(u64::MAX);

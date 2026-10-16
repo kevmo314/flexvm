@@ -199,10 +199,7 @@ impl Vm {
     }
 
     pub fn post_mortem(&self) -> String {
-        match self.fc.lock().unwrap().as_ref() {
-            Some(fc) => fc.post_mortem(),
-            None => "no firecracker".into(),
-        }
+        self.fc.lock().unwrap().as_ref().map_or_else(|| "no firecracker".into(), Firecracker::post_mortem)
     }
 
     /// Its Firecracker died: whatever operation is in progress is cut short
@@ -767,21 +764,16 @@ impl Vm {
         let mut first = None;
         for tries in 1.. {
             let start = Instant::now();
-            match crate::guest::clock(&self.vsock, deadline.saturating_duration_since(start)) {
-                Ok(off) => {
-                    let off = *first.get_or_insert(off);
-                    if start.elapsed() < CLOCK_RTT || Instant::now() + Duration::from_millis(200) >= deadline {
-                        return Ok(off);
-                    }
-                    // A guest still faulting its memory in answers slowly.
-                    if tries >= 3 {
-                        std::thread::sleep(Duration::from_millis(100));
-                    }
-                }
-                Err(e) => {
-                    self.clock_unsure.store(true, Ordering::SeqCst);
-                    return Err(e);
-                }
+            let off = crate::guest::clock(&self.vsock, deadline.saturating_duration_since(start)).inspect_err(|_| {
+                self.clock_unsure.store(true, Ordering::SeqCst);
+            })?;
+            let off = *first.get_or_insert(off);
+            if start.elapsed() < CLOCK_RTT || Instant::now() + Duration::from_millis(200) >= deadline {
+                return Ok(off);
+            }
+            // A guest still faulting its memory in answers slowly.
+            if tries >= 3 {
+                std::thread::sleep(Duration::from_millis(100));
             }
         }
         unreachable!()
@@ -843,13 +835,8 @@ impl Vm {
         self.running_here()?;
         let s = crate::util::connect_unix(&self.vsock, crate::guest::TIMEOUT)?;
         let id = self.track(&s)?;
-        match start(s).and_then(|g| crate::guest::untimed(&g).map(|()| g)) {
-            Ok(g) => Ok((g, id)),
-            Err(e) => {
-                self.untrack_exec(id);
-                Err(e)
-            }
-        }
+        let g = start(s).and_then(|g| crate::guest::untimed(&g).map(|()| g)).inspect_err(|_| self.untrack_exec(id))?;
+        Ok((g, id))
     }
 
     /// A failure leaves the clock unsure (see `leave`).
