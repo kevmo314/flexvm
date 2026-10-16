@@ -74,6 +74,8 @@ pub struct Stats {
     pub given_back: AtomicU64,
     /// Faults that waited for a writer (over budget, or the page was being read), once each however often retried.
     pub retries: AtomicU64,
+    /// Faults whose page a writer claimed after the fault checked it (#88): retried once the writer was done.
+    pub writer_claimed: AtomicU64,
     /// Discards held back until the copy was done, and for how long in all.
     pub drains: AtomicU64,
     pub drain_ns: AtomicU64,
@@ -369,6 +371,7 @@ impl Cow {
             "rescue_failures": get(&s.rescue_failures),
             "given_back": get(&s.given_back),
             "retries": get(&s.retries),
+            "writer_claimed": get(&s.writer_claimed),
             "discards_held": get(&s.drains),
             "discards_held_ms": get(&s.drain_ns) as f64 / 1e6,
             "saved_while_held_mib": (get(&s.held_pages) * PAGE_SIZE as u64) >> 20,

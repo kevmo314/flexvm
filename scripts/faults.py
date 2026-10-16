@@ -3504,8 +3504,11 @@ def standby():
     check("standby: 0 stops them", wait_for(lambda: live() == 0, 30), live())
     r = ok(run(A, "ft-sb2"))
     check("standby: without one, a cold run", r["standby"] is False, r)
-    # Relative, not a wall-clock limit: a claim skips the load a cold run does.
-    check("standby: a claim is ready sooner than a cold run", claimed["ready_ms"] < r["ready_ms"], (claimed["ready_ms"], r["ready_ms"]))
+    # Structural, not timed: a claim resumes a VM loaded ahead of time, so its start has no snapshot load,
+    # which a cold start's has.
+    check("standby: a claim loads no snapshot, a cold run does",
+          "snapshot_load" not in claimed.get("timings_ms", {}) and "snapshot_load" in r.get("timings_ms", {}),
+          (claimed.get("timings_ms"), r.get("timings_ms")))
     cleanup("ft-sb1")
     cleanup("ft-sb2")
 
@@ -4113,6 +4116,7 @@ def cow_wp_race():
     ok(run(A, n))
     start_writer(A, n, mib=64, threads=2)
     fault(A, "ckpt_wp_race", 600000)
+    claimed = 0
     for i in range(8):
         path = ckpt_path(f"ft-wprace{i}")
         r = checkpoint(A, n, path, timeout=120)
@@ -4126,9 +4130,12 @@ def cow_wp_race():
         wait_for(lambda: got.update(zip(("errors", "k", "out"), writer_check(A, n))) or got["errors"] != 0 or got["k"] > k0, 30)
         errors, k1, out = got["errors"], got["k"], got["out"]
         print(f"wp race {i}: paused {r['result']['paused_ms']} ms, copy {r['result']['copy']}")
+        claimed += r["result"]["copy"].get("writer_claimed", 0)
         if not check(f"wp race {i}: every writer thread still runs, memory intact", errors == 0 and k1 > k0, (k0, k1, out)):
             break
     fault(A, "ckpt_wp_race", 0)
+    # The race itself, not only its absence of harm: a writer claimed a faulting page after the fault checked it.
+    check("wp race: a writer claimed a faulting page under the fault", claimed > 0, claimed)
     cleanup(n)
 
 
@@ -4627,9 +4634,10 @@ def shrink_stall():
     instead of answering `busy` until the guest OOMs (#97). Kernel-zone
     blocks pinned by unmovable allocations stall a shrink the same way; here
     the guest's virtio-mem driver is told not to unplug online memory at all.
-    PLUG_TEMPLATE picks the template."""
+    SHRINK_TEMPLATE (else PLUG_TEMPLATE) picks the template: it needs 4 GiB
+    at the start and 4 GiB more to grow into."""
     n = "ft-shrink-stall"
-    setup(n, mib=1, template=os.environ.get("PLUG_TEMPLATE"))
+    setup(n, mib=1, template=os.environ.get("SHRINK_TEMPLATE") or os.environ.get("PLUG_TEMPLATE"))
     v = vms(A)[n]
     if v["guest_mib"] < 4096 or v["max_mib"] - v["guest_mib"] < 4096:
         raise Skip(f"template too small ({v['guest_mib']} of {v['max_mib']} MiB)")
@@ -5225,12 +5233,14 @@ def evict_grower():
     reserve), one of them growing fast: that one is moved to B, ranked over
     two bigger but static ones by its growth, before the host gets to its
     reserve. Meanwhile each VM's controller ticks on and its memory requests
-    are answered."""
+    are answered. EVICT_TEMPLATE picks the template: its guests must grow
+    past 3 GiB."""
     g, big = "ft-ev-grow", ["ft-ev-big1", "ft-ev-big2"]
-    sums = {g: setup(g, mib=1)}
+    tpl = os.environ.get("EVICT_TEMPLATE")
+    sums = {g: setup(g, mib=1, template=tpl)}
     if vms(A)[g]["max_mib"] < 3072:
         raise Skip("its guests need room to grow past 2 GiB (one at its ceiling is starved, and moved for that)")
-    sums.update({n: setup(n, mib=900) for n in big})
+    sums.update({n: setup(n, mib=900, template=tpl) for n in big})
     time.sleep(11)  # the starts' grants age out
     base = mem_available()
     reserve, high = base - 2600, base - 700
@@ -5734,8 +5744,6 @@ def wildcard_listen():
     check("wildcard listen: port 0 refused", code != 0 and "port" in err, (code, err))
     subprocess.run(["rm", "-rf", fresh.dir])
     wilds = ["0.0.0.0"] + (["[::]"] if dual_stack() else [])
-    if len(wilds) == 1:
-        print("wildcard listen: no dual-stack loopback here; [::] not tried")
     for wild in wilds:
         stop_listener(A)
         try:
@@ -5760,6 +5768,9 @@ def wildcard_listen():
         finally:
             stop_listener(A)
             start_listener(A)
+    if len(wilds) == 1:
+        # The IPv4 case ran (its checks count); the scenario still ends SKIPPED, never ok, without [::].
+        raise Skip("no dual-stack loopback here: the [::] listener was not tried")
 
 
 def peer_by_name():
@@ -6924,9 +6935,9 @@ def terminal():
     said = lambda: log(A, n).count("injected fault: not published")
     os.killpg(p.pid, signal.SIGTSTP)
     check("terminal: its output then goes to its log", wait_for(lambda: said() >= 1, 10), log(A, n)[-300:])
-    k = said()
     os.killpg(p.pid, signal.SIGCONT)
-    wait_for(lambda: said() > k, 10)
+    # Running again, not just alive: a paused VM refuses an exec (its state may not be published meanwhile).
+    check("terminal: SIGCONT resumes it with the terminal gone", wait_for(lambda: sh(A, n, "echo hi") == (0, "hi"), 15), sh(A, n, "echo hi"))
     fault(A, "publish", 0)
     check("terminal: a closed terminal leaves it running", p.poll() is None and alive(fc), p.poll())
     os.killpg(p.pid, signal.SIGINT)

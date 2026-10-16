@@ -151,6 +151,7 @@ impl Pager {
         // writer is done, and unprotect it then. (Only with a copy: nothing is kept protected without one.)
         // Test fault `ckpt_wp_race`: the writer that claimed the page is done with it before the fault is settled.
         self.wp_race(cow, page, &[PENDING, READING, RESCUING]);
+        cow.stats.writer_claimed.fetch_add(1, Ordering::Relaxed);
         cow.wait_for(page, cow.state(page));
         Ok(Served::Writer(cow.clone()))
     }
