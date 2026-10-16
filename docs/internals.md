@@ -901,8 +901,19 @@ binds the vsock socket and maps the pmem file into KVM. The next
 configuration and memory layout; hot-plugged slots are replugged to match)
 then only restores vCPU, VM and device state. Under nested virtualization
 those prepared steps are most of a load (creating a KVM memory slot alone
-takes 3–10 ms on a busy host). Without the patch, Firecracker rejects the
-path and flexvm loads the whole snapshot during the pause.
+takes 3–10 ms on a busy host).
+
+The same patch makes a load refuse a snapshot whose devices are not exactly
+the template's (#548): the vmstate comes from a peer or a checkpoint
+directory, and Firecracker runs as root without a jail, so a device it adds
+(a block device on `/dev/sda`, a net device on another VM's tap) would be
+opened on the host. Every load names the template's vmstate as
+`device_reference_path` (a prepared load checks against the prepared
+snapshot); before anything is opened, Firecracker refuses a snapshot with
+any block device, with devices of other kinds, ids, number, guest
+addresses or pmem files than the reference's, or with a net device or vsock
+whose tap or socket the load's overrides do not name. flexvm needs the
+patch: stock Firecracker rejects the field.
 
 `firecracker/0003-hold-free-page-reporting.patch`: `PATCH
 /balloon/reporting/hold` and `PATCH /balloon/reporting/release`. While held,

@@ -568,7 +568,7 @@ fn record_working_set(paths: &Paths, dir: &Path, tap: &str, sockets: &Arc<Socket
     let p = crate::vm::Prepared::new(fc, tpl.clone())?;
     let fc = p.firecracker();
     // Like VM restores: stepping the clock touches pages of its own.
-    fc.load_snapshot(&tpl.vmstate(), tap, Some(true), crate::fc::API_TIMEOUT)?;
+    fc.load_snapshot(&tpl.vmstate(), &tpl.vmstate(), tap, Some(true), crate::fc::API_TIMEOUT)?;
     fc.resume(crate::fc::API_TIMEOUT)?;
     retry(Duration::from_secs(10), Duration::from_millis(10), || guest::ping(&fc.sockets.vsock))?;
     guest::start(&fc.sockets.vsock, "10.255.255.254".parse()?, None)?;
