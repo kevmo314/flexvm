@@ -764,8 +764,12 @@ impl Host {
     fn read_addr(&self, ip: Ipv4Addr) -> Result<Addr> {
         let path = self.addr_path(ip);
         if std::fs::metadata(&path).is_ok_and(|m| m.len() == 0) {
-            if std::fs::read_to_string(self.unsynced_marker(ip)).is_ok_and(|b| b == boot_id()) {
-                bail!("{}: empty, and written in this boot: its VM may still run", path.display());
+            // Free only on proof: no marker, or one read back from another boot. A marker that
+            // cannot be read, or no boot id to compare, proves nothing.
+            match std::fs::read_to_string(self.unsynced_marker(ip)) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(b) if !boot_id().is_empty() && b != boot_id() => {}
+                _ => bail!("{}: empty, and maybe written in this boot: its VM may still run", path.display()),
             }
             let g = load::<Gens>(&self.gens_path())?.ok_or_else(|| format!("{}: empty, with no high-water mark to bound it", path.display()))?;
             return Ok(Addr { seen: g.reserved, withdrawn: true, ..Addr::default() });
