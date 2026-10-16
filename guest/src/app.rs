@@ -525,8 +525,17 @@ mod tests {
             supervisor.join().unwrap();
             assert!(begun.elapsed() < DRAIN + Duration::from_millis(900), "{:?}", begun.elapsed());
             assert!(matches!(APP.lock().unwrap().state, State::Exited(0)));
-            // Only the discarder's thread is added, however many starts.
-            assert_eq!(count("task"), tasks + 1);
+            // Only the discarder's thread is added, however many starts. A joined thread
+            // can still be in /proc/self/task until the kernel finishes its exit.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let remaining = count("task");
+                if remaining == tasks + 1 {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "{remaining} tasks, expected {}", tasks + 1);
+                thread::sleep(Duration::from_millis(20));
+            }
         }
         // Once the descendants exit, their pipes are closed: only the discarder's wake pipe is left.
         let deadline = Instant::now() + Duration::from_secs(10);

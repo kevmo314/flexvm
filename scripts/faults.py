@@ -8142,7 +8142,8 @@ def source_unpublished():
     hears `released`, goes; one copy runs."""
     n = "ft-unpublished"
     m = setup(n, mib=200)
-    migs = lambda: os.listdir(os.path.join(B.state, "migs"))
+    # Atomic record rewrites briefly expose .ID.PID.tmp alongside the record.
+    migs = lambda: sorted(name for name in os.listdir(os.path.join(B.state, "migs")) if not name.startswith("."))
     fault(A, "publish", 60000)
     fault(B, "status", 60000)
     ok(migrate(A, n, B))
@@ -8152,7 +8153,8 @@ def source_unpublished():
     setup("ft-unpublished-gc", host=B, mib=1)
     # A sweep now, not one some process may have run meanwhile.
     ok(cli_json(B, "debug", "gc"))
-    check("unpublished: garbage collection kept the record", migs() == before and before, (before, migs()))
+    after = migs()
+    check("unpublished: garbage collection kept the record", after == before and before, (before, after))
     fault(A, "publish", 0)
     fault(B, "status", 0)
     check("unpublished: the source let go", wait_for(lambda: n not in vms(A), 30), vms(A).get(n))
