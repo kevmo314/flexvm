@@ -788,6 +788,11 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
   messages about older ones are ignored, and the route a peer
   announced for the newest one is put back when a claim here goes without
   its VM running (see process-per-vm.md).
+  No VM gets a local, peer, underlay or gateway address (#549). What a peer
+  asks for (arrival, route, lend) is checked against the listener's own peer
+  lookups, briefly waiting for one under way; a restore or resume, root's own,
+  against the listener's last-known peer addresses (`RUN/peers.json`) whatever
+  their age, with no DNS wait.
 - Reachability:
   - **Peers** get a route pushed to them: `<vm-ip>/32 via <host underlay ip>`.
     Routes via an address local to the host's network namespace (including
