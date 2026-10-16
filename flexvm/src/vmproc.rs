@@ -1137,10 +1137,10 @@ impl Proc {
                 self.publish();
                 Ok(())
             }),
+            // Not run here, whether paused or running when it left: `flexvm resume` is told so, not that it runs (#569).
+            libc::SIGCONT if self.leaving.load(Ordering::SeqCst) => Err(format!("vm {} is migrating away (or ending)", vm.name).into()),
             // Also through while a new address is pending (a resume that failed to set it): this one retries it.
             libc::SIGCONT if !(self.paused_by_request.load(Ordering::SeqCst) || vm.pending_net.load(Ordering::SeqCst)) => Ok(()),
-            // Not run here: `flexvm resume` is told so, not that it runs (#569).
-            libc::SIGCONT if self.leaving.load(Ordering::SeqCst) => Err(format!("vm {} is migrating away (or ending)", vm.name).into()),
             libc::SIGCONT => self.resume().map(drop),
             libc::SIGTERM if matches!(vm.state(), State::Source(_)) => {
                 crate::log!("vm {}: migrating away; it ends once the target has its memory", vm.name);

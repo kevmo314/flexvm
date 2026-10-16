@@ -3914,22 +3914,26 @@ def kill_prepare():
 
 
 def resume_migrating():
-    """#569: `flexvm resume` of a paused VM whose migration's outcome is unknown (ack lost,
-    status unavailable: it stays paused here, reconciling) fails, saying it is migrating
-    away, rather than reporting a resume that never ran."""
-    n = "ft-resume-migrating"
-    setup(n, mib=1)
-    check("resume migrating: paused", pause(A, n))
-    with armed_fault(B, "lost_ack", 30000):
-        fault(B, "status", 30000)
-        r = migrate(A, n, B)
-    check("resume migrating: outcome unknown, the source reconciling", not r["ok"] and vms(A).get(n, {}).get("state") == "reconciling", (r, where(n)))
-    code, out, err = cli(A, "resume", n)
-    check("resume migrating: resume fails, saying so", code != 0 and "migrating away" in err, (code, out, err))
-    check("resume migrating: the vm process said so", "migrating away" in log(A, n), log(A, n)[-500:])
-    fault(B, "status", 0)
-    st = wait_released(B, n, timeout=60)
-    check("resume migrating: then it moves on", st["released"] is True and st["state"] == "paused", st)
+    """#569: `flexvm resume` of a VM whose migration's outcome is unknown (ack lost, status
+    unavailable: it stays paused here, reconciling) fails, saying it is migrating away, rather
+    than reporting a resume that never ran: whether it was paused or running when it left."""
+    for paused in (True, False):
+        n = f"ft-resume-migrating-{'paused' if paused else 'running'}"
+        what = f"resume migrating ({'paused' if paused else 'running'})"
+        clear_log(A, n)
+        setup(n, mib=1)
+        if paused:
+            check(f"{what}: paused", pause(A, n))
+        with armed_fault(B, "lost_ack", 30000):
+            fault(B, "status", 30000)
+            r = migrate(A, n, B)
+        check(f"{what}: outcome unknown, the source reconciling", not r["ok"] and vms(A).get(n, {}).get("state") == "reconciling", (r, where(n)))
+        code, out, err = cli(A, "resume", n)
+        check(f"{what}: resume fails, saying so", code != 0 and "migrating away" in err, (code, out, err))
+        check(f"{what}: the vm process said so", "migrating away" in log(A, n), log(A, n)[-500:])
+        fault(B, "status", 0)
+        st = wait_released(B, n, timeout=60)
+        check(f"{what}: then it moves on", st["released"] is True and st["state"] == ("paused" if paused else "running"), st)
 
 
 def resume_bind_fail():
