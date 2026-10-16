@@ -7,7 +7,7 @@
 
 use std::borrow::Cow;
 use std::io::{BufReader, Read, Write};
-use std::net::{Ipv4Addr, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, TcpStream};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -53,6 +53,30 @@ struct Header<'a> {
 enum Outcome {
     Committed(Value),
     Aborted,
+}
+
+/// A reroute remains owed even before its target underlay can be validated.
+#[derive(Clone)]
+pub(crate) struct Route {
+    to: String,
+    target: Value,
+    peer: Option<IpAddr>,
+    via: Option<Ipv4Addr>,
+}
+
+impl Route {
+    fn new(to: &str, target: &Value, conn: Option<&TcpStream>) -> Self {
+        Self { to: to.into(), target: target.clone(), peer: conn.and_then(|c| c.peer_addr().ok()).map(|a| a.ip()), via: None }
+    }
+
+    fn resolve(&mut self, host: &crate::host::Host) -> Result<Ipv4Addr> {
+        if let Some(via) = self.via {
+            return Ok(via);
+        }
+        let via = target_via(host, &self.target, &self.to, self.peer)?;
+        self.via = Some(via);
+        Ok(via)
+    }
 }
 
 impl Proc {
@@ -396,9 +420,12 @@ impl Proc {
                 }
                 delay = (delay * 2).min(Duration::from_secs(5));
             }
-            if let Some(via) = p.take_pending_route(mig) {
-                if let Err(e) = p.switch_route(mig, via) {
-                    crate::log!("route {} via {via}: {e}; giving up", p.vm().ip);
+            // One last try, never a retry loop: until `finish` the source stays unkillable, keeps its
+            // name, claim and paused Firecracker, and a migration back here waits. `retry_route` already
+            // retried in the background while the target pulled.
+            if let Some(mut route) = p.take_pending_route(mig) {
+                if let Err(e) = route.resolve(&p.host).and_then(|via| p.switch_route(mig, via)) {
+                    crate::log!("route {} to {}: {e}; giving up", p.vm().ip, route.to);
                 }
             }
             let op = p.op();
@@ -418,16 +445,19 @@ impl Proc {
     /// A failed route is retried in the background: the target owns the VM either way.
     fn reroute(&self, mig: u64, to: &str, target: &Value, conn: Option<&TcpStream>, switch: bool) -> (Option<hold::Stats>, Result<()>) {
         let ip = self.vm().ip;
-        let via = match target_via(&self.host, target, to, conn) {
+        let mut route = Route::new(to, target, conn);
+        *self.pending_route.lock().unwrap() = Some((mig, route.clone()));
+        let via = match route.resolve(&self.host) {
             Ok(via) => via,
             Err(e) => {
                 if let Some(h) = self.holder() {
                     h.forget(ip, mig);
                 }
-                self.retry_route(mig, to, target, None, &e);
+                self.retry_route(mig, route, &e);
                 return (None, Err(e));
             }
         };
+        *self.pending_route.lock().unwrap() = Some((mig, route.clone()));
         let (mut held, mut res) = (None, None);
         if let Some(h) = self.holder().filter(|h| h.holding_for(ip, mig)) {
             // Its paused Firecracker takes nothing off the tap: what is there came before the hold.
@@ -451,33 +481,26 @@ impl Proc {
         }
         let res = res.unwrap_or_else(|| self.switch_route(mig, via));
         if let Err(e) = &res {
-            self.retry_route(mig, to, target, Some(via), e);
+            self.retry_route(mig, route, e);
+        } else {
+            self.take_pending_route(mig);
         }
         (held, res)
     }
 
-    fn retry_route(&self, mig: u64, to: &str, target: &Value, via: Option<Ipv4Addr>, error: &dyn std::fmt::Display) {
+    fn retry_route(&self, mig: u64, mut route: Route, error: &dyn std::fmt::Display) {
         let Some(p) = self.arc() else { return };
-        let ip = self.vm().ip;
-        let what = format!("route {ip} to {to}");
+        let what = format!("route {} to {}", self.vm().ip, route.to);
         crate::log!("{what}: {error}; retrying");
-        if let Some(via) = via {
-            *self.pending_route.lock().unwrap() = Some((mig, via));
-        }
-        let (to, target) = (to.to_string(), target.clone());
         thread::spawn(move || {
             if !retry(&what, || {
-                let resolved = match via {
-                    Some(via) => via,
-                    None => target_via(&p.host, &target, &to, None)?,
-                };
-                if via.is_none() {
-                    let mut pending = p.pending_route.lock().unwrap();
-                    if pending.is_none_or(|(m, _)| m == mig) {
-                        *pending = Some((mig, resolved));
-                    }
+                let via = route.resolve(&p.host)?;
+                let mut pending = p.pending_route.lock().unwrap();
+                if pending.as_ref().is_some_and(|(m, _)| *m == mig) {
+                    *pending = Some((mig, route.clone()));
                 }
-                p.switch_route(mig, resolved)
+                drop(pending);
+                p.switch_route(mig, via)
             }) {
                 return;
             }
@@ -490,9 +513,9 @@ impl Proc {
 
     /// Migration `mig`'s pending route, taken: never a later migration's, which an old retry or
     /// an abort must leave for that migration's own `wait_release`.
-    fn take_pending_route(&self, mig: u64) -> Option<Ipv4Addr> {
+    fn take_pending_route(&self, mig: u64) -> Option<Route> {
         let mut pending = self.pending_route.lock().unwrap();
-        pending.take_if(|(m, _)| *m == mig).map(|(_, via)| via)
+        pending.take_if(|(m, _)| *m == mig).map(|(_, route)| route)
     }
 
     /// Runs `f`, a route change for this VM's address, under the host lock and only while
@@ -959,7 +982,7 @@ impl Proc {
 }
 
 /// Check the target before forwarding held packets or changing any route.
-fn target_via(host: &crate::host::Host, target: &Value, to: &str, conn: Option<&TcpStream>) -> Result<Ipv4Addr> {
+fn target_via(host: &crate::host::Host, target: &Value, to: &str, peer: Option<IpAddr>) -> Result<Ipv4Addr> {
     let via = target["underlay"].as_str().ok_or("target sent no underlay")?.parse()?;
     let cfg = host.config_now();
     let cache = crate::listen::Cached::read(&host.run, &cfg.peers);
@@ -969,8 +992,8 @@ fn target_via(host: &crate::host::Host, target: &Value, to: &str, conn: Option<&
             peers.extend(addrs);
         }
     }
-    match conn {
-        Some(conn) => peers.push(conn.peer_addr()?.ip()),
+    match peer {
+        Some(peer) => peers.push(peer),
         None => {
             if let Ok(addrs) = crate::util::resolve(to, Instant::now() + Duration::from_secs(2)) {
                 peers.extend(addrs.iter().map(|a| a.ip()));
@@ -1162,10 +1185,13 @@ mod tests {
         .unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let conn = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        assert_eq!(target_via(&host, &json!({"underlay": "127.0.0.1"}), "unseen.invalid:7070", Some(&conn)).unwrap(), Ipv4Addr::LOCALHOST);
+        assert_eq!(
+            target_via(&host, &json!({"underlay": "127.0.0.1"}), "unseen.invalid:7070", Some(conn.peer_addr().unwrap().ip())).unwrap(),
+            Ipv4Addr::LOCALHOST
+        );
         // Reconciliation has no connection: resolve the destination instead.
         assert_eq!(target_via(&host, &json!({"underlay": "127.0.0.1"}), "localhost:7070", None).unwrap(), Ipv4Addr::LOCALHOST);
-        assert!(target_via(&host, &json!({"underlay": "192.0.2.8"}), "127.0.0.1:7070", Some(&conn)).is_err());
+        assert!(target_via(&host, &json!({"underlay": "192.0.2.8"}), "127.0.0.1:7070", Some(conn.peer_addr().unwrap().ip())).is_err());
         assert!(target_via(&host, &json!({"underlay": "224.0.0.1"}), "224.0.0.1:7070", None).is_err());
     }
 
@@ -1187,6 +1213,41 @@ mod tests {
             via.map(|_| ())
         }));
         assert_eq!(attempts, 2);
+    }
+
+    #[test]
+    fn unresolved_pending_route_can_be_resolved_at_release() {
+        let root = crate::test_util::TempDir::new("pending-route");
+        let mut host = crate::host::Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let mut pending = Some((7, Route::new("bad address", &json!({"underlay": "192.0.2.7"}), None)));
+        // Neither the initial attempt nor its background retry can validate the target yet.
+        for _ in 0..2 {
+            assert!(pending.as_mut().unwrap().1.resolve(&host).is_err());
+        }
+        host.configure(|c| {
+            c.peers.push("192.0.2.7:7070".into());
+            Ok(())
+        })
+        .unwrap();
+        // Release still has the unresolved reroute, even if all earlier attempts failed.
+        assert!(pending.take_if(|(mig, _)| *mig == 8).is_none());
+        let (_, mut route) = pending.take_if(|(mig, _)| *mig == 7).unwrap();
+        assert_eq!(route.resolve(&host).unwrap(), "192.0.2.7".parse::<Ipv4Addr>().unwrap());
+    }
+
+    #[test]
+    fn route_retry_retains_the_connection_peer() {
+        let root = crate::test_util::TempDir::new("route-peer-retry");
+        let host = crate::host::Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let conn = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let route = Route::new("bad address", &json!({"underlay": "127.0.0.1"}), Some(&conn));
+        drop(conn);
+        // The connection address survives copying the unresolved route to the retry thread.
+        let mut retry = route.clone();
+        assert_eq!(retry.resolve(&host).unwrap(), Ipv4Addr::LOCALHOST);
+        assert!(route.via.is_none());
+        assert!(target_via(&host, &route.target, &route.to, None).is_err());
     }
 
     /// A refused arrival reads what its source still sends, so the source, still writing, gets the reason, not a reset.
