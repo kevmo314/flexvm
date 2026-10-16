@@ -2526,6 +2526,15 @@ pub fn gate(name: &str) {
     }
 }
 
+/// Test fault `name`, armed: also tells a test this process got there (`reached`), so it can tell the fault was hit.
+pub fn tripped(name: &str) -> bool {
+    let armed = fault(name);
+    if armed {
+        reached(name);
+    }
+    armed
+}
+
 /// Test hook: tells a test this process got to `name` (RUN/gates/NAME.PID), so it acts there, not after a guessed delay.
 fn reached(name: &str) {
     if let Some(dir) = RUN_DIR.get().map(|r| r.join("gates")) {

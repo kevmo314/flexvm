@@ -489,6 +489,7 @@ impl Proc {
     }
 
     /// Moves the VM's revision `by` on, recorded here too.
+    /// Test fault `advance_fail`: recording it here fails, the revision moved on.
     pub fn advance(&self, l: &crate::host::Locked, by: u64) -> Result<()> {
         let Some((ip, gen, rev)) = self.addr.lock().unwrap().as_mut().map(|a| {
             a.rev = a.rev.saturating_add(by);
@@ -496,6 +497,9 @@ impl Proc {
         }) else {
             return Ok(());
         };
+        if crate::host::tripped("advance_fail") {
+            bail!("injected fault: recording the revision failed");
+        }
         self.host.advance(l, ip, gen, rev)
     }
 

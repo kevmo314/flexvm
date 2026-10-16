@@ -290,10 +290,14 @@ impl Vm {
         // Link-down waits for an RCU grace period; joined on every path so `resume` never races it.
         let tap = self.tap.clone();
         let down = std::thread::spawn(move || crate::net::set_link_up(&tap, false));
-        let saved = self.fc(|fc| {
-            self.snapshot_discards.store(self.pager.discards(), Ordering::SeqCst);
-            fc.put("/snapshot/create", json!({"snapshot_type": "Full", "snapshot_path": vmstate, "mem_file_path": "", "sync_snapshot_files": sync}))
-        });
+        // Test fault `snapshot_fail`: Firecracker's snapshot fails, the VM paused.
+        let saved = match crate::host::tripped("snapshot_fail") {
+            true => Err("injected fault: creating the snapshot failed".into()),
+            false => self.fc(|fc| {
+                self.snapshot_discards.store(self.pager.discards(), Ordering::SeqCst);
+                fc.put("/snapshot/create", json!({"snapshot_type": "Full", "snapshot_path": vmstate, "mem_file_path": "", "sync_snapshot_files": sync}))
+            }),
+        };
         t.mark("snapshot_create");
         let down = down.join().unwrap_or_else(|_| Err("link-down thread panicked".into()));
         t.mark("link_down");
