@@ -805,8 +805,11 @@ fn sweep(paths: &Paths) -> Result<()> {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
         let tombstone = name.strip_prefix('.').and_then(|n| n.split_once(".rm-")).is_some_and(|(id, nonce)| valid_id(id) && crate::util::is_nonce(nonce));
+        // Like a build's leftovers: one it cannot finish must not stop every build after it.
         if entry.file_type()?.is_dir() && tombstone {
-            finish_remove(paths, &entry.path(), None)?;
+            if let Err(e) = finish_remove(paths, &entry.path(), None) {
+                crate::log!("template: removing {}, left by an rmi that did not finish: {e}", entry.path().display());
+            }
         }
     }
     // A lock made under this lock (shared) and its build's directory gone: its build's too.
@@ -1552,6 +1555,24 @@ mod tests {
         assert!(!rootfs.exists());
         sweep(&f.paths).unwrap();
         assert!(!tombstone.exists());
+    }
+
+    #[test]
+    fn a_tombstone_sweep_cannot_remove_does_not_stop_builds() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = Fixture::new();
+        let gens = f.paths.templates.join(GENERATIONS);
+        std::fs::create_dir_all(&gens).unwrap();
+        let stuck = gens.join(".aaaa1111.rm-0000000000000001/stuck");
+        std::fs::create_dir_all(&stuck).unwrap();
+        std::fs::write(stuck.join("file"), b"x").unwrap();
+        std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let removable = std::fs::remove_file(stuck.join("file")).is_ok(); // as root
+        let res = sweep(&f.paths);
+        std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o755)).unwrap();
+        res.unwrap();
+        assert!(removable || stuck.exists());
+        assert!(Staging::new(&f.paths, "t").is_ok());
     }
 
     #[test]
