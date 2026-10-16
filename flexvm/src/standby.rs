@@ -890,38 +890,62 @@ mod tests {
         let mut pids = [Ident::me().pid, unsafe { libc::getppid() } as u32];
         pids.sort_by_key(|pid| format!("{pid}.sock"));
         let socks = pids.map(|pid| d.join(format!("{pid}.sock")));
-        let serve = |n: u32| {
-            let l = UnixListener::bind(&socks[(n - 1) as usize]).unwrap();
-            let (release, held) = std::sync::mpsc::channel::<()>();
-            let thread = std::thread::spawn(move || {
-                let (c, _) = l.accept().unwrap();
-                std::io::BufRead::read_line(&mut BufReader::new(&c), &mut String::new()).unwrap();
-                send_json(&mut &c, &json!({"claiming": true})).unwrap();
-                send_json(&mut &c, &json!({"ok": true, "result": n})).unwrap();
-                // Answers no other claimer: one queued here would wait out the handshake budget.
-                // Keep the listener alive through the assertions, regardless of scheduling delays.
-                let _ = held.recv();
-            });
-            (thread, release)
+        let first = UnixListener::bind(&socks[0]).unwrap();
+        let second = UnixListener::bind(&socks[1]).unwrap();
+        let claim = |name: &'static str| {
+            let host = host.clone();
+            let paths = paths.clone();
+            std::thread::spawn(move || take(&host, &paths, "default", &json!({"name": name}), &[]).unwrap().unwrap().0)
         };
-        let ((first, release_first), (second, release_second)) = (serve(1), serve(2));
-        // Another claimer is trying the first: this one takes the second, at once.
-        let other = try_take(&socks[0]).unwrap().unwrap();
+        let request = |listener: &UnixListener, name: &str| {
+            assert!(crate::util::readable(listener, CLAIM_TIMEOUT).unwrap(), "claimer {name} did not connect");
+            let (c, _) = listener.accept().unwrap();
+            let mut r = crate::util::By { s: BufReader::new(&c), at: Instant::now() + CLAIM_TIMEOUT };
+            assert_eq!(crate::util::recv_json(&mut r).unwrap().unwrap()["name"], name);
+            c
+        };
+        let first_claimer = claim("a");
+        // Wait for an actual claim in flight before starting its competitor.
+        let mut first_request = request(&first, "a");
         assert!(try_take(&socks[0]).is_none());
-        let start = Instant::now();
-        let (v, _) = take(&host, &paths, "default", &json!({"name": "a"}), &[]).unwrap().unwrap();
-        assert_eq!(v, json!(2));
-        assert!(start.elapsed() < HANDSHAKE_TIMEOUT, "{:?}", start.elapsed());
-        // Only those others are trying are left: tried anyway.
-        assert!(try_take(&socks[1]).unwrap().is_some());
-        std::fs::remove_file(&socks[1]).unwrap();
-        let (v, _) = take(&host, &paths, "default", &json!({"name": "b"}), &[]).unwrap().unwrap();
+        let second_claimer = claim("b");
+        let mut second_request = request(&second, "b");
+        // The second request reached the other standby while the first handshake
+        // was still pending. On timeout the first claimer releases this take lock.
+        // Check that state before replying: processing replies can take longer than
+        // HANDSHAKE_TIMEOUT (CLAIM_TIMEOUT applies once claiming is received).
+        assert!(try_take(&socks[0]).is_none(), "first claimer timed out before the second request arrived");
+        for (c, n) in [(&mut first_request, 1), (&mut second_request, 2)] {
+            send_json(c, &json!({"claiming": true})).unwrap();
+            send_json(c, &json!({"ok": true, "result": n})).unwrap();
+        }
+        assert_eq!(first_claimer.join().unwrap(), json!(1));
+        assert_eq!(second_claimer.join().unwrap(), json!(2));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_busy_standby_is_tried_if_no_idle_one_remains() {
+        let root = crate::test_util::TempDir::new("standby-busy");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        std::fs::create_dir_all(root.join("templates/.gen/a")).unwrap();
+        std::os::unix::fs::symlink(".gen/a", root.join("templates/default")).unwrap();
+        let paths = Paths::new(&root);
+        let d = dir(&host, "default");
+        std::fs::create_dir_all(&d).unwrap();
+        let sock = d.join(format!("{}.sock", Ident::me().pid));
+        let listener = UnixListener::bind(&sock).unwrap();
+        let other = try_take(&sock).unwrap().unwrap();
+        let peer = std::thread::spawn(move || {
+            let (c, _) = listener.accept().unwrap();
+            crate::util::recv_json(&mut BufReader::new(&c)).unwrap().unwrap();
+            send_json(&mut &c, &json!({"claiming": true})).unwrap();
+            send_json(&mut &c, &json!({"ok": true, "result": 1})).unwrap();
+        });
+        let (v, _) = take(&host, &paths, "default", &json!({"name": "test"}), &[]).unwrap().unwrap();
         assert_eq!(v, json!(1));
         drop(other);
-        drop((release_first, release_second));
-        first.join().unwrap();
-        second.join().unwrap();
-        std::fs::remove_dir_all(root).unwrap();
+        peer.join().unwrap();
     }
 
     #[test]
