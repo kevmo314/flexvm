@@ -17,7 +17,7 @@ Each scenario ends `ok`, `FAILED` or `SKIPPED` (this host lacks what it tests,
 or it restarts listeners it was not given: --no-listeners); --no-skips counts
 a skip as a failure. BENCHMARKS (ckpt_stall) only run when named.
 """
-from contextlib import contextmanager, suppress
+from contextlib import ExitStack, contextmanager, suppress
 
 import argparse, base64, fcntl, ipaddress, json, struct, os, re, signal, socket, subprocess, sys, tempfile, termios, threading, time, traceback
 
@@ -399,6 +399,64 @@ def addr(host, ip):
         return {}
 
 
+# --- a third peer, down -------------------------------------------------------------------------
+# A peer's route next hop must be one of its peers' addresses, and not a router (#591). Scenarios that
+# need a route the kernel really installs, via a host other than A or B, use this one: an address in a
+# network namespace of its own behind a veth, on-link here and not ours, where nothing listens (a peer
+# that is down: what is sent to it is refused at once). Listed as a peer of A and B only while such a
+# scenario runs (`with_third_peer`).
+EXTRA_PEERS = []
+THIRD = {}
+
+
+def third_peer():
+    """The third peer's address (its namespace made on first use, removed at exit)."""
+    if not THIRD:
+        pid = os.getpid()
+        ns, dev, base = f"fvp-third-{pid}", f"fvp3{pid % 100000}", ipaddress.IPv4Address("198.19.0.0") + (pid % 16384) * 4
+        subprocess.run(["ip", "netns", "add", ns], check=True)
+        THIRD.update(ns=ns, dev=dev, addr=str(base + 2))
+        subprocess.run(["ip", "link", "add", dev, "type", "veth", "peer", "name", "eth0", "netns", ns], check=True)
+        subprocess.run(["ip", "addr", "add", f"{base + 1}/30", "dev", dev], check=True)
+        subprocess.run(["ip", "link", "set", dev, "up"], check=True)
+        subprocess.run(["ip", "-n", ns, "addr", "add", f"{base + 2}/30", "dev", "eth0"], check=True)
+        for d in ("eth0", "lo"):
+            subprocess.run(["ip", "-n", ns, "link", "set", d, "up"], check=True)
+    return THIRD["addr"]
+
+
+def remove_third_peer():
+    if THIRD:
+        subprocess.run(["ip", "link", "del", THIRD["dev"]], capture_output=True)
+        subprocess.run(["ip", "netns", "del", THIRD["ns"]], capture_output=True)
+        THIRD.clear()
+
+
+@contextmanager
+def listing_third_peer(*hosts):
+    """The third peer listed by `hosts` (and by a listener restarted meanwhile), their own peer lists
+    as they were afterwards. Not across a restart of a loopback listener: one refuses a peer elsewhere."""
+    peer = f"{third_peer()}:7070"
+    before = {h: ok(cli_json(h, "config"))["set"].get("peers", []) for h in hosts}
+    EXTRA_PEERS.append(peer)
+    try:
+        for h in hosts:
+            ok(cli_json(h, "config", *[a for p in before[h] + [peer] for a in ("--peer", p)]))
+        yield
+    finally:
+        EXTRA_PEERS.remove(peer)
+        for h in hosts:
+            ok(cli_json(h, "config", *([a for p in before[h] for a in ("--peer", p)] or ["--peer", ""])))
+
+
+def with_third_peer(scenario):
+    """`scenario`, run with the third peer listed by A and B."""
+    def run():
+        with listing_third_peer(A, B):
+            scenario()
+    run.__name__ = scenario.__name__
+    return run
+
 def start_listener(h, listen=None, extra=(), peer=None, wait=True):
     """`h`'s listener, on `listen` (default: its address) with `extra` flags,
     peered with `peer` (default: the other host's address); `wait`: until it
@@ -410,7 +468,7 @@ def start_listener(h, listen=None, extra=(), peer=None, wait=True):
     # Include the spare addresses in each subnet used by forged-arrival scenarios too.
     nets = [ipaddress.IPv4Network(f"{ip}/24", strict=False) for host in (h, other) for ip in host.ips.split("-")]
     first, last = min(n.network_address for n in nets) + 1, max(n.broadcast_address for n in nets) - 1
-    ok(cli_json(h, "config", "--peer", peer or other.addr, "--vm-ips", h.ips,
+    ok(cli_json(h, "config", "--peer", peer or other.addr, *[a for p in EXTRA_PEERS for a in ("--peer", p)], "--vm-ips", h.ips,
                 "--cluster-ips", f"{first}-{last}", "--reserve", "512", *extra))
     listeners[h.addr] = spawn_cli(h, "listen", listen or h.addr, stdout=lg, stderr=lg)
     if not wait:
@@ -1443,6 +1501,7 @@ def arrival_cap_restart():
     lock = os.path.join(B.run, "vms", ".locks", "ft-cap-x.lock")
     check("arrival cap restart: and gives up too", wait_for(lambda: not os.path.exists(lock), 10))
 
+@with_third_peer
 def abort_superseded():
     """A migration that aborts after the source paused does not resume the
     source if a newer generation of its address was recorded meanwhile (the
@@ -1452,9 +1511,9 @@ def abort_superseded():
     setup(n)
     v = vms(A)[n]
     ip, gen = v["ip"], v["gen"]
-    # The replacement's host: an on-link address that is not ours (the
-    # default gateway), so the route is really installed.
-    gw = subprocess.run(["ip", "route", "show", "default"], capture_output=True, text=True).stdout.split()[2]
+    # The replacement's host: the third peer, on-link and not ours, so the
+    # route is really installed.
+    gw = third_peer()
     with armed_fault(A, "pages", 30000):
         res, t = background(lambda: migrate(A, n, B))
         # While the target probes the dead page server, the address moves on.
@@ -1802,6 +1861,7 @@ def glob_idle(pid, start):
         return []
 
 
+@with_third_peer
 def abort_stay_fail():
     """#460: an abort (the target refused a bad preload page) runs the source here again, then
     marking it here again (`abort_stay_fail`) and recording its revision (`advance_fail`, after it moved on)
@@ -1814,7 +1874,7 @@ def abort_stay_fail():
     v = vms(A)[n]
     ip, gen, tap = v["ip"], v["gen"], v["tap"]
     rev = addr(A, ip).get("rev", 0)
-    gw = subprocess.run(["ip", "route", "show", "default"], capture_output=True, text=True).stdout.split()[2]
+    gw = third_peer()
     before = boundary(B)
     seen = len(log(A, n))
     faults = ("bad_preload", "abort_stay_fail", "advance_fail")
@@ -2290,6 +2350,7 @@ def rx_stall():
           f"{len(stalls)} stalls in {sum(done.values())} operations {done}, sent {sent[0]}")
 
 
+@with_third_peer
 def handoff_superseded():
     """A same-host arrival routes its address only after the held packets
     (`handoff_stall` delays that by 3 s). A newer generation of the address
@@ -2298,7 +2359,7 @@ def handoff_superseded():
     ok(run(A, n))
     v = vms(A)[n]
     ip, gen = v["ip"], v["gen"]
-    gw = subprocess.run(["ip", "route", "show", "default"], capture_output=True, text=True).stdout.split()[2]
+    gw = third_peer()
     with armed_fault(B, "handoff_stall", 30000):
         clear_log(B, n)
         r = migrate(A, n, B)
@@ -2802,10 +2863,10 @@ def peer_route(ip):
 
 def arrival_with_peer_route(n, ip):
     """B learns that an address of A's is routed via a peer (an on-link
-    address that is not ours, the default gateway, so the route is really
+    address that is not ours, the third peer's, so the route is really
     installed), then takes an arrival of it that sends a vmstate that cannot
     load and preloaded pages it never sends. Returns (socket, mig, gateway)."""
-    gw = subprocess.run(["ip", "route", "show", "default"], capture_output=True, text=True).stdout.split()[2]
+    gw = third_peer()
     gen = addr(B, ip).get("seen", 0) + 1
     r = peer(B, {"op": "route", "ip": ip, "via": gw, "gen": gen, "rev": 0})
     assert r.get("ok"), r
@@ -2826,6 +2887,7 @@ def forget_peer_route(ip, gen):
     subprocess.run(["ip", "route", "del", f"{ip}/32"], capture_output=True)
 
 
+@with_third_peer
 def arrival_abort_route():
     """#90: an arrival that fails before it commits leaves the target host's
     route back to its peer alone; the address never routes to its tap."""
@@ -2847,6 +2909,7 @@ def arrival_abort_route():
     forget_peer_route(ip, gen)
 
 
+@with_third_peer
 def arrival_killed_route():
     """#90: an arrival SIGKILLed before it commits (no cleanup runs) leaves
     the route back to its peer; one lost meanwhile is put back once its
@@ -7555,18 +7618,19 @@ def pull_died():
     check("home died: and not handed out again", not r["ok"] and "lent" in r.get("error", ""), r)
 
 
+@with_third_peer
 def route_abort():
     """#231: a source whose route switch failed retries it in the background. Its target
     then dies mid-pull, so the source aborts and runs its copy again; the retry, which the
     abort left with the same holder and generation, must not route the address to the dead
-    target afterwards. B advertises an underlay that is not a local address (the default
-    gateway), so the source's switch is a real route the kernel keeps. The source's page
+    target afterwards. B advertises an underlay that is not a local address (the third
+    peer's), so the source's switch is a real route the kernel keeps. The source's page
     server is slowed from the start (`pages_slow`: every reply comes, a second late), not
     stopped on a timer: the target's probe of it still succeeds, and its 1000 MiB take
     minutes to pull, so it is killed mid-pull however loaded the host (#294)."""
     n = "ft-route-abort"
     scenario_vms.add(n)
-    gw = subprocess.run(["ip", "route", "show", "default"], capture_output=True, text=True).stdout.split()[2]
+    gw = third_peer()
     code, out, err = cli(B, "config", "--underlay", gw)
     assert code == 0, err
     ip = None
@@ -8983,6 +9047,7 @@ class RouteWatch:
         self.proc.wait()
 
 
+@with_third_peer
 def restore_route_fence():
     """#534: a restore installs its address's route only under its generation
     fence, paused (--paused) or not. Held at restore_prepared_gate (Firecracker
@@ -8994,7 +9059,7 @@ def restore_route_fence():
     ip = vms(A)[n]["ip"]
     ok(checkpoint(A, n, path, stop=True))
     check("route fence: checkpointed, the vm gone", wait_for(lambda: n not in vms(A), 30), vms(A).get(n))
-    gw = subprocess.run(["ip", "route", "show", "default"], capture_output=True, text=True).stdout.split()[2]
+    gw = third_peer()
     marker = A.ips.split("-")[1].rsplit(".", 1)[0] + ".249"
     gate = "restore_prepared_gate"
     for paused in (False, True):
@@ -9067,8 +9132,11 @@ def reboot():
     ok(migrate(A, moved, B))
     wait_released(B, moved)
     check("reboot: lent while away", lent(ip_moved) is not None, addr(A, ip_moved))
-    # A peer's VM that B routes to (via the default gateway, not an address of ours, so the route is really made).
-    gw = subprocess.run(["ip", "route", "show", "default"], capture_output=True, text=True).stdout.split()[2]
+    # A peer's VM that B routes to (via the third peer, not an address of ours, so the route is really made),
+    # listed by B until the route is back: B's loopback listener, restarted after, refuses a peer elsewhere.
+    gw = third_peer()
+    third_listed = ExitStack()
+    third_listed.enter_context(listing_third_peer(B))
     ip_peer = A.ips.split("-")[1].rsplit(".", 1)[0] + ".203"
     gen = addr(B, ip_peer).get("seen", 0) + 1
     r = peer(B, {"op": "route", "ip": ip_peer, "via": gw, "gen": gen, "rev": 0})
@@ -9108,6 +9176,7 @@ def reboot():
               (addr(B, ip_local), addr(B, ip_moved)))
         check("reboot: A takes back its loan", wait_for(lambda: not lent(ip_moved) and addr(A, ip_moved).get("withdrawn") is True, 15), addr(A, ip_moved))
         check("reboot: the route to the peer's vm is back", f"via {gw}" in peer_route(ip_peer), peer_route(ip_peer))
+        third_listed.close()
         check("reboot: the standby vm is refilled", wait_for(lambda: len(standby_pids(B, t)) == 1, 60), standby_pids(B, t))
         start_listener(B)
         ok(kill(B, local))
@@ -9117,6 +9186,7 @@ def reboot():
         ok(run(A, n2, ip=ip_moved))
         check("reboot: A hands the address out again", where(n2) == {A: "running"}, where(n2))
     finally:
+        third_listed.close()
         if B.addr not in listeners:
             start_listener(B)
         cli_json(B, "standby", "--template", t, "0")
@@ -9216,6 +9286,7 @@ try:
                 print(f"scenario {s}: {'ok' if failures == before else 'FAILED'} in {time.time() - started:.1f} s", flush=True)
 finally:
     stop_listeners()
+    remove_third_peer()
     for d in OWN_DIRS:
         subprocess.run(["rm", "-rf", d])
 print("failures:", failures, "skipped:", len(skipped), *(["(" + " ".join(skipped) + ")"] if skipped else []))
