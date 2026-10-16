@@ -1020,7 +1020,7 @@ impl Host {
     /// one). A withdrawal frees a loan of that gen or older.
     pub fn observe(&self, l: &Locked, ip: Ipv4Addr, gen: u64, rev: u64, via: Option<Ipv4Addr>) -> Result<bool> {
         self.update(l, ip, true, |a| {
-            if gen == 0 || gen > RECV_MAX || gen < a.seen || (gen == a.seen && via.is_some() && (a.withdrawn || rev < a.rev)) {
+            if !a.takes(gen, rev, via) {
                 return false;
             }
             if via.is_some() || gen > a.seen {
@@ -1034,13 +1034,30 @@ impl Host {
         })
     }
 
-    /// Records revision `rev` of `gen`, if newer: where this host's VM runs again.
+    /// Records revision `rev` of `gen`, if newer: where this host's VM runs again. A peer's
+    /// route for an older revision goes with it: taken while the record trailed (#533), it
+    /// would name a place the VM left as the way to it.
     pub fn advance(&self, l: &Locked, ip: Ipv4Addr, gen: u64, rev: u64) -> Result<()> {
         self.update(l, ip, true, |a| {
-            if gen == a.seen {
-                a.rev = a.rev.max(rev);
+            if gen == a.seen && rev > a.rev {
+                (a.rev, a.via) = (rev, None);
             }
         })
+    }
+
+    /// Whether `observe` would take the message, by the record alone.
+    pub fn takes(&self, l: &Locked, ip: Ipv4Addr, gen: u64, rev: u64, via: Option<Ipv4Addr>) -> Result<bool> {
+        Ok(self.addr(l, ip)?.takes(gen, rev, via))
+    }
+
+    /// The VM process here to ask for the revision it runs at (`listen::route`), by its name
+    /// and instance: one holding `ip` with generation `gen`, the newest seen, which an
+    /// announcement of `gen` (`via`) could be older than while the record trails it (#533).
+    /// For any other message the record decides alone.
+    pub fn to_ask(&self, l: &Locked, ip: Ipv4Addr, gen: u64, via: Option<Ipv4Addr>) -> Result<Option<(String, Ident)>> {
+        let a = self.addr(l, ip)?;
+        let asked = via.is_some() && a.seen == gen && a.held == gen && self.held(&a);
+        Ok(asked.then_some(a.holder.zip(a.holder_id)).flatten())
     }
 
     /// A paused migration source keeps its route too: its release moves it.
@@ -1062,12 +1079,6 @@ impl Host {
 
     pub fn current(&self, l: &Locked, ip: Ipv4Addr, gen: u64) -> Result<bool> {
         Ok(self.addr(l, ip)?.current(gen))
-    }
-
-    /// The VM process holding `ip` here, by its name and instance.
-    pub fn holding(&self, l: &Locked, ip: Ipv4Addr) -> Result<Option<(String, Ident)>> {
-        let a = self.addr(l, ip)?;
-        Ok(self.held(&a).then_some(a.holder.zip(a.holder_id)).flatten())
     }
 
     pub fn holder(&self, l: &Locked, ip: Ipv4Addr) -> Result<Option<String>> {
@@ -1647,6 +1658,11 @@ pub struct Addr {
 impl Addr {
     pub fn current(&self, gen: u64) -> bool {
         gen > self.seen || (gen == self.seen && !self.withdrawn)
+    }
+
+    /// Not stale: not older, announcing a withdrawn generation, or an older revision of the newest one.
+    fn takes(&self, gen: u64, rev: u64, via: Option<Ipv4Addr>) -> bool {
+        !(gen == 0 || gen > RECV_MAX || gen < self.seen || (gen == self.seen && via.is_some() && (self.withdrawn || rev < self.rev)))
     }
 }
 
@@ -3887,7 +3903,11 @@ mod tests {
         assert_eq!(h.claim_incoming(&l, "y", x, 7, Some(9)).unwrap().rev, 9);
         assert!(h.observe(&l, x, 7, 4, b).unwrap(), "an arrival's revision counts only once it commits");
         h.advance(&l, x, 7, 6).unwrap();
+        assert_eq!(h.addr(&l, x).unwrap().via, None, "a route for an older revision goes with it");
         assert!(!h.observe(&l, x, 7, 5, b).unwrap());
+        assert!(h.observe(&l, x, 7, 6, b).unwrap());
+        h.advance(&l, x, 7, 6).unwrap();
+        assert_eq!(h.addr(&l, x).unwrap().via, b, "one for the same revision stays");
         assert!(h.observe(&l, x, 8, 0, a).unwrap(), "a newer generation starts over");
         assert!(h.observe(&l, x, 8, 0, None).unwrap() && !h.observe(&l, x, 8, 9, b).unwrap(), "a withdrawal takes every revision");
     }

@@ -666,40 +666,59 @@ pub(crate) fn route(host: &Host, req: &Value, peers: &[IpAddr]) -> Result<Value>
             std::thread::sleep(Duration::from_millis(10));
         }
     }
-    let l = host_lock(host)?;
-    let stale = via.is_some() && live(host, &l, ip).is_some_and(|now| (gen, rev) < now);
-    if stale || !host.observe(&l, ip, gen, rev, via)? {
-        return Ok(json!({"ip": ip.to_string(), "stale": true}));
-    }
-    let local = host.keeps_route(&l, ip, gen)?;
-    if !local {
-        match via {
-            Some(via) => crate::net::route_via(ip, via)?,
-            None => crate::net::unroute(ip),
+    let stale = || Ok(json!({"ip": ip.to_string(), "stale": true}));
+    // Whom to ask, and what came of it: asked without the host lock, then judged under it, if the
+    // record still names the one asked (else asked again). What the record shows stale is never asked.
+    let (mut asked, mut answer) = (None, None);
+    for tries in 1.. {
+        let l = host_lock(host)?;
+        if !host.takes(&l, ip, gen, rev, via)? {
+            return stale();
         }
+        let now = host.to_ask(&l, ip, gen, via)?;
+        if now == asked && (answer.is_some() || now.is_none()) && !appeared(host, &now, &answer) {
+            match answer.take() {
+                Some(Ok(live)) if (gen, rev) < live => return stale(),
+                // Not running yet (an arrival before its commit, whose revision is not its own yet), or gone.
+                Some(Err(e)) if !absent(&e) => {
+                    let (name, _) = now.unwrap_or_default();
+                    crate::log!("route {ip}: vm {name:?}, which holds it, did not say its revision: {e}; refused for now");
+                    bail!("{BUSY}: the vm holding {ip} here did not say its revision");
+                }
+                _ => {}
+            }
+            if !host.observe(&l, ip, gen, rev, via)? {
+                return stale();
+            }
+            let local = host.keeps_route(&l, ip, gen)?;
+            if !local {
+                match via {
+                    Some(via) => crate::net::route_via(ip, via)?,
+                    None => crate::net::unroute(ip),
+                }
+            }
+            return Ok(json!({"ip": ip.to_string(), "local": local}));
+        }
+        drop(l);
+        if tries > 3 {
+            bail!("{BUSY}: the vm holding {ip} here changed while asked");
+        }
+        answer = now.as_ref().map(|(name, id)| crate::vmproc::live_rev(host, name, id, ip, Instant::now() + crate::vmproc::LIVE_WAIT));
+        asked = now;
     }
-    Ok(json!({"ip": ip.to_string(), "local": local}))
+    unreachable!()
 }
 
-/// The generation and revision a VM process here holding `ip` runs at, which its record may trail
-/// (a write being retried, an arrival's recorded only after its handoff: #533); None if none holds
-/// it or it cannot tell within `vmproc::LIVE_WAIT`, when the record decides alone. Asked under the
-/// host lock, outside which neither changes, and bounded: the answer takes no lock the lock's
-/// holders wait on, so only a process that cannot answer (stopped, say) keeps the lock that long.
-pub(crate) fn live(host: &Host, l: &crate::host::Locked, ip: Ipv4Addr) -> Option<(u64, u64)> {
-    let (name, id) = host.holding(l, ip).ok().flatten()?;
-    match crate::vmproc::live_rev(host, &name, &id, ip, Instant::now() + crate::vmproc::LIVE_WAIT) {
-        Ok(now) => Some(now),
-        Err(e) => {
-            // No socket: suspended, or not running yet.
-            let absent =
-                e.downcast_ref::<std::io::Error>().is_some_and(|e| matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused));
-            if !absent {
-                crate::log!("route {ip}: asking vm {name:?} for its revision: {e}; going by the record");
-            }
-            None
-        }
-    }
+/// No control socket to ask: the holder is not running yet, or is gone (its record then decides).
+fn absent(e: &crate::util::Error) -> bool {
+    e.downcast_ref::<std::io::Error>().is_some_and(|e| matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused))
+}
+
+/// Whether the holder asked had no control socket then and has one now: an arrival that committed
+/// since, whose revision it now answers for (it binds the socket under the commit's host lock).
+fn appeared(host: &Host, asked: &Option<(String, crate::host::Ident)>, answer: &Option<Result<(u64, u64)>>) -> bool {
+    let missing = matches!(answer, Some(Err(e)) if e.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound));
+    missing && asked.as_ref().is_some_and(|(name, _)| host.sock(name).is_ok_and(|s| s.exists()))
 }
 
 /// A peer routes only a VM's address, never one this host reaches its peers or network by (#365).

@@ -1171,7 +1171,7 @@ impl Proc {
     }
 
     /// This process and its address as the VM has it now, which the host's record may trail (#533):
-    /// what the listener asks, holding the host lock, before it takes an announcement of the address.
+    /// what the listener asks before it takes an announcement of the address.
     /// Takes `addr` alone: never the host lock, nor a lock anything holds while it waits for that.
     /// Served only once the revision is the VM's own: an arrival binds its control socket at its commit.
     fn live_addr(&self) -> Result<Value> {
@@ -2597,7 +2597,7 @@ pub fn connect(host: &Host, name: &str, req: &Value, fds: &[i32], at: Instant) -
     Ok(c)
 }
 
-/// How long the listener waits for a holder's answer (`live_rev`), holding the host lock.
+/// How long the listener waits for a holder's answer (`live_rev`); it holds no host lock meanwhile.
 pub const LIVE_WAIT: Duration = Duration::from_millis(250);
 
 /// The generation and revision of `ip` the VM process `id`, holding it under `name`, runs at now,
@@ -3103,39 +3103,40 @@ mod tests {
         assert_eq!(reply["error"], "unknown op \"unknown\"");
     }
 
-    /// #533: the listener, holding the host lock, asks an address's holder here for the revision it
-    /// runs at, which its record may trail; the answer takes no host lock. An announcement older than
-    /// it is stale, and only the holder's own process, about that address, is believed.
-    #[test]
-    fn announcements_are_judged_by_the_holders_live_revision() {
-        let (p, _root) = test_proc("live-rev");
-        p.set_name(p.host.take_name("live", false).unwrap());
-        let claim = p.host.claim_new(&p.host.lock().unwrap(), "live", None).unwrap();
+    /// A route announcement of `ip` to this host's listener, asked again while the host is busy
+    /// for some other reason: other tests may hold the host lock's process-wide half a while.
+    fn announce(host: &Host, ip: Ipv4Addr, gen: u64, rev: u64) -> Result<Value> {
+        let req = json!({"op": "route", "ip": ip.to_string(), "via": "10.1.0.1", "gen": gen, "rev": rev});
+        let end = Instant::now() + Duration::from_secs(60);
+        loop {
+            match crate::listen::route(host, &req, &[]) {
+                Err(e) if e.to_string() == "host busy, try again" && Instant::now() < end => continue,
+                r => return r,
+            }
+        }
+    }
+
+    /// A VM process here holding a fresh address, its control socket served.
+    fn holding(tag: &str, name: &str) -> (Arc<Proc>, crate::test_util::TempDir, Ipv4Addr, u64) {
+        let (p, root) = test_proc(tag);
+        p.set_name(p.host.take_name(name, false).unwrap());
+        let claim = p.host.claim_new(&p.host.lock().unwrap(), name, None).unwrap();
         let gen = claim.gen;
         let ip = p.set_addr(claim);
-        // Without a control socket (not running yet, or suspended), the record decides.
-        assert_eq!(crate::listen::live(&p.host, &p.host.lock().unwrap(), ip), None);
+        (p, root, ip, gen)
+    }
+
+    /// #533: the listener asks an address's holder here for the revision it runs at, which its
+    /// record may trail. An announcement older than it is stale, and only the holder's own
+    /// process, about that address, is believed.
+    #[test]
+    fn announcements_are_judged_by_the_holders_live_revision() {
+        let (p, _root, ip, gen) = holding("live-rev", "live");
         p.serve_control().unwrap();
         // The VM runs at revision 2; its record is still at 0.
         p.addr.lock().unwrap().as_mut().unwrap().rev = 2;
-        {
-            let l = p.host.lock().unwrap();
-            assert_eq!(p.host.addr(&l, ip).unwrap().rev, 0);
-            assert_eq!(crate::listen::live(&p.host, &l, ip), Some((gen, 2)));
-        }
-        let announce = |gen: u64, rev: u64| {
-            let req = json!({"op": "route", "ip": ip.to_string(), "via": "10.1.0.1", "gen": gen, "rev": rev});
-            // Asked again while busy: other tests may hold the host lock's process-wide half a while.
-            let end = Instant::now() + Duration::from_secs(60);
-            loop {
-                match crate::listen::route(&p.host, &req, &[]) {
-                    Err(e) if e.to_string() == "host busy, try again" && Instant::now() < end => continue,
-                    r => break r.unwrap(),
-                }
-            }
-        };
-        for (g, rev) in [(gen, 0), (gen, 1)] {
-            assert_eq!(announce(g, rev)["stale"], true, "{g} {rev}");
+        for rev in [0, 1] {
+            assert_eq!(announce(&p.host, ip, gen, rev).unwrap()["stale"], true, "{rev}");
         }
         let a = p.host.addr(&p.host.lock().unwrap(), ip).unwrap();
         assert_eq!((a.seen, a.rev, a.via), (gen, 0, None), "{a:?}");
@@ -3148,22 +3149,54 @@ mod tests {
         }
         let e = live_rev(&p.host, "live", &me, "10.1.2.3".parse().unwrap(), by()).unwrap_err();
         assert!(e.to_string().contains("holds something else"), "{e}");
+        // Its own revision is not older: taken (the address keeps its local route).
+        assert_eq!(announce(&p.host, ip, gen, 2).unwrap()["local"], true);
+        // Recorded since, its own revision outranks that route: it goes.
+        p.host.advance(&p.host.lock().unwrap(), ip, gen, 3).unwrap();
+        assert_eq!(p.host.addr(&p.host.lock().unwrap(), ip).unwrap().via, None);
     }
 
-    /// #533: a holder that never answers (stopped, say) holds the asking listener, and its host
-    /// lock, `LIVE_WAIT` at most; the record decides then.
+    /// #533: a holder that cannot answer (stopped, say) gets a late announcement of the revision
+    /// its record trails at refused for now (announcers try again), never taken on the record.
+    /// One the record already shows stale is answered so without asking it.
     #[test]
-    fn a_holder_that_never_answers_is_waited_for_a_bounded_time() {
-        let (p, _root) = test_proc("live-mute");
-        p.set_name(p.host.take_name("mute", false).unwrap());
-        let claim = p.host.claim_new(&p.host.lock().unwrap(), "mute", None).unwrap();
-        let ip = p.set_addr(claim);
-        let _mute = UnixListener::bind(p.host.sock("mute").unwrap()).unwrap();
-        // Timed from the lock on: other tests may hold its process-wide half a while.
-        let l = p.host.lock().unwrap();
+    fn a_holder_that_cannot_answer_is_not_judged_by_its_trailing_record() {
+        let (p, _root, ip, gen) = holding("live-mute", "mute");
+        let mute = UnixListener::bind(p.host.sock("mute").unwrap()).unwrap();
+        mute.set_nonblocking(true).unwrap();
+        p.host.advance(&p.host.lock().unwrap(), ip, gen, 3).unwrap();
         let start = Instant::now();
-        assert_eq!(crate::listen::live(&p.host, &l, ip), None);
-        assert!(start.elapsed() >= LIVE_WAIT && start.elapsed() < LIVE_WAIT + Duration::from_secs(1), "{:?}", start.elapsed());
+        assert_eq!(announce(&p.host, ip, gen, 2).unwrap()["stale"], true);
+        assert!(start.elapsed() < Duration::from_secs(60));
+        assert!(mute.accept().is_err_and(|e| e.kind() == std::io::ErrorKind::WouldBlock), "the record's stale one asked the holder");
+        let e = announce(&p.host, ip, gen, 3).unwrap_err();
+        assert!(e.to_string().contains("did not say its revision"), "{e}");
+        assert!(mute.accept().is_ok(), "asked");
+        let a = p.host.addr(&p.host.lock().unwrap(), ip).unwrap();
+        assert_eq!((a.rev, a.via), (3, None), "{a:?}");
+    }
+
+    /// #533: the holder is asked without the host lock held: it can take the lock and still
+    /// answer in time.
+    #[test]
+    fn the_holder_is_asked_without_the_host_lock() {
+        let (p, _root, ip, gen) = holding("live-unlocked", "unlocked");
+        let fake = UnixListener::bind(p.host.sock("unlocked").unwrap()).unwrap();
+        let answered_in_time = (0..5).any(|_| {
+            let host = p.host.clone();
+            let asking = thread::spawn(move || announce(&host, ip, gen, 0));
+            let (c, _) = fake.accept().unwrap();
+            let mut line = String::new();
+            std::io::BufRead::read_line(&mut BufReader::new(&c), &mut line).unwrap();
+            // Taken while the listener waits for the answer: it holds no host lock then.
+            let l = p.host.lock().unwrap();
+            let reply = json!({"ok": true, "result": {"ident": Ident::me(), "ip": ip.to_string(), "gen": gen, "rev": 1}});
+            let _ = send_json(&mut &c, &reply);
+            drop(l);
+            // Stale by the answer: in time. Refused: the lock took longer than the wait, as it may with other tests.
+            asking.join().unwrap().is_ok_and(|r| r["stale"] == true)
+        });
+        assert!(answered_in_time);
     }
 
     #[test]

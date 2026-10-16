@@ -739,7 +739,7 @@ impl Proc {
             // Defer both revision fsyncs (file, then addrs directory) until after the reply and
             // packet handoff, so the disk never delays the route switch. The old durable claim still
             // has the generation, owner and `arriving` migration; only the routing revision lags,
-            // which this process answers for meanwhile (`listen::live`), so a late announcement of
+            // which this process answers for meanwhile (`listen::route`), so a late announcement of
             // the source's is still stale here (#533). The durable commit prevents a live target from
             // answering aborted; after its death, mig_status reaps it before allowing the source to
             // resume. Neither decision depends on the revision. Keep write_file's file-before-rename
