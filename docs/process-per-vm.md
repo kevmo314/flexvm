@@ -144,8 +144,7 @@ STATE (default /var/lib/flexvm, on disk)
   addrs/IP               per address: newest generation seen, withdrawn?, lent generation, holder name, instance
                          (pid, start time) and generation, the route a peer announced for the newest generation
                          and the newest revision of it (where the VM is within the generation)
-  addrs/.gens            durable generation cursor with the boot id
-  addrs/.gens.reserved   independent durable high-water mark, reserved 1024 at a time
+  addrs/.gens            generation high-water mark, reserved 1024 at a time: fsynced, written only then
   addrs/.next            where the next automatic allocation starts looking (a hint, wrapping around)
   suspended/NAME/        a suspended VM's checkpoint, GEN (its address's generation) published with it,
                          + STARTED, DISCARDED, QUARANTINE markers; without a manifest, or STARTED or
@@ -164,6 +163,7 @@ RUN (default /run/flexvm, tmpfs)
   vms/.incoming-LPID-N-PEER.log   an arrival's log until it is accepted (as NAME.log) or refused; locked by the arrival
   state.json             canonical state path, claimed on first open by a hard link (one state wins a race)
   .gc, .gc.lock          when garbage was last swept periodically; one sweep at a time
+  .gens.next             the next generation below the high-water mark, with the boot id; lost or damaged, it starts at the mark
   .logs.lock             logs are opened holding it shared, swept holding it exclusively
   holds/ID-MIB           memory admitted to a live process, flocked by it (`.ID` while being made)
   grants-BOOTID          recent grants not yet held, counted against the reserve
@@ -277,16 +277,12 @@ with that generation, or it is lent. Another instance of the same name (a
 restart after a SIGKILL) does not hold it, and an instance releases only its
 own claim.
 All of this is decided under the host lock, in one critical section with the
-claim. Every address record replacement, including a live holder change, is
-fsynced before rename, and its directory is fsynced afterward. The generation
-cursor (`addrs/.gens`) uses the same durable replacement; a separate
-`addrs/.gens.reserved` preserves the block reservation and changes only when
-another block is reserved. A missing or corrupt cursor recovers above the
-reservation and surviving address generations. An empty legacy address record
-recovers as a dead holder fenced by that high-water mark; without a surviving
-reservation, it is quarantined. Other malformed address records are also
-quarantined as lent, so they cannot be allocated twice.
-I/O errors still fail closed.
+claim. Records with a new generation, a loan or a withdrawal are fsynced
+before acting; a fresh start's claim is not (a crash loses the VM too, and the
+high-water mark already orders generations). After a power loss that claim
+may be empty (#554): it reads as withdrawn at the high-water mark, so the
+address is free and its generations still only rise. Any other record that
+cannot be read or parsed is an error, never a free address.
 
 - **Borrowing.** A restore keeping another host's address (its checkpoint's,
   or `--ip`) asks the peers to `lend` it: the home host checks it is free

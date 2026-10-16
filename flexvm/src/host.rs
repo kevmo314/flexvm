@@ -374,22 +374,6 @@ pub fn load<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
     }
 }
 
-/// Damaged generation/address JSON is recoverable; I/O errors still fail closed.
-fn recoverable_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
-    match std::fs::read(path) {
-        Ok(bytes) => Ok(serde_json::from_slice(&bytes).ok()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => bail!("{}: {e}", path.display()),
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-struct Gens {
-    next: u64,
-    reserved: u64,
-    boot: String,
-}
-
 /// Who a name lock says holds it: None for an empty lock (created, never
 /// written: no VM started under it); unreadable or corrupt is an error.
 fn lock_holder(path: &Path) -> Result<Option<Ident>> {
@@ -508,7 +492,7 @@ impl Host {
             let _ = std::fs::remove_file(&marker);
             dirs.iter()
                 .try_for_each(|(d, mode)| crate::util::create_dir_durably(&state.join(d), *mode))
-                .and_then(|()| crate::util::write_file(state, ".synced", id()?.as_bytes(), true))
+                .and_then(|()| std::fs::write(&marker, id()?))
                 .map_err(root)?;
         }
         // Only the run directory itself must be made here: a non-root user still reads one root made.
@@ -766,74 +750,35 @@ impl Host {
     }
 
     pub fn addr(&self, _: &Locked, ip: Ipv4Addr) -> Result<Addr> {
+        self.read_addr(ip)
+    }
+
+    /// Records are replaced whole, so reading one needs no lock. Only `claim_new_in`
+    /// writes one without fsync, so only that one can come back empty (a power loss after
+    /// another write synced the directory, #554). Its VM died with the host, and its
+    /// generation is below the durable high-water mark: as withdrawn at the mark, the
+    /// address is free and its generations still only rise. Anything else that cannot
+    /// be read or parsed is an error, never a free address.
+    fn read_addr(&self, ip: Ipv4Addr) -> Result<Addr> {
         let path = self.addr_path(ip);
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Addr::default()),
-            Err(e) => bail!("{}: {e}", path.display()),
-        };
-        if let Ok(a) = serde_json::from_slice(&bytes) {
-            return Ok(a);
+        if std::fs::metadata(&path).is_ok_and(|m| m.len() == 0) {
+            let g = load::<Gens>(&self.gens_path())?.ok_or_else(|| format!("{}: empty, with no high-water mark to bound it", path.display()))?;
+            return Ok(Addr { seen: g.reserved, withdrawn: true, ..Addr::default() });
         }
-        let seen = self.generation_floor()?;
-        // Only the old non-durable cold-start write could leave an empty file:
-        // its holder died with the host, and a surviving reservation fences its
-        // generation. If legacy state lost that reservation too, quarantine the
-        // address: other addresses' generations cannot bound the lost one.
-        // Other corruption could hide a loan; quarantine that address instead of
-        // allocating it twice. Neither case invents a leaving/arriving process,
-        // so one damaged address cannot pin every migration on this host.
-        let quarantined = !bytes.is_empty() || self.generation_reservation()?.is_none();
-        let a = Addr { seen, withdrawn: true, lent: quarantined.then_some(GEN_MAX), ..Addr::default() };
-        self.put_addr(ip, &a)?;
-        crate::log!("{}: recovered {} address record", path.display(), if quarantined { "quarantined damaged" } else { "empty" });
-        Ok(a)
+        Ok(load(&path)?.unwrap_or_default())
     }
 
-    fn put_addr(&self, ip: Ipv4Addr, a: &Addr) -> Result<()> {
-        // Every replacement must sync its data before another writer syncs addrs/.
-        store(&self.addr_path(ip), a, true)
-    }
-
-    fn generation_reservation(&self) -> Result<Option<u64>> {
-        let dir = self.state.join("addrs");
-        let mut reserved = recoverable_json::<u64>(&dir.join(".gens.reserved"))?;
-        if let Some(g) = recoverable_json::<Gens>(&dir.join(".gens"))? {
-            reserved = Some(reserved.unwrap_or(0).max(g.reserved).max(g.next));
-        }
-        Ok(reserved.filter(|&g| g > 0))
-    }
-
-    /// Recovery reads raw records to avoid recursing through `addr` on corruption.
-    /// Without an old reservation, quarantine damaged records before creating a
-    /// new bound: that new bound cannot retroactively fence their lost generations.
-    fn generation_floor(&self) -> Result<u64> {
-        let dir = self.state.join("addrs");
-        let reservation = self.generation_reservation()?;
-        let mut floor = reservation.unwrap_or(0);
-        let mut damaged = Vec::new();
-        for entry in std::fs::read_dir(&dir)? {
-            let entry = entry?;
-            let Some(ip) = entry.file_name().to_str().and_then(|s| s.parse::<Ipv4Addr>().ok()) else { continue };
-            match recoverable_json::<Addr>(&entry.path())? {
-                Some(a) => floor = floor.max(a.seen),
-                None if reservation.is_none() => damaged.push(ip),
-                None => {}
-            }
-        }
-        for ip in damaged {
-            self.put_addr(ip, &Addr { seen: floor, withdrawn: true, lent: Some(GEN_MAX), ..Addr::default() })?;
-        }
-        Ok(floor)
+    fn put_addr(&self, ip: Ipv4Addr, a: &Addr, durable: bool) -> Result<()> {
+        store(&self.addr_path(ip), a, durable)
     }
 
     /// Stores the record only if `change` changed it.
-    fn update<T>(&self, l: &Locked, ip: Ipv4Addr, change: impl FnOnce(&mut Addr) -> T) -> Result<T> {
+    fn update<T>(&self, l: &Locked, ip: Ipv4Addr, durable: bool, change: impl FnOnce(&mut Addr) -> T) -> Result<T> {
         let mut a = self.addr(l, ip)?;
         let before = a.clone();
         let out = change(&mut a);
         if a != before {
-            self.put_addr(ip, &a)?;
+            self.put_addr(ip, &a, durable)?;
         }
         Ok(out)
     }
@@ -883,14 +828,17 @@ impl Host {
                 // rescan of every resident VM's address per start.
                 let hint = std::fs::read_to_string(self.alloc_hint()).ok().and_then(|s| s.trim().parse().ok());
                 let ip = range.allocate(hint, taken).ok_or("no free addresses left")?;
-                let _ = crate::util::write_file(&self.state.join("addrs"), ALLOC_HINT, range.after(ip).to_string().as_bytes(), true);
+                let _ = crate::util::write_file(&self.state.join("addrs"), ALLOC_HINT, range.after(ip).to_string().as_bytes(), false);
                 ip
             }
         };
         let a = self.addr(l, ip)?;
         let gen = self.next_gen(a.seen)?;
         let me = Ident::me();
-        self.put_addr(ip, &Addr { seen: gen, holder: Some(holder.into()), holder_id: Some(me.clone()), held: gen, lent: a.lent, ..Addr::default() })?;
+        // Not fsynced, to keep fsyncs off a start: a crash loses this VM too, and the mark
+        // already orders its generation. Lost, the record before it stays; emptied, it reads
+        // as withdrawn at the mark (`read_addr`), losing no loan (a lent address is not claimed here).
+        self.put_addr(ip, &Addr { seen: gen, holder: Some(holder.into()), holder_id: Some(me.clone()), held: gen, lent: a.lent, ..Addr::default() }, false)?;
         Ok(AddrClaim { host: self.clone(), ip, gen, rev: 0, holder: holder.into(), id: me, kept: false, fresh: true })
     }
 
@@ -913,44 +861,38 @@ impl Host {
             bail!("{ip} is in use");
         }
         let gen = self.next_gen(a.seen)?;
-        self.put_addr(ip, &Addr { seen: gen, lent: Some(gen), ..Addr::default() })?;
+        self.put_addr(ip, &Addr { seen: gen, lent: Some(gen), ..Addr::default() }, true)?;
         Ok(gen)
     }
 
-    /// Monotonic across crashes and reboots: a high-water mark reserved
-    /// durably `GEN_BLOCK` at a time.
+    fn gens_path(&self) -> PathBuf {
+        self.state.join("addrs").join(".gens")
+    }
+
+    /// Monotonic across crashes and reboots: every generation handed out is below a
+    /// high-water mark (`addrs/.gens`) reserved `GEN_BLOCK` at a time, fsynced before
+    /// one at or above it is used, and never written otherwise (#554: a rewrite without
+    /// fsync could come back empty). The cursor below it (`RUN/.gens.next`) is per boot
+    /// and never synced, so a start pays no fsync for it: lost, damaged or from another
+    /// boot, it starts again at the mark.
     fn next_gen(&self, seen: u64) -> Result<u64> {
         const GEN_BLOCK: u64 = 1024;
-        let dir = self.state.join("addrs");
-        let path = dir.join(".gens");
-        let reservation = dir.join(".gens.reserved");
+        let cursor = self.run.join(".gens.next");
         if boot_id().is_empty() {
             bail!("cannot read the boot id: generations would not be ordered across a reboot");
         }
-        let g = recoverable_json::<Gens>(&path)?;
-        let saved_reserved = recoverable_json::<u64>(&reservation)?;
-        let reserved = saved_reserved.unwrap_or(0);
-        // The separate reservation survives a lost/corrupt cursor. For legacy
-        // state without it, surviving address records provide a monotonic floor:
-        // never issue a generation at or below one already recorded here.
-        let next = match &g {
-            Some(g) if g.boot == boot_id() => g.next,
-            Some(g) => g.next.max(g.reserved).max(reserved),
-            None => self.generation_floor()?.saturating_add(1),
-        };
-        let gen = next.max(seen.saturating_add(1));
-        let previous = reserved.max(g.as_ref().map_or(0, |g| g.reserved));
-        let reserved = if gen >= previous { gen.saturating_add(GEN_BLOCK) } else { previous };
-        if reserved > GEN_MAX {
-            bail!("generations exhausted");
+        let mut g = load::<Gens>(&self.gens_path())?.unwrap_or(Gens { next: 1, reserved: 0, boot: String::new() });
+        let at = std::fs::read(&cursor).ok().and_then(|b| serde_json::from_slice::<Gens>(&b).ok()).filter(|c| c.boot == boot_id());
+        let gen = at.map_or(g.next.max(g.reserved), |c| c.next.max(g.next)).max(seen.saturating_add(1));
+        (g.next, g.boot) = (gen + 1, boot_id().into());
+        if gen >= g.reserved {
+            g.reserved = gen.saturating_add(GEN_BLOCK);
+            if g.reserved > GEN_MAX {
+                bail!("generations exhausted");
+            }
+            store(&self.gens_path(), &g, true)?;
         }
-        // Migrate the legacy reservation before replacing its only durable copy.
-        // This file changes only at block boundaries; .gens is also durable so
-        // a later directory sync cannot expose an empty replacement inode.
-        if saved_reserved != Some(reserved) {
-            store(&reservation, &reserved, true)?;
-        }
-        store(&path, &Gens { next: gen + 1, reserved, boot: boot_id().into() }, true)?;
+        store(&cursor, &g, false)?;
         Ok(gen)
     }
 
@@ -990,7 +932,7 @@ impl Host {
         }
         let me = Ident::me();
         (a.holder, a.holder_id, a.held, a.arriving, a.leaving) = (Some(holder.into()), Some(me.clone()), gen, mig, None);
-        self.put_addr(ip, &a)?;
+        self.put_addr(ip, &a, true)?;
         Ok(AddrClaim { host: self.clone(), ip, gen, rev, holder: holder.into(), id: me, kept: false, fresh: false })
     }
 
@@ -1009,7 +951,7 @@ impl Host {
     /// Its published revision (`publish_live`) goes with it.
     pub fn release(&self, l: &Locked, ip: Ipv4Addr, holder: &str, id: Option<&Ident>) -> Result<()> {
         let mut released = None;
-        self.update(l, ip, |a| {
+        self.update(l, ip, true, |a| {
             let by = |h: &Ident| id.is_none_or(|id| id == h);
             if a.holder.as_deref() == Some(holder) && a.holder_id.as_ref().is_none_or(by) {
                 released = a.holder_id.take();
@@ -1030,7 +972,7 @@ impl Host {
     /// takes it back never hands it out while the VM runs elsewhere (#521).
     pub fn lend(&self, l: &Locked, ip: Ipv4Addr, gen: u64, mig: u64, to: &str) -> Result<bool> {
         let me = Ident::me();
-        self.update(l, ip, |a| {
+        self.update(l, ip, true, |a| {
             if a.holder_id.as_ref() == Some(&me) {
                 a.leaving = Some(Leaving { mig, to: to.into() });
             }
@@ -1047,7 +989,7 @@ impl Host {
             bail!("injected fault");
         }
         let me = Ident::me();
-        self.update(l, ip, |a| {
+        self.update(l, ip, true, |a| {
             if a.holder_id.as_ref() == Some(&me) {
                 a.leaving = None;
             }
@@ -1061,7 +1003,7 @@ impl Host {
     /// host's own, and a loan of its generation here (it came home) ends.
     /// Idempotent: a release cut short is finished by `mig_done` or `withdraw_dead`.
     fn settle_arrived(&self, l: &Locked, ip: Ipv4Addr, mig: u64) -> Result<()> {
-        self.update(l, ip, |a| {
+        self.update(l, ip, true, |a| {
             if a.arriving == Some(mig) {
                 a.arriving = None;
                 a.lent = a.lent.filter(|&lent| lent > a.held);
@@ -1074,7 +1016,7 @@ impl Host {
         if fault("unlend_fail") {
             bail!("injected fault");
         }
-        self.update(l, ip, |a| a.lent = a.lent.filter(|&lent| lent != gen))
+        self.update(l, ip, true, |a| a.lent = a.lent.filter(|&lent| lent != gen))
     }
 
     /// `via` None is a withdrawal (of every revision). False if stale (older,
@@ -1084,7 +1026,7 @@ impl Host {
     /// newer of the two decides.
     pub fn observe(&self, l: &Locked, ip: Ipv4Addr, gen: u64, rev: u64, via: Option<Ipv4Addr>) -> Result<bool> {
         let live = via.and_then(|_| self.live_of(ip, &self.addr(l, ip).ok()?)).unwrap_or(0);
-        self.update(l, ip, |a| {
+        self.update(l, ip, true, |a| {
             if gen == 0 || gen > RECV_MAX || gen < a.seen || (gen == a.seen && via.is_some() && (a.withdrawn || rev < a.rev.max(live))) {
                 return false;
             }
@@ -1103,7 +1045,7 @@ impl Host {
     /// route for an older revision goes with it: taken while the record trailed (#533), it
     /// would name a place the VM left as the way to it.
     pub fn advance(&self, l: &Locked, ip: Ipv4Addr, gen: u64, rev: u64) -> Result<()> {
-        self.update(l, ip, |a| {
+        self.update(l, ip, true, |a| {
             if gen == a.seen && rev > a.rev {
                 (a.rev, a.via) = (rev, None);
             }
@@ -1504,9 +1446,8 @@ impl Host {
         recorded || self.leaving_by(by)
     }
 
-    /// Whether `by` holds an address here as a migration source (`leaving`).
-    /// I/O errors count as such; malformed JSON is recovered/quarantined by
-    /// `addr`, without inventing a source process for every caller.
+    /// Whether `by` holds an address here as a migration source (`leaving`);
+    /// what cannot be read counts as such.
     fn leaving_by(&self, by: &Ident) -> bool {
         let entries = match std::fs::read_dir(self.state.join("addrs")) {
             Ok(entries) => entries,
@@ -1515,7 +1456,7 @@ impl Host {
         entries.into_iter().any(|e| {
             let Ok(e) = e else { return true };
             let Some(ip) = e.file_name().to_str().and_then(|n| n.parse::<Ipv4Addr>().ok()) else { return false };
-            recoverable_json::<Addr>(&self.addr_path(ip)).map_or(true, |a| a.is_some_and(|a| a.leaving.is_some() && a.holder_id.as_ref() == Some(by)))
+            self.read_addr(ip).map_or(true, |a| a.leaving.is_some() && a.holder_id.as_ref() == Some(by))
         })
     }
 
@@ -1744,6 +1685,14 @@ const ALLOC_HINT: &str = ".next";
 const GEN_MAX: u64 = u64::MAX / 2;
 const RECV_MAX: u64 = 1 << 62; // Leave allocation headroom above any peer generation.
 
+/// `addrs/.gens` (the high-water mark `reserved`) and `RUN/.gens.next` (the cursor `next`, in boot `boot`).
+#[derive(Serialize, Deserialize)]
+struct Gens {
+    next: u64,
+    reserved: u64,
+    boot: String,
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Addr {
     pub seen: u64,
@@ -1914,7 +1863,7 @@ impl MigRecord {
                     self.host.settle_arrived(&l, ip, self.id)?;
                 }
                 match home {
-                    Some((ip, gen)) => self.host.update(&l, ip, |a| a.lent = a.lent.filter(|&lent| lent > gen)),
+                    Some((ip, gen)) => self.host.update(&l, ip, true, |a| a.lent = a.lent.filter(|&lent| lent > gen)),
                     None => Ok(()),
                 }
             });
@@ -2291,12 +2240,7 @@ impl Host {
             .flatten()
             .flatten()
             .filter_map(|e| e.file_name().to_str()?.parse::<Ipv4Addr>().ok())
-            .filter(|&ip| match recoverable_json::<Addr>(&self.addr_path(ip)) {
-                Ok(Some(a)) => a.holder_id.is_some_and(|id| id.liveness() == Liveness::Gone),
-                // Include damaged records so `addr` repairs them under the lock.
-                Ok(None) => self.addr_path(ip).exists(),
-                Err(_) => false,
-            })
+            .filter(|&ip| self.read_addr(ip).ok().and_then(|a| a.holder_id).is_some_and(|id| id.liveness() == Liveness::Gone))
             .collect();
         if candidates.is_empty() {
             return Ok(());
@@ -2372,7 +2316,7 @@ impl Host {
     /// source process goes, durably, before the evidence (the owed record, the
     /// target's) may.
     fn retire_leaving(&self, l: &Locked, o: &Owed, mig: u64) -> Result<()> {
-        self.update(l, o.ip, |a| {
+        self.update(l, o.ip, true, |a| {
             if a.leaving.as_ref().is_some_and(|left| left.mig == mig) && a.holder_id.as_ref() == Some(&o.by) {
                 (a.holder, a.holder_id, a.arriving, a.leaving) = (None, None, None, None);
             }
@@ -3182,7 +3126,7 @@ mod tests {
         let dead = dead_owner(&h, 999_999_901, &[&fc.1]);
         store(&h.vms("d", "lock").unwrap(), &dead, false).unwrap();
         let l = h.lock().unwrap();
-        h.put_addr(ip("10.9.0.1"), &Addr { seen: 1, holder: Some("d".into()), holder_id: Some(dead), held: 1, ..Addr::default() }).unwrap();
+        h.put_addr(ip("10.9.0.1"), &Addr { seen: 1, holder: Some("d".into()), holder_id: Some(dead), held: 1, ..Addr::default() }, false).unwrap();
         assert!(fc.1.alive());
         assert!(h.claim_new(&l, "x", Some(ip("10.9.0.1"))).unwrap().gen > 1 && fc.done());
         let fc = Sleeper::new();
@@ -3240,119 +3184,52 @@ mod tests {
         assert_eq!(h.holder(&l, wc.ip).unwrap().as_deref(), Some("w"));
         wc.keep();
         std::fs::write(h.addr_path(ip("10.9.0.3")), "{").unwrap();
-        assert_eq!(h.addr(&l, ip("10.9.0.3")).unwrap().lent, Some(GEN_MAX));
-        assert!(h.claim_new(&l, "z", Some(ip("10.9.0.3"))).is_err());
+        assert!(h.addr(&l, ip("10.9.0.3")).is_err() && h.claim_new(&l, "z", Some(ip("10.9.0.3"))).is_err());
+        // After a reboot (the cursor another boot's), generations go on from the mark.
         std::fs::write(h.state.join("addrs/.gens"), r#"{"next": 7, "reserved": 2048, "boot": "other"}"#).unwrap();
+        std::fs::write(h.run.join(".gens.next"), r#"{"next": 9, "reserved": 0, "boot": "other"}"#).unwrap();
         assert!(h.claim_new(&l, "z", None).unwrap().gen >= 2048);
         std::fs::write(h.state.join("addrs/.gens"), "x").unwrap();
-        assert!(h.claim_new(&l, "z", None).unwrap().gen > 2048);
+        assert!(h.claim_new(&l, "z", None).is_err());
     }
 
+    /// #554: the cursor and a start's record are written without fsync; after a power loss
+    /// either may be empty, and neither may stop a start or reuse a generation.
     #[test]
-    fn damaged_generation_cursors_recover_above_the_reservation() {
-        let (_dir, h) = host("gens-recovery");
-        let l = h.lock().unwrap();
-        let first = h.lend_new(&l, ip("10.9.0.1")).unwrap();
-        let reservation = h.state.join("addrs/.gens.reserved");
-        let reserved = load::<u64>(&reservation).unwrap().unwrap();
-        assert!(reserved > first);
-        // A per-start cursor replacement leaves the independent reservation alone.
-        let inode = std::fs::metadata(&reservation).unwrap().ino();
-        assert!(h.next_gen(first).unwrap() < reserved);
-        assert_eq!(std::fs::metadata(&reservation).unwrap().ino(), inode);
-        for damaged in ["", "{", "null"] {
-            let reserved = load::<u64>(&reservation).unwrap().unwrap();
-            std::fs::write(h.state.join("addrs/.gens"), damaged).unwrap();
-            let next = h.next_gen(0).unwrap();
-            assert!(next > reserved);
-            assert_eq!(load::<Gens>(&h.state.join("addrs/.gens")).unwrap().unwrap().next, next + 1);
-        }
-    }
-
-    #[test]
-    fn legacy_generation_recovery_uses_surviving_addresses() {
-        let (_dir, h) = host("legacy-gens-recovery");
-        let _l = h.lock().unwrap();
-        h.put_addr(ip("10.9.0.1"), &Addr { seen: 4100, ..Addr::default() }).unwrap();
-        for damaged in ["", "not json"] {
-            std::fs::write(h.state.join("addrs/.gens"), damaged).unwrap();
-            let next = h.next_gen(0).unwrap();
-            assert!(next > 4100);
-            assert!(load::<u64>(&h.state.join("addrs/.gens.reserved")).unwrap().unwrap() > next);
-            std::fs::remove_file(h.state.join("addrs/.gens.reserved")).unwrap();
-        }
-        // A valid legacy reservation is retained on upgrade, even within its block.
-        store(&h.state.join("addrs/.gens"), &Gens { next: 4102, reserved: 8192, boot: boot_id().into() }, true).unwrap();
-        assert_eq!(h.next_gen(0).unwrap(), 4102);
-        assert_eq!(load::<u64>(&h.state.join("addrs/.gens.reserved")).unwrap(), Some(8192));
-    }
-
-    #[test]
-    fn empty_addresses_recover_without_blocking_starts_or_migration_status() {
-        let (_dir, h) = host("empty-addr-recovery");
-        let x = ip("10.9.0.1");
+    fn unsynced_records_come_back_empty() {
+        let (_dir, h) = host("unsynced");
         let gone = dead_owner(&h, 999_999_991, &[]);
         let l = h.lock().unwrap();
-        let first = h.claim_new(&l, "old", Some(x)).unwrap();
+        let x = ip("10.9.0.1");
+        let first = h.claim_new(&l, "a", Some(x)).unwrap();
         let gen = first.gen;
         first.keep();
-        let reserved = load::<u64>(&h.state.join("addrs/.gens.reserved")).unwrap().unwrap();
+        let gens = || load::<Gens>(&h.gens_path()).unwrap().unwrap();
+        // Starts within the block leave the mark alone.
+        let mark = gens().reserved;
+        assert_eq!(h.next_gen(0).unwrap(), gen + 1);
+        assert_eq!(gens().reserved, mark);
+        for cursor in ["", "{"] {
+            let mark = gens().reserved;
+            std::fs::write(h.run.join(".gens.next"), cursor).unwrap();
+            assert_eq!(h.next_gen(0).unwrap(), mark);
+        }
+        let mark = gens().reserved;
         std::fs::write(h.addr_path(x), "").unwrap();
-        std::fs::write(h.state.join("addrs/.gens"), "").unwrap();
-        assert!(!h.owes(&gone), "an empty record cannot pin every source process");
-        drop(l);
-        h.withdraw_dead().unwrap();
-        let l = h.lock().unwrap();
         let a = h.addr(&l, x).unwrap();
-        assert_eq!(a.seen, reserved);
-        assert!(a.withdrawn && a.holder.is_none() && a.lent.is_none());
-        assert_eq!(load::<Addr>(&h.addr_path(x)).unwrap(), Some(a));
-        assert!(!h.observe(&l, x, gen, 0, Some(ip("192.0.2.1"))).unwrap());
-        store(&h.mig_path(123), &Mig::Pending { owner: gone.clone(), ip: Some(x) }, true).unwrap();
-        drop(l);
-        assert_eq!(h.mig_status(123).unwrap(), "aborted");
+        assert!(a.seen == mark && a.withdrawn && a.holder.is_none() && a.lent.is_none());
+        assert!(!h.observe(&l, x, gen, 0, Some(ip("192.0.2.1"))).unwrap(), "its old generation is stale");
         assert!(!h.owes(&gone));
+        drop(l);
         h.withdraw_dead().unwrap();
+        store(&h.mig_path(3), &Mig::Pending { owner: gone, ip: Some(x) }, false).unwrap();
+        assert_eq!(h.mig_status(3).unwrap(), "aborted");
         let l = h.lock().unwrap();
-        assert!(h.claim_new(&l, "new", Some(x)).unwrap().gen > reserved);
-        assert!(h.lend_new(&l, ip("10.9.0.2")).unwrap() > reserved);
-    }
-
-    #[test]
-    fn corrupt_addresses_are_quarantined_and_io_errors_still_fail_closed() {
-        let (_dir, h) = host("corrupt-addr-recovery");
-        let l = h.lock().unwrap();
-        let x = ip("10.9.0.1");
-        std::fs::write(h.addr_path(x), "{").unwrap();
-        let a = h.addr(&l, x).unwrap();
-        assert_eq!(a.lent, Some(GEN_MAX));
-        assert!(a.holder.is_none() && a.leaving.is_none());
-        assert!(h.claim_new(&l, "new", Some(x)).is_err());
-        assert!(h.claim_new(&l, "new", Some(ip("10.9.0.2"))).is_ok());
-        // Quarantine's sentinel loan must not exhaust host-wide generations.
-        assert!(h.next_gen(0).is_ok());
-        std::fs::remove_file(h.addr_path(x)).unwrap();
-        std::fs::create_dir(h.addr_path(x)).unwrap();
-        assert!(h.addr(&l, x).is_err());
-        std::fs::remove_file(h.state.join("addrs/.gens")).unwrap();
-        std::fs::create_dir(h.state.join("addrs/.gens")).unwrap();
-        assert!(h.next_gen(0).is_err());
-    }
-
-    #[test]
-    fn empty_legacy_addresses_without_a_reservation_stay_quarantined() {
-        let (_dir, h) = host("lost-legacy-reservation");
-        let l = h.lock().unwrap();
-        let x = ip("10.9.0.1");
-        h.put_addr(ip("10.9.0.2"), &Addr { seen: 4100, ..Addr::default() }).unwrap();
-        std::fs::write(h.addr_path(x), "").unwrap();
-        std::fs::write(h.state.join("addrs/.gens"), "").unwrap();
-        // Rebuilding a bound for another address must quarantine legacy damage
-        // first, rather than making that new bound look like the lost one.
-        assert!(h.lend_new(&l, ip("10.9.0.2")).unwrap() > 4100);
-        assert_eq!(load::<Addr>(&h.addr_path(x)).unwrap().unwrap().lent, Some(GEN_MAX));
-        assert!(h.claim_new(&l, "new", Some(x)).is_err());
-        assert!(h.claim_new(&l, "new", Some(ip("10.9.0.3"))).unwrap().gen > 4100);
+        assert!(h.claim_new(&l, "b", Some(x)).unwrap().gen > mark);
+        // Without a mark nothing bounds it.
+        std::fs::write(h.addr_path(ip("10.9.0.2")), "").unwrap();
+        std::fs::remove_file(h.gens_path()).unwrap();
+        assert!(h.addr(&l, ip("10.9.0.2")).is_err());
     }
 
     #[test]
@@ -3364,9 +3241,9 @@ mod tests {
         let dead = dead_owner(&h, 999_999_911, &[&fc.1]);
         store(&h.vms("web", "lock").unwrap(), &dead, false).unwrap();
         let l = h.lock().unwrap();
-        h.put_addr(x, &Addr { seen: 1, holder: Some("web".into()), holder_id: Some(dead.clone()), held: 1, ..Addr::default() }).unwrap();
+        h.put_addr(x, &Addr { seen: 1, holder: Some("web".into()), holder_id: Some(dead.clone()), held: 1, ..Addr::default() }, false).unwrap();
         let older = Ident { pid: 999_999_912, ..dead.clone() };
-        h.put_addr(y, &Addr { seen: 2, holder: Some("web".into()), holder_id: Some(older), held: 2, ..Addr::default() }).unwrap();
+        h.put_addr(y, &Addr { seen: 2, holder: Some("web".into()), holder_id: Some(older), held: 2, ..Addr::default() }, false).unwrap();
         // The restart takes the name (reaping it), then the same address.
         let _web = h.take_name("web", false).unwrap();
         assert!(fc.done());
@@ -3381,13 +3258,13 @@ mod tests {
         d.keep();
         // A live process that does not hold the name holds nothing.
         let other = Sleeper::new();
-        h.put_addr(y, &Addr { seen: 3, holder: Some("web".into()), holder_id: Some(other.1.clone()), held: 3, ..Addr::default() }).unwrap();
+        h.put_addr(y, &Addr { seen: 3, holder: Some("web".into()), holder_id: Some(other.1.clone()), held: 3, ..Addr::default() }, false).unwrap();
         assert_eq!(h.holder(&l, y).unwrap(), None);
         assert!(!other.done());
         // An instance lets go of its own claim only, never a later one's of the same name.
         let mut a = h.addr(&l, x).unwrap();
         a.holder_id = Some(Ident { start: 1, ..Ident::me() });
-        h.put_addr(x, &a).unwrap();
+        h.put_addr(x, &a, false).unwrap();
         c.release(&l).unwrap();
         assert_eq!(h.addr(&l, x).unwrap().holder.as_deref(), Some("web"));
         h.release(&l, x, "web", None).unwrap();
@@ -3396,7 +3273,7 @@ mod tests {
         std::fs::create_dir_all(h.suspended("s").unwrap()).unwrap();
         std::fs::write(h.suspended("s").unwrap().join("manifest.json"), "").unwrap();
         let gone = Ident { pid: 999_999_913, ..dead };
-        h.put_addr(x, &Addr { seen: 5, holder: Some("s".into()), holder_id: Some(gone), held: 5, ..Addr::default() }).unwrap();
+        h.put_addr(x, &Addr { seen: 5, holder: Some("s".into()), holder_id: Some(gone), held: 5, ..Addr::default() }, false).unwrap();
         assert_eq!(h.holder(&l, x).unwrap().as_deref(), Some("s"), "quarantined (no GEN): kept");
         std::fs::write(h.suspended("s").unwrap().join("GEN"), "5").unwrap();
         assert_eq!(h.holder(&l, x).unwrap().as_deref(), Some("s"));
@@ -3412,7 +3289,7 @@ mod tests {
         let claim = |ip: Ipv4Addr, name: &str, id: Option<Ident>, gen: u64, change: &dyn Fn(&mut Addr)| {
             let mut a = Addr { seen: gen, holder: Some(name.into()), holder_id: id, held: gen, ..Addr::default() };
             change(&mut a);
-            h.put_addr(ip, &a).unwrap();
+            h.put_addr(ip, &a, false).unwrap();
         };
         let ips: Vec<Ipv4Addr> = (1..=10).map(|i| ip(&format!("10.9.1.{i}"))).collect();
         // SIGKILLed or panicked after a migration here: withdrawn.
@@ -3513,7 +3390,7 @@ mod tests {
         // Another instance's claim is not this source's.
         let mut a = h.addr(&l, away).unwrap();
         a.holder_id = Some(Ident { start: 1, ..Ident::me() });
-        h.put_addr(away, &a).unwrap();
+        h.put_addr(away, &a, false).unwrap();
         h.stay(&l, away, None).unwrap();
         assert!(moving(away));
         h.release(&l, away, "vm2", None).unwrap();
@@ -3580,14 +3457,14 @@ mod tests {
             leaving: Some(Leaving { mig: 8, to: "b".into() }),
             ..Addr::default()
         };
-        h.put_addr(y, &a).unwrap();
+        h.put_addr(y, &a, false).unwrap();
         assert!(h.owes(&gone));
         h.withdraw_dead().unwrap();
         assert!(h.owes(&gone) && h.owed_path(8).exists(), "owed until the target says");
-        // Corrupt JSON is quarantined without inventing a leaving process.
+        // What cannot be read counts as leaving.
         let other = dead_owner(&h, 999_999_962, &[]);
         std::fs::write(h.state.join("addrs").join("10.9.0.3"), b"{").unwrap();
-        assert!(!h.owes(&other));
+        assert!(h.owes(&other));
     }
 
     #[test]
@@ -3604,7 +3481,7 @@ mod tests {
             leaving: Some(Leaving { mig: 9, to: "b".into() }),
             ..Addr::default()
         };
-        h.put_addr(x, &a).unwrap();
+        h.put_addr(x, &a, false).unwrap();
         // A sweep owes it, then dies before the claim goes: the owed record and the claim both remain.
         h.owe(9, &Owed { to: "b".into(), ip: x, gen: 3, by: gone.clone() }).unwrap();
         // b has it: the claim is retired before the record goes and before b is told done.
@@ -3639,7 +3516,7 @@ mod tests {
             leaving: Some(Leaving { mig: 10, to: "b".into() }),
             ..Addr::default()
         };
-        h.put_addr(y, &a).unwrap();
+        h.put_addr(y, &a, false).unwrap();
         h.owe(10, &Owed { to: "b".into(), ip: y, gen: 5, by: gone }).unwrap();
         while h.owed_path(10).exists() {
             h.settle_owed_with(5, |_, _| Ok("aborted".into()), |_, _| (), |_, _| ());
@@ -3681,7 +3558,7 @@ mod tests {
         h.cfg.peers = vec!["a".into()];
         let x = ip("10.9.1.1");
         let l = h.lock().unwrap();
-        h.put_addr(x, &Addr { seen: 4, holder: Some("vm".into()), holder_id: Some(Ident::me()), held: 4, ..Addr::default() }).unwrap();
+        h.put_addr(x, &Addr { seen: 4, holder: Some("vm".into()), holder_id: Some(Ident::me()), held: 4, ..Addr::default() }, false).unwrap();
         // The notice cannot be written: nothing changes, so the claim (kept) still leads a sweep to it.
         let notices = h.state.join("withdrawals");
         std::fs::remove_dir(&notices).unwrap();
@@ -3708,7 +3585,7 @@ mod tests {
         let (_h_dir, h) = host("withdraw-unreadable");
         let x = ip("10.9.1.1");
         let gone = dead_owner(&h, 999_999_951, &[]);
-        h.put_addr(x, &Addr { seen: 4, holder: Some("vm".into()), holder_id: Some(gone), held: 4, ..Addr::default() }).unwrap();
+        h.put_addr(x, &Addr { seen: 4, holder: Some("vm".into()), holder_id: Some(gone), held: 4, ..Addr::default() }, false).unwrap();
         let kept = |h: &Host| !h.addr(&h.lock().unwrap(), x).unwrap().withdrawn;
         // An owed record or a migration record that cannot be read may be the one that keeps it.
         for dir in ["owed", "migs"] {
@@ -3738,7 +3615,7 @@ mod tests {
         let x = ip("10.9.0.1");
         let gone = dead_owner(&h, 999_999_952, &[]);
         let a = Addr { seen: 4, lent: Some(4), holder: Some("vm".into()), holder_id: Some(gone), held: 4, arriving: Some(30), ..Addr::default() };
-        h.put_addr(x, &a).unwrap();
+        h.put_addr(x, &a, false).unwrap();
         store(&h.mig_path(30), &Mig::Released { source: "s".into(), by: None, ip: Some(x) }, false).unwrap();
         // The source is done (or gone) before any sweep: the record goes, its evidence moved to the address.
         h.mig_done(30).unwrap();
@@ -3779,7 +3656,7 @@ mod tests {
         h.cfg.peers = vec!["p1".into(), "p2".into()];
         let x = ip("10.9.1.1");
         let gone = dead_owner(&h, 999_999_953, &[]);
-        h.put_addr(x, &Addr { seen: 4, holder: Some("vm".into()), holder_id: Some(gone), held: 4, ..Addr::default() }).unwrap();
+        h.put_addr(x, &Addr { seen: 4, holder: Some("vm".into()), holder_id: Some(gone), held: 4, ..Addr::default() }, false).unwrap();
         h.withdraw_dead().unwrap();
         let notice = |h: &Host| load::<Notice>(&h.notice_path(x)).unwrap();
         assert_eq!(notice(&h), Some(Notice { gen: 4, peers: unheard(&["p1", "p2"]) }), "recorded with the withdrawal");
@@ -3872,7 +3749,7 @@ mod tests {
             leaving: Some(Leaving { mig: 50, to: "c".into() }),
             ..Addr::default()
         };
-        h.put_addr(x, &a).unwrap();
+        h.put_addr(x, &a, false).unwrap();
         h.withdraw_dead().unwrap();
         assert_eq!(load::<Owed>(&h.owed_path(50)).unwrap(), Some(Owed { to: "c".into(), ip: x, gen: 4, by: gone }));
         let rec = h.addr(&h.lock().unwrap(), x).unwrap();
@@ -3888,7 +3765,7 @@ mod tests {
         let gone = dead_owner(&h, 999_999_955, &[]);
         let a =
             Addr { seen: 4, holder: Some("vm2".into()), holder_id: Some(gone), held: 4, leaving: Some(Leaving { mig: 51, to: "c".into() }), ..Addr::default() };
-        h.put_addr(y, &a).unwrap();
+        h.put_addr(y, &a, false).unwrap();
         h.withdraw_dead().unwrap();
         h.settle_owed_with(5, |_, id| Ok(if id == 51 { "released" } else { "pending" }.into()), |_, _| (), |_, _| ());
         let rec = h.addr(&h.lock().unwrap(), y).unwrap();
@@ -4536,14 +4413,14 @@ mod tests {
             let l = h.lock().unwrap();
             h.lend(&l, x, 8, 1, "source").unwrap();
             h.claim_arrival(&l, "target", x, 8, 2, 7).unwrap().keep();
-            h.update(&l, x, |a| a.holder_id = Some(owner.clone())).unwrap();
+            h.update(&l, x, false, |a| a.holder_id = Some(owner.clone())).unwrap();
             let mut expected = h.addr(&l, x).unwrap();
             (expected.holder, expected.holder_id, expected.arriving) = (None, None, None);
             // Neither another migration's claim nor another owner's is this arrival's.
             let y = ip("10.9.0.2");
             let z = ip("10.9.0.3");
             h.claim_arrival(&l, "other-migration", y, 8, 2, 9).unwrap().keep();
-            h.update(&l, y, |a| a.holder_id = Some(owner.clone())).unwrap();
+            h.update(&l, y, false, |a| a.holder_id = Some(owner.clone())).unwrap();
             h.claim_arrival(&l, "other-owner", z, 8, 2, 7).unwrap().keep();
             let unchanged = [h.addr(&l, y).unwrap(), h.addr(&l, z).unwrap()];
             let record = if committed { Mig::Committed { owner } } else { Mig::Pending { owner, ip: Some(x) } };
@@ -4710,7 +4587,7 @@ mod tests {
         // A dead holder's file is stale: the record decides.
         let dead = dead_owner(&h, 999_999_940, &[]);
         let crashed = Addr { seen: 7, held: 7, holder: Some("z".into()), holder_id: Some(dead.clone()), ..Default::default() };
-        h.put_addr(gone, &crashed).unwrap();
+        h.put_addr(gone, &crashed, false).unwrap();
         store(&h.live_path(gone), &Live { id: dead, gen: 7, rev: 5 }, false).unwrap();
         assert_eq!(h.live(&l, gone).unwrap(), None);
         assert!(h.observe(&l, gone, 7, 0, a).unwrap());
@@ -4746,7 +4623,7 @@ mod tests {
         let (gone, named) = (dead_owner(&h, 999_999_930, &[]), dead_owner(&h, 999_999_931, &[]));
         store(&h.live_path(x), &Live { id: gone, gen: 7, rev: 4 }, false).unwrap();
         let held = Addr { seen: 7, held: 7, holder: Some("m".into()), holder_id: Some(named.clone()), ..Default::default() };
-        h.put_addr(y, &held).unwrap();
+        h.put_addr(y, &held, false).unwrap();
         store(&h.live_path(y), &Live { id: named, gen: 7, rev: 4 }, false).unwrap();
         let _claim = h.claim_incoming(&l, "n", z, 7, None).unwrap();
         h.publish_live(&l, z, 7, 1).unwrap();
@@ -4783,7 +4660,7 @@ mod tests {
         let l = h.lock().unwrap();
         let mut crashed = before.clone();
         crashed.holder_id = Some(dead.clone());
-        h.put_addr(x, &crashed).unwrap();
+        h.put_addr(x, &crashed, true).unwrap();
         store(&h.mig_path(1), &Mig::Committed { owner: dead }, true).unwrap();
         drop(l);
         assert_eq!(h.mig_status(1).unwrap(), "aborted");
@@ -4820,10 +4697,10 @@ mod tests {
         assert!(h.mig_status(4).unwrap() == "aborted" && rec(4).is_none() && r.commit(&h.lock().unwrap()).is_err());
         // A dead arrival's route that cannot be put back yet keeps its record, for the next query.
         let back = ip("10.9.0.4");
-        std::fs::create_dir(h.addr_path(back)).unwrap();
+        std::fs::write(h.addr_path(back), "{").unwrap();
         store(&h.mig_path(10), &Mig::Pending { owner: dead_owner(&h, 999_999_910, &[]), ip: Some(back) }, false).unwrap();
         assert!(h.mig_status(10).unwrap() == "aborted" && rec(10).is_some(), "kept while its route cannot be put back");
-        std::fs::remove_dir(h.addr_path(back)).unwrap();
+        std::fs::remove_file(h.addr_path(back)).unwrap();
         assert!(h.mig_status(10).unwrap() == "aborted" && rec(10).is_none());
         let fc = Sleeper::new();
         store(&h.mig_path(5), &Mig::Committed { owner: dead_owner(&h, 999_999_905, &[&fc.1]) }, false).unwrap();

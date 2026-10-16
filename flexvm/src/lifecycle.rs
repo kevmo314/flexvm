@@ -320,7 +320,7 @@ impl Proc {
             Err(Restore::Uncertain(e)) => {
                 *self.cmd.lock().unwrap() = None;
                 self.keep_addr();
-                let _ = crate::util::write_file(&dir, QUARANTINE, format!("{} {e}", crate::host::boot_id()).as_bytes(), true);
+                let _ = std::fs::write(dir.join(QUARANTINE), format!("{} {e}", crate::host::boot_id()));
                 bail!("vm {name} is quarantined: {e}; kill it to discard its checkpoint")
             }
             // Re-arming the checkpoint would replay what it did since.

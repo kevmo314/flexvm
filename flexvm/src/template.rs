@@ -470,7 +470,7 @@ fn memory_bitmap(file: &File, len: usize, dir: &Path) -> Result<Vec<u64>> {
             let extents = data_extents(file, len as u64)?;
             if Stamp::of(&file.metadata()?) == stamp {
                 let cache = MemoryExtents { stamp, extents: extents.clone() };
-                let _ = crate::util::write_file(dir, "extents.json", &serde_json::to_vec(&cache)?, true);
+                let _ = crate::util::write_file(dir, "extents.json", &serde_json::to_vec(&cache)?, false);
             }
             extents
         }
