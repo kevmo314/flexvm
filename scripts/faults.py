@@ -2218,6 +2218,38 @@ def delayed_announce():
     kill(B, n)
 
 
+def delayed_announce_handoff():
+    """#492: as delayed_announce, but the source's late announcement reaches
+    B while B's handoff is still under way (`handoff_stall`, 3 s). B recorded
+    the arrival's revision at the commit, before the source had its answer,
+    so the late one is stale already: it never names A as the way to the
+    address in B's record."""
+    n = "ft-delayed-handoff"
+    fault(B, "route_stall", 60000)
+    ok(run(A, n))
+    v = vms(A)[n]
+    ip, gen = v["ip"], v["gen"]
+    check("delayed handoff: B holds up A's announcement", wait_for(lambda: conns(B) == 1, 10), conns(B))
+    clear_gate(B, "handoff_stall")
+    fault(B, "handoff_stall", 30000)
+    r = migrate(A, n, B)
+    answered = time.time()
+    check("delayed handoff: migrated", r["ok"] and where(n).get(B) == "running", (r, where(n)))
+    check("delayed handoff: B's handoff is stalled", wait_for(lambda: reached(B, "handoff_stall"), 2), reached(B, "handoff_stall"))
+    check("delayed handoff: B recorded the arrival's revision at the commit", addr(B, ip).get("rev") == 1, addr(B, ip))
+    fault(B, "route_stall", 0)
+    check("delayed handoff: B handled A's announcement", wait_for(lambda: conns(B) == 0, 2), conns(B))
+    check("delayed handoff: within the handoff stall", time.time() - answered < 3, time.time() - answered)
+    a = addr(B, ip)
+    check("delayed handoff: A's late one is stale", a.get("seen") == gen and a.get("rev") == 1 and a.get("via") is None, a)
+    fault(B, "handoff_stall", 0)
+    wait_released(B, n)
+    a = addr(B, ip)
+    check("delayed handoff: and stays so after the handoff", a.get("rev") == 1 and a.get("via") is None, a)
+    check("delayed handoff: running on B", where(n) == {B: "running"}, where(n))
+    kill(B, n)
+
+
 # Linux's (and its SCM_TIMESTAMPNS cmsg type), which Python's socket module leaves out.
 SO_TIMESTAMPNS = getattr(socket, "SO_TIMESTAMPNS", 35)
 
@@ -8338,7 +8370,7 @@ SCENARIOS = dict(
     sigkill_restart=sigkill_restart, listen_trickle=listen_trickle,
     cow_wp_race=cow_wp_race, fetch_tail_enomem=fetch_tail_enomem, fetch_enomem_stuck=fetch_enomem_stuck, pull_enomem=pull_enomem,
     collapse_abort=collapse_abort, collapse_ckpt_fail=collapse_ckpt_fail, ckpt_paused_backlog=ckpt_paused_backlog, same_host_order=same_host_order, same_host_slow_route=same_host_slow_route, same_host_flood=same_host_flood, same_host_late_handover=same_host_late_handover, same_host_backlog=same_host_backlog, same_host_bulk_tcp=same_host_bulk_tcp, ckpt_backlog=ckpt_backlog, rx_stall=rx_stall, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,
-    handoff_superseded=handoff_superseded, delayed_announce=delayed_announce, announce_arp_timer=announce_arp_timer,
+    handoff_superseded=handoff_superseded, delayed_announce=delayed_announce, delayed_announce_handoff=delayed_announce_handoff, announce_arp_timer=announce_arp_timer,
     prepare_fail_announce=prepare_fail_announce, reconcile_announce=reconcile_announce, reconcile_kill=reconcile_kill, resume_pull_lock=resume_pull_lock, page_conns=page_conns, suspend_cmd=suspend_cmd, suspend_overlap=suspend_overlap, fc_died_busy=fc_died_busy, pause_cmd_start=pause_cmd_start, suspend_died=suspend_died,
     ctrl_z_long_op=ctrl_z_long_op, resume_suspending=resume_suspending, quit_status=quit_status)
 # Measurements, not correctness checks (nothing they print has a threshold): run only when named.
