@@ -185,6 +185,11 @@ pub struct Proc {
     growth: AtomicU64,
     /// Held by `publish` from reading the VM's state to writing it.
     publishing: Mutex<()>,
+    /// A failed revision write is being tried again (`advance`); set and cleared under the host lock.
+    recording: AtomicBool,
+    /// Test hook: called by `record_again` holding the host lock.
+    #[cfg(test)]
+    record_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     me: std::sync::Weak<Proc>,
     announcer: Arc<Announcer>,
 }
@@ -283,6 +288,9 @@ impl Proc {
             ticks: Mutex::new(Ticks::default()),
             growth: AtomicU64::new(0),
             publishing: Mutex::new(()),
+            recording: AtomicBool::new(false),
+            #[cfg(test)]
+            record_hook: Mutex::new(None),
             me: me.clone(),
             announcer,
         }))
@@ -384,7 +392,9 @@ impl Proc {
 
     pub fn set_addr(&self, a: AddrClaim) -> Ipv4Addr {
         let ip = a.ip;
-        *self.addr.lock().unwrap() = Some(a);
+        // Dropped (released, under the host lock) after `addr` is let go: see `record_again`.
+        let old = self.addr.lock().unwrap().replace(a);
+        drop(old);
         ip
     }
 
@@ -485,7 +495,9 @@ impl Proc {
     }
 
     pub fn keep_addr(&self) {
-        if let Some(a) = self.addr.lock().unwrap().take() {
+        // Taken out first: keep() may take the host lock, which a revision retry holds while it waits for addr.
+        let a = self.addr.lock().unwrap().take();
+        if let Some(a) = a {
             a.keep();
         }
     }
@@ -503,19 +515,54 @@ impl Proc {
         self.addr.lock().unwrap().as_ref().map_or(0, |a| a.rev)
     }
 
-    /// Moves the VM's revision `by` on, recorded here too.
-    /// Test fault `advance_fail`: recording it here fails, the revision moved on.
+    /// Moves the VM's revision `by` on, recorded here too. If recording it
+    /// fails, a thread tries again until it is recorded, so this host's record
+    /// catches up with the revision its VM announces (#499): until then, a late
+    /// announcement of an older revision (an aborted target's) is taken here.
     pub fn advance(&self, l: &crate::host::Locked, by: u64) -> Result<()> {
-        let Some((ip, gen, rev)) = self.addr.lock().unwrap().as_mut().map(|a| {
+        if let Some(a) = self.addr.lock().unwrap().as_mut() {
             a.rev = a.rev.saturating_add(by);
-            (a.ip, a.gen, a.rev)
-        }) else {
-            return Ok(());
+        }
+        let r = self.record_rev(l).map(drop);
+        if r.is_err() && !self.recording.swap(true, Ordering::SeqCst) {
+            let me = self.me.clone();
+            let spawned = thread::Builder::new().name("record-rev".into()).spawn(move || {
+                retry_record(|| Some(me.upgrade()?.record_again()), |d| thread::sleep(d + jitter(d)));
+            });
+            if let Err(e) = spawned {
+                self.recording.store(false, Ordering::SeqCst);
+                crate::log!("vm {}: no thread to record its revision again: {e}", self.name());
+            }
+        }
+        r.map_err(|e| format!("{e}; trying again").into())
+    }
+
+    /// One try of `advance`'s retry. Lock order: the host lock, then `addr`
+    /// (as `advance`'s callers have it); nothing takes the host lock holding `addr`.
+    fn record_again(&self) -> Result<()> {
+        let l = self.host.lock()?;
+        #[cfg(test)]
+        if let Some(hook) = self.record_hook.lock().unwrap().as_ref() {
+            hook();
+        }
+        if self.record_rev(&l)? {
+            crate::log!("vm {}: recorded its revision {} after all", self.name(), self.rev());
+        }
+        // Under the host lock, as `advance` sets it: a failure after this starts another thread.
+        self.recording.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Records the VM's revision (as it is now, which only changes under the host lock) here.
+    /// False if there is none (its claim is gone). Test fault `advance_fail`: it fails.
+    fn record_rev(&self, l: &crate::host::Locked) -> Result<bool> {
+        let Some((ip, gen, rev)) = self.addr.lock().unwrap().as_ref().map(|a| (a.ip, a.gen, a.rev)) else {
+            return Ok(false);
         };
         if crate::host::tripped("advance_fail") {
             bail!("injected fault: recording the revision failed");
         }
-        self.host.advance(l, ip, gen, rev)
+        self.host.advance(l, ip, gen, rev).map(|()| true)
     }
 
     pub fn op(&self) -> Op<'_> {
@@ -617,29 +664,11 @@ impl Proc {
         // An arrival still pulling that dies leaves its source's copy to run
         // again (see `Host::mig_status`): its address is not withdrawn.
         let source_runs = matches!(end, End::Died) && self.arrived.lock().unwrap().is_some();
-        if let Some(rec) = self.arrived.lock().unwrap().take() {
+        let arrived = self.arrived.lock().unwrap().take();
+        if let Some(rec) = arrived {
             rec.settle(matches!(end, End::Gone));
         }
-        match (end, self.addr.lock().unwrap().take()) {
-            (End::Suspended, Some(a)) => a.keep(),
-            (End::Gone | End::Died, Some(a)) if !source_runs => self.withdraw(a),
-            (End::NotStarted, Some(a)) if a.fresh => self.withdraw(a),
-            (End::Moved(to), _) => {
-                if let Ok(moved) = self.host.vms(&self.name(), "moved") {
-                    let _ = std::fs::write(moved, &to);
-                }
-                crate::log!("vm {}: moved to {to}", self.name());
-            }
-            // Never ran here, or (`Owed`) may run at its target: a peer's route for it comes back, any loan stays.
-            (_, Some(a)) => {
-                let ip = a.ip;
-                if let Ok(l) = self.host.lock() {
-                    let _ = a.release(&l);
-                    let _ = self.host.reinstall(&l, ip, None);
-                }
-            }
-            (_, None) => {}
-        }
+        self.end_claim(end, source_runs);
         if let Some(dir) = self.consumed.lock().unwrap().take() {
             crate::lifecycle::delete_consumed(&self.name(), &dir);
         }
@@ -663,6 +692,32 @@ impl Proc {
         crate::util::flush_log(crate::util::LOG_FLUSH);
         crate::util::output::drain();
         std::process::exit(code)
+    }
+
+    /// What becomes of the address claim as the process ends. Taken out of `addr`
+    /// first: its withdrawal or release takes the host lock (see `record_again`).
+    fn end_claim(&self, end: End, source_runs: bool) {
+        let claim = self.addr.lock().unwrap().take();
+        match (end, claim) {
+            (End::Suspended, Some(a)) => a.keep(),
+            (End::Gone | End::Died, Some(a)) if !source_runs => self.withdraw(a),
+            (End::NotStarted, Some(a)) if a.fresh => self.withdraw(a),
+            (End::Moved(to), _) => {
+                if let Ok(moved) = self.host.vms(&self.name(), "moved") {
+                    let _ = std::fs::write(moved, &to);
+                }
+                crate::log!("vm {}: moved to {to}", self.name());
+            }
+            // Never ran here, or (`Owed`) may run at its target: a peer's route for it comes back, any loan stays.
+            (_, Some(a)) => {
+                let ip = a.ip;
+                if let Ok(l) = self.host.lock() {
+                    let _ = a.release(&l);
+                    let _ = self.host.reinstall(&l, ip, None);
+                }
+            }
+            (_, None) => {}
+        }
     }
 
     /// Returns only if refused: a migration source whose target committed is
@@ -2362,6 +2417,22 @@ struct Pending {
 /// The first and longest pause between tries: a peer down for long is tried quietly, and told once it is back.
 const ANNOUNCE_RETRY: (Duration, Duration) = (Duration::from_millis(250), Duration::from_secs(60));
 
+/// Up to a quarter of `d` more, so hosts sharing a failed disk do not retry in step.
+fn jitter(d: Duration) -> Duration {
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().subsec_nanos();
+    Duration::from_nanos(u64::from(nanos) % (d.as_nanos() as u64 / 4 + 1))
+}
+
+/// Calls `attempt` until it succeeds or has nothing left to do (None), napping
+/// between tries, from 50 ms up to 2 s.
+fn retry_record(mut attempt: impl FnMut() -> Option<Result<()>>, nap: impl Fn(Duration)) {
+    let mut wait = Duration::from_millis(50);
+    while let Some(Err(_)) = attempt() {
+        nap(wait);
+        wait = (wait * 2).min(Duration::from_secs(2));
+    }
+}
+
 impl Announcer {
     fn start(
         spawn: fn(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
@@ -2750,6 +2821,31 @@ mod tests {
         controller.join().unwrap();
     }
 
+    /// A failed revision write is tried again, backing off, until it is recorded or there is nothing to record (#499).
+    #[test]
+    fn revision_writes_are_tried_until_recorded() {
+        let (tries, naps) = (std::cell::Cell::new(0), std::cell::RefCell::new(Vec::new()));
+        retry_record(
+            || {
+                tries.set(tries.get() + 1);
+                Some(if tries.get() < 8 { Err("down".into()) } else { Ok(()) })
+            },
+            |d| naps.borrow_mut().push(d.as_millis()),
+        );
+        assert_eq!(tries.get(), 8);
+        assert_eq!(*naps.borrow(), [50, 100, 200, 400, 800, 1600, 2000]);
+        // The VM went: no more tries.
+        let tries = std::cell::Cell::new(0);
+        retry_record(
+            || {
+                tries.set(tries.get() + 1);
+                (tries.get() < 3).then(|| Err("down".into()))
+            },
+            drop,
+        );
+        assert_eq!(tries.get(), 3);
+    }
+
     /// A peer no longer configured is not told on; one down for long (past 36 tries) is told once it is back.
     #[test]
     fn announcements_stop_for_removed_peers_and_reach_one_back_up() {
@@ -2905,6 +3001,53 @@ mod tests {
         std::os::unix::fs::symlink(".gen/a", root.join("templates/default")).unwrap();
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
         (Proc::new(host, Paths::new(&root)).unwrap(), root)
+    }
+
+    /// #509: a revision retry holding the host lock and a process ending (its claim's
+    /// release takes the host lock) never wait on each other: the end lets go of `addr`
+    /// before it takes the host lock, so the retry, parked holding it, gets on.
+    #[test]
+    fn a_revision_retry_and_the_end_take_their_locks_in_one_order() {
+        use std::sync::mpsc::channel;
+        let (p, _root) = test_proc("record-order");
+        p.set_name(p.host.take_name("ordered", false).unwrap());
+        let claim = p.host.claim_new(&p.host.lock().unwrap(), "ordered", None).unwrap();
+        let ip = p.set_addr(claim);
+        let ((parked, at), (go, wait)) = (channel(), channel::<()>());
+        let wait = Mutex::new(wait);
+        *p.record_hook.lock().unwrap() = Some(Box::new(move || {
+            parked.send(()).unwrap();
+            wait.lock().unwrap().recv_timeout(Duration::from_secs(30)).unwrap();
+        }));
+        let (q, (done, ended)) = (p.clone(), channel());
+        let d = done.clone();
+        thread::spawn(move || d.send(("retry", q.record_again().is_ok())).unwrap());
+        // Generous: the host lock's thread half is process-wide, so other tests may hold it a while.
+        at.recv_timeout(Duration::from_secs(60)).unwrap();
+        // The retry holds the host lock. The end takes the claim, then waits for the host lock.
+        let q = p.clone();
+        thread::spawn(move || {
+            q.end_claim(End::Owed, false);
+            done.send(("end", true)).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let let_go = loop {
+            if let Ok(a) = p.addr.try_lock() {
+                if a.is_none() {
+                    break true;
+                }
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            thread::sleep(Duration::from_millis(1));
+        };
+        go.send(()).unwrap();
+        assert!(let_go, "the end held addr while it waited for the host lock");
+        let mut got: Vec<_> = (0..2).map(|_| ended.recv_timeout(Duration::from_secs(60)).expect("deadlocked")).collect();
+        got.sort();
+        assert_eq!(got, [("end", true), ("retry", true)]);
+        assert!(p.host.addr(&p.host.lock().unwrap(), ip).unwrap().holder.is_none(), "the claim was released");
     }
 
     #[test]
