@@ -113,6 +113,11 @@ runtimes keep for themselves: 125 when it could not start the VM (or gave it
 up), 124 when the VM died under it (`flexvm ls` then shows it `failed`, and
 `flexvm ls --json` why, until `flexvm kill`). Without `-- CMD` they are
 the same, so a script can tell a VM that never ran (125) from one that did.
+`flexvm exec` returns the command's status, or 125 for flexvm's own failures.
+
+`flexvm reclaim IP` explains the loan and prints `flexvm reclaim IP --force GEN`
+with its current generation. After checking that no host still runs that VM,
+use that command to withdraw the loan. It refuses if the lent generation changed.
 
 A VM migrating away stays paused on its source until the target has all its
 memory; `flexvm kill` refuses that copy (kill the VM where it runs), and
@@ -247,7 +252,8 @@ takes back an address it lent), lists those VMs as `lost`, puts back the
 routes to VMs on peers, settles migrations the reboot interrupted, and
 refills the standby VMs. Any flexvm command run as root does this too, but a
 quiet host needs something to start; one without a listener can run
-`flexvm recover` at boot:
+`flexvm recover` at boot (it requires root and exits non-zero if boot recovery,
+forwarding setup, or recording recovery completion fails):
 
 ```ini
 # /etc/systemd/system/flexvm-recover.service
@@ -398,7 +404,7 @@ copy-on-write, packet holds, clocks, Firecracker patches, measurements).
 - An address lent to a restore elsewhere stays lent if that restore's host
   dies before it starts the VM (a leak, never a collision).
 - `exec` reaches VMs on this host; one that migrates away ends its exec
-  saying where it went and exits 1 (the command keeps running there).
+  saying where it went and exits 125 (the command keeps running there).
 - Templates must be identical on every host (checked by content id), as
   must the CPU model and the Firecracker binary (see Setup).
 - The templates directory is trusted like the binaries: whoever can write in

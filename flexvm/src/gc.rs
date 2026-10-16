@@ -8,8 +8,9 @@ use std::fs::File;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
+use crate::bail;
 use crate::host::{boot_id, probe, Flock, Host, Ident, Liveness};
-use crate::util::locked;
+use crate::util::{locked, Result};
 
 /// How often `periodic` sweeps (some process on the host does).
 const EVERY: Duration = Duration::from_secs(30);
@@ -43,33 +44,30 @@ pub fn periodic(host: Host) {
 /// routes to peers' VMs. With `rest`, then the forwarding settings flexvm needs and `recover`; the
 /// recovery is marked complete (`Host::mark_recovered`) only after all of it, and only if each
 /// step succeeded (delivery and settlement are retried from their records by every sweep). VM
-/// processes and template builds pass false and leave it to a full pass. Returns whether it ran.
-pub fn after_boot(host: &Host, rest: bool) -> bool {
+/// processes and template builds pass false and leave it to a full pass. Returns whether it ran,
+/// or an error if local recovery, forwarding setup or recording completion failed.
+pub fn after_boot(host: &Host, rest: bool) -> Result<bool> {
     if unsafe { libc::geteuid() } != 0 {
-        return false;
+        return Ok(false);
     }
-    let local = match host.after_boot() {
-        Ok(Some(ok)) => ok,
-        Ok(None) => return false,
-        Err(e) => {
-            crate::log!("flexvm: recovering after boot: {e}");
-            return false;
-        }
-    };
+    let Some(local) = host.after_boot()? else { return Ok(false) };
     if !rest {
-        return true;
+        if !local {
+            bail!("local boot recovery incomplete; see earlier errors");
+        }
+        return Ok(true);
     }
-    let forwarding = crate::net::ip_forward().inspect_err(|e| crate::log!("flexvm: after boot: {e}")).is_ok();
+    let forwarding = crate::net::ip_forward();
     if let Some(dev) = host.config_now().announce_dev() {
         crate::net::proxy_arp(&dev);
     }
     recover(host);
-    if local && forwarding {
-        if let Err(e) = host.mark_recovered() {
-            crate::log!("flexvm: after boot: {e}");
-        }
+    forwarding?;
+    if !local {
+        bail!("local boot recovery incomplete; see earlier errors");
     }
-    true
+    host.mark_recovered()?;
+    Ok(true)
 }
 
 /// A sweep now (the peers told of withdrawals, interrupted migrations settled and retired) and

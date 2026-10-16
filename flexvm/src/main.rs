@@ -53,7 +53,7 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
   flexvm restore DIR [--name N] [--ip IP|auto] [--paused] [-d]
                                      start a VM from a checkpoint
   flexvm migrate NAME HOST:PORT      live-migrate a VM to the host listening there
-  flexvm reclaim IP [--force]        take back an address lent out with a VM that migrated away,
+  flexvm reclaim IP [--force GEN]    take back an address lent out with a VM that migrated away,
                                      once its target is gone for good (without --force: say what)
   flexvm config [--peer HOST:PORT]... [--vm-ips CIDR|FIRST-LAST] [--dns IP] [--underlay IP]
                 [--cluster-ips CIDR|FIRST-LAST] [--announce-dev IFACE|none] [--reserve MIB] [--evict-at MIB]
@@ -61,7 +61,7 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
                                      derived for those unset); --peer replaces the list, '' unsets
                                      --cluster-ips holds every host's VM range (unset: only --vm-ips)
   flexvm listen [ADDR]               take migrations from peers (no ADDR: saved or socket-activated address)
-  flexvm recover                     sweep and refill standby VMs now (at boot, on a host without a listener)
+  flexvm recover                     sweep and refill standby VMs now, as root (at boot, without a listener)
   flexvm standby [--template T] [N]  keep N VMs restored and paused, so run takes ~5 ms (no N: show)
   flexvm template NAME [--vcpus N] [--mem MIB] [--max MIB] [--plug MIB] [--image REF [--init PATH] ...]
                                      build a template (see README)
@@ -72,10 +72,10 @@ options: --state DIR (/var/lib/flexvm: artifacts, templates, images, VMs), --run
 Each state directory is bound to its first run directory; a different --run is refused (and so is
 none, if it is bound to another than its default); /run/flexvm is /var/lib/flexvm's alone.
 run, resume and restore exit with the VM's command's status, 128+signal, 125 when flexvm
-fails, 124 when the VM dies
+fails, 124 when the VM dies; exec returns the command's status, or 125 when flexvm fails
 ";
 
-const SWITCHES: &[&str] = &["warm", "stop", "paused", "incremental", "standby", "incoming", "json", "detach", "force", "help", "version"];
+const SWITCHES: &[&str] = &["warm", "stop", "paused", "incremental", "standby", "incoming", "json", "detach", "help", "version"];
 
 /// `--flag value`s: last wins. `rest` follows `--` (or `exec NAME`).
 pub struct Args {
@@ -177,7 +177,7 @@ fn main() {
         }
     }));
     let (args, error) = Args::parse_partly(std::env::args().skip(1));
-    let vm = matches!(args.positional.first().map(String::as_str), Some("run" | "resume" | "restore"));
+    let vm = matches!(args.positional.first().map(String::as_str), Some("run" | "resume" | "restore" | "exec"));
     let result = error.map_or_else(|| real_main(&args), Err);
     if let Some(sig) = template::interrupted_signal() {
         util::raise_signal(sig);
@@ -280,7 +280,9 @@ fn state(args: &Args) -> Result<PathBuf> {
 pub fn open_host(args: &Args) -> Result<Host> {
     let host = open_host_only(args)?;
     let partly = matches!(args.positional.first().map(String::as_str), Some("run" | "resume" | "restore" | "listen" | "recover" | "template"));
-    gc::after_boot(&host, !partly);
+    if let Err(e) = gc::after_boot(&host, !partly) {
+        crate::log!("flexvm: recovering after boot: {e}");
+    }
     Ok(host)
 }
 
@@ -320,7 +322,8 @@ fn real_main(args: &Args) -> Result<()> {
             vmproc::main(open_host(args)?, paths(args)?, Start::Incoming { req }, notify_fd())
         }
         Some("run") => run(args, name, template),
-        Some("resume") if resume(&open_host(args)?, name)? => Ok(()),
+        // A detached child must answer its parent through vmproc, even if another resume won meanwhile.
+        Some("resume") if std::env::var_os("FLEXVM_NOTIFY_FD").is_none() && resume(&open_host(args)?, name)? => Ok(()),
         Some("resume") => start(args, name, Start::Resume { name: name.into() }),
         Some("restore") => {
             let dir = std::path::absolute(pos.get(1).ok_or("restore needs DIR")?)?;
@@ -339,15 +342,21 @@ fn real_main(args: &Args) -> Result<()> {
         Some("ls") => list(&open_host(args)?, args.has("json")),
         Some("exec") => util::exit(exec(&open_host(args)?, name, &args.rest.join(" "))?),
         Some("kill") => kill(&open_host(args)?, name),
-        Some("reclaim") => reclaim(&open_host(args)?, name, args.has("force")),
+        Some("reclaim") => {
+            let gen = args.get("force").map(|v| v.parse().map_err(|_| format!("bad --force generation {v:?}"))).transpose()?;
+            reclaim(&open_host(args)?, name, gen)
+        }
         Some("checkpoint") => {
             let dir = std::path::absolute(arg2.ok_or("checkpoint needs NAME DIR")?)?;
             call(json!({"op": "checkpoint", "dir": dir, "stop": args.has("stop"), "incremental": args.has("incremental")}))
         }
         Some("migrate") => call(json!({"op": "migrate", "to": arg2.ok_or("migrate needs NAME HOST:PORT")?})),
         Some("recover") => {
-            let host = open_host(args)?;
-            if !gc::after_boot(&host, true) {
+            if unsafe { libc::geteuid() } != 0 {
+                bail!("recover requires root");
+            }
+            let host = open_host_only(args)?;
+            if !gc::after_boot(&host, true)? {
                 gc::recover(&host);
             }
             Ok(())
@@ -681,22 +690,22 @@ fn kill(host: &Host, name: &str) -> Result<()> {
 
 /// Withdraws the generation an address was lent out with, everywhere, and forgets what
 /// outcome was owed for it: only for a target gone for good, so `--force` it is.
-fn reclaim(host: &Host, ip: &str, force: bool) -> Result<()> {
+fn reclaim(host: &Host, ip: &str, force: Option<u64>) -> Result<()> {
     let ip: std::net::Ipv4Addr = ip.parse().map_err(|_| format!("reclaim takes the address (an IPv4 address), not {ip:?}"))?;
     let Some((gen, owed)) = host.lent_to(ip)? else { return Err(format!("{ip} is not lent out").into()) };
     let whom = match owed.as_slice() {
         [] => "a vm that migrated away".to_string(),
         o => o.iter().map(|(id, to)| format!("migration {id} to {to}, whose outcome is unknown")).collect::<Vec<_>>().join(", "),
     };
-    if !force {
+    let Some(expected) = force else {
         return Err(format!(
             "{ip} is lent out (generation {gen}) with {whom}. Reclaiming withdraws that generation everywhere and lets {ip} be handed out here again: \
              first make sure no host runs that vm any more (kill it there, or know the host is gone for good), or two vms will share {ip}. \
-             Then: flexvm reclaim {ip} --force"
+             Then: flexvm reclaim {ip} --force {gen}"
         )
         .into());
-    }
-    let (gen, forgot) = host.reclaim(ip)?;
+    };
+    let (gen, forgot) = host.reclaim(ip, expected)?;
     vmproc::tell_peers(host, json!({"op": "route", "ip": ip.to_string(), "gen": gen}));
     util::log_line(format!(
         "WARNING: {ip} reclaimed (generation {gen} withdrawn, lent with {whom}); if that vm still runs anywhere, it shares {ip} with the next vm given it"
@@ -1225,6 +1234,32 @@ mod exec_tests {
         }
         let error = Args::parse(["run", "web", "--ip"].map(String::from)).err().unwrap();
         assert_eq!(error.to_string(), "--ip needs a value");
+    }
+
+    #[test]
+    fn recover_refuses_non_root_before_opening_the_host() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let root = crate::test_util::TempDir::new("recover-non-root");
+        let state = root.join("state");
+        let run = root.join("run");
+        let args = parse(&["recover", "--state", state.to_str().unwrap(), "--run", run.to_str().unwrap()]);
+        assert_eq!(real_main(&args).unwrap_err().to_string(), "recover requires root");
+        assert!(!state.exists() && !run.exists());
+    }
+
+    #[test]
+    fn reclaim_force_requires_a_generation() {
+        let error = Args::parse(["reclaim", "10.9.0.2", "--force"].map(String::from)).err().unwrap();
+        assert_eq!(error.to_string(), "--force needs a value");
+        let args = parse(&["reclaim", "10.9.0.2", "--force", "42"]);
+        check_applies(&args).unwrap();
+        assert_eq!(args.get("force"), Some("42"));
+        for gen in ["", "bad", "-1", "18446744073709551616"] {
+            let args = parse(&["reclaim", "10.9.0.2", "--force", gen]);
+            assert_eq!(real_main(&args).unwrap_err().to_string(), format!("bad --force generation {gen:?}"));
+        }
     }
 
     #[test]

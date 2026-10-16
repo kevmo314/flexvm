@@ -744,7 +744,7 @@ def quiet_source():
     # The source closed its side; the exec client, which reaches this host
     # only, ends saying where the VM went (the command runs on there).
     _, err = communicate_process(session, 60)
-    check("quiet source: exec ends saying the vm moved", session.returncode != 0 and "moved to" in err, err[-300:])
+    check("quiet source: exec ends saying the vm moved", session.returncode == 125 and "moved to" in err, err[-300:])
     stop.set()
     st = wait_released(B, n)
     check("quiet source: released, only on B", st["released"] is True and where(n) == {B: "running"}, (st, where(n)))
@@ -2564,8 +2564,8 @@ def reconcile_kill():
         check(f"{what}: unsettled while the target cannot say", len(owed(A)) == 1 and addr(A, ip).get("lent") == gen, (owed(A), addr(A, ip)))
         code, out, err = cli(A, "reclaim", ip)
         check(f"{what}: reclaim without --force says what it would do, and does nothing",
-              code != 0 and "make sure no host runs that vm" in err and "--force" in err and len(owed(A)) == 1 and addr(A, ip).get("lent") == gen, (code, err))
-        code, out, err = cli(A, "reclaim", ip, "--force")
+              code != 0 and "make sure no host runs that vm" in err and f"--force {gen}" in err and len(owed(A)) == 1 and addr(A, ip).get("lent") == gen, (code, err))
+        code, out, err = cli(A, "reclaim", ip, "--force", str(gen))
         r = json.loads(out) if code == 0 else {}
         check(f"{what}: reclaim --force withdraws it and forgets the owed outcome, warning",
               code == 0 and r.get("withdrawn_gen") == gen and len(r.get("forgot_migrations", [])) == 1 and "WARNING" in err and not owed(A), (code, out, err))
@@ -7989,7 +7989,7 @@ def exec_recovery_instance():
     ok(run(A, n))
     check("exec instance: made again, a new generation", vms(A)[n]["gen"] != gen, (gen, vms(A).get(n)))
     code, out, err = finish(p)
-    check("exec instance: the new vm is refused", code != 0 and "killed and made again" in err and "done" not in out, (code, out, err))
+    check("exec instance: the new vm is refused", code == 125 and "killed and made again" in err and "done" not in out, (code, out, err))
     code, out = sh(A, n, "test -e /tmp/ran && echo ran || echo never")
     check("exec instance: the new vm never ran the command", code == 0 and out == "never", (code, out))
     p = lost_and_held()

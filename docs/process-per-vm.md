@@ -118,9 +118,10 @@ so a lent address always has a record of whom it is owed to.
 A target lost for good (its host gone, never to answer) leaves the address
 lent, refused to `run --ip` and automatic allocation alike. `flexvm reclaim
 IP` says what it is lent with (the migrations owed for it) and what
-reclaiming does; `flexvm reclaim IP --force` withdraws that generation here
-and at every peer and forgets the owed records, so the address can be handed
-out again. It is the operator's word that no host still runs the VM: one that
+reclaiming does, and prints the exact `flexvm reclaim IP --force GEN` command.
+`--force` requires that generation and refuses under the host lock if the address
+is no longer lent with it. It withdraws that generation here and at every peer
+and forgets the owed records, so the address can be handed out again. It is the operator's word that no host still runs the VM: one that
 does would share the address with the next VM given it, so make sure first
 (kill it there, or know its host is gone). It also takes back a loan left by
 a source killed with SIGKILL, which records nothing.
@@ -338,8 +339,9 @@ A command, the listener as it starts, and `flexvm recover` then set forwarding,
 sweep (the peers told, owed outcomes settled) and refill the standby VMs
 (`gc::recover`), and only then, if every step succeeded, write `RUN/.boot`; a
 VM process or a template build does only the local part and leaves the marker
-to a full pass. A `QUARANTINE` of an earlier boot no longer keeps a dead claim
-from being withdrawn, and the name's next holder withdraws its generation as it
+to a full pass. `flexvm recover` requires root and exits non-zero if the local
+boot recovery, forwarding setup or writing `RUN/.boot` fails. A `QUARANTINE`
+of an earlier boot no longer keeps a dead claim from being withdrawn, and the name's next holder withdraws its generation as it
 removes that debris (that resume never ran its VM).
 
 - **Borrowing.** A restore keeping another host's address (its checkpoint's,
@@ -569,7 +571,8 @@ configured now (`Host::config_now`); the listener re-reads them too, so
 
 There is no remote control channel. An exec whose VM migrates away ends
 with `vm NAME moved to HOST; the command keeps running there (session ID)`,
-exit 1; reconnection within a host (checkpoint pauses, vsock resets) still
+exit 125 (as for other flexvm exec failures; guest command statuses pass through);
+reconnection within a host (checkpoint pauses, vsock resets) still
 works.
 
 ## Invariants

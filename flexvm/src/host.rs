@@ -1597,15 +1597,19 @@ impl Host {
         remove_write_debris(&self.state.join(dir), |_| true);
     }
 
-    /// `flexvm reclaim IP --force`: an address lent out with a VM that migrated away, taken
+    /// `flexvm reclaim IP --force GEN`: an address lent out with a VM that migrated away, taken
     /// back: its generation withdrawn here (the peers are told by the caller) and any
     /// outcome owed for it forgotten. Only for a target known to be gone for good (the VM
     /// is not running there): a VM still running with the address would share it.
+    /// Refuses unless the lent generation still matches the operator's confirmation, under the host lock.
     /// Returns the generation withdrawn and the migrations forgotten.
-    pub fn reclaim(&self, ip: Ipv4Addr) -> Result<Lent> {
+    pub fn reclaim(&self, ip: Ipv4Addr, expected: u64) -> Result<Lent> {
         let l = self.lock()?;
         let a = self.addr(&l, ip)?;
         let Some(gen) = a.lent else { bail!("{ip} is not lent out") };
+        if gen != expected {
+            bail!("{ip} is lent out with generation {gen}, not confirmed generation {expected}; run flexvm reclaim {ip} again");
+        }
         if let Some(h) = self.holder(&l, ip)? {
             bail!("{ip} is held by vm {h} here");
         }
@@ -4342,7 +4346,7 @@ mod tests {
             assert!(h.owes(&gone));
         }
         let reclaimed = ip("10.9.2.3");
-        h.reclaim(reclaimed).unwrap();
+        h.reclaim(reclaimed, 4).unwrap();
         let rec = h.addr(&h.lock().unwrap(), reclaimed).unwrap();
         assert!(rec.withdrawn && rec.holder.is_none() && rec.leaving.is_none(), "{rec:?}");
         h.withdraw_dead(false).unwrap();
@@ -5100,7 +5104,7 @@ mod tests {
     fn reclaim_withdraws_a_lent_address_and_forgets_its_owed_outcome() {
         let (_h_dir, h) = host("reclaim");
         let x = ip("10.9.0.2");
-        assert!(h.reclaim(x).unwrap_err().to_string().contains("not lent"));
+        assert!(h.reclaim(x, 1).unwrap_err().to_string().contains("not lent"));
         let gen = {
             let l = h.lock().unwrap();
             let _v = h.take_name("v", false).unwrap();
@@ -5113,12 +5117,34 @@ mod tests {
         h.owe(4, &Owed { to: "lost:1".into(), ip: x, gen, by: Ident { start: 4, ..Ident::me() } }).unwrap();
         h.owe(5, &Owed { to: "other:1".into(), ip: ip("10.9.0.3"), gen: 1, by: Ident { start: 5, ..Ident::me() } }).unwrap();
         assert_eq!(h.lent_to(x).unwrap(), Some((gen, vec![(4, "lost:1".to_string())])));
-        assert_eq!(h.reclaim(x).unwrap(), (gen, vec![(4, "lost:1".to_string())]));
+        let warning = crate::reclaim(&h, &x.to_string(), None).unwrap_err().to_string();
+        assert!(warning.contains(&format!("Then: flexvm reclaim {x} --force {gen}")), "{warning}");
+        assert_eq!(h.reclaim(x, gen).unwrap(), (gen, vec![(4, "lost:1".to_string())]));
         let a = h.addr(&h.lock().unwrap(), x).unwrap();
         assert!(a.withdrawn && a.lent.is_none());
         assert!(!h.owed_path(4).exists() && h.owed_path(5).exists(), "only that address's");
         let _w = h.take_name("w", false).unwrap();
         assert!(h.claim_new(&h.lock().unwrap(), "w", Some(x)).unwrap().gen > gen);
+    }
+
+    #[test]
+    fn reclaim_refuses_a_generation_lent_again_since_confirmation() {
+        let (_h_dir, h) = host("reclaim-generation");
+        let x = ip("10.9.0.2");
+        h.put_addr(x, &Addr { seen: 4, lent: Some(4), ..Addr::default() }, false).unwrap();
+        let (confirmed, _) = h.lent_to(x).unwrap().unwrap();
+        // The VM came home and left again while the operator checked its old target.
+        h.put_addr(x, &Addr { seen: 5, lent: Some(5), ..Addr::default() }, false).unwrap();
+        let owed = Owed { to: "live:1".into(), ip: x, gen: 5, by: Ident::me() };
+        h.owe(7, &owed).unwrap();
+        let error = h.reclaim(x, confirmed).unwrap_err().to_string();
+        assert!(error.contains("generation 5, not confirmed generation 4"), "{error}");
+        let a = h.addr(&h.lock().unwrap(), x).unwrap();
+        assert_eq!((a.seen, a.lent, a.withdrawn), (5, Some(5), false));
+        assert!(h.owed_path(7).exists() && !h.notice_path(x).exists());
+        // A loan that ended meanwhile is refused too.
+        h.put_addr(x, &Addr { seen: 5, ..Addr::default() }, false).unwrap();
+        assert!(h.reclaim(x, confirmed).unwrap_err().to_string().contains("not lent"));
     }
 
     #[test]
