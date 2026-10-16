@@ -2780,9 +2780,10 @@ def pause_resume():
     fault(A, "pages", 2000)
     check("paused migrate: stays paused on the target", vms(B)[n]["state"] == "paused", vms(B)[n]["state"])
     waited = resume(B, n)
+    # Its pull already ended when the resume returned (compared as events, not as two durations).
+    pulled = vms(B)[n].get("background_pull_ms")
     st = wait_released(B, n)
-    check("paused migrate: resume waited for the whole pull", waited > 1.0 and st["background_pull_ms"] is not None
-          and st["background_pull_ms"] <= waited * 1000 + 100, (waited, st))
+    check("paused migrate: resume waited for the whole pull", waited > 1.0 and pulled is not None, (waited, pulled, st))
     check("paused migrate: source released, only on B", where(n) == {B: "running"} and st["released"] is True, (where(n), st))
     check("paused migrate: runs on B after resume, md5 intact", md5(B, n) == m)
     cleanup(n)

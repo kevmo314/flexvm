@@ -804,7 +804,7 @@ def faults():
         return
     # Growth needs a template that starts with little plugged.
     env = {**os.environ, "COW_GROW_TEMPLATE": GROW, "PLUG_TEMPLATE": GROW, "APP_TEMPLATE": APP,
-           "SHRINK_TEMPLATE": BIG, "EVICT_TEMPLATE": BIG}
+           "SHRINK_TEMPLATE": args.template, "EVICT_TEMPLATE": args.template}
     # The app-log template is built from the cached image when there is one (CI), not pulled.
     layout = image_layout()
     image = ["--image", layout] if layout else ["--image", args.image]
@@ -849,11 +849,9 @@ GROW = args.template + "-grow"
 # The app_log and bad_app_log scenarios' template, built once with the others (lanes that each built
 # it on first use would replace it under one another's VMs). Its app as scripts/faults.py's app_template.
 APP = args.template + "-applog"
-# The heavy shard's shrink_stall (4 GiB at the start, 4 GiB more to grow into) and evict_grower (guests that
-# grow past 3 GiB): a ceiling well above the others', with the default 4 GiB plugged.
-BIG = args.template + "-big"
-BIG_FAULTS = ("shrink_stall", "evict_grower")
-BIG_OPTS = ["--vcpus", "2", "--max", "8704"]
+# The template's ceiling: the heavy shard's guests write 1.5 GiB, shrink_stall needs 4 GiB at the start and
+# 4 GiB more to grow into, evict_grower's grow past 3 GiB (with the default 4 GiB plugged, free until touched).
+TEMPLATE_MAX = "10240" if args.shard == "heavy" else "2048"
 APP_FAULTS = ("app_log", "bad_app_log")
 APP_OPTS = ["--vcpus", "2", "--max", "2048", "--cmd", json.dumps(
     ["sh", "-c", "head -c 8000000 /dev/zero | tr '\\0' x; echo; i=0; while :; do echo applog-$i; i=$((i+1)); sleep 0.05; done"])]
@@ -966,7 +964,7 @@ def main():
     work = [(c, set() if c == "image_template" else {args.template}, COST.get(c, 2)) for c in selected if c != "faults"]
     # Growth (and checkpoint_hotplug, unplug_collapsed and mem_refused_fill, which need room to plug) runs on GROW; fc_prepare needs a second template to mismatch with.
     work += [(f"faults/{s}", ({args.template, GROW} if s in ("cow_grow", "plug_race", "plug_storm", "checkpoint_hotplug", "unplug_collapsed", "fc_prepare", "mem_refused_fill") else {args.template})
-              | ({APP} if s in APP_FAULTS else set()) | ({BIG} if s in BIG_FAULTS else set()),
+              | ({APP} if s in APP_FAULTS else set()),
               COST.get(f"faults/{s}", 2)) for s in scenarios]
     work.sort(key=lambda w: -w[2])
     scheduled = list(work)
@@ -1091,11 +1089,9 @@ def main():
             with lock:
                 summary.extend(got)
 
-    builders = [threading.Thread(target=build, args=(args.template, "--vcpus", "2", "--max", "2048")),
+    builders = [threading.Thread(target=build, args=(args.template, "--vcpus", "2", "--max", TEMPLATE_MAX)),
                 # A larger ceiling with little plugged at the start: VMs must grow.
                 threading.Thread(target=build, args=(GROW, "--vcpus", "2", "--max", "6144", "--plug", "128"))]
-    if any(s in BIG_FAULTS for s in scenarios):
-        builders.append(threading.Thread(target=build, args=(BIG, *BIG_OPTS)))
     if any(s in APP_FAULTS for s in scenarios):
         builders.append(threading.Thread(target=build, args=(APP, *APP_OPTS), kwargs={"image": True}))
     runners = [threading.Thread(target=lane, args=(i, *l), daemon=True) for i, l in enumerate(lanes())]
