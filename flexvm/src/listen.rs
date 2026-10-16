@@ -224,7 +224,7 @@ pub fn main(host: Host, listener: TcpListener) -> Result<()> {
 
 fn serve(host: &Host, peers: &Peers, conn: TcpStream, _slot: Wait, deadline: Instant) {
     let _ = conn.set_nodelay(true);
-    if let Err(e) = handle(host, peers, conn, deadline) {
+    if let Err(e) = handle(host, peers, conn, deadline, &LOCKING) {
         crate::log!("peer request: {e}");
     }
 }
@@ -549,11 +549,11 @@ pub fn activated() -> Option<TcpListener> {
 }
 
 /// From a peer: they are authenticated by address only (`main`), the network between them is trusted.
-fn handle(host: &Host, peers: &Peers, mut conn: TcpStream, deadline: Instant) -> Result<()> {
+fn handle(host: &Host, peers: &Peers, mut conn: TcpStream, deadline: Instant, locking: &'static AtomicUsize) -> Result<()> {
     let line = read_line_by(&conn, deadline)?;
     let req: Value = serde_json::from_slice(&line)?;
     let op = req["op"].as_str().unwrap_or("");
-    let locking = matches!(op, "migration" | "route" | "lend").then(|| Slot::take(&LOCKING, MAX_LOCKING));
+    let locking = matches!(op, "migration" | "route" | "lend").then(|| Slot::take(locking, MAX_LOCKING));
     let reply = match op {
         // Checked by the arrival (`check_vm_ip`) against these, as route and lend are: a name
         // with no addresses yet, its lookup under way (a peer just added), is waited for.
@@ -1242,12 +1242,14 @@ mod tests {
         use std::io::Write;
         let root = crate::test_util::TempDir::new("listen-busy");
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        // Saturating this test's budget must not make other hosts' requests busy.
+        static LOCKING: AtomicUsize = AtomicUsize::new(0);
         let ask = |req: Value| {
             let (client, server) = pair();
             let (start, mut line) = (Instant::now(), req.to_string().into_bytes());
             line.push(b'\n');
             (&client).write_all(&line).unwrap();
-            handle(&host, &Peers::default(), server, Instant::now() + REQUEST_DEADLINE).unwrap();
+            handle(&host, &Peers::default(), server, Instant::now() + REQUEST_DEADLINE, &LOCKING).unwrap();
             let reply = crate::util::recv_json(&mut std::io::BufReader::new(&client)).unwrap().unwrap();
             (reply, start.elapsed())
         };
@@ -1265,7 +1267,8 @@ mod tests {
         });
         // Its budget taken: refused at once, the lock never waited for.
         let full: Vec<_> = std::iter::from_fn(|| Slot::take(&LOCKING, MAX_LOCKING)).collect();
-        assert!(full.len() <= MAX_LOCKING && Slot::take(&LOCKING, MAX_LOCKING).is_none());
+        assert_eq!(full.len(), MAX_LOCKING);
+        assert!(Slot::take(&LOCKING, MAX_LOCKING).is_none());
         for r in &requests {
             let (reply, took) = ask(r.clone());
             assert!(reply["error"] == BUSY && took < Duration::from_secs(1), "{reply} {took:?}");
@@ -1275,7 +1278,7 @@ mod tests {
         assert!(reply["error"].as_str().unwrap().contains("not the source"), "{reply}");
         drop(full);
         drop(held);
-        // Lent once free (other tests' hosts share this process's lock threads and slot budget).
+        // Lent once free (other tests' hosts share this process's lock threads).
         let deadline = Instant::now() + Duration::from_secs(10);
         let reply = loop {
             let reply = ask(requests[0].clone()).0;
