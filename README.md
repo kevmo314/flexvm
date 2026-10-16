@@ -143,7 +143,9 @@ a new one.
 ## Migrate
 
 A host's settings are `flexvm config`'s, kept in `STATE/host.json` and
-applied live: running VM processes and listeners pick up changes. Each host
+applied live: running VM processes and listeners pick up changes. A new
+`--vm-ips` or `--dns` applies to addresses handed out and guests set up after
+it (standby VMs' claims included); running VMs keep theirs. Each host
 that takes migrations then runs a listener, which takes only its address
 and can be socket-activated:
 

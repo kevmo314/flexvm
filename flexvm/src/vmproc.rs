@@ -874,7 +874,7 @@ impl Proc {
         self.publish();
         t.mark("register");
         let running = t.total();
-        vm.guest_net(vm.ip, self.host.cfg.dns.as_deref())?;
+        vm.guest_net(vm.ip, self.host.config_now().dns.as_deref())?;
         if t.mark("guest_net") >= crate::vm::CLOCK_RTT {
             self.sync_clock_later();
         }

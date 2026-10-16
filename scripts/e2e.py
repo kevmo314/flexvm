@@ -58,7 +58,7 @@ p.add_argument("--image-cache", help="keep the pulled image here as an OCI layou
 FAULTS = ("basic route route_abort lost_ack unknown refused pages_blip pages_dead_restore prepared_retry resume_kill exec_race guest_calls exec_background exec_pause_grace "
           "checkpoint_restore checkpoint_fork checkpoint_corrupt held_restore_frozen cow_exact cow_rescue_fail cow_collapsed unplug_collapsed cow_abort ckpt_incremental ckpt_hot "
           "ckpt_failed_stop ckpt_rearm prepare_fail fc_prepare slow_preload bad_preload pull_enomem ckpt_packet_hold "
-          "abort_superseded gen_zero signals suspend_gen standby restore_ip_peer spoof_filter killed_migrated "
+          "abort_superseded gen_zero signals suspend_gen standby standby_vm_ips restore_ip_peer spoof_filter killed_migrated "
           "incoming_killed start_killed claim_killed standby_stalled standby_refill_race standby_lock_timeout standby_stop_claim standby_claim_signal standby_concurrent_claims fc_died cow_grow plug_race plug_storm suspend_debris revoked_publication "
           "same_host_order same_host_slow_route same_host_flood same_host_late_handover same_host_hold_route_fail same_host_backlog same_host_bulk_tcp ckpt_backlog ckpt_paused_backlog rx_stall arrival_abort_route arrival_killed_route handoff_superseded delayed_announce delayed_announce_handoff announce_arp_timer prepare_fail_announce reconcile_announce reconcile_kill mem_high mem_high_migrate mem_high_evict mem_refused_headroom mem_refused_fill "
           "sigkill_restart listen_trickle suspend_cmd suspend_slow_cmd suspend_overlap fc_died_busy pause_cmd_start suspend_died evict_latency evict_skips_cmd cmd_flag "
@@ -71,7 +71,7 @@ FAULTS = ("basic route route_abort lost_ack unknown refused pages_blip pages_dea
 # terminal's, and the ones bound by timeouts (a guest that never answers; a pager that fails or
 # never gets its pages, gated deterministically).
 LISTENER_FAULTS = {"suspend_resume", "target_killed", "unit_restart", "wildcard_listen", "peer_by_name", "peer_moved",
-                   "peer_unresolvable", "late_withdrawal", "resume_listener_restart"}
+                   "peer_unresolvable", "late_withdrawal", "resume_listener_restart", "arrival_cap_restart"}
 RECOVERY_FAULTS = " ".join(sorted(LISTENER_FAULTS)) + " terminal guest_hang uffd_err fetch_tail_enomem fetch_enomem_stuck cow_wp_race"
 # GiB-scale guests (pages_dead, source_killed_basic, which runs source_killed, pull_died, kill_source,
 # kill_refused_checkpoint, quiet_source, checkpoint_crash, suspend_disk_freed), long device and
