@@ -895,7 +895,8 @@ def exec_background():
     """An exec whose command leaves a background process holding its output returns once the
     shell exits (the process keeps running), and such execs never use up the guest agent's 64
     session slots; nor do interrupted ones (SIGINT stops the command), or abandoned sessions
-    whose client disconnected or was killed outright, or exits acknowledged late by a slow reader."""
+    whose client disconnected or was killed outright, nor exits whose client acknowledged them late
+    (a slow reader) or never."""
     n = "ft-exec-bg"
     ok(run(A, n))
     # Processes whose command line starts with `cmd` (the ^ keeps grep from counting itself).
@@ -961,28 +962,51 @@ def exec_background():
     stopped = wait_for(lambda: count("yes") == (0, "0"), 10)
     check("exec bg: a piped exec's command is stopped once its stdout breaks", stopped, count("yes"))
     check("exec bg: execs still start after the piped ones", sh(A, n, "echo hi") == (0, "hi"))
-    # Piped into a slow reader, the CLI acknowledges its exit only after it wrote all output out, seconds
-    # late (#505): 70 of these at once must not use up the slots, keep a new exec out, or lose output.
-    drained = []
+    # #505: the guest and the relay wait 2 s for a client's exit acknowledgement. A client that reads its
+    # exit and then stays silent, its connection open, holds neither past that; its session stays
+    # (exited, unacknowledged) for a reattach.
+    sessions = lambda: cli_json(A, "debug", n, "sessions").get("result") or {}
+    before = sessions().get("unacknowledged", 0)
+    with socket.socket(socket.AF_UNIX) as s:
+        s.settimeout(30)
+        s.connect(os.path.join(A.run, "vms", f"{n}.sock"))
+        s.sendall((json.dumps({"op": "exec", "session": os.urandom(16).hex(), "action": "start", "cmd": "echo hi"}) + "\n").encode())
+        f = s.makefile("rb")
+        f.readline()
+        kind = None
+        while (head := f.read(5)) and len(head) == 5:
+            kind, size = struct.unpack("<BI", head)
+            f.read(size)
+            if kind == 3:
+                break
+        t = time.time()
+        hung_up = s.recv(1) == b""
+        took = time.time() - t
+        check("exec bg: the relay lets go of a client silent after its exit", kind == 3 and hung_up and took < 4, (kind, hung_up, took))
+        check("exec bg: so does the guest, keeping the session", wait_for(lambda: sessions().get("unacknowledged") == before + 1, 3), sessions())
+        f.close()
+    # Piped into a slow reader, the CLI acknowledges its exit only once it wrote all output out, too late.
+    # 64 such exits at once fill every slot; new execs still start at once, each evicting the oldest.
+    big = 200000
 
-    def slow_reader():
-        cmd = f'set -o pipefail; "$0" --state "$1" --run "$2" exec "$3" "head -c 200000 /dev/zero" | (sleep 5; cat) | wc -c'
-        r = subprocess.run(["bash", "-c", cmd, BIN, A.state, A.run, n], capture_output=True, text=True, timeout=120, env=ENV)
-        drained.append((r.returncode, r.stdout.strip(), r.stderr.strip()[-200:]))
+    def slow_exec():
+        p = subprocess.Popen([BIN, "--state", A.state, "--run", A.run, "exec", n, f"head -c {big} /dev/zero"],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=ENV)
+        # Admitted (or refused, and ended) once this returns; then the pipe fills and the CLI stalls.
+        return p, p.stdout.read(1)
 
-    readers = [threading.Thread(target=slow_reader) for _ in range(70)]
-    for r in readers:
-        r.start()
-        time.sleep(0.02)
-    time.sleep(1)
+    slow = [slow_exec() for _ in range(64)]
+    full = wait_for(lambda: sessions().get("unacknowledged", 0) >= 64, 30)
+    check("exec bg: 64 slow readers' exits are unacknowledged at once", full and all(b for _, b in slow), sessions())
     t = time.time()
+    more = [slow_exec() for _ in range(6)]
     r = sh(A, n, "echo hi")
     took = time.time() - t
-    check("exec bg: an exec starts at once while 70 exited ones wait on slow readers", r == (0, "hi") and took < 4, (r, took))
-    for r in readers:
-        r.join()
-    bad = [d for d in drained if d != (0, "200000", "")]
-    check("exec bg: 70 execs piped into slow readers all end with all their output", len(drained) == 70 and not bad, bad[:3])
+    check("exec bg: 6 more slow readers and a new exec start at once beside them", all(b for _, b in more) and r == (0, "hi") and took < 8,
+          (r, took, [p.stderr.read(200) for p, b in more if not b][:3]))
+    drained = [(len(b + p.stdout.read()), p.wait(), p.stderr.read().strip()[-200:]) for p, b in slow + more]
+    bad = [d for d in drained if d != (big, 0, b"")]
+    check("exec bg: 70 slow readers all get all their output and status", not bad, bad[:3])
     check("exec bg: execs still start after the slow readers", sh(A, n, "echo hi") == (0, "hi"))
     knob = "/run/flexvm-test-abandoned-running-secs"
     check("exec bg: the abandoned-session wait is shortened", sh(A, n, f"echo 3 > {knob}") == (0, ""))

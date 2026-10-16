@@ -272,6 +272,17 @@ pub fn start_app(uds: &Path) -> Result<u32> {
     }
 }
 
+/// How many sessions the agent has live, and how many of those are exited and unacknowledged.
+pub fn sessions(uds: &Path) -> Result<(u64, u64)> {
+    let m = message(uds, "SESSIONS", TIMEOUT)?;
+    let counts: Vec<u64> =
+        m.strip_prefix("ok ").ok_or_else(|| refused("SESSIONS", m.as_bytes()))?.split_whitespace().map(str::parse).collect::<std::result::Result<_, _>>()?;
+    match counts[..] {
+        [live, unacknowledged] => Ok((live, unacknowledged)),
+        _ => bail!("bad sessions reply {m:?}"),
+    }
+}
+
 /// `idle`, `running <pid>` or `exited <code>`.
 pub fn app_status(uds: &Path) -> Result<String> {
     message(uds, "APPSTATUS", TIMEOUT)

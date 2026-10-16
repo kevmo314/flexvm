@@ -27,15 +27,12 @@ use crate::vm::{Snapshot, State, Vm};
 
 /// Frame by frame: vsock does not pass a half-close on, so the exit frame is what ends the
 /// relay. Then the client's acknowledgement, if it sends one, lets the guest release the session.
-/// It is waited for until the client hangs up: a client acknowledges only once it wrote all output
-/// out, however slowly its stdout drains. Only this session's connection waits on it (and the guest
-/// lets an unacknowledged exit make room for new sessions).
-fn relay_session(guest: &mut BufReader<impl Read + Write>, client: &mut (impl Read + Write)) -> Result<()> {
+fn relay_session(guest: &mut BufReader<impl Read + Write>, client: &mut (impl crate::util::Timed + Write)) -> Result<()> {
     while let Some((kind, data)) = guest::read_frame(guest)? {
         client.write_all(&guest::frame(kind, &[&data]))?;
         if kind == guest::FRAME_EXIT {
             let mut ack = [0];
-            if client.read_exact(&mut ack).is_ok() && ack[0] == guest::SESSION_DONE {
+            if (crate::util::By { s: client, at: Instant::now() + Duration::from_secs(2) }).read_exact(&mut ack).is_ok() && ack[0] == guest::SESSION_DONE {
                 guest.get_mut().write_all(&ack)?;
             }
             break;
@@ -1163,6 +1160,10 @@ impl Proc {
         let vm = self.vm();
         match req["what"].as_str().unwrap_or("") {
             "memhash" => self.memhash(),
+            "sessions" => {
+                let (live, unacknowledged) = guest::sessions(&vm.vsock)?;
+                Ok(json!({"live": live, "unacknowledged": unacknowledged}))
+            }
             "hotplug" => {
                 let _op = self.op_within()?;
                 if vm.state() != State::Running {
@@ -3301,6 +3302,14 @@ mod session_relay_tests {
             Ok(())
         }
     }
+    impl crate::util::Timed for Duplex {
+        fn read_timeout(&self, _: Duration) -> io::Result<()> {
+            Ok(())
+        }
+        fn write_timeout(&self, _: Duration) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn exit_acknowledgement_uses_the_existing_attachment_and_is_optional() {
@@ -3317,20 +3326,21 @@ mod session_relay_tests {
     }
 
     #[test]
-    fn a_late_acknowledgement_is_still_passed_on() {
+    fn a_silent_client_releases_the_relay_within_its_deadline() {
         let exit = guest::frame(guest::FRAME_EXIT, &[&0u64.to_le_bytes()[..], &0i32.to_le_bytes()]);
         let mut guest = BufReader::new(Duplex { input: Cursor::new(exit.clone()), output: Vec::new() });
-        let (mut relay, mut client) = UnixStream::pair().unwrap();
-        let slow = thread::spawn(move || {
+        let (relay, mut client) = UnixStream::pair().unwrap();
+        // Reads the exit, then neither acknowledges nor hangs up.
+        let silent = thread::spawn(move || {
             let mut got = vec![0; exit.len()];
             client.read_exact(&mut got).unwrap();
-            assert_eq!(got, exit);
-            // Its stdout drains slowly: it acknowledges only once it wrote everything out.
-            thread::sleep(Duration::from_secs(3));
-            client.write_all(&[guest::SESSION_DONE]).unwrap();
+            thread::sleep(Duration::from_secs(6));
+            drop(client);
         });
-        relay_session(&mut guest, &mut relay).unwrap();
-        slow.join().unwrap();
-        assert_eq!(guest.get_ref().output, [guest::SESSION_DONE]);
+        let t = Instant::now();
+        relay_session(&mut guest, &mut &relay).unwrap();
+        assert!(t.elapsed() < Duration::from_secs(4), "the relay waited {:?}", t.elapsed());
+        assert!(guest.get_ref().output.is_empty());
+        silent.join().unwrap();
     }
 }
