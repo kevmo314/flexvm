@@ -370,6 +370,11 @@ goes with the process whatever becomes of the file (admission removes one
 whose lock is free). A start refused fails before it loads
 anything. Standby refills stop under it.
 
+The VM controller's hot-page buffers are outside this guest memory admission.
+Size `--reserve` with an additional 128 MiB per VM taking keep-running
+checkpoints: up to 64 MiB for the last checkpoint's copies and 64 MiB for
+the next copy, allocated before the pause and retained for reuse.
+
 **Memory marks** (`limit.rs`): each VM's Firecracker cgroup has a
 `memory.high` at the memory admitted for it plus Firecracker's overhead
 (64 MiB + 1/64). It starts at what the start was admitted (a cold run: the

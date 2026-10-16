@@ -7,7 +7,7 @@
 //!
 //! So the freeze (`copy_hot`) first copies the pages dirtied both since the last pause and in the interval before it,
 //! into memory allocated before the pause (`prepare_hot`), and hands them to the writer as saved (`Cow::hold`), up to
-//! `HOT_MIB`, preferring those copied last time too. They stay unprotected, and count as dirty again from the pause on:
+//! `HOT_MIB`, preferring those copied last time too, then lower page numbers. They stay unprotected, and count as dirty again from the pause on:
 //! the next checkpoint copies them again. That one compares them with what this one saved: pages that did not change are left out of an incremental
 //! checkpoint (their contents at the pause are byte for byte what the last checkpoint has), and protected again where a
 //! whole block of them did not (`HOT_BLOCK`). The copies are kept for that comparison only once their checkpoint is
@@ -119,16 +119,14 @@ impl Hot {
 }
 
 impl Pager {
-    /// Before a keep-running checkpoint pauses the VM: allocates the memory its hot pages are copied into, a little
-    /// more than is dirty now, capped at `HOT_MIB`. Without it, the pause protects every dirty page.
+    /// Before a keep-running checkpoint pauses the VM: allocates the memory its hot pages are copied into, twice what
+    /// is dirty now (it grows until the pause), capped at `HOT_MIB`. Without it, the pause protects every dirty page.
     pub fn prepare_hot(&self) {
-        let cap = HOT_MIB << 20 >> 12;
         if !self.tracking() {
             return;
         }
-        let dirty = self.dirty_count();
+        let want = (self.dirty_count() * 2 + 1024).min(HOT_MIB << 20 >> 12);
         let mut spare = self.hot_spare.lock().unwrap();
-        let want = (dirty * 3 / 2 + 256).min(cap);
         if spare.as_ref().is_some_and(|b| b.pages() >= want) {
             return;
         }
@@ -156,7 +154,7 @@ impl Pager {
         let prev = self.hot_prev.lock().unwrap().take();
         let hot_before = |p: usize| before.bits.get(p / 64).is_some_and(|w| w >> (p % 64) & 1 != 0);
         let candidate = |p: usize| pages.is_dirty(p) && hot_before(p) && eligible(p);
-        let hot = select_hot(pages.hot_pages(&before.bits).filter(|&p| eligible(p)), prev.as_ref().map_or(&[], |h| h.pages()), candidate, buf.pages());
+        let hot = select_hot(pages.hot_pages(&before.bits), prev.as_ref().map_or(&[], |h| h.pages()), candidate, buf.pages());
         let read = |p: usize, dst: &mut [u8]| self.read_at((p * PAGE_SIZE) as u64, &[libc::iovec { iov_base: dst.as_mut_ptr().cast(), iov_len: dst.len() }]);
         copy(buf, prev, hot, |p| next_to(self.mappings(), p), read).inspect_err(|e| crate::log!("uffd: hot pages not copied, protecting them: {e}")).ok()
     }
@@ -178,12 +176,18 @@ impl Pager {
 
 /// Keeps up to `cap` of the ascending `candidates`, preferring pages copied last time too (dirty in at least three
 /// intervals; `prev`, ascending, checked with `candidate`), then lower page numbers. Bounded by the cap, not by how many
-/// candidates there are: it runs during the pause, and a large guest can have millions. Returns ascending pages for
-/// copying runs and binary searches.
+/// candidates there are: examines at most `SCAN_BUDGET * cap` candidates, ineligible ones (discarded or unmapped)
+/// included, so it may copy fewer. It runs during the pause, and a large guest can have millions. Returns ascending pages for
+/// copying runs and binary searches. Bitmap words without candidates are still skipped by the iterator.
+/// Candidates examined per hot page wanted (`select_hot`).
+const SCAN_BUDGET: usize = 4;
+
 fn select_hot(candidates: impl Iterator<Item = usize>, prev: &[usize], candidate: impl Fn(usize) -> bool, cap: usize) -> Vec<usize> {
-    let mut hot: Vec<usize> = prev.iter().copied().filter(|&p| candidate(p)).take(cap).collect();
+    let mut hot: Vec<usize> = prev.iter().copied().take(cap).filter(|&p| candidate(p)).collect();
     let mut j = 0;
     let others = candidates
+        .take(SCAN_BUDGET * cap)
+        .filter(|&p| candidate(p))
         .filter(|&p| {
             j += prev[j..].partition_point(|&q| q < p);
             prev.get(j) != Some(&p)
@@ -280,6 +284,17 @@ impl Held {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hot_scan_bounds_ineligible_candidates() {
+        let visited = std::cell::Cell::new(0);
+        let candidates = (0..1_000_000).inspect(|_| visited.set(visited.get() + 1));
+        // Discarded or unmapped pages still count against the scan budget; previous copies get priority.
+        let hot = select_hot(candidates, &[100, 101], |p| p >= 14 && p != 101, 4);
+        assert_eq!(hot, [14, 15, 100]);
+        assert_eq!(visited.get(), 16);
+        assert!(select_hot((0..).inspect(|_| panic!("zero budget scanned")), &[], |_| true, 0).is_empty());
+    }
 
     #[test]
     fn hot_pages_over_cap_keep_previous_hot_pages_first() {

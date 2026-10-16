@@ -548,10 +548,14 @@ through, so the checkpoint is exactly the memory at the pause.
   The next checkpoint copies them again and compares: pages unchanged since
   are left out of a delta (byte for byte what its parent has; only while
   that parent is the last checkpoint taken, which a failure or re-arming
-  forgets), and a 64-page block with none changed is protected again. All
-  or none, up to 64 MiB: copying part
-  of a larger set costs the pause as much but leaves the vCPUs writing the
-  rest stalling as before. Keeps up to twice that in memory per VM. Saving
+  forgets), and a 64-page block with none changed is protected again. Copies
+  up to 64 MiB, preferring last time's copies, then lower page numbers.
+  The scan examines at most that many pages from each of the two inputs
+  (the dirty intersection and the previous copies), including discarded or unmapped pages;
+  it may copy fewer. The buffer is sized to the cap before the pause,
+  regardless of how many pages are dirty then. Keeps up to twice that in
+  memory per VM, outside guest admission: allow an extra 128 MiB in
+  `--reserve` per VM taking keep-running checkpoints. Saving
   device state writes guest memory (a vsock transport reset), so the copy
   starts after it. `ckpt_stall`, 2 vCPUs × 4 MiB, 3 runs × 10 checkpoints:
   quiet, stall p50 23.8 → 14.5 ms (p90 30.6 → 22.3), pause 7.1 → 9.4 ms, the
