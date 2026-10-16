@@ -159,12 +159,23 @@ fn key(dir: RawFd, name: &CStr) -> Option<Key> {
     Some((d.st_dev, d.st_ino, name.to_owned()))
 }
 
+/// Entries retained by whiteouts and directories already swept in this layer.
+#[derive(Default)]
+struct Layer {
+    entries: HashSet<Key>,
+    opaque: HashSet<Key>,
+    #[cfg(test)]
+    visits: usize,
+}
+
 /// Forgets the directories of `layer` at and under `name`, which is about to be replaced, so that one
 /// created later on a reused inode is not taken for a directory whose ancestors are already recorded.
-fn forget(fd: RawFd, name: &CStr, layer: &mut HashSet<Key>, depth: u32) -> Result<()> {
+fn forget(fd: RawFd, name: &CStr, layer: &mut Layer, depth: u32) -> Result<()> {
     let Some(st) = stat_at(fd, name).filter(|st| st.st_mode & libc::S_IFMT == libc::S_IFDIR) else { return Ok(()) };
+    let k = (st.st_dev, st.st_ino, CString::default());
+    layer.opaque.remove(&k);
     // Directories of this layer's are only ever under others of its own.
-    if !layer.remove(&(st.st_dev, st.st_ino, CString::default())) {
+    if !layer.entries.remove(&k) {
         return Ok(());
     }
     if depth > MAX_DEPTH {
@@ -178,16 +189,27 @@ fn forget(fd: RawFd, name: &CStr, layer: &mut HashSet<Key>, depth: u32) -> Resul
 }
 
 /// Hides lower layers' entries under `fd`, keeping `layer` (this layer's entries and their directories).
-fn opaque(fd: RawFd, layer: &HashSet<Key>, depth: u32) -> Result<()> {
+fn opaque(fd: RawFd, layer: &mut Layer, depth: u32) -> Result<()> {
+    let k = key(fd, c"").ok_or("opaque directory disappeared")?;
+    if layer.opaque.contains(&k) {
+        return Ok(());
+    }
     for name in list_dir(fd)? {
+        #[cfg(test)]
+        {
+            layer.visits += 1;
+        }
         hide(fd, &name, layer, depth)?;
     }
+    // Future entries under this directory can only come from this layer. Record descendants
+    // too (through hide), so whiteouts of them cannot repeat an ancestor's sweep.
+    layer.opaque.insert(k);
     Ok(())
 }
 
 /// Whiteout of `name` in `fd`: removed if from a lower layer, else made opaque.
-fn hide(fd: RawFd, name: &CStr, layer: &HashSet<Key>, depth: u32) -> Result<()> {
-    if !key(fd, name).is_some_and(|k| layer.contains(&k)) {
+fn hide(fd: RawFd, name: &CStr, layer: &mut Layer, depth: u32) -> Result<()> {
+    if !key(fd, name).is_some_and(|k| layer.entries.contains(&k)) {
         return remove_at(fd, name);
     }
     if depth > MAX_DEPTH {
@@ -436,7 +458,7 @@ impl Root {
         let mut r = Hashed::new(layer.take(limit.saturating_add(1)));
         let mut seen = self.seen;
         // This layer's entries and the directories holding them, which its whiteouts keep.
-        let mut mine = HashSet::new();
+        let mut mine = Layer::default();
         let res = each_entry(&mut r, &mut seen, self.limits.entries, |e, m| self.apply(e, m, &mut mine))
             .and_then(|_| Ok(io::copy(&mut r, &mut io::sink()).map(|_| ())?));
         self.seen = seen;
@@ -448,7 +470,7 @@ impl Root {
         Ok(r.digest())
     }
 
-    fn apply<R: Read>(&mut self, e: &mut tar::Entry<R>, m: Meta, mine: &mut HashSet<Key>) -> Result<()> {
+    fn apply<R: Read>(&mut self, e: &mut tar::Entry<R>, m: Meta, mine: &mut Layer) -> Result<()> {
         let Some((parent, name)) = split(&m.path)? else { return Ok(()) };
         let name = name.as_bytes();
         if let Some(rest) = name.strip_prefix(b".wh.") {
@@ -469,11 +491,11 @@ impl Root {
             return Ok(());
         }
         let at = self.entry(e, &parent.join(OsStr::from_bytes(name)), m, mine)?;
-        mine.extend(key(at.dir.as_raw_fd(), &at.name));
+        mine.entries.extend(key(at.dir.as_raw_fd(), &at.name));
         // Up from where the entry landed, which a symlinked parent may have moved.
         let (root, mut dir) = (key(self.fd.as_raw_fd(), c""), at.dir);
         while let Some(k) = key(dir.as_raw_fd(), c"").filter(|k| Some(k) != root.as_ref()) {
-            if !mine.insert(k) {
+            if !mine.entries.insert(k) {
                 break;
             }
             dir = open_dir_at(dir.as_raw_fd(), c"..")?;
@@ -481,7 +503,7 @@ impl Root {
         Ok(())
     }
 
-    fn entry<R: Read>(&mut self, e: &mut tar::Entry<R>, rel: &Path, m: Meta, mine: &mut HashSet<Key>) -> Result<At> {
+    fn entry<R: Read>(&mut self, e: &mut tar::Entry<R>, rel: &Path, m: Meta, mine: &mut Layer) -> Result<At> {
         use tar::EntryType as T;
         let h = e.header().clone();
         let kind = h.entry_type();
@@ -994,15 +1016,58 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn repeated_whiteouts_visit_each_entry_once() {
+        const N: usize = 128;
+        let s = Sandbox::new("wh-linear");
+        let mut root = s.open();
+        root.apply_layer(&layer(&[("d/old", 'f', "lower"), ("alias", 'l', "d")])[..]).unwrap();
+        let mut upper = Vec::new();
+        for i in 0..N {
+            upper.push((format!("d/sub/{i}"), 'f', "keep"));
+        }
+        upper.push(("d/.wh..wh..opq".into(), 'f', ""));
+        for i in 0..N {
+            // Alternate opaque and plain whiteouts, including resolved aliases and descendants.
+            for path in ["alias/.wh..wh..opq", "alias/sub/.wh..wh..opq", ".wh.d", "d/.wh.sub"] {
+                upper.push((path.into(), 'f', ""));
+            }
+            // Directories added after the ancestor's sweep must also be swept at most once.
+            upper.push((format!("d/new{i}/file"), 'f', "keep"));
+            upper.push((format!("d/.wh.new{i}"), 'f', ""));
+            upper.push((format!("d/new{i}/.wh..wh..opq"), 'f', ""));
+        }
+        let upper: Vec<_> = upper.iter().map(|(path, kind, data)| (path.as_str(), *kind, *data)).collect();
+        let tar = layer(&upper);
+        let mut mine = Layer::default();
+        let mut seen = 0;
+        each_entry(&mut &tar[..], &mut seen, Limits::default().entries, |e, m| root.apply(e, m, &mut mine)).unwrap();
+        assert_eq!(mine.visits, 2 * N + 2);
+        assert_eq!(s.read("d/old"), None);
+        for i in 0..N {
+            assert_eq!(s.read(&format!("d/sub/{i}")).as_deref(), Some("keep"));
+            assert_eq!(s.read(&format!("d/new{i}/file")).as_deref(), Some("keep"));
+        }
+        // Opaque tracking belongs to one layer only.
+        root.apply_layer(&layer(&[("alias/.wh..wh..opq", 'f', "")])[..]).unwrap();
+        assert_eq!(std::fs::read_dir(s.root.join("d")).unwrap().count(), 0);
+    }
+
+    #[test]
     fn replaced_directories_are_forgotten() {
         let s = Sandbox::new("forget");
         std::fs::create_dir_all(s.root.join("tmp/a/b")).unwrap();
         std::fs::create_dir(s.root.join("keep")).unwrap();
+        std::fs::create_dir(s.root.join("empty")).unwrap();
         let root = open_at(libc::AT_FDCWD, &cpath(&s.root).unwrap(), libc::O_PATH | libc::O_DIRECTORY).unwrap();
         let key = |p: &str| key(root.as_raw_fd(), &cpath(Path::new(p)).unwrap()).unwrap();
-        let mut mine: HashSet<Key> = ["tmp", "tmp/a", "tmp/a/b", "keep"].map(key).into();
+        let entries: HashSet<Key> = ["tmp", "tmp/a", "tmp/a/b", "keep"].map(key).into();
+        let mut mine = Layer { opaque: entries.clone(), entries, ..Layer::default() };
+        // An opaque lower directory need not be in this layer's retained entries.
+        mine.opaque.insert(key("empty"));
+        forget(root.as_raw_fd(), c"empty", &mut mine, 0).unwrap();
         forget(root.as_raw_fd(), c"tmp", &mut mine, 0).unwrap();
-        assert_eq!(mine, HashSet::from([key("keep")]));
+        assert_eq!(mine.entries, HashSet::from([key("keep")]));
+        assert_eq!(mine.opaque, HashSet::from([key("keep")]));
     }
 
     #[test]
