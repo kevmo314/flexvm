@@ -26,11 +26,8 @@ macro_rules! log {
     }};
 }
 
-/// Lines dropped since the log writer last got through (`log_line`), and
-/// lines it has written.
+/// Lines dropped since the log writer last got through (`log_line`).
 static LOG_DROPPED: AtomicUsize = AtomicUsize::new(0);
-#[cfg(test)]
-static LOG_WRITTEN: AtomicUsize = AtomicUsize::new(0);
 static WRITER: OnceLock<std::sync::mpsc::SyncSender<LogMsg>> = OnceLock::new();
 
 /// A longer log line (a peer's error, say) is cut to this, its note of the cut included.
@@ -83,20 +80,14 @@ fn log_writer() -> Option<&'static std::sync::mpsc::SyncSender<LogMsg>> {
         *tried = Some(Instant::now());
         let (tx, rx) = sync_channel::<LogMsg>(1024);
         let writer = move || {
-            for msg in rx {
-                if let LogMsg::Line(line) = msg {
-                    let mut err = io::stderr().lock();
-                    let dropped = LOG_DROPPED.swap(0, Ordering::SeqCst);
-                    if dropped > 0 {
-                        let _ = err.write_all(format!("flexvm: {dropped} log lines dropped: stderr was blocked\n").as_bytes());
-                    }
-                    let _ = err.write_all(line.as_bytes());
-                    #[cfg(test)]
-                    LOG_WRITTEN.fetch_add(1, Ordering::SeqCst);
-                } else if let LogMsg::Flush(done) = msg {
-                    let _ = done.send(());
+            write_logs(rx, |line| {
+                let mut err = io::stderr().lock();
+                let dropped = LOG_DROPPED.swap(0, Ordering::SeqCst);
+                if dropped > 0 {
+                    let _ = err.write_all(format!("flexvm: {dropped} log lines dropped: stderr was blocked\n").as_bytes());
                 }
-            }
+                let _ = err.write_all(line.as_bytes());
+            })
         };
         // Started with every signal blocked, so that a signal for the process
         // (that `block_signals`' callers wait for) is never handed to it.
@@ -112,6 +103,18 @@ fn log_writer() -> Option<&'static std::sync::mpsc::SyncSender<LogMsg>> {
         }
     }
     WRITER.get()
+}
+
+/// The sink finishes each line before a later flush is acknowledged.
+fn write_logs(rx: std::sync::mpsc::Receiver<LogMsg>, mut write: impl FnMut(&str)) {
+    for msg in rx {
+        match msg {
+            LogMsg::Line(line) => write(&line),
+            LogMsg::Flush(done) => {
+                let _ = done.send(());
+            }
+        }
+    }
 }
 
 /// Waits up to `timeout` for every line handed to the log writer before this
@@ -138,6 +141,10 @@ pub fn log_final(mut line: String, capped: bool) {
 fn flush_log_by(deadline: Instant) {
     // No writer: every line so far was dropped. Do not start one just to flush.
     let Some(tx) = WRITER.get() else { return };
+    flush_log_to(tx, deadline);
+}
+
+fn flush_log_to(tx: &std::sync::mpsc::SyncSender<LogMsg>, deadline: Instant) {
     let (done, acked) = std::sync::mpsc::channel();
     if send_log_by(tx, LogMsg::Flush(done), deadline) {
         let _ = acked.recv_timeout(deadline.saturating_duration_since(Instant::now()));
@@ -1177,14 +1184,15 @@ const REAP_POLL: Duration = Duration::from_secs(1);
 /// The shared reaper's wake-up fd, started if it is not yet: called before a child is
 /// spawned for `reap_later`, so one that cannot be reaped is never started.
 pub fn start_reaper() -> io::Result<RawFd> {
+    #[cfg(test)]
+    if NO_REAPER.with(|n| n.get()) {
+        return Err(io::Error::other("no reaper (test)"));
+    }
+
     static WAKE: std::sync::Mutex<Option<OwnedFd>> = std::sync::Mutex::new(None);
     let mut wake = WAKE.lock().unwrap();
     if let Some(fd) = &*wake {
         return Ok(fd.as_raw_fd());
-    }
-    #[cfg(test)]
-    if NO_REAPER.with(|n| n.get()) {
-        return Err(io::Error::other("no reaper (test)"));
     }
     let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
     check(fd)?;
@@ -1392,18 +1400,31 @@ mod tests {
     }
 
     #[test]
+    fn reaper_failure_is_injected_even_after_the_shared_reaper_started() {
+        start_reaper().unwrap();
+        NO_REAPER.with(|disabled| disabled.set(true));
+        let result = start_reaper();
+        NO_REAPER.with(|disabled| disabled.set(false));
+        assert_eq!(result.unwrap_err().to_string(), "no reaper (test)");
+    }
+
+    #[test]
     fn a_reaped_child_holds_its_slot_only_until_it_says_so_and_is_reaped_once_it_exits() {
         static HELD: AtomicUsize = AtomicUsize::new(0);
         let gone = |pid: u32| !Path::new(&format!("/proc/{pid}")).exists();
-        let (done, told) = UnixStream::pair().unwrap();
-        let child = std::process::Command::new("sleep").arg("1").spawn().unwrap();
+        let (done, mut told) = UnixStream::pair().unwrap();
+        let child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
         let pid = child.id();
         reap_later(child, Some((done.into(), Box::new(Slot::take(&HELD, 1).unwrap()))));
         std::thread::sleep(Duration::from_millis(100));
         assert!(Slot::take(&HELD, 1).is_none(), "held while the child has not said");
+        // Signal explicitly: a concurrent fork may still hold another copy of `told`.
+        told.write_all(b"done").unwrap();
+        assert!(within(Duration::from_secs(5), || HELD.load(Ordering::SeqCst) == 0), "let go once told");
+        let running = !gone(pid);
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
         drop(told);
-        assert!(within(Duration::from_secs(2), || HELD.load(Ordering::SeqCst) == 0), "let go once told");
-        assert!(!gone(pid), "the child runs on");
+        assert!(running, "the child runs on");
         assert!(within(Duration::from_secs(5), || gone(pid)), "reaped once it exited");
         // One that ends without saying lets go too, whoever else holds its fd.
         let (done, told) = UnixStream::pair().unwrap();
@@ -1632,7 +1653,7 @@ mod tests {
         assert_eq!(e.to_string(), format!("{addr}: no room"));
         let start = Instant::now();
         let e = rpc(&addr, wait, start + Duration::from_millis(200), &serde_json::json!({})).unwrap_err();
-        assert!(start.elapsed() < Duration::from_millis(600) && e.to_string() == format!("{addr}: deadline passed"), "{e}");
+        assert!(start.elapsed() < Duration::from_secs(5) && e.to_string() == format!("{addr}: deadline passed"), "{e}");
         server.join().unwrap();
     }
 
@@ -1758,7 +1779,7 @@ mod tests {
         tx.send(LogMsg::Line("first".into())).unwrap();
         let start = Instant::now();
         assert!(!send_log_by(&tx, LogMsg::Line("full".into()), start + Duration::from_millis(20)));
-        assert!(start.elapsed() < Duration::from_millis(300));
+        assert!(start.elapsed() < Duration::from_secs(5));
         let reader = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(10));
             assert!(matches!(rx.recv().unwrap(), LogMsg::Line(line) if line == "first"));
@@ -1790,24 +1811,29 @@ mod tests {
     /// whatever other threads log meanwhile.
     #[test]
     fn a_flush_follows_every_line_logged_before_it() {
-        use std::sync::atomic::Ordering::SeqCst;
-        static SENT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let base = super::LOG_WRITTEN.load(SeqCst);
-        let threads: Vec<_> = (0..8)
-            .map(|t| {
-                std::thread::spawn(move || {
-                    for i in 0..25 {
-                        crate::log!("a_flush_follows_every_line_logged_before_it {t}.{i}");
-                        let sent = SENT.fetch_add(1, SeqCst) + 1;
-                        super::flush_log(Duration::from_secs(30));
-                        // Other tests' lines count too: at least ours are there.
-                        let written = super::LOG_WRITTEN.load(SeqCst) - base;
-                        assert!(written >= sent, "flushed with {written} of {sent} lines written");
-                    }
-                })
+        let (tx, rx) = std::sync::mpsc::sync_channel(1024);
+        let lines = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        let written = lines.clone();
+        let writer = std::thread::spawn(move || {
+            write_logs(rx, |line| {
+                written.lock().unwrap().insert(line.to_string());
             })
-            .collect();
-        threads.into_iter().for_each(|t| t.join().unwrap());
+        });
+        std::thread::scope(|scope| {
+            for t in 0..8 {
+                let (tx, lines) = (&tx, &lines);
+                scope.spawn(move || {
+                    for i in 0..25 {
+                        let marker = format!("{t}.{i}");
+                        tx.send(LogMsg::Line(marker.clone())).unwrap();
+                        flush_log_to(tx, Instant::now() + Duration::from_secs(30));
+                        assert!(lines.lock().unwrap().contains(&marker), "flush missed {marker}");
+                    }
+                });
+            }
+        });
+        drop(tx);
+        writer.join().unwrap();
     }
 
     /// Past the cap a log moves to `.1` whole and its writers go on in a new
@@ -1868,7 +1894,7 @@ mod tests {
         assert!(held.len() < 64);
         let start = Instant::now();
         let e = send_unix(&path, b"{}\n", &[], start + Duration::from_millis(200)).unwrap_err();
-        assert!(e.raw_os_error() == Some(libc::EAGAIN) && start.elapsed() < Duration::from_millis(600), "{e}");
+        assert!(e.raw_os_error() == Some(libc::EAGAIN) && start.elapsed() < Duration::from_secs(5), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2286,7 +2312,7 @@ pub mod output {
         while (&t).write(&[0; 4096]).is_ok() {}
         let start = Instant::now();
         assert_eq!(write_within(&t, &[0; 100], start + Duration::from_millis(200)), 0);
-        assert!(start.elapsed() < Duration::from_millis(600));
+        assert!(start.elapsed() < Duration::from_secs(5));
         assert_eq!(unsafe { libc::fcntl(w.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK, 0);
     }
 

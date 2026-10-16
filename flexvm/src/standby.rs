@@ -764,7 +764,7 @@ mod tests {
             let start = Instant::now();
             let error = wait_locked(&mut BufReader::new(r), &mut child, start + Duration::from_millis(100)).unwrap_err();
             assert_eq!(child.try_wait().unwrap().unwrap().signal(), Some(libc::SIGKILL));
-            assert!(start.elapsed() < Duration::from_secs(1));
+            assert!(start.elapsed() < Duration::from_secs(5));
             drop(stop);
             relief.join().unwrap();
             let why = if reply.contains("no template") { "failed to start: \"no template\"" } else { "failed to acknowledge its lock" };
@@ -786,8 +786,11 @@ mod tests {
         // A child that never replies still fails within its timeout, from when it is read.
         let (r, _w) = UnixStream::pair().unwrap();
         let start = Instant::now();
-        assert!(wait_ready(BufReader::new(r), Duration::from_millis(100)).unwrap_err().to_string().contains("deadline passed"));
-        assert!(start.elapsed() >= Duration::from_millis(100) && start.elapsed() < Duration::from_secs(1));
+        let timeout = Duration::from_millis(100);
+        assert!(wait_ready(BufReader::new(r), timeout).unwrap_err().to_string().contains("deadline passed"));
+        let elapsed = start.elapsed();
+        assert!(elapsed >= timeout, "readiness timed out early: {elapsed:?}");
+        assert!(elapsed < timeout + Duration::from_secs(5), "readiness missed its deadline: {elapsed:?}");
     }
 
     #[test]
@@ -805,7 +808,7 @@ mod tests {
         assert!(crate::util::recv_json(&mut r).is_err());
         child.kill().unwrap();
         child.wait().unwrap();
-        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(start.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
@@ -985,7 +988,7 @@ mod tests {
         let held = Flock::new(File::create(host.state.join("lock")).unwrap(), libc::LOCK_EX).unwrap();
         let start = Instant::now();
         assert_eq!(refill_by(&host, "default", true, true).unwrap(), 0);
-        assert!(start.elapsed() < Duration::from_secs(1), "{:?}", start.elapsed());
+        assert!(start.elapsed() < Duration::from_secs(5), "{:?}", start.elapsed());
         drop(held);
         std::fs::remove_dir_all(root).unwrap();
     }

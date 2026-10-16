@@ -94,6 +94,13 @@ jobs:
           key: e2e
           cache-on-failure: true
 
+      # These exercise tap, routing and tc operations only; no VM is started.
+      - name: Root networking unit tests
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends iproute2
+          sudo -E "$(command -v cargo)" test -p flexvm -- --ignored
+
       # flexvm builds in the background (its release profile: fat LTO, one codegen unit,
       # as shipped) while the steps below restore or build the rest; "Build flexvm" waits.
       - name: Start building flexvm

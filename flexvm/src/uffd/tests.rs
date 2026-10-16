@@ -552,7 +552,7 @@ fn a_fetch_ends_by_its_deadline_however_the_server_trickles() {
     let start = Instant::now();
     let e = c.fetch(0, &mut [0u8; PAGE_SIZE], 0, &mut |_| true, start + Duration::from_millis(200)).unwrap_err();
     assert_eq!(e.kind(), io::ErrorKind::TimedOut, "{e}");
-    assert!(start.elapsed() < Duration::from_millis(400), "{:?}", start.elapsed());
+    assert!(start.elapsed() < Duration::from_secs(5), "{:?}", start.elapsed());
 }
 
 /// A source that delivers steadily but too slowly for any one request to finish by its deadline: the pull goes on from

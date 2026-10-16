@@ -371,16 +371,24 @@ mod tests {
         let held = host.lock().unwrap();
         let (l, host) = (&l, &host);
         std::thread::scope(|sc| {
-            let grower = sc.spawn(|| l.grow(host, &mut GrantBackoff::default()));
-            std::thread::sleep(Duration::from_millis(100));
+            let (waiting, blocked) = std::sync::mpsc::channel();
+            let grower = sc.spawn(move || {
+                crate::host::LOCK_WAITING.with(|hook| *hook.borrow_mut() = Some(waiting));
+                l.grow(host, &mut GrantBackoff::default())
+            });
+            if blocked.recv_timeout(Duration::from_secs(30)).is_err() {
+                drop(held);
+                panic!("grower never waited on the host lock");
+            }
             let (tx, rx) = std::sync::mpsc::channel();
             sc.spawn(move || {
                 let lifted = l.lift(None);
                 drop(lifted);
                 let _ = tx.send(());
             });
-            assert!(rx.recv_timeout(Duration::from_secs(5)).is_ok(), "restore waited for admission");
+            let restored = rx.recv_timeout(Duration::from_secs(5));
             drop(held);
+            assert!(restored.is_ok(), "restore waited for admission");
             assert_eq!(grower.join().unwrap(), Growth::Raised);
         });
         assert_eq!(l.admitted(), 512 + step(512));
@@ -395,10 +403,22 @@ mod tests {
         let held = host.lock().unwrap();
         let (l, host) = (&l, &host);
         std::thread::scope(|sc| {
-            let grower = sc.spawn(|| l.grow(host, &mut GrantBackoff::default()));
-            std::thread::sleep(Duration::from_millis(100));
-            let lifted = l.lift(None);
+            let (waiting, blocked) = std::sync::mpsc::channel();
+            let grower = sc.spawn(move || {
+                crate::host::LOCK_WAITING.with(|hook| *hook.borrow_mut() = Some(waiting));
+                l.grow(host, &mut GrantBackoff::default())
+            });
+            if blocked.recv_timeout(Duration::from_secs(30)).is_err() {
+                drop(held);
+                panic!("grower never waited on the host lock");
+            }
+            let (tx, rx) = std::sync::mpsc::channel();
+            sc.spawn(move || {
+                let _ = tx.send(l.lift(None));
+            });
+            let lifted = rx.recv_timeout(Duration::from_secs(5));
             drop(held);
+            let lifted = lifted.expect("lift waited for admission");
             assert_eq!(grower.join().unwrap(), Growth::Idle);
             assert_eq!(l.admitted(), 512);
             let grants: Vec<(u64, u64, u64)> = crate::host::load(&host.grants()).unwrap().unwrap_or_default();
