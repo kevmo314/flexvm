@@ -923,7 +923,7 @@ mod tests {
         };
         let requests = [json!({"op": "lend", "ip": "10.200.0.7"}), json!({"op": "migration", "mig": 7}), json!({"op": "route", "ip": "10.200.0.8", "gen": 3})];
         // Held by another process, as one stopped while holding it would.
-        let held = std::fs::File::create(host.state.join("lock")).unwrap();
+        let held = crate::host::private_file(&host.state.join("lock")).unwrap();
         crate::host::flock(&held, libc::LOCK_EX).unwrap();
         std::thread::scope(|s| {
             let waits: Vec<_> = requests.iter().map(|r| s.spawn(|| ask(r.clone()))).collect();

@@ -208,7 +208,7 @@ mod tests {
     fn socket_sweep_skips_a_standby_publishing() {
         let d = dir("publish");
         File::create(d.join("999999990.sock")).unwrap();
-        let publishing = File::create(d.join(".publish")).unwrap();
+        let publishing = crate::host::private_file(&d.join(".publish")).unwrap();
         flock(&publishing, libc::LOCK_EX).unwrap();
         standby_sockets(&d);
         assert!(d.join("999999990.sock").exists(), "skipped, not waited for");

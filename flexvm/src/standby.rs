@@ -190,7 +190,7 @@ fn refill_by(host: &Host, template: &str, wait: bool, cooldown: bool) -> Result<
     }
     let mut ready = Vec::new();
     let log_path = d.join("standby.log");
-    drop(crate::host::private_file(&log_path)?);
+    drop(crate::host::private_log(&log_path)?);
     let log = std::fs::OpenOptions::new().append(true).open(log_path)?;
     let mib = grant_mib(host, template);
     // A failed start ends the round, but those started before it are still waited for.
@@ -970,7 +970,7 @@ mod tests {
         assert_eq!(refill_by(&host, "default", false, true).unwrap(), 0);
         drop(stop);
         // A busy host lock ends this round without a refill failure or backoff, and lets relief in.
-        let held = File::create(host.state.join("lock")).unwrap();
+        let held = crate::host::private_file(&host.state.join("lock")).unwrap();
         let held = Flock::new(held, libc::LOCK_EX).unwrap();
         let start = Instant::now();
         assert_eq!(refill_by(&host, "default", false, true).unwrap(), 0);
@@ -994,7 +994,7 @@ mod tests {
         // Under the stop lock, before the grant: recent pressure ends the round at once, with
         // no grant (one would wait out the busy host lock), even for a refill that got its locks late.
         host.cfg.reserve_mib = Some(0);
-        let held = Flock::new(File::create(host.state.join("lock")).unwrap(), libc::LOCK_EX).unwrap();
+        let held = Flock::new(crate::host::private_file(&host.state.join("lock")).unwrap(), libc::LOCK_EX).unwrap();
         let start = Instant::now();
         assert_eq!(refill_by(&host, "default", true, true).unwrap(), 0);
         assert!(start.elapsed() < Duration::from_secs(5), "{:?}", start.elapsed());

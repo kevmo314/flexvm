@@ -183,7 +183,8 @@ impl Firecracker {
 /// Firecracker gets pipe writers only, so guest output cannot bypass log rotation.
 fn spawn_logged(mut cmd: Command, dir: &Path) -> std::io::Result<(Child, std::thread::JoinHandle<()>)> {
     let log = dir.join("firecracker.log");
-    File::create(&log)?;
+    // Flocked by its writers (`append_capped`): only root may open it.
+    crate::host::private_log(&log)?.set_len(0)?;
     let (mut reader, writer) = std::io::pipe()?;
     cmd.stdout(writer.try_clone()?).stderr(writer);
     let child = crate::util::unblock_signals_in(&mut cmd).spawn()?;

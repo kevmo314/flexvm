@@ -193,7 +193,9 @@ RUN (default /run/flexvm, tmpfs)
 
 Every file flexvm flocks is 0600 and root's (`host::private_file`): Linux grants
 an exclusive flock through a read-only descriptor, so a lock any user can open
-is one any user can hold. Readable files and directories are never flocked; a
+is one any user can hold. One that is not (an older flexvm's) is replaced, not
+chmodded, since a descriptor opened before a chmod keeps its flock; a log is
+moved aside to `.1`. Readable files and directories are never flocked; a
 non-root `flexvm ls` opens the state root without its lock and shows entries
 whose process is alive, without the lock's check.
 

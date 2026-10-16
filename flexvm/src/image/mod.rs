@@ -238,15 +238,13 @@ fn entry_complete(cached: &Path) -> bool {
 
 /// Holds a per-key lock through the cache check, build and publication.
 fn cached_rootfs(cached: &Path, build: impl FnOnce(&Path) -> Result<String>, sync: impl Fn(&Path) -> std::io::Result<()>) -> Result<PathBuf> {
-    use std::os::unix::fs::OpenOptionsExt;
     let dir = cached.parent().unwrap();
     // Entries handed out must survive a crash right after the first build, whoever made the directories.
     crate::util::create_dir_durably(dir, 0o777)?;
     sweep_temporaries(dir)?;
-    // Never unlink the lock: waiters must all lock the same inode.
-    let lock = File::options().write(true).create(true).truncate(false).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(cached.with_extension("lock"))?;
-    use std::os::unix::fs::PermissionsExt;
-    lock.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    // Never unlink the lock: waiters must all lock the same inode (`private_file`
+    // replaces only one another user could open, as an older flexvm made it).
+    let lock = crate::host::private_file(&cached.with_extension("lock"))?;
     if let Err(e) = flock(&lock, libc::LOCK_EX | libc::LOCK_NB) {
         if e.raw_os_error() != Some(libc::EWOULDBLOCK) {
             return Err(e.into());

@@ -2630,18 +2630,46 @@ pub fn check_name(name: &str) -> Result<()> {
 }
 
 /// Lock inodes must not be readable by other users: Linux permits an exclusive
-/// flock even on a read-only descriptor. Repair modes of existing files as well.
+/// flock even on a read-only descriptor. One that is not private (an older
+/// layout's, or not ours) is replaced, not repaired: a mode change does not take
+/// back a descriptor another user opened before it, and with it the flock. What
+/// it holds (a name lock's holder) is copied over.
 pub fn private_file(path: &Path) -> std::io::Result<File> {
-    let f = File::options().create(true).truncate(false).read(true).write(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(path)?;
-    let meta = f.metadata()?;
-    // One link only: never chmod an inode linked in from elsewhere (a user-owned checkpoint directory).
-    if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } || meta.nlink() != 1 {
-        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "lock file must be a regular file owned by this user, with one link"));
+    private_or(path, |path| {
+        use std::io::{Read, Write};
+        let mut held = Vec::new();
+        File::options().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)?.take(1 << 16).read_to_end(&mut held)?;
+        // Atomic: a process always finds a file at `path`.
+        let tmp = path.with_file_name(format!(".{}.{}", path.file_name().unwrap_or_default().to_string_lossy(), crate::util::random_hex(8)?));
+        let f = File::options().write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(&tmp);
+        f.and_then(|mut f| f.write_all(&held)).and_then(|()| std::fs::rename(&tmp, path)).inspect_err(|_| drop(std::fs::remove_file(&tmp)))
+    })
+}
+
+/// A log flexvm flocks while it writes: one that is not private is moved aside to
+/// `.1`, as rotation moves it, so its output is kept.
+pub fn private_log(path: &Path) -> std::io::Result<File> {
+    private_or(path, |path| {
+        let mut old = path.as_os_str().to_owned();
+        old.push(".1");
+        std::fs::rename(path, old)
+    })
+}
+
+fn private_or(path: &Path, replace: impl Fn(&Path) -> std::io::Result<()>) -> std::io::Result<File> {
+    for _ in 0..8 {
+        let f = File::options().create(true).truncate(false).read(true).write(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(path)?;
+        let meta = f.metadata()?;
+        if !meta.is_file() {
+            return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, format!("{}: not a regular file", path.display())));
+        }
+        // One link only: an inode linked in from elsewhere is never ours to use.
+        if meta.uid() == unsafe { libc::geteuid() } && meta.nlink() == 1 && meta.mode() & 0o7777 == 0o600 {
+            return Ok(f);
+        }
+        replace(path)?;
     }
-    if meta.mode() & 0o7777 != 0o600 {
-        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(f)
+    Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, format!("{}: not made private", path.display())))
 }
 
 fn private_dir(path: &Path) -> std::io::Result<()> {
@@ -2912,14 +2940,31 @@ mod tests {
     }
 
     #[test]
-    fn a_lock_linked_in_from_elsewhere_is_refused_and_left_alone() {
-        let root = crate::test_util::TempDir::new("linked-lock");
-        let (other, link) = (root.join("other"), root.join("x.lock"));
+    fn a_lock_another_user_could_open_is_replaced_not_repaired() {
+        let root = crate::test_util::TempDir::new("replaced-lock");
+        let (other, link, open) = (root.join("other"), root.join("x.lock"), root.join("y.lock"));
         std::fs::write(&other, b"").unwrap();
         std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o644)).unwrap();
         std::fs::hard_link(&other, &link).unwrap();
-        assert_eq!(private_file(&link).unwrap_err().kind(), std::io::ErrorKind::PermissionDenied);
-        assert_eq!(std::fs::metadata(&other).unwrap().permissions().mode() & 0o777, 0o644);
+        let f = private_file(&link).unwrap();
+        assert_ne!(f.metadata().unwrap().ino(), std::fs::metadata(&other).unwrap().ino(), "a linked inode is not used");
+        assert_eq!(std::fs::metadata(&other).unwrap().permissions().mode() & 0o777, 0o644, "nor changed");
+        // A descriptor opened while the file was readable keeps its flock, but on an inode no longer used.
+        std::fs::write(&open, b"").unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let _early = Flock::new(File::open(&open).unwrap(), libc::LOCK_EX).unwrap();
+        let f = private_file(&open).unwrap();
+        assert_eq!(f.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        flock(&f, libc::LOCK_EX | libc::LOCK_NB).expect("the early holder does not block it");
+        let leftovers: Vec<_> = std::fs::read_dir(&*root).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(leftovers.len(), 3, "{leftovers:?}");
+        // A log is moved aside, its output kept.
+        let log = root.join("vm.log");
+        std::fs::write(&log, b"before").unwrap();
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).unwrap();
+        private_log(&log).unwrap();
+        assert_eq!(std::fs::read(root.join("vm.log.1")).unwrap(), b"before");
+        assert_eq!(std::fs::metadata(&log).unwrap().permissions().mode() & 0o777, 0o600);
     }
 
     #[test]
@@ -5243,7 +5288,7 @@ mod tests {
     fn a_bounded_flock_wait_wakes_when_the_holder_lets_go() {
         let base = crate::test_util::TempDir::new("flock-by");
         let path = base.join("lock");
-        let open = || File::options().create(true).truncate(false).write(true).open(&path).unwrap();
+        let open = || private_file(&path).unwrap();
         let held = Flock::new(open(), libc::LOCK_EX).unwrap();
         // Let go of while the wait is under way: had then, long before its deadline.
         let (tx, rx) = std::sync::mpsc::channel();
@@ -5281,7 +5326,7 @@ mod tests {
     fn timed_out_flock_waits_share_one_helper() {
         let base = crate::test_util::TempDir::new("flock-by-shared");
         let path = base.join("lock");
-        let open = || File::options().create(true).truncate(false).write(true).open(&path).unwrap();
+        let open = || private_file(&path).unwrap();
         let held = Flock::new(open(), libc::LOCK_EX).unwrap();
         let helpers = || FLOCK_HELPERS.lock().unwrap().as_ref().and_then(|m| m.get(&path).copied()).unwrap_or(0);
         for _ in 0..20 {
