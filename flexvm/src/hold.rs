@@ -1350,14 +1350,17 @@ mod tests {
         let tap = format!("tso{:x}t0", std::process::id());
         let (_address, ip) = root_address();
         crate::net::create_tap(&tap, "test").unwrap();
-        let fd = unsafe { OwnedFd::from_raw_fd(libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC)) };
+        let raw = unsafe { libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC) };
+        assert!(raw >= 0, "open /dev/net/tun: {}", std::io::Error::last_os_error());
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
         let mut req = crate::net::ifreq(&tap).unwrap();
         req.ifr_ifru.ifru_flags = (libc::IFF_TAP | libc::IFF_NO_PI | libc::IFF_VNET_HDR) as libc::c_short;
         let hdr: libc::c_int = 12;
+        let ok = |what: &str, r: libc::c_int| assert_eq!(r, 0, "{what}: {}", std::io::Error::last_os_error());
         unsafe {
-            assert_eq!(libc::ioctl(fd.as_raw_fd(), libc::TUNSETIFF, &req), 0);
-            assert_eq!(libc::ioctl(fd.as_raw_fd(), 0x4004_54d8 /* TUNSETVNETHDRSZ */, &hdr), 0);
-            assert_eq!(libc::ioctl(fd.as_raw_fd(), 0x4004_54d0 /* TUNSETOFFLOAD */, 0x3 as libc::c_ulong /* CSUM, TSO4 */), 0);
+            ok("TUNSETIFF", libc::ioctl(fd.as_raw_fd(), libc::TUNSETIFF, &req));
+            ok("TUNSETVNETHDRSZ", libc::ioctl(fd.as_raw_fd(), 0x4004_54d8, &hdr));
+            ok("TUNSETOFFLOAD", libc::ioctl(fd.as_raw_fd(), 0x4004_54d0, 0x3 as libc::c_ulong /* CSUM, TSO4 */));
         }
         crate::net::set_link_up(&tap, true).unwrap();
         crate::net::attach(ip, &tap).unwrap();

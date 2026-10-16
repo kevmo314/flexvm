@@ -99,6 +99,7 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q --no-install-recommends iproute2
+          sudo modprobe tun
           sudo -E "$(command -v cargo)" test -p flexvm -- --ignored
 
       # flexvm builds in the background (its release profile: fat LTO, one codegen unit,
