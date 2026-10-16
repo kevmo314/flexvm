@@ -613,3 +613,36 @@ fn tmpfs_page_reads_work_without_direct_io_support() {
     assert_eq!(bytes, data);
     file.drop_cache();
 }
+
+#[test]
+fn chains_open_to_their_depth_limit_and_refuse_incompatible_parents() {
+    let dir = tmp("chain-limits");
+    // MAX_CHAIN checkpoints (a base and its deltas) open; one more delta on top is refused.
+    let (mut parent, mut ids) = (None, Vec::new());
+    for i in 0..=MAX_CHAIN {
+        let id = link(&dir.join(format!("ck{i}")), parent, |_| {});
+        ids.insert(0, id.clone());
+        parent = Some(Parent { path: format!("../ck{i}").into(), id });
+    }
+    let at_limit = dir.join(format!("ck{}", MAX_CHAIN - 1));
+    let ck = Checkpoint::open(&at_limit).unwrap();
+    assert_eq!((ck.chain.len(), &ck.chain_ids[..]), (MAX_CHAIN - 1, &ids[2..]));
+    assert_eq!(chain_ids(&at_limit).unwrap(), ids[1..]);
+    let past = dir.join(format!("ck{MAX_CHAIN}"));
+    for e in [Checkpoint::open(&past).err().unwrap().to_string(), chain_ids(&past).err().unwrap().to_string()] {
+        assert!(e.contains(&format!("more than {MAX_CHAIN} deltas deep")), "{e}");
+    }
+    // A parent whose id (its manifest's checksum) matches, but of another template or guest size.
+    type Edit = fn(&mut Manifest);
+    let edits: [Edit; 2] = [|m| m.template_id = "other".into(), |m| m.guest_pages = 512];
+    for (i, edit) in edits.into_iter().enumerate() {
+        let (base, head) = (dir.join(format!("base{i}")), dir.join(format!("head{i}")));
+        let id = link(&base, None, edit);
+        Checkpoint::open(&base).unwrap();
+        link(&head, Some(Parent { path: parent_path(&head, &base), id }), |_| {});
+        for e in [Checkpoint::open(&head).err().unwrap().to_string(), chain_ids(&head).err().unwrap().to_string()] {
+            assert!(e.contains("is of another template or size"), "{e}");
+        }
+    }
+    fs::remove_dir_all(&dir).unwrap();
+}

@@ -391,6 +391,8 @@ impl Proc {
         let (vm, restore) = (|| -> Result<_> {
             let seed = Some((ck.runs, Origin::File(ck.file)));
             let prepared = Vm::prepare(self.spawner.take(None)?, tpl, t)?;
+            // Test gate: its Firecracker is up, nothing loaded or paged in yet.
+            crate::host::hold("restore_prepared_gate");
             prepared.load(&self.spawner, name, Snapshot::Bytes(&ck.vmstate), seed, ip, !(hold && fault("restore_no_hold")), None, || Ok(()), t)
         })()
         .map_err(Restore::NotRun)?;
@@ -422,6 +424,10 @@ impl Proc {
         if hold {
             return Ok(keep_paused(t, None));
         }
+        // Test gate: a resume loaded and paused, not yet marked STARTED (the fence's host lock not yet taken).
+        if owned {
+            crate::host::hold("resume_unmarked_gate");
+        }
         // Test fault `resume_fence_fail`: the generation is found withdrawn at the fence.
         let still = match fault("resume_fence_fail") {
             true => Err("injected fault: the address's generation was withdrawn meanwhile".into()),
@@ -445,6 +451,8 @@ impl Proc {
                 });
             }
             *self.consumed.lock().unwrap() = Some(dir.clone());
+            // Test gate: STARTED is durable, the vCPUs not yet unpaused, the fence's host lock held.
+            crate::host::hold("resume_marked_gate");
         }
         let unpaused = match fault("restore_unpause_fail") {
             true => Err("injected fault: resuming its vCPUs failed".into()),
@@ -464,6 +472,10 @@ impl Proc {
         }
         drop(still);
         t.mark("resume");
+        // Test gate: a resume marked STARTED and running, not yet published.
+        if owned {
+            crate::host::hold("resume_ran_gate");
+        }
         if fault("restore_after_run") {
             return Err(Restore::Ran(kill("injected fault: restore failed after the vm ran".into())));
         }

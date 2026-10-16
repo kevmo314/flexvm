@@ -8511,6 +8511,251 @@ def uffd_err():
     check("uffd err: kill clears it", n not in vms(A), vms(A).get(n))
 
 
+def pagemap_runs(path):
+    """A checkpoint's page map: its runs (first guest page, pages, kind: 1 data, 2 zero, 3 template, index in pages)."""
+    b = open(os.path.join(path, "pagemap"), "rb").read()
+    assert b[:8] == b"FVPGMAP2", b[:8]
+    nruns = struct.unpack_from("<Q", b, 8)[0]
+    return [struct.unpack_from("<4Q", b, 24 + 32 * r) for r in range(nruns)]
+
+
+def children(pid):
+    """`pid`'s child processes."""
+    out = []
+    for task in os.listdir(f"/proc/{pid}/task") if os.path.isdir(f"/proc/{pid}/task") else []:
+        try:
+            out += [int(c) for c in open(f"/proc/{pid}/task/{task}/children").read().split()]
+        except OSError:
+            pass
+    return out
+
+
+def comm(pid):
+    try:
+        return open(f"/proc/{pid}/comm").read().strip()
+    except OSError:
+        return None
+
+
+def release(host, gate):
+    """Lets the processes parked at `host::hold` gate `gate` go (removes their reached-markers), then disarms it."""
+    clear_gate(host, gate)
+    fault(host, gate, 0)
+
+
+def ckpt_ancestor_corrupt():
+    """#461: a page only an ancestor of a delta stores (none of its descendants
+    overrides it) turns out corrupt once the head is restored: the real pager
+    finds it as it pages it in (the guest reads its memory, or the background
+    pull gets there first) and the VM fails for that page's checksum, its
+    Firecracker gone and nothing left hanging (an exec of it returns)."""
+    n, base, head = "ft-anc-corrupt", ckpt_path("ft-anc-base"), ckpt_path("ft-anc-head")
+    setup(n, mib=64)
+    ok(checkpoint(A, n, base))
+    must = sh(A, n, "echo delta >/tmp/g && sync")
+    check("ancestor corrupt: the guest changed after the base", must[0] == 0, must)
+    ok(checkpoint(A, n, head, incremental=True))
+    ok(kill(A, n))
+    # A data page of the base that no run of the delta covers, mid-way through the base's longest such stretch.
+    covered = [(f, f + c) for f, c, _, _ in pagemap_runs(head)]
+    best = None
+    for f, c, kind, at in pagemap_runs(base):
+        if kind != 1:
+            continue
+        p = f
+        while p < f + c:
+            over = next(((s, e) for s, e in covered if s <= p < e), None)
+            if over:
+                p = over[1]
+                continue
+            end = min([f + c] + [s for s, _ in covered if s > p])
+            if not best or end - p > best[1] - best[0]:
+                best = (p, end, f, at)
+            p = end
+    check("ancestor corrupt: the base stores pages the delta does not", best and best[1] - best[0] >= 16, best)
+    if not best:
+        return
+    page = (best[0] + best[1]) // 2
+    d = best[3] + page - best[2]
+    with open(os.path.join(base, "pages"), "r+b") as f:
+        f.seek(d * 4096 + 123)
+        b = f.read(1)
+        f.seek(d * 4096 + 123)
+        f.write(bytes([b[0] ^ 0x5a]))
+    clear_log(B, n)
+    # The restoring VM process parks once its Firecracker is up, before anything is paged in: both are
+    # identified (pid, start time) then, whether or not the restore gets to publish them.
+    gate = "restore_prepared_gate"
+    clear_gate(B, gate)
+    fault(B, gate, 600000)
+    res = {}
+    th = threading.Thread(target=lambda: res.update(r=restore(B, head, ip="auto")))
+    th.start()
+    check("ancestor corrupt: the restore parked before its load", wait_for(lambda: len(reached(B, gate)) == 1, 60), reached(B, gate))
+    pid = (reached(B, gate) or [None])[0]
+    fcs = [c for c in children(pid) if comm(c) == "firecracker"] if pid else []
+    check("ancestor corrupt: its Firecracker found", len(fcs) == 1, (pid, fcs))
+    procs = [(p, starttime_of(p)) for p in [pid] + fcs if p]
+    release(B, gate)
+    th.join(120)
+    r = res.get("r") or {"ok": False, "error": "restore did not return"}
+    t = time.time()
+    exec_code = None
+    if r["ok"]:
+        # Read all of the guest's memory there is: /tmp/f, and whatever else the page cache holds.
+        try:
+            exec_code = subprocess.run([BIN, "--state", B.state, "--run", B.run, "exec", n, "md5sum /tmp/f; cat /proc/meminfo >/dev/null"],
+                                       capture_output=True, timeout=60, env=ENV).returncode
+        except subprocess.TimeoutExpired:
+            exec_code = "hung"
+    took = time.time() - t
+    want = f"data page {d} does not match its checksum"
+    why = lambda: (r.get("error") or "") + (vms(B).get(n) or {}).get("error", "") + log(B, n)
+    check("ancestor corrupt: fails for that ancestor page's checksum", wait_for(lambda: want in why(), 60),
+          (want, r, vms(B).get(n), log(B, n)[-800:]))
+    check("ancestor corrupt: an exec of it returns, nothing hangs", exec_code != "hung" and took < 60, (exec_code, took))
+    check("ancestor corrupt: it never runs on", wait_for(lambda: B not in where(n), 30), vms(B).get(n))
+    check("ancestor corrupt: exactly its VM process and Firecracker exited",
+          len(procs) == 2 and wait_for(lambda: all(starttime_of(p) != st for p, st in procs), 15), procs)
+    v = vms(B).get(n)
+    check("ancestor corrupt: listed failed (or gone), saying why", v is None or (v.get("state") == "failed" and "checksum" in v.get("error", "")), v)
+    kill(B, n)
+    check("ancestor corrupt: nothing left once killed", n not in vms(B), vms(B).get(n))
+    rm_ckpt(head)
+    rm_ckpt(base)
+
+
+def resume_listener_restart():
+    """#461: the listener restarts while a suspended VM resumes: once with the
+    resume parked before it marks the checkpoint STARTED, once after it marked
+    it and unpaused the VM (gates). Either way the VM runs on with its memory,
+    its address keeps its generation and its command reattaches; a resume
+    SIGKILLed after it ran (STARTED durable) never replays its checkpoint."""
+    n = "ft-resume-listen"
+    scenario_vms.add(n)
+    own_listeners("resume listener restart")
+    go = "resume-listen-done"
+    cmd = f"echo resume-listen-start; while [ ! -e /tmp/go ]; do sleep 0.1; done; echo {go}; exit 7"
+    ok(cli_json(A, "run", n, "--template", args.template, "-d", "--", cmd))
+    code, out = sh(A, n, "dd if=/dev/urandom of=/tmp/f bs=1M count=20 iflag=fullblock 2>/dev/null && md5sum /tmp/f")
+    assert code == 0, out
+    m, ip, gen = out.split()[0], vms(A)[n]["ip"], vms(A)[n]["gen"]
+    check("resume listener restart: the address's generation is recorded", gen and addr(A, ip).get("held") == gen, (gen, addr(A, ip)))
+    proc = None
+    for gate in ("resume_unmarked_gate", "resume_ran_gate"):
+        label = f"resume listener restart ({gate})"
+        pid = vm_pid(A, n)
+        os.kill(pid, signal.SIGTERM)
+        check(f"{label}: suspended", wait_for(lambda: not alive(pid) and vms(A).get(n, {}).get("state") == "suspended", 60), vms(A).get(n))
+        if proc:
+            check(f"{label}: the earlier resume's process exited for the suspend", proc.wait(30) == 128 + signal.SIGTERM, proc.returncode)
+        d = os.path.join(A.state, "suspended", n)
+        clear_gate(A, gate)
+        fault(A, gate, 600000)
+        proc = subprocess.Popen([BIN, "--state", A.state, "--run", A.run, "resume", n], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, env=ENV)
+        check(f"{label}: the resume got to its gate", wait_for(lambda: reached(A, gate) == [proc.pid], 60), (reached(A, gate), proc.pid))
+        started = os.path.exists(os.path.join(d, "STARTED"))
+        check(f"{label}: STARTED {'on disk' if gate == 'resume_ran_gate' else 'not yet made'}", started == (gate == "resume_ran_gate"), started)
+        restart_listeners(label, (A,))
+        # Held until released (`host::hold`): still parked across the restart, not yet published.
+        parked = (proc.poll(), reached(A, gate), os.path.exists(os.path.join(d, "STARTED")), vms(A).get(n, {}).get("pid"))
+        check(f"{label}: still parked after the restart", parked[:3] == (None, [proc.pid], started) and parked[3] != proc.pid, parked)
+        release(A, gate)
+        check(f"{label}: runs", wait_for(lambda: vms(A).get(n, {}).get("state") == "running", 60), vms(A).get(n))
+        check(f"{label}: memory intact", md5(A, n) == m)
+        v = vms(A)[n]
+        check(f"{label}: its address keeps its generation", (v["ip"], v["gen"], addr(A, ip).get("held")) == (ip, gen, gen), (gen, v, addr(A, ip)))
+        check(f"{label}: its checkpoint deleted once paged in", wait_for(lambda: not os.path.exists(d), 60), os.listdir(d) if os.path.exists(d) else None)
+        # A resume now finds nothing suspended: it continues the running VM, no other process loads the checkpoint.
+        r = resume_suspended(A, n)
+        check(f"{label}: a second resume replays nothing", vms(A).get(n, {}).get("pid") == proc.pid and not os.path.exists(d), (r, vms(A).get(n)))
+    # The command reattached to the last resume's process, which exits with its status.
+    sh(A, n, "touch /tmp/go")
+    try:
+        out, err = proc.communicate(timeout=60)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        out, err = proc.communicate()
+    check("resume listener restart: the command reattached, its status and output", proc.returncode == 7 and go in out.splitlines(),
+          (proc.returncode, out[-300:], err[-300:]))
+    check("resume listener restart: gone after the command", wait_for(lambda: n not in vms(A), 30), vms(A).get(n))
+
+    # SIGKILLed once it ran, with a listener restart in between: never resumed again.
+    setup(n, mib=8)
+    pid = vm_pid(A, n)
+    os.kill(pid, signal.SIGTERM)
+    check("resume listener restart, killed: suspended", wait_for(lambda: not alive(pid) and vms(A).get(n, {}).get("state") == "suspended", 60), vms(A).get(n))
+    d = os.path.join(A.state, "suspended", n)
+    clear_gate(A, "resume_ran_gate")
+    fault(A, "resume_ran_gate", 600000)
+    proc = subprocess.Popen([BIN, "--state", A.state, "--run", A.run, "resume", n, "-d"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, env=ENV)
+    check("resume listener restart, killed: ran (gate reached, STARTED on disk)",
+          wait_for(lambda: reached(A, "resume_ran_gate"), 60) and os.path.exists(os.path.join(d, "STARTED")), reached(A, "resume_ran_gate"))
+    restart_listeners("resume listener restart, killed", (A,))
+    parked = [(p, starttime_of(p)) for p in reached(A, "resume_ran_gate")]
+    check("resume listener restart, killed: still parked after the restart", len(parked) == 1 and parked[0][1], parked)
+    for p, _ in parked:
+        os.kill(p, signal.SIGKILL)
+    check("resume listener restart, killed: its process died", wait_for(lambda: all(starttime_of(p) != st for p, st in parked), 15), parked)
+    release(A, "resume_ran_gate")
+    try:
+        proc.communicate(timeout=30)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+    check("resume listener restart, killed: not listed suspended", vms(A).get(n, {}).get("state") != "suspended", vms(A).get(n))
+    r = resume_suspended(A, n)
+    check("resume listener restart, killed: no replay", not r["ok"] and A not in where(n), (r, where(n)))
+    check("resume listener restart, killed: checkpoint deleted", not os.path.exists(d), os.listdir(d) if os.path.exists(d) else None)
+    kill(A, n)
+    check("resume listener restart, killed: nothing left once killed", n not in vms(A), vms(A).get(n))
+
+
+def resume_killed_marked():
+    """#461: a resume SIGKILLed once its checkpoint's STARTED mark is durable,
+    before its vCPUs were unpaused (parked under the fence's host lock, released
+    by its reached-marker, not `debug fault`): the checkpoint is consumed, never
+    replayed, though the VM never ran; its Firecracker dies with it."""
+    n, gate = "ft-killed-marked", "resume_marked_gate"
+    setup(n, mib=8)
+    pid = vm_pid(A, n)
+    os.kill(pid, signal.SIGTERM)
+    check("killed marked: suspended", wait_for(lambda: not alive(pid) and vms(A).get(n, {}).get("state") == "suspended", 60), vms(A).get(n))
+    d = os.path.join(A.state, "suspended", n)
+    clear_gate(A, gate)
+    fault(A, gate, 600000)
+    proc = subprocess.Popen([BIN, "--state", A.state, "--run", A.run, "resume", n, "-d"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, env=ENV)
+    check("killed marked: the resume parked at its gate", wait_for(lambda: len(reached(A, gate)) == 1, 60), reached(A, gate))
+    pid = (reached(A, gate) or [None])[0]
+    fcs = [c for c in children(pid) if comm(c) == "firecracker"] if pid else []
+    check("killed marked: STARTED on disk", os.path.exists(os.path.join(d, "STARTED")))
+    sock = None
+    if len(fcs) == 1:
+        argv = open(f"/proc/{fcs[0]}/cmdline", "rb").read().split(b"\0")
+        sock = os.path.join(f"/proc/{fcs[0]}/cwd", argv[argv.index(b"--api-sock") + 1].decode())
+    info = fc_api(sock, "GET", "/") if sock else None
+    check("killed marked: its Firecracker is up, its vCPUs never unpaused", (info or {}).get("state") == "Paused", (fcs, info))
+    procs = [(p, starttime_of(p)) for p in [pid] + fcs if p]
+    for p, _ in procs[:1]:
+        os.kill(p, signal.SIGKILL)
+    check("killed marked: its VM process and Firecracker exited", len(procs) == 2 and wait_for(lambda: all(starttime_of(p) != st for p, st in procs), 15), procs)
+    release(A, gate)
+    try:
+        proc.communicate(timeout=30)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+    check("killed marked: not listed suspended", vms(A).get(n, {}).get("state") != "suspended", vms(A).get(n))
+    r = resume_suspended(A, n)
+    check("killed marked: no replay", not r["ok"] and A not in where(n), (r, where(n)))
+    check("killed marked: checkpoint deleted", not os.path.exists(d), os.listdir(d) if os.path.exists(d) else None)
+    kill(A, n)
+    check("killed marked: nothing left once killed", n not in vms(A), vms(A).get(n))
+
+
 SCENARIOS = dict(
     killed_migrated=killed_migrated,
     unread_output=unread_output,
@@ -8554,7 +8799,9 @@ SCENARIOS = dict(
     collapse_abort=collapse_abort, collapse_ckpt_fail=collapse_ckpt_fail, ckpt_paused_backlog=ckpt_paused_backlog, same_host_order=same_host_order, same_host_slow_route=same_host_slow_route, same_host_flood=same_host_flood, same_host_late_handover=same_host_late_handover, same_host_hold_route_fail=same_host_hold_route_fail, same_host_backlog=same_host_backlog, same_host_bulk_tcp=same_host_bulk_tcp, ckpt_backlog=ckpt_backlog, rx_stall=rx_stall, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,
     handoff_superseded=handoff_superseded, delayed_announce=delayed_announce, delayed_announce_handoff=delayed_announce_handoff, announce_arp_timer=announce_arp_timer,
     prepare_fail_announce=prepare_fail_announce, reconcile_announce=reconcile_announce, reconcile_kill=reconcile_kill, resume_pull_lock=resume_pull_lock, page_conns=page_conns, suspend_cmd=suspend_cmd, suspend_slow_cmd=suspend_slow_cmd, suspend_overlap=suspend_overlap, fc_died_busy=fc_died_busy, pause_cmd_start=pause_cmd_start, suspend_died=suspend_died,
-    ctrl_z_long_op=ctrl_z_long_op, resume_suspending=resume_suspending, quit_status=quit_status)
+    ctrl_z_long_op=ctrl_z_long_op, resume_suspending=resume_suspending, quit_status=quit_status,
+    ckpt_ancestor_corrupt=ckpt_ancestor_corrupt, resume_listener_restart=resume_listener_restart,
+    resume_killed_marked=resume_killed_marked)
 # Measurements, not correctness checks (nothing they print has a threshold): run only when named.
 BENCHMARKS = dict(ckpt_stall=ckpt_stall)
 del SCENARIOS["ckpt_stall"]
