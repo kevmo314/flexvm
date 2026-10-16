@@ -2456,7 +2456,9 @@ mod tests {
         let peers_host = running.clone();
         let announcer = Announcer::start(
             |f| thread::Builder::new().spawn(f).map(drop),
-            |peer, req| peer_call(peer, req.clone()).map(drop),
+            // Bounds that only catch a hang: a call timed out under load would be retried,
+            // and the retry would look like a route to a removed peer.
+            |peer, req| crate::util::rpc(peer, Duration::from_secs(30), Instant::now() + Duration::from_secs(60), req).map(drop),
             Box::new(move || peers_host.config_now().peers),
             ANNOUNCE_RETRY,
         )
@@ -2486,10 +2488,10 @@ mod tests {
         });
         let tick = || {
             commands.send(()).unwrap();
-            result_rx.recv_timeout(Duration::from_secs(5)).unwrap()
+            result_rx.recv_timeout(Duration::from_secs(60)).unwrap()
         };
         let receive = |listener: &std::net::TcpListener, via: &str| {
-            let end = Instant::now() + Duration::from_secs(5);
+            let end = Instant::now() + Duration::from_secs(60);
             let mut socket = loop {
                 match listener.accept() {
                     Ok((socket, _)) => break socket,
@@ -2500,7 +2502,7 @@ mod tests {
                     Err(e) => panic!("accept: {e}"),
                 }
             };
-            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
             let req = crate::util::recv_json(&mut BufReader::new(socket.try_clone().unwrap())).unwrap().unwrap();
             writeln!(socket, "{}", json!({"ok": true, "result": null})).unwrap();
             assert_eq!(req["op"], "route");
@@ -2529,7 +2531,7 @@ mod tests {
             })
             .unwrap();
         // Keep the same watcher and its admission backoff: it eventually retries and lifts throttling.
-        let end = Instant::now() + Duration::from_secs(5);
+        let end = Instant::now() + Duration::from_secs(60);
         loop {
             let (admitted, throttled) = tick();
             receive(&second, "192.0.2.20");

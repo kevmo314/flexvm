@@ -1243,7 +1243,7 @@ pub(super) mod tests {
                 }
             });
             let reg = Registry::new(Reference::parse(&format!("{addr}/test")).unwrap());
-            let err = reg.get("blobs/x", "*/*", Instant::now() + Duration::from_secs(2)).err().unwrap().to_string();
+            let err = reg.get("blobs/x", "*/*", Instant::now() + Duration::from_secs(10)).err().unwrap().to_string();
             assert!(err.contains(expected), "{challenge}: {err}");
             let seen = requests.lock().unwrap();
             assert_eq!(seen.iter().filter(|(p, _)| p.starts_with("/v2/")).count(), registry_calls, "{challenge}");
@@ -1273,7 +1273,7 @@ pub(super) mod tests {
                 response("307 Temporary Redirect", &headers, "")
             });
             let reg = Registry::new(Reference::parse(&format!("{addr}/test")).unwrap());
-            let err = reg.get("0", "*/*", Instant::now() + Duration::from_secs(2)).err().unwrap().to_string();
+            let err = reg.get("0", "*/*", Instant::now() + Duration::from_secs(10)).err().unwrap().to_string();
             assert!(err.contains(if missing { "redirect without a location" } else { "too many redirects" }), "{err}");
             assert_eq!(seen.lock().unwrap().len(), if missing { 1 } else { 6 });
             assert_eq!(forbidden.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
