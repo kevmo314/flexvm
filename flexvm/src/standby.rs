@@ -337,6 +337,17 @@ pub fn load_set(host: &Host, tpl: &Template) -> Vec<u64> {
     set
 }
 
+/// Whether an unclaimed standby leaves, and its exit status: 124 (`DIED`) when its VM
+/// died; 0 when it leaves the pool on purpose (its template changed, the pool is over
+/// target, or its socket is gone). A signal sent to it ends it first (`Proc::stop_requested`).
+fn leave_status(died: bool, left_pool: bool) -> Option<i32> {
+    if died {
+        Some(crate::vmproc::DIED)
+    } else {
+        left_pool.then_some(0)
+    }
+}
+
 /// `run --standby`: returns once claimed; ends the process if stopped,
 /// out of date, extra, or its VM died.
 pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) -> Result<Value> {
@@ -385,8 +396,8 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
     loop {
         let mut pfd = libc::pollfd { fd: listener.as_raw_fd(), events: libc::POLLIN, revents: 0 };
         if unsafe { libc::poll(&mut pfd, 1, 100) } <= 0 {
-            if p.stop_requested() {
-                p.finish(op, End::NotStarted, 0, None);
+            if let Some(code) = p.stop_requested() {
+                p.finish(op, End::NotStarted, code, None);
             }
             if checked.elapsed() < Duration::from_secs(1) {
                 continue;
@@ -394,10 +405,15 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
             checked = Instant::now();
             let current = key(&p.paths, template).ok();
             let extra = live(host, template).iter().position(|id| *id == me).is_none_or(|i| i >= target(host, template));
-            let dead = p.standby.lock().unwrap().as_ref().is_none_or(|s| s.pager.failed().is_some() || !s.firecracker().alive());
+            let died = p.standby.lock().unwrap().as_ref().map_or(Some("it was given up".to_string()), |s| {
+                s.pager.failed().map(String::from).or((!s.firecracker().alive()).then(|| "its firecracker exited".into()))
+            });
             let unreachable = std::fs::symlink_metadata(&sock).map(|m| m.ino()).ok() != Some(bound);
-            if current.as_deref() != Some(&mine) || extra || dead || unreachable {
-                p.finish(op, End::NotStarted, 0, None);
+            if let Some(why) = &died {
+                crate::log!("standby {template}: died: {why}");
+            }
+            if let Some(code) = leave_status(died.is_some(), current.as_deref() != Some(&mine) || extra || unreachable) {
+                p.finish(op, End::NotStarted, code, None);
             }
             continue;
         }
@@ -405,7 +421,7 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
         // In short waits, minding stops: a claimer stopped mid-request must not keep this one.
         let at = Instant::now() + HANDSHAKE_TIMEOUT;
         let ready = || loop {
-            if p.stop_requested() || Instant::now() >= at {
+            if p.stop_requested().is_some() || Instant::now() >= at {
                 return Err(std::io::ErrorKind::TimedOut.into());
             }
             if crate::util::readable(&c, Duration::from_millis(100)).unwrap_or(true) {
@@ -421,8 +437,8 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
         let claiming = File::options().create(true).truncate(false).write(true).open(&claim_path)?;
         crate::host::flock(&claiming, libc::LOCK_EX)?;
         // Not yet `claiming`, so the claimer tries another.
-        if p.stop_requested() {
-            p.finish(op, End::NotStarted, 0, None);
+        if let Some(code) = p.stop_requested() {
+            p.finish(op, End::NotStarted, code, None);
         }
         // From here the claim may take effect: the claimer must not retry elsewhere.
         if send_json(&mut &c, &json!({"claiming": true})).is_err() {
@@ -687,6 +703,14 @@ fn wait_for_reseed(vsock: &std::path::Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_dead_standby_exits_124_and_only_leaving_the_pool_exits_0() {
+        assert_eq!(leave_status(false, false), None);
+        assert_eq!(leave_status(false, true), Some(0));
+        assert_eq!(leave_status(true, false), Some(crate::vmproc::DIED));
+        assert_eq!(leave_status(true, true), Some(crate::vmproc::DIED));
+    }
 
     #[test]
     fn long_template_has_a_short_socket_path() {

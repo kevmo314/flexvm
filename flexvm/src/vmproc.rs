@@ -1,6 +1,6 @@
 //! The VM process: one process per VM, owning its Firecracker, pager, tap,
 //! route and holds, exiting with the VM. SIGTERM suspends, SIGTSTP pauses,
-//! SIGCONT resumes, SIGINT (and SIGQUIT) destroys, SIGUSR1 stops a standby; `RUN/vms/NAME.sock` takes control ops.
+//! SIGCONT resumes, SIGINT (and SIGQUIT) destroys, SIGUSR1 stops a standby (which SIGTERM destroys, unclaimed); `RUN/vms/NAME.sock` takes control ops.
 //! Every operation, starting included, holds `op`; the process ends only
 //! through `finish`, which holds it too.
 
@@ -1390,8 +1390,9 @@ impl Proc {
         Ok(self.cmd_session.get_or_init(|| Mutex::new(new)))
     }
 
-    pub fn stop_requested(&self) -> bool {
-        self.early.lock().unwrap().iter().any(|&s| is_stop(s))
+    /// A standby VM's exit status if a stop is pending (`stop_status`).
+    pub fn stop_requested(&self) -> Option<i32> {
+        stop_status(&self.early.lock().unwrap())
     }
 
     pub fn forget_stop(&self) {
@@ -1521,9 +1522,17 @@ fn owe_or_refuse(reconciling: &Mutex<Option<(u64, String)>>, mig: u64, tries: u3
 }
 
 /// What stops a standby VM before its claim: SIGUSR1 (`standby::stop`'s, which
-/// the claimed VM ignores), or SIGINT or SIGTERM sent to it.
+/// the claimed VM ignores), or SIGINT, SIGQUIT or SIGTERM sent to it.
 fn is_stop(sig: i32) -> bool {
     matches!(sig, libc::SIGINT | libc::SIGQUIT | libc::SIGTERM | libc::SIGUSR1)
+}
+
+/// How a pending stop ends an unclaimed standby VM: 128 + the first SIGINT,
+/// SIGQUIT or SIGTERM (it has nothing to suspend, so SIGTERM destroys it too),
+/// else 0 for the pool's own stop (SIGUSR1); None while none is pending.
+fn stop_status(early: &[i32]) -> Option<i32> {
+    let signalled = early.iter().find(|&&s| is_stop(s) && s != libc::SIGUSR1).map(|&s| 128 + s);
+    signalled.or_else(|| early.contains(&libc::SIGUSR1).then_some(0))
 }
 
 /// A claim discards only the pool's stop; termination requests still replay.
@@ -2669,6 +2678,19 @@ mod tests {
         let mut early = vec![libc::SIGUSR1, libc::SIGINT, libc::SIGTSTP, libc::SIGTERM, libc::SIGUSR1, libc::SIGCONT];
         forget_stop(&mut early);
         assert_eq!(early, [libc::SIGINT, libc::SIGTSTP, libc::SIGTERM, libc::SIGCONT]);
+    }
+
+    /// Only the pool's own stop leaves an unclaimed standby with 0; a signal sent to it gives 128 + it.
+    #[test]
+    fn standby_stops_exit_with_their_signal() {
+        assert_eq!(stop_status(&[]), None);
+        assert_eq!(stop_status(&[libc::SIGTSTP, libc::SIGCONT, libc::SIGHUP]), None);
+        assert_eq!(stop_status(&[libc::SIGUSR1]), Some(0));
+        for sig in [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM] {
+            assert_eq!(stop_status(&[sig]), Some(128 + sig));
+            assert_eq!(stop_status(&[libc::SIGUSR1, libc::SIGTSTP, sig]), Some(128 + sig));
+        }
+        assert_eq!(stop_status(&[libc::SIGTERM, libc::SIGINT]), Some(128 + libc::SIGTERM));
     }
 
     /// MemAvailable unreadable (None) is no pressure: no standby is stopped
