@@ -1940,26 +1940,37 @@ fn rank(mut vms: Vec<Entry>, rss: impl Fn(&Entry) -> u64) -> Vec<Entry> {
 
 /// Per VM and peer (a peer may refuse a big VM but take a small one), in
 /// RUN/evict.backoff under evict.lock, so changing deciders share it and a
-/// reboot clears it. An entry a minute past its cooldown is forgotten.
+/// reboot clears it. Deadlines use boot-clock seconds and the boot id also
+/// expires old wall-clock records. An entry a minute past its cooldown is forgotten.
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct PeerBackoff {
     delay: u64,
     until: u64,
+    #[serde(default)]
+    boot: String,
 }
 
 impl PeerBackoff {
     fn ready(&self, now: u64) -> bool {
-        now >= self.until
+        !self.recent(now) || now >= self.until
+    }
+
+    fn recent(&self, now: u64) -> bool {
+        !self.boot.is_empty() && self.boot == crate::host::boot_id() && now < self.until.saturating_add(60)
     }
 
     fn refuse(&mut self, now: u64) {
+        if !self.recent(now) {
+            self.delay = 0;
+        }
         self.delay = self.delay.saturating_mul(2).clamp(5, 60);
         self.until = now.saturating_add(self.delay);
+        self.boot = crate::host::boot_id().into();
     }
 }
 
 fn eviction_time() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
+    crate::host::boottime_ms() / 1000
 }
 
 /// Whether this process is running an eviction (on its own thread).
@@ -2087,7 +2098,7 @@ fn evict(host: &Host, peers: &[String], vms: &[Entry], avail: u64, deadline: Ins
     let Ok(saved) = crate::host::load::<std::collections::HashMap<String, PeerBackoff>>(&backoff_path) else { return };
     let mut backoff = saved.unwrap_or_default();
     let now = eviction_time();
-    backoff.retain(|_, b| now < b.until.saturating_add(60));
+    backoff.retain(|_, b| b.recent(now));
     for vm in vms {
         let why = match (vm.starved, growth_bucket(vm.growth_mib_s)) {
             (true, _) => "cannot grow here".to_string(),
@@ -2945,6 +2956,42 @@ mod tests {
         std::fs::remove_dir_all(base).unwrap();
         assert!(took < Duration::from_millis(500), "{took:?}");
         assert!(pressure && !held && evicting && running && stopping.is_none());
+    }
+
+    #[test]
+    fn peer_backoff_uses_boot_clock_across_a_wall_clock_step() {
+        // At refusal the wall clock is far ahead of boot time. After a backward
+        // wall-clock step, only elapsed boot seconds should govern the cooldown.
+        crate::host::pin_clock(100_000);
+        assert_eq!(eviction_time(), 100);
+        let mut backoff = PeerBackoff::default();
+        backoff.refuse(eviction_time());
+        let wall_before = 10_000;
+        let wall_until = wall_before + backoff.delay;
+        let backoff: PeerBackoff = serde_json::from_slice(&serde_json::to_vec(&backoff).unwrap()).unwrap();
+        crate::host::pin_clock(104_000);
+        assert!(!backoff.ready(eviction_time()));
+        crate::host::pin_clock(105_000);
+        let wall_after = wall_before - 3600 + 5;
+        assert!(wall_after < wall_until, "a wall-clock deadline would still skip this peer");
+        assert!(backoff.ready(eviction_time()));
+        crate::host::pin_clock(165_000);
+        assert!(!backoff.recent(eviction_time()));
+    }
+
+    #[test]
+    fn peer_backoffs_from_another_boot_or_the_old_wall_clock_format_expire() {
+        let mut backoff = PeerBackoff::default();
+        backoff.refuse(100);
+        backoff.boot = "earlier-boot".into();
+        assert!(!backoff.recent(1));
+        assert!(backoff.ready(1));
+        backoff.refuse(1);
+        assert_eq!(backoff.delay, 5);
+        assert!(!backoff.ready(1));
+        let legacy: PeerBackoff = serde_json::from_str(r#"{"delay":60,"until":1700000000}"#).unwrap();
+        assert!(!legacy.recent(100));
+        assert!(legacy.ready(100));
     }
 
     #[test]

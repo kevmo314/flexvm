@@ -51,15 +51,18 @@ pub struct Firecracker {
     api: Api,
     /// The cgroup move: joined before a load or reap.
     joining: RefCell<Option<std::thread::JoinHandle<()>>>,
+    /// Drained after exit, before reading diagnostics or removing the directory.
+    logging: RefCell<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl Firecracker {
     pub fn spawn(bin: &Path, dir: &Path, sockets: Sockets, ready: Duration) -> Result<Self> {
         crate::socket::check(&sockets.api)?;
         use std::os::unix::process::CommandExt;
-        let log = File::create(dir.join("firecracker.log"))?;
         let mut cmd = Command::new(bin);
-        cmd.arg("--api-sock").arg(&sockets.api).arg("--level").arg("Warn").stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log);
+        cmd.arg("--api-sock").arg(&sockets.api).arg("--level").arg("Warn").stdin(Stdio::null());
+        // Its output is a pipe now: its working directory is how tools find its directory.
+        cmd.current_dir(dir);
         // Firecracker never outlives its VM process (whose pager serves its memory). The
         // signal comes when the spawning *thread* exits, so spawn from the main thread.
         let parent = std::process::id() as i32;
@@ -75,8 +78,17 @@ impl Firecracker {
                 Ok(())
             });
         }
-        let child = crate::util::unblock_signals_in(&mut cmd).spawn().map_err(|e| format!("{}: {e} (see README: Setup)", bin.display()))?;
-        let fc = Firecracker { child, sockets, dir: dir.into(), cgroup: None, tap: String::new(), api: Api::default(), joining: RefCell::new(None) };
+        let (child, logging) = spawn_logged(cmd, dir).map_err(|e| format!("{}: {e} (see README: Setup)", bin.display()))?;
+        let fc = Firecracker {
+            child,
+            sockets,
+            dir: dir.into(),
+            cgroup: None,
+            tap: String::new(),
+            api: Api::default(),
+            joining: RefCell::new(None),
+            logging: RefCell::new(Some(logging)),
+        };
         let id = crate::host::Ident::of(fc.pid()).ok_or_else(|| fc.post_mortem())?;
         crate::host::store(&dir.join("fc"), &id, false)?;
         retry(ready, Duration::from_micros(200), || -> Result<Result<UnixStream>> {
@@ -138,11 +150,14 @@ impl Firecracker {
 
     pub fn post_mortem(&self) -> String {
         let status = match exited(&self.child) {
-            Ok(Some(st)) => format!("exited ({st})"),
+            Ok(Some(st)) => {
+                self.join_log();
+                format!("exited ({st})")
+            }
             Ok(None) => "still running".into(),
             Err(e) => format!("unknown ({e})"),
         };
-        let log = File::open(self.dir.join("firecracker.log")).and_then(|mut f| log_tail(&mut f)).unwrap_or_default();
+        let log = firecracker_log_tail(&self.dir);
         let lines: Vec<&str> = log.lines().collect();
         format!("firecracker {} {status}; log: {}", self.pid(), lines[lines.len().saturating_sub(5)..].join(" | "))
     }
@@ -152,6 +167,43 @@ impl Firecracker {
             let _ = j.join();
         }
     }
+
+    fn join_log(&self) {
+        if let Some(j) = self.logging.borrow_mut().take() {
+            let _ = j.join();
+        }
+    }
+}
+
+/// One reader for both streams, with bounded memory even for a console without newlines.
+/// Firecracker gets pipe writers only, so guest output cannot bypass log rotation.
+fn spawn_logged(mut cmd: Command, dir: &Path) -> std::io::Result<(Child, std::thread::JoinHandle<()>)> {
+    let log = dir.join("firecracker.log");
+    File::create(&log)?;
+    let (mut reader, writer) = std::io::pipe()?;
+    cmd.stdout(writer.try_clone()?).stderr(writer);
+    let child = crate::util::unblock_signals_in(&mut cmd).spawn()?;
+    // Command retains the write ends too: close them so exit delivers EOF to the reader.
+    drop(cmd);
+    let logging = std::thread::spawn(move || {
+        let mut buf = [0; 64 << 10];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    crate::util::output::append_capped(&log, &buf[..n], crate::util::output::LOG_CAP);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+    });
+    Ok((child, logging))
+}
+
+fn firecracker_log_tail(dir: &Path) -> String {
+    // Rotation may have just removed the current file, or left fewer than five lines in it.
+    ["firecracker.log.1", "firecracker.log"].into_iter().filter_map(|name| File::open(dir.join(name)).and_then(|mut f| log_tail(&mut f)).ok()).collect()
 }
 
 /// `child`'s exit status once it exited, leaving it unreaped: only `Drop` reaps Firecracker,
@@ -314,6 +366,7 @@ impl Drop for Firecracker {
         self.api.connection.get_mut().take();
         let _ = self.child.kill();
         let _ = self.child.wait();
+        self.join_log();
         if !self.tap.is_empty() {
             release(&self.tap, self.cgroup.as_deref(), &self.dir);
         }
@@ -451,6 +504,40 @@ mod tests {
 
     use std::os::unix::net::UnixListener;
     use std::thread::JoinHandle;
+
+    #[test]
+    fn firecracker_output_flood_is_capped_and_keeps_final_diagnostics() {
+        let dir = crate::test_util::TempDir::new("fc-log-flood");
+        let mut cmd = Command::new("sh");
+        // Flood both streams without line boundaries, then emit distinct final diagnostics.
+        cmd.arg("-c")
+            .arg(
+                "i=0; while [ \"$i\" -lt 4096 ]; do printf '%s' \"$1\"; printf '%s' \"$1\" >&2; i=$((i+1)); done; \
+             printf '\\nstdout final\\n'; printf 'stderr final\\n' >&2",
+            )
+            .arg("sh")
+            .arg("x".repeat(4096));
+        let (mut child, logging) = spawn_logged(cmd, &dir).unwrap();
+        assert!(child.wait().unwrap().success());
+        logging.join().unwrap();
+        let mut total = 0;
+        for name in ["firecracker.log", "firecracker.log.1"] {
+            let len = std::fs::metadata(dir.join(name)).unwrap().len();
+            assert!(len <= crate::util::output::LOG_CAP + (64 << 10), "{name}: {len}");
+            total += len;
+        }
+        assert!(total < 32 << 20, "the flood must have rotated");
+        assert!(firecracker_log_tail(&dir).ends_with("stdout final\nstderr final\n"));
+    }
+
+    #[test]
+    fn firecracker_diagnostics_span_rotation_even_without_a_current_log() {
+        let dir = crate::test_util::TempDir::new("fc-log-rotation");
+        std::fs::write(dir.join("firecracker.log.1"), "first\nsecond\n").unwrap();
+        assert_eq!(firecracker_log_tail(&dir), "first\nsecond\n");
+        std::fs::write(dir.join("firecracker.log"), "third\n").unwrap();
+        assert_eq!(firecracker_log_tail(&dir), "first\nsecond\nthird\n");
+    }
 
     #[test]
     fn spawner_reuses_tap_names_past_256_and_4096_takes() {
