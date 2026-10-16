@@ -105,22 +105,31 @@ fn is_public(ip: std::net::IpAddr) -> bool {
     }
     match ip {
         IpAddr::V4(v4) => {
-            let [a, b, ..] = v4.octets();
+            let [a, b, c, _] = v4.octets();
             !(v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified() || v4.is_broadcast() || v4.is_multicast())
                 && a != 0
                 && !(a == 100 && b & 0xc0 == 64)
+                && !(a == 192 && b == 0 && c == 0)
+                && !(a == 198 && b & 0xfe == 18)
+                && a < 240
         }
-        // IPv4-mapped, or NAT64's well-known prefix (RFC 6052): as the IPv4 address it stands for.
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped().or_else(|| nat64_well_known(v6)) {
+        // IPv4-mapped, NAT64's well-known prefix, or 6to4: as the IPv4 address it stands for.
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped().or_else(|| nat64_well_known(v6)).or_else(|| six_to_four(v6)) {
             Some(v4) => is_public(IpAddr::V4(v4)),
             // NAT64's local-use prefix (RFC 8215) may translate to anything, private addresses included.
             None if is_nat64(v6) => false,
             None => {
                 let s0 = v6.segments()[0];
-                !(v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() || s0 & 0xfe00 == 0xfc00 || s0 & 0xffc0 == 0xfe80)
+                !(v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() || s0 & 0xfe00 == 0xfc00 || s0 & 0xffc0 == 0xfe80 || s0 & 0xffc0 == 0xfec0)
             }
         },
     }
+}
+
+/// The IPv4 address embedded in a 6to4 address, 2002::/16.
+fn six_to_four(v6: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    let s = v6.segments();
+    (s[0] == 0x2002).then(|| std::net::Ipv4Addr::from((u32::from(s[1]) << 16) | u32::from(s[2])))
 }
 
 /// The IPv4 address embedded in an address under NAT64's well-known prefix, 64:ff9b::/96.
@@ -1465,6 +1474,34 @@ pub(super) mod tests {
         }
         for ip in ["8.8.8.8", "203.0.113.7", "100.128.0.1", "2606:4700::1111", "::ffff:8.8.8.8"] {
             assert!(is_public(ip.parse::<IpAddr>().unwrap()), "{ip}");
+        }
+    }
+
+    #[test]
+    fn special_ranges_and_private_six_to_four_are_not_public() {
+        for ip in [
+            "192.0.0.0",
+            "192.0.0.255",
+            "198.18.0.0",
+            "198.19.255.255",
+            "240.0.0.0",
+            "254.255.255.255",
+            "fec0::",
+            "feff:ffff::1",
+            "2002:a00:1::",
+            "2002:ac10:1::",
+            "2002:c0a8:101::",
+            "2002:7f00:1::",
+            "2002:c000:1::",
+            "2002:c612:1::",
+            "2002:f000:1::",
+            "::ffff:198.18.0.1",
+            "64:ff9b::c000:1",
+        ] {
+            assert!(!is_public(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in ["192.0.1.0", "198.17.255.255", "198.20.0.0", "fe7f::1", "2002:808:808::1", "2003:a00:1::"] {
+            assert!(is_public(ip.parse().unwrap()), "{ip}");
         }
     }
 

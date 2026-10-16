@@ -646,10 +646,32 @@ fn resolve_user(root: &Root, user: &str) -> Result<(u32, u32, String, Vec<u32>)>
     Ok((uid, gid, home, groups))
 }
 
+/// ext4 needs a block per directory and per symlink too long for its inode (60 bytes).
+/// Staging filesystems may report no allocated blocks for these, so `du` alone is insufficient.
+fn ext4_extra_kib(dir: &Path) -> Result<u64> {
+    let mut dirs = vec![dir.to_path_buf()];
+    let mut kib = 0;
+    while let Some(dir) = dirs.pop() {
+        kib += 4;
+        for entry in std::fs::read_dir(dir)? {
+            interrupted()?;
+            let entry = entry?;
+            let metadata = entry.metadata()?;
+            if metadata.is_dir() {
+                dirs.push(entry.path());
+            } else if metadata.is_symlink() && metadata.len() >= 60 {
+                kib += 4;
+            }
+        }
+    }
+    Ok(kib)
+}
+
 /// Sized to content and 256-byte inodes plus headroom, rounded up to 2 MiB as virtio-pmem requires.
 fn mkfs(dir: &Path, entries: u64, dest: &Path) -> Result<()> {
     let du = run_until(Command::new("du").arg("-sk").arg(dir), interrupted)?;
     let kib: u64 = String::from_utf8_lossy(&du.stdout).split_whitespace().next().and_then(|s| s.parse().ok()).ok_or("du failed")?;
+    let kib = kib + ext4_extra_kib(dir)?;
     let inodes = entries * 12 / 10 + 4096;
     let mib = ((kib + inodes / 4) * 12 / 10 / 1024 + 64).div_ceil(2) * 2;
     // mkfs writes through our descriptor, so the name cannot be swapped for a symlink.
@@ -674,6 +696,20 @@ mod tests {
 
     fn read(p: impl AsRef<Path>) -> String {
         std::fs::read_to_string(p).unwrap()
+    }
+
+    #[test]
+    fn ext4_estimate_counts_directory_and_long_symlink_blocks() {
+        let dir = tmpdir("ext4-blocks");
+        assert_eq!(ext4_extra_kib(&dir).unwrap(), 4);
+        std::fs::create_dir_all(dir.join("a/b")).unwrap();
+        std::fs::write(dir.join("file"), b"contents").unwrap();
+        symlink("a", dir.join("directory-link")).unwrap();
+        symlink("x".repeat(59), dir.join("inline-link")).unwrap();
+        assert_eq!(ext4_extra_kib(&dir).unwrap(), 12);
+        symlink("x".repeat(60), dir.join("block-link")).unwrap();
+        symlink("x".repeat(100), dir.join("a/b/long-link")).unwrap();
+        assert_eq!(ext4_extra_kib(&dir).unwrap(), 20);
     }
 
     #[test]
