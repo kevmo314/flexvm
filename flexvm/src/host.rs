@@ -2634,10 +2634,13 @@ pub fn check_name(name: &str) -> Result<()> {
 pub fn private_file(path: &Path) -> std::io::Result<File> {
     let f = File::options().create(true).truncate(false).read(true).write(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(path)?;
     let meta = f.metadata()?;
-    if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } {
-        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "lock file must be a regular file owned by this user"));
+    // One link only: never chmod an inode linked in from elsewhere (a user-owned checkpoint directory).
+    if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } || meta.nlink() != 1 {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "lock file must be a regular file owned by this user, with one link"));
     }
-    f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    if meta.mode() & 0o7777 != 0o600 {
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
     Ok(f)
 }
 
@@ -2906,6 +2909,17 @@ mod tests {
         drop(h.worker_flock().unwrap());
         assert_eq!(mode(&h.state.join("evict.worker.lock")), 0o600);
         drop(name);
+    }
+
+    #[test]
+    fn a_lock_linked_in_from_elsewhere_is_refused_and_left_alone() {
+        let root = crate::test_util::TempDir::new("linked-lock");
+        let (other, link) = (root.join("other"), root.join("x.lock"));
+        std::fs::write(&other, b"").unwrap();
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::hard_link(&other, &link).unwrap();
+        assert_eq!(private_file(&link).unwrap_err().kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(std::fs::metadata(&other).unwrap().permissions().mode() & 0o777, 0o644);
     }
 
     #[test]

@@ -138,7 +138,8 @@ STATE (default /var/lib/flexvm, on disk)
   templates/             built templates: NAME -> .gen/ID (see internals.md)
   images/                pulled container images: blobs/sha256/, rootfs/KEY.ext4 (see images.md)
   host.json              host config (`flexvm config`'s; listen is `flexvm listen`'s): listen, peers, vm_ips, underlay, announce_dev, dns, reserve_mib, evict_mib; unset ones are derived where used
-  run.json               canonical run path, bound on first open under the state root's flock; fsynced
+  run.json               canonical run path, bound on first open under `.lockdir/open`'s flock; fsynced
+  .lockdir/open          held while a root `Host::open` binds or repairs the root (0600 in a 0700 directory)
   lock                   the host lock (flock), held for short critical sections only
   .synced                the root's (dev, inode) once its directories were made durable (`Host::open`)
   addrs/IP               per address: newest generation seen, withdrawn?, lent generation, holder name, instance
@@ -189,6 +190,12 @@ RUN (default /run/flexvm, tmpfs)
                          process with its pid never shares it): `owner` (pid, start time), and per
                          Firecracker a directory with `fc` (its pid and start time)
 ```
+
+Every file flexvm flocks is 0600 and root's (`host::private_file`): Linux grants
+an exclusive flock through a read-only descriptor, so a lock any user can open
+is one any user can hold. Readable files and directories are never flocked; a
+non-root `flexvm ls` opens the state root without its lock and shows entries
+whose process is alive, without the lock's check.
 
 **Liveness** is the name lock: a registry entry whose `.lock` can be locked
 belongs to a dead process and is ignored; an entry is believed only for the

@@ -2249,7 +2249,7 @@ fn relieve(host: &Host, avail: Option<u64>, starved_here: bool, stopping: &mut O
     if (avail >= at && !evicting && !starved_here) || EVICTING.load(Ordering::SeqCst) {
         return;
     }
-    let Ok(lock) = std::fs::File::options().create(true).truncate(false).write(true).open(host.state.join("evict.lock")) else { return };
+    let Ok(lock) = crate::host::private_file(&host.state.join("evict.lock")) else { return };
     let Ok(lock) = crate::host::Flock::new(lock, libc::LOCK_EX | libc::LOCK_NB) else { return };
     let pressure = avail < until && (evicting || avail < at);
     if pressure && !evicting {
