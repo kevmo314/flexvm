@@ -117,11 +117,8 @@ impl Link {
         let (file, _) = read_at(dfd.as_raw_fd(), "pages", 0).map_err(|e| bad(format!("pages: {e}")))?;
         ensure!(file.metadata()?.len() == data * PAGE_SIZE as u64, "{}", bad("pages has the wrong length".into()));
         // This descriptor is dedicated to page data; metadata reads use separate files.
-        // Some filesystems reject O_DIRECT here; others reject it on the first read.
-        match direct(&file, true) {
-            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {}
-            r => r?,
-        }
+        // Some filesystems reject O_DIRECT here (reads stay buffered); others reject it on the first read.
+        let _ = direct(&file, true);
         Ok(Link { dir, manifest, id, vmstate, map, file: Some(file), sums })
     }
 }
@@ -180,7 +177,7 @@ impl Checkpoint {
         Ok(Checkpoint { dir, manifest, id, vmstate, runs, file: Arc::new(file), chain, chain_ids, meta_left })
     }
 
-    fn each_page(&self, mut f: impl FnMut(usize, &[u8])) -> Result<()> {
+    fn each_page(&self, drop_cache: bool, mut f: impl FnMut(usize, &[u8])) -> Result<()> {
         let mut storage = aligned(256)?;
         let buf = as_bytes(&mut storage);
         for &(first, count, state) in &self.runs {
@@ -191,7 +188,7 @@ impl Checkpoint {
                     continue;
                 }
                 let b = &mut buf[..n * PAGE_SIZE];
-                self.file.read(p, b)?;
+                self.file.read(p, b, drop_cache)?;
                 b.chunks(PAGE_SIZE).enumerate().for_each(|(i, page)| f(p + i, page));
             }
         }
@@ -199,7 +196,7 @@ impl Checkpoint {
     }
 
     pub fn verify_data(&self) -> Result<()> {
-        self.each_page(|_, _| {})
+        self.each_page(true, |_, _| {})
     }
 
     pub fn data_pages(&self) -> u64 {
@@ -208,7 +205,7 @@ impl Checkpoint {
 
     pub fn content_hash(&self, template: &Template) -> Result<String> {
         let mut canon = Canon::new(template);
-        self.each_page(|p, b| canon.page(p, b))?;
+        self.each_page(false, |p, b| canon.page(p, b))?;
         Ok(canon.finish())
     }
 }
@@ -263,9 +260,9 @@ fn corrupt(why: String) -> io::Error {
 }
 
 impl PageFile {
-    /// Reads whole pages into a page-aligned buffer.
+    /// Reads whole pages into a page-aligned buffer, evicting them after with `drop_cache` where reads are buffered.
     /// Errors are InvalidData, which the pager treats as fatal.
-    pub fn read(&self, page: usize, buf: &mut [u8]) -> io::Result<()> {
+    pub fn read(&self, page: usize, buf: &mut [u8], drop_cache: bool) -> io::Result<()> {
         let n = buf.len() / PAGE_SIZE;
         let mut done = 0;
         while done < n {
@@ -278,6 +275,9 @@ impl PageFile {
             let (k, d) = (((first + count - p) as usize).min(n - done), d + p - first);
             let (out, off, file) = (&mut buf[done * PAGE_SIZE..(done + k) * PAGE_SIZE], d * PAGE_SIZE as u64, &self.files[f]);
             read_with_fallback(file, || file.read_exact_at(out, off)).map_err(|e| corrupt(format!("read at {off}: {e}")))?;
+            if drop_cache && buffered(file) {
+                unsafe { libc::posix_fadvise(file.as_raw_fd(), off as i64, out.len() as i64, libc::POSIX_FADV_DONTNEED) };
+            }
             for (i, page) in out.chunks(PAGE_SIZE).enumerate() {
                 let d = d as usize + i;
                 if crc32c::page(page).0 != self.sums[f][d] {
@@ -288,6 +288,23 @@ impl PageFile {
         }
         Ok(())
     }
+
+    /// Whether any file is read through the page cache (its filesystem refused O_DIRECT).
+    pub fn buffered(&self) -> bool {
+        self.files.iter().any(buffered)
+    }
+
+    /// Evicts the files read through the page cache.
+    pub fn drop_cache(&self) {
+        for f in self.files.iter().filter(|f| buffered(f)) {
+            unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+        }
+    }
+}
+
+fn buffered(file: &File) -> bool {
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    flags & libc::O_DIRECT == 0
 }
 
 /// EINVAL can be reported on I/O even if enabling O_DIRECT succeeded (e.g. tmpfs).

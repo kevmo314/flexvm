@@ -32,11 +32,12 @@ impl Pager {
         let source = link.as_ref().map(|l| l.source.clone());
         for i in 0..FAULT_FETCHERS + PULL_THREADS {
             let (p, puller) = (self.clone(), i >= FAULT_FETCHERS);
-            // Reads directly from the checkpoint file or over a source connection of its own.
+            // Reads from the checkpoint file (directly, or evicting what it read for a puller where that is buffered) or
+            // over a source connection of its own.
             let mut fetch: Box<Fetch> = match (file.clone(), &source) {
-                (Some(file), _) => {
-                    Box::new(move |off, buf, _, _| file.read(off as usize / PAGE_SIZE, buf).map_err(|e| io::Error::new(e.kind(), FetchFailure::Checkpoint(e))))
-                }
+                (Some(file), _) => Box::new(move |off, buf, _, _| {
+                    file.read(off as usize / PAGE_SIZE, buf, puller).map_err(|e| io::Error::new(e.kind(), FetchFailure::Checkpoint(e)))
+                }),
                 (None, Some(source)) if puller => {
                     let mut link = Link::new(source.clone());
                     Box::new(move |off, buf, stop, progress| link.fetch_with(None, off, buf, stop, progress))
