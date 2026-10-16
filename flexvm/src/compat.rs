@@ -91,27 +91,10 @@ pub fn local(pid: u32) -> Result<Compat> {
     if let Some((_, c)) = cache.as_ref().filter(|(s, _)| *s == stamp) {
         return Ok(c.clone());
     }
-    let compat = local_record(&firecracker, stamp.clone(), crate::host::run_dir(), crate::host::boot_id(), supported_cpuid)?;
+    let (stamp, binary) = firecracker_id(&firecracker, crate::host::run_dir())?;
+    let compat = Compat::of_cpuid(&supported_cpuid()?, binary)?;
     *cache = Some((stamp, compat.clone()));
     Ok(compat)
-}
-
-/// KVM capabilities are local to this boot; RUN can live on a persistent filesystem.
-fn local_record(path: &Path, stamp: Stamp, run: Option<&Path>, boot: &str, cpuid: impl FnOnce() -> Result<Vec<[u32; 6]>>) -> Result<Compat> {
-    if let Some((_, _, record)) = run
-        .filter(|_| !boot.is_empty())
-        .and_then(|d| std::fs::read(d.join("compat.json")).ok())
-        .and_then(|b| serde_json::from_slice::<(Stamp, String, Compat)>(&b).ok())
-        .filter(|(s, b, _)| *s == stamp && b == boot)
-    {
-        return Ok(record);
-    }
-    let (stamp, binary) = firecracker_id(path, run)?;
-    let record = Compat::of_cpuid(&cpuid()?, binary)?;
-    if let Some(run) = run.filter(|_| !boot.is_empty()) {
-        let _ = crate::util::write_file(run, "compat.json", &serde_json::to_vec(&(stamp, boot, &record))?, false);
-    }
-    Ok(record)
 }
 
 /// Shared across VM processes; an unreadable cache is only a miss.
@@ -205,41 +188,6 @@ mod tests {
         assert_eq!(firecracker_id(&binary, Some(&root)).unwrap(), changed);
         assert_eq!(std::fs::read_to_string(calls).unwrap().lines().count(), 5);
         std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn local_record_is_cached_per_boot_and_binary_and_bad_caches_are_misses() {
-        let root = crate::test_util::TempDir::new("compat-record");
-        let path = root.join("binary");
-        std::fs::write(&path, b"one").unwrap();
-        let calls = std::cell::Cell::new(0);
-        let probe = |boot: &str| {
-            let stamp = Stamp::of(&std::fs::metadata(&path).unwrap());
-            // Keep this test independent of a real Firecracker or KVM.
-            std::fs::write(root.join("firecracker.json"), serde_json::to_vec(&(stamp.clone(), "version")).unwrap()).unwrap();
-            local_record(&path, stamp, Some(&root), boot, || {
-                calls.set(calls.get() + 1);
-                Ok(vec![[1, 0, 0, 0, 0, 0]])
-            })
-            .unwrap()
-        };
-        let first = probe("boot1");
-        assert_eq!(probe("boot1"), first);
-        assert_eq!(calls.get(), 1);
-        probe("boot2");
-        assert_eq!(calls.get(), 2);
-        std::fs::write(&path, b"longer").unwrap();
-        probe("boot2");
-        assert_eq!(calls.get(), 3);
-        std::fs::write(root.join("compat.json"), b"broken").unwrap();
-        probe("boot2");
-        assert_eq!(calls.get(), 4);
-        probe("");
-        probe("");
-        assert_eq!(calls.get(), 6, "an unknown boot cannot reuse KVM capabilities");
-        std::fs::remove_file(root.join("compat.json")).unwrap();
-        std::fs::create_dir(root.join("compat.json")).unwrap();
-        assert_eq!(probe("boot2"), first);
     }
 
     #[test]
