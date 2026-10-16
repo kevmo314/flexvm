@@ -373,7 +373,9 @@ impl Pages {
                 i += 1;
                 continue;
             }
-            let m = (i + 1..end).find(|&p| self.get(p) != INFLIGHT).unwrap_or(end) - i;
+            // Bound the copy while holding events: REMOVE and fault batches need its write lock.
+            let copy_end = end.min(i + 32);
+            let m = (i + 1..copy_end).find(|&p| self.get(p) != INFLIGHT).unwrap_or(copy_end) - i;
             let gen = self.read_gen.load(Ordering::SeqCst);
             match populate(i, m) {
                 Ok(done) => {
@@ -407,6 +409,48 @@ impl Pages {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn install_uses_full_capped_runs() {
+        let mut pages = Pages::new(513);
+        pages.fill(0, 513, REMOTE);
+        assert_eq!(pages.claim(0, 513, REMOTE, |_| true), 513);
+        let mut copies = Vec::new();
+        let (resolved, result) = pages.install(0, 513, REMOTE, None, |p, count| {
+            copies.push((p, count));
+            Ok(count)
+        });
+        result.unwrap();
+        assert_eq!(resolved, 513);
+        assert_eq!(copies, (0..513).step_by(32).map(|p| (p, (513 - p).min(32))).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn install_caps_copies_and_settles_partial_and_discarded_pages() {
+        for n in [1, 31, 32, 33, 256, 512] {
+            let mut pages = Pages::new(n);
+            pages.fill(0, n, REMOTE);
+            assert_eq!(pages.claim(0, n, REMOTE, |_| true), n);
+            {
+                let removing = pages.removing();
+                pages.discard(&removing, n / 2);
+            }
+            let mut copied = 0;
+            let (resolved, result) = pages.install(0, n, REMOTE, None, |p, count| {
+                assert!((1..=32).contains(&count));
+                assert!(!(p..p + count).contains(&(n / 2)));
+                let done = count.min(17);
+                copied += done;
+                Ok(done)
+            });
+            result.unwrap();
+            assert_eq!(resolved, n);
+            assert_eq!(copied, n - 1);
+            for p in 0..n {
+                assert_eq!(pages.get(p), if p == n / 2 { ZERO } else { PRESENT });
+            }
+        }
+    }
 
     #[test]
     fn present_publishes_dirty() {

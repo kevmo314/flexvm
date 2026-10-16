@@ -1,5 +1,6 @@
 use super::event::{FETCH, FIRST, QUEUED};
 use super::{os, Pager, Pages, Source, FAULT_TIMEOUT, PAGE_SIZE, REMOTE, REMOTE_FAULT_RUN};
+use crate::checkpoint::{aligned, as_bytes};
 use std::collections::VecDeque;
 use std::io::{self, IoSliceMut, Read, Write};
 use std::net::TcpStream;
@@ -133,7 +134,11 @@ impl Pager {
     /// Fetches and installs the runs faults claimed (`lane`), so that the event thread never waits for the network or
     /// disk. The faulting thread is woken by the copy, the event thread by the pages settling.
     pub(super) fn fetch_faults(&self, lane: &Lane, fetch: &mut Fetch) {
-        let mut buf = vec![0u8; REMOTE_FAULT_RUN * PAGE_SIZE];
+        let mut storage = match aligned(REMOTE_FAULT_RUN) {
+            Ok(buf) => buf,
+            Err(e) => return self.fail(format!("allocating fault fetch buffer: {e}")),
+        };
+        let buf = as_bytes(&mut storage);
         let pages = self.pages();
         // Connects ahead of the first fault (nothing to read).
         if let Err(e) = fetch(0, &mut [], &self.stop, &mut |_| true) {
@@ -185,7 +190,7 @@ impl Pager {
             };
             let mut first = true;
             let stuck = *self.stuck_from.lock().unwrap();
-            let res = self.install_claimed(page, n, &mut buf, &mut fetch, |p, c, src| {
+            let res = self.install_claimed(page, n, buf, &mut fetch, |p, c, src| {
                 if tail_fail && p != page && self.tail_fail.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |k| k.checked_sub(1)).is_ok() {
                     return Err(os(libc::ENOMEM));
                 }

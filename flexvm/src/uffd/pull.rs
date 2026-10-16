@@ -1,7 +1,7 @@
 use super::event::PULL;
 use super::fetch::{Failed, Fetch, FetchFailure, Link};
 use super::{os, Pager, ALL, FAULT_FETCHERS, PAGE_SIZE, PULL_RUN, REMOTE};
-use crate::checkpoint::PageFile;
+use crate::checkpoint::{aligned, as_bytes, PageFile};
 use std::io;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -32,12 +32,11 @@ impl Pager {
         let source = link.as_ref().map(|l| l.source.clone());
         for i in 0..FAULT_FETCHERS + PULL_THREADS {
             let (p, puller) = (self.clone(), i >= FAULT_FETCHERS);
-            // Reads from the checkpoint file (evicting what it read, for a puller) or over a source connection of its
-            // own.
+            // Reads directly from the checkpoint file or over a source connection of its own.
             let mut fetch: Box<Fetch> = match (file.clone(), &source) {
-                (Some(file), _) => Box::new(move |off, buf, _, _| {
-                    file.read(off as usize / PAGE_SIZE, buf, puller).map_err(|e| io::Error::new(e.kind(), FetchFailure::Checkpoint(e)))
-                }),
+                (Some(file), _) => {
+                    Box::new(move |off, buf, _, _| file.read(off as usize / PAGE_SIZE, buf).map_err(|e| io::Error::new(e.kind(), FetchFailure::Checkpoint(e))))
+                }
                 (None, Some(source)) if puller => {
                     let mut link = Link::new(source.clone());
                     Box::new(move |off, buf, stop, progress| link.fetch_with(None, off, buf, stop, progress))
@@ -69,7 +68,11 @@ impl Pager {
         // them soonest.
         let first = self.chunks(self.working_set(t, PULL_THREADS).filter(|_| file.is_some()), PULL_RUN);
         let all = self.chunks(ALL, PULL_RUN).skip(t).step_by(PULL_THREADS);
-        let mut buf = vec![0u8; PULL_RUN * PAGE_SIZE];
+        let mut storage = match aligned(PULL_RUN) {
+            Ok(buf) => buf,
+            Err(e) => return self.fail(format!("allocating background pull buffer: {e}")),
+        };
+        let buf = as_bytes(&mut storage);
         for (i, end) in first.chain(all) {
             if !self.pulling() {
                 break;
@@ -77,11 +80,11 @@ impl Pager {
             // At most `STEER_BURST` runs before each of its own, so faults that keep coming never hold the rest of the
             // pull back for long.
             for (a, b) in std::iter::from_fn(|| self.steered()).take(STEER_BURST) {
-                if !self.pull_range(t, a, b, &mut buf, fetch) {
+                if !self.pull_range(t, a, b, buf, fetch) {
                     return;
                 }
             }
-            if !self.pull_range(t, i, end, &mut buf, fetch) {
+            if !self.pull_range(t, i, end, buf, fetch) {
                 return;
             }
         }
