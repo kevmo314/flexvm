@@ -415,8 +415,54 @@ pub fn run_dir() -> Option<&'static Path> {
     RUN_DIR.get().map(PathBuf::as_path)
 }
 
+fn unwritable(e: &std::io::Error) -> bool {
+    matches!(e.kind(), std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem)
+}
+
+/// Binds the run directory to one canonical state path in `RUN/state.json` (gone on reboot, as
+/// `STATE/run.json` still binds that side). Two state roots hold different flocks, so the first
+/// write is a hard link of a whole file, which only one of them can make; both then read the winner.
+/// A user who cannot write the run directory leaves it unbound.
+fn claim_run(state: &Path, run: &Path) -> Result<()> {
+    let owner = run.join("state.json");
+    let refuse = |saved: &Path| -> Result<()> {
+        bail!(
+            "run directory {} belongs to state directory {}; refusing --state {} (with no VM running, remove {} to rebind)",
+            run.display(),
+            saved.display(),
+            state.display(),
+            owner.display()
+        )
+    };
+    let check = |bytes: Vec<u8>| -> Result<()> {
+        let saved: PathBuf = serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", owner.display()))?;
+        if saved != state {
+            refuse(&saved)
+        } else {
+            Ok(())
+        }
+    };
+    match std::fs::read(&owner) {
+        Ok(bytes) => return check(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => bail!("{}: {e}", owner.display()),
+    }
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = run.join(format!(".state.json.{}-{n}.tmp", std::process::id()));
+    let made = std::fs::write(&tmp, serde_json::to_vec(state)?).and_then(|()| std::fs::hard_link(&tmp, &owner));
+    let _ = std::fs::remove_file(&tmp);
+    match made {
+        Ok(()) => Ok(()),
+        Err(e) if unwritable(&e) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => check(std::fs::read(&owner).map_err(|e| format!("{}: {e}", owner.display()))?),
+        Err(e) => bail!("{}: {e}", owner.display()),
+    }
+}
+
 impl Host {
-    /// Binds each state root to one canonical run path on first open, under the root's flock.
+    /// Binds each state root to one canonical run path on first open, under the root's flock,
+    /// and the run directory to that state root (`claim_run`).
     /// Synced up to `/` once per state root, not per command: under the root's flock, `.synced` names the
     /// root (dev, inode), so a copy syncs again; it goes before a repair and comes back after the syncs.
     pub fn open(state: &Path, run: &Path) -> Result<Host> {
@@ -444,7 +490,7 @@ impl Host {
         let canon = |d: &Path| d.canonicalize().map_err(|e| named(d, e));
         let (state, run) = (canon(state)?, canon(run)?);
         let binding = state.join("run.json");
-        match std::fs::read(&binding) {
+        let bound = match std::fs::read(&binding) {
             Ok(bytes) => {
                 let saved: PathBuf = serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", binding.display()))?;
                 if saved != run {
@@ -456,13 +502,18 @@ impl Host {
                         binding.display()
                     );
                 }
+                true
             }
-            // A user who cannot write the state root (a non-root `flexvm ls` of an unbound one) leaves it unbound.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => match crate::util::write_file(&state, "run.json", &serde_json::to_vec(&run)?, true) {
-                Err(e) if matches!(e.kind(), std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem) => {}
-                r => r.map_err(|e| format!("{}: {e}", binding.display()))?,
-            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
             Err(e) => bail!("{}: {e}", binding.display()),
+        };
+        claim_run(&state, &run)?;
+        // A user who cannot write the state root (a non-root `flexvm ls` of an unbound one) leaves it unbound.
+        if !bound {
+            match crate::util::write_file(&state, "run.json", &serde_json::to_vec(&run)?, true) {
+                Err(e) if unwritable(&e) => {}
+                r => r.map_err(|e| format!("{}: {e}", binding.display()))?,
+            }
         }
         let _ = RUN_DIR.set(run.clone());
         let cfg_stamp = stamp(&state.join("host.json"));
@@ -2526,6 +2577,45 @@ mod tests {
     }
 
     #[test]
+    fn run_directory_belongs_to_one_state() {
+        let (base, h) = host("run-owner");
+        let other = base.join("other-state");
+        let e = Host::open(&other, &h.run).err().unwrap().to_string();
+        assert!(
+            e.contains("belongs to state directory")
+                && e.contains(h.run.to_str().unwrap())
+                && e.contains(h.state.to_str().unwrap())
+                && e.contains(other.to_str().unwrap())
+                && e.contains("state.json to rebind"),
+            "{e}"
+        );
+        // The refused state is not bound to the run directory it was refused.
+        assert!(!other.join("run.json").exists());
+        // Once the owner is gone (a reboot empties tmpfs), STATE/run.json still binds the first state.
+        std::fs::remove_file(h.run.join("state.json")).unwrap();
+        Host::open(&h.state, &h.run).unwrap();
+        assert!(Host::open(&other, &h.run).is_err());
+    }
+
+    #[test]
+    fn racing_states_claim_a_run_directory_once() {
+        let base = crate::test_util::TempDir::new("host-run-race");
+        let run = base.join("run");
+        std::fs::create_dir(&run).unwrap();
+        let opened: Vec<bool> = std::thread::scope(|s| {
+            let opens: Vec<_> = (0..8)
+                .map(|i| {
+                    let (state, run) = (base.join(format!("state{i}")), run.clone());
+                    s.spawn(move || Host::open(&state, &run).is_ok())
+                })
+                .collect();
+            opens.into_iter().map(|t| t.join().unwrap()).collect()
+        });
+        assert_eq!(opened.iter().filter(|o| **o).count(), 1, "{opened:?}");
+        assert!(std::fs::read_dir(&run).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().ends_with(".tmp")));
+    }
+
+    #[test]
     fn invalid_run_binding_is_not_replaced() {
         let (_base, h) = host("run-binding-invalid");
         let binding = h.state.join("run.json");
@@ -2551,6 +2641,14 @@ mod tests {
         mode(0o755);
         result.unwrap();
         assert!(!binding.exists());
+        // Likewise a run directory it cannot write.
+        std::fs::remove_file(h.run.join("state.json")).unwrap();
+        let mode = |m| std::fs::set_permissions(&h.run, std::fs::Permissions::from_mode(m)).unwrap();
+        mode(0o555);
+        let result = Host::open(&h.state, &h.run);
+        mode(0o755);
+        result.unwrap();
+        assert!(!h.run.join("state.json").exists());
     }
 
     #[test]

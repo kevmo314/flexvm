@@ -283,7 +283,8 @@ hold no secrets at startup. Details: [docs/images.md](docs/images.md).
 for another). Several hosts on one machine (tests, benchmarks) each take a `--state` and
 `--run` of their own; their `artifacts` and `templates` can be symlinks to one
 host's. On first open, each state directory permanently records its canonical run
-path in `run.json`; using that state with a different `--run` is refused.
+path in `run.json`, and the run directory records its state in `state.json`; using
+either with a different partner is refused.
 `FLEXVM_FAULTS=1` enables test fault injection only. The state layout is in
 [docs/process-per-vm.md](docs/process-per-vm.md#on-disk-state).
 
