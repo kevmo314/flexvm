@@ -4003,6 +4003,68 @@ def arrival_bind_fail():
     check("arrival bound: migration fenced as aborted", st["outcome"] == "aborted", st)
 
 
+def back_to_back():
+    """#611: migrations A->B->A, each started the moment the last returned (its source may still be
+    leaving, its arrival still pulling). Whenever a host's registry says the VM runs there, its control
+    socket is there: no holder's cleanup unlinks another's, and no CLI finds it missing. A refusal while
+    the last copy still holds the name is retried; none fails for a missing socket."""
+    n, rounds = "ft-b2b", 12
+    m = setup(n, mib=20)
+    stop, missing, errors = threading.Event(), [], []
+
+    def entry(h):
+        with suppress(OSError, ValueError):
+            with open(os.path.join(h.run, "vms", f"{n}.json")) as f:
+                return json.load(f)
+
+    def watch():
+        # Its json is unlinked before its socket as a holder lets go (`NameLock`): the same entry
+        # read after the socket was missing means the holder had not let go when it was.
+        while not stop.is_set():
+            for h in (A, B):
+                e = entry(h)
+                if not e or e.get("state") != "running":
+                    continue
+                there = os.path.exists(os.path.join(h.run, "vms", f"{n}.sock"))
+                if not there and entry(h) == e and alive(e["pid"]):
+                    missing.append((h.addr, e["pid"], e.get("gen")))
+            time.sleep(0.002)
+
+    def move(src, dst):
+        end = time.time() + 60
+        while True:
+            r = migrate(src, n, dst)
+            if r["ok"] or time.time() > end or not re.search(r"taken|busy|leaving|still|exists|pulling|retry", r["error"]):
+                return r
+            errors.append(r["error"])
+            time.sleep(0.05)
+
+    t = start_thread(target=watch, daemon=True)
+    results = []
+    try:
+        for _ in range(rounds):
+            for src, dst in ((A, B), (B, A)):
+                r = move(src, dst)
+                results.append(r)
+                if not r["ok"]:
+                    break
+            if not results[-1]["ok"]:
+                break
+    finally:
+        stop.set()
+        t.join(10)
+    failed = [r["error"] for r in results if not r["ok"]]
+    check("back to back: every migration done", len(results) == 2 * rounds and not failed, failed)
+    check("back to back: none found a socket missing", not any(re.search(r"No such file|ENOENT|socket is unavailable", e) for e in failed + errors), errors[-5:])
+    check("back to back: a running holder's socket was always there", not missing, missing[:5])
+    wait_released(A, n)
+    check("back to back: running on A only", where(n) == {A: "running"}, where(n))
+    check("back to back: socket there on A, none on B", os.path.exists(os.path.join(A.run, "vms", f"{n}.sock"))
+          and not os.path.exists(os.path.join(B.run, "vms", f"{n}.sock")))
+    check("back to back: md5 intact", md5(A, n) == m)
+    print(f"  back to back: {len(errors)} refusals retried: {sorted(set(re.sub(r'[0-9]+', 'N', e)[:120] for e in errors))[:4]}", flush=True)
+
+
 def app_abort():
     """#569: an image VM's app output goes on after a migration aborted once its source
     left (the target refuses a bad preload page, `bad_preload`), none lost or repeated."""
@@ -9170,7 +9232,7 @@ SCENARIOS = dict(
     collapse_abort=collapse_abort, collapse_ckpt_fail=collapse_ckpt_fail, ckpt_paused_backlog=ckpt_paused_backlog, same_host_order=same_host_order, same_host_slow_route=same_host_slow_route, same_host_flood=same_host_flood, same_host_late_handover=same_host_late_handover, same_host_hold_route_fail=same_host_hold_route_fail, same_host_backlog=same_host_backlog, same_host_bulk_tcp=same_host_bulk_tcp, ckpt_backlog=ckpt_backlog, rx_stall=rx_stall, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,
     handoff_superseded=handoff_superseded, delayed_announce=delayed_announce, delayed_announce_handoff=delayed_announce_handoff, announce_arp_timer=announce_arp_timer,
     prepare_fail_announce=prepare_fail_announce, reconcile_announce=reconcile_announce, reconcile_kill=reconcile_kill, resume_pull_lock=resume_pull_lock, page_conns=page_conns, suspend_cmd=suspend_cmd, suspend_slow_cmd=suspend_slow_cmd, suspend_overlap=suspend_overlap, fc_died_busy=fc_died_busy, pause_cmd_start=pause_cmd_start, suspend_died=suspend_died,
-    kill_prepare=kill_prepare, resume_migrating=resume_migrating, resume_bind_fail=resume_bind_fail, arrival_bind_fail=arrival_bind_fail, app_abort=app_abort,
+    kill_prepare=kill_prepare, resume_migrating=resume_migrating, resume_bind_fail=resume_bind_fail, arrival_bind_fail=arrival_bind_fail, back_to_back=back_to_back, app_abort=app_abort,
     ctrl_z_long_op=ctrl_z_long_op, resume_suspending=resume_suspending, quit_status=quit_status, resume_outcome=resume_outcome, exec_recovery_instance=exec_recovery_instance,
     ckpt_ancestor_corrupt=ckpt_ancestor_corrupt, resume_listener_restart=resume_listener_restart,
     resume_killed_marked=resume_killed_marked, restore_route_fence=restore_route_fence, reboot=reboot)
