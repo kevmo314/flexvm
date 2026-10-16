@@ -1,6 +1,7 @@
 //! A minimal OCI distribution (registry v2) client.
 
-use std::io::Read;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -10,7 +11,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver};
-use ureq::unversioned::transport::{Buffers, ConnectionDetails, Connector, NextTimeout, RustlsConnector, TcpConnector, Transport};
+use ureq::unversioned::transport::{Buffers, ConnectionDetails, Connector, LazyBuffers, NextTimeout, RustlsConnector, Transport};
 use ureq::Timeout;
 
 use super::reference::Reference;
@@ -33,11 +34,14 @@ fn deadline(size: u64) -> Instant {
     Instant::now() + TRANSFER_BASE + Duration::from_secs(size / MIN_RATE)
 }
 
+/// Where the last connection an agent opened went: its socket's peer, as connected.
+type Peer = Arc<Mutex<Option<SocketAddr>>>;
+
 /// An agent for one transfer: DNS, connect, the TLS handshake and every read and write obey the transfer's deadline
-/// (ureq holds each handshake read, not the handshake, to its connect timeout), and its connections are never pooled
-/// into another transfer. With `public_only`, it connects only to public addresses (as resolved, so DNS cannot
-/// rebind it elsewhere).
-fn agent(deadline: Instant, public_only: bool) -> ureq::Agent {
+/// (ureq holds each handshake read, not the handshake, to its connect timeout), and its connections are never pooled,
+/// into another transfer or another request of this one: each request opens its own, and records its peer in `peer`.
+/// With `public_only`, it connects only to public addresses (as resolved, so DNS cannot rebind it elsewhere).
+fn agent(deadline: Instant, public_only: bool, peer: Peer) -> ureq::Agent {
     let config = ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(30)))
         .user_agent(concat!("flexvm/", env!("CARGO_PKG_VERSION")))
@@ -46,8 +50,10 @@ fn agent(deadline: Instant, public_only: bool) -> ureq::Agent {
         .max_redirects_will_error(false)
         .http_status_as_error(false)
         .proxy(None)
+        .max_idle_connections(0)
+        .max_idle_connections_per_host(0)
         .build();
-    let connector = TcpConnector::default().chain(DeadlineConnector(deadline)).chain(RustlsConnector::default());
+    let connector = PeerConnector(peer).chain(DeadlineConnector(deadline)).chain(RustlsConnector::default());
     ureq::Agent::with_parts(config, connector, DeadlineResolver { deadline, public_only })
 }
 
@@ -65,6 +71,12 @@ impl Resolver for DeadlineResolver {
         let (Some(scheme), Some(authority)) = (uri.scheme(), uri.authority()) else { return Err(ureq::Error::HostNotFound) };
         let addr = DefaultResolver::host_and_port(scheme, authority).ok_or(ureq::Error::HostNotFound)?;
         let mut addrs = self.empty();
+        #[cfg(test)]
+        let found = match tests::fake_dns(&addr) {
+            Some(found) => found,
+            None => crate::util::resolve(&addr, self.deadline)?,
+        };
+        #[cfg(not(test))]
         let found = crate::util::resolve(&addr, self.deadline)?;
         for a in reachable(&found, self.public_only).take(16) {
             addrs.push(a);
@@ -87,6 +99,10 @@ fn reachable(found: &[std::net::SocketAddr], public_only: bool) -> impl Iterator
 /// Not loopback, link-local, private (RFC 1918, unique local, shared CGNAT space), unspecified, broadcast or multicast.
 fn is_public(ip: std::net::IpAddr) -> bool {
     use std::net::IpAddr;
+    #[cfg(test)]
+    if tests::PRETEND_PUBLIC.lock().unwrap().contains(&ip) {
+        return true;
+    }
     match ip {
         IpAddr::V4(v4) => {
             let [a, b, ..] = v4.octets();
@@ -101,6 +117,89 @@ fn is_public(ip: std::net::IpAddr) -> bool {
                 !(v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() || s0 & 0xfe00 == 0xfc00 || s0 & 0xffc0 == 0xfe80)
             }
         },
+    }
+}
+
+/// Connects as ureq's `TcpConnector` does, trying each resolved address in turn, and records the connected socket's
+/// peer: the address the answer to this request comes from (whatever else DNS answered).
+#[derive(Debug)]
+struct PeerConnector(Peer);
+
+impl Connector<()> for PeerConnector {
+    type Out = PeerTcp;
+
+    fn connect(&self, details: &ConnectionDetails, _: Option<()>) -> std::result::Result<Option<PeerTcp>, ureq::Error> {
+        use std::io::ErrorKind::*;
+        let (start, budget, n) = (Instant::now(), details.timeout.not_zero().map(|t| *t), details.addrs.len());
+        let mut last = None;
+        for (i, addr) in details.addrs.iter().enumerate() {
+            // Every address but the last gets half the time left, so one that never answers leaves time for the rest.
+            let per = budget.map(|b| {
+                let left = b.saturating_sub(start.elapsed());
+                if i + 1 < n { left / 2 } else { left }.max(Duration::from_millis(10))
+            });
+            match per.map_or_else(|| TcpStream::connect(addr), |t| TcpStream::connect_timeout(addr, t)) {
+                Ok(stream) => {
+                    stream.set_nodelay(details.config.no_delay())?;
+                    *self.0.lock().unwrap() = Some(stream.peer_addr()?);
+                    let buffers = LazyBuffers::new(details.config.input_buffer_size(), details.config.output_buffer_size());
+                    return Ok(Some(PeerTcp { stream, buffers }));
+                }
+                Err(e) if matches!(e.kind(), ConnectionRefused | HostUnreachable | NetworkUnreachable | AddrNotAvailable | TimedOut | WouldBlock) => {
+                    last = Some(e)
+                }
+                Err(e) => return Err(e.into()),
+            }
+            if budget.is_some_and(|b| start.elapsed() >= b) {
+                break;
+            }
+        }
+        Err(match last {
+            Some(e) if matches!(e.kind(), TimedOut | WouldBlock) => ureq::Error::Timeout(details.timeout.reason),
+            Some(e) => e.into(),
+            None => ureq::Error::HostNotFound,
+        })
+    }
+}
+
+/// A plain TCP connection (ureq's own is not nameable outside it).
+#[derive(Debug)]
+struct PeerTcp {
+    stream: TcpStream,
+    buffers: LazyBuffers,
+}
+
+fn io_error(e: std::io::Error, timeout: NextTimeout) -> ureq::Error {
+    match e.kind() {
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => ureq::Error::Timeout(timeout.reason),
+        _ => e.into(),
+    }
+}
+
+impl Transport for PeerTcp {
+    fn buffers(&mut self) -> &mut dyn Buffers {
+        &mut self.buffers
+    }
+
+    fn transmit_output(&mut self, amount: usize, timeout: NextTimeout) -> std::result::Result<(), ureq::Error> {
+        self.stream.set_write_timeout(timeout.not_zero().map(|t| *t))?;
+        self.stream.write_all(&self.buffers.output()[..amount]).map_err(|e| io_error(e, timeout))
+    }
+
+    fn await_input(&mut self, timeout: NextTimeout) -> std::result::Result<bool, ureq::Error> {
+        self.stream.set_read_timeout(timeout.not_zero().map(|t| *t))?;
+        let n = self.stream.read(self.buffers.input_append_buf()).map_err(|e| io_error(e, timeout))?;
+        self.buffers.input_appended(n);
+        Ok(n > 0)
+    }
+
+    /// Open while nothing is waiting to be read and the peer has not hung up.
+    fn is_open(&mut self) -> bool {
+        if self.stream.set_nonblocking(true).is_err() {
+            return false;
+        }
+        let idle = matches!(self.stream.read(&mut [0]), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock);
+        self.stream.set_nonblocking(false).is_ok() && idle
     }
 }
 
@@ -217,9 +316,18 @@ fn backoff(n: u32) -> Duration {
     Duration::from_secs(1u64 << n.min(5)).min(Duration::from_secs(30))
 }
 
+/// The longest wait a `Retry-After` gets: a registry asking for more is asked again after this.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(120);
+
+/// The wait before retry `n`: `retry_after` in seconds, at most `MAX_RETRY_AFTER`, or else (also for an HTTP date,
+/// which is rare) `backoff`.
+fn retry_wait(retry_after: Option<&str>, n: u32) -> Duration {
+    retry_after.and_then(|v| v.trim().parse().ok()).map_or(backoff(n), |s| Duration::from_secs(s).min(MAX_RETRY_AFTER))
+}
+
 /// `req` sent, and sent again after a 429 or 503 (a rate limit, or a registry briefly unavailable) up to `MAX_RETRIES`
-/// times: after its `Retry-After` in seconds, or else `backoff`, and only while that wait ends before `deadline`. The
-/// last answer is returned whatever its status.
+/// times: after `retry_wait`, and only while that wait ends before `deadline`. The last answer is returned whatever its
+/// status.
 fn call(
     what: &str,
     deadline: Instant,
@@ -235,9 +343,7 @@ fn call(
         if !matches!(code, 429 | 503) || retries == MAX_RETRIES {
             return Ok(resp);
         }
-        // An HTTP date (rare) gets the backoff.
-        let after = resp.headers().get("retry-after").and_then(|v| v.to_str().ok()?.trim().parse().ok());
-        let wait = after.map_or(backoff(retries), Duration::from_secs);
+        let wait = retry_wait(resp.headers().get("retry-after").and_then(|v| v.to_str().ok()), retries);
         if wait >= deadline.saturating_duration_since(Instant::now()) {
             bail!("{what}: HTTP {code}, and a retry in {} s would pass the transfer deadline", wait.as_secs());
         }
@@ -247,9 +353,50 @@ fn call(
     unreachable!()
 }
 
+/// A `WWW-Authenticate` challenge's scheme and auth-params (RFC 9110 section 11.2), their names lowercased; a quoted
+/// value may hold commas, and backslash-escaped quotes. Anything not `name=value` (a token68) is skipped.
+fn parse_challenge(challenge: &str) -> (&str, Vec<(String, String)>) {
+    let challenge = challenge.trim();
+    let (scheme, mut rest) = challenge.split_once(|c: char| c.is_ascii_whitespace()).unwrap_or((challenge, ""));
+    let mut params = Vec::new();
+    loop {
+        rest = rest.trim_start_matches(|c: char| c == ',' || c.is_ascii_whitespace());
+        let Some(i) = rest.find(['=', ',']) else { break };
+        if rest.as_bytes()[i] == b',' {
+            rest = &rest[i..];
+            continue;
+        }
+        let name = rest[..i].trim().to_ascii_lowercase();
+        rest = rest[i + 1..].trim_start();
+        let mut value = String::new();
+        if let Some(quoted) = rest.strip_prefix('"') {
+            let (mut chars, mut end) = (quoted.char_indices(), quoted.len());
+            while let Some((i, c)) = chars.next() {
+                match c {
+                    '\\' => value.extend(chars.next().map(|(_, c)| c)),
+                    '"' => {
+                        end = i + 1;
+                        break;
+                    }
+                    c => value.push(c),
+                }
+            }
+            rest = &quoted[end..];
+        } else {
+            let end = rest.find(',').unwrap_or(rest.len());
+            value = rest[..end].trim().to_string();
+            rest = &rest[end..];
+        }
+        params.push((name, value));
+    }
+    (scheme, params)
+}
+
 /// Shared by all of an image's layers (`Arc`), its token with them.
 pub struct Registry {
     pub r: Reference,
+    /// `r.base_url()` (tests point it elsewhere).
+    base: String,
     /// base64 `user:password` from the Docker config.
     basic: Option<String>,
     auth: Mutex<Option<Arc<str>>>,
@@ -258,8 +405,9 @@ pub struct Registry {
 impl Registry {
     pub fn new(r: Reference) -> Registry {
         // Credentials only ever travel over TLS.
-        let basic = if r.base_url().starts_with("https://") { docker_credentials(&r.registry) } else { None };
-        Registry { r, basic, auth: Mutex::new(None) }
+        let base = r.base_url();
+        let basic = if base.starts_with("https://") { docker_credentials(&r.registry) } else { None };
+        Registry { r, base, basic, auth: Mutex::new(None) }
     }
 
     /// Credentials go only over HTTPS to the registry itself or its well-known token service.
@@ -277,15 +425,20 @@ impl Registry {
         }
     }
 
-    /// Authenticates on a 401 and retries once; redirects (blob storage) are followed without credentials.
+    /// Authenticates on a 401 and retries once; redirects (blob storage) are followed without credentials, and, as
+    /// the token service is, only to public addresses unless the registry is local.
     fn get(&self, path: &str, accept: &str, deadline: Instant) -> Result<ureq::Body> {
-        let base = format!("{}/{path}", self.r.base_url());
+        let base = format!("{}/{path}", self.base);
         let (mut url, mut redirects, mut authenticated) = (base.clone(), 0, false);
-        let agent = agent(deadline, false);
+        let peer = Peer::default();
+        // The registry itself may be anywhere: it is what the image reference names.
+        let registry = agent(deadline, false, peer.clone());
+        let (mut local, mut hops) = (self.local(), None);
         loop {
             let auth = if redirects == 0 { self.auth.lock().unwrap().clone() } else { None };
+            let client = if redirects == 0 { &registry } else { hops.get_or_insert_with(|| agent(deadline, !local, Peer::default())) };
             let resp = call(&format!("GET {url}"), deadline, |left| {
-                let mut req = agent.get(&url).config().timeout_global(Some(left)).build();
+                let mut req = client.get(&url).config().timeout_global(Some(left)).build();
                 if redirects == 0 {
                     req = req.header("Accept", accept);
                 }
@@ -294,10 +447,24 @@ impl Registry {
                 }
                 req
             })?;
+            if redirects == 0 {
+                // The registry is local, and may send this host to its own networks, if it is written as a local
+                // address or this answer came over a connection to one. Its DNS cannot make that so from outside: a
+                // name answering with a private address sends flexvm to that host, whose answer (the realm or the
+                // redirect included) the name's owner does not write; and what counts is the peer of the socket the
+                // answer came over (never pooled, so this request's own), not any address DNS also answered.
+                local = self.local() || peer.lock().unwrap().take().is_some_and(|p| !is_public(p.ip()));
+            }
             let header = |name: &str| resp.headers().get(name).and_then(|v| v.to_str().ok());
             match resp.status().as_u16() {
                 300..=399 => {
-                    let loc = header("location").ok_or("redirect without a location")?;
+                    let loc = match resp.headers().get("location") {
+                        None => bail!("GET {url}: redirect without a location"),
+                        Some(v) => match v.to_str() {
+                            Ok(loc) => loc,
+                            Err(_) => bail!("GET {url}: redirect to a location that is not ASCII: {:?}", String::from_utf8_lossy(v.as_bytes())),
+                        },
+                    };
                     url = resolve_location(&url, loc)?;
                     if base.starts_with("https://") && !url.starts_with("https://") {
                         bail!("refusing a redirect from HTTPS to {url}");
@@ -310,7 +477,7 @@ impl Registry {
                 ..=299 => return Ok(resp.into_body()),
                 401 if !authenticated && redirects == 0 => {
                     let challenge = header("www-authenticate").unwrap_or("").to_string();
-                    self.authenticate(&challenge, deadline)?;
+                    self.authenticate(&challenge, deadline, local)?;
                     authenticated = true;
                 }
                 401 if redirects == 0 => {
@@ -325,17 +492,17 @@ impl Registry {
         }
     }
 
-    /// Whether the image reference names a local registry: `localhost`, or a loopback, link-local or private address
-    /// as written (never as resolved: DNS could answer otherwise for the registry than for its token realm). Its token
-    /// service may be local too.
+    /// Whether the image reference names a local registry as written: `localhost`, or a loopback, link-local or
+    /// private address. (`get` also finds one local by the address it answers from.)
     fn local(&self) -> bool {
-        let host = self.r.registry.strip_prefix('[').and_then(|h| h.split(']').next());
-        let host = host.unwrap_or_else(|| self.r.registry.split(':').next().unwrap_or(""));
+        let host = self.r.host();
         host.eq_ignore_ascii_case("localhost") || host.parse().is_ok_and(|ip| !is_public(ip))
     }
 
-    fn authenticate(&self, challenge: &str, deadline: Instant) -> Result<()> {
-        let (scheme, params) = challenge.split_once(' ').unwrap_or((challenge, ""));
+    /// Answers `challenge` for a registry that is `local` or not: a local registry's token service may be anywhere,
+    /// any other's must be HTTPS on a public address.
+    fn authenticate(&self, challenge: &str, deadline: Instant, local: bool) -> Result<()> {
+        let (scheme, params) = parse_challenge(challenge);
         if scheme.eq_ignore_ascii_case("basic") {
             let Some(b) = &self.basic else { bail!("{} wants basic credentials; none found", self.r.registry) };
             *self.auth.lock().unwrap() = Some(format!("Basic {b}").into());
@@ -344,19 +511,14 @@ impl Registry {
         if !scheme.eq_ignore_ascii_case("bearer") {
             bail!("{}: unsupported auth challenge {challenge:?}", self.r.registry);
         }
-        let param = |name: &str| {
-            params.split(',').find_map(|kv| {
-                let (k, v) = kv.trim().split_once('=')?;
-                (k.trim() == name).then(|| v.trim().trim_matches('"').to_string())
-            })
-        };
+        let param = |name: &str| params.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone());
         let realm = param("realm").ok_or("auth challenge has no realm")?;
         // The registry names where to fetch: never down from HTTPS, nor into this host's own networks (its loopback
         // or metadata services) unless the registry is there itself.
-        if self.r.base_url().starts_with("https://") && !realm.starts_with("https://") {
+        if (self.base.starts_with("https://") || !local) && !realm.starts_with("https://") {
             bail!("{}: refusing token realm {realm}: not HTTPS", self.r.registry);
         }
-        let agent = agent(deadline, !self.local());
+        let agent = agent(deadline, !local, Peer::default());
         let creds = match &self.basic {
             Some(b) if self.trusted(&realm) => Some(format!("Basic {b}")),
             // Anywhere else gets an anonymous token request.
@@ -533,9 +695,153 @@ pub(super) mod tests {
         ALLOCATED.with(|n| n.get())
     }
 
+    /// Addresses `is_public` takes for public: loopback ones the tests stand public servers on.
+    pub(super) static PRETEND_PUBLIC: Mutex<Vec<std::net::IpAddr>> = Mutex::new(Vec::new());
+
+    /// Names the agents' resolver answers itself: `(HOST:PORT, addresses)`.
+    static FAKE_DNS: Mutex<Vec<(String, Vec<SocketAddr>)>> = Mutex::new(Vec::new());
+
+    pub(super) fn fake_dns(addr: &str) -> Option<Vec<SocketAddr>> {
+        FAKE_DNS.lock().unwrap().iter().find(|(name, _)| name == addr).map(|(_, a)| a.clone())
+    }
+
+    /// A public address, as far as the tests' `is_public` knows, on this host's loopback.
+    const PUBLIC: &str = "127.0.0.2";
+
+    /// A server on `ip` answering every request with `respond(base, path)`, counting its requests.
+    fn counting_server(ip: &str, respond: impl Fn(&str, &str) -> String + Send + Sync + 'static) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits2 = hits.clone();
+        let addr = http_server_on(
+            ip,
+            move |base, path| {
+                hits2.fetch_add(1, Ordering::SeqCst);
+                respond(base, path)
+            },
+            |socket, resp| {
+                let _ = socket.write_all(&resp);
+            },
+        );
+        (addr.parse().unwrap(), hits)
+    }
+
+    /// A registry for `test` at `name` (resolved to `addrs`), over plain HTTP whatever the name.
+    fn named_registry(name: &str, addrs: &[SocketAddr]) -> Registry {
+        PRETEND_PUBLIC.lock().unwrap().push(PUBLIC.parse().unwrap());
+        let port = addrs[0].port();
+        FAKE_DNS.lock().unwrap().push((format!("{name}:{port}"), addrs.to_vec()));
+        let mut reg = Registry::new(Reference::parse(&format!("{name}:{port}/test")).unwrap());
+        reg.base = format!("http://{name}:{port}/v2/test");
+        reg
+    }
+
+    const CLOSE: &str = "Content-Length: 0\r\nConnection: close\r\n\r\n";
+
+    /// A registry is local by the address its answer came from: one reached on a private address by name may use a
+    /// private token service and redirect into private networks; one reached on a public address may not, nor can a
+    /// mixed DNS answer make it local while the answer came from the public address.
+    #[test]
+    fn registries_are_local_by_their_peer() {
+        use std::sync::atomic::Ordering;
+        let deadline = || Instant::now() + Duration::from_secs(10);
+        let ok = |b: &str| format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len());
+        let (token, tokens) = counting_server("127.0.0.1", move |_, _| ok("{\"token\":\"t\"}"));
+        let (blob, blobs) = counting_server("127.0.0.1", move |_, _| ok("private"));
+        let challenge = move |realm: &str| format!("HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"{realm}://{token}/token\"\r\n{CLOSE}");
+        let fetch = |reg: &Registry| {
+            reg.get("blobs/x", "*/*", deadline()).and_then(|r| {
+                let mut data = String::new();
+                r.into_reader().read_to_string(&mut data)?;
+                Ok(data)
+            })
+        };
+        // Answers 401 until it gets a token, then redirects to the private blob server.
+        let registry = move |ip: &str, realm: &'static str| {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            counting_server(ip, move |_, _| match calls.fetch_add(1, Ordering::SeqCst) {
+                0 => challenge(realm),
+                _ => format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{blob}/v2/test/blob\r\n{CLOSE}"),
+            })
+            .0
+        };
+
+        // Private by name: its private realm and redirect are followed.
+        let private = registry("127.0.0.1", "http");
+        assert_eq!(fetch(&named_registry("private.test", &[private])).unwrap(), "private");
+        assert_eq!((tokens.load(Ordering::SeqCst), blobs.load(Ordering::SeqCst)), (1, 1));
+
+        // Public by name: neither its private realm, over HTTPS or not, nor its redirect.
+        for realm in ["https", "http"] {
+            let err = fetch(&named_registry("public.test", &[registry(PUBLIC, realm)])).unwrap_err().to_string();
+            assert!(err.contains(if realm == "https" { "not on a public address" } else { "not HTTPS" }), "{err}");
+        }
+        let (redirect, _) = counting_server(PUBLIC, move |_, _| format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{blob}/v2/test/blob\r\n{CLOSE}"));
+        let err = fetch(&named_registry("public-redirect.test", &[redirect])).unwrap_err().to_string();
+        assert!(err.contains("not on a public address") && err.contains(&blob.to_string()), "{err}");
+
+        // A mixed answer, public first: the answer comes from the public address, and the registry is not local.
+        let public = registry(PUBLIC, "https");
+        let err = fetch(&named_registry("mixed.test", &[public, registry("127.0.0.1", "https")])).unwrap_err().to_string();
+        assert!(err.contains("not on a public address"), "{err}");
+        // Public, unreachable first (a refused port): the private one connected, so local.
+        let refused = std::net::TcpListener::bind((PUBLIC, 0)).unwrap().local_addr().unwrap();
+        assert_eq!(fetch(&named_registry("mixed-down.test", &[refused, registry("127.0.0.1", "http")])).unwrap(), "private");
+        assert_eq!((tokens.load(Ordering::SeqCst), blobs.load(Ordering::SeqCst)), (2, 2));
+    }
+
+    /// A redirect to a location that is not ASCII says so.
+    #[test]
+    fn non_ascii_locations_are_reported() {
+        let (addr, _) = counting_server("127.0.0.1", |_, _| format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: /caf\u{e9}\r\n{CLOSE}"));
+        let reg = Registry::new(Reference::parse(&format!("{addr}/test")).unwrap());
+        let err = reg.get("blobs/x", "*/*", Instant::now() + Duration::from_secs(10)).err().unwrap().to_string();
+        assert!(err.contains("not ASCII") && err.contains("caf"), "{err}");
+    }
+
+    #[test]
+    fn retry_after_is_capped() {
+        assert_eq!(retry_wait(Some("3600"), 0), MAX_RETRY_AFTER);
+        assert_eq!(retry_wait(Some("18446744073709551615"), 0), MAX_RETRY_AFTER);
+        assert_eq!(retry_wait(Some(" 7 "), 0), Duration::from_secs(7));
+        assert_eq!(retry_wait(Some("Wed, 21 Oct 2015 07:28:00 GMT"), 2), backoff(2));
+        assert_eq!(retry_wait(None, 1), backoff(1));
+    }
+
+    #[test]
+    fn challenges_parse_as_rfc_9110_has_them() {
+        let p = |c: &str| {
+            let (scheme, params) = parse_challenge(c);
+            (scheme.to_string(), params.into_iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>())
+        };
+        let want = |s: &str, ps: &[&str]| (s.to_string(), ps.iter().map(|p| p.to_string()).collect::<Vec<_>>());
+        assert_eq!(
+            p(r#"Bearer realm="https://auth.example/token",service="registry.example",scope="repository:a/b:pull,push""#),
+            want("Bearer", &["realm=https://auth.example/token", "service=registry.example", "scope=repository:a/b:pull,push"])
+        );
+        assert_eq!(p(r#"bearer  Realm = "https://a/t" , SCOPE=x , Service="s""#), want("bearer", &["realm=https://a/t", "scope=x", "service=s"]));
+        assert_eq!(p(r#"Bearer realm="a\"b\\c,d""#), want("Bearer", &[r#"realm=a"b\c,d"#]));
+        assert_eq!(p("Bearer	realm=https://a/t,,service=s,"), want("Bearer", &["realm=https://a/t", "service=s"]));
+        assert_eq!(p(r#"Bearer junk, realm="r""#), want("Bearer", &["realm=r"]));
+        assert_eq!(p(r#"Bearer realm="unterminated, scope=x"#), want("Bearer", &["realm=unterminated, scope=x"]));
+        assert_eq!(p("Basic"), want("Basic", &[]));
+        assert_eq!(p(""), want("", &[]));
+        // Names match whatever their case.
+        let reg = Registry::new(Reference::parse("203.0.113.7/test").unwrap());
+        let err = reg.authenticate(r#"Bearer REALM="http://auth.example/t""#, Instant::now() + Duration::from_secs(5), false).unwrap_err().to_string();
+        assert!(err.contains("not HTTPS"), "{err}");
+    }
+
+    #[test]
+    fn ipv6_registries_are_local_as_written() {
+        let reg = Registry::new(Reference::parse("[::1]:5000/x").unwrap());
+        assert!(reg.local() && reg.base.starts_with("http://[::1]:5000/"));
+        assert!(!Registry::new(Reference::parse("[2606:4700::1111]:5000/x").unwrap()).local());
+    }
+
     #[test]
     fn agent_dns_obeys_the_transfer_deadline() {
-        let err = agent(Instant::now(), false).get("http://unused.example:80/").call().unwrap_err();
+        let err = agent(Instant::now(), false, Peer::default()).get("http://unused.example:80/").call().unwrap_err();
         let ureq::Error::Io(err) = err else { panic!("expected a timed-out lookup: {err}") };
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
     }
@@ -614,8 +920,17 @@ pub(super) mod tests {
         respond: impl Fn(&str, &str) -> String + Send + Sync + 'static,
         send: impl Fn(&mut std::net::TcpStream, Vec<u8>) + Send + Sync + 'static,
     ) -> String {
+        http_server_on("127.0.0.1", respond, send)
+    }
+
+    /// `http_server`, listening on `ip`.
+    fn http_server_on(
+        ip: &str,
+        respond: impl Fn(&str, &str) -> String + Send + Sync + 'static,
+        send: impl Fn(&mut std::net::TcpStream, Vec<u8>) + Send + Sync + 'static,
+    ) -> String {
         use std::io::{BufRead, BufReader};
-        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let server = std::net::TcpListener::bind((ip, 0)).unwrap();
         let addr = server.local_addr().unwrap().to_string();
         let (respond, send) = (Arc::new(respond), Arc::new(send));
         let base = addr.clone();
@@ -698,7 +1013,7 @@ pub(super) mod tests {
         let start = Instant::now();
         let deadline = start + Duration::from_millis(700);
         // No timeout of ureq's own: it would hold each handshake read to it, not the handshake.
-        let err = agent(deadline, false).get(&format!("https://{addr}/v2/")).call().unwrap_err().to_string();
+        let err = agent(deadline, false, Peer::default()).get(&format!("https://{addr}/v2/")).call().unwrap_err().to_string();
         assert!(err.contains("timeout") || err.contains("timed out"), "{err}");
         assert!(start.elapsed() < Duration::from_secs(5), "took {:?}", start.elapsed());
     }
@@ -865,11 +1180,11 @@ pub(super) mod tests {
         });
         let reg = Registry::new(Reference::parse(&format!("{addr}/test")).unwrap());
         let start = Instant::now();
-        let err = reg.authenticate(&format!("Bearer realm=\"http://{addr}/token\""), start + Duration::from_secs(10)).unwrap_err().to_string();
+        let err = reg.authenticate(&format!("Bearer realm=\"http://{addr}/token\""), start + Duration::from_secs(10), true).unwrap_err().to_string();
         assert!(err.contains("HTTP 503") && err.contains("deadline"), "{err}");
         // The HTTP date got the 1 s backoff.
         assert!(start.elapsed() >= Duration::from_secs(1) && calls.load(Ordering::SeqCst) == 2);
-        reg.authenticate(&format!("Bearer realm=\"http://{addr}/token\""), Instant::now() + Duration::from_secs(10)).unwrap();
+        reg.authenticate(&format!("Bearer realm=\"http://{addr}/token\""), Instant::now() + Duration::from_secs(10), true).unwrap();
         assert_eq!(reg.auth.lock().unwrap().as_deref(), Some("Bearer t"));
         assert_eq!(
             (backoff(0), backoff(1), backoff(4), backoff(5), backoff(50)),
@@ -891,18 +1206,18 @@ pub(super) mod tests {
         let public = Registry::new(Reference::parse("203.0.113.7/test").unwrap());
         let deadline = Instant::now() + Duration::from_secs(10);
         for realm in [format!("https://127.0.0.1:{port}/t"), format!("https://localhost:{port}/t"), format!("https://[::1]:{port}/t")] {
-            let err = public.authenticate(&format!("Bearer realm=\"{realm}\""), deadline).unwrap_err().to_string();
+            let err = public.authenticate(&format!("Bearer realm=\"{realm}\""), deadline, public.local()).unwrap_err().to_string();
             assert!(err.contains("not on a public address"), "{realm}: {err}");
         }
-        let err = public.authenticate("Bearer realm=\"http://auth.example/t\"", deadline).unwrap_err().to_string();
+        let err = public.authenticate("Bearer realm=\"http://auth.example/t\"", deadline, false).unwrap_err().to_string();
         assert!(err.contains("not HTTPS"), "{err}");
         assert!(!served.load(std::sync::atomic::Ordering::SeqCst));
         // A local registry may use a local token service.
         let reg = Registry::new(Reference::parse(&format!("{local}/test")).unwrap());
-        reg.authenticate(&format!("Bearer realm=\"http://{local}/t\""), deadline).unwrap();
+        reg.authenticate(&format!("Bearer realm=\"http://{local}/t\""), deadline, reg.local()).unwrap();
         assert!(served.load(std::sync::atomic::Ordering::SeqCst));
 
-        // Only a registry local as written is exempt; a name is filtered whatever it resolves to.
+        // Local as written; a name is local only by the address it answers from (`registries_are_local_by_their_peer`).
         let local = |r: &str| Registry::new(Reference::parse(&format!("{r}/test")).unwrap()).local();
         assert!(local("127.0.0.1:5000") && local("localhost:5000") && local("10.0.0.5") && local("[::1]:5000"));
         assert!(!local("registry.example") && !local("localhost.evil.example") && !local("8.8.8.8:5000"));
