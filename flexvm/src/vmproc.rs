@@ -1952,7 +1952,7 @@ static EVICTING: AtomicBool = AtomicBool::new(false);
 ///
 /// Pressure starts when MemAvailable falls under the high-water mark
 /// (`evict_at`, above the reserve) and lasts until it is back to
-/// `evict_until` (`RUN/evict.active` while it lasts). A starved VM is moved
+/// `evict_marks` (`RUN/evict.active` while it lasts). A starved VM is moved
 /// whenever it asks, pressure or not. Nothing is done when MemAvailable
 /// cannot be read (`avail` None): that is no pressure.
 fn relieve(host: &Host, avail: Option<u64>, starved_here: bool, stopping: &mut Option<Stopping>) {
@@ -1961,7 +1961,7 @@ fn relieve(host: &Host, avail: Option<u64>, starved_here: bool, stopping: &mut O
         return;
     };
     let cfg = host.config_now();
-    let (reserve, at, until) = (cfg.reserve(), cfg.evict_at(), cfg.evict_until());
+    let (reserve, at, until) = cfg.evict_marks();
     // Standby VMs go under the reserve whatever eviction is doing (a slow migration holds its lock).
     if avail >= reserve {
         *stopping = None;
@@ -2828,14 +2828,17 @@ mod tests {
     #[test]
     fn eviction_starts_at_its_high_water_mark_and_stops_above_it() {
         let mut c = crate::host::Config { reserve_mib: Some(1024), ..Default::default() };
-        assert_eq!((c.evict_at(), c.evict_until()), (2048, 2560));
+        assert_eq!(c.evict_marks(), (1024, 2048, 2560));
         c.reserve_mib = Some(256);
-        assert_eq!((c.evict_at(), c.evict_until()), (768, 1024));
+        assert_eq!(c.evict_marks(), (256, 768, 1024));
         c.evict_mib = Some(5000);
-        assert_eq!((c.evict_at(), c.evict_until()), (5000, 7372));
+        assert_eq!(c.evict_marks(), (256, 5000, 7372));
         // Never under the reserve; a mark at it still stops a little above.
         c.evict_mib = Some(100);
-        assert_eq!((c.evict_at(), c.evict_until()), (256, 384));
+        assert_eq!(c.evict_marks(), (256, 256, 384));
+        // A hand-edited reserve near u64::MAX saturates instead of wrapping.
+        c.reserve_mib = Some(u64::MAX - 1);
+        assert_eq!(c.evict_marks(), (u64::MAX - 1, u64::MAX - 1, u64::MAX));
     }
 
     const SIZES: Sizes = Sizes { mem_mib: 256, floor: 4096, hotplug_total: 31744 };

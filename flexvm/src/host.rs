@@ -129,6 +129,68 @@ pub fn toward(peers: &[Vec<IpAddr>], local: impl Fn(Ipv4Addr) -> bool) -> Toward
     out
 }
 
+const DERIVE_EVERY: Duration = Duration::from_secs(30);
+const DERIVE_WAIT: Duration = Duration::from_secs(2);
+
+/// Each peer list's derivation: at most one under way, every `DERIVE_EVERY`.
+#[derive(Default)]
+struct Derivation {
+    under_way: bool,
+    ended: Option<std::time::Instant>,
+    /// The last good result, else the first.
+    good: Option<Derived>,
+    last: Option<std::result::Result<Derived, String>>,
+}
+
+static DERIVED: Mutex<std::collections::BTreeMap<Vec<String>, Derivation>> = Mutex::new(std::collections::BTreeMap::new());
+
+fn derive_now(peers: Vec<String>) {
+    let lookup = |p: &str| crate::util::lookup(p).map(|a| a.iter().map(SocketAddr::ip).collect());
+    let route = |to| crate::net::route_get(to).map(|(dev, src)| (dev.clone(), src, crate::net::is_ethernet(&dev)));
+    let out = derive(&peers, lookup, |a| crate::net::is_local_addr(a).unwrap_or(false), route);
+    let logged = DERIVED.lock().unwrap().entry(peers).or_default().record(out);
+    if let Some(e) = logged {
+        crate::log!("flexvm: {e}");
+    }
+}
+
+impl Derivation {
+    /// Keeps a good result, or the first; what to log, once per change, not by every VM process at every refresh.
+    fn record(&mut self, out: std::result::Result<Derived, String>) -> Option<String> {
+        let log = match (&out, self.last.as_ref() == Some(&out)) {
+            (Err(e), false) => {
+                let kept = if self.good.is_some() { "; keeping the last derived" } else { "" };
+                Some(format!("{e}: no underlay address or announce device derived{kept} (set them with flexvm config)"))
+            }
+            _ => None,
+        };
+        if out.is_ok() || self.good.is_none() {
+            self.good = Some(out.clone().unwrap_or_default());
+        }
+        (self.last, self.under_way, self.ended) = (Some(out), false, Some(std::time::Instant::now()));
+        log
+    }
+}
+
+/// The underlay address and announce device toward `peers`: `lookup` gives a peer's
+/// addresses, `route` the device, source and whether the device is Ethernet (one that is
+/// not, a WireGuard or tun link, takes no ARP announcements).
+fn derive(
+    peers: &[String],
+    lookup: impl Fn(&str) -> std::io::Result<Vec<IpAddr>>,
+    local: impl Fn(Ipv4Addr) -> bool,
+    route: impl Fn(Ipv4Addr) -> Result<(String, Ipv4Addr, bool)>,
+) -> std::result::Result<Derived, String> {
+    let mut unresolved = Vec::new();
+    let addrs: Vec<Vec<IpAddr>> = peers.iter().map(|p| lookup(p).unwrap_or_else(|e| (unresolved.push(format!("peer {p}: {e}")), Vec::new()).1)).collect();
+    match toward(&addrs, local) {
+        Toward::Local => Ok((Some(Ipv4Addr::LOCALHOST), None)),
+        Toward::Remote(to) => route(to).map(|(dev, src, ether)| (Some(src), ether.then_some(dev))).map_err(|e| e.to_string()),
+        Toward::Unknown if unresolved.is_empty() => Err("no peer elsewhere has an IPv4 address".into()),
+        Toward::Unknown => Err(unresolved.join(", ")),
+    }
+}
+
 impl Config {
     pub fn reserve(&self) -> u64 {
         self.reserve_mib.unwrap_or_else(default_reserve)
@@ -136,15 +198,16 @@ impl Config {
 
     /// MemAvailable (MiB) under which eviction starts: never below the reserve.
     pub fn evict_at(&self) -> u64 {
-        let reserve = self.reserve();
-        self.evict_mib.unwrap_or(reserve + reserve.max(512)).max(reserve)
+        self.evict_marks().1
     }
 
-    /// Once started, eviction goes on until MemAvailable is back this high:
-    /// the mark plus half its height above the reserve (at least 128 MiB).
-    pub fn evict_until(&self) -> u64 {
-        let at = self.evict_at();
-        at + ((at - self.reserve()) / 2).max(128)
+    /// The reserve, the eviction mark and, once started, how high MemAvailable must be back
+    /// for eviction to stop: the mark plus half its height above the reserve (at least
+    /// 128 MiB). From one read of the reserve, which may follow MemTotal.
+    pub fn evict_marks(&self) -> (u64, u64, u64) {
+        let reserve = self.reserve();
+        let at = self.evict_mib.unwrap_or(reserve.saturating_add(reserve.max(512))).max(reserve);
+        (reserve, at, at.saturating_add(((at - reserve) / 2).max(128)))
     }
 
     pub fn range(&self) -> Result<IpRange> {
@@ -172,30 +235,27 @@ impl Config {
         }
     }
 
-    /// Looked up again once the peers change or 30 s on.
+    /// Derived in the background (`DERIVED`); only a peer list's first derivation is waited
+    /// for, and for at most `DERIVE_WAIT`.
     fn derived(&self) -> Derived {
-        static SEEN: Mutex<Option<(std::time::Instant, Vec<String>, Derived)>> = Mutex::new(None);
-        let mut seen = SEEN.lock().unwrap();
-        if let Some((at, peers, d)) = &*seen {
-            if *peers == self.peers && at.elapsed() < Duration::from_secs(30) {
-                return d.clone();
+        let by = std::time::Instant::now() + DERIVE_WAIT;
+        loop {
+            let mut all = DERIVED.lock().unwrap();
+            let d = all.entry(self.peers.clone()).or_default();
+            if !d.under_way && d.ended.is_none_or(|t| t.elapsed() >= DERIVE_EVERY) {
+                let peers = self.peers.clone();
+                d.under_way = std::thread::Builder::new().spawn(move || derive_now(peers)).is_ok();
+                d.ended = (!d.under_way).then(std::time::Instant::now);
             }
+            if let Some(good) = &d.good {
+                return good.clone();
+            }
+            drop(all);
+            if std::time::Instant::now() >= by {
+                return (None, None);
+            }
+            std::thread::sleep(Duration::from_millis(20));
         }
-        use std::net::ToSocketAddrs;
-        let addrs: Vec<Vec<IpAddr>> = self.peers.iter().map(|p| p.to_socket_addrs().map(|a| a.map(|a| a.ip()).collect()).unwrap_or_default()).collect();
-        let d = match toward(&addrs, |a| crate::net::is_local_addr(a).unwrap_or(false)) {
-            Toward::Local => (Some(Ipv4Addr::LOCALHOST), None),
-            Toward::Remote(to) => crate::net::route_get(to).map_or_else(
-                |e| {
-                    crate::log!("flexvm: {e}: no underlay address or announce device derived (set them with flexvm config)");
-                    (None, None)
-                },
-                |(dev, src)| (Some(src), Some(dev)),
-            ),
-            Toward::Unknown => (None, None),
-        };
-        *seen = Some((std::time::Instant::now(), self.peers.clone(), d.clone()));
-        d
     }
 
     /// Where peers reach this host's listener (a migration target pulls
@@ -3250,6 +3310,47 @@ mod tests {
         }
         let off = Config { announce_dev: Some("none".into()), ..any };
         assert_eq!(off.announce_dev(), None);
+    }
+
+    #[test]
+    fn derivation_names_unresolvable_peers_and_skips_links_without_arp() {
+        let peers = |p: &[&str]| p.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        let lookup = |p: &str| match p {
+            "far:1" => Ok(vec!["192.0.2.9".parse().unwrap()]),
+            "near:1" => Ok(vec!["127.0.0.1".parse().unwrap()]),
+            _ => Err(std::io::Error::other("no such name")),
+        };
+        let src: Ipv4Addr = "192.0.2.1".parse().unwrap();
+        let route = |ether: bool| {
+            move |to: Ipv4Addr| -> Result<(String, Ipv4Addr, bool)> {
+                assert_eq!(to, Ipv4Addr::new(192, 0, 2, 9));
+                Ok(("eth0".into(), src, ether))
+            }
+        };
+        let derive = |p: &[&str], ether| derive(&peers(p), lookup, |_| false, route(ether));
+        assert_eq!(derive(&["near:1"], true), Ok((Some(Ipv4Addr::LOCALHOST), None)));
+        assert_eq!(derive(&["near:1", "far:1"], true), Ok((Some(src), Some("eth0".into()))));
+        // A WireGuard or tun device: the source still, but no ARP announcements on it.
+        assert_eq!(derive(&["far:1"], false), Ok((Some(src), None)));
+        assert_eq!(derive(&["near:1", "gone:1"], true), Err("peer gone:1: no such name".into()));
+        let failed = super::derive(&peers(&["far:1"]), lookup, |_| false, |_| Err("no route toward 192.0.2.9: Network is unreachable".into()));
+        assert_eq!(failed, Err("no route toward 192.0.2.9: Network is unreachable".into()));
+    }
+
+    #[test]
+    fn derivation_keeps_the_last_good_result_and_logs_changes_only() {
+        let mut d = Derivation::default();
+        let good: Derived = (Some("192.0.2.1".parse().unwrap()), Some("eth0".into()));
+        let e = d.record(Err("peer a:1: timed out".into())).unwrap();
+        assert!(e.starts_with("peer a:1: timed out: no underlay") && !e.contains("keeping"), "{e}");
+        assert_eq!(d.good, Some((None, None)), "the first result, failed, is used until a good one");
+        assert_eq!(d.record(Err("peer a:1: timed out".into())), None, "the same failure again is not logged");
+        assert_eq!(d.record(Ok(good.clone())), None);
+        assert_eq!(d.good.as_ref(), Some(&good));
+        let e = d.record(Err("peer a:1: timed out".into())).unwrap();
+        assert!(e.contains("keeping the last derived"), "{e}");
+        assert_eq!(d.good.as_ref(), Some(&good), "a failure keeps the last good result");
+        assert!(!d.under_way && d.ended.is_some());
     }
 
     /// A tap is this host's by its alias alone, whatever its name: hosts

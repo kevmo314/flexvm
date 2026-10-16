@@ -73,17 +73,34 @@ impl Drop for Wait {
 }
 
 pub fn validate(listener: &TcpListener, cfg: &crate::host::Config) -> Result<()> {
-    if let Some(e) = unreachable_at(listener.local_addr()?, v6only(listener), cfg.advertise()?.as_deref()) {
+    let local = listener.local_addr()?;
+    if let Some(e) = unreachable_at(local, v6only(listener), cfg.advertise()?.as_deref()) {
+        bail!("{e}");
+    }
+    // Bounded: this runs under the host lock.
+    let by = Instant::now() + Duration::from_secs(2);
+    let resolve = |p: &String| crate::util::resolve(p, by).map(|a| a.iter().map(SocketAddr::ip).collect()).unwrap_or_default();
+    let toward = || crate::host::toward(&cfg.peers.iter().map(resolve).collect::<Vec<_>>(), |a| crate::net::is_local_addr(a).unwrap_or(false));
+    if let Some(e) = loopback_with_remote(local, toward) {
         bail!("{e}");
     }
     Ok(())
+}
+
+/// A loopback listener is reachable, and a loopback underlay usable, only by peers on this machine.
+fn loopback_with_remote(local: SocketAddr, toward: impl FnOnce() -> crate::host::Toward) -> Option<String> {
+    if !local.ip().to_canonical().is_loopback() {
+        return None;
+    }
+    let crate::host::Toward::Remote(peer) = toward() else { return None };
+    Some(format!("{local} is loopback, but peer {peer} is elsewhere and cannot reach it; listen on 0.0.0.0 or this host's address toward it"))
 }
 
 pub fn main(host: Host, listener: TcpListener) -> Result<()> {
     crate::net::ip_forward()?;
     let dev = host.cfg.announce_dev();
     if let Some(dev) = &dev {
-        crate::net::conf("ipv4", dev, "proxy_arp", "1")?;
+        crate::net::proxy_arp(dev);
     }
     let underlay = host.cfg.underlay().map_or("none".into(), |u| u.to_string());
     crate::log!("flexvm listening on {} (underlay {underlay}, announce device {})", listener.local_addr()?, dev.as_deref().unwrap_or("none"));
@@ -931,6 +948,22 @@ mod tests {
         assert!(unreachable_at(at("[::]:7070"), true, Some("[2001:db8::1]:7070")).is_none());
         assert!(unreachable_at(at("[2001:db8::1]:7070"), true, Some("[2001:db8::1]:7070")).is_none());
         assert!(unreachable_at(at("[::]:7070"), true, None).is_none());
+    }
+
+    #[test]
+    fn a_loopback_listener_is_refused_with_a_peer_elsewhere() {
+        use crate::host::Toward;
+        let at = |s: &str| s.parse::<SocketAddr>().unwrap();
+        let remote = || Toward::Remote(Ipv4Addr::new(192, 168, 1, 11));
+        let e = loopback_with_remote(at("127.0.0.1:7070"), remote).unwrap();
+        assert!(e.contains("192.168.1.11 is elsewhere"), "{e}");
+        assert!(loopback_with_remote(at("[::ffff:127.0.0.1]:7070"), remote).is_some());
+        // Peers are not even looked up for an address that is not loopback.
+        assert!(loopback_with_remote(at("0.0.0.0:7070"), || unreachable!()).is_none());
+        // Peers on this machine, or none, or one whose address is unknown (a name that may yet be local): allowed.
+        for t in [Toward::Local, Toward::Unknown] {
+            assert!(loopback_with_remote(at("127.0.0.1:7070"), || t).is_none());
+        }
     }
 
     /// What this host's kernel does with a dual-stack wildcard bind.
