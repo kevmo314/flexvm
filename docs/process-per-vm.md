@@ -128,6 +128,8 @@ a source killed with SIGKILL, which records nothing.
 ## On-disk state
 
 Two directories, both overridable (`--state`, `--run`):
+each state directory is bound to one canonical run path on first open.
+A different `--run` for the same state directory is refused, including after a reboot.
 
 ```
 STATE (default /var/lib/flexvm, on disk)
@@ -136,6 +138,7 @@ STATE (default /var/lib/flexvm, on disk)
   templates/             built templates: NAME -> .gen/ID (see internals.md)
   images/                pulled container images: blobs/sha256/, rootfs/KEY.ext4 (see images.md)
   host.json              host config (`flexvm config`'s; listen is `flexvm listen`'s): listen, peers, vm_ips, underlay, announce_dev, dns, reserve_mib, evict_mib; unset ones are derived where used
+  run.json               canonical run path, bound on first open under the state root's flock; fsynced
   lock                   the host lock (flock), held for short critical sections only
   .synced                the root's (dev, inode) once its directories were made durable (`Host::open`)
   addrs/IP               per address: newest generation seen, withdrawn?, lent generation, holder name, instance

@@ -282,7 +282,9 @@ hold no secrets at startup. Details: [docs/images.md](docs/images.md).
 `template --image` runs `STATE/artifacts/flexvm-init` as PID 1 (`--init PATH`
 for another). Several hosts on one machine (tests, benchmarks) each take a `--state` and
 `--run` of their own; their `artifacts` and `templates` can be symlinks to one
-host's. `FLEXVM_FAULTS=1` enables test fault injection only. The state layout is in
+host's. On first open, each state directory permanently records its canonical run
+path in `run.json`; using that state with a different `--run` is refused.
+`FLEXVM_FAULTS=1` enables test fault injection only. The state layout is in
 [docs/process-per-vm.md](docs/process-per-vm.md#on-disk-state).
 
 ## Benchmarks

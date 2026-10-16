@@ -416,6 +416,7 @@ pub fn run_dir() -> Option<&'static Path> {
 }
 
 impl Host {
+    /// Binds each state root to one canonical run path on first open, under the root's flock.
     /// Synced up to `/` once per state root, not per command: under the root's flock, `.synced` names the
     /// root (dev, inode), so a copy syncs again; it goes before a repair and comes back after the syncs.
     pub fn open(state: &Path, run: &Path) -> Result<Host> {
@@ -442,6 +443,23 @@ impl Host {
         }
         let canon = |d: &Path| d.canonicalize().map_err(|e| named(d, e));
         let (state, run) = (canon(state)?, canon(run)?);
+        let binding = state.join("run.json");
+        match std::fs::read(&binding) {
+            Ok(bytes) => {
+                let saved: PathBuf = serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", binding.display()))?;
+                if saved != run {
+                    bail!(
+                        "state directory {} is bound to run directory {}; refusing --run {} (with no VM running, remove {} to rebind)",
+                        state.display(),
+                        saved.display(),
+                        run.display(),
+                        binding.display()
+                    );
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => store(&binding, &run, true)?,
+            Err(e) => bail!("{}: {e}", binding.display()),
+        }
         let _ = RUN_DIR.set(run.clone());
         let cfg_stamp = stamp(&state.join("host.json"));
         let cfg = load(&state.join("host.json"))?.unwrap_or_default();
@@ -2478,6 +2496,39 @@ mod tests {
 
     fn ip(s: &str) -> Ipv4Addr {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn state_is_bound_to_one_run_directory() {
+        let (base, h) = host("run-binding");
+        let other = base.join("other-run");
+        let e = Host::open(&h.state, &other).err().unwrap().to_string();
+        assert!(
+            e.contains("is bound to run directory")
+                && e.contains(h.state.to_str().unwrap())
+                && e.contains(h.run.to_str().unwrap())
+                && e.contains(other.to_str().unwrap()),
+            "{e}"
+        );
+        // A different state root can still have its own run directory on this machine.
+        Host::open(&base.join("other-state"), &other).unwrap();
+        // Canonical paths accept aliases of the same pair.
+        let alias = base.join("alias");
+        std::os::unix::fs::symlink(&*base, &alias).unwrap();
+        Host::open(&alias.join("state"), &alias.join("run")).unwrap();
+        // The path binding survives removal of tmpfs contents (for example, a reboot).
+        std::fs::remove_dir_all(&h.run).unwrap();
+        Host::open(&h.state, &h.run).unwrap();
+    }
+
+    #[test]
+    fn invalid_run_binding_is_not_replaced() {
+        let (_base, h) = host("run-binding-invalid");
+        let binding = h.state.join("run.json");
+        std::fs::write(&binding, "").unwrap();
+        let e = Host::open(&h.state, &h.run).err().unwrap().to_string();
+        assert!(e.contains(binding.to_str().unwrap()), "{e}");
+        assert_eq!(std::fs::read(&binding).unwrap(), b"");
     }
 
     #[test]
