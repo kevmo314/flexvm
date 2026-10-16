@@ -291,7 +291,7 @@ either with a different partner is refused.
 ## Benchmarks
 
 ```sh
-flexvm bench --template small                                     # run latency
+flexvm bench --template small                                     # standby and cold run latency
 flexvm bench --to 127.0.0.1:7131 --to-state S --to-run R --dirty-mib 500   # run + migrate to another host on this machine
 flexvm bench --lifecycle /data/ckpt --to-state S --to-run R      # pause, checkpoint, restore, suspend
 ```
@@ -299,7 +299,12 @@ flexvm bench --lifecycle /data/ckpt --to-state S --to-run R      # pause, checkp
 The other host's state (S) holds the same artifacts and templates (symlinks
 to this host's do). Reports land in `bench/`. With `--dirty-mib`, the guest reads its memory
 back before and right after the migration; `post_copy` has the difference
-(`stall`) and the target's fault service per kind.
+(`stall`) and the target's fault service per kind, including write-protect faults.
+Run percentiles are split into `run_standby` and `run_cold` (with matching
+`*_client` groups); an absent population is omitted. Phase percentiles use only
+samples containing that phase and include a `count`. Lifecycle `pause_client`
+and `resume_client` include signal dispatch and state polling at 1 ms intervals;
+they are client-observed times, with each trial reporting ten cycles' median.
 
 ## Tests
 

@@ -102,7 +102,7 @@ fn template(dir: &Path, pages: &[Option<u8>]) -> Arc<Template> {
     fs::create_dir_all(&tdir).unwrap();
     std::os::unix::fs::symlink(".gen/a", dir.join("tpl")).unwrap();
     let meta = json!({
-        "compatibility": {"cpu": "test", "firecracker": "test", "features": {}, "xsave": {}},
+        "compatibility": {"cpu": "test", "tsc_khz": 2000000, "tsc_control": false, "msrs": [], "firecracker": "test", "features": {}, "xsave": {}},
         "vcpus": 1, "mem_mib": 1, "max_mib": 1, "plugged_mib": 0,
         "kernel": "/k", "rootfs": "/r", "id": "a", "components": {}
     });

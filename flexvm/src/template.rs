@@ -908,7 +908,15 @@ mod tests {
             let dir = crate::test_util::TempDir::new("template");
             let paths = Paths { firecracker: dir.join("firecracker"), kernel: dir.join("kernel"), rootfs: dir.join("rootfs"), templates: dir.clone() };
             let mut meta = Meta {
-                compatibility: crate::compat::Compat { cpu: String::new(), firecracker: String::new(), features: BTreeMap::new(), xsave: BTreeMap::new() },
+                compatibility: crate::compat::Compat {
+                    cpu: String::new(),
+                    tsc_khz: 2_000_000,
+                    tsc_control: false,
+                    msrs: Default::default(),
+                    firecracker: String::new(),
+                    features: BTreeMap::new(),
+                    xsave: BTreeMap::new(),
+                },
                 vcpus: 2,
                 mem_mib: 256,
                 max_mib: 1024,

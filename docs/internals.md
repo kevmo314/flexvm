@@ -136,13 +136,16 @@ of `flexvm bench --dirty-mib 200`, 15 trials each:
 ## Host compatibility
 
 A template records the host it was built on: CPU vendor, family and model,
-the CPU feature bits KVM offered its guest, the XSAVE layout, and the
-Firecracker version and build. Checkpoints and migrations pin their template
-by content id and so carry its guest CPU. Every snapshot load (run, a standby
-VM's load, restore, resume, and a migration target before its source pauses)
+the CPU feature bits KVM offered its guest (including invariant TSC), the XSAVE
+layout, TSC rate, saved MSR index set, and the Firecracker version and build.
+Checkpoints and migrations pin their template by content id and so carry its
+guest CPU. Every snapshot load (run, a standby VM's load, restore, resume, and a migration target before its source pauses)
 refuses a host with a different CPU model or Firecracker, a missing feature
-bit or another XSAVE layout, naming the mismatch. Extra feature bits are
-fine. Templates built before this record must be rebuilt.
+bit, another XSAVE layout, or a missing saved MSR, naming the mismatch. TSC
+rates may differ by up to 250 ppm (Firecracker’s calibration tolerance); larger
+differences require target KVM TSC scaling. Extra feature bits and MSRs are
+fine. Templates built before these records must be rebuilt. Host probes are
+cached per process while the Firecracker binary is unchanged.
 
 ### Pages
 
@@ -979,10 +982,10 @@ pass on both. The details are in #274.
 | UDP stream through the same, 5,000 datagrams/s | **0 lost**, 0–17 reordered per round (12 rounds); before: 184–770 lost per round. At 20,000/s: 0 lost, 0–14 reordered |
 | nginx image, `run` → first HTTP response from the host | **205 ms** p50 (run 56 + nginx startup 144); `--warm`: **55 ms** p50 (run 31 + first request 22) |
 | Background memory pull | ~1.1 GB/s over loopback TCP |
-| Post-copy faults, 500 MiB written then read back right after the migration (host load ~15; 4 interleaved rounds of 8) | REMOTE fault p50 **1.0–1.3 ms** (was 4.2–5.2 ms, fetched on the event thread), p99 2.6–4.2 ms (was 12.6–16.8); template/zero faults p50 41–57 µs (was 1.3–1.6 ms, queued behind fetches); all faults blocked 0.77–0.98 s in all (was 1.33–1.6). The read itself barely changes here: most of it is KVM mapping each page again under nested virtualization |
+| Post-copy faults, 500 MiB written then read back right after the migration (host load ~15; 4 interleaved rounds of 8) | REMOTE fault p50 **1.0–1.3 ms** (was 4.2–5.2 ms, fetched on the event thread), p99 2.6–4.2 ms (was 12.6–16.8); template/zero faults p50 41–57 µs (was 1.3–1.6 ms, queued behind fetches); local/remote/wait faults blocked 0.77–0.98 s in all (was 1.33–1.6; historical report omitted write-protect faults). The read itself barely changes here: most of it is KVM mapping each page again under nested virtualization |
 | First read of 500 MiB once the pull is done (2 vCPU, 2 × 5 interleaved rounds) | migrated: **59 ms** p50 with huge pages (was 1037–1146 ms; 40–50 ms the second time either way); restored from a checkpoint: **54 ms** (was 1047–1124 ms). The collapse pass: 0.4–0.85 s of CPU for 253 chunks (2–3 ms each; up to 9 ms on a loaded host), 0.9–1.8 s in all. Downtime, pull, restore and checkpoint pauses unchanged; RSS the same |
 | Idle VM host RSS | 13–35 MiB |
-| pause / resume (VM side) | **0.6 / 0.7 ms** (2 vCPU), 1.5 ms resume (24 vCPU) |
+| pause / resume (client observed) | Needs remeasurement with the current benchmark; includes signal dispatch, entry/lock reads and 1 ms state polling. Older daemon RPC figures measured a different operation. |
 | checkpoint (the VM runs on), 256 / 1024 / 4096 MiB written in the guest: VM paused | **20 / 18 / 24–31 ms** (was 125 / 406–428 / 1456–1923 ms); write protection armed beforehand while it runs (first checkpoint only): 20 / 95–125 / 270–380 ms; whole checkpoint 220–250 / 450–620 / 1900–2200 ms |
 | ... with a guest rewriting 2 × 256 MiB during the copy | pause 17–56 ms; 650–2700 write faults, 340–1970 of them saving 20–120 MiB first (120–250 µs each); writer iterations > 100 µs: 4–9k (idle 0.1–1k), worst single stall 35–50 ms at 1 GiB (one 100–150 ms stall before 2 MiB protect chunks); free page reports are held during the copy (they cost 0.35–3.6 s stalls before) |
 | incremental checkpoint of a 4 GiB VM (small writer running) | **paused 29–50 ms, 92–112 ms in all, 35 MiB written** (full: 4238 MiB, 1.5–1.9 s) |
@@ -991,8 +994,11 @@ pass on both. The details are in #274.
 | suspend (checkpoint + free) / resume of a suspended VM to ready | 127 / 448 / 2012 ms; 27 / 28 / 36 ms |
 | suspended VM host RSS | 0 (Firecracker gone) |
 
-Lifecycle numbers are from `flexvm bench --lifecycle` with the 2-vCPU template,
-5 trials per size, restoring on the second host on the same machine
+The pause/resume figures from the daemon-era benchmark have been removed.
+Current lifecycle reports label those measurements `pause_client` and
+`resume_client`; each trial reports the median of ten cycles. Other lifecycle
+numbers are historical measurements from `flexvm bench --lifecycle` with the
+2-vCPU template, 5 trials per size, restoring on the second host on the same machine
 (`bench/*-lifecycle.json`). The guest clock step after a restore adds another
 35–100 ms after ready.
 
