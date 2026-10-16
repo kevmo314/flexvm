@@ -235,7 +235,8 @@ WantedBy=multi-user.target
 
 `systemctl enable --now flexvm-listen.socket flexvm-listen.service` starts the
 listener at boot too, not only when a peer connects: VMs do not survive a
-reboot, and the first flexvm process after one recovers the host. It
+reboot, and flexvm processes recover the host after one (each tries until a
+pass completes, marked by `/run/flexvm/.boot`). It
 withdraws the addresses of the VMs it lost (telling the peers, so a home host
 takes back an address it lent), lists those VMs as `lost`, puts back the
 routes to VMs on peers, settles migrations the reboot interrupted, and
@@ -310,8 +311,10 @@ for another). Several hosts on one machine (tests, benchmarks) each take a `--st
 `--run` of their own; their `artifacts` and `templates` can be symlinks to one
 host's. On first open, each state directory permanently records its canonical run
 path in `run.json`, and the run directory records its state in `state.json`; using
-either with a different partner is refused. Without `--run`, a state uses the run
-directory its `run.json` names, so after a reboot another state never takes it.
+either with a different partner is refused. Without `--run`, the run directory follows
+from the state's path alone (`/run/flexvm` for `/var/lib/flexvm`, `/run/flexvm-PREFIX` for
+any other), so after a reboot no state defaults into another's; a state bound to any other
+run directory must be given it.
 `FLEXVM_FAULTS=1` enables test fault injection only. The state layout is in
 [docs/process-per-vm.md](docs/process-per-vm.md#on-disk-state).
 

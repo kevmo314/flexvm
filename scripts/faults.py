@@ -8748,9 +8748,9 @@ def kill_tree(pid):
 
 def reboot():
     """#553, #555, #556: B rebooted, emulated: its listener, VM and standby processes SIGKILLed,
-    its run directory emptied (tmpfs) and its kernel routes gone. The first command after it,
-    without --run, opens B's own run directory (another state that came first got one of its
-    own), withdraws what the lost VMs held (so A takes back the loan of one that migrated in),
+    its run directory emptied (tmpfs) and its kernel routes gone. Another state opening first
+    without --run gets a run directory of its own, never B's. The first command of B's after it
+    withdraws what the lost VMs held (so A takes back the loan of one that migrated in),
     lists them as lost until killed, puts back B's route to a peer's VM from its records and
     refills B's standby VMs."""
     own_listeners("reboot")
@@ -8791,9 +8791,13 @@ def reboot():
         other_run = json.load(open(os.path.join(other, "run.json"))) if os.path.exists(os.path.join(other, "run.json")) else None
         check("reboot: another state gets a run directory of its own", r.returncode == 0 and other_run and other_run != os.path.realpath(B.run)
               and not os.path.exists(os.path.join(B.run, "state.json")), (r.stderr, other_run))
-        r = subprocess.run([BIN, "--state", B.state, "ls", "--json"], capture_output=True, text=True, timeout=180, env=ENV)
-        check("reboot: B's state opens its own run directory without --run", r.returncode == 0
+        r = subprocess.run([BIN, "--state", B.state, "ls"], capture_output=True, text=True, timeout=60, env=ENV)
+        check("reboot: B's state, bound elsewhere, is refused without its --run, never defaulted", r.returncode != 0
+              and f"give --run {os.path.realpath(B.run)}" in r.stderr and not os.path.exists(os.path.join(B.run, "state.json")), r.stderr)
+        r = subprocess.run([BIN, "--state", B.state, "--run", B.run, "ls", "--json"], capture_output=True, text=True, timeout=180, env=ENV)
+        check("reboot: B's state takes its run directory back", r.returncode == 0
               and json.load(open(os.path.join(B.run, "state.json"))) == os.path.realpath(B.state), r.stderr)
+        check("reboot: its recovery is marked complete", open(os.path.join(B.run, ".boot")).read() == open("/proc/sys/kernel/random/boot_id").read().strip())
         listed = {v["name"]: v for v in json.loads(r.stdout or "[]")}
         check("reboot: the lost vms are listed, with why", all(listed.get(n, {}).get("state") == "lost" and "lost" in listed[n].get("error", "") for n in (local, moved)),
               listed)

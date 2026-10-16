@@ -38,30 +38,36 @@ pub fn periodic(host: Host) {
     });
 }
 
-/// The first opener of the host in a boot (as root): `Host::after_boot`, which withdraws what
-/// the VMs lost in the reboot held, records them for `ls` and puts back the routes to peers' VMs;
-/// then the forwarding settings flexvm needs and, with `rest`, `recover`. VM processes and the
-/// listener pass false: they sweep and refill as they start. Returns whether it ran.
+/// Until this boot's recovery is complete, every opener of the host as root: `Host::after_boot`,
+/// which records the VMs lost in the reboot for `ls`, withdraws what they held and puts back the
+/// routes to peers' VMs. With `rest`, then the forwarding settings flexvm needs and `recover`; the
+/// recovery is marked complete (`Host::mark_recovered`) only after all of it, and only if each
+/// step succeeded (delivery and settlement are retried from their records by every sweep). VM
+/// processes and template builds pass false and leave it to a full pass. Returns whether it ran.
 pub fn after_boot(host: &Host, rest: bool) -> bool {
     if unsafe { libc::geteuid() } != 0 {
         return false;
     }
-    match host.after_boot() {
-        Ok(true) => {}
-        Ok(false) => return false,
+    let local = match host.after_boot() {
+        Ok(Some(ok)) => ok,
+        Ok(None) => return false,
         Err(e) => {
             crate::log!("flexvm: recovering after boot: {e}");
             return false;
         }
+    };
+    if !rest {
+        return true;
     }
-    if let Err(e) = crate::net::ip_forward() {
-        crate::log!("flexvm: after boot: {e}");
-    }
+    let forwarding = crate::net::ip_forward().inspect_err(|e| crate::log!("flexvm: after boot: {e}")).is_ok();
     if let Some(dev) = host.config_now().announce_dev() {
         crate::net::proxy_arp(&dev);
     }
-    if rest {
-        recover(host);
+    recover(host);
+    if local && forwarding {
+        if let Err(e) = host.mark_recovered() {
+            crate::log!("flexvm: after boot: {e}");
+        }
     }
     true
 }

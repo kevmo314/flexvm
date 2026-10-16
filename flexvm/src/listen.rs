@@ -149,7 +149,11 @@ pub fn main(host: Host, listener: TcpListener) -> Result<()> {
     // A sweep and a refill now, not after the first period: a listener started at boot is
     // what recovers a quiet host (#555).
     let first = host.clone();
-    std::thread::spawn(move || crate::gc::recover(&first));
+    std::thread::spawn(move || {
+        if !crate::gc::after_boot(&first, true) {
+            crate::gc::recover(&first);
+        }
+    });
     crate::standby::maintain(host.clone());
     crate::gc::periodic(host.clone());
     let peers = Peers::watch(host.clone());

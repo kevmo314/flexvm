@@ -68,7 +68,8 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
 
 options: --state DIR (/var/lib/flexvm: artifacts, templates, images, VMs), --run DIR (/run/flexvm, or
          /run/flexvm-PREFIX for another --state), --version
-Each state directory is bound to its first run directory, its default from then on; a different --run is refused.
+Each state directory is bound to its first run directory; a different --run is refused (and so is
+none, if it is bound to another than its default).
 run, resume and restore exit with the VM's command's status, 128+signal, 125 when flexvm
 fails, 124 when the VM dies
 ";
@@ -272,17 +273,17 @@ fn state(args: &Args) -> Result<PathBuf> {
     Ok(std::path::absolute(args.get("state").unwrap_or(host::DEFAULT_STATE))?)
 }
 
-/// The host, recovered first if this is its first open in this boot (`gc::after_boot`): a VM
-/// process or the listener sweeps and refills as it starts, `recover` after, a template build not
-/// at all; any other command does it here.
+/// The host, recovered first until this boot's recovery is complete (`gc::after_boot`): a VM
+/// process and a template build only its local part (they leave the rest to a full pass), the
+/// listener and `recover` the rest after this; any other command all of it here.
 pub fn open_host(args: &Args) -> Result<Host> {
     let host = open_host_only(args)?;
-    let starts = matches!(args.positional.first().map(String::as_str), Some("run" | "resume" | "restore" | "listen" | "recover" | "template"));
-    gc::after_boot(&host, !starts);
+    let partly = matches!(args.positional.first().map(String::as_str), Some("run" | "resume" | "restore" | "listen" | "recover" | "template"));
+    gc::after_boot(&host, !partly);
     Ok(host)
 }
 
-/// Without `--run`: the run directory the state is bound to, else its default (`host::default_run`).
+/// Without `--run`: the state's default run directory (`host::default_run`).
 fn open_host_only(args: &Args) -> Result<Host> {
     let state = state(args)?;
     let run = match args.get("run") {
@@ -345,7 +346,9 @@ fn real_main(args: &Args) -> Result<()> {
         Some("migrate") => call(json!({"op": "migrate", "to": arg2.ok_or("migrate needs NAME HOST:PORT")?})),
         Some("recover") => {
             let host = open_host(args)?;
-            gc::recover(&host);
+            if !gc::after_boot(&host, true) {
+                gc::recover(&host);
+            }
             Ok(())
         }
         Some("listen") => {
