@@ -1275,6 +1275,9 @@ def arrival_flood():
     src = source_vm()
     names = [(f"ft-flood-{i}", spare(B, 10 + i)) for i in range(4)]
     replies = {}
+    # The listener takes an arrival's place before it makes its log (`.incoming-*.log`).
+    arrivals = lambda: {f for f in os.listdir(os.path.join(B.run, "vms")) if f.startswith(".incoming-")}
+    before = arrivals()
     with open(os.path.join(B.state, "lock"), "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         started = time.time()
@@ -1285,7 +1288,7 @@ def arrival_flood():
         ts = [threading.Thread(target=arrive, args=a) for a in names]
         for t in ts:
             t.start()
-        time.sleep(2)
+        check("arrival flood: the peer's arrivals hold their places", wait_for(lambda: len(arrivals() - before) == len(names), 5), arrivals() - before)
         t0 = time.time()
         r = migrate(A, n, B)
         took = time.time() - t0
