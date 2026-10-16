@@ -23,7 +23,7 @@ impl Pager {
         }
         let p = self.clone();
         thread::spawn(move || {
-            if p.wait_pulled(None) && !crate::host::fault("no_collapse") {
+            if p.wait_pulled(None) {
                 p.collapse();
             }
         });

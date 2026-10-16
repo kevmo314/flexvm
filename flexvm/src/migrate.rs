@@ -612,7 +612,9 @@ impl Proc {
                     // ends. Unplugged, it would overtake them: left to the stream's end then.
                     crate::log!("vm {}: taking over {}: {e}; routing it to its tap", vm.name, vm.ip);
                     // Test fault `hold_plug_fail`: the tap's plug is refused.
-                    let (plug, res) = plug(&vm, "hold_plug_fail");
+                    // Keep the uncertain installed state on an unanswered request: it must be unplugged.
+                    let (plug, res) = crate::fault_result!(tripped("hold_plug_fail") =>
+                        (false, Err("injected fault: plugging the tap failed".into())); crate::net::plug_tap(&vm.tap));
                     plugged = plug;
                     match res {
                         Err(e) => crate::log!("vm {}: plugging its tap: {e}; routing {} once the held packets are in", vm.name, vm.ip),
@@ -664,7 +666,7 @@ impl Proc {
                     // host can delay past the next packet): then it follows, in order.
                     // Whether our plug may be on the tap (also when the kernel's answer was
                     // lost): only then is it unplugged, never after a refusal.
-                    let (plugged, res) = plug(&vm, "no_plug");
+                    let (plugged, res) = crate::net::plug_tap(&vm.tap);
                     if let Err(e) = res {
                         crate::log!("vm {}: plugging its tap: {e}", vm.name);
                     }
@@ -1035,16 +1037,6 @@ fn read_vec(r: &mut impl Read, len: u64, max: u64) -> Result<Vec<u8>> {
     let mut v = vec![0u8; len as usize];
     r.read_exact(&mut v)?;
     Ok(v)
-}
-
-// Keep the uncertain installed state even on an unanswered plug request: it must be unplugged.
-fn plug(vm: &Vm, fault: &str) -> (bool, Result<()>) {
-    if fault == "no_plug" && crate::host::fault(fault) {
-        crate::log!("vm {}: injected fault: not plugging its tap", vm.name);
-        return (false, Ok(()));
-    }
-    crate::fault_result!(fault != "no_plug" && tripped(fault) => (false, Err("injected fault: plugging the tap failed".into()));
-        crate::net::plug_tap(&vm.tap))
 }
 
 fn unplug(vm: &Vm) -> u64 {
