@@ -65,7 +65,7 @@ FAULTS = ("basic route route_abort lost_ack unknown refused pages_blip pages_dea
           "refused_admission arrival_grew arrival_grew_admitted meminfo_unreadable checkpoint_hotplug log_cap gc_debris arrival_log template_tap arrival_overtaken "
           "leave_fail capture_fail abort_gen_fail commit_fail commit_fail_routed abort_stay_fail prepare_disconnect prepare_trickle arrival_flood unlend_retry bad_app_log resume_slow_guest resume_readdress_fail resume_unpause_fail abort_link_fail resume_unsettled resume_pull_lock page_conns page_refusals suspend_unaddressed resume_fence_fails quarantine_reboot_ls "
           "resume_failures resume_mark_fails suspend_killed resume_suspending source_unpublished start_admission standby_admission pause_lost cow_crash ckpt_dir_moved "
-          "checkpoint_untrusted_dir run_status unread_output quit_status ctrl_z_long_op app_log forged_peer forged_pages ckpt_ancestor_corrupt resume_killed_marked "
+          "checkpoint_untrusted_dir run_status unread_output quit_status ctrl_z_long_op app_log forged_peer forged_pages ckpt_ancestor_corrupt resume_killed_marked restore_route_fence "
           "resume_outcome exec_recovery_instance")
 # The ones that restart the listeners (faults.py starts its own for them: LISTENER_FAULTS), the
 # terminal's, and the ones bound by timeouts (a guest that never answers; a pager that fails or
