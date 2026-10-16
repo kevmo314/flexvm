@@ -417,8 +417,10 @@ fn serve(statuses: Statuses) -> io::Result<()> {
         let at = Instant::now() + BODY_TIMEOUT;
         // Out of threads: drop this connection (closing it) rather than abort PID 1.
         let _ = thread::Builder::new().spawn(move || {
-            if !matches!(line.split_whitespace().next(), Some("SESSION" | "ATTACH" | "CLOSE")) {
-                return drop(handle(&stream, &line, &statuses));
+            match line.split_whitespace().next() {
+                Some("SESSIONS") => return drop(msg(&stream, session::counts(&sessions))),
+                Some("SESSION" | "ATTACH" | "CLOSE") => {}
+                _ => return drop(handle(&stream, &line, &statuses)),
             }
             // A session's command arrives a round trip later, which a guest faulting in memory can stretch past a second.
             let body = match session::parse(&line) {

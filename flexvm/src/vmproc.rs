@@ -25,11 +25,21 @@ use crate::template::{Paths, Template, STEP_MIB};
 use crate::util::{answer, ms, proc_kb, send_json, Error, Phases, Result, Slot};
 use crate::vm::{Snapshot, State, Vm};
 
+/// A client that takes no output for this long is dropped, freeing its relay and control slot; its
+/// session stays in the guest for a reattach.
+const CLIENT_STALL: Duration = Duration::from_secs(60);
+
 /// Frame by frame: vsock does not pass a half-close on, so the exit frame is what ends the
 /// relay. Then the client's acknowledgement, if it sends one, lets the guest release the session.
-fn relay_session(guest: &mut BufReader<impl Read + Write>, client: &mut (impl crate::util::Timed + Write)) -> Result<()> {
+fn relay_session(guest: &mut BufReader<impl Read + Write>, client: &mut (impl crate::util::Timed + Write), stall: Duration) -> Result<()> {
+    client.write_timeout(stall)?;
     while let Some((kind, data)) = guest::read_frame(guest)? {
-        client.write_all(&guest::frame(kind, &[&data]))?;
+        match client.write_all(&guest::frame(kind, &[&data])) {
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                bail!("the client took no output for {} s", stall.as_secs())
+            }
+            res => res?,
+        }
         if kind == guest::FRAME_EXIT {
             let mut ack = [0];
             if (crate::util::By { s: client, at: Instant::now() + Duration::from_secs(2) }).read_exact(&mut ack).is_ok() && ack[0] == guest::SESSION_DONE {
@@ -1147,7 +1157,7 @@ impl Proc {
             // The guest heartbeats every second; silence means the VM moved, or its agent stalled.
             g.get_ref().set_read_timeout(Some(Duration::from_secs(3)))?;
             send_json(&mut w, &json!({"ok": true}))?;
-            relay_session(&mut g, &mut w)?;
+            relay_session(&mut g, &mut w, CLIENT_STALL)?;
             Ok(())
         })();
         vm.untrack_exec(id);
@@ -1160,6 +1170,10 @@ impl Proc {
         let vm = self.vm();
         match req["what"].as_str().unwrap_or("") {
             "memhash" => self.memhash(),
+            "sessions" => {
+                let (live, unacknowledged) = guest::sessions(&vm.vsock)?;
+                Ok(json!({"live": live, "unacknowledged": unacknowledged}))
+            }
             "hotplug" => {
                 let _op = self.op_within()?;
                 if vm.state() != State::Running {
@@ -3315,9 +3329,49 @@ mod session_relay_tests {
             // The exit ends the relay, with the stream still open (vsock passes no half-close on).
             let mut guest = BufReader::new(Duplex { input: Cursor::new([&exit[..], b"never read"].concat()), output: Vec::new() });
             let mut client = Duplex { input: Cursor::new(ack.clone()), output: Vec::new() };
-            relay_session(&mut guest, &mut client).unwrap();
+            relay_session(&mut guest, &mut client, CLIENT_STALL).unwrap();
             assert_eq!(client.output, exit);
             assert_eq!(guest.get_ref().output, if ack == [guest::SESSION_DONE] { ack } else { vec![] });
         }
+    }
+
+    #[test]
+    fn a_silent_client_releases_the_relay_within_its_deadline() {
+        let exit = guest::frame(guest::FRAME_EXIT, &[&0u64.to_le_bytes()[..], &0i32.to_le_bytes()]);
+        let mut guest = BufReader::new(Duplex { input: Cursor::new(exit.clone()), output: Vec::new() });
+        let (relay, mut client) = UnixStream::pair().unwrap();
+        // Reads the exit, then neither acknowledges nor hangs up.
+        let silent = thread::spawn(move || {
+            let mut got = vec![0; exit.len()];
+            client.read_exact(&mut got).unwrap();
+            thread::sleep(Duration::from_secs(6));
+        });
+        let t = Instant::now();
+        relay_session(&mut guest, &mut &relay, CLIENT_STALL).unwrap();
+        assert!(t.elapsed() < Duration::from_secs(4), "the relay waited {:?}", t.elapsed());
+        assert!(guest.get_ref().output.is_empty());
+        silent.join().unwrap();
+    }
+
+    #[test]
+    fn a_stalled_client_is_dropped_after_its_deadline() {
+        // The guest has output to spare; the client never reads.
+        let (relay_end, mut agent) = UnixStream::pair().unwrap();
+        let writer = thread::spawn(move || {
+            for i in 0..1024u64 {
+                if agent.write_all(&guest::frame(guest::FRAME_STDOUT, &[&(i * 65536).to_le_bytes()[..], &[b'x'; 65536]])).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut guest = BufReader::new(relay_end);
+        let (relay, _client) = UnixStream::pair().unwrap();
+        let t = Instant::now();
+        let err = relay_session(&mut guest, &mut &relay, Duration::from_secs(1)).unwrap_err();
+        assert!(err.to_string().contains("took no output for 1 s"), "{err}");
+        assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
+        // Dropped, the guest's connection ends unacknowledged: the session stays for a reattach.
+        drop(guest);
+        writer.join().unwrap();
     }
 }

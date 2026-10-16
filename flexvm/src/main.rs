@@ -898,6 +898,7 @@ enum StreamEnd {
 /// Tracks the session's offset so a reattach resumes without duplicates.
 fn exec_frames(r: &mut impl Read, session: &Mutex<Session>, stdout: &mut impl Write, stderr: &mut impl Write, deadline: &mut Instant) -> Result<StreamEnd> {
     let id = session.lock().unwrap().id.clone();
+    let mut echoed = false;
     loop {
         let (kind, data) = match guest::read_frame(r) {
             Ok(Some(frame)) => frame,
@@ -923,7 +924,13 @@ fn exec_frames(r: &mut impl Read, session: &Mutex<Session>, stdout: &mut impl Wr
                 let start = u64::from_le_bytes(data.as_slice().try_into().map_err(|_| "bad output-lost frame")?);
                 return Err(format!("session output lost: needed offset {}, retained output starts at {start}", s.offset).into());
             }
-            guest::FRAME_MSG if data == id.as_bytes() => s.started = true,
+            guest::FRAME_MSG if data == id.as_bytes() => (s.started, echoed) = (true, true),
+            // A reattach after the connection was lost, to a session closed meanwhile (acknowledged, or reclaimed).
+            guest::FRAME_MSG if s.started && !echoed && data == b"error: session closed" => {
+                return Err(
+                    format!("lost the connection to the vm after byte {} of output; the session has since been closed and the rest is gone", s.offset).into()
+                )
+            }
             guest::FRAME_MSG if data == b"waiting" && s.started => {}
             // Before the id echo the request itself failed: not retried.
             guest::FRAME_MSG if !s.started => return Err(guest::refusal(&data).into()),
@@ -1310,6 +1317,18 @@ mod exec_tests {
         assert!(matches!(run(resumed), StreamEnd::Exit(7)));
         let s = session.lock().unwrap();
         assert!(s.started && s.offset == 6 && s.exit == Some(7) && stdout == b"abc" && stderr == b"def");
+    }
+
+    #[test]
+    fn a_reattach_to_a_closed_session_ends_at_once() {
+        let session = Mutex::new(Session { id: "test-id".into(), started: true, offset: 5, exit: None });
+        // Within one attachment, a closed session is only a lost connection, retried.
+        let input = frames(&[(guest::FRAME_MSG, b"test-id"), (guest::FRAME_MSG, b"error: session closed")]);
+        let end = exec_frames(&mut input.as_slice(), &session, &mut Vec::new(), &mut Vec::new(), &mut Instant::now()).unwrap();
+        assert!(matches!(end, StreamEnd::Disconnected(_)));
+        let input = frames(&[(guest::FRAME_MSG, b"error: session closed")]);
+        let e = exec_frames(&mut input.as_slice(), &session, &mut Vec::new(), &mut Vec::new(), &mut Instant::now()).err().unwrap();
+        assert!(e.to_string().contains("after byte 5 of output"), "{e}");
     }
 
     #[test]

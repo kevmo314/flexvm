@@ -895,7 +895,8 @@ def exec_background():
     """An exec whose command leaves a background process holding its output returns once the
     shell exits (the process keeps running), and such execs never use up the guest agent's 64
     session slots; nor do interrupted ones (SIGINT stops the command), or abandoned sessions
-    whose client disconnected or was killed outright."""
+    whose client disconnected or was killed outright, nor exits whose client reads its output
+    slowly or stays silent after it; a client that takes no output for 60 s is dropped."""
     n = "ft-exec-bg"
     ok(run(A, n))
     # Processes whose command line starts with `cmd` (the ^ keeps grep from counting itself).
@@ -961,6 +962,101 @@ def exec_background():
     stopped = wait_for(lambda: count("yes") == (0, "0"), 10)
     check("exec bg: a piped exec's command is stopped once its stdout breaks", stopped, count("yes"))
     check("exec bg: execs still start after the piped ones", sh(A, n, "echo hi") == (0, "hi"))
+    sock = os.path.join(A.run, "vms", f"{n}.sock")
+
+    def raw_exec(sid, cmd):
+        s = socket.socket(socket.AF_UNIX)
+        s.settimeout(30)
+        s.connect(sock)
+        s.sendall((json.dumps({"op": "exec", "session": sid, "action": "start", "cmd": cmd}) + "\n").encode())
+        return s
+
+    # #505. A client that stops reading is dropped after 60 s without progress, freeing its relay and
+    # control slot; its session stays in the guest. Started now, checked at the end.
+    stalled_id = os.urandom(16).hex()
+    stalled = raw_exec(stalled_id, "head -c 100000000 /dev/zero")
+    stalled_at = time.time()
+    sessions = lambda: cli_json(A, "debug", n, "sessions").get("result") or {}
+    # A client that reads its exit and then stays silent, its connection open, holds the relay and the
+    # guest's handler for 2 s at most; its session stays, exited and unacknowledged, for a reattach.
+    before = sessions().get("unacknowledged", 0)
+    with raw_exec(os.urandom(16).hex(), "echo hi") as s:
+        f = s.makefile("rb")
+        f.readline()
+        kind = None
+        while (head := f.read(5)) and len(head) == 5:
+            kind, size = struct.unpack("<BI", head)
+            f.read(size)
+            if kind == 3:
+                break
+        t = time.time()
+        hung_up = s.recv(1) == b""
+        took = time.time() - t
+        check("exec bg: the relay lets go of a client silent after its exit", kind == 3 and hung_up and took < 4, (kind, hung_up, took))
+        check("exec bg: the session stays, unacknowledged", wait_for(lambda: sessions().get("unacknowledged") == before + 1, 3), sessions())
+        f.close()
+    # Piped into a slow reader, the CLI acknowledges its exit only once it wrote all output out, after the
+    # guest stopped waiting. Such exits do not count towards the 64 running sessions: with 70 at once,
+    # all 70 unacknowledged, a new exec still starts at once, and every reader gets all its output.
+    big = 200000
+    drained = []
+
+    def slow_reader(size, wait):
+        cmd = f'set -o pipefail; "$0" --state "$1" --run "$2" exec "$3" "head -c {size} /dev/zero" | (sleep {wait}; cat) | wc -c'
+        r = subprocess.run(["bash", "-c", cmd, BIN, A.state, A.run, n], capture_output=True, text=True, timeout=180, env=ENV)
+        drained.append((size, (r.returncode, r.stdout.strip(), r.stderr.strip()[-200:])))
+
+    readers = [threading.Thread(target=slow_reader, args=(big, 6)) for _ in range(70)]
+    start = time.time()
+    for r in readers:
+        r.start()
+        time.sleep(0.02)
+    full = wait_for(lambda: sessions().get("unacknowledged", 0) >= before + 1 + 64, 15)
+    check("exec bg: 64 and more slow readers' exits are unacknowledged at once", full and not drained, (sessions(), time.time() - start))
+    t = time.time()
+    r = sh(A, n, "echo hi")
+    took = time.time() - t
+    check("exec bg: an exec starts at once beside them", r == (0, "hi") and took < 4 and not drained, (r, took, len(drained)))
+    for r in readers:
+        r.join()
+    bad = [d for d in drained if d[1] != (0, str(d[0]), "")]
+    check("exec bg: 70 slow readers all get all their output and status", len(drained) == 70 and not bad, bad[:3])
+    # More output than the guest keeps for a session (4 MiB): the command waits for its reader, and the
+    # reader, back after 15 s (well past Firecracker's 2 s vsock shutdown expiry), gets all of it.
+    drained.clear()
+    slow_reader(6000000, 15)
+    check("exec bg: 6 MB to a reader that stalls for 15 s all arrive", drained == [(6000000, (0, "6000000", ""))], drained)
+    check("exec bg: execs still start after the slow readers", sh(A, n, "echo hi") == (0, "hi"))
+    time.sleep(max(0, stalled_at + 65 - time.time()))
+    got, t = 0, time.time()
+    stalled.settimeout(10)
+    try:
+        while d := stalled.recv(1 << 20):
+            got += len(d)
+    except OSError as e:
+        got = (got, str(e))
+    stalled.close()
+    check("exec bg: a client that took nothing for 60 s was dropped", isinstance(got, int) and 0 < got < 100000000 and time.time() - t < 10, got)
+    frames = []
+    if isinstance(got, int):
+        with socket.socket(socket.AF_UNIX) as s:
+            s.settimeout(30)
+            s.connect(sock)
+            s.sendall((json.dumps({"op": "exec", "session": stalled_id, "action": "attach", "offset": got}) + "\n").encode())
+            f = s.makefile("rb")
+            frames.append(f.readline())
+            for _ in range(2):
+                kind, size = struct.unpack("<BI", f.read(5))
+                data = f.read(size)
+                frames.append((kind, data if kind == 4 else data[:8]))
+            f.close()
+    check("exec bg: its session stayed in the guest, for a reattach from where it was dropped",
+          frames[1:] == [(4, stalled_id.encode()), (1, struct.pack("<Q", got))], frames)
+    with socket.socket(socket.AF_UNIX) as s:
+        s.settimeout(30)
+        s.connect(sock)
+        s.sendall((json.dumps({"op": "exec", "session": stalled_id, "action": "close"}) + "\n").encode())
+        s.makefile("rb").readline()
     knob = "/run/flexvm-test-abandoned-running-secs"
     check("exec bg: the abandoned-session wait is shortened", sh(A, n, f"echo 3 > {knob}") == (0, ""))
     with socket.socket(socket.AF_UNIX) as s:
@@ -7477,6 +7573,53 @@ def unread_output():
     check("unread output: what it printed went to its log", "xxxx" in log(A, n), len(log(A, n)))
 
 
+def suspend_slow_cmd():
+    """#505: a `run -- CMD` whose stdout drains slowly is suspended (SIGTERM) in the middle of more output
+    than the guest keeps for a session; `flexvm resume` reattaches and prints the rest. Every byte comes
+    out once, and the resumed process exits with CMD's status."""
+    n = "ft-susp-slow"
+    scenario_vms.add(n)
+    total = 6000000
+    out = []
+
+    def slow(p):
+        # About 1.6 MB/s: well behind the command.
+        while d := p.stdout.read(16384):
+            out.append(d)
+            time.sleep(0.01)
+
+    p = subprocess.Popen([BIN, "--state", A.state, "--run", A.run, "run", n, "--template", args.template, "--",
+                          f"head -c {total} /dev/zero | tr '\\0' x; exit 7"],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=ENV)
+    reader = threading.Thread(target=slow, args=(p,))
+    reader.start()
+    started = wait_for(lambda: sum(map(len, out)) >= 1000000, 60)
+    check("suspend slow cmd: output is coming", started, (sum(map(len, out)), p.poll()))
+    os.kill(vm_pid(A, n), signal.SIGTERM)
+    try:
+        code = p.wait(timeout=60)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        code = p.wait()
+    reader.join()
+    first = sum(map(len, out))
+    check("suspend slow cmd: SIGTERM suspends it mid-output", code == 128 + signal.SIGTERM and first < total
+          and vms(A).get(n, {}).get("state") == "suspended", (code, first, vms(A).get(n), p.stderr.read()[-300:]))
+    r = subprocess.Popen([BIN, "--state", A.state, "--run", A.run, "resume", n], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=ENV)
+    reader = threading.Thread(target=slow, args=(r,))
+    reader.start()
+    try:
+        code = r.wait(timeout=120)
+    except subprocess.TimeoutExpired:
+        r.kill()
+        code = r.wait()
+    reader.join()
+    data = b"".join(out)
+    check("suspend slow cmd: resumed, every byte once and CMD's status", code == 7 and data == b"x" * total,
+          (code, first, len(data), data.count(b"x"), r.stderr.read()[-300:]))
+    check("suspend slow cmd: gone after it", n not in vms(A), vms(A).get(n))
+
+
 def suspend_killed():
     """SIGINT means destroy, and it wins over a suspend: a kill that comes
     while the suspend is publishing its checkpoint revokes the checkpoint
@@ -8371,7 +8514,7 @@ SCENARIOS = dict(
     cow_wp_race=cow_wp_race, fetch_tail_enomem=fetch_tail_enomem, fetch_enomem_stuck=fetch_enomem_stuck, pull_enomem=pull_enomem,
     collapse_abort=collapse_abort, collapse_ckpt_fail=collapse_ckpt_fail, ckpt_paused_backlog=ckpt_paused_backlog, same_host_order=same_host_order, same_host_slow_route=same_host_slow_route, same_host_flood=same_host_flood, same_host_late_handover=same_host_late_handover, same_host_backlog=same_host_backlog, same_host_bulk_tcp=same_host_bulk_tcp, ckpt_backlog=ckpt_backlog, rx_stall=rx_stall, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,
     handoff_superseded=handoff_superseded, delayed_announce=delayed_announce, delayed_announce_handoff=delayed_announce_handoff, announce_arp_timer=announce_arp_timer,
-    prepare_fail_announce=prepare_fail_announce, reconcile_announce=reconcile_announce, reconcile_kill=reconcile_kill, resume_pull_lock=resume_pull_lock, page_conns=page_conns, suspend_cmd=suspend_cmd, suspend_overlap=suspend_overlap, fc_died_busy=fc_died_busy, pause_cmd_start=pause_cmd_start, suspend_died=suspend_died,
+    prepare_fail_announce=prepare_fail_announce, reconcile_announce=reconcile_announce, reconcile_kill=reconcile_kill, resume_pull_lock=resume_pull_lock, page_conns=page_conns, suspend_cmd=suspend_cmd, suspend_slow_cmd=suspend_slow_cmd, suspend_overlap=suspend_overlap, fc_died_busy=fc_died_busy, pause_cmd_start=pause_cmd_start, suspend_died=suspend_died,
     ctrl_z_long_op=ctrl_z_long_op, resume_suspending=resume_suspending, quit_status=quit_status)
 # Measurements, not correctness checks (nothing they print has a threshold): run only when named.
 BENCHMARKS = dict(ckpt_stall=ckpt_stall)
