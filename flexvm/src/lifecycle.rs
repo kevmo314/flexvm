@@ -353,9 +353,20 @@ impl Proc {
             Some(ip) => Some(ip.parse().map_err(|_| format!("bad address {ip:?}"))?),
             None => Some(ck.manifest.ip),
         };
-        let claim = match want.filter(|&ip| !self.host.config_now().range().is_ok_and(|r| r.contains(ip))) {
-            Some(ip) => self.borrow(&name, ip)?,
-            None => self.host.claim_new(&self.host.lock()?, &name, want).map_err(|e| format!("{e}; restore with --ip auto (or another address)"))?,
+        // Decided and claimed under one lock, by one reading of the range: a change
+        // between them cannot send a local address to `claim_new` as foreign.
+        let l = self.host.lock()?;
+        let cfg = self.host.config_now();
+        let claim = match want.filter(|&ip| !cfg.range().is_ok_and(|r| r.contains(ip))) {
+            Some(ip) => {
+                drop(l);
+                self.borrow(&name, ip)?
+            }
+            None => {
+                let claim = self.host.claim_new_in(&l, &cfg, &name, want);
+                drop(l);
+                claim.map_err(|e| format!("{e}; restore with --ip auto (or another address)"))?
+            }
         };
         let ip = self.set_addr(claim);
         t.mark("claim_ip");

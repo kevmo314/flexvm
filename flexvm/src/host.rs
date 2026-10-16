@@ -821,7 +821,12 @@ impl Host {
     /// From the range as host.json has it now (a standby started before a `--vm-ips`
     /// change claims from the new one); addresses handed out before it stay.
     pub fn claim_new(&self, l: &Locked, holder: &str, want: Option<Ipv4Addr>) -> Result<AddrClaim> {
-        let range = self.config_now().range()?;
+        self.claim_new_in(l, &self.config_now(), holder, want)
+    }
+
+    /// `claim_new` from `cfg`'s range: a caller that decided by that range claims by it too.
+    pub fn claim_new_in(&self, l: &Locked, cfg: &Config, holder: &str, want: Option<Ipv4Addr>) -> Result<AddrClaim> {
+        let range = cfg.range()?;
         let taken = |ip| self.addr(l, ip).map_or(true, |a| a.lent.is_some() || self.held(&a));
         let ip = match want {
             Some(ip) if !range.allocatable(ip) => {
@@ -955,16 +960,19 @@ impl Host {
         })
     }
 
-    /// True if this made the loan (only then may its maker undo it). On any
-    /// host, the source's own claim is marked `leaving` until it `stay`s.
-    /// `mig` to `to`: what a sweep asks should the source die meanwhile.
+    /// True if this made the loan (only then may its maker undo it). The
+    /// source's own claim is marked `leaving` until it `stay`s. `mig` to `to`:
+    /// what a sweep asks should the source die meanwhile. Lent whatever the
+    /// range is now: the range decides only what is newly handed out, never
+    /// whether an address in use is tracked, so a range that drops it and later
+    /// takes it back never hands it out while the VM runs elsewhere (#521).
     pub fn lend(&self, l: &Locked, ip: Ipv4Addr, gen: u64, mig: u64, to: &str) -> Result<bool> {
-        let (home, me) = (self.config_now().range()?.contains(ip), Ident::me());
+        let me = Ident::me();
         self.update(l, ip, true, |a| {
             if a.holder_id.as_ref() == Some(&me) {
                 a.leaving = Some(Leaving { mig, to: to.into() });
             }
-            home && a.lent.replace(gen) != Some(gen)
+            a.lent.replace(gen) != Some(gen)
         })
     }
 
@@ -3116,7 +3124,8 @@ mod tests {
         assert!(!moving(home) && h.addr(&l, home).unwrap().lent == Some(c.gen), "the loan is its maker's to undo");
         h.unlend(&l, home, c.gen).unwrap();
         let d = h.claim_incoming(&l, "vm2", away, 7, None).unwrap();
-        assert!(!moving(away) && !h.lend(&l, away, 7, 2, "t").unwrap() && moving(away), "not lent elsewhere, yet moving");
+        assert!(!moving(away) && h.lend(&l, away, 7, 2, "t").unwrap() && moving(away), "lent here too, whatever the range");
+        h.unlend(&l, away, 7).unwrap();
         // Another instance's claim is not this source's.
         let mut a = h.addr(&l, away).unwrap();
         a.holder_id = Some(Ident { start: 1, ..Ident::me() });
@@ -3912,7 +3921,43 @@ mod tests {
         let c = h.claim_new(&l, "x", None).unwrap();
         assert_eq!(c.ip, new);
         assert!(h.lend(&l, new, c.gen, 1, "t").unwrap(), "home by the new range: lent here");
-        assert!(!h.lend(&l, old, 7, 2, "t").unwrap(), "the old range is no longer home");
+    }
+
+    /// A VM's address the range dropped while it ran: migrated away, its loan is still
+    /// recorded, so the range taking it back never hands it out meanwhile (#521).
+    #[test]
+    fn an_address_a_range_change_dropped_stays_lent_when_its_vm_migrates() {
+        let (_dir, mut h) = host("dropped-range");
+        let set = |h: &mut Host, r: &str| {
+            h.configure(|c| {
+                c.vm_ips = r.into();
+                Ok(())
+            })
+            .unwrap()
+        };
+        set(&mut h, "10.9.0.1-10.9.0.1");
+        let x = ip("10.9.0.1");
+        let l = h.lock().unwrap();
+        let c = h.claim_new(&l, "vm", None).unwrap();
+        let gen = c.gen;
+        assert_eq!(c.ip, x);
+        drop(l);
+        set(&mut h, "10.9.0.2-10.9.0.2");
+        let l = h.lock().unwrap();
+        assert!(h.lend(&l, x, gen, 1, "t").unwrap(), "lent though out of range now");
+        // The source lets go once the target has it.
+        h.release(&l, x, "vm", None).unwrap();
+        c.keep();
+        drop(l);
+        set(&mut h, "10.9.0.1-10.9.0.1");
+        let l = h.lock().unwrap();
+        assert_eq!(h.addr(&l, x).unwrap().lent, Some(gen));
+        assert!(h.claim_new(&l, "w", Some(x)).err().unwrap().to_string().contains("lent out"));
+        assert!(h.claim_new(&l, "w", None).is_err(), "nothing else to hand out");
+        assert!(h.lend_new(&l, x).is_err());
+        // Withdrawn (the VM gone wherever it ran): free again.
+        assert!(h.observe(&l, x, gen, 0, None).unwrap());
+        assert_eq!(h.claim_new(&l, "w", None).unwrap().ip, x);
     }
 
     #[test]
