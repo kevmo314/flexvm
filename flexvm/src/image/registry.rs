@@ -629,12 +629,11 @@ fn cached_blob<R: Read>(digest: &str, size: u64, blobs: &Path, download: impl Fn
 
 pub(super) fn sweep_parts(dir: &Path) {
     use std::os::fd::AsRawFd;
-    let Ok(dir_lock) = super::publish_lock(dir) else { return };
+    let Ok(pinned) = crate::host::Directory::open(dir) else { return };
+    let Ok(dir_lock) = super::publish_lock(&pinned) else { return };
     let Ok(_lock) = crate::host::Flock::new(dir_lock, libc::LOCK_EX | libc::LOCK_NB) else { return };
-    // Entries are opened and removed relative to the directory as opened here.
-    let Ok(dir_c) = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()) else { return };
-    let Ok(fd) = crate::util::open_dir_at(libc::AT_FDCWD, &dir_c) else { return };
-    let Ok(entries) = std::fs::read_dir(format!("/proc/self/fd/{}", fd.as_raw_fd())) else { return };
+    let fd = &pinned.fd;
+    let Ok(entries) = std::fs::read_dir(&pinned.path) else { return };
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some((hex, id)) = name.to_str().and_then(|n| n.rsplit_once(".part")) else { continue };

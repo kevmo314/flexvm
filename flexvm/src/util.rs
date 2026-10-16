@@ -2317,13 +2317,13 @@ pub mod output {
     pub fn append_capped(log: &Path, data: &[u8], cap: u64) -> bool {
         let deadline = Instant::now() + STALL;
         // Taken on an open of this call's own: one shared would not exclude the others sharing it.
-        let lock = log_lock(log).and_then(|l| crate::host::private_file(&l)).ok();
-        let locked = lock.as_ref().is_some_and(|l| loop {
-            match crate::host::flock(l, libc::LOCK_EX | libc::LOCK_NB) {
+        let lock = log_lock(log).ok().and_then(|path| loop {
+            match crate::host::lock_path(&path, libc::LOCK_EX | libc::LOCK_NB) {
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline => std::thread::sleep(Duration::from_millis(1)),
-                r => break r.is_ok(),
+                result => break result.ok(),
             }
         });
+        let locked = lock.is_some();
         use std::os::unix::fs::OpenOptionsExt;
         let written = File::options().create(true).append(true).mode(0o600).open(log).is_ok_and(|mut f| {
             let written = f.write_all(data).is_ok();
@@ -2334,7 +2334,7 @@ pub mod output {
             }
             written
         });
-        if let Some(l) = lock.filter(|_| locked) {
+        if let Some(l) = lock {
             // Unlocked, not only closed: see `host::Flock`.
             let _ = crate::host::flock(&l, libc::LOCK_UN);
         }

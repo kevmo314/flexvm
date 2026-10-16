@@ -2717,12 +2717,23 @@ pub fn keyed(kind: &str, st: &libc::stat, rest: &str) -> String {
     format!("{kind}-{}-{}{rest}", st.st_dev, st.st_ino)
 }
 
-/// `dir`'s stat, for `keyed`.
-pub fn stat_dir(dir: &Path) -> std::io::Result<libc::stat> {
-    let m = std::fs::metadata(dir)?;
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    (st.st_dev, st.st_ino) = (m.dev(), m.ino());
-    Ok(st)
+/// A directory opened once, for a lock keyed by it (`keyed`) and work in it: `path`
+/// reaches it through the descriptor, whatever its own path names since, for this
+/// process and its children.
+pub struct Directory {
+    pub fd: OwnedFd,
+    pub path: PathBuf,
+}
+
+impl Directory {
+    pub fn open(path: &Path) -> std::io::Result<Self> {
+        let fd: OwnedFd = std::os::unix::fs::OpenOptionsExt::custom_flags(File::options().read(true), libc::O_DIRECTORY).open(path)?.into();
+        Ok(Self { path: PathBuf::from(format!("/proc/{}/fd/{}", std::process::id(), fd.as_raw_fd())), fd })
+    }
+
+    pub fn stat(&self) -> std::io::Result<libc::stat> {
+        crate::util::fstat(self.fd.as_raw_fd())
+    }
 }
 
 /// A lock held and unlinked when dropped (then let go of explicitly): `lock_at`.
@@ -2742,15 +2753,65 @@ impl Drop for HeldLock {
 /// `name` in `dir`, locked, and the file there still: a holder may unlink it just
 /// before we lock (`HeldLock`), so retried until the one locked is the name's.
 pub fn lock_at(dir: OwnedFd, name: &str, how: i32) -> std::io::Result<HeldLock> {
+    lock_at_with(dir, name, |file| flock(file, how))
+}
+
+/// Like `lock_at`, with an interruptible or bounded acquisition.
+pub fn lock_at_with(dir: OwnedFd, name: &str, take: impl Fn(&File) -> std::io::Result<()>) -> std::io::Result<HeldLock> {
     let c = std::ffi::CString::new(name)?;
     loop {
         let file = open_lock(&dir, std::ffi::OsStr::new(name))?;
-        flock(&file, how)?;
+        take(&file)?;
         let (now, mine) = (crate::util::stat_at(dir.as_raw_fd(), &c), file.metadata()?);
         if now.is_some_and(|st| st.st_ino == mine.ino() && st.st_dev == mine.dev()) {
             return Ok(HeldLock { dir, name: c, file });
         }
         let _ = flock(&file, libc::LOCK_UN);
+    }
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    };
+    use std::time::Duration;
+
+    #[test]
+    fn waiter_on_unlinked_lock_retries_the_current_inode() {
+        let root = crate::test_util::TempDir::new("unlinked-waiter");
+        let dir = root.join("locks");
+        let first = lock_at(lock_dir(&dir).unwrap(), "key", libc::LOCK_EX).unwrap();
+        let ((opened, opening), (resume, resumed), (finished, done)) = (mpsc::channel(), mpsc::channel(), mpsc::channel());
+        let waiter_dir = dir.clone();
+        let waiter = std::thread::spawn(move || {
+            let first = AtomicBool::new(true);
+            let held = lock_at_with(lock_dir(&waiter_dir).unwrap(), "key", |file| {
+                if first.swap(false, Ordering::SeqCst) {
+                    opened.send(()).unwrap();
+                    resumed.recv().unwrap();
+                }
+                flock(file, libc::LOCK_EX)
+            })
+            .unwrap();
+            finished.send(()).unwrap();
+            held
+        });
+        opening.recv_timeout(Duration::from_secs(5)).unwrap();
+        drop(first);
+        assert!(!dir.join("key").exists());
+        let next = lock_at(lock_dir(&dir).unwrap(), "key", libc::LOCK_EX).unwrap();
+        resume.send(()).unwrap();
+        assert!(done.recv_timeout(Duration::from_millis(100)).is_err(), "waiter must contend on the replacement inode");
+        drop(next);
+        done.recv_timeout(Duration::from_secs(5)).unwrap();
+        let held = waiter.join().unwrap();
+        let current = std::fs::metadata(dir.join("key")).unwrap();
+        assert_eq!(current.ino(), held.file.metadata().unwrap().ino());
+        drop(held);
+        assert!(!dir.join("key").exists());
     }
 }
 
@@ -2855,6 +2916,7 @@ pub fn lock_path(path: &Path, how: i32) -> std::io::Result<File> {
         if crate::util::stat_at(dir.as_raw_fd(), &c).is_some_and(|st| f.metadata().is_ok_and(|m| m.ino() == st.st_ino && m.dev() == st.st_dev)) {
             return Ok(f);
         }
+        let _ = flock(&f, libc::LOCK_UN);
     }
 }
 

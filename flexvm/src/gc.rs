@@ -65,9 +65,11 @@ pub fn local_cleanup(host: &Host) {
         crate::log!("garbage collection: {e}");
     }
     vm_files(host);
+    orphan_log_locks(&host.run.join("vms"));
     for e in std::fs::read_dir(host.run.join("standby")).into_iter().flatten().flatten() {
         if e.file_type().is_ok_and(|t| t.is_dir()) {
             standby_sockets(&e.path());
+            orphan_log_locks(&e.path());
         }
     }
     load_sets(&host.run.join("standby"));
@@ -124,9 +126,23 @@ fn vm_files(host: &Host) {
         let Ok(suspended) = host.suspended(name) else { continue };
         let orphan = host.holder_gone(name) && !suspended.exists() && !["failed", "moved"].iter().any(|ext| host.vms(name, ext).is_ok_and(|p| p.exists()));
         if orphan {
-            // Its writers' lock (`output::log_lock`) stays: one may have it open, not yet
-            // locked, and a new one would let two writers rotate at once.
+            // Its writers' lock goes after (`orphan_log_locks`).
             let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// Writers' locks (`output::log_lock`) in `dir` with neither log there, removed while held:
+/// a writer that opened one before checks after locking that it is still the name's.
+fn orphan_log_locks(dir: &Path) {
+    for entry in std::fs::read_dir(crate::host::locks(dir)).into_iter().flatten().flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str().filter(|n| n.ends_with(".log") && !n.starts_with('.')) else { continue };
+        let log = dir.join(name);
+        let Ok(lock) = crate::host::lock_path(&entry.path(), libc::LOCK_EX | libc::LOCK_NB) else { continue };
+        let Ok(_held) = Flock::new(lock, libc::LOCK_EX | libc::LOCK_NB) else { continue };
+        if !log.exists() && !log.with_extension("log.1").exists() {
+            let _ = std::fs::remove_file(entry.path());
         }
     }
 }
@@ -271,10 +287,28 @@ mod tests {
         assert!(logs.iter().all(|p| !p.exists()), "without its snapshot the old logs are orphaned");
     }
 
-    /// An orphaned log goes; its writers' lock stays, since a writer may have it open,
-    /// not yet locked, and a new one would let two writers rotate at once.
     #[test]
-    fn a_logs_writer_lock_outlives_the_log() {
+    fn orphan_standby_log_locks_are_removed_only_while_free_and_without_logs() {
+        let d = crate::test_util::TempDir::new("standby-log-locks");
+        let log = d.join("standby.log");
+        let path = crate::util::output::log_lock(&log).unwrap();
+        let lock = crate::host::lock_path(&path, libc::LOCK_EX).unwrap();
+        let held = Flock::new(lock, libc::LOCK_EX).unwrap();
+        orphan_log_locks(&d);
+        assert!(path.exists());
+        drop(held);
+        std::fs::write(log.with_extension("log.1"), b"previous").unwrap();
+        orphan_log_locks(&d);
+        assert!(path.exists(), "a rotated log still needs its writer lock");
+        std::fs::remove_file(log.with_extension("log.1")).unwrap();
+        orphan_log_locks(&d);
+        assert!(!path.exists());
+    }
+
+    /// An orphaned log and its writers' lock go together, even with a waiter open,
+    /// which must retry on the replacement lock before rotating.
+    #[test]
+    fn a_logs_writer_lock_is_removed_with_the_log() {
         let d = dir("writer-lock");
         let host = Host::open(&d.join("state"), &d.join("run")).unwrap();
         let log = host.vms("gone", "log").unwrap();
@@ -283,9 +317,11 @@ mod tests {
         let lock = crate::util::output::log_lock(&log).unwrap();
         let writer = File::open(&lock).unwrap();
         vm_files(&host);
-        assert!(!log.exists() && lock.exists(), "the log goes, its lock stays");
+        orphan_log_locks(&host.run.join("vms"));
+        assert!(!log.exists() && !lock.exists(), "the log and its lock go");
         use std::os::unix::fs::MetadataExt;
-        assert_eq!(writer.metadata().unwrap().ino(), std::fs::metadata(&lock).unwrap().ino());
+        assert!(crate::util::output::append_capped(&log, b"new\n", 1 << 20));
+        assert_ne!(writer.metadata().unwrap().ino(), std::fs::metadata(&lock).unwrap().ino());
         std::fs::remove_dir_all(d).unwrap();
     }
 
