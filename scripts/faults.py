@@ -2586,12 +2586,11 @@ def reconcile_kill():
     kill(B, n)
 
     # A SIGINT taken while the migration still holds the operation lock (the target stalls preparing):
-    # it waits, the outcome turns out unknown, and the wait ends the source all the same.
+    # it waits, and the migration, seeing it before it lends, gives up (#567): the source ends, nothing owed.
     n = "ft-reconcile-kill-waiting"
     what = f"reconcile kill ({n})"
     setup(n, mib=100)
     ip, pid = vms(A)[n]["ip"], vm_pid(A, n)
-    gen = addr(A, ip)["seen"]
     with armed_fault(A, "pages_slow", 120000):
         fault(B, "incoming_stall", 2000)
         with armed_fault(B, "lost_ack", 30000):
@@ -2603,14 +2602,12 @@ def reconcile_kill():
             os.kill(pid, signal.SIGINT)
             th.join()
         gone = wait_for(lambda: not alive(pid), 10)
-        check(f"{what}: the waiting SIGINT ends the source once the outcome is unknown", gone and len(owed(A)) == 1,
+        check(f"{what}: the waiting SIGINT ends the source, the migration giving up", gone and not r[0]["ok"] and "being destroyed" in r[0]["error"] and not owed(A),
               (r[0], owed(A), log(A, n)[-400:]))
         if not gone:
             os.kill(pid, signal.SIGKILL)
-        check(f"{what}: still lent meanwhile", addr(A, ip).get("lent") == gen and not addr(A, ip).get("withdrawn"), addr(A, ip))
         fault(B, "status", 0)
-    check(f"{what}: settled once the target's copy ends", wait_for(lambda: where(n) == {} and cli(A, "debug", "gc")[0] == 0 and not owed(A), 90),
-          (where(n), owed(A), addr(A, ip)))
+    check(f"{what}: it runs nowhere", wait_for(lambda: where(n) == {} and name_free(B, n), 30), where(n))
     check(f"{what}: then free", addr(A, ip).get("lent") is None and addr(A, ip).get("withdrawn"), addr(A, ip))
     kill(B, n)
 
@@ -3885,6 +3882,104 @@ def resume_outcome():
     code, out, err = cli(A, "resume", n)
     check("resume outcome: then it resumes, running when it exits 0", code == 0 and vms(A).get(n, {}).get("state") == "running", (code, err, vms(A).get(n)))
     check("resume outcome: md5 intact", md5(A, n) == m)
+
+
+def kill_prepare():
+    """#567: `flexvm kill` while a migration still prepares wins: the target parked before it
+    answers the prepare (`incoming_gate`), or the source parked having lent the address, not
+    yet leaving (`leave_gate`). The kill waits for the migration (`destroy_wait`), which gives
+    up once it sees it: the VM dies on the source, the target's prepared arrival goes, and
+    the address is neither lent nor run anywhere."""
+    migs = lambda: sorted(f for f in os.listdir(os.path.join(B.state, "migs")) if f.isdigit()) if os.path.isdir(os.path.join(B.state, "migs")) else []
+    for host, gate in ((B, "incoming_gate"), (A, "leave_gate")):
+        n = f"ft-kill-prepare-{'target' if host is B else 'source'}"
+        what = f"kill during prepare ({gate})"
+        setup(n, mib=1)
+        ip, pid, recorded = vms(A)[n]["ip"], vm_pid(A, n), migs()
+        clear_gate(host, gate)
+        clear_gate(A, "destroy_wait")
+        # The gate under the source's 10 s for the target's answer (PREFLIGHT_TIMEOUT).
+        with armed_fault(A, "destroy_wait", 60000), armed_fault(host, gate, 8000):
+            moved, mt = background(lambda: migrate(A, n, B))
+            check(f"{what}: the migration got to the gate", wait_for(lambda: reached(host, gate), 8), reached(host, gate))
+            killed, kt = background(lambda: kill(A, n))
+            check(f"{what}: the kill waits for the migration", wait_for(lambda: reached(A, "destroy_wait"), 8), reached(A, "destroy_wait"))
+            fault(host, gate, 0)
+            mt.join()
+            kt.join()
+        r = moved["r"]
+        check(f"{what}: the migration gives up for the kill", not r["ok"] and "being destroyed" in r["error"], r)
+        check(f"{what}: the kill succeeds", killed["r"]["ok"], killed["r"])
+        check(f"{what}: the source process is gone", not alive(pid), log(A, n)[-500:])
+        check(f"{what}: it runs nowhere", where(n) == {} and name_free(B, n), where(n))
+        check(f"{what}: not moved", not os.path.exists(os.path.join(A.run, "vms", f"{n}.moved")))
+        check(f"{what}: the target keeps no record", wait_for(lambda: migs() == recorded, 10), (recorded, migs()))
+        a = addr(A, ip)
+        check(f"{what}: the address is not lent, nor left", a.get("lent") is None and not a.get("leaving") and not a.get("holder"), a)
+
+
+def resume_migrating():
+    """#569: `flexvm resume` of a VM whose migration's outcome is unknown (ack lost, status
+    unavailable: it stays paused here, reconciling) fails, saying it is migrating away, rather
+    than reporting a resume that never ran: whether it was paused or running when it left."""
+    for paused in (True, False):
+        n = f"ft-resume-migrating-{'paused' if paused else 'running'}"
+        what = f"resume migrating ({'paused' if paused else 'running'})"
+        clear_log(A, n)
+        setup(n, mib=1)
+        if paused:
+            check(f"{what}: paused", pause(A, n))
+        with armed_fault(B, "lost_ack", 30000):
+            fault(B, "status", 30000)
+            r = migrate(A, n, B)
+        check(f"{what}: outcome unknown, the source reconciling", not r["ok"] and vms(A).get(n, {}).get("state") == "reconciling", (r, where(n)))
+        code, out, err = cli(A, "resume", n)
+        check(f"{what}: resume fails, saying so", code != 0 and "migrating away" in err, (code, out, err))
+        check(f"{what}: the vm process said so", "migrating away" in log(A, n), log(A, n)[-500:])
+        fault(B, "status", 0)
+        st = wait_released(B, n, timeout=60)
+        check(f"{what}: then it moves on", st["released"] is True and st["state"] == ("paused" if paused else "running"), st)
+
+
+def resume_bind_fail():
+    """#569: a resume whose control socket cannot be bound (a directory in its place) fails
+    before its VM runs or is published: its checkpoint is kept, not consumed, and it resumes
+    once the socket can be bound."""
+    n = "ft-resume-bind"
+    m = setup(n, mib=20)
+    suspend(A, n)
+    sock = os.path.join(A.run, "vms", f"{n}.sock")
+    os.mkdir(sock)
+    try:
+        r = resume_suspended(A, n)
+    finally:
+        os.rmdir(sock)
+    check("resume bind fails: refused, saying why", not r["ok"] and "no control socket" in r["error"], r)
+    check("resume bind fails: still suspended", vms(A).get(n, {}).get("state") == "suspended", vms(A).get(n))
+    r = resume_suspended(A, n)
+    check("resume bind fails: then it resumes, md5 intact", r["ok"] and md5(A, n) == m, r)
+
+
+def app_abort():
+    """#569: an image VM's app output goes on after a migration aborted once its source
+    left (the target refuses a bad preload page, `bad_preload`), none lost or repeated."""
+    n = "ft-app-abort"
+    tpl = app_template()
+    clear_log(A, n)
+    ok(run(A, n, template=tpl))
+    upto = lambda k: wait_for(lambda: max(app_lines(log(A, n)), default=-1) >= k, 60)
+    check("app abort: printing", upto(5), log(A, n)[-500:])
+    with armed_fault(A, "bad_preload", 10000):
+        r = migrate(A, n, B)
+    check("app abort: the target refused, the migration aborted", not r["ok"] and "target refused" in r["error"], r)
+    check("app abort: runs on A", where(n) == {A: "running"}, where(n))
+    last = max(app_lines(log(A, n)))
+    check("app abort: printing after the abort", upto(last + 20), log(A, n)[-500:])
+    lines = app_lines(log(A, n))
+    dups = sorted({x for x in lines if lines.count(x) > 1})
+    check("app abort: no line printed twice", not dups, dups[:20])
+    missing = sorted(set(range(min(lines), max(lines) + 1)) - set(lines))
+    check("app abort: none lost", not missing, missing[:20])
 
 
 def abort_link_fail():
@@ -6287,27 +6382,25 @@ def kill_source():
 
 
 def kill_refused_checkpoint():
-    """A kill that waited for a migration and was refused (the VM became its
-    source) leaves nothing behind: once the target dies mid-pull and the
-    source runs its copy again, a checkpoint is not taken for killed."""
+    """A kill refused for a migration's source (a kill that comes while it
+    still prepares wins instead: kill_prepare) leaves nothing behind: once
+    the target dies mid-pull and the source runs its copy again, a
+    checkpoint is not taken for killed."""
     n = "ft-kill-refused"
     clear_log(A, n)
     m = setup(n, mib=1500)
     pid = vm_pid(A, n)
-    fault(B, "incoming_stall", 2000)
-    r = [None]
-    t = start_thread(target=lambda: r.__setitem__(0, migrate(A, n, B)))
-    # The target stalls preparing; the source holds its operation lock, not yet a source.
     lock = os.path.join(B.run, "vms", ".locks", f"{n}.lock")
-    wait_for(lambda: os.path.exists(lock) and open(lock).read().strip(), 20)
-    os.kill(pid, signal.SIGINT)
-    t.join()
-    check("kill refused: migrated", r[0]["ok"], r[0])
+    # Its pages slow to come: the target is still pulling when the kill comes.
+    with armed_fault(A, "pages_slow", 120000):
+        r = migrate(A, n, B)
+        check("kill refused: migrated", r["ok"], r)
+        os.kill(pid, signal.SIGINT)
+        check("kill refused: the kill was refused for the source",
+              wait_for(lambda: "source of a migration" in log(A, n), 10) and alive(pid), log(A, n)[-500:])
     with armed_fault(A, "pages", 6000):
         tpid = json.load(open(lock))["pid"]
         os.kill(tpid, signal.SIGKILL)
-        check("kill refused: the kill was refused for the source",
-              wait_for(lambda: "source of a migration" in log(A, n), 10) and alive(pid), log(A, n)[-500:])
     check("kill refused: the source runs its copy again", wait_for(lambda: where(n) == {A: "running"}, 60), where(n))
     c = checkpoint(A, n, ckpt_path(n))
     check("kill refused: a checkpoint afterwards succeeds", c["ok"], c)
@@ -8936,6 +9029,7 @@ SCENARIOS = dict(
     collapse_abort=collapse_abort, collapse_ckpt_fail=collapse_ckpt_fail, ckpt_paused_backlog=ckpt_paused_backlog, same_host_order=same_host_order, same_host_slow_route=same_host_slow_route, same_host_flood=same_host_flood, same_host_late_handover=same_host_late_handover, same_host_hold_route_fail=same_host_hold_route_fail, same_host_backlog=same_host_backlog, same_host_bulk_tcp=same_host_bulk_tcp, ckpt_backlog=ckpt_backlog, rx_stall=rx_stall, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,
     handoff_superseded=handoff_superseded, delayed_announce=delayed_announce, delayed_announce_handoff=delayed_announce_handoff, announce_arp_timer=announce_arp_timer,
     prepare_fail_announce=prepare_fail_announce, reconcile_announce=reconcile_announce, reconcile_kill=reconcile_kill, resume_pull_lock=resume_pull_lock, page_conns=page_conns, suspend_cmd=suspend_cmd, suspend_slow_cmd=suspend_slow_cmd, suspend_overlap=suspend_overlap, fc_died_busy=fc_died_busy, pause_cmd_start=pause_cmd_start, suspend_died=suspend_died,
+    kill_prepare=kill_prepare, resume_migrating=resume_migrating, resume_bind_fail=resume_bind_fail, app_abort=app_abort,
     ctrl_z_long_op=ctrl_z_long_op, resume_suspending=resume_suspending, quit_status=quit_status, resume_outcome=resume_outcome, exec_recovery_instance=exec_recovery_instance,
     ckpt_ancestor_corrupt=ckpt_ancestor_corrupt, resume_listener_restart=resume_listener_restart,
     resume_killed_marked=resume_killed_marked, restore_route_fence=restore_route_fence, reboot=reboot)

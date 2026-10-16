@@ -546,6 +546,17 @@ impl Proc {
         Ok(())
     }
 
+    /// Before a suspend keeps the claim (#585): its revision recorded durably, as an `advance` whose
+    /// write failed is still retried to (the retry stops once the claim is kept), and the record
+    /// synced (#563). An error fails the suspend: the resumed VM would announce a revision
+    /// already announced, and a late announcement of it (an aborted target's) would pass.
+    pub fn record_for_suspend(&self) -> Result<()> {
+        let Some(ip) = self.ip() else { return Ok(()) };
+        let l = self.host.lock()?;
+        self.record_rev(&l).map_err(|e| format!("recording its revision: {e}"))?;
+        self.host.sync_addr(&l, ip)
+    }
+
     /// Publishes the VM's revision as it is now (which only changes under the host lock), if it has an address.
     fn publish_rev(&self, l: &crate::host::Locked) -> Result<()> {
         let Some((ip, gen, rev)) = self.addr.lock().unwrap().as_ref().map(|a| (a.ip, a.gen, a.rev)) else {
@@ -754,10 +765,16 @@ impl Proc {
     /// For a pause or resume: refused once a destroy waits for `op` too.
     pub fn op_unless_destroyed(&self) -> Result<Op<'_>> {
         let op = self.op_within()?;
-        if self.destroy_code().is_some() {
-            bail!("vm {} is being destroyed", self.name());
-        }
+        self.not_destroyed()?;
         Ok(op)
+    }
+
+    /// Refused once a destroy waits for `op`: for an operation that already holds it.
+    pub fn not_destroyed(&self) -> Result<()> {
+        match self.destroy_code() {
+            Some(_) => bail!("vm {} is being destroyed", self.name()),
+            None => Ok(()),
+        }
     }
 
     fn try_destroy(&self, code: i32) -> Error {
@@ -772,6 +789,8 @@ impl Proc {
         }
         vm.cancel_checkpoint.fetch_add(1, Ordering::SeqCst);
         vm.pager.abort_copy();
+        // Test marker: a destroy waits for `op` (a migration still preparing gives up once it sees it).
+        crate::host::tripped("destroy_wait");
         let op = self.op();
         if let State::Source(mig) = vm.state() {
             // It became one while this waited (a migration that holds `op` until its outcome is unknown).
@@ -1118,12 +1137,10 @@ impl Proc {
                 self.publish();
                 Ok(())
             }),
+            // Not run here, whether paused or running when it left: `flexvm resume` is told so, not that it runs (#569).
+            libc::SIGCONT if self.leaving.load(Ordering::SeqCst) => Err(format!("vm {} is migrating away (or ending)", vm.name).into()),
             // Also through while a new address is pending (a resume that failed to set it): this one retries it.
-            libc::SIGCONT
-                if self.leaving.load(Ordering::SeqCst) || !(self.paused_by_request.load(Ordering::SeqCst) || vm.pending_net.load(Ordering::SeqCst)) =>
-            {
-                Ok(())
-            }
+            libc::SIGCONT if !(self.paused_by_request.load(Ordering::SeqCst) || vm.pending_net.load(Ordering::SeqCst)) => Ok(()),
             libc::SIGCONT => self.resume().map(drop),
             libc::SIGTERM if matches!(vm.state(), State::Source(_)) => {
                 crate::log!("vm {}: migrating away; it ends once the target has its memory", vm.name);
@@ -1165,6 +1182,10 @@ impl Proc {
         };
         let _ = c.set_read_timeout(None);
         let reply = match req["op"].as_str().unwrap_or("") {
+            // Bound before a resume or restore runs its VM (`restore_checkpoint`).
+            "exec" | "pages" | "checkpoint" | "migrate" | "debug" | "resume" if self.vm.get().is_none() => {
+                Err(format!("vm {} is starting", self.name()).into())
+            }
             "exec" => return self.exec(&req, c),
             "pages" => return self.pages(&req, fds, slot),
             "checkpoint" => self.op_within().and_then(|op| {
@@ -1441,9 +1462,11 @@ impl Proc {
         }
     }
 
+    /// Kept while the VM is away (a migration's source): an aborted migration runs it here again (#569).
     fn follow_app(self: Arc<Self>) {
         let vm = self.vm().clone();
-        while vm.state().local() {
+        while !vm.dead() {
+            // Refused while it is not running here.
             let got = vm.exec(|s| guest::start_logs(s, self.app_log.load(Ordering::SeqCst), true, guest::TIMEOUT));
             if let Ok((mut g, id)) = got {
                 let _ = g.get_ref().set_read_timeout(None);
@@ -3123,6 +3146,25 @@ mod tests {
         std::fs::remove_dir(&blocker).unwrap();
     }
 
+    /// #585: a suspend records the revision an `advance` failed to, durably, before its claim is
+    /// kept (which ends the retry); failing that, the suspend fails.
+    #[test]
+    fn a_suspend_records_a_revision_whose_write_failed_or_fails() {
+        let (p, _root) = test_proc("suspend-rev", Some("susp"));
+        let claim = p.host.claim_new(&p.host.lock().unwrap(), "susp", None).unwrap();
+        let ip = p.set_addr(claim);
+        let blocker = block_write(&p.host.state.join("addrs"), &ip.to_string());
+        p.advance(&p.host.lock().unwrap(), 2).unwrap();
+        let e = p.record_for_suspend().unwrap_err();
+        assert!(e.to_string().contains("recording its revision"), "{e}");
+        std::fs::remove_dir(&blocker).unwrap();
+        p.record_for_suspend().unwrap();
+        p.addr.lock().unwrap().take().unwrap().keep();
+        let l = p.host.lock().unwrap();
+        assert_eq!(p.host.addr(&l, ip).unwrap().rev, 2, "recorded before the claim was kept");
+        assert!(!p.host.unsynced_marker(ip).exists(), "and durably");
+    }
+
     /// The temporary file `util::write_file` makes for `dir/name`, taken by a directory: writing it fails.
     fn block_write(dir: &std::path::Path, name: &str) -> PathBuf {
         std::fs::create_dir_all(dir).unwrap();
@@ -3204,11 +3246,17 @@ mod tests {
         let inode = std::fs::metadata(&sock).unwrap().ino();
         p.serve_control().unwrap();
         assert_eq!(std::fs::metadata(&sock).unwrap().ino(), inode);
-        let mut c = UnixStream::connect(sock).unwrap();
+        let mut c = UnixStream::connect(&sock).unwrap();
         c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         send_json(&mut c, &json!({"op": "unknown"})).unwrap();
         let reply = crate::util::recv_json(&mut BufReader::new(c)).unwrap().unwrap();
         assert_eq!(reply["error"], "unknown op \"unknown\"");
+        // Bound before a resume or restore has its VM: asked for it, the socket says it is starting.
+        let mut c = UnixStream::connect(&sock).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        send_json(&mut c, &json!({"op": "debug", "what": "status"})).unwrap();
+        let reply = crate::util::recv_json(&mut BufReader::new(c)).unwrap().unwrap();
+        assert_eq!(reply["error"], "vm bound is starting");
     }
 
     #[test]

@@ -202,11 +202,9 @@ impl Proc {
             if dir.exists() && !self.host.is_suspended(&vm.name) {
                 remove_durably(&dir).map_err(|e| format!("removing what is left of {}: {e}", dir.display()))?;
             }
-            // Its address record durable first: a fresh claim's was written without fsync, and a
-            // power loss must not leave a resumable checkpoint whose generation reads as withdrawn (#563).
-            if let Some(ip) = self.ip() {
-                self.host.sync_addr(&self.host.lock()?, ip)?;
-            }
+            // Its address record durable first, at its revision: a fresh claim's was written without fsync, and a
+            // power loss must not leave a resumable checkpoint whose generation reads as withdrawn (#563, #585).
+            self.record_for_suspend()?;
             let staging = Staging::new(&dir, vm.dir.join("checkpoint.vmstate"))?;
             staging.add_file(GEN, self.gen().to_string().as_bytes())?;
             let cmd = match self.cmd.lock().unwrap().clone() {
@@ -426,6 +424,8 @@ impl Proc {
             (_, _, s) => Err(format!("vm is {} before resuming", s.name()).into()),
         };
         ready.map_err(|e| Restore::NotRun(kill(e)))?;
+        // Bound before it is published or runs (#569, as `start_guest`): failing, it never ran and its checkpoint stays.
+        self.serve_control().map_err(|e| Restore::NotRun(kill(e)))?;
         // Published paused, until SIGCONT (`flexvm resume`); `why`: a resume that failed.
         let keep_paused = |t: &mut Phases, why: Option<String>| {
             if ip != m.ip {

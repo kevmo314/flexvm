@@ -646,6 +646,10 @@ fn kill(host: &Host, name: &str) -> Result<()> {
         if !vm.wait(Duration::from_secs(30)) {
             return Err(format!("vm {name} is still there; see {}", host.vms(name, "log")?.display()).into());
         }
+        // A migration past its pause refused the kill, and the VM runs on at its target (#567).
+        if let Ok(to) = std::fs::read_to_string(host.vms(name, "moved")?) {
+            return Err(format!("vm {name} moved to {to} before the kill took; kill it there").into());
+        }
         // A suspend that finished first is undone: the kill wins.
         if !host.suspended(name)?.exists() {
             return Ok(());

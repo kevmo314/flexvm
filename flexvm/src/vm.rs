@@ -401,10 +401,17 @@ impl Vm {
 
     /// For a migration (`Source`) or a checkpoint.
     pub fn leave(&self, to: State) -> Result<()> {
+        self.leave_unless(to, || Ok(()))
+    }
+
+    /// `leave`, unless `veto` refuses: asked under the state lock, so whatever reads the
+    /// state once `veto` has let it go finds it left.
+    pub fn leave_unless(&self, to: State, veto: impl FnOnce() -> Result<()>) -> Result<()> {
         let _devices = self.devices.lock().unwrap();
         self.can_leave()?;
         let mut st = self.state.lock().unwrap();
         self.leavable(*st)?;
+        veto()?;
         self.was_paused.store(*st == State::Paused, Ordering::SeqCst);
         *st = to;
         Ok(())

@@ -107,13 +107,18 @@ impl Proc {
         let unthrottle = unthrottle.elapsed();
         // Made now, not in the hold right before the pause.
         self.holder();
+        // A kill that came while this prepared wins (#567): its connection dropped, the target's arrival goes.
+        self.not_destroyed()?;
         // Lent durably first: a crash with the outcome unknown must not hand the address out.
         self.lent_here.fetch_or(self.host.lend(&self.host.lock()?, vm.ip, gen, mig, to)?, Ordering::SeqCst);
+        // Test gate: lent, not yet leaving.
+        crate::host::gate("leave_gate");
         self.drop_held_in();
         self.set_leaving(true);
         // Test fault `leave_fail`: leaving fails once the address is lent.
+        // A kill that comes before the VM is a source wins; one after it is refused (`try_destroy`).
         let left = crate::fault_result!(tripped("leave_fail") => Err("injected fault: leaving failed".into());
-            vm.leave(State::Source(mig)));
+            vm.leave_unless(State::Source(mig), || self.not_destroyed()));
         if let Err(e) = left {
             self.set_leaving(false);
             // Leaving and its own loan undone in one write.

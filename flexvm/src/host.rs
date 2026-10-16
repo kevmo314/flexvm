@@ -770,7 +770,7 @@ impl Host {
 
     /// `RUN/claims/IP`, with the boot id: the record was last written without fsync in
     /// this boot. A clock can be set, so the boot id, not a time, tells (`read_addr`).
-    fn unsynced_marker(&self, ip: Ipv4Addr) -> PathBuf {
+    pub(crate) fn unsynced_marker(&self, ip: Ipv4Addr) -> PathBuf {
         self.run.join("claims").join(ip.to_string())
     }
 
@@ -1614,6 +1614,12 @@ impl Host {
         // Withdrawn first: a crash before the records go leaves them to settle as aborted (a withdrawal again).
         let current = self.observe(&l, ip, gen, 0, None)?;
         self.unlend(&l, ip, gen)?;
+        // A dead source's `leaving` claim goes too: withdrawn, nothing is owed for it (#570).
+        if let (Some(_), Some(name), Some(by)) = (&a.leaving, &a.holder, &a.holder_id) {
+            if self.dead_and_reaped(&a) {
+                self.release(&l, ip, name, Some(by))?;
+            }
+        }
         if current && !self.reinstall(&l, ip, None)? {
             crate::net::unroute(ip);
         }
@@ -2498,7 +2504,19 @@ impl Host {
             // A source that died mid-migration (its abort's resume included): what became of
             // the VM is its target's to say, as for a source killed while reconciling.
             if let (Some(left), Some(by)) = (a.leaving.as_ref(), a.holder_id.as_ref()) {
-                if a.current(gen) && self.dead_and_reaped(&a) {
+                // Its generation withdrawn or superseded: nothing is owed, the claim just goes (#570).
+                if !a.current(gen) && self.dead_and_reaped(&a) {
+                    match self.release(&l, ip, name, Some(by)) {
+                        Ok(()) => crate::log!(
+                            "vm {name} died as the source of migration {} to {}: {ip} generation {gen} is withdrawn or superseded, so nothing is owed",
+                            left.mig,
+                            left.to
+                        ),
+                        Err(e) => {
+                            crate::log!("vm {name} died as the source of migration {}: letting go of its claim: {e}; retried on the next sweep", left.mig)
+                        }
+                    }
+                } else if a.current(gen) && self.dead_and_reaped(&a) {
                     let owe = || {
                         self.owe(left.mig, &Owed { to: left.to.clone(), ip, gen, by: by.clone() })?;
                         self.release(&l, ip, name, Some(by))
@@ -4300,6 +4318,40 @@ mod tests {
         h.settle_owed_with(5, |_, id| Ok(if id == 51 { "released" } else { "pending" }.into()), |_, _| (), |_, _| ());
         let rec = h.addr(&h.lock().unwrap(), y).unwrap();
         assert!(!rec.withdrawn && rec.current(4) && !h.owed_path(51).exists(), "{rec:?}");
+    }
+
+    #[test]
+    fn a_dead_sources_leaving_claim_goes_once_its_generation_is_withdrawn_or_superseded() {
+        let (_h_dir, h) = host("leaving-stale");
+        // Withdrawn (its target released then killed it), superseded (moved on, gen + 1 announced),
+        // and reclaimed: each source died after lending, before it stayed or was released.
+        let cases = [("10.9.2.1", true, 4, 60, 999_999_941), ("10.9.2.2", false, 5, 61, 999_999_942), ("10.9.2.3", false, 4, 62, 999_999_943)];
+        for (x, withdrawn, seen, mig, pid) in cases {
+            let gone = dead_owner(&h, pid, &[]);
+            let a = Addr {
+                seen,
+                withdrawn,
+                lent: Some(4),
+                holder: Some(format!("vm{mig}")),
+                holder_id: Some(gone.clone()),
+                held: 4,
+                leaving: Some(Leaving { mig, to: "b".into() }),
+                ..Addr::default()
+            };
+            h.put_addr(ip(x), &a, false).unwrap();
+            assert!(h.owes(&gone));
+        }
+        let reclaimed = ip("10.9.2.3");
+        h.reclaim(reclaimed).unwrap();
+        let rec = h.addr(&h.lock().unwrap(), reclaimed).unwrap();
+        assert!(rec.withdrawn && rec.holder.is_none() && rec.leaving.is_none(), "{rec:?}");
+        h.withdraw_dead(false).unwrap();
+        for (x, _, _, mig, pid) in cases {
+            let rec = h.addr(&h.lock().unwrap(), ip(x)).unwrap();
+            assert!(rec.holder.is_none() && rec.holder_id.is_none() && rec.leaving.is_none(), "{x}: {rec:?}");
+            assert!(!h.owed_path(mig).exists(), "{x}: nothing is owed");
+            assert!(!h.owes(&Ident { pid, start: 1, boot: boot_id().into() }), "{x}: its target may forget it");
+        }
     }
 
     #[test]
