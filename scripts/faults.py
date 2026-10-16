@@ -228,6 +228,13 @@ def wait_for(cond, timeout):
     return cond()
 
 
+def name_free(host, name, timeout=10):
+    """Waits until `host` holds no `name`: an arrival it refused or aborted gives the name (its lock)
+    up only once its process has; returns whether it did."""
+    lock = os.path.join(host.run, "vms", f"{name}.lock")
+    return wait_for(lambda: name not in vms(host) and not os.path.exists(lock), timeout)
+
+
 def wait_released(target, name, source=None, timeout=120):
     """Waits until the source's copy of `name` is gone (its process exits once
     the target has every page, or its VM is gone) and the target's pull ended;
@@ -247,15 +254,6 @@ def wait_released(target, name, source=None, timeout=120):
 def fault(host, f, ms):
     code, out, err = cli(host, "debug", "fault", f, str(ms))
     assert code == 0, err
-
-
-FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_before_run", "restore_after_run",
-          "ckpt_abort", "ckpt_fail_protect", "ckpt_fail_write", "ckpt_memhash", "ckpt_no_hold", "ckpt_slow", "resume_kill",
-          "prepare_fail", "short_incoming", "slow_preload", "bad_preload", "bad_app_log", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
-          "started_fsync", "started_unmark", "start_stall", "incoming_stall", "incoming_gate", "admitted_stall", "claim_stall", "standby_lock_stall", "standby_lock_hang", "handoff_stall", "handoff_gate", "ckpt_wp_race", "ckpt_rescue_fail",
-          "fetch_tail_enomem", "fetch_enomem_stuck", "pull_enomem", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo", "release_stall", "release_late", "no_plug", "pause_lost", "tap_backlog", "tap_backlog_stuck", "pause_unknown", "restore_unpause_fail", "resume_link_fail", "resume_partial", "repause_fail", "pause_fail", "restore_ping_slow", "readdress_fail", "no_collapse", "collapse_slow", "pages_slow", "unlend_fail", "route_stall", "suspend_slow", "owe_fail", "settle_unpause", "prealloc_fail", "resume_fence_fail",
-          "leave_fail", "park_fail", "capture_fail", "preload_read_fail", "abort_gen_fail", "abort_stay_fail", "advance_fail", "commit_gate", "commit_fail", "snapshot_fail", "hold_route_fail", "hold_plug_fail",
-          "exec_lose_echo", "exec_retry")
 
 
 def disarm():
@@ -489,7 +487,6 @@ def basic():
     check("basic: records go once their sources are done", wait_for(lambda: not migs(A) and not migs(B), 10), (migs(A), migs(B)))
     s3 = peer(B, {"op": "migration", "mig": 12345})
     check("basic: an unknown id is fenced as aborted", s3["result"]["outcome"] == "aborted", s3)
-    cleanup(n)
 
 
 def route():
@@ -503,7 +500,6 @@ def route():
     st = wait_released(B, n)
     check("route: released, only on B", st["released"] is True and where(n) == {B: "running"}, (st, where(n)))
     check("route: md5 intact", md5(B, n) == m)
-    cleanup(n)
 
 
 def lost_ack():
@@ -515,7 +511,6 @@ def lost_ack():
     st = wait_released(B, n)
     check("lost ack: only on B", where(n) == {B: "running"}, (where(n), st))
     check("lost ack: md5 intact", md5(B, n) == m)
-    cleanup(n)
 
 
 def unknown():
@@ -531,7 +526,6 @@ def unknown():
     st = wait_released(B, n)
     check("unknown: reconciled and released", st["released"] is True and where(n) == {B: "running"}, (st, where(n)))
     check("unknown: md5 intact", md5(B, n) == m)
-    cleanup(n)
 
 
 def refused():
@@ -568,7 +562,6 @@ def pages_blip():
     wait_released(A, n)
     w, back = where(n), md5(A, n)
     check("pages blip: back on A only, md5 intact", w == {A: "running"} and back == m, (w, back))
-    cleanup(n)
 
 
 def pages_dead_restore():
@@ -586,7 +579,6 @@ def pages_dead_restore():
           "page server refused: injected fault" in r.get("error", "") or "snapshot/load" in r.get("error", ""), r.get("error"))
     check("pages dead at restore: source resumed, only on A", where(n) == {A: "running"}, where(n))
     check("pages dead at restore: md5 intact on A", md5(A, n) == m)
-    cleanup(n)
 
 
 def pages_dead():
@@ -602,7 +594,6 @@ def pages_dead():
     check("pages dead: the target said why", re.search(r"died: (background pull|fetching pages for a fault)", said), said[-300:])
     check("pages dead: the source runs its copy again", wait_for(lambda: where(n) == {A: "running"}, 60), where(n))
     check("pages dead: md5 intact on A", md5(A, n) == m)
-    cleanup(n)
 
 
 def resume_kill():
@@ -632,7 +623,6 @@ def resume_kill():
     ok(cli_json(A, "standby", "--template", args.template, "0"))
     r = run(A, n)
     check("resume kill: the name runs again", r["ok"], r)
-    cleanup(n)
 
 
 def prepared_retry():
@@ -652,7 +642,6 @@ def prepared_retry():
     st = wait_released(B, n)
     w, got = where(n), md5(B, n)
     check("prepared retry: only on B, md5 intact", w == {B: "running"} and got == m, (w, got, st))
-    cleanup(n)
 
 
 def quiet_source():
@@ -709,7 +698,6 @@ def quiet_source():
     check("quiet source: md5 intact", md5(B, n) == m)
     check("quiet source: guest still answers", sh(B, n, "echo hi") == (0, "hi"))
     print(f"quiet source: downtime {r['downtime_ms']} ms, checkpoint {r['checkpoint_ms']} ms")
-    cleanup(n)
 
 
 def source_killed():
@@ -823,7 +811,6 @@ def exec_race():
     check("exec race: every exec finished, was refused or moved", not results["cut"] and results["ok"] > 0, results)
     check("exec race: back on A only", where(n) == {A: "running"}, where(n))
     check("exec race: md5 intact", md5(A, n) == m)
-    cleanup(n)
 
 
 def guest_calls():
@@ -889,7 +876,6 @@ def guest_calls():
     retried = lambda: vms(B)[n]["guest_retries"].get("CLOCK", 0) > before
     check("guest calls: a clock step with its reply lost went again", wait_for(retried, 10), vms(B)[n]["guest_retries"])
     check("guest calls: exec after the lost reply", sh(B, n, "echo hi") == (0, "hi"))
-    cleanup(n)
 
 
 def exec_background():
@@ -900,6 +886,24 @@ def exec_background():
     slowly or stays silent after it; a client that takes no output for 60 s is dropped."""
     n = "ft-exec-bg"
     ok(run(A, n))
+    # The guest's sweeper reads the knob only between its sweeps, which come a minute apart without it:
+    # set now at the default wait (600 s), sweeps come every second by the time the wait is shortened.
+    knob = "/run/flexvm-test-abandoned-running-secs"
+    check("exec bg: the sweeper set to sweep every second", sh(A, n, f"echo 600 > {knob}") == (0, ""))
+    sock = os.path.join(A.run, "vms", f"{n}.sock")
+
+    def raw_exec(sid, cmd):
+        s = socket.socket(socket.AF_UNIX)
+        s.settimeout(30)
+        s.connect(sock)
+        s.sendall((json.dumps({"op": "exec", "session": sid, "action": "start", "cmd": cmd}) + "\n").encode())
+        return s
+
+    # #505. A client that stops reading is dropped after 60 s without progress, freeing its relay and
+    # control slot; its session stays in the guest. Started now, checked after the rest below.
+    stalled_id = os.urandom(16).hex()
+    stalled = raw_exec(stalled_id, "head -c 100000000 /dev/zero")
+    stalled_at = time.time()
     # Processes whose command line starts with `cmd` (the ^ keeps grep from counting itself).
     count = lambda cmd: sh(A, n, f"for f in /proc/[0-9]*/cmdline; do tr '\\0' ' ' <$f; echo; done | grep -c '^{cmd} ' || :")
     t = time.time()
@@ -963,20 +967,6 @@ def exec_background():
     stopped = wait_for(lambda: count("yes") == (0, "0"), 10)
     check("exec bg: a piped exec's command is stopped once its stdout breaks", stopped, count("yes"))
     check("exec bg: execs still start after the piped ones", sh(A, n, "echo hi") == (0, "hi"))
-    sock = os.path.join(A.run, "vms", f"{n}.sock")
-
-    def raw_exec(sid, cmd):
-        s = socket.socket(socket.AF_UNIX)
-        s.settimeout(30)
-        s.connect(sock)
-        s.sendall((json.dumps({"op": "exec", "session": sid, "action": "start", "cmd": cmd}) + "\n").encode())
-        return s
-
-    # #505. A client that stops reading is dropped after 60 s without progress, freeing its relay and
-    # control slot; its session stays in the guest. Started now, checked at the end.
-    stalled_id = os.urandom(16).hex()
-    stalled = raw_exec(stalled_id, "head -c 100000000 /dev/zero")
-    stalled_at = time.time()
     sessions = lambda: cli_json(A, "debug", n, "sessions").get("result") or {}
     # A client that reads its exit and then stays silent, its connection open, holds the relay and the
     # guest's handler for 2 s at most; its session stays, exited and unacknowledged, for a reattach.
@@ -1058,7 +1048,6 @@ def exec_background():
         s.connect(sock)
         s.sendall((json.dumps({"op": "exec", "session": stalled_id, "action": "close"}) + "\n").encode())
         s.makefile("rb").readline()
-    knob = "/run/flexvm-test-abandoned-running-secs"
     check("exec bg: the abandoned-session wait is shortened", sh(A, n, f"echo 3 > {knob}") == (0, ""))
     with socket.socket(socket.AF_UNIX) as s:
         s.settimeout(30)
@@ -1071,7 +1060,6 @@ def exec_background():
                 break
             buf += d
     check("exec bg: a resumable exec started", b"ready" in buf, buf[-200:])
-    # The guest's sweeper reads the knob only between its sweeps, which come a minute apart without it.
     stopped = wait_for(lambda: count("sleep 1002") == (0, "0"), 90)
     check("exec bg: a disconnected exec's command is reclaimed", stopped, count("sleep 1002"))
     # A client killed outright (SIGKILL: no close) leaves its command running. Once the client has been
@@ -1107,7 +1095,6 @@ def exec_background():
     # the knob set, a sweep comes every second, so right after the resume too).
     check("exec bg: the abandoned-session wait is set to 8 s", sh(A, n, f"echo 8 > {knob}") == (0, ""))
     sid = os.urandom(16).hex()
-    sock = os.path.join(A.run, "vms", f"{n}.sock")
 
     def session(req, until):
         with socket.socket(socket.AF_UNIX) as s:
@@ -1129,14 +1116,13 @@ def exec_background():
     uptime = lambda: float(sh(A, n, "cut -d' ' -f1 /proc/uptime")[1])
     before = uptime()
     check("exec bg: paused", pause(A, n))
-    time.sleep(20)
+    time.sleep(12)
     resume(A, n)
     counted = uptime() - before
-    check("exec bg: the guest's clock counted the pause", counted >= 20, counted)
+    check("exec bg: the guest's clock counted the pause", counted >= 12, counted)
     out = session({"action": "attach", "offset": 0}, b"done")
     check("exec bg: a session whose client left just before a long pause reattaches after it", b"done" in out, out[-200:])
     sh(A, n, f"rm -f {knob}")
-    cleanup(n)
 
 
 def exec_pause_grace():
@@ -1189,17 +1175,17 @@ def exec_pause_grace():
     seqs = lambda: sh(A, n, "for f in /proc/[0-9]*/comm; do cat $f; done 2>/dev/null | grep -cx seq || :")
     check("exec grace: the output waits for the client", seqs() == (0, "1"), seqs())
     check("exec grace: paused", pause(A, n))
-    time.sleep(40)
+    time.sleep(27)
     resume(A, n)
-    # Past the grace on the wall clock, well within it on the guest's own: it must still be waiting.
+    # Past the grace on the wall clock (about 38 s since the client left), well within it on the
+    # guest's own: it must still be waiting.
     time.sleep(5)
-    check("exec grace: still waiting after a 40 s pause", seqs() == (0, "1"), seqs())
+    check("exec grace: still waiting after a 27 s pause", seqs() == (0, "1"), seqs())
     end, data, code, gaps = output(attach({"action": "attach", "offset": offset}))
     expected = b"".join(b"%d\n" % i for i in range(1, lines + 1))
     check("exec grace: the reattached client gets all of it, nothing lost", not gaps and data == expected,
           (gaps[:3], len(data), len(expected)))
     check("exec grace: then the exit", code == 0 and end == 6 + len(expected), (code, end))
-    cleanup(n)
 
 
 def guest_hang():
@@ -1242,7 +1228,6 @@ def guest_hang():
     ok(migrate(A, n, B))
     wait_released(B, n)
     check("guest hang: migrates afterwards, md5 intact", where(n) == {B: "running"} and md5(B, n) == m, where(n))
-    cleanup(n)
 
 
 def migrate_in_raw(host, name, ip, source, gen=None, template=None):
@@ -1281,8 +1266,7 @@ def spare(h, k):
 def nothing_left(label, name, ip):
     """B holds neither the name nor the address after an abandoned migration."""
     # The incoming process holds the name (its lock) until it has given up.
-    lock = os.path.join(B.run, "vms", f"{name}.lock")
-    check(f"{label}: name free on B", wait_for(lambda: name not in vms(B) and not os.path.exists(lock), 10), vms(B).get(name))
+    check(f"{label}: name free on B", name_free(B, name), vms(B).get(name))
     check(f"{label}: address free on B", wait_for(lambda: not addr(B, ip).get("holder"), 10), addr(B, ip))
     r = run(B, name, ip=ip)
     check(f"{label}: name and address usable on B", r["ok"], r)
@@ -1338,16 +1322,6 @@ def prepare_trickle():
     nothing_left("prepare trickle", n, ip)
 
 
-def gen_zero():
-    """An arrival without a generation (0) is refused: no legacy exemption."""
-    n, ip = "ft-gen0", B.ips.split("-")[1].rsplit(".", 1)[0] + ".202"
-    s, r, _ = migrate_in_raw(B, n, ip, source_vm(), gen=0)
-    s.close()
-    check("gen zero: refused", not r.get("ok") and "generation" in r.get("error", ""), r)
-    r = peer(B, {"op": "route", "ip": ip, "via": "127.0.0.9"})
-    check("gen zero: a route message without one is refused", not r.get("ok"), r)
-
-
 def prepare_fail():
     """A target that fails once everything is prepared refuses before the
     source pauses; the VM never stops running."""
@@ -1365,7 +1339,6 @@ def prepare_fail():
     check("prepare fail: a later migration works", r["ok"] and where(n).get(B) == "running", r)
     wait_released(B, n)
     check("prepare fail: md5 intact on B", md5(B, n) == m)
-    cleanup(n)
 
 
 def arrival_flood():
@@ -1414,7 +1387,6 @@ def arrival_flood():
     check("arrival flood: a later migration works", r["ok"] and where(n).get(B) == "running", r)
     wait_released(B, n)
     check("arrival flood: md5 intact on B", md5(B, n) == m)
-    cleanup(n)
 
 
 
@@ -1601,7 +1573,6 @@ def capture_fail():
     st = wait_released(B, n)
     check("capture fail: a later migration goes", r["ok"] and st["released"] and where(n) == {B: "running"}, (r, st, where(n)))
     check("capture fail: md5 intact on B", md5(B, n) == m)
-    cleanup(n)
 
 
 def abort_gen_fail():
@@ -1636,18 +1607,6 @@ def abort_gen_fail():
     r = run(A, n2, ip=ip)
     check("abort gen fail: a new vm takes the address", r["ok"] and vms(A)[n2]["gen"] > gen, (r, vms(A).get(n2)))
     kill(A, n2)
-
-
-def children(pid):
-    """Pids of `pid`'s child processes."""
-    out = []
-    for c in filter(str.isdigit, os.listdir("/proc")):
-        try:
-            if int(open(f"/proc/{c}/stat").read().rsplit(")", 1)[1].split()[1]) == pid:
-                out.append(int(c))
-        except (OSError, ValueError, IndexError):
-            continue
-    return out
 
 
 def commit_fail():
@@ -1691,7 +1650,6 @@ def commit_fail():
     st = wait_released(B, n)
     check("commit fail: a later migration goes", r["ok"] and st["released"] and where(n) == {B: "running"}, (r, st, where(n)))
     check("commit fail: md5 intact on B", md5(B, n) == m)
-    cleanup(n)
 
 
 def commit_fail_routed():
@@ -1999,7 +1957,6 @@ def same_host_bulk_tcp():
           all(isinstance(h, dict) and h.get("injected") == h.get("packets") and h.get("dropped") == 0 and h.get("dropped_target") == 0
               for h in held), held)
     check("bulk tcp: the download goes on after each move", all(m > 0 for m in moved), (moved, sent[1:]))
-    cleanup(n)
 
 
 def ckpt_backlog():
@@ -2046,7 +2003,6 @@ def ckpt_backlog():
           vm_log.count("injected fault: stopping firecracker") == 3 and vm_log.count("frames still queued on its tap") == 3,
           [l for l in vm_log.splitlines() if "tap" in l][-8:])
     check("ckpt backlog: nothing discarded from its tap", "dropped" not in vm_log, [l for l in vm_log.splitlines() if "dropped" in l])
-    cleanup(n)
 
 
 def ckpt_paused_backlog():
@@ -2073,7 +2029,6 @@ def ckpt_paused_backlog():
     check("paused backlog: the kill counts what was left on its tap", found and int(left.search(log(A, n)).group(1)) > 0,
           [l for l in log(A, n).splitlines() if "tap" in l][-6:])
     rm_ckpt(path)
-    cleanup(n)
 
 
 def udp_receiver(host, n):
@@ -2334,7 +2289,6 @@ def rx_stall():
         t.join(10)
     check("rx stall: the guest kept receiving after every operation", not stalls,
           f"{len(stalls)} stalls in {sum(done.values())} operations {done}, sent {sent[0]}")
-    cleanup(n)
 
 
 def handoff_superseded():
@@ -2736,7 +2690,6 @@ def resume_pull_lock():
         resume(B, n)
     check("resume pull lock: runs on B only, md5 intact", where(n) == {B: "running"} and md5(B, n) == m, where(n))
     cleanup(n)
-    cleanup(other)
 
 
 def page_conns():
@@ -2799,7 +2752,6 @@ def page_conns():
             s.close()
     st = wait_released(B, n)
     check("page conns: migration completed, md5 intact", st["released"] is True and where(n) == {B: "running"} and md5(B, n) == m, (st, where(n)))
-    cleanup(n)
 
 
 def page_refusals():
@@ -2871,7 +2823,6 @@ def page_refusals():
     fault(A, "pages_slow", 0)
     st = wait_released(B, n)
     check("page refusals: migration completed, md5 intact", st["released"] is True and where(n) == {B: "running"} and md5(B, n) == m, (st, where(n)))
-    cleanup(n)
 
 
 def conns(host):
@@ -3164,7 +3115,6 @@ def slow_preload():
     st = wait_released(B, n)
     check("slow preload: released, only on B", st["released"] is True and where(n) == {B: "running"}, (st, where(n)))
     check("slow preload: md5 intact", md5(B, n) == m)
-    cleanup(n)
 
 
 def bad_preload():
@@ -3188,7 +3138,6 @@ def bad_preload():
     check("bad preload: a later migration works", r["ok"] and where(n).get(B) == "running", r)
     wait_released(B, n)
     check("bad preload: md5 intact on B", md5(B, n) == m)
-    cleanup(n)
 
 
 # --- lifecycle: checkpoint / restore / pause / suspend -------------------------
@@ -3545,7 +3494,6 @@ def pause_resume():
     check("paused migrate: resume waited for the whole pull", waited > 1.0 and pulled is not None, (waited, pulled, st))
     check("paused migrate: source released, only on B", where(n) == {B: "running"} and st["released"] is True, (where(n), st))
     check("paused migrate: runs on B after resume, md5 intact", md5(B, n) == m)
-    cleanup(n)
 
 
 def pause_lost():
@@ -3623,7 +3571,6 @@ def pause_lost():
     got = md5(B, n)
     check("unknown before a migration: resumes there, intact", where(n) == {B: "running"} and got == m, (where(n), got, m))
     rm_ckpt(path)
-    cleanup(n)
 
 
 def signals():
@@ -3849,7 +3796,6 @@ def resume_failures():
     check("resume fails after running: not re-armed", n not in vms(A), vms(A).get(n))
     r = resume_suspended(A, n)
     check("resume fails after running: no second resume", not r["ok"], r)
-    cleanup(n)
 
 
 def resume_slow_guest():
@@ -3873,7 +3819,6 @@ def resume_slow_guest():
     check("slow guest: checkpoint deleted once all is in", wait_for(lambda: not os.path.exists(d), 30), d)
     check("slow guest: deleted only once completely paged in", "paged in from" in log(A, n) and "(complete: true" in log(A, n), log(A, n)[-2000:])
     check("slow guest: still running after", vms(A).get(n, {}).get("state") == "running", vms(A).get(n))
-    cleanup(n)
 
 
 def resume_readdress_fail():
@@ -3946,7 +3891,6 @@ def resume_unpause_fail():
     resume(A, n)
     check("unpause fails: flexvm resume runs it", vms(A).get(n, {}).get("state") == "running", vms(A).get(n))
     check("unpause fails: md5 intact, same processes", md5(A, n) == m and marker_id(A, n) == proc, (proc, marker_id(A, n)))
-    cleanup(n)
 
 
 def resume_unsettled():
@@ -4000,7 +3944,6 @@ def resume_outcome():
     code, out, err = cli(A, "resume", n)
     check("resume outcome: then it resumes, running when it exits 0", code == 0 and vms(A).get(n, {}).get("state") == "running", (code, err, vms(A).get(n)))
     check("resume outcome: md5 intact", md5(A, n) == m)
-    cleanup(n)
 
 
 def abort_link_fail():
@@ -4062,7 +4005,6 @@ def suspend_resume():
     err = guest_clock_error(A, n)
     check("suspend: guest clock right", err is not None and abs(err) < 0.5, err)
     check("suspend: paged back in", wait_for(lambda: vms(A)[n].get("pages_mib", {}).get("remote") == 0, 30), vms(A)[n])
-    cleanup(n)
 
 
 def suspend_gen():
@@ -4087,7 +4029,6 @@ def suspend_gen():
     r = restore(A, os.path.join(A.state, "suspended", n), name=n + "2", ip="auto")
     check("suspend gen: without it, its checkpoint restores at a new address", r["ok"] and md5(A, n + "2") == m, r)
     cleanup(n + "2")
-    cleanup(n)
 
 
 def suspend_unaddressed():
@@ -4119,7 +4060,6 @@ def suspend_unaddressed():
     ok(resume_suspended(A, n2))
     check("unaddressed: resumes, md5 intact", md5(A, n2) == m)
     cleanup(n2)
-    cleanup(n)
 
 
 def resume_fence_fails():
@@ -4140,29 +4080,6 @@ def resume_fence_fails():
     check("fence fails: still suspended, never marked", vms(A).get(n, {}).get("state") == "suspended" and not exists("STARTED") and not exists("QUARANTINE") and exists("manifest.json"), vms(A).get(n))
     ok(resume_suspended(A, n))
     check("fence fails: resumes later, md5 intact", md5(A, n) == m)
-    cleanup(n)
-
-
-def quarantine_reboot_ls():
-    """ls agrees with resume about a quarantine: one written in this boot is
-    listed quarantined; after a (faked) reboot, its QUARANTINE no longer
-    holds, so the VM is listed suspended, and resumes."""
-    n = "ft-q-boot"
-    m = setup(n, mib=20)
-    d = suspend(A, n)["dir"]
-    fault(A, "started_fsync", 60000)
-    fault(A, "started_unmark", 60000)
-    r = resume_suspended(A, n)
-    disarm()
-    check("quarantine: resume refused, quarantined", not r["ok"] and "quarantined" in r["error"], r)
-    check("quarantine: listed quarantined in its boot", vms(A).get(n, {}).get("state") == "quarantined", vms(A).get(n))
-    q = os.path.join(d, "QUARANTINE")
-    why = open(q).read().split(" ", 1)[1]
-    open(q, "w").write("another-boot " + why)
-    check("quarantine: after a reboot, listed suspended", vms(A).get(n, {}).get("state") == "suspended" and os.path.exists(q), vms(A).get(n))
-    ok(resume_suspended(A, n))
-    check("quarantine: after a reboot, resumes, md5 intact", md5(A, n) == m)
-    cleanup(n)
 
 
 def open_under(pid, path):
@@ -4201,7 +4118,6 @@ def suspend_disk_freed():
     print(f"disk freed: {data} MiB checkpoint; free space {before} -> {after} MiB (+{after - before})")
     check("disk freed: its space came back", after - before >= data * 0.8, (before, after, data))
     check("disk freed: still running, md5 intact", vms(A)[n]["state"] == "running" and md5(A, n) == m)
-    cleanup(n)
 
 
 def resume_mark_fails():
@@ -4234,9 +4150,11 @@ def resume_mark_fails():
     r = resume_suspended(A, n)
     check("unmark fails: no resume while quarantined", not r["ok"] and "quarantined" in r["error"], r)
     check("unmark fails: checkpoint kept", exists("manifest.json"))
-    # A reboot (another boot id): the disk has no marker, so it is suspended again.
+    # A reboot (another boot id): the disk has no marker, so it is suspended again, and ls agrees.
     q = open(os.path.join(d, "QUARANTINE")).read()
     open(os.path.join(d, "QUARANTINE"), "w").write("another-boot " + q.split(" ", 1)[1])
+    v = vms(A).get(n, {})
+    check("unmark fails: after a reboot, listed suspended", v.get("state") == "suspended" and exists("QUARANTINE"), v)
     ok(resume_suspended(A, n))
     check("unmark fails: after a reboot, resumes, md5 intact", md5(A, n) == m)
 
@@ -4266,7 +4184,6 @@ def resume_mark_fails():
     check("quarantined kill: checkpoint deleted", not exists("manifest.json"))
     r = resume_suspended(A, n)
     check("quarantined kill: no resume", not r["ok"], r)
-    cleanup(n)
 
 
 def standby():
@@ -4331,7 +4248,6 @@ def standby_vm_ips():
         ok(cli_json(A, "config", "--vm-ips", was["vm_ips"], "--dns", was.get("dns") or ""))
     check("standby vm ips: standbys stopped", wait_for(lambda: not ready(), 30), ready())
     cleanup(n)
-    cleanup(old)
 
 # --- copy-on-write and incremental checkpoints --------------------------------
 #
@@ -4475,7 +4391,6 @@ def cow_rescue_fail():
         fault(A, f, 0)
     errors, _, out = writer_check(A, n)
     check("rescue fail: the original is intact", errors == 0, out)
-    cleanup(n)
 
 
 def huge_mib(host, name):
@@ -4568,7 +4483,6 @@ def collapse_abort():
     check("collapse abort: the pass was mid-way when the source paused", mid is None, mid)
     check("collapse abort: the pass went on to the end", c and c["stopped"] is None and c["collapsed"] >= 200 and huge >= 400, (c, huge))
     check("collapse abort: md5 intact", md5(B, n) == m)
-    cleanup(n)
 
 
 def collapse_ckpt_fail():
@@ -4602,7 +4516,6 @@ def collapse_ckpt_fail():
     check("collapse ckpt fail: the pass went on to the end", c and c["stopped"] is None and c["collapsed"] >= 200 and huge >= 400, (c, huge))
     check("collapse ckpt fail: md5 intact", md5(B, n) == m)
     rm_ckpt(path)
-    cleanup(n)
 
 
 def guest_chunks(host, name):
@@ -4732,7 +4645,6 @@ def unplug_collapsed():
     check("huge unplug: data moved, not copied (RSS did not grow)", rss1 <= rss0 + 64, (rss0, rss1))
     errors, _, out = writer_check(B, n)
     check("huge unplug: guest memory intact", errors == 0 and md5(B, n) == m and sh(B, n, "md5sum /tmp/g")[1].split()[0] == g, out)
-    cleanup(n)
 
 
 def cow_abort():
@@ -4956,7 +4868,6 @@ def cow_wp_race():
     fault(A, "ckpt_wp_race", 0)
     # The race itself, not only its absence of harm: a writer claimed a faulting page after the fault checked it.
     check("wp race: a writer claimed a faulting page under the fault", claimed > 0, claimed)
-    cleanup(n)
 
 
 def fetch_tail_enomem():
@@ -4975,7 +4886,6 @@ def fetch_tail_enomem():
     fault(B, "fetch_tail_enomem", 0)
     check("tail: the failed tail was exercised, and installed again", re.search(r"installing pages \d+\+\d+ for a fault: .*; retrying", log(B, n)),
           log(B, n)[-500:])
-    cleanup(n)
 
 
 def pull_enomem():
@@ -4994,7 +4904,6 @@ def pull_enomem():
           st["released"] is True and st["background_pull_ms"] is not None and st["failed"] is None, st)
     check("pull enomem: the pullers retried", "background pull" in log(B, n) and "retrying" in log(B, n), log(B, n)[-500:])
     check("pull enomem: memory intact", md5(B, n) == m)
-    cleanup(n)
 
 
 def fetch_enomem_stuck():
@@ -5032,7 +4941,6 @@ def fetch_enomem_stuck():
     finally:
         reader.kill()
         reader.wait()
-    cleanup(n)
 
 
 def cow_reports_held():
@@ -5440,7 +5348,6 @@ def ckpt_stall():
         print(f"guest gaps > 20 us in the 300 ms after each resume, per thread: {len(posts) / max(1, len(tot)) / 2:.0f} a "
               f"checkpoint, p50 {q(0.5):.0f} us, p90 {q(0.9):.0f} us, p99 {q(0.99):.0f} us, sum {sum(posts) / 1e6 / max(1, len(tot)):.1f} ms")
     check("stall: the guest runs on", where(n) == {A: "running"} and sh(A, n, "pidof stallprobe")[0] == 0)
-    cleanup(n)
 
 
 def hotplug(host, name, mib):
@@ -5480,7 +5387,6 @@ def shrink_stall():
     check("shrink stall: holder not OOM-killed", sh(A, n, f"kill -0 {pid}")[0] == 0,
           sh(A, n, "dmesg | grep -i 'out of memory' | tail -n 2"))
     check("shrink stall: resize settled, guest grew", wait_for(lambda: hp()[0] == hp()[1] > plugged, 60), (plugged, hp()))
-    cleanup(n)
 
 
 def cow_grow():
@@ -5574,7 +5480,6 @@ def plug_race():
         check(f"plug race {i}: md5 intact", md5(dst, n) == m)
         code, out = sh(dst, n, "python3 -c 'b=bytearray(512<<20); print(len(b)>>20)'")
         check(f"plug race {i}: guest can use its memory", code == 0 and out == "512", out)
-    cleanup(n)
 
 
 def plug_storm():
@@ -5615,7 +5520,6 @@ def plug_storm():
     check("plug storm: md5 intact", got == m, (dst, got))
     code, out = sh(dst, n, "python3 -c 'b=bytearray(512<<20); print(len(b)>>20)'")
     check("plug storm: guest can use its memory", code == 0 and out == "512", out)
-    cleanup(n)
 
 
 def cgroup(host, name):
@@ -5689,11 +5593,6 @@ def throttle(label, host, n, reserve=512):
     return fill
 
 
-def skippable(scenario):
-    """A scenario that may find this host lacks what it tests (it raises Skip: SKIPPED, not ok)."""
-    return scenario
-
-
 def mem_high():
     """A guest filling far beyond its admitted memory while the host refuses
     to admit more is throttled at its mark rather than eating the host's
@@ -5710,7 +5609,6 @@ def mem_high():
     check("mem high: its mark grew with it", used >= fill and high >= used, (fill, v["admitted_mib"], used, high))
     check("mem high: no longer throttled", wait_for(lambda: not vms(A)[n].get("throttled"), 5), vms(A)[n])
     check("mem high: md5 intact", md5(A, n) == m)
-    cleanup(n)
 
 
 def mem_high_migrate():
@@ -5730,7 +5628,6 @@ def mem_high_migrate():
     check("mem high migrate: the target's mark covers what it pulled", vms(B)[n]["admitted_mib"] >= used, (used, vms(B)[n]["admitted_mib"]))
     check("mem high migrate: the fill finishes there", wait_for(lambda: hog_done(B, n), 240), cgroup(B, n))
     check("mem high migrate: md5 intact, one copy", md5(B, n) == m and where(n) == {B: "running"}, where(n))
-    cleanup(n)
 
 
 def mem_high_evict():
@@ -5750,7 +5647,6 @@ def mem_high_evict():
     check("mem high evict: the arrival's held grant goes once its memory is in", wait_for(lambda: not holds(), 10), holds())
     check("mem high evict: the fill finishes there", wait_for(lambda: hog_done(B, n), 240), cgroup(B, n))
     check("mem high evict: md5 intact", md5(B, n) == m)
-    cleanup(n)
 
 
 def mem_refused_headroom():
@@ -5794,7 +5690,6 @@ def mem_refused_headroom():
     fault(A, "no_admit", 0)
     wait_released(B, n, timeout=60)
     check("mem headroom: md5 intact", md5(B, n) == m)
-    cleanup(n)
 
 
 def guest_mem(host, name):
@@ -5862,7 +5757,6 @@ def mem_refused_fill():
     g = guest_mem(B, n)
     check("refused fill: the same fill, nothing OOM-killed", g is not None and g[2] and g[3] == 0, g)
     check("refused fill: md5 intact", md5(B, n) == m)
-    cleanup(n)
 
 
 class Watch:
@@ -6045,7 +5939,6 @@ def evict_no_pingpong():
         check("no ping-pong: with room on B it moves there once, and stays", seen == [A.addr, B.addr] and where(n) == {B: "running"},
               (seen, where(n), log(B, n)[-1200:]))
     check("no ping-pong: md5 intact", md5(B, n) == m)
-    cleanup(n)
 
 
 def evict_grower():
@@ -6118,7 +6011,6 @@ def evict_skips_cmd():
     check("evict cmd: md5 intact", md5(B, other) == m)
     os.kill(p.pid, signal.SIGINT)
     check("evict cmd: its command's end still ends it here", p.wait(timeout=30) == 130)
-    cleanup(other)
 
 
 def evict_latency():
@@ -6351,7 +6243,6 @@ def arrival_grew():
         check("arrival grew: pulled and released", st["released"] is True and st["failed"] is None, st)
         check("arrival grew: admitted for all it pulled", vms(B)[n]["admitted_mib"] >= grow, vms(B)[n].get("admitted_mib"))
         check("arrival grew: md5 intact, one copy", md5(B, n) == m and where(n) == {B: "running"}, where(n))
-    cleanup(n)
 
 
 def arrival_grew_admitted():
@@ -6501,7 +6392,6 @@ def kill_source():
     check("kill source: target pulled everything and released it",
           st["released"] is True and st["failed"] is None and where(n) == {B: "running"}, (st, where(n)))
     check("kill source: md5 intact on B", md5(B, n) == m)
-    cleanup(n)
 
 
 def kill_refused_checkpoint():
@@ -6532,7 +6422,6 @@ def kill_refused_checkpoint():
     c = checkpoint(A, n, ckpt_path(n))
     check("kill refused: a checkpoint afterwards succeeds", c["ok"], c)
     check("kill refused: still running, md5 intact", where(n) == {A: "running"} and md5(A, n) == m, where(n))
-    cleanup(n)
 
 
 def dual_stack():
@@ -6705,13 +6594,12 @@ def forged_peer():
     tid = source_vm()
     n, ip = "ft-forged-gen", spare(B, 2)
     scenario_vms.add(n)
-    for label, gen in (("zero", 0),):
-        s, r, _ = migrate_in_raw(B, n, ip, tid, gen=gen)
-        s.close()
-        check(f"forged gen {label}: arrival refused", not r.get("ok") and "generation" in r.get("error", ""), r)
-        # The refused arrival's process holds the name (its lock) until it has given up.
-        lock = os.path.join(B.run, "vms", f"{n}.lock")
-        check(f"forged gen {label}: name free again", wait_for(lambda: n not in vms(B) and not os.path.exists(lock), 10), vms(B).get(n))
+    s, r, _ = migrate_in_raw(B, n, ip, tid, gen=0)
+    s.close()
+    check("forged gen zero: arrival refused", not r.get("ok") and "generation" in r.get("error", ""), r)
+    check("forged gen zero: name free again", name_free(B, n), vms(B).get(n))
+    r = peer(B, {"op": "route", "ip": ip, "via": "127.0.0.9"})
+    check("forged gen zero: a route message without one is refused", not r.get("ok"), r)
     newest = addr(B, ip).get("seen", 0) + 10
     s, r, _ = migrate_in_raw(B, n, ip, tid, gen=newest)
     s.close()
@@ -6783,7 +6671,6 @@ def forged_pages():
     st = wait_released(B, n)
     check("forged pages: migration completed", st["released"] is True and where(n) == {B: "running"}, (st, where(n)))
     check("forged pages: md5 intact", md5(B, n) == m)
-    cleanup(n)
 
 
 def restore_ip_peer():
@@ -6900,9 +6787,12 @@ def unlend_retry():
         fault(A, "unlend_fail", 60000)
         r = migrate(A, n, B)
         check("unlend retry: aborted, still lent", not r["ok"] and where(n) == {A: "running"} and lent() == gen, (r, where(n), addr(A, ip)))
+        # Each retry once B's aborted arrival gave the name up (#559).
+        check("unlend retry: B gave the name up", name_free(B, n), vms(B).get(n))
         fault(A, "unlend_fail", 0)
         r = migrate(A, n, B)
         check("unlend retry: a second abort undoes the loan", not r["ok"] and where(n) == {A: "running"} and not lent(), (r, where(n), addr(A, ip)))
+        check("unlend retry: B gave the name up again", name_free(B, n), vms(B).get(n))
         fault(A, "unlend_fail", 60000)
         r = migrate(A, n, B)
         check("unlend retry: aborted again, still lent", not r["ok"] and lent() == gen, (r, addr(A, ip)))
@@ -6912,7 +6802,6 @@ def unlend_retry():
     check("unlend retry: md5 intact on A", md5(A, n) == m)
     kill(A, n)
     check("unlend retry: its end undoes the loan", wait_for(lambda: not lent(), 10), addr(A, ip))
-    cleanup(n)
 
 
 def late_withdrawal():
@@ -7025,7 +6914,6 @@ def killed_migrated():
     n5 = "ft-killed-migrated-5"
     ok(run(A, n5, ip=ip4))
     check("killed migrated, home back: the address runs a new vm on A", where(n5) == {A: "running"}, where(n5))
-    cleanup(n5)
 
 
 def incoming_killed():
@@ -7373,7 +7261,6 @@ def standby_stalled():
         pass
     cli(A, "standby", "--template", t, "0")
     check("standby stalled: stopped", wait_for(lambda: not standby_pids(A, t), 30))
-    cleanup(n)
 
 
 def standby_refill_race():
@@ -7415,7 +7302,6 @@ def standby_refill_race():
     except FileNotFoundError:
         pass
     cli(A, "standby", "--template", t, "0")
-    cleanup(n)
 
 
 def standby_starting(host):
@@ -7490,7 +7376,6 @@ def standby_lock_timeout():
         os.remove(pressure)
     except FileNotFoundError:
         pass
-    cleanup(n)
 
 
 def fc_died():
@@ -7594,7 +7479,6 @@ def pull_died():
     check("home died: the address is still lent on its home host", addr(A, ip).get("lent") is not None, addr(A, ip))
     r = run(A, "ft-home-x", ip=ip)
     check("home died: and not handed out again", not r["ok"] and "lent" in r.get("error", ""), r)
-    cleanup(n)
 
 
 def route_abort():
@@ -7725,7 +7609,6 @@ def arrival_overtaken():
     wait_released(B, n, source=A)
     check("migrate on after the arrival: one copy, on B", where(n) == {B: "running"} and md5(B, n) == m, where(n))
     check("migrate on after the arrival: lent by its home host", lent(ip) is not None, addr(A, ip))
-    cleanup(n)
 
 
 def terminal():
@@ -8264,7 +8147,6 @@ def suspend_debris():
     cleanup(n + "-ip")
     r = run(A, n)
     check("debris: run of the name removes it", r["ok"] and gone(), (r, os.path.exists(d)))
-    cleanup(n)
 
 
 def revoked_publication():
@@ -8309,7 +8191,6 @@ def revoked_publication():
     check("revoked: suspends once it can, over what was left", vms(A).get(n, {}).get("state") == "suspended", vms(A).get(n))
     ok(resume_suspended(A, n))
     check("revoked: resumes, md5 intact", md5(A, n) == m)
-    cleanup(n)
 
 
 def app_template():
@@ -8380,7 +8261,6 @@ def app_log():
     check("app log: no line printed twice across the migration", not dups, dups[:20])
     missing = sorted(set(range(min(lines), max(lines) + 1)) - set(lines))
     check("app log: none lost across the migration", not missing, missing[:20])
-    cleanup(n)
 
 
 def bad_app_log():
@@ -8404,7 +8284,6 @@ def bad_app_log():
     lines = app_lines(log(A, n)) + app_lines(log(B, n))
     dups = sorted({x for x in lines if lines.count(x) > 1})
     check("bad app log: no line printed twice", not dups, dups[:20])
-    cleanup(n)
 
 
 def no_evict(scenario):
@@ -8666,7 +8545,9 @@ def arrival_log():
     wait_for(lambda: os.path.exists(lock) and open(lock).read().strip(), 20)
     pid = json.load(open(lock))["pid"]
     mine = arrivals() - before
-    time.sleep(6)
+    # Older than the sweep's 5 s grace for a log not yet locked, without waiting it out.
+    backdate = lambda: [os.utime(os.path.join(vd, f), (time.time() - 60,) * 2) for f in mine & arrivals()]
+    backdate()
     ok(cli_json(B, "debug", "gc"))
     check("arrival log: a live arrival's log stays", len(mine) == 1 and mine <= arrivals(), (mine, arrivals()))
     os.kill(pid, signal.SIGKILL)
@@ -8674,7 +8555,7 @@ def arrival_log():
     fault(B, "incoming_stall", 0)
     check("arrival log: left by the killed arrival", mine <= arrivals(), arrivals())
     check("arrival log: never published as its name's", not os.path.exists(os.path.join(vd, f"{n}.log")))
-    time.sleep(6)
+    backdate()
     ok(cli_json(B, "debug", "gc"))
     check("arrival log: swept once its arrival is dead", not (mine & arrivals()), arrivals())
     if "r" in res:
@@ -9108,25 +8989,25 @@ SCENARIOS = dict(
     pull_died=pull_died,
     route_abort=route_abort,
     uffd_err=uffd_err,
-    mem_high=no_evict(skippable(mem_high)), mem_high_migrate=no_evict(skippable(mem_high_migrate)),
-    mem_high_evict=skippable(mem_high_evict), mem_refused_headroom=skippable(mem_refused_headroom), mem_refused_fill=skippable(mem_refused_fill), evict_grower=skippable(evict_grower), evict_no_pingpong=evict_no_pingpong, evict_skips_cmd=evict_skips_cmd, cmd_flag=cmd_flag, standby_stop_claim=standby_stop_claim, standby_claim_signal=standby_claim_signal, standby_concurrent_claims=standby_concurrent_claims, evict_latency=skippable(evict_latency),
+    mem_high=no_evict(mem_high), mem_high_migrate=no_evict(mem_high_migrate),
+    mem_high_evict=mem_high_evict, mem_refused_headroom=mem_refused_headroom, mem_refused_fill=mem_refused_fill, evict_grower=evict_grower, evict_no_pingpong=evict_no_pingpong, evict_skips_cmd=evict_skips_cmd, cmd_flag=cmd_flag, standby_stop_claim=standby_stop_claim, standby_claim_signal=standby_claim_signal, standby_concurrent_claims=standby_concurrent_claims, evict_latency=evict_latency,
     start_admission=start_admission, standby_admission=standby_admission,
-    refused_admission=refused_admission, arrival_grew=no_evict(skippable(arrival_grew)), arrival_grew_admitted=no_evict(skippable(arrival_grew_admitted)), meminfo_unreadable=meminfo_unreadable,
+    refused_admission=refused_admission, arrival_grew=no_evict(arrival_grew), arrival_grew_admitted=no_evict(arrival_grew_admitted), meminfo_unreadable=meminfo_unreadable,
     cow_grow=no_evict(cow_grow), plug_race=no_evict(plug_race), shrink_stall=no_evict(shrink_stall), plug_storm=no_evict(plug_storm),
     basic=basic, route=route, lost_ack=lost_ack, unknown=unknown, refused=refused, pages_blip=pages_blip,
     pages_dead_restore=pages_dead_restore, pages_dead=pages_dead, resume_kill=resume_kill, prepared_retry=prepared_retry,
     quiet_source=quiet_source, exec_race=exec_race, guest_calls=guest_calls, exec_background=exec_background, exec_pause_grace=exec_pause_grace, guest_hang=guest_hang,
-    source_killed=source_killed, target_killed=target_killed, abort_superseded=abort_superseded, gen_zero=gen_zero,
+    source_killed=source_killed, target_killed=target_killed, abort_superseded=abort_superseded,
     checkpoint_restore=checkpoint_restore, checkpoint_fork=checkpoint_fork, checkpoint_corrupt=checkpoint_corrupt,
     checkpoint_crash=checkpoint_crash, pause_resume=pause_resume, signals=signals, pause_lost=pause_lost, suspend_resume=suspend_resume,
     suspend_gen=suspend_gen, checkpoint_hotplug=checkpoint_hotplug, checkpoint_untrusted_dir=checkpoint_untrusted_dir,
-    resume_failures=resume_failures, resume_unpause_fail=resume_unpause_fail, abort_link_fail=abort_link_fail, resume_unsettled=resume_unsettled, resume_slow_guest=resume_slow_guest, resume_readdress_fail=resume_readdress_fail, held_restore_frozen=held_restore_frozen, cow_exact=cow_exact, cow_rescue_fail=cow_rescue_fail, cow_collapsed=skippable(cow_collapsed), unplug_collapsed=no_evict(skippable(unplug_collapsed)), cow_abort=cow_abort,
+    resume_failures=resume_failures, resume_unpause_fail=resume_unpause_fail, abort_link_fail=abort_link_fail, resume_unsettled=resume_unsettled, resume_slow_guest=resume_slow_guest, resume_readdress_fail=resume_readdress_fail, held_restore_frozen=held_restore_frozen, cow_exact=cow_exact, cow_rescue_fail=cow_rescue_fail, cow_collapsed=cow_collapsed, unplug_collapsed=no_evict(unplug_collapsed), cow_abort=cow_abort,
     cow_crash=cow_crash, cow_reports_held=cow_reports_held, ckpt_incremental=ckpt_incremental, ckpt_hot=ckpt_hot,
     ckpt_failed_stop=ckpt_failed_stop, ckpt_rearm=ckpt_rearm, ckpt_dir_moved=ckpt_dir_moved,
     leave_fail=leave_fail, capture_fail=capture_fail, abort_gen_fail=abort_gen_fail, commit_fail=commit_fail, commit_fail_routed=commit_fail_routed, abort_stay_fail=abort_stay_fail,
     prepare_disconnect=prepare_disconnect, prepare_trickle=prepare_trickle, prepare_fail=prepare_fail, arrival_flood=arrival_flood, arrival_cap_restart=arrival_cap_restart,
     fc_prepare=fc_prepare, forged_vmstate=forged_vmstate, slow_preload=slow_preload, bad_preload=bad_preload, ckpt_packet_hold=ckpt_packet_hold, ckpt_stall=ckpt_stall, standby=standby, standby_vm_ips=standby_vm_ips,
-    suspend_disk_freed=suspend_disk_freed, resume_mark_fails=resume_mark_fails, suspend_unaddressed=suspend_unaddressed, resume_fence_fails=resume_fence_fails, quarantine_reboot_ls=quarantine_reboot_ls, kill_source=kill_source,
+    suspend_disk_freed=suspend_disk_freed, resume_mark_fails=resume_mark_fails, suspend_unaddressed=suspend_unaddressed, resume_fence_fails=resume_fence_fails, kill_source=kill_source,
     kill_refused_checkpoint=no_evict(kill_refused_checkpoint), wildcard_listen=wildcard_listen, peer_by_name=peer_by_name, peer_moved=peer_moved, peer_unresolvable=peer_unresolvable, page_refusals=page_refusals,
     forged_peer=forged_peer, forged_pages=forged_pages, restore_ip_peer=restore_ip_peer, spoof_filter=spoof_filter, late_withdrawal=late_withdrawal, unlend_retry=unlend_retry,
     unit_restart=unit_restart, log_cap=log_cap, gc_debris=gc_debris, arrival_log=arrival_log, template_tap=template_tap,

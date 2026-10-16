@@ -838,6 +838,7 @@ mod tests {
     #[test]
     #[ignore]
     fn taps_name_their_owner_and_only_our_plug_goes() {
+        let _root = crate::test_util::root_net_lock();
         let tap = format!("tw4p{:x}", std::process::id());
         let tc = |args: &str| std::process::Command::new("tc").args(args.split(' ')).output().unwrap();
         let root = || String::from_utf8_lossy(&tc(&format!("qdisc show dev {tap} root")).stdout).into_owned();

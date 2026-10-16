@@ -165,3 +165,12 @@ fn sweep_removes_dead_fixtures_and_preserves_live_and_unrelated_directories() {
     assert!(kept.iter().all(|name| root.join(name).exists()));
     assert!(link.is_symlink());
 }
+
+/// Held by each root networking test (`--ignored`) while it runs. Run in parallel, one test's
+/// fork (`tc`, say) inherits another's /dev/net/tun descriptor until it execs, keeping the tap
+/// attached, so a reattach in between fails with EBUSY (#552).
+#[allow(dead_code)] // the guest's tests share this file
+pub fn root_net_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}

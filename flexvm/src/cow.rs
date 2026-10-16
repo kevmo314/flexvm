@@ -466,12 +466,23 @@ mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
 
-    #[test]
-    fn unclaim_many_wakes_once() {
+    /// A non-blocking eventfd, for a waker.
+    fn eventfd() -> OwnedFd {
         use std::os::fd::FromRawFd;
         let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
         assert!(fd >= 0);
-        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        unsafe { OwnedFd::from_raw_fd(fd) }
+    }
+
+    /// The wakes `fd` counted since last read; none if it was not woken.
+    fn wakes(fd: &OwnedFd) -> Option<u64> {
+        let mut n = 0u64;
+        (unsafe { libc::read(fd.as_raw_fd(), (&mut n as *mut u64).cast(), 8) } == 8).then_some(n)
+    }
+
+    #[test]
+    fn unclaim_many_wakes_once() {
+        let fd = eventfd();
         let cow = Arc::new(Cow::new(8, &vec![(0, 8, REMOTE)]));
         cow.set_waker(fd.try_clone().unwrap());
         for p in [1, 3, 5] {
@@ -492,9 +503,7 @@ mod tests {
         assert_eq!(cow.notifications.load(Ordering::SeqCst), 1);
         assert_eq!((cow.state(1), cow.state(3), cow.state(5)), (PENDING, RESCUING, PENDING));
         assert_eq!(*cow.waits.lock().unwrap(), [3]);
-        let mut wakes = 0u64;
-        assert_eq!(unsafe { libc::read(fd.as_raw_fd(), (&mut wakes as *mut u64).cast(), 8) }, 8);
-        assert_eq!(wakes, 1, "one event-thread wake for the whole batch");
+        assert_eq!(wakes(&fd), Some(1), "one event-thread wake for the whole batch");
     }
 
     /// Guest memory whose pages change under the writer, as a running VM's do.
@@ -642,10 +651,7 @@ mod tests {
     fn batched_rescue_keeps_each_pause_time_copy() {
         let cow = Cow::new(6, &vec![(0, 6, REMOTE)]);
         let live = Live { pages: StdMutex::new((0..6 * PAGE_SIZE).map(|i| (i / PAGE_SIZE) as u8).collect()) };
-        use std::os::fd::FromRawFd;
-        let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
-        assert!(fd >= 0);
-        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let fd = eventfd();
         cow.set_waker(fd.try_clone().unwrap());
         let claimed = [1, 3, 4];
         for p in claimed {
@@ -654,9 +660,7 @@ mod tests {
         cow.wait_for(1, RESCUING);
         cow.wait_for(4, RESCUING);
         cow.rescue_many(1, 5, claimed.map(|p| (p, vec![p as u8; PAGE_SIZE].into())));
-        let mut wakes = 0u64;
-        assert_eq!(unsafe { libc::read(fd.as_raw_fd(), (&mut wakes as *mut u64).cast(), 8) }, 8);
-        assert_eq!(wakes, 1, "one wake for the whole batch");
+        assert_eq!(wakes(&fd), Some(1), "one wake for the whole batch");
         assert!(cow.waits.lock().unwrap().is_empty());
         assert_eq!(cow.left(), 3);
         assert_eq!(*cow.progress.0.lock().unwrap(), 3);
@@ -737,14 +741,8 @@ mod tests {
     /// still being read, or for other pages saved meanwhile.
     #[test]
     fn faults_waiting_for_a_writer_are_woken() {
-        use std::os::fd::FromRawFd;
-        let efd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
-        assert!(efd >= 0);
-        let efd = unsafe { OwnedFd::from_raw_fd(efd) };
-        let woken = || {
-            let mut n = 0u64;
-            unsafe { libc::read(efd.as_raw_fd(), (&mut n as *mut u64).cast(), 8) == 8 }
-        };
+        let efd = eventfd();
+        let woken = || wakes(&efd).is_some();
         let mut cow = Cow::new(8, &vec![(0, 8, REMOTE)]);
         cow.budget = 0;
         cow.set_waker(efd.try_clone().unwrap());

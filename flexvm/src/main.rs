@@ -1124,7 +1124,6 @@ mod exec_tests {
         real_main(&args).unwrap();
         assert_eq!(std::fs::read_to_string(root.join("state/standby/default")).unwrap(), "0");
         assert!(!root.join("state/artifacts").exists());
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1140,17 +1139,13 @@ mod exec_tests {
     }
 
     #[test]
-    fn exec_preserves_guest_flags_without_a_separator() {
+    fn exec_preserves_guest_flags_and_drops_only_one_separator() {
         let args = parse(&["--state", "/tmp/state", "exec", "web", "tool", "-d", "--detach", "--unknown"]);
         assert_eq!(args.get("state"), Some("/tmp/state"));
         assert!(!args.has("detach"));
         assert_eq!(args.positional, ["exec", "web"]);
         assert_eq!(args.rest, ["tool", "-d", "--detach", "--unknown"]);
         assert_eq!(args.child_args, ["--state", "/tmp/state", "exec", "web", "tool", "-d", "--detach", "--unknown"]);
-    }
-
-    #[test]
-    fn exec_drops_one_separator() {
         let args = parse(&["exec", "web", "--", "ls", "--", "-d"]);
         assert_eq!(args.rest, ["ls", "--", "-d"]);
     }
@@ -1322,7 +1317,6 @@ mod exec_tests {
         }
         // Port 0 binds, but peers could not be told the port.
         assert!(configure_listener(&mut host, Some("127.0.0.1:0"), None).is_err());
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1355,7 +1349,6 @@ mod exec_tests {
         result.unwrap();
         assert_eq!(status.signal(), Some(libc::SIGINT));
         drop(name);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn frames(fs: &[(u8, &[u8])]) -> Vec<u8> {
@@ -1429,7 +1422,6 @@ mod exec_tests {
         let error = exec_session(&host, "gone", "true", &session, false).unwrap_err();
         assert!(!error.to_string().contains("recovery timed out"), "{error}");
         assert!(start.elapsed() < Duration::from_secs(5));
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1461,7 +1453,6 @@ mod exec_tests {
         BufReader::new(l.accept().unwrap().0).read_line(&mut line).unwrap();
         assert_eq!(line, "{\"op\":\"x\"}\n");
         assert_eq!(vm, None);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

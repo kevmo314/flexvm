@@ -782,7 +782,6 @@ mod tests {
         finish_incoming_log(&host, "web", &arrival, true).unwrap();
         assert!(!arrival.exists());
         assert_eq!(std::fs::read(&existing).unwrap(), b"accepted");
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1010,7 +1009,7 @@ mod tests {
 
     #[test]
     fn a_peer_by_name_is_admitted_once_its_lookup_completes() {
-        let (root, host) = host_with_peers("by-name", &["localhost:7070"]);
+        let (_root, host) = host_with_peers("by-name", &["localhost:7070"]);
         let names = host.config_now().peers;
         // As at start, or for a peer just added: nothing resolved, so the accept loop hands it to a waiting slot.
         // The lookup under way is marked here, not run: a real one of localhost can end before `resolving` is asked (#294).
@@ -1024,12 +1023,11 @@ mod tests {
         // Only a bound on a hung lookup: on a loaded machine one of localhost can take seconds.
         let by = Instant::now() + Duration::from_secs(60);
         assert!(local.iter().any(|&a| p.admit_by(&host, a, by)), "admitted once localhost resolved");
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn a_non_peer_is_refused_at_once_with_every_name_looked_up() {
-        let (root, host) = host_with_peers("non-peer", &["localhost:7070", "no-such-host.invalid:7070", "10.1.0.2:7070"]);
+        let (_root, host) = host_with_peers("non-peer", &["localhost:7070", "no-such-host.invalid:7070", "10.1.0.2:7070"]);
         let (p, names) = (Peers::default(), host.config_now().peers);
         p.addrs(&names);
         assert!(settled(&p, &names[..2]));
@@ -1042,7 +1040,6 @@ mod tests {
         let from = "10.9.9.9".parse().unwrap();
         assert_eq!(p.check(&names, from), Admission::Refused);
         assert!(!p.admit_by(&host, from, Instant::now() + Duration::from_secs(60)));
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1101,7 +1098,7 @@ mod tests {
 
     #[test]
     fn a_peer_by_name_on_a_new_address_is_admitted_before_the_refresh() {
-        let (root, host) = host_with_peers("moved", &["localhost:7070"]);
+        let (_root, host) = host_with_peers("moved", &["localhost:7070"]);
         let names = host.config_now().peers;
         let p = Peers::default();
         // Resolved before it moved (DHCP), and not looked up since `LOOKUP_EVERY`.
@@ -1115,7 +1112,6 @@ mod tests {
         // Only a bound on a hung lookup: on a loaded machine one of localhost can take seconds.
         let by = Instant::now() + Duration::from_secs(60);
         assert!(local.iter().any(|&a| p.admit_by(&host, a, by)), "admitted once localhost resolved");
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1194,7 +1190,6 @@ mod tests {
         assert!(admit(&running, from));
         other.configure(|c| set(c, &[])).unwrap();
         assert!(!admit(&running, from));
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

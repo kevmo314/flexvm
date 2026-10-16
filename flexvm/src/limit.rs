@@ -447,7 +447,6 @@ mod tests {
         assert!(l.throttled.load(Ordering::SeqCst));
         assert_eq!(l.grow_with(&host, &mut GrantBackoff::default(), Instant::now(), |_| Err("admission failed".into())), Growth::Refused);
         assert!(!l.throttled.load(Ordering::SeqCst));
-        std::fs::remove_dir_all(cg.parent().unwrap()).unwrap();
     }
 
     #[test]
@@ -455,54 +454,30 @@ mod tests {
         let (_dir, l, cg, host) = cgroup("retry");
         l.start(4096, 8192);
         set(&cg, 4096 + overhead(4096));
-        let asks = std::cell::RefCell::new(Vec::new());
-        assert_eq!(
-            l.grow_with(&host, &mut GrantBackoff::default(), Instant::now(), |more| {
+        // A growth whose admission grants only `granted` MiB, and the sizes it asked for.
+        let grow = |granted: Option<u64>| {
+            let asks = std::cell::RefCell::new(Vec::new());
+            let growth = l.grow_with(&host, &mut GrantBackoff::default(), Instant::now(), |more| {
                 asks.borrow_mut().push(more);
-                Ok((more == 512).then_some(1))
-            }),
-            Growth::Raised
-        );
-        assert_eq!(*asks.borrow(), [1024, 512]);
+                Ok((Some(more) == granted).then_some(1))
+            });
+            (growth, asks.into_inner())
+        };
+        assert_eq!(grow(Some(512)), (Growth::Raised, vec![1024, 512]));
         assert_eq!(l.admitted(), 4608);
         assert_eq!(high(&cg), Some(4608 + overhead(4608)));
         assert!(!l.throttled.load(Ordering::SeqCst));
         set(&cg, 4608 + overhead(4608));
-        asks.borrow_mut().clear();
-        assert_eq!(
-            l.grow_with(&host, &mut GrantBackoff::default(), Instant::now(), |more| {
-                asks.borrow_mut().push(more);
-                Ok(None)
-            }),
-            Growth::Refused
-        );
-        assert_eq!(*asks.borrow(), [1152, 576]);
+        assert_eq!(grow(None), (Growth::Refused, vec![1152, 576]));
         assert!(l.throttled.load(Ordering::SeqCst));
         // Even the final hotplug unit can be admitted in smaller pieces.
         l.start(8192 - STEP_MIB, 8192);
         set(&cg, 8192);
-        asks.borrow_mut().clear();
-        assert_eq!(
-            l.grow_with(&host, &mut GrantBackoff::default(), Instant::now(), |more| {
-                asks.borrow_mut().push(more);
-                Ok(None)
-            }),
-            Growth::Refused
-        );
-        assert_eq!(*asks.borrow(), [STEP_MIB, STEP_MIB / 2]);
+        assert_eq!(grow(None), (Growth::Refused, vec![STEP_MIB, STEP_MIB / 2]));
         // A single MiB has no smaller positive admission to retry.
         l.start(8191, 8192);
         set(&cg, 8192);
-        asks.borrow_mut().clear();
-        assert_eq!(
-            l.grow_with(&host, &mut GrantBackoff::default(), Instant::now(), |more| {
-                asks.borrow_mut().push(more);
-                Ok(None)
-            }),
-            Growth::Refused
-        );
-        assert_eq!(*asks.borrow(), [1]);
-        std::fs::remove_dir_all(cg.parent().unwrap()).unwrap();
+        assert_eq!(grow(None), (Growth::Refused, vec![1]));
     }
 
     #[test]
@@ -544,7 +519,6 @@ mod tests {
         assert_eq!(asks.get(), before + 3);
         assert_eq!(l.grow_with(&host, &mut backoff, now + Duration::from_millis(250), grant), Growth::Refused);
         assert_eq!(asks.get(), before + 5);
-        std::fs::remove_dir_all(cg.parent().unwrap()).unwrap();
     }
 
     #[test]
@@ -555,7 +529,6 @@ mod tests {
         l.throttled.store(true, Ordering::SeqCst);
         assert_eq!(l.grow_with(&host, &mut GrantBackoff::default(), Instant::now(), |_| panic!("full VM requested a grant")), Growth::Full);
         assert!(!l.throttled.load(Ordering::SeqCst));
-        std::fs::remove_dir_all(cg.parent().unwrap()).unwrap();
     }
 
     #[test]

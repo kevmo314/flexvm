@@ -316,6 +316,28 @@ pub fn start_logs(s: UnixStream, offset: u64, follow: bool, timeout: Duration) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::net::{UnixListener, UnixStream};
+
+    /// A socket standing in for the guest agent's (through Firecracker's vsock), in a fixture directory.
+    fn agent(tag: &str) -> (crate::test_util::TempDir, PathBuf, UnixListener) {
+        let dir = crate::test_util::TempDir::new(tag);
+        let path = dir.join("fixture");
+        let listener = UnixListener::bind(&path).unwrap();
+        (dir, path, listener)
+    }
+
+    /// Accepts the next connection to the agent, checks its CONNECT, and returns it with its request line.
+    fn accept(listener: &UnixListener) -> (BufReader<UnixStream>, String) {
+        let (stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+        let mut stream = BufReader::new(stream);
+        let mut line = String::new();
+        stream.read_line(&mut line).unwrap();
+        assert_eq!(line, format!("CONNECT {PORT}\n"));
+        line.clear();
+        stream.read_line(&mut line).unwrap();
+        (stream, line)
+    }
 
     #[test]
     fn overflowing_timeouts_fail_before_contacting_the_guest() {
@@ -327,9 +349,7 @@ mod tests {
 
     #[test]
     fn message_deadline_bounds_a_trickled_frame() {
-        let _dir = crate::test_util::TempDir::new("message");
-        let path = _dir.join("fixture");
-        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let (_dir, path, listener) = agent("message");
         let uds = path.clone();
         let client = std::thread::spawn(move || {
             let start = Instant::now();
@@ -348,14 +368,11 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         client.join().unwrap();
-        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn exec_deadline_bounds_a_guest_that_keeps_answering() {
-        let _dir = crate::test_util::TempDir::new("exec");
-        let path = _dir.join("fixture");
-        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let (_dir, path, listener) = agent("exec");
         let uds = path.clone();
         let client = std::thread::spawn(move || {
             let start = Instant::now();
@@ -389,26 +406,16 @@ mod tests {
         let _ = stream.write_all(b"OK 1\n");
         let _ = write_frame(&mut stream, FRAME_MSG, b"closed");
         client.join().unwrap();
-        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn ping_waits_for_pong_without_a_session() {
-        let _dir = crate::test_util::TempDir::new("ping");
-        let path = _dir.join("fixture");
-        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let (_dir, path, listener) = agent("ping");
         for reply in [b"pong".as_slice(), b"error: no shell"] {
             let (tx, rx) = std::sync::mpsc::channel();
             let uds = path.clone();
             let client = std::thread::spawn(move || tx.send(ping(&uds).is_ok()).unwrap());
-            let (stream, _) = listener.accept().unwrap();
-            stream.set_read_timeout(Some(TIMEOUT)).unwrap();
-            let mut stream = BufReader::new(stream);
-            let mut line = String::new();
-            stream.read_line(&mut line).unwrap();
-            assert_eq!(line, format!("CONNECT {PORT}\n"));
-            line.clear();
-            stream.read_line(&mut line).unwrap();
+            let (mut stream, line) = accept(&listener);
             assert_eq!(line, "PING\n");
             stream.get_mut().write_all(b"OK 1\n").unwrap();
             assert!(matches!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
@@ -416,15 +423,11 @@ mod tests {
             assert_eq!(rx.recv_timeout(TIMEOUT).unwrap(), reply == b"pong");
             client.join().unwrap();
         }
-        drop(listener);
-        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn current_agent_protocol_is_required() {
-        let _dir = crate::test_util::TempDir::new("current-agent");
-        let path = _dir.join("fixture");
-        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let (_dir, path, listener) = agent("current-agent");
         let replies: &[(&str, &[u8])] = &[
             ("START", b"ok"),
             ("START", b"unknown request START"),
@@ -437,14 +440,7 @@ mod tests {
         ];
         let server = std::thread::spawn(move || {
             for (verb, reply) in replies {
-                let (stream, _) = listener.accept().unwrap();
-                stream.set_read_timeout(Some(TIMEOUT)).unwrap();
-                let mut stream = BufReader::new(stream);
-                let mut line = String::new();
-                stream.read_line(&mut line).unwrap();
-                assert_eq!(line, format!("CONNECT {PORT}\n"));
-                line.clear();
-                stream.read_line(&mut line).unwrap();
+                let (mut stream, line) = accept(&listener);
                 let parts: Vec<_> = line.split_whitespace().collect();
                 assert_eq!(parts[0], *verb);
                 match *verb {
@@ -473,7 +469,6 @@ mod tests {
         assert_eq!(forks(&path).unwrap(), 1);
         assert!(forks(&path).unwrap_err().to_string().contains("guest forks: unknown request FORKS; rebuild the rootfs and its templates"));
         server.join().unwrap();
-        std::fs::remove_file(path).unwrap();
     }
 
     fn wire(frames: &[(u8, Vec<u8>)]) -> Vec<u8> {
@@ -568,7 +563,6 @@ mod tests {
         let start = Instant::now();
         let e = ping(&uds).unwrap_err();
         assert!(start.elapsed() < Duration::from_secs(5) && !dropped(&e), "{e}");
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

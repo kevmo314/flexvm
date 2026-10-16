@@ -686,6 +686,38 @@ mod tests {
         }
     }
 
+    /// Runs the calling test, by its full `name`, in a child process with `env` set: true in that child.
+    /// Isolated so advancing the clock cannot expire other tests' sessions.
+    fn in_child(env: &str, name: &str) -> bool {
+        if std::env::var_os(env).is_some() {
+            return true;
+        }
+        assert!(Command::new(std::env::current_exe().unwrap()).args(["--exact", name]).env(env, "1").status().unwrap().success());
+        false
+    }
+
+    fn set_clock(at: Duration) {
+        AWAKE_MS.store(at.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// Waits for every process in `group` to be gone, reaping them as PID 1 would.
+    fn wait_group_gone(group: i32, what: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while unsafe { libc::kill(-group, 0) } == 0 {
+            assert!(Instant::now() < deadline, "{what}");
+            unsafe { libc::waitpid(-group, std::ptr::null_mut(), libc::WNOHANG) };
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Starts a handler for `line` on a new connection; returns it and the client's end.
+    fn handler(sessions: &Sessions, statuses: &Statuses, line: String) -> (thread::JoinHandle<io::Result<()>>, UnixStream) {
+        let (conn, peer) = UnixStream::pair().unwrap();
+        let dup = File::from(OwnedFd::from(conn.try_clone().unwrap()));
+        let (sessions, statuses) = (sessions.clone(), statuses.clone());
+        (thread::spawn(move || handle(conn, b"", Some(dup), &line, &sessions, &statuses)), peer)
+    }
+
     fn detach_and_join(output: &Session, t: thread::JoinHandle<()>) {
         output.0.lock().unwrap().attached = None;
         output.1.notify_all();
@@ -772,14 +804,9 @@ mod tests {
 
     #[test]
     fn output_grace_uses_the_awake_clock() {
-        // Isolated so advancing the clock cannot expire other tests' sessions.
-        const CHILD: &str = "FLEXVM_GRACE_TEST";
-        if std::env::var_os(CHILD).is_none() {
-            let name = "session::tests::output_grace_uses_the_awake_clock";
-            assert!(Command::new(std::env::current_exe().unwrap()).args(["--exact", name]).env(CHILD, "1").status().unwrap().success());
+        if !in_child("FLEXVM_GRACE_TEST", "session::tests::output_grace_uses_the_awake_clock") {
             return;
         }
-        let set_clock = |at: Duration| AWAKE_MS.store(at.as_millis() as u64, Ordering::Relaxed);
         let gone = GRACE * 2;
         set_clock(gone);
         let mut ring = Output { end: BASE as u64 / 2, gone: Some(gone), ..Default::default() };
@@ -816,12 +843,7 @@ mod tests {
         assert!(gone.0.lock().unwrap().closed);
         let status = reap(&statuses, group);
         assert!(libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while unsafe { libc::kill(-group, 0) } == 0 {
-            assert!(Instant::now() < deadline, "the abandoned command's background process survived");
-            unsafe { libc::waitpid(-group, std::ptr::null_mut(), libc::WNOHANG) };
-            thread::sleep(Duration::from_millis(10));
-        }
+        wait_group_gone(group, "the abandoned command's background process survived");
         assert!(request(&sessions, &statuses, "CLOSE kept", b"").ends_with(b"closed"));
         reap(&statuses, kept_group);
         let ring = kept.0.lock().unwrap();
@@ -865,10 +887,7 @@ mod tests {
         let (sessions, statuses) = (Sessions::default(), statuses());
         let output = live(&mut sessions.lock().unwrap(), "s", Output::default());
         output.0.lock().unwrap().push(FRAME_STDOUT, &vec![b'x'; 64 * BLOCK], CAPACITY);
-        let (conn, _peer) = UnixStream::pair().unwrap();
-        let dup = File::from(OwnedFd::from(conn.try_clone().unwrap()));
-        let (sessions_, statuses_) = (sessions.clone(), statuses.clone());
-        let handler = thread::spawn(move || handle(conn, b"", Some(dup), "ATTACH s 0", &sessions_, &statuses_));
+        let (handler, _peer) = handler(&sessions, &statuses, "ATTACH s 0".into());
         // The client reads nothing, so its handler blocks writing to it.
         thread::sleep(Duration::from_millis(200));
         assert!(!handler.is_finished());
@@ -882,14 +901,9 @@ mod tests {
 
     #[test]
     fn tombstone_expiry_uses_the_awake_clock() {
-        // Isolated so advancing the clock cannot expire other tests' sessions.
-        const CHILD: &str = "FLEXVM_TOMBSTONE_TEST";
-        if std::env::var_os(CHILD).is_none() {
-            let name = "session::tests::tombstone_expiry_uses_the_awake_clock";
-            assert!(Command::new(std::env::current_exe().unwrap()).args(["--exact", name]).env(CHILD, "1").status().unwrap().success());
+        if !in_child("FLEXVM_TOMBSTONE_TEST", "session::tests::tombstone_expiry_uses_the_awake_clock") {
             return;
         }
-        let set_clock = |at: Duration| AWAKE_MS.store(at.as_millis() as u64, Ordering::Relaxed);
         let mut table = Table::default();
         let statuses = statuses();
         let old = RETENTION * 2;
@@ -1041,13 +1055,7 @@ mod tests {
         let status = reap(&statuses, group);
         assert!(libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL);
         // The background sleep went with it: the group empties.
-        let gone = Instant::now() + Duration::from_secs(5);
-        while unsafe { libc::kill(-group, 0) } == 0 {
-            assert!(Instant::now() < gone, "the background process survived");
-            let mut status = 0;
-            unsafe { libc::waitpid(-group, &mut status, libc::WNOHANG) };
-            thread::sleep(Duration::from_millis(10));
-        }
+        wait_group_gone(group, "the background process survived");
         let ring = output.0.lock().unwrap();
         assert!(output.1.wait_timeout_while(ring, DRAIN * 3, |r| r.exit.is_none()).unwrap().0.exit.is_some());
     }
@@ -1202,11 +1210,8 @@ mod tests {
         for acknowledge in [false, true] {
             let (sessions, statuses) = (Sessions::default(), statuses());
             let output = finished(&mut sessions.lock().unwrap(), "done", None);
-            let (conn, mut peer) = UnixStream::pair().unwrap();
+            let (handler, mut peer) = handler(&sessions, &statuses, "ATTACH done 0".into());
             peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-            let duplicate = File::from(OwnedFd::from(conn.try_clone().unwrap()));
-            let (sessions_, statuses_) = (sessions.clone(), statuses.clone());
-            let handler = thread::spawn(move || handle(conn, b"", Some(duplicate), "ATTACH done 0", &sessions_, &statuses_));
             // The stream stays open after the exit (vsock passes no half-close on), for the acknowledgement.
             read_to_exit(&mut peer);
             if acknowledge {
@@ -1232,11 +1237,8 @@ mod tests {
     fn an_exit_acknowledgement_cannot_close_a_newer_attachment() {
         let (sessions, statuses) = (Sessions::default(), statuses());
         let output = finished(&mut sessions.lock().unwrap(), "done", None);
-        let (conn, mut peer) = UnixStream::pair().unwrap();
+        let (handler, mut peer) = handler(&sessions, &statuses, "ATTACH done 0".into());
         peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-        let duplicate = File::from(OwnedFd::from(conn.try_clone().unwrap()));
-        let (sessions_, statuses_) = (sessions.clone(), statuses.clone());
-        let handler = thread::spawn(move || handle(conn, b"", Some(duplicate), "ATTACH done 0", &sessions_, &statuses_));
         read_to_exit(&mut peer);
         // Replace the old attachment while its acknowledgement is in flight.
         attach(&output, 0, None);
@@ -1251,12 +1253,9 @@ mod tests {
     /// Attaches a client to `id` and reads to its exit, leaving the acknowledgement to the caller; returns
     /// once the guest counts the exit as sent.
     fn attach_to_exit(sessions: &Sessions, statuses: &Statuses, id: &str) -> (thread::JoinHandle<io::Result<()>>, UnixStream) {
-        let (conn, mut peer) = UnixStream::pair().unwrap();
-        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let duplicate = File::from(OwnedFd::from(conn.try_clone().unwrap()));
         let output = sessions.lock().unwrap().live[id].output.clone();
-        let (sessions, statuses, line) = (sessions.clone(), statuses.clone(), format!("ATTACH {id} 0"));
-        let handler = thread::spawn(move || handle(conn, b"", Some(duplicate), &line, &sessions, &statuses));
+        let (handler, mut peer) = handler(sessions, statuses, format!("ATTACH {id} 0"));
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         read_to_exit(&mut peer);
         let deadline = Instant::now() + Duration::from_secs(5);
         while output.0.lock().unwrap().delivered.is_none() && !output.0.lock().unwrap().closed {
@@ -1355,12 +1354,7 @@ mod tests {
         let output = live(&mut sessions.lock().unwrap(), "s", Output::default());
         let total = 64 * BLOCK as u64;
         output.0.lock().unwrap().push(FRAME_STDOUT, &vec![b'x'; total as usize], CAPACITY);
-        let attach = |offset: u64| {
-            let (conn, peer) = UnixStream::pair().unwrap();
-            let dup = File::from(std::os::fd::OwnedFd::from(conn.try_clone().unwrap()));
-            let (sessions, statuses) = (sessions.clone(), statuses.clone());
-            (thread::spawn(move || handle(conn, b"", Some(dup), &format!("ATTACH s {offset}"), &sessions, &statuses)), peer)
-        };
+        let attach = |offset: u64| handler(&sessions, &statuses, format!("ATTACH s {offset}"));
         // The first client reads nothing, so its handler blocks writing to it.
         let (first, first_peer) = attach(0);
         thread::sleep(Duration::from_millis(200));

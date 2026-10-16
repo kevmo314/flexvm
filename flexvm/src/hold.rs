@@ -1004,6 +1004,14 @@ mod tests {
         Holder { dev: "test".into(), ifindex: 0, tun, held, reading: AtomicBool::new(false), routes: Mutex::new(()), rx: Mutex::new(()), gone, resend: None }
     }
 
+    /// A holder reading a datagram socket standing in for its tun (the kernel's reads: one frame each), and the
+    /// socket's other end, to write frames to.
+    fn paired() -> (Holder, OwnedFd) {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK, 0, fds.as_mut_ptr()) }, 0);
+        unsafe { (holder(OwnedFd::from_raw_fd(fds[0])), OwnedFd::from_raw_fd(fds[1])) }
+    }
+
     /// A UDP datagram 10.9.0.2 -> `dst` (ports 12345 -> 54321), its header checksum filled in.
     fn udp_to(dst: Ipv4Addr) -> Vec<u8> {
         let mut p = vec![0x45, 0, 0, 29, 0, 1, 0, 0, 64, 17, 0, 0, 10, 9, 0, 2, 0, 0, 0, 0, 0x30, 0x39, 0xd4, 0x31, 0, 9, 0, 0, 0];
@@ -1054,9 +1062,7 @@ mod tests {
         assert_eq!(cut(&tap_frame(&p, 1, 0, (14 + 20, 16), 0)), None, "TCP's field in a UDP packet");
         assert!(cut(&tap_frame(&p, 1, 0, (14 + 20, 6), 0)).is_some(), "UDP's own field");
         // The hold device's reads too: the kernel leaves completion to it.
-        let mut fds = [0; 2];
-        assert_eq!(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK, 0, fds.as_mut_ptr()) }, 0);
-        let (h, w) = unsafe { (holder(OwnedFd::from_raw_fd(fds[0])), OwnedFd::from_raw_fd(fds[1])) };
+        let (h, w) = paired();
         let dst = Ipv4Addr::new(10, 9, 0, 8);
         h.held.lock().unwrap().insert(dst, Arc::new(Entry { mig: 1, q: Mutex::default() }));
         let mut buf = vec![0u8; VNET_HDR + MAX_FRAME];
@@ -1295,9 +1301,7 @@ mod tests {
     fn a_refused_switch_keeps_the_stream() {
         const LATE: usize = PASS + 100;
         for (ack, took) in [(b'w', true), (b'n', false)] {
-            let mut fds = [0; 2];
-            assert_eq!(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK, 0, fds.as_mut_ptr()) }, 0);
-            let (h, w) = unsafe { (holder(OwnedFd::from_raw_fd(fds[0])), OwnedFd::from_raw_fd(fds[1])) };
+            let (h, w) = paired();
             let ip = Ipv4Addr::new(10, 9, 0, 8);
             let q = Queue { packets: VecDeque::from(vec![udp_to(ip); 3]), bytes: 3 * 29, ..Queue::default() };
             h.held.lock().unwrap().insert(ip, Arc::new(Entry { mig: 1, q: Mutex::new(q) }));
@@ -1337,9 +1341,7 @@ mod tests {
     /// stragglers (counted there, with no raw socket to re-send them by).
     #[test]
     fn a_release_discards_nothing_the_reader_queues() {
-        let mut fds = [0; 2];
-        assert_eq!(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK, 0, fds.as_mut_ptr()) }, 0);
-        let (h, w) = unsafe { (holder(OwnedFd::from_raw_fd(fds[0])), OwnedFd::from_raw_fd(fds[1])) };
+        let (h, w) = paired();
         let ip = Ipv4Addr::new(10, 9, 0, 8);
         let (p, stop) = ([&vnet_hdr(0, 0, (0, 0))[..], &udp_to(ip)].concat(), AtomicBool::new(false));
         std::thread::scope(|s| {
@@ -1394,6 +1396,7 @@ mod tests {
     #[test]
     #[ignore]
     fn a_kernel_tso_frame_is_cut_into_valid_segments() {
+        let _root = crate::test_util::root_net_lock();
         let tap = format!("tso{:x}t0", std::process::id());
         let (_address, ip) = root_address();
         crate::net::create_tap(&tap, "test").unwrap();
@@ -1467,6 +1470,7 @@ mod tests {
     #[test]
     #[ignore]
     fn stragglers_follow_the_address() {
+        let _root = crate::test_util::root_net_lock();
         let (a, b) =
             (Holder::new(&format!("tsa{:x}h", std::process::id())).unwrap().unwrap(), Holder::new(&format!("tsb{:x}h", std::process::id())).unwrap().unwrap());
         let (_address, ip) = root_address();
