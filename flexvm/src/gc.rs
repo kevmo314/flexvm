@@ -50,7 +50,17 @@ pub fn after_boot(host: &Host, rest: bool) -> Result<bool> {
     if unsafe { libc::geteuid() } != 0 {
         return Ok(false);
     }
-    let Some(local) = host.after_boot()? else { return Ok(false) };
+    let local = match host.after_boot() {
+        Ok(Some(local)) => local,
+        Ok(None) => return Ok(false),
+        // Retried on the next open; a full pass still sweeps and refills now.
+        Err(e) => {
+            if rest {
+                recover(host);
+            }
+            return Err(e);
+        }
+    };
     if !rest {
         if !local {
             bail!("local boot recovery incomplete; see earlier errors");
@@ -70,14 +80,12 @@ pub fn after_boot(host: &Host, rest: bool) -> Result<bool> {
     Ok(true)
 }
 
-/// Listener startup and explicit recovery always sweep and refill, even if boot recovery
-/// failed before reaching that step (for example, opening the host lock).
+/// `after_boot` with the rest, or `recover` if it did not run: listener startup and `flexvm recover`.
 pub fn recover_after_boot(host: &Host) -> Result<()> {
-    let result = after_boot(host, true);
-    if !matches!(result, Ok(true)) {
+    if !after_boot(host, true)? {
         recover(host);
     }
-    result.map(|_| ())
+    Ok(())
 }
 
 /// One foreground warning per host and boot, without suppressing recovery retries.
