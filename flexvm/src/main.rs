@@ -301,7 +301,11 @@ fn open_host_only(args: &Args) -> Result<Host> {
         Some(run) => PathBuf::from(run),
         None => host::default_run(&state)?,
     };
-    Host::open(&state, &run)
+    // `config` is how a host.json with invalid ranges is fixed: it validates what it saves.
+    match args.positional.first().map(String::as_str) {
+        Some("config") => Host::open_unvalidated(&state, &run),
+        _ => Host::open(&state, &run),
+    }
 }
 
 fn paths(args: &Args) -> Result<Paths> {

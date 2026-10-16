@@ -457,7 +457,16 @@ impl Host {
     /// and the run directory to that state root (`claim_run`).
     /// Synced up to `/` once per state root, not per command: under the root's flock, `.synced` names the
     /// root (dev, inode), so a copy syncs again; it goes before a repair and comes back after the syncs.
+    /// A `host.json` whose ranges do not validate is refused (see `open_unvalidated`).
     pub fn open(state: &Path, run: &Path) -> Result<Host> {
+        let host = Self::open_unvalidated(state, run)?;
+        host.cfg.validate_ranges().map_err(|e| format!("{}: {e}; fix it with flexvm config", host.state.join("host.json").display()))?;
+        Ok(host)
+    }
+
+    /// `open`, taking `host.json` whatever its ranges: for `flexvm config`, which is how they are
+    /// fixed (`configure` validates what it saves).
+    pub fn open_unvalidated(state: &Path, run: &Path) -> Result<Host> {
         let dirs = [("addrs", 0o777), ("standby", 0o777), ("migs", 0o777), ("owed", 0o700), ("withdrawals", 0o700), ("suspended", 0o700)];
         let (marker, id) = (state.join(".synced"), || std::fs::metadata(state).map(|m| format!("{} {}", m.dev(), m.ino())));
         let named = |d: &Path, e: std::io::Error| {
@@ -504,7 +513,6 @@ impl Host {
         let _ = RUN_DIR.set(run.clone());
         let cfg_stamp = stamp(&state.join("host.json"));
         let mut cfg: Config = load(&state.join("host.json"))?.unwrap_or_default();
-        cfg.validate_ranges().map_err(|e| format!("{}: {e}", state.join("host.json").display()))?;
         cfg.run = Some(run.clone());
         Ok(Host { state, run, cfg, cfg_stamp, cfg_seen: Arc::new(Mutex::new(None)) })
     }
@@ -3337,6 +3345,16 @@ mod tests {
             assert!(Host::open(&h.state, &h.run).is_err());
             assert_eq!(h.config_now().vm_ips, h.cfg.vm_ips);
             assert_eq!(h.config_now().cluster_ips, h.cfg.cluster_ips);
+            // `flexvm config` still opens it, and saves only a fix.
+            let mut fixing = Host::open_unvalidated(&h.state, &h.run).unwrap();
+            assert!(fixing.configure(|_| Ok(())).is_err());
+            fixing
+                .configure(|c| {
+                    (c.vm_ips, c.cluster_ips) = ("10.200.0.0/16".into(), None);
+                    Ok(())
+                })
+                .unwrap();
+            Host::open(&h.state, &h.run).unwrap();
         }
     }
 

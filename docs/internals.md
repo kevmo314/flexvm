@@ -804,6 +804,7 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
   peers configured without it produce a warning from both `config` and `listen`.
   `config` reports the effective allowlist as `derived.cluster_ips`. Loading or
   reloading `host.json` validates range syntax and containment of `vm_ips`;
+  an invalid one refuses every command but `flexvm config` (which fixes it), and
   an invalid reload leaves the last valid configuration in use. A peer's report
   of its own range never authorizes an address here. Withdrawals of recorded
   generations remain accepted, including retries, after the allowlist narrows.
