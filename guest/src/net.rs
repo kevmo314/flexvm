@@ -97,67 +97,44 @@ pub fn configure(ip: Ipv4Addr, dns: Option<&str>) -> io::Result<()> {
     let (fd, ifindex) = *NETLINK.get().ok_or_else(|| io::Error::other("no netlink socket"))?;
     update_address(&mut address, ip, |kind, ip| address_request(fd, ifindex, kind, ip))?;
     if let Some(dns) = dns {
-        resolv_conf(std::path::Path::new("/etc/resolv.conf"), dns)?;
+        resolv_conf(std::path::Path::new("/etc"), dns)?;
     }
     Ok(())
 }
 
-/// Atomically replaces the directory entry, including an image's symlink (even systemd-resolved's
-/// stub). Never follows it or rewrites bind mounts in place; an unreplaceable mount returns EBUSY.
-fn resolv_conf(path: &std::path::Path, dns: &str) -> io::Result<()> {
-    use std::ffi::CString;
-    use std::fs::File;
-    use std::io::{Read, Write};
+/// Replaces DIR/resolv.conf with a rename, so a lookup never reads it empty, through DIR's fd. It
+/// follows no symlink (an image's link is replaced, not its target) and opens no special file. A
+/// bind-mounted file cannot be renamed over, so it is rewritten in place.
+fn resolv_conf(dir: &std::path::Path, dns: &str) -> io::Result<()> {
+    use std::fs::{File, OpenOptions};
+    use std::io::Write;
     use std::os::fd::{AsRawFd, FromRawFd};
-    use std::os::unix::ffi::OsStrExt;
-    use std::path::{Component, Path};
-
-    let cstr = |name: &std::ffi::OsStr| CString::new(name.as_bytes()).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e));
-    let open = |dir: &File, name: &std::ffi::CStr, flags| -> io::Result<File> {
-        let fd = os(unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags | libc::O_CLOEXEC, 0o644) })?;
-        Ok(unsafe { File::from_raw_fd(fd) })
-    };
-    // Pin each parent component without following symlinks, then use only this fd for all I/O.
-    let mut parent = File::open(if path.is_absolute() { "/" } else { "." })?;
-    for component in path.parent().unwrap_or(Path::new(".")).components() {
-        if matches!(component, Component::RootDir | Component::CurDir) {
-            continue;
-        }
-        parent = open(&parent, &cstr(component.as_os_str())?, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK)?;
-    }
-    let name = cstr(path.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing resolver filename"))?)?;
+    use std::os::unix::fs::OpenOptionsExt;
     let content = format!("nameserver {dns}\n");
-    match open(&parent, &name, libc::O_PATH | libc::O_NOFOLLOW) {
-        Ok(file) => {
-            let metadata = file.metadata()?;
-            if !metadata.is_file() && !metadata.file_type().is_symlink() {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, "resolver is not a regular file or symlink"));
-            }
-            if metadata.is_file() {
-                // Recheck the opened file: a concurrent swap must never make us read a FIFO/device.
-                if let Ok(file) = open(&parent, &name, libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK) {
-                    if file.metadata()?.is_file() {
-                        let mut old = Vec::new();
-                        file.take(content.len() as u64 + 1).read_to_end(&mut old)?;
-                        if old == content.as_bytes() {
-                            return Ok(());
-                        }
-                    }
-                }
-            }
+    let dir = OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW).open(dir)?;
+    let (fd, name, tmp) = (dir.as_raw_fd(), c"resolv.conf", c"resolv.conf.tmp");
+    let at = |name: &std::ffi::CStr, flags| {
+        os(unsafe { libc::openat(fd, name.as_ptr(), flags | libc::O_NOFOLLOW | libc::O_CLOEXEC, 0o644) }).map(|f| unsafe { File::from_raw_fd(f) })
+    };
+    // Reopened through /proc only once its O_PATH fd is known to be a regular file.
+    let existing = |options: &mut OpenOptions| {
+        let path = at(name, libc::O_PATH)?;
+        if !path.metadata()?.is_file() {
+            return Err(io::Error::other("resolv.conf is not a regular file"));
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
+        options.open(format!("/proc/self/fd/{}", path.as_raw_fd()))
+    };
+    if existing(OpenOptions::new().read(true)).and_then(io::read_to_string).is_ok_and(|old| old == content) {
+        return Ok(());
     }
-    let tmp = cstr(path.with_extension("conf.tmp").file_name().unwrap())?;
-    let mut file = open(&parent, &tmp, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_NONBLOCK)?;
-    let result = file
-        .write_all(content.as_bytes())
-        .and_then(|()| os(unsafe { libc::renameat(parent.as_raw_fd(), tmp.as_ptr(), parent.as_raw_fd(), name.as_ptr()) }).map(drop));
-    if result.is_err() {
-        let _ = unsafe { libc::unlinkat(parent.as_raw_fd(), tmp.as_ptr(), 0) };
+    unsafe { libc::unlinkat(fd, tmp.as_ptr(), 0) };
+    at(tmp, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL)?.write_all(content.as_bytes())?;
+    let renamed = os(unsafe { libc::renameat(fd, tmp.as_ptr(), fd, name.as_ptr()) });
+    unsafe { libc::unlinkat(fd, tmp.as_ptr(), 0) };
+    match renamed {
+        Err(e) if e.raw_os_error() == Some(libc::EBUSY) => existing(OpenOptions::new().write(true).truncate(true))?.write_all(content.as_bytes()),
+        r => r.map(drop),
     }
-    result
 }
 
 fn update_address(address: &mut Option<Ipv4Addr>, ip: Ipv4Addr, mut request: impl FnMut(u16, Ipv4Addr) -> io::Result<()>) -> io::Result<()> {
@@ -236,81 +213,76 @@ mod tests {
     fn resolv_conf_is_replaced_atomically_and_unchanged_content_is_skipped() {
         use std::os::unix::fs::MetadataExt;
         let dir = crate::test_util::TempDir::new("resolv");
-        let path = dir.join("resolv.conf");
-        resolv_conf(&path, "1.1.1.1").unwrap();
+        let (path, tmp) = (dir.join("resolv.conf"), dir.join("resolv.conf.tmp"));
+        resolv_conf(&dir, "1.1.1.1").unwrap();
         let old = std::fs::File::open(&path).unwrap();
         let ino = old.metadata().unwrap().ino();
-        resolv_conf(&path, "1.1.1.1").unwrap();
+        resolv_conf(&dir, "1.1.1.1").unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().ino(), ino);
-        resolv_conf(&path, "8.8.8.8").unwrap();
+        resolv_conf(&dir, "8.8.8.8").unwrap();
         assert_ne!(std::fs::metadata(&path).unwrap().ino(), ino);
         assert_eq!(std::io::read_to_string(old).unwrap(), "nameserver 1.1.1.1\n");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "nameserver 8.8.8.8\n");
-        assert!(!path.with_extension("conf.tmp").exists());
+        assert!(!tmp.exists());
         // A failed replacement leaves the published file intact.
-        std::fs::create_dir(path.with_extension("conf.tmp")).unwrap();
-        resolv_conf(&path, "8.8.8.8").unwrap();
-        assert!(resolv_conf(&path, "9.9.9.9").is_err());
+        std::fs::create_dir(&tmp).unwrap();
+        resolv_conf(&dir, "8.8.8.8").unwrap();
+        assert!(resolv_conf(&dir, "9.9.9.9").is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "nameserver 8.8.8.8\n");
-        std::fs::remove_dir(path.with_extension("conf.tmp")).unwrap();
-    }
-
-    #[test]
-    fn resolv_conf_replaces_symlinks_without_touching_their_targets() {
-        let dir = crate::test_util::TempDir::new("resolv-links");
-        let target = dir.join("victim");
-        std::fs::write(&target, "keep").unwrap();
-        for destination in [&target, &dir.join("missing")] {
-            let path = dir.join("resolv.conf");
-            std::os::unix::fs::symlink(destination, &path).unwrap();
-            resolv_conf(&path, "1.1.1.1").unwrap();
-            assert!(std::fs::symlink_metadata(&path).unwrap().is_file());
-            assert_eq!(std::fs::read_to_string(&path).unwrap(), "nameserver 1.1.1.1\n");
-            assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
-            std::fs::remove_file(path).unwrap();
-        }
-    }
-
-    #[test]
-    fn resolv_conf_refuses_planted_temp_files_and_special_targets() {
-        use std::os::unix::ffi::OsStrExt;
-        let dir = crate::test_util::TempDir::new("resolv-special");
-        let path = dir.join("resolv.conf");
-        let tmp = path.with_extension("conf.tmp");
-        let victim = dir.join("victim");
-        std::fs::write(&victim, "keep").unwrap();
-        let fifo = |path: &std::path::Path| {
-            let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
-            assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
-        };
-        std::os::unix::fs::symlink(&victim, &tmp).unwrap();
-        assert!(resolv_conf(&path, "1.1.1.1").is_err());
-        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
-        assert!(std::fs::symlink_metadata(&tmp).unwrap().file_type().is_symlink());
-        std::fs::remove_file(&tmp).unwrap();
-        fifo(&tmp);
-        assert!(resolv_conf(&path, "1.1.1.1").is_err());
-        std::fs::remove_file(&tmp).unwrap();
-        fifo(&path);
-        assert!(resolv_conf(&path, "1.1.1.1").is_err());
+        std::fs::remove_dir(&tmp).unwrap();
+        // So does one that cannot rename over a directory.
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
-        assert!(resolv_conf(&path, "1.1.1.1").is_err());
+        assert!(resolv_conf(&dir, "1.1.1.1").is_err());
         assert!(!tmp.exists());
     }
 
     #[test]
-    fn resolv_conf_refuses_symlinks_in_parent_directories() {
-        let dir = crate::test_util::TempDir::new("resolv-parent");
-        let real = dir.join("real");
+    fn resolv_conf_follows_no_symlink_and_opens_no_fifo() {
+        let dir = crate::test_util::TempDir::new("resolv-links");
+        let (path, tmp, victim) = (dir.join("resolv.conf"), dir.join("resolv.conf.tmp"), dir.join("victim"));
+        let fifo = |p: &std::path::Path| assert!(std::process::Command::new("mkfifo").arg(p).status().unwrap().success());
+        std::fs::write(&victim, "keep").unwrap();
+        let plants: [Box<dyn Fn()>; 5] = [
+            Box::new(|| std::os::unix::fs::symlink(&victim, &path).unwrap()),
+            Box::new(|| std::os::unix::fs::symlink(dir.join("missing"), &path).unwrap()),
+            Box::new(|| std::os::unix::fs::symlink(&victim, &tmp).unwrap()),
+            Box::new(|| fifo(&path)),
+            Box::new(|| fifo(&tmp)),
+        ];
+        for plant in plants {
+            plant();
+            resolv_conf(&dir, "1.1.1.1").unwrap();
+            assert!(std::fs::symlink_metadata(&path).unwrap().is_file());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "nameserver 1.1.1.1\n");
+            assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+            assert!(!tmp.exists());
+            std::fs::remove_file(&path).unwrap();
+        }
+        // The directory itself is not followed either.
         let link = dir.join("link");
-        std::fs::create_dir(&real).unwrap();
-        std::os::unix::fs::symlink(&real, &link).unwrap();
-        assert!(resolv_conf(&link.join("resolv.conf"), "1.1.1.1").is_err());
-        std::fs::create_dir(real.join("nested")).unwrap();
-        assert!(resolv_conf(&link.join("nested/resolv.conf"), "1.1.1.1").is_err());
-        assert!(!real.join("resolv.conf").exists());
-        assert!(!real.join("nested/resolv.conf").exists());
+        std::os::unix::fs::symlink(&*dir, &link).unwrap();
+        assert!(resolv_conf(&link, "1.1.1.1").is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn resolv_conf_rewrites_a_bind_mounted_file_in_place() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = crate::test_util::TempDir::new("resolv-bind");
+        let (path, source) = (dir.join("resolv.conf"), dir.join("source"));
+        std::fs::write(&path, "").unwrap();
+        std::fs::write(&source, "nameserver 8.8.8.8\n").unwrap();
+        let c = |p: &std::path::Path| std::ffi::CString::new(p.as_os_str().as_bytes()).unwrap();
+        // Needs CAP_SYS_ADMIN, as under `unshare -rm`.
+        if unsafe { libc::mount(c(&source).as_ptr(), c(&path).as_ptr(), std::ptr::null(), libc::MS_BIND, std::ptr::null()) } != 0 {
+            return;
+        }
+        let result = resolv_conf(&dir, "1.1.1.1");
+        unsafe { libc::umount2(c(&path).as_ptr(), libc::MNT_DETACH) };
+        result.unwrap();
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), "nameserver 1.1.1.1\n");
+        assert!(!dir.join("resolv.conf.tmp").exists());
     }
 
     #[test]
