@@ -4,6 +4,7 @@
 //! Every operation, starting included, holds `op`; the process ends only
 //! through `finish`, which holds it too.
 
+use std::collections::VecDeque;
 use std::io::{BufReader, Read, Write};
 use std::net::Ipv4Addr;
 use std::os::fd::{FromRawFd, OwnedFd};
@@ -25,20 +26,99 @@ use crate::template::{Paths, Template, STEP_MIB};
 use crate::util::{answer, ms, proc_kb, send_json, Error, Phases, Result, Slot};
 use crate::vm::{Snapshot, State, Vm};
 
-/// Frame by frame: vsock does not pass a half-close on, so the exit frame is what ends the
-/// relay. Then the client's acknowledgement, if it sends one, lets the guest release the session.
-fn relay_session(guest: &mut BufReader<impl Read + Write>, client: &mut (impl crate::util::Timed + Write)) -> Result<()> {
-    while let Some((kind, data)) = guest::read_frame(guest)? {
-        client.write_all(&guest::frame(kind, &[&data]))?;
-        if kind == guest::FRAME_EXIT {
-            let mut ack = [0];
-            if (crate::util::By { s: client, at: Instant::now() + Duration::from_secs(2) }).read_exact(&mut ack).is_ok() && ack[0] == guest::SESSION_DONE {
-                guest.get_mut().write_all(&ack)?;
+/// Output a relay holds for a client slower than its command: as much as the guest's ring for it.
+const RELAY_BUFFER: usize = 4 << 20;
+/// A client that takes no output for this long is dropped, freeing its relay and control slot.
+const CLIENT_STALL: Duration = Duration::from_secs(60);
+
+#[derive(Default)]
+struct Relayed {
+    frames: VecDeque<Vec<u8>>,
+    bytes: usize,
+    /// The guest's stream ended: at its exit, or cut short.
+    end: Option<Result<()>>,
+    /// The client was dropped.
+    dropped: bool,
+}
+
+/// Reads the guest's frames as they come, into a buffer of its own, and writes them on to the client:
+/// a slow client never leaves output in Firecracker's vsock buffer, which the guest closing drops.
+/// vsock passes no half-close on, so the exit frame ends the stream. With `release` (a client that has
+/// no use for its session once it has the exit), the relay acknowledges the exit as soon as it holds
+/// it, releasing the session (or calls `release` if it cannot); otherwise a client's own
+/// acknowledgement, within 2 s, is passed on. A client that takes nothing for `stall` is dropped.
+fn relay_session(guest: &mut BufReader<UnixStream>, client: &UnixStream, release: Option<&(dyn Fn() + Sync)>, stall: Duration) -> Result<()> {
+    let shared = (Mutex::new(Relayed::default()), std::sync::Condvar::new());
+    let to_guest = guest.get_ref().try_clone()?;
+    client.set_write_timeout(Some(stall))?;
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            let end = (|| -> Result<()> {
+                while let Some((kind, data)) = guest::read_frame(guest)? {
+                    let exit = kind == guest::FRAME_EXIT;
+                    if let Some(release) = release.filter(|_| exit) {
+                        if (&to_guest).write_all(&[guest::SESSION_DONE]).is_err() {
+                            release();
+                        }
+                    }
+                    let frame = guest::frame(kind, &[&data]);
+                    let mut r = shared.0.lock().unwrap();
+                    while r.bytes >= RELAY_BUFFER && !r.dropped {
+                        r = shared.1.wait(r).unwrap();
+                    }
+                    if r.dropped {
+                        return Ok(());
+                    }
+                    r.bytes += frame.len();
+                    r.frames.push_back(frame);
+                    drop(r);
+                    shared.1.notify_all();
+                    if exit {
+                        break;
+                    }
+                }
+                Ok(())
+            })();
+            shared.0.lock().unwrap().end = Some(end);
+            shared.1.notify_all();
+        });
+        let sent = (|| -> Result<()> {
+            loop {
+                let mut r = shared.0.lock().unwrap();
+                while r.frames.is_empty() && r.end.is_none() {
+                    r = shared.1.wait(r).unwrap();
+                }
+                let Some(frame) = r.frames.pop_front() else { return r.end.take().unwrap() };
+                r.bytes -= frame.len();
+                drop(r);
+                shared.1.notify_all();
+                match (&*client).write_all(&frame) {
+                    Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                        bail!("the client took no output for {} s", stall.as_secs())
+                    }
+                    res => res?,
+                }
+                if frame[0] == guest::FRAME_EXIT {
+                    let mut ack = [0];
+                    let mut c = client;
+                    if release.is_none()
+                        && (crate::util::By { s: &mut c, at: Instant::now() + Duration::from_secs(2) }).read_exact(&mut ack).is_ok()
+                        && ack[0] == guest::SESSION_DONE
+                    {
+                        (&to_guest).write_all(&ack)?;
+                    }
+                    return Ok(());
+                }
             }
-            break;
+        })();
+        if sent.is_err() {
+            // Unblocks the reader; without an acknowledgement the guest keeps the session for a reattach.
+            shared.0.lock().unwrap().dropped = true;
+            shared.1.notify_all();
+            let _ = to_guest.shutdown(std::net::Shutdown::Both);
         }
-    }
-    Ok(())
+        sent
+    })
 }
 
 /// A VM process's own exit statuses (`run -- CMD` passes CMD's through):
@@ -1147,7 +1227,13 @@ impl Proc {
             // The guest heartbeats every second; silence means the VM moved, or its agent stalled.
             g.get_ref().set_read_timeout(Some(Duration::from_secs(3)))?;
             send_json(&mut w, &json!({"ok": true}))?;
-            relay_session(&mut g, &mut w)?;
+            let session = req["session"].as_str().unwrap_or("");
+            let close = || {
+                if let Err(e) = guest::close(&vm.vsock, session, Instant::now() + guest::TIMEOUT) {
+                    crate::log!("vm {}: releasing exec session {session}: {e}", vm.name);
+                }
+            };
+            relay_session(&mut g, &c, (req["release"] == true).then_some(&close as &(dyn Fn() + Sync)), CLIENT_STALL)?;
             Ok(())
         })();
         vm.untrack_exec(id);
@@ -1160,10 +1246,7 @@ impl Proc {
         let vm = self.vm();
         match req["what"].as_str().unwrap_or("") {
             "memhash" => self.memhash(),
-            "sessions" => {
-                let (live, unacknowledged) = guest::sessions(&vm.vsock)?;
-                Ok(json!({"live": live, "unacknowledged": unacknowledged}))
-            }
+            "sessions" => Ok(json!({"live": guest::sessions(&vm.vsock)?})),
             "hotplug" => {
                 let _op = self.op_within()?;
                 if vm.state() != State::Running {
@@ -3283,64 +3366,117 @@ mod tests {
 #[cfg(test)]
 mod session_relay_tests {
     use super::*;
-    use std::io::{self, Cursor};
+    use std::sync::atomic::AtomicUsize;
 
-    struct Duplex {
-        input: Cursor<Vec<u8>>,
-        output: Vec<u8>,
+    const CHUNK: usize = 64 * 1024;
+
+    /// The guest's side: `chunks` output frames of CHUNK bytes, then the exit, written from a thread
+    /// (a relay that stops reading blocks it).
+    fn guest(chunks: usize) -> (BufReader<UnixStream>, UnixStream, thread::JoinHandle<()>) {
+        let (relay, agent) = UnixStream::pair().unwrap();
+        let mut w = agent.try_clone().unwrap();
+        let writer = thread::spawn(move || {
+            for i in 0..chunks {
+                let _ = w.write_all(&guest::frame(guest::FRAME_STDOUT, &[&((i * CHUNK) as u64).to_le_bytes()[..], &[b'x'; CHUNK]]));
+            }
+            let _ = w.write_all(&guest::frame(guest::FRAME_EXIT, &[&((chunks * CHUNK) as u64).to_le_bytes()[..], &7i32.to_le_bytes()]));
+        });
+        (BufReader::new(relay), agent, writer)
     }
-    impl Read for Duplex {
-        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            self.input.read(buf)
+
+    /// Reads the client's side to the exit; returns the output bytes and the exit code.
+    fn read_all(client: &mut UnixStream) -> (usize, i32) {
+        let mut out = 0;
+        while let Some((kind, data)) = guest::read_frame(client).unwrap() {
+            match kind {
+                guest::FRAME_STDOUT => out += data.len() - 8,
+                guest::FRAME_EXIT => return (out, i32::from_le_bytes(data[8..].try_into().unwrap())),
+                _ => {}
+            }
         }
-    }
-    impl Write for Duplex {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            self.output.write(bytes)
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-    impl crate::util::Timed for Duplex {
-        fn read_timeout(&self, _: Duration) -> io::Result<()> {
-            Ok(())
-        }
-        fn write_timeout(&self, _: Duration) -> io::Result<()> {
-            Ok(())
-        }
+        panic!("no exit")
     }
 
     #[test]
-    fn exit_acknowledgement_uses_the_existing_attachment_and_is_optional() {
-        let out = guest::frame(guest::FRAME_STDOUT, &[&0u64.to_le_bytes()[..], b"hi"]);
-        let exit = [out, guest::frame(guest::FRAME_EXIT, &[&2u64.to_le_bytes()[..], &7i32.to_le_bytes()])].concat();
+    fn without_release_a_clients_acknowledgement_is_passed_on() {
         for ack in [vec![], vec![guest::SESSION_DONE], vec![b'?']] {
-            // The exit ends the relay, with the stream still open (vsock passes no half-close on).
-            let mut guest = BufReader::new(Duplex { input: Cursor::new([&exit[..], b"never read"].concat()), output: Vec::new() });
-            let mut client = Duplex { input: Cursor::new(ack.clone()), output: Vec::new() };
-            relay_session(&mut guest, &mut client).unwrap();
-            assert_eq!(client.output, exit);
-            assert_eq!(guest.get_ref().output, if ack == [guest::SESSION_DONE] { ack } else { vec![] });
+            let (mut g, mut agent, writer) = guest(1);
+            let (relay, mut client) = UnixStream::pair().unwrap();
+            let c = thread::spawn(move || {
+                let got = read_all(&mut client);
+                client.write_all(&ack).unwrap();
+                (got, ack, client)
+            });
+            relay_session(&mut g, &relay, None, CLIENT_STALL).unwrap();
+            let (got, ack, _client) = c.join().unwrap();
+            writer.join().unwrap();
+            assert_eq!(got, (CHUNK, 7));
+            drop(g);
+            let mut passed = Vec::new();
+            agent.read_to_end(&mut passed).unwrap();
+            assert_eq!(passed, if ack == [guest::SESSION_DONE] { ack } else { vec![] });
         }
     }
 
     #[test]
     fn a_silent_client_releases_the_relay_within_its_deadline() {
-        let exit = guest::frame(guest::FRAME_EXIT, &[&0u64.to_le_bytes()[..], &0i32.to_le_bytes()]);
-        let mut guest = BufReader::new(Duplex { input: Cursor::new(exit.clone()), output: Vec::new() });
+        let (mut g, _agent, writer) = guest(0);
         let (relay, mut client) = UnixStream::pair().unwrap();
         // Reads the exit, then neither acknowledges nor hangs up.
         let silent = thread::spawn(move || {
-            let mut got = vec![0; exit.len()];
-            client.read_exact(&mut got).unwrap();
+            read_all(&mut client);
             thread::sleep(Duration::from_secs(6));
-            drop(client);
         });
         let t = Instant::now();
-        relay_session(&mut guest, &mut &relay).unwrap();
+        relay_session(&mut g, &relay, None, CLIENT_STALL).unwrap();
         assert!(t.elapsed() < Duration::from_secs(4), "the relay waited {:?}", t.elapsed());
-        assert!(guest.get_ref().output.is_empty());
+        writer.join().unwrap();
         silent.join().unwrap();
+    }
+
+    #[test]
+    fn the_relay_holds_a_slow_clients_output_and_releases_the_session_at_once() {
+        // 2 MiB: more than the sockets hold, less than the relay's buffer.
+        let (mut g, mut agent, writer) = guest(32);
+        let (relay, mut client) = UnixStream::pair().unwrap();
+        let released = AtomicUsize::new(0);
+        let fallback = || {
+            released.fetch_add(1, Ordering::SeqCst);
+        };
+        thread::scope(|scope| {
+            let relaying = scope.spawn(|| relay_session(&mut g, &relay, Some(&fallback), CLIENT_STALL));
+            // The guest gets its acknowledgement while the client reads nothing.
+            writer.join().unwrap();
+            agent.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut ack = [0];
+            agent.read_exact(&mut ack).unwrap();
+            assert_eq!(ack, [guest::SESSION_DONE]);
+            thread::sleep(Duration::from_secs(2));
+            assert!(!relaying.is_finished());
+            assert_eq!(read_all(&mut client), (32 * CHUNK, 7));
+            relaying.join().unwrap().unwrap();
+        });
+        assert_eq!(released.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_stalled_client_is_dropped_after_its_deadline() {
+        // More than the relay's buffer and the sockets hold together.
+        let (mut g, mut agent, writer) = guest(2 * RELAY_BUFFER / CHUNK);
+        let (relay, _client) = UnixStream::pair().unwrap();
+        let t = Instant::now();
+        let err = relay_session(&mut g, &relay, Some(&|| panic!("released")), Duration::from_secs(1)).unwrap_err();
+        assert!(err.to_string().contains("took no output"), "{err}");
+        assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
+        // The guest's connection is shut down unacknowledged: its session stays for a reattach.
+        drop(g);
+        let mut rest = Vec::new();
+        // Reset, when some of what it wrote went unread.
+        match agent.read_to_end(&mut rest) {
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::ConnectionReset),
+            Ok(_) => assert!(rest.is_empty()),
+        }
+        drop(agent);
+        writer.join().unwrap();
     }
 }

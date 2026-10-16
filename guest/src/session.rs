@@ -1,17 +1,15 @@
 //! Resumable commands: `SESSION <id> <len>` (then `len` bytes of shell command), `ATTACH <id> <offset>`,
 //! `CLOSE <id>`. Output frames start with their stream offset (u64 LE); the exit frame is offset plus code.
-//! After an exit, the client may send SESSION_DONE on the attachment, within `ACK_WAIT`, to release the
-//! session; without that acknowledgement the exit stays available for reattachment, and the session for
-//! eviction.
+//! After an exit, the client may send SESSION_DONE on the attachment to release the session;
+//! without that acknowledgement the exit stays available for reattachment.
 //! The command runs in a process group of its own; its exit is the shell's, recorded once output stops or
 //! `DRAIN` after the shell exits; background processes that keep its pipes open run on, their later output
 //! read and dropped (by one thread, for at most `MAX_DISCARDED` pipes: past that, a job's next write gets
 //! SIGPIPE). Closing a session whose shell has not exited kills its process group (not processes that
 //! left it with setsid or setpgid: that would take a cgroup per session); closing an unknown one cancels it, so
 //! a start still in flight never runs. Sessions whose client is gone are closed in time, running ones too.
-//! At most `MAX_LIVE` sessions are live; when that many are, the one whose client left without
-//! acknowledging its exit longest ago makes room for a new one (a slow reader acknowledges late, or never).
-//! Closed ones leave a tombstone so a delayed `SESSION` retry cannot rerun the command. Rings keep `BASE` bytes and grow towards `CAPACITY` from a shared pool: at most
+//! At most `MAX_LIVE` sessions are live; closed ones leave a tombstone so a delayed `SESSION` retry cannot
+//! rerun the command. Rings keep `BASE` bytes and grow towards `CAPACITY` from a shared pool: at most
 //! `MAX_LIVE * BASE + POOL` (plus a partial `BLOCK` each). One attachment per session; a new one shuts the
 //! old one down. Output waits for it rather than overwrite unsent bytes; writers never hold the ring lock.
 use std::collections::{HashMap, VecDeque};
@@ -55,15 +53,11 @@ const ABANDONED_RUNNING_KNOB: &str = "/run/flexvm-test-abandoned-running-secs";
 /// How often the awake clock ticks, and the most one tick adds.
 const TICK: Duration = Duration::from_secs(1);
 const MAX_TICK: Duration = Duration::from_secs(2);
-/// How long a handler waits for SESSION_DONE after sending the exit.
-const ACK_WAIT: Duration = Duration::from_secs(2);
 
 /// Milliseconds the guest has run since `start_clock`. A plain pause stops the vCPUs but not the
 /// TSC, so CLOCK_MONOTONIC (and `Instant`) jump by the paused time on resume; this counts it as one
 /// tick of at most `MAX_TICK`. A starved ticker only makes it slow, never fast.
 static AWAKE_MS: AtomicU64 = AtomicU64::new(0);
-/// Orders sent exits, oldest first.
-static DELIVERIES: AtomicU64 = AtomicU64::new(0);
 
 pub fn start_clock() {
     thread::spawn(|| {
@@ -195,30 +189,9 @@ impl Table {
         }
     }
 
-    /// Sessions whose exit was sent to a client that left without acknowledging it, oldest first.
-    fn unacknowledged(&self) -> Vec<(u64, String)> {
-        let mut found: Vec<_> = self
-            .live
-            .iter()
-            .filter_map(|(id, e)| {
-                let o = e.output.0.lock().unwrap();
-                o.delivered.filter(|_| o.attached.is_none()).map(|at| (at, id.clone()))
-            })
-            .collect();
-        found.sort();
-        found
-    }
-
     fn admit(&mut self, statuses: &Statuses) -> io::Result<()> {
         if self.live.len() >= MAX_LIVE {
             self.reclaim(statuses);
-        }
-        if self.live.len() >= MAX_LIVE {
-            // Its client most likely has the exit, and only acknowledged too late or not at all; a reattach
-            // after a lost exit finds it while there is room.
-            if let Some((_, id)) = self.unacknowledged().into_iter().next() {
-                self.close(&id, None);
-            }
         }
         if self.live.len() >= MAX_LIVE {
             return Err(io::Error::other(format!("too many sessions: {MAX_LIVE} commands are running or awaiting their client")));
@@ -292,9 +265,6 @@ pub(crate) struct Output {
     sent: u64,
     /// When it was detached, on the awake clock.
     gone: Option<Duration>,
-    /// The current attachment was sent the exit (in `DELIVERIES`' order); once it is gone without an
-    /// acknowledgement, the session may be evicted.
-    delivered: Option<u64>,
     reservation: Reservation,
 }
 
@@ -376,10 +346,9 @@ pub fn parse(line: &str) -> io::Result<Request<'_>> {
     }
 }
 
-/// `SESSIONS`' reply: how many sessions are live, and how many of those are exited and unacknowledged.
+/// `SESSIONS`' reply: how many sessions are live.
 pub fn counts(sessions: &Sessions) -> String {
-    let table = sessions.lock().unwrap();
-    format!("ok {} {}", table.live.len(), table.unacknowledged().len())
+    format!("ok {}", sessions.lock().unwrap().live.len())
 }
 
 pub fn cleanup(sessions: &Sessions, statuses: &Statuses) {
@@ -396,13 +365,6 @@ pub fn handle(mut w: impl Write, body: &[u8], conn: Option<File>, line: &str, se
     match open(body, conn, line, sessions, statuses) {
         Ok(Some((id, offset, (output, me)))) => {
             let result = msg(&mut w, id).and_then(|_| drain(&mut w, &output, offset, me));
-            if matches!(result, Ok(true)) {
-                let mut ring = output.0.lock().unwrap();
-                // Not if a newer attachment replaced it meanwhile: that one's replay is not done.
-                if ring.attached.as_ref().is_some_and(|a| a.id == me) {
-                    ring.delivered = Some(DELIVERIES.fetch_add(1, Ordering::Relaxed));
-                }
-            }
             // Without an acknowledgement (a lost exit, or a client keeping the session), a retry still finds the exit.
             let acknowledged = matches!(result, Ok(true)) && acknowledge(&output, me);
             let mut table = sessions.lock().unwrap();
@@ -504,7 +466,6 @@ fn attach(output: &Session, offset: u64, conn: Option<File>) -> Attached {
     ring.attachments += 1;
     let id = ring.attachments;
     let previous = ring.attached.replace(Attachment { id, conn });
-    ring.delivered = None;
     ring.sent = offset.clamp(ring.start, ring.end);
     drop(ring);
     output.1.notify_all();
@@ -537,14 +498,13 @@ fn deliver(output: &Session, kind: u8, data: &[u8]) -> Duration {
     waited
 }
 
-/// SESSION_DONE from the client on attachment `me`, within `ACK_WAIT` of its exit frame (a newer attachment
-/// shuts it down). A client acknowledges once it wrote all output out: a slow reader's comes too late.
+/// SESSION_DONE from the client on attachment `me`, within 2 s of its exit frame (a newer attachment shuts it down).
 fn acknowledge(output: &Session, me: u64) -> bool {
     let conn = output.0.lock().unwrap().attached.as_ref().filter(|a| a.id == me).and_then(|a| a.conn.as_ref()).and_then(|c| c.try_clone().ok());
     let Some(mut conn) = conn else { return false };
     let mut ready = libc::pollfd { fd: conn.as_raw_fd(), events: libc::POLLIN, revents: 0 };
     let mut ack = [0];
-    (unsafe { libc::poll(&mut ready, 1, ACK_WAIT.as_millis() as i32) }) > 0 && conn.read(&mut ack).is_ok_and(|n| n == 1) && ack[0] == SESSION_DONE
+    (unsafe { libc::poll(&mut ready, 1, 2000) }) > 0 && conn.read(&mut ack).is_ok_and(|n| n == 1) && ack[0] == SESSION_DONE
 }
 
 fn drain(w: &mut impl Write, output: &Session, mut offset: u64, me: u64) -> io::Result<bool> {
@@ -1202,81 +1162,29 @@ mod tests {
         let _ = peer.write_all(&[SESSION_DONE]);
         handler.join().unwrap().unwrap();
         assert!(sessions.lock().unwrap().live.contains_key("done"));
-        let ring = output.0.lock().unwrap();
-        assert!(!ring.closed);
-        assert!(ring.delivered.is_none(), "the newer attachment was not sent the exit");
+        assert!(!output.0.lock().unwrap().closed);
     }
 
-    /// Attaches a client to `id` and reads to its exit, leaving the acknowledgement to the caller.
-    fn attach_to_exit(sessions: &Sessions, statuses: &Statuses, id: &str) -> (thread::JoinHandle<io::Result<()>>, UnixStream) {
+    #[test]
+    fn a_stalled_acknowledgement_leaves_the_exit_for_a_reattach() {
+        let (sessions, statuses) = (Sessions::default(), statuses());
+        finished(&mut sessions.lock().unwrap(), "slow", None);
         let (conn, mut peer) = UnixStream::pair().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let duplicate = File::from(OwnedFd::from(conn.try_clone().unwrap()));
-        let (sessions, statuses, line) = (sessions.clone(), statuses.clone(), format!("ATTACH {id} 0"));
-        let handler = thread::spawn(move || handle(conn, b"", Some(duplicate), &line, &sessions, &statuses));
+        let (sessions_, statuses_) = (sessions.clone(), statuses.clone());
+        let handler = thread::spawn(move || handle(conn, b"", Some(duplicate), "ATTACH slow 0", &sessions_, &statuses_));
         read_to_exit(&mut peer);
-        (handler, peer)
-    }
-
-    #[test]
-    fn a_stalled_acknowledgement_leaves_the_exit_reattachable_and_evictable() {
-        let (sessions, statuses) = (Sessions::default(), statuses());
-        let output = finished(&mut sessions.lock().unwrap(), "slow", None);
-        let (handler, mut peer) = attach_to_exit(&sessions, &statuses, "slow");
-        // A client whose stdout drains slowly acknowledges only once it wrote everything out.
-        let t = Instant::now();
-        thread::sleep(ACK_WAIT + Duration::from_secs(2));
-        assert!(handler.is_finished(), "still waiting after {:?}", t.elapsed());
+        // The acknowledgement comes seconds late: the handler gave up on it and let go of its connection.
+        thread::sleep(Duration::from_secs(4));
+        assert!(handler.is_finished());
         handler.join().unwrap().unwrap();
-        // The handler let go of its connection, and the late acknowledgement goes nowhere.
         assert_eq!(peer.read(&mut [0]).unwrap(), 0);
         let _ = peer.write_all(&[SESSION_DONE]);
-        assert!(output.0.lock().unwrap().attached.is_none());
-        assert_eq!(sessions.lock().unwrap().unacknowledged().len(), 1);
-        // A reattach still finds the exit.
+        assert_eq!(counts(&sessions), "ok 1");
+        // The exit is still there for a reattach.
         let retry = request(&sessions, &statuses, "ATTACH slow 0", b"");
         assert!(retry.ends_with(&[&0u64.to_le_bytes()[..], &0i32.to_le_bytes()].concat()));
-        // And with every slot taken, it makes room.
-        let mut table = sessions.lock().unwrap();
-        for i in 1..MAX_LIVE {
-            live(&mut table, &i.to_string(), Output::default());
-        }
-        table.admit(&statuses).unwrap();
-        assert!(table.closed.contains_key("slow") && output.0.lock().unwrap().closed);
-    }
-
-    #[test]
-    fn unacknowledged_exits_make_room_for_new_sessions() {
-        let (sessions, statuses) = (Sessions::default(), statuses());
-        for i in 0..MAX_LIVE {
-            finished(&mut sessions.lock().unwrap(), &i.to_string(), None);
-        }
-        // Every client reads its exit, then stays silent with its connection open.
-        let clients: Vec<_> = (0..MAX_LIVE).map(|i| attach_to_exit(&sessions, &statuses, &i.to_string())).collect();
-        let order: Vec<_> = (0..MAX_LIVE).map(|i| sessions.lock().unwrap().live[&i.to_string()].output.clone()).collect();
-        let t = Instant::now();
-        let mut peers = Vec::new();
-        for (handler, peer) in clients {
-            handler.join().unwrap().unwrap();
-            peers.push(peer);
-        }
-        assert!(t.elapsed() < ACK_WAIT + Duration::from_secs(3), "handlers took {:?} to let go", t.elapsed());
-        assert_eq!(counts(&sessions), format!("ok {MAX_LIVE} {MAX_LIVE}"), "not all were exited and unacknowledged at once");
-        let mut table = sessions.lock().unwrap();
-        // A session being replayed to a new attachment is not one of them.
-        attach(&order[0], 0, None);
-        assert_eq!(table.unacknowledged().len(), MAX_LIVE - 1);
-        let mut by_delivery: Vec<_> = order[1..].iter().map(|o| o.0.lock().unwrap().delivered.unwrap()).zip(1..).collect();
-        by_delivery.sort();
-        // Each new session evicts the oldest delivery.
-        for (n, (_, i)) in by_delivery.into_iter().enumerate() {
-            table.admit(&statuses).unwrap_or_else(|e| panic!("new session {n} refused: {e}"));
-            assert!(table.closed.contains_key(&i.to_string()), "session {i} was not the oldest");
-            live(&mut table, &format!("new{n}"), Output::default());
-        }
-        // The replayed one, and the running ones, are never evicted.
-        assert!(table.admit(&statuses).unwrap_err().to_string().contains("too many sessions"));
-        assert!(table.live.contains_key("0"));
     }
 
     #[test]
