@@ -987,16 +987,6 @@ pub fn is_nonce(s: &str) -> bool {
     s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// False if `path` exists.
-pub fn rename_noreplace(tmp: &Path, path: &Path) -> io::Result<bool> {
-    use std::os::unix::ffi::OsStrExt;
-    let (src, dest) = (std::ffi::CString::new(tmp.as_os_str().as_bytes())?, std::ffi::CString::new(path.as_os_str().as_bytes())?);
-    match eintr(|| unsafe { libc::renameat2(libc::AT_FDCWD, src.as_ptr(), libc::AT_FDCWD, dest.as_ptr(), libc::RENAME_NOREPLACE) }) {
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
-        res => res.map(|_| true),
-    }
-}
-
 /// Durably: the file is fsynced before the rename, its directory after.
 pub fn write_file(dir: &Path, name: &str, data: &[u8], durable: bool) -> io::Result<()> {
     let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
@@ -2317,13 +2307,13 @@ pub mod output {
     pub fn append_capped(log: &Path, data: &[u8], cap: u64) -> bool {
         let deadline = Instant::now() + STALL;
         // Taken on an open of this call's own: one shared would not exclude the others sharing it.
-        let lock = log_lock(log).and_then(|l| crate::host::private_file(&l)).ok();
-        let locked = lock.as_ref().is_some_and(|l| loop {
-            match crate::host::flock(l, libc::LOCK_EX | libc::LOCK_NB) {
+        let lock = log_lock(log).ok().and_then(|path| loop {
+            match crate::host::lock_path(&path, libc::LOCK_EX | libc::LOCK_NB) {
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline => std::thread::sleep(Duration::from_millis(1)),
-                r => break r.is_ok(),
+                result => break result.ok(),
             }
         });
+        let locked = lock.is_some();
         use std::os::unix::fs::OpenOptionsExt;
         let written = File::options().create(true).append(true).mode(0o600).open(log).is_ok_and(|mut f| {
             let written = f.write_all(data).is_ok();
