@@ -154,7 +154,9 @@ impl Pager {
         let eligible = |p: usize| pages.get(p) == PRESENT && spans.iter().any(|&(a, b)| (a..b).contains(&p));
         // Taken: unless this checkpoint is taken, the next one has nothing to compare with.
         let prev = self.hot_prev.lock().unwrap().take();
-        let hot = select_hot(pages.hot_pages(&before.bits).filter(|&p| eligible(p)), prev.as_ref().map_or(&[], |h| h.pages()), buf.pages());
+        let hot_before = |p: usize| before.bits.get(p / 64).is_some_and(|w| w >> (p % 64) & 1 != 0);
+        let candidate = |p: usize| pages.is_dirty(p) && hot_before(p) && eligible(p);
+        let hot = select_hot(pages.hot_pages(&before.bits).filter(|&p| eligible(p)), prev.as_ref().map_or(&[], |h| h.pages()), candidate, buf.pages());
         let read = |p: usize, dst: &mut [u8]| self.read_at((p * PAGE_SIZE) as u64, &[libc::iovec { iov_base: dst.as_mut_ptr().cast(), iov_len: dst.len() }]);
         copy(buf, prev, hot, |p| next_to(self.mappings(), p), read).inspect_err(|e| crate::log!("uffd: hot pages not copied, protecting them: {e}")).ok()
     }
@@ -174,15 +176,22 @@ impl Pager {
     }
 }
 
-/// Keeps up to `cap` ascending candidates, preferring pages copied last time too (dirty in at least three intervals), then
-/// lower page numbers. Returns ascending pages for copying runs and binary searches.
-fn select_hot(candidates: impl Iterator<Item = usize>, prev: &[usize], cap: usize) -> Vec<usize> {
-    let mut hot: Vec<usize> = candidates.collect();
-    if hot.len() > cap {
-        hot.select_nth_unstable_by_key(cap, |p| (prev.binary_search(p).is_err(), *p));
-        hot.truncate(cap);
-        hot.sort_unstable();
-    }
+/// Keeps up to `cap` of the ascending `candidates`, preferring pages copied last time too (dirty in at least three
+/// intervals; `prev`, ascending, checked with `candidate`), then lower page numbers. Bounded by the cap, not by how many
+/// candidates there are: it runs during the pause, and a large guest can have millions. Returns ascending pages for
+/// copying runs and binary searches.
+fn select_hot(candidates: impl Iterator<Item = usize>, prev: &[usize], candidate: impl Fn(usize) -> bool, cap: usize) -> Vec<usize> {
+    let mut hot: Vec<usize> = prev.iter().copied().filter(|&p| candidate(p)).take(cap).collect();
+    let mut j = 0;
+    let others = candidates
+        .filter(|&p| {
+            j += prev[j..].partition_point(|&q| q < p);
+            prev.get(j) != Some(&p)
+        })
+        .take(cap - hot.len());
+    hot.extend(others);
+    // Two ascending runs: a stable sort merges them in linear time.
+    hot.sort();
     hot
 }
 
@@ -281,11 +290,18 @@ mod tests {
         }
         let before = pages.dirty_bits(false);
         let prev = [cap - 1, cap, cap + 1];
-        let hot = select_hot(pages.hot_pages(&before.bits), &prev, cap);
+        let all = |_| true;
+        let hot = select_hot(pages.hot_pages(&before.bits), &prev, all, cap);
         assert_eq!(hot.len(), cap);
         assert_eq!(&hot[..cap - 3], &(0..cap - 3).collect::<Vec<_>>());
         assert_eq!(&hot[cap - 3..], &prev);
-        assert_eq!(select_hot(pages.hot_pages(&before.bits), &[], cap), (0..cap).collect::<Vec<_>>());
+        assert_eq!(select_hot(pages.hot_pages(&before.bits), &[], all, cap), (0..cap).collect::<Vec<_>>());
+        // Pages copied last time that are no candidates now are not taken, and leave room for others.
+        let hot = select_hot(pages.hot_pages(&before.bits), &[1, cap + 1, cap + 9], |p| p != cap + 9, cap);
+        assert_eq!(hot, (0..cap - 1).chain([cap + 1]).collect::<Vec<_>>());
+        // Under the cap, every candidate.
+        assert_eq!(select_hot([3, 5, 9].into_iter(), &[5, 7], |p| p != 7, 4), [3, 5, 9]);
+        assert_eq!(select_hot([3, 5, 9].into_iter(), &[9], all, 2), [3, 9]);
     }
 
     /// A guest of `n` pages, each filled with its own byte.
