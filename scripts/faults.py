@@ -254,7 +254,7 @@ FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_be
           "prepare_fail", "short_incoming", "slow_preload", "bad_preload", "bad_app_log", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
           "started_fsync", "started_unmark", "start_stall", "incoming_stall", "incoming_gate", "admitted_stall", "claim_stall", "standby_lock_stall", "standby_lock_hang", "handoff_stall", "ckpt_wp_race", "ckpt_rescue_fail",
           "fetch_tail_enomem", "fetch_enomem_stuck", "pull_enomem", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo", "release_stall", "release_late", "no_plug", "pause_lost", "tap_backlog", "tap_backlog_stuck", "pause_unknown", "restore_unpause_fail", "resume_link_fail", "resume_partial", "repause_fail", "pause_fail", "restore_ping_slow", "readdress_fail", "no_collapse", "collapse_slow", "pages_slow", "unlend_fail", "route_stall", "suspend_slow", "owe_fail", "settle_unpause", "prealloc_fail", "resume_fence_fail",
-          "leave_fail", "park_fail", "capture_fail", "preload_read_fail", "abort_gen_fail", "abort_stay_fail", "advance_fail", "commit_gate", "commit_fail", "snapshot_fail")
+          "leave_fail", "park_fail", "capture_fail", "preload_read_fail", "abort_gen_fail", "abort_stay_fail", "advance_fail", "commit_gate", "commit_fail", "snapshot_fail", "hold_route_fail", "hold_plug_fail")
 
 
 def disarm():
@@ -1870,6 +1870,36 @@ def same_host_late_handover():
     udp_across_migrations("same host late handover", "ft-late", "release_late")
 
 
+def same_host_hold_route_fail():
+    """#512: the target's hold fails to take the address over from the source's
+    (`hold_route_fail`: its route change fails). It routes the address to its
+    tap at once instead, plugged behind the source's last held packets, and
+    tells the source only once it has: nothing the source still held or
+    re-sends loops back to it, and nothing is lost or reordered. If the plug
+    fails too (`hold_plug_fail`), it routes nothing early and tells the source
+    so (`n`): the source streams the rest of what it held and lets go of the
+    address without re-sending (no loop), and the target routes it once the
+    stream ends. Nothing is reordered, and what is lost meanwhile is counted."""
+    gates = ("hold_route_fail", "hold_plug_fail")
+    for h in (A, B):
+        for g in gates:
+            clear_gate(h, g)
+    udp_across_migrations("same host hold route fail", "ft-hold-route", "hold_route_fail")
+    hits = {h: reached(h, "hold_route_fail") for h in (A, B)}
+    check("same host hold route fail: reached on each target", len(hits[A]) == 1 and len(hits[B]) == 2, hits)
+    for h in (A, B):
+        for g in gates:
+            clear_gate(h, g)
+    logs = udp_across_migrations("same host hold plug fail", "ft-hold-plug", gates, counted=True)
+    hits = {(h, g): reached(h, g) for h in (A, B) for g in gates}
+    check("same host hold plug fail: both reached on each target", all(len(p) == (1 if h is A else 2) for (h, _), p in hits.items()), hits)
+    lines = [l for t in logs for l in t.splitlines()]
+    told = [l for l in lines if "could not take the address over" in l]
+    check("same host hold plug fail: each source was told", len(told) == 3, told)
+    looped = [l for l in lines if re.search(r"re-sent [1-9]", l)]
+    check("same host hold plug fail: nothing re-sent into the loop", not looped, looped)
+
+
 def same_host_flood():
     """#136: traffic that keeps arriving while the target lets go of its hold
     (10k datagrams/s, its route change made slow by `release_stall`) never
@@ -2020,12 +2050,15 @@ def udp_receiver(host, n):
     assert code == 0, f"socat did not bind UDP port 9000 in the guest: {out}"
 
 
-def udp_across_migrations(label, n, target_fault=None, burst=1, source_fault=None):
+def udp_across_migrations(label, n, target_fault=None, burst=1, source_fault=None, counted=False):
     """A UDP sequence stream to `n` (`burst` datagrams every millisecond)
-    across migrations A to B, back and to B again, `target_fault` armed on
-    each target, arrives whole and, at 1 kHz, in order. The guest's socket
-    buffer is made large enough for any burst of held packets, so a datagram
-    missing was lost by flexvm (the guest's own drops are shown)."""
+    across migrations A to B, back and to B again, `target_fault` (one or a
+    tuple) armed on each target, arrives whole and, at 1 kHz, in order. The
+    guest's socket buffer is made large enough for any burst of held packets,
+    so a datagram missing was lost by flexvm (the guest's own drops are shown).
+    `counted`: at 1 kHz too, what is lost need only be counted. Returns every
+    log its VM processes wrote."""
+    target_faults = (target_fault,) if isinstance(target_fault, str) else tuple(target_fault or ())
     for h in (A, B):
         clear_log(h, n)
     ok(run(A, n))
@@ -2047,8 +2080,8 @@ def udp_across_migrations(label, n, target_fault=None, burst=1, source_fault=Non
     held, at, took, logs = [], [], [], []
     hops = ((A, B), (B, A), (A, B))
     for i, (src, dst) in enumerate(hops):
-        if target_fault:
-            fault(dst, target_fault, 60000)
+        for f in target_faults:
+            fault(dst, f, 60000)
         if source_fault:
             fault(src, source_fault, 60000)
         at.append(sent[0])
@@ -2065,8 +2098,8 @@ def udp_across_migrations(label, n, target_fault=None, burst=1, source_fault=Non
             logs.append(src_log)
         if source_fault:
             took.append([l for l in src_log.splitlines() if "took what was queued on its tap" in l])
-        if target_fault:
-            fault(dst, target_fault, 0)
+        for f in target_faults:
+            fault(dst, f, 0)
         time.sleep(0.3)
     stop.set()
     t.join(10)
@@ -2087,9 +2120,10 @@ def udp_across_migrations(label, n, target_fault=None, burst=1, source_fault=Non
     dropped = {h: [l for l in log(h, n).splitlines() if "dropped" in l or "dropping" in l] for h in (A, B)}
     dropped["earlier sources"] = [l for t in logs for l in t.splitlines() if "dropped" in l or "dropping" in l]
     if burst == 1:
-        check(f"{label}: no udp datagram lost", not missing, detail)
         late = [got[max(0, i - 3):i + 12] for i, (a, b) in enumerate(zip(got, got[1:])) if b <= a]
         check(f"{label}: none reordered", not late, late[:10])
+    if burst == 1 and not counted:
+        check(f"{label}: no udp datagram lost", not missing, detail)
         for h in dropped:
             # A tap's own drops are no held packets; one of the stream's would be missing above.
             held_drops = [l for l in dropped[h] if "its tap dropped" not in l]
@@ -2106,11 +2140,14 @@ def udp_across_migrations(label, n, target_fault=None, burst=1, source_fault=Non
             diag = rx_state(B, n)
             diag["lines"] = sh(B, n, "wc -l < /tmp/udp; cat /proc/net/softnet_stat")[1]
         check(f"{label}: nothing lost that was not counted", len(missing) <= said, (detail, dropped, diag))
+    if burst > 1:
         if source_fault:
             check(f"{label}: each source paused with a queue on its tap, which its guest took first", all(len(t) == 1 for t in took), took)
         let_go = [float(m) for h in (A, B) for m in re.findall(r"let go of \S+ after ([\d.]+) ms", log(h, n))]
         check(f"{label}: each release ended within 2 s of its 300 ms route change", let_go and max(let_go) < 2000, let_go)
+    every = logs + [log(A, n), log(B, n)]
     cleanup(n)
+    return every
 
 
 def udp_in(host, name):
@@ -8514,7 +8551,7 @@ SCENARIOS = dict(
     incoming_killed=incoming_killed, start_killed=start_killed, claim_killed=claim_killed, standby_stalled=standby_stalled, standby_refill_race=standby_refill_race, standby_lock_timeout=standby_lock_timeout, fc_died=fc_died,
     sigkill_restart=sigkill_restart, listen_trickle=listen_trickle,
     cow_wp_race=cow_wp_race, fetch_tail_enomem=fetch_tail_enomem, fetch_enomem_stuck=fetch_enomem_stuck, pull_enomem=pull_enomem,
-    collapse_abort=collapse_abort, collapse_ckpt_fail=collapse_ckpt_fail, ckpt_paused_backlog=ckpt_paused_backlog, same_host_order=same_host_order, same_host_slow_route=same_host_slow_route, same_host_flood=same_host_flood, same_host_late_handover=same_host_late_handover, same_host_backlog=same_host_backlog, same_host_bulk_tcp=same_host_bulk_tcp, ckpt_backlog=ckpt_backlog, rx_stall=rx_stall, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,
+    collapse_abort=collapse_abort, collapse_ckpt_fail=collapse_ckpt_fail, ckpt_paused_backlog=ckpt_paused_backlog, same_host_order=same_host_order, same_host_slow_route=same_host_slow_route, same_host_flood=same_host_flood, same_host_late_handover=same_host_late_handover, same_host_hold_route_fail=same_host_hold_route_fail, same_host_backlog=same_host_backlog, same_host_bulk_tcp=same_host_bulk_tcp, ckpt_backlog=ckpt_backlog, rx_stall=rx_stall, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,
     handoff_superseded=handoff_superseded, delayed_announce=delayed_announce, delayed_announce_handoff=delayed_announce_handoff, announce_arp_timer=announce_arp_timer,
     prepare_fail_announce=prepare_fail_announce, reconcile_announce=reconcile_announce, reconcile_kill=reconcile_kill, resume_pull_lock=resume_pull_lock, page_conns=page_conns, suspend_cmd=suspend_cmd, suspend_slow_cmd=suspend_slow_cmd, suspend_overlap=suspend_overlap, fc_died_busy=fc_died_busy, pause_cmd_start=pause_cmd_start, suspend_died=suspend_died,
     ctrl_z_long_op=ctrl_z_long_op, resume_suspending=resume_suspending, quit_status=quit_status)
