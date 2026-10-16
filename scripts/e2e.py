@@ -803,7 +803,7 @@ def faults():
         print("  none selected")
         return
     # Growth needs a template that starts with little plugged.
-    env = {**os.environ, "COW_GROW_TEMPLATE": GROW, "PLUG_TEMPLATE": GROW}
+    env = {**os.environ, "COW_GROW_TEMPLATE": GROW, "PLUG_TEMPLATE": GROW, "APP_TEMPLATE": APP}
     # The app-log template is built from the cached image when there is one (CI), not pulled.
     layout = image_layout()
     image = ["--image", layout] if layout else ["--image", args.image]
@@ -845,6 +845,12 @@ BUILD = os.path.join(WORK, "build")
 shared_state(BUILD)
 A = Host("a", args.port_a, args.port_a + 1, args.net_a)
 GROW = args.template + "-grow"
+# The app_log and bad_app_log scenarios' template, built once with the others (lanes that each built
+# it on first use would replace it under one another's VMs). Its app as scripts/faults.py's app_template.
+APP = args.template + "-applog"
+APP_FAULTS = ("app_log", "bad_app_log")
+APP_OPTS = ["--vcpus", "2", "--max", "2048", "--cmd", json.dumps(
+    ["sh", "-c", "head -c 8000000 /dev/zero | tr '\\0' x; echo; i=0; while :; do echo applog-$i; i=$((i+1)); sleep 0.05; done"])]
 B = Host("b", args.port_a + 1, args.port_a, args.net_b)
 
 
@@ -953,7 +959,8 @@ def main():
     # (name, templates it needs, cost): the cases, and each scenario on its own.
     work = [(c, set() if c == "image_template" else {args.template}, COST.get(c, 2)) for c in selected if c != "faults"]
     # Growth (and checkpoint_hotplug, unplug_collapsed and mem_refused_fill, which need room to plug) runs on GROW; fc_prepare needs a second template to mismatch with.
-    work += [(f"faults/{s}", {args.template, GROW} if s in ("cow_grow", "plug_race", "plug_storm", "checkpoint_hotplug", "unplug_collapsed", "fc_prepare", "mem_refused_fill") else {args.template},
+    work += [(f"faults/{s}", ({args.template, GROW} if s in ("cow_grow", "plug_race", "plug_storm", "checkpoint_hotplug", "unplug_collapsed", "fc_prepare", "mem_refused_fill") else {args.template})
+              | ({APP} if s in APP_FAULTS else set()),
               COST.get(f"faults/{s}", 2)) for s in scenarios]
     work.sort(key=lambda w: -w[2])
     scheduled = list(work)
@@ -965,10 +972,17 @@ def main():
         with out_lock:
             print(line, flush=True)
 
-    def build(name, *extra):
+    def build(name, *extra, image=False):
         t = time.time()
         try:
-            r = flexvm("template", name, *extra, timeout=600) if not args.selftest else None
+            layout = image_layout()
+            if args.selftest:
+                r = None
+            elif not image:
+                r = flexvm("template", name, *extra, timeout=600)
+            else:
+                # From the cached image (CI), else pulled, its HTTP 429s retried.
+                r = flexvm("template", name, "--image", layout, *extra, timeout=600) if layout else pull_template(name, list(extra))
             out, ok = (r.stdout + r.stderr).strip() if r else "(selftest)", True
         except Exception as e:
             out, ok = str(e), False
@@ -1074,6 +1088,8 @@ def main():
     builders = [threading.Thread(target=build, args=(args.template, "--vcpus", "2", "--max", "2048")),
                 # A larger ceiling with little plugged at the start: VMs must grow.
                 threading.Thread(target=build, args=(GROW, "--vcpus", "2", "--max", "6144", "--plug", "128"))]
+    if any(s in APP_FAULTS for s in scenarios):
+        builders.append(threading.Thread(target=build, args=(APP, *APP_OPTS), kwargs={"image": True}))
     runners = [threading.Thread(target=lane, args=(i, *l), daemon=True) for i, l in enumerate(lanes())]
     try:
         for t in builders + runners:
@@ -1109,7 +1125,7 @@ def main():
         print(f"selftest: failed {bad}, expected {want}; skipped {sorted(r[0] for r in skipped)}, expected {want_skip}")
         mixed = [b for b in spawned if len({s in LISTENER_FAULTS for s in b[1]}) > 1]
         print(f"selftest: batches mixing listener-owning scenarios with others: {mixed}")
-        return 0 if (bad == want and len(summary) == len(scheduled) + 2 and not mixed
+        return 0 if (bad == want and len(summary) == len(scheduled) + len(builders) and not mixed
                      and sorted(r[0] for r in skipped) == want_skip) else 1
     return 1 if failed else 0
 
