@@ -756,7 +756,9 @@ impl Proc {
         going: &dyn Fn() -> Result<()>,
     ) -> Result<(crate::vm::Prepared, Ipv4Addr, Source, String, Vec<u64>)> {
         let ip: Ipv4Addr = req["ip"].as_str().ok_or("missing ip")?.parse()?;
-        crate::listen::check_vm_ip(&self.host, ip, Some(from), until)?;
+        let mut peers: Vec<std::net::IpAddr> = std::env::var("FLEXVM_INCOMING_PEERS").ok().map(|p| serde_json::from_str(&p)).transpose()?.unwrap_or_default();
+        peers.push(from);
+        crate::listen::check_vm_ip(&self.host, ip, &peers)?;
         crate::util::check_kvm()?;
         let name = req["name"].as_str().ok_or("missing name")?.to_string();
         let regions = serde_json::from_value::<Vec<_>>(req["regions"].clone()).map_err(|e| format!("bad regions: {e}"))?;

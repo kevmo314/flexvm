@@ -449,7 +449,7 @@ fn handle(host: &Host, peers: &Peers, mut conn: TcpStream, deadline: Instant) ->
     let op = req["op"].as_str().unwrap_or("");
     let locking = matches!(op, "migration" | "route" | "lend").then(|| Slot::take(&LOCKING, MAX_LOCKING));
     let reply = match op {
-        "migrate_in" => return incoming(host, &req, &line, conn, deadline - REQUEST_DEADLINE + PREPARE_WAIT),
+        "migrate_in" => return incoming(host, &req, &line, conn, deadline - REQUEST_DEADLINE + PREPARE_WAIT, &peers.addrs(&host.config_now().peers)),
         "pages" => return pages(host, &req, conn),
         _ if matches!(locking, Some(None)) => Err(BUSY.into()),
         "migration" => migration(host, &req),
@@ -516,7 +516,7 @@ fn read_line_by(conn: &TcpStream, deadline: Instant) -> Result<Vec<u8>> {
 /// Spawns the incoming VM process with the connection as fd 3; it answers the source. Its
 /// arrival slot is held, by the shared reaper, until it says it committed or was refused
 /// (on its fd 4, `FLEXVM_NOTIFY_FD`) or it ends.
-fn incoming(host: &Host, req: &Value, line: &[u8], conn: TcpStream, by: Instant) -> Result<()> {
+fn incoming(host: &Host, req: &Value, line: &[u8], conn: TcpStream, by: Instant, peers: &[IpAddr]) -> Result<()> {
     let name = req["name"].as_str().unwrap_or("");
     let refuse = |mut c: &TcpStream, e: String| send_json(&mut c, &json!({"ok": false, "error": e}));
     if let Err(e) = crate::host::check_name(name) {
@@ -555,6 +555,7 @@ fn incoming(host: &Host, req: &Value, line: &[u8], conn: TcpStream, by: Instant)
     let args = ["--state".as_ref(), host.state.as_os_str(), "--run".as_ref(), host.run.as_os_str(), "run".as_ref(), "--incoming".as_ref()];
     let (done, told) = std::os::unix::net::UnixStream::pair()?;
     let by = (monotonic_ms() + by.saturating_duration_since(Instant::now()).as_millis() as u64).to_string();
+    let peers = serde_json::to_string(peers)?;
     let spawned = crate::util::spawn_self_child(
         &args,
         &log,
@@ -566,6 +567,7 @@ fn incoming(host: &Host, req: &Value, line: &[u8], conn: TcpStream, by: Instant)
             ("FLEXVM_INCOMING_LOG", log_path.to_str().ok_or("non-UTF8 log path")?),
             ("FLEXVM_NOTIFY_FD", "4"),
             ("FLEXVM_INCOMING_BY", &by),
+            ("FLEXVM_INCOMING_PEERS", &peers),
         ],
     );
     drop(told);
@@ -694,21 +696,33 @@ fn route(host: &Host, req: &Value, peers: &[IpAddr]) -> Result<Value> {
     Ok(json!({"ip": ip.to_string(), "local": local}))
 }
 
-/// Validate addresses from migrations and checkpoints before preparing or claiming them.
-pub fn check_vm_ip(host: &Host, ip: Ipv4Addr, from: Option<IpAddr>, by: Instant) -> Result<()> {
-    static PEERS: std::sync::LazyLock<Peers> = std::sync::LazyLock::new(Peers::default);
+/// Validate addresses from migrations and checkpoints without waiting for DNS.
+/// `peers` includes the listener's cached addresses for an arrival, plus its source.
+pub fn check_vm_ip(host: &Host, ip: Ipv4Addr, peers: &[IpAddr]) -> Result<()> {
     let cfg = host.config_now();
-    PEERS.refresh(&cfg.peers);
-    let mut peers = PEERS.all_addrs(&cfg.peers, by)?;
-    peers.extend(from);
-    routable(ip, &cfg, &peers, &crate::net::gateways(&std::fs::read_to_string("/proc/net/route")?))
+    let mut known = peers.to_vec();
+    known.extend(cfg.peers.iter().filter_map(|p| p.parse::<SocketAddr>().ok().map(|a| a.ip())));
+    // Names without cached addresses are not evidence of a collision (just as after a
+    // failed lookup). This is a collision check, not peer authorization: the listener
+    // admits the source separately and passes its cached peers, and the arrival adds
+    // the actual source address, so DNS failure cannot hide that peer's address here.
+    // Checkpoints are local input; local, underlay and gateway checks still apply.
+    routable(ip, &cfg, &known, &crate::net::gateways(&std::fs::read_to_string("/proc/net/route")?))
 }
 
 /// A peer routes only a VM's address, never one this host reaches its peers or network by (#365).
 fn routable(ip: Ipv4Addr, cfg: &crate::host::Config, peers: &[IpAddr], gateways: &[Ipv4Addr]) -> Result<()> {
+    routable_by(ip, cfg, peers, gateways, crate::net::is_local_addr)
+}
+
+fn routable_by(ip: Ipv4Addr, cfg: &crate::host::Config, peers: &[IpAddr], gateways: &[Ipv4Addr], local: impl FnOnce(Ipv4Addr) -> Result<bool>) -> Result<()> {
     let peer = is_peer(peers, IpAddr::V4(ip));
-    let special = ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() || cfg.underlay() == Some(ip) || gateways.contains(&ip);
-    if peer || special || crate::net::is_local_addr(ip)? {
+    // Do not call cfg.underlay(): its first derivation can wait for DNS. A derived
+    // underlay is an interface's source address, covered by is_local_addr below.
+    let listen = cfg.listen.as_deref().and_then(|s| s.parse::<SocketAddr>().ok()).map(|a| a.ip().to_canonical());
+    let underlay = cfg.underlay == Some(ip) || listen == Some(IpAddr::V4(ip));
+    let special = ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() || underlay || gateways.contains(&ip);
+    if peer || special || local(ip)? {
         bail!("{ip} is not a vm's address: a local, peer, underlay or gateway address, or not unicast");
     }
     Ok(())
@@ -791,6 +805,43 @@ mod tests {
     }
 
     #[test]
+    fn fresh_process_vm_address_checks_need_no_dns() {
+        let root = crate::test_util::TempDir::new("vm-ip-no-dns");
+        let mut host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        host.configure(|cfg| {
+            cfg.peers = vec!["peer.example:7000".into(), "10.98.0.1:7000".into(), "[::ffff:10.98.0.2]:7000".into()];
+            Ok(())
+        })
+        .unwrap();
+        // No resolver is started or waited for, even with an empty process cache.
+        check_vm_ip(&host, "10.98.0.1".parse().unwrap(), &[]).unwrap_err();
+        routable_by("10.200.0.7".parse().unwrap(), &host.config_now(), &[], &[], |_| Ok(false)).unwrap();
+        host.configure(|cfg| {
+            cfg.underlay = Some("10.97.0.1".parse().unwrap());
+            cfg.listen = Some("[::ffff:10.96.0.1]:7000".into());
+            Ok(())
+        })
+        .unwrap();
+        for ip in ["10.98.0.1", "10.98.0.2", "10.97.0.1", "10.96.0.1"] {
+            let e = check_vm_ip(&host, ip.parse().unwrap(), &[]).unwrap_err();
+            assert!(e.to_string().contains("not a vm's address"), "{e}");
+        }
+        // An arrival inherits resolved names from the listener, even during an
+        // unsuccessful refresh, and adds its actual source (including mapped IPv4).
+        let peers = Peers::default();
+        peers.0.resolved.write().unwrap().insert("peer.example:7000".into(), vec!["10.94.0.1".parse().unwrap()]);
+        peers.0.lookups.lock().unwrap().insert("peer.example:7000".into(), None);
+        let mut known = peers.addrs(&host.config_now().peers);
+        known.push("::ffff:10.95.0.1".parse().unwrap());
+        for ip in ["10.94.0.1", "10.95.0.1"] {
+            assert!(check_vm_ip(&host, ip.parse().unwrap(), &known).unwrap_err().to_string().contains("not a vm's address"));
+        }
+        let cfg = host.config_now();
+        routable_by("10.200.0.7".parse().unwrap(), &cfg, &known, &[], |_| Ok(false)).unwrap();
+        assert!(routable_by("10.200.0.7".parse().unwrap(), &cfg, &known, &[], |_| Ok(true)).is_err());
+    }
+
+    #[test]
     fn peers_route_only_vm_addresses() {
         let cfg = crate::host::Config {
             peers: vec!["10.98.0.1:7000".into(), "peer.example:7000".into()],
@@ -842,7 +893,7 @@ mod tests {
         let refused = |why: &str| {
             let (client, server) = pair();
             let start = Instant::now();
-            incoming(&host, &serde_json::from_slice(line).unwrap(), line, server, Instant::now() + PREPARE_WAIT).unwrap();
+            incoming(&host, &serde_json::from_slice(line).unwrap(), line, server, Instant::now() + PREPARE_WAIT, &[]).unwrap();
             assert!(start.elapsed() < Duration::from_secs(1));
             let reply = crate::util::recv_json(&mut std::io::BufReader::new(&client)).unwrap().unwrap();
             assert_eq!(reply["ok"], false);
@@ -889,7 +940,7 @@ mod tests {
         let end = |logs: Vec<Option<(std::fs::File, std::path::PathBuf)>>| logs.into_iter().flatten().for_each(|(_, p)| std::fs::remove_file(p).unwrap());
         let refused = |why: &str| {
             let (client, server) = pair();
-            incoming(&host, &serde_json::from_slice(line).unwrap(), line, server, Instant::now() + PREPARE_WAIT).unwrap();
+            incoming(&host, &serde_json::from_slice(line).unwrap(), line, server, Instant::now() + PREPARE_WAIT, &[]).unwrap();
             let reply = crate::util::recv_json(&mut std::io::BufReader::new(&client)).unwrap().unwrap();
             assert_eq!(reply["ok"], false);
             assert!(reply["error"].as_str().unwrap().contains(why), "{reply}");
