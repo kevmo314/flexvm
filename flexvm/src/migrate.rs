@@ -688,16 +688,6 @@ impl Proc {
             }
             p.held_in.lock().unwrap().take();
             p.announce();
-            // Defer both revision fsyncs (file, then addrs directory) until after the
-            // reply and packet handoff, so the disk never delays the route switch.
-            // The old durable claim still has the generation, owner and `arriving` migration;
-            // only the routing revision lags. The durable commit prevents a live target from
-            // answering aborted; after its death, mig_status reaps it before allowing the
-            // source to resume. Neither decision depends on the revision. Keep write_file's
-            // file-before-rename ordering here so a crash cannot corrupt the old claim.
-            if let Err(e) = p.host.lock().and_then(|l| p.advance(&l, 0)) {
-                crate::log!("vm {}: recording its revision: {e}", p.name());
-            }
         });
         let p = self.clone();
         let source = req["source"].as_str().unwrap_or("").to_string();
@@ -852,6 +842,12 @@ impl Proc {
                     bail!("injected fault: committing failed");
                 }
                 self.arrived.lock().unwrap().as_mut().ok_or("no migration record")?.commit(&l)?;
+                // Only now its revision outranks the source's (`claim_arrival`). Recorded before the
+                // source has its answer: a record behind it would take the source's late announcement
+                // as current and name the source as the way to the address (#499, #492).
+                if let Err(e) = self.advance(&l, 0) {
+                    crate::log!("vm {name}: recording its revision: {e}");
+                }
                 Ok(l)
             }),
         };
