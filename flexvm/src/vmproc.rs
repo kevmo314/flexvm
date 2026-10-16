@@ -1014,7 +1014,7 @@ impl Proc {
             let _ = self.handle(sig);
             return;
         }
-        if self.resumes.offer(sig, || self.pauses.offer(sig)) {
+        if self.resumes.offer(|| self.pauses.offer(sig)) {
             let p = self.clone();
             if let Err(e) = thread::Builder::new().spawn(move || {
                 while let Some((sig, asked)) = p.resumes.next(|| p.pauses.next()) {
@@ -1557,10 +1557,13 @@ impl Latest {
 }
 
 /// The SIGCONTs `flexvm resume` sent, and what came of them. Each is asked
-/// with a ticket; a SIGCONT offered to the pause worker counts every ticket
-/// asked by then, and the worker's turn (`Latest`) takes with it those
-/// offered by then. Its handling answers them: a SIGCONT with its outcome, a
-/// SIGTSTP (a later Ctrl-Z, which `Latest` lets win) as paused again.
+/// with a ticket. A SIGTSTP or SIGCONT the signal thread takes notes the
+/// tickets asked by then (`took`, under `taking`, as `ask` is): their SIGCONT
+/// is that one, came before it, or was discarded by it (a SIGTSTP sent after
+/// a SIGCONT still pending discards it). Offered to the pause worker, it
+/// carries them on, and the worker's turn (`Latest`) takes those offered by
+/// then: its handling answers them, a SIGCONT with its outcome, a SIGTSTP (a
+/// later Ctrl-Z) as paused again. Each ticket's outcome is kept for its asker.
 #[derive(Default)]
 struct Resumes {
     state: Mutex<ResumeState>,
@@ -1570,9 +1573,12 @@ struct Resumes {
 #[derive(Default)]
 struct ResumeState {
     asked: u64,
+    /// For each SIGTSTP or SIGCONT taken and not yet offered, in order: the tickets asked when it was taken.
+    taken: std::collections::VecDeque<u64>,
     offered: u64,
     answered: u64,
-    outcome: Option<std::result::Result<(), String>>,
+    /// The tickets whose askers still wait, with their outcomes once answered.
+    waiting: std::collections::BTreeMap<u64, Option<std::result::Result<(), String>>>,
 }
 
 impl Resumes {
@@ -1580,15 +1586,24 @@ impl Resumes {
     fn ask(&self, send: impl FnOnce()) -> u64 {
         let mut s = self.state.lock().unwrap();
         s.asked += 1;
+        let ticket = s.asked;
+        s.waiting.insert(ticket, None);
         send();
-        s.asked
+        ticket
     }
 
-    /// `offer` (`Latest::offer`) of `sig`, counted with the tickets it answers.
-    fn offer(&self, sig: i32, offer: impl FnOnce() -> bool) -> bool {
+    /// The signal thread took a SIGTSTP or SIGCONT (holding `taking`).
+    fn took(&self) {
         let mut s = self.state.lock().unwrap();
-        if sig == libc::SIGCONT {
-            s.offered = s.asked;
+        let asked = s.asked;
+        s.taken.push_back(asked);
+    }
+
+    /// `offer` (`Latest::offer`) of the SIGTSTP or SIGCONT taken first of those not yet offered.
+    fn offer(&self, offer: impl FnOnce() -> bool) -> bool {
+        let mut s = self.state.lock().unwrap();
+        if let Some(t) = s.taken.pop_front() {
+            s.offered = s.offered.max(t);
         }
         offer()
     }
@@ -1599,21 +1614,26 @@ impl Resumes {
         next().map(|sig| (sig, s.offered))
     }
 
+    /// Answers the tickets up to `upto` not answered yet.
     fn answer(&self, upto: u64, sig: i32, res: std::result::Result<(), String>) {
         let mut s = self.state.lock().unwrap();
         if upto <= s.answered {
             return;
         }
+        let outcome = if sig == libc::SIGCONT { res } else { Err("paused again meanwhile (a later SIGTSTP)".into()) };
+        let from = s.answered + 1;
+        for (_, o) in s.waiting.range_mut(from..=upto) {
+            *o = Some(outcome.clone());
+        }
         s.answered = upto;
-        s.outcome = Some(if sig == libc::SIGCONT { res } else { Err("paused again meanwhile (a later SIGTSTP)".into()) });
         self.answered.notify_all();
     }
 
-    /// What came of `ticket`, if answered within `wait`.
+    /// What came of `ticket`, if answered within `wait`; either way it is no longer waited for.
     fn wait(&self, ticket: u64, wait: Duration) -> Option<std::result::Result<(), String>> {
         let s = self.state.lock().unwrap();
-        let (s, _) = self.answered.wait_timeout_while(s, wait, |s| s.answered < ticket).unwrap();
-        (s.answered >= ticket).then(|| s.outcome.clone().unwrap_or(Ok(())))
+        let (mut s, _) = self.answered.wait_timeout_while(s, wait, |s| matches!(s.waiting.get(&ticket), Some(None))).unwrap();
+        s.waiting.remove(&ticket).flatten()
     }
 }
 
@@ -1684,6 +1704,9 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
         // Taken, and a SIGTERM's suspend reserved, under `taking` (`ask_resume`).
         let taking = s.taking.lock().unwrap();
         let Some(sig) = crate::util::take_signal(&signals) else { continue };
+        if matches!(sig, libc::SIGTSTP | libc::SIGCONT) {
+            s.resumes.took();
+        }
         if sig != libc::SIGTERM {
             drop(taking);
         }
@@ -2959,6 +2982,7 @@ mod tests {
 
     #[test]
     fn a_resume_asked_while_a_sigterm_is_taken_waits_for_its_reservation() {
+        let _signals = PROCESS_SIGCONT.lock().unwrap_or_else(|e| e.into_inner());
         let (p, root) = test_proc("resume-taking");
         assert!(p.ask_resume().is_some());
         // The signal thread has taken a SIGTERM (no longer pending) and not yet reserved.
@@ -2976,41 +3000,88 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// Held by tests that send this process a SIGCONT (`ask_resume`), which would discard or
+    /// add to the stop signals another test has pending.
+    static PROCESS_SIGCONT: Mutex<()> = Mutex::new(());
+
+    /// The signal thread's part: takes what is pending, noting and offering each.
+    fn take_and_offer(r: &Resumes, l: &Latest, set: &libc::sigset_t) {
+        while let Some(sig) = crate::util::take_signal(set) {
+            r.took();
+            r.offer(|| l.offer(sig));
+        }
+    }
+
     #[test]
-    fn resume_tickets_are_answered_by_the_handling_that_covers_them() {
+    fn each_resume_ticket_keeps_its_own_outcome() {
         let (r, l) = (Resumes::default(), Latest::default());
-        let sent = std::cell::Cell::new(0);
-        let (one, two) = (r.ask(|| sent.set(sent.get() + 1)), r.ask(|| sent.set(sent.get() + 1)));
-        assert_eq!((one, two, sent.get()), (1, 2, 2));
-        assert!(r.offer(libc::SIGCONT, || l.offer(libc::SIGCONT)), "starts the worker");
-        // Asked after that SIGCONT was offered: its own comes later.
-        let three = r.ask(|| ());
+        let one = r.ask(|| ());
+        r.took();
+        assert!(r.offer(|| l.offer(libc::SIGCONT)), "starts the worker");
         let (sig, upto) = r.next(|| l.next()).unwrap();
-        assert_eq!((sig, upto), (libc::SIGCONT, 2));
+        assert_eq!((sig, upto), (libc::SIGCONT, one));
+        // Asked while that one is handled: its own SIGCONT comes next.
+        let two = r.ask(|| ());
+        r.took();
+        assert!(!r.offer(|| l.offer(libc::SIGCONT)));
         r.answer(upto, sig, Err("resume failed part way".into()));
+        let (sig, upto) = r.next(|| l.next()).unwrap();
+        assert_eq!((sig, upto), (libc::SIGCONT, two));
+        r.answer(upto, sig, Ok(()));
+        // Neither asker had woken: each gets its own.
+        assert_eq!(r.wait(two, Duration::ZERO), Some(Ok(())));
         assert_eq!(r.wait(one, Duration::ZERO), Some(Err("resume failed part way".into())));
-        assert_eq!(r.wait(two, Duration::ZERO), Some(Err("resume failed part way".into())));
-        assert_eq!(r.wait(three, Duration::from_millis(20)), None, "not answered yet: bounded");
-        // Its SIGCONT, then a later Ctrl-Z that wins: answered as paused again, never left waiting.
-        assert!(!r.offer(libc::SIGCONT, || l.offer(libc::SIGCONT)));
-        assert!(!r.offer(libc::SIGTSTP, || l.offer(libc::SIGTSTP)));
-        let (sig, upto) = r.next(|| l.next()).unwrap();
-        assert_eq!((sig, upto), (libc::SIGTSTP, 3));
-        r.answer(upto, sig, Ok(()));
-        assert!(r.wait(three, Duration::ZERO).unwrap().unwrap_err().contains("paused again"));
-        // An older handling finishing late changes nothing.
-        r.answer(2, libc::SIGCONT, Ok(()));
-        assert!(r.wait(three, Duration::ZERO).unwrap().is_err());
-        let four = r.ask(|| ());
-        assert!(!r.offer(libc::SIGCONT, || l.offer(libc::SIGCONT)));
-        let (sig, upto) = r.next(|| l.next()).unwrap();
-        r.answer(upto, sig, Ok(()));
-        assert_eq!(r.wait(four, Duration::ZERO), Some(Ok(())));
+        // An older handling finishing late changes nothing; one never answered is bounded.
+        let three = r.ask(|| ());
+        r.answer(two, libc::SIGCONT, Ok(()));
+        assert_eq!(r.wait(three, Duration::from_millis(20)), None);
         assert!(r.next(|| l.next()).is_none(), "the worker stops");
+        assert!(r.state.lock().unwrap().waiting.is_empty(), "nothing kept for askers gone");
+    }
+
+    #[test]
+    fn a_ctrl_z_that_discards_a_pending_resume_answers_it() {
+        let _signals = PROCESS_SIGCONT.lock().unwrap_or_else(|e| e.into_inner());
+        thread::spawn(|| {
+            let set = crate::util::block_signals(&[libc::SIGCONT, libc::SIGTSTP]);
+            let (r, l) = (Resumes::default(), Latest::default());
+            let me = unsafe { libc::pthread_self() };
+            // Sent while still pending (not yet taken), a SIGTSTP discards the SIGCONT.
+            let ticket = r.ask(|| unsafe {
+                libc::pthread_kill(me, libc::SIGCONT);
+            });
+            unsafe { libc::pthread_kill(me, libc::SIGTSTP) };
+            assert!(!crate::util::signal_pending(libc::SIGCONT), "discarded by the kernel");
+            take_and_offer(&r, &l, &set);
+            let (sig, upto) = r.next(|| l.next()).unwrap();
+            assert_eq!((sig, upto), (libc::SIGTSTP, ticket));
+            r.answer(upto, sig, Ok(()));
+            assert!(r.wait(ticket, Duration::ZERO).unwrap().unwrap_err().contains("paused again"));
+            assert!(r.next(|| l.next()).is_none());
+            // A Ctrl-Z taken before the ask answers nothing: the SIGCONT after it does.
+            unsafe { libc::pthread_kill(me, libc::SIGTSTP) };
+            take_and_offer(&r, &l, &set);
+            let ticket = r.ask(|| unsafe {
+                libc::pthread_kill(me, libc::SIGCONT);
+            });
+            let (sig, upto) = r.next(|| l.next()).unwrap();
+            assert_eq!(sig, libc::SIGTSTP);
+            r.answer(upto, sig, Ok(()));
+            assert_eq!(r.wait(ticket, Duration::from_millis(20)), None, "not answered by the older Ctrl-Z");
+            let ticket = r.ask(|| ());
+            take_and_offer(&r, &l, &set);
+            let (sig, upto) = r.next(|| l.next()).unwrap();
+            assert_eq!((sig, upto), (libc::SIGCONT, ticket));
+            r.answer(upto, sig, Ok(()));
+            assert_eq!(r.wait(ticket, Duration::ZERO), Some(Ok(())));
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]
     fn a_resume_answers_without_any_signal_taken() {
+        let _signals = PROCESS_SIGCONT.lock().unwrap_or_else(|e| e.into_inner());
         // No signal thread (nor a SIGCONT a Ctrl-Z could erase): answered at once, from what is pending.
         let (p, root) = test_proc("resume-pending");
         thread::spawn(move || {

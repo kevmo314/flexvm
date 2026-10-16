@@ -384,7 +384,7 @@ fn configure_listener(host: &mut Host, addr: Option<&str>, activated: Option<std
             Some(l) => {
                 let local = l.local_addr()?;
                 match addr {
-                    Some(a) => activated_at(a, local)?,
+                    Some(a) => activated_at(a, local, listen::v6only(&l))?,
                     None => c.listen = Some(local.to_string()),
                 }
                 l
@@ -403,13 +403,24 @@ fn configure_listener(host: &mut Host, addr: Option<&str>, activated: Option<std
 
 /// An ADDR given with an activated socket is what peers are told (they fetch a
 /// migration's memory from it): one the socket does not listen on is refused.
-fn activated_at(addr: &str, local: std::net::SocketAddr) -> Result<()> {
-    let at = |a: &std::net::SocketAddr| a.port() == local.port() && (local.ip().is_unspecified() || a.ip().to_canonical() == local.ip().to_canonical());
+fn activated_at(addr: &str, local: std::net::SocketAddr, v6only: bool) -> Result<()> {
+    let at = |a: &std::net::SocketAddr| a.port() == local.port() && takes(local, v6only, a.ip());
     let resolved = util::resolve(addr, Instant::now() + Duration::from_secs(2)).map_err(|e| format!("listen address {addr}: {e}"))?;
     if !resolved.iter().any(at) {
         bail!("the activated socket listens on {local}, not {addr}: run flexvm listen without ADDR, or give the socket's address");
     }
     Ok(())
+}
+
+/// Whether a socket bound at `local` takes connections to `ip`: its own address, or for a
+/// wildcard one any of its family (an IPv6 one IPv4 too, unless IPV6_V6ONLY).
+fn takes(local: std::net::SocketAddr, v6only: bool, ip: std::net::IpAddr) -> bool {
+    let (ip, bound) = (ip.to_canonical(), local.ip().to_canonical());
+    match (bound.is_unspecified(), local.ip()) {
+        (false, _) => ip == bound,
+        (true, std::net::IpAddr::V4(_)) => ip.is_ipv4(),
+        (true, std::net::IpAddr::V6(_)) => ip.is_ipv6() || !v6only,
+    }
 }
 
 /// What `configure` sets.
@@ -1305,9 +1316,16 @@ mod exec_tests {
         assert_eq!(host.cfg.listen.as_deref(), Some(own.as_str()));
         // A wildcard socket listens on every address with its port.
         let wildcard = std::net::SocketAddr::from(([0, 0, 0, 0], 7070));
-        assert!(activated_at("10.1.2.3:7070", wildcard).is_ok());
-        assert!(activated_at("10.1.2.3:7071", wildcard).is_err());
-        assert!(activated_at("127.0.0.1:7070", std::net::SocketAddr::from(([10, 1, 2, 3], 7070))).is_err());
+        assert!(activated_at("10.1.2.3:7070", wildcard, false).is_ok());
+        assert!(activated_at("10.1.2.3:7071", wildcard, false).is_err());
+        assert!(activated_at("127.0.0.1:7070", std::net::SocketAddr::from(([10, 1, 2, 3], 7070)), false).is_err());
+        // An IPv4 wildcard takes no IPv6 connections; an IPv6 one IPv4 ones only without IPV6_V6ONLY.
+        assert!(activated_at("[::1]:7070", wildcard, false).is_err());
+        let v6 = "[::]:7070".parse().unwrap();
+        assert!(activated_at("[::1]:7070", v6, true).is_ok());
+        assert!(activated_at("10.1.2.3:7070", v6, false).is_ok());
+        assert!(activated_at("10.1.2.3:7070", v6, true).is_err());
+        assert!(activated_at("[::ffff:10.1.2.3]:7070", wildcard, false).is_ok());
         // An IPv6 listener needs no IPv4 underlay.
         if let Ok(v6) = TcpListener::bind("[::1]:0") {
             drop(configure_listener(&mut host, None, Some(v6)).unwrap());
