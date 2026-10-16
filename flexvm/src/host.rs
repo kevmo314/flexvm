@@ -457,7 +457,11 @@ impl Host {
                     );
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => store(&binding, &run, true)?,
+            // A user who cannot write the state root (a non-root `flexvm ls` of an unbound one) leaves it unbound.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => match crate::util::write_file(&state, "run.json", &serde_json::to_vec(&run)?, true) {
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem) => {}
+                r => r.map_err(|e| format!("{}: {e}", binding.display()))?,
+            },
             Err(e) => bail!("{}: {e}", binding.display()),
         }
         let _ = RUN_DIR.set(run.clone());
@@ -2529,6 +2533,24 @@ mod tests {
         let e = Host::open(&h.state, &h.run).err().unwrap().to_string();
         assert!(e.contains(binding.to_str().unwrap()), "{e}");
         assert_eq!(std::fs::read(&binding).unwrap(), b"");
+    }
+
+    #[test]
+    fn an_unwritable_state_opens_unbound() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let (_base, h) = host("run-binding-readonly");
+        let binding = h.state.join("run.json");
+        std::fs::remove_file(&binding).unwrap();
+        let mode = |m| std::fs::set_permissions(&h.state, std::fs::Permissions::from_mode(m)).unwrap();
+        mode(0o555);
+        let result = Host::open(&h.state, &h.run);
+        mode(0o755);
+        result.unwrap();
+        assert!(!binding.exists());
     }
 
     #[test]
