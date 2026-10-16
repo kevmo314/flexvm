@@ -88,23 +88,11 @@ pub fn recover_after_boot(host: &Host) -> Result<()> {
     Ok(())
 }
 
-/// One foreground warning per host and boot, without suppressing recovery retries.
-pub fn first_boot_warning(host: &Host, boot: &str) -> Result<bool> {
-    use std::io::{Read, Seek, Write};
-    if boot.is_empty() {
-        return Ok(true);
-    }
-    let mut file = crate::host::private_file(&crate::host::locks(&host.run).join("boot-warning"))?;
-    let _lock = Flock::new(file.try_clone()?, libc::LOCK_EX)?;
-    let mut previous = String::new();
-    file.read_to_string(&mut previous)?;
-    if previous == boot {
-        return Ok(false);
-    }
-    file.rewind()?;
-    file.set_len(0)?;
-    file.write_all(boot.as_bytes())?;
-    Ok(true)
+/// Whether this is the first foreground warning in this boot (`RUN/.warned-BOOT`), so a failed
+/// boot recovery is retried on every open but reported once.
+pub fn first_boot_warning(host: &Host, boot: &str) -> bool {
+    let marker = host.run.join(format!(".warned-{boot}"));
+    boot.is_empty() || !matches!(std::fs::File::create_new(marker), Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists)
 }
 
 /// A sweep now (the peers told of withdrawals, interrupted migrations settled and retired) and
@@ -272,14 +260,12 @@ mod tests {
     fn foreground_boot_warning_is_once_per_boot() {
         let d = dir("boot-warning");
         let host = Host::open(&d.join("state"), &d.join("run")).unwrap();
-        assert!(first_boot_warning(&host, "boot-1").unwrap());
-        assert!(!first_boot_warning(&host, "boot-1").unwrap());
-        let reopened = Host::open(&host.state, &host.run).unwrap();
-        assert!(!first_boot_warning(&reopened, "boot-1").unwrap());
-        assert!(first_boot_warning(&reopened, "b2").unwrap());
-        assert!(!first_boot_warning(&host, "b2").unwrap());
+        assert!(first_boot_warning(&host, "boot-1"));
+        assert!(!first_boot_warning(&host, "boot-1"));
+        assert!(first_boot_warning(&host, "b2"));
+        assert!(first_boot_warning(&host, ""), "no boot id: always warn");
         std::thread::scope(|scope| {
-            let warnings: Vec<_> = (0..8).map(|_| scope.spawn(|| first_boot_warning(&host, "boot-3").unwrap())).collect();
+            let warnings: Vec<_> = (0..8).map(|_| scope.spawn(|| first_boot_warning(&host, "boot-3"))).collect();
             assert_eq!(warnings.into_iter().map(|warning| warning.join().unwrap()).filter(|&first| first).count(), 1);
         });
     }

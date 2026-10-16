@@ -287,7 +287,7 @@ pub fn open_host(args: &Args) -> Result<Host> {
     let host = open_host_only(args)?;
     let partly = matches!(args.positional.first().map(String::as_str), Some("run" | "resume" | "restore" | "listen" | "recover" | "template"));
     if let Err(e) = gc::after_boot(&host, !partly) {
-        if gc::first_boot_warning(&host, host::boot_id()).unwrap_or(true) {
+        if gc::first_boot_warning(&host, host::boot_id()) {
             crate::log!("flexvm: recovering after boot: {e}");
         }
     }
