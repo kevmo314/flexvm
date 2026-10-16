@@ -566,7 +566,7 @@ committed, never ends the process,
    `host::suspend_debris_is_removed_by_the_names_next_holder`; faults
    `suspend_debris`, `revoked_publication`. Quarantine is a file
    (`QUARANTINE`, with the boot id), held only in that boot by both `resume`
-   and `ls` (fault `quarantine_reboot_ls`). Suspended VMs keep name and address with
+   and `ls` (fault `resume_mark_fails`). Suspended VMs keep name and address with
    no pid, and `ls` lists them.
 7. **Address state** is read fresh and changed per change under the host
    lock, durable where it orders anything. The listener's skip-local check
@@ -593,7 +593,7 @@ committed, never ends the process,
    suspend writes its generation into the checkpoint (`GEN`) before it is
    published, and a suspended VM without one is quarantined, never given a
    new generation; every VM start rechecks its generation under the host
-   lock until it runs. Faults `abort_superseded`, `gen_zero`, `forged_peer`,
+   lock until it runs. Faults `abort_superseded`, `forged_peer`,
    `suspend_gen`, `late_withdrawal`, `checkpoint_restore`, `restore_ip_peer`.
 12. **An arrival settles once, before anything else changes owners.** Until
    every page is in and its record is durably `released` (then a home host

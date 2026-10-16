@@ -16,9 +16,10 @@ usage: sudo scripts/e2e.py [--bin FLEXVM] [--state DIR] [--log-dir DIR]
                            [--port-a N] [--net-a A.B.C] [--net-b A.B.C]
                            [--jobs N] [--lanes "PORT:NET-A:NET-B ..."]
                            [--image REF [--image-cache DIR] | --no-image] [--faults "SCENARIO ..."]
-                           [--shard main|recovery|heavy] [--no-skips] [CASE ...]
+                           [--shard pr|main|recovery|heavy] [--split I/N] [--no-skips] [CASE ...]
 
-Shards (CI runs main and recovery side by side, heavy on a schedule):
+Shards (CI runs pr in four splits side by side, heavy on a schedule):
+  pr        main and recovery together;
   main      the cases and FAULTS;
   recovery  RECOVERY_FAULTS: the scenarios that restart listeners (run with listeners
             faults.py starts itself, which they check are new processes), the
@@ -58,12 +59,12 @@ p.add_argument("--image-cache", help="keep the pulled image here as an OCI layou
 FAULTS = ("basic route route_abort lost_ack unknown refused pages_blip pages_dead_restore prepared_retry resume_kill exec_race guest_calls exec_background exec_pause_grace "
           "checkpoint_restore checkpoint_fork checkpoint_corrupt held_restore_frozen cow_exact cow_rescue_fail cow_collapsed unplug_collapsed cow_abort ckpt_incremental ckpt_hot "
           "ckpt_failed_stop ckpt_rearm prepare_fail fc_prepare forged_vmstate slow_preload bad_preload pull_enomem ckpt_packet_hold "
-          "abort_superseded gen_zero signals suspend_gen standby standby_vm_ips restore_ip_peer spoof_filter killed_migrated "
+          "abort_superseded signals suspend_gen standby standby_vm_ips restore_ip_peer spoof_filter killed_migrated "
           "incoming_killed start_killed claim_killed standby_stalled standby_refill_race standby_lock_timeout standby_stop_claim standby_claim_signal standby_concurrent_claims fc_died cow_grow plug_race plug_storm suspend_debris revoked_publication "
           "same_host_order same_host_slow_route same_host_flood same_host_late_handover same_host_hold_route_fail same_host_backlog same_host_bulk_tcp ckpt_backlog ckpt_paused_backlog rx_stall arrival_abort_route arrival_killed_route handoff_superseded delayed_announce delayed_announce_handoff announce_arp_timer prepare_fail_announce reconcile_announce reconcile_kill mem_high mem_high_migrate mem_high_evict mem_refused_headroom mem_refused_fill "
           "sigkill_restart listen_trickle suspend_cmd suspend_slow_cmd suspend_overlap fc_died_busy pause_cmd_start suspend_died evict_latency evict_skips_cmd cmd_flag "
           "refused_admission arrival_grew arrival_grew_admitted meminfo_unreadable checkpoint_hotplug log_cap gc_debris arrival_log template_tap arrival_overtaken "
-          "leave_fail capture_fail abort_gen_fail commit_fail commit_fail_routed abort_stay_fail prepare_disconnect prepare_trickle arrival_flood unlend_retry bad_app_log resume_slow_guest resume_readdress_fail resume_unpause_fail abort_link_fail resume_unsettled resume_pull_lock page_conns page_refusals suspend_unaddressed resume_fence_fails quarantine_reboot_ls "
+          "leave_fail capture_fail abort_gen_fail commit_fail commit_fail_routed abort_stay_fail prepare_disconnect prepare_trickle arrival_flood unlend_retry bad_app_log resume_slow_guest resume_readdress_fail resume_unpause_fail abort_link_fail resume_unsettled resume_pull_lock page_conns page_refusals suspend_unaddressed resume_fence_fails "
           "resume_failures resume_mark_fails suspend_killed resume_suspending source_unpublished start_admission standby_admission pause_lost cow_crash ckpt_dir_moved "
           "checkpoint_untrusted_dir run_status unread_output quit_status ctrl_z_long_op app_log forged_peer forged_pages ckpt_ancestor_corrupt resume_killed_marked restore_route_fence "
           "resume_outcome exec_recovery_instance")
@@ -79,9 +80,10 @@ RECOVERY_FAULTS = " ".join(sorted(LISTENER_FAULTS)) + " terminal guest_hang uffd
 # paused migration: scheduled, one at a time (--jobs 1).
 HEAVY_FAULTS = ("pages_dead source_killed_basic pull_died kill_source kill_refused_checkpoint quiet_source checkpoint_crash suspend_disk_freed "
                 "cow_reports_held collapse_abort collapse_ckpt_fail shrink_stall evict_no_pingpong evict_grower pause_resume")
-SHARDS = {"main": FAULTS, "recovery": RECOVERY_FAULTS, "heavy": HEAVY_FAULTS}
+SHARDS = {"pr": FAULTS + " " + RECOVERY_FAULTS, "main": FAULTS, "recovery": RECOVERY_FAULTS, "heavy": HEAVY_FAULTS}
 p.add_argument("--shard", choices=SHARDS, default="main",
-               help="main: the cases and FAULTS; recovery, heavy: only the faults case, with those scenarios")
+               help="pr, main: the cases and those scenarios; recovery, heavy: only the faults case, with those scenarios")
+p.add_argument("--split", help="I/N: run only the I-th of N parts of the selection, balanced by COST (CI runs N side by side)")
 p.add_argument("--no-skips", action="store_true", help="a skipped case or scenario fails the run")
 p.add_argument("--faults", help="scripts/faults.py scenarios to run against the two hosts ('' for none; default: the shard's)")
 # A worker runs its cases on one lane, against templates that are already built.
@@ -97,7 +99,7 @@ args = p.parse_args()
 if args.faults is None:
     # The self-test schedules every CI shard's scenarios at once: listener-owning batches stay apart.
     args.faults = SHARDS[args.shard] + (" " + RECOVERY_FAULTS if args.selftest else "")
-if not args.cases and not args.worker and args.shard != "main":
+if not args.cases and not args.worker and args.shard not in ("pr", "main"):
     args.cases = ["faults"]
 BIN = os.path.abspath(args.bin)
 ARTIFACTS = os.path.join(os.path.abspath(args.state), "artifacts")
@@ -923,24 +925,40 @@ def worker():
     return 1 if failed else 0
 
 
-# About how many seconds each case and scenario takes on a CI runner (4 lanes): the long ones
-# start first, and the short ones go in batches of about BATCH_S (each batch is a worker, with
-# hosts of its own). Unlisted ones count as 2 s.
-COST = {"image_template": 30, "pause_resume": 6, "migrate": 3, "checkpoint_restore": 3, "suspend_resume": 3,
-        "faults/cow_grow": 70, "faults/mem_refused_fill": 45, "faults/plug_race": 40, "faults/held_restore_frozen": 19,
-        "faults/pages_blip": 18, "faults/standby_stop_claim": 5, "faults/standby_claim_signal": 15, "faults/standby_concurrent_claims": 10, "faults/standby_lock_timeout": 10, "faults/ckpt_incremental": 18, "faults/ckpt_hot": 25, "faults/cow_collapsed": 18, "faults/unplug_collapsed": 35,
-        "faults/pages_dead_restore": 14, "faults/abort_superseded": 13, "faults/plug_storm": 11, "faults/unknown": 10,
-        "faults/checkpoint_corrupt": 10, "faults/guest_calls": 10, "faults/checkpoint_fork": 9,
-        "faults/signals": 9, "faults/checkpoint_restore": 7, "faults/suspend_cmd": 7, "faults/fc_died_busy": 5, "faults/pause_cmd_start": 6, "faults/suspend_died": 4,
-        "faults/cow_exact": 7, "faults/cow_rescue_fail": 20, "faults/prepared_retry": 7, "faults/ckpt_failed_stop": 7, "faults/exec_race": 7,
-        "faults/prepare_fail": 6, "faults/route": 6, "faults/route_abort": 30, "faults/basic": 6, "faults/slow_preload": 6, "faults/bad_preload": 6, "faults/refused": 6,
-        "faults/resume_kill": 5, "faults/lost_ack": 5, "faults/ckpt_rearm": 5, "faults/cow_abort": 5,
-        "faults/ckpt_packet_hold": 4, "faults/checkpoint_hotplug": 4, "faults/arrival_grew": 30, "faults/arrival_grew_admitted": 40, "faults/log_cap": 8, "faults/arrival_log": 13,
-        "faults/guest_hang": 60, "faults/app_log": 35, "faults/resume_suspending": 22, "faults/wildcard_listen": 22,
-        "faults/target_killed": 20, "faults/start_admission": 18, "faults/standby_admission": 17, "faults/forged_pages": 13,
-        "faults/cow_wp_race": 13, "faults/pause_lost": 12, "faults/fetch_tail_enomem": 12, "faults/fetch_enomem_stuck": 11,
-        "faults/suspend_resume": 9, "faults/ctrl_z_long_op": 8, "faults/resume_failures": 7, "faults/suspend_killed": 6,
-        "faults/source_unpublished": 6, "faults/cow_crash": 6, "faults/arrival_flood": 18}
+# About how many seconds each case and scenario takes on a CI runner (4 lanes; the slowest of a few
+# runs, as e2e.py's summary prints them): --split balances by these, the long ones start first, and
+# the short ones go in batches of about BATCH_S (each batch is a worker, with hosts of its own).
+# Unlisted ones count as 2 s.
+COST = {"faults/exec_background": 110, "faults/mem_refused_fill": 92, "faults/arrival_overtaken": 78,
+        "faults/cow_grow": 65, "faults/reconcile_kill": 64, "faults/plug_race": 45, "faults/guest_hang": 44,
+        "faults/exec_pause_grace": 42, "faults/route_abort": 35, "faults/unplug_collapsed": 30,
+        "faults/arrival_grew": 25, "faults/evict_latency": 25, "faults/mem_high": 25, "faults/target_killed": 25,
+        "faults/resume_pull_lock": 23, "faults/mem_high_migrate": 22, "faults/cow_collapsed": 21,
+        "faults/ckpt_incremental": 20, "faults/arrival_grew_admitted": 19, "faults/held_restore_frozen": 18,
+        "faults/mem_refused_headroom": 18, "faults/standby_stalled": 18, "faults/pages_blip": 16,
+        "faults/resume_suspending": 16, "image_template": 15, "faults/arrival_flood": 14, "faults/page_conns": 14,
+        "faults/page_refusals": 14, "faults/abort_superseded": 13, "faults/cow_rescue_fail": 13,
+        "faults/arrival_log": 12, "faults/mem_high_evict": 12, "faults/pages_dead_restore": 12,
+        "faults/start_admission": 12, "faults/cow_wp_race": 11, "faults/forged_pages": 11,
+        "faults/standby_admission": 11, "faults/wildcard_listen": 11, "faults/arrival_abort_route": 10,
+        "faults/evict_skips_cmd": 10, "faults/listen_trickle": 10, "faults/pause_lost": 10, "faults/cow_exact": 9,
+        "faults/fetch_tail_enomem": 9, "faults/plug_storm": 9, "faults/unknown": 9, "faults/fetch_enomem_stuck": 8,
+        "faults/rx_stall": 8, "faults/signals": 8, "faults/spoof_filter": 8, "faults/suspend_overlap": 8,
+        "faults/app_log": 7, "faults/checkpoint_corrupt": 7, "faults/ckpt_failed_stop": 7, "faults/ckpt_hot": 7,
+        "faults/guest_calls": 7, "faults/resume_slow_guest": 7, "faults/suspend_cmd": 7, "faults/suspend_resume": 7,
+        "faults/bad_app_log": 6, "faults/checkpoint_hotplug": 6, "faults/exec_race": 6, "faults/fc_died_busy": 6,
+        "faults/pause_cmd_start": 6, "faults/reconcile_announce": 6, "faults/resume_unpause_fail": 6,
+        "faults/same_host_hold_route_fail": 6, "faults/standby_lock_timeout": 6, "faults/standby_refill_race": 6,
+        "faults/checkpoint_fork": 5, "faults/checkpoint_restore": 5, "faults/ckpt_backlog": 5,
+        "faults/ckpt_dir_moved": 5, "faults/ckpt_rearm": 5, "faults/resume_failures": 5, "faults/resume_kill": 5,
+        "faults/source_unpublished": 5, "pause_resume": 5, "faults/bad_preload": 4, "faults/basic": 4,
+        "faults/cow_abort": 4, "faults/cow_crash": 4, "faults/ctrl_z_long_op": 4, "faults/handoff_superseded": 4,
+        "faults/lost_ack": 4, "faults/meminfo_unreadable": 4, "faults/prepare_fail": 4, "faults/prepared_retry": 4,
+        "faults/pull_enomem": 4, "faults/refused": 4, "faults/resume_mark_fails": 4, "faults/resume_readdress_fail": 4,
+        "faults/route": 4, "faults/same_host_backlog": 4, "faults/same_host_bulk_tcp": 4, "faults/same_host_flood": 4,
+        "faults/same_host_slow_route": 4, "faults/slow_preload": 4, "faults/suspend_killed": 4,
+        "faults/suspend_slow_cmd": 4, "faults/unlend_retry": 4, "faults/ckpt_ancestor_corrupt": 3,
+        "faults/ckpt_packet_hold": 3, "faults/same_host_order": 3, "faults/suspend_died": 3}
 BATCH_S = 20
 SELFTEST_SKIP_NAME = "wildcard_listen"
 
@@ -967,7 +985,16 @@ def main():
     work += [(f"faults/{s}", ({args.template, GROW} if s in ("cow_grow", "plug_race", "plug_storm", "checkpoint_hotplug", "unplug_collapsed", "fc_prepare", "mem_refused_fill") else {args.template})
               | ({APP} if s in APP_FAULTS else set()),
               COST.get(f"faults/{s}", 2)) for s in scenarios]
-    work.sort(key=lambda w: -w[2])
+    work.sort(key=lambda w: (-w[2], w[0]))
+    if args.split:
+        # Longest first, each to the part with the least so far: every split computes the same parts.
+        i, n = map(int, args.split.split("/"))
+        assert 1 <= i <= n, f"--split {args.split}: want I/N with 1 <= I <= N"
+        parts = [[] for _ in range(n)]
+        for w in work:
+            min(parts, key=lambda p: sum(x[2] for x in p)).append(w)
+        work = parts[i - 1]
+    needed = set().union(*(w[1] for w in work))
     scheduled = list(work)
     lock, out_lock = threading.Condition(), threading.Lock()
     built, broken, procs, summary = set(), set(), [], []
@@ -1090,10 +1117,12 @@ def main():
             with lock:
                 summary.extend(got)
 
-    builders = [threading.Thread(target=build, args=(args.template, "--vcpus", "2", "--max", TEMPLATE_MAX)),
-                # A larger ceiling with little plugged at the start: VMs must grow.
-                threading.Thread(target=build, args=(GROW, "--vcpus", "2", "--max", "6144", "--plug", "128"))]
-    if any(s in APP_FAULTS for s in scenarios):
+    # The templates this selection uses, built side by side.
+    builders = [threading.Thread(target=build, args=(args.template, "--vcpus", "2", "--max", TEMPLATE_MAX))] if args.template in needed else []
+    if GROW in needed:
+        # A larger ceiling with little plugged at the start: VMs must grow.
+        builders.append(threading.Thread(target=build, args=(GROW, "--vcpus", "2", "--max", "6144", "--plug", "128")))
+    if APP in needed:
         builders.append(threading.Thread(target=build, args=(APP, *APP_OPTS), kwargs={"image": True}))
     runners = [threading.Thread(target=lane, args=(i, *l), daemon=True) for i, l in enumerate(lanes())]
     try:

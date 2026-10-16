@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       heavy:
-        description: "Run the heavy shard (as the nightly does) instead of main and recovery"
+        description: "Run the heavy shard (as the nightly does) instead of the pr splits"
         type: boolean
         default: false
   # The heavy fault scenarios (scripts/e2e.py --shard heavy), nightly.
@@ -55,21 +55,26 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: unit tests
         run: cargo test --workspace
+      # Tap, routing and tc operations only (no VM): built as the runner's user, run as root.
+      - name: Root networking unit tests
+        run: |
+          sudo modprobe tun
+          cargo test -p flexvm --config 'target.x86_64-unknown-linux-gnu.runner="sudo -E"' -- --ignored
       - name: e2e scheduler self-test
         # Fake templates and workers, one of which cannot be spawned: its cases must fail.
         run: python3 scripts/e2e.py --selftest --log-dir "$RUNNER_TEMP/e2e-selftest"
 
   e2e:
-    # Shards (scripts/e2e.py --shard), side by side: main (the cases and most scenarios) and recovery
-    # (listener restarts with listeners of faults.py's own, the terminal, timeout-bound ones); the
-    # scheduled run takes heavy (GiB-scale guests, long windows) one scenario at a time.
+    # Shards (scripts/e2e.py --shard): pr (the cases, and the main and recovery scenarios) in four
+    # splits side by side, balanced by e2e.py's COST; the scheduled run takes heavy (GiB-scale
+    # guests, long windows) one scenario at a time.
     name: end-to-end (KVM, ${{ matrix.shard }})
     runs-on: ubuntu-24.04
     timeout-minutes: ${{ matrix.shard == 'heavy' && 150 || 45 }}
     strategy:
       fail-fast: false
       matrix:
-        shard: ${{ fromJSON((github.event_name == 'schedule' || inputs.heavy) && '["heavy"]' || '["main", "recovery"]') }}
+        shard: ${{ fromJSON((github.event_name == 'schedule' || inputs.heavy) && '["heavy"]' || '["pr 1/4", "pr 2/4", "pr 3/4", "pr 4/4"]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -93,14 +98,6 @@ jobs:
         with:
           key: e2e
           cache-on-failure: true
-
-      # These exercise tap, routing and tc operations only; no VM is started.
-      - name: Root networking unit tests
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q --no-install-recommends iproute2 strace
-          sudo modprobe tun
-          sudo -E "$(command -v cargo)" test -p flexvm -- --ignored
 
       # flexvm builds in the background (its release profile: fat LTO, one codegen unit,
       # as shipped) while the steps below restore or build the rest; "Build flexvm" waits.
@@ -232,8 +229,10 @@ jobs:
         env:
           SHARD: ${{ matrix.shard }}
         run: |
-          jobs=4; if [ "$SHARD" = heavy ]; then jobs=1; fi
-          sudo python3 -u scripts/e2e.py --shard "$SHARD" --jobs "$jobs" --no-skips --image "$E2E_IMAGE" --image-cache "$RUNNER_TEMP/image-cache" --log-dir "$RUNNER_TEMP/e2e-logs"
+          # "pr 2/4": shard pr, its second of four splits.
+          set -- $SHARD
+          jobs=4; if [ "$1" = heavy ]; then jobs=1; fi
+          sudo python3 -u scripts/e2e.py --shard "$1" ${2:+--split "$2"} --jobs "$jobs" --no-skips --image "$E2E_IMAGE" --image-cache "$RUNNER_TEMP/image-cache" --log-dir "$RUNNER_TEMP/e2e-logs"
 
       - name: Image digest
         id: img-digest
@@ -245,7 +244,7 @@ jobs:
           done
           true
       - name: Save image
-        if: always() && matrix.shard == 'main' && steps.img-digest.outputs.digest != '' && steps.img-cache.outputs.cache-matched-key != format('{0}{1}', steps.img.outputs.prefix, steps.img-digest.outputs.digest)
+        if: always() && startsWith(matrix.shard, 'pr') && steps.img-digest.outputs.digest != '' && steps.img-cache.outputs.cache-matched-key != format('{0}{1}', steps.img.outputs.prefix, steps.img-digest.outputs.digest)
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/image-cache/oci
@@ -263,6 +262,6 @@ jobs:
         if: failure() || cancelled()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: e2e-logs-${{ matrix.shard }}
+          name: e2e-logs-${{ strategy.job-index }}
           path: ${{ runner.temp }}/e2e-logs
           if-no-files-found: ignore

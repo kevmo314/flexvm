@@ -315,8 +315,9 @@ they are client-observed times, with each trial reporting ten cycles' median.
 and a selection of `scripts/faults.py` scenarios (every failure path of
 migration, checkpoints and suspend, by injected faults), in `--jobs` lanes at
 once, each with two hosts of its own on loopback. Its `--shard` picks the
-selection: `main` and `recovery` (listener restarts, timeouts) run side by
-side on every change, `heavy` (GiB-scale guests) nightly. A scenario that
+selection: `pr` (`main` and `recovery`: listener restarts, timeouts) runs on
+every change, in four `--split`s side by side, `heavy` (GiB-scale guests)
+nightly. A scenario that
 finds the host lacks what it tests reports SKIP, never PASS; `--no-skips`
 fails on one, as CI does.
 `scripts/nettest.sh` migrates a VM back and forth under TCP and UDP traffic
