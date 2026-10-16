@@ -128,6 +128,12 @@ impl Stats {
     }
 }
 
+enum Switch {
+    Switched,
+    Refused,
+    Lost(crate::util::Error),
+}
+
 impl Holder {
     /// None, with a warning, without TUN support: then nothing is held.
     pub fn new(dev: &str) -> Result<Option<Arc<Holder>>> {
@@ -251,18 +257,17 @@ impl Holder {
 
     /// Hands the queue to `sink` then `barrier`s (far end catching up), up to four rounds, then
     /// `switch`es and hands over the rest. `barrier` false: far end lost, but the route switches.
-    /// `refused` (set by a failed `switch`): the far end routes the address itself once it has
+    /// `Switch::Refused`: the far end routes the address itself once it has
     /// all, so the route here stays until then, what reaches it counted as dropped, never
     /// removed (the address would go nowhere meanwhile) nor re-sent (it would come back).
-    pub fn release(
+    fn release(
         &self,
         ip: Ipv4Addr,
         mig: u64,
         sink: &mut dyn FnMut(&[u8]) -> bool,
         barrier: &mut dyn FnMut() -> bool,
-        switch: impl FnOnce() -> Result<()>,
-        refused: &std::cell::Cell<bool>,
-    ) -> Option<(Stats, Result<()>)> {
+        switch: impl FnOnce() -> Switch,
+    ) -> Option<(Stats, Switch)> {
         let e = self.releasing(ip, mig)?;
         let mut stats = Stats::default();
         let mut lost = false;
@@ -279,15 +284,15 @@ impl Holder {
         let switched = switch();
         match (lost, &switched) {
             (true, _) => {}
-            (false, Ok(())) => self.drain_switched(&e, &mut || {
+            (false, Switch::Switched) => self.drain_switched(&e, &mut || {
                 self.give_queued(&e, sink, &mut stats);
             }),
-            (false, Err(_)) => {
+            (false, _) => {
                 self.hand_over(&e, sink, &mut stats);
                 // What the device took meanwhile, read here rather than left to the reader
                 // (which a busy host may not run for a while): read after `unhold`, it would be a
                 // straggler, counted as dropped (#539).
-                if refused.get() {
+                if matches!(switched, Switch::Refused) {
                     self.drain(&mut || {
                         self.give_queued(&e, sink, &mut stats);
                     });
@@ -295,15 +300,15 @@ impl Holder {
             }
         }
         match switched {
-            Ok(()) => self.unhold(ip, &e, true),
-            Err(_) if refused.get() => self.unhold(ip, &e, false),
+            Switch::Switched => self.unhold(ip, &e, true),
+            Switch::Refused => self.unhold(ip, &e, false),
             // Left to the TUN, the address would be dropped here until the caller's retry.
-            Err(_) => self.unroute(ip, &e),
+            Switch::Lost(_) => self.unroute(ip, &e),
         }
         // After `unhold`: a packet read since is a straggler, re-sent (or, refused, counted),
         // not discarded here. Refused, the stream goes on, so what the reader queued after the
         // last hand-over goes too (#539).
-        if !lost && (switched.is_ok() || refused.get()) {
+        if !lost && !matches!(switched, Switch::Lost(_)) {
             self.give_queued(&e, sink, &mut stats);
         }
         stats.dropped += e.q.lock().unwrap().discard();
@@ -891,7 +896,6 @@ pub fn send(holder: &Holder, ip: Ipv4Addr, mig: u64, conn: &TcpStream, handoff: 
     // A handoff moves the route on the target; `switch` runs after the stragglers went, as
     // until they are injected, packets routed to the target overtake them.
     let mut switch = Some(switch);
-    let refused = std::cell::Cell::new(false);
     let handover = || match handoff {
         true => {
             let mut o = out.borrow_mut();
@@ -899,24 +903,23 @@ pub fn send(holder: &Holder, ip: Ipv4Addr, mig: u64, conn: &TcpStream, handoff: 
             let (mut ack, deadline) = ([0u8; 1], Instant::now() + SWITCH_WAIT);
             let answered = o.flush(deadline) && By { s: conn, at: deadline }.read_exact(&mut ack).is_ok();
             match ack[0] {
-                b'w' if answered => Ok(()),
+                b'w' if answered => Switch::Switched,
                 // It could not route the address yet: the rest still goes to it, which routes
                 // the address once the stream ends.
                 b'n' if answered => {
-                    refused.set(true);
                     crate::log!("hold {ip}: the target could not take the address over; it routes it after the held packets");
-                    bail!("the target could not take {ip} over")
+                    Switch::Refused
                 }
                 _ => {
                     o.broken = true;
                     crate::log!("hold {ip}: the target did not take the address over; dropping the rest");
-                    bail!("the target did not take {ip} over (its held packets after this are lost)")
+                    Switch::Lost(format!("the target did not take {ip} over (its held packets after this are lost)").into())
                 }
             }
         }
-        false => switch.take().map_or(Ok(()), |f| f()),
+        false => switch.take().map_or(Ok(()), |f| f()).map_or_else(Switch::Lost, |()| Switch::Switched),
     };
-    let (mut stats, switched) = holder.release(ip, mig, &mut sink, &mut barrier, handover, &refused)?;
+    let (mut stats, switched) = holder.release(ip, mig, &mut sink, &mut barrier, handover)?;
     let mut o = out.into_inner();
     o.buf.extend_from_slice(&0u32.to_be_bytes());
     match o.flush(Instant::now() + FLUSH_WAIT).then(|| read_reply(conn, Instant::now() + REPLY_WAIT)).flatten() {
@@ -926,8 +929,9 @@ pub fn send(holder: &Holder, ip: Ipv4Addr, mig: u64, conn: &TcpStream, handoff: 
     // Refused, the target routes the address itself once the stream ends (or breaks): no route
     // is owed here, nor retried (#539).
     let switched = match switched {
-        Err(_) if refused.get() => Ok(()),
-        s => s.and_then(|()| switch.take().map_or(Ok(()), |f| f())),
+        Switch::Refused => Ok(()),
+        Switch::Switched => switch.take().map_or(Ok(()), |f| f()),
+        Switch::Lost(e) => Err(e),
     };
     Some((stats, switched))
 }

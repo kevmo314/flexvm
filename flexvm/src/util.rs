@@ -16,6 +16,29 @@ macro_rules! bail {
     ($($arg:tt)*) => { return Err(format!($($arg)*).into()) };
 }
 
+/// Selects an injected result without evaluating the operation when the fault is armed.
+#[macro_export]
+macro_rules! fault_result {
+    ($fault:expr => $injected:expr; $operation:expr) => {
+        if $fault {
+            $injected
+        } else {
+            $operation
+        }
+    };
+}
+
+/// Checks one syscall result without retrying, capturing errno before formatting its name.
+#[macro_export]
+macro_rules! syscall_check {
+    ($failed:expr, $($name:tt)*) => {
+        if $failed {
+            let error = std::io::Error::last_os_error();
+            $crate::bail!("{}: {error}", format_args!($($name)*));
+        }
+    };
+}
+
 /// Queues a diagnostic line for stderr without blocking (`log_line`).
 #[macro_export]
 macro_rules! log {
@@ -602,7 +625,7 @@ pub struct By<S> {
 }
 
 impl<S> By<S> {
-    fn left(&self) -> io::Result<Duration> {
+    pub(crate) fn left(&self) -> io::Result<Duration> {
         match self.at.saturating_duration_since(Instant::now()) {
             d if d.is_zero() => Err(io::Error::new(io::ErrorKind::TimedOut, "deadline passed")),
             d => Ok(d),
@@ -1377,6 +1400,41 @@ fn scope(prefix: &[u8], pid: u32, start: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fault_results_evaluate_only_the_selected_branch() {
+        let calls = std::cell::Cell::new(0);
+        for armed in [true, false] {
+            let result: Result<()> = crate::fault_result!(armed => Err("injected".into()); {
+                calls.set(calls.get() + 1);
+                Ok(())
+            });
+            assert_eq!(result.is_err(), armed);
+        }
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn syscall_checks_capture_errno_before_the_name_and_do_not_retry() {
+        let calls = std::cell::Cell::new(0);
+        let operation = || -> Result<()> {
+            crate::syscall_check!(
+                {
+                    calls.set(calls.get() + 1);
+                    unsafe { *libc::__errno_location() = libc::EINTR };
+                    true
+                },
+                "{}",
+                {
+                    unsafe { *libc::__errno_location() = libc::EINVAL };
+                    "interrupted"
+                }
+            );
+            Ok(())
+        };
+        assert_eq!(operation().unwrap_err().to_string(), format!("interrupted: {}", io::Error::from_raw_os_error(libc::EINTR)));
+        assert_eq!(calls.get(), 1);
+    }
 
     fn within(t: Duration, cond: impl Fn() -> bool) -> bool {
         let end = Instant::now() + t;

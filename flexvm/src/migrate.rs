@@ -112,10 +112,8 @@ impl Proc {
         self.drop_held_in();
         self.set_leaving(true);
         // Test fault `leave_fail`: leaving fails once the address is lent.
-        let left = match tripped("leave_fail") {
-            true => Err("injected fault: leaving failed".into()),
-            false => vm.leave(State::Source(mig)),
-        };
+        let left = crate::fault_result!(tripped("leave_fail") => Err("injected fault: leaving failed".into());
+            vm.leave(State::Source(mig)));
         if let Err(e) = left {
             self.set_leaving(false);
             // Leaving and its own loan undone in one write.
@@ -128,10 +126,8 @@ impl Proc {
         }
         self.publish();
         // Test fault `park_fail`: parking the balloon fails, the VM still running as the source.
-        let parked = match tripped("park_fail") {
-            true => Err("injected fault: parking the balloon failed".into()),
-            false => vm.park_balloon(),
-        };
+        let parked = crate::fault_result!(tripped("park_fail") => Err("injected fault: parking the balloon failed".into());
+            vm.park_balloon());
         if let Err(e) = parked {
             return Err(self.abort(&op, &vm, mig, e));
         }
@@ -141,10 +137,8 @@ impl Proc {
         let captured = (|| -> Result<_> {
             let saved = vm.save_state(&vmstate, false, false, hold, &mut t).and_then(|r| {
                 // Test fault `capture_fail`: paused, its state captured, reading it fails.
-                let read = match tripped("capture_fail") {
-                    true => Err(std::io::Error::other("injected fault: reading the vmstate failed")),
-                    false => std::fs::read(&vmstate),
-                };
+                let read = crate::fault_result!(tripped("capture_fail") => Err(std::io::Error::other("injected fault: reading the vmstate failed"));
+                    std::fs::read(&vmstate));
                 Ok((r, t.total(), read?))
             });
             let _ = std::fs::remove_file(&vmstate);
@@ -283,9 +277,9 @@ impl Proc {
         let _lifted = vm.limit.lift(vm.pid());
         let gen = self.gen();
         // Test fault `abort_gen_fail`: the address's record cannot be read.
-        let checked = self.host.lock().and_then(|l| match tripped("abort_gen_fail") {
-            true => Err("injected fault: reading the address's generation failed".into()),
-            false => Ok((self.host.current(&l, vm.ip, gen)?, l)),
+        let checked = self.host.lock().and_then(|l| {
+            crate::fault_result!(tripped("abort_gen_fail") => Err("injected fault: reading the address's generation failed".into());
+                Ok((self.host.current(&l, vm.ip, gen)?, l)))
         });
         let l = match checked {
             Ok((true, l)) => l,
@@ -332,10 +326,8 @@ impl Proc {
         // through its target, `withdraw_dead`) or neither.
         let unlend = self.lent_here.load(Ordering::SeqCst).then_some(gen);
         // Test fault `abort_stay_fail`: resumed here, recording so fails.
-        let stayed = match tripped("abort_stay_fail") {
-            true => Err("injected fault: marking it here again failed".into()),
-            false => self.host.stay(&l, vm.ip, unlend),
-        };
+        let stayed = crate::fault_result!(tripped("abort_stay_fail") => Err("injected fault: marking it here again failed".into());
+                self.host.stay(&l, vm.ip, unlend));
         match stayed {
             Ok(()) => self.lent_here.store(false, Ordering::SeqCst),
             Err(r) => crate::log!("vm {}: marking it here again and undoing its loan after an aborted migration: {r}", vm.name),
@@ -607,9 +599,9 @@ impl Proc {
                 }
                 let mut took = p.if_current(|| match holder.as_deref() {
                     // Test fault `hold_route_fail`: this hold's route fails.
-                    Some(h) => vm.if_here(|| match tripped("hold_route_fail") {
-                        true => Err("injected fault: routing the address to the hold failed".into()),
-                        false => h.hold(vm.ip, mig),
+                    Some(h) => vm.if_here(|| {
+                        crate::fault_result!(tripped("hold_route_fail") => Err("injected fault: routing the address to the hold failed".into());
+                            h.hold(vm.ip, mig))
                     }),
                     None => vm.route_here().map(|()| false),
                 });
@@ -620,10 +612,7 @@ impl Proc {
                     // ends. Unplugged, it would overtake them: left to the stream's end then.
                     crate::log!("vm {}: taking over {}: {e}; routing it to its tap", vm.name, vm.ip);
                     // Test fault `hold_plug_fail`: the tap's plug is refused.
-                    let (plug, res) = match tripped("hold_plug_fail") {
-                        true => (false, Err("injected fault: plugging the tap failed".into())),
-                        false => crate::net::plug_tap(&vm.tap),
-                    };
+                    let (plug, res) = plug(&vm, "hold_plug_fail");
                     plugged = plug;
                     match res {
                         Err(e) => crate::log!("vm {}: plugging its tap: {e}; routing {} once the held packets are in", vm.name, vm.ip),
@@ -659,10 +648,7 @@ impl Proc {
                 crate::log!("vm {}: no held packets from the source after {} ms", vm.name, ms(fence.elapsed()));
             }
             if plugged {
-                let (drops, unplugged) = crate::net::unplug_tap(&vm.tap);
-                if let Err(e) = unplugged {
-                    crate::log!("vm {}: letting {}'s packets through its tap: {e}", vm.name, vm.ip);
-                }
+                let drops = unplug(&vm);
                 if drops > 0 {
                     crate::log!("vm {}: its tap's plug dropped {drops} packets while taking {} over", vm.name, vm.ip);
                 }
@@ -678,16 +664,10 @@ impl Proc {
                     // host can delay past the next packet): then it follows, in order.
                     // Whether our plug may be on the tap (also when the kernel's answer was
                     // lost): only then is it unplugged, never after a refusal.
-                    let plugged = if fault("no_plug") {
-                        crate::log!("vm {}: injected fault: not plugging its tap", vm.name);
-                        false
-                    } else {
-                        let (plugged, res) = crate::net::plug_tap(&vm.tap);
-                        if let Err(e) = res {
-                            crate::log!("vm {}: plugging its tap: {e}", vm.name);
-                        }
-                        plugged
-                    };
+                    let (plugged, res) = plug(&vm, "no_plug");
+                    if let Err(e) = res {
+                        crate::log!("vm {}: plugging its tap: {e}", vm.name);
+                    }
                     let (released, switched) = release_into(h, vm.ip, mig, &vm, STRAGGLERS, |()| {
                         let routed = p.if_current(|| {
                             // `release_stall`: the route change waits long (for RTNL, say).
@@ -699,13 +679,7 @@ impl Proc {
                         current = routed.is_some();
                         routed.ok_or_else(|| format!("{} went to a newer vm", vm.ip).into())
                     });
-                    let (plug_drops, unplugged) = match plugged {
-                        true => crate::net::unplug_tap(&vm.tap),
-                        false => (0, Ok(())),
-                    };
-                    if let Err(e) = unplugged {
-                        crate::log!("vm {}: letting {}'s packets through its tap: {e}", vm.name, vm.ip);
-                    }
+                    let plug_drops = if plugged { unplug(&vm) } else { 0 };
                     if let Some(mut s) = released.filter(|_| current) {
                         s.dropped_target += plug_drops;
                         crate::log!("vm {}: let go of {} after {} ms, {} packets injected", vm.name, vm.ip, ms(start.elapsed()), s.injected);
@@ -816,11 +790,10 @@ impl Proc {
         let load_set = crate::standby::load_set(&self.host, &tpl);
         let saved = serde_json::from_value(req["msrs"].clone()).map_err(|e| format!("bad msrs: {e}"))?;
         let tsc_khz = serde_json::from_value(req["tsc_khz"].clone()).map_err(|e| format!("bad tsc_khz: {e}"))?;
-        tpl.meta.compatibility.check_saved(&crate::compat::local(idle.pid())?, tsc_khz, &saved)?;
-        let vm = crate::vm::Prepared::with_saved_tsc(idle, tpl, tsc_khz)?;
+        let vm = crate::vm::Prepared::with_saved_tsc(idle, tpl, || Ok((tsc_khz, &saved)))?;
         t.mark("pager_start");
         // All of routing the address here but the route itself, which waits for the commit.
-        crate::net::neighbour(ip, &vm.firecracker().tap)?;
+        let ifindex = crate::net::neighbour(ip, &vm.firecracker().tap)?;
         t.mark("neighbour");
         if shares_routes(&source.addr) {
             // Ready before the source pauses: it takes the address over from the source's hold.
@@ -834,7 +807,7 @@ impl Proc {
             bail!("injected fault: preparing failed");
         }
         going()?;
-        Ok((vm, ip, source, name, load_set))
+        Ok((vm.unrouted(ifindex), ip, source, name, load_set))
     }
 
     /// Every check that can still abort runs before the commit; the host lock
@@ -874,7 +847,7 @@ impl Proc {
         // Routed here at the commit (sharing the source's routes, after the held packets):
         // until then the route back to the source stays, whatever happens to this arrival.
         let shared = shares_routes(&source.addr);
-        let restored = prepared.unrouted().load(&self.spawner, &name, Snapshot::Bytes(state), seed, ip, paused, Some(deadline), retry, t);
+        let restored = prepared.load(&self.spawner, &name, Snapshot::Bytes(state), seed, ip, paused, Some(deadline), retry, t);
         let probed = probe.map_or(Ok(()), |p| p.join().unwrap_or_else(|_| Err(std::io::Error::other("probe panicked"))));
         // A load that fails for want of pages says less than the probe of the source does.
         let (vm, _) = match (restored, &probed) {
@@ -901,7 +874,7 @@ impl Proc {
                 }
                 // A failed commit takes the tap, and this route, with it; `finish` puts the peer's back.
                 if !shared {
-                    crate::net::route_dev(true, ip, crate::net::ifindex(&vm.tap)?)?;
+                    vm.route()?;
                     t.mark("route");
                 }
                 // Test fault `commit_fail`: the durable commit fails, its route (if any) installed.
@@ -1060,6 +1033,24 @@ fn read_vec(r: &mut impl Read, len: u64, max: u64) -> Result<Vec<u8>> {
     let mut v = vec![0u8; len as usize];
     r.read_exact(&mut v)?;
     Ok(v)
+}
+
+// Keep the uncertain installed state even on an unanswered plug request: it must be unplugged.
+fn plug(vm: &Vm, fault: &str) -> (bool, Result<()>) {
+    if fault == "no_plug" && crate::host::fault(fault) {
+        crate::log!("vm {}: injected fault: not plugging its tap", vm.name);
+        return (false, Ok(()));
+    }
+    crate::fault_result!(fault != "no_plug" && tripped(fault) => (false, Err("injected fault: plugging the tap failed".into()));
+        crate::net::plug_tap(&vm.tap))
+}
+
+fn unplug(vm: &Vm) -> u64 {
+    let (drops, res) = crate::net::unplug_tap(&vm.tap);
+    if let Err(e) = res {
+        crate::log!("vm {}: letting {}'s packets through its tap: {e}", vm.name, vm.ip);
+    }
+    drops
 }
 
 #[cfg(test)]

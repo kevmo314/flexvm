@@ -58,7 +58,7 @@ pub struct Manifest {
 }
 
 impl Manifest {
-    pub fn check_compatibility(&self, template: &Template, host: &crate::compat::Compat) -> Result<u32> {
+    pub fn saved_cpu(&self) -> Result<(u32, &BTreeSet<u32>)> {
         let rate = self
             .saved_tsc_khz
             .filter(|&khz| khz != 0)
@@ -67,6 +67,12 @@ impl Manifest {
             .saved_msrs
             .as_ref()
             .ok_or("this checkpoint or suspended VM was made with an older flexvm without a saving host MSR record and cannot be restored")?;
+        Ok((rate, msrs))
+    }
+
+    #[cfg(test)]
+    pub fn check_compatibility(&self, template: &Template, host: &crate::compat::Compat) -> Result<u32> {
+        let (rate, msrs) = self.saved_cpu()?;
         template.meta.compatibility.check_saved(host, rate, msrs)?;
         Ok(rate)
     }

@@ -2635,17 +2635,14 @@ pub fn mem_available_override() -> Option<u64> {
 
 /// Test hook: a window for a test to kill the process here.
 pub fn stall(name: &str) {
-    if fault(name) {
-        reached(name);
+    if tripped(name) {
         std::thread::sleep(Duration::from_secs(3));
     }
 }
 
 /// Test hook: parks here while `name` is armed (its arming bounds the wait), until a test disarms it.
 pub fn gate(name: &str) {
-    if fault(name) {
-        reached(name);
-    }
+    tripped(name);
     while fault(name) {
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -2664,10 +2661,9 @@ pub fn tripped(name: &str) -> bool {
 /// reached-marker (RUN/gates/NAME.PID; `rm -rf RUN/gates` releases every one), or for at most 10 minutes.
 /// Neither the arming's expiry nor the host lock releases it: it parks under the lock too.
 pub fn hold(name: &str) {
-    if !fault(name) {
+    if !tripped(name) {
         return;
     }
-    reached(name);
     let Some(marker) = RUN_DIR.get().map(|r| r.join("gates").join(format!("{name}.{}", std::process::id()))) else { return };
     let end = std::time::Instant::now() + Duration::from_secs(600);
     while marker.exists() && std::time::Instant::now() < end {

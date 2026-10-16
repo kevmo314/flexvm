@@ -942,7 +942,7 @@ impl Proc {
         }
         let still = self.host.fence(ip, self.gen()).inspect_err(|_| vm.kill())?;
         // Routed under the fence (the load leaves the route alone, #534).
-        crate::net::ifindex(&vm.tap).and_then(|i| crate::net::route_dev(true, ip, i)).inspect_err(|_| vm.kill())?;
+        vm.route().inspect_err(|_| vm.kill())?;
         t.mark("route");
         if let Err(e) = vm.start(fault("resume_kill")) {
             vm.kill();
@@ -1666,7 +1666,6 @@ struct ResumeState {
     /// For each SIGTSTP or SIGCONT taken and not yet offered, in order: the tickets asked when it was taken.
     taken: std::collections::VecDeque<u64>,
     offered: u64,
-    answered: u64,
     /// The tickets whose askers still wait, with their outcomes once answered.
     waiting: std::collections::BTreeMap<u64, Option<std::result::Result<(), String>>>,
 }
@@ -1707,15 +1706,12 @@ impl Resumes {
     /// Answers the tickets up to `upto` not answered yet.
     fn answer(&self, upto: u64, sig: i32, res: std::result::Result<(), String>) {
         let mut s = self.state.lock().unwrap();
-        if upto <= s.answered {
-            return;
-        }
         let outcome = if sig == libc::SIGCONT { res } else { Err("paused again meanwhile (a later SIGTSTP)".into()) };
-        let from = s.answered + 1;
-        for (_, o) in s.waiting.range_mut(from..=upto) {
-            *o = Some(outcome.clone());
+        for (_, o) in s.waiting.range_mut(..=upto) {
+            if o.is_none() {
+                *o = Some(outcome.clone());
+            }
         }
-        s.answered = upto;
         self.answered.notify_all();
     }
 
@@ -2600,12 +2596,14 @@ fn refuse_pages(s: std::net::TcpStream, why: &str) {
     crate::listen::refuse(s, why, draining.as_ref().map(|_| PAGE_REFUSAL));
 }
 
-/// Connects and sends `req` by `at`; the stream's reads and writes then block.
-pub fn connect(host: &Host, name: &str, req: &Value, fds: &[i32], at: Instant) -> Result<UnixStream> {
+type ConnectCheck<'a> = &'a mut dyn FnMut(&UnixStream) -> Result<()>;
+
+/// Connects, optionally checks the peer, and sends `req` by `at`; reads and writes then block.
+pub fn connect(host: &Host, name: &str, req: &Value, fds: &[i32], at: Instant, check: Option<ConnectCheck<'_>>) -> Result<UnixStream> {
     let (sock, log) = (host.sock(name)?, host.vms(name, "log")?);
     let mut line = serde_json::to_vec(req)?;
     line.push(b'\n');
-    let c = crate::util::send_unix(&sock, &line, fds, at).map_err(|e| {
+    let unavailable = |e| {
         if host.alive(name) {
             format!("vm {name:?} is starting or its control socket is unavailable; retry once it is ready, or see {}: {e}", log.display())
         } else if host.is_suspended(name) {
@@ -2613,7 +2611,12 @@ pub fn connect(host: &Host, name: &str, req: &Value, fds: &[i32], at: Instant) -
         } else {
             format!("no vm named {name:?}")
         }
-    })?;
+    };
+    let c = crate::util::By { s: (), at }.left().and_then(|left| crate::util::connect_unix(&sock, left)).map_err(unavailable)?;
+    if let Some(check) = check {
+        check(&c)?;
+    }
+    crate::util::send_with_fds(&c, &line, fds, at).map_err(unavailable)?;
     c.set_read_timeout(None)?;
     c.set_write_timeout(None)?;
     Ok(c)
@@ -2621,7 +2624,7 @@ pub fn connect(host: &Host, name: &str, req: &Value, fds: &[i32], at: Instant) -
 
 /// With `at`, connected, sent and answered by then; otherwise only connecting and sending time out.
 pub fn call(host: &Host, name: &str, req: Value, at: Option<Instant>) -> Result<Value> {
-    let c = connect(host, name, &req, &[], at.unwrap_or_else(|| Instant::now() + Duration::from_secs(10)))?;
+    let c = connect(host, name, &req, &[], at.unwrap_or_else(|| Instant::now() + Duration::from_secs(10)), None)?;
     let reply = match at {
         Some(at) => crate::util::recv_json(&mut BufReader::new(crate::util::By { s: c, at })),
         None => crate::util::recv_json(&mut BufReader::new(c)),

@@ -75,6 +75,7 @@ pub struct Vm {
     pub dir: PathBuf,
     pub ip: Ipv4Addr,
     pub tap: String,
+    ifindex: Option<u32>,
     pub pager: Arc<Pager>,
     pub state: Mutex<State>,
     pub last_resize: Mutex<Instant>,
@@ -145,7 +146,6 @@ impl Vm {
 
     /// The part of a restore that needs no vmstate, done by a migration target before its source pauses.
     pub fn prepare(fc: Firecracker, template: Arc<Template>, phases: &mut Phases) -> Result<Prepared> {
-        crate::compat::check(&template, fc.pid())?;
         let prepared = Prepared::new(fc, template)?;
         phases.mark("pager_start");
         Ok(prepared)
@@ -494,12 +494,16 @@ impl Vm {
         self.limit.restore();
     }
 
+    pub fn route(&self) -> Result<()> {
+        crate::net::route(self.ip, self.ifindex.map_or_else(|| crate::net::ifindex(&self.tap), Ok)?)
+    }
+
     /// Routes the address to the tap (its neighbour entry is there: `net::neighbour`)
     /// unless the VM left meanwhile (a checkpoint's or migration's hold routes it then).
     /// Under `state` (not `devices`, which a slow balloon request may hold): `leave` changes
     /// it before the hold routes the address elsewhere.
     pub fn route_here(&self) -> Result<()> {
-        self.if_here(|| crate::net::route_dev(true, self.ip, crate::net::ifindex(&self.tap)?)).map(drop)
+        self.if_here(|| self.route()).map(drop)
     }
 
     /// Runs `f` (which routes the address) unless the VM left; false if it had.
@@ -603,10 +607,9 @@ impl Vm {
             self.pager.hold_collapse(true);
         }
         // Test faults `pause_fail` and `resume_partial` (a resume some vCPUs missed: Firecracker still says Paused).
-        let mut res = match crate::host::fault(if pausing { "pause_fail" } else { "resume_partial" }) {
-            true => Err(format!("injected fault: firecracker PATCH /vm: 400 the {} failed part way", if pausing { "pause" } else { "resume" }).into()),
-            false => self.fc(|fc| if pausing { fc.pause(API_TIMEOUT) } else { fc.resume(API_TIMEOUT) }).map(drop),
-        };
+        let mut res = crate::fault_result!(crate::host::fault(if pausing { "pause_fail" } else { "resume_partial" }) =>
+            Err(format!("injected fault: firecracker PATCH /vm: 400 the {} failed part way", if pausing { "pause" } else { "resume" }).into());
+            self.fc(|fc| if pausing { fc.pause(API_TIMEOUT) } else { fc.resume(API_TIMEOUT) }).map(drop));
         // Test fault `pause_lost`: the pause landed, but its answer is lost.
         if pausing && res.is_ok() && crate::host::fault("pause_lost") {
             res = Err("injected fault: the pause's answer was lost".into());
@@ -936,22 +939,28 @@ pub struct Prepared {
     pub pager: Arc<Pager>,
     template: Arc<Template>,
     tsc_khz: u32,
-    /// Readies its tap for the address (`net::neighbour`) while loading. The route itself is
-    /// never installed by the load: the caller does it under its generation fence (#534).
-    /// False when the caller readied the tap itself (a migration target, routed at commit).
-    route: bool,
+    /// Ready the neighbour while loading; the caller installs the route under its fence.
+    neighbour: bool,
+    saved_msrs: std::collections::BTreeSet<u32>,
+    ifindex: Option<u32>,
 }
 
 impl Prepared {
     pub fn new(fc: Firecracker, template: Arc<Template>) -> Result<Self> {
-        let rate = template.meta.compatibility.tsc_khz;
-        Self::with_saved_tsc(fc, template, rate)
+        Self::with_saved_tsc(fc, template.clone(), || Ok((template.meta.compatibility.tsc_khz, &template.meta.compatibility.msrs)))
     }
 
-    pub fn with_saved_tsc(fc: Firecracker, template: Arc<Template>, saved_khz: u32) -> Result<Self> {
-        let tsc_khz = crate::compat::restored_tsc_khz(saved_khz, &crate::compat::local(fc.pid())?)?;
+    /// Read saved CPU records after probing the host, preserving preflight error ordering.
+    pub fn with_saved_tsc<'a>(
+        fc: Firecracker,
+        template: Arc<Template>,
+        saved: impl FnOnce() -> Result<(u32, &'a std::collections::BTreeSet<u32>)>,
+    ) -> Result<Self> {
+        let host = crate::compat::local(fc.pid())?;
+        let (saved_khz, msrs) = saved()?;
+        let tsc_khz = template.meta.compatibility.check_saved(&host, saved_khz, msrs)?;
         let pager = Pager::start(&fc.sockets.uffd, template.clone(), None)?;
-        let p = Prepared { fc: Some(fc), pager, template, tsc_khz, route: true };
+        let p = Prepared { fc: Some(fc), pager, template, tsc_khz, neighbour: true, saved_msrs: msrs.clone(), ifindex: None };
         p.pager.set_pid(p.firecracker().pid())?;
         Ok(p)
     }
@@ -964,9 +973,10 @@ impl Prepared {
         self.fc.as_ref().unwrap()
     }
 
-    /// The load leaves the tap alone too: the caller readied it (a migration target routes it at commit).
-    pub fn unrouted(mut self) -> Prepared {
-        self.route = false;
+    /// The caller already readied the neighbour.
+    pub fn unrouted(mut self, ifindex: u32) -> Prepared {
+        self.ifindex = Some(ifindex);
+        self.neighbour = false;
         self
     }
 
@@ -985,6 +995,7 @@ impl Prepared {
             dir: idle.dir.clone(),
             ip,
             tap: idle.tap.clone(),
+            ifindex: self.ifindex,
             pager: self.pager.clone(),
             state: Mutex::new(state),
             last_resize: Mutex::new(Instant::now()),
@@ -1056,7 +1067,8 @@ impl Prepared {
         before_retry: impl FnOnce() -> Result<()>,
         t: &mut Phases,
     ) -> Result<(Arc<Vm>, Duration)> {
-        let (tpl, route, tsc_khz) = (self.template.clone(), self.route, self.tsc_khz);
+        let msrs = self.saved_msrs.clone();
+        let (tpl, neighbour, tsc_khz) = (self.template.clone(), self.neighbour, self.tsc_khz);
         let (e, realtime) = match self.load_once(name, vmstate, seed.clone(), ip, hold, true, deadline, t) {
             Ok(r) => return Ok(r),
             Err((e, None)) => return Err(e),
@@ -1066,12 +1078,12 @@ impl Prepared {
         before_retry()?;
         // Retrying the same state on this host preserves its effective rate.
         let fc = spawner.take(deadline)?;
-        let mut fresh = Prepared::with_saved_tsc(fc, tpl, tsc_khz)?;
+        let mut fresh = Prepared::with_saved_tsc(fc, tpl, || Ok((tsc_khz, &msrs)))?;
         t.mark("pager_start");
-        fresh.route = route;
-        if !route {
+        fresh.neighbour = neighbour;
+        if !neighbour {
             // The route waits, but everything else about it goes on the fresh tap.
-            crate::net::neighbour(ip, &fresh.firecracker().tap)?;
+            fresh.ifindex = Some(crate::net::neighbour(ip, &fresh.firecracker().tap)?);
         }
         fresh.load_once(name, vmstate, seed, ip, hold, realtime, deadline, t).map_err(|(e, _)| e)
     }
@@ -1079,7 +1091,7 @@ impl Prepared {
     /// On failure, whether another (and with `clock_realtime`) may work.
     #[allow(clippy::too_many_arguments)]
     fn load_once(
-        self,
+        mut self,
         name: &str,
         vmstate: Snapshot,
         seed: Option<(Runs, Origin)>,
@@ -1107,7 +1119,7 @@ impl Prepared {
             let fc = self.firecracker();
             let tap = fc.tap.clone();
             // All of routing the address here but the route, alongside the load: the route waits for the fence.
-            let neighbour = self.route.then(|| std::thread::spawn(move || crate::net::neighbour(ip, &tap)));
+            let neighbour = self.neighbour.then(|| std::thread::spawn(move || crate::net::neighbour(ip, &tap)));
             // Before `left` is read: the deadline covers it too.
             fc.join_cgroup();
             let loaded = fc.load_snapshot(&path, &fc.tap, Some(clock_realtime), left(API_TIMEOUT));
@@ -1128,9 +1140,9 @@ impl Prepared {
                 }
                 self.pager.wait_ready(left(Duration::from_secs(5)))
             });
-            let readied = neighbour.map_or(Ok(Ok(0)), |r| r.join()).map_err(|_| "neighbour thread panicked")?;
+            let readied = neighbour.map(|r| r.join()).transpose().map_err(|_| "neighbour thread panicked")?;
             held?;
-            readied?;
+            self.ifindex = readied.transpose()?.or(self.ifindex);
             t.mark("neighbour_wait");
             Ok(took)
         })();

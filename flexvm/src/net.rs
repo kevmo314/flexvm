@@ -25,9 +25,7 @@ pub fn mac_string(mac: &[u8; 6]) -> String {
 
 fn socket(domain: c_int, kind: c_int, protocol: c_int, what: &str) -> Result<OwnedFd> {
     let fd = unsafe { libc::socket(domain, kind | libc::SOCK_CLOEXEC, protocol) };
-    if fd < 0 {
-        bail!("{what}: {}", std::io::Error::last_os_error());
-    }
+    crate::syscall_check!(fd < 0, "{what}");
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
@@ -47,9 +45,7 @@ pub fn set_link_up(name: &str, up: bool) -> Result<()> {
             libc::ioctl(fd.as_raw_fd(), libc::SIOCSIFFLAGS, &req) >= 0
         }
     };
-    if !done {
-        bail!("set {name} {}: {}", if up { "up" } else { "down" }, std::io::Error::last_os_error());
-    }
+    crate::syscall_check!(!done, "set {name} {}", if up { "up" } else { "down" });
     Ok(())
 }
 
@@ -92,9 +88,7 @@ pub fn tap_fd_of(pid: u32, tap: &str) -> Result<OwnedFd> {
             continue;
         }
         let fd = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd.as_raw_fd(), target, 0) };
-        if fd < 0 {
-            bail!("pidfd_getfd {pid} {target}: {}", std::io::Error::last_os_error());
-        }
+        crate::syscall_check!(fd < 0, "pidfd_getfd {pid} {target}");
         return Ok(unsafe { OwnedFd::from_raw_fd(fd as c_int) });
     }
     bail!("process {pid} has no descriptor attached to {tap}")
@@ -116,22 +110,16 @@ pub fn create_tap(name: &str, owner: &str) -> Result<()> {
     }
     let mut req = ifreq(name)?;
     let fd = unsafe { libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
-    if fd < 0 {
-        bail!("/dev/net/tun: {}", std::io::Error::last_os_error());
-    }
+    crate::syscall_check!(fd < 0, "/dev/net/tun");
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
     // Never a leaked tap of a dead process with this name, nor its routes.
     req.ifr_ifru.ifru_flags = (libc::IFF_TAP | libc::IFF_NO_PI | libc::IFF_TUN_EXCL) as libc::c_short;
-    if unsafe { libc::ioctl(fd.as_raw_fd(), libc::TUNSETIFF, &req) } < 0 {
-        bail!("create tap {name}: {}", std::io::Error::last_os_error());
-    }
+    crate::syscall_check!(unsafe { libc::ioctl(fd.as_raw_fd(), libc::TUNSETIFF, &req) } < 0, "create tap {name}");
     // Until TUNSETPERSIST the tap goes with `fd`, so with this process.
     let mut alias = ifinfomsg(ifindex(name)?);
     attr(&mut alias, IFLA_IFALIAS, owner.as_bytes());
     netlink(RTM_SETLINK, 0, &alias).map_err(|e| format!("tap {name}: its owner: {e}"))?;
-    if unsafe { libc::ioctl(fd.as_raw_fd(), libc::TUNSETPERSIST, 1) } < 0 {
-        bail!("create tap {name}: {}", std::io::Error::last_os_error());
-    }
+    crate::syscall_check!(unsafe { libc::ioctl(fd.as_raw_fd(), libc::TUNSETPERSIST, 1) } < 0, "create tap {name}");
     drop(fd);
     let made = (|| -> Result<()> {
         let index = ifindex(name)?;
@@ -143,9 +131,7 @@ pub fn create_tap(name: &str, owner: &str) -> Result<()> {
         let mut q = ifreq(name)?;
         q.ifr_ifru.ifru_metric = TAP_QUEUE as i32;
         let sock = socket(libc::AF_INET, libc::SOCK_DGRAM, 0, "socket")?;
-        if unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCSIFTXQLEN as _, &q) } < 0 {
-            bail!("txqueuelen of {name}: {}", std::io::Error::last_os_error());
-        }
+        crate::syscall_check!(unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCSIFTXQLEN as _, &q) } < 0, "txqueuelen of {name}");
         conf("ipv4", name, "arp_ignore", "3")?;
         // The guest is IPv4 only. With IPv6, the host sends an MLD report out of the tap as
         // it comes up: dropped (tx_dropped) when no Firecracker reads it yet (an arrival's),
@@ -193,7 +179,12 @@ pub fn ifreq(name: &str) -> Result<libc::ifreq> {
 /// Puts the gateway MAC back first: udev (`MACAddressPolicy=persistent`) may have replaced
 /// it, leaving the guest's pinned gateway ARP entry pointing nowhere.
 pub fn attach(ip: Ipv4Addr, tap: &str) -> Result<()> {
-    route_dev(true, ip, neighbour(ip, tap)?)
+    route(ip, neighbour(ip, tap)?)
+}
+
+/// Installs the route using the index retained when the caller readied the tap.
+pub fn route(ip: Ipv4Addr, index: u32) -> Result<()> {
+    route_dev(true, ip, index)
 }
 
 /// `attach` but the route, which a migration target installs at its commit; returns the
@@ -439,9 +430,7 @@ pub fn is_local_addr(ip: Ipv4Addr) -> Result<bool> {
     let mut local = LOCAL.lock().unwrap();
     if local.0.is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(1)) {
         let mut addrs = std::ptr::null_mut();
-        if unsafe { libc::getifaddrs(&mut addrs) } != 0 {
-            bail!("getifaddrs: {}", std::io::Error::last_os_error());
-        }
+        crate::syscall_check!(unsafe { libc::getifaddrs(&mut addrs) } != 0, "getifaddrs");
         local.1.clear();
         let mut current = addrs;
         while !current.is_null() {
@@ -473,9 +462,7 @@ pub fn route_get(to: Ipv4Addr) -> Result<(String, Ipv4Addr)> {
 fn route_from_reply(to: Ipv4Addr, reply: &[u8]) -> Result<(String, Ipv4Addr)> {
     let (oif, src) = parse_route(reply).map_err(|e| format!("no route toward {to}{e}"))?;
     let mut name = [0 as libc::c_char; libc::IFNAMSIZ];
-    if unsafe { libc::if_indextoname(oif, name.as_mut_ptr()) }.is_null() {
-        bail!("the route toward {to}: interface {oif}: {}", std::io::Error::last_os_error());
-    }
+    crate::syscall_check!(unsafe { libc::if_indextoname(oif, name.as_mut_ptr()) }.is_null(), "the route toward {to}: interface {oif}");
     Ok((unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }.to_string_lossy().into_owned(), src))
 }
 
@@ -666,9 +653,7 @@ pub fn gratuitous_arp(dev: &str, ip: Ipv4Addr) -> Result<()> {
     addr.sll_ifindex = ifindex as i32;
     addr.sll_halen = 6;
     addr.sll_addr[..6].copy_from_slice(&[0xff; 6]);
-    if send_to(&fd, &frame, &addr) < 0 {
-        bail!("send gratuitous arp: {}", std::io::Error::last_os_error());
-    }
+    crate::syscall_check!(send_to(&fd, &frame, &addr) < 0, "send gratuitous arp");
     Ok(())
 }
 
