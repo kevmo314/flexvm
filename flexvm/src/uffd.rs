@@ -241,9 +241,9 @@ pub struct Runtime {
     /// `hot`).
     hot_spare: Mutex<Option<hot::Buf>>,
     hot_prev: Mutex<Option<Arc<Held>>>,
-    /// The dirty bits of the interval before the last pause, and the hot pages it left unprotected (bitmaps).
-    hot_dirty: Mutex<Vec<u64>>,
-    hot_kept: Mutex<Vec<u64>>,
+    /// The previous interval's snapshot, shared with Frozen for rollback, and sparse words for kept hot pages.
+    hot_dirty: Mutex<Arc<Vec<u64>>>,
+    hot_kept: Mutex<std::collections::BTreeMap<usize, u64>>,
     /// Test fault: the next freeze fails to re-protect pages.
     pub fail_protect: AtomicBool,
     /// Test fault: write faults during a copy dawdle before claiming pages.
