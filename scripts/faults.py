@@ -3076,7 +3076,7 @@ def forged_vmstate():
         held = []
         threading.Thread(target=lambda: held.append(uffd.accept()), daemon=True).start()
         trace = f"{d}/trace"
-        p, api = start_fc(d, "strace", "-f", "-qq", "-s", "4096", "-e", "trace=open,openat,openat2,creat", "-o", trace)
+        p, api = start_fc(d, "strace", "--kill-on-exit", "-f", "-qq", "-s", "4096", "-e", "trace=open,openat,openat2,creat", "-o", trace)
         body = lambda path: {"snapshot_path": path, "mem_backend": {"backend_type": "Uffd", "backend_path": f"{d}/u.sock"},
                              "vsock_override": {"uds_path": f"{d}/v.sock"}, "network_overrides": [{"iface_id": "eth0", "host_dev_name": "fvt0"}],
                              "device_reference_path": tpl}
