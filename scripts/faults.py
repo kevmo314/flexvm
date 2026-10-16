@@ -1267,12 +1267,13 @@ def prepare_fail():
 
 
 def arrival_flood():
-    """Arrivals waiting for a held host lock (#486): at most 8 at once, more refused at
-    once (the source's VM runs on), each refused once its admission wait (8 s) is up."""
+    """Arrivals waiting for a held host lock (#486): at most 4 from one peer (8 in all), more
+    refused at once (the source's VM runs on), each refused once its preparation time (7 s) is
+    up; one prepared whose source never sends its header gives its place back within 5 s."""
     n = "ft-flood"
     m = setup(n)
     src = source_vm()
-    names = [(f"ft-flood-{i}", spare(B, 10 + i)) for i in range(8)]
+    names = [(f"ft-flood-{i}", spare(B, 10 + i)) for i in range(4)]
     replies = {}
     with open(os.path.join(B.state, "lock"), "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
@@ -1290,11 +1291,19 @@ def arrival_flood():
         took = time.time() - t0
         for t in ts:
             t.join(30)
-    check("arrival flood: one past the bound refused at once", not r["ok"] and "arriving here already" in r["error"] and took < 5, (r, took))
-    late = {k: v for k, v in replies.items() if v[0].get("ok") or "not admitted" not in v[0].get("error", "") or v[1] > 15}
-    check("arrival flood: waiting arrivals refused within their admission wait", len(replies) == len(names) and not late, replies)
+    check("arrival flood: one past the peer's quota refused at once", not r["ok"] and "arriving here already" in r["error"] and took < 5, (r, took))
+    late = {k: v for k, v in replies.items() if v[0].get("ok") or "not admitted" not in v[0].get("error", "") or v[1] > 12}
+    check("arrival flood: waiting arrivals refused within their preparation time", len(replies) == len(names) and not late, replies)
     check("arrival flood: running on A only", where(n) == {A: "running"}, where(n))
     check("arrival flood: md5 intact", md5(A, n) == m)
+    # Prepared, then silent: their places come back once the header is overdue.
+    idle = [migrate_in_raw(B, name, ip, src) for name, ip in names]
+    check("arrival flood: idle arrivals prepared", all(r.get("ok") for _, r, _ in idle), [r for _, r, _ in idle])
+    r = migrate(A, n, B)
+    check("arrival flood: refused while idle arrivals hold the quota", not r["ok"] and "arriving here already" in r["error"], r)
+    time.sleep(6)
+    for s, _, _ in idle:
+        s.close()
     r = migrate(A, n, B)
     check("arrival flood: a later migration works", r["ok"] and where(n).get(B) == "running", r)
     wait_released(B, n)

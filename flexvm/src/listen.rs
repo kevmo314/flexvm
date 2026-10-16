@@ -21,10 +21,30 @@ use crate::util::{send_json, Result, Slot};
 /// Requests handled at once; more connections are closed unanswered.
 const MAX_ACTIVE: usize = 512;
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
-/// Arrival processes from their start until they commit or are refused (or end); more
-/// arrivals are refused at once, before their source pauses anything.
+/// Arrival processes from their start until they commit or are refused (or end), in all
+/// and from any one peer address; more arrivals are refused at once, before their source
+/// pauses anything.
 const MAX_ARRIVALS: usize = 8;
-static ARRIVALS: AtomicUsize = AtomicUsize::new(0);
+const MAX_ARRIVALS_FROM: usize = MAX_ARRIVALS / 2;
+static ARRIVALS: std::sync::LazyLock<Waiting> = std::sync::LazyLock::new(|| Waiting::new(MAX_ARRIVALS, MAX_ARRIVALS_FROM));
+/// An arrival is prepared, or refused, within this of its request's accept: well within
+/// its source's preflight (`migrate::PREFLIGHT_TIMEOUT`, 10 s from before it connects).
+pub const PREPARE_WAIT: Duration = Duration::from_secs(7);
+
+fn monotonic_ms() -> u64 {
+    let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) };
+    t.tv_sec as u64 * 1000 + t.tv_nsec as u64 / 1_000_000
+}
+
+/// When an arrival's preparation must be done: `PREPARE_WAIT` after the listener accepted
+/// its request (`FLEXVM_INCOMING_BY`, monotonic milliseconds), else after now.
+pub fn prepare_by() -> Instant {
+    match std::env::var("FLEXVM_INCOMING_BY").ok().and_then(|v| v.parse::<u64>().ok()) {
+        Some(by) => Instant::now() + Duration::from_millis(by.saturating_sub(monotonic_ms())),
+        None => Instant::now() + PREPARE_WAIT,
+    }
+}
 /// Unknown addresses held while a peer's name with no addresses yet is
 /// looked up, in all and from any one address (a peer's restart backlog can
 /// hold a few of its requests); more are refused at once. One source cannot
@@ -409,7 +429,7 @@ fn handle(host: &Host, peers: &Peers, mut conn: TcpStream, deadline: Instant) ->
     let line = read_line_by(&conn, deadline)?;
     let req: Value = serde_json::from_slice(&line)?;
     let reply = match req["op"].as_str().unwrap_or("") {
-        "migrate_in" => return incoming(host, &req, &line, conn),
+        "migrate_in" => return incoming(host, &req, &line, conn, deadline - REQUEST_DEADLINE + PREPARE_WAIT),
         "pages" => return pages(host, &req, conn),
         "migration" => migration(host, &req),
         // Its peers by address, those configured by name too, and the one asking.
@@ -476,7 +496,7 @@ fn read_line_by(conn: &TcpStream, deadline: Instant) -> Result<Vec<u8>> {
 /// Spawns the incoming VM process with the connection as fd 3; it answers the source. Its
 /// arrival slot is held, by the shared reaper, until it says it committed or was refused
 /// (on its fd 4, `FLEXVM_NOTIFY_FD`) or it ends.
-fn incoming(host: &Host, req: &Value, line: &[u8], conn: TcpStream) -> Result<()> {
+fn incoming(host: &Host, req: &Value, line: &[u8], conn: TcpStream, by: Instant) -> Result<()> {
     let name = req["name"].as_str().unwrap_or("");
     let refuse = |mut c: &TcpStream, e: String| send_json(&mut c, &json!({"ok": false, "error": e}));
     if let Err(e) = crate::host::check_name(name) {
@@ -484,10 +504,16 @@ fn incoming(host: &Host, req: &Value, line: &[u8], conn: TcpStream) -> Result<()
         return Ok(());
     }
     // Refused before anything is made: the source has paused nothing yet, and its VM runs on.
-    let Some(slot) = Slot::take(&ARRIVALS, MAX_ARRIVALS) else {
-        refuse(&conn, format!("{MAX_ARRIVALS} migrations are arriving here already; try again later"))?;
+    let from = conn.peer_addr()?.ip();
+    let Some(slot) = ARRIVALS.take(from) else {
+        let why = format!("too many migrations are arriving here already (at most {MAX_ARRIVALS}, {MAX_ARRIVALS_FROM} from one peer); try again later");
+        refuse(&conn, why)?;
         return Ok(());
     };
+    if let Err(e) = crate::util::start_reaper() {
+        refuse(&conn, format!("cannot start the vm process: {e}"))?;
+        return Ok(());
+    }
     // Each arrival owns its log until accepted; refusing a duplicate name
     // must not remove the running VM's log.
     static ARRIVAL: AtomicUsize = AtomicUsize::new(0);
@@ -498,12 +524,18 @@ fn incoming(host: &Host, req: &Value, line: &[u8], conn: TcpStream) -> Result<()
     crate::host::flock(&log, libc::LOCK_SH)?;
     let args = ["--state".as_ref(), host.state.as_os_str(), "--run".as_ref(), host.run.as_os_str(), "run".as_ref(), "--incoming".as_ref()];
     let (done, told) = std::os::unix::net::UnixStream::pair()?;
+    let by = (monotonic_ms() + by.saturating_duration_since(Instant::now()).as_millis() as u64).to_string();
     let spawned = crate::util::spawn_self_child(
         &args,
         &log,
         conn.as_raw_fd(),
         Some(told.as_raw_fd()),
-        &[("FLEXVM_INCOMING", std::str::from_utf8(line)?), ("FLEXVM_INCOMING_LOG", log_path.to_str().ok_or("non-UTF8 log path")?), ("FLEXVM_NOTIFY_FD", "4")],
+        &[
+            ("FLEXVM_INCOMING", std::str::from_utf8(line)?),
+            ("FLEXVM_INCOMING_LOG", log_path.to_str().ok_or("non-UTF8 log path")?),
+            ("FLEXVM_NOTIFY_FD", "4"),
+            ("FLEXVM_INCOMING_BY", &by),
+        ],
     );
     drop(told);
     match spawned {
@@ -702,23 +734,37 @@ mod tests {
     }
 
     #[test]
-    fn arrivals_past_the_bound_are_refused_at_once_starting_nothing() {
+    fn arrivals_past_either_bound_or_without_a_reaper_are_refused_at_once_starting_nothing() {
         let root = crate::test_util::TempDir::new("arrivals-full");
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
-        let held: Vec<Slot> = std::iter::from_fn(|| Slot::take(&ARRIVALS, MAX_ARRIVALS)).collect();
-        assert_eq!(held.len(), MAX_ARRIVALS);
-        let (client, server) = pair();
         let line = br#"{"op":"migrate_in","name":"web"}"#;
-        let start = Instant::now();
-        incoming(&host, &serde_json::from_slice(line).unwrap(), line, server).unwrap();
-        assert!(start.elapsed() < Duration::from_secs(1));
-        let reply = crate::util::recv_json(&mut std::io::BufReader::new(&client)).unwrap().unwrap();
-        assert_eq!(reply["ok"], false);
-        assert!(reply["error"].as_str().unwrap().contains("arriving here already"), "{reply}");
-        let logs = std::fs::read_dir(host.run.join("vms")).unwrap().count();
-        assert_eq!(logs, 0, "no arrival log made");
-        drop(held);
-        assert_eq!(ARRIVALS.load(Ordering::SeqCst), 0);
+        let refused = |why: &str| {
+            let (client, server) = pair();
+            let start = Instant::now();
+            incoming(&host, &serde_json::from_slice(line).unwrap(), line, server, Instant::now() + PREPARE_WAIT).unwrap();
+            assert!(start.elapsed() < Duration::from_secs(1));
+            let reply = crate::util::recv_json(&mut std::io::BufReader::new(&client)).unwrap().unwrap();
+            assert_eq!(reply["ok"], false);
+            assert!(reply["error"].as_str().unwrap().contains(why), "{reply}");
+            assert_eq!(std::fs::read_dir(host.run.join("vms")).unwrap().count(), 0, "no arrival log made");
+        };
+        let held = || ARRIVALS.held.lock().unwrap().values().sum::<usize>();
+        let take = |from: &str, n: usize| (0..n).map(|_| ARRIVALS.take(from.parse().unwrap()).unwrap()).collect::<Vec<_>>();
+        // One peer takes at most half.
+        let mine = take("127.0.0.1", MAX_ARRIVALS_FROM);
+        assert!(ARRIVALS.take("127.0.0.1".parse().unwrap()).is_none());
+        refused("arriving here already");
+        drop(mine);
+        // Others hold them all.
+        let others: Vec<_> = (1..=MAX_ARRIVALS).map(|i| take(&format!("10.9.0.{i}"), 1)).collect();
+        refused("arriving here already");
+        drop(others);
+        assert_eq!(held(), 0);
+        // No reaper: refused, its slot given back.
+        crate::util::NO_REAPER.with(|n| n.set(true));
+        refused("cannot start the vm process");
+        crate::util::NO_REAPER.with(|n| n.set(false));
+        assert_eq!(held(), 0);
     }
 
     #[test]

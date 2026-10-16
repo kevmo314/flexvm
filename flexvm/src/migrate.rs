@@ -27,9 +27,9 @@ use crate::vmproc::{peer_call, End, Op, Proc};
 
 /// From the target's prepare answer to its commit answer.
 const INCOMING_WAIT: Duration = Duration::from_secs(30);
-/// How long an arrival waits to be admitted (the host lock): refused, within its source's
-/// `PREFLIGHT_TIMEOUT`, before the source pauses anything.
-const ADMIT_WAIT: Duration = Duration::from_secs(8);
+/// From the target's prepare answer to the start of the source's header: the source only pauses
+/// and saves its VM meanwhile. An arrival never sent one gives its slot back (`listen`).
+const HEADER_WAIT: Duration = Duration::from_secs(5);
 const MAX_VMSTATE: u64 = 64 << 20;
 const MAX_HEADER: u64 = 256 << 20;
 const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -471,7 +471,18 @@ impl Proc {
         let mut w = conn;
         let mig = req["mig"].as_u64().ok_or("missing mig")?;
         let mut prep = Phases::new();
-        let prepared = match self.prepare_in(req, mig, &mut prep) {
+        // Refused once its source cannot wait longer, or has hung up.
+        let by = crate::listen::prepare_by();
+        let going = || -> Result<()> {
+            if Instant::now() >= by {
+                bail!("not prepared within {} s", crate::listen::PREPARE_WAIT.as_secs());
+            }
+            if crate::util::hung_up(&w) {
+                bail!("the source hung up");
+            }
+            Ok(())
+        };
+        let prepared = match self.prepare_in(req, mig, &mut prep, by, &going) {
             Ok(p) => p,
             Err(e) => {
                 send_json(&mut w, &json!({"ok": false, "error": e.to_string()}))?;
@@ -485,6 +496,11 @@ impl Proc {
         // Bytes the source has declared and this side not yet read, at most what it may send: a refusal drains them.
         let owed = &std::sync::atomic::AtomicU64::new(arrival_owed(u64::MAX, usize::MAX));
         let res = thread::scope(|scope| -> Result<(Arc<Vm>, Value)> {
+            if !crate::util::readable(&w, HEADER_WAIT.min(deadline.saturating_duration_since(Instant::now())))? {
+                // Nothing to drain: the refusal waits on it no longer.
+                r.get_mut().at = Instant::now();
+                bail!("the source sent nothing within {} s of its preflight", HEADER_WAIT.as_secs());
+            }
             let hdr: Header<'static> = crate::util::recv_json_max(&mut r, MAX_HEADER)?.ok_or("source hung up before sending the vmstate")?;
             owed.store(arrival_owed(hdr.vmstate_len, hdr.preload.len()), Ordering::SeqCst);
             let preload_len = (hdr.preload.len() * crate::util::PAGE_SIZE) as u64;
@@ -676,7 +692,14 @@ impl Proc {
         Ok(())
     }
 
-    fn prepare_in(&self, req: &Value, mig: u64, t: &mut Phases) -> Result<(crate::vm::Prepared, Ipv4Addr, Source, String, Vec<u64>)> {
+    fn prepare_in(
+        &self,
+        req: &Value,
+        mig: u64,
+        t: &mut Phases,
+        until: Instant,
+        going: &dyn Fn() -> Result<()>,
+    ) -> Result<(crate::vm::Prepared, Ipv4Addr, Source, String, Vec<u64>)> {
         crate::util::check_kvm()?;
         let name = req["name"].as_str().ok_or("missing name")?.to_string();
         let regions = serde_json::from_value::<Vec<_>>(req["regions"].clone()).map_err(|e| format!("bad regions: {e}"))?;
@@ -689,8 +712,9 @@ impl Proc {
         let ip: Ipv4Addr = req["ip"].as_str().ok_or("missing ip")?.parse()?;
         let tpl = Template::open_id(&self.paths, req["template"].as_str().ok_or("missing template")?, req["id"].as_str().ok_or("missing template id")?)?;
         t.mark("template");
+        going()?;
         // Admission, the record and the claim under one wait for the lock, which gives up in time.
-        let l = self.host.lock_by(Some(Instant::now() + ADMIT_WAIT)).map_err(|e| format!("not admitted within {} s: {e}", ADMIT_WAIT.as_secs()))?;
+        let l = self.host.lock_by(Some(until)).map_err(|e| format!("not admitted within {} s: {e}", crate::listen::PREPARE_WAIT.as_secs()))?;
         // Before the record (fsynced) and the claim: a refusal leaves nothing to undo. Never past the guest's size.
         self.admit_start(req["rss_mib"].as_u64().unwrap_or(0).min(tpl.meta.max_mib), None, arrival_floor(req))?;
         *self.arrived.lock().unwrap() = Some(self.host.mig_begin(mig, &source.addr, by, Some(ip))?);
@@ -700,7 +724,8 @@ impl Proc {
         drop(l);
         self.set_addr(claim);
         t.mark("claim_ip");
-        let idle = self.spawner.take(None)?;
+        going()?;
+        let idle = self.spawner.take(Some(until))?;
         crate::host::stall("incoming_stall");
         crate::host::gate("incoming_gate");
         t.mark("spawn");
@@ -720,6 +745,7 @@ impl Proc {
         if fault("prepare_fail") {
             bail!("injected fault: preparing failed");
         }
+        going()?;
         Ok((vm, ip, source, name, load_set))
     }
 

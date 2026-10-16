@@ -274,6 +274,7 @@ fn start_one(host: &Host, template: &str, log: &File, mib: u64, cooldown: bool) 
             "--template".as_ref(),
             template.as_ref(),
         ];
+        crate::util::start_reaper()?;
         let mut child = crate::util::spawn_self_child(&args, log, w.as_raw_fd(), None, &[("FLEXVM_NOTIFY_FD", "3")])?;
         drop(w);
         let mut r = BufReader::new(r);

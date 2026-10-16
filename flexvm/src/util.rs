@@ -696,6 +696,14 @@ pub fn readable(fd: &impl AsRawFd, timeout: Duration) -> io::Result<bool> {
     Ok(eintr(|| unsafe { libc::poll(&mut pfd, 1, left()) })? > 0)
 }
 
+/// Whether the peer has hung up (or reset), without waiting; what it sent but was not read yet
+/// does not count.
+pub fn hung_up(fd: &impl AsRawFd) -> bool {
+    let mut pfd = libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLRDHUP, revents: 0 };
+    let n = unsafe { libc::poll(&mut pfd, 1, 0) };
+    n > 0 && pfd.revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR) != 0
+}
+
 /// After a failed `accept`: one worth retrying at once (interrupted, the
 /// peer gone) returns; anything else (out of fds) waits rather than spins.
 pub fn accept_failed(what: &str, e: &io::Error) {
@@ -1059,6 +1067,7 @@ pub fn wait_signal(set: &libc::sigset_t) -> i32 {
 /// reach of whatever stops the caller's: a systemd unit's restart or stop
 /// (`KillMode=control-group`), logind's `KillUserProcesses`.
 pub fn spawn_self<S: AsRef<std::ffi::OsStr>>(args: &[S], log: &std::fs::File, fd3: RawFd, env: &[(&str, &str)]) -> io::Result<()> {
+    start_reaper()?;
     reap_later(spawn_self_child(args, log, fd3, None, env)?, None);
     Ok(())
 }
@@ -1118,60 +1127,98 @@ struct Reaping {
     hold: Option<(OwnedFd, Box<dyn Send>)>,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// `start_reaper` fails on this thread.
+    pub static NO_REAPER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 static REAPING: std::sync::Mutex<Vec<Reaping>> = std::sync::Mutex::new(Vec::new());
 const REAP_POLL: Duration = Duration::from_secs(1);
 
+/// The shared reaper's wake-up fd, started if it is not yet: called before a child is
+/// spawned for `reap_later`, so one that cannot be reaped is never started.
+pub fn start_reaper() -> io::Result<RawFd> {
+    static WAKE: std::sync::Mutex<Option<OwnedFd>> = std::sync::Mutex::new(None);
+    let mut wake = WAKE.lock().unwrap();
+    if let Some(fd) = &*wake {
+        return Ok(fd.as_raw_fd());
+    }
+    #[cfg(test)]
+    if NO_REAPER.with(|n| n.get()) {
+        return Err(io::Error::other("no reaper (test)"));
+    }
+    let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    check(fd)?;
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let raw = fd.as_raw_fd();
+    // Never closed: the thread polls it for good.
+    std::thread::Builder::new().name("reaper".into()).spawn(move || reaper(raw))?;
+    *wake = Some(fd);
+    Ok(raw)
+}
+
 /// Reaps `child` once it exits, from one thread shared by all the process's children rather
-/// than one each; drops `hold`'s value then, or once its fd reads ready if sooner.
+/// than one each; drops `hold`'s value then, or once its fd reads ready if sooner. Its
+/// spawner called `start_reaper` first.
 pub fn reap_later(child: std::process::Child, hold: Option<(OwnedFd, Box<dyn Send>)>) {
     let pidfd = pidfd_open(child.id()).ok();
     REAPING.lock().unwrap().push(Reaping { child, pidfd, hold });
-    // Started once; a failure to start it is retried with the next child (none is lost meanwhile).
-    static WAKE: std::sync::Mutex<Option<OwnedFd>> = std::sync::Mutex::new(None);
-    let mut wake = WAKE.lock().unwrap();
-    if wake.is_none() {
-        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-        if fd < 0 {
-            return crate::log!("reaping children: eventfd: {}", io::Error::last_os_error());
+    match start_reaper() {
+        Ok(wake) => {
+            let one = 1u64;
+            unsafe { libc::write(wake, (&one as *const u64).cast(), 8) };
         }
-        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        let raw = fd.as_raw_fd();
-        // Never closed: the thread polls it for good.
-        match std::thread::Builder::new().name("reaper".into()).spawn(move || reaper(raw)) {
-            Ok(_) => *wake = Some(fd),
-            Err(e) => return crate::log!("reaping children: {e}"),
+        // Not reached after a `start_reaper` that succeeded.
+        Err(e) => crate::log!("reaping children: {e}"),
+    }
+}
+
+/// The fds to poll: the wake-up's, then each entry's real ones only, with (entry, whether
+/// it is its hold) for each; and whether some entry has no pidfd (it is tried on a timer).
+fn reap_fds(wake: RawFd, r: &[Reaping]) -> (Vec<libc::pollfd>, Vec<(usize, bool)>, bool) {
+    let pfd = |fd: RawFd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+    let (mut fds, mut whose) = (vec![pfd(wake)], vec![]);
+    for (i, e) in r.iter().enumerate() {
+        for (fd, hold) in [(e.pidfd.as_ref(), false), (e.hold.as_ref().map(|h| &h.0), true)] {
+            if let Some(fd) = fd {
+                fds.push(pfd(fd.as_raw_fd()));
+                whose.push((i, hold));
+            }
         }
     }
-    let one = 1u64;
-    unsafe { libc::write(wake.as_ref().unwrap().as_raw_fd(), (&one as *const u64).cast(), 8) };
+    (fds, whose, r.iter().any(|e| e.pidfd.is_none()))
 }
 
 fn reaper(wake: RawFd) {
     loop {
-        // Entries are only appended meanwhile, and removed only here: `fds[1 + 2i..]` stays entry i's.
-        let (mut fds, timeout) = {
-            let r = REAPING.lock().unwrap();
-            let fd = |f: Option<&OwnedFd>| libc::pollfd { fd: f.map_or(-1, |f| f.as_raw_fd()), events: libc::POLLIN, revents: 0 };
-            let mut fds = vec![libc::pollfd { fd: wake, events: libc::POLLIN, revents: 0 }];
-            fds.extend(r.iter().flat_map(|e| [fd(e.pidfd.as_ref()), fd(e.hold.as_ref().map(|h| &h.0))]));
-            (fds, if r.iter().any(|e| e.pidfd.is_none()) { REAP_POLL.as_millis() as i32 } else { -1 })
-        };
-        if eintr(|| unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) }).is_err() {
+        // Entries are only appended meanwhile, and removed only here: `whose` stays right.
+        let (mut fds, whose, timer) = reap_fds(wake, &REAPING.lock().unwrap());
+        let timeout = if timer { REAP_POLL.as_millis() as i32 } else { -1 };
+        let polled = eintr(|| unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) });
+        if let Err(e) = &polled {
+            crate::log!("reaping children: poll: {e}; trying each");
             std::thread::sleep(REAP_POLL);
         }
         if fds[0].revents != 0 {
             let mut n = 0u64;
             unsafe { libc::read(wake, (&mut n as *mut u64).cast(), 8) };
         }
-        let mut i = 0;
-        REAPING.lock().unwrap().retain_mut(|e| {
-            let (exited, done) = fds.get(1 + 2 * i..3 + 2 * i).map_or((false, false), |f| (f[0].revents != 0, f[1].revents != 0));
-            i += 1;
-            if done {
-                e.hold = None;
+        let mut r = REAPING.lock().unwrap();
+        let mut exited = vec![polled.is_err(); r.len()];
+        for (f, &(i, hold)) in fds[1..].iter().zip(&whose) {
+            match (f.revents != 0, hold) {
+                (false, _) => {}
+                (true, true) => r[i].hold = None,
+                (true, false) => exited[i] = true,
             }
-            // Gone once waited for (or never to be: an error).
-            !((exited || e.pidfd.is_none()) && !matches!(e.child.try_wait(), Ok(None)))
+        }
+        let mut i = 0;
+        r.retain_mut(|e| {
+            let tried = exited.get(i).copied().unwrap_or(false) || e.pidfd.is_none();
+            i += 1;
+            // Kept unless waited for (or never to be: an error).
+            !tried || matches!(e.child.try_wait(), Ok(None))
         });
     }
 }
@@ -1284,6 +1331,26 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         true
+    }
+
+    #[test]
+    fn the_reaper_polls_only_real_fds() {
+        let entry = |pidfd: bool, hold: bool| {
+            let fd = || OwnedFd::from(UnixStream::pair().unwrap().0);
+            let child = std::process::Command::new("true").spawn().unwrap();
+            Reaping { child, pidfd: pidfd.then(fd), hold: hold.then(|| (fd(), Box::new(()) as Box<dyn Send>)) }
+        };
+        // Those without fds add nothing to the poll (no -1 placeholders), then one with both.
+        let mut r: Vec<Reaping> = (0..3).map(|_| entry(false, false)).collect();
+        r.push(entry(true, true));
+        let (fds, whose, timer) = reap_fds(-5, &r);
+        assert_eq!(fds.len(), 3);
+        assert!(fds[1..].iter().all(|f| f.fd >= 0));
+        assert_eq!(whose, [(3, false), (3, true)]);
+        assert!(timer, "one without a pidfd is tried on a timer");
+        for mut e in r {
+            e.child.wait().unwrap();
+        }
     }
 
     #[test]
