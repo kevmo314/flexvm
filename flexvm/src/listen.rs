@@ -266,8 +266,8 @@ struct PeersInner {
 ///
 /// Who asks decides how fresh peer addresses must be. A peer is the attacker #549 guards
 /// against: what a peer asks for (arrival, route, lend) is checked by the listener against
-/// its own lookups, waiting briefly for one under way on a name it has no addresses for and
-/// refused after. Restore and resume are root's own: they go by this file whatever its age,
+/// its own lookups, waiting briefly for any under way on a peer name (cached addresses or not)
+/// and refused after. Restore and resume are root's own: they go by this file whatever its age,
 /// never waiting on DNS, and are refused at once only for a name it has no entry for (no
 /// listener looked it up yet). A peer whose name moved since is not caught there.
 const PEER_CACHE: &str = "peers.json";
@@ -360,9 +360,9 @@ impl Peers {
         addrs
     }
 
-    /// `addrs` once no name without addresses has its lookup under way (it could give any
-    /// address), waiting for one until `by`, then an error: asked again, it may have ended. A
-    /// lookup that ended with none (a name that does not resolve) gives none (#411).
+    /// `addrs` once no name has its lookup under way (it could give any address, a name with
+    /// addresses a new one too), waiting for one until `by`, then an error: asked again, it may
+    /// have ended. A lookup that ended with none (a name that does not resolve) gives none (#411).
     fn all_addrs(&self, names: &[String], by: Instant) -> Result<Vec<IpAddr>> {
         loop {
             // Starts a lookup of a name with none; then addresses and lookups under way read
@@ -373,10 +373,12 @@ impl Peers {
                 let mut addrs = Vec::new();
                 let mut pending = false;
                 for n in names {
-                    match (n.parse::<SocketAddr>(), r.get(n)) {
-                        (Ok(a), _) => addrs.push(a.ip()),
-                        (_, Some(a)) => addrs.extend(a),
-                        _ => pending |= l.get(n) == Some(&None),
+                    match n.parse::<SocketAddr>() {
+                        Ok(a) => addrs.push(a.ip()),
+                        Err(_) => {
+                            addrs.extend(r.get(n).into_iter().flatten());
+                            pending |= l.get(n) == Some(&None);
+                        }
                     }
                 }
                 (addrs, pending)
@@ -967,8 +969,16 @@ mod tests {
         // Ended with no address (it does not resolve): no addresses, not a refusal forever.
         p.0.lookups.lock().unwrap().insert("peer.example:7000".into(), Some(Instant::now()));
         assert_eq!(p.all_addrs(&cfg.peers, soon()).unwrap(), ["10.98.0.1".parse::<IpAddr>().unwrap()]);
+        // Cached, but looked up again (it may come back on a new address): refused after a wait
+        // too, never answered with the old address alone; then with the new one.
+        p.0.resolved.write().unwrap().insert("peer.example:7000".into(), vec!["10.94.0.2".parse().unwrap()]);
+        p.0.lookups.lock().unwrap().insert("peer.example:7000".into(), None);
+        let e = p.all_addrs(&cfg.peers, soon()).unwrap_err().to_string();
+        assert!(e.contains("still being looked up"), "{e}");
         p.0.resolved.write().unwrap().insert("peer.example:7000".into(), vec!["10.94.0.1".parse().unwrap()]);
+        p.0.lookups.lock().unwrap().insert("peer.example:7000".into(), Some(Instant::now()));
         let peers = [p.all_addrs(&cfg.peers, soon()).unwrap(), vec!["10.95.0.1".parse().unwrap()]].concat();
+        assert!(peers.contains(&"10.94.0.1".parse().unwrap()) && !peers.contains(&"10.94.0.2".parse().unwrap()));
         let check = |ip: &str| routable(ip.parse().unwrap(), &cfg, &peers, &[gw]);
         for ip in ["127.0.0.1", "0.0.0.0", "255.255.255.255", "224.0.0.1", "10.98.0.1", "10.94.0.1", "10.97.0.1", "10.96.0.1", "10.95.0.1"] {
             assert!(check(ip).is_err(), "{ip} is refused");
