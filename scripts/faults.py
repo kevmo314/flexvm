@@ -5878,6 +5878,9 @@ def forged_peer():
         s, r, _ = migrate_in_raw(B, n, ip, tid, gen=gen)
         s.close()
         check(f"forged gen {label}: arrival refused", not r.get("ok") and "generation" in r.get("error", ""), r)
+        # The refused arrival's process holds the name (its lock) until it has given up.
+        lock = os.path.join(B.run, "vms", f"{n}.lock")
+        check(f"forged gen {label}: name free again", wait_for(lambda: n not in vms(B) and not os.path.exists(lock), 10), vms(B).get(n))
     newest = addr(B, ip).get("seen", 0) + 10
     s, r, _ = migrate_in_raw(B, n, ip, tid, gen=newest)
     s.close()
