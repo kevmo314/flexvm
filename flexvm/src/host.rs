@@ -421,43 +421,57 @@ fn unwritable(e: &std::io::Error) -> bool {
 
 /// Binds the run directory to one canonical state path in `RUN/state.json` (gone on reboot, as
 /// `STATE/run.json` still binds that side). Two state roots hold different flocks, so the first
-/// write is a hard link of a whole file, which only one of them can make; both then read the winner.
-/// A user who cannot write the run directory leaves it unbound.
-fn claim_run(state: &Path, run: &Path) -> Result<()> {
+/// write is a hard link of a whole file, made under a random name, which only one of them can make;
+/// every opener then reads the winner. False if the run directory is unclaimed and this user cannot
+/// claim it (a non-root opener), so the caller leaves its state unbound too.
+fn claim_run(state: &Path, run: &Path) -> Result<bool> {
+    use std::io::ErrorKind::{AlreadyExists, NotFound};
     let owner = run.join("state.json");
-    let refuse = |saved: &Path| -> Result<()> {
-        bail!(
-            "run directory {} belongs to state directory {}; refusing --state {} (with no VM running, remove {} to rebind)",
-            run.display(),
-            saved.display(),
-            state.display(),
-            owner.display()
-        )
-    };
-    let check = |bytes: Vec<u8>| -> Result<()> {
+    // Whether the owner names this state, or None while there is no owner.
+    let verify = || -> Result<Option<()>> {
+        let bytes = match std::fs::read(&owner) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == NotFound => return Ok(None),
+            Err(e) => bail!("{}: {e}", owner.display()),
+        };
         let saved: PathBuf = serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", owner.display()))?;
         if saved != state {
-            refuse(&saved)
-        } else {
-            Ok(())
+            bail!(
+                "run directory {} belongs to state directory {}; refusing --state {} (with no VM running, remove {} to rebind)",
+                run.display(),
+                saved.display(),
+                state.display(),
+                owner.display()
+            );
+        }
+        Ok(Some(()))
+    };
+    if verify()?.is_some() {
+        return Ok(true);
+    }
+    let tmp = run.join(format!(".state.json.{}.tmp", crate::util::nonce()?));
+    let made = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp);
+    let linked = match made {
+        // Another state may have claimed it since it was read.
+        Err(e) if unwritable(&e) => return Ok(verify()?.is_some()),
+        Err(e) => bail!("{}: {e}", tmp.display()),
+        Ok(mut f) => {
+            if let Err(e) = std::io::Write::write_all(&mut f, &serde_json::to_vec(state)?).and_then(|()| f.sync_all()) {
+                let _ = std::fs::remove_file(&tmp);
+                bail!("{}: {e}", tmp.display());
+            }
+            let linked = std::fs::hard_link(&tmp, &owner);
+            let _ = std::fs::remove_file(&tmp);
+            linked
         }
     };
-    match std::fs::read(&owner) {
-        Ok(bytes) => return check(bytes),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+    match linked {
+        Ok(()) => {}
+        Err(e) if e.kind() == AlreadyExists || unwritable(&e) => {}
         Err(e) => bail!("{}: {e}", owner.display()),
     }
-    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = run.join(format!(".state.json.{}-{n}.tmp", std::process::id()));
-    let made = std::fs::write(&tmp, serde_json::to_vec(state)?).and_then(|()| std::fs::hard_link(&tmp, &owner));
-    let _ = std::fs::remove_file(&tmp);
-    match made {
-        Ok(()) => Ok(()),
-        Err(e) if unwritable(&e) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => check(std::fs::read(&owner).map_err(|e| format!("{}: {e}", owner.display()))?),
-        Err(e) => bail!("{}: {e}", owner.display()),
-    }
+    // Linked or not, the owner on disk decides.
+    Ok(verify()?.is_some())
 }
 
 impl Host {
@@ -507,9 +521,10 @@ impl Host {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
             Err(e) => bail!("{}: {e}", binding.display()),
         };
-        claim_run(&state, &run)?;
-        // A user who cannot write the state root (a non-root `flexvm ls` of an unbound one) leaves it unbound.
-        if !bound {
+        let claimed = claim_run(&state, &run)?;
+        // A user who cannot write the state root (a non-root `flexvm ls` of an unbound one) leaves it unbound,
+        // as does one who could not claim the run directory: it is not bound to a directory it may not own.
+        if !bound && claimed {
             match crate::util::write_file(&state, "run.json", &serde_json::to_vec(&run)?, true) {
                 Err(e) if unwritable(&e) => {}
                 r => r.map_err(|e| format!("{}: {e}", binding.display()))?,
@@ -2649,6 +2664,20 @@ mod tests {
         mode(0o755);
         result.unwrap();
         assert!(!h.run.join("state.json").exists());
+        // An unbound state is not bound to a run directory it could not claim, and one another state
+        // claimed is refused though it cannot be written.
+        let other = h.state.with_file_name("other-state");
+        mode(0o555);
+        let unclaimed = Host::open(&other, &h.run).map(|_| ());
+        mode(0o755);
+        unclaimed.unwrap();
+        assert!(!other.join("run.json").exists());
+        std::fs::write(h.run.join("state.json"), serde_json::to_vec(&h.state).unwrap()).unwrap();
+        mode(0o555);
+        let refused = Host::open(&other, &h.run).map(|_| ());
+        mode(0o755);
+        assert!(refused.err().unwrap().to_string().contains("belongs to state directory"));
+        assert!(!other.join("run.json").exists());
     }
 
     #[test]
