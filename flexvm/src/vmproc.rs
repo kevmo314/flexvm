@@ -651,6 +651,10 @@ impl Proc {
         let work = self.ident.work_dir(&self.host.run);
         crate::socket::remove(&work);
         let _ = std::fs::remove_dir_all(&work);
+        // Rate-limited straggler counts not reported yet would end with the process.
+        if let Some(h) = self.holder() {
+            h.report_now();
+        }
         crate::util::flush_log(crate::util::LOG_FLUSH);
         crate::util::output::drain();
         std::process::exit(code)

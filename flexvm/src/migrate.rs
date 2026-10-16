@@ -404,10 +404,6 @@ impl Proc {
                     p.vm().name
                 ),
             }
-            // Before the process ends: what reached its hold after it let go is in the log.
-            if let Some(h) = p.holder() {
-                h.report_now();
-            }
             p.finish(&op, End::Moved(to), 0, None)
         });
     }
