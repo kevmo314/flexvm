@@ -13,25 +13,46 @@ process and the VM is gone, send it a signal and the VM pauses or suspends.
 
 Everything flexvm keeps lives in its state directory, `/var/lib/flexvm`: the
 artifacts (`artifacts/`), templates (`templates/`), pulled images
-(`images/`) and VMs. The scripts install into it (with sudo); give them
-`--state DIR` for another.
+(`images/`) and VMs.
+
+```sh
+cargo build --release && sudo install target/release/flexvm /usr/local/bin/
+sudo flexvm pull ubuntu:24.04
+sudo flexvm run web
+```
+
+flexvm-init (the guest's PID 1 and agent) is built by the same `cargo build`
+and embedded in the binary. The patched Firecracker and the guest kernel are
+prebuilt: the first command that needs them downloads them into
+`artifacts/` from the release this build pins (`ARTIFACTS_TAG` in
+`scripts/versions.sh`) and checks them against the sha256 pinned in
+`scripts/checksums.sha256`. A file already there is never downloaded or
+replaced.
+
+To build your own, or for a host without network access, put the files in
+`artifacts/` first (the scripts install with sudo; give them `--state DIR`
+for another state directory, then copy it over):
 
 ```sh
 ./scripts/build-firecracker.sh   # patched firecracker (needs musl-tools, libseccomp-dev)
-./scripts/fetch.sh               # guest kernel 6.1, ubuntu 24.04 base (and stock firecracker, if none is built)
-./scripts/build-rootfs.sh        # rootfs.ext4, and flexvm-init for image templates (needs squashfs-tools, e2fsprogs)
-cargo build --release && sudo install target/release/flexvm /usr/local/bin/
-sudo flexvm template default     # cold-boot and snapshot a template (default CPUs, ceiling = host RAM, 4 GiB plugged)
-sudo flexvm run web
+./scripts/fetch.sh               # guest kernel and ubuntu 24.04 base (and the release's firecracker, if none is built)
+./scripts/build-rootfs.sh        # rootfs.ext4 for `flexvm template default` (needs squashfs-tools, e2fsprogs)
 ```
+
+`FLEXVM_ARTIFACTS_URL` points the download at a mirror of the release (the
+same pins apply). A new release of the artifacts is cut by pushing the tag
+`scripts/versions.sh` names (`.github/workflows/release.yml` builds and
+publishes it), then pinning it with `scripts/pin-artifacts.sh` in a
+follow-up commit.
 
 The host needs Linux 5.16+: Firecracker patch `0004` uses `KVM_VCPU_TSC_OFFSET`.
 
 Hosts that migrate or restore each other's VMs need the same CPU model and
 a byte-identical Firecracker: a snapshot records both (the binary by its
-content hash), and any difference refuses it ("Firecracker differs"). Build
-Firecracker once and copy `/var/lib/flexvm/artifacts` to every host rather than
-building it on each. Replacing the binary also invalidates every template
+content hash), and any difference refuses it ("Firecracker differs"). Builds
+pinning the same release download the same binary; a Firecracker of your own
+is built once and copied to every host (`/var/lib/flexvm/artifacts`) rather than
+built on each. Replacing the binary also invalidates every template
 built with the old one: rebuild them. Templates themselves must be identical
 too (build once and copy `/var/lib/flexvm/templates`, or build from the same
 inputs). A template pins its rootfs by path, so one built before the state
@@ -339,10 +360,10 @@ hold no secrets at startup. Details: [docs/images.md](docs/images.md).
 
 | flag | default | what |
 |---|---|---|
-| `--state DIR` | `/var/lib/flexvm` | everything on disk: `artifacts/` (`firecracker`, `vmlinux`, `rootfs.ext4`, `flexvm-init`), `templates/`, `images/` (pulled container images), `staging/` (where image layers unpack: root-owned, see [docs/images.md](docs/images.md)), host configuration, addresses, suspended VMs |
+| `--state DIR` | `/var/lib/flexvm` | everything on disk: `artifacts/` (`firecracker`, `vmlinux`, `rootfs.ext4`), `templates/`, `images/` (pulled container images), `staging/` (where image layers unpack: root-owned, see [docs/images.md](docs/images.md)), host configuration, addresses, suspended VMs |
 | `--run DIR` | `/run/flexvm` (another `--state`'s: `/run/flexvm-PREFIX`) | registry, sockets, logs (tmpfs) |
 
-`template --image` runs `STATE/artifacts/flexvm-init` as PID 1 (`--init PATH`
+`template --image` runs the flexvm-init built into flexvm as PID 1 (`--init PATH`
 for another). Several hosts on one machine (tests, benchmarks) each take a `--state` and
 `--run` of their own; their `artifacts` and `templates` can be symlinks to one
 host's. On first open, each state directory permanently records its canonical run

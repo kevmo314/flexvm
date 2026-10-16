@@ -18,9 +18,8 @@ SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-1700000000}
 # Where cargo puts the build, passed explicitly, so flexvm-init is taken from
 # the directory just built into and never a stale one elsewhere.
 target=${CARGO_TARGET_DIR:-${CARGO_BUILD_TARGET_DIR:-$root/target}}
+# (Image templates need none of this: flexvm embeds its own flexvm-init.)
 RUSTFLAGS="-C target-feature=+crt-static" cargo build --release -p flexvm-init --target x86_64-unknown-linux-gnu --target-dir "$target"
-# Also injected into templates built from container images (flexvm template --image).
-sudo install -D -m 755 "$target"/x86_64-unknown-linux-gnu/release/flexvm-init "$out/flexvm-init"
 
 # Unpacked as root, setuid binaries and device nodes included: only inside a
 # fresh root-only (0700) directory beside the artifacts (on disk, not a tmpfs),

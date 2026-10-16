@@ -139,8 +139,9 @@ another may own; one bound to another run directory (`run.json`) is refused with
 
 ```
 STATE (default /var/lib/flexvm, on disk)
-  artifacts/             firecracker, vmlinux, base.squashfs, rootfs-HASH.ext4, rootfs.ext4 (a symlink to
-                         the newest) and flexvm-init, as scripts/fetch.sh and build-*.sh install them
+  artifacts/             firecracker and vmlinux (downloaded on first use from the pinned release, or as
+                         scripts/fetch.sh and build-firecracker.sh install them); base.squashfs,
+                         rootfs-HASH.ext4 and rootfs.ext4 (a symlink to the newest), as build-rootfs.sh does
   templates/             built templates: NAME -> .gen/ID (see internals.md)
   images/                pulled container images: blobs/sha256/, rootfs/KEY.ext4 (see images.md)
   host.json              host config (`flexvm config`'s; listen is `flexvm listen`'s): listen, peers, vm_ips, cluster_ips, underlay, announce_dev, dns, reserve_mib, evict_mib; unset ones are derived where used

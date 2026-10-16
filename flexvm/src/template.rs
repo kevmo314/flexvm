@@ -818,6 +818,8 @@ fn build(paths: &Paths, dir: &Path, name: &str, vcpus: u32, mem_mib: u64, max_mi
     // rootfs.ext4 is a symlink a rebuild repoints; the snapshot's page cache needs these bytes.
     let rootfs = std::fs::canonicalize(&paths.rootfs)
         .map_err(|e| format!("{}: {e} (build it: scripts/build-rootfs.sh, or give --image REF)", paths.rootfs.display()))?;
+    // Downloaded on first use if missing (`artifacts`): every later VM restores with the Firecracker built with.
+    crate::artifacts::ensure(&[(&paths.kernel, &crate::artifacts::KERNEL), (&paths.firecracker, &crate::artifacts::FIRECRACKER)])?;
     let kernel = std::fs::canonicalize(&paths.kernel).map_err(|e| format!("{}: {e} (fetch it: scripts/fetch.sh)", paths.kernel.display()))?;
     let sockets = SocketRoot::new(&std::fs::canonicalize(dir)?)?;
     let start = Instant::now();
