@@ -503,7 +503,7 @@ fn non_utf8_parent_paths_roundtrip_and_open() {
 fn suspended_description_checks_manifest_and_saturates_sizes() {
     let root = tmp("suspended-description");
     let host = crate::host::Host::open(&root.join("state"), &root.join("run")).unwrap();
-    let dir = host.suspended("x");
+    let dir = host.suspended("x").unwrap();
     link(&dir, Some(Parent { path: "missing-parent".into(), id: "missing".into() }), |m| {
         m.mem_mib = u64::MAX;
         m.hotplug_mib = 1;

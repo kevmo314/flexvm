@@ -578,16 +578,21 @@ impl Host {
         Ok(Locked(Some((f, threads))))
     }
 
-    pub fn sock(&self, name: &str) -> PathBuf {
+    // The paths made from a VM name refuse a name `check_name` does, so
+    // none (a peer's "../x", say) reaches outside its directory.
+
+    pub fn sock(&self, name: &str) -> Result<PathBuf> {
         self.vms(name, "sock")
     }
 
-    pub fn vms(&self, name: &str, ext: &str) -> PathBuf {
-        self.run.join("vms").join(format!("{}.{ext}", confined(name)))
+    pub fn vms(&self, name: &str, ext: &str) -> Result<PathBuf> {
+        check_name(name)?;
+        Ok(self.run.join("vms").join(format!("{name}.{ext}")))
     }
 
-    pub fn suspended(&self, name: &str) -> PathBuf {
-        self.state.join("suspended").join(confined(name))
+    pub fn suspended(&self, name: &str) -> Result<PathBuf> {
+        check_name(name)?;
+        Ok(self.state.join("suspended").join(name))
     }
 
     /// Whether a suspended VM of this name may still be resumed (or is
@@ -595,14 +600,14 @@ impl Host {
     /// else in its place is debris of an interrupted suspend, resume or
     /// discard, removed by the next holder of the name.
     pub fn is_suspended(&self, name: &str) -> bool {
-        let dir = self.suspended(name);
+        let Ok(dir) = self.suspended(name) else { return false };
         dir.join("manifest.json").is_file() && !dir.join("STARTED").exists() && !dir.join("DISCARDED").exists()
     }
 
     /// What a dead holder left running is reaped first, then debris in its
     /// suspended directory is removed.
     pub fn take_name(&self, name: &str, resuming: bool) -> Result<NameLock> {
-        check_name(name)?;
+        let (lock, suspended) = (self.vms(name, "lock")?, self.suspended(name)?);
         if !resuming && self.is_suspended(name) {
             bail!("vm {name:?} exists (suspended); resume or kill it");
         }
@@ -610,7 +615,7 @@ impl Host {
         // not taken, so tried again briefly.
         let until = std::time::Instant::now() + Duration::from_millis(250);
         let f = loop {
-            match lock_path(&self.vms(name, "lock"), libc::LOCK_EX | libc::LOCK_NB) {
+            match lock_path(&lock, libc::LOCK_EX | libc::LOCK_NB) {
                 Ok(f) => break f,
                 Err(_) if std::time::Instant::now() < until && self.holder_gone(name) => std::thread::sleep(Duration::from_millis(2)),
                 Err(_) => bail!("vm name {name:?} is taken"),
@@ -618,17 +623,17 @@ impl Host {
         };
         // Locked, so its holder no longer runs it; its Firecrackers are reaped on
         // proof of death only, and an unreadable lock is an error, never no holder.
-        if let Some(old) = lock_holder(&self.vms(name, "lock"))?.filter(|o| *o != Ident::me()) {
+        if let Some(old) = lock_holder(&lock)?.filter(|o| *o != Ident::me()) {
             reap(&self.run, &old)?;
         }
-        if self.suspended(name).exists() && !self.is_suspended(name) {
+        if suspended.exists() && !self.is_suspended(name) {
             crate::lifecycle::remove_debris(self, name)?;
         }
-        if !resuming && self.suspended(name).exists() {
+        if !resuming && suspended.exists() {
             bail!("vm {name:?} exists (suspended); resume or kill it");
         }
         for ext in ["json", "sock", "moved", "failed"] {
-            let _ = std::fs::remove_file(self.vms(name, ext));
+            let _ = std::fs::remove_file(self.vms(name, ext)?);
         }
         f.set_len(0)?;
         f.write_all_at(&serde_json::to_vec(&Ident::me())?, 0)?;
@@ -639,7 +644,7 @@ impl Host {
     /// probe of the lock, which a start takes without waiting): none, or one
     /// proven gone.
     pub fn holder_gone(&self, name: &str) -> bool {
-        match lock_holder(&self.vms(name, "lock")) {
+        match self.vms(name, "lock").and_then(|l| lock_holder(&l)) {
             Ok(None) => true,
             Ok(Some(id)) => id.liveness() == Liveness::Gone,
             Err(_) => false,
@@ -654,13 +659,13 @@ impl Host {
     }
 
     pub fn alive(&self, name: &str) -> bool {
-        File::open(self.vms(name, "lock")).is_ok_and(|f| probe(&f, libc::LOCK_SH).is_err())
+        self.vms(name, "lock").is_ok_and(|l| File::open(l).is_ok_and(|f| probe(&f, libc::LOCK_SH).is_err()))
     }
 
     /// Whether `name`'s lock is held: None when that cannot be told (the
     /// file cannot be opened, or the probe fails other than by contention).
     pub fn name_locked(&self, name: &str) -> Option<bool> {
-        let f = match File::open(self.vms(name, "lock")) {
+        let f = match File::open(self.vms(name, "lock").ok()?) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(false),
             Err(_) => return None,
@@ -678,12 +683,13 @@ impl Host {
         if !self.name_locked(name)? {
             return Some(false);
         }
-        lock_holder(&self.vms(name, "lock")).ok()?.map(|h| h == *id)
+        lock_holder(&self.vms(name, "lock").ok()?).ok()?.map(|h| h == *id)
     }
 
     /// Also requires the last holder's Firecrackers to have exited.
     fn gone(&self, name: &str) -> bool {
-        self.name_locked(name) == Some(false) && lock_holder(&self.vms(name, "lock")).is_ok_and(|id| id.is_none_or(|id| reap(&self.run, &id).is_ok()))
+        self.name_locked(name) == Some(false)
+            && self.vms(name, "lock").and_then(|l| lock_holder(&l)).is_ok_and(|id| id.is_none_or(|id| reap(&self.run, &id).is_ok()))
     }
 
     pub fn entries(&self) -> Vec<Entry> {
@@ -699,8 +705,8 @@ impl Host {
 
     /// Only believed if written by the process holding the name now.
     pub fn entry(&self, name: &str) -> Result<Entry> {
-        match load::<Entry>(&self.vms(name, "json")) {
-            Ok(Some(e)) if self.alive(name) && lock_holder(&self.vms(name, "lock")).ok().flatten() == Some(e.ident.clone()) => Ok(e),
+        match load::<Entry>(&self.vms(name, "json")?) {
+            Ok(Some(e)) if self.alive(name) && lock_holder(&self.vms(name, "lock")?).ok().flatten() == Some(e.ident.clone()) => Ok(e),
             _ => bail!("no vm named {name:?}"),
         }
     }
@@ -759,7 +765,7 @@ impl Host {
     /// A suspended VM `name` with generation `gen` (or one whose generation was
     /// never recorded: quarantined, it keeps what it held).
     fn suspended_with(&self, name: &str, gen: u64) -> bool {
-        let recorded = || std::fs::read_to_string(self.suspended(name).join("GEN")).ok().and_then(|g| g.trim().parse::<u64>().ok());
+        let recorded = || std::fs::read_to_string(self.suspended(name).ok()?.join("GEN")).ok().and_then(|g| g.trim().parse::<u64>().ok());
         self.is_suspended(name) && recorded().is_none_or(|g| g == gen)
     }
 
@@ -1761,7 +1767,7 @@ pub struct NameLock {
 
 impl NameLock {
     pub fn publish(&self, e: &Entry) -> Result<()> {
-        store(&self.host.vms(&self.name, "json"), e, false)
+        store(&self.host.vms(&self.name, "json")?, e, false)
     }
 }
 
@@ -1769,7 +1775,10 @@ impl Drop for NameLock {
     fn drop(&mut self) {
         // Unlinked while held: a taker re-checks the path after locking.
         for ext in ["json", "sock", "lock"] {
-            let _ = std::fs::remove_file(self.host.vms(&self.name, ext));
+            // Checked when taken.
+            if let Ok(path) = self.host.vms(&self.name, ext) {
+                let _ = std::fs::remove_file(path);
+            }
         }
     }
 }
@@ -2144,7 +2153,7 @@ impl Host {
             && a.current(a.held)
             && (settled || a.lent.is_none_or(|lent| lent < a.held))
             && self.dead_and_reaped(a)
-            && !self.suspended(name).join("QUARANTINE").exists()
+            && self.suspended(name).is_ok_and(|d| !d.join("QUARANTINE").exists())
     }
 
     fn notice_path(&self, ip: Ipv4Addr) -> PathBuf {
@@ -2353,19 +2362,6 @@ fn tap_prefix(state: &Path) -> String {
     std::iter::once('f').chain((0..5).map(digit)).collect()
 }
 
-/// Stands in for a name `check_name` refuses in the paths made from VM
-/// names, so none (a peer's "../x", say) reaches outside its directory. No
-/// VM can hold it: names never start with '.'.
-const BAD_NAME: &str = ".bad-name";
-
-fn confined(name: &str) -> &str {
-    if check_name(name).is_ok() {
-        name
-    } else {
-        BAD_NAME
-    }
-}
-
 pub fn check_name(name: &str) -> Result<()> {
     if name.is_empty() || name.len() > 64 || name.starts_with('.') || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)) {
         bail!("bad vm name {name:?}: up to 64 letters, digits, '-', '_' or '.', not starting with '.'");
@@ -2505,17 +2501,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn name_paths_stay_in_their_directories() {
-        let (_base, h) = host("confined");
+    fn name_paths_refuse_bad_names() {
+        let (_base, h) = host("name-paths");
         for name in ["../x", "../../var/run/docker", "a/b", "/etc/passwd", "", ".", "..", ".lock", "x\0y"] {
-            for p in [h.sock(name), h.vms(name, "lock")] {
-                assert_eq!(p.parent(), Some(h.run.join("vms").as_path()), "{name:?}");
-                assert!(p.file_name().unwrap().to_str().unwrap().starts_with(BAD_NAME), "{name:?}");
-            }
-            assert_eq!(h.suspended(name), h.state.join("suspended").join(BAD_NAME), "{name:?}");
+            assert!(h.sock(name).is_err() && h.vms(name, "lock").is_err() && h.suspended(name).is_err(), "{name:?}");
+            assert!(!h.alive(name) && !h.is_suspended(name) && h.entry(name).is_err(), "{name:?}");
         }
-        assert_eq!(h.sock("web.1"), h.run.join("vms/web.1.sock"));
-        assert_eq!(h.suspended("web.1"), h.state.join("suspended/web.1"));
+        assert_eq!(h.sock("web.1").unwrap(), h.run.join("vms/web.1.sock"));
+        assert_eq!(h.suspended("web.1").unwrap(), h.state.join("suspended/web.1"));
     }
 
     fn host(tag: &str) -> (crate::test_util::TempDir, Host) {
@@ -2701,8 +2694,8 @@ mod tests {
         for bad in ["", ".x", "a/b", &"x".repeat(65)] {
             assert!(h.take_name(bad, false).is_err());
         }
-        std::fs::create_dir_all(h.suspended("s")).unwrap();
-        std::fs::write(h.suspended("s").join("manifest.json"), "").unwrap();
+        std::fs::create_dir_all(h.suspended("s").unwrap()).unwrap();
+        std::fs::write(h.suspended("s").unwrap().join("manifest.json"), "").unwrap();
         assert!(h.take_name("s", false).is_err() && h.take_name("s", true).is_ok());
     }
 
@@ -2710,8 +2703,8 @@ mod tests {
     fn suspend_debris_is_removed_by_the_names_next_holder() {
         let (_h_dir, h) = host("debris");
         let dir = |n: &str, files: &[&str]| {
-            std::fs::create_dir_all(h.suspended(n)).unwrap();
-            files.iter().for_each(|f| std::fs::write(h.suspended(n).join(f), "").unwrap());
+            std::fs::create_dir_all(h.suspended(n).unwrap()).unwrap();
+            files.iter().for_each(|f| std::fs::write(h.suspended(n).unwrap().join(f), "").unwrap());
         };
         // No manifest (an interrupted removal or revoke), consumed, discarded.
         dir("bare", &["GEN", "pages"]);
@@ -2721,7 +2714,7 @@ mod tests {
         for n in ["bare", "started", "discarded", "quarantined"] {
             assert!(!h.is_suspended(n));
             drop(h.take_name(n, false).unwrap());
-            assert!(!h.suspended(n).exists(), "{n}");
+            assert!(!h.suspended(n).unwrap().exists(), "{n}");
         }
         // A suspended VM, quarantined or not, stays.
         dir("kept", &["manifest.json"]);
@@ -2729,25 +2722,25 @@ mod tests {
         for n in ["kept", "held"] {
             assert!(h.is_suspended(n) && h.take_name(n, false).is_err());
             drop(h.take_name(n, true).unwrap());
-            assert!(h.suspended(n).exists());
+            assert!(h.suspended(n).unwrap().exists());
         }
         // Held by a live process, it is not touched.
         let _live = h.take_name("live", true).unwrap();
         dir("live", &["GEN"]);
-        assert!(h.take_name("live", false).is_err() && h.suspended("live").exists());
+        assert!(h.take_name("live", false).is_err() && h.suspended("live").unwrap().exists());
     }
 
     #[test]
     fn a_dead_holders_firecrackers_die_before_its_name_or_address_is_free() {
         let (_h_dir, h) = host("reap");
         let fc = Sleeper::new();
-        store(&h.vms("d", "lock"), &dead_owner(&h, 999_999_901, &[&fc.1]), false).unwrap();
+        store(&h.vms("d", "lock").unwrap(), &dead_owner(&h, 999_999_901, &[&fc.1]), false).unwrap();
         let l = h.lock().unwrap();
         h.put_addr(ip("10.9.0.1"), &Addr { seen: 1, holder: Some("d".into()), ..Addr::default() }, false).unwrap();
         assert!(fc.1.alive());
         assert!(h.claim_new(&l, "x", Some(ip("10.9.0.1"))).unwrap().gen > 1 && fc.done());
         let fc = Sleeper::new();
-        store(&h.vms("e", "lock"), &dead_owner(&h, 999_999_902, &[&fc.1]), false).unwrap();
+        store(&h.vms("e", "lock").unwrap(), &dead_owner(&h, 999_999_902, &[&fc.1]), false).unwrap();
         let _e = h.take_name("e", false).unwrap();
         assert!(fc.done());
         let fc = Sleeper::new();
@@ -2756,11 +2749,11 @@ mod tests {
         assert!(!fc.done());
         // A killed holder's name is let go of by the garbage collector; a live one's is not.
         let fc = Sleeper::new();
-        store(&h.vms("k", "lock"), &dead_owner(&h, 999_999_904, &[&fc.1]), false).unwrap();
-        std::fs::write(h.vms("k", "failed"), "why").unwrap();
+        store(&h.vms("k", "lock").unwrap(), &dead_owner(&h, 999_999_904, &[&fc.1]), false).unwrap();
+        std::fs::write(h.vms("k", "failed").unwrap(), "why").unwrap();
         collect_owned(&h.run);
-        assert!(fc.done() && !h.vms("k", "lock").exists() && h.vms("k", "failed").exists());
-        assert!(h.vms("e", "lock").exists());
+        assert!(fc.done() && !h.vms("k", "lock").unwrap().exists() && h.vms("k", "failed").unwrap().exists());
+        assert!(h.vms("e", "lock").unwrap().exists());
     }
 
     #[test]
@@ -2815,7 +2808,7 @@ mod tests {
         // `web` SIGKILLed at x (its Firecracker still running), and an earlier crash's claim at y.
         let fc = Sleeper::new();
         let dead = dead_owner(&h, 999_999_911, &[&fc.1]);
-        store(&h.vms("web", "lock"), &dead, false).unwrap();
+        store(&h.vms("web", "lock").unwrap(), &dead, false).unwrap();
         let l = h.lock().unwrap();
         h.put_addr(x, &Addr { seen: 1, holder: Some("web".into()), holder_id: Some(dead.clone()), held: 1, ..Addr::default() }, false).unwrap();
         let older = Ident { pid: 999_999_912, ..dead.clone() };
@@ -2846,14 +2839,14 @@ mod tests {
         h.release(&l, x, "web", None).unwrap();
         assert_eq!(h.addr(&l, x).unwrap().holder, None, "by name: a suspended VM's, whoever suspended it");
         // Suspended here, it holds the address of its own generation only.
-        std::fs::create_dir_all(h.suspended("s")).unwrap();
-        std::fs::write(h.suspended("s").join("manifest.json"), "").unwrap();
+        std::fs::create_dir_all(h.suspended("s").unwrap()).unwrap();
+        std::fs::write(h.suspended("s").unwrap().join("manifest.json"), "").unwrap();
         let gone = Ident { pid: 999_999_913, ..dead };
         h.put_addr(x, &Addr { seen: 5, holder: Some("s".into()), holder_id: Some(gone), held: 5, ..Addr::default() }, false).unwrap();
         assert_eq!(h.holder(&l, x).unwrap().as_deref(), Some("s"), "quarantined (no GEN): kept");
-        std::fs::write(h.suspended("s").join("GEN"), "5").unwrap();
+        std::fs::write(h.suspended("s").unwrap().join("GEN"), "5").unwrap();
         assert_eq!(h.holder(&l, x).unwrap().as_deref(), Some("s"));
-        std::fs::write(h.suspended("s").join("GEN"), "6").unwrap();
+        std::fs::write(h.suspended("s").unwrap().join("GEN"), "6").unwrap();
         assert_eq!(h.holder(&l, x).unwrap(), None, "suspended with another address");
         // Records from before instances were recorded go by the name.
         h.put_addr(x, &Addr { seen: 7, holder: Some("web".into()), held: 7, ..Addr::default() }, false).unwrap();
@@ -2882,13 +2875,13 @@ mod tests {
         claim(ips[4], "withdrawn", Some(dead(999_999_935)), 4, &|a| a.withdrawn = true);
         // Suspended here with its generation; quarantined after a resume that may have run.
         claim(ips[5], "suspended", Some(dead(999_999_936)), 4, &|_| ());
-        std::fs::create_dir_all(h.suspended("suspended")).unwrap();
-        std::fs::write(h.suspended("suspended").join("manifest.json"), "").unwrap();
-        std::fs::write(h.suspended("suspended").join("GEN"), "4").unwrap();
+        std::fs::create_dir_all(h.suspended("suspended").unwrap()).unwrap();
+        std::fs::write(h.suspended("suspended").unwrap().join("manifest.json"), "").unwrap();
+        std::fs::write(h.suspended("suspended").unwrap().join("GEN"), "4").unwrap();
         claim(ips[6], "quarantined", Some(dead(999_999_937)), 4, &|_| ());
-        std::fs::create_dir_all(h.suspended("quarantined")).unwrap();
+        std::fs::create_dir_all(h.suspended("quarantined").unwrap()).unwrap();
         for f in ["manifest.json", "GEN", "STARTED", "QUARANTINE"] {
-            std::fs::write(h.suspended("quarantined").join(f), "4").unwrap();
+            std::fs::write(h.suspended("quarantined").unwrap().join(f), "4").unwrap();
         }
         // Alive (this process, though it does not hold the name), and a record without its instance.
         claim(ips[7], "alive", Some(Ident::me()), 4, &|_| ());
@@ -2946,7 +2939,7 @@ mod tests {
         let l = h.lock().unwrap();
         assert!(h.addr(&l, ips[10]).unwrap().withdrawn);
         // Once the suspended VM is resumed and dies, its claim goes too.
-        std::fs::write(h.suspended("suspended").join("STARTED"), "").unwrap();
+        std::fs::write(h.suspended("suspended").unwrap().join("STARTED"), "").unwrap();
         drop(l);
         h.withdraw_dead().unwrap();
         assert!(h.addr(&h.lock().unwrap(), ips[5]).unwrap().withdrawn);
@@ -3365,26 +3358,26 @@ mod tests {
         std::fs::create_dir_all(dead.work_dir(&h.run).join("0/fc")).unwrap();
         assert!(reap(&h.run, &dead).is_err());
         // A name whose lock cannot be read is not free, and its address stays held.
-        std::fs::write(h.vms("u", "lock"), "{").unwrap();
+        std::fs::write(h.vms("u", "lock").unwrap(), "{").unwrap();
         let l = h.lock().unwrap();
         h.put_addr(ip("10.9.0.1"), &Addr { seen: 1, holder: Some("u".into()), held: 1, ..Addr::default() }, false).unwrap();
         assert!(h.take_name("u", false).is_err() && !h.gone("u"));
         assert_eq!(h.holder(&l, ip("10.9.0.1")).unwrap().as_deref(), Some("u"));
         collect_owned(&h.run);
-        assert!(h.vms("u", "lock").exists(), "kept by the garbage collector too");
+        assert!(h.vms("u", "lock").unwrap().exists(), "kept by the garbage collector too");
         // An empty lock (created, never written) is no holder.
-        std::fs::write(h.vms("e", "lock"), "").unwrap();
+        std::fs::write(h.vms("e", "lock").unwrap(), "").unwrap();
         assert!(h.take_name("e", false).is_ok());
         // A live holder whose lock record cannot be read keeps its address.
         let _v = h.take_name("v", false).unwrap();
         let x = h.claim_new(&l, "v", Some(ip("10.9.0.2"))).unwrap();
         for unreadable in ["{", ""] {
-            std::fs::write(h.vms("v", "lock"), unreadable).unwrap();
+            std::fs::write(h.vms("v", "lock").unwrap(), unreadable).unwrap();
             assert_eq!(h.holder(&l, x.ip).unwrap().as_deref(), Some("v"), "{unreadable:?}");
             assert!(h.claim_new(&l, "w", Some(x.ip)).is_err() && h.lend_new(&l, x.ip).is_err());
         }
         // Read, and naming another instance: not this claim's holder.
-        store(&h.vms("v", "lock"), &Ident { start: 1, ..Ident::me() }, false).unwrap();
+        store(&h.vms("v", "lock").unwrap(), &Ident { start: 1, ..Ident::me() }, false).unwrap();
         assert_eq!(h.holder(&l, x.ip).unwrap(), None);
         x.keep();
     }

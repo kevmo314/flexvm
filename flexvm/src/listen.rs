@@ -502,7 +502,7 @@ fn incoming(host: &Host, req: &Value, line: &[u8], conn: TcpStream) -> Result<()
 /// temporary file, even when the requested name already belongs to a VM.
 pub fn finish_incoming_log(host: &Host, name: &str, log: &std::path::Path, accepted: bool) -> Result<()> {
     if accepted {
-        std::fs::rename(log, host.vms(name, "log"))?;
+        std::fs::rename(log, host.vms(name, "log")?)?;
     } else {
         std::fs::remove_file(log)?;
     }
@@ -512,12 +512,11 @@ pub fn finish_incoming_log(host: &Host, name: &str, log: &std::path::Path, accep
 fn pages(host: &Host, req: &Value, conn: TcpStream) -> Result<()> {
     let name = req["name"].as_str().unwrap_or("");
     let fwd = json!({"op": "pages", "mig": req["mig"]});
-    let sent =
-        crate::host::check_name(name).and_then(|()| crate::vmproc::connect(host, name, &fwd, &[conn.as_raw_fd()], Instant::now() + Duration::from_secs(5)));
-    if let Err(e) = sent {
+    // Connected only to a valid name's socket in RUN/vms (`connect` checks it).
+    if let Err(e) = crate::vmproc::connect(host, name, &fwd, &[conn.as_raw_fd()], Instant::now() + Duration::from_secs(5)) {
         // The reason stays here: it tells what exists on this host.
         crate::log!("migration {}: page request for {name:?} refused: {e}", req["mig"]);
-        refuse(conn, &format!("vm {name:?} is not the source of migration {}", req["mig"]), Some(Duration::from_secs(1)));
+        crate::vmproc::refuse_not_source(conn, name, &req["mig"]);
     }
     Ok(())
 }
@@ -612,19 +611,30 @@ mod tests {
         // A socket the traversal name would reach, and a suspended VM.
         let outside = std::os::unix::net::UnixListener::bind(root.join("outside.sock")).unwrap();
         outside.set_nonblocking(true).unwrap();
-        std::fs::create_dir_all(host.suspended("asleep")).unwrap();
-        std::fs::write(host.suspended("asleep").join("manifest.json"), "").unwrap();
+        std::fs::create_dir_all(host.suspended("asleep").unwrap()).unwrap();
+        std::fs::write(host.suspended("asleep").unwrap().join("manifest.json"), "").unwrap();
+        // A running VM that is not the source: it refuses as `Proc::pages` does.
+        let running = std::os::unix::net::UnixListener::bind(host.sock("web").unwrap()).unwrap();
+        let vm = std::thread::spawn(move || {
+            let (c, _) = running.accept().unwrap();
+            let (line, fds) = crate::util::recv_with_fds(&c, 4096, || Ok(())).unwrap();
+            let req: Value = serde_json::from_slice(&line).unwrap();
+            let fd = fds.into_iter().next().unwrap();
+            crate::vmproc::refuse_not_source(TcpStream::from(fd), "web", &req["mig"]);
+        });
         let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
         let ask = |name: &str| {
             let mut c = TcpStream::connect(tcp.local_addr().unwrap()).unwrap();
             pages(&host, &json!({"op": "pages", "name": name, "mig": 7}), tcp.accept().unwrap().0).unwrap();
-            let mut reply = String::new();
-            c.read_to_string(&mut reply).unwrap();
-            serde_json::from_str::<Value>(&reply).unwrap()["error"].as_str().unwrap().to_string()
+            let mut reply = Vec::new();
+            c.read_to_end(&mut reply).unwrap();
+            String::from_utf8(reply).unwrap()
         };
-        for name in ["../../outside", "asleep", "nothing"] {
-            assert_eq!(ask(name), format!("vm {name:?} is not the source of migration 7"));
+        let refusal = |name: &str| format!("{}\n", json!({"ok": false, "error": format!("vm {name:?} is not the source of migration 7")}));
+        for name in ["../../outside", "asleep", "nothing", "web"] {
+            assert_eq!(ask(name), refusal(name), "{name}");
         }
+        vm.join().unwrap();
         assert_eq!(outside.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
     }
 
@@ -660,7 +670,7 @@ mod tests {
         let root = crate::test_util::TempDir::new("arrival-log");
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
         let arrival = host.run.join("vms/.incoming.log");
-        let existing = host.vms("web", "log");
+        let existing = host.vms("web", "log").unwrap();
         std::fs::write(&existing, b"existing vm").unwrap();
         std::fs::write(&arrival, b"refused").unwrap();
         finish_incoming_log(&host, "web", &arrival, false).unwrap();
