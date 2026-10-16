@@ -664,6 +664,12 @@ failed (an error answer, a timeout, a Firecracker that died) fails the `run`
 instead: Firecracker resumes vCPUs one by one, so the guest may have run, and
 a second copy could repeat what it did.
 
+A claimed or cold `run` binds its control socket before its registry entry
+first says running, so a control call made as soon as the entry appears
+connects; a failed bind fails the start. A claim's timings split `neighbour`
+(tap and neighbour setup), `fence` (host lock and generation check) and
+`route` (the route replacement).
+
 - **Count.** `flexvm standby [--template T] N` keeps N; each claimed one starts
   its replacement, none start while the host is under its reserve, and the
   memory controller stops them all when the host goes under it.

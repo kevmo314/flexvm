@@ -3559,6 +3559,14 @@ def standby():
     check("standby: a claim loads no snapshot, a cold run does",
           "snapshot_load" not in claimed.get("timings_ms", {}) and "snapshot_load" in r.get("timings_ms", {}),
           (claimed.get("timings_ms"), r.get("timings_ms")))
+    # A claim only prepares the existing tap, fences its generation, and replaces
+    # the route before resuming. Keep these separate: the fence can wait for the
+    # host lock; each netlink request can wait for RTNL shared by all CI lanes.
+    phases = claimed.get("timings_ms", {})
+    check("standby: tap preparation, fence and route are timed separately",
+          all(isinstance(phases.get(k), (int, float)) for k in ("neighbour", "fence", "route", "resume")), phases)
+    route = peer_route(claimed["ip"])
+    check("standby: claimed address routes directly to its tap", " dev " in " " + route and " via " not in " " + route, route)
     cleanup("ft-sb1")
     cleanup("ft-sb2")
 
@@ -7161,16 +7169,23 @@ def cmd_flag():
     try:
         live = lambda: len([f for f in os.listdir(standby_dir(A.run, t)) if f.endswith(".lock") and alive(f[:-5].split("-")[0])])
         check("cmd flag: a standby ready", wait_for(lambda: live() == 1, 60), live())
+        # Hold the old publish-before-bind window open deterministically.
+        clear_gate(A, "claim_stall")
+        fault(A, "claim_stall", 60000)
         p = subprocess.Popen([BIN, "--state", A.state, "--run", A.run, "run", n, "--template", t, "--", "sleep 600"],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=ENV, start_new_session=True)
+        check("cmd flag: claimed VM reached the reply gate", wait_for(lambda: reached(A, "claim_stall"), 60))
         e = first_entry(A, n)
         check("cmd flag: a claimed standby is published as a cmd vm", e is not None and e.get("cmd") is True, e)
-        wait_for(lambda: vms(A).get(n, {}).get("state") == "running", 30)
+        check("cmd flag: control socket bound at first publication",
+              os.path.exists(os.path.join(A.run, "vms", f"{n}.sock")), e)
+        fault(A, "claim_stall", 0)
         m = migrate(A, n, B)
         check("cmd flag: migrate refuses it, saying why", not m["ok"] and "cannot migrate" in m["error"], m)
         os.kill(p.pid, signal.SIGINT)
         check("cmd flag: its command's end still ends it", p.wait(timeout=30) == 130)
     finally:
+        fault(A, "claim_stall", 0)
         ok(cli_json(A, "standby", "--template", t, "0"))
     clear_log(A, r)
     started = ok(cli_json(A, "run", r, "--template", t, "-d", "--", "sleep 600"))
