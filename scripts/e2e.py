@@ -82,7 +82,8 @@ os.makedirs(args.log_dir, exist_ok=True)
 
 def flexvm(*argv, timeout=180, check=True, env=None):
     """Runs the flexvm CLI; returns the CompletedProcess."""
-    r = subprocess.run([BIN, "--state", BUILD, *argv], capture_output=True, text=True, timeout=timeout,
+    # A run directory belongs to one state directory, so BUILD has its own (a Host's --run follows and wins).
+    r = subprocess.run([BIN, "--state", BUILD, "--run", os.path.join(RUN, "build"), *argv], capture_output=True, text=True, timeout=timeout,
                        env=env)
     if check and r.returncode != 0:
         raise AssertionError(f"flexvm {' '.join(argv)} exited {r.returncode}: {r.stderr.strip()}")
