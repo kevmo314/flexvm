@@ -66,6 +66,7 @@ fn main() {
         }
         mem::start();
     }
+    app::init();
     let statuses = Statuses::default();
     let reaped = statuses.clone();
     thread::spawn(move || reap(reaped));

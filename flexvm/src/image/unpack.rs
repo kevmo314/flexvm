@@ -82,6 +82,12 @@ pub fn open_at(dir: RawFd, name: &CStr, flags: i32) -> Result<OwnedFd> {
     crate::util::openat(dir, name, flags).map_err(|e| format!("open {name:?}: {e}").into())
 }
 
+/// Gives an injected file to the builder: root in production (unpacking chowns to any image uid),
+/// the test user in an unprivileged test run.
+fn own(fd: &impl AsRawFd, rel: &Path) -> Result<()> {
+    check(unsafe { libc::fchown(fd.as_raw_fd(), libc::geteuid(), libc::getegid()) }, "chown", rel)
+}
+
 pub fn open_dir_at(dir: RawFd, name: &CStr) -> Result<OwnedFd> {
     crate::util::open_dir_at(dir, name).map_err(|e| format!("open {name:?}: {e}").into())
 }
@@ -598,12 +604,23 @@ impl Root {
         Ok(())
     }
 
+    /// An injected config directory must not retain an image user's ownership or write access.
+    pub fn secure_dir(&mut self, rel: &str, mode: u32) -> Result<()> {
+        self.ensure_dir(rel, mode)?;
+        let at = self.at(Path::new(rel))?;
+        let dir = open_dir_at(at.dir.as_raw_fd(), &at.name)?;
+        own(&dir, Path::new(rel))?;
+        check(unsafe { libc::fchmod(dir.as_raw_fd(), mode) }, "chmod", Path::new(rel))?;
+        Ok(())
+    }
+
     pub fn write_file(&mut self, rel: &str, data: &[u8], mode: u32) -> Result<()> {
         let at = self.at(Path::new(rel))?;
         self.check_entry_limit()?;
         let mut f = at.create()?;
         self.entries += 1;
         f.write_all(data)?;
+        own(&f, Path::new(rel))?;
         check(unsafe { libc::fchmod(f.as_raw_fd(), mode) }, "chmod", Path::new(rel))?;
         Ok(())
     }
