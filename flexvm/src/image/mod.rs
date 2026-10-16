@@ -877,6 +877,24 @@ mod tests {
     }
 
     #[test]
+    fn image_config_preserves_carriage_returns_through_injection() {
+        let config = json!({"config": {
+            "Entrypoint": ["/bin/app\r"], "Cmd": ["\r", " a\r\nb\\r \t\r", ""],
+            "Env": ["FOO=bar\r", "EMPTY=", "CR=\r"], "WorkingDir": "/srv\r",
+        }});
+        let app = app_config(&config, &Options::default()).unwrap();
+        assert_eq!(app.argv, ["/bin/app\r", "\r", " a\r\nb\\r \t\r", ""]);
+        assert_eq!(app.env, ["FOO=bar\r", "EMPTY=", "CR=\r"]);
+        assert_eq!(app.workdir, "/srv\r");
+        let dir = tmpdir("conf-cr");
+        let mut root = Root::open(&dir, Limits::default()).unwrap();
+        let conf = inject(&mut root, &app, b"init").unwrap();
+        assert!(conf.starts_with("arg /bin/app\r\narg \r\narg  a\r\\nb\\\\r \t\r\narg \nenv FOO=bar\r\nenv EMPTY=\nenv CR=\r\n"));
+        assert!(conf.contains("\ncwd /srv\r\n"));
+        assert_eq!(root.read("etc/flexvm/app.conf").unwrap(), conf.as_bytes());
+    }
+
+    #[test]
     fn overrides() {
         let config = json!({"config": {
             "Entrypoint": ["/docker-entrypoint.sh"], "Cmd": ["nginx", "-g", "daemon off;"],

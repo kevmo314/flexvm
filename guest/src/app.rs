@@ -110,7 +110,8 @@ fn unescape(s: &str) -> String {
 fn parse_conf(text: &str) -> io::Result<Conf> {
     let mut c = Conf { argv: vec![], env: vec![], cwd: "/".into(), uid: 0, gid: 0, groups: vec![] };
     let num = |v: &str| v.trim().parse::<u32>().map_err(|_| io::Error::other(format!("{CONF}: bad id {v:?}")));
-    for line in text.lines() {
+    // Only LF delimits records; str::lines() also removes a value's trailing CR.
+    for line in text.split('\n') {
         let (k, v) = line.split_once(' ').unwrap_or((line, ""));
         match k {
             "arg" => c.argv.push(unescape(v)),
@@ -613,6 +614,18 @@ mod tests {
         assert_eq!(at, end, "the reader ends exactly where the output does");
         let tail = data.len() - b"crash-tail\n".len();
         assert!(data[..tail].iter().all(|&b| b == b'x') && &data[tail..] == b"crash-tail\n");
+    }
+
+    #[test]
+    fn conf_preserves_whitespace_and_carriage_returns() {
+        let c = parse_conf("arg /bin/app\r\narg \r\narg  a\r\\nb\\\\r \t\r\nenv FOO=bar\r\nenv EMPTY=\nenv CR=\r\ncwd /srv\r\n").unwrap();
+        assert_eq!(c.argv, ["/bin/app\r", "\r", " a\r\nb\\r \t\r"]);
+        assert_eq!(c.env, [("FOO".into(), "bar\r".into()), ("EMPTY".into(), "".into()), ("CR".into(), "\r".into())]);
+        assert_eq!(c.cwd, "/srv\r");
+        let cmd = command(&c, &c.argv);
+        assert_eq!(cmd.get_program(), "/bin/app\r");
+        assert_eq!(cmd.get_args().collect::<Vec<_>>(), ["\r", " a\r\nb\\r \t\r"]);
+        assert!(cmd.get_envs().any(|(k, v)| k == "FOO" && v == Some(std::ffi::OsStr::new("bar\r"))));
     }
 
     #[test]
