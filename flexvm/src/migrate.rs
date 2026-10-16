@@ -646,6 +646,7 @@ impl Proc {
             };
             let fence = Instant::now();
             crate::host::stall("handoff_stall");
+            crate::host::gate("handoff_gate");
             if hold::wait_start(&mut r, (fence + HOLD_FENCE).min(deadline)) {
                 if let Some(reported) = hold::receive(&mut r, vm.ip, &vm.tap, &revoked, (Instant::now() + HELD_STREAM).min(deadline), &mut take_over) {
                     vm.tap_drops_reported(reported);
@@ -735,6 +736,17 @@ impl Proc {
             }
             p.held_in.lock().unwrap().take();
             p.announce();
+            // Defer both revision fsyncs (file, then addrs directory) until after the reply and
+            // packet handoff, so the disk never delays the route switch. The old durable claim still
+            // has the generation, owner and `arriving` migration; only the routing revision lags,
+            // which this process answers for meanwhile (`listen::live`), so a late announcement of
+            // the source's is still stale here (#533). The durable commit prevents a live target from
+            // answering aborted; after its death, mig_status reaps it before allowing the source to
+            // resume. Neither decision depends on the revision. Keep write_file's file-before-rename
+            // ordering here so a crash cannot corrupt the old claim.
+            if let Err(e) = p.host.lock().and_then(|l| p.advance(&l, 0)) {
+                crate::log!("vm {}: recording its revision: {e}", p.name());
+            }
         });
         let p = self.clone();
         let source = req["source"].as_str().unwrap_or("").to_string();
@@ -893,12 +905,8 @@ impl Proc {
                     bail!("injected fault: committing failed");
                 }
                 self.arrived.lock().unwrap().as_mut().ok_or("no migration record")?.commit(&l)?;
-                // Only now its revision outranks the source's (`claim_arrival`). Recorded before the
-                // source has its answer: a record behind it would take the source's late announcement
-                // as current and name the source as the way to the address (#499, #492).
-                if let Err(e) = self.advance(&l, 0) {
-                    crate::log!("vm {name}: recording its revision: {e}");
-                }
+                // Only now its revision outranks the source's (`claim_arrival`); recorded after the
+                // reply and handoff (`migrate_in`). Until then this process answers for it (below).
                 Ok(l)
             }),
         };
@@ -912,6 +920,12 @@ impl Proc {
         t.mark("register");
         // Its memory mark is set once the source has its answer (`migrate_in`).
         self.adopt(vm.clone());
+        // Before the host lock is let go: from the commit on, a listener judging an announcement of
+        // the address asks this process for its revision, which its record trails until the deferred
+        // write (#533). Failing, the reply's turn (`migrate_in`) tries again and refuses the arrival.
+        if let Err(e) = self.serve_control() {
+            crate::log!("vm {name}: {e}");
+        }
         if !paused {
             if let Err(e) = vm.start(fault("resume_kill")) {
                 crate::log!("vm {name}: resuming after migration {} failed: {e}", source.mig);

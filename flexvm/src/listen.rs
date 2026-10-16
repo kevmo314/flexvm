@@ -647,7 +647,7 @@ fn lend(host: &Host, req: &Value) -> Result<Value> {
 /// Stale generations and revisions (see `host::Addr`) are ignored; an
 /// address a VM here holds keeps its local route.
 /// Test fault `route_refuse`: refused, as by a listener that is down.
-fn route(host: &Host, req: &Value, peers: &[IpAddr]) -> Result<Value> {
+pub(crate) fn route(host: &Host, req: &Value, peers: &[IpAddr]) -> Result<Value> {
     if fault("route_refuse") {
         bail!("injected fault: route messages refused");
     }
@@ -667,7 +667,8 @@ fn route(host: &Host, req: &Value, peers: &[IpAddr]) -> Result<Value> {
         }
     }
     let l = host_lock(host)?;
-    if !host.observe(&l, ip, gen, rev, via)? {
+    let stale = via.is_some() && live(host, &l, ip).is_some_and(|now| (gen, rev) < now);
+    if stale || !host.observe(&l, ip, gen, rev, via)? {
         return Ok(json!({"ip": ip.to_string(), "stale": true}));
     }
     let local = host.keeps_route(&l, ip, gen)?;
@@ -678,6 +679,27 @@ fn route(host: &Host, req: &Value, peers: &[IpAddr]) -> Result<Value> {
         }
     }
     Ok(json!({"ip": ip.to_string(), "local": local}))
+}
+
+/// The generation and revision a VM process here holding `ip` runs at, which its record may trail
+/// (a write being retried, an arrival's recorded only after its handoff: #533); None if none holds
+/// it or it cannot tell within `vmproc::LIVE_WAIT`, when the record decides alone. Asked under the
+/// host lock, outside which neither changes, and bounded: the answer takes no lock the lock's
+/// holders wait on, so only a process that cannot answer (stopped, say) keeps the lock that long.
+pub(crate) fn live(host: &Host, l: &crate::host::Locked, ip: Ipv4Addr) -> Option<(u64, u64)> {
+    let (name, id) = host.holding(l, ip).ok().flatten()?;
+    match crate::vmproc::live_rev(host, &name, &id, ip, Instant::now() + crate::vmproc::LIVE_WAIT) {
+        Ok(now) => Some(now),
+        Err(e) => {
+            // No socket: suspended, or not running yet.
+            let absent =
+                e.downcast_ref::<std::io::Error>().is_some_and(|e| matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused));
+            if !absent {
+                crate::log!("route {ip}: asking vm {name:?} for its revision: {e}; going by the record");
+            }
+            None
+        }
+    }
 }
 
 /// A peer routes only a VM's address, never one this host reaches its peers or network by (#365).

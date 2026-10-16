@@ -1163,10 +1163,20 @@ impl Proc {
             "migrate" => self.migrate(req["to"].as_str().unwrap_or(""), req["if_idle"] == true, req["evict"] == true),
             "debug" => self.debug(&req),
             "resume" => self.resume_request(),
+            "addr" => self.live_addr(),
             "claim" => Err("this vm is not a standby vm".into()),
             op => Err(format!("unknown op {op:?}").into()),
         };
         let _ = send_json(&mut &c, &reply.map_or_else(|e| json!({"ok": false, "error": e.to_string()}), |v| json!({"ok": true, "result": v})));
+    }
+
+    /// This process and its address as the VM has it now, which the host's record may trail (#533):
+    /// what the listener asks, holding the host lock, before it takes an announcement of the address.
+    /// Takes `addr` alone: never the host lock, nor a lock anything holds while it waits for that.
+    /// Served only once the revision is the VM's own: an arrival binds its control socket at its commit.
+    fn live_addr(&self) -> Result<Value> {
+        let (ip, gen, rev) = self.addr.lock().unwrap().as_ref().map(|a| (a.ip, a.gen, a.rev)).ok_or("no address")?;
+        Ok(json!({"ident": self.ident, "ip": ip.to_string(), "gen": gen, "rev": rev}))
     }
 
     fn pages(&self, req: &Value, fds: Vec<OwnedFd>, slot: Slot) {
@@ -2587,6 +2597,29 @@ pub fn connect(host: &Host, name: &str, req: &Value, fds: &[i32], at: Instant) -
     Ok(c)
 }
 
+/// How long the listener waits for a holder's answer (`live_rev`), holding the host lock.
+pub const LIVE_WAIT: Duration = Duration::from_millis(250);
+
+/// The generation and revision of `ip` the VM process `id`, holding it under `name`, runs at now,
+/// as it says by `at` (`live_addr`); an error if that cannot be told, or the process that answers
+/// is not `id` or holds another address.
+pub fn live_rev(host: &Host, name: &str, id: &Ident, ip: Ipv4Addr, at: Instant) -> Result<(u64, u64)> {
+    let c = crate::util::connect_unix(&host.sock(name)?, at.saturating_duration_since(Instant::now()))?;
+    // The process that listens: `id` itself, not one that got its pid since.
+    let pid = crate::util::peer_pid(&c)?;
+    if pid != id.pid || Ident::of(pid).as_ref() != Some(id) {
+        bail!("vm {name:?}'s control socket is another process's ({pid})");
+    }
+    crate::util::send_with_fds(&c, b"{\"op\":\"addr\"}\n", &[], at)?;
+    let reply = crate::util::recv_json(&mut BufReader::new(crate::util::By { s: c, at }))?;
+    let live = answer(reply, &format!("vm {name}"), "refused")?;
+    let ident: Option<Ident> = serde_json::from_value(live["ident"].clone()).ok();
+    if ident.as_ref() != Some(id) || live["ip"].as_str() != Some(&ip.to_string()) {
+        bail!("vm {name:?} holds something else: {live}");
+    }
+    Ok((live["gen"].as_u64().ok_or("no generation")?, live["rev"].as_u64().ok_or("no revision")?))
+}
+
 /// With `at`, connected, sent and answered by then; otherwise only connecting and sending time out.
 pub fn call(host: &Host, name: &str, req: Value, at: Option<Instant>) -> Result<Value> {
     let c = connect(host, name, &req, &[], at.unwrap_or_else(|| Instant::now() + Duration::from_secs(10)))?;
@@ -3068,6 +3101,69 @@ mod tests {
         send_json(&mut c, &json!({"op": "unknown"})).unwrap();
         let reply = crate::util::recv_json(&mut BufReader::new(c)).unwrap().unwrap();
         assert_eq!(reply["error"], "unknown op \"unknown\"");
+    }
+
+    /// #533: the listener, holding the host lock, asks an address's holder here for the revision it
+    /// runs at, which its record may trail; the answer takes no host lock. An announcement older than
+    /// it is stale, and only the holder's own process, about that address, is believed.
+    #[test]
+    fn announcements_are_judged_by_the_holders_live_revision() {
+        let (p, _root) = test_proc("live-rev");
+        p.set_name(p.host.take_name("live", false).unwrap());
+        let claim = p.host.claim_new(&p.host.lock().unwrap(), "live", None).unwrap();
+        let gen = claim.gen;
+        let ip = p.set_addr(claim);
+        // Without a control socket (not running yet, or suspended), the record decides.
+        assert_eq!(crate::listen::live(&p.host, &p.host.lock().unwrap(), ip), None);
+        p.serve_control().unwrap();
+        // The VM runs at revision 2; its record is still at 0.
+        p.addr.lock().unwrap().as_mut().unwrap().rev = 2;
+        {
+            let l = p.host.lock().unwrap();
+            assert_eq!(p.host.addr(&l, ip).unwrap().rev, 0);
+            assert_eq!(crate::listen::live(&p.host, &l, ip), Some((gen, 2)));
+        }
+        let announce = |gen: u64, rev: u64| {
+            let req = json!({"op": "route", "ip": ip.to_string(), "via": "10.1.0.1", "gen": gen, "rev": rev});
+            // Asked again while busy: other tests may hold the host lock's process-wide half a while.
+            let end = Instant::now() + Duration::from_secs(60);
+            loop {
+                match crate::listen::route(&p.host, &req, &[]) {
+                    Err(e) if e.to_string() == "host busy, try again" && Instant::now() < end => continue,
+                    r => break r.unwrap(),
+                }
+            }
+        };
+        for (g, rev) in [(gen, 0), (gen, 1)] {
+            assert_eq!(announce(g, rev)["stale"], true, "{g} {rev}");
+        }
+        let a = p.host.addr(&p.host.lock().unwrap(), ip).unwrap();
+        assert_eq!((a.seen, a.rev, a.via), (gen, 0, None), "{a:?}");
+        let (me, by) = (Ident::me(), || Instant::now() + LIVE_WAIT);
+        assert_eq!(live_rev(&p.host, "live", &me, ip, by()).unwrap(), (gen, 2));
+        // Another instance (its pid reused), another process, or another address: not believed.
+        for id in [Ident { start: me.start + 1, ..me.clone() }, Ident { pid: 1, ..me.clone() }] {
+            let e = live_rev(&p.host, "live", &id, ip, by()).unwrap_err();
+            assert!(e.to_string().contains("another process's"), "{e}");
+        }
+        let e = live_rev(&p.host, "live", &me, "10.1.2.3".parse().unwrap(), by()).unwrap_err();
+        assert!(e.to_string().contains("holds something else"), "{e}");
+    }
+
+    /// #533: a holder that never answers (stopped, say) holds the asking listener, and its host
+    /// lock, `LIVE_WAIT` at most; the record decides then.
+    #[test]
+    fn a_holder_that_never_answers_is_waited_for_a_bounded_time() {
+        let (p, _root) = test_proc("live-mute");
+        p.set_name(p.host.take_name("mute", false).unwrap());
+        let claim = p.host.claim_new(&p.host.lock().unwrap(), "mute", None).unwrap();
+        let ip = p.set_addr(claim);
+        let _mute = UnixListener::bind(p.host.sock("mute").unwrap()).unwrap();
+        // Timed from the lock on: other tests may hold its process-wide half a while.
+        let l = p.host.lock().unwrap();
+        let start = Instant::now();
+        assert_eq!(crate::listen::live(&p.host, &l, ip), None);
+        assert!(start.elapsed() >= LIVE_WAIT && start.elapsed() < LIVE_WAIT + Duration::from_secs(1), "{:?}", start.elapsed());
     }
 
     #[test]

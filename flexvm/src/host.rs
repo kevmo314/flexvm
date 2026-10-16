@@ -1064,6 +1064,12 @@ impl Host {
         Ok(self.addr(l, ip)?.current(gen))
     }
 
+    /// The VM process holding `ip` here, by its name and instance.
+    pub fn holding(&self, l: &Locked, ip: Ipv4Addr) -> Result<Option<(String, Ident)>> {
+        let a = self.addr(l, ip)?;
+        Ok(self.held(&a).then_some(a.holder.zip(a.holder_id)).flatten())
+    }
+
     pub fn holder(&self, l: &Locked, ip: Ipv4Addr) -> Result<Option<String>> {
         let a = self.addr(l, ip)?;
         Ok(self.held(&a).then_some(a.holder).flatten())
@@ -4308,10 +4314,10 @@ mod tests {
         assert_eq!(before.rev, 0, "the incoming revision must not outrank the source before commit");
         record.commit(&l).unwrap();
         drop(l);
-        assert_eq!(h.mig_status(1).unwrap(), "committed", "a live target owns it even without its revision recorded (advance is best effort)");
+        assert_eq!(h.mig_status(1).unwrap(), "committed", "a live target owns it even before the deferred revision write");
         assert_eq!(h.addr(&h.lock().unwrap(), x).unwrap(), before);
 
-        // Model a crash before the revision is recorded: the durable claim and commit
+        // Model a crash before the deferred write: the durable claim and commit
         // remain, with a dead owner. Recovery must clear that arrival before it
         // tells the source it may resume; no routing revision is needed.
         let dead = dead_owner(&h, 999_999_950, &[]);
