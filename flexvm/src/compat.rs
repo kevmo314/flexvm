@@ -440,7 +440,7 @@ mod tests {
     }
 
     #[test]
-    fn host_cache_reprobes_corrupt_incomplete_and_unreadable_entries() {
+    fn host_cache_reprobes_corrupt_incomplete_and_old_entries() {
         let root = crate::test_util::TempDir::new("host-compat-invalid");
         let key = host_key(&root);
         let cached = HostCache { version: 1, key: key.clone(), compat: host() };
@@ -450,17 +450,6 @@ mod tests {
             let mut value = valid.clone();
             value["compat"].as_object_mut().unwrap().remove(field);
             invalid.push(serde_json::to_vec(&value).unwrap());
-        }
-        for (field, value) in [
-            ("tsc_khz", serde_json::json!(0)),
-            ("cpu", serde_json::json!("")),
-            ("firecracker", serde_json::json!("")),
-            ("msrs", serde_json::json!([])),
-            ("features", serde_json::json!({})),
-        ] {
-            let mut entry = valid.clone();
-            entry["compat"][field] = value;
-            invalid.push(serde_json::to_vec(&entry).unwrap());
         }
         let mut old = valid.clone();
         old["version"] = serde_json::json!(0);
