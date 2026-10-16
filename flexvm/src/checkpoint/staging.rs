@@ -30,23 +30,10 @@ pub(super) fn publish_permissions(files: &[RawFd], dir: RawFd, owner: &libc::sta
     Ok(())
 }
 
-/// Lets go of an fd's flock when dropped, explicitly: not only by its close,
-/// which a child another thread forked meanwhile delays (see `host::Flock`).
-struct Unlock(RawFd);
-
-impl Drop for Unlock {
-    fn drop(&mut self) {
-        unsafe { libc::flock(self.0, libc::LOCK_UN) };
-    }
-}
-
-/// Unlinks a lock file when dropped, before its `Unlock` lets go of it.
-struct Unlink(PathBuf);
-
-impl Drop for Unlink {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
+/// The lock on a checkpoint destination's directory (`st`, its stat) while staging is made
+/// there and stale staging cleared: one per directory on the host, whichever instance.
+pub(super) fn parent_lock(st: &libc::stat, how: i32) -> io::Result<crate::host::HeldLock> {
+    crate::host::lock_at(crate::host::host_locks()?, &crate::host::keyed("checkpoint", st, ""), how)
 }
 
 pub(super) const STAGING_PREFIX: &str = ".flexvm-staging-";
@@ -97,23 +84,25 @@ impl Staging {
         ensure!(crate::util::stat_at(pfd.as_raw_fd(), &base).is_none(), "{} already exists; checkpoints are never overwritten", dest.display());
         // Ancestors need durability only at publication. Walk once in commit, using
         // the pinned directory's then-current ancestry (it may move during the write).
-        // Not in the directory, which its owner may change: in root's, by the directory's (dev, inode).
-        let st = fstat(pfd.as_raw_fd())?;
-        let locks = crate::host::run_dir().map(Path::to_path_buf).or_else(|| vmstate.parent().map(Path::to_path_buf)).ok_or("no run directory")?;
-        let lock_path = crate::host::locks(&locks).join("checkpoints").join(format!("{}-{}", st.st_dev, st.st_ino));
-        let parent_lock = crate::host::lock_path(&lock_path, libc::LOCK_EX)?;
-        // Let go on error paths too, before the descriptor closes, and unlinked while held
-        // (a taker re-checks the path); on success, the private staging directory takes
-        // over exclusion below.
-        let _parent_lock = (Unlink(lock_path), Unlock(parent_lock.as_raw_fd()));
+        // Not in the directory, which its owner may change: in the host's own lock directory,
+        // shared by every instance, by the directory's (dev, inode). Unlinked while held when
+        // dropped, on error paths too; on success, the private staging directory takes over
+        // exclusion below.
+        let _parent_lock = parent_lock(&fstat(pfd.as_raw_fd())?, libc::LOCK_EX)?;
         clear_stale_fd(&pfd);
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().subsec_nanos();
         let outer_name = cname(&format!("{STAGING_PREFIX}{}-{nanos:x}", std::process::id()));
         check(unsafe { libc::mkdirat(pfd.as_raw_fd(), outer_name.as_ptr(), 0o700) })?;
         let outer = open_dir_at(pfd.as_raw_fd(), &outer_name).inspect_err(|_| remove_staging(pfd.as_raw_fd(), &outer_name, -1, None))?;
         let ck = (|| -> Result<_> {
-            check(unsafe { libc::flock(outer.as_raw_fd(), libc::LOCK_EX) })?;
+            // Checked before it is locked: the directory's owner may have put another in its
+            // place, perhaps one locked to hold this up. Ours is new, so never locked.
             ensure!(private_dir(outer.as_raw_fd()), "staging directory in {} was replaced", parent_path.display());
+            ensure!(
+                unsafe { libc::flock(outer.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
+                "staging directory in {} was replaced",
+                parent_path.display()
+            );
             check(unsafe { libc::mkdirat(outer.as_raw_fd(), c"ck".as_ptr(), 0o700) })?;
             Ok(open_dir_at(outer.as_raw_fd(), c"ck")?)
         })()

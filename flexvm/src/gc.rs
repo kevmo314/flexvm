@@ -124,9 +124,9 @@ fn vm_files(host: &Host) {
         let Ok(suspended) = host.suspended(name) else { continue };
         let orphan = host.holder_gone(name) && !suspended.exists() && !["failed", "moved"].iter().any(|ext| host.vms(name, ext).is_ok_and(|p| p.exists()));
         if orphan {
+            // Its writers' lock (`output::log_lock`) stays: one may have it open, not yet
+            // locked, and a new one would let two writers rotate at once.
             let _ = std::fs::remove_file(&path);
-            // Its writers' lock (`output::log_lock`), with it.
-            let _ = crate::util::output::log_lock(&path).map(std::fs::remove_file);
         }
     }
 }
@@ -269,6 +269,24 @@ mod tests {
         std::fs::remove_dir_all(host.suspended("sleeping").unwrap()).unwrap();
         vm_files(&host);
         assert!(logs.iter().all(|p| !p.exists()), "without its snapshot the old logs are orphaned");
+    }
+
+    /// An orphaned log goes; its writers' lock stays, since a writer may have it open,
+    /// not yet locked, and a new one would let two writers rotate at once.
+    #[test]
+    fn a_logs_writer_lock_outlives_the_log() {
+        let d = dir("writer-lock");
+        let host = Host::open(&d.join("state"), &d.join("run")).unwrap();
+        let log = host.vms("gone", "log").unwrap();
+        assert!(crate::util::output::append_capped(&log, b"x\n", 1 << 20));
+        File::options().append(true).open(&log).unwrap().set_modified(SystemTime::now() - ORPHAN_LOG_TTL - Duration::from_secs(60)).unwrap();
+        let lock = crate::util::output::log_lock(&log).unwrap();
+        let writer = File::open(&lock).unwrap();
+        vm_files(&host);
+        assert!(!log.exists() && lock.exists(), "the log goes, its lock stays");
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(writer.metadata().unwrap().ino(), std::fs::metadata(&lock).unwrap().ino());
+        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]

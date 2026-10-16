@@ -628,7 +628,7 @@ fn cached_blob<R: Read>(digest: &str, size: u64, blobs: &Path, download: impl Fn
 }
 
 pub(super) fn sweep_parts(dir: &Path) {
-    let Ok(dir_lock) = crate::host::private_file(&super::publish_lock(dir)) else { return };
+    let Ok(dir_lock) = super::publish_lock(dir) else { return };
     let Ok(_lock) = crate::host::Flock::new(dir_lock, libc::LOCK_EX | libc::LOCK_NB) else { return };
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {

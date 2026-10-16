@@ -169,8 +169,7 @@ RUN (default /run/flexvm, tmpfs)
   .gens.next             the next generation, with the boot id and the synced mark it is under; trusted only while
                          addrs/.gens holds that mark, else the next generation reserves and syncs a new one
   .locks/                root's locks (0700): gc (one sweep at a time), logs (logs are opened holding it
-                         shared, swept holding it exclusively), owed, retire, withdrawals, checkpoints/DEV-INO
-                         (a checkpoint destination's directory, by its device and inode, while staging is made)
+                         shared, swept holding it exclusively), owed, retire, withdrawals
   .locks/holds/ID-MIB    memory admitted to a live process, flocked by it (`.ID` while being made)
   grants-BOOTID          recent grants not yet held, counted against the reserve
   evict.active           present while the host is under its eviction mark
@@ -193,14 +192,24 @@ RUN (default /run/flexvm, tmpfs)
                          Firecracker a directory with `fc` (its pid and start time)
 ```
 
-Every lock flexvm flocks is a file in a `.locks` directory (0700, root's; the
-file 0600) beside what it guards: Linux grants an exclusive flock through a
+Every lock flexvm flocks is a 0600 file in a directory only root may enter
+(0700, root's), opened relative to that directory's descriptor once it was
+checked, never through a link: Linux grants an exclusive flock through a
 read-only descriptor, so a lock any user can open is one any user can hold.
-Readable files and directories (logs, checkpoint directories, the state root)
-are never flocked. A non-root `flexvm ls` opens the state root without its lock
-and shows entries whose process is alive, without the lock's check. Files of the
-older layout (`STATE/lock` and the like) are never used; running older and newer
-flexvm binaries on one host at once is unsupported.
+Locks on what is in `STATE` and `RUN` are in a `.locks` directory beside it.
+Locks on what may lie where other users can write are in the host's own lock
+directory, `/run/flexvm-locks`, shared by every instance whatever its `--state`
+and `--run`, each named for its target directory's (dev, inode): a checkpoint
+destination's (`checkpoint-DEV-INO`, held while staging is made there and stale
+staging cleared), an image directory's (`image-DEV-INO-KEY.lock`,
+`publish-DEV-INO`) and the templates directory's (`templates-DEV-INO`,
+`verify-DEV-INO-ID`, `template-new-DEV-INO-STAGING`). Readable files and
+directories (logs, checkpoint directories, the state root) are never flocked; a
+log's writers' lock stays when the log goes. A non-root `flexvm ls` opens the
+state root without its lock and shows entries whose process is alive, without
+the lock's check. Files of the older layout (`STATE/lock` and the like) are
+never used; running older and newer flexvm binaries on one host at once is
+unsupported.
 
 **Liveness** is the name lock: a registry entry whose `.lock` can be locked
 belongs to a dead process and is ignored; an entry is believed only for the

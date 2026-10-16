@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -2651,23 +2651,107 @@ pub fn locks(dir: &Path) -> PathBuf {
 pub const LOCKS: &str = ".locks";
 
 /// A lock file, made (0600) if missing, in a directory only this user may enter,
-/// made (0700) if missing: one that is not is refused, never repaired.
+/// made (0700) if missing: one that is not is refused, never repaired. Opened
+/// relative to the directory as validated, so no swap of it reaches the open.
 pub fn private_file(path: &Path) -> std::io::Result<File> {
-    let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    private_dir(dir)?;
-    File::options().create(true).truncate(false).read(true).write(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(path)
+    let (dir, name) = split(path)?;
+    open_lock(&lock_dir(dir)?, name)
+}
+
+/// `path`'s directory and file name, as `lock_dir` and `open_lock` take them.
+fn split(path: &Path) -> std::io::Result<(&Path, &std::ffi::OsStr)> {
+    let name = path.file_name().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{}: no file name", path.display())))?;
+    Ok((path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")), name))
 }
 
 pub fn private_dir(path: &Path) -> std::io::Result<()> {
+    lock_dir(path).map(drop)
+}
+
+/// A directory only this user may enter (0700, its own; made if missing), opened
+/// without following a link at its last component and checked through that
+/// descriptor: locks are opened relative to it (`open_lock`).
+pub fn lock_dir(path: &Path) -> std::io::Result<OwnedFd> {
     match std::fs::DirBuilder::new().recursive(true).mode(0o700).create(path) {
         Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e),
         _ => {}
     }
-    let m = std::fs::symlink_metadata(path)?;
-    if !m.is_dir() || m.uid() != unsafe { libc::geteuid() } || m.mode() & 0o077 != 0 {
+    let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())?;
+    let fd = crate::util::openat(libc::AT_FDCWD, &c, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW)?;
+    let st = crate::util::stat_at(fd.as_raw_fd(), c"").ok_or_else(std::io::Error::last_os_error)?;
+    if st.st_mode & libc::S_IFMT != libc::S_IFDIR || st.st_uid != unsafe { libc::geteuid() } || st.st_mode & 0o077 != 0 {
         return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, format!("{}: not a directory only this user may enter", path.display())));
     }
-    Ok(())
+    Ok(fd)
+}
+
+/// `name` in `dir` (from `lock_dir`), made 0600 if missing, never through a link.
+pub fn open_lock(dir: &OwnedFd, name: &std::ffi::OsStr) -> std::io::Result<File> {
+    let c = std::ffi::CString::new(name.as_encoded_bytes())?;
+    Ok(crate::util::openat(dir.as_raw_fd(), &c, libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW)?.into())
+}
+
+/// `name` in `dir` if it is there; never made.
+pub fn existing_lock(dir: &OwnedFd, name: &std::ffi::OsStr) -> std::io::Result<File> {
+    let c = std::ffi::CString::new(name.as_encoded_bytes())?;
+    Ok(crate::util::openat(dir.as_raw_fd(), &c, libc::O_RDONLY | libc::O_NOFOLLOW)?.into())
+}
+
+/// The host's own lock directory, shared by every flexvm instance on it whatever its
+/// `--state` and `--run`: for locks on what lies where other users may write (image and
+/// template directories, a checkpoint's destination), each named for its target's (dev,
+/// inode) (`keyed`). In `/run`, where only root makes entries.
+pub fn host_locks() -> std::io::Result<OwnedFd> {
+    #[cfg(not(test))]
+    let root = PathBuf::from(HOST_LOCKS);
+    #[cfg(test)]
+    let root = std::env::temp_dir().join(format!("flexvm-locks-{}", unsafe { libc::geteuid() }));
+    lock_dir(&root)
+}
+
+#[cfg_attr(test, allow(dead_code))]
+pub const HOST_LOCKS: &str = "/run/flexvm-locks";
+
+/// A host lock's name: `KIND-DEV-INO` of the directory `st` describes, then `rest`.
+pub fn keyed(kind: &str, st: &libc::stat, rest: &str) -> String {
+    format!("{kind}-{}-{}{rest}", st.st_dev, st.st_ino)
+}
+
+/// `dir`'s stat, for `keyed`.
+pub fn stat_dir(dir: &Path) -> std::io::Result<libc::stat> {
+    let m = std::fs::metadata(dir)?;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    (st.st_dev, st.st_ino) = (m.dev(), m.ino());
+    Ok(st)
+}
+
+/// A lock held and unlinked when dropped (then let go of explicitly): `lock_at`.
+pub struct HeldLock {
+    dir: OwnedFd,
+    name: std::ffi::CString,
+    file: File,
+}
+
+impl Drop for HeldLock {
+    fn drop(&mut self) {
+        unsafe { libc::unlinkat(self.dir.as_raw_fd(), self.name.as_ptr(), 0) };
+        let _ = flock(&self.file, libc::LOCK_UN);
+    }
+}
+
+/// `name` in `dir`, locked, and the file there still: a holder may unlink it just
+/// before we lock (`HeldLock`), so retried until the one locked is the name's.
+pub fn lock_at(dir: OwnedFd, name: &str, how: i32) -> std::io::Result<HeldLock> {
+    let c = std::ffi::CString::new(name)?;
+    loop {
+        let file = open_lock(&dir, std::ffi::OsStr::new(name))?;
+        flock(&file, how)?;
+        let (now, mine) = (crate::util::stat_at(dir.as_raw_fd(), &c), file.metadata()?);
+        if now.is_some_and(|st| st.st_ino == mine.ino() && st.st_dev == mine.dev()) {
+            return Ok(HeldLock { dir, name: c, file });
+        }
+        let _ = flock(&file, libc::LOCK_UN);
+    }
 }
 
 pub fn flock(f: &File, how: i32) -> std::io::Result<()> {
@@ -2762,10 +2846,13 @@ pub fn probe(f: &File, how: i32) -> std::io::Result<()> {
 
 /// A holder may unlink the file just before we lock: retry until it is the path's.
 pub fn lock_path(path: &Path, how: i32) -> std::io::Result<File> {
+    let (dir, name) = split(path)?;
+    let dir = lock_dir(dir)?;
     loop {
-        let f = private_file(path)?;
+        let f = open_lock(&dir, name)?;
         flock(&f, how)?;
-        if std::fs::metadata(path).is_ok_and(|m| f.metadata().is_ok_and(|n| n.ino() == m.ino())) {
+        let c = std::ffi::CString::new(name.as_encoded_bytes())?;
+        if crate::util::stat_at(dir.as_raw_fd(), &c).is_some_and(|st| f.metadata().is_ok_and(|m| m.ino() == st.st_ino && m.dev() == st.st_dev)) {
             return Ok(f);
         }
     }
@@ -2945,6 +3032,22 @@ mod tests {
         assert_eq!(private_file(&dir.join("x")).unwrap_err().kind(), std::io::ErrorKind::PermissionDenied);
         assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o755);
         assert!(!dir.join("x").exists());
+    }
+
+    /// A lock directory swapped for a link after it was checked is not followed: locks
+    /// are opened relative to the descriptor checked, and a link in its place is refused.
+    #[test]
+    fn a_lock_directory_swapped_after_its_check_is_not_followed() {
+        let root = crate::test_util::TempDir::new("swapped-locks");
+        let (dir, moved, theirs) = (locks(&root), root.join("moved"), root.join("theirs"));
+        let checked = lock_dir(&dir).unwrap();
+        std::fs::rename(&dir, &moved).unwrap();
+        std::fs::create_dir(&theirs).unwrap();
+        std::os::unix::fs::symlink(&theirs, &dir).unwrap();
+        drop(open_lock(&checked, "x".as_ref()).unwrap());
+        assert!(moved.join("x").exists() && !theirs.join("x").exists(), "opened where it was checked");
+        assert!(private_file(&dir.join("y")).is_err() && !theirs.join("y").exists(), "a link is never a lock directory");
+        assert!(lock_path(&dir.join("z"), libc::LOCK_EX).is_err() && !theirs.join("z").exists());
     }
 
     #[test]
