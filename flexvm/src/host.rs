@@ -54,10 +54,11 @@ pub enum Floor {
     EvictMark,
 }
 
-/// `STATE/host.json`: `flexvm config` sets it (and the listen address,
-/// `flexvm listen`). What is left unset is derived where it is used, never saved.
+/// `STATE/host.json`, edited by hand (README: Configuration) and read again live
+/// (`config_now`); `flexvm listen` saves its address. What is left unset is derived
+/// where it is used, never saved. A field it does not know is refused, not ignored.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// The owning host's RUN directory; runtime context, never saved in host.json.
     #[serde(skip)]
@@ -198,11 +199,48 @@ impl Config {
         IpRange::parse(self.effective_cluster_ips())
     }
 
-    pub fn validate_ranges(&self) -> Result<()> {
+    /// What a hand edit must get right: refused on open, and never taken live (`config_now`).
+    pub fn validate(&self) -> Result<()> {
         if !self.cluster()?.contains_range(&self.range()?) {
-            bail!("--vm-ips {} is not inside --cluster-ips {}", self.vm_ips, self.effective_cluster_ips());
+            bail!("vm_ips {} is not inside cluster_ips {}", self.vm_ips, self.effective_cluster_ips());
+        }
+        if let Some(p) = self.peers.iter().find(|p| !is_endpoint(p)) {
+            bail!("bad peer {p:?}: give HOST:PORT, a peer's flexvm listen address");
+        }
+        // A peer's underlays count only while it is a peer (`underlays_of`): a dropped peer's are ignored.
+        for (peer, ips) in &self.peer_underlays {
+            if let Some(ip) = ips.iter().find(|i| i.is_unspecified() || i.is_broadcast() || i.is_multicast() || crate::net::is_local_addr(**i).unwrap_or(true))
+            {
+                bail!("peer_underlays {peer}: {ip} is local or not unicast");
+            }
+        }
+        if let Some(d) = self.dns.as_deref().filter(|d| d.parse::<Ipv4Addr>().is_err()) {
+            bail!("bad dns {d:?}: give an IPv4 address");
+        }
+        if self.announce_dev.as_deref() == Some("") {
+            bail!("announce_dev is empty: name an interface, or \"none\"");
         }
         Ok(())
+    }
+
+    /// What `flexvm info` and the listener warn of: valid, but likely a mistake.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut w: Vec<String> = self.cluster_warning().into_iter().collect();
+        if !self.peers.is_empty() && self.vm_ips == Config::default().vm_ips {
+            w.push(format!("flexvm: warning: vm_ips is the default {}; each peer needs a range of its own", self.vm_ips));
+        }
+        if let Some(e) = self.evict_mib.filter(|&e| e < self.reserve()) {
+            w.push(format!("flexvm: the eviction mark {e} MiB is under the {} MiB reserve: eviction starts at the reserve", self.reserve()));
+        }
+        // Valid (a host.json copied from a larger host), but every start would be refused.
+        let total = crate::util::proc_kb("/proc/meminfo", "MemTotal").map_or(u64::MAX, |b| b >> 20);
+        if let Some(r) = self.reserve_mib.filter(|&r| r > total) {
+            w.push(format!("flexvm: warning: reserve_mib {r} is more than this host's {total} MiB of RAM: every start is refused"));
+        }
+        if let Some(p) = self.peer_underlays.keys().find(|p| !self.peers.contains(p)) {
+            w.push(format!("flexvm: warning: peer_underlays names {p}, which is not a peer: ignored"));
+        }
+        w
     }
 
     /// `peer`'s configured underlays (`--peer-underlay`), none unless it is a configured peer.
@@ -224,7 +262,7 @@ impl Config {
 
     pub fn cluster_warning(&self) -> Option<String> {
         (!self.peers.is_empty() && self.cluster_ips.is_none())
-            .then(|| format!("flexvm: warning: --cluster-ips is unset; peer VM addresses outside --vm-ips {} are refused", self.vm_ips))
+            .then(|| format!("flexvm: warning: cluster_ips is unset; peer VM addresses outside vm_ips {} are refused", self.vm_ips))
     }
 
     /// Never a wildcard address. Unset: the listen address, else the source
@@ -301,7 +339,7 @@ impl Config {
         match out {
             Ok(d) => (d, None),
             Err(e) if unseen.is_empty() => {
-                (Derived::default(), Some(format!("{e}: no underlay address or announce device derived (set them with flexvm config)")))
+                (Derived::default(), Some(format!("{e}: no underlay address or announce device derived (set underlay and announce_dev in host.json)")))
             }
             Err(e) => {
                 let why = match unresolved.is_empty() {
@@ -312,7 +350,7 @@ impl Config {
                 (
                     Derived::default(),
                     Some(format!(
-                        "{e}{why}: no underlay address or announce device derived; this host's listener has not looked up {unseen} yet: start flexvm listen (or set them with flexvm config)"
+                        "{e}{why}: no underlay address or announce device derived; this host's listener has not looked up {unseen} yet: start flexvm listen (or set underlay and announce_dev in host.json)"
                     )),
                 )
             }
@@ -346,7 +384,7 @@ impl Config {
         match self.underlay_by(look) {
             Some(u) => Ok(Some(SocketAddr::from((u, addr.port())).to_string())),
             None => bail!(
-                "listening on {listen} needs an underlay address (none derived toward the peers: flexvm config --underlay IP): peers cannot reach a wildcard or link-local address"
+                "listening on {listen} needs an underlay address (none derived toward the peers: set underlay in host.json): peers cannot reach a wildcard or link-local address"
             ),
         }
     }
@@ -493,16 +531,15 @@ impl Host {
     /// and the run directory to that state root (`claim_run`).
     /// Synced up to `/` once per state root, not per command: under the root's flock, `.synced` names the
     /// root (dev, inode), so a copy syncs again; it goes before a repair and comes back after the syncs.
-    /// A `host.json` whose ranges do not validate is refused (see `open_unvalidated`).
+    /// A `host.json` that does not validate is refused: fix the file.
     pub fn open(state: &Path, run: &Path) -> Result<Host> {
         let host = Self::open_unvalidated(state, run)?;
-        host.cfg.validate_ranges().map_err(|e| format!("{}: {e}; fix it with flexvm config", host.state.join("host.json").display()))?;
+        host.cfg.validate().map_err(|e| format!("{}: {e} (see README: Configuration)", host.state.join("host.json").display()))?;
         Ok(host)
     }
 
-    /// `open`, taking `host.json` whatever its ranges: for `flexvm config`, which is how they are
-    /// fixed (`configure` validates what it saves).
-    pub fn open_unvalidated(state: &Path, run: &Path) -> Result<Host> {
+    /// `open`, taking `host.json` whatever it says (it may still fail to parse).
+    fn open_unvalidated(state: &Path, run: &Path) -> Result<Host> {
         let dirs = [("addrs", 0o755), ("standby", 0o755), ("migs", 0o755), ("owed", 0o700), ("withdrawals", 0o700), ("suspended", 0o700)];
         let named = |d: &Path, e: std::io::Error| {
             let hint = if e.kind() == std::io::ErrorKind::PermissionDenied { " (run flexvm as root to create it)" } else { "" };
@@ -570,7 +607,7 @@ impl Host {
         let mut cfg: Config = load(&path)?.unwrap_or_default();
         cfg.run = Some(self.run.clone());
         change(&mut cfg)?;
-        cfg.validate_ranges()?;
+        cfg.validate()?;
         store(&path, &cfg, true)?;
         self.cfg = cfg;
         self.cfg_stamp = stamp(&path);
@@ -602,7 +639,7 @@ impl Host {
         if let Some((_, cfg)) = last.as_ref().filter(|(t, _)| Some(*t) == now) {
             return cfg.clone();
         }
-        if let Some(mut cfg) = now.and_then(|_| load::<Config>(&path).ok().flatten().filter(|c| c.validate_ranges().is_ok())) {
+        if let Some(mut cfg) = now.and_then(|_| load::<Config>(&path).ok().flatten().filter(|c| c.validate().is_ok())) {
             cfg.run = Some(self.run.clone());
             *seen = Some((now.unwrap(), cfg.clone()));
             return cfg;
@@ -2154,6 +2191,10 @@ pub struct Entry {
     pub template: String,
     pub template_id: String,
     pub vcpus: u32,
+    /// Its `run --cpus` cap, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpus: Option<f64>,
+    /// Its memory ceiling: the template's, or less (`run --memory`).
     pub max_mib: u64,
     pub state: String,
     pub firecracker: Option<u32>,
@@ -3517,20 +3558,47 @@ mod tests {
         for (vm, cluster) in [("10.200.0.0/16", Some("10.201.0.0/16")), ("bad", None), ("10.200.0.0/16", Some("bad"))] {
             let cfg = Config { vm_ips: vm.into(), cluster_ips: cluster.map(String::from), ..Config::default() };
             store(&path, &cfg, true).unwrap();
-            assert!(Host::open(&h.state, &h.run).is_err());
+            let e = Host::open(&h.state, &h.run).err().unwrap().to_string();
+            assert!(e.contains("host.json") && e.contains("README: Configuration"), "{e}");
             assert_eq!(h.config_now().vm_ips, h.cfg.vm_ips);
             assert_eq!(h.config_now().cluster_ips, h.cfg.cluster_ips);
-            // `flexvm config` still opens it, and saves only a fix.
-            let mut fixing = Host::open_unvalidated(&h.state, &h.run).unwrap();
-            assert!(fixing.configure(|_| Ok(())).is_err());
-            fixing
-                .configure(|c| {
-                    (c.vm_ips, c.cluster_ips) = ("10.200.0.0/16".into(), None);
-                    Ok(())
-                })
-                .unwrap();
+            // Fixed by hand, it opens again.
+            store(&path, &Config::default(), true).unwrap();
             Host::open(&h.state, &h.run).unwrap();
         }
+    }
+
+    #[test]
+    fn a_hand_edit_is_validated_whole() {
+        let (_dir, h) = host("hand-edit");
+        let path = h.state.join("host.json");
+        let total = crate::util::proc_kb("/proc/meminfo", "MemTotal").unwrap() >> 20;
+        for bad in [
+            r#"{"peers": ["192.168.1.11"]}"#,
+            r#"{"peers": ["a:1"], "peer_underlays": {"a:1": ["127.0.0.1"]}}"#,
+            r#"{"peers": ["a:1"], "peer_underlays": {"a:1": ["224.0.0.1"]}}"#,
+            r#"{"dns": "::1"}"#,
+            r#"{"announce_dev": ""}"#,
+            r#"{"vm_ip": "10.9.0.0/24"}"#,
+            r#"{"reserve_mib": "x"}"#,
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(Host::open(&h.state, &h.run).is_err(), "{bad}");
+        }
+        std::fs::write(
+            &path,
+            r#"{"peers": ["a:1", "[2001:db8::2]:7070"], "peer_underlays": {"a:1": ["198.51.100.7"], "gone:1": ["198.51.100.8"]},
+            "vm_ips": "10.9.0.0/24", "cluster_ips": "10.9.0.0/16", "dns": "1.1.1.1", "announce_dev": "none", "reserve_mib": 300, "evict_mib": 200}"#,
+        )
+        .unwrap();
+        let c = Host::open(&h.state, &h.run).unwrap().cfg;
+        assert_eq!((c.peers.len(), c.reserve_mib, c.announce_dev()), (2, Some(300), None));
+        // A dropped peer's underlays are ignored, with a warning; so is an eviction mark under the reserve.
+        assert!(c.underlays_of("gone:1").is_empty());
+        let w = c.warnings().join("\n");
+        assert!(w.contains("gone:1") && w.contains("under the 300 MiB reserve"), "{w}");
+        std::fs::write(&path, format!(r#"{{"reserve_mib": {}}}"#, total + 1)).unwrap();
+        assert!(Host::open(&h.state, &h.run).unwrap().cfg.warnings().join("").contains("every start is refused"));
     }
 
     #[test]

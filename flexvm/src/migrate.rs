@@ -278,6 +278,7 @@ impl Proc {
                 "rss_mib": vm.rss() >> 20,
                 // Settled: the arrival's memory mark is sized by it without asking its Firecracker.
                 "plugged_mib": vm.hotplug_plugged(),
+                "resources": *vm.resources.lock().unwrap(),
                 "regions": vm.pager.regions(),
                 // The MSRs its vmstate will hold: this host's, which may be more than the template's.
                 "msrs": msrs,
@@ -837,6 +838,8 @@ impl Proc {
         self.serve_control()?;
         let by = serde_json::from_value(req["source_ident"].clone()).ok();
         let tpl = Template::open_id(&self.paths, req["template"].as_str().ok_or("missing template")?, req["id"].as_str().ok_or("missing template id")?)?;
+        // Its caps move with it (the same template: they fit).
+        *self.resources.lock().unwrap() = serde_json::from_value(req["resources"].clone()).unwrap_or_default();
         t.mark("template");
         going()?;
         // Admission, the record and the claim under one wait for the lock, which gives up in time.

@@ -32,7 +32,7 @@ struct OwnedVm<'a> {
 impl Drop for OwnedVm<'_> {
     fn drop(&mut self) {
         for host in &self.hosts {
-            if let Err(e) = self.h.cli(host, &["kill", self.name]) {
+            if let Err(e) = self.h.cli(host, &["rm", "-f", self.name]) {
                 crate::log!("bench: cleanup {}: {e}", self.name);
             }
         }
@@ -167,7 +167,7 @@ fn runs(h: &Hosts, args: &Args, template: &str, date: &str, id: &str) -> Result<
 
 fn iteration(h: &Hosts, name: &str, template: &str, dirty_mib: u64, ready: Option<(u16, bool)>) -> Result<Value> {
     let start = Instant::now();
-    let run = h.cli(&h.a, &["run", name, "--template", template, "-d"])?;
+    let run = h.cli(&h.a, &["run", "--name", name, "-d", template])?;
     let run_cli = start.elapsed();
     let mut owned = OwnedVm { h, name, hosts: vec![&h.a] };
     let mut sample = json!({"run": run["timings_ms"], "standby": run["standby"], "run_client": {"total": ms(run_cli)}});
@@ -215,7 +215,7 @@ fn iteration(h: &Hosts, name: &str, template: &str, dirty_mib: u64, ready: Optio
         }
         sample["post_copy"] = post;
     }
-    h.cli(if h.to.is_some() { &h.b } else { &h.a }, &["kill", name])?;
+    h.cli(if h.to.is_some() { &h.b } else { &h.a }, &["rm", "-f", name])?;
     owned.hosts.clear();
     Ok(sample)
 }
@@ -256,7 +256,7 @@ fn lifecycle(h: &Hosts, args: &Args, template: &str, dir: &std::path::Path, date
 
 /// Ten pause/resume cycles, checkpoint --stop, restore on `b`, then suspend and resume.
 fn trial(h: &Hosts, name: &str, template: &str, mib: u64, ck: &std::path::Path) -> Result<Value> {
-    h.cli(&h.a, &["run", name, "--template", template, "-d"])?;
+    h.cli(&h.a, &["run", "--name", name, "-d", template])?;
     let mut owned = OwnedVm { h, name, hosts: vec![&h.a] };
     if mib > 0 && crate::exec(&h.a, name, &format!("dd if=/dev/urandom of=/tmp/f bs=1M count={mib} 2>/dev/null"))? != 0 {
         bail!("dirtying guest memory failed");
@@ -295,7 +295,7 @@ fn trial(h: &Hosts, name: &str, template: &str, mib: u64, ck: &std::path::Path) 
         Ok(t)
     };
     let ck = ck.to_string_lossy();
-    let mut argv = vec!["restore", &ck, "--name", name, "-d"];
+    let mut argv = vec!["run", "--checkpoint", &ck, "--name", name, "-d"];
     if h.to.is_some() || h.a.state != h.b.state || h.a.run != h.b.run {
         // Another host gives it an address of its own (its own is the first host's to give).
         argv.extend(["--ip", "auto"]);
@@ -308,7 +308,7 @@ fn trial(h: &Hosts, name: &str, template: &str, mib: u64, ck: &std::path::Path) 
     h.b.signal(name, libc::SIGTERM)?;
     h.wait("suspend", || !h.b.alive(name))?;
     let suspend = json!({"total": ms(t.elapsed())});
-    let resume_suspended = restored(h.cli(&h.b, &["resume", name, "-d"])?)?;
+    let resume_suspended = restored(h.cli(&h.b, &["start", name])?)?;
     Ok(json!({"pause_client": pause_client, "checkpoint": checkpoint, "restore": restore, "suspend": suspend, "resume_suspended": resume_suspended}))
 }
 

@@ -83,6 +83,18 @@ impl Limit {
         Limit { cgroup, mark: Mutex::new(Mark::default()), throttled: AtomicBool::new(false) }
     }
 
+    /// `cpu.max` (`Resources::cpu_max`); without a cgroup, or one without the cpu
+    /// controller, a cap is not applied, and said so.
+    pub fn set_cpu_max(&self, max: &str, capped: bool) {
+        let res = match &self.cgroup {
+            Some(cg) => std::fs::write(cg.join("cpu.max"), max).map_err(|e| format!("{}: {e}", cg.join("cpu.max").display())),
+            None => Err("no cgroup".to_string()),
+        };
+        if let (Err(e), true) = (res, capped) {
+            crate::log!("flexvm: WARNING: --cpus not applied: {e}");
+        }
+    }
+
     /// MiB charged to the VM's cgroup.
     pub fn used(&self) -> Option<u64> {
         let cg = self.cgroup.as_ref()?;

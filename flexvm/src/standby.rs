@@ -290,16 +290,8 @@ fn start_one(host: &Host, template: &str, log: &File, mib: u64, cooldown: bool) 
     };
     let started = (|| {
         let (r, w) = UnixStream::pair()?;
-        let args = [
-            "--state".as_ref(),
-            host.state.as_os_str(),
-            "--run".as_ref(),
-            host.run.as_os_str(),
-            "run".as_ref(),
-            "--standby".as_ref(),
-            "--template".as_ref(),
-            template.as_ref(),
-        ];
+        let args =
+            ["--state".as_ref(), host.state.as_os_str(), "--run".as_ref(), host.run.as_os_str(), "run".as_ref(), "--standby".as_ref(), template.as_ref()];
         crate::util::start_reaper()?;
         let mut child = crate::util::spawn_self_child(&args, log, w.as_raw_fd(), None, None, &[("FLEXVM_NOTIFY_FD", "3")])?;
         drop(w);
@@ -541,6 +533,10 @@ fn claim(p: &Arc<Proc>, req: &Value) -> std::result::Result<Value, (Error, bool)
         None => None,
     };
     let mut t = Phases::new();
+    // Checked against this standby's own generation; a refusal leaves it for another claim.
+    let resources = serde_json::from_value(req["resources"].clone()).map_err(|e| (format!("bad resources: {e}").into(), false))?;
+    let tpl = p.standby.lock().unwrap().as_ref().map(|s| s.template()).ok_or_else(|| ("standby vm gone".into(), true))?;
+    p.set_resources(resources, &tpl.meta).map_err(|e| (e, false))?;
     let lock = host.take_name(name, false).map_err(|e| (e, false))?;
     // Its memory is already out of MemAvailable: only the step is charged. Sized
     // as it was loaded (`serve`), and admitted before the address is claimed.

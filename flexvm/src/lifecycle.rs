@@ -294,6 +294,7 @@ impl Proc {
         // Checked again, as a restore's is: safe when suspended, it may be a peer's or local now.
         crate::listen::check_vm_ip(&self.host, ip, &crate::listen::known_peers(&self.host)?)?;
         let tpl = self.admit_checkpoint(&ck, &mut t)?;
+        self.set_resources(ck.manifest.resources, &tpl.meta)?;
         let claim = {
             let l = self.host.lock()?;
             if !self.host.current(&l, ip, gen)? {
@@ -340,7 +341,7 @@ impl Proc {
     }
 
     /// Another host's address is borrowed.
-    pub fn restore(&self, dir: &Path, name: Option<&str>, ip: Option<&str>, paused: bool) -> Result<Value> {
+    pub fn restore(&self, dir: &Path, name: Option<&str>, ip: Option<&str>, paused: bool, resources: crate::vm::Resources) -> Result<Value> {
         let mut t = Phases::new();
         let ck = Checkpoint::open(dir)?;
         t.mark("verify_checkpoint");
@@ -355,6 +356,7 @@ impl Proc {
         }
         self.set_name(self.host.take_name(&name, false)?);
         let tpl = self.admit_checkpoint(&ck, &mut t)?;
+        self.set_resources(resources.or(ck.manifest.resources), &tpl.meta)?;
         // Decided and claimed under one lock, by one reading of the range: a change
         // between them cannot send a local address to `claim_new` as foreign.
         let l = self.host.lock()?;

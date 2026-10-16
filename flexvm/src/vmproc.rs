@@ -82,6 +82,7 @@ pub enum Start {
         template: String,
         ip: Option<Ipv4Addr>,
         cmd: Option<String>,
+        resources: crate::vm::Resources,
     },
     Resume {
         name: String,
@@ -91,6 +92,8 @@ pub enum Start {
         name: Option<String>,
         ip: Option<String>,
         paused: bool,
+        /// Each set overrides the checkpoint's.
+        resources: crate::vm::Resources,
     },
     /// The migration connection is fd 3.
     Incoming {
@@ -146,6 +149,8 @@ pub struct Runtime {
     pub standby: Mutex<Option<crate::vm::Prepared>>,
     pub claimer: Mutex<Option<UnixStream>>,
     pub cmd: Mutex<Option<String>>,
+    /// `run --cpus/--memory` (or a checkpoint's, an arrival's): the VM's once it is adopted.
+    pub resources: Mutex<crate::vm::Resources>,
     /// The main command's session: a suspend holds it, so what it records is
     /// what was written out, and the resumed VM reattaches from there.
     pub cmd_session: OnceLock<Mutex<crate::Session>>,
@@ -290,7 +295,18 @@ impl Proc {
     pub fn adopt(&self, vm: Arc<Vm>) {
         let _early = self.early.lock().unwrap();
         self.charged.store(0, Ordering::SeqCst);
+        let r = *self.resources.lock().unwrap();
+        *vm.resources.lock().unwrap() = r;
+        // A standby's or a reused Firecracker's cgroup may hold another cap.
+        vm.limit.set_cpu_max(&r.cpu_max(), r.cpus.is_some());
         let _ = self.vm.set(vm);
+    }
+
+    /// What the VM will be capped at, checked against its template first.
+    pub fn set_resources(&self, r: crate::vm::Resources, meta: &crate::template::Meta) -> Result<()> {
+        r.check(meta)?;
+        *self.resources.lock().unwrap() = r;
+        Ok(())
     }
 
     /// From the sizes taken ahead (a standby's, an arrival's from the runs
@@ -658,7 +674,8 @@ impl Proc {
             template: vm.template.name.clone(),
             template_id: vm.template.meta.id.clone(),
             vcpus: vm.template.meta.vcpus,
-            max_mib: vm.template.meta.max_mib,
+            max_mib: vm.max_mib(),
+            cpus: vm.resources.lock().unwrap().cpus,
             state: match vm.state() {
                 State::Source(mig) if self.reconciling.lock().unwrap().as_ref().is_some_and(|(m, _)| *m == mig) => "reconciling",
                 // SIGCONT does nothing then: `flexvm resume` waits for the suspend instead.
@@ -927,6 +944,7 @@ impl Proc {
         let mut t = Phases::new();
         self.set_name(self.host.take_name(name, false)?);
         let tpl = Template::open(&self.paths, template)?;
+        self.set_resources(*self.resources.lock().unwrap(), &tpl.meta)?;
         t.mark("template");
         // Before the claim: a refused start mints no generation (nor withdraws one).
         self.admit_start(tpl.working_set_mib(), Some(0), crate::host::Floor::Reserve)?;
@@ -1297,7 +1315,7 @@ impl Proc {
                     bail!("vm {} is not running here", vm.name);
                 }
                 *vm.last_resize.lock().unwrap() = Instant::now();
-                let mib = req["mib"].as_u64().ok_or("missing mib")?.min(vm.template.meta.max_mib - vm.template.meta.mem_mib);
+                let mib = req["mib"].as_u64().ok_or("missing mib")?.min(vm.hotplug_total());
                 vm.limit.plug(vm.template.meta.mem_mib + mib, 0);
                 vm.fc(|fc| fc.patch("/hotplug/memory", json!({"requested_size_mib": mib})))?;
                 Ok(json!(mib))
@@ -1805,12 +1823,13 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
     let kvm = if matches!(start, Start::Incoming { .. }) { Ok(()) } else { crate::util::check_kvm() };
     let res = match start {
         _ if kvm.is_err() => kvm.map(|()| Value::Null),
-        Start::Run { name, template, ip, cmd } => {
+        Start::Run { name, template, ip, cmd, resources } => {
             *p.cmd.lock().unwrap() = cmd;
+            *p.resources.lock().unwrap() = resources;
             p.run(&name, &template, ip)
         }
         Start::Resume { name } => p.resume_suspended(&name),
-        Start::Restore { dir, name, ip, paused } => p.restore(&dir, name.as_deref(), ip.as_deref(), paused),
+        Start::Restore { dir, name, ip, paused, resources } => p.restore(&dir, name.as_deref(), ip.as_deref(), paused, resources),
         Start::Incoming { req } => {
             let log = std::env::var_os("FLEXVM_INCOMING_LOG").map(PathBuf::from);
             std::env::remove_var("FLEXVM_INCOMING_LOG");
@@ -1931,7 +1950,8 @@ pub enum Resized {
 /// statistics may trigger shrinking. Callers hold the op lock (or copy-growth).
 fn resize(vm: &Vm, host: &Host, hint: Option<u64>, grow_only: bool) -> Result<Resized> {
     let meta = &vm.template.meta;
-    let hotplug_total = meta.max_mib - meta.mem_mib;
+    // `--memory` caps it below the template's region.
+    let hotplug_total = vm.hotplug_total();
     if hotplug_total == 0 {
         return Ok(Resized::Full);
     }

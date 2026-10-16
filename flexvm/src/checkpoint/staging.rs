@@ -213,6 +213,7 @@ impl Staging {
             files,
             parent,
             app_log: self.app_log,
+            resources: *vm.resources.lock().unwrap(),
         };
         let body = serde_json::to_vec_pretty(&manifest)?;
         let id = sum(&body);
