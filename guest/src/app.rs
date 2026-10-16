@@ -213,6 +213,8 @@ struct CheckGroup {
     dir: String,
     procs: CString,
     done: bool,
+    /// `cleanup` ran (and failed): the drop does not wait out its tasks again, past the host's deadline.
+    tried: bool,
 }
 
 impl CheckGroup {
@@ -241,7 +243,7 @@ impl CheckGroup {
     }
 
     fn from_dir(dir: String) -> io::Result<CheckGroup> {
-        let mut g = CheckGroup { procs: CString::new(format!("{dir}/cgroup.procs")).unwrap(), dir, done: false };
+        let mut g = CheckGroup { procs: CString::new(format!("{dir}/cgroup.procs")).unwrap(), dir, done: false, tried: false };
         // Needs cgroup.kill (Linux 5.14) to kill every task at once.
         if !std::path::Path::new(&format!("{}/cgroup.kill", g.dir)).exists() {
             g.finished();
@@ -253,6 +255,7 @@ impl CheckGroup {
 
     /// Done only once the group is removed: until then the drop tries again.
     fn cleanup(&mut self) -> io::Result<()> {
+        self.tried = true;
         std::fs::write(format!("{}/cgroup.kill", self.dir), "1")?;
         // Reading through the polled fd rearms its POLLPRI, so a change after the read still wakes the poll.
         let mut events = File::open(format!("{}/cgroup.events", self.dir))?;
@@ -274,7 +277,8 @@ impl CheckGroup {
 impl Drop for CheckGroup {
     fn drop(&mut self) {
         if !self.done {
-            if let Err(e) = self.cleanup() {
+            let res = if self.tried { std::fs::remove_dir(&self.dir) } else { self.cleanup() };
+            if let Err(e) = res {
                 let _ = writeln!(io::stderr(), "flexvm-init: readiness check group: {e} (the next check removes it)");
             }
             self.finished();
