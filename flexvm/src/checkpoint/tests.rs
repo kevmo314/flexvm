@@ -178,7 +178,7 @@ fn template(dir: &Path, pages: &[Option<u8>]) -> Arc<Template> {
     for (i, b) in pages.iter().enumerate().filter_map(|(i, p)| Some((i, (*p)?))) {
         mem.write_all_at(&[b; PAGE_SIZE], (i * PAGE_SIZE) as u64).unwrap();
     }
-    let paths = Paths { firecracker: "/f".into(), kernel: "/k".into(), templates: dir.into() };
+    let paths = Paths { firecracker: "/f".into(), kernel: "/k".into(), templates: dir.into(), images: dir.join("images") };
     Template::open(&paths, "tpl").unwrap()
 }
 

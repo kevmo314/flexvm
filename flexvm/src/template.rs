@@ -266,6 +266,7 @@ pub struct Paths {
     pub firecracker: PathBuf,
     pub kernel: PathBuf,
     pub templates: PathBuf,
+    pub images: PathBuf,
 }
 
 impl Paths {
@@ -274,7 +275,7 @@ impl Paths {
     pub fn new(state: &Path) -> Self {
         let a = state.join("artifacts");
         let a = a.canonicalize().unwrap_or(a);
-        Paths { firecracker: a.join("firecracker"), kernel: a.join("vmlinux"), templates: state.join("templates") }
+        Paths { firecracker: a.join("firecracker"), kernel: a.join("vmlinux"), templates: state.join("templates"), images: state.join("images") }
     }
 }
 
@@ -751,7 +752,7 @@ impl Staging {
         crate::util::create_dir_durably(&paths.templates, 0o777)?;
         let parent = crate::host::Directory::open(&paths.templates)?;
         let paths = &Paths { templates: parent.path.clone(), ..paths.clone() };
-        sweep(paths)?;
+        sweep(paths, &paths.images)?;
         let _l = templates_lock(paths, libc::LOCK_SH)?;
         let file = format!(".{name}.new-{}", crate::util::random_hex(8)?);
         let lock_name = template_lock_name(paths, "template-new", &format!("-{file}"))?;
@@ -776,8 +777,12 @@ impl Drop for Staging {
 
 /// Removes staging directories whose builds are gone (their lock free, or no lock) and
 /// leftover publish links: builds killed before they could clean up.
-fn sweep(paths: &Paths) -> Result<()> {
+fn sweep(paths: &Paths, images: &Path) -> Result<()> {
     let _l = templates_lock(paths, libc::LOCK_EX)?;
+    sweep_locked(paths, images)
+}
+
+fn sweep_locked(paths: &Paths, images: &Path) -> Result<()> {
     let locks = crate::host::host_locks()?;
     let prefix = template_lock_name(paths, "template-new", "-")?;
     let live = |name: &str| {
@@ -807,7 +812,7 @@ fn sweep(paths: &Paths) -> Result<()> {
         let tombstone = name.strip_prefix('.').and_then(|n| n.split_once(".rm-")).is_some_and(|(id, nonce)| valid_id(id) && crate::util::is_nonce(nonce));
         // Like a build's leftovers: one it cannot finish must not stop every build after it.
         if entry.file_type()?.is_dir() && tombstone {
-            if let Err(e) = finish_remove(paths, &entry.path(), None) {
+            if let Err(e) = finish_remove(paths, &entry.path(), images) {
                 crate::log!("template: removing {}, left by an rmi that did not finish: {e}", entry.path().display());
             }
         }
@@ -1125,6 +1130,7 @@ pub fn remove(paths: &Paths, images: &Path, name: Option<&str>, id: &str, in_use
     let paths = &Paths { templates: parent.path.clone(), ..paths.clone() };
     // No build publishes meanwhile (they take it shared).
     let _l = templates_lock(paths, libc::LOCK_EX)?;
+    sweep_locked(paths, images)?;
     if let Some(name) = name {
         check_name(name)?;
         let link = paths.templates.join(name);
@@ -1162,13 +1168,13 @@ pub fn remove(paths: &Paths, images: &Path, name: Option<&str>, id: &str, in_use
     let tombstone = gens.join(format!(".{id}.rm-{}", crate::util::random_hex(8)?));
     std::fs::rename(gens.join(id), &tombstone)?;
     crate::util::sync_dir(&gens)?;
-    let removed_rootfs = finish_remove(paths, &tombstone, Some(images))?;
+    let removed_rootfs = finish_remove(paths, &tombstone, images)?;
     Ok(json!({"untagged": name, "deleted": id, "rootfs": removed_rootfs}))
 }
 
 /// Under the templates lock. Tombstones are no longer rootfs users. Their metadata stays
 /// intact until rootfs cleanup finishes, so a sweep can retry after an interrupted removal.
-fn finish_remove(paths: &Paths, tombstone: &Path, images: Option<&Path>) -> Result<Option<PathBuf>> {
+fn finish_remove(paths: &Paths, tombstone: &Path, images: &Path) -> Result<Option<PathBuf>> {
     let mut removed = None;
     if let Ok(meta) = Meta::read(tombstone) {
         let rootfs = meta.rootfs;
@@ -1177,11 +1183,8 @@ fn finish_remove(paths: &Paths, tombstone: &Path, images: Option<&Path>) -> Resu
         for g in generations(&paths.templates)? {
             used |= Meta::read(&gens.join(g)).map_or(true, |m| m.rootfs == rootfs);
         }
-        // Sweep has no caller's cache path; image root filesystems live in CACHE/rootfs.
-        if let Some(cache) = images.or_else(|| rootfs.parent().and_then(Path::parent)) {
-            if !used && crate::image::remove_rootfs(cache, &rootfs)? {
-                removed = Some(rootfs);
-            }
+        if !used && crate::image::remove_rootfs(images, &rootfs)? {
+            removed = Some(rootfs);
         }
     }
     std::fs::remove_dir_all(tombstone)?;
@@ -1254,7 +1257,7 @@ mod tests {
     impl Fixture {
         fn new() -> Self {
             let dir = crate::test_util::TempDir::new("template");
-            let paths = Paths { firecracker: dir.join("firecracker"), kernel: dir.join("kernel"), templates: dir.clone() };
+            let paths = Paths { firecracker: dir.join("firecracker"), kernel: dir.join("kernel"), templates: dir.clone(), images: dir.join("images") };
             let mut meta = Meta {
                 compatibility: crate::compat::Compat {
                     cpu: String::new(),
@@ -1541,7 +1544,7 @@ mod tests {
         std::fs::remove_file(f.paths.templates.join("t")).unwrap();
         std::fs::rename(gens.join(&meta.id), &tombstone).unwrap();
         // Interrupted immediately after rename: sweep still has metadata for the rootfs.
-        sweep(&f.paths).unwrap();
+        sweep(&f.paths, &f.paths.images).unwrap();
         assert!(!tombstone.exists());
         for ext in ["ext4", "ok", "conf"] {
             assert!(!rootfs.with_extension(ext).exists());
@@ -1553,8 +1556,37 @@ mod tests {
         publish_as(&f, "u", &Meta { id: "bbbb2222".into(), ..meta.clone() });
         assert_eq!(remove(&f.paths, &cache, Some("u"), "bbbb2222", &BTreeSet::new()).unwrap()["rootfs"], json!(rootfs));
         assert!(!rootfs.exists());
-        sweep(&f.paths).unwrap();
+        assert!(!tombstone.exists(), "rmi finishes earlier tombstones too");
+    }
+
+    #[test]
+    fn rmi_sweeps_an_unrelated_tombstone_even_when_keeping_its_target() {
+        let f = Fixture::new();
+        let rootfs = f.paths.images.join("rootfs/old.ext4");
+        std::fs::create_dir_all(rootfs.parent().unwrap()).unwrap();
+        std::fs::write(&rootfs, b"old image").unwrap();
+        publish_as(&f, "t", &Meta { id: "aaaa1111".into(), ..f.meta.clone() });
+        let tombstone = f.paths.templates.join(GENERATIONS).join(".bbbb2222.rm-0000000000000001");
+        std::fs::create_dir(&tombstone).unwrap();
+        f.write_meta(&Meta { rootfs: rootfs.clone(), ..f.meta.clone() }, &tombstone);
+        let used = BTreeSet::from(["aaaa1111".into()]);
+        assert_eq!(remove(&f.paths, &f.paths.images, Some("t"), "aaaa1111", &used).unwrap()["kept"], "aaaa1111");
         assert!(!tombstone.exists());
+        assert!(!rootfs.exists());
+    }
+
+    #[test]
+    fn sweep_keeps_rootfs_outside_the_states_image_cache() {
+        let f = Fixture::new();
+        let rootfs = f.dir.join("other-cache/rootfs/a.ext4");
+        std::fs::create_dir_all(rootfs.parent().unwrap()).unwrap();
+        std::fs::write(&rootfs, b"external rootfs").unwrap();
+        let tombstone = f.paths.templates.join(GENERATIONS).join(".aaaa1111.rm-0000000000000001");
+        std::fs::create_dir_all(&tombstone).unwrap();
+        f.write_meta(&Meta { rootfs: rootfs.clone(), ..f.meta.clone() }, &tombstone);
+        sweep(&f.paths, &f.paths.images).unwrap();
+        assert!(!tombstone.exists());
+        assert!(rootfs.exists());
     }
 
     #[test]
@@ -1568,7 +1600,7 @@ mod tests {
         std::fs::write(stuck.join("file"), b"x").unwrap();
         std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o555)).unwrap();
         let removable = std::fs::remove_file(stuck.join("file")).is_ok(); // as root
-        let res = sweep(&f.paths);
+        let res = sweep(&f.paths, &f.paths.images);
         std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o755)).unwrap();
         res.unwrap();
         assert!(removable || stuck.exists());
@@ -1587,7 +1619,7 @@ mod tests {
         let tombstone = f.paths.templates.join(GENERATIONS).join(".bbbb2222.rm-0000000000000001");
         std::fs::create_dir(&tombstone).unwrap();
         f.write_meta(&meta, &tombstone);
-        sweep(&f.paths).unwrap();
+        sweep(&f.paths, &f.paths.images).unwrap();
         assert!(!tombstone.exists());
         assert!(rootfs.exists());
         assert!(Template::resolve(&f.paths, "t").is_ok());
@@ -1915,7 +1947,7 @@ mod tests {
         // A concurrent fork can inherit the open file description until exec.
         crate::host::flock(&running, libc::LOCK_UN).unwrap();
         drop(running);
-        sweep(&f.paths).unwrap();
+        sweep(&f.paths, &f.paths.images).unwrap();
         assert!(!exists(".t.new-0000000000000002") && second.dir.exists());
         // Templates and generations are never touched.
         assert!(exists("kernel") && exists("mem"));
