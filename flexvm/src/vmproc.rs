@@ -909,6 +909,9 @@ impl Proc {
             crate::standby::save_load_set(&self.host, &tpl);
         }
         let still = self.host.fence(ip, self.gen()).inspect_err(|_| vm.kill())?;
+        // Routed under the fence (the load leaves the route alone, #534).
+        crate::net::ifindex(&vm.tap).and_then(|i| crate::net::route_dev(true, ip, i)).inspect_err(|_| vm.kill())?;
+        t.mark("route");
         if let Err(e) = vm.start(fault("resume_kill")) {
             vm.kill();
             bail!("resuming the restored vm failed (it may have run, so it is not loaded again): {e}");

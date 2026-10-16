@@ -433,9 +433,6 @@ impl Proc {
             self.watch_checkpoint_pull(vm.clone(), dir.clone(), to_load);
             json!({"name": name, "ip": ip.to_string(), "pid": std::process::id(), "state": "paused", "resume_error": why, "restore_ms": ms(restore), "timings_ms": t.json()})
         };
-        if hold {
-            return Ok(keep_paused(t, None));
-        }
         // Test gate: a resume loaded and paused, not yet marked STARTED (the fence's host lock not yet taken).
         if owned {
             crate::host::hold("resume_unmarked_gate");
@@ -446,6 +443,15 @@ impl Proc {
             false => self.still_current(ip),
         };
         let still = still.map_err(|e| Restore::NotRun(kill(e)))?;
+        // Routed only under the fence, paused or not: a newer generation routed elsewhere while this
+        // one loaded keeps its route, and this restore fails above without having touched it (#534).
+        let routed = crate::net::ifindex(&vm.tap).and_then(|i| crate::net::route_dev(true, ip, i));
+        routed.map_err(|e| Restore::NotRun(kill(format!("routing {ip} to its tap: {e}").into())))?;
+        t.mark("route");
+        if hold {
+            drop(still);
+            return Ok(keep_paused(t, None));
+        }
         if owned {
             // A crash must not bring it back once it may have run. Marked under the fence, not before:
             // a crash while waiting for the host lock would otherwise lose a VM that never ran.
