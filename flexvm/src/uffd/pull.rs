@@ -108,8 +108,8 @@ impl Pager {
     fn pull_range(&self, t: usize, mut i: usize, end: usize, buf: &mut [u8], fetch: &mut Fetch) -> bool {
         let pages = self.pages();
         while i < end && self.pulling() {
-            // Test fault `fetch_enomem_stuck`: only faults fetch pages.
-            while self.stuck_from.lock().unwrap().is_some() && !self.stop.load(Ordering::SeqCst) {
+            // Test faults `fetch_enomem_stuck` (only faults fetch pages) and `fetch_tail_enomem` (until a fault took a run).
+            while (self.stuck_from.lock().unwrap().is_some() || self.tail_fail.load(Ordering::SeqCst) == 2) && !self.stop.load(Ordering::SeqCst) {
                 thread::sleep(Duration::from_millis(10));
             }
             let n = pages.claim(i, (end - i).min(PULL_RUN), REMOTE, |_| true);

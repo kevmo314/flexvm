@@ -16,7 +16,17 @@ usage: sudo scripts/e2e.py [--bin FLEXVM] [--state DIR] [--log-dir DIR]
                            [--port-a N] [--net-a A.B.C] [--net-b A.B.C]
                            [--jobs N] [--lanes "PORT:NET-A:NET-B ..."]
                            [--image REF [--image-cache DIR] | --no-image] [--faults "SCENARIO ..."]
-                           [CASE ...]
+                           [--shard main|recovery|heavy] [--no-skips] [CASE ...]
+
+Shards (CI runs main and recovery side by side, heavy on a schedule):
+  main      the cases and FAULTS;
+  recovery  RECOVERY_FAULTS: the scenarios that restart listeners (run with listeners
+            faults.py starts itself, which they check are new processes), the
+            terminal's, and the timeout-bound ones;
+  heavy     HEAVY_FAULTS: GiB-scale guests and long observation windows; run them
+            with --jobs 1.
+A scenario that finds this host lacks what it tests ends SKIP, not PASS; with
+--no-skips (CI) a SKIP fails the run.
 """
 import argparse, glob, hashlib, json, os, re, shutil, signal, socket, subprocess, sys, tempfile, threading, time, traceback
 
@@ -43,30 +53,51 @@ p.add_argument("--image-cache", help="keep the pulled image here as an OCI layou
 # The scripts/faults.py scenarios that fit CI time: migration failure paths and fencing, address
 # generations and loans, forged peers, processes killed between steps, checkpoint corruption,
 # copy-on-write exactness, growth and a checkpoint during a resize (on a template with little
-# pre-plugged), held packets and devices, signals, standby VMs. Left out: slow or heavy ones (pages_dead, quiet_source, guest_hang,
-# cow_reports_held, suspend_disk_freed, source_killed, kill_source, forged_peer: their
-# 1.5 GB guests outgrow the CI template, and the host moves them), evict_grower (it steers by the
-# machine's MemAvailable, which lanes running at once move) and the ones that restart the
-# listeners (target_killed, suspend_resume, unit_restart).
+# pre-plugged), held packets and devices, signals, standby VMs, resume failures, admission, the
+# exit statuses of foreground runs and image apps' logs.
 FAULTS = ("basic route route_abort lost_ack unknown refused pages_blip pages_dead_restore prepared_retry resume_kill exec_race guest_calls exec_background exec_pause_grace "
           "checkpoint_restore checkpoint_fork checkpoint_corrupt held_restore_frozen cow_exact cow_rescue_fail cow_collapsed unplug_collapsed cow_abort ckpt_incremental ckpt_hot "
           "ckpt_failed_stop ckpt_rearm prepare_fail fc_prepare slow_preload bad_preload pull_enomem ckpt_packet_hold "
-          "abort_superseded gen_zero signals suspend_gen standby restore_ip_peer spoof_filter late_withdrawal killed_migrated "
+          "abort_superseded gen_zero signals suspend_gen standby restore_ip_peer spoof_filter killed_migrated "
           "incoming_killed start_killed claim_killed standby_stalled standby_refill_race standby_lock_timeout standby_stop_claim standby_claim_signal standby_concurrent_claims fc_died cow_grow plug_race plug_storm suspend_debris revoked_publication "
           "same_host_order same_host_slow_route same_host_flood same_host_late_handover same_host_backlog same_host_bulk_tcp ckpt_backlog ckpt_paused_backlog rx_stall arrival_abort_route arrival_killed_route handoff_superseded delayed_announce announce_arp_timer prepare_fail_announce reconcile_announce reconcile_kill mem_high mem_high_migrate mem_high_evict mem_refused_headroom mem_refused_fill "
           "sigkill_restart listen_trickle suspend_cmd suspend_overlap fc_died_busy pause_cmd_start suspend_died evict_latency evict_skips_cmd cmd_flag "
           "refused_admission arrival_grew arrival_grew_admitted meminfo_unreadable checkpoint_hotplug log_cap gc_debris arrival_log template_tap arrival_overtaken "
-          "prepare_disconnect prepare_trickle unlend_retry bad_app_log resume_slow_guest resume_readdress_fail resume_unpause_fail abort_link_fail resume_unsettled resume_pull_lock page_conns page_refusals suspend_unaddressed resume_fence_fails quarantine_reboot_ls")
-p.add_argument("--faults", default=FAULTS, help="scripts/faults.py scenarios to run against the two hosts ('' for none)")
+          "prepare_disconnect prepare_trickle unlend_retry bad_app_log resume_slow_guest resume_readdress_fail resume_unpause_fail abort_link_fail resume_unsettled resume_pull_lock page_conns page_refusals suspend_unaddressed resume_fence_fails quarantine_reboot_ls "
+          "resume_failures resume_mark_fails suspend_killed resume_suspending source_unpublished start_admission standby_admission pause_lost cow_crash ckpt_dir_moved "
+          "checkpoint_untrusted_dir run_status unread_output quit_status ctrl_z_long_op app_log forged_peer forged_pages")
+# The ones that restart the listeners (faults.py starts its own for them: LISTENER_FAULTS), the
+# terminal's, and the ones bound by timeouts (a guest that never answers; a pager that fails or
+# never gets its pages, gated deterministically).
+LISTENER_FAULTS = {"suspend_resume", "target_killed", "unit_restart", "wildcard_listen", "peer_by_name", "peer_moved",
+                   "peer_unresolvable", "late_withdrawal"}
+RECOVERY_FAULTS = " ".join(sorted(LISTENER_FAULTS)) + " terminal guest_hang uffd_err fetch_tail_enomem fetch_enomem_stuck cow_wp_race"
+# GiB-scale guests (pages_dead, source_killed_basic, which runs source_killed, pull_died, kill_source,
+# kill_refused_checkpoint, quiet_source, checkpoint_crash, suspend_disk_freed), long device and
+# eviction sequences (cow_reports_held, evict_*), THP collapse (collapse_*), a stalled shrink and
+# paused migration: scheduled, one at a time (--jobs 1).
+HEAVY_FAULTS = ("pages_dead source_killed_basic pull_died kill_source kill_refused_checkpoint quiet_source checkpoint_crash suspend_disk_freed "
+                "cow_reports_held collapse_abort collapse_ckpt_fail shrink_stall evict_no_pingpong evict_grower pause_resume")
+SHARDS = {"main": FAULTS, "recovery": RECOVERY_FAULTS, "heavy": HEAVY_FAULTS}
+p.add_argument("--shard", choices=SHARDS, default="main",
+               help="main: the cases and FAULTS; recovery, heavy: only the faults case, with those scenarios")
+p.add_argument("--no-skips", action="store_true", help="a skipped case or scenario fails the run")
+p.add_argument("--faults", help="scripts/faults.py scenarios to run against the two hosts ('' for none; default: the shard's)")
 # A worker runs its cases on one lane, against templates that are already built.
 p.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
 p.add_argument("--templates", help=argparse.SUPPRESS)
 p.add_argument("--lane", type=int, default=0, help=argparse.SUPPRESS)
 p.add_argument("--results", help=argparse.SUPPRESS)
+p.add_argument("--own-listeners", action="store_true", help=argparse.SUPPRESS)
 p.add_argument("--selftest", action="store_true",
                help="check the scheduler without KVM: fake templates and workers, one worker that cannot be spawned")
 p.add_argument("cases", nargs="*", help="cases to run (default: all)")
 args = p.parse_args()
+if args.faults is None:
+    # The self-test schedules every CI shard's scenarios at once: listener-owning batches stay apart.
+    args.faults = SHARDS[args.shard] + (" " + RECOVERY_FAULTS if args.selftest else "")
+if not args.cases and not args.worker and args.shard != "main":
+    args.cases = ["faults"]
 BIN = os.path.abspath(args.bin)
 ARTIFACTS = os.path.join(os.path.abspath(args.state), "artifacts")
 os.makedirs(args.log_dir, exist_ok=True)
@@ -772,15 +803,19 @@ def faults():
         print("  none selected")
         return
     # Growth needs a template that starts with little plugged.
-    env = {**os.environ, "COW_GROW_TEMPLATE": GROW, "PLUG_TEMPLATE": GROW}
+    env = {**os.environ, "COW_GROW_TEMPLATE": GROW, "PLUG_TEMPLATE": GROW, "APP_TEMPLATE": APP,
+           "SHRINK_TEMPLATE": args.template, "EVICT_TEMPLATE": args.template}
     # The app-log template is built from the cached image when there is one (CI), not pulled.
     layout = image_layout()
     image = ["--image", layout] if layout else ["--image", args.image]
+    # Listeners of this lane's hosts (started by the worker), or, for the scenarios that restart them,
+    # faults.py's own on the same addresses and directories (BUILD links this run's artifacts and templates).
+    listeners = ["--state", BUILD] if args.own_listeners else ["--no-listeners"]
     r = subprocess.run([sys.executable, os.path.join(ROOT, "scripts", "faults.py"), "--a", A.addr, "--b", B.addr,
                         "--a-state", A.state_dir, "--a-run", A.run_dir, "--b-state", B.state_dir, "--b-run", B.run_dir,
                         "--a-listen-log", A.log, "--b-listen-log", B.log,
                         "--a-ips", f"{A.net}.2-{A.net}.60", "--b-ips", f"{B.net}.2-{B.net}.60",
-                        "--no-listeners", "--bin", BIN, "--template", args.template,
+                        *listeners, *(["--no-skips"] if args.no_skips else []), "--bin", BIN, "--template", args.template,
                         "--ckpt-dir", os.path.join(WORK, "faults-ckpt"), *image, *args.faults.split()], timeout=1800, env=env)
     check("faults.py: no failures", r.returncode == 0, f"exit {r.returncode}")
 
@@ -811,6 +846,15 @@ BUILD = os.path.join(WORK, "build")
 shared_state(BUILD)
 A = Host("a", args.port_a, args.port_a + 1, args.net_a)
 GROW = args.template + "-grow"
+# The app_log and bad_app_log scenarios' template, built once with the others (lanes that each built
+# it on first use would replace it under one another's VMs). Its app as scripts/faults.py's app_template.
+APP = args.template + "-applog"
+# The template's ceiling: the heavy shard's guests write 1.5 GiB, shrink_stall needs 4 GiB at the start and
+# 4 GiB more to grow into, evict_grower's grow past 3 GiB (with the default 4 GiB plugged, free until touched).
+TEMPLATE_MAX = "10240" if args.shard == "heavy" else "2048"
+APP_FAULTS = ("app_log", "bad_app_log")
+APP_OPTS = ["--vcpus", "2", "--max", "2048", "--cmd", json.dumps(
+    ["sh", "-c", "head -c 8000000 /dev/zero | tr '\\0' x; echo; i=0; while :; do echo applog-$i; i=$((i+1)); sleep 0.05; done"])]
 B = Host("b", args.port_a + 1, args.port_a, args.net_b)
 
 
@@ -818,8 +862,10 @@ def worker():
     """Runs the given cases against this lane's two hosts; writes their results to --results."""
     failed, clean = [], False
     try:
-        A.start()
-        B.start()
+        # Scenarios that restart the listeners run with faults.py's own (--own-listeners).
+        if not args.own_listeners:
+            A.start()
+            B.start()
         for c in args.cases:
             print(f"--- {c}: {CASES[c].__doc__.strip().splitlines()[0]}", flush=True)
             t = time.time()
@@ -854,7 +900,9 @@ def worker():
         # so), sweep each host now.
         for h in (A, B):
             try:
-                if h.proc and "faults" in args.cases:
+                if args.own_listeners and os.path.isdir(h.state_dir):
+                    h.prefix = json.loads(h.cli("config").stdout)["derived"]["prefix"]
+                if "faults" in args.cases and os.path.isdir(h.state_dir):
                     h.cli("debug", "gc")
             except Exception as e:
                 problems.append(f"host {h.label}: collecting garbage: {e}")
@@ -886,8 +934,14 @@ COST = {"image_template": 30, "pause_resume": 6, "migrate": 3, "checkpoint_resto
         "faults/cow_exact": 7, "faults/cow_rescue_fail": 20, "faults/prepared_retry": 7, "faults/ckpt_failed_stop": 7, "faults/exec_race": 7,
         "faults/prepare_fail": 6, "faults/route": 6, "faults/route_abort": 30, "faults/basic": 6, "faults/slow_preload": 6, "faults/bad_preload": 6, "faults/refused": 6,
         "faults/resume_kill": 5, "faults/lost_ack": 5, "faults/ckpt_rearm": 5, "faults/cow_abort": 5,
-        "faults/ckpt_packet_hold": 4, "faults/checkpoint_hotplug": 4, "faults/arrival_grew": 30, "faults/arrival_grew_admitted": 40, "faults/log_cap": 8, "faults/arrival_log": 13}
+        "faults/ckpt_packet_hold": 4, "faults/checkpoint_hotplug": 4, "faults/arrival_grew": 30, "faults/arrival_grew_admitted": 40, "faults/log_cap": 8, "faults/arrival_log": 13,
+        "faults/guest_hang": 60, "faults/app_log": 35, "faults/resume_suspending": 22, "faults/wildcard_listen": 22,
+        "faults/target_killed": 20, "faults/start_admission": 18, "faults/standby_admission": 17, "faults/forged_pages": 13,
+        "faults/cow_wp_race": 13, "faults/pause_lost": 12, "faults/fetch_tail_enomem": 12, "faults/fetch_enomem_stuck": 11,
+        "faults/suspend_resume": 9, "faults/ctrl_z_long_op": 8, "faults/resume_failures": 7, "faults/suspend_killed": 6,
+        "faults/source_unpublished": 6, "faults/cow_crash": 6}
 BATCH_S = 20
+SELFTEST_SKIP_NAME = "wildcard_listen"
 
 
 def lanes():
@@ -909,7 +963,8 @@ def main():
     # (name, templates it needs, cost): the cases, and each scenario on its own.
     work = [(c, set() if c == "image_template" else {args.template}, COST.get(c, 2)) for c in selected if c != "faults"]
     # Growth (and checkpoint_hotplug, unplug_collapsed and mem_refused_fill, which need room to plug) runs on GROW; fc_prepare needs a second template to mismatch with.
-    work += [(f"faults/{s}", {args.template, GROW} if s in ("cow_grow", "plug_race", "plug_storm", "checkpoint_hotplug", "unplug_collapsed", "fc_prepare", "mem_refused_fill") else {args.template},
+    work += [(f"faults/{s}", ({args.template, GROW} if s in ("cow_grow", "plug_race", "plug_storm", "checkpoint_hotplug", "unplug_collapsed", "fc_prepare", "mem_refused_fill") else {args.template})
+              | ({APP} if s in APP_FAULTS else set()),
               COST.get(f"faults/{s}", 2)) for s in scenarios]
     work.sort(key=lambda w: -w[2])
     scheduled = list(work)
@@ -921,10 +976,17 @@ def main():
         with out_lock:
             print(line, flush=True)
 
-    def build(name, *extra):
+    def build(name, *extra, image=False):
         t = time.time()
         try:
-            r = flexvm("template", name, *extra, timeout=600) if not args.selftest else None
+            layout = image_layout()
+            if args.selftest:
+                r = None
+            elif not image:
+                r = flexvm("template", name, *extra, timeout=600)
+            else:
+                # From the cached image (CI), else pulled, its HTTP 429s retried.
+                r = flexvm("template", name, "--image", layout, *extra, timeout=600) if layout else pull_template(name, list(extra))
             out, ok = (r.stdout + r.stderr).strip() if r else "(selftest)", True
         except Exception as e:
             out, ok = str(e), False
@@ -948,8 +1010,9 @@ def main():
                 lock.wait()
             if not ready:
                 return None
+            # A batch's worker starts its hosts' listeners, or leaves them to faults.py: never both.
             batch = [ready[0]]
-            for w in reversed(ready[1:]):
+            for w in reversed([w for w in ready[1:] if own(w[0]) == own(ready[0][0])]):
                 if sum(b[2] for b in batch) + w[2] > BATCH_S:
                     break
                 batch.append(w)
@@ -959,6 +1022,9 @@ def main():
 
     spawned = []
 
+    def own(name):
+        return name.startswith("faults/") and name.split("/", 1)[1] in LISTENER_FAULTS
+
     def spawn(cmd, cases, scens, res):
         """A worker process; under --selftest a fake one, and the second spawn fails as with EMFILE."""
         if args.selftest:
@@ -966,7 +1032,9 @@ def main():
                 spawned.append((cases, scens))
                 if len(spawned) == 2:
                     raise OSError(24, "Too many open files (selftest)")
-            fake = ("import json, sys; c, s, res = json.loads(sys.argv[1]); [print(f'scenario {x}: ok in 0.0 s') for x in s]; "
+            # SELFTEST_SKIP's scenario says it skipped, as faults.py does.
+            fake = ("import json, sys; c, s, res = json.loads(sys.argv[1]); "
+                    f"[print(f'scenario {{x}}: ' + ('SKIPPED (selftest)' if x == {SELFTEST_SKIP_NAME!r} else 'ok') + ' in 0.0 s') for x in s]; "
                     "json.dump([[x, 'PASS', 0.0] for x in c] + ([['faults', 'PASS', 0.0]] if s else []), open(res, 'w'))")
             cmd = [sys.executable, "-c", fake, json.dumps([cases, scens, res])]
         return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, text=True)
@@ -982,6 +1050,7 @@ def main():
                "--template", args.template, "--templates", TEMPLATES, "--image", args.image, "--results", res,
                *(["--image-cache", os.path.abspath(args.image_cache)] if args.image_cache else []),
                "--faults", " ".join(scens), *(["--no-image"] if args.no_image else []),
+               *(["--own-listeners"] if any(own(c) for c in batch) else []), *(["--no-skips"] if args.no_skips else []),
                *cases, *(["faults"] if scens else [])]
         say(f"[{label}] {' '.join(batch)}")
         t = time.time()
@@ -991,12 +1060,15 @@ def main():
         got = []
         for line in p.stdout:
             say(f"[{label}] {line.rstrip()}")
-            m = re.match(r"scenario (\S+): (ok|FAILED) in ([\d.]+) s$", line.strip())
+            m = re.match(r"scenario (\S+): (ok|FAILED|SKIPPED)(?: \(.*\))? in ([\d.]+) s$", line.strip())
             if m:
-                got.append((f"faults/{m.group(1)}", "PASS" if m.group(2) == "ok" else "FAIL", float(m.group(3)), label))
+                st = {"ok": "PASS", "FAILED": "FAIL", "SKIPPED": "SKIP"}[m.group(2)]
+                got.append((f"faults/{m.group(1)}", st, float(m.group(3)), label))
         code = p.wait()
         try:
-            got += [(c, st, d, label) for c, st, d in json.load(open(res)) if c != "faults" or st == "FAIL"]
+            # The faults case fails for a skip under --no-skips, which its scenario's own line says already.
+            skip_only = args.no_skips and any(g[1] == "SKIP" for g in got) and not any(g[1] == "FAIL" for g in got)
+            got += [(c, st, d, label) for c, st, d in json.load(open(res)) if c != "faults" or (st == "FAIL" and not skip_only)]
         except (OSError, ValueError):
             got.append((f"worker {label}", "FAIL", time.time() - t, label))
         if code != 0 and not any(g[1] == "FAIL" for g in got):
@@ -1017,9 +1089,11 @@ def main():
             with lock:
                 summary.extend(got)
 
-    builders = [threading.Thread(target=build, args=(args.template, "--vcpus", "2", "--max", "2048")),
+    builders = [threading.Thread(target=build, args=(args.template, "--vcpus", "2", "--max", TEMPLATE_MAX)),
                 # A larger ceiling with little plugged at the start: VMs must grow.
                 threading.Thread(target=build, args=(GROW, "--vcpus", "2", "--max", "6144", "--plug", "128"))]
+    if any(s in APP_FAULTS for s in scenarios):
+        builders.append(threading.Thread(target=build, args=(APP, *APP_OPTS), kwargs={"image": True}))
     runners = [threading.Thread(target=lane, args=(i, *l), daemon=True) for i, l in enumerate(lanes())]
     try:
         for t in builders + runners:
@@ -1041,16 +1115,22 @@ def main():
     done = {r[0] for r in summary}
     summary.extend((name, "FAIL", 0.0, "not run") for name, _, _ in scheduled if name not in done)
     summary.sort(key=lambda r: -r[2])
-    failed = [r for r in summary if r[1] != "PASS"]
+    skipped = [r for r in summary if r[1] == "SKIP"]
+    failed = [r for r in summary if r[1] == "FAIL" or (r[1] == "SKIP" and args.no_skips)]
     print("\n" + "\n".join(f"{s} {c} ({d:.1f} s, batch {b})" for c, s, d, b in summary))
-    print(f"{len(summary) - len(failed)} passed, {len(failed)} failed in {time.time() - started:.0f} s "
-          f"({sum(r[2] for r in summary):.0f} s of work in {len(lanes())} lanes)")
+    print(f"{len([r for r in summary if r[1] == 'PASS'])} passed, {len(skipped)} skipped{' (failures: --no-skips)' if skipped and args.no_skips else ''}, {len([r for r in summary if r[1] == 'FAIL'])} failed "
+          f"in {time.time() - started:.0f} s ({sum(r[2] for r in summary):.0f} s of work in {len(lanes())} lanes)")
     if args.selftest:
         # The second batch could not be spawned: exactly its cases and scenarios fail, the rest pass.
         bad = sorted(r[0] for r in failed)
         want = sorted(spawned[1][0] + [f"faults/{x}" for x in spawned[1][1]]) if len(spawned) > 1 else ["(no second batch)"]
-        print(f"selftest: failed {bad}, expected {want}")
-        return 0 if bad == want and len(summary) == len(scheduled) + 2 else 1
+        # Skipped, unless its batch was the one that could not be spawned.
+        want_skip = [f"faults/{SELFTEST_SKIP_NAME}"] if len(spawned) > 1 and SELFTEST_SKIP_NAME not in spawned[1][1] else []
+        print(f"selftest: failed {bad}, expected {want}; skipped {sorted(r[0] for r in skipped)}, expected {want_skip}")
+        mixed = [b for b in spawned if len({s in LISTENER_FAULTS for s in b[1]}) > 1]
+        print(f"selftest: batches mixing listener-owning scenarios with others: {mixed}")
+        return 0 if (bad == want and len(summary) == len(scheduled) + len(builders) and not mixed
+                     and sorted(r[0] for r in skipped) == want_skip) else 1
     return 1 if failed else 0
 
 

@@ -5,12 +5,21 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      heavy:
+        description: "Run the heavy shard (as the nightly does) instead of main and recovery"
+        type: boolean
+        default: false
+  # The heavy fault scenarios (scripts/e2e.py --shard heavy), nightly.
+  schedule:
+    - cron: "23 7 * * *"
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  # The nightly run never holds up (or is held up by) a push to main.
+  group: ci-${{ github.event_name == 'schedule' && 'nightly-' || '' }}${{ github.ref }}
   # Runs on main are never cancelled.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
@@ -51,9 +60,16 @@ jobs:
         run: python3 scripts/e2e.py --selftest --log-dir "$RUNNER_TEMP/e2e-selftest"
 
   e2e:
-    name: end-to-end (KVM)
+    # Shards (scripts/e2e.py --shard), side by side: main (the cases and most scenarios) and recovery
+    # (listener restarts with listeners of faults.py's own, the terminal, timeout-bound ones); the
+    # scheduled run takes heavy (GiB-scale guests, long windows) one scenario at a time.
+    name: end-to-end (KVM, ${{ matrix.shard }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: ${{ matrix.shard == 'heavy' && 150 || 45 }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON((github.event_name == 'schedule' || inputs.heavy) && '["heavy"]' || '["main", "recovery"]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -202,8 +218,14 @@ jobs:
           key: ${{ steps.img.outputs.prefix }}
           restore-keys: ${{ steps.img.outputs.prefix }}
 
+      # A scenario that finds the runner lacks what it tests (cgroup v2, THP, IPv6, a template's room)
+      # is a SKIP, which fails every shard (--no-skips).
       - name: End-to-end tests
-        run: sudo python3 -u scripts/e2e.py --jobs 4 --image "$E2E_IMAGE" --image-cache "$RUNNER_TEMP/image-cache" --log-dir "$RUNNER_TEMP/e2e-logs"
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          jobs=4; if [ "$SHARD" = heavy ]; then jobs=1; fi
+          sudo python3 -u scripts/e2e.py --shard "$SHARD" --jobs "$jobs" --no-skips --image "$E2E_IMAGE" --image-cache "$RUNNER_TEMP/image-cache" --log-dir "$RUNNER_TEMP/e2e-logs"
 
       - name: Image digest
         id: img-digest
@@ -215,7 +237,7 @@ jobs:
           done
           true
       - name: Save image
-        if: always() && steps.img-digest.outputs.digest != '' && steps.img-cache.outputs.cache-matched-key != format('{0}{1}', steps.img.outputs.prefix, steps.img-digest.outputs.digest)
+        if: always() && matrix.shard == 'main' && steps.img-digest.outputs.digest != '' && steps.img-cache.outputs.cache-matched-key != format('{0}{1}', steps.img.outputs.prefix, steps.img-digest.outputs.digest)
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/image-cache/oci
@@ -233,6 +255,6 @@ jobs:
         if: failure() || cancelled()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: e2e-logs
+          name: e2e-logs-${{ matrix.shard }}
           path: ${{ runner.temp }}/e2e-logs
           if-no-files-found: ignore

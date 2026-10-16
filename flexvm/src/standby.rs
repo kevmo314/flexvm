@@ -449,7 +449,7 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
         match claim(p, &req) {
             Ok(v) => {
                 p.forget_stop();
-                crate::host::stall("claim_stall");
+                crate::host::gate("claim_stall");
                 let _ = std::fs::remove_file(&sock);
                 p.serve_control();
                 // A claimer gone before its answer (a foreground `run` interrupted) would leave
