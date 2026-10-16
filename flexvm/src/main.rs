@@ -841,9 +841,7 @@ pub fn exec_session(host: &Host, name: &str, cmd: &str, session: &Mutex<Session>
             }
             (s.started, s.offset)
         };
-        // Once it holds the exit, the VM process releases the session for us (not a VM's main command's,
-        // which a suspend may leave to reattach to).
-        let req = json!({"op": "exec", "session": id, "action": if started { "attach" } else { "start" }, "offset": offset, "cmd": cmd, "release": !patient});
+        let req = json!({"op": "exec", "session": id, "action": if started { "attach" } else { "start" }, "offset": offset, "cmd": cmd});
         let at = Instant::now() + Duration::from_secs(5);
         let stream = vmproc::connect(host, name, &req, &[], at).and_then(|c| exec_stream(c, at));
         // Locked per write, never across a read: a checkpoint takes stdout's lock too.
@@ -927,9 +925,11 @@ fn exec_frames(r: &mut impl Read, session: &Mutex<Session>, stdout: &mut impl Wr
                 return Err(format!("session output lost: needed offset {}, retained output starts at {start}", s.offset).into());
             }
             guest::FRAME_MSG if data == id.as_bytes() => (s.started, echoed) = (true, true),
-            // A reattach after the connection was lost: released meanwhile, its exit was already relayed.
+            // A reattach after the connection was lost, to a session closed meanwhile (acknowledged, or reclaimed).
             guest::FRAME_MSG if s.started && !echoed && data == b"error: session closed" => {
-                return Err(format!("lost the connection to the vm after byte {} of output; the command has ended and the rest is gone", s.offset).into())
+                return Err(
+                    format!("lost the connection to the vm after byte {} of output; the session has since been closed and the rest is gone", s.offset).into()
+                )
             }
             guest::FRAME_MSG if data == b"waiting" && s.started => {}
             // Before the id echo the request itself failed: not retried.
@@ -1320,7 +1320,7 @@ mod exec_tests {
     }
 
     #[test]
-    fn a_reattach_to_a_released_session_ends_at_once() {
+    fn a_reattach_to_a_closed_session_ends_at_once() {
         let session = Mutex::new(Session { id: "test-id".into(), started: true, offset: 5, exit: None });
         // Within one attachment, a closed session is only a lost connection, retried.
         let input = frames(&[(guest::FRAME_MSG, b"test-id"), (guest::FRAME_MSG, b"error: session closed")]);
