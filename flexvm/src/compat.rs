@@ -68,10 +68,7 @@ impl Compat {
                 host.tsc_khz
             );
         }
-        let missing: Vec<_> = self.msrs.difference(&host.msrs).map(|index| format!("{index:#x}")).collect();
-        if !missing.is_empty() {
-            bail!("snapshot incompatible with this host: KVM lacks saved MSRs {}", missing.join(", "));
-        }
+        check_msrs(&self.msrs, &host.msrs)?;
         for (word, &want) in &self.features {
             let missing = want & !host.features.get(word).copied().unwrap_or(0);
             if missing != 0 {
@@ -153,6 +150,16 @@ pub fn check(template: &Template, pid: u32) -> Result<()> {
     template.meta.compatibility.check(&local(pid)?)
 }
 
+/// Firecracker saves the MSRs of the host that took the snapshot, not the template's: a VM
+/// that moved to a host with more brings them along, and a load on a host without them fails.
+pub fn check_msrs(saved: &BTreeSet<u32>, host: &BTreeSet<u32>) -> Result<()> {
+    let missing: Vec<_> = saved.difference(host).map(|index| format!("{index:#x}")).collect();
+    if !missing.is_empty() {
+        bail!("snapshot incompatible with this host: KVM lacks saved MSRs {}", missing.join(", "));
+    }
+    Ok(())
+}
+
 /// KVM_GET_SUPPORTED_CPUID as [function, index, eax, ebx, ecx, edx].
 fn supported_cpuid(kvm: &File) -> Result<Vec<[u32; 6]>> {
     const MAX: usize = 256;
@@ -173,6 +180,9 @@ fn tsc_khz(kvm: &File) -> Result<u32> {
     let vm = unsafe { OwnedFd::from_raw_fd(ioctl(kvm, 0xae01, 0, "KVM_CREATE_VM")?) };
     let vcpu = unsafe { OwnedFd::from_raw_fd(ioctl(&vm, 0xae41, 0, "KVM_CREATE_VCPU")?) };
     let khz = ioctl(&vcpu, 0xaea3, 0, "KVM_GET_TSC_KHZ")? as u32;
+    // Destroying a VM waits out RCU grace periods: 20-40 ms under nested virtualization,
+    // which every start, restore and migration target would otherwise wait for.
+    std::thread::spawn(move || drop((vcpu, vm)));
     if khz == 0 {
         bail!("KVM_GET_TSC_KHZ returned zero");
     }
@@ -350,6 +360,10 @@ mod tests {
         target.msrs.remove(&0xda0);
         let error = snapshot.check(&target).unwrap_err().to_string();
         assert!(error.contains("saved MSRs 0x122, 0xda0"), "{error}");
+        // A source host with more than the template: what it saves is checked on its own.
+        let source: BTreeSet<u32> = [0x10, 0x3b].into();
+        check_msrs(&source, &snapshot.msrs).unwrap_err();
+        check_msrs(&source, &target.msrs).unwrap();
     }
 
     #[test]

@@ -152,9 +152,6 @@ fn runs(h: &Hosts, args: &Args, template: &str, date: &str, id: &str) -> Result<
     let standby = samples.iter().filter(|s| s["standby"] == json!(true)).count();
     let mut summary = run_summary(&samples)?;
     summary["run_standby_hits"] = json!(standby);
-    if ready.is_some() {
-        summary["client"] = summarize(&samples, "client")?;
-    }
     if h.to.is_some() {
         summary["migrate"] = summarize(&samples, "migrate")?;
         summary["migrate_target"] = summarize(&samples, "migrate_target")?;
@@ -372,6 +369,10 @@ fn run_summary(samples: &[Value]) -> Result<Value> {
         if !population.is_empty() {
             summary[group] = summarize(&population, "run")?;
             summary[format!("{group}_client")] = summarize(&population, "run_client")?;
+            // With --ready-port: until the app answers.
+            if population.iter().all(|s| s.get("client").is_some()) {
+                summary[group.replace("run", "ready")] = summarize(&population, "client")?;
+            }
         }
     }
     Ok(summary)
@@ -456,6 +457,18 @@ mod tests {
         assert_eq!(summary["run_cold_client"]["total"]["count"], 1);
         assert!(summary["run_standby"]["snapshot_load"].is_null());
         assert!(run_summary(&samples[..2]).unwrap()["run_cold"].is_null());
+        assert!(summary["ready_standby"].is_null());
+        let ready: Vec<_> = samples
+            .iter()
+            .cloned()
+            .map(|mut s| {
+                s["client"] = json!({"total": s["run_client"]["total"].as_f64().unwrap() + 10.0});
+                s
+            })
+            .collect();
+        let summary = run_summary(&ready).unwrap();
+        assert_eq!(summary["ready_standby"]["total"]["max"], 15.0);
+        assert_eq!(summary["ready_cold"]["total"]["count"], 1);
     }
 
     #[test]

@@ -144,8 +144,11 @@ refuses a host with a different CPU model or Firecracker, a missing feature
 bit, another XSAVE layout, or a missing saved MSR, naming the mismatch. TSC
 rates may differ by up to 250 ppm (Firecracker’s calibration tolerance); larger
 differences require target KVM TSC scaling. Extra feature bits and MSRs are
-fine. Templates built before these records must be rebuilt. Host probes are
-cached per process while the Firecracker binary is unchanged.
+fine. Firecracker saves the MSRs of the host that takes the snapshot, so a
+migration's source also sends its own set, which the target checks before the
+source pauses. Templates built before these records must be rebuilt, and
+checkpoints and suspended VMs of such a template cannot be restored. Host
+probes are cached per process while the Firecracker binary is unchanged.
 
 ### Pages
 

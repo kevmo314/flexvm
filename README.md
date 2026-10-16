@@ -301,7 +301,8 @@ to this host's do). Reports land in `bench/`. With `--dirty-mib`, the guest read
 back before and right after the migration; `post_copy` has the difference
 (`stall`) and the target's fault service per kind, including write-protect faults.
 Run percentiles are split into `run_standby` and `run_cold` (with matching
-`*_client` groups); an absent population is omitted. Phase percentiles use only
+`*_client` groups, and `ready_standby`/`ready_cold` with `--ready-port`); an
+absent population is omitted. Phase percentiles use only
 samples containing that phase and include a `count`. Lifecycle `pause_client`
 and `resume_client` include signal dispatch and state polling at 1 ms intervals;
 they are client-observed times, with each trial reporting ten cycles' median.
