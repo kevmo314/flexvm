@@ -2538,14 +2538,26 @@ pub fn mem_available_override() -> Option<u64> {
 /// Test hook: a window for a test to kill the process here.
 pub fn stall(name: &str) {
     if fault(name) {
+        reached(name);
         std::thread::sleep(Duration::from_secs(3));
     }
 }
 
 /// Test hook: parks here while `name` is armed (its arming bounds the wait), until a test disarms it.
 pub fn gate(name: &str) {
+    if fault(name) {
+        reached(name);
+    }
     while fault(name) {
         std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Test hook: tells a test this process got to `name` (RUN/gates/NAME.PID), so it acts there, not after a guessed delay.
+fn reached(name: &str) {
+    if let Some(dir) = RUN_DIR.get().map(|r| r.join("gates")) {
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(dir.join(format!("{name}.{}", std::process::id())), b"");
     }
 }
 

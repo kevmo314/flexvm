@@ -745,8 +745,8 @@ impl Proc {
             prepared.pager.pull_fail.store(40, Ordering::SeqCst);
         }
         if fault("fetch_enomem_stuck") {
-            // Late enough for the load (and the resume) to get their pages.
-            *prepared.pager.stuck_from.lock().unwrap() = Some(Instant::now() + Duration::from_millis(500));
+            // Pullers held off from here; copies fail from the resume on (below), once the load had its pages.
+            *prepared.pager.stuck_from.lock().unwrap() = Some(Instant::now() + Duration::from_secs(86400));
         }
         // A retry first drains the preload off the connection (the source still serves those pages).
         let seed = Some((runs, Origin::Peer(source.clone())));
@@ -803,6 +803,10 @@ impl Proc {
                 vm.set_failed();
             }
             t.mark("resume");
+            // Test fault `fetch_enomem_stuck`: its copies fail from now on.
+            if let Some(from) = vm.pager.stuck_from.lock().unwrap().as_mut() {
+                *from = Instant::now();
+            }
         }
         drop(committed);
         self.publish();
