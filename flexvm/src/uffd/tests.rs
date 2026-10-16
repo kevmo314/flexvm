@@ -196,7 +196,7 @@ fn dirty_count_skips_untouched_chunks() {
             w.store(u64::MAX, Ordering::Relaxed);
         }
         assert_eq!(p.dirty_count(), count);
-        assert_eq!(p.dirty_bits(true).iter().map(|w| w.count_ones() as usize).sum::<usize>(), count);
+        assert_eq!(p.dirty_bits(true).count(), count);
         assert_eq!(p.dirty_count(), 0);
         if n > CHUNK {
             assert!(full() > 0);
@@ -210,10 +210,10 @@ fn dirty_scan_skips_untouched_chunks_and_keeps_dirty_base_pages() {
     p.mark_dirty(CHUNK + 7);
     p.mark_dirty(CHUNK * 3);
     let bits = p.dirty_bits(true);
-    assert_eq!(bits.iter().map(|b| b.count_ones()).sum::<u32>(), 2);
-    assert_eq!(p.dirty_bits(false).iter().sum::<u64>(), 0);
+    assert_eq!(bits.count(), 2);
+    assert_eq!(p.dirty_bits(false).count(), 0);
     p.restore_dirty(&bits);
-    assert_eq!(p.dirty_bits(false), bits);
+    assert_eq!(p.dirty_bits(false).bits, bits.bits);
     assert!(!p.touched(0));
     assert!(!p.touched(CHUNK * 2));
 }

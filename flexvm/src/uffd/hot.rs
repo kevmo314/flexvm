@@ -160,7 +160,7 @@ impl Pager {
         let spans: Vec<(usize, usize)> = self.mappings().iter().map(|m| m.span()).collect();
         let eligible = |p: usize| pages.get(p) == PRESENT && spans.iter().any(|&(a, b)| (a..b).contains(&p));
         // One past what fits is enough to know they do not.
-        let hot: Vec<usize> = pages.hot_pages(&before).filter(|&p| eligible(p)).take(buf.pages() + 1).collect();
+        let hot: Vec<usize> = pages.hot_pages(&before.bits).filter(|&p| eligible(p)).take(buf.pages() + 1).collect();
         if hot.len() > buf.pages() {
             self.recycle_buf(buf);
             return None;
