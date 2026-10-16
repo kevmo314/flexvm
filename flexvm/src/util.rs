@@ -997,9 +997,32 @@ pub fn rename_noreplace(tmp: &Path, path: &Path) -> io::Result<bool> {
     }
 }
 
+/// Characters of the boot id in `write_tag`.
+pub const BOOT_TAG: usize = 8;
+
+/// What names this process in `write_file`'s temporary files: `PID-START-BOOT` (its start time
+/// and the first `BOOT_TAG` characters of the boot id), so a sweep tells a dead writer's from a
+/// live one that got its pid, in this boot or after a reboot (`host::write_debris_of`). A bare
+/// PID if either cannot be read.
+pub fn write_tag() -> String {
+    static TAG: std::sync::Mutex<Option<(u32, String)>> = std::sync::Mutex::new(None);
+    let pid = std::process::id();
+    let mut t = TAG.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, tag)) = t.as_ref().filter(|(p, _)| *p == pid) {
+        return tag.clone();
+    }
+    let boot = crate::host::boot_id().get(..BOOT_TAG).filter(|b| !b.contains('-'));
+    let tag = match (crate::host::starttime(pid), boot) {
+        (Some(start), Some(boot)) => format!("{pid}-{start}-{boot}"),
+        _ => return pid.to_string(),
+    };
+    *t = Some((pid, tag.clone()));
+    tag
+}
+
 /// Durably: the file is fsynced before the rename, its directory after.
 pub fn write_file(dir: &Path, name: &str, data: &[u8], durable: bool) -> io::Result<()> {
-    let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
+    let tmp = dir.join(format!(".{name}.{}.tmp", write_tag()));
     let mut f = std::fs::File::create(&tmp)?;
     let res = (|| {
         f.write_all(data)?;
@@ -1673,7 +1696,7 @@ mod tests {
         let dir = crate::test_util::TempDir::new("write-file");
         std::fs::create_dir_all(dir.join("dest")).unwrap();
         assert!(write_file(&dir, "dest", b"data", true).is_err());
-        assert!(!dir.join(format!(".dest.{}.tmp", std::process::id())).exists());
+        assert!(!dir.join(format!(".dest.{}.tmp", write_tag())).exists());
     }
 
     #[test]

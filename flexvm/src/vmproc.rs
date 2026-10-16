@@ -486,6 +486,11 @@ impl Proc {
         self.host.fence(ip, self.gen()).map_err(|e| format!("{e}; restore with --ip auto").into())
     }
 
+    /// The address this VM holds, if any.
+    pub fn ip(&self) -> Option<Ipv4Addr> {
+        self.addr.lock().unwrap().as_ref().map(|a| a.ip)
+    }
+
     pub fn gen(&self) -> u64 {
         self.addr.lock().unwrap().as_ref().map_or(0, |a| a.gen)
     }
@@ -3121,7 +3126,7 @@ mod tests {
     /// The temporary file `util::write_file` makes for `dir/name`, taken by a directory: writing it fails.
     fn block_write(dir: &std::path::Path, name: &str) -> PathBuf {
         std::fs::create_dir_all(dir).unwrap();
-        let blocker = dir.join(format!(".{name}.{}.tmp", std::process::id()));
+        let blocker = dir.join(format!(".{name}.{}.tmp", crate::util::write_tag()));
         std::fs::create_dir(&blocker).unwrap();
         blocker
     }

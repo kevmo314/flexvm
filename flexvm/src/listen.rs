@@ -146,6 +146,14 @@ pub fn main(host: Host, listener: TcpListener) -> Result<()> {
     }
     let underlay = host.cfg.underlay().map_or("none".into(), |u| u.to_string());
     crate::log!("flexvm listening on {} (underlay {underlay}, announce device {})", listener.local_addr()?, dev.as_deref().unwrap_or("none"));
+    // A sweep and a refill now, not after the first period: a listener started at boot is
+    // what recovers a quiet host (#555).
+    let first = host.clone();
+    std::thread::spawn(move || {
+        if !crate::gc::after_boot(&first, true) {
+            crate::gc::recover(&first);
+        }
+    });
     crate::standby::maintain(host.clone());
     crate::gc::periodic(host.clone());
     let peers = Peers::watch(host.clone());

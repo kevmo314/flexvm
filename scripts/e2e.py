@@ -72,7 +72,7 @@ FAULTS = ("basic route route_abort lost_ack unknown refused pages_blip pages_dea
 # terminal's, and the ones bound by timeouts (a guest that never answers; a pager that fails or
 # never gets its pages, gated deterministically).
 LISTENER_FAULTS = {"suspend_resume", "target_killed", "unit_restart", "wildcard_listen", "peer_by_name", "peer_moved",
-                   "peer_unresolvable", "late_withdrawal", "resume_listener_restart", "arrival_cap_restart"}
+                   "peer_unresolvable", "late_withdrawal", "resume_listener_restart", "arrival_cap_restart", "reboot"}
 RECOVERY_FAULTS = " ".join(sorted(LISTENER_FAULTS)) + " terminal guest_hang uffd_err fetch_tail_enomem fetch_enomem_stuck cow_wp_race"
 # GiB-scale guests (pages_dead, source_killed_basic, which runs source_killed, pull_died, kill_source,
 # kill_refused_checkpoint, quiet_source, checkpoint_crash, suspend_disk_freed), long device and
@@ -929,7 +929,7 @@ def worker():
 # runs, as e2e.py's summary prints them): --split balances by these, the long ones start first, and
 # the short ones go in batches of about BATCH_S (each batch is a worker, with hosts of its own).
 # Unlisted ones count as 2 s.
-COST = {"faults/exec_background": 110, "faults/mem_refused_fill": 92, "faults/arrival_overtaken": 78,
+COST = {"faults/exec_background": 110, "faults/reboot": 40, "faults/mem_refused_fill": 92, "faults/arrival_overtaken": 78,
         "faults/cow_grow": 65, "faults/reconcile_kill": 64, "faults/plug_race": 45, "faults/guest_hang": 44,
         "faults/exec_pause_grace": 42, "faults/route_abort": 35, "faults/unplug_collapsed": 30,
         "faults/arrival_grew": 25, "faults/evict_latency": 25, "faults/mem_high": 25, "faults/target_killed": 25,

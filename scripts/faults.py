@@ -4097,8 +4097,15 @@ def resume_mark_fails():
     resume_suspended(A, n)
     disarm()
     check("marker kept: quarantined", vms(A).get(n, {}).get("state") == "quarantined", vms(A).get(n))
+    ip = vms(A)[n]["ip"]
     open(os.path.join(d, "STARTED"), "w").close()
     check("marker kept: no longer listed (consumed)", n not in vms(A), vms(A).get(n))
+    # A reboot that showed STARTED on disk: that resume never ran its VM, so its earlier boot's
+    # quarantine no longer keeps a sweep from withdrawing the generation (#556).
+    q = open(os.path.join(d, "QUARANTINE")).read()
+    open(os.path.join(d, "QUARANTINE"), "w").write("another-boot " + q.split(" ", 1)[1])
+    ok(cli_json(A, "debug", "gc"))
+    check("marker kept, after a reboot: its generation withdrawn", addr(A, ip).get("withdrawn") is True and addr(A, ip).get("holder") is None, addr(A, ip))
     r = resume_suspended(A, n)
     check("marker kept: no resume (nothing replays)", not r["ok"], r)
     check("marker kept: checkpoint deleted", not os.path.exists(d))
@@ -8724,6 +8731,99 @@ def restore_route_fence():
     rm_ckpt(path)
 
 
+def kill_tree(pid):
+    """SIGKILLs `pid` and its descendants (children first listed, then all killed), as a power loss would end them."""
+    pids, todo = [], [pid]
+    while todo:
+        p = todo.pop()
+        pids.append(p)
+        todo += children(p)
+    for p in pids:
+        try:
+            os.kill(p, signal.SIGKILL)
+        except OSError:
+            pass
+    return pids
+
+
+def reboot():
+    """#553, #555, #556: B rebooted, emulated: its listener, VM and standby processes SIGKILLed,
+    its run directory emptied (tmpfs) and its kernel routes gone. Another state opening first
+    without --run gets a run directory of its own, never B's. The first command of B's after it
+    withdraws what the lost VMs held (so A takes back the loan of one that migrated in),
+    lists them as lost until killed, puts back B's route to a peer's VM from its records and
+    refills B's standby VMs."""
+    own_listeners("reboot")
+    t, local, moved = args.template, "ft-reboot-local", "ft-reboot-moved"
+    scenario_vms.update([local, moved])
+    lent = lambda ip: addr(A, ip).get("lent")
+    ok(run(B, local))
+    ip_local = vms(B)[local]["ip"]
+    setup(moved, mib=1)
+    ip_moved = vms(A)[moved]["ip"]
+    ok(migrate(A, moved, B))
+    wait_released(B, moved)
+    check("reboot: lent while away", lent(ip_moved) is not None, addr(A, ip_moved))
+    # A peer's VM that B routes to (via the default gateway, not an address of ours, so the route is really made).
+    gw = subprocess.run(["ip", "route", "show", "default"], capture_output=True, text=True).stdout.split()[2]
+    ip_peer = A.ips.split("-")[1].rsplit(".", 1)[0] + ".203"
+    gen = addr(B, ip_peer).get("seen", 0) + 1
+    r = peer(B, {"op": "route", "ip": ip_peer, "via": gw, "gen": gen, "rev": 0})
+    check("reboot: B routes the peer's vm", r.get("ok") and f"via {gw}" in peer_route(ip_peer), (r, peer_route(ip_peer)))
+    other = tempfile.mkdtemp(prefix="fvp-other-", dir="/var/tmp")
+    other_run = None
+    try:
+        ok(cli_json(B, "standby", "--template", t, "1"))
+        check("reboot: a standby vm", wait_for(lambda: len(standby_pids(B, t)) == 1, 60), standby_pids(B, t))
+        victims = [vm_pid(B, local), vm_pid(B, moved), *standby_pids(B, t)]
+        listener = listeners.pop(B.addr)
+        killed = kill_tree(listener.pid) + [p for v in victims for p in kill_tree(v)]
+        listener.wait()
+        check("reboot: everything of B's is dead", wait_for(lambda: not any(alive(p) for p in killed), 10), [p for p in killed if alive(p)])
+        for e in os.listdir(B.run):
+            path = os.path.join(B.run, e)
+            if path != B.listen_log:
+                subprocess.run(["rm", "-rf", path])
+        subprocess.run(["ip", "route", "del", f"{ip_peer}/32"], capture_output=True)
+        check("reboot: the route is gone with it", peer_route(ip_peer) == "", peer_route(ip_peer))
+        # Another state opens first, without --run: it gets a run directory of its own, never B's.
+        r = subprocess.run([BIN, "--state", other, "ls"], capture_output=True, text=True, timeout=60, env=ENV)
+        other_run = json.load(open(os.path.join(other, "run.json"))) if os.path.exists(os.path.join(other, "run.json")) else None
+        check("reboot: another state gets a run directory of its own", r.returncode == 0 and other_run and other_run != os.path.realpath(B.run)
+              and not os.path.exists(os.path.join(B.run, "state.json")), (r.stderr, other_run))
+        r = subprocess.run([BIN, "--state", B.state, "ls"], capture_output=True, text=True, timeout=60, env=ENV)
+        check("reboot: B's state, bound elsewhere, is refused without its --run, never defaulted", r.returncode != 0
+              and f"give --run {os.path.realpath(B.run)}" in r.stderr and not os.path.exists(os.path.join(B.run, "state.json")), r.stderr)
+        r = subprocess.run([BIN, "--state", B.state, "--run", B.run, "ls", "--json"], capture_output=True, text=True, timeout=180, env=ENV)
+        check("reboot: B's state takes its run directory back", r.returncode == 0
+              and json.load(open(os.path.join(B.run, "state.json"))) == os.path.realpath(B.state), r.stderr)
+        check("reboot: its recovery is marked complete", open(os.path.join(B.run, ".boot")).read() == open("/proc/sys/kernel/random/boot_id").read().strip())
+        listed = {v["name"]: v for v in json.loads(r.stdout or "[]")}
+        check("reboot: the lost vms are listed, with why", all(listed.get(n, {}).get("state") == "lost" and "lost" in listed[n].get("error", "") for n in (local, moved)),
+              listed)
+        check("reboot: their addresses are withdrawn on B", all(addr(B, ip).get("withdrawn") is True and addr(B, ip).get("holder") is None for ip in (ip_local, ip_moved)),
+              (addr(B, ip_local), addr(B, ip_moved)))
+        check("reboot: A takes back its loan", wait_for(lambda: not lent(ip_moved) and addr(A, ip_moved).get("withdrawn") is True, 15), addr(A, ip_moved))
+        check("reboot: the route to the peer's vm is back", f"via {gw}" in peer_route(ip_peer), peer_route(ip_peer))
+        check("reboot: the standby vm is refilled", wait_for(lambda: len(standby_pids(B, t)) == 1, 60), standby_pids(B, t))
+        start_listener(B)
+        ok(kill(B, local))
+        check("reboot: kill clears a lost record", local not in vms(B) and moved in vms(B), vms(B))
+        n2 = "ft-reboot-again"
+        scenario_vms.add(n2)
+        ok(run(A, n2, ip=ip_moved))
+        check("reboot: A hands the address out again", where(n2) == {A: "running"}, where(n2))
+    finally:
+        if B.addr not in listeners:
+            start_listener(B)
+        cli_json(B, "standby", "--template", t, "0")
+        wait_for(lambda: not standby_pids(B, t), 30)
+        forget_peer_route(ip_peer, gen)
+        if other_run:
+            subprocess.run(["rm", "-rf", other_run])
+        subprocess.run(["rm", "-rf", other])
+
+
 SCENARIOS = dict(
     killed_migrated=killed_migrated,
     unread_output=unread_output,
@@ -8769,7 +8869,7 @@ SCENARIOS = dict(
     prepare_fail_announce=prepare_fail_announce, reconcile_announce=reconcile_announce, reconcile_kill=reconcile_kill, resume_pull_lock=resume_pull_lock, page_conns=page_conns, suspend_cmd=suspend_cmd, suspend_slow_cmd=suspend_slow_cmd, suspend_overlap=suspend_overlap, fc_died_busy=fc_died_busy, pause_cmd_start=pause_cmd_start, suspend_died=suspend_died,
     ctrl_z_long_op=ctrl_z_long_op, resume_suspending=resume_suspending, quit_status=quit_status, resume_outcome=resume_outcome, exec_recovery_instance=exec_recovery_instance,
     ckpt_ancestor_corrupt=ckpt_ancestor_corrupt, resume_listener_restart=resume_listener_restart,
-    resume_killed_marked=resume_killed_marked, restore_route_fence=restore_route_fence)
+    resume_killed_marked=resume_killed_marked, restore_route_fence=restore_route_fence, reboot=reboot)
 # Measurements, not correctness checks (nothing they print has a threshold): run only when named.
 BENCHMARKS = dict(ckpt_stall=ckpt_stall)
 del SCENARIOS["ckpt_stall"]

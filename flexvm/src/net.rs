@@ -639,8 +639,16 @@ pub fn proxy_arp(dev: &str) {
 }
 
 pub fn ip_forward() -> Result<()> {
-    std::fs::write("/proc/sys/net/ipv4/ip_forward", "1").map_err(|e| format!("ip_forward: {e}"))?;
-    Ok(())
+    enable("/proc/sys/net/ipv4/ip_forward".as_ref()).map_err(|e| format!("ip_forward: {e}").into())
+}
+
+/// Sets a boolean sysctl to 1, written only if it is not already: one already on is enough even
+/// where it is read-only (a container's /proc/sys).
+fn enable(path: &std::path::Path) -> std::io::Result<()> {
+    if std::fs::read_to_string(path).is_ok_and(|v| v.trim() == "1") {
+        return Ok(());
+    }
+    std::fs::write(path, "1")
 }
 
 pub fn gratuitous_arp(dev: &str, ip: Ipv4Addr) -> Result<()> {
@@ -928,5 +936,25 @@ mod tests {
             // Works without CAP_NET_ADMIN: no route request is sent.
             route_via(Ipv4Addr::new(192, 0, 2, 123), via).unwrap();
         }
+    }
+
+    /// An already enabled sysctl needs no write, so a read-only one that is on is no failure.
+    #[test]
+    fn a_sysctl_already_on_is_not_written() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = crate::test_util::TempDir::new("sysctl");
+        let (on, off) = (d.join("on"), d.join("off"));
+        for (p, v) in [(&on, "1\n"), (&off, "0\n")] {
+            std::fs::write(p, v).unwrap();
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o444)).unwrap();
+        }
+        assert!(enable(&on).is_ok());
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(enable(&off).is_err(), "off and read-only: a failure");
+        }
+        let w = d.join("w");
+        std::fs::write(&w, "0").unwrap();
+        enable(&w).unwrap();
+        assert_eq!(std::fs::read_to_string(&w).unwrap(), "1");
     }
 }

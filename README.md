@@ -64,6 +64,7 @@ web              10.200.0.1      default    running        41522   24       27  
 | `suspended` | on disk, no process (SIGTERM); `flexvm resume` brings it back |
 | `quarantined` | a suspended VM that cannot be resumed (its address generation is unknown); `restore` its directory with a new name and `--ip auto`, or `flexvm kill` it |
 | `failed` | died under its process (exit 124); `ls --json` (or `/run/flexvm/vms/NAME.failed`) says why, until `flexvm kill` |
+| `lost` | ran here when the host went down (a reboot, or its process was SIGKILLed); its address is withdrawn, until `flexvm kill` |
 
 Standby VMs are not listed: `flexvm standby` shows them.
 
@@ -84,7 +85,7 @@ messages) goes to `/run/flexvm/vms/web.log`. Logs live on tmpfs: past
 one is started; the logs of a name with nothing left on
 the host (no VM, suspended VM, `failed` or moved record) are removed once
 unwritten for an hour, by sweeps that run when a VM starts and about every
-30 s while a listener or any VM process runs.
+30 s while a listener or any VM process runs. Logs do not survive a reboot.
 
 ## Pause, suspend, destroy
 
@@ -196,7 +197,7 @@ Every VM process and listener sets `net.ipv4.ip_forward=1`, and
 `proxy_arp` on the announce device, and never reverts them: the host routes
 between all its interfaces from then on, so check its `FORWARD` policy.
 
-A host that only runs VMs needs no listener.
+A host that only runs VMs needs no listener, but see below for what recovers it after a reboot.
 
 Taps are named after the state directory (`f` and five characters of its
 hash, then the owning process's pid), so hosts on separate state directories
@@ -227,6 +228,30 @@ After=flexvm-listen.socket
 ExecStart=/usr/local/bin/flexvm listen
 Restart=on-failure
 # The default KillMode=control-group is right: see below.
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`systemctl enable --now flexvm-listen.socket flexvm-listen.service` starts the
+listener at boot too, not only when a peer connects: VMs do not survive a
+reboot, and flexvm processes recover the host after one (each tries until a
+pass completes, marked by `/run/flexvm/.boot`). It
+withdraws the addresses of the VMs it lost (telling the peers, so a home host
+takes back an address it lent), lists those VMs as `lost`, puts back the
+routes to VMs on peers, settles migrations the reboot interrupted, and
+refills the standby VMs. Any flexvm command run as root does this too, but a
+quiet host needs something to start; one without a listener can run
+`flexvm recover` at boot:
+
+```ini
+# /etc/systemd/system/flexvm-recover.service
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/flexvm recover
+
+[Install]
+WantedBy=multi-user.target
 ```
 
 The VM processes a listener starts (arrivals, standby VMs) move into
@@ -279,14 +304,18 @@ hold no secrets at startup. Details: [docs/images.md](docs/images.md).
 | flag | default | what |
 |---|---|---|
 | `--state DIR` | `/var/lib/flexvm` | everything on disk: `artifacts/` (`firecracker`, `vmlinux`, `rootfs.ext4`, `flexvm-init`), `templates/`, `images/` (pulled container images), `staging/` (where image layers unpack: root-owned, see [docs/images.md](docs/images.md)), host configuration, addresses, suspended VMs |
-| `--run DIR` | `/run/flexvm` | registry, sockets, logs (tmpfs) |
+| `--run DIR` | `/run/flexvm` (another `--state`'s: `/run/flexvm-PREFIX`) | registry, sockets, logs (tmpfs) |
 
 `template --image` runs `STATE/artifacts/flexvm-init` as PID 1 (`--init PATH`
 for another). Several hosts on one machine (tests, benchmarks) each take a `--state` and
 `--run` of their own; their `artifacts` and `templates` can be symlinks to one
 host's. On first open, each state directory permanently records its canonical run
 path in `run.json`, and the run directory records its state in `state.json`; using
-either with a different partner is refused.
+either with a different partner is refused. Without `--run`, the run directory follows
+from the state's path alone (`/run/flexvm` for `/var/lib/flexvm`, `/run/flexvm-PREFIX` for
+any other), so after a reboot no state defaults into another's; a state bound to any other
+run directory must be given it. `/run/flexvm` belongs to `/var/lib/flexvm` alone: any other state is
+refused it, even with `--run`.
 `FLEXVM_FAULTS=1` enables test fault injection only. The state layout is in
 [docs/process-per-vm.md](docs/process-per-vm.md#on-disk-state).
 
