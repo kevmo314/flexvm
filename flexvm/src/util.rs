@@ -782,12 +782,40 @@ type Seen = std::collections::HashSet<((u64, u64), Option<(u64, u64)>)>;
 /// link's target resolves through. Run when publishing in `dir`: an existing directory may have
 /// been made by a process that died before syncing it.
 fn sync_ancestors(dir: &Path) -> io::Result<()> {
-    sync_ancestors_with(dir, &mut Seen::new(), &mut |d| d.sync_all())
+    let mut dirs = Vec::new();
+    sync_ancestors_with(dir, &mut Seen::new(), &mut |d| d.try_clone().map(|d| dirs.push(d)))?;
+    sync_dirs_with(&dirs, &std::fs::File::sync_all)
 }
 
 /// As `sync_ancestors`, from a pinned directory: never by a path, which may since name another.
 pub fn sync_ancestors_fd(dir: RawFd) -> io::Result<()> {
-    walk_up(dir, &mut Seen::new(), &mut |d| d.sync_all())
+    sync_ancestors_fd_with(dir, &std::fs::File::sync_all)
+}
+
+fn sync_ancestors_fd_with(dir: RawFd, sync: &(impl Fn(&std::fs::File) -> io::Result<()> + Sync)) -> io::Result<()> {
+    let mut dirs = Vec::new();
+    walk_up(dir, &mut Seen::new(), &mut |d| d.try_clone().map(|d| dirs.push(d)))?;
+    sync_dirs_with(&dirs, sync)
+}
+
+/// Entries must already exist, with no dependency between these syncs. Pin all
+/// directories first, deduplicated by the walk; join every sync before returning.
+fn sync_dirs_with(dirs: &[std::fs::File], sync: &(impl Fn(&std::fs::File) -> io::Result<()> + Sync)) -> io::Result<()> {
+    let next = AtomicUsize::new(0);
+    let work = || {
+        let mut result = Ok(());
+        while let Some(dir) = dirs.get(next.fetch_add(1, Ordering::Relaxed)) {
+            result = result.and(sync(dir));
+        }
+        result
+    };
+    std::thread::scope(|s| {
+        // I/O can overlap even on one CPU. Bound threads for deep paths; if a
+        // spawn fails, this thread and any helpers still drain all the work.
+        let helpers: Vec<_> = (1..dirs.len().min(8)).map_while(|_| std::thread::Builder::new().spawn_scoped(s, work).ok()).collect();
+        let here = work();
+        helpers.into_iter().fold(here, |result, h| result.and(h.join().unwrap_or_else(|_| Err(io::Error::other("directory fsync thread panicked")))))
+    })
 }
 
 fn sync_ancestors_with(dir: &Path, seen: &mut Seen, sync: &mut impl FnMut(&std::fs::File) -> io::Result<()>) -> io::Result<()> {
@@ -1905,6 +1933,51 @@ mod tests {
             assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o700);
         }
         create_dir_durably(&dir, 0o700).unwrap();
+    }
+
+    #[test]
+    fn pinned_ancestors_are_synced_once_even_on_error() {
+        let root = crate::test_util::TempDir::new("ancestor-count");
+        std::fs::create_dir_all(root.join("a/b/c")).unwrap();
+        let path = root.join("a/b/c").canonicalize().unwrap();
+        let dir = open_dir(&path).unwrap();
+        let want: std::collections::HashSet<_> = path.ancestors().skip(1).map(|p| dir_id(open_dir(p).unwrap().as_raw_fd()).unwrap()).collect();
+        for fail in [false, true] {
+            let calls = std::sync::Mutex::new(Vec::new());
+            let result = sync_ancestors_fd_with(dir.as_raw_fd(), &|d| {
+                calls.lock().unwrap().push(dir_id(d.as_raw_fd())?);
+                if fail {
+                    Err(io::Error::other("injected fsync error"))
+                } else {
+                    Ok(())
+                }
+            });
+            assert_eq!(result.is_err(), fail);
+            let calls = calls.into_inner().unwrap();
+            assert_eq!(calls.len(), want.len(), "exactly one fsync per ancestor");
+            assert_eq!(calls.into_iter().collect::<std::collections::HashSet<_>>(), want);
+        }
+    }
+
+    #[test]
+    fn directory_syncs_overlap_and_join_on_error() {
+        let root = crate::test_util::TempDir::new("ancestor-overlap");
+        let dirs = [open_dir(&root).unwrap(), open_dir(&root).unwrap()];
+        let entered = std::sync::Mutex::new(0);
+        let ready = std::sync::Condvar::new();
+        let completed = AtomicUsize::new(0);
+        let result = sync_dirs_with(&dirs, &|_| {
+            let mut n = entered.lock().unwrap();
+            *n += 1;
+            ready.notify_all();
+            let (guard, timeout) = ready.wait_timeout_while(n, Duration::from_secs(5), |n| *n < 2).unwrap();
+            drop(guard);
+            assert!(!timeout.timed_out(), "fsyncs must overlap");
+            completed.fetch_add(1, Ordering::SeqCst);
+            Err(io::Error::other("injected fsync error"))
+        });
+        assert!(result.is_err());
+        assert_eq!(completed.load(Ordering::SeqCst), 2, "all syncs joined before returning an error");
     }
 
     #[test]

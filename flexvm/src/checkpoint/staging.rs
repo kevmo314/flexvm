@@ -86,8 +86,8 @@ impl Staging {
             .map_err(|e| format!("checkpoint directory {}: {e}", parent_path.display()))?;
         let base = CString::new(base.as_bytes())?;
         ensure!(crate::util::stat_at(pfd.as_raw_fd(), &base).is_none(), "{} already exists; checkpoints are never overwritten", dest.display());
-        // Its directory's own entry, up to the root, ahead of the pause; `commit` walks again, as then.
-        crate::util::sync_ancestors_fd(pfd.as_raw_fd()).map_err(|e| format!("checkpoint directory {}: {e}", parent_path.display()))?;
+        // Ancestors need durability only at publication. Walk once in commit, using
+        // the pinned directory's then-current ancestry (it may move during the write).
         check(unsafe { libc::flock(pfd.as_raw_fd(), libc::LOCK_EX) })?;
         // Let go of on the error paths too, before `pfd` closes; on success, handed to the staging lock below.
         let _parent_lock = Unlock(pfd.as_raw_fd());
@@ -231,7 +231,11 @@ impl Staging {
         if named.dev() != pinned.st_dev as u64 || named.ino() != pinned.st_ino as u64 {
             return Err(moved.into());
         }
-        // Again from the pinned directory: an ancestor may have been moved since (cheap if not).
+        // Sync each ancestor once, concurrently: all ancestor entries already exist,
+        // and all syncs finish before publication. A partial sync on failure leaves
+        // only private staging, never a published checkpoint. Use the pinned directory
+        // to cover ancestors moved during the write; the parent itself is synced only
+        // after rename below, to persist the checkpoint's new name.
         crate::util::sync_ancestors_fd(self.parent.as_raw_fd())?;
         t.mark("fsync");
         let (outer, parent) = (self.outer.as_raw_fd(), self.parent.as_raw_fd());
