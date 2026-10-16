@@ -3000,7 +3000,8 @@ def fc_prepare():
 
     def mismatch(put, load):
         code, body = put("/snapshot/load", load(other))
-        check("fc prepare: a snapshot of another layout is refused", code == 400 and "differs" in body, (code, body))
+        # Its devices sit elsewhere in guest memory, which the device check (#548) sees first.
+        check("fc prepare: a snapshot of another layout is refused", code == 400 and ("differs" in body or "not the ones prepared" in body), (code, body))
 
     def config_between(put, load):
         put("/boot-source", {"kernel_image_path": "/nonexistent"})
