@@ -254,7 +254,7 @@ FAULTS = ("pages", "route", "lost_ack", "status", "restore_no_hold", "restore_be
           "prepare_fail", "short_incoming", "slow_preload", "bad_preload", "bad_app_log", "kill_prepared", "guest_drop", "guest_lose_reply", "ckpt_copy_wait",
           "started_fsync", "started_unmark", "start_stall", "incoming_stall", "incoming_gate", "admitted_stall", "claim_stall", "standby_lock_stall", "standby_lock_hang", "handoff_stall", "ckpt_wp_race", "ckpt_rescue_fail",
           "fetch_tail_enomem", "fetch_enomem_stuck", "pull_enomem", "publish", "no_evict", "suspend_stall", "uffd_err", "publish_fsync", "revoke_cleanup", "no_admit", "no_meminfo", "release_stall", "release_late", "no_plug", "pause_lost", "tap_backlog", "tap_backlog_stuck", "pause_unknown", "restore_unpause_fail", "resume_link_fail", "resume_partial", "repause_fail", "pause_fail", "restore_ping_slow", "readdress_fail", "no_collapse", "collapse_slow", "pages_slow", "unlend_fail", "route_stall", "suspend_slow", "owe_fail", "settle_unpause", "prealloc_fail", "resume_fence_fail",
-          "leave_fail", "park_fail", "capture_fail", "preload_read_fail", "abort_gen_fail", "abort_stay_fail", "advance_fail", "commit_gate", "commit_fail")
+          "leave_fail", "park_fail", "capture_fail", "preload_read_fail", "abort_gen_fail", "abort_stay_fail", "advance_fail", "commit_gate", "commit_fail", "snapshot_fail")
 
 
 def disarm():
@@ -1388,10 +1388,16 @@ def one_owner(label, n, m, owner, ip, gen, before, lent=None, leaving=False):
     check(f"{label}: the address is held there by its generation",
           a.get("holder") == n and a.get("held") == gen and a.get("seen") == gen and not a.get("withdrawn"), a)
     check(f"{label}: lent {lent}, {'still' if leaving else 'no longer'} leaving", a.get("lent") == lent and bool(a.get("leaving")) == leaving, a)
+    nothing_on(label, other, n, ip, before)
+
+
+def nothing_on(label, other, n, ip, before):
+    """`other` has none of `n` left (as of `before`, from `boundary`): no process, arrival, name
+    lock, claim, tap or migration record (one left, its arrival killed say, reads aborted and goes
+    once asked about)."""
     lock = os.path.join(other.run, "vms", f"{n}.lock")
     left = lambda: (n in vms(other), os.path.exists(lock), arrivals(other), taps(other) - before[0], addr(other, ip).get("holder"))
     check(f"{label}: nothing of it left on {other}", wait_for(lambda: left() == (False, False, set(), set(), None), 15), left())
-    # A record left (its arrival killed, say) reads aborted, and goes once asked about.
     made = lambda: migs_of(other) - before[1]
     told = {mig: peer(other, {"op": "migration", "mig": int(mig)}).get("result", {}).get("outcome") for mig in made()}
     check(f"{label}: no migration record of it left on {other}", set(told.values()) <= {"aborted"} and wait_for(lambda: not made(), 10), (told, made()))
@@ -1441,13 +1447,14 @@ def leave_fail():
 
 def capture_fail():
     """#460: the source fails after it became one, before its target has a state: parking the
-    balloon (`park_fail`, still running), reading the captured vmstate (`capture_fail`, paused)
+    balloon (`park_fail`, still running), creating the snapshot (`snapshot_fail`, paused), reading
+    the captured vmstate (`capture_fail`)
     or the preloaded pages (`preload_read_fail`). Each time it runs here again intact, its address
     held by its generation with no loan or leaving mark, a revision past the one its target took;
     the target, which never got a state, leaves nothing behind. Then a migration goes."""
     n = "ft-capture-fail"
     m = setup(n, mib=20)
-    for f, why in (("park_fail", "parking the balloon failed"), ("capture_fail", "reading the vmstate failed"),
+    for f, why in (("park_fail", "parking the balloon failed"), ("snapshot_fail", "creating the snapshot failed"), ("capture_fail", "reading the vmstate failed"),
                    ("preload_read_fail", "reading the preloaded pages failed")):
         label = f"capture fail ({f})"
         v = vms(A)[n]
@@ -1489,9 +1496,7 @@ def abort_gen_fail():
     check("abort gen fail: its vCPUs stay paused", fc_api(api_sock(A, n), "GET", "/")["state"] == "Paused")
     a = addr(A, ip)
     check("abort gen fail: the address stays its, lent", a.get("holder") == n and a.get("held") == gen and a.get("lent") == gen, a)
-    lock = os.path.join(B.run, "vms", f"{n}.lock")
-    left = lambda: (n in vms(B), os.path.exists(lock), arrivals(B), taps(B) - before[0], addr(B, ip).get("holder"))
-    check("abort gen fail: nothing of it left on B", wait_for(lambda: left() == (False, False, set(), set(), None), 15), left())
+    nothing_on("abort gen fail", B, n, ip, before)
     code, out, err = cli(A, "resume", n)
     check("abort gen fail: flexvm resume does not run it",
           where(n) == {A: "failed"} and fc_api(api_sock(A, n), "GET", "/")["state"] == "Paused", (code, out, err, where(n)))
@@ -1534,6 +1539,8 @@ def commit_fail():
     t.start()
     try:
         check("commit fail: the arrival got to its commit", wait_for(lambda: reached(B, "commit_gate"), 30), reached(B, "commit_gate"))
+        # From here at most 5 s: Rust only gates with 10 s to spare before the deadlines.
+        fault(B, "commit_gate", 5000)
         pid = (reached(B, "commit_gate") or [0])[0]
         fcs = [c for c in children(pid) if b"--api-sock" in open(f"/proc/{c}/cmdline", "rb").read()]
         sock = lambda c: (lambda a: a[a.index(b"--api-sock") + 1].decode())(open(f"/proc/{c}/cmdline", "rb").read().split(b"\0"))
@@ -1555,6 +1562,141 @@ def commit_fail():
     check("commit fail: a later migration goes", r["ok"] and st["released"] and where(n) == {B: "running"}, (r, st, where(n)))
     check("commit fail: md5 intact on B", md5(B, n) == m)
     cleanup(n)
+
+
+def commit_fail_routed():
+    """#460: `commit_fail` between hosts that do not share routes: each host in a network
+    namespace of its own on one bridge (as scripts/nettest.sh has them), so the target installs
+    its route to its tap before the commit, and the commit fails after that. Refused, the target
+    puts back the route via its peer it had; the source runs on intact, routed to its tap; a
+    later migration routes it to the target's tap; and neither host leaves a process or cgroup
+    behind."""
+    tag = f"ft{A.addr.rsplit(':', 1)[1]}"
+    net, port = "10.254.0", 7070
+    ns = {h: f"{tag}{h}" for h in ("a", "b", "lan")}
+    root = tempfile.mkdtemp(prefix=f"{tag}-routed-", dir="/var/tmp")
+    hosts = {h: Host(f"{net}.{i}:{port}", os.path.join(root, h), f"{net}.{lo}-{net}.{hi}")
+             for h, i, lo, hi in (("a", 1, 128, 191), ("b", 2, 192, 250))}
+    procs, seen = [], set()
+
+    def nscli(h, *a, timeout=120):
+        r = subprocess.run(["ip", "netns", "exec", ns[h], "sh", "-c", 'mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null; exec "$@"', "sh",
+                            BIN, "--state", hosts[h].state, "--run", hosts[h].run, *a], capture_output=True, text=True, timeout=timeout, env=ENV)
+        return r.returncode, r.stdout.strip(), r.stderr.strip()
+
+    def nsjson(h, *a):
+        code, out, err = nscli(h, *a)
+        assert code == 0, (a, err or out)
+        return json.loads(out) if out else None
+
+    def route(h, ip):
+        return subprocess.run(["ip", "-n", ns[h], "route", "show", f"{ip}/32"], capture_output=True, text=True).stdout.strip()
+
+    def ours():
+        """Pids of processes run against either host's state."""
+        out = []
+        for p in filter(str.isdigit, os.listdir("/proc")):
+            try:
+                argv = open(f"/proc/{p}/cmdline", "rb").read().split(b"\0")
+            except OSError:
+                continue
+            if any(hosts[h].state.encode() in argv for h in hosts):
+                out.append(int(p))
+        return out
+
+    def ls(h):
+        return {v["name"]: v for v in nsjson(h, "ls", "--json")}
+
+    n = "ft-commit-routed"
+    try:
+        for h in ns.values():
+            subprocess.run(["ip", "netns", "add", h], check=True)
+        subprocess.run(["ip", "-n", ns["lan"], "link", "add", "br0", "type", "bridge"], check=True)
+        subprocess.run(["ip", "-n", ns["lan"], "link", "set", "br0", "up"], check=True)
+        for h, i in (("a", 1), ("b", 2)):
+            subprocess.run(["ip", "link", "add", "eth0", "netns", ns[h], "type", "veth", "peer", "name", f"p{h}", "netns", ns["lan"]], check=True)
+            subprocess.run(["ip", "-n", ns["lan"], "link", "set", f"p{h}", "master", "br0", "up"], check=True)
+            subprocess.run(["ip", "-n", ns[h], "addr", "add", f"{net}.{i}/24", "dev", "eth0"], check=True)
+            for dev in ("eth0", "lo"):
+                subprocess.run(["ip", "-n", ns[h], "link", "set", dev, "up"], check=True)
+        for h, other in (("a", "b"), ("b", "a")):
+            x = hosts[h]
+            os.makedirs(x.state)
+            os.makedirs(x.run)
+            for d in ("artifacts", "templates"):
+                os.symlink(os.path.join(os.path.abspath(args.state), d), os.path.join(x.state, d))
+            nsjson(h, "config", "--peer", hosts[other].addr, "--vm-ips", x.ips, "--reserve", "512")
+            lg = open(os.path.join(root, f"listen-{h}.log"), "a")
+            # Its arrivals' Firecrackers get cgroups too: the hierarchy `ip netns exec`'s sysfs lacks.
+            procs.append(subprocess.Popen(["ip", "netns", "exec", ns[h], "sh", "-c", 'mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null; exec "$@"', "sh",
+                                           BIN, "--state", x.state, "--run", x.run, "listen", x.addr], stdout=lg, stderr=lg, env=ENV))
+        up = lambda h: subprocess.run(["ip", "netns", "exec", ns[h], "bash", "-c", f"exec 3<>/dev/tcp/{hosts[h].addr.replace(':', '/')}"],
+                                      capture_output=True).returncode == 0
+        assert wait_for(lambda: up("a") and up("b"), 10), "listeners did not come up"
+        r = nsjson("a", "run", n, "--template", args.template, "-d")
+        ip = r["ip"]
+        code, out, err = nscli("a", "exec", n, "dd if=/dev/urandom of=/tmp/f bs=1M count=20 iflag=fullblock 2>/dev/null && md5sum /tmp/f")
+        assert code == 0, err or out
+        m = out.split()[0]
+        v = ls("a")[n]
+        gen = v["gen"]
+        seen.add((v["pid"], v["start"]))
+        check("commit fail routed: the source's peer routes its address via it", wait_for(lambda: f"via {net}.1" in route("b", ip), 10), route("b", ip))
+        check("commit fail routed: the source routes it to its tap", " dev " in route("a", ip) and "via" not in route("a", ip), route("a", ip))
+        nsjson("b", "debug", "fault", "commit_fail", "60000")
+        code, out, err = nscli("a", "migrate", n, hosts["b"].addr)
+        nsjson("b", "debug", "fault", "commit_fail", "0")
+        hit_by = [int(f.split(".", 1)[1]) for f in os.listdir(os.path.join(hosts["b"].run, "gates")) if f.startswith("commit_fail.")] \
+            if os.path.isdir(os.path.join(hosts["b"].run, "gates")) else []
+        check("commit fail routed: reached, its own route installed (no shared routes)", len(hit_by) == 1, hit_by)
+        check("commit fail routed: migrate refused, saying why", code != 0 and "committing failed" in err, (code, out, err))
+        check("commit fail routed: the arrival is gone", wait_for(lambda: not any(alive(p) for p in hit_by), 15), hit_by)
+        check("commit fail routed: the target routes the address via its peer again", wait_for(lambda: f"via {net}.1" in route("b", ip), 10), route("b", ip))
+        a, b = addr(hosts["a"], ip), addr(hosts["b"], ip)
+        check("commit fail routed: held by the source's generation, the target holds nothing",
+              a.get("holder") == n and a.get("held") == gen and not a.get("leaving") and not a.get("lent") and not b.get("holder"), (a, b))
+        check("commit fail routed: running on the source only", ls("a")[n]["state"] == "running" and n not in ls("b"), (ls("a").get(n), ls("b").get(n)))
+        code, out, err = nscli("a", "exec", n, "md5sum /tmp/f")
+        check("commit fail routed: md5 intact", code == 0 and out.split()[0] == m, out or err)
+        check("commit fail routed: the source routes it to its tap still", " dev " in route("a", ip) and "via" not in route("a", ip), route("a", ip))
+        # Unfaulted, the same commit routes the address to the target's tap.
+        code, out, err = nscli("a", "migrate", n, hosts["b"].addr)
+        moved = lambda: n in ls("b") and ls("b")[n]["state"] == "running" and n not in ls("a")
+        check("commit fail routed: a later migration goes", code == 0 and wait_for(moved, 30), (code, err))
+        check("commit fail routed: and routes it to the target's tap", wait_for(lambda: "via" not in route("b", ip) and " dev " in route("b", ip), 10), route("b", ip))
+        seen.add((ls("b")[n]["pid"], ls("b")[n]["start"]))
+        code, out, err = nscli("b", "exec", n, "md5sum /tmp/f")
+        check("commit fail routed: md5 intact on the target", code == 0 and out.split()[0] == m, out or err)
+        nsjson("b", "kill", n)
+    finally:
+        for p in procs:
+            p.terminate()
+            p.wait()
+        pids = ours()
+        for p in pids:
+            seen.add((p, starttime_of(p)))
+        for p in pids:
+            try:
+                os.kill(p, signal.SIGKILL)
+            except OSError:
+                pass
+        check("commit fail routed: no process of either host left", not pids and wait_for(lambda: not ours(), 10), pids)
+        cgs = lambda: [c for p, start in seen for c in glob_idle(p, start)]
+        check("commit fail routed: no cgroup left", wait_for(lambda: not cgs(), 10), cgs())
+        for c in cgs():
+            os.rmdir(c)
+        for h in ns.values():
+            subprocess.run(["ip", "netns", "del", h], capture_output=True)
+        subprocess.run(["rm", "-rf", root])
+
+
+def glob_idle(pid, start):
+    """The Firecracker cgroups of VM process `pid` (started at `start`): `flexvm/idle-PID-START-N`."""
+    d = "/sys/fs/cgroup/flexvm"
+    try:
+        return [os.path.join(d, c) for c in os.listdir(d) if c.startswith(f"idle-{pid}-{start}-")]
+    except OSError:
+        return []
 
 
 def abort_stay_fail():
@@ -8184,7 +8326,7 @@ SCENARIOS = dict(
     resume_failures=resume_failures, resume_unpause_fail=resume_unpause_fail, abort_link_fail=abort_link_fail, resume_unsettled=resume_unsettled, resume_slow_guest=resume_slow_guest, resume_readdress_fail=resume_readdress_fail, held_restore_frozen=held_restore_frozen, cow_exact=cow_exact, cow_rescue_fail=cow_rescue_fail, cow_collapsed=skippable(cow_collapsed), unplug_collapsed=no_evict(skippable(unplug_collapsed)), cow_abort=cow_abort,
     cow_crash=cow_crash, cow_reports_held=cow_reports_held, ckpt_incremental=ckpt_incremental, ckpt_hot=ckpt_hot,
     ckpt_failed_stop=ckpt_failed_stop, ckpt_rearm=ckpt_rearm, ckpt_dir_moved=ckpt_dir_moved,
-    leave_fail=leave_fail, capture_fail=capture_fail, abort_gen_fail=abort_gen_fail, commit_fail=commit_fail, abort_stay_fail=abort_stay_fail,
+    leave_fail=leave_fail, capture_fail=capture_fail, abort_gen_fail=abort_gen_fail, commit_fail=commit_fail, commit_fail_routed=commit_fail_routed, abort_stay_fail=abort_stay_fail,
     prepare_disconnect=prepare_disconnect, prepare_trickle=prepare_trickle, prepare_fail=prepare_fail, arrival_flood=arrival_flood,
     fc_prepare=fc_prepare, slow_preload=slow_preload, bad_preload=bad_preload, ckpt_packet_hold=ckpt_packet_hold, ckpt_stall=ckpt_stall, standby=standby,
     suspend_disk_freed=suspend_disk_freed, resume_mark_fails=resume_mark_fails, suspend_unaddressed=suspend_unaddressed, resume_fence_fails=resume_fence_fails, quarantine_reboot_ls=quarantine_reboot_ls, kill_source=kill_source,

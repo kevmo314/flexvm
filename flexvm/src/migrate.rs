@@ -139,16 +139,20 @@ impl Proc {
         let vmstate = vm.dir.join("vmstate.out");
         let hold = || self.hold_addr(&vm, mig, "migration");
         let captured = (|| -> Result<_> {
-            let saved = vm.save_state(&vmstate, false, false, hold, &mut t).and_then(|r| Ok((r, t.total(), std::fs::read(&vmstate)?)));
+            let saved = vm.save_state(&vmstate, false, false, hold, &mut t).and_then(|r| {
+                // Test fault `capture_fail`: paused, its state captured, reading it fails.
+                let read = match tripped("capture_fail") {
+                    true => Err(std::io::Error::other("injected fault: reading the vmstate failed")),
+                    false => std::fs::read(&vmstate),
+                };
+                Ok((r, t.total(), read?))
+            });
             let _ = std::fs::remove_file(&vmstate);
             let (runs, paused, state) = saved?;
-            // Test faults `capture_fail` and `preload_read_fail`: paused, its state captured, reading it fails.
-            if tripped("capture_fail") {
-                bail!("injected fault: reading the vmstate failed");
-            }
             t.mark("read_state");
             let pages = crate::uffd::remote_among(&runs, wanted);
             let mut data = vec![0u8; pages.len() * crate::util::PAGE_SIZE];
+            // Test fault `preload_read_fail`: reading the pages it sends with the state fails.
             if tripped("preload_read_fail") {
                 bail!("injected fault: reading the preloaded pages failed");
             }
@@ -815,8 +819,11 @@ impl Proc {
             (Err(e), _) => Err(format!("migration source {} does not serve pages: {e}", source.addr).into()),
             (_, Some(why)) => Err(format!("its memory cannot be paged in: {why}").into()),
             _ => before_commit.take().map_or(Ok(Ok(())), |f| f()).and_then(|r| r).and_then(|()| {
-                // Test gate `commit_gate`: a test looks at the loaded, never-run VM here.
-                crate::host::gate("commit_gate");
+                // Test gate `commit_gate`: a test looks at the loaded, never-run VM here; only with time to spare
+                // (the test lets go within 5 s), so waiting there never ends in a deadline error.
+                if deadline.saturating_duration_since(Instant::now()) >= Duration::from_secs(10) {
+                    crate::host::gate("commit_gate");
+                }
                 // The ownership boundary (refused if fenced).
                 let l = self.host.lock_by(Some(deadline))?;
                 if Instant::now() >= deadline {
