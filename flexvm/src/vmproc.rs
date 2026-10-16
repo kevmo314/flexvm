@@ -1182,10 +1182,8 @@ impl Proc {
         };
         let _ = c.set_read_timeout(None);
         let reply = match req["op"].as_str().unwrap_or("") {
-            // Bound before a resume or restore runs its VM (`restore_checkpoint`).
-            "exec" | "pages" | "checkpoint" | "migrate" | "debug" | "resume" if self.vm.get().is_none() => {
-                Err(format!("vm {} is starting", self.name()).into())
-            }
+            // Bound before a resume or restore runs its VM (`restore_checkpoint`), or an arrival is prepared (`prepare_in`).
+            "exec" | "checkpoint" | "migrate" | "debug" | "resume" if self.vm.get().is_none() => Err(format!("vm {} is starting", self.name()).into()),
             "exec" => return self.exec(&req, c),
             "pages" => return self.pages(&req, fds, slot),
             "checkpoint" => self.op_within().and_then(|op| {
@@ -1211,12 +1209,13 @@ impl Proc {
     fn pages(&self, req: &Value, fds: Vec<OwnedFd>, slot: Slot) {
         let Some(fd) = fds.into_iter().next() else { return };
         let s = std::net::TcpStream::from(fd);
-        // Checked before taking a page slot: a refusal never holds one.
-        let (vm, source) = (self.vm(), req["mig"].as_u64().map(State::Source));
-        if source != Some(vm.state()) {
+        // Checked before taking a page slot: a refusal never holds one. Not yet a VM (an arrival
+        // still preparing, a resume starting): not the source of anything.
+        let (vm, source) = (self.vm.get(), req["mig"].as_u64().map(State::Source));
+        let Some(vm) = vm.filter(|vm| source == Some(vm.state())) else {
             drop(slot);
-            return refuse_not_source(s, &vm.name, &req["mig"]);
-        }
+            return refuse_not_source(s, &self.name(), &req["mig"]);
+        };
         if fault("pages") {
             drop(slot);
             return refuse_pages(s, "injected fault: page server down");
@@ -3257,6 +3256,17 @@ mod tests {
         send_json(&mut c, &json!({"op": "debug", "what": "status"})).unwrap();
         let reply = crate::util::recv_json(&mut BufReader::new(c)).unwrap().unwrap();
         assert_eq!(reply["error"], "vm bound is starting");
+        // A page request (an arrival bound while it prepares, #593): refused on its connection, as not the source.
+        use std::os::fd::AsRawFd;
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = std::net::TcpStream::connect(tcp.local_addr().unwrap()).unwrap();
+        let (server, _) = tcp.accept().unwrap();
+        let at = Instant::now() + Duration::from_secs(5);
+        drop(connect(&p.host, "bound", &json!({"op": "pages", "mig": 7}), &[server.as_raw_fd()], at, None).unwrap());
+        drop(server);
+        client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let reply = crate::util::recv_json(&mut BufReader::new(&mut client)).unwrap().unwrap();
+        assert_eq!(reply["error"], "vm \"bound\" is not the source of migration 7");
     }
 
     #[test]
