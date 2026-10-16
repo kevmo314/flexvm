@@ -688,8 +688,11 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
 `route` (the route replacement).
 
 - **Count.** `flexvm standby [--template T] N` keeps N; each claimed one starts
-  its replacement, none start while the host is under its reserve, and the
-  memory controller stops them all when the host goes under it.
+  its replacement, none start unless they leave the host's eviction mark
+  available (so a refill never takes the room eviction moves VMs away to
+  make), and the memory controller stops them all when the host goes under
+  its reserve. A standby VM also checks every second and leaves by itself
+  under the reserve, so a host with no running VM relieves them too.
 - **Generations.** `flexvm template` publishes each build as an immutable
   `templates/.gen/<content id>/` and points `templates/NAME` at it with one
   atomic symlink swap. It never deletes a generation: VMs, migrations,

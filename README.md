@@ -192,7 +192,8 @@ list; an empty value (`--peer ''`, `--reserve ''`, ...) unsets a setting.
   than this available, the fastest growing first, until it is back above the
   mark by half the mark's height over the reserve. Default: the reserve plus
   the reserve or 512, whichever is more. A peer takes such a VM only if it
-  stays above its own mark; a mark under the reserve counts as the reserve.
+  stays above its own mark, and a host refills standby VMs only above its
+  own; a mark under the reserve counts as the reserve.
 
 Derived values are never saved: they follow the routes, the peers and the
 host's RAM. A wildcard listener with peers elsewhere and no route toward them

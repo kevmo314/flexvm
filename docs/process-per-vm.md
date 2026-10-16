@@ -494,7 +494,7 @@ standby VMs, and for a minute after a template's refill failed), so a pool
 comes back after a reboot, a template rebuild or a standby's death. A foreground `run` that claimed
 one forwards its signals to it and exits with the status the VM process sends
 back on the claim connection. Under memory pressure standby VMs are stopped
-(SIGUSR1) first. The count is explicit, and refills stop under the reserve; one refill
+(SIGUSR1) first. The count is explicit, and refills stop under the eviction mark; one refill
 of a template runs at a time (`.locks/refill`), and waits until the standby
 VMs it starts are ready (a minute at most each), so concurrent claims never overfill. A claim sent
 but not answered (the standby died, or hung up) is an uncertain outcome: the
@@ -502,8 +502,8 @@ guest may have run, so `run` reports it (with the standby's socket, and
 whether the registry shows the VM) and starts nothing else.
 
 An unclaimed standby VM exits 0 only when it leaves the pool on purpose: the
-pool's stop (SIGUSR1), its template changed, the pool is over its target, or
-its socket is gone. SIGINT, SIGQUIT and SIGTERM destroy it with 128 + the
+pool's stop (SIGUSR1), its template changed, the pool is over its target, its
+socket is gone, or the host is under its reserve. SIGINT, SIGQUIT and SIGTERM destroy it with 128 + the
 signal (SIGTERM too: there is nothing worth suspending), and its Firecracker
 dying (or its memory lost) ends it with 124, as for any VM. A claim that
 fails and gives the VM up ends it with 125.
@@ -529,8 +529,12 @@ back above the mark by half the mark's height over the reserve (at least
 admission uses) are read from `host.json` as it changes. Under the reserve,
 standby VMs are stopped first, under a lock of their own
 (`STATE/.locks/standby.stop`), so a slow migration holding the eviction lock does
-not hold that up. A refill's grant for each standby is the template's working set (what a cold start
-admits), 256 MiB at least. Recovery and a claim's refill start none while `.pressure` is recent, checked under the stop lock before each grant (relief marks it holding the lock), so one that waited behind another refill during relief starts none. A refill holds it shared from each standby's grant until
+not hold that up. Each unclaimed standby also leaves by itself (exit 0) on its
+own once-a-second check under the reserve, marking `.pressure` first, so a
+host with no running VM (no controller) relieves them too; one a refill
+started in a race leaves on its next check. A refill's grant for each standby is the template's working set (what a cold start
+admits), 256 MiB at least, admitted above the eviction mark (`Floor::EvictMark`, refused while an
+eviction runs here), so refills stop where eviction starts, not only under the reserve. Recovery and a claim's refill start none while `.pressure` is recent, checked under the stop lock before each grant (relief marks it holding the lock), so one that waited behind another refill during relief starts none. A refill holds it shared from each standby's grant until
 that standby has created its lock file (it says so on its notify fd), 5 s
 at most (its grant gives up on a busy host lock by then; a standby that has not said so by then, or said something else, is killed and reaped before the lock is let go, then its grant is refunded and what it left swept locally, never waiting on peers, and the refill fails), never through its load, and starts none while relief holds it: relief either lists
 a standby being started or ran before its grant, and meanwhile holds eviction
@@ -558,7 +562,9 @@ unanswered migration is not a refusal: the VM, still migrating, is busy to
 the next decider). The request is `if_idle`: a VM busy with another
 operation (a checkpoint's copy, a migration, an arrival not yet settled)
 refuses at once and the next VM is tried; eviction never waits for or races
-an operation. A refused VM and peer pair is not tried again for 5 s, doubling
+an operation. Busy here is what the VM process's own checks say (its reply
+sets `busy`), never a peer's text: any peer's refusal, whatever it says, is
+a refusal (#599). A refused VM and peer pair is not tried again for 5 s, doubling
 to 60 s while refusals continue (`RUN/evict.backoff`). A refused arrival's
 log is removed; an accepted one becomes `NAME.log`.
 Announcements and `lend` requests go to all peers at once, by the peers

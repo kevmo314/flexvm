@@ -260,7 +260,9 @@ fn start_one(host: &Host, template: &str, log: &File, mib: u64, cooldown: bool) 
     if cooldown && recent(&pressure(host)) {
         return Ok(None);
     }
-    let grant = match host.grant(mib, Some(by)) {
+    // Above the eviction mark, and none while an eviction runs here: a refill never takes
+    // the room eviction is moving VMs away to make (#600).
+    let grant = match host.grant_above(mib, crate::host::Floor::EvictMark, Some(by)) {
         Ok(Some(id)) => id,
         Ok(None) => return Ok(None),
         Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::WouldBlock) => return Ok(None),
@@ -351,9 +353,23 @@ pub fn load_set(host: &Host, tpl: &Template) -> Vec<u64> {
     set
 }
 
+/// Under the reserve, a standby leaves by itself, marking the pressure so it is not
+/// refilled: a host with no running VM has no controller to stop it (#600). A running
+/// VM's controller stops them first (`vmproc::relieve`), holding eviction off meanwhile.
+fn under_reserve(host: &Host, template: &str) -> bool {
+    let Some(avail) = crate::vmproc::host_available_mib() else { return false };
+    let reserve = host.config_now().reserve();
+    if avail >= reserve {
+        return false;
+    }
+    crate::log!("standby {template}: host has {avail} MiB available, under its {reserve} MiB reserve: leaving");
+    let _ = std::fs::write(pressure(host), b"");
+    true
+}
+
 /// Whether an unclaimed standby leaves, and its exit status: 124 (`DIED`) when its VM
 /// died; 0 when it leaves the pool on purpose (its template changed, the pool is over
-/// target, or its socket is gone). A signal sent to it ends it first (`Proc::stop_requested`).
+/// target, its socket is gone, or the host is under its reserve). A signal sent to it ends it first (`Proc::stop_requested`).
 fn leave_status(died: bool, left_pool: bool) -> Option<i32> {
     if died {
         Some(crate::vmproc::DIED)
@@ -427,7 +443,8 @@ pub fn serve(p: &Arc<Proc>, template: &str, notify: &mut Option<File>, op: &Op) 
             if let Some(why) = &died {
                 crate::log!("standby {template}: died: {why}");
             }
-            if let Some(code) = leave_status(died.is_some(), current.as_deref() != Some(&mine) || extra || unreachable) {
+            let low = under_reserve(host, template);
+            if let Some(code) = leave_status(died.is_some(), current.as_deref() != Some(&mine) || extra || unreachable || low) {
                 p.finish(op, End::NotStarted, code, None);
             }
             continue;
@@ -1016,5 +1033,23 @@ mod tests {
         assert_eq!(refill_by(&host, "default", true, true).unwrap(), 0);
         assert!(start.elapsed() < Duration::from_secs(5), "{:?}", start.elapsed());
         drop(held);
+    }
+
+    /// #600: a refill leaves the eviction mark available, not just the reserve, so it
+    /// never takes room eviction moves VMs away to make; a refused grant is no failure.
+    #[test]
+    fn refills_are_admitted_above_the_eviction_mark() {
+        let root = crate::test_util::TempDir::new("refill-mark");
+        let mut host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        crate::util::write_file(&host.state.join("standby"), "default", b"1", true).unwrap();
+        std::fs::create_dir_all(dir(&host, "default")).unwrap();
+        host.cfg.reserve_mib = Some(0);
+        host.cfg.evict_mib = Some(u64::MAX / 2);
+        let l = host.lock().unwrap();
+        let started = refill_by(&host, "default", false, true).unwrap();
+        drop(l);
+        assert_eq!(started, 0);
+        assert!(live(&host, "default").is_empty());
+        assert!(!dir(&host, "default").join(".failed").exists());
     }
 }
