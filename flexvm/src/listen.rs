@@ -256,21 +256,44 @@ struct PeersInner {
     resolved: RwLock<HashMap<String, Vec<IpAddr>>>,
     /// Each name's lookup: None while under way, else when the last one ended.
     lookups: Mutex<HashMap<String, Option<Instant>>>,
-    /// The listener's: where each looked-up name's addresses are kept for other processes
+    /// The listener's: where each name's last successful lookup is kept for other processes
     /// (`PEER_CACHE` in RUN), with what was last written there.
     cache: Option<(std::path::PathBuf, Mutex<Cached>)>,
 }
 
-/// `RUN/peers.json`: {name: [address, ...]} for each peer name the listener looked up, with
-/// the addresses it goes by (none for one that never resolved). Restores check addresses
-/// against it, never waiting on DNS for a name the listener already looked up. Older than
-/// `PEER_CACHE_AGE` (its listener stopped, refreshing no more), it counts for nothing.
+/// `RUN/peers.json`: each peer name's addresses as the listener's last successful lookup
+/// gave them, and when (this boot's monotonic clock). Restores and resumes check addresses
+/// against an entry while it is fresh (`PEER_CACHE_FRESH`), never waiting on DNS for it; a
+/// name with none fresh (never resolved, failing lately, no listener) is looked up then.
+/// A peer whose name legitimately moves to a VM's address within that time is not caught
+/// until it passes; no peer's input can make that happen.
 const PEER_CACHE: &str = "peers.json";
-type Cached = HashMap<String, Vec<IpAddr>>;
-const PEER_CACHE_AGE: Duration = Duration::from_secs(4 * PEER_REFRESH.as_secs());
-/// How long a restore looks up a peer name the listener has not looked up (none runs, or
-/// the name was just added) before it refuses: a guard only, never a DNS outage's length.
+/// A refresh, and slack for its lookup.
+const PEER_CACHE_FRESH: Duration = Duration::from_secs(PEER_REFRESH.as_secs() + 15);
+/// How long a restore or resume looks up a name with no fresh entry before it refuses.
 const UNCACHED_WAIT: Duration = Duration::from_secs(1);
+
+#[derive(Clone, Default, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
+struct Cached {
+    boot: String,
+    names: HashMap<String, Looked>,
+}
+
+#[derive(Clone, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
+struct Looked {
+    addrs: Vec<IpAddr>,
+    /// When the lookup ended, `monotonic_ms`.
+    at_ms: u64,
+}
+
+impl Cached {
+    /// `name`'s addresses if looked up within `PEER_CACHE_FRESH`, in this boot.
+    fn fresh(&self, name: &str) -> Option<&[IpAddr]> {
+        let now = monotonic_ms();
+        let l = self.names.get(name).filter(|_| self.boot == crate::host::boot_id())?;
+        (l.at_ms <= now && now - l.at_ms < PEER_CACHE_FRESH.as_millis() as u64).then_some(&l.addrs)
+    }
+}
 
 const PEER_REFRESH: Duration = Duration::from_secs(30);
 const LOOKUP_EVERY: Duration = Duration::from_secs(2);
@@ -287,7 +310,7 @@ impl Peers {
             let names = host.config_now().peers;
             p.0.resolved.write().unwrap().retain(|n, _| names.contains(n));
             p.0.lookups.lock().unwrap().retain(|n, l| l.is_none() || names.contains(n));
-            p.cache(|c| c.retain(|n, _| names.contains(n)));
+            p.cache(|c| c.names.retain(|n, _| names.contains(n)));
             p.refresh(&names);
             std::thread::sleep(PEER_REFRESH);
         });
@@ -308,29 +331,31 @@ impl Peers {
                 if let Some(a) = &found {
                     p.0.resolved.write().unwrap().insert(name.clone(), a.clone());
                 }
-                // For restores (`known_peers`): one that failed keeps what it had, else has none, as here.
-                p.cache(|c| match found {
-                    Some(a) => drop(c.insert(name.clone(), a)),
-                    None => {
-                        c.entry(name.clone()).or_default();
-                    }
-                });
+                // For restores and resumes (`known_peers`): one that failed leaves its entry to age out.
+                if let Some(addrs) = found {
+                    p.cache(|c| drop(c.names.insert(name.clone(), Looked { addrs, at_ms: monotonic_ms() })));
+                }
                 p.0.lookups.lock().unwrap().insert(name, Some(Instant::now()));
             });
             lookups.insert(n.clone(), if lookup.is_ok() { None } else { Some(Instant::now()) });
         }
     }
 
-    /// Changes the listener's cache and writes it to RUN, at every lookup's end too: its age
-    /// tells a live listener's from a stopped one's (`known_peers`). A failed write only costs
-    /// a restore a lookup of its own.
+    /// Changes the listener's cache and writes it to RUN. One that cannot be written is
+    /// removed, never left to answer for addresses since changed: a restore then looks
+    /// names up itself.
     fn cache(&self, change: impl FnOnce(&mut Cached)) {
         let Some((path, cached)) = &self.0.cache else { return };
         let mut c = cached.lock().unwrap();
         change(&mut c);
+        c.boot = crate::host::boot_id().into();
         let (dir, name) = (path.parent().unwrap(), path.file_name().unwrap().to_str().unwrap());
         if let Err(e) = serde_json::to_vec(&*c).map_err(std::io::Error::from).and_then(|b| crate::util::write_file(dir, name, &b, false)) {
-            crate::log!("{}: {e}", path.display());
+            let gone = match std::fs::remove_file(path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => format!("; cannot remove it either: {e}"),
+                _ => String::new(),
+            };
+            crate::log!("{}: {e}{gone}", path.display());
         }
     }
 
@@ -752,28 +777,27 @@ pub fn check_vm_ip(host: &Host, ip: Ipv4Addr, peers: &[IpAddr]) -> Result<()> {
     routable(ip, &cfg, &known, &crate::net::gateways(&std::fs::read_to_string("/proc/net/route")?))
 }
 
-/// The configured peers' addresses, for a process other than the listener: those it looked
-/// up (`PEER_CACHE`), a name it has not looked up yet looked up here, waiting at most
+/// The configured peers' addresses, for a process other than the listener: as the listener
+/// last looked them up, if fresh (`PEER_CACHE`); else looked up here, waiting at most
 /// `UNCACHED_WAIT`, then refused, as the listener refuses a route message meanwhile. A
 /// name that does not resolve has none, as for the listener (#411).
 pub fn known_peers(host: &Host) -> Result<Vec<IpAddr>> {
     let names = host.config_now().peers;
     let cache: Cached = match names.iter().any(|n| n.parse::<SocketAddr>().is_err()) {
         true => crate::util::trusted_file(&host.run.join(PEER_CACHE))
-            .filter(|f| f.metadata().and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().is_ok_and(|age| age < PEER_CACHE_AGE)))
             .and_then(|f| serde_json::from_reader(std::io::BufReader::new(f).take(1 << 20)).ok())
             .unwrap_or_default(),
-        false => HashMap::new(),
+        false => Cached::default(),
     };
     let by = Instant::now() + UNCACHED_WAIT;
     let mut addrs = Vec::new();
     for n in &names {
-        match (n.parse::<SocketAddr>(), cache.get(n)) {
+        match (n.parse::<SocketAddr>(), cache.fresh(n)) {
             (Ok(a), _) => addrs.push(a.ip()),
             (_, Some(a)) => addrs.extend(a),
             _ => match crate::util::resolve(n, by) {
                 Ok(a) => addrs.extend(a.iter().map(SocketAddr::ip)),
-                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => bail!("peer {n}: {e}; its addresses are not known yet, try again"),
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => bail!("peer {n}: {e}; its addresses are not known lately, try again"),
                 Err(_) => {}
             },
         }
@@ -888,23 +912,25 @@ mod tests {
         check_vm_ip(&host, "10.98.0.1".parse().unwrap(), &[]).unwrap_err();
         // A restore goes by what the listener looked up, with no lookup of its own.
         let listener = Peers(Arc::new(PeersInner { cache: Some((host.run.join(PEER_CACHE), Mutex::default())), ..Default::default() }));
-        listener.cache(|c| drop(c.insert("peer.example:7000".into(), vec!["10.93.0.1".parse().unwrap()])));
+        let looked = |ago: Duration| Looked { addrs: vec!["10.93.0.1".parse().unwrap()], at_ms: monotonic_ms() - ago.as_millis() as u64 };
+        listener.cache(|c| drop(c.names.insert("peer.example:7000".into(), looked(Duration::ZERO))));
         let start = Instant::now();
         let known = known_peers(&host).unwrap();
         assert!(start.elapsed() < UNCACHED_WAIT && known.contains(&"10.93.0.1".parse().unwrap()), "{known:?}");
         assert!(check_vm_ip(&host, "10.93.0.1".parse().unwrap(), &known).unwrap_err().to_string().contains("not a vm's address"));
-        // One that never resolved there has none; a lookup that fails later keeps what it had.
-        listener.cache(|c| {
-            c.entry("peer.example:7000".into()).or_default();
-        });
+        // Fresh until a refresh and its slack have passed since the lookup.
+        listener.cache(|c| drop(c.names.insert("peer.example:7000".into(), looked(PEER_CACHE_FRESH - Duration::from_secs(5)))));
         assert!(known_peers(&host).unwrap().contains(&"10.93.0.1".parse().unwrap()));
-        listener.cache(|c| drop(c.insert("peer.example:7000".into(), Vec::new())));
-        assert!(!known_peers(&host).unwrap().contains(&"10.93.0.1".parse().unwrap()));
-        // A stopped listener's cache counts for nothing: a name it lists is looked up again.
-        listener.cache(|c| drop(c.insert("peer.example:7000".into(), vec!["10.93.0.1".parse().unwrap()])));
-        let old = std::time::SystemTime::now() - PEER_CACHE_AGE - Duration::from_secs(1);
-        std::fs::File::options().write(true).open(host.run.join(PEER_CACHE)).unwrap().set_modified(old).unwrap();
-        assert!(!known_peers(&host).unwrap_or_default().contains(&"10.93.0.1".parse().unwrap()));
+        // Past it (lookups failing lately, or a stopped listener's), or another boot's, it
+        // counts for nothing: the name is looked up again, and a timeout refuses.
+        let stale = || !known_peers(&host).unwrap_or_default().contains(&"10.93.0.1".parse().unwrap());
+        listener.cache(|c| drop(c.names.insert("peer.example:7000".into(), looked(PEER_CACHE_FRESH + Duration::from_secs(1)))));
+        assert!(stale());
+        listener.cache(|c| drop(c.names.insert("peer.example:7000".into(), looked(Duration::ZERO))));
+        let mut other: Cached = serde_json::from_slice(&std::fs::read(host.run.join(PEER_CACHE)).unwrap()).unwrap();
+        other.boot = "another".into();
+        std::fs::write(host.run.join(PEER_CACHE), serde_json::to_vec(&other).unwrap()).unwrap();
+        assert!(stale());
         routable_by("10.200.0.7".parse().unwrap(), &host.config_now(), &[], &[], |_| Ok(false)).unwrap();
         host.configure(|cfg| {
             cfg.underlay = Some("10.97.0.1".parse().unwrap());

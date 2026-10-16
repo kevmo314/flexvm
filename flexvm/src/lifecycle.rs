@@ -288,10 +288,8 @@ impl Proc {
         let cmd = read_cmd(&dir).map_err(|e| format!("vm {name}: its command's record {}: {e}", dir.join(CMD).display()))?;
         t.mark("verify_checkpoint");
         let ip = ck.manifest.ip;
-        // Not checked as a restore's is (`check_vm_ip`): this address is no peer's input. Only this
-        // host's suspend writes STATE/suspended (root's alone), from a VM of its own whose address
-        // was checked as it was claimed (run, restore or arrival), and the generation it recorded
-        // must still be current here (below).
+        // Checked again, as a restore's is: safe when suspended, it may be a peer's or local now.
+        crate::listen::check_vm_ip(&self.host, ip, &crate::listen::known_peers(&self.host)?)?;
         let tpl = self.admit_checkpoint(&ck, &mut t)?;
         let claim = {
             let l = self.host.lock()?;
