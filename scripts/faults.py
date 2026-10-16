@@ -1256,7 +1256,8 @@ def migrate_in_raw(host, name, ip, source, gen=None, template=None):
     # Newer than any the host has seen for it, as an arriving VM's is.
     gen = addr(host, ip).get("seen", 0) + 1 if gen is None else gen
     # The rate its state was saved at: the template's, as a VM restored on its build host runs at.
-    with open(os.path.join(host.state, "templates", template or args.template, "meta.json")) as f:
+    # A forged template name (forged_peer) has none: the real template's then.
+    with open(os.path.join(host.state, "templates", args.template, "meta.json")) as f:
         tsc_khz = json.load(f)["compatibility"]["tsc_khz"]
     req = {"op": "migrate_in", "name": name, "mig": mig, "template": template or args.template, "id": template_id,
            "ip": ip, "gen": gen, "rev": 0, "source": A.addr, "regions": regions, "msrs": [], "tsc_khz": tsc_khz}
