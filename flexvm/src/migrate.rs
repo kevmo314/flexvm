@@ -565,7 +565,8 @@ impl Proc {
             let _ = w.shutdown(std::net::Shutdown::Both);
         } else {
             let _ = answer(json!({"ok": true, "result": {
-                "underlay": self.host.config_now().underlay().map(|u| u.to_string()),
+                // On the downtime: never a lookup (the process's start made any it needed).
+                "underlay": self.host.config_now().underlay_known().map(|u| u.to_string()),
                 "timings_ms": t,
                 "resume_error": (vm.state() == State::Failed).then_some("resuming failed"),
             }}));

@@ -811,9 +811,12 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
     deriving anything, the address it advertises for a wildcard `ADDR`
     included. Other processes never look up a name the listener has seen,
     one it could not look up (an empty entry) included, so once a listener
-    has run nothing waits on DNS. A name with no entry at all (no listener
-    has run since a boot) is looked up within 2 s, so a VM started before
-    the listener still announces its routes. If a peer elsewhere has no known
+    has run nothing waits on DNS; a name added while it runs gets an empty
+    entry before its lookup starts. A name with no entry at all (no listener
+    has run since a boot) is looked up within 2 s, once per process (a failed
+    lookup counts as no addresses until the listener's entry stands), so a VM
+    started before the listener still announces its routes. Nothing under the
+    host lock or on a migration's downtime starts such a lookup. If a peer elsewhere has no known
     IPv4 address, nothing is derived and a diagnostic is logged, saying to
     start `flexvm listen` when the listener has not looked a peer up (no
     peers, or all local, uses loopback).

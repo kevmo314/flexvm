@@ -135,7 +135,8 @@ pub fn validate(listener: &TcpListener, cfg: &crate::host::Config) -> Result<()>
         }
         c.write(&run.join(PEER_CACHE));
     }
-    if let Some(e) = unreachable_at(local, v6only(listener), cfg.advertise()?.as_deref()) {
+    // Under the host lock: from what was just seeded, never a lookup.
+    if let Some(e) = unreachable_at(local, v6only(listener), cfg.advertise_by(false)?.as_deref()) {
         bail!("{e}");
     }
     let toward =
@@ -334,8 +335,12 @@ impl Peers {
     /// Starts a lookup of each name that has none under way nor one ended
     /// within `LOOKUP_EVERY`; never waits on one.
     fn refresh<'a>(&self, names: impl IntoIterator<Item = &'a String>) {
+        let names: Vec<&String> = names.into_iter().filter(|n| n.parse::<SocketAddr>().is_err()).collect();
+        // A new name gets an empty entry before its lookup starts: other processes then never
+        // look up one this listener knows of (`Config::derived`), however long its lookup takes.
+        self.cache_missing(&names);
         let mut lookups = self.0.lookups.lock().unwrap();
-        for n in names.into_iter().filter(|n| n.parse::<SocketAddr>().is_err()) {
+        for n in names {
             if lookups.get(n).is_some_and(|l| l.is_none_or(|t| t.elapsed() < LOOKUP_EVERY)) {
                 continue;
             }
@@ -356,6 +361,19 @@ impl Peers {
             });
             lookups.insert(n.clone(), if lookup.is_ok() { None } else { Some(Instant::now()) });
         }
+    }
+
+    /// An empty entry for each of `names` the listener's cache has none for, written only if any.
+    fn cache_missing(&self, names: &[&String]) {
+        let Some((_, cached)) = &self.0.cache else { return };
+        if names.iter().all(|n| cached.lock().unwrap().names.contains_key(*n)) {
+            return;
+        }
+        self.cache(|c| {
+            for n in names {
+                c.names.entry((*n).clone()).or_default();
+            }
+        });
     }
 
     /// Changes the listener's cache and writes it to RUN. One that cannot be written is
@@ -746,7 +764,8 @@ fn migration(host: &Host, req: &Value) -> Result<Value> {
         return Ok(json!({"done": true}));
     }
     let outcome = host.mig_status(mig)?;
-    Ok(json!({"outcome": outcome, "underlay": host.config_now().underlay().map(|u| u.to_string())}))
+    // Under the host lock: never a lookup.
+    Ok(json!({"outcome": outcome, "underlay": host.config_now().underlay_known().map(|u| u.to_string())}))
 }
 
 fn lend(host: &Host, req: &Value, peers: &[IpAddr]) -> Result<Value> {
@@ -1035,6 +1054,26 @@ mod tests {
         Peers::listener(&host).cache(|c| drop(c.names.insert("never.invalid:7107".into(), vec!["10.93.0.1".parse().unwrap()])));
         let after = Cached::read(&host.run, &peers);
         assert!(after.addrs("localhost:7107").unwrap().iter().any(|a| a.is_loopback()), "{after:?}");
+    }
+
+    /// A name the listener is to look up has an entry, empty until its lookup ends, so other
+    /// processes never look it up themselves; an entry it has is kept.
+    #[test]
+    fn a_new_peer_name_gets_an_empty_entry_before_its_lookup() {
+        let root = crate::test_util::TempDir::new("listen-new-name");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let p = Peers::listener(&host);
+        p.cache(|c| drop(c.names.insert("old.invalid:1".into(), vec!["10.93.0.1".parse().unwrap()])));
+        let names = ["old.invalid:1".to_string(), "new.invalid:1".into(), "10.98.0.1:1".into()];
+        // As if its lookup were under way already: none is started, the entry is still written.
+        p.0.lookups.lock().unwrap().insert("new.invalid:1".into(), None);
+        p.0.lookups.lock().unwrap().insert("old.invalid:1".into(), Some(Instant::now()));
+        p.refresh(&names);
+        let c = Cached::read(&host.run, &names);
+        assert_eq!(c.addrs("new.invalid:1").unwrap(), Vec::<IpAddr>::new());
+        assert_eq!(c.addrs("old.invalid:1").unwrap(), ["10.93.0.1".parse::<IpAddr>().unwrap()]);
+        assert_eq!(c.names.len(), 2, "names only: {c:?}");
+        assert!(p.0.resolved.read().unwrap().is_empty(), "an empty entry admits no one");
     }
 
     #[test]
