@@ -180,13 +180,13 @@ fixed (`flexvm config` still runs, to fix it), other commands refuse to start,
 and a running process keeps its last valid configuration. Withdrawals of previously recorded
 addresses remain accepted after the allowlist narrows. A generation routed
 via a peer is withdrawn only by that peer (its addresses and
-`--peer-underlay`); another peer only moves it on, with a newer generation or
-revision. The hosts must list each other
+`--peer-underlay`), or by one that had the VM later (a newer revision of the
+generation: it migrated on) or a newer generation. The hosts must list each other
 with `--peer HOST:PORT` (each peer's listen address): a listener serves its
 peers' addresses only, and tells any other it is not a peer. A reported route
 next hop (including a migration target's underlay) must be the connection's
-peer address or a configured peer's known address, and cannot be a router (the
-next hop of a route here other than to a peer's VM) or not unicast. A peer's
+peer address or a configured peer's known address (or `--peer-underlay`), and
+unicast. A peer's
 address local to this host, as with hosts sharing a network namespace, is
 taken but installs no route. Saved routes are checked again before
 reinstalling them. The default range, `10.200.0.0/16`, is the same on every
@@ -206,7 +206,7 @@ list; an empty value (`--peer ''`, `--reserve ''`, ...) unsets a setting.
 - `--peer-underlay HOST:PORT=IP[,IP]`, repeated: a peer's next hops besides
   its `--peer` address, its `--underlay` on another network. Only these, set
   here, are trusted: never an address because it is on-link. Each must be
-  unicast and not this host's; one that is a router here is still refused.
+  unicast and not this host's.
   It replaces every entry (`''` clears them); a peer dropped from `--peer`
   takes its entry with it.
 - `--announce-dev IFACE`, where the host answers ARP for its VMs

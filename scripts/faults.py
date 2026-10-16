@@ -400,7 +400,7 @@ def addr(host, ip):
 
 
 # --- a third peer, down -------------------------------------------------------------------------
-# A peer's route next hop must be one of its peers' addresses, and not a router (#591). Scenarios that
+# A peer's route next hop must be one of its peers' addresses (#591). Scenarios that
 # need a route the kernel really installs, via a host other than A or B, use this one: an address in a
 # network namespace of its own behind a veth, on-link here and not ours, where nothing listens (a peer
 # that is down: what is sent to it is refused at once). Listed as a peer of A and B only while such a

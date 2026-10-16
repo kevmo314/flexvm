@@ -810,11 +810,13 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
   generations remain accepted, including retries, after the allowlist narrows.
   A generation routed via a peer is withdrawn (same generation) only by that
   peer: the asking connection's address, and the addresses and
-  `--peer-underlay` of each configured peer it is one of. A newer generation, or
-  a newer revision of the same one (a migration), may come from any peer.
+  `--peer-underlay` of each configured peer it is one of; or by any peer with a
+  newer revision of it than recorded (the VM migrated on and ended there before
+  its announcement arrived: withdrawals carry the revision, the durable notice
+  the latest one) or a newer generation. A newer revision announced may come
+  from any peer.
   Configured `--peer-underlay` addresses count as that peer's next hops (and are
-  no VM's address); nothing is trusted for being on-link. Routers are read from
-  every routing table (a netlink dump). Boot recovery stays incomplete, and the
+  no VM's address); nothing is trusted for being on-link. Boot recovery stays incomplete, and the
   listener's periodic sweep tries it again, while a saved next hop is no known
   peer address and a peer by name has none known yet; `flexvm config` runs no
   recovery.
@@ -828,8 +830,9 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
   boot's pass tries again while a peer by name is not known yet.
   A route's `via` and a migration target's reported underlay must be the
   connection's peer address or one of the configured peers' known addresses,
-  never a router (a next hop of a route wider than /32 in any routing table: not a peer whose VMs
-  are routed through it already) or a non-unicast address; one local to this network namespace
+  or a configured `--peer-underlay`, and unicast (no router check: a cluster VM's
+  /32 via a peer's own address sends that VM's traffic to the peer only, which
+  any peer may claim by announcing the VM); one local to this network namespace
   (hosts sharing a machine) is taken and installs no route. Route requests use the
   listener's strict peer lookup; migration replies use its last-known peer
   addresses plus the target connection's address.

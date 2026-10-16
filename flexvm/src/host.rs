@@ -1220,11 +1220,10 @@ impl Host {
     /// Whether the saved route may be put back (a refusal for good is logged): an error while that
     /// cannot be told yet, to try again later. A next hop that is no peer's known address while a
     /// peer by name has none known (a name no listener has looked up since a boot, or whose lookup
-    /// failed) may be that peer's; the routers unknown (netlink failed) the same.
+    /// failed) may be that peer's.
     fn route_check(&self, ip: Ipv4Addr, via: Ipv4Addr) -> Result<bool> {
         let peers = crate::listen::known_peers(self)?;
-        let routers = crate::net::routers()?;
-        let checked = crate::listen::check_vm_ip(self, ip, &peers).and_then(|()| crate::listen::via_by(via, &peers, &routers));
+        let checked = crate::listen::check_vm_ip(self, ip, &peers).and_then(|()| crate::listen::via_by(via, &peers));
         if let Err(e) = &checked {
             let unknown = crate::listen::unknown_peers(self);
             if !unknown.is_empty() && !peers.iter().any(|p| p.to_canonical() == IpAddr::V4(via)) {

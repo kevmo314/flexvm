@@ -858,18 +858,19 @@ pub fn check_vm_ip(host: &Host, ip: Ipv4Addr, peers: &[IpAddr]) -> Result<()> {
     routable(ip, &cfg, &known, &crate::net::gateways(&std::fs::read_to_string("/proc/net/route")?))
 }
 
-/// A next hop is the connection's peer or a configured peer, never a router (`net::routers`, any
-/// routing table's: not a peer that routes to its VMs go through already) or a non-unicast address.
+/// A next hop is the connection's peer or a configured peer (its addresses or `--peer-underlay`),
+/// never a non-unicast address: a cluster VM's route to a peer's own address sends its traffic to
+/// that peer only, which any peer may claim by announcing the VM moved to it.
 /// Callers include the connection address in `peers`; named peers come from strict listener lookup.
 /// A peer's local address (hosts sharing a network namespace, loopback included) is taken:
 /// `net::route_via` installs nothing for it, and a migration's handoff relies on it.
 pub fn check_via(via: Ipv4Addr, peers: &[IpAddr]) -> Result<()> {
-    via_by(via, peers, &crate::net::routers()?)
+    via_by(via, peers)
 }
 
-pub(crate) fn via_by(via: Ipv4Addr, peers: &[IpAddr], routers: &[Ipv4Addr]) -> Result<()> {
-    if !is_peer(peers, IpAddr::V4(via)) || via.is_unspecified() || via.is_broadcast() || via.is_multicast() || routers.contains(&via) {
-        bail!("{via} is not a peer next hop: not a peer's address, a router or not unicast");
+pub(crate) fn via_by(via: Ipv4Addr, peers: &[IpAddr]) -> Result<()> {
+    if !is_peer(peers, IpAddr::V4(via)) || via.is_unspecified() || via.is_broadcast() || via.is_multicast() {
+        bail!("{via} is not a peer next hop: not a peer's address, or not unicast");
     }
     Ok(())
 }
@@ -954,19 +955,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn next_hops_are_known_peers_but_never_routers() {
+    fn next_hops_are_known_peers_and_unicast() {
         let via: Ipv4Addr = "192.0.2.7".parse().unwrap();
         let peers = [IpAddr::V4(via), "::ffff:192.0.2.8".parse().unwrap(), "127.0.0.1".parse().unwrap()];
-        via_by(via, &peers, &[]).unwrap();
-        via_by("192.0.2.8".parse().unwrap(), &peers, &[]).unwrap();
+        via_by(via, &peers).unwrap();
+        via_by("192.0.2.8".parse().unwrap(), &peers).unwrap();
         // Peers sharing this network namespace route via a local address (net::route_via skips it).
-        via_by("127.0.0.1".parse().unwrap(), &peers, &[]).unwrap();
-        assert!(via_by("192.0.2.9".parse().unwrap(), &peers, &[]).is_err());
-        assert!(via_by("127.0.0.2".parse().unwrap(), &peers, &[]).is_err());
-        assert!(via_by(via, &peers, &[via]).is_err());
+        via_by("127.0.0.1".parse().unwrap(), &peers).unwrap();
+        assert!(via_by("192.0.2.9".parse().unwrap(), &peers).is_err());
+        assert!(via_by("127.0.0.2".parse().unwrap(), &peers).is_err());
         for ip in ["0.0.0.0", "255.255.255.255", "224.0.0.1"] {
             let ip = ip.parse().unwrap();
-            assert!(via_by(ip, &[IpAddr::V4(ip)], &[]).is_err());
+            assert!(via_by(ip, &[IpAddr::V4(ip)]).is_err());
         }
     }
 
@@ -1010,9 +1010,8 @@ mod tests {
         cfg.peer_underlays.insert("192.0.2.9:7070".into(), vec!["198.51.100.9".parse().unwrap()]);
         assert_eq!(cfg.peer_underlay_addrs(), [IpAddr::V4(data)]);
         let known = [vec!["192.0.2.7".parse().unwrap()], cfg.peer_underlay_addrs()].concat();
-        via_by(data, &known, &[]).unwrap();
-        assert!(via_by("198.51.100.9".parse().unwrap(), &known, &[]).is_err(), "not a configured peer's");
-        assert!(via_by(data, &known, &[data]).is_err(), "a router");
+        via_by(data, &known).unwrap();
+        assert!(via_by("198.51.100.9".parse().unwrap(), &known).is_err(), "not a configured peer's");
         // The asking peer's own addresses take in its underlays, never another peer's.
         cfg.peers.push("192.0.2.10:7070".into());
         cfg.peer_underlays.insert("192.0.2.10:7070".into(), vec!["198.51.100.10".parse().unwrap()]);
