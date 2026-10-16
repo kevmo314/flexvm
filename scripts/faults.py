@@ -3960,6 +3960,49 @@ def resume_bind_fail():
     check("resume bind fails: then it resumes, md5 intact", r["ok"] and md5(A, n) == m, r)
 
 
+def arrival_bind_fail():
+    """#593: an arrival whose control socket cannot be bound (a directory in its place on the
+    target) refuses the prepare, before its source pauses: the VM never stops running on the
+    source, the target keeps nothing, and a later migration works. A prepared arrival's socket
+    says it is starting, and goes with the arrival when its source hangs up."""
+    n = "ft-arrival-bind"
+    migs = lambda: sorted(f for f in os.listdir(os.path.join(B.state, "migs")) if f.isdigit()) if os.path.isdir(os.path.join(B.state, "migs")) else []
+    m = setup(n, mib=20)
+    ip, pid, recorded, before = vms(A)[n]["ip"], vm_pid(A, n), migs(), len(log(A, n))
+    sock = os.path.join(B.run, "vms", f"{n}.sock")
+    os.mkdir(sock)
+    try:
+        r = migrate(A, n, B)
+    finally:
+        os.rmdir(sock)
+    check("arrival bind fails: refused at the prepare, saying why", not r["ok"] and "no control socket" in r["error"] and "cannot move" in r["error"], r)
+    check("arrival bind fails: running on A only, same process", where(n) == {A: "running"} and vm_pid(A, n) == pid, where(n))
+    check("arrival bind fails: the source never paused nor aborted", not re.search(r"abort|resum|paus", log(A, n)[before:]), log(A, n)[before:][-500:])
+    check("arrival bind fails: md5 intact", md5(A, n) == m)
+    check("arrival bind fails: the target keeps nothing", name_free(B, n) and not addr(B, ip).get("holder") and migs() == recorded, (addr(B, ip), recorded, migs()))
+    a = addr(A, ip)
+    check("arrival bind fails: the address is not lent, nor left", a.get("lent") is None and not a.get("leaving") and a.get("holder") == n, a)
+    r = migrate(A, n, B)
+    check("arrival bind fails: a later migration works", r["ok"] and where(n).get(B) == "running", r)
+    wait_released(B, n)
+    check("arrival bind fails: md5 intact on B", md5(B, n) == m)
+    kill(B, n)
+    # Prepared, then abandoned by its source: bound while it prepares, unlinked as it goes.
+    p, ip = "ft-arrival-bound", spare(B, 2)
+    s, r, mig = migrate_in_raw(B, p, ip, source_vm())
+    try:
+        check("arrival bound: target prepared", r.get("ok"), r)
+        sock = os.path.join(B.run, "vms", f"{p}.sock")
+        st = control(B, p, {"op": "debug", "what": "status"}, timeout=10) if os.path.exists(sock) else None
+        check("arrival bound: its socket answers that it is starting", st and not st["ok"] and "is starting" in st["error"], st)
+    finally:
+        s.close()
+    check("arrival bound: name free on B", name_free(B, p), vms(B).get(p))
+    check("arrival bound: socket gone with the aborted arrival", not os.path.exists(sock))
+    st = ok(peer(B, {"op": "migration", "mig": mig}))
+    check("arrival bound: migration fenced as aborted", st["outcome"] == "aborted", st)
+
+
 def app_abort():
     """#569: an image VM's app output goes on after a migration aborted once its source
     left (the target refuses a bad preload page, `bad_preload`), none lost or repeated."""
@@ -9030,7 +9073,7 @@ SCENARIOS = dict(
     collapse_abort=collapse_abort, collapse_ckpt_fail=collapse_ckpt_fail, ckpt_paused_backlog=ckpt_paused_backlog, same_host_order=same_host_order, same_host_slow_route=same_host_slow_route, same_host_flood=same_host_flood, same_host_late_handover=same_host_late_handover, same_host_hold_route_fail=same_host_hold_route_fail, same_host_backlog=same_host_backlog, same_host_bulk_tcp=same_host_bulk_tcp, ckpt_backlog=ckpt_backlog, rx_stall=rx_stall, arrival_abort_route=arrival_abort_route, arrival_killed_route=arrival_killed_route,
     handoff_superseded=handoff_superseded, delayed_announce=delayed_announce, delayed_announce_handoff=delayed_announce_handoff, announce_arp_timer=announce_arp_timer,
     prepare_fail_announce=prepare_fail_announce, reconcile_announce=reconcile_announce, reconcile_kill=reconcile_kill, resume_pull_lock=resume_pull_lock, page_conns=page_conns, suspend_cmd=suspend_cmd, suspend_slow_cmd=suspend_slow_cmd, suspend_overlap=suspend_overlap, fc_died_busy=fc_died_busy, pause_cmd_start=pause_cmd_start, suspend_died=suspend_died,
-    kill_prepare=kill_prepare, resume_migrating=resume_migrating, resume_bind_fail=resume_bind_fail, app_abort=app_abort,
+    kill_prepare=kill_prepare, resume_migrating=resume_migrating, resume_bind_fail=resume_bind_fail, arrival_bind_fail=arrival_bind_fail, app_abort=app_abort,
     ctrl_z_long_op=ctrl_z_long_op, resume_suspending=resume_suspending, quit_status=quit_status, resume_outcome=resume_outcome, exec_recovery_instance=exec_recovery_instance,
     ckpt_ancestor_corrupt=ckpt_ancestor_corrupt, resume_listener_restart=resume_listener_restart,
     resume_killed_marked=resume_killed_marked, restore_route_fence=restore_route_fence, reboot=reboot)

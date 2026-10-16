@@ -565,7 +565,6 @@ impl Proc {
         };
         let revoked = Arc::new(Mutex::new(false));
         *self.held_in.lock().unwrap() = Some(revoked.clone());
-        self.serve_control()?;
         if fault("lost_ack") {
             let _ = w.shutdown(std::net::Shutdown::Both);
         } else {
@@ -778,6 +777,10 @@ impl Proc {
         }
         let source = Source { addr: req["source"].as_str().ok_or("missing source")?.into(), vm: name.clone(), mig, regions };
         self.set_name(self.host.take_name(&name, false)?);
+        // Bound before the prepare is answered (#593, as a resume's): failing, the source never
+        // pauses. Until the VM is adopted, the socket says it is starting; an abort's `finish`
+        // unlinks it with the name.
+        self.serve_control()?;
         let by = serde_json::from_value(req["source_ident"].clone()).ok();
         let tpl = Template::open_id(&self.paths, req["template"].as_str().ok_or("missing template")?, req["id"].as_str().ok_or("missing template id")?)?;
         t.mark("template");
