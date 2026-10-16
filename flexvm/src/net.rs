@@ -465,6 +465,10 @@ pub fn route_get(to: Ipv4Addr) -> Result<(String, Ipv4Addr)> {
     attr(&mut msg, RTA_DST, &to.octets());
     let mut buf = [0u8; 4096];
     let reply = exchange(&sock, libc::RTM_GETROUTE, 0, &msg, &mut buf).map_err(|_| format!("no route toward {to}: netlink failed"))?;
+    route_from_reply(to, reply)
+}
+
+fn route_from_reply(to: Ipv4Addr, reply: &[u8]) -> Result<(String, Ipv4Addr)> {
     let (oif, src) = parse_route(reply).map_err(|e| format!("no route toward {to}{e}"))?;
     let mut name = [0 as libc::c_char; libc::IFNAMSIZ];
     if unsafe { libc::if_indextoname(oif, name.as_mut_ptr()) }.is_null() {
@@ -803,6 +807,21 @@ mod tests {
         let mut bad = full.clone();
         bad[28] = 200;
         assert_eq!(parse_route(&bad), Err("".into()), "an attribute past the end");
+    }
+
+    #[test]
+    fn route_lookup_errors_and_vanished_interfaces_are_reported() {
+        let to = Ipv4Addr::new(192, 0, 2, 1);
+        let err = route_from_reply(to, &[]).unwrap_err().to_string();
+        assert!(err.contains("no route toward 192.0.2.1"), "{err}");
+        let mut reply = vec![0u8; 28];
+        reply[4..6].copy_from_slice(&RTM_NEWROUTE.to_ne_bytes());
+        attr(&mut reply, RTA_OIF, &u32::MAX.to_ne_bytes());
+        attr(&mut reply, libc::RTA_PREFSRC, &[192, 0, 2, 2]);
+        let len = reply.len() as u32;
+        reply[..4].copy_from_slice(&len.to_ne_bytes());
+        let err = route_from_reply(to, &reply).unwrap_err().to_string();
+        assert!(err.contains("route toward 192.0.2.1: interface 4294967295:"), "{err}");
     }
 
     #[test]

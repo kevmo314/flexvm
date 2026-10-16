@@ -3447,9 +3447,12 @@ mod tests {
         assert_eq!(cfg("[2001:db8::1]:7070", &["flexvm-no-such-host.invalid:7070"]).advertise().unwrap().as_deref(), Some("[2001:db8::1]:7070"));
         // The kernel's route toward a peer elsewhere: its device and source, as set ones override.
         let any = cfg("0.0.0.0:7070", &["192.0.2.1:7070"]);
-        if let Ok((dev, src)) = crate::net::route_get("192.0.2.1".parse().unwrap()) {
-            assert_eq!((any.underlay(), any.announce_dev()), (Some(src), Some(dev)));
-        }
+        // Whatever the kernel answers is checked, a failed lookup included: then nothing is derived, never loopback.
+        let want = match crate::net::route_get("192.0.2.1".parse().unwrap()) {
+            Ok((dev, src)) => (Some(src), crate::net::is_ethernet(&dev).then_some(dev)),
+            Err(_) => (None, None),
+        };
+        assert_eq!((any.underlay(), any.announce_dev()), want);
         let off = Config { announce_dev: Some("none".into()), ..any };
         assert_eq!(off.announce_dev(), None);
     }
@@ -3503,6 +3506,29 @@ mod tests {
         // A derivation toward peers since replaced is dropped.
         assert_eq!(D.record(gen - 1, (Ok((None, None)), vec!["peer c:1: gone".into()])), Vec::<String>::new());
         assert_eq!(D.state.lock().unwrap().good.as_ref(), Some(&good));
+    }
+
+    /// A failed derivation gives nothing (never loopback for a peer elsewhere) and is not tried again until
+    /// `DERIVE_EVERY` has passed; then it is, and its success replaces the failure.
+    #[test]
+    fn a_failed_derivation_recovers_once_refreshed() {
+        static D: Deriver = Deriver::new(Duration::from_secs(60));
+        let peers = vec!["far:1".to_string()];
+        let ok: Derived = (Some("192.0.2.1".parse().unwrap()), Some("eth0".into()));
+        assert_eq!(D.get(&peers, |_| (Err("no route toward 192.0.2.9: Network is unreachable".into()), Vec::new())), (None, None));
+        assert_eq!(D.get(&peers, |_| unreachable!("tried again within DERIVE_EVERY")), (None, None));
+        // As if DERIVE_EVERY had passed (None, early in boot, counts as never derived).
+        D.state.lock().unwrap().ended = std::time::Instant::now().checked_sub(DERIVE_EVERY);
+        let good = ok.clone();
+        assert_eq!(D.get(&peers, move |_| (Ok(good), Vec::new())), (None, None), "answered at once, refreshed in the background");
+        let mut d = D.state.lock().unwrap();
+        while d.under_way {
+            let (next, timeout) = D.changed.wait_timeout(d, Duration::from_secs(60)).unwrap();
+            assert!(!timeout.timed_out(), "the refresh never ended");
+            d = next;
+        }
+        drop(d);
+        assert_eq!(D.get(&peers, |_| unreachable!("refreshed just now")), ok);
     }
 
     /// A derivation that hangs holds one thread at most, whatever the peers change to, and
