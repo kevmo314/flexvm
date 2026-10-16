@@ -15,7 +15,8 @@ use crate::bail;
 use crate::util::Result;
 use crate::util::{cpath, stat_at};
 
-/// Budgets for one image build: bytes compressed, uncompressed and per file, and tar entries.
+/// Budgets for one image build: bytes compressed, uncompressed and per file, and entries.
+/// Both tar entries (including metadata and whiteouts) and filesystem creations are capped.
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
     pub download: u64,
@@ -58,7 +59,17 @@ pub fn lexical(p: &Path) -> PathBuf {
     out
 }
 
+/// Match Linux's pathname limits before creating prefixes: resolution can return ENOENT for a
+/// missing prefix before it reaches an overlong component. This also bounds lexical path depth.
+fn check_path(p: &Path) -> Result<()> {
+    if p.as_os_str().len() >= libc::PATH_MAX as usize || p.components().any(|c| c.as_os_str().len() > libc::NAME_MAX as usize) {
+        bail!("layer path {p:?} too long");
+    }
+    Ok(())
+}
+
 fn split(p: &Path) -> Result<Option<(PathBuf, CString)>> {
+    check_path(p)?;
     if p.components().any(|c| c == Component::ParentDir) {
         bail!("layer path {p:?} contains '..'");
     }
@@ -338,6 +349,15 @@ impl Root {
         Root { fd, limits, entries: 0, seen: 0, unpacked: 0 }
     }
 
+    /// Check before creating anything, including implicit parents. Deletions do not refund the
+    /// budget; hard links count too, even though they share an inode.
+    fn check_entry_limit(&self) -> Result<()> {
+        if self.entries >= self.limits.entries {
+            bail!("more than {} filesystem entries (--max-entries)", self.limits.entries);
+        }
+        Ok(())
+    }
+
     fn openat2(&self, rel: &[u8], flags: i32) -> io::Result<OwnedFd> {
         let path = CString::new(if rel.is_empty() { b".".as_slice() } else { rel }).map_err(|_| io::Error::other("NUL in path"))?;
         let mut how: libc::open_how = unsafe { std::mem::zeroed() };
@@ -362,6 +382,7 @@ impl Root {
     }
 
     fn mkdir_p(&mut self, rel: &Path, depth: u32) -> Result<OwnedFd> {
+        check_path(rel)?;
         if depth > 40 {
             bail!("too many levels of symbolic links creating {rel:?}");
         }
@@ -378,6 +399,7 @@ impl Root {
             fd = match self.resolve(&cur) {
                 Ok(next) => next,
                 Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
+                    self.check_entry_limit()?;
                     if unsafe { libc::mkdirat(fd.as_raw_fd(), name.as_ptr(), 0o755) } == 0 {
                         self.entries += 1;
                     } else {
@@ -472,8 +494,10 @@ impl Root {
         match kind {
             T::Directory => {
                 if !is_type(dfd, &at.name, libc::S_IFDIR) {
+                    self.check_entry_limit()?;
                     at.remove()?;
                     check(unsafe { libc::mkdirat(dfd, name, 0o700) }, "mkdir", rel)?;
+                    self.entries += 1;
                 }
             }
             T::Regular | T::Continuous => {
@@ -483,14 +507,18 @@ impl Root {
                 if e.size() > self.limits.unpacked - self.unpacked {
                     bail!("image exceeds the unpacked size limit (--max-unpacked-mib)");
                 }
+                self.check_entry_limit()?;
                 // No bigger than the file: most are small, and a 256 KiB buffer each would be an mmap.
                 let mut file = BufWriter::with_capacity((e.size() as usize).min(256 << 10), at.create()?);
+                self.entries += 1;
                 io::copy(e, &mut file).and_then(|_| file.flush()).map_err(|err| format!("write {rel:?}: {err}"))?;
             }
             T::Symlink => {
                 let target = m.link.as_ref().ok_or("symlink without target")?;
+                self.check_entry_limit()?;
                 at.remove()?;
                 check(unsafe { libc::symlinkat(cpath(target)?.as_ptr(), dfd, name) }, "symlink", rel)?;
+                self.entries += 1;
             }
             T::Link => {
                 let src = self.at(m.link.as_ref().ok_or("hard link without target")?)?;
@@ -498,6 +526,7 @@ impl Root {
                 if ino(&src).is_some_and(|i| Some(i) == ino(&at)) {
                     return Ok(at);
                 }
+                self.check_entry_limit()?;
                 forget(dfd, &at.name, mine, 0)?;
                 at.remove()?;
                 check(unsafe { libc::linkat(src.dir.as_raw_fd(), src.name.as_ptr(), dfd, name, 0) }, "link", rel)?;
@@ -506,6 +535,7 @@ impl Root {
                 return Ok(at);
             }
             T::Char | T::Block | T::Fifo => {
+                self.check_entry_limit()?;
                 at.remove()?;
                 let fmt = match kind {
                     T::Char => libc::S_IFCHR,
@@ -514,10 +544,10 @@ impl Root {
                 };
                 let dev = libc::makedev(h.device_major()?.unwrap_or(0), h.device_minor()?.unwrap_or(0));
                 check(unsafe { libc::mknodat(dfd, name, fmt | 0o600, dev) }, "mknod", rel)?;
+                self.entries += 1;
             }
             other => bail!("unsupported tar entry type {other:?} at {rel:?}"),
         }
-        self.entries += 1;
         let nofollow = libc::AT_SYMLINK_NOFOLLOW;
         check(unsafe { libc::fchownat(dfd, name, m.uid, m.gid, nofollow) }, "chown", rel)?;
         if kind != T::Symlink {
@@ -537,19 +567,22 @@ impl Root {
     pub fn ensure_dir(&mut self, rel: &str, mode: u32) -> Result<()> {
         let at = self.at(Path::new(rel))?;
         if stat_at(at.dir.as_raw_fd(), &at.name).is_none() {
+            self.check_entry_limit()?;
             let (dfd, name) = (at.dir.as_raw_fd(), at.name.as_ptr());
             check(unsafe { libc::mkdirat(dfd, name, 0o700) }, "mkdir", Path::new(rel))?;
-            check(unsafe { libc::fchmodat(dfd, name, mode, 0) }, "chmod", Path::new(rel))?;
             self.entries += 1;
+            check(unsafe { libc::fchmodat(dfd, name, mode, 0) }, "chmod", Path::new(rel))?;
         }
         Ok(())
     }
 
     pub fn write_file(&mut self, rel: &str, data: &[u8], mode: u32) -> Result<()> {
-        let mut f = self.at(Path::new(rel))?.create()?;
+        let at = self.at(Path::new(rel))?;
+        self.check_entry_limit()?;
+        let mut f = at.create()?;
+        self.entries += 1;
         f.write_all(data)?;
         check(unsafe { libc::fchmod(f.as_raw_fd(), mode) }, "chmod", Path::new(rel))?;
-        self.entries += 1;
         Ok(())
     }
 
@@ -752,6 +785,65 @@ pub(super) mod tests {
             renamer.join().unwrap();
             result.expect("path resolution failed during unrelated renames");
         });
+    }
+
+    #[test]
+    fn implicit_directories_obey_entry_limit() {
+        let s = Sandbox::new("implicit-entry-limit");
+        let mut root = Root::open(&s.root, Limits { entries: 6, ..Limits::default() }).unwrap();
+        let tar = layer(&[("a/b/c/file", 'f', ""), ("d/e/f/file", 'f', "")]);
+        let err = root.apply_layer(&tar[..]).unwrap_err().to_string();
+        assert!(err.contains("--max-entries"), "{err}");
+        assert_eq!(root.entries, 6);
+        assert!(s.root.join("d/e").is_dir());
+        assert!(!s.root.join("d/e/f").exists());
+    }
+
+    #[test]
+    fn all_creations_obey_entry_limit() {
+        for kind in ['d', 'f', 'l', 'h', 'p'] {
+            let s = Sandbox::new(&format!("entry-limit-{kind}"));
+            let mut root = Root::open(&s.root, Limits { entries: 3, ..Limits::default() }).unwrap();
+            let tar = layer(&[("seed", 'f', ""), ("a/b/new", kind, "seed")]);
+            let err = root.apply_layer(&tar[..]).unwrap_err().to_string();
+            assert!(err.contains("--max-entries"), "{kind}: {err}");
+            assert_eq!(root.entries, 3);
+            assert!(std::fs::symlink_metadata(s.root.join("a/b/new")).is_err());
+        }
+        let s = Sandbox::new("dangling-entry-limit");
+        let mut root = Root::open(&s.root, Limits { entries: 3, ..Limits::default() }).unwrap();
+        let tar = layer(&[("link", 'l', "a/b/c"), ("link/file", 'f', "")]);
+        let err = root.apply_layer(&tar[..]).unwrap_err().to_string();
+        assert!(err.contains("--max-entries"), "{err}");
+        assert_eq!(root.entries, 3);
+        assert!(!s.root.join("a/b/c").exists());
+    }
+
+    #[test]
+    fn entry_accounting_survives_layers_and_whiteouts() {
+        let s = Sandbox::new("entry-accounting");
+        let mut root = Root::open(&s.root, Limits { entries: 7, ..Limits::default() }).unwrap();
+        root.apply_layer(&layer(&[("a/b/file", 'f', ""), ("a/b", 'd', ""), ("hard", 'h', "a/b/file")])[..]).unwrap();
+        assert_eq!(root.entries, 4); // Existing directories are not created again; hard links count.
+        root.apply_layer(&layer(&[(".wh.hard", 'f', ""), ("missing/parents/.wh.file", 'f', "")])[..]).unwrap();
+        assert_eq!(root.entries, 4); // Whiteouts create nothing and do not refund creations.
+        let err = root.apply_layer(&layer(&[("c/d/e/f", 'f', "")])[..]).unwrap_err().to_string();
+        assert!(err.contains("--max-entries"), "{err}");
+        assert_eq!(root.entries, 7);
+        assert!(!s.root.join("missing").exists());
+        assert!(!s.root.join("c/d/e/f").exists());
+    }
+
+    #[test]
+    fn overlong_parent_paths_create_nothing() {
+        let s = Sandbox::new("long-parent");
+        let mut root = s.open();
+        // Validate both total path bytes and component bytes before creating a missing prefix.
+        for path in ["a/".repeat(4096), format!("prefix/{}", "a".repeat(256))] {
+            assert!(root.mkdir_p(Path::new(&path), 0).is_err());
+            assert_eq!(root.entries, 0);
+            assert_eq!(std::fs::read_dir(&s.root).unwrap().count(), 0);
+        }
     }
 
     #[test]
