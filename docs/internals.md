@@ -809,11 +809,14 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
     directly. The listener looks its peers up as it starts (within 2 s, a
     failed lookup keeping the address it last had) and writes the file before
     deriving anything, the address it advertises for a wildcard `ADDR`
-    included; at a first start or after a boot nothing else has. VM processes
-    never look up peer names or wait for DNS, including at startup. If a peer
-    elsewhere has no known IPv4 address, nothing is derived and a diagnostic
-    is logged (no peers, or all local, uses loopback): a VM started before
-    the host's first listener announces no routes to peers.
+    included. Other processes never look up a name the listener has seen,
+    one it could not look up (an empty entry) included, so once a listener
+    has run nothing waits on DNS. A name with no entry at all (no listener
+    has run since a boot) is looked up within 2 s, so a VM started before
+    the listener still announces its routes. If a peer elsewhere has no known
+    IPv4 address, nothing is derived and a diagnostic is logged, saying to
+    start `flexvm listen` when the listener has not looked a peer up (no
+    peers, or all local, uses loopback).
     Explicit `--underlay` and `--announce-dev` settings
     override derivation (`--announce-dev none` disables announcements).
 - On migration, the target routes the address to its new tap at the commit,

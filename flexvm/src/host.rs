@@ -133,6 +133,9 @@ pub fn toward(peers: &[Vec<IpAddr>], local: impl Fn(Ipv4Addr) -> bool) -> Toward
     out
 }
 
+/// A peer name's lookup by a process other than the listener, for one the listener has not seen.
+const PEER_WAIT: Duration = Duration::from_secs(2);
+
 /// What a derivation found, and the peers whose addresses were unknown.
 type Outcome = (std::result::Result<Derived, String>, Vec<String>);
 
@@ -199,21 +202,49 @@ impl Config {
         }
     }
 
-    /// Derive from the listener's last-known peer addresses, whatever their age.
-    /// IP literals need no cache; names are never looked up or waited for here.
+    /// Derive from the listener's last-known peer addresses, whatever their age; IP literals
+    /// need none. A name the listener has seen (an empty entry for one it could not look up
+    /// included) is never looked up here; one it has no entry for (no listener has run since
+    /// a boot) is, within `PEER_WAIT`, so a VM started first still announces.
     fn derived(&self) -> Derived {
-        let cache = self.run.as_ref().map(|run| crate::listen::Cached::read(run, &self.peers)).unwrap_or_default();
-        let route = |to| crate::net::route_get(to).map(|(dev, src)| (dev.clone(), src, crate::net::is_ethernet(&dev)));
-        let (out, _) = derive(&self.peers, |p| cache.addrs(p), |a| crate::net::is_local_addr(a).unwrap_or(false), route);
+        let by = std::time::Instant::now() + PEER_WAIT;
+        let (out, why) = self.derived_by(|p| crate::util::resolve(p, by).map(|a| a.iter().map(SocketAddr::ip).collect()));
         static FAILED: Mutex<Option<String>> = Mutex::new(None);
         let mut failed = FAILED.lock().unwrap();
-        if let Err(e) = &out {
-            if failed.as_ref() != Some(e) {
-                crate::log!("flexvm: {e}: no underlay address or announce device derived (set them with flexvm config)");
+        if let Some(why) = &why {
+            if failed.as_ref() != Some(why) {
+                crate::log!("flexvm: {why}");
             }
         }
-        *failed = out.as_ref().err().cloned();
-        out.unwrap_or_default()
+        *failed = why;
+        out
+    }
+
+    /// What `derived` finds with `lookup` for unseen names, and why nothing was derived.
+    fn derived_by(&self, lookup: impl Fn(&str) -> std::io::Result<Vec<IpAddr>>) -> (Derived, Option<String>) {
+        let cache = self.run.as_ref().map(|run| crate::listen::Cached::read(run, &self.peers)).unwrap_or_default();
+        let unseen: Vec<&str> = self.peers.iter().map(String::as_str).filter(|p| cache.addrs(p).is_err()).collect();
+        let route = |to| crate::net::route_get(to).map(|(dev, src)| (dev.clone(), src, crate::net::is_ethernet(&dev)));
+        let (out, unresolved) = derive(&self.peers, |p| cache.addrs(p).or_else(|_| lookup(p)), |a| crate::net::is_local_addr(a).unwrap_or(false), route);
+        match out {
+            Ok(d) => (d, None),
+            Err(e) if unseen.is_empty() => {
+                (Derived::default(), Some(format!("{e}: no underlay address or announce device derived (set them with flexvm config)")))
+            }
+            Err(e) => {
+                let why = match unresolved.is_empty() {
+                    true => String::new(),
+                    false => format!(" ({})", unresolved.join("; ")),
+                };
+                let unseen = unseen.join(", ");
+                (
+                    Derived::default(),
+                    Some(format!(
+                        "{e}{why}: no underlay address or announce device derived; this host's listener has not looked up {unseen} yet: start flexvm listen (or set them with flexvm config)"
+                    )),
+                )
+            }
+        }
     }
 
     /// Where peers reach this host's listener (a migration target pulls
@@ -4482,11 +4513,13 @@ mod tests {
         .unwrap();
         let reopened = Host::open(&h.state, &h.run).unwrap();
         let now = || (reopened.config_now().underlay(), reopened.config_now().announce_dev());
+        let cache = h.run.join("peers.json");
+        // Seen by the listener, which could not look it up: never looked up here.
+        std::fs::write(&cache, r#"{"names":{"blackholed.example:7070":[]}}"#).unwrap();
         let start = std::time::Instant::now();
-        assert_eq!(now(), (None, None), "no cache: nothing derived, never wait for DNS");
+        assert_eq!(now(), (None, None), "seen, no addresses: nothing derived, never wait for DNS");
         assert!(start.elapsed() < Duration::from_millis(500));
 
-        let cache = h.run.join("peers.json");
         std::fs::write(&cache, r#"{"names":{"blackholed.example:7070":["127.0.0.1"]}}"#).unwrap();
         let old = SystemTime::now() - Duration::from_secs(3600);
         File::options().write(true).open(&cache).unwrap().set_modified(old).unwrap();
@@ -4510,6 +4543,54 @@ mod tests {
         })
         .unwrap();
         assert_eq!(now().1, None);
+    }
+
+    /// Only a name with no entry in `RUN/peers.json` (no listener has run since a boot) is
+    /// looked up by a process other than the listener; one it has seen never is, even with
+    /// no addresses (#579).
+    #[test]
+    fn only_names_the_listener_has_not_seen_are_looked_up() {
+        let dir = crate::test_util::TempDir::new("derive-unseen");
+        let cfg =
+            Config { run: Some(dir.to_path_buf()), peers: vec!["seen.example:1".into(), "unseen.example:1".into(), "127.0.0.2:1".into()], ..Config::default() };
+        let asked = std::cell::RefCell::new(Vec::<String>::new());
+        let found = |ok: bool| {
+            let asked = &asked;
+            move |p: &str| {
+                asked.borrow_mut().push(p.into());
+                match ok {
+                    true => Ok(vec!["127.0.0.1".parse().unwrap()]),
+                    false => Err(std::io::Error::other("DNS lookup timed out")),
+                }
+            }
+        };
+        let write = |json: &str| std::fs::write(dir.join("peers.json"), json).unwrap();
+
+        // No listener yet: both names looked up, and found on this machine.
+        assert_eq!(cfg.derived_by(found(true)), ((Some(Ipv4Addr::LOCALHOST), None), None));
+        assert_eq!(asked.take(), ["seen.example:1", "unseen.example:1"]);
+        // Not found: the listener is what to start.
+        let (d, why) = cfg.derived_by(found(false));
+        assert_eq!(d, (None, None));
+        let why = why.unwrap();
+        assert!(why.contains("start flexvm listen") && why.contains("seen.example:1, unseen.example:1") && why.contains("timed out"), "{why}");
+        asked.take();
+
+        // The listener saw one, with no addresses: only the other is looked up.
+        write(r#"{"names":{"seen.example:1":[]}}"#);
+        let (d, why) = cfg.derived_by(found(false));
+        assert_eq!((d, asked.take()), ((None, None), vec!["unseen.example:1".to_string()]));
+        assert!(why.unwrap().contains("not looked up unseen.example:1 yet: start flexvm listen"));
+
+        // It saw both: nothing is looked up, nor is the listener blamed.
+        write(r#"{"names":{"seen.example:1":[],"unseen.example:1":["127.0.0.1"]}}"#);
+        let (d, why) = cfg.derived_by(found(true));
+        assert_eq!((d, asked.take()), ((None, None), Vec::<String>::new()));
+        let why = why.unwrap();
+        assert!(why.starts_with("no peer elsewhere has a known IPv4 address") && !why.contains("flexvm listen"), "{why}");
+        write(r#"{"names":{"seen.example:1":["127.0.0.1"],"unseen.example:1":["127.0.0.1"]}}"#);
+        assert_eq!(cfg.derived_by(found(true)), ((Some(Ipv4Addr::LOCALHOST), None), None));
+        assert!(asked.take().is_empty());
     }
 
     #[test]

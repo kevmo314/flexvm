@@ -1010,7 +1010,6 @@ mod tests {
         host.configure(|cfg| {
             cfg.listen = Some("0.0.0.0:7106".into());
             cfg.peers = vec!["localhost:7107".into()];
-            assert_eq!(cfg.advertise().ok().flatten(), None, "nothing looked up yet");
             validate(&listener, cfg)?;
             assert_eq!(cfg.advertise()?.as_deref(), Some("127.0.0.1:7106"));
             Ok(())
